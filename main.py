@@ -11,6 +11,11 @@ import multiprocessing
 import clang.cindex
 import ctypes
 import os
+import inspect 
+MBE_DEBUG = True
+def MBE_PRINT(debuginfo):
+	print(f"{debuginfo}") 	
+
 
 # Right now this only mutes (legacy) include errors that don't break everything
 CLEAN_PRINT = True
@@ -283,8 +288,13 @@ def commentRemover(text):
 
 ########### DB UTILS ###########
 def connect_sql():
+
+	if os.path.exists('/.dockerenv') or 'docker' in open('/proc/self/cgroup').read():
+		mysql_host = "host.docker.internal"
+	else :
+		mysql_host = "localhost"
 	# Connect to DB
-	return mysql.connector.connect(host="localhost", user="root", password="Passe123", database="test")
+	return mysql.connector.connect(host=mysql_host, user="root", password="Passe123", database="test")
 
 def set_db():
 	db = []
@@ -330,7 +340,8 @@ class Great_Processor:
 		multi_proc = False
 		self.vid = 0
 		self.loggin = []
-		self.version_name = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+		#self.version_name = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+		self.version_name = "9c7ef209cd0f7c1a92ed61eed3e835d6e4abc66c"
 		self.vid = 0
 		self.manager = None
 		self.shared_set_list = None
@@ -741,7 +752,7 @@ class Table:
 			if "AUTO_INCREMENT" in col:
 				self.auto_increment = True
 
-			temp_sql += f"{" ".join(map(str, col))},"
+			temp_sql += f'{" ".join(map(str, col))},'
 
 			temp_id += 1
 
@@ -759,7 +770,7 @@ class Table:
 		del temp_arr, temp_arr_primary
 
 
-		self.sql_set = f"INSERT INTO {self.table_name} VALUES ({("%s," * len(self.columns))[:-1]})"
+		self.sql_set = f'INSERT INTO {self.table_name} VALUES ({("%s," * len(self.columns))[:-1]})'
 		key_update_sql = ""
 
 		if OVERRIDE_TABLE_CREATION_PRINT:
@@ -769,7 +780,7 @@ class Table:
 		for column in self.columns:
 			if column not in itemgetter(*self.primary_key)(self.columns):
 				key_update_sql += f"{column} = VALUES({column}), "
-		self.sql_update = f"INSERT INTO {self.table_name} ({', '.join(map(str, self.columns))}) VALUES ({("%s," * len(self.columns))[:-1]}) ON DUPLICATE KEY UPDATE {key_update_sql[:-2]}"
+		self.sql_update = f'INSERT INTO {self.table_name} ({", ".join(map(str, self.columns))}) VALUES ({("%s," * len(self.columns))[:-1]}) ON DUPLICATE KEY UPDATE {key_update_sql[:-2]}'
 
 
 		temp_sql = f"{temp_sql[:-1]}),"
@@ -779,11 +790,14 @@ class Table:
 				temp_sql += f" FOREIGN KEY ({keys[0]}) REFERENCES {keys[1]}({keys[2]}),"
 
 		db = set_db()
+		MBE_PRINT(f"{inspect.currentframe().f_lineno} : CREATE TABLE {self.table_name} ({temp_sql[:-1]} );") if MBE_DEBUG else None #mbe 	
+
+		
 		execdb(db, f"CREATE TABLE {self.table_name} ({temp_sql[:-1]} );")
 		del temp_sql
 
 		if self.initial_insert:
-			execdb(db, f"INSERT INTO {self.table_name} VALUES ({("%s," * temp_id)[:-1]})", self.initial_insert)
+			execdb(db, f'INSERT INTO {self.table_name} VALUES ({("%s," * temp_id)[:-1]})', self.initial_insert)
 		del temp_id
 
 		unset_db(db)
@@ -998,6 +1012,8 @@ class Master_File:
 	def add_version(self, version_name=None):
 		if version_name is None:
 			version_name=gp.version_name
+		MBE_PRINT(f"{ inspect.currentframe().f_lineno} :{gp.version_name=} {version_name=}") if MBE_DEBUG else None #mbe	
+
 		self.version_dict[version_name] = git_clone(version_name)
 		self.file_dict[version_name] = {}
 
@@ -1419,7 +1435,7 @@ class Ast_Manager():
 
 		translation_unit = index.parse(f"{mf.version_dict[version]}/{file_path}", args=[
 			"-D__KERNEL__",*cppro_cindex_input,#"-nostdinc",
-			f"-I{mf.version_dict[version]}/{"/".join(file_path.split("/")[:-1])}",
+			f'-I{mf.version_dict[version]}/{"/".join(file_path.split("/")[:-1])}',
 			f"-I{mf.version_dict[version]}/include",
 			f"-I{mf.version_dict[version]}/include/uapi"
 		],
@@ -1484,8 +1500,11 @@ def git_change_list(old_vn, vn):
 	return raw_file_list.stdout.splitlines()
 
 def git_clone(version):
-	temp_path = create_temp_dir()
-
+	try:
+		temp_path = create_temp_dir()
+	except Exception as e:
+		MBE_PRINT(f"{ inspect.currentframe().f_lineno} : {temp_path=} {e=}") if MBE_DEBUG else None #mbe		
+	version="v6.16"
 	command = [
 		"git",
 		"clone",
@@ -1495,9 +1514,16 @@ def git_clone(version):
 		f"{temp_path}",
 		"-c advice.detachedHead=false"
 	]
-
-	sp.run(command)
-	shutil.rmtree(f"{temp_path}/.git")
+	MBE_PRINT(f"{ inspect.currentframe().f_lineno} : {command=} ") if MBE_DEBUG else None #mbe	
+	
+	try:
+		sp.run(command)
+	except Exception as e:
+		MBE_PRINT(f"{ inspect.currentframe().f_lineno} : {command=} {e=}") if MBE_DEBUG else None #mbe	
+	try:
+		shutil.rmtree(f"{temp_path}/.git")
+	except Exception as e: 
+		MBE_PRINT(f"{ inspect.currentframe().f_lineno} : {temp_path=} {e=}") if MBE_DEBUG else None #mbe		
 	command = [
 		"ln",
 		"-s",
@@ -1731,11 +1757,11 @@ def file_processing(start, end=None, override_list=None):
 							# ? Create BRIDGE INCLUDE
 							CS(m_bridge_include(X[2].fid, X[pos_include].iid))
 							# ?? Generate include content with file names
-							count_rank = 0
+							count_ranking = 0
 							for include in includes:
 								CS(m_file_name.get_set(m_file_name.fname(include)))
-								CS(m_include_content(X[pos_include].iid, count_rank, X[-1].fnid))
-								count_rank += 1
+								CS(m_include_content(X[pos_include].iid, count_ranking, X[-1].fnid))
+								count_ranking += 1
 							#EXIT INCLUDES
 
 				case "M":
@@ -1811,11 +1837,11 @@ def file_processing(start, end=None, override_list=None):
 						# ? Create BRIDGE INCLUDE
 						CS(m_bridge_include(X[2].fid, X[pos_include].iid))
 						# ?? Generate include content with file names
-						count_rank = 0
+						count_ranking = 0
 						for include in includes:
 							CS(m_file_name.get_set(m_file_name.fname(include)))
-							CS(m_include_content(X[pos_include].iid, count_rank, X[-1].fnid))
-							count_rank += 1
+							CS(m_include_content(X[pos_include].iid, count_ranking, X[-1].fnid))
+							count_ranking += 1
 					#EXIT INCLUDES
 
 		except _MyBreak:
@@ -1841,11 +1867,11 @@ def file_processing(start, end=None, override_list=None):
 				# 4 Create BRIDGE INCLUDE
 				CS(m_bridge_include(X[1].fid, X[3].iid))
 				# ?? Generate include content with file names
-				count_rank = 0
+				count_ranking = 0
 				for include in includes:
 					CS(m_file_name.get_set(m_file_name.fname(include)))
-					CS(m_include_content(X[3].iid, count_rank, X[-1].fnid))
-					count_rank += 1
+					CS(m_include_content(X[3].iid, count_ranking, X[-1].fnid))
+					count_ranking += 1
 
 			#EXIT INCLUDES
 
@@ -1863,6 +1889,7 @@ def update(version):
 	print(green(f"=======================Working on {version}======================="))
 	gp.clear_fetch_all()
 	# Pre-Processing
+	MBE_PRINT(f"{ inspect.currentframe().f_lineno} : {version=} ") if MBE_DEBUG else None #mbe		
 	gp.create_new_vid(version)
 	mf.add_version()
 	#include/linux/netfilter_bridge/ebtables.h
@@ -1910,12 +1937,14 @@ def update(version):
 def main():
 	gp.drop_all()
 	initialize_db()
-	update("v3.0")
-	update("v3.1")
-	update("v3.2")
-	update("v3.3")
-	update("v3.4")
-	update("v3.5")
+	update("v6.16")
+	#update("v3.0") #mbe
+	#update("v3.1") #mbe
+	#update("v3.2") #mbe
+	#update("v3.3") #mbe
+	#3update("v3.4") #mbe
+	#update("v3.5") #mbe
+	sys.exit() #mbe
 	emergency_shutdown()
 	return
 
@@ -1950,7 +1979,7 @@ m_moved_file = Table("m_moved_file", (("s_fid", "INT", "NOT NULL"),("e_fid", "IN
 
 m_include = Table("m_include", (("iid", "INT", "NOT NULL", "AUTO_INCREMENT"),("tid", "INT", "NOT NULL")), ("iid",), (("tid", "m_time", "tid"),), ((0,0),), False )
 
-m_include_content = Table("m_include_content", (("iid", "INT", "NOT NULL"),("rank", "INT", "NOT NULL"),("fnid", "INT", "NOT NULL")), ("iid","rank"), (("iid", "m_include", "iid"),("fnid","m_file_name","fnid")), None , False, True)
+m_include_content = Table("m_include_content", (("iid", "INT", "NOT NULL"),("ranking", "INT", "NOT NULL"),("fnid", "INT", "NOT NULL")), ("iid","ranking"), (("iid", "m_include", "iid"),("fnid","m_file_name","fnid")), None , False, True)
 
 m_bridge_include = Table("m_bridge_include", (("fid", "INT", "NOT NULL"),("iid", "INT", "NOT NULL")), ("fid","iid"), (("fid","m_file","fid"),("iid", "m_include", "iid")), None)
 
@@ -1960,14 +1989,14 @@ m_ast = Table("m_ast", (("aid", "INT", "NOT NULL", "AUTO_INCREMENT"),("tnid", "I
 
 # Think about unions and kconfig
 # encode typedefs HERE
-m_ast_struct = Table("m_ast_struct", (("aid", "INT", "NOT NULL"),("rank", "INT", "NOT NULL"),("tnid", "INT", "NOT NULL"),("inneraid", "INT", "NOT NULL"),("tspec", "INT", "NOT NULL")), ("aid","rank"), (("tnid","m_tag_name","tnid"),("aid","m_ast","aid"),("inneraid","m_ast","aid")), None, False, True)
+m_ast_struct = Table("m_ast_struct", (("aid", "INT", "NOT NULL"),("ranking", "INT", "NOT NULL"),("tnid", "INT", "NOT NULL"),("inneraid", "INT", "NOT NULL"),("tspec", "INT", "NOT NULL")), ("aid","ranking"), (("tnid","m_tag_name","tnid"),("aid","m_ast","aid"),("inneraid","m_ast","aid")), None, False, True)
 
 # TypeKind use values from TypeKind in cindex to store along with the name so that you can know wtf it is
 m_ast_type = Table("m_ast_type", (("aid", "INT", "NOT NULL"),("tnid", "INT", "NOT NULL"),("typekind", "INT", "NOT NULL")), ("aid",), (("aid","m_ast","aid"),("tnid","m_tag_name","tnid")))
 
 m_tag = Table("m_tag", (("tgid", "INT", "NOT NULL", "AUTO_INCREMENT"),("tid", "INT", "NOT NULL"),("ttype", "TINYINT", "UNSIGNED", "NOT NULL"),("tnid", "INT", "NOT NULL"),("tspec", "INT", "NOT NULL"),("aid", "INT")), ("tgid",), (("tid","m_time","tid"),("tnid","m_tag_name","tnid"),("aid","m_ast","aid")), ((0,0,0,0,0,0),))
 
-#m_tag_content = Table("m_tag_content", (("tgid", "INT", "NOT NULL"),("rank", "INT", "NOT NULL"),("mtgid", "INT", "NOT NULL")), ("tgid","rank"), (("tgid","m_tag","tgid"),("mtgid","m_tag","tgid")), None, False, True)
+#m_tag_content = Table("m_tag_content", (("tgid", "INT", "NOT NULL"),("ranking", "INT", "NOT NULL"),("mtgid", "INT", "NOT NULL")), ("tgid","ranking"), (("tgid","m_tag","tgid"),("mtgid","m_tag","tgid")), None, False, True)
 
 m_line = Table("m_line", (("lnid", "INT", "NOT NULL", "AUTO_INCREMENT"),("ln_s", "INT", "UNSIGNED", "NOT NULL"),("ln_e", "INT", "UNSIGNED", "NOT NULL")), ("lnid",), None, ((0,4294967295,0),), True)
 
@@ -2005,7 +2034,7 @@ m_kconfig_source = Table("m_kconfig_source", (("ksid", "INT", "NOT NULL", "AUTO_
 
 m_kconfig_order = Table("m_kconfig_order", (("koid", "INT", "NOT NULL", "AUTO_INCREMENT"),("tid", "INT", "NOT NULL")), ("koid",), (("tid","m_time","tid"),), ((0,0),))
 
-m_kconfig_order_content = Table("m_kconfig_order_content", (("koid", "INT", "NOT NULL"),("rank", "INT", "NOT NULL"),("kotype", "TINYINT", "UNSIGNED", "NOT NULL")), ("koid",), (("koid","m_kconfig_order","koid"),), None)
+m_kconfig_order_content = Table("m_kconfig_order_content", (("koid", "INT", "NOT NULL"),("ranking", "INT", "NOT NULL"),("kotype", "TINYINT", "UNSIGNED", "NOT NULL")), ("koid",), (("koid","m_kconfig_order","koid"),), None)
 #kotype:
 #config=1
 #menuconfig=2
