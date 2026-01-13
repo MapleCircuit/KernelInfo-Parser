@@ -46,6 +46,6 @@ sudo docker build -t kernelinfo-parser .
 
 # 3. Run with Linux kernel mounted
 ```bash
-# if we added current user to docker group, there would be no need for sudo
-sudo docker run --add-host=host.docker.internal:host-gateway  -v ~/Downloads/linux-kernel:/app/linux  kernelinfo-parser
+# if we added current user to docker group, there would be no need for sudo. 6g of sharedmemory/ramdisk. increase if needed.
+sudo docker run --add-host=host.docker.internal:host-gateway --tmpfs /dev/shm:rw,exec,size=6g  -v ~/Downloads/linux:/app/KernelInfo-Parser/linux  -v ~/Documents/dev/KernelInfo-Parser:/app/KernelInfo-Parser kernelinfo-parser
 ```

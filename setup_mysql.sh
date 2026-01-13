@@ -127,7 +127,8 @@ FLUSH PRIVILEGES;
 CREATE DATABASE IF NOT EXISTS ${DB_NAME};
 GRANT ALL PRIVILEGES ON ${DB_NAME}.* TO 'root'@'localhost';
 CREATE USER 'root'@'%' IDENTIFIED BY '${DB_PASSWORD}';
-GRANT ALL PRIVILEGES ON ${DB_NAME}.* TO 'root'@'%';
+GRANT ALL PRIVILEGES ON *.* TO 'root'@'%';
+GRANT SUPER ON *.* TO 'root'@'%';
 FLUSH PRIVILEGES;
 EOF
     else
@@ -135,6 +136,8 @@ EOF
         log_info "MYSQL017" "Attempting connection with configured password..."
         
         mysql -u root -p"${DB_PASSWORD}" <<EOF
+ALTER USER 'root'@'localhost' IDENTIFIED WITH mysql_native_password BY '${DB_PASSWORD}';
+FLUSH PRIVILEGES;
 CREATE DATABASE IF NOT EXISTS ${DB_NAME};
 GRANT ALL PRIVILEGES ON ${DB_NAME}.* TO 'root'@'localhost';
 CREATE USER 'root'@'%' IDENTIFIED BY '${DB_PASSWORD}';
@@ -201,9 +204,11 @@ print_connection_info() {
     echo "  Password: ${DB_PASSWORD}"
     echo ""
     echo "To run KernelInfo-Parser with Docker:"
-    echo "  docker run --add-host=host.docker.internal:host-gateway \\"
-    echo "    -v ~/Downloads/linux-kernel:/app/linux \\"
-    echo "    KernelInfo-Parser"
+    echo "  sudo docker run --add-host=host.docker.internal:host-gateway \\"
+    echo "                  --tmpfs /dev/shm:rw,exec,size=6g \\"
+    echo "                  -v ~/Downloads/linux:/app/KernelInfo-Parser/linux \\"
+    echo "                  -v ~/Documents/dev/KernelInfo-Parser:/app/KernelInfo-Parser \\"
+    echo "                  kernelinfo-parser"
     echo ""
 }
 
