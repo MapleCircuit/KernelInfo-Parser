@@ -1383,13 +1383,18 @@ class Ast_Manager():
 			children
 		)
 
+	def ast_parse_function_decl(self, c_children):
+		#######LIST EVERYTHING AND GET THE KIDS AND PRINT SOMETHING TO UNDERSTAND WHAT ISGOING ONNNNNN
+		return self.ast_parse_function(c_children)
+
 
 	def ast_parse(self, c_children):
 		print(f"{c_children.kind}---{c_children.spelling}")
 		match f"{c_children.kind}"[11:]:
 			case "STRUCT_DECL":
 				return self.ast_parse_struct_decl(c_children)
-
+			case "FUNCTION_DECL":
+				return self.ast_parse_function_decl(c_children)
 
 
 		return
@@ -1868,7 +1873,7 @@ def update(version):
 	#include/linux/netfilter_bridge/ebtables.h
 	#include/linux/lockd/bind.h
 	#include/linux/sched.h
-	am.ast_type("include/linux/lockd/bind.h")
+	am.ast_type("fs/ext4/symlink.c")
 	emergency_shutdown()
 
 
