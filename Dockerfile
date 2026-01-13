@@ -6,7 +6,7 @@ FROM python:3.11-slim
 
 # Argument to specify the version/branch/tag to pull from GitHub
 # Defaults to main branch
-ARG KERNELINFO-PARSER_VERSION=main
+ARG KERNELINFO_PARSER_VERSION=main
 
 # MySQL connection configuration (for host database)
 # Use host.docker.internal to connect to MySQL running on the host
@@ -19,7 +19,7 @@ ARG MYSQL_DATABASE=test
 # Image metadata
 LABEL maintainer="mbeware"
 LABEL description="Install kernel tool from Maple-Circuit"
-LABEL version="${KERNELINFO-PARSER_VERSION}"
+LABEL version="${KERNELINFO_PARSER_VERSION}"
 
 # Environment variables
 ENV PYTHONUNBUFFERED=1
@@ -43,14 +43,21 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Create working directory
-WORKDIR /app
+WORKDIR /app/KernelInfo-Parser
 
-# Clone KernelInfo-Parser repository from GitHub with specified version
-RUN git clone --branch ${KERNELINFO-PARSER_VERSION} --depth 1 \
-    https://github.com/MapleCircuit/KernelInfo-Parser.git /app
+#### Option 1 :  Clone KernelInfo-Parser repository from GitHub with specified version
+#RUN git clone --branch ${KERNELINFO_PARSER_VERSION} --depth 1 \
+#    https://github.com/MapleCircuit/KernelInfo-Parser.git /app
+#
+#### Option 2 :  Clone your own version to test your changed. 
+# RUN git clone --branch ${KERNELINFO_PARSER_VERSION} --depth 1 \
+#    https://github.com/mbeware/KernelInfo-Parser.git /app/KernelInfo-Parser
+#
+#### Option 3 :  Use local directory that will be mounted as a volume
+#### See VOLUME ["/app/KernetInfo-Parser"] a little further
 
 # Create directory for Linux kernel source (to be mounted as volume)
-RUN mkdir -p /app/linux
+RUN mkdir -p linux
 
 # Install Python dependencies
 RUN pip install --no-cache-dir \
@@ -59,13 +66,14 @@ RUN pip install --no-cache-dir \
 
 # Volume for Linux kernel source
 # Mount from host: -v ~/Downloads/linux-kernel:/app/linux
-VOLUME ["/app/linux"]
+VOLUME ["/app/KernelInfo-Parser/linux"]
+#### Option 3 - mountpoint
+VOLUME ["/app/KernelInfo-Parser"]
 
-# Default entrypoint
+RUN git config --global --add safe.directory /app/KernelInfo-Parser/linux/.git
+# Default entrypoint (we are still in the WORKDIR /app/KernelInfo-Parser)
 ENTRYPOINT ["python", "main.py"]
 
 # Usage:
-# Build: docker build --build-arg KERNELINFO-PARSER_VERSION=main -t KernelInfo-Parser .
-# Run:   docker run --add-host=host.docker.internal:host-gateway \
-#          -v ~/Downloads/linux-kernel:/app/linux \
-#          KernelInfo-Parser
+# Build: docker build --build-arg KERNELINFO_PARSER_VERSION=main -t kernelinfo-parser .
+# Run:   sudo docker run --add-host=host.docker.internal:host-gateway --tmpfs /dev/shm:rw,exec,size=1g  -v ~/Downloads/linux:/app/KernelInfo-Parser/linux  -v ~/Documents/dev/KernelInfo-Parser:/app/KernelInfo-Parser kernelinfo-parser
