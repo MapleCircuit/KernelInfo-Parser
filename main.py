@@ -11,6 +11,7 @@ import multiprocessing
 import clang.cindex
 import ctypes
 import os
+import argparse
 
 
 # Right now this only mutes (legacy) include errors that don't break everything
@@ -31,9 +32,9 @@ OVERRIDE_CINDEX_ERROR_PRINT = True
 OVERRIDE_CINDEX_SKIPPED_PRINT = True
 OVERRIDE_MAX_PRINT_SIZE = 60
 
-def emergency_shutdown():
+def emergency_shutdown(number_error=1):
 	mf.clear_all_version()
-	sys.exit(0)
+	sys.exit(number_error)
 	return
 
 class _MyBreak(Exception): pass
@@ -47,7 +48,7 @@ CXSourceRangeList_P = ctypes.POINTER(CXSourceRangeList)
 def green(string_arg):
 	return f"\033[92m{string_arg}\033[0m"
 def red(string_arg):
-	return f"\033[91m{string_arg}\033[0m"
+	return f"\033[93m{string_arg}\033[0m"
 def magenta(string_arg):
 	return f"\033[35m{string_arg}\033[0m"
 def cyan(string_arg):
@@ -492,7 +493,7 @@ class Great_Processor:
 		except Exception as e:
 			print("Error in gp.processing_changes()")
 			print(e)
-			emergency_shutdown()
+			emergency_shutdown(2)
 
 		del processes
 		multi_proc = False
@@ -563,7 +564,7 @@ class Great_Processor:
 		print("Great_Processor.execute() start")
 		if len(self.shared_set_list) != CPUS-1:
 			print(f"You have {len(self.shared_set_list)} set_list. We need {CPUS-1}!!! Exiting now!")
-			emergency_shutdown()
+			emergency_shutdown(3)
 		for remote_gp in self.shared_set_list:
 			self.main_dict.update(pickle.loads(remote_gp))
 		self.execute()
@@ -969,7 +970,7 @@ class Table:
 			print(f"Error happend while insert_set() in table:{self.table_name}")
 			print(db[1].statement)
 			print(e)
-			emergency_shutdown()
+			emergency_shutdown(4)
 		unset_db(db)
 		del self.set_table
 		self.set_table = {}
@@ -989,7 +990,7 @@ class Table:
 			print(f"Error happend while insert_update() in table:{self.table_name}")
 			print(db[1].statement)
 			print(e)
-			emergency_shutdown()
+			emergency_shutdown(5)
 		unset_db(db)
 		del self.update_table
 		self.update_table = {}
@@ -1145,10 +1146,10 @@ class Ast_Manager():
 				# Start #elifndef AND #elifdef
 				case "#elifndef":
 					print (f"SOME RETARDED DEVS, ADDED THIS FUCKING BULSHIT TO THEIR CODE: #elifndef , Line:{current_line+1}")
-					emergency_shutdown()
+					emergency_shutdown(6)
 				case "#elifdef":
 					print (f"SOME RETARDED DEVS, ADDED THIS FUCKING BULSHIT TO THEIR CODE: #elifdef , Line:{current_line+1}")
-					emergency_shutdown()
+					emergency_shutdown(7)
 				# End #elifndef AND #elifdef
 
 
@@ -1479,7 +1480,7 @@ class Ast_Manager():
 			else:
 				print("No Error Found")
 
-		emergency_shutdown()
+		emergency_shutdown(8)
 		return
 am = Ast_Manager()
 
@@ -1878,12 +1879,6 @@ def update(version):
 	# Pre-Processing
 	gp.create_new_vid(version)
 	mf.add_version()
-	#include/linux/netfilter_bridge/ebtables.h
-	#include/linux/lockd/bind.h
-	#include/linux/sched.h
-	am.ast_type("fs/ext4/symlink.c")
-	emergency_shutdown()
-
 
 	gp.create_new_tid(gp.vid)
 
@@ -1921,6 +1916,7 @@ def update(version):
 
 
 def main():
+	arg_handling()
 	gp.drop_all()
 	initialize_db()
 	update("v3.0") 
@@ -1929,9 +1925,35 @@ def main():
 	update("v3.3") 
 	update("v3.4") 
 	update("v3.5") 
-	sys.exit(99) 	# emergency_shutdown() is really violent. It even close the terminal windows. sys.exit() is softer  
+	emergency_shutdown(0)
 	return
 
+def arg_handling():
+	parser = argparse.ArgumentParser()
+	parser.add_argument("-D", "--Drop", help="Drop all tables", action='store_true')
+	parser.add_argument("-C", "--Create-Tables", help="Generate all tables", action='store_true')
+	parser.add_argument("-T", "--Test", help="Test/Parse a specific file")
+	args = parser.parse_args()
+
+	if args.Drop:
+		print("Dropping all tables")
+		gp.drop_all()
+		emergency_shutdown(0)
+	if args.Create_Tables:
+		initialize_db()
+		emergency_shutdown(0)
+	if args.Test:
+		gp.drop_all()
+		initialize_db()
+		gp.clear_fetch_all()
+		gp.create_new_vid("v3.0")
+		mf.add_version()
+		#include/linux/netfilter_bridge/ebtables.h
+		#include/linux/lockd/bind.h
+		#include/linux/sched.h
+		am.ast_type(args.Test)
+		emergency_shutdown(0)
+	return
 
 ##################################
 # DB STRUCTURE
