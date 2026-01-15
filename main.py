@@ -1,4 +1,4 @@
-from collections import namedtuple, deque
+from collections import namedtuple
 import mysql.connector
 from operator import itemgetter
 import subprocess as sp
@@ -554,7 +554,7 @@ class Great_Processor:
 		global multi_proc
 		multi_proc = False
 		for CS in self.main_dict.values():
-			x = []
+			x = [] # ruff F841 : unused will we need it? if not, no soup for you!
 			for item in CS.cs:
 				while item.__class__.__name__ == "Delayed_Executor":
 					item = item.process(CS.cs_result)
@@ -657,11 +657,11 @@ class Great_Processor:
 			sql_drop_print += f"`{table.table_name}`, "
 			sql_drop += f"`{table.table_name}`, "
 		print(sql_drop_print[:-2])
-		for x in range(3):
+		for _ in range(3): # ruff F841 we don't use the variable, so we dont need one. 
 			try:
 				execdb(db, sql_drop[:-2])
-			except Exception as e:
-				print("drop failed")
+			except Exception as e: 
+				print(f"drop failed : exception : {e}") 
 		unset_db(db)
 		return
 
@@ -765,7 +765,7 @@ class Table:
 		self.columns = tuple(temp_arr)
 
 		temp_arr_primary = []
-		temp_sql += f" PRIMARY KEY ("
+		temp_sql += " PRIMARY KEY (" 
 		for keys in self.init_primary:
 			temp_sql += f"{keys},"
 			temp_arr_primary.append(temp_arr.index(keys))
@@ -863,7 +863,7 @@ class Table:
 			if key_group in self.optimized_table:
 				if self.get_list:
 					get_array = []
-					if (keys := self.optimized_table[key_group].get(values)):
+					if (keys := self.optimized_table[key_group].get(values)): # ruff F841 : we dont use keys, we could not assign it
 						for key in self.optimized_table[key_group].get(values):
 							if (query_result := self.current_table.get(key)):
 								get_array.append(query_result)
@@ -1080,7 +1080,7 @@ class Master_File:
 						case _:
 							if not CLEAN_PRINT:
 								print(f"Unrecognised include: {item}")
-				except:
+				except Exception:
 					print(f"Unrecognised include causing an error: {item}")
 			for item in filter(str.strip, temp_arr):
 				path_arr = []
