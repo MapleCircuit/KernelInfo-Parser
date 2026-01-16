@@ -84,7 +84,7 @@ def good_looking_printing(object_name, pre_result = "", post_result = " "):
 	for key in vars(object_name):
 		if not getattr(object_name, key):
 			continue
-		if isinstance(getattr(object_name, key), list):
+		if (isinstance(getattr(object_name, key), list) or (isinstance(getattr(object_name, key), tuple))):
 			list_wait_arr.append(key)
 		else:
 			to_be_added = f"{magenta(key)}:{getattr(object_name, key)},"
@@ -193,6 +193,19 @@ class Ast_FUNCTION_DECL(Ast):
 		self.line = line
 		self.name = name
 		self.ast_type = ast_type
+
+class Ast_VAR_DECL(Ast):
+	def __init__(self, line, name, ast_type):
+		self.line = line
+		self.name = name
+		self.ast_type = ast_type
+
+class Ast_ENUM_DECL(Ast):
+	def __init__(self, line, name, enumerator_list):
+		self.line = line
+		self.name = name
+		self.enum_list = enumerator_list
+
 
 class Ast_Struct_FIELD_DECL(Ast):
 	def __init__(self, line, name, ast_type):
@@ -657,7 +670,8 @@ class Great_Processor:
 			sql_drop_print += f"`{table.table_name}`, "
 			sql_drop += f"`{table.table_name}`, "
 		print(sql_drop_print[:-2])
-		for _ in range(3): # ruff F841 we don't use the variable, so we dont need one. 
+		#for _ in range(3): # ruff F841 we don't use the variable, so we dont need one.
+		if True:
 			try:
 				execdb(db, sql_drop[:-2])
 			except Exception as e: 
@@ -1337,7 +1351,6 @@ class Ast_Manager():
 		if c_children_type.is_const_qualified():
 			ast_t.const = True
 
-		print(f"{c_children_type.kind}")
 		match c_children_type.kind:
 			case cc.TypeKind.FUNCTIONPROTO:
 				ast_t.type_style = Ast_Type_Function
@@ -1382,7 +1395,7 @@ class Ast_Manager():
 						continue
 			# END CHECK FOR STRUCT MEMBER WITHIN
 
-			print(f"   {member_decl.kind}---{member_decl.spelling}---{member_decl_type.get_declaration().spelling}")
+			#print(f"   {member_decl.kind}---{member_decl.spelling}---{member_decl_type.get_declaration().spelling}")
 
 
 			if cc.CursorKind.STRUCT_DECL == member_decl.kind:
@@ -1414,6 +1427,24 @@ class Ast_Manager():
 			self.ast_parse_function(c_children)
 		)
 
+	def ast_parse_var_decl(self, c_children):
+		return Ast_VAR_DECL(Line(c_children.extent),
+			c_children.spelling,
+			self.ast_type_getter(c_children)
+		)
+
+	def ast_parse_enum_decl(self, c_children):
+		print(f"{c_children.kind}---{c_children.spelling}")
+		enum_list = []
+		for kids in c_children.get_children():
+			if cc.CursorKind.ENUM_CONSTANT_DECL == kids.kind:
+				enum_list.append(kids.spelling)
+
+		return Ast_ENUM_DECL(Line(c_children.extent),
+			c_children.spelling,
+			tuple(enum_list)
+		)
+
 
 	def ast_parse(self, c_children):
 		print(f"{c_children.kind}---{c_children.spelling}")
@@ -1422,8 +1453,10 @@ class Ast_Manager():
 				return self.ast_parse_struct_decl(c_children)
 			case cc.CursorKind.FUNCTION_DECL:
 				return self.ast_parse_function_decl(c_children)
-
-
+			case cc.CursorKind.VAR_DECL:
+				return self.ast_parse_var_decl(c_children)
+			case cc.CursorKind.ENUM_DECL:
+				return self.ast_parse_enum_decl(c_children)
 		return
 
 
