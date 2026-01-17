@@ -37,6 +37,12 @@ def emergency_shutdown(number_error=1):
 	sys.exit(number_error)
 	return
 
+def BP():
+	print("=====BREAKPOINT=====\nc: Continue execution\nq: Quit the debugger\nn: Step to the next line within the same function\ns: Step to the next line in this function or a called function.")
+	sys.breakpointhook()
+	return
+
+
 class _MyBreak(Exception): pass
 
 
@@ -188,6 +194,17 @@ class Ast_STRUCT_DECL(Ast):
 		self.name = name
 		self.children = children
 
+class Ast_UNION_DECL(Ast):
+	def __init__(self, line, name=None, children=None):
+		if isinstance(line, Ast_STRUCT_DECL):
+			self.line = line.line
+			self.name = line.name
+			self.children = line.children
+		else:
+			self.line = line
+			self.name = name
+			self.children = children
+
 class Ast_FUNCTION_DECL(Ast):
 	def __init__(self, line, name, ast_type):
 		self.line = line
@@ -213,11 +230,11 @@ class Ast_Struct_FIELD_DECL(Ast):
 		self.name = name
 		self.ast_type = ast_type
 class Ast_Struct_STRUCT_DECL(Ast):
-	def __init__(self, line, name, ast_type, member=[]):
+	def __init__(self, line, name, ast_type):
 		self.line = line
 		self.name = name
 		self.ast_type = ast_type
-		self.member = member
+		self.member = []
 
 
 
@@ -236,6 +253,7 @@ class Ast_Type():
 		self.func_type = None
 		self.func_args = []
 		self.func_args_name = []
+		self.array = None
 
 		# Ast_Type_Pure, Ast_Type_Typedef, Ast_Type_Struct, Ast_Type_Function
 		self.type_name = None
@@ -1335,6 +1353,14 @@ class Ast_Manager():
 
 		c_children_type = c_children.type
 
+
+		### this  ALSO DOESN'T WORK WHEN ARRAY CONTAINS SOME RANDOM SHIT IN IT THAT IS NOT A NUMBER
+		### THIS SHIT PROBABLY NEEDS TO BE PART OF THE LOOP, good fucking job
+		array_count = c_children_type.get_array_size()
+		if array_count != -1:
+			ast_t.array = array_count
+			c_children_type = c_children_type.get_array_element_type()
+
 		while ((c_children_type.kind == cc.TypeKind.ELABORATED) or (c_children_type.kind == cc.TypeKind.POINTER)):
 			# START POINTER HANDLING
 			if c_children_type.kind == cc.TypeKind.POINTER:
@@ -1350,6 +1376,11 @@ class Ast_Manager():
 
 		if c_children_type.is_const_qualified():
 			ast_t.const = True
+
+
+
+
+
 
 		match c_children_type.kind:
 			case cc.TypeKind.FUNCTIONPROTO:
@@ -1391,7 +1422,7 @@ class Ast_Manager():
 				if children[-1].__class__.__name__ == "Ast_Struct_STRUCT_DECL":
 					if f"{member_decl_type.get_declaration().spelling}" == children[-1].name:
 						#NAME OF WHATEVER THE FUCK + INFO
-						children[-1].member.append(f"{member_decl.spelling}")
+						children[-1].member.append(member_decl.spelling)
 						continue
 			# END CHECK FOR STRUCT MEMBER WITHIN
 
@@ -1434,7 +1465,6 @@ class Ast_Manager():
 		)
 
 	def ast_parse_enum_decl(self, c_children):
-		print(f"{c_children.kind}---{c_children.spelling}")
 		enum_list = []
 		for kids in c_children.get_children():
 			if cc.CursorKind.ENUM_CONSTANT_DECL == kids.kind:
@@ -1445,9 +1475,8 @@ class Ast_Manager():
 			tuple(enum_list)
 		)
 
-
 	def ast_parse(self, c_children):
-		print(f"{c_children.kind}---{c_children.spelling}")
+		#print(f"{c_children.kind}---{c_children.spelling}")
 		match c_children.kind:
 			case cc.CursorKind.STRUCT_DECL:
 				return self.ast_parse_struct_decl(c_children)
@@ -1457,6 +1486,16 @@ class Ast_Manager():
 				return self.ast_parse_var_decl(c_children)
 			case cc.CursorKind.ENUM_DECL:
 				return self.ast_parse_enum_decl(c_children)
+			case cc.CursorKind.UNION_DECL:
+				return Ast_UNION_DECL(self.ast_parse_struct_decl(c_children))
+			case cc.CursorKind.MACRO_DEFINITION:
+				return
+			case cc.CursorKind.MACRO_INSTANTIATION:
+				return
+			case cc.CursorKind.INCLUSION_DIRECTIVE:
+				return
+			case _:
+				print(f"{c_children.kind}---{c_children.spelling}")
 		return
 
 
