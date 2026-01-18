@@ -12,8 +12,7 @@ import clang.cindex as cc
 import ctypes
 import os
 import argparse
-
-
+from StringWrangler import wrap_lines, render_ansi_box, render_with_indent
 # Right now this only mutes (legacy) include errors that don't break everything
 CLEAN_PRINT = True
 
@@ -43,16 +42,20 @@ def BP():
 	return
 
 
-def String_shortner(text):
-	#if  (OVERRIDE_MAX_PRINT_SIZE*1.5) > len(text):
-	#	return text
-	#MBEfix
-	#return [text[i:i + OVERRIDE_MAX_PRINT_SIZE] for i in range(0, len(text), OVERRIDE_MAX_PRINT_SIZE)]
-	return text
-	#return [text[i:i + int(OVERRIDE_MAX_PRINT_SIZE*1.5)] for i in range(0, len(text), int(OVERRIDE_MAX_PRINT_SIZE*1.5))]
-
-
-
+def String_shortner(text,mode="boxed+indent"):
+	formated_text = ""
+	wrapped_text = wrap_lines([text],OVERRIDE_MAX_PRINT_SIZE+(OVERRIDE_MAX_PRINT_SIZE/2))
+	
+	if mode == "boxed":
+		formated_list = render_ansi_box(wrapped_text)
+	elif mode == "indent":
+		formated_list = render_with_indent(wrapped_text, "    > ")
+	elif mode == "boxed+indent":
+		formated_list = render_ansi_box(render_with_indent(wrapped_text, "    > "))
+	
+	for line in formated_list[0]:
+		formated_text = f"{formated_text}\n{line}"
+	return formated_text
 
 
 class _MyBreak(Exception): pass
@@ -1375,8 +1378,8 @@ class Ast_Manager():
 			c_children_type = c_children_type.get_array_element_type()
 
 		if c_children.spelling == "stack":
-			BP()
-
+			#BP()
+			pass
 
 		try:
 			#FUCKING ARRAY TEST
@@ -2036,6 +2039,25 @@ def update(version):
 
 
 def main():
+	# demo String_shortner
+
+	def random_line(min_chars=500, max_chars=2000):
+		import random, string
+		words = []
+		total_len = 0
+
+		while total_len < min_chars :
+			word = "".join(random.choices(string.ascii_lowercase, k=random.randint(10, 30))) # k=length
+			words.append(word)
+			total_len += len(word) + 1  # + space
+
+		return " ".join(words)[:max_chars]
+
+	demo_data = random_line()
+	print(demo_data)
+	print(String_shortner(demo_data)) # default is mode="boxed+indent". other mode are : "boxed", "indent". 
+	# end of demo String_shortner
+
 	arg_handling()
 	gp.drop_all()
 	initialize_db()
