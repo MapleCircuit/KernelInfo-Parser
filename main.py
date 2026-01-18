@@ -43,6 +43,18 @@ def BP():
 	return
 
 
+def String_shortner(text):
+	#if  (OVERRIDE_MAX_PRINT_SIZE*1.5) > len(text):
+	#	return text
+	#MBEfix
+	#return [text[i:i + OVERRIDE_MAX_PRINT_SIZE] for i in range(0, len(text), OVERRIDE_MAX_PRINT_SIZE)]
+	return text
+	#return [text[i:i + int(OVERRIDE_MAX_PRINT_SIZE*1.5)] for i in range(0, len(text), int(OVERRIDE_MAX_PRINT_SIZE*1.5))]
+
+
+
+
+
 class _MyBreak(Exception): pass
 
 
@@ -247,6 +259,7 @@ class Ast_Type():
 		self.pointer = False
 		self.pointer_const = False
 		self.const = False
+		self.debug = None
 		# Ast_Type_Pure
 		self.pure_kind = None
 		# Ast_Type_Function
@@ -1361,6 +1374,21 @@ class Ast_Manager():
 			ast_t.array = array_count
 			c_children_type = c_children_type.get_array_element_type()
 
+		if c_children.spelling == "stack":
+			BP()
+
+
+		try:
+			#FUCKING ARRAY TEST
+			fucjk_line = mf.get_file(self.file_path, self.version).splitlines()[c_children.extent.end.line-1][c_children.extent.end.column-1:].lstrip()
+
+			if fucjk_line[0] == "[":
+				ast_t.array = True
+				ast_t.array_expr = fucjk_line[1:fucjk_line.find("]")]
+		except IndexError:
+			print("")
+
+
 		while ((c_children_type.kind == cc.TypeKind.ELABORATED) or (c_children_type.kind == cc.TypeKind.POINTER)):
 			# START POINTER HANDLING
 			if c_children_type.kind == cc.TypeKind.POINTER:
@@ -1376,10 +1404,6 @@ class Ast_Manager():
 
 		if c_children_type.is_const_qualified():
 			ast_t.const = True
-
-
-
-
 
 
 		match c_children_type.kind:
@@ -1487,6 +1511,7 @@ class Ast_Manager():
 			case cc.CursorKind.ENUM_DECL:
 				return self.ast_parse_enum_decl(c_children)
 			case cc.CursorKind.UNION_DECL:
+				#BP()
 				return Ast_UNION_DECL(self.ast_parse_struct_decl(c_children))
 			case cc.CursorKind.MACRO_DEFINITION:
 				return
@@ -1503,6 +1528,9 @@ class Ast_Manager():
 	def ast_type(self, file_path, version=None):
 		if version is None:
 			version=gp.version_name
+
+		self.file_path = file_path
+		self.version = version
 
 		current_file = mf.get_file(file_path, version)
 		cppro_parse_r = self.cppro_parse(current_file, file_path)
@@ -1521,7 +1549,7 @@ class Ast_Manager():
 		# Initialize the Clang index
 		index = cc.Index.create()
 
-		translation_unit = index.parse(f"{mf.version_dict[version]}/{file_path}", args=[
+		translation_unit = index.parse(f"{mf.version_dict[version]}/{file_path}", args=["-ferror-limit=0",
 			"-D__KERNEL__",*cppro_cindex_input,#"-nostdinc",
 			f'-I{mf.version_dict[version]}/{"/".join(file_path.split("/")[:-1])}',
 			f"-I{mf.version_dict[version]}/include",
@@ -1565,7 +1593,10 @@ class Ast_Manager():
 			if translation_unit.diagnostics:
 				print(red("Found Errors:"))
 				for diag in translation_unit.diagnostics:
-					print(f"  - {diag.spelling} (Line:{diag.location.line} File:{diag.location.file})")
+					print(String_shortner(f"  - {diag.spelling} (Line:{diag.location.line})"))
+						#File:{diag.location.file}
+
+
 			else:
 				print("No Error Found")
 
