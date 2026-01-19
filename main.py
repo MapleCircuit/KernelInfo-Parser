@@ -16,6 +16,10 @@ from StringWrangler import wrap_lines, render_ansi_box, render_with_indent
 # Right now this only mutes (legacy) include errors that don't break everything
 CLEAN_PRINT = True
 
+#    =========>enumerate()<=========
+
+
+
 RAMDISK = "/dev/shm"
 CPUS = 8
 linux_directory = Path('linux')
@@ -1369,6 +1373,12 @@ class Ast_Manager():
 
 		c_children_type = c_children.type
 
+		#####################################THIS IS FUCKED, PLS FIX, THANKS
+		fucked = []
+		for x in range(c_children.extent.start.line,c_children.extent.end.line):
+			if self.diag_dict.get(x):
+				fucked.append(self.diag[self.diag_dict[x]])
+		ast_t.debug = fucked
 
 		### this  ALSO DOESN'T WORK WHEN ARRAY CONTAINS SOME RANDOM SHIT IN IT THAT IS NOT A NUMBER
 		### THIS SHIT PROBABLY NEEDS TO BE PART OF THE LOOP, good fucking job
@@ -1382,14 +1392,15 @@ class Ast_Manager():
 			pass
 
 		try:
-			#FUCKING ARRAY TEST
-			fucjk_line = mf.get_file(self.file_path, self.version).splitlines()[c_children.extent.end.line-1][c_children.extent.end.column-1:].lstrip()
+			if fucked:
+				#FUCKING ARRAY TEST
+				fucjk_line = mf.get_file(self.file_path, self.version).splitlines()[c_children.extent.end.line-1][c_children.extent.end.column-1:].lstrip()
 
-			if fucjk_line[0] == "[":
-				ast_t.array = True
-				ast_t.array_expr = fucjk_line[1:fucjk_line.find("]")]
+				if fucjk_line[0] == "[":
+					ast_t.array = True
+					ast_t.array_expr = fucjk_line[1:fucjk_line.find("]")]
 		except IndexError:
-			print("")
+			pass
 
 
 		while ((c_children_type.kind == cc.TypeKind.ELABORATED) or (c_children_type.kind == cc.TypeKind.POINTER)):
@@ -1526,6 +1537,14 @@ class Ast_Manager():
 				print(f"{c_children.kind}---{c_children.spelling}")
 		return
 
+	def diag_process(self, diags):
+		current_file = f"{mf.version_dict[self.version]}/{self.file_path}"
+		for x, diag in enumerate(diags):
+			#itterrate iterate itterate iterrate enumarate
+			if str(diag.location.file) == current_file:
+				self.diag_dict[diag.location.line] = x
+
+		return
 
 	# include/linux/lockd/bind.h
 	def ast_type(self, file_path, version=None):
@@ -1552,13 +1571,17 @@ class Ast_Manager():
 		# Initialize the Clang index
 		index = cc.Index.create()
 
-		translation_unit = index.parse(f"{mf.version_dict[version]}/{file_path}", args=["-ferror-limit=0",
+		translation_unit = index.parse(f"{mf.version_dict[version]}/{file_path}", args=["-ferror-limit=0","-M","-MG","-Wall",
 			"-D__KERNEL__",*cppro_cindex_input,#"-nostdinc",
 			f'-I{mf.version_dict[version]}/{"/".join(file_path.split("/")[:-1])}',
 			f"-I{mf.version_dict[version]}/include",
 			f"-I{mf.version_dict[version]}/include/uapi"
 		],
 		options=cc.TranslationUnit.PARSE_DETAILED_PROCESSING_RECORD)
+
+		self.diag = tuple(translation_unit.diagnostics)
+		self.diag_dict = {}
+		self.diag_process(self.diag)
 
 		#######################################################################
 		cc.conf.lib.clang_getSkippedRanges.restype = CXSourceRangeList_P#
@@ -1591,13 +1614,27 @@ class Ast_Manager():
 		for x in processing_list:
 			print(x)
 
+		def type_of_warning(argx):
+			match argx:
+				case 0:
+					return "Ignored"
+				case 1:
+					return "Note"
+				case 2:
+					return "Warning"
+				case 3:
+					return "Error"
+				case 4:
+					return "Fatal"
+			return "WTF IS THIS"
+
 		if OVERRIDE_CINDEX_ERROR_PRINT:
 			print(green("=======Cindex Errors======="))
-			if translation_unit.diagnostics:
+			if self.diag:
 				print(red("Found Errors:"))
-				for diag in translation_unit.diagnostics:
-					print(String_shortner(f"  - {diag.spelling} (Line:{diag.location.line})"))
-						#File:{diag.location.file}
+				for diag in self.diag:
+					print(String_shortner(f"[{type_of_warning(diag.severity)}] - {diag.spelling} (Line:{diag.location.line} File:{diag.location.file})", "indent"))
+
 
 
 			else:
@@ -2041,21 +2078,21 @@ def update(version):
 def main():
 	# demo String_shortner
 
-	def random_line(min_chars=500, max_chars=2000):
-		import random, string
-		words = []
-		total_len = 0
+	#def random_line(min_chars=500, max_chars=2000):
+	#	import random, string
+	#	words = []
+	#	total_len = 0
 
-		while total_len < min_chars :
-			word = "".join(random.choices(string.ascii_lowercase, k=random.randint(10, 30))) # k=length
-			words.append(word)
-			total_len += len(word) + 1  # + space
+	#	while total_len < min_chars :
+	#		word = "".join(random.choices(string.ascii_lowercase, k=random.randint(10, 30))) # k=length
+	#		words.append(word)
+	#		total_len += len(word) + 1  # + space
 
-		return " ".join(words)[:max_chars]
+	#	return " ".join(words)[:max_chars]
 
-	demo_data = random_line()
-	print(demo_data)
-	print(String_shortner(demo_data)) # default is mode="boxed+indent". other mode are : "boxed", "indent". 
+	#demo_data = random_line()
+	#print(demo_data)
+	#print(String_shortner(demo_data)) # default is mode="boxed+indent". other mode are : "boxed", "indent".
 	# end of demo String_shortner
 
 	arg_handling()
