@@ -1356,15 +1356,24 @@ class Ast_Manager():
 			ast_t = Ast_Type()
 		ast_t.type_style = Ast_Type_Function
 
+		if c_children.spelling == "kstack_end":
+			for shit in c_children.get_children():
+				print(f"{shit.spelling}===={shit.kind}===={shit.type.kind}")
+
 		for kids in c_children.get_children():
-			if kids.kind == cc.CursorKind.COMPOUND_STMT:
-				continue
-			if f"{kids.kind}" == "CursorKind.TYPE_REF":
-				ast_t.func_type = self.ast_type_getter(kids)
-				continue
-			ast_t.func_args.append(self.ast_type_getter(kids))
-			if kids.spelling != "":
-				ast_t.func_args_name.append(kids.spelling)
+			match kids.kind:
+				case cc.CursorKind.COMPOUND_STMT:
+					continue
+				case cc.CursorKind.TYPE_REF:
+					ast_t.func_type = self.ast_type_getter(kids)
+					continue
+				case cc.CursorKind.PARM_DECL:
+					ast_t.func_args.append(self.ast_type_getter(kids))
+					if kids.spelling != "":
+						ast_t.func_args_name.append(kids.spelling)
+					continue
+
+
 		return ast_t
 
 	def ast_type_getter(self, c_children, ast_t=None):
@@ -1375,10 +1384,10 @@ class Ast_Manager():
 
 		#####################################THIS IS FUCKED, PLS FIX, THANKS
 		fucked = []
-		for x in range(c_children.extent.start.line,c_children.extent.end.line):
+		for x in range(c_children.extent.start.line,c_children.extent.end.line+1):
 			if self.diag_dict.get(x):
-				fucked.append(self.diag[self.diag_dict[x]])
-		ast_t.debug = fucked
+				fucked.append(str(self.diag[self.diag_dict[x]]))
+		ast_t.debug = tuple(map(lambda x: x[x.find(" ")+1:], fucked))
 
 		### this  ALSO DOESN'T WORK WHEN ARRAY CONTAINS SOME RANDOM SHIT IN IT THAT IS NOT A NUMBER
 		### THIS SHIT PROBABLY NEEDS TO BE PART OF THE LOOP, good fucking job
