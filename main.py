@@ -17,7 +17,8 @@ from StringWrangler import wrap_lines, render_ansi_box, render_with_indent
 CLEAN_PRINT = True
 
 #    =========>enumerate()<=========
-
+# THINGS THAT WE NEED TO SOLVE
+# GCC COMPILE ARGS DETECTION __attribute__
 
 
 RAMDISK = "/dev/shm"
@@ -236,11 +237,26 @@ class Ast_VAR_DECL(Ast):
 		self.name = name
 		self.ast_type = ast_type
 
+class Ast_TYPEDEF_DECL(Ast):
+	def __init__(self, line, name, ast_type):
+		self.line = line
+		self.name = name
+		self.ast_type = ast_type
+
+
 class Ast_ENUM_DECL(Ast):
 	def __init__(self, line, name, enumerator_list):
 		self.line = line
 		self.name = name
 		self.enum_list = enumerator_list
+
+class Ast_MACRO_INSTANTIATION(Ast):
+	def __init__(self, line, name, filename, args):
+		self.line = line
+		self.name = name
+		self.filename = filename
+		self.args = args
+
 
 
 class Ast_Struct_FIELD_DECL(Ast):
@@ -1356,9 +1372,10 @@ class Ast_Manager():
 			ast_t = Ast_Type()
 		ast_t.type_style = Ast_Type_Function
 
-		if c_children.spelling == "kstack_end":
-			for shit in c_children.get_children():
-				print(f"{shit.spelling}===={shit.kind}===={shit.type.kind}")
+		# DEBUG
+		#if c_children.spelling == "kstack_end":
+		#	for shit in c_children.get_children():
+		#		print(f"{shit.spelling}===={shit.kind}===={shit.type.kind}")
 
 		for kids in c_children.get_children():
 			match kids.kind:
@@ -1376,11 +1393,14 @@ class Ast_Manager():
 
 		return ast_t
 
-	def ast_type_getter(self, c_children, ast_t=None):
+	def ast_type_getter(self, c_children, ast_t=None, bypass_type=None):
 		if ast_t is None:
 			ast_t = Ast_Type()
 
-		c_children_type = c_children.type
+		if bypass_type:
+			c_children_type = bypass_type
+		else:
+			c_children_type = c_children.type
 
 		#####################################THIS IS FUCKED, PLS FIX, THANKS
 		fucked = []
@@ -1522,6 +1542,51 @@ class Ast_Manager():
 			tuple(enum_list)
 		)
 
+	def ast_parse_macro_instantiation(self, c_children):
+		args = False
+		name = c_children.spelling
+		excluded_keywords = {"inline"}
+		if name in excluded_keywords:
+			return #SPECIAL OUTPUT
+
+		filename = str(c_children.get_definition().extent.start.file)[len(str(mf.version_dict[self.version]))+1:]
+		if filename == self.file_path:
+			filename = None
+
+		if len(name) == (c_children.extent.end.column - c_children.extent.start.column):
+			return Ast_MACRO_INSTANTIATION(
+				Line(c_children.extent),
+				c_children.spelling,
+				filename,
+				None
+			)
+
+		try:
+			args = mf.get_file(self.file_path, self.version).splitlines()[c_children.extent.end.line-1][c_children.extent.start.column-1+len(name):c_children.extent.end.column-1]
+
+		except IndexError:
+			return Ast_MACRO_INSTANTIATION(
+				Line(c_children.extent),
+				c_children.spelling,
+				filename,
+				None
+			)
+
+		return Ast_MACRO_INSTANTIATION(
+			Line(c_children.extent),
+			c_children.spelling,
+			filename,
+			args
+			)
+
+	def ast_parse_typedef_decl(self, c_children):
+		return Ast_TYPEDEF_DECL(
+			Line(c_children.extent),
+			c_children.spelling,
+			self.ast_type_getter(c_children, None, c_children.underlying_typedef_type)
+		)
+
+
 	def ast_parse(self, c_children):
 		#print(f"{c_children.kind}---{c_children.spelling}")
 		match c_children.kind:
@@ -1534,13 +1599,14 @@ class Ast_Manager():
 			case cc.CursorKind.ENUM_DECL:
 				return self.ast_parse_enum_decl(c_children)
 			case cc.CursorKind.UNION_DECL:
-				#BP()
 				return Ast_UNION_DECL(self.ast_parse_struct_decl(c_children))
-			case cc.CursorKind.MACRO_DEFINITION:
-				return
+			case cc.CursorKind.TYPEDEF_DECL:
+				return self.ast_parse_typedef_decl(c_children)
 			case cc.CursorKind.MACRO_INSTANTIATION:
-				return
+				return self.ast_parse_macro_instantiation(c_children)
 			case cc.CursorKind.INCLUSION_DIRECTIVE:
+				return
+			case cc.CursorKind.MACRO_DEFINITION:
 				return
 			case _:
 				print(f"{c_children.kind}---{c_children.spelling}")
@@ -1573,7 +1639,8 @@ class Ast_Manager():
 			print(green("=======End CPPro Result======="))
 
 		cppro_cindex_input = []
-		if OVERRIDE_CPPRO_CINDEX_INPUT:
+		#if OVERRIDE_CPPRO_CINDEX_INPUT:
+		if False:
 			for ifdefs in filter(lambda x: x.__class__.__name__ == "CPPro_ifdef", cppro_parse_r):
 				cppro_cindex_input.append(f"-D{ifdefs.identifier}")
 
@@ -1586,7 +1653,7 @@ class Ast_Manager():
 			f"-I{mf.version_dict[version]}/include",
 			f"-I{mf.version_dict[version]}/include/uapi"
 		],
-		options=cc.TranslationUnit.PARSE_DETAILED_PROCESSING_RECORD)
+		options=(cc.TranslationUnit.PARSE_DETAILED_PROCESSING_RECORD+32768))
 
 		self.diag = tuple(translation_unit.diagnostics)
 		self.diag_dict = {}
