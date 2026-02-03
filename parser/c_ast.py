@@ -75,10 +75,45 @@ class Line:
 				self.line_pos = (args[0], args[1])
 				self.char_pos = (args[2], args[3])
 
+	# Code Capture
+	def cc(self, rawfile):
+		split_rawfile = rawfile.splitlines()
+
+		if self.char_pos[0] == 0:
+			char_start = 0
+		else:
+			char_start = self.char_pos[0] - 1
+
+		if self.char_pos[1] == 0:
+			char_end = 0
+		else:
+			char_end = self.char_pos[1] - 1
+
+		#Line Select
+		try:
+			if self.line_pos[0] == self.line_pos[1]:
+				self.code = split_rawfile[self.line_pos[0]-1]
+			else:
+				self.code = "\n".join(split_rawfile[self.line_pos[0]-1:self.line_pos[1]])
+		except IndexError:
+			self.code = None
+			return self
+
+		#  Char1 Trim
+		try:
+			self.code = self.code[char_start:(char_end - len(split_rawfile[self.line_pos[1]-1]))]
+		except IndexError:
+			self.code = None
+		return self
 
 	def __str__(self):
 		if (self.line_pos == (0,0)) and (self.char_pos == (0,0)):
 			return "None"
+
+		if OVERRIDE_C_AST_LINE_PRINT:
+			if "code" in vars(self):
+				return f"(S{self.line_pos[0]}[{self.char_pos[0]}], E{self.line_pos[1]}[{self.char_pos[1]}], C­<{self.code}>)"
+
 		return f"(S{self.line_pos[0]}[{self.char_pos[0]}], E{self.line_pos[1]}[{self.char_pos[1]}])"
 
 
@@ -327,17 +362,17 @@ class Ast_Manager():
 
 				# Start #ifdef
 				case "#ifdef":
-					return CPPro_ifdef(Line(current_line+1, current_line+1+loopval), working_line[6:].lstrip())
+					return CPPro_ifdef(Line(current_line+1, current_line+1+loopval).cc(self.rawfile), working_line[6:].lstrip())
 				# End #ifdef
 
 				# Start #ifndef
 				case "#ifndef":
-					return CPPro_ifndef(Line(current_line+1, current_line+1+loopval), working_line[7:].lstrip())
+					return CPPro_ifndef(Line(current_line+1, current_line+1+loopval).cc(self.rawfile), working_line[7:].lstrip())
 				# End #ifndef
 
 				# Start #if
 				case "#if":
-					return CPPro_if(Line(current_line+1, current_line+1+loopval), working_line[3:].lstrip())
+					return CPPro_if(Line(current_line+1, current_line+1+loopval).cc(self.rawfile), working_line[3:].lstrip())
 				# End #if
 
 				# Start #elifndef AND #elifdef
@@ -352,17 +387,17 @@ class Ast_Manager():
 
 				# Start #elif
 				case "#elif":
-					return CPPro_elif(Line(current_line+1, current_line+1+loopval), working_line[5:].lstrip())
+					return CPPro_elif(Line(current_line+1, current_line+1+loopval).cc(self.rawfile), working_line[5:].lstrip())
 				# End #elif
 
 				# Start #else
 				case "#else":
-					return CPPro_else(Line(current_line+1, current_line+1+loopval))
+					return CPPro_else(Line(current_line+1, current_line+1+loopval).cc(self.rawfile))
 				# End #else
 
 				# Start #endif
 				case "#endif":
-					return CPPro_endif(Line(current_line+1, current_line+1+loopval))
+					return CPPro_endif(Line(current_line+1, current_line+1+loopval).cc(self.rawfile))
 				# End #endif
 
 				# Start #define
@@ -395,19 +430,19 @@ class Ast_Manager():
 					if arg_two == "":
 						arg_two = None
 
-					return CPPro_define(Line(current_line+1, current_line+1+loopval), arg_one, arg_two)
+					return CPPro_define(Line(current_line+1, current_line+1+loopval).cc(self.rawfile), arg_one, arg_two)
 				# End #define
 
 				# Start #undef
 				case "#undef":
-					return CPPro_undef(Line(current_line+1, current_line+1+loopval), working_line[6:].lstrip())
+					return CPPro_undef(Line(current_line+1, current_line+1+loopval).cc(self.rawfile), working_line[6:].lstrip())
 				# End #undef
 
 				# Start #include
 				case "#include":
 					working_line = working_line[8:].lstrip()
 					if working_line == "":
-						return CPPro_include(Line(current_line+1, current_line+1+loopval), "", "")
+						return CPPro_include(Line(current_line+1, current_line+1+loopval).cc(self.rawfile), "", "")
 
 					if working_line[0] == "\"":
 						written_include = "\""
@@ -424,7 +459,7 @@ class Ast_Manager():
 							if line_char == ">":
 								break
 					else:
-						return CPPro_include(Line(current_line+1, current_line+1+loopval), "", "")
+						return CPPro_include(Line(current_line+1, current_line+1+loopval).cc(self.rawfile), "", "")
 
 					# PARSE THE ACTUAL INCLUDE
 					written_include[1:-2]
@@ -440,7 +475,7 @@ class Ast_Manager():
 						else:
 							path_arr.append(chunk)
 
-					return CPPro_include(Line(current_line+1, current_line+1+loopval), written_include, "/".join(path_arr[::-1]))
+					return CPPro_include(Line(current_line+1, current_line+1+loopval).cc(self.rawfile), written_include, "/".join(path_arr[::-1]))
 				# End #include
 
 				# Start #line
@@ -453,17 +488,17 @@ class Ast_Manager():
 					except IndexError:
 						filename = None
 
-					return CPPro_line(Line(current_line+1, current_line+1+loopval), int(lineno), filename)
+					return CPPro_line(Line(current_line+1, current_line+1+loopval).cc(self.rawfile), int(lineno), filename)
 				# End #line
 
 				# Start #error
 				case "#error":
-					return CPPro_error(Line(current_line+1, current_line+1+loopval), working_line[6:].lstrip().rstrip())
+					return CPPro_error(Line(current_line+1, current_line+1+loopval).cc(self.rawfile), working_line[6:].lstrip().rstrip())
 				# End #error
 
 				# Start #pragma
 				case "#pragma":
-					return CPPro_pragma(Line(current_line+1, current_line+1+loopval), working_line[7:].lstrip())
+					return CPPro_pragma(Line(current_line+1, current_line+1+loopval).cc(self.rawfile), working_line[7:].lstrip())
 				# End #pragma
 
 		except IndexError:
@@ -619,13 +654,13 @@ class Ast_Manager():
 
 			if cc.CursorKind.STRUCT_DECL == member_decl.kind:
 				children.append(Ast_Struct_STRUCT_DECL(
-					Line(member_decl.extent),
+					Line(member_decl.extent).cc(self.rawfile),
 					member_decl.spelling,
 					ast_t
 				))
 			elif cc.CursorKind.FIELD_DECL == member_decl.kind:
 				children.append(Ast_Struct_FIELD_DECL(
-					Line(member_decl.extent),
+					Line(member_decl.extent).cc(self.rawfile),
 					member_decl.spelling,
 					ast_t
 				))
@@ -634,20 +669,20 @@ class Ast_Manager():
 			children = None
 
 		return Ast_STRUCT_DECL(
-			Line(c_children.extent),
+			Line(c_children.extent).cc(self.rawfile),
 			c_children.spelling,
 			children
 		)
 
 
 	def ast_parse_function_decl(self, c_children):
-		return Ast_FUNCTION_DECL(Line(c_children.extent),
+		return Ast_FUNCTION_DECL(Line(c_children.extent).cc(self.rawfile),
 			c_children.spelling,
 			self.ast_parse_function(c_children)
 		)
 
 	def ast_parse_var_decl(self, c_children):
-		return Ast_VAR_DECL(Line(c_children.extent),
+		return Ast_VAR_DECL(Line(c_children.extent).cc(self.rawfile),
 			c_children.spelling,
 			self.ast_type_getter(c_children)
 		)
@@ -658,7 +693,7 @@ class Ast_Manager():
 			if cc.CursorKind.ENUM_CONSTANT_DECL == kids.kind:
 				enum_list.append(kids.spelling)
 
-		return Ast_ENUM_DECL(Line(c_children.extent),
+		return Ast_ENUM_DECL(Line(c_children.extent).cc(self.rawfile),
 			c_children.spelling,
 			tuple(enum_list)
 		)
@@ -676,7 +711,7 @@ class Ast_Manager():
 
 		if len(name) == (c_children.extent.end.column - c_children.extent.start.column):
 			return Ast_MACRO_INSTANTIATION(
-				Line(c_children.extent),
+				Line(c_children.extent).cc(self.rawfile),
 				c_children.spelling,
 				filename,
 				None
@@ -687,14 +722,14 @@ class Ast_Manager():
 
 		except IndexError:
 			return Ast_MACRO_INSTANTIATION(
-				Line(c_children.extent),
+				Line(c_children.extent).cc(self.rawfile),
 				c_children.spelling,
 				filename,
 				None
 			)
 
 		return Ast_MACRO_INSTANTIATION(
-			Line(c_children.extent),
+			Line(c_children.extent).cc(self.rawfile),
 			c_children.spelling,
 			filename,
 			args
@@ -702,7 +737,7 @@ class Ast_Manager():
 
 	def ast_parse_typedef_decl(self, c_children):
 		return Ast_TYPEDEF_DECL(
-			Line(c_children.extent),
+			Line(c_children.extent).cc(self.rawfile),
 			c_children.spelling,
 			self.ast_type_getter(c_children, None, c_children.underlying_typedef_type)
 		)
