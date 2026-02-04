@@ -79,16 +79,6 @@ class Line:
 	def cc(self, rawfile):
 		split_rawfile = rawfile.splitlines()
 
-		if self.char_pos[0] == 0:
-			char_start = 0
-		else:
-			char_start = self.char_pos[0] - 1
-
-		if self.char_pos[1] == 0:
-			char_end = 0
-		else:
-			char_end = self.char_pos[1] - 1
-
 		#Line Select
 		try:
 			if self.line_pos[0] == self.line_pos[1]:
@@ -99,11 +89,22 @@ class Line:
 			self.code = None
 			return self
 
-		#  Char1 Trim
-		try:
-			self.code = self.code[char_start:(char_end - len(split_rawfile[self.line_pos[1]-1]))]
-		except IndexError:
-			self.code = None
+
+		if self.char_pos[0] == 0:
+			char_start = 0
+		else:
+			char_start = self.char_pos[0] - 1
+
+		if self.char_pos[1] == 0:
+			self.code = self.code[char_start:]
+		else:
+			char_end = self.char_pos[1] - 1
+
+			#  Char Trim
+			try:
+				self.code = self.code[char_start:(char_end - len(split_rawfile[self.line_pos[1]-1]))]
+			except IndexError:
+				self.code = None
 		return self
 
 	def __str__(self):
@@ -116,9 +117,10 @@ class Line:
 
 		return f"(S{self.line_pos[0]}[{self.char_pos[0]}], E{self.line_pos[1]}[{self.char_pos[1]}])"
 
+class Highlight(Line):pass
+
 
 class Ast:
-
 	def __str__(self):
 		return good_looking_printing(self, red(f"\n{type(self).__name__}: "))
 
@@ -511,7 +513,6 @@ class Ast_Manager():
 		current_file = commentRemover(current_file).splitlines()
 
 		result_arr = []
-
 		bypass_num = 0
 		for shit in range(len(current_file)):
 			if shit<bypass_num:
@@ -782,12 +783,6 @@ class Ast_Manager():
 		current_file = self.rawfile
 		cppro_parse_r = self.cppro_parse(current_file, self.filename)
 
-		if OVERRIDE_CPPRO_PRINT:
-			print(green("=======Start CPPro Result======="))
-			for cppro_elements in cppro_parse_r:
-				print(f"{cppro_elements}")
-			print(green("=======End CPPro Result======="))
-
 		cppro_cindex_input = []
 		#if OVERRIDE_CPPRO_CINDEX_INPUT:
 		if False:
@@ -834,6 +829,12 @@ class Ast_Manager():
 			if f"{kids.location.file}" == self.fullfilename:
 				if (result := self.ast_parse(kids)):
 					processing_list.append(result)
+
+		if OVERRIDE_CPPRO_PRINT:
+			print(green("=======Start CPPro Result======="))
+			for cppro_elements in cppro_parse_r:
+				print(f"{cppro_elements}")
+			print(green("=======End CPPro Result======="))
 
 		print(green("======PRINT LOOP======"))
 		# PRINT LOOP
