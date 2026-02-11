@@ -1,5 +1,6 @@
 from globalstuff import *
 
+import types
 from collections import namedtuple
 import mysql.connector
 from operator import itemgetter
@@ -109,6 +110,7 @@ class Great_Processor:
 		return state
 
 	def create_new_vid(self, name):
+		m_v_main.clear_fetch()
 		self.old_version_name = self.version_name
 		self.version_name = name
 		self.old_vid = self.vid
@@ -198,7 +200,7 @@ class Great_Processor:
 				m_file.update(
 					old_bf.fid,
 					None,
-					gp.vid,
+					gp.old_vid,
 					None,
 					None,
 					"R"
@@ -255,13 +257,16 @@ class Great_Processor:
 		forgotten_delete = ((old_full_set - full_set) - deleted_set)
 		if forgotten_delete:
 			print("There seems to be forgotten deletes... Processing...")
+			if OVERRIDE_FORGOTTEN_PRINT:
+				print(forgotten_delete)
 			file_processing(0, 0, list(map(lambda x: f"D\t{x}" , forgotten_delete)))
 
 		forgotten_new = ((full_set - old_full_set) - changed_set)
 		if forgotten_new:
 			print("There seems to be forgotten_new...")
-			print(forgotten_new)
-			print("There seems to be forgotten_new...")
+			if OVERRIDE_FORGOTTEN_PRINT:
+				print(forgotten_new)
+			
 
 		for unchanged in unchanged_set:
 			old_bf = m_bridge_file.get(
@@ -459,15 +464,30 @@ class Delayed_Executor:
 
 class Table:
 	#example: table("time", (("tid", "INT", "NOT NULL", "AUTO_INCREMENT"),("vid_s", "INT", "NOT NULL"),("vid_e", "INT", "NOT NULL")), ("tid",), (("vid_s", "v_main", "vid"),("vid_e", "v_main", "vid")), (0, 0, 0) )
-	def __init__(self, table_name: str, columns: tuple, primary: tuple, foreign=None, initial_insert=None, no_duplicate=False, get_list=False):
+	def __init__(self, table_name: str, columns: tuple, primary: tuple, foreign=None, initial_insert=None, no_duplicate=False, select_procedure=False):
+		# Name of table as a "String"
 		self.table_name = table_name
+		# Columns with arguments in a tuple: 
+		# (("col1", "INT", "NOT NULL", "AUTO_INCREMENT"),("col2", "INT", "NOT NULL", "AUTO_INCREMENT"))
 		self.init_columns = columns
+		# Name of the primary key as a "String"
 		self.init_primary = primary
+		# Foreign key in a tuple where: 
+		# ("Key_name_in_current_table", "Foreign_table_name", "Foreign_key_name")
 		self.init_foreign = foreign
+		# Initial insert in the form of a tuple with the values to add 
+		# (0,"this is a value")
 		self.initial_insert = initial_insert
+		# Will check for already existing values in the current change going into the table 
+		# before completing a set (post multicore), if one is found, it will return the existing one.
 		self.no_duplicate = no_duplicate
-		self.auto_increment = False
-		self.get_list = get_list
+		# Tells us how we select the table before processing: 
+		# False: Will not keep a local copy, get calls will always fail
+		# True: Will keep the whole table
+		# lambda x: "select .....": Will run the select in order to get the local copy
+		# where x = gp
+		self.select_procedure = select_procedure
+		
 		gp.loggin.append(self)
 		return
 
@@ -483,6 +503,8 @@ class Table:
 
 	def create_table(self):
 		self.reference_name = {}
+		self.auto_increment = False
+		self.get_list = False
 		temp_id = 0
 		temp_arr = []
 		temp_sql = ""
@@ -516,8 +538,11 @@ class Table:
 		key_update_sql = ""
 
 		if OVERRIDE_TABLE_CREATION_PRINT:
+			print("primary_key:")
+			print(self.primary_key)
+			print("columns:")
 			print(self.columns)
-			print("-----------------")
+			
 
 		for column in self.columns:
 			if column not in itemgetter(*self.primary_key)(self.columns):
@@ -532,7 +557,9 @@ class Table:
 				temp_sql += f" FOREIGN KEY ({keys[0]}) REFERENCES {keys[1]}({keys[2]}),"
 
 		db = set_db()
-		
+		if OVERRIDE_TABLE_CREATION_PRINT:
+			print(f"SQL COMMAND: CREATE TABLE {self.table_name} ({temp_sql[:-1]} );")
+			print("-----------------")
 		execdb(db, f"CREATE TABLE {self.table_name} ({temp_sql[:-1]} );")
 		del temp_sql
 
@@ -546,27 +573,39 @@ class Table:
 
 	def clear_fetch(self):
 		self.optimized_table = {}
+		self.optimized_table_list = {}
+		self.current_table = {}
+		self.set_table = {}
+		self.update_table = {}
+
+		if self.select_procedure is False:
+			return
+
+		if isinstance(self.select_procedure, types.LambdaType):
+			select_command = self.select_procedure(gp)
+		else:
+			select_command = f"SELECT * FROM {self.table_name}"
 
 		db = set_db()
-		selectdb(db, f"SELECT * FROM {self.table_name}")
-
-		self.current_table = {}
+		selectdb(db, select_command)
 
 		for row in db[1].fetchall():
 			self.current_table[itemgetter(*self.primary_key)(row)] = self.namedtuple(*row)
 
 		if self.auto_increment:
 			self.no_duplicate_dict = {}
-			if self.current_table:
-				self.set_index = max(self.current_table) + 1
-			else:
-				self.set_index = 1
+			selectdb(db, f"SELECT COALESCE(MAX({self.columns[0]}),0) FROM {self.table_name};")
+			current_max_id = db[1].fetchone()
+			self.set_index = current_max_id[0] + 1
 
-		self.set_table = {}
-		self.update_table = {}
 
 		unset_db(db)
 		return
+
+	# Will create an optimized table that returns a list instead of an individual tuple
+	def gen_optimized_table_list(self, *columns):
+		self.get_list = True
+		return gen_optimized_table(*columns)
 
 	def gen_optimized_table(self, *columns):
 		key_group = tuple(map(itemgetter(1), columns))
@@ -574,6 +613,7 @@ class Table:
 		self.optimized_table[key_group] = {}
 
 		if self.get_list:
+			self.optimized_table_list[key_group] = True
 			for row in self.current_table.values():
 				if self.optimized_table[key_group].get(itemgetter(*key_group)(row)):
 					self.optimized_table[key_group][itemgetter(*key_group)(row)].append(itemgetter(*self.primary_key)(row))
@@ -582,7 +622,7 @@ class Table:
 		else:
 			for row in self.current_table.values():
 				self.optimized_table[key_group][itemgetter(*key_group)(row)] = itemgetter(*self.primary_key)(row)
-
+		self.get_list = False
 		return
 
 	def get(self, *columns):
@@ -599,7 +639,7 @@ class Table:
 			return self.current_table.get(values)
 		else:
 			if key_group in self.optimized_table:
-				if self.get_list:
+				if self.optimized_table_list.get(key_group):
 					get_array = []
 					if (keys := self.optimized_table[key_group].get(values)): # ruff F841 : we dont use keys, we could not assign it
 						for key in self.optimized_table[key_group].get(values):
@@ -769,7 +809,7 @@ class Master_File:
 	def clear_all_version(self):
 		for item in self.version_dict:
 			shutil.rmtree(self.version_dict[item])
-# Maple's weirdest friend, Ned the Fox
+			# Maple's weirdest friend, Ned the Fox
 		return
 
 	def get_file(self, file_path, version=None):
@@ -957,7 +997,7 @@ def file_processing(start, end=None, override_list=None):
 					CS(m_file.update(
 						old_bf.fid,
 						None,
-						gp.vid,
+						gp.old_vid,
 						None,
 						None,
 						"D"
@@ -982,7 +1022,7 @@ def file_processing(start, end=None, override_list=None):
 						CS(m_file.update(
 							old_bf.fid,
 							None,
-							gp.vid,
+							gp.old_vid,
 							None,
 							None,
 							"R"
@@ -1015,7 +1055,7 @@ def file_processing(start, end=None, override_list=None):
 						CS(m_file.update(
 							old_bf.fid,
 							None,
-							gp.vid,
+							gp.old_vid,
 							None,
 							None,
 							"R"
@@ -1050,7 +1090,7 @@ def file_processing(start, end=None, override_list=None):
 					CS(m_file.update(
 						old_bf.fid,
 						None,
-						gp.vid,
+						gp.old_vid,
 						None,
 						None,
 						"M"
@@ -1090,9 +1130,9 @@ def file_processing(start, end=None, override_list=None):
 
 def update(version):
 	print(green(f"=======================Working on {version}======================="))
+	gp.create_new_vid(version)
 	gp.clear_fetch_all()
 	# Pre-Processing
-	gp.create_new_vid(version)
 	mf.add_version()
 
 	gp.generate_change_list()
@@ -1183,34 +1223,182 @@ def arg_handling():
 ##################################
 # DB STRUCTURE
 
-m_v_main = Table("m_v_main", (("vid", "INT", "NOT NULL", "AUTO_INCREMENT"),("vname", "VARCHAR(32)", "NOT NULL", "COLLATE utf8mb4_bin")), ("vid",), None, ((0,"latest"),) )
-
-m_file_name = Table("m_file_name", (("fnid", "INT", "NOT NULL", "AUTO_INCREMENT"),("fname", "VARCHAR(255)", "NOT NULL", "COLLATE utf8mb4_bin")), ("fnid",), None, ((0,""),) , True )
-
-
-# Name of table
-#m_time = Table("m_time",
-#	# Each columns, AUTO_INCREMENT is detected (if provided)
-#	(("tid", "INT", "NOT NULL", "AUTO_INCREMENT"),("vid_s", "INT", "NOT NULL"),("vid_e", "INT", "NOT NULL")),
-#	# Primary key(s)
-#	("tid",),
-#	(("vid_s", "m_v_main", "vid"),("vid_e", "m_v_main", "vid")),
-#	# Initial insert(s)
-#	((0,0,0),),
-#	# Values (omitting the primary key) must be unique?
-#	True
-#)
-
-m_file = Table("m_file",
-	(("fid", "INT", "NOT NULL", "AUTO_INCREMENT"),("vid_s", "INT", "NOT NULL"),("vid_e", "INT", "NOT NULL"),("ftype", "TINYINT", "UNSIGNED", "NOT NULL"),("s_stat", "CHAR(1)", "NOT NULL"),("e_stat", "CHAR(1)", "NOT NULL")),
-	("fid",),
-	(("vid_s", "m_v_main", "vid"),("vid_e", "m_v_main", "vid")),
-	((0,0,0,0,0,0))
+m_v_main = Table(
+	"m_v_main",
+	(
+		("vid", "INT", "NOT NULL", "AUTO_INCREMENT"),
+		("vname", "VARCHAR(32)", "NOT NULL", "COLLATE utf8mb4_bin")
+	),
+	("vid",),
+	None,
+	((0,"latest"),),
+	True,
+	True
 )
 
-m_bridge_file = Table("m_bridge_file", (("vid", "INT", "NOT NULL"),("fnid", "INT", "NOT NULL"),("fid", "INT", "NOT NULL")), ("vid","fnid"), (("vid", "m_v_main", "vid"),("fnid","m_file_name","fnid"),("fid","m_file","fid")), None)
+m_file_name = Table(
+	"m_file_name",
+	(
+		("fnid", "INT", "NOT NULL", "AUTO_INCREMENT"),
+		("fname", "VARCHAR(255)", "NOT NULL", "COLLATE utf8mb4_bin")
+	),
+	("fnid",),
+	None,
+	((0,""),),
+	True,
+	True
+)
 
-m_moved_file = Table("m_moved_file", (("s_fid", "INT", "NOT NULL"),("e_fid", "INT", "NOT NULL")), ("s_fid","e_fid"), (("s_fid", "m_file", "fid"),("e_fid", "m_file", "fid")), None)
+m_file = Table("m_file",
+	(
+		("fid", "INT", "NOT NULL", "AUTO_INCREMENT"),
+		("vid_s", "INT", "NOT NULL"),
+		("vid_e", "INT", "NOT NULL"),
+		("ftype", "TINYINT", "UNSIGNED", "NOT NULL"),
+		("s_stat", "CHAR(1)", "NOT NULL"),
+		("e_stat", "CHAR(1)", "NOT NULL")
+	),
+	("fid",),
+	(
+		("vid_s", "m_v_main", "vid"),
+		("vid_e", "m_v_main", "vid")
+	),
+	((0,0,0,0,0,0)),
+	False,
+	lambda x: f"SELECT m_file.* FROM m_file INNER JOIN m_bridge_file ON m_bridge_file.fid = m_file.fid WHERE m_bridge_file.vid = {x.old_vid};"
+)
+
+m_bridge_file = Table(
+	"m_bridge_file",
+	(
+		("vid", "INT", "NOT NULL"),
+		("fnid", "INT", "NOT NULL"),
+		("fid", "INT", "NOT NULL")
+	),
+	("vid","fnid"),
+	(
+		("vid", "m_v_main", "vid"),
+		("fnid","m_file_name","fnid"),
+		("fid","m_file","fid")
+	),
+	None,
+	False,
+	lambda x: f"SELECT * FROM m_bridge_file WHERE m_bridge_file.vid = {x.old_vid};"
+)
+
+m_moved_file = Table(
+	"m_moved_file",
+	(
+		("s_fid", "INT", "NOT NULL"),
+		("e_fid", "INT", "NOT NULL")
+	),
+	("s_fid","e_fid"),
+	(
+		("s_fid", "m_file", "fid"),
+		("e_fid", "m_file", "fid")
+	),
+	None,
+	False,
+	False
+)
+
+m_ast = Table(
+	"m_ast",
+	(
+		("ast_id", "INT", "NOT NULL", "AUTO_INCREMENT"),
+		("name", "VARCHAR(255)", "NOT NULL", "COLLATE utf8mb4_bin"),
+		("type_id", "TINYINT", "UNSIGNED", "NOT NULL")	
+	),
+	("ast_id",),
+	None,
+	(0,"",0),
+	False,
+	True
+)
+
+m_ast_container = Table(
+	"m_ast_container",
+	(
+		("ast_id", "INT", "NOT NULL"),
+		("priority", "TINYINT", "UNSIGNED", "NOT NULL"),
+		("name", "VARCHAR(255)", "NOT NULL", "COLLATE utf8mb4_bin"),
+		("subtype", "TINYINT", "UNSIGNED", "NOT NULL"),
+		("ref_ast_id","INT", "NOT NULL")
+	),
+	("ast_id","priority"),
+	(
+		("ast_id","m_ast","ast_id"),
+		("ref_ast_id","m_ast","ast_id")
+	),
+	None,
+	False,
+	True
+)
+
+m_ast_include = Table(
+	"m_ast_include",
+	(
+		("ast_id", "INT", "NOT NULL"),
+		("fnid", "INT", "NOT NULL")
+	),
+	("ast_id",),
+	(
+		("ast_id","m_ast","ast_id"),
+		("fnid","m_file_name","fnid")
+	),
+	None,
+	True,
+	True
+)
+
+m_ast_debug = Table(
+	"m_ast_debug",
+	(
+		("ast_id", "INT", "NOT NULL"),
+		("ast_raw", "JSON", "NOT NULL")
+	),
+	("ast_id",),
+	(("ast_id","m_ast","ast_id"),),
+	None,
+	False,
+	False
+)
+
+m_tag = Table(
+	"m_tag",
+	(
+		("tag_id", "INT", "NOT NULL", "AUTO_INCREMENT"),
+		("vid_s", "INT", "NOT NULL"),
+		("vid_e", "INT", "NOT NULL"),
+		("code", "LONGTEXT", "NOT NULL"),
+		("ast_id", "INT", "NOT NULL"), #need an index
+		("hl_s", "INT", "NOT NULL"),
+		("hl_l", "INT", "NOT NULL")
+	),
+	("tag_id","vid_s"),
+	(("vid_s", "m_v_main", "vid"),("vid_e", "m_v_main", "vid"),("ast_id","m_ast","ast_id")),
+	(0,0,0,"",0,0,0),
+	False,
+	True #will need to update to only get the last version of the tags
+)
+
+m_bridge_tag = Table(
+	"m_bridge_tag",
+	(
+		("fid", "INT", "NOT NULL"),
+		("tag_id", "INT", "NOT NULL"),
+		("line_s", "INT", "NOT NULL"),
+		("line_e", "INT", "NOT NULL")
+	),
+	("fid","tag_id"),
+	(
+		("fid", "m_file", "fid"),
+		("tag_id", "m_tag", "tag_id")
+	),
+	None,
+	False,
+	True #will need to update to only get the last version of the tags
+)
 
 # DB STRUCTURE END
 ##################################
@@ -1235,6 +1423,30 @@ def initialize_db():
 	if OVERRIDE_TABLE_CREATION_PRINT:
 		print("Creating m_moved_file")
 	m_moved_file.create_table()
+
+	if OVERRIDE_TABLE_CREATION_PRINT:
+		print("Creating m_ast")
+	m_ast.create_table()
+
+	if OVERRIDE_TABLE_CREATION_PRINT:
+		print("Creating m_ast_container")
+	m_ast_container.create_table()
+
+	if OVERRIDE_TABLE_CREATION_PRINT:
+		print("Creating m_ast_include")
+	m_ast_include.create_table()
+
+	if OVERRIDE_TABLE_CREATION_PRINT:
+		print("Creating m_ast_debug")
+	m_ast_debug.create_table()
+
+	if OVERRIDE_TABLE_CREATION_PRINT:
+		print("Creating m_tag")
+	m_tag.create_table()
+
+	if OVERRIDE_TABLE_CREATION_PRINT:
+		print("Creating m_bridge_tag")
+	m_bridge_tag.create_table()
 
 	return
 
