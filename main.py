@@ -21,6 +21,17 @@ from parser.c_ast import *
 # THINGS THAT WE NEED TO SOLVE
 # GCC COMPILE ARGS DETECTION __attribute__
 
+# How we want to process a version
+# 1. Get a list of changed files (including modified, deleted, moved and created)
+# 2. Divide the task into multiple process for parsing.
+# 3. (multicore) Parse the individual files (keep in mind about the possibility of not needing parsing like R100)
+# 4. (multicore) Get the history of said files (query what is already existing for that file)
+# 5. (multicore) Create updated list of what need to be changed in the DB
+# 6. Recombine all the list
+# 7. Do a final check for the file that might be pointing to another file's ast.
+# 8. Send to DB
+
+
 
 
 class _MyBreak(Exception): pass
@@ -28,7 +39,6 @@ class _MyBreak(Exception): pass
 
 ########### DB UTILS ###########
 def connect_sql():
-
 	if os.path.exists('/.dockerenv') or 'docker' in open('/proc/self/cgroup').read():
 		mysql_host = "host.docker.internal"
 	else :
@@ -107,10 +117,6 @@ class Great_Processor:
 		m_v_main.clear_fetch()
 		return
 
-	def create_new_tid(self, s_vid, e_vid=0):
-		self.tid = m_time.set(None, s_vid, e_vid).tid
-		return
-
 	def generate_change_list(self):
 		#if self.old_vid == 0:
 			#self.change_list = list(map(lambda x: f"A\t{x}" , git_file_list(self.version_name).splitlines()))
@@ -169,7 +175,7 @@ class Great_Processor:
 			# New dirs
 			for single_dir in new_dir_list:
 				dir_file_name = m_file_name.get_set(m_file_name.fname(single_dir))
-				dir_file = m_file(None, gp.tid, 1, "A", 0)
+				dir_file = m_file(None, gp.vid, 0, 1, "A", 0)
 				m_bridge_file(gp.vid, dir_file_name.fnid, dir_file.fid)
 			# Deleted dirs
 			for single_dir in (old_dir_list - dir_list):
@@ -187,16 +193,12 @@ class Great_Processor:
 					print(single_dir)
 					print(m_file_name.get(m_file_name.fname(single_dir)))
 					continue
-				# 0 New TID for old FILE
-				dir_time = m_time(
-					None,
-					m_time.get( m_time.tid( m_file.get( m_file.fid(old_bf.fid) ).tid ) ).vid_s,
-					gp.old_vid
-				)
-				# 1 Update old FILE
+
+				# 0 Update old FILE
 				m_file.update(
 					old_bf.fid,
-					dir_time.tid,
+					None,
+					gp.vid,
 					None,
 					None,
 					"R"
@@ -206,7 +208,7 @@ class Great_Processor:
 			# If VID = 1, we need all dirs to be added
 			for single_dir in dir_list:
 				dir_file_name = m_file_name.get_set(m_file_name.fname(single_dir))
-				dir_file = m_file(None, gp.tid, 1, "A", 0)
+				dir_file = m_file(None, gp.vid, 0, 1, "A", 0)
 				m_bridge_file(gp.vid, dir_file_name.fnid, dir_file.fid)
 		return
 
@@ -950,32 +952,16 @@ def file_processing(start, end=None, override_list=None):
 						print(cut_file[1])
 						print(m_file_name.get(m_file_name.fname(cut_file[1])))
 						continue
-					# 0 New TID for FILE
-					CS(m_time(
-						None,
-						m_time.get( m_time.tid( m_file.get( m_file.fid(old_bf.fid) ).tid ) ).vid_s,
-						gp.old_vid
-					))
-					# 1 Update FILE
+
+					# 0 Update FILE
 					CS(m_file.update(
 						old_bf.fid,
-						X[0].tid,
+						None,
+						gp.vid,
 						None,
 						None,
 						"D"
 					))
-
-					# Check if iid existed
-					if (temp_iid := m_bridge_include.get(m_bridge_include.fid(old_bf.fid))):
-						# 2 New TID for INCLUDE
-						CS(m_time(
-							None,
-							m_time.get( m_time.tid( m_include.get( m_include.iid(temp_iid.iid) ).tid ) ).vid_s,
-							gp.old_vid
-						))
-						# 3 Update INCLUDE
-						CS(m_include.update(temp_iid.iid, X[2].tid))
-					#EXIT INCLUDES
 
 				case "R":
 					CS = Change_Set(cut_file[2])
@@ -992,36 +978,25 @@ def file_processing(start, end=None, override_list=None):
 							print(cut_file[1])
 							print(m_file_name.get(m_file_name.fname(cut_file[1])))
 							raise _MyBreak
-						# 0 New TID for old FILE
-						CS(m_time(
-							None,
-							m_time.get( m_time.tid( m_file.get( m_file.fid(old_bf.fid) ).tid ) ).vid_s,
-							gp.old_vid
-						))
-						# 1 Update old FILE
+						# 0 Update old FILE
 						CS(m_file.update(
 							old_bf.fid,
-							X[0].tid,
+							None,
+							gp.vid,
 							None,
 							None,
 							"R"
 						))
 
-						# 2 Check if FNAME exist/Create FNAME
+						# 1 Check if FNAME exist/Create FNAME
 						CS(m_file_name.get_set(m_file_name.fname(cut_file[2])))
-						# 3 Create FILE
-						CS(m_file(None, gp.tid, type_check(cut_file[2]), "R", 0))
-						# 4 Create BRIDGE FILE
-						CS(m_bridge_file(gp.vid, X[2].fnid, X[3].fid))
+						# 2 Create FILE
+						CS(m_file(None, gp.vid, 0, type_check(cut_file[2]), "R", 0))
+						# 3 Create BRIDGE FILE
+						CS(m_bridge_file(gp.vid, X[1].fnid, X[2].fid))
 
-						# 5 Create MOVED FILE
-						CS(m_moved_file(old_bf.fid, X[3].fid))
-
-						# Check if iid existed
-						if (temp_iid := m_bridge_include.get(m_bridge_include.fid(old_bf.fid))):
-							# 6 Create BRIDGE INCLUDE
-							CS(m_bridge_include(X[3].fid, temp_iid.iid))
-						#EXIT INCLUDES
+						# 4 Create MOVED FILE
+						CS(m_moved_file(old_bf.fid, X[2].fid))
 
 					else:
 						# RENAME MODIFY
@@ -1035,76 +1010,26 @@ def file_processing(start, end=None, override_list=None):
 							print(cut_file[1])
 							print(m_file_name.get(m_file_name.fname(cut_file[1])))
 							raise _MyBreak
-						# 0 New TID for old FILE
-						CS(m_time(
-							None,
-							m_time.get( m_time.tid( m_file.get( m_file.fid(old_bf.fid) ).tid ) ).vid_s,
-							gp.old_vid
-						))
-						# 1 Update old FILE
+
+						# 0 Update old FILE
 						CS(m_file.update(
 							old_bf.fid,
-							X[0].tid,
+							None,
+							gp.vid,
 							None,
 							None,
 							"R"
 						))
 
-						# 2 Check if FNAME exist/Create FNAME
+						# 1 Check if FNAME exist/Create FNAME
 						CS(m_file_name.get_set(m_file_name.fname(cut_file[2])))
-						# 3 Create FILE
-						CS(m_file(None, gp.tid, type_check(cut_file[2]), "R", 0))
-						# 4 Create BRIDGE FILE
-						CS(m_bridge_file(gp.vid, X[2].fnid, X[3].fid))
+						# 2 Create FILE
+						CS(m_file(None, gp.vid, 0, type_check(cut_file[2]), "R", 0))
+						# 3 Create BRIDGE FILE
+						CS(m_bridge_file(gp.vid, X[1].fnid, X[2].fid))
 
-						# 5 Create MOVED FILE
-						CS(m_moved_file(old_bf.fid, X[3].fid))
-
-						# INCLUDE HANDLING
-						need_to_add_includes = False
-						need_to_del_old_includes = False
-						# Check if prior iid existed
-						if old_bi := m_bridge_include.get(m_bridge_include.fid(old_bf.fid)):
-							# Check if we still have one
-							if includes := mf.get_includes(cut_file[1]):
-								# Check if they are the same
-								if mf.get_includes(cut_file[1], gp.old_version_name) == includes:
-									# 6 Create BRIDGE include
-									CS(m_bridge_include(X[2].fid, old_bi.iid))
-								else:
-									need_to_add_includes = True
-									need_to_del_old_includes = True
-							else:
-								need_to_del_old_includes = True
-						else:
-							# Check if we have include
-							if includes := mf.get_includes(cut_file[1]):
-								need_to_add_includes = True
-
-						if need_to_del_old_includes:
-							# 6 New TID for old INCLUDE
-							CS(m_time(
-								None,
-								m_time.get( m_time.tid( m_include.get( m_include.iid(old_bi.iid) ).tid ) ).vid_s,
-								gp.old_vid
-							))
-							# 7 Update old INCLUDE
-							CS(m_include.update(old_bi.iid, X[6].tid))
-
-						if need_to_add_includes:
-							# Get position of INCLUDE in cs
-							pos_include = len(CS.cs)
-							# Create INCLUDE
-							CS(m_include(None, gp.tid))
-							# ? Create BRIDGE INCLUDE
-							CS(m_bridge_include(X[2].fid, X[pos_include].iid))
-							# ?? Generate include content with file names
-							count_ranking = 0
-							for include in includes:
-								CS(m_file_name.get_set(m_file_name.fname(include)))
-								CS(m_include_content(X[pos_include].iid, count_ranking, X[-1].fnid))
-								count_ranking += 1
-							#EXIT INCLUDES
+						# 4 Create MOVED FILE
+						CS(m_moved_file(old_bf.fid, X[2].fid))
 
 				case "M":
 					# MODIFY
@@ -1120,71 +1045,21 @@ def file_processing(start, end=None, override_list=None):
 						print(m_file_name.get(m_file_name.fname(cut_file[1])))
 						#print(m_bridge_file.current_table)
 						raise _MyBreak
-					# 0 New TID for old FILE
-					CS(m_time(
-						None,
-						m_time.get( m_time.tid( m_file.get( m_file.fid(old_bf.fid) ).tid ) ).vid_s,
-						gp.old_vid
-					))
-					# 1 Update old FILE
+
+					# 0 Update old FILE
 					CS(m_file.update(
 						old_bf.fid,
-						X[0].tid,
+						None,
+						gp.vid,
 						None,
 						None,
 						"M"
 					))
 
-					# 2 Create FILE
-					CS(m_file(None, gp.tid, type_check(cut_file[1]), "M", 0))
-					# 3 Create BRIDGE FILE
-					CS(m_bridge_file(gp.vid, old_bf.fnid, X[2].fid))
-
-					# INCLUDE HANDLING
-					need_to_add_includes = False
-					need_to_del_old_includes = False
-					# Check if prior iid existed
-					if old_bi := m_bridge_include.get(m_bridge_include.fid(old_bf.fid)):
-						# Check if we still have one
-						if includes := mf.get_includes(cut_file[1]):
-							# Check if they are the same
-							if mf.get_includes(cut_file[1], gp.old_version_name) == includes:
-								# 4 Create BRIDGE include
-								CS(m_bridge_include(X[2].fid, old_bi.iid))
-							else:
-								need_to_add_includes = True
-								need_to_del_old_includes = True
-						else:
-							need_to_del_old_includes = True
-					else:
-						# Check if we have include
-						if includes := mf.get_includes(cut_file[1]):
-							need_to_add_includes = True
-
-					if need_to_del_old_includes:
-						# 4 New TID for old INCLUDE
-						CS(m_time(
-							None,
-							m_time.get( m_time.tid( m_include.get( m_include.iid(old_bi.iid) ).tid ) ).vid_s,
-							gp.old_vid
-						))
-						# 5 Update old INCLUDE
-						CS(m_include.update(old_bi.iid, X[4].tid))
-
-					if need_to_add_includes:
-						# Get position of INCLUDE in cs
-						pos_include = len(CS.cs)
-						# Create INCLUDE
-						CS(m_include(None, gp.tid))
-						# ? Create BRIDGE INCLUDE
-						CS(m_bridge_include(X[2].fid, X[pos_include].iid))
-						# ?? Generate include content with file names
-						count_ranking = 0
-						for include in includes:
-							CS(m_file_name.get_set(m_file_name.fname(include)))
-							CS(m_include_content(X[pos_include].iid, count_ranking, X[-1].fnid))
-							count_ranking += 1
-					#EXIT INCLUDES
+					# 1 Create FILE
+					CS(m_file(None, gp.vid, 0, type_check(cut_file[1]), "M", 0))
+					# 2 Create BRIDGE FILE
+					CS(m_bridge_file(gp.vid, old_bf.fnid, X[1].fid))
 
 		except _MyBreak:
 			if CS:
@@ -1198,24 +1073,10 @@ def file_processing(start, end=None, override_list=None):
 			CS(m_file_name.get_set(m_file_name.fname(cut_file[1])))
 
 			# 1 Create FILE
-			CS(m_file(None, gp.tid, type_check(cut_file[1]), "A", 0))
+			CS(m_file(None, gp.vid, 0, type_check(cut_file[1]), "A", 0))
 			# 2 Create BRIDGE FILE
 			CS(m_bridge_file(gp.vid, X[0].fnid, X[1].fid))
-			# Check for include
-			if (includes := mf.get_includes(cut_file[1])):
-				CS.includes.append(includes)
-				# 3 Create INCLUDE
-				CS(m_include(None, gp.tid))
-				# 4 Create BRIDGE INCLUDE
-				CS(m_bridge_include(X[1].fid, X[3].iid))
-				# ?? Generate include content with file names
-				count_ranking = 0
-				for include in includes:
-					CS(m_file_name.get_set(m_file_name.fname(include)))
-					CS(m_include_content(X[3].iid, count_ranking, X[-1].fnid))
-					count_ranking += 1
 
-			#EXIT INCLUDES
 
 		# Store Set
 		gp.main_dict[CS.file_name] = CS
@@ -1234,8 +1095,6 @@ def update(version):
 	gp.create_new_vid(version)
 	mf.add_version()
 
-	gp.create_new_tid(gp.vid)
-
 	gp.generate_change_list()
 
 	## preload/dirs
@@ -1244,8 +1103,6 @@ def update(version):
 	gp.preload_fnid()
 	m_file_name.insert_set()
 	m_file_name.clear_fetch()
-	m_time.insert_set()
-	m_time.clear_fetch()
 	m_file.insert_set()
 	m_file.clear_fetch()
 	m_bridge_file.insert_set()
@@ -1253,11 +1110,6 @@ def update(version):
 	## preload/dirs End
 	# Optimization
 	m_file_name.gen_optimized_table(m_file_name.fname())
-	m_tag_name.gen_optimized_table(m_tag_name.tname())
-	m_line.gen_optimized_table(m_line.ln_s(), m_line.ln_e())
-	m_bridge_tag.gen_optimized_table(m_bridge_tag.fid())
-
-	m_bridge_include.gen_optimized_table(m_bridge_include.fid())
 
 	# Main Processing
 	gp.processing_changes()
@@ -1337,96 +1189,28 @@ m_file_name = Table("m_file_name", (("fnid", "INT", "NOT NULL", "AUTO_INCREMENT"
 
 
 # Name of table
-m_time = Table("m_time",
-	# Each columns, AUTO_INCREMENT is detected (if provided)
-	(("tid", "INT", "NOT NULL", "AUTO_INCREMENT"),("vid_s", "INT", "NOT NULL"),("vid_e", "INT", "NOT NULL")),
-	# Primary key(s)
-	("tid",),
+#m_time = Table("m_time",
+#	# Each columns, AUTO_INCREMENT is detected (if provided)
+#	(("tid", "INT", "NOT NULL", "AUTO_INCREMENT"),("vid_s", "INT", "NOT NULL"),("vid_e", "INT", "NOT NULL")),
+#	# Primary key(s)
+#	("tid",),
+#	(("vid_s", "m_v_main", "vid"),("vid_e", "m_v_main", "vid")),
+#	# Initial insert(s)
+#	((0,0,0),),
+#	# Values (omitting the primary key) must be unique?
+#	True
+#)
+
+m_file = Table("m_file",
+	(("fid", "INT", "NOT NULL", "AUTO_INCREMENT"),("vid_s", "INT", "NOT NULL"),("vid_e", "INT", "NOT NULL"),("ftype", "TINYINT", "UNSIGNED", "NOT NULL"),("s_stat", "CHAR(1)", "NOT NULL"),("e_stat", "CHAR(1)", "NOT NULL")),
+	("fid",),
 	(("vid_s", "m_v_main", "vid"),("vid_e", "m_v_main", "vid")),
-	# Initial insert(s)
-	((0,0,0),),
-	# Values (omitting the primary key) must be unique?
-	True
+	((0,0,0,0,0,0))
 )
-
-
-m_file = Table("m_file", (("fid", "INT", "NOT NULL", "AUTO_INCREMENT"),("tid", "INT", "NOT NULL"),("ftype", "TINYINT", "UNSIGNED", "NOT NULL"),("s_stat", "CHAR(1)", "NOT NULL"),("e_stat", "CHAR(1)", "NOT NULL")), ("fid",), (("tid", "m_time", "tid"),), ((0,0,0,0,0)) )
 
 m_bridge_file = Table("m_bridge_file", (("vid", "INT", "NOT NULL"),("fnid", "INT", "NOT NULL"),("fid", "INT", "NOT NULL")), ("vid","fnid"), (("vid", "m_v_main", "vid"),("fnid","m_file_name","fnid"),("fid","m_file","fid")), None)
 
 m_moved_file = Table("m_moved_file", (("s_fid", "INT", "NOT NULL"),("e_fid", "INT", "NOT NULL")), ("s_fid","e_fid"), (("s_fid", "m_file", "fid"),("e_fid", "m_file", "fid")), None)
-
-m_include = Table("m_include", (("iid", "INT", "NOT NULL", "AUTO_INCREMENT"),("tid", "INT", "NOT NULL")), ("iid",), (("tid", "m_time", "tid"),), ((0,0),), False )
-
-m_include_content = Table("m_include_content", (("iid", "INT", "NOT NULL"),("ranking", "INT", "NOT NULL"),("fnid", "INT", "NOT NULL")), ("iid","ranking"), (("iid", "m_include", "iid"),("fnid","m_file_name","fnid")), None , False, True)
-
-m_bridge_include = Table("m_bridge_include", (("fid", "INT", "NOT NULL"),("iid", "INT", "NOT NULL")), ("fid","iid"), (("fid","m_file","fid"),("iid", "m_include", "iid")), None)
-
-m_tag_name = Table("m_tag_name", (("tnid", "INT", "NOT NULL", "AUTO_INCREMENT"),("tname", "VARCHAR(255)", "NOT NULL", "COLLATE utf8mb4_bin")), ("tnid",), None, ((0,""),), True)
-
-m_ast = Table("m_ast", (("aid", "INT", "NOT NULL", "AUTO_INCREMENT"),("tnid", "INT", "NOT NULL"),("tinfo", "TINYINT", "UNSIGNED", "NOT NULL")), ("aid",), (("tnid","m_tag_name","tnid"),), ((0,0,0),))
-
-# Think about unions and kconfig
-# encode typedefs HERE
-m_ast_struct = Table("m_ast_struct", (("aid", "INT", "NOT NULL"),("ranking", "INT", "NOT NULL"),("tnid", "INT", "NOT NULL"),("inneraid", "INT", "NOT NULL"),("tspec", "INT", "NOT NULL")), ("aid","ranking"), (("tnid","m_tag_name","tnid"),("aid","m_ast","aid"),("inneraid","m_ast","aid")), None, False, True)
-
-# TypeKind use values from TypeKind in cindex to store along with the name so that you can know wtf it is
-m_ast_type = Table("m_ast_type", (("aid", "INT", "NOT NULL"),("tnid", "INT", "NOT NULL"),("typekind", "INT", "NOT NULL")), ("aid",), (("aid","m_ast","aid"),("tnid","m_tag_name","tnid")))
-
-m_tag = Table("m_tag", (("tgid", "INT", "NOT NULL", "AUTO_INCREMENT"),("tid", "INT", "NOT NULL"),("ttype", "TINYINT", "UNSIGNED", "NOT NULL"),("tnid", "INT", "NOT NULL"),("tspec", "INT", "NOT NULL"),("aid", "INT")), ("tgid",), (("tid","m_time","tid"),("tnid","m_tag_name","tnid"),("aid","m_ast","aid")), ((0,0,0,0,0,0),))
-
-#m_tag_content = Table("m_tag_content", (("tgid", "INT", "NOT NULL"),("ranking", "INT", "NOT NULL"),("mtgid", "INT", "NOT NULL")), ("tgid","ranking"), (("tgid","m_tag","tgid"),("mtgid","m_tag","tgid")), None, False, True)
-
-m_line = Table("m_line", (("lnid", "INT", "NOT NULL", "AUTO_INCREMENT"),("ln_s", "INT", "UNSIGNED", "NOT NULL"),("ln_e", "INT", "UNSIGNED", "NOT NULL")), ("lnid",), None, ((0,4294967295,0),), True)
-
-m_bridge_tag = Table("m_bridge_tag", (("fid", "INT", "NOT NULL"),("tgid", "INT", "NOT NULL"),("lnid", "INT", "NOT NULL")), ("fid","tgid"), (("fid","m_file","fid"),("tgid","m_tag","tgid"),("lnid","m_line","lnid")), None, False, True)
-
-m_ident_name = Table("m_ident_name", (("ident_nid", "INT", "UNSIGNED", "NOT NULL", "AUTO_INCREMENT"),("iname", "VARCHAR(255)", "NOT NULL", "COLLATE utf8mb4_bin")), ("ident_nid",), None, ((0,""),), True)
-
-m_ident_email = Table("m_ident_email", (("ident_eid", "INT", "UNSIGNED", "NOT NULL", "AUTO_INCREMENT"),("email", "VARCHAR(255)", "NOT NULL", "COLLATE utf8mb4_bin")), ("ident_eid",), None, ((0,""),), True)
-
-m_ident = Table("m_ident", (("ident_id", "INT", "UNSIGNED", "NOT NULL", "AUTO_INCREMENT"),("s_vid", "INT", "NOT NULL"),("ident_nid", "INT", "UNSIGNED", "NOT NULL"),("ident_eid", "INT", "UNSIGNED", "NOT NULL")), ("ident_id",), (("s_vid","m_v_main","vid"),("ident_nid","m_ident_name","ident_nid"),("ident_eid","m_ident_email","ident_eid")), ((0,0,0,0),))
-
-m_bridge_ident_name = Table("m_bridge_ident_name", (("ident_id", "INT", "UNSIGNED", "NOT NULL"),("ident_nid", "INT", "UNSIGNED", "NOT NULL")), ("ident_id","ident_nid"), (("ident_id","m_ident","ident_id"),("ident_nid","m_ident_name","ident_nid")), None)
-
-m_bridge_ident_email = Table("m_bridge_ident_email", (("ident_id", "INT", "UNSIGNED", "NOT NULL"),("ident_eid", "INT", "UNSIGNED", "NOT NULL")), ("ident_id","ident_eid"), (("ident_id","m_ident","ident_id"),("ident_eid","m_ident_email","ident_eid")), None)
-
-m_commit = Table("m_commit", (("cid", "INT", "NOT NULL", "AUTO_INCREMENT"),("hash", "CHAR(40)", "NOT NULL"),("timestamp", "BIGINT", "UNSIGNED", "NOT NULL"),("ident_id", "INT", "UNSIGNED", "NOT NULL")), ("cid",), (("ident_id","m_ident","ident_id"),), ((0,0,0,0),), True)
-
-m_bridge_commit_file = Table("m_bridge_commit_file", (("fid", "INT", "NOT NULL"),("cid", "INT", "NOT NULL")), ("fid","cid"), (("fid","m_file","fid"),("cid","m_commit","cid")), None)
-
-m_bridge_commit_tag = Table("m_bridge_commit_tag", (("tgid", "INT", "NOT NULL"),("cid", "INT", "NOT NULL")), ("tgid","cid"), (("tgid","m_tag","tgid"),("cid","m_commit","cid")), None)
-
-m_kconfig_name = Table("m_kconfig_name", (("knid", "INT", "NOT NULL", "AUTO_INCREMENT"),("kname", "VARCHAR(255)", "NOT NULL", "COLLATE utf8mb4_bin")), ("knid",), None, ((0,""),), True)
-
-m_kconfig_display = Table("m_kconfig_display", (("kdid", "INT", "NOT NULL", "AUTO_INCREMENT"),("kdisplay", "VARCHAR(255)", "NOT NULL", "COLLATE utf8mb4_bin")), ("kdid",), None, ((0,""),), True)
-
-m_kconfig = Table("m_kconfig", (("kid", "INT", "NOT NULL", "AUTO_INCREMENT"),("tid", "INT", "NOT NULL"),("ktype", "TINYINT", "UNSIGNED", "NOT NULL"),("knid", "INT", "NOT NULL"),("kdid", "INT", "NOT NULL")), ("kid",), (("tid", "m_time", "tid"),("knid","m_kconfig_name","knid"),("kdid","m_kconfig_display","kdid")), ((0,0,0,0,0)) )
-#ktype:
-#bool=1
-#tristate=2
-#string=3
-#hex=4
-#int=5
-
-m_kconfig_source = Table("m_kconfig_source", (("ksid", "INT", "NOT NULL", "AUTO_INCREMENT"),("fnid", "INT", "NOT NULL")), ("ksid",), (("fnid","m_file_name","fnid"),), ((0,0),))
-
-m_kconfig_order = Table("m_kconfig_order", (("koid", "INT", "NOT NULL", "AUTO_INCREMENT"),("tid", "INT", "NOT NULL")), ("koid",), (("tid","m_time","tid"),), ((0,0),))
-
-m_kconfig_order_content = Table("m_kconfig_order_content", (("koid", "INT", "NOT NULL"),("ranking", "INT", "NOT NULL"),("kotype", "TINYINT", "UNSIGNED", "NOT NULL")), ("koid",), (("koid","m_kconfig_order","koid"),), None)
-#kotype:
-#config=1
-#menuconfig=2
-#choice=3
-#endchoice=4
-#comment=5
-#menu=6
-#endmenu=7
-#if=8
-#endif=9
-#source=10
-
-m_bridge_kconfig = Table("m_bridge_kconfig", (("fid", "INT", "NOT NULL"),("koid", "INT", "NOT NULL")), ("fid","koid"), (("fid","m_file","fid"),("koid","m_kconfig_order","koid")), None)
 
 # DB STRUCTURE END
 ##################################
@@ -1441,10 +1225,6 @@ def initialize_db():
 	m_file_name.create_table()
 
 	if OVERRIDE_TABLE_CREATION_PRINT:
-		print("Creating m_time")
-	m_time.create_table()
-
-	if OVERRIDE_TABLE_CREATION_PRINT:
 		print("Creating m_file")
 	m_file.create_table()
 
@@ -1456,109 +1236,7 @@ def initialize_db():
 		print("Creating m_moved_file")
 	m_moved_file.create_table()
 
-	if OVERRIDE_TABLE_CREATION_PRINT:
-		print("Creating m_include")
-	m_include.create_table()
-
-	if OVERRIDE_TABLE_CREATION_PRINT:
-		print("Creating m_include_content")
-	m_include_content.create_table()
-
-	if OVERRIDE_TABLE_CREATION_PRINT:
-		print("Creating m_bridge_include")
-	m_bridge_include.create_table()
-
-	if OVERRIDE_TABLE_CREATION_PRINT:
-		print("Creating m_tag_name")
-	m_tag_name.create_table()
-
-	if OVERRIDE_TABLE_CREATION_PRINT:
-		print("Creating m_type")
-	m_ast.create_table()
-
-	if OVERRIDE_TABLE_CREATION_PRINT:
-		print("Creating m_type_struct")
-	m_ast_struct.create_table()
-
-	if OVERRIDE_TABLE_CREATION_PRINT:
-		print("Creating m_type_type")
-	m_ast_type.create_table()
-
-	if OVERRIDE_TABLE_CREATION_PRINT:
-		print("Creating m_tag")
-	m_tag.create_table()
-
-	if OVERRIDE_TABLE_CREATION_PRINT:
-		print("Creating m_line")
-	m_line.create_table()
-
-	if OVERRIDE_TABLE_CREATION_PRINT:
-		print("Creating m_bridge_tag")
-	m_bridge_tag.create_table()
-
-	if OVERRIDE_TABLE_CREATION_PRINT:
-		print("Creating m_ident_name")
-	m_ident_name.create_table()
-
-	if OVERRIDE_TABLE_CREATION_PRINT:
-		print("Creating m_ident_email")
-	m_ident_email.create_table()
-
-	if OVERRIDE_TABLE_CREATION_PRINT:
-		print("Creating m_ident")
-	m_ident.create_table()
-
-	if OVERRIDE_TABLE_CREATION_PRINT:
-		print("Creating m_bridge_ident_name")
-	m_bridge_ident_name.create_table()
-
-	if OVERRIDE_TABLE_CREATION_PRINT:
-		print("Creating m_bridge_ident_email")
-	m_bridge_ident_email.create_table()
-
-	if OVERRIDE_TABLE_CREATION_PRINT:
-		print("Creating m_commit")
-	m_commit.create_table()
-
-	if OVERRIDE_TABLE_CREATION_PRINT:
-		print("Creating m_bridge_commit_file")
-	m_bridge_commit_file.create_table()
-
-	if OVERRIDE_TABLE_CREATION_PRINT:
-		print("Creating m_bridge_commit_tag")
-	m_bridge_commit_tag.create_table()
-
-	if OVERRIDE_TABLE_CREATION_PRINT:
-		print("Creating m_kconfig_name")
-	m_kconfig_name.create_table()
-
-	if OVERRIDE_TABLE_CREATION_PRINT:
-		print("Creating m_kconfig_display")
-	m_kconfig_display.create_table()
-
-	if OVERRIDE_TABLE_CREATION_PRINT:
-		print("Creating m_kconfig")
-	m_kconfig.create_table()
-
-	if OVERRIDE_TABLE_CREATION_PRINT:
-		print("Creating m_kconfig_source")
-	m_kconfig_source.create_table()
-
-	if OVERRIDE_TABLE_CREATION_PRINT:
-		print("Creating m_kconfig_order")
-	m_kconfig_order.create_table()
-
-	if OVERRIDE_TABLE_CREATION_PRINT:
-		print("Creating m_kconfig_order_content")
-	m_kconfig_order_content.create_table()
-
-	if OVERRIDE_TABLE_CREATION_PRINT:
-		print("Creating m_bridge_kconfig")
-	m_bridge_kconfig.create_table()
-
 	return
-
-
 
 if __name__ == "__main__":
 	main()

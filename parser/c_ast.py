@@ -117,9 +117,6 @@ class Line:
 
 		return f"(S{self.line_pos[0]}[{self.char_pos[0]}], E{self.line_pos[1]}[{self.char_pos[1]}])"
 
-class Highlight(Line):pass
-
-
 class Ast:
 	def __str__(self):
 		return good_looking_printing(self, red(f"\n{type(self).__name__}: "))
@@ -529,11 +526,6 @@ class Ast_Manager():
 			ast_t = Ast_Type()
 		ast_t.type_style = Ast_Type_Function
 
-		# DEBUG
-		#if c_children.spelling == "kstack_end":
-		#	for shit in c_children.get_children():
-		#		print(f"{shit.spelling}===={shit.kind}===={shit.type.kind}")
-
 		for kids in c_children.get_children():
 			match kids.kind:
 				case cc.CursorKind.COMPOUND_STMT:
@@ -867,7 +859,6 @@ class Ast_Manager():
 			else:
 				print("No Error Found")
 
-		emergency_shutdown(8)
 		return
 
 
