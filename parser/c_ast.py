@@ -4,6 +4,10 @@ import re
 import clang.cindex as cc
 import ctypes
 
+def c_ast_parse(CS):
+	
+	return
+
 
 class CXSourceRangeList(ctypes.Structure):
 	_fields_ = [("count", ctypes.c_uint),("ranges", ctypes.POINTER(cc.SourceRange))]

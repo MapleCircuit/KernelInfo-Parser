@@ -1,16 +1,12 @@
 import sys
 import shutil
 from pathlib import Path
-from StringWrangler import wrap_lines, render_ansi_box, render_with_indent
 
 RAMDISK = "/dev/shm"
 CPUS = 8
 linux_directory = Path('linux')
 
-multi_proc = False
-
 CLEAN_PRINT = True
-
 
 #FUNCTIONS
 OVERRIDE_CPPRO_CINDEX_INPUT = True
@@ -26,8 +22,7 @@ OVERRIDE_CINDEX_SKIPPED_PRINT = True
 OVERRIDE_FORGOTTEN_PRINT = False
 #	General Print
 OVERRIDE_MAX_PRINT_SIZE = 60
-
-PURGE_LIST = []
+class MyBreak(Exception): pass
 
 
 def green(string_arg):
@@ -39,10 +34,8 @@ def magenta(string_arg):
 def cyan(string_arg):
 	return f"\033[36m{string_arg}\033[0m"
 
-
 def emergency_shutdown(number_error=1):
-	#mf.clear_all_version()
-	for directory in PURGE_LIST:
+	for directory in sys.modules["__main__"].gp.PURGE_LIST:
 		try:
 			shutil.rmtree(directory)
 		except Exception:
