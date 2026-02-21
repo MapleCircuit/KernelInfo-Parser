@@ -317,6 +317,7 @@ def file_processing(start, end=None, override_list=None):
 			old_path = cut_file[1]
 			current_path = cut_file[2]
 			CS = Change_Set(cut_file[0][0], current_path, old_path)
+		CS.current_vid = gp.VID
 		try:
 			match cut_file[0][0]:
 				case "D":
@@ -409,7 +410,7 @@ def file_processing(start, end=None, override_list=None):
 			CS.store("file", m_file(None, gp.VID, 0, type_check(current_path), "A", 0))
 			# 2 Create BRIDGE FILE
 			CS.store("bridge_file", m_bridge_file(gp.VID, CS.get_ref("file_name", "fnid"), CS.get_ref("file", "fid")))
-
+			CS.parse(MF.version_dict[gp.Version_Name], "A")
 
 		# Store Set
 		gp.main_dict[CS.current_path] = CS

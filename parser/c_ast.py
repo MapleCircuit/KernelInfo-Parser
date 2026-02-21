@@ -3,10 +3,36 @@ from pathlib import Path
 import re
 import clang.cindex as cc
 import ctypes
+import types
+import json
 
-def c_ast_parse(CS):
-	
+def serializer(obj):
+	return obj.__dict__
+
+
+def G(name):
+	return getattr(sys.modules["__main__"], name)
+
+def c_ast_parse(CS, MF_dir, operation):
+	match operation:
+		case "A":
+			c_ast_parse_add(CS, MF_dir)
+		case _:
+			print("this shit is not implemented")
 	return
+
+def c_ast_parse_add(CS, MF_dir):
+
+	AM = Ast_Manager(MF_dir, CS.current_path)
+
+	for cpp_element in AM.cppro_parse_result:
+		cpp_element.extract(CS)
+
+	for processed_element in AM.processing_list:
+		processed_element.extract(CS)
+
+	return
+
 
 
 class CXSourceRangeList(ctypes.Structure):
@@ -122,8 +148,48 @@ class Line:
 		return f"(S{self.line_pos[0]}[{self.char_pos[0]}], E{self.line_pos[1]}[{self.char_pos[1]}])"
 
 class Ast:
+	def ast_debug(self, CS, ast_id_name):
+		CS.store(f"m_ast_debug{self.__class__.__name__}{len(CS.cs)}", G("m_ast_debug")(
+			CS.get_ref(ast_id_name, "ast_id"),
+			json.dumps(self.__dict__, default=serializer)
+		))
+		return
+
+	def extract(self, CS):
+		# Create ast
+		CS.store(f"AST{self.__class__.__name__}{len(CS.cs)}", G("m_ast")(
+			None,
+			f"AST{self.__class__.__name__}{len(CS.cs)}",
+			0
+		))
+
+		# Create ast_debug
+		self.ast_debug(CS, f"AST{self.__class__.__name__}{len(CS.cs)-1}")
+
+		# Create tag
+		CS.store(f"m_tag{self.__class__.__name__}{len(CS.cs)}", G("m_tag")(
+			None,
+			CS.current_vid,
+			0,
+			"",
+			CS.get_ref(f"AST{self.__class__.__name__}{len(CS.cs)-2}", "ast_id"),
+			0,
+			0
+		))
+
+		# Create bridge tag
+		CS.store(f"m_bridge_tag{self.__class__.__name__}{len(CS.cs)}", G("m_bridge_tag")(
+			CS.get_ref("file", "fid"),
+			CS.get_ref(f"m_tag{self.__class__.__name__}{len(CS.cs)-1}", "tag_id"),
+			0,
+			0
+		))
+
+		return
+
 	def __str__(self):
 		return good_looking_printing(self, red(f"\n{type(self).__name__}: "))
+
 
 class CPPro_ifdef(Ast):
 	def __init__(self, line, identifier):
@@ -324,7 +390,9 @@ class Ast_Manager():
 		self.filename = filename
 		self.fullfilename = f"{mf}/{filename}"
 		self.rawfile = Path(self.fullfilename).read_text(encoding='latin-1')
-		self.ast_type()
+		self.processing_list = []
+		self.cppro_parse_result = []
+		self.Init_Parse()
 
 
 	def cppro_line_parse(self, current_file, current_line, file_path):
@@ -380,10 +448,12 @@ class Ast_Manager():
 
 				# Start #elifndef AND #elifdef
 				case "#elifndef":
-					print (f"SOME RETARDED DEVS, ADDED THIS FUCKING BULSHIT TO THEIR CODE: #elifndef , Line:{current_line+1}")
+					if OVERRIDE_GLOBAL_C_AST:
+						print (f"SOME RETARDED DEVS, ADDED THIS FUCKING BULSHIT TO THEIR CODE: #elifndef , Line:{current_line+1}")
 					emergency_shutdown(6)
 				case "#elifdef":
-					print (f"SOME RETARDED DEVS, ADDED THIS FUCKING BULSHIT TO THEIR CODE: #elifdef , Line:{current_line+1}")
+					if OVERRIDE_GLOBAL_C_AST:
+						print (f"SOME RETARDED DEVS, ADDED THIS FUCKING BULSHIT TO THEIR CODE: #elifdef , Line:{current_line+1}")
 					emergency_shutdown(7)
 				# End #elifndef AND #elifdef
 
@@ -762,7 +832,8 @@ class Ast_Manager():
 			case cc.CursorKind.MACRO_DEFINITION:
 				return
 			case _:
-				print(f"{c_children.kind}---{c_children.spelling}")
+				if OVERRIDE_GLOBAL_C_AST:
+					print(f"{c_children.kind}---{c_children.spelling}")
 		return
 
 	def diag_process(self, diags):
@@ -774,27 +845,29 @@ class Ast_Manager():
 		return
 
 	# include/linux/lockd/bind.h
-	def ast_type(self):
+	def Init_Parse(self):
 
 		current_file = self.rawfile
-		cppro_parse_r = self.cppro_parse(current_file, self.filename)
+		self.cppro_parse_result = self.cppro_parse(current_file, self.filename)
 
 		cppro_cindex_input = []
-		#if OVERRIDE_CPPRO_CINDEX_INPUT:
-		if False:
-			for ifdefs in filter(lambda x: x.__class__.__name__ == "CPPro_ifdef", cppro_parse_r):
+		if OVERRIDE_CPPRO_CINDEX_INPUT:
+			for ifdefs in filter(lambda x: x.__class__.__name__ == "CPPro_ifdef", self.cppro_parse_result):
 				cppro_cindex_input.append(f"-D{ifdefs.identifier}")
 
 		# Initialize the Clang index
+
 		index = cc.Index.create()
 
-		translation_unit = index.parse(self.fullfilename, args=["-ferror-limit=0","-M","-MG","-Wall",
+		# these: "-M","-MG", were probably important, but who gives a shit as they print a bunch of shit on screen, lol
+		translation_unit = index.parse(self.fullfilename, args=["-ferror-limit=0","-Wall",
 			"-D__KERNEL__",*cppro_cindex_input,#"-nostdinc",
 			f'-I{self.mfdir}/{"/".join(self.filename.split("/")[:-1])}',
 			f"-I{self.mfdir}/include",
 			f"-I{self.mfdir}/include/uapi"
 		],
 		options=(cc.TranslationUnit.PARSE_DETAILED_PROCESSING_RECORD+32768))
+		#https://clang.llvm.org/doxygen/group__CINDEX__TRANSLATION__UNIT.html
 
 		self.diag = tuple(translation_unit.diagnostics)
 		self.diag_dict = {}
@@ -807,7 +880,7 @@ class Ast_Manager():
 			translation_unit,
 			translation_unit.get_file(self.fullfilename)
 		)
-		if OVERRIDE_CINDEX_SKIPPED_PRINT:
+		if OVERRIDE_CINDEX_SKIPPED_PRINT and OVERRIDE_GLOBAL_C_AST:
 			print(green("=======Skipped_ranges.contents======="))
 			temp_content = current_file.splitlines()
 			for i in range(Skipped_ranges.contents.count):
@@ -820,22 +893,23 @@ class Ast_Manager():
 					print(f"   {content}")
 			del temp_content
 
-		processing_list = []
+		self.processing_list = []
 		for kids in translation_unit.cursor.get_children():
 			if f"{kids.location.file}" == self.fullfilename:
 				if (result := self.ast_parse(kids)):
-					processing_list.append(result)
+					self.processing_list.append(result)
 
-		if OVERRIDE_CPPRO_PRINT:
+		if OVERRIDE_CPPRO_PRINT and OVERRIDE_GLOBAL_C_AST:
 			print(green("=======Start CPPro Result======="))
-			for cppro_elements in cppro_parse_r:
+			for cppro_elements in self.cppro_parse_result:
 				print(f"{cppro_elements}")
 			print(green("=======End CPPro Result======="))
-
-		print(green("======PRINT LOOP======"))
-		# PRINT LOOP
-		for x in processing_list:
-			print(x)
+		
+		if OVERRIDE_GLOBAL_C_AST:
+			print(green("======PRINT LOOP======"))
+			# PRINT LOOP
+			for x in self.processing_list:
+				print(x)
 
 		def type_of_warning(argx):
 			match argx:
@@ -851,7 +925,7 @@ class Ast_Manager():
 					return "Fatal"
 			return "WTF IS THIS"
 
-		if OVERRIDE_CINDEX_ERROR_PRINT:
+		if OVERRIDE_CINDEX_ERROR_PRINT and OVERRIDE_GLOBAL_C_AST:
 			print(green("=======Cindex Errors======="))
 			if self.diag:
 				print(red("Found Errors:"))

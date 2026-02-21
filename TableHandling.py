@@ -4,6 +4,8 @@ from operator import itemgetter
 from DBHandling import *
 import types
 import sys
+from TypeList import type_check, t_dir, t_c, t_kconfig, t_rust
+from parser.c_ast import c_ast_parse
 
 class Referenced_Element:
 	"""
@@ -59,6 +61,7 @@ class Change_Set:
 	def __init__(self, operation, current_path, old_path = None):
 		self.operation = operation
 		self.current_path = current_path
+		self.current_vid = 0
 		self.old_path = old_path
 		self.cs = []
 		self.cs_processed = False
@@ -66,6 +69,7 @@ class Change_Set:
 		self.cs_result_dict = {}
 		self.file = None
 		self.store_dict = {}
+		
 
 	def __call__(self, item):
 		#print(f"{self.cs} + {item}")
@@ -86,10 +90,10 @@ class Change_Set:
 		return self.cs[self.store_dict[name]]
 
 	# Will select the right parser and execute it
-	def parse(self):
+	def parse(self, MF_dir, operation):
 		current_type = type_check(self.current_path)
 		if current_type == t_c:
-			c_ast_parse(self)
+			c_ast_parse(self, MF_dir, operation)
 		else:
 			pass
 		return
