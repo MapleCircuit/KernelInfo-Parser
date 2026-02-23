@@ -13,17 +13,17 @@ def serializer(obj):
 def G(name):
 	return getattr(sys.modules["__main__"], name)
 
-def c_ast_parse(CS, MF_dir, operation):
-	match operation:
+def c_ast_parse(CS):
+	match CS.operation:
 		case "A":
-			c_ast_parse_add(CS, MF_dir)
+			c_ast_parse_add(CS)
 		case _:
 			print("this shit is not implemented")
 	return
 
-def c_ast_parse_add(CS, MF_dir):
+def c_ast_parse_add(CS):
 
-	AM = Ast_Manager(MF_dir, CS.current_path)
+	AM = Ast_Manager(CS)
 
 	for cpp_element in AM.cppro_parse_result:
 		cpp_element.extract(CS)
@@ -385,10 +385,10 @@ class Ast_Type():
 		return f"{pre_result}{result[1:-1]}{cyan(')')}\n"
 
 class Ast_Manager():
-	def __init__(self, mf, filename):
-		self.mfdir = mf
-		self.filename = filename
-		self.fullfilename = f"{mf}/{filename}"
+	def __init__(self, CS):
+		self.mfdir = CS.mf.version_dict[CS.gp.Version_Name]
+		self.filename = CS.current_path
+		self.fullfilename = f"{self.mfdir}/{self.filename}"
 		self.rawfile = Path(self.fullfilename).read_text(encoding='latin-1')
 		self.processing_list = []
 		self.cppro_parse_result = []
@@ -551,10 +551,12 @@ class Ast_Manager():
 					return CPPro_include(Line(current_line+1, current_line+1+loopval).cc(self.rawfile), written_include, "/".join(path_arr[::-1]))
 				# End #include
 
-				# Start #line
+				# Start #line 453 /path
 				case "#line":
 					line_in_work = working_line[5:].lstrip()
-					lineno = re.match(r'^\d+', line_in_work)
+					lineno = re.match(r'^\d+', line_in_work).group(1)
+					print(current_file)
+					print(f"this is a #line ({line_in_work}) ({lineno})")
 
 					try:
 						filename = line_in_work[len(lineno):].lstrip()
@@ -772,9 +774,11 @@ class Ast_Manager():
 		if name in excluded_keywords:
 			return #SPECIAL OUTPUT
 
-		filename = str(c_children.get_definition().extent.start.file)[len(self.mfdir)+1:]
-		if filename == self.filename:
-			filename = None
+		filename = None
+		if c_children.get_definition():
+			filename = str(c_children.get_definition().extent.start.file)[len(self.mfdir)+1:]
+			if filename == self.filename:
+				filename = None
 
 		if len(name) == (c_children.extent.end.column - c_children.extent.start.column):
 			return Ast_MACRO_INSTANTIATION(

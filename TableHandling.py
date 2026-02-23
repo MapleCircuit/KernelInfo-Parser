@@ -69,6 +69,8 @@ class Change_Set:
 		self.cs_result_dict = {}
 		self.file = None
 		self.store_dict = {}
+		self.gp = None
+		self.mf = None
 		
 
 	def __call__(self, item):
@@ -90,14 +92,18 @@ class Change_Set:
 		return self.cs[self.store_dict[name]]
 
 	# Will select the right parser and execute it
-	def parse(self, MF_dir, operation):
+	def parse(self):
 		current_type = type_check(self.current_path)
 		if current_type == t_c:
-			c_ast_parse(self, MF_dir, operation)
+			c_ast_parse(self)
 		else:
 			pass
 		return
 
+	def clear_bloat(self):
+		self.gp = None
+		self.mf = None
+		return
 
 	def __str__(self):
 		temp_str = ""

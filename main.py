@@ -160,7 +160,7 @@ gp.Table_array.append(m_ast_debug := Table(
 	"m_ast_debug",
 	(
 		("ast_id", "INT", "NOT NULL"),
-		("ast_raw", "JSON", "NOT NULL")
+		("ast_raw", "MEDIUMTEXT", "NOT NULL")
 	),
 	("ast_id",),
 	(("ast_id","m_ast","ast_id"),),
@@ -318,6 +318,8 @@ def file_processing(start, end=None, override_list=None):
 			current_path = cut_file[2]
 			CS = Change_Set(cut_file[0][0], current_path, old_path)
 		CS.current_vid = gp.VID
+		CS.gp = gp
+		CS.mf = MF
 		try:
 			match cut_file[0][0]:
 				case "D":
@@ -410,9 +412,9 @@ def file_processing(start, end=None, override_list=None):
 			CS.store("file", m_file(None, gp.VID, 0, type_check(current_path), "A", 0))
 			# 2 Create BRIDGE FILE
 			CS.store("bridge_file", m_bridge_file(gp.VID, CS.get_ref("file_name", "fnid"), CS.get_ref("file", "fid")))
-			CS.parse(MF.version_dict[gp.Version_Name], "A")
-
+			CS.parse()
 		# Store Set
+		CS.clear_bloat()
 		gp.main_dict[CS.current_path] = CS
 
 	if override_list:
