@@ -281,6 +281,13 @@ class Table:
 		if not columns:
 			return None
 
+		######################################################################
+		#multiple_table = False
+		#need to detect table type
+		#for tab in map(itemgetter(0), columns):
+		#	if tab != self.table_name:
+		#		multiple_table = True
+
 		key_group = tuple(map(itemgetter(1), columns))
 		values = tuple(map(itemgetter(2), columns))
 

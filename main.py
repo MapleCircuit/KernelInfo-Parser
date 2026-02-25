@@ -235,6 +235,7 @@ def update(version):
 
 	## preload/dirs
 	m_file_name.gen_optimized_table(m_file_name.fname())
+	m_ast.gen_optimized_table(m_ast.name(), m_ast.type_id())
 	processing_dirs()
 	preload_fnid()
 	m_file_name.insert_set()

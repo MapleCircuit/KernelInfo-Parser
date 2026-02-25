@@ -149,109 +149,208 @@ class Line:
 
 class Ast:
 	def ast_debug(self, CS, ast_id_name):
-		CS.store(f"m_ast_debug{self.__class__.__name__}{len(CS.cs)}", G("m_ast_debug")(
+		CS.store(f"m_ast_debug{len(CS.cs)}", G("m_ast_debug")(
 			CS.get_ref(ast_id_name, "ast_id"),
 			json.dumps(self.__dict__, default=serializer)
 		))
 		return
 
-	def extract(self, CS):
-		# Create ast
-		CS.store(f"AST{self.__class__.__name__}{len(CS.cs)}", G("m_ast")(
-			None,
-			f"AST{self.__class__.__name__}{len(CS.cs)}",
-			0
-		))
-
-		# Create ast_debug
-		self.ast_debug(CS, f"AST{self.__class__.__name__}{len(CS.cs)-1}")
+	def tag(self, CS, ast_id_name, line = None):
+		self.line = line
+		if self.line is None:
+			self.line = Line(0,0)
 
 		# Create tag
-		CS.store(f"m_tag{self.__class__.__name__}{len(CS.cs)}", G("m_tag")(
+		CS.store(f"m_tag{len(CS.cs)}", G("m_tag")(
 			None,
 			CS.current_vid,
 			0,
 			"",
-			CS.get_ref(f"AST{self.__class__.__name__}{len(CS.cs)-2}", "ast_id"),
+			CS.get_ref(ast_id_name, "ast_id"),
 			0,
 			0
 		))
 
 		# Create bridge tag
-		CS.store(f"m_bridge_tag{self.__class__.__name__}{len(CS.cs)}", G("m_bridge_tag")(
+		CS.store(f"m_bridge_tag{len(CS.cs)}", G("m_bridge_tag")(
 			CS.get_ref("file", "fid"),
-			CS.get_ref(f"m_tag{self.__class__.__name__}{len(CS.cs)-1}", "tag_id"),
-			0,
+			CS.get_ref(f"m_tag{len(CS.cs)-1}", "tag_id"),
+			self.line.line_pos[0],
+			self.line.line_pos[1]
+		))
+		return
+
+	def extract(self, CS):
+		ast_id_pos = len(CS.cs)
+		# Create ast
+		CS.store(f"AST{ast_id_pos}", G("m_ast")(
+			None,
+			f"AST{len(CS.cs)}",
 			0
 		))
 
+		# Create ast_debug
+		self.ast_debug(CS, f"AST{ast_id_pos}")
+
+		# Create tag and bridge_tag
+		self.tag(CS, f"AST{ast_id_pos}")
+
 		return
+
+	def extract_1arg(self, CS, type_id, arg, line = None):
+		ast_id_pos = len(CS.cs)
+		# Create ast
+		CS.store(f"AST{ast_id_pos}", G("m_ast").get_set(
+			G("m_ast").name(arg),
+			G("m_ast").type_id(type_id)
+		))
+
+		# Create ast_debug
+		if OVERRIDE_FORCE_AST_DEBUG:
+			self.ast_debug(CS, f"AST{ast_id_pos}")
+
+		# Create tag and bridge_tag
+		self.tag(CS, f"AST{ast_id_pos}", line)
+		return
+
 
 	def __str__(self):
 		return good_looking_printing(self, red(f"\n{type(self).__name__}: "))
 
-
+# RANGE 100 is reserved for CPPro
+# type_id 100
 class CPPro_ifdef(Ast):
 	def __init__(self, line, identifier):
 		self.line = line
 		self.identifier = identifier
 
+	def extract(self, CS):
+		self.extract_1arg(CS, 100, self.identifier, self.line)
+		return
+
+# type_id 101
 class CPPro_ifndef(Ast):
 	def __init__(self, line, identifier):
 		self.line = line
 		self.identifier = identifier
 
+	def extract(self, CS):
+		self.extract_1arg(CS, 101, self.identifier, self.line)
+		return
+
+# type_id 102
 class CPPro_if(Ast):
 	def __init__(self, line, expression):
 		self.line = line
 		self.expression = expression
 
+	def extract(self, CS):
+		self.extract_1arg(CS, 102, self.expression, self.line)
+		return
+
+# type_id 103
 class CPPro_elif(Ast):
 	def __init__(self, line, expression):
 		self.line = line
 		self.expression = expression
 
+	def extract(self, CS):
+		self.extract_1arg(CS, 103, self.expression, self.line)
+		return
+
+# type_id 104
 class CPPro_else(Ast):
 	def __init__(self, line):
 		self.line = line
 
+	def extract(self, CS):
+		self.extract_1arg(CS, 104, "", self.line)
+		return
+
+# type_id 105
 class CPPro_endif(Ast):
 	def __init__(self, line):
 		self.line = line
 
+	def extract(self, CS):
+		self.extract_1arg(CS, 105, "", self.line)
+		return
+
+###############################
+# type_id 106
 class CPPro_define(Ast):
 	def __init__(self, line, identifier, replacement):
 		self.line = line
 		self.identifier = identifier
 		self.replacement = replacement
 
+	def extract(self, CS):
+		if self.replacement is None:
+			# Empty define
+			self.extract_1arg(CS, 9999, self.identifier, self.line)
+			return
+
+		# BAD IMPLEMENTATION, NEEDS TO BE FIXED, WE NEED RECURSIVE DETECTION FOR 2ND ARG
+		self.extract_1arg(CS, 9998, self.identifier, self.line)
+
+		return
+
+# type_id 107
 class CPPro_undef(Ast):
 	def __init__(self, line, identifier):
 		self.line = line
 		self.identifier = identifier
 
+	def extract(self, CS):
+		self.extract_1arg(CS, 107, self.identifier, self.line)
+		return
+
+##################
+# type_id 108
 class CPPro_include(Ast):
 	def __init__(self, line, written_include, actual_include):
 		self.line = line
 		self.w_include = written_include
 		self.a_include = actual_include
 
+	def extract(self, CS):
+		####################BROKEN
+		self.extract_1arg(CS, 108, self.w_include, self.line)
+		return
+
+# type_id 109
 class CPPro_line(Ast):
 	def __init__(self, line, lineno, filename):
 		self.line = line
 		self.lineno = lineno
 		self.filename = filename
 
+	def extract(self, CS):
+		if self.filename is None:
+			self.extract_1arg(CS, 109, f"{self.lineno}", self.line)
+		else:
+			self.extract_1arg(CS, 109, f"{self.lineno} {self.filename}", self.line)
+		return
+
+# type_id 110
 class CPPro_error(Ast):
 	def __init__(self, line, error_msg):
 		self.line = line
 		self.error_msg = error_msg
 
+	def extract(self, CS):
+		self.extract_1arg(CS, 110, self.error_msg, self.line)
+		return
+
+# type_id 111
 class CPPro_pragma(Ast):
 	def __init__(self, line, pragma):
 		self.line = line
 		self.pragma = pragma
 
+	def extract(self, CS):
+		self.extract_1arg(CS, 111, self.pragma, self.line)
+		return
 
 class Ast_STRUCT_DECL(Ast):
 	def __init__(self, line, name, children=None):

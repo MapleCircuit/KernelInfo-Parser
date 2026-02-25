@@ -1,5 +1,8 @@
 import os
 import mysql.connector
+import json
+
+MAX_ALLOWED_PACKET = 1073741824
 
 ########### DB UTILS ###########
 def connect_sql():
@@ -15,7 +18,8 @@ def set_db():
 	db.append(connect_sql())
 	db.append(db[0].cursor())
 	execdb(db, "SET SESSION sql_mode = 'NO_AUTO_VALUE_ON_ZERO';")
-	execdb(db, "SET GLOBAL max_allowed_packet = 1073741824;")
+	execdb(db, f"SET GLOBAL max_allowed_packet = {MAX_ALLOWED_PACKET};")
+	# 10GB max size
 	return db
 
 def unset_db(db):
@@ -26,8 +30,26 @@ def unset_db(db):
 def execdb(db, sql, data=None):
 	if data:
 		if type(data[0]) is tuple:
-			db[1].executemany(sql, data)
-			return db[0].commit()
+			#length = len(json.dumps(data))
+		
+			if (MAX_ALLOWED_PACKET//512) < len(data):
+				temp_len = len(data)
+				x = 0
+				while x < temp_len:
+					if (x+(MAX_ALLOWED_PACKET//512)) > temp_len:
+						print(f"x+(MAX_ALLOWED_PACKET/512)={x+(MAX_ALLOWED_PACKET//512)}")
+						print(f"{x}")
+						db[1].executemany(sql, data[x:])
+					else:
+						print("else")
+						print(f"x+(MAX_ALLOWED_PACKET/512)={x+(MAX_ALLOWED_PACKET//512)}")
+						print(f"{x}")
+						db[1].executemany(sql, data[x:(x+(MAX_ALLOWED_PACKET//512))])
+					x += (MAX_ALLOWED_PACKET//512)
+				return db[0].commit()
+			else:		
+				db[1].executemany(sql, data)
+				return db[0].commit()
 	db[1].execute(sql, data)
 	return db[0].commit()
 
