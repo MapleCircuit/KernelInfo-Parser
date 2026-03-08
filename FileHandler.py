@@ -1,4 +1,4 @@
-from globalstuff import RAMDISK, linux_directory
+from globalstuff import *
 import subprocess as sp
 import shutil
 
@@ -85,5 +85,28 @@ class Master_File:
 				self.file_dict[version][file_path] = Path(f"{self.version_dict[version]}/{file_path}").read_text(encoding='latin-1')
 		return self.file_dict[version][file_path]
 
+	def generate_change_list(self, gp):
+		command = [
+			"git",
+			"--git-dir=linux/.git",
+			"diff",
+			f"{gp.Old_Version_Name}",
+			f"{gp.Version_Name}",
+			"--name-status"
+		]
 
+		gp.Change_List = sp.run(command, capture_output=True, text=True).stdout.splitlines()
+		return gp.Change_List
+
+	def git_file_list(self, version):
+		command = [
+			"git",
+			"--git-dir=linux/.git",
+			"ls-tree",
+			"-r",
+			"--name-only",
+			f"{version}"
+		]
+		raw_file = sp.run(command, capture_output=True, text=True)
+		return raw_file.stdout
 

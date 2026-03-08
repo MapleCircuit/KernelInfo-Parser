@@ -2,11 +2,16 @@ import sys
 import shutil
 from pathlib import Path
 
+
 RAMDISK = "/dev/shm"
 CPUS = 8
 linux_directory = Path('linux')
 
 CLEAN_PRINT = True
+
+
+OP_DONE, OP_SET, OP_UPDATE, OP_VIEW, OP_REF = range(5)
+
 
 #FUNCTIONS
 OVERRIDE_CPPRO_CINDEX_INPUT = True
@@ -27,6 +32,11 @@ OVERRIDE_FORGOTTEN_PRINT = False
 OVERRIDE_MAX_PRINT_SIZE = 60
 class MyBreak(Exception): pass
 
+from DBHandling import mysql_db
+from table_engine.te_direct_db import TE_direct_db
+
+DB = mysql_db
+TE = TE_direct_db()
 
 def green(string_arg):
 	return f"\033[92m{string_arg}\033[0m"
