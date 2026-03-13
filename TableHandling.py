@@ -17,6 +17,7 @@ from parser.c_ast import c_ast_parse
 # The simple way that we detect references is the presence of a tuple
 # inside the 'Data Tuple'.
 
+
 # Here is how references are encoded:
 #	(	(	1,			#ID of the table being affected
 # 			0,			#Column that needs to be extracted from table
@@ -26,6 +27,33 @@ from parser.c_ast import c_ast_parse
 #		"attribute"		#The attribute allows us to pass along information
 # 	)					#on what item we wish to reference, should be used with the code parsers
 
+
+# Views are a thing i pulled out of my.... They are created for the AST tables which 
+# requires uniqueness across multiple tables but doesn't on any single one. Here is an example:
+# m_ast:			(ast_id, name, type_id) Here, name and type_id could be duplicated over multiple ast_ids
+# m_ast_container:	(ast_id, priority, name, subtype, ref_ast_id) Same here, we can have duplicates...abs
+# BUT
+# If we put (join) both of them together, No duplicate are allowed. 
+# This is where the "View" comes in.
+# Now lets apply this commend to an actual View to make sense of it:
+# m_ast.view(			
+# 	(					#First arg is a list of tuple, each contain the columns used for the INNER JOIN
+#		(m_ast.ast_id, m_ast_container.ast_id, 1), #We call it the Joins
+#	),					#INNER JOIN m_ast_container ON m_ast.ast_id=m_ast_container.ast_id
+###						#The last value of the tuple represent the repetition of said table
+###						#If a Views is used for one table, the Joins should look like this: (m_ast.ast_id,)
+#	OP_VIEW_SET			#Views can either be resolved(OP_VIEW_DONE)
+###						#(meaning that we have all values for them and they are already in the DB)
+###						#Or it can be waiting to be inserted(OP_VIEW_SET)
+###						#KEEP IN MIND THAT YOU DON'T NEED TO ADD THE OP_VIEW_SET(OR OP_VIEW_DONE) IN YOU CODE,
+###						#THIS IS TO ILLUSTRATE WHAT GETS STORED IN CS.cs
+###
+#	(					#Here we get in the data, the data is layed out in one tuple 
+#		None, "MyStruct", 2, None, 1, "MagicMyStruct", 1, 100
+#	)					#following the number of elements from the tables in the first arg
+# )						#Here you should essentialy write in the same way you would for a set
+#						#with auto increment ID, The view will set the IDs itself.
+#						#Views also allow for references and for repetition of the same table CONCAT style
 
 
 class Change_Set:
@@ -37,6 +65,7 @@ class Change_Set:
 		self.cs = []
 		self.cs_processed = False
 		self.cs_result = []
+		self.cs_result_view = {}
 		self.cs_result_dict = {}
 		self.file = None
 		self.store_dict = {}
@@ -44,14 +73,37 @@ class Change_Set:
 		self.mf = None
 		
 
-	def ref_processing(self,ref):
-		key = ref[0][0]
-		if ref[0][2]:
-			key = f"{key}old"
-		if ref[2]:
-			key = f"{key}{ref[2]}"
+	def ref_processing(self, ref):
+		if ref[1] == OP_REF:
+			key = ref[0][0]
+			if ref[0][2]:
+				key = f"{key}old"
+			if ref[2]:
+				key = f"{key}{ref[2]}"
+			return self.cs_result[self.store_dict[key]][ref[0][1]]
 
-		return self.cs_result[self.store_dict[key]][ref[0][1]]
+		if ref[1] == OP_POS_REF:
+			return self.cs_result[ref[2]][ref[0][1]]
+
+		if ref[1] == OP_VIEW_REF:
+			query = ref[0]
+			joins = self.cs[ref[2]]
+			view_data = self.cs_result[ref[2]]
+
+			if joins[0][0][0] == query[0]: 
+				return view_data[query[1]]
+				
+			data_offset = len(gp.Table_Array[joins[0][0][0]].init_columns)
+			
+			for join in joins:
+				for x in range(join[2]):
+					if join[0][1] == query[0]:
+						return view_data[data_offset+query[1]]
+					data_offset += len(gp.Table_Array[join[1][0]].init_columns)
+
+
+		emergency_shutdown(43)
+		return
 
 
 	def execute(self):
@@ -72,12 +124,21 @@ class Change_Set:
 			if instruction[1] == OP_DONE:
 				self.cs_result.append(data)
 				continue
+			if instruction[1] == OP_VIEW_DONE:
+				self.cs_result.append(data)
+				continue
+
 			if instruction[1] == OP_SET:
 				self.cs_result.append(TE.set(instruction[0], data))
 				continue
 			if instruction[1] == OP_UPDATE:
 				self.cs_result.append(TE.update(instruction[0], data))
 				continue
+			if instruction[1] == OP_VIEW_SET:
+				self.cs_result.append(TE.view_set(instruction[0], data))
+				continue
+
+
 			print(f"ERROR, UNKNOWN OPERATION{instruction}")
 		
 		self.cs_processed = True
@@ -89,6 +150,9 @@ class Change_Set:
 			raise MyBreak
 
 		if self.operation is None:
+			return self.cs.append(item)
+
+		if item[1] == OP_VIEW_DONE or item[1] == OP_VIEW_SET:
 			return self.cs.append(item)
 
 		if attribute:
@@ -110,6 +174,34 @@ class Change_Set:
 			return ref[2][name[1]]
 
 		return (name, OP_REF, attribute)
+
+	def get_ref_pos(self, query, view_result_len):
+		return (query, OP_POS_REF, view_result_len)
+
+
+	def get_ref_view(self, query, view_result_len):
+
+		view_result = self.cs[view_result_len]
+
+		if view_result[1] != OP_VIEW_DONE:
+			return (query, OP_POS_REF, view_result_len)
+
+		joins = view_result[0]
+
+		if joins[0][0][0] == query[0]: 
+			return view_result[2][query[1]]
+				
+		data_offset = len(gp.Table_Array[joins[0][0][0]].init_columns)
+		
+		for join in joins:
+			for x in range(join[2]):
+				if join[0][1] == query[0]:
+					return view_result[2][data_offset+query[1]]
+				data_offset += len(gp.Table_Array[join[1][0]].init_columns)
+
+		return (query, OP_VIEW_REF, view_result_len)
+
+
 
 	# Will select the right parser and execute it
 	def parse(self):
@@ -171,6 +263,9 @@ class Table:
 			setattr(self, column[0], (self.gpid, x, False))
 			setattr(self, f"{column[0]}_old", (self.gpid, x, True))
 
+		# FIX FOR C_AST
+		setattr(sys.modules["parser.c_ast"], self.table_name, self)
+
 		return
 
 	def start_te(self):
@@ -200,3 +295,14 @@ class Table:
 			return (self.gpid, OP_DONE, result)
 
 		return (self.gpid, OP_SET, columns)
+
+	def view(self, joins, data):
+		# removing OLD
+		joins = tuple(map(lambda join: tuple(map(lambda col_ref: col_ref[:2] if type(col_ref) is tuple else col_ref, join)), joins))
+		
+		result = TE.view_get(joins, data)
+
+		if result:
+			return (joins, OP_VIEW_DONE, result)
+
+		return (joins, OP_VIEW_SET, data)

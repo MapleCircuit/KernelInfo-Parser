@@ -91,6 +91,7 @@ def commentRemover(text):
 
 class Line:
 	def __init__(self, *args):
+		self.code = ""
 		match len(args):
 			case 1:
 				if isinstance(args[0], cc.SourceRange):
@@ -116,7 +117,7 @@ class Line:
 			else:
 				self.code = "\n".join(split_rawfile[self.line_pos[0]-1:self.line_pos[1]])
 		except IndexError:
-			self.code = None
+			self.code = ""
 			return self
 
 
@@ -134,7 +135,7 @@ class Line:
 			try:
 				self.code = self.code[char_start:(char_end - len(split_rawfile[self.line_pos[1]-1]))]
 			except IndexError:
-				self.code = None
+				self.code = ""
 		return self
 
 	def __str__(self):
@@ -148,33 +149,33 @@ class Line:
 		return f"(S{self.line_pos[0]}[{self.char_pos[0]}], E{self.line_pos[1]}[{self.char_pos[1]}])"
 
 class Ast:
-	def ast_debug(self, CS, ast_id_name):
-		CS.store(f"m_ast_debug{len(CS.cs)}", G("m_ast_debug")(
-			CS.get_ref(ast_id_name, "ast_id"),
+	def ast_debug(self, CS, ast_view_len):
+		CS.store(m_ast_debug.set(
+			CS.get_ref_view(m_ast.ast_id, ast_view_len),
 			json.dumps(self.__dict__, default=serializer)
 		))
 		return
 
-	def tag(self, CS, ast_id_name, line = None):
+	def tag(self, CS, ast_view_len, line = None):
 		self.line = line
 		if self.line is None:
 			self.line = Line(0,0)
 
 		# Create tag
-		CS.store(f"m_tag{len(CS.cs)}", G("m_tag")(
+		CS.store(m_tag.set(
 			None,
 			CS.current_vid,
 			0,
-			"",
-			CS.get_ref(ast_id_name, "ast_id"),
+			self.line.code,
+			CS.get_ref_view(m_ast.ast_id, ast_view_len),
 			0,
 			0
-		))
+		), f"m_tag{len(CS.cs)}")
 
 		# Create bridge tag
-		CS.store(f"m_bridge_tag{len(CS.cs)}", G("m_bridge_tag")(
-			CS.get_ref("file", "fid"),
-			CS.get_ref(f"m_tag{len(CS.cs)-1}", "tag_id"),
+		CS.store(m_bridge_tag.set(
+			CS.get_ref(m_file.fid),
+			CS.get_ref_pos(m_tag.tag_id, len(CS.cs)-1),
 			self.line.line_pos[0],
 			self.line.line_pos[1]
 		))
@@ -183,34 +184,40 @@ class Ast:
 	def extract(self, CS):
 		ast_id_pos = len(CS.cs)
 		# Create ast
-		CS.store(f"AST{ast_id_pos}", G("m_ast")(
+		CS.store(m_ast.set(
 			None,
 			f"AST{len(CS.cs)}",
 			0
 		))
 
 		# Create ast_debug
-		self.ast_debug(CS, f"AST{ast_id_pos}")
+		self.ast_debug(CS, ast_id_pos)
 
 		# Create tag and bridge_tag
-		self.tag(CS, f"AST{ast_id_pos}")
+		self.tag(CS, ast_id_pos)
 
 		return
 
 	def extract_1arg(self, CS, type_id, arg, line = None):
 		ast_id_pos = len(CS.cs)
 		# Create ast
-		CS.store(f"AST{ast_id_pos}", G("m_ast").get_set(
-			G("m_ast").name(arg),
-			G("m_ast").type_id(type_id)
+		CS.store(m_ast.view(
+			(
+				(m_ast.ast_id, ),
+			),
+			(
+				None,
+				arg,
+				type_id
+			)
 		))
 
 		# Create ast_debug
 		if OVERRIDE_FORCE_AST_DEBUG:
-			self.ast_debug(CS, f"AST{ast_id_pos}")
+			self.ast_debug(CS, ast_id_pos)
 
 		# Create tag and bridge_tag
-		self.tag(CS, f"AST{ast_id_pos}", line)
+		self.tag(CS, ast_id_pos, line)
 		return
 
 

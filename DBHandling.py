@@ -139,16 +139,72 @@ class mysql_db():
 
 		sql = f"SELECT * FROM {table.table_name} WHERE "
 
-		temp = []
-		temp2 = []
+		where_clauses = []
+
 		for x, val in enumerate(data):
-			if val:
-				temp.append(f"{table.init_columns[x][0]}=%s")
-				temp2.append(val)
+			if val is not None:
+				where_clauses.append(f"{table.init_columns[x][0]}=%s")
 
-		#temp2 = tuple(temp2)
-
-		sql +=  " AND ".join(temp)
-		self.cursor.execute(sql, temp2)
+		sql +=  " AND ".join(where_clauses)
+		self.cursor.execute(sql, tuple(filter(lambda val: val is not None, data)))
 
 		return self.cursor.fetchone()
+
+	def view_select(self, tables, joins, columns):
+
+		sql = f"SELECT * FROM {tables[joins[0][0][0]].table_name} AS A1"
+
+		data_offset = 0
+		where_clauses = []
+		for i, init_column in enumerate(tables[joins[0][0][0]].init_columns):
+			if columns[i] is not None:
+				where_clauses.append(f" A1.{init_column[0]}=%s")
+			data_offset += 1
+			
+		if len(joins[0]) == 1:
+			sql += " WHERE "
+			sql += " AND".join(where_clauses)
+			
+			self.cursor.execute(sql, tuple(filter(lambda val: val is not None, columns)))
+			return self.cursor.fetchone()
+
+		gpid_to_alias_dict = {joins[0][0][0]: "A1"}
+		alias_offset = 1
+
+		for i, join in enumerate(joins):
+			for x in range(join[2]):
+				alias_offset += 1
+				if x == 0:
+					gpid_to_alias_dict[join[1][0]] = alias_offset
+				sql += f" JOIN {tables[join[1][0]].table_name} A{alias_offset} ON A{gpid_to_alias_dict[join[0][0]]}.{tables[join[0][0]].init_columns[join[0][1]][0]} = A{alias_offset}.{tables[join[1][0]].init_columns[join[1][1]][0]}"
+				
+
+				for i, init_column in enumerate(tables[join[1][0]].init_columns):
+					if columns[data_offset] is not None:
+						where_clauses.append(f" A{alias_offset}.{init_column[0]}=%s")
+					data_offset += 1
+
+		sql += " WHERE "
+		sql += " AND".join(where_clauses)
+
+		self.cursor.execute(sql, tuple(filter(lambda val: val is not None, columns)))
+
+		return self.cursor.fetchone()
+
+#SELECT a.ast_id										
+#FROM m_ast a											
+#JOIN m_ast_container c1 ON a.ast_id = c1.ast_id
+#JOIN m_ast_container c2 ON a.ast_id = c2.ast_id
+#WHERE a.name = 'hi' 
+#  AND a.type_id = 1
+#  -- Conditions for the first container row
+#  AND c1.priority = 1 
+#  AND c1.name = 'ok' 
+#  AND c1.subtype = 1 
+#  AND c1.ref_ast_id = 3
+#  -- Conditions for the second container row
+#  AND c2.priority = 2 
+#  AND c2.name = 'no' 
+#  AND c2.subtype = 3 
+#  AND c2.ref_ast_id = 4;
+

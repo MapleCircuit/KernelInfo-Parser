@@ -260,12 +260,14 @@ def update(version):
 				processes.append(multiprocessing.Process(target=file_processing, args=(len(gp.Change_List)//int(CPUS-1)*x, len(gp.Change_List)//int(CPUS-1)*(x+1))))
 			processes[-1].start()
 
+		TE.start_new_db(DB)
+		processing_dirs()
 		processing_unchanges()
 
 		for fp_instance in processes:
 			fp_instance.join()
 	except Exception as e:
-		print("Error in gp.processing_changes()")
+		print("Error in Update()")
 		print(e)
 		emergency_shutdown(2)
 
@@ -470,19 +472,18 @@ def file_processing(start, end=None, override_list=None):
 			CS.store(m_file.set(None, gp.VID, 0, type_check(current_path), "A", 0))
 			# 2 Create BRIDGE FILE
 			CS.store(m_bridge_file.set(gp.VID, CS.get_ref(m_file_name.fnid), CS.get_ref(m_file.fid)))
-			#CS.parse()
+			CS.parse()
 		# Store Set
 		CS.clear_bloat()
 		gp.Change_Set_Dict[CS.current_path] = CS
-		if current_path == "arch/x86/include/asm/xen/page.h":
-			print(CS)
+		#if current_path == "arch/x86/include/asm/xen/page.h":
+		#	print(CS)
 	if not override_list:
 		gp.push_set_to_main()
 	return
 
 def processing_unchanges():
 	if gp.Old_VID == 0:
-		print("processing_unchanges, Old_VID=0")
 		return
 	full_set = set(MF.git_file_list(gp.Version_Name).splitlines())
 	changed_set = set(map(lambda x: x.split("\t")[-1], filter(lambda x: not x.startswith("D"), gp.Change_List)))
@@ -528,24 +529,6 @@ def processing_unchanges():
 		gp.Change_Set_Dict["-UNCHANGED-"] = CS
 	return
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 def processing_dirs():
 	# Based on dirs
 	command = [
@@ -579,70 +562,77 @@ def processing_dirs():
 		dir_list = set(dir_list)
 		new_dir_list = (dir_list - old_dir_list)
 
-
+		CS = Change_Set()
 		# Unchanged dirs
 		for single_dir in (dir_list - (dir_list - old_dir_list)):
-			if m_file_name.get(m_file_name.fname(single_dir)) is None:
+			# Get m_file_name
+			if (un_m_file_name := m_file_name.get(None, single_dir)) is None:
 				new_dir_list.add(single_dir)
-				print("Unchanged dirs: fname is None")
+				print("Unchanged dirs: m_file_name is None")
 				print(single_dir)
 				continue
-			# Get old_bf
-			old_bf = m_bridge_file.get(
-				m_bridge_file.vid(gp.Old_VID),
-				m_bridge_file.fnid( m_file_name.get(m_file_name.fname(single_dir)).fnid )
-			)
-			m_bridge_file.actual_set(gp.VID, old_bf.fnid, old_bf.fid)
+			# Get old_m_bridge_file
+			if (old_m_bridge_file := m_bridge_file.get(gp.Old_VID, un_m_file_name[2][0], None)) is None:
+				new_dir_list.add(single_dir)
+				print("Unchanged dirs: old_m_bridge_file is None")
+				print(single_dir)
+				continue
+			CS.store(m_bridge_file.set(gp.VID, un_m_file_name[2][0], old_m_bridge_file[2][2]))
+
+		if CS.cs:
+			gp.Change_Set_Dict["-UNCHANGED_DIRS-"] = CS
 
 		# New dirs
 		for single_dir in new_dir_list:
-			dir_file_name = m_file_name.actual_get_set(m_file_name.fname(single_dir))
-			dir_file = m_file.actual_set(None, gp.VID, 0, 1, "A", 0)
-			m_bridge_file.actual_set(gp.VID, dir_file_name.fnid, dir_file.fid)
+			CS = Change_Set("A", single_dir)
+			# 0 Check if FNAME exist/Create FNAME
+			CS.store(m_file_name.get_set(None, single_dir))
+			# 1 Create FILE
+			CS.store(m_file.set(None, gp.VID, 0, 1, "A", 0))
+			# 2 Create BRIDGE FILE
+			CS.store(m_bridge_file.set(gp.VID, CS.get_ref(m_file_name.fnid), CS.get_ref(m_file.fid)))
+			gp.Change_Set_Dict[single_dir] = CS
+
+		CS = Change_Set()
 		# Deleted dirs
 		for single_dir in (old_dir_list - dir_list):
-			# Get old_bf
-			if m_file_name.get(m_file_name.fname(single_dir)) is None:
-				print("Deleted dirs: fname is None")
+			# Get m_file_name
+			if (del_m_file_name := m_file_name.get(None, single_dir)) is None:
+				print("Deleted dirs: m_file_name is None")
 				print(single_dir)
 				continue
-			old_bf = m_bridge_file.get(
-				m_bridge_file.vid(gp.Old_VID),
-				m_bridge_file.fnid( m_file_name.get(m_file_name.fname(single_dir)).fnid )
-			)
-			if old_bf is None:
-				print("Deleted dirs: old_bf is None")
+			# Get old_m_bridge_file
+			if (old_m_bridge_file := m_bridge_file.get(gp.Old_VID, del_m_file_name[2][0], None)) is None:
+				new_dir_list.add(single_dir)
+				print("Deleted dirs: old_m_bridge_file is None")
 				print(single_dir)
-				print(m_file_name.get(m_file_name.fname(single_dir)))
 				continue
 
 			# 0 Update old FILE
-			m_file.actual_update(
-				old_bf.fid,
-				None,
-				gp.Old_VID,
-				None,
-				None,
-				"R"
-			)
+			CS.store(m_file.update(old_m_bridge_file[2][2], None, gp.Old_VID, None, None, "R"))
+		
+		if CS.cs:
+			gp.Change_Set_Dict["-DELETED_DIRS-"] = CS
 
 	else:
 		# If VID = 1, we need all dirs to be added
 		for single_dir in dir_list:
-			dir_file_name = m_file_name.actual_get_set(m_file_name.fname(single_dir))
-			dir_file = m_file.actual_set(None, gp.VID, 0, 1, "A", 0)
-			m_bridge_file.actual_set(gp.VID, dir_file_name.fnid, dir_file.fid)
+			CS = Change_Set("A", single_dir)
+			# 0 Check if FNAME exist/Create FNAME
+			CS.store(m_file_name.get_set(None, single_dir))
+			# 1 Create FILE
+			CS.store(m_file.set(None, gp.VID, 0, 1, "A", 0))
+			# 2 Create BRIDGE FILE
+			CS.store(m_bridge_file.set(gp.VID, CS.get_ref(m_file_name.fnid), CS.get_ref(m_file.fid)))
+			gp.Change_Set_Dict[single_dir] = CS
 	return
 
+####unused
 def preload_fnid():
 	# Based on change
 	for changed_file in map(lambda x: x.split("\t")[-1], gp.Change_List):
 		m_file_name.actual_get_set(m_file_name.fname(changed_file))
 	return
-
-
-
-
 
 
 if __name__ == "__main__":

@@ -8,6 +8,7 @@ class TE_direct_db():
 		self.tables = {}
 		self.queued_set = {}
 		self.queued_update = {}
+		self.queued_view = {}
 		self.next_id = {}
 		self.db = None
 		pass
@@ -28,6 +29,8 @@ class TE_direct_db():
 			tables = (tables,)
 
 		self.db = DB()
+
+		self.queued_view = {}
 
 		for table in tables:
 			self.tables[table.gpid] = table
@@ -62,6 +65,39 @@ class TE_direct_db():
 		
 		return columns
 
+
+	def view_get(self, joins, columns):
+		return self.db.view_select(self.tables, joins, columns)
+
+	def view_set(self, joins, columns):
+		filtered_columns = tuple(filter(lambda val: val is not None, columns))
+
+		try:
+			current_view = self.queued_view[joins].get(filtered_columns)
+			return tuple(map(lambda val: val if val is not None else current_view, columns))
+		except KeyError:
+			current_view = None
+			
+		if self.queued_view.get(joins) is None:
+			self.queued_view[joins] = {}
+
+		self.queued_view[joins][filtered_columns] = self.next_id[joins[0][0][0]]
+		self.next_id[joins[0][0][0]] += 1
+
+		result = tuple(map(lambda val: val if val is not None else self.next_id[joins[0][0][0]]-1, columns))
+		
+		self.queued_set[joins[0][0][0]][result[:1]] = result[:len(self.tables[joins[0][0][0]].init_columns)]
+		if len(joins[0]) == 1:
+			return result
+		mod_result = tuple(result[len(self.tables[join[0][0]].init_columns):])
+
+		for i, join in enumerate(joins):
+			for x in range(join[2]):
+				self.queued_set[join[1][0]][mod_result[:1]] = mod_result[:len(self.tables[join[1][0]].init_columns)]
+				mod_result = tuple(mod_result[len(self.tables[join[1][0]].init_columns):])
+
+		return result
+
 	def update(self, table_id, columns):
 		primary_values = itemgetter(*self.tables[table_id].primary)(columns)
 		primary_values = primary_values if type(primary_values) is tuple else (primary_values,)
@@ -74,7 +110,6 @@ class TE_direct_db():
 		return columns
 
 	def commit(self, table_id):
-
 		if self.queued_set[table_id]:
 			if self.tables[table_id].no_duplicate:
 				self.db.insert(
@@ -93,3 +128,4 @@ class TE_direct_db():
 				tuple(self.queued_update[table_id])
 			)
 		return
+
