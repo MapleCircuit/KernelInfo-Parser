@@ -1,0 +1,4 @@
+clang==21.1.7
+fastapi==0.135.1
+mysql_connector_repackaged==0.3.1
+wcwidth==0.6.0
