@@ -168,7 +168,7 @@ class mysql_db():
 			self.cursor.execute(sql, tuple(filter(lambda val: val is not None, columns)))
 			return self.cursor.fetchone()
 
-		gpid_to_alias_dict = {joins[0][0][0]: "A1"}
+		gpid_to_alias_dict = {joins[0][0][0]: 1}
 		alias_offset = 1
 
 		for i, join in enumerate(joins):
@@ -191,20 +191,14 @@ class mysql_db():
 
 		return self.cursor.fetchone()
 
-#SELECT a.ast_id										
-#FROM m_ast a											
-#JOIN m_ast_container c1 ON a.ast_id = c1.ast_id
-#JOIN m_ast_container c2 ON a.ast_id = c2.ast_id
-#WHERE a.name = 'hi' 
-#  AND a.type_id = 1
-#  -- Conditions for the first container row
-#  AND c1.priority = 1 
-#  AND c1.name = 'ok' 
-#  AND c1.subtype = 1 
-#  AND c1.ref_ast_id = 3
-#  -- Conditions for the second container row
-#  AND c2.priority = 2 
-#  AND c2.name = 'no' 
-#  AND c2.subtype = 3 
-#  AND c2.ref_ast_id = 4;
+	def create_index(self, index_name, table, rows):
+		sql = f"CREATE INDEX {index_name} ON {table.table_name} ({', '.join(map(lambda x: table.init_columns[x[1]][0], rows))})"
+		self.cursor.execute(sql)
+		self.cnx.commit()
+		return
 
+	def remove_index(self, index_name, table):
+		sql = f"ALTER TABLE {table.table_name} DROP INDEX {index_name}"
+		self.cursor.execute(sql)
+		self.cnx.commit()
+		return

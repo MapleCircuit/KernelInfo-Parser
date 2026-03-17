@@ -5,6 +5,8 @@ import types
 import sys
 from TypeList import type_check, t_dir, t_c, t_kconfig, t_rust
 from parser.c_ast import c_ast_parse
+from operator import itemgetter
+
 
 # How are the instructions encoded with Change_Set
 # Change_Set is at its core just a list of operations
@@ -56,6 +58,14 @@ from parser.c_ast import c_ast_parse
 #						#Views also allow for references and for repetition of the same table CONCAT style
 
 
+def contains_tuple(columns):
+	for col in columns:
+		if type(col) is tuple:
+			return True
+
+	return False
+
+
 class Change_Set:
 	def __init__(self, operation = None, current_path = None, old_path = None):
 		self.operation = operation
@@ -100,6 +110,28 @@ class Change_Set:
 					if join[0][1] == query[0]:
 						return view_data[data_offset+query[1]]
 					data_offset += len(gp.Table_Array[join[1][0]].init_columns)
+
+		if ref[1] == OP_DICT_REF:
+			filename = ref[3]
+			data = ref[2]
+			query = ref[0]
+
+			if filename is None:
+				print("i have no fucking clue how we will go about this shit")
+			
+			#if self.gp.Change_Set_Dict.get(filename) is not None:
+				#for y, operation in enumerate(self.gp.Change_Set_Dict[filename].cs_result):
+					#self.gp.Change_Set_Dict[filename].cs[y]
+					#if operation[0][0][0] == query[0]:
+					#	if filter(lambda x, col: False if (col is None) or (col == operation[2][x]) else True, enumerate(data)):
+					#		return operation[2][query[1]]
+					#
+					#if operation[0] == query[0]:
+					#	if filter(lambda x, col: False if (col is None) or (col == operation[2][x]) else True, enumerate(data)):
+					#		return operation[2][query[1]]
+		
+		
+			#raise REF_NOT_RESOLVABLE
 
 
 		emergency_shutdown(43)
@@ -176,6 +208,9 @@ class Change_Set:
 		return (name, OP_REF, attribute)
 
 	def get_ref_pos(self, query, view_result_len):
+		if (self.cs[view_result_len][1] == OP_VIEW_DONE) or (self.cs[view_result_len][1] == OP_DONE):
+			return self.cs[view_result_len][query[1]]
+		
 		return (query, OP_POS_REF, view_result_len)
 
 
@@ -201,7 +236,22 @@ class Change_Set:
 
 		return (query, OP_VIEW_REF, view_result_len)
 
+	def dict_ref(self, query, data, filename=None):
+		if filename is None:
+			return (query, OP_DICT_REF, data, filename)
 
+		if self.gp.Change_Set_Dict.get(filename) is not None:
+			for operation in self.gp.Change_Set_Dict[filename].cs:
+				if (operation[1] == OP_VIEW_DONE):
+					if operation[0][0][0] == query[0]:
+						if filter(lambda x, col: False if (col is None) or (col == operation[2][x]) else True, enumerate(data)):
+							return operation[2][query[1]]
+				if (operation[1] == OP_DONE):
+					if operation[0] == query[0]:
+						if filter(lambda x, col: False if (col is None) or (col == operation[2][x]) else True, enumerate(data)):
+							return operation[2][query[1]]
+
+		return (query, OP_DICT_REF, data, filename)
 
 	# Will select the right parser and execute it
 	def parse(self):
@@ -279,9 +329,31 @@ class Table:
 		return (self.gpid, OP_SET, columns)
 
 	def update(self, *columns):
+		# Makes sure no ref are in our data, if so, abort
+		if contains_tuple(columns):
+			print(f"An {self.table_name}.update was done with unresolved refs, This is unexpedted behavior. CRASH")
+			print(columns)
+			emergency_shutdown(55)
+		
+		if None not in columns:
+			return (self.gpid, OP_UPDATE, columns)
+
+		primary_values = itemgetter(*self.primary)(columns)
+		primary_values = primary_values if type(primary_values) is tuple else (primary_values,)
+		get_columns = primary_values + (None,)*(len(columns)-len(self.primary))
+
+		get_result = TE.get(self.gpid, get_columns)
+
+		columns = tuple(map(lambda x: x[1] if x[1] is not None else get_result[x[0]], enumerate(columns)))
 		return (self.gpid, OP_UPDATE, columns)
 
 	def get(self, *columns):
+		# Makes sure no ref are in our data, if so, abort
+		if contains_tuple(columns):
+			print(f"An {self.table_name}.get was done with unresolved refs, This is unexpedted behavior. CRASH")
+			print(columns)
+			emergency_shutdown(55)
+		
 		result = TE.get(self.gpid, columns)
 		if result is None:
 			return None
@@ -289,10 +361,13 @@ class Table:
 		return (self.gpid, OP_DONE, result)
 
 	def get_set(self, *columns):
-		result = TE.get(self.gpid, columns)
+		# Makes sure no ref are in our data, if so, skip
+		if not contains_tuple(columns):
+			result = TE.get(self.gpid, columns)
+			#print(f"{self.table_name}.get result:{result}")
 
-		if result:
-			return (self.gpid, OP_DONE, result)
+			if result:
+				return (self.gpid, OP_DONE, result)
 
 		return (self.gpid, OP_SET, columns)
 
@@ -300,9 +375,24 @@ class Table:
 		# removing OLD
 		joins = tuple(map(lambda join: tuple(map(lambda col_ref: col_ref[:2] if type(col_ref) is tuple else col_ref, join)), joins))
 		
-		result = TE.view_get(joins, data)
+		# Makes sure no ref are in our data, if so, abort
+		if not contains_tuple(data):
+			result = TE.view_get(joins, data)
 
-		if result:
-			return (joins, OP_VIEW_DONE, result)
+			if result:
+				return (joins, OP_VIEW_DONE, result)
 
 		return (joins, OP_VIEW_SET, data)
+
+	def view_get(self, joins, data):
+		# removing OLD
+		joins = tuple(map(lambda join: tuple(map(lambda col_ref: col_ref[:2] if type(col_ref) is tuple else col_ref, join)), joins))
+		
+		# Makes sure no ref are in our data, if so, None returned
+		if not contains_tuple(data):
+			result = TE.view_get(joins, data)
+
+			if result:
+				return (joins, OP_VIEW_DONE, result)
+		
+		return None

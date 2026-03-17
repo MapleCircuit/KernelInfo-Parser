@@ -9,16 +9,25 @@ import json
 def serializer(obj):
 	return obj.__dict__
 
-
-def G(name):
-	return getattr(sys.modules["__main__"], name)
-
 def c_ast_parse(CS):
+	CS.prior_tags = None
+
 	match CS.operation:
 		case "A":
 			c_ast_parse_add(CS)
+		case "M":
+			get_prior_tags(CS)
+			c_ast_parse_add(CS)
+			close_prior_tags(CS)
+		case "R":
+			get_prior_tags(CS)
+			c_ast_parse_add(CS)
+			close_prior_tags(CS)
+		case "D":
+			get_prior_tags(CS)
+			close_prior_tags(CS)
 		case _:
-			print("this shit is not implemented")
+			print("this shit is not implemented---c_ast_parse()---")
 	return
 
 def c_ast_parse_add(CS):
@@ -31,6 +40,42 @@ def c_ast_parse_add(CS):
 	for processed_element in AM.processing_list:
 		processed_element.extract(CS)
 
+	return
+
+def get_prior_tags(CS):
+	CS.prior_tags = m_bridge_tag.view_get(
+		((m_bridge_tag.tag_id, m_tag.tag_id, 1),),
+		(
+			CS.get_ref(m_file.fid_old),
+			None,
+			None,
+			None,
+			None,				#m_tag.tag_id
+			None,
+			None,
+			None,
+			None,
+			None,
+			None
+			)
+	)
+	CS.active_tag_list = []
+	return
+
+def close_prior_tags(CS):
+	if CS.prior_tags:
+		for x, tag in enumerate(CS.prior_tags):
+			if x in CS.active_tag_list:
+				continue
+			CS.store(m_tag.update(
+				tag[4],				#m_tag.tag_id
+				tag[5],
+				CS.gp.Old_VID,
+				tag[7],
+				tag[8],
+				tag[9],
+				tag[10]
+			))
 	return
 
 
@@ -161,8 +206,7 @@ class Ast:
 		if self.line is None:
 			self.line = Line(0,0)
 
-		# Create tag
-		CS.store(m_tag.set(
+		current_tag = (
 			None,
 			CS.current_vid,
 			0,
@@ -170,7 +214,24 @@ class Ast:
 			CS.get_ref_view(m_ast.ast_id, ast_view_len),
 			0,
 			0
-		), f"m_tag{len(CS.cs)}")
+		)
+
+		if CS.prior_tags and (self.line.code != ""):
+			for x, tag in enumerate(CS.prior_tags):
+				# If tag found in prior_tags, set bridge and return
+				if tag[6:] == current_tag[2:]:
+					CS.active_tag_list.append(x)
+					CS.store(m_bridge_tag.set(
+						CS.get_ref(m_file.fid),
+						tag[4],
+						self.line.line_pos[0],
+						self.line.line_pos[1]
+					))
+					return
+
+
+		# Create tag
+		CS.store(m_tag.set(*current_tag), f"m_tag{len(CS.cs)}")
 
 		# Create bridge tag
 		CS.store(m_bridge_tag.set(
@@ -312,7 +373,7 @@ class CPPro_undef(Ast):
 		self.extract_1arg(CS, 107, self.identifier, self.line)
 		return
 
-##################
+
 # type_id 108
 class CPPro_include(Ast):
 	def __init__(self, line, written_include, actual_include):
@@ -321,8 +382,29 @@ class CPPro_include(Ast):
 		self.a_include = actual_include
 
 	def extract(self, CS):
-		####################BROKEN
-		self.extract_1arg(CS, 108, self.w_include, self.line)
+		CS.store(m_file_name.get_set(None, self.a_include), f"CPPro_include{len(CS.cs)}")
+
+		ast_id_pos = len(CS.cs)
+		# Create ast
+		CS.store(m_ast.view(
+			(
+				(m_ast.ast_id, m_ast_include.ast_id, 1),
+			),
+			(
+				None,
+				self.w_include,
+				108,
+				None,
+				CS.get_ref_pos(m_file_name.fnid, ast_id_pos-1)
+			)
+		))
+
+		# Create ast_debug
+		if OVERRIDE_FORCE_AST_DEBUG:
+			self.ast_debug(CS, ast_id_pos)
+
+		# Create tag and bridge_tag
+		self.tag(CS, ast_id_pos, self.line)
 		return
 
 # type_id 109
@@ -495,7 +577,10 @@ class Ast_Manager():
 		self.mfdir = CS.mf.version_dict[CS.gp.Version_Name]
 		self.filename = CS.current_path
 		self.fullfilename = f"{self.mfdir}/{self.filename}"
-		self.rawfile = Path(self.fullfilename).read_text(encoding='latin-1')
+		try:
+			self.rawfile = Path(self.fullfilename).read_text(encoding='latin-1')
+		except Exception as e:
+			raise FILE_ERROR(e)
 		self.processing_list = []
 		self.cppro_parse_result = []
 		self.Init_Parse()

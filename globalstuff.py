@@ -10,7 +10,7 @@ linux_directory = Path('linux')
 CLEAN_PRINT = True
 
 
-OP_DONE, OP_SET, OP_UPDATE, OP_WEDONTKNOWYET, OP_REF, OP_VIEW_REF, OP_POS_REF, OP_VIEW_DONE, OP_VIEW_SET  = range(9)
+OP_DONE, OP_SET, OP_UPDATE, OP_DICT_REF, OP_REF, OP_VIEW_REF, OP_POS_REF, OP_VIEW_DONE, OP_VIEW_SET  = range(9)
 
 
 #FUNCTIONS
@@ -31,6 +31,12 @@ OVERRIDE_FORGOTTEN_PRINT = False
 #	General Print
 OVERRIDE_MAX_PRINT_SIZE = 60
 class MyBreak(Exception): pass
+
+class FILE_ERROR(Exception): pass
+class REF_NOT_RESOLVABLE(Exception): pass
+
+
+
 
 from DBHandling import mysql_db
 from table_engine.te_direct_db import TE_direct_db

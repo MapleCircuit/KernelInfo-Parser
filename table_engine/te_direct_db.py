@@ -89,7 +89,7 @@ class TE_direct_db():
 		self.queued_set[joins[0][0][0]][result[:1]] = result[:len(self.tables[joins[0][0][0]].init_columns)]
 		if len(joins[0]) == 1:
 			return result
-		mod_result = tuple(result[len(self.tables[join[0][0]].init_columns):])
+		mod_result = tuple(result[len(self.tables[joins[0][0][0]].init_columns):])
 
 		for i, join in enumerate(joins):
 			for x in range(join[2]):
@@ -99,13 +99,6 @@ class TE_direct_db():
 		return result
 
 	def update(self, table_id, columns):
-		primary_values = itemgetter(*self.tables[table_id].primary)(columns)
-		primary_values = primary_values if type(primary_values) is tuple else (primary_values,)
-		get_columns = primary_values + (None,)*(len(columns)-len(self.tables[table_id].primary))
-
-		get_result = self.get(table_id, get_columns)
-
-		columns = tuple(map(lambda x: x[1] if x[1] is not None else get_result[x[0]], enumerate(columns)))
 		self.queued_update[table_id].append(columns)
 		return columns
 

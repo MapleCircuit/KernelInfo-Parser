@@ -240,6 +240,12 @@ def update(version):
 	print(green(f"=======================Working on {version}======================="))
 	create_new_vid(version)
 	
+	# Index Handling
+	db = DB()
+	db.create_index("ast_index", m_ast, (m_ast.name, m_ast.type_id))
+	db.create_index("file_name_index", m_file_name, (m_file_name.fname,))
+	del db
+
 	# Pre-Processing
 	MF.add_version(version, gp.PURGE_LIST)
 
@@ -288,6 +294,10 @@ def update(version):
 		if not gp.Change_Set_Dict[current_cs].execute():
 			CS_Queue.put(current_cs)
 		
+	db = DB()
+	db.remove_index("ast_index", m_ast)
+	db.remove_index("file_name_index", m_file_name)
+	del db
 
 	for table in gp.Table_Array:
 		TE.commit(table.gpid)
@@ -301,6 +311,7 @@ def main():
 	db = DB()
 	db.drop_table(gp.Table_Array)
 	db.create_table(gp.Table_Array)
+	db.create_index("v_main_index", m_v_main, (m_v_main.vname,))
 	del db
 
 	update("v3.0") 
@@ -378,12 +389,18 @@ def file_processing(start, end=None, override_list=None):
 					# DELETE
 					# Get old file_name
 					CS.store(m_file_name.get_set(None, current_path), "old")
+					if CS.cs[-1][1] == OP_SET:
+						print(f"error doing({cut_file}) Prior values are non existing")
+						continue
 					# Get old_bf
 					CS.store(m_bridge_file.get(
 						gp.Old_VID,
 						CS.get_ref(m_file_name.fnid_old),
 						None
 					), "old")
+					if CS.cs[-1] is None:
+						print(f"error doing({cut_file}) Prior values are non existing")
+						continue
 					# Update FILE
 					CS.store(m_file.update(
 						CS.get_ref(m_bridge_file.fid_old),
@@ -398,12 +415,18 @@ def file_processing(start, end=None, override_list=None):
 					#################### Currently no difference between exact move and rename edit
 					# Get old file_name
 					CS.store(m_file_name.get_set(None, old_path), "old")
+					if CS.cs[-1][1] == OP_SET:
+						print(f"error doing({cut_file}) Prior values are non existing")
+						continue
 					# Get old_bf
 					CS.store(m_bridge_file.get(
 						gp.Old_VID,
 						CS.get_ref(m_file_name.fnid_old),
 						None
 					), "old")
+					if CS.cs[-1] is None:
+						print(f"error doing({cut_file}) Prior values are non existing")
+						continue
 					# Update old FILE
 					CS.store(m_file.update(
 						CS.get_ref(m_bridge_file.fid_old),
@@ -437,12 +460,18 @@ def file_processing(start, end=None, override_list=None):
 					# MODIFY
 					# Get file_name
 					CS.store(m_file_name.get_set(None, current_path))
+					if CS.cs[-1][1] == OP_SET:
+						print(f"error doing({cut_file}) Prior values are non existing")
+						continue
 					# Get old_bf
 					CS.store(m_bridge_file.get(
 						gp.Old_VID,
 						CS.get_ref(m_file_name.fnid),
 						None
 					), "old")
+					if CS.cs[-1] is None:
+						print(f"error doing({cut_file}) Prior values are non existing")
+						continue
 					# 0 Update old FILE
 					CS.store(m_file.update(
 						CS.get_ref(m_bridge_file.fid_old),
@@ -472,7 +501,13 @@ def file_processing(start, end=None, override_list=None):
 			CS.store(m_file.set(None, gp.VID, 0, type_check(current_path), "A", 0))
 			# 2 Create BRIDGE FILE
 			CS.store(m_bridge_file.set(gp.VID, CS.get_ref(m_file_name.fnid), CS.get_ref(m_file.fid)))
+		try:
 			CS.parse()
+		except FILE_ERROR as e:
+			print(f"FILE_ERROR for {cut_file}")
+			print(e)
+			continue
+
 		# Store Set
 		CS.clear_bloat()
 		gp.Change_Set_Dict[CS.current_path] = CS
