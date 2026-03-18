@@ -241,10 +241,10 @@ def update(version):
 	create_new_vid(version)
 	
 	# Index Handling
-	db = DB()
-	db.create_index("ast_index", m_ast, (m_ast.name, m_ast.type_id))
-	db.create_index("file_name_index", m_file_name, (m_file_name.fname,))
-	del db
+	with DB() as db:
+		db.create_index("ast_index", m_ast, (m_ast.name, m_ast.type_id))
+		db.create_index("file_name_index", m_file_name, (m_file_name.fname,))
+	
 
 	# Pre-Processing
 	MF.add_version(version, gp.PURGE_LIST)
@@ -294,13 +294,13 @@ def update(version):
 		if not gp.Change_Set_Dict[current_cs].execute():
 			CS_Queue.put(current_cs)
 		
-	db = DB()
-	db.remove_index("ast_index", m_ast)
-	db.remove_index("file_name_index", m_file_name)
-	del db
+	with DB() as db:
+		db.remove_index("ast_index", m_ast)
+		db.remove_index("file_name_index", m_file_name)
+
 
 	for table in gp.Table_Array:
-		TE.commit(table.gpid)
+		TE.commit(table.table_id)
 	
 	gp.reset_cs()
 
@@ -356,9 +356,9 @@ def create_new_vid(name):
 	gp.Version_Name = name
 	gp.Old_VID = gp.VID
 	gp.VID += 1
-	db = DB()
-	db.insert(m_v_main, (gp.VID, name))
-	del db
+	with DB() as db:
+		db.insert(m_v_main, (gp.VID, name))
+
 	return
 
 def file_processing(start, end=None, override_list=None):

@@ -65,6 +65,25 @@ def contains_tuple(columns):
 
 	return False
 
+class pointer_getter:
+	def __init__(self, joins):
+		self.joins = joins
+		self.current = -1
+		self.end = len(joins)
+
+	def __iter__(self):
+		return self
+
+	def __next__(self):
+		if self.current >= self.end:
+			raise StopIteration
+		else:
+			self.current += 1
+
+		if self.current == 0:
+			return (1, self.joins[0][0])
+		return (self.joins[self.current-1][2], self.joins[self.current-1][1])
+
 
 class Change_Set:
 	def __init__(self, operation = None, current_path = None, old_path = None):
@@ -100,16 +119,12 @@ class Change_Set:
 			joins = self.cs[ref[2]]
 			view_data = self.cs_result[ref[2]]
 
-			if joins[0][0][0] == query[0]: 
-				return view_data[query[1]]
-				
-			data_offset = len(gp.Table_Array[joins[0][0][0]].init_columns)
-			
-			for join in joins:
-				for x in range(join[2]):
-					if join[0][1] == query[0]:
+			data_offset = 0
+			for repeat, pointer in pointer_getter(joins):
+				for x in range(repeat):
+					if pointer[0] == query[0]:
 						return view_data[data_offset+query[1]]
-					data_offset += len(gp.Table_Array[join[1][0]].init_columns)
+					data_offset += gp.Table_Array[pointer[0]].lenght
 
 		if ref[1] == OP_DICT_REF:
 			filename = ref[3]
@@ -214,27 +229,23 @@ class Change_Set:
 		return (query, OP_POS_REF, view_result_len)
 
 
-	def get_ref_view(self, query, view_result_len):
-
-		view_result = self.cs[view_result_len]
+	def get_ref_view(self, query, pos):
+		view_result = self.cs[pos]
 
 		if view_result[1] != OP_VIEW_DONE:
-			return (query, OP_POS_REF, view_result_len)
+			return (query, OP_POS_REF, pos)
 
 		joins = view_result[0]
+		view_data = view_result[2]
 
-		if joins[0][0][0] == query[0]: 
-			return view_result[2][query[1]]
-				
-		data_offset = len(gp.Table_Array[joins[0][0][0]].init_columns)
-		
-		for join in joins:
-			for x in range(join[2]):
-				if join[0][1] == query[0]:
-					return view_result[2][data_offset+query[1]]
-				data_offset += len(gp.Table_Array[join[1][0]].init_columns)
+		data_offset = 0
+		for repeat, pointer in pointer_getter(joins):
+			for x in range(repeat):
+				if pointer[0] == query[0]:
+					return view_data[data_offset+query[1]]
+				data_offset += gp.Table_Array[pointer[0]].lenght
 
-		return (query, OP_VIEW_REF, view_result_len)
+		return (query, OP_VIEW_REF, pos)
 
 	def dict_ref(self, query, data, filename=None):
 		if filename is None:
@@ -275,14 +286,15 @@ class Change_Set:
 
 class Table:
 	#example: table("time", (("tid", "INT", "NOT NULL", "AUTO_INCREMENT"),("vid_s", "INT", "NOT NULL"),("vid_e", "INT", "NOT NULL")), ("tid",), (("vid_s", "v_main", "vid"),("vid_e", "v_main", "vid")), (0, 0, 0) )
-	def __init__(self, gpid, table_name: str, columns: tuple, primary: tuple, foreign=None, initial_insert=None, no_duplicate=False, select_procedure=False):
+	def __init__(self, table_id, table_name: str, columns: tuple, primary: tuple, foreign=None, initial_insert=None, no_duplicate=False, select_procedure=False):
 		# ID in gp.Table_array
-		self.gpid = gpid
+		self.table_id = table_id
 		# Name of table as a "String"
 		self.table_name = table_name
 		# Columns with arguments in a tuple: 
 		# (("col1", "INT", "NOT NULL", "AUTO_INCREMENT"),("col2", "INT", "NOT NULL", "AUTO_INCREMENT"))
 		self.init_columns = columns
+		self.lenght = len(columns)
 		# Name of the primary key as a "String"
 		self.init_primary = primary
 		temp_primary = []
@@ -309,9 +321,10 @@ class Table:
 		# where x = globals()
 		self.select_procedure = select_procedure
 
+		# Pointer
 		for x, column in enumerate(self.init_columns):
-			setattr(self, column[0], (self.gpid, x, False))
-			setattr(self, f"{column[0]}_old", (self.gpid, x, True))
+			setattr(self, column[0], (self.table_id, x, False))
+			setattr(self, f"{column[0]}_old", (self.table_id, x, True))
 
 		# FIX FOR C_AST
 		setattr(sys.modules["parser.c_ast"], self.table_name, self)
@@ -326,7 +339,7 @@ class Table:
 		if self.no_duplicate:
 			return self.get_set(table, *columns)
 
-		return (self.gpid, OP_SET, columns)
+		return (self.table_id, OP_SET, columns)
 
 	def update(self, *columns):
 		# Makes sure no ref are in our data, if so, abort
@@ -336,16 +349,16 @@ class Table:
 			emergency_shutdown(55)
 		
 		if None not in columns:
-			return (self.gpid, OP_UPDATE, columns)
+			return (self.table_id, OP_UPDATE, columns)
 
 		primary_values = itemgetter(*self.primary)(columns)
 		primary_values = primary_values if type(primary_values) is tuple else (primary_values,)
 		get_columns = primary_values + (None,)*(len(columns)-len(self.primary))
 
-		get_result = TE.get(self.gpid, get_columns)
+		get_result = TE.get(self.table_id, get_columns)
 
 		columns = tuple(map(lambda x: x[1] if x[1] is not None else get_result[x[0]], enumerate(columns)))
-		return (self.gpid, OP_UPDATE, columns)
+		return (self.table_id, OP_UPDATE, columns)
 
 	def get(self, *columns):
 		# Makes sure no ref are in our data, if so, abort
@@ -354,22 +367,22 @@ class Table:
 			print(columns)
 			emergency_shutdown(55)
 		
-		result = TE.get(self.gpid, columns)
+		result = TE.get(self.table_id, columns)
 		if result is None:
 			return None
 
-		return (self.gpid, OP_DONE, result)
+		return (self.table_id, OP_DONE, result)
 
 	def get_set(self, *columns):
 		# Makes sure no ref are in our data, if so, skip
 		if not contains_tuple(columns):
-			result = TE.get(self.gpid, columns)
+			result = TE.get(self.table_id, columns)
 			#print(f"{self.table_name}.get result:{result}")
 
 			if result:
-				return (self.gpid, OP_DONE, result)
+				return (self.table_id, OP_DONE, result)
 
-		return (self.gpid, OP_SET, columns)
+		return (self.table_id, OP_SET, columns)
 
 	def view(self, joins, data):
 		# removing OLD

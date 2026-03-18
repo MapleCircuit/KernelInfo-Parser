@@ -33,10 +33,10 @@ class TE_direct_db():
 		self.queued_view = {}
 
 		for table in tables:
-			self.tables[table.gpid] = table
-			self.queued_set[table.gpid] = {}
-			self.queued_update[table.gpid] = []
-			self.next_id[table.gpid] = self.db.get_next_id(table)
+			self.tables[table.table_id] = table
+			self.queued_set[table.table_id] = {}
+			self.queued_update[table.table_id] = []
+			self.next_id[table.table_id] = self.db.get_next_id(table)
 
 		return
 

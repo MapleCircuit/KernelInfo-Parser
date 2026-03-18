@@ -18,6 +18,12 @@ class mysql_db():
 		self.cursor.execute(f"SET GLOBAL max_allowed_packet = {MAX_ALLOWED_PACKET};")
 		self.cnx.commit()
 
+	def __enter__(self):
+		return self
+	
+	def __exit__(self, exception_type, exception_value, exception_traceback):
+		return
+
 	def __del__(self):
 		self.cursor.close()
 		self.cnx.close()
@@ -168,15 +174,15 @@ class mysql_db():
 			self.cursor.execute(sql, tuple(filter(lambda val: val is not None, columns)))
 			return self.cursor.fetchone()
 
-		gpid_to_alias_dict = {joins[0][0][0]: 1}
+		table_id_to_alias_dict = {joins[0][0][0]: 1}
 		alias_offset = 1
 
 		for i, join in enumerate(joins):
 			for x in range(join[2]):
 				alias_offset += 1
 				if x == 0:
-					gpid_to_alias_dict[join[1][0]] = alias_offset
-				sql += f" JOIN {tables[join[1][0]].table_name} A{alias_offset} ON A{gpid_to_alias_dict[join[0][0]]}.{tables[join[0][0]].init_columns[join[0][1]][0]} = A{alias_offset}.{tables[join[1][0]].init_columns[join[1][1]][0]}"
+					table_id_to_alias_dict[join[1][0]] = alias_offset
+				sql += f" JOIN {tables[join[1][0]].table_name} A{alias_offset} ON A{table_id_to_alias_dict[join[0][0]]}.{tables[join[0][0]].init_columns[join[0][1]][0]} = A{alias_offset}.{tables[join[1][0]].init_columns[join[1][1]][0]}"
 				
 
 				for i, init_column in enumerate(tables[join[1][0]].init_columns):
