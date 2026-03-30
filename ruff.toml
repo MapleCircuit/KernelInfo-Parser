@@ -1,0 +1,6 @@
+
+[lint.pep8-naming]
+extend-ignore-names = ["CS","CPPro_*", "Ast_*"]
+
+[lint.per-file-ignores]
+"parser/c_ast.py" = ["D107"]
