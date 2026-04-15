@@ -5,7 +5,10 @@ import re
 import clang.cindex as cc
 import ctypes
 import json
+import logging
 from typing import Self
+
+logger = logging.getLogger(__name__)
 
 # Linter bypass
 m_v_main = m_file_name = m_file = m_bridge_file = m_moved_file = m_ast = m_ast_container = m_ast_include = m_ast_debug = m_tag = m_bridge_tag = None
@@ -30,7 +33,7 @@ def c_ast_parse(CS: ChangeSetType) -> None:
             get_prior_tags(CS)
             close_prior_tags(CS)
         else:
-            print(f"this shit[{CS}] is not implemented---c_ast_parse()---")
+            logger.error(f"this shit[{CS}] is not implemented---c_ast_parse()---")
 
     return
 
@@ -160,7 +163,7 @@ class Line:
                     self.line_pos = (args[0].start.line, args[0].end.line)
                     self.char_pos = (args[0].start.column, args[0].end.column)
                 else:
-                    print("Line: 1 ARGS TYPE ERROR")
+                    logger.error("Line: 1 ARGS TYPE ERROR")
             case 2:
                 self.line_pos = (args[0], args[1])
                 self.char_pos = (0, 0)
@@ -722,13 +725,13 @@ class Ast_Manager:
                 # Start #elifndef AND #elifdef
                 case "#elifndef":
                     if G.OVERRIDE_GLOBAL_C_AST:
-                        print(
+                        logger.error(
                             f"SOME RETARDED DEVS, ADDED THIS FUCKING BULSHIT TO THEIR CODE: #elifndef , Line:{current_line + 1}"
                         )
                     G.emergency_shutdown(6)
                 case "#elifdef":
                     if G.OVERRIDE_GLOBAL_C_AST:
-                        print(
+                        logger.error(
                             f"SOME RETARDED DEVS, ADDED THIS FUCKING BULSHIT TO THEIR CODE: #elifdef , Line:{current_line + 1}"
                         )
                     G.emergency_shutdown(7)
@@ -875,8 +878,6 @@ class Ast_Manager:
                 case "#line":
                     line_in_work = working_line[5:].lstrip()
                     lineno = re.match(r"^\d+", line_in_work).group(1)
-                    print(current_file)
-                    print(f"this is a #line ({line_in_work}) ({lineno})")
 
                     try:
                         filename = line_in_work[len(lineno) :].lstrip()

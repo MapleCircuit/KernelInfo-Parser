@@ -26,10 +26,13 @@ from globalstuff import (
     UnSafeDataType,
 )
 import sys
+import logging
 from parser.c_ast import c_ast_parse
 from operator import itemgetter
 from typing import Self
 from types import TracebackType
+
+logger = logging.getLogger(__name__)
 
 # Basics in how this Works:
 # ***At the top of globalstuff.py we have a list of all the types, it may help.***
@@ -184,7 +187,7 @@ class ChangeSet:
     def last_not_none(self) -> None:
         """Check if last value in CS.cs is None."""
         if self.cs[-1] is None:
-            print("Last not None Error")
+            logger.error("Last not None Error")
             raise CONTINUE_EXCEPTION
         return
 
@@ -233,7 +236,7 @@ class ChangeSet:
                 self.cs_result.append(G.TE.view_set(operation[0], data))
                 continue
 
-            print(f"ERROR, UNKNOWN OPERATION{operation}")
+            logger.error(f"ERROR, UNKNOWN OPERATION{operation}")
 
         self.cs_processed = True
         return True
@@ -327,14 +330,14 @@ class ChangeSet:
                     if pointer[0] == query[0]:
                         return view_data[data_offset + query[1]]
                     data_offset += self.gp.Table_Array[pointer[0]].length
-            print("something wrong with get_value_at while in a view")
-            print(f"query:{query} pos:{pos}")
+            logger.error("something wrong with get_value_at while in a view")
+            logger.error(f"query:{query} pos:{pos}")
             G.emergency_shutdown(456)
 
         # sanity check the table_id of the target
         if operation[0] != query[0]:
-            print("something wrong with get_value_at, table_id do not match")
-            print(f"query:{query} pos:{pos}")
+            logger.error("something wrong with get_value_at, table_id do not match")
+            logger.error(f"query:{query} pos:{pos}")
             G.emergency_shutdown(457)
 
         if len(self.cs_result) > pos:
@@ -343,9 +346,6 @@ class ChangeSet:
         #result= <   data   >|<  row  >
         result = operation[2][query[1]]
         return None if type(result) is tuple else result
-
-        print("how did we get here")
-        return None
 
     @G.type_check(Self, PointerType, RouteType)
     def resolve_ref(self, query: PointerType, parsed_route: RouteType) -> SafeDataType:
@@ -400,8 +400,8 @@ class ChangeSet:
             else:
                 pass
         except FILE_ERROR as e:
-            print(f"FILE_ERROR for '{self.file_operation}'={self.current_path}")
-            print(e)
+            logger.error(f"FILE_ERROR for '{self.file_operation}'={self.current_path}")
+            logger.error(e)
             self.cs = []
 
         return
@@ -496,9 +496,9 @@ class Table:
     def update(self, *columns: SafeDataType) -> OperationType:
         """Create update operation, will execute get to fill None(s)."""
         if is_data_unsafe(columns):
-            print(f"""An {self.table_name}.update was done with unresolved refs,
+            logger.error(f"""An {self.table_name}.update was done with unresolved refs,
             This is unexpedted behavior. CRASH""")
-            print(columns)
+            logger.error(columns)
             G.emergency_shutdown(55)
 
         if None not in columns:
@@ -522,9 +522,9 @@ class Table:
     def get(self, *columns: SafeDataType) -> OperationType|None:
         """Create get operation, can return None if nothing found."""
         if is_data_unsafe(columns):
-            print(f"""An {self.table_name}.get was done with unresolved refs,
+            logger.error(f"""An {self.table_name}.get was done with unresolved refs,
             This is unexpedted behavior. CRASH""")
-            print(columns)
+            logger.error(columns)
             G.emergency_shutdown(55)
 
         result = G.TE.get(self.table_id, columns)

@@ -144,7 +144,7 @@ class TEDirectDB:
 
     def commit(self, table_id: int) -> None:
         """Commit all change to DB."""
-        print(f"======{self.tables[table_id].table_name}======")
+        #print(f"======{self.tables[table_id].table_name}======")
         if self.queued_set[table_id]:
             if self.tables[table_id].no_duplicate:
                 self.db.insert(

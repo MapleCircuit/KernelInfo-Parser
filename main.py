@@ -7,7 +7,9 @@ from globalstuff import (
     REF_OLD,
     REF_NOT_RESOLVABLE,
     CONTINUE_EXCEPTION,
+    T_DIR,
 )
+import logging
 import argparse
 import multiprocessing
 from queue import SimpleQueue
@@ -21,6 +23,12 @@ G.DB = MariaDB
 G.TE = TEDirectDB()
 MF = MasterFile()
 gp = GreatProcessor()
+logging.basicConfig(
+    level=logging.INFO,  # Set the minimum logging level
+    format="%(asctime)s - %(levelname)s - %(message)s"  # Format of log messages
+)
+logger = logging.getLogger(__name__)
+
 
 ##################################
 # DB STRUCTURE
@@ -226,7 +234,7 @@ gp.Table_Array.append(
 
 def update(version: str) -> None:
     """Execute main processing loop."""
-    print(COLOR.green(f"=======================Working on {version}======================="))
+    logger.info(COLOR.green(f"=======================Working on {version}======================="))
     create_new_vid(version)
 
     # Index Handling
@@ -257,9 +265,9 @@ def update(version: str) -> None:
     while not cs_queue.empty():
         max_loop -= 1
         if max_loop < 0:
-            print(f"max loop ({len(gp.ChangeSet_Dict)*G.OVERRIDE_FC_MAX_LOOP_EXEC_MULT}) was brought to 0, printing queue:")
+            logger.error(f"max loop ({len(gp.ChangeSet_Dict)*G.OVERRIDE_FC_MAX_LOOP_EXEC_MULT}) was brought to 0, printing queue:")
             while not cs_queue.empty():
-                print(gp.ChangeSet_Dict[cs_queue.get()])
+                logger.error(gp.ChangeSet_Dict[cs_queue.get()])
             G.emergency_shutdown(666)
         current_cs = cs_queue.get()
         try:
@@ -340,8 +348,8 @@ def main() -> None:
     update("v3.4")
     update("v3.5")
     #except Exception as e:  # noqa: BLE001
-    #    print("Error in Update()")
-    #    print(e)
+    #    logger.error("Error in Update()")
+    #    logger.error(e)
     #    G.emergency_shutdown(2)
 
     G.emergency_shutdown(0)
@@ -370,7 +378,7 @@ def arg_handling() -> None:
     args = parser.parse_args()
 
     if args.Drop:
-        print("Dropping all tables")
+        logger.info("Dropping all tables")
         gp.drop_all()
     if args.Create_Tables:
         gp.create_table_all()
@@ -562,7 +570,7 @@ def default_processing(CS: ChangeSet) -> None:
             ))
 
     except CONTINUE_EXCEPTION:
-        print(f"CONTINUE_EXCEPTION:'{CS.file_operation}'={CS.current_path}")
+        logger.error(f"CONTINUE_EXCEPTION:'{CS.file_operation}'={CS.current_path}")
 
     # If not yet processed
     if not CS.cs:
@@ -644,34 +652,34 @@ def processing_unchanges() -> None:
     forgotten_delete = (old_full_set - full_set) - deleted_set
 
     if forgotten_delete:
-        print("There seems to be forgotten deletes... Processing...")
+        logger.warning("There seems to be forgotten deletes... Processing...")
         if G.OVERRIDE_FORGOTTEN_PRINT:
-            print(forgotten_delete)
+            logger.debug(forgotten_delete)
         file_processing(0, 0, (f"D\t{x}" for x in forgotten_delete))
         #map(lambda x: f"D\t{x}", forgotten_delete))
 
     forgotten_new = (full_set - old_full_set) - changed_set
     if forgotten_new:
-        print("There seems to be forgotten_new...")
+        logger.warning("There seems to be forgotten_new...")
         if G.OVERRIDE_FORGOTTEN_PRINT:
-            print(forgotten_new)
+            logger.debug(forgotten_new)
 
     CS = ChangeSet()
     for unchanged in unchanged_set:
         un_m_file_name = m_file_name.get(None, unchanged)
         if un_m_file_name is None:
-            print("processing_unchanges: un_m_file_name is None")
-            print(unchanged)
-            print(gp.Old_VID)
-            print(m_file_name.get(m_file_name.fname(unchanged)))
+            logger.error("processing_unchanges: un_m_file_name is None")
+            logger.error(unchanged)
+            logger.error(gp.Old_VID)
+            logger.error(m_file_name.get(m_file_name.fname(unchanged)))
             continue
         un_m_bridge_file = m_bridge_file.get(gp.Old_VID, un_m_file_name[2][0], None)
 
         if un_m_bridge_file is None:
-            print("processing_unchanges: un_m_bridge_file is None")
-            print(unchanged)
-            print(gp.Old_VID)
-            print(m_file_name.get(m_file_name.fname(unchanged)))
+            logger.error("processing_unchanges: un_m_bridge_file is None")
+            logger.error(unchanged)
+            logger.error(gp.Old_VID)
+            logger.error(m_file_name.get(m_file_name.fname(unchanged)))
             continue
         CS.store(m_bridge_file.set(
             gp.VID,
@@ -700,15 +708,15 @@ def processing_dirs() -> None:  # noqa: C901
             un_m_file_name = m_file_name.get(None, single_dir)
             if un_m_file_name is None:
                 new_dir_list.add(single_dir)
-                print("Unchanged dirs: m_file_name is None")
-                print(single_dir)
+                logger.error("Unchanged dirs: m_file_name is None")
+                logger.error(single_dir)
                 continue
             # Get old_m_bridge_file
             old_m_bridge_file = m_bridge_file.get(gp.Old_VID, un_m_file_name[2][0],None)
             if old_m_bridge_file is None:
                 new_dir_list.add(single_dir)
-                print("Unchanged dirs: old_m_bridge_file is None")
-                print(single_dir)
+                logger.error("Unchanged dirs: old_m_bridge_file is None")
+                logger.error(single_dir)
                 continue
             CS.store(m_bridge_file.set(
                 gp.VID,
@@ -725,7 +733,7 @@ def processing_dirs() -> None:  # noqa: C901
             # 0 Check if FNAME exist/Create FNAME
             CS.store(m_file_name.get_set(None, single_dir))
             # 1 Create FILE
-            CS.store(m_file.set(None, gp.VID, 0, 1, "A", 0))
+            CS.store(m_file.set(None, gp.VID, 0, T_DIR, "A", 0))
             # 2 Create BRIDGE FILE
             CS.store(m_bridge_file.set(
                 gp.VID,
@@ -739,15 +747,15 @@ def processing_dirs() -> None:  # noqa: C901
         for single_dir in old_dir_list - dir_list:
             # Get m_file_name
             if (del_m_file_name := m_file_name.get(None, single_dir)) is None:
-                print("Deleted dirs: m_file_name is None")
-                print(single_dir)
+                logger.error("Deleted dirs: m_file_name is None")
+                logger.error(single_dir)
                 continue
             # Get old_m_bridge_file
             old_m_bridge_file = m_bridge_file.get(gp.Old_VID, del_m_file_name[2][0], None)
             if old_m_bridge_file is None:
                 new_dir_list.add(single_dir)
-                print("Deleted dirs: old_m_bridge_file is None")
-                print(single_dir)
+                logger.error("Deleted dirs: old_m_bridge_file is None")
+                logger.error(single_dir)
                 continue
 
             # 0 Update old FILE
@@ -769,7 +777,7 @@ def processing_dirs() -> None:  # noqa: C901
             # 0 Check if FNAME exist/Create FNAME
             CS.store(m_file_name.get_set(None, single_dir))
             # 1 Create FILE
-            CS.store(m_file.set(None, gp.VID, 0, 1, "A", 0))
+            CS.store(m_file.set(None, gp.VID, 0, T_DIR, "A", 0))
             # 2 Create BRIDGE FILE
             CS.store(m_bridge_file.set(
                 gp.VID,

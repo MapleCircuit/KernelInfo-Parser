@@ -1,0 +1,363 @@
+<html>
+<head>
+<style>
+.wrapper {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    width: auto;
+    height: auto;
+    overflow-x: auto;
+    overflow-y: scroll;
+    box-sizing: inherit;
+    display: flex;margin: 0;
+    flex-direction: column;
+}
+main {display: flex;flex-direction: row;height: 100%;}
+button {
+  background: none;
+  border: none;
+  cursor: pointer;
+}
+
+.table-tags{table, th, td {border: 1px solid black;padding:1px;}}
+
+.topbar {background-color: grey;}
+.search {display: flex; justify-content: flex-end;}
+.sidebar {color: #fff;background-color: #111; flex: 5%;}
+.slink {color: #fff;}
+.workspace {flex: 95%}
+.tabs {background-color: #b3b3b3;flex: 95%;}
+.tab {background-color: #a6a6a6;display: inline-block;padding: 0.35em;border: 1px solid #ccc;font-weight: 700;}
+.active {background-color: red;}
+.left-pad {padding-left: 2%;}
+.tag-code {border: 1px solid black;padding: 0.35em;}
+</style>
+
+</head>
+<body>
+<div class="wrapper">
+
+<header class="topbar">
+   
+</header>
+
+<main>
+<aside class="sidebar">
+<div id="sidebar">
+</div>
+</aside>
+
+<div class="workspace">
+
+<header class="tabs">
+<div id="tab">
+|
+
+</div>
+</header>
+
+<div id="content" class="content">
+    <div class="loginPopup">
+      <div class="formPopup" id="popupForm">
+        <h2>Please select your api address</h2>
+          <label for="api-addr">
+            <strong>API address</address></strong>
+          </label>
+          <input type="text" id="api-addr" placeholder="Your API address" name="api-addr">
+          <button id="login-button">Log in</button>
+        </form>
+      </div>
+    </div>
+</div>
+</div>
+
+</main>
+</div>
+</body>
+<script>
+let server = "http://192.168.2.190:8000/"
+
+const tabs_arr = [];
+let active_index = 0;
+
+
+class tab {
+    constructor(version, path, html, active = true) {
+        this.version = version;
+        this.path = path;
+        this.html = html;
+        this.active = active;
+    }
+
+    static async create(version, path, active = true) {
+        const htmlContent = await generate_content(version, path);
+        return new tab(version, path, htmlContent, active);
+    }
+    async update_file(path) {
+        const htmlContent = await generate_content(this.version, path);
+        this.path = path;
+        this.html = htmlContent;
+    }
+}
+
+
+
+
+function clear_active_tab(){
+    tabs_arr.forEach((item, index) => {
+        if (item.active) {
+            item.active = false;
+        }
+    });
+}
+
+function print_tabs(){
+    let text = "<button onclick=\"expend_all()\">EXPAND</buton>";
+    tabs_arr.forEach((item, index) => {
+        if (item.active) {
+            text += "<button onclick=\"clicked_tab('" + index + "')\" class=\"active\">" + item.version + ":" + item.path + "</buton>";
+            active_index = index;
+        } else {
+            text += "<button onclick=\"clicked_tab('" + index + "')\">" + item.version + ":" + item.path + "</buton>";
+        }
+    });
+    document.getElementById("tab").innerHTML = text;
+    document.getElementById("content").innerHTML = tabs_arr[active_index].html;
+}
+
+function clicked_tab(tab_index){
+    clear_active_tab();
+    tabs_arr[tab_index].active = true;
+    print_tabs();
+}
+
+function jsonToHtmlTable(jsonData) {
+    if (typeof jsonData === "string") {
+        jsonData = JSON.parse(jsonData);
+    }
+    if (!Array.isArray(jsonData)) {
+        jsonData = [jsonData];
+    }
+
+    const getHeaders = (data) => {
+        const headers = new Set();
+        data.forEach(obj => Object.keys(obj).forEach(k => headers.add(k)));
+        return Array.from(headers);
+    };
+
+    const createTable = (data) => {
+        const headers = getHeaders(data);
+        let html = '<table class="table-tags"><thead><tr>';
+        headers.forEach(h => html += `<th>${h}</th>`);
+        html += '</tr></thead><tbody>';
+
+        data.forEach(row => {
+            html += '<tr>';
+            headers.forEach(h => {
+                let cell = row[h];
+                if (Array.isArray(cell) && typeof cell !== 'string') {
+                    let len = cell.length;
+                    for (let i = 0; i < len; i++) {
+                        if (typeof cell[i] === 'object' && cell[i] !== null) {
+                            cell[i] = createTable(Array.isArray(cell[i]) ? cell[i] : [cell[i]]);
+                        }
+                    }
+                    cell = cell.join(", ");
+                }
+                if (typeof cell === 'object' && cell !== null) {
+                    cell = createTable(Array.isArray(cell) ? cell : [cell]);
+                }
+                
+                html += `<td>${cell !== undefined ? cell : ''}</td>`;
+            });
+            html += '</tr>';
+        });
+
+        html += '</tbody></table>';
+        return html;
+    };
+
+    return createTable(jsonData);
+}
+
+
+function expend_all() {
+    document.querySelectorAll("details").forEach(el => {
+        el.open = true; // Set the 'open' attribute to expand
+    });
+}
+
+async function fetch_file(version, path){
+    if (path == "/") {path = "";}
+    let request = await fetch(server + "v/" + version + "/" + path);
+    return await request.json();
+}
+
+async function fetch_tid(tid){
+    let request = await fetch(server + "api/tid/" + tid);
+    return await request.json();
+}
+
+
+async function fetch_raw_file(version, path){
+    let request = await fetch(server + "api/rf/" + version + "/" + path);
+    return await request.json();
+}
+
+async function fetch_include(fid){
+    let request = await fetch(server + "api/i/" + fid);
+    return await request.json();
+}
+
+async function fetch_tag(fid){
+    let request = await fetch(server + "api/t/" + fid);
+    return await request.json();
+}
+
+async function fetch_c_file(fid){
+    let request = await fetch(server + "api/cf/" + fid);
+    return await request.json();
+}
+
+async function fetch_c_tag(tgid){
+    let request = await fetch(server + "api/ct/" + tgid);
+    return await request.json();
+}
+
+async function generate_content(version, path){
+    let request_json = await fetch_file(version, path);
+    let text = "<button class=\"dlink\" onclick=\"open_file('/')\">..</button><br>";
+    console.log(request_json);
+
+    if (request_json == -1){
+        text += "<p>ERROR, IN FUNCTION GENERATE_CONTENT</p>";
+        return text
+    }
+
+    if (path.includes("/")){
+        text = "<button class=\"dlink\" onclick=\"open_file('" + path.slice(0, path.lastIndexOf('/')) + "')\">..</button><br>";
+    }
+    
+    if (request_json.ftype == 0){
+        let len = request_json.sub_dirs.length;
+        for (let i = 0; i < len; i++) {
+            file_name = request_json.sub_dirs[i].slice(request_json.sub_dirs[i].lastIndexOf('/') + 1);
+            text += "<button class=\"dlink\" onclick=\"open_file('" + request_json.sub_dirs[i] + "')\">" + file_name + "</button><br>";
+        }
+    } else if (request_json.ftype == 1) {
+        tags = request_json.tags;
+        delete request_json.tags;
+
+        text += jsonToHtmlTable(request_json) + "<br>";
+
+        text += "<div class=\"left-pad\"><details><summary><b>tags: </b></summary><p>";
+        let len_tags = tags.length;
+        for (let i = 0; i < len_tags; i++) {
+            if ("name" in tags[i]){
+                if (!(tags[i].name === null)){
+                    text += "<b>" + tags[i].name + "</b>"
+                }
+                delete tags[i].name
+            }
+            tag_code = null
+            if ("code" in tags[i]){
+                if (!(tags[i].code === null)){
+                    tag_code = tags[i].code;
+                    delete tags[i].code;
+                }
+            }
+            tag_ast_raw = null
+            if ("ast_raw" in tags[i]){
+                if (!(tags[i].ast_raw === null)){
+                    tag_ast_raw = tags[i].ast_raw
+                }
+                delete tags[i].ast_raw
+            }
+            text += jsonToHtmlTable(tags[i]);
+            if ((tag_code == null) && (tag_ast_raw == null)){
+                text += "<br>";
+                break
+            }
+            if (tag_code != null){
+                text += "<div class=\"left-pad\"><details><summary><b>code: </b></summary><p><code class=\"tag-code\">" + tag_code + "</code><br><br>";
+                text += "</p></details></div>";
+            }
+
+            if (tag_ast_raw != null){
+                text += "<div class=\"left-pad\"><details><summary><b>ast_raw: </b></summary><p>" + jsonToHtmlTable(tag_ast_raw) + "<br><br>";
+                text += "</p></details></div>";
+            }
+            
+            text += "<br>"
+        }
+        text += "</p></details></div>";
+    }
+
+
+
+
+    text += request_json.ftype;
+    return text
+}
+
+async function open_version(version){
+    clear_active_tab();
+    tabs_arr.push(await tab.create(version, "/"));
+    print_tabs();
+}
+
+async function open_file(path){
+    await tabs_arr[active_index].update_file(path);
+    print_tabs();
+}
+
+async function fetch_sidebar(){
+    let request = await fetch(server + "versions");
+    let request_arr = await request.json();
+
+    let len = request_arr.length;
+    let text = "";
+
+    for (let i = 0; i < len; i++) {
+        text += "<button class=\"slink\" onclick=\"open_version('" + request_arr[i][1] + "')\">" + request_arr[i][1] + "</button><br>";
+    }
+    return text
+}
+
+async function exec_sidebar(){
+    document.getElementById("sidebar").innerHTML = await fetch_sidebar();
+}
+
+function main(){
+    exec_sidebar()
+}
+
+
+async function ping_test(){
+    let result = fetch(server, {
+        method: 'GET'
+    })
+    .then(response => response.json())
+    .then(data => true)
+    .catch(error => false);
+    return result
+}
+
+async function server_test_boot(api_addr) {
+    server = api_addr
+    console.log(server)
+    if (await ping_test()){
+        main()
+    }
+}
+
+document.getElementById("login-button").addEventListener("click", function foo(){server_test_boot(document.getElementById("api-addr").value)});
+
+server_test_boot(server)
+
+
+</script>
+</html>
