@@ -72,6 +72,20 @@ class GlobalStuff:
         # TypeCheck
         self.DEBUG_TYPECHECK = True
 
+        self.OP_isinstanceDict = {
+            PointerType:self.is_PointerType,
+            JoinType:self.is_JoinType,
+            JoinsType:self.is_JoinsType,
+            OperationType:self.is_OperationType,
+            LinkType:self.is_LinkType,
+            RouteType:self.is_RouteType,
+            RefType:self.is_RefType,
+            SafeDataType:self.is_SafeDataType,
+            UnSafeDataType:self.is_UnSafeDataType,
+            None:lambda x: x is None,
+        }
+
+
 
     @classmethod
     def emergency_shutdown(cls, number_error: int=1) -> None:
@@ -162,31 +176,16 @@ s: Step to the next line in this function or a called function.
     def is_UnSafeDataType(self, variable: UnSafeDataType) -> bool:
         return bool(self.is_SafeDataType(variable) or self.is_RefType(variable))
 
+
+
     def OP_isinstance(self, arg: any, expected_type: any) -> bool:
         #print(f"OP_isinstance arg:{arg} expected_type:{expected_type}")
-        if expected_type == PointerType:
-            return self.is_PointerType(arg)
-        elif expected_type == JoinType:
-            return self.is_JoinType(arg)
-        elif expected_type == JoinsType:
-            return self.is_JoinsType(arg)
-        elif expected_type == OperationType:
-            return self.is_OperationType(arg)
-        elif expected_type == LinkType:
-            return self.is_LinkType(arg)
-        elif expected_type == RouteType:
-            return self.is_RouteType(arg)
-        elif expected_type == RefType:
-            return self.is_RefType(arg)
-        elif expected_type == SafeDataType:
-            return self.is_SafeDataType(arg)
-        elif expected_type == UnSafeDataType:
-            return self.is_UnSafeDataType(arg)
-        elif expected_type is None:
-            return arg is None
+
+        if (type_detected := self.OP_isinstanceDict.get(expected_type)) is not None:
+            return type_detected(arg)
         else:
             return isinstance(arg, expected_type)
-        return False
+
 
     def type_check(self, *expected_types):
         def decorator(func):

@@ -18,6 +18,9 @@ from table_engine.te_direct_db import TEDirectDB
 from FileHandler import MasterFile
 from TableHandling import Table, ChangeSet
 from GreatProcessor import GreatProcessor
+#import cProfile
+#import pstats
+
 
 G.DB = MariaDB
 G.TE = TEDirectDB()
@@ -220,6 +223,8 @@ gp.Table_Array.append(
             ("tag_id", "INT", "NOT NULL"),
             ("line_s", "INT", "NOT NULL"),
             ("line_e", "INT", "NOT NULL"),
+            ("char_s", "INT", "NOT NULL"),
+            ("char_e", "INT", "NOT NULL"),
         ),
         primary=("fid", "tag_id"),
         foreign=(("fid", "m_file", "fid"), ("tag_id", "m_tag", "tag_id")),
@@ -342,11 +347,11 @@ def main() -> None:
 
     #try:
     update("v3.0")
-    update("v3.1")
-    update("v3.2")
-    update("v3.3")
-    update("v3.4")
-    update("v3.5")
+    #update("v3.1")
+    #update("v3.2")
+    #update("v3.3")
+    #update("v3.4")
+    #update("v3.5")
     #except Exception as e:  # noqa: BLE001
     #    logger.error("Error in Update()")
     #    logger.error(e)
@@ -601,6 +606,10 @@ def default_processing(CS: ChangeSet) -> None:
 
 def file_processing(start: int, end: int | None, override_list: list[str] | None=None) -> None:
     """Process gp.Change_List and sent CS into gp.ChangeSet_Dict."""
+
+    #profiler = cProfile.Profile()
+    #profiler.enable()
+
     G.TE.start_new_db(G.DB)
     if override_list:
         changed_files = override_list
@@ -625,6 +634,15 @@ def file_processing(start: int, end: int | None, override_list: list[str] | None
 
     if override_list is None:
         gp.push_set_to_main()
+
+
+    #profiler.disable()
+
+    # Create statistics object and format output
+    #stats = pstats.Stats(profiler)
+    # Sort by cumulative time (time in function + all subcalls)
+    #stats.sort_stats('cumulative')
+    #stats.print_stats()
     return
 
 

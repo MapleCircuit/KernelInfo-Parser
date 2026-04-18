@@ -172,16 +172,15 @@ class Line:
                 self.char_pos = (args[2], args[3])
 
     # Code Capture
-    def cc(self, rawfile: str) -> Self:
+    def cc(self, rawfile: tuple[str]) -> Self:
         """Extract the str using line/col pos."""
-        split_rawfile = rawfile.splitlines()
 
         # Line Select
         try:
             if self.line_pos[0] == self.line_pos[1]:
-                self.code = split_rawfile[self.line_pos[0] - 1]
+                self.code = rawfile[self.line_pos[0] - 1]
             else:
-                self.code = "\n".join(split_rawfile[self.line_pos[0] - 1 : self.line_pos[1]])
+                self.code = "\n".join(rawfile[self.line_pos[0] - 1 : self.line_pos[1]])
         except IndexError:
             self.code = ""
             return self
@@ -196,7 +195,7 @@ class Line:
             #  Char Trim
             try:
                 self.code = self.code[
-                    char_start : (char_end - len(split_rawfile[self.line_pos[1] - 1]))
+                    char_start : (char_end - len(rawfile[self.line_pos[1] - 1]))
                 ]
             except IndexError:
                 self.code = ""
@@ -254,6 +253,8 @@ class Ast:
                             tag[4],
                             self.line.line_pos[0],
                             self.line.line_pos[1],
+                            self.line.char_pos[0],
+                            self.line.char_pos[1],
                         ))
                     return
 
@@ -266,6 +267,8 @@ class Ast:
             CS.ref(m_tag.tag_id, REF_POS, len(CS.cs) - 1),
             self.line.line_pos[0],
             self.line.line_pos[1],
+            self.line.char_pos[0],
+            self.line.char_pos[1],
         ))
         return
 
@@ -641,10 +644,6 @@ class Ast_Manager:
         self.mfdir = CS.mf.version_dict[CS.gp.Version_Name]
         self.filename = CS.current_path
         self.fullfilename = f"{self.mfdir}/{self.filename}"
-        try:
-            self.rawfile = Path(self.fullfilename).read_text(encoding="latin-1")
-        except Exception as e:
-            raise FILE_ERROR(e)
         self.processing_list = []
         self.cppro_parse_result = []
         self.Init_Parse()
@@ -981,7 +980,7 @@ class Ast_Manager:
         try:
             if fucked:
                 # FUCKING ARRAY TEST
-                fucjk_line = self.rawfile.splitlines()[c_children.extent.end.line - 1][
+                fucjk_line = self.rawfile[c_children.extent.end.line - 1][
                     c_children.extent.end.column - 1 :
                 ].lstrip()
 
@@ -1098,15 +1097,15 @@ class Ast_Manager:
         )
 
     def ast_parse_enum_decl(self, c_children):
-        enum_list = []
-        for kids in c_children.get_children():
-            if cc.CursorKind.ENUM_CONSTANT_DECL == kids.kind:
-                enum_list.append(kids.spelling)
+        #enum_list = []
+        #for kids in c_children.get_children():
+        #    if cc.CursorKind.ENUM_CONSTANT_DECL == kids.kind:
+        #        enum_list.append(kids.spelling)
 
         return Ast_ENUM_DECL(
             Line(c_children.extent).cc(self.rawfile),
             c_children.spelling,
-            tuple(enum_list),
+            tuple(kids.spelling for kids in filter(lambda x: x.kind == cc.CursorKind.ENUM_CONSTANT_DECL, c_children.get_children())),
         )
 
     def ast_parse_macro_instantiation(self, c_children):
@@ -1133,7 +1132,7 @@ class Ast_Manager:
             )
 
         try:
-            args = self.rawfile.splitlines()[c_children.extent.end.line - 1][
+            args = self.rawfile[c_children.extent.end.line - 1][
                 c_children.extent.start.column - 1 + len(name)
                 : c_children.extent.end.column - 1
             ]
@@ -1196,16 +1195,22 @@ class Ast_Manager:
 
     # include/linux/lockd/bind.h
     def Init_Parse(self) -> None:
+        try:
+            self.unsplit_rawfile = Path(self.fullfilename).read_text(encoding="latin-1")
+        except Exception as e:
+            raise FILE_ERROR(e)
 
-        current_file = self.rawfile
-        self.cppro_parse_result = self.cppro_parse(current_file, self.filename)
+        self.rawfile = tuple(self.unsplit_rawfile.splitlines())
+
+        self.cppro_parse_result = self.cppro_parse(self.unsplit_rawfile, self.filename)
 
         cppro_cindex_input = []
         if G.OVERRIDE_CPPRO_CINDEX_INPUT:
-            for ifdefs in filter(
-                lambda x: x.__class__.__name__ == "CPPro_ifdef", self.cppro_parse_result
-            ):
-                cppro_cindex_input.append(f"-D{ifdefs.identifier}")
+            #for ifdefs in filter(
+            #    lambda x: x.__class__.__name__ == "CPPro_ifdef", self.cppro_parse_result
+            #):
+            #    cppro_cindex_input.append(f"-D{ifdefs.identifier}")
+            cppro_cindex_input = [f"-D{ifdefs.identifier}" for ifdefs in filter(lambda x: x.__class__.__name__ == "CPPro_ifdef", self.cppro_parse_result)]
 
         # Initialize the Clang index
 
@@ -1239,7 +1244,6 @@ class Ast_Manager:
         )
         if G.OVERRIDE_CINDEX_SKIPPED_PRINT and G.OVERRIDE_GLOBAL_C_AST:
             print(COLOR.green("=======Skipped_ranges.contents======="))
-            temp_content = current_file.splitlines()
             for i in range(Skipped_ranges.contents.count):
                 print(
                     f"Skipped_range {i}: {Skipped_ranges.contents.ranges[i].start.file}"
@@ -1247,12 +1251,12 @@ class Ast_Manager:
                 print(
                     f"          Line:({Skipped_ranges.contents.ranges[i].start.line}, {Skipped_ranges.contents.ranges[i].end.line})"
                 )
-                for content in temp_content[
+                for content in self.rawfile[
                     Skipped_ranges.contents.ranges[i].start.line
                     - 1 : Skipped_ranges.contents.ranges[i].end.line
                 ]:
                     print(f"   {content}")
-            del temp_content
+
 
         self.processing_list = []
         for kids in translation_unit.cursor.get_children():
@@ -1260,6 +1264,7 @@ class Ast_Manager:
                 if result := self.ast_parse(kids):
                     self.processing_list.append(result)
 
+        
         if G.OVERRIDE_CPPRO_PRINT and G.OVERRIDE_GLOBAL_C_AST:
             print(COLOR.green("=======Start CPPro Result======="))
             for cppro_elements in self.cppro_parse_result:
