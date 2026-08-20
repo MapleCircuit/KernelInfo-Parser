@@ -1409,16 +1409,17 @@ class TypeSegment():
                 and self.cqual == CQual.Empty
             ):
                 notbind_type = get_notbind_type(self.content[0].type)
-                with CS(REF_POS):
+                op_idx = len(CS.cs)
+                with CS(REF_NO_REF):
                     CS.store(m_ast.get_set(
                         None,
                         self.content[1].code,
                         notbind_type,
                     ))
-                    route_key = CS.get_route_parse()
-                    self.type_id = self.content[0].type
-                    self.ref_type = TSRef.Route_Ref
-                    self.ref = route_key
+                route_key = (REF_POS, op_idx)
+                self.type_id = self.content[0].type
+                self.ref_type = TSRef.Route_Ref
+                self.ref = route_key
                 return
 
             compound = []
@@ -1430,13 +1431,14 @@ class TypeSegment():
                 if typetoken.type in (ASTT.C_struct, ASTT.C_functionproto, ASTT.C_union, ASTT.C_enum):
                     if i > 0 and self.content[i - 1].type == typetoken.type:
                         notbind_type = get_notbind_type(typetoken.type)
-                        with CS(REF_POS):
+                        op_idx = len(CS.cs)
+                        with CS(REF_NO_REF):
                             CS.store(m_ast.get_set(
                                 None,
                                 typetoken.code,
                                 notbind_type,
                             ))
-                            compound.append((typetoken.type, CS.ref(m_ast.ast_id)))
+                        compound.append((typetoken.type, CS.ref(m_ast.ast_id, REF_POS, op_idx)))
                 else:
                     compound.append((typetoken.type, 0))
 
