@@ -6,10 +6,11 @@ from StringWrangler import wrap_lines, render_ansi_box, render_with_indent
 import contextlib
 from typing import Self
 from functools import wraps
+from enum import IntEnum, auto, Flag
 
 
-OP_DONE, OP_SET, OP_UPDATE, OP_REF, OP_VIEW_DONE, OP_VIEW_SET = range(6)
-REF_ROOT, REF_OLD, REF_POS, REF_FILE, REF_C_AST = range(5)
+OP_DONE, OP_SET, OP_UPDATE, OP_REF, OP_REF_VIEW, OP_VIEW_DONE, OP_VIEW_SET = range(7)
+REF_ROOT, REF_OLD, REF_POS, REF_FILE, REF_MULTI, REF_C_AST, REF_NO_REF = range(7)
 T_DIR, T_C, T_KCONFIG, T_RUST = range(4)
 
 PointerType = tuple[int, int]
@@ -28,7 +29,6 @@ UnSafeDataType = SafeDataType|RefType
 
 
 
-
 class FILE_ERROR(Exception):  # noqa: D101, N801, N818
     pass
 class REF_NOT_RESOLVABLE(Exception):  # noqa: D101, N801, N818
@@ -43,11 +43,15 @@ class GlobalStuff:
         """Set default for all but DB and TE."""
         self.DB = None
         self.TE = None
+        self.MF = None
         self.RAMDISK = "/dev/shm"  # noqa: S108
         self.CPUS = 8
         self.linux_directory = Path("linux")
 
         self.CLEAN_PRINT = True
+
+        self.BP_ON_SHUTDOWN = True
+        self.BP_ON_REF_FAIL = False
 
         # FAIL CHECK
         self.OVERRIDE_FC_MAX_LOOP_EXEC_MULT = 2
@@ -87,9 +91,12 @@ class GlobalStuff:
 
 
 
-    @classmethod
-    def emergency_shutdown(cls, number_error: int=1) -> None:
+    #@classmethod
+    def emergency_shutdown(self, number_error: int=1) -> None:
         """Close the program cleanly by deleting the git files."""
+        if self.BP_ON_SHUTDOWN:
+            self.BP()
+
         for directory in sys.modules["__main__"].gp.PURGE_LIST:
             with contextlib.suppress(Exception):
                 shutil.rmtree(directory)
@@ -99,13 +106,7 @@ class GlobalStuff:
     @classmethod
     def BP(cls) -> None:  # noqa: N802
         """Breakpoint with instructions."""
-        print("""
-=====BREAKPOINT=====
-c: Continue execution
-q: Quit the debugger
-n: Step to the next line within the same function
-s: Step to the next line in this function or a called function.
-""")
+        
         sys.breakpointhook()  # noqa: T100
         return
 
@@ -189,22 +190,24 @@ s: Step to the next line in this function or a called function.
 
     def type_check(self, *expected_types):
         def decorator(func):
+            if not self.DEBUG_TYPECHECK:
+                return func
+
             @wraps(func)
             def wrapper(*args, **kwargs):
-                if self.DEBUG_TYPECHECK:
-                    try:
-                        for i, expected_type in enumerate(expected_types):
-                            if expected_type == Self:
-                                continue
-                            if isinstance(expected_type, set):
-                                assert all(any(self.OP_isinstance(item, e_type) for e_type in expected_type) for item in args[i:]), f"Type Error expected:{expected_type}| Received: {args[i:]}"
-                                raise IndexError  # noqa: TRY301
-                            if isinstance(expected_type, tuple):
-                                assert any(self.OP_isinstance(args[i], e_type) for e_type in expected_type), f"Type Error expected:{expected_type}| Received: {args[i]}"
-                            else:
-                                assert self.OP_isinstance(args[i], expected_type), f"Type Error expected:{expected_type}| Received: {args[i]}"
-                    except IndexError:
-                        pass
+                try:
+                    for i, expected_type in enumerate(expected_types):
+                        if expected_type == Self:
+                            continue
+                        if isinstance(expected_type, set):
+                            assert all(any(self.OP_isinstance(item, e_type) for e_type in expected_type) for item in args[i:]), f"Type Error expected:{expected_type}| Received: {args[i:]}"
+                            raise IndexError  # noqa: TRY301
+                        if isinstance(expected_type, tuple):
+                            assert any(self.OP_isinstance(args[i], e_type) for e_type in expected_type), f"Type Error expected:{expected_type}| Received: {args[i]}"
+                        else:
+                            assert self.OP_isinstance(args[i], expected_type), f"Type Error expected:{expected_type}| Received: {args[i]}"
+                except IndexError:
+                    pass
                 # before exec
                 result = func(*args, **kwargs)
                 # after exec
@@ -253,7 +256,7 @@ class PointerGetter:
     def __init__(self, joins: JoinsType|int) -> None:
         """Parse joins and detects single table joins.
 
-        Will also accept table_id as an arg, to be used with get_first_pointer.
+        Will also accept table_id as an arg, to be used with get_first_table_id.
         """
         self.joins = joins
         if not isinstance(joins, int):
@@ -282,13 +285,30 @@ class PointerGetter:
 
     def get_first_pointer(self) -> PointerType:
         """Get the first pointer of the joins."""
-        if isinstance(self.joins, int):
-            return self.joins
         return self.joins[0][0]
 
     def get_first_table_id(self) -> int:
         """Get the first table_id of the joins."""
+        if isinstance(self.joins, int):
+            return self.joins
         return self.joins[0][0][0]
+
+    @staticmethod
+    def add_join(joins: list, join: tuple) -> None:
+        """Add a join tuple to a joins list, upgrading initial single pointer or incrementing repeat count."""
+        if len(joins[0]) == 1:
+            if join[0] == joins[0][0]:
+                joins[0] = (joins[0][0], join[1], join[2])
+                return
+            else:
+                G.emergency_shutdown(52)
+
+        if joins[-1][1] == join[1]:
+            joins[-1] = (joins[-1][0], joins[-1][1], joins[-1][2] + 1)
+            return
+
+        joins.append(join)
+
 
 def type_check(name: str) -> int | None:
     """Parse string to get file type."""
@@ -299,3 +319,75 @@ def type_check(name: str) -> int | None:
     if name.endswith(".h"):
         return T_RUST
     return None
+
+
+class ASTT(IntEnum):
+    Undefined = 0
+    # C
+    C_Compound = auto()
+    C_Comment = auto()
+    C_Keyword = auto()
+    ## Storage Class
+    C_SCauto = auto()
+    C_SCregister = auto()
+    C_SCstatic = auto()
+    C_SCextern = auto()
+    C_SC_Thread_local = auto()
+    C_SCthread_local = auto()
+    C_SCtypedef = auto()
+    C_SCconstexpr = auto()
+    ## Function Specifiers
+    C_FSinline = auto()
+    C_FS_Noreturn = auto()
+    ## Alignment Specifiers
+    C_AS__Alignas = auto()
+    C_AS_alignas = auto()
+    ## Qualifiers
+    C_Qconst = auto()
+    C_Qvolatile = auto()
+    C_Qrestrict = auto()
+    C_Q_Atomic = auto()
+    ## Qualifiers End
+    C_functionproto = auto()
+    C_functionprotodecl = auto()
+    C_functionprotnotbind = auto()
+    C_array = auto()
+    C_arrayempty = auto()
+    C_enumequal = auto()
+    C_pointer = auto()
+    C_struct = auto()
+    C_structdecl = auto()
+    C_structnotbind = auto()
+    C_enum = auto()
+    C_enumdecl = auto()
+    C_enumnotbind = auto()
+    C_union = auto()
+    C_uniondecl = auto()
+    C_unionnotbind = auto()
+    C_void = auto()
+    C_unsigned = auto()
+    C_signed = auto()
+    C_char = auto()
+    C_short = auto()
+    C_int = auto()
+    C_long = auto()
+    C_bool = auto()
+    C_float = auto()
+    C_double = auto()
+    ## CPPro
+    CPPro_if = auto()
+    CPPro_elif = auto()
+    CPPro_else = auto()
+    CPPro_endif = auto()
+    CPPro_ifdef = auto()
+    CPPro_ifndef = auto()
+    CPPro_elifdef = auto()
+    CPPro_elifndef = auto()
+    CPPro_define = auto()
+    CPPro_define_macro = auto()
+    CPPro_undef = auto()
+    CPPro_include = auto()
+    CPPro_line = auto()
+    CPPro_error = auto()
+    CPPro_warning = auto()
+    CPPro_pragma = auto()

@@ -1,4 +1,99 @@
-"""TableHandling.py - Implements ChangeSet, Table used to interface with TE and DB."""
+"""TableHandling.py - ChangeSet Management & Relational Table Bindings.
+
+===============================================================================
+TABLE HANDLING & CHANGE-SET ARCHITECTURAL GUIDE
+===============================================================================
+This module implements the core data structures used to record, resolve, and
+execute database operations for individual file changes across project versions.
+
+1. HOW OPERATIONS WORK:
+-------------------------------------------------------------------------------
+When processing a file diff, operations are queued inside `ChangeSet.cs[]`.
+An operation is a tuple structured as:
+  (target, operation_type, data)
+
+Acceptable values in each position:
+  - target: table_id (int) OR joins tuple (JoinsType)
+  - operation_type: OP_SET, OP_UPDATE, OP_VIEW_SET, OP_REF_VIEW, OP_DONE, OP_VIEW_DONE
+  - data: tuple of row values (SafeDataType or UnSafeDataType)
+
+Examples:
+  - Simple Set:   (m_v_main.table_id, OP_SET, (None, "v3.0"))
+  - View Set:     (joins_tuple, OP_VIEW_SET, (None, "struct foo", 12))
+
+Data classification:
+  - SafeDataType:   int | str | None (Data containing pure primitive values)
+  - UnSafeDataType: RefType | int | str | None (Data containing reference tuples)
+
+2. REFERENCES (RefType) & POINTERS (PointerType):
+-------------------------------------------------------------------------------
+PointerType is a tuple containing `(table_id, col_idx)` generated dynamically
+on Table objects (e.g., `m_file_name.fnid` = `(1, 0)`).
+
+A Reference tuple (RefType) is encoded within operation data as:
+  (query_pointer, OP_REF, route_tuple)
+
+Example reference tuple:
+  ((m_v_main.table_id, 0), OP_REF, (REF_ROOT, REF_OLD))
+
+3. ROUTES & LINK CONTEXTS:
+-------------------------------------------------------------------------------
+Routes define how operations are indexed in `CS.store_dict` and located.
+A Route contains Links allowing data to be stored and retrieved reliably across files
+and AST parsing scopes.
+
+Usage with context managers:
+  with CS(REF_OLD):
+      # Store m_file_name in route (REF_ROOT, REF_OLD)
+      CS.store(m_file_name.get_set(None, CS.current_path))
+      
+      # Reference m_file_name.fnid from (REF_ROOT, REF_OLD)
+      CS.store(m_bridge_file.get(
+          gp.Old_VID,
+          CS.ref(m_file_name.fnid),
+          None,
+      ))
+
+Available Link Types:
+  - REF_FILE: Directs reference lookup to another file's ChangeSet (followed by file path).
+  - REF_POS: Directs reference lookup to a specific numerical index in `CS.cs`. 
+  - REF_MULTI: Stores multiple items under the same key. `with CS(REF_MULTI):` will create a new key.
+  - REF_ROOT / REF_C_AST: Sets system scope context. 
+  - REF_OLD: Indicates that the data belongs to the previous project version.
+
+4. VIEWS & RELATIONAL JOINS (JoinsType):
+-------------------------------------------------------------------------------
+Views ensure uniqueness across multi-table relationships (e.g., `m_ast` join graphs):
+  CS.store(m_ast.view(
+      ((m_ast.ast_id,),),    # Joins graph tuple
+      None, name, type_id   # Data tuple
+  ))
+
+Joins format:
+  - Single table join: `((m_ast.ast_id,),)`
+  - Multi-table join:
+    (
+        (m_ast.ast_id, m_ast_include.ast_id, 1),
+        (m_ast.ast_id, m_ast_container.ast_id, 2),
+    )
+  The 3rd element specifies the repetition count of joined table columns.
+
+5. DATA SANITIZATION:
+-------------------------------------------------------------------------------
+All scalar values sent to the Table Engine (`G.TE`) or stored in execution results
+are de-subclassed via `to_safe_data()` so that `IntEnum` items (e.g., `ASTT.C_struct`)
+are converted into pure native `int` objects to maintain database driver compatibility.
+===============================================================================
+"""
+from __future__ import annotations
+
+import sys
+import logging
+from operator import itemgetter
+from typing import Any, Self
+from types import TracebackType
+from enum import Enum
+
 from globalstuff import (
     G,
     PointerGetter,
@@ -8,6 +103,8 @@ from globalstuff import (
     REF_POS,
     REF_FILE,
     REF_C_AST,
+    REF_MULTI,
+    REF_NO_REF,
     CONTINUE_EXCEPTION,
     FILE_ERROR,
     REF_NOT_RESOLVABLE,
@@ -15,6 +112,7 @@ from globalstuff import (
     OP_SET,
     OP_UPDATE,
     OP_REF,
+    OP_REF_VIEW,
     OP_VIEW_DONE,
     OP_VIEW_SET,
     LinkType,
@@ -25,122 +123,86 @@ from globalstuff import (
     SafeDataType,
     UnSafeDataType,
 )
-import sys
-import logging
-from parser.c_ast import c_ast_parse
-from operator import itemgetter
-from typing import Self
-from types import TracebackType
+from parser.c_ast.c_ast import c_ast_parse
 
 logger = logging.getLogger(__name__)
 
-# Basics in how this Works:
-# ***At the top of globalstuff.py we have a list of all the types, it may help.***
-
-# When processing a file, we will generate Operations.
-# Operations are either already process or to be processed.
-# An Operation will look like this: (m_m_v_main.table_id, OP_SET, (None, "v3.0"))
-# Lets define the acceptable values/types in each positions:
-# ( Operation
-#   m_m_v_main.table_id,    # OP.target => table_id(int) OR joins(JoinsType) *joins defined soon.
-#   OP_SET,                 # OP.type   => operation_type(int)
-#   (None, "v3.0"),         # OP.data   => data(UnSafeDataType)
-# )
-
-# These Operations are stored inside of Change_Set.cs[].
-# **If you see CS, it is the initialized form of Change_Set**
-# Once an operation is fully processed, the resulting data is stored in Change_Set.cs_result[]
-
-# Data can either be Safe or UnSafe (SafeDataType,UnSafeDataType)
-# SafeDataType   =         int|str|None # Data without references.
-# UnSafeDataType = RefType|int|str|None # Data with references.
-
-# References (RefType) are encoded inside of OP.data.
-# Lets define the acceptable values/types in each positions:
-# ( Reference
-#   (m_m_v_main.table_id, 0),   # REF.query => query(PointerType)
-#   OP_REF,                     # REF.type  => reference_type(int)
-#   (REF_ROOT, REF_OLD),        # REF.route  => route(RouteType)   LinkType
-# )
-
-# PointerType is a tuple containing a table_id and column_id.
-# This is the main way we will be targeting a specific table/column.
-
-# Route is used to store and recover data in a standardized way.
-# A Route contains Links which allows us to know where the data should be stored
-# for it to be found again. Here is an example of how we could store and retrieve data:
-# **It is assumed that we start the route in REF_ROOT.**
-#   with CS(REF_OLD):
-#       # Store m_file_name in (REF_ROOT, REF_OLD)
-#       CS.store(m_file_name.get_set(None, CS.current_path))
-# *** Later in the code ***
-#       CS.store(m_bridge_file.get(
-#           gp.Old_VID,
-#           # Reference m_file_name.fnid in (REF_ROOT, REF_OLD)
-#           # **we are still inside CS(REF_OLD):**
-#           CS.ref(m_file_name.fnid),
-#           None,
-#       ))
-#
-# CS.store() can also take Links as arguments. Example:
-# CS.store(...., REF_ROOT, REF_OLD)
-#
-# When used, the links within the Route are Resolved.
-# For example: (REF_ROOT, REF_C_AST, REF_ROOT)
-# Once resolve will become: (REF_ROOT,)
-#
-# Here is the link of all possible Links. Higher or equal will remove previous instances.
-#   REF_FILE            => Set the file we are referencing. Is followed by a Path.
-#   REF_POS             => Set the position within CS.cs. Is followed by an int.
-#   REF_ROOT, REF_C_AST => Set the system the data is a part of.
-#   REF_OLD             => Indicate that the data is part of the previous version
-
-# REF_C_AST is able to store multiple items at the same position.
-
-
-# It is sometime necessary for us to ensure uniqueness across multiple table of our DB.
-# For example, m_ast* tables are not individualy unique but unique across all of them.
-# We solve this by using View.
-#   CS.store(m_ast.view(
-#       ((m_ast.ast_id,),),     # Joins
-#       None, name, type_id   # Data
-#   ))
-#
-# Joins allows us to set 'INNER JOIN' and exist in 2 form:
-# Single table:
-#   ((m_ast.ast_id,),), # Only need a Pointer within 2 tuples.
-# Multi table:
-#   (
-#       (m_ast.ast_id, m_ast_include.ast_id, 1),
-#       (m_ast.ast_id, m_ast_container.ast_id, 2),
-#   )
-# In this form the first 2 pointer acts as the 'INNER JOIN'.
-# The 3rd argument is the number of repetition of the data. Here is how the data would look:
-# (
-#   m_ast[0], m_ast[1], m_ast[2],
-#   m_ast_include[0], m_ast_include[1],
-#   m_ast_container[0], m_ast_container[1], m_ast_container[2], m_ast_container[3], m_ast_container[4], # x1
-#   m_ast_container[0], m_ast_container[1], m_ast_container[2], m_ast_container[3], m_ast_container[4], # x2
-# )
-
-
 
 def is_data_unsafe(data: tuple) -> bool:
-    """Check if data contain Refs."""
-    return any(type(col) is tuple for col in data)
+    """Check if a row data tuple contains unresolved reference tuples (OP_REF).
+
+    Args:
+        data: Tuple of row column values.
+
+    Returns:
+        True if any element in `data` is a tuple (indicating an unresolved reference
+        tuple `(query, OP_REF, route)`), False if all elements are safe primitive values.
+    """
+    return any(isinstance(col, tuple) for col in data)
+
+
+def to_safe_data(val: Any) -> SafeDataType:
+    """Convert a value into strict primitive SafeDataType (pure int, pure str, or None).
+
+    Ensures that IntEnum/Enum subclasses (like ASTT) or custom subclasses
+    are converted into pure native Python `int` or `str` objects before being sent
+    to the Table Engine or database driver.
+
+    Args:
+        val: Any scalar value, enum member, or None.
+
+    Returns:
+        Pure primitive `int`, `str`, or `None`.
+    """
+    if val is None:
+        return None
+    if isinstance(val, str):
+        return str(val)
+    if isinstance(val, Enum):
+        return int(val.value) if isinstance(val.value, int) else str(val.value)
+    if isinstance(val, (int, bool)):
+        return int(val)
+    if hasattr(val, "value") and isinstance(val.value, (int, str)):
+        return int(val.value) if isinstance(val.value, int) else str(val.value)
+    return val
+
+
+def normalize_data_tuple(data: tuple) -> tuple[SafeDataType, ...]:
+    """Convert all non-reference elements in a tuple into strict primitive SafeDataType.
+
+    Args:
+        data: Tuple containing primitive values or reference tuples.
+
+    Returns:
+        Tuple with all primitive/enum values sanitized to pure `int`, `str`, or `None`.
+    """
+    return tuple(to_safe_data(col) if not isinstance(col, tuple) else col for col in data)
 
 
 class ChangeSet:
-    """Contain the change and operation of a file."""
+    """Encapsulate file change operations, reference resolution, and parsing pipelines.
 
-    @G.type_check(Self, (str, None),(str, None),(str, None))
-    def __init__(  # noqa: D107
+    A `ChangeSet` (CS) instance represents a single file modification (diff) between two
+    project releases. It records operations generated by language parsers,
+    manages reference resolution routes (`REF_ROOT`, `REF_C_AST`, `REF_OLD`), and submits
+    resolved operations to the Table Engine (`G.TE`).
+    """
+
+    @G.type_check(Self, (str, None), (str, None), (str, None))
+    def __init__(
         self,
         operation: str | None = None,
         current_path: str | None = None,
         old_path: str | None = None,
     ) -> None:
+        """Initialize ChangeSet state from git diff status line or path arguments.
 
+        Args:
+            operation: Git diff status line (e.g. `"M\\tinclude/linux/lock.h"` or
+                       `"R100\\told_path.c\\tnew_path.c"`), or operation string.
+            current_path: Relative target file path.
+            old_path: Relative old file path (for git renames).
+        """
         if current_path is None and operation is not None:
             cut_file = operation.split("\t")
             self.file_operation = cut_file[0]
@@ -153,23 +215,56 @@ class ChangeSet:
             self.file_operation = operation
         self.current_path = current_path
         self.old_path = old_path
-        self.cs = []
-        self.cs_processed = False
-        self.cs_result = []
-        self.file = None
-        self.store_dict = {}
-        self.gp = None
-        self.mf = None
-        self.route = [REF_ROOT]
+        self.cs: list[OperationType] = []
+        self.cs_processed: bool = False
+        self.cs_result: list[tuple[SafeDataType, ...]] = []
+        self.file: Any | None = None
+        self.store_dict: dict[Any, Any] = {
+            REF_MULTI: [],
+        }
+        self.gp: Any | None = None
+        self.mf: Any | None = None
+        self.route: list[LinkType] = [REF_ROOT]
+        self.route_count: list[int] = []
+        self.multi_stack: list[int] = []
+        self.prior_tags: Any | None = None
+        self.parsers: dict[str, Any] = {}
+        self.debug: list[Any] = []
 
-    @G.type_check(Self, LinkType)
-    def __call__(self, link: LinkType) -> Self:
-        """Add link to route."""
-        self.route.append(link)
+    @G.type_check(Self, {LinkType})
+    def __call__(self, *links: LinkType) -> Self:
+        """Push link context scopes (e.g., `REF_C_AST`, `REF_OLD`) onto active routing stack.
+
+        Args:
+            *links: One or more route link markers to push.
+
+        Usage:
+            `with CS(REF_C_AST):`
+            `with CS(REF_OLD):`
+            `with CS(REF_MULTI):`
+
+        Returns:
+            Self (Context manager).
+        """
+        if len(links) == 1:
+            self.route_count.append(1)
+            self.route.append(links[0])
+            # REF_MULTI handling
+            if links[0] == REF_MULTI:
+                self.route_count[-1] = 2
+                multi_idx = len(self.store_dict[REF_MULTI])
+                self.route.append(multi_idx)
+                self.store_dict[REF_MULTI].append([])
+                self.multi_stack.append(multi_idx)
+            return self
+
+        self.route_count.append(len(links))
+        for link in links:
+            self.route.append(link)
         return self
 
     def __enter__(self) -> Self:
-        """To be used with __call__ to enter route."""
+        """Enter route context manager block (`with CS(REF_C_AST):`)."""
         return self
 
     def __exit__(
@@ -178,242 +273,562 @@ class ChangeSet:
         exception_value: BaseException | None,
         exception_traceback: TracebackType | None,
     ) -> None:
-        """Pop link from current route."""
-        self.route.pop()
-        if len(self.route) == 0:
-            self.route = [REF_ROOT]
-        return
+        """Exit route context manager block and pop pushed link scopes."""
+        count = self.route_count.pop()
+        popped = self.route[-count:] if len(self.route) >= count else []
+        if REF_MULTI in popped and self.multi_stack:
+            self.multi_stack.pop()
+        for _ in range(count):
+            self.route.pop()
+            if len(self.route) == 0:
+                self.route = [REF_ROOT]
 
     def last_not_none(self) -> None:
-        """Check if last value in CS.cs is None."""
-        if self.cs[-1] is None:
+        """Sanity check verifying that the last operation in `CS.cs` is not `None`.
+
+        Raises:
+            CONTINUE_EXCEPTION: If the last operation in `CS.cs` is None.
+        """
+        if not self.cs or self.cs[-1] is None:
             logger.error("Last not None Error")
             raise CONTINUE_EXCEPTION
-        return
+
+    @G.type_check(Self, PointerType, RouteType)
+    def resolve_ref(self, query: PointerType, parsed_route: RouteType) -> SafeDataType:
+        """Resolve a pointer query using parsed route to locate value across CS index or external CS.
+
+        Evaluates route links:
+        - If `REF_FILE` link is present, redirects lookup to another file's ChangeSet in `gp.ChangeSet_Dict`.
+        - If `REF_POS` link is present, fetches directly from `CS.cs` at the specified position.
+        - If `REF_MULTI` link is present, will return an array.
+        - Otherwise looks up `parsed_route` in `self.store_dict` to find stored position.
+
+        Args:
+            query: PointerType `(table_id, col_idx)`.
+            parsed_route: Canonical normalized route link tuple.
+
+        Returns:
+            Resolved primitive value (`int`, `str`, `None`).
+        """
+        if parsed_route[0] == REF_NO_REF:
+            return None
+
+        if parsed_route[0] == REF_FILE:
+            foreign_cs = self.gp.safe_get_cs(parsed_route[1])
+            return foreign_cs.resolve_ref(query, parsed_route[2:])
+
+        if parsed_route[0] == REF_POS:
+            return self._get_value_at(query, parsed_route[1])
+
+        if parsed_route[0] == REF_MULTI:
+            return self._get_values_at(query, self._get_multi_from_route(parsed_route))
+
+        return self._get_value_at(query, self._get_pos_from_route(parsed_route, query[0]))
 
     @G.type_check(Self, {UnSafeDataType})
-    def resolve_ref_from_tuple(self, *data: UnSafeDataType) -> tuple[SafeDataType, ...]:
-        """Resolve all refs from data or raise REF_NOT_RESOLVABLE."""
+    def _resolve_ref_from_tuple(self, *data: UnSafeDataType) -> tuple[SafeDataType, ...]:
+        """Resolve all reference tuples in a data tuple into safe primitive values.
+
+        Evaluates each element in `data`. If an element is a reference tuple `(query, OP_REF, route)`,
+        calls `resolve_ref(query, route)`. All resolved values are de-subclassed to native primitives.
+
+        Args:
+            *data: Column values, which may include unresolved reference tuples.
+
+        Returns:
+            Tuple of resolved primitive values (`tuple[SafeDataType, ...]`).
+
+        Raises:
+            REF_NOT_RESOLVABLE: If any reference tuple cannot be resolved.
+        """
         output_data = []
         for val in data:
-            if type(val) is tuple:
-                output_data.append(self.resolve_ref(val[0], val[2]))
-                if output_data[-1] is None:
+            if isinstance(val, tuple):
+                resolved = self.resolve_ref(val[0], val[2])
+                if resolved is None:
+                    # DEBUG
+                    if G.BP_ON_REF_FAIL:
+                        G.BP()
+                        debug_output_data = []
+                        for debug_val in data:
+                            if isinstance(debug_val, tuple):
+                                dbg_res = self.resolve_ref(debug_val[0], debug_val[2])
+                                debug_output_data.append(to_safe_data(dbg_res))
+                            else:
+                                debug_output_data.append(to_safe_data(debug_val))
+                    # DEBUG
                     raise REF_NOT_RESOLVABLE
+                output_data.append(to_safe_data(resolved))
             else:
-                output_data.append(val)
+                output_data.append(to_safe_data(val))
         return tuple(output_data)
 
     def execute(self) -> bool:
-        """Execute stored operations in CS.cs.
+        """Execute queued operations in `CS.cs` sequentially against Table Engine (`G.TE`).
 
-        If the operation cannot be processed,
-        the REF_NOT_RESOLVABLE exception will be raised.
+        Iterates over `CS.cs` starting from index `len(CS.cs_result)`. Resolves any embedded
+        references, unpacks dynamic AST view references (`OP_REF_VIEW`), submits operations to
+        `G.TE.set()`, `G.TE.update()`, or `G.TE.view_set()`, and records execution outputs in
+        `CS.cs_result`. Sets `cs_processed = True` upon completion.
+
+        Returns:
+            True if all operations were successfully resolved and executed, False if unresolved.
         """
         if self.cs_processed:
             return True
 
         operation_offset = len(self.cs_result)
         for operation in self.cs[operation_offset:]:
-            # check if tuple or None
-            #if type(operation[2]) is not tuple:
-            #    continue
+            try:
+                op_type = operation[1]
+                if op_type == OP_REF_VIEW:
+                    unpacked = self._unpack_ref_view(operation)
+                    if unpacked is None:
+                        raise REF_NOT_RESOLVABLE
+                    operation = unpacked
+                    op_type = operation[1]
 
-            data = self.resolve_ref_from_tuple(*operation[2])
-            op_type = operation[1]
+                data = self._resolve_ref_from_tuple(*operation[2])
 
-            if op_type in (OP_DONE, OP_VIEW_DONE):
-                self.cs_result.append(data)
-                continue
+                if op_type in (OP_DONE, OP_VIEW_DONE):
+                    self.cs_result.append(data)
+                    continue
 
-            if op_type == OP_SET:
-                self.cs_result.append(G.TE.set(operation[0], data))
-                continue
-            if op_type == OP_UPDATE:
-                self.cs_result.append(G.TE.update(operation[0], data))
-                continue
-            if op_type == OP_VIEW_SET:
-                self.cs_result.append(G.TE.view_set(operation[0], data))
-                continue
+                if op_type == OP_SET:
+                    self.cs_result.append(G.TE.set(operation[0], data))
+                    continue
+                if op_type == OP_UPDATE:
+                    self.cs_result.append(G.TE.update(operation[0], data))
+                    continue
+                if op_type == OP_VIEW_SET:
+                    self.cs_result.append(G.TE.view_set(operation[0], data))
+                    continue
 
-            logger.error(f"ERROR, UNKNOWN OPERATION{operation}")
+                logger.error(f"ERROR, UNKNOWN OPERATION {operation}")
+                self.cs_result.append(None)
+            except REF_NOT_RESOLVABLE:
+                return False
 
         self.cs_processed = True
         return True
 
     @G.type_check(Self, OperationType, {LinkType})
     def store(self, operation: OperationType, *route: LinkType) -> None:
-        """Store the operation in CS.cs.
+        """Queue an operation into `CS.cs` and index its position in `store_dict` under parsed route.
 
-        Will handle route if CS.file_operation is not None.
+        Args:
+            operation: Operation tuple `(target, op_type, data)`.
+            *route: Optional route link markers modifying the active context route.
+
+        Usage:
+            `CS.store(m_file_name.set(None, CS.current_path))`
+            `CS.store(m_ast.view(...), REF_C_AST)`
         """
         if self.file_operation is None:
             self.cs.append(operation)
             return
 
-        parsed_route = tuple(self.route_parse(self.route + list(route)))
+        if route and route[-1] == REF_NO_REF:
+            return
 
-        if self.store_dict.get(parsed_route) is None:
-            self.store_dict[parsed_route] = {}
+        if route:
+            if route[-1] == REF_POS:
+                self.route_count.append(2)
+                op_idx = len(self.cs)
+                if self.multi_stack and REF_NO_REF not in self.route and REF_NO_REF not in route:
+                    multi_idx = self.multi_stack[-1]
+                    if isinstance(multi_idx, int) and len(self.store_dict[REF_MULTI]) > multi_idx:
+                        if self.store_dict[REF_MULTI][multi_idx] is None:
+                            self.store_dict[REF_MULTI][multi_idx] = []
+                        self.store_dict[REF_MULTI][multi_idx].append(op_idx)
+                self.route.append(REF_POS)
+                self.route.append(op_idx)
+                self.cs.append(operation)
+                return
+            elif route[-1] == REF_NO_REF:
+                self.cs.append(operation)
+                return
 
-        # check for table_id/first join in route
-        table_id_pointer = PointerGetter(operation[0]).get_first_pointer()
-
-        ### we should have a set with REF_C_AST in it and we should do if parsed_route[0] in SetThatContainsREF_C_AST:
-        if parsed_route[0] == REF_C_AST:
-            if self.store_dict[parsed_route].get(table_id_pointer) is None:
-                self.store_dict[parsed_route][table_id_pointer] = []
-
-            self.store_dict[parsed_route][table_id_pointer].append(len(self.cs))
+        elif self.route[-1] == REF_POS:
+            self.route_count[-1] = 2
+            op_idx = len(self.cs)
+            if self.multi_stack and REF_NO_REF not in self.route:
+                multi_idx = self.multi_stack[-1]
+                if isinstance(multi_idx, int) and len(self.store_dict[REF_MULTI]) > multi_idx:
+                    if self.store_dict[REF_MULTI][multi_idx] is None:
+                        self.store_dict[REF_MULTI][multi_idx] = []
+                    self.store_dict[REF_MULTI][multi_idx].append(op_idx)
+            self.route.append(op_idx)
+            self.cs.append(operation)
+            return
+        elif self.route[-1] == REF_NO_REF:
             self.cs.append(operation)
             return
 
-        self.store_dict[parsed_route][table_id_pointer] = len(self.cs)
-        self.cs.append(operation)
-        return
+        parsed_route = tuple(self.route_parse(self.route + list(route)))
 
+        if parsed_route[0] == REF_MULTI:
+            if G.DEBUG_TYPECHECK:
+                assert len(self.store_dict[REF_MULTI]) > parsed_route[1], "CS.store() is trying to store into a non-existing REF_MULTI"
+            if self.store_dict[REF_MULTI][parsed_route[1]] is None:
+                self.store_dict[REF_MULTI][parsed_route[1]] = []
+
+            self.store_dict[REF_MULTI][parsed_route[1]].append(len(self.cs))
+        else:
+            if self.store_dict.get(parsed_route) is None:
+                self.store_dict[parsed_route] = {}
+            elif G.DEBUG_TYPECHECK:
+                if (current_val := self.store_dict[parsed_route].get(PointerGetter(operation[0]).get_first_table_id())) is not None:
+                    assert self.cs[current_val] == operation, (
+                        f"Not only did you push 2 times to the same route, but you didn't push the same value!!!\n"
+                        f"-current_val:{self.cs[current_val]}\n-operation:{operation}"
+                    )
+
+            self.store_dict[parsed_route][PointerGetter(operation[0]).get_first_table_id()] = len(self.cs)
+
+        self.cs.append(operation)
+
+    def get_route_parse(self) -> tuple:
+        """Return the normalized canonical route tuple for current routing stack."""
+        return tuple(self.route_parse(self.route))
 
     @G.type_check(Self, RouteType)
     def route_parse(self, route: RouteType) -> list:
-        """Parse route to reduce to their minimal usefull form."""
+        """Normalize a route link list into a minimal canonical route representation.
+
+        Args:
+            route: Sequence of route links.
+
+        Returns:
+            Normalized list of route link markers.
+        """
         parsed_route = []
-
-        # REF_FILE, REF_POS,  REF_ROOT    , REF_OLD
-        #                    REF_C_AST
-
         data_bypass = False
-        has_ref_file = False
-        has_ref_pos = False
+        has_ref_file = None
 
         for link in route:
             if data_bypass:
+                if has_ref_file is False:
+                    has_ref_file = link
+                else:
+                    parsed_route.append(link)
                 data_bypass = False
-                parsed_route.append(link)
                 continue
 
             if link == REF_FILE:
-                has_ref_file = True
+                has_ref_file = False
+                data_bypass = True
+                parsed_route = []
+                continue
+
+            if link in (REF_POS, REF_MULTI):
                 data_bypass = True
                 parsed_route = []
 
-            if link == REF_POS:
-                has_ref_pos = True
-                data_bypass = True
-                if not has_ref_file:
-                    parsed_route = []
-
-            if link in (REF_ROOT, REF_C_AST) and not has_ref_file and not has_ref_pos:
+            if link in (REF_ROOT, REF_C_AST, REF_NO_REF):
                 parsed_route = []
 
             parsed_route.append(link)
 
+        if has_ref_file is not None:
+            parsed_route = [REF_FILE, has_ref_file] + parsed_route
         return parsed_route
 
-    @G.type_check(Self, PointerType, int)
-    def get_value_at(self, query: PointerType, pos: int) -> SafeDataType:
-        """Get value at pos in CS.cs, may return None."""
+    @G.type_check(Self, RouteType, int)
+    def _get_pos_from_route(self, route: RouteType, table_id: int) -> int | None:
+        """Retrieve stored operation index in `CS.cs` matching pre-parsed route and table_id.
+
+        Args:
+            route: Pre-parsed route tuple.
+            table_id: Target table identifier integer.
+
+        Returns:
+            Operation index integer or None.
+        """
+        if G.DEBUG_TYPECHECK:
+            route_tuple = tuple(route)
+            route_parsed = tuple(self.route_parse(route_tuple))
+            assert route_tuple == route_parsed, "get_pos_from_route didn't receive a clean route, could be reduced with route_parse()"
+
+        store_entry = self.store_dict.get(tuple(route))
+        return store_entry.get(table_id) if store_entry is not None else None
+
+    @G.type_check(Self, RouteType)
+    def _get_multi_from_route(self, route: RouteType) -> list:
+        """Retrieve stored operation indices in `CS.cs` matching REF_MULTI route.
+
+        Args:
+            route: Route ending with `(REF_MULTI, pos)`.
+
+        Returns:
+            List of operation indices in `CS.cs`.
+        """
+        if G.DEBUG_TYPECHECK:
+            assert len(route) > 1, "get_multi_from_route got a route that is too small"
+            assert isinstance(route[-1], int), "get_multi_from_route got non-int at pos -1"
+
+        return self.store_dict[REF_MULTI][route[-1]]
+
+    @G.type_check(Self, PointerType, {int, None})
+    def _get_value_at(self, query: PointerType, pos: int | None) -> SafeDataType:
+        """Fetch resolved column value at query pointer `(table_id, col_idx)` from operation at index `pos`.
+
+        Args:
+            query: PointerType `(table_id, col_idx)`.
+            pos: Numerical index of the operation in `CS.cs`.
+
+        Returns:
+            The resolved value (`int`, `str`, `None`) at that position and column.
+        """
+        if pos is None:
+            return None
+
         operation = self.cs[pos]
 
-        if operation[1] in (OP_VIEW_DONE, OP_VIEW_SET):
-            joins = operation[0]
-            # view_data will return None instead of refs if not processed
-            if len(self.cs_result) > pos:
-                view_data = self.cs_result[pos]
-            else:
-                view_data = tuple(
-                    None if type(data) is tuple else data for data in operation[2]
-                )
-
-            data_offset = 0
-            for repeat, pointer in PointerGetter(joins):
-                for _x in range(repeat):
-                    if pointer[0] == query[0]:
-                        return view_data[data_offset + query[1]]
-                    data_offset += self.gp.Table_Array[pointer[0]].length
-            logger.error("something wrong with get_value_at while in a view")
-            logger.error(f"query:{query} pos:{pos}")
-            G.emergency_shutdown(456)
-
-        # sanity check the table_id of the target
-        if operation[0] != query[0]:
-            logger.error("something wrong with get_value_at, table_id do not match")
-            logger.error(f"query:{query} pos:{pos}")
-            G.emergency_shutdown(457)
-
         if len(self.cs_result) > pos:
-            return self.cs_result[pos][query[1]]
+            data = self.cs_result[pos]
+        else:
+            data = operation[2]
 
-        #result= <   data   >|<  row  >
-        result = operation[2][query[1]]
-        return None if type(result) is tuple else result
+        if G.DEBUG_TYPECHECK:
+            tableid = operation[0]
+            data_size = len(data)
 
-    @G.type_check(Self, PointerType, RouteType)
-    def resolve_ref(self, query: PointerType, parsed_route: RouteType) -> SafeDataType:
-        """Resolve ref, will return None if Nothing/another ref found."""
-        data_bypass = False
+            if operation[1] in (OP_VIEW_DONE, OP_VIEW_SET, OP_REF_VIEW):
+                tableid = PointerGetter(operation[0]).get_first_table_id()
+                if operation[1] == OP_REF_VIEW:
+                    data_size -= 1
 
-        for i, route in enumerate(parsed_route):
-            if data_bypass:
-                data_bypass = False
-                continue
+            assert query[0] == tableid, f"_get_value_at()'s query doesn't match underlying OP TableID.\nquery:{query} pos:{pos}"
+            assert data_size > query[1], f"_get_value_at()'s query column is too big for the OP.\nquery:{query} pos:{pos}"
 
-            if route == REF_FILE:
-                foreign_cs = self.gp.ChangeSet_Dict.get(parsed_route[i + 1])
-                if foreign_cs is None:
-                    return None
+        result = data[query[1]]
+        if isinstance(result, tuple):
+            return None
+        return to_safe_data(result)
 
-                return foreign_cs.resolve_ref(query, parsed_route[i + 2 :])
+    @G.type_check(Self, PointerType, list)
+    def _get_values_at(self, query: PointerType, multipos: list) -> list[SafeDataType]:
+        """Fetch resolved column values at query pointer `(table_id, col_idx)` across multiple positions.
 
-            if route == REF_POS:
-                return self.get_value_at(query, parsed_route[i + 1])
+        Args:
+            query: PointerType `(table_id, col_idx)`.
+            multipos: List of numerical indices in `CS.cs`.
 
-        stored_route = self.store_dict.get(tuple(parsed_route))
-        if stored_route is not None:
-            stored_pos = stored_route.get(PointerGetter(query[0]).get_first_pointer())
-            if stored_pos is not None:
-                if type(stored_pos) is list:
-                    return self.get_value_at(query, stored_pos[0])
-                return self.get_value_at(query, stored_pos)
-        return None
+        Returns:
+            List of resolved primitive values.
+        """
+        return_list = []
+        for pos in multipos:
+            operation = self.cs[pos]
+
+            if len(self.cs_result) > pos:
+                data = self.cs_result[pos]
+            else:
+                data = operation[2]
+
+            if G.DEBUG_TYPECHECK:
+                tableid = operation[0]
+                data_size = len(data)
+
+                if operation[1] in (OP_VIEW_DONE, OP_VIEW_SET, OP_REF_VIEW):
+                    tableid = PointerGetter(operation[0]).get_first_table_id()
+                    if operation[1] == OP_REF_VIEW:
+                        data_size -= 1
+
+                assert query[0] == tableid, f"_get_values_at()'s query doesn't match underlying OP TableID.\nquery:{query} pos:{pos}"
+                assert data_size > query[1], f"_get_values_at()'s query column is too big for the OP.\nquery:{query} pos:{pos}"
+
+            result = data[query[1]]
+            if isinstance(result, tuple):
+                return_list.append(None)
+            else:
+                return_list.append(to_safe_data(result))
+        return return_list
+
+    @G.type_check(Self, RouteType, {int, None})
+    def get_available_data(
+        self,
+        route: RouteType,
+        tableid: int | None = None,
+    ) -> list[tuple[OperationType, tuple[SafeDataType, ...] | None]]:
+        """Get operation and result for a given route (assumes no REF_FILE).
+
+        Args:
+            route: Route link tuple.
+            tableid: Target table identifier integer (optional for REF_POS/REF_MULTI).
+
+        Returns:
+            List of `(operation, processed_result_tuple)` pairs.
+        """
+        result = []
+        get_target = []
+
+        if route[0] == REF_POS:
+            get_target.append(route[1])
+        elif route[0] == REF_MULTI:
+            get_target.extend(self._get_multi_from_route(route))
+        else:
+            get_target.append(self._get_pos_from_route(route, tableid))
+
+        for target in get_target:
+            if target is not None and 0 <= target < len(self.cs):
+                target_processed = self.cs_result[target] if target < len(self.cs_result) else None
+                if target_processed is None:
+                    result.append((self.cs[target], None))
+                else:
+                    result.append((self.cs[target], tuple(to_safe_data(x) for x in target_processed)))
+
+        return result
 
     @G.type_check(Self, PointerType, {LinkType})
     def ref(self, query: PointerType, *route_args: LinkType) -> UnSafeDataType:
-        """Create a reference based on the current route + args."""
+        """Create reference tuple `(query, OP_REF, route)` or return immediate resolved value.
+
+        Args:
+            query: PointerType `(table_id, col_idx)`.
+            *route_args: Route links defining lookup context.
+
+        Usage:
+            `CS.ref(m_file_name.fnid)`
+            `CS.ref(m_ast.ast_id, REF_C_AST)`
+
+        Returns:
+            Resolved primitive value if already resolvable, or reference tuple `(query, OP_REF, route)`.
+        """
         if route_args:
-            parsed_route = tuple(self.route_parse(self.route + list(route_args)))
+            if self.route[-1] == REF_POS and route_args[0] == REF_POS:
+                parsed_route = tuple(self.route_parse(route_args))
+            else:
+                parsed_route = tuple(self.route_parse(self.route + list(route_args)))
         else:
             parsed_route = tuple(self.route_parse(self.route))
 
         result = self.resolve_ref(query, parsed_route)
         if result is not None:
-            return result
+            return to_safe_data(result)
 
         return (query, OP_REF, parsed_route)
 
-    # Will select the right parser and execute it
+    def _resolve_col_val(self, target_op, val_tuple, col_idx: int) -> SafeDataType:
+        """Extract resolved column value from val_tuple or target_op[2] fallback.
+
+        Args:
+            target_op: Underlying operation tuple.
+            val_tuple: Processed result tuple.
+            col_idx: Target column position integer.
+
+        Returns:
+            Resolved primitive value.
+        """
+        val = None
+        if val_tuple is not None and col_idx < len(val_tuple):
+            val = val_tuple[col_idx]
+
+        if val is None or (isinstance(val, tuple) and len(val) == 3 and val[1] == OP_REF):
+            if target_op is not None and len(target_op) > 2 and col_idx < len(target_op[2]):
+                op_val = target_op[2][col_idx]
+                if not (isinstance(op_val, tuple) and len(op_val) == 3 and op_val[1] == OP_REF):
+                    val = op_val
+
+        if isinstance(val, tuple) and len(val) == 3 and val[1] == OP_REF:
+            val = self.resolve_ref(val[0], val[2])
+
+        return to_safe_data(val)
+
+    def _unpack_ref_view(self, operation: OperationType) -> OperationType | None:
+        """Expand dynamic AST view schema reference (`OP_REF_VIEW`) into concrete `OP_VIEW_SET`.
+
+        Evaluates schema rules against AST nodes stored in `store_dict`, matches applicable rule,
+        builds joined table structure, and returns concrete `(joins_tuple, OP_VIEW_SET, data_tuple)`.
+
+        Args:
+            operation: `(joins, OP_REF_VIEW, (..., schema))` operation tuple.
+
+        Returns:
+            Concrete `(joins, OP_VIEW_SET, data)` operation or None if unresolved.
+        """
+        joins = list(operation[0])
+        data = [to_safe_data(x) for x in operation[2][:-1]]
+        rank = 0
+
+        schema = operation[2][-1]
+        schema_ifs = schema[0]
+        schema_thens = schema[1]
+        schema_route = schema[2]
+
+        # getting a list of pos from route
+        if not schema_route:
+            data_list = []
+        else:
+            target_table_id = schema_ifs[0][0][0] if isinstance(schema_ifs[0][0], tuple) else schema_ifs[0][0]
+            if schema_route[0] == REF_FILE:
+                foreign_cs = self.gp.safe_get_cs(schema_route[1])
+                data_list = foreign_cs.get_available_data(schema_route[2:], target_table_id)
+            else:
+                data_list = self.get_available_data(schema_route, target_table_id)
+
+        if not data_list:
+            return (tuple(joins), OP_VIEW_SET, tuple(data))
+
+        for target_op, val_tuple in data_list:
+            chosen_rule = -1
+            for i, rule in enumerate(schema_ifs):
+                testing_val = self._resolve_col_val(target_op, val_tuple, rule[0][1])
+                if testing_val is None:
+                    continue
+
+                expected = rule[1]
+                is_match = (testing_val in expected) if isinstance(expected, (tuple, list, set, dict)) else (testing_val == expected)
+                if is_match:
+                    chosen_rule = i
+                    break
+
+            rule_joins = schema_thens[chosen_rule][0] if chosen_rule != -1 else schema_thens[-1][0]
+            rule_items = schema_thens[chosen_rule][1] if chosen_rule != -1 else schema_thens[-1][1]
+
+            for item in rule_items:
+                if isinstance(item, tuple):
+                    if G.is_PointerType(item):
+                        val = self._resolve_col_val(target_op, val_tuple, item[1])
+                        if val is None:
+                            return None
+                        data.append(to_safe_data(val))
+                        continue
+                    elif len(item) == 1 and item[0] == "rank":
+                        data.append(rank)
+                        rank += 1
+                        continue
+                data.append(to_safe_data(item))
+
+            for join in rule_joins:
+                PointerGetter.add_join(joins, join)
+
+        return (tuple(joins), OP_VIEW_SET, tuple(data))
+
     def parse(self) -> None:
-        """Select the parse based on file type."""
+        """Select and invoke appropriate language AST parser based on current_path file type.
+
+        Detects file language type using `type_check(current_path)` and triggers parser (e.g. `c_ast_parse(self)`).
+        """
         try:
             current_type = type_check(self.current_path)
             if current_type == T_C:
                 c_ast_parse(self)
-            else:
-                pass
         except FILE_ERROR as e:
             logger.error(f"FILE_ERROR for '{self.file_operation}'={self.current_path}")
             logger.error(e)
             self.cs = []
 
-        return
-
     def clear_bloat(self) -> None:
-        """Remove gp and mf as they could break during pickling."""
+        """Remove un-picklable attributes (gp, mf, debug) before multiprocessing serialization."""
         self.gp = None
         self.mf = None
-        return
+        self.debug = []
+        self.parsers = {}
 
     def __str__(self) -> str:
-        """Will print CS.file_operation, CS.cs and CS.cs_result."""
+        """Return formatted string summarizing file operation, queued cs, and results."""
         result = f"CS:file({self.current_path}),op({self.file_operation}),"
         result += f"cs({','.join(map(str, self.cs))}),"
         result += f"cs_result({','.join(map(str, self.cs_result))})"
@@ -421,156 +836,251 @@ class ChangeSet:
 
 
 class Table:
-    """Generate binding for us to manage our table."""
+    """Represent database table schema and provide operation builders (set, update, view)."""
 
-    def __init__(  # noqa: PLR0913
+    def __init__(
         self,
         *,
         table_id: int,
         table_name: str,
         columns: tuple[tuple[str, ...], ...],
-        primary: tuple[str,...],
-        foreign: tuple[tuple[str,str,str], ...]|None=None,
-        initial_insert: tuple[tuple[SafeDataType, ...], ...]|None=None,
-        no_duplicate: bool=False,
-        select_procedure: bool|str=False,
+        primary: tuple[str, ...],
+        foreign: tuple[tuple[str, str, str], ...] | None = None,
+        initial_insert: tuple[tuple[SafeDataType, ...], ...] | tuple[SafeDataType, ...] | None = None,
+        no_duplicate: bool = False,
+        select_procedure: bool | str = False,
     ) -> None:
-        """Set columns and create Pointer bindings."""
-        # ID in gp.Table_array
+        """Initialize a Table schema definition, generate dynamic column pointers, and bind to parser.
+
+        Args:
+            table_id: Integer index identifying the table in `gp.Table_Array` (e.g., 0, 1, 2...).
+            table_name: Database table name string (e.g., `"m_file_name"`).
+            columns: Tuple of column definition tuples: `(("col_name", "DATA_TYPE", "CONSTRAINTS"), ...)`.
+            primary: Tuple of column name strings forming the Primary Key: `("fnid",)` or `("vid", "fnid")`.
+            foreign: Optional tuple of Foreign Key constraints: `(("local_col", "foreign_table", "foreign_col"), ...)`.
+            initial_insert: Optional tuple of default rows inserted when table is created.
+            no_duplicate: If True, `set()` automatically checks if a row exists in Table Engine (`G.TE`) via `get_set()`.
+            select_procedure: Pre-loading caching strategy for Table Engine initialization.
+
+        Side Effects:
+            1. Binds column attribute pointers directly on this instance:
+               `self.<column_name> = (table_id, col_idx)`  (e.g., `m_file_name.fnid` becomes `(1, 0)`).
+            2. Injects this `Table` instance directly into the `parser.c_ast.c_ast_type` module namespace
+               under `self.table_name` for direct access during AST node extraction.
+        """
         self.table_id = table_id
-        # Name of table as a "String"
         self.table_name = table_name
-        # Columns with arguments in a tuple:
-        # (("col1", "INT", "NOT NULL", "AUTO_INCREMENT"),("col2", "INT", "NOT NULL", "AUTO_INCREMENT"))
         self.init_columns = columns
         self.length = len(columns)
-        # Name of the primary key as a "String"
         self.init_primary = primary
+
+        # Convert primary key column names into 0-indexed column position integers
         temp_primary = []
         for prim in self.init_primary:
             for x, column in enumerate(self.init_columns):
                 if column[0] == prim:
                     temp_primary.append(x)
                     break
-        # Tuple of the pos for the primary key, to be used with ittemgetter
         self.primary = tuple(temp_primary)
-        # Foreign key in a tuple where:
-        # ("Key_name_in_current_table", "Foreign_table_name", "Foreign_key_name")
+
         self.init_foreign = foreign
-        # Initial insert in the form of a tuple with the values to add
-        # (0,"this is a value")
         self.initial_insert = initial_insert
-        # Will check for already existing values in the current change going into the table
-        # before completing a set (post multicore), if one is found, it will return the existing one.
         self.no_duplicate = no_duplicate
-        # Tells us how we select the table before processing:
-        # False: Will not keep a local copy, get calls will always fail
-        # True: Will keep the whole table
-        # lambda x: "select .....": Will run the select in order to get the local copy
-        # where x = globals()
         self.select_procedure = select_procedure
 
-        # Pointer/query
+        # Step 1: Bind column attribute pointers directly onto instance (self.column_name = (table_id, col_idx))
         for x, column in enumerate(self.init_columns):
             setattr(self, column[0], (self.table_id, x))
 
-        # FIX FOR C_AST
-        setattr(sys.modules["parser.c_ast"], self.table_name, self)
-
-        return
+        # Step 2: Inject Table object reference into c_ast_type module scope for AST parsing
+        setattr(sys.modules["parser.c_ast.c_ast_type"], self.table_name, self)
 
     def start_te(self) -> None:
-        """Initiate TE."""
-        G.TE.start(self)
-        return
+        """Register table schema with active Table Engine (`G.TE`)."""
+        G.TE.start(self, G.DB)
 
     @G.type_check(Self, {UnSafeDataType})
     def set(self, *columns: UnSafeDataType) -> OperationType:
-        """Create set operation, will execute get_set if no_dup enabled."""
+        """Construct OP_SET operation (or get_set if `no_duplicate` is enabled).
+
+        Args:
+            *columns: Row column values.
+
+        Usage:
+            `m_file_name.set(None, CS.current_path)`
+
+        Returns:
+            Operation tuple `(table_id, OP_SET, columns)`.
+        """
         if self.no_duplicate:
             return self.get_set(*columns)
 
-        return (self.table_id, OP_SET, columns)
+        sanitized_columns = normalize_data_tuple(columns)
+        return (self.table_id, OP_SET, sanitized_columns)
 
     @G.type_check(Self, {SafeDataType})
     def update(self, *columns: SafeDataType) -> OperationType:
-        """Create update operation, will execute get to fill None(s)."""
+        """Construct OP_UPDATE operation, fetching missing None values from Table Engine.
+
+        Args:
+            *columns: Row column values with primary key values populated.
+
+        Usage:
+            `m_file_name.update(12, "drivers/net/new_name.c")`
+
+        Returns:
+            Operation tuple `(table_id, OP_UPDATE, columns)`.
+        """
         if is_data_unsafe(columns):
             logger.error(f"""An {self.table_name}.update was done with unresolved refs,
-            This is unexpedted behavior. CRASH""")
+            This is unexpected behavior. CRASH""")
             logger.error(columns)
             G.emergency_shutdown(55)
 
-        if None not in columns:
-            return (self.table_id, OP_UPDATE, columns)
+        sanitized_columns = tuple(to_safe_data(col) for col in columns)
 
-        primary_values = itemgetter(*self.primary)(columns)
+        if None not in sanitized_columns:
+            return (self.table_id, OP_UPDATE, sanitized_columns)
 
-        if type(primary_values) is not tuple:
-            primary_values = (primary_values,)
-
-        get_columns = primary_values + (None,) * (len(columns) - len(self.primary))
+        get_columns = tuple(
+            sanitized_columns[i] if i in self.primary else None
+            for i in range(len(sanitized_columns))
+        )
 
         get_result = G.TE.get(self.table_id, get_columns)
 
-        columns = tuple(
-            x[1] if x[1] is not None else get_result[x[0]] for x in enumerate(columns)
-        )
-        return (self.table_id, OP_UPDATE, columns)
+        if get_result is not None:
+            sanitized_columns = tuple(
+                sanitized_columns[i] if sanitized_columns[i] is not None else (get_result[i] if i < len(get_result) else None)
+                for i in range(len(sanitized_columns))
+            )
+
+        return (self.table_id, OP_UPDATE, sanitized_columns)
 
     @G.type_check(Self, {SafeDataType})
-    def get(self, *columns: SafeDataType) -> OperationType|None:
-        """Create get operation, can return None if nothing found."""
+    def get(self, *columns: SafeDataType) -> OperationType | None:
+        """Query Table Engine for matching record and return OP_DONE operation, or None.
+
+        Args:
+            *columns: Column filter values.
+
+        Usage:
+            `m_file_name.get(None, "core/sched.c")`
+
+        Returns:
+            Operation tuple `(table_id, OP_DONE, result)` or None.
+        """
         if is_data_unsafe(columns):
             logger.error(f"""An {self.table_name}.get was done with unresolved refs,
-            This is unexpedted behavior. CRASH""")
+            This is unexpected behavior. CRASH""")
             logger.error(columns)
             G.emergency_shutdown(55)
 
-        result = G.TE.get(self.table_id, columns)
+        sanitized_columns = tuple(to_safe_data(col) for col in columns)
+        result = G.TE.get(self.table_id, sanitized_columns)
         if result is None:
             return None
 
-        return (self.table_id, OP_DONE, result)
+        return (self.table_id, OP_DONE, tuple(to_safe_data(x) for x in result))
 
     @G.type_check(Self, {UnSafeDataType})
     def get_set(self, *columns: UnSafeDataType) -> OperationType:
-        """Create get_set operation, will create set if get return None."""
+        """Return existing record as OP_DONE if match exists in TE, else construct OP_SET.
+
+        Args:
+            *columns: Column values or reference tuples.
+
+        Usage:
+            `m_file_name.get_set(None, "fs/ext4/super.c")`
+
+        Returns:
+            Operation tuple `(table_id, OP_DONE, result)` if found, else `(table_id, OP_SET, columns)`.
+        """
         if not is_data_unsafe(columns):
-            result = G.TE.get(self.table_id, columns)
+            sanitized_columns = tuple(to_safe_data(col) for col in columns)
+            result = G.TE.get(self.table_id, sanitized_columns)
             if result:
-                return (self.table_id, OP_DONE, result)
+                return (self.table_id, OP_DONE, tuple(to_safe_data(x) for x in result))
+            return (self.table_id, OP_SET, sanitized_columns)
 
-        return (self.table_id, OP_SET, columns)
-
-
+        return (self.table_id, OP_SET, normalize_data_tuple(columns))
 
     @G.type_check(Self, JoinsType, {UnSafeDataType})
     def view(self, joins: JoinsType, *data: UnSafeDataType) -> OperationType:
-        """Create view operation, will create view_set if view_get return None."""
-        if not is_data_unsafe(data):
-            result = G.TE.view_get(joins, data)
-            if result:
-                return (joins, OP_VIEW_DONE, result)
+        """Construct OP_VIEW_SET operation (or OP_VIEW_DONE if view_get finds match).
 
-        return (joins, OP_VIEW_SET, data)
+        Args:
+            joins: Relational join graph tuple (JoinsType).
+            *data: Column data values across joined tables.
+
+        Usage:
+            `m_ast.view(((m_ast.ast_id,),), None, "node_name", type_id)`
+
+        Returns:
+            Operation tuple `(joins, OP_VIEW_DONE, result)` if found, else `(joins, OP_VIEW_SET, data)`.
+        """
+        if not is_data_unsafe(data):
+            sanitized_data = tuple(to_safe_data(x) for x in data)
+            result = G.TE.view_get(joins, sanitized_data)
+            if result:
+                return (joins, OP_VIEW_DONE, tuple(to_safe_data(x) for x in result))
+            return (joins, OP_VIEW_SET, sanitized_data)
+
+        return (joins, OP_VIEW_SET, normalize_data_tuple(data))
 
     @G.type_check(Self, JoinsType, {SafeDataType})
-    def view_get(self, joins: JoinsType, *data: SafeDataType) -> OperationType|None:
-        """Create view_get operation, can return None."""
-        if not is_data_unsafe(data):
-            result = G.TE.view_get(joins, data)
+    def view_get(self, joins: JoinsType, *data: SafeDataType) -> OperationType | None:
+        """Query Table Engine for single multi-table view join match and return OP_VIEW_DONE.
 
+        Args:
+            joins: Relational join graph tuple (JoinsType).
+            *data: Column filter values across joined tables.
+
+        Usage:
+            `m_ast.view_get(joins_tuple, None, "struct_name", type_id)`
+
+        Returns:
+            Operation tuple `(joins, OP_VIEW_DONE, result)` or None.
+        """
+        if not is_data_unsafe(data):
+            sanitized_data = tuple(to_safe_data(x) for x in data)
+            result = G.TE.view_get(joins, sanitized_data)
             if result:
-                return (joins, OP_VIEW_DONE, result)
+                return (joins, OP_VIEW_DONE, tuple(to_safe_data(x) for x in result))
 
         return None
 
     @G.type_check(Self, JoinsType, {UnSafeDataType})
-    def view_get_multiple(self, joins: JoinsType, *data: UnSafeDataType) -> tuple[tuple[SafeDataType, ...], ...]|None:
-        """USE ONLY TO GET A TUPLE OF RESULTS."""
+    def view_get_multiple(
+        self,
+        joins: JoinsType,
+        *data: UnSafeDataType,
+    ) -> list[tuple[SafeDataType, ...]] | None:
+        """Query Table Engine for all matching multi-table view join rows.
+
+        Args:
+            joins: Relational join graph tuple (JoinsType).
+            *data: Column filter values across joined tables.
+
+        Returns:
+            List of matching joined row tuples or None if unsafe.
+        """
         if is_data_unsafe(data):
             return None
-        return G.TE.view_get_multiple(joins, data)
+        sanitized_data = tuple(to_safe_data(x) for x in data)
+        results = G.TE.view_get_multiple(joins, sanitized_data)
+        if results is None:
+            return None
+        return [tuple(to_safe_data(col) for col in row) for row in results]
 
+    def ref_view(self, joins: JoinsType, *data: UnSafeDataType) -> OperationType:
+        """Construct OP_REF_VIEW operation for dynamic schema-driven AST view expansion.
 
+        Args:
+            joins: Relational join graph tuple.
+            *data: Dynamic view schema arguments.
+
+        Returns:
+            Operation tuple `(joins, OP_REF_VIEW, data)`.
+        """
+        return (joins, OP_REF_VIEW, data)

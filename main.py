@@ -1,4 +1,47 @@
-"""Main.py - Main processing loop."""
+"""main.py - Core Orchestration Loop, Table Definitions & Processing Workflows.
+
+===============================================================================
+SYSTEM ORCHESTRATION & PIPELINE ARCHITECTURAL GUIDE
+===============================================================================
+This module serves as the primary entry point and orchestrator for the parser.
+It defines the database table schema array (`gp.Table_Array`), manages git version
+lifecycles, coordinates multiprocessing parsing workers, and resolves queued
+`ChangeSet` operations into database transactions.
+
+1. DATABASE SCHEMA INITIALIZATION:
+-------------------------------------------------------------------------------
+  `gp.Table_Array` registers 14 core relational tables defining the schema:
+    - Version & File tracking: `m_v_main`, `m_file_name`, `m_file`, `m_bridge_file`, `m_moved_file`
+    - AST Schema: `m_type_descriptor`, `m_ast`, `m_ast_container`, `m_ast_include`, `m_ast_debug`
+    - Version Tags & Spatial Coordinates: `m_tag`, `m_bridge_tag`, `m_map_ast`, `m_bridge_map`
+
+2. VERSION PROCESSING PIPELINE (`update(version)`):
+-------------------------------------------------------------------------------
+  Step 1: Version Registration (`create_new_vid`)
+          Registers new release tag in `m_v_main`.
+  Step 2: Database Index Optimization (`create_index`)
+          Creates temporary B-tree indexes (`ast_index`, `file_name_index`) for fast lookups.
+  Step 3: Multiprocessing AST Parsing (`trigger_multicore`)
+          Distributes `gp.Change_List` across `G.CPUS - 1` parallel worker processes.
+          Each worker invokes `file_processing()`, runs `default_processing()` and `CS.parse()`,
+          and returns picklable `ChangeSet` objects.
+  Step 4: Unchanged File & Directory Propagation (`processing_unchanges`, `processing_dirs`)
+          Propagates file and directory references from `gp.Old_VID` to `gp.VID` for
+          unmodified files and directories.
+  Step 5: ChangeSet Resolution Loop (`cs_queue.get()`)
+          Iterates over queued `ChangeSet` instances in serial, calling `CS.execute()`.
+          Unresolved references raise `REF_NOT_RESOLVABLE` and are requeued until satisfied.
+  Step 6: Transaction Commit & Reset (`G.TE.commit`)
+          Removes temporary indexes, commits database transactions, and purges RAMDISK.
+
+3. DIFF OPERATION ROUTING (`default_processing(CS)`):
+-------------------------------------------------------------------------------
+  - `"A"` (Added): Inserts new `m_file_name`, `m_file` (vid_s=VID, s_stat='A'), and `m_bridge_file`.
+  - `"M"` (Modified): Updates prior `m_file` (vid_e=Old_VID, e_stat='M') and creates new `m_file`.
+  - `"R"` (Renamed): Updates prior `m_file` (e_stat='R'), creates new `m_file`, and inserts `m_moved_file`.
+  - `"D"` (Deleted): Updates prior `m_file` (vid_e=Old_VID, e_stat='D').
+===============================================================================
+"""
 from globalstuff import (
     G,
     COLOR,
@@ -8,259 +51,104 @@ from globalstuff import (
     REF_NOT_RESOLVABLE,
     CONTINUE_EXCEPTION,
     T_DIR,
+    ASTT,
 )
+import sys
 import logging
 import argparse
 import multiprocessing
+import traceback
+import pickle
 from queue import SimpleQueue
-from DBHandling import MariaDB
+from db_engine import MariaDB, MockDB, get_db_engine
 from table_engine.te_direct_db import TEDirectDB
 from FileHandler import MasterFile
 from TableHandling import Table, ChangeSet
 from GreatProcessor import GreatProcessor
-#import cProfile
-#import pstats
+from parser.c_ast.c_ast import Ast_Manager
 
 
 G.DB = MariaDB
 G.TE = TEDirectDB()
 MF = MasterFile()
+G.MF = MF
 gp = GreatProcessor()
 logging.basicConfig(
-    level=logging.INFO,  # Set the minimum logging level
-    format="%(asctime)s - %(levelname)s - %(message)s"  # Format of log messages
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
 
 
 ##################################
-# DB STRUCTURE
-# Order is important, keep vmain as 0 or change GP
-gp.Table_Array.append(
-    m_v_main := Table(
-        table_id=len(gp.Table_Array),
-        table_name="m_v_main",
-        columns=(
-            ("vid", "INT", "NOT NULL", "AUTO_INCREMENT"),
-            ("vname", "VARCHAR(32)", "NOT NULL", "COLLATE utf8mb4_bin"),
-        ),
-        primary=("vid",),
-        foreign=None,
-        initial_insert=((0, "latest"),),
-        no_duplicate=True,
-        select_procedure=True,
-    ),
+# DB STRUCTURE (Extracted to DBLayout.py)
+from DBLayout import (
+    init_db_layout,
+    m_v_main,
+    m_file_name,
+    m_file,
+    m_bridge_file,
+    m_moved_file,
+    m_type_descriptor,
+    m_ast,
+    m_ast_container,
+    m_ast_include,
+    m_ast_debug,
+    m_tag,
+    m_bridge_tag,
+    m_map_ast,
+    m_bridge_map,
 )
 
-gp.Table_Array.append(
-    m_file_name := Table(
-        table_id=len(gp.Table_Array),
-        table_name="m_file_name",
-        columns=(
-            ("fnid", "INT", "NOT NULL", "AUTO_INCREMENT"),
-            ("fname", "VARCHAR(255)", "NOT NULL", "COLLATE utf8mb4_bin"),
-        ),
-        primary=("fnid",),
-        foreign=None,
-        initial_insert=((0, ""),),
-        no_duplicate=True,
-        select_procedure=True,
-    ),
-)
-
-gp.Table_Array.append(
-    m_file := Table(
-        table_id=len(gp.Table_Array),
-        table_name="m_file",
-        columns=(
-            ("fid", "INT", "NOT NULL", "AUTO_INCREMENT"),
-            ("vid_s", "INT", "NOT NULL"),
-            ("vid_e", "INT", "NOT NULL"),
-            ("ftype", "TINYINT", "UNSIGNED", "NOT NULL"),
-            ("s_stat", "CHAR(1)", "NOT NULL"),
-            ("e_stat", "CHAR(1)", "NOT NULL"),
-        ),
-        primary=("fid",),
-        foreign=(("vid_s", "m_v_main", "vid"), ("vid_e", "m_v_main", "vid")),
-        initial_insert=((0, 0, 0, 0, 0, 0)),
-        no_duplicate=False,
-        select_procedure=True,
-    ),
-)
-
-#select_procedure=lambda x: (f"SELECT m_file.* FROM m_file INNER JOIN m_bridge_file ON m_bridge_file.fid = m_file.fid WHERE m_bridge_file.vid = {x.Old_VID};"),
-
-
-gp.Table_Array.append(
-    m_bridge_file := Table(
-        table_id=len(gp.Table_Array),
-        table_name="m_bridge_file",
-        columns=(
-            ("vid", "INT", "NOT NULL"),
-            ("fnid", "INT", "NOT NULL"),
-            ("fid", "INT", "NOT NULL"),
-        ),
-        primary=("vid", "fnid"),
-        foreign=(
-            ("vid", "m_v_main", "vid"),
-            ("fnid", "m_file_name", "fnid"),
-            ("fid", "m_file", "fid"),
-        ),
-        initial_insert=None,
-        no_duplicate=False,
-        select_procedure=True,
-    ),
-)
-
-#lambda x: f"SELECT * FROM m_bridge_file WHERE m_bridge_file.vid = {x.Old_VID};",
-
-gp.Table_Array.append(
-    m_moved_file := Table(
-        table_id=len(gp.Table_Array),
-        table_name="m_moved_file",
-        columns=(("s_fid", "INT", "NOT NULL"), ("e_fid", "INT", "NOT NULL")),
-        primary=("s_fid", "e_fid"),
-        foreign=(("s_fid", "m_file", "fid"), ("e_fid", "m_file", "fid")),
-        initial_insert=None,
-        no_duplicate=False,
-        select_procedure=False,
-    ),
-)
-
-gp.Table_Array.append(
-    m_ast := Table(
-        table_id=len(gp.Table_Array),
-        table_name="m_ast",
-        columns=(
-            ("ast_id", "INT", "NOT NULL", "AUTO_INCREMENT"),
-            ("name", "VARCHAR(255)", "NOT NULL", "COLLATE utf8mb4_bin"),
-            ("type_id", "TINYINT", "UNSIGNED", "NOT NULL"),
-        ),
-        primary=("ast_id",),
-        foreign=None,
-        initial_insert=(0, "", 0),
-        no_duplicate=False,
-        select_procedure=True,
-    ),
-)
-
-gp.Table_Array.append(
-    m_ast_container := Table(
-        table_id=len(gp.Table_Array),
-        table_name="m_ast_container",
-        columns=(
-            ("ast_id", "INT", "NOT NULL"),
-            ("priority", "TINYINT", "UNSIGNED", "NOT NULL"),
-            ("name", "VARCHAR(255)", "NOT NULL", "COLLATE utf8mb4_bin"),
-            ("subtype", "TINYINT", "UNSIGNED", "NOT NULL"),
-            ("ref_ast_id", "INT", "NOT NULL"),
-        ),
-        primary=("ast_id", "priority"),
-        foreign=(("ast_id", "m_ast", "ast_id"), ("ref_ast_id", "m_ast", "ast_id")),
-        initial_insert=None,
-        no_duplicate=False,
-        select_procedure=True,
-    ),
-)
-
-gp.Table_Array.append(
-    m_ast_include := Table(
-        table_id=len(gp.Table_Array),
-        table_name="m_ast_include",
-        columns=(("ast_id", "INT", "NOT NULL"), ("fnid", "INT", "NOT NULL")),
-        primary=("ast_id",),
-        foreign=(("ast_id", "m_ast", "ast_id"), ("fnid", "m_file_name", "fnid")),
-        initial_insert=None,
-        no_duplicate=False,
-        select_procedure=True,
-    ),
-)
-
-gp.Table_Array.append(
-    m_ast_debug := Table(
-        table_id=len(gp.Table_Array),
-        table_name="m_ast_debug",
-        columns=(("ast_id", "INT", "NOT NULL"), ("ast_raw", "MEDIUMTEXT", "NOT NULL")),
-        primary=("ast_id",),
-        foreign=(("ast_id", "m_ast", "ast_id"),),
-        initial_insert=None,
-        no_duplicate=False,
-        select_procedure=False,
-    ),
-)
-
-gp.Table_Array.append(
-    m_tag := Table(
-        table_id=len(gp.Table_Array),
-        table_name="m_tag",
-        columns=(
-            ("tag_id", "INT", "NOT NULL", "AUTO_INCREMENT"),
-            ("vid_s", "INT", "NOT NULL"),
-            ("vid_e", "INT", "NOT NULL"),
-            ("code", "LONGTEXT", "NOT NULL"),
-            ("ast_id", "INT", "NOT NULL"),
-            ("hl_s", "INT", "NOT NULL"),
-            ("hl_l", "INT", "NOT NULL"),
-        ),
-        primary=("tag_id", "vid_s"),
-        foreign=(
-            ("vid_s", "m_v_main", "vid"),
-            ("vid_e", "m_v_main", "vid"),
-            ("ast_id", "m_ast", "ast_id"),
-        ),
-        initial_insert=(0, 0, 0, "", 0, 0, 0),
-        no_duplicate=False,
-        select_procedure=True,  #only get the last version of the tags
-    ),
-)
-
-gp.Table_Array.append(
-    m_bridge_tag := Table(
-        table_id=len(gp.Table_Array),
-        table_name="m_bridge_tag",
-        columns=(
-            ("fid", "INT", "NOT NULL"),
-            ("tag_id", "INT", "NOT NULL"),
-            ("line_s", "INT", "NOT NULL"),
-            ("line_e", "INT", "NOT NULL"),
-            ("char_s", "INT", "NOT NULL"),
-            ("char_e", "INT", "NOT NULL"),
-        ),
-        primary=("fid", "tag_id"),
-        foreign=(("fid", "m_file", "fid"), ("tag_id", "m_tag", "tag_id")),
-        initial_insert=None,
-        no_duplicate=False,
-        select_procedure=True,  #only get the last version of the tags
-    ),
-)
-
-# DB STRUCTURE END
+init_db_layout(gp)
 ##################################
 
 def update(version: str) -> None:
-    """Execute main processing loop."""
+    """Execute the full version parsing and database ingestion pipeline for a target release version.
+    
+    Workflow Steps:
+    1. Register new version string in `m_v_main` via `create_new_vid()`.
+    2. Build temporary performance B-tree indexes (`ast_index`, `file_name_index`).
+    3. Clone repository branch into RAMDISK via `MF.add_version()`.
+    4. Generate git diff change list (`MF.generate_change_list()`) & start Table Engine cache.
+    5. Spawn parallel worker processes (`trigger_multicore()`) to parse file diffs into ChangeSets.
+    6. Enqueue all generated `ChangeSet` objects into `cs_queue` and resolve operations sequentially.
+    7. Remove temporary indexes, commit table transactions (`G.TE.commit()`), and reset state.
+    """
     logger.info(COLOR.green(f"=======================Working on {version}======================="))
+    
+    # -------------------------------------------------------------------------
+    # STEP 1: Register new version release in m_v_main
+    # -------------------------------------------------------------------------
     create_new_vid(version)
 
-    # Index Handling
+    # -------------------------------------------------------------------------
+    # STEP 2: Create temporary performance indexes on DB tables
+    # -------------------------------------------------------------------------
     with G.DB() as db:
         db.create_index("ast_index", m_ast, (m_ast.name, m_ast.type_id))
         db.create_index("file_name_index", m_file_name, (m_file_name.fname,))
 
-    # Pre-Processing
+    # -------------------------------------------------------------------------
+    # STEP 3: Clone repository branch version to RAMDISK workspace
+    # -------------------------------------------------------------------------
     MF.add_version(version, gp.PURGE_LIST)
 
+    # -------------------------------------------------------------------------
+    # STEP 4: Generate git diff change list & initialize Table Engine cache
+    # -------------------------------------------------------------------------
     MF.generate_change_list(gp)
     G.TE.start(gp.Table_Array, G.DB)
-    ## preload/dirs
-    # processing_dirs()
-    # preload_fnid()
 
-    # Main Processing
+    # -------------------------------------------------------------------------
+    # STEP 5: Spawn multicore workers to parse changed files in parallel
+    # -------------------------------------------------------------------------
     trigger_multicore()
 
+    # -------------------------------------------------------------------------
+    # STEP 6: Enqueue ChangeSets and resolve operations sequentially
+    # -------------------------------------------------------------------------
     G.TE.start_new_db(G.DB)
-    # probably this loop missing some shit, IE: arch/x86/include/asm/xen/page.h
     cs_queue = SimpleQueue()
 
     for key in gp.ChangeSet_Dict:
@@ -271,16 +159,24 @@ def update(version: str) -> None:
         max_loop -= 1
         if max_loop < 0:
             logger.error(f"max loop ({len(gp.ChangeSet_Dict)*G.OVERRIDE_FC_MAX_LOOP_EXEC_MULT}) was brought to 0, printing queue:")
+            debug_unresolved = []
             while not cs_queue.empty():
-                logger.error(gp.ChangeSet_Dict[cs_queue.get()])
+                debug_unresolved.append(gp.ChangeSet_Dict[cs_queue.get()])
+
+            G.BP_ON_REF_FAIL = True
+
+            for item in debug_unresolved:
+                item.execute()
+
             G.emergency_shutdown(666)
         current_cs = cs_queue.get()
-        try:
-            if not gp.ChangeSet_Dict[current_cs].execute():
-                cs_queue.put(current_cs)
-        except REF_NOT_RESOLVABLE:
+        if not gp.ChangeSet_Dict[current_cs].execute():
             cs_queue.put(current_cs)
 
+
+    # -------------------------------------------------------------------------
+    # STEP 7: Remove temporary indexes, commit transactions, and reset state
+    # -------------------------------------------------------------------------
     with G.DB() as db:
         db.remove_index("ast_index", m_ast)
         db.remove_index("file_name_index", m_file_name)
@@ -291,42 +187,62 @@ def update(version: str) -> None:
     gp.reset_cs()
     return
 
-def trigger_multicore() -> None:
-    """Execute G.CPUS - 1 process for parsing."""
+
+def trigger_multicore(batch_size: int = 200) -> None:
+    """Distribute file parsing across `G.CPUS - 1` parallel worker processes in dynamic batches."""
     gp.start_manager()
+    task_queue = gp.Manager.Queue()
+    error_list = gp.Manager.list()
+
+    change_list = gp.Change_List
+    total_files = len(change_list)
+    total_batches = (total_files + batch_size - 1) // batch_size if total_files > 0 else 0
+
+    num_workers = max(1, int(G.CPUS - 1))
+    logger.info(
+        f"Distributing {total_files} changed files in {total_batches} batches "
+        f"(batch size: {batch_size}) across {num_workers} parallel workers"
+    )
+
+    for i in range(0, total_files, batch_size):
+        task_queue.put((i // batch_size, change_list[i : i + batch_size]))
+
+    for _ in range(num_workers):
+        task_queue.put(None)  # Sentinel to terminate each worker
+
     processes = []
-
-    split_change_list_size = len(gp.Change_List) // int(G.CPUS - 1)
-
-    for x in range(G.CPUS - 1):
-        if x == (G.CPUS - 2):
-            process_arg = (split_change_list_size * x, None)
-            processes.append(
-                multiprocessing.Process(
-                    target=file_processing,
-                    args=process_arg,
-                ),
-            )
-        else:
-            process_arg = (
-                split_change_list_size * x,
-                split_change_list_size * (x + 1),
-            )
-            processes.append(
-                multiprocessing.Process(
-                    target=file_processing,
-                    args=process_arg,
-                ),
-            )
-        processes[-1].start()
+    for worker_id in range(num_workers):
+        p = multiprocessing.Process(
+            target=file_processing_worker,
+            args=(task_queue, error_list, gp.Shared_ChangeSet_Dict_List, gp.VID, gp, MF, worker_id),
+        )
+        processes.append(p)
+        p.start()
 
     G.TE.start_new_db(G.DB)
     # needs to be try: protected
     processing_dirs()
     processing_unchanges()
 
-    for fp_instance in processes:
-        fp_instance.join()
+    failed_workers = 0
+    for p in processes:
+        p.join()
+        if p.exitcode != 0:
+            failed_workers += 1
+            logger.error(COLOR.red(f"Worker PID {p.pid} terminated abnormally with exit code {p.exitcode}"))
+
+    if error_list:
+        logger.error(COLOR.red(f"Multicore processing encountered {len(error_list)} file error(s):"))
+        for failed_file, err, tb in error_list:
+            logger.error(COLOR.red(f"  [ERROR] File: {failed_file} => {err}"))
+
+    if failed_workers > 0 or error_list:
+        logger.error(
+            COLOR.red(
+                f"Multicore execution completed with {failed_workers} crashed worker(s) "
+                f"and {len(error_list)} file error(s)!"
+            )
+        )
 
     gp.stop_manager()
 
@@ -357,6 +273,8 @@ def main() -> None:
     #    logger.error(e)
     #    G.emergency_shutdown(2)
 
+
+    logger.info("We are done! Closing")
     G.emergency_shutdown(0)
     return
 
@@ -373,14 +291,28 @@ def arg_handling() -> None:
         help="Generate all tables", action="store_true",
     )
     parser.add_argument(
+        "-u", "--unit-test", "--test-unit",
+        dest="unit_test",
+        nargs="?",
+        const="",
+        default=None,
+        help="Run C-AST unit test suite in /dev/shm (optionally specify a single file to test)",
+    )
+    parser.add_argument(
         "-T", "--Test",
         help="Test/Parse a specific file",
     )
     parser.add_argument(
-        "-V", "--version",
-        help="Add a new version to the DB",
+        "--db", "--db-engine",
+        dest="db_engine",
+        default="mariadb",
+        choices=["mariadb", "mysql", "mock", "mockdb", "inmemory"],
+        help="Select database backend engine (default: mariadb)",
     )
     args = parser.parse_args()
+
+    if args.db_engine:
+        G.DB = get_db_engine(args.db_engine)
 
     if args.Drop:
         logger.info("Dropping all tables")
@@ -388,18 +320,15 @@ def arg_handling() -> None:
     if args.Create_Tables:
         gp.create_table_all()
         G.emergency_shutdown(0)
+    if args.unit_test is not None:
+        target = args.unit_test if args.unit_test != "" else None
+        from tests.test_c_ast import run_c_ast_tests
+        code = run_c_ast_tests(target)
+        sys.exit(code)
     if args.Test:
-        # THIS SHIT AINT WORKIN
-        gp.drop_all()
-        gp.create_table_all()
-        gp.clear_fetch_all()
-        gp.create_new_vid("v3.0")
-        MF.add_version("v3.0", gp.PURGE_LIST)
-        # include/linux/netfilter_bridge/ebtables.h
-        # include/linux/lockd/bind.h
-        # include/linux/sched.h
-        # Ast_Manager(MF.version_dict[gp.Version_Name], args.Test)
-        G.emergency_shutdown(0)
+        from tests.test_c_ast import run_c_ast_tests
+        code = run_c_ast_tests(args.Test)
+        sys.exit(code)
     return
 
 
@@ -604,12 +533,63 @@ def default_processing(CS: ChangeSet) -> None:
         ))
     return
 
-def file_processing(start: int, end: int | None, override_list: list[str] | None=None) -> None:
-    """Process gp.Change_List and sent CS into gp.ChangeSet_Dict."""
+def file_processing_worker(
+    task_queue: multiprocessing.Queue,
+    error_list: list,
+    shared_dict_list: list,
+    vid: int,
+    gp_ref: GreatProcessor,
+    mf_ref: MasterFile,
+    worker_id: int = 0,
+) -> None:
+    """Worker process that continuously pulls and parses batches of files from `task_queue`."""
+    G.TE.start_new_db(G.DB)
 
-    #profiler = cProfile.Profile()
-    #profiler.enable()
+    while True:
+        try:
+            task = task_queue.get()
+        except Exception as e:
+            logger.error(f"Worker {worker_id} failed to get batch from queue: {e}")
+            break
 
+        if task is None:
+            # Sentinel received, gracefully exit
+            break
+
+        batch_id, changed_files = task
+        batch_cs_dict = {}
+
+        for changed_file in changed_files:
+            try:
+                CS = ChangeSet(changed_file)
+                CS.current_vid = vid
+                CS.gp = gp_ref
+                CS.mf = mf_ref
+
+                default_processing(CS)
+                CS.parse()
+
+                # Clean bloat and store in batch dict
+                CS.clear_bloat()
+                batch_cs_dict[CS.current_path] = CS
+            except Exception as e:
+                err_str = str(e)
+                tb_str = traceback.format_exc()
+                logger.error(COLOR.red(f"Worker {worker_id} error parsing '{changed_file}': {err_str}"))
+                error_list.append((changed_file, err_str, tb_str))
+
+        if batch_cs_dict:
+            try:
+                shared_dict_list.append(pickle.dumps(batch_cs_dict))
+            except Exception as e:
+                logger.error(COLOR.red(f"Worker {worker_id} failed to serialize batch {batch_id}: {e}"))
+                error_list.append((f"Batch-{batch_id}", str(e), traceback.format_exc()))
+
+    return
+
+
+def file_processing(start: int, end: int | None, override_list: list[str] | None = None) -> None:
+    """Process gp.Change_List (or override_list) and send CS into gp.ChangeSet_Dict."""
     G.TE.start_new_db(G.DB)
     if override_list:
         changed_files = override_list
@@ -619,30 +599,24 @@ def file_processing(start: int, end: int | None, override_list: list[str] | None
         changed_files = gp.Change_List[start:end]
 
     for changed_file in changed_files:
-        CS = ChangeSet(changed_file)
-        CS.current_vid = gp.VID
-        CS.gp = gp
-        CS.mf = MF
+        try:
+            CS = ChangeSet(changed_file)
+            CS.current_vid = gp.VID
+            CS.gp = gp
+            CS.mf = MF
 
-        default_processing(CS)
+            default_processing(CS)
+            CS.parse()
 
-        CS.parse()
-
-        # Store Set
-        CS.clear_bloat()
-        gp.ChangeSet_Dict[CS.current_path] = CS
+            # Store Set
+            CS.clear_bloat()
+            gp.ChangeSet_Dict[CS.current_path] = CS
+        except Exception as e:
+            logger.error(COLOR.red(f"Error processing file '{changed_file}': {e}\n{traceback.format_exc()}"))
 
     if override_list is None:
         gp.push_set_to_main()
 
-
-    #profiler.disable()
-
-    # Create statistics object and format output
-    #stats = pstats.Stats(profiler)
-    # Sort by cumulative time (time in function + all subcalls)
-    #stats.sort_stats('cumulative')
-    #stats.print_stats()
     return
 
 
@@ -803,14 +777,6 @@ def processing_dirs() -> None:  # noqa: C901
                 CS.ref(m_file.fid),
             ))
             gp.ChangeSet_Dict[single_dir] = CS
-    return
-
-
-####unused
-def preload_fnid() -> None:  # noqa: D103
-    # Based on change
-    for changed_file in (x.split("\t")[-1] for x in gp.Change_List):
-        m_file_name.actual_get_set(m_file_name.fname(changed_file))
     return
 
 

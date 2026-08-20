@@ -22,7 +22,7 @@ button {
   cursor: pointer;
 }
 
-.table-tags{table, th, td {border: 1px solid black;padding:1px;}}
+.table-tags{table, th, td {border: 2px solid black;padding:2px;}}
 
 .topbar {background-color: grey;}
 .search {display: flex; justify-content: flex-end;}
@@ -30,10 +30,11 @@ button {
 .slink {color: #fff;}
 .workspace {flex: 95%}
 .tabs {background-color: #b3b3b3;flex: 95%;}
-.tab {background-color: #a6a6a6;display: inline-block;padding: 0.35em;border: 1px solid #ccc;font-weight: 700;}
+.tab {background-color: #a6a6a6;display: inline-block;padding: 0.35em;border: 2px solid #ccc;font-weight: 700;}
 .active {background-color: red;}
-.left-pad {padding-left: 2%;}
-.tag-code {border: 1px solid black;padding: 0.35em;}
+.left-pad {padding-left: 2px;}
+.tag-container{border: 2px solid black;padding:2px;}
+.tag-code {border: 2px solid black;padding: 0.35em;}
 </style>
 
 </head>
@@ -256,6 +257,7 @@ async function generate_content(version, path){
         text += "<div class=\"left-pad\"><details><summary><b>tags: </b></summary><p>";
         let len_tags = tags.length;
         for (let i = 0; i < len_tags; i++) {
+            text += "<div class=\"tag-container\">"
             if ("name" in tags[i]){
                 if (!(tags[i].name === null)){
                     text += "<b>" + tags[i].name + "</b>"
@@ -282,15 +284,15 @@ async function generate_content(version, path){
                 break
             }
             if (tag_code != null){
-                text += "<div class=\"left-pad\"><details><summary><b>code: </b></summary><p><code class=\"tag-code\">" + tag_code + "</code><br><br>";
-                text += "</p></details></div>";
+                text += "<details><summary><b>code: </b></summary><p><code class=\"tag-code\">" + tag_code + "</code>";
+                text += "</p></details>";
             }
 
             if (tag_ast_raw != null){
-                text += "<div class=\"left-pad\"><details><summary><b>ast_raw: </b></summary><p>" + jsonToHtmlTable(tag_ast_raw) + "<br><br>";
-                text += "</p></details></div>";
+                text += "<details><summary><b>ast_raw: </b></summary><p>" + jsonToHtmlTable(tag_ast_raw) + "";
+                text += "</p></details>";
             }
-            
+            text += "</div>"
             text += "<br>"
         }
         text += "</p></details></div>";

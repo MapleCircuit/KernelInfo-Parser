@@ -1,0 +1,7 @@
+.vscode
+.agents
+.temp
+.ruff_cache
+Notes
+__pycache__
+linux
