@@ -37,8 +37,8 @@ SCHEMA ENTITY-RELATIONSHIP GRAPH:
    m_map_ast (map_id, line_s, char_s, line_e, char_e, ast_id) ----------------|
 ===============================================================================
 """
-from globalstuff import ASTT
-from TableHandling import Table
+from core.globalstuff import ASTT
+from core.TableHandling import Table
 
 # Pre-populate AST type descriptor entries from ASTT enum
 m_type_descriptor_insert = tuple((ast.value, ast.name) for ast in ASTT)

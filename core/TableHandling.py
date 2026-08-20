@@ -94,7 +94,7 @@ from typing import Any, Self
 from types import TracebackType
 from enum import Enum
 
-from globalstuff import (
+from core.globalstuff import (
     G,
     PointerGetter,
     type_check,
@@ -754,7 +754,6 @@ class ChangeSet:
         schema_thens = schema[1]
         schema_route = schema[2]
 
-        # getting a list of pos from route
         if not schema_route:
             data_list = []
         else:

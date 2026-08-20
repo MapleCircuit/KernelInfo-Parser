@@ -218,4 +218,3 @@ if __UNICODE_SUPPORT:
 else:
     def render_ansi_box_unicode(groups):
         return NotImplemented   
-

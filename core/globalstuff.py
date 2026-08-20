@@ -2,7 +2,7 @@
 import sys
 import shutil
 from pathlib import Path
-from StringWrangler import wrap_lines, render_ansi_box, render_with_indent
+from core.StringWrangler import wrap_lines, render_ansi_box, render_with_indent
 import contextlib
 from typing import Self
 from functools import wraps
@@ -23,8 +23,8 @@ LinkType = int | str
 RouteType = tuple[LinkType, ...] | list[LinkType, ...]
 RefType = tuple[PointerType, int, RouteType]
 
-SafeDataType = int|str|None
-UnSafeDataType = SafeDataType|RefType
+SafeDataType = int | str | None
+UnSafeDataType = SafeDataType | RefType
 
 
 
@@ -47,7 +47,6 @@ class GlobalStuff:
         self.RAMDISK = "/dev/shm"  # noqa: S108
         self.CPUS = 8
         self.linux_directory = Path("linux")
-
         self.CLEAN_PRINT = True
 
         self.BP_ON_SHUTDOWN = True
@@ -77,22 +76,19 @@ class GlobalStuff:
         self.DEBUG_TYPECHECK = True
 
         self.OP_isinstanceDict = {
-            PointerType:self.is_PointerType,
-            JoinType:self.is_JoinType,
-            JoinsType:self.is_JoinsType,
-            OperationType:self.is_OperationType,
-            LinkType:self.is_LinkType,
-            RouteType:self.is_RouteType,
-            RefType:self.is_RefType,
-            SafeDataType:self.is_SafeDataType,
-            UnSafeDataType:self.is_UnSafeDataType,
-            None:lambda x: x is None,
+            PointerType: self.is_PointerType,
+            JoinType: self.is_JoinType,
+            JoinsType: self.is_JoinsType,
+            OperationType: self.is_OperationType,
+            LinkType: self.is_LinkType,
+            RouteType: self.is_RouteType,
+            RefType: self.is_RefType,
+            SafeDataType: self.is_SafeDataType,
+            UnSafeDataType: self.is_UnSafeDataType,
+            None: lambda x: x is None,
         }
 
-
-
-    #@classmethod
-    def emergency_shutdown(self, number_error: int=1) -> None:
+    def emergency_shutdown(self, number_error: int = 1) -> None:
         """Close the program cleanly by deleting the git files."""
         if self.BP_ON_SHUTDOWN:
             self.BP()
@@ -106,12 +102,11 @@ class GlobalStuff:
     @classmethod
     def BP(cls) -> None:  # noqa: N802
         """Breakpoint with instructions."""
-        
         sys.breakpointhook()  # noqa: T100
         return
 
-    def string_shortner(self, text: str, mode: str="boxed+indent") -> str:
-        """Butify my string."""
+    def string_shortner(self, text: str, mode: str = "boxed+indent") -> str:
+        """Beautify string."""
         formated_text = ""
         wrapped_text = wrap_lines(
             [text],
@@ -130,28 +125,28 @@ class GlobalStuff:
         return formated_text
 
     def is_PointerType(self, variable: PointerType) -> bool:
-        if isinstance(variable, tuple) and len(variable)==2:  # noqa: PLR2004, SIM102
+        if isinstance(variable, tuple) and len(variable) == 2:  # noqa: PLR2004, SIM102
             if isinstance(variable[0], int) and isinstance(variable[1], int):
                 return True
         return False
 
     def is_JoinType(self, variable: JoinType) -> bool:
         if isinstance(variable, tuple):
-            if len(variable)==1:
+            if len(variable) == 1:
                 return self.is_PointerType(variable[0])
 
-            if len(variable)==3:  # noqa: PLR2004, SIM102
+            if len(variable) == 3:  # noqa: PLR2004, SIM102
                 if self.is_PointerType(variable[0]) and self.is_PointerType(variable[1]) and isinstance(variable[2], int):
                     return True
         return False
 
     def is_JoinsType(self, variable: JoinsType) -> bool:
-        if isinstance(variable, tuple) and len(variable)!=0:
+        if isinstance(variable, tuple) and len(variable) != 0:
             return all(self.is_JoinType(possible_join) for possible_join in variable)
         return False
 
     def is_OperationType(self, variable: OperationType) -> bool:
-        if isinstance(variable, tuple) and len(variable)==3:  # noqa: PLR2004, SIM102
+        if isinstance(variable, tuple) and len(variable) == 3:  # noqa: PLR2004, SIM102
             if isinstance(variable[0], int) or self.is_JoinsType(variable[0]):  # noqa: SIM102
                 if isinstance(variable[1], int) and isinstance(variable[2], tuple):
                     return True
@@ -161,12 +156,12 @@ class GlobalStuff:
         return isinstance(variable, (int, str))
 
     def is_RouteType(self, variable: RouteType) -> bool:
-        if isinstance(variable, (tuple, list)) and len(variable)!=0:
+        if isinstance(variable, (tuple, list)) and len(variable) != 0:
             return all(self.is_LinkType(possible_link) for possible_link in variable)
         return False
 
     def is_RefType(self, variable: RefType) -> bool:
-        if isinstance(variable, tuple) and len(variable)==3:  # noqa: PLR2004, SIM102
+        if isinstance(variable, tuple) and len(variable) == 3:  # noqa: PLR2004, SIM102
             if self.is_PointerType(variable[0]) and isinstance(variable[1], int) and self.is_RouteType(variable[2]):
                 return True
         return False
@@ -177,16 +172,11 @@ class GlobalStuff:
     def is_UnSafeDataType(self, variable: UnSafeDataType) -> bool:
         return bool(self.is_SafeDataType(variable) or self.is_RefType(variable))
 
-
-
     def OP_isinstance(self, arg: any, expected_type: any) -> bool:
-        #print(f"OP_isinstance arg:{arg} expected_type:{expected_type}")
-
         if (type_detected := self.OP_isinstanceDict.get(expected_type)) is not None:
             return type_detected(arg)
         else:
             return isinstance(arg, expected_type)
-
 
     def type_check(self, *expected_types):
         def decorator(func):
@@ -208,20 +198,13 @@ class GlobalStuff:
                             assert self.OP_isinstance(args[i], expected_type), f"Type Error expected:{expected_type}| Received: {args[i]}"
                 except IndexError:
                     pass
-                # before exec
                 result = func(*args, **kwargs)
-                # after exec
                 return result
             return wrapper
         return decorator
 
 
-
-
-
-
 G = GlobalStuff()
-
 
 
 class COLOR:
@@ -231,14 +214,17 @@ class COLOR:
     def green(cls, string_arg: str) -> str:
         """Green color codes."""
         return f"\033[92m{string_arg}\033[0m"
+
     @classmethod
     def red(cls, string_arg: str) -> str:
         """Red color codes."""
         return f"\033[93m{string_arg}\033[0m"
+
     @classmethod
     def magenta(cls, string_arg: str) -> str:
         """Magenta color codes."""
         return f"\033[35m{string_arg}\033[0m"
+
     @classmethod
     def cyan(cls, string_arg: str) -> str:
         """Cyan color codes."""
@@ -246,23 +232,14 @@ class COLOR:
 
 
 class PointerGetter:
-    """Iterator that returns the pointer and repetition from a joins in order.
+    """Iterator that returns the pointer and repetition from a joins in order."""
 
-    Here is a good base for its use:
-    for repeat, pointer in PointerGetter(joins):
-        for x in range(repeat):
-    """
-
-    def __init__(self, joins: JoinsType|int) -> None:
-        """Parse joins and detects single table joins.
-
-        Will also accept table_id as an arg, to be used with get_first_table_id.
-        """
+    def __init__(self, joins: JoinsType | int) -> None:
+        """Parse joins and detects single table joins."""
         self.joins = joins
         if not isinstance(joins, int):
             self.current = -1
             self.end = len(joins)
-            # check for view size 1 without 2nd pointer
             if len(joins) == 1 and len(joins[0]) == 1:
                 self.end = 0
 
@@ -277,11 +254,11 @@ class PointerGetter:
         self.current += 1
 
         if self.current == 0:
-            return (1, self.joins[0][0])  # Get the first pointer
+            return (1, self.joins[0][0])
         return (
             self.joins[self.current - 1][2],
             self.joins[self.current - 1][1],
-        )  # Get subsequent pointer
+        )
 
     def get_first_pointer(self) -> PointerType:
         """Get the first pointer of the joins."""

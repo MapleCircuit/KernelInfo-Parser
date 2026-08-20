@@ -37,14 +37,14 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any, Callable, Sequence, Self
 from types import TracebackType
 from operator import itemgetter
-from globalstuff import (
+from core.globalstuff import (
     SafeDataType,
     JoinsType,
     PointerGetter,
 )
 
 if TYPE_CHECKING:
-    from TableHandling import Table
+    from core.TableHandling import Table
     from db_engine.base import BaseDBEngine
 
 

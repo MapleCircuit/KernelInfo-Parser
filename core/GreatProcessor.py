@@ -31,7 +31,8 @@ change lists, and cross-process IPC communication during multicore parsing.
 """
 import multiprocessing
 import pickle
-from TableHandling import ChangeSet
+from core.TableHandling import ChangeSet
+
 
 class GreatProcessor:
     """Central runtime state container (`gp`) and multiprocessing IPC manager."""
@@ -56,14 +57,14 @@ class GreatProcessor:
         return
 
     def safe_get_cs(self, path: str):
-      CS = self.ChangeSet_Dict.get(path)
-      if CS is None:
-        CS = self.Alt_ChangeSet_Dict.get(path)
+        CS = self.ChangeSet_Dict.get(path)
         if CS is None:
-          CS = ChangeSet("M", path)
-          self.Alt_ChangeSet_Dict[path] = CS
-          CS.parse()
-      return CS
+            CS = self.Alt_ChangeSet_Dict.get(path)
+            if CS is None:
+                CS = ChangeSet("M", path)
+                self.Alt_ChangeSet_Dict[path] = CS
+                CS.parse()
+        return CS
 
     def start_manager(self) -> None:
         """Initialize `multiprocessing.Manager()` and create `Shared_ChangeSet_Dict_List` for worker IPC."""
@@ -89,7 +90,5 @@ class GreatProcessor:
         del self.Change_List
         del self.ChangeSet_Dict
         self.Change_List = None
-        
         self.ChangeSet_Dict = {}
-        
         return

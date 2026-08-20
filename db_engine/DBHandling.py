@@ -106,7 +106,7 @@ import os
 from typing import TYPE_CHECKING, Any, Sequence, Self
 from types import TracebackType
 import mysql.connector
-from globalstuff import (
+from core.globalstuff import (
     G,
     PointerGetter,
     SafeDataType,
@@ -117,7 +117,7 @@ from globalstuff import (
 from db_engine.base import BaseDBEngine
 
 if TYPE_CHECKING:
-    from TableHandling import Table
+    from core.TableHandling import Table
 
 MAX_ALLOWED_PACKET = 1073741824
 MAX_JOIN_TABLES = 50

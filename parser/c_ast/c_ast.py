@@ -53,7 +53,7 @@ database operations into a ChangeSet (`CS`).
     - `close_prior_tags(CS)`: Marks tags as inactive if the underlying AST element was removed or altered.
 ===============================================================================
 """
-from globalstuff import G, COLOR, REF_ROOT, REF_OLD, REF_C_AST, FILE_ERROR
+from core.globalstuff import G, COLOR, REF_ROOT, REF_OLD, REF_C_AST, FILE_ERROR
 from parser.c_ast.c_ast_type import (
     ChangeSetType,
     m_v_main,

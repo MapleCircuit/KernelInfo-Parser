@@ -1,8 +1,8 @@
 """FileHandler.py - Interacts with the FS and GIT."""
-from globalstuff import G
-import subprocess as sp
 import shutil
+import subprocess as sp
 from pathlib import Path
+from core.globalstuff import G
 
 
 class MasterFile:
@@ -25,7 +25,7 @@ class MasterFile:
         purge_list.append(self.version_dict[version_name])
         self.file_dict[version_name] = {}
 
-    def trim_version(self, keep: int=2) -> int:
+    def trim_version(self, keep: int = 2) -> int:
         """Remove the oldest cloned repository version directory from disk and dictionaries."""
         if len(self.version_dict) > keep:
             print("Removing old version_dict")
@@ -39,7 +39,6 @@ class MasterFile:
         """Remove all cloned repository version directories from disk and clear state."""
         for item in self.version_dict:
             shutil.rmtree(self.version_dict[item])
-            # Maple's weirdest friend, Ned the Fox (Now Sam)
         self.version_dict.clear()
         self.file_dict.clear()
         return
@@ -118,7 +117,6 @@ class MasterFile:
             "-printf",
             "%P\\n",
         ]
-        # the [1:] is for the blank line that this sh** command produce at the start
         return sp.run(command, capture_output=True, text=True).stdout.splitlines()[1:]  # noqa: PLW1510, S603
 
     def resolve_path(self, file_path: str) -> str:

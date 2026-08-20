@@ -42,7 +42,7 @@ lifecycles, coordinates multiprocessing parsing workers, and resolves queued
   - `"D"` (Deleted): Updates prior `m_file` (vid_e=Old_VID, e_stat='D').
 ===============================================================================
 """
-from globalstuff import (
+from core.globalstuff import (
     G,
     COLOR,
     type_check,
@@ -62,27 +62,10 @@ import pickle
 from queue import SimpleQueue
 from db_engine import MariaDB, MockDB, get_db_engine
 from table_engine.te_direct_db import TEDirectDB
-from FileHandler import MasterFile
-from TableHandling import Table, ChangeSet
-from GreatProcessor import GreatProcessor
-from parser.c_ast.c_ast import Ast_Manager
-
-
-G.DB = MariaDB
-G.TE = TEDirectDB()
-MF = MasterFile()
-G.MF = MF
-gp = GreatProcessor()
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s"
-)
-logger = logging.getLogger(__name__)
-
-
-##################################
-# DB STRUCTURE (Extracted to DBLayout.py)
-from DBLayout import (
+from core.FileHandler import MasterFile
+from core.TableHandling import Table, ChangeSet
+from core.GreatProcessor import GreatProcessor
+from core.DBLayout import (
     init_db_layout,
     m_v_main,
     m_file_name,
@@ -99,6 +82,19 @@ from DBLayout import (
     m_map_ast,
     m_bridge_map,
 )
+from parser.c_ast.c_ast import Ast_Manager
+
+
+G.DB = MariaDB
+G.TE = TEDirectDB()
+MF = MasterFile()
+G.MF = MF
+gp = GreatProcessor()
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s"
+)
+logger = logging.getLogger(__name__)
 
 init_db_layout(gp)
 ##################################

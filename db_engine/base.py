@@ -8,10 +8,10 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any, Sequence, Self
 from types import TracebackType
-from globalstuff import SafeDataType, JoinsType, PointerType
+from core.globalstuff import SafeDataType, JoinsType, PointerType
 
 if TYPE_CHECKING:
-    from TableHandling import Table
+    from core.TableHandling import Table
 
 
 class BaseDBEngine(ABC):

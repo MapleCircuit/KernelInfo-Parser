@@ -15,11 +15,11 @@ import subprocess
 import multiprocessing
 from typing import Any
 
-from globalstuff import G, COLOR
-from GreatProcessor import GreatProcessor
-from FileHandler import MasterFile
-from TableHandling import ChangeSet
-from DBLayout import (
+from core.globalstuff import G, COLOR
+from core.GreatProcessor import GreatProcessor
+from core.FileHandler import MasterFile
+from core.TableHandling import ChangeSet
+from core.DBLayout import (
     init_db_layout,
     m_file_name,
     m_file,

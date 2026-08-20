@@ -9,10 +9,10 @@ from collections import defaultdict
 from typing import TYPE_CHECKING, Any, Sequence, Self
 from types import TracebackType
 from db_engine.base import BaseDBEngine
-from globalstuff import SafeDataType, JoinsType, PointerType, PointerGetter
+from core.globalstuff import SafeDataType, JoinsType, PointerType, PointerGetter
 
 if TYPE_CHECKING:
-    from TableHandling import Table
+    from core.TableHandling import Table
 
 
 class MockDB(BaseDBEngine):
