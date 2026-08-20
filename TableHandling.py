@@ -138,7 +138,10 @@ def is_data_unsafe(data: tuple) -> bool:
         True if any element in `data` is a tuple (indicating an unresolved reference
         tuple `(query, OP_REF, route)`), False if all elements are safe primitive values.
     """
-    return any(isinstance(col, tuple) for col in data)
+    for col in data:
+        if type(col) is tuple:
+            return True
+    return False
 
 
 def to_safe_data(val: Any) -> SafeDataType:
@@ -154,13 +157,12 @@ def to_safe_data(val: Any) -> SafeDataType:
     Returns:
         Pure primitive `int`, `str`, or `None`.
     """
-    if val is None:
-        return None
-    if isinstance(val, str):
-        return str(val)
+    t = type(val)
+    if t is int or t is str or val is None:
+        return val
     if isinstance(val, Enum):
         return int(val.value) if isinstance(val.value, int) else str(val.value)
-    if isinstance(val, (int, bool)):
+    if t is bool:
         return int(val)
     if hasattr(val, "value") and isinstance(val.value, (int, str)):
         return int(val.value) if isinstance(val.value, int) else str(val.value)
@@ -176,7 +178,7 @@ def normalize_data_tuple(data: tuple) -> tuple[SafeDataType, ...]:
     Returns:
         Tuple with all primitive/enum values sanitized to pure `int`, `str`, or `None`.
     """
-    return tuple(to_safe_data(col) if not isinstance(col, tuple) else col for col in data)
+    return tuple(col if type(col) is tuple else to_safe_data(col) for col in data)
 
 
 class ChangeSet:
@@ -341,22 +343,16 @@ class ChangeSet:
         Raises:
             REF_NOT_RESOLVABLE: If any reference tuple cannot be resolved.
         """
+        if not is_data_unsafe(data):
+            return tuple(to_safe_data(val) for val in data)
+
         output_data = []
         for val in data:
-            if isinstance(val, tuple):
+            if type(val) is tuple:
                 resolved = self.resolve_ref(val[0], val[2])
                 if resolved is None:
-                    # DEBUG
                     if G.BP_ON_REF_FAIL:
                         G.BP()
-                        debug_output_data = []
-                        for debug_val in data:
-                            if isinstance(debug_val, tuple):
-                                dbg_res = self.resolve_ref(debug_val[0], debug_val[2])
-                                debug_output_data.append(to_safe_data(dbg_res))
-                            else:
-                                debug_output_data.append(to_safe_data(debug_val))
-                    # DEBUG
                     raise REF_NOT_RESOLVABLE
                 output_data.append(to_safe_data(resolved))
             else:
@@ -377,6 +373,7 @@ class ChangeSet:
         if self.cs_processed:
             return True
 
+        te = G.TE
         operation_offset = len(self.cs_result)
         for operation in self.cs[operation_offset:]:
             try:
@@ -395,13 +392,13 @@ class ChangeSet:
                     continue
 
                 if op_type == OP_SET:
-                    self.cs_result.append(G.TE.set(operation[0], data))
+                    self.cs_result.append(te.set(operation[0], data))
                     continue
                 if op_type == OP_UPDATE:
-                    self.cs_result.append(G.TE.update(operation[0], data))
+                    self.cs_result.append(te.update(operation[0], data))
                     continue
                 if op_type == OP_VIEW_SET:
-                    self.cs_result.append(G.TE.view_set(operation[0], data))
+                    self.cs_result.append(te.view_set(operation[0], data))
                     continue
 
                 logger.error(f"ERROR, UNKNOWN OPERATION {operation}")
@@ -603,7 +600,7 @@ class ChangeSet:
             assert data_size > query[1], f"_get_value_at()'s query column is too big for the OP.\nquery:{query} pos:{pos}"
 
         result = data[query[1]]
-        if isinstance(result, tuple):
+        if type(result) is tuple:
             return None
         return to_safe_data(result)
 
@@ -640,7 +637,7 @@ class ChangeSet:
                 assert data_size > query[1], f"_get_values_at()'s query column is too big for the OP.\nquery:{query} pos:{pos}"
 
             result = data[query[1]]
-            if isinstance(result, tuple):
+            if type(result) is tuple:
                 return_list.append(None)
             else:
                 return_list.append(to_safe_data(result))
