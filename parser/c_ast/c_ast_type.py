@@ -1,3 +1,4 @@
+from collections import deque
 from core.globalstuff import G, COLOR, REF_POS, REF_ROOT, REF_OLD, REF_MULTI, REF_NO_REF, ASTT, IntEnum, Flag, auto, RefType, OP_REF, RouteType
 import clang.cindex as cc
 import logging
@@ -11,22 +12,36 @@ logger = logging.getLogger(__name__)
 m_v_main = m_file_name = m_file = m_bridge_file = m_moved_file = m_type_descriptor = m_ast = m_ast_container = m_ast_include = m_ast_debug = m_tag = m_bridge_tag = None
 ChangeSetType = None
 
-def serializer(obj: object) -> dict:
+def serializer(obj: object):
     """For ast_debug."""
-    return obj.__dict__
+    if hasattr(obj, "__dict__"):
+        return obj.__dict__
+    if hasattr(obj, "__slots__"):
+        return {s: getattr(obj, s, None) for s in obj.__slots__}
+    if isinstance(obj, (deque, tuple, set)):
+        return list(obj)
+    return str(obj)
 
-def good_looking_printing(object_name: str, pre_result: str="", post_result: str=" ") -> str:
+def good_looking_printing(object_name: object, pre_result: str="", post_result: str=" ") -> str:
     """Print AST without headache."""
     result = " "
     multi_line_leap = False
     list_wait_arr = []
-    for key in vars(object_name):
-        if not getattr(object_name, key):
+    if hasattr(object_name, "__dict__"):
+        keys = vars(object_name)
+    elif hasattr(object_name, "__slots__"):
+        keys = object_name.__slots__
+    else:
+        keys = ()
+
+    for key in keys:
+        val = getattr(object_name, key, None)
+        if not val:
             continue
-        if isinstance(getattr(object_name, key), (list, tuple)):
+        if isinstance(val, (list, tuple, deque)):
             list_wait_arr.append(key)
         else:
-            to_be_added = f"{COLOR.magenta(key)}:{getattr(object_name, key)},"
+            to_be_added = f"{COLOR.magenta(key)}:{val},"
             if len(result.splitlines()[-1]) > G.OVERRIDE_MAX_PRINT_SIZE:
                 if not multi_line_leap:
                     pre_result += "\n"
@@ -71,28 +86,36 @@ def good_looking_printing(object_name: str, pre_result: str="", post_result: str
 class Line:
     """Represent position of code, can extract the underlying str."""
 
-    def __init__(self, *args: int|object) -> None:
+    __slots__ = ("line_pos", "char_pos", "code")
+
+    def __init__(self, *args: int | object) -> None:
         """Init the line pos and optionaly the col pos, accept cc.SourceRange."""
         self.code = ""
-        match len(args):
-            case 0:
+        l = len(args)
+        if l == 0:
+            self.line_pos = (0, 0)
+            self.char_pos = (0, 0)
+        elif l == 1:
+            arg = args[0]
+            if isinstance(arg, cc.SourceRange):
+                self.line_pos = (arg.start.line, arg.end.line)
+                self.char_pos = (arg.start.column, arg.end.column)
+            elif isinstance(arg, Line):
+                self.line_pos = arg.line_pos
+                self.char_pos = arg.char_pos
+            else:
+                logger.error("Line: 1 ARGS TYPE ERROR")
                 self.line_pos = (0, 0)
                 self.char_pos = (0, 0)
-            case 1:
-                if isinstance(args[0], cc.SourceRange):
-                    self.line_pos = (args[0].start.line, args[0].end.line)
-                    self.char_pos = (args[0].start.column, args[0].end.column)
-                elif isinstance(args[0], Line):
-                    self.line_pos = (args[0].line_pos[0], args[0].line_pos[1])
-                    self.char_pos = (args[0].char_pos[0], args[0].char_pos[1])
-                else:
-                    logger.error("Line: 1 ARGS TYPE ERROR")
-            case 2:
-                self.line_pos = (args[0], args[1])
-                self.char_pos = (0, 0)
-            case 4:
-                self.line_pos = (args[0], args[1])
-                self.char_pos = (args[2], args[3])
+        elif l == 2:
+            self.line_pos = (args[0], args[1])
+            self.char_pos = (0, 0)
+        elif l == 4:
+            self.line_pos = (args[0], args[1])
+            self.char_pos = (args[2], args[3])
+        else:
+            self.line_pos = (0, 0)
+            self.char_pos = (0, 0)
 
     # Code Capture
     def cc(self, rawfile: tuple[str]) -> Self:
@@ -126,115 +149,123 @@ class Line:
             self.code = self.code[char_start : -trim_end]
         return self
 
-    def new_end(self, *args: int|object) -> None:
+    def new_end(self, *args: int | object) -> None:
         """Update the end values of Line, accept cc.SourceRange, cc.Token and Line."""
         if self.line_pos[0] == 0:
             self.__init__(*args)
             return
 
-        match len(args):
-            case 1:
-                arg = args[0]
-                if hasattr(arg, 'line'):
-                    self.line_pos = (self.line_pos[0], arg.line.line_pos[1])
-                    self.char_pos = (self.char_pos[0], arg.line.char_pos[1])
-                elif isinstance(arg, Line):
-                    self.line_pos = (self.line_pos[0], arg.line_pos[1])
-                    self.char_pos = (self.char_pos[0], arg.char_pos[1])
-                elif isinstance(arg, cc.SourceRange):
-                    self.line_pos = (self.line_pos[0], arg.end.line)
-                    self.char_pos = (self.char_pos[0], arg.end.column)
-                else:
-                    self.line_pos = (self.line_pos[0], arg)
-            case 2:
-                self.line_pos = (self.line_pos[0], args[0])
-                self.char_pos = (self.char_pos[0], args[1])
+        l = len(args)
+        if l == 1:
+            arg = args[0]
+            if hasattr(arg, 'line'):
+                self.line_pos = (self.line_pos[0], arg.line.line_pos[1])
+                self.char_pos = (self.char_pos[0], arg.line.char_pos[1])
+            elif isinstance(arg, Line):
+                self.line_pos = (self.line_pos[0], arg.line_pos[1])
+                self.char_pos = (self.char_pos[0], arg.char_pos[1])
+            elif isinstance(arg, cc.SourceRange):
+                self.line_pos = (self.line_pos[0], arg.end.line)
+                self.char_pos = (self.char_pos[0], arg.end.column)
+            else:
+                self.line_pos = (self.line_pos[0], arg)
+        elif l == 2:
+            self.line_pos = (self.line_pos[0], args[0])
+            self.char_pos = (self.char_pos[0], args[1])
 
-    def new_end_reversed(self, *args: int|object) -> None:
+    def new_end_reversed(self, *args: int | object) -> None:
         """Update the end values of Line, will use start vals, accept cc.SourceRange and Line."""
         if self.line_pos[0] == 0:
             self.__init__(*args)
             return
 
-        match len(args):
-            case 1:
-                if isinstance(args[0], cc.SourceRange):
-                    self.line_pos = (self.line_pos[0], args[0].start.line)
-                    self.char_pos = (self.char_pos[0], args[0].start.column)
-                elif isinstance(args[0], Line):
-                    self.line_pos = (self.line_pos[0], args[0].line_pos[0])
-                    self.char_pos = (self.char_pos[0], args[0].char_pos[0])
-                else:
-                    self.line_pos = (self.line_pos[0], args[0])
-            case 2:
+        l = len(args)
+        if l == 1:
+            if isinstance(args[0], cc.SourceRange):
+                self.line_pos = (self.line_pos[0], args[0].start.line)
+                self.char_pos = (self.char_pos[0], args[0].start.column)
+            elif isinstance(args[0], Line):
+                self.line_pos = (self.line_pos[0], args[0].line_pos[0])
+                self.char_pos = (self.char_pos[0], args[0].char_pos[0])
+            else:
                 self.line_pos = (self.line_pos[0], args[0])
-                self.char_pos = (self.char_pos[0], args[1])
+        elif l == 2:
+            self.line_pos = (self.line_pos[0], args[0])
+            self.char_pos = (self.char_pos[0], args[1])
 
-    def grow(self, *args: int|object) -> None:
-        """Update the start and end values of Line, will use start vals, accept cc.SourceRange and Line."""
+    def grow(self, *args: int | object) -> None:
+        """Update the start and end values of Line, accept cc.SourceRange and Line."""
         if self.line_pos[0] == 0:
             self.__init__(*args)
             return
 
+        arg = args[0]
+        if isinstance(arg, Line):
+            a_s_l, a_e_l = arg.line_pos
+            a_s_c, a_e_c = arg.char_pos
+        elif isinstance(arg, cc.SourceRange):
+            a_s_l, a_e_l = arg.start.line, arg.end.line
+            a_s_c, a_e_c = arg.start.column, arg.end.column
+        else:
+            return
 
-        if isinstance(args[0], cc.SourceRange):
-            if self.line_pos[0] > args[0].start.line:
-                self.line_pos = (args[0].start.line, self.line_pos[1])
-                self.char_pos = (args[0].start.column, self.char_pos[1])
-            elif self.line_pos[0] == args[0].start.line:
-                if self.char_pos[0] > args[0].start.column:
-                    self.char_pos = (args[0].start.column, self.char_pos[1])
+        s_l, e_l = self.line_pos
+        s_c, e_c = self.char_pos
 
-            if self.line_pos[1] < args[0].end.line:
-                self.line_pos = (self.line_pos[0], args[0].end.line)
-                self.char_pos = (self.char_pos[0], args[0].end.column)
-            elif self.line_pos[1] == args[0].end.line:
-                if self.char_pos[1] < args[0].end.column:
-                    self.char_pos = (self.char_pos[0], args[0].end.column)
+        if s_l > a_s_l:
+            s_l = a_s_l
+            s_c = a_s_c
+        elif s_l == a_s_l and s_c > a_s_c:
+            s_c = a_s_c
 
-        elif isinstance(args[0], Line):
-            if self.line_pos[0] > args[0].line_pos[0]:
-                self.line_pos = (args[0].line_pos[0], self.line_pos[1])
-                self.char_pos = (args[0].char_pos[0], self.char_pos[1])
-            elif self.line_pos[0] == args[0].line_pos[0]:
-                if self.char_pos[0] > args[0].char_pos[0]:
-                    self.char_pos = (args[0].char_pos[0], self.char_pos[1])
+        if e_l < a_e_l:
+            e_l = a_e_l
+            e_c = a_e_c
+        elif e_l == a_e_l and e_c < a_e_c:
+            e_c = a_e_c
 
-            if self.line_pos[1] < args[0].line_pos[1]:
-                self.line_pos = (self.line_pos[0], args[0].line_pos[1])
-                self.char_pos = (self.char_pos[0], args[0].char_pos[1])
-            elif self.line_pos[1] == args[0].line_pos[1]:
-                if self.char_pos[1] < args[0].char_pos[1]:
-                    self.char_pos = (self.char_pos[0], args[0].char_pos[1])
+        self.line_pos = (s_l, e_l)
+        self.char_pos = (s_c, e_c)
 
-
-    def is_inside(self, extent):
+    def is_inside(self, extent) -> bool:
         """Test whether an extent/Line is within current Line."""
-        if isinstance(extent, cc.SourceRange):
-            extent = Line(extent)
+        s_s_l, s_e_l = self.line_pos
+        if isinstance(extent, Line):
+            e_s_l, e_e_l = extent.line_pos
+            e_s_c, e_e_c = extent.char_pos
+        elif isinstance(extent, cc.SourceRange):
+            e_s_l, e_e_l = extent.start.line, extent.end.line
+            e_s_c, e_e_c = extent.start.column, extent.end.column
+        else:
+            return False
 
         # line_pos squarely inside or outside.
-        if (self.line_pos[0] > extent.line_pos[0]) or (extent.line_pos[1] > self.line_pos[1]):
+        if s_s_l > e_s_l or e_e_l > s_e_l:
             return False
-        elif (self.line_pos[0] < extent.line_pos[0]) and (extent.line_pos[1] < self.line_pos[1]):
+        elif s_s_l < e_s_l and e_e_l < s_e_l:
             return True
 
         # check char_pos if we are outside.
-        if (self.line_pos[0] == extent.line_pos[0]) and (self.char_pos[0] > extent.char_pos[0]):
+        s_s_c, s_e_c = self.char_pos
+        if s_s_l == e_s_l and s_s_c > e_s_c:
             return False
-        if (self.line_pos[1] == extent.line_pos[1]) and (self.char_pos[1] < extent.char_pos[1]):
+        if s_e_l == e_e_l and s_e_c < e_e_c:
             return False
 
         return True
 
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, Line):
+            return self.line_pos == other.line_pos and self.char_pos == other.char_pos
+        return False
 
     def __str__(self) -> str:
         """Line to str with empty detection."""
         if (self.line_pos == (0, 0)) and (self.char_pos == (0, 0)):
             return "None"
 
-        if G.OVERRIDE_C_AST_LINE_PRINT and "code" in vars(self):
-            return f"(S{self.line_pos[0]}[{self.char_pos[0]}], E{self.line_pos[1]}[{self.char_pos[1]}], C­<{self.code}>)"
+        if G.OVERRIDE_C_AST_LINE_PRINT and self.code:
+            return f"(S{self.line_pos[0]}[{self.char_pos[0]}], E{self.line_pos[1]}[{self.char_pos[1]}], C\u00ad<{self.code}>)"
 
         return f"(S{self.line_pos[0]}[{self.char_pos[0]}], E{self.line_pos[1]}[{self.char_pos[1]}])"
 
@@ -303,20 +334,37 @@ class Ast:
         )
 
         if CS.prior_tags and (self.extent.code != ""):
-            for x, tag in enumerate(CS.prior_tags):
-                # If tag found in prior_tags, set bridge and return
-                if tag[6:] == current_tag[2:]:
+            lookup = getattr(CS, "prior_tags_map", None)
+            if lookup is not None:
+                tag_match = lookup.get(current_tag[2:])
+                if tag_match is not None:
+                    x, tag_id = tag_match
                     with CS(REF_OLD):
                         CS.active_tag_list.append(x)
                         CS.store(m_bridge_tag.set(
                             CS.ref(m_file.fid, REF_ROOT, REF_OLD),
-                            tag[4],
+                            tag_id,
                             self.extent.line_pos[0],
                             self.extent.line_pos[1],
                             self.extent.char_pos[0],
                             self.extent.char_pos[1],
                         ))
                     return
+            else:
+                for x, tag in enumerate(CS.prior_tags):
+                    # If tag found in prior_tags, set bridge and return
+                    if tag[6:] == current_tag[2:]:
+                        with CS(REF_OLD):
+                            CS.active_tag_list.append(x)
+                            CS.store(m_bridge_tag.set(
+                                CS.ref(m_file.fid, REF_ROOT, REF_OLD),
+                                tag[4],
+                                self.extent.line_pos[0],
+                                self.extent.line_pos[1],
+                                self.extent.char_pos[0],
+                                self.extent.char_pos[1],
+                            ))
+                        return
 
         with CS(REF_POS):
             # Create tag
@@ -1376,7 +1424,7 @@ class AST_Initializer(AST_Expression):
                 self.bracket_depth += 1
             elif spelling == "]":
                 self.bracket_depth = max(0, self.bracket_depth - 1)
-            elif spelling in (";", ","):
+            elif spelling in {";", ","}:
                 if self.brace_depth == 0 and self.paren_depth == 0 and self.bracket_depth == 0:
                     self.extent.new_end_reversed(Line(token.extent))
                     self.need_processing = False
@@ -1397,7 +1445,9 @@ class AST_Initializer(AST_Expression):
 
 
 class TypeToken():
-    def __init__(self, token, asttype=0) -> None:
+    __slots__ = ("extent", "code", "type", "is_definition", "foreign_name", "foreign_file", "foreign_extent")
+
+    def __init__(self, token, asttype: int = 0) -> None:
         self.extent = getattr(token, 'line', None) or Line(token.extent)
         self.code = getattr(token, 'spelling_str', '')
         self.type = asttype
@@ -1430,6 +1480,8 @@ class TSRef(IntEnum):
 
 
 class TypeSegment():
+    __slots__ = ("content", "cqual", "cqual_content", "ref_type", "ref", "type_id", "ref_ast_id")
+
     def __init__(self) -> None:
         self.content = []
         self.cqual = CQual.Empty
@@ -1479,7 +1531,7 @@ class TypeSegment():
 
             if (
                 self.content
-                and self.content[0].type in (ASTT.C_struct, ASTT.C_functionproto, ASTT.C_union, ASTT.C_enum)
+                and self.content[0].type in {ASTT.C_struct, ASTT.C_functionproto, ASTT.C_union, ASTT.C_enum}
                 and len(self.content) == 2
                 and self.cqual == CQual.Empty
             ):
@@ -1503,7 +1555,7 @@ class TypeSegment():
                     compound.append((item, 0))
 
             for i, typetoken in enumerate(self.content):
-                if typetoken.type in (ASTT.C_struct, ASTT.C_functionproto, ASTT.C_union, ASTT.C_enum):
+                if typetoken.type in {ASTT.C_struct, ASTT.C_functionproto, ASTT.C_union, ASTT.C_enum}:
                     if i > 0 and self.content[i - 1].type == typetoken.type:
                         notbind_type = get_notbind_type(typetoken.type)
                         op_idx = len(CS.cs)
@@ -1560,7 +1612,7 @@ class Zone:
     def __init__(self, zone_type:int, cursors_array) -> None:
         self.zone_type = zone_type
         self.extent = Line()
-        self.preset_extents = []
+        self.preset_extents = deque()
         self.children = []
         self.ast_type = C_Type
         self.end_mode = End_Mode.Auto
@@ -1628,7 +1680,7 @@ class Zone:
         tspelling = getattr(token, 'spelling_str', '')
 
         if ast_kind == AST_KIND.punctuation and tspelling == "}":
-            if self.zone_type in (Zone_Type.Declared_Args, Zone_Type.Enum_Content, Zone_Type.Compound_Stmt):
+            if self.zone_type in {Zone_Type.Declared_Args, Zone_Type.Enum_Content, Zone_Type.Compound_Stmt}:
                 self.extent.grow(tline)
                 self.preset_extents.clear()
                 self.completed = True
@@ -1652,7 +1704,7 @@ class Zone:
 
         if ast_kind == AST_KIND.punctuation:
             # Commonly found between extents, Processing not needed.
-            if tspelling in (";", ",", ")", "}"):
+            if tspelling in {";", ",", ")", "}"}:
                 return True
             # While were in punctuation, lets handle CPPros
             if tspelling == "#":
@@ -1665,15 +1717,15 @@ class Zone:
                     return True
 
         # Guard against statement keywords outside type declarations
-        if ast_kind == AST_KIND.keyword and tspelling in (
+        if ast_kind == AST_KIND.keyword and tspelling in {
             "if", "else", "return", "switch", "case", "default", "break", "continue", "for", "while", "do", "goto"
-        ):
+        }:
             return True
 
         # Check for valid preset_extents
         if self.preset_extents:
             while self.preset_extents and self.preset_extents[0].line_pos[1] < tline.line_pos[0]:
-                self.preset_extents.pop(0)
+                self.preset_extents.popleft()
 
             for i, p_extent in enumerate(self.preset_extents):
                 if p_extent.is_inside(tline):
@@ -1819,7 +1871,7 @@ class C_Type(Ast):
                 for typesegment in final_type:
                     if typesegment.is_definition():
                         for item in typesegment.content:
-                            if item.is_definition and item.type in (ASTT.C_struct, ASTT.C_functionproto, ASTT.C_union, ASTT.C_enum):
+                            if item.is_definition and item.type in {ASTT.C_struct, ASTT.C_functionproto, ASTT.C_union, ASTT.C_enum}:
                                 decl_type = get_decl_type(item.type)
                                 # Push the defined struct/union/enum to CS via ref_view
                                 with CS(REF_POS):
@@ -1847,7 +1899,7 @@ class C_Type(Ast):
 
                                 # For standalone type definitions (no variable declarator in final_type),
                                 # tag and debug the canonical declaration AST directly here
-                                has_var = any(any(token.type == 0 for token in ts.content) for ts in final_type)
+                                has_var = any(token.type == 0 for ts in final_type for token in ts.content)
                                 if not has_var:
                                     with CS(REF_NO_REF):
                                         if G.OVERRIDE_FORCE_AST_DEBUG:
@@ -1860,7 +1912,7 @@ class C_Type(Ast):
                 continue
 
             # Skip standalone type definitions that were already emitted and tagged in Step 3
-            has_var = any(any(token.type == 0 for token in ts.content) for ts in final_type)
+            has_var = any(token.type == 0 for ts in final_type for token in ts.content)
             is_type_def = any(ts.is_definition() for ts in final_type)
             if self.zones and is_type_def and not has_var:
                 continue
@@ -2086,10 +2138,8 @@ class C_Type(Ast):
                     self.func_proto = True
                     return
 
-                arg_children = []
-                for kids in cursor.get_children():
-                    if kids.kind == cc.CursorKind.PARM_DECL:
-                        arg_children.append(kids)
+                children = tuple(cursor.get_children())
+                arg_children = [kids for kids in children if kids.kind == cc.CursorKind.PARM_DECL]
                 if arg_children:
                     self.zones.append(Zone(Zone_Type.Function_Args, arg_children))
             case "{":
@@ -2098,7 +2148,8 @@ class C_Type(Ast):
                     self.zones.append(Zone(Zone_Type.Compound_Stmt, (cursor,)))
                     return
 
-                compound_kids = [k for k in cursor.get_children() if k.kind == cc.CursorKind.COMPOUND_STMT]
+                children = tuple(cursor.get_children())
+                compound_kids = [k for k in children if k.kind == cc.CursorKind.COMPOUND_STMT]
                 if compound_kids:
                     self.zones.append(Zone(Zone_Type.Compound_Stmt, compound_kids))
                     return
@@ -2112,15 +2163,15 @@ class C_Type(Ast):
                     zone_type = Zone_Type.Enum_Content
 
                 cur_file = cursor.extent.start.file.name if cursor.extent.start.file else None
-                children = []
-                for kids in cursor.get_children():
+                filtered_children = []
+                for kids in children:
                     kid_file = kids.extent.start.file.name if kids.extent.start.file else None
                     if cur_file and kid_file and cur_file != kid_file:
                         continue
-                    children.append(kids)
+                    filtered_children.append(kids)
 
-                if children:
-                    self.zones.append(Zone(zone_type, children))
+                if filtered_children:
+                    self.zones.append(Zone(zone_type, filtered_children))
                 elif zone_type == Zone_Type.Enum_Content:
                     self.zones.append(Zone(zone_type, (cursor,)))
             case "}":
@@ -2130,14 +2181,11 @@ class C_Type(Ast):
                         if not any(ch.need_processing for ch in zone.children):
                             self.need_processing = False
                             return
-                    elif zone.zone_type in (Zone_Type.Declared_Args, Zone_Type.Enum_Content):
+                    elif zone.zone_type in {Zone_Type.Declared_Args, Zone_Type.Enum_Content}:
                         zone.completed = True
                         zone.preset_extents.clear()
             case "[":
-                array_children = []
-                for kids in cursor.get_children():
-                    array_children.append(kids)
-
+                array_children = tuple(cursor.get_children())
                 if array_children:
                     self.content.append(TypeToken(token, ASTT.C_array))
                     self.zones.append(Zone(Zone_Type.Array_Content, array_children))
@@ -2145,17 +2193,16 @@ class C_Type(Ast):
                     self.content.append(TypeToken(token, ASTT.C_arrayempty))
                 self.swap_out()
             case "=":
-                if cursor.kind in (cc.CursorKind.ENUM_DECL, cc.CursorKind.ENUM_CONSTANT_DECL):
+                kids = tuple(cursor.get_children())
+                if cursor.kind in {cc.CursorKind.ENUM_DECL, cc.CursorKind.ENUM_CONSTANT_DECL}:
                     self.content.append(TypeToken(token, ASTT.C_enumequal))
                     self.swap_out()
-                    kids = tuple(cursor.get_children())
                     if kids:
                         self.zones.append(Zone(Zone_Type.Enum_Equal, kids))
                     else:
                         self.zones.append(Zone(Zone_Type.Enum_Equal, (cursor,)))
                 else:
                     # Variable / Struct Initializer expression zone
-                    kids = tuple(cursor.get_children())
                     if kids:
                         self.zones.append(Zone(Zone_Type.Initializer_Expr, kids))
                     else:
@@ -2178,7 +2225,7 @@ class C_Type(Ast):
 
         tspelling = getattr(token, 'spelling_str', '')
         # Ignore predefined identifiers in expression contexts
-        if tspelling in ("__func__", "__FUNCTION__", "__PRETTY_FUNCTION__"):
+        if tspelling in {"__func__", "__FUNCTION__", "__PRETTY_FUNCTION__"}:
             return
 
         if cursor.type.kind == cc.TypeKind.TYPEDEF:
@@ -2188,7 +2235,7 @@ class C_Type(Ast):
             return
 
         if self.content.content:
-            if self.content.content[-1].type in (ASTT.C_struct, ASTT.C_union, ASTT.C_enum, ASTT.C_functionproto):
+            if self.content.content[-1].type in {ASTT.C_struct, ASTT.C_union, ASTT.C_enum, ASTT.C_functionproto}:
                 self.name = tspelling
                 self.content.append(TypeToken(token, self.content.content[-1].type))
                 self.content.get_foreign(cursor)

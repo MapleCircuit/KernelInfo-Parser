@@ -169,7 +169,7 @@ def to_safe_data(val: Any) -> SafeDataType:
     return val
 
 
-def normalize_data_tuple(data: tuple) -> tuple[SafeDataType, ...]:
+def normalize_data_tuple(data: tuple) -> tuple[UnSafeDataType, ...]:
     """Convert all non-reference elements in a tuple into strict primitive SafeDataType.
 
     Args:
@@ -208,7 +208,9 @@ class ChangeSet:
         if current_path is None and operation is not None:
             cut_file = operation.split("\t")
             self.file_operation = cut_file[0]
-            if len(cut_file) == 2:  # noqa: PLR2004
+            if len(cut_file) == 1:
+                pass
+            elif len(cut_file) == 2:  # noqa: PLR2004
                 current_path = cut_file[1]
             else:
                 old_path = cut_file[1]
@@ -296,7 +298,7 @@ class ChangeSet:
             raise CONTINUE_EXCEPTION
 
     @G.type_check(Self, PointerType, RouteType)
-    def resolve_ref(self, query: PointerType, parsed_route: RouteType) -> SafeDataType:
+    def resolve_ref(self, query: PointerType, parsed_route: RouteType) -> SafeDataType | list[SafeDataType]:
         """Resolve a pointer query using parsed route to locate value across CS index or external CS.
 
         Evaluates route links:
@@ -387,7 +389,7 @@ class ChangeSet:
 
                 data = self._resolve_ref_from_tuple(*operation[2])
 
-                if op_type in (OP_DONE, OP_VIEW_DONE):
+                if op_type in {OP_DONE, OP_VIEW_DONE}:
                     self.cs_result.append(data)
                     continue
 
@@ -423,9 +425,6 @@ class ChangeSet:
         """
         if self.file_operation is None:
             self.cs.append(operation)
-            return
-
-        if route and route[-1] == REF_NO_REF:
             return
 
         if route:
@@ -518,11 +517,11 @@ class ChangeSet:
                 parsed_route = []
                 continue
 
-            if link in (REF_POS, REF_MULTI):
+            if link in {REF_POS, REF_MULTI}:
                 data_bypass = True
                 parsed_route = []
 
-            if link in (REF_ROOT, REF_C_AST, REF_NO_REF):
+            if link in {REF_ROOT, REF_C_AST, REF_NO_REF}:
                 parsed_route = []
 
             parsed_route.append(link)
@@ -591,7 +590,7 @@ class ChangeSet:
             tableid = operation[0]
             data_size = len(data)
 
-            if operation[1] in (OP_VIEW_DONE, OP_VIEW_SET, OP_REF_VIEW):
+            if operation[1] in {OP_VIEW_DONE, OP_VIEW_SET, OP_REF_VIEW}:
                 tableid = PointerGetter(operation[0]).get_first_table_id()
                 if operation[1] == OP_REF_VIEW:
                     data_size -= 1
@@ -628,7 +627,7 @@ class ChangeSet:
                 tableid = operation[0]
                 data_size = len(data)
 
-                if operation[1] in (OP_VIEW_DONE, OP_VIEW_SET, OP_REF_VIEW):
+                if operation[1] in {OP_VIEW_DONE, OP_VIEW_SET, OP_REF_VIEW}:
                     tableid = PointerGetter(operation[0]).get_first_table_id()
                     if operation[1] == OP_REF_VIEW:
                         data_size -= 1
@@ -724,9 +723,7 @@ class ChangeSet:
 
         if val is None or (isinstance(val, tuple) and len(val) == 3 and val[1] == OP_REF):
             if target_op is not None and len(target_op) > 2 and col_idx < len(target_op[2]):
-                op_val = target_op[2][col_idx]
-                if not (isinstance(op_val, tuple) and len(op_val) == 3 and op_val[1] == OP_REF):
-                    val = op_val
+                val = target_op[2][col_idx]
 
         if isinstance(val, tuple) and len(val) == 3 and val[1] == OP_REF:
             val = self.resolve_ref(val[0], val[2])
@@ -807,6 +804,9 @@ class ChangeSet:
 
         Detects file language type using `type_check(current_path)` and triggers parser (e.g. `c_ast_parse(self)`).
         """
+        if not self.current_path:
+            return
+
         try:
             current_type = type_check(self.current_path)
             if current_type == T_C:
@@ -889,7 +889,8 @@ class Table:
             setattr(self, column[0], (self.table_id, x))
 
         # Step 2: Inject Table object reference into c_ast_type module scope for AST parsing
-        setattr(sys.modules["parser.c_ast.c_ast_type"], self.table_name, self)
+        if mod := sys.modules.get("parser.c_ast.c_ast_type"):
+            setattr(mod, self.table_name, self)
 
     def start_te(self) -> None:
         """Register table schema with active Table Engine (`G.TE`)."""
@@ -1069,7 +1070,7 @@ class Table:
             return None
         return [tuple(to_safe_data(col) for col in row) for row in results]
 
-    def ref_view(self, joins: JoinsType, *data: UnSafeDataType) -> OperationType:
+    def ref_view(self, joins: JoinsType, *data: Any) -> OperationType:
         """Construct OP_REF_VIEW operation for dynamic schema-driven AST view expansion.
 
         Args:

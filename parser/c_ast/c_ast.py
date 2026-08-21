@@ -267,6 +267,10 @@ def get_prior_tags(CS: ChangeSetType) -> None:
             None,
         )
     CS.active_tag_list = []
+    if CS.prior_tags:
+        CS.prior_tags_map = {tag[6:]: (x, tag[4]) for x, tag in enumerate(CS.prior_tags)}
+    else:
+        CS.prior_tags_map = {}
     return
 
 
@@ -312,16 +316,13 @@ class TokenList:
         parsed_file = cc.File.from_name(parsed_tu, fullfilename)
 
         start_loc = cc.SourceLocation.from_position(parsed_tu, parsed_file, 1, 1)
-        logger.info(f"start_loc:{start_loc}")
 
         #filesize in bytes
         file_size = Path(fullfilename).stat().st_size
-        logger.info(f"file_size:{file_size}")
         end_loc = cc.conf.lib.clang_getLocationForOffset(parsed_tu, parsed_file, file_size)
         logger.info(f"end_loc:{end_loc}")
 
         extent = cc.SourceRange.from_locations(start_loc, end_loc)
-        logger.info(f"extent:{extent}")
 
         tokens_memory = ctypes.POINTER(cc.Token)()
         tokens_count = ctypes.c_uint()
@@ -329,7 +330,6 @@ class TokenList:
         cc.conf.lib.clang_tokenize(parsed_tu, extent, ctypes.byref(tokens_memory), ctypes.byref(tokens_count))
 
         self.count = int(tokens_count.value)
-        logger.info(f"self.count:{self.count}")
 
         self.cursors_array = []
         self.tokens_array = []
