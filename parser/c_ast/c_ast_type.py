@@ -9,7 +9,7 @@ import random
 logger = logging.getLogger(__name__)
 
 # Linter bypass
-m_v_main = m_file_name = m_file = m_bridge_file = m_moved_file = m_type_descriptor = m_ast = m_ast_container = m_ast_include = m_ast_debug = m_tag = m_bridge_tag = None
+m_v_main = m_file_name = m_file = m_bridge_file = m_moved_file = m_type_descriptor = m_ast = m_ast_container = m_ast_include = m_ast_debug = m_tag = m_bridge_tag = m_map_ast = m_bridge_map = None
 ChangeSetType = None
 
 def serializer(obj: object):
@@ -379,6 +379,40 @@ class Ast:
             self.extent.line_pos[1],
             self.extent.char_pos[0],
             self.extent.char_pos[1],
+        ))
+
+        # Create map and bridge map
+        self.map_ast(CS, ast_id_route, tag_route, self.extent)
+        return
+
+    def map_ast(
+        self,
+        CS: ChangeSetType,
+        ast_id_route: RouteType,
+        tag_route: RouteType,
+        extent: Line | None = None,
+    ) -> None:
+        """Create m_map_ast and m_bridge_map spatial coordinate entries for this AST node."""
+        ext = extent if extent is not None else getattr(self, "extent", None)
+        if ext is None:
+            return
+
+        line_s = 1
+        char_s = 1
+        line_e = max(1, ext.line_pos[1] - ext.line_pos[0] + 1)
+        char_e = ext.char_pos[1]
+
+        CS.store(m_map_ast.set(
+            CS.ref(m_tag.tag_id, *tag_route),
+            line_s,
+            char_s,
+            line_e,
+            char_e,
+            CS.ref(m_ast.ast_id, *ast_id_route),
+        ))
+        CS.store(m_bridge_map.set(
+            CS.ref(m_tag.tag_id, *tag_route),
+            CS.ref(m_tag.tag_id, *tag_route),
         ))
         return
 

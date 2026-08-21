@@ -309,7 +309,7 @@ m_bridge_tag = Table(
 # -----------------------------------------------------------------------------
 # 13. m_map_ast (table_id=12): Spatial Source Region to AST Mapping
 #     - map_id: Map Set Grouping ID.
-#     - line_s / char_s / line_e / char_e: Coordinate region.
+#     - line_s / char_s / line_e / char_e: Coordinate region relative to tag snippet.
 #     - ast_id: Target AST Node ID (FK -> m_ast.ast_id).
 # -----------------------------------------------------------------------------
 m_map_ast = Table(
@@ -333,7 +333,7 @@ m_map_ast = Table(
 # -----------------------------------------------------------------------------
 # 14. m_bridge_map (table_id=13): Code Tag to AST Coordinate Map Bridge
 #     - tag_id: Code Tag ID (FK -> m_tag.tag_id).
-#     - map_id: Map Set ID (FK -> m_map_ast.map_id).
+#     - map_id: Map Set ID (matching m_map_ast.map_id).
 # -----------------------------------------------------------------------------
 m_bridge_map = Table(
     table_id=13,
@@ -343,7 +343,7 @@ m_bridge_map = Table(
         ("map_id", "INT", "NOT NULL"),
     ),
     primary=("tag_id", "map_id"),
-    foreign=(("tag_id", "m_tag", "tag_id"), ("map_id", "m_map_ast", "map_id")),
+    foreign=(("tag_id", "m_tag", "tag_id"),),
     initial_insert=None,
     no_duplicate=False,
     select_procedure=True,

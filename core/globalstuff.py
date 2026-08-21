@@ -218,6 +218,11 @@ class COLOR:
     @classmethod
     def red(cls, string_arg: str) -> str:
         """Red color codes."""
+        return f"\033[91m{string_arg}\033[0m"
+
+    @classmethod
+    def yellow(cls, string_arg: str) -> str:
+        """Yellow color codes."""
         return f"\033[93m{string_arg}\033[0m"
 
     @classmethod
