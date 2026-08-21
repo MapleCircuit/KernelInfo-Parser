@@ -160,13 +160,21 @@ class MariaDB(BaseDBEngine):
 
         Process:
             1. Sets `SET SESSION sql_mode = 'NO_AUTO_VALUE_ON_ZERO'`.
-            2. Attempts `SET GLOBAL max_allowed_packet = 1GB`, suppressing privilege errors.
-            3. Commits session configuration.
+            2. Configures session timeouts (`wait_timeout`, `interactive_timeout`, `net_read_timeout`, `net_write_timeout`).
+            3. Attempts `SET GLOBAL max_allowed_packet = 1GB`, suppressing privilege errors.
+            4. Commits session configuration.
 
         Outputs:
             None.
         """
         self.cursor.execute("SET SESSION sql_mode = 'NO_AUTO_VALUE_ON_ZERO';")
+        try:
+            self.cursor.execute("SET SESSION wait_timeout = 28800;")
+            self.cursor.execute("SET SESSION interactive_timeout = 28800;")
+            self.cursor.execute("SET SESSION net_read_timeout = 3600;")
+            self.cursor.execute("SET SESSION net_write_timeout = 3600;")
+        except mysql.connector.Error:
+            pass
         try:
             self.cursor.execute(f"SET GLOBAL max_allowed_packet = {MAX_ALLOWED_PACKET};")
         except mysql.connector.Error:
@@ -284,7 +292,7 @@ class MariaDB(BaseDBEngine):
             None.
 
         Process:
-            Checks `self.cnx.is_connected()`. If disconnected, attempts up to 3 reconnects,
+            Checks active connection via `ping(reconnect=True)`. If disconnected, attempts up to 3 reconnects,
             re-creating the cursor and re-initializing session state.
 
         Outputs:
@@ -293,15 +301,23 @@ class MariaDB(BaseDBEngine):
         Raises:
             ConnectionError: If connection cannot be re-established after 3 attempts.
         """
-        for attempt in range(3):
-            if self.cnx is not None and self.cnx.is_connected():
+        if getattr(self, "cnx", None) is not None:
+            try:
+                self.cnx.ping(reconnect=True, attempts=3, delay=1)
+                if getattr(self, "cursor", None) is None:
+                    self.cursor = self.cnx.cursor()
                 return
+            except Exception:
+                pass
+
+        for attempt in range(3):
             print(f"No SQL connection. Reconnection attempt {attempt + 1}/3...")
             try:
                 self.cnx = self.connect_sql()
                 self.cursor = self.cnx.cursor()
                 self._init_session()
-            except mysql.connector.Error as e:
+                return
+            except (mysql.connector.Error, Exception) as e:
                 if attempt == 2:
                     raise ConnectionError(f"Failed to reconnect to database after 3 attempts: {e}") from e
 
@@ -439,8 +455,8 @@ class MariaDB(BaseDBEngine):
 
         Process:
             1. Constructs parameterized `INSERT INTO table VALUES (%s, ...)`.
-            2. If `data` is a batch tuple, chunks into 5000-row slices and executes `executemany`.
-            3. If `data` is a single row tuple, executes `execute`.
+            2. If `data` is a batch tuple, chunks into 1000-row slices and executes `executemany` with auto-retry.
+            3. If `data` is a single row tuple, executes `execute` with auto-retry.
             4. Commits transaction.
 
         Outputs:
@@ -449,16 +465,33 @@ class MariaDB(BaseDBEngine):
         if not data:
             return
 
-        self.check_if_connected()
         sql = f"INSERT INTO `{table.table_name}` VALUES ({','.join(('%s',) * table.length)})"
 
         if isinstance(data[0], (tuple, list)):
-            batch_size = 5000  # High-throughput batch size
+            batch_size = 1000  # Safe high-throughput packet batch size
             for i in range(0, len(data), batch_size):
-                self.cursor.executemany(sql, data[i : i + batch_size])
+                chunk = data[i : i + batch_size]
+                for attempt in range(3):
+                    self.check_if_connected()
+                    try:
+                        self.cursor.executemany(sql, chunk)
+                        break
+                    except (mysql.connector.OperationalError, mysql.connector.InterfaceError, OSError):
+                        if attempt == 2:
+                            raise
+                        self.close()
         else:
-            self.cursor.execute(sql, data)
+            for attempt in range(3):
+                self.check_if_connected()
+                try:
+                    self.cursor.execute(sql, data)
+                    break
+                except (mysql.connector.OperationalError, mysql.connector.InterfaceError, OSError):
+                    if attempt == 2:
+                        raise
+                    self.close()
 
+        self.check_if_connected()
         self.cnx.commit()
 
     def update(
@@ -476,8 +509,8 @@ class MariaDB(BaseDBEngine):
             1. Constructs upsert SQL statement:
                `INSERT INTO table VALUES (...) ON DUPLICATE KEY UPDATE col=VALUES(col)`
                for all non-primary key columns.
-            2. If `data` is a batch tuple, chunks into 5000-row slices and executes `executemany`.
-            3. If single row, executes `execute`.
+            2. If `data` is a batch tuple, chunks into 1000-row slices and executes `executemany` with auto-retry.
+            3. If single row, executes `execute` with auto-retry.
             4. Commits transaction.
 
         Outputs:
@@ -486,24 +519,40 @@ class MariaDB(BaseDBEngine):
         if not data:
             return
 
-        self.check_if_connected()
-
-        sql = f"INSERT INTO {table.table_name} "
-        sql += f"({', '.join(column[0] for column in table.init_columns)}) VALUES "
+        sql = f"INSERT INTO `{table.table_name}` "
+        sql += f"({', '.join(f'`{column[0]}`' for column in table.init_columns)}) VALUES "
         sql += f"({','.join(('%s',) * table.length)}) ON DUPLICATE KEY UPDATE "
         updatable_columns = []
         for x, column in enumerate(table.init_columns):
             if x not in table.primary:
-                updatable_columns.append(f"{column[0]} = VALUES({column[0]})")
+                updatable_columns.append(f"`{column[0]}` = VALUES(`{column[0]}`)")
         sql += ", ".join(updatable_columns)
 
         if isinstance(data[0], (tuple, list)):
-            batch_size = 5000
+            batch_size = 1000
             for i in range(0, len(data), batch_size):
-                self.cursor.executemany(sql, data[i : i + batch_size])
+                chunk = data[i : i + batch_size]
+                for attempt in range(3):
+                    self.check_if_connected()
+                    try:
+                        self.cursor.executemany(sql, chunk)
+                        break
+                    except (mysql.connector.OperationalError, mysql.connector.InterfaceError, OSError):
+                        if attempt == 2:
+                            raise
+                        self.close()
         else:
-            self.cursor.execute(sql, data)
+            for attempt in range(3):
+                self.check_if_connected()
+                try:
+                    self.cursor.execute(sql, data)
+                    break
+                except (mysql.connector.OperationalError, mysql.connector.InterfaceError, OSError):
+                    if attempt == 2:
+                        raise
+                    self.close()
 
+        self.check_if_connected()
         self.cnx.commit()
 
     def select(
