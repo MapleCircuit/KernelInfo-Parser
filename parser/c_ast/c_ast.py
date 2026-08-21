@@ -386,6 +386,7 @@ class TokenList:
                     self.main_zone.check_exec(token, cursor, AST_KIND.literal)
 
         self.main_zone.gen_lined_dict()
+        self.main_zone.resolve_cppro_scopes()
 
         if G.OVERRIDE_FORCE_AST_DEBUG:
             G.BP()

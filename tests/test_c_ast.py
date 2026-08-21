@@ -34,37 +34,37 @@ from parser.c_ast.c_ast_type import safe_spelling, safe_cursor_spelling
 TEST_SUITE: list[dict[str, Any]] = [
     {
         "file": "include/linux/drbd_tag_magic.h",
-        "baseline_ast_ops": 510,
+        "baseline_ast_ops": 442,
         "description": "Kernel Header (drbd_tag_magic.h)",
     },
     {
         "file": "virt/kvm/iodev.h",
-        "baseline_ast_ops": 222,
+        "baseline_ast_ops": 231,
         "description": "Kernel Header (virt/kvm/iodev.h)",
     },
     {
         "file": "include/linux/lockd/bind.h",
-        "baseline_ast_ops": 183,
+        "baseline_ast_ops": 217,
         "description": "Kernel Header (lockd/bind.h)",
     },
     {
         "file": "include/linux/netfilter_bridge/ebtables.h",
-        "baseline_ast_ops": 1341,
+        "baseline_ast_ops": 1584,
         "description": "Kernel Header (ebtables.h)",
     },
     {
         "file": "drivers/watchdog/w83627hf_wdt.c",
-        "baseline_ast_ops": 1136,
+        "baseline_ast_ops": 1468,
         "description": "Watchdog Driver (Latin-1 byte 0xe1 resilience)",
     },
     {
         "file": "drivers/usb/storage/isd200.c",
-        "baseline_ast_ops": 3198,
+        "baseline_ast_ops": 4161,
         "description": "USB Storage Driver (Latin-1 byte 0xf6 resilience)",
     },
     {
         "file": "include/linux/sched.h",
-        "baseline_ast_ops": 11325,
+        "baseline_ast_ops": 12507,
         "description": "Kernel Header (sched.h)",
     },
 ]

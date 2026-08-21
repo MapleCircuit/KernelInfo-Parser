@@ -744,12 +744,12 @@ class ChangeSet:
         """
         joins = list(operation[0])
         data = [to_safe_data(x) for x in operation[2][:-1]]
-        rank = 0
 
         schema = operation[2][-1]
         schema_ifs = schema[0]
         schema_thens = schema[1]
         schema_route = schema[2]
+        rank = schema[3] if len(schema) > 3 else 0
 
         if not schema_route:
             data_list = []

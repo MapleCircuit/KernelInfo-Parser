@@ -396,6 +396,30 @@
       font-weight: bold !important;
     }
 
+    /* CPPro Conditional Scope Highlight */
+    .code-line.cppro-scope-highlight {
+      background-color: rgba(209, 154, 102, 0.12) !important;
+      border-left: 3px solid #d19a66 !important;
+    }
+    .gutter-line.cppro-scope-highlight {
+      background-color: rgba(209, 154, 102, 0.22) !important;
+      color: #d19a66 !important;
+      font-weight: bold !important;
+    }
+    .gutter-line.cppro-scope-highlight span {
+      color: #d19a66 !important;
+      font-weight: bold !important;
+    }
+    .collapse-btn-cppro {
+      color: #d19a66 !important;
+      font-weight: bold;
+    }
+    .btn-active {
+      background: var(--accent) !important;
+      color: #181a1f !important;
+      font-weight: bold !important;
+    }
+
     /* Highlight Tokens */
     .token {
       border-radius: 2px;
@@ -724,10 +748,29 @@
       "C_Compound": { color: "#61afef", enabled: true, label: "Compound Statement Blocks" },
       "CPPro_define": { color: "#d19a66", enabled: true, label: "Macros (#define)" },
       "CPPro_include": { color: "#98c379", enabled: true, label: "Includes (#include)" },
-      "CPPro_if": { color: "#d19a66", enabled: true, label: "Conditionals (#if, #ifdef)" },
+      "CPPro_if": { color: "#d19a66", enabled: true, label: "Conditionals (#if, #ifdef, #ifndef)" },
+      "CPPro_ifdef": { color: "#d19a66", enabled: true, label: "Conditionals (#ifdef)" },
+      "CPPro_ifndef": { color: "#d19a66", enabled: true, label: "Conditionals (#ifndef)" },
+      "CPPro_elif": { color: "#d19a66", enabled: true, label: "Conditionals (#elif)" },
+      "CPPro_else": { color: "#d19a66", enabled: true, label: "Conditionals (#else)" },
+      "CPPro_endif": { color: "#d19a66", enabled: true, label: "Conditionals (#endif)" },
       "Undefined": { color: "#abb2bf", enabled: true, label: "Other AST Elements" }
     };
+    // Container Hierarchy Depth Color Palette (Applied strictly to container items)
+    const defaultContainerDepthPalette = [
+      { depth: 0, color: "#e5c07b", label: "Container Level 0 (Color A - Outer Structs/Compounds)" },
+      { depth: 1, color: "#61afef", label: "Container Level 1 (Color B - Members & Function Prototypes)" },
+      { depth: 2, color: "#98c379", label: "Container Level 2 (Color C - Parameters & Return Types)" },
+      { depth: 3, color: "#c678dd", label: "Container Level 3 (Color D - Inner Qualifiers & Types)" },
+      { depth: 4, color: "#56b6c2", label: "Container Level 4 (Color E - Deep Nested Types)" },
+      { depth: 5, color: "#e06c75", label: "Container Level 5 (Color F - Level 5+ Containers)" }
+    ];
+    let containerDepthPalette = JSON.parse(localStorage.getItem("kernelinfo_container_palette")) || defaultContainerDepthPalette;
+    let containerColoringEnabled = true;
+
     let highlightSettings = JSON.parse(localStorage.getItem("kernelinfo_hl_settings")) || defaultHighlightSettings;
+    let cpproHighlightEnabled = false;
+    let activeCpproRanges = [];
 
     // ------------------------------------------------------------------------
     // URL Hash Parser & Synchronizer
@@ -1247,7 +1290,11 @@
             <span><strong>Tags:</strong> ${tags.length}</span>
             <span><strong>Mapped Elements:</strong> ${totalMaps}</span>
           </div>
-          <div>
+          <div style="display: flex; gap: 8px; align-items: center; flex-wrap: wrap;">
+            <button id="btnToggleContainer" class="btn ${containerColoringEnabled ? 'btn-active' : ''}" onclick="toggleContainerColoring()" title="Toggle container hierarchy depth coloring (Color A, B, C...) applied strictly to container items">🎨 Container Depth Colors</button>
+            <button id="btnToggleCppro" class="btn ${cpproHighlightEnabled ? 'btn-active' : ''}" onclick="toggleCpproHighlighting()" title="Toggle visual highlighting of code governed by CPPro conditional scopes (#if/#ifdef/#elif/#else)">⚡ Highlight Conditionals</button>
+            <button class="btn" onclick="collapseAllConditionals()" title="Collapse all #if/#ifdef conditional blocks">Collapse #if</button>
+            <button class="btn" onclick="expandAllConditionals()" title="Expand all #if/#ifdef conditional blocks">Expand #if</button>
             <button class="btn" onclick="expandAllCode()">Expand All</button>
             <button class="btn" onclick="collapseAllCode()">Collapse All</button>
           </div>
@@ -1309,11 +1356,24 @@
         if (!tok) {
           result += escapeHtml(segment);
         } else {
-          const typeKey = tok.type_name || "Undefined";
-          const hlConfig = highlightSettings[typeKey] || highlightSettings["Undefined"] || { color: "#98c379", enabled: true };
+          let tokenColor = null;
+          const isContainerItem = (tok.container_depth !== undefined && tok.container_depth !== null);
 
-          if (hlConfig.enabled) {
-            result += `<span class="token" style="color: ${hlConfig.color};" onclick="inspectAst(${tok.ast_id}, '${escapeHtml(tok.ast_name || '')}', '${tok.type_name}', event)" title="AST: ${escapeHtml(tok.ast_name || '')} (${tok.type_name})">${escapeHtml(segment)}</span>`;
+          if (containerColoringEnabled && isContainerItem) {
+            const depthIdx = Math.max(0, parseInt(tok.container_depth, 10));
+            const depthEntry = containerDepthPalette[depthIdx % containerDepthPalette.length];
+            tokenColor = depthEntry ? depthEntry.color : "#98c379";
+          } else {
+            const typeKey = tok.type_name || "Undefined";
+            const hlConfig = highlightSettings[typeKey] || highlightSettings["Undefined"] || { color: "#abb2bf", enabled: true };
+            if (hlConfig.enabled) {
+              tokenColor = hlConfig.color;
+            }
+          }
+
+          if (tokenColor) {
+            const depthTitle = isContainerItem ? ` [Container Level ${tok.container_depth}]` : '';
+            result += `<span class="token" style="color: ${tokenColor};" onclick="inspectAst(${tok.ast_id}, '${escapeHtml(tok.ast_name || '')}', '${tok.type_name}', event)" title="AST: ${escapeHtml(tok.ast_name || '')} (${tok.type_name})${depthTitle}">${escapeHtml(segment)}</span>`;
           } else {
             result += escapeHtml(segment);
           }
@@ -1329,6 +1389,8 @@
       const gutter = document.getElementById("codeGutter");
       const body = document.getElementById("codeBody");
       if (!gutter || !body) return;
+
+      activeCpproRanges = [];
 
       if (!tags || tags.length === 0) {
         gutter.innerHTML = `<div class="gutter-line"><span>1</span></div>`;
@@ -1372,6 +1434,12 @@
       sortedTags.forEach(t => {
         if (t.line_e && t.line_e > maxLine) maxLine = t.line_e;
         if (t.line_s && t.line_s > maxLine) maxLine = t.line_s;
+        if (t.maps && t.maps.length > 0) {
+          t.maps.forEach(m => {
+            const m_end = (t.line_s || 1) + (m.line_e || 1) - 1;
+            if (m_end > maxLine) maxLine = m_end;
+          });
+        }
       });
 
       // 4. Map each file line to its base text and collapse button from outerTags
@@ -1389,7 +1457,7 @@
 
           // Collapse button for multi-line tags on first line
           const collapseBtn = (isFirstLine && tagLines.length > 1) 
-            ? `<span class="collapse-btn" id="cbtn_${outerIdx}" onclick="toggleTagCollapse(${outerIdx}, ${startL}, ${endL}, event)">▼</span>` 
+            ? `<span class="collapse-btn" id="cbtn_${outerIdx}" onclick="toggleTagCollapse('${outerIdx}', ${startL}, ${endL}, event)">▼</span>` 
             : "";
 
           // Indentation: if first line of tag and char_s > 1, infer leading spaces
@@ -1414,11 +1482,43 @@
         const tagCharStart = t.char_s || 1;
 
         if (t.maps && t.maps.length > 0) {
-          t.maps.forEach(m => {
+          t.maps.forEach((m, mIdx) => {
             const m_line_s = m.line_s || 1;
             const m_line_e = m.line_e || m_line_s;
             const abs_start_line = tagLineStart + (m_line_s - 1);
             const abs_end_line = tagLineStart + (m_line_e - 1);
+
+            const isCppro = m.type_name && m.type_name.startsWith("CPPro_");
+            if (isCppro && abs_end_line > abs_start_line) {
+              activeCpproRanges.push({
+                start: abs_start_line,
+                end: abs_end_line,
+                ast_id: m.ast_id,
+                ast_name: m.ast_name,
+                type_name: m.type_name
+              });
+
+              // Add CPPro collapse toggle on the first line if no collapse button yet
+              if (fileLines[abs_start_line] && !fileLines[abs_start_line].collapseBtn) {
+                fileLines[abs_start_line].collapseBtn = `<span class="collapse-btn collapse-btn-cppro" id="cbtn_cppro_${t.tag_id}_${mIdx}" onclick="toggleTagCollapse('cppro_${t.tag_id}_${mIdx}', ${abs_start_line}, ${abs_end_line}, event)" title="Collapse CPPro ${m.type_name} conditional scope">▼</span>`;
+              }
+
+              // Token syntax highlighting for CPPro_if* applies ONLY to the directive line itself
+              if (!lineMapsMap[abs_start_line]) lineMapsMap[abs_start_line] = [];
+              const cs = (m_line_s === 1) ? (tagCharStart + (m.char_s - 1)) : (m.char_s || 1);
+              const ce = (t.line_e === t.line_s) ? (tagCharStart + ((t.char_e || m.char_e || 9999) - 1)) : 9999;
+              lineMapsMap[abs_start_line].push({
+                char_s: cs,
+                char_e: ce,
+                ast_id: m.ast_id,
+                ast_name: m.ast_name,
+                type_name: m.type_name,
+                is_multi_line: false,
+                abs_start_line: abs_start_line,
+                abs_end_line: abs_start_line
+              });
+              return;
+            }
 
             for (let absL = abs_start_line; absL <= abs_end_line; absL++) {
               if (!lineMapsMap[absL]) lineMapsMap[absL] = [];
@@ -1444,13 +1544,20 @@
                 ce = 9999;
               }
 
+              const eff_depth = (m.container_depth !== undefined && m.container_depth !== null)
+                ? m.container_depth
+                : ((t.container_depth !== undefined && t.container_depth !== null) ? t.container_depth : null);
+
               lineMapsMap[absL].push({
                 char_s: cs,
                 char_e: ce,
                 ast_id: m.ast_id,
                 ast_name: m.ast_name,
                 type_name: m.type_name,
-                is_multi_line: (abs_end_line > abs_start_line)
+                container_depth: eff_depth,
+                is_multi_line: (abs_end_line > abs_start_line),
+                abs_start_line: abs_start_line,
+                abs_end_line: abs_end_line
               });
             }
           });
@@ -1482,7 +1589,10 @@
               ast_id: t.ast_id,
               ast_name: t.ast_name,
               type_name: t.ast_type_name,
-              is_multi_line: (tag_end > tag_start)
+              container_depth: (t.container_depth !== undefined && t.container_depth !== null) ? t.container_depth : null,
+              is_multi_line: (tag_end > tag_start),
+              abs_start_line: tag_start,
+              abs_end_line: tag_end
             });
           }
         }
@@ -1498,6 +1608,10 @@
         const tagClass = lineData.outerIdx !== null ? `tag-block-${lineData.outerIdx}` : "";
         const rawText = lineData.rawText || " ";
 
+        // Check if line is within any CPPro conditional scope
+        const inCpproScope = activeCpproRanges.some(r => l >= r.start && l <= r.end);
+        const cpproClass = (cpproHighlightEnabled && inCpproScope) ? "cppro-scope-highlight" : "";
+
         // Sort maps for this line: smallest span (innermost specific token) first
         const lineMaps = (lineMapsMap[l] || []).slice().sort((a, b) => {
           const spanA = (a.char_e - a.char_s);
@@ -1508,8 +1622,8 @@
 
         const highlightedContent = highlightLineText(rawText, lineMaps);
 
-        gutterHtml += `<div class="gutter-line" id="g_${l}" onclick="onLineClick(${l}, event)" title="Line ${l} (Click to link, Shift+Click for range)"><span>${l}</span> ${collapseSpan}</div>`;
-        bodyHtml += `<div class="code-line ${tagClass}" id="l_${l}">${highlightedContent || ' '}</div>`;
+        gutterHtml += `<div class="gutter-line ${cpproClass}" id="g_${l}" onclick="onLineClick(${l}, event)" title="Line ${l} (Click to link, Shift+Click for range)"><span>${l}</span> ${collapseSpan}</div>`;
+        bodyHtml += `<div class="code-line ${tagClass} ${cpproClass}" id="l_${l}">${highlightedContent || ' '}</div>`;
       }
 
       gutter.innerHTML = gutterHtml;
@@ -1527,6 +1641,50 @@
           }
         }, 60);
       }
+    }
+
+    function toggleCpproHighlighting() {
+      cpproHighlightEnabled = !cpproHighlightEnabled;
+      const btn = document.getElementById("btnToggleCppro");
+      if (btn) {
+        if (cpproHighlightEnabled) {
+          btn.classList.add("btn-active");
+        } else {
+          btn.classList.remove("btn-active");
+        }
+      }
+
+      // Toggle class on all code/gutter lines in active CPPro scopes
+      activeCpproRanges.forEach(r => {
+        for (let l = r.start; l <= r.end; l++) {
+          const lineEl = document.getElementById(`l_${l}`);
+          const gutterEl = document.getElementById(`g_${l}`);
+          if (lineEl) {
+            if (cpproHighlightEnabled) lineEl.classList.add("cppro-scope-highlight");
+            else lineEl.classList.remove("cppro-scope-highlight");
+          }
+          if (gutterEl) {
+            if (cpproHighlightEnabled) gutterEl.classList.add("cppro-scope-highlight");
+            else gutterEl.classList.remove("cppro-scope-highlight");
+          }
+        }
+      });
+    }
+
+    function collapseAllConditionals() {
+      document.querySelectorAll(".collapse-btn-cppro").forEach(btn => {
+        if (btn.innerText === "▼") {
+          btn.click();
+        }
+      });
+    }
+
+    function expandAllConditionals() {
+      document.querySelectorAll(".collapse-btn-cppro").forEach(btn => {
+        if (btn.innerText === "▶") {
+          btn.click();
+        }
+      });
     }
 
     function escapeHtml(text) {
@@ -1650,27 +1808,53 @@
       renderColorPickers();
     }
 
-    function closeHighlightModal() {
-      document.getElementById("highlightModal").classList.remove("open");
-      localStorage.setItem("kernelinfo_hl_settings", JSON.stringify(highlightSettings));
-      // Re-render active code view
-      if (openTabs[activeTabIndex] && openTabs[activeTabIndex].type !== "directory") {
-        loadTabContent(activeTabIndex);
+    function toggleContainerColoring() {
+      containerColoringEnabled = !containerColoringEnabled;
+      const btn = document.getElementById("btnToggleContainer");
+      if (btn) {
+        if (containerColoringEnabled) btn.classList.add("btn-active");
+        else btn.classList.remove("btn-active");
       }
-    }
-
-    function initHighlightManager() {
-      // Merge descriptors into settings
-      typeDescriptors.forEach(td => {
-        if (!highlightSettings[td.name]) {
-          highlightSettings[td.name] = { color: "#61afef", enabled: true, label: td.name };
+      if (openTabs[activeTabIndex] && openTabs[activeTabIndex].type !== "directory") {
+        const currentData = openTabs[activeTabIndex].data;
+        if (currentData && currentData.tags) {
+          buildHighlightedSource(currentData.tags);
         }
-      });
+      }
     }
 
     function renderColorPickers() {
       const container = document.getElementById("colorPickerGrid");
-      container.innerHTML = Object.entries(highlightSettings).map(([key, config]) => {
+      let html = `
+        <div style="grid-column: 1 / -1; margin-bottom: 8px;">
+          <h4 style="margin: 0 0 4px 0; color: var(--accent);">Container Hierarchy Depth Colors (Container Items Only)</h4>
+          <p style="margin: 0 0 10px 0; font-size: 12px; color: var(--text-muted);">
+            Hierarchical color palette applied strictly to items inside AST containers (Level 0 = Root Struct/Compound [Color A], Level 1 = Members [Color B], Level 2 = Params/Return Types [Color C], etc.)
+          </p>
+        </div>
+      `;
+
+      html += containerDepthPalette.map((entry, idx) => {
+        return `
+          <div class="color-card" style="border-left: 3px solid ${entry.color};">
+            <label>
+              <span><strong>${entry.label}</strong></span>
+            </label>
+            <input type="color" class="color-picker" value="${entry.color}" onchange="changeContainerDepthColor(${idx}, this.value)">
+          </div>
+        `;
+      }).join("");
+
+      html += `
+        <div style="grid-column: 1 / -1; margin-top: 14px; margin-bottom: 8px; border-top: 1px solid var(--border); padding-top: 12px;">
+          <h4 style="margin: 0 0 4px 0; color: var(--text-bright);">Syntax Category Colors (Non-Container & Standalone Items)</h4>
+          <p style="margin: 0 0 10px 0; font-size: 12px; color: var(--text-muted);">
+            Colors for comments, keywords, macros, preprocessors, and uncontained syntax tokens.
+          </p>
+        </div>
+      `;
+
+      html += Object.entries(highlightSettings).map(([key, config]) => {
         return `
           <div class="color-card">
             <label>
@@ -1681,6 +1865,14 @@
           </div>
         `;
       }).join("");
+
+      container.innerHTML = html;
+    }
+
+    function changeContainerDepthColor(idx, color) {
+      if (containerDepthPalette[idx]) {
+        containerDepthPalette[idx].color = color;
+      }
     }
 
     function toggleHighlightCategory(key, enabled) {
@@ -1691,8 +1883,30 @@
       if (highlightSettings[key]) highlightSettings[key].color = color;
     }
 
+    function initHighlightManager() {
+      typeDescriptors.forEach(td => {
+        if (!highlightSettings[td.name]) {
+          highlightSettings[td.name] = { color: "#61afef", enabled: true, label: td.name };
+        }
+      });
+    }
+
+    function closeHighlightModal() {
+      document.getElementById("highlightModal").classList.remove("open");
+      localStorage.setItem("kernelinfo_hl_settings", JSON.stringify(highlightSettings));
+      localStorage.setItem("kernelinfo_container_palette", JSON.stringify(containerDepthPalette));
+      // Re-render active code view
+      if (openTabs[activeTabIndex] && openTabs[activeTabIndex].type !== "directory") {
+        const currentData = openTabs[activeTabIndex].data;
+        if (currentData && currentData.tags) {
+          buildHighlightedSource(currentData.tags);
+        }
+      }
+    }
+
     function resetHighlightDefaults() {
       highlightSettings = JSON.parse(JSON.stringify(defaultHighlightSettings));
+      containerDepthPalette = JSON.parse(JSON.stringify(defaultContainerDepthPalette));
       renderColorPickers();
     }
 

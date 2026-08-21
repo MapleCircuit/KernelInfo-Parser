@@ -186,6 +186,61 @@ def get_type_descriptors() -> list[dict[str, Any]]:
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 
+def compute_container_depths(cursor, all_ast_ids: set[int]) -> dict[int, int]:
+    """Compute the hierarchical nesting depth for all AST nodes participating in m_ast_container."""
+    clean_ids = [int(x) for x in all_ast_ids if x and x != 0]
+    if not clean_ids:
+        return {}
+    try:
+        format_ast_strings = ",".join(["%s"] * len(clean_ids))
+        cursor.execute(
+            f"""
+            SELECT c.ast_id, c.priority, c.type_id, c.ref_ast_id
+            FROM m_ast_container c
+            WHERE c.ast_id IN ({format_ast_strings}) OR c.ref_ast_id IN ({format_ast_strings})
+            ORDER BY c.ast_id ASC, c.priority ASC;
+            """,
+            tuple(clean_ids) * 2,
+        )
+        container_rows = cursor.fetchall()
+        parent_to_children = defaultdict(list)
+        child_to_parents = defaultdict(list)
+        all_container_nodes = set()
+
+        for c_row in container_rows:
+            p_id = c_row[0]
+            child_id = c_row[3]
+            all_container_nodes.add(p_id)
+            if child_id and child_id != 0:
+                parent_to_children[p_id].append(child_id)
+                all_container_nodes.add(child_id)
+                child_to_parents[child_id].append(p_id)
+
+        # Root container nodes: nodes that are parents in m_ast_container but have no parents in this file subset
+        root_nodes = [nid for nid in all_container_nodes if nid in parent_to_children and not child_to_parents.get(nid)]
+        # If cyclic or all have parents, pick top-level parent keys
+        if not root_nodes and parent_to_children:
+            root_nodes = list(parent_to_children.keys())
+
+        ast_depth_map = {}
+        queue = [(r_id, 0) for r_id in root_nodes]
+        visited = set()
+        while queue:
+            curr_id, curr_depth = queue.pop(0)
+            if curr_id in visited:
+                continue
+            visited.add(curr_id)
+            ast_depth_map[curr_id] = curr_depth
+            for c_id in parent_to_children.get(curr_id, []):
+                if c_id and c_id != 0 and c_id not in visited:
+                    queue.append((c_id, curr_depth + 1))
+
+        return ast_depth_map
+    except Exception as e:
+        logger.warning("Failed to compute container depths: %s", e)
+        return {}
+
+
 @app.get("/api/version/{version_name}/browse/")
 @app.get("/api/version/{version_name}/browse/{path:path}")
 @app.get("/v/{version_name}/")
@@ -358,9 +413,9 @@ def browse_path(version_name: str, path: str = "") -> dict[str, Any]:
         )
         tag_rows = cursor.fetchall()
         tag_ids = [r[0] for r in tag_rows]
-
         # Fetch spatial coordinate map entries for all tags in this file
         map_dict = defaultdict(list)
+        all_ast_ids = set([r[4] for r in tag_rows if r[4]])
         if tag_ids:
             format_strings = ",".join(["%s"] * len(tag_ids))
             cursor.execute(
@@ -376,22 +431,34 @@ def browse_path(version_name: str, path: str = "") -> dict[str, Any]:
                 """,
                 tuple(tag_ids),
             )
-            for m_row in cursor.fetchall():
+            raw_maps = cursor.fetchall()
+            for m_row in raw_maps:
+                if m_row[6]:
+                    all_ast_ids.add(m_row[6])
+
+            ast_depth_map = compute_container_depths(cursor, all_ast_ids)
+
+            for m_row in raw_maps:
+                m_ast_id = m_row[6]
                 map_dict[m_row[0]].append({
                     "map_id": m_row[1],
                     "line_s": m_row[2],
                     "char_s": m_row[3],
                     "line_e": m_row[4],
                     "char_e": m_row[5],
-                    "ast_id": m_row[6],
+                    "ast_id": m_ast_id,
                     "ast_name": safe_decode(m_row[7]),
                     "type_id": m_row[8],
                     "type_name": safe_decode(m_row[9]),
+                    "container_depth": ast_depth_map.get(m_ast_id, None),
                 })
+        else:
+            ast_depth_map = compute_container_depths(cursor, all_ast_ids)
 
         tags = []
         for r in tag_rows:
             t_id = r[0]
+            ast_id = r[4]
             raw_ast = safe_decode(r[14])
             parsed_raw = None
             if raw_ast:
@@ -405,7 +472,7 @@ def browse_path(version_name: str, path: str = "") -> dict[str, Any]:
                 "vid_s": r[1],
                 "vid_e": r[2],
                 "code": safe_decode(r[3]),
-                "ast_id": r[4],
+                "ast_id": ast_id,
                 "hl_s": r[5],
                 "hl_l": r[6],
                 "line_s": r[7],
@@ -416,6 +483,7 @@ def browse_path(version_name: str, path: str = "") -> dict[str, Any]:
                 "ast_type_id": r[12],
                 "ast_type_name": safe_decode(r[13]),
                 "ast_raw": parsed_raw,
+                "container_depth": ast_depth_map.get(ast_id, None),
                 "maps": map_dict.get(t_id, []),
             })
 
@@ -494,6 +562,7 @@ def get_file_by_id(fid: int) -> dict[str, Any]:
         )
         tag_rows = cursor.fetchall()
         tag_ids = [r[0] for r in tag_rows]
+        all_ast_ids = set([r[4] for r in tag_rows if r[4]])
 
         map_dict = defaultdict(list)
         if tag_ids:
@@ -511,18 +580,29 @@ def get_file_by_id(fid: int) -> dict[str, Any]:
                 """,
                 tuple(tag_ids),
             )
-            for m_row in cursor.fetchall():
+            raw_maps = cursor.fetchall()
+            for m_row in raw_maps:
+                if m_row[6]:
+                    all_ast_ids.add(m_row[6])
+
+            ast_depth_map = compute_container_depths(cursor, all_ast_ids)
+
+            for m_row in raw_maps:
+                m_ast_id = m_row[6]
                 map_dict[m_row[0]].append({
                     "map_id": m_row[1],
                     "line_s": m_row[2],
                     "char_s": m_row[3],
                     "line_e": m_row[4],
                     "char_e": m_row[5],
-                    "ast_id": m_row[6],
+                    "ast_id": m_ast_id,
                     "ast_name": safe_decode(m_row[7]),
                     "type_id": m_row[8],
                     "type_name": safe_decode(m_row[9]),
+                    "container_depth": ast_depth_map.get(m_ast_id, None),
                 })
+        else:
+            ast_depth_map = compute_container_depths(cursor, all_ast_ids)
 
         tags = [
             {
@@ -541,6 +621,7 @@ def get_file_by_id(fid: int) -> dict[str, Any]:
                 "ast_type_id": r[12],
                 "ast_type_name": safe_decode(r[13]),
                 "ast_raw": safe_decode(r[14]),
+                "container_depth": ast_depth_map.get(r[4], None),
                 "maps": map_dict.get(r[0], []),
             }
             for r in tag_rows

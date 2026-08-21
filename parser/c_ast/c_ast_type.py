@@ -399,8 +399,13 @@ class Ast:
 
         line_s = 1
         char_s = 1
-        line_e = max(1, ext.line_pos[1] - ext.line_pos[0] + 1)
-        char_e = ext.char_pos[1]
+        if hasattr(self, "endif") and self.endif and self.endif.line_pos[0] > 0:
+            end_line = self.endif.line_pos[1]
+            line_e = max(1, end_line - ext.line_pos[0] + 1)
+            char_e = self.endif.char_pos[1] if self.endif.char_pos[1] > 0 else ext.char_pos[1]
+        else:
+            line_e = max(1, ext.line_pos[1] - ext.line_pos[0] + 1)
+            char_e = ext.char_pos[1]
 
         CS.store(m_map_ast.set(
             CS.ref(m_tag.tag_id, *tag_route),
@@ -526,15 +531,19 @@ class Ast:
 
 
 class Ast_Comment(Ast):
-    """type_id 1."""
+    """type_id ASTT.C_Comment."""
 
-    def __init__(self, extent: Line) -> None:
+    def __init__(self, extent: Line, comment: str = "") -> None:
         self.extent = extent
+        self.comment = comment
 
-    # rip this shit NEED TO REDO FOR USE WITH LINE
+    def within_range(self, token, ast_kind) -> bool:
+        return False
+
     def extract(self, CS: ChangeSetType) -> None:
         """Passthrough to AST.extract_1arg."""
-        self.extract_1arg(CS, ASTT.C_Comment, self.comment, self.extent)
+        comment_name = self.comment[:255] if self.comment else ""
+        self.extract_1arg(CS, ASTT.C_Comment, comment_name, self.extent)
         return
 
 class Ast_Keyword(Ast_Comment):
@@ -1706,12 +1715,13 @@ class Zone:
         if self.completed:
             return False
 
-        # Fast exit for comments - comments do not need AST token extraction
-        if ast_kind == AST_KIND.comment:
-            return True
-
         tline = getattr(token, 'line', None) or Line(token.extent)
         tspelling = getattr(token, 'spelling_str', '')
+
+        # Capture comments into Ast_Comment AST nodes
+        if ast_kind == AST_KIND.comment:
+            self.children.append(Ast_Comment(tline, tspelling))
+            return True
 
         if ast_kind == AST_KIND.punctuation and tspelling == "}":
             if self.zone_type in {Zone_Type.Declared_Args, Zone_Type.Enum_Content, Zone_Type.Compound_Stmt}:
@@ -1794,6 +1804,32 @@ class Zone:
             self.A_Line_Dict[item.extent.line_pos[0]].append(item)
 
         return
+
+    def resolve_cppro_scopes(self) -> None:
+        """Resolve the ending boundaries (endif line coordinates) for all CPPro_if* conditionals."""
+        cpp_stack = []
+
+        for item in self.children:
+            if isinstance(item, (CPPro_if, CPPro_ifdef, CPPro_ifndef)) and not isinstance(item, (CPPro_elif, CPPro_elifdef, CPPro_elifndef)):
+                cpp_stack.append([item])
+            elif isinstance(item, (CPPro_elif, CPPro_elifdef, CPPro_elifndef)):
+                if cpp_stack:
+                    prev_branch = cpp_stack[-1][-1]
+                    end_l = max(prev_branch.extent.line_pos[0], item.extent.line_pos[0] - 1)
+                    prev_branch.endif = Line(end_l, end_l)
+                    cpp_stack[-1].append(item)
+            elif isinstance(item, CPPro_else):
+                if cpp_stack:
+                    prev_branch = cpp_stack[-1][-1]
+                    end_l = max(prev_branch.extent.line_pos[0], item.extent.line_pos[0] - 1)
+                    prev_branch.endif = Line(end_l, end_l)
+                    cpp_stack[-1].append(item)
+            elif isinstance(item, CPPro_endif):
+                if cpp_stack:
+                    group = cpp_stack.pop()
+                    for branch in group:
+                        if branch.endif.line_pos[0] == 0:
+                            branch.endif = Line(item.extent.line_pos[1], item.extent.line_pos[1])
 
 
 class C_Type(Ast):
@@ -1900,55 +1936,145 @@ class C_Type(Ast):
             final_types.append(tuple(type_constructor))
 
         # 3. Zone Handling for Type Definitions (struct/union/enum/functionproto declarations)
-        if self.zones:
-            for final_type in final_types:
-                for typesegment in final_type:
-                    if typesegment.is_definition():
-                        for item in typesegment.content:
-                            if item.is_definition and item.type in {ASTT.C_struct, ASTT.C_functionproto, ASTT.C_union, ASTT.C_enum}:
-                                decl_type = get_decl_type(item.type)
-                                # Push the defined struct/union/enum to CS via ref_view
-                                with CS(REF_POS):
-                                    CS.store(m_ast.ref_view(
-                                        ((m_ast.ast_id,),),
-                                        None,
-                                        item.code,
-                                        decl_type,
-                                        (
-                                            (  # If condition: any child m_ast in zone
-                                                (m_ast.ast_id, None),
-                                            ),
-                                            (  # Then / Else branches
-                                                (
-                                                    ((m_ast.ast_id, m_ast_container.ast_id, 1),),
-                                                    (None, ("rank",), m_ast.type_id, m_ast.ast_id),
-                                                ),
-                                            ),
-                                            tuple(zone_link),
-                                        ),
-                                    ))
-                                    ast_id_route = CS.get_route_parse()
-                                    typesegment.ref_type = TSRef.Route_Ref
-                                    typesegment.ref = ast_id_route
+        for final_type in final_types:
+            for typesegment in final_type:
+                if typesegment.is_definition():
+                    for item in typesegment.content:
+                        if item.is_definition and item.type in {ASTT.C_struct, ASTT.C_functionproto, ASTT.C_union, ASTT.C_enum}:
+                            decl_type = get_decl_type(item.type)
+                            if item.type == ASTT.C_functionproto:
+                                # Determine return type from preceding segments in final_type
+                                ret_idx = final_type.index(typesegment)
+                                return_segments = final_type[:ret_idx]
+                                if not return_segments:
+                                    return_segments = [root_type] if root_type != typesegment else []
 
-                                # For standalone type definitions (no variable declarator in final_type),
-                                # tag and debug the canonical declaration AST directly here
-                                has_var = any(token.type == 0 for ts in final_type for token in ts.content)
-                                if not has_var:
-                                    with CS(REF_NO_REF):
-                                        if G.OVERRIDE_FORCE_AST_DEBUG:
-                                            self.ast_debug(CS, ast_id_route)
-                                        self.tag(CS, ast_id_route, self.extent)
+                                if len(return_segments) == 1:
+                                    ret_seg = return_segments[0]
+                                    ret_seg.generate_ast(CS)
+                                elif len(return_segments) > 1:
+                                    ret_seg = TypeSegment()
+                                    for seg in return_segments:
+                                        ret_seg.extend(seg)
+                                    ret_seg.generate_ast(CS)
+                                else:
+                                    ret_seg = TypeSegment()
+                                    ret_seg.content.append(TypeToken(item, ASTT.C_void))
+                                    ret_seg.generate_ast(CS)
+
+                                ret_t_id = ret_seg.type_id
+                                if ret_t_id is None:
+                                    if ret_seg.ref_type == TSRef.Route_Ref and not ret_seg.content:
+                                        ret_t_id = ASTT.C_Compound
+                                    elif ret_seg.content:
+                                        ret_t_id = ret_seg.content[0].type
+                                    else:
+                                        ret_t_id = ASTT.C_void
+
+                                if ret_seg.ref_type == TSRef.Route_Ref:
+                                    ret_ref_ast_id = CS.ref(m_ast.ast_id, *ret_seg.ref)
+                                elif ret_seg.ref_type == TSRef.AST_Ref:
+                                    ret_ref_ast_id = ret_seg.ref
+                                else:
+                                    ret_ref_ast_id = ret_seg.ref_ast_id if ret_seg.ref_ast_id is not None else 0
+
+                                if zone_link:
+                                    with CS(REF_POS):
+                                        CS.store(m_ast.ref_view(
+                                            ((m_ast.ast_id, m_ast_container.ast_id, 1),),
+                                            None,
+                                            item.code,
+                                            decl_type,
+                                            None,
+                                            0,
+                                            ret_t_id,
+                                            ret_ref_ast_id,
+                                            (
+                                                (  # If condition: any child m_ast in zone
+                                                    (m_ast.ast_id, None),
+                                                ),
+                                                (  # Then / Else branches
+                                                    (
+                                                        ((m_ast.ast_id, m_ast_container.ast_id, 1),),
+                                                        (None, ("rank",), m_ast.type_id, m_ast.ast_id),
+                                                    ),
+                                                ),
+                                                tuple(zone_link),
+                                                1,
+                                            ),
+                                        ))
+                                        ast_id_route = CS.get_route_parse()
+                                        typesegment.ref_type = TSRef.Route_Ref
+                                        typesegment.ref = ast_id_route
+                                else:
+                                    with CS(REF_POS):
+                                        CS.store(m_ast.view(
+                                            ((m_ast.ast_id, m_ast_container.ast_id, 1),),
+                                            None,
+                                            item.code,
+                                            decl_type,
+                                            None,
+                                            0,
+                                            ret_t_id,
+                                            ret_ref_ast_id,
+                                        ))
+                                        ast_id_route = CS.get_route_parse()
+                                        typesegment.ref_type = TSRef.Route_Ref
+                                        typesegment.ref = ast_id_route
+                            else:
+                                if zone_link:
+                                    # Push the defined struct/union/enum to CS via ref_view
+                                    with CS(REF_POS):
+                                        CS.store(m_ast.ref_view(
+                                            ((m_ast.ast_id,),),
+                                            None,
+                                            item.code,
+                                            decl_type,
+                                            (
+                                                (  # If condition: any child m_ast in zone
+                                                    (m_ast.ast_id, None),
+                                                ),
+                                                (  # Then / Else branches
+                                                    (
+                                                        ((m_ast.ast_id, m_ast_container.ast_id, 1),),
+                                                        (None, ("rank",), m_ast.type_id, m_ast.ast_id),
+                                                    ),
+                                                ),
+                                                tuple(zone_link),
+                                            ),
+                                        ))
+                                        ast_id_route = CS.get_route_parse()
+                                        typesegment.ref_type = TSRef.Route_Ref
+                                        typesegment.ref = ast_id_route
+                                else:
+                                    with CS(REF_POS):
+                                        CS.store(m_ast.get_set(
+                                            None,
+                                            item.code,
+                                            decl_type,
+                                        ))
+                                        ast_id_route = CS.get_route_parse()
+                                        typesegment.ref_type = TSRef.Route_Ref
+                                        typesegment.ref = ast_id_route
+
+                            # For standalone type definitions (or function declarations),
+                            # tag and debug the canonical declaration AST directly here
+                            has_var = any(token.type == 0 for ts in final_type for token in ts.content)
+                            if not has_var or item.type == ASTT.C_functionproto:
+                                with CS(REF_NO_REF):
+                                    if G.OVERRIDE_FORCE_AST_DEBUG:
+                                        self.ast_debug(CS, ast_id_route)
+                                    self.tag(CS, ast_id_route, self.extent)
 
         # 4. Insert ASTs into ChangeSet
         for final_type in final_types:
             if not final_type:
                 continue
 
-            # Skip standalone type definitions that were already emitted and tagged in Step 3
+            # Skip standalone type definitions and function declarations that were already emitted and tagged in Step 3
             has_var = any(token.type == 0 for ts in final_type for token in ts.content)
             is_type_def = any(ts.is_definition() for ts in final_type)
-            if self.zones and is_type_def and not has_var:
+            if is_type_def and (not has_var or any(tok.type == ASTT.C_functionproto for ts in final_type for tok in ts.content)):
                 continue
 
             cs_inserter = []
@@ -2275,6 +2401,15 @@ class C_Type(Ast):
                 self.content.get_foreign(cursor)
                 self.swap_out()
                 return
+
+        if cursor.kind == cc.CursorKind.FUNCTION_DECL and tspelling == cursor.spelling:
+            self.name = tspelling
+            tt = TypeToken(token, ASTT.C_functionproto)
+            tt.is_definition = True
+            self.content.append(tt)
+            self.content.get_foreign(cursor)
+            self.swap_out()
+            return
 
         self.content.append(TypeToken(token))
         self.swap_out()
