@@ -351,6 +351,18 @@ class ChangeSet:
         output_data = []
         for val in data:
             if type(val) is tuple:
+                if len(val) == 3 and val[1] == OP_REF:
+                    route = val[2]
+                    if type(route) is tuple and len(route) == 2 and route[0] == REF_POS:
+                        pos_idx = route[1]
+                        col_idx = val[0][1]
+                        if pos_idx < len(self.cs_result):
+                            res = self.cs_result[pos_idx]
+                            if res is not None and col_idx < len(res):
+                                resolved = res[col_idx]
+                                if type(resolved) is not tuple:
+                                    output_data.append(to_safe_data(resolved))
+                                    continue
                 resolved = self.resolve_ref(val[0], val[2])
                 if resolved is None:
                     if G.BP_ON_REF_FAIL:

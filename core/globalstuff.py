@@ -73,7 +73,7 @@ class GlobalStuff:
         self.OVERRIDE_MAX_PRINT_SIZE = 60
 
         # TypeCheck
-        self.DEBUG_TYPECHECK = True
+        self.DEBUG_TYPECHECK = False
 
         self.OP_isinstanceDict = {
             PointerType: self.is_PointerType,

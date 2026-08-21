@@ -109,6 +109,7 @@ logging.basicConfig(
 )
 
 logger = logging.getLogger(__name__)
+_WORKER_CLANG_INDEX: cc.Index | None = None
 
 # This applies to c_ast and c_ast_type only
 # ==========================================================
@@ -320,7 +321,7 @@ class TokenList:
         #filesize in bytes
         file_size = Path(fullfilename).stat().st_size
         end_loc = cc.conf.lib.clang_getLocationForOffset(parsed_tu, parsed_file, file_size)
-        logger.info(f"end_loc:{end_loc}")
+        logger.debug(f"end_loc:{end_loc}")
 
         extent = cc.SourceRange.from_locations(start_loc, end_loc)
 
@@ -433,9 +434,11 @@ class Ast_Manager:
             cppro_cindex_input = [line[6:].lstrip() for line in comment_remover(self.unsplit_rawfile).splitlines() if line.startswith("#ifdef")]
 
 
-        # Initialize the Clang index
-
-        index = cc.Index.create()
+        # Initialize/Reuse the Clang index
+        global _WORKER_CLANG_INDEX
+        if _WORKER_CLANG_INDEX is None:
+            _WORKER_CLANG_INDEX = cc.Index.create()
+        index = _WORKER_CLANG_INDEX
 
         # these: "-M","-MG", were probably important, but who gives a shit as they print a bunch of shit on screen, lol
         translation_unit = index.parse(

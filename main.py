@@ -122,8 +122,10 @@ def update(version: str) -> None:
     # STEP 2: Create temporary performance indexes on DB tables
     # -------------------------------------------------------------------------
     with G.DB() as db:
-        db.create_index("ast_index", m_ast, (m_ast.name, m_ast.type_id))
+        db.create_index("ast_index", m_ast, (m_ast.type_id, m_ast.name))
         db.create_index("file_name_index", m_file_name, (m_file_name.fname,))
+        
+
 
     # -------------------------------------------------------------------------
     # STEP 3: Clone repository branch version to RAMDISK workspace
@@ -186,11 +188,7 @@ def update(version: str) -> None:
 
 def trigger_multicore(batch_size: int = 200) -> None:
     """Distribute file parsing across `G.CPUS - 1` parallel worker processes in dynamic batches."""
-    gp.start_manager()
-    task_queue = gp.Manager.Queue()
-    error_list = gp.Manager.list()
-
-    change_list = gp.Change_List
+    change_list = gp.Change_List or []
     total_files = len(change_list)
     total_batches = (total_files + batch_size - 1) // batch_size if total_files > 0 else 0
 
@@ -199,6 +197,16 @@ def trigger_multicore(batch_size: int = 200) -> None:
         f"Distributing {total_files} changed files in {total_batches} batches "
         f"(batch size: {batch_size}) across {num_workers} parallel workers"
     )
+
+    if total_files == 0:
+        G.TE.start_new_db(G.DB)
+        processing_dirs()
+        processing_unchanges()
+        return
+
+    task_queue = multiprocessing.Queue()
+    result_queue = multiprocessing.Queue()
+    error_queue = multiprocessing.Queue()
 
     for i in range(0, total_files, batch_size):
         task_queue.put((i // batch_size, change_list[i : i + batch_size]))
@@ -210,7 +218,7 @@ def trigger_multicore(batch_size: int = 200) -> None:
     for worker_id in range(num_workers):
         p = multiprocessing.Process(
             target=file_processing_worker,
-            args=(task_queue, error_list, gp.Shared_ChangeSet_Dict_List, gp.VID, gp, MF, worker_id),
+            args=(task_queue, error_queue, result_queue, gp.VID, gp, MF, worker_id),
         )
         processes.append(p)
         p.start()
@@ -220,12 +228,31 @@ def trigger_multicore(batch_size: int = 200) -> None:
     processing_dirs()
     processing_unchanges()
 
+    finished_workers = 0
+    while finished_workers < num_workers:
+        try:
+            item = result_queue.get()
+            if item is None:
+                finished_workers += 1
+            else:
+                gp.ChangeSet_Dict.update(pickle.loads(item))
+        except Exception as e:
+            logger.error(f"Error reading worker batch result: {e}")
+            break
+
     failed_workers = 0
     for p in processes:
         p.join()
         if p.exitcode != 0:
             failed_workers += 1
             logger.error(COLOR.red(f"Worker PID {p.pid} terminated abnormally with exit code {p.exitcode}"))
+
+    error_list = []
+    while not error_queue.empty():
+        try:
+            error_list.append(error_queue.get_nowait())
+        except Exception:
+            break
 
     if error_list:
         logger.error(COLOR.red(f"Multicore processing encountered {len(error_list)} file error(s):"))
@@ -239,8 +266,6 @@ def trigger_multicore(batch_size: int = 200) -> None:
                 f"and {len(error_list)} file error(s)!"
             )
         )
-
-    gp.stop_manager()
 
     del processes
 
@@ -531,8 +556,8 @@ def default_processing(CS: ChangeSet) -> None:
 
 def file_processing_worker(
     task_queue: multiprocessing.Queue,
-    error_list: list,
-    shared_dict_list: list,
+    error_queue: multiprocessing.Queue,
+    result_queue: multiprocessing.Queue,
     vid: int,
     gp_ref: GreatProcessor,
     mf_ref: MasterFile,
@@ -572,15 +597,16 @@ def file_processing_worker(
                 err_str = str(e)
                 tb_str = traceback.format_exc()
                 logger.error(COLOR.red(f"Worker {worker_id} error parsing '{changed_file}': {err_str}"))
-                error_list.append((changed_file, err_str, tb_str))
+                error_queue.put((changed_file, err_str, tb_str))
 
         if batch_cs_dict:
             try:
-                shared_dict_list.append(pickle.dumps(batch_cs_dict))
+                result_queue.put(pickle.dumps(batch_cs_dict))
             except Exception as e:
                 logger.error(COLOR.red(f"Worker {worker_id} failed to serialize batch {batch_id}: {e}"))
-                error_list.append((f"Batch-{batch_id}", str(e), traceback.format_exc()))
+                error_queue.put((f"Batch-{batch_id}", str(e), traceback.format_exc()))
 
+    result_queue.put(None)  # Worker done sentinel
     return
 
 

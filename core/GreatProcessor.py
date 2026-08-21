@@ -67,19 +67,15 @@ class GreatProcessor:
         return CS
 
     def start_manager(self) -> None:
-        """Initialize `multiprocessing.Manager()` and create `Shared_ChangeSet_Dict_List` for worker IPC."""
-        self.Manager = multiprocessing.Manager()
-        self.Shared_ChangeSet_Dict_List = self.Manager.list()
+        """Initialize `Shared_ChangeSet_Dict_List` for worker IPC."""
+        self.Shared_ChangeSet_Dict_List = []
         return
 
     def stop_manager(self) -> None:
-        """Deserialize pickled worker ChangeSet dictionaries, merge into `gp.ChangeSet_Dict`, and shut down manager."""
-        for shared in self.Shared_ChangeSet_Dict_List:
-            self.ChangeSet_Dict.update(pickle.loads(shared))  # noqa: S301
-
-        del self.Manager
-        del self.Shared_ChangeSet_Dict_List
-        self.Manager = None
+        """Deserialize pickled worker ChangeSet dictionaries and merge into `gp.ChangeSet_Dict`."""
+        if self.Shared_ChangeSet_Dict_List:
+            for shared in self.Shared_ChangeSet_Dict_List:
+                self.ChangeSet_Dict.update(pickle.loads(shared))  # noqa: S301
         self.Shared_ChangeSet_Dict_List = []
         return
 

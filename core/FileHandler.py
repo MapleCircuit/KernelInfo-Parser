@@ -44,24 +44,26 @@ class MasterFile:
         return
 
     def git_clone(self, version: str) -> str:
-        """Clone a repository version branch to RAMDISK, strip .git, and set up include symlinks."""
+        """Extract a repository version branch directly into RAMDISK and set up include symlinks."""
         temp_path = self.create_temp_dir()
-        command = [
-            "git",
-            "clone",
-            f"{G.linux_directory}",
-            "--branch",
-            f"{version}",
-            f"{temp_path}",
-            "-c advice.detachedHead=false",
-        ]
+        git_dir = f"{G.linux_directory}/.git" if Path(f"{G.linux_directory}/.git").exists() else "linux/.git"
+        p_arch = sp.Popen(
+            ["git", f"--git-dir={git_dir}", "archive", f"{version}"],
+            stdout=sp.PIPE,
+        )
+        sp.run(["tar", "-x", "-C", f"{temp_path}"], stdin=p_arch.stdout, check=True)  # noqa: S603, PLW1510
+        p_arch.wait()
 
-        sp.run(command)  # noqa: PLW1510, S603
-        shutil.rmtree(f"{temp_path}/.git")
-        command = ["ln", "-s", "asm-generic", f"{temp_path}/include/asm"]
-        sp.run(command)  # noqa: PLW1510, S603
-        command = ["ln", "-s", "asm-generic", f"{temp_path}/include/uapi/asm"]
-        sp.run(command)  # noqa: PLW1510, S603
+        # Symlinks for asm
+        asm_path = Path(f"{temp_path}/include/asm")
+        if not asm_path.exists():
+            sp.run(["ln", "-s", "asm-generic", f"{temp_path}/include/asm"])  # noqa: S603, PLW1510
+
+        uapi_asm_parent = Path(f"{temp_path}/include/uapi")
+        if uapi_asm_parent.exists():
+            uapi_asm_path = Path(f"{temp_path}/include/uapi/asm")
+            if not uapi_asm_path.exists():
+                sp.run(["ln", "-s", "asm-generic", f"{temp_path}/include/uapi/asm"])  # noqa: S603, PLW1510
         return temp_path
 
     def get_file(self, file_path: str, version: str) -> str:

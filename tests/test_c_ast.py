@@ -101,6 +101,7 @@ def run_single_file_worker(item: dict[str, Any]) -> dict[str, Any]:
     temp_dir = None
     try:
         # Isolated in-memory DB per worker
+        G.DEBUG_TYPECHECK = True
         G.DB = MockDB
         G.TE = TEDirectDB()
         gp = GreatProcessor()

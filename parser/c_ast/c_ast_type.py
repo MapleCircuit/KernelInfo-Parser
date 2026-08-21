@@ -3,7 +3,7 @@ from core.globalstuff import G, COLOR, REF_POS, REF_ROOT, REF_OLD, REF_MULTI, RE
 import clang.cindex as cc
 import logging
 import json
-from typing import Self
+from typing import Self, Any
 import random
 
 logger = logging.getLogger(__name__)
@@ -97,12 +97,18 @@ class Line:
             self.char_pos = (0, 0)
         elif l == 1:
             arg = args[0]
-            if isinstance(arg, cc.SourceRange):
-                self.line_pos = (arg.start.line, arg.end.line)
-                self.char_pos = (arg.start.column, arg.end.column)
+            if type(arg) is Line:
+                self.line_pos = arg.line_pos
+                self.char_pos = arg.char_pos
+            elif hasattr(arg, 'line') and type(arg.line) is Line:
+                self.line_pos = arg.line.line_pos
+                self.char_pos = arg.line.char_pos
             elif isinstance(arg, Line):
                 self.line_pos = arg.line_pos
                 self.char_pos = arg.char_pos
+            elif isinstance(arg, cc.SourceRange):
+                self.line_pos = (arg.start.line, arg.end.line)
+                self.char_pos = (arg.start.column, arg.end.column)
             else:
                 logger.error("Line: 1 ARGS TYPE ERROR")
                 self.line_pos = (0, 0)
@@ -158,7 +164,10 @@ class Line:
         l = len(args)
         if l == 1:
             arg = args[0]
-            if hasattr(arg, 'line'):
+            if type(arg) is Line:
+                self.line_pos = (self.line_pos[0], arg.line_pos[1])
+                self.char_pos = (self.char_pos[0], arg.char_pos[1])
+            elif hasattr(arg, 'line'):
                 self.line_pos = (self.line_pos[0], arg.line.line_pos[1])
                 self.char_pos = (self.char_pos[0], arg.line.char_pos[1])
             elif isinstance(arg, Line):
@@ -181,14 +190,21 @@ class Line:
 
         l = len(args)
         if l == 1:
-            if isinstance(args[0], cc.SourceRange):
-                self.line_pos = (self.line_pos[0], args[0].start.line)
-                self.char_pos = (self.char_pos[0], args[0].start.column)
-            elif isinstance(args[0], Line):
-                self.line_pos = (self.line_pos[0], args[0].line_pos[0])
-                self.char_pos = (self.char_pos[0], args[0].char_pos[0])
+            arg = args[0]
+            if type(arg) is Line:
+                self.line_pos = (self.line_pos[0], arg.line_pos[0])
+                self.char_pos = (self.char_pos[0], arg.char_pos[0])
+            elif hasattr(arg, 'line'):
+                self.line_pos = (self.line_pos[0], arg.line.line_pos[0])
+                self.char_pos = (self.char_pos[0], arg.line.char_pos[0])
+            elif isinstance(arg, cc.SourceRange):
+                self.line_pos = (self.line_pos[0], arg.start.line)
+                self.char_pos = (self.char_pos[0], arg.start.column)
+            elif isinstance(arg, Line):
+                self.line_pos = (self.line_pos[0], arg.line_pos[0])
+                self.char_pos = (self.char_pos[0], arg.char_pos[0])
             else:
-                self.line_pos = (self.line_pos[0], args[0])
+                self.line_pos = (self.line_pos[0], arg)
         elif l == 2:
             self.line_pos = (self.line_pos[0], args[0])
             self.char_pos = (self.char_pos[0], args[1])
@@ -200,7 +216,13 @@ class Line:
             return
 
         arg = args[0]
-        if isinstance(arg, Line):
+        if type(arg) is Line:
+            a_s_l, a_e_l = arg.line_pos
+            a_s_c, a_e_c = arg.char_pos
+        elif hasattr(arg, 'line') and type(arg.line) is Line:
+            a_s_l, a_e_l = arg.line.line_pos
+            a_s_c, a_e_c = arg.line.char_pos
+        elif isinstance(arg, Line):
             a_s_l, a_e_l = arg.line_pos
             a_s_c, a_e_c = arg.char_pos
         elif isinstance(arg, cc.SourceRange):
@@ -230,7 +252,13 @@ class Line:
     def is_inside(self, extent) -> bool:
         """Test whether an extent/Line is within current Line."""
         s_s_l, s_e_l = self.line_pos
-        if isinstance(extent, Line):
+        if type(extent) is Line:
+            e_s_l, e_e_l = extent.line_pos
+            e_s_c, e_e_c = extent.char_pos
+        elif hasattr(extent, 'line') and type(extent.line) is Line:
+            e_s_l, e_e_l = extent.line.line_pos
+            e_s_c, e_e_c = extent.line.char_pos
+        elif isinstance(extent, Line):
             e_s_l, e_e_l = extent.line_pos
             e_s_c, e_e_c = extent.char_pos
         elif isinstance(extent, cc.SourceRange):
@@ -323,12 +351,14 @@ class Ast:
         else:
             self.extent.cc(CS.parsers["C_AM"].rawfile)
 
+        ast_ref = CS.ref(m_ast.ast_id, *ast_id_route)
+
         current_tag = (
             None,
             CS.gp.VID,
             0,
             self.extent.code,
-            CS.ref(m_ast.ast_id, *ast_id_route),
+            ast_ref,
             0,
             0,
         )
@@ -371,10 +401,12 @@ class Ast:
             CS.store(m_tag.set(*current_tag))
             tag_route = CS.get_route_parse()
 
+        tag_ref = CS.ref(m_tag.tag_id, *tag_route)
+
         # Create bridge tag
         CS.store(m_bridge_tag.set(
             CS.ref(m_file.fid, REF_ROOT),
-            CS.ref(m_tag.tag_id, *tag_route),
+            tag_ref,
             self.extent.line_pos[0],
             self.extent.line_pos[1],
             self.extent.char_pos[0],
@@ -382,14 +414,14 @@ class Ast:
         ))
 
         # Create map and bridge map
-        self.map_ast(CS, ast_id_route, tag_route, self.extent)
+        self.map_ast(CS, ast_ref, tag_ref, self.extent)
         return
 
     def map_ast(
         self,
         CS: ChangeSetType,
-        ast_id_route: RouteType,
-        tag_route: RouteType,
+        ast_id_route: RouteType | Any,
+        tag_route: RouteType | Any,
         extent: Line | None = None,
     ) -> None:
         """Create m_map_ast and m_bridge_map spatial coordinate entries for this AST node."""
@@ -407,17 +439,20 @@ class Ast:
             line_e = max(1, ext.line_pos[1] - ext.line_pos[0] + 1)
             char_e = ext.char_pos[1]
 
+        ast_target = ast_id_route if (type(ast_id_route) is tuple and len(ast_id_route) == 3 and ast_id_route[1] == OP_REF) or type(ast_id_route) is int else CS.ref(m_ast.ast_id, *ast_id_route)
+        tag_target = tag_route if (type(tag_route) is tuple and len(tag_route) == 3 and tag_route[1] == OP_REF) or type(tag_route) is int else CS.ref(m_tag.tag_id, *tag_route)
+
         CS.store(m_map_ast.set(
-            CS.ref(m_tag.tag_id, *tag_route),
+            tag_target,
             line_s,
             char_s,
             line_e,
             char_e,
-            CS.ref(m_ast.ast_id, *ast_id_route),
+            ast_target,
         ))
         CS.store(m_bridge_map.set(
-            CS.ref(m_tag.tag_id, *tag_route),
-            CS.ref(m_tag.tag_id, *tag_route),
+            tag_target,
+            tag_target,
         ))
         return
 
