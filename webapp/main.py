@@ -258,7 +258,22 @@ def browse_path(version_name: str, path: str = "") -> dict[str, Any]:
         # 1. Check if path is empty (Root directory)
         # ---------------------------------------------------------------------
         if not norm_path:
-            # Query top-level files (no slash in fname)
+            # Query top-level subdirectories
+            cursor.execute(
+                """
+                SELECT DISTINCT SUBSTRING_INDEX(f.fname, '/', 1) AS dir_prefix
+                FROM m_file_name f
+                JOIN m_bridge_file bf ON f.fnid = bf.fnid
+                JOIN m_v_main v ON bf.vid = v.vid
+                WHERE v.vname = %s AND f.fname LIKE '%/%'
+                ORDER BY dir_prefix ASC;
+                """,
+                (version_name,),
+            )
+            sub_dirs = [safe_decode(r[0]) for r in cursor.fetchall() if r[0] is not None]
+            sub_dir_set = set(sub_dirs)
+
+            # Query top-level files (no slash in fname, not in sub_dirs)
             cursor.execute(
                 """
                 SELECT f.fname, fi.fid, fi.ftype, fi.s_stat, fi.e_stat
@@ -280,21 +295,8 @@ def browse_path(version_name: str, path: str = "") -> dict[str, Any]:
                     "e_stat": safe_decode(r[4]),
                 }
                 for r in cursor.fetchall()
+                if safe_decode(r[0]) not in sub_dir_set
             ]
-
-            # Query top-level subdirectories
-            cursor.execute(
-                """
-                SELECT DISTINCT SUBSTRING_INDEX(f.fname, '/', 1) AS dir_prefix
-                FROM m_file_name f
-                JOIN m_bridge_file bf ON f.fnid = bf.fnid
-                JOIN m_v_main v ON bf.vid = v.vid
-                WHERE v.vname = %s AND f.fname LIKE '%/%'
-                ORDER BY dir_prefix ASC;
-                """,
-                (version_name,),
-            )
-            sub_dirs = [safe_decode(r[0]) for r in cursor.fetchall()]
 
             cursor.close()
             cnx.close()
@@ -327,7 +329,24 @@ def browse_path(version_name: str, path: str = "") -> dict[str, Any]:
         # If not a file or if ftype == 0 (Directory instance)
         if file_row is None or file_row[7] == 0:
             prefix = f"{norm_path}/"
-            # Query immediate child files under this directory
+            prefix_len = len(prefix) + 1
+
+            # Query immediate child subdirectories
+            cursor.execute(
+                """
+                SELECT DISTINCT SUBSTRING_INDEX(SUBSTRING(f.fname, %s), '/', 1) AS subdir
+                FROM m_file_name f
+                JOIN m_bridge_file bf ON f.fnid = bf.fnid
+                JOIN m_v_main v ON bf.vid = v.vid
+                WHERE v.vname = %s AND f.fname LIKE %s AND f.fname LIKE %s
+                ORDER BY subdir ASC;
+                """,
+                (prefix_len, version_name, f"{prefix}%", f"{prefix}%/%"),
+            )
+            sub_dirs = [f"{norm_path}/{safe_decode(r[0])}" for r in cursor.fetchall() if r[0] is not None]
+            sub_dir_set = set(sub_dirs)
+
+            # Query immediate child files under this directory (excluding sub_dirs)
             cursor.execute(
                 """
                 SELECT f.fname, fi.fid, fi.ftype, fi.s_stat, fi.e_stat
@@ -349,22 +368,8 @@ def browse_path(version_name: str, path: str = "") -> dict[str, Any]:
                     "e_stat": safe_decode(r[4]),
                 }
                 for r in cursor.fetchall()
+                if safe_decode(r[0]) not in sub_dir_set
             ]
-
-            # Query immediate child subdirectories
-            prefix_len = len(prefix) + 1
-            cursor.execute(
-                """
-                SELECT DISTINCT SUBSTRING_INDEX(SUBSTRING(f.fname, %s), '/', 1) AS subdir
-                FROM m_file_name f
-                JOIN m_bridge_file bf ON f.fnid = bf.fnid
-                JOIN m_v_main v ON bf.vid = v.vid
-                WHERE v.vname = %s AND f.fname LIKE %s AND f.fname LIKE %s
-                ORDER BY subdir ASC;
-                """,
-                (prefix_len, version_name, f"{prefix}%", f"{prefix}%/%"),
-            )
-            sub_dirs = [f"{norm_path}/{safe_decode(r[0])}" for r in cursor.fetchall()]
 
             cursor.close()
             cnx.close()

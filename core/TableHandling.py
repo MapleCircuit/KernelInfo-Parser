@@ -130,11 +130,15 @@ from core.Profiler import PipelineProfiler
 logger = logging.getLogger(__name__)
 
 
+_REF_BYPASS_LINKS = (REF_POS, REF_MULTI)
+_REF_RESET_LINKS = (REF_ROOT, REF_C_AST, REF_NO_REF)
+
+
 def is_data_unsafe(data: tuple) -> bool:
-    """Check if a row data tuple contains unresolved reference tuples (OP_REF).
+    """Check if a data tuple contains any unresolved references (RefType).
 
     Args:
-        data: Tuple of row column values.
+        data: Tuple of column values.
 
     Returns:
         True if any element in `data` is a tuple (indicating an unresolved reference
@@ -162,12 +166,15 @@ def to_safe_data(val: Any) -> SafeDataType:
     t = type(val)
     if t is int or t is str or val is None:
         return val
-    if isinstance(val, Enum):
-        return int(val.value) if isinstance(val.value, int) else str(val.value)
     if t is bool:
         return int(val)
-    if hasattr(val, "value") and isinstance(val.value, (int, str)):
-        return int(val.value) if isinstance(val.value, int) else str(val.value)
+    if isinstance(val, Enum):
+        v = val.value
+        return int(v) if type(v) is int else str(v)
+    if hasattr(val, "value"):
+        v = val.value
+        if isinstance(v, (int, str)):
+            return int(v) if type(v) is int else str(v)
     return val
 
 
@@ -180,7 +187,11 @@ def normalize_data_tuple(data: tuple) -> tuple[UnSafeDataType, ...]:
     Returns:
         Tuple with all primitive/enum values sanitized to pure `int`, `str`, or `None`.
     """
-    return tuple(col if type(col) is tuple else to_safe_data(col) for col in data)
+    for col in data:
+        t = type(col)
+        if not (t is int or t is str or t is tuple or col is None):
+            return tuple(col if type(col) is tuple else to_safe_data(col) for col in data)
+    return data
 
 
 class ChangeSet:
@@ -334,15 +345,15 @@ class ChangeSet:
 
         return self._get_value_at(query, self._get_pos_from_route(parsed_route, query[0]))
 
-    @G.type_check(Self, {UnSafeDataType})
-    def _resolve_ref_from_tuple(self, *data: UnSafeDataType) -> tuple[SafeDataType, ...]:
+    @G.type_check(Self, tuple)
+    def _resolve_ref_from_tuple(self, data: tuple) -> tuple[SafeDataType, ...]:
         """Resolve all reference tuples in a data tuple into safe primitive values.
 
         Evaluates each element in `data`. If an element is a reference tuple `(query, OP_REF, route)`,
         calls `resolve_ref(query, route)`. All resolved values are de-subclassed to native primitives.
 
         Args:
-            *data: Column values, which may include unresolved reference tuples.
+            data: Column values tuple, which may include unresolved reference tuples.
 
         Returns:
             Tuple of resolved primitive values (`tuple[SafeDataType, ...]`).
@@ -350,8 +361,11 @@ class ChangeSet:
         Raises:
             REF_NOT_RESOLVABLE: If any reference tuple cannot be resolved.
         """
-        if not is_data_unsafe(data):
-            return tuple(to_safe_data(val) for val in data)
+        for col in data:
+            if type(col) is tuple:
+                break
+        else:
+            return data
 
         output_data = []
         for val in data:
@@ -406,7 +420,7 @@ class ChangeSet:
                     operation = unpacked
                     op_type = operation[1]
 
-                data = self._resolve_ref_from_tuple(*operation[2])
+                data = self._resolve_ref_from_tuple(operation[2])
 
                 if op_type in {OP_DONE, OP_VIEW_DONE}:
                     self.cs_result.append(data)
@@ -486,6 +500,8 @@ class ChangeSet:
             return
 
         parsed_route = tuple(self.route_parse(self.route + list(route)))
+        target = operation[0]
+        first_tid = target if type(target) is int else target[0][0][0]
 
         if parsed_route[0] == REF_MULTI:
             if G.DEBUG_TYPECHECK:
@@ -498,13 +514,13 @@ class ChangeSet:
             if self.store_dict.get(parsed_route) is None:
                 self.store_dict[parsed_route] = {}
             elif G.DEBUG_TYPECHECK:
-                if (current_val := self.store_dict[parsed_route].get(PointerGetter(operation[0]).get_first_table_id())) is not None:
+                if (current_val := self.store_dict[parsed_route].get(first_tid)) is not None:
                     assert self.cs[current_val] == operation, (
                         f"Not only did you push 2 times to the same route, but you didn't push the same value!!!\n"
                         f"-current_val:{self.cs[current_val]}\n-operation:{operation}"
                     )
 
-            self.store_dict[parsed_route][PointerGetter(operation[0]).get_first_table_id()] = len(self.cs)
+            self.store_dict[parsed_route][first_tid] = len(self.cs)
 
         self.cs.append(operation)
 
@@ -538,15 +554,15 @@ class ChangeSet:
             if link == REF_FILE:
                 has_ref_file = False
                 data_bypass = True
-                parsed_route = []
+                parsed_route.clear()
                 continue
 
-            if link in {REF_POS, REF_MULTI}:
+            if link in _REF_BYPASS_LINKS:
                 data_bypass = True
-                parsed_route = []
+                parsed_route.clear()
 
-            if link in {REF_ROOT, REF_C_AST, REF_NO_REF}:
-                parsed_route = []
+            if link in _REF_RESET_LINKS:
+                parsed_route.clear()
 
             parsed_route.append(link)
 
@@ -611,11 +627,11 @@ class ChangeSet:
             data = operation[2]
 
         if G.DEBUG_TYPECHECK:
-            tableid = operation[0]
+            target = operation[0]
+            tableid = target if type(target) is int else target[0][0][0]
             data_size = len(data)
 
             if operation[1] in {OP_VIEW_DONE, OP_VIEW_SET, OP_REF_VIEW}:
-                tableid = PointerGetter(operation[0]).get_first_table_id()
                 if operation[1] == OP_REF_VIEW:
                     data_size -= 1
 
@@ -648,11 +664,11 @@ class ChangeSet:
                 data = operation[2]
 
             if G.DEBUG_TYPECHECK:
-                tableid = operation[0]
+                target = operation[0]
+                tableid = target if type(target) is int else target[0][0][0]
                 data_size = len(data)
 
                 if operation[1] in {OP_VIEW_DONE, OP_VIEW_SET, OP_REF_VIEW}:
-                    tableid = PointerGetter(operation[0]).get_first_table_id()
                     if operation[1] == OP_REF_VIEW:
                         data_size -= 1
 

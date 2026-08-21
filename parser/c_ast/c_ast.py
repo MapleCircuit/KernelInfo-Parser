@@ -308,8 +308,18 @@ CXSourceRangeList_P = ctypes.POINTER(CXSourceRangeList)
 ) = range(2)
 
 _CLANG_GET_EXTENT = cc.conf.lib.clang_getTokenExtent
+_CLANG_GET_CURSOR_EXTENT = cc.conf.lib.clang_getCursorExtent
+_CLANG_GET_CURSOR_EXTENT.argtypes = [cc.Cursor]
+_CLANG_GET_CURSOR_EXTENT.restype = cc.SourceRange
+
 _CLANG_GET_RANGE_START = cc.conf.lib.clang_getRangeStart
+_CLANG_GET_RANGE_START.argtypes = [cc.SourceRange]
+_CLANG_GET_RANGE_START.restype = cc.SourceLocation
+
 _CLANG_GET_RANGE_END = cc.conf.lib.clang_getRangeEnd
+_CLANG_GET_RANGE_END.argtypes = [cc.SourceRange]
+_CLANG_GET_RANGE_END.restype = cc.SourceLocation
+
 _CLANG_GET_SPELLING_LOC = cc.conf.lib.clang_getSpellingLocation
 
 _CTYPES_F_PTR = cc.c_object_p()
@@ -322,10 +332,41 @@ _CTYPES_E_OFF = cc.c_uint()
 _CTYPES_BYREF = ctypes.byref
 
 
+_CLANG_GET_TOKEN_KIND = cc.conf.lib.clang_getTokenKind
+_CLANG_GET_TOKEN_KIND.argtypes = [cc.Token]
+_CLANG_GET_TOKEN_KIND.restype = ctypes.c_uint
+
+_CLANG_TOKEN_KIND_MAP = (
+    AST_KIND.punctuation,
+    AST_KIND.keyword,
+    AST_KIND.identifier,
+    AST_KIND.literal,
+    AST_KIND.comment,
+)
+
+
+def get_cursor_line(cursor) -> Line:
+    """Fast-path ctypes Line extraction from Clang Cursor with caching."""
+    cl = getattr(cursor, "_cached_line", None)
+    if cl is not None:
+        return cl
+    ext = _CLANG_GET_CURSOR_EXTENT(cursor)
+    st = _CLANG_GET_RANGE_START(ext)
+    en = _CLANG_GET_RANGE_END(ext)
+    _CLANG_GET_SPELLING_LOC(st, _CTYPES_BYREF(_CTYPES_F_PTR), _CTYPES_BYREF(_CTYPES_S_LINE), _CTYPES_BYREF(_CTYPES_S_COL), _CTYPES_BYREF(_CTYPES_S_OFF))
+    _CLANG_GET_SPELLING_LOC(en, _CTYPES_BYREF(_CTYPES_F_PTR), _CTYPES_BYREF(_CTYPES_E_LINE), _CTYPES_BYREF(_CTYPES_E_COL), _CTYPES_BYREF(_CTYPES_E_OFF))
+    cl = Line.__new__(Line)
+    cl.code = ""
+    cl.line_pos = (_CTYPES_S_LINE.value, _CTYPES_E_LINE.value)
+    cl.char_pos = (_CTYPES_S_COL.value, _CTYPES_E_COL.value)
+    cursor._cached_line = cl
+    return cl
+
+
 class TokenList:
     """Binding for clang_tokenize and clang_annotateTokens."""
 
-    def __init__(self, parsed_tu, fullfilename):
+    def __init__(self, parsed_tu, fullfilename, rawfile: tuple[str] | None = None):
 
         parsed_file = cc.File.from_name(parsed_tu, fullfilename)
 
@@ -371,17 +412,26 @@ class TokenList:
             _CLANG_GET_SPELLING_LOC(st, _CTYPES_BYREF(_CTYPES_F_PTR), _CTYPES_BYREF(_CTYPES_S_LINE), _CTYPES_BYREF(_CTYPES_S_COL), _CTYPES_BYREF(_CTYPES_S_OFF))
             _CLANG_GET_SPELLING_LOC(en, _CTYPES_BYREF(_CTYPES_F_PTR), _CTYPES_BYREF(_CTYPES_E_LINE), _CTYPES_BYREF(_CTYPES_E_COL), _CTYPES_BYREF(_CTYPES_E_OFF))
 
+            s_line = _CTYPES_S_LINE.value
+            e_line = _CTYPES_E_LINE.value
+            s_col = _CTYPES_S_COL.value
+            e_col = _CTYPES_E_COL.value
+
             l = Line.__new__(Line)
             l.code = ""
-            l.line_pos = (_CTYPES_S_LINE.value, _CTYPES_E_LINE.value)
-            l.char_pos = (_CTYPES_S_COL.value, _CTYPES_E_COL.value)
+            l.line_pos = (s_line, e_line)
+            l.char_pos = (s_col, e_col)
             token.line = l
 
-            try:
-                token.spelling_str = token.spelling
-            except Exception:
-                token.spelling_str = ""
+            if s_line == e_line and rawfile and s_line <= len(rawfile):
+                token.spelling_str = rawfile[s_line - 1][s_col - 1 : e_col - 1]
+            else:
+                try:
+                    token.spelling_str = token.spelling
+                except Exception:
+                    token.spelling_str = ""
 
+            token.ast_kind = _CLANG_TOKEN_KIND_MAP[_CLANG_GET_TOKEN_KIND(token)]
             self.tokens_array.append(token)
 
         self.token_group = cc.TokenGroup(parsed_tu, tokens_memory, tokens_count)
@@ -400,21 +450,7 @@ class TokenList:
 
         check_exec = self.main_zone.check_exec
         for token, cursor in zip(self.tokens_array, self.cursors_array):
-            match token.kind:
-                case cc.TokenKind.COMMENT:
-                    check_exec(token, cursor, AST_KIND.comment)
-
-                case cc.TokenKind.KEYWORD:
-                    check_exec(token, cursor, AST_KIND.keyword)
-
-                case cc.TokenKind.IDENTIFIER:
-                    check_exec(token, cursor, AST_KIND.identifier)
-
-                case cc.TokenKind.PUNCTUATION:
-                    check_exec(token, cursor, AST_KIND.punctuation)
-
-                case cc.TokenKind.LITERAL:
-                    check_exec(token, cursor, AST_KIND.literal)
+            check_exec(token, cursor, token.ast_kind)
 
         self.main_zone.gen_lined_dict()
         self.main_zone.resolve_cppro_scopes()
@@ -486,7 +522,7 @@ class Ast_Manager:
             self.fullfilename,
             args=[
                 "-ferror-limit=0",
-                "-Wall",
+                "-w",
                 "-D__KERNEL__",
                 *cppro_cindex_input,  # "-nostdinc",
                 f"-I{self.mfdir}/{'/'.join(self.filename.split('/')[:-1])}",
@@ -501,7 +537,7 @@ class Ast_Manager:
             prof.clang_parse_tu_s = time.perf_counter() - t_parse_0
             t_tok_0 = time.perf_counter()
 
-        TL = TokenList(translation_unit, self.fullfilename)
+        TL = TokenList(translation_unit, self.fullfilename, self.rawfile)
 
         if prof is not None:
             prof.clang_tokenize_s = time.perf_counter() - t_tok_0

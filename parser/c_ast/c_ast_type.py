@@ -1,8 +1,10 @@
+from __future__ import annotations
 from collections import deque
 from core.globalstuff import G, COLOR, REF_POS, REF_ROOT, REF_OLD, REF_MULTI, REF_NO_REF, ASTT, IntEnum, Flag, auto, RefType, OP_REF, RouteType
 import clang.cindex as cc
 import logging
 import json
+import ctypes
 from typing import Self, Any
 import random
 
@@ -11,6 +13,50 @@ logger = logging.getLogger(__name__)
 # Linter bypass
 m_v_main = m_file_name = m_file = m_bridge_file = m_moved_file = m_type_descriptor = m_ast = m_ast_container = m_ast_include = m_ast_debug = m_tag = m_bridge_tag = m_map_ast = m_bridge_map = None
 ChangeSetType = None
+_DEF_TYPES = (ASTT.C_struct, ASTT.C_functionproto, ASTT.C_union, ASTT.C_enum)
+_PUNCT_IGNORED = (";", ",", ")", "}")
+_KEYWORD_IGNORED = ("if", "else", "return", "switch", "case", "default", "break", "continue", "for", "while", "do", "goto")
+
+_CLANG_GET_CURSOR_EXTENT = cc.conf.lib.clang_getCursorExtent
+_CLANG_GET_CURSOR_EXTENT.argtypes = [cc.Cursor]
+_CLANG_GET_CURSOR_EXTENT.restype = cc.SourceRange
+
+_CLANG_GET_RANGE_START = cc.conf.lib.clang_getRangeStart
+_CLANG_GET_RANGE_START.argtypes = [cc.SourceRange]
+_CLANG_GET_RANGE_START.restype = cc.SourceLocation
+
+_CLANG_GET_RANGE_END = cc.conf.lib.clang_getRangeEnd
+_CLANG_GET_RANGE_END.argtypes = [cc.SourceRange]
+_CLANG_GET_RANGE_END.restype = cc.SourceLocation
+
+_CLANG_GET_SPELLING_LOC = cc.conf.lib.clang_getSpellingLocation
+
+_CTYPES_F_PTR = cc.c_object_p()
+_CTYPES_S_LINE = cc.c_uint()
+_CTYPES_S_COL = cc.c_uint()
+_CTYPES_S_OFF = cc.c_uint()
+_CTYPES_E_LINE = cc.c_uint()
+_CTYPES_E_COL = cc.c_uint()
+_CTYPES_E_OFF = cc.c_uint()
+_CTYPES_BYREF = ctypes.byref
+
+
+def get_cursor_line(cursor) -> Line:
+    """Fast-path ctypes Line extraction from Clang Cursor with caching."""
+    cl = getattr(cursor, "_cached_line", None)
+    if cl is not None:
+        return cl
+    ext = _CLANG_GET_CURSOR_EXTENT(cursor)
+    st = _CLANG_GET_RANGE_START(ext)
+    en = _CLANG_GET_RANGE_END(ext)
+    _CLANG_GET_SPELLING_LOC(st, _CTYPES_BYREF(_CTYPES_F_PTR), _CTYPES_BYREF(_CTYPES_S_LINE), _CTYPES_BYREF(_CTYPES_S_COL), _CTYPES_BYREF(_CTYPES_S_OFF))
+    _CLANG_GET_SPELLING_LOC(en, _CTYPES_BYREF(_CTYPES_F_PTR), _CTYPES_BYREF(_CTYPES_E_LINE), _CTYPES_BYREF(_CTYPES_E_COL), _CTYPES_BYREF(_CTYPES_E_OFF))
+    cl = Line.__new__(Line)
+    cl.code = ""
+    cl.line_pos = (_CTYPES_S_LINE.value, _CTYPES_E_LINE.value)
+    cl.char_pos = (_CTYPES_S_COL.value, _CTYPES_E_COL.value)
+    cursor._cached_line = cl
+    return cl
 
 def serializer(obj: object):
     """For ast_debug."""
@@ -67,20 +113,18 @@ def good_looking_printing(object_name: object, pre_result: str="", post_result: 
 
 
 # This applies to c_ast and c_ast_type only
-# =========================================
-# The 
-
-
-
-
-
-
-
-
-
-
-
-
+# ==========================================================
+# The goal of the C_AST parser is to parse C code.
+# We achieve this by creating an intermediary tree structure
+# made of Zones and Asts. 
+# This allows us to standardize (and simplify) our handling of C.
+# TLDR: We don't have to care about libclang when adding to CS.
+#
+# ==========================================================
+# OVERVIEW
+# C_AST works in 2 main stages:
+# 1. The parsing through libclang which creates the Zone/Ast Tree.
+# 2. The "extract" / push of changes to CS (ChangeSet)
 
 
 class Line:
@@ -88,37 +132,22 @@ class Line:
 
     __slots__ = ("line_pos", "char_pos", "code")
 
-    def __init__(self, *args: int | object) -> None:
-        """Init the line pos and optionaly the col pos, accept cc.SourceRange."""
+    def __init__(self, arg0: int | Line | cc.SourceRange | Any = 0, arg1: int = 0, arg2: int = 0, arg3: int = 0) -> None:
+        """Init the line pos and optionally the col pos, accept cc.SourceRange."""
         self.code = ""
-        l = len(args)
-        if l == 0:
-            self.line_pos = (0, 0)
-            self.char_pos = (0, 0)
-        elif l == 1:
-            arg = args[0]
-            if type(arg) is Line:
-                self.line_pos = arg.line_pos
-                self.char_pos = arg.char_pos
-            elif hasattr(arg, 'line') and type(arg.line) is Line:
-                self.line_pos = arg.line.line_pos
-                self.char_pos = arg.line.char_pos
-            elif isinstance(arg, Line):
-                self.line_pos = arg.line_pos
-                self.char_pos = arg.char_pos
-            elif isinstance(arg, cc.SourceRange):
-                self.line_pos = (arg.start.line, arg.end.line)
-                self.char_pos = (arg.start.column, arg.end.column)
-            else:
-                logger.error("Line: 1 ARGS TYPE ERROR")
-                self.line_pos = (0, 0)
-                self.char_pos = (0, 0)
-        elif l == 2:
-            self.line_pos = (args[0], args[1])
-            self.char_pos = (0, 0)
-        elif l == 4:
-            self.line_pos = (args[0], args[1])
-            self.char_pos = (args[2], args[3])
+        t = type(arg0)
+        if t is int:
+            self.line_pos = (arg0, arg1)
+            self.char_pos = (arg2, arg3)
+        elif t is Line or isinstance(arg0, Line):
+            self.line_pos = arg0.line_pos
+            self.char_pos = arg0.char_pos
+        elif isinstance(arg0, cc.SourceRange):
+            self.line_pos = (arg0.start.line, arg0.end.line)
+            self.char_pos = (arg0.start.column, arg0.end.column)
+        elif hasattr(arg0, 'line') and isinstance(arg0.line, Line):
+            self.line_pos = arg0.line.line_pos
+            self.char_pos = arg0.line.char_pos
         else:
             self.line_pos = (0, 0)
             self.char_pos = (0, 0)
@@ -399,13 +428,11 @@ class Ast:
         with CS(REF_POS):
             # Create tag
             CS.store(m_tag.set(*current_tag))
-            tag_route = CS.get_route_parse()
-
-        tag_ref = CS.ref(m_tag.tag_id, *tag_route)
+            tag_ref = ((m_tag.table_id, 0), OP_REF, (REF_POS, CS.route[-1]))
 
         # Create bridge tag
         CS.store(m_bridge_tag.set(
-            CS.ref(m_file.fid, REF_ROOT),
+            ((m_file.table_id, 0), OP_REF, (REF_ROOT,)),
             tag_ref,
             self.extent.line_pos[0],
             self.extent.line_pos[1],
@@ -492,36 +519,38 @@ class Ast:
         """Check if token is within Type/CPPro. Called from Zone"""
         if not self.need_processing:
             return False
+        tline = token.line
+        tspelling = token.spelling_str
         match self.end_mode:
             case End_Mode.No_Check:
-                self.extent.grow(Line(token.extent))
+                self.extent.grow(tline)
                 return True
             case End_Mode.Auto:
                 if ast_kind != AST_KIND.punctuation:
-                    self.extent.grow(Line(token.extent))
+                    self.extent.grow(tline)
                     return True
-                if token.spelling_str == ";":
+                if tspelling == ";":
                     self.need_processing = False
                     return False
             case End_Mode.Semicolon:
                 if ast_kind != AST_KIND.punctuation:
-                    self.extent.grow(Line(token.extent))
+                    self.extent.grow(tline)
                     return True
-                if token.spelling_str == ";":
+                if tspelling == ";":
                     self.need_processing = False
                     return False
             case End_Mode.Comma:
                 if ast_kind != AST_KIND.punctuation:
-                    self.extent.grow(Line(token.extent))
+                    self.extent.grow(tline)
                     return True
-                if token.spelling_str == ",":
+                if tspelling == ",":
                     self.need_processing = False
                     return False
             case End_Mode.Extent:
-                if not self.extent.is_inside(token.extent):
+                if not self.extent.is_inside(tline):
                     self.need_processing = False
                     return False
-        self.extent.grow(Line(token.extent))
+        self.extent.grow(tline)
         return True
 
     def em_auto_check(self, cursor) -> None:
@@ -609,7 +638,7 @@ class Ast_MACRO_INSTANTIATION(Ast):
             if token.spelling_str == ",":
                 self.function_args.append(Line())
             else:
-                self.function_args[-1].new_end(token.extent)
+                self.function_args[-1].new_end(token.line)
         elif token.spelling_str == "(":
             self.function_args.append(Line())
             self.is_function = True
@@ -618,19 +647,19 @@ class Ast_MACRO_INSTANTIATION(Ast):
 
     def exec_keyword(self, token, cursor):
         if self.is_function:
-            self.function_args[-1].new_end(token.extent)
+            self.function_args[-1].new_end(token.line)
 
         return
 
     def exec_identifier(self, token, cursor):
         if self.is_function:
-            self.function_args[-1].new_end(token.extent)
+            self.function_args[-1].new_end(token.line)
 
         return
 
     def exec_literal(self, token, cursor):
         if self.is_function:
-            self.function_args[-1].new_end(token.extent)
+            self.function_args[-1].new_end(token.line)
 
         return
 
@@ -685,41 +714,42 @@ class CPPro(Ast):
 
     def exec_identifier(self, token, cursor) -> None:
         tspelling = token.spelling_str
+        cline = get_cursor_line(cursor)
         match tspelling:
             case 'if':
-                self.ccpro_start_flip(CPPro_if, Line(cursor.extent))
+                self.ccpro_start_flip(CPPro_if, cline)
             case 'elif':
-                self.ccpro_start_flip(CPPro_elif, Line(cursor.extent))
+                self.ccpro_start_flip(CPPro_elif, cline)
             case 'else':
-                self.ccpro_start_flip(CPPro_else, Line(cursor.extent))
+                self.ccpro_start_flip(CPPro_else, cline)
             case 'endif':
-                self.ccpro_start_flip(CPPro_endif, Line(cursor.extent))
+                self.ccpro_start_flip(CPPro_endif, cline)
             case 'ifdef':
-                self.ccpro_start_flip(CPPro_ifdef, Line(cursor.extent))
+                self.ccpro_start_flip(CPPro_ifdef, cline)
             case 'ifndef':
-                self.ccpro_start_flip(CPPro_ifndef, Line(cursor.extent))
+                self.ccpro_start_flip(CPPro_ifndef, cline)
             case 'elifdef':
-                self.ccpro_start_flip(CPPro_elifdef, Line(cursor.extent))
+                self.ccpro_start_flip(CPPro_elifdef, cline)
             case 'elifndef':
-                self.ccpro_start_flip(CPPro_elifndef, Line(cursor.extent))
+                self.ccpro_start_flip(CPPro_elifndef, cline)
             case 'define':
-                self.ccpro_start_flip(CPPro_define, Line(cursor.extent))
+                self.ccpro_start_flip(CPPro_define, cline)
             case 'undef':
-                self.ccpro_start_flip(CPPro_undef, Line(cursor.extent))
+                self.ccpro_start_flip(CPPro_undef, cline)
             case 'include':
-                self.ccpro_start_flip(CPPro_include, Line(cursor.extent if cursor.kind == cc.CursorKind.INCLUSION_DIRECTIVE else token.line))
+                self.ccpro_start_flip(CPPro_include, cline if cursor.kind == cc.CursorKind.INCLUSION_DIRECTIVE else token.line)
                 self.exec_identifier(token, cursor)
             case 'embed':
                 logger.warn(f"#embed detected {cursor.extent}, NOT IMPLEMENTED!!")
                 return
             case 'line':
-                self.ccpro_start_flip(CPPro_line, Line(cursor.extent))
+                self.ccpro_start_flip(CPPro_line, cline)
             case 'error':
-                self.ccpro_start_flip(CPPro_error, Line(cursor.extent))
+                self.ccpro_start_flip(CPPro_error, cline)
             case 'warning' | 'warn':
-                self.ccpro_start_flip(CPPro_warning, Line(cursor.extent))
+                self.ccpro_start_flip(CPPro_warning, cline)
             case 'pragma':
-                self.ccpro_start_flip(CPPro_pragma, Line(cursor.extent))
+                self.ccpro_start_flip(CPPro_pragma, cline)
 
             case _:
                 logger.warn(f"CPPro>>Spelling:{tspelling},Kind:{cursor.kind} => Not implemented")
@@ -758,27 +788,27 @@ class CPPro_if(Ast):
         return
 
     def exec_punctuation(self, token, cursor) -> None:
-        self.extent.grow(Line(token.extent))
+        self.extent.grow(token.line)
         self.expression += token.spelling_str
-        self.highlight.new_end(token.extent)
+        self.highlight.new_end(token.line)
         return
 
     def exec_keyword(self, token, cursor) -> None:
-        self.extent.grow(Line(token.extent))
+        self.extent.grow(token.line)
         self.expression += token.spelling_str
-        self.highlight.new_end(token.extent)
+        self.highlight.new_end(token.line)
         return
 
     def exec_identifier(self, token, cursor) -> None:
-        self.extent.grow(Line(token.extent))
+        self.extent.grow(token.line)
         self.expression += token.spelling_str
-        self.highlight.new_end(token.extent)
+        self.highlight.new_end(token.line)
         return
 
     def exec_literal(self, token, cursor) -> None:
-        self.extent.grow(Line(token.extent))
+        self.extent.grow(token.line)
         self.expression += token.spelling_str
-        self.highlight.new_end(token.extent)
+        self.highlight.new_end(token.line)
         return
 
     def extract(self, CS: ChangeSetType) -> None:
@@ -894,7 +924,7 @@ class CPPro_define(Ast):
         return
 
     def exec_punctuation(self, token, cursor) -> None:
-        self.extent.grow(Line(token.extent))
+        self.extent.grow(token.line)
         spelling = token.spelling_str
         if self.func_enabled:
             if spelling == ")":
@@ -912,15 +942,15 @@ class CPPro_define(Ast):
             return
 
         self.replacement += spelling
-        self.highlight_replacement.new_end(token.extent)
+        self.highlight_replacement.new_end(token.line)
         return
 
     def exec_keyword(self, token, cursor) -> None:
-        self.extent.grow(Line(token.extent))
+        self.extent.grow(token.line)
         spelling = token.spelling_str
         if self.identifier == "":
             self.identifier += spelling
-            self.highlight.new_end(token.extent)
+            self.highlight.new_end(token.line)
             return
 
         if self.func_enabled:
@@ -928,15 +958,15 @@ class CPPro_define(Ast):
             return
 
         self.replacement += spelling
-        self.highlight_replacement.new_end(token.extent)
+        self.highlight_replacement.new_end(token.line)
         return
 
     def exec_identifier(self, token, cursor) -> None:
-        self.extent.grow(Line(token.extent))
+        self.extent.grow(token.line)
         spelling = token.spelling_str
         if self.identifier == "":
             self.identifier += spelling
-            self.highlight.new_end(token.extent)
+            self.highlight.new_end(token.line)
             return
 
         if self.func_enabled:
@@ -944,18 +974,18 @@ class CPPro_define(Ast):
             return
 
         self.replacement += spelling
-        self.highlight_replacement.new_end(token.extent)
+        self.highlight_replacement.new_end(token.line)
         return
 
     def exec_literal(self, token, cursor) -> None:
-        self.extent.grow(Line(token.extent))
+        self.extent.grow(token.line)
         spelling = token.spelling_str
         if self.func_enabled:
             self.func_args[-1] += spelling
             return
 
         self.replacement += spelling
-        self.highlight_replacement.new_end(token.extent)
+        self.highlight_replacement.new_end(token.line)
         return
 
     def extract(self, CS: ChangeSetType) -> None:
@@ -995,27 +1025,27 @@ class CPPro_undef(Ast):
         return
 
     def exec_punctuation(self, token, cursor) -> None:
-        self.extent.grow(Line(token.extent))
+        self.extent.grow(token.line)
         self.identifier += token.spelling_str
-        self.highlight.new_end(token.extent)
+        self.highlight.new_end(token.line)
         return
 
     def exec_keyword(self, token, cursor) -> None:
-        self.extent.grow(Line(token.extent))
+        self.extent.grow(token.line)
         self.identifier += token.spelling_str
-        self.highlight.new_end(token.extent)
+        self.highlight.new_end(token.line)
         return
 
     def exec_identifier(self, token, cursor) -> None:
-        self.extent.grow(Line(token.extent))
+        self.extent.grow(token.line)
         self.identifier += token.spelling_str
-        self.highlight.new_end(token.extent)
+        self.highlight.new_end(token.line)
         return
 
     def exec_literal(self, token, cursor) -> None:
-        self.extent.grow(Line(token.extent))
+        self.extent.grow(token.line)
         self.identifier += token.spelling_str
-        self.highlight.new_end(token.extent)
+        self.highlight.new_end(token.line)
         return
 
     def extract(self, CS: ChangeSetType) -> None:
@@ -1050,15 +1080,15 @@ class CPPro_include(Ast):
         return
 
     def exec_punctuation(self, token, cursor) -> None:
-        self.extent.grow(Line(token.extent))
+        self.extent.grow(token.line)
         self.w_include += token.spelling_str
         if self.debug:
             self.a_include = self.w_include
-        self.highlight.new_end(token.extent)
+        self.highlight.new_end(token.line)
         return
 
     def exec_keyword(self, token, cursor) -> None:
-        self.extent.grow(Line(token.extent))
+        self.extent.grow(token.line)
         spelling = token.spelling_str
         if self.a_include is None and spelling == "include":
             try:
@@ -1074,11 +1104,11 @@ class CPPro_include(Ast):
         self.w_include += spelling
         if self.debug:
             self.a_include = self.w_include
-        self.highlight.new_end(token.extent)
+        self.highlight.new_end(token.line)
         return
 
     def exec_identifier(self, token, cursor) -> None:
-        self.extent.grow(Line(token.extent))
+        self.extent.grow(token.line)
         spelling = token.spelling_str
         if self.a_include is None and spelling == "include":
             try:
@@ -1094,15 +1124,15 @@ class CPPro_include(Ast):
         self.w_include += spelling
         if self.debug:
             self.a_include = self.w_include
-        self.highlight.new_end(token.extent)
+        self.highlight.new_end(token.line)
         return
 
     def exec_literal(self, token, cursor) -> None:
-        self.extent.grow(Line(token.extent))
+        self.extent.grow(token.line)
         self.w_include += token.spelling_str
         if self.debug:
             self.a_include = self.w_include
-        self.highlight.new_end(token.extent)
+        self.highlight.new_end(token.line)
         return
 
 
@@ -1166,7 +1196,7 @@ class CPPro_line(Ast):
     def within_range(self, token, ast_kind) -> bool:
         if not self.need_processing:
             return False
-        tline = getattr(token, 'line', None) or Line(token.extent)
+        tline = token.line
         if tline.line_pos[0] <= self.extent.line_pos[1]:
             self.extent.grow(tline)
             return True
@@ -1177,51 +1207,51 @@ class CPPro_line(Ast):
         return
 
     def exec_punctuation(self, token, cursor) -> None:
-        self.extent.grow(Line(token.extent))
+        self.extent.grow(token.line)
         spelling = token.spelling_str
         if self.lineno == "":
             self.lineno = spelling
-            self.hl_lineno = Line(token.extent)
+            self.hl_lineno = Line(token.line)
             return
 
         self.filename = spelling
-        self.hl_filename = Line(token.extent)
+        self.hl_filename = Line(token.line)
         return
 
     def exec_keyword(self, token, cursor) -> None:
-        self.extent.grow(Line(token.extent))
+        self.extent.grow(token.line)
         spelling = token.spelling_str
         if self.lineno == "":
             self.lineno = spelling
-            self.hl_lineno = Line(token.extent)
+            self.hl_lineno = Line(token.line)
             return
 
         self.filename = spelling
-        self.hl_filename = Line(token.extent)
+        self.hl_filename = Line(token.line)
         return
 
     def exec_identifier(self, token, cursor) -> None:
-        self.extent.grow(Line(token.extent))
+        self.extent.grow(token.line)
         spelling = token.spelling_str
         if self.lineno == "":
             self.lineno = spelling
-            self.hl_lineno = Line(token.extent)
+            self.hl_lineno = Line(token.line)
             return
 
         self.filename = spelling
-        self.hl_filename = Line(token.extent)
+        self.hl_filename = Line(token.line)
         return
 
     def exec_literal(self, token, cursor) -> None:
-        self.extent.grow(Line(token.extent))
+        self.extent.grow(token.line)
         spelling = token.spelling_str
         if self.lineno == "":
             self.lineno = spelling
-            self.hl_lineno = Line(token.extent)
+            self.hl_lineno = Line(token.line)
             return
 
         self.filename = spelling
-        self.hl_filename = Line(token.extent)
+        self.hl_filename = Line(token.line)
         return
 
     def extract(self, CS: ChangeSetType) -> None:
@@ -1246,7 +1276,7 @@ class CPPro_error(Ast):
     def within_range(self, token, ast_kind) -> bool:
         if not self.need_processing:
             return False
-        tline = getattr(token, 'line', None) or Line(token.extent)
+        tline = token.line
         if tline.line_pos[0] <= self.extent.line_pos[1]:
             self.extent.grow(tline)
             return True
@@ -1257,27 +1287,27 @@ class CPPro_error(Ast):
         return
 
     def exec_punctuation(self, token, cursor) -> None:
-        self.extent.grow(Line(token.extent))
+        self.extent.grow(token.line)
         self.msg += token.spelling_str
-        self.hl_msg.new_end(token.extent)
+        self.hl_msg.new_end(token.line)
         return
 
     def exec_keyword(self, token, cursor) -> None:
-        self.extent.grow(Line(token.extent))
+        self.extent.grow(token.line)
         self.msg += token.spelling_str
-        self.hl_msg.new_end(token.extent)
+        self.hl_msg.new_end(token.line)
         return
 
     def exec_identifier(self, token, cursor) -> None:
-        self.extent.grow(Line(token.extent))
+        self.extent.grow(token.line)
         self.msg += token.spelling_str
-        self.hl_msg.new_end(token.extent)
+        self.hl_msg.new_end(token.line)
         return
 
     def exec_literal(self, token, cursor) -> None:
-        self.extent.grow(Line(token.extent))
+        self.extent.grow(token.line)
         self.msg += token.spelling_str
-        self.hl_msg.new_end(token.extent)
+        self.hl_msg.new_end(token.line)
         return
 
     def extract(self, CS: ChangeSetType) -> None:
@@ -1402,16 +1432,16 @@ class Not_Implemented(Ast):
             elif tspelling == "}":
                 self.brace_depth -= 1
                 if self.brace_depth <= 0:
-                    self.extent.grow(Line(token.extent))
+                    self.extent.grow(token.line)
                     self.need_processing = False
                     return True
 
-        if self.end_mode == End_Mode.Extent and not self.extent.is_inside(token.extent):
+        if self.end_mode == End_Mode.Extent and not self.extent.is_inside(token.line):
             if self.brace_depth <= 0:
                 self.need_processing = False
                 return False
 
-        self.extent.grow(Line(token.extent))
+        self.extent.grow(token.line)
         return True
 
     def exec_filter(self, token, cursor, ast_kind):
@@ -1442,7 +1472,7 @@ class AST_Enum_Equal(AST_Expression):
             return
         if ast_kind == AST_KIND.punctuation:
             if token.spelling_str == "}":
-                self.extent.new_end_reversed(Line(token.extent))
+                self.extent.new_end_reversed(token.line)
                 self.need_processing = False
                 return
         self.data.append(token.spelling_str)
@@ -1468,11 +1498,11 @@ class AST_Array(AST_Expression):
             elif spelling == "]":
                 self.bracket_depth -= 1
                 if self.bracket_depth <= 0:
-                    self.extent.new_end_reversed(Line(token.extent))
+                    self.extent.new_end_reversed(token.line)
                     self.need_processing = False
                     return True
 
-        self.extent.grow(Line(token.extent))
+        self.extent.grow(token.line)
         return True
 
     def exec_filter(self, token, cursor, ast_kind):
@@ -1545,7 +1575,7 @@ class TypeToken():
             self.extent = token.extent
             self.code = getattr(token, 'code', '') or getattr(token, 'spelling_str', '')
         else:
-            self.extent = getattr(token, 'line', None) or Line(token.extent)
+            self.extent = getattr(token, 'line', None) or Line(0, 0)
             self.code = getattr(token, 'spelling_str', '')
         self.type = asttype
         self.is_definition = False
@@ -1566,7 +1596,7 @@ class TypeToken():
             return
         self.foreign_name = safe_cursor_spelling(foreign_cursor)
         self.foreign_file = foreign_cursor.extent.start.file
-        self.foreign_extent = Line(foreign_cursor.extent)
+        self.foreign_extent = get_cursor_line(foreign_cursor)
         return
 
 
@@ -1698,6 +1728,9 @@ class Zone_Type(IntEnum):
     Initializer_Expr = 8
 
 
+_BRACE_ZONE_TYPES = (Zone_Type.Declared_Args, Zone_Type.Enum_Content, Zone_Type.Compound_Stmt)
+
+
 class Zone:
     """Represent spatial code scoping boundaries for parsing C code blocks in isolation.
     
@@ -1708,14 +1741,18 @@ class Zone:
     """
     def __init__(self, zone_type:int, cursors_array) -> None:
         self.zone_type = zone_type
-        self.extent = Line()
         self.preset_extents = deque()
         self.children = []
+        self.completed = False
+        self.extent = Line(0, 0)
         self.ast_type = C_Type
         self.end_mode = End_Mode.Auto
-        self.completed = False
+        self.A_Line_Dict = None
 
-        if cursors_array and zone_type != Zone_Type.Full_File:
+        if not cursors_array:
+            return
+
+        if zone_type != Zone_Type.Full_File:
             def _get_cur_file_name(c):
                 f = getattr(c, "_file_name", None)
                 if f is None:
@@ -1737,27 +1774,27 @@ class Zone:
 
         if zone_type == Zone_Type.Compound_Stmt:
             for cursor in cursors_array:
-                self.extent.grow(Line(cursor.extent))
+                self.extent.grow(get_cursor_line(cursor))
             self.children.append(Not_Implemented(self.extent))
 
         elif zone_type == Zone_Type.Enum_Equal:
             for cursor in cursors_array:
-                self.extent.grow(Line(cursor.extent))
+                self.extent.grow(get_cursor_line(cursor))
             self.children.append(AST_Enum_Equal(self.extent))
 
         elif zone_type == Zone_Type.Initializer_Expr:
             for cursor in cursors_array:
-                self.extent.grow(Line(cursor.extent))
+                self.extent.grow(get_cursor_line(cursor))
             self.children.append(AST_Initializer(self.extent))
 
         elif zone_type == Zone_Type.Array_Content:
             for cursor in cursors_array:
-                self.extent.grow(Line(cursor.extent))
+                self.extent.grow(get_cursor_line(cursor))
             self.children.append(AST_Array(self.extent))
 
         elif zone_type != Zone_Type.Full_File:
             for cursor in cursors_array:
-                temp_ext = Line(cursor.extent)
+                temp_ext = get_cursor_line(cursor)
                 self.extent.grow(temp_ext)
                 self.preset_extents.append(temp_ext)
 
@@ -1778,7 +1815,7 @@ class Zone:
             return True
 
         if ast_kind == AST_KIND.punctuation and tspelling == "}":
-            if self.zone_type in {Zone_Type.Declared_Args, Zone_Type.Enum_Content, Zone_Type.Compound_Stmt}:
+            if self.zone_type in _BRACE_ZONE_TYPES:
                 self.extent.grow(tline)
                 self.preset_extents.clear()
                 self.completed = True
@@ -1796,29 +1833,27 @@ class Zone:
                 return True
             if ast_kind == AST_KIND.punctuation:
                 if tspelling == "*":
-                    last_child.extent.grow(cursor.extent)
+                    last_child.extent.grow(get_cursor_line(cursor))
                     last_child.need_processing = True
                     last_child.exec_filter(token, cursor, ast_kind)
                     return True
 
         if ast_kind == AST_KIND.punctuation:
             # Commonly found between extents, Processing not needed.
-            if tspelling in {";", ",", ")", "}"}:
+            if tspelling in _PUNCT_IGNORED:
                 return True
             # While were in punctuation, lets handle CPPros
             if tspelling == "#":
                 kind = cursor.kind
                 if kind == cc.CursorKind.INCLUSION_DIRECTIVE: 
-                    self.children.append(CPPro_include(Line(cursor.extent)))
+                    self.children.append(CPPro_include(get_cursor_line(cursor)))
                     return True
                 else:
                     self.children.append(CPPro(tline))
                     return True
 
         # Guard against statement keywords outside type declarations
-        if ast_kind == AST_KIND.keyword and tspelling in {
-            "if", "else", "return", "switch", "case", "default", "break", "continue", "for", "while", "do", "goto"
-        }:
+        if ast_kind == AST_KIND.keyword and tspelling in _KEYWORD_IGNORED:
             return True
 
         # Check for valid preset_extents
@@ -1995,7 +2030,7 @@ class C_Type(Ast):
             for typesegment in final_type:
                 if typesegment.is_definition():
                     for item in typesegment.content:
-                        if item.is_definition and item.type in {ASTT.C_struct, ASTT.C_functionproto, ASTT.C_union, ASTT.C_enum}:
+                        if item.is_definition and item.type in _DEF_TYPES:
                             decl_type = get_decl_type(item.type)
                             if item.type == ASTT.C_functionproto:
                                 # Determine return type from preceding segments in final_type

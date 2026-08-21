@@ -1074,6 +1074,7 @@
       // Files
       if (data.files && data.files.length > 0) {
         data.files.forEach(f => {
+          if (f.ftype === 0) return;
           const fileName = f.fname.split("/").pop();
           const isCurrent = openTabs[activeTabIndex] && openTabs[activeTabIndex].path === f.fname;
           html += `
@@ -1211,12 +1212,14 @@
     }
 
     function renderDirectoryView(container, data) {
+      const validFiles = (data.files || []).filter(f => f.ftype !== 0);
+      const subDirs = data.sub_dirs || [];
       let html = `
         <div class="dir-container">
           <div class="dir-header">
             <div>
               <h2 style="color: var(--text-bright); font-size: 18px;">Directory: ${data.path || '/'}</h2>
-              <span style="font-size: 12px; color: var(--text-muted);">${(data.sub_dirs || []).length} directories, ${(data.files || []).length} files</span>
+              <span style="font-size: 12px; color: var(--text-muted);">${subDirs.length} directories, ${validFiles.length} files</span>
             </div>
             <span class="badge badge-accent">Version: ${data.version}</span>
           </div>
@@ -1234,8 +1237,8 @@
             <tbody>
       `;
 
-      if (data.sub_dirs) {
-        data.sub_dirs.forEach(sd => {
+      if (subDirs.length > 0) {
+        subDirs.forEach(sd => {
           const name = sd.split("/").pop();
           html += `
             <tr>
@@ -1249,8 +1252,8 @@
         });
       }
 
-      if (data.files) {
-        data.files.forEach(f => {
+      if (validFiles.length > 0) {
+        validFiles.forEach(f => {
           const name = f.fname.split("/").pop();
           const statusBadge = f.s_stat === 'A' ? '<span class="badge badge-success">Added</span>' : (f.s_stat === 'M' ? '<span class="badge badge-accent">Modified</span>' : '<span class="badge">Active</span>');
           html += `
