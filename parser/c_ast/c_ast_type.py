@@ -663,6 +663,14 @@ class CPPro(Ast):
         self.__init__(*args)
 
     def within_range(self, token, ast_kind) -> bool:
+        if not self.need_processing:
+            return False
+        tline = token.line
+        # If token is on a subsequent line before CPPro was flipped to a concrete directive,
+        # the lone '#' was a null preprocessor directive.
+        if tline.line_pos[0] > self.extent.line_pos[1]:
+            self.need_processing = False
+            return False
         return True
 
     def exec_comment(self, token, cursor) -> None:
@@ -698,6 +706,9 @@ class CPPro(Ast):
                 self.ccpro_start_flip(CPPro_define, Line(cursor.extent))
             case 'undef':
                 self.ccpro_start_flip(CPPro_undef, Line(cursor.extent))
+            case 'include':
+                self.ccpro_start_flip(CPPro_include, Line(cursor.extent if cursor.kind == cc.CursorKind.INCLUSION_DIRECTIVE else token.line))
+                self.exec_identifier(token, cursor)
             case 'embed':
                 logger.warn(f"#embed detected {cursor.extent}, NOT IMPLEMENTED!!")
                 return
@@ -705,13 +716,14 @@ class CPPro(Ast):
                 self.ccpro_start_flip(CPPro_line, Line(cursor.extent))
             case 'error':
                 self.ccpro_start_flip(CPPro_error, Line(cursor.extent))
-            case 'warning':
+            case 'warning' | 'warn':
                 self.ccpro_start_flip(CPPro_warning, Line(cursor.extent))
             case 'pragma':
                 self.ccpro_start_flip(CPPro_pragma, Line(cursor.extent))
 
             case _:
                 logger.warn(f"CPPro>>Spelling:{tspelling},Kind:{cursor.kind} => Not implemented")
+                self.need_processing = False
         return
 
 
@@ -735,7 +747,7 @@ class CPPro_if(Ast):
     def within_range(self, token, ast_kind) -> bool:
         if not self.need_processing:
             return False
-        tline = getattr(token, 'line', None) or Line(token.extent)
+        tline = token.line
         if tline.line_pos[0] <= self.extent.line_pos[1]:
             self.extent.grow(tline)
             return True
@@ -871,7 +883,7 @@ class CPPro_define(Ast):
     def within_range(self, token, ast_kind) -> bool:
         if not self.need_processing:
             return False
-        tline = getattr(token, 'line', None) or Line(token.extent)
+        tline = token.line
         if tline.line_pos[0] <= self.extent.line_pos[1]:
             self.extent.grow(tline)
             return True
@@ -972,7 +984,7 @@ class CPPro_undef(Ast):
     def within_range(self, token, ast_kind) -> bool:
         if not self.need_processing:
             return False
-        tline = getattr(token, 'line', None) or Line(token.extent)
+        tline = token.line
         if tline.line_pos[0] <= self.extent.line_pos[1]:
             self.extent.grow(tline)
             return True
@@ -1027,7 +1039,7 @@ class CPPro_include(Ast):
     def within_range(self, token, ast_kind) -> bool:
         if not self.need_processing:
             return False
-        tline = getattr(token, 'line', None) or Line(token.extent)
+        tline = token.line
         if tline.line_pos[0] <= self.extent.line_pos[1]:
             self.extent.grow(tline)
             return True
@@ -1504,11 +1516,11 @@ class AST_Initializer(AST_Expression):
                 self.bracket_depth = max(0, self.bracket_depth - 1)
             elif spelling in {";", ","}:
                 if self.brace_depth == 0 and self.paren_depth == 0 and self.bracket_depth == 0:
-                    self.extent.new_end_reversed(Line(token.extent))
+                    self.extent.new_end_reversed(token.line)
                     self.need_processing = False
                     return False
 
-        self.extent.grow(Line(token.extent))
+        self.extent.grow(token.line)
         return True
 
     def exec_filter(self, token, cursor, ast_kind):
@@ -1526,8 +1538,15 @@ class TypeToken():
     __slots__ = ("extent", "code", "type", "is_definition", "foreign_name", "foreign_file", "foreign_extent")
 
     def __init__(self, token, asttype: int = 0) -> None:
-        self.extent = getattr(token, 'line', None) or Line(token.extent)
-        self.code = getattr(token, 'spelling_str', '')
+        if hasattr(token, 'line'):
+            self.extent = token.line
+            self.code = getattr(token, 'spelling_str', '')
+        elif hasattr(token, 'extent'):
+            self.extent = token.extent
+            self.code = getattr(token, 'code', '') or getattr(token, 'spelling_str', '')
+        else:
+            self.extent = getattr(token, 'line', None) or Line(token.extent)
+            self.code = getattr(token, 'spelling_str', '')
         self.type = asttype
         self.is_definition = False
         self.foreign_name = None
@@ -1750,8 +1769,8 @@ class Zone:
         if self.completed:
             return False
 
-        tline = getattr(token, 'line', None) or Line(token.extent)
-        tspelling = getattr(token, 'spelling_str', '')
+        tline = token.line
+        tspelling = token.spelling_str
 
         # Capture comments into Ast_Comment AST nodes
         if ast_kind == AST_KIND.comment:
@@ -1771,14 +1790,15 @@ class Zone:
 
         # Fast path, the last children added
         if self.children:
-            if self.children[-1].within_range(token, ast_kind):
-                self.children[-1].exec_filter(token, cursor, ast_kind)
+            last_child = self.children[-1]
+            if last_child.within_range(token, ast_kind):
+                last_child.exec_filter(token, cursor, ast_kind)
                 return True
             if ast_kind == AST_KIND.punctuation:
                 if tspelling == "*":
-                    self.children[-1].extent.grow(cursor.extent)
-                    self.children[-1].need_processing = True
-                    self.children[-1].exec_filter(token, cursor, ast_kind)
+                    last_child.extent.grow(cursor.extent)
+                    last_child.need_processing = True
+                    last_child.exec_filter(token, cursor, ast_kind)
                     return True
 
         if ast_kind == AST_KIND.punctuation:
@@ -1900,12 +1920,12 @@ class C_Type(Ast):
         if not self.need_processing:
             return False
 
-        tline = getattr(token, 'line', None) or Line(token.extent)
-        tspelling = getattr(token, 'spelling_str', '')
+        tline = token.line
+        tspelling = token.spelling_str
 
         if self.zones:
             for zone in self.zones:
-                if getattr(zone, "completed", False):
+                if zone.completed:
                     continue
                 if zone.extent.is_inside(tline) or (zone.children and zone.children[-1].need_processing) or zone.preset_extents:
                     self.extent.grow(tline)
@@ -2183,7 +2203,7 @@ class C_Type(Ast):
 
     def keyword_parse(self, token, cursor) -> None:
         """Allow to parse all possible keywords within C Types."""
-        tspelling = getattr(token, 'spelling_str', '')
+        tspelling = token.spelling_str
         match tspelling:
             # Storage Class
             case "auto":
@@ -2311,7 +2331,7 @@ class C_Type(Ast):
         return
 
     def exec_punctuation(self, token, cursor):
-        tspelling = getattr(token, 'spelling_str', '')
+        tspelling = token.spelling_str
         for zone in self.zones:
             if zone.check_exec(token, cursor, AST_KIND.punctuation):
                 if tspelling == "}" and zone.zone_type == Zone_Type.Compound_Stmt:
@@ -2418,7 +2438,7 @@ class C_Type(Ast):
             if zone.check_exec(token, cursor, AST_KIND.identifier):
                 return
 
-        tspelling = getattr(token, 'spelling_str', '')
+        tspelling = token.spelling_str
         # Ignore predefined identifiers in expression contexts
         if tspelling in {"__func__", "__FUNCTION__", "__PRETTY_FUNCTION__"}:
             return
@@ -2437,7 +2457,7 @@ class C_Type(Ast):
                 self.swap_out()
                 return
 
-        if cursor.kind == cc.CursorKind.FUNCTION_DECL and tspelling == cursor.spelling:
+        if cursor.kind == cc.CursorKind.FUNCTION_DECL and tspelling == safe_cursor_spelling(cursor):
             self.name = tspelling
             tt = TypeToken(token, ASTT.C_functionproto)
             tt.is_definition = True

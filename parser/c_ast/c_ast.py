@@ -103,12 +103,9 @@ import time
 import clang.cindex as cc
 import ctypes
 import logging
+from core.globalstuff import configure_logging
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(levelname)s - %(message)s"
-)
-
+configure_logging(level=logging.INFO, fmt="%(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 _WORKER_CLANG_INDEX: cc.Index | None = None
 
@@ -310,6 +307,21 @@ CXSourceRangeList_P = ctypes.POINTER(CXSourceRangeList)
     Stack_CPP, Stack_CPP_Include
 ) = range(2)
 
+_CLANG_GET_EXTENT = cc.conf.lib.clang_getTokenExtent
+_CLANG_GET_RANGE_START = cc.conf.lib.clang_getRangeStart
+_CLANG_GET_RANGE_END = cc.conf.lib.clang_getRangeEnd
+_CLANG_GET_SPELLING_LOC = cc.conf.lib.clang_getSpellingLocation
+
+_CTYPES_F_PTR = cc.c_object_p()
+_CTYPES_S_LINE = cc.c_uint()
+_CTYPES_S_COL = cc.c_uint()
+_CTYPES_S_OFF = cc.c_uint()
+_CTYPES_E_LINE = cc.c_uint()
+_CTYPES_E_COL = cc.c_uint()
+_CTYPES_E_OFF = cc.c_uint()
+_CTYPES_BYREF = ctypes.byref
+
+
 class TokenList:
     """Binding for clang_tokenize and clang_annotateTokens."""
 
@@ -351,11 +363,25 @@ class TokenList:
         temp_tokens_array = ctypes.cast(tokens_memory, ctypes.POINTER(cc.Token * self.count)).contents
         for token in temp_tokens_array:
             token._tu = parsed_tu
-            token.line = Line(token.extent)
+
+            # Direct Ctypes line/char coordinate extraction (2 C calls vs 5 C calls)
+            ext = _CLANG_GET_EXTENT(parsed_tu, token)
+            st = _CLANG_GET_RANGE_START(ext)
+            en = _CLANG_GET_RANGE_END(ext)
+            _CLANG_GET_SPELLING_LOC(st, _CTYPES_BYREF(_CTYPES_F_PTR), _CTYPES_BYREF(_CTYPES_S_LINE), _CTYPES_BYREF(_CTYPES_S_COL), _CTYPES_BYREF(_CTYPES_S_OFF))
+            _CLANG_GET_SPELLING_LOC(en, _CTYPES_BYREF(_CTYPES_F_PTR), _CTYPES_BYREF(_CTYPES_E_LINE), _CTYPES_BYREF(_CTYPES_E_COL), _CTYPES_BYREF(_CTYPES_E_OFF))
+
+            l = Line.__new__(Line)
+            l.code = ""
+            l.line_pos = (_CTYPES_S_LINE.value, _CTYPES_E_LINE.value)
+            l.char_pos = (_CTYPES_S_COL.value, _CTYPES_E_COL.value)
+            token.line = l
+
             try:
                 token.spelling_str = token.spelling
             except Exception:
                 token.spelling_str = ""
+
             self.tokens_array.append(token)
 
         self.token_group = cc.TokenGroup(parsed_tu, tokens_memory, tokens_count)
@@ -372,24 +398,23 @@ class TokenList:
         if prof is not None:
             t_proc_0 = time.perf_counter()
 
-        for i, token in enumerate(self.tokens_array):
-            cursor = self.cursors_array[i]
-
+        check_exec = self.main_zone.check_exec
+        for token, cursor in zip(self.tokens_array, self.cursors_array):
             match token.kind:
                 case cc.TokenKind.COMMENT:
-                    self.main_zone.check_exec(token, cursor, AST_KIND.comment)
+                    check_exec(token, cursor, AST_KIND.comment)
 
                 case cc.TokenKind.KEYWORD:
-                    self.main_zone.check_exec(token, cursor, AST_KIND.keyword)
+                    check_exec(token, cursor, AST_KIND.keyword)
 
                 case cc.TokenKind.IDENTIFIER:
-                    self.main_zone.check_exec(token, cursor, AST_KIND.identifier)
+                    check_exec(token, cursor, AST_KIND.identifier)
 
                 case cc.TokenKind.PUNCTUATION:
-                    self.main_zone.check_exec(token, cursor, AST_KIND.punctuation)
+                    check_exec(token, cursor, AST_KIND.punctuation)
 
                 case cc.TokenKind.LITERAL:
-                    self.main_zone.check_exec(token, cursor, AST_KIND.literal)
+                    check_exec(token, cursor, AST_KIND.literal)
 
         self.main_zone.gen_lined_dict()
         self.main_zone.resolve_cppro_scopes()
@@ -427,6 +452,7 @@ class Ast_Manager:
         self.mfdir = CS.mf.version_dict[CS.gp.Version_Name]
         self.filename = CS.current_path
         self.fullfilename = f"{self.mfdir}/{self.filename}"
+        G.CURRENT_PARSING_FILE = self.filename
         self.processing_list = []
         self.cppro_parse_result = []
         CS.parsers["C_AM"] = self

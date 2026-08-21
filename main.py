@@ -52,20 +52,23 @@ from core.globalstuff import (
     CONTINUE_EXCEPTION,
     T_DIR,
     ASTT,
+    configure_logging,
 )
 import sys
 import time
 import logging
 import argparse
 import multiprocessing
-import traceback
+from collections import deque
 import pickle
-from queue import SimpleQueue
+import traceback
+from parser.c_ast.c_ast import c_ast_parse
+from parser.c_ast.c_ast_type import Line
+from core.FileHandler import MasterFile
+from core.GreatProcessor import GreatProcessor
+from core.TableHandling import Table, ChangeSet
 from db_engine import MariaDB, MockDB, get_db_engine
 from table_engine.te_direct_db import TEDirectDB
-from core.FileHandler import MasterFile
-from core.TableHandling import Table, ChangeSet
-from core.GreatProcessor import GreatProcessor
 from core.DBLayout import (
     init_db_layout,
     m_v_main,
@@ -83,7 +86,6 @@ from core.DBLayout import (
     m_map_ast,
     m_bridge_map,
 )
-from parser.c_ast.c_ast import Ast_Manager
 
 
 G.DB = MariaDB
@@ -91,10 +93,7 @@ G.TE = TEDirectDB()
 MF = MasterFile()
 G.MF = MF
 gp = GreatProcessor()
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s"
-)
+configure_logging(level=logging.INFO, fmt="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
 init_db_layout(gp)
@@ -123,7 +122,7 @@ def update(version: str) -> None:
     # STEP 2: Create temporary performance indexes on DB tables
     # -------------------------------------------------------------------------
     with G.DB() as db:
-        db.create_index("ast_index", m_ast, (m_ast.type_id, m_ast.name))
+        db.create_index("ast_index", m_ast, (m_ast.name, m_ast.type_id))
         db.create_index("file_name_index", m_file_name, (m_file_name.fname,))
         
 
@@ -148,19 +147,14 @@ def update(version: str) -> None:
     # STEP 6: Enqueue ChangeSets and resolve operations sequentially
     # -------------------------------------------------------------------------
     G.TE.start_new_db(G.DB)
-    cs_queue = SimpleQueue()
-
-    for key in gp.ChangeSet_Dict:
-        cs_queue.put(key)
+    cs_queue = deque(gp.ChangeSet_Dict.keys())
 
     max_loop = len(gp.ChangeSet_Dict) * G.OVERRIDE_FC_MAX_LOOP_EXEC_MULT
-    while not cs_queue.empty():
+    while cs_queue:
         max_loop -= 1
         if max_loop < 0:
             logger.error(f"max loop ({len(gp.ChangeSet_Dict)*G.OVERRIDE_FC_MAX_LOOP_EXEC_MULT}) was brought to 0, printing queue:")
-            debug_unresolved = []
-            while not cs_queue.empty():
-                debug_unresolved.append(gp.ChangeSet_Dict[cs_queue.get()])
+            debug_unresolved = [gp.ChangeSet_Dict[k] for k in cs_queue]
 
             G.BP_ON_REF_FAIL = True
 
@@ -168,9 +162,9 @@ def update(version: str) -> None:
                 item.execute()
 
             G.emergency_shutdown(666)
-        current_cs = cs_queue.get()
+        current_cs = cs_queue.popleft()
         if not gp.ChangeSet_Dict[current_cs].execute():
-            cs_queue.put(current_cs)
+            cs_queue.append(current_cs)
 
 
     # -------------------------------------------------------------------------
@@ -601,6 +595,7 @@ def file_processing_worker(
                 CS.current_vid = vid
                 CS.gp = gp_ref
                 CS.mf = mf_ref
+                G.CURRENT_PARSING_FILE = CS.current_path
 
                 default_processing(CS)
                 CS.parse()
@@ -613,6 +608,8 @@ def file_processing_worker(
                 tb_str = traceback.format_exc()
                 logger.error(COLOR.red(f"Worker {worker_id} error parsing '{changed_file}': {err_str}"))
                 error_queue.put((changed_file, err_str, tb_str))
+            finally:
+                G.CURRENT_PARSING_FILE = None
 
         if batch_cs_dict:
             try:
@@ -641,6 +638,7 @@ def file_processing(start: int, end: int | None, override_list: list[str] | None
             CS.current_vid = gp.VID
             CS.gp = gp
             CS.mf = MF
+            G.CURRENT_PARSING_FILE = CS.current_path
 
             default_processing(CS)
             CS.parse()
@@ -650,6 +648,8 @@ def file_processing(start: int, end: int | None, override_list: list[str] | None
             gp.ChangeSet_Dict[CS.current_path] = CS
         except Exception as e:
             logger.error(COLOR.red(f"Error processing file '{changed_file}': {e}\n{traceback.format_exc()}"))
+        finally:
+            G.CURRENT_PARSING_FILE = None
 
     if override_list is None:
         gp.push_set_to_main()

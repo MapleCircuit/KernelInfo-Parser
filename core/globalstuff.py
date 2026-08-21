@@ -1,6 +1,7 @@
 """globalstuff.py - Global objects and constants."""
 import sys
 import shutil
+import logging
 from pathlib import Path
 from core.StringWrangler import wrap_lines, render_ansi_box, render_with_indent
 import contextlib
@@ -49,8 +50,11 @@ class GlobalStuff:
         self.linux_directory = Path("linux")
         self.CLEAN_PRINT = True
 
-        self.BP_ON_SHUTDOWN = True
+        self.BP_ON_SHUTDOWN = False
         self.BP_ON_REF_FAIL = False
+
+        # Active file context for logging
+        self.CURRENT_PARSING_FILE: str | None = None
 
         # FAIL CHECK
         self.OVERRIDE_FC_MAX_LOOP_EXEC_MULT = 2
@@ -376,3 +380,26 @@ class ASTT(IntEnum):
     CPPro_error = auto()
     CPPro_warning = auto()
     CPPro_pragma = auto()
+
+
+class FileContextFormatter(logging.Formatter):
+    """Logging formatter that prepends [current_file] if G.CURRENT_PARSING_FILE is set."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        file_ctx = getattr(G, "CURRENT_PARSING_FILE", None)
+        if file_ctx and not str(record.msg).startswith(f"[{file_ctx}]"):
+            record.msg = f"[{file_ctx}] {record.msg}"
+        return super().format(record)
+
+
+def configure_logging(fmt: str = "%(asctime)s - %(levelname)s - %(message)s", level: int = logging.INFO) -> None:
+    """Configure root logger and ensure all handlers use FileContextFormatter."""
+    if not logging.root.handlers:
+        logging.basicConfig(level=level, format=fmt)
+
+    for handler in logging.root.handlers:
+        h_fmt = handler.formatter._fmt if handler.formatter and getattr(handler.formatter, "_fmt", None) else fmt
+        handler.setFormatter(FileContextFormatter(h_fmt))
+
+
+configure_logging()

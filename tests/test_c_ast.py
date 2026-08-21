@@ -130,6 +130,7 @@ def run_single_file_worker(item: dict[str, Any]) -> dict[str, Any]:
         cs.current_vid = 1
         cs.gp = gp
         cs.mf = mf
+        G.CURRENT_PARSING_FILE = file_path
 
         default_processing(cs, gp)
         cs.parse()
