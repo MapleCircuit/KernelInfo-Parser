@@ -1,365 +1,1864 @@
-<html>
+<!DOCTYPE html>
+<html lang="en">
 <head>
-<style>
-.wrapper {
-    position: absolute;
-    top: 0;
-    bottom: 0;
-    left: 0;
-    right: 0;
-    width: auto;
-    height: auto;
-    overflow-x: auto;
-    overflow-y: scroll;
-    box-sizing: inherit;
-    display: flex;margin: 0;
-    flex-direction: column;
-}
-main {display: flex;flex-direction: row;height: 100%;}
-button {
-  background: none;
-  border: none;
-  cursor: pointer;
-}
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>KernelInfo Dev Viewer & AST Explorer</title>
+  <style>
+    :root {
+      --bg-dark: #181a1f;
+      --bg-sidebar: #1e2227;
+      --bg-content: #21252b;
+      --bg-card: #282c34;
+      --bg-header: #21252b;
+      --border-color: #3e4451;
+      --text-main: #abb2bf;
+      --text-bright: #e5c07b;
+      --text-muted: #5c6370;
+      --accent: #61afef;
+      --accent-hover: #528bff;
+      --danger: #e06c75;
+      --success: #98c379;
+      --tab-active-bg: #282c34;
+      --tab-inactive-bg: #1e2227;
+      
+      /* Dynamic Syntax Highlight Colors (customizable) */
+      --hl-keyword: #c678dd;
+      --hl-comment: #5c6370;
+      --hl-struct: #e5c07b;
+      --hl-type: #56b6c2;
+      --hl-macro: #d19a66;
+      --hl-function: #61afef;
+      --hl-compound: rgba(97, 175, 239, 0.15);
+      --hl-default: #98c379;
+    }
 
-.table-tags{table, th, td {border: 2px solid black;padding:2px;}}
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, monospace;
+      background-color: var(--bg-dark);
+      color: var(--text-main);
+      height: 100vh;
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+    }
 
-.topbar {background-color: grey;}
-.search {display: flex; justify-content: flex-end;}
-.sidebar {color: #fff;background-color: #111; flex: 5%;}
-.slink {color: #fff;}
-.workspace {flex: 95%}
-.tabs {background-color: #b3b3b3;flex: 95%;}
-.tab {background-color: #a6a6a6;display: inline-block;padding: 0.35em;border: 2px solid #ccc;font-weight: 700;}
-.active {background-color: red;}
-.left-pad {padding-left: 2px;}
-.tag-container{border: 2px solid black;padding:2px;}
-.tag-code {border: 2px solid black;padding: 0.35em;}
-</style>
+    /* Top Bar */
+    .topbar {
+      background-color: var(--bg-header);
+      border-bottom: 1px solid var(--border-color);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 6px 16px;
+      height: 48px;
+      gap: 12px;
+    }
+    .topbar-left {
+      display: flex;
+      align-items: center;
+      gap: 16px;
+    }
+    .brand {
+      font-weight: bold;
+      color: var(--text-bright);
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 15px;
+    }
+    .version-selector {
+      background: var(--bg-card);
+      border: 1px solid var(--border-color);
+      color: var(--text-main);
+      padding: 4px 8px;
+      border-radius: 4px;
+      font-size: 13px;
+      outline: none;
+      cursor: pointer;
+    }
+    .breadcrumbs {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 13px;
+      color: var(--text-muted);
+      overflow-x: auto;
+      white-space: nowrap;
+    }
+    .crumb-link {
+      color: var(--accent);
+      cursor: pointer;
+      text-decoration: none;
+    }
+    .crumb-link:hover { text-decoration: underline; }
+    .topbar-right {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    .btn {
+      background: var(--bg-card);
+      border: 1px solid var(--border-color);
+      color: var(--text-main);
+      padding: 5px 10px;
+      border-radius: 4px;
+      cursor: pointer;
+      font-size: 12px;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      transition: all 0.15s ease;
+    }
+    .btn:hover { background: var(--border-color); color: #fff; }
+    .btn-accent { background: var(--accent); color: #1e2227; font-weight: bold; border-color: var(--accent); }
+    .btn-accent:hover { background: var(--accent-hover); color: #fff; }
 
+    /* Main Container */
+    .app-body {
+      display: flex;
+      flex: 1;
+      height: calc(100vh - 48px);
+      overflow: hidden;
+    }
+
+    /* Left Sidebar */
+    .sidebar {
+      width: 280px;
+      background: var(--bg-sidebar);
+      border-right: 1px solid var(--border-color);
+      display: flex;
+      flex-direction: column;
+      height: 100%;
+    }
+    .sidebar-header {
+      padding: 10px 12px;
+      border-bottom: 1px solid var(--border-color);
+      font-size: 12px;
+      font-weight: bold;
+      color: var(--text-muted);
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    .sidebar-filter {
+      padding: 8px 12px;
+      border-bottom: 1px solid var(--border-color);
+    }
+    .sidebar-filter input {
+      width: 100%;
+      background: var(--bg-dark);
+      border: 1px solid var(--border-color);
+      color: var(--text-main);
+      padding: 4px 8px;
+      border-radius: 4px;
+      font-size: 12px;
+    }
+    .tree-view {
+      flex: 1;
+      overflow-y: auto;
+      padding: 6px 0;
+    }
+    .tree-item {
+      padding: 5px 12px;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 13px;
+      color: var(--text-main);
+      user-select: none;
+    }
+    .tree-item:hover {
+      background: rgba(255, 255, 255, 0.05);
+      color: #fff;
+    }
+    .tree-item.active {
+      background: var(--tab-active-bg);
+      color: var(--accent);
+      font-weight: bold;
+    }
+    .tree-icon { font-size: 14px; }
+
+    /* Workspace */
+    .workspace {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      height: 100%;
+      background: var(--bg-content);
+      overflow: hidden;
+    }
+
+    /* Tabs Bar */
+    .tabs-bar {
+      background: var(--bg-sidebar);
+      border-bottom: 1px solid var(--border-color);
+      display: flex;
+      align-items: center;
+      overflow-x: auto;
+      height: 36px;
+      gap: 2px;
+      padding: 0 4px;
+    }
+    .tab {
+      background: var(--tab-inactive-bg);
+      border: 1px solid transparent;
+      border-bottom: none;
+      color: var(--text-muted);
+      padding: 6px 12px;
+      font-size: 12px;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      max-width: 220px;
+      border-radius: 4px 4px 0 0;
+      white-space: nowrap;
+      user-select: none;
+    }
+    .tab:hover { color: var(--text-main); background: rgba(255, 255, 255, 0.03); }
+    .tab.active {
+      background: var(--tab-active-bg);
+      color: #fff;
+      border-color: var(--border-color);
+      border-bottom-color: var(--tab-active-bg);
+      font-weight: 500;
+    }
+    .tab-close {
+      border-radius: 50%;
+      width: 14px;
+      height: 14px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 10px;
+      opacity: 0.6;
+    }
+    .tab-close:hover { opacity: 1; background: var(--danger); color: #fff; }
+    .tab-add {
+      padding: 4px 8px;
+      cursor: pointer;
+      color: var(--text-muted);
+    }
+    .tab-add:hover { color: var(--accent); }
+
+    /* Content Area */
+    .tab-content {
+      flex: 1;
+      overflow: auto;
+      display: flex;
+      flex-direction: column;
+      position: relative;
+    }
+
+    /* Directory View */
+    .dir-container {
+      padding: 20px;
+      max-width: 1100px;
+      margin: 0 auto;
+      width: 100%;
+    }
+    .dir-header {
+      margin-bottom: 16px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    .dir-table {
+      width: 100%;
+      border-collapse: collapse;
+      background: var(--bg-card);
+      border: 1px solid var(--border-color);
+      border-radius: 6px;
+      overflow: hidden;
+    }
+    .dir-table th, .dir-table td {
+      padding: 8px 14px;
+      text-align: left;
+      border-bottom: 1px solid var(--border-color);
+      font-size: 13px;
+    }
+    .dir-table th { background: rgba(0, 0, 0, 0.2); color: var(--text-muted); font-size: 11px; text-transform: uppercase; }
+    .dir-table tr:hover { background: rgba(255, 255, 255, 0.03); }
+    .item-link {
+      color: var(--accent);
+      cursor: pointer;
+      text-decoration: none;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .item-link:hover { text-decoration: underline; }
+    .badge {
+      display: inline-block;
+      padding: 2px 6px;
+      border-radius: 3px;
+      font-size: 10px;
+      font-weight: bold;
+      background: var(--border-color);
+      color: var(--text-main);
+    }
+    .badge-success { background: rgba(152, 195, 121, 0.2); color: var(--success); }
+    .badge-danger { background: rgba(224, 108, 117, 0.2); color: var(--danger); }
+    .badge-accent { background: rgba(97, 175, 239, 0.2); color: var(--accent); }
+
+    /* Code View */
+    .file-meta-bar {
+      background: var(--bg-card);
+      border-bottom: 1px solid var(--border-color);
+      padding: 8px 16px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      font-size: 12px;
+      color: var(--text-muted);
+    }
+    .file-meta-info {
+      display: flex;
+      gap: 16px;
+      align-items: center;
+    }
+    .code-viewer {
+      flex: 1;
+      overflow: auto;
+      background: var(--bg-dark);
+      position: relative;
+      font-family: "JetBrains Mono", Consolas, "Courier New", monospace;
+      font-size: 13px;
+      line-height: 1.5;
+    }
+    .code-scroll-wrapper {
+      display: flex;
+      min-width: 100%;
+      width: max-content;
+      min-height: 100%;
+      align-items: stretch;
+    }
+    .gutter {
+      width: 65px;
+      background: var(--bg-sidebar);
+      border-right: 1px solid var(--border-color);
+      padding: 12px 0;
+      user-select: none;
+      text-align: right;
+      color: var(--text-muted);
+      flex-shrink: 0;
+      position: sticky;
+      left: 0;
+      z-index: 10;
+      align-self: stretch;
+    }
+    .gutter-line {
+      padding: 0 10px;
+      height: 21px;
+      cursor: pointer;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    .gutter-line:hover { color: var(--text-main); }
+    .collapse-btn {
+      font-size: 9px;
+      color: var(--accent);
+      cursor: pointer;
+      opacity: 0.7;
+    }
+    .collapse-btn:hover { opacity: 1; }
+    .code-body {
+      flex: 1;
+      padding: 12px 16px;
+      white-space: pre;
+    }
+    .code-line {
+      height: 21px;
+      display: block;
+      cursor: text;
+    }
+    .code-line.collapsed,
+    .gutter-line.collapsed {
+      display: none !important;
+    }
+    .code-line.target-highlight {
+      background-color: rgba(229, 192, 123, 0.28) !important;
+      outline: 1px solid rgba(229, 192, 123, 0.75) !important;
+    }
+    .gutter-line.target-highlight {
+      background-color: #e5c07b !important;
+      color: #181a1f !important;
+      font-weight: bold !important;
+    }
+    .gutter-line.target-highlight span {
+      color: #181a1f !important;
+      font-weight: bold !important;
+    }
+
+    /* Highlight Tokens */
+    .token {
+      border-radius: 2px;
+      padding: 1px 2px;
+      cursor: pointer;
+      transition: background 0.1s ease;
+    }
+    .token:hover {
+      outline: 1px solid #fff;
+    }
+    .token-keyword { color: var(--hl-keyword); font-weight: bold; }
+    .token-comment { color: var(--hl-comment); font-style: italic; }
+    .token-struct { color: var(--hl-struct); font-weight: bold; }
+    .token-type { color: var(--hl-type); }
+    .token-macro { color: var(--hl-macro); }
+    .token-function { color: var(--hl-function); }
+    .token-compound { background: var(--hl-compound); }
+
+    /* Modals & Panels */
+    .modal-overlay {
+      position: fixed;
+      top: 0; left: 0; right: 0; bottom: 0;
+      background: rgba(0, 0, 0, 0.7);
+      display: none;
+      align-items: center;
+      justify-content: center;
+      z-index: 1000;
+    }
+    .modal-overlay.open { display: flex; }
+    .modal {
+      background: var(--bg-card);
+      border: 1px solid var(--border-color);
+      border-radius: 8px;
+      width: 90%;
+      max-width: 900px;
+      max-height: 85vh;
+      display: flex;
+      flex-direction: column;
+      box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
+    }
+    .modal-header {
+      padding: 14px 18px;
+      border-bottom: 1px solid var(--border-color);
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    .modal-header h3 { font-size: 16px; color: var(--text-bright); }
+    .modal-body {
+      padding: 18px;
+      overflow-y: auto;
+      flex: 1;
+    }
+    .modal-footer {
+      padding: 12px 18px;
+      border-top: 1px solid var(--border-color);
+      display: flex;
+      justify-content: flex-end;
+      gap: 10px;
+    }
+
+    /* AST Tree Drawer / Inspector */
+    .ast-inspector {
+      background: var(--bg-card);
+      border-top: 1px solid var(--border-color);
+      max-height: 240px;
+      overflow-y: auto;
+      padding: 12px 16px;
+      font-size: 12px;
+      display: none;
+    }
+    .ast-inspector.open { display: block; }
+    .tree-node {
+      margin-left: 16px;
+      border-left: 1px dashed var(--border-color);
+      padding-left: 8px;
+      margin-top: 4px;
+    }
+    .tree-node-title {
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .tree-node-title:hover { color: var(--accent); }
+
+    /* Color Palette Grid */
+    .color-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+      gap: 12px;
+    }
+    .color-card {
+      background: var(--bg-sidebar);
+      border: 1px solid var(--border-color);
+      padding: 10px;
+      border-radius: 6px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+    .color-card label {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 12px;
+      cursor: pointer;
+    }
+    .color-picker {
+      border: none;
+      background: none;
+      width: 28px;
+      height: 28px;
+      cursor: pointer;
+    }
+
+    /* Dev Tools Endpoint Runner */
+    .dev-endpoint-list {
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+    .dev-endpoint-card {
+      background: var(--bg-sidebar);
+      border: 1px solid var(--border-color);
+      border-radius: 6px;
+      padding: 12px;
+    }
+    .dev-endpoint-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 8px;
+    }
+    .dev-endpoint-path {
+      font-family: monospace;
+      color: var(--accent);
+      font-weight: bold;
+    }
+    .dev-response-box {
+      background: var(--bg-dark);
+      border: 1px solid var(--border-color);
+      padding: 8px;
+      border-radius: 4px;
+      font-family: monospace;
+      font-size: 11px;
+      max-height: 180px;
+      overflow: auto;
+      margin-top: 8px;
+      display: none;
+    }
+
+    /* JSON Viewer */
+    pre.json-view {
+      color: #98c379;
+      white-space: pre-wrap;
+      word-break: break-all;
+    }
+  </style>
 </head>
 <body>
-<div class="wrapper">
 
-<header class="topbar">
-   
-</header>
-
-<main>
-<aside class="sidebar">
-<div id="sidebar">
-</div>
-</aside>
-
-<div class="workspace">
-
-<header class="tabs">
-<div id="tab">
-|
-
-</div>
-</header>
-
-<div id="content" class="content">
-    <div class="loginPopup">
-      <div class="formPopup" id="popupForm">
-        <h2>Please select your api address</h2>
-          <label for="api-addr">
-            <strong>API address</address></strong>
-          </label>
-          <input type="text" id="api-addr" placeholder="Your API address" name="api-addr">
-          <button id="login-button">Log in</button>
-        </form>
+  <!-- Top Bar -->
+  <header class="topbar">
+    <div class="topbar-left">
+      <div class="brand">
+        <span>⚡</span> KernelInfo Dev Viewer
+      </div>
+      <select id="versionSelect" class="version-selector" onchange="onVersionChange(this.value)">
+        <option value="">Loading versions...</option>
+      </select>
+      <div id="breadcrumbs" class="breadcrumbs">
+        <span class="crumb-link" onclick="openPath('/')">/</span>
       </div>
     </div>
-</div>
-</div>
+    <div class="topbar-right">
+      <button class="btn" onclick="promptApiBase()" title="Click to change API Server URL">
+        <span>🌐</span> <code id="apiHostDisplay" style="font-size: 11px;">API: ...</code>
+      </button>
+      <button class="btn" onclick="openHighlightModal()">
+        <span>🎨</span> Highlight Palette
+      </button>
+      <button class="btn btn-accent" onclick="openDevModal()">
+        <span>⚙️</span> Dev Tools
+      </button>
+    </div>
+  </header>
 
-</main>
-</div>
-</body>
-<script>
-let server = "http://192.168.2.190:8000/"
+  <!-- Network / Server Error Banner -->
+  <div id="apiErrorBanner" style="display: none; background: #e06c75; color: #1e2227; font-weight: bold; font-size: 12px; padding: 6px 16px; display: none; justify-content: space-between; align-items: center;">
+    <span>⚠️ Cannot connect to API backend at <code id="errApiHost"></code>. Ensure the server is running (<code>python3 webapp/main.py</code>).</span>
+    <div style="display: flex; gap: 8px;">
+      <button class="btn btn-accent" style="padding: 2px 8px; font-size: 11px;" onclick="promptApiBase()">Change API Server IP/URL</button>
+      <button class="btn" style="padding: 2px 8px; font-size: 11px;" onclick="document.getElementById('apiErrorBanner').style.display='none'">✕</button>
+    </div>
+  </div>
 
-const tabs_arr = [];
-let active_index = 0;
+  <!-- Main Body -->
+  <div class="app-body">
+    <!-- Left Sidebar -->
+    <aside class="sidebar">
+      <div class="sidebar-header">
+        <span>File Explorer</span>
+        <button class="btn" style="padding: 2px 6px;" onclick="refreshCurrentTree()">⟳</button>
+      </div>
+      <div class="sidebar-filter">
+        <input type="text" id="fileFilterInput" placeholder="Filter files/folders..." oninput="filterSidebarTree(this.value)">
+      </div>
+      <div id="sidebarTree" class="tree-view">
+        <div style="padding: 12px; color: var(--text-muted); font-size: 12px;">Loading directory...</div>
+      </div>
+    </aside>
 
+    <!-- Workspace -->
+    <main class="workspace">
+      <!-- Tabs Bar -->
+      <div id="tabsBar" class="tabs-bar">
+        <!-- Tabs populated dynamically -->
+      </div>
 
-class tab {
-    constructor(version, path, html, active = true) {
-        this.version = version;
-        this.path = path;
-        this.html = html;
-        this.active = active;
+      <!-- Tab Content Area -->
+      <div id="tabContent" class="tab-content">
+        <div style="padding: 40px; text-align: center; color: var(--text-muted);">
+          <h2>Select a file or directory from the sidebar to begin.</h2>
+        </div>
+      </div>
+
+      <!-- Bottom AST Inspector Panel -->
+      <div id="astInspector" class="ast-inspector">
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
+          <strong style="color: var(--text-bright);">AST Container Hierarchy & Token Inspector</strong>
+          <div style="display: flex; gap: 8px; align-items: center;">
+            <label style="font-size: 11px;">Depth: <span id="depthVal">3</span></label>
+            <input type="range" id="depthSlider" min="1" max="8" value="3" onchange="onDepthChange(this.value)">
+            <button class="btn" style="padding: 2px 6px;" onclick="closeAstInspector()">✕</button>
+          </div>
+        </div>
+        <div id="astInspectorContent"></div>
+      </div>
+    </main>
+  </div>
+
+  <!-- Highlight Settings Modal -->
+  <div id="highlightModal" class="modal-overlay">
+    <div class="modal">
+      <div class="modal-header">
+        <h3>Highlight Color Palette & Visibility Manager</h3>
+        <button class="btn" onclick="closeHighlightModal()">✕</button>
+      </div>
+      <div class="modal-body">
+        <p style="font-size: 12px; color: var(--text-muted); margin-bottom: 14px;">
+          Customize colors and toggle visibility for AST syntax elements mapped via <code>m_map_ast</code>. Preferences persist across browser sessions.
+        </p>
+        <div id="colorPickerGrid" class="color-grid">
+          <!-- Dynamic Color Cards -->
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn" onclick="resetHighlightDefaults()">Reset to Defaults</button>
+        <button class="btn btn-accent" onclick="closeHighlightModal()">Done</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Dev Tools Modal (Gear Icon) -->
+  <div id="devModal" class="modal-overlay">
+    <div class="modal" style="max-width: 960px;">
+      <div class="modal-header">
+        <h3>⚙️ Developer Introspection & Endpoint Runner</h3>
+        <button class="btn" onclick="closeDevModal()">✕</button>
+      </div>
+      <div class="modal-body">
+        <div style="margin-bottom: 16px; background: var(--bg-sidebar); padding: 12px; border-radius: 6px; border: 1px solid var(--border-color);">
+          <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
+            <h4 style="font-size: 13px; color: var(--accent);">Database Table Row Counts</h4>
+            <button class="btn btn-accent" style="padding: 3px 10px;" onclick="refreshDevStats()">Load / Refresh DB Stats</button>
+          </div>
+          <div id="devTableCounts" style="display: flex; flex-wrap: wrap; gap: 8px; font-size: 11px;">
+            <span style="color: var(--text-muted); font-size: 12px;">Click "Load / Refresh DB Stats" to inspect schema table row counts.</span>
+          </div>
+        </div>
+
+        <h4 style="font-size: 13px; color: var(--accent); margin-bottom: 8px;">Interactive API Endpoints</h4>
+        <div id="devEndpointList" class="dev-endpoint-list">
+          <!-- Dynamic Endpoints with Parameters -->
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-accent" onclick="closeDevModal()">Close</button>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    // State Architecture
+    function getInitialApiBase() {
+      const saved = localStorage.getItem("kernelinfo_api_base");
+      if (saved) return saved.replace(/\/+$/, "");
+      if (window.location.protocol.startsWith("http")) {
+        const port = window.location.port ? window.location.port : "8000";
+        return `${window.location.protocol}//${window.location.hostname}:${port}`;
+      }
+      return "http://localhost:8000";
     }
 
-    static async create(version, path, active = true) {
-        const htmlContent = await generate_content(version, path);
-        return new tab(version, path, htmlContent, active);
-    }
-    async update_file(path) {
-        const htmlContent = await generate_content(this.version, path);
-        this.path = path;
-        this.html = htmlContent;
-    }
-}
+    let API_BASE = getInitialApiBase();
+    let currentVersion = "v3.0";
+    let versionsList = [];
+    let typeDescriptors = [];
+    let openTabs = [];
+    let activeTabIndex = 0;
+    let selectedAstId = null;
+    let currentInspectorDepth = 3;
+    let selectedLineStart = null;
 
-
-
-
-function clear_active_tab(){
-    tabs_arr.forEach((item, index) => {
-        if (item.active) {
-            item.active = false;
-        }
-    });
-}
-
-function print_tabs(){
-    let text = "<button onclick=\"expend_all()\">EXPAND</buton>";
-    tabs_arr.forEach((item, index) => {
-        if (item.active) {
-            text += "<button onclick=\"clicked_tab('" + index + "')\" class=\"active\">" + item.version + ":" + item.path + "</buton>";
-            active_index = index;
-        } else {
-            text += "<button onclick=\"clicked_tab('" + index + "')\">" + item.version + ":" + item.path + "</buton>";
-        }
-    });
-    document.getElementById("tab").innerHTML = text;
-    document.getElementById("content").innerHTML = tabs_arr[active_index].html;
-}
-
-function clicked_tab(tab_index){
-    clear_active_tab();
-    tabs_arr[tab_index].active = true;
-    print_tabs();
-}
-
-function jsonToHtmlTable(jsonData) {
-    if (typeof jsonData === "string") {
-        jsonData = JSON.parse(jsonData);
-    }
-    if (!Array.isArray(jsonData)) {
-        jsonData = [jsonData];
-    }
-
-    const getHeaders = (data) => {
-        const headers = new Set();
-        data.forEach(obj => Object.keys(obj).forEach(k => headers.add(k)));
-        return Array.from(headers);
+    // Highlight Categories & Default Palette
+    const defaultHighlightSettings = {
+      "C_Keyword": { color: "#c678dd", enabled: true, label: "Keywords (if, static, return)" },
+      "C_Comment": { color: "#5c6370", enabled: true, label: "Comments (/* ... */, //)" },
+      "C_struct": { color: "#e5c07b", enabled: true, label: "Structs (struct)" },
+      "C_structdecl": { color: "#e5c07b", enabled: true, label: "Struct Declarations" },
+      "C_enum": { color: "#e5c07b", enabled: true, label: "Enums (enum)" },
+      "C_union": { color: "#e5c07b", enabled: true, label: "Unions (union)" },
+      "C_functionproto": { color: "#61afef", enabled: true, label: "Function Prototypes" },
+      "C_pointer": { color: "#56b6c2", enabled: true, label: "Pointers (*)" },
+      "C_Compound": { color: "#61afef", enabled: true, label: "Compound Statement Blocks" },
+      "CPPro_define": { color: "#d19a66", enabled: true, label: "Macros (#define)" },
+      "CPPro_include": { color: "#98c379", enabled: true, label: "Includes (#include)" },
+      "CPPro_if": { color: "#d19a66", enabled: true, label: "Conditionals (#if, #ifdef)" },
+      "Undefined": { color: "#abb2bf", enabled: true, label: "Other AST Elements" }
     };
+    let highlightSettings = JSON.parse(localStorage.getItem("kernelinfo_hl_settings")) || defaultHighlightSettings;
 
-    const createTable = (data) => {
-        const headers = getHeaders(data);
-        let html = '<table class="table-tags"><thead><tr>';
-        headers.forEach(h => html += `<th>${h}</th>`);
-        html += '</tr></thead><tbody>';
+    // ------------------------------------------------------------------------
+    // URL Hash Parser & Synchronizer
+    // ------------------------------------------------------------------------
+    function parseHash() {
+      const hashStr = window.location.hash;
+      if (!hashStr) return null;
+      let raw = hashStr.replace(/^#/, '').trim();
+      if (!raw) return null;
 
-        data.forEach(row => {
-            html += '<tr>';
-            headers.forEach(h => {
-                let cell = row[h];
-                if (Array.isArray(cell) && typeof cell !== 'string') {
-                    let len = cell.length;
-                    for (let i = 0; i < len; i++) {
-                        if (typeof cell[i] === 'object' && cell[i] !== null) {
-                            cell[i] = createTable(Array.isArray(cell[i]) ? cell[i] : [cell[i]]);
-                        }
-                    }
-                    cell = cell.join(", ");
-                }
-                if (typeof cell === 'object' && cell !== null) {
-                    cell = createTable(Array.isArray(cell) ? cell : [cell]);
-                }
-                
-                html += `<td>${cell !== undefined ? cell : ''}</td>`;
+      let startLine = null;
+      let endLine = null;
+
+      // Match line specs: :L10-L20, :L10, #L10-L20, #L10, :10-20, :10
+      const lineMatch = raw.match(/[:#]L?(\d+)(?:-L?(\d+))?$/i);
+      if (lineMatch) {
+        startLine = parseInt(lineMatch[1], 10);
+        endLine = lineMatch[2] ? parseInt(lineMatch[2], 10) : startLine;
+        raw = raw.substring(0, lineMatch.index);
+      }
+
+      // Split version and path
+      const slashIdx = raw.indexOf('/');
+      let version = "";
+      let path = "";
+      if (slashIdx === -1) {
+        version = raw;
+        path = "";
+      } else {
+        version = raw.substring(0, slashIdx);
+        path = raw.substring(slashIdx + 1);
+      }
+
+      return { version, path, startLine, endLine };
+    }
+
+    function updateUrlHash(version, path, startLine = null, endLine = null) {
+      if (!version) return;
+      let hash = `#${version}/${path || ''}`;
+      if (startLine) {
+        if (endLine && endLine !== startLine) {
+          hash += `:L${startLine}-L${endLine}`;
+        } else {
+          hash += `:L${startLine}`;
+        }
+      }
+      if (window.location.hash !== hash) {
+        history.replaceState(null, '', hash);
+      }
+    }
+
+    function onLineClick(lineNum, event) {
+      if (event) {
+        event.stopPropagation();
+        if (event.shiftKey) {
+          event.preventDefault();
+        }
+      }
+      const currentTab = openTabs[activeTabIndex];
+      if (!currentTab || currentTab.type === "directory") return;
+
+      lineNum = parseInt(lineNum, 10);
+      if (isNaN(lineNum)) return;
+
+      // Check if clicking on an already highlighted single line or range
+      const isSingleActive = (
+        !event?.shiftKey &&
+        currentTab.targetStartLine === lineNum &&
+        (currentTab.targetEndLine === lineNum || currentTab.targetEndLine === null)
+      );
+
+      if (isSingleActive) {
+        // Toggle OFF / Deselect
+        currentTab.targetStartLine = null;
+        currentTab.targetEndLine = null;
+        selectedLineStart = null;
+        highlightLineRange(null, null);
+        updateUrlHash(currentTab.version, currentTab.path, null, null);
+        return;
+      }
+
+      let start = lineNum;
+      let end = lineNum;
+
+      if (event && event.shiftKey && selectedLineStart !== null) {
+        start = Math.min(selectedLineStart, lineNum);
+        end = Math.max(selectedLineStart, lineNum);
+      } else {
+        selectedLineStart = lineNum;
+      }
+
+      currentTab.targetStartLine = start;
+      currentTab.targetEndLine = end;
+      highlightLineRange(start, end);
+      updateUrlHash(currentTab.version, currentTab.path, start, end);
+    }
+
+    function highlightLineRange(startLine, endLine) {
+      document.querySelectorAll('.code-line.target-highlight').forEach(el => el.classList.remove('target-highlight'));
+      document.querySelectorAll('.gutter-line.target-highlight').forEach(el => el.classList.remove('target-highlight'));
+
+      if (!startLine) return;
+      startLine = parseInt(startLine, 10);
+      const end = endLine ? parseInt(endLine, 10) : startLine;
+      const min = Math.min(startLine, end);
+      const max = Math.max(startLine, end);
+
+      for (let l = min; l <= max; l++) {
+        const lineEl = document.getElementById(`l_${l}`);
+        if (lineEl) lineEl.classList.add('target-highlight');
+        const gutterEl = document.getElementById(`g_${l}`);
+        if (gutterEl) gutterEl.classList.add('target-highlight');
+      }
+    }
+
+    function updateApiHostDisplay() {
+      const el = document.getElementById("apiHostDisplay");
+      if (el) el.innerText = `API: ${API_BASE.replace(/^https?:\/\//, '')}`;
+      const errEl = document.getElementById("errApiHost");
+      if (errEl) errEl.innerText = API_BASE;
+    }
+
+    function promptApiBase() {
+      const current = API_BASE;
+      const input = prompt("Enter the backend API server URL (e.g., http://192.168.2.190:8000 or http://localhost:8000):", current);
+      if (input !== null && input.trim()) {
+        API_BASE = input.trim().replace(/\/+$/, "");
+        localStorage.setItem("kernelinfo_api_base", API_BASE);
+        updateApiHostDisplay();
+        document.getElementById("apiErrorBanner").style.display = "none";
+        reloadApp();
+      }
+    }
+
+    async function reloadApp() {
+      await loadVersions();
+      await loadTypeDescriptors();
+      initHighlightManager();
+      if (openTabs.length > 0) {
+        loadTabContent(activeTabIndex);
+        refreshCurrentTree();
+      }
+    }
+
+    async function handleHashNavigation() {
+      const parsed = parseHash();
+      if (!parsed || !parsed.version) return false;
+
+      if (parsed.version && versionsList.some(v => v.vname === parsed.version)) {
+        currentVersion = parsed.version;
+        const select = document.getElementById("versionSelect");
+        if (select) select.value = currentVersion;
+      }
+
+      const activeTab = openTabs[activeTabIndex];
+      if (activeTab && activeTab.version === currentVersion && activeTab.path === parsed.path) {
+        activeTab.targetStartLine = parsed.startLine;
+        activeTab.targetEndLine = parsed.endLine;
+        selectedLineStart = parsed.startLine;
+        if (parsed.startLine) {
+          highlightLineRange(parsed.startLine, parsed.endLine);
+          const targetEl = document.getElementById(`l_${parsed.startLine}`);
+          if (targetEl) targetEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        } else {
+          highlightLineRange(null, null);
+        }
+        return true;
+      }
+
+      const existingIdx = openTabs.findIndex(t => t.path === parsed.path && t.version === currentVersion);
+      if (existingIdx >= 0) {
+        openTabs[existingIdx].targetStartLine = parsed.startLine;
+        openTabs[existingIdx].targetEndLine = parsed.endLine;
+        switchTab(existingIdx);
+      } else {
+        openTab({
+          type: (!parsed.path || !parsed.path.includes('.')) ? "directory" : "file",
+          version: currentVersion,
+          path: parsed.path,
+          title: `${currentVersion}: ${parsed.path ? parsed.path.split('/').pop() : '/'}`,
+          targetStartLine: parsed.startLine,
+          targetEndLine: parsed.endLine
+        });
+      }
+      return true;
+    }
+
+    window.addEventListener("hashchange", () => {
+      handleHashNavigation();
+    });
+
+    // Initialization
+    window.addEventListener("DOMContentLoaded", async () => {
+      updateApiHostDisplay();
+      await loadVersions();
+      await loadTypeDescriptors();
+      initHighlightManager();
+      
+      const navigated = await handleHashNavigation();
+      if (!navigated) {
+        openTab({
+          type: "directory",
+          version: currentVersion,
+          path: "",
+          title: `${currentVersion}: /`
+        });
+        updateUrlHash(currentVersion, "");
+      }
+    });
+
+    // ------------------------------------------------------------------------
+    // API Utilities
+    // ------------------------------------------------------------------------
+    async function apiFetch(endpoint) {
+      try {
+        const res = await fetch(`${API_BASE}${endpoint}`);
+        if (!res.ok) throw new Error(`HTTP ${res.status}: ${res.statusText}`);
+        const banner = document.getElementById("apiErrorBanner");
+        if (banner) banner.style.display = "none";
+        return await res.json();
+      } catch (err) {
+        console.error("API Error on", endpoint, err);
+        const banner = document.getElementById("apiErrorBanner");
+        if (banner) {
+          banner.style.display = "flex";
+          const errEl = document.getElementById("errApiHost");
+          if (errEl) errEl.innerText = API_BASE;
+        }
+        return null;
+      }
+    }
+
+    async function loadVersions() {
+      const data = await apiFetch("/api/versions");
+      if (data && data.length > 0) {
+        versionsList = data;
+        const select = document.getElementById("versionSelect");
+        select.innerHTML = data.map(v => `<option value="${v.vname}" ${v.vname === currentVersion ? 'selected' : ''}>${v.vname} (VID: ${v.vid})</option>`).join("");
+        currentVersion = select.value || data[0].vname;
+      }
+    }
+
+    async function loadTypeDescriptors() {
+      const data = await apiFetch("/api/type_descriptors");
+      if (data) {
+        typeDescriptors = data;
+      }
+    }
+
+    function onVersionChange(newVer) {
+      currentVersion = newVer;
+      refreshCurrentTree();
+      // Reload active tab with new version
+      if (openTabs[activeTabIndex]) {
+        openTabs[activeTabIndex].version = currentVersion;
+        loadTabContent(activeTabIndex);
+        updateUrlHash(currentVersion, openTabs[activeTabIndex].path, openTabs[activeTabIndex].targetStartLine, openTabs[activeTabIndex].targetEndLine);
+      }
+    }
+
+    // ------------------------------------------------------------------------
+    // Sidebar & Tree Traversal
+    // ------------------------------------------------------------------------
+    async function refreshCurrentTree() {
+      const currentPath = openTabs[activeTabIndex] ? openTabs[activeTabIndex].path : "";
+      const dirPath = currentPath.includes(".") ? currentPath.substring(0, currentPath.lastIndexOf("/")) : currentPath;
+      const data = await apiFetch(`/api/version/${currentVersion}/browse/${encodeURIComponent(dirPath)}`);
+      renderSidebarTree(data, dirPath);
+    }
+
+    function renderSidebarTree(data, currentPath) {
+      const container = document.getElementById("sidebarTree");
+      if (!data) {
+        container.innerHTML = `<div style="padding: 12px; color: var(--danger);">Failed to load directory.</div>`;
+        return;
+      }
+
+      let html = "";
+      // Parent directory button if not root
+      if (currentPath && currentPath !== "/") {
+        const parentPath = currentPath.includes("/") ? currentPath.substring(0, currentPath.lastIndexOf("/")) : "";
+        html += `
+          <div class="tree-item" onclick="openPath('${parentPath}')">
+            <span class="tree-icon">📂</span> <span>.. (Parent)</span>
+          </div>
+        `;
+      }
+
+      // Subdirectories
+      if (data.sub_dirs && data.sub_dirs.length > 0) {
+        data.sub_dirs.forEach(sd => {
+          const dirName = sd.split("/").pop();
+          html += `
+            <div class="tree-item" onclick="openPath('${sd}')">
+              <span class="tree-icon">📁</span> <span>${dirName}</span>
+            </div>
+          `;
+        });
+      }
+
+      // Files
+      if (data.files && data.files.length > 0) {
+        data.files.forEach(f => {
+          const fileName = f.fname.split("/").pop();
+          const isCurrent = openTabs[activeTabIndex] && openTabs[activeTabIndex].path === f.fname;
+          html += `
+            <div class="tree-item ${isCurrent ? 'active' : ''}" onclick="openPath('${f.fname}')">
+              <span class="tree-icon">📄</span> <span>${fileName}</span>
+            </div>
+          `;
+        });
+      }
+
+      if (!html) {
+        html = `<div style="padding: 12px; color: var(--text-muted);">Empty directory.</div>`;
+      }
+
+      container.innerHTML = html;
+    }
+
+    function filterSidebarTree(query) {
+      const items = document.querySelectorAll("#sidebarTree .tree-item");
+      const q = query.toLowerCase();
+      items.forEach(item => {
+        const text = item.innerText.toLowerCase();
+        item.style.display = text.includes(q) ? "flex" : "none";
+      });
+    }
+
+    // ------------------------------------------------------------------------
+    // Tabs & Workspace Management
+    // ------------------------------------------------------------------------
+    function openTab(tabSpec) {
+      // Check if already open
+      const existingIdx = openTabs.findIndex(t => t.path === tabSpec.path && t.version === tabSpec.version);
+      if (existingIdx >= 0) {
+        switchTab(existingIdx);
+        return;
+      }
+
+      openTabs.push(tabSpec);
+      switchTab(openTabs.length - 1);
+    }
+
+    function switchTab(index) {
+      if (index < 0 || index >= openTabs.length) return;
+      activeTabIndex = index;
+      const tab = openTabs[index];
+      renderTabsBar();
+      loadTabContent(index);
+      updateBreadcrumbs(tab.path);
+      refreshCurrentTree();
+      updateUrlHash(tab.version, tab.path, tab.targetStartLine, tab.targetEndLine);
+    }
+
+    function closeTab(index, event) {
+      if (event) event.stopPropagation();
+      openTabs.splice(index, 1);
+      if (openTabs.length === 0) {
+        openTab({ type: "directory", version: currentVersion, path: "", title: `${currentVersion}: /` });
+      } else {
+        switchTab(Math.max(0, index - 1));
+      }
+    }
+
+    function renderTabsBar() {
+      const container = document.getElementById("tabsBar");
+      container.innerHTML = openTabs.map((t, idx) => {
+        const title = t.path ? t.path.split("/").pop() : "/";
+        const icon = t.type === "directory" ? "📁" : "📄";
+        return `
+          <div class="tab ${idx === activeTabIndex ? 'active' : ''}" onclick="switchTab(${idx})">
+            <span>${icon}</span>
+            <span>${t.version}: ${title}</span>
+            <span class="tab-close" onclick="closeTab(${idx}, event)">✕</span>
+          </div>
+        `;
+      }).join("") + `<span class="tab-add" onclick="openNewTabDialog()" title="Open new tab">+</span>`;
+    }
+
+    function openNewTabDialog() {
+      openTab({ type: "directory", version: currentVersion, path: "", title: `${currentVersion}: /` });
+    }
+
+    function updateBreadcrumbs(path) {
+      const bc = document.getElementById("breadcrumbs");
+      if (!path || path === "/") {
+        bc.innerHTML = `<span class="crumb-link" onclick="openPath('/')">/</span>`;
+        return;
+      }
+      const parts = path.split("/");
+      let accum = "";
+      let html = `<span class="crumb-link" onclick="openPath('/')">/</span>`;
+      parts.forEach((p, idx) => {
+        accum += (idx === 0 ? p : `/${p}`);
+        const currentAccum = accum;
+        html += ` <span>/</span> <span class="crumb-link" onclick="openPath('${currentAccum}')">${p}</span>`;
+      });
+      bc.innerHTML = html;
+    }
+
+    async function openPath(path) {
+      const norm = path.startsWith("/") ? path.slice(1) : path;
+      const currentTab = openTabs[activeTabIndex];
+      if (currentTab) {
+        currentTab.path = norm;
+        currentTab.targetStartLine = null;
+        currentTab.targetEndLine = null;
+        currentTab.title = `${currentVersion}: ${norm.split('/').pop() || '/'}`;
+        renderTabsBar();
+        await loadTabContent(activeTabIndex);
+        updateBreadcrumbs(norm);
+        refreshCurrentTree();
+        updateUrlHash(currentTab.version, currentTab.path);
+      }
+    }
+
+    // ------------------------------------------------------------------------
+    // Tab Content Loading & Highlighting
+    // ------------------------------------------------------------------------
+    async function loadTabContent(index) {
+      const tab = openTabs[index];
+      if (!tab) return;
+      const container = document.getElementById("tabContent");
+      container.innerHTML = `<div style="padding: 30px; text-align: center; color: var(--text-muted);">Loading content...</div>`;
+
+      const data = await apiFetch(`/api/version/${tab.version}/browse/${encodeURIComponent(tab.path)}`);
+      if (!data) {
+        container.innerHTML = `<div style="padding: 30px; color: var(--danger);">Failed to load ${tab.path}</div>`;
+        return;
+      }
+
+      if (data.type === "directory") {
+        renderDirectoryView(container, data);
+      } else {
+        renderFileCodeView(container, data);
+      }
+    }
+
+    function renderDirectoryView(container, data) {
+      let html = `
+        <div class="dir-container">
+          <div class="dir-header">
+            <div>
+              <h2 style="color: var(--text-bright); font-size: 18px;">Directory: ${data.path || '/'}</h2>
+              <span style="font-size: 12px; color: var(--text-muted);">${(data.sub_dirs || []).length} directories, ${(data.files || []).length} files</span>
+            </div>
+            <span class="badge badge-accent">Version: ${data.version}</span>
+          </div>
+
+          <table class="dir-table">
+            <thead>
+              <tr>
+                <th style="width: 40px;">Type</th>
+                <th>Name</th>
+                <th style="width: 80px;">FID</th>
+                <th style="width: 100px;">Status</th>
+                <th style="width: 100px;">Action</th>
+              </tr>
+            </thead>
+            <tbody>
+      `;
+
+      if (data.sub_dirs) {
+        data.sub_dirs.forEach(sd => {
+          const name = sd.split("/").pop();
+          html += `
+            <tr>
+              <td>📁</td>
+              <td><a class="item-link" onclick="openPath('${sd}')"><strong>${name}/</strong></a></td>
+              <td>-</td>
+              <td><span class="badge">DIR</span></td>
+              <td><button class="btn" style="padding: 2px 6px;" onclick="openTab({type: 'directory', version: '${data.version}', path: '${sd}', title: '${name}'})">New Tab</button></td>
+            </tr>
+          `;
+        });
+      }
+
+      if (data.files) {
+        data.files.forEach(f => {
+          const name = f.fname.split("/").pop();
+          const statusBadge = f.s_stat === 'A' ? '<span class="badge badge-success">Added</span>' : (f.s_stat === 'M' ? '<span class="badge badge-accent">Modified</span>' : '<span class="badge">Active</span>');
+          html += `
+            <tr>
+              <td>📄</td>
+              <td><a class="item-link" onclick="openPath('${f.fname}')">${name}</a></td>
+              <td><code>${f.fid}</code></td>
+              <td>${statusBadge}</td>
+              <td><button class="btn" style="padding: 2px 6px;" onclick="openTab({type: 'file', version: '${data.version}', path: '${f.fname}', title: '${name}'})">New Tab</button></td>
+            </tr>
+          `;
+        });
+      }
+
+      html += `
+            </tbody>
+          </table>
+        </div>
+      `;
+      container.innerHTML = html;
+    }
+
+    function renderFileCodeView(container, data) {
+      const fileInfo = data.file_info || {};
+      const tags = data.tags || [];
+
+      // Calculate statistics
+      let totalMaps = 0;
+      tags.forEach(t => { if (t.maps) totalMaps += t.maps.length; });
+
+      let html = `
+        <div class="file-meta-bar">
+          <div class="file-meta-info">
+            <span><strong>File:</strong> ${data.path}</span>
+            <span><strong>FID:</strong> <code>${fileInfo.fid}</code></span>
+            <span><strong>Version:</strong> <span class="badge badge-accent">${data.version}</span></span>
+            <span><strong>Tags:</strong> ${tags.length}</span>
+            <span><strong>Mapped Elements:</strong> ${totalMaps}</span>
+          </div>
+          <div>
+            <button class="btn" onclick="expandAllCode()">Expand All</button>
+            <button class="btn" onclick="collapseAllCode()">Collapse All</button>
+          </div>
+        </div>
+
+        <div class="code-viewer">
+          <div class="code-scroll-wrapper">
+            <div id="codeGutter" class="gutter"></div>
+            <div id="codeBody" class="code-body"></div>
+          </div>
+        </div>
+      `;
+
+      container.innerHTML = html;
+      buildHighlightedSource(tags);
+    }
+
+    function highlightLineText(rawText, lineMaps) {
+      if (!rawText) return "";
+      if (!lineMaps || lineMaps.length === 0) return escapeHtml(rawText);
+
+      const len = rawText.length;
+      const charTokens = new Array(len);
+
+      // For each character column, find the innermost (smallest span) active token
+      for (let k = 0; k < len; k++) {
+        const col = k + 1; // 1-indexed column
+        let bestToken = null;
+        let bestSpan = Infinity;
+
+        for (let i = 0; i < lineMaps.length; i++) {
+          const m = lineMaps[i];
+          const cs = m.char_s || 1;
+          const ce = m.char_e || 9999;
+          if (cs <= col && col <= ce) {
+            const span = (ce - cs);
+            if (span < bestSpan) {
+              bestSpan = span;
+              bestToken = m;
+            }
+          }
+        }
+        charTokens[k] = bestToken;
+      }
+
+      // Group contiguous characters with the same winning token
+      let result = "";
+      let idx = 0;
+
+      while (idx < len) {
+        const tok = charTokens[idx];
+        let runEnd = idx + 1;
+        while (runEnd < len && charTokens[runEnd] === tok) {
+          runEnd++;
+        }
+
+        const segment = rawText.substring(idx, runEnd);
+
+        if (!tok) {
+          result += escapeHtml(segment);
+        } else {
+          const typeKey = tok.type_name || "Undefined";
+          const hlConfig = highlightSettings[typeKey] || highlightSettings["Undefined"] || { color: "#98c379", enabled: true };
+
+          if (hlConfig.enabled) {
+            result += `<span class="token" style="color: ${hlConfig.color};" onclick="inspectAst(${tok.ast_id}, '${escapeHtml(tok.ast_name || '')}', '${tok.type_name}', event)" title="AST: ${escapeHtml(tok.ast_name || '')} (${tok.type_name})">${escapeHtml(segment)}</span>`;
+          } else {
+            result += escapeHtml(segment);
+          }
+        }
+
+        idx = runEnd;
+      }
+
+      return result;
+    }
+
+    function buildHighlightedSource(tags) {
+      const gutter = document.getElementById("codeGutter");
+      const body = document.getElementById("codeBody");
+      if (!gutter || !body) return;
+
+      if (!tags || tags.length === 0) {
+        gutter.innerHTML = `<div class="gutter-line"><span>1</span></div>`;
+        body.innerHTML = `<div class="code-line" style="color: var(--text-muted); padding: 12px;">(Empty file or no AST tags found)</div>`;
+        return;
+      }
+
+      // 1. Sort tags by line_s ASC, char_s ASC, and span length DESC (outermost first)
+      const sortedTags = tags.slice().sort((a, b) => {
+        if (a.line_s !== b.line_s) return (a.line_s || 0) - (b.line_s || 0);
+        if (a.char_s !== b.char_s) return (a.char_s || 0) - (b.char_s || 0);
+        return ((b.line_e || 0) - (b.line_s || 0)) - ((a.line_e || 0) - (a.line_s || 0));
+      });
+
+      // 2. Identify Outermost / Primary Tags (Base source code lines)
+      const outerTags = [];
+      sortedTags.forEach((t) => {
+        let isNested = false;
+        for (let other of sortedTags) {
+          if (other.tag_id === t.tag_id) continue;
+          const otherIsLarger = (
+            (other.line_s < t.line_s || (other.line_s === t.line_s && other.char_s <= t.char_s)) &&
+            (other.line_e > t.line_e || (other.line_e === t.line_e && other.char_e >= t.char_e))
+          );
+          if (otherIsLarger && (
+            (other.line_e - other.line_s > t.line_e - t.line_s) ||
+            (other.char_e - other.char_s > t.char_e - t.char_s) ||
+            (other.line_s < t.line_s)
+          )) {
+            isNested = true;
+            break;
+          }
+        }
+        if (!isNested) {
+          outerTags.push(t);
+        }
+      });
+
+      // 3. Find max line number in file
+      let maxLine = 1;
+      sortedTags.forEach(t => {
+        if (t.line_e && t.line_e > maxLine) maxLine = t.line_e;
+        if (t.line_s && t.line_s > maxLine) maxLine = t.line_s;
+      });
+
+      // 4. Map each file line to its base text and collapse button from outerTags
+      const fileLines = {};
+
+      outerTags.forEach((tag, outerIdx) => {
+        const tagCode = tag.code || "";
+        const tagLines = tagCode.split("\n");
+        const startL = tag.line_s || 1;
+        const endL = startL + tagLines.length - 1;
+
+        tagLines.forEach((lineText, lineIdxInTag) => {
+          const fileLineNum = startL + lineIdxInTag;
+          const isFirstLine = lineIdxInTag === 0;
+
+          // Collapse button for multi-line tags on first line
+          const collapseBtn = (isFirstLine && tagLines.length > 1) 
+            ? `<span class="collapse-btn" id="cbtn_${outerIdx}" onclick="toggleTagCollapse(${outerIdx}, ${startL}, ${endL}, event)">▼</span>` 
+            : "";
+
+          // Indentation: if first line of tag and char_s > 1, infer leading spaces
+          const leadingSpaces = (isFirstLine && tag.char_s > 1) ? " ".repeat(tag.char_s - 1) : "";
+          const fullRawLine = leadingSpaces + lineText;
+
+          if (!fileLines[fileLineNum]) {
+            fileLines[fileLineNum] = {
+              rawText: fullRawLine,
+              collapseBtn: collapseBtn,
+              outerIdx: outerIdx,
+              tag: tag
+            };
+          }
+        });
+      });
+
+      // 5. Gather token highlights for each line across ALL tags & multi-line maps
+      const lineMapsMap = {};
+      sortedTags.forEach(t => {
+        const tagLineStart = t.line_s || 1;
+        const tagCharStart = t.char_s || 1;
+
+        if (t.maps && t.maps.length > 0) {
+          t.maps.forEach(m => {
+            const m_line_s = m.line_s || 1;
+            const m_line_e = m.line_e || m_line_s;
+            const abs_start_line = tagLineStart + (m_line_s - 1);
+            const abs_end_line = tagLineStart + (m_line_e - 1);
+
+            for (let absL = abs_start_line; absL <= abs_end_line; absL++) {
+              if (!lineMapsMap[absL]) lineMapsMap[absL] = [];
+
+              let cs = 1;
+              let ce = 9999;
+
+              if (abs_start_line === abs_end_line) {
+                // Single-line map
+                cs = (m_line_s === 1) ? (tagCharStart + (m.char_s - 1)) : (m.char_s || 1);
+                ce = (m_line_s === 1) ? (tagCharStart + (m.char_e - 1)) : (m.char_e || 9999);
+              } else if (absL === abs_start_line) {
+                // First line of multi-line map
+                cs = (m_line_s === 1) ? (tagCharStart + (m.char_s - 1)) : (m.char_s || 1);
+                ce = 9999;
+              } else if (absL === abs_end_line) {
+                // Last line of multi-line map
+                cs = 1;
+                ce = (m_line_e === 1) ? (tagCharStart + (m.char_e - 1)) : (m.char_e || 9999);
+              } else {
+                // Middle line of multi-line map
+                cs = 1;
+                ce = 9999;
+              }
+
+              lineMapsMap[absL].push({
+                char_s: cs,
+                char_e: ce,
+                ast_id: m.ast_id,
+                ast_name: m.ast_name,
+                type_name: m.type_name,
+                is_multi_line: (abs_end_line > abs_start_line)
+              });
+            }
+          });
+        } else {
+          const tag_start = t.line_s || 1;
+          const tag_end = t.line_e || tag_start;
+          for (let l = tag_start; l <= tag_end; l++) {
+            if (!lineMapsMap[l]) lineMapsMap[l] = [];
+            let cs = 1;
+            let ce = 9999;
+
+            if (tag_start === tag_end) {
+              cs = t.char_s || 1;
+              ce = t.char_e || 9999;
+            } else if (l === tag_start) {
+              cs = t.char_s || 1;
+              ce = 9999;
+            } else if (l === tag_end) {
+              cs = 1;
+              ce = t.char_e || 9999;
+            } else {
+              cs = 1;
+              ce = 9999;
+            }
+
+            lineMapsMap[l].push({
+              char_s: cs,
+              char_e: ce,
+              ast_id: t.ast_id,
+              ast_name: t.ast_name,
+              type_name: t.ast_type_name,
+              is_multi_line: (tag_end > tag_start)
             });
-            html += '</tr>';
+          }
+        }
+      });
+
+      // 6. Render gutter and code body
+      let gutterHtml = "";
+      let bodyHtml = "";
+
+      for (let l = 1; l <= maxLine; l++) {
+        const lineData = fileLines[l] || { rawText: " ", collapseBtn: "", outerIdx: null };
+        const collapseSpan = lineData.collapseBtn || "";
+        const tagClass = lineData.outerIdx !== null ? `tag-block-${lineData.outerIdx}` : "";
+        const rawText = lineData.rawText || " ";
+
+        // Sort maps for this line: smallest span (innermost specific token) first
+        const lineMaps = (lineMapsMap[l] || []).slice().sort((a, b) => {
+          const spanA = (a.char_e - a.char_s);
+          const spanB = (b.char_e - b.char_s);
+          if (spanA !== spanB) return spanA - spanB;
+          return a.char_s - b.char_s;
         });
 
-        html += '</tbody></table>';
-        return html;
-    };
+        const highlightedContent = highlightLineText(rawText, lineMaps);
 
-    return createTable(jsonData);
-}
+        gutterHtml += `<div class="gutter-line" id="g_${l}" onclick="onLineClick(${l}, event)" title="Line ${l} (Click to link, Shift+Click for range)"><span>${l}</span> ${collapseSpan}</div>`;
+        bodyHtml += `<div class="code-line ${tagClass}" id="l_${l}">${highlightedContent || ' '}</div>`;
+      }
 
+      gutter.innerHTML = gutterHtml;
+      body.innerHTML = bodyHtml;
 
-function expend_all() {
-    document.querySelectorAll("details").forEach(el => {
-        el.open = true; // Set the 'open' attribute to expand
-    });
-}
-
-async function fetch_file(version, path){
-    if (path == "/") {path = "";}
-    let request = await fetch(server + "v/" + version + "/" + path);
-    return await request.json();
-}
-
-async function fetch_tid(tid){
-    let request = await fetch(server + "api/tid/" + tid);
-    return await request.json();
-}
-
-
-async function fetch_raw_file(version, path){
-    let request = await fetch(server + "api/rf/" + version + "/" + path);
-    return await request.json();
-}
-
-async function fetch_include(fid){
-    let request = await fetch(server + "api/i/" + fid);
-    return await request.json();
-}
-
-async function fetch_tag(fid){
-    let request = await fetch(server + "api/t/" + fid);
-    return await request.json();
-}
-
-async function fetch_c_file(fid){
-    let request = await fetch(server + "api/cf/" + fid);
-    return await request.json();
-}
-
-async function fetch_c_tag(tgid){
-    let request = await fetch(server + "api/ct/" + tgid);
-    return await request.json();
-}
-
-async function generate_content(version, path){
-    let request_json = await fetch_file(version, path);
-    let text = "<button class=\"dlink\" onclick=\"open_file('/')\">..</button><br>";
-    console.log(request_json);
-
-    if (request_json == -1){
-        text += "<p>ERROR, IN FUNCTION GENERATE_CONTENT</p>";
-        return text
+      // Handle target line scrolling and highlighting from URL hash
+      const currentTab = openTabs[activeTabIndex];
+      if (currentTab && currentTab.targetStartLine) {
+        selectedLineStart = currentTab.targetStartLine;
+        setTimeout(() => {
+          const targetEl = document.getElementById(`l_${currentTab.targetStartLine}`);
+          if (targetEl) {
+            targetEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            highlightLineRange(currentTab.targetStartLine, currentTab.targetEndLine || currentTab.targetStartLine);
+          }
+        }, 60);
+      }
     }
 
-    if (path.includes("/")){
-        text = "<button class=\"dlink\" onclick=\"open_file('" + path.slice(0, path.lastIndexOf('/')) + "')\">..</button><br>";
+    function escapeHtml(text) {
+      if (!text) return "";
+      return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
     }
-    
-    if (request_json.ftype == 0){
-        let len = request_json.sub_dirs.length;
-        for (let i = 0; i < len; i++) {
-            file_name = request_json.sub_dirs[i].slice(request_json.sub_dirs[i].lastIndexOf('/') + 1);
-            text += "<button class=\"dlink\" onclick=\"open_file('" + request_json.sub_dirs[i] + "')\">" + file_name + "</button><br>";
+
+    function toggleTagCollapse(tagIndex, startLine, endLine, event) {
+      if (event) event.stopPropagation();
+      const btn = document.getElementById(`cbtn_${tagIndex}`);
+      const isCurrentlyCollapsed = btn && btn.innerText === "▶";
+
+      for (let l = startLine + 1; l <= endLine; l++) {
+        const codeEl = document.getElementById(`l_${l}`);
+        const gutterEl = document.getElementById(`g_${l}`);
+        if (codeEl) {
+          if (isCurrentlyCollapsed) {
+            codeEl.classList.remove("collapsed");
+          } else {
+            codeEl.classList.add("collapsed");
+          }
         }
-    } else if (request_json.ftype == 1) {
-        tags = request_json.tags;
-        delete request_json.tags;
-
-        text += jsonToHtmlTable(request_json) + "<br>";
-
-        text += "<div class=\"left-pad\"><details><summary><b>tags: </b></summary><p>";
-        let len_tags = tags.length;
-        for (let i = 0; i < len_tags; i++) {
-            text += "<div class=\"tag-container\">"
-            if ("name" in tags[i]){
-                if (!(tags[i].name === null)){
-                    text += "<b>" + tags[i].name + "</b>"
-                }
-                delete tags[i].name
-            }
-            tag_code = null
-            if ("code" in tags[i]){
-                if (!(tags[i].code === null)){
-                    tag_code = tags[i].code;
-                    delete tags[i].code;
-                }
-            }
-            tag_ast_raw = null
-            if ("ast_raw" in tags[i]){
-                if (!(tags[i].ast_raw === null)){
-                    tag_ast_raw = tags[i].ast_raw
-                }
-                delete tags[i].ast_raw
-            }
-            text += jsonToHtmlTable(tags[i]);
-            if ((tag_code == null) && (tag_ast_raw == null)){
-                text += "<br>";
-                break
-            }
-            if (tag_code != null){
-                text += "<details><summary><b>code: </b></summary><p><code class=\"tag-code\">" + tag_code + "</code>";
-                text += "</p></details>";
-            }
-
-            if (tag_ast_raw != null){
-                text += "<details><summary><b>ast_raw: </b></summary><p>" + jsonToHtmlTable(tag_ast_raw) + "";
-                text += "</p></details>";
-            }
-            text += "</div>"
-            text += "<br>"
+        if (gutterEl) {
+          if (isCurrentlyCollapsed) {
+            gutterEl.classList.remove("collapsed");
+          } else {
+            gutterEl.classList.add("collapsed");
+          }
         }
-        text += "</p></details></div>";
+      }
+
+      if (btn) {
+        btn.innerText = isCurrentlyCollapsed ? "▼" : "▶";
+      }
     }
 
-
-
-
-    text += request_json.ftype;
-    return text
-}
-
-async function open_version(version){
-    clear_active_tab();
-    tabs_arr.push(await tab.create(version, "/"));
-    print_tabs();
-}
-
-async function open_file(path){
-    await tabs_arr[active_index].update_file(path);
-    print_tabs();
-}
-
-async function fetch_sidebar(){
-    let request = await fetch(server + "versions");
-    let request_arr = await request.json();
-
-    let len = request_arr.length;
-    let text = "";
-
-    for (let i = 0; i < len; i++) {
-        text += "<button class=\"slink\" onclick=\"open_version('" + request_arr[i][1] + "')\">" + request_arr[i][1] + "</button><br>";
+    function collapseAllCode() {
+      document.querySelectorAll(".collapse-btn").forEach(btn => {
+        if (btn.innerText === "▼") {
+          btn.click();
+        }
+      });
     }
-    return text
-}
 
-async function exec_sidebar(){
-    document.getElementById("sidebar").innerHTML = await fetch_sidebar();
-}
-
-function main(){
-    exec_sidebar()
-}
-
-
-async function ping_test(){
-    let result = fetch(server, {
-        method: 'GET'
-    })
-    .then(response => response.json())
-    .then(data => true)
-    .catch(error => false);
-    return result
-}
-
-async function server_test_boot(api_addr) {
-    server = api_addr
-    console.log(server)
-    if (await ping_test()){
-        main()
+    function expandAllCode() {
+      document.querySelectorAll(".collapse-btn").forEach(btn => {
+        if (btn.innerText === "▶") {
+          btn.click();
+        }
+      });
     }
-}
 
-document.getElementById("login-button").addEventListener("click", function foo(){server_test_boot(document.getElementById("api-addr").value)});
+    // ------------------------------------------------------------------------
+    // AST Container Hierarchy Inspector
+    // ------------------------------------------------------------------------
+    async function inspectAst(astId, name, typeName, event) {
+      if (event) event.stopPropagation();
+      selectedAstId = astId;
+      const inspector = document.getElementById("astInspector");
+      const content = document.getElementById("astInspectorContent");
+      inspector.classList.add("open");
 
-server_test_boot(server)
+      content.innerHTML = `<div style="color: var(--text-muted);">Fetching recursive AST hierarchy for AST ID: ${astId}...</div>`;
+      const data = await apiFetch(`/api/ast/${astId}/tree?depth=${currentInspectorDepth}`);
+      if (!data) {
+        content.innerHTML = `<div style="color: var(--danger);">Failed to load AST container tree.</div>`;
+        return;
+      }
 
+      content.innerHTML = renderAstTreeNode(data);
+    }
 
-</script>
+    function renderAstTreeNode(node) {
+      if (!node) return "";
+      let html = `
+        <div class="tree-node">
+          <div class="tree-node-title">
+            <span class="badge badge-accent">AST: ${node.ast_id}</span>
+            <strong style="color: var(--text-bright);">${node.name || 'Anonymous'}</strong>
+            <span class="badge">${node.type_name || 'Undefined'}</span>
+            ${node.ast_raw ? `<span style="font-size: 10px; color: var(--text-muted); cursor: pointer;" onclick="alert(JSON.stringify(${escapeHtml(JSON.stringify(node.ast_raw))}, null, 2))">🔍 raw JSON</span>` : ''}
+          </div>
+      `;
+
+      if (node.containers && node.containers.length > 0) {
+        html += `<div style="margin-left: 12px; margin-top: 4px;">`;
+        node.containers.forEach(c => {
+          html += `
+            <div style="margin-top: 3px;">
+              <span style="color: var(--accent); font-size: 11px;">↳ [Priority ${c.priority}] (${c.rel_type_name}):</span>
+              ${renderAstTreeNode(c.child_node)}
+            </div>
+          `;
+        });
+        html += `</div>`;
+      } else {
+        html += `<div style="font-size: 11px; color: var(--text-muted); margin-left: 14px;">(No child containers)</div>`;
+      }
+
+      html += `</div>`;
+      return html;
+    }
+
+    function onDepthChange(val) {
+      currentInspectorDepth = parseInt(val, 10);
+      document.getElementById("depthVal").innerText = val;
+      if (selectedAstId) {
+        inspectAst(selectedAstId, "", "");
+      }
+    }
+
+    function closeAstInspector() {
+      document.getElementById("astInspector").classList.remove("open");
+    }
+
+    // ------------------------------------------------------------------------
+    // Highlight Palette Manager
+    // ------------------------------------------------------------------------
+    function openHighlightModal() {
+      document.getElementById("highlightModal").classList.add("open");
+      renderColorPickers();
+    }
+
+    function closeHighlightModal() {
+      document.getElementById("highlightModal").classList.remove("open");
+      localStorage.setItem("kernelinfo_hl_settings", JSON.stringify(highlightSettings));
+      // Re-render active code view
+      if (openTabs[activeTabIndex] && openTabs[activeTabIndex].type !== "directory") {
+        loadTabContent(activeTabIndex);
+      }
+    }
+
+    function initHighlightManager() {
+      // Merge descriptors into settings
+      typeDescriptors.forEach(td => {
+        if (!highlightSettings[td.name]) {
+          highlightSettings[td.name] = { color: "#61afef", enabled: true, label: td.name };
+        }
+      });
+    }
+
+    function renderColorPickers() {
+      const container = document.getElementById("colorPickerGrid");
+      container.innerHTML = Object.entries(highlightSettings).map(([key, config]) => {
+        return `
+          <div class="color-card">
+            <label>
+              <input type="checkbox" ${config.enabled ? 'checked' : ''} onchange="toggleHighlightCategory('${key}', this.checked)">
+              <span>${config.label || key}</span>
+            </label>
+            <input type="color" class="color-picker" value="${config.color}" onchange="changeHighlightColor('${key}', this.value)">
+          </div>
+        `;
+      }).join("");
+    }
+
+    function toggleHighlightCategory(key, enabled) {
+      if (highlightSettings[key]) highlightSettings[key].enabled = enabled;
+    }
+
+    function changeHighlightColor(key, color) {
+      if (highlightSettings[key]) highlightSettings[key].color = color;
+    }
+
+    function resetHighlightDefaults() {
+      highlightSettings = JSON.parse(JSON.stringify(defaultHighlightSettings));
+      renderColorPickers();
+    }
+
+    // ------------------------------------------------------------------------
+    // Dev Tools Modal (Gear Icon) & Interactive Endpoint Runner
+    // ------------------------------------------------------------------------
+    const devEndpointDefinitions = [
+      {
+        id: "ep_versions",
+        method: "GET",
+        path: "/api/versions",
+        description: "List all registered Linux kernel versions from m_v_main",
+        params: [],
+        buildUrl: () => "/api/versions"
+      },
+      {
+        id: "ep_types",
+        method: "GET",
+        path: "/api/type_descriptors",
+        description: "List all AST syntax category descriptors from m_type_descriptor",
+        params: [],
+        buildUrl: () => "/api/type_descriptors"
+      },
+      {
+        id: "ep_browse",
+        method: "GET",
+        path: "/api/version/{version_name}/browse/{path}",
+        description: "Browse directory hierarchy or fetch full file AST tags and spatial maps",
+        params: [
+          { name: "version_name", label: "Version Name", type: "text", default: "v3.0" },
+          { name: "path", label: "File or Directory Path", type: "text", default: "include/linux/lockd/bind.h" }
+        ],
+        buildUrl: (vals) => `/api/version/${encodeURIComponent(vals.version_name || 'v3.0')}/browse/${encodeURIComponent((vals.path || '').replace(/^\/+/, ''))}`
+      },
+      {
+        id: "ep_ast_tree",
+        method: "GET",
+        path: "/api/ast/{ast_id}/tree?depth={depth}",
+        description: "Recursively resolve m_ast_container child hierarchy down to requested depth",
+        params: [
+          { name: "ast_id", label: "AST Node ID", type: "number", default: "50" },
+          { name: "depth", label: "Traversal Depth (1-10)", type: "number", default: "3" }
+        ],
+        buildUrl: (vals) => `/api/ast/${vals.ast_id || 1}/tree?depth=${vals.depth || 3}`
+      },
+      {
+        id: "ep_file",
+        method: "GET",
+        path: "/api/file/{fid}",
+        description: "Direct file metadata, tags, and spatial coordinates inspection by File ID (fid)",
+        params: [
+          { name: "fid", label: "File ID (fid)", type: "number", default: "1" }
+        ],
+        buildUrl: (vals) => `/api/file/${vals.fid || 1}`
+      },
+      {
+        id: "ep_tag",
+        method: "GET",
+        path: "/api/tag/{tag_id}",
+        description: "Direct tag metadata and spatial coordinate map inspection by Tag ID (tag_id)",
+        params: [
+          { name: "tag_id", label: "Tag ID (tag_id)", type: "number", default: "1" }
+        ],
+        buildUrl: (vals) => `/api/tag/${vals.tag_id || 1}`
+      },
+      {
+        id: "ep_tables",
+        method: "GET",
+        path: "/api/dev/tables",
+        description: "Inspect row counts across all 14 database schema tables",
+        params: [],
+        buildUrl: () => "/api/dev/tables"
+      },
+      {
+        id: "ep_custom",
+        method: "GET",
+        path: "Custom URL Path",
+        description: "Execute an arbitrary API endpoint path directly against backend",
+        params: [
+          { name: "custom_path", label: "API Endpoint Path", type: "text", default: "/api/versions" }
+        ],
+        buildUrl: (vals) => {
+          const p = (vals.custom_path || '').trim();
+          return p.startsWith('/') ? p : `/${p}`;
+        }
+      }
+    ];
+
+    function openDevModal() {
+      document.getElementById("devModal").classList.add("open");
+      renderDevEndpoints();
+    }
+
+    function closeDevModal() {
+      document.getElementById("devModal").classList.remove("open");
+    }
+
+    async function refreshDevStats() {
+      const container = document.getElementById("devTableCounts");
+      container.innerHTML = `<span class="badge" style="color: var(--accent);">Fetching table row counts from MySQL...</span>`;
+      const data = await apiFetch("/api/dev/tables");
+      if (!data) {
+        container.innerHTML = `<span class="badge badge-danger">Failed to fetch table statistics</span>`;
+        return;
+      }
+      container.innerHTML = Object.entries(data).map(([t, count]) => {
+        return `<span class="badge"><strong>${t}:</strong> ${count} rows</span>`;
+      }).join(" ");
+    }
+
+    function renderDevEndpoints() {
+      const container = document.getElementById("devEndpointList");
+      container.innerHTML = devEndpointDefinitions.map((ep, idx) => {
+        const hasParams = ep.params && ep.params.length > 0;
+        return `
+          <div class="dev-endpoint-card">
+            <div class="dev-endpoint-head">
+              <div>
+                <span class="badge badge-accent">${ep.method}</span>
+                <span class="dev-endpoint-path">${ep.path}</span>
+              </div>
+              <button class="btn btn-accent" onclick="runDevEndpointWithParams('${ep.id}', ${idx})">▶ Execute</button>
+            </div>
+            <div style="font-size: 12px; color: var(--text-muted); margin-bottom: 6px;">${ep.description}</div>
+            
+            ${hasParams ? `
+              <div style="display: flex; flex-wrap: wrap; gap: 10px; margin-bottom: 8px; background: rgba(0,0,0,0.25); padding: 8px 10px; border-radius: 4px; border: 1px solid var(--border-color);">
+                ${ep.params.map(p => `
+                  <div style="display: flex; flex-direction: column; gap: 2px;">
+                    <label style="font-size: 11px; color: var(--text-bright); font-weight: 500;">${p.label}:</label>
+                    <input type="${p.type}" id="param_${ep.id}_${p.name}" value="${p.default}" style="background: var(--bg-dark); border: 1px solid var(--border-color); color: var(--text-main); padding: 4px 8px; border-radius: 3px; font-size: 12px; min-width: 140px;">
+                  </div>
+                `).join('')}
+              </div>
+            ` : ''}
+
+            <div id="devResp_${idx}" class="dev-response-box"></div>
+          </div>
+        `;
+      }).join("");
+    }
+
+    async function runDevEndpointWithParams(epId, idx) {
+      const ep = devEndpointDefinitions.find(e => e.id === epId);
+      if (!ep) return;
+
+      const vals = {};
+      ep.params.forEach(p => {
+        const el = document.getElementById(`param_${ep.id}_${p.name}`);
+        if (el) vals[p.name] = el.value.trim();
+      });
+
+      const url = ep.buildUrl(vals);
+      const box = document.getElementById(`devResp_${idx}`);
+      box.style.display = "block";
+      box.innerHTML = `<span style="color: var(--accent);">Executing GET ${url}...</span>`;
+      
+      const res = await apiFetch(url);
+      box.innerHTML = `
+        <div style="color: var(--text-muted); font-size: 11px; margin-bottom: 6px; display: flex; justify-content: space-between;">
+          <span>Requested Endpoint: <code>${url}</code></span>
+          <span>Status: ${res !== null ? '✅ 200 OK' : '❌ Error'}</span>
+        </div>
+        <pre class="json-view">${escapeHtml(JSON.stringify(res, null, 2))}</pre>
+      `;
+    }
+  </script>
+</body>
 </html>
