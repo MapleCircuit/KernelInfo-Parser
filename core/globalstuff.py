@@ -75,6 +75,9 @@ class GlobalStuff:
         # TypeCheck
         self.DEBUG_TYPECHECK = False
 
+        # Profiling Facility
+        self.PROFILING_ENABLED = False
+
         self.OP_isinstanceDict = {
             PointerType: self.is_PointerType,
             JoinType: self.is_JoinType,

@@ -88,6 +88,7 @@ are converted into pure native `int` objects to maintain database driver compati
 from __future__ import annotations
 
 import sys
+import time
 import logging
 from operator import itemgetter
 from typing import Any, Self
@@ -124,6 +125,7 @@ from core.globalstuff import (
     UnSafeDataType,
 )
 from parser.c_ast.c_ast import c_ast_parse
+from core.Profiler import PipelineProfiler
 
 logger = logging.getLogger(__name__)
 
@@ -234,6 +236,9 @@ class ChangeSet:
         self.prior_tags: Any | None = None
         self.parsers: dict[str, Any] = {}
         self.debug: list[Any] = []
+        self.profiler: PipelineProfiler | None = (
+            PipelineProfiler(file_path=self.current_path or "") if G.PROFILING_ENABLED else None
+        )
 
     @G.type_check(Self, {LinkType})
     def __call__(self, *links: LinkType) -> Self:
@@ -389,6 +394,8 @@ class ChangeSet:
 
         te = G.TE
         operation_offset = len(self.cs_result)
+        t_exec_0 = time.perf_counter() if self.profiler is not None else 0.0
+
         for operation in self.cs[operation_offset:]:
             try:
                 op_type = operation[1]
@@ -418,7 +425,12 @@ class ChangeSet:
                 logger.error(f"ERROR, UNKNOWN OPERATION {operation}")
                 self.cs_result.append(None)
             except REF_NOT_RESOLVABLE:
+                if self.profiler is not None:
+                    self.profiler.cs_execute_s = time.perf_counter() - t_exec_0
                 return False
+
+        if self.profiler is not None:
+            self.profiler.cs_execute_s = time.perf_counter() - t_exec_0
 
         self.cs_processed = True
         return True

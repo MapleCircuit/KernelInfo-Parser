@@ -151,6 +151,7 @@ def run_single_file_worker(item: dict[str, Any]) -> dict[str, Any]:
             "results_count": len(cs.cs_result),
             "elapsed_s": elapsed,
             "exec_time_s": exec_time,
+            "profiler": cs.profiler.to_dict() if cs.profiler else None,
             "error": None,
         }
     except Exception as e:
@@ -165,6 +166,7 @@ def run_single_file_worker(item: dict[str, Any]) -> dict[str, Any]:
             "results_count": 0,
             "elapsed_s": elapsed,
             "exec_time_s": 0,
+            "profiler": None,
             "error": str(e),
         }
     finally:
@@ -217,21 +219,29 @@ class TestCASTParser(unittest.TestCase):
         self.assertEqual(getattr(cursor, "_spelling_str", None), "my_func")
 
 
-def run_c_ast_tests(target_file: str | None = None) -> int:
+def run_c_ast_tests(target_file: str | None = None, profile: bool = False) -> int:
     """Programmatic multi-core test runner invoked via CLI in main.py.
     
     Args:
         target_file: Optional single file path to test.
+        profile: Whether to collect and print granular stage profiler breakdowns.
         
     Returns:
         0 if all tests pass, 1 otherwise.
     """
+    if profile:
+        G.PROFILING_ENABLED = True
+
     print(COLOR.cyan("\n=========================================================================================="))
     print(COLOR.cyan("                    MULTI-CORE C-AST PARSER & EXECUTE TEST RUNNER                         "))
     print(COLOR.cyan("=========================================================================================="))
     print(f"Workspace: {COLOR.magenta(G.RAMDISK)} (Isolated /dev/shm RAMDISK)")
     print(f"Dataset:   {COLOR.magenta('Linux v3.0 (Read-Only)')}")
-    print(f"Backend:   {COLOR.magenta('In-Memory MockDB (Isolated)')}\n")
+    print(f"Backend:   {COLOR.magenta('In-Memory MockDB (Isolated)')}")
+    if G.PROFILING_ENABLED:
+        print(f"Profiler:  {COLOR.green('ACTIVE (-p / --profile)')}\n")
+    else:
+        print()
 
     start_time = time.time()
 
@@ -249,6 +259,10 @@ def run_c_ast_tests(target_file: str | None = None) -> int:
             print(f"    - Operations Staged:    {res['actual_total_ops']:,}")
             print(f"    - CS.execute():         {COLOR.green('SUCCESS')}")
             print(f"    - Execution Time:       {elapsed:.2f}s\n")
+            if res.get("profiler"):
+                from core.Profiler import PipelineProfiler, format_profiling_report
+                prof_obj = PipelineProfiler.from_dict(res["profiler"])
+                print(format_profiling_report([prof_obj], title=f"PIPELINE PROFILE: {target_file}"))
             return 0
         else:
             print(COLOR.red(f"\n[-] FAIL: {target_file} after {elapsed:.2f}s"))
@@ -271,7 +285,12 @@ def run_c_ast_tests(target_file: str | None = None) -> int:
 
     all_passed = True
     any_delta = False
+    profiler_list = []
     for r in results:
+        if r.get("profiler"):
+            from core.Profiler import PipelineProfiler
+            profiler_list.append(PipelineProfiler.from_dict(r["profiler"]))
+
         if r["error"]:
             all_passed = False
             exec_str = COLOR.red("ERROR")
@@ -304,6 +323,10 @@ def run_c_ast_tests(target_file: str | None = None) -> int:
         print(COLOR.yellow("[*] NOTE: Operation count deltas detected."))
         print("    Length changes reflect AST optimization / output changes and are tracked for review.\n")
 
+    if G.PROFILING_ENABLED and profiler_list:
+        from core.Profiler import format_profiling_report
+        print(format_profiling_report(profiler_list, title="MULTI-CORE PIPELINE STAGE TIMING BREAKDOWN"))
+
     if all_passed:
         print(COLOR.green(f"[+] ALL {len(results)} MULTI-CORE TESTS PASSED & EXECUTED CLEANLY in {elapsed:.2f}s!"))
         print(COLOR.cyan("==========================================================================================\n"))
@@ -315,4 +338,9 @@ def run_c_ast_tests(target_file: str | None = None) -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(run_c_ast_tests())
+    import argparse
+    parser = argparse.ArgumentParser(description="C-AST Parser Test Suite")
+    parser.add_argument("target_file", nargs="?", default=None, help="Target file to parse")
+    parser.add_argument("-p", "--profile", action="store_true", help="Enable granular stage timing profiler")
+    args = parser.parse_args()
+    sys.exit(run_c_ast_tests(target_file=args.target_file, profile=args.profile))

@@ -54,6 +54,7 @@ from core.globalstuff import (
     ASTT,
 )
 import sys
+import time
 import logging
 import argparse
 import multiprocessing
@@ -181,6 +182,12 @@ def update(version: str) -> None:
 
     for table in gp.Table_Array:
         G.TE.commit(table.table_id)
+
+    if G.PROFILING_ENABLED and gp.ChangeSet_Dict:
+        from core.Profiler import format_profiling_report
+        profilers = [cs.profiler for cs in gp.ChangeSet_Dict.values() if getattr(cs, "profiler", None)]
+        if profilers:
+            print(format_profiling_report(profilers, title=f"UPDATE CYCLE PROFILE: {version}"))
 
     gp.reset_cs()
     return
@@ -324,6 +331,11 @@ def arg_handling() -> None:
         help="Test/Parse a specific file",
     )
     parser.add_argument(
+        "-p", "--profile",
+        action="store_true",
+        help="Enable granular stage timing profiler across tests and update loop cycles",
+    )
+    parser.add_argument(
         "--db", "--db-engine",
         dest="db_engine",
         default="mariadb",
@@ -331,6 +343,9 @@ def arg_handling() -> None:
         help="Select database backend engine (default: mariadb)",
     )
     args = parser.parse_args()
+
+    if args.profile:
+        G.PROFILING_ENABLED = True
 
     if args.db_engine:
         G.DB = get_db_engine(args.db_engine)
@@ -344,11 +359,11 @@ def arg_handling() -> None:
     if args.unit_test is not None:
         target = args.unit_test if args.unit_test != "" else None
         from tests.test_c_ast import run_c_ast_tests
-        code = run_c_ast_tests(target)
+        code = run_c_ast_tests(target, profile=args.profile)
         sys.exit(code)
     if args.Test:
         from tests.test_c_ast import run_c_ast_tests
-        code = run_c_ast_tests(args.Test)
+        code = run_c_ast_tests(args.Test, profile=args.profile)
         sys.exit(code)
     return
 

@@ -99,6 +99,7 @@ from parser.c_ast.c_ast_type import (
 )  # noqa: F401
 from pathlib import Path
 import re
+import time
 import clang.cindex as cc
 import ctypes
 import logging
@@ -367,6 +368,10 @@ class TokenList:
         self.CS = CS
         self.main_zone = Zone(Zone_Type.Full_File, None)
 
+        prof = getattr(CS, "profiler", None)
+        if prof is not None:
+            t_proc_0 = time.perf_counter()
+
         for i, token in enumerate(self.tokens_array):
             cursor = self.cursors_array[i]
 
@@ -389,14 +394,20 @@ class TokenList:
         self.main_zone.gen_lined_dict()
         self.main_zone.resolve_cppro_scopes()
 
+        if prof is not None:
+            prof.token_processing_s = time.perf_counter() - t_proc_0
+            t_extract_0 = time.perf_counter()
+
         if G.OVERRIDE_FORCE_AST_DEBUG:
             G.BP()
         
         self.main_zone.extract(self.CS)
 
+        if prof is not None:
+            prof.ast_extraction_s = time.perf_counter() - t_extract_0
+
         if G.OVERRIDE_FORCE_AST_DEBUG:
             G.BP()
-
 
         return
 
@@ -440,6 +451,10 @@ class Ast_Manager:
             _WORKER_CLANG_INDEX = cc.Index.create()
         index = _WORKER_CLANG_INDEX
 
+        prof = getattr(CS, "profiler", None)
+        if prof is not None:
+            t_parse_0 = time.perf_counter()
+
         # these: "-M","-MG", were probably important, but who gives a shit as they print a bunch of shit on screen, lol
         translation_unit = index.parse(
             self.fullfilename,
@@ -456,11 +471,16 @@ class Ast_Manager:
         )
         # https://clang.llvm.org/doxygen/group__CINDEX__TRANSLATION__UNIT.html
 
+        if prof is not None:
+            prof.clang_parse_tu_s = time.perf_counter() - t_parse_0
+            t_tok_0 = time.perf_counter()
 
         TL = TokenList(translation_unit, self.fullfilename)
+
+        if prof is not None:
+            prof.clang_tokenize_s = time.perf_counter() - t_tok_0
+
         TL.process_tokens(CS)
-
-
 
         return
 
