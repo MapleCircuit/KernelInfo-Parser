@@ -97,11 +97,18 @@ class Line:
     # Code Capture
     def cc(self, rawfile: tuple[str]) -> Self:
         """Extract the str using line/col pos."""
+        if self.line_pos[0] == 0:
+            self.code = ""
+            return self
 
         # Line Select
         try:
             if self.line_pos[0] == self.line_pos[1]:
                 self.code = rawfile[self.line_pos[0] - 1]
+                char_start = 0 if self.char_pos[0] == 0 else self.char_pos[0] - 1
+                char_end = len(self.code) if (self.char_pos[1] == 0 or self.char_pos[1] - 1 >= len(self.code)) else (self.char_pos[1] - 1)
+                self.code = self.code[char_start : char_end]
+                return self
             else:
                 self.code = "\n".join(rawfile[self.line_pos[0] - 1 : self.line_pos[1]])
         except IndexError:
@@ -109,19 +116,14 @@ class Line:
             return self
 
         char_start = 0 if self.char_pos[0] == 0 else self.char_pos[0] - 1
+        last_line_len = len(rawfile[self.line_pos[1] - 1])
+        char_end = last_line_len if (self.char_pos[1] == 0 or self.char_pos[1] - 1 >= last_line_len) else (self.char_pos[1] - 1)
 
-        if self.char_pos[1] == 0:
+        if char_end == last_line_len:
             self.code = self.code[char_start:]
         else:
-            char_end = self.char_pos[1] - 1
-
-            #  Char Trim
-            try:
-                self.code = self.code[
-                    char_start : (char_end - len(rawfile[self.line_pos[1] - 1]))
-                ]
-            except IndexError:
-                self.code = ""
+            trim_end = last_line_len - char_end
+            self.code = self.code[char_start : -trim_end]
         return self
 
     def new_end(self, *args: int|object) -> None:
@@ -519,13 +521,21 @@ class AST_KIND(IntEnum):
 class CPPro(Ast):
     def __init__(self, cppro_ex: Line):
         self.ccpro_start_extent = cppro_ex
+        self.extent = Line(cppro_ex)
         self.need_processing = True
         self.end_mode = End_Mode.No_Check
 
     def ccpro_start_flip(self, cppro_class, *args) -> None:
+        start_extent = Line(self.ccpro_start_extent)
+        if args and isinstance(args[0], Line):
+            if args[0].line_pos[0] != 0:
+                start_extent.grow(args[0])
+            args = (start_extent, *args[1:])
+        else:
+            args = (start_extent, *args)
         self.__class__ = cppro_class
         self.__init__(*args)
-        
+
     def within_range(self, token, ast_kind) -> bool:
         return True
 
@@ -588,33 +598,47 @@ class CPPro(Ast):
 class CPPro_if(Ast):
     """type_id 102."""
 
-    def __init__(self, extent: Line) -> None:
+    def __init__(self, extent: Line, expression: str = "") -> None:
         self.extent = extent
         self.need_processing = True
-        self.end_mode = End_Mode.Extent
-        self.expression = ""
+        self.end_mode = End_Mode.No_Check
+        self.expression = expression
         self.highlight = Line()
         self.endif = Line()
+
+    def within_range(self, token, ast_kind) -> bool:
+        if not self.need_processing:
+            return False
+        tline = getattr(token, 'line', None) or Line(token.extent)
+        if tline.line_pos[0] <= self.extent.line_pos[1]:
+            self.extent.grow(tline)
+            return True
+        self.need_processing = False
+        return False
 
     def exec_comment(self, token, cursor) -> None:
         return
 
     def exec_punctuation(self, token, cursor) -> None:
+        self.extent.grow(Line(token.extent))
         self.expression += token.spelling_str
         self.highlight.new_end(token.extent)
         return
 
     def exec_keyword(self, token, cursor) -> None:
+        self.extent.grow(Line(token.extent))
         self.expression += token.spelling_str
         self.highlight.new_end(token.extent)
         return
 
     def exec_identifier(self, token, cursor) -> None:
+        self.extent.grow(Line(token.extent))
         self.expression += token.spelling_str
         self.highlight.new_end(token.extent)
         return
 
     def exec_literal(self, token, cursor) -> None:
+        self.extent.grow(Line(token.extent))
         self.expression += token.spelling_str
         self.highlight.new_end(token.extent)
         return
@@ -627,29 +651,6 @@ class CPPro_if(Ast):
 
 class CPPro_elif(CPPro_if):
     """type_id 103."""
-
-    def exec_comment(self, token, cursor) -> None:
-        return
-
-    def exec_punctuation(self, token, cursor) -> None:
-        self.expression += token.spelling_str
-        self.highlight.new_end(token.extent)
-        return
-
-    def exec_keyword(self, token, cursor) -> None:
-        self.expression += token.spelling_str
-        self.highlight.new_end(token.extent)
-        return
-
-    def exec_identifier(self, token, cursor) -> None:
-        self.expression += token.spelling_str
-        self.highlight.new_end(token.extent)
-        return
-
-    def exec_literal(self, token, cursor) -> None:
-        self.expression += token.spelling_str
-        self.highlight.new_end(token.extent)
-        return
 
     def extract(self, CS: ChangeSetType) -> None:
         """Passthrough to AST.extract_1arg."""
@@ -664,9 +665,12 @@ class CPPro_else(Ast):
     def __init__(self, extent: Line) -> None:
         self.extent = extent
         self.need_processing = False
-        self.end_mode = End_Mode.Extent
+        self.end_mode = End_Mode.No_Check
         self.expression = ""
         self.endif = Line()
+
+    def within_range(self, token, ast_kind) -> bool:
+        return False
 
     def extract(self, CS: ChangeSetType) -> None:
         """Passthrough to AST.extract_1arg."""
@@ -680,7 +684,10 @@ class CPPro_endif(Ast):
     def __init__(self, extent: Line) -> None:
         self.extent = extent
         self.need_processing = False
-        self.end_mode = End_Mode.Extent
+        self.end_mode = End_Mode.No_Check
+
+    def within_range(self, token, ast_kind) -> bool:
+        return False
 
     def extract(self, CS: ChangeSetType) -> None:
         """Passthrough to AST.extract_1arg."""
@@ -724,21 +731,32 @@ class CPPro_elifndef(CPPro_elif):
 class CPPro_define(Ast):
     """type_id 106."""
 
-    def __init__(self, extent: Line) -> None:
+    def __init__(self, extent: Line, identifier: str = "", replacement: str = "") -> None:
         self.extent = extent
         self.need_processing = True
-        self.end_mode = End_Mode.Extent
-        self.identifier = ""
+        self.end_mode = End_Mode.No_Check
+        self.identifier = identifier
         self.func_args = []
         self.func_enabled = False
-        self.replacement = ""
+        self.replacement = replacement
         self.highlight = Line()
         self.highlight_replacement = Line()
+
+    def within_range(self, token, ast_kind) -> bool:
+        if not self.need_processing:
+            return False
+        tline = getattr(token, 'line', None) or Line(token.extent)
+        if tline.line_pos[0] <= self.extent.line_pos[1]:
+            self.extent.grow(tline)
+            return True
+        self.need_processing = False
+        return False
 
     def exec_comment(self, token, cursor) -> None:
         return
 
     def exec_punctuation(self, token, cursor) -> None:
+        self.extent.grow(Line(token.extent))
         spelling = token.spelling_str
         if self.func_enabled:
             if spelling == ")":
@@ -760,6 +778,7 @@ class CPPro_define(Ast):
         return
 
     def exec_keyword(self, token, cursor) -> None:
+        self.extent.grow(Line(token.extent))
         spelling = token.spelling_str
         if self.identifier == "":
             self.identifier += spelling
@@ -775,6 +794,7 @@ class CPPro_define(Ast):
         return
 
     def exec_identifier(self, token, cursor) -> None:
+        self.extent.grow(Line(token.extent))
         spelling = token.spelling_str
         if self.identifier == "":
             self.identifier += spelling
@@ -790,6 +810,7 @@ class CPPro_define(Ast):
         return
 
     def exec_literal(self, token, cursor) -> None:
+        self.extent.grow(Line(token.extent))
         spelling = token.spelling_str
         if self.func_enabled:
             self.func_args[-1] += spelling
@@ -801,7 +822,7 @@ class CPPro_define(Ast):
 
     def extract(self, CS: ChangeSetType) -> None:
         """Passthrough to AST.extract_1arg."""
-        if self.replacement is None:
+        if self.replacement is None or self.replacement == "":
             # Empty define
             self.extract_1arg(CS, ASTT.CPPro_define, self.identifier, self.extent)
             return
@@ -815,32 +836,46 @@ class CPPro_define(Ast):
 class CPPro_undef(Ast):
     """type_id 107."""
 
-    def __init__(self, extent: Line) -> None:
+    def __init__(self, extent: Line, identifier: str = "") -> None:
         self.extent = extent
         self.need_processing = True
-        self.end_mode = End_Mode.Extent
-        self.identifier = ""
+        self.end_mode = End_Mode.No_Check
+        self.identifier = identifier
         self.highlight = Line()
+
+    def within_range(self, token, ast_kind) -> bool:
+        if not self.need_processing:
+            return False
+        tline = getattr(token, 'line', None) or Line(token.extent)
+        if tline.line_pos[0] <= self.extent.line_pos[1]:
+            self.extent.grow(tline)
+            return True
+        self.need_processing = False
+        return False
 
     def exec_comment(self, token, cursor) -> None:
         return
 
     def exec_punctuation(self, token, cursor) -> None:
+        self.extent.grow(Line(token.extent))
         self.identifier += token.spelling_str
         self.highlight.new_end(token.extent)
         return
 
     def exec_keyword(self, token, cursor) -> None:
+        self.extent.grow(Line(token.extent))
         self.identifier += token.spelling_str
         self.highlight.new_end(token.extent)
         return
 
     def exec_identifier(self, token, cursor) -> None:
+        self.extent.grow(Line(token.extent))
         self.identifier += token.spelling_str
         self.highlight.new_end(token.extent)
         return
 
     def exec_literal(self, token, cursor) -> None:
+        self.extent.grow(Line(token.extent))
         self.identifier += token.spelling_str
         self.highlight.new_end(token.extent)
         return
@@ -854,19 +889,30 @@ class CPPro_undef(Ast):
 class CPPro_include(Ast):
     """type_id 108."""
 
-    def __init__(self, extent: Line) -> None:
+    def __init__(self, extent: Line, written_include: str = "", actual_include: str = "") -> None:
         self.extent = extent
         self.need_processing = True
-        self.end_mode = End_Mode.Extent
-        self.a_include = None
-        self.w_include = ""
+        self.end_mode = End_Mode.No_Check
+        self.a_include = actual_include if actual_include else None
+        self.w_include = written_include
         self.highlight = Line()
         self.debug = None
+
+    def within_range(self, token, ast_kind) -> bool:
+        if not self.need_processing:
+            return False
+        tline = getattr(token, 'line', None) or Line(token.extent)
+        if tline.line_pos[0] <= self.extent.line_pos[1]:
+            self.extent.grow(tline)
+            return True
+        self.need_processing = False
+        return False
 
     def exec_comment(self, token, cursor) -> None:
         return
 
     def exec_punctuation(self, token, cursor) -> None:
+        self.extent.grow(Line(token.extent))
         self.w_include += token.spelling_str
         if self.debug:
             self.a_include = self.w_include
@@ -874,6 +920,7 @@ class CPPro_include(Ast):
         return
 
     def exec_keyword(self, token, cursor) -> None:
+        self.extent.grow(Line(token.extent))
         spelling = token.spelling_str
         if self.a_include is None and spelling == "include":
             try:
@@ -890,10 +937,10 @@ class CPPro_include(Ast):
         if self.debug:
             self.a_include = self.w_include
         self.highlight.new_end(token.extent)
-        
         return
 
     def exec_identifier(self, token, cursor) -> None:
+        self.extent.grow(Line(token.extent))
         spelling = token.spelling_str
         if self.a_include is None and spelling == "include":
             try:
@@ -910,10 +957,10 @@ class CPPro_include(Ast):
         if self.debug:
             self.a_include = self.w_include
         self.highlight.new_end(token.extent)
-        
         return
 
     def exec_literal(self, token, cursor) -> None:
+        self.extent.grow(Line(token.extent))
         self.w_include += token.spelling_str
         if self.debug:
             self.a_include = self.w_include
@@ -972,16 +1019,27 @@ class CPPro_line(Ast):
     def __init__(self, extent: Line, lineno: int | str = "", filename: str | None = None) -> None:
         self.extent = extent
         self.need_processing = True
-        self.end_mode = End_Mode.Extent
+        self.end_mode = End_Mode.No_Check
         self.lineno = lineno
         self.hl_lineno = Line()
         self.filename = filename
         self.hl_filename = Line()
 
+    def within_range(self, token, ast_kind) -> bool:
+        if not self.need_processing:
+            return False
+        tline = getattr(token, 'line', None) or Line(token.extent)
+        if tline.line_pos[0] <= self.extent.line_pos[1]:
+            self.extent.grow(tline)
+            return True
+        self.need_processing = False
+        return False
+
     def exec_comment(self, token, cursor) -> None:
         return
 
     def exec_punctuation(self, token, cursor) -> None:
+        self.extent.grow(Line(token.extent))
         spelling = token.spelling_str
         if self.lineno == "":
             self.lineno = spelling
@@ -993,6 +1051,7 @@ class CPPro_line(Ast):
         return
 
     def exec_keyword(self, token, cursor) -> None:
+        self.extent.grow(Line(token.extent))
         spelling = token.spelling_str
         if self.lineno == "":
             self.lineno = spelling
@@ -1004,6 +1063,7 @@ class CPPro_line(Ast):
         return
 
     def exec_identifier(self, token, cursor) -> None:
+        self.extent.grow(Line(token.extent))
         spelling = token.spelling_str
         if self.lineno == "":
             self.lineno = spelling
@@ -1015,6 +1075,7 @@ class CPPro_line(Ast):
         return
 
     def exec_literal(self, token, cursor) -> None:
+        self.extent.grow(Line(token.extent))
         spelling = token.spelling_str
         if self.lineno == "":
             self.lineno = spelling
@@ -1040,29 +1101,43 @@ class CPPro_error(Ast):
     def __init__(self, extent: Line, msg: str = "") -> None:
         self.extent = extent
         self.need_processing = True
-        self.end_mode = End_Mode.Extent
+        self.end_mode = End_Mode.No_Check
         self.msg = msg
         self.hl_msg = Line()
+
+    def within_range(self, token, ast_kind) -> bool:
+        if not self.need_processing:
+            return False
+        tline = getattr(token, 'line', None) or Line(token.extent)
+        if tline.line_pos[0] <= self.extent.line_pos[1]:
+            self.extent.grow(tline)
+            return True
+        self.need_processing = False
+        return False
 
     def exec_comment(self, token, cursor) -> None:
         return
 
     def exec_punctuation(self, token, cursor) -> None:
+        self.extent.grow(Line(token.extent))
         self.msg += token.spelling_str
         self.hl_msg.new_end(token.extent)
         return
 
     def exec_keyword(self, token, cursor) -> None:
+        self.extent.grow(Line(token.extent))
         self.msg += token.spelling_str
         self.hl_msg.new_end(token.extent)
         return
 
     def exec_identifier(self, token, cursor) -> None:
+        self.extent.grow(Line(token.extent))
         self.msg += token.spelling_str
         self.hl_msg.new_end(token.extent)
         return
 
     def exec_literal(self, token, cursor) -> None:
+        self.extent.grow(Line(token.extent))
         self.msg += token.spelling_str
         self.hl_msg.new_end(token.extent)
         return
@@ -1582,11 +1657,11 @@ class Zone:
             # While were in punctuation, lets handle CPPros
             if tspelling == "#":
                 kind = cursor.kind
-                if kind == cc.CursorKind.PREPROCESSING_DIRECTIVE:
-                    self.children.append(CPPro(tline))
-                    return True
-                elif kind == cc.CursorKind.INCLUSION_DIRECTIVE: 
+                if kind == cc.CursorKind.INCLUSION_DIRECTIVE: 
                     self.children.append(CPPro_include(Line(cursor.extent)))
+                    return True
+                else:
+                    self.children.append(CPPro(tline))
                     return True
 
         # Guard against statement keywords outside type declarations
