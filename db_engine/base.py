@@ -191,6 +191,23 @@ class BaseDBEngine(ABC):
         """
 
     @abstractmethod
+    def commit_tables_parallel(
+        self,
+        tables_data: Sequence[tuple[Table, Sequence[tuple[SafeDataType, ...]], Sequence[tuple[SafeDataType, ...]]]],
+        max_workers: int | None = None,
+    ) -> None:
+        """Commit inserts and updates for multiple tables concurrently across worker connection threads.
+
+        Args:
+            tables_data: Sequence of tuples `(table, insert_payload, update_payload)`.
+            max_workers: Maximum concurrent database worker threads (defaults to min(len(tables_data), G.CPUS)).
+        Process:
+            Executes table insert/update operations in parallel across isolated database connections and commits.
+        Outputs:
+            None.
+        """
+
+    @abstractmethod
     def create_table(self, tables: Sequence[Table] | Table) -> None:
         """Create database tables from Table schema specifications and seed initial records.
 

@@ -174,8 +174,7 @@ def update(version: str) -> None:
         db.remove_index("ast_index", m_ast)
         db.remove_index("file_name_index", m_file_name)
 
-    for table in gp.Table_Array:
-        G.TE.commit(table.table_id)
+    G.TE.commit_all()
 
     if G.PROFILING_ENABLED and gp.ChangeSet_Dict:
         from core.Profiler import format_profiling_report

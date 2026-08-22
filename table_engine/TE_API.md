@@ -116,6 +116,11 @@ Stateful caching, sequence coordination, relational view decomposition, and batc
   2. **Updates (`queued_update`)**: If `queued_update[table_id]` is non-empty:
      - Calls `self.db.update(table, tuple(queued_update[table_id]))` and clears `self.queued_update[table_id]`.
 
+- **`commit_all(max_workers: int | None = None) -> None`**
+  - Gathers payloads `(table, insert_payload, update_payload)` across all modified tables.
+  - Dispatches concurrently to `self.db.commit_tables_parallel(tables_data, max_workers=max_workers)`.
+  - Clears all queued buffers in one pass.
+
 ---
 
 ## 4. Expected Database Driver Interface (`G.DB`)
@@ -125,7 +130,7 @@ Any backend passed to `TableEngine` must implement:
 - `select(table: Table, columns: tuple) -> tuple | None`: Single-row select matching non-None filters.
 - `view_select(tables: dict, joins: JoinsType, columns: tuple) -> tuple | None`: Joined single-row select.
 - `view_select_multiple(tables: dict, joins: JoinsType, columns: tuple) -> list[tuple]`: Joined multi-row select.
-- `insert(table: Table, data: tuple[tuple, ...]) -> None`: Batch insert (e.g. 5000 rows/batch).
+- `insert(table: Table, data: tuple[tuple, ...]) -> None`: Batch insert (e.g. 1000 rows/batch).
 - `update(table: Table, data: tuple[tuple, ...]) -> None`: Batch upsert (`ON DUPLICATE KEY UPDATE`).
 - `close() -> None`: Closes connections/cursors cleanly.
 

@@ -107,6 +107,18 @@ class MockDB(BaseDBEngine):
         """Batch upsert/update rows into in-memory table store."""
         self.insert(table, data)
 
+    def commit_tables_parallel(
+        self,
+        tables_data: Sequence[tuple[Table, Sequence[tuple[SafeDataType, ...]], Sequence[tuple[SafeDataType, ...]]]],
+        max_workers: int | None = None,
+    ) -> None:
+        """Commit inserts and updates for multiple tables in mock database."""
+        for table, insert_data, update_data in tables_data:
+            if insert_data:
+                self.insert(table, insert_data)
+            if update_data:
+                self.update(table, update_data)
+
     def view_select(
         self,
         tables: Sequence[Table] | dict[int, Table],

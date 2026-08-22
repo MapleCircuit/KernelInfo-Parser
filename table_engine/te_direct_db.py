@@ -382,3 +382,48 @@ class TEDirectDB:
         if self.queued_update[table_id]:
             self.db.update(table, tuple(self.queued_update[table_id]))
             self.queued_update[table_id].clear()
+
+    def commit_all(self, max_workers: int | None = None) -> None:
+        """Flush staged insert and update operations across ALL tables concurrently and clear buffers.
+
+        Args:
+            max_workers: Maximum concurrent worker threads.
+
+        Process:
+            1. Collects payload tuples `(table, insert_payload, update_payload)` for all non-empty tables.
+            2. Dispatches to `self.db.commit_tables_parallel(tables_data, max_workers=max_workers)`.
+            3. Clears all queued buffers.
+
+        Outputs:
+            None.
+        """
+        tables_data = []
+        for table_id, table in self.tables.items():
+            insert_payload = ()
+            update_payload = ()
+
+            if self.queued_set[table_id]:
+                if table.no_duplicate:
+                    insert_payload = tuple((item[1], *item[0]) for item in self.queued_set[table_id].items())
+                else:
+                    insert_payload = tuple(self.queued_set[table_id].values())
+
+            if self.queued_update[table_id]:
+                update_payload = tuple(self.queued_update[table_id])
+
+            if insert_payload or update_payload:
+                tables_data.append((table, insert_payload, update_payload))
+
+        if tables_data:
+            if hasattr(self.db, "commit_tables_parallel"):
+                self.db.commit_tables_parallel(tables_data, max_workers=max_workers)
+            else:
+                for table, ins_p, upd_p in tables_data:
+                    if ins_p:
+                        self.db.insert(table, ins_p)
+                    if upd_p:
+                        self.db.update(table, upd_p)
+
+            for table_id in self.tables:
+                self.queued_set[table_id].clear()
+                self.queued_update[table_id].clear()

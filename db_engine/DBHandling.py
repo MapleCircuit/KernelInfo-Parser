@@ -64,7 +64,7 @@ Any database driver class (e.g., MariaDB, PostgreSQL, SQLite, DuckDB) assigned t
 11. insert(table: Table, data: tuple[tuple[SafeDataType, ...], ...] | tuple[SafeDataType, ...]) -> None
     - Input: Table schema object, row tuple or batch of row tuples matching table columns.
     - Process: Constructs parameterized INSERT INTO statement. Handles payload chunking
-      (5000 rows/batch), executes batch insert, and commits.
+      (1000 rows/batch), executes batch insert, and commits.
     - Output: None.
 
 12. update(table: Table, data: tuple[tuple[SafeDataType, ...], ...] | tuple[SafeDataType, ...]) -> None
@@ -468,7 +468,7 @@ class MariaDB(BaseDBEngine):
         sql = f"INSERT INTO `{table.table_name}` VALUES ({','.join(('%s',) * table.length)})"
 
         if isinstance(data[0], (tuple, list)):
-            batch_size = 1000  # Safe high-throughput packet batch size
+            batch_size = 1000  # Safe High-throughput batch size
             for i in range(0, len(data), batch_size):
                 chunk = data[i : i + batch_size]
                 for attempt in range(3):
@@ -554,6 +554,64 @@ class MariaDB(BaseDBEngine):
 
         self.check_if_connected()
         self.cnx.commit()
+
+    def commit_tables_parallel(
+        self,
+        tables_data: Sequence[tuple[Table, Sequence[tuple[SafeDataType, ...]], Sequence[tuple[SafeDataType, ...]]]],
+        max_workers: int | None = None,
+    ) -> None:
+        """Commit inserts and updates for multiple tables concurrently across worker connection threads.
+
+        Args:
+            tables_data: Sequence of tuples `(table, insert_payload, update_payload)`.
+            max_workers: Maximum concurrent database worker threads (defaults to min(len(tables_data), 8)).
+
+        Process:
+            1. Filters non-empty table payloads.
+            2. If single table, executes directly on current connection.
+            3. If multiple tables, dispatches concurrently via ThreadPoolExecutor.
+            4. Each worker thread opens an isolated MariaDB connection, disables foreign key and unique checks,
+               executes batch operations, commits, and releases resources.
+        """
+        valid_items = [item for item in tables_data if item[1] or item[2]]
+        if not valid_items:
+            return
+
+        if len(valid_items) == 1:
+            table, insert_data, update_data = valid_items[0]
+            if insert_data:
+                self.insert(table, insert_data)
+            if update_data:
+                self.update(table, update_data)
+            return
+
+        from concurrent.futures import ThreadPoolExecutor
+        workers = min(len(valid_items), max_workers or 8)
+
+        def _worker_commit(item: tuple[Table, Sequence[tuple[SafeDataType, ...]], Sequence[tuple[SafeDataType, ...]]]) -> None:
+            table, insert_data, update_data = item
+            worker_db = MariaDB()
+            try:
+                try:
+                    worker_db.cursor.execute("SET unique_checks = 0; SET foreign_key_checks = 0; SET autocommit = 0;")
+                except Exception:
+                    pass
+
+                if insert_data:
+                    worker_db.insert(table, insert_data)
+                if update_data:
+                    worker_db.update(table, update_data)
+
+                try:
+                    worker_db.cursor.execute("SET unique_checks = 1; SET foreign_key_checks = 1; SET autocommit = 1;")
+                except Exception:
+                    pass
+                worker_db.cnx.commit()
+            finally:
+                worker_db.close()
+
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            list(executor.map(_worker_commit, valid_items))
 
     def select(
         self,
