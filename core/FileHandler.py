@@ -107,19 +107,17 @@ class MasterFile:
         return raw_file.stdout
 
     def get_dir_list(self, version_name: str) -> list[str]:
-        """Retrieve full list of relative directory paths for a cloned version on disk."""
+        """Retrieve full list of relative directory paths for a version from git repository."""
         command = [
-            "find",
-            f"{self.version_dict[version_name]}",
-            "-type",
-            "d",
-            "!",
-            "-type",
-            "l",
-            "-printf",
-            "%P\\n",
+            "git",
+            "--git-dir=linux/.git",
+            "ls-tree",
+            "-r",
+            "-d",
+            "--name-only",
+            f"{version_name}",
         ]
-        return sp.run(command, capture_output=True, text=True).stdout.splitlines()[1:]  # noqa: PLW1510, S603
+        return sp.run(command, capture_output=True, text=True).stdout.splitlines()  # noqa: PLW1510, S603
 
     def resolve_path(self, file_path: str) -> str:
         """Convert an absolute working directory path back into a relative repository file path."""

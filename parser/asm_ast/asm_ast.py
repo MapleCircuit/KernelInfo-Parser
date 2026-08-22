@@ -52,6 +52,8 @@ from parser.c_ast.c_ast_type import (
 )
 from parser.c_ast.c_ast import (
     TokenList,
+    get_prior_tags,
+    close_prior_tags,
     _CLANG_GET_EXTENT,
     _CLANG_GET_RANGE_START,
     _CLANG_GET_RANGE_END,
@@ -73,7 +75,16 @@ _WORKER_ASM_CLANG_INDEX: cc.Index | None = None
 
 def asm_ast_parse(CS: ChangeSetType) -> None:
     """Entry point for parsing assembly (.S, .s) files into ChangeSet operations."""
-    Asm_Manager(CS)
+    with CS(REF_C_AST):
+        if CS.file_operation == "A":
+            Asm_Manager(CS)
+        elif CS.file_operation == "M" or CS.file_operation[0] == "R":
+            get_prior_tags(CS)
+            Asm_Manager(CS)
+            close_prior_tags(CS)
+        elif CS.file_operation == "D":
+            get_prior_tags(CS)
+            close_prior_tags(CS)
 
 
 class Asm_Manager:

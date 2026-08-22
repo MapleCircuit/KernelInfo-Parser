@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 
 # Linter bypass
 m_v_main = m_file_name = m_file = m_bridge_file = m_moved_file = m_type_descriptor = m_ast = m_ast_container = m_ast_include = m_ast_debug = m_tag = m_bridge_tag = m_map_ast = m_bridge_map = None
-ChangeSetType = None
+ChangeSetType = Any
 _DEF_TYPES = (ASTT.C_struct, ASTT.C_functionproto, ASTT.C_union, ASTT.C_enum)
 _PUNCT_IGNORED = (";", ",", ")", "}")
 _KEYWORD_IGNORED = ("if", "else", "return", "switch", "case", "default", "break", "continue", "for", "while", "do", "goto")
@@ -374,6 +374,7 @@ class Ast:
 
     def tag(self, CS: ChangeSetType, ast_id_route: RouteType, extent: Line|None=None) -> None:
         """Create or recycle tag for current AST."""
+        from core.DBLayout import m_ast, m_file, m_tag, m_bridge_tag
         self.extent = extent
         if self.extent is None:
             self.extent = Line(0, 0)
@@ -397,11 +398,14 @@ class Ast:
         if CS.prior_tags and (self.extent.code != ""):
             lookup = getattr(CS, "prior_tags_map", None)
             if lookup is not None:
-                tag_match = lookup.get(current_tag[2:])
+                tag_match = lookup.get(self.extent.code)
                 if tag_match is not None:
                     x, tag_id = tag_match
-                    with CS(REF_OLD):
+                    if isinstance(CS.active_tag_list, set):
+                        CS.active_tag_list.add(x)
+                    else:
                         CS.active_tag_list.append(x)
+                    with CS(REF_OLD):
                         CS.store(m_bridge_tag.set(
                             CS.ref(m_file.fid, REF_ROOT, REF_OLD),
                             tag_id,
@@ -414,12 +418,15 @@ class Ast:
             else:
                 for x, tag in enumerate(CS.prior_tags):
                     # If tag found in prior_tags, set bridge and return
-                    if tag[6:] == current_tag[2:]:
-                        with CS(REF_OLD):
+                    if tag[9] == self.extent.code:
+                        if isinstance(CS.active_tag_list, set):
+                            CS.active_tag_list.add(x)
+                        else:
                             CS.active_tag_list.append(x)
+                        with CS(REF_OLD):
                             CS.store(m_bridge_tag.set(
                                 CS.ref(m_file.fid, REF_ROOT, REF_OLD),
-                                tag[4],
+                                tag[1],
                                 self.extent.line_pos[0],
                                 self.extent.line_pos[1],
                                 self.extent.char_pos[0],

@@ -126,14 +126,8 @@ class MockDB(BaseDBEngine):
         columns: tuple[SafeDataType, ...],
     ) -> tuple[SafeDataType, ...] | None:
         """Joined single-row select with wildcard column matching."""
-        if isinstance(tables, (tuple, list)):
-            tables_dict = {t.table_id: t for t in tables}
-        else:
-            tables_dict = tables
-
-        first_table_id = joins[0][0][0] if isinstance(joins[0], (tuple, list)) else joins[0][0]
-        table = tables_dict[first_table_id]
-        return self.select(table, columns[:table.length])
+        res = self.view_select_multiple(tables, joins, columns)
+        return res[0] if res else None
 
     def view_select_multiple(
         self,
@@ -141,24 +135,55 @@ class MockDB(BaseDBEngine):
         joins: JoinsType,
         columns: tuple[SafeDataType, ...],
     ) -> list[tuple[SafeDataType, ...]]:
-        """Joined multi-row select with wildcard column matching."""
+        """Joined multi-row select across join graph with wildcard column matching."""
         if isinstance(tables, (tuple, list)):
             tables_dict = {t.table_id: t for t in tables}
         else:
             tables_dict = tables
 
-        first_table_id = joins[0][0][0] if isinstance(joins[0], (tuple, list)) else joins[0][0]
-        table = tables_dict[first_table_id]
-        rows = self.tables_data.get(table.table_name, {})
+        pg = PointerGetter(joins)
+        first_table_id = pg.get_first_table_id()
+        t1 = tables_dict[first_table_id]
+        t1_rows = self.tables_data.get(t1.table_name, {})
+
         results = []
-        for row in rows.values():
+        for r1 in t1_rows.values():
             match = True
-            for i, val in enumerate(columns[:table.length]):
-                if val is not None and i < len(row) and row[i] != val:
+            for i, val in enumerate(columns[:t1.length]):
+                if val is not None and i < len(r1) and r1[i] != val:
                     match = False
                     break
-            if match:
-                results.append(row)
+            if not match:
+                continue
+
+            current_composite_rows = [list(r1)]
+            col_offset = t1.length
+
+            for join in joins:
+                if len(join) < 2:
+                    continue
+                from_ptr, to_ptr = join[0], join[1]
+                t_target = tables_dict[to_ptr[0]]
+                t_target_rows = self.tables_data.get(t_target.table_name, {})
+
+                new_composite = []
+                for comp in current_composite_rows:
+                    from_val = comp[from_ptr[1]]
+                    for r_tgt in t_target_rows.values():
+                        if r_tgt[to_ptr[1]] == from_val:
+                            tgt_match = True
+                            for j, val in enumerate(columns[col_offset : col_offset + t_target.length]):
+                                if val is not None and j < len(r_tgt) and r_tgt[j] != val:
+                                    tgt_match = False
+                                    break
+                            if tgt_match:
+                                new_composite.append(comp + list(r_tgt))
+                current_composite_rows = new_composite
+                col_offset += t_target.length
+
+            for comp in current_composite_rows:
+                results.append(tuple(comp))
+
         return results
 
     def create_table(self, tables: Sequence[Table] | Table) -> None:
@@ -179,6 +204,10 @@ class MockDB(BaseDBEngine):
         for table in tables:
             self.tables_data.pop(table.table_name, None)
             self.tables_schema.pop(table.table_id, None)
+
+    def index_exists(self, index_name: str, table: Table) -> bool:
+        """Check if index exists (MockDB no-op)."""
+        return False
 
     def create_index(self, index_name: str, table: Table, rows: tuple[PointerType, ...]) -> None:
         """No-op for in-memory mock engine."""

@@ -249,45 +249,63 @@ def process_c_ast(CS: ChangeSetType) -> None:
 
 
 def get_prior_tags(CS: ChangeSetType) -> None:
-    """Query Table Engine for existing active AST tags registered in the previous version (`REF_OLD`)."""
-    with CS(REF_OLD):
-        CS.prior_tags = m_bridge_tag.view_get_multiple(
-            ((m_bridge_tag.tag_id, m_tag.tag_id, 1),),
-            CS.ref(m_file.fid, REF_ROOT),
-            None,
-            None,
-            None,
-            None,  # m_tag.tag_id
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        )
-    CS.active_tag_list = []
+    """Query Table Engine for existing active AST tags registered in the previous version."""
+    from core.DBLayout import m_file_name, m_bridge_file, m_bridge_tag, m_tag
+    CS.active_tag_list = set()
+    CS.prior_tags = None
+    CS.prior_tags_map = {}
+
+    old_vid = getattr(CS.gp, "Old_VID", 0)
+    if old_vid <= 0:
+        return
+
+    fn_row = G.TE.get(m_file_name.table_id, (None, CS.current_path))
+    if not fn_row:
+        return
+    fnid = fn_row[0]
+
+    bf_row = G.TE.get(m_bridge_file.table_id, (old_vid, fnid, None))
+    if not bf_row:
+        return
+    old_fid = bf_row[2]
+
+    CS.prior_tags = m_bridge_tag.view_get_multiple(
+        ((m_bridge_tag.tag_id, m_tag.tag_id, 1),),
+        old_fid,
+        None,  # 1: m_bridge_tag.tag_id
+        None,  # 2: m_bridge_tag.line_s
+        None,  # 3: m_bridge_tag.line_e
+        None,  # 4: m_bridge_tag.char_s
+        None,  # 5: m_bridge_tag.char_e
+        None,  # 6: m_tag.tag_id
+        None,  # 7: m_tag.vid_s
+        None,  # 8: m_tag.vid_e
+        None,  # 9: m_tag.code
+        None,  # 10: m_tag.ast_id
+        None,  # 11: m_tag.hl_s
+        None,  # 12: m_tag.hl_l
+    )
     if CS.prior_tags:
-        CS.prior_tags_map = {tag[6:]: (x, tag[4]) for x, tag in enumerate(CS.prior_tags)}
-    else:
-        CS.prior_tags_map = {}
+        CS.prior_tags_map = {tag[9]: (x, tag[1]) for x, tag in enumerate(CS.prior_tags) if tag[9]}
     return
 
 
 def close_prior_tags(CS: ChangeSetType) -> None:
     """Mark prior version AST tags as closed/inactive if they were not recycled in the current version."""
+    from core.DBLayout import m_tag
     if CS.prior_tags:
         with CS(REF_OLD):
             for x, tag in enumerate(CS.prior_tags):
                 if x in CS.active_tag_list:
                     continue
                 CS.store(m_tag.update(
-                    tag[4],  # m_tag.tag_id
-                    tag[5],
-                    CS.gp.Old_VID,
-                    tag[7],
-                    tag[8],
-                    tag[9],
-                    tag[10],
+                    tag[6],          # m_tag.tag_id
+                    tag[7],          # m_tag.vid_s
+                    CS.gp.Old_VID,   # m_tag.vid_e (closed)
+                    tag[9],          # m_tag.code
+                    tag[10],         # m_tag.ast_id
+                    tag[11],         # m_tag.hl_s
+                    tag[12],         # m_tag.hl_l
                 ))
     return
 

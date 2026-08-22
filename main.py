@@ -111,12 +111,14 @@ def update(version: str) -> None:
     6. Enqueue all generated `ChangeSet` objects into `cs_queue` and resolve operations sequentially.
     7. Remove temporary indexes, commit table transactions (`G.TE.commit()`), and reset state.
     """
+    # -------------------------------------------------------------------------
+    # STEP 1: Register new version release in m_v_main (or skip if already exists)
+    # -------------------------------------------------------------------------
+    if create_new_vid(version):
+        logger.info(COLOR.yellow(f"=======================Version '{version}' already exists in DB. Skipping======================="))
+        return
+
     logger.info(COLOR.green(f"=======================Working on {version}======================="))
-    
-    # -------------------------------------------------------------------------
-    # STEP 1: Register new version release in m_v_main
-    # -------------------------------------------------------------------------
-    create_new_vid(version)
 
     # -------------------------------------------------------------------------
     # STEP 2: Create temporary performance indexes on DB tables
@@ -274,17 +276,29 @@ def trigger_multicore(batch_size: int = 200) -> None:
 
 def main() -> None:
     """Set the plan for what version to parse."""
-    arg_handling()
+    args = arg_handling()
     with G.DB() as db:
-        db.drop_table(gp.Table_Array)
-        db.create_table(gp.Table_Array)
-        db.create_index("v_main_index", m_v_main, (m_v_main.vname,))
-
-
+        if getattr(args, "reset", False) or getattr(args, "Drop", False):
+            logger.info("Resetting and recreating all database tables...")
+            db.drop_table(gp.Table_Array)
+            db.create_table(gp.Table_Array)
+            try:
+                db.create_index("v_main_index", m_v_main, (m_v_main.vname,))
+            except Exception:
+                pass
+        else:
+            missing = db.test_tables(gp.Table_Array)
+            if missing:
+                logger.info(f"Missing tables detected ({missing}), creating tables...")
+                db.create_table(gp.Table_Array)
+                try:
+                    db.create_index("v_main_index", m_v_main, (m_v_main.vname,))
+                except Exception:
+                    pass
 
     #try:
-    update("v3.0")
-    #update("v3.1")
+    #update("v3.0")
+    update("v3.1")
     #update("v3.2")
     #update("v3.3")
     #update("v3.4")
@@ -300,9 +314,15 @@ def main() -> None:
     return
 
 
-def arg_handling() -> None:
+def arg_handling() -> argparse.Namespace:
     """Handle arguments passed with python."""
     parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "-r", "--reset", "--reset-db",
+        dest="reset",
+        action="store_true",
+        help="Reset and recreate all database tables from scratch",
+    )
     parser.add_argument(
         "-D", "--Drop",
         help="Drop all tables", action="store_true",
@@ -358,19 +378,32 @@ def arg_handling() -> None:
         from tests.test_c_ast import run_c_ast_tests
         code = run_c_ast_tests(args.Test, profile=args.profile)
         sys.exit(code)
-    return
+    return args
 
 
-def create_new_vid(name: str) -> None:
-    """Create new m_v_main row."""
-    gp.Old_Version_Name = gp.Version_Name
-    gp.Version_Name = name
-    gp.Old_VID = gp.VID
-    gp.VID += 1
+def create_new_vid(name: str) -> bool:
+    """Register or synchronize active version in m_v_main. Returns True if version already exists."""
     with G.DB() as db:
-        db.insert(m_v_main, (gp.VID, name))
+        existing = db.select(m_v_main, (None, name))
+        if existing:
+            gp.Old_VID = existing[0]
+            gp.VID = existing[0]
+            gp.Old_Version_Name = name
+            gp.Version_Name = name
+            return True
 
-    return
+        next_vid = db.get_next_id(m_v_main)
+        gp.Old_VID = next_vid - 1
+        gp.VID = next_vid
+        gp.Old_Version_Name = gp.Version_Name
+        gp.Version_Name = name
+        if gp.Old_VID > 0 and gp.Old_Version_Name == "4b825dc642cb6eb9a060e54bf8d69288fbee4904":
+            old_row = db.select(m_v_main, (gp.Old_VID, None))
+            if old_row:
+                gp.Old_Version_Name = old_row[1]
+
+        db.insert(m_v_main, (gp.VID, name))
+        return False
 
 def default_processing(CS: ChangeSet) -> None:
     """Create m_file_name, m_file, m_bridge_file."""
@@ -386,10 +419,13 @@ def default_processing(CS: ChangeSet) -> None:
                 CS.last_not_none()
 
                 # Get old_bf
-                CS.store(m_bridge_file.get(
+                CS.store(m_bridge_file.view(
+                    ((m_bridge_file.fnid, m_file_name.fnid, 1),),
                     gp.Old_VID,
                     CS.ref(m_file_name.fnid),
                     None,
+                    None,
+                    CS.current_path,
                 ))
                 CS.last_not_none()
 
@@ -414,10 +450,13 @@ def default_processing(CS: ChangeSet) -> None:
                 CS.last_not_none()
 
                 # Get old_bf
-                CS.store(m_bridge_file.get(
+                CS.store(m_bridge_file.view(
+                    ((m_bridge_file.fnid, m_file_name.fnid, 1),),
                     gp.Old_VID,
                     CS.ref(m_file_name.fnid),
                     None,
+                    None,
+                    CS.old_path,
                 ))
                 CS.last_not_none()
 
@@ -431,14 +470,14 @@ def default_processing(CS: ChangeSet) -> None:
                     "R",
                 ))
 
-            # Check if FNAME exist/Create FNAME
+            # Get new file_name
             CS.store(m_file_name.get_set(
                 None,
                 CS.current_path,
             ))
 
             if CS.file_operation == "R100":
-                # Exact Moved
+                # RENAME EXACT
                 # Get FILE
                 CS.store(m_file.set(
                     None,
@@ -498,10 +537,13 @@ def default_processing(CS: ChangeSet) -> None:
 
             with CS(REF_OLD):
                 # Get old_bf
-                CS.store(m_bridge_file.get(
+                CS.store(m_bridge_file.view(
+                    ((m_bridge_file.fnid, m_file_name.fnid, 1),),
                     gp.Old_VID,
                     CS.ref(m_file_name.fnid, REF_ROOT),
                     None,
+                    None,
+                    CS.current_path,
                 ))
                 CS.last_not_none()
 

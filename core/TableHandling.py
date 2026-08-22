@@ -959,24 +959,18 @@ class Table:
         sanitized_columns = normalize_data_tuple(columns)
         return (self.table_id, OP_SET, sanitized_columns)
 
-    @G.type_check(Self, {SafeDataType})
-    def update(self, *columns: SafeDataType) -> OperationType:
-        """Construct OP_UPDATE operation, fetching missing None values from Table Engine.
+    @G.type_check(Self, {UnSafeDataType})
+    def update(self, *columns: UnSafeDataType) -> OperationType:
+        """Construct OP_UPDATE operation.
 
         Args:
-            *columns: Row column values with primary key values populated.
-
-        Usage:
-            `m_file_name.update(12, "drivers/net/new_name.c")`
+            *columns: Row column values (or reference tuples) matching table schema.
 
         Returns:
             Operation tuple `(table_id, OP_UPDATE, columns)`.
         """
         if is_data_unsafe(columns):
-            logger.error(f"""An {self.table_name}.update was done with unresolved refs,
-            This is unexpected behavior. CRASH""")
-            logger.error(columns)
-            G.emergency_shutdown(55)
+            return (self.table_id, OP_UPDATE, normalize_data_tuple(columns))
 
         sanitized_columns = tuple(to_safe_data(col) for col in columns)
 

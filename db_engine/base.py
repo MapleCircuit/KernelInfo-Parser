@@ -234,28 +234,39 @@ class BaseDBEngine(ABC):
         """
 
     @abstractmethod
+    def index_exists(self, index_name: str, table: Table) -> bool:
+        """Check if an index exists on target table in database catalog.
+
+        Args:
+            index_name (str): Identifier name for index.
+            table (Table): Target Table schema instance.
+        Outputs:
+            bool: True if index exists, False otherwise.
+        """
+
+    @abstractmethod
     def create_index(self, index_name: str, table: Table, rows: tuple[PointerType, ...]) -> None:
-        """Create composite or single-column index on target table.
+        """Create composite or single-column index on target table if not already existing.
 
         Args:
             index_name (str): Identifier name for index.
             table (Table): Target Table schema instance.
             rows (tuple[PointerType, ...]): Tuple of pointer tuples `(table_id, col_idx)` specifying indexed columns.
         Process:
-            Maps column indices to names, executes `CREATE INDEX <index_name> ON <table> (<cols>)`, and commits.
+            Checks for existing index, maps column indices to names, executes `CREATE INDEX <index_name> ON <table> (<cols>)`, and commits.
         Outputs:
             None.
         """
 
     @abstractmethod
     def remove_index(self, index_name: str, table: Table) -> None:
-        """Drop existing index from target table.
+        """Drop existing index from target table if it exists.
 
         Args:
             index_name (str): Name of index to remove.
             table (Table): Target Table schema instance.
         Process:
-            Executes `ALTER TABLE <table> DROP INDEX <index_name>`, and commits.
+            Checks for existing index, executes `ALTER TABLE <table> DROP INDEX <index_name>`, and commits.
         Outputs:
             None.
         """

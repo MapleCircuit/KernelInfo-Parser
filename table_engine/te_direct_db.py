@@ -372,7 +372,11 @@ class TEDirectDB:
 
         if self.queued_set[table_id]:
             if table.no_duplicate:
-                payload = tuple((item[1], *item[0]) for item in self.queued_set[table_id].items())
+                payload = tuple(
+                    v if isinstance(v, (tuple, list))
+                    else ((v, *k) if isinstance(k, tuple) else (v, k))
+                    for k, v in self.queued_set[table_id].items()
+                )
             else:
                 payload = tuple(self.queued_set[table_id].values())
 
@@ -404,7 +408,11 @@ class TEDirectDB:
 
             if self.queued_set[table_id]:
                 if table.no_duplicate:
-                    insert_payload = tuple((item[1], *item[0]) for item in self.queued_set[table_id].items())
+                    insert_payload = tuple(
+                        v if isinstance(v, (tuple, list))
+                        else ((v, *k) if isinstance(k, tuple) else (v, k))
+                        for k, v in self.queued_set[table_id].items()
+                    )
                 else:
                     insert_payload = tuple(self.queued_set[table_id].values())
 
