@@ -67,6 +67,16 @@ TEST_SUITE: list[dict[str, Any]] = [
         "baseline_ast_ops": 12507,
         "description": "Kernel Header (sched.h)",
     },
+    {
+        "file": "arch/mips/include/asm/mach-cavium-octeon/kernel-entry-init.h",
+        "baseline_ast_ops": 140,
+        "description": "Assembly Header (kernel-entry-init.h)",
+    },
+    {
+        "file": "arch/alpha/lib/clear_page.S",
+        "baseline_ast_ops": 145,
+        "description": "Assembly Source (clear_page.S)",
+    },
 ]
 
 # Total expected operations including the 3 default lifecycle operations (FNAME, FILE, BRIDGE_FILE)

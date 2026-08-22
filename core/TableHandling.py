@@ -100,6 +100,7 @@ from core.globalstuff import (
     PointerGetter,
     type_check,
     T_C,
+    T_ASM,
     REF_ROOT,
     REF_POS,
     REF_FILE,
@@ -125,6 +126,7 @@ from core.globalstuff import (
     UnSafeDataType,
 )
 from parser.c_ast.c_ast import c_ast_parse
+from parser.asm_ast.asm_ast import asm_ast_parse
 from core.Profiler import PipelineProfiler
 
 logger = logging.getLogger(__name__)
@@ -851,6 +853,8 @@ class ChangeSet:
             current_type = type_check(self.current_path)
             if current_type == T_C:
                 c_ast_parse(self)
+            elif current_type == T_ASM:
+                asm_ast_parse(self)
         except FILE_ERROR as e:
             logger.error(f"FILE_ERROR for '{self.file_operation}'={self.current_path}")
             logger.error(e)

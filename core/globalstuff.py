@@ -12,7 +12,7 @@ from enum import IntEnum, auto, Flag
 
 OP_DONE, OP_SET, OP_UPDATE, OP_REF, OP_REF_VIEW, OP_VIEW_DONE, OP_VIEW_SET = range(7)
 REF_ROOT, REF_OLD, REF_POS, REF_FILE, REF_MULTI, REF_C_AST, REF_NO_REF = range(7)
-T_DIR, T_C, T_KCONFIG, T_RUST = range(4)
+T_DIR, T_C, T_KCONFIG, T_RUST, T_ASM = range(5)
 
 PointerType = tuple[int, int]
 JoinType = tuple[PointerType, PointerType, int] | tuple[PointerType]
@@ -303,9 +303,11 @@ def type_check(name: str) -> int | None:
     """Parse string to get file type."""
     if name.endswith((".c", ".h")):
         return T_C
+    if name.endswith((".S", ".s")):
+        return T_ASM
     if name.endswith("Kconfig"):
         return T_KCONFIG
-    if name.endswith(".h"):
+    if name.endswith(".rs"):
         return T_RUST
     return None
 
@@ -380,6 +382,12 @@ class ASTT(IntEnum):
     CPPro_error = auto()
     CPPro_warning = auto()
     CPPro_pragma = auto()
+    ## ASM
+    ASM_Macro = auto()
+    ASM_Directive = auto()
+    ASM_Instruction = auto()
+    ASM_Label = auto()
+    ASM_Comment = auto()
 
 
 class FileContextFormatter(logging.Formatter):

@@ -500,7 +500,7 @@ class Ast_Manager:
         except Exception as e:
             raise FILE_ERROR(e)
 
-        self.rawfile = tuple(self.unsplit_rawfile.splitlines())
+        self.rawfile = tuple(self.unsplit_rawfile.split("\n"))
 
         cppro_cindex_input = []
         if G.OVERRIDE_CPPRO_CINDEX_INPUT:

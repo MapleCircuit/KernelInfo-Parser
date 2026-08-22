@@ -1,0 +1,63 @@
+"""parser/asm_ast/asm_ast_type.py - Assembly AST Type Definitions and Node Classes."""
+from __future__ import annotations
+
+from core.globalstuff import ASTT
+from typing import Any
+ChangeSetType = Any
+from parser.c_ast.c_ast_type import (
+    Line,
+    Ast,
+    Ast_Comment,
+    Ast_ASM_Macro,
+    Ast_ASM_Directive,
+    Ast_ASM_Instruction,
+    Ast_ASM_Label,
+    Ast_ASM_Comment,
+    CPPro,
+    CPPro_if,
+    CPPro_elif,
+    CPPro_else,
+    CPPro_endif,
+    CPPro_ifdef,
+    CPPro_ifndef,
+    CPPro_elifdef,
+    CPPro_elifndef,
+    CPPro_define,
+    CPPro_undef,
+    CPPro_include,
+    CPPro_line,
+    CPPro_error,
+    CPPro_warning,
+    CPPro_pragma,
+    End_Mode,
+    get_cursor_line,
+)
+
+__all__ = [
+    "Line",
+    "Ast",
+    "Ast_Comment",
+    "Ast_ASM_Macro",
+    "Ast_ASM_Directive",
+    "Ast_ASM_Instruction",
+    "Ast_ASM_Label",
+    "Ast_ASM_Comment",
+    "CPPro",
+    "CPPro_if",
+    "CPPro_elif",
+    "CPPro_else",
+    "CPPro_endif",
+    "CPPro_ifdef",
+    "CPPro_ifndef",
+    "CPPro_elifdef",
+    "CPPro_elifndef",
+    "CPPro_define",
+    "CPPro_undef",
+    "CPPro_include",
+    "CPPro_line",
+    "CPPro_error",
+    "CPPro_warning",
+    "CPPro_pragma",
+    "End_Mode",
+    "get_cursor_line",
+]

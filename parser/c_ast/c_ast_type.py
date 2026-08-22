@@ -378,7 +378,9 @@ class Ast:
         if self.extent is None:
             self.extent = Line(0, 0)
         else:
-            self.extent.cc(CS.parsers["C_AM"].rawfile)
+            parser_obj = CS.parsers.get("C_AM") or CS.parsers.get("ASM_AM")
+            if parser_obj and hasattr(parser_obj, "rawfile"):
+                self.extent.cc(parser_obj.rawfile)
 
         ast_ref = CS.ref(m_ast.ast_id, *ast_id_route)
 
@@ -622,6 +624,225 @@ class Ast_Keyword(Ast_Comment):
         self.extract_1arg(CS, 2, self.comment, self.extent)
         return
 
+class Ast_ASM_Macro(Ast):
+    """type_id ASTT.ASM_Macro."""
+
+    def __init__(self, extent: Line, name: str = "") -> None:
+        self.extent = extent
+        self.name = name
+        self.need_processing = True
+        self.end_mode = End_Mode.No_Check
+        self.saw_dot = False
+
+    def within_range(self, token, ast_kind) -> bool:
+        if not self.need_processing:
+            return False
+        self.extent.grow(token.line)
+        tspelling = token.spelling_str
+        if tspelling == ".":
+            self.saw_dot = True
+            return True
+        if self.saw_dot and tspelling == "endm":
+            self.need_processing = False
+            return True
+        if tspelling == ".endm":
+            self.need_processing = False
+            return True
+        self.saw_dot = False
+        return True
+
+    def exec_comment(self, token, cursor) -> None:
+        return
+
+    def exec_punctuation(self, token, cursor) -> None:
+        return
+
+    def exec_keyword(self, token, cursor) -> None:
+        if not self.name:
+            self.name = token.spelling_str
+        return
+
+    def exec_identifier(self, token, cursor) -> None:
+        if not self.name:
+            self.name = token.spelling_str
+        return
+
+    def exec_literal(self, token, cursor) -> None:
+        return
+
+    def extract(self, CS: ChangeSetType) -> None:
+        """Passthrough to AST.extract_1arg."""
+        self.extract_1arg(CS, ASTT.ASM_Macro, self.name or "macro", self.extent)
+        return
+
+
+class Ast_ASM_Directive(Ast):
+    """type_id ASTT.ASM_Directive."""
+
+    def __init__(self, extent: Line, directive: str = "") -> None:
+        self.extent = extent
+        self.directive = directive
+        self.need_processing = True
+        self.end_mode = End_Mode.No_Check
+
+    def within_range(self, token, ast_kind) -> bool:
+        if not self.need_processing:
+            return False
+        if token.spelling_str == "macro" and self.directive == ".":
+            self.__class__ = Ast_ASM_Macro
+            self.__init__(self.extent)
+            return True
+        tline = token.line
+        if tline.line_pos[0] <= self.extent.line_pos[1]:
+            self.extent.grow(tline)
+            return True
+        self.need_processing = False
+        return False
+
+    def exec_comment(self, token, cursor) -> None:
+        return
+
+    def exec_punctuation(self, token, cursor) -> None:
+        self.extent.grow(token.line)
+        self.directive += (" " if self.directive else "") + token.spelling_str
+        return
+
+    def exec_keyword(self, token, cursor) -> None:
+        self.extent.grow(token.line)
+        self.directive += (" " if self.directive else "") + token.spelling_str
+        return
+
+    def exec_identifier(self, token, cursor) -> None:
+        self.extent.grow(token.line)
+        self.directive += (" " if self.directive else "") + token.spelling_str
+        return
+
+    def exec_literal(self, token, cursor) -> None:
+        self.extent.grow(token.line)
+        self.directive += (" " if self.directive else "") + token.spelling_str
+        return
+
+    def extract(self, CS: ChangeSetType) -> None:
+        """Passthrough to AST.extract_1arg."""
+        dir_name = self.directive[:255] if self.directive else ".directive"
+        self.extract_1arg(CS, ASTT.ASM_Directive, dir_name, self.extent)
+        return
+
+
+class Ast_ASM_Comment(Ast):
+    """type_id ASTT.ASM_Comment."""
+
+    def __init__(self, extent: Line, comment: str = "") -> None:
+        self.extent = extent
+        self.comment = comment
+        self.need_processing = True
+        self.end_mode = End_Mode.No_Check
+
+    def within_range(self, token, ast_kind) -> bool:
+        if not self.need_processing:
+            return False
+        tline = token.line
+        if tline.line_pos[0] <= self.extent.line_pos[1]:
+            self.extent.grow(tline)
+            return True
+        self.need_processing = False
+        return False
+
+    def exec_comment(self, token, cursor) -> None:
+        return
+
+    def exec_punctuation(self, token, cursor) -> None:
+        self.extent.grow(token.line)
+        self.comment += (" " if self.comment else "") + token.spelling_str
+        return
+
+    def exec_keyword(self, token, cursor) -> None:
+        self.extent.grow(token.line)
+        self.comment += (" " if self.comment else "") + token.spelling_str
+        return
+
+    def exec_identifier(self, token, cursor) -> None:
+        self.extent.grow(token.line)
+        self.comment += (" " if self.comment else "") + token.spelling_str
+        return
+
+    def exec_literal(self, token, cursor) -> None:
+        self.extent.grow(token.line)
+        self.comment += (" " if self.comment else "") + token.spelling_str
+        return
+
+    def extract(self, CS: ChangeSetType) -> None:
+        """Passthrough to AST.extract_1arg."""
+        c_name = self.comment[:255] if self.comment else ""
+        self.extract_1arg(CS, ASTT.ASM_Comment, c_name, self.extent)
+        return
+
+
+class Ast_ASM_Instruction(Ast):
+    """type_id ASTT.ASM_Instruction."""
+
+    def __init__(self, extent: Line, instruction: str = "") -> None:
+        self.extent = extent
+        self.instruction = instruction
+        self.need_processing = True
+        self.end_mode = End_Mode.No_Check
+
+    def within_range(self, token, ast_kind) -> bool:
+        if not self.need_processing:
+            return False
+        tline = token.line
+        if tline.line_pos[0] <= self.extent.line_pos[1]:
+            self.extent.grow(tline)
+            return True
+        self.need_processing = False
+        return False
+
+    def exec_comment(self, token, cursor) -> None:
+        return
+
+    def exec_punctuation(self, token, cursor) -> None:
+        self.extent.grow(token.line)
+        self.instruction += (" " if self.instruction else "") + token.spelling_str
+        return
+
+    def exec_keyword(self, token, cursor) -> None:
+        self.extent.grow(token.line)
+        self.instruction += (" " if self.instruction else "") + token.spelling_str
+        return
+
+    def exec_identifier(self, token, cursor) -> None:
+        self.extent.grow(token.line)
+        self.instruction += (" " if self.instruction else "") + token.spelling_str
+        return
+
+    def exec_literal(self, token, cursor) -> None:
+        self.extent.grow(token.line)
+        self.instruction += (" " if self.instruction else "") + token.spelling_str
+        return
+
+    def extract(self, CS: ChangeSetType) -> None:
+        """Passthrough to AST.extract_1arg."""
+        ins_name = self.instruction[:255] if self.instruction else "instruction"
+        self.extract_1arg(CS, ASTT.ASM_Instruction, ins_name, self.extent)
+        return
+
+
+class Ast_ASM_Label(Ast):
+    """type_id ASTT.ASM_Label."""
+
+    def __init__(self, extent: Line, name: str = "") -> None:
+        self.extent = extent
+        self.name = name
+
+    def within_range(self, token, ast_kind) -> bool:
+        return False
+
+    def extract(self, CS: ChangeSetType) -> None:
+        """Passthrough to AST.extract_1arg."""
+        self.extract_1arg(CS, ASTT.ASM_Label, self.name, self.extent)
+        return
+
+
 class Ast_MACRO_INSTANTIATION(Ast):
     def __init__(self, line: Line, func_name: Line) -> None:
         self.extent = line
@@ -752,8 +973,11 @@ class CPPro(Ast):
                 self.ccpro_start_flip(CPPro_pragma, cline)
 
             case _:
-                logger.warn(f"CPPro>>Spelling:{tspelling},Kind:{cursor.kind} => Not implemented")
-                self.need_processing = False
+                self.ccpro_start_flip(Ast_ASM_Comment, cline, tspelling)
+        return
+
+    def extract(self, CS: ChangeSetType) -> None:
+        """Do not emit database AST records for unflipped or non-directive CPPro instances."""
         return
 
 
@@ -1851,6 +2075,9 @@ class Zone:
                 else:
                     self.children.append(CPPro(tline))
                     return True
+            if tspelling == "." and self.zone_type == Zone_Type.Full_File:
+                self.children.append(Ast_ASM_Directive(tline, "."))
+                return True
 
         # Guard against statement keywords outside type declarations
         if ast_kind == AST_KIND.keyword and tspelling in _KEYWORD_IGNORED:
