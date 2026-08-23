@@ -16,6 +16,8 @@ Stateful caching, sequence coordination, relational view decomposition, and batc
   - `primary: tuple[int, ...]` &mdash; 0-indexed column indices forming Primary Key (e.g., `(0,)` or `(0, 1)`).
   - `no_duplicate: bool` &mdash; If `True`, deduplicates rows via in-memory key `columns[1:]`.
   - `initial_insert: tuple[...] | None` &mdash; Initial seed rows.
+  - `te_cached: bool` &mdash; If `True`, enables in-memory preloading and multi-indexing in `TECachedDB`.
+  - `hashing_table: bool | str` &mdash; If set (e.g. `"m_ast_hash"`), enables automatic structural hash deduplication and acceleration for views rooted at this table.
 
 ---
 
@@ -39,12 +41,14 @@ Stateful caching, sequence coordination, relational view decomposition, and batc
 - **`__init__() -> None`**
   - Initializes empty dictionaries for `tables`, `queued_set`, `queued_update`, `queued_view`, `next_id`, and sets `db = None`.
 - **`start_new_db(db: Callable[[], Any] | type[Any]) -> None`**
-  - Safely closes active `self.db` (if present) and instantiates a new driver: `self.db = db()`.
+  1. Safely closes active `self.db` (if present) and instantiates a new driver: `self.db = db()`.
+  2. Resets `queued_view = {}`.
+  3. For all registered `self.tables`: resets `queued_set[t_id] = {}`, `queued_update[t_id] = []`, and refreshes `next_id[t_id] = self.db.get_next_id(t)`.
+  4. (In `TECachedDB`): Re-initializes `_cached_rows`, `_pk_index`, `_nodup_index`, and `_col_indices`, and preloads all records from the database for tables with `te_cached=True`.
 - **`start(tables: Sequence[Table] | Table, db: Callable[[], Any] | type[Any]) -> None`**
   1. Normalizes `tables` into a tuple.
-  2. Calls `start_new_db(db)`.
-  3. Resets `self.queued_view = {}`.
-  4. For each `t` in `tables`: sets `tables[t.table_id] = t`, `queued_set[t.table_id] = {}`, `queued_update[t.table_id] = []`, and `next_id[t.table_id] = self.db.get_next_id(t)`.
+  2. Registers all tables in `self.tables`.
+  3. Calls `self.start_new_db(db)`.
 - **`close() -> None`**
   - Calls `self.db.close()` if available (ignoring exceptions) and sets `self.db = None`.
 - **Context Manager**: `__enter__() -> Self`, `__exit__(...) -> close()`, `__del__() -> close()`.
@@ -55,7 +59,7 @@ Stateful caching, sequence coordination, relational view decomposition, and batc
 
 - **`get(table_id: int, columns: tuple[SafeDataType, ...]) -> tuple[SafeDataType, ...] | None`**
   - **Emptiness Guard**: If `table.initial_insert is None and self.next_id[table_id] <= 1`, returns `None` immediately without querying DB.
-  - **Query**: Returns `self.db.select(table, columns)` where `None` positions act as wildcards.
+  - **Query**: Returns `self.db.select(table, columns)` where `None` positions act as wildcards. (In `TECachedDB`, resolves in-memory via indices for `te_cached=True` tables).
 - **`set(table_id: int, columns: tuple[SafeDataType, ...]) -> tuple[SafeDataType, ...]`**
   - **Case 1 (`table.no_duplicate == True`)**:
     - Key: `key = columns[1:]`.
@@ -78,14 +82,28 @@ Stateful caching, sequence coordination, relational view decomposition, and batc
 - **`view_get(joins: JoinsType, columns: tuple[SafeDataType, ...]) -> tuple[SafeDataType, ...] | None`**
   - `init_id = PointerGetter(joins).get_first_table_id()`.
   - If `tables[init_id].initial_insert is None and next_id[init_id] <= 1`: returns `None`.
-  - Returns `self.db.view_select(self.tables, joins, columns)`.
+  - **Schema-Driven Hash Fast-Path**: If `tables[init_id]` has `hashing_table` configured and registered:
+    1. Computes SHA-256 hash `h = compute_ast_hash(joins, filtered_columns)`.
+    2. Queries `hash_table` (or checks staged buffer/in-memory cache) for `(h, None)`.
+    3. If match found with `ast_id`, returns `tuple(val if val is not None else ast_id for val in columns)`.
+    4. If not found and `hash_table.te_cached is True`: returns `None` immediately (zero SQL queries).
+  - **Fallback**: Returns `self.db.view_select(self.tables, joins, columns)`.
 - **`view_get_multiple(joins: JoinsType, columns: tuple[SafeDataType, ...]) -> list[tuple[SafeDataType, ...]]`**
   - Returns `self.db.view_select_multiple(self.tables, joins, columns)`.
 - **`view_set(joins: JoinsType, columns: tuple[SafeDataType, ...]) -> tuple[SafeDataType, ...]`**
   1. Extracts non-None values: `filtered = tuple(x for x in columns if x is not None)`.
   2. If `joins` in `queued_view` and `filtered` in `queued_view[joins]`:
      - Returns `tuple(x if x is not None else queued_view[joins][filtered] for x in columns)`.
-  3. Else:
+  3. **Schema-Driven Hash Fast-Path & Staging**: If `tables[main_id]` has `hashing_table` configured and registered:
+     - Computes SHA-256 hash `h = compute_ast_hash(joins, filtered)`.
+     - Checks staged `queued_set[hash_table]` or queries `self.get(hash_table.table_id, (h, None))`.
+     - If match exists: returns `columns` with None positions replaced by existing `ast_id`.
+     - If new:
+       - Assigns `current_view_id = next_id[main_id]`; increments `next_id[main_id] += 1`.
+       - Stages `(h, current_view_id)` into `queued_set[hash_table.table_id]`.
+       - Decomposes `result` across constituent tables.
+       - Returns `result`.
+  4. Else (Non-Hashed Views):
      - `main_id = PointerGetter(joins).get_first_table_id()`.
      - `current_view_id = next_id[main_id]`; increments `next_id[main_id] += 1`.
      - `queued_view.setdefault(joins, {})[filtered] = current_view_id`.
@@ -142,3 +160,36 @@ Any backend passed to `TableEngine` must implement:
 2. **Buffer Transformations**: On `commit()`, `no_duplicate` tables must reconstruct rows as `(assigned_id, *data_key)` before calling `db.insert()`.
 3. **Multiprocessing Isolation**: Re-invoke `start_new_db()` in child workers to ensure separate DB connection sockets.
 4. **Tuple Immutability**: All returned and cached rows must be immutable tuples of primitive `SafeDataType`.
+
+---
+
+## 6. TableEngine Variants & Factory Resolver
+
+- **`TEDirectDB` (`table_engine/te_direct_db.py`)**: Direct passthrough engine with local deduplication staging, monotonic sequence assignment, `m_ast_hash` acceleration, and high-throughput batch execution.
+- **`TECachedDB` (`table_engine/te_cached_db.py`)** *(Default)*: Extends `TEDirectDB` with in-memory preloading, multi-index acceleration, and zero-latency single-table query resolution:
+  - **Selective Hot-Table Preloading**: At `start()`, all database rows for registered tables with `table.te_cached = True` are preloaded via `db.view_select_multiple()` into `_cached_rows`.
+  - **Multi-Index In-Memory Architecture**:
+    - `_pk_index[table_id][pk] -> row`: O(1) primary key exact row lookup.
+    - `_nodup_index[table_id][columns[1:]] -> assigned_id`: O(1) deduplication key lookup for `no_duplicate=True` tables.
+    - `_col_indices[table_id][col_idx][val] -> [row, ...]`: Inverted column indices for fast partial filter matching.
+  - **In-Memory Query Fast-Path**: `get(table_id, columns)` for cached tables is resolved entirely in memory across primary key, deduplication, and column indices without issuing SQL queries to the database.
+  - **Real-Time Synchronization**: Staged `set()`, `update()`, and `view_set()` operations instantly update `_cached_rows` and internal indices.
+  - **Lifecycle Cleanup**: Explicit `clear_cache()` and `close()` support to release memory resources cleanly.
+
+### 6.1. Factory Resolver (`get_table_engine`)
+
+The `table_engine` package provides a dynamic resolver `get_table_engine(name)`:
+```python
+from table_engine import get_table_engine
+
+# Resolved from CLI option (--te cached | --te direct)
+EngineClass = get_table_engine("cached")  # -> TECachedDB
+G.TE = EngineClass()
+```
+
+| Engine Alias | Resolved Class | Description |
+| :--- | :--- | :--- |
+| `"cached"`, `"tecacheddb"` | `TECachedDB` | In-memory cached table engine (default) |
+| `"direct"`, `"tedirectdb"` | `TEDirectDB` | Direct database passthrough table engine |
+
+

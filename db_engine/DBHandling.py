@@ -283,6 +283,7 @@ class MariaDB(BaseDBEngine):
             user=self.user,
             password=self.password,
             database=self.db_name,
+            autocommit=True,
         )
 
     def check_if_connected(self) -> None:
@@ -939,7 +940,7 @@ class MariaDB(BaseDBEngine):
         self.check_if_connected()
         try:
             self.cursor.execute(f"SHOW INDEX FROM {table.table_name} WHERE Key_name = %s", (index_name,))
-            return bool(self.cursor.fetchone())
+            return bool(self.cursor.fetchall())
         except Exception:
             return False
 

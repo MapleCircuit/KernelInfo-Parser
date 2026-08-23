@@ -85,6 +85,7 @@ from core.DBLayout import (
     m_bridge_tag,
     m_map_ast,
     m_bridge_map,
+    m_ast_hash,
 )
 
 __all__ = [
@@ -161,4 +162,5 @@ __all__ = [
     "m_bridge_tag",
     "m_map_ast",
     "m_bridge_map",
+    "m_ast_hash",
 ]

@@ -80,11 +80,8 @@ class GreatProcessor:
         return
 
     def reset_cs(self) -> None:
-        """Reset `Change_List` and `ChangeSet_Dict` upon completion of a version parsing pass."""
-        del self.Alt_ChangeSet_Dict
-        self.Alt_ChangeSet_Dict = self.ChangeSet_Dict
-        del self.Change_List
-        del self.ChangeSet_Dict
+        """Reset Change_List and ChangeSet_Dict upon completion of a version parsing pass."""
+        self.Alt_ChangeSet_Dict.clear()
         self.Change_List = None
-        self.ChangeSet_Dict = {}
+        self.ChangeSet_Dict.clear()
         return

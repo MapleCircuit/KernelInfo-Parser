@@ -3,7 +3,7 @@
 ===============================================================================
 RELATIONAL DATABASE SCHEMA REFERENCE GUIDE FOR AI & PARSERS
 ===============================================================================
-This module defines the 14 core relational database tables used across the parser
+This module defines the 15 core relational database tables used across the parser
 pipeline (`Table_Array`).
 
 SCHEMA ENTITY-RELATIONSHIP GRAPH:
@@ -25,6 +25,7 @@ SCHEMA ENTITY-RELATIONSHIP GRAPH:
                                          ^
       |-- (ast_id, ref_ast_id) ---|------|-> m_ast_container (ast_id, priority, type_id, ref_ast_id)
       |-- (ast_id) ----------------------|-> m_ast_debug (ast_id, ast_raw)
+      |-- (ast_id) ----------------------|-> m_ast_hash (hash, ast_id)
 
 3. Code Tags & Source Coordinates:
    m_tag (tag_id, vid_s, vid_e, code, ast_id, hl_s, hl_l)
@@ -59,7 +60,8 @@ m_v_main = Table(
     foreign=None,
     initial_insert=((0, "latest"),),
     no_duplicate=True,
-    select_procedure=True,
+    te_cached=True,
+    hashing_table=False,
 )
 
 # -----------------------------------------------------------------------------
@@ -78,7 +80,8 @@ m_file_name = Table(
     foreign=None,
     initial_insert=((0, ""),),
     no_duplicate=True,
-    select_procedure=True,
+    te_cached=True,
+    hashing_table=False,
 )
 
 # -----------------------------------------------------------------------------
@@ -105,7 +108,8 @@ m_file = Table(
     foreign=(("vid_s", "m_v_main", "vid"), ("vid_e", "m_v_main", "vid")),
     initial_insert=((0, 0, 0, 0, 0, 0),),
     no_duplicate=False,
-    select_procedure=True,
+    te_cached=True,
+    hashing_table=False,
 )
 
 # -----------------------------------------------------------------------------
@@ -130,7 +134,8 @@ m_bridge_file = Table(
     ),
     initial_insert=None,
     no_duplicate=False,
-    select_procedure=True,
+    te_cached=True,
+    hashing_table=False,
 )
 
 # -----------------------------------------------------------------------------
@@ -146,7 +151,8 @@ m_moved_file = Table(
     foreign=(("s_fid", "m_file", "fid"), ("e_fid", "m_file", "fid")),
     initial_insert=None,
     no_duplicate=False,
-    select_procedure=False,
+    te_cached=False,
+    hashing_table=False,
 )
 
 # -----------------------------------------------------------------------------
@@ -165,7 +171,8 @@ m_type_descriptor = Table(
     foreign=None,
     initial_insert=m_type_descriptor_insert,
     no_duplicate=False,
-    select_procedure=True,
+    te_cached=True,
+    hashing_table=False,
 )
 
 # -----------------------------------------------------------------------------
@@ -186,7 +193,8 @@ m_ast = Table(
     foreign=(("type_id", "m_type_descriptor", "type_id"),),
     initial_insert=((0, "", 0),),
     no_duplicate=False,
-    select_procedure=True,
+    te_cached=False,
+    hashing_table="m_ast_hash",
 )
 
 # -----------------------------------------------------------------------------
@@ -213,7 +221,8 @@ m_ast_container = Table(
     ),
     initial_insert=None,
     no_duplicate=False,
-    select_procedure=True,
+    te_cached=False,
+    hashing_table=False,
 )
 
 # -----------------------------------------------------------------------------
@@ -229,7 +238,8 @@ m_ast_include = Table(
     foreign=(("ast_id", "m_ast", "ast_id"), ("fnid", "m_file_name", "fnid")),
     initial_insert=None,
     no_duplicate=False,
-    select_procedure=True,
+    te_cached=False,
+    hashing_table=False,
 )
 
 # -----------------------------------------------------------------------------
@@ -245,7 +255,8 @@ m_ast_debug = Table(
     foreign=(("ast_id", "m_ast", "ast_id"),),
     initial_insert=None,
     no_duplicate=False,
-    select_procedure=False,
+    te_cached=False,
+    hashing_table=False,
 )
 
 # -----------------------------------------------------------------------------
@@ -278,7 +289,8 @@ m_tag = Table(
     ),
     initial_insert=(0, 0, 0, "", 0, 0, 0),
     no_duplicate=False,
-    select_procedure=True,
+    te_cached=False,
+    hashing_table=False,
 )
 
 # -----------------------------------------------------------------------------
@@ -303,7 +315,8 @@ m_bridge_tag = Table(
     foreign=(("fid", "m_file", "fid"), ("tag_id", "m_tag", "tag_id")),
     initial_insert=None,
     no_duplicate=False,
-    select_procedure=True,
+    te_cached=False,
+    hashing_table=False,
 )
 
 # -----------------------------------------------------------------------------
@@ -327,7 +340,8 @@ m_map_ast = Table(
     foreign=(("ast_id", "m_ast", "ast_id"),),
     initial_insert=((0, 0, 0, 0, 0, 0),),
     no_duplicate=False,
-    select_procedure=True,
+    te_cached=False,
+    hashing_table=False,
 )
 
 # -----------------------------------------------------------------------------
@@ -346,7 +360,28 @@ m_bridge_map = Table(
     foreign=(("tag_id", "m_tag", "tag_id"),),
     initial_insert=None,
     no_duplicate=False,
-    select_procedure=True,
+    te_cached=False,
+    hashing_table=False,
+)
+
+# -----------------------------------------------------------------------------
+# 15. m_ast_hash (table_id=14): AST Structural Hash Deduplication Registry
+#     - hash: SHA-256 hex string of canonical AST node & children (PK).
+#     - ast_id: Assigned AST Node ID (FK -> m_ast.ast_id).
+# -----------------------------------------------------------------------------
+m_ast_hash = Table(
+    table_id=14,
+    table_name="m_ast_hash",
+    columns=(
+        ("hash", "VARCHAR(64)", "NOT NULL", "COLLATE utf8mb4_bin"),
+        ("ast_id", "INT", "NOT NULL"),
+    ),
+    primary=("hash",),
+    foreign=(("ast_id", "m_ast", "ast_id"),),
+    initial_insert=None,
+    no_duplicate=False,
+    te_cached=True,
+    hashing_table=False,
 )
 
 TABLES: tuple[Table, ...] = (
@@ -364,17 +399,18 @@ TABLES: tuple[Table, ...] = (
     m_bridge_tag,
     m_map_ast,
     m_bridge_map,
+    m_ast_hash,
 )
 
 
 def init_db_layout(gp=None) -> tuple[Table, ...]:
-    """Initialize and populate gp.Table_Array with the default 14 schema tables.
+    """Initialize and populate gp.Table_Array with the default 15 schema tables.
     
     Args:
         gp: Optional GreatProcessor instance to attach Table_Array to.
         
     Returns:
-        Immutable tuple of all 14 Table schema objects.
+        Immutable tuple of all 15 Table schema objects.
     """
     if gp is not None:
         gp.Table_Array = list(TABLES)

@@ -11,7 +11,7 @@ import random
 logger = logging.getLogger(__name__)
 
 # Linter bypass
-m_v_main = m_file_name = m_file = m_bridge_file = m_moved_file = m_type_descriptor = m_ast = m_ast_container = m_ast_include = m_ast_debug = m_tag = m_bridge_tag = m_map_ast = m_bridge_map = None
+m_v_main = m_file_name = m_file = m_bridge_file = m_moved_file = m_type_descriptor = m_ast = m_ast_container = m_ast_include = m_ast_debug = m_tag = m_bridge_tag = m_map_ast = m_bridge_map = m_ast_hash = None
 ChangeSetType = Any
 _DEF_TYPES = (ASTT.C_struct, ASTT.C_functionproto, ASTT.C_union, ASTT.C_enum)
 _PUNCT_IGNORED = (";", ",", ")", "}")
@@ -398,40 +398,46 @@ class Ast:
         if CS.prior_tags and (self.extent.code != ""):
             lookup = getattr(CS, "prior_tags_map", None)
             if lookup is not None:
-                tag_match = lookup.get(self.extent.code)
-                if tag_match is not None:
-                    x, tag_id = tag_match
-                    if isinstance(CS.active_tag_list, set):
-                        CS.active_tag_list.add(x)
-                    else:
-                        CS.active_tag_list.append(x)
-                    with CS(REF_OLD):
+                tag_list = lookup.get(self.extent.code)
+                if tag_list is not None:
+                    tag_match = None
+                    for item in tag_list:
+                        if item[0] not in CS.active_tag_list:
+                            tag_match = item
+                            break
+                    if tag_match is not None:
+                        x, tag_id = tag_match
+                        if isinstance(CS.active_tag_list, set):
+                            CS.active_tag_list.add(x)
+                        else:
+                            CS.active_tag_list.append(x)
                         CS.store(m_bridge_tag.set(
-                            CS.ref(m_file.fid, REF_ROOT, REF_OLD),
+                            ((m_file.table_id, 0), OP_REF, (REF_ROOT,)),
                             tag_id,
                             self.extent.line_pos[0],
                             self.extent.line_pos[1],
                             self.extent.char_pos[0],
                             self.extent.char_pos[1],
                         ))
-                    return
+                        return
             else:
                 for x, tag in enumerate(CS.prior_tags):
+                    if x in CS.active_tag_list:
+                        continue
                     # If tag found in prior_tags, set bridge and return
                     if tag[9] == self.extent.code:
                         if isinstance(CS.active_tag_list, set):
                             CS.active_tag_list.add(x)
                         else:
                             CS.active_tag_list.append(x)
-                        with CS(REF_OLD):
-                            CS.store(m_bridge_tag.set(
-                                CS.ref(m_file.fid, REF_ROOT, REF_OLD),
-                                tag[1],
-                                self.extent.line_pos[0],
-                                self.extent.line_pos[1],
-                                self.extent.char_pos[0],
-                                self.extent.char_pos[1],
-                            ))
+                        CS.store(m_bridge_tag.set(
+                            ((m_file.table_id, 0), OP_REF, (REF_ROOT,)),
+                            tag[1],
+                            self.extent.line_pos[0],
+                            self.extent.line_pos[1],
+                            self.extent.char_pos[0],
+                            self.extent.char_pos[1],
+                        ))
                         return
 
         with CS(REF_POS):

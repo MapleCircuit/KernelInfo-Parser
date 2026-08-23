@@ -861,11 +861,14 @@ class ChangeSet:
             self.cs = []
 
     def clear_bloat(self) -> None:
-        """Remove un-picklable attributes (gp, mf, debug) before multiprocessing serialization."""
+        """Remove un-picklable and ephemeral parsing structures before IPC serialization."""
         self.gp = None
         self.mf = None
         self.debug = []
         self.parsers = {}
+        self.prior_tags = None
+        self.prior_tags_map = None
+        self.active_tag_list = None
 
     def __str__(self) -> str:
         """Return formatted string summarizing file operation, queued cs, and results."""
@@ -888,7 +891,8 @@ class Table:
         foreign: tuple[tuple[str, str, str], ...] | None = None,
         initial_insert: tuple[tuple[SafeDataType, ...], ...] | tuple[SafeDataType, ...] | None = None,
         no_duplicate: bool = False,
-        select_procedure: bool | str = False,
+        te_cached: bool = False,
+        hashing_table: bool | str = False,
     ) -> None:
         """Initialize a Table schema definition, generate dynamic column pointers, and bind to parser.
 
@@ -900,7 +904,8 @@ class Table:
             foreign: Optional tuple of Foreign Key constraints: `(("local_col", "foreign_table", "foreign_col"), ...)`.
             initial_insert: Optional tuple of default rows inserted when table is created.
             no_duplicate: If True, `set()` automatically checks if a row exists in Table Engine (`G.TE`) via `get_set()`.
-            select_procedure: Pre-loading caching strategy for Table Engine initialization.
+            te_cached: Pre-loading caching strategy for Table Engine initialization.
+            hashing_table: Name of the linked hashing table.
 
         Side Effects:
             1. Binds column attribute pointers directly on this instance:
@@ -926,7 +931,9 @@ class Table:
         self.init_foreign = foreign
         self.initial_insert = initial_insert
         self.no_duplicate = no_duplicate
-        self.select_procedure = select_procedure
+        self.te_cached = te_cached
+        self.hashing_table = hashing_table
+        self.has_auto_increment = any(any("AUTO_INCREMENT" in str(elem) for elem in col) for col in self.init_columns)
 
         # Step 1: Bind column attribute pointers directly onto instance (self.column_name = (table_id, col_idx))
         for x, column in enumerate(self.init_columns):

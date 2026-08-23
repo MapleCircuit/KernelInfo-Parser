@@ -15,6 +15,8 @@ import subprocess
 import multiprocessing
 from typing import Any
 
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 from core.globalstuff import G, COLOR
 from core.GreatProcessor import GreatProcessor
 from core.FileHandler import MasterFile
@@ -25,7 +27,7 @@ from core.DBLayout import (
     m_file,
     m_bridge_file,
 )
-from table_engine.te_direct_db import TEDirectDB
+from table_engine import TEDirectDB, TECachedDB, get_table_engine
 from db_engine import MockDB, MariaDB
 from parser.c_ast.c_ast_type import safe_spelling, safe_cursor_spelling
 
@@ -113,7 +115,8 @@ def run_single_file_worker(item: dict[str, Any]) -> dict[str, Any]:
         # Isolated in-memory DB per worker
         G.DEBUG_TYPECHECK = True
         G.DB = MockDB
-        G.TE = TEDirectDB()
+        te_choice = item.get("table_engine", "cached")
+        G.TE = get_table_engine(te_choice)()
         gp = GreatProcessor()
         init_db_layout(gp)
         G.TE.start(gp.Table_Array, G.DB)
@@ -229,13 +232,43 @@ class TestCASTParser(unittest.TestCase):
         self.assertEqual(safe_cursor_spelling(cursor), "my_func")
         self.assertEqual(getattr(cursor, "_spelling_str", None), "my_func")
 
+    def test_table_engine_resolver(self) -> None:
+        """Test get_table_engine resolver and alias mappings."""
+        self.assertEqual(get_table_engine("cached"), TECachedDB)
+        self.assertEqual(get_table_engine("tecacheddb"), TECachedDB)
+        self.assertEqual(get_table_engine("direct"), TEDirectDB)
+        self.assertEqual(get_table_engine("tedirectdb"), TEDirectDB)
+        self.assertEqual(get_table_engine(None), TECachedDB)
+        self.assertEqual(get_table_engine(TEDirectDB), TEDirectDB)
+        self.assertEqual(get_table_engine(TECachedDB), TECachedDB)
+        with self.assertRaises(ValueError):
+            get_table_engine("invalid_engine")
 
-def run_c_ast_tests(target_file: str | None = None, profile: bool = False) -> int:
+    def test_direct_table_engine_execution(self) -> None:
+        """Verify parsing and ChangeSet execution with TEDirectDB."""
+        item = {
+            "file": "virt/kvm/iodev.h",
+            "baseline_ast_ops": 231,
+            "description": "Kernel Header (virt/kvm/iodev.h)",
+            "table_engine": "direct",
+        }
+        res = run_single_file_worker(item)
+        self.assertIsNone(res["error"])
+        self.assertTrue(res["execute_success"])
+        self.assertEqual(res["actual_total_ops"], res["baseline_total_ops"])
+
+
+def run_c_ast_tests(
+    target_file: str | None = None,
+    profile: bool = False,
+    table_engine: str = "cached",
+) -> int:
     """Programmatic multi-core test runner invoked via CLI in main.py.
     
     Args:
         target_file: Optional single file path to test.
         profile: Whether to collect and print granular stage profiler breakdowns.
+        table_engine: Table engine variant ('cached' or 'direct').
         
     Returns:
         0 if all tests pass, 1 otherwise.
@@ -243,25 +276,29 @@ def run_c_ast_tests(target_file: str | None = None, profile: bool = False) -> in
     if profile:
         G.PROFILING_ENABLED = True
 
+    te_display = table_engine if isinstance(table_engine, str) else getattr(table_engine, "__name__", str(table_engine))
+
     print(COLOR.cyan("\n=========================================================================================="))
     print(COLOR.cyan("                    MULTI-CORE C-AST PARSER & EXECUTE TEST RUNNER                         "))
     print(COLOR.cyan("=========================================================================================="))
-    print(f"Workspace: {COLOR.magenta(G.RAMDISK)} (Isolated /dev/shm RAMDISK)")
-    print(f"Dataset:   {COLOR.magenta('Linux v3.0 (Read-Only)')}")
-    print(f"Backend:   {COLOR.magenta('In-Memory MockDB (Isolated)')}")
+    print(f"Workspace:   {COLOR.magenta(G.RAMDISK)} (Isolated /dev/shm RAMDISK)")
+    print(f"Dataset:     {COLOR.magenta('Linux v3.0 (Read-Only)')}")
+    print(f"Backend:     {COLOR.magenta('In-Memory MockDB (Isolated)')}")
+    print(f"TableEngine: {COLOR.magenta(te_display.capitalize())}")
     if G.PROFILING_ENABLED:
-        print(f"Profiler:  {COLOR.green('ACTIVE (-p / --profile)')}\n")
+        print(f"Profiler:    {COLOR.green('ACTIVE (-p / --profile)')}\n")
     else:
         print()
 
     start_time = time.time()
 
     if target_file:
-        print(COLOR.cyan(f"[*] Executing Single Target Test: {target_file}"))
+        print(COLOR.cyan(f"[*] Executing Single Target Test: {target_file} (TableEngine: {te_display})"))
         item = {
             "file": target_file,
             "baseline_ast_ops": 0,
             "description": f"Target: {target_file}",
+            "table_engine": table_engine,
         }
         res = run_single_file_worker(item)
         elapsed = time.time() - start_time
@@ -285,8 +322,10 @@ def run_c_ast_tests(target_file: str | None = None, profile: bool = False) -> in
     workers = min(len(TEST_SUITE), num_cpus)
     print(COLOR.cyan(f"[*] Dispatching test suite across {workers} parallel CPU workers..."))
 
+    suite_items = [{**item, "table_engine": table_engine} for item in TEST_SUITE]
+
     with multiprocessing.Pool(processes=workers) as pool:
-        results = pool.map(run_single_file_worker, TEST_SUITE)
+        results = pool.map(run_single_file_worker, suite_items)
 
     elapsed = time.time() - start_time
 
@@ -353,5 +392,12 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="C-AST Parser Test Suite")
     parser.add_argument("target_file", nargs="?", default=None, help="Target file to parse")
     parser.add_argument("-p", "--profile", action="store_true", help="Enable granular stage timing profiler")
+    parser.add_argument(
+        "--te", "--table-engine",
+        dest="table_engine",
+        default="cached",
+        choices=["cached", "direct", "tecacheddb", "tedirectdb"],
+        help="Select Table Engine architecture backend (default: cached)",
+    )
     args = parser.parse_args()
-    sys.exit(run_c_ast_tests(target_file=args.target_file, profile=args.profile))
+    sys.exit(run_c_ast_tests(target_file=args.target_file, profile=args.profile, table_engine=args.table_engine))

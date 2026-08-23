@@ -34,6 +34,7 @@ KEY RESPONSIBILITIES:
 """
 from __future__ import annotations
 
+import hashlib
 from typing import TYPE_CHECKING, Any, Callable, Sequence, Self
 from types import TracebackType
 from operator import itemgetter
@@ -46,6 +47,12 @@ from core.globalstuff import (
 if TYPE_CHECKING:
     from core.TableHandling import Table
     from db_engine.base import BaseDBEngine
+
+
+def compute_ast_hash(joins: JoinsType, filtered_columns: tuple[SafeDataType, ...]) -> str:
+    """Compute deterministic SHA-256 hash for canonical AST join graph and filtered column data."""
+    key_str = f"{joins}:{filtered_columns}"
+    return hashlib.sha256(key_str.encode("utf-8")).hexdigest()
 
 
 class TEDirectDB:
@@ -111,12 +118,22 @@ class TEDirectDB:
         Process:
             1. Closes any existing active database connection handle safely.
             2. Instantiates a new database driver instance: `self.db = db()`.
+            3. Refreshes next_id and resets staging queues for registered tables.
 
         Outputs:
             None.
         """
         self.close()
         self.db = db()
+        self.queued_view = {}
+        for table_id, table in self.tables.items():
+            self.queued_set[table_id] = {}
+            self.queued_update[table_id] = []
+            if self.db is not None:
+                try:
+                    self.next_id[table_id] = self.db.get_next_id(table)
+                except Exception:
+                    pass
 
     def start(self, tables: Sequence[Table] | Table, db: Callable[[], Any] | type[Any]) -> None:
         """Initialize Table Engine with schema tables and connect to database.
@@ -127,28 +144,17 @@ class TEDirectDB:
 
         Process:
             1. Normalizes `tables` into a tuple if a single table was provided.
-            2. Starts a fresh database connection via `self.start_new_db(db)`.
-            3. Resets view deduplication cache `self.queued_view = {}`.
-            4. For each registered Table schema:
-               - Stores table schema reference in `self.tables[table.table_id]`.
-               - Initializes empty insert staging dictionary in `self.queued_set[table.table_id]`.
-               - Initializes empty update staging list in `self.queued_update[table.table_id]`.
-               - Queries current MAX primary key sequence ID via `self.db.get_next_id(table)`.
+            2. Registers tables into `self.tables`.
+            3. Starts a fresh database connection and initializes queues via `self.start_new_db(db)`.
 
         Outputs:
             None.
         """
         if not isinstance(tables, (tuple, list)):
             tables = (tables,)
-
-        self.start_new_db(db)
-        self.queued_view = {}
-
         for table in tables:
             self.tables[table.table_id] = table
-            self.queued_set[table.table_id] = {}
-            self.queued_update[table.table_id] = []
-            self.next_id[table.table_id] = self.db.get_next_id(table)
+        self.start_new_db(db)
 
     def get(
         self,
@@ -162,16 +168,46 @@ class TEDirectDB:
             columns: Tuple of column filter values, where None represents wildcards.
 
         Process:
-            1. Emptiness guard: If `next_id == 1` and `table.initial_insert is None`,
+            1. Staging check: Checks local `queued_set` for staged rows.
+            2. Emptiness guard: If `next_id <= 1` and `table.initial_insert is None`,
                the table is empty, avoiding unnecessary database queries.
-            2. Executes parameterized SELECT query via `self.db.select(table, columns)`.
+            3. Executes parameterized SELECT query via `self.db.select(table, columns)`.
 
         Outputs:
             Matching row tuple `tuple[SafeDataType, ...]` or None if no match is found.
         """
         table = self.tables[table_id]
-        if table.initial_insert is None and self.next_id[table_id] <= 1:
+
+        # 1. Staging check in queued_set
+        if table_id in self.queued_set:
+            if table.no_duplicate:
+                if len(columns) > 1 and all(c is not None for c in columns[1:]):
+                    cached_id = self.queued_set[table_id].get(columns[1:])
+                    if cached_id is not None:
+                        row = (cached_id, *columns[1:])
+                        if columns[0] is None or row[0] == columns[0]:
+                            return row
+            else:
+                pk_specified = all(columns[i] is not None for i in table.primary)
+                if pk_specified:
+                    pk = itemgetter(*table.primary)(columns)
+                    staged_row = self.queued_set[table_id].get(pk)
+                    if staged_row is not None:
+                        match = True
+                        for i, val in enumerate(columns):
+                            if val is not None and staged_row[i] != val:
+                                match = False
+                                break
+                        if match:
+                            return staged_row
+
+        # 2. Emptiness guard: Table has never received data and has no seed insert
+        if getattr(table, "has_auto_increment", True) and table.initial_insert is None and self.next_id.get(table_id, 0) <= 1:
             return None
+
+        if self.db is None:
+            return None
+
         return self.db.select(table, columns)
 
     def set(
@@ -229,12 +265,36 @@ class TEDirectDB:
         self.queued_set[table_id][pk] = columns
         return columns
 
+    def get_hashing_table(self, table: Table | None) -> Table | None:
+        """Resolve associated hashing table schema for target table if configured.
+
+        Args:
+            table: Target Table schema instance.
+
+        Returns:
+            Linked hashing Table schema instance, or None.
+        """
+        if table is None or not getattr(table, "hashing_table", False):
+            return None
+
+        ht = table.hashing_table
+        if isinstance(ht, str):
+            return next((t for t in self.tables.values() if t.table_name == ht), None)
+        if isinstance(ht, int):
+            return self.tables.get(ht)
+        if hasattr(ht, "table_id"):
+            return self.tables.get(ht.table_id, ht)
+        if ht is True:
+            default_name = f"{table.table_name}_hash"
+            return next((t for t in self.tables.values() if t.table_name == default_name), None)
+        return None
+
     def view_get(
         self,
         joins: JoinsType,
         columns: tuple[SafeDataType, ...],
     ) -> tuple[SafeDataType, ...] | None:
-        """Execute single-row SELECT query across multi-table relational join graph.
+        """Execute single-row SELECT query across multi-table relational join graph or AST hash table.
 
         Args:
             joins: Relational join graph tuple (JoinsType).
@@ -243,15 +303,45 @@ class TEDirectDB:
         Process:
             1. Emptiness guard: Checks if the initial table in the join graph has data,
                safely handling cases where `table.initial_insert is None`.
-            2. Executes multi-table join SELECT via `self.db.view_select(self.tables, joins, columns)`.
+            2. If initial table has `hashing_table` configured:
+               - Computes deterministic SHA-256 hash from `(joins, filtered_columns)`.
+               - Queries hash table (or checks staged buffer) for existing `ast_id`.
+               - Returns matching view tuple with `ast_id` if found.
+            3. Fallback: Executes multi-table join SELECT via `self.db.view_select(self.tables, joins, columns)`.
 
         Outputs:
             First matching joined row tuple `tuple[SafeDataType, ...]` or None.
         """
         initial_table_id = PointerGetter(joins).get_first_table_id()
-        table = self.tables[initial_table_id]
-        if table.initial_insert is None and self.next_id[initial_table_id] <= 1:
+        table = self.tables.get(initial_table_id)
+        if table is None:
             return None
+        if table.initial_insert is None and self.next_id.get(initial_table_id, 0) <= 1:
+            return None
+
+        filtered_columns = tuple(val for val in columns if val is not None)
+
+        # Check if AST hash deduplication applies via table.hashing_table
+        hash_table = self.get_hashing_table(table)
+        if hash_table is not None:
+            h = compute_ast_hash(joins, filtered_columns)
+            # Check staged in-memory queued_set
+            staged_row = self.queued_set.get(hash_table.table_id, {}).get(h)
+            if staged_row is not None:
+                ast_id = staged_row[1]
+                return tuple(val if val is not None else ast_id for val in columns)
+
+            # Check DB for existing hash
+            hash_row = self.get(hash_table.table_id, (h, None))
+            if hash_row is not None:
+                ast_id = hash_row[1]
+                return tuple(val if val is not None else ast_id for val in columns)
+
+            return None
+
+        if self.db is None:
+            return None
+
         return self.db.view_select(self.tables, joins, columns)
 
     def view_get_multiple(
@@ -271,6 +361,8 @@ class TEDirectDB:
         Outputs:
             List of matching joined row tuples `list[tuple[SafeDataType, ...]]`.
         """
+        if self.db is None:
+            return []
         return self.db.view_select_multiple(self.tables, joins, columns)
 
     def view_set(
@@ -278,7 +370,7 @@ class TEDirectDB:
         joins: JoinsType,
         columns: tuple[SafeDataType, ...],
     ) -> tuple[SafeDataType, ...]:
-        """Stage multi-table relational view, deduplicate in memory, and decompose into table inserts.
+        """Stage multi-table relational view, deduplicate via hashing_table / memory, and decompose.
 
         Args:
             joins: Relational join graph tuple (JoinsType).
@@ -288,15 +380,13 @@ class TEDirectDB:
             1. Extracts non-None column values: `filtered = tuple(x for x in columns if x is not None)`.
             2. Checks `self.queued_view` cache for matching `joins` and `filtered`:
                - If cached: returns `columns` with None positions replaced by cached `view_id`.
-            3. If not cached:
-               - Assigns `current_view_id = self.next_id[main_table_id]`, increments counter.
-               - Caches in `self.queued_view[joins][filtered] = current_view_id`.
-               - Builds `result` by replacing None values in `columns` with `current_view_id`.
-               - Decomposes `result` across each constituent table in `joins`:
-                 * Slices per-table row: `row = result[data_offset : data_offset + table.length]`.
-                 * Extracts primary key from `row` slice: `pk = itemgetter(*table.primary)(row)`.
-                 * Stores staged row in `self.queued_set[table_id][pk] = row`.
-                 * Advances `data_offset += table.length`.
+            3. If main table has `hashing_table` configured:
+               - Computes deterministic SHA-256 hash `h = compute_ast_hash(joins, filtered)`.
+               - Checks staged `queued_set[hash_table]` or queries `self.get(hash_table.table_id, (h, None))`.
+               - If existing: caches in `queued_view` and returns tuple with existing `ast_id`.
+               - If new: generates `current_view_id = self.next_id[main_table_id]`, decomposes across
+                 constituent tables, and stages `(h, current_view_id)` into `queued_set[hash_table]`.
+            4. Fallback for non-hashed views: Standard relational view decomposition across tables.
 
         Outputs:
             Complete joined row tuple `tuple[SafeDataType, ...]`.
@@ -311,6 +401,49 @@ class TEDirectDB:
             self.queued_view[joins] = {}
 
         main_table_id = PointerGetter(joins).get_first_table_id()
+        main_table = self.tables.get(main_table_id)
+
+        # Check if AST hash deduplication applies via table.hashing_table
+        hash_table = self.get_hashing_table(main_table)
+        if hash_table is not None:
+            h = compute_ast_hash(joins, filtered_columns)
+
+            # Check staged in-memory queued_set
+            staged_row = self.queued_set.get(hash_table.table_id, {}).get(h)
+            if staged_row is not None:
+                current_view_id = staged_row[1]
+                self.queued_view[joins][filtered_columns] = current_view_id
+                return tuple(val if val is not None else current_view_id for val in columns)
+
+            # Check DB / cache for existing hash
+            hash_row = self.get(hash_table.table_id, (h, None))
+            if hash_row is not None:
+                current_view_id = hash_row[1]
+                self.queued_view[joins][filtered_columns] = current_view_id
+                return tuple(val if val is not None else current_view_id for val in columns)
+
+            # New AST - allocate monotonic ID
+            current_view_id = self.next_id[main_table_id]
+            self.queued_view[joins][filtered_columns] = current_view_id
+            self.next_id[main_table_id] += 1
+
+            result = tuple(val if val is not None else current_view_id for val in columns)
+
+            # Decompose result across tables using self.set
+            data_offset = 0
+            for repeat, pointer in PointerGetter(joins):
+                target_table = self.tables[pointer[0]]
+                t_len = target_table.length
+                for _ in range(repeat):
+                    row = result[data_offset : data_offset + t_len]
+                    self.set(pointer[0], row)
+                    data_offset += t_len
+
+            # Stage row in hash_table using self.set
+            self.set(hash_table.table_id, (h, current_view_id))
+            return result
+
+        # Standard non-hashed view_set decomposition
         current_view_id = self.next_id[main_table_id]
         self.queued_view[joins][filtered_columns] = current_view_id
         self.next_id[main_table_id] += 1
@@ -323,8 +456,7 @@ class TEDirectDB:
             t_len = target_table.length
             for _ in range(repeat):
                 row = result[data_offset : data_offset + t_len]
-                pk = itemgetter(*target_table.primary)(row)
-                self.queued_set[pointer[0]][pk] = row
+                self.set(pointer[0], row)
                 data_offset += t_len
 
         return result

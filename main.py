@@ -10,9 +10,9 @@ lifecycles, coordinates multiprocessing parsing workers, and resolves queued
 
 1. DATABASE SCHEMA INITIALIZATION:
 -------------------------------------------------------------------------------
-  `gp.Table_Array` registers 14 core relational tables defining the schema:
+  `gp.Table_Array` registers 15 core relational tables defining the schema:
     - Version & File tracking: `m_v_main`, `m_file_name`, `m_file`, `m_bridge_file`, `m_moved_file`
-    - AST Schema: `m_type_descriptor`, `m_ast`, `m_ast_container`, `m_ast_include`, `m_ast_debug`
+    - AST Schema: `m_type_descriptor`, `m_ast`, `m_ast_container`, `m_ast_include`, `m_ast_debug`, `m_ast_hash`
     - Version Tags & Spatial Coordinates: `m_tag`, `m_bridge_tag`, `m_map_ast`, `m_bridge_map`
 
 2. VERSION PROCESSING PIPELINE (`update(version)`):
@@ -68,7 +68,7 @@ from core.FileHandler import MasterFile
 from core.GreatProcessor import GreatProcessor
 from core.TableHandling import Table, ChangeSet
 from db_engine import MariaDB, MockDB, get_db_engine
-from table_engine.te_direct_db import TEDirectDB
+from table_engine import TEDirectDB, TECachedDB, get_table_engine
 from core.DBLayout import (
     init_db_layout,
     m_v_main,
@@ -85,11 +85,12 @@ from core.DBLayout import (
     m_bridge_tag,
     m_map_ast,
     m_bridge_map,
+    m_ast_hash,
 )
 
 
 G.DB = MariaDB
-G.TE = TEDirectDB()
+G.TE = TECachedDB()
 MF = MasterFile()
 G.MF = MF
 gp = GreatProcessor()
@@ -121,13 +122,12 @@ def update(version: str) -> None:
     logger.info(COLOR.green(f"=======================Working on {version}======================="))
 
     # -------------------------------------------------------------------------
-    # STEP 2: Create temporary performance indexes on DB tables
+    # STEP 2: Ensure performance B-tree indexes are active for worker queries
     # -------------------------------------------------------------------------
     with G.DB() as db:
         db.create_index("ast_index", m_ast, (m_ast.name, m_ast.type_id))
         db.create_index("file_name_index", m_file_name, (m_file_name.fname,))
-        
-
+        db.create_index("bridge_tag_fid_idx", m_bridge_tag, (m_bridge_tag.fid, m_bridge_tag.tag_id))
 
     # -------------------------------------------------------------------------
     # STEP 3: Clone repository branch version to RAMDISK workspace
@@ -170,13 +170,25 @@ def update(version: str) -> None:
 
 
     # -------------------------------------------------------------------------
-    # STEP 7: Remove temporary indexes, commit transactions, and reset state
+    # STEP 7: Drop secondary indexes, commit transactions, and rebuild indexes
     # -------------------------------------------------------------------------
+    if getattr(G.TE, "db", None) is not None and hasattr(G.TE.db, "cnx") and G.TE.db.cnx is not None:
+        try:
+            G.TE.db.cnx.commit()
+        except Exception:
+            pass
+
     with G.DB() as db:
         db.remove_index("ast_index", m_ast)
         db.remove_index("file_name_index", m_file_name)
+        db.remove_index("bridge_tag_fid_idx", m_bridge_tag)
 
     G.TE.commit_all()
+
+    with G.DB() as db:
+        db.create_index("ast_index", m_ast, (m_ast.name, m_ast.type_id))
+        db.create_index("file_name_index", m_file_name, (m_file_name.fname,))
+        db.create_index("bridge_tag_fid_idx", m_bridge_tag, (m_bridge_tag.fid, m_bridge_tag.tag_id))
 
     if G.PROFILING_ENABLED and gp.ChangeSet_Dict:
         from core.Profiler import format_profiling_report
@@ -185,6 +197,9 @@ def update(version: str) -> None:
             print(format_profiling_report(profilers, title=f"UPDATE CYCLE PROFILE: {version}"))
 
     gp.reset_cs()
+    G.TE.close()
+    import gc
+    gc.collect()
     return
 
 
@@ -297,12 +312,12 @@ def main() -> None:
                     pass
 
     #try:
-    #update("v3.0")
+    update("v3.0")
     update("v3.1")
-    #update("v3.2")
-    #update("v3.3")
-    #update("v3.4")
-    #update("v3.5")
+    update("v3.2")
+    update("v3.3")
+    update("v3.4")
+    update("v3.5")
     #except Exception as e:  # noqa: BLE001
     #    logger.error("Error in Update()")
     #    logger.error(e)
@@ -355,6 +370,13 @@ def arg_handling() -> argparse.Namespace:
         choices=["mariadb", "mysql", "mock", "mockdb", "inmemory"],
         help="Select database backend engine (default: mariadb)",
     )
+    parser.add_argument(
+        "--te", "--table-engine",
+        dest="table_engine",
+        default="cached",
+        choices=["cached", "direct", "tecacheddb", "tedirectdb"],
+        help="Select Table Engine architecture backend (default: cached)",
+    )
     args = parser.parse_args()
 
     if args.profile:
@@ -362,6 +384,9 @@ def arg_handling() -> argparse.Namespace:
 
     if args.db_engine:
         G.DB = get_db_engine(args.db_engine)
+
+    if args.table_engine:
+        G.TE = get_table_engine(args.table_engine)()
 
     if args.Drop:
         logger.info("Dropping all tables")
@@ -372,11 +397,11 @@ def arg_handling() -> argparse.Namespace:
     if args.unit_test is not None:
         target = args.unit_test if args.unit_test != "" else None
         from tests.test_c_ast import run_c_ast_tests
-        code = run_c_ast_tests(target, profile=args.profile)
+        code = run_c_ast_tests(target, profile=args.profile, table_engine=args.table_engine)
         sys.exit(code)
     if args.Test:
         from tests.test_c_ast import run_c_ast_tests
-        code = run_c_ast_tests(args.Test, profile=args.profile)
+        code = run_c_ast_tests(args.Test, profile=args.profile, table_engine=args.table_engine)
         sys.exit(code)
     return args
 
@@ -734,6 +759,8 @@ def processing_unchanges() -> None:
         if G.OVERRIDE_FORGOTTEN_PRINT:
             logger.debug(forgotten_new)
 
+    batch_size = 1000
+    batch_idx = 0
     CS = ChangeSet()
     for unchanged in unchanged_set:
         un_m_file_name = m_file_name.get(None, unchanged)
@@ -756,8 +783,13 @@ def processing_unchanges() -> None:
             un_m_file_name[2][0],
             un_m_bridge_file[2][2],
         ))
+        if len(CS.cs) >= batch_size:
+            gp.ChangeSet_Dict[f"-UNCHANGED-{batch_idx}-"] = CS
+            batch_idx += 1
+            CS = ChangeSet()
+
     if CS.cs:
-        gp.ChangeSet_Dict["-UNCHANGED-"] = CS
+        gp.ChangeSet_Dict[f"-UNCHANGED-{batch_idx}-"] = CS
     return
 
 

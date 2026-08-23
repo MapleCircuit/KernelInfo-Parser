@@ -286,7 +286,13 @@ def get_prior_tags(CS: ChangeSetType) -> None:
         None,  # 12: m_tag.hl_l
     )
     if CS.prior_tags:
-        CS.prior_tags_map = {tag[9]: (x, tag[1]) for x, tag in enumerate(CS.prior_tags) if tag[9]}
+        CS.prior_tags_map = {}
+        for x, tag in enumerate(CS.prior_tags):
+            code = tag[9]
+            if code:
+                if code not in CS.prior_tags_map:
+                    CS.prior_tags_map[code] = []
+                CS.prior_tags_map[code].append((x, tag[1]))
     return
 
 
