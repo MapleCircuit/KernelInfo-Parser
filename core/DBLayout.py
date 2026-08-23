@@ -3,7 +3,7 @@
 ===============================================================================
 RELATIONAL DATABASE SCHEMA REFERENCE GUIDE FOR AI & PARSERS
 ===============================================================================
-This module defines the 15 core relational database tables used across the parser
+This module defines the 18 core relational database tables used across the parser
 pipeline (`Table_Array`).
 
 SCHEMA ENTITY-RELATIONSHIP GRAPH:
@@ -36,6 +36,13 @@ SCHEMA ENTITY-RELATIONSHIP GRAPH:
       |-- (tag_id, map_id) --------------> m_bridge_map (tag_id, map_id)
                                                 ^
    m_map_ast (map_id, line_s, char_s, line_e, char_e, ast_id) ----------------|
+
+4. Kconfig Relational Acceleration & Dependency Graph:
+   m_kconfig_symbol (kcid, name, type, prompt, def_val, help, ast_id -> m_ast.ast_id)
+      ^            ^
+      |            |-- (kcid) ---------> m_kconfig_relation (kcid, target_name, rel_type, cond_ast_id, priority)
+      |
+      |-- (kcid) ----------------------> m_kconfig_tree (tree_id, parent_id, node_type, title, kcid, priority, dep_ast_id, ast_id)
 ===============================================================================
 """
 from core.globalstuff import ASTT
@@ -384,6 +391,96 @@ m_ast_hash = Table(
     hashing_table=False,
 )
 
+# -----------------------------------------------------------------------------
+# 16. m_kconfig_symbol (table_id=15): Normalized Kconfig Configuration Symbols
+#     - kcid: Unique Kconfig Symbol ID (PK, AUTO_INCREMENT).
+#     - name: Symbol identifier without CONFIG_ prefix (e.g. "EXT4_FS").
+#     - type: Datatype (1: bool, 2: tristate, 3: string, 4: hex, 5: int).
+#     - prompt: User-visible menu prompt string.
+#     - def_val: Default value expression / literal string.
+#     - help: Multi-line help / documentation text.
+#     - ast_id: Associated AST Node ID (FK -> m_ast.ast_id).
+# -----------------------------------------------------------------------------
+m_kconfig_symbol = Table(
+    table_id=15,
+    table_name="m_kconfig_symbol",
+    columns=(
+        ("kcid", "INT", "NOT NULL", "AUTO_INCREMENT"),
+        ("name", "VARCHAR(64)", "NOT NULL", "COLLATE utf8mb4_bin"),
+        ("type", "TINYINT", "UNSIGNED", "NOT NULL"),
+        ("prompt", "VARCHAR(255)", "NOT NULL", "COLLATE utf8mb4_bin"),
+        ("def_val", "VARCHAR(255)", "NOT NULL", "COLLATE utf8mb4_bin"),
+        ("help", "MEDIUMTEXT", "NOT NULL"),
+        ("ast_id", "INT", "NOT NULL"),
+    ),
+    primary=("kcid",),
+    foreign=(("ast_id", "m_ast", "ast_id"),),
+    initial_insert=None,
+    no_duplicate=True,
+    te_cached=True,
+    hashing_table=False,
+)
+
+# -----------------------------------------------------------------------------
+# 17. m_kconfig_relation (table_id=16): Dependency & Reverse-Dependency Graph
+#     - kcid: Source Kconfig Symbol ID (FK -> m_kconfig_symbol.kcid).
+#     - target_name: Depended-upon or selected symbol name (e.g. "BLOCK", "CRC32").
+#     - rel_type: Category (1: depends_on, 2: select, 3: imply, 4: choice_member).
+#     - cond_ast_id: Conditional guard AST Node ID (0 if unconditional).
+#     - priority: Positional rank in multi-clause expression lists.
+# -----------------------------------------------------------------------------
+m_kconfig_relation = Table(
+    table_id=16,
+    table_name="m_kconfig_relation",
+    columns=(
+        ("kcid", "INT", "NOT NULL"),
+        ("target_name", "VARCHAR(64)", "NOT NULL", "COLLATE utf8mb4_bin"),
+        ("rel_type", "TINYINT", "UNSIGNED", "NOT NULL"),
+        ("cond_ast_id", "INT", "NOT NULL"),
+        ("priority", "SMALLINT", "UNSIGNED", "NOT NULL"),
+    ),
+    primary=("kcid", "rel_type", "target_name", "priority"),
+    foreign=(("kcid", "m_kconfig_symbol", "kcid"),),
+    initial_insert=None,
+    no_duplicate=False,
+    te_cached=False,
+    hashing_table=False,
+)
+
+# -----------------------------------------------------------------------------
+# 18. m_kconfig_tree (table_id=17): Menuconfig Hierarchy & Display Structure
+#     - tree_id: Unique Tree Item ID (PK, AUTO_INCREMENT).
+#     - parent_id: Parent menu / choice tree ID (0 for root).
+#     - node_type: Category (1: menu, 2: choice, 3: config, 4: menuconfig, 5: comment).
+#     - title: Display prompt / menu header title.
+#     - kcid: Linked Symbol ID (FK -> m_kconfig_symbol.kcid, 0 if menu/comment).
+#     - priority: Sibling display ordering rank.
+#     - dep_ast_id: Visibility / conditional dependency AST ID (0 if unconditional).
+#     - ast_id: Associated AST Node ID (FK -> m_ast.ast_id).
+# -----------------------------------------------------------------------------
+m_kconfig_tree = Table(
+    table_id=17,
+    table_name="m_kconfig_tree",
+    columns=(
+        ("tree_id", "INT", "NOT NULL", "AUTO_INCREMENT"),
+        ("parent_id", "INT", "NOT NULL"),
+        ("node_type", "TINYINT", "UNSIGNED", "NOT NULL"),
+        ("title", "VARCHAR(255)", "NOT NULL", "COLLATE utf8mb4_bin"),
+        ("kcid", "INT", "NOT NULL"),
+        ("priority", "INT", "NOT NULL"),
+        ("dep_ast_id", "INT", "NOT NULL"),
+        ("ast_id", "INT", "NOT NULL"),
+    ),
+    primary=("tree_id",),
+    foreign=(
+        ("ast_id", "m_ast", "ast_id"),
+    ),
+    initial_insert=None,
+    no_duplicate=False,
+    te_cached=False,
+    hashing_table=False,
+)
+
 TABLES: tuple[Table, ...] = (
     m_v_main,
     m_file_name,
@@ -400,18 +497,22 @@ TABLES: tuple[Table, ...] = (
     m_map_ast,
     m_bridge_map,
     m_ast_hash,
+    m_kconfig_symbol,
+    m_kconfig_relation,
+    m_kconfig_tree,
 )
 
 
 def init_db_layout(gp=None) -> tuple[Table, ...]:
-    """Initialize and populate gp.Table_Array with the default 15 schema tables.
+    """Initialize and populate gp.Table_Array with the default 18 schema tables.
     
     Args:
         gp: Optional GreatProcessor instance to attach Table_Array to.
         
     Returns:
-        Immutable tuple of all 15 Table schema objects.
+        Immutable tuple of all 18 Table schema objects.
     """
     if gp is not None:
         gp.Table_Array = list(TABLES)
     return TABLES
+

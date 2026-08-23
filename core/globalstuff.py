@@ -388,6 +388,41 @@ class ASTT(IntEnum):
     ASM_Instruction = auto()
     ASM_Label = auto()
     ASM_Comment = auto()
+    ## Kconfig Grammar Constructs
+    Kconfig_Mainmenu = auto()
+    Kconfig_Menu = auto()
+    Kconfig_Endmenu = auto()
+    Kconfig_Config = auto()
+    Kconfig_Menuconfig = auto()
+    Kconfig_Choice = auto()
+    Kconfig_Endchoice = auto()
+    Kconfig_Comment = auto()
+    Kconfig_Source = auto()
+    Kconfig_Rsource = auto()
+    Kconfig_If = auto()
+    Kconfig_Endif = auto()
+    ## Kconfig Types & Properties
+    Kconfig_Type_Bool = auto()
+    Kconfig_Type_Tristate = auto()
+    Kconfig_Type_String = auto()
+    Kconfig_Type_Hex = auto()
+    Kconfig_Type_Int = auto()
+    Kconfig_Prompt = auto()
+    Kconfig_Default = auto()
+    Kconfig_Depends_On = auto()
+    Kconfig_Select = auto()
+    Kconfig_Imply = auto()
+    Kconfig_Range = auto()
+    Kconfig_Help = auto()
+    ## Kconfig Logical Expressions
+    Kconfig_Op_And = auto()
+    Kconfig_Op_Or = auto()
+    Kconfig_Op_Not = auto()
+    Kconfig_Op_Equal = auto()
+    Kconfig_Op_Unequal = auto()
+    Kconfig_Symbol_Ref = auto()
+    Kconfig_Constant = auto()
+
 
 
 class FileContextFormatter(logging.Formatter):
