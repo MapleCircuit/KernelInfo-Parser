@@ -3,7 +3,7 @@
 ===============================================================================
 RELATIONAL DATABASE SCHEMA REFERENCE GUIDE FOR AI & PARSERS
 ===============================================================================
-This module defines the 18 core relational database tables used across the parser
+This module defines the 25 core relational database tables used across the parser
 pipeline (`Table_Array`).
 
 SCHEMA ENTITY-RELATIONSHIP GRAPH:
@@ -38,11 +38,30 @@ SCHEMA ENTITY-RELATIONSHIP GRAPH:
    m_map_ast (map_id, line_s, char_s, line_e, char_e, ast_id) ----------------|
 
 4. Kconfig Relational Acceleration & Dependency Graph:
-   m_kconfig_symbol (kcid, name, type, prompt, def_val, help, ast_id -> m_ast.ast_id)
+   m_kconfig_symbol (kcid, vid_s, vid_e, name, type, prompt, def_val, help, ast_id -> m_ast.ast_id)
       ^            ^
       |            |-- (kcid) ---------> m_kconfig_relation (kcid, target_name, rel_type, cond_ast_id, priority)
       |
-      |-- (kcid) ----------------------> m_kconfig_tree (tree_id, parent_id, node_type, title, kcid, priority, dep_ast_id, ast_id)
+      |-- (kcid) ----------------------> m_kconfig_tree (tree_id, vid, parent_id, node_type, title, kcid, priority, dep_ast_id, ast_id)
+      |
+      |-- (kcid, fid) -----------------> m_kconfig_kbuild (kcid, vid, fid, compile_mode, target_obj)
+
+5. Maintainer & Ownership Subsystem:
+   m_v_main (vid, vname)
+      ^
+      |-- (vid_s, vid_e) ----------> m_maintainer_section (sec_id, vid_s, vid_e, name, status, scm_tree, web_page, mailing_list, ast_id)
+      |                                     ^                   ^
+      |                                     |                   |-- (sec_id) -> m_maintainer_pattern (sec_id, pat_type, pattern, priority)
+      |                                     |                   |
+      |                                     |                   |-- (sec_id) -> m_maintainer_member (sec_id, person_id, role_type, priority)
+      |                                     |                                         ^
+      |                                     |                                         |-- (person_id) -> m_maintainer_person (person_id, name, email)
+      |                                     |                                         |
+      |-- (vid, fid, sec_id) ---------------> m_maintainer_file (vid, fid, sec_id)    |
+      |                                        ^                                      |
+      |-- (vid_s, vid_e, person_id) --------> m_credits_entry (credit_id, vid_s, ...) -|
+                                               ^
+   m_file (fid, ...) --------------------------|
 ===============================================================================
 """
 from core.globalstuff import ASTT
@@ -392,11 +411,13 @@ m_ast_hash = Table(
 )
 
 # -----------------------------------------------------------------------------
-# 16. m_kconfig_symbol (table_id=15): Normalized Kconfig Configuration Symbols
-#     - kcid: Unique Kconfig Symbol ID (PK, AUTO_INCREMENT).
-#     - name: Symbol identifier without CONFIG_ prefix (e.g. "EXT4_FS").
-#     - type: Datatype (1: bool, 2: tristate, 3: string, 4: hex, 5: int).
-#     - prompt: User-visible menu prompt string.
+# 16. m_kconfig_symbol (table_id=15): Kconfig Configuration Symbol Registry
+#     - kcid: Unique Kconfig Symbol ID (PK with vid_s).
+#     - vid_s: Starting Version ID (FK -> m_v_main.vid).
+#     - vid_e: Ending Version ID (FK -> m_v_main.vid, 0 if still active).
+#     - name: Symbol name without CONFIG_ prefix (e.g. "64BIT", "EXT4_FS").
+#     - type: Data type (1: bool, 2: tristate, 3: string, 4: hex, 5: int).
+#     - prompt: Primary user-visible prompt label.
 #     - def_val: Default value expression / literal string.
 #     - help: Multi-line help / documentation text.
 #     - ast_id: Associated AST Node ID (FK -> m_ast.ast_id).
@@ -406,6 +427,8 @@ m_kconfig_symbol = Table(
     table_name="m_kconfig_symbol",
     columns=(
         ("kcid", "INT", "NOT NULL", "AUTO_INCREMENT"),
+        ("vid_s", "INT", "NOT NULL"),
+        ("vid_e", "INT", "NOT NULL"),
         ("name", "VARCHAR(64)", "NOT NULL", "COLLATE utf8mb4_bin"),
         ("type", "TINYINT", "UNSIGNED", "NOT NULL"),
         ("prompt", "VARCHAR(255)", "NOT NULL", "COLLATE utf8mb4_bin"),
@@ -413,8 +436,12 @@ m_kconfig_symbol = Table(
         ("help", "MEDIUMTEXT", "NOT NULL"),
         ("ast_id", "INT", "NOT NULL"),
     ),
-    primary=("kcid",),
-    foreign=(("ast_id", "m_ast", "ast_id"),),
+    primary=("kcid", "vid_s"),
+    foreign=(
+        ("vid_s", "m_v_main", "vid"),
+        ("vid_e", "m_v_main", "vid"),
+        ("ast_id", "m_ast", "ast_id"),
+    ),
     initial_insert=None,
     no_duplicate=True,
     te_cached=True,
@@ -449,7 +476,8 @@ m_kconfig_relation = Table(
 
 # -----------------------------------------------------------------------------
 # 18. m_kconfig_tree (table_id=17): Menuconfig Hierarchy & Display Structure
-#     - tree_id: Unique Tree Item ID (PK, AUTO_INCREMENT).
+#     - tree_id: Unique Tree Item ID (PK with vid).
+#     - vid: Kernel Version ID (FK -> m_v_main.vid).
 #     - parent_id: Parent menu / choice tree ID (0 for root).
 #     - node_type: Category (1: menu, 2: choice, 3: config, 4: menuconfig, 5: comment).
 #     - title: Display prompt / menu header title.
@@ -463,6 +491,7 @@ m_kconfig_tree = Table(
     table_name="m_kconfig_tree",
     columns=(
         ("tree_id", "INT", "NOT NULL", "AUTO_INCREMENT"),
+        ("vid", "INT", "NOT NULL"),
         ("parent_id", "INT", "NOT NULL"),
         ("node_type", "TINYINT", "UNSIGNED", "NOT NULL"),
         ("title", "VARCHAR(255)", "NOT NULL", "COLLATE utf8mb4_bin"),
@@ -471,13 +500,219 @@ m_kconfig_tree = Table(
         ("dep_ast_id", "INT", "NOT NULL"),
         ("ast_id", "INT", "NOT NULL"),
     ),
-    primary=("tree_id",),
+    primary=("tree_id", "vid"),
     foreign=(
+        ("vid", "m_v_main", "vid"),
         ("ast_id", "m_ast", "ast_id"),
     ),
     initial_insert=None,
     no_duplicate=False,
     te_cached=False,
+    hashing_table=False,
+)
+
+# -----------------------------------------------------------------------------
+# 19. m_kconfig_kbuild (table_id=18): Kconfig to Source File Compilation Map
+#     - kcid: Target Kconfig Symbol ID (FK -> m_kconfig_symbol.kcid, 0 for core obj-y).
+#     - vid: Kernel Version ID (FK -> m_v_main.vid).
+#     - fid: Source File ID (FK -> m_file.fid).
+#     - compile_mode: Compilation state (1: built-in obj-y, 2: module obj-m, 3: conditional obj-$(CONFIG_...)).
+#     - target_obj: Target object or composite module name (e.g. "ext4.o", "drbd.o").
+# -----------------------------------------------------------------------------
+m_kconfig_kbuild = Table(
+    table_id=18,
+    table_name="m_kconfig_kbuild",
+    columns=(
+        ("kcid", "INT", "NOT NULL"),
+        ("vid", "INT", "NOT NULL"),
+        ("fid", "INT", "NOT NULL"),
+        ("compile_mode", "TINYINT", "UNSIGNED", "NOT NULL"),
+        ("target_obj", "VARCHAR(64)", "NOT NULL", "COLLATE utf8mb4_bin"),
+    ),
+    primary=("kcid", "vid", "fid", "compile_mode"),
+    foreign=(
+        ("vid", "m_v_main", "vid"),
+        ("fid", "m_file", "fid"),
+    ),
+    initial_insert=None,
+    no_duplicate=False,
+    te_cached=False,
+    hashing_table=False,
+)
+
+# -----------------------------------------------------------------------------
+# 20. m_maintainer_person (table_id=19): Maintainer & Reviewer Persona Registry
+#     - person_id: Unique Person ID (PK, AUTO_INCREMENT).
+#     - name: Full name string (e.g. "Linus Torvalds").
+#     - email: Primary email address (e.g. "torvalds@linux-foundation.org").
+# -----------------------------------------------------------------------------
+m_maintainer_person = Table(
+    table_id=19,
+    table_name="m_maintainer_person",
+    columns=(
+        ("person_id", "INT", "NOT NULL", "AUTO_INCREMENT"),
+        ("name", "VARCHAR(255)", "NOT NULL", "COLLATE utf8mb4_bin"),
+        ("email", "VARCHAR(255)", "NOT NULL", "COLLATE utf8mb4_bin"),
+    ),
+    primary=("person_id",),
+    foreign=None,
+    initial_insert=None,
+    no_duplicate=True,
+    te_cached=True,
+    hashing_table=False,
+)
+
+# -----------------------------------------------------------------------------
+# 21. m_maintainer_section (table_id=20): Subsystem Section Registry
+#     - sec_id: Unique Section ID (PK with vid_s, AUTO_INCREMENT).
+#     - vid_s: Starting Version ID (FK -> m_v_main.vid).
+#     - vid_e: Ending Version ID (FK -> m_v_main.vid, 0 if active).
+#     - name: Subsystem title/name (e.g. "EXT4 FILE SYSTEM").
+#     - status: Status string (e.g. "Maintained", "Supported", "Orphan").
+#     - scm_tree: SCM tree URL string (or "").
+#     - web_page: Web page URL string (or "").
+#     - mailing_list: Primary mailing list address (or "").
+#     - ast_id: Associated AST Node ID (FK -> m_ast.ast_id).
+# -----------------------------------------------------------------------------
+m_maintainer_section = Table(
+    table_id=20,
+    table_name="m_maintainer_section",
+    columns=(
+        ("sec_id", "INT", "NOT NULL", "AUTO_INCREMENT"),
+        ("vid_s", "INT", "NOT NULL"),
+        ("vid_e", "INT", "NOT NULL"),
+        ("name", "VARCHAR(255)", "NOT NULL", "COLLATE utf8mb4_bin"),
+        ("status", "VARCHAR(32)", "NOT NULL", "COLLATE utf8mb4_bin"),
+        ("scm_tree", "VARCHAR(255)", "NOT NULL", "COLLATE utf8mb4_bin"),
+        ("web_page", "VARCHAR(255)", "NOT NULL", "COLLATE utf8mb4_bin"),
+        ("mailing_list", "VARCHAR(255)", "NOT NULL", "COLLATE utf8mb4_bin"),
+        ("ast_id", "INT", "NOT NULL"),
+    ),
+    primary=("sec_id", "vid_s"),
+    foreign=(
+        ("vid_s", "m_v_main", "vid"),
+        ("vid_e", "m_v_main", "vid"),
+        ("ast_id", "m_ast", "ast_id"),
+    ),
+    initial_insert=None,
+    no_duplicate=True,
+    te_cached=True,
+    hashing_table=False,
+)
+
+# -----------------------------------------------------------------------------
+# 22. m_maintainer_member (table_id=21): Section to Person Role Mapping
+#     - sec_id: Subsystem Section ID (FK -> m_maintainer_section.sec_id).
+#     - person_id: Person ID (FK -> m_maintainer_person.person_id).
+#     - role_type: Role (1: Maintainer 'M', 2: Reviewer 'R', 3: Person 'P', 4: Other).
+#     - priority: Display order rank index.
+# -----------------------------------------------------------------------------
+m_maintainer_member = Table(
+    table_id=21,
+    table_name="m_maintainer_member",
+    columns=(
+        ("sec_id", "INT", "NOT NULL"),
+        ("person_id", "INT", "NOT NULL"),
+        ("role_type", "TINYINT", "UNSIGNED", "NOT NULL"),
+        ("priority", "SMALLINT", "UNSIGNED", "NOT NULL"),
+    ),
+    primary=("sec_id", "person_id", "role_type"),
+    foreign=(
+        ("sec_id", "m_maintainer_section", "sec_id"),
+        ("person_id", "m_maintainer_person", "person_id"),
+    ),
+    initial_insert=None,
+    no_duplicate=False,
+    te_cached=False,
+    hashing_table=False,
+)
+
+# -----------------------------------------------------------------------------
+# 23. m_maintainer_pattern (table_id=22): Section Pattern & Rule Registry
+#     - sec_id: Subsystem Section ID (FK -> m_maintainer_section.sec_id).
+#     - pat_type: Pattern Type (1: File 'F', 2: Exclude 'X', 3: Keyword 'K', 4: Regex 'N').
+#     - pattern: Raw pattern string (e.g. "fs/ext4/", "drivers/net/3c505*").
+#     - priority: Rule evaluation order rank.
+# -----------------------------------------------------------------------------
+m_maintainer_pattern = Table(
+    table_id=22,
+    table_name="m_maintainer_pattern",
+    columns=(
+        ("sec_id", "INT", "NOT NULL"),
+        ("pat_type", "TINYINT", "UNSIGNED", "NOT NULL"),
+        ("pattern", "VARCHAR(255)", "NOT NULL", "COLLATE utf8mb4_bin"),
+        ("priority", "SMALLINT", "UNSIGNED", "NOT NULL"),
+    ),
+    primary=("sec_id", "pat_type", "pattern", "priority"),
+    foreign=(("sec_id", "m_maintainer_section", "sec_id"),),
+    initial_insert=None,
+    no_duplicate=False,
+    te_cached=False,
+    hashing_table=False,
+)
+
+# -----------------------------------------------------------------------------
+# 24. m_maintainer_file (table_id=23): Materialized File-to-Section Bridge
+#     - vid: Kernel Version ID (FK -> m_v_main.vid).
+#     - fid: File Instance ID (FK -> m_file.fid).
+#     - sec_id: Subsystem Section ID (FK -> m_maintainer_section.sec_id).
+# -----------------------------------------------------------------------------
+m_maintainer_file = Table(
+    table_id=23,
+    table_name="m_maintainer_file",
+    columns=(
+        ("vid", "INT", "NOT NULL"),
+        ("fid", "INT", "NOT NULL"),
+        ("sec_id", "INT", "NOT NULL"),
+    ),
+    primary=("vid", "fid", "sec_id"),
+    foreign=(
+        ("vid", "m_v_main", "vid"),
+        ("fid", "m_file", "fid"),
+        ("sec_id", "m_maintainer_section", "sec_id"),
+    ),
+    initial_insert=None,
+    no_duplicate=False,
+    te_cached=False,
+    hashing_table=False,
+)
+
+# -----------------------------------------------------------------------------
+# 25. m_credits_entry (table_id=24): Contributor & Author Credits Registry
+#     - credit_id: Unique Credit ID (PK with vid_s, AUTO_INCREMENT).
+#     - vid_s: Starting Version ID (FK -> m_v_main.vid).
+#     - vid_e: Ending Version ID (FK -> m_v_main.vid, 0 if active).
+#     - person_id: Person ID (FK -> m_maintainer_person.person_id).
+#     - web_page: Contributor homepage / web address.
+#     - pgp_key: PGP key fingerprint / ID.
+#     - description: Detailed summary of contributions.
+#     - snail_mail: Postal / snail-mail address.
+#     - ast_id: Associated AST Node ID (FK -> m_ast.ast_id).
+# -----------------------------------------------------------------------------
+m_credits_entry = Table(
+    table_id=24,
+    table_name="m_credits_entry",
+    columns=(
+        ("credit_id", "INT", "NOT NULL", "AUTO_INCREMENT"),
+        ("vid_s", "INT", "NOT NULL"),
+        ("vid_e", "INT", "NOT NULL"),
+        ("person_id", "INT", "NOT NULL"),
+        ("web_page", "VARCHAR(255)", "NOT NULL", "COLLATE utf8mb4_bin"),
+        ("pgp_key", "VARCHAR(255)", "NOT NULL", "COLLATE utf8mb4_bin"),
+        ("description", "MEDIUMTEXT", "NOT NULL"),
+        ("snail_mail", "MEDIUMTEXT", "NOT NULL"),
+        ("ast_id", "INT", "NOT NULL"),
+    ),
+    primary=("credit_id", "vid_s"),
+    foreign=(
+        ("vid_s", "m_v_main", "vid"),
+        ("vid_e", "m_v_main", "vid"),
+        ("person_id", "m_maintainer_person", "person_id"),
+        ("ast_id", "m_ast", "ast_id"),
+    ),
+    initial_insert=None,
+    no_duplicate=True,
+    te_cached=True,
     hashing_table=False,
 )
 
@@ -500,19 +735,29 @@ TABLES: tuple[Table, ...] = (
     m_kconfig_symbol,
     m_kconfig_relation,
     m_kconfig_tree,
+    m_kconfig_kbuild,
+    m_maintainer_person,
+    m_maintainer_section,
+    m_maintainer_member,
+    m_maintainer_pattern,
+    m_maintainer_file,
+    m_credits_entry,
 )
 
 
 def init_db_layout(gp=None) -> tuple[Table, ...]:
-    """Initialize and populate gp.Table_Array with the default 18 schema tables.
+    """Initialize and populate gp.Table_Array with the default 25 schema tables.
     
     Args:
         gp: Optional GreatProcessor instance to attach Table_Array to.
         
     Returns:
-        Immutable tuple of all 18 Table schema objects.
+        Immutable tuple of all 25 Table schema objects.
     """
     if gp is not None:
         gp.Table_Array = list(TABLES)
     return TABLES
+
+
+
 

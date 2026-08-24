@@ -101,6 +101,9 @@ from core.globalstuff import (
     type_check,
     T_C,
     T_ASM,
+    T_KCONFIG,
+    T_MAINTAINERS,
+    T_CREDITS,
     REF_ROOT,
     REF_POS,
     REF_FILE,
@@ -127,6 +130,7 @@ from core.globalstuff import (
 )
 from parser.c_ast.c_ast import c_ast_parse
 from parser.asm_ast.asm_ast import asm_ast_parse
+from parser.kconfig_ast.kconfig_ast import kconfig_ast_parse
 from core.Profiler import PipelineProfiler
 
 logger = logging.getLogger(__name__)
@@ -249,6 +253,7 @@ class ChangeSet:
         self.prior_tags: Any | None = None
         self.parsers: dict[str, Any] = {}
         self.debug: list[Any] = []
+        self._bridge_maps: set[tuple[Any, Any]] = set()
         self.profiler: PipelineProfiler | None = (
             PipelineProfiler(file_path=self.current_path or "") if G.PROFILING_ENABLED else None
         )
@@ -855,6 +860,14 @@ class ChangeSet:
                 c_ast_parse(self)
             elif current_type == T_ASM:
                 asm_ast_parse(self)
+            elif current_type == T_KCONFIG:
+                kconfig_ast_parse(self)
+            elif current_type == T_MAINTAINERS:
+                from parser.maintainer_ast.maintainer_ast import maintainer_ast_parse
+                maintainer_ast_parse(self)
+            elif current_type == T_CREDITS:
+                from parser.maintainer_ast.maintainer_ast import credits_ast_parse
+                credits_ast_parse(self)
         except FILE_ERROR as e:
             logger.error(f"FILE_ERROR for '{self.file_operation}'={self.current_path}")
             logger.error(e)
@@ -869,6 +882,20 @@ class ChangeSet:
         self.prior_tags = None
         self.prior_tags_map = None
         self.active_tag_list = None
+        self._bridge_maps = set()
+
+    def register_bridge_map(self, tag_ref: Any, map_ref: Any) -> bool:
+        """Register a tag-to-map bridge association within this ChangeSet.
+
+        Returns:
+            True if this is the first registration of (tag_ref, map_ref),
+            False if it has already been registered in this ChangeSet.
+        """
+        key = (tag_ref, map_ref)
+        if key in self._bridge_maps:
+            return False
+        self._bridge_maps.add(key)
+        return True
 
     def __str__(self) -> str:
         """Return formatted string summarizing file operation, queued cs, and results."""

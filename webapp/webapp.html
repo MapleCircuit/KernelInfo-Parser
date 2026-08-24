@@ -578,6 +578,467 @@
       white-space: pre-wrap;
       word-break: break-all;
     }
+    /* =========================================================================
+       KCONFIG MENU & WEB MENUCONFIG STYLES
+       ========================================================================= */
+    .mode-nav {
+      display: flex;
+      gap: 6px;
+      margin-left: 12px;
+    }
+    .btn-mode {
+      background: var(--bg-card);
+      border: 1px solid var(--border-color);
+      color: var(--text-muted);
+      padding: 4px 12px;
+      border-radius: 4px;
+      cursor: pointer;
+      font-size: 12px;
+      font-weight: 500;
+      transition: all 0.15s ease;
+    }
+    .btn-mode.active {
+      background: var(--accent);
+      color: #181a1f;
+      border-color: var(--accent);
+      font-weight: bold;
+    }
+    .kconfig-workspace {
+      display: flex;
+      flex-direction: column;
+      flex: 1;
+      height: calc(100vh - 48px);
+      overflow: hidden;
+      background: var(--bg-dark);
+    }
+    .kconfig-toolbar {
+      background: var(--bg-header);
+      border-bottom: 1px solid var(--border-color);
+      padding: 8px 16px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+    .kconfig-search-box {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex: 1;
+      max-width: 540px;
+    }
+    .kconfig-input {
+      background: var(--bg-card);
+      border: 1px solid var(--border-color);
+      color: var(--text-main);
+      padding: 6px 12px;
+      border-radius: 4px;
+      font-size: 13px;
+      width: 100%;
+      outline: none;
+    }
+    .kconfig-input:focus {
+      border-color: var(--accent);
+      box-shadow: 0 0 0 2px rgba(97, 175, 239, 0.2);
+    }
+    .kconfig-select {
+      background: var(--bg-card);
+      border: 1px solid var(--border-color);
+      color: var(--text-main);
+      padding: 6px 10px;
+      border-radius: 4px;
+      font-size: 12px;
+      outline: none;
+    }
+    .kconfig-actions {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .kconfig-main-split {
+      display: flex;
+      flex: 1;
+      overflow: hidden;
+    }
+    .kconfig-tree-panel {
+      flex: 1.3;
+      border-right: 1px solid var(--border-color);
+      overflow-y: auto;
+      padding: 12px 16px;
+      background: var(--bg-sidebar);
+      font-family: monospace;
+      font-size: 13px;
+    }
+    .kconfig-inspector-panel {
+      flex: 1;
+      overflow-y: auto;
+      padding: 16px 20px;
+      background: var(--bg-content);
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+    }
+    .kconfig-item {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 4px 6px;
+      border-radius: 4px;
+      cursor: pointer;
+      user-select: none;
+      transition: background 0.1s ease;
+      margin: 2px 0;
+    }
+    .kconfig-item:hover {
+      background: rgba(97, 175, 239, 0.1);
+    }
+    .kconfig-item.selected {
+      background: rgba(97, 175, 239, 0.25);
+      border-left: 3px solid var(--accent);
+    }
+    .kconfig-item.disabled {
+      opacity: 0.4;
+    }
+    .kconfig-toggle-btn {
+      font-weight: bold;
+      font-family: monospace;
+      cursor: pointer;
+      padding: 1px 6px;
+      border-radius: 3px;
+      background: rgba(0,0,0,0.4);
+      border: 1px solid var(--border-color);
+      min-width: 36px;
+      text-align: center;
+      user-select: none;
+    }
+    .kconfig-toggle-btn.state-y { color: var(--success); border-color: var(--success); }
+    .kconfig-toggle-btn.state-m { color: var(--text-bright); border-color: var(--text-bright); }
+    .kconfig-toggle-btn.state-n { color: var(--text-muted); }
+    .kconfig-type-tag {
+      font-size: 10px;
+      padding: 2px 6px;
+      border-radius: 3px;
+      text-transform: uppercase;
+      font-weight: bold;
+    }
+    .kconfig-tag-bool { background: rgba(152, 195, 121, 0.2); color: var(--success); }
+    .kconfig-tag-tristate { background: rgba(229, 192, 123, 0.2); color: var(--text-bright); }
+    .kconfig-tag-string { background: rgba(97, 175, 239, 0.2); color: var(--accent); }
+    .kconfig-tag-int, .kconfig-tag-hex { background: rgba(198, 120, 221, 0.2); color: var(--hl-keyword); }
+    .kconfig-tag-menu { background: rgba(86, 182, 194, 0.2); color: #56b6c2; }
+    .kconfig-tag-choice { background: rgba(209, 154, 102, 0.2); color: var(--hl-macro); }
+    .kconfig-tag-comment { background: rgba(92, 99, 112, 0.3); color: var(--text-muted); }
+    .kconfig-help-box {
+      background: var(--bg-card);
+      border: 1px solid var(--border-color);
+      padding: 12px;
+      border-radius: 6px;
+      white-space: pre-wrap;
+      font-size: 12px;
+      line-height: 1.5;
+      color: var(--text-main);
+      max-height: 250px;
+      overflow-y: auto;
+    }
+    .kconfig-dep-chip {
+      background: var(--bg-card);
+      border: 1px solid var(--border-color);
+      padding: 3px 8px;
+      border-radius: 4px;
+      font-size: 11px;
+      font-family: monospace;
+      color: var(--accent);
+      cursor: pointer;
+    }
+    .kconfig-dep-chip:hover {
+      background: var(--border-color);
+      color: #fff;
+    }
+
+    /* =========================================================================
+       TERMINAL MENUCONFIG (TUI) STYLES
+       ========================================================================= */
+    .tui-workspace {
+      display: flex;
+      flex-direction: column;
+      flex: 1;
+      height: calc(100vh - 48px);
+      background: #000088;
+      color: #ffffff;
+      font-family: "Courier New", Courier, monospace;
+      padding: 12px 24px;
+      overflow: hidden;
+      box-sizing: border-box;
+      user-select: none;
+      outline: none;
+    }
+    .tui-frame {
+      display: flex;
+      flex-direction: column;
+      flex: 1;
+      border: 2px solid #aaaaaa;
+      background: #000088;
+      padding: 8px 16px;
+      border-radius: 2px;
+      box-shadow: inset 0 0 10px rgba(0,0,0,0.5);
+    }
+    .tui-title {
+      text-align: center;
+      color: #55ffff;
+      font-weight: bold;
+      font-size: 15px;
+      margin-bottom: 6px;
+      letter-spacing: 0.5px;
+    }
+    .tui-legend {
+      font-size: 12px;
+      color: #ffff55;
+      background: rgba(0,0,0,0.25);
+      border: 1px solid #5555bb;
+      padding: 6px 12px;
+      margin-bottom: 8px;
+      line-height: 1.4;
+    }
+    .tui-legend span.key {
+      color: #ffffff;
+      font-weight: bold;
+    }
+    .tui-breadcrumbs {
+      font-size: 12px;
+      color: #55ffff;
+      margin-bottom: 6px;
+      font-weight: bold;
+    }
+    .tui-box {
+      flex: 1;
+      border: 2px solid #aaaaaa;
+      background: #0000aa;
+      overflow-y: auto;
+      padding: 6px 0;
+    }
+    .tui-item {
+      display: flex;
+      align-items: center;
+      padding: 3px 12px;
+      cursor: pointer;
+      font-size: 13px;
+      white-space: pre;
+    }
+    .tui-item:hover {
+      background: #0000ff;
+    }
+    .tui-item.active {
+      background: #ffffff !important;
+      color: #000000 !important;
+      font-weight: bold;
+    }
+    .tui-item.active span.tui-hotkey {
+      color: #aa0000 !important;
+    }
+    .tui-tag-badge {
+      color: #ffff55;
+      margin-right: 8px;
+      font-weight: bold;
+    }
+    .tui-item.active .tui-tag-badge {
+      color: #0000aa !important;
+    }
+    .tui-footer {
+      display: flex;
+      justify-content: center;
+      gap: 16px;
+      margin-top: 10px;
+      padding-top: 6px;
+      border-top: 1px solid #5555bb;
+    }
+    .tui-btn {
+      background: #aaaaaa;
+      color: #000000;
+      border: none;
+      padding: 4px 14px;
+      font-family: inherit;
+      font-size: 13px;
+      font-weight: bold;
+      cursor: pointer;
+      outline: none;
+    }
+    .tui-btn:hover, .tui-btn.active {
+      background: #55ffff;
+      color: #000000;
+      box-shadow: 0 0 6px #55ffff;
+    }
+    .tui-dialog-overlay {
+      position: fixed;
+      top: 0; left: 0; right: 0; bottom: 0;
+      background: rgba(0,0,0,0.6);
+      display: none;
+      align-items: center;
+      justify-content: center;
+      z-index: 2000;
+    }
+    .tui-dialog-overlay.open { display: flex; }
+    .tui-dialog {
+      background: #0000aa;
+      border: 3px double #ffffff;
+      color: #ffffff;
+      font-family: "Courier New", Courier, monospace;
+      width: 90%;
+      max-width: 680px;
+      max-height: 80vh;
+      display: flex;
+      flex-direction: column;
+      box-shadow: 10px 10px 0 rgba(0,0,0,0.5);
+    }
+    .tui-dialog-head {
+      background: #aaaaaa;
+      color: #000000;
+      padding: 6px 12px;
+      font-weight: bold;
+      display: flex;
+      justify-content: space-between;
+    }
+    .tui-dialog-body {
+      padding: 14px;
+      overflow-y: auto;
+      flex: 1;
+      font-size: 12px;
+      line-height: 1.5;
+    }
+    .token-kconfig-symbol {
+      color: #e5c07b !important;
+      font-weight: bold;
+      cursor: pointer;
+      border-bottom: 1px dotted #e5c07b;
+      padding: 0 3px;
+      border-radius: 3px;
+      background: rgba(229, 192, 123, 0.12);
+      transition: all 0.15s ease;
+      display: inline-block;
+    }
+    .token-kconfig-symbol:hover {
+      background: rgba(229, 192, 123, 0.3) !important;
+      color: #ffffff !important;
+      border-bottom: 1px solid #55ffff;
+      box-shadow: 0 0 8px rgba(229, 192, 123, 0.4);
+    }
+
+    /* Subsystem & Contributor Styling */
+    .subsystem-chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 3px 10px;
+      border-radius: 6px;
+      background: linear-gradient(135deg, rgba(97, 175, 239, 0.15) 0%, rgba(152, 195, 121, 0.15) 100%);
+      border: 1px solid rgba(97, 175, 239, 0.35);
+      color: #61afef;
+      font-size: 11px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+    }
+    .subsystem-chip:hover {
+      background: linear-gradient(135deg, rgba(97, 175, 239, 0.3) 0%, rgba(152, 195, 121, 0.3) 100%);
+      border-color: #61afef;
+      transform: translateY(-1px);
+      box-shadow: 0 4px 12px rgba(97, 175, 239, 0.25);
+    }
+    .role-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      padding: 2px 7px;
+      border-radius: 4px;
+      font-size: 10px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+    .role-maintainer {
+      background: rgba(152, 195, 121, 0.2);
+      color: #98c379;
+      border: 1px solid rgba(152, 195, 121, 0.4);
+    }
+    .role-reviewer {
+      background: rgba(229, 192, 123, 0.2);
+      color: #e5c07b;
+      border: 1px solid rgba(229, 192, 123, 0.4);
+    }
+    .role-credits {
+      background: rgba(198, 120, 221, 0.2);
+      color: #c678dd;
+      border: 1px solid rgba(198, 120, 221, 0.4);
+    }
+    .person-link {
+      color: var(--text-bright);
+      font-weight: 600;
+      cursor: pointer;
+      text-decoration: none;
+      transition: color 0.15s ease;
+    }
+    .person-link:hover {
+      color: #55ffff;
+      text-decoration: underline;
+    }
+    .maintainers-workspace, .credits-workspace {
+      display: flex;
+      flex-direction: column;
+      height: calc(100vh - 42px);
+      background: var(--bg-main);
+      overflow: hidden;
+    }
+    .maintainers-grid, .credits-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(350px, 1fr));
+      gap: 16px;
+      padding: 20px;
+      overflow-y: auto;
+      flex: 1;
+    }
+    .subsystem-card, .credit-card {
+      background: var(--bg-card, #21252b);
+      border: 1px solid var(--border-color, #3a3f4b);
+      border-radius: 8px;
+      padding: 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      transition: all 0.2s ease;
+      cursor: pointer;
+      position: relative;
+    }
+    .subsystem-card:hover, .credit-card:hover {
+      border-color: var(--accent, #61afef);
+      transform: translateY(-2px);
+      box-shadow: 0 6px 20px rgba(0, 0, 0, 0.35);
+    }
+    .card-title {
+      font-size: 14px;
+      font-weight: bold;
+      color: var(--text-bright, #abb2bf);
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 8px;
+    }
+    .card-meta {
+      font-size: 11px;
+      color: var(--text-muted, #7f848e);
+      display: flex;
+      flex-direction: column;
+      gap: 5px;
+    }
+    .member-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      background: rgba(255, 255, 255, 0.05);
+      border: 1px solid rgba(255, 255, 255, 0.1);
+      padding: 3px 8px;
+      border-radius: 4px;
+      font-size: 11px;
+    }
   </style>
 </head>
 <body>
@@ -587,6 +1048,13 @@
     <div class="topbar-left">
       <div class="brand">
         <span>⚡</span> KernelInfo Dev Viewer
+      </div>
+      <div class="mode-nav">
+        <button id="btnModeExplorer" class="btn btn-mode active" onclick="switchAppMode('explorer')">📁 Explorer & AST</button>
+        <button id="btnModeKconfig" class="btn btn-mode" onclick="switchAppMode('kconfig')">⚙️ Kconfig GUI</button>
+        <button id="btnModeTui" class="btn btn-mode" onclick="switchAppMode('tui')">📟 Terminal Menuconfig (TUI)</button>
+        <button id="btnModeMaintainers" class="btn btn-mode" onclick="switchAppMode('maintainers')">👥 Subsystems</button>
+        <button id="btnModeCredits" class="btn btn-mode" onclick="switchAppMode('credits')">🏆 Credits</button>
       </div>
       <select id="versionSelect" class="version-selector" onchange="onVersionChange(this.value)">
         <option value="">Loading versions...</option>
@@ -617,8 +1085,8 @@
     </div>
   </div>
 
-  <!-- Main Body -->
-  <div class="app-body">
+  <!-- Main Body (Explorer & AST) -->
+  <div id="explorerWorkspace" class="app-body">
     <!-- Left Sidebar -->
     <aside class="sidebar">
       <div class="sidebar-header">
@@ -660,6 +1128,392 @@
         <div id="astInspectorContent"></div>
       </div>
     </main>
+  </div>
+
+  <!-- Kconfig Workspace (Web Menuconfig) -->
+  <div id="kconfigWorkspace" class="kconfig-workspace" style="display: none;">
+    <!-- Kconfig Toolbar -->
+    <div class="kconfig-toolbar">
+      <div class="kconfig-search-box">
+        <input type="text" id="kconfigSearchInput" class="kconfig-input" placeholder="🔍 Search Kconfig symbols (e.g. EXT4_FS, NET, MODULES)..." oninput="onKconfigSearchInput(this.value)">
+        <select id="kconfigTypeFilter" class="kconfig-select" onchange="onKconfigTypeFilterChange(this.value)">
+          <option value="">All Types</option>
+          <option value="bool">bool</option>
+          <option value="tristate">tristate</option>
+          <option value="string">string</option>
+          <option value="hex">hex</option>
+          <option value="int">int</option>
+        </select>
+      </div>
+      <div class="kconfig-actions">
+        <button class="btn" id="btnKconfigViewMode" onclick="toggleKconfigDrillDownMode()">🔀 Mode: Drill-Down</button>
+        <button class="btn" id="btnTargetProfile" onclick="openKconfigProfileModal()">🌐 Target Profile</button>
+        <button class="btn" id="btnKconfigDefconfig" onclick="openKconfigDefconfigModal()">⚙️ Defconfig</button>
+        <button class="btn" onclick="resetKconfigDefaults()">🔄 Reset Defaults</button>
+        <button class="btn" onclick="openKconfigImportModal()">📥 Import .config</button>
+        <button class="btn btn-accent" onclick="openKconfigExportModal()">💾 Export .config</button>
+      </div>
+    </div>
+
+    <!-- Drill-Down Navigation Bar -->
+    <div id="kconfigBreadcrumbBar" style="background: var(--bg-card); border-bottom: 1px solid var(--border-color); padding: 8px 16px; font-size: 12px; display: flex; align-items: center; justify-content: space-between;">
+      <div style="display: flex; align-items: center; gap: 8px;">
+        <button class="btn" id="kconfigBackBtn" style="padding: 2px 8px; font-size: 11px;" onclick="kconfigNavigateUp()" disabled>⬆ Up to Parent</button>
+        <span id="kconfigBreadcrumbs" style="color: var(--accent); font-weight: 500;">Main Menu</span>
+      </div>
+      <div style="display: flex; align-items: center; gap: 12px;">
+        <span id="activeDefconfigBadge" class="badge" style="background: rgba(85,255,255,0.15); color: #55ffff; font-family: monospace; font-size: 11px; display: none;">⚙️ Defconfig: None</span>
+        <span id="kconfigScopeCount" style="font-size: 11px; color: var(--text-muted);">Showing 0 items</span>
+      </div>
+    </div>
+
+    <!-- Kconfig Main Split -->
+    <div class="kconfig-main-split">
+      <!-- Left Tree Panel -->
+      <div id="kconfigTreePanel" class="kconfig-tree-panel">
+        <div style="padding: 20px; color: var(--text-muted); text-align: center;">
+          Loading Kconfig menu tree...
+        </div>
+      </div>
+
+      <!-- Right Inspector Panel -->
+      <div id="kconfigInspectorPanel" class="kconfig-inspector-panel">
+        <div style="padding: 40px; text-align: center; color: var(--text-muted);">
+          <h3>Select any configuration symbol or menu to inspect details.</h3>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Terminal Menuconfig (TUI) Workspace -->
+  <div id="tuiWorkspace" class="tui-workspace" style="display: none;" tabindex="0" onkeydown="onTuiKeyDown(event)">
+    <div class="tui-frame">
+      <div id="tuiTitle" class="tui-title">Linux/x86_64 Kernel Configuration</div>
+      <div class="tui-legend">
+        Arrow keys navigate the menu. <span class="key">&lt;Enter&gt;</span> selects submenus <span class="key">---&gt;</span>.<br>
+        Highlighted letters are hotkeys. Pressing <span class="key">&lt;Y&gt;</span> includes, <span class="key">&lt;N&gt;</span> excludes, <span class="key">&lt;M&gt;</span> modularizes features.<br>
+        Press <span class="key">&lt;Esc&gt;&lt;Esc&gt;</span> to exit, <span class="key">&lt;?&gt;</span> for Help, <span class="key">&lt;/&gt;</span> for Search, <span class="key">&lt;D&gt;</span> for Defconfig, <span class="key">&lt;T&gt;</span> for Target. Legend: <span class="key">[*]</span> built-in  <span class="key">[ ]</span> excluded  <span class="key">&lt;M&gt;</span> module  <span class="key">&lt; &gt;</span> module capable
+      </div>
+      <div id="tuiBreadcrumbs" class="tui-breadcrumbs">Main Menu</div>
+      <div id="tuiMenuBox" class="tui-box">
+        <!-- Scoped Menu Items -->
+      </div>
+      <div class="tui-footer">
+        <button id="tuiBtnSelect" class="tui-btn active" onclick="tuiActionSelect()">&lt; Select &gt;</button>
+        <button id="tuiBtnDefconfig" class="tui-btn" onclick="openTuiDefconfigModal()">&lt; Defconfig &gt;</button>
+        <button id="tuiBtnExit" class="tui-btn" onclick="tuiActionExit()">&lt; Exit &gt;</button>
+        <button id="tuiBtnTarget" class="tui-btn" onclick="openTuiProfileModal()">&lt; Target &gt;</button>
+        <button id="tuiBtnHelp" class="tui-btn" onclick="tuiActionHelp()">&lt; Help &gt;</button>
+        <button id="tuiBtnSave" class="tui-btn" onclick="openKconfigExportModal()">&lt; Save &gt;</button>
+        <button id="tuiBtnLoad" class="tui-btn" onclick="openKconfigImportModal()">&lt; Load &gt;</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Subsystems & Maintainers Hub Workspace -->
+  <div id="maintainersWorkspace" class="maintainers-workspace" style="display: none;">
+    <div style="background: var(--bg-sidebar); border-bottom: 1px solid var(--border-color); padding: 12px 20px; display: flex; gap: 14px; align-items: center; justify-content: space-between; flex-wrap: wrap;">
+      <div style="display: flex; gap: 10px; align-items: center; flex: 1; max-width: 700px;">
+        <input type="text" id="maintainerSearchInput" class="kconfig-input" placeholder="🔍 Search subsystems by name, maintainer, or pattern (e.g. EXT4, netdev, arm64)..." oninput="filterMaintainers()" style="flex: 1;">
+        <select id="maintainerStatusFilter" class="kconfig-select" onchange="filterMaintainers()" style="width: 170px;">
+          <option value="">All Statuses</option>
+          <option value="Supported">Supported</option>
+          <option value="Maintained">Maintained</option>
+          <option value="Odd Fixes">Odd Fixes</option>
+          <option value="Orphan">Orphan</option>
+          <option value="Obsolete">Obsolete</option>
+        </select>
+      </div>
+      <div style="display: flex; gap: 12px; align-items: center;">
+        <span id="maintainerCountBadge" class="badge badge-accent" style="font-size: 12px; padding: 4px 10px;">0 Subsystems</span>
+        <button class="btn btn-accent" onclick="loadMaintainersData(true)">⟳ Refresh</button>
+      </div>
+    </div>
+
+    <div id="maintainersGrid" class="maintainers-grid">
+      <!-- Dynamic Subsystem Cards -->
+    </div>
+  </div>
+
+  <!-- Kernel Credits Hub Workspace -->
+  <div id="creditsWorkspace" class="credits-workspace" style="display: none;">
+    <div style="background: var(--bg-sidebar); border-bottom: 1px solid var(--border-color); padding: 12px 20px; display: flex; gap: 14px; align-items: center; justify-content: space-between; flex-wrap: wrap;">
+      <div style="display: flex; gap: 10px; align-items: center; flex: 1; max-width: 700px;">
+        <input type="text" id="creditsSearchInput" class="kconfig-input" placeholder="🔍 Search contributors by name, email, or contribution topic (e.g. Linus, TCP, ext4)..." oninput="filterCredits()" style="flex: 1;">
+      </div>
+      <div style="display: flex; gap: 12px; align-items: center;">
+        <span id="creditsCountBadge" class="badge badge-accent" style="font-size: 12px; padding: 4px 10px;">0 Contributors</span>
+        <button class="btn btn-accent" onclick="loadCreditsData(true)">⟳ Refresh</button>
+      </div>
+    </div>
+
+    <div id="creditsGrid" class="credits-grid">
+      <!-- Dynamic Contributor Cards -->
+    </div>
+  </div>
+
+  <!-- Target Profile Configuration Modal (GUI) -->
+  <div id="kconfigProfileModal" class="modal-overlay">
+    <div class="modal" style="max-width: 650px;">
+      <div class="modal-header">
+        <h3>🌐 Target Architecture &amp; Compiler Profile</h3>
+        <button class="btn" onclick="closeKconfigProfileModal()">✕</button>
+      </div>
+      <div class="modal-body">
+        <p style="font-size: 12px; color: var(--text-muted); margin-bottom: 14px;">
+          Configure build environment variables such as target architecture, compiler toolchain, and cross-compilation prefixes. Kconfig options and conditional dependencies will re-evaluate immediately.
+        </p>
+
+        <div style="margin-bottom: 14px;">
+          <label style="font-size: 11px; color: var(--text-bright); font-weight: bold; display: block; margin-bottom: 4px;">Target Architecture Preset:</label>
+          <select id="profileArchSelect" class="kconfig-select" style="width: 100%;" onchange="onProfileArchPresetChange(this.value)">
+            <option value="x86_64">x86_64 (64-bit x86)</option>
+            <option value="i386">i386 / x86_32 (32-bit x86)</option>
+            <option value="arm64">arm64 / aarch64 (64-bit ARM)</option>
+            <option value="arm">arm (32-bit ARM)</option>
+            <option value="riscv64">riscv64 (64-bit RISC-V)</option>
+            <option value="powerpc">powerpc (PPC / PPC64)</option>
+            <option value="mips">mips (MIPS Architecture)</option>
+            <option value="s390">s390 (IBM System z / s390x)</option>
+            <option value="custom">Custom Architecture...</option>
+          </select>
+        </div>
+
+        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin-bottom: 14px;">
+          <div>
+            <label style="font-size: 11px; color: var(--text-bright); font-weight: bold; display: block; margin-bottom: 4px;">Compiler Toolchain:</label>
+            <select id="profileCompilerSelect" class="kconfig-select" style="width: 100%;">
+              <option value="gcc">GCC (GNU Compiler Collection)</option>
+              <option value="clang">Clang / LLVM</option>
+            </select>
+          </div>
+          <div>
+            <label style="font-size: 11px; color: var(--text-bright); font-weight: bold; display: block; margin-bottom: 4px;">Compiler Version String:</label>
+            <input type="text" id="profileCompilerVersion" class="kconfig-input" value="11.2.0" placeholder="e.g. 11.2.0 or 15.0.0">
+          </div>
+        </div>
+
+        <div style="margin-bottom: 14px;">
+          <label style="font-size: 11px; color: var(--text-bright); font-weight: bold; display: block; margin-bottom: 4px;">Cross-Compiler Prefix (CROSS_COMPILE):</label>
+          <input type="text" id="profileCrossCompile" class="kconfig-input" placeholder="e.g. aarch64-linux-gnu-, arm-linux-gnueabihf-, or leave blank">
+        </div>
+
+        <div>
+          <label style="font-size: 11px; color: var(--text-bright); font-weight: bold; display: block; margin-bottom: 4px;">Custom Environment &amp; Symbol Bindings (KEY=VALUE per line):</label>
+          <textarea id="profileCustomEnv" rows="4" class="kconfig-input" style="font-family: monospace; font-size: 11px;" placeholder="ARCH=x86&#10;SRCARCH=x86&#10;CC=gcc"></textarea>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn" onclick="closeKconfigProfileModal()">Cancel</button>
+        <button class="btn btn-accent" onclick="applyTargetProfileFromGui()">Apply Profile &amp; Re-evaluate</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- TUI Target Profile Dialog Modal -->
+  <div id="tuiProfileModal" class="tui-dialog-overlay" onclick="closeTuiProfileModal(event)">
+    <div class="tui-dialog" onclick="event.stopPropagation()" style="max-width: 680px;">
+      <div class="tui-dialog-head">
+        <span>Target Architecture &amp; Compiler Profile</span>
+        <button style="background:none; border:none; color:#000; font-weight:bold; cursor:pointer;" onclick="closeTuiProfileModal()">✕</button>
+      </div>
+      <div class="tui-dialog-body">
+        <div style="margin-bottom: 12px; color: #ffff55;">Select target hardware architecture &amp; build toolchain:</div>
+        
+        <div style="margin-bottom: 10px;">
+          <label style="color: #55ffff; font-weight: bold;">Target Architecture:</label><br>
+          <select id="tuiProfileArchSelect" class="kconfig-input" style="font-family: monospace; margin-top: 4px;" onchange="onTuiProfileArchChange(this.value)">
+            <option value="x86_64">x86_64 (64-bit x86)</option>
+            <option value="i386">i386 (32-bit x86)</option>
+            <option value="arm64">arm64 (64-bit ARM)</option>
+            <option value="arm">arm (32-bit ARM)</option>
+            <option value="riscv64">riscv64 (64-bit RISC-V)</option>
+            <option value="powerpc">powerpc (PPC / PPC64)</option>
+            <option value="mips">mips (MIPS Architecture)</option>
+            <option value="s390">s390 (IBM System z / s390x)</option>
+          </select>
+        </div>
+
+        <div style="margin-bottom: 10px;">
+          <label style="color: #55ffff; font-weight: bold;">Compiler Family:</label><br>
+          <div style="margin-top: 4px; display: flex; gap: 16px;">
+            <label><input type="radio" name="tuiCompiler" id="tuiCompilerGcc" value="gcc" checked> GCC</label>
+            <label><input type="radio" name="tuiCompiler" id="tuiCompilerClang" value="clang"> Clang / LLVM</label>
+          </div>
+        </div>
+
+        <div style="margin-bottom: 10px;">
+          <label style="color: #55ffff; font-weight: bold;">Compiler Version:</label><br>
+          <input type="text" id="tuiCompilerVersion" class="kconfig-input" style="font-family: monospace; margin-top: 4px;" value="11.2.0">
+        </div>
+
+        <div>
+          <label style="color: #55ffff; font-weight: bold;">Cross-Compiler Toolchain Prefix:</label><br>
+          <input type="text" id="tuiCrossCompile" class="kconfig-input" style="font-family: monospace; margin-top: 4px;" placeholder="e.g. aarch64-linux-gnu-">
+        </div>
+      </div>
+      <div class="tui-dialog-foot">
+        <button class="tui-btn" onclick="applyTargetProfileFromTui()">&lt; Apply &gt;</button>
+        <button class="tui-btn" onclick="closeTuiProfileModal()">&lt; Cancel &gt;</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- TUI Help Dialog Modal -->
+  <div id="tuiHelpModal" class="tui-dialog-overlay" onclick="closeTuiHelpModal(event)">
+    <div class="tui-dialog" onclick="event.stopPropagation()">
+      <div class="tui-dialog-head">
+        <span id="tuiHelpTitle">Symbol Help</span>
+        <button style="background:none; border:none; color:#000; font-weight:bold; cursor:pointer;" onclick="closeTuiHelpModal()">✕</button>
+      </div>
+      <div id="tuiHelpBody" class="tui-dialog-body"></div>
+      <div class="tui-dialog-foot">
+        <button class="tui-btn" onclick="closeTuiHelpModal()">&lt; OK &gt;</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- TUI Search Dialog Modal -->
+  <div id="tuiSearchModal" class="tui-dialog-overlay" onclick="closeTuiSearchModal(event)">
+    <div class="tui-dialog" onclick="event.stopPropagation()" style="max-width: 780px;">
+      <div class="tui-dialog-head">
+        <span>Search Configuration Parameter</span>
+        <button style="background:none; border:none; color:#000; font-weight:bold; cursor:pointer;" onclick="closeTuiSearchModal()">✕</button>
+      </div>
+      <div class="tui-dialog-body">
+        <div style="margin-bottom: 8px;">Enter string to search:</div>
+        <input type="text" id="tuiSearchInput" class="kconfig-input" style="font-family: monospace; margin-bottom: 12px;" oninput="onTuiSearchInput(this.value)" placeholder="e.g. EXT4, NET, WATCHDOG...">
+        <div id="tuiSearchResults" style="max-height: 260px; overflow-y: auto; font-family: monospace; font-size: 11px;"></div>
+      </div>
+      <div class="tui-dialog-foot">
+        <button class="tui-btn" onclick="closeTuiSearchModal()">&lt; Close &gt;</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- TUI Defconfig Dialog Modal -->
+  <div id="tuiDefconfigModal" class="tui-dialog-overlay" onclick="closeTuiDefconfigModal(event)">
+    <div class="tui-dialog" onclick="event.stopPropagation()" style="max-width: 780px;">
+      <div class="tui-dialog-head">
+        <span>Default Configurations (make defconfig)</span>
+        <button style="background:none; border:none; color:#000; font-weight:bold; cursor:pointer;" onclick="closeTuiDefconfigModal()">✕</button>
+      </div>
+      <div class="tui-dialog-body">
+        <div style="margin-bottom: 8px; color: #ffff55;">
+          Architecture: <strong id="tuiDefconfigArchLabel" style="color: #ffffff;">x86</strong> | Canonical: <span id="tuiDefconfigCanonicalLabel" style="color: #55ffff;">x86_64_defconfig</span>
+        </div>
+        <input type="text" id="tuiDefconfigSearch" class="kconfig-input" style="font-family: monospace; margin-bottom: 8px;" placeholder="Filter defconfigs (e.g. omap, smp, 64)..." oninput="filterTuiDefconfigs(this.value)">
+        <div id="tuiDefconfigList" style="max-height: 260px; overflow-y: auto; font-family: monospace; font-size: 11px; background: #000088; border: 1px solid #5555bb; padding: 4px;">
+          <!-- Dynamic Defconfig Rows -->
+        </div>
+      </div>
+      <div class="tui-dialog-foot">
+        <button class="tui-btn" onclick="applySelectedTuiDefconfig()">&lt; Select &gt;</button>
+        <button class="tui-btn" onclick="applyCanonicalTuiDefconfig()">&lt; Load Baseline &gt;</button>
+        <button class="tui-btn" onclick="closeTuiDefconfigModal()">&lt; Cancel &gt;</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Kconfig Defconfig Modal (GUI) -->
+  <div id="kconfigDefconfigModal" class="modal-overlay">
+    <div class="modal" style="max-width: 760px;">
+      <div class="modal-header">
+        <h3>⚙️ Architecture Default Configuration (Defconfig)</h3>
+        <button class="btn" onclick="closeKconfigDefconfigModal()">✕</button>
+      </div>
+      <div class="modal-body">
+        <p style="font-size: 12px; color: var(--text-muted); margin-bottom: 14px;">
+          Select a default configuration profile from the kernel source tree for the active architecture. When multiple hardware defconfigs exist, you can search and choose whichever board/platform profile you need.
+        </p>
+
+        <!-- Recommended Baseline Card -->
+        <div style="background: rgba(33, 150, 243, 0.1); border: 1px solid rgba(33, 150, 243, 0.3); border-radius: 6px; padding: 12px 16px; margin-bottom: 16px; display: flex; justify-content: space-between; align-items: center;">
+          <div>
+            <div style="font-size: 11px; text-transform: uppercase; color: var(--accent); font-weight: bold; letter-spacing: 0.5px;">Recommended Baseline</div>
+            <h4 id="guiDefconfigCanonicalTitle" style="color: var(--text-bright); margin: 4px 0;">x86_64_defconfig</h4>
+            <div id="guiDefconfigCanonicalPath" style="font-size: 11px; color: var(--text-muted); font-family: monospace;">arch/x86/configs/x86_64_defconfig</div>
+          </div>
+          <button class="btn btn-accent" id="guiBtnApplyCanonical" onclick="applyCanonicalDefconfig()">🚀 Apply make defconfig</button>
+        </div>
+
+        <!-- Filter Input -->
+        <div style="margin-bottom: 10px;">
+          <input type="text" id="guiDefconfigFilter" class="kconfig-input" placeholder="🔍 Search available defconfigs (e.g. omap, smp, 64, board, pci)..." oninput="filterGuiDefconfigs(this.value)">
+        </div>
+
+        <!-- Defconfig List -->
+        <div id="guiDefconfigList" style="max-height: 320px; overflow-y: auto; display: flex; flex-direction: column; gap: 6px;">
+          <!-- Dynamic Defconfig Cards -->
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn" onclick="closeKconfigDefconfigModal()">Close</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Kconfig Symbol Inspection Modal (From Code Viewer) -->
+  <div id="kconfigSymbolInfoModal" class="modal-overlay" onclick="closeKconfigSymbolModal(event)">
+    <div class="modal" onclick="event.stopPropagation()" style="max-width: 780px;">
+      <div class="modal-header">
+        <div style="display: flex; align-items: center; gap: 10px;">
+          <h3 id="codeSymModalTitle" style="color: #55ffff; font-family: monospace; margin: 0;">CONFIG_SYMBOL</h3>
+          <span id="codeSymModalTypeBadge" class="kconfig-type-tag">tristate</span>
+        </div>
+        <button class="btn" onclick="closeKconfigSymbolModal()">✕</button>
+      </div>
+      <div id="codeSymModalBody" class="modal-body" style="max-height: 70vh; overflow-y: auto;">
+        <!-- Dynamic Symbol Details Content -->
+      </div>
+      <div class="modal-footer" style="display: flex; justify-content: space-between; align-items: center;">
+        <button class="btn btn-accent" id="codeSymBtnJumpMenuconfig" onclick="jumpFromCodeToKconfig()">🔀 Open in Web Menuconfig</button>
+        <button class="btn" onclick="closeKconfigSymbolModal()">Close</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Kconfig Import Modal -->
+  <div id="kconfigImportModal" class="modal-overlay">
+    <div class="modal" style="max-width: 680px;">
+      <div class="modal-header">
+        <h3>📥 Import Linux Kernel .config File</h3>
+        <button class="btn" onclick="closeKconfigImportModal()">✕</button>
+      </div>
+      <div class="modal-body">
+        <p style="font-size: 12px; color: var(--text-muted); margin-bottom: 12px;">
+          Select a <code>.config</code> file from your computer or paste its content below to apply configuration symbols.
+        </p>
+        <div style="margin-bottom: 12px;">
+          <input type="file" id="kconfigFileInput" accept=".config,text/plain" onchange="onKconfigConfigFileChosen(event)" style="font-size: 12px; color: var(--text-main);">
+        </div>
+        <textarea id="kconfigImportText" rows="12" class="kconfig-input" style="font-family: monospace; font-size: 11px;" placeholder="# Paste .config contents here...&#10;CONFIG_MODULES=y&#10;CONFIG_EXT4_FS=m&#10;# CONFIG_WATCHDOG is not set"></textarea>
+      </div>
+      <div class="modal-footer">
+        <button class="btn" onclick="closeKconfigImportModal()">Cancel</button>
+        <button class="btn btn-accent" onclick="applyKconfigImport()">Apply Configuration</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Kconfig Export Modal -->
+  <div id="kconfigExportModal" class="modal-overlay">
+    <div class="modal" style="max-width: 720px;">
+      <div class="modal-header">
+        <h3>💾 Export Kernel-Compatible .config</h3>
+        <button class="btn" onclick="closeKconfigExportModal()">✕</button>
+      </div>
+      <div class="modal-body">
+        <p style="font-size: 12px; color: var(--text-muted); margin-bottom: 12px;">
+          This generated <code>.config</code> file strictly adheres to Linux kernel build system requirements (<code>CONFIG_XXX=y</code>, <code>CONFIG_XXX=m</code>, <code># CONFIG_XXX is not set</code>).
+        </p>
+        <textarea id="kconfigExportText" rows="16" class="kconfig-input" style="font-family: monospace; font-size: 11px;" readonly></textarea>
+      </div>
+      <div class="modal-footer">
+        <button class="btn" onclick="copyKconfigExportToClipboard()">📋 Copy to Clipboard</button>
+        <button class="btn btn-accent" onclick="downloadKconfigExportFile()">⬇️ Download .config</button>
+      </div>
+    </div>
   </div>
 
   <!-- Highlight Settings Modal -->
@@ -709,6 +1563,38 @@
       </div>
       <div class="modal-footer">
         <button class="btn btn-accent" onclick="closeDevModal()">Close</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Subsystem Details Modal -->
+  <div id="subsystemModal" class="modal-overlay">
+    <div class="modal" style="max-width: 850px; max-height: 88vh; display: flex; flex-direction: column;">
+      <div class="modal-header">
+        <h3 id="subsystemModalTitle">🏷️ Subsystem Details</h3>
+        <button class="btn" onclick="closeSubsystemModal()">✕</button>
+      </div>
+      <div id="subsystemModalContent" class="modal-body" style="padding: 20px; overflow-y: auto; flex: 1;">
+        <!-- Dynamic Subsystem Body -->
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-accent" onclick="closeSubsystemModal()">Close</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Person / Contributor Profile Modal -->
+  <div id="personModal" class="modal-overlay">
+    <div class="modal" style="max-width: 680px; max-height: 88vh; display: flex; flex-direction: column;">
+      <div class="modal-header">
+        <h3 id="personModalTitle">👤 Developer &amp; Contributor Profile</h3>
+        <button class="btn" onclick="closePersonModal()">✕</button>
+      </div>
+      <div id="personModalContent" class="modal-body" style="padding: 20px; overflow-y: auto; flex: 1;">
+        <!-- Dynamic Person Profile Body -->
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-accent" onclick="closePersonModal()">Close</button>
       </div>
     </div>
   </div>
@@ -1279,17 +2165,54 @@
     function renderFileCodeView(container, data) {
       const fileInfo = data.file_info || {};
       const tags = data.tags || [];
+      const subsystems = data.subsystems || [];
 
       // Calculate statistics
       let totalMaps = 0;
       tags.forEach(t => { if (t.maps) totalMaps += t.maps.length; });
 
+      // Build Subsystem Chips HTML
+      let subsystemsHtml = "";
+      if (subsystems.length > 0) {
+        subsystemsHtml = subsystems.map(s => `
+          <span class="subsystem-chip" onclick="openSubsystemModal('${s.sec_id || escapeJs(s.name)}')" title="Click to view ${escapeHtml(s.name)} maintainers and all subsystem files">
+            🏷️ <strong>Subsystem:</strong> ${escapeHtml(s.name)} <span class="badge badge-success" style="margin-left: 4px; font-size: 10px;">${escapeHtml(s.status || 'Active')}</span>
+          </span>
+        `).join("");
+      }
+
+      // Check if viewing MAINTAINERS or CREDITS
+      let bannerHtml = "";
+      const normPath = (data.path || "").trim();
+      if (normPath === "MAINTAINERS" || normPath.endsWith("/MAINTAINERS")) {
+        bannerHtml = `
+          <div style="background: linear-gradient(90deg, #282c34 0%, #1e2227 100%); border-left: 4px solid var(--accent); padding: 12px 18px; margin-bottom: 10px; border-radius: 6px; display: flex; justify-content: space-between; align-items: center; box-shadow: 0 4px 12px rgba(0,0,0,0.2);">
+            <div>
+              <div style="font-weight: bold; font-size: 13px; color: var(--text-bright);">👥 Linux Kernel MAINTAINERS File</div>
+              <div style="font-size: 11px; color: var(--text-muted);">Explore all kernel subsystems, maintainer rosters, and wildcard file patterns interactively.</div>
+            </div>
+            <button class="btn btn-accent" onclick="switchAppMode('maintainers')" style="padding: 6px 14px; font-size: 12px; font-weight: bold;">🚀 Open Subsystems &amp; Maintainers Hub</button>
+          </div>
+        `;
+      } else if (normPath === "CREDITS" || normPath.endsWith("/CREDITS")) {
+        bannerHtml = `
+          <div style="background: linear-gradient(90deg, #282c34 0%, #1e2227 100%); border-left: 4px solid #c678dd; padding: 12px 18px; margin-bottom: 10px; border-radius: 6px; display: flex; justify-content: space-between; align-items: center; box-shadow: 0 4px 12px rgba(0,0,0,0.2);">
+            <div>
+              <div style="font-weight: bold; font-size: 13px; color: #c678dd;">🏆 Linux Kernel CREDITS File</div>
+              <div style="font-size: 11px; color: var(--text-muted);">Browse all credited authors, historical contributions, PGP keys, and linked maintainer roles.</div>
+            </div>
+            <button class="btn btn-accent" onclick="switchAppMode('credits')" style="padding: 6px 14px; font-size: 12px; font-weight: bold; background: #c678dd; border-color: #c678dd; color: #1e2227;">⭐ Open Kernel Credits Hub</button>
+          </div>
+        `;
+      }
+
       let html = `
         <div class="file-meta-bar">
-          <div class="file-meta-info">
+          <div class="file-meta-info" style="display: flex; align-items: center; flex-wrap: wrap; gap: 8px;">
             <span><strong>File:</strong> ${data.path}</span>
             <span><strong>FID:</strong> <code>${fileInfo.fid}</code></span>
             <span><strong>Version:</strong> <span class="badge badge-accent">${data.version}</span></span>
+            ${subsystemsHtml}
             <span><strong>Tags:</strong> ${tags.length}</span>
             <span><strong>Mapped Elements:</strong> ${totalMaps}</span>
           </div>
@@ -1303,6 +2226,8 @@
           </div>
         </div>
 
+        ${bannerHtml}
+
         <div class="code-viewer">
           <div class="code-scroll-wrapper">
             <div id="codeGutter" class="gutter"></div>
@@ -1315,9 +2240,56 @@
       buildHighlightedSource(tags);
     }
 
+    function renderSegmentWithKconfigTokens(segment, tok, tokenColor, isContainerItem) {
+      if (!segment) return "";
+      const kconfigRegex = /\bCONFIG_([A-Za-z0-9_]+)\b/g;
+      if (!kconfigRegex.test(segment)) {
+        if (tok && tokenColor) {
+          const depthTitle = isContainerItem ? ` [Container Level ${tok.container_depth}]` : '';
+          return `<span class="token" style="color: ${tokenColor};" onclick="inspectAst(${tok.ast_id}, '${escapeHtml(tok.ast_name || '')}', '${tok.type_name}', event)" title="AST: ${escapeHtml(tok.ast_name || '')} (${tok.type_name})${depthTitle}">${escapeHtml(segment)}</span>`;
+        }
+        return escapeHtml(segment);
+      }
+
+      // Contains CONFIG_ symbols - split and wrap each symbol
+      let resultHtml = "";
+      let lastIndex = 0;
+      kconfigRegex.lastIndex = 0;
+      let m;
+      while ((m = kconfigRegex.exec(segment)) !== null) {
+        const before = segment.substring(lastIndex, m.index);
+        if (before) {
+          if (tok && tokenColor) {
+            const depthTitle = isContainerItem ? ` [Container Level ${tok.container_depth}]` : '';
+            resultHtml += `<span class="token" style="color: ${tokenColor};" onclick="inspectAst(${tok.ast_id}, '${escapeHtml(tok.ast_name || '')}', '${tok.type_name}', event)" title="AST: ${escapeHtml(tok.ast_name || '')} (${tok.type_name})${depthTitle}">${escapeHtml(before)}</span>`;
+          } else {
+            resultHtml += escapeHtml(before);
+          }
+        }
+        const fullSym = m[0];
+        const symName = m[1];
+        resultHtml += `<span class="token-kconfig-symbol" onclick="openKconfigSymbolModal('${escapeHtml(symName)}', event)" title="Kconfig Symbol: CONFIG_${escapeHtml(symName)} (Click for details &amp; live value)">${escapeHtml(fullSym)}</span>`;
+        lastIndex = kconfigRegex.lastIndex;
+      }
+
+      const after = segment.substring(lastIndex);
+      if (after) {
+        if (tok && tokenColor) {
+          const depthTitle = isContainerItem ? ` [Container Level ${tok.container_depth}]` : '';
+          resultHtml += `<span class="token" style="color: ${tokenColor};" onclick="inspectAst(${tok.ast_id}, '${escapeHtml(tok.ast_name || '')}', '${tok.type_name}', event)" title="AST: ${escapeHtml(tok.ast_name || '')} (${tok.type_name})${depthTitle}">${escapeHtml(after)}</span>`;
+        } else {
+          resultHtml += escapeHtml(after);
+        }
+      }
+
+      return resultHtml;
+    }
+
     function highlightLineText(rawText, lineMaps) {
       if (!rawText) return "";
-      if (!lineMaps || lineMaps.length === 0) return escapeHtml(rawText);
+      if (!lineMaps || lineMaps.length === 0) {
+        return renderSegmentWithKconfigTokens(rawText, null, null, false);
+      }
 
       const len = rawText.length;
       const charTokens = new Array(len);
@@ -1357,7 +2329,7 @@
         const segment = rawText.substring(idx, runEnd);
 
         if (!tok) {
-          result += escapeHtml(segment);
+          result += renderSegmentWithKconfigTokens(segment, null, null, false);
         } else {
           let tokenColor = null;
           const isContainerItem = (tok.container_depth !== undefined && tok.container_depth !== null);
@@ -1374,12 +2346,7 @@
             }
           }
 
-          if (tokenColor) {
-            const depthTitle = isContainerItem ? ` [Container Level ${tok.container_depth}]` : '';
-            result += `<span class="token" style="color: ${tokenColor};" onclick="inspectAst(${tok.ast_id}, '${escapeHtml(tok.ast_name || '')}', '${tok.type_name}', event)" title="AST: ${escapeHtml(tok.ast_name || '')} (${tok.type_name})${depthTitle}">${escapeHtml(segment)}</span>`;
-          } else {
-            result += escapeHtml(segment);
-          }
+          result += renderSegmentWithKconfigTokens(segment, tok, tokenColor, isContainerItem);
         }
 
         idx = runEnd;
@@ -1693,6 +2660,11 @@
     function escapeHtml(text) {
       if (!text) return "";
       return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+    }
+
+    function escapeJs(text) {
+      if (!text) return "";
+      return String(text).replace(/\\/g, "\\\\").replace(/'/g, "\\'").replace(/"/g, "&quot;");
     }
 
     function toggleTagCollapse(tagIndex, startLine, endLine, event) {
@@ -2075,6 +3047,2196 @@
         </div>
         <pre class="json-view">${escapeHtml(JSON.stringify(res, null, 2))}</pre>
       `;
+    }
+
+    // =========================================================================
+    // KCONFIG MENU & WEB MENUCONFIG JAVASCRIPT LOGIC
+    // =========================================================================
+    let currentAppMode = "explorer"; // "explorer" | "kconfig" | "tui"
+    let kconfigTreeData = [];
+    let kconfigNodesById = {};
+    let kconfigSymbolsByName = {};
+    let kconfigRelations = {}; // { [sym]: { depends_on: [], selects: [], implies: [] } }
+    let kconfigReverseRelations = {}; // { [sym]: { selected_by: [], implied_by: [] } }
+    let kconfigForcedSymbols = {}; // { [sym]: { forcedValue: 'y'|'m', forcedBy: ['SYM1', ...] } }
+    let kconfigUnmetDependencies = {}; // { [sym]: ['DEP1', ...] }
+    let kconfigValues = {};
+    let kconfigInitialDefaults = {};
+    let selectedKconfigNodeId = null;
+    let kconfigSearchQuery = "";
+    let kconfigTypeFilter = "";
+    let kconfigExpandedNodes = new Set();
+    let kconfigLoadedVersion = null;
+
+    // Drill-Down Navigation State
+    let kconfigCurrentMenuId = 0; // 0 is root main menu
+    let kconfigMenuHistory = [{ id: 0, title: "Main Menu" }];
+    let kconfigDrillDownMode = true; // true: drill-down per submenu, false: full expanded tree
+
+    // Terminal Menuconfig (TUI) State
+    let tuiActiveIndex = 0;
+    let tuiActiveButtonIndex = 0; // 0: Select, 1: Defconfig, 2: Exit, 3: Target, 4: Help, 5: Save, 6: Load
+    const tuiButtons = ["select", "defconfig", "exit", "target", "help", "save", "load"];
+
+    // Defconfig Dynamic State
+    let currentDefconfigsData = {
+      version: "v3.0",
+      arch: "x86",
+      total_count: 0,
+      canonical_default: null,
+      defconfigs: []
+    };
+    let guiDefconfigFilterQuery = "";
+    let tuiDefconfigFilterQuery = "";
+    let tuiSelectedDefconfigIdx = 0;
+
+    // Target Architecture & Compiler Profile Dynamic State
+    let targetArchPresets = {};
+    let detectedEnvSymbols = [];
+
+    let currentTargetProfile = {
+      arch: "x86_64",
+      bits: 64,
+      compiler: "gcc",
+      compilerVersion: "11.2.0",
+      crossCompile: "",
+      customEnv: {}
+    };
+
+    async function loadTargetProfilePresets() {
+      const res = await apiFetch(`/api/version/${currentVersion}/kconfig/env-presets`);
+      if (res && res.architectures) {
+        targetArchPresets = {};
+        res.architectures.forEach(a => {
+          targetArchPresets[a.id] = a;
+        });
+        detectedEnvSymbols = res.detected_env_symbols || [];
+        populateArchSelectElements();
+      }
+    }
+
+    function populateArchSelectElements() {
+      const guiSelect = document.getElementById("profileArchSelect");
+      const tuiSelect = document.getElementById("tuiProfileArchSelect");
+      if (!guiSelect || !tuiSelect) return;
+
+      const archEntries = Object.values(targetArchPresets);
+      if (archEntries.length === 0) return;
+
+      const optionsHtml = archEntries.map(a => `<option value="${a.id}">${escapeHtml(a.label || a.id)}</option>`).join("");
+      guiSelect.innerHTML = optionsHtml;
+      tuiSelect.innerHTML = optionsHtml;
+
+      const defaultArch = targetArchPresets["x86_64"] ? "x86_64" : archEntries[0].id;
+      if (!targetArchPresets[currentTargetProfile.arch]) {
+        currentTargetProfile.arch = defaultArch;
+      }
+      guiSelect.value = currentTargetProfile.arch;
+      tuiSelect.value = currentTargetProfile.arch;
+    }
+
+    function onProfileArchPresetChange(archId) {
+      // Bitness and architecture symbols are automatically derived from the target architecture preset
+    }
+
+    function onTuiProfileArchChange(archId) {
+      // Bitness and architecture symbols are automatically derived from the target architecture preset
+    }
+
+    async function openKconfigProfileModal() {
+      if (Object.keys(targetArchPresets).length === 0) {
+        await loadTargetProfilePresets();
+      }
+      document.getElementById("kconfigProfileModal").classList.add("open");
+      document.getElementById("profileArchSelect").value = currentTargetProfile.arch;
+      document.getElementById("profileCompilerSelect").value = currentTargetProfile.compiler;
+      document.getElementById("profileCompilerVersion").value = currentTargetProfile.compilerVersion;
+      document.getElementById("profileCrossCompile").value = currentTargetProfile.crossCompile;
+
+      const envLines = Object.entries(currentTargetProfile.customEnv || {}).map(([k, v]) => `${k}=${v}`).join("\n");
+      document.getElementById("profileCustomEnv").value = envLines;
+    }
+
+    function closeKconfigProfileModal() {
+      document.getElementById("kconfigProfileModal").classList.remove("open");
+    }
+
+    function applyTargetProfileFromGui() {
+      const arch = document.getElementById("profileArchSelect").value;
+      const preset = targetArchPresets[arch] || {};
+      const bits = preset.bits || (arch.includes("64") ? 64 : 32);
+      const compiler = document.getElementById("profileCompilerSelect").value;
+      const compilerVersion = document.getElementById("profileCompilerVersion").value.trim();
+      const crossCompile = document.getElementById("profileCrossCompile").value.trim();
+      const customEnvText = document.getElementById("profileCustomEnv").value;
+
+      const customEnv = {};
+      customEnvText.split("\n").forEach(line => {
+        const trimmed = line.trim();
+        if (trimmed && !trimmed.startsWith("#") && trimmed.includes("=")) {
+          const idx = trimmed.indexOf("=");
+          const k = trimmed.substring(0, idx).trim();
+          const v = trimmed.substring(idx + 1).trim();
+          if (k) customEnv[k] = v;
+        }
+      });
+
+      currentTargetProfile = { arch, bits, compiler, compilerVersion, crossCompile, customEnv };
+      applyTargetProfile(currentTargetProfile);
+      closeKconfigProfileModal();
+      alert(`Applied Target Profile: Architecture = ${arch} (${bits}-bit), Toolchain = ${compiler} ${compilerVersion}`);
+    }
+
+    async function openTuiProfileModal() {
+      if (Object.keys(targetArchPresets).length === 0) {
+        await loadTargetProfilePresets();
+      }
+      const modal = document.getElementById("tuiProfileModal");
+      modal.classList.add("open");
+      document.getElementById("tuiProfileArchSelect").value = currentTargetProfile.arch;
+      document.getElementById("tuiCompilerGcc").checked = (currentTargetProfile.compiler === "gcc");
+      document.getElementById("tuiCompilerClang").checked = (currentTargetProfile.compiler === "clang");
+      document.getElementById("tuiCompilerVersion").value = currentTargetProfile.compilerVersion;
+      document.getElementById("tuiCrossCompile").value = currentTargetProfile.crossCompile;
+    }
+
+    function closeTuiProfileModal(e) {
+      if (e) e.stopPropagation();
+      document.getElementById("tuiProfileModal").classList.remove("open");
+      if (currentAppMode === "tui") document.getElementById("tuiWorkspace").focus();
+    }
+
+    function applyTargetProfileFromTui() {
+      const arch = document.getElementById("tuiProfileArchSelect").value;
+      const preset = targetArchPresets[arch] || {};
+      const bits = preset.bits || (arch.includes("64") ? 64 : 32);
+      const compiler = document.getElementById("tuiCompilerGcc").checked ? "gcc" : "clang";
+      const compilerVersion = document.getElementById("tuiCompilerVersion").value.trim();
+      const crossCompile = document.getElementById("tuiCrossCompile").value.trim();
+
+      currentTargetProfile = {
+        ...currentTargetProfile,
+        arch,
+        bits,
+        compiler,
+        compilerVersion,
+        crossCompile
+      };
+
+      applyTargetProfile(currentTargetProfile);
+      closeTuiProfileModal();
+    }
+
+    function applyTargetProfile(profile) {
+      // 1. Apply preset architecture symbols
+      const archPreset = targetArchPresets[profile.arch];
+      if (archPreset && archPreset.symbols) {
+        Object.assign(kconfigValues, archPreset.symbols);
+      }
+
+      // 2. Apply bitness
+      kconfigValues["64BIT"] = (profile.bits === 64) ? "y" : "n";
+
+      // 3. Apply compiler symbols
+      if (profile.compiler === "gcc") {
+        kconfigValues["CC_IS_GCC"] = "y";
+        kconfigValues["CC_IS_CLANG"] = "n";
+        const verNum = profile.compilerVersion.replace(/[^0-9]/g, "").padEnd(6, "0").slice(0, 6) || "110200";
+        kconfigValues["GCC_VERSION"] = verNum;
+        kconfigValues["CC"] = "gcc";
+      } else if (profile.compiler === "clang") {
+        kconfigValues["CC_IS_CLANG"] = "y";
+        kconfigValues["CC_IS_GCC"] = "n";
+        const verNum = profile.compilerVersion.replace(/[^0-9]/g, "").padEnd(6, "0").slice(0, 6) || "150000";
+        kconfigValues["CLANG_VERSION"] = verNum;
+        kconfigValues["LLVM"] = "1";
+        kconfigValues["CC"] = "clang";
+      }
+
+      // 4. Apply cross compile prefix & custom env
+      if (profile.crossCompile) {
+        kconfigValues["CROSS_COMPILE"] = profile.crossCompile;
+      }
+      if (profile.customEnv) {
+        Object.assign(kconfigValues, profile.customEnv);
+      }
+
+      // 5. Reload scoped tree with updated architecture
+      loadKconfigTree();
+    }
+
+    // =========================================================================
+    // DEFCONFIG DETECTION & SELECTION JAVASCRIPT HANDLERS
+    // =========================================================================
+    let currentLoadedDefconfig = null;
+
+    async function loadDefconfigsForCurrentArch() {
+      const arch = (currentTargetProfile && currentTargetProfile.arch) ? currentTargetProfile.arch : "x86";
+      const res = await apiFetch(`/api/version/${currentVersion}/kconfig/defconfigs?arch=${encodeURIComponent(arch)}`);
+      if (res && res.defconfigs) {
+        currentDefconfigsData = res;
+      }
+      return currentDefconfigsData;
+    }
+
+    async function openKconfigDefconfigModal() {
+      await loadDefconfigsForCurrentArch();
+      const modal = document.getElementById("kconfigDefconfigModal");
+      modal.classList.add("open");
+
+      const canonical = currentDefconfigsData.canonical_default || (currentDefconfigsData.defconfigs && currentDefconfigsData.defconfigs[0]);
+      if (canonical) {
+        document.getElementById("guiDefconfigCanonicalTitle").innerText = canonical.name;
+        document.getElementById("guiDefconfigCanonicalPath").innerText = canonical.file_path;
+        document.getElementById("guiBtnApplyCanonical").innerText = `🚀 Apply make defconfig (${canonical.name})`;
+      }
+
+      guiDefconfigFilterQuery = "";
+      document.getElementById("guiDefconfigFilter").value = "";
+      renderGuiDefconfigList();
+    }
+
+    function closeKconfigDefconfigModal() {
+      document.getElementById("kconfigDefconfigModal").classList.remove("open");
+    }
+
+    function filterGuiDefconfigs(q) {
+      guiDefconfigFilterQuery = (q || "").trim().toLowerCase();
+      renderGuiDefconfigList();
+    }
+
+    function renderGuiDefconfigList() {
+      const listEl = document.getElementById("guiDefconfigList");
+      if (!listEl) return;
+
+      const configs = currentDefconfigsData.defconfigs || [];
+      const filtered = configs.filter(c => {
+        if (!guiDefconfigFilterQuery) return true;
+        return c.name.toLowerCase().includes(guiDefconfigFilterQuery) || c.file_path.toLowerCase().includes(guiDefconfigFilterQuery);
+      });
+
+      if (filtered.length === 0) {
+        listEl.innerHTML = `<div style="padding: 16px; color: var(--text-muted); text-align: center;">No defconfigs matching "${escapeHtml(guiDefconfigFilterQuery)}".</div>`;
+        return;
+      }
+
+      listEl.innerHTML = filtered.map(c => `
+        <div style="background: var(--bg-card); border: 1px solid ${c.is_canonical ? 'var(--accent)' : 'var(--border-color)'}; border-radius: 6px; padding: 10px 14px; display: flex; justify-content: space-between; align-items: center;">
+          <div>
+            <div style="display: flex; align-items: center; gap: 8px;">
+              <strong style="color: var(--text-bright); font-size: 13px; font-family: monospace;">${escapeHtml(c.name)}</strong>
+              ${c.is_canonical ? '<span class="badge" style="background: rgba(85,255,255,0.2); color: #55ffff; font-size: 10px;">★ Baseline</span>' : ''}
+            </div>
+            <div style="font-size: 11px; color: var(--text-muted); font-family: monospace; margin-top: 2px;">📁 ${escapeHtml(c.file_path)}</div>
+          </div>
+          <button class="btn ${c.is_canonical ? 'btn-accent' : ''}" style="padding: 4px 12px; font-size: 11px;" onclick="applyDefconfigByPath('${escapeHtml(c.file_path)}', '${escapeHtml(c.name)}')">Apply Config</button>
+        </div>
+      `).join("");
+    }
+
+    async function applyCanonicalDefconfig() {
+      const canonical = currentDefconfigsData.canonical_default || (currentDefconfigsData.defconfigs && currentDefconfigsData.defconfigs[0]);
+      if (!canonical) {
+        alert("No canonical defconfig available for this architecture.");
+        return;
+      }
+      await applyDefconfigByPath(canonical.file_path, canonical.name);
+    }
+
+    async function applyDefconfigByPath(filePath, defconfigName) {
+      const arch = (currentTargetProfile && currentTargetProfile.arch) ? currentTargetProfile.arch : "x86";
+      const res = await apiFetch(`/api/version/${currentVersion}/kconfig/defconfig?file_path=${encodeURIComponent(filePath)}&arch=${encodeURIComponent(arch)}`);
+      if (!res || !res.values) {
+        alert(`Failed to load defconfig: ${filePath}`);
+        return;
+      }
+
+      // 1. Reset kconfigValues to clean baseline defaults
+      kconfigValues = {};
+      if (kconfigTreeData && kconfigTreeData.length > 0) {
+        kconfigTreeData.forEach(n => {
+          if (n.symbol_name) {
+            let defVal = "n";
+            if (n.def_val === "y" || n.def_val === "1") defVal = "y";
+            else if (n.def_val === "m") defVal = "m";
+            else if (n.def_val && n.symbol_type_name === "string") defVal = n.def_val.replace(/^"|"$/g, "");
+            else if (n.def_val) defVal = n.def_val;
+            kconfigValues[n.symbol_name] = defVal;
+          }
+        });
+      }
+
+      // 2. Overlay target architecture and compiler presets
+      if (currentTargetProfile && targetArchPresets[currentTargetProfile.arch]) {
+        Object.assign(kconfigValues, targetArchPresets[currentTargetProfile.arch].symbols || {});
+      }
+
+      // 3. Update target bitness from defconfig if present
+      if (res.bits) {
+        currentTargetProfile.bits = res.bits;
+        kconfigValues["64BIT"] = (res.bits === 64) ? "y" : "n";
+      }
+
+      // 4. Merge parsed defconfig values
+      Object.assign(kconfigValues, res.values);
+      currentLoadedDefconfig = {
+        name: defconfigName,
+        path: res.file_path || filePath,
+        symbolCount: res.symbol_count || Object.keys(res.values).length
+      };
+
+      // 5. Evaluate all Kconfig constraints (selects, depends_on, cascaded forced symbols)
+      evaluateKconfigConstraints();
+
+      // 6. Re-render UI
+      renderKconfigTree();
+      if (selectedKconfigNodeId) {
+        selectKconfigNode(selectedKconfigNodeId);
+      }
+      if (currentAppMode === "tui") renderTui();
+
+      // 7. Update active defconfig badge
+      updateActiveDefconfigBadge();
+
+      closeKconfigDefconfigModal();
+      closeTuiDefconfigModal();
+
+      console.log(`✅ Loaded defconfig "${defconfigName}" with ${currentLoadedDefconfig.symbolCount} symbols applied.`);
+    }
+
+    function updateActiveDefconfigBadge() {
+      const badge = document.getElementById("activeDefconfigBadge");
+      if (!badge) return;
+      if (currentLoadedDefconfig) {
+        badge.style.display = "inline-flex";
+        badge.innerText = `⚙️ Defconfig: ${currentLoadedDefconfig.name} (${currentLoadedDefconfig.symbolCount} symbols)`;
+        badge.title = `Active defconfig file: ${currentLoadedDefconfig.path}`;
+      } else {
+        badge.style.display = "none";
+      }
+    }
+
+    // TUI Defconfig Dialog Methods
+    async function openTuiDefconfigModal() {
+      await loadDefconfigsForCurrentArch();
+      const modal = document.getElementById("tuiDefconfigModal");
+      modal.classList.add("open");
+
+      document.getElementById("tuiDefconfigArchLabel").innerText = currentDefconfigsData.arch || "x86";
+      const canonical = currentDefconfigsData.canonical_default || (currentDefconfigsData.defconfigs && currentDefconfigsData.defconfigs[0]);
+      document.getElementById("tuiDefconfigCanonicalLabel").innerText = canonical ? canonical.name : "defconfig";
+
+      tuiDefconfigFilterQuery = "";
+      tuiSelectedDefconfigIdx = 0;
+      document.getElementById("tuiDefconfigSearch").value = "";
+      renderTuiDefconfigList();
+    }
+
+    function closeTuiDefconfigModal(e) {
+      if (e) e.stopPropagation();
+      document.getElementById("tuiDefconfigModal").classList.remove("open");
+      if (currentAppMode === "tui") document.getElementById("tuiWorkspace").focus();
+    }
+
+    function filterTuiDefconfigs(q) {
+      tuiDefconfigFilterQuery = (q || "").trim().toLowerCase();
+      tuiSelectedDefconfigIdx = 0;
+      renderTuiDefconfigList();
+    }
+
+    function renderTuiDefconfigList() {
+      const listEl = document.getElementById("tuiDefconfigList");
+      if (!listEl) return;
+
+      const configs = currentDefconfigsData.defconfigs || [];
+      const filtered = configs.filter(c => {
+        if (!tuiDefconfigFilterQuery) return true;
+        return c.name.toLowerCase().includes(tuiDefconfigFilterQuery) || c.file_path.toLowerCase().includes(tuiDefconfigFilterQuery);
+      });
+
+      if (filtered.length === 0) {
+        listEl.innerHTML = `<div style="color: #ff5555; padding: 6px;">No defconfigs matching "${escapeHtml(tuiDefconfigFilterQuery)}".</div>`;
+        return;
+      }
+
+      listEl.innerHTML = filtered.map((c, idx) => {
+        const isSelected = (idx === tuiSelectedDefconfigIdx);
+        return `
+          <div class="tui-item ${isSelected ? 'active' : ''}" style="padding: 4px 6px; cursor: pointer;" onclick="tuiSelectDefconfigRow(${idx})" ondblclick="applySelectedTuiDefconfig()">
+            <span style="color: #55ffff; font-weight: bold;">${c.is_canonical ? '(*)' : '( )'} ${escapeHtml(c.name)}</span>
+            <span style="color: #aaaaaa; margin-left: 8px;">[${escapeHtml(c.file_path)}]</span>
+          </div>
+        `;
+      }).join("");
+    }
+
+    function tuiSelectDefconfigRow(idx) {
+      tuiSelectedDefconfigIdx = idx;
+      renderTuiDefconfigList();
+    }
+
+    async function applySelectedTuiDefconfig() {
+      const configs = currentDefconfigsData.defconfigs || [];
+      const filtered = configs.filter(c => {
+        if (!tuiDefconfigFilterQuery) return true;
+        return c.name.toLowerCase().includes(tuiDefconfigFilterQuery) || c.file_path.toLowerCase().includes(tuiDefconfigFilterQuery);
+      });
+      const selected = filtered[tuiSelectedDefconfigIdx] || filtered[0];
+      if (!selected) return;
+      await applyDefconfigByPath(selected.file_path, selected.name);
+    }
+
+    async function applyCanonicalTuiDefconfig() {
+      await applyCanonicalDefconfig();
+    }
+
+    // =========================================================================
+    // CODE VIEWER KCONFIG SYMBOL INSPECTION MODAL HANDLERS
+    // =========================================================================
+    let activeCodeModalSymbol = null;
+
+    async function openKconfigSymbolModal(symName, event) {
+      if (event) {
+        event.stopPropagation();
+        if (event.preventDefault) event.preventDefault();
+      }
+
+      const cleanName = symName.startsWith("CONFIG_") ? symName.slice(7) : symName;
+      activeCodeModalSymbol = cleanName;
+
+      const modal = document.getElementById("kconfigSymbolInfoModal");
+      const titleEl = document.getElementById("codeSymModalTitle");
+      const typeBadgeEl = document.getElementById("codeSymModalTypeBadge");
+      const bodyEl = document.getElementById("codeSymModalBody");
+
+      titleEl.innerText = `CONFIG_${cleanName}`;
+      typeBadgeEl.innerText = "...";
+      typeBadgeEl.className = "kconfig-type-tag";
+      bodyEl.innerHTML = `<div style="padding: 24px; text-align: center; color: var(--accent);">⏳ Loading Kconfig symbol details for CONFIG_${escapeHtml(cleanName)}...</div>`;
+      modal.classList.add("open");
+
+      const symData = await apiFetch(`/api/version/${currentVersion}/kconfig/symbol/${encodeURIComponent(cleanName)}`);
+      if (!symData) {
+        bodyEl.innerHTML = `
+          <div style="padding: 20px; color: var(--danger);">
+            <h4>Symbol "CONFIG_${escapeHtml(cleanName)}" not found in version ${currentVersion}</h4>
+            <p style="font-size: 12px; color: var(--text-muted); margin-top: 8px;">
+              This macro might be conditionally generated by toolchains, defined in an unindexed architecture, or an internal preprocessor definition.
+            </p>
+          </div>
+        `;
+        return;
+      }
+
+      typeBadgeEl.innerText = symData.type_name || "config";
+      typeBadgeEl.className = `kconfig-type-tag kconfig-tag-${symData.type_name}`;
+
+      const curVal = (kconfigValues && kconfigValues[cleanName] !== undefined) ? kconfigValues[cleanName] : (symData.def_val || "n");
+      const isForced = Boolean(kconfigForcedSymbols[cleanName]);
+      const isUnmet = Boolean(kconfigUnmetDependencies[cleanName] && !isForced);
+
+      let constraintNoticeHtml = "";
+      if (isForced) {
+        constraintNoticeHtml = `
+          <div style="padding: 6px 10px; background: rgba(229,192,123,0.15); border: 1px solid rgba(229,192,123,0.4); border-radius: 4px; color: #e5c07b; font-size: 11px; margin-bottom: 8px;">
+            🔒 <strong>Forced Active</strong> by [Selected By]: ${kconfigForcedSymbols[cleanName].forcedBy.map(s => 'CONFIG_' + s).join(', ')}. Disabling is prohibited until selecting symbols are disabled.
+          </div>
+        `;
+      } else if (isUnmet) {
+        constraintNoticeHtml = `
+          <div style="padding: 6px 10px; background: rgba(255,85,85,0.15); border: 1px solid rgba(255,85,85,0.4); border-radius: 4px; color: #ff5555; font-size: 11px; margin-bottom: 8px;">
+            ⚠️ <strong>Unmet Dependency</strong>: ${kconfigUnmetDependencies[cleanName].join(' && ')}. Enabling is prohibited until required dependencies are satisfied.
+          </div>
+        `;
+      }
+
+      let valEditorHtml = "";
+      if (symData.type === 1) {
+        valEditorHtml = `
+          ${constraintNoticeHtml}
+          <div style="display: flex; gap: 8px; align-items: center;">
+            <button class="btn ${curVal === 'y' ? 'btn-accent' : ''}" ${isUnmet ? 'disabled style="opacity: 0.5; cursor: not-allowed;" title="Disabled: Unmet dependency"' : ''} onclick="setKconfigSymbolValueFromCode('${cleanName}', 'y')">[*] Built-in (y)</button>
+            <button class="btn ${curVal === 'n' ? 'btn-accent' : ''}" ${isForced ? 'disabled style="opacity: 0.5; cursor: not-allowed;" title="Disabled: Forced active by Selected By"' : ''} onclick="setKconfigSymbolValueFromCode('${cleanName}', 'n')">[ ] Excluded (n)</button>
+          </div>
+        `;
+      } else if (symData.type === 2) {
+        valEditorHtml = `
+          ${constraintNoticeHtml}
+          <div style="display: flex; gap: 8px; align-items: center;">
+            <button class="btn ${curVal === 'y' ? 'btn-accent' : ''}" ${isUnmet ? 'disabled style="opacity: 0.5; cursor: not-allowed;" title="Disabled: Unmet dependency"' : ''} onclick="setKconfigSymbolValueFromCode('${cleanName}', 'y')">&lt;*&gt; Built-in (y)</button>
+            <button class="btn ${curVal === 'm' ? 'btn-accent' : ''}" ${isUnmet ? 'disabled style="opacity: 0.5; cursor: not-allowed;" title="Disabled: Unmet dependency"' : ''} onclick="setKconfigSymbolValueFromCode('${cleanName}', 'm')">&lt;M&gt; Module (m)</button>
+            <button class="btn ${curVal === 'n' ? 'btn-accent' : ''}" ${isForced ? 'disabled style="opacity: 0.5; cursor: not-allowed;" title="Disabled: Forced active by Selected By"' : ''} onclick="setKconfigSymbolValueFromCode('${cleanName}', 'n')">&lt; &gt; Excluded (n)</button>
+          </div>
+        `;
+      } else {
+        valEditorHtml = `
+          ${constraintNoticeHtml}
+          <div style="display: flex; gap: 8px; align-items: center;">
+            <input type="text" class="kconfig-input" id="codeModalInputVal_${cleanName}" value="${escapeHtml(curVal)}" style="max-width: 250px;">
+            <button class="btn btn-accent" onclick="setKconfigSymbolValueFromCode('${cleanName}', document.getElementById('codeModalInputVal_${cleanName}').value)">Apply</button>
+          </div>
+        `;
+      }
+
+      bodyEl.innerHTML = `
+        <div style="background: var(--bg-sidebar); padding: 14px 16px; border-radius: 6px; border: 1px solid var(--border-color); margin-bottom: 12px;">
+          <div style="font-size: 14px; font-weight: bold; color: var(--text-bright); margin-bottom: 4px;">
+            "${escapeHtml(symData.prompt || 'Configuration Option')}"
+          </div>
+          ${symData.file_path ? `
+            <div style="font-size: 11px; color: var(--text-muted); margin-top: 4px;">
+              📁 Defined at: <span class="crumb-link" onclick="closeKconfigSymbolModal(); openPath('${escapeHtml(symData.file_path)}')">${escapeHtml(symData.file_path)}:${symData.line_s || 1}</span>
+            </div>
+          ` : ''}
+        </div>
+
+        <div style="margin-bottom: 14px; padding: 10px 14px; background: var(--bg-card); border-radius: 6px; border: 1px solid var(--border-color);">
+          <label style="font-size: 11px; color: var(--text-muted); display: block; margin-bottom: 6px; font-weight: bold;">ACTIVE VALUE IN WORKSPACE:</label>
+          ${valEditorHtml}
+        </div>
+
+        ${symData.compiled_files && symData.compiled_files.length > 0 ? `
+          <div style="margin-bottom: 14px;">
+            <h4 style="font-size: 11px; color: var(--accent); margin-bottom: 6px; text-transform: uppercase;">📦 Compiled Source Files (Kbuild)</h4>
+            <div style="max-height: 120px; overflow-y: auto; background: var(--bg-sidebar); border: 1px solid var(--border-color); border-radius: 4px; padding: 6px 10px; font-family: monospace; font-size: 11px;">
+              ${symData.compiled_files.map(f => `
+                <div style="padding: 2px 0; display: flex; justify-content: space-between;">
+                  <span class="crumb-link" onclick="closeKconfigSymbolModal(); openPath('${escapeHtml(f.file_path)}')">📄 ${escapeHtml(f.file_path)}</span>
+                  <span style="color: var(--text-muted); font-size: 10px;">${escapeHtml(f.compile_mode)}</span>
+                </div>
+              `).join('')}
+            </div>
+          </div>
+        ` : ''}
+
+        <div style="margin-bottom: 14px;">
+          <h4 style="font-size: 11px; color: var(--accent); margin-bottom: 6px; text-transform: uppercase;">Help & Documentation</h4>
+          <div class="kconfig-help-box" style="max-height: 140px; overflow-y: auto;">${escapeHtml(symData.help || 'No help text provided.')}</div>
+        </div>
+
+        ${symData.depends_on && symData.depends_on.length > 0 ? `
+          <div style="margin-bottom: 12px;">
+            <h4 style="font-size: 11px; color: var(--text-bright); margin-bottom: 6px; text-transform: uppercase;">Direct Dependencies (Depends On)</h4>
+            <div class="kconfig-dep-list">
+              ${symData.depends_on.map(d => `<span class="kconfig-dep-chip" onclick="openKconfigSymbolModal('${escapeHtml(d)}', event)">${escapeHtml(d)}</span>`).join('')}
+            </div>
+          </div>
+        ` : ''}
+
+        ${symData.selects && symData.selects.length > 0 ? `
+          <div style="margin-bottom: 12px;">
+            <h4 style="font-size: 11px; color: var(--text-bright); margin-bottom: 6px; text-transform: uppercase;">Selects</h4>
+            <div class="kconfig-dep-list">
+              ${symData.selects.map(d => `<span class="kconfig-dep-chip" onclick="openKconfigSymbolModal('${escapeHtml(d)}', event)">${escapeHtml(d)}</span>`).join('')}
+            </div>
+          </div>
+        ` : ''}
+
+        ${symData.selected_by && symData.selected_by.length > 0 ? `
+          <div style="margin-bottom: 12px;">
+            <h4 style="font-size: 11px; color: var(--text-bright); margin-bottom: 6px; text-transform: uppercase;">Selected By</h4>
+            <div class="kconfig-dep-list">
+              ${symData.selected_by.map(d => `<span class="kconfig-dep-chip" onclick="openKconfigSymbolModal('${escapeHtml(d.name)}', event)">${escapeHtml(d.name)}</span>`).join('')}
+            </div>
+          </div>
+        ` : ''}
+      `;
+    }
+
+    function closeKconfigSymbolModal(e) {
+      if (e && e.target && !e.target.classList.contains("modal-overlay") && !e.target.classList.contains("btn")) return;
+      document.getElementById("kconfigSymbolInfoModal").classList.remove("open");
+    }
+
+    function setKconfigSymbolValueFromCode(symName, val) {
+      kconfigValues[symName] = val;
+      renderKconfigTree();
+      if (currentAppMode === "tui") renderTui();
+      openKconfigSymbolModal(symName);
+    }
+
+    function jumpFromCodeToKconfig() {
+      if (!activeCodeModalSymbol) return;
+      const sym = activeCodeModalSymbol;
+      document.getElementById("kconfigSymbolInfoModal").classList.remove("open");
+      switchAppMode("kconfig");
+      jumpToKconfigSymbol(sym);
+    }
+
+    function switchAppMode(mode) {
+      currentAppMode = mode;
+      document.getElementById("btnModeExplorer").classList.toggle("active", mode === "explorer");
+      document.getElementById("btnModeKconfig").classList.toggle("active", mode === "kconfig");
+      document.getElementById("btnModeTui").classList.toggle("active", mode === "tui");
+      const btnMaint = document.getElementById("btnModeMaintainers");
+      if (btnMaint) btnMaint.classList.toggle("active", mode === "maintainers");
+      const btnCred = document.getElementById("btnModeCredits");
+      if (btnCred) btnCred.classList.toggle("active", mode === "credits");
+
+      const explorerWs = document.getElementById("explorerWorkspace");
+      const kconfigWs = document.getElementById("kconfigWorkspace");
+      const tuiWs = document.getElementById("tuiWorkspace");
+      const maintainersWs = document.getElementById("maintainersWorkspace");
+      const creditsWs = document.getElementById("creditsWorkspace");
+
+      if (explorerWs) explorerWs.style.display = (mode === "explorer") ? "flex" : "none";
+      if (kconfigWs) kconfigWs.style.display = (mode === "kconfig") ? "flex" : "none";
+      if (tuiWs) tuiWs.style.display = (mode === "tui") ? "flex" : "none";
+      if (maintainersWs) maintainersWs.style.display = (mode === "maintainers") ? "flex" : "none";
+      if (creditsWs) creditsWs.style.display = (mode === "credits") ? "flex" : "none";
+
+      if (mode === "kconfig" || mode === "tui") {
+        if (kconfigLoadedVersion !== currentVersion) {
+          loadKconfigTree();
+        } else if (mode === "tui") {
+          renderTui();
+          tuiWs.focus();
+        } else {
+          renderKconfigTree();
+        }
+      } else if (mode === "maintainers") {
+        if (maintainersLoadedVersion !== currentVersion) {
+          loadMaintainersData();
+        } else {
+          filterMaintainers();
+        }
+      } else if (mode === "credits") {
+        if (creditsLoadedVersion !== currentVersion) {
+          loadCreditsData();
+        } else {
+          filterCredits();
+        }
+      }
+    }
+
+    // =========================================================================
+    // KCONFIG EXPRESSION & CONSTRAINT PROPAGATION ENGINE
+    // =========================================================================
+    function evalKconfigExpr(exprStr, values) {
+      if (!exprStr) return "y";
+      let s = String(exprStr).trim();
+      if (!s) return "y";
+
+      // Handle simple expressions or tokenized expressions
+      // Remove outer parentheses if matching
+      if (s.startsWith("(") && s.endsWith(")")) {
+        let depth = 0;
+        let balanced = true;
+        for (let i = 0; i < s.length - 1; i++) {
+          if (s[i] === "(") depth++;
+          else if (s[i] === ")") depth--;
+          if (depth === 0) { balanced = false; break; }
+        }
+        if (balanced) return evalKconfigExpr(s.slice(1, -1), values);
+      }
+
+      // Handle || (logical OR: max of branches)
+      let orBranches = splitTopLevelKconfig(s, "||");
+      if (orBranches.length > 1) {
+        let maxVal = "n";
+        for (let b of orBranches) {
+          let res = evalKconfigExpr(b, values);
+          if (res === "y") return "y";
+          if (res === "m") maxVal = "m";
+        }
+        return maxVal;
+      }
+
+      // Handle && (logical AND: min of branches)
+      let andBranches = splitTopLevelKconfig(s, "&&");
+      if (andBranches.length > 1) {
+        let minVal = "y";
+        for (let b of andBranches) {
+          let res = evalKconfigExpr(b, values);
+          if (res === "n") return "n";
+          if (res === "m") minVal = "m";
+        }
+        return minVal;
+      }
+
+      // Handle ! (logical NOT)
+      if (s.startsWith("!")) {
+        let res = evalKconfigExpr(s.slice(1), values);
+        return (res === "n") ? "y" : "n";
+      }
+
+      // Handle comparisons: A = y, A != n, A = "val"
+      if (s.includes("!=")) {
+        let parts = s.split("!=").map(p => p.trim());
+        let l = evalKconfigTerm(parts[0], values);
+        let r = evalKconfigTerm(parts[1], values);
+        return (l !== r) ? "y" : "n";
+      }
+      if (s.includes("=")) {
+        let parts = s.split("=").map(p => p.trim());
+        let l = evalKconfigTerm(parts[0], values);
+        let r = evalKconfigTerm(parts[1], values);
+        return (l === r) ? "y" : "n";
+      }
+
+      return evalKconfigTerm(s, values);
+    }
+
+    function splitTopLevelKconfig(s, delim) {
+      let parts = [];
+      let depth = 0;
+      let cur = "";
+      for (let i = 0; i < s.length; i++) {
+        if (s[i] === "(") depth++;
+        else if (s[i] === ")") depth--;
+
+        if (depth === 0 && s.substring(i, i + delim.length) === delim) {
+          parts.push(cur.trim());
+          cur = "";
+          i += delim.length - 1;
+        } else {
+          cur += s[i];
+        }
+      }
+      if (cur.trim()) parts.push(cur.trim());
+      return parts;
+    }
+
+    function evalKconfigTerm(term, values) {
+      let t = term.trim().replace(/^"|"$/g, "");
+      if (t === "y" || t === "1") return "y";
+      if (t === "m") return "m";
+      if (t === "n" || t === "0" || !t) return "n";
+      let sym = t.startsWith("CONFIG_") ? t.slice(7) : t;
+      return values[sym] || "n";
+    }
+
+    function evaluateKconfigConstraints() {
+      // Step 1: Iteratively compute forced minimum values from active symbols with `selects`
+      kconfigForcedSymbols = {};
+      let changed = true;
+      let pass = 0;
+
+      while (changed && pass < 20) {
+        changed = false;
+        pass++;
+
+        Object.keys(kconfigValues).forEach(sym => {
+          const val = kconfigValues[sym];
+          if (val === "y" || val === "m") {
+            const rel = kconfigRelations[sym] || (kconfigSymbolsByName[sym] ? { selects: kconfigSymbolsByName[sym].selects || [] } : null);
+            if (rel && rel.selects && rel.selects.length > 0) {
+              rel.selects.forEach(target => {
+                const targetSym = target.startsWith("CONFIG_") ? target.slice(7) : target;
+                const forcedVal = (val === "y") ? "y" : "m";
+
+                if (!kconfigForcedSymbols[targetSym]) {
+                  kconfigForcedSymbols[targetSym] = { forcedValue: forcedVal, forcedBy: [sym] };
+                  if (kconfigValues[targetSym] !== forcedVal) {
+                    kconfigValues[targetSym] = forcedVal;
+                    changed = true;
+                  }
+                } else {
+                  if (!kconfigForcedSymbols[targetSym].forcedBy.includes(sym)) {
+                    kconfigForcedSymbols[targetSym].forcedBy.push(sym);
+                  }
+                  if (forcedVal === "y" && kconfigForcedSymbols[targetSym].forcedValue !== "y") {
+                    kconfigForcedSymbols[targetSym].forcedValue = "y";
+                    if (kconfigValues[targetSym] !== "y") {
+                      kconfigValues[targetSym] = "y";
+                      changed = true;
+                    }
+                  }
+                }
+              });
+            }
+          }
+        });
+      }
+
+      // Step 2: Evaluate `depends_on` satisfaction for all symbols
+      kconfigUnmetDependencies = {};
+
+      Object.keys(kconfigSymbolsByName).forEach(sym => {
+        const node = kconfigSymbolsByName[sym];
+        const rel = kconfigRelations[sym] || node;
+        const deps = (rel && rel.depends_on) ? rel.depends_on : (node.depends_on || []);
+
+        if (deps && deps.length > 0) {
+          const unmetList = [];
+          deps.forEach(depExpr => {
+            const res = evalKconfigExpr(depExpr, kconfigValues);
+            if (res === "n") {
+              unmetList.push(depExpr);
+            }
+          });
+
+          if (unmetList.length > 0) {
+            kconfigUnmetDependencies[sym] = unmetList;
+            // If symbol is not forced by a select, clamp value to 'n' (except protected core arch/bitness symbols)
+            const isProtectedArchSym = ["64BIT", "32BIT", "X86", "X86_64", "X86_32", "ARM", "ARM64", "RISCV", "PPC", "PPC64"].includes(sym);
+            if (!isProtectedArchSym && !kconfigForcedSymbols[sym] && (kconfigValues[sym] === "y" || kconfigValues[sym] === "m")) {
+              kconfigValues[sym] = "n";
+            }
+          }
+        }
+      });
+
+      // Step 3: Synchronize derived architecture and bitness state
+      const is64 = (kconfigValues["64BIT"] === "y");
+      if (currentTargetProfile) {
+        currentTargetProfile.bits = is64 ? 64 : 32;
+      }
+      if (currentTargetProfile && (currentTargetProfile.arch === "x86" || currentTargetProfile.arch === "x86_64" || currentTargetProfile.arch === "i386")) {
+        kconfigValues["X86_64"] = is64 ? "y" : "n";
+        kconfigValues["X86_32"] = is64 ? "n" : "y";
+      }
+    }
+
+    async function loadKconfigTree() {
+      const panel = document.getElementById("kconfigTreePanel");
+      panel.innerHTML = `<div style="padding: 24px; text-align: center; color: var(--accent);">⏳ Loading Kconfig hierarchy for version <strong>${currentVersion}</strong> (${currentTargetProfile.arch})...</div>`;
+      
+      const res = await apiFetch(`/api/version/${currentVersion}/kconfig/tree?arch=${encodeURIComponent(currentTargetProfile.arch || 'x86')}`);
+      if (!res || !res.nodes) {
+        panel.innerHTML = `<div style="padding: 24px; text-align: center; color: var(--danger);">⚠️ Failed to load Kconfig tree. Verify database connection and that Kconfig tables are populated.</div>`;
+        return;
+      }
+
+      kconfigTreeData = res.nodes;
+      kconfigRelations = res.relations || {};
+      kconfigReverseRelations = res.reverse_relations || {};
+      kconfigLoadedVersion = currentVersion;
+      kconfigNodesById = {};
+      kconfigSymbolsByName = {};
+      kconfigCurrentMenuId = 0;
+      kconfigMenuHistory = [{ id: 0, title: "Main Menu" }];
+
+      await loadTargetProfilePresets();
+
+      kconfigTreeData.forEach(n => {
+        kconfigNodesById[n.tree_id] = n;
+        if (n.symbol_name) {
+          kconfigSymbolsByName[n.symbol_name] = n;
+          if (kconfigValues[n.symbol_name] === undefined) {
+            let defVal = "n";
+            if (n.def_val === "y" || n.def_val === "1") defVal = "y";
+            else if (n.def_val === "m") defVal = "m";
+            else if (n.def_val && n.symbol_type_name === "string") defVal = n.def_val.replace(/^"|"$/g, "");
+            else if (n.def_val) defVal = n.def_val;
+            kconfigValues[n.symbol_name] = defVal;
+            kconfigInitialDefaults[n.symbol_name] = defVal;
+          }
+        }
+        if (n.parent_id === 0) {
+          kconfigExpandedNodes.add(n.tree_id);
+        }
+      });
+
+      evaluateKconfigConstraints();
+
+      // Auto-load canonical defconfig if none loaded yet
+      if (!currentLoadedDefconfig && res.nodes && res.nodes.length > 0) {
+        try {
+          const dRes = await loadDefconfigsForCurrentArch();
+          const canonical = dRes.canonical_default || (dRes.defconfigs && dRes.defconfigs[0]);
+          if (canonical) {
+            const cContent = await apiFetch(`/api/version/${currentVersion}/kconfig/defconfig?file_path=${encodeURIComponent(canonical.file_path)}&arch=${encodeURIComponent(currentTargetProfile.arch || 'x86')}`);
+            if (cContent && cContent.values) {
+              Object.assign(kconfigValues, cContent.values);
+              currentLoadedDefconfig = {
+                name: canonical.name,
+                path: cContent.file_path || canonical.file_path,
+                symbolCount: cContent.symbol_count || Object.keys(cContent.values).length
+              };
+              evaluateKconfigConstraints();
+              updateActiveDefconfigBadge();
+            }
+          }
+        } catch (err) {
+          console.debug("Could not auto-load canonical defconfig:", err);
+        }
+      }
+
+      if (currentAppMode === "tui") {
+        renderTui();
+        document.getElementById("tuiWorkspace").focus();
+      } else {
+        renderKconfigTree();
+      }
+    }
+
+    // -------------------------------------------------------------------------
+    // HIERARCHICAL DRILL-DOWN & GUI TREE RENDERING
+    // -------------------------------------------------------------------------
+    function toggleKconfigDrillDownMode() {
+      kconfigDrillDownMode = !kconfigDrillDownMode;
+      const btn = document.getElementById("btnKconfigViewMode");
+      btn.innerText = kconfigDrillDownMode ? "🔀 Mode: Drill-Down" : "🔀 Mode: Full Tree";
+      renderKconfigTree();
+    }
+
+    function kconfigDrillInto(treeId, title) {
+      kconfigCurrentMenuId = treeId;
+      kconfigMenuHistory.push({ id: treeId, title: title || "Submenu" });
+      renderKconfigTree();
+      if (currentAppMode === "tui") {
+        tuiActiveIndex = 0;
+        renderTui();
+      }
+    }
+
+    function kconfigNavigateUp() {
+      if (kconfigMenuHistory.length > 1) {
+        kconfigMenuHistory.pop();
+        kconfigCurrentMenuId = kconfigMenuHistory[kconfigMenuHistory.length - 1].id;
+        renderKconfigTree();
+        if (currentAppMode === "tui") {
+          tuiActiveIndex = 0;
+          renderTui();
+        }
+      }
+    }
+
+    function kconfigBreadcrumbClick(idx) {
+      if (idx >= 0 && idx < kconfigMenuHistory.length) {
+        kconfigMenuHistory = kconfigMenuHistory.slice(0, idx + 1);
+        kconfigCurrentMenuId = kconfigMenuHistory[kconfigMenuHistory.length - 1].id;
+        renderKconfigTree();
+        if (currentAppMode === "tui") {
+          tuiActiveIndex = 0;
+          renderTui();
+        }
+      }
+    }
+
+    function updateKconfigBreadcrumbs() {
+      const bcEl = document.getElementById("kconfigBreadcrumbs");
+      const backBtn = document.getElementById("kconfigBackBtn");
+      backBtn.disabled = (kconfigMenuHistory.length <= 1);
+
+      bcEl.innerHTML = kconfigMenuHistory.map((item, idx) => {
+        const isLast = (idx === kconfigMenuHistory.length - 1);
+        if (isLast) {
+          return `<strong style="color: var(--text-bright);">${escapeHtml(item.title)}</strong>`;
+        }
+        return `<span class="crumb-link" onclick="kconfigBreadcrumbClick(${idx})">${escapeHtml(item.title)}</span> &gt; `;
+      }).join("");
+    }
+
+    function getScopedKconfigItems(parentId) {
+      return kconfigTreeData.filter(n => (n.parent_id || 0) === parentId);
+    }
+
+    function renderKconfigTree() {
+      const panel = document.getElementById("kconfigTreePanel");
+      if (!kconfigTreeData || kconfigTreeData.length === 0) {
+        panel.innerHTML = `<div style="padding: 24px; color: var(--text-muted); text-align: center;">No Kconfig entries found for version ${currentVersion}.</div>`;
+        return;
+      }
+
+      updateKconfigBreadcrumbs();
+
+      const childrenByParent = {};
+      kconfigTreeData.forEach(n => {
+        const pid = n.parent_id || 0;
+        if (!childrenByParent[pid]) childrenByParent[pid] = [];
+        childrenByParent[pid].push(n);
+      });
+
+      const query = (kconfigSearchQuery || "").trim().toUpperCase();
+      const typeFilter = kconfigTypeFilter;
+      const isSearching = Boolean(query || typeFilter);
+
+      function renderNodeRow(node, depth, isSearchResult = false) {
+        const isMenu = node.node_type === 1;
+        const isChoice = node.node_type === 2;
+        const isConfig = node.node_type === 3 || node.node_type === 4;
+        const isMenuConfig = node.node_type === 4;
+        const isComment = node.node_type === 5;
+        const hasChildren = Boolean(childrenByParent[node.tree_id] && childrenByParent[node.tree_id].length > 0);
+        const isExpanded = kconfigExpandedNodes.has(node.tree_id);
+        const isSelected = selectedKconfigNodeId === node.tree_id;
+
+        let controlHtml = "";
+        const isForced = Boolean(node.symbol_name && kconfigForcedSymbols[node.symbol_name]);
+        const isUnmet = Boolean(node.symbol_name && kconfigUnmetDependencies[node.symbol_name] && !isForced);
+
+        if (isConfig) {
+          const symVal = (node.symbol_name && kconfigValues[node.symbol_name]) !== undefined ? kconfigValues[node.symbol_name] : (node.def_val || "n");
+          const isTristate = (node.symbol_type === 2 || node.symbol_type === "2" || node.symbol_type_name === "tristate");
+          const isBool = (node.symbol_type === 1 || node.symbol_type === "1" || node.symbol_type_name === "bool");
+
+          if (isBool) {
+            const isChecked = symVal === "y";
+            const lockTitle = isForced ? `Forced active by Selected By: ${kconfigForcedSymbols[node.symbol_name].forcedBy.join(', ')}` : (isUnmet ? `Unmet dependencies: ${kconfigUnmetDependencies[node.symbol_name].join(' && ')}` : '');
+            controlHtml = `<span class="kconfig-toggle-btn ${isChecked ? 'state-y' : 'state-n'} ${isForced ? 'state-locked' : ''}" onclick="toggleKconfigNodeValue(${node.tree_id}, event)" title="${escapeHtml(lockTitle)}">[${isChecked ? (isForced ? '*-' : '*') : ' '}]</span>`;
+          } else if (isTristate) {
+            let stateClass = "state-n";
+            let stateDisplay = "&lt; &gt;";
+            if (symVal === "y") { stateClass = "state-y"; stateDisplay = isForced ? "&lt;*-&gt;" : "&lt;*&gt;"; }
+            else if (symVal === "m") { stateClass = "state-m"; stateDisplay = "&lt;M&gt;"; }
+            const lockTitle = isForced ? `Forced active by Selected By: ${kconfigForcedSymbols[node.symbol_name].forcedBy.join(', ')}` : (isUnmet ? `Unmet dependencies: ${kconfigUnmetDependencies[node.symbol_name].join(' && ')}` : '');
+            controlHtml = `<span class="kconfig-toggle-btn ${stateClass} ${isForced ? 'state-locked' : ''}" onclick="toggleKconfigNodeValue(${node.tree_id}, event)" title="${escapeHtml(lockTitle)}">${stateDisplay}</span>`;
+          } else if (node.symbol_type >= 3) {
+            controlHtml = `<span class="badge" style="font-size: 11px; font-family: monospace;">(${escapeHtml(symVal || '')})</span>`;
+          }
+        } else if (isMenu) {
+          controlHtml = `<span style="color: #56b6c2; font-weight: bold;">[--->]</span>`;
+        } else if (isChoice) {
+          controlHtml = `<span style="color: var(--hl-macro); font-weight: bold;">( Choice )</span>`;
+        } else if (isComment) {
+          controlHtml = `<span style="color: var(--text-muted); font-style: italic;">***</span>`;
+        }
+
+        let typeBadge = "";
+        if (node.symbol_type_name) {
+          typeBadge = `<span class="kconfig-type-tag kconfig-tag-${node.symbol_type_name}">${node.symbol_type_name}</span>`;
+        } else if (isMenu) {
+          typeBadge = `<span class="kconfig-type-tag kconfig-tag-menu">menu</span>`;
+        } else if (isChoice) {
+          typeBadge = `<span class="kconfig-type-tag kconfig-tag-choice">choice</span>`;
+        }
+
+        let constraintBadge = "";
+        if (isForced) {
+          constraintBadge = `<span class="badge" style="background: rgba(229,192,123,0.2); color: #e5c07b; font-size: 10px; margin-left: 4px;" title="Forced active by: ${kconfigForcedSymbols[node.symbol_name].forcedBy.join(', ')}">🔒 Forced</span>`;
+        } else if (isUnmet) {
+          constraintBadge = `<span class="badge" style="background: rgba(255,85,85,0.2); color: #ff5555; font-size: 10px; margin-left: 4px;" title="Unmet dependency: ${kconfigUnmetDependencies[node.symbol_name].join(' && ')}">⚠️ Unmet</span>`;
+        }
+
+        const indentPx = (kconfigDrillDownMode || isSearchResult) ? 8 : (depth * 18 + 6);
+        let drillAction = "";
+        let drillButton = "";
+        if (!isSearchResult && kconfigDrillDownMode && (isMenu || isChoice || (isMenuConfig && hasChildren))) {
+          drillAction = `ondblclick="kconfigDrillInto(${node.tree_id}, '${escapeHtml(node.title || node.symbol_name || 'Submenu')}')"`;
+          drillButton = `<button class="btn" style="padding: 1px 6px; font-size: 10px; margin-left: auto;" onclick="kconfigDrillInto(${node.tree_id}, '${escapeHtml(node.title || node.symbol_name || 'Submenu')}'); event.stopPropagation();">Enter &gt;</button>`;
+        }
+
+        let pathHint = "";
+        if (isSearchResult && node.file_path) {
+          pathHint = `<span style="font-size: 10px; color: var(--text-muted); margin-left: 6px; font-family: monospace;">(${escapeHtml(node.file_path)})</span>`;
+        }
+
+        let html = `
+          <div class="kconfig-item ${isSelected ? 'selected' : ''}" style="padding-left: ${indentPx}px;" onclick="selectKconfigNode(${node.tree_id})" ${drillAction}>
+            ${controlHtml}
+            <span style="color: var(--text-bright); font-weight: ${isMenu ? 'bold' : 'normal'};">
+              ${escapeHtml(node.title || node.symbol_name || 'Item')}
+            </span>
+            ${isMenu ? `<span style="color: #56b6c2; font-size: 11px;">---></span>` : ''}
+            ${node.symbol_name ? `<span style="color: var(--text-muted); font-size: 11px;">(CONFIG_${escapeHtml(node.symbol_name)})</span>` : ''}
+            ${typeBadge}
+            ${constraintBadge}
+            ${pathHint}
+            ${drillButton}
+          </div>
+        `;
+
+        // If not in search and not in drill-down mode, recursively expand children
+        if (!isSearchResult && !kconfigDrillDownMode && hasChildren && isExpanded) {
+          childrenByParent[node.tree_id].forEach(child => {
+            html += renderNodeRow(child, depth + 1, false);
+          });
+        }
+
+        return html;
+      }
+
+      // --- 1. Global Search Mode across all directories for this version ---
+      if (isSearching) {
+        const rawQuery = (kconfigSearchQuery || "").trim().toUpperCase();
+        const cleanQuery = rawQuery.startsWith("CONFIG_") ? rawQuery.slice(7) : rawQuery;
+
+        const matchedNodes = kconfigTreeData.filter(node => {
+          if (typeFilter) {
+            const matchesType = (node.symbol_type_name === typeFilter) || (node.node_type_name === typeFilter);
+            if (!matchesType) return false;
+          }
+          if (!rawQuery) return true;
+          const sName = (node.symbol_name || "").toUpperCase();
+          const sFullConfig = sName ? ("CONFIG_" + sName) : "";
+          const sTitle = (node.title || "").toUpperCase();
+          const sPrompt = (node.prompt || "").toUpperCase();
+          const sHelp = (node.help || "").toUpperCase();
+          const sFile = (node.file_path || "").toUpperCase();
+
+          return (cleanQuery && sName.includes(cleanQuery)) ||
+                 sFullConfig.includes(rawQuery) ||
+                 sTitle.includes(rawQuery) ||
+                 (cleanQuery && sTitle.includes(cleanQuery)) ||
+                 sPrompt.includes(rawQuery) ||
+                 (cleanQuery && sPrompt.includes(cleanQuery)) ||
+                 sHelp.includes(rawQuery) ||
+                 (cleanQuery && sHelp.includes(cleanQuery)) ||
+                 (cleanQuery && sFile.includes(cleanQuery));
+        });
+
+        document.getElementById("kconfigScopeCount").innerText = `🔍 Found ${matchedNodes.length} matching Kconfig symbol(s) across all directories in ${currentVersion}`;
+
+        const bcEl = document.getElementById("kconfigBreadcrumbs");
+        const backBtn = document.getElementById("kconfigBackBtn");
+        backBtn.disabled = true;
+        bcEl.innerHTML = `
+          <span style="color: var(--text-muted);">Global Search:</span>
+          <strong style="color: #55ffff;">"${escapeHtml(kconfigSearchQuery)}"</strong>
+          <span style="font-size: 11px; color: var(--text-muted); margin-left: 4px;">(${matchedNodes.length} matches across all directories)</span>
+          <button class="btn" style="padding: 1px 8px; font-size: 10px; margin-left: 8px;" onclick="clearKconfigSearch()">✕ Clear Search</button>
+        `;
+
+        let renderedHtml = "";
+        if (matchedNodes.length === 0) {
+          renderedHtml = `<div style="padding: 32px; color: var(--text-muted); text-align: center;">No Kconfig symbols matching "<strong>${escapeHtml(kconfigSearchQuery)}</strong>" found in version ${currentVersion}.</div>`;
+        } else {
+          matchedNodes.forEach(item => {
+            renderedHtml += renderNodeRow(item, 0, true);
+          });
+        }
+
+        panel.innerHTML = renderedHtml;
+        return;
+      }
+
+      // --- 2. Scoped Directory Navigation Mode (Reverts automatically when search is empty) ---
+      updateKconfigBreadcrumbs();
+
+      let renderedHtml = "";
+      if (kconfigDrillDownMode) {
+        const scopedItems = childrenByParent[kconfigCurrentMenuId] || [];
+        document.getElementById("kconfigScopeCount").innerText = `Showing ${scopedItems.length} items in current menu`;
+        if (kconfigCurrentMenuId !== 0) {
+          renderedHtml += `
+            <div class="kconfig-item" style="padding-left: 8px; color: var(--accent); font-weight: bold; border-bottom: 1px dashed var(--border-color); margin-bottom: 4px;" onclick="kconfigNavigateUp()">
+              <span>[ ⬆ .. ]</span> <span>Up to Parent Menu</span>
+            </div>
+          `;
+        }
+        scopedItems.forEach(item => {
+          renderedHtml += renderNodeRow(item, 0, false);
+        });
+      } else {
+        const roots = childrenByParent[0] || kconfigTreeData.filter(n => !n.parent_id || n.parent_id === 0);
+        document.getElementById("kconfigScopeCount").innerText = `Showing full tree hierarchy (${kconfigTreeData.length} items)`;
+        roots.forEach(r => {
+          renderedHtml += renderNodeRow(r, 0, false);
+        });
+      }
+
+      panel.innerHTML = renderedHtml || `<div style="padding: 24px; color: var(--text-muted); text-align: center;">No Kconfig items in this menu scope.</div>`;
+    }
+
+    function clearKconfigSearch() {
+      kconfigSearchQuery = "";
+      const searchInput = document.getElementById("kconfigSearchInput");
+      if (searchInput) searchInput.value = "";
+      renderKconfigTree();
+    }
+
+    function onKconfigSearchInput(val) {
+      kconfigSearchQuery = val;
+      renderKconfigTree();
+    }
+
+    function onKconfigTypeFilterChange(val) {
+      kconfigTypeFilter = val;
+      renderKconfigTree();
+    }
+
+    function toggleKconfigNodeValue(treeId, event) {
+      if (event) event.stopPropagation();
+      const node = kconfigNodesById[treeId];
+      if (!node || !node.symbol_name) return;
+
+      const symName = node.symbol_name;
+      const curVal = kconfigValues[symName] || "n";
+      let nextVal = "n";
+
+      if (node.symbol_type === 1) { // bool: n -> y -> n
+        nextVal = (curVal === "y") ? "n" : "y";
+      } else if (node.symbol_type === 2) { // tristate: n -> y -> m -> n
+        if (curVal === "n") nextVal = "y";
+        else if (curVal === "y") nextVal = "m";
+        else nextVal = "n";
+      }
+
+      setKconfigSymbolValue(symName, nextVal);
+    }
+
+    async function selectKconfigNode(treeId) {
+      selectedKconfigNodeId = treeId;
+      renderKconfigTree();
+
+      const node = kconfigNodesById[treeId];
+      const panel = document.getElementById("kconfigInspectorPanel");
+      if (!node) return;
+
+      if (!node.symbol_name) {
+        // Non-symbol menu / choice / comment
+        panel.innerHTML = `
+          <div style="background: var(--bg-sidebar); padding: 16px; border-radius: 6px; border: 1px solid var(--border-color);">
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
+              <h2 style="color: var(--text-bright); font-size: 16px;">${escapeHtml(node.title || 'Menu Item')}</h2>
+              <span class="kconfig-type-tag kconfig-tag-${node.node_type_name}">${node.node_type_name}</span>
+            </div>
+            <p style="font-size: 12px; color: var(--text-muted); margin-bottom: 12px;">Hierarchy Node ID: <code>${node.tree_id}</code> | AST ID: <code>${node.ast_id}</code></p>
+            ${(node.node_type === 1 || node.node_type === 2) ? `
+              <button class="btn btn-accent" onclick="kconfigDrillInto(${node.tree_id}, '${escapeHtml(node.title || 'Submenu')}')">Enter Submenu (${escapeHtml(node.title)}) &gt;&gt;</button>
+            ` : ''}
+          </div>
+        `;
+        return;
+      }
+
+      panel.innerHTML = `<div style="padding: 20px; color: var(--accent);">⏳ Fetching details for CONFIG_${escapeHtml(node.symbol_name)}...</div>`;
+      const symData = await apiFetch(`/api/version/${currentVersion}/kconfig/symbol/${node.symbol_name}`);
+      if (!symData) {
+        panel.innerHTML = `<div style="color: var(--danger);">Failed to load symbol details.</div>`;
+        return;
+      }
+
+      const cleanSym = node.symbol_name;
+      const curVal = kconfigValues[cleanSym] || "n";
+      const isForced = Boolean(kconfigForcedSymbols[cleanSym]);
+      const isUnmet = Boolean(kconfigUnmetDependencies[cleanSym] && !isForced);
+
+      let constraintNoticeHtml = "";
+      if (isForced) {
+        constraintNoticeHtml = `
+          <div style="padding: 6px 10px; background: rgba(229,192,123,0.15); border: 1px solid rgba(229,192,123,0.4); border-radius: 4px; color: #e5c07b; font-size: 11px; margin-bottom: 8px;">
+            🔒 <strong>Forced Active</strong> by [Selected By]: ${kconfigForcedSymbols[cleanSym].forcedBy.map(s => 'CONFIG_' + s).join(', ')}. Disabling is prohibited until selecting symbols are disabled.
+          </div>
+        `;
+      } else if (isUnmet) {
+        constraintNoticeHtml = `
+          <div style="padding: 6px 10px; background: rgba(255,85,85,0.15); border: 1px solid rgba(255,85,85,0.4); border-radius: 4px; color: #ff5555; font-size: 11px; margin-bottom: 8px;">
+            ⚠️ <strong>Unmet Dependency</strong>: ${kconfigUnmetDependencies[cleanSym].join(' && ')}. Enabling is prohibited until required dependencies are satisfied.
+          </div>
+        `;
+      }
+
+      let valEditorHtml = "";
+      if (symData.type === 1) {
+        valEditorHtml = `
+          ${constraintNoticeHtml}
+          <div style="display: flex; gap: 8px; align-items: center;">
+            <button class="btn ${curVal === 'y' ? 'btn-accent' : ''}" ${isUnmet ? 'disabled style="opacity: 0.5; cursor: not-allowed;" title="Disabled: Unmet dependency"' : ''} onclick="setKconfigSymbolValue('${symData.name}', 'y')">[*] Built-in (y)</button>
+            <button class="btn ${curVal === 'n' ? 'btn-accent' : ''}" ${isForced ? 'disabled style="opacity: 0.5; cursor: not-allowed;" title="Disabled: Forced active by Selected By"' : ''} onclick="setKconfigSymbolValue('${symData.name}', 'n')">[ ] Excluded (n)</button>
+          </div>
+        `;
+      } else if (symData.type === 2) {
+        valEditorHtml = `
+          ${constraintNoticeHtml}
+          <div style="display: flex; gap: 8px; align-items: center;">
+            <button class="btn ${curVal === 'y' ? 'btn-accent' : ''}" ${isUnmet ? 'disabled style="opacity: 0.5; cursor: not-allowed;" title="Disabled: Unmet dependency"' : ''} onclick="setKconfigSymbolValue('${symData.name}', 'y')">&lt;*&gt; Built-in (y)</button>
+            <button class="btn ${curVal === 'm' ? 'btn-accent' : ''}" ${isUnmet ? 'disabled style="opacity: 0.5; cursor: not-allowed;" title="Disabled: Unmet dependency"' : ''} onclick="setKconfigSymbolValue('${symData.name}', 'm')">&lt;M&gt; Module (m)</button>
+            <button class="btn ${curVal === 'n' ? 'btn-accent' : ''}" ${isForced ? 'disabled style="opacity: 0.5; cursor: not-allowed;" title="Disabled: Forced active by Selected By"' : ''} onclick="setKconfigSymbolValue('${symData.name}', 'n')">&lt; &gt; Excluded (n)</button>
+          </div>
+        `;
+      } else {
+        valEditorHtml = `
+          ${constraintNoticeHtml}
+          <div style="display: flex; gap: 8px; align-items: center;">
+            <input type="text" class="kconfig-input" id="kconfigInputVal_${symData.name}" value="${escapeHtml(curVal)}" style="max-width: 250px;">
+            <button class="btn btn-accent" onclick="setKconfigSymbolValue('${symData.name}', document.getElementById('kconfigInputVal_${symData.name}').value)">Apply</button>
+          </div>
+        `;
+      }
+
+      panel.innerHTML = `
+        <div style="background: var(--bg-sidebar); padding: 16px; border-radius: 6px; border: 1px solid var(--border-color);">
+          <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
+            <div>
+              <h2 style="color: var(--text-bright); font-size: 16px; font-family: monospace;">CONFIG_${escapeHtml(symData.name)}</h2>
+              <div style="font-size: 13px; color: #fff; margin-top: 4px;">"${escapeHtml(symData.prompt || '')}"</div>
+            </div>
+            <span class="kconfig-type-tag kconfig-tag-${symData.type_name}">${symData.type_name}</span>
+          </div>
+
+          <div style="margin: 12px 0; padding: 10px; background: var(--bg-card); border-radius: 4px; border: 1px solid var(--border-color);">
+            <label style="font-size: 11px; color: var(--text-muted); display: block; margin-bottom: 6px;">CURRENT VALUE:</label>
+            ${valEditorHtml}
+          </div>
+
+          ${symData.file_path ? `
+            <div style="font-size: 12px; color: var(--text-muted); margin-top: 6px;">
+              📁 Defined at: <span class="crumb-link" onclick="switchAppMode('explorer'); openPath('${escapeHtml(symData.file_path)}')">${escapeHtml(symData.file_path)}:${symData.line_s || 1}</span>
+            </div>
+          ` : ''}
+        </div>
+
+        <div>
+          <h4 style="font-size: 12px; color: var(--accent); margin-bottom: 6px; text-transform: uppercase;">Help & Documentation</h4>
+          <div class="kconfig-help-box">${escapeHtml(symData.help || 'No help text provided for this symbol.')}</div>
+        </div>
+
+        ${symData.depends_on && symData.depends_on.length > 0 ? `
+          <div>
+            <h4 style="font-size: 12px; color: var(--text-bright); margin-bottom: 6px; text-transform: uppercase;">Direct Dependencies (Depends On)</h4>
+            <div class="kconfig-dep-list">
+              ${symData.depends_on.map(d => `<span class="kconfig-dep-chip" onclick="jumpToKconfigSymbol('${escapeHtml(d)}')">${escapeHtml(d)}</span>`).join('')}
+            </div>
+          </div>
+        ` : ''}
+
+        ${symData.selects && symData.selects.length > 0 ? `
+          <div>
+            <h4 style="font-size: 12px; color: var(--success); margin-bottom: 6px; text-transform: uppercase;">Symbols Selected by this Config (Selects)</h4>
+            <div class="kconfig-dep-list">
+              ${symData.selects.map(s => `<span class="kconfig-dep-chip" onclick="jumpToKconfigSymbol('${escapeHtml(s)}')">${escapeHtml(s)}</span>`).join('')}
+            </div>
+          </div>
+        ` : ''}
+
+        ${symData.compiled_files && symData.compiled_files.length > 0 ? `
+          <div>
+            <h4 style="font-size: 12px; color: var(--accent); margin-bottom: 6px; text-transform: uppercase;">📦 Compiled Kernel Source Files (Kbuild)</h4>
+            <div style="background: var(--bg-card); border: 1px solid var(--border-color); border-radius: 6px; max-height: 180px; overflow-y: auto; padding: 6px;">
+              ${symData.compiled_files.map(f => `
+                <div style="display: flex; justify-content: space-between; align-items: center; padding: 4px 6px; border-bottom: 1px solid rgba(255,255,255,0.05); font-size: 12px;">
+                  <span class="crumb-link" onclick="switchAppMode('explorer'); openPath('${escapeHtml(f.file_path)}')">📄 ${escapeHtml(f.file_path)}</span>
+                  <span style="font-size: 10px; color: var(--text-muted); background: var(--bg-sidebar); padding: 2px 6px; border-radius: 3px;">${escapeHtml(f.target_obj || '')} [${escapeHtml(f.compile_mode || '')}]</span>
+                </div>
+              `).join('')}
+            </div>
+          </div>
+        ` : ''}
+
+        ${symData.selected_by && symData.selected_by.length > 0 ? `
+          <div>
+            <h4 style="font-size: 12px; color: var(--hl-macro); margin-bottom: 6px; text-transform: uppercase;">Reverse Dependencies (Selected By)</h4>
+            <div class="kconfig-dep-list">
+              ${symData.selected_by.map(sb => `<span class="kconfig-dep-chip" onclick="jumpToKconfigSymbol('${escapeHtml(sb.name)}')">${escapeHtml(sb.name)}</span>`).join('')}
+            </div>
+          </div>
+        ` : ''}
+      `;
+    }
+
+    function setKconfigSymbolValue(symName, val) {
+      const cleanSym = symName.startsWith("CONFIG_") ? symName.slice(7) : symName;
+
+      // 1. Check if trying to disable a forced symbol
+      if (val === "n" && kconfigForcedSymbols[cleanSym]) {
+        const forcedBy = kconfigForcedSymbols[cleanSym].forcedBy || [];
+        alert(`⛔ Cannot disable CONFIG_${cleanSym}!\n\nThis symbol is forced active by [Selected By]: ${forcedBy.map(s => 'CONFIG_' + s).join(', ')}.\n\nTo disable CONFIG_${cleanSym}, you must first disable the selecting options.`);
+        return false;
+      }
+
+      // 2. Check if trying to enable a symbol with unmet dependencies
+      if ((val === "y" || val === "m") && kconfigUnmetDependencies[cleanSym] && !kconfigForcedSymbols[cleanSym]) {
+        const unmet = kconfigUnmetDependencies[cleanSym] || [];
+        alert(`⛔ Cannot enable CONFIG_${cleanSym}!\n\nUnmet dependency condition: [${unmet.join(' && ')}].\n\nPlease enable the required dependencies first.`);
+        return false;
+      }
+
+      kconfigValues[cleanSym] = val;
+
+      if (cleanSym === "64BIT") {
+        const is64 = (val === "y");
+        if (currentTargetProfile) {
+          currentTargetProfile.bits = is64 ? 64 : 32;
+        }
+        if (currentTargetProfile && (currentTargetProfile.arch === "x86" || currentTargetProfile.arch === "x86_64" || currentTargetProfile.arch === "i386")) {
+          kconfigValues["X86_64"] = is64 ? "y" : "n";
+          kconfigValues["X86_32"] = is64 ? "n" : "y";
+        }
+      }
+
+      evaluateKconfigConstraints();
+
+      renderKconfigTree();
+      if (currentAppMode === "tui") renderTui();
+      if (selectedKconfigNodeId) {
+        selectKconfigNode(selectedKconfigNodeId);
+      }
+      return true;
+    }
+
+    function jumpToKconfigSymbol(symName) {
+      const node = kconfigSymbolsByName[symName];
+      if (node) {
+        kconfigDrillInto(node.parent_id || 0, "Enclosing Menu");
+        selectKconfigNode(node.tree_id);
+      } else {
+        kconfigSearchQuery = symName;
+        document.getElementById("kconfigSearchInput").value = symName;
+        renderKconfigTree();
+      }
+    }
+
+    function resetKconfigDefaults() {
+      kconfigValues = { ...kconfigInitialDefaults };
+      evaluateKconfigConstraints();
+      renderKconfigTree();
+      if (currentAppMode === "tui") renderTui();
+      if (selectedKconfigNodeId) {
+        selectKconfigNode(selectedKconfigNodeId);
+      }
+    }
+
+    // -------------------------------------------------------------------------
+    // AUTHENTIC LINUX "MAKE MENUCONFIG" TERMINAL (TUI) ENGINE
+    // -------------------------------------------------------------------------
+    function renderTui() {
+      const titleEl = document.getElementById("tuiTitle");
+      const bcEl = document.getElementById("tuiBreadcrumbs");
+      const boxEl = document.getElementById("tuiMenuBox");
+
+      titleEl.innerText = `Linux/x86_64 ${currentVersion} Kernel Configuration`;
+      bcEl.innerText = `Location: ${kconfigMenuHistory.map(m => m.title).join(" > ")}`;
+
+      const items = getScopedKconfigItems(kconfigCurrentMenuId);
+      if (tuiActiveIndex >= items.length) tuiActiveIndex = Math.max(0, items.length - 1);
+
+      let tuiRowsHtml = "";
+      if (kconfigCurrentMenuId !== 0) {
+        const isBackSelected = (tuiActiveIndex === -1);
+        tuiRowsHtml += `
+          <div class="tui-item ${isBackSelected ? 'active' : ''}" onclick="tuiSelectRow(-1)">
+            <span class="tui-tag-badge">&lt;--&gt;</span> (Up to parent directory)
+          </div>
+        `;
+      }
+
+      items.forEach((item, idx) => {
+        const isSelected = (tuiActiveIndex === idx);
+        const isMenu = (item.node_type === 1);
+        const isChoice = (item.node_type === 2);
+        const isConfig = (item.node_type === 3 || item.node_type === 4);
+        const isComment = (item.node_type === 5);
+
+        let prefix = "    ";
+        if (isConfig) {
+          const symVal = (item.symbol_name && kconfigValues[item.symbol_name]) !== undefined ? kconfigValues[item.symbol_name] : (item.def_val || "n");
+          const isTristate = (item.symbol_type === 2 || item.symbol_type === "2" || item.symbol_type_name === "tristate");
+          const isBool = (item.symbol_type === 1 || item.symbol_type === "1" || item.symbol_type_name === "bool");
+          const isForced = Boolean(item.symbol_name && kconfigForcedSymbols[item.symbol_name]);
+
+          if (isBool) {
+            prefix = (symVal === "y") ? (isForced ? "[-*-] " : "[*] ") : "[ ] ";
+          } else if (isTristate) {
+            if (symVal === "y") prefix = isForced ? "&lt;*-&gt; " : "&lt;*&gt; ";
+            else if (symVal === "m") prefix = "&lt;M&gt; ";
+            else prefix = "&lt; &gt; ";
+          } else {
+            prefix = `(${escapeHtml(symVal || '')}) `;
+          }
+        } else if (isMenu) {
+          prefix = "    ";
+        } else if (isChoice) {
+          prefix = "( ) ";
+        } else if (isComment) {
+          prefix = "*** ";
+        }
+
+        const childItems = getScopedKconfigItems(item.tree_id);
+        const hasChildren = Boolean(childItems && childItems.length > 0);
+        const isSubmenu = isMenu || isChoice || (item.node_type === 4) || hasChildren;
+
+        let suffix = "";
+        if (isSubmenu) suffix = "  --->";
+        else if (isComment) suffix = " ***";
+
+        const isForcedBadge = Boolean(item.symbol_name && kconfigForcedSymbols[item.symbol_name]) ? ' <span style="color: #ffff55;">[FORCED]</span>' : '';
+        const titleText = escapeHtml(item.title || item.symbol_name || "Option") + isForcedBadge;
+        tuiRowsHtml += `
+          <div class="tui-item ${isSelected ? 'active' : ''}" id="tui_row_${idx}" onclick="tuiSelectRow(${idx})" ondblclick="tuiActionSelect()">
+            <span class="tui-tag-badge">${prefix}</span><span>${titleText}</span><span style="color: #55ffff;">${suffix}</span>
+          </div>
+        `;
+      });
+
+      boxEl.innerHTML = tuiRowsHtml || `<div style="padding: 20px; text-align: center; color: #ffff55;">(Empty Submenu)</div>`;
+
+      // Auto-scroll to keep active item in view
+      const activeEl = document.getElementById(`tui_row_${tuiActiveIndex}`);
+      if (activeEl) {
+        activeEl.scrollIntoView({ block: "nearest" });
+      }
+
+      // Update TUI Button states
+      tuiButtons.forEach((bName, bIdx) => {
+        const bEl = document.getElementById(`tuiBtn${bName.charAt(0).toUpperCase() + bName.slice(1)}`);
+        if (bEl) bEl.classList.toggle("active", tuiActiveButtonIndex === bIdx);
+      });
+    }
+
+    function tuiSelectRow(idx) {
+      tuiActiveIndex = idx;
+      renderTui();
+    }
+
+    function onTuiKeyDown(e) {
+      if (currentAppMode !== "tui") return;
+
+      const items = getScopedKconfigItems(kconfigCurrentMenuId);
+      const minIndex = (kconfigCurrentMenuId !== 0) ? -1 : 0;
+      const maxIndex = items.length - 1;
+
+      if (e.key === "ArrowUp" || e.key === "k") {
+        e.preventDefault();
+        tuiActiveIndex = Math.max(minIndex, tuiActiveIndex - 1);
+        renderTui();
+      } else if (e.key === "ArrowDown" || e.key === "j") {
+        e.preventDefault();
+        tuiActiveIndex = Math.min(maxIndex, tuiActiveIndex + 1);
+        renderTui();
+      } else if (e.key === "ArrowLeft") {
+        e.preventDefault();
+        tuiActiveButtonIndex = (tuiActiveButtonIndex - 1 + tuiButtons.length) % tuiButtons.length;
+        renderTui();
+      } else if (e.key === "ArrowRight" || e.key === "Tab") {
+        e.preventDefault();
+        tuiActiveButtonIndex = (tuiActiveButtonIndex + 1) % tuiButtons.length;
+        renderTui();
+      } else if (e.key === "Enter") {
+        e.preventDefault();
+        const activeBtn = tuiButtons[tuiActiveButtonIndex];
+        if (activeBtn === "select") tuiActionSelect();
+        else if (activeBtn === "defconfig") openTuiDefconfigModal();
+        else if (activeBtn === "exit") tuiActionExit();
+        else if (activeBtn === "target") openTuiProfileModal();
+        else if (activeBtn === "help") tuiActionHelp();
+        else if (activeBtn === "save") openKconfigExportModal();
+        else if (activeBtn === "load") openKconfigImportModal();
+      } else if (e.key === " ") {
+        e.preventDefault();
+        tuiToggleActiveSymbol("toggle");
+      } else if (e.key === "y" || e.key === "Y") {
+        e.preventDefault();
+        tuiToggleActiveSymbol("y");
+      } else if (e.key === "n" || e.key === "N") {
+        e.preventDefault();
+        tuiToggleActiveSymbol("n");
+      } else if (e.key === "m" || e.key === "M") {
+        e.preventDefault();
+        tuiToggleActiveSymbol("m");
+      } else if (e.key === "d" || e.key === "D") {
+        e.preventDefault();
+        openTuiDefconfigModal();
+      } else if (e.key === "t" || e.key === "T") {
+        e.preventDefault();
+        openTuiProfileModal();
+      } else if (e.key === "?" || e.key === "h" || e.key === "H") {
+        e.preventDefault();
+        tuiActionHelp();
+      } else if (e.key === "/") {
+        e.preventDefault();
+        openTuiSearchModal();
+      } else if (e.key === "Escape" || e.key === "q" || e.key === "Q") {
+        e.preventDefault();
+        tuiActionExit();
+      }
+    }
+
+    function tuiActionSelect() {
+      if (tuiActiveIndex === -1) {
+        kconfigNavigateUp();
+        return;
+      }
+      const items = getScopedKconfigItems(kconfigCurrentMenuId);
+      const item = items[tuiActiveIndex];
+      if (!item) return;
+
+      const childItems = getScopedKconfigItems(item.tree_id);
+      const hasChildren = Boolean(childItems && childItems.length > 0);
+      const isSubmenu = (item.node_type === 1 || item.node_type === 2 || item.node_type === 4 || hasChildren);
+
+      if (isSubmenu) {
+        kconfigDrillInto(item.tree_id, item.title || item.symbol_name || "Submenu");
+      } else if (item.symbol_name) {
+        tuiToggleActiveSymbol("toggle");
+      }
+    }
+
+    function tuiActionExit() {
+      if (kconfigMenuHistory.length > 1) {
+        kconfigNavigateUp();
+      } else {
+        switchAppMode("kconfig");
+      }
+    }
+
+    function tuiToggleActiveSymbol(targetState) {
+      const items = getScopedKconfigItems(kconfigCurrentMenuId);
+      const item = (tuiActiveIndex >= 0) ? items[tuiActiveIndex] : null;
+      if (!item || !item.symbol_name) return;
+
+      const symName = item.symbol_name;
+      const isTristate = (item.symbol_type === 2 || item.symbol_type === "2" || item.symbol_type_name === "tristate");
+      const isBool = (item.symbol_type === 1 || item.symbol_type === "1" || item.symbol_type_name === "bool");
+      const curVal = kconfigValues[symName] || "n";
+
+      if (targetState === "m") {
+        if (isTristate) {
+          setKconfigSymbolValue(symName, "m");
+        }
+      } else if (targetState === "y") {
+        setKconfigSymbolValue(symName, "y");
+      } else if (targetState === "n") {
+        setKconfigSymbolValue(symName, "n");
+      } else {
+        // Toggle / Cycle
+        let nextVal = "n";
+        if (isBool) {
+          nextVal = (curVal === "y") ? "n" : "y";
+        } else if (isTristate) {
+          if (curVal === "n") nextVal = "y";
+          else if (curVal === "y") nextVal = "m";
+          else nextVal = "n";
+        }
+        setKconfigSymbolValue(symName, nextVal);
+      }
+      renderTui();
+      renderKconfigTree();
+    }
+
+    async function tuiActionHelp() {
+      const items = getScopedKconfigItems(kconfigCurrentMenuId);
+      const item = (tuiActiveIndex >= 0) ? items[tuiActiveIndex] : null;
+      const modal = document.getElementById("tuiHelpModal");
+      const titleEl = document.getElementById("tuiHelpTitle");
+      const bodyEl = document.getElementById("tuiHelpBody");
+
+      if (!item) {
+        titleEl.innerText = "Navigation Help";
+        bodyEl.innerHTML = `
+          <p>Use arrow keys to move cursor up and down.</p>
+          <p>Press &lt;Enter&gt; to select a menu or submenu.</p>
+          <p>Press &lt;Y&gt;, &lt;N&gt;, or &lt;M&gt; to change configuration options.</p>
+          <p>Press &lt;Esc&gt; to go back to the parent menu.</p>
+        `;
+        modal.classList.add("open");
+        return;
+      }
+
+      titleEl.innerText = `CONFIG_${item.symbol_name || item.title || 'Help'}`;
+      bodyEl.innerHTML = `<div style="color: #55ffff;">Fetching documentation...</div>`;
+      modal.classList.add("open");
+
+      if (item.symbol_name) {
+        const symData = await apiFetch(`/api/version/${currentVersion}/kconfig/symbol/${item.symbol_name}`);
+        if (symData) {
+          let compiledFilesHtml = "";
+          if (symData.compiled_files && symData.compiled_files.length > 0) {
+            compiledFilesHtml = `
+              <div style="color: #55ff55; margin-top: 8px; font-weight: bold;">Compiled Files (Kbuild):</div>
+              <div style="color: #ffffff; font-size: 11px; margin-bottom: 8px;">
+                ${symData.compiled_files.map(f => `* ${escapeHtml(f.file_path)} (${escapeHtml(f.target_obj)})`).join('<br>')}
+              </div>
+            `;
+          }
+
+          bodyEl.innerHTML = `
+            <div style="color: #ffff55; font-weight: bold; margin-bottom: 8px;">CONFIG_${escapeHtml(symData.name)} - "${escapeHtml(symData.prompt || '')}"</div>
+            <div style="color: #55ffff; margin-bottom: 8px;">Type: ${symData.type_name} | Current Value: [ ${kconfigValues[symData.name] || 'n'} ]</div>
+            ${symData.file_path ? `<div style="color: #aaaaaa; margin-bottom: 8px;">Location: ${escapeHtml(symData.file_path)}:${symData.line_s || 1}</div>` : ''}
+            ${symData.depends_on && symData.depends_on.length ? `<div style="color: #ff55ff; margin-bottom: 8px;">Depends on: ${escapeHtml(symData.depends_on.join(' && '))}</div>` : ''}
+            ${compiledFilesHtml}
+            <div style="white-space: pre-wrap; line-height: 1.4; border-top: 1px dashed #aaaaaa; padding-top: 8px;">${escapeHtml(symData.help || 'No help text available for this configuration symbol.')}</div>
+          `;
+          return;
+        }
+      }
+
+      bodyEl.innerHTML = `<div>Menu Header: ${escapeHtml(item.title || 'Submenu')}</div>`;
+    }
+
+    function closeTuiHelpModal(e) {
+      if (e) e.stopPropagation();
+      document.getElementById("tuiHelpModal").classList.remove("open");
+      if (currentAppMode === "tui") document.getElementById("tuiWorkspace").focus();
+    }
+
+    function openTuiSearchModal() {
+      const modal = document.getElementById("tuiSearchModal");
+      modal.classList.add("open");
+      const inp = document.getElementById("tuiSearchInput");
+      inp.value = "";
+      document.getElementById("tuiSearchResults").innerHTML = `<div style="color: #aaaaaa;">Type a search keyword above...</div>`;
+      inp.focus();
+    }
+
+    function closeTuiSearchModal(e) {
+      if (e) e.stopPropagation();
+      document.getElementById("tuiSearchModal").classList.remove("open");
+      if (currentAppMode === "tui") document.getElementById("tuiWorkspace").focus();
+    }
+
+    async function onTuiSearchInput(q) {
+      const resultsEl = document.getElementById("tuiSearchResults");
+      if (!q.trim()) {
+        resultsEl.innerHTML = `<div style="color: #aaaaaa;">Type a search keyword above...</div>`;
+        return;
+      }
+      resultsEl.innerHTML = `<div style="color: #55ffff;">Searching...</div>`;
+      const res = await apiFetch(`/api/version/${currentVersion}/kconfig/search?q=${encodeURIComponent(q)}&limit=25`);
+      if (!res || !res.symbols || res.symbols.length === 0) {
+        resultsEl.innerHTML = `<div style="color: #ff5555;">No symbols found matching "${escapeHtml(q)}".</div>`;
+        return;
+      }
+
+      resultsEl.innerHTML = res.symbols.map(s => `
+        <div style="padding: 6px; border-bottom: 1px solid #5555bb; cursor: pointer;" onclick="tuiJumpToSearchSymbol('${s.name}')">
+          <div style="color: #55ffff; font-weight: bold;">CONFIG_${escapeHtml(s.name)} [${escapeHtml(s.type_name)}]</div>
+          <div style="color: #ffffff; font-size: 11px;">${escapeHtml(s.prompt || s.help || '')}</div>
+        </div>
+      `).join("");
+    }
+
+    function tuiJumpToSearchSymbol(symName) {
+      closeTuiSearchModal();
+      jumpToKconfigSymbol(symName);
+      if (currentAppMode === "tui") {
+        renderTui();
+      }
+    }
+
+    // -------------------------------------------------------------------------
+    // MODAL IMPORT / EXPORT
+    // -------------------------------------------------------------------------
+    function openKconfigImportModal() {
+      document.getElementById("kconfigImportModal").classList.add("open");
+    }
+
+    function closeKconfigImportModal() {
+      document.getElementById("kconfigImportModal").classList.remove("open");
+    }
+
+    function onKconfigConfigFileChosen(e) {
+      const file = e.target.files[0];
+      if (!file) return;
+      const reader = new FileReader();
+      reader.onload = function(evt) {
+        document.getElementById("kconfigImportText").value = evt.target.result;
+      };
+      reader.readAsText(file);
+    }
+
+    async function applyKconfigImport() {
+      const text = document.getElementById("kconfigImportText").value;
+      if (!text.trim()) {
+        alert("Please select a .config file or paste its content first.");
+        return;
+      }
+
+      const res = await apiFetch(`/api/version/${currentVersion}/kconfig/import`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ content: text }),
+      });
+
+      if (res && res.symbols) {
+        Object.assign(kconfigValues, res.symbols);
+        closeKconfigImportModal();
+        renderKconfigTree();
+        if (currentAppMode === "tui") renderTui();
+        if (selectedKconfigNodeId) selectKconfigNode(selectedKconfigNodeId);
+        alert(`Successfully imported and updated ${res.symbol_count} configuration symbols!`);
+      } else {
+        alert("Failed to parse configuration file.");
+      }
+    }
+
+    async function openKconfigExportModal() {
+      document.getElementById("kconfigExportModal").classList.add("open");
+      const exportBox = document.getElementById("kconfigExportText");
+      exportBox.value = "Generating .config file...";
+
+      const res = await apiFetch(`/api/version/${currentVersion}/kconfig/export`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ symbols: kconfigValues }),
+      });
+
+      if (res && res.content) {
+        exportBox.value = res.content;
+      } else {
+        exportBox.value = "# Error generating .config file from backend.";
+      }
+    }
+
+    function closeKconfigExportModal() {
+      document.getElementById("kconfigExportModal").classList.remove("open");
+    }
+
+    function copyKconfigExportToClipboard() {
+      const text = document.getElementById("kconfigExportText").value;
+      navigator.clipboard.writeText(text).then(() => {
+        alert("Kernel .config copied to clipboard!");
+      });
+    }
+
+    function downloadKconfigExportFile() {
+      const text = document.getElementById("kconfigExportText").value;
+      const blob = new Blob([text], { type: "text/plain" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = ".config";
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+    }
+
+    // =========================================================================
+    // MAINTAINERS & CREDITS SUBSYSTEM HUB CONTROLLERS
+    // =========================================================================
+    let maintainersData = [];
+    let maintainersLoadedVersion = null;
+    let creditsData = [];
+    let creditsLoadedVersion = null;
+    let activeSubsystemDetail = null;
+
+    async function loadMaintainersData(force = false) {
+      const grid = document.getElementById("maintainersGrid");
+      const badge = document.getElementById("maintainerCountBadge");
+      grid.innerHTML = `<div style="padding: 40px; text-align: center; color: var(--accent); grid-column: 1/-1;">⏳ Loading kernel subsystems for ${currentVersion}...</div>`;
+
+      const data = await apiFetch(`/api/version/${currentVersion}/maintainers`);
+      if (!data || !data.sections) {
+        grid.innerHTML = `<div style="padding: 40px; text-align: center; color: var(--danger); grid-column: 1/-1;">Failed to load subsystems catalog.</div>`;
+        return;
+      }
+
+      maintainersData = data.sections;
+      maintainersLoadedVersion = currentVersion;
+      filterMaintainers();
+    }
+
+    function filterMaintainers() {
+      const q = (document.getElementById("maintainerSearchInput").value || "").trim().toLowerCase();
+      const statusFilter = (document.getElementById("maintainerStatusFilter").value || "").trim().toLowerCase();
+      const grid = document.getElementById("maintainersGrid");
+      const badge = document.getElementById("maintainerCountBadge");
+
+      const filtered = maintainersData.filter(s => {
+        if (statusFilter && !s.status.toLowerCase().includes(statusFilter)) return false;
+        if (!q) return true;
+        const inName = s.name.toLowerCase().includes(q);
+        const inMaint = (s.maintainers || []).some(m => m.name.toLowerCase().includes(q) || m.email.toLowerCase().includes(q));
+        const inRev = (s.reviewers || []).some(r => r.name.toLowerCase().includes(q) || r.email.toLowerCase().includes(q));
+        const inMail = (s.mailing_list || "").toLowerCase().includes(q);
+        return inName || inMaint || inRev || inMail;
+      });
+
+      badge.innerText = `${filtered.length} Subsystems`;
+
+      if (filtered.length === 0) {
+        grid.innerHTML = `<div style="padding: 40px; text-align: center; color: var(--text-muted); grid-column: 1/-1;">No subsystems matching filter "${escapeHtml(q)}".</div>`;
+        return;
+      }
+
+      grid.innerHTML = filtered.map(s => {
+        const maintainersHtml = (s.maintainers || []).map(m => `
+          <span class="member-pill" onclick="event.stopPropagation(); openPersonModal('${escapeJs(m.email || m.name)}')">
+            <span class="role-badge role-maintainer">M</span>
+            <span class="person-link">${escapeHtml(m.name || m.email)}</span>
+            ${m.in_credits ? '<span title="Listed in Kernel CREDITS">⭐</span>' : ''}
+          </span>
+        `).join("");
+
+        const reviewersHtml = (s.reviewers || []).map(r => `
+          <span class="member-pill" onclick="event.stopPropagation(); openPersonModal('${escapeJs(r.email || r.name)}')">
+            <span class="role-badge role-reviewer">R</span>
+            <span class="person-link">${escapeHtml(r.name || r.email)}</span>
+            ${r.in_credits ? '<span title="Listed in Kernel CREDITS">⭐</span>' : ''}
+          </span>
+        `).join("");
+
+        const statusClass = s.status === 'Supported' ? 'badge-accent' : (s.status === 'Maintained' ? 'badge-success' : 'badge');
+
+        return `
+          <div class="subsystem-card" onclick="openSubsystemModal('${s.sec_id || escapeJs(s.name)}')">
+            <div class="card-title">
+              <span>🏷️ ${escapeHtml(s.name)}</span>
+              <span class="badge ${statusClass}">${escapeHtml(s.status || 'Active')}</span>
+            </div>
+            <div class="card-meta">
+              ${s.mailing_list ? `<div><strong>📬 List:</strong> <code>${escapeHtml(s.mailing_list)}</code></div>` : ''}
+              ${s.scm_tree ? `<div><strong>🌿 SCM:</strong> <span style="font-size: 10px; word-break: break-all;">${escapeHtml(s.scm_tree)}</span></div>` : ''}
+            </div>
+            <div style="display: flex; flex-wrap: wrap; gap: 6px; margin-top: 4px;">
+              ${maintainersHtml}
+              ${reviewersHtml}
+            </div>
+            <div style="margin-top: auto; padding-top: 8px; border-top: 1px solid var(--border-color); display: flex; justify-content: space-between; font-size: 11px; color: var(--text-muted);">
+              <span>${s.pattern_count || 0} pattern rules</span>
+              <span style="color: var(--accent); font-weight: bold;">Inspect Subsystem ➔</span>
+            </div>
+          </div>
+        `;
+      }).join("");
+    }
+
+    async function openSubsystemModal(secIdOrName) {
+      const modal = document.getElementById("subsystemModal");
+      const titleEl = document.getElementById("subsystemModalTitle");
+      const contentEl = document.getElementById("subsystemModalContent");
+
+      modal.classList.add("open");
+      titleEl.innerText = "🏷️ Loading Subsystem...";
+      contentEl.innerHTML = `<div style="padding: 40px; text-align: center; color: var(--accent);">⏳ Loading subsystem details &amp; files...</div>`;
+
+      const data = await apiFetch(`/api/version/${currentVersion}/maintainer/section/${encodeURIComponent(secIdOrName)}`);
+      if (!data || !data.section) {
+        contentEl.innerHTML = `<div style="padding: 30px; color: var(--danger);">Failed to load subsystem details for ${secIdOrName}.</div>`;
+        return;
+      }
+
+      const sec = data.section;
+      activeSubsystemDetail = sec;
+      titleEl.innerText = `🏷️ ${sec.name}`;
+
+      const membersHtml = (sec.members || []).map(m => {
+        const isMaint = m.role_name === 'Maintainer';
+        const roleClass = isMaint ? 'role-maintainer' : 'role-reviewer';
+        return `
+          <div style="background: var(--bg-sidebar); border: 1px solid var(--border-color); border-radius: 6px; padding: 10px 14px; display: flex; justify-content: space-between; align-items: center;">
+            <div style="display: flex; align-items: center; gap: 10px;">
+              <span class="role-badge ${roleClass}">${escapeHtml(m.role_name)}</span>
+              <div>
+                <a class="person-link" style="font-size: 13px;" onclick="openPersonModal('${escapeJs(m.email || m.name)}')">${escapeHtml(m.name || 'Unnamed')}</a>
+                ${m.email ? `<div style="font-size: 11px; color: var(--text-muted);"><code>${escapeHtml(m.email)}</code></div>` : ''}
+              </div>
+            </div>
+            <div>
+              ${m.in_credits ? '<span class="role-badge role-credits" title="Author is credited in Kernel CREDITS">⭐ In Credits</span>' : ''}
+            </div>
+          </div>
+        `;
+      }).join("");
+
+      const patternsHtml = (sec.patterns || []).map(p => `
+        <div style="font-family: monospace; font-size: 11px; background: rgba(0,0,0,0.2); padding: 3px 8px; border-radius: 3px;">
+          <strong style="color: ${p.type === 'EXCLUDE' ? '#e06c75' : '#98c379'};">${p.type === 'EXCLUDE' ? 'X:' : 'F:'}</strong> ${escapeHtml(p.pattern)}
+        </div>
+      `).join("");
+
+      const files = sec.files || [];
+      const filesHtml = files.map(f => `
+        <tr style="cursor: pointer;" onclick="openSubsystemFile('${escapeHtml(f.fname)}')">
+          <td style="width: 30px;">📄</td>
+          <td><a class="item-link">${escapeHtml(f.fname)}</a></td>
+          <td style="width: 70px;"><code>${f.fid}</code></td>
+          <td style="width: 80px; text-align: right;"><button class="btn btn-accent" style="padding: 2px 8px; font-size: 10px;" onclick="event.stopPropagation(); openSubsystemFile('${escapeHtml(f.fname)}')">Open ➔</button></td>
+        </tr>
+      `).join("");
+
+      contentEl.innerHTML = `
+        <div style="display: flex; flex-direction: column; gap: 16px;">
+          <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; background: var(--bg-sidebar); padding: 14px; border-radius: 8px; border: 1px solid var(--border-color);">
+            <div><strong style="color: var(--text-muted); font-size: 11px;">STATUS</strong><div style="font-size: 13px; font-weight: bold; color: #98c379;">${escapeHtml(sec.status || 'Maintained')}</div></div>
+            ${sec.mailing_list ? `<div><strong style="color: var(--text-muted); font-size: 11px;">MAILING LIST</strong><div style="font-size: 12px; word-break: break-all;"><code>${escapeHtml(sec.mailing_list)}</code></div></div>` : ''}
+            ${sec.web_page ? `<div><strong style="color: var(--text-muted); font-size: 11px;">WEB PAGE</strong><div style="font-size: 12px;"><a href="${escapeHtml(sec.web_page)}" target="_blank" class="crumb-link">${escapeHtml(sec.web_page)}</a></div></div>` : ''}
+            ${sec.scm_tree ? `<div><strong style="color: var(--text-muted); font-size: 11px;">SCM GIT TREE</strong><div style="font-size: 11px; word-break: break-all;"><code>${escapeHtml(sec.scm_tree)}</code></div></div>` : ''}
+          </div>
+
+          <div>
+            <h4 style="font-size: 13px; color: var(--accent); margin-bottom: 8px; display: flex; align-items: center; gap: 6px;">
+              <span>👥 Maintainers &amp; Reviewers (${(sec.members || []).length})</span>
+            </h4>
+            <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 10px;">
+              ${membersHtml || '<div style="color: var(--text-muted); font-size: 12px;">No members listed.</div>'}
+            </div>
+          </div>
+
+          <div>
+            <h4 style="font-size: 13px; color: var(--accent); margin-bottom: 8px;">📁 Subsystem Pattern Rules (${(sec.patterns || []).length})</h4>
+            <div style="display: flex; flex-wrap: wrap; gap: 6px;">
+              ${patternsHtml || '<div style="color: var(--text-muted); font-size: 12px;">No file patterns.</div>'}
+            </div>
+          </div>
+
+          <div>
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
+              <h4 style="font-size: 13px; color: var(--accent);">📂 Repository Files in this Subsystem (<span id="subsystemFileCount">${files.length}</span>)</h4>
+              <input type="text" id="subsystemFileFilter" class="kconfig-input" placeholder="Filter files in subsystem..." oninput="filterSubsystemFiles(this.value)" style="width: 250px; font-size: 11px; padding: 4px 8px;">
+            </div>
+            <div style="max-height: 240px; overflow-y: auto; border: 1px solid var(--border-color); border-radius: 6px; background: var(--bg-sidebar);">
+              <table class="dir-table" style="margin: 0;">
+                <tbody id="subsystemFilesTableBody">
+                  ${filesHtml || '<tr><td colspan="4" style="text-align: center; color: var(--text-muted); padding: 20px;">No matching files found in repository.</td></tr>'}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      `;
+    }
+
+    function closeSubsystemModal() {
+      document.getElementById("subsystemModal").classList.remove("open");
+    }
+
+    function filterSubsystemFiles(query) {
+      if (!activeSubsystemDetail) return;
+      const q = (query || "").trim().toLowerCase();
+      const files = activeSubsystemDetail.files || [];
+      const filtered = files.filter(f => !q || f.fname.toLowerCase().includes(q));
+
+      document.getElementById("subsystemFileCount").innerText = filtered.length;
+      const tbody = document.getElementById("subsystemFilesTableBody");
+      if (filtered.length === 0) {
+        tbody.innerHTML = `<tr><td colspan="4" style="text-align: center; color: var(--text-muted); padding: 14px;">No files matching "${escapeHtml(q)}".</td></tr>`;
+        return;
+      }
+      tbody.innerHTML = filtered.map(f => `
+        <tr style="cursor: pointer;" onclick="openSubsystemFile('${escapeHtml(f.fname)}')">
+          <td style="width: 30px;">📄</td>
+          <td><a class="item-link">${escapeHtml(f.fname)}</a></td>
+          <td style="width: 70px;"><code>${f.fid}</code></td>
+          <td style="width: 80px; text-align: right;"><button class="btn btn-accent" style="padding: 2px 8px; font-size: 10px;" onclick="event.stopPropagation(); openSubsystemFile('${escapeHtml(f.fname)}')">Open ➔</button></td>
+        </tr>
+      `).join("");
+    }
+
+    function openSubsystemFile(filePath) {
+      closeSubsystemModal();
+      closePersonModal();
+      switchAppMode("explorer");
+      openPath(filePath);
+    }
+
+    async function openPersonModal(personIdOrEmail) {
+      const modal = document.getElementById("personModal");
+      const titleEl = document.getElementById("personModalTitle");
+      const contentEl = document.getElementById("personModalContent");
+
+      modal.classList.add("open");
+      titleEl.innerText = "👤 Developer Profile";
+      contentEl.innerHTML = `<div style="padding: 40px; text-align: center; color: var(--accent);">⏳ Loading developer profile &amp; credits...</div>`;
+
+      const data = await apiFetch(`/api/version/${currentVersion}/person/${encodeURIComponent(personIdOrEmail)}`);
+      if (!data || !data.person) {
+        contentEl.innerHTML = `<div style="padding: 30px; color: var(--danger);">Failed to load profile for ${personIdOrEmail}.</div>`;
+        return;
+      }
+
+      const p = data.person;
+      const inCred = data.in_credits;
+      const cred = data.credits;
+      const subs = data.subsystems || [];
+
+      titleEl.innerText = `👤 ${p.name || p.email}`;
+
+      const subsHtml = subs.map(s => `
+        <div style="background: var(--bg-sidebar); border: 1px solid var(--border-color); border-radius: 6px; padding: 10px 14px; display: flex; justify-content: space-between; align-items: center; cursor: pointer;" onclick="openSubsystemModal('${s.sec_id || escapeJs(s.name)}')">
+          <div>
+            <div style="font-weight: bold; font-size: 13px; color: var(--text-bright);">🏷️ ${escapeHtml(s.name)}</div>
+            ${s.mailing_list ? `<div style="font-size: 11px; color: var(--text-muted);">📬 ${escapeHtml(s.mailing_list)}</div>` : ''}
+          </div>
+          <div style="display: flex; align-items: center; gap: 8px;">
+            <span class="role-badge ${s.role === 'Maintainer' ? 'role-maintainer' : 'role-reviewer'}">${escapeHtml(s.role)}</span>
+            <button class="btn btn-accent" style="padding: 2px 8px; font-size: 10px;">View ➔</button>
+          </div>
+        </div>
+      `).join("");
+
+      contentEl.innerHTML = `
+        <div style="display: flex; flex-direction: column; gap: 16px;">
+          <div style="background: var(--bg-sidebar); padding: 16px; border-radius: 8px; border: 1px solid var(--border-color); display: flex; justify-content: space-between; align-items: center;">
+            <div>
+              <h3 style="color: var(--text-bright); font-size: 18px; margin-bottom: 4px;">${escapeHtml(p.name || 'Linux Contributor')}</h3>
+              ${p.email ? `<div style="font-size: 12px; color: var(--accent);"><a href="mailto:${escapeHtml(p.email)}" class="crumb-link">📧 ${escapeHtml(p.email)}</a></div>` : ''}
+            </div>
+            <div>
+              ${inCred ? '<span class="role-badge role-credits" style="padding: 6px 12px; font-size: 12px;">⭐ Listed in CREDITS</span>' : '<span class="badge">Subsystem Contributor</span>'}
+            </div>
+          </div>
+
+          <div>
+            <h4 style="font-size: 13px; color: #c678dd; margin-bottom: 8px;">🏆 Kernel CREDITS Profile</h4>
+            ${inCred && cred ? `
+              <div style="background: rgba(198, 120, 221, 0.08); border: 1px solid rgba(198, 120, 221, 0.25); border-radius: 8px; padding: 14px; display: flex; flex-direction: column; gap: 8px;">
+                ${cred.description ? `<div><strong style="color: #c678dd; font-size: 11px;">CONTRIBUTIONS:</strong><div style="font-size: 12px; color: var(--text-bright); line-height: 1.5; margin-top: 2px;">${escapeHtml(cred.description)}</div></div>` : ''}
+                ${cred.web_page ? `<div><strong style="color: #c678dd; font-size: 11px;">HOMEPAGE:</strong><div><a href="${escapeHtml(cred.web_page)}" target="_blank" class="crumb-link" style="font-size: 12px;">🌐 ${escapeHtml(cred.web_page)}</a></div></div>` : ''}
+                ${cred.pgp_key ? `<div><strong style="color: #c678dd; font-size: 11px;">PGP KEY:</strong><div style="font-size: 11px; font-family: monospace; color: var(--text-muted);">🔑 ${escapeHtml(cred.pgp_key)}</div></div>` : ''}
+                ${cred.snail_mail ? `<div><strong style="color: #c678dd; font-size: 11px;">POSTAL ADDRESS:</strong><pre style="font-size: 11px; color: var(--text-muted); margin: 2px 0 0 0; background: rgba(0,0,0,0.2); padding: 6px; border-radius: 4px;">${escapeHtml(cred.snail_mail)}</pre></div>` : ''}
+              </div>
+            ` : `
+              <div style="background: var(--bg-sidebar); border: 1px solid var(--border-color); border-radius: 6px; padding: 12px; font-size: 12px; color: var(--text-muted);">
+                This developer is an active subsystem maintainer/reviewer, but is not currently indexed in the historical <code>CREDITS</code> file.
+              </div>
+            `}
+          </div>
+
+          <div>
+            <h4 style="font-size: 13px; color: var(--accent); margin-bottom: 8px;">🏷️ Subsystems Handled (${subs.length})</h4>
+            <div style="display: flex; flex-direction: column; gap: 8px;">
+              ${subsHtml || '<div style="color: var(--text-muted); font-size: 12px;">No subsystems registered.</div>'}
+            </div>
+          </div>
+        </div>
+      `;
+    }
+
+    function closePersonModal() {
+      document.getElementById("personModal").classList.remove("open");
+    }
+
+    async function loadCreditsData(force = false) {
+      const grid = document.getElementById("creditsGrid");
+      const badge = document.getElementById("creditsCountBadge");
+      grid.innerHTML = `<div style="padding: 40px; text-align: center; color: #c678dd; grid-column: 1/-1;">⏳ Loading credited Linux kernel contributors for ${currentVersion}...</div>`;
+
+      const data = await apiFetch(`/api/version/${currentVersion}/credits`);
+      if (!data || !data.credits) {
+        grid.innerHTML = `<div style="padding: 40px; text-align: center; color: var(--danger); grid-column: 1/-1;">Failed to load CREDITS directory.</div>`;
+        return;
+      }
+
+      creditsData = data.credits;
+      creditsLoadedVersion = currentVersion;
+      filterCredits();
+    }
+
+    function filterCredits() {
+      const q = (document.getElementById("creditsSearchInput").value || "").trim().toLowerCase();
+      const grid = document.getElementById("creditsGrid");
+      const badge = document.getElementById("creditsCountBadge");
+
+      const filtered = creditsData.filter(c => {
+        if (!q) return true;
+        const inName = c.name.toLowerCase().includes(q);
+        const inEmail = (c.email || "").toLowerCase().includes(q);
+        const inDesc = (c.description || "").toLowerCase().includes(q);
+        const inWeb = (c.web_page || "").toLowerCase().includes(q);
+        const inPgp = (c.pgp_key || "").toLowerCase().includes(q);
+        return inName || inEmail || inDesc || inWeb || inPgp;
+      });
+
+      badge.innerText = `${filtered.length} Contributors`;
+
+      if (filtered.length === 0) {
+        grid.innerHTML = `<div style="padding: 40px; text-align: center; color: var(--text-muted); grid-column: 1/-1;">No contributors matching "${escapeHtml(q)}".</div>`;
+        return;
+      }
+
+      grid.innerHTML = filtered.map(c => {
+        const subsHtml = (c.subsystems || []).map(s => `
+          <span class="subsystem-chip" onclick="event.stopPropagation(); openSubsystemModal('${s.sec_id || escapeJs(s.name)}')">
+            🏷️ ${escapeHtml(s.name)}
+          </span>
+        `).join("");
+
+        return `
+          <div class="credit-card" onclick="openPersonModal('${escapeJs(c.email || c.name)}')">
+            <div class="card-title">
+              <span style="color: #c678dd; font-size: 15px;">⭐ ${escapeHtml(c.name)}</span>
+              ${c.subsystems_count > 0 ? `<span class="badge badge-accent">${c.subsystems_count} Subsystems</span>` : ''}
+            </div>
+            ${c.email ? `<div style="font-size: 11px; color: var(--accent);">📧 <code>${escapeHtml(c.email)}</code></div>` : ''}
+            ${c.description ? `<div style="font-size: 12px; color: var(--text-bright); line-height: 1.4; background: rgba(0,0,0,0.2); padding: 8px; border-radius: 4px;">${escapeHtml(c.description)}</div>` : ''}
+            ${subsHtml ? `
+              <div style="margin-top: 4px;">
+                <div style="font-size: 10px; color: var(--text-muted); font-weight: bold; margin-bottom: 4px;">MAINTAINED SUBSYSTEMS:</div>
+                <div style="display: flex; flex-wrap: wrap; gap: 4px;">${subsHtml}</div>
+              </div>
+            ` : ''}
+            <div style="margin-top: auto; padding-top: 8px; border-top: 1px solid var(--border-color); display: flex; justify-content: space-between; align-items: center; font-size: 11px; color: var(--text-muted);">
+              <span>${c.pgp_key ? '🔑 PGP Verified' : (c.web_page ? '🌐 Web' : '')}</span>
+              <span style="color: #c678dd; font-weight: bold;">View Full Profile ➔</span>
+            </div>
+          </div>
+        `;
+      }).join("");
     }
   </script>
 </body>

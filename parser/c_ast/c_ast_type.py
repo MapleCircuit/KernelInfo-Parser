@@ -492,10 +492,11 @@ class Ast:
             char_e,
             ast_target,
         ))
-        CS.store(m_bridge_map.set(
-            tag_target,
-            tag_target,
-        ))
+        if not hasattr(CS, "register_bridge_map") or CS.register_bridge_map(tag_target, tag_target):
+            CS.store(m_bridge_map.set(
+                tag_target,
+                tag_target,
+            ))
         return
 
     def extract(self, CS: ChangeSetType) -> None:

@@ -12,7 +12,7 @@ from enum import IntEnum, auto, Flag
 
 OP_DONE, OP_SET, OP_UPDATE, OP_REF, OP_REF_VIEW, OP_VIEW_DONE, OP_VIEW_SET = range(7)
 REF_ROOT, REF_OLD, REF_POS, REF_FILE, REF_MULTI, REF_C_AST, REF_NO_REF = range(7)
-T_DIR, T_C, T_KCONFIG, T_RUST, T_ASM = range(5)
+T_DIR, T_C, T_KCONFIG, T_RUST, T_ASM, T_MAINTAINERS, T_CREDITS = range(7)
 
 PointerType = tuple[int, int]
 JoinType = tuple[PointerType, PointerType, int] | tuple[PointerType]
@@ -301,6 +301,10 @@ class PointerGetter:
 
 def type_check(name: str) -> int | None:
     """Parse string to get file type."""
+    if name == "MAINTAINERS" or name.endswith("/MAINTAINERS"):
+        return T_MAINTAINERS
+    if name == "CREDITS" or name.endswith("/CREDITS"):
+        return T_CREDITS
     if name.endswith((".c", ".h")):
         return T_C
     if name.endswith((".S", ".s")):
@@ -422,6 +426,11 @@ class ASTT(IntEnum):
     Kconfig_Op_Unequal = auto()
     Kconfig_Symbol_Ref = auto()
     Kconfig_Constant = auto()
+    ## Maintainer Constructs
+    Maintainer_Section = auto()
+    Maintainer_Member = auto()
+    Maintainer_Pattern = auto()
+    Credits_Entry = auto()
 
 
 
