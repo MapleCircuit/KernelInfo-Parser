@@ -15,7 +15,7 @@ m_v_main = m_file_name = m_file = m_bridge_file = m_moved_file = m_type_descript
 ChangeSetType = Any
 _DEF_TYPES = (ASTT.C_struct, ASTT.C_functionproto, ASTT.C_union, ASTT.C_enum)
 _PUNCT_IGNORED = (";", ",", ")", "}")
-_KEYWORD_IGNORED = ("if", "else", "return", "switch", "case", "default", "break", "continue", "for", "while", "do", "goto")
+_KEYWORD_IGNORED = ("if", "else", "return", "switch", "case", "default", "break", "continue", "for", "while", "do", "goto", "_Static_assert", "static_assert")
 
 _CLANG_GET_CURSOR_EXTENT = cc.conf.lib.clang_getCursorExtent
 _CLANG_GET_CURSOR_EXTENT.argtypes = [cc.Cursor]
@@ -2544,6 +2544,9 @@ class C_Type(Ast):
                 logger.debug(f"C_Type>>asm keyword {tspelling}")
                 return
             case "_Generic":
+                return
+            case "_Static_assert" | "static_assert":
+                logger.debug(f"C_Type>>static assert keyword {tspelling}")
                 return
 
             # Type specifiers

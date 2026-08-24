@@ -257,6 +257,49 @@ class TestCASTParser(unittest.TestCase):
         self.assertTrue(res["execute_success"])
         self.assertEqual(res["actual_total_ops"], res["baseline_total_ops"])
 
+    def test_static_assert_keyword_handling(self) -> None:
+        """Verify _Static_assert and static_assert are handled cleanly without warnings."""
+        temp_dir = None
+        try:
+            G.DEBUG_TYPECHECK = True
+            G.DB = MockDB
+            G.TE = get_table_engine("cached")()
+            gp = GreatProcessor()
+            init_db_layout(gp)
+            G.TE.start(gp.Table_Array, G.DB)
+
+            mf = MasterFile()
+            temp_dir = mf.create_temp_dir()
+            mf.version_dict["v7.0"] = temp_dir
+            G.MF = mf
+            gp.Version_Name = "v7.0"
+            gp.VID = 1
+
+            file_path = "arch/x86/include/uapi/asm/elf.h"
+            full_path = os.path.join(temp_dir, file_path)
+            os.makedirs(os.path.dirname(full_path), exist_ok=True)
+            file_content = subprocess.check_output(
+                ["git", "-C", "linux", "show", f"v7.0:{file_path}"],
+                stderr=subprocess.PIPE,
+            )
+            with open(full_path, "wb") as f:
+                f.write(file_content)
+
+            cs = ChangeSet(f"A\t{file_path}")
+            cs.current_vid = 1
+            cs.gp = gp
+            cs.mf = mf
+            G.CURRENT_PARSING_FILE = file_path
+
+            default_processing(cs, gp)
+            cs.parse()
+            self.assertGreater(len(cs.cs), 0)
+            self.assertTrue(cs.execute())
+            self.assertEqual(len(cs.cs), len(cs.cs_result))
+        finally:
+            if temp_dir and os.path.exists(temp_dir):
+                shutil.rmtree(temp_dir, ignore_errors=True)
+
 
 def run_c_ast_tests(
     target_file: str | None = None,
