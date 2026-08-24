@@ -431,6 +431,28 @@ class ASTT(IntEnum):
     Maintainer_Member = auto()
     Maintainer_Pattern = auto()
     Credits_Entry = auto()
+    ## Rust Constructs
+    Rust_Struct = auto()
+    Rust_Field = auto()
+    Rust_Enum = auto()
+    Rust_Variant = auto()
+    Rust_Union = auto()
+    Rust_Fn = auto()
+    Rust_Param = auto()
+    Rust_Trait = auto()
+    Rust_TraitAlias = auto()
+    Rust_Impl = auto()
+    Rust_Type = auto()
+    Rust_Const = auto()
+    Rust_Static = auto()
+    Rust_Mod = auto()
+    Rust_Use = auto()
+    Rust_MacroDef = auto()
+    Rust_MacroCall = auto()
+    Rust_ForeignMod = auto()
+    Rust_Attribute = auto()
+    Rust_DocComment = auto()
+    Rust_Comment = auto()
 
 
 

@@ -77,7 +77,7 @@ class DatabaseManager:
         return "127.0.0.1"
 
     def _init_pool(self) -> None:
-        candidate_dbs = ["main"]
+        candidate_dbs = ["test"]
         if self.database and self.database not in candidate_dbs:
             candidate_dbs.append(self.database)
 

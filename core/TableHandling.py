@@ -102,6 +102,7 @@ from core.globalstuff import (
     T_C,
     T_ASM,
     T_KCONFIG,
+    T_RUST,
     T_MAINTAINERS,
     T_CREDITS,
     REF_ROOT,
@@ -868,6 +869,9 @@ class ChangeSet:
             elif current_type == T_CREDITS:
                 from parser.maintainer_ast.maintainer_ast import credits_ast_parse
                 credits_ast_parse(self)
+            elif current_type == T_RUST:
+                from parser.rust_ast.rust_ast import rust_ast_parse
+                rust_ast_parse(self)
         except FILE_ERROR as e:
             logger.error(f"FILE_ERROR for '{self.file_operation}'={self.current_path}")
             logger.error(e)
