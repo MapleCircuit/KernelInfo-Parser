@@ -137,8 +137,8 @@ from core.Profiler import PipelineProfiler
 logger = logging.getLogger(__name__)
 
 
-_REF_BYPASS_LINKS = (REF_POS, REF_MULTI)
-_REF_RESET_LINKS = (REF_ROOT, REF_C_AST, REF_NO_REF)
+_REF_BYPASS_LINKS = frozenset({REF_POS, REF_MULTI})
+_REF_RESET_LINKS = frozenset({REF_ROOT, REF_C_AST, REF_NO_REF})
 
 
 def is_data_unsafe(data: tuple) -> bool:
@@ -178,10 +178,9 @@ def to_safe_data(val: Any) -> SafeDataType:
     if isinstance(val, Enum):
         v = val.value
         return int(v) if type(v) is int else str(v)
-    if hasattr(val, "value"):
-        v = val.value
-        if isinstance(v, (int, str)):
-            return int(v) if type(v) is int else str(v)
+    val_attr = getattr(val, "value", None)
+    if val_attr is not None and (type(val_attr) is int or type(val_attr) is str):
+        return val_attr
     return val
 
 
@@ -251,6 +250,7 @@ class ChangeSet:
         self.route: list[LinkType] = [REF_ROOT]
         self.route_count: list[int] = []
         self.multi_stack: list[int] = []
+        self._cached_route: tuple[LinkType, ...] | None = (REF_ROOT,)
         self.prior_tags: Any | None = None
         self.parsers: dict[str, Any] = {}
         self.debug: list[Any] = []
@@ -274,6 +274,7 @@ class ChangeSet:
         Returns:
             Self (Context manager).
         """
+        self._cached_route = None
         if len(links) == 1:
             self.route_count.append(1)
             self.route.append(links[0])
@@ -302,6 +303,7 @@ class ChangeSet:
         exception_traceback: TracebackType | None,
     ) -> None:
         """Exit route context manager block and pop pushed link scopes."""
+        self._cached_route = None
         count = self.route_count.pop()
         popped = self.route[-count:] if len(self.route) >= count else []
         if REF_MULTI in popped and self.multi_stack:
@@ -310,6 +312,7 @@ class ChangeSet:
             self.route.pop()
             if len(self.route) == 0:
                 self.route = [REF_ROOT]
+                self._cached_route = (REF_ROOT,)
 
     def last_not_none(self) -> None:
         """Sanity check verifying that the last operation in `CS.cs` is not `None`.
@@ -376,6 +379,10 @@ class ChangeSet:
             return data
 
         output_data = []
+        out_append = output_data.append
+        cs_res = self.cs_result
+        cs_res_len = len(cs_res)
+
         for val in data:
             if type(val) is tuple:
                 if len(val) == 3 and val[1] == OP_REF:
@@ -383,21 +390,21 @@ class ChangeSet:
                     if type(route) is tuple and len(route) == 2 and route[0] == REF_POS:
                         pos_idx = route[1]
                         col_idx = val[0][1]
-                        if pos_idx < len(self.cs_result):
-                            res = self.cs_result[pos_idx]
+                        if pos_idx < cs_res_len:
+                            res = cs_res[pos_idx]
                             if res is not None and col_idx < len(res):
                                 resolved = res[col_idx]
                                 if type(resolved) is not tuple:
-                                    output_data.append(to_safe_data(resolved))
+                                    out_append(resolved)
                                     continue
                 resolved = self.resolve_ref(val[0], val[2])
                 if resolved is None:
                     if G.BP_ON_REF_FAIL:
                         G.BP()
                     raise REF_NOT_RESOLVABLE
-                output_data.append(to_safe_data(resolved))
+                out_append(to_safe_data(resolved))
             else:
-                output_data.append(to_safe_data(val))
+                out_append(val if (type(val) is int or type(val) is str or val is None) else to_safe_data(val))
         return tuple(output_data)
 
     def execute(self) -> bool:
@@ -417,8 +424,14 @@ class ChangeSet:
         te = G.TE
         operation_offset = len(self.cs_result)
         t_exec_0 = time.perf_counter() if self.profiler is not None else 0.0
+        cs = self.cs
+        cs_result = self.cs_result
+        cs_res_append = cs_result.append
+        te_set = te.set
+        te_update = te.update
+        te_view_set = te.view_set
 
-        for operation in self.cs[operation_offset:]:
+        for operation in cs[operation_offset:]:
             try:
                 op_type = operation[1]
                 if op_type == OP_REF_VIEW:
@@ -430,22 +443,22 @@ class ChangeSet:
 
                 data = self._resolve_ref_from_tuple(operation[2])
 
-                if op_type in {OP_DONE, OP_VIEW_DONE}:
-                    self.cs_result.append(data)
+                if op_type == OP_DONE or op_type == OP_VIEW_DONE:
+                    cs_res_append(data)
                     continue
 
                 if op_type == OP_SET:
-                    self.cs_result.append(te.set(operation[0], data))
+                    cs_res_append(te_set(operation[0], data))
                     continue
                 if op_type == OP_UPDATE:
-                    self.cs_result.append(te.update(operation[0], data))
+                    cs_res_append(te_update(operation[0], data))
                     continue
                 if op_type == OP_VIEW_SET:
-                    self.cs_result.append(te.view_set(operation[0], data))
+                    cs_res_append(te_view_set(operation[0], data))
                     continue
 
                 logger.error(f"ERROR, UNKNOWN OPERATION {operation}")
-                self.cs_result.append(None)
+                cs_res_append(None)
             except REF_NOT_RESOLVABLE:
                 if self.profiler is not None:
                     self.profiler.cs_execute_s = time.perf_counter() - t_exec_0
@@ -485,6 +498,7 @@ class ChangeSet:
                         self.store_dict[REF_MULTI][multi_idx].append(op_idx)
                 self.route.append(REF_POS)
                 self.route.append(op_idx)
+                self._cached_route = None
                 self.cs.append(operation)
                 return
             elif route[-1] == REF_NO_REF:
@@ -501,13 +515,21 @@ class ChangeSet:
                         self.store_dict[REF_MULTI][multi_idx] = []
                     self.store_dict[REF_MULTI][multi_idx].append(op_idx)
             self.route.append(op_idx)
+            self._cached_route = None
             self.cs.append(operation)
             return
         elif self.route[-1] == REF_NO_REF:
             self.cs.append(operation)
             return
 
-        parsed_route = tuple(self.route_parse(self.route + list(route)))
+        if not route:
+            parsed_route = self._cached_route
+            if parsed_route is None:
+                parsed_route = tuple(self.route_parse(self.route))
+                self._cached_route = parsed_route
+        else:
+            parsed_route = tuple(self.route_parse(self.route + list(route)))
+
         target = operation[0]
         first_tid = target if type(target) is int else target[0][0][0]
 
@@ -519,16 +541,18 @@ class ChangeSet:
 
             self.store_dict[REF_MULTI][parsed_route[1]].append(len(self.cs))
         else:
-            if self.store_dict.get(parsed_route) is None:
-                self.store_dict[parsed_route] = {}
+            store_entry = self.store_dict.get(parsed_route)
+            if store_entry is None:
+                store_entry = {}
+                self.store_dict[parsed_route] = store_entry
             elif G.DEBUG_TYPECHECK:
-                if (current_val := self.store_dict[parsed_route].get(first_tid)) is not None:
+                if (current_val := store_entry.get(first_tid)) is not None:
                     assert self.cs[current_val] == operation, (
                         f"Not only did you push 2 times to the same route, but you didn't push the same value!!!\n"
                         f"-current_val:{self.cs[current_val]}\n-operation:{operation}"
                     )
 
-            self.store_dict[parsed_route][first_tid] = len(self.cs)
+            store_entry[first_tid] = len(self.cs)
 
         self.cs.append(operation)
 
@@ -970,9 +994,11 @@ class Table:
         for x, column in enumerate(self.init_columns):
             setattr(self, column[0], (self.table_id, x))
 
-        # Step 2: Inject Table object reference into c_ast_type module scope for AST parsing
+        # Step 2: Inject Table object reference into c_ast_type and c_ast module scopes for AST parsing
         if mod := sys.modules.get("parser.c_ast.c_ast_type"):
             setattr(mod, self.table_name, self)
+        if mod_c := sys.modules.get("parser.c_ast.c_ast"):
+            setattr(mod_c, self.table_name, self)
 
     def start_te(self) -> None:
         """Register table schema with active Table Engine (`G.TE`)."""
@@ -1054,7 +1080,7 @@ class Table:
         if result is None:
             return None
 
-        return (self.table_id, OP_DONE, tuple(to_safe_data(x) for x in result))
+        return (self.table_id, OP_DONE, result)
 
     @G.type_check(Self, {UnSafeDataType})
     def get_set(self, *columns: UnSafeDataType) -> OperationType:
@@ -1073,7 +1099,7 @@ class Table:
             sanitized_columns = tuple(to_safe_data(col) for col in columns)
             result = G.TE.get(self.table_id, sanitized_columns)
             if result:
-                return (self.table_id, OP_DONE, tuple(to_safe_data(x) for x in result))
+                return (self.table_id, OP_DONE, result)
             return (self.table_id, OP_SET, sanitized_columns)
 
         return (self.table_id, OP_SET, normalize_data_tuple(columns))
@@ -1096,7 +1122,7 @@ class Table:
             sanitized_data = tuple(to_safe_data(x) for x in data)
             result = G.TE.view_get(joins, sanitized_data)
             if result:
-                return (joins, OP_VIEW_DONE, tuple(to_safe_data(x) for x in result))
+                return (joins, OP_VIEW_DONE, result)
             return (joins, OP_VIEW_SET, sanitized_data)
 
         return (joins, OP_VIEW_SET, normalize_data_tuple(data))
@@ -1119,7 +1145,7 @@ class Table:
             sanitized_data = tuple(to_safe_data(x) for x in data)
             result = G.TE.view_get(joins, sanitized_data)
             if result:
-                return (joins, OP_VIEW_DONE, tuple(to_safe_data(x) for x in result))
+                return (joins, OP_VIEW_DONE, result)
 
         return None
 

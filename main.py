@@ -782,7 +782,7 @@ def file_processing_worker(
 
         if batch_cs_dict:
             try:
-                result_queue.put(pickle.dumps(batch_cs_dict))
+                result_queue.put(pickle.dumps(batch_cs_dict, protocol=pickle.HIGHEST_PROTOCOL))
             except Exception as e:
                 logger.error(COLOR.red(f"Worker {worker_id} failed to serialize batch {batch_id}: {e}"))
                 error_queue.put((f"Batch-{batch_id}", str(e), traceback.format_exc()))
@@ -881,10 +881,14 @@ def processing_unchanges() -> None:
             logger.error(gp.Old_VID)
             logger.error(m_file_name.get(m_file_name.fname(unchanged)))
             continue
-        CS.store(m_bridge_file.set(
-            gp.VID,
-            un_m_file_name[2][0],
-            un_m_bridge_file[2][2],
+        CS.cs.append((
+            m_bridge_file.table_id,
+            1,  # OP_SET
+            (
+                gp.VID,
+                un_m_file_name[2][0],
+                un_m_bridge_file[2][2],
+            ),
         ))
         if len(CS.cs) >= batch_size:
             gp.ChangeSet_Dict[f"-UNCHANGED-{batch_idx}-"] = CS
@@ -923,10 +927,14 @@ def processing_dirs() -> None:  # noqa: C901
                 logger.error("Unchanged dirs: old_m_bridge_file is None")
                 logger.error(single_dir)
                 continue
-            CS.store(m_bridge_file.set(
-                gp.VID,
-                un_m_file_name[2][0],
-                old_m_bridge_file[2][2],
+            CS.cs.append((
+                m_bridge_file.table_id,
+                1,  # OP_SET
+                (
+                    gp.VID,
+                    un_m_file_name[2][0],
+                    old_m_bridge_file[2][2],
+                ),
             ))
 
         if CS.cs:
@@ -1005,6 +1013,22 @@ def processing_git_commits(version: str) -> None:
 
     logger.info(f"Processing {len(commits)} git commits for version '{version}'...")
 
+    file_fid_cache: dict[str, int | None] = {}
+
+    def get_fid_for_path(path: str) -> int | None:
+        if path in file_fid_cache:
+            return file_fid_cache[path]
+        fn_row = m_file_name.get(None, path)
+        if fn_row and len(fn_row) >= 3 and fn_row[2]:
+            fnid = fn_row[2][0]
+            bf_row = m_bridge_file.get(gp.VID, fnid, None)
+            if bf_row and len(bf_row) >= 3 and bf_row[2]:
+                fid = bf_row[2][2]
+                file_fid_cache[path] = fid
+                return fid
+        file_fid_cache[path] = None
+        return None
+
     commit_hash_to_id = {}
     for commit in commits:
         # Resolve author person_id
@@ -1059,35 +1083,26 @@ def processing_git_commits(version: str) -> None:
 
         # Insert modified file bridges
         for change_type, file_path in commit.files:
-            fn_row = m_file_name.get(None, file_path)
-            if fn_row and len(fn_row) >= 3 and fn_row[2]:
-                fnid = fn_row[2][0]
-                bf_row = m_bridge_file.get(gp.VID, fnid, None)
-                if bf_row and len(bf_row) >= 3 and bf_row[2]:
-                    fid = bf_row[2][2]
-                    G.TE.set(
-                        m_bridge_commit_file.table_id,
-                        (
-                            commit_id,
-                            gp.VID,
-                            fid,
-                            change_type[:1],
-                        ),
-                    )
+            fid = get_fid_for_path(file_path)
+            if fid is not None:
+                G.TE.set(
+                    m_bridge_commit_file.table_id,
+                    (
+                        commit_id,
+                        gp.VID,
+                        fid,
+                        change_type[:1],
+                    ),
+                )
 
     # Link tags to commits for all changed files and evacuate executed ChangeSet memory
     for file_path, cs_obj in list(gp.ChangeSet_Dict.items()):
         if not cs_obj or not getattr(cs_obj, "current_path", None):
             continue
         c_path = cs_obj.current_path
-        fn_row = m_file_name.get(None, c_path)
-        if not fn_row or len(fn_row) < 3 or not fn_row[2]:
+        fid = get_fid_for_path(c_path)
+        if fid is None:
             continue
-        fnid = fn_row[2][0]
-        bf_row = m_bridge_file.get(gp.VID, fnid, None)
-        if not bf_row or len(bf_row) < 3 or not bf_row[2]:
-            continue
-        fid = bf_row[2][2]
 
         # Collect tags for this file from ChangeSet operations
         file_tags = []

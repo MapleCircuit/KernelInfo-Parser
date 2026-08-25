@@ -354,7 +354,13 @@ _CTYPES_E_LINE = cc.c_uint()
 _CTYPES_E_COL = cc.c_uint()
 _CTYPES_E_OFF = cc.c_uint()
 _CTYPES_BYREF = ctypes.byref
-
+_BYREF_F_PTR = ctypes.byref(_CTYPES_F_PTR)
+_BYREF_S_LINE = ctypes.byref(_CTYPES_S_LINE)
+_BYREF_S_COL = ctypes.byref(_CTYPES_S_COL)
+_BYREF_S_OFF = ctypes.byref(_CTYPES_S_OFF)
+_BYREF_E_LINE = ctypes.byref(_CTYPES_E_LINE)
+_BYREF_E_COL = ctypes.byref(_CTYPES_E_COL)
+_BYREF_E_OFF = ctypes.byref(_CTYPES_E_OFF)
 
 _CLANG_GET_TOKEN_KIND = cc.conf.lib.clang_getTokenKind
 _CLANG_GET_TOKEN_KIND.argtypes = [cc.Token]
@@ -377,8 +383,8 @@ def get_cursor_line(cursor) -> Line:
     ext = _CLANG_GET_CURSOR_EXTENT(cursor)
     st = _CLANG_GET_RANGE_START(ext)
     en = _CLANG_GET_RANGE_END(ext)
-    _CLANG_GET_SPELLING_LOC(st, _CTYPES_BYREF(_CTYPES_F_PTR), _CTYPES_BYREF(_CTYPES_S_LINE), _CTYPES_BYREF(_CTYPES_S_COL), _CTYPES_BYREF(_CTYPES_S_OFF))
-    _CLANG_GET_SPELLING_LOC(en, _CTYPES_BYREF(_CTYPES_F_PTR), _CTYPES_BYREF(_CTYPES_E_LINE), _CTYPES_BYREF(_CTYPES_E_COL), _CTYPES_BYREF(_CTYPES_E_OFF))
+    _CLANG_GET_SPELLING_LOC(st, _BYREF_F_PTR, _BYREF_S_LINE, _BYREF_S_COL, _BYREF_S_OFF)
+    _CLANG_GET_SPELLING_LOC(en, _BYREF_F_PTR, _BYREF_E_LINE, _BYREF_E_COL, _BYREF_E_OFF)
     cl = Line.__new__(Line)
     cl.code = ""
     cl.line_pos = (_CTYPES_S_LINE.value, _CTYPES_E_LINE.value)
@@ -421,25 +427,48 @@ class TokenList:
 
         cc.conf.lib.clang_annotateTokens(parsed_tu, tokens_memory.contents, self.count, temp_cursors_array)
 
+        self.cursors_array = []
         for cursor in temp_cursors_array:
             cursor._tu = parsed_tu
             self.cursors_array.append(cursor)
 
         temp_tokens_array = ctypes.cast(tokens_memory, ctypes.POINTER(cc.Token * self.count)).contents
+        
+        get_extent = _CLANG_GET_EXTENT
+        get_range_start = _CLANG_GET_RANGE_START
+        get_range_end = _CLANG_GET_RANGE_END
+        get_spelling_loc = _CLANG_GET_SPELLING_LOC
+        get_token_kind = _CLANG_GET_TOKEN_KIND
+        token_kind_map = _CLANG_TOKEN_KIND_MAP
+        byref_f = _BYREF_F_PTR
+        byref_s_l = _BYREF_S_LINE
+        byref_s_c = _BYREF_S_COL
+        byref_s_o = _BYREF_S_OFF
+        byref_e_l = _BYREF_E_LINE
+        byref_e_c = _BYREF_E_COL
+        byref_e_o = _BYREF_E_OFF
+        s_l_val = _CTYPES_S_LINE
+        e_l_val = _CTYPES_E_LINE
+        s_c_val = _CTYPES_S_COL
+        e_c_val = _CTYPES_E_COL
+        tokens_array = []
+        tokens_append = tokens_array.append
+        rawfile_len = len(rawfile) if rawfile else 0
+
         for token in temp_tokens_array:
             token._tu = parsed_tu
 
             # Direct Ctypes line/char coordinate extraction (2 C calls vs 5 C calls)
-            ext = _CLANG_GET_EXTENT(parsed_tu, token)
-            st = _CLANG_GET_RANGE_START(ext)
-            en = _CLANG_GET_RANGE_END(ext)
-            _CLANG_GET_SPELLING_LOC(st, _CTYPES_BYREF(_CTYPES_F_PTR), _CTYPES_BYREF(_CTYPES_S_LINE), _CTYPES_BYREF(_CTYPES_S_COL), _CTYPES_BYREF(_CTYPES_S_OFF))
-            _CLANG_GET_SPELLING_LOC(en, _CTYPES_BYREF(_CTYPES_F_PTR), _CTYPES_BYREF(_CTYPES_E_LINE), _CTYPES_BYREF(_CTYPES_E_COL), _CTYPES_BYREF(_CTYPES_E_OFF))
+            ext = get_extent(parsed_tu, token)
+            st = get_range_start(ext)
+            en = get_range_end(ext)
+            get_spelling_loc(st, byref_f, byref_s_l, byref_s_c, byref_s_o)
+            get_spelling_loc(en, byref_f, byref_e_l, byref_e_c, byref_e_o)
 
-            s_line = _CTYPES_S_LINE.value
-            e_line = _CTYPES_E_LINE.value
-            s_col = _CTYPES_S_COL.value
-            e_col = _CTYPES_E_COL.value
+            s_line = s_l_val.value
+            e_line = e_l_val.value
+            s_col = s_c_val.value
+            e_col = e_c_val.value
 
             l = Line.__new__(Line)
             l.code = ""
@@ -447,7 +476,7 @@ class TokenList:
             l.char_pos = (s_col, e_col)
             token.line = l
 
-            if s_line == e_line and rawfile and s_line <= len(rawfile):
+            if s_line == e_line and s_line <= rawfile_len:
                 token.spelling_str = rawfile[s_line - 1][s_col - 1 : e_col - 1]
             else:
                 try:
@@ -455,9 +484,10 @@ class TokenList:
                 except Exception:
                     token.spelling_str = ""
 
-            token.ast_kind = _CLANG_TOKEN_KIND_MAP[_CLANG_GET_TOKEN_KIND(token)]
-            self.tokens_array.append(token)
+            token.ast_kind = token_kind_map[get_token_kind(token)]
+            tokens_append(token)
 
+        self.tokens_array = tokens_array
         self.token_group = cc.TokenGroup(parsed_tu, tokens_memory, tokens_count)
 
         return
@@ -860,20 +890,17 @@ class Ast_Manager:
 ###### END SPECIAL BINDINGS 
 
 
+_COMMENT_PATTERN = re.compile(
+    r'//.*?$|/\*.*?\*/|\'(?:\\.|[^\\\'])*\'|"(?:\\.|[^\\"])*"',
+    re.DOTALL | re.MULTILINE,
+)
+
+def _comment_replacer(match: object) -> str:
+    s = match.group(0)
+    if s.startswith("/"):
+        return "\n" * s.count("\n")
+    return s
+
 def comment_remover(text: str) -> str:
-    """Remove C comments.
-
-    Stolen from: https://gist.github.com/ChunMinChang/88bfa5842396c1fbbc5b
-    """
-    def replacer(match: object) -> str:
-        s = match.group(0)
-        if s.startswith("/"):
-            return "\n" * s.count("\n")
-
-        return s
-
-    pattern = re.compile(
-        r'//.*?$|/\*.*?\*/|\'(?:\\.|[^\\\'])*\'|"(?:\\.|[^\\"])*"',
-        re.DOTALL | re.MULTILINE,
-    )
-    return re.sub(pattern, replacer, text)
+    """Remove C comments."""
+    return _COMMENT_PATTERN.sub(_comment_replacer, text)

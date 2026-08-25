@@ -20,19 +20,20 @@ class PatternType(IntEnum):
     REGEX = 4    # 'N' - File regex pattern
 
 
-@dataclass
+@dataclass(slots=True)
 class MaintainerPerson:
     """Represents a maintainer, reviewer, or contributor."""
     name: str
     email: str
     role: MaintainerRole = MaintainerRole.MAINTAINER
+    person_id: int | None = None
 
     def __post_init__(self) -> None:
         self.name = self.name.strip().strip('"\'')
         self.email = self.email.strip().strip("<>\"' \t\r\n")
 
 
-@dataclass
+@dataclass(slots=True)
 class PatternRule:
     """Represents a pattern rule within a maintainer section."""
     pat_type: PatternType
@@ -43,7 +44,7 @@ class PatternRule:
         self.pattern = self.pattern.strip()
 
 
-@dataclass
+@dataclass(slots=True)
 class MaintainerSection:
     """Represents an entire subsystem entry in MAINTAINERS."""
     name: str
@@ -57,6 +58,7 @@ class MaintainerSection:
     line_s: int = 1
     line_e: int = 1
     raw_text: str = ""
+    sec_id: int | None = None
 
     def get_maintainers(self) -> list[MaintainerPerson]:
         """Return members designated as maintainers."""
@@ -75,7 +77,7 @@ class MaintainerSection:
         return [p.pattern for p in self.patterns if p.pat_type == PatternType.EXCLUDE]
 
 
-@dataclass
+@dataclass(slots=True)
 class CreditsEntry:
     """Represents a contributor record from CREDITS."""
     name: str
@@ -87,6 +89,8 @@ class CreditsEntry:
     line_s: int = 1
     line_e: int = 1
     raw_text: str = ""
+    credit_id: int | None = None
+    person_id: int | None = None
 
     def __post_init__(self) -> None:
         self.name = self.name.strip().strip('"\'')

@@ -301,12 +301,12 @@ class PointerGetter:
 
 def type_check(name: str) -> int | None:
     """Parse string to get file type."""
+    if name.endswith((".c", ".h")):
+        return T_C
     if name == "MAINTAINERS" or name.endswith("/MAINTAINERS"):
         return T_MAINTAINERS
     if name == "CREDITS" or name.endswith("/CREDITS"):
         return T_CREDITS
-    if name.endswith((".c", ".h")):
-        return T_C
     if name.endswith((".S", ".s")):
         return T_ASM
     if name.endswith("Kconfig"):

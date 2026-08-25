@@ -37,7 +37,7 @@ class CommitRole(IntEnum):
         return cls.OTHER
 
 
-@dataclass
+@dataclass(slots=True)
 class GitContributor:
     """Represents an individual contributor (author, committer, reviewer, signer) on a commit."""
     name: str
@@ -47,7 +47,7 @@ class GitContributor:
     person_id: int | None = None
 
 
-@dataclass
+@dataclass(slots=True)
 class GitCommit:
     """Represents a parsed git commit with full metadata and contributors."""
     commit_hash: str
@@ -66,7 +66,7 @@ class GitCommit:
     committer_person_id: int | None = None
 
 
-@dataclass
+@dataclass(slots=True)
 class CommitDiffHunk:
     """Represents a unified diff hunk in a commit for spatial tag coordinate mapping."""
     commit_hash: str

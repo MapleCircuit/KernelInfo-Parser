@@ -64,7 +64,7 @@ class TokenType(Enum):
     EOF = auto()
 
 
-@dataclass
+@dataclass(slots=True)
 class Token:
     type: TokenType
     value: str

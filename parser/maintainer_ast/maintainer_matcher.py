@@ -117,7 +117,7 @@ class MaintainerMatcher:
 
         # Fast lookup indices by exact paths and top-level directory prefixes
         self.exact_index: dict[str, list[CompiledSectionRules]] = defaultdict(list)
-        self.prefix_index: list[tuple[str, CompiledSectionRules]] = []
+        self.prefix_by_top_dir: dict[str, list[tuple[str, CompiledSectionRules]]] = defaultdict(list)
         self.general_rules: list[CompiledSectionRules] = []
 
         for rule in self.compiled_rules:
@@ -126,22 +126,36 @@ class MaintainerMatcher:
                 self.exact_index[exact_path].append(rule)
                 has_specific = True
             for pfx in rule.prefix_includes:
-                self.prefix_index.append((pfx, rule))
+                top_dir = pfx.split("/", 1)[0]
+                self.prefix_by_top_dir[top_dir].append((pfx, rule))
                 has_specific = True
             if rule.regex_includes or not has_specific:
                 self.general_rules.append(rule)
 
     def match_file(self, file_path: str) -> list[MaintainerSection]:
-        """Find all maintainer sections responsible for the given file path."""
+        """Find all maintainer sections responsible for the given file path using indexed lookups."""
         file_path = file_path.strip().lstrip("/")
         matching_sections: list[MaintainerSection] = []
         seen_secs: set[str] = set()
 
-        for rule in self.compiled_rules:
-            if rule.matches(file_path):
-                if rule.section.name not in seen_secs:
-                    seen_secs.add(rule.section.name)
-                    matching_sections.append(rule.section)
+        # 1. Exact path matches
+        for rule in self.exact_index.get(file_path, ()):
+            if rule.matches(file_path) and rule.section.name not in seen_secs:
+                seen_secs.add(rule.section.name)
+                matching_sections.append(rule.section)
+
+        # 2. Top-level directory prefix matches
+        top_dir = file_path.split("/", 1)[0]
+        for pfx, rule in self.prefix_by_top_dir.get(top_dir, ()):
+            if rule.section.name not in seen_secs and file_path.startswith(pfx) and rule.matches(file_path):
+                seen_secs.add(rule.section.name)
+                matching_sections.append(rule.section)
+
+        # 3. General regex / root wildcard fallback rules
+        for rule in self.general_rules:
+            if rule.section.name not in seen_secs and rule.matches(file_path):
+                seen_secs.add(rule.section.name)
+                matching_sections.append(rule.section)
 
         return matching_sections
 

@@ -1,5 +1,7 @@
 """FileHandler.py - Interacts with the FS and GIT."""
+import os
 import shutil
+import tempfile
 import subprocess as sp
 from pathlib import Path
 from core.globalstuff import G
@@ -15,9 +17,7 @@ class MasterFile:
 
     def create_temp_dir(self) -> str:
         """Create a new temporary directory in RAMDISK for cloning repository versions."""
-        command = ["mktemp", "-d", "-p", f"{G.RAMDISK}", "code-parser.XXXXXX"]
-        output = sp.run(command, capture_output=True, text=True)  # noqa: PLW1510, S603
-        return output.stdout.strip()
+        return tempfile.mkdtemp(prefix="code-parser.", dir=G.RAMDISK)
 
     def add_version(self, version_name: str, purge_list: list) -> None:
         """Clone a new repository version, register its directory, and track it in purge_list."""
@@ -28,10 +28,11 @@ class MasterFile:
     def trim_version(self, keep: int = 2) -> int:
         """Remove the oldest cloned repository version directory from disk and dictionaries."""
         if len(self.version_dict) > keep:
-            print("Removing old version_dict")
-            shutil.rmtree(self.version_dict[next(iter(self.version_dict))])
-            del self.version_dict[next(iter(self.version_dict))]
-            del self.file_dict[next(iter(self.file_dict))]
+            oldest_v = next(iter(self.version_dict))
+            oldest_dir = self.version_dict.pop(oldest_v)
+            self.file_dict.pop(oldest_v, None)
+            if os.path.exists(oldest_dir):
+                shutil.rmtree(oldest_dir, ignore_errors=True)
             return 1
         return 0
 
@@ -57,13 +58,19 @@ class MasterFile:
         # Symlinks for asm
         asm_path = Path(f"{temp_path}/include/asm")
         if not asm_path.exists():
-            sp.run(["ln", "-s", "asm-generic", f"{temp_path}/include/asm"])  # noqa: S603, PLW1510
+            try:
+                os.symlink("asm-generic", asm_path)
+            except OSError:
+                sp.run(["ln", "-s", "asm-generic", str(asm_path)], check=False)
 
         uapi_asm_parent = Path(f"{temp_path}/include/uapi")
         if uapi_asm_parent.exists():
             uapi_asm_path = Path(f"{temp_path}/include/uapi/asm")
             if not uapi_asm_path.exists():
-                sp.run(["ln", "-s", "asm-generic", f"{temp_path}/include/uapi/asm"])  # noqa: S603, PLW1510
+                try:
+                    os.symlink("asm-generic", uapi_asm_path)
+                except OSError:
+                    sp.run(["ln", "-s", "asm-generic", str(uapi_asm_path)], check=False)
         return temp_path
 
     def get_file(self, file_path: str, version: str) -> str:

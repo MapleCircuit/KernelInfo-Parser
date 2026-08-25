@@ -13,9 +13,9 @@ logger = logging.getLogger(__name__)
 # Linter bypass
 m_v_main = m_file_name = m_file = m_bridge_file = m_moved_file = m_type_descriptor = m_ast = m_ast_container = m_ast_include = m_ast_debug = m_tag = m_bridge_tag = m_map_ast = m_bridge_map = m_ast_hash = None
 ChangeSetType = Any
-_DEF_TYPES = (ASTT.C_struct, ASTT.C_functionproto, ASTT.C_union, ASTT.C_enum)
-_PUNCT_IGNORED = (";", ",", ")", "}")
-_KEYWORD_IGNORED = ("if", "else", "return", "switch", "case", "default", "break", "continue", "for", "while", "do", "goto", "_Static_assert", "static_assert")
+_DEF_TYPES = frozenset({ASTT.C_struct, ASTT.C_functionproto, ASTT.C_union, ASTT.C_enum})
+_PUNCT_IGNORED = frozenset({";", ",", ")", "}"})
+_KEYWORD_IGNORED = frozenset({"if", "else", "return", "switch", "case", "default", "break", "continue", "for", "while", "do", "goto", "_Static_assert", "static_assert"})
 
 _CLANG_GET_CURSOR_EXTENT = cc.conf.lib.clang_getCursorExtent
 _CLANG_GET_CURSOR_EXTENT.argtypes = [cc.Cursor]
@@ -38,7 +38,14 @@ _CTYPES_S_OFF = cc.c_uint()
 _CTYPES_E_LINE = cc.c_uint()
 _CTYPES_E_COL = cc.c_uint()
 _CTYPES_E_OFF = cc.c_uint()
-_CTYPES_BYREF = ctypes.byref
+
+_BYREF_F_PTR = ctypes.byref(_CTYPES_F_PTR)
+_BYREF_S_LINE = ctypes.byref(_CTYPES_S_LINE)
+_BYREF_S_COL = ctypes.byref(_CTYPES_S_COL)
+_BYREF_S_OFF = ctypes.byref(_CTYPES_S_OFF)
+_BYREF_E_LINE = ctypes.byref(_CTYPES_E_LINE)
+_BYREF_E_COL = ctypes.byref(_CTYPES_E_COL)
+_BYREF_E_OFF = ctypes.byref(_CTYPES_E_OFF)
 
 
 def get_cursor_line(cursor) -> Line:
@@ -49,8 +56,8 @@ def get_cursor_line(cursor) -> Line:
     ext = _CLANG_GET_CURSOR_EXTENT(cursor)
     st = _CLANG_GET_RANGE_START(ext)
     en = _CLANG_GET_RANGE_END(ext)
-    _CLANG_GET_SPELLING_LOC(st, _CTYPES_BYREF(_CTYPES_F_PTR), _CTYPES_BYREF(_CTYPES_S_LINE), _CTYPES_BYREF(_CTYPES_S_COL), _CTYPES_BYREF(_CTYPES_S_OFF))
-    _CLANG_GET_SPELLING_LOC(en, _CTYPES_BYREF(_CTYPES_F_PTR), _CTYPES_BYREF(_CTYPES_E_LINE), _CTYPES_BYREF(_CTYPES_E_COL), _CTYPES_BYREF(_CTYPES_E_OFF))
+    _CLANG_GET_SPELLING_LOC(st, _BYREF_F_PTR, _BYREF_S_LINE, _BYREF_S_COL, _BYREF_S_OFF)
+    _CLANG_GET_SPELLING_LOC(en, _BYREF_F_PTR, _BYREF_E_LINE, _BYREF_E_COL, _BYREF_E_OFF)
     cl = Line.__new__(Line)
     cl.code = ""
     cl.line_pos = (_CTYPES_S_LINE.value, _CTYPES_E_LINE.value)
@@ -283,33 +290,36 @@ class Line:
         s_s_l, s_e_l = self.line_pos
         if type(extent) is Line:
             e_s_l, e_e_l = extent.line_pos
+            if s_s_l > e_s_l or e_e_l > s_e_l:
+                return False
+            if s_s_l < e_s_l and e_e_l < s_e_l:
+                return True
+            s_s_c, s_e_c = self.char_pos
             e_s_c, e_e_c = extent.char_pos
-        elif hasattr(extent, 'line') and type(extent.line) is Line:
-            e_s_l, e_e_l = extent.line.line_pos
-            e_s_c, e_e_c = extent.line.char_pos
-        elif isinstance(extent, Line):
-            e_s_l, e_e_l = extent.line_pos
-            e_s_c, e_e_c = extent.char_pos
-        elif isinstance(extent, cc.SourceRange):
+            return not ((s_s_l == e_s_l and s_s_c > e_s_c) or (s_e_l == e_e_l and s_e_c < e_e_c))
+
+        if hasattr(extent, 'line') and type(extent.line) is Line:
+            t_ext = extent.line
+            e_s_l, e_e_l = t_ext.line_pos
+            if s_s_l > e_s_l or e_e_l > s_e_l:
+                return False
+            if s_s_l < e_s_l and e_e_l < s_e_l:
+                return True
+            s_s_c, s_e_c = self.char_pos
+            e_s_c, e_e_c = t_ext.char_pos
+            return not ((s_s_l == e_s_l and s_s_c > e_s_c) or (s_e_l == e_e_l and s_e_c < e_e_c))
+
+        if isinstance(extent, cc.SourceRange):
             e_s_l, e_e_l = extent.start.line, extent.end.line
+            if s_s_l > e_s_l or e_e_l > s_e_l:
+                return False
+            if s_s_l < e_s_l and e_e_l < s_e_l:
+                return True
+            s_s_c, s_e_c = self.char_pos
             e_s_c, e_e_c = extent.start.column, extent.end.column
-        else:
-            return False
+            return not ((s_s_l == e_s_l and s_s_c > e_s_c) or (s_e_l == e_e_l and s_e_c < e_e_c))
 
-        # line_pos squarely inside or outside.
-        if s_s_l > e_s_l or e_e_l > s_e_l:
-            return False
-        elif s_s_l < e_s_l and e_e_l < s_e_l:
-            return True
-
-        # check char_pos if we are outside.
-        s_s_c, s_e_c = self.char_pos
-        if s_s_l == e_s_l and s_s_c > e_s_c:
-            return False
-        if s_e_l == e_e_l and s_e_c < e_e_c:
-            return False
-
-        return True
+        return False
 
     def __eq__(self, other: object) -> bool:
         if isinstance(other, Line):
@@ -374,7 +384,6 @@ class Ast:
 
     def tag(self, CS: ChangeSetType, ast_id_route: RouteType, extent: Line|None=None) -> None:
         """Create or recycle tag for current AST."""
-        from core.DBLayout import m_ast, m_file, m_tag, m_bridge_tag
         self.extent = extent
         if self.extent is None:
             self.extent = Line(0, 0)
@@ -1966,7 +1975,7 @@ class Zone_Type(IntEnum):
     Initializer_Expr = 8
 
 
-_BRACE_ZONE_TYPES = (Zone_Type.Declared_Args, Zone_Type.Enum_Content, Zone_Type.Compound_Stmt)
+_BRACE_ZONE_TYPES = frozenset({Zone_Type.Declared_Args, Zone_Type.Enum_Content, Zone_Type.Compound_Stmt})
 
 
 class Zone:
