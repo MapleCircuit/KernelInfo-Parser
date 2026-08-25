@@ -113,7 +113,7 @@ configure_logging(level=logging.INFO, fmt="%(asctime)s - %(levelname)s - %(messa
 logger = logging.getLogger(__name__)
 
 init_db_layout(gp)
-##################################
+
 
 def update(version: str) -> None:
     """Execute the full version parsing and database ingestion pipeline for a target release version.
@@ -211,11 +211,7 @@ def update(version: str) -> None:
             pass
 
     with G.DB() as db:
-        db.remove_indexes((
-            ("ast_index", m_ast),
-            ("file_name_index", m_file_name),
-            ("bridge_tag_fid_idx", m_bridge_tag),
-        ))
+        db.remove_indexes(((item[0],item[1]) for item in performance_indexes))
 
     G.TE.commit_all()
 
@@ -249,6 +245,7 @@ def trigger_multicore(batch_size: int = 200) -> None:
         f"(batch size: {batch_size}) across {num_workers} parallel workers"
     )
 
+    # If no change within this version
     if total_files == 0:
         G.TE.start_new_db(G.DB)
         processing_dirs()
@@ -345,7 +342,7 @@ def main() -> None:
                 except Exception:
                     pass
 
-    #try:
+
     update("v3.0")
     update("v3.1")
     if True:
@@ -431,12 +428,6 @@ def main() -> None:
         update("v7.0")
         update("v7.1")
         update("v7.2")
-
-
-    #except Exception as e:  # noqa: BLE001
-    #    logger.error("Error in Update()")
-    #    logger.error(e)
-    #    G.emergency_shutdown(2)
 
 
     logger.info("We are done! Closing")
@@ -894,9 +885,6 @@ def processing_unchanges() -> None:
         else:
             changed_set.add(item.split("\t")[-1])
 
-    #changed_set = {x.split("\t")[-1] for x in filter(lambda x: not x.startswith("D"), gp.Change_List)}
-    #deleted_set = {x.split("\t")[-1] for x in filter(lambda x: x.startswith("D"), gp.Change_List)}
-
     unchanged_set = full_set - changed_set
 
     old_full_set = set(MF.git_file_list(gp.Old_Version_Name).splitlines())
@@ -907,7 +895,6 @@ def processing_unchanges() -> None:
         if G.OVERRIDE_FORGOTTEN_PRINT:
             logger.debug(forgotten_delete)
         file_processing(0, 0, (f"D\t{x}" for x in forgotten_delete))
-        #map(lambda x: f"D\t{x}", forgotten_delete))
 
     forgotten_new = (full_set - old_full_set) - changed_set
     if forgotten_new:
