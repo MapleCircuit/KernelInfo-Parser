@@ -252,7 +252,7 @@ class TestRustChangeSetExecution(unittest.TestCase):
 
     def tearDown(self) -> None:
         if hasattr(self, "mf") and self.mf:
-            self.mf.clean_all()
+            self.mf.clear_all_version()
 
     def test_comprehensive_synthetic_execution(self) -> None:
         file_path = "drivers/sample/comprehensive.rs"
@@ -413,7 +413,7 @@ class TestRustTagLifecycle(unittest.TestCase):
 
     def tearDown(self) -> None:
         if hasattr(self, "mf") and self.mf:
-            self.mf.clean_all()
+            self.mf.clear_all_version()
 
     def test_tag_recycling_and_closing(self) -> None:
         file_path = "drivers/sample/lifecycle.rs"

@@ -54,6 +54,7 @@ from core.globalstuff import (
     ASTT,
     configure_logging,
 )
+import os
 import sys
 import time
 import logging
@@ -191,6 +192,16 @@ def update(version: str) -> None:
     processing_git_commits(version)
 
     # -------------------------------------------------------------------------
+    # STEP 6.6: Parse Kbuild/Makefiles & Populate m_kconfig_kbuild
+    # -------------------------------------------------------------------------
+    processing_kbuild(version)
+
+    # -------------------------------------------------------------------------
+    # STEP 6.7: Batch Match Maintainer Sections & Populate m_maintainer_file
+    # -------------------------------------------------------------------------
+    processing_maintainer_files(version)
+
+    # -------------------------------------------------------------------------
     # STEP 7: Drop secondary indexes, commit transactions, and rebuild indexes
     # -------------------------------------------------------------------------
     if getattr(G.TE, "db", None) is not None and hasattr(G.TE.db, "cnx") and G.TE.db.cnx is not None:
@@ -218,6 +229,7 @@ def update(version: str) -> None:
             print(format_profiling_report(profilers, title=f"UPDATE CYCLE PROFILE: {version}"))
 
     gp.reset_cs()
+    file_fid_cache.clear()
     MF.trim_version(keep=1)
     G.TE.close()
     import gc
@@ -336,7 +348,7 @@ def main() -> None:
     #try:
     update("v3.0")
     update("v3.1")
-    if False:
+    if True:
         update("v3.2")
         update("v3.3")
         update("v3.4")
@@ -455,7 +467,7 @@ def arg_handling() -> argparse.Namespace:
         nargs="?",
         const="",
         default=None,
-        help="Run C-AST unit test suite in /dev/shm (optionally specify a single file to test)",
+        help="Run all tests in the testing suite (optionally specify a single file to test C-AST)",
     )
     parser.add_argument(
         "-T", "--Test",
@@ -500,8 +512,45 @@ def arg_handling() -> argparse.Namespace:
     if args.unit_test is not None:
         target = args.unit_test if args.unit_test != "" else None
         from tests.test_c_ast import run_c_ast_tests
-        code = run_c_ast_tests(target, profile=args.profile, table_engine=args.table_engine)
-        sys.exit(code)
+        if target:
+            code = run_c_ast_tests(target, profile=args.profile, table_engine=args.table_engine)
+            sys.exit(code)
+
+        # 1. Multi-Core C-AST regression suite
+        c_ast_code = run_c_ast_tests(None, profile=args.profile, table_engine=args.table_engine)
+
+        # 2. Comprehensive Unittest Suite across all test modules
+        print(COLOR.cyan("=========================================================================================="))
+        print(COLOR.cyan("                        RUNNING COMPREHENSIVE UNIT TEST SUITE                             "))
+        print(COLOR.cyan("=========================================================================================="))
+        import unittest
+        loader = unittest.TestLoader()
+        test_modules = [
+            "tests.test_maintainer_ast",
+            "tests.test_credits_lifecycle",
+            "tests.test_bridge_map_dedup",
+            "tests.test_git_commit_parser",
+            "tests.test_te_db_integrity",
+            "tests.test_kconfig_ast",
+            "tests.test_webapp_defconfig",
+            "tests.test_webapp_maintainer",
+        ]
+        suite = unittest.TestSuite()
+        for mod_name in test_modules:
+            try:
+                suite.addTests(loader.loadTestsFromName(mod_name))
+            except Exception as e:
+                logger.error(f"Failed loading test module {mod_name}: {e}")
+
+        runner = unittest.TextTestRunner(verbosity=2)
+        res = runner.run(suite)
+
+        all_ok = (c_ast_code == 0) and res.wasSuccessful()
+        if all_ok:
+            print(COLOR.green(f"\n[+] ALL {res.testsRun} UNIT TESTS AND C-AST REGRESSIONS COMPLETED SUCCESSFULLY!"))
+        else:
+            print(COLOR.red(f"\n[-] TEST FAILURES DETECTED IN TEST SUITE."))
+        sys.exit(0 if all_ok else 1)
     if args.Test:
         from tests.test_c_ast import run_c_ast_tests
         code = run_c_ast_tests(args.Test, profile=args.profile, table_engine=args.table_engine)
@@ -567,70 +616,84 @@ def default_processing(CS: ChangeSet) -> None:
                     "D",
                 ))
 
-        elif CS.file_operation[1:] == "R":
-            ## Currently no difference between R100 or R##
-            with CS(REF_OLD):
-                # Get old file_name
+        elif CS.file_operation and CS.file_operation[0] == "R":
+            if CS.file_operation == "R100":
+                # RENAME EXACT (content identical, reuse old fid)
+                with CS(REF_OLD):
+                    # Get old file_name
+                    CS.store(m_file_name.get_set(
+                        None,
+                        CS.old_path,
+                    ))
+                    CS.last_not_none()
+
+                    # Get old_bf
+                    CS.store(m_bridge_file.view(
+                        ((m_bridge_file.fnid, m_file_name.fnid, 1),),
+                        gp.Old_VID,
+                        CS.ref(m_file_name.fnid),
+                        None,
+                        None,
+                        CS.old_path,
+                    ))
+                    CS.last_not_none()
+
+                # Get new file_name
                 CS.store(m_file_name.get_set(
                     None,
-                    CS.old_path,
-                ))
-                CS.last_not_none()
-
-                # Get old_bf
-                CS.store(m_bridge_file.view(
-                    ((m_bridge_file.fnid, m_file_name.fnid, 1),),
-                    gp.Old_VID,
-                    CS.ref(m_file_name.fnid),
-                    None,
-                    None,
-                    CS.old_path,
-                ))
-                CS.last_not_none()
-
-                # Update old FILE
-                CS.store(m_file.update(
-                    CS.ref(m_bridge_file.fid),
-                    None,
-                    gp.Old_VID,
-                    None,
-                    None,
-                    "R",
+                    CS.current_path,
                 ))
 
-            # Get new file_name
-            CS.store(m_file_name.get_set(
-                None,
-                CS.current_path,
-            ))
-
-            if CS.file_operation == "R100":
-                # RENAME EXACT
-                # Get FILE
-                CS.store(m_file.set(
-                    None,
-                    gp.VID,
-                    0,
-                    type_check(CS.current_path),
-                    "R",
-                    0,
-                ))
-
-                # Create BRIDGE FILE
+                # Create BRIDGE FILE pointing to old fid
                 CS.store(m_bridge_file.set(
                     gp.VID,
                     CS.ref(m_file_name.fnid),
-                    CS.ref(m_file.fid),
+                    CS.ref(m_bridge_file.fid, REF_OLD),
                 ))
 
-                # Create MOVED FILE
+                # Create MOVED FILE (old_fid, old_fid)
                 CS.store(m_moved_file.set(
                     CS.ref(m_bridge_file.fid, REF_OLD),
-                    CS.ref(m_file.fid),
+                    CS.ref(m_bridge_file.fid, REF_OLD),
                 ))
 
             else:
-                # RENAME MODIFY
+                # RENAME MODIFY (content modified, old fid ends and new fid starts)
+                with CS(REF_OLD):
+                    # Get old file_name
+                    CS.store(m_file_name.get_set(
+                        None,
+                        CS.old_path,
+                    ))
+                    CS.last_not_none()
+
+                    # Get old_bf
+                    CS.store(m_bridge_file.view(
+                        ((m_bridge_file.fnid, m_file_name.fnid, 1),),
+                        gp.Old_VID,
+                        CS.ref(m_file_name.fnid),
+                        None,
+                        None,
+                        CS.old_path,
+                    ))
+                    CS.last_not_none()
+
+                    # Update old FILE
+                    CS.store(m_file.update(
+                        CS.ref(m_bridge_file.fid),
+                        None,
+                        gp.Old_VID,
+                        None,
+                        None,
+                        "R",
+                    ))
+
+                # Get new file_name
+                CS.store(m_file_name.get_set(
+                    None,
+                    CS.current_path,
+                ))
+
                 # Get FILE
                 CS.store(m_file.set(
                     None,
@@ -1001,6 +1064,25 @@ def processing_dirs() -> None:  # noqa: C901
     return
 
 
+file_fid_cache: dict[str, int | None] = {}
+
+
+def get_fid_for_path(path: str) -> int | None:
+    """Resolve m_file.fid for a given path in active gp.VID."""
+    if path in file_fid_cache:
+        return file_fid_cache[path]
+    fn_row = m_file_name.get(None, path)
+    if fn_row and len(fn_row) >= 3 and fn_row[2]:
+        fnid = fn_row[2][0]
+        bf_row = m_bridge_file.get(gp.VID, fnid, None)
+        if bf_row and len(bf_row) >= 3 and bf_row[2]:
+            fid = bf_row[2][2]
+            file_fid_cache[path] = fid
+            return fid
+    file_fid_cache[path] = None
+    return None
+
+
 def processing_git_commits(version: str) -> None:
     """Parse git commits for active version, link contributors, and bridge tags to commits."""
     from parser.git_ast import GitCommitParser
@@ -1012,22 +1094,6 @@ def processing_git_commits(version: str) -> None:
         return
 
     logger.info(f"Processing {len(commits)} git commits for version '{version}'...")
-
-    file_fid_cache: dict[str, int | None] = {}
-
-    def get_fid_for_path(path: str) -> int | None:
-        if path in file_fid_cache:
-            return file_fid_cache[path]
-        fn_row = m_file_name.get(None, path)
-        if fn_row and len(fn_row) >= 3 and fn_row[2]:
-            fnid = fn_row[2][0]
-            bf_row = m_bridge_file.get(gp.VID, fnid, None)
-            if bf_row and len(bf_row) >= 3 and bf_row[2]:
-                fid = bf_row[2][2]
-                file_fid_cache[path] = fid
-                return fid
-        file_fid_cache[path] = None
-        return None
 
     commit_hash_to_id = {}
     for commit in commits:
@@ -1143,5 +1209,150 @@ def processing_git_commits(version: str) -> None:
             cs_obj.cs_result.clear()
 
 
+def processing_kbuild(version: str) -> None:
+    """Parse Makefile and Kbuild files for active version and map Kconfig symbols to compiled sources."""
+    if gp.VID == 0:
+        return
+
+    from parser.kbuild_parser import KbuildParser
+    kbuild_parser = KbuildParser()
+
+    try:
+        file_list_raw = MF.git_file_list(gp.Version_Name)
+    except Exception as e:
+        logger.debug(f"Failed to get git_file_list for kbuild parsing in {version}: {e}")
+        return
+
+    all_files = file_list_raw.splitlines() if file_list_raw else []
+    makefile_paths = [
+        f for f in all_files
+        if f.endswith("Makefile") or f.endswith("Kbuild") or f.endswith("/Makefile") or f.endswith("/Kbuild")
+    ]
+    if not makefile_paths:
+        return
+
+    logger.info(f"Processing {len(makefile_paths)} Makefile/Kbuild files for version '{version}'...")
+
+    kcid_cache: dict[str, int] = {}
+
+    def get_kcid_for_sym(sym: str) -> int:
+        if not sym or sym in ("y", "m"):
+            return 0
+        clean_sym = sym[7:] if sym.startswith("CONFIG_") else sym
+        if clean_sym in kcid_cache:
+            return kcid_cache[clean_sym]
+        sym_row = m_kconfig_symbol.get(None, None, None, clean_sym, None, None, None, None, None)
+        if sym_row and len(sym_row) >= 3 and sym_row[2]:
+            kcid = sym_row[2][0]
+            kcid_cache[clean_sym] = kcid
+            return kcid
+        kcid_cache[clean_sym] = 0
+        return 0
+
+    count = 0
+    for mk_path in makefile_paths:
+        try:
+            content = MF.get_file(mk_path, gp.Version_Name)
+            if not content:
+                continue
+            dir_path = os.path.dirname(mk_path)
+            bindings = kbuild_parser.parse_makefile_content(content, dir_path=dir_path)
+            for b in bindings:
+                fid = get_fid_for_path(b.source_file_rel)
+                if fid is None and b.source_file_rel.endswith(".c"):
+                    alt_asm = b.source_file_rel[:-2] + ".S"
+                    fid = get_fid_for_path(alt_asm)
+                if fid is not None:
+                    kcid = get_kcid_for_sym(b.symbol_name)
+                    G.TE.set(
+                        m_kconfig_kbuild.table_id,
+                        (
+                            kcid,
+                            gp.VID,
+                            fid,
+                            int(b.compile_mode),
+                            b.target_obj[:64],
+                        ),
+                    )
+                    count += 1
+        except Exception as e:
+            logger.debug(f"Error parsing kbuild file '{mk_path}': {e}")
+
+    logger.info(f"Staged {count} Kbuild symbol-to-source mappings into m_kconfig_kbuild for version '{version}'.")
+
+
+def processing_maintainer_files(version: str) -> None:
+    """Batch match active files for version against MAINTAINERS patterns and populate m_maintainer_file."""
+    if gp.VID == 0:
+        return
+
+    try:
+        raw_maintainers = MF.get_file("MAINTAINERS", gp.Version_Name)
+    except Exception as e:
+        logger.debug(f"MAINTAINERS file not found for version '{version}': {e}")
+        return
+
+    if not raw_maintainers:
+        return
+
+    from parser.maintainer_ast.maintainer_parser import MaintainerParser
+    from parser.maintainer_ast.maintainer_matcher import MaintainerMatcher
+
+    sections = MaintainerParser(raw_maintainers).parse()
+    if not sections:
+        return
+
+    matcher = MaintainerMatcher(sections)
+
+    sec_id_cache: dict[str, int | None] = {}
+
+    def get_sec_id_for_name(name: str) -> int | None:
+        if name in sec_id_cache:
+            return sec_id_cache[name]
+        sec_row = m_maintainer_section.get(None, None, None, name, None, None, None, None, None)
+        if sec_row and len(sec_row) >= 3 and sec_row[2]:
+            sec_id = sec_row[2][0]
+            sec_id_cache[name] = sec_id
+            return sec_id
+        sec_id_cache[name] = None
+        return None
+
+    try:
+        file_list_raw = MF.git_file_list(gp.Version_Name)
+    except Exception as e:
+        logger.debug(f"Failed to get git_file_list for maintainer matching in {version}: {e}")
+        return
+
+    all_files = file_list_raw.splitlines() if file_list_raw else []
+    if not all_files:
+        return
+
+    logger.info(f"Matching {len(all_files)} files against {len(sections)} maintainer sections for version '{version}'...")
+
+    matched_count = 0
+    for file_path in all_files:
+        matched_sections = matcher.match_file(file_path)
+        if not matched_sections:
+            continue
+        fid = get_fid_for_path(file_path)
+        if fid is None:
+            continue
+        for sec in matched_sections:
+            sec_id = get_sec_id_for_name(sec.name)
+            if sec_id is not None:
+                G.TE.set(
+                    m_maintainer_file.table_id,
+                    (
+                        gp.VID,
+                        fid,
+                        sec_id,
+                    ),
+                )
+                matched_count += 1
+
+    logger.info(f"Staged {matched_count} file-to-section mappings into m_maintainer_file for version '{version}'.")
+
+
 if __name__ == "__main__":
     main()
+

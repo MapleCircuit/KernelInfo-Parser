@@ -19,12 +19,15 @@ from core.DBLayout import (
     m_file_name,
     m_file,
     m_bridge_file,
+    m_moved_file,
     m_ast,
     m_ast_container,
     m_tag,
     m_bridge_tag,
     m_map_ast,
     m_bridge_map,
+    m_kconfig_symbol,
+    m_kconfig_kbuild,
     m_maintainer_person,
     m_maintainer_section,
     m_maintainer_member,
@@ -337,6 +340,157 @@ class TestMaintainerAndCreditsIntegration(unittest.TestCase):
         person_rows = G.TE._cached_rows.get(m_maintainer_person.table_id, [])
         tytso_entries = [r for r in person_rows if r[2] == "tytso@mit.edu"]
         self.assertEqual(len(tytso_entries), 1, "Theodore Ts'o must be deduplicated to a single person row")
+
+    def test_moved_file_r100_and_r_modify(self) -> None:
+        """Test default_processing() for R100 exact rename and R modify rename."""
+        from main import default_processing, gp as main_gp, file_fid_cache
+
+        G.DB = MockDB
+        G.TE = TECachedDB()
+        file_fid_cache.clear()
+        main_gp.Table_Array = list(self.gp.Table_Array)
+        G.TE.start(main_gp.Table_Array, MockDB)
+
+        # Set up version context
+        main_gp.Old_VID = 1
+        main_gp.VID = 2
+        self.gp.Old_VID = 1
+        self.gp.VID = 2
+
+        # 1. Seed Old Version (VID=1) files in TE
+        # old_file_1: drivers/old_foo.c (fid=10)
+        fn1 = G.TE.set(m_file_name.table_id, (None, "drivers/old_foo.c"))[0]
+        G.TE.set(m_file.table_id, (10, 1, 0, 1, "A", "0"))
+        G.TE.set(m_bridge_file.table_id, (1, fn1, 10))
+
+        # old_file_2: fs/old_bar.c (fid=20)
+        fn2 = G.TE.set(m_file_name.table_id, (None, "fs/old_bar.c"))[0]
+        G.TE.set(m_file.table_id, (20, 1, 0, 1, "A", "0"))
+        G.TE.set(m_bridge_file.table_id, (1, fn2, 20))
+
+        # Commit initial seed rows into MockDB so view_select can join them
+        G.TE.commit_all()
+
+        # 2. Process R100 exact rename: drivers/old_foo.c -> drivers/new_foo.c
+        cs_r100 = ChangeSet("R100\tdrivers/old_foo.c\tdrivers/new_foo.c")
+        cs_r100.gp = main_gp
+        default_processing(cs_r100)
+        self.assertTrue(cs_r100.execute())
+
+        # Verify R100 behavior:
+        # - m_moved_file has (10, 10)
+        # - m_bridge_file has (2, new_fnid, 10) pointing to original fid=10
+        moved_rows = G.TE.queued_set.get(m_moved_file.table_id, {})
+        self.assertIn((10, 10), moved_rows)
+
+        bf_rows = G.TE.queued_set.get(m_bridge_file.table_id, {})
+        new_foo_bf = [row for row in bf_rows.values() if row[0] == 2 and row[2] == 10]
+        self.assertEqual(len(new_foo_bf), 1)
+
+        # 3. Process R090 modify rename: fs/old_bar.c -> fs/new_bar.c
+        cs_r90 = ChangeSet("R090\tfs/old_bar.c\tfs/new_bar.c")
+        cs_r90.gp = main_gp
+        default_processing(cs_r90)
+        self.assertTrue(cs_r90.execute())
+
+        # Verify R<100 behavior:
+        # - Old m_file (fid=20) was queued for update with e_stat='R' and vid_e=1
+        updates = G.TE.queued_update.get(m_file.table_id, [])
+        self.assertTrue(any(u[0] == 20 and u[2] == 1 and u[5] == "R" for u in updates))
+
+        # - New m_file created with s_stat='R'
+        new_file_rows = G.TE.queued_set.get(m_file.table_id, {})
+        new_bar_files = [row for row in new_file_rows.values() if row[1] == 2 and row[4] == "R"]
+        self.assertEqual(len(new_bar_files), 1)
+        new_fid = new_bar_files[0][0]
+
+        # - m_moved_file has (20, new_fid)
+        self.assertIn((20, new_fid), moved_rows)
+
+    def test_processing_maintainer_files_and_kbuild(self) -> None:
+        """Test processing_maintainer_files and processing_kbuild helper routines."""
+        from main import processing_maintainer_files, processing_kbuild, gp as main_gp, file_fid_cache
+
+        G.DB = MockDB
+        G.TE = TECachedDB()
+        file_fid_cache.clear()
+        main_gp.Table_Array = list(self.gp.Table_Array)
+        G.TE.start(main_gp.Table_Array, MockDB)
+
+        main_gp.VID = 1
+        main_gp.Version_Name = "v3.0"
+
+        # Mock MasterFile responses
+        class FakeMF:
+            def get_file(self, path: str, version: str) -> str:
+                if path == "MAINTAINERS":
+                    return SAMPLE_MAINTAINERS
+                if path == "fs/ext4/Makefile":
+                    return "obj-$(CONFIG_EXT4_FS) += ext4.o\next4-y := balloc.o inode.o\nobj-y += core.o\n"
+                return ""
+
+            def git_file_list(self, version: str) -> str:
+                return "MAINTAINERS\nfs/ext4/Makefile\nfs/ext4/balloc.c\nfs/ext4/inode.c\nfs/ext4/core.c\nnet/ipv6/ip6_output.c\n"
+
+        import main
+        main.MF = FakeMF()
+        main.G.MF = FakeMF()
+
+        # Seed section and symbol
+        sec_ext4 = G.TE.set(m_maintainer_section.table_id, (None, 1, 0, "EXT4 FILE SYSTEM", "Maintained", "", "", "linux-ext4@vger.kernel.org", 1))
+        sec_ext4_id = sec_ext4[0]
+        sec_ipv6 = G.TE.set(m_maintainer_section.table_id, (None, 1, 0, "IPV6 NETWORKING", "Maintained", "", "", "netdev@vger.kernel.org", 2))
+        sec_ipv6_id = sec_ipv6[0]
+
+        sym_ext4 = G.TE.set(m_kconfig_symbol.table_id, (None, 1, 0, "EXT4_FS", 1, "Ext4", "", "", 1))
+        sym_ext4_id = sym_ext4[0]
+
+        # Seed files
+        for fid, path in [
+            (10, "fs/ext4/balloc.c"),
+            (11, "fs/ext4/inode.c"),
+            (12, "fs/ext4/core.c"),
+            (13, "net/ipv6/ip6_output.c"),
+        ]:
+            fn_res = G.TE.set(m_file_name.table_id, (None, path))
+            fnid = fn_res[0]
+            G.TE.set(m_file.table_id, (fid, 1, 0, 1, "A", "0"))
+            G.TE.set(m_bridge_file.table_id, (1, fnid, fid))
+
+        # 1. Run processing_maintainer_files
+        processing_maintainer_files("v3.0")
+
+        # Verify m_maintainer_file staging:
+        # balloc.c and inode.c and core.c matched EXT4 FILE SYSTEM
+        sec_ext4_row = m_maintainer_section.get(None, None, None, "EXT4 FILE SYSTEM", None, None, None, None, None)
+        self.assertIsNotNone(sec_ext4_row)
+        sec_ext4_id = sec_ext4_row[2][0]
+
+        sec_ipv6_row = m_maintainer_section.get(None, None, None, "IPV6 NETWORKING", None, None, None, None, None)
+        self.assertIsNotNone(sec_ipv6_row)
+        sec_ipv6_id = sec_ipv6_row[2][0]
+
+        maint_file_rows = G.TE.queued_set.get(m_maintainer_file.table_id, {})
+        self.assertIn((1, 10, sec_ext4_id), maint_file_rows)
+        self.assertIn((1, 11, sec_ext4_id), maint_file_rows)
+        self.assertIn((1, 12, sec_ext4_id), maint_file_rows)
+        self.assertIn((1, 13, sec_ipv6_id), maint_file_rows)
+
+        # 2. Run processing_kbuild
+        processing_kbuild("v3.0")
+
+        # Verify m_kconfig_kbuild staging:
+        sym_ext4_row = m_kconfig_symbol.get(None, None, None, "EXT4_FS", None, None, None, None, None)
+        self.assertIsNotNone(sym_ext4_row)
+        sym_ext4_id = sym_ext4_row[2][0]
+
+        # balloc.c -> (kcid=sym_ext4_id, vid=1, fid=10, compile_mode=3, target_obj='ext4.o')
+        # inode.c -> (kcid=sym_ext4_id, vid=1, fid=11, compile_mode=3, target_obj='ext4.o')
+        # core.c -> (kcid=0, vid=1, fid=12, compile_mode=1, target_obj='core.o')
+        kbuild_rows = G.TE.queued_set.get(m_kconfig_kbuild.table_id, {})
+        self.assertIn((sym_ext4_id, 1, 10, 3), kbuild_rows)
+        self.assertIn((sym_ext4_id, 1, 11, 3), kbuild_rows)
+        self.assertIn((0, 1, 12, 1), kbuild_rows)
 
 
 if __name__ == "__main__":
