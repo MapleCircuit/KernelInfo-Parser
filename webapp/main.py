@@ -65,6 +65,22 @@ def safe_decode(val: Any) -> Any:
     return val
 
 
+STAT_LABEL_MAP: dict[str, str] = {
+    "A": "Added",
+    "M": "Modified",
+    "R": "Renamed",
+    "D": "Deleted",
+    "0": "Active",
+}
+
+
+def format_stat_label(stat: str | None, is_end: bool = False) -> str:
+    """Return friendly label for start or end status code."""
+    if not stat or stat == "0":
+        return "Active" if is_end else "Added"
+    return STAT_LABEL_MAP.get(stat, str(stat))
+
+
 class DatabaseManager:
     """Manage MySQL connection pool and execute queries with automatic reconnect resilience."""
 
@@ -346,11 +362,14 @@ def browse_path(version_name: str, path: str = "") -> dict[str, Any]:
         # ---------------------------------------------------------------------
         cursor.execute(
             """
-            SELECT v.vid, v.vname, f.fnid, f.fname, fi.fid, fi.vid_s, fi.vid_e, fi.ftype, fi.s_stat, fi.e_stat
+            SELECT v.vid, v.vname, f.fnid, f.fname, fi.fid, fi.vid_s, fi.vid_e, fi.ftype, fi.s_stat, fi.e_stat,
+                   vs.vname AS vname_s, ve.vname AS vname_e
             FROM m_file_name f
             JOIN m_bridge_file bf ON f.fnid = bf.fnid
             JOIN m_v_main v ON bf.vid = v.vid
             JOIN m_file fi ON bf.fid = fi.fid
+            LEFT JOIN m_v_main vs ON fi.vid_s = vs.vid
+            LEFT JOIN m_v_main ve ON fi.vid_e = ve.vid
             WHERE v.vname = %s AND f.fname = %s
             LIMIT 1;
             """,
@@ -415,20 +434,76 @@ def browse_path(version_name: str, path: str = "") -> dict[str, Any]:
             }
 
         # ---------------------------------------------------------------------
-        # 3. Path is an active source file -> Fetch full AST tags and spatial maps
+        # 3. Path is an active source file -> Fetch full AST tags, maps & lifecycle
         # ---------------------------------------------------------------------
         fid = file_row[4]
+        fnid = file_row[2]
+        vid_s = file_row[5]
+        vid_e = file_row[6]
+        s_stat_str = safe_decode(file_row[8])
+        e_stat_str = safe_decode(file_row[9])
+        vname_s_str = safe_decode(file_row[10]) if len(file_row) > 10 and file_row[10] is not None else safe_decode(file_row[1])
+        vname_e_str = safe_decode(file_row[11]) if len(file_row) > 11 and file_row[11] is not None else None
+
+        # Fetch revision history for this fnid
+        cursor.execute(
+            """
+            SELECT fi.fid, fi.vid_s, vs.vname AS vname_s, fi.s_stat, fi.vid_e, ve.vname AS vname_e, fi.e_stat
+            FROM m_bridge_file bf
+            JOIN m_file fi ON bf.fid = fi.fid
+            LEFT JOIN m_v_main vs ON fi.vid_s = vs.vid
+            LEFT JOIN m_v_main ve ON fi.vid_e = ve.vid
+            WHERE bf.fnid = %s
+            GROUP BY fi.fid, fi.vid_s, vs.vname, fi.s_stat, fi.vid_e, ve.vname, fi.e_stat
+            ORDER BY fi.vid_s ASC;
+            """,
+            (fnid,),
+        )
+        hist_rows = cursor.fetchall()
+        history_list = []
+        added_version = vname_s_str
+        added_stat = s_stat_str or "A"
+        for hr in hist_rows:
+            h_vid_s = hr[1]
+            h_vname_s = safe_decode(hr[2]) or f"VID-{h_vid_s}"
+            h_s_stat = safe_decode(hr[3])
+            h_vid_e = hr[4]
+            h_vname_e = safe_decode(hr[5]) if hr[5] is not None else (None if h_vid_e == 0 else f"VID-{h_vid_e}")
+            h_e_stat = safe_decode(hr[6])
+            history_list.append({
+                "fid": hr[0],
+                "vid_s": h_vid_s,
+                "vname_s": h_vname_s,
+                "s_stat": h_s_stat,
+                "s_stat_label": format_stat_label(h_s_stat, is_end=False),
+                "vid_e": h_vid_e,
+                "vname_e": h_vname_e,
+                "e_stat": h_e_stat,
+                "e_stat_label": format_stat_label(h_e_stat, is_end=True),
+            })
+        if history_list:
+            added_version = history_list[0]["vname_s"]
+            added_stat = history_list[0]["s_stat"]
+
         file_meta = {
             "vid": file_row[0],
             "vname": safe_decode(file_row[1]),
-            "fnid": file_row[2],
+            "fnid": fnid,
             "fname": safe_decode(file_row[3]),
             "fid": fid,
-            "vid_s": file_row[5],
-            "vid_e": file_row[6],
+            "vid_s": vid_s,
+            "vname_s": vname_s_str,
+            "vid_e": vid_e,
+            "vname_e": vname_e_str,
             "ftype": file_row[7],
-            "s_stat": safe_decode(file_row[8]),
-            "e_stat": safe_decode(file_row[9]),
+            "s_stat": s_stat_str,
+            "s_stat_label": format_stat_label(s_stat_str, is_end=False),
+            "e_stat": e_stat_str,
+            "e_stat_label": format_stat_label(e_stat_str, is_end=True),
+            "added_version": added_version,
+            "added_stat": added_stat,
+            "added_stat_label": format_stat_label(added_stat, is_end=False),
+            "history": history_list,
         }
 
         # Fetch tags for this file
@@ -496,13 +571,13 @@ def browse_path(version_name: str, path: str = "") -> dict[str, Any]:
         for r in tag_rows:
             t_id = r[0]
             ast_id = r[4]
-            raw_ast = safe_decode(r[14])
+            raw_val = r[14]
             parsed_raw = None
-            if raw_ast:
+            if raw_val:
                 try:
-                    parsed_raw = json.loads(raw_ast)
+                    parsed_raw = json.loads(safe_decode(raw_val))
                 except Exception:
-                    parsed_raw = raw_ast
+                    parsed_raw = safe_decode(raw_val)
 
             tags.append({
                 "tag_id": t_id,
@@ -563,11 +638,14 @@ def get_file_by_id(fid: int) -> dict[str, Any]:
         cursor = cnx.cursor()
         cursor.execute(
             """
-            SELECT v.vid, v.vname, f.fnid, f.fname, fi.fid, fi.vid_s, fi.vid_e, fi.ftype, fi.s_stat, fi.e_stat
+            SELECT v.vid, v.vname, f.fnid, f.fname, fi.fid, fi.vid_s, fi.vid_e, fi.ftype, fi.s_stat, fi.e_stat,
+                   vs.vname AS vname_s, ve.vname AS vname_e
             FROM m_file fi
             JOIN m_bridge_file bf ON fi.fid = bf.fid
             JOIN m_v_main v ON bf.vid = v.vid
             JOIN m_file_name f ON bf.fnid = f.fnid
+            LEFT JOIN m_v_main vs ON fi.vid_s = vs.vid
+            LEFT JOIN m_v_main ve ON fi.vid_e = ve.vid
             WHERE fi.fid = %s
             LIMIT 1;
             """,
@@ -579,17 +657,73 @@ def get_file_by_id(fid: int) -> dict[str, Any]:
             cnx.close()
             raise HTTPException(status_code=404, detail=f"File fid={fid} not found")
 
+        fnid = file_row[2]
+        vid_s = file_row[5]
+        vid_e = file_row[6]
+        s_stat_str = safe_decode(file_row[8])
+        e_stat_str = safe_decode(file_row[9])
+        vname_s_str = safe_decode(file_row[10]) if len(file_row) > 10 and file_row[10] is not None else safe_decode(file_row[1])
+        vname_e_str = safe_decode(file_row[11]) if len(file_row) > 11 and file_row[11] is not None else None
+
+        # Fetch revision history for this fnid
+        cursor.execute(
+            """
+            SELECT fi.fid, fi.vid_s, vs.vname AS vname_s, fi.s_stat, fi.vid_e, ve.vname AS vname_e, fi.e_stat
+            FROM m_bridge_file bf
+            JOIN m_file fi ON bf.fid = fi.fid
+            LEFT JOIN m_v_main vs ON fi.vid_s = vs.vid
+            LEFT JOIN m_v_main ve ON fi.vid_e = ve.vid
+            WHERE bf.fnid = %s
+            GROUP BY fi.fid, fi.vid_s, vs.vname, fi.s_stat, fi.vid_e, ve.vname, fi.e_stat
+            ORDER BY fi.vid_s ASC;
+            """,
+            (fnid,),
+        )
+        hist_rows = cursor.fetchall()
+        history_list = []
+        added_version = vname_s_str
+        added_stat = s_stat_str or "A"
+        for hr in hist_rows:
+            h_vid_s = hr[1]
+            h_vname_s = safe_decode(hr[2]) or f"VID-{h_vid_s}"
+            h_s_stat = safe_decode(hr[3])
+            h_vid_e = hr[4]
+            h_vname_e = safe_decode(hr[5]) if hr[5] is not None else (None if h_vid_e == 0 else f"VID-{h_vid_e}")
+            h_e_stat = safe_decode(hr[6])
+            history_list.append({
+                "fid": hr[0],
+                "vid_s": h_vid_s,
+                "vname_s": h_vname_s,
+                "s_stat": h_s_stat,
+                "s_stat_label": format_stat_label(h_s_stat, is_end=False),
+                "vid_e": h_vid_e,
+                "vname_e": h_vname_e,
+                "e_stat": h_e_stat,
+                "e_stat_label": format_stat_label(h_e_stat, is_end=True),
+            })
+        if history_list:
+            added_version = history_list[0]["vname_s"]
+            added_stat = history_list[0]["s_stat"]
+
         file_meta = {
             "vid": file_row[0],
             "vname": safe_decode(file_row[1]),
-            "fnid": file_row[2],
+            "fnid": fnid,
             "fname": safe_decode(file_row[3]),
             "fid": fid,
-            "vid_s": file_row[5],
-            "vid_e": file_row[6],
+            "vid_s": vid_s,
+            "vname_s": vname_s_str,
+            "vid_e": vid_e,
+            "vname_e": vname_e_str,
             "ftype": file_row[7],
-            "s_stat": safe_decode(file_row[8]),
-            "e_stat": safe_decode(file_row[9]),
+            "s_stat": s_stat_str,
+            "s_stat_label": format_stat_label(s_stat_str, is_end=False),
+            "e_stat": e_stat_str,
+            "e_stat_label": format_stat_label(e_stat_str, is_end=True),
+            "added_version": added_version,
+            "added_stat": added_stat,
+            "added_stat_label": format_stat_label(added_stat, is_end=False),
+            "history": history_list,
         }
 
         # Fetch tags
@@ -1035,12 +1169,28 @@ def get_kconfig_symbol_detail(version_name: str, name_or_kcid: str) -> dict[str,
         if has_vid_cols:
             if clean_name.isdigit():
                 cursor.execute(
-                    "SELECT kcid, name, type, prompt, def_val, help, ast_id FROM m_kconfig_symbol WHERE kcid = %s AND (vid_e = 0 OR vid_e >= %s) AND vid_s <= %s LIMIT 1;",
+                    """
+                    SELECT s.kcid, s.name, s.type, s.prompt, s.def_val, s.help, s.ast_id,
+                           s.vid_s, s.vid_e, vs.vname AS vname_s, ve.vname AS vname_e
+                    FROM m_kconfig_symbol s
+                    LEFT JOIN m_v_main vs ON s.vid_s = vs.vid
+                    LEFT JOIN m_v_main ve ON s.vid_e = ve.vid
+                    WHERE s.kcid = %s AND (s.vid_e = 0 OR s.vid_e >= %s) AND s.vid_s <= %s
+                    LIMIT 1;
+                    """,
                     (int(clean_name), vid, vid),
                 )
             else:
                 cursor.execute(
-                    "SELECT kcid, name, type, prompt, def_val, help, ast_id FROM m_kconfig_symbol WHERE name = %s AND (vid_e = 0 OR vid_e >= %s) AND vid_s <= %s LIMIT 1;",
+                    """
+                    SELECT s.kcid, s.name, s.type, s.prompt, s.def_val, s.help, s.ast_id,
+                           s.vid_s, s.vid_e, vs.vname AS vname_s, ve.vname AS vname_e
+                    FROM m_kconfig_symbol s
+                    LEFT JOIN m_v_main vs ON s.vid_s = vs.vid
+                    LEFT JOIN m_v_main ve ON s.vid_e = ve.vid
+                    WHERE s.name = %s AND (s.vid_e = 0 OR s.vid_e >= %s) AND s.vid_s <= %s
+                    LIMIT 1;
+                    """,
                     (clean_name, vid, vid),
                 )
         else:
@@ -1068,6 +1218,30 @@ def get_kconfig_symbol_detail(version_name: str, name_or_kcid: str) -> dict[str,
         def_val = safe_decode(sym_row[4])
         help_text = safe_decode(sym_row[5])
         ast_id = sym_row[6]
+        vid_s = sym_row[7] if len(sym_row) > 7 else vid
+        vid_e = sym_row[8] if len(sym_row) > 8 else 0
+        vname_s = safe_decode(sym_row[9]) if len(sym_row) > 9 and sym_row[9] is not None else version_name
+        vname_e = safe_decode(sym_row[10]) if len(sym_row) > 10 and sym_row[10] is not None else None
+
+        added_version = vname_s
+        if has_vid_cols and sym_name:
+            cursor.execute(
+                """
+                SELECT vs.vname
+                FROM m_kconfig_symbol s2
+                LEFT JOIN m_v_main vs ON s2.vid_s = vs.vid
+                WHERE s2.name = %s
+                ORDER BY s2.vid_s ASC
+                LIMIT 1;
+                """,
+                (sym_name,),
+            )
+            av_row = cursor.fetchone()
+            if av_row and av_row[0]:
+                added_version = safe_decode(av_row[0])
+
+        is_active = (vid_e == 0 or vid_e is None)
+        lifecycle_status = "Active" if is_active else f"Ended in {vname_e}"
 
         # Query direct relations (depends_on, selects, implies)
         cursor.execute(
@@ -1099,11 +1273,11 @@ def get_kconfig_symbol_detail(version_name: str, name_or_kcid: str) -> dict[str,
                 """
                 SELECT s2.name, s2.prompt, r.rel_type
                 FROM m_kconfig_relation r
-                JOIN m_kconfig_symbol s2 ON r.kcid = s2.kcid AND (s2.vid_e = 0 OR s2.vid_e >= %s) AND s2.vid_s <= %s
-                WHERE r.target_name = %s AND r.rel_type IN (2, 3)
+                JOIN m_kconfig_symbol s2 ON r.kcid = s2.kcid
+                WHERE r.target_name = %s AND (s2.vid_e = 0 OR s2.vid_e >= %s) AND s2.vid_s <= %s
                 ORDER BY s2.name ASC;
                 """,
-                (vid, vid, sym_name),
+                (sym_name, vid, vid),
             )
         else:
             cursor.execute(
@@ -1111,7 +1285,7 @@ def get_kconfig_symbol_detail(version_name: str, name_or_kcid: str) -> dict[str,
                 SELECT s2.name, s2.prompt, r.rel_type
                 FROM m_kconfig_relation r
                 JOIN m_kconfig_symbol s2 ON r.kcid = s2.kcid
-                WHERE r.target_name = %s AND r.rel_type IN (2, 3)
+                WHERE r.target_name = %s
                 ORDER BY s2.name ASC;
                 """,
                 (sym_name,),
@@ -1119,24 +1293,24 @@ def get_kconfig_symbol_detail(version_name: str, name_or_kcid: str) -> dict[str,
         rev_rows = cursor.fetchall()
         selected_by = []
         implied_by = []
-        for rev in rev_rows:
-            source_name = safe_decode(rev[0])
-            source_prompt = safe_decode(rev[1])
-            rtype = rev[2]
-            if rtype == 2:
-                selected_by.append({"name": source_name, "prompt": source_prompt})
-            elif rtype == 3:
-                implied_by.append({"name": source_name, "prompt": source_prompt})
+        for rvr in rev_rows:
+            entry = {
+                "name": safe_decode(rvr[0]),
+                "prompt": safe_decode(rvr[1]),
+            }
+            if rvr[2] == 2:
+                selected_by.append(entry)
+            elif rvr[2] == 3:
+                implied_by.append(entry)
 
-        # Query source location tags
+        # Query AST and source file coordinates
         tag_params = []
         sql = """
             SELECT fn.fname, bt.line_s, bt.line_e, t.code
-            FROM m_tag t
-            JOIN m_bridge_tag bt ON bt.tag_id = t.tag_id
-            JOIN m_file f ON f.fid = bt.fid
-            JOIN m_bridge_file bf ON bf.fid = f.fid
-            JOIN m_file_name fn ON fn.fnid = bf.fnid
+            FROM m_bridge_tag bt
+            JOIN m_tag t ON bt.tag_id = t.tag_id
+            JOIN m_bridge_file bf ON bt.fid = bf.fid
+            JOIN m_file_name fn ON bf.fnid = fn.fnid
             WHERE t.ast_id = %s
         """
         if has_vid_cols:
@@ -1215,6 +1389,13 @@ def get_kconfig_symbol_detail(version_name: str, name_or_kcid: str) -> dict[str,
             "def_val": def_val,
             "help": help_text,
             "ast_id": ast_id,
+            "vid_s": vid_s,
+            "vname_s": vname_s,
+            "vid_e": vid_e,
+            "vname_e": vname_e,
+            "added_version": added_version,
+            "is_active": is_active,
+            "lifecycle_status": lifecycle_status,
             "file_path": file_path,
             "line_s": line_s,
             "line_e": line_e,

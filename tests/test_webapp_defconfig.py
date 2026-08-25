@@ -6,11 +6,16 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from webapp.main import get_kconfig_defconfigs, get_kconfig_defconfig_content, get_kconfig_tree
+from webapp.main import (
+    get_kconfig_defconfigs,
+    get_kconfig_defconfig_content,
+    get_kconfig_tree,
+    get_kconfig_symbol_detail,
+)
 
 
 class TestWebappDefconfig(unittest.TestCase):
-    """Test defconfig listing, content retrieval, and architecture-scoped dependencies."""
+    """Test defconfig listing, content retrieval, architecture-scoped dependencies, and symbol lifecycle."""
 
     def test_get_kconfig_defconfigs_x86(self) -> None:
         """Test retrieving x86 architecture defconfigs."""
@@ -59,8 +64,8 @@ class TestWebappDefconfig(unittest.TestCase):
         self.assertIn("defconfigs", res)
         self.assertGreaterEqual(res["total_count"], 1)
 
-    def test_x86_64bit_architecture_scoping(self) -> None:
-        """Verify that x86 64BIT symbol dependencies are not polluted by PA8X00 or TILEGX."""
+    def test_x86_tree_scoped_arch_dependencies(self) -> None:
+        """Verify that x86 menu tree only retains x86 architecture dependencies."""
         tree = get_kconfig_tree("v3.0", "x86")
         self.assertIn("nodes", tree)
 
@@ -74,6 +79,15 @@ class TestWebappDefconfig(unittest.TestCase):
             deps = sym_64bit_node.get("depends_on", [])
             self.assertNotIn("PA8X00", deps)
             self.assertNotIn("TILEGX", deps)
+
+    def test_kconfig_symbol_lifecycle_metadata(self) -> None:
+        """Verify Kconfig symbol lifecycle tracking fields (vid_s, vid_e, added_version, lifecycle_status)."""
+        sym = get_kconfig_symbol_detail("v3.0", "EXT4_FS")
+        self.assertEqual(sym["name"], "EXT4_FS")
+        self.assertEqual(sym["vname_s"], "v3.0")
+        self.assertEqual(sym["added_version"], "v3.0")
+        self.assertTrue(sym["is_active"])
+        self.assertEqual(sym["lifecycle_status"], "Active")
 
 
 if __name__ == "__main__":

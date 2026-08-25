@@ -17,6 +17,7 @@ from webapp.main import (
     get_person_profile,
     get_credits_overview,
     browse_path,
+    get_file_by_id,
 )
 
 
@@ -103,6 +104,33 @@ class TestWebAppMaintainerEndpoints(unittest.TestCase):
         self.assertGreaterEqual(len(subsystems), 1)
         self.assertEqual(subsystems[0]["name"], "EXT4 FILE SYSTEM")
         self.assertGreaterEqual(len(subsystems[0]["maintainers"]), 1)
+
+    def test_browse_file_lifecycle_metadata(self) -> None:
+        # Browse ext4 super.c and verify lifecycle metadata
+        res = browse_path("v3.0", "fs/ext4/super.c")
+        self.assertEqual(res.get("type"), "file")
+        self.assertIn("file_info", res)
+        fi = res["file_info"]
+        self.assertEqual(fi["fname"], "fs/ext4/super.c")
+        self.assertEqual(fi["vname_s"], "v3.0")
+        self.assertEqual(fi["added_version"], "v3.0")
+        self.assertIn("s_stat_label", fi)
+        self.assertIn("e_stat_label", fi)
+        self.assertIn(fi["s_stat_label"], ("Added", "Modified", "Renamed"))
+        self.assertIn(fi["e_stat_label"], ("Active", "Modified", "Deleted", "Renamed"))
+        self.assertIn("history", fi)
+        self.assertIsInstance(fi["history"], list)
+        self.assertGreaterEqual(len(fi["history"]), 1)
+        self.assertEqual(fi["history"][0]["vname_s"], "v3.0")
+
+        # Test get_file_by_id endpoint
+        fid = fi["fid"]
+        f_res = get_file_by_id(fid)
+        self.assertEqual(f_res.get("type"), "file")
+        self.assertIn("file_info", f_res)
+        self.assertEqual(f_res["file_info"]["fid"], fid)
+        self.assertEqual(f_res["file_info"]["added_version"], "v3.0")
+        self.assertEqual(f_res["file_info"]["s_stat_label"], fi["s_stat_label"])
 
 
 if __name__ == "__main__":

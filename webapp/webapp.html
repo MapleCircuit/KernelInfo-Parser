@@ -944,6 +944,22 @@
       transform: translateY(-1px);
       box-shadow: 0 4px 12px rgba(97, 175, 239, 0.25);
     }
+    .lifecycle-chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      padding: 3px 8px;
+      border-radius: 6px;
+      background: rgba(40, 44, 52, 0.85);
+      border: 1px solid var(--border-color);
+      color: var(--text-main);
+      font-size: 11px;
+      transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+    }
+    .lifecycle-chip:hover {
+      border-color: var(--accent);
+      background: rgba(97, 175, 239, 0.12);
+    }
     .role-badge {
       display: inline-flex;
       align-items: center;
@@ -1613,6 +1629,24 @@
       <div class="modal-footer" style="display: flex; justify-content: space-between; align-items: center;">
         <button class="btn btn-accent" id="codeSymBtnJumpMenuconfig" onclick="jumpFromCodeToKconfig()">🔀 Open in Web Menuconfig</button>
         <button class="btn" onclick="closeKconfigSymbolModal()">Close</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- File Lifecycle History Modal -->
+  <div id="fileHistoryModal" class="modal-overlay" onclick="closeFileHistoryModal(event)">
+    <div class="modal" onclick="event.stopPropagation()" style="max-width: 820px;">
+      <div class="modal-header">
+        <div style="display: flex; align-items: center; gap: 10px;">
+          <h3 id="fileHistoryModalTitle" style="color: var(--accent); font-family: monospace; margin: 0;">📜 File Revision Timeline</h3>
+        </div>
+        <button class="btn" onclick="closeFileHistoryModal()">✕</button>
+      </div>
+      <div id="fileHistoryModalBody" class="modal-body" style="max-height: 70vh; overflow-y: auto;">
+        <!-- Dynamic History Table -->
+      </div>
+      <div class="modal-footer">
+        <button class="btn" onclick="closeFileHistoryModal()">Close</button>
       </div>
     </div>
   </div>
@@ -2366,12 +2400,41 @@
         `;
       }
 
+      // Lifecycle presentation
+      const addedVer = fileInfo.added_version || fileInfo.vname_s || data.version;
+      const vStart = fileInfo.vname_s || data.version;
+      const sStatLabel = fileInfo.s_stat_label || "Added";
+      const vEnd = fileInfo.vname_e || "Active";
+      const eStatLabel = fileInfo.e_stat_label || "Active";
+      const isEndActive = (!fileInfo.vid_e || fileInfo.vid_e === 0);
+
+      const startBadgeClass = (fileInfo.s_stat === "A") ? "badge-success" : (fileInfo.s_stat === "R") ? "badge-warning" : "badge-accent";
+      const endBadgeClass = isEndActive ? "badge-success" : (fileInfo.e_stat === "D") ? "badge-danger" : "badge-warning";
+
+      let lifecycleHtml = `
+        <span class="lifecycle-chip" title="File originally introduced in release ${escapeHtml(addedVer)} (${escapeHtml(fileInfo.added_stat_label || 'Added')})">
+          ⭐ <strong>Added:</strong> <span class="badge ${startBadgeClass}" style="margin-left: 3px;">${escapeHtml(addedVer)}</span>
+        </span>
+        <span class="lifecycle-chip" title="Active revision lifespan: Started in ${escapeHtml(vStart)} (${escapeHtml(sStatLabel)}) and ${isEndActive ? 'currently Active' : 'ended in ' + escapeHtml(vEnd) + ' (' + escapeHtml(eStatLabel) + ')'}">
+          🔄 <strong>Revision:</strong> ${escapeHtml(vStart)} <span class="badge ${startBadgeClass}" style="font-size: 10px; margin: 0 2px;">${escapeHtml(sStatLabel)}</span>
+          &rarr; ${escapeHtml(vEnd)} <span class="badge ${endBadgeClass}" style="font-size: 10px; margin-left: 2px;">${escapeHtml(eStatLabel)}</span>
+        </span>
+      `;
+      if (fileInfo.history && fileInfo.history.length > 1) {
+        lifecycleHtml += `
+          <button class="btn" style="padding: 2px 8px; font-size: 11px; background: rgba(97, 175, 239, 0.15); border-color: rgba(97, 175, 239, 0.35); color: #61afef;" onclick="openFileHistoryModal()" title="View complete file revision timeline across kernel releases">
+            📜 History (${fileInfo.history.length})
+          </button>
+        `;
+      }
+
       let html = `
         <div class="file-meta-bar">
           <div class="file-meta-info" style="display: flex; align-items: center; flex-wrap: wrap; gap: 8px;">
             <span><strong>File:</strong> ${data.path}</span>
             <span><strong>FID:</strong> <code>${fileInfo.fid}</code></span>
             <span><strong>Version:</strong> <span class="badge badge-accent">${data.version}</span></span>
+            ${lifecycleHtml}
             ${subsystemsHtml}
             <span><strong>Tags:</strong> ${tags.length}</span>
             <span><strong>Mapped Elements:</strong> ${totalMaps}</span>
@@ -2401,6 +2464,65 @@
       activeFileTags = tags;
       activeFileData = data;
       buildHighlightedSource(tags);
+    }
+
+    function openFileHistoryModal() {
+      const modal = document.getElementById("fileHistoryModal");
+      const titleEl = document.getElementById("fileHistoryModalTitle");
+      const bodyEl = document.getElementById("fileHistoryModalBody");
+      const fileInfo = (activeFileData && activeFileData.file_info) ? activeFileData.file_info : {};
+      const history = fileInfo.history || [];
+
+      titleEl.innerHTML = `📜 Revision Timeline: <code>${escapeHtml(fileInfo.fname || activePath || '')}</code>`;
+
+      let rowsHtml = "";
+      history.forEach((h) => {
+        const isCur = (h.fid === fileInfo.fid);
+        const sBadge = (h.s_stat === 'A') ? 'badge-success' : (h.s_stat === 'R') ? 'badge-warning' : 'badge-accent';
+        const isEndActive = (!h.vid_e || h.vid_e === 0);
+        const eBadge = isEndActive ? 'badge-success' : (h.e_stat === 'D') ? 'badge-danger' : 'badge-warning';
+
+        rowsHtml += `
+          <tr style="${isCur ? 'background: rgba(97, 175, 239, 0.15); font-weight: bold;' : ''}">
+            <td style="padding: 8px 12px; font-family: monospace;"><code>${h.fid}</code> ${isCur ? '<span class="badge badge-accent" style="font-size: 9px; margin-left: 4px;">CURRENT</span>' : ''}</td>
+            <td style="padding: 8px 12px;">
+              <span class="badge ${sBadge}">${escapeHtml(h.vname_s)}</span>
+              <span style="font-size: 11px; color: var(--text-muted); margin-left: 4px;">(${escapeHtml(h.s_stat_label)})</span>
+            </td>
+            <td style="padding: 8px 12px;">
+              <span class="badge ${eBadge}">${escapeHtml(h.vname_e || 'Active')}</span>
+              <span style="font-size: 11px; color: var(--text-muted); margin-left: 4px;">(${escapeHtml(h.e_stat_label)})</span>
+            </td>
+            <td style="padding: 8px 12px; text-align: right;">
+              <button class="btn" style="padding: 2px 8px; font-size: 11px;" onclick="closeFileHistoryModal(); changeVersion('${escapeHtml(h.vname_s)}'); openPath('${escapeHtml(fileInfo.fname || activePath || '')}');">Open in ${escapeHtml(h.vname_s)} &gt;</button>
+            </td>
+          </tr>
+        `;
+      });
+
+      bodyEl.innerHTML = `
+        <table style="width: 100%; border-collapse: collapse; font-size: 12px; text-align: left;">
+          <thead>
+            <tr style="border-bottom: 1px solid var(--border-color); color: var(--text-muted);">
+              <th style="padding: 8px 12px;">FID</th>
+              <th style="padding: 8px 12px;">Started / Added In</th>
+              <th style="padding: 8px 12px;">Ended / Replaced In</th>
+              <th style="padding: 8px 12px; text-align: right;">Action</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${rowsHtml || '<tr><td colspan="4" style="padding: 16px; text-align: center; color: var(--text-muted);">No additional revision history recorded.</td></tr>'}
+          </tbody>
+        </table>
+      `;
+
+      modal.classList.add("open");
+    }
+
+    function closeFileHistoryModal(event) {
+      if (event && event.target && !event.target.classList.contains("modal-overlay")) return;
+      const modal = document.getElementById("fileHistoryModal");
+      if (modal) modal.classList.remove("open");
     }
 
     let blameViewEnabled = false;
@@ -3833,6 +3955,15 @@
               📁 Defined at: <span class="crumb-link" onclick="closeKconfigSymbolModal(); openPath('${escapeHtml(symData.file_path)}')">${escapeHtml(symData.file_path)}:${symData.line_s || 1}</span>
             </div>
           ` : ''}
+          <div style="display: flex; gap: 8px; flex-wrap: wrap; margin-top: 10px; font-size: 11px;">
+            <div style="background: var(--bg-card); border: 1px solid var(--border-color); border-radius: 4px; padding: 6px 10px; flex: 1; min-width: 160px;">
+              <span style="color: var(--text-muted);">🌱 Introduced In:</span> <strong>${escapeHtml(symData.added_version || symData.vname_s || currentVersion)}</strong>
+            </div>
+            <div style="background: var(--bg-card); border: 1px solid var(--border-color); border-radius: 4px; padding: 6px 10px; flex: 1; min-width: 200px;">
+              <span style="color: var(--text-muted);">📌 Revision Span:</span> <strong>${escapeHtml(symData.vname_s || currentVersion)} &rarr; ${escapeHtml(symData.vname_e || 'Active')}</strong>
+              <span class="badge ${symData.is_active ? 'badge-success' : 'badge-warning'}" style="margin-left: 4px; font-size: 9px;">${escapeHtml(symData.lifecycle_status || 'Active')}</span>
+            </div>
+          </div>
         </div>
 
         <div style="margin-bottom: 14px; padding: 10px 14px; background: var(--bg-card); border-radius: 6px; border: 1px solid var(--border-color);">
@@ -4605,6 +4736,16 @@
           <div style="margin: 12px 0; padding: 10px; background: var(--bg-card); border-radius: 4px; border: 1px solid var(--border-color);">
             <label style="font-size: 11px; color: var(--text-muted); display: block; margin-bottom: 6px;">CURRENT VALUE:</label>
             ${valEditorHtml}
+          </div>
+
+          <div style="display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 8px; font-size: 11px;">
+            <div style="background: var(--bg-card); border: 1px solid var(--border-color); border-radius: 4px; padding: 6px 10px; flex: 1; min-width: 140px;">
+              <span style="color: var(--text-muted);">🌱 Introduced In:</span> <strong>${escapeHtml(symData.added_version || symData.vname_s || currentVersion)}</strong>
+            </div>
+            <div style="background: var(--bg-card); border: 1px solid var(--border-color); border-radius: 4px; padding: 6px 10px; flex: 1; min-width: 180px;">
+              <span style="color: var(--text-muted);">📌 Revision Span:</span> <strong>${escapeHtml(symData.vname_s || currentVersion)} &rarr; ${escapeHtml(symData.vname_e || 'Active')}</strong>
+              <span class="badge ${symData.is_active ? 'badge-success' : 'badge-warning'}" style="margin-left: 4px; font-size: 9px;">${escapeHtml(symData.lifecycle_status || 'Active')}</span>
+            </div>
           </div>
 
           ${symData.file_path ? `
