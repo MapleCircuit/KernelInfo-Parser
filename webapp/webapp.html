@@ -1039,6 +1039,121 @@
       border-radius: 4px;
       font-size: 11px;
     }
+    /* Git Blame & Commit Timeline Styles */
+    .timeline-workspace {
+      display: flex;
+      flex-direction: column;
+      height: calc(100vh - 42px);
+      background: var(--bg-main);
+      overflow: hidden;
+    }
+    .timeline-container {
+      display: flex;
+      flex: 1;
+      overflow: hidden;
+    }
+    .timeline-sidebar {
+      width: 320px;
+      background: var(--bg-sidebar);
+      border-right: 1px solid var(--border-color);
+      display: flex;
+      flex-direction: column;
+      overflow-y: auto;
+      padding: 16px;
+      gap: 16px;
+    }
+    .timeline-main {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      overflow-y: auto;
+      padding: 20px 30px;
+      gap: 16px;
+    }
+    .timeline-card {
+      background: var(--bg-card, #21252b);
+      border: 1px solid var(--border-color, #3a3f4b);
+      border-radius: 8px;
+      padding: 16px 20px;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      transition: all 0.2s ease;
+      cursor: pointer;
+      position: relative;
+    }
+    .timeline-card:hover {
+      border-color: var(--accent);
+      transform: translateY(-2px);
+      box-shadow: 0 6px 20px rgba(0, 0, 0, 0.4);
+    }
+    .commit-hash-chip {
+      font-family: monospace;
+      font-size: 11px;
+      padding: 2px 6px;
+      border-radius: 4px;
+      background: rgba(255, 255, 255, 0.08);
+      border: 1px solid rgba(255, 255, 255, 0.15);
+      color: #e5c07b;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      transition: all 0.15s ease;
+    }
+    .commit-hash-chip:hover {
+      background: rgba(229, 192, 123, 0.2);
+      border-color: #e5c07b;
+    }
+    .author-avatar {
+      width: 22px;
+      height: 22px;
+      border-radius: 50%;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      font-weight: bold;
+      font-size: 10px;
+      color: #1e2227;
+      flex-shrink: 0;
+    }
+    .blame-gutter-cell {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      padding: 0 6px;
+      font-size: 11px;
+      font-family: var(--font-mono, monospace);
+      color: var(--text-muted);
+      cursor: pointer;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      border-right: 1px solid rgba(255, 255, 255, 0.08);
+      background: rgba(0, 0, 0, 0.15);
+      transition: background 0.15s ease;
+      min-width: 220px;
+      max-width: 260px;
+    }
+    .blame-gutter-cell:hover {
+      background: rgba(97, 175, 239, 0.15);
+      color: var(--text-bright);
+    }
+    .blame-multi-badge {
+      background: rgba(198, 120, 221, 0.2);
+      color: #c678dd;
+      border: 1px solid rgba(198, 120, 221, 0.4);
+      padding: 1px 5px;
+      border-radius: 3px;
+      font-size: 9px;
+      font-weight: bold;
+    }
+    .tag-blame-highlight {
+      background: rgba(97, 175, 239, 0.08);
+    }
+    .tag-blame-highlight:hover {
+      background: rgba(97, 175, 239, 0.16);
+    }
   </style>
 </head>
 <body>
@@ -1055,6 +1170,7 @@
         <button id="btnModeTui" class="btn btn-mode" onclick="switchAppMode('tui')">📟 Terminal Menuconfig (TUI)</button>
         <button id="btnModeMaintainers" class="btn btn-mode" onclick="switchAppMode('maintainers')">👥 Subsystems</button>
         <button id="btnModeCredits" class="btn btn-mode" onclick="switchAppMode('credits')">🏆 Credits</button>
+        <button id="btnModeTimeline" class="btn btn-mode" onclick="switchAppMode('timeline')">⏱️ Commit Timeline</button>
       </div>
       <select id="versionSelect" class="version-selector" onchange="onVersionChange(this.value)">
         <option value="">Loading versions...</option>
@@ -1249,6 +1365,34 @@
 
     <div id="creditsGrid" class="credits-grid">
       <!-- Dynamic Contributor Cards -->
+    </div>
+  </div>
+
+  <!-- Commit Timeline Workspace -->
+  <div id="timelineWorkspace" class="timeline-workspace" style="display: none;">
+    <div style="background: var(--bg-sidebar); border-bottom: 1px solid var(--border-color); padding: 12px 20px; display: flex; gap: 14px; align-items: center; justify-content: space-between; flex-wrap: wrap;">
+      <div style="display: flex; gap: 10px; align-items: center; flex: 1; max-width: 700px;">
+        <input type="text" id="timelineSearchInput" class="kconfig-input" placeholder="🔍 Search commits by subject, message, author, or SHA..." oninput="filterTimeline()" style="flex: 1;">
+        <input type="text" id="timelineAuthorFilter" class="kconfig-input" placeholder="👤 Filter by author (e.g. Linus)..." oninput="filterTimeline()" style="width: 220px;">
+      </div>
+      <div style="display: flex; gap: 12px; align-items: center;">
+        <span id="timelineCountBadge" class="badge badge-accent" style="font-size: 12px; padding: 4px 10px;">0 Commits</span>
+        <button class="btn btn-accent" onclick="loadTimelineData(true)">⟳ Refresh</button>
+      </div>
+    </div>
+
+    <div class="timeline-container">
+      <div class="timeline-sidebar">
+        <h4 style="color: var(--accent); font-size: 13px; margin-bottom: 4px;">🏆 Top Contributors</h4>
+        <div id="timelineTopContributors" style="display: flex; flex-direction: column; gap: 8px;">
+          <!-- Top contributors populated dynamically -->
+        </div>
+      </div>
+      <div class="timeline-main">
+        <div id="timelineStream" style="display: flex; flex-direction: column; gap: 14px;">
+          <!-- Chronological commit cards populated dynamically -->
+        </div>
+      </div>
     </div>
   </div>
 
@@ -1595,6 +1739,22 @@
       </div>
       <div class="modal-footer">
         <button class="btn btn-accent" onclick="closePersonModal()">Close</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Git Commit Detail Modal -->
+  <div id="commitModal" class="modal-overlay">
+    <div class="modal" style="max-width: 760px; max-height: 88vh; display: flex; flex-direction: column;">
+      <div class="modal-header">
+        <h3 id="commitModalTitle">📜 Commit Details</h3>
+        <button class="btn" onclick="closeCommitModal()">✕</button>
+      </div>
+      <div id="commitModalContent" class="modal-body" style="padding: 20px; overflow-y: auto; flex: 1;">
+        <!-- Dynamic Commit Content -->
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-accent" onclick="closeCommitModal()">Close</button>
       </div>
     </div>
   </div>
@@ -2217,6 +2377,7 @@
             <span><strong>Mapped Elements:</strong> ${totalMaps}</span>
           </div>
           <div style="display: flex; gap: 8px; align-items: center; flex-wrap: wrap;">
+            <button id="btnToggleBlame" class="btn ${blameViewEnabled ? 'btn-active' : ''}" onclick="toggleGitBlameView()" title="Toggle interactive Git Blame line annotations with multi-commit tags and author highlights">🏷️ Git Blame</button>
             <button id="btnToggleContainer" class="btn ${containerColoringEnabled ? 'btn-active' : ''}" onclick="toggleContainerColoring()" title="Toggle container hierarchy depth coloring (Color A, B, C...) applied strictly to container items">🎨 Container Depth Colors</button>
             <button id="btnToggleCppro" class="btn ${cpproHighlightEnabled ? 'btn-active' : ''}" onclick="toggleCpproHighlighting()" title="Toggle visual highlighting of code governed by CPPro conditional scopes (#if/#ifdef/#elif/#else)">⚡ Highlight Conditionals</button>
             <button class="btn" onclick="collapseAllConditionals()" title="Collapse all #if/#ifdef conditional blocks">Collapse #if</button>
@@ -2237,7 +2398,52 @@
       `;
 
       container.innerHTML = html;
+      activeFileTags = tags;
+      activeFileData = data;
       buildHighlightedSource(tags);
+    }
+
+    let blameViewEnabled = false;
+    let activeFileBlame = null;
+    let activeFileTags = null;
+    let activeFileData = null;
+
+    function getAuthorColor(nameOrEmail) {
+      if (!nameOrEmail) return "#61afef";
+      let hash = 0;
+      for (let i = 0; i < nameOrEmail.length; i++) {
+        hash = nameOrEmail.charCodeAt(i) + ((hash << 5) - hash);
+      }
+      const h = Math.abs(hash) % 360;
+      return `hsl(${h}, 65%, 65%)`;
+    }
+
+    function highlightTagLines(startL, endL, enable) {
+      for (let l = startL; l <= endL; l++) {
+        const el = document.getElementById(`l_${l}`);
+        if (el) {
+          if (enable) el.classList.add("tag-blame-highlight");
+          else el.classList.remove("tag-blame-highlight");
+        }
+      }
+    }
+
+    async function toggleGitBlameView() {
+      blameViewEnabled = !blameViewEnabled;
+      const btn = document.getElementById("btnToggleBlame");
+      if (btn) btn.classList.toggle("btn-active", blameViewEnabled);
+
+      if (blameViewEnabled) {
+        const fid = activeFileData && activeFileData.file_info && activeFileData.file_info.fid;
+        if (fid && (!activeFileBlame || activeFileBlame.fid !== fid)) {
+          const bData = await apiFetch(`/api/version/${currentVersion}/file/${fid}/blame`);
+          if (bData) activeFileBlame = bData;
+        }
+      }
+
+      if (activeFileTags) {
+        buildHighlightedSource(activeFileTags);
+      }
     }
 
     function renderSegmentWithKconfigTokens(segment, tok, tokenColor, isContainerItem) {
@@ -2568,6 +2774,18 @@
         }
       });
 
+      // Build Blame Map for lines if Git Blame view is active
+      const lineBlameMap = {};
+      if (blameViewEnabled && activeFileBlame && activeFileBlame.tags) {
+        activeFileBlame.tags.forEach(t => {
+          const ls = t.line_s || 1;
+          const le = t.line_e || ls;
+          for (let l = ls; l <= le; l++) {
+            if (!lineBlameMap[l]) lineBlameMap[l] = t;
+          }
+        });
+      }
+
       // 6. Render gutter and code body
       let gutterHtml = "";
       let bodyHtml = "";
@@ -2592,7 +2810,34 @@
 
         const highlightedContent = highlightLineText(rawText, lineMaps);
 
-        gutterHtml += `<div class="gutter-line ${cpproClass}" id="g_${l}" onclick="onLineClick(${l}, event)" title="Line ${l} (Click to link, Shift+Click for range)"><span>${l}</span> ${collapseSpan}</div>`;
+        // Blame cell rendering
+        let blameCellHtml = "";
+        if (blameViewEnabled) {
+          const bInfo = lineBlameMap[l];
+          if (bInfo && bInfo.primary_author) {
+            const auth = bInfo.primary_author;
+            const comm = bInfo.primary_commit || {};
+            const authName = auth.name || auth.email || "Unknown";
+            const initials = (authName.replace(/[^A-Za-z]/g, "").substring(0, 2) || "U").toUpperCase();
+            const avatarBg = getAuthorColor(authName);
+            const multiBadge = (bInfo.commits_count > 1) ? `<span class="blame-multi-badge" title="${bInfo.commits_count} commits modified this code block">+${bInfo.commits_count - 1}</span>` : "";
+            const hashShort = (comm.commit_hash || "").substring(0, 7);
+            const commitBadge = hashShort ? `<span class="commit-hash-chip" onclick="event.stopPropagation(); openCommitModal('${comm.commit_hash}')" title="${escapeHtml(comm.subject || '')}">#${hashShort}</span>` : "";
+
+            blameCellHtml = `
+              <div class="blame-gutter-cell" onmouseenter="highlightTagLines(${bInfo.line_s}, ${bInfo.line_e}, true)" onmouseleave="highlightTagLines(${bInfo.line_s}, ${bInfo.line_e}, false)" onclick="openPersonModal('${escapeJs(auth.email || auth.name)}')" title="Author: ${escapeHtml(authName)} · Commit: ${escapeHtml(comm.subject || '')}">
+                <span class="author-avatar" style="background: ${avatarBg};">${initials}</span>
+                <span style="font-size: 11px; color: var(--text-bright); overflow: hidden; text-overflow: ellipsis; max-width: 85px;">${escapeHtml(authName)}</span>
+                ${multiBadge}
+                ${commitBadge}
+              </div>
+            `;
+          } else {
+            blameCellHtml = `<div class="blame-gutter-cell" style="opacity: 0.25; justify-content: center;">-</div>`;
+          }
+        }
+
+        gutterHtml += `<div class="gutter-line ${cpproClass}" id="g_${l}" style="display: flex; align-items: center;">${blameCellHtml}<span onclick="onLineClick(${l}, event)" title="Line ${l} (Click to link, Shift+Click for range)" style="min-width: 32px; text-align: right;">${l}</span> ${collapseSpan}</div>`;
         bodyHtml += `<div class="code-line ${tagClass} ${cpproClass}" id="l_${l}">${highlightedContent || ' '}</div>`;
       }
 
@@ -3672,18 +3917,22 @@
       if (btnMaint) btnMaint.classList.toggle("active", mode === "maintainers");
       const btnCred = document.getElementById("btnModeCredits");
       if (btnCred) btnCred.classList.toggle("active", mode === "credits");
+      const btnTimeline = document.getElementById("btnModeTimeline");
+      if (btnTimeline) btnTimeline.classList.toggle("active", mode === "timeline");
 
       const explorerWs = document.getElementById("explorerWorkspace");
       const kconfigWs = document.getElementById("kconfigWorkspace");
       const tuiWs = document.getElementById("tuiWorkspace");
       const maintainersWs = document.getElementById("maintainersWorkspace");
       const creditsWs = document.getElementById("creditsWorkspace");
+      const timelineWs = document.getElementById("timelineWorkspace");
 
       if (explorerWs) explorerWs.style.display = (mode === "explorer") ? "flex" : "none";
       if (kconfigWs) kconfigWs.style.display = (mode === "kconfig") ? "flex" : "none";
       if (tuiWs) tuiWs.style.display = (mode === "tui") ? "flex" : "none";
       if (maintainersWs) maintainersWs.style.display = (mode === "maintainers") ? "flex" : "none";
       if (creditsWs) creditsWs.style.display = (mode === "credits") ? "flex" : "none";
+      if (timelineWs) timelineWs.style.display = (mode === "timeline") ? "flex" : "none";
 
       if (mode === "kconfig" || mode === "tui") {
         if (kconfigLoadedVersion !== currentVersion) {
@@ -3705,6 +3954,12 @@
           loadCreditsData();
         } else {
           filterCredits();
+        }
+      } else if (mode === "timeline") {
+        if (timelineLoadedVersion !== currentVersion) {
+          loadTimelineData();
+        } else {
+          filterTimeline();
         }
       }
     }
@@ -5101,7 +5356,7 @@
 
       modal.classList.add("open");
       titleEl.innerText = "👤 Developer Profile";
-      contentEl.innerHTML = `<div style="padding: 40px; text-align: center; color: var(--accent);">⏳ Loading developer profile &amp; credits...</div>`;
+      contentEl.innerHTML = `<div style="padding: 40px; text-align: center; color: var(--accent);">⏳ Loading developer profile &amp; git history...</div>`;
 
       const data = await apiFetch(`/api/version/${currentVersion}/person/${encodeURIComponent(personIdOrEmail)}`);
       if (!data || !data.person) {
@@ -5113,6 +5368,9 @@
       const inCred = data.in_credits;
       const cred = data.credits;
       const subs = data.subsystems || [];
+      const latestPatch = data.latest_patch;
+      const stats = data.contribution_stats || {};
+      const recentCommits = data.recent_commits || [];
 
       titleEl.innerText = `👤 ${p.name || p.email}`;
 
@@ -5129,6 +5387,36 @@
         </div>
       `).join("");
 
+      let latestPatchHtml = "";
+      if (latestPatch && latestPatch.commit_hash) {
+        latestPatchHtml = `
+          <div style="background: linear-gradient(90deg, rgba(97, 175, 239, 0.12) 0%, rgba(30, 34, 40, 0.6) 100%); border: 1px solid rgba(97, 175, 239, 0.35); border-left: 4px solid var(--accent); border-radius: 8px; padding: 14px 18px; display: flex; flex-direction: column; gap: 8px;">
+            <div style="display: flex; justify-content: space-between; align-items: center;">
+              <span style="font-size: 11px; font-weight: bold; color: var(--accent); text-transform: uppercase;">🚀 Latest Patch Authored / Contributed</span>
+              <span class="commit-hash-chip" onclick="openCommitModal('${escapeJs(latestPatch.commit_hash)}')"># ${latestPatch.commit_hash.substring(0, 10)}</span>
+            </div>
+            <div style="font-size: 13px; font-weight: bold; color: var(--text-bright); line-height: 1.4;">${escapeHtml(latestPatch.subject)}</div>
+            <div style="display: flex; justify-content: space-between; align-items: center; font-size: 11px; color: var(--text-muted); flex-wrap: wrap; gap: 8px;">
+              <span>📅 ${escapeHtml(latestPatch.author_date_iso || '')} · <span class="badge badge-accent">${escapeHtml(latestPatch.role || 'Author')}</span></span>
+              <button class="btn btn-accent" style="padding: 2px 10px; font-size: 11px;" onclick="openCommitModal('${escapeJs(latestPatch.commit_hash)}')">View Commit Details ➔</button>
+            </div>
+          </div>
+        `;
+      }
+
+      let recentCommitsHtml = "";
+      if (recentCommits.length > 0) {
+        recentCommitsHtml = recentCommits.slice(0, 6).map(rc => `
+          <div style="background: var(--bg-sidebar); border: 1px solid var(--border-color); border-radius: 6px; padding: 8px 12px; display: flex; justify-content: space-between; align-items: center; cursor: pointer;" onclick="openCommitModal('${escapeJs(rc.commit_hash)}')">
+            <div style="flex: 1; min-width: 0; margin-right: 12px;">
+              <div style="font-size: 12px; font-weight: bold; color: var(--text-bright); overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">${escapeHtml(rc.subject)}</div>
+              <div style="font-size: 10px; color: var(--text-muted); margin-top: 2px;">📅 ${escapeHtml(rc.author_date_iso || '')} · <span class="badge" style="font-size: 9px;">${escapeHtml(rc.role || 'Contributor')}</span></div>
+            </div>
+            <span class="commit-hash-chip"># ${rc.commit_hash.substring(0, 8)}</span>
+          </div>
+        `).join("");
+      }
+
       contentEl.innerHTML = `
         <div style="display: flex; flex-direction: column; gap: 16px;">
           <div style="background: var(--bg-sidebar); padding: 16px; border-radius: 8px; border: 1px solid var(--border-color); display: flex; justify-content: space-between; align-items: center;">
@@ -5141,6 +5429,40 @@
             </div>
           </div>
 
+          ${latestPatchHtml}
+
+          <!-- Git Contribution Breakdown -->
+          <div>
+            <h4 style="font-size: 12px; color: var(--accent); margin-bottom: 8px; text-transform: uppercase;">📊 Git Contribution Breakdown</h4>
+            <div style="display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px;">
+              <div style="background: var(--bg-sidebar); border: 1px solid var(--border-color); border-radius: 6px; padding: 10px; text-align: center;">
+                <div style="font-size: 18px; font-weight: bold; color: var(--accent);">${stats.authored_commits || 0}</div>
+                <div style="font-size: 10px; color: var(--text-muted); text-transform: uppercase;">Authored</div>
+              </div>
+              <div style="background: var(--bg-sidebar); border: 1px solid var(--border-color); border-radius: 6px; padding: 10px; text-align: center;">
+                <div style="font-size: 18px; font-weight: bold; color: #98c379;">${stats.co_developed_commits || 0}</div>
+                <div style="font-size: 10px; color: var(--text-muted); text-transform: uppercase;">Co-developed</div>
+              </div>
+              <div style="background: var(--bg-sidebar); border: 1px solid var(--border-color); border-radius: 6px; padding: 10px; text-align: center;">
+                <div style="font-size: 18px; font-weight: bold; color: #e5c07b;">${stats.signed_off_commits || 0}</div>
+                <div style="font-size: 10px; color: var(--text-muted); text-transform: uppercase;">Signed-off</div>
+              </div>
+              <div style="background: var(--bg-sidebar); border: 1px solid var(--border-color); border-radius: 6px; padding: 10px; text-align: center;">
+                <div style="font-size: 18px; font-weight: bold; color: #c678dd;">${stats.reviewed_commits || 0}</div>
+                <div style="font-size: 10px; color: var(--text-muted); text-transform: uppercase;">Reviewed</div>
+              </div>
+            </div>
+          </div>
+
+          ${recentCommitsHtml ? `
+            <div>
+              <h4 style="font-size: 12px; color: var(--text-bright); margin-bottom: 8px; text-transform: uppercase;">📜 Recent Commits</h4>
+              <div style="display: flex; flex-direction: column; gap: 6px;">
+                ${recentCommitsHtml}
+              </div>
+            </div>
+          ` : ''}
+
           <div>
             <h4 style="font-size: 13px; color: #c678dd; margin-bottom: 8px;">🏆 Kernel CREDITS Profile</h4>
             ${inCred && cred ? `
@@ -5152,7 +5474,7 @@
               </div>
             ` : `
               <div style="background: var(--bg-sidebar); border: 1px solid var(--border-color); border-radius: 6px; padding: 12px; font-size: 12px; color: var(--text-muted);">
-                This developer is an active subsystem maintainer/reviewer, but is not currently indexed in the historical <code>CREDITS</code> file.
+                This developer is an active subsystem maintainer/contributor, but is not currently indexed in the historical <code>CREDITS</code> file.
               </div>
             `}
           </div>
@@ -5169,6 +5491,237 @@
 
     function closePersonModal() {
       document.getElementById("personModal").classList.remove("open");
+    }
+
+    // ------------------------------------------------------------------------
+    // Commit Details Modal
+    // ------------------------------------------------------------------------
+    async function openCommitModal(commitHashOrId) {
+      const modal = document.getElementById("commitModal");
+      const titleEl = document.getElementById("commitModalTitle");
+      const contentEl = document.getElementById("commitModalContent");
+
+      modal.classList.add("open");
+      titleEl.innerText = "📜 Commit Details";
+      contentEl.innerHTML = `<div style="padding: 40px; text-align: center; color: var(--accent);">⏳ Loading commit details...</div>`;
+
+      const data = await apiFetch(`/api/version/${currentVersion}/commit/${encodeURIComponent(commitHashOrId)}`);
+      if (!data || !data.commit_hash) {
+        contentEl.innerHTML = `<div style="padding: 30px; color: var(--danger);">Failed to load commit "${commitHashOrId}".</div>`;
+        return;
+      }
+
+      const chash = data.commit_hash;
+      const auth = data.author || {};
+      const comm = data.committer || {};
+      const contribs = data.contributors || [];
+      const files = data.files || [];
+
+      titleEl.innerText = `📜 Commit #${chash.substring(0, 10)}`;
+
+      const contribsHtml = contribs.map(c => `
+        <span class="member-pill" onclick="openPersonModal('${escapeJs(c.email || c.name)}')" title="Role: ${escapeHtml(c.role_name || '')}">
+          <span class="badge ${c.role === 1 ? 'badge-accent' : (c.role === 3 ? 'badge-success' : '')}">${escapeHtml(c.role_name || 'Contributor')}</span>
+          <strong>${escapeHtml(c.name || 'Unnamed')}</strong> ${c.email ? `<span style="color: var(--text-muted);">&lt;${escapeHtml(c.email)}&gt;</span>` : ''}
+        </span>
+      `).join("");
+
+      const filesHtml = files.map(f => `
+        <div style="background: var(--bg-sidebar); border: 1px solid var(--border-color); border-radius: 6px; padding: 8px 12px; display: flex; justify-content: space-between; align-items: center;">
+          <div style="display: flex; align-items: center; gap: 8px;">
+            <span class="badge ${f.change_type === 'A' ? 'badge-success' : (f.change_type === 'M' ? 'badge-accent' : 'badge-danger')}">${escapeHtml(f.change_type)}</span>
+            <a class="item-link" onclick="closeCommitModal(); openSubsystemFile('${escapeJs(f.path)}')">${escapeHtml(f.path)}</a>
+          </div>
+          <button class="btn btn-accent" style="padding: 2px 8px; font-size: 11px;" onclick="closeCommitModal(); openSubsystemFile('${escapeJs(f.path)}')">Open File ➔</button>
+        </div>
+      `).join("");
+
+      contentEl.innerHTML = `
+        <div style="display: flex; flex-direction: column; gap: 16px;">
+          <!-- Commit Header Box -->
+          <div style="background: var(--bg-sidebar); padding: 16px; border-radius: 8px; border: 1px solid var(--border-color); display: flex; flex-direction: column; gap: 10px;">
+            <div style="display: flex; justify-content: space-between; align-items: center;">
+              <div style="display: flex; align-items: center; gap: 8px;">
+                <span class="commit-hash-chip" style="font-size: 13px; padding: 4px 10px;">🔑 ${escapeHtml(chash)}</span>
+                <span class="badge badge-accent">Version: ${escapeHtml(data.version || currentVersion)}</span>
+              </div>
+              <button class="btn" style="padding: 4px 10px; font-size: 11px;" onclick="navigator.clipboard.writeText('${escapeJs(chash)}')">📋 Copy SHA</button>
+            </div>
+            <h3 style="color: var(--text-bright); font-size: 16px; line-height: 1.4; margin: 4px 0;">${escapeHtml(data.subject)}</h3>
+            <div style="display: flex; justify-content: space-between; align-items: center; font-size: 12px; color: var(--text-muted); flex-wrap: wrap; gap: 8px;">
+              <div>
+                <strong>Author:</strong> <a class="person-link" onclick="openPersonModal('${escapeJs(auth.email || auth.name)}')">${escapeHtml(auth.name || 'Unknown')}</a> ${auth.email ? `&lt;${escapeHtml(auth.email)}&gt;` : ''}
+              </div>
+              <div>📅 ${escapeHtml(data.author_date_iso || '')}</div>
+            </div>
+          </div>
+
+          <!-- Commit Message Body -->
+          <div>
+            <h4 style="font-size: 12px; color: var(--text-muted); margin-bottom: 6px; text-transform: uppercase;">Commit Message &amp; Trailers</h4>
+            <pre style="background: #1e2227; border: 1px solid var(--border-color); border-radius: 6px; padding: 14px; font-size: 12px; font-family: monospace; color: var(--text-bright); white-space: pre-wrap; line-height: 1.5; max-height: 200px; overflow-y: auto;">${escapeHtml(data.message || data.subject)}</pre>
+          </div>
+
+          <!-- Contributors Breakdown -->
+          ${contribs.length > 0 ? `
+            <div>
+              <h4 style="font-size: 12px; color: var(--accent); margin-bottom: 8px; text-transform: uppercase;">👥 Co-developers, Signers &amp; Reviewers (${contribs.length})</h4>
+              <div style="display: flex; flex-wrap: wrap; gap: 8px;">
+                ${contribsHtml}
+              </div>
+            </div>
+          ` : ''}
+
+          <!-- Modified Files -->
+          <div>
+            <h4 style="font-size: 12px; color: #98c379; margin-bottom: 8px; text-transform: uppercase;">📁 Files Modified in this Patch (${files.length})</h4>
+            <div style="display: flex; flex-direction: column; gap: 6px; max-height: 180px; overflow-y: auto;">
+              ${filesHtml || '<div style="color: var(--text-muted); font-size: 12px;">No specific files indexed.</div>'}
+            </div>
+          </div>
+        </div>
+      `;
+    }
+
+    function closeCommitModal() {
+      document.getElementById("commitModal").classList.remove("open");
+    }
+
+    // ------------------------------------------------------------------------
+    // Commit Timeline Workspace Handlers
+    // ------------------------------------------------------------------------
+    let timelineData = [];
+    let timelineTopContributorsData = [];
+    let timelineLoadedVersion = "";
+
+    async function loadTimelineData(force = false) {
+      const stream = document.getElementById("timelineStream");
+      const topEl = document.getElementById("timelineTopContributors");
+      const countBadge = document.getElementById("timelineCountBadge");
+
+      if (!stream || !topEl) return;
+      stream.innerHTML = `<div style="padding: 40px; text-align: center; color: var(--accent);">⏳ Loading commit timeline for ${currentVersion}...</div>`;
+      topEl.innerHTML = `<div style="color: var(--text-muted); font-size: 11px;">Loading ranking...</div>`;
+
+      const data = await apiFetch(`/api/version/${currentVersion}/timeline?limit=150`);
+      if (!data || !data.timeline) {
+        stream.innerHTML = `<div style="padding: 40px; text-align: center; color: var(--danger);">Failed to load commit timeline.</div>`;
+        return;
+      }
+
+      timelineData = data.timeline || [];
+      timelineTopContributorsData = data.top_contributors || [];
+      timelineLoadedVersion = currentVersion;
+      if (countBadge) countBadge.innerText = `${data.total_commits || timelineData.length} Commits`;
+
+      renderTimelineTopContributors();
+      renderTimelineStream(timelineData);
+    }
+
+    function renderTimelineTopContributors() {
+      const topEl = document.getElementById("timelineTopContributors");
+      if (!topEl) return;
+
+      if (!timelineTopContributorsData || timelineTopContributorsData.length === 0) {
+        topEl.innerHTML = `<div style="color: var(--text-muted); font-size: 11px;">No contributor stats available.</div>`;
+        return;
+      }
+
+      topEl.innerHTML = timelineTopContributorsData.map((tc, idx) => {
+        const avatarBg = getAuthorColor(tc.name || tc.email);
+        const initials = (tc.name.replace(/[^A-Za-z]/g, "").substring(0, 2) || "U").toUpperCase();
+        return `
+          <div style="background: var(--bg-card); border: 1px solid var(--border-color); border-radius: 6px; padding: 8px 12px; display: flex; justify-content: space-between; align-items: center; cursor: pointer;" onclick="openPersonModal('${escapeJs(tc.email || tc.name)}')">
+            <div style="display: flex; align-items: center; gap: 8px;">
+              <span style="font-size: 11px; font-weight: bold; color: var(--text-muted); width: 16px;">#${idx + 1}</span>
+              <span class="author-avatar" style="background: ${avatarBg};">${initials}</span>
+              <div>
+                <div style="font-size: 12px; font-weight: bold; color: var(--text-bright);">${escapeHtml(tc.name)}</div>
+                ${tc.email ? `<div style="font-size: 10px; color: var(--text-muted);">${escapeHtml(tc.email)}</div>` : ''}
+              </div>
+            </div>
+            <span class="badge badge-accent">${tc.commits_count} commits</span>
+          </div>
+        `;
+      }).join("");
+    }
+
+    function renderTimelineStream(commits) {
+      const stream = document.getElementById("timelineStream");
+      if (!stream) return;
+
+      if (!commits || commits.length === 0) {
+        stream.innerHTML = `<div style="padding: 40px; text-align: center; color: var(--text-muted);">No commits found matching filter criteria.</div>`;
+        return;
+      }
+
+      stream.innerHTML = commits.map(c => {
+        const auth = c.author || {};
+        const authName = auth.name || auth.email || "Unknown";
+        const initials = (authName.replace(/[^A-Za-z]/g, "").substring(0, 2) || "U").toUpperCase();
+        const avatarBg = getAuthorColor(authName);
+        const contribs = c.contributors || [];
+        const coDevs = contribs.filter(cb => cb.role !== 1);
+
+        const coDevsHtml = coDevs.slice(0, 3).map(cb => `
+          <span class="badge" style="font-size: 10px; opacity: 0.85;" onclick="event.stopPropagation(); openPersonModal('${escapeJs(cb.email || cb.name)}')">
+            ${escapeHtml(cb.role_name || '')}: ${escapeHtml(cb.name)}
+          </span>
+        `).join("");
+
+        return `
+          <div class="timeline-card" onclick="openCommitModal('${escapeJs(c.commit_hash)}')">
+            <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px;">
+              <div style="display: flex; align-items: center; gap: 10px;">
+                <span class="author-avatar" style="background: ${avatarBg};">${initials}</span>
+                <div>
+                  <a class="person-link" style="font-weight: bold; font-size: 13px;" onclick="event.stopPropagation(); openPersonModal('${escapeJs(auth.email || auth.name)}')">${escapeHtml(authName)}</a>
+                  <span style="font-size: 11px; color: var(--text-muted); margin-left: 6px;">${escapeHtml(c.author_date_iso || '')}</span>
+                </div>
+              </div>
+              <span class="commit-hash-chip" onclick="event.stopPropagation(); openCommitModal('${escapeJs(c.commit_hash)}')"># ${c.commit_hash.substring(0, 10)}</span>
+            </div>
+
+            <div style="font-size: 14px; font-weight: bold; color: var(--text-bright); line-height: 1.4;">
+              ${escapeHtml(c.subject)}
+            </div>
+
+            <div style="display: flex; justify-content: space-between; align-items: center; font-size: 11px; color: var(--text-muted); flex-wrap: wrap; gap: 8px;">
+              <div style="display: flex; align-items: center; gap: 6px; flex-wrap: wrap;">
+                ${coDevsHtml}
+                ${coDevs.length > 3 ? `<span style="color: var(--text-muted);">+${coDevs.length - 3} more</span>` : ''}
+              </div>
+              <div style="display: flex; gap: 10px; align-items: center;">
+                <span>📁 ${c.files_count || 0} files</span>
+                <button class="btn btn-accent" style="padding: 2px 8px; font-size: 11px;" onclick="event.stopPropagation(); openCommitModal('${escapeJs(c.commit_hash)}')">Details ➔</button>
+              </div>
+            </div>
+          </div>
+        `;
+      }).join("");
+    }
+
+    function filterTimeline() {
+      const search = (document.getElementById("timelineSearchInput")?.value || "").trim().toLowerCase();
+      const authFilter = (document.getElementById("timelineAuthorFilter")?.value || "").trim().toLowerCase();
+
+      let filtered = timelineData;
+      if (search) {
+        filtered = filtered.filter(c => 
+          c.subject.toLowerCase().includes(search) || 
+          c.commit_hash.toLowerCase().includes(search) ||
+          (c.author && (c.author.name.toLowerCase().includes(search) || c.author.email.toLowerCase().includes(search)))
+        );
+      }
+      if (authFilter) {
+        filtered = filtered.filter(c => 
+          c.author && (c.author.name.toLowerCase().includes(authFilter) || c.author.email.toLowerCase().includes(authFilter))
+        );
+      }
+
+      const countBadge = document.getElementById("timelineCountBadge");
+      if (countBadge) countBadge.innerText = `${filtered.length} Commits`;
+      renderTimelineStream(filtered);
     }
 
     async function loadCreditsData(force = false) {

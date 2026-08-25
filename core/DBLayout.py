@@ -3,7 +3,7 @@
 ===============================================================================
 RELATIONAL DATABASE SCHEMA REFERENCE GUIDE FOR AI & PARSERS
 ===============================================================================
-This module defines the 25 core relational database tables used across the parser
+This module defines the 29 core relational database tables used across the parser
 pipeline (`Table_Array`).
 
 SCHEMA ENTITY-RELATIONSHIP GRAPH:
@@ -62,6 +62,20 @@ SCHEMA ENTITY-RELATIONSHIP GRAPH:
       |-- (vid_s, vid_e, person_id) --------> m_credits_entry (credit_id, vid_s, ...) -|
                                                ^
    m_file (fid, ...) --------------------------|
+
+6. Git Commit, Multi-Contributor & Multi-Commit Tag Subsystem:
+   m_v_main (vid, vname)
+      ^
+      |-- (vid) ---------------------> m_commit (commit_id, vid, commit_hash, author_id, author_date,
+      |                                          committer_id, committer_date, subject, message)
+      |                                  ^              ^              ^
+   m_maintainer_person (person_id) ------| (author_id)  | (committer)  |
+      ^                                                                |
+      |-- (person_id) <------- m_bridge_commit_person (commit_id, person_id, role_type, priority)
+                                         ^
+   m_file (fid, ...) --------------------|--------> m_bridge_commit_file (commit_id, vid, fid, change_type)
+                                         |
+   m_tag (tag_id, ...) ------------------|--------> m_bridge_commit_tag (commit_id, vid, fid, tag_id)
 ===============================================================================
 """
 from core.globalstuff import ASTT
@@ -716,6 +730,128 @@ m_credits_entry = Table(
     hashing_table=False,
 )
 
+# -----------------------------------------------------------------------------
+# 26. m_commit (table_id=25): Git Commit Registry
+#     - commit_id: Unique Commit ID (PK, AUTO_INCREMENT).
+#     - vid: Target Kernel Version ID (FK -> m_v_main.vid).
+#     - commit_hash: 40-char SHA-1 Git commit hash.
+#     - author_id: Commit Author Person ID (FK -> m_maintainer_person.person_id).
+#     - author_date: Author date as Unix epoch timestamp.
+#     - committer_id: Committer Person ID (FK -> m_maintainer_person.person_id).
+#     - committer_date: Committer date as Unix epoch timestamp.
+#     - subject: Single-line commit subject / summary.
+#     - message: Full commit message body (including trailers).
+# -----------------------------------------------------------------------------
+m_commit = Table(
+    table_id=25,
+    table_name="m_commit",
+    columns=(
+        ("commit_id", "INT", "NOT NULL", "AUTO_INCREMENT"),
+        ("vid", "INT", "NOT NULL"),
+        ("commit_hash", "VARCHAR(40)", "NOT NULL", "COLLATE utf8mb4_bin"),
+        ("author_id", "INT", "NOT NULL"),
+        ("author_date", "INT", "NOT NULL"),
+        ("committer_id", "INT", "NOT NULL"),
+        ("committer_date", "INT", "NOT NULL"),
+        ("subject", "VARCHAR(500)", "NOT NULL", "COLLATE utf8mb4_bin"),
+        ("message", "MEDIUMTEXT", "NOT NULL"),
+    ),
+    primary=("commit_id",),
+    foreign=(
+        ("vid", "m_v_main", "vid"),
+        ("author_id", "m_maintainer_person", "person_id"),
+        ("committer_id", "m_maintainer_person", "person_id"),
+    ),
+    initial_insert=None,
+    no_duplicate=False,
+    te_cached=False,
+    hashing_table=False,
+)
+
+# -----------------------------------------------------------------------------
+# 27. m_bridge_commit_person (table_id=26): Commit Multi-Contributor Bridge
+#     - commit_id: Git Commit ID (FK -> m_commit.commit_id).
+#     - person_id: Contributor Person ID (FK -> m_maintainer_person.person_id).
+#     - role_type: Role (1: Author, 2: Committer, 3: Co-developed-by, 4: Signed-off-by, 5: Reviewed-by, 6: Acked-by, 7: Tested-by, 8: Reported-by, 9: Suggested-by).
+#     - priority: Occurrence order / rank.
+# -----------------------------------------------------------------------------
+m_bridge_commit_person = Table(
+    table_id=26,
+    table_name="m_bridge_commit_person",
+    columns=(
+        ("commit_id", "INT", "NOT NULL"),
+        ("person_id", "INT", "NOT NULL"),
+        ("role_type", "TINYINT", "UNSIGNED", "NOT NULL"),
+        ("priority", "SMALLINT", "UNSIGNED", "NOT NULL"),
+    ),
+    primary=("commit_id", "person_id", "role_type"),
+    foreign=(
+        ("commit_id", "m_commit", "commit_id"),
+        ("person_id", "m_maintainer_person", "person_id"),
+    ),
+    initial_insert=None,
+    no_duplicate=False,
+    te_cached=False,
+    hashing_table=False,
+)
+
+# -----------------------------------------------------------------------------
+# 28. m_bridge_commit_file (table_id=27): Commit Modified File Bridge
+#     - commit_id: Git Commit ID (FK -> m_commit.commit_id).
+#     - vid: Target Kernel Version ID (FK -> m_v_main.vid).
+#     - fid: Modified File Instance ID (FK -> m_file.fid).
+#     - change_type: Modification flag ('A'=Added, 'M'=Modified, 'D'=Deleted, 'R'=Renamed).
+# -----------------------------------------------------------------------------
+m_bridge_commit_file = Table(
+    table_id=27,
+    table_name="m_bridge_commit_file",
+    columns=(
+        ("commit_id", "INT", "NOT NULL"),
+        ("vid", "INT", "NOT NULL"),
+        ("fid", "INT", "NOT NULL"),
+        ("change_type", "CHAR(1)", "NOT NULL"),
+    ),
+    primary=("commit_id", "fid"),
+    foreign=(
+        ("commit_id", "m_commit", "commit_id"),
+        ("vid", "m_v_main", "vid"),
+        ("fid", "m_file", "fid"),
+    ),
+    initial_insert=None,
+    no_duplicate=False,
+    te_cached=False,
+    hashing_table=False,
+)
+
+# -----------------------------------------------------------------------------
+# 29. m_bridge_commit_tag (table_id=28): Multi-Commit Tag Mapping Bridge
+#     - commit_id: Git Commit ID (FK -> m_commit.commit_id).
+#     - vid: Target Kernel Version ID (FK -> m_v_main.vid).
+#     - fid: File Instance ID (FK -> m_file.fid).
+#     - tag_id: Code Snippet Tag ID (FK -> m_tag.tag_id).
+# -----------------------------------------------------------------------------
+m_bridge_commit_tag = Table(
+    table_id=28,
+    table_name="m_bridge_commit_tag",
+    columns=(
+        ("commit_id", "INT", "NOT NULL"),
+        ("vid", "INT", "NOT NULL"),
+        ("fid", "INT", "NOT NULL"),
+        ("tag_id", "INT", "NOT NULL"),
+    ),
+    primary=("commit_id", "tag_id"),
+    foreign=(
+        ("commit_id", "m_commit", "commit_id"),
+        ("vid", "m_v_main", "vid"),
+        ("fid", "m_file", "fid"),
+        ("tag_id", "m_tag", "tag_id"),
+    ),
+    initial_insert=None,
+    no_duplicate=False,
+    te_cached=False,
+    hashing_table=False,
+)
+
 TABLES: tuple[Table, ...] = (
     m_v_main,
     m_file_name,
@@ -742,21 +878,27 @@ TABLES: tuple[Table, ...] = (
     m_maintainer_pattern,
     m_maintainer_file,
     m_credits_entry,
+    m_commit,
+    m_bridge_commit_person,
+    m_bridge_commit_file,
+    m_bridge_commit_tag,
 )
 
 
 def init_db_layout(gp=None) -> tuple[Table, ...]:
-    """Initialize and populate gp.Table_Array with the default 25 schema tables.
+    """Initialize and populate gp.Table_Array with the default 29 schema tables.
     
     Args:
         gp: Optional GreatProcessor instance to attach Table_Array to.
         
+        
     Returns:
-        Immutable tuple of all 25 Table schema objects.
+        Immutable tuple of all 29 Table schema objects.
     """
     if gp is not None:
         gp.Table_Array = list(TABLES)
     return TABLES
+
 
 
 

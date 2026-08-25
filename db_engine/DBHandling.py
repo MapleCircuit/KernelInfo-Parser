@@ -1010,3 +1010,75 @@ class MariaDB(BaseDBEngine):
             if getattr(e, "errno", None) == 1091 or "check that column/key exists" in str(e):
                 return
             raise
+
+    def create_indexes(
+        self,
+        indexes: Sequence[tuple[str, Table, tuple[PointerType, ...]]],
+        max_workers: int | None = None,
+    ) -> None:
+        """Create multiple database indexes in parallel across dedicated worker connections.
+
+        Args:
+            indexes: Sequence of index specifications `(index_name, table, rows)`.
+            max_workers: Optional max concurrency limit (default 8).
+
+        Outputs:
+            None.
+        """
+        if not indexes:
+            return
+
+        if len(indexes) == 1:
+            idx_name, tbl, rows = indexes[0]
+            self.create_index(idx_name, tbl, rows)
+            return
+
+        from concurrent.futures import ThreadPoolExecutor
+        workers = min(len(indexes), max_workers or 8)
+
+        def _worker_create(item: tuple[str, Table, tuple[PointerType, ...]]) -> None:
+            idx_name, tbl, rows = item
+            worker_db = self.__class__()
+            try:
+                worker_db.create_index(idx_name, tbl, rows)
+            finally:
+                worker_db.close()
+
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            list(executor.map(_worker_create, indexes))
+
+    def remove_indexes(
+        self,
+        indexes: Sequence[tuple[str, Table]],
+        max_workers: int | None = None,
+    ) -> None:
+        """Remove multiple database indexes in parallel across dedicated worker connections.
+
+        Args:
+            indexes: Sequence of index specifications `(index_name, table)`.
+            max_workers: Optional max concurrency limit (default 8).
+
+        Outputs:
+            None.
+        """
+        if not indexes:
+            return
+
+        if len(indexes) == 1:
+            idx_name, tbl = indexes[0]
+            self.remove_index(idx_name, tbl)
+            return
+
+        from concurrent.futures import ThreadPoolExecutor
+        workers = min(len(indexes), max_workers or 8)
+
+        def _worker_remove(item: tuple[str, Table]) -> None:
+            idx_name, tbl = item
+            worker_db = self.__class__()
+            try:
+                worker_db.remove_index(idx_name, tbl)
+            finally:
+                worker_db.close()
+
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            list(executor.map(_worker_remove, indexes))

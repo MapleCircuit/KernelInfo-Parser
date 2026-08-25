@@ -272,6 +272,36 @@ class BaseDBEngine(ABC):
         """
 
     @abstractmethod
+    def create_indexes(
+        self,
+        indexes: Sequence[tuple[str, Table, tuple[PointerType, ...]]],
+        max_workers: int | None = None,
+    ) -> None:
+        """Create multiple database indexes in parallel across dedicated worker connections.
+
+        Args:
+            indexes (Sequence[tuple[str, Table, tuple[PointerType, ...]]]): Sequence of index specifications `(index_name, table, rows)`.
+            max_workers (int | None): Maximum concurrent worker threads (default 8).
+        Outputs:
+            None.
+        """
+
+    @abstractmethod
+    def remove_indexes(
+        self,
+        indexes: Sequence[tuple[str, Table]],
+        max_workers: int | None = None,
+    ) -> None:
+        """Remove multiple database indexes in parallel across dedicated worker connections.
+
+        Args:
+            indexes (Sequence[tuple[str, Table]]): Sequence of index specifications `(index_name, table)`.
+            max_workers (int | None): Maximum concurrent worker threads (default 8).
+        Outputs:
+            None.
+        """
+
+    @abstractmethod
     def test_tables(self, tables: Sequence[Table] | Table) -> list[str] | None:
         """Check for existence of registered schema tables in database catalog.
 

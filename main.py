@@ -96,6 +96,10 @@ from core.DBLayout import (
     m_maintainer_pattern,
     m_maintainer_file,
     m_credits_entry,
+    m_commit,
+    m_bridge_commit_person,
+    m_bridge_commit_file,
+    m_bridge_commit_tag,
 )
 
 
@@ -132,12 +136,15 @@ def update(version: str) -> None:
     logger.info(COLOR.green(f"=======================Working on {version}======================="))
 
     # -------------------------------------------------------------------------
-    # STEP 2: Ensure performance B-tree indexes are active for worker queries
+    # STEP 2: Ensure performance B-tree indexes are active for worker queries (in parallel)
     # -------------------------------------------------------------------------
+    performance_indexes = (
+        ("ast_index", m_ast, (m_ast.name, m_ast.type_id)),
+        ("file_name_index", m_file_name, (m_file_name.fname,)),
+        ("bridge_tag_fid_idx", m_bridge_tag, (m_bridge_tag.fid, m_bridge_tag.tag_id)),
+    )
     with G.DB() as db:
-        db.create_index("ast_index", m_ast, (m_ast.name, m_ast.type_id))
-        db.create_index("file_name_index", m_file_name, (m_file_name.fname,))
-        db.create_index("bridge_tag_fid_idx", m_bridge_tag, (m_bridge_tag.fid, m_bridge_tag.tag_id))
+        db.create_indexes(performance_indexes)
 
     # -------------------------------------------------------------------------
     # STEP 3: Clone repository branch version to RAMDISK workspace
@@ -178,6 +185,10 @@ def update(version: str) -> None:
         if not gp.ChangeSet_Dict[current_cs].execute():
             cs_queue.append(current_cs)
 
+    # -------------------------------------------------------------------------
+    # STEP 6.5: Parse Git Commits, Multi-Contributors & Bridge Tags to Commits
+    # -------------------------------------------------------------------------
+    processing_git_commits(version)
 
     # -------------------------------------------------------------------------
     # STEP 7: Drop secondary indexes, commit transactions, and rebuild indexes
@@ -189,16 +200,16 @@ def update(version: str) -> None:
             pass
 
     with G.DB() as db:
-        db.remove_index("ast_index", m_ast)
-        db.remove_index("file_name_index", m_file_name)
-        db.remove_index("bridge_tag_fid_idx", m_bridge_tag)
+        db.remove_indexes((
+            ("ast_index", m_ast),
+            ("file_name_index", m_file_name),
+            ("bridge_tag_fid_idx", m_bridge_tag),
+        ))
 
     G.TE.commit_all()
 
     with G.DB() as db:
-        db.create_index("ast_index", m_ast, (m_ast.name, m_ast.type_id))
-        db.create_index("file_name_index", m_file_name, (m_file_name.fname,))
-        db.create_index("bridge_tag_fid_idx", m_bridge_tag, (m_bridge_tag.fid, m_bridge_tag.tag_id))
+        db.create_indexes(performance_indexes)
 
     if G.PROFILING_ENABLED and gp.ChangeSet_Dict:
         from core.Profiler import format_profiling_report
@@ -207,6 +218,7 @@ def update(version: str) -> None:
             print(format_profiling_report(profilers, title=f"UPDATE CYCLE PROFILE: {version}"))
 
     gp.reset_cs()
+    MF.trim_version(keep=1)
     G.TE.close()
     import gc
     gc.collect()
@@ -322,9 +334,9 @@ def main() -> None:
                     pass
 
     #try:
+    update("v3.0")
+    update("v3.1")
     if False:
-        update("v3.0")
-        update("v3.1")
         update("v3.2")
         update("v3.3")
         update("v3.4")
@@ -404,9 +416,10 @@ def main() -> None:
         update("v6.17")
         update("v6.18")
         update("v6.19")
-    update("v7.0")
-    update("v7.1")
-    update("v7.2")
+        update("v7.0")
+        update("v7.1")
+        update("v7.2")
+
 
     #except Exception as e:  # noqa: BLE001
     #    logger.error("Error in Update()")
@@ -978,6 +991,141 @@ def processing_dirs() -> None:  # noqa: C901
             ))
             gp.ChangeSet_Dict[single_dir] = CS
     return
+
+
+def processing_git_commits(version: str) -> None:
+    """Parse git commits for active version, link contributors, and bridge tags to commits."""
+    from parser.git_ast import GitCommitParser
+    git_parser = GitCommitParser()
+    commits, file_hunks_map = git_parser.parse_version_commits_with_hunks(
+        gp.Old_Version_Name, gp.Version_Name
+    )
+    if not commits:
+        return
+
+    logger.info(f"Processing {len(commits)} git commits for version '{version}'...")
+
+    commit_hash_to_id = {}
+    for commit in commits:
+        # Resolve author person_id
+        author_res = G.TE.set(
+            m_maintainer_person.table_id,
+            (None, commit.author_name or commit.author_email, commit.author_email),
+        )
+        author_pid = author_res[0] if author_res else 1
+
+        # Resolve committer person_id
+        committer_res = G.TE.set(
+            m_maintainer_person.table_id,
+            (None, commit.committer_name or commit.committer_email, commit.committer_email),
+        )
+        committer_pid = committer_res[0] if committer_res else author_pid
+
+        # Insert commit
+        commit_res = G.TE.set(
+            m_commit.table_id,
+            (
+                None,
+                gp.VID,
+                commit.commit_hash,
+                author_pid,
+                commit.author_date,
+                committer_pid,
+                commit.committer_date,
+                commit.subject[:500],
+                commit.message,
+            ),
+        )
+        commit_id = commit_res[0]
+        commit.commit_id = commit_id
+        commit_hash_to_id[commit.commit_hash] = commit_id
+
+        # Insert contributors (Author, Committer, Co-developed-by, Signed-off-by, Reviewed-by, etc.)
+        for contrib in commit.contributors:
+            c_res = G.TE.set(
+                m_maintainer_person.table_id,
+                (None, contrib.name or contrib.email, contrib.email),
+            )
+            c_pid = c_res[0] if c_res else 1
+            G.TE.set(
+                m_bridge_commit_person.table_id,
+                (
+                    commit_id,
+                    c_pid,
+                    int(contrib.role),
+                    int(contrib.priority),
+                ),
+            )
+
+        # Insert modified file bridges
+        for change_type, file_path in commit.files:
+            fn_row = m_file_name.get(None, file_path)
+            if fn_row and len(fn_row) >= 3 and fn_row[2]:
+                fnid = fn_row[2][0]
+                bf_row = m_bridge_file.get(gp.VID, fnid, None)
+                if bf_row and len(bf_row) >= 3 and bf_row[2]:
+                    fid = bf_row[2][2]
+                    G.TE.set(
+                        m_bridge_commit_file.table_id,
+                        (
+                            commit_id,
+                            gp.VID,
+                            fid,
+                            change_type[:1],
+                        ),
+                    )
+
+    # Link tags to commits for all changed files and evacuate executed ChangeSet memory
+    for file_path, cs_obj in list(gp.ChangeSet_Dict.items()):
+        if not cs_obj or not getattr(cs_obj, "current_path", None):
+            continue
+        c_path = cs_obj.current_path
+        fn_row = m_file_name.get(None, c_path)
+        if not fn_row or len(fn_row) < 3 or not fn_row[2]:
+            continue
+        fnid = fn_row[2][0]
+        bf_row = m_bridge_file.get(gp.VID, fnid, None)
+        if not bf_row or len(bf_row) < 3 or not bf_row[2]:
+            continue
+        fid = bf_row[2][2]
+
+        # Collect tags for this file from ChangeSet operations
+        file_tags = []
+        for op in getattr(cs_obj, "cs", []):
+            if op and len(op) >= 3 and op[0] == m_bridge_tag.table_id:
+                cols = op[2]
+                if len(cols) >= 4:
+                    tag_id = cols[1] if not isinstance(cols[1], tuple) else None
+                    line_s = cols[2] if isinstance(cols[2], int) else 1
+                    line_e = cols[3] if isinstance(cols[3], int) else line_s
+                    if tag_id is not None:
+                        file_tags.append((tag_id, fid, line_s, line_e))
+
+        if file_tags:
+            tag_bridges = git_parser.map_tags_to_commits(
+                file_tags,
+                c_path,
+                commit_hash_to_id=commit_hash_to_id,
+                file_hunks_map=file_hunks_map,
+            )
+            for cid, f_id, tid in tag_bridges:
+                G.TE.set(
+                    m_bridge_commit_tag.table_id,
+                    (
+                        cid,
+                        gp.VID,
+                        f_id,
+                        tid,
+                    ),
+                )
+
+        # Evacuate internal AST memory from executed ChangeSet
+        if hasattr(cs_obj, "cs") and isinstance(cs_obj.cs, list):
+            cs_obj.cs.clear()
+        if hasattr(cs_obj, "store_dict") and isinstance(cs_obj.store_dict, dict):
+            cs_obj.store_dict.clear()
+        if hasattr(cs_obj, "cs_result") and isinstance(cs_obj.cs_result, list):
+            cs_obj.cs_result.clear()
 
 
 if __name__ == "__main__":

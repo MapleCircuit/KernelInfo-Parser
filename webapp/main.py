@@ -18,6 +18,7 @@ import json
 import logging
 import subprocess
 import urllib.parse
+from datetime import datetime, timezone
 from typing import Any
 from collections import defaultdict
 import mysql.connector
@@ -37,6 +38,13 @@ from parser.maintainer_ast.maintainer_types import (
 from parser.maintainer_ast.maintainer_parser import MaintainerParser
 from parser.maintainer_ast.credits_parser import CreditsParser
 from parser.maintainer_ast.maintainer_matcher import MaintainerMatcher
+from parser.git_ast.git_types import (
+    CommitRole,
+    GitContributor,
+    GitCommit,
+    CommitDiffHunk,
+)
+from parser.git_ast.git_commit_parser import GitCommitParser
 
 logging.basicConfig(
     level=logging.INFO,
@@ -2782,92 +2790,334 @@ def get_maintainer_section_detail(version_name: str, sec_id_or_name: str) -> dic
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 
+COMMIT_ROLE_NAMES = {
+    1: "Author",
+    2: "Committer",
+    3: "Co-developed-by",
+    4: "Signed-off-by",
+    5: "Reviewed-by",
+    6: "Acked-by",
+    7: "Tested-by",
+    8: "Reported-by",
+    9: "Suggested-by",
+    10: "Contributor",
+}
+
+
+def get_person_git_contributions(
+    cnx: Any,
+    version_name: str,
+    target_pid: int | None,
+    target_name: str,
+    target_email: str,
+) -> dict[str, Any]:
+    """Query git contributions, contribution breakdown, recent commits, and latest patch for a developer."""
+    commits_list: list[dict[str, Any]] = []
+    authored_count = 0
+    codev_count = 0
+    signed_off_count = 0
+    reviewed_count = 0
+    other_count = 0
+
+    clean_email = (target_email or "").strip().strip("<>").lower()
+    clean_name = (target_name or "").strip().lower()
+
+    if cnx and cnx.is_connected():
+        try:
+            cursor = cnx.cursor()
+            # 1. Query commits via m_bridge_commit_person or author_id
+            cursor.execute("""
+                SELECT DISTINCT c.commit_id, c.commit_hash, c.subject, c.author_date,
+                       bp.role_type, ap.name AS author_name, ap.email AS author_email, v.vname
+                FROM m_commit c
+                JOIN m_maintainer_person ap ON c.author_id = ap.person_id
+                LEFT JOIN m_bridge_commit_person bp ON c.commit_id = bp.commit_id
+                LEFT JOIN m_maintainer_person bp_p ON bp.person_id = bp_p.person_id
+                LEFT JOIN m_v_main v ON c.vid = v.vid
+                WHERE (bp.person_id = %s OR c.author_id = %s OR LOWER(ap.email) = %s OR LOWER(ap.name) = %s OR LOWER(bp_p.email) = %s OR LOWER(bp_p.name) = %s)
+                ORDER BY c.author_date DESC
+                LIMIT 50
+            """, (target_pid or 0, target_pid or 0, clean_email, clean_name, clean_email, clean_name))
+            rows = cursor.fetchall()
+            seen_commit_ids = set()
+
+            for r in rows:
+                cid = r[0]
+                if cid in seen_commit_ids:
+                    continue
+                seen_commit_ids.add(cid)
+
+                chash = safe_decode(r[1])
+                subj = safe_decode(r[2])
+                ts = int(r[3]) if r[3] else 0
+                role_val = r[4] or 1
+                a_name = safe_decode(r[5])
+                a_email = safe_decode(r[6])
+                vname = safe_decode(r[7]) or version_name
+
+                # Count files modified
+                cursor.execute("SELECT COUNT(*) FROM m_bridge_commit_file WHERE commit_id = %s", (cid,))
+                f_count = (cursor.fetchone() or [0])[0]
+
+                role_str = COMMIT_ROLE_NAMES.get(role_val, "Contributor")
+                if role_val == 1:
+                    authored_count += 1
+                elif role_val == 3:
+                    codev_count += 1
+                elif role_val == 4:
+                    signed_off_count += 1
+                elif role_val == 5:
+                    reviewed_count += 1
+                else:
+                    other_count += 1
+
+                iso_date = datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC") if ts else ""
+
+                commits_list.append({
+                    "commit_id": cid,
+                    "commit_hash": chash,
+                    "subject": subj,
+                    "author_date": ts,
+                    "author_date_iso": iso_date,
+                    "author_name": a_name,
+                    "author_email": a_email,
+                    "role": role_str,
+                    "role_type": role_val,
+                    "version": vname,
+                    "files_count": f_count,
+                })
+            cursor.close()
+        except Exception as e:
+            logger.warning("Error querying developer git contributions from MySQL: %s", e)
+
+    # Fallback to direct Git parser if no commits in DB
+    if not commits_list and (clean_name or clean_email):
+        try:
+            git_parser = GitCommitParser()
+            raw_commits = git_parser.parse_version_commits(None, version_name, limit=1000)
+            seen_hashes = set()
+            for idx, gc in enumerate(raw_commits):
+                if gc.commit_hash in seen_hashes:
+                    continue
+
+                matched_role = None
+                if (clean_name and clean_name in gc.author_name.lower()) or (clean_email and clean_email in gc.author_email.lower()):
+                    matched_role = CommitRole.AUTHOR
+                else:
+                    for cb in gc.contributors:
+                        if (clean_name and clean_name in cb.name.lower()) or (clean_email and clean_email in cb.email.lower()):
+                            matched_role = cb.role
+                            break
+
+                if matched_role is not None:
+                    seen_hashes.add(gc.commit_hash)
+                    role_val = int(matched_role)
+                    if role_val == 1:
+                        authored_count += 1
+                    elif role_val == 3:
+                        codev_count += 1
+                    elif role_val == 4:
+                        signed_off_count += 1
+                    elif role_val == 5:
+                        reviewed_count += 1
+                    else:
+                        other_count += 1
+
+                    iso_date = datetime.fromtimestamp(gc.author_date, timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC") if gc.author_date else ""
+                    commits_list.append({
+                        "commit_id": idx + 1,
+                        "commit_hash": gc.commit_hash,
+                        "subject": gc.subject,
+                        "author_date": gc.author_date,
+                        "author_date_iso": iso_date,
+                        "author_name": gc.author_name,
+                        "author_email": gc.author_email,
+                        "role": matched_role.name.capitalize().replace("_", "-"),
+                        "role_type": role_val,
+                        "version": version_name,
+                        "files_count": len(gc.files),
+                    })
+        except Exception as e:
+            logger.error("Git fallback for person contributions failed: %s", e)
+
+    # Determine latest patch
+    latest_patch = None
+    if commits_list:
+        # Sort by timestamp descending
+        commits_list.sort(key=lambda x: x["author_date"], reverse=True)
+        # Find latest where role is Author (1), Co-developed (3), or Committer (2)
+        primary_patches = [c for c in commits_list if c["role_type"] in (1, 2, 3)]
+        top_patch = primary_patches[0] if primary_patches else commits_list[0]
+        latest_patch = {
+            "commit_id": top_patch["commit_id"],
+            "commit_hash": top_patch["commit_hash"],
+            "subject": top_patch["subject"],
+            "author_date": top_patch["author_date"],
+            "author_date_iso": top_patch["author_date_iso"],
+            "role": top_patch["role"],
+            "version": top_patch["version"],
+            "files_count": top_patch.get("files_count", 0),
+        }
+
+    return {
+        "latest_patch": latest_patch,
+        "contribution_stats": {
+            "authored_commits": authored_count,
+            "co_developed_commits": codev_count,
+            "signed_off_commits": signed_off_count,
+            "reviewed_commits": reviewed_count,
+            "other_contributions": other_count,
+            "total_contributions": len(commits_list),
+        },
+        "recent_commits": commits_list[:15],
+    }
+
+
 @app.get("/api/version/{version_name}/person/{person_id_or_email:path}")
 def get_person_profile(version_name: str, person_id_or_email: str) -> dict[str, Any]:
-    """Retrieve developer/contributor profile, CREDITS entry, and all maintained subsystems."""
+    """Retrieve full developer profile, maintainer subsystems, CREDITS match, and latest patch."""
     cnx = db.get_connection()
     try:
-        sections, _ = get_maintainer_data(cnx, version_name)
-        credits_entries = get_credits_data(cnx, version_name)
+        decoded_id = urllib.parse.unquote(person_id_or_email).strip()
+        # Decode once more if double-encoded
+        if "%" in decoded_id:
+            decoded_id = urllib.parse.unquote(decoded_id).strip()
 
-        target_raw = urllib.parse.unquote_plus(urllib.parse.unquote(person_id_or_email)).strip() if isinstance(person_id_or_email, str) else str(person_id_or_email)
-        target_identifier = target_raw.strip().strip("<>").strip()
-        target_lower = target_identifier.lower()
+        person_data = None
+        credits_data = None
+        subsystems = []
+
+        target_lower = decoded_id.lower()
         target_name = ""
         target_email = ""
         target_pid = None
 
-        # 1. Find person in MAINTAINERS sections
-        associated_subsystems = []
+        sections, _ = get_maintainer_data(cnx, version_name)
+        credits_entries = get_credits_data(cnx, version_name)
+
+        # 1. Search in Maintainer sections
         for sec in sections:
             for m in sec.members:
-                pid = getattr(m, "person_id", None)
                 m_email_clean = (m.email or "").strip().strip("<>").lower()
                 m_name_clean = (m.name or "").strip().lower()
-                if (target_identifier.isdigit() and pid == int(target_identifier)) or \
+                if (decoded_id.isdigit() and getattr(m, "person_id", None) == int(decoded_id)) or \
                    (m_email_clean and (m_email_clean == target_lower or target_lower == m_email_clean)) or \
                    (m_name_clean and (m_name_clean == target_lower or target_lower == m_name_clean)):
-                    if not target_name:
+                    if not target_name and m.name:
                         target_name = m.name
                     if not target_email and m.email:
                         target_email = m.email
-                    if target_pid is None and pid is not None:
-                        target_pid = pid
-                    associated_subsystems.append({
-                        "sec_id": getattr(sec, "sec_id", None),
-                        "name": sec.name,
-                        "status": sec.status,
-                        "role": m.role.name.capitalize(),
-                        "mailing_list": sec.mailing_list,
-                    })
+                    if target_pid is None and getattr(m, "person_id", None) is not None:
+                        target_pid = m.person_id
 
-        # 2. Find person in CREDITS entries
-        credit_match: CreditsEntry | None = None
+        # 2. Search in CREDITS entries
+        credit_match = None
         for ce in credits_entries:
-            ce_pid = getattr(ce, "person_id", None)
             ce_email_clean = (ce.email or "").strip().strip("<>").lower()
             ce_name_clean = (ce.name or "").strip().lower()
-            if (target_identifier.isdigit() and ce_pid == int(target_identifier)) or \
+            if (decoded_id.isdigit() and getattr(ce, "person_id", None) == int(decoded_id)) or \
                (ce_email_clean and (ce_email_clean == target_lower or (target_email and ce_email_clean == target_email.strip().strip("<>").lower()))) or \
                (ce_name_clean and (ce_name_clean == target_lower or (target_name and ce_name_clean == target_name.strip().lower()))):
                 credit_match = ce
-                if not target_name:
+                if not target_name and ce.name:
                     target_name = ce.name
                 if not target_email and ce.email:
                     target_email = ce.email
-                if target_pid is None and ce_pid is not None:
-                    target_pid = ce_pid
+                if target_pid is None and getattr(ce, "person_id", None) is not None:
+                    target_pid = ce.person_id
                 break
 
-        if not target_name and not target_email and not credit_match and not associated_subsystems:
-            if cnx and cnx.is_connected():
-                cnx.close()
-            raise HTTPException(status_code=404, detail=f"Person '{person_id_or_email}' not found")
+        if cnx and cnx.is_connected():
+            try:
+                cursor = cnx.cursor()
+                if decoded_id.isdigit():
+                    cursor.execute("SELECT person_id, name, email FROM m_maintainer_person WHERE person_id = %s", (int(decoded_id),))
+                else:
+                    cursor.execute("SELECT person_id, name, email FROM m_maintainer_person WHERE LOWER(email) = %s OR LOWER(name) = %s LIMIT 1", (decoded_id.lower(), decoded_id.lower()))
+                row = cursor.fetchone()
+                if row:
+                    person_data = {
+                        "person_id": row[0],
+                        "name": safe_decode(row[1]) or target_name,
+                        "email": safe_decode(row[2]) or target_email,
+                    }
+                cursor.close()
+            except Exception as e:
+                logger.warning("Error looking up person in DB: %s", e)
 
-        credits_info = None
+        # Fallback if person not in DB: construct stub from parsed name/email
+        if not person_data:
+            person_data = {
+                "person_id": target_pid or (int(decoded_id) if decoded_id.isdigit() else (hash(target_name or decoded_id) & 0x7FFFFFFF or 1)),
+                "name": target_name or (decoded_id if not decoded_id.isdigit() else f"Person #{decoded_id}"),
+                "email": target_email or (decoded_id if "@" in decoded_id else ""),
+            }
+
+        # 3. Check if developer is in CREDITS
+        p_email = person_data.get("email", "").lower()
+        p_name = person_data.get("name", "").lower()
+        in_credits = (credit_match is not None)
+
         if credit_match:
-            credits_info = {
-                "credit_id": getattr(credit_match, "credit_id", None),
+            credits_data = {
+                "credit_id": getattr(credit_match, "credit_id", getattr(credit_match, "entry_id", None)),
+                "name": credit_match.name,
+                "email": credit_match.email,
                 "web_page": credit_match.web_page,
-                "pgp_key": credit_match.pgp_key,
                 "description": credit_match.description,
                 "snail_mail": credit_match.snail_mail,
+                "pgp_key": credit_match.pgp_key,
             }
+        else:
+            for entry in credits_entries:
+                if (p_email and entry.email and p_email == entry.email.lower()) or (p_name and entry.name and p_name == entry.name.lower()):
+                    in_credits = True
+                    credits_data = {
+                        "credit_id": getattr(entry, "credit_id", getattr(entry, "entry_id", None)),
+                        "name": entry.name,
+                        "email": entry.email,
+                        "web_page": entry.web_page,
+                        "description": entry.description,
+                        "snail_mail": entry.snail_mail,
+                        "pgp_key": entry.pgp_key,
+                    }
+                    break
+
+        # 3. Subsystems handled by this developer
+        sections, _ = get_maintainer_data(cnx, version_name)
+        for sec in sections:
+            for m in sec.members:
+                if (p_email and m.email and p_email == m.email.lower()) or (p_name and m.name and p_name == m.name.lower()):
+                    subsystems.append({
+                        "sec_id": sec.sec_id,
+                        "name": sec.name,
+                        "role": m.role.name.capitalize(),
+                        "mailing_list": sec.mailing_list,
+                        "status": sec.status,
+                    })
+                    break
+
+        # 4. Git history, latest patch, and contribution breakdown
+        git_contribs = get_person_git_contributions(
+            cnx,
+            version_name,
+            person_data.get("person_id"),
+            person_data.get("name", ""),
+            person_data.get("email", ""),
+        )
 
         if cnx and cnx.is_connected():
             cnx.close()
 
         return {
-            "version": version_name,
-            "person": {
-                "person_id": target_pid or 1,
-                "name": target_name or target_email,
-                "email": target_email,
-            },
-            "in_credits": credit_match is not None,
-            "credits": credits_info,
-            "subsystems": associated_subsystems,
-            "subsystems_count": len(associated_subsystems),
+            "person": person_data,
+            "in_credits": in_credits,
+            "credits": credits_data,
+            "subsystems_count": len(subsystems),
+            "subsystems": subsystems,
+            "latest_patch": git_contribs.get("latest_patch"),
+            "contribution_stats": git_contribs.get("contribution_stats"),
+            "recent_commits": git_contribs.get("recent_commits", []),
         }
     except HTTPException:
         raise
@@ -2876,6 +3126,594 @@ def get_person_profile(version_name: str, person_id_or_email: str) -> dict[str, 
             cnx.close()
         logger.error("Error in get_person_profile: %s", e)
         raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@app.get("/api/version/{version_name}/commits")
+def get_version_commits(
+    version_name: str,
+    q: str = Query("", description="Search term for commit subject, message, or hash"),
+    author: str = Query("", description="Filter commits by author name or email"),
+    limit: int = Query(50, ge=1, le=500, description="Max items per page"),
+    offset: int = Query(0, ge=0, description="Pagination offset index"),
+) -> dict[str, Any]:
+    """Retrieve chronological commit timeline for the specified kernel version."""
+    cnx = db.get_connection()
+    try:
+        commits = []
+        total_count = 0
+
+        author_filter = author.strip() if isinstance(author, str) else ""
+        search_query = q.strip() if isinstance(q, str) else ""
+        limit_val = limit if isinstance(limit, int) else 50
+        offset_val = offset if isinstance(offset, int) else 0
+
+        if cnx and cnx.is_connected():
+            try:
+                cursor = cnx.cursor()
+                where_clauses = ["v.vname = %s"]
+                params: list[Any] = [version_name]
+
+                if author_filter:
+                    where_clauses.append("(LOWER(ap.name) LIKE %s OR LOWER(ap.email) LIKE %s)")
+                    params.extend([f"%{author_filter.lower()}%", f"%{author_filter.lower()}%"])
+                if search_query:
+                    where_clauses.append("(LOWER(c.subject) LIKE %s OR LOWER(c.commit_hash) LIKE %s)")
+                    params.extend([f"%{search_query.lower()}%", f"%{search_query.lower()}%"])
+
+                where_sql = " AND ".join(where_clauses)
+                count_query = f"""
+                    SELECT COUNT(DISTINCT c.commit_id)
+                    FROM m_commit c
+                    JOIN m_v_main v ON c.vid = v.vid
+                    JOIN m_maintainer_person ap ON c.author_id = ap.person_id
+                    WHERE {where_sql}
+                """
+                cursor.execute(count_query, params)
+                count_row = cursor.fetchone()
+                total_count = count_row[0] if count_row else 0
+
+                data_query = f"""
+                    SELECT c.commit_id, c.commit_hash, c.author_id, ap.name AS author_name, ap.email AS author_email,
+                           c.author_date, c.committer_id, cp.name AS committer_name, cp.email AS committer_email,
+                           c.committer_date, c.subject
+                    FROM m_commit c
+                    JOIN m_v_main v ON c.vid = v.vid
+                    JOIN m_maintainer_person ap ON c.author_id = ap.person_id
+                    JOIN m_maintainer_person cp ON c.committer_id = cp.person_id
+                    WHERE {where_sql}
+                    ORDER BY c.author_date DESC
+                    LIMIT %s OFFSET %s
+                """
+                cursor.execute(data_query, params + [limit_val, offset_val])
+                rows = cursor.fetchall()
+                for r in rows:
+                    cid = r[0]
+                    cursor.execute("SELECT COUNT(*) FROM m_bridge_commit_file WHERE commit_id = %s", (cid,))
+                    f_count = (cursor.fetchone() or [0])[0]
+                    cursor.execute("SELECT COUNT(*) FROM m_bridge_commit_tag WHERE commit_id = %s", (cid,))
+                    t_count = (cursor.fetchone() or [0])[0]
+
+                    cursor.execute("""
+                        SELECT bp.person_id, p.name, p.email, bp.role_type
+                        FROM m_bridge_commit_person bp
+                        JOIN m_maintainer_person p ON bp.person_id = p.person_id
+                        WHERE bp.commit_id = %s
+                        ORDER BY bp.priority ASC
+                    """, (cid,))
+                    contrib_rows = cursor.fetchall()
+                    contributors = [
+                        {
+                            "person_id": cr[0],
+                            "name": safe_decode(cr[1]),
+                            "email": safe_decode(cr[2]),
+                            "role": cr[3],
+                            "role_name": COMMIT_ROLE_NAMES.get(cr[3], "Contributor"),
+                        }
+                        for cr in contrib_rows
+                    ]
+
+                    author_ts = int(r[5]) if r[5] else 0
+                    author_iso = datetime.fromtimestamp(author_ts, timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC") if author_ts else ""
+
+                    commits.append({
+                        "commit_id": cid,
+                        "commit_hash": safe_decode(r[1]),
+                        "author": {
+                            "person_id": r[2],
+                            "name": safe_decode(r[3]),
+                            "email": safe_decode(r[4]),
+                        },
+                        "author_date": author_ts,
+                        "author_date_iso": author_iso,
+                        "committer": {
+                            "person_id": r[6],
+                            "name": safe_decode(r[7]),
+                            "email": safe_decode(r[8]),
+                        },
+                        "committer_date": int(r[9]) if r[9] else 0,
+                        "subject": safe_decode(r[10]),
+                        "files_count": f_count,
+                        "tags_count": t_count,
+                        "contributors": contributors,
+                    })
+                cursor.close()
+            except Exception as e:
+                logger.warning("MySQL query for git commits failed, falling back to Git parser: %s", e)
+
+        # Fallback to direct Git parser
+        if not commits:
+            git_parser = GitCommitParser()
+            raw_commits = git_parser.parse_version_commits(None, version_name, limit=1000)
+            filtered = []
+            for rc in raw_commits:
+                if author_filter:
+                    af = author_filter.lower()
+                    if af not in rc.author_name.lower() and af not in rc.author_email.lower():
+                        continue
+                if search_query:
+                    sq = search_query.lower()
+                    if sq not in rc.subject.lower() and sq not in rc.commit_hash.lower() and sq not in rc.message.lower():
+                        continue
+                filtered.append(rc)
+
+            total_count = len(filtered)
+            paged = filtered[offset_val : offset_val + limit_val]
+
+            for idx, gc in enumerate(paged):
+                c_id = idx + 1 + offset_val
+                author_ts = gc.author_date
+                author_iso = datetime.fromtimestamp(author_ts, timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC") if author_ts else ""
+                commits.append({
+                    "commit_id": c_id,
+                    "commit_hash": gc.commit_hash,
+                    "author": {
+                        "person_id": hash(gc.author_name) & 0x7FFFFFFF or 1,
+                        "name": gc.author_name,
+                        "email": gc.author_email,
+                    },
+                    "author_date": author_ts,
+                    "author_date_iso": author_iso,
+                    "committer": {
+                        "person_id": hash(gc.committer_name) & 0x7FFFFFFF or 1,
+                        "name": gc.committer_name,
+                        "email": gc.committer_email,
+                    },
+                    "committer_date": gc.committer_date,
+                    "subject": gc.subject,
+                    "files_count": len(gc.files),
+                    "tags_count": 0,
+                    "contributors": [
+                        {
+                            "person_id": hash(cb.name) & 0x7FFFFFFF or 1,
+                            "name": cb.name,
+                            "email": cb.email,
+                            "role": int(cb.role),
+                            "role_name": cb.role.name.capitalize().replace("_", "-"),
+                        }
+                        for cb in gc.contributors
+                    ],
+                })
+
+        if cnx and cnx.is_connected():
+            cnx.close()
+
+        return {
+            "version": version_name,
+            "total": total_count,
+            "total_count": total_count,
+            "limit": limit_val,
+            "offset": offset_val,
+            "commits": commits,
+        }
+    except Exception as e:
+        if cnx and cnx.is_connected():
+            cnx.close()
+        logger.error("Error in get_version_commits: %s", e)
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@app.get("/api/version/{version_name}/commit/{commit_hash_or_id:path}")
+def get_commit_detail(version_name: str, commit_hash_or_id: str) -> dict[str, Any]:
+    """Retrieve detailed commit metadata, full log message, contributors, touched files, and linked tags."""
+    cnx = db.get_connection()
+    try:
+        identifier = commit_hash_or_id.strip()
+        commit_data = None
+
+        if cnx and cnx.is_connected():
+            try:
+                cursor = cnx.cursor()
+                if identifier.isdigit():
+                    cursor.execute("""
+                        SELECT c.commit_id, c.commit_hash, c.author_id, ap.name, ap.email, c.author_date,
+                               c.committer_id, cp.name, cp.email, c.committer_date, c.subject, c.message, c.vid, v.vname
+                        FROM m_commit c
+                        JOIN m_maintainer_person ap ON c.author_id = ap.person_id
+                        JOIN m_maintainer_person cp ON c.committer_id = cp.person_id
+                        LEFT JOIN m_v_main v ON c.vid = v.vid
+                        WHERE c.commit_id = %s
+                    """, (int(identifier),))
+                else:
+                    cursor.execute("""
+                        SELECT c.commit_id, c.commit_hash, c.author_id, ap.name, ap.email, c.author_date,
+                               c.committer_id, cp.name, cp.email, c.committer_date, c.subject, c.message, c.vid, v.vname
+                        FROM m_commit c
+                        JOIN m_maintainer_person ap ON c.author_id = ap.person_id
+                        JOIN m_maintainer_person cp ON c.committer_id = cp.person_id
+                        LEFT JOIN m_v_main v ON c.vid = v.vid
+                        WHERE c.commit_hash LIKE %s
+                        LIMIT 1
+                    """, (f"{identifier}%",))
+                row = cursor.fetchone()
+                if row:
+                    cid = row[0]
+                    chash = safe_decode(row[1])
+                    a_ts = int(row[5]) if row[5] else 0
+                    a_iso = datetime.fromtimestamp(a_ts, timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC") if a_ts else ""
+                    c_ts = int(row[9]) if row[9] else 0
+                    c_iso = datetime.fromtimestamp(c_ts, timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC") if c_ts else ""
+
+                    # Get contributors
+                    cursor.execute("""
+                        SELECT bp.person_id, p.name, p.email, bp.role_type
+                        FROM m_bridge_commit_person bp
+                        JOIN m_maintainer_person p ON bp.person_id = p.person_id
+                        WHERE bp.commit_id = %s
+                        ORDER BY bp.priority ASC
+                    """, (cid,))
+                    contribs = [
+                        {
+                            "person_id": cr[0],
+                            "name": safe_decode(cr[1]),
+                            "email": safe_decode(cr[2]),
+                            "role": cr[3],
+                            "role_name": COMMIT_ROLE_NAMES.get(cr[3], "Contributor"),
+                        }
+                        for cr in cursor.fetchall()
+                    ]
+
+                    # Get modified files
+                    cursor.execute("""
+                        SELECT bcf.fid, fn.fname, bcf.change_type
+                        FROM m_bridge_commit_file bcf
+                        JOIN m_bridge_file bf ON bcf.fid = bf.fid
+                        JOIN m_file_name fn ON bf.fnid = fn.fnid
+                        WHERE bcf.commit_id = %s
+                    """, (cid,))
+                    files_list = [
+                        {
+                            "fid": fr[0],
+                            "path": safe_decode(fr[1]),
+                            "change_type": safe_decode(fr[2]),
+                        }
+                        for fr in cursor.fetchall()
+                    ]
+
+                    # Get linked tags
+                    cursor.execute("""
+                        SELECT bct.tag_id, bct.fid, bt.line_s, bt.line_e, t.code
+                        FROM m_bridge_commit_tag bct
+                        JOIN m_bridge_tag bt ON bct.tag_id = bt.tag_id AND bct.fid = bt.fid
+                        JOIN m_tag t ON bct.tag_id = t.tag_id
+                        WHERE bct.commit_id = %s
+                        LIMIT 100
+                    """, (cid,))
+                    tags_list = [
+                        {
+                            "tag_id": tr[0],
+                            "fid": tr[1],
+                            "line_s": tr[2],
+                            "line_e": tr[3],
+                            "code": safe_decode(tr[4]),
+                        }
+                        for tr in cursor.fetchall()
+                    ]
+
+                    commit_data = {
+                        "commit_id": cid,
+                        "commit_hash": chash,
+                        "version": safe_decode(row[13]) or version_name,
+                        "author": {
+                            "person_id": row[2],
+                            "name": safe_decode(row[3]),
+                            "email": safe_decode(row[4]),
+                        },
+                        "author_date": a_ts,
+                        "author_date_iso": a_iso,
+                        "committer": {
+                            "person_id": row[6],
+                            "name": safe_decode(row[7]),
+                            "email": safe_decode(row[8]),
+                        },
+                        "committer_date": c_ts,
+                        "committer_date_iso": c_iso,
+                        "subject": safe_decode(row[10]),
+                        "message": safe_decode(row[11]),
+                        "contributors": contribs,
+                        "files": files_list,
+                        "tags": tags_list,
+                    }
+                cursor.close()
+            except Exception as e:
+                logger.warning("Error fetching commit detail from MySQL: %s", e)
+
+        # Fallback to direct Git query
+        if not commit_data:
+            git_parser = GitCommitParser()
+            raw_commits = git_parser.parse_version_commits(None, version_name, limit=1000)
+            target_gc = None
+            for gc in raw_commits:
+                if gc.commit_hash.startswith(identifier) or identifier in gc.subject:
+                    target_gc = gc
+                    break
+
+            if target_gc:
+                a_ts = target_gc.author_date
+                a_iso = datetime.fromtimestamp(a_ts, timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC") if a_ts else ""
+                c_ts = target_gc.committer_date
+                c_iso = datetime.fromtimestamp(c_ts, timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC") if c_ts else ""
+                commit_data = {
+                    "commit_id": hash(target_gc.commit_hash) & 0x7FFFFFFF or 1,
+                    "commit_hash": target_gc.commit_hash,
+                    "version": version_name,
+                    "author": {
+                        "person_id": hash(target_gc.author_name) & 0x7FFFFFFF or 1,
+                        "name": target_gc.author_name,
+                        "email": target_gc.author_email,
+                    },
+                    "author_date": a_ts,
+                    "author_date_iso": a_iso,
+                    "committer": {
+                        "person_id": hash(target_gc.committer_name) & 0x7FFFFFFF or 1,
+                        "name": target_gc.committer_name,
+                        "email": target_gc.committer_email,
+                    },
+                    "committer_date": c_ts,
+                    "committer_date_iso": c_iso,
+                    "subject": target_gc.subject,
+                    "message": target_gc.message,
+                    "contributors": [
+                        {
+                            "person_id": hash(cb.name) & 0x7FFFFFFF or 1,
+                            "name": cb.name,
+                            "email": cb.email,
+                            "role": int(cb.role),
+                            "role_name": cb.role.name.capitalize().replace("_", "-"),
+                        }
+                        for cb in target_gc.contributors
+                    ],
+                    "files": [
+                        {
+                            "fid": 0,
+                            "path": f_path,
+                            "change_type": c_type,
+                        }
+                        for c_type, f_path in target_gc.files
+                    ],
+                    "tags": [],
+                }
+
+        if cnx and cnx.is_connected():
+            cnx.close()
+
+        if not commit_data:
+            raise HTTPException(status_code=404, detail=f"Commit '{commit_hash_or_id}' not found")
+
+        return commit_data
+    except HTTPException:
+        raise
+    except Exception as e:
+        if cnx and cnx.is_connected():
+            cnx.close()
+        logger.error("Error in get_commit_detail: %s", e)
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@app.get("/api/version/{version_name}/file/{fid}/blame")
+def get_file_blame(version_name: str, fid: int) -> dict[str, Any]:
+    """Retrieve code tag git blame annotations, multi-commit links, and author highlights for a file."""
+    cnx = db.get_connection()
+    try:
+        file_path = ""
+        tags_blame = []
+
+        if cnx and cnx.is_connected():
+            try:
+                cursor = cnx.cursor()
+                # 1. Look up file name
+                cursor.execute("""
+                    SELECT fn.fname
+                    FROM m_bridge_file bf
+                    JOIN m_file_name fn ON bf.fnid = fn.fnid
+                    WHERE bf.fid = %s
+                    LIMIT 1
+                """, (fid,))
+                fn_row = cursor.fetchone()
+                if fn_row:
+                    file_path = safe_decode(fn_row[0])
+
+                # 2. Look up all tags for this file
+                cursor.execute("""
+                    SELECT bt.tag_id, bt.line_s, bt.line_e, bt.char_s, bt.char_e, t.code, t.ast_id
+                    FROM m_bridge_tag bt
+                    JOIN m_tag t ON bt.tag_id = t.tag_id
+                    WHERE bt.fid = %s
+                    ORDER BY bt.line_s ASC, bt.char_s ASC
+                """, (fid,))
+                tag_rows = cursor.fetchall()
+
+                # 3. Look up multi-commit mappings for each tag
+                for tr in tag_rows:
+                    tid = tr[0]
+                    line_s = tr[1]
+                    line_e = tr[2]
+                    char_s = tr[3]
+                    char_e = tr[4]
+                    code_snippet = safe_decode(tr[5])
+
+                    cursor.execute("""
+                        SELECT c.commit_id, c.commit_hash, c.subject, c.author_date,
+                               c.author_id, ap.name AS author_name, ap.email AS author_email
+                        FROM m_bridge_commit_tag bct
+                        JOIN m_commit c ON bct.commit_id = c.commit_id
+                        JOIN m_maintainer_person ap ON c.author_id = ap.person_id
+                        WHERE bct.tag_id = %s AND bct.fid = %s
+                        ORDER BY c.author_date DESC
+                    """, (tid, fid))
+                    c_rows = cursor.fetchall()
+                    commits = []
+
+                    for cr in c_rows:
+                        cid = cr[0]
+                        chash = safe_decode(cr[1])
+                        c_subj = safe_decode(cr[2])
+                        c_ts = int(cr[3]) if cr[3] else 0
+                        c_iso = datetime.fromtimestamp(c_ts, timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC") if c_ts else ""
+
+                        # Contributors on this commit
+                        cursor.execute("""
+                            SELECT bp.person_id, p.name, bp.role_type
+                            FROM m_bridge_commit_person bp
+                            JOIN m_maintainer_person p ON bp.person_id = p.person_id
+                            WHERE bp.commit_id = %s
+                            ORDER BY bp.priority ASC
+                        """, (cid,))
+                        contribs = [
+                            {
+                                "person_id": cb[0],
+                                "name": safe_decode(cb[1]),
+                                "role": cb[2],
+                                "role_name": COMMIT_ROLE_NAMES.get(cb[2], "Contributor"),
+                            }
+                            for cb in cursor.fetchall()
+                        ]
+
+                        commits.append({
+                            "commit_id": cid,
+                            "commit_hash": chash,
+                            "subject": c_subj,
+                            "author_date": c_ts,
+                            "author_date_iso": c_iso,
+                            "author": {
+                                "person_id": cr[4],
+                                "name": safe_decode(cr[5]),
+                                "email": safe_decode(cr[6]),
+                            },
+                            "contributors": contribs,
+                        })
+
+                    tags_blame.append({
+                        "tag_id": tid,
+                        "line_s": line_s,
+                        "line_e": line_e,
+                        "char_s": char_s,
+                        "char_e": char_e,
+                        "code": code_snippet,
+                        "commits_count": len(commits),
+                        "commits": commits,
+                        "primary_author": commits[0]["author"] if commits else None,
+                        "primary_commit": commits[0] if commits else None,
+                    })
+
+                cursor.close()
+            except Exception as e:
+                logger.warning("Error fetching file blame from MySQL: %s", e)
+
+        # Fallback / dynamic git blame if tags or commit bridges not yet populated
+        if (not tags_blame or all(t["commits_count"] == 0 for t in tags_blame)) and file_path:
+            try:
+                git_parser = GitCommitParser()
+                hunks = git_parser.extract_file_hunks(None, version_name, file_path)
+                raw_commits = git_parser.parse_version_commits(None, version_name, limit=500)
+                commit_map = {gc.commit_hash: gc for gc in raw_commits}
+
+                for t_item in tags_blame:
+                    matched_c = []
+                    for h in hunks:
+                        h_s = h.new_start
+                        h_e = h.new_start + max(1, h.new_count) - 1
+                        if not (t_item["line_e"] < h_s or t_item["line_s"] > h_e):
+                            if h.commit_hash in commit_map:
+                                gc = commit_map[h.commit_hash]
+                                matched_c.append({
+                                    "commit_id": hash(gc.commit_hash) & 0x7FFFFFFF or 1,
+                                    "commit_hash": gc.commit_hash,
+                                    "subject": gc.subject,
+                                    "author_date": gc.author_date,
+                                    "author_date_iso": datetime.fromtimestamp(gc.author_date, timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC") if gc.author_date else "",
+                                    "author": {
+                                        "person_id": hash(gc.author_name) & 0x7FFFFFFF or 1,
+                                        "name": gc.author_name,
+                                        "email": gc.author_email,
+                                    },
+                                    "contributors": [
+                                        {
+                                            "person_id": hash(cb.name) & 0x7FFFFFFF or 1,
+                                            "name": cb.name,
+                                            "role": int(cb.role),
+                                            "role_name": cb.role.name.capitalize().replace("_", "-"),
+                                        }
+                                        for cb in gc.contributors
+                                    ],
+                                })
+                    if matched_c:
+                        t_item["commits"] = matched_c
+                        t_item["commits_count"] = len(matched_c)
+                        t_item["primary_author"] = matched_c[0]["author"]
+                        t_item["primary_commit"] = matched_c[0]
+            except Exception as e:
+                logger.error("Git fallback blame correlation failed: %s", e)
+
+        if cnx and cnx.is_connected():
+            cnx.close()
+
+        return {
+            "fid": fid,
+            "version": version_name,
+            "path": file_path,
+            "total_tags": len(tags_blame),
+            "tags": tags_blame,
+        }
+    except Exception as e:
+        if cnx and cnx.is_connected():
+            cnx.close()
+        logger.error("Error in get_file_blame: %s", e)
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@app.get("/api/version/{version_name}/timeline")
+def get_commit_timeline(
+    version_name: str,
+    limit: int = Query(100, ge=1, le=1000),
+) -> dict[str, Any]:
+    """Retrieve structured commit timeline and contributor activity metrics."""
+    limit_val = limit if isinstance(limit, int) else 100
+    commit_res = get_version_commits(version_name=version_name, limit=limit_val, offset=0)
+    commits = commit_res.get("commits", [])
+
+    # Calculate contributor frequency
+    author_counts: dict[str, dict[str, Any]] = {}
+    for c in commits:
+        a = c.get("author", {})
+        a_key = a.get("name") or a.get("email") or "Unknown"
+        if a_key not in author_counts:
+            author_counts[a_key] = {
+                "name": a.get("name") or a_key,
+                "email": a.get("email", ""),
+                "person_id": a.get("person_id", 1),
+                "commits_count": 0,
+            }
+        author_counts[a_key]["commits_count"] += 1
+
+    top_authors = sorted(author_counts.values(), key=lambda x: x["commits_count"], reverse=True)[:10]
+
+    return {
+        "version": version_name,
+        "total_commits": commit_res.get("total_count", commit_res.get("total", len(commits))),
+        "displayed_commits": len(commits),
+        "top_contributors": top_authors,
+        "timeline": commits,
+    }
 
 
 @app.get("/api/version/{version_name}/credits")

@@ -2549,6 +2549,27 @@ class C_Type(Ast):
                 logger.debug(f"C_Type>>static assert keyword {tspelling}")
                 return
 
+            # Built-in operators and compiler intrinsics
+            case (
+                "__builtin_types_compatible_p"
+                | "__builtin_choose_expr"
+                | "__builtin_offsetof"
+                | "__builtin_constant_p"
+                | "__builtin_expect"
+                | "__builtin_unreachable"
+                | "__builtin_alloca"
+                | "__builtin_prefetch"
+                | "__builtin_assume_aligned"
+                | "__builtin_convertvector"
+                | "__builtin_bit_cast"
+                | "__builtin_va_start"
+                | "__builtin_va_end"
+                | "__builtin_va_arg"
+                | "__builtin_va_copy"
+            ):
+                logger.debug(f"C_Type>>builtin operator {tspelling}")
+                return
+
             # Type specifiers
             case "struct":
                 self.content.append(TypeToken(token, ASTT.C_struct))

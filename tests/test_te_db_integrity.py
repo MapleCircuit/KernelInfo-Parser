@@ -235,6 +235,32 @@ class TestDBEngineIntegrity(unittest.TestCase):
         else:
             self.db.remove_index(index_name, fake_tbl_simple)
 
+    def test_parallel_index_lifecycle(self) -> None:
+        """Verify concurrent create_indexes and remove_indexes operations."""
+        idx_specs = (
+            ("idx_par_simple_1", fake_tbl_simple, ((fake_tbl_simple.table_id, 1),)),
+            ("idx_par_simple_2", fake_tbl_simple, ((fake_tbl_simple.table_id, 2),)),
+            ("idx_par_parent", fake_tbl_parent, ((fake_tbl_parent.table_id, 1),)),
+        )
+        remove_specs = (
+            ("idx_par_simple_1", fake_tbl_simple),
+            ("idx_par_simple_2", fake_tbl_simple),
+            ("idx_par_parent", fake_tbl_parent),
+        )
+
+        self.db.create_indexes(idx_specs)
+
+        if not isinstance(self.db, MockDB):
+            for name, tbl, _ in idx_specs:
+                self.assertTrue(self.db.index_exists(name, tbl))
+
+            self.db.remove_indexes(remove_specs)
+
+            for name, tbl in remove_specs:
+                self.assertFalse(self.db.index_exists(name, tbl))
+        else:
+            self.db.remove_indexes(remove_specs)
+
     def test_get_next_id_empty_and_populated(self) -> None:
         """Verify get_next_id returns 1 on empty table and MAX(pk) + 1 on populated table."""
         next_id = self.db.get_next_id(fake_tbl_simple)

@@ -300,6 +300,55 @@ class TestCASTParser(unittest.TestCase):
             if temp_dir and os.path.exists(temp_dir):
                 shutil.rmtree(temp_dir, ignore_errors=True)
 
+    def test_builtin_types_compatible_p_handling(self) -> None:
+        """Verify __builtin_types_compatible_p and compiler intrinsics parse cleanly."""
+        temp_dir = None
+        try:
+            G.DEBUG_TYPECHECK = True
+            G.DB = MockDB
+            G.TE = get_table_engine("cached")()
+            gp = GreatProcessor()
+            init_db_layout(gp)
+            G.TE.start(gp.Table_Array, G.DB)
+
+            mf = MasterFile()
+            temp_dir = mf.create_temp_dir()
+            mf.version_dict["v3.0"] = temp_dir
+            G.MF = mf
+            gp.Version_Name = "v3.0"
+            gp.VID = 1
+
+            file_path = "include/linux/test_compat.h"
+            full_path = os.path.join(temp_dir, file_path)
+            os.makedirs(os.path.dirname(full_path), exist_ok=True)
+            snippet = """
+#define type_is_int(var) __builtin_types_compatible_p(typeof(var), int)
+#define check_compat(a, b) __builtin_choose_expr(__builtin_types_compatible_p(typeof(a), typeof(b)), 1, 0)
+
+static inline int test_compat_fn(int x, long y) {
+    int is_int = __builtin_types_compatible_p(typeof(x), int);
+    int is_const = __builtin_constant_p(x);
+    return is_int + is_const;
+}
+"""
+            with open(full_path, "w") as f:
+                f.write(snippet)
+
+            cs = ChangeSet(f"A\t{file_path}")
+            cs.current_vid = 1
+            cs.gp = gp
+            cs.mf = mf
+            G.CURRENT_PARSING_FILE = file_path
+
+            default_processing(cs, gp)
+            cs.parse()
+            self.assertGreater(len(cs.cs), 0)
+            self.assertTrue(cs.execute())
+            self.assertEqual(len(cs.cs), len(cs.cs_result))
+        finally:
+            if temp_dir and os.path.exists(temp_dir):
+                shutil.rmtree(temp_dir, ignore_errors=True)
+
 
 def run_c_ast_tests(
     target_file: str | None = None,

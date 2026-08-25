@@ -217,6 +217,22 @@ class MockDB(BaseDBEngine):
         """No-op for in-memory mock engine."""
         pass
 
+    def create_indexes(
+        self,
+        indexes: Sequence[tuple[str, Table, tuple[PointerType, ...]]],
+        max_workers: int | None = None,
+    ) -> None:
+        """No-op for in-memory mock engine."""
+        pass
+
+    def remove_indexes(
+        self,
+        indexes: Sequence[tuple[str, Table]],
+        max_workers: int | None = None,
+    ) -> None:
+        """No-op for in-memory mock engine."""
+        pass
+
     def test_tables(self, tables: Sequence[Table] | Table) -> list[str] | None:
         """Check registered table existence."""
         if not isinstance(tables, (tuple, list)):
