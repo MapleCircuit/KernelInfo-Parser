@@ -68,11 +68,13 @@ logger = logging.getLogger(__name__)
 
 def maintainer_ast_parse(CS: Any) -> None:
     """Entry point for parsing MAINTAINERS file into ChangeSet database operations."""
+    if CS.file_operation == "R100":
+        return
     _init_tables()
     with CS(REF_C_AST):
         if CS.file_operation == "A":
             MaintainerManager(CS)
-        elif CS.file_operation == "M" or (CS.file_operation and CS.file_operation[0] == "R"):
+        elif CS.file_operation == "M" or (CS.file_operation and CS.file_operation.startswith("R")):
             get_prior_tags(CS)
             MaintainerManager(CS)
             close_prior_tags(CS)
@@ -85,11 +87,13 @@ def maintainer_ast_parse(CS: Any) -> None:
 
 def credits_ast_parse(CS: Any) -> None:
     """Entry point for parsing CREDITS file into ChangeSet database operations."""
+    if CS.file_operation == "R100":
+        return
     _init_tables()
     with CS(REF_C_AST):
         if CS.file_operation == "A":
             CreditsManager(CS)
-        elif CS.file_operation == "M" or (CS.file_operation and CS.file_operation[0] == "R"):
+        elif CS.file_operation == "M" or (CS.file_operation and CS.file_operation.startswith("R")):
             get_prior_tags(CS)
             CreditsManager(CS)
             close_prior_tags(CS)

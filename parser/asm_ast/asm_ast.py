@@ -75,10 +75,13 @@ _WORKER_ASM_CLANG_INDEX: cc.Index | None = None
 
 def asm_ast_parse(CS: ChangeSetType) -> None:
     """Entry point for parsing assembly (.S, .s) files into ChangeSet operations."""
+    if CS.file_operation == "R100":
+        return
+
     with CS(REF_C_AST):
         if CS.file_operation == "A":
             Asm_Manager(CS)
-        elif CS.file_operation == "M" or CS.file_operation[0] == "R":
+        elif CS.file_operation == "M" or (CS.file_operation and CS.file_operation.startswith("R")):
             get_prior_tags(CS)
             Asm_Manager(CS)
             close_prior_tags(CS)

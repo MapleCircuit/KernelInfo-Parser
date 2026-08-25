@@ -104,6 +104,72 @@ class TestGitCommitParser(unittest.TestCase):
         self.assertIn(CommitRole.AUTHOR, roles)
         self.assertIn(CommitRole.SIGNED_OFF_BY, roles)
 
+    def test_parse_merge_commit_pull_request(self) -> None:
+        merge_log = """COMMIT_DELIM_START_1f922d07704c501388a306c78536bca7432b3934
+HASH:1f922d07704c501388a306c78536bca7432b3934
+PARENTS:2bafc7a23cba737ea7b4e72ba69680327f27ff6e 33d8881af5584fb7994f6b3d17fc11dcaf07b3b2
+ANAME:Linus Torvalds
+AEMAIL:torvalds@linux-foundation.org
+ADATE:1311281000
+CNAME:Linus Torvalds
+CEMAIL:torvalds@linux-foundation.org
+CDATE:1311281000
+SUBJ:Merge branch 'for-linus' of git://git.kernel.org/pub/scm/linux/kernel/git/tj/wq
+BODY_START
+Merge branch 'for-linus' of git://git.kernel.org/pub/scm/linux/kernel/git/tj/wq
+
+Pull workqueue fixes from Tejun Heo <tj@kernel.org>:
+ "A couple of workqueue fixes for v3.0 release candidate."
+
+* 'for-linus' of git://git.kernel.org/pub/scm/linux/kernel/git/tj/wq:
+  workqueue: fix hang on rescuer thread
+  workqueue: lockdep assertion fix
+
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+BODY_END
+M	kernel/workqueue.c
+COMMIT_DELIM_END
+"""
+        commits = GitCommitParser.parse_commit_log(merge_log)
+        self.assertEqual(len(commits), 1)
+        mc = commits[0]
+
+        self.assertTrue(mc.is_merge)
+        self.assertEqual(len(mc.parents), 2)
+        self.assertIn("2bafc7a23cba737ea7b4e72ba69680327f27ff6e", mc.parents)
+        self.assertIn("33d8881af5584fb7994f6b3d17fc11dcaf07b3b2", mc.parents)
+        self.assertEqual(mc.merge_requester_name, "Tejun Heo")
+        self.assertEqual(mc.merge_requester_email, "tj@kernel.org")
+        self.assertIn("'for-linus' of git://git.kernel.org/pub/scm/linux/kernel/git/tj/wq", mc.merged_branch)
+        self.assertEqual(len(mc.merged_commits_summary), 2)
+        self.assertEqual(mc.merged_commits_summary[0], "workqueue: fix hang on rescuer thread")
+        self.assertEqual(mc.merged_commits_summary[1], "workqueue: lockdep assertion fix")
+
+        # Contributor roles
+        merger_contribs = [cb for cb in mc.contributors if cb.email == "torvalds@linux-foundation.org" and cb.role == CommitRole.MERGED_BY]
+        self.assertEqual(len(merger_contribs), 1)
+
+        req_contribs = [cb for cb in mc.contributors if cb.name == "Tejun Heo" and cb.role == CommitRole.REQUESTED_BY]
+        self.assertEqual(len(req_contribs), 1)
+
+    def test_parse_merge_commit_binary_delimited(self) -> None:
+        raw_output = (
+            "\x1eaabbcc112233\x1fparent1 parent2\x1fLinus Torvalds\x1ftorvalds@linux-foundation.org\x1f1311282000"
+            "\x1fLinus Torvalds\x1ftorvalds@linux-foundation.org\x1f1311282000"
+            "\x1fMerge git://git.kernel.org/pub/scm/linux/kernel/git/sfrench/cifs-2.6"
+            "\x1fMerge git://git.kernel.org/pub/scm/linux/kernel/git/sfrench/cifs-2.6\n\n* git://git.kernel.org/pub/scm/linux/kernel/git/sfrench/cifs-2.6:\n  CIFS: Fix signing failure\x1d"
+            "M\tfs/cifs/cifsfs.c\n"
+        )
+        commits = GitCommitParser.parse_commit_log(raw_output)
+        self.assertEqual(len(commits), 1)
+        mc = commits[0]
+        self.assertTrue(mc.is_merge)
+        self.assertEqual(mc.parents, ["parent1", "parent2"])
+        self.assertEqual(mc.merge_requester_name, "sfrench")
+        self.assertEqual(mc.merge_requester_email, "sfrench@kernel.org")
+        self.assertEqual(mc.merged_branch, "git://git.kernel.org/pub/scm/linux/kernel/git/sfrench/cifs-2.6")
+        self.assertIn("CIFS: Fix signing failure", mc.merged_commits_summary)
+
     def test_diff_hunk_extraction(self) -> None:
         patch_text = """diff --git a/fs/ext4/super.c b/fs/ext4/super.c
 index 1111111..2222222 100644

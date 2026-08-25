@@ -5657,12 +5657,17 @@
       const comm = data.committer || {};
       const contribs = data.contributors || [];
       const files = data.files || [];
+      const isMerge = Boolean(data.is_merge);
+      const reqName = data.merge_requester_name || "";
+      const reqEmail = data.merge_requester_email || "";
+      const mergedBranch = data.merged_branch || "";
+      const mergedSummaries = data.merged_commits_summary || [];
 
-      titleEl.innerText = `📜 Commit #${chash.substring(0, 10)}`;
+      titleEl.innerText = `${isMerge ? '🔀 Merge Commit' : '📜 Commit'} #${chash.substring(0, 10)}`;
 
       const contribsHtml = contribs.map(c => `
         <span class="member-pill" onclick="openPersonModal('${escapeJs(c.email || c.name)}')" title="Role: ${escapeHtml(c.role_name || '')}">
-          <span class="badge ${c.role === 1 ? 'badge-accent' : (c.role === 3 ? 'badge-success' : '')}">${escapeHtml(c.role_name || 'Contributor')}</span>
+          <span class="badge ${c.role === 1 ? 'badge-accent' : (c.role === 3 ? 'badge-success' : (c.role === 10 ? 'badge-warning' : (c.role === 11 ? 'badge-accent' : '')))}">${escapeHtml(c.role_name || 'Contributor')}</span>
           <strong>${escapeHtml(c.name || 'Unnamed')}</strong> ${c.email ? `<span style="color: var(--text-muted);">&lt;${escapeHtml(c.email)}&gt;</span>` : ''}
         </span>
       `).join("");
@@ -5681,9 +5686,10 @@
         <div style="display: flex; flex-direction: column; gap: 16px;">
           <!-- Commit Header Box -->
           <div style="background: var(--bg-sidebar); padding: 16px; border-radius: 8px; border: 1px solid var(--border-color); display: flex; flex-direction: column; gap: 10px;">
-            <div style="display: flex; justify-content: space-between; align-items: center;">
-              <div style="display: flex; align-items: center; gap: 8px;">
+            <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px;">
+              <div style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap;">
                 <span class="commit-hash-chip" style="font-size: 13px; padding: 4px 10px;">🔑 ${escapeHtml(chash)}</span>
+                ${isMerge ? '<span class="badge" style="background: rgba(229, 192, 123, 0.2); color: #e5c07b; border: 1px solid #e5c07b;">🔀 Merge Commit</span>' : ''}
                 <span class="badge badge-accent">Version: ${escapeHtml(data.version || currentVersion)}</span>
               </div>
               <button class="btn" style="padding: 4px 10px; font-size: 11px;" onclick="navigator.clipboard.writeText('${escapeJs(chash)}')">📋 Copy SHA</button>
@@ -5691,15 +5697,44 @@
             <h3 style="color: var(--text-bright); font-size: 16px; line-height: 1.4; margin: 4px 0;">${escapeHtml(data.subject)}</h3>
             <div style="display: flex; justify-content: space-between; align-items: center; font-size: 12px; color: var(--text-muted); flex-wrap: wrap; gap: 8px;">
               <div>
-                <strong>Author:</strong> <a class="person-link" onclick="openPersonModal('${escapeJs(auth.email || auth.name)}')">${escapeHtml(auth.name || 'Unknown')}</a> ${auth.email ? `&lt;${escapeHtml(auth.email)}&gt;` : ''}
+                <strong>${isMerge ? 'Merged By:' : 'Author:'}</strong> <a class="person-link" onclick="openPersonModal('${escapeJs(auth.email || auth.name)}')">${escapeHtml(auth.name || 'Unknown')}</a> ${auth.email ? `&lt;${escapeHtml(auth.email)}&gt;` : ''}
               </div>
               <div>📅 ${escapeHtml(data.author_date_iso || '')}</div>
             </div>
           </div>
 
+          <!-- Pull Requester / Maintainer Card for Merges -->
+          ${isMerge && (reqName || mergedBranch) ? `
+            <div style="background: rgba(97, 175, 239, 0.08); border: 1px solid rgba(97, 175, 239, 0.25); border-radius: 8px; padding: 12px 16px; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px;">
+              <div>
+                <div style="font-size: 11px; color: var(--accent); text-transform: uppercase; font-weight: 600; letter-spacing: 0.5px;">📥 Pull Request Submitter / Maintainer</div>
+                <div style="font-size: 14px; color: var(--text-bright); margin-top: 4px;">
+                  <a class="person-link" style="font-weight: 600;" onclick="openPersonModal('${escapeJs(reqEmail || reqName)}')">${escapeHtml(reqName || 'Subsystem Maintainer')}</a>
+                  ${reqEmail ? `<span style="color: var(--text-muted); font-size: 12px; margin-left: 6px;">&lt;${escapeHtml(reqEmail)}&gt;</span>` : ''}
+                </div>
+              </div>
+              ${mergedBranch ? `
+                <div style="text-align: right;">
+                  <div style="font-size: 11px; color: var(--text-muted); text-transform: uppercase;">Merged Branch / Origin</div>
+                  <div style="font-size: 12px; color: #98c379; font-family: monospace; max-width: 320px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;" title="${escapeHtml(mergedBranch)}">🌿 ${escapeHtml(mergedBranch)}</div>
+                </div>
+              ` : ''}
+            </div>
+          ` : ''}
+
+          <!-- Merged Patches Shortlog -->
+          ${isMerge && mergedSummaries.length > 0 ? `
+            <div>
+              <h4 style="font-size: 12px; color: #e5c07b; margin-bottom: 8px; text-transform: uppercase;">📑 Merged Patches &amp; Shortlog (${mergedSummaries.length})</h4>
+              <div style="background: var(--bg-sidebar); border: 1px solid var(--border-color); border-radius: 6px; padding: 10px 14px; max-height: 160px; overflow-y: auto; font-family: monospace; font-size: 11px; line-height: 1.6; color: var(--text-bright);">
+                ${mergedSummaries.map(s => `<div>• ${escapeHtml(s)}</div>`).join("")}
+              </div>
+            </div>
+          ` : ''}
+
           <!-- Commit Message Body -->
           <div>
-            <h4 style="font-size: 12px; color: var(--text-muted); margin-bottom: 6px; text-transform: uppercase;">Commit Message &amp; Trailers</h4>
+            <h4 style="font-size: 12px; color: var(--text-muted); margin-bottom: 6px; text-transform: uppercase;">Full Commit Log &amp; Trailers</h4>
             <pre style="background: #1e2227; border: 1px solid var(--border-color); border-radius: 6px; padding: 14px; font-size: 12px; font-family: monospace; color: var(--text-bright); white-space: pre-wrap; line-height: 1.5; max-height: 200px; overflow-y: auto;">${escapeHtml(data.message || data.subject)}</pre>
           </div>
 

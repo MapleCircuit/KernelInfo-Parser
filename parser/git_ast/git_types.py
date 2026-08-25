@@ -14,7 +14,9 @@ class CommitRole(IntEnum):
     TESTED_BY = 7
     REPORTED_BY = 8
     SUGGESTED_BY = 9
-    OTHER = 10
+    MERGED_BY = 10
+    REQUESTED_BY = 11
+    OTHER = 12
 
     @classmethod
     def from_trailer_prefix(cls, prefix: str) -> "CommitRole":
@@ -34,12 +36,16 @@ class CommitRole(IntEnum):
             return cls.REPORTED_BY
         if "suggested-by" in p:
             return cls.SUGGESTED_BY
+        if "merged-by" in p or "merger" in p:
+            return cls.MERGED_BY
+        if "requested-by" in p or "pull-from" in p:
+            return cls.REQUESTED_BY
         return cls.OTHER
 
 
 @dataclass(slots=True)
 class GitContributor:
-    """Represents an individual contributor (author, committer, reviewer, signer) on a commit."""
+    """Represents an individual contributor (author, committer, reviewer, signer, requester, merger) on a commit."""
     name: str
     email: str
     role: CommitRole
@@ -49,7 +55,7 @@ class GitContributor:
 
 @dataclass(slots=True)
 class GitCommit:
-    """Represents a parsed git commit with full metadata and contributors."""
+    """Represents a parsed git commit with full metadata, merge lineage, and contributors."""
     commit_hash: str
     author_name: str
     author_email: str
@@ -64,6 +70,12 @@ class GitCommit:
     commit_id: int | None = None
     author_person_id: int | None = None
     committer_person_id: int | None = None
+    is_merge: bool = False
+    parents: list[str] = field(default_factory=list)
+    merge_requester_name: str | None = None
+    merge_requester_email: str | None = None
+    merged_branch: str | None = None
+    merged_commits_summary: list[str] = field(default_factory=list)
 
 
 @dataclass(slots=True)

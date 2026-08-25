@@ -2874,7 +2874,8 @@ def get_maintainer_section_detail(version_name: str, sec_id_or_name: str) -> dic
                     """
                     SELECT fn.fname, mf.fid, 1
                     FROM m_maintainer_file mf
-                    JOIN m_file_name fn ON mf.fid = fn.fnid
+                    JOIN m_bridge_file bf ON (mf.fid = bf.fid AND mf.vid = bf.vid)
+                    JOIN m_file_name fn ON bf.fnid = fn.fnid
                     JOIN m_v_main vm ON mf.vid = vm.vid
                     WHERE vm.vname = %s AND mf.sec_id = %s
                     ORDER BY fn.fname ASC;
@@ -2981,7 +2982,9 @@ COMMIT_ROLE_NAMES = {
     7: "Tested-by",
     8: "Reported-by",
     9: "Suggested-by",
-    10: "Contributor",
+    10: "Merged-by",
+    11: "Requested-by",
+    12: "Contributor",
 }
 
 
@@ -2998,6 +3001,8 @@ def get_person_git_contributions(
     codev_count = 0
     signed_off_count = 0
     reviewed_count = 0
+    merged_count = 0
+    requested_count = 0
     other_count = 0
 
     clean_email = (target_email or "").strip().strip("<>").lower()
@@ -3049,6 +3054,10 @@ def get_person_git_contributions(
                     signed_off_count += 1
                 elif role_val == 5:
                     reviewed_count += 1
+                elif role_val == 10:
+                    merged_count += 1
+                elif role_val == 11:
+                    requested_count += 1
                 else:
                     other_count += 1
 
@@ -3101,6 +3110,10 @@ def get_person_git_contributions(
                         signed_off_count += 1
                     elif role_val == 5:
                         reviewed_count += 1
+                    elif role_val == 10:
+                        merged_count += 1
+                    elif role_val == 11:
+                        requested_count += 1
                     else:
                         other_count += 1
 
@@ -3126,8 +3139,8 @@ def get_person_git_contributions(
     if commits_list:
         # Sort by timestamp descending
         commits_list.sort(key=lambda x: x["author_date"], reverse=True)
-        # Find latest where role is Author (1), Co-developed (3), or Committer (2)
-        primary_patches = [c for c in commits_list if c["role_type"] in (1, 2, 3)]
+        # Find latest where role is Author (1), Co-developed (3), Committer (2), or Requested-by (11)
+        primary_patches = [c for c in commits_list if c["role_type"] in (1, 2, 3, 11)]
         top_patch = primary_patches[0] if primary_patches else commits_list[0]
         latest_patch = {
             "commit_id": top_patch["commit_id"],
@@ -3147,6 +3160,8 @@ def get_person_git_contributions(
             "co_developed_commits": codev_count,
             "signed_off_commits": signed_off_count,
             "reviewed_commits": reviewed_count,
+            "merged_commits": merged_count,
+            "requested_commits": requested_count,
             "other_contributions": other_count,
             "total_contributions": len(commits_list),
         },
@@ -3356,7 +3371,7 @@ def get_version_commits(
                 data_query = f"""
                     SELECT c.commit_id, c.commit_hash, c.author_id, ap.name AS author_name, ap.email AS author_email,
                            c.author_date, c.committer_id, cp.name AS committer_name, cp.email AS committer_email,
-                           c.committer_date, c.subject
+                           c.committer_date, c.subject, c.message
                     FROM m_commit c
                     JOIN m_v_main v ON c.vid = v.vid
                     JOIN m_maintainer_person ap ON c.author_id = ap.person_id
@@ -3395,6 +3410,10 @@ def get_version_commits(
 
                     author_ts = int(r[5]) if r[5] else 0
                     author_iso = datetime.fromtimestamp(author_ts, timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC") if author_ts else ""
+                    c_subj = safe_decode(r[10])
+                    c_msg = safe_decode(r[11]) if len(r) > 11 else c_subj
+
+                    is_m, req_n, req_e, m_br, m_sums = GitCommitParser.extract_merge_metadata(c_subj, c_msg, [])
 
                     commits.append({
                         "commit_id": cid,
@@ -3412,10 +3431,15 @@ def get_version_commits(
                             "email": safe_decode(r[8]),
                         },
                         "committer_date": int(r[9]) if r[9] else 0,
-                        "subject": safe_decode(r[10]),
+                        "subject": c_subj,
                         "files_count": f_count,
                         "tags_count": t_count,
                         "contributors": contributors,
+                        "is_merge": is_m,
+                        "merge_requester_name": req_n,
+                        "merge_requester_email": req_e,
+                        "merged_branch": m_br,
+                        "merged_commits_summary": m_sums,
                     })
                 cursor.close()
             except Exception as e:
@@ -3473,6 +3497,12 @@ def get_version_commits(
                         }
                         for cb in gc.contributors
                     ],
+                    "is_merge": gc.is_merge,
+                    "parents": gc.parents,
+                    "merge_requester_name": gc.merge_requester_name,
+                    "merge_requester_email": gc.merge_requester_email,
+                    "merged_branch": gc.merged_branch,
+                    "merged_commits_summary": gc.merged_commits_summary,
                 })
 
         if cnx and cnx.is_connected():
@@ -3533,6 +3563,10 @@ def get_commit_detail(version_name: str, commit_hash_or_id: str) -> dict[str, An
                     a_iso = datetime.fromtimestamp(a_ts, timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC") if a_ts else ""
                     c_ts = int(row[9]) if row[9] else 0
                     c_iso = datetime.fromtimestamp(c_ts, timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC") if c_ts else ""
+                    c_subj = safe_decode(row[10])
+                    c_msg = safe_decode(row[11])
+
+                    is_m, req_n, req_e, m_br, m_sums = GitCommitParser.extract_merge_metadata(c_subj, c_msg, [])
 
                     # Get contributors
                     cursor.execute("""
@@ -3608,11 +3642,17 @@ def get_commit_detail(version_name: str, commit_hash_or_id: str) -> dict[str, An
                         },
                         "committer_date": c_ts,
                         "committer_date_iso": c_iso,
-                        "subject": safe_decode(row[10]),
-                        "message": safe_decode(row[11]),
+                        "subject": c_subj,
+                        "message": c_msg,
                         "contributors": contribs,
                         "files": files_list,
                         "tags": tags_list,
+                        "is_merge": is_m,
+                        "parents": [],
+                        "merge_requester_name": req_n,
+                        "merge_requester_email": req_e,
+                        "merged_branch": m_br,
+                        "merged_commits_summary": m_sums,
                     }
                 cursor.close()
             except Exception as e:
@@ -3672,6 +3712,12 @@ def get_commit_detail(version_name: str, commit_hash_or_id: str) -> dict[str, An
                         for c_type, f_path in target_gc.files
                     ],
                     "tags": [],
+                    "is_merge": target_gc.is_merge,
+                    "parents": target_gc.parents,
+                    "merge_requester_name": target_gc.merge_requester_name,
+                    "merge_requester_email": target_gc.merge_requester_email,
+                    "merged_branch": target_gc.merged_branch,
+                    "merged_commits_summary": target_gc.merged_commits_summary,
                 }
 
         if cnx and cnx.is_connected():

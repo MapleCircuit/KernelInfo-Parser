@@ -37,9 +37,11 @@ logger = logging.getLogger(__name__)
 
 def rust_ast_parse(CS: ChangeSetType) -> None:
     """Entry point for parsing Rust source files into ChangeSet operations."""
-    if CS.file_operation == "A":
+    if CS.file_operation == "R100":
+        return
+    elif CS.file_operation == "A":
         Rust_Manager(CS)
-    elif CS.file_operation == "M" or CS.file_operation[0] == "R":
+    elif CS.file_operation == "M" or (CS.file_operation and CS.file_operation.startswith("R")):
         get_prior_tags(CS)
         Rust_Manager(CS)
         close_prior_tags(CS)
@@ -58,7 +60,8 @@ def get_prior_tags(CS: ChangeSetType) -> None:
     if old_vid <= 0:
         return
 
-    fn_row = G.TE.get(m_file_name.table_id, (None, CS.current_path))
+    lookup_path = CS.old_path if (CS.file_operation and CS.file_operation.startswith("R") and CS.old_path) else CS.current_path
+    fn_row = G.TE.get(m_file_name.table_id, (None, lookup_path))
     if not fn_row:
         return
     fnid = fn_row[0]

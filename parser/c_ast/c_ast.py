@@ -226,11 +226,15 @@ def c_ast_parse(CS: ChangeSetType) -> None:
     - `"M"` / `"R"` (Modified / Renamed file): Queries prior version active tags (`get_prior_tags`),
       parses new AST (`process_c_ast`), and marks obsolete tags closed (`close_prior_tags`).
     - `"D"` (Deleted file): Queries prior version active tags and marks them as closed.
+    - `"R100"` (Exact rename): No-op (re-uses existing file instance and AST tags).
     """
+    if CS.file_operation == "R100":
+        return
+
     with CS(REF_C_AST):
         if CS.file_operation == "A":
             process_c_ast(CS)
-        elif CS.file_operation == "M" or CS.file_operation[0] == "R":
+        elif CS.file_operation == "M" or (CS.file_operation and CS.file_operation.startswith("R")):
             get_prior_tags(CS)
             process_c_ast(CS)
             close_prior_tags(CS)
@@ -259,7 +263,8 @@ def get_prior_tags(CS: ChangeSetType) -> None:
     if old_vid <= 0:
         return
 
-    fn_row = G.TE.get(m_file_name.table_id, (None, CS.current_path))
+    lookup_path = CS.old_path if (CS.file_operation and CS.file_operation.startswith("R") and CS.old_path) else CS.current_path
+    fn_row = G.TE.get(m_file_name.table_id, (None, lookup_path))
     if not fn_row:
         return
     fnid = fn_row[0]

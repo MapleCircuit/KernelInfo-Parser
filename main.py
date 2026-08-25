@@ -563,21 +563,17 @@ def create_new_vid(name: str) -> bool:
     with G.DB() as db:
         existing = db.select(m_v_main, (None, name))
         if existing:
-            gp.Old_VID = existing[0]
+            gp.Old_VID = gp.VID
             gp.VID = existing[0]
-            gp.Old_Version_Name = name
+            gp.Old_Version_Name = gp.Version_Name
             gp.Version_Name = name
             return True
 
         next_vid = db.get_next_id(m_v_main)
-        gp.Old_VID = next_vid - 1
+        gp.Old_VID = gp.VID
         gp.VID = next_vid
         gp.Old_Version_Name = gp.Version_Name
         gp.Version_Name = name
-        if gp.Old_VID > 0 and gp.Old_Version_Name == "4b825dc642cb6eb9a060e54bf8d69288fbee4904":
-            old_row = db.select(m_v_main, (gp.Old_VID, None))
-            if old_row:
-                gp.Old_Version_Name = old_row[1]
 
         db.insert(m_v_main, (gp.VID, name))
         return False
@@ -648,12 +644,6 @@ def default_processing(CS: ChangeSet) -> None:
                 CS.store(m_bridge_file.set(
                     gp.VID,
                     CS.ref(m_file_name.fnid),
-                    CS.ref(m_bridge_file.fid, REF_OLD),
-                ))
-
-                # Create MOVED FILE (old_fid, old_fid)
-                CS.store(m_moved_file.set(
-                    CS.ref(m_bridge_file.fid, REF_OLD),
                     CS.ref(m_bridge_file.fid, REF_OLD),
                 ))
 

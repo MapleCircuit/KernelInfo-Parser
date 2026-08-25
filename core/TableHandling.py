@@ -876,7 +876,7 @@ class ChangeSet:
 
         Detects file language type using `type_check(current_path)` and triggers parser (e.g. `c_ast_parse(self)`).
         """
-        if not self.current_path:
+        if not self.current_path or self.file_operation == "R100":
             return
 
         try:

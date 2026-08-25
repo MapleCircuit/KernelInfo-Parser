@@ -28,13 +28,39 @@ BODY_END_SEP = "\x1d"  # Separates body from file status list
 
 # Regex to extract structured git trailers
 TRAILER_PATTERN = re.compile(
-    r"^(Co-developed-by|Signed-off-by|Reviewed-by|Acked-by|Tested-by|Reported-by|Suggested-by):\s*(.+?)\s*<([^>\n\r]+)>",
+    r"^(Co-developed-by|Signed-off-by|Reviewed-by|Acked-by|Tested-by|Reported-by|Suggested-by|Merged-by|Requested-by):\s*(.+?)\s*<([^>\n\r]+)>",
     re.IGNORECASE | re.MULTILINE,
+)
+
+# Regexes to extract pull request requesters, maintainers, and merged branches
+PULL_FROM_RE = re.compile(
+    r"Pull\s+(?:.*?\s+)?from\s+([^:\n<]+?)\s*(?:<([^>\n\r]+)>)?\s*:",
+    re.IGNORECASE,
+)
+FROM_HEADER_RE = re.compile(
+    r"From:\s*([^<\n\r]+?)\s*<([^>\n\r]+)>",
+    re.IGNORECASE,
+)
+BRANCH_MERGE_RE = re.compile(
+    r"Merge (?:branch|tag)\s+'([^']+)'\s+of\s+(\S+)",
+    re.IGNORECASE,
+)
+GIT_URL_MERGE_RE = re.compile(
+    r"Merge (git://\S+|https://\S+|ssh://\S+)",
+    re.IGNORECASE,
+)
+GENERIC_MERGE_BRANCH_RE = re.compile(
+    r"Merge (?:branches?|tag)\s+(.+)",
+    re.IGNORECASE,
+)
+URL_MAINTAINER_RE = re.compile(
+    r"/(?:pub/scm/linux/kernel/git|kernel/git)/([a-zA-Z0-9_\-]+)/",
+    re.IGNORECASE,
 )
 
 
 class GitCommitParser:
-    """Parser for git commits, multi-person trailers, and tag-to-commit mappings."""
+    """Parser for git commits, merge lineages, multi-person trailers, and tag-to-commit mappings."""
 
     def __init__(self, repo_dir: str | Path | None = None) -> None:
         if repo_dir is None:
@@ -66,6 +92,70 @@ class GitCommitParser:
             logger.error(f"Failed to execute git command: {e}")
             return ""
 
+    @classmethod
+    def extract_merge_metadata(
+        cls,
+        subject: str,
+        message: str,
+        parents: list[str],
+    ) -> tuple[bool, str | None, str | None, str | None, list[str]]:
+        """Extract merge flag, pull requester maintainer, branch origin, and patch summaries.
+
+        Returns:
+            Tuple of (is_merge, requester_name, requester_email, merged_branch, merged_commits_summary)
+        """
+        is_merge = len(parents) >= 2 or subject.startswith("Merge ") or subject.startswith("Merge:")
+        if not is_merge:
+            return False, None, None, None, []
+
+        merged_branch = None
+        requester_name = None
+        requester_email = None
+        merged_commits_summary: list[str] = []
+
+        # 1. Identify merged branch / tag / repository
+        m_branch = BRANCH_MERGE_RE.search(subject) or BRANCH_MERGE_RE.search(message)
+        if m_branch:
+            merged_branch = f"'{m_branch.group(1)}' of {m_branch.group(2)}"
+        else:
+            m_url = GIT_URL_MERGE_RE.search(subject) or GIT_URL_MERGE_RE.search(message)
+            if m_url:
+                merged_branch = m_url.group(1)
+            else:
+                m_gen = GENERIC_MERGE_BRANCH_RE.search(subject)
+                if m_gen:
+                    merged_branch = m_gen.group(1).strip()
+                elif subject.startswith("Merge "):
+                    merged_branch = subject[6:].strip()
+
+        # 2. Extract pull requester / maintainer
+        m_pull = PULL_FROM_RE.search(message)
+        if m_pull:
+            requester_name = m_pull.group(1).strip()
+            requester_email = m_pull.group(2).strip() if m_pull.group(2) else ""
+        else:
+            m_from = FROM_HEADER_RE.search(message)
+            if m_from:
+                requester_name = m_from.group(1).strip()
+                requester_email = m_from.group(2).strip()
+            elif merged_branch:
+                m_maint = URL_MAINTAINER_RE.search(merged_branch)
+                if m_maint:
+                    requester_name = m_maint.group(1).strip()
+                    requester_email = f"{requester_name}@kernel.org"
+
+        # 3. Extract embedded patch topics and summary lines
+        for line in message.splitlines():
+            line_str = line.strip()
+            if not line_str or line_str.startswith(("Merge ", "Pull ", "From:", "Signed-off-by:", "Acked-by:", "Reviewed-by:", "---", "diff ")):
+                continue
+            if (line.startswith("  ") or line_str.startswith("* ")) and len(line_str) > 3:
+                clean_line = line_str[2:].strip() if line_str.startswith("* ") else line_str
+                if clean_line and not clean_line.endswith(":") and clean_line not in merged_commits_summary:
+                    merged_commits_summary.append(clean_line)
+
+        return True, requester_name, requester_email, merged_branch, merged_commits_summary
+
     def parse_version_commits(
         self,
         old_rev: str | None,
@@ -92,7 +182,7 @@ class GitCommitParser:
             max_flag = [f"-n{limit}"] if limit else []
 
         fmt_spec = (
-            f"{RECORD_SEP}%H{FIELD_SEP}%an{FIELD_SEP}%ae{FIELD_SEP}%at{FIELD_SEP}"
+            f"{RECORD_SEP}%H{FIELD_SEP}%P{FIELD_SEP}%an{FIELD_SEP}%ae{FIELD_SEP}%at{FIELD_SEP}"
             f"%cn{FIELD_SEP}%ce{FIELD_SEP}%ct{FIELD_SEP}%s{FIELD_SEP}%B{BODY_END_SEP}"
         )
 
@@ -135,7 +225,7 @@ class GitCommitParser:
             max_flag = [f"-n{limit}"] if limit else []
 
         fmt_spec = (
-            f"{RECORD_SEP}%H{FIELD_SEP}%an{FIELD_SEP}%ae{FIELD_SEP}%at{FIELD_SEP}"
+            f"{RECORD_SEP}%H{FIELD_SEP}%P{FIELD_SEP}%an{FIELD_SEP}%ae{FIELD_SEP}%at{FIELD_SEP}"
             f"%cn{FIELD_SEP}%ce{FIELD_SEP}%ct{FIELD_SEP}%s{FIELD_SEP}%B{BODY_END_SEP}"
         )
 
@@ -171,6 +261,7 @@ class GitCommitParser:
             if not chunk:
                 continue
 
+            parents: list[str] = []
             if RECORD_SEP in raw_output or FIELD_SEP in chunk:
                 if BODY_END_SEP not in chunk:
                     continue
@@ -179,23 +270,46 @@ class GitCommitParser:
                 if len(fields) < 8:
                     continue
 
-                commit_hash = fields[0].strip()
-                author_name = fields[1].strip()
-                author_email = fields[2].strip()
-                try:
-                    author_date = int(fields[3].strip())
-                except ValueError:
-                    author_date = 0
+                if len(fields) >= 9:
+                    # New format with %P
+                    commit_hash = fields[0].strip()
+                    parents_raw = fields[1].strip()
+                    parents = [p for p in parents_raw.split() if p]
+                    author_name = fields[2].strip()
+                    author_email = fields[3].strip()
+                    try:
+                        author_date = int(fields[4].strip())
+                    except ValueError:
+                        author_date = 0
 
-                committer_name = fields[4].strip()
-                committer_email = fields[5].strip()
-                try:
-                    committer_date = int(fields[6].strip())
-                except ValueError:
-                    committer_date = 0
+                    committer_name = fields[5].strip()
+                    committer_email = fields[6].strip()
+                    try:
+                        committer_date = int(fields[7].strip())
+                    except ValueError:
+                        committer_date = 0
 
-                subject = fields[7].strip()
-                message = fields[8].strip() if len(fields) > 8 else subject
+                    subject = fields[8].strip()
+                    message = fields[9].strip() if len(fields) > 9 else subject
+                else:
+                    # Legacy 8-field format without %P
+                    commit_hash = fields[0].strip()
+                    author_name = fields[1].strip()
+                    author_email = fields[2].strip()
+                    try:
+                        author_date = int(fields[3].strip())
+                    except ValueError:
+                        author_date = 0
+
+                    committer_name = fields[4].strip()
+                    committer_email = fields[5].strip()
+                    try:
+                        committer_date = int(fields[6].strip())
+                    except ValueError:
+                        committer_date = 0
+
+                    subject = fields[7].strip()
+                    message = fields[8].strip() if len(fields) > 8 else subject
             else:
                 # Text key-value format
                 commit_hash = ""
@@ -215,6 +329,8 @@ class GitCommitParser:
                     line = lines[idx]
                     if line.startswith("HASH:"):
                         commit_hash = line[5:].strip()
+                    elif line.startswith(("PARENTS:", "PARENT:")):
+                        parents = [p for p in line.split(":", 1)[1].strip().split() if p]
                     elif line.startswith("ANAME:"):
                         author_name = line[6:].strip()
                     elif line.startswith("AEMAIL:"):
@@ -251,38 +367,86 @@ class GitCommitParser:
             if not commit_hash:
                 continue
 
-            # Parse contributors (Author, Committer, Trailers)
+            # Extract merge metadata
+            is_merge, req_name, req_email, merged_branch, merged_summaries = cls.extract_merge_metadata(
+                subject, message, parents
+            )
+
+            # Parse contributors (Author, Committer, Requester, Merger, Trailers)
             contributors: list[GitContributor] = []
             seen_contributors: set[tuple[str, str, int]] = set()
 
-            # 1. Author (Role 1)
-            if author_name or author_email:
-                contributors.append(
-                    GitContributor(
-                        name=author_name or author_email,
-                        email=author_email,
-                        role=CommitRole.AUTHOR,
-                        priority=0,
-                    )
-                )
-                seen_contributors.add((author_name.lower(), author_email.lower(), int(CommitRole.AUTHOR)))
-
-            # 2. Committer (Role 2)
-            if (committer_name or committer_email) and (committer_name != author_name or committer_email != author_email):
-                c_key = (committer_name.lower(), committer_email.lower(), int(CommitRole.COMMITTER))
-                if c_key not in seen_contributors:
+            if is_merge:
+                # 1. Merger (Role 10)
+                if author_name or author_email:
                     contributors.append(
                         GitContributor(
-                            name=committer_name or committer_email,
-                            email=committer_email,
-                            role=CommitRole.COMMITTER,
-                            priority=1,
+                            name=author_name or author_email,
+                            email=author_email,
+                            role=CommitRole.MERGED_BY,
+                            priority=0,
                         )
                     )
-                    seen_contributors.add(c_key)
+                    seen_contributors.add((author_name.lower(), author_email.lower(), int(CommitRole.MERGED_BY)))
 
-            # 3. Trailers in commit message body
-            priority_idx = 2
+                # 2. Pull Requester / Submitter (Role 11)
+                if req_name or req_email:
+                    r_name = req_name or req_email
+                    r_mail = req_email or ""
+                    r_key = (r_name.lower(), r_mail.lower(), int(CommitRole.REQUESTED_BY))
+                    if r_key not in seen_contributors:
+                        contributors.append(
+                            GitContributor(
+                                name=r_name,
+                                email=r_mail,
+                                role=CommitRole.REQUESTED_BY,
+                                priority=1,
+                            )
+                        )
+                        seen_contributors.add(r_key)
+
+                # 3. Committer (Role 2) if distinct from author
+                if (committer_name or committer_email) and (committer_name != author_name or committer_email != author_email):
+                    c_key = (committer_name.lower(), committer_email.lower(), int(CommitRole.COMMITTER))
+                    if c_key not in seen_contributors:
+                        contributors.append(
+                            GitContributor(
+                                name=committer_name or committer_email,
+                                email=committer_email,
+                                role=CommitRole.COMMITTER,
+                                priority=2,
+                            )
+                        )
+                        seen_contributors.add(c_key)
+            else:
+                # 1. Author (Role 1)
+                if author_name or author_email:
+                    contributors.append(
+                        GitContributor(
+                            name=author_name or author_email,
+                            email=author_email,
+                            role=CommitRole.AUTHOR,
+                            priority=0,
+                        )
+                    )
+                    seen_contributors.add((author_name.lower(), author_email.lower(), int(CommitRole.AUTHOR)))
+
+                # 2. Committer (Role 2)
+                if (committer_name or committer_email) and (committer_name != author_name or committer_email != author_email):
+                    c_key = (committer_name.lower(), committer_email.lower(), int(CommitRole.COMMITTER))
+                    if c_key not in seen_contributors:
+                        contributors.append(
+                            GitContributor(
+                                name=committer_name or committer_email,
+                                email=committer_email,
+                                role=CommitRole.COMMITTER,
+                                priority=1,
+                            )
+                        )
+                        seen_contributors.add(c_key)
+
+            # 4. Trailers in commit message body
+            priority_idx = len(contributors)
             for match in TRAILER_PATTERN.finditer(message):
                 trailer_tag, t_name, t_email = match.groups()
                 t_role = CommitRole.from_trailer_prefix(trailer_tag)
@@ -301,7 +465,7 @@ class GitCommitParser:
                     seen_contributors.add(t_key)
                     priority_idx += 1
 
-            # 4. Parse modified files
+            # 5. Parse modified files
             modified_files: list[tuple[str, str]] = []
             for file_line in file_part.strip().splitlines():
                 file_line = file_line.strip()
@@ -326,6 +490,12 @@ class GitCommitParser:
                     message=message,
                     contributors=contributors,
                     files=modified_files,
+                    is_merge=is_merge,
+                    parents=parents,
+                    merge_requester_name=req_name,
+                    merge_requester_email=req_email,
+                    merged_branch=merged_branch,
+                    merged_commits_summary=merged_summaries,
                 )
             )
 
@@ -361,6 +531,7 @@ class GitCommitParser:
 
             main_part = ""
             patch_part = ""
+            parents: list[str] = []
 
             if RECORD_SEP in raw_output or FIELD_SEP in chunk:
                 if BODY_END_SEP in chunk:
@@ -371,23 +542,46 @@ class GitCommitParser:
                 if len(fields) < 8:
                     continue
 
-                commit_hash = fields[0].strip()
-                author_name = fields[1].strip()
-                author_email = fields[2].strip()
-                try:
-                    author_date = int(fields[3].strip())
-                except ValueError:
-                    author_date = 0
+                if len(fields) >= 9:
+                    # New format with %P
+                    commit_hash = fields[0].strip()
+                    parents_raw = fields[1].strip()
+                    parents = [p for p in parents_raw.split() if p]
+                    author_name = fields[2].strip()
+                    author_email = fields[3].strip()
+                    try:
+                        author_date = int(fields[4].strip())
+                    except ValueError:
+                        author_date = 0
 
-                committer_name = fields[4].strip()
-                committer_email = fields[5].strip()
-                try:
-                    committer_date = int(fields[6].strip())
-                except ValueError:
-                    committer_date = 0
+                    committer_name = fields[5].strip()
+                    committer_email = fields[6].strip()
+                    try:
+                        committer_date = int(fields[7].strip())
+                    except ValueError:
+                        committer_date = 0
 
-                subject = fields[7].strip()
-                message = fields[8].strip() if len(fields) > 8 else subject
+                    subject = fields[8].strip()
+                    message = fields[9].strip() if len(fields) > 9 else subject
+                else:
+                    # Legacy 8-field format without %P
+                    commit_hash = fields[0].strip()
+                    author_name = fields[1].strip()
+                    author_email = fields[2].strip()
+                    try:
+                        author_date = int(fields[3].strip())
+                    except ValueError:
+                        author_date = 0
+
+                    committer_name = fields[4].strip()
+                    committer_email = fields[5].strip()
+                    try:
+                        committer_date = int(fields[6].strip())
+                    except ValueError:
+                        committer_date = 0
+
+                    subject = fields[7].strip()
+                    message = fields[8].strip() if len(fields) > 8 else subject
             else:
                 # Text key-value format
                 commit_hash = ""
@@ -407,6 +601,8 @@ class GitCommitParser:
                     line = lines[idx]
                     if line.startswith("HASH:"):
                         commit_hash = line[5:].strip()
+                    elif line.startswith(("PARENTS:", "PARENT:")):
+                        parents = [p for p in line.split(":", 1)[1].strip().split() if p]
                     elif line.startswith("ANAME:"):
                         author_name = line[6:].strip()
                     elif line.startswith("AEMAIL:"):
@@ -443,35 +639,85 @@ class GitCommitParser:
             if not commit_hash:
                 continue
 
-            # Parse contributors (Author, Committer, Trailers)
+            # Extract merge metadata
+            is_merge, req_name, req_email, merged_branch, merged_summaries = cls.extract_merge_metadata(
+                subject, message, parents
+            )
+
+            # Parse contributors (Author, Committer, Requester, Merger, Trailers)
             contributors: list[GitContributor] = []
             seen_contributors: set[tuple[str, str, int]] = set()
 
-            if author_name or author_email:
-                contributors.append(
-                    GitContributor(
-                        name=author_name or author_email,
-                        email=author_email,
-                        role=CommitRole.AUTHOR,
-                        priority=0,
-                    )
-                )
-                seen_contributors.add((author_name.lower(), author_email.lower(), int(CommitRole.AUTHOR)))
-
-            if (committer_name or committer_email) and (committer_name != author_name or committer_email != author_email):
-                c_key = (committer_name.lower(), committer_email.lower(), int(CommitRole.COMMITTER))
-                if c_key not in seen_contributors:
+            if is_merge:
+                # 1. Merger (Role 10)
+                if author_name or author_email:
                     contributors.append(
                         GitContributor(
-                            name=committer_name or committer_email,
-                            email=committer_email,
-                            role=CommitRole.COMMITTER,
-                            priority=1,
+                            name=author_name or author_email,
+                            email=author_email,
+                            role=CommitRole.MERGED_BY,
+                            priority=0,
                         )
                     )
-                    seen_contributors.add(c_key)
+                    seen_contributors.add((author_name.lower(), author_email.lower(), int(CommitRole.MERGED_BY)))
 
-            priority_idx = 2
+                # 2. Pull Requester / Submitter (Role 11)
+                if req_name or req_email:
+                    r_name = req_name or req_email
+                    r_mail = req_email or ""
+                    r_key = (r_name.lower(), r_mail.lower(), int(CommitRole.REQUESTED_BY))
+                    if r_key not in seen_contributors:
+                        contributors.append(
+                            GitContributor(
+                                name=r_name,
+                                email=r_mail,
+                                role=CommitRole.REQUESTED_BY,
+                                priority=1,
+                            )
+                        )
+                        seen_contributors.add(r_key)
+
+                # 3. Committer (Role 2) if distinct from author
+                if (committer_name or committer_email) and (committer_name != author_name or committer_email != author_email):
+                    c_key = (committer_name.lower(), committer_email.lower(), int(CommitRole.COMMITTER))
+                    if c_key not in seen_contributors:
+                        contributors.append(
+                            GitContributor(
+                                name=committer_name or committer_email,
+                                email=committer_email,
+                                role=CommitRole.COMMITTER,
+                                priority=2,
+                            )
+                        )
+                        seen_contributors.add(c_key)
+            else:
+                # 1. Author (Role 1)
+                if author_name or author_email:
+                    contributors.append(
+                        GitContributor(
+                            name=author_name or author_email,
+                            email=author_email,
+                            role=CommitRole.AUTHOR,
+                            priority=0,
+                        )
+                    )
+                    seen_contributors.add((author_name.lower(), author_email.lower(), int(CommitRole.AUTHOR)))
+
+                # 2. Committer (Role 2)
+                if (committer_name or committer_email) and (committer_name != author_name or committer_email != author_email):
+                    c_key = (committer_name.lower(), committer_email.lower(), int(CommitRole.COMMITTER))
+                    if c_key not in seen_contributors:
+                        contributors.append(
+                            GitContributor(
+                                name=committer_name or committer_email,
+                                email=committer_email,
+                                role=CommitRole.COMMITTER,
+                                priority=1,
+                            )
+                        )
+                        seen_contributors.add(c_key)
+
+            priority_idx = len(contributors)
             for match in TRAILER_PATTERN.finditer(message):
                 trailer_tag, t_name, t_email = match.groups()
                 t_role = CommitRole.from_trailer_prefix(trailer_tag)
@@ -561,6 +807,12 @@ class GitCommitParser:
                     message=message,
                     contributors=contributors,
                     files=modified_files,
+                    is_merge=is_merge,
+                    parents=parents,
+                    merge_requester_name=req_name,
+                    merge_requester_email=req_email,
+                    merged_branch=merged_branch,
+                    merged_commits_summary=merged_summaries,
                 )
             )
 

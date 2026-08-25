@@ -407,6 +407,52 @@ class TestMaintainerAndCreditsIntegration(unittest.TestCase):
         # - m_moved_file has (20, new_fid)
         self.assertIn((20, new_fid), moved_rows)
 
+    def test_r100_c_ast_pipeline_no_unresolved_refs(self) -> None:
+        """Verify R100 exact rename (e.g. linux/fs/xfs/kmem.c) completes parse() and execute() without unresolved references."""
+        from main import default_processing, gp as main_gp, file_fid_cache
+
+        G.DB = MockDB
+        G.TE = TECachedDB()
+        file_fid_cache.clear()
+        main_gp.Table_Array = list(self.gp.Table_Array)
+        G.TE.start(main_gp.Table_Array, MockDB)
+
+        main_gp.Old_VID = 1
+        main_gp.VID = 2
+        self.gp.Old_VID = 1
+        self.gp.VID = 2
+
+        # 1. Seed old version file fs/xfs/linux-2.6/kmem.c (fid=55)
+        fn_old = G.TE.set(m_file_name.table_id, (None, "fs/xfs/linux-2.6/kmem.c"))[0]
+        G.TE.set(m_file.table_id, (55, 1, 0, 1, "A", "0"))
+        G.TE.set(m_bridge_file.table_id, (1, fn_old, 55))
+        G.TE.commit_all()
+
+        # 2. Process R100 exact rename
+        cs_r100 = ChangeSet("R100\tfs/xfs/linux-2.6/kmem.c\tfs/xfs/kmem.c")
+        cs_r100.gp = main_gp
+        default_processing(cs_r100)
+        cs_r100.parse()
+
+        # 3. Ensure ChangeSet executes cleanly on first attempt with NO unresolvable tuples or infinite loops
+        executed = cs_r100.execute()
+        self.assertTrue(executed, "R100 changeset execute() must return True on first attempt")
+
+        # 4. Verify both m_file_name records exist
+        fn_old_row = G.TE.get(m_file_name.table_id, (None, "fs/xfs/linux-2.6/kmem.c"))
+        fn_new_row = G.TE.get(m_file_name.table_id, (None, "fs/xfs/kmem.c"))
+        self.assertIsNotNone(fn_old_row)
+        self.assertIsNotNone(fn_new_row)
+
+        # 5. Verify m_bridge_file links new fnid to old fid=55
+        bf_rows = G.TE.queued_set.get(m_bridge_file.table_id, {})
+        new_kmem_bf = [row for row in bf_rows.values() if row[0] == 2 and row[1] == fn_new_row[0] and row[2] == 55]
+        self.assertEqual(len(new_kmem_bf), 1)
+
+        # 6. Verify m_moved_file records (55, 55)
+        moved_rows = G.TE.queued_set.get(m_moved_file.table_id, {})
+        self.assertIn((55, 55), moved_rows)
+
     def test_processing_maintainer_files_and_kbuild(self) -> None:
         """Test processing_maintainer_files and processing_kbuild helper routines."""
         from main import processing_maintainer_files, processing_kbuild, gp as main_gp, file_fid_cache
@@ -433,64 +479,72 @@ class TestMaintainerAndCreditsIntegration(unittest.TestCase):
                 return "MAINTAINERS\nfs/ext4/Makefile\nfs/ext4/balloc.c\nfs/ext4/inode.c\nfs/ext4/core.c\nnet/ipv6/ip6_output.c\n"
 
         import main
-        main.MF = FakeMF()
-        main.G.MF = FakeMF()
+        orig_mf = getattr(main, "MF", None)
+        orig_g_mf = getattr(main.G, "MF", None)
+        try:
+            main.MF = FakeMF()
+            main.G.MF = FakeMF()
 
-        # Seed section and symbol
-        sec_ext4 = G.TE.set(m_maintainer_section.table_id, (None, 1, 0, "EXT4 FILE SYSTEM", "Maintained", "", "", "linux-ext4@vger.kernel.org", 1))
-        sec_ext4_id = sec_ext4[0]
-        sec_ipv6 = G.TE.set(m_maintainer_section.table_id, (None, 1, 0, "IPV6 NETWORKING", "Maintained", "", "", "netdev@vger.kernel.org", 2))
-        sec_ipv6_id = sec_ipv6[0]
+            # Seed section and symbol
+            sec_ext4 = G.TE.set(m_maintainer_section.table_id, (None, 1, 0, "EXT4 FILE SYSTEM", "Maintained", "", "", "linux-ext4@vger.kernel.org", 1))
+            sec_ext4_id = sec_ext4[0]
+            sec_ipv6 = G.TE.set(m_maintainer_section.table_id, (None, 1, 0, "IPV6 NETWORKING", "Maintained", "", "", "netdev@vger.kernel.org", 2))
+            sec_ipv6_id = sec_ipv6[0]
 
-        sym_ext4 = G.TE.set(m_kconfig_symbol.table_id, (None, 1, 0, "EXT4_FS", 1, "Ext4", "", "", 1))
-        sym_ext4_id = sym_ext4[0]
+            sym_ext4 = G.TE.set(m_kconfig_symbol.table_id, (None, 1, 0, "EXT4_FS", 1, "Ext4", "", "", 1))
+            sym_ext4_id = sym_ext4[0]
 
-        # Seed files
-        for fid, path in [
-            (10, "fs/ext4/balloc.c"),
-            (11, "fs/ext4/inode.c"),
-            (12, "fs/ext4/core.c"),
-            (13, "net/ipv6/ip6_output.c"),
-        ]:
-            fn_res = G.TE.set(m_file_name.table_id, (None, path))
-            fnid = fn_res[0]
-            G.TE.set(m_file.table_id, (fid, 1, 0, 1, "A", "0"))
-            G.TE.set(m_bridge_file.table_id, (1, fnid, fid))
+            # Seed files
+            for fid, path in [
+                (10, "fs/ext4/balloc.c"),
+                (11, "fs/ext4/inode.c"),
+                (12, "fs/ext4/core.c"),
+                (13, "net/ipv6/ip6_output.c"),
+            ]:
+                fn_res = G.TE.set(m_file_name.table_id, (None, path))
+                fnid = fn_res[0]
+                G.TE.set(m_file.table_id, (fid, 1, 0, 1, "A", "0"))
+                G.TE.set(m_bridge_file.table_id, (1, fnid, fid))
 
-        # 1. Run processing_maintainer_files
-        processing_maintainer_files("v3.0")
+            # 1. Run processing_maintainer_files
+            processing_maintainer_files("v3.0")
 
-        # Verify m_maintainer_file staging:
-        # balloc.c and inode.c and core.c matched EXT4 FILE SYSTEM
-        sec_ext4_row = m_maintainer_section.get(None, None, None, "EXT4 FILE SYSTEM", None, None, None, None, None)
-        self.assertIsNotNone(sec_ext4_row)
-        sec_ext4_id = sec_ext4_row[2][0]
+            # Verify m_maintainer_file staging:
+            # balloc.c and inode.c and core.c matched EXT4 FILE SYSTEM
+            sec_ext4_row = m_maintainer_section.get(None, None, None, "EXT4 FILE SYSTEM", None, None, None, None, None)
+            self.assertIsNotNone(sec_ext4_row)
+            sec_ext4_id = sec_ext4_row[2][0]
 
-        sec_ipv6_row = m_maintainer_section.get(None, None, None, "IPV6 NETWORKING", None, None, None, None, None)
-        self.assertIsNotNone(sec_ipv6_row)
-        sec_ipv6_id = sec_ipv6_row[2][0]
+            sec_ipv6_row = m_maintainer_section.get(None, None, None, "IPV6 NETWORKING", None, None, None, None, None)
+            self.assertIsNotNone(sec_ipv6_row)
+            sec_ipv6_id = sec_ipv6_row[2][0]
 
-        maint_file_rows = G.TE.queued_set.get(m_maintainer_file.table_id, {})
-        self.assertIn((1, 10, sec_ext4_id), maint_file_rows)
-        self.assertIn((1, 11, sec_ext4_id), maint_file_rows)
-        self.assertIn((1, 12, sec_ext4_id), maint_file_rows)
-        self.assertIn((1, 13, sec_ipv6_id), maint_file_rows)
+            maint_file_rows = G.TE.queued_set.get(m_maintainer_file.table_id, {})
+            self.assertIn((1, 10, sec_ext4_id), maint_file_rows)
+            self.assertIn((1, 11, sec_ext4_id), maint_file_rows)
+            self.assertIn((1, 12, sec_ext4_id), maint_file_rows)
+            self.assertIn((1, 13, sec_ipv6_id), maint_file_rows)
 
-        # 2. Run processing_kbuild
-        processing_kbuild("v3.0")
+            # 2. Run processing_kbuild
+            processing_kbuild("v3.0")
 
-        # Verify m_kconfig_kbuild staging:
-        sym_ext4_row = m_kconfig_symbol.get(None, None, None, "EXT4_FS", None, None, None, None, None)
-        self.assertIsNotNone(sym_ext4_row)
-        sym_ext4_id = sym_ext4_row[2][0]
+            # Verify m_kconfig_kbuild staging:
+            sym_ext4_row = m_kconfig_symbol.get(None, None, None, "EXT4_FS", None, None, None, None, None)
+            self.assertIsNotNone(sym_ext4_row)
+            sym_ext4_id = sym_ext4_row[2][0]
 
-        # balloc.c -> (kcid=sym_ext4_id, vid=1, fid=10, compile_mode=3, target_obj='ext4.o')
-        # inode.c -> (kcid=sym_ext4_id, vid=1, fid=11, compile_mode=3, target_obj='ext4.o')
-        # core.c -> (kcid=0, vid=1, fid=12, compile_mode=1, target_obj='core.o')
-        kbuild_rows = G.TE.queued_set.get(m_kconfig_kbuild.table_id, {})
-        self.assertIn((sym_ext4_id, 1, 10, 3), kbuild_rows)
-        self.assertIn((sym_ext4_id, 1, 11, 3), kbuild_rows)
-        self.assertIn((0, 1, 12, 1), kbuild_rows)
+            # balloc.c -> (kcid=sym_ext4_id, vid=1, fid=10, compile_mode=3, target_obj='ext4.o')
+            # inode.c -> (kcid=sym_ext4_id, vid=1, fid=11, compile_mode=3, target_obj='ext4.o')
+            # core.c -> (kcid=0, vid=1, fid=12, compile_mode=1, target_obj='core.o')
+            kbuild_rows = G.TE.queued_set.get(m_kconfig_kbuild.table_id, {})
+            self.assertIn((sym_ext4_id, 1, 10, 3), kbuild_rows)
+            self.assertIn((sym_ext4_id, 1, 11, 3), kbuild_rows)
+            self.assertIn((0, 1, 12, 1), kbuild_rows)
+        finally:
+            if orig_mf is not None:
+                main.MF = orig_mf
+            if orig_g_mf is not None:
+                main.G.MF = orig_g_mf
 
 
 if __name__ == "__main__":
