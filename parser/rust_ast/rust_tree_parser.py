@@ -579,7 +579,9 @@ def convert_item_node(item: dict[str, Any], raw_lines: tuple[str, ...]) -> Ast_R
 
     elif kind_type == "TyAlias":
         ty_data = kind_obj.get("_items", [{}])[0] if isinstance(kind_obj.get("_items"), list) else kind_obj
-        target_ty = extract_type_string(ty_data.get("ty")) if isinstance(ty_data, dict) else ""
+        target_ty = extract_type_string(ty_data.get("ty") or ty_data.get("default")) if isinstance(ty_data, dict) else ""
+        if target_ty in ("None", "None()", ""):
+            target_ty = ""
         return Ast_Rust_Type(
             name=ident,
             target_ty=target_ty,
@@ -644,7 +646,22 @@ def convert_item_node(item: dict[str, Any], raw_lines: tuple[str, ...]) -> Ast_R
 
     elif kind_type == "ForeignMod":
         mod_data = kind_obj.get("_items", [{}])[0] if isinstance(kind_obj.get("_items"), list) else kind_obj
-        abi = str(mod_data.get("abi", "C")) if isinstance(mod_data, dict) else "C"
+        abi_raw = mod_data.get("abi") if isinstance(mod_data, dict) else None
+        if not abi_raw and isinstance(kind_obj.get("_items"), list) and len(kind_obj["_items"]) > 1:
+            abi_raw = kind_obj["_items"][0]
+        
+        def _get_abi(obj: Any) -> str:
+            if not obj or obj in ("None", "None()"):
+                return "C"
+            if isinstance(obj, str):
+                return obj
+            if isinstance(obj, dict):
+                if obj.get("_type") == "Some" and obj.get("_items"):
+                    return _get_abi(obj["_items"][0])
+                return str(obj.get("symbol") or obj.get("symbol_unescaped") or obj.get("name") or "C")
+            return "C"
+
+        abi = _get_abi(abi_raw)
         items_list = mod_data.get("items", []) if isinstance(mod_data, dict) else []
         foreign_items = []
         for assoc in items_list:
@@ -710,7 +727,9 @@ def convert_assoc_item(assoc: dict[str, Any], raw_lines: tuple[str, ...]) -> Ast
 
     elif kind_type == "Type":
         ty_data = kind_obj.get("_items", [{}])[0] if isinstance(kind_obj.get("_items"), list) else kind_obj
-        target_ty = extract_type_string(ty_data.get("ty")) if isinstance(ty_data, dict) else ""
+        target_ty = extract_type_string(ty_data.get("ty") or ty_data.get("default")) if isinstance(ty_data, dict) else ""
+        if target_ty in ("None", "None()", ""):
+            target_ty = ""
         return Ast_Rust_Type(name=ident, target_ty=target_ty, extent=extent, vis=vis)
 
     return None

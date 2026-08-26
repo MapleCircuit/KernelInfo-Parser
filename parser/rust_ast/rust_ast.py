@@ -146,7 +146,7 @@ class Rust_Manager:
                     "--edition=2021",
                     "--crate-type=lib",
                     "-Z", "unpretty=ast-tree",
-                    "-o", "/dev/null",
+                    "-o", "-",
                     self.fullfilename,
                 ],
                 capture_output=True,

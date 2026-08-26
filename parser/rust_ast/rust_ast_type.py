@@ -600,7 +600,7 @@ class Ast_Rust_Mod(Ast_Rust):
         attributes: list[str] | None = None,
     ) -> None:
         super().__init__(
-            name=f"mod {name}",
+            name=name,
             extent=extent,
             ast_type=ASTT.Rust_Mod,
             vis=vis,

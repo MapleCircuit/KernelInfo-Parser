@@ -56,6 +56,7 @@ class GreatProcessor:
         self.Shared_ChangeSet_Dict_List.append(pickle.dumps(self.ChangeSet_Dict))
         return
 
+    # this is not optimized as reset_cs destroys our progress... might be too much to ask to keep 2 CS_list
     def safe_get_cs(self, path: str):
         CS = self.ChangeSet_Dict.get(path)
         if CS is None:

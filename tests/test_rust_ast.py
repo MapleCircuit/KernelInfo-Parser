@@ -159,7 +159,7 @@ class TestRustAstGrammarAndParsing(unittest.TestCase):
 
         try:
             p = subprocess.run(
-                ["rustc", "--edition=2021", "--crate-type=lib", "-Z", "unpretty=ast-tree", "-o", "/dev/null", tmp_file],
+                ["rustc", "--edition=2021", "--crate-type=lib", "-Z", "unpretty=ast-tree", "-o", "-", tmp_file],
                 capture_output=True,
                 text=True,
                 env=self.env,
@@ -444,6 +444,7 @@ class TestRustTagLifecycle(unittest.TestCase):
         cs1.store(m_bridge_file.set(1, cs1.ref(m_file_name.fnid), cs1.ref(m_file.fid)))
         cs1.parse()
         cs1.execute()
+        G.TE.commit_all()
 
         # --- Version 2 (VID = 2, Old_VID = 1) ---
         dir_v2 = self.mf.create_temp_dir()

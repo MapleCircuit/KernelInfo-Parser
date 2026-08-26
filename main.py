@@ -211,7 +211,7 @@ def update(version: str) -> None:
             pass
 
     with G.DB() as db:
-        db.remove_indexes(((item[0],item[1]) for item in performance_indexes))
+        db.remove_indexes(tuple((item[0],item[1]) for item in performance_indexes))
 
     G.TE.commit_all()
 
