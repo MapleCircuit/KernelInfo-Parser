@@ -378,11 +378,7 @@ class TestMaintainerAndCreditsIntegration(unittest.TestCase):
         self.assertTrue(cs_r100.execute())
 
         # Verify R100 behavior:
-        # - m_moved_file has (10, 10)
         # - m_bridge_file has (2, new_fnid, 10) pointing to original fid=10
-        moved_rows = G.TE.queued_set.get(m_moved_file.table_id, {})
-        self.assertIn((10, 10), moved_rows)
-
         bf_rows = G.TE.queued_set.get(m_bridge_file.table_id, {})
         new_foo_bf = [row for row in bf_rows.values() if row[0] == 2 and row[2] == 10]
         self.assertEqual(len(new_foo_bf), 1)
@@ -405,6 +401,7 @@ class TestMaintainerAndCreditsIntegration(unittest.TestCase):
         new_fid = new_bar_files[0][0]
 
         # - m_moved_file has (20, new_fid)
+        moved_rows = G.TE.queued_set.get(m_moved_file.table_id, {})
         self.assertIn((20, new_fid), moved_rows)
 
     def test_r100_c_ast_pipeline_no_unresolved_refs(self) -> None:
@@ -449,9 +446,9 @@ class TestMaintainerAndCreditsIntegration(unittest.TestCase):
         new_kmem_bf = [row for row in bf_rows.values() if row[0] == 2 and row[1] == fn_new_row[0] and row[2] == 55]
         self.assertEqual(len(new_kmem_bf), 1)
 
-        # 6. Verify m_moved_file records (55, 55)
+        # 6. Verify m_moved_file is empty for R100 (same fid maintained)
         moved_rows = G.TE.queued_set.get(m_moved_file.table_id, {})
-        self.assertIn((55, 55), moved_rows)
+        self.assertEqual(len(moved_rows), 0)
 
     def test_processing_maintainer_files_and_kbuild(self) -> None:
         """Test processing_maintainer_files and processing_kbuild helper routines."""
