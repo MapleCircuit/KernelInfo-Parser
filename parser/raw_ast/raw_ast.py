@@ -60,15 +60,15 @@ def get_prior_tags(CS: Any) -> None:
         return
 
     lookup_path = CS.old_path if (CS.file_operation and CS.file_operation.startswith("R") and CS.old_path) else CS.current_path
-    fn_row = G.TE.get(m_file_name.table_id, (None, lookup_path))
-    if not fn_row:
+    fn_row = m_file_name.get(None, lookup_path)
+    if not fn_row or len(fn_row) < 3 or not fn_row[2]:
         return
-    fnid = fn_row[0]
+    fnid = fn_row[2][0]
 
-    bf_row = G.TE.get(m_bridge_file.table_id, (old_vid, fnid, None))
-    if not bf_row:
+    bf_row = m_bridge_file.get(old_vid, fnid, None)
+    if not bf_row or len(bf_row) < 3 or not bf_row[2]:
         return
-    old_fid = bf_row[2]
+    old_fid = bf_row[2][2]
 
     CS.prior_tags = m_bridge_tag.view_get_multiple(
         ((m_bridge_tag.tag_id, m_tag.tag_id, 1),),
@@ -89,11 +89,13 @@ def get_prior_tags(CS: Any) -> None:
     if CS.prior_tags:
         CS.prior_tags_map = {}
         for x, tag in enumerate(CS.prior_tags):
-            code = tag[9]
-            if code is not None:
-                if code not in CS.prior_tags_map:
-                    CS.prior_tags_map[code] = []
-                CS.prior_tags_map[code].append((x, tag[1]))
+            if len(tag) > 9:
+                code = tag[9]
+                if code is not None:
+                    if code not in CS.prior_tags_map:
+                        CS.prior_tags_map[code] = []
+                    tag_id = tag[1] if len(tag) > 1 else tag[0]
+                    CS.prior_tags_map[code].append((x, tag_id))
 
 
 def close_prior_tags(CS: Any) -> None:
@@ -103,15 +105,16 @@ def close_prior_tags(CS: Any) -> None:
             for x, tag in enumerate(CS.prior_tags):
                 if x in CS.active_tag_list:
                     continue
-                CS.store(m_tag.update(
-                    tag[6],          # m_tag.tag_id
-                    tag[7],          # m_tag.vid_s
-                    CS.gp.Old_VID,   # m_tag.vid_e
-                    tag[9],          # m_tag.code
-                    tag[10],         # m_tag.ast_id
-                    tag[11],         # m_tag.hl_s
-                    tag[12],         # m_tag.hl_l
-                ))
+                if len(tag) >= 13:
+                    CS.store(m_tag.update(
+                        tag[6],          # m_tag.tag_id
+                        tag[7],          # m_tag.vid_s
+                        CS.gp.Old_VID,   # m_tag.vid_e
+                        tag[9],          # m_tag.code
+                        tag[10],         # m_tag.ast_id
+                        tag[11],         # m_tag.hl_s
+                        tag[12],         # m_tag.hl_l
+                    ))
 
 
 class RawManager:

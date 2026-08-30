@@ -434,14 +434,15 @@ class Ast:
                     if x in CS.active_tag_list:
                         continue
                     # If tag found in prior_tags, set bridge and return
-                    if tag[9] == self.extent.code:
+                    if len(tag) > 9 and tag[9] == self.extent.code:
                         if isinstance(CS.active_tag_list, set):
                             CS.active_tag_list.add(x)
                         else:
                             CS.active_tag_list.append(x)
+                        tag_id = tag[1] if len(tag) > 1 else tag[0]
                         CS.store(m_bridge_tag.set(
                             ((m_file.table_id, 0), OP_REF, (REF_ROOT,)),
-                            tag[1],
+                            tag_id,
                             self.extent.line_pos[0],
                             self.extent.line_pos[1],
                             self.extent.char_pos[0],
