@@ -12,7 +12,7 @@ from enum import IntEnum, auto, Flag
 
 OP_DONE, OP_SET, OP_UPDATE, OP_REF, OP_REF_VIEW, OP_VIEW_DONE, OP_VIEW_SET = range(7)
 REF_ROOT, REF_OLD, REF_POS, REF_FILE, REF_MULTI, REF_C_AST, REF_NO_REF = range(7)
-T_DIR, T_C, T_KCONFIG, T_RUST, T_ASM, T_MAINTAINERS, T_CREDITS = range(7)
+T_DIR, T_C, T_KCONFIG, T_RUST, T_ASM, T_MAINTAINERS, T_CREDITS, T_RAW = range(8)
 
 PointerType = tuple[int, int]
 JoinType = tuple[PointerType, PointerType, int] | tuple[PointerType]
@@ -299,7 +299,7 @@ class PointerGetter:
         joins.append(join)
 
 
-def type_check(name: str) -> int | None:
+def type_check(name: str) -> int:
     """Parse string to get file type."""
     if name.endswith((".c", ".h")):
         return T_C
@@ -313,7 +313,7 @@ def type_check(name: str) -> int | None:
         return T_KCONFIG
     if name.endswith(".rs"):
         return T_RUST
-    return None
+    return T_RAW
 
 
 class ASTT(IntEnum):
@@ -475,6 +475,8 @@ class ASTT(IntEnum):
     Rust_Attribute = auto()
     Rust_DocComment = auto()
     Rust_Comment = auto()
+    ## Fallback / Raw Content Construct
+    Raw_Content = auto()
 
 
 

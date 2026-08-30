@@ -80,6 +80,9 @@ class MasterFile:
             raw_file = sp.run(command, capture_output=True, text=True, encoding="latin-1")  # noqa: PLW1510, S603
             return raw_file.stdout
 
+        if version not in self.file_dict:
+            self.file_dict[version] = {}
+
         if file_path not in self.file_dict[version]:
             self.file_dict[version][file_path] = Path(
                 f"{self.version_dict[version]}/{file_path}",
