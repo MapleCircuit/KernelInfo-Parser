@@ -162,33 +162,36 @@ class Line:
     # Code Capture
     def cc(self, rawfile: tuple[str]) -> Self:
         """Extract the str using line/col pos."""
-        if self.line_pos[0] == 0:
+        if not rawfile or self.line_pos[0] <= 0 or self.line_pos[0] > len(rawfile):
             self.code = ""
             return self
 
-        # Line Select
+        start_line_idx = self.line_pos[0] - 1
+        end_line_idx = min(len(rawfile), max(self.line_pos[0], self.line_pos[1])) - 1
+
         try:
-            if self.line_pos[0] == self.line_pos[1]:
-                self.code = rawfile[self.line_pos[0] - 1]
-                char_start = 0 if self.char_pos[0] == 0 else self.char_pos[0] - 1
-                char_end = len(self.code) if (self.char_pos[1] == 0 or self.char_pos[1] - 1 >= len(self.code)) else (self.char_pos[1] - 1)
-                self.code = self.code[char_start : char_end]
+            if start_line_idx == end_line_idx:
+                line_str = rawfile[start_line_idx]
+                char_start = max(0, self.char_pos[0] - 1) if self.char_pos[0] > 0 else 0
+                char_end = len(line_str) if (self.char_pos[1] == 0 or self.char_pos[1] - 1 >= len(line_str)) else (self.char_pos[1] - 1)
+                self.code = line_str[char_start : char_end]
                 return self
+
+            lines_slice = rawfile[start_line_idx : end_line_idx + 1]
+            self.code = "\n".join(lines_slice)
+
+            char_start = max(0, self.char_pos[0] - 1) if self.char_pos[0] > 0 else 0
+            last_line_len = len(lines_slice[-1])
+            char_end = last_line_len if (self.char_pos[1] == 0 or self.char_pos[1] - 1 >= last_line_len) else (self.char_pos[1] - 1)
+
+            if char_end == last_line_len:
+                self.code = self.code[char_start:]
             else:
-                self.code = "\n".join(rawfile[self.line_pos[0] - 1 : self.line_pos[1]])
-        except IndexError:
+                trim_end = last_line_len - char_end
+                self.code = self.code[char_start : -trim_end] if trim_end > 0 else self.code[char_start:]
+        except (IndexError, TypeError):
             self.code = ""
-            return self
 
-        char_start = 0 if self.char_pos[0] == 0 else self.char_pos[0] - 1
-        last_line_len = len(rawfile[self.line_pos[1] - 1])
-        char_end = last_line_len if (self.char_pos[1] == 0 or self.char_pos[1] - 1 >= last_line_len) else (self.char_pos[1] - 1)
-
-        if char_end == last_line_len:
-            self.code = self.code[char_start:]
-        else:
-            trim_end = last_line_len - char_end
-            self.code = self.code[char_start : -trim_end]
         return self
 
     def new_end(self, *args: int | object) -> None:

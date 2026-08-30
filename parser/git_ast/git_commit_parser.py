@@ -905,9 +905,9 @@ class GitCommitParser:
         if hunks_by_commit is not None:
             tag_to_cids: dict[int, list[int]] = {}
             for t in tags:
-                tid = t["tag_id"] if isinstance(t, dict) else t[0]
-                ls = t["line_s"] if isinstance(t, dict) else t[2]
-                le = t["line_e"] if isinstance(t, dict) else t[3]
+                tid = t["tag_id"] if isinstance(t, dict) else (t[0] if len(t) > 0 else 0)
+                ls = t["line_s"] if isinstance(t, dict) else (t[2] if len(t) > 2 else 1)
+                le = t["line_e"] if isinstance(t, dict) else (t[3] if len(t) > 3 else ls)
                 matched_cids: list[int] = []
 
                 for cid, hunk_list in hunks_by_commit.items():
@@ -935,8 +935,13 @@ class GitCommitParser:
                     fid = t.get("fid", 0)
                     line_s = t.get("line_s", 1)
                     line_e = t.get("line_e", line_s)
+                elif isinstance(t, (tuple, list)):
+                    tag_id = t[0] if len(t) > 0 else 0
+                    fid = t[1] if len(t) > 1 else 0
+                    line_s = t[2] if len(t) > 2 else 1
+                    line_e = t[3] if len(t) > 3 else line_s
                 else:
-                    tag_id, fid, line_s, line_e = t
+                    continue
 
                 matched_commit_ids: set[int] = set()
 
@@ -973,8 +978,13 @@ class GitCommitParser:
                 fid = t.get("fid", 0)
                 line_s = t.get("line_s", 1)
                 line_e = t.get("line_e", line_s)
+            elif isinstance(t, (tuple, list)):
+                tag_id = t[0] if len(t) > 0 else 0
+                fid = t[1] if len(t) > 1 else 0
+                line_s = t[2] if len(t) > 2 else 1
+                line_e = t[3] if len(t) > 3 else line_s
             else:
-                tag_id, fid, line_s, line_e = t
+                continue
 
             matched_commit_ids = set()
 

@@ -484,7 +484,7 @@ class TokenList:
             l.char_pos = (s_col, e_col)
             token.line = l
 
-            if s_line == e_line and s_line <= rawfile_len:
+            if s_line == e_line and 0 < s_line <= rawfile_len:
                 token.spelling_str = rawfile[s_line - 1][s_col - 1 : e_col - 1]
             else:
                 try:
