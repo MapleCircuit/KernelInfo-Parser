@@ -41,7 +41,7 @@ TEST_SUITE: list[dict[str, Any]] = [
     },
     {
         "file": "virt/kvm/iodev.h",
-        "baseline_ast_ops": 231,
+        "baseline_ast_ops": 408,
         "description": "Kernel Header (virt/kvm/iodev.h)",
     },
     {
@@ -51,22 +51,22 @@ TEST_SUITE: list[dict[str, Any]] = [
     },
     {
         "file": "include/linux/netfilter_bridge/ebtables.h",
-        "baseline_ast_ops": 1584,
+        "baseline_ast_ops": 1567,
         "description": "Kernel Header (ebtables.h)",
     },
     {
         "file": "drivers/watchdog/w83627hf_wdt.c",
-        "baseline_ast_ops": 1468,
+        "baseline_ast_ops": 1787,
         "description": "Watchdog Driver (Latin-1 byte 0xe1 resilience)",
     },
     {
         "file": "drivers/usb/storage/isd200.c",
-        "baseline_ast_ops": 4161,
+        "baseline_ast_ops": 6879,
         "description": "USB Storage Driver (Latin-1 byte 0xf6 resilience)",
     },
     {
         "file": "include/linux/sched.h",
-        "baseline_ast_ops": 12507,
+        "baseline_ast_ops": 13725,
         "description": "Kernel Header (sched.h)",
     },
     {
@@ -248,7 +248,7 @@ class TestCASTParser(unittest.TestCase):
         """Verify parsing and ChangeSet execution with TEDirectDB."""
         item = {
             "file": "virt/kvm/iodev.h",
-            "baseline_ast_ops": 231,
+            "baseline_ast_ops": 408,
             "description": "Kernel Header (virt/kvm/iodev.h)",
             "table_engine": "direct",
         }
@@ -345,6 +345,97 @@ static inline int test_compat_fn(int x, long y) {
             self.assertGreater(len(cs.cs), 0)
             self.assertTrue(cs.execute())
             self.assertEqual(len(cs.cs), len(cs.cs_result))
+        finally:
+            if temp_dir and os.path.exists(temp_dir):
+                shutil.rmtree(temp_dir, ignore_errors=True)
+
+    def test_function_body_and_type_linking(self) -> None:
+        """Verify function statements, call expressions, member accesses, and type linking."""
+        temp_dir = None
+        try:
+            G.DEBUG_TYPECHECK = True
+            G.DB = MockDB
+            G.TE = get_table_engine("cached")()
+            gp = GreatProcessor()
+            init_db_layout(gp)
+            G.TE.start(gp.Table_Array, G.DB)
+
+            mf = MasterFile()
+            temp_dir = mf.create_temp_dir()
+            mf.version_dict["v3.0"] = temp_dir
+            G.MF = mf
+            gp.Version_Name = "v3.0"
+            gp.VID = 1
+
+            file_path = "test_func_body.c"
+            full_path = os.path.join(temp_dir, file_path)
+            snippet = """
+struct device {
+    int id;
+    void *priv;
+};
+
+int helper_calc(int val) {
+    return val * 2;
+}
+
+int process_device(struct device *dev) {
+    int total = 0;
+    if (dev != 0) {
+        total = helper_calc(dev->id);
+    }
+    for (int i = 0; i < 10; i = i + 1) {
+        total = total + 1;
+    }
+    while (total > 100) {
+        total = total - 1;
+        break;
+    }
+    switch (total) {
+        case 1:
+            total = 2;
+            break;
+        default:
+            break;
+    }
+    return total;
+}
+"""
+            with open(full_path, "w") as f:
+                f.write(snippet)
+
+            cs = ChangeSet(f"A\t{file_path}")
+            cs.current_vid = 1
+            cs.gp = gp
+            cs.mf = mf
+            G.CURRENT_PARSING_FILE = file_path
+
+            default_processing(cs, gp)
+            cs.parse()
+            self.assertGreater(len(cs.cs), 0)
+            self.assertTrue(cs.execute())
+            self.assertEqual(len(cs.cs), len(cs.cs_result))
+
+            from core.globalstuff import ASTT
+
+            types_in_ast = set()
+            for op in cs.cs:
+                if isinstance(op[0], tuple) and len(op) >= 3 and isinstance(op[2], tuple):
+                    for val in op[2]:
+                        if isinstance(val, (int, ASTT)) and not isinstance(val, bool):
+                            try:
+                                types_in_ast.add(ASTT(val))
+                            except:
+                                pass
+
+            self.assertIn(ASTT.C_IfStmt, types_in_ast)
+            self.assertIn(ASTT.C_ForStmt, types_in_ast)
+            self.assertIn(ASTT.C_WhileStmt, types_in_ast)
+            self.assertIn(ASTT.C_SwitchStmt, types_in_ast)
+            self.assertIn(ASTT.C_ReturnStmt, types_in_ast)
+            self.assertIn(ASTT.C_CallExpr, types_in_ast)
+            self.assertIn(ASTT.C_MemberRefExpr, types_in_ast)
+            self.assertIn(ASTT.C_DeclRefExpr, types_in_ast)
         finally:
             if temp_dir and os.path.exists(temp_dir):
                 shutil.rmtree(temp_dir, ignore_errors=True)

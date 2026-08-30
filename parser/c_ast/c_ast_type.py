@@ -15,7 +15,7 @@ m_v_main = m_file_name = m_file = m_bridge_file = m_moved_file = m_type_descript
 ChangeSetType = Any
 _DEF_TYPES = frozenset({ASTT.C_struct, ASTT.C_functionproto, ASTT.C_union, ASTT.C_enum})
 _PUNCT_IGNORED = frozenset({";", ",", ")", "}"})
-_KEYWORD_IGNORED = frozenset({"if", "else", "return", "switch", "case", "default", "break", "continue", "for", "while", "do", "goto", "_Static_assert", "static_assert"})
+_KEYWORD_IGNORED = frozenset({"_Static_assert", "static_assert"})
 
 _CLANG_GET_CURSOR_EXTENT = cc.conf.lib.clang_getCursorExtent
 _CLANG_GET_CURSOR_EXTENT.argtypes = [cc.Cursor]
@@ -52,7 +52,7 @@ def get_cursor_line(cursor) -> Line:
     """Fast-path ctypes Line extraction from Clang Cursor with caching."""
     cl = getattr(cursor, "_cached_line", None)
     if cl is not None:
-        return cl
+        return Line(cl)
     ext = _CLANG_GET_CURSOR_EXTENT(cursor)
     st = _CLANG_GET_RANGE_START(ext)
     en = _CLANG_GET_RANGE_END(ext)
@@ -63,7 +63,7 @@ def get_cursor_line(cursor) -> Line:
     cl.line_pos = (_CTYPES_S_LINE.value, _CTYPES_E_LINE.value)
     cl.char_pos = (_CTYPES_S_COL.value, _CTYPES_E_COL.value)
     cursor._cached_line = cl
-    return cl
+    return Line(cl)
 
 def serializer(obj: object):
     """For ast_debug."""
@@ -1658,17 +1658,554 @@ def get_notbind_type(ast_type: int) -> int:
             return ast_type + 2
 
 
+def resolve_cursor_type_ast(CS: ChangeSetType, cursor) -> tuple[int, Any]:
+    """Resolve a Clang cursor's referenced symbol/type to an AST type ID and relational reference."""
+    if cursor is None:
+        return (ASTT.Undefined, 0)
+
+    try:
+        ref_cursor = getattr(cursor, "referenced", None) or cursor.get_definition()
+    except Exception:
+        ref_cursor = None
+
+    if ref_cursor is None:
+        ref_cursor = cursor
+
+    # Check for function declarations/definitions
+    k = getattr(ref_cursor, "kind", None)
+    if k in (cc.CursorKind.FUNCTION_DECL, cc.CursorKind.CXX_METHOD):
+        spelling = safe_cursor_spelling(ref_cursor)
+        if spelling:
+            op_idx = len(CS.cs)
+            with CS(REF_NO_REF):
+                CS.store(m_ast.get_set(None, spelling, ASTT.C_functionprotnotbind))
+            return (ASTT.C_functionproto, CS.ref(m_ast.ast_id, REF_POS, op_idx))
+
+    # Check for struct member / field declaration
+    if k == cc.CursorKind.FIELD_DECL:
+        spelling = safe_cursor_spelling(ref_cursor)
+        if spelling:
+            op_idx = len(CS.cs)
+            with CS(REF_NO_REF):
+                CS.store(m_ast.get_set(None, spelling, ASTT.C_structnotbind))
+            return (ASTT.C_struct, CS.ref(m_ast.ast_id, REF_POS, op_idx))
+
+    # Check for variable / parameter declaration
+    if k in (cc.CursorKind.VAR_DECL, cc.CursorKind.PARM_DECL):
+        type_obj = getattr(ref_cursor, "type", None)
+        t_spelling = safe_cursor_spelling(ref_cursor)
+        if type_obj is not None:
+            t_kind = getattr(type_obj, "kind", None)
+            if t_kind == cc.TypeKind.INT:
+                return (ASTT.C_int, 0)
+            elif t_kind in (cc.TypeKind.CHAR_S, cc.TypeKind.CHAR_U):
+                return (ASTT.C_char, 0)
+            elif t_kind in (cc.TypeKind.LONG, cc.TypeKind.LONGLONG):
+                return (ASTT.C_long, 0)
+            elif t_kind == cc.TypeKind.SHORT:
+                return (ASTT.C_short, 0)
+            elif t_kind == cc.TypeKind.FLOAT:
+                return (ASTT.C_float, 0)
+            elif t_kind == cc.TypeKind.DOUBLE:
+                return (ASTT.C_double, 0)
+            elif t_kind == cc.TypeKind.BOOL:
+                return (ASTT.C_bool, 0)
+            elif t_kind == cc.TypeKind.VOID:
+                return (ASTT.C_void, 0)
+            elif t_kind == cc.TypeKind.POINTER:
+                return (ASTT.C_pointer, 0)
+            elif t_kind == cc.TypeKind.RECORD:
+                try:
+                    decl_cursor = type_obj.get_declaration()
+                    tag_name = safe_cursor_spelling(decl_cursor) or t_spelling
+                except Exception:
+                    tag_name = t_spelling
+                if tag_name:
+                    op_idx = len(CS.cs)
+                    with CS(REF_NO_REF):
+                        CS.store(m_ast.get_set(None, tag_name, ASTT.C_structnotbind))
+                    return (ASTT.C_struct, CS.ref(m_ast.ast_id, REF_POS, op_idx))
+        return (ASTT.C_DeclRefExpr, 0)
+
+    # Check for struct/union/enum types
+    type_obj = getattr(ref_cursor, "type", None)
+    if type_obj is not None:
+        t_kind = getattr(type_obj, "kind", None)
+        t_spelling = safe_cursor_spelling(ref_cursor)
+        if t_kind == cc.TypeKind.RECORD:
+            try:
+                decl_cursor = type_obj.get_declaration()
+                tag_name = safe_cursor_spelling(decl_cursor) or t_spelling
+            except Exception:
+                tag_name = t_spelling
+            if tag_name:
+                op_idx = len(CS.cs)
+                with CS(REF_NO_REF):
+                    CS.store(m_ast.get_set(None, tag_name, ASTT.C_structnotbind))
+                return (ASTT.C_struct, CS.ref(m_ast.ast_id, REF_POS, op_idx))
+        elif t_kind == cc.TypeKind.ENUM:
+            try:
+                decl_cursor = type_obj.get_declaration()
+                tag_name = safe_cursor_spelling(decl_cursor) or t_spelling
+            except Exception:
+                tag_name = t_spelling
+            if tag_name:
+                op_idx = len(CS.cs)
+                with CS(REF_NO_REF):
+                    CS.store(m_ast.get_set(None, tag_name, ASTT.C_enumnotbind))
+                return (ASTT.C_enum, CS.ref(m_ast.ast_id, REF_POS, op_idx))
+
+    return (ASTT.Undefined, 0)
+
+
+class Ast_Statement(Ast):
+    """Base class for C statement AST nodes."""
+    def __init__(self, extent: Line, name: str = "", end_mode: int = End_Mode.Auto, cursor = None) -> None:
+        self.extent = extent
+        self.name = name
+        self.need_processing = True
+        self.end_mode = end_mode
+        self.cursor = cursor
+        self.operands = []
+        self.zones = []
+        self.call_exprs = []
+        self.member_refs = []
+        self.decl_refs = []
+
+        if cursor is not None:
+            try:
+                compound_kids = [k for k in cursor.get_children() if k.kind == cc.CursorKind.COMPOUND_STMT]
+                if compound_kids:
+                    self.zones.append(Zone(Zone_Type.Compound_Stmt, compound_kids))
+            except Exception:
+                pass
+
+    def within_range(self, token, ast_kind) -> bool:
+        if not self.need_processing:
+            return False
+        tline = token.line
+        tspelling = token.spelling_str
+        if self.end_mode == End_Mode.Extent:
+            if not self.extent.is_inside(tline):
+                self.need_processing = False
+                return False
+            self.extent.grow(tline)
+            return True
+        elif self.end_mode in (End_Mode.Auto, End_Mode.Semicolon):
+            if ast_kind == AST_KIND.punctuation and tspelling == ";":
+                self.extent.grow(tline)
+                self.need_processing = False
+                return True
+        self.extent.grow(tline)
+        return True
+
+    def exec_comment(self, token, cursor):
+        for zone in self.zones:
+            if zone.check_exec(token, cursor, AST_KIND.comment):
+                return
+
+    def exec_punctuation(self, token, cursor):
+        for zone in self.zones:
+            if zone.check_exec(token, cursor, AST_KIND.punctuation):
+                return
+        tspelling = token.spelling_str
+        if tspelling == "{" and not self.zones:
+            self.zones.append(Zone(Zone_Type.Compound_Stmt, (cursor,)))
+            return
+        self.extent.grow(token.line)
+        self.operands.append(tspelling)
+
+    def exec_keyword(self, token, cursor):
+        for zone in self.zones:
+            if zone.check_exec(token, cursor, AST_KIND.keyword):
+                return
+        self.extent.grow(token.line)
+        if not self.name:
+            self.name = token.spelling_str
+        self.operands.append(token.spelling_str)
+
+    def exec_identifier(self, token, cursor):
+        for zone in self.zones:
+            if zone.check_exec(token, cursor, AST_KIND.identifier):
+                return
+        self.extent.grow(token.line)
+        k = getattr(cursor, "kind", None)
+        ref = getattr(cursor, "referenced", None)
+        ref_k = getattr(ref, "kind", None) if ref is not None else None
+
+        if k == cc.CursorKind.CALL_EXPR or ref_k in (cc.CursorKind.FUNCTION_DECL, cc.CursorKind.CXX_METHOD):
+            self.call_exprs.append(Ast_CallExpr(token.line, token.spelling_str))
+            self.call_exprs[-1].callee_cursor = cursor
+        elif k == cc.CursorKind.MEMBER_REF_EXPR or ref_k == cc.CursorKind.FIELD_DECL:
+            self.member_refs.append(Ast_MemberRefExpr(token.line, token.spelling_str))
+            self.member_refs[-1].member_cursor = cursor
+        elif k == cc.CursorKind.DECL_REF_EXPR or ref_k in (cc.CursorKind.VAR_DECL, cc.CursorKind.PARM_DECL):
+            self.decl_refs.append(Ast_DeclRefExpr(token.line, token.spelling_str))
+            self.decl_refs[-1].decl_cursor = cursor
+        self.operands.append(token.spelling_str)
+
+    def exec_literal(self, token, cursor):
+        for zone in self.zones:
+            if zone.check_exec(token, cursor, AST_KIND.literal):
+                return
+        self.extent.grow(token.line)
+        self.operands.append(token.spelling_str)
+
+    def _extract_nested(self, CS: ChangeSetType) -> None:
+        if self.zones:
+            with CS(REF_MULTI):
+                for zone in self.zones:
+                    zone.extract(CS)
+        for call_expr in self.call_exprs:
+            with CS(REF_NO_REF):
+                call_expr.extract(CS)
+        for member_ref in self.member_refs:
+            with CS(REF_NO_REF):
+                member_ref.extract(CS)
+        for decl_ref in self.decl_refs:
+            with CS(REF_NO_REF):
+                decl_ref.extract(CS)
+
+    def extract(self, CS: ChangeSetType) -> None:
+        self._extract_nested(CS)
+        stmt_name = self.name[:255] if self.name else "stmt"
+        self.extract_1arg(CS, ASTT.C_CompoundStmt, stmt_name, self.extent)
+
+
+class Ast_CompoundStmt(Ast_Statement):
+    """type_id ASTT.C_CompoundStmt."""
+    def extract(self, CS: ChangeSetType) -> None:
+        self._extract_nested(CS)
+        self.extract_1arg(CS, ASTT.C_CompoundStmt, "{}", self.extent)
+
+
+class Ast_IfStmt(Ast_Statement):
+    """type_id ASTT.C_IfStmt."""
+    def extract(self, CS: ChangeSetType) -> None:
+        self._extract_nested(CS)
+        self.extract_1arg(CS, ASTT.C_IfStmt, "if", self.extent)
+
+
+class Ast_SwitchStmt(Ast_Statement):
+    """type_id ASTT.C_SwitchStmt."""
+    def extract(self, CS: ChangeSetType) -> None:
+        self._extract_nested(CS)
+        self.extract_1arg(CS, ASTT.C_SwitchStmt, "switch", self.extent)
+
+
+class Ast_CaseStmt(Ast_Statement):
+    """type_id ASTT.C_CaseStmt."""
+    def extract(self, CS: ChangeSetType) -> None:
+        self._extract_nested(CS)
+        self.extract_1arg(CS, ASTT.C_CaseStmt, "case", self.extent)
+
+
+class Ast_DefaultStmt(Ast_Statement):
+    """type_id ASTT.C_DefaultStmt."""
+    def extract(self, CS: ChangeSetType) -> None:
+        self._extract_nested(CS)
+        self.extract_1arg(CS, ASTT.C_DefaultStmt, "default", self.extent)
+
+
+class Ast_WhileStmt(Ast_Statement):
+    """type_id ASTT.C_WhileStmt."""
+    def extract(self, CS: ChangeSetType) -> None:
+        self._extract_nested(CS)
+        self.extract_1arg(CS, ASTT.C_WhileStmt, "while", self.extent)
+
+
+class Ast_DoStmt(Ast_Statement):
+    """type_id ASTT.C_DoStmt."""
+    def extract(self, CS: ChangeSetType) -> None:
+        self._extract_nested(CS)
+        self.extract_1arg(CS, ASTT.C_DoStmt, "do", self.extent)
+
+
+class Ast_ForStmt(Ast_Statement):
+    """type_id ASTT.C_ForStmt."""
+    def extract(self, CS: ChangeSetType) -> None:
+        self._extract_nested(CS)
+        self.extract_1arg(CS, ASTT.C_ForStmt, "for", self.extent)
+
+
+class Ast_ReturnStmt(Ast_Statement):
+    """type_id ASTT.C_ReturnStmt."""
+    def extract(self, CS: ChangeSetType) -> None:
+        self._extract_nested(CS)
+        self.extract_1arg(CS, ASTT.C_ReturnStmt, "return", self.extent)
+
+
+class Ast_BreakStmt(Ast_Statement):
+    """type_id ASTT.C_BreakStmt."""
+    def extract(self, CS: ChangeSetType) -> None:
+        self._extract_nested(CS)
+        self.extract_1arg(CS, ASTT.C_BreakStmt, "break", self.extent)
+
+
+class Ast_ContinueStmt(Ast_Statement):
+    """type_id ASTT.C_ContinueStmt."""
+    def extract(self, CS: ChangeSetType) -> None:
+        self._extract_nested(CS)
+        self.extract_1arg(CS, ASTT.C_ContinueStmt, "continue", self.extent)
+
+
+class Ast_GotoStmt(Ast_Statement):
+    """type_id ASTT.C_GotoStmt."""
+    def extract(self, CS: ChangeSetType) -> None:
+        self._extract_nested(CS)
+        self.extract_1arg(CS, ASTT.C_GotoStmt, "goto", self.extent)
+
+
+class Ast_LabelStmt(Ast_Statement):
+    """type_id ASTT.C_LabelStmt."""
+    def extract(self, CS: ChangeSetType) -> None:
+        self._extract_nested(CS)
+        label_name = self.name[:255] if self.name else "label"
+        self.extract_1arg(CS, ASTT.C_LabelStmt, label_name, self.extent)
+
+
+class Ast_AsmStmt(Ast_Statement):
+    """type_id ASTT.C_AsmStmt."""
+    def extract(self, CS: ChangeSetType) -> None:
+        self._extract_nested(CS)
+        self.extract_1arg(CS, ASTT.C_AsmStmt, "asm", self.extent)
+
+
+class Ast_CallExpr(Ast):
+    """type_id ASTT.C_CallExpr with relational function prototype linking."""
+    def __init__(self, extent: Line, name: str = "", end_mode: int = End_Mode.Auto) -> None:
+        self.extent = extent
+        self.name = name
+        self.need_processing = True
+        self.end_mode = end_mode
+        self.operands = []
+        self.callee_cursor = None
+
+    def within_range(self, token, ast_kind) -> bool:
+        if not self.need_processing:
+            return False
+        tline = token.line
+        tspelling = token.spelling_str
+        if self.end_mode == End_Mode.Extent and not self.extent.is_inside(tline):
+            self.need_processing = False
+            return False
+        elif self.end_mode in (End_Mode.Auto, End_Mode.Semicolon):
+            if ast_kind == AST_KIND.punctuation and tspelling in (";", ","):
+                self.extent.grow(tline)
+                self.need_processing = False
+                return True
+        self.extent.grow(tline)
+        return True
+
+    def exec_identifier(self, token, cursor):
+        self.extent.grow(token.line)
+        if not self.name:
+            self.name = token.spelling_str
+            self.callee_cursor = cursor
+        self.operands.append(token.spelling_str)
+
+    def exec_punctuation(self, token, cursor):
+        self.extent.grow(token.line)
+        self.operands.append(token.spelling_str)
+
+    def exec_keyword(self, token, cursor):
+        self.extent.grow(token.line)
+        self.operands.append(token.spelling_str)
+
+    def exec_literal(self, token, cursor):
+        self.extent.grow(token.line)
+        self.operands.append(token.spelling_str)
+
+    def extract(self, CS: ChangeSetType) -> None:
+        type_const, proto_ref = resolve_cursor_type_ast(CS, self.callee_cursor)
+        call_name = self.name[:255] if self.name else "call"
+
+        container_entries = []
+        if proto_ref != 0:
+            container_entries.extend((None, 0, type_const, proto_ref))
+
+        with CS(REF_POS):
+            if container_entries:
+                CS.store(m_ast.view(
+                    ((m_ast.ast_id, m_ast_container.ast_id, 1),),
+                    None,
+                    call_name,
+                    ASTT.C_CallExpr,
+                    *container_entries,
+                ))
+            else:
+                CS.store(m_ast.view(
+                    ((m_ast.ast_id,),),
+                    None,
+                    call_name,
+                    ASTT.C_CallExpr,
+                ))
+            ast_id_route = CS.get_route_parse()
+
+        with CS(REF_NO_REF):
+            if G.OVERRIDE_FORCE_AST_DEBUG:
+                self.ast_debug(CS, ast_id_route)
+            self.tag(CS, ast_id_route, self.extent)
+
+
+class Ast_MemberRefExpr(Ast):
+    """type_id ASTT.C_MemberRefExpr with relational field/type linking."""
+    def __init__(self, extent: Line, member_name: str = "", end_mode: int = End_Mode.Auto) -> None:
+        self.extent = extent
+        self.member_name = member_name
+        self.need_processing = True
+        self.end_mode = end_mode
+        self.operands = []
+        self.member_cursor = None
+
+    def within_range(self, token, ast_kind) -> bool:
+        if not self.need_processing:
+            return False
+        tline = token.line
+        tspelling = token.spelling_str
+        if self.end_mode == End_Mode.Extent and not self.extent.is_inside(tline):
+            self.need_processing = False
+            return False
+        elif self.end_mode in (End_Mode.Auto, End_Mode.Semicolon):
+            if ast_kind == AST_KIND.punctuation and tspelling in (";", ","):
+                self.extent.grow(tline)
+                self.need_processing = False
+                return True
+        self.extent.grow(tline)
+        return True
+
+    def exec_identifier(self, token, cursor):
+        self.extent.grow(token.line)
+        self.member_name = token.spelling_str
+        self.member_cursor = cursor
+        self.operands.append(token.spelling_str)
+
+    def exec_punctuation(self, token, cursor):
+        self.extent.grow(token.line)
+        self.operands.append(token.spelling_str)
+
+    def exec_keyword(self, token, cursor):
+        self.extent.grow(token.line)
+        self.operands.append(token.spelling_str)
+
+    def exec_literal(self, token, cursor):
+        self.extent.grow(token.line)
+        self.operands.append(token.spelling_str)
+
+    def extract(self, CS: ChangeSetType) -> None:
+        type_const, member_ref = resolve_cursor_type_ast(CS, self.member_cursor)
+        mem_name = self.member_name[:255] if self.member_name else "member"
+
+        container_entries = []
+        if member_ref != 0:
+            container_entries.extend((None, 0, type_const, member_ref))
+
+        with CS(REF_POS):
+            if container_entries:
+                CS.store(m_ast.view(
+                    ((m_ast.ast_id, m_ast_container.ast_id, 1),),
+                    None,
+                    mem_name,
+                    ASTT.C_MemberRefExpr,
+                    *container_entries,
+                ))
+            else:
+                CS.store(m_ast.view(
+                    ((m_ast.ast_id,),),
+                    None,
+                    mem_name,
+                    ASTT.C_MemberRefExpr,
+                ))
+            ast_id_route = CS.get_route_parse()
+
+        with CS(REF_NO_REF):
+            if G.OVERRIDE_FORCE_AST_DEBUG:
+                self.ast_debug(CS, ast_id_route)
+            self.tag(CS, ast_id_route, self.extent)
+
+
+class Ast_DeclRefExpr(Ast):
+    """type_id ASTT.C_DeclRefExpr with relational declaration type linking."""
+    def __init__(self, extent: Line, name: str = "", end_mode: int = End_Mode.Auto) -> None:
+        self.extent = extent
+        self.name = name
+        self.need_processing = True
+        self.end_mode = end_mode
+        self.decl_cursor = None
+
+    def within_range(self, token, ast_kind) -> bool:
+        if not self.need_processing:
+            return False
+        tline = token.line
+        if self.end_mode == End_Mode.Extent and not self.extent.is_inside(tline):
+            self.need_processing = False
+            return False
+        self.extent.grow(tline)
+        return True
+
+    def exec_identifier(self, token, cursor):
+        self.extent.grow(token.line)
+        if not self.name:
+            self.name = token.spelling_str
+            self.decl_cursor = cursor
+
+    def extract(self, CS: ChangeSetType) -> None:
+        type_const, decl_ref = resolve_cursor_type_ast(CS, self.decl_cursor)
+        var_name = self.name[:255] if self.name else "decl_ref"
+
+        container_entries = []
+        if decl_ref != 0:
+            container_entries.extend((None, 0, type_const, decl_ref))
+
+        with CS(REF_POS):
+            if container_entries:
+                CS.store(m_ast.view(
+                    ((m_ast.ast_id, m_ast_container.ast_id, 1),),
+                    None,
+                    var_name,
+                    ASTT.C_DeclRefExpr,
+                    *container_entries,
+                ))
+            else:
+                CS.store(m_ast.view(
+                    ((m_ast.ast_id,),),
+                    None,
+                    var_name,
+                    ASTT.C_DeclRefExpr,
+                ))
+            ast_id_route = CS.get_route_parse()
+
+        with CS(REF_NO_REF):
+            if G.OVERRIDE_FORCE_AST_DEBUG:
+                self.ast_debug(CS, ast_id_route)
+            self.tag(CS, ast_id_route, self.extent)
+
+
+class Ast_BinaryOperator(Ast_Statement):
+    """type_id ASTT.C_BinaryOperator."""
+    def extract(self, CS: ChangeSetType) -> None:
+        self._extract_nested(CS)
+        op_name = self.name[:255] if self.name else "binop"
+        self.extract_1arg(CS, ASTT.C_BinaryOperator, op_name, self.extent)
+
+
+class Ast_UnaryOperator(Ast_Statement):
+    """type_id ASTT.C_UnaryOperator."""
+    def extract(self, CS: ChangeSetType) -> None:
+        self._extract_nested(CS)
+        op_name = self.name[:255] if self.name else "unop"
+        self.extract_1arg(CS, ASTT.C_UnaryOperator, op_name, self.extent)
+
+
 class Not_Implemented(Ast):
     def __init__(self, extent: Line, end_mode: int=End_Mode.Extent) -> None:
         self.extent = extent
         self.end_mode = end_mode
-        # Flag to be set to False once we are past the appropriate extent of the type.
         self.need_processing = True
         self.data = []
         self.brace_depth = 0
 
     def within_range(self, token, ast_kind) -> bool:
-        """Swallow all tokens within compound statement / unhandled block."""
         if not self.need_processing:
             return False
 
@@ -1698,7 +2235,6 @@ class Not_Implemented(Ast):
         return
 
     def extract(self, CS: ChangeSetType) -> None:
-        """Do not emit AST database records for unextracted code blocks."""
         return
 
 
@@ -1995,6 +2531,7 @@ class Zone:
         self.ast_type = C_Type
         self.end_mode = End_Mode.Auto
         self.A_Line_Dict = None
+        self.brace_depth = 1 if zone_type in _BRACE_ZONE_TYPES else 0
 
         if not cursors_array:
             return
@@ -2022,7 +2559,13 @@ class Zone:
         if zone_type == Zone_Type.Compound_Stmt:
             for cursor in cursors_array:
                 self.extent.grow(get_cursor_line(cursor))
-            self.children.append(Not_Implemented(self.extent))
+                try:
+                    for child in cursor.get_children():
+                        child_ext = get_cursor_line(child)
+                        if child_ext.line_pos[0] > 0:
+                            self.preset_extents.append((child_ext, child))
+                except Exception:
+                    pass
 
         elif zone_type == Zone_Type.Enum_Equal:
             for cursor in cursors_array:
@@ -2048,6 +2591,50 @@ class Zone:
         if zone_type == Zone_Type.Enum_Content:
             self.end_mode = End_Mode.Comma
 
+    def _create_child_node(self, cursor, extent: Line) -> Ast:
+        k = getattr(cursor, "kind", None) if cursor is not None else None
+        if k in (cc.CursorKind.DECL_STMT, cc.CursorKind.VAR_DECL):
+            return C_Type(extent, End_Mode.Extent)
+        elif k == cc.CursorKind.IF_STMT:
+            return Ast_IfStmt(extent, end_mode=End_Mode.Extent, cursor=cursor)
+        elif k == cc.CursorKind.SWITCH_STMT:
+            return Ast_SwitchStmt(extent, end_mode=End_Mode.Extent, cursor=cursor)
+        elif k == cc.CursorKind.CASE_STMT:
+            return Ast_CaseStmt(extent, end_mode=End_Mode.Extent, cursor=cursor)
+        elif k == cc.CursorKind.DEFAULT_STMT:
+            return Ast_DefaultStmt(extent, end_mode=End_Mode.Extent, cursor=cursor)
+        elif k == cc.CursorKind.WHILE_STMT:
+            return Ast_WhileStmt(extent, end_mode=End_Mode.Extent, cursor=cursor)
+        elif k == cc.CursorKind.DO_STMT:
+            return Ast_DoStmt(extent, end_mode=End_Mode.Extent, cursor=cursor)
+        elif k == cc.CursorKind.FOR_STMT:
+            return Ast_ForStmt(extent, end_mode=End_Mode.Extent, cursor=cursor)
+        elif k == cc.CursorKind.RETURN_STMT:
+            return Ast_ReturnStmt(extent, end_mode=End_Mode.Extent, cursor=cursor)
+        elif k == cc.CursorKind.BREAK_STMT:
+            return Ast_BreakStmt(extent, end_mode=End_Mode.Extent, cursor=cursor)
+        elif k == cc.CursorKind.CONTINUE_STMT:
+            return Ast_ContinueStmt(extent, end_mode=End_Mode.Extent, cursor=cursor)
+        elif k == cc.CursorKind.GOTO_STMT:
+            return Ast_GotoStmt(extent, end_mode=End_Mode.Extent, cursor=cursor)
+        elif k == cc.CursorKind.LABEL_STMT:
+            return Ast_LabelStmt(extent, end_mode=End_Mode.Extent, cursor=cursor)
+        elif k in (getattr(cc.CursorKind, "ASM_STMT", None), getattr(cc.CursorKind, "MS_ASM_STMT", None)) or (k and getattr(k, "name", "").endswith("ASM_STMT")):
+            return Ast_AsmStmt(extent, end_mode=End_Mode.Extent, cursor=cursor)
+        elif k == cc.CursorKind.CALL_EXPR:
+            return Ast_CallExpr(extent, end_mode=End_Mode.Extent)
+        elif k == cc.CursorKind.MEMBER_REF_EXPR:
+            return Ast_MemberRefExpr(extent, end_mode=End_Mode.Extent)
+        elif k == cc.CursorKind.DECL_REF_EXPR:
+            return Ast_DeclRefExpr(extent, end_mode=End_Mode.Extent)
+        elif k == cc.CursorKind.BINARY_OPERATOR:
+            return Ast_BinaryOperator(extent, end_mode=End_Mode.Extent, cursor=cursor)
+        elif k == cc.CursorKind.UNARY_OPERATOR:
+            return Ast_UnaryOperator(extent, end_mode=End_Mode.Extent, cursor=cursor)
+        elif k == cc.CursorKind.COMPOUND_STMT:
+            return Ast_CompoundStmt(extent, end_mode=End_Mode.Extent, cursor=cursor)
+        return self.ast_type(extent, End_Mode.Extent)
+
     def check_exec(self, token, cursor, ast_kind):
         """Check if extent is part of Zone and exec if needed. Return True on exec."""
         if self.completed:
@@ -2061,17 +2648,6 @@ class Zone:
             self.children.append(Ast_Comment(tline, tspelling))
             return True
 
-        if ast_kind == AST_KIND.punctuation and tspelling == "}":
-            if self.zone_type in _BRACE_ZONE_TYPES:
-                self.extent.grow(tline)
-                self.preset_extents.clear()
-                self.completed = True
-                return True
-
-        if (not self.extent.is_inside(tline)) and (self.zone_type != Zone_Type.Full_File):
-            if not (self.children and self.children[-1].need_processing):
-                return False
-
         # Fast path, the last children added
         if self.children:
             last_child = self.children[-1]
@@ -2084,6 +2660,21 @@ class Zone:
                     last_child.need_processing = True
                     last_child.exec_filter(token, cursor, ast_kind)
                     return True
+
+        if ast_kind == AST_KIND.punctuation:
+            if tspelling == "{":
+                self.brace_depth += 1
+            elif tspelling == "}":
+                self.brace_depth -= 1
+                if self.zone_type in _BRACE_ZONE_TYPES and self.brace_depth <= 0:
+                    self.extent.grow(tline)
+                    self.preset_extents.clear()
+                    self.completed = True
+                    return True
+
+        if (not self.extent.is_inside(tline)) and (self.zone_type != Zone_Type.Full_File):
+            if not (self.children and self.children[-1].need_processing):
+                return False
 
         if ast_kind == AST_KIND.punctuation:
             # Commonly found between extents, Processing not needed.
@@ -2102,22 +2693,73 @@ class Zone:
                 self.children.append(Ast_ASM_Directive(tline, "."))
                 return True
 
-        # Guard against statement keywords outside type declarations
-        if ast_kind == AST_KIND.keyword and tspelling in _KEYWORD_IGNORED:
-            return True
-
         # Check for valid preset_extents
         if self.preset_extents:
-            while self.preset_extents and self.preset_extents[0].line_pos[1] < tline.line_pos[0]:
+            while self.preset_extents and (self.preset_extents[0][0] if isinstance(self.preset_extents[0], tuple) else self.preset_extents[0]).line_pos[1] < tline.line_pos[0]:
                 self.preset_extents.popleft()
 
-            for i, p_extent in enumerate(self.preset_extents):
+            for i, p_item in enumerate(self.preset_extents):
+                p_extent = p_item[0] if isinstance(p_item, tuple) else p_item
+                p_cursor = p_item[1] if isinstance(p_item, tuple) else cursor
                 if p_extent.is_inside(tline):
-                    # Quick reminder that libclang won't give us the extent of CPPros here...
-                    self.children.append(self.ast_type(p_extent, End_Mode.Extent))
+                    node = self._create_child_node(p_cursor, p_extent)
+                    self.children.append(node)
                     self.children[-1].exec_filter(token, cursor, ast_kind)
-
                     del self.preset_extents[i]
+                    return True
+
+        # Check statement keywords
+        if ast_kind == AST_KIND.keyword:
+            match tspelling:
+                case "if":
+                    self.children.append(Ast_IfStmt(tline))
+                    self.children[-1].exec_keyword(token, cursor)
+                    return True
+                case "return":
+                    self.children.append(Ast_ReturnStmt(tline))
+                    self.children[-1].exec_keyword(token, cursor)
+                    return True
+                case "while":
+                    self.children.append(Ast_WhileStmt(tline))
+                    self.children[-1].exec_keyword(token, cursor)
+                    return True
+                case "for":
+                    self.children.append(Ast_ForStmt(tline))
+                    self.children[-1].exec_keyword(token, cursor)
+                    return True
+                case "do":
+                    self.children.append(Ast_DoStmt(tline))
+                    self.children[-1].exec_keyword(token, cursor)
+                    return True
+                case "switch":
+                    self.children.append(Ast_SwitchStmt(tline))
+                    self.children[-1].exec_keyword(token, cursor)
+                    return True
+                case "case":
+                    self.children.append(Ast_CaseStmt(tline))
+                    self.children[-1].exec_keyword(token, cursor)
+                    return True
+                case "default":
+                    self.children.append(Ast_DefaultStmt(tline))
+                    self.children[-1].exec_keyword(token, cursor)
+                    return True
+                case "break":
+                    self.children.append(Ast_BreakStmt(tline))
+                    self.children[-1].exec_keyword(token, cursor)
+                    return True
+                case "continue":
+                    self.children.append(Ast_ContinueStmt(tline))
+                    self.children[-1].exec_keyword(token, cursor)
+                    return True
+                case "goto":
+                    self.children.append(Ast_GotoStmt(tline))
+                    self.children[-1].exec_keyword(token, cursor)
+                    return True
+                case "asm" | "__asm__" | "__asm":
+                    self.children.append(Ast_AsmStmt(tline))
+                    self.children[-1].exec_keyword(token, cursor)
+                    return True
+                case "_Static_assert" | "static_assert":
                     return True
 
         self.children.append(self.ast_type(tline, self.end_mode))
@@ -2643,9 +3285,8 @@ class C_Type(Ast):
         tspelling = token.spelling_str
         for zone in self.zones:
             if zone.check_exec(token, cursor, AST_KIND.punctuation):
-                if tspelling == "}" and zone.zone_type == Zone_Type.Compound_Stmt:
-                    if not any(ch.need_processing for ch in zone.children):
-                        self.need_processing = False
+                if tspelling == "}" and zone.zone_type == Zone_Type.Compound_Stmt and zone.completed:
+                    self.need_processing = False
                 return
 
         match tspelling:
