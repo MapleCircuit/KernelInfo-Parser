@@ -451,6 +451,14 @@ The C AST parser generates and references records across 8 core database tables:
    CS.store(m_bridge_map.set(tag_ref, tag_ref))
    ```
 
+### 10.2. Tag Extent & Delimiter Encapsulation Protocol
+
+To guarantee 100.00% exact character code coverage and zero orphaned characters between AST tags:
+1. **Semicolons (`;`)**: Encapsulated in `C_Type.within_range` on `End_Mode.Auto`, `End_Mode.Semicolon`, and `End_Mode.Extent` before terminating processing.
+2. **Closing Braces (`}`)**: Encapsulated in `Zone.check_exec` by growing `self.children[-1].extent.grow(tline)` when closing `_BRACE_ZONE_TYPES` (`Declared_Args`, `Enum_Content`, `Compound_Stmt`).
+3. **Inter-Node Punctuation (`_PUNCT_IGNORED`)**: Delimiters in `{";", ",", ")", "}"}` occurring between child nodes in a zone are absorbed into the preceding AST node extent.
+4. **Macro Continuation Backslashes (`\`)**: Encapsulated in `CPPro_define.extract` by expanding `self.extent.char_pos[1]` when `line_str.rstrip().endswith("\\")`.
+
 ---
 
 ## 11. Critical Invariants & AI Development Guidelines
@@ -462,3 +470,6 @@ The C AST parser generates and references records across 8 core database tables:
 5. **Deduplication Key Ordering**: For all `m_ast.get_set` or `no_duplicate` lookups, column arguments must match canonical table schemas exactly (`(None, name, type_id)` for `m_ast`).
 6. **No-Op Exact Renames**: When `CS.file_operation == "R100"`, `c_ast_parse()` must return immediately to avoid generating duplicate AST tags.
 7. **Testing Command Rule**: When validating AST parser changes, execute `python3 -m unittest tests/test_c_ast.py` and run `python3 main.py -u` once.
+8. **Line Splitting & Form Feed Invariant**: Libclang strictly treats `\r\n` and `\n` as newlines and `\x0c` (ASCII Form Feed) as in-line whitespace. Python's `str.splitlines()` splits on `\x0c`, which desynchronizes line indices on files containing form-feed characters (such as `arch/powerpc/xmon/ppc-opc.c`). Always use `raw_content.replace("\r\n", "\n").split("\n")` for 1:1 line index parity with Libclang.
+9. **Default Tag Fidelity & Coverage**: The test runner (`python3 -m tests.test_c_ast` and `python3 main.py -u`) enforces tag fidelity and source code coverage auditing by default (`-f / --fidelity`), requiring 100.00% character coverage and 0 text mismatches across all benchmark targets.
+

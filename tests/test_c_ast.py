@@ -29,6 +29,9 @@ from core.DBLayout import (
     m_file_name,
     m_file,
     m_bridge_file,
+    m_tag,
+    m_bridge_tag,
+    m_ast,
 )
 from table_engine import TEDirectDB, TECachedDB, get_table_engine
 from db_engine import MockDB, MariaDB
@@ -39,42 +42,42 @@ from parser.c_ast.c_ast_type import safe_spelling, safe_cursor_spelling
 TEST_SUITE: list[dict[str, Any]] = [
     {
         "file": "include/linux/drbd_tag_magic.h",
-        "baseline_ast_ops": 442,
+        "baseline_ast_ops": 265,
         "description": "Kernel Header (drbd_tag_magic.h)",
     },
     {
         "file": "virt/kvm/iodev.h",
-        "baseline_ast_ops": 408,
+        "baseline_ast_ops": 395,
         "description": "Kernel Header (virt/kvm/iodev.h)",
     },
     {
         "file": "include/linux/lockd/bind.h",
-        "baseline_ast_ops": 217,
+        "baseline_ast_ops": 220,
         "description": "Kernel Header (lockd/bind.h)",
     },
     {
         "file": "include/linux/netfilter_bridge/ebtables.h",
-        "baseline_ast_ops": 1567,
+        "baseline_ast_ops": 1479,
         "description": "Kernel Header (ebtables.h)",
     },
     {
         "file": "drivers/watchdog/w83627hf_wdt.c",
-        "baseline_ast_ops": 1787,
+        "baseline_ast_ops": 1789,
         "description": "Watchdog Driver (Latin-1 byte 0xe1 resilience)",
     },
     {
         "file": "drivers/usb/storage/isd200.c",
-        "baseline_ast_ops": 6879,
+        "baseline_ast_ops": 8452,
         "description": "USB Storage Driver (Latin-1 byte 0xf6 resilience)",
     },
     {
         "file": "include/linux/sched.h",
-        "baseline_ast_ops": 13725,
+        "baseline_ast_ops": 13085,
         "description": "Kernel Header (sched.h)",
     },
     {
         "file": "arch/mips/include/asm/mach-cavium-octeon/kernel-entry-init.h",
-        "baseline_ast_ops": 140,
+        "baseline_ast_ops": 70,
         "description": "Assembly Header (kernel-entry-init.h)",
     },
     {
@@ -84,7 +87,7 @@ TEST_SUITE: list[dict[str, Any]] = [
     },
     {
         "file": "arch/powerpc/xmon/ppc-opc.c",
-        "baseline_ast_ops": 79553,
+        "baseline_ast_ops": 7296,
         "description": "PowerPC Opcode Table & Large Initializer Array (ppc-opc.c)",
     },
 ]
@@ -121,6 +124,7 @@ def run_single_file_worker(item: dict[str, Any]) -> dict[str, Any]:
     temp_dir = None
     try:
         # Isolated in-memory DB per worker
+        MockDB._global_store.clear()
         G.DEBUG_TYPECHECK = True
         G.DB = MockDB
         te_choice = item.get("table_engine", "cached")
@@ -161,6 +165,79 @@ def run_single_file_worker(item: dict[str, Any]) -> dict[str, Any]:
         t_exec = time.time()
         exec_ok = cs.execute()
         exec_time = time.time() - t_exec
+        G.TE.commit_all()
+
+        # Compute tag text fidelity and source code coverage metrics
+        raw_lines = file_content.decode("latin-1").replace("\r\n", "\n").split("\n")
+
+        mock_tags = MockDB._global_store.get("m_tag", {})
+        mock_bridge = MockDB._global_store.get("m_bridge_tag", {})
+        tag_map = {row[0]: row for row in mock_tags.values()}
+
+        mismatches_count = 0
+        zero_extent_tags = 0
+        covered_char_mask = [[False] * len(line) for line in raw_lines]
+
+        for b_pk, b_row in mock_bridge.items():
+            fid, tag_id, line_s, line_e, char_s, char_e = b_row
+            tag_row = tag_map.get(tag_id)
+            if not tag_row:
+                continue
+            tag_code = tag_row[3]
+
+            if line_s == 0 and line_e == 0:
+                zero_extent_tags += 1
+                continue
+
+            # Slice raw file using 1-based start inclusive, end exclusive coordinates
+            if line_s == line_e:
+                if 1 <= line_s <= len(raw_lines):
+                    line_str = raw_lines[line_s - 1]
+                    s_idx = max(0, char_s - 1)
+                    e_idx = min(len(line_str), char_e - 1) if char_e > 0 else len(line_str)
+                    raw_slice = line_str[s_idx:e_idx]
+                    for c in range(s_idx, e_idx):
+                        covered_char_mask[line_s - 1][c] = True
+                else:
+                    raw_slice = ""
+            else:
+                slices = []
+                for l in range(line_s, line_e + 1):
+                    if 1 <= l <= len(raw_lines):
+                        line_str = raw_lines[l - 1]
+                        if l == line_s:
+                            s_idx = max(0, char_s - 1)
+                            slices.append(line_str[s_idx:])
+                            for c in range(s_idx, len(line_str)):
+                                covered_char_mask[l - 1][c] = True
+                        elif l == line_e:
+                            e_idx = min(len(line_str), char_e - 1) if char_e > 0 else len(line_str)
+                            slices.append(line_str[:e_idx])
+                            for c in range(0, e_idx):
+                                covered_char_mask[l - 1][c] = True
+                        else:
+                            slices.append(line_str)
+                            for c in range(len(line_str)):
+                                covered_char_mask[l - 1][c] = True
+                raw_slice = "\n".join(slices)
+
+            # Compare tag code vs raw source slice
+            match_exact = (tag_code == raw_slice)
+            match_trimmed = (tag_code.rstrip(",; \t\r\n") == raw_slice.rstrip(",; \t\r\n"))
+            if not (match_exact or match_trimmed):
+                mismatches_count += 1
+
+        total_non_ws = sum(len([c for c in line if not c.isspace()]) for line in raw_lines)
+        uncovered_non_ws = 0
+        uncovered_samples: list[str] = []
+        for l_idx, (line, mask) in enumerate(zip(raw_lines, covered_char_mask)):
+            un_text = "".join(c for c, m in zip(line, mask) if not m and not c.isspace())
+            if un_text:
+                uncovered_non_ws += len(un_text)
+                if len(uncovered_samples) < 3:
+                    uncovered_samples.append(f"Line {l_idx + 1}: '{un_text[:40]}' (in: {line.strip()[:50]})")
+
+        coverage_ratio = (total_non_ws - uncovered_non_ws) / max(1, total_non_ws)
 
         elapsed = time.time() - t0
         return {
@@ -171,6 +248,12 @@ def run_single_file_worker(item: dict[str, Any]) -> dict[str, Any]:
             "delta": actual_total_ops - baseline_total_ops,
             "execute_success": exec_ok,
             "results_count": len(cs.cs_result),
+            "total_tags": len(mock_tags),
+            "zero_extent_tags": zero_extent_tags,
+            "mismatches_count": mismatches_count,
+            "coverage_ratio": coverage_ratio,
+            "uncovered_non_ws": uncovered_non_ws,
+            "uncovered_samples": uncovered_samples,
             "elapsed_s": elapsed,
             "exec_time_s": exec_time,
             "profiler": cs.profiler.to_dict() if cs.profiler else None,
@@ -186,6 +269,12 @@ def run_single_file_worker(item: dict[str, Any]) -> dict[str, Any]:
             "delta": 0,
             "execute_success": False,
             "results_count": 0,
+            "total_tags": 0,
+            "zero_extent_tags": 0,
+            "mismatches_count": 0,
+            "coverage_ratio": 0.0,
+            "uncovered_non_ws": 0,
+            "uncovered_samples": [],
             "elapsed_s": elapsed,
             "exec_time_s": 0,
             "profiler": None,
@@ -256,7 +345,7 @@ class TestCASTParser(unittest.TestCase):
         """Verify parsing and ChangeSet execution with TEDirectDB."""
         item = {
             "file": "virt/kvm/iodev.h",
-            "baseline_ast_ops": 408,
+            "baseline_ast_ops": 395,
             "description": "Kernel Header (virt/kvm/iodev.h)",
             "table_engine": "direct",
         }
@@ -774,17 +863,278 @@ struct task_struct {
             if temp_dir and os.path.exists(temp_dir):
                 shutil.rmtree(temp_dir, ignore_errors=True)
 
+    def test_tag_fidelity_sched_h(self) -> None:
+        """Verify full tag text fidelity and 100% source code coverage on linux/include/linux/sched.h."""
+        res = assert_file_tag_fidelity("include/linux/sched.h", min_coverage=1.0)
+        self.assertEqual(res["mismatches_count"], 0)
+        self.assertEqual(res["uncovered_non_ws"], 0)
+        self.assertEqual(res["coverage_ratio"], 1.0)
+        self.assertGreater(res["total_tags"], 2000)
+
+    def test_tag_fidelity_drbd_magic(self) -> None:
+        """Verify tag text fidelity on include/linux/drbd_tag_magic.h."""
+        res = assert_file_tag_fidelity("include/linux/drbd_tag_magic.h", min_coverage=1.0)
+        self.assertEqual(res["mismatches_count"], 0)
+        self.assertEqual(res["uncovered_non_ws"], 0)
+        self.assertEqual(res["coverage_ratio"], 1.0)
+
+    def test_tag_fidelity_kvm_iodev(self) -> None:
+        """Verify tag text fidelity on virt/kvm/iodev.h."""
+        res = assert_file_tag_fidelity("virt/kvm/iodev.h", min_coverage=1.0)
+        self.assertEqual(res["mismatches_count"], 0)
+        self.assertEqual(res["uncovered_non_ws"], 0)
+        self.assertEqual(res["coverage_ratio"], 1.0)
+
+    def test_tag_fidelity_lockd_bind(self) -> None:
+        """Verify tag text fidelity on include/linux/lockd/bind.h."""
+        res = assert_file_tag_fidelity("include/linux/lockd/bind.h", min_coverage=1.0)
+        self.assertEqual(res["mismatches_count"], 0)
+        self.assertEqual(res["uncovered_non_ws"], 0)
+        self.assertEqual(res["coverage_ratio"], 1.0)
+
+    def test_tag_fidelity_ppc_opc(self) -> None:
+        """Verify tag text fidelity on arch/powerpc/xmon/ppc-opc.c."""
+        res = assert_file_tag_fidelity("arch/powerpc/xmon/ppc-opc.c", min_coverage=1.0)
+        self.assertEqual(res["mismatches_count"], 0)
+        self.assertEqual(res["uncovered_non_ws"], 0)
+        self.assertEqual(res["coverage_ratio"], 1.0)
+
+    def test_tag_fidelity_ebtables(self) -> None:
+        """Verify tag text fidelity on include/linux/netfilter_bridge/ebtables.h."""
+        res = assert_file_tag_fidelity("include/linux/netfilter_bridge/ebtables.h", min_coverage=1.0)
+        self.assertEqual(res["mismatches_count"], 0)
+        self.assertEqual(res["uncovered_non_ws"], 0)
+        self.assertEqual(res["coverage_ratio"], 1.0)
+
+    def test_tag_fidelity_watchdog(self) -> None:
+        """Verify tag text fidelity on drivers/watchdog/w83627hf_wdt.c."""
+        res = assert_file_tag_fidelity("drivers/watchdog/w83627hf_wdt.c", min_coverage=1.0)
+        self.assertEqual(res["mismatches_count"], 0)
+        self.assertEqual(res["uncovered_non_ws"], 0)
+        self.assertEqual(res["coverage_ratio"], 1.0)
+
+    def test_tag_fidelity_isd200(self) -> None:
+        """Verify tag text fidelity on drivers/usb/storage/isd200.c."""
+        res = assert_file_tag_fidelity("drivers/usb/storage/isd200.c", min_coverage=1.0)
+        self.assertEqual(res["mismatches_count"], 0)
+        self.assertEqual(res["uncovered_non_ws"], 0)
+        self.assertEqual(res["coverage_ratio"], 1.0)
+
+
+
+
+
+def assert_file_tag_fidelity(
+    file_path: str,
+    min_coverage: float = 0.99,
+) -> dict[str, Any]:
+    """Audit every created AST tag against the raw source file.
+    
+    Verifies:
+    1. Every tag in m_bridge_tag has valid coordinates within file boundaries.
+    2. Slicing the raw source file with (line_s, line_e, char_s, char_e) matches m_tag.code
+       (accounting for delimiter alignment on declarations and enum items).
+    3. Non-whitespace character coverage across the file meets or exceeds `min_coverage`.
+    
+    Args:
+        file_path: Relative repository file path (e.g. 'include/linux/sched.h').
+        min_coverage: Minimum acceptable ratio of non-whitespace source characters tagged.
+        
+    Returns:
+        Dictionary containing audit statistics and fidelity metrics.
+    """
+    MockDB._global_store.clear()
+    G.DEBUG_TYPECHECK = True
+    G.DB = MockDB
+    G.TE = TECachedDB()
+    gp = GreatProcessor()
+    init_db_layout(gp)
+    G.TE.start(gp.Table_Array, G.DB)
+
+    mf = MasterFile()
+    temp_dir = mf.create_temp_dir()
+    mf.version_dict["v3.0"] = temp_dir
+    G.MF = mf
+    gp.Version_Name = "v3.0"
+    gp.VID = 1
+
+    try:
+        full_path = os.path.join(temp_dir, file_path)
+        os.makedirs(os.path.dirname(full_path), exist_ok=True)
+        file_content_bytes = subprocess.check_output(
+            ["git", "-C", "linux", "show", f"v3.0:{file_path}"],
+            stderr=subprocess.PIPE,
+        )
+        with open(full_path, "wb") as f:
+            f.write(file_content_bytes)
+
+        raw_lines = file_content_bytes.decode("latin-1").replace("\r\n", "\n").split("\n")
+
+        cs = ChangeSet(f"A\t{file_path}")
+        cs.current_vid = 1
+        cs.gp = gp
+        cs.mf = mf
+        G.CURRENT_PARSING_FILE = file_path
+
+        default_processing(cs, gp)
+        cs.parse()
+        exec_ok = cs.execute()
+        G.TE.commit_all()
+
+        if not exec_ok:
+            raise AssertionError(f"CS.execute() failed for {file_path}")
+
+        mock_tags = MockDB._global_store.get("m_tag", {})
+        mock_bridge = MockDB._global_store.get("m_bridge_tag", {})
+        tag_map = {row[0]: row for row in mock_tags.values()}
+
+        mismatches: list[dict[str, Any]] = []
+        zero_extent_tags = 0
+        covered_char_mask = [[False] * len(line) for line in raw_lines]
+
+        for b_pk, b_row in mock_bridge.items():
+            fid, tag_id, line_s, line_e, char_s, char_e = b_row
+            tag_row = tag_map.get(tag_id)
+            if not tag_row:
+                continue
+            tag_code = tag_row[3]
+
+            if line_s == 0 and line_e == 0:
+                zero_extent_tags += 1
+                continue
+
+            # Slice raw file using 1-based start inclusive, end exclusive coordinates
+            if line_s == line_e:
+                if 1 <= line_s <= len(raw_lines):
+                    line_str = raw_lines[line_s - 1]
+                    s_idx = max(0, char_s - 1)
+                    e_idx = min(len(line_str), char_e - 1) if char_e > 0 else len(line_str)
+                    raw_slice = line_str[s_idx:e_idx]
+                    for c in range(s_idx, e_idx):
+                        covered_char_mask[line_s - 1][c] = True
+                else:
+                    raw_slice = ""
+            else:
+                slices = []
+                for l in range(line_s, line_e + 1):
+                    if 1 <= l <= len(raw_lines):
+                        line_str = raw_lines[l - 1]
+                        if l == line_s:
+                            s_idx = max(0, char_s - 1)
+                            slices.append(line_str[s_idx:])
+                            for c in range(s_idx, len(line_str)):
+                                covered_char_mask[l - 1][c] = True
+                        elif l == line_e:
+                            e_idx = min(len(line_str), char_e - 1) if char_e > 0 else len(line_str)
+                            slices.append(line_str[:e_idx])
+                            for c in range(0, e_idx):
+                                covered_char_mask[l - 1][c] = True
+                        else:
+                            slices.append(line_str)
+                            for c in range(len(line_str)):
+                                covered_char_mask[l - 1][c] = True
+                raw_slice = "\n".join(slices)
+
+            # Compare tag code vs raw source slice
+            match_exact = (tag_code == raw_slice)
+            match_trimmed = (tag_code.rstrip(",; \t\r\n") == raw_slice.rstrip(",; \t\r\n"))
+            if not (match_exact or match_trimmed):
+                mismatches.append({
+                    "tag_id": tag_id,
+                    "coords": (line_s, line_e, char_s, char_e),
+                    "tag_code": tag_code,
+                    "raw_slice": raw_slice,
+                })
+
+        total_non_ws = sum(len([c for c in line if not c.isspace()]) for line in raw_lines)
+        uncovered_non_ws = 0
+        uncovered_lines: list[tuple[int, str, str]] = []
+        for l_idx, (line, mask) in enumerate(zip(raw_lines, covered_char_mask)):
+            un_text = "".join(c for c, m in zip(line, mask) if not m and not c.isspace())
+            if un_text:
+                uncovered_non_ws += len(un_text)
+                uncovered_lines.append((l_idx + 1, un_text, line.strip()))
+
+        coverage_ratio = (total_non_ws - uncovered_non_ws) / max(1, total_non_ws)
+
+        if mismatches:
+            sample_mismatches = mismatches[:3]
+            raise AssertionError(
+                f"Tag text mismatch detected in {file_path} ({len(mismatches)} mismatches). Samples: {sample_mismatches}"
+            )
+
+        if coverage_ratio < min_coverage:
+            raise AssertionError(
+                f"Tag coverage ratio {coverage_ratio:.4f} below threshold {min_coverage:.4f} for {file_path} "
+                f"({uncovered_non_ws} uncovered non-whitespace characters across {len(uncovered_lines)} lines)."
+            )
+
+        return {
+            "file": file_path,
+            "execute_success": exec_ok,
+            "total_tags": len(mock_tags),
+            "total_bridge": len(mock_bridge),
+            "zero_extent_tags": zero_extent_tags,
+            "mismatches_count": len(mismatches),
+            "coverage_ratio": coverage_ratio,
+            "uncovered_non_ws": uncovered_non_ws,
+        }
+
+    finally:
+        if temp_dir and os.path.exists(temp_dir):
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+
+def format_fidelity_table(results: list[dict[str, Any]]) -> str:
+    """Format a clean colorized report table summarizing tag fidelity and code coverage."""
+    lines = [
+        "",
+        COLOR.cyan("=" * 105),
+        COLOR.cyan("                    TAG TEXT & RAW SOURCE FIDELITY AUDIT REPORT"),
+        COLOR.cyan("=" * 105),
+        f"{'Target File':<42} | {'Tags':>6} | {'Mismatches':>10} | {'Coverage':>8} | {'Uncovered':>9} | {'Fidelity':<8}",
+        COLOR.cyan("-" * 105),
+    ]
+    for r in results:
+        file_display = r["file"]
+        if len(file_display) > 42:
+            file_display = "..." + file_display[-39:]
+        tags_cnt = r.get("total_tags", 0)
+        mismatches = r.get("mismatches_count", 0)
+        cov_pct = r.get("coverage_ratio", 0.0) * 100.0
+        uncovered = r.get("uncovered_non_ws", 0)
+
+        if mismatches == 0 and cov_pct >= 99.0:
+            status_str = COLOR.green("PASS")
+            mismatches_str = COLOR.green("0")
+        elif mismatches == 0:
+            status_str = COLOR.yellow("PASS (COV)")
+            mismatches_str = COLOR.green("0")
+        else:
+            status_str = COLOR.red("FAIL")
+            mismatches_str = COLOR.red(str(mismatches))
+
+        lines.append(
+            f"{file_display:<42} | {tags_cnt:>6} | {mismatches_str:>19} | {cov_pct:>7.2f}% | {uncovered:>9} | {status_str:<17}"
+        )
+    lines.append(COLOR.cyan("=" * 105))
+    return "\n".join(lines)
+
 
 def run_c_ast_tests(
     target_file: str | None = None,
     profile: bool = False,
+    fidelity: bool = True,
     table_engine: str = "cached",
 ) -> int:
+
     """Programmatic multi-core test runner invoked via CLI in main.py.
     
     Args:
         target_file: Optional single file path to test.
         profile: Whether to collect and print granular stage profiler breakdowns.
+        fidelity: Whether to print detailed tag text and source code fidelity audit.
         table_engine: Table engine variant ('cached' or 'direct').
         
     Returns:
@@ -803,9 +1153,10 @@ def run_c_ast_tests(
     print(f"Backend:     {COLOR.magenta('In-Memory MockDB (Isolated)')}")
     print(f"TableEngine: {COLOR.magenta(te_display.capitalize())}")
     if G.PROFILING_ENABLED:
-        print(f"Profiler:    {COLOR.green('ACTIVE (-p / --profile)')}\n")
-    else:
-        print()
+        print(f"Profiler:    {COLOR.green('ACTIVE (-p / --profile)')}")
+    if fidelity:
+        print(f"Fidelity:    {COLOR.green('ACTIVE (-f / --fidelity)')}")
+    print()
 
     start_time = time.time()
 
@@ -823,6 +1174,17 @@ def run_c_ast_tests(
             print(COLOR.green(f"\n[+] PASS: {target_file}"))
             print(f"    - Operations Staged:    {res['actual_total_ops']:,}")
             print(f"    - CS.execute():         {COLOR.green('SUCCESS')}")
+            print(f"    - AST Tags Created:     {res.get('total_tags', 0):,}")
+            mismatches = res.get("mismatches_count", 0)
+            mismatch_str = COLOR.green("0") if mismatches == 0 else COLOR.red(str(mismatches))
+            print(f"    - Tag Text Mismatches:  {mismatch_str}")
+            cov_pct = res.get("coverage_ratio", 0.0) * 100.0
+            cov_str = COLOR.green(f"{cov_pct:.2f}%") if cov_pct >= 99.0 else COLOR.yellow(f"{cov_pct:.2f}%")
+            print(f"    - Source Code Coverage: {cov_str} ({res.get('uncovered_non_ws', 0)} uncovered non-whitespace chars)")
+            if res.get("uncovered_samples"):
+                print("    - Uncovered Samples:")
+                for s in res["uncovered_samples"]:
+                    print(f"        * {s}")
             print(f"    - Execution Time:       {elapsed:.2f}s\n")
             if res.get("profiler"):
                 from core.Profiler import PipelineProfiler, format_profiling_report
@@ -890,6 +1252,9 @@ def run_c_ast_tests(
         print(COLOR.yellow("[*] NOTE: Operation count deltas detected."))
         print("    Length changes reflect AST optimization / output changes and are tracked for review.\n")
 
+    if fidelity:
+        print(format_fidelity_table(results))
+
     if G.PROFILING_ENABLED and profiler_list:
         from core.Profiler import format_profiling_report
         print(format_profiling_report(profiler_list, title="MULTI-CORE PIPELINE STAGE TIMING BREAKDOWN"))
@@ -909,6 +1274,9 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="C-AST Parser Test Suite")
     parser.add_argument("target_file", nargs="?", default=None, help="Target file to parse")
     parser.add_argument("-p", "--profile", action="store_true", help="Enable granular stage timing profiler")
+    parser.add_argument("-f", "--fidelity", action="store_true", default=True, help="Display full tag text & source code fidelity audit report (default: True)")
+    parser.add_argument("--no-fidelity", dest="fidelity", action="store_false", help="Disable tag text & source code fidelity audit report")
+
     parser.add_argument(
         "--te", "--table-engine",
         dest="table_engine",
@@ -917,4 +1285,10 @@ if __name__ == "__main__":
         help="Select Table Engine architecture backend (default: cached)",
     )
     args = parser.parse_args()
-    sys.exit(run_c_ast_tests(target_file=args.target_file, profile=args.profile, table_engine=args.table_engine))
+    sys.exit(run_c_ast_tests(
+        target_file=args.target_file,
+        profile=args.profile,
+        fidelity=args.fidelity,
+        table_engine=args.table_engine,
+    ))
+

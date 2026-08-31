@@ -610,10 +610,12 @@ class Ast:
 
 class Ast_Comment(Ast):
     """type_id ASTT.C_Comment."""
+    need_processing: bool = False
 
     def __init__(self, extent: Line, comment: str = "") -> None:
         self.extent = extent
         self.comment = comment
+        self.need_processing = False
 
     def within_range(self, token, ast_kind) -> bool:
         return False
@@ -1225,6 +1227,17 @@ class CPPro_define(Ast):
 
     def extract(self, CS: ChangeSetType) -> None:
         """Passthrough to AST.extract_1arg."""
+        parser_obj = CS.parsers.get("C_AM") or CS.parsers.get("ASM_AM")
+        if parser_obj and hasattr(parser_obj, "rawfile"):
+            end_line_idx = self.extent.line_pos[1] - 1
+            if 0 <= end_line_idx < len(parser_obj.rawfile):
+                line_str = parser_obj.rawfile[end_line_idx]
+                r_line = line_str.rstrip()
+                if r_line.endswith("\\"):
+                    end_col = len(r_line) + 1
+                    if end_col > self.extent.char_pos[1]:
+                        self.extent.char_pos = (self.extent.char_pos[0], end_col)
+
         if self.replacement is None or self.replacement == "":
             # Empty define
             self.extract_1arg(CS, ASTT.CPPro_define, self.identifier, self.extent)
@@ -1232,6 +1245,7 @@ class CPPro_define(Ast):
 
         self.extract_1arg(CS, ASTT.CPPro_define_macro, self.identifier, self.extent)
         return
+
 
 
 class CPPro_undef(Ast):
@@ -2232,16 +2246,22 @@ class AST_Enum_Equal(AST_Expression):
         self.need_processing = True
         self.data = []
 
+    def within_range(self, token, ast_kind) -> bool:
+        if not self.need_processing:
+            return False
+        if ast_kind == AST_KIND.punctuation:
+            if token.spelling_str in ("}", ","):
+                self.need_processing = False
+                return False
+        self.extent.grow(token.line)
+        return True
+
     def exec_filter(self, token, cursor, ast_kind):
         if ast_kind == AST_KIND.comment:
             return
-        if ast_kind == AST_KIND.punctuation:
-            if token.spelling_str == "}":
-                self.extent.new_end_reversed(token.line)
-                self.need_processing = False
-                return
         self.data.append(token.spelling_str)
         return
+
 
 class AST_Array(AST_Expression):
     def __init__(self, extent: Line, end_mode: int=End_Mode.Extent) -> None:
@@ -2655,12 +2675,7 @@ class Zone:
         tline = token.line
         tspelling = token.spelling_str
 
-        # Capture comments into Ast_Comment AST nodes
-        if ast_kind == AST_KIND.comment:
-            self.children.append(Ast_Comment(tline, tspelling))
-            return True
-
-        # Fast path, the last children added
+        # Fast path: check active last_child first before capturing comments or top-level tokens
         if self.children:
             last_child = self.children[-1]
             if last_child.within_range(token, ast_kind):
@@ -2673,6 +2688,11 @@ class Zone:
                     last_child.exec_filter(token, cursor, ast_kind)
                     return True
 
+        # Capture comments into Ast_Comment AST nodes if not consumed by active child
+        if ast_kind == AST_KIND.comment:
+            self.children.append(Ast_Comment(tline, tspelling))
+            return True
+
         if ast_kind == AST_KIND.punctuation:
             if self.zone_type == Zone_Type.Function_Args:
                 if tspelling == "(":
@@ -2683,7 +2703,7 @@ class Zone:
                         self.extent.grow(tline)
                         self.preset_extents.clear()
                         self.completed = True
-                        if self.children and self.children[-1].need_processing:
+                        if self.children and getattr(self.children[-1], "need_processing", False):
                             self.children[-1].need_processing = False
                         return True
             elif self.zone_type == Zone_Type.Initializer_Expr:
@@ -2709,29 +2729,39 @@ class Zone:
                         self.completed = True
                         self.preset_extents.clear()
                         return False
+            elif self.zone_type == Zone_Type.Enum_Equal:
+                if tspelling in (",", "}"):
+                    self.completed = True
+                    self.preset_extents.clear()
             elif tspelling == "{":
                 self.brace_depth += 1
             elif tspelling == "}":
+
                 self.brace_depth -= 1
                 if self.zone_type in _BRACE_ZONE_TYPES and self.brace_depth <= 0:
                     self.extent.grow(tline)
                     self.preset_extents.clear()
                     self.completed = True
+                    if self.children:
+                        self.children[-1].extent.grow(tline)
                     return True
 
-        if (not self.extent.is_inside(tline)) and (self.zone_type != Zone_Type.Full_File) and (self.zone_type not in _BRACE_ZONE_TYPES):
-            if not (self.children and self.children[-1].need_processing):
+        if (not self.extent.is_inside(tline)) and (self.zone_type != Zone_Type.Full_File) and (self.zone_type not in _BRACE_ZONE_TYPES) and (self.zone_type != Zone_Type.Function_Args):
+            if not (self.children and getattr(self.children[-1], "need_processing", False)):
                 if self.zone_type == Zone_Type.Initializer_Expr:
                     self.completed = True
                 return False
 
-        if self.zone_type in _BRACE_ZONE_TYPES:
+        if self.zone_type in _BRACE_ZONE_TYPES or self.zone_type == Zone_Type.Function_Args:
             self.extent.grow(tline)
 
         if ast_kind == AST_KIND.punctuation:
             # Commonly found between extents, Processing not needed.
             if tspelling in _PUNCT_IGNORED:
+                if self.children:
+                    self.children[-1].extent.grow(tline)
                 return True
+
             # While were in punctuation, lets handle CPPros
             if tspelling == "#":
                 kind = cursor.kind
@@ -2903,11 +2933,27 @@ class C_Type(Ast):
         tspelling = token.spelling_str
 
         if self.zones:
-            self.zones = [z for z in self.zones if not z.completed]
-            for zone in self.zones:
-                if zone.extent.is_inside(tline) or (zone.children and zone.children[-1].need_processing) or zone.preset_extents:
-                    self.extent.grow(tline)
-                    return True
+            if ast_kind == AST_KIND.punctuation:
+                if tspelling in (",", "}"):
+                    for z in self.zones:
+                        if z.zone_type == Zone_Type.Enum_Equal:
+                            z.completed = True
+                            if z.children and getattr(z.children[-1], "need_processing", False):
+                                z.children[-1].need_processing = False
+                elif tspelling in (";", ","):
+                    for z in self.zones:
+                        if z.zone_type == Zone_Type.Initializer_Expr and z.brace_depth <= 0 and z.paren_depth <= 0 and z.bracket_depth <= 0:
+                            z.completed = True
+                            if z.children and getattr(z.children[-1], "need_processing", False):
+                                z.children[-1].need_processing = False
+            for z in self.zones:
+                if z.children and not getattr(z.children[-1], "need_processing", False):
+                    if z.zone_type in (Zone_Type.Array_Content, Zone_Type.Enum_Equal, Zone_Type.Initializer_Expr):
+                        z.completed = True
+            active_zones = [z for z in self.zones if not z.completed]
+            if active_zones:
+                self.extent.grow(tline)
+                return True
 
         match self.end_mode:
             case End_Mode.No_Check:
@@ -2918,19 +2964,27 @@ class C_Type(Ast):
                     self.extent.grow(tline)
                     return True
                 if tspelling == ";":
+                    self.extent.grow(tline)
                     self.need_processing = False
                     return False
             case End_Mode.Comma:
                 if ast_kind != AST_KIND.punctuation:
                     self.extent.grow(tline)
                     return True
-                if tspelling in (",", ")"):
+                if tspelling in (",", ")", "}"):
                     self.need_processing = False
                     return False
             case End_Mode.Extent:
                 if not self.extent.is_inside(tline):
                     self.need_processing = False
                     return False
+                if ast_kind == AST_KIND.punctuation and tspelling in (";", ",", ")", "}"):
+                    if tspelling == ";":
+                        self.extent.grow(tline)
+                    self.need_processing = False
+                    return False
+
+
 
         self.extent.grow(tline)
         return True
@@ -3327,9 +3381,8 @@ class C_Type(Ast):
 
     def exec_comment(self, token, cursor):
         if self.zones:
-            self.zones = [z for z in self.zones if not z.completed]
             for zone in reversed(self.zones):
-                if zone.check_exec(token, cursor, AST_KIND.comment):
+                if not zone.completed and zone.check_exec(token, cursor, AST_KIND.comment):
                     return
 
         return
@@ -3337,9 +3390,8 @@ class C_Type(Ast):
     def exec_punctuation(self, token, cursor):
         tspelling = token.spelling_str
         if self.zones:
-            self.zones = [z for z in self.zones if not z.completed]
             for zone in reversed(self.zones):
-                if zone.check_exec(token, cursor, AST_KIND.punctuation):
+                if not zone.completed and zone.check_exec(token, cursor, AST_KIND.punctuation):
                     if tspelling == "}" and zone.zone_type == Zone_Type.Compound_Stmt and zone.completed:
                         self.need_processing = False
                     return
@@ -3435,9 +3487,8 @@ class C_Type(Ast):
 
     def exec_keyword(self, token, cursor):
         if self.zones:
-            self.zones = [z for z in self.zones if not z.completed]
             for zone in reversed(self.zones):
-                if zone.check_exec(token, cursor, AST_KIND.keyword):
+                if not zone.completed and zone.check_exec(token, cursor, AST_KIND.keyword):
                     return
 
         self.keyword_parse(token, cursor)
@@ -3445,9 +3496,8 @@ class C_Type(Ast):
 
     def exec_identifier(self, token, cursor):
         if self.zones:
-            self.zones = [z for z in self.zones if not z.completed]
             for zone in reversed(self.zones):
-                if zone.check_exec(token, cursor, AST_KIND.identifier):
+                if not zone.completed and zone.check_exec(token, cursor, AST_KIND.identifier):
                     return
 
         tspelling = token.spelling_str
@@ -3512,9 +3562,8 @@ class C_Type(Ast):
 
     def exec_literal(self, token, cursor):
         if self.zones:
-            self.zones = [z for z in self.zones if not z.completed]
             for zone in reversed(self.zones):
-                if zone.check_exec(token, cursor, AST_KIND.literal):
+                if not zone.completed and zone.check_exec(token, cursor, AST_KIND.literal):
                     return True
 
         self.content.append(TypeToken(token, ASTT.Undefined))

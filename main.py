@@ -582,6 +582,19 @@ def arg_handling() -> argparse.Namespace:
         help="Enable granular stage timing profiler across tests and update loop cycles",
     )
     parser.add_argument(
+        "-f", "--fidelity",
+        dest="fidelity",
+        action="store_true",
+        default=True,
+        help="Display full tag text & source code fidelity audit report across test files (default: True)",
+    )
+    parser.add_argument(
+        "--no-fidelity",
+        dest="fidelity",
+        action="store_false",
+        help="Disable tag text & source code fidelity audit report",
+    )
+    parser.add_argument(
         "-l", "--low-mem", "--low-memory",
         dest="low_mem",
         action="store_true",
@@ -635,11 +648,11 @@ def arg_handling() -> argparse.Namespace:
         target = args.unit_test if args.unit_test != "" else None
         from tests.test_c_ast import run_c_ast_tests
         if target:
-            code = run_c_ast_tests(target, profile=args.profile, table_engine=args.table_engine)
+            code = run_c_ast_tests(target, profile=args.profile, fidelity=args.fidelity, table_engine=args.table_engine)
             sys.exit(code)
 
         # 1. Multi-Core C-AST regression suite
-        c_ast_code = run_c_ast_tests(None, profile=args.profile, table_engine=args.table_engine)
+        c_ast_code = run_c_ast_tests(None, profile=args.profile, fidelity=args.fidelity, table_engine=args.table_engine)
 
         # 2. Comprehensive Unittest Suite across all test modules
         print(COLOR.cyan("=========================================================================================="))
@@ -675,8 +688,9 @@ def arg_handling() -> argparse.Namespace:
         sys.exit(0 if all_ok else 1)
     if args.Test:
         from tests.test_c_ast import run_c_ast_tests
-        code = run_c_ast_tests(args.Test, profile=args.profile, table_engine=args.table_engine)
+        code = run_c_ast_tests(args.Test, profile=args.profile, fidelity=args.fidelity, table_engine=args.table_engine)
         sys.exit(code)
+
     return args
 
 
