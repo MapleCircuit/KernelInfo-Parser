@@ -1,59 +1,58 @@
 """parser/c_ast.py - Parse C Source Files into ChangeSet Database Operations.
 
 ===============================================================================
-C_AST PARSER & DATA ARCHITECTURE GUIDE
+C_AST PARSER ARCHITECTURE & TECHNICAL SPECIFICATION
 ===============================================================================
-This module implements the C language AST parser. Its responsibility is to parse
-C source code files (.c, .h) into an intermediate node tree and extract relational
-database operations into a ChangeSet (`CS`).
+This module implements the C and Assembly AST parser. It translates C and Assembly
+source files (.c, .h, .S) into relational database operations staged in a ChangeSet (CS).
 
 1. TWO-STAGE PARSING PIPELINE:
 -------------------------------------------------------------------------------
-  Stage 1: Tree Generation (libclang + TokenList + Zone/Ast Tree)
-    - Uses `libclang` (`clang.cindex`) to tokenize and annotate C source files.
-    - Parses C preprocessor directives (#include, #define, #ifdef, #ifndef, etc.).
-    - Builds an in-memory intermediate tree composed of `Ast` nodes, `Zone` scopes,
-      and `C_Type` declarations.
+  Stage 1: Intermediate Tree Generation (libclang + TokenList + Zone / Ast Tree)
+    - Tokenizes and annotates source files using libclang (clang.cindex) with direct ctypes bindings.
+    - Resolves C preprocessor directives (#include, #define, #ifdef, #ifndef, etc.).
+    - Builds an in-memory intermediate tree composed of `Zone` spatial scopes, `Ast` statement/expression
+      nodes, and `C_Type` type definitions.
   
-  Stage 2: ChangeSet Extraction (`.extract(CS)`)
-    - Walks the constructed `Ast` / `Zone` tree.
+  Stage 2: ChangeSet Extraction (.extract(CS))
+    - Traverses the constructed `Zone` and `Ast` tree.
     - Emits relational database view operations (`m_ast.view`, `m_ast_container.set`,
-      `m_ast_include.set`, `m_tag.get_set`, `m_bridge_tag.set`) into `CS.cs[]`.
+      `m_ast_include.set`, `m_tag.set`/`get_set`, `m_bridge_tag.set`, `m_map_ast.set`) into `CS.cs[]`.
 
-2. INTERMEDIATE TREE STRUCTURE (Zone vs C_Type):
+2. SPATIAL ZONES VS C_TYPE:
 -------------------------------------------------------------------------------
   `Zone`:
-    - Manages spatial scope boundaries for code parsed in isolation (e.g. `Full_File`,
-      `Declared_Args`, `Function_Args`, `Compound_Body`).
-    - Acts as a position locator: during extraction, requests from child/parent zones
-      return the index in `CS.cs` where their `m_ast.view(...)` is stored, allowing
-      relational foreign keys (`container_ast_id`, `parent_ast_id`) to be resolved using `CS.ref(...)`.
+    - Defines spatial code boundaries parsed in localized scope (e.g. `Full_File`, `Declared_Args`,
+      `Function_Args`, `Compound_Stmt`, `Initializer_Expr`).
+    - Tracks delimiter depths (`brace_depth`, `paren_depth`, `bracket_depth`).
+    - Acts as a position locator: during extraction, queries from child/parent zones return the index
+      in `CS.cs` where their `m_ast.view(...)` is stored, resolving foreign key references using `CS.ref(...)`.
 
   `C_Type`:
-    - Encapsulates type information, specifiers, qualifiers (`const`, `volatile`, `restrict`),
-      and declarators for variable/function/type definitions.
-    - Uses 3 internal mechanics:
-        1. `self.content = []` (+ `self.current_qual` flag for `CQual`)
-        2. `self.swap_out()` (Pops accumulated tokens into `typedata`)
-        3. `self.typedata = [([], CQual), ...]` (Stores type-qualifier tuples)
+    - Encapsulates type specifiers, qualifiers (`const`, `volatile`, `restrict`, `_Atomic`),
+      pointer indirection, array extents, and declarators.
+    - Internal state cycle:
+        1. `self.content` (Accumulates `TypeToken` elements and qualifier bit-flags `CQual`).
+        2. `self.swap_out()` (Pops accumulated tokens into `self.typedata`).
+        3. `self.typedata = [TypeSegment, ...]` (Stores finalized type segments).
+    - Active zone pruning: `self.zones = [z for z in self.zones if not z.completed]` maintaining $O(1)$ stack depth.
 
 3. C TYPE QUALIFIERS & MULTI-DECLARATIONS:
 -------------------------------------------------------------------------------
-  In C, position dictates semantics:
-    - `const char * text`  -> Pointer to constant char.
-    - `char * text` vs `const char ctext` -> Multi-identifier declarations:
-        `char * text, const ctext;` creates two declarations where pointer `*`
-        applies only to `text` and `const` applies only to `ctext`.
+  In C, qualifier position dictates semantics:
+    - `const char * text;`   -> Pointer to constant char (char data is read-only).
+    - `char * const text;`   -> Constant pointer to char (pointer address is read-only).
+    - `char * text, const ctext;` -> Multi-identifier declaration: `*` binds only to `text`,
+      while `const` binds only to `ctext`.
 
-4. TAG MANAGEMENT & VERSION TRACKING (`m_tag` & `m_bridge_tag`):
+4. TAG MANAGEMENT & CROSS-VERSION TRACKING (`m_tag` & `m_bridge_tag`):
 -------------------------------------------------------------------------------
-  Tags track individual AST nodes (functions, structs, typedefs, macros) across project releases:
-    - `get_prior_tags(CS)`: Queries previous version (`REF_OLD`) for active file tags.
-    - `process_c_ast(CS)`: Matches AST elements against prior tags to recycle tag IDs via `m_bridge_tag`.
-    - `close_prior_tags(CS)`: Marks tags as inactive if the underlying AST element was removed or altered.
+  - `get_prior_tags(CS)`: Queries prior release version (`REF_OLD`) for active file AST tags.
+  - `process_c_ast(CS)`: Matches AST elements against prior tags to recycle tag IDs via `m_bridge_tag`.
+  - `close_prior_tags(CS)`: Marks removed or modified tags closed as of `Old_VID`.
 ===============================================================================
 """
-from core.globalstuff import G, COLOR, REF_ROOT, REF_OLD, REF_C_AST, FILE_ERROR
+from core.globalstuff import G, COLOR, REF_ROOT, REF_OLD, REF_C_AST, FILE_ERROR, configure_logging
 from parser.c_ast.c_ast_type import (
     ChangeSetType,
     m_v_main,
@@ -95,7 +94,6 @@ from parser.c_ast.c_ast_type import (
     Zone_Type,
     C_Type,
     Ast_MACRO_INSTANTIATION,
-
 )  # noqa: F401
 from pathlib import Path
 import re
@@ -103,119 +101,10 @@ import time
 import clang.cindex as cc
 import ctypes
 import logging
-from core.globalstuff import configure_logging
 
 configure_logging(level=logging.INFO, fmt="%(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 _WORKER_CLANG_INDEX: cc.Index | None = None
-
-# This applies to c_ast and c_ast_type only
-# ==========================================================
-# The goal of the C_AST parser is to parse C code.
-# We achive this by creating an intermediary tree structure
-# made of Zones and Asts. 
-# This allows us to standardize (and simplify) our handling of C.
-# TLDR: We don't have to care about libclang when adding to CS.
-#
-# ==========================================================
-# OVERVIEW
-# C_AST works in 2 main stages:
-# 1. The parsing through libclang which creates the Zone/Ast Tree.
-# 2. The "extract" / push of changes to CS (ChangeSet)
-# 
-# Each class have their documentation in c_ast_type. (will be true...)
-#
-# ==========================================================
-# LET IT BE CLEAR
-# The other parsers shouldn't be built using any concept that are created
-# within this parser. All parsers should be indepentent and don't have
-# to resemble this implementation.
-# The only thing we care about is that it plugs into our CS infrastructure.
-#
-# ==========================================================
-# Zones/Asts examples.
-# Here is a code snippet and its resulting tree structure which should be created.
-# SOURCE: https://elixir.bootlin.com/linux/v3.0/source/include/linux/lockd/bind.h
-#
-#   struct nlmsvc_binding {
-#	    __be32			(*fopen)(struct svc_rqst *,
-#	    					struct nfs_fh *,
-#	    					struct file **);
-#	    void			(*fclose)(struct file *);
-#   };
-#
-# and our structure:
-#
-# Zone(Zone_Type=Full_File)
-# \=>C_Type(nlmsvc_binding)
-#    \=>Zone(Zone_Type=Declared_Args)
-#       \=>C_Type(fopen)
-#       |  \=>Zone(Zone_Type=Function_Args)
-#       |     \=>C_Type(struct svc_rqst *)
-#       |     |=>C_Type(struct nfs_fh *)
-#       |     |=>C_Type(struct file **)
-#       |=>C_Type(fclose)
-#          \=>Zone(Zone_Type=Function_Args)
-#             \=>C_Type(struct file *)
-#
-# Each C_Type is going to be representing what is usualy 1 line of code.
-# This is most likely 1 type but in this case:
-#   char *text, const ctext;
-# It would capture both type as it is part of the same base type.
-# The inverse would be 2 C_type.:
-#   char *text; const char ctext;
-#
-# ==========================================================
-# Zone VS C_Type
-#
-# Zone
-# Zone allows us to 'zone' parts of the code to be parsed.
-# It is not possible for us to know when something stops or starts without it.
-# It can create multiple section of code within itself
-# to be parsed in a vacuum (Look Zone(Zone_Type=Function_Args) above).
-# Once at the extract stage, we can request from a zone to return the relevant
-# pos within CS where its CS.store(m_ast.view(...)) is.
-# Zone should NOT have much more than positioning info, for all other info, we use:
-#
-# C_Type
-# C_Type allows the information of a type to be stored.
-# The main way it acheives this is by using self.typedata and self.content.
-# Before getting into it, here is a quick TLDR on types in C.
-# ---
-# In C, "const char * text;" and "char * const text;" do not represent the same thing.
-# In the 1st, the pointer is const while in the 2nd the text being pointed to is const.
-# This fact means that we cannot just set a flag for every instance of const/(any other code)
-# as the position is core to understanding the data.
-# 
-# C also allow multiple identifier per type:
-#   "char * text, const ctext;"
-# In this example 2 char are created:
-#   char * text;
-#   const char ctext; 
-# Note that * doesn't apply to ctext and const doesn't apply to text.
-#
-# ---
-# Now that we have a quick understanding of C types, how do we capture this correctly?
-# We will use 3 tools for our parsing to be done correctly:
-#   1. self.content => []  (+ self.current_qual=CQual)
-#   2. self.swap_out()
-#   3. self.typedata => [([], CQual)]
-# When parsing, each token are stored in self.content, 
-# there are special token we call CQual, 
-#
-# CQuals are stored in a flag within self.content/self.typedata.
-# Here is the list of CQuals {const, volatile, restrict, _Atomic}
-# 
-# While we parse, we store each token in self.content,
-# if it is a CQual, it is stored in the flag.
-# some token will trigger self.swap_out() which pop self.content into self.typedata.
-# If we have an already enable CQual, self.swap_out() is triggered.
-# If we have an identifier, self.swap_out() is triggered.
-# Pointer, char, int? self.swap_out() is triggered.
-
-
-
-
 
 
 def c_ast_parse(CS: ChangeSetType) -> None:
@@ -579,21 +468,20 @@ class Ast_Manager:
         if prof is not None:
             t_parse_0 = time.perf_counter()
 
-        # these: "-M","-MG", were probably important, but who gives a shit as they print a bunch of shit on screen, lol
+        # Parse translation unit using kernel compilation arguments
         translation_unit = index.parse(
             self.fullfilename,
             args=[
                 "-ferror-limit=0",
                 "-w",
                 "-D__KERNEL__",
-                *cppro_cindex_input,  # "-nostdinc",
+                *cppro_cindex_input,
                 f"-I{self.mfdir}/{'/'.join(self.filename.split('/')[:-1])}",
                 f"-I{self.mfdir}/include",
                 f"-I{self.mfdir}/include/uapi",
             ],
             options=(cc.TranslationUnit.PARSE_DETAILED_PROCESSING_RECORD + 32768),
         )
-        # https://clang.llvm.org/doxygen/group__CINDEX__TRANSLATION__UNIT.html
 
         if prof is not None:
             prof.clang_parse_tu_s = time.perf_counter() - t_parse_0
@@ -609,15 +497,15 @@ class Ast_Manager:
         return
 
     def cppro_parse(self, current_file: str, file_path: str) -> list[Ast]:
-        # Cleanup
+        """Parse standalone preprocessor directive blocks from file content string."""
         current_file = comment_remover(current_file).splitlines()
 
         result_arr = []
         bypass_num = 0
-        for shit in range(len(current_file)):
-            if shit < bypass_num:
+        for line_idx in range(len(current_file)):
+            if line_idx < bypass_num:
                 continue
-            result = self.cppro_line_parse(current_file, shit, file_path)
+            result = self.cppro_line_parse(current_file, line_idx, file_path)
             if result:
                 if (temp := getattr(result, "line")) is not None:
                     bypass_num = temp.line_pos[0]
@@ -701,13 +589,13 @@ class Ast_Manager:
                 case "#elifndef":
                     if G.OVERRIDE_GLOBAL_C_AST:
                         logger.error(
-                            f"SOME RETARDED DEVS, ADDED THIS FUCKING BULSHIT TO THEIR CODE: #elifndef , Line:{current_line + 1}"
+                            f"Unsupported preprocessor directive: #elifndef at line {current_line + 1}"
                         )
                     G.emergency_shutdown(6)
                 case "#elifdef":
                     if G.OVERRIDE_GLOBAL_C_AST:
                         logger.error(
-                            f"SOME RETARDED DEVS, ADDED THIS FUCKING BULSHIT TO THEIR CODE: #elifdef , Line:{current_line + 1}"
+                            f"Unsupported preprocessor directive: #elifdef at line {current_line + 1}"
                         )
                     G.emergency_shutdown(7)
                 # End #elifndef AND #elifdef
@@ -827,9 +715,9 @@ class Ast_Manager:
                     # PARSE THE ACTUAL INCLUDE
                     written_include[1:-2]
 
+                    # Normalize relative include path segments with parent traversal (..) handling
                     path_arr = []
                     dotdot = 0
-                    # IT WILL FUCKING BREAK IF SOME RETARD PUT SOME ROOT PATH IN THERE LIBS, WHY WOULD SOMEONE DO SOMETHING SO WRONG???? WHO THE FUCJK KNOWS!!!! BEWARE
                     for chunk in str(actual_path + written_include[1:-1]).split("/")[
                         ::-1
                     ]:

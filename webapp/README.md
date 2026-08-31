@@ -4,11 +4,12 @@ The KernelInfo-Parser Web Application is a high-performance introspection and an
 
 ## Documentation Reference
 For an exhaustive, deep architectural and feature specification of both the **FastAPI Backend Server** and the **Single-Page Application Client**, see:
-👉 **[`WEBAPP_SYSTEMS_AND_FEATURES.md`](file:///home/scottviger/dev/KernelInfo-Parser/webapp/WEBAPP_SYSTEMS_AND_FEATURES.md)**
+👉 **[`WEBAPP_SYSTEMS_AND_FEATURES.md`](webapp/WEBAPP_SYSTEMS_AND_FEATURES.md)**
 
 ## Architecture Overview
-- **Backend API Server**: [`webapp/main.py`](file:///home/scottviger/dev/KernelInfo-Parser/webapp/main.py) (FastAPI, MySQL connection pooling, Git integration, in-memory caching).
-- **Frontend SPA Client**: [`webapp/webapp.html`](file:///home/scottviger/dev/KernelInfo-Parser/webapp/webapp.html) (Vanilla HTML5 / CSS3 / ES2022 JavaScript, responsive dark theme, zero runtime npm dependencies).
+- **Backend API Server**: [`webapp/main.py`](webapp/main.py) (FastAPI, MySQL connection pooling, Git integration, in-memory caching).
+- **Frontend SPA Client**: [`webapp/webapp.html`](webapp/webapp.html) (Vanilla HTML5 / CSS3 / ES2022 JavaScript, responsive dark theme, zero runtime npm dependencies).
+
 
 ## Running the Web Application
 Start the FastAPI server from the repository root:

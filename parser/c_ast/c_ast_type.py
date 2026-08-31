@@ -119,21 +119,6 @@ def good_looking_printing(object_name: object, pre_result: str="", post_result: 
 
 
 
-# This applies to c_ast and c_ast_type only
-# ==========================================================
-# The goal of the C_AST parser is to parse C code.
-# We achieve this by creating an intermediary tree structure
-# made of Zones and Asts. 
-# This allows us to standardize (and simplify) our handling of C.
-# TLDR: We don't have to care about libclang when adding to CS.
-#
-# ==========================================================
-# OVERVIEW
-# C_AST works in 2 main stages:
-# 1. The parsing through libclang which creates the Zone/Ast Tree.
-# 2. The "extract" / push of changes to CS (ChangeSet)
-
-
 class Line:
     """Represent position of code, can extract the underlying str."""
 
@@ -645,7 +630,6 @@ class Ast_Keyword(Ast_Comment):
     def __init__(self, extent: Line) -> None:
         self.extent = extent
 
-    # rip this shit
     def extract(self, CS: ChangeSetType) -> None:
         """Passthrough to AST.extract_1arg."""
         self.extract_1arg(CS, 2, self.comment, self.extent)
@@ -1246,9 +1230,7 @@ class CPPro_define(Ast):
             self.extract_1arg(CS, ASTT.CPPro_define, self.identifier, self.extent)
             return
 
-        # BAD IMPLEMENTATION, NEEDS TO BE FIXED, WE NEED RECURSIVE DETECTION FOR 2ND ARG
         self.extract_1arg(CS, ASTT.CPPro_define_macro, self.identifier, self.extent)
-
         return
 
 
@@ -1387,7 +1369,6 @@ class CPPro_include(Ast):
         return
 
 
-    #################################REMEMBER TO CLEAN A_INCLUDE IF DEBUG ISN'T NONE
     def extract(self, CS: ChangeSetType) -> None:
         """Extract with m_ast_include."""
         include_target = self.a_include if self.a_include is not None else self.w_include
@@ -1416,7 +1397,6 @@ class CPPro_include(Ast):
             self.tag(CS, ast_id_route, self.extent)
         return
 
-##NOT IN USE
 class CPPro_embed(Ast):
     """type_id 999."""
 
@@ -1583,7 +1563,6 @@ class CPPro_pragma(CPPro_error):
         self.extract_1arg(CS, ASTT.CPPro_pragma, self.msg, self.extent)
         return
 
-##NOT IN USE
 class CPPro_defined(Ast):
     """type_id 999."""
 
@@ -1591,11 +1570,10 @@ class CPPro_defined(Ast):
         self.extent = extent
         self.need_processing = True
         self.end_mode = End_Mode.Extent
-        #self.defined = defined
 
     def extract(self, CS: ChangeSetType) -> None:
         """Passthrough to AST.extract_1arg."""
-        self.extract_1arg(CS, 999, self.defined, self.extent)
+        self.extract_1arg(CS, 999, getattr(self, "defined", "defined"), self.extent)
         return
 
 class End_Mode(IntEnum):

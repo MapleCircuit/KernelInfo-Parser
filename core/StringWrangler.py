@@ -1,5 +1,6 @@
-# based on tools from http://github.com/mbeware
+"""core/StringWrangler.py - Text formatting, column alignment, and terminal boxing utilities."""
 import textwrap
+from typing import Any, Callable
 
 try:
     from wcwidth import wcwidth
@@ -11,7 +12,11 @@ except ImportError:
 
 __STRING_WRANGLER_DEFAULT_TAG = "###"
 
-def align_columns(rows, padding=2):
+
+def align_columns(rows: list[list[str]], padding: int = 2) -> list[list[str]]:
+    """Align 2D matrix of cell strings into padded columnar format."""
+    if not rows or not rows[0]:
+        return []
     widths = [
         max(len(row[i]) for row in rows)
         for i in range(len(rows[0]))
@@ -26,22 +31,19 @@ def align_columns(rows, padding=2):
 
     return aligned
 
-def tag_lines(lines, prefix=__STRING_WRANGLER_DEFAULT_TAG):
+
+def tag_lines(lines: list[str], prefix: str = __STRING_WRANGLER_DEFAULT_TAG) -> list[str]:
+    """Prefix each line in a list with specified tag prefix."""
     return [f"{prefix}{line}" for line in lines]
 
-def group_lines(lines, groupingFunction):
-    """
-    group lines each time the function is true for a line.
-    Function example : 
-    - str.isdigit() : A new number for numbered list
-    - str.startswith(prefix): If processing a markdown file, this could be # 
-    - str.endswith(suffix): If processing a filelist, this could be a certain extendion  
-    """
+
+def group_lines(lines: list[str], grouping_function: Callable[[str], bool]) -> list[list[str]]:
+    """Group lines into sub-lists whenever grouping_function evaluates to True for a line."""
     groups = []
     current = []
 
     for line in lines:
-        if groupingFunction(line) and current:
+        if grouping_function(line) and current:
             groups.append(current)
             current = []
         current.append(line)
@@ -50,77 +52,57 @@ def group_lines(lines, groupingFunction):
         groups.append(current)
 
     return groups
-def normalize(text):
-    """
-    Remove extra white spaces from string
-    """
+
+
+def normalize(text: str) -> str:
+    """Remove redundant whitespace from string."""
     return " ".join(text.strip().split())
 
-def listify(items):
-    """
-    Create list from string
-    """
+
+def listify(items: list[Any]) -> list[str]:
+    """Convert a collection of items into a list of strings."""
     return [str(item) for item in items]
 
 
-
-def __wrap_lines_no_split(lines, max_len):
-    """
-    Do not split words
-    """
-    
-    
+def __wrap_lines_no_split(lines: list[str], max_len: int) -> list[list[str]]:
+    """Wrap lines without splitting whole words."""
     groups = []
-
-
     for line in lines:
         wrapped = textwrap.wrap(line, max_len)
         if not wrapped:
             wrapped = [line]
+        groups.append(wrapped)
+    return groups
 
+
+def wrap_lines(lines: list[str], max_len: int, no_split: bool = True) -> list[list[str]]:
+    """Wrap lines to maximum line length and return nested groups of strings."""
+    assert isinstance(lines, list), "lines must be a list of string"
+    assert lines, "Need at least 1 line"
+    assert max_len > 0, "can't split string to less than 1 characters"
+
+    if no_split:
+        return __wrap_lines_no_split(lines, max_len)
+
+    groups = []
+    for line in lines:
+        if not line:
+            groups.append([""])
+            continue
+
+        wrapped = []
+        remaining = line
+        while remaining:
+            wrapped.append(remaining[:max_len])
+            remaining = remaining[max_len:]
         groups.append(wrapped)
 
     return groups
 
-def wrap_lines(lines, max_len, no_split=True):
-    """
-    Wrap lines and return groups of strings
-    """
-    assert isinstance(lines, list), "lines must be a list of string"
-    assert lines , "Need at least 1 line"
-    assert max_len > 0, "can't split string to less than 1 characters"
-    
-    
-    groups = []
 
-    if no_split: 
-        groups = __wrap_lines_no_split(lines, max_len)
-
-    else: 
-        for line in lines:
-            if not line:
-                groups.append([""])
-                continue
-
-            wrapped = []
-            remaining = line
-
-            while remaining:
-                wrapped.append(remaining[:max_len])
-                remaining = remaining[max_len:]
-
-            groups.append(wrapped)
-
-    return groups
-
-
-
-def render_with_indent(groups, indent=__STRING_WRANGLER_DEFAULT_TAG):
-    """
-    Add indentation to group of strings
-    """
+def render_with_indent(groups: list[list[str]], indent: str = __STRING_WRANGLER_DEFAULT_TAG) -> list[list[str]]:
+    """Add indentation prefix to non-initial lines in each group of strings."""
     rendered = []
-
     for group in groups:
         if not group:
             rendered.append([])
@@ -129,81 +111,59 @@ def render_with_indent(groups, indent=__STRING_WRANGLER_DEFAULT_TAG):
         out = [group[0]]
         for line in group[1:]:
             out.append(indent + line)
-
         rendered.append(out)
 
     return rendered
 
-def render_ansi_box(groups):
-    """
-    create a box aroud a group of string
-    """
-    rendered = []
 
+def render_ansi_box(groups: list[list[str]]) -> list[list[str]]:
+    """Render an ANSI Unicode box border around a group of strings."""
+    rendered = []
     for group in groups:
         if not group:
             rendered.append([])
             continue
 
         width = max(len(line) for line in group)
-
-        top =    f"┌{'─' * (width + 2)}┐"
+        top = f"┌{'─' * (width + 2)}┐"
         bottom = f"└{'─' * (width + 2)}┘"
 
         boxed = [top]
         for line in group:
             boxed.append(f"│ {line.ljust(width)} │")
         boxed.append(bottom)
-
         rendered.append(boxed)
 
     return rendered
 
 
-if __UNICODE_SUPPORT: 
-    def visible_len_unicode(text):
-        """
-        Retourne la largeur visible d'une chaîne en colonnes terminal.
-        """
+if __UNICODE_SUPPORT:
+    def visible_len_unicode(text: str) -> int:
+        """Return visible terminal character column width for Unicode text."""
         width = 0
         for ch in text:
             w = wcwidth(ch)
             if w > 0:
                 width += w
         return width
-else:
-    def visible_len_unicode(text):
-        return NotImplemented
 
-
-if __UNICODE_SUPPORT: 
-    def pad_to_visible_width_unicode(text, target_width):
-        """
-        Pad une chaîne avec des espaces pour atteindre une largeur visible cible.
-        """
+    def pad_to_visible_width_unicode(text: str, target_width: int) -> str:
+        """Pad string with trailing spaces to match visible terminal character width."""
         padding = target_width - visible_len_unicode(text)
         if padding > 0:
             return text + (" " * padding)
         return text
-else:
-    def pad_to_visible_width_unicode(text, target_width):
-        return NotImplemented
 
-if __UNICODE_SUPPORT:
-    def render_ansi_box_unicode(groups):
-        """
-        create a box around unicode variable width characters
-        """
+    def render_ansi_box_unicode(groups: list[list[str]]) -> list[list[str]]:
+        """Render an ANSI Unicode box border supporting variable-width Unicode characters."""
         rendered = []
-
         for group in groups:
             if not group:
                 rendered.append([])
                 continue
 
             content_width = max(visible_len_unicode(line) for line in group)
-
-            top =    f"┌{'─' * (content_width + 2)}┐"
+            top = f"┌{'─' * (content_width + 2)}┐"
             bottom = f"└{'─' * (content_width + 2)}┘"
 
             boxed = [top]
@@ -211,10 +171,19 @@ if __UNICODE_SUPPORT:
                 padded = pad_to_visible_width_unicode(line, content_width)
                 boxed.append(f"│ {padded} │")
             boxed.append(bottom)
-
             rendered.append(boxed)
 
         return rendered
 else:
-    def render_ansi_box_unicode(groups):
-        return NotImplemented   
+    def visible_len_unicode(text: str) -> int:
+        """Fallback when wcwidth is unavailable."""
+        return NotImplemented
+
+    def pad_to_visible_width_unicode(text: str, target_width: int) -> str:
+        """Fallback when wcwidth is unavailable."""
+        return NotImplemented
+
+    def render_ansi_box_unicode(groups: list[list[str]]) -> list[list[str]]:
+        """Fallback when wcwidth is unavailable."""
+        return NotImplemented
+   

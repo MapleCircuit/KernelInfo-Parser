@@ -1,6 +1,6 @@
 # KernelInfo-Parser Developer Web Application: Full Architecture, Systems & Features Specification
 
-This document provides an exhaustive, authoritative technical specification of all features, subsystems, REST endpoints, UI controllers, rendering algorithms, state machines, and caching architectures within the **KernelInfo-Parser Developer Web Application** (comprising the **FastAPI Backend Server** in [`webapp/main.py`](file:///home/scottviger/dev/KernelInfo-Parser/webapp/main.py) and the **Single-Page Application Client** in [`webapp/webapp.html`](file:///home/scottviger/dev/KernelInfo-Parser/webapp/webapp.html)).
+This document provides an exhaustive, authoritative technical specification of all features, subsystems, REST endpoints, UI controllers, rendering algorithms, state machines, and caching architectures within the **KernelInfo-Parser Developer Web Application** (comprising the **FastAPI Backend Server** in [`webapp/main.py`](webapp/main.py) and the **Single-Page Application Client** in [`webapp/webapp.html`](webapp/webapp.html)).
 
 ---
 
@@ -93,7 +93,7 @@ The KernelInfo-Parser Web Application is a high-performance developer introspect
 
 ## 2. Database Schema & Relational Integration
 
-The web application interfaces directly with the MySQL relational database defined in [`core/DBLayout.py`](file:///home/scottviger/dev/KernelInfo-Parser/core/DBLayout.py):
+The web application interfaces directly with the MySQL relational database defined in [`core/DBLayout.py`](core/DBLayout.py):
 
 | Table Name | `table_id` | Primary Key | Key Columns Utilized by Webapp | Role in Webapp Subsystems |
 | :--- | :--- | :--- | :--- | :--- |
@@ -260,7 +260,7 @@ The backend exposes **49 route registrations (38 unique endpoints)** across 21 f
 - **`GET /`** (`read_root`):
   - Returns service status, connected database host, connected database name, webapp URL (`/app`), and OpenAPI docs URL (`/docs`).
 - **`GET /app`** / **`GET /webapp`** (`serve_webapp`):
-  - Returns [`webapp/webapp.html`](file:///home/scottviger/dev/KernelInfo-Parser/webapp/webapp.html) as a static `FileResponse` with `media_type="text/html"`.
+  - Returns [`webapp/webapp.html`](webapp/webapp.html) as a static `FileResponse` with `media_type="text/html"`.
 
 #### 2. Version & Syntax Descriptors
 - **`GET /api/versions`** / **`GET /versions`** (`get_all_versions`):
