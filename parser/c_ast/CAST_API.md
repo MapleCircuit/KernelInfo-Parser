@@ -278,11 +278,13 @@ class Zone_Type(IntEnum):
   - `end_mode: End_Mode`: Default delimiter termination mode for new children.
 - **Token Processing (`check_exec`)**:
   1. If `ast_kind == AST_KIND.comment`, appends `Ast_Comment` and consumes.
-  2. If `tspelling == "}"` and `zone_type in _BRACE_ZONE_TYPES` (`Declared_Args`, `Enum_Content`, `Compound_Stmt`), marks `self.completed = True` and consumes.
-  3. If last child `within_range(token, ast_kind)` is `True`, dispatches to `last_child.exec_filter()`.
-  4. If `tspelling == "#"`, instantiates `CPPro` (or `CPPro_include`).
-  5. If `tspelling == "."` at `Full_File` root, instantiates `Ast_ASM_Directive`.
-  6. Pops matching preset extent from `preset_extents` or allocates a new `C_Type(tline, self.end_mode)`.
+  2. If `zone_type in _BRACE_ZONE_TYPES` (`Declared_Args`, `Enum_Content`, `Compound_Stmt`), the zone remains active across preprocessor directives (`#ifdef`, `#else`, `#endif`, `#define`) and comments until `tspelling == "}"` and `brace_depth <= 0`. Extent dynamically expands (`extent.grow(tline)`), preventing trailing preprocessor directives from leaking into outer declarators.
+  3. If `zone_type == Zone_Type.Function_Args`, tracks `paren_depth` across `(` and `)`. When `paren_depth <= 0` at `)`, marks `completed = True` and terminates the active parameter declarator.
+  4. If `zone_type == Zone_Type.Initializer_Expr`, marks `completed = True` on `;` or `,` delimiters without creating orphan child declarators.
+  5. If last child `within_range(token, ast_kind)` is `True`, dispatches to `last_child.exec_filter()`.
+  6. If `tspelling == "#"`, instantiates `CPPro` (or `CPPro_include`).
+  7. If `tspelling == "."` at `Full_File` root, instantiates `Ast_ASM_Directive`.
+  8. Pops matching preset extent from `preset_extents` or allocates a new `C_Type(tline, self.end_mode)`.
 - **Preprocessor Scope Resolution (`resolve_cppro_scopes`)**:
   - Scans `self.children` with a LIFO branch stack.
   - Links each `#if`, `#ifdef`, `#ifndef`, `#elif`, `#elifdef`, `#elifndef`, and `#else` node to its subsequent branch or terminating `#endif` line coordinate, setting `node.endif = Line(end_line, end_line)`.
@@ -346,6 +348,9 @@ Aggregated segment of a type declaration:
 4. **Variable Declaration Insertion**:
    - Emits joined view `m_ast.view(((m_ast.ast_id, m_ast_container.ast_id, len(final_type)),), None, name, main_t_id, *container_tuples)` into `CS.cs`.
    - Emits tag and spatial mapping via `self.tag(CS, ast_id_route, self.extent)`.
+5. **Initializer Expression Extraction (`AST_Initializer`)**:
+   - Captures nested function calls (`Ast_CallExpr`), struct member accesses (`Ast_MemberRefExpr`), and declaration references (`Ast_DeclRefExpr`) during expression parsing.
+   - Stages nested expression AST nodes into `CS` under `REF_NO_REF` during ChangeSet extraction.
 
 ---
 

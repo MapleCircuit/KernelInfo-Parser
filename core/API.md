@@ -192,6 +192,7 @@ Represents a parsed file diff and acts as the relational staging buffer.
   5. Default: Looks up `pos = store_dict[parsed_route][query[0]]` and extracts column value `query[1]`.
 - **Dynamic AST Views (`_unpack_ref_view(operation) -> OperationType | None`)**:
   - Evaluates AST rule schemas against records in `store_dict`, matches conditional rules (`schema_ifs`), dynamically constructs joined table graph (`schema_thens`), and converts `OP_REF_VIEW` into concrete `(joins_tuple, OP_VIEW_SET, data_tuple)`.
+  - Queries candidate rows via `CS.get_available_data(route, target_table_id)`, which filters candidate operations strictly by `tableid` (handling both integer IDs and joined view tuples) to isolate `m_ast` records from co-located tag and bridge operations.
 - **Pipeline Execution (`execute() -> bool`)**:
   - Iterates over `CS.cs` starting at `len(CS.cs_result)`.
   - Unpacks dynamic views (`OP_REF_VIEW` &rarr; `OP_VIEW_SET`).

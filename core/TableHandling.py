@@ -742,11 +742,20 @@ class ChangeSet:
 
         for target in get_target:
             if target is not None and 0 <= target < len(self.cs):
+                target_op = self.cs[target]
+                if tableid is not None:
+                    op_target = target_op[0]
+                    op_tid = op_target if isinstance(op_target, int) else (
+                        op_target[0][0][0] if isinstance(op_target, tuple) and op_target and isinstance(op_target[0], tuple) and op_target[0] and isinstance(op_target[0][0], tuple) else None
+                    )
+                    if op_tid != tableid:
+                        continue
+
                 target_processed = self.cs_result[target] if target < len(self.cs_result) else None
                 if target_processed is None:
-                    result.append((self.cs[target], None))
+                    result.append((target_op, None))
                 else:
-                    result.append((self.cs[target], tuple(to_safe_data(x) for x in target_processed)))
+                    result.append((target_op, tuple(to_safe_data(x) for x in target_processed)))
 
         return result
 

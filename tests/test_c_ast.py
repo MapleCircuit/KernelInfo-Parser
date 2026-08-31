@@ -8,6 +8,9 @@ from __future__ import annotations
 
 import os
 import sys
+
+# Raise recursion limit for parsing deeply nested ASTs in kernel source files
+sys.setrecursionlimit(50000)
 import time
 import shutil
 import unittest
@@ -78,6 +81,11 @@ TEST_SUITE: list[dict[str, Any]] = [
         "file": "arch/alpha/lib/clear_page.S",
         "baseline_ast_ops": 145,
         "description": "Assembly Source (clear_page.S)",
+    },
+    {
+        "file": "arch/powerpc/xmon/ppc-opc.c",
+        "baseline_ast_ops": 79553,
+        "description": "PowerPC Opcode Table & Large Initializer Array (ppc-opc.c)",
     },
 ]
 
@@ -436,6 +444,332 @@ int process_device(struct device *dev) {
             self.assertIn(ASTT.C_CallExpr, types_in_ast)
             self.assertIn(ASTT.C_MemberRefExpr, types_in_ast)
             self.assertIn(ASTT.C_DeclRefExpr, types_in_ast)
+        finally:
+            if temp_dir and os.path.exists(temp_dir):
+                shutil.rmtree(temp_dir, ignore_errors=True)
+
+    def test_declaration_initializer_and_subsequent_expressions(self) -> None:
+        """Verify declarations with '=' do not swallow subsequent statements or expressions."""
+        temp_dir = None
+        try:
+            G.DEBUG_TYPECHECK = True
+            G.DB = MockDB
+            G.TE = get_table_engine("cached")()
+            gp = GreatProcessor()
+            init_db_layout(gp)
+            G.TE.start(gp.Table_Array, G.DB)
+
+            mf = MasterFile()
+            temp_dir = mf.create_temp_dir()
+            mf.version_dict["v3.0"] = temp_dir
+            G.MF = mf
+            gp.Version_Name = "v3.0"
+            gp.VID = 1
+
+            file_path = "test_decl_init.c"
+            full_path = os.path.join(temp_dir, file_path)
+            snippet = """
+void notify_user(int code);
+
+int compute_metrics(int base) {
+    int factor = 10;
+    int scaled = base * factor;
+    scaled = scaled + 5;
+    notify_user(scaled);
+    return scaled;
+}
+"""
+            with open(full_path, "w") as f:
+                f.write(snippet)
+
+            cs = ChangeSet(f"A\t{file_path}")
+            cs.current_vid = 1
+            cs.gp = gp
+            cs.mf = mf
+            G.CURRENT_PARSING_FILE = file_path
+
+            default_processing(cs, gp)
+            cs.parse()
+            self.assertGreater(len(cs.cs), 0)
+            self.assertTrue(cs.execute())
+            self.assertEqual(len(cs.cs), len(cs.cs_result))
+
+            from core.globalstuff import ASTT
+            types_in_ast = set()
+            tag_codes = []
+            for op in cs.cs:
+                if op[0] == 10:
+                    tag_codes.append(op[2][3])
+                elif isinstance(op[0], tuple) and len(op) >= 3 and isinstance(op[2], tuple):
+                    for val in op[2]:
+                        if isinstance(val, (int, ASTT)) and not isinstance(val, bool):
+                            try:
+                                types_in_ast.add(ASTT(val))
+                            except:
+                                pass
+
+            self.assertIn(ASTT.C_BinaryOperator, types_in_ast)
+            self.assertIn(ASTT.C_CallExpr, types_in_ast)
+            self.assertIn(ASTT.C_ReturnStmt, types_in_ast)
+
+            # Ensure 'int factor = 10;' tag does NOT swallow subsequent lines
+            factor_tags = [t for t in tag_codes if "int factor" in t and "compute_metrics" not in t]
+            self.assertTrue(any("int factor = 10;" in t for t in factor_tags))
+            self.assertFalse(any("notify_user" in t for t in factor_tags))
+        finally:
+            if temp_dir and os.path.exists(temp_dir):
+                shutil.rmtree(temp_dir, ignore_errors=True)
+
+    def test_function_parameter_boundaries(self) -> None:
+        """Verify function parameter declarations terminate cleanly and do not bleed into function body."""
+        temp_dir = None
+        try:
+            G.DEBUG_TYPECHECK = True
+            G.DB = MockDB
+            G.TE = get_table_engine("cached")()
+            gp = GreatProcessor()
+            init_db_layout(gp)
+            G.TE.start(gp.Table_Array, G.DB)
+
+            mf = MasterFile()
+            temp_dir = mf.create_temp_dir()
+            mf.version_dict["v3.0"] = temp_dir
+            G.MF = mf
+            gp.Version_Name = "v3.0"
+            gp.VID = 1
+
+            file_path = "test_param_boundaries.c"
+            full_path = os.path.join(temp_dir, file_path)
+            snippet = """
+int add_three(int a, int b, int c) {
+    int res = a + b;
+    res = res + c;
+    return res;
+}
+"""
+            with open(full_path, "w") as f:
+                f.write(snippet)
+
+            cs = ChangeSet(f"A\t{file_path}")
+            cs.current_vid = 1
+            cs.gp = gp
+            cs.mf = mf
+            G.CURRENT_PARSING_FILE = file_path
+
+            default_processing(cs, gp)
+            cs.parse()
+            self.assertGreater(len(cs.cs), 0)
+            self.assertTrue(cs.execute())
+            self.assertEqual(len(cs.cs), len(cs.cs_result))
+
+            tag_codes = [op[2][3] for op in cs.cs if op[0] == 10]
+            # Parameter c must strictly be 'int c' without bleeding into '{' or 'int res'
+            param_c_tags = [t for t in tag_codes if "int c" in t and "add_three" not in t]
+            self.assertTrue(len(param_c_tags) > 0)
+            for t in param_c_tags:
+                self.assertNotIn("int res", t)
+                self.assertNotIn("return res", t)
+        finally:
+            if temp_dir and os.path.exists(temp_dir):
+                shutil.rmtree(temp_dir, ignore_errors=True)
+
+    def test_nested_function_definitions(self) -> None:
+        """Verify GNU C nested functions inside compound statements parse cleanly."""
+        temp_dir = None
+        try:
+            G.DEBUG_TYPECHECK = True
+            G.DB = MockDB
+            G.TE = get_table_engine("cached")()
+            gp = GreatProcessor()
+            init_db_layout(gp)
+            G.TE.start(gp.Table_Array, G.DB)
+
+            mf = MasterFile()
+            temp_dir = mf.create_temp_dir()
+            mf.version_dict["v3.0"] = temp_dir
+            G.MF = mf
+            gp.Version_Name = "v3.0"
+            gp.VID = 1
+
+            file_path = "test_nested_fn.c"
+            full_path = os.path.join(temp_dir, file_path)
+            snippet = """
+int outer_calc(int x) {
+    int square(int val) {
+        return val * val;
+    }
+    return square(x) + 1;
+}
+"""
+            with open(full_path, "w") as f:
+                f.write(snippet)
+
+            cs = ChangeSet(f"A\t{file_path}")
+            cs.current_vid = 1
+            cs.gp = gp
+            cs.mf = mf
+            G.CURRENT_PARSING_FILE = file_path
+
+            default_processing(cs, gp)
+            cs.parse()
+            self.assertGreater(len(cs.cs), 0)
+            self.assertTrue(cs.execute())
+            self.assertEqual(len(cs.cs), len(cs.cs_result))
+
+            from core.globalstuff import ASTT
+            types_in_ast = set()
+            for op in cs.cs:
+                if isinstance(op[0], tuple) and len(op) >= 3 and isinstance(op[2], tuple):
+                    for val in op[2]:
+                        if isinstance(val, (int, ASTT)) and not isinstance(val, bool):
+                            try:
+                                types_in_ast.add(ASTT(val))
+                            except:
+                                pass
+
+            self.assertIn(ASTT.C_CallExpr, types_in_ast)
+            self.assertIn(ASTT.C_ReturnStmt, types_in_ast)
+        finally:
+            if temp_dir and os.path.exists(temp_dir):
+                shutil.rmtree(temp_dir, ignore_errors=True)
+
+    def test_initializer_expression_references(self) -> None:
+        """Verify calls, member accesses, and variable refs inside initializers are extracted."""
+        temp_dir = None
+        try:
+            G.DEBUG_TYPECHECK = True
+            G.DB = MockDB
+            G.TE = get_table_engine("cached")()
+            gp = GreatProcessor()
+            init_db_layout(gp)
+            G.TE.start(gp.Table_Array, G.DB)
+
+            mf = MasterFile()
+            temp_dir = mf.create_temp_dir()
+            mf.version_dict["v3.0"] = temp_dir
+            G.MF = mf
+            gp.Version_Name = "v3.0"
+            gp.VID = 1
+
+            file_path = "test_init_refs.c"
+            full_path = os.path.join(temp_dir, file_path)
+            snippet = """
+struct item {
+    int value;
+};
+
+int get_multiplier(void) { return 3; }
+
+int process_item(struct item *it) {
+    int factor = get_multiplier();
+    int base = it->value;
+    return factor * base;
+}
+"""
+            with open(full_path, "w") as f:
+                f.write(snippet)
+
+            cs = ChangeSet(f"A\t{file_path}")
+            cs.current_vid = 1
+            cs.gp = gp
+            cs.mf = mf
+            G.CURRENT_PARSING_FILE = file_path
+
+            default_processing(cs, gp)
+            cs.parse()
+            self.assertGreater(len(cs.cs), 0)
+            self.assertTrue(cs.execute())
+            self.assertEqual(len(cs.cs), len(cs.cs_result))
+
+            from core.globalstuff import ASTT
+            types_in_ast = set()
+            for op in cs.cs:
+                if isinstance(op[0], tuple) and len(op) >= 3 and isinstance(op[2], tuple):
+                    for val in op[2]:
+                        if isinstance(val, (int, ASTT)) and not isinstance(val, bool):
+                            try:
+                                types_in_ast.add(ASTT(val))
+                            except:
+                                pass
+
+            self.assertIn(ASTT.C_CallExpr, types_in_ast)
+            self.assertIn(ASTT.C_MemberRefExpr, types_in_ast)
+            self.assertIn(ASTT.C_DeclRefExpr, types_in_ast)
+        finally:
+            if temp_dir and os.path.exists(temp_dir):
+                shutil.rmtree(temp_dir, ignore_errors=True)
+
+    def test_struct_with_intermediate_and_trailing_ifdef(self) -> None:
+        """Verify struct definitions with intermediate and trailing #ifdef/#endif parse cleanly without leaking declarators."""
+        temp_dir = None
+        try:
+            G.DEBUG_TYPECHECK = True
+            G.DB = MockDB
+            G.TE = get_table_engine("cached")()
+            gp = GreatProcessor()
+            init_db_layout(gp)
+            G.TE.start(gp.Table_Array, G.DB)
+
+            mf = MasterFile()
+            temp_dir = mf.create_temp_dir()
+            mf.version_dict["v3.0"] = temp_dir
+            G.MF = mf
+            gp.Version_Name = "v3.0"
+            gp.VID = 1
+
+            file_path = "test_sched_task.h"
+            full_path = os.path.join(temp_dir, file_path)
+            snippet = """
+struct task_struct {
+    volatile long state;
+    void *stack;
+    int flags;
+#ifdef CONFIG_SMP
+    int on_cpu;
+    int cpu;
+#endif
+    int prio;
+#ifdef CONFIG_PREEMPT_RCU
+    int rcu_read_lock_nesting;
+#endif
+};
+"""
+            with open(full_path, "w") as f:
+                f.write(snippet)
+
+            cs = ChangeSet(f"A\t{file_path}")
+            cs.current_vid = 1
+            cs.gp = gp
+            cs.mf = mf
+            G.CURRENT_PARSING_FILE = file_path
+
+            default_processing(cs, gp)
+            cs.parse()
+            self.assertGreater(len(cs.cs), 0)
+            self.assertTrue(cs.execute())
+            self.assertEqual(len(cs.cs), len(cs.cs_result))
+
+            from core.globalstuff import ASTT
+            ast_names = []
+            tag_codes = []
+            for op in cs.cs:
+                if op[0] == 10:
+                    tag_codes.append(op[2][3])
+                elif isinstance(op[0], tuple) and len(op) >= 3 and isinstance(op[2], tuple):
+                    name = op[2][1] if len(op[2]) > 1 else None
+                    if name:
+                        ast_names.append(name)
+
+            # Ensure '#endif' or directive keywords were NOT mis-parsed as variable declarators
+            self.assertNotIn("endif", ast_names)
+            self.assertIn("task_struct", ast_names)
+            self.assertIn("state", ast_names)
+            self.assertIn("prio", ast_names)
+
+            # Ensure struct tag covers the entire struct definition
+            struct_tags = [t for t in tag_codes if "struct task_struct" in t]
+            self.assertTrue(len(struct_tags) > 0)
+            self.assertTrue(any("rcu_read_lock_nesting" in t for t in struct_tags))
         finally:
             if temp_dir and os.path.exists(temp_dir):
                 shutil.rmtree(temp_dir, ignore_errors=True)

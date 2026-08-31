@@ -2312,6 +2312,9 @@ class AST_Initializer(AST_Expression):
         self.brace_depth = 0
         self.paren_depth = 0
         self.bracket_depth = 0
+        self.call_exprs = []
+        self.member_refs = []
+        self.decl_refs = []
 
     def within_range(self, token, ast_kind) -> bool:
         if not self.need_processing:
@@ -2340,15 +2343,40 @@ class AST_Initializer(AST_Expression):
         self.extent.grow(token.line)
         return True
 
+    def exec_identifier(self, token, cursor):
+        k = getattr(cursor, "kind", None)
+        ref = getattr(cursor, "referenced", None)
+        ref_k = getattr(ref, "kind", None) if ref is not None else None
+        if k == cc.CursorKind.CALL_EXPR or ref_k in (cc.CursorKind.FUNCTION_DECL, cc.CursorKind.CXX_METHOD):
+            self.call_exprs.append(Ast_CallExpr(token.line, token.spelling_str))
+            self.call_exprs[-1].callee_cursor = cursor
+        elif k == cc.CursorKind.MEMBER_REF_EXPR or ref_k == cc.CursorKind.FIELD_DECL:
+            self.member_refs.append(Ast_MemberRefExpr(token.line, token.spelling_str))
+            self.member_refs[-1].member_cursor = cursor
+        elif k == cc.CursorKind.DECL_REF_EXPR or ref_k in (cc.CursorKind.VAR_DECL, cc.CursorKind.PARM_DECL):
+            self.decl_refs.append(Ast_DeclRefExpr(token.line, token.spelling_str))
+            self.decl_refs[-1].decl_cursor = cursor
+        self.data.append(token.spelling_str)
+
     def exec_filter(self, token, cursor, ast_kind):
         if ast_kind == AST_KIND.comment:
+            return
+        if ast_kind == AST_KIND.identifier:
+            self.exec_identifier(token, cursor)
             return
         self.data.append(token.spelling_str)
         return
 
     def extract(self, CS: ChangeSetType) -> None:
-        """Do not emit AST database records for variable initializer expressions."""
-        return
+        for call_expr in self.call_exprs:
+            with CS(REF_NO_REF):
+                call_expr.extract(CS)
+        for member_ref in self.member_refs:
+            with CS(REF_NO_REF):
+                member_ref.extract(CS)
+        for decl_ref in self.decl_refs:
+            with CS(REF_NO_REF):
+                decl_ref.extract(CS)
 
 
 class TypeToken():
@@ -2533,9 +2561,11 @@ class Zone:
         self.completed = False
         self.extent = Line(0, 0)
         self.ast_type = C_Type
-        self.end_mode = End_Mode.Auto
+        self.end_mode = End_Mode.Comma if zone_type in (Zone_Type.Function_Args, Zone_Type.Enum_Content) else End_Mode.Auto
         self.A_Line_Dict = None
         self.brace_depth = 1 if zone_type in _BRACE_ZONE_TYPES else 0
+        self.paren_depth = 1 if zone_type == Zone_Type.Function_Args else 0
+        self.bracket_depth = 0
 
         if not cursors_array:
             return
@@ -2666,7 +2696,42 @@ class Zone:
                     return True
 
         if ast_kind == AST_KIND.punctuation:
-            if tspelling == "{":
+            if self.zone_type == Zone_Type.Function_Args:
+                if tspelling == "(":
+                    self.paren_depth += 1
+                elif tspelling == ")":
+                    self.paren_depth -= 1
+                    if self.paren_depth <= 0:
+                        self.extent.grow(tline)
+                        self.preset_extents.clear()
+                        self.completed = True
+                        if self.children and self.children[-1].need_processing:
+                            self.children[-1].need_processing = False
+                        return True
+            elif self.zone_type == Zone_Type.Initializer_Expr:
+                if tspelling == "{":
+                    self.brace_depth += 1
+                elif tspelling == "}":
+                    self.brace_depth = max(0, self.brace_depth - 1)
+                elif tspelling == "(":
+                    self.paren_depth += 1
+                elif tspelling == ")":
+                    self.paren_depth = max(0, self.paren_depth - 1)
+                elif tspelling == "[":
+                    self.bracket_depth += 1
+                elif tspelling == "]":
+                    self.bracket_depth = max(0, self.bracket_depth - 1)
+                elif tspelling == ";":
+                    if self.brace_depth <= 0:
+                        self.completed = True
+                        self.preset_extents.clear()
+                        return False
+                elif tspelling == ",":
+                    if self.brace_depth <= 0 and self.paren_depth <= 0 and self.bracket_depth <= 0:
+                        self.completed = True
+                        self.preset_extents.clear()
+                        return False
+            elif tspelling == "{":
                 self.brace_depth += 1
             elif tspelling == "}":
                 self.brace_depth -= 1
@@ -2676,9 +2741,14 @@ class Zone:
                     self.completed = True
                     return True
 
-        if (not self.extent.is_inside(tline)) and (self.zone_type != Zone_Type.Full_File):
+        if (not self.extent.is_inside(tline)) and (self.zone_type != Zone_Type.Full_File) and (self.zone_type not in _BRACE_ZONE_TYPES):
             if not (self.children and self.children[-1].need_processing):
+                if self.zone_type == Zone_Type.Initializer_Expr:
+                    self.completed = True
                 return False
+
+        if self.zone_type in _BRACE_ZONE_TYPES:
+            self.extent.grow(tline)
 
         if ast_kind == AST_KIND.punctuation:
             # Commonly found between extents, Processing not needed.
@@ -2855,9 +2925,8 @@ class C_Type(Ast):
         tspelling = token.spelling_str
 
         if self.zones:
+            self.zones = [z for z in self.zones if not z.completed]
             for zone in self.zones:
-                if zone.completed:
-                    continue
                 if zone.extent.is_inside(tline) or (zone.children and zone.children[-1].need_processing) or zone.preset_extents:
                     self.extent.grow(tline)
                     return True
@@ -2877,7 +2946,7 @@ class C_Type(Ast):
                 if ast_kind != AST_KIND.punctuation:
                     self.extent.grow(tline)
                     return True
-                if tspelling == ",":
+                if tspelling in (",", ")"):
                     self.need_processing = False
                     return False
             case End_Mode.Extent:
@@ -3279,19 +3348,23 @@ class C_Type(Ast):
         return
 
     def exec_comment(self, token, cursor):
-        for zone in self.zones:
-            if zone.check_exec(token, cursor, AST_KIND.comment):
-                return
+        if self.zones:
+            self.zones = [z for z in self.zones if not z.completed]
+            for zone in reversed(self.zones):
+                if zone.check_exec(token, cursor, AST_KIND.comment):
+                    return
 
         return
 
     def exec_punctuation(self, token, cursor):
         tspelling = token.spelling_str
-        for zone in self.zones:
-            if zone.check_exec(token, cursor, AST_KIND.punctuation):
-                if tspelling == "}" and zone.zone_type == Zone_Type.Compound_Stmt and zone.completed:
-                    self.need_processing = False
-                return
+        if self.zones:
+            self.zones = [z for z in self.zones if not z.completed]
+            for zone in reversed(self.zones):
+                if zone.check_exec(token, cursor, AST_KIND.punctuation):
+                    if tspelling == "}" and zone.zone_type == Zone_Type.Compound_Stmt and zone.completed:
+                        self.need_processing = False
+                    return
 
         match tspelling:
             case "*":
@@ -3327,9 +3400,12 @@ class C_Type(Ast):
                     self.zones.append(Zone(Zone_Type.Compound_Stmt, (cursor,)))
                     return
 
-                zone_type = Zone_Type.Declared_Args
                 if kind == cc.CursorKind.ENUM_DECL:
                     zone_type = Zone_Type.Enum_Content
+                elif kind in {cc.CursorKind.STRUCT_DECL, cc.CursorKind.UNION_DECL, cc.CursorKind.CLASS_DECL}:
+                    zone_type = Zone_Type.Declared_Args
+                else:
+                    return
 
                 cur_file = cursor.extent.start.file.name if cursor.extent.start.file else None
                 filtered_children = []
@@ -3380,22 +3456,54 @@ class C_Type(Ast):
         return
 
     def exec_keyword(self, token, cursor):
-        for zone in self.zones:
-            if zone.check_exec(token, cursor, AST_KIND.keyword):
-                return
+        if self.zones:
+            self.zones = [z for z in self.zones if not z.completed]
+            for zone in reversed(self.zones):
+                if zone.check_exec(token, cursor, AST_KIND.keyword):
+                    return
 
         self.keyword_parse(token, cursor)
         return
 
     def exec_identifier(self, token, cursor):
-        for zone in self.zones:
-            if zone.check_exec(token, cursor, AST_KIND.identifier):
-                return
+        if self.zones:
+            self.zones = [z for z in self.zones if not z.completed]
+            for zone in reversed(self.zones):
+                if zone.check_exec(token, cursor, AST_KIND.identifier):
+                    return
 
         tspelling = token.spelling_str
         # Ignore predefined identifiers in expression contexts
         if tspelling in {"__func__", "__FUNCTION__", "__PRETTY_FUNCTION__"}:
             return
+
+        for typesegment in self.typedata:
+            if not typesegment.content:
+                continue
+
+            if typesegment.content[-1].type == ASTT.C_struct:
+                self.content.append(TypeToken(token, ASTT.C_struct))
+                self.content.get_foreign(cursor)
+                self.swap_out()
+                return
+
+            if typesegment.content[-1].type == ASTT.C_union:
+                self.content.append(TypeToken(token, ASTT.C_union))
+                self.content.get_foreign(cursor)
+                self.swap_out()
+                return
+
+            if typesegment.content[-1].type == ASTT.C_enum:
+                self.content.append(TypeToken(token, ASTT.C_enum))
+                self.content.get_foreign(cursor)
+                self.swap_out()
+                return
+
+            if typesegment.content[-1].type == ASTT.C_SCtypedef:
+                self.content.append(TypeToken(token, typesegment.content[-1].type))
+                self.content.get_foreign(cursor)
+                self.swap_out()
+                return
 
         if cursor.type.kind == cc.TypeKind.TYPEDEF:
             self.content.append(TypeToken(token, ASTT.C_SCtypedef))
@@ -3425,11 +3533,11 @@ class C_Type(Ast):
         return
 
     def exec_literal(self, token, cursor):
-        for zone in self.zones:
-            if zone.check_exec(token, cursor, AST_KIND.literal):
-                return True
+        if self.zones:
+            self.zones = [z for z in self.zones if not z.completed]
+            for zone in reversed(self.zones):
+                if zone.check_exec(token, cursor, AST_KIND.literal):
+                    return True
 
         self.content.append(TypeToken(token, ASTT.Undefined))
         return
-
-

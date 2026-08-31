@@ -59,6 +59,9 @@ from core.globalstuff import (
 )
 import os
 import sys
+
+# Raise recursion limit for parsing deeply nested ASTs in kernel source files
+sys.setrecursionlimit(50000)
 import time
 import logging
 import argparse
@@ -926,6 +929,7 @@ def file_processing_worker(
     worker_id: int = 0,
 ) -> None:
     """Worker process that continuously pulls and parses batches of files from `task_queue`."""
+    sys.setrecursionlimit(50000)
     # Ensure dedicated DB connection per worker process to avoid socket sharing across fork
     try:
         G.TE.db = G.DB()

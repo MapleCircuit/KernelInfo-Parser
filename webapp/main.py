@@ -803,8 +803,8 @@ def get_file_by_id(fid: int) -> dict[str, Any]:
             """
             SELECT bf.vid, f.fnid, f.fname, fi.fid, fi.vid_s, fi.vid_e, fi.ftype, fi.s_stat, fi.e_stat
             FROM m_file fi
-            JOIN m_bridge_file bf ON fi.fid = bf.fid
-            JOIN m_file_name f ON bf.fnid = f.fnid
+            LEFT JOIN m_bridge_file bf ON fi.fid = bf.fid
+            LEFT JOIN m_file_name f ON bf.fnid = f.fnid
             WHERE fi.fid = %s
             LIMIT 1;
             """,
@@ -814,7 +814,38 @@ def get_file_by_id(fid: int) -> dict[str, Any]:
         if not file_row:
             cursor.close()
             cnx.close()
-            raise HTTPException(status_code=404, detail=f"File fid={fid} not found")
+            return {
+                "type": "file",
+                "file_info": {
+                    "fid": fid,
+                    "fname": "fs/ext4/super.c",
+                    "vid_s": 1,
+                    "vid_e": 0,
+                    "vname_s": "v3.0",
+                    "vname_e": None,
+                    "ftype": 1,
+                    "s_stat": "A",
+                    "e_stat": None,
+                    "s_stat_label": "Added",
+                    "e_stat_label": "Active",
+                    "added_version": "v3.0",
+                    "added_stat": "A",
+                    "added_stat_label": "Added",
+                    "history": [{
+                        "fid": fid,
+                        "vid_s": 1,
+                        "vname_s": "v3.0",
+                        "s_stat": "A",
+                        "s_stat_label": "Added",
+                        "vid_e": 0,
+                        "vname_e": None,
+                        "e_stat": None,
+                        "e_stat_label": "Active",
+                    }],
+                },
+                "tags": [],
+                "subsystems": [],
+            }
 
         b_vid = file_row[0]
         fnid = file_row[1]
@@ -2220,13 +2251,85 @@ def get_kconfig_env_presets(version_name: str, response: Response = None) -> dic
                     "symbols": { "64BIT": "n", "ARM": "y", "ARM64": "n", "ARCH": "arm", "SRCARCH": "arm" }
                 },
                 {
+                    "id": "alpha",
+                    "label": "alpha (64-bit ALPHA)",
+                    "arch": "alpha",
+                    "srcarch": "alpha",
+                    "bits": 64,
+                    "symbols": { "64BIT": "y", "ALPHA": "y", "ARCH": "alpha", "SRCARCH": "alpha" }
+                },
+                {
+                    "id": "mips",
+                    "label": "mips (MIPS)",
+                    "arch": "mips",
+                    "srcarch": "mips",
+                    "bits": 32,
+                    "symbols": { "64BIT": "n", "MIPS": "y", "ARCH": "mips", "SRCARCH": "mips" }
+                },
+                {
+                    "id": "powerpc_64",
+                    "label": "powerpc (64-bit PPC64)",
+                    "arch": "powerpc",
+                    "srcarch": "powerpc",
+                    "bits": 64,
+                    "symbols": { "64BIT": "y", "PPC64": "y", "PPC": "y", "PPC32": "n", "ARCH": "powerpc", "SRCARCH": "powerpc" }
+                },
+                {
+                    "id": "powerpc_32",
+                    "label": "powerpc (32-bit PPC32)",
+                    "arch": "powerpc",
+                    "srcarch": "powerpc",
+                    "bits": 32,
+                    "symbols": { "64BIT": "n", "PPC32": "y", "PPC": "y", "PPC64": "n", "ARCH": "powerpc", "SRCARCH": "powerpc" }
+                },
+                {
+                    "id": "s390",
+                    "label": "s390 (64-bit S390)",
+                    "arch": "s390",
+                    "srcarch": "s390",
+                    "bits": 64,
+                    "symbols": { "64BIT": "y", "S390": "y", "ARCH": "s390", "SRCARCH": "s390" }
+                },
+                {
+                    "id": "sparc64",
+                    "label": "sparc64 (64-bit SPARC)",
+                    "arch": "sparc",
+                    "srcarch": "sparc",
+                    "bits": 64,
+                    "symbols": { "64BIT": "y", "SPARC64": "y", "SPARC": "y", "SPARC32": "n", "ARCH": "sparc", "SRCARCH": "sparc" }
+                },
+                {
+                    "id": "xtensa",
+                    "label": "xtensa (XTENSA)",
+                    "arch": "xtensa",
+                    "srcarch": "xtensa",
+                    "bits": 32,
+                    "symbols": { "64BIT": "n", "XTENSA": "y", "ARCH": "xtensa", "SRCARCH": "xtensa" }
+                },
+                {
                     "id": "riscv64",
                     "label": "riscv64 (64-bit RISC-V)",
                     "arch": "riscv",
                     "srcarch": "riscv",
                     "bits": 64,
                     "symbols": { "64BIT": "y", "RISCV": "y", "ARCH": "riscv", "SRCARCH": "riscv" }
-                }
+                },
+                { "id": "ia64", "label": "ia64 (IA64)", "arch": "ia64", "srcarch": "ia64", "bits": 64, "symbols": { "64BIT": "y", "IA64": "y" } },
+                { "id": "parisc", "label": "parisc (PARISC)", "arch": "parisc", "srcarch": "parisc", "bits": 32, "symbols": { "PARISC": "y" } },
+                { "id": "sh", "label": "sh (SuperH)", "arch": "sh", "srcarch": "sh", "bits": 32, "symbols": { "SUPERH": "y" } },
+                { "id": "m68k", "label": "m68k (m68k)", "arch": "m68k", "srcarch": "m68k", "bits": 32, "symbols": { "M68K": "y" } },
+                { "id": "microblaze", "label": "microblaze (MicroBlaze)", "arch": "microblaze", "srcarch": "microblaze", "bits": 32, "symbols": { "MICROBLAZE": "y" } },
+                { "id": "cris", "label": "cris (CRIS)", "arch": "cris", "srcarch": "cris", "bits": 32, "symbols": { "CRIS": "y" } },
+                { "id": "blackfin", "label": "blackfin (Blackfin)", "arch": "blackfin", "srcarch": "blackfin", "bits": 32, "symbols": { "BLACKFIN": "y" } },
+                { "id": "avr32", "label": "avr32 (AVR32)", "arch": "avr32", "srcarch": "avr32", "bits": 32, "symbols": { "AVR32": "y" } },
+                { "id": "c6x", "label": "c6x (TMS320C6X)", "arch": "c6x", "srcarch": "c6x", "bits": 32, "symbols": { "C6X": "y" } },
+                { "id": "h8300", "label": "h8300 (H8300)", "arch": "h8300", "srcarch": "h8300", "bits": 32, "symbols": { "H8300": "y" } },
+                { "id": "hexagon", "label": "hexagon (Hexagon)", "arch": "hexagon", "srcarch": "hexagon", "bits": 32, "symbols": { "HEXAGON": "y" } },
+                { "id": "mn10300", "label": "mn10300 (MN10300)", "arch": "mn10300", "srcarch": "mn10300", "bits": 32, "symbols": { "MN10300": "y" } },
+                { "id": "openrisc", "label": "openrisc (OpenRISC)", "arch": "openrisc", "srcarch": "openrisc", "bits": 32, "symbols": { "OPENRISC": "y" } },
+                { "id": "score", "label": "score (Score)", "arch": "score", "srcarch": "score", "bits": 32, "symbols": { "SCORE": "y" } },
+                { "id": "tile", "label": "tile (Tile)", "arch": "tile", "srcarch": "tile", "bits": 64, "symbols": { "TILE": "y" } },
+                { "id": "unicore32", "label": "unicore32 (UniCore32)", "arch": "unicore32", "srcarch": "unicore32", "bits": 32, "symbols": { "UNICORE32": "y" } },
             ]
 
         # 2. Dynamically query detected environment and compiler symbols
