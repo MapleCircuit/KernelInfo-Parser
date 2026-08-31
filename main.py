@@ -51,6 +51,9 @@ from core.globalstuff import (
     REF_NOT_RESOLVABLE,
     CONTINUE_EXCEPTION,
     T_DIR,
+    T_RAW,
+    T_MAINTAINERS,
+    T_CREDITS,
     ASTT,
     configure_logging,
 )
@@ -62,7 +65,10 @@ import argparse
 import multiprocessing
 from collections import deque
 import pickle
+import zlib
 import traceback
+import gc
+import ctypes
 from parser.c_ast.c_ast import c_ast_parse
 from parser.c_ast.c_ast_type import Line
 from core.FileHandler import MasterFile
@@ -114,6 +120,16 @@ logger = logging.getLogger(__name__)
 
 init_db_layout(gp)
 
+T_NO_FOREIGN = frozenset({T_RAW, T_DIR, T_MAINTAINERS, T_CREDITS})
+
+
+def reclaim_system_memory() -> None:
+    """Force CPython garbage collection and release heap pages back to OS via glibc."""
+    gc.collect()
+    try:
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except Exception:
+        pass
 
 def update(version: str) -> None:
     """Execute the full version parsing and database ingestion pipeline for a target release version.
@@ -130,6 +146,7 @@ def update(version: str) -> None:
     # -------------------------------------------------------------------------
     # STEP 1: Register new version release in m_v_main (or skip if already exists)
     # -------------------------------------------------------------------------
+    gp.init_cs_dict()
     if create_new_vid(version):
         logger.info(COLOR.yellow(f"=======================Version '{version}' already exists in DB. Skipping======================="))
         return
@@ -166,10 +183,12 @@ def update(version: str) -> None:
     # -------------------------------------------------------------------------
     # STEP 6: Enqueue ChangeSets and resolve operations sequentially
     # -------------------------------------------------------------------------
-    G.TE.start_new_db(G.DB)
     cs_queue = deque(gp.ChangeSet_Dict.keys())
 
     max_loop = len(gp.ChangeSet_Dict) * G.OVERRIDE_FC_MAX_LOOP_EXEC_MULT
+    chunk_commit_interval = 300 if G.VERY_LOW_MEMORY_MODE else (500 if G.LOW_MEMORY_MODE else 0)
+    executed_count = 0
+
     while cs_queue:
         max_loop -= 1
         if max_loop < 0:
@@ -183,8 +202,67 @@ def update(version: str) -> None:
 
             G.emergency_shutdown(666)
         current_cs = cs_queue.popleft()
-        if not gp.ChangeSet_Dict[current_cs].execute():
+        cs_obj = gp.ChangeSet_Dict[current_cs]
+        if not cs_obj.execute():
             cs_queue.append(current_cs)
+        else:
+            executed_count += 1
+            # Selective evacuation: only for non-C file types without foreign AST references
+            c_path = getattr(cs_obj, "current_path", None)
+            if c_path and type_check(c_path) in T_NO_FOREIGN:
+                fid = get_fid_for_path(c_path)
+                if fid is not None and not hasattr(cs_obj, "pre_extracted_tags"):
+                    file_tags = []
+                    for op in getattr(cs_obj, "cs", []):
+                        if op and len(op) >= 3 and op[0] == m_bridge_tag.table_id:
+                            cols = op[2]
+                            if len(cols) >= 4:
+                                tag_id = cols[1] if not isinstance(cols[1], tuple) else None
+                                line_s = cols[2] if isinstance(cols[2], int) else 1
+                                line_e = cols[3] if isinstance(cols[3], int) else line_s
+                                if tag_id is not None:
+                                    file_tags.append((tag_id, fid, line_s, line_e))
+                    cs_obj.pre_extracted_tags = file_tags
+
+                if hasattr(cs_obj, "cs") and isinstance(cs_obj.cs, list):
+                    cs_obj.cs.clear()
+                if hasattr(cs_obj, "store_dict") and isinstance(cs_obj.store_dict, dict):
+                    cs_obj.store_dict.clear()
+                if hasattr(cs_obj, "cs_result") and isinstance(cs_obj.cs_result, list):
+                    cs_obj.cs_result.clear()
+
+            # Periodic intermediate chunk commits in low/very-low memory modes
+            if chunk_commit_interval > 0 and executed_count % chunk_commit_interval == 0:
+                G.TE.commit_all()
+                reclaim_system_memory()
+
+    # Now that all ChangeSets are fully executed, extract tags and evacuate remaining AST memory
+    for cs_obj in gp.ChangeSet_Dict.values():
+        if not cs_obj or not getattr(cs_obj, "current_path", None):
+            continue
+        c_path = cs_obj.current_path
+        fid = get_fid_for_path(c_path)
+        if fid is not None and not hasattr(cs_obj, "pre_extracted_tags"):
+            file_tags = []
+            for op in getattr(cs_obj, "cs", []):
+                if op and len(op) >= 3 and op[0] == m_bridge_tag.table_id:
+                    cols = op[2]
+                    if len(cols) >= 4:
+                        tag_id = cols[1] if not isinstance(cols[1], tuple) else None
+                        line_s = cols[2] if isinstance(cols[2], int) else 1
+                        line_e = cols[3] if isinstance(cols[3], int) else line_s
+                        if tag_id is not None:
+                            file_tags.append((tag_id, fid, line_s, line_e))
+            cs_obj.pre_extracted_tags = file_tags
+
+        if hasattr(cs_obj, "cs") and isinstance(cs_obj.cs, list):
+            cs_obj.cs.clear()
+        if hasattr(cs_obj, "store_dict") and isinstance(cs_obj.store_dict, dict):
+            cs_obj.store_dict.clear()
+        if hasattr(cs_obj, "cs_result") and isinstance(cs_obj.cs_result, list):
+            cs_obj.cs_result.clear()
+
+    reclaim_system_memory()
 
     # -------------------------------------------------------------------------
     # STEP 6.5: Parse Git Commits, Multi-Contributors & Bridge Tags to Commits
@@ -201,6 +279,15 @@ def update(version: str) -> None:
     # -------------------------------------------------------------------------
     processing_maintainer_files(version)
 
+    if G.PROFILING_ENABLED and gp.ChangeSet_Dict:
+        from core.Profiler import format_profiling_report
+        profilers = [cs.profiler for cs in gp.ChangeSet_Dict.values() if getattr(cs, "profiler", None)]
+        if profilers:
+            print(format_profiling_report(profilers, title=f"UPDATE CYCLE PROFILE: {version}"))
+
+    gp.reset_cs()
+    reclaim_system_memory()
+
     # -------------------------------------------------------------------------
     # STEP 7: Drop secondary indexes, commit transactions, and rebuild indexes
     # -------------------------------------------------------------------------
@@ -210,44 +297,51 @@ def update(version: str) -> None:
         except Exception:
             pass
 
-    with G.DB() as db:
-        db.remove_indexes(tuple((item[0],item[1]) for item in performance_indexes))
+    if gp.VID == 1:
+        with G.DB() as db:
+            db.remove_indexes(tuple((item[0],item[1]) for item in performance_indexes))
 
     G.TE.commit_all()
 
-    with G.DB() as db:
-        db.create_indexes(performance_indexes)
+    if gp.VID == 1:
+        with G.DB() as db:
+            db.create_indexes(performance_indexes)
 
-    if G.PROFILING_ENABLED and gp.ChangeSet_Dict:
-        from core.Profiler import format_profiling_report
-        profilers = [cs.profiler for cs in gp.ChangeSet_Dict.values() if getattr(cs, "profiler", None)]
-        if profilers:
-            print(format_profiling_report(profilers, title=f"UPDATE CYCLE PROFILE: {version}"))
-
-    gp.reset_cs()
     file_fid_cache.clear()
+    MF.clear_version_cache(version)
     MF.trim_version(keep=1)
     G.TE.close()
-    import gc
-    gc.collect()
+    reclaim_system_memory()
     return
 
 
-def trigger_multicore(batch_size: int = 200) -> None:
-    """Distribute file parsing across `G.CPUS - 1` parallel worker processes in dynamic batches."""
+def trigger_multicore(batch_size: int | None = None) -> None:
+    """Distribute file parsing across parallel worker processes in dynamic batches."""
     change_list = gp.Change_List or []
     total_files = len(change_list)
+
+    if batch_size is None:
+        if G.VERY_LOW_MEMORY_MODE:
+            batch_size = 25
+        elif G.LOW_MEMORY_MODE:
+            batch_size = 50
+        else:
+            batch_size = 200
+
+    if G.VERY_LOW_MEMORY_MODE:
+        num_workers = max(1, min(2, int(G.CPUS // 4)))
+    else:
+        num_workers = max(1, int(G.CPUS - 1))
+
     total_batches = (total_files + batch_size - 1) // batch_size if total_files > 0 else 0
 
-    num_workers = max(1, int(G.CPUS - 1))
     logger.info(
         f"Distributing {total_files} changed files in {total_batches} batches "
-        f"(batch size: {batch_size}) across {num_workers} parallel workers"
+        f"(batch size: {batch_size}, memory mode: {G.MEMORY_MODE}) across {num_workers} parallel workers"
     )
 
     # If no change within this version
     if total_files == 0:
-        G.TE.start_new_db(G.DB)
         processing_dirs()
         processing_unchanges()
         return
@@ -271,7 +365,6 @@ def trigger_multicore(batch_size: int = 200) -> None:
         processes.append(p)
         p.start()
 
-    G.TE.start_new_db(G.DB)
     # needs to be try: protected
     processing_dirs()
     processing_unchanges()
@@ -283,10 +376,25 @@ def trigger_multicore(batch_size: int = 200) -> None:
             if item is None:
                 finished_workers += 1
             else:
-                gp.ChangeSet_Dict.update(pickle.loads(item))
+                try:
+                    raw_bytes = zlib.decompress(item)
+                    partial_dict = pickle.loads(raw_bytes)
+                    del raw_bytes
+                except Exception:
+                    partial_dict = pickle.loads(item)
+
+                try:
+                    gp.ChangeSet_Dict.update(execute_and_purge(partial_dict))
+                except Exception as e:
+                    logger.error(f"Error executing and purging worker batch result: {e}")
+                    gp.ChangeSet_Dict.update(partial_dict)
+
+                del partial_dict
+            del item
         except Exception as e:
             logger.error(f"Error reading worker batch result: {e}")
             break
+        reclaim_system_memory()
 
     failed_workers = 0
     for p in processes:
@@ -316,6 +424,7 @@ def trigger_multicore(batch_size: int = 200) -> None:
         )
 
     del processes
+    reclaim_system_memory()
 
     return
 
@@ -470,6 +579,18 @@ def arg_handling() -> argparse.Namespace:
         help="Enable granular stage timing profiler across tests and update loop cycles",
     )
     parser.add_argument(
+        "-l", "--low-mem", "--low-memory",
+        dest="low_mem",
+        action="store_true",
+        help="Enable Low Memory Mode: utilizes all CPU cores with reduced batch sizes and intermediate chunk commits",
+    )
+    parser.add_argument(
+        "-vl", "--very-low-mem", "--very-low-memory",
+        dest="very_low_mem",
+        action="store_true",
+        help="Enable Very Low Memory Mode: throttles CPU cores (<=2) with ultra-compact batch sizes and continuous memory compaction",
+    )
+    parser.add_argument(
         "--db", "--db-engine",
         dest="db_engine",
         default="mariadb",
@@ -484,6 +605,13 @@ def arg_handling() -> argparse.Namespace:
         help="Select Table Engine architecture backend (default: cached)",
     )
     args = parser.parse_args()
+
+    if args.very_low_mem:
+        G.MEMORY_MODE = "very_low"
+    elif args.low_mem:
+        G.MEMORY_MODE = "low"
+
+    gp.init_cs_dict()
 
     if args.profile:
         G.PROFILING_ENABLED = True
@@ -550,15 +678,27 @@ def arg_handling() -> argparse.Namespace:
 
 
 def create_new_vid(name: str) -> bool:
-    """Register or synchronize active version in m_v_main. Returns True if version already exists."""
+    """Register or synchronize active version in m_v_main. Returns True if version already exists and is complete."""
     with G.DB() as db:
         existing = db.select(m_v_main, (None, name))
         if existing:
-            gp.Old_VID = gp.VID
-            gp.VID = existing[0]
-            gp.Old_Version_Name = gp.Version_Name
-            gp.Version_Name = name
-            return True
+            # Verify if this version actually contains committed bridge_file records
+            bf_sample = db.select(m_bridge_file, (existing[0], None, None))
+            if bf_sample:
+                gp.Old_VID = gp.VID
+                gp.VID = existing[0]
+                gp.Old_Version_Name = gp.Version_Name
+                gp.Version_Name = name
+                return True
+            else:
+                logger.warning(
+                    f"Version '{name}' exists in m_v_main (VID {existing[0]}) but has no committed files. Reparsing..."
+                )
+                gp.Old_VID = gp.VID
+                gp.VID = existing[0]
+                gp.Old_Version_Name = gp.Version_Name
+                gp.Version_Name = name
+                return False
 
         next_vid = db.get_next_id(m_v_main)
         gp.Old_VID = gp.VID
@@ -786,50 +926,72 @@ def file_processing_worker(
     worker_id: int = 0,
 ) -> None:
     """Worker process that continuously pulls and parses batches of files from `task_queue`."""
-    G.TE.start_new_db(G.DB)
+    # Ensure dedicated DB connection per worker process to avoid socket sharing across fork
+    try:
+        G.TE.db = G.DB()
+    except Exception as e:
+        logger.error(f"Worker {worker_id} failed to initialize DB connection: {e}")
 
-    while True:
-        try:
-            task = task_queue.get()
-        except Exception as e:
-            logger.error(f"Worker {worker_id} failed to get batch from queue: {e}")
-            break
-
-        if task is None:
-            # Sentinel received, gracefully exit
-            break
-
-        batch_id, changed_files = task
-        batch_cs_dict = {}
-
-        for changed_file in changed_files:
+    try:
+        while True:
             try:
-                CS = ChangeSet(changed_file)
-                CS.current_vid = vid
-                CS.gp = gp_ref
-                CS.mf = mf_ref
-                G.CURRENT_PARSING_FILE = CS.current_path
-
-                default_processing(CS)
-                CS.parse()
-
-                # Clean bloat and store in batch dict
-                CS.clear_bloat()
-                batch_cs_dict[CS.current_path] = CS
+                task = task_queue.get()
             except Exception as e:
-                err_str = str(e)
-                tb_str = traceback.format_exc()
-                logger.error(COLOR.red(f"Worker {worker_id} error parsing '{changed_file}': {err_str}"))
-                error_queue.put((changed_file, err_str, tb_str))
-            finally:
-                G.CURRENT_PARSING_FILE = None
+                logger.error(f"Worker {worker_id} failed to get batch from queue: {e}")
+                break
 
-        if batch_cs_dict:
+            if task is None:
+                # Sentinel received, gracefully exit
+                break
+
+            batch_id, changed_files = task
+            batch_cs_dict = {}
+
+            for changed_file in changed_files:
+                try:
+                    CS = ChangeSet(changed_file)
+                    CS.current_vid = vid
+                    CS.gp = gp_ref
+                    CS.mf = mf_ref
+                    G.CURRENT_PARSING_FILE = CS.current_path
+
+                    default_processing(CS)
+                    CS.parse()
+
+                    # Clean bloat and store in batch dict
+                    CS.clear_bloat()
+                    batch_cs_dict[CS.current_path] = CS
+                except Exception as e:
+                    err_str = str(e)
+                    tb_str = traceback.format_exc()
+                    logger.error(COLOR.red(f"Worker {worker_id} error parsing '{changed_file}': {err_str}"))
+                    error_queue.put((changed_file, err_str, tb_str))
+                finally:
+                    G.CURRENT_PARSING_FILE = None
+
+            if batch_cs_dict:
+                try:
+                    raw_bytes = pickle.dumps(batch_cs_dict, protocol=pickle.HIGHEST_PROTOCOL)
+                    compressed = zlib.compress(raw_bytes, level=1)
+                    result_queue.put(compressed)
+                    del raw_bytes
+                    del compressed
+                except Exception as e:
+                    logger.error(COLOR.red(f"Worker {worker_id} failed to serialize batch {batch_id}: {e}"))
+                    error_queue.put((f"Batch-{batch_id}", str(e), traceback.format_exc()))
+
+            del batch_cs_dict
+            if G.LOW_MEMORY_MODE:
+                reclaim_system_memory()
+    finally:
+        if getattr(G.TE, "db", None) is not None:
             try:
-                result_queue.put(pickle.dumps(batch_cs_dict, protocol=pickle.HIGHEST_PROTOCOL))
-            except Exception as e:
-                logger.error(COLOR.red(f"Worker {worker_id} failed to serialize batch {batch_id}: {e}"))
-                error_queue.put((f"Batch-{batch_id}", str(e), traceback.format_exc()))
+                G.TE.db.close()
+            except Exception:
+                pass
+            G.TE.db = None
+        if G.LOW_MEMORY_MODE:
+            reclaim_system_memory()
 
     result_queue.put(None)  # Worker done sentinel
     return
@@ -837,7 +999,6 @@ def file_processing_worker(
 
 def file_processing(start: int, end: int | None, override_list: list[str] | None = None) -> None:
     """Process gp.Change_List (or override_list) and send CS into gp.ChangeSet_Dict."""
-    G.TE.start_new_db(G.DB)
     if override_list:
         changed_files = override_list
     elif end is None:
@@ -871,7 +1032,7 @@ def file_processing(start: int, end: int | None, override_list: list[str] | None
 
 
 def processing_unchanges() -> None:
-    """Process everything outside gp.Change_List."""
+    """Process everything outside gp.Change_List with self-healing for legacy unparsed files."""
     if gp.Old_VID == 0:
         return
     full_set = set(MF.git_file_list(gp.Version_Name).splitlines())
@@ -898,87 +1059,83 @@ def processing_unchanges() -> None:
 
     forgotten_new = (full_set - old_full_set) - changed_set
     if forgotten_new:
-        logger.warning("There seems to be forgotten_new...")
+        logger.warning(f"Found {len(forgotten_new)} forgotten new files... Processing...")
         if G.OVERRIDE_FORGOTTEN_PRINT:
             logger.debug(forgotten_new)
+        file_processing(0, 0, (f"A\t{x}" for x in forgotten_new))
 
-    batch_size = 1000
-    batch_idx = 0
-    CS = ChangeSet()
+    te_set = G.TE.set
+    t_id = m_bridge_file.table_id
+    vid = gp.VID
+    old_vid = gp.Old_VID
+
+    missing_unchanged = []
     for unchanged in unchanged_set:
         un_m_file_name = m_file_name.get(None, unchanged)
         if un_m_file_name is None:
-            logger.error("processing_unchanges: un_m_file_name is None")
-            logger.error(unchanged)
-            logger.error(gp.Old_VID)
-            logger.error(m_file_name.get(m_file_name.fname(unchanged)))
+            missing_unchanged.append(unchanged)
             continue
-        un_m_bridge_file = m_bridge_file.get(gp.Old_VID, un_m_file_name[2][0], None)
+        un_m_bridge_file = m_bridge_file.get(old_vid, un_m_file_name[2][0], None)
 
         if un_m_bridge_file is None:
-            logger.error("processing_unchanges: un_m_bridge_file is None")
-            logger.error(unchanged)
-            logger.error(gp.Old_VID)
-            logger.error(m_file_name.get(m_file_name.fname(unchanged)))
+            missing_unchanged.append(unchanged)
             continue
-        CS.cs.append((
-            m_bridge_file.table_id,
-            1,  # OP_SET
+
+        te_set(
+            t_id,
             (
-                gp.VID,
+                vid,
                 un_m_file_name[2][0],
                 un_m_bridge_file[2][2],
             ),
-        ))
-        if len(CS.cs) >= batch_size:
-            gp.ChangeSet_Dict[f"-UNCHANGED-{batch_idx}-"] = CS
-            batch_idx += 1
-            CS = ChangeSet()
+        )
 
-    if CS.cs:
-        gp.ChangeSet_Dict[f"-UNCHANGED-{batch_idx}-"] = CS
+    if missing_unchanged:
+        logger.warning(
+            f"Found {len(missing_unchanged)} files in unchanged_set missing from prior DB version (Old_VID {old_vid}). "
+            f"Self-healing by processing as new additions in VID {vid}..."
+        )
+        file_processing(0, 0, [f"A\t{x}" for x in missing_unchanged])
+
     return
 
 
 def processing_dirs() -> None:  # noqa: C901
     """Process dirs."""
-    dir_list = MF.get_dir_list(gp.Version_Name)
+    dir_list = set(MF.get_dir_list(gp.Version_Name))
 
     if gp.Old_VID != 0:
 
         old_dir_list = set(MF.get_dir_list(gp.Old_Version_Name))
-        dir_list = set(dir_list)
         new_dir_list = dir_list - old_dir_list
+        unchanged_dirs = dir_list & old_dir_list
+        deleted_dirs = old_dir_list - dir_list
 
-        CS = ChangeSet()
         # Unchanged dirs
-        for single_dir in dir_list - (dir_list - old_dir_list):
+        for single_dir in unchanged_dirs:
             # Get m_file_name
             un_m_file_name = m_file_name.get(None, single_dir)
             if un_m_file_name is None:
                 new_dir_list.add(single_dir)
-                logger.error("Unchanged dirs: m_file_name is None")
-                logger.error(single_dir)
+                logger.warning(f"Unchanged dir missing m_file_name: '{single_dir}', self-healing as new addition...")
                 continue
             # Get old_m_bridge_file
-            old_m_bridge_file = m_bridge_file.get(gp.Old_VID, un_m_file_name[2][0],None)
+            old_m_bridge_file = m_bridge_file.get(gp.Old_VID, un_m_file_name[2][0], None)
             if old_m_bridge_file is None:
                 new_dir_list.add(single_dir)
-                logger.error("Unchanged dirs: old_m_bridge_file is None")
-                logger.error(single_dir)
+                logger.warning(
+                    f"Unchanged dir '{single_dir}' missing prior m_bridge_file (Old_VID {gp.Old_VID}). "
+                    f"Self-healing as new addition in VID {gp.VID}..."
+                )
                 continue
-            CS.cs.append((
+            G.TE.set(
                 m_bridge_file.table_id,
-                1,  # OP_SET
                 (
                     gp.VID,
                     un_m_file_name[2][0],
                     old_m_bridge_file[2][2],
                 ),
-            ))
-
-        if CS.cs:
-            gp.ChangeSet_Dict["-UNCHANGED_DIRS-"] = CS
+            )
 
         # New dirs
         for single_dir in new_dir_list:
@@ -997,18 +1154,13 @@ def processing_dirs() -> None:  # noqa: C901
 
         CS = ChangeSet()
         # Deleted dirs
-        for single_dir in old_dir_list - dir_list:
+        for single_dir in deleted_dirs:
             # Get m_file_name
             if (del_m_file_name := m_file_name.get(None, single_dir)) is None:
-                logger.error("Deleted dirs: m_file_name is None")
-                logger.error(single_dir)
                 continue
             # Get old_m_bridge_file
             old_m_bridge_file = m_bridge_file.get(gp.Old_VID, del_m_file_name[2][0], None)
             if old_m_bridge_file is None:
-                new_dir_list.add(single_dir)
-                logger.error("Deleted dirs: old_m_bridge_file is None")
-                logger.error(single_dir)
                 continue
 
             # 0 Update old FILE
@@ -1017,7 +1169,7 @@ def processing_dirs() -> None:  # noqa: C901
                 None, gp.Old_VID,
                 None,
                 None,
-                "R",
+                "D",
             ))
 
         if CS.cs:
@@ -1147,17 +1299,19 @@ def processing_git_commits(version: str) -> None:
         if fid is None:
             continue
 
-        # Collect tags for this file from ChangeSet operations
-        file_tags = []
-        for op in getattr(cs_obj, "cs", []):
-            if op and len(op) >= 3 and op[0] == m_bridge_tag.table_id:
-                cols = op[2]
-                if len(cols) >= 4:
-                    tag_id = cols[1] if not isinstance(cols[1], tuple) else None
-                    line_s = cols[2] if isinstance(cols[2], int) else 1
-                    line_e = cols[3] if isinstance(cols[3], int) else line_s
-                    if tag_id is not None:
-                        file_tags.append((tag_id, fid, line_s, line_e))
+        # Collect tags for this file from ChangeSet operations or pre-extracted tags
+        file_tags = getattr(cs_obj, "pre_extracted_tags", None)
+        if file_tags is None:
+            file_tags = []
+            for op in getattr(cs_obj, "cs", []):
+                if op and len(op) >= 3 and op[0] == m_bridge_tag.table_id:
+                    cols = op[2]
+                    if len(cols) >= 4:
+                        tag_id = cols[1] if not isinstance(cols[1], tuple) else None
+                        line_s = cols[2] if isinstance(cols[2], int) else 1
+                        line_e = cols[3] if isinstance(cols[3], int) else line_s
+                        if tag_id is not None:
+                            file_tags.append((tag_id, fid, line_s, line_e))
 
         if file_tags:
             tag_bridges = git_parser.map_tags_to_commits(
@@ -1329,6 +1483,35 @@ def processing_maintainer_files(version: str) -> None:
 
     logger.info(f"Staged {matched_count} file-to-section mappings into m_maintainer_file for version '{version}'.")
 
+def execute_and_purge(cs_dict: dict) -> dict:
+    """Execute non-foreign ChangeSets immediately and purge internal AST buffers to minimize RAM usage."""
+    for CS in cs_dict.values():
+        if not CS:
+            continue
+        c_path = getattr(CS, "current_path", None)
+        if c_path and type_check(c_path) in T_NO_FOREIGN:
+            if CS.execute():
+                fid = get_fid_for_path(c_path)
+                if fid is not None and not hasattr(CS, "pre_extracted_tags"):
+                    file_tags = []
+                    for op in getattr(CS, "cs", []):
+                        if op and len(op) >= 3 and op[0] == m_bridge_tag.table_id:
+                            cols = op[2]
+                            if len(cols) >= 4:
+                                tag_id = cols[1] if not isinstance(cols[1], tuple) else None
+                                line_s = cols[2] if isinstance(cols[2], int) else 1
+                                line_e = cols[3] if isinstance(cols[3], int) else line_s
+                                if tag_id is not None:
+                                    file_tags.append((tag_id, fid, line_s, line_e))
+                    CS.pre_extracted_tags = file_tags
+
+                if hasattr(CS, "cs") and isinstance(CS.cs, list):
+                    CS.cs.clear()
+                if hasattr(CS, "store_dict") and isinstance(CS.store_dict, dict):
+                    CS.store_dict.clear()
+                if hasattr(CS, "cs_result") and isinstance(CS.cs_result, list):
+                    CS.cs_result.clear()
+    return cs_dict
 
 if __name__ == "__main__":
     main()

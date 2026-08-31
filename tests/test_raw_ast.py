@@ -128,10 +128,12 @@ class TestRawAstParser(unittest.TestCase):
         self.assertTrue(success, "ChangeSet execution should succeed")
         self.assertEqual(len(cs.cs_result), len(cs.cs))
 
-        # Check tag content
+        # Check tag content is SHA-256 hash
+        import hashlib
+        expected_hash = hashlib.sha256(SAMPLE_DOC_TEXT.encode("latin-1")).hexdigest()
         tag_rows = [row for row in cs.cs if isinstance(row, tuple) and len(row) == 3 and row[0] == m_tag.table_id]
         self.assertEqual(len(tag_rows), 1)
-        self.assertEqual(tag_rows[0][2][3], SAMPLE_DOC_TEXT)
+        self.assertEqual(tag_rows[0][2][3], expected_hash)
 
     def test_raw_ast_empty_file(self) -> None:
         """Verify adding an empty 0-byte file extracts cleanly with valid extents."""
@@ -154,10 +156,12 @@ class TestRawAstParser(unittest.TestCase):
         success = cs.execute()
         self.assertTrue(success)
 
-        # Check tag row
+        # Check tag row has empty string hash
+        import hashlib
+        empty_hash = hashlib.sha256(b"").hexdigest()
         tag_rows = [row for row in cs.cs if isinstance(row, tuple) and len(row) == 3 and row[0] == m_tag.table_id]
         self.assertEqual(len(tag_rows), 1)
-        self.assertEqual(tag_rows[0][2][3], "")
+        self.assertEqual(tag_rows[0][2][3], empty_hash)
 
     def test_raw_ast_r100_rename_noop(self) -> None:
         """Verify exact rename (R100) performs no operations in raw_ast_parse."""

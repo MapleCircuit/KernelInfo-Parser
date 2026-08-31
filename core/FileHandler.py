@@ -25,16 +25,23 @@ class MasterFile:
         purge_list.append(self.version_dict[version_name])
         self.file_dict[version_name] = {}
 
-    def trim_version(self, keep: int = 2) -> int:
-        """Remove the oldest cloned repository version directory from disk and dictionaries."""
-        if len(self.version_dict) > keep:
+    def clear_version_cache(self, version: str) -> None:
+        """Evict cached file contents for a completed version."""
+        if version in self.file_dict:
+            self.file_dict[version].clear()
+            del self.file_dict[version]
+
+    def trim_version(self, keep: int = 1) -> int:
+        """Remove the oldest cloned repository version directories from disk and dictionaries."""
+        trimmed = 0
+        while len(self.version_dict) > keep:
             oldest_v = next(iter(self.version_dict))
             oldest_dir = self.version_dict.pop(oldest_v)
             self.file_dict.pop(oldest_v, None)
             if os.path.exists(oldest_dir):
                 shutil.rmtree(oldest_dir, ignore_errors=True)
-            return 1
-        return 0
+            trimmed += 1
+        return trimmed
 
     def clear_all_version(self) -> None:
         """Remove all cloned repository version directories from disk and clear state."""

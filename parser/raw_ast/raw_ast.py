@@ -1,9 +1,10 @@
 """parser/raw_ast/raw_ast.py - Fallback Raw Content AST Parser & Lifecycle Manager.
 
-Orchestrates parsing of unhandled/generic files by capturing full file content into
+Orchestrates parsing of unhandled/generic files by capturing content hash into
 code occurrence tags (m_tag) and managing tag recycling/lifecycle across versions.
 """
 from __future__ import annotations
+import hashlib
 import logging
 from typing import Any
 
@@ -118,27 +119,30 @@ def close_prior_tags(CS: Any) -> None:
 
 
 class RawManager:
-    """Manages raw content extraction and tag creation for unparsed files."""
+    """Manages raw content extraction, hashing, and tag creation for unparsed files."""
 
     def __init__(self, CS: Any) -> None:
         self.CS = CS
         self.parse_and_extract()
 
     def parse_and_extract(self) -> None:
-        """Read full file content, compute extents, recycle or create tags in ChangeSet."""
+        """Read full file content, compute SHA-256 hash, recycle or create tags in ChangeSet."""
         CS = self.CS
         try:
             content = CS.mf.get_file(CS.current_path, CS.gp.Version_Name)
         except Exception as e:
             raise FILE_ERROR(e) from e
 
+        content_bytes = content.encode("latin-1") if isinstance(content, str) else bytes(content)
+        content_hash = hashlib.sha256(content_bytes).hexdigest()
+
         lines = content.split("\n")
         line_count = max(1, len(lines))
         last_char_count = max(1, len(lines[-1])) if lines else 1
 
-        # Check if content matches prior tag (recycled)
+        # Check if content hash matches prior tag (recycled)
         if getattr(CS, "prior_tags", None) and getattr(CS, "prior_tags_map", None):
-            tag_list = CS.prior_tags_map.get(content)
+            tag_list = CS.prior_tags_map.get(content_hash) or CS.prior_tags_map.get(content)
             if tag_list:
                 for item in tag_list:
                     if item[0] not in CS.active_tag_list:
@@ -155,11 +159,11 @@ class RawManager:
                             ))
                         return
 
-        # New tag required
+        # New tag required using content_hash
         with CS(REF_POS):
             CS.store(m_ast.get_set(
                 None,
-                CS.current_path,
+                content_hash,
                 ASTT.Raw_Content,
             ))
             ast_ref = ((m_ast.table_id, 0), OP_REF, (REF_POS, CS.route[-1]))
@@ -169,7 +173,7 @@ class RawManager:
                 None,
                 CS.gp.VID,
                 0,
-                content,
+                content_hash,
                 ast_ref,
                 0,
                 0,
@@ -202,3 +206,4 @@ class RawManager:
                     tag_ref,
                     tag_ref,
                 ))
+

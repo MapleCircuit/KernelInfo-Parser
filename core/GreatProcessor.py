@@ -31,7 +31,141 @@ change lists, and cross-process IPC communication during multicore parsing.
 """
 import multiprocessing
 import pickle
+import zlib
+from collections import OrderedDict
+from typing import Any
 from core.TableHandling import ChangeSet
+
+
+class CompressedChangeSetDict(dict):
+    """Memory-optimized dictionary that compresses ChangeSet objects in RAM.
+
+    Maintains a small LRU cache in decompressed memory, while keeping all other
+    queued ChangeSets as compact zlib byte buffers.
+    """
+
+    def __init__(self, lru_cache_size: int = 50, *args: Any, **kwargs: Any) -> None:
+        super().__init__()
+        self._compressed_store: dict[str, bytes | None] = {}
+        self._lru_cache: OrderedDict[str, Any] = OrderedDict()
+        self._lru_size = lru_cache_size
+        if args or kwargs:
+            self.update(*args, **kwargs)
+
+    def _evict_lru(self) -> None:
+        """Evict oldest entries from LRU cache and re-compress to persist any in-place mutations."""
+        while len(self._lru_cache) > self._lru_size:
+            k, v = self._lru_cache.popitem(last=False)
+            if v is not None and k in self._compressed_store:
+                try:
+                    raw_bytes = pickle.dumps(v, protocol=pickle.HIGHEST_PROTOCOL)
+                    self._compressed_store[k] = zlib.compress(raw_bytes, level=1)
+                except Exception:
+                    pass
+
+    def __setitem__(self, key: str, value: Any) -> None:
+        if value is None:
+            self._compressed_store[key] = None
+            self._lru_cache.pop(key, None)
+            return
+
+        # Compress into a single flat byte buffer
+        raw_bytes = pickle.dumps(value, protocol=pickle.HIGHEST_PROTOCOL)
+        self._compressed_store[key] = zlib.compress(raw_bytes, level=1)
+
+        # Keep in local LRU working cache
+        self._lru_cache[key] = value
+        self._lru_cache.move_to_end(key)
+        self._evict_lru()
+
+    def __getitem__(self, key: str) -> Any:
+        if key in self._lru_cache:
+            self._lru_cache.move_to_end(key)
+            return self._lru_cache[key]
+
+        if key not in self._compressed_store:
+            raise KeyError(key)
+
+        compressed = self._compressed_store[key]
+        if compressed is None:
+            return None
+
+        # Decompress on-demand
+        obj = pickle.loads(zlib.decompress(compressed))  # noqa: S301
+        self._lru_cache[key] = obj
+        self._lru_cache.move_to_end(key)
+        self._evict_lru()
+        return obj
+
+    def __delitem__(self, key: str) -> None:
+        del self._compressed_store[key]
+        self._lru_cache.pop(key, None)
+
+    def __contains__(self, key: object) -> bool:
+        return key in self._compressed_store
+
+    def __len__(self) -> int:
+        return len(self._compressed_store)
+
+    def __iter__(self):
+        return iter(self._compressed_store)
+
+    def get(self, key: str, default: Any = None) -> Any:
+        if key in self._lru_cache:
+            self._lru_cache.move_to_end(key)
+            return self._lru_cache[key]
+
+        if key not in self._compressed_store:
+            return default
+
+        compressed = self._compressed_store[key]
+        if compressed is None:
+            return None
+
+        obj = pickle.loads(zlib.decompress(compressed))  # noqa: S301
+        self._lru_cache[key] = obj
+        self._lru_cache.move_to_end(key)
+        self._evict_lru()
+        return obj
+
+    def keys(self):
+        return self._compressed_store.keys()
+
+    def values(self):
+        for k in self.keys():
+            yield self[k]
+
+    def items(self):
+        for k in self.keys():
+            yield (k, self[k])
+
+    def update(self, *args: Any, **kwargs: Any) -> None:
+        if args:
+            other = args[0]
+            if isinstance(other, dict):
+                for k, v in other.items():
+                    self[k] = v
+            else:
+                for k, v in other:
+                    self[k] = v
+        for k, v in kwargs.items():
+            self[k] = v
+
+    def pop(self, key: str, *args: Any) -> Any:
+        if key in self:
+            val = self[key]
+            del self[key]
+            return val
+        if args:
+            return args[0]
+        raise KeyError(key)
+
+    def clear(self) -> None:
+        self._compressed_store.clear()
+        self._lru_cache.clear()
+
+    def __bool__(self) -> bool:
+        return bool(self._compressed_store)
 
 
 class GreatProcessor:
@@ -50,6 +184,19 @@ class GreatProcessor:
         self.Alt_ChangeSet_Dict = {}
         self.Manager = None
         self.Shared_ChangeSet_Dict_List = None
+
+    def init_cs_dict(self) -> None:
+        """Initialize or reset ChangeSet_Dict according to active G.LOW_MEMORY_MODE."""
+        from core.globalstuff import G
+        if G.VERY_LOW_MEMORY_MODE:
+            self.ChangeSet_Dict = CompressedChangeSetDict(lru_cache_size=25)
+            self.Alt_ChangeSet_Dict = CompressedChangeSetDict(lru_cache_size=25)
+        elif G.LOW_MEMORY_MODE:
+            self.ChangeSet_Dict = CompressedChangeSetDict(lru_cache_size=50)
+            self.Alt_ChangeSet_Dict = CompressedChangeSetDict(lru_cache_size=50)
+        else:
+            self.ChangeSet_Dict = {}
+            self.Alt_ChangeSet_Dict = {}
 
     def push_set_to_main(self) -> None:
         """Serialize worker process `ChangeSet_Dict` via `pickle.dumps()` and push to IPC shared list."""

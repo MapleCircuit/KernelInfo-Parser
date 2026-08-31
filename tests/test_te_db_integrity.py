@@ -168,6 +168,24 @@ fake_tbl_hash = Table(
     hashing_table=False,
 )
 
+# 9. In-Memory Cached bridge table (vid, fnid) -> fid
+FAKE_TBL_CACHED_BRIDGE_ID = 108
+fake_tbl_cached_bridge = Table(
+    table_id=FAKE_TBL_CACHED_BRIDGE_ID,
+    table_name="_test_fake_cached_bridge",
+    columns=(
+        ("vid", "INT", "NOT NULL"),
+        ("fnid", "INT", "NOT NULL"),
+        ("fid", "INT", "NOT NULL"),
+    ),
+    primary=("vid", "fnid"),
+    foreign=None,
+    initial_insert=None,
+    no_duplicate=False,
+    te_cached=True,
+    hashing_table=False,
+)
+
 ALL_FAKE_TABLES = (
     fake_tbl_simple,
     fake_tbl_nodup,
@@ -177,6 +195,7 @@ ALL_FAKE_TABLES = (
     fake_tbl_cached_nodup,
     fake_tbl_hroot,
     fake_tbl_hash,
+    fake_tbl_cached_bridge,
 )
 FAKE_TABLES_DICT = {tbl.table_id: tbl for tbl in ALL_FAKE_TABLES}
 
@@ -757,6 +776,53 @@ class TestDBAndTEIntegration(unittest.TestCase):
             cycle2_te.commit_all()
         finally:
             cycle2_te.close()
+
+    def test_multi_version_bridge_propagation(self) -> None:
+        """Verify that unchanged bridge records propagate across versions without loss."""
+        # Cycle 1: VID=1
+        fnid = 1
+        fid = 10
+        self.te.set(fake_tbl_cached_bridge.table_id, (1, fnid, fid))
+        self.te.commit_all()
+
+        # Verify DB has VID=1
+        db_row = self.db.select(fake_tbl_cached_bridge, (1, fnid, None))
+        self.assertEqual(db_row, (1, fnid, fid))
+
+        # Cycle 2: VID=2 (Simulate next version update)
+        cycle2_te = CONFIGURED_TE_ENGINE_CLS()
+        cycle2_te.start(ALL_FAKE_TABLES, lambda: self.db)
+        try:
+            # Query Old_VID=1 bridge record (like processing_dirs does)
+            old_bf = cycle2_te.get(fake_tbl_cached_bridge.table_id, (1, fnid, None))
+            self.assertIsNotNone(old_bf)
+            self.assertEqual(old_bf, (1, fnid, fid))
+
+            # Propagate unchanged directory/file bridge to VID=2
+            cycle2_te.set(fake_tbl_cached_bridge.table_id, (2, fnid, old_bf[2]))
+            cycle2_te.commit_all()
+        finally:
+            cycle2_te.close()
+
+        # Cycle 3: VID=3 (Simulate next version update)
+        cycle3_te = CONFIGURED_TE_ENGINE_CLS()
+        cycle3_te.start(ALL_FAKE_TABLES, lambda: self.db)
+        try:
+            # Query Old_VID=2 bridge record
+            old_bf = cycle3_te.get(fake_tbl_cached_bridge.table_id, (2, fnid, None))
+            self.assertIsNotNone(old_bf)
+            self.assertEqual(old_bf, (2, fnid, fid))
+
+            # Propagate unchanged directory/file bridge to VID=3
+            cycle3_te.set(fake_tbl_cached_bridge.table_id, (3, fnid, old_bf[2]))
+            cycle3_te.commit_all()
+        finally:
+            cycle3_te.close()
+
+        # Verify all 3 versions exist in DB
+        for v in (1, 2, 3):
+            row = self.db.select(fake_tbl_cached_bridge, (v, fnid, None))
+            self.assertEqual(row, (v, fnid, fid))
 
 
 # =============================================================================

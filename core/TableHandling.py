@@ -227,7 +227,7 @@ class ChangeSet:
         """
         if current_path is None and operation is not None:
             cut_file = operation.split("\t")
-            self.file_operation = cut_file[0]
+            self.file_operation = sys.intern(cut_file[0]) if cut_file[0] else None
             if len(cut_file) == 1:
                 pass
             elif len(cut_file) == 2:  # noqa: PLR2004
@@ -236,9 +236,9 @@ class ChangeSet:
                 old_path = cut_file[1]
                 current_path = cut_file[2]
         else:
-            self.file_operation = operation
-        self.current_path = current_path
-        self.old_path = old_path
+            self.file_operation = sys.intern(operation) if operation else None
+        self.current_path = sys.intern(current_path) if current_path else None
+        self.old_path = sys.intern(old_path) if old_path else None
         self.cs: list[OperationType] = []
         self.cs_processed: bool = False
         self.cs_result: list[tuple[SafeDataType, ...]] = []

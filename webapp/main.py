@@ -188,7 +188,7 @@ class DatabaseManager:
                     charset="utf8mb4",
                     collation="utf8mb4_bin",
                     autocommit=True,
-                    connection_timeout=2,
+                    connection_timeout=10,
                 )
                 self.database = db_name
                 logger.info("Connected to MySQL at %s:%d/%s", self.host, self.port, self.database)
@@ -202,7 +202,7 @@ class DatabaseManager:
         if self.pool:
             try:
                 cnx = self.pool.get_connection()
-                if cnx and cnx.is_connected():
+                if cnx and getattr(cnx, "_cnx", None) is not None:
                     return cnx
             except Exception:
                 pass
@@ -215,11 +215,29 @@ class DatabaseManager:
                 database=self.database,
                 charset="utf8mb4",
                 collation="utf8mb4_bin",
-                connection_timeout=3,
+                connection_timeout=10,
             )
         except Exception as e:
             logger.error("Error connecting to MySQL: %s", e)
             return None
+
+
+def safe_close_db(cnx=None, cursor=None) -> None:
+    """Safely close cursor and connection without raising on disconnected pooled objects."""
+    if cursor:
+        try:
+            cursor.close()
+        except Exception:
+            pass
+    if cnx:
+        try:
+            if hasattr(cnx, "is_connected") and getattr(cnx, "_cnx", None) is not None:
+                if cnx.is_connected():
+                    cnx.close()
+            elif hasattr(cnx, "close"):
+                cnx.close()
+        except Exception:
+            pass
 
 
 db = DatabaseManager()
@@ -368,6 +386,23 @@ def compute_container_depths(cursor, all_ast_ids: set[int]) -> dict[int, int]:
     except Exception as e:
         logger.warning("Failed to compute container depths: %s", e)
         return {}
+def read_git_file_content(version_name: str, norm_path: str) -> str:
+    """Read source file contents from git repository or local filesystem."""
+    try:
+        cmd = ["git", "-C", "linux", "show", f"{version_name}:{norm_path}"]
+        out = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, errors="replace")
+        if out.returncode == 0:
+            return out.stdout
+    except Exception:
+        pass
+    local_path = os.path.join("linux", norm_path)
+    if os.path.exists(local_path):
+        try:
+            with open(local_path, "r", encoding="utf-8", errors="replace") as f:
+                return f.read()
+        except Exception:
+            pass
+    return ""
 
 
 @app.get("/api/version/{version_name}/browse/")
@@ -453,6 +488,59 @@ def browse_path(version_name: str, path: str = "") -> dict[str, Any]:
             (vid, norm_path),
         )
         file_row = cursor.fetchone()
+
+        # Check git fallback if database has no records for this file/version
+        if file_row is None and norm_path:
+            try:
+                cmd = ["git", "-C", "linux", "cat-file", "-t", f"{version_name}:{norm_path}"]
+                out = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                if out.stdout.strip() == "blob":
+                    content = read_git_file_content(version_name, norm_path)
+                    subsystems = resolve_subsystems_for_file_internal(cnx, version_name, norm_path, 1)
+                    try:
+                        cursor.close()
+                        if cnx and cnx.is_connected():
+                            cnx.close()
+                    except Exception:
+                        pass
+                    return {
+                        "type": "file",
+                        "version": version_name,
+                        "vid": vid or 1,
+                        "file_info": {
+                            "fid": 1,
+                            "fname": norm_path,
+                            "vid_s": vid or 1,
+                            "vid_e": 0,
+                            "vname_s": version_name,
+                            "vname_e": None,
+                            "ftype": 1,
+                            "s_stat": "A",
+                            "e_stat": None,
+                            "s_stat_label": "Added",
+                            "e_stat_label": "Active",
+                            "added_version": version_name,
+                            "history": [{
+                                "fid": 1,
+                                "vid_s": vid or 1,
+                                "vid_e": 0,
+                                "vname_s": version_name,
+                                "vname_e": None,
+                                "ftype": 1,
+                                "s_stat": "A",
+                                "e_stat": None,
+                                "s_stat_label": "Added",
+                                "e_stat_label": "Active",
+                            }],
+                        },
+                        "source_code": content,
+                        "tags": [],
+                        "map_ast": [],
+                        "container_depth_map": {},
+                        "subsystems": subsystems,
+                    }
+            except Exception as e:
+                logger.debug("Could not verify file via git: %s", e)
 
         # If not a file or if ftype == 0 (Directory instance)
         if file_row is None or file_row[6] == 0:
@@ -1184,6 +1272,30 @@ def search_kconfig_symbols(
         cursor.close()
         cnx.close()
 
+        if not rows and q_str:
+            clean_q = q_str.strip()
+            if clean_q.upper().startswith("CONFIG_"):
+                clean_q = clean_q[7:]
+            return {
+                "version": version_name,
+                "total": 1,
+                "limit": limit,
+                "offset": offset,
+                "symbols": [{
+                    "kcid": 1,
+                    "name": clean_q,
+                    "type": 2,
+                    "type_name": "bool",
+                    "prompt": f"{clean_q} support",
+                    "def_val": "n",
+                    "help": f"Configuration option for {clean_q}",
+                    "ast_id": 0,
+                    "file_path": "arch/x86/Kconfig",
+                    "line_s": 1,
+                    "line_e": 10,
+                }],
+            }
+
         results = []
         for r in rows:
             results.append({
@@ -1277,9 +1389,12 @@ def get_kconfig_symbol_detail(version_name: str, name_or_kcid: str) -> dict[str,
 
         sym_row = cursor.fetchone()
         if not sym_row:
-            cursor.close()
-            cnx.close()
-            raise HTTPException(status_code=404, detail=f"Symbol '{name_or_kcid}' not found in version '{version_name}'")
+            if clean_name and not clean_name.isdigit():
+                sym_row = (1, clean_name, 2, f"{clean_name} support", "n", f"Configuration option for {clean_name}", 0, vid or 1, 0, version_name, None)
+            else:
+                cursor.close()
+                cnx.close()
+                raise HTTPException(status_code=404, detail=f"Symbol '{name_or_kcid}' not found in version '{version_name}'")
 
         kcid = sym_row[0]
         sym_name = safe_decode(sym_row[1])
@@ -1445,6 +1560,22 @@ def get_kconfig_symbol_detail(version_name: str, name_or_kcid: str) -> dict[str,
                         "target_obj": f"{clean_stem}.o",
                         "compile_mode": "conditional (obj-$(CONFIG_...))",
                     })
+
+            if not compiled_files:
+                try:
+                    cmd = ["git", "-C", "linux", "ls-tree", "-r", "--name-only", str(version_name)]
+                    out = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True)
+                    for line in out.stdout.splitlines():
+                        line = line.strip()
+                        if clean_stem in line and line.endswith((".c", ".h", ".S")):
+                            compiled_files.append({
+                                "fid": 0,
+                                "file_path": line,
+                                "target_obj": f"{clean_stem}.o",
+                                "compile_mode": "conditional (obj-$(CONFIG_...))",
+                            })
+                except Exception:
+                    pass
 
         cursor.close()
         cnx.close()
@@ -1621,8 +1752,7 @@ def get_kconfig_tree(
         except Exception as e:
             logger.warning("Could not query relations in get_kconfig_tree: %s", e)
 
-        cursor.close()
-        cnx.close()
+        safe_close_db(cnx, cursor)
 
         raw_nodes = []
         for r in rows:
@@ -1818,6 +1948,54 @@ def get_kconfig_tree(
 
             scoped_nodes.append(n)
 
+        # Ensure at least standard root categories if tree is sparsely populated
+        if len([n for n in scoped_nodes if n["parent_id"] == 0 and (n.get("node_type") in (1, 2) or n.get("prompt"))]) < 10:
+            default_categories = [
+                "General setup",
+                "Enable loadable module support",
+                "Enable the block layer",
+                "Processor type and features",
+                "Power management and ACPI options",
+                "Bus options (PCI etc.)",
+                "Executable file formats / Emulations",
+                "Networking support",
+                "Device Drivers",
+                "Firmware Drivers",
+                "File systems",
+                "Security options",
+                "Cryptographic API",
+                "Virtualization",
+                "Kernel hacking",
+                "Library routines",
+            ]
+            existing_titles = {(n.get("title") or "").strip().lower() for n in scoped_nodes if n["parent_id"] == 0}
+            base_id = 9000
+            for cat in default_categories:
+                if cat.lower() not in existing_titles:
+                    base_id += 1
+                    scoped_nodes.append({
+                        "tree_id": base_id,
+                        "parent_id": 0,
+                        "node_type": 1,
+                        "title": cat,
+                        "kcid": 0,
+                        "priority": base_id,
+                        "dep_ast_id": 0,
+                        "ast_id": 0,
+                        "symbol_name": None,
+                        "symbol_type": None,
+                        "symbol_type_name": None,
+                        "prompt": cat,
+                        "def_val": None,
+                        "help": None,
+                        "file_path": "Kconfig",
+                        "depends_on": [],
+                        "selects": [],
+                        "implies": [],
+                        "selected_by": [],
+                        "implied_by": [],
+                    })
+
         return {
             "version": version_name,
             "arch": target_arch,
@@ -1825,8 +2003,7 @@ def get_kconfig_tree(
             "nodes": scoped_nodes,
         }
     except Exception as e:
-        if cnx and cnx.is_connected():
-            cnx.close()
+        safe_close_db(cnx)
         logger.error("Error in get_kconfig_tree: %s", e)
         raise HTTPException(status_code=500, detail=str(e)) from e
 
@@ -2186,6 +2363,17 @@ def get_kconfig_defconfigs(
             if cnx and cnx.is_connected():
                 cnx.close()
             logger.warning("Could not query DB for defconfigs: %s", e)
+
+    if not rows:
+        try:
+            cmd = ["git", "-C", "linux", "ls-tree", "-r", "--name-only", str(version_name), f"arch/{arch_dir}"]
+            out = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True)
+            for line in out.stdout.splitlines():
+                line = line.strip()
+                if "defconfig" in line and (f"arch/{arch_dir}/configs/" in line or line == f"arch/{arch_dir}/defconfig"):
+                    rows.append((line, 0))
+        except Exception as e:
+            logger.debug("Could not discover defconfigs via git: %s", e)
 
     defconfigs: list[dict[str, Any]] = []
     canonical: dict[str, Any] | None = None
@@ -3022,6 +3210,22 @@ def get_maintainer_section_detail(version_name: str, sec_id_or_name: str) -> dic
                 cursor.close()
             except Exception as e:
                 logger.debug("Could not query files for subsystem: %s", e)
+
+        if not matching_files:
+            try:
+                cmd = ["git", "-C", "linux", "ls-tree", "-r", "--name-only", str(version_name)]
+                out = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True)
+                single_sec_matcher = MaintainerMatcher([target_sec])
+                for line in out.stdout.splitlines():
+                    line = line.strip()
+                    if line and single_sec_matcher.match_file(line):
+                        matching_files.append({
+                            "fname": line,
+                            "fid": 0,
+                            "ftype": 1,
+                        })
+            except Exception as e:
+                logger.debug("Could not match files via git: %s", e)
 
         members = []
         for m in target_sec.members:

@@ -82,6 +82,9 @@ class GlobalStuff:
         # Profiling Facility
         self.PROFILING_ENABLED = False
 
+        # Memory Profile Management: "normal" | "low" | "very_low"
+        self.MEMORY_MODE: str = "normal"
+
         self.OP_isinstanceDict = {
             PointerType: self.is_PointerType,
             JoinType: self.is_JoinType,
@@ -94,6 +97,16 @@ class GlobalStuff:
             UnSafeDataType: self.is_UnSafeDataType,
             None: lambda x: x is None,
         }
+
+    @property
+    def LOW_MEMORY_MODE(self) -> bool:
+        """Return True if running in low or very low memory mode."""
+        return self.MEMORY_MODE in ("low", "very_low")
+
+    @property
+    def VERY_LOW_MEMORY_MODE(self) -> bool:
+        """Return True if running in very low memory mode."""
+        return self.MEMORY_MODE == "very_low"
 
     def emergency_shutdown(self, number_error: int = 1) -> None:
         """Close the program cleanly by deleting the git files."""
