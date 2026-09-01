@@ -97,8 +97,8 @@ Central runtime container, schema registry, and worker IPC coordinator.
   - `Old_Version_Name: str | int`: Prior Git release tag.
   - `VID: int` / `Old_VID: int`: Monotonic database primary keys for current and prior versions in `m_v_main`.
   - `Change_List: list[str] | None`: Raw diff lines (`"M\tpath"`, `"R100\told\tnew"`).
-  - `ChangeSet_Dict: dict[str, ChangeSet]`: Main process dictionary mapping relative file paths to parsed `ChangeSet` objects.
-  - `Alt_ChangeSet_Dict: dict[str, ChangeSet]`: Secondary cache for on-demand parsed foreign `ChangeSets` during cross-file reference resolution.
+  - `ChangeSet_Dict: dict[str, ChangeSet] | CompressedChangeSetDict`: Main process dictionary mapping relative file paths to parsed `ChangeSet` objects.
+  - `Alt_ChangeSet_Dict: dict[str, ChangeSet] | CompressedChangeSetDict`: Secondary cache for on-demand parsed foreign `ChangeSets` during cross-file reference resolution.
   - `Shared_ChangeSet_Dict_List: list[bytes] | None`: IPC list holding worker `pickle.dumps()` payloads.
 - **IPC Protocol**:
   - `start_manager() -> None`: Initializes `Shared_ChangeSet_Dict_List = []`.

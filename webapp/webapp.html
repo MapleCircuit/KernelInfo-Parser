@@ -1172,6 +1172,138 @@
     }
 
     /* -------------------------------------------------------------------------
+       Tag Version Timeline & Code Evolution Explorer Styling
+       ------------------------------------------------------------------------- */
+    .tag-chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 3px;
+      padding: 1px 6px;
+      font-size: 10px;
+      font-family: var(--font-mono, monospace);
+      background: rgba(97, 175, 239, 0.12);
+      border: 1px solid rgba(97, 175, 239, 0.3);
+      color: #61afef;
+      border-radius: 4px;
+      cursor: pointer;
+      margin-left: 6px;
+      user-select: none;
+      transition: all 0.15s ease;
+      vertical-align: middle;
+    }
+    .tag-chip:hover {
+      background: rgba(97, 175, 239, 0.25);
+      border-color: #61afef;
+      box-shadow: 0 0 8px rgba(97, 175, 239, 0.4);
+      transform: translateY(-1px);
+    }
+    .tag-timeline-scrubber-box {
+      box-shadow: inset 0 1px 3px rgba(0, 0, 0, 0.3);
+    }
+    .timeline-node-tick {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      cursor: pointer;
+      font-size: 10px;
+      color: var(--text-muted);
+      transition: color 0.15s, transform 0.15s;
+      user-select: none;
+    }
+    .timeline-node-tick:hover {
+      color: var(--accent);
+      transform: translateY(-2px);
+    }
+    .timeline-node-tick.active {
+      color: var(--text-bright);
+      font-weight: 700;
+    }
+    .timeline-node-dot {
+      width: 9px;
+      height: 9px;
+      border-radius: 50%;
+      background: var(--text-muted);
+      margin-bottom: 4px;
+      transition: all 0.2s;
+    }
+    .timeline-node-tick:hover .timeline-node-dot {
+      background: var(--accent);
+      box-shadow: 0 0 6px var(--accent);
+    }
+    .timeline-node-tick.active .timeline-node-dot {
+      background: var(--accent);
+      box-shadow: 0 0 10px var(--accent);
+      transform: scale(1.4);
+    }
+    .timeline-node-dot.dot-mutation {
+      background: #e5c07b;
+      box-shadow: 0 0 4px rgba(229, 192, 123, 0.6);
+    }
+    .timeline-node-dot.dot-introduced {
+      background: var(--success);
+      box-shadow: 0 0 4px rgba(152, 195, 121, 0.6);
+    }
+    .timeline-node-dot.dot-deleted {
+      background: var(--danger);
+      box-shadow: 0 0 4px rgba(224, 108, 117, 0.6);
+    }
+
+    /* Tag Timeline Diff View Styling */
+    .diff-line {
+      display: flex;
+      padding: 2px 10px;
+      white-space: pre-wrap;
+      word-break: break-all;
+      font-family: var(--font-mono, monospace);
+    }
+    .diff-line-add {
+      background: rgba(152, 195, 121, 0.15);
+      color: #98c379;
+      border-left: 3px solid #98c379;
+    }
+    .diff-line-del {
+      background: rgba(224, 108, 117, 0.15);
+      color: #e06c75;
+      border-left: 3px solid #e06c75;
+      text-decoration: line-through;
+    }
+    .diff-line-ctx {
+      color: var(--text-main);
+      border-left: 3px solid transparent;
+    }
+    .diff-line-marker {
+      width: 22px;
+      user-select: none;
+      font-weight: 700;
+      opacity: 0.8;
+    }
+    .diff-line-content {
+      flex: 1;
+    }
+
+    /* Split Diff Grid */
+    .split-diff-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      height: 100%;
+    }
+    .split-diff-pane {
+      overflow-x: auto;
+      padding: 8px;
+    }
+    .split-diff-pane:first-child {
+      border-right: 1px solid var(--border-color);
+    }
+    .split-diff-header {
+      padding: 6px 12px;
+      font-size: 11px;
+      font-weight: 600;
+      background: var(--bg-panel);
+      border-bottom: 1px solid var(--border-color);
+      color: var(--text-bright);
+    }
+
+    /* -------------------------------------------------------------------------
        7 Major Features Styling (Diff, Patch, AST Sandbox, XRef, Graph, Exporter)
        ------------------------------------------------------------------------- */
     .diff-workspace, .patch-workspace, .ast-sandbox-workspace {
@@ -2680,6 +2812,83 @@
       </div>
       <div class="modal-footer">
         <button class="btn btn-accent" onclick="closeBloatometerModal()">Close</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Tag Version Timeline & Code Evolution Explorer Modal -->
+  <div id="tagTimelineModal" class="modal-overlay" onclick="closeTagTimelineModal(event)">
+    <div class="modal" style="max-width: 1050px; width: 95%; max-height: 90vh;" onclick="event.stopPropagation()">
+      <div class="modal-header">
+        <div style="display: flex; align-items: center; gap: 10px; flex-wrap: wrap;">
+          <span class="badge badge-accent" id="tagTimelineIdBadge" style="font-size: 13px; font-weight: 700;">🏷️ Tag #...</span>
+          <h3 id="tagTimelineTitle" style="margin: 0; font-size: 16px; color: var(--text-bright);">Tag Version Evolution</h3>
+          <span class="badge" id="tagTimelineAstBadge" style="font-size: 11px;">AST Symbol</span>
+          <span id="tagTimelineFileBadge" style="font-size: 12px; color: var(--text-muted); font-family: monospace;"></span>
+        </div>
+        <button class="btn" onclick="closeTagTimelineModal()" style="padding: 4px 10px; font-size: 14px;">✕</button>
+      </div>
+
+      <div class="modal-body" style="padding: 16px; display: flex; flex-direction: column; gap: 14px;">
+        <!-- Tag Summary Bar -->
+        <div style="display: flex; align-items: center; justify-content: space-between; background: var(--bg-main); padding: 10px 16px; border-radius: 6px; border: 1px solid var(--border-color); flex-wrap: wrap; gap: 10px;">
+          <div style="display: flex; gap: 16px; font-size: 12px; flex-wrap: wrap;">
+            <span><strong style="color: var(--text-muted);">Total Versions:</strong> <span id="tagTotalVersions" style="color: var(--text-bright); font-weight: 600;">-</span></span>
+            <span><strong style="color: var(--text-muted);">Mutations:</strong> <span id="tagTotalMutations" style="color: var(--accent); font-weight: 600;">-</span></span>
+            <span><strong style="color: var(--text-muted);">Introduced In:</strong> <span id="tagIntroVersion" style="color: var(--success); font-weight: 600;">-</span></span>
+            <span><strong style="color: var(--text-muted);">Latest Active:</strong> <span id="tagLatestVersion" style="color: var(--text-bright); font-weight: 600;">-</span></span>
+          </div>
+          <div style="display: flex; gap: 6px; align-items: center;">
+            <span style="font-size: 11px; color: var(--text-muted);">View:</span>
+            <button class="btn btn-sm btn-active" id="btnDiffUnified" onclick="setTimelineViewMode('unified')" title="Unified Diff View">Unified Diff</button>
+            <button class="btn btn-sm" id="btnDiffSplit" onclick="setTimelineViewMode('split')" title="Side-by-Side Split Diff View">Split Diff</button>
+            <button class="btn btn-sm" id="btnDiffFull" onclick="setTimelineViewMode('full')" title="Full Code View">Full Code</button>
+          </div>
+        </div>
+
+        <!-- Interactive Timeline Scrubber Bar -->
+        <div class="tag-timeline-scrubber-box" style="background: var(--bg-panel); padding: 14px 18px; border-radius: 8px; border: 1px solid var(--border-color); display: flex; flex-direction: column; gap: 10px;">
+          <div style="display: flex; justify-content: space-between; align-items: center;">
+            <div style="display: flex; align-items: center; gap: 10px;">
+              <strong style="font-size: 13px; color: var(--text-bright);">🕒 Version Timeline</strong>
+              <span id="timelineCurrentVersionBadge" class="badge badge-accent" style="font-size: 12px; font-weight: 600;">v...</span>
+              <span id="timelineCurrentStatusBadge" class="badge" style="font-size: 11px;">Status</span>
+            </div>
+            <div style="display: flex; align-items: center; gap: 6px;">
+              <button class="btn btn-sm" onclick="stepTimeline(-1)" title="Previous Version (Left Arrow)">◀</button>
+              <button class="btn btn-sm" id="btnPlayTimeline" onclick="toggleTimelinePlayback()" title="Play / Pause Auto Scrubber (Space)">▶ Play</button>
+              <button class="btn btn-sm" onclick="stepTimeline(1)" title="Next Version (Right Arrow)">▶</button>
+            </div>
+          </div>
+
+          <!-- Draggable Range Slider with Glow Track -->
+          <div style="position: relative; padding: 6px 0 2px 0;">
+            <input type="range" id="tagTimelineSlider" min="0" max="0" value="0" step="1" 
+                   oninput="onTimelineSliderInput(this.value)" 
+                   style="width: 100%; cursor: pointer; accent-color: var(--accent);">
+            <!-- Version Tick Nodes Container -->
+            <div id="tagTimelineNodes" style="display: flex; justify-content: space-between; margin-top: 6px; position: relative;">
+              <!-- Dynamic Version Step Ticks / Badges -->
+            </div>
+          </div>
+        </div>
+
+        <!-- Commit Context Panel (if commit exists for active snapshot) -->
+        <div id="tagTimelineCommitBox" style="display: none; background: rgba(97, 175, 239, 0.08); border: 1px solid rgba(97, 175, 239, 0.25); border-radius: 6px; padding: 10px 14px; font-size: 12px;">
+          <!-- Dynamic Commit details -->
+        </div>
+
+        <!-- Code & Diff Render Container -->
+        <div id="tagTimelineCodeContainer" style="background: var(--bg-main); border: 1px solid var(--border-color); border-radius: 6px; overflow: hidden; font-family: monospace; font-size: 12px; line-height: 1.5; min-height: 220px; max-height: 420px; overflow-y: auto;">
+          <!-- Diff or code rows rendered here -->
+        </div>
+      </div>
+
+      <div class="modal-footer">
+        <span style="margin-right: auto; font-size: 11px; color: var(--text-muted);">
+          Tip: Drag slider or use ◄ / ► arrow keys to scrub versions. Space to Play/Pause.
+        </span>
+        <button class="btn" onclick="closeTagTimelineModal()">Close</button>
       </div>
     </div>
   </div>
@@ -4432,7 +4641,8 @@
               rawText: fullRawLine,
               collapseBtn: collapseBtn,
               outerIdx: outerIdx,
-              tag: tag
+              tag: tag,
+              isFirstLine: isFirstLine
             };
           }
         });
@@ -4578,7 +4788,7 @@
       let bodyHtml = "";
 
       for (let l = 1; l <= maxLine; l++) {
-        const lineData = fileLines[l] || { rawText: " ", collapseBtn: "", outerIdx: null };
+        const lineData = fileLines[l] || { rawText: " ", collapseBtn: "", outerIdx: null, isFirstLine: false, tag: null };
         const collapseSpan = lineData.collapseBtn || "";
         const tagClass = lineData.outerIdx !== null ? `tag-block-${lineData.outerIdx}` : "";
         const rawText = lineData.rawText || " ";
@@ -4596,6 +4806,11 @@
         });
 
         const highlightedContent = highlightLineText(rawText, lineMaps);
+
+        // Tag chip rendering for lines starting a tag block
+        const tagChipHtml = (lineData.isFirstLine && lineData.tag && lineData.tag.tag_id)
+          ? `<span class="tag-chip" onclick="openTagTimelineModal(${lineData.tag.tag_id}, '${currentVersion}')" title="Inspect Tag #${lineData.tag.tag_id} (${lineData.tag.ast_type_name || 'Tag'}) version history & evolution timeline">🏷️ #${lineData.tag.tag_id}</span>`
+          : "";
 
         // Blame cell rendering
         let blameCellHtml = "";
@@ -4625,7 +4840,7 @@
         }
 
         gutterHtml += `<div class="gutter-line ${cpproClass}" id="g_${l}" style="display: flex; align-items: center;">${blameCellHtml}<span onclick="onLineClick(${l}, event)" title="Line ${l} (Click to link, Shift+Click for range)" style="min-width: 32px; text-align: right;">${l}</span> ${collapseSpan}</div>`;
-        bodyHtml += `<div class="code-line ${tagClass} ${cpproClass}" id="l_${l}">${highlightedContent || ' '}</div>`;
+        bodyHtml += `<div class="code-line ${tagClass} ${cpproClass}" id="l_${l}">${highlightedContent || ' '}${tagChipHtml}</div>`;
       }
 
       gutter.innerHTML = gutterHtml;
@@ -4745,6 +4960,324 @@
     }
 
     // ------------------------------------------------------------------------
+    // Tag Version Timeline & Code Evolution Explorer
+    // ------------------------------------------------------------------------
+    let activeTagTimelineData = null;
+    let activeTagTimelineIndex = 0;
+    let activeTimelineViewMode = "unified"; // "unified" | "split" | "full"
+    let tagTimelinePlayTimer = null;
+
+    async function openTagTimelineModal(tagId, initialVersion = null) {
+      if (!tagId) return;
+      const modal = document.getElementById("tagTimelineModal");
+      if (!modal) return;
+
+      // Stop any existing playback
+      if (tagTimelinePlayTimer) {
+        clearInterval(tagTimelinePlayTimer);
+        tagTimelinePlayTimer = null;
+        const playBtn = document.getElementById("btnPlayTimeline");
+        if (playBtn) playBtn.innerHTML = "▶ Play";
+      }
+
+      // Show modal in loading state
+      modal.classList.add("open");
+      const codeContainer = document.getElementById("tagTimelineCodeContainer");
+      codeContainer.innerHTML = `<div style="padding: 40px; text-align: center; color: var(--accent);">⏳ Loading evolution timeline for Tag #${tagId}...</div>`;
+
+      document.getElementById("tagTimelineIdBadge").innerText = `🏷️ Tag #${tagId}`;
+      document.getElementById("tagTimelineTitle").innerText = `Tag #${tagId} Version Evolution`;
+
+      const data = await apiFetch(`/api/tag/${tagId}/timeline`);
+      if (!data || !data.timeline || data.timeline.length === 0) {
+        codeContainer.innerHTML = `<div style="padding: 40px; text-align: center; color: var(--danger);">Failed to load timeline data for Tag #${tagId}.</div>`;
+        return;
+      }
+
+      activeTagTimelineData = data;
+
+      // Update Summary Header
+      document.getElementById("tagTimelineAstBadge").innerText = data.ast_type_name ? `${data.ast_name || 'Symbol'} (${data.ast_type_name})` : (data.ast_name || 'AST Symbol');
+      document.getElementById("tagTimelineFileBadge").innerText = data.file_path || "";
+      document.getElementById("tagTotalVersions").innerText = data.total_versions || data.timeline.length;
+      document.getElementById("tagTotalMutations").innerText = data.total_mutations || 0;
+      document.getElementById("tagIntroVersion").innerText = data.introduced_version || "-";
+      document.getElementById("tagLatestVersion").innerText = data.latest_version || "-";
+
+      // Configure Slider
+      const slider = document.getElementById("tagTimelineSlider");
+      slider.min = 0;
+      slider.max = data.timeline.length - 1;
+
+      // Determine initial active index
+      let targetIdx = data.timeline.length - 1; // default to latest
+      if (initialVersion) {
+        const foundIdx = data.timeline.findIndex(t => t.vname === initialVersion || String(t.vid) === String(initialVersion));
+        if (foundIdx !== -1) targetIdx = foundIdx;
+      }
+      activeTagTimelineIndex = targetIdx;
+      slider.value = activeTagTimelineIndex;
+
+      // Render step markers / ticks along slider track
+      renderTimelineNodes(data.timeline);
+
+      // Render Active View
+      renderTimelineView();
+    }
+
+    async function openTagTimelineByAst(astId) {
+      if (!astId) return;
+      if (activeFileTags && activeFileTags.length > 0) {
+        const found = activeFileTags.find(t => t.ast_id === astId || (t.maps && t.maps.some(m => m.ast_id === astId)));
+        if (found) {
+          openTagTimelineModal(found.tag_id, currentVersion);
+          return;
+        }
+      }
+      try {
+        const res = await apiFetch(`/api/version/${currentVersion}/symbols/search?q=${astId}`);
+        if (res && res.symbols && res.symbols.length > 0 && res.symbols[0].tag_id) {
+          openTagTimelineModal(res.symbols[0].tag_id, currentVersion);
+          return;
+        }
+      } catch (e) {}
+      openTagTimelineModal(astId, currentVersion);
+    }
+
+    function closeTagTimelineModal(event) {
+      if (event && event.target && !event.target.classList.contains("modal-overlay")) return;
+      const modal = document.getElementById("tagTimelineModal");
+      if (modal) modal.classList.remove("open");
+      if (tagTimelinePlayTimer) {
+        clearInterval(tagTimelinePlayTimer);
+        tagTimelinePlayTimer = null;
+        const playBtn = document.getElementById("btnPlayTimeline");
+        if (playBtn) playBtn.innerHTML = "▶ Play";
+      }
+    }
+
+    function renderTimelineNodes(timeline) {
+      const nodesContainer = document.getElementById("tagTimelineNodes");
+      if (!nodesContainer) return;
+
+      let html = "";
+      timeline.forEach((item, idx) => {
+        let dotClass = "timeline-node-dot";
+        if (item.status === "introduced") dotClass += " dot-introduced";
+        else if (item.status === "modified") dotClass += " dot-mutation";
+        else if (item.status === "deleted") dotClass += " dot-deleted";
+
+        const isCur = (idx === activeTagTimelineIndex);
+        html += `
+          <div class="timeline-node-tick ${isCur ? 'active' : ''}" id="tntick_${idx}" onclick="setTimelineVersionIndex(${idx})" title="Version ${escapeHtml(item.vname)} · Status: ${escapeHtml(item.status)}">
+            <div class="${dotClass}"></div>
+            <span>${escapeHtml(item.vname)}</span>
+          </div>
+        `;
+      });
+      nodesContainer.innerHTML = html;
+    }
+
+    function onTimelineSliderInput(val) {
+      activeTagTimelineIndex = parseInt(val, 10);
+      renderTimelineView();
+    }
+
+    function setTimelineVersionIndex(idx) {
+      if (!activeTagTimelineData || !activeTagTimelineData.timeline) return;
+      activeTagTimelineIndex = Math.max(0, Math.min(activeTagTimelineData.timeline.length - 1, idx));
+      const slider = document.getElementById("tagTimelineSlider");
+      if (slider) slider.value = activeTagTimelineIndex;
+      renderTimelineView();
+    }
+
+    function stepTimeline(delta) {
+      if (!activeTagTimelineData || !activeTagTimelineData.timeline) return;
+      const newIdx = activeTagTimelineIndex + delta;
+      if (newIdx >= 0 && newIdx < activeTagTimelineData.timeline.length) {
+        setTimelineVersionIndex(newIdx);
+      }
+    }
+
+    function toggleTimelinePlayback() {
+      const playBtn = document.getElementById("btnPlayTimeline");
+      if (tagTimelinePlayTimer) {
+        clearInterval(tagTimelinePlayTimer);
+        tagTimelinePlayTimer = null;
+        if (playBtn) playBtn.innerHTML = "▶ Play";
+      } else {
+        if (!activeTagTimelineData || !activeTagTimelineData.timeline) return;
+        if (playBtn) playBtn.innerHTML = "⏸ Pause";
+        tagTimelinePlayTimer = setInterval(() => {
+          if (!activeTagTimelineData || !activeTagTimelineData.timeline) {
+            clearInterval(tagTimelinePlayTimer);
+            tagTimelinePlayTimer = null;
+            return;
+          }
+          let nextIdx = activeTagTimelineIndex + 1;
+          if (nextIdx >= activeTagTimelineData.timeline.length) {
+            nextIdx = 0;
+          }
+          setTimelineVersionIndex(nextIdx);
+        }, 1400);
+      }
+    }
+
+    function setTimelineViewMode(mode) {
+      activeTimelineViewMode = mode;
+      document.getElementById("btnDiffUnified").classList.toggle("btn-active", mode === "unified");
+      document.getElementById("btnDiffSplit").classList.toggle("btn-active", mode === "split");
+      document.getElementById("btnDiffFull").classList.toggle("btn-active", mode === "full");
+      renderTimelineView();
+    }
+
+    function renderTimelineView() {
+      if (!activeTagTimelineData || !activeTagTimelineData.timeline) return;
+      const timeline = activeTagTimelineData.timeline;
+      const snapshot = timeline[activeTagTimelineIndex];
+      if (!snapshot) return;
+
+      // Update Active Node Highlight
+      document.querySelectorAll(".timeline-node-tick").forEach((el, idx) => {
+        el.classList.toggle("active", idx === activeTagTimelineIndex);
+      });
+
+      // Update Current Version & Status Badges
+      const vBadge = document.getElementById("timelineCurrentVersionBadge");
+      const sBadge = document.getElementById("timelineCurrentStatusBadge");
+      vBadge.innerText = snapshot.vname || `VID ${snapshot.vid}`;
+
+      let statusColor = "badge-accent";
+      let statusLabel = snapshot.status ? snapshot.status.toUpperCase() : "ACTIVE";
+      if (snapshot.status === "introduced") {
+        statusColor = "badge-success";
+        statusLabel = `✨ INTRODUCED (${snapshot.lines_added || 0} lines)`;
+      } else if (snapshot.status === "modified") {
+        statusColor = "badge-warning";
+        statusLabel = `🔄 MODIFIED (+${snapshot.lines_added || 0}, -${snapshot.lines_removed || 0})`;
+      } else if (snapshot.status === "unchanged") {
+        statusColor = "badge-accent";
+        statusLabel = "⏸ UNCHANGED";
+      } else if (snapshot.status === "deleted") {
+        statusColor = "badge-danger";
+        statusLabel = `❌ DELETED (-${snapshot.lines_removed || 0} lines)`;
+      }
+      sBadge.className = `badge ${statusColor}`;
+      sBadge.innerText = statusLabel;
+
+      // Commit Box
+      const commitBox = document.getElementById("tagTimelineCommitBox");
+      const commits = snapshot.commits || [];
+      if (commits.length > 0) {
+        const comm = commits[0];
+        const hashShort = (comm.commit_hash || "").substring(0, 10);
+        commitBox.style.display = "block";
+        commitBox.innerHTML = `
+          <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px;">
+            <div style="display: flex; align-items: center; gap: 8px;">
+              <span class="commit-hash-chip" onclick="openCommitModal('${escapeJs(comm.commit_hash)}')" title="Click to view commit details">#${hashShort}</span>
+              <strong style="color: var(--text-bright);">${escapeHtml(comm.subject || 'Code update')}</strong>
+            </div>
+            <div style="color: var(--text-muted); font-size: 11px;">
+              Author: <span style="color: var(--accent);">${escapeHtml(comm.author_name || 'Unknown')}</span> · ${escapeHtml(comm.author_date || '')}
+            </div>
+          </div>
+        `;
+      } else {
+        commitBox.style.display = "none";
+      }
+
+      // Code / Diff Display
+      const codeContainer = document.getElementById("tagTimelineCodeContainer");
+      if (snapshot.status === "deleted") {
+        codeContainer.innerHTML = `
+          <div style="padding: 30px; text-align: center; color: var(--danger);">
+            <div style="font-size: 16px; font-weight: bold; margin-bottom: 6px;">❌ Tag Inactive or Deleted in ${escapeHtml(snapshot.vname)}</div>
+            <div style="color: var(--text-muted); font-size: 11px;">This code snippet was removed or is not present in this release version.</div>
+          </div>
+        `;
+        return;
+      }
+
+      if (activeTimelineViewMode === "unified") {
+        codeContainer.innerHTML = renderUnifiedDiffHtml(snapshot.diff || []);
+      } else if (activeTimelineViewMode === "split") {
+        codeContainer.innerHTML = renderSplitDiffHtml(snapshot.prev_code, snapshot.code, snapshot.diff || []);
+      } else {
+        codeContainer.innerHTML = renderFullCodeHtml(snapshot.code || "", snapshot.line_s || 1);
+      }
+    }
+
+    function renderUnifiedDiffHtml(diffList) {
+      if (!diffList || diffList.length === 0) {
+        return `<div style="padding: 20px; color: var(--text-muted); text-align: center;">No code lines.</div>`;
+      }
+      let html = "";
+      diffList.forEach((d) => {
+        let lineClass = "diff-line-ctx";
+        let marker = " ";
+        if (d.type === "add") {
+          lineClass = "diff-line-add";
+          marker = "+";
+        } else if (d.type === "del") {
+          lineClass = "diff-line-del";
+          marker = "-";
+        }
+        html += `
+          <div class="diff-line ${lineClass}">
+            <span class="diff-line-marker">${marker}</span>
+            <span class="diff-line-content">${escapeHtml(d.text || ' ')}</span>
+          </div>
+        `;
+      });
+      return html;
+    }
+
+    function renderSplitDiffHtml(prevCode, currCode, diffList) {
+      const prevLines = prevCode ? prevCode.split("\n") : [];
+      const currLines = currCode ? currCode.split("\n") : [];
+
+      let prevHtml = "";
+      prevLines.forEach((l, idx) => {
+        prevHtml += `<div class="diff-line diff-line-ctx"><span style="width: 28px; opacity: 0.5; user-select: none;">${idx+1}</span><span class="diff-line-content">${escapeHtml(l || ' ')}</span></div>`;
+      });
+
+      let currHtml = "";
+      currLines.forEach((l, idx) => {
+        currHtml += `<div class="diff-line diff-line-ctx"><span style="width: 28px; opacity: 0.5; user-select: none;">${idx+1}</span><span class="diff-line-content">${escapeHtml(l || ' ')}</span></div>`;
+      });
+
+      return `
+        <div class="split-diff-grid">
+          <div class="split-diff-pane">
+            <div class="split-diff-header">Prior Version (${prevCode ? `${prevLines.length} lines` : 'None / New'})</div>
+            ${prevHtml || '<div style="padding: 16px; color: var(--text-muted);">(No previous version)</div>'}
+          </div>
+          <div class="split-diff-pane">
+            <div class="split-diff-header">Current Snapshot (${currLines.length} lines)</div>
+            ${currHtml || '<div style="padding: 16px; color: var(--text-muted);">(Empty code)</div>'}
+          </div>
+        </div>
+      `;
+    }
+
+    function renderFullCodeHtml(code, startLine = 1) {
+      if (!code) return `<div style="padding: 20px; color: var(--text-muted); text-align: center;">Empty code content.</div>`;
+      const lines = code.split("\n");
+      let html = "";
+      lines.forEach((l, idx) => {
+        const lineNum = startLine + idx;
+        html += `
+          <div class="diff-line diff-line-ctx" style="border-left: none;">
+            <span style="width: 34px; color: var(--text-muted); opacity: 0.6; text-align: right; margin-right: 12px; user-select: none;">${lineNum}</span>
+            <span class="diff-line-content">${escapeHtml(l || ' ')}</span>
+          </div>
+        `;
+      });
+      return html;
+    }
+
+    // ------------------------------------------------------------------------
     // AST Container Hierarchy Inspector
     // ------------------------------------------------------------------------
     async function inspectAst(astId, name, typeName, event) {
@@ -4773,6 +5306,7 @@
             <strong style="color: var(--text-bright);">${node.name || 'Anonymous'}</strong>
             <span class="badge">${node.type_name || 'Undefined'}</span>
             ${node.ast_raw ? `<span style="font-size: 10px; color: var(--text-muted); cursor: pointer;" onclick="alert(JSON.stringify(${escapeHtml(JSON.stringify(node.ast_raw))}, null, 2))">🔍 raw JSON</span>` : ''}
+            <button class="btn btn-sm" style="font-size: 10px; padding: 1px 6px; margin-left: 6px;" onclick="openTagTimelineByAst(${node.ast_id})" title="Inspect Tag evolution & cross-version timeline for AST #${node.ast_id}">🕒 Tag Timeline</button>
           </div>
       `;
 
@@ -9818,6 +10352,20 @@
     }
 
     window.addEventListener("keydown", (e) => {
+      const tagModal = document.getElementById("tagTimelineModal");
+      if (tagModal && tagModal.classList.contains("open")) {
+        if (e.key === "ArrowLeft") {
+          stepTimeline(-1);
+          e.preventDefault();
+        } else if (e.key === "ArrowRight") {
+          stepTimeline(1);
+          e.preventDefault();
+        } else if (e.key === " " && (e.target === document.body || e.target === tagModal)) {
+          toggleTimelinePlayback();
+          e.preventDefault();
+        }
+      }
+
       if (e.key === "Escape" && currentAppMode !== "tui") {
         closeAllModals();
       }

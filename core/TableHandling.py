@@ -921,12 +921,17 @@ class ChangeSet:
         """Remove un-picklable and ephemeral parsing structures before IPC serialization."""
         self.gp = None
         self.mf = None
+        self.file = None
         self.debug = []
         self.parsers = {}
         self.prior_tags = None
         self.prior_tags_map = None
         self.active_tag_list = None
         self._bridge_maps = set()
+        self.route = [REF_ROOT]
+        self.route_count = []
+        self.multi_stack = []
+        self._cached_route = (REF_ROOT,)
 
     def register_bridge_map(self, tag_ref: Any, map_ref: Any) -> bool:
         """Register a tag-to-map bridge association within this ChangeSet.

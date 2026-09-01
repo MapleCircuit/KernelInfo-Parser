@@ -134,6 +134,53 @@ def reclaim_system_memory() -> None:
     except Exception:
         pass
 
+
+file_fid_cache: dict[str, int | None] = {}
+
+
+def get_fid_for_path(path: str) -> int | None:
+    """Resolve m_file.fid for a given path in active gp.VID."""
+    if path in file_fid_cache:
+        return file_fid_cache[path]
+    fn_row = m_file_name.get(None, path)
+    if fn_row and len(fn_row) >= 3 and fn_row[2]:
+        fnid = fn_row[2][0]
+        bf_row = m_bridge_file.get(gp.VID, fnid, None)
+        if bf_row and len(bf_row) >= 3 and bf_row[2]:
+            fid = bf_row[2][2]
+            file_fid_cache[path] = fid
+            return fid
+    file_fid_cache[path] = None
+    return None
+
+
+def extract_tags_and_evacuate_cs(cs_obj: ChangeSet) -> None:
+    """Extract bridge tags and purge internal AST buffers from an executed ChangeSet."""
+    c_path = getattr(cs_obj, "current_path", None)
+    if not c_path:
+        return
+    fid = get_fid_for_path(c_path)
+    if fid is not None and not hasattr(cs_obj, "pre_extracted_tags"):
+        file_tags = []
+        for op in getattr(cs_obj, "cs", []):
+            if op and len(op) >= 3 and op[0] == m_bridge_tag.table_id:
+                cols = op[2]
+                if len(cols) >= 4:
+                    tag_id = cols[1] if not isinstance(cols[1], tuple) else None
+                    line_s = cols[2] if isinstance(cols[2], int) else 1
+                    line_e = cols[3] if isinstance(cols[3], int) else line_s
+                    if tag_id is not None:
+                        file_tags.append((tag_id, fid, line_s, line_e))
+        cs_obj.pre_extracted_tags = file_tags
+
+    if hasattr(cs_obj, "cs") and isinstance(cs_obj.cs, list):
+        cs_obj.cs.clear()
+    if hasattr(cs_obj, "store_dict") and isinstance(cs_obj.store_dict, dict):
+        cs_obj.store_dict.clear()
+    if hasattr(cs_obj, "cs_result") and isinstance(cs_obj.cs_result, list):
+        cs_obj.cs_result.clear()
+
+
 def update(version: str) -> None:
     """Execute the full version parsing and database ingestion pipeline for a target release version.
     
@@ -210,60 +257,13 @@ def update(version: str) -> None:
             cs_queue.append(current_cs)
         else:
             executed_count += 1
-            # Selective evacuation: only for non-C file types without foreign AST references
-            c_path = getattr(cs_obj, "current_path", None)
-            if c_path and type_check(c_path) in T_NO_FOREIGN:
-                fid = get_fid_for_path(c_path)
-                if fid is not None and not hasattr(cs_obj, "pre_extracted_tags"):
-                    file_tags = []
-                    for op in getattr(cs_obj, "cs", []):
-                        if op and len(op) >= 3 and op[0] == m_bridge_tag.table_id:
-                            cols = op[2]
-                            if len(cols) >= 4:
-                                tag_id = cols[1] if not isinstance(cols[1], tuple) else None
-                                line_s = cols[2] if isinstance(cols[2], int) else 1
-                                line_e = cols[3] if isinstance(cols[3], int) else line_s
-                                if tag_id is not None:
-                                    file_tags.append((tag_id, fid, line_s, line_e))
-                    cs_obj.pre_extracted_tags = file_tags
-
-                if hasattr(cs_obj, "cs") and isinstance(cs_obj.cs, list):
-                    cs_obj.cs.clear()
-                if hasattr(cs_obj, "store_dict") and isinstance(cs_obj.store_dict, dict):
-                    cs_obj.store_dict.clear()
-                if hasattr(cs_obj, "cs_result") and isinstance(cs_obj.cs_result, list):
-                    cs_obj.cs_result.clear()
+            # Evacuate executed ChangeSet tags and clear internal AST buffers immediately
+            extract_tags_and_evacuate_cs(cs_obj)
 
             # Periodic intermediate chunk commits in low/very-low memory modes
             if chunk_commit_interval > 0 and executed_count % chunk_commit_interval == 0:
                 G.TE.commit_all()
                 reclaim_system_memory()
-
-    # Now that all ChangeSets are fully executed, extract tags and evacuate remaining AST memory
-    for cs_obj in gp.ChangeSet_Dict.values():
-        if not cs_obj or not getattr(cs_obj, "current_path", None):
-            continue
-        c_path = cs_obj.current_path
-        fid = get_fid_for_path(c_path)
-        if fid is not None and not hasattr(cs_obj, "pre_extracted_tags"):
-            file_tags = []
-            for op in getattr(cs_obj, "cs", []):
-                if op and len(op) >= 3 and op[0] == m_bridge_tag.table_id:
-                    cols = op[2]
-                    if len(cols) >= 4:
-                        tag_id = cols[1] if not isinstance(cols[1], tuple) else None
-                        line_s = cols[2] if isinstance(cols[2], int) else 1
-                        line_e = cols[3] if isinstance(cols[3], int) else line_s
-                        if tag_id is not None:
-                            file_tags.append((tag_id, fid, line_s, line_e))
-            cs_obj.pre_extracted_tags = file_tags
-
-        if hasattr(cs_obj, "cs") and isinstance(cs_obj.cs, list):
-            cs_obj.cs.clear()
-        if hasattr(cs_obj, "store_dict") and isinstance(cs_obj.store_dict, dict):
-            cs_obj.store_dict.clear()
-        if hasattr(cs_obj, "cs_result") and isinstance(cs_obj.cs_result, list):
-            cs_obj.cs_result.clear()
 
     reclaim_system_memory()
 
@@ -1211,25 +1211,6 @@ def processing_dirs() -> None:  # noqa: C901
     return
 
 
-file_fid_cache: dict[str, int | None] = {}
-
-
-def get_fid_for_path(path: str) -> int | None:
-    """Resolve m_file.fid for a given path in active gp.VID."""
-    if path in file_fid_cache:
-        return file_fid_cache[path]
-    fn_row = m_file_name.get(None, path)
-    if fn_row and len(fn_row) >= 3 and fn_row[2]:
-        fnid = fn_row[2][0]
-        bf_row = m_bridge_file.get(gp.VID, fnid, None)
-        if bf_row and len(bf_row) >= 3 and bf_row[2]:
-            fid = bf_row[2][2]
-            file_fid_cache[path] = fid
-            return fid
-    file_fid_cache[path] = None
-    return None
-
-
 def processing_git_commits(version: str) -> None:
     """Parse git commits for active version, link contributors, and bridge tags to commits."""
     from parser.git_ast import GitCommitParser
@@ -1509,26 +1490,7 @@ def execute_and_purge(cs_dict: dict) -> dict:
         c_path = getattr(CS, "current_path", None)
         if c_path and type_check(c_path) in T_NO_FOREIGN:
             if CS.execute():
-                fid = get_fid_for_path(c_path)
-                if fid is not None and not hasattr(CS, "pre_extracted_tags"):
-                    file_tags = []
-                    for op in getattr(CS, "cs", []):
-                        if op and len(op) >= 3 and op[0] == m_bridge_tag.table_id:
-                            cols = op[2]
-                            if len(cols) >= 4:
-                                tag_id = cols[1] if not isinstance(cols[1], tuple) else None
-                                line_s = cols[2] if isinstance(cols[2], int) else 1
-                                line_e = cols[3] if isinstance(cols[3], int) else line_s
-                                if tag_id is not None:
-                                    file_tags.append((tag_id, fid, line_s, line_e))
-                    CS.pre_extracted_tags = file_tags
-
-                if hasattr(CS, "cs") and isinstance(CS.cs, list):
-                    CS.cs.clear()
-                if hasattr(CS, "store_dict") and isinstance(CS.store_dict, dict):
-                    CS.store_dict.clear()
-                if hasattr(CS, "cs_result") and isinstance(CS.cs_result, list):
-                    CS.cs_result.clear()
+                extract_tags_and_evacuate_cs(CS)
     return cs_dict
 
 if __name__ == "__main__":

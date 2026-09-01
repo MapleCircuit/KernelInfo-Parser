@@ -217,6 +217,7 @@ The backend exposes **49 route registrations (38 unique endpoints)** across 21 f
 | GET    | /v/{version_name}/, /v/{version_name}/{path:path}  | browse_path() (Short Aliases)              |
 | GET    | /api/file/{fid}                                   | get_file_by_id()                           |
 | GET    | /api/tag/{tag_id}                                 | get_tag_by_id()                            |
+| GET    | /api/tag/{tag_id}/timeline                        | get_tag_timeline()                         |
 | GET    | /api/ast/{ast_id}/tree                            | get_ast_container_tree()                   |
 | GET    | /api/version/{version_name}/kconfig/search        | search_kconfig_symbols()                   |
 | GET    | /api/version/{version_name}/kconfig/symbol/{name} | get_kconfig_symbol_detail()                |
@@ -289,6 +290,8 @@ The backend exposes **49 route registrations (38 unique endpoints)** across 21 f
   - Looks up a file directly by numeric `fid`, returning tags, maps, container depths, subsystems, and revision history.
 - **`GET /api/tag/{tag_id}`** (`get_tag_by_id`):
   - Returns snippet code, character offsets, linked AST metadata, and spatial token coordinate maps for a specific code tag.
+- **`GET /api/tag/{tag_id}/timeline`** (`get_tag_timeline`):
+  - Returns cross-version lifecycle history, chronological version snapshots, structured unified line diffs, and associated git commits for a tag. Power the interactive Draggable Version Timeline Scrubber in the WebApp.
 - **`GET /api/ast/{ast_id}/tree?depth=3`** (`get_ast_container_tree`):
   - Traverses recursive `m_ast_container` child relationships down to the requested `depth` (1 to 10), returning a nested tree of child AST nodes, relationship priority ranks, and descriptor names.
 

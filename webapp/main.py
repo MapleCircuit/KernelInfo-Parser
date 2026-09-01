@@ -15,6 +15,7 @@ if str(REPO_ROOT) not in sys.path:
 import os
 import re
 import json
+import difflib
 import logging
 import subprocess
 import urllib.parse
@@ -1113,6 +1114,280 @@ def get_tag_by_id(tag_id: int) -> dict[str, Any]:
         if cnx and cnx.is_connected():
             cnx.close()
         logger.error("Error in get_tag_by_id: %s", e)
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+def _compute_structured_diff(old_code: str, new_code: str) -> list[dict[str, Any]]:
+    """Compute structured line-by-line diff between two code snapshots."""
+    old_lines = old_code.splitlines() if old_code else []
+    new_lines = new_code.splitlines() if new_code else []
+    diff_res = []
+    matcher = difflib.SequenceMatcher(None, old_lines, new_lines)
+    for tag_op, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag_op == "equal":
+            for line in old_lines[i1:i2]:
+                diff_res.append({"type": "ctx", "text": line})
+        elif tag_op == "replace":
+            for line in old_lines[i1:i2]:
+                diff_res.append({"type": "del", "text": line})
+            for line in new_lines[j1:j2]:
+                diff_res.append({"type": "add", "text": line})
+        elif tag_op == "delete":
+            for line in old_lines[i1:i2]:
+                diff_res.append({"type": "del", "text": line})
+        elif tag_op == "insert":
+            for line in new_lines[j1:j2]:
+                diff_res.append({"type": "add", "text": line})
+    return diff_res
+
+
+@app.get("/api/tag/{tag_id}/timeline")
+def get_tag_timeline(tag_id: int) -> dict[str, Any]:
+    """Fetch cross-version code evolution history, timeline snapshots, diffs, and commit contexts for a tag."""
+    cnx = db.get_connection()
+    if not cnx:
+        raise HTTPException(status_code=500, detail="Database connection unavailable")
+    try:
+        cursor = cnx.cursor()
+
+        # 1. Fetch all versions registered in m_v_main
+        cursor.execute("SELECT vid, vname FROM m_v_main ORDER BY vid ASC;")
+        all_versions_rows = cursor.fetchall()
+        version_dict: dict[int, str] = {r[0]: safe_decode(r[1]) for r in all_versions_rows}
+        version_list = [{"vid": r[0], "vname": safe_decode(r[1])} for r in all_versions_rows]
+
+        # 2. Fetch all tag revisions for this tag_id
+        cursor.execute(
+            """
+            SELECT t.tag_id, t.vid_s, t.vid_e, t.code, t.ast_id, t.hl_s, t.hl_l,
+                   a.name AS ast_name, a.type_id AS ast_type_id, td.name AS ast_type_name,
+                   ad.ast_raw
+            FROM m_tag t
+            JOIN m_ast a ON t.ast_id = a.ast_id
+            LEFT JOIN m_type_descriptor td ON a.type_id = td.type_id
+            LEFT JOIN m_ast_debug ad ON a.ast_id = ad.ast_id
+            WHERE t.tag_id = %s
+            ORDER BY t.vid_s ASC;
+            """,
+            (tag_id,),
+        )
+        tag_revisions = cursor.fetchall()
+        if not tag_revisions:
+            cursor.close()
+            cnx.close()
+            raise HTTPException(status_code=404, detail=f"Tag tag_id={tag_id} not found")
+
+        # 3. Fetch spatial coordinates and file path info
+        cursor.execute(
+            """
+            SELECT bt.fid, bt.line_s, bt.line_e, bt.char_s, bt.char_e, fn.fname, bf.vid
+            FROM m_bridge_tag bt
+            LEFT JOIN m_bridge_file bf ON bt.fid = bf.fid
+            LEFT JOIN m_file_name fn ON bf.fnid = fn.fnid
+            WHERE bt.tag_id = %s
+            ORDER BY bf.vid ASC;
+            """,
+            (tag_id,),
+        )
+        loc_rows = cursor.fetchall()
+        loc_by_vid: dict[int, dict[str, Any]] = {}
+        primary_fname = ""
+        primary_line_s = 1
+        primary_line_e = 1
+        for lr in loc_rows:
+            v_id = lr[6]
+            fname_val = safe_decode(lr[5]) or ""
+            if not primary_fname and fname_val:
+                primary_fname = fname_val
+                primary_line_s = lr[1] or 1
+                primary_line_e = lr[2] or primary_line_s
+            loc_by_vid[v_id] = {
+                "fid": lr[0],
+                "line_s": lr[1],
+                "line_e": lr[2],
+                "char_s": lr[3],
+                "char_e": lr[4],
+                "fname": fname_val,
+            }
+
+        # 4. Fetch commits associated with this tag
+        cursor.execute(
+            """
+            SELECT bct.vid, bct.commit_id, c.commit_hash, c.subject, c.author_date,
+                   p.name, p.email
+            FROM m_bridge_commit_tag bct
+            JOIN m_commit c ON bct.commit_id = c.commit_id
+            LEFT JOIN m_bridge_commit_person bcp ON c.commit_id = bcp.commit_id AND bcp.role_type = 1
+            LEFT JOIN m_maintainer_person p ON bcp.person_id = p.person_id
+            WHERE bct.tag_id = %s
+            ORDER BY c.author_date ASC;
+            """,
+            (tag_id,),
+        )
+        commit_rows = cursor.fetchall()
+        commits_by_vid = defaultdict(list)
+        for cr in commit_rows:
+            commits_by_vid[cr[0]].append({
+                "commit_id": cr[1],
+                "commit_hash": safe_decode(cr[2]),
+                "subject": safe_decode(cr[3]),
+                "author_date": str(cr[4]) if cr[4] else None,
+                "author_name": safe_decode(cr[5]) or "Unknown",
+                "author_email": safe_decode(cr[6]) or "",
+            })
+
+        cursor.close()
+        cnx.close()
+
+        # 5. Build chronological timeline across versions
+        min_vid_s = min(r[1] for r in tag_revisions)
+        timeline = []
+        prev_code: str | None = None
+        total_mutations = 0
+        introduced_version = ""
+        latest_version = ""
+
+        # If version_list is empty, synthesize versions from tag_revisions
+        if not version_list:
+            v_ids = sorted(list(set([r[1] for r in tag_revisions] + [r[2] for r in tag_revisions if r[2] and r[2] > 0])))
+            version_list = [{"vid": vid, "vname": f"v{vid}"} for vid in v_ids]
+            version_dict = {v["vid"]: v["vname"] for v in version_list}
+
+        for v_entry in version_list:
+            v_id = v_entry["vid"]
+            v_name = v_entry["vname"]
+
+            # Check if this version is before tag was created
+            if v_id < min_vid_s:
+                continue
+
+            # Find matching tag revision active in v_id
+            active_rev = None
+            for rev in tag_revisions:
+                vid_s = rev[1]
+                vid_e = rev[2]
+                if vid_s <= v_id and (vid_e == 0 or vid_e >= v_id):
+                    active_rev = rev
+                    break
+
+            loc_info = loc_by_vid.get(v_id) or (list(loc_by_vid.values())[0] if loc_by_vid else {})
+            commit_list = commits_by_vid.get(v_id, [])
+
+            if active_rev:
+                code_text = safe_decode(active_rev[3]) or ""
+                ast_name = safe_decode(active_rev[7]) or ""
+                ast_type_id = active_rev[8]
+                ast_type_name = safe_decode(active_rev[9]) or ""
+                ast_raw = safe_decode(active_rev[10])
+
+                if prev_code is None:
+                    status = "introduced"
+                    total_mutations += 1
+                    introduced_version = v_name
+                    latest_version = v_name
+                    diff_ops = [{"type": "add", "text": line} for line in code_text.splitlines()]
+                    lines_added = len(diff_ops)
+                    lines_removed = 0
+                elif code_text != prev_code:
+                    status = "modified"
+                    total_mutations += 1
+                    latest_version = v_name
+                    diff_ops = _compute_structured_diff(prev_code, code_text)
+                    lines_added = sum(1 for d in diff_ops if d["type"] == "add")
+                    lines_removed = sum(1 for d in diff_ops if d["type"] == "del")
+                else:
+                    status = "unchanged"
+                    latest_version = v_name
+                    diff_ops = [{"type": "ctx", "text": line} for line in code_text.splitlines()]
+                    lines_added = 0
+                    lines_removed = 0
+
+                timeline.append({
+                    "vid": v_id,
+                    "vname": v_name,
+                    "is_active": True,
+                    "status": status,
+                    "code": code_text,
+                    "prev_code": prev_code,
+                    "diff": diff_ops,
+                    "lines_added": lines_added,
+                    "lines_removed": lines_removed,
+                    "ast_id": active_rev[4],
+                    "ast_name": ast_name,
+                    "ast_type_id": ast_type_id,
+                    "ast_type_name": ast_type_name,
+                    "ast_raw": ast_raw,
+                    "vid_s": active_rev[1],
+                    "vid_e": active_rev[2],
+                    "vname_s": version_dict.get(active_rev[1], str(active_rev[1])),
+                    "vname_e": version_dict.get(active_rev[2], str(active_rev[2])) if active_rev[2] > 0 else "HEAD",
+                    "fname": loc_info.get("fname", primary_fname),
+                    "fid": loc_info.get("fid"),
+                    "line_s": loc_info.get("line_s", primary_line_s),
+                    "line_e": loc_info.get("line_e", primary_line_e),
+                    "char_s": loc_info.get("char_s", 1),
+                    "char_e": loc_info.get("char_e", 9999),
+                    "commits": commit_list,
+                })
+                prev_code = code_text
+            else:
+                # Tag inactive / deleted in this version
+                if prev_code is not None:
+                    diff_ops = [{"type": "del", "text": line} for line in prev_code.splitlines()]
+                    lines_removed = len(diff_ops)
+                else:
+                    diff_ops = []
+                    lines_removed = 0
+
+                timeline.append({
+                    "vid": v_id,
+                    "vname": v_name,
+                    "is_active": False,
+                    "status": "deleted",
+                    "code": "",
+                    "prev_code": prev_code,
+                    "diff": diff_ops,
+                    "lines_added": 0,
+                    "lines_removed": lines_removed,
+                    "ast_id": tag_revisions[0][4],
+                    "ast_name": safe_decode(tag_revisions[0][7]) or "",
+                    "ast_type_id": tag_revisions[0][8],
+                    "ast_type_name": safe_decode(tag_revisions[0][9]) or "",
+                    "ast_raw": None,
+                    "vid_s": 0,
+                    "vid_e": 0,
+                    "vname_s": "",
+                    "vname_e": "",
+                    "fname": loc_info.get("fname", primary_fname),
+                    "fid": loc_info.get("fid"),
+                    "line_s": None,
+                    "line_e": None,
+                    "char_s": None,
+                    "char_e": None,
+                    "commits": commit_list,
+                })
+                prev_code = None
+
+        first_rev = tag_revisions[0]
+        return {
+            "tag_id": tag_id,
+            "ast_id": first_rev[4],
+            "ast_name": safe_decode(first_rev[7]) or "Anonymous",
+            "ast_type_id": first_rev[8],
+            "ast_type_name": safe_decode(first_rev[9]) or "Undefined",
+            "file_path": primary_fname,
+            "total_versions": len(timeline),
+            "total_mutations": total_mutations,
+            "introduced_version": introduced_version or (version_dict.get(first_rev[1], f"VID {first_rev[1]}")),
+            "latest_version": latest_version,
+            "timeline": timeline,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        if cnx and cnx.is_connected():
+            cnx.close()
+        logger.error("Error in get_tag_timeline: %s", e)
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 
@@ -4517,6 +4792,12 @@ def get_dev_endpoints() -> list[dict[str, Any]]:
             "path": "/api/tag/{tag_id}",
             "description": "Direct tag metadata and spatial coordinate map inspection",
             "sample_call": "/api/tag/1",
+        },
+        {
+            "method": "GET",
+            "path": "/api/tag/{tag_id}/timeline",
+            "description": "Cross-version code evolution history, timeline snapshots, and diffs for a tag",
+            "sample_call": "/api/tag/1/timeline",
         },
         {
             "method": "GET",

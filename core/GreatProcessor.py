@@ -44,7 +44,7 @@ class CompressedChangeSetDict(dict):
     queued ChangeSets as compact zlib byte buffers.
     """
 
-    def __init__(self, lru_cache_size: int = 50, *args: Any, **kwargs: Any) -> None:
+    def __init__(self, lru_cache_size: int = 500, *args: Any, **kwargs: Any) -> None:
         super().__init__()
         self._compressed_store: dict[str, bytes | None] = {}
         self._lru_cache: OrderedDict[str, Any] = OrderedDict()
@@ -180,13 +180,13 @@ class GreatProcessor:
         self.VID = 0
         self.Old_VID = 0
         self.Change_List = None
-        self.ChangeSet_Dict = {}
-        self.Alt_ChangeSet_Dict = {}
+        self.ChangeSet_Dict = CompressedChangeSetDict(lru_cache_size=500)
+        self.Alt_ChangeSet_Dict = CompressedChangeSetDict(lru_cache_size=500)
         self.Manager = None
         self.Shared_ChangeSet_Dict_List = None
 
     def init_cs_dict(self) -> None:
-        """Initialize or reset ChangeSet_Dict according to active G.LOW_MEMORY_MODE."""
+        """Initialize or reset ChangeSet_Dict according to active G.MEMORY_MODE."""
         from core.globalstuff import G
         if G.VERY_LOW_MEMORY_MODE:
             self.ChangeSet_Dict = CompressedChangeSetDict(lru_cache_size=25)
@@ -195,8 +195,8 @@ class GreatProcessor:
             self.ChangeSet_Dict = CompressedChangeSetDict(lru_cache_size=50)
             self.Alt_ChangeSet_Dict = CompressedChangeSetDict(lru_cache_size=50)
         else:
-            self.ChangeSet_Dict = {}
-            self.Alt_ChangeSet_Dict = {}
+            self.ChangeSet_Dict = CompressedChangeSetDict(lru_cache_size=500)
+            self.Alt_ChangeSet_Dict = CompressedChangeSetDict(lru_cache_size=500)
 
     def push_set_to_main(self) -> None:
         """Serialize worker process `ChangeSet_Dict` via `pickle.dumps()` and push to IPC shared list."""

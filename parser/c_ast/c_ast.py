@@ -293,14 +293,20 @@ def get_cursor_line(cursor) -> Line:
 class TokenList:
     """Binding for clang_tokenize and clang_annotateTokens."""
 
-    def __init__(self, parsed_tu, fullfilename, rawfile: tuple[str] | None = None):
-
+    def __init__(
+        self,
+        parsed_tu,
+        fullfilename,
+        rawfile: tuple[str] | None = None,
+        file_size: int | None = None,
+    ):
         parsed_file = cc.File.from_name(parsed_tu, fullfilename)
 
         start_loc = cc.SourceLocation.from_position(parsed_tu, parsed_file, 1, 1)
 
-        #filesize in bytes
-        file_size = Path(fullfilename).stat().st_size
+        # filesize in bytes (use pre-computed in-memory size if provided, fallback to stat)
+        if file_size is None:
+            file_size = Path(fullfilename).stat().st_size
         end_loc = cc.conf.lib.clang_getLocationForOffset(parsed_tu, parsed_file, file_size)
         logger.debug(f"end_loc:{end_loc}")
 
@@ -447,16 +453,16 @@ class Ast_Manager:
 
     def Init_Parse(self, CS) -> None:
         try:
-            self.unsplit_rawfile = Path(self.fullfilename).read_text(encoding="latin-1")
+            unsplit_rawfile = Path(self.fullfilename).read_text(encoding="latin-1")
         except Exception as e:
             raise FILE_ERROR(e)
 
-        self.rawfile = tuple(self.unsplit_rawfile.split("\n"))
+        self.rawfile = tuple(unsplit_rawfile.split("\n"))
+        file_byte_size = len(unsplit_rawfile)
 
         cppro_cindex_input = []
         if G.OVERRIDE_CPPRO_CINDEX_INPUT:
-            cppro_cindex_input = [line[6:].lstrip() for line in comment_remover(self.unsplit_rawfile).splitlines() if line.startswith("#ifdef")]
-
+            cppro_cindex_input = [line[6:].lstrip() for line in comment_remover(unsplit_rawfile).splitlines() if line.startswith("#ifdef")]
 
         # Initialize/Reuse the Clang index
         global _WORKER_CLANG_INDEX
@@ -468,6 +474,8 @@ class Ast_Manager:
         if prof is not None:
             t_parse_0 = time.perf_counter()
 
+        inc_dir = self.filename.rpartition("/")[0]
+
         # Parse translation unit using kernel compilation arguments
         translation_unit = index.parse(
             self.fullfilename,
@@ -476,7 +484,7 @@ class Ast_Manager:
                 "-w",
                 "-D__KERNEL__",
                 *cppro_cindex_input,
-                f"-I{self.mfdir}/{'/'.join(self.filename.split('/')[:-1])}",
+                f"-I{self.mfdir}/{inc_dir}",
                 f"-I{self.mfdir}/include",
                 f"-I{self.mfdir}/include/uapi",
             ],
@@ -487,7 +495,7 @@ class Ast_Manager:
             prof.clang_parse_tu_s = time.perf_counter() - t_parse_0
             t_tok_0 = time.perf_counter()
 
-        TL = TokenList(translation_unit, self.fullfilename, self.rawfile)
+        TL = TokenList(translation_unit, self.fullfilename, self.rawfile, file_size=file_byte_size)
 
         if prof is not None:
             prof.clang_tokenize_s = time.perf_counter() - t_tok_0

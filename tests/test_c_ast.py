@@ -21,7 +21,7 @@ from typing import Any
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from core.globalstuff import G, COLOR
-from core.GreatProcessor import GreatProcessor
+from core.GreatProcessor import GreatProcessor, CompressedChangeSetDict
 from core.FileHandler import MasterFile
 from core.TableHandling import ChangeSet
 from core.DBLayout import (
@@ -340,6 +340,66 @@ class TestCASTParser(unittest.TestCase):
         self.assertEqual(get_table_engine(TECachedDB), TECachedDB)
         with self.assertRaises(ValueError):
             get_table_engine("invalid_engine")
+
+    def test_compressed_changeset_dict_lru500(self) -> None:
+        """Verify CompressedChangeSetDict with default LRU 500 and memory mode initialization."""
+        # 1. Verify GreatProcessor init defaults
+        gp = GreatProcessor()
+        self.assertIsInstance(gp.ChangeSet_Dict, CompressedChangeSetDict)
+        self.assertIsInstance(gp.Alt_ChangeSet_Dict, CompressedChangeSetDict)
+        self.assertEqual(gp.ChangeSet_Dict._lru_size, 500)
+        self.assertEqual(gp.Alt_ChangeSet_Dict._lru_size, 500)
+
+        # 2. Verify init_cs_dict under normal, low, and very_low modes
+        orig_mode = G.MEMORY_MODE
+        try:
+            G.MEMORY_MODE = "normal"
+            gp.init_cs_dict()
+            self.assertEqual(gp.ChangeSet_Dict._lru_size, 500)
+
+            G.MEMORY_MODE = "low"
+            gp.init_cs_dict()
+            self.assertEqual(gp.ChangeSet_Dict._lru_size, 50)
+
+            G.MEMORY_MODE = "very_low"
+            gp.init_cs_dict()
+            self.assertEqual(gp.ChangeSet_Dict._lru_size, 25)
+        finally:
+            G.MEMORY_MODE = orig_mode
+            gp.init_cs_dict()
+
+        # 3. Test LRU eviction, decompress on-demand, mutation persistence
+        c_dict = CompressedChangeSetDict(lru_cache_size=3)
+        c_dict["a"] = {"count": 1}
+        c_dict["b"] = {"count": 2}
+        c_dict["c"] = {"count": 3}
+        self.assertEqual(len(c_dict), 3)
+        self.assertEqual(len(c_dict._lru_cache), 3)
+
+        # Exceed LRU cache size
+        c_dict["d"] = {"count": 4}
+        self.assertEqual(len(c_dict), 4)
+        self.assertEqual(len(c_dict._lru_cache), 3)
+        self.assertNotIn("a", c_dict._lru_cache)  # evicted to compressed store
+
+        # Access evicted item -> decompressed and brought back into LRU
+        item_a = c_dict["a"]
+        self.assertEqual(item_a, {"count": 1})
+        self.assertIn("a", c_dict._lru_cache)
+
+        # In-place mutation and eviction roundtrip
+        item_a["count"] = 99
+        # Evict 'a' again by adding more items
+        c_dict["e"] = {"count": 5}
+        c_dict["f"] = {"count": 6}
+        c_dict["g"] = {"count": 7}
+        self.assertNotIn("a", c_dict._lru_cache)
+
+        # Access again to verify mutated state was persisted
+        self.assertEqual(c_dict["a"]["count"], 99)
+        self.assertEqual(c_dict.get("missing", "default_val"), "default_val")
+        self.assertEqual(c_dict.pop("a")["count"], 99)
+        self.assertNotIn("a", c_dict)
 
     def test_direct_table_engine_execution(self) -> None:
         """Verify parsing and ChangeSet execution with TEDirectDB."""

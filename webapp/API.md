@@ -57,3 +57,5 @@ For exhaustive architectural specifications, endpoint schemas, state machines, a
 - `POST /api/bloat/estimate`: Estimate `vmlinux` size impact from active configuration changes.
 - `GET /api/symbols/search?version={v}&q={prefix}`: Global symbol autocompletion across C and Kconfig.
 - `POST /api/ast/sandbox/query`: Multi-constraint relational AST search.
+- `GET /api/tag/{tag_id}`: Direct tag metadata and spatial AST coordinate map inspection.
+- `GET /api/tag/{tag_id}/timeline`: Cross-version code evolution history, timeline snapshots, diffs, and commit contexts.

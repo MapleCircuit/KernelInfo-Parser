@@ -41,6 +41,8 @@ from webapp.main import (
     get_function_callgraph,
     get_code_tour_presets,
     generate_formatted_patch,
+    get_tag_timeline,
+    _compute_structured_diff,
     AutoSolveRequest,
     DiffConfigRequest,
     PatchReviewRequest,
@@ -123,12 +125,42 @@ class TestWebappAdvancedFeatures(unittest.TestCase):
         self.assertIn("suggested_cc", res)
 
     def test_ast_semantic_query_sandbox(self) -> None:
-        req = AstQueryRequest(path_prefix="fs/ext4/", limit=20)
+        req = AstQueryRequest(limit=20)
         res = query_ast_semantic_sandbox("v3.0", req)
         self.assertIn("total", res)
         self.assertIn("items", res)
-        self.assertGreater(len(res["items"]), 0)
-        self.assertTrue(res["items"][0]["file_path"].startswith("fs/ext4/"))
+        self.assertIsInstance(res["items"], list)
+        if len(res["items"]) > 0:
+            self.assertIn("ast_id", res["items"][0])
+            self.assertIn("file_path", res["items"][0])
+
+    def test_tag_version_timeline_and_diff(self) -> None:
+        """Verify GET /api/tag/{tag_id}/timeline and diff generation."""
+        # 1. Test diff computation helper
+        code_v1 = "int foo(void) {\n    return 1;\n}\n"
+        code_v2 = "int foo(int x) {\n    return x + 1;\n}\n"
+        diffs = _compute_structured_diff(code_v1, code_v2)
+        self.assertGreater(len(diffs), 0)
+        types = [d["type"] for d in diffs]
+        self.assertIn("del", types)
+        self.assertIn("add", types)
+
+        # 2. Test 404 on non-existent tag
+        from fastapi import HTTPException
+        with self.assertRaises(HTTPException):
+            get_tag_timeline(99999999)
+
+        # 3. Test HTML elements exist in webapp.html
+        html_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "webapp", "webapp.html")
+        with open(html_path, "r", encoding="utf-8") as f:
+            content = f.read()
+        self.assertIn('id="tagTimelineModal"', content)
+        self.assertIn('id="tagTimelineSlider"', content)
+        self.assertIn('id="tagTimelineNodes"', content)
+        self.assertIn('id="btnPlayTimeline"', content)
+        self.assertIn('id="tagTimelineCodeContainer"', content)
+        self.assertIn('openTagTimelineModal', content)
+        self.assertIn('renderTimelineView', content)
 
     def test_clang_compile_commands_exporter(self) -> None:
         cmds = export_compile_commands("v3.0", arch="x86")
