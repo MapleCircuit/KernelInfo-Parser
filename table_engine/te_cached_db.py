@@ -6,12 +6,13 @@ TABLE ENGINE (TECachedDB) ARCHITECTURAL GUIDE & CONTRACT SPECIFICATION
 This module implements the In-Memory Cached Table Engine (TECachedDB) for
 KernelInfo-Parser. Extending TEDirectDB, it provides in-memory preloading,
 multi-index acceleration (Primary Key, unique deduplication, and column indices),
-and zero-latency query resolution for tables marked with `Table.te_cached = True`.
+and zero-latency query resolution for tables marked with `Table.te_cached`.
 
 KEY RESPONSIBILITIES:
 1. SELECTIVE TABLE PRELOADING:
-   Preloads all records from the database at startup (`start()`) for tables
-   where `table.te_cached is True`, eliminating repeated database SELECT queries.
+   Preloads records from the database at startup (`start()`) for tables
+   where `table.te_cached` is configured, eliminating repeated database SELECT queries.
+   For tables with column-level caching, only cached columns are retained in memory.
 
 2. MULTI-INDEX IN-MEMORY ACCELERATION:
    - `_pk_index`: O(1) row retrieval via Primary Key (`itemgetter(*table.primary)`).
@@ -59,50 +60,79 @@ class TECachedDB(TEDirectDB):
         return bool(getattr(table, "te_cached", False))
 
     @staticmethod
-    def _match_columns(row: tuple[SafeDataType, ...], filter_cols: tuple[SafeDataType, ...]) -> bool:
-        """Check if row matches all non-None column filter criteria."""
+    def _project_row(table: Table, row: tuple[SafeDataType, ...]) -> tuple[SafeDataType, ...]:
+        """Project row to only retain configured cached columns, substituting un-cached with None."""
+        cached_cols = getattr(table, "cached_columns", None)
+        if cached_cols is None or len(cached_cols) == table.length:
+            return row
+        return tuple(val if i in cached_cols else None for i, val in enumerate(row))
+
+    @staticmethod
+    def _match_columns(table: Table, row: tuple[SafeDataType, ...], filter_cols: tuple[SafeDataType, ...]) -> bool:
+        """Check if row matches non-None column filter criteria for cached columns."""
+        cached_cols = getattr(table, "cached_columns", None)
+        has_cached_filter = False
         for i, val in enumerate(filter_cols):
-            if val is not None and row[i] != val:
+            if val is not None:
+                if cached_cols is not None and i not in cached_cols:
+                    if row[i] is not None and row[i] != val:
+                        return False
+                else:
+                    has_cached_filter = True
+                    if row[i] != val:
+                        return False
+        if cached_cols is not None and len(cached_cols) < table.length:
+            any_filter = any(val is not None for val in filter_cols)
+            if any_filter and not has_cached_filter:
                 return False
         return True
 
     def _index_row(self, table: Table, row: tuple[SafeDataType, ...]) -> None:
         """Add row to internal primary key, deduplication, and column indices."""
         table_id = table.table_id
+        cached_cols = getattr(table, "cached_columns", None)
 
         # 1. Primary Key Index
-        pk = itemgetter(*table.primary)(row)
-        self._pk_index[table_id][pk] = row
+        if all(row[i] is not None for i in table.primary):
+            pk = itemgetter(*table.primary)(row)
+            self._pk_index[table_id][pk] = row
 
         # 2. Deduplication Index (for no_duplicate=True tables)
         if table.no_duplicate and len(row) > 1:
-            self._nodup_index[table_id][row[1:]] = int(row[0]) if isinstance(row[0], int) else row[0]
+            if all(c is not None for c in row[1:]):
+                self._nodup_index[table_id][row[1:]] = int(row[0]) if isinstance(row[0], int) else row[0]
 
         # 3. Secondary Column Indices
         for col_idx in range(table.length):
-            val = row[col_idx]
-            self._col_indices[table_id][col_idx].setdefault(val, []).append(row)
+            if cached_cols is None or col_idx in cached_cols:
+                val = row[col_idx]
+                if val is not None:
+                    self._col_indices[table_id][col_idx].setdefault(val, []).append(row)
 
     def _unindex_row(self, table: Table, row: tuple[SafeDataType, ...]) -> None:
         """Remove row from internal indices prior to updating."""
         table_id = table.table_id
+        cached_cols = getattr(table, "cached_columns", None)
 
         # 1. Primary Key Index
-        pk = itemgetter(*table.primary)(row)
-        self._pk_index[table_id].pop(pk, None)
+        if all(row[i] is not None for i in table.primary):
+            pk = itemgetter(*table.primary)(row)
+            self._pk_index[table_id].pop(pk, None)
 
         # 2. Deduplication Index
         if table.no_duplicate and len(row) > 1:
-            self._nodup_index[table_id].pop(row[1:], None)
+            if all(c is not None for c in row[1:]):
+                self._nodup_index[table_id].pop(row[1:], None)
 
         # 3. Secondary Column Indices
         for col_idx in range(table.length):
-            val = row[col_idx]
-            if col_idx in self._col_indices[table_id] and val in self._col_indices[table_id][col_idx]:
-                try:
-                    self._col_indices[table_id][col_idx][val].remove(row)
-                except ValueError:
-                    pass
+            if cached_cols is None or col_idx in cached_cols:
+                val = row[col_idx]
+                if val is not None and col_idx in self._col_indices[table_id] and val in self._col_indices[table_id][col_idx]:
+                    try:
+                        self._col_indices[table_id][col_idx][val].remove(row)
+                    except ValueError:
+                        pass
 
     def _ensure_table(self, table_id: int) -> None:
         """Ensure internal cache and index structures exist for the given table_id."""
@@ -143,12 +173,14 @@ class TECachedDB(TEDirectDB):
                     rows = []
                 if rows:
                     for row in rows:
-                        self._cached_rows[table_id].append(row)
-                        self._index_row(table, row)
+                        proj_row = self._project_row(table, row)
+                        self._cached_rows[table_id].append(proj_row)
+                        self._index_row(table, proj_row)
                 elif table.initial_insert:
                     for row in table.initial_insert:
-                        self._cached_rows[table_id].append(row)
-                        self._index_row(table, row)
+                        proj_row = self._project_row(table, row)
+                        self._cached_rows[table_id].append(proj_row)
+                        self._index_row(table, proj_row)
 
     def start(self, tables: Sequence[Table] | Table, db: Callable[[], Any] | type[Any]) -> None:
         """Initialize Table Engine, connect to database, and preload cached tables.
@@ -166,7 +198,7 @@ class TECachedDB(TEDirectDB):
     ) -> tuple[SafeDataType, ...] | None:
         """Query single row matching non-None column filter criteria.
 
-        For tables where `table.te_cached is True`, resolves entirely from in-memory
+        For tables where `table.te_cached` is configured, resolves entirely from in-memory
         cache and internal indices with zero database SELECT queries.
 
         Args:
@@ -187,7 +219,7 @@ class TECachedDB(TEDirectDB):
         if pk_specified:
             pk = itemgetter(*table.primary)(columns)
             row = self._pk_index[table_id].get(pk)
-            if row is not None and self._match_columns(row, columns):
+            if row is not None and self._match_columns(table, row, columns):
                 return row
             return None
 
@@ -196,7 +228,7 @@ class TECachedDB(TEDirectDB):
             assigned_id = self._nodup_index[table_id].get(columns[1:])
             if assigned_id is not None:
                 row = (assigned_id, *columns[1:])
-                if self._match_columns(row, columns):
+                if self._match_columns(table, row, columns):
                     return row
             return None
 
@@ -216,13 +248,13 @@ class TECachedDB(TEDirectDB):
 
             if best_candidates is not None:
                 for row in best_candidates:
-                    if self._match_columns(row, columns):
+                    if self._match_columns(table, row, columns):
                         return row
                 return None
 
         # 4. In-Memory Linear Scan Fallback
         for row in self._cached_rows[table_id]:
-            if self._match_columns(row, columns):
+            if self._match_columns(table, row, columns):
                 return row
 
         return None
@@ -264,8 +296,9 @@ class TECachedDB(TEDirectDB):
             self.queued_set[table_id][key] = assigned_id
             self.next_id[table_id] += 1
             row = (assigned_id, *columns[1:])
-            self._cached_rows[table_id].append(row)
-            self._index_row(table, row)
+            proj_row = self._project_row(table, row)
+            self._cached_rows[table_id].append(proj_row)
+            self._index_row(table, proj_row)
             return row
 
         if columns[0] is None:
@@ -273,8 +306,9 @@ class TECachedDB(TEDirectDB):
             row = (assigned_id, *columns[1:])
             self.queued_set[table_id][assigned_id] = row
             self.next_id[table_id] += 1
-            self._cached_rows[table_id].append(row)
-            self._index_row(table, row)
+            proj_row = self._project_row(table, row)
+            self._cached_rows[table_id].append(proj_row)
+            self._index_row(table, proj_row)
             return row
 
         pk = itemgetter(*table.primary)(columns)
@@ -288,8 +322,9 @@ class TECachedDB(TEDirectDB):
             except ValueError:
                 pass
 
-        self._cached_rows[table_id].append(columns)
-        self._index_row(table, columns)
+        proj_row = self._project_row(table, columns)
+        self._cached_rows[table_id].append(proj_row)
+        self._index_row(table, proj_row)
         return columns
 
     def update(
@@ -319,8 +354,9 @@ class TECachedDB(TEDirectDB):
                     self._cached_rows[table_id].remove(existing_row)
                 except ValueError:
                     pass
-            self._cached_rows[table_id].append(columns)
-            self._index_row(table, columns)
+            proj_row = self._project_row(table, columns)
+            self._cached_rows[table_id].append(proj_row)
+            self._index_row(table, proj_row)
 
         return columns
 

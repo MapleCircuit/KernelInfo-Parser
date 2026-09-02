@@ -33,7 +33,9 @@ from core.DBLayout import (
     m_map_ast,
     m_bridge_map,
     m_ast_hash,
+    m_tag_code,
 )
+from core.globalstuff import compute_code_hash
 
 ChangeSetType = Any
 
@@ -127,11 +129,13 @@ class Ast_Rust:
         """Extract this top-level AST construct (AST + tag + bridge_tag + map_ast)."""
         ast_ref = self.extract_ast_node(CS)
 
+        code_hash = compute_code_hash(self.extent.code)
+
         current_tag = (
             None,
             CS.gp.VID,
             0,
-            self.extent.code,
+            code_hash,
             ast_ref,
             self.extent.char_pos[0],
             max(0, self.extent.char_pos[1] - self.extent.char_pos[0]),
@@ -140,9 +144,9 @@ class Ast_Rust:
         # Prior tag recycling check
         if CS.prior_tags:
             lookup = getattr(CS, "prior_tags_map", None)
-            if lookup is not None and self.extent.code in lookup:
+            if lookup is not None and code_hash in lookup:
                 available = [
-                    (idx, tid) for idx, tid in lookup[self.extent.code]
+                    (idx, tid) for idx, tid in lookup[code_hash]
                     if idx not in CS.active_tag_list
                 ]
                 if available:
@@ -166,7 +170,7 @@ class Ast_Rust:
                 for x, tag in enumerate(CS.prior_tags):
                     if x in CS.active_tag_list:
                         continue
-                    if tag[9] == self.extent.code:
+                    if len(tag) > 9 and tag[9] == code_hash:
                         if isinstance(CS.active_tag_list, set):
                             CS.active_tag_list.add(x)
                         else:
@@ -186,6 +190,7 @@ class Ast_Rust:
         with CS(REF_POS):
             CS.store(m_tag.set(*current_tag))
             tag_ref = ((m_tag.table_id, 0), OP_REF, (REF_POS, CS.route[-1]))
+            CS.store(m_tag_code.get_set(code_hash, self.extent.code))
 
         # Stage Bridge Tag
         CS.store(m_bridge_tag.set(

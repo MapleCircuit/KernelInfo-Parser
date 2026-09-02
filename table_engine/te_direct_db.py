@@ -49,10 +49,10 @@ if TYPE_CHECKING:
     from db_engine.base import BaseDBEngine
 
 
-def compute_ast_hash(joins: JoinsType, filtered_columns: tuple[SafeDataType, ...]) -> str:
-    """Compute deterministic SHA-256 hash for canonical AST join graph and filtered column data."""
+def compute_ast_hash(joins: JoinsType, filtered_columns: tuple[SafeDataType, ...]) -> bytes:
+    """Compute deterministic 32-byte binary SHA-256 hash for canonical AST join graph and filtered column data."""
     key_str = f"{joins}:{filtered_columns}"
-    return hashlib.sha256(key_str.encode("utf-8")).hexdigest()
+    return hashlib.sha256(key_str.encode("utf-8")).digest()
 
 
 class TEDirectDB:

@@ -29,6 +29,7 @@ from core.DBLayout import (
     m_file_name,
     m_file,
     m_bridge_file,
+    m_tag_code,
     m_tag,
     m_bridge_tag,
     m_ast,
@@ -171,8 +172,10 @@ def run_single_file_worker(item: dict[str, Any]) -> dict[str, Any]:
         raw_lines = file_content.decode("latin-1").replace("\r\n", "\n").split("\n")
 
         mock_tags = MockDB._global_store.get("m_tag", {})
+        mock_tag_codes = MockDB._global_store.get("m_tag_code", {})
         mock_bridge = MockDB._global_store.get("m_bridge_tag", {})
         tag_map = {row[0]: row for row in mock_tags.values()}
+        code_map = {row[0]: row[1] for row in mock_tag_codes.values()}
 
         mismatches_count = 0
         zero_extent_tags = 0
@@ -183,7 +186,8 @@ def run_single_file_worker(item: dict[str, Any]) -> dict[str, Any]:
             tag_row = tag_map.get(tag_id)
             if not tag_row:
                 continue
-            tag_code = tag_row[3]
+            tag_hash = tag_row[3]
+            tag_code = code_map.get(tag_hash, "")
 
             if line_s == 0 and line_e == 0:
                 zero_extent_tags += 1
@@ -405,7 +409,7 @@ class TestCASTParser(unittest.TestCase):
         """Verify parsing and ChangeSet execution with TEDirectDB."""
         item = {
             "file": "virt/kvm/iodev.h",
-            "baseline_ast_ops": 395,
+            "baseline_ast_ops": 470,
             "description": "Kernel Header (virt/kvm/iodev.h)",
             "table_engine": "direct",
         }
@@ -647,8 +651,8 @@ int compute_metrics(int base) {
             types_in_ast = set()
             tag_codes = []
             for op in cs.cs:
-                if op[0] == 10:
-                    tag_codes.append(op[2][3])
+                if op[0] == m_tag_code.table_id:
+                    tag_codes.append(op[2][1])
                 elif isinstance(op[0], tuple) and len(op) >= 3 and isinstance(op[2], tuple):
                     for val in op[2]:
                         if isinstance(val, (int, ASTT)) and not isinstance(val, bool):
@@ -711,7 +715,7 @@ int add_three(int a, int b, int c) {
             self.assertTrue(cs.execute())
             self.assertEqual(len(cs.cs), len(cs.cs_result))
 
-            tag_codes = [op[2][3] for op in cs.cs if op[0] == 10]
+            tag_codes = [op[2][1] for op in cs.cs if op[0] == m_tag_code.table_id]
             # Parameter c must strictly be 'int c' without bleeding into '{' or 'int res'
             param_c_tags = [t for t in tag_codes if "int c" in t and "add_three" not in t]
             self.assertTrue(len(param_c_tags) > 0)
@@ -902,8 +906,8 @@ struct task_struct {
             ast_names = []
             tag_codes = []
             for op in cs.cs:
-                if op[0] == 10:
-                    tag_codes.append(op[2][3])
+                if op[0] == m_tag_code.table_id:
+                    tag_codes.append(op[2][1])
                 elif isinstance(op[0], tuple) and len(op) >= 3 and isinstance(op[2], tuple):
                     name = op[2][1] if len(op[2]) > 1 else None
                     if name:
@@ -1045,8 +1049,10 @@ def assert_file_tag_fidelity(
             raise AssertionError(f"CS.execute() failed for {file_path}")
 
         mock_tags = MockDB._global_store.get("m_tag", {})
+        mock_tag_codes = MockDB._global_store.get("m_tag_code", {})
         mock_bridge = MockDB._global_store.get("m_bridge_tag", {})
         tag_map = {row[0]: row for row in mock_tags.values()}
+        code_map = {row[0]: row[1] for row in mock_tag_codes.values()}
 
         mismatches: list[dict[str, Any]] = []
         zero_extent_tags = 0
@@ -1057,7 +1063,8 @@ def assert_file_tag_fidelity(
             tag_row = tag_map.get(tag_id)
             if not tag_row:
                 continue
-            tag_code = tag_row[3]
+            tag_hash = tag_row[3]
+            tag_code = code_map.get(tag_hash, "")
 
             if line_s == 0 and line_e == 0:
                 zero_extent_tags += 1

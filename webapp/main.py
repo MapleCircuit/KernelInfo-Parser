@@ -673,12 +673,13 @@ def browse_path(version_name: str, path: str = "") -> dict[str, Any]:
         # Fetch tags for this file
         cursor.execute(
             """
-            SELECT t.tag_id, t.vid_s, t.vid_e, t.code, t.ast_id, t.hl_s, t.hl_l,
+            SELECT t.tag_id, t.vid_s, t.vid_e, tc.code, t.ast_id, t.hl_s, t.hl_l,
                    bt.line_s, bt.line_e, bt.char_s, bt.char_e,
                    a.name AS ast_name, a.type_id AS ast_type_id, td.name AS ast_type_name,
                    ad.ast_raw
             FROM m_bridge_tag bt
             JOIN m_tag t ON bt.tag_id = t.tag_id
+            LEFT JOIN m_tag_code tc ON t.hash = tc.hash
             JOIN m_ast a ON t.ast_id = a.ast_id
             LEFT JOIN m_type_descriptor td ON a.type_id = td.type_id
             LEFT JOIN m_ast_debug ad ON a.ast_id = ad.ast_id
@@ -923,12 +924,13 @@ def get_file_by_id(fid: int) -> dict[str, Any]:
         # Fetch tags
         cursor.execute(
             """
-            SELECT t.tag_id, t.vid_s, t.vid_e, t.code, t.ast_id, t.hl_s, t.hl_l,
+            SELECT t.tag_id, t.vid_s, t.vid_e, tc.code, t.ast_id, t.hl_s, t.hl_l,
                    bt.line_s, bt.line_e, bt.char_s, bt.char_e,
                    a.name AS ast_name, a.type_id AS ast_type_id, td.name AS ast_type_name,
                    ad.ast_raw
             FROM m_bridge_tag bt
             JOIN m_tag t ON bt.tag_id = t.tag_id
+            LEFT JOIN m_tag_code tc ON t.hash = tc.hash
             JOIN m_ast a ON t.ast_id = a.ast_id
             LEFT JOIN m_type_descriptor td ON a.type_id = td.type_id
             LEFT JOIN m_ast_debug ad ON a.ast_id = ad.ast_id
@@ -1039,10 +1041,11 @@ def get_tag_by_id(tag_id: int) -> dict[str, Any]:
         cursor = cnx.cursor()
         cursor.execute(
             """
-            SELECT t.tag_id, t.vid_s, t.vid_e, t.code, t.ast_id, t.hl_s, t.hl_l,
+            SELECT t.tag_id, t.vid_s, t.vid_e, tc.code, t.ast_id, t.hl_s, t.hl_l,
                    bt.fid, bt.line_s, bt.line_e, bt.char_s, bt.char_e,
                    a.name, a.type_id, td.name, ad.ast_raw
             FROM m_tag t
+            LEFT JOIN m_tag_code tc ON t.hash = tc.hash
             LEFT JOIN m_bridge_tag bt ON t.tag_id = bt.tag_id
             JOIN m_ast a ON t.ast_id = a.ast_id
             LEFT JOIN m_type_descriptor td ON a.type_id = td.type_id
@@ -1159,10 +1162,11 @@ def get_tag_timeline(tag_id: int) -> dict[str, Any]:
         # 2. Fetch all tag revisions for this tag_id
         cursor.execute(
             """
-            SELECT t.tag_id, t.vid_s, t.vid_e, t.code, t.ast_id, t.hl_s, t.hl_l,
+            SELECT t.tag_id, t.vid_s, t.vid_e, tc.code, t.ast_id, t.hl_s, t.hl_l,
                    a.name AS ast_name, a.type_id AS ast_type_id, td.name AS ast_type_name,
                    ad.ast_raw
             FROM m_tag t
+            LEFT JOIN m_tag_code tc ON t.hash = tc.hash
             JOIN m_ast a ON t.ast_id = a.ast_id
             LEFT JOIN m_type_descriptor td ON a.type_id = td.type_id
             LEFT JOIN m_ast_debug ad ON a.ast_id = ad.ast_id
@@ -1797,9 +1801,10 @@ def get_kconfig_symbol_detail(version_name: str, name_or_kcid: str) -> dict[str,
         # Query AST and source file coordinates
         tag_params = []
         sql = """
-            SELECT fn.fname, bt.line_s, bt.line_e, t.code
+            SELECT fn.fname, bt.line_s, bt.line_e, tc.code
             FROM m_bridge_tag bt
             JOIN m_tag t ON bt.tag_id = t.tag_id
+            LEFT JOIN m_tag_code tc ON t.hash = tc.hash
             JOIN m_bridge_file bf ON bt.fid = bf.fid
             JOIN m_file_name fn ON bf.fnid = fn.fnid
             WHERE t.ast_id = %s
@@ -4287,10 +4292,11 @@ def get_commit_detail(version_name: str, commit_hash_or_id: str) -> dict[str, An
 
                     # Get linked tags
                     cursor.execute("""
-                        SELECT bct.tag_id, bct.fid, bt.line_s, bt.line_e, t.code
+                        SELECT bct.tag_id, bct.fid, bt.line_s, bt.line_e, tc.code
                         FROM m_bridge_commit_tag bct
                         JOIN m_bridge_tag bt ON bct.tag_id = bt.tag_id AND bct.fid = bt.fid
                         JOIN m_tag t ON bct.tag_id = t.tag_id
+                        LEFT JOIN m_tag_code tc ON t.hash = tc.hash
                         WHERE bct.commit_id = %s
                         LIMIT 100
                     """, (cid,))
@@ -4441,9 +4447,10 @@ def get_file_blame(version_name: str, fid: int) -> dict[str, Any]:
 
                 # 2. Look up all tags for this file
                 cursor.execute("""
-                    SELECT bt.tag_id, bt.line_s, bt.line_e, bt.char_s, bt.char_e, t.code, t.ast_id
+                    SELECT bt.tag_id, bt.line_s, bt.line_e, bt.char_s, bt.char_e, tc.code, t.ast_id
                     FROM m_bridge_tag bt
                     JOIN m_tag t ON bt.tag_id = t.tag_id
+                    LEFT JOIN m_tag_code tc ON t.hash = tc.hash
                     WHERE bt.fid = %s
                     ORDER BY bt.line_s ASC, bt.char_s ASC
                 """, (fid,))
@@ -4718,6 +4725,7 @@ def get_dev_table_counts() -> dict[str, Any]:
         "m_map_ast",
         "m_bridge_map",
         "m_ast_hash",
+        "m_tag_code",
         "m_kconfig_symbol",
         "m_kconfig_relation",
         "m_kconfig_tree",
@@ -5176,11 +5184,12 @@ def get_symbol_xref(version_name: str, symbol_name: str) -> dict[str, Any]:
         # 2. Look for usage references in m_tag & m_bridge_tag
         cursor.execute(
             """
-            SELECT t.tag_id, t.code, bt.line_s, bt.line_e, bt.char_s, bt.char_e,
+            SELECT t.tag_id, tc.code, bt.line_s, bt.line_e, bt.char_s, bt.char_e,
                    f.fname, fi.fid, td.name AS tag_type
             FROM m_ast a
             JOIN m_type_descriptor td ON a.type_id = td.type_id
             JOIN m_tag t ON a.ast_id = t.ast_id
+            LEFT JOIN m_tag_code tc ON t.hash = tc.hash
             JOIN m_bridge_tag bt ON t.tag_id = bt.tag_id
             JOIN m_file fi ON bt.fid = fi.fid
             JOIN m_bridge_file bf ON fi.fid = bf.fid
@@ -6074,9 +6083,10 @@ def get_function_callgraph(version_name: str, function_name: str) -> dict[str, A
 
         cursor.execute(
             """
-            SELECT DISTINCT f.fname, bt.line_s, t.code
+            SELECT DISTINCT f.fname, bt.line_s, tc.code
             FROM m_ast a
             JOIN m_tag t ON a.ast_id = t.ast_id
+            LEFT JOIN m_tag_code tc ON t.hash = tc.hash
             JOIN m_bridge_tag bt ON t.tag_id = bt.tag_id
             JOIN m_file fi ON bt.fid = fi.fid
             JOIN m_bridge_file bf ON fi.fid = bf.fid

@@ -34,7 +34,7 @@ Dense architectural contract and state interaction reference across `globalstuff
 - **`LinkType`**: `int | str` &mdash; Context route marker (`REF_ROOT`, `REF_C_AST`, `REF_OLD`, `REF_POS`, `REF_MULTI`, `REF_FILE`, `REF_NO_REF`, or custom string identifier).
 - **`RouteType`**: `tuple[LinkType, ...] | list[LinkType, ...]` &mdash; Path sequence identifying a stored operation.
 - **`RefType`**: `tuple[PointerType, int, RouteType]` &mdash; Unresolved reference tuple: `(query_pointer, OP_REF, route_tuple)`.
-- **`SafeDataType`**: `int | str | None` &mdash; Primitive scalar values acceptable to TableEngine and SQL backends.
+- **`SafeDataType`**: `int | str | bytes | None` &mdash; Primitive scalar values acceptable to TableEngine and SQL backends.
 - **`UnSafeDataType`**: `SafeDataType | RefType` &mdash; Data scalar containing either a primitive or an unresolved reference.
 
 ### 1.3. Global Constants & Enums
@@ -111,7 +111,7 @@ Central runtime container, schema registry, and worker IPC coordinator.
 
 ## 4. Relational Database Schema Registry (`core/DBLayout.py`)
 
-29 Core Tables defined via `Table` instances and exported in `TABLES` tuple (`init_db_layout(gp)` sets `gp.Table_Array = list(TABLES)`):
+30 Core Tables defined via `Table` instances and exported in `TABLES` tuple (`init_db_layout(gp)` sets `gp.Table_Array = list(TABLES)`):
 
 | `table_id` | Table Name | Columns | Primary Key | `no_duplicate` | `te_cached` | `hashing_table` | Description |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
@@ -125,25 +125,26 @@ Central runtime container, schema registry, and worker IPC coordinator.
 | **7** | `m_ast_container` | `(ast_id, priority, type_id, ref_ast_id)`| `("ast_id", "priority")`| `False` | `False` | `False` | AST child hierarchy links |
 | **8** | `m_ast_include` | `(ast_id, fnid)` | `("ast_id",)` | `False` | `False`| `False` | AST `#include` / `source` references |
 | **9** | `m_ast_debug` | `(ast_id, ast_raw)` | `("ast_id",)` | `False` | `False`| `False` | JSON dumps of AST structures |
-| **10** | `m_tag` | `(tag_id, vid_s, vid_e, code, ast_id, hl_s, hl_l)` | `("tag_id", "vid_s")`| `False` | `False` | `False` | Code snippet occurrence tag |
-| **11** | `m_bridge_tag` | `(fid, tag_id, line_s, line_e, char_s, char_e)` | `("fid", "tag_id")` | `False` | `False` | `False` | Tag line & coordinate mapping |
-| **12** | `m_map_ast` | `(map_id, line_s, char_s, line_e, char_e, ast_id)`| `("map_id", "line_s", ...)`| `False` | `False`| `False` | Spatial AST coordinate region |
-| **13** | `m_bridge_map` | `(tag_id, map_id)` | `("tag_id", "map_id")` | `False` | `False` | `False` | Tag-to-AST spatial map bridge |
-| **14** | `m_ast_hash` | `(hash, ast_id)` | `("hash",)` | `False` | `True` | `False` | SHA-256 AST structural hash deduplication |
-| **15** | `m_kconfig_symbol` | `(kcid, vid_s, vid_e, name, type, prompt, def_val, help, ast_id)` | `("kcid",)` | `True` | `True` | `False` | Normalized Kconfig symbol definitions |
-| **16** | `m_kconfig_relation`| `(kcid, target_name, rel_type, cond_ast_id, priority)`| `("kcid", "rel_type", ...)`| `False` | `False` | `False` | Direct depends_on / select / imply dependency graph |
-| **17** | `m_kconfig_tree` | `(tree_id, vid, parent_id, node_type, title, kcid, priority, dep_ast_id, ast_id)` | `("tree_id",)` | `False` | `False` | `False` | Hierarchical Menuconfig tree & UI ordering |
-| **18** | `m_kconfig_kbuild`| `(kcid, vid, fid, compile_mode, target_obj)` | `("kcid", "vid", "fid", "target_obj")` | `False` | `False` | `False` | Kconfig to compiled file/object map |
-| **19** | `m_maintainer_person`| `(person_id, name, email)` | `("person_id",)` | `True` | `True` | `False` | Unique maintainer & contributor identity registry |
-| **20** | `m_maintainer_section`| `(sec_id, vid_s, vid_e, name, status, scm_tree, web_page, mailing_list, ast_id)` | `("sec_id",)` | `True` | `True` | `False` | Subsystem maintainer section definitions |
-| **21** | `m_maintainer_member`| `(sec_id, person_id, role_type, priority)` | `("sec_id", "person_id", "role_type")` | `False` | `False` | `False` | Maintainer subsystem personnel roles |
-| **22** | `m_maintainer_pattern`| `(sec_id, pat_type, pattern, priority)` | `("sec_id", "pat_type", "pattern")` | `False` | `False` | `False` | File & directory path matching patterns |
-| **23** | `m_maintainer_file`| `(vid, fid, sec_id)` | `("vid", "fid", "sec_id")` | `False` | `False` | `False` | Resolved file-to-subsystem ownership bridge |
-| **24** | `m_credits_entry` | `(credit_id, vid_s, vid_e, person_id, fields_json, ast_id)` | `("credit_id",)` | `True` | `True` | `False` | CREDITS file entries and biographies |
-| **25** | `m_commit` | `(commit_id, vid, commit_hash, author_id, author_date, committer_id, committer_date, subject, message)` | `("commit_id",)` | `True` | `True` | `False` | Git commit metadata registry |
-| **26** | `m_bridge_commit_person`| `(commit_id, person_id, role_type, priority)` | `("commit_id", "person_id", "role_type")` | `False` | `False` | `False` | Commit author, committer, and trailers |
-| **27** | `m_bridge_commit_file`| `(commit_id, vid, fid, change_type)` | `("commit_id", "vid", "fid")` | `False` | `False` | `False` | Files touched per commit |
-| **28** | `m_bridge_commit_tag`| `(commit_id, vid, fid, tag_id)` | `("commit_id", "vid", "fid", "tag_id")` | `False` | `False` | `False` | Code tags modified per commit |
+| **10** | `m_tag_code` | `(hash, code)` | `("hash",)` | `False` | `("hash",)` | `False` | Code snippet text registry |
+| **11** | `m_tag` | `(tag_id, vid_s, vid_e, hash, ast_id, hl_s, hl_l)` | `("tag_id", "vid_s")`| `False` | `False` | `False` | Code snippet occurrence tag |
+| **12** | `m_bridge_tag` | `(fid, tag_id, line_s, line_e, char_s, char_e)` | `("fid", "tag_id")` | `False` | `False` | `False` | Tag line & coordinate mapping |
+| **13** | `m_map_ast` | `(map_id, line_s, char_s, line_e, char_e, ast_id)`| `("map_id", "line_s", ...)`| `False` | `False`| `False` | Spatial AST coordinate region |
+| **14** | `m_bridge_map` | `(tag_id, map_id)` | `("tag_id", "map_id")` | `False` | `False` | `False` | Tag-to-AST spatial map bridge |
+| **15** | `m_ast_hash` | `(hash, ast_id)` | `("hash",)` | `False` | `True` | `False` | Binary 32-byte SHA-256 AST structural hash deduplication |
+| **16** | `m_kconfig_symbol` | `(kcid, vid_s, vid_e, name, type, prompt, def_val, help, ast_id)` | `("kcid",)` | `True` | `True` | `False` | Normalized Kconfig symbol definitions |
+| **17** | `m_kconfig_relation`| `(kcid, target_name, rel_type, cond_ast_id, priority)`| `("kcid", "rel_type", ...)`| `False` | `False` | `False` | Direct depends_on / select / imply dependency graph |
+| **18** | `m_kconfig_tree` | `(tree_id, vid, parent_id, node_type, title, kcid, priority, dep_ast_id, ast_id)` | `("tree_id",)` | `False` | `False` | `False` | Hierarchical Menuconfig tree & UI ordering |
+| **19** | `m_kconfig_kbuild`| `(kcid, vid, fid, compile_mode, target_obj)` | `("kcid", "vid", "fid", "target_obj")` | `False` | `False` | `False` | Kconfig to compiled file/object map |
+| **20** | `m_maintainer_person`| `(person_id, name, email)` | `("person_id",)` | `True` | `True` | `False` | Unique maintainer & contributor identity registry |
+| **21** | `m_maintainer_section`| `(sec_id, vid_s, vid_e, name, status, scm_tree, web_page, mailing_list, ast_id)` | `("sec_id",)` | `True` | `True` | `False` | Subsystem maintainer section definitions |
+| **22** | `m_maintainer_member`| `(sec_id, person_id, role_type, priority)` | `("sec_id", "person_id", "role_type")` | `False` | `False` | `False` | Maintainer subsystem personnel roles |
+| **23** | `m_maintainer_pattern`| `(sec_id, pat_type, pattern, priority)` | `("sec_id", "pat_type", "pattern")` | `False` | `False` | `False` | File & directory path matching patterns |
+| **24** | `m_maintainer_file`| `(vid, fid, sec_id)` | `("vid", "fid", "sec_id")` | `False` | `False` | `False` | Resolved file-to-subsystem ownership bridge |
+| **25** | `m_credits_entry` | `(credit_id, vid_s, vid_e, person_id, fields_json, ast_id)` | `("credit_id",)` | `True` | `True` | `False` | CREDITS file entries and biographies |
+| **26** | `m_commit` | `(commit_id, vid, commit_hash, author_id, author_date, committer_id, committer_date, subject, message)` | `("commit_id",)` | `True` | `True` | `False` | Git commit metadata registry |
+| **27** | `m_bridge_commit_person`| `(commit_id, person_id, role_type, priority)` | `("commit_id", "person_id", "role_type")` | `False` | `False` | `False` | Commit author, committer, and trailers |
+| **28** | `m_bridge_commit_file`| `(commit_id, vid, fid, change_type)` | `("commit_id", "vid", "fid")` | `False` | `False` | `False` | Files touched per commit |
+| **29** | `m_bridge_commit_tag`| `(commit_id, vid, fid, tag_id)` | `("commit_id", "vid", "fid", "tag_id")` | `False` | `False` | `False` | Code tags modified per commit |
 
 ---
 

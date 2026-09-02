@@ -1,6 +1,22 @@
 from __future__ import annotations
 from collections import deque
-from core.globalstuff import G, COLOR, REF_POS, REF_ROOT, REF_OLD, REF_MULTI, REF_NO_REF, ASTT, IntEnum, Flag, auto, RefType, OP_REF, RouteType
+from core.globalstuff import (
+    G,
+    COLOR,
+    REF_POS,
+    REF_ROOT,
+    REF_OLD,
+    REF_MULTI,
+    REF_NO_REF,
+    ASTT,
+    IntEnum,
+    Flag,
+    auto,
+    RefType,
+    OP_REF,
+    RouteType,
+    compute_code_hash,
+)
 import clang.cindex as cc
 import logging
 import json
@@ -11,7 +27,7 @@ import random
 logger = logging.getLogger(__name__)
 
 # Linter bypass
-m_v_main = m_file_name = m_file = m_bridge_file = m_moved_file = m_type_descriptor = m_ast = m_ast_container = m_ast_include = m_ast_debug = m_tag = m_bridge_tag = m_map_ast = m_bridge_map = m_ast_hash = None
+m_v_main = m_file_name = m_file = m_bridge_file = m_moved_file = m_type_descriptor = m_ast = m_ast_container = m_ast_include = m_ast_debug = m_tag = m_bridge_tag = m_map_ast = m_bridge_map = m_ast_hash = m_tag_code = None
 ChangeSetType = Any
 _DEF_TYPES = frozenset({ASTT.C_struct, ASTT.C_functionproto, ASTT.C_union, ASTT.C_enum})
 _PUNCT_IGNORED = frozenset({";", ",", ")", "}"})
@@ -381,12 +397,13 @@ class Ast:
                 self.extent.cc(parser_obj.rawfile)
 
         ast_ref = CS.ref(m_ast.ast_id, *ast_id_route)
+        code_hash = compute_code_hash(self.extent.code)
 
         current_tag = (
             None,
             CS.gp.VID,
             0,
-            self.extent.code,
+            code_hash,
             ast_ref,
             0,
             0,
@@ -395,7 +412,7 @@ class Ast:
         if CS.prior_tags and (self.extent.code != ""):
             lookup = getattr(CS, "prior_tags_map", None)
             if lookup is not None:
-                tag_list = lookup.get(self.extent.code)
+                tag_list = lookup.get(code_hash)
                 if tag_list is not None:
                     tag_match = None
                     for item in tag_list:
@@ -422,7 +439,7 @@ class Ast:
                     if x in CS.active_tag_list:
                         continue
                     # If tag found in prior_tags, set bridge and return
-                    if len(tag) > 9 and tag[9] == self.extent.code:
+                    if len(tag) > 9 and tag[9] == code_hash:
                         if isinstance(CS.active_tag_list, set):
                             CS.active_tag_list.add(x)
                         else:
@@ -442,6 +459,7 @@ class Ast:
             # Create tag
             CS.store(m_tag.set(*current_tag))
             tag_ref = ((m_tag.table_id, 0), OP_REF, (REF_POS, CS.route[-1]))
+            CS.store(m_tag_code.get_set(code_hash, self.extent.code))
 
         # Create bridge tag
         CS.store(m_bridge_tag.set(

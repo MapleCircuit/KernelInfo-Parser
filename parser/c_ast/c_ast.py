@@ -174,7 +174,7 @@ def get_prior_tags(CS: ChangeSetType) -> None:
         None,  # 6: m_tag.tag_id
         None,  # 7: m_tag.vid_s
         None,  # 8: m_tag.vid_e
-        None,  # 9: m_tag.code
+        None,  # 9: m_tag.hash
         None,  # 10: m_tag.ast_id
         None,  # 11: m_tag.hl_s
         None,  # 12: m_tag.hl_l
@@ -183,12 +183,12 @@ def get_prior_tags(CS: ChangeSetType) -> None:
         CS.prior_tags_map = {}
         for x, tag in enumerate(CS.prior_tags):
             if len(tag) > 9:
-                code = tag[9]
-                if code:
-                    if code not in CS.prior_tags_map:
-                        CS.prior_tags_map[code] = []
+                tag_hash = tag[9]
+                if tag_hash:
+                    if tag_hash not in CS.prior_tags_map:
+                        CS.prior_tags_map[tag_hash] = []
                     tag_id = tag[1] if len(tag) > 1 else tag[0]
-                    CS.prior_tags_map[code].append((x, tag_id))
+                    CS.prior_tags_map[tag_hash].append((x, tag_id))
     return
 
 
@@ -205,7 +205,7 @@ def close_prior_tags(CS: ChangeSetType) -> None:
                         tag[6],          # m_tag.tag_id
                         tag[7],          # m_tag.vid_s
                         CS.gp.Old_VID,   # m_tag.vid_e (closed)
-                        tag[9],          # m_tag.code
+                        tag[9],          # m_tag.hash
                         tag[10],         # m_tag.ast_id
                         tag[11],         # m_tag.hl_s
                         tag[12],         # m_tag.hl_l

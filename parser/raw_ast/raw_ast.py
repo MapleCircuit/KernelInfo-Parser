@@ -23,6 +23,7 @@ from core.DBLayout import (
     m_file,
     m_bridge_file,
     m_ast,
+    m_tag_code,
     m_tag,
     m_bridge_tag,
     m_map_ast,
@@ -134,7 +135,8 @@ class RawManager:
             raise FILE_ERROR(e) from e
 
         content_bytes = content.encode("latin-1") if isinstance(content, str) else bytes(content)
-        content_hash = hashlib.sha256(content_bytes).hexdigest()
+        content_hash = hashlib.sha256(content_bytes).digest()
+        content_hex = hashlib.sha256(content_bytes).hexdigest()
 
         lines = content.split("\n")
         line_count = max(1, len(lines))
@@ -142,7 +144,7 @@ class RawManager:
 
         # Check if content hash matches prior tag (recycled)
         if getattr(CS, "prior_tags", None) and getattr(CS, "prior_tags_map", None):
-            tag_list = CS.prior_tags_map.get(content_hash) or CS.prior_tags_map.get(content)
+            tag_list = CS.prior_tags_map.get(content_hash)
             if tag_list:
                 for item in tag_list:
                     if item[0] not in CS.active_tag_list:
@@ -159,11 +161,11 @@ class RawManager:
                             ))
                         return
 
-        # New tag required using content_hash
+        # New tag required using content_hex for AST name and content_hash for m_tag
         with CS(REF_POS):
             CS.store(m_ast.get_set(
                 None,
-                content_hash,
+                content_hex,
                 ASTT.Raw_Content,
             ))
             ast_ref = ((m_ast.table_id, 0), OP_REF, (REF_POS, CS.route[-1]))
@@ -179,6 +181,7 @@ class RawManager:
                 0,
             ))
             tag_ref = ((m_tag.table_id, 0), OP_REF, (REF_POS, CS.route[-1]))
+            CS.store(m_tag_code.get_set(content_hash, content))
 
         with CS(REF_POS):
             CS.store(m_bridge_tag.set(

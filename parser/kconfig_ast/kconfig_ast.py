@@ -20,13 +20,14 @@ from core.globalstuff import (
     FILE_ERROR,
 )
 m_file_name = m_file = m_bridge_file = m_type_descriptor = m_ast = m_ast_container = None
-m_ast_include = m_ast_debug = m_tag = m_bridge_tag = m_map_ast = m_bridge_map = None
+m_ast_include = m_ast_debug = m_tag_code = m_tag = m_bridge_tag = m_map_ast = m_bridge_map = None
 m_ast_hash = m_kconfig_symbol = m_kconfig_relation = m_kconfig_tree = None
+from core.globalstuff import compute_code_hash
 
 
 def _init_tables() -> None:
     global m_file_name, m_file, m_bridge_file, m_type_descriptor, m_ast, m_ast_container
-    global m_ast_include, m_ast_debug, m_tag, m_bridge_tag, m_map_ast, m_bridge_map
+    global m_ast_include, m_ast_debug, m_tag_code, m_tag, m_bridge_tag, m_map_ast, m_bridge_map
     global m_ast_hash, m_kconfig_symbol, m_kconfig_relation, m_kconfig_tree
     if m_file_name is not None:
         return
@@ -39,6 +40,7 @@ def _init_tables() -> None:
     m_ast_container = db_layout.m_ast_container
     m_ast_include = db_layout.m_ast_include
     m_ast_debug = db_layout.m_ast_debug
+    m_tag_code = db_layout.m_tag_code
     m_tag = db_layout.m_tag
     m_bridge_tag = db_layout.m_bridge_tag
     m_map_ast = db_layout.m_map_ast
@@ -153,11 +155,12 @@ class KconfigManager:
         extent.char_pos = (char_s, char_e)
         extent.code = code
 
+        code_hash = compute_code_hash(code)
         current_tag = (
             None,
             CS.gp.VID,
             0,
-            extent.code,
+            code_hash,
             ast_ref,
             0,
             0,
@@ -167,7 +170,7 @@ class KconfigManager:
         if CS.prior_tags and (extent.code != ""):
             lookup = getattr(CS, "prior_tags_map", None)
             if lookup is not None:
-                tag_list = lookup.get(extent.code)
+                tag_list = lookup.get(code_hash)
                 if tag_list is not None:
                     tag_match = None
                     for item in tag_list:
@@ -194,6 +197,7 @@ class KconfigManager:
         with CS(REF_POS):
             CS.store(m_tag.set(*current_tag))
             tag_ref = ((m_tag.table_id, 0), OP_REF, (REF_POS, CS.route[-1]))
+            CS.store(m_tag_code.get_set(code_hash, code))
 
         with CS(REF_POS):
             CS.store(m_bridge_tag.set(

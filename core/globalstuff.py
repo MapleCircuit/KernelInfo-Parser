@@ -7,6 +7,7 @@ from core.StringWrangler import wrap_lines, render_ansi_box, render_with_indent
 import contextlib
 from typing import Self
 from functools import wraps
+import hashlib
 from enum import IntEnum, auto, Flag
 
 
@@ -24,8 +25,13 @@ LinkType = int | str
 RouteType = tuple[LinkType, ...] | list[LinkType, ...]
 RefType = tuple[PointerType, int, RouteType]
 
-SafeDataType = int | str | None
+SafeDataType = int | str | bytes | None
 UnSafeDataType = SafeDataType | RefType
+
+
+def compute_code_hash(code: str) -> bytes:
+    """Compute deterministic 32-byte binary SHA-256 hash for code snippet string."""
+    return hashlib.sha256(code.encode("latin-1")).digest()
 
 
 
@@ -187,7 +193,7 @@ class GlobalStuff:
         return False
 
     def is_SafeDataType(self, variable: SafeDataType) -> bool:
-        return bool(isinstance(variable, (int, str)) or variable is None)
+        return bool(isinstance(variable, (int, str, bytes)) or variable is None)
 
     def is_UnSafeDataType(self, variable: UnSafeDataType) -> bool:
         return bool(self.is_SafeDataType(variable) or self.is_RefType(variable))

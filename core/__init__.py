@@ -67,6 +67,7 @@ from core.GreatProcessor import GreatProcessor
 from core.TableHandling import (
     Table,
     ChangeSet,
+    compute_code_hash,
     to_safe_data,
     is_data_unsafe,
     normalize_data_tuple,
@@ -103,6 +104,7 @@ from core.DBLayout import (
     m_bridge_commit_person,
     m_bridge_commit_file,
     m_bridge_commit_tag,
+    m_tag_code,
 )
 
 __all__ = [
@@ -162,6 +164,7 @@ __all__ = [
     # TableHandling
     "Table",
     "ChangeSet",
+    "compute_code_hash",
     "to_safe_data",
     "is_data_unsafe",
     "normalize_data_tuple",
@@ -197,4 +200,5 @@ __all__ = [
     "m_bridge_commit_person",
     "m_bridge_commit_file",
     "m_bridge_commit_tag",
+    "m_tag_code",
 ]

@@ -157,7 +157,7 @@ fake_tbl_hash = Table(
     table_id=FAKE_TBL_HASH_ID,
     table_name="_test_fake_hash",
     columns=(
-        ("hash", "VARCHAR(64)", "NOT NULL"),
+        ("hash", "BINARY(32)", "NOT NULL"),
         ("ast_id", "INT", "NOT NULL"),
     ),
     primary=("hash",),
@@ -186,6 +186,23 @@ fake_tbl_cached_bridge = Table(
     hashing_table=False,
 )
 
+# 10. In-Memory Partial Cached table (only column "hash" / index 0 cached)
+FAKE_TBL_PARTIAL_CACHED_ID = 109
+fake_tbl_partial_cached = Table(
+    table_id=FAKE_TBL_PARTIAL_CACHED_ID,
+    table_name="_test_fake_partial_cached",
+    columns=(
+        ("hash", "BINARY(32)", "NOT NULL"),
+        ("code", "LONGTEXT", "NOT NULL"),
+    ),
+    primary=("hash",),
+    foreign=None,
+    initial_insert=((b"\x00" * 32, ""),),
+    no_duplicate=False,
+    te_cached=("hash",),
+    hashing_table=False,
+)
+
 ALL_FAKE_TABLES = (
     fake_tbl_simple,
     fake_tbl_nodup,
@@ -196,6 +213,7 @@ ALL_FAKE_TABLES = (
     fake_tbl_hroot,
     fake_tbl_hash,
     fake_tbl_cached_bridge,
+    fake_tbl_partial_cached,
 )
 FAKE_TABLES_DICT = {tbl.table_id: tbl for tbl in ALL_FAKE_TABLES}
 
@@ -670,6 +688,104 @@ class TestTECachedDBIntegrity(unittest.TestCase):
 
         cached_row = self.te.get(fake_tbl_cached.table_id, (1, None, None))
         self.assertEqual(cached_row, (1, "persist_key", 777))
+
+    def test_column_level_caching_preload_and_existence(self) -> None:
+        """Verify column-level te_cached preloads only cached columns and strips un-cached payloads."""
+        import hashlib
+        h1 = hashlib.sha256(b"code_block_1").digest()
+        h2 = hashlib.sha256(b"code_block_2").digest()
+
+        self.db.insert(fake_tbl_partial_cached, (
+            (h1, "int main() { return 0; }"),
+            (h2, "static void foo(void) {}"),
+        ))
+
+        self.te.start(ALL_FAKE_TABLES, lambda: self.db)
+
+        # Preloaded row should project un-cached column (index 1 code) to None
+        self.assertIn(h1, self.te._pk_index[fake_tbl_partial_cached.table_id])
+        self.assertEqual(
+            self.te._pk_index[fake_tbl_partial_cached.table_id][h1],
+            (h1, None),
+        )
+
+        # get() with (hash, code) matches via PK fast-path and returns projected row
+        res_full = self.te.get(fake_tbl_partial_cached.table_id, (h1, "int main() { return 0; }"))
+        self.assertEqual(res_full, (h1, None))
+
+        # get() with (hash, None) also matches
+        res_partial = self.te.get(fake_tbl_partial_cached.table_id, (h1, None))
+        self.assertEqual(res_partial, (h1, None))
+
+        # get() with un-cached column alone cannot match from partial cache
+        res_uncached_only = self.te.get(fake_tbl_partial_cached.table_id, (None, "int main() { return 0; }"))
+        self.assertIsNone(res_uncached_only)
+
+        # Non-existent hash
+        h_nonexistent = hashlib.sha256(b"unknown").digest()
+        self.assertIsNone(self.te.get(fake_tbl_partial_cached.table_id, (h_nonexistent, None)))
+
+    def test_column_level_caching_set_and_commit(self) -> None:
+        """Verify set() preserves full row in queued_set while caching projected row in-memory."""
+        import hashlib
+        self.te.start(ALL_FAKE_TABLES, lambda: self.db)
+
+        h_new = hashlib.sha256(b"new_function()").digest()
+        code_str = "void new_function() { printf(\"hello\"); }"
+
+        # Stage insert
+        res = self.te.set(fake_tbl_partial_cached.table_id, (h_new, code_str))
+        self.assertEqual(res, (h_new, code_str))
+
+        # In queued_set, full row is preserved for SQL flush
+        self.assertEqual(
+            self.te.queued_set[fake_tbl_partial_cached.table_id][h_new],
+            (h_new, code_str),
+        )
+
+        # In in-memory cache, projected row (h_new, None) is stored
+        self.assertEqual(
+            self.te._pk_index[fake_tbl_partial_cached.table_id][h_new],
+            (h_new, None),
+        )
+
+        # Querying existence returns projected row in O(1)
+        self.assertEqual(
+            self.te.get(fake_tbl_partial_cached.table_id, (h_new, code_str)),
+            (h_new, None),
+        )
+
+        # Commit flushes full row to DB
+        self.te.commit(fake_tbl_partial_cached.table_id)
+        self.assertEqual(len(self.te.queued_set[fake_tbl_partial_cached.table_id]), 0)
+
+        db_row = self.db.select(fake_tbl_partial_cached, (h_new, None))
+        self.assertEqual(db_row, (h_new, code_str))
+
+    def test_schema_table_ordering_and_backward_foreign_keys(self) -> None:
+        """Verify m_tag_code is table_id=10 and all foreign keys point strictly backward."""
+        from core.DBLayout import TABLES, m_tag_code, m_tag
+
+        self.assertEqual(m_tag_code.table_id, 10)
+        self.assertEqual(m_tag_code.te_cached, (0,))
+        self.assertEqual(m_tag.table_id, 11)
+
+        # Verify TABLES order matches table_id
+        for idx, tbl in enumerate(TABLES):
+            self.assertEqual(tbl.table_id, idx, f"Table {tbl.table_name} table_id mismatch")
+
+        # Verify all foreign keys point to lower table_ids
+        tbl_id_map = {tbl.table_name: tbl.table_id for tbl in TABLES}
+        for tbl in TABLES:
+            if tbl.init_foreign:
+                for fk in tbl.init_foreign:
+                    foreign_tbl_name = fk[1]
+                    foreign_tbl_id = tbl_id_map[foreign_tbl_name]
+                    self.assertLess(
+                        foreign_tbl_id,
+                        tbl.table_id,
+                        f"Forward FK constraint detected: {tbl.table_name} (id={tbl.table_id}) -> {foreign_tbl_name} (id={foreign_tbl_id})",
+                    )
 
 
 # =============================================================================

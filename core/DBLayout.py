@@ -3,7 +3,7 @@
 ===============================================================================
 RELATIONAL DATABASE SCHEMA REFERENCE GUIDE FOR AI & PARSERS
 ===============================================================================
-This module defines the 29 core relational database tables used across the parser
+This module defines the 30 core relational database tables used across the parser
 pipeline (`Table_Array`).
 
 SCHEMA ENTITY-RELATIONSHIP GRAPH:
@@ -28,13 +28,15 @@ SCHEMA ENTITY-RELATIONSHIP GRAPH:
       |-- (ast_id) ----------------------|-> m_ast_hash (hash, ast_id)
 
 3. Code Tags & Source Coordinates:
-   m_tag (tag_id, vid_s, vid_e, code, ast_id, hl_s, hl_l)
-      ^           ^                     ^
-      |           |--(vid_s, vid_e)     |--(ast_id -> m_ast.ast_id)
-      |
-      |-- (tag_id, fid -> m_file.fid) ---> m_bridge_tag (fid, tag_id, line_s, line_e, char_s, char_e)
-      |-- (tag_id, map_id) --------------> m_bridge_map (tag_id, map_id)
-                                                ^
+   m_tag_code (hash, code)
+      ^
+      |-- (hash) ------------------> m_tag (tag_id, vid_s, vid_e, hash, ast_id, hl_s, hl_l)
+                                        ^           ^                     ^
+                                        |           |--(vid_s, vid_e)     |--(ast_id -> m_ast.ast_id)
+                                        |
+                                        |-- (tag_id, fid -> m_file.fid) ---> m_bridge_tag (fid, tag_id, line_s, line_e, char_s, char_e)
+                                        |-- (tag_id, map_id) --------------> m_bridge_map (tag_id, map_id)
+                                                  ^
    m_map_ast (map_id, line_s, char_s, line_e, char_e, ast_id) ----------------|
 
 4. Kconfig Relational Acceleration & Dependency Graph:
@@ -300,23 +302,43 @@ m_ast_debug = Table(
 )
 
 # -----------------------------------------------------------------------------
-# 11. m_tag (table_id=10): Code Occurrence / AST Tag Instance
+# 11. m_tag_code (table_id=10): Code Snippet Text Registry
+#     - hash: 32-byte binary SHA-256 digest of code snippet string (PK).
+#     - code: Raw code snippet text content.
+# -----------------------------------------------------------------------------
+m_tag_code = Table(
+    table_id=10,
+    table_name="m_tag_code",
+    columns=(
+        ("hash", "BINARY(32)", "NOT NULL"),
+        ("code", "LONGTEXT", "NOT NULL"),
+    ),
+    primary=("hash",),
+    foreign=None,
+    initial_insert=((b"\x00" * 32, ""),),
+    no_duplicate=False,
+    te_cached=("hash",),
+    hashing_table=False,
+)
+
+# -----------------------------------------------------------------------------
+# 12. m_tag (table_id=11): Code Occurrence / AST Tag Instance
 #     - tag_id: Unique Tag ID (PK with vid_s).
 #     - vid_s: Starting Version ID (FK -> m_v_main.vid).
 #     - vid_e: Ending Version ID (FK -> m_v_main.vid, 0 if still active).
-#     - code: Raw code snippet captured for this tag.
+#     - hash: Associated code snippet SHA-256 hash (FK -> m_tag_code.hash).
 #     - ast_id: Associated AST Node ID (FK -> m_ast.ast_id).
 #     - hl_s: Highlight start offset.
 #     - hl_l: Highlight length.
 # -----------------------------------------------------------------------------
 m_tag = Table(
-    table_id=10,
+    table_id=11,
     table_name="m_tag",
     columns=(
         ("tag_id", "INT", "NOT NULL", "AUTO_INCREMENT"),
         ("vid_s", "INT", "NOT NULL"),
         ("vid_e", "INT", "NOT NULL"),
-        ("code", "LONGTEXT", "NOT NULL"),
+        ("hash", "BINARY(32)", "NOT NULL"),
         ("ast_id", "INT", "NOT NULL"),
         ("hl_s", "INT", "NOT NULL"),
         ("hl_l", "INT", "NOT NULL"),
@@ -325,23 +347,24 @@ m_tag = Table(
     foreign=(
         ("vid_s", "m_v_main", "vid"),
         ("vid_e", "m_v_main", "vid"),
+        ("hash", "m_tag_code", "hash"),
         ("ast_id", "m_ast", "ast_id"),
     ),
-    initial_insert=(0, 0, 0, "", 0, 0, 0),
+    initial_insert=((0, 0, 0, b"\x00" * 32, 0, 0, 0),),
     no_duplicate=False,
     te_cached=False,
     hashing_table=False,
 )
 
 # -----------------------------------------------------------------------------
-# 12. m_bridge_tag (table_id=11): Tag to File & Line Range Mapping
+# 13. m_bridge_tag (table_id=12): Tag to File & Line Range Mapping
 #     - fid: File Instance ID (FK -> m_file.fid).
 #     - tag_id: Tag ID (FK -> m_tag.tag_id).
 #     - line_s / line_e: Start / End line numbers in source file.
 #     - char_s / char_e: Start / End character column offsets.
 # -----------------------------------------------------------------------------
 m_bridge_tag = Table(
-    table_id=11,
+    table_id=12,
     table_name="m_bridge_tag",
     columns=(
         ("fid", "INT", "NOT NULL"),
@@ -360,13 +383,13 @@ m_bridge_tag = Table(
 )
 
 # -----------------------------------------------------------------------------
-# 13. m_map_ast (table_id=12): Spatial Source Region to AST Mapping
+# 14. m_map_ast (table_id=13): Spatial Source Region to AST Mapping
 #     - map_id: Map Set Grouping ID.
 #     - line_s / char_s / line_e / char_e: Coordinate region relative to tag snippet.
 #     - ast_id: Target AST Node ID (FK -> m_ast.ast_id).
 # -----------------------------------------------------------------------------
 m_map_ast = Table(
-    table_id=12,
+    table_id=13,
     table_name="m_map_ast",
     columns=(
         ("map_id", "INT", "NOT NULL"),
@@ -385,12 +408,12 @@ m_map_ast = Table(
 )
 
 # -----------------------------------------------------------------------------
-# 14. m_bridge_map (table_id=13): Code Tag to AST Coordinate Map Bridge
+# 15. m_bridge_map (table_id=14): Code Tag to AST Coordinate Map Bridge
 #     - tag_id: Code Tag ID (FK -> m_tag.tag_id).
 #     - map_id: Map Set ID (matching m_map_ast.map_id).
 # -----------------------------------------------------------------------------
 m_bridge_map = Table(
-    table_id=13,
+    table_id=14,
     table_name="m_bridge_map",
     columns=(
         ("tag_id", "INT", "NOT NULL"),
@@ -405,15 +428,15 @@ m_bridge_map = Table(
 )
 
 # -----------------------------------------------------------------------------
-# 15. m_ast_hash (table_id=14): AST Structural Hash Deduplication Registry
-#     - hash: SHA-256 hex string of canonical AST node & children (PK).
+# 16. m_ast_hash (table_id=15): AST Structural Hash Deduplication Registry
+#     - hash: 32-byte binary SHA-256 digest of canonical AST node & children (PK).
 #     - ast_id: Assigned AST Node ID (FK -> m_ast.ast_id).
 # -----------------------------------------------------------------------------
 m_ast_hash = Table(
-    table_id=14,
+    table_id=15,
     table_name="m_ast_hash",
     columns=(
-        ("hash", "VARCHAR(64)", "NOT NULL", "COLLATE utf8mb4_bin"),
+        ("hash", "BINARY(32)", "NOT NULL"),
         ("ast_id", "INT", "NOT NULL"),
     ),
     primary=("hash",),
@@ -425,7 +448,7 @@ m_ast_hash = Table(
 )
 
 # -----------------------------------------------------------------------------
-# 16. m_kconfig_symbol (table_id=15): Kconfig Configuration Symbol Registry
+# 17. m_kconfig_symbol (table_id=16): Kconfig Configuration Symbol Registry
 #     - kcid: Unique Kconfig Symbol ID (PK with vid_s).
 #     - vid_s: Starting Version ID (FK -> m_v_main.vid).
 #     - vid_e: Ending Version ID (FK -> m_v_main.vid, 0 if still active).
@@ -437,7 +460,7 @@ m_ast_hash = Table(
 #     - ast_id: Associated AST Node ID (FK -> m_ast.ast_id).
 # -----------------------------------------------------------------------------
 m_kconfig_symbol = Table(
-    table_id=15,
+    table_id=16,
     table_name="m_kconfig_symbol",
     columns=(
         ("kcid", "INT", "NOT NULL", "AUTO_INCREMENT"),
@@ -463,7 +486,7 @@ m_kconfig_symbol = Table(
 )
 
 # -----------------------------------------------------------------------------
-# 17. m_kconfig_relation (table_id=16): Dependency & Reverse-Dependency Graph
+# 18. m_kconfig_relation (table_id=17): Dependency & Reverse-Dependency Graph
 #     - kcid: Source Kconfig Symbol ID (FK -> m_kconfig_symbol.kcid).
 #     - target_name: Depended-upon or selected symbol name (e.g. "BLOCK", "CRC32").
 #     - rel_type: Category (1: depends_on, 2: select, 3: imply, 4: choice_member).
@@ -471,7 +494,7 @@ m_kconfig_symbol = Table(
 #     - priority: Positional rank in multi-clause expression lists.
 # -----------------------------------------------------------------------------
 m_kconfig_relation = Table(
-    table_id=16,
+    table_id=17,
     table_name="m_kconfig_relation",
     columns=(
         ("kcid", "INT", "NOT NULL"),
@@ -489,7 +512,7 @@ m_kconfig_relation = Table(
 )
 
 # -----------------------------------------------------------------------------
-# 18. m_kconfig_tree (table_id=17): Menuconfig Hierarchy & Display Structure
+# 19. m_kconfig_tree (table_id=18): Menuconfig Hierarchy & Display Structure
 #     - tree_id: Unique Tree Item ID (PK with vid).
 #     - vid: Kernel Version ID (FK -> m_v_main.vid).
 #     - parent_id: Parent menu / choice tree ID (0 for root).
@@ -501,7 +524,7 @@ m_kconfig_relation = Table(
 #     - ast_id: Associated AST Node ID (FK -> m_ast.ast_id).
 # -----------------------------------------------------------------------------
 m_kconfig_tree = Table(
-    table_id=17,
+    table_id=18,
     table_name="m_kconfig_tree",
     columns=(
         ("tree_id", "INT", "NOT NULL", "AUTO_INCREMENT"),
@@ -526,7 +549,7 @@ m_kconfig_tree = Table(
 )
 
 # -----------------------------------------------------------------------------
-# 19. m_kconfig_kbuild (table_id=18): Kconfig to Source File Compilation Map
+# 20. m_kconfig_kbuild (table_id=19): Kconfig to Source File Compilation Map
 #     - kcid: Target Kconfig Symbol ID (FK -> m_kconfig_symbol.kcid, 0 for core obj-y).
 #     - vid: Kernel Version ID (FK -> m_v_main.vid).
 #     - fid: Source File ID (FK -> m_file.fid).
@@ -534,7 +557,7 @@ m_kconfig_tree = Table(
 #     - target_obj: Target object or composite module name (e.g. "ext4.o", "drbd.o").
 # -----------------------------------------------------------------------------
 m_kconfig_kbuild = Table(
-    table_id=18,
+    table_id=19,
     table_name="m_kconfig_kbuild",
     columns=(
         ("kcid", "INT", "NOT NULL"),
@@ -555,13 +578,13 @@ m_kconfig_kbuild = Table(
 )
 
 # -----------------------------------------------------------------------------
-# 20. m_maintainer_person (table_id=19): Maintainer & Reviewer Persona Registry
+# 21. m_maintainer_person (table_id=20): Maintainer & Reviewer Persona Registry
 #     - person_id: Unique Person ID (PK, AUTO_INCREMENT).
 #     - name: Full name string (e.g. "Linus Torvalds").
 #     - email: Primary email address (e.g. "torvalds@linux-foundation.org").
 # -----------------------------------------------------------------------------
 m_maintainer_person = Table(
-    table_id=19,
+    table_id=20,
     table_name="m_maintainer_person",
     columns=(
         ("person_id", "INT", "NOT NULL", "AUTO_INCREMENT"),
@@ -572,12 +595,12 @@ m_maintainer_person = Table(
     foreign=None,
     initial_insert=None,
     no_duplicate=True,
-    te_cached=True,
+    te_cached=False,
     hashing_table=False,
 )
 
 # -----------------------------------------------------------------------------
-# 21. m_maintainer_section (table_id=20): Subsystem Section Registry
+# 22. m_maintainer_section (table_id=21): Subsystem Section Registry
 #     - sec_id: Unique Section ID (PK with vid_s, AUTO_INCREMENT).
 #     - vid_s: Starting Version ID (FK -> m_v_main.vid).
 #     - vid_e: Ending Version ID (FK -> m_v_main.vid, 0 if active).
@@ -589,7 +612,7 @@ m_maintainer_person = Table(
 #     - ast_id: Associated AST Node ID (FK -> m_ast.ast_id).
 # -----------------------------------------------------------------------------
 m_maintainer_section = Table(
-    table_id=20,
+    table_id=21,
     table_name="m_maintainer_section",
     columns=(
         ("sec_id", "INT", "NOT NULL", "AUTO_INCREMENT"),
@@ -610,19 +633,19 @@ m_maintainer_section = Table(
     ),
     initial_insert=None,
     no_duplicate=True,
-    te_cached=True,
+    te_cached=False,
     hashing_table=False,
 )
 
 # -----------------------------------------------------------------------------
-# 22. m_maintainer_member (table_id=21): Section to Person Role Mapping
+# 23. m_maintainer_member (table_id=22): Section to Person Role Mapping
 #     - sec_id: Subsystem Section ID (FK -> m_maintainer_section.sec_id).
 #     - person_id: Person ID (FK -> m_maintainer_person.person_id).
 #     - role_type: Role (1: Maintainer 'M', 2: Reviewer 'R', 3: Person 'P', 4: Other).
 #     - priority: Display order rank index.
 # -----------------------------------------------------------------------------
 m_maintainer_member = Table(
-    table_id=21,
+    table_id=22,
     table_name="m_maintainer_member",
     columns=(
         ("sec_id", "INT", "NOT NULL"),
@@ -642,14 +665,14 @@ m_maintainer_member = Table(
 )
 
 # -----------------------------------------------------------------------------
-# 23. m_maintainer_pattern (table_id=22): Section Pattern & Rule Registry
+# 24. m_maintainer_pattern (table_id=23): Section Pattern & Rule Registry
 #     - sec_id: Subsystem Section ID (FK -> m_maintainer_section.sec_id).
 #     - pat_type: Pattern Type (1: File 'F', 2: Exclude 'X', 3: Keyword 'K', 4: Regex 'N').
 #     - pattern: Raw pattern string (e.g. "fs/ext4/", "drivers/net/3c505*").
 #     - priority: Rule evaluation order rank.
 # -----------------------------------------------------------------------------
 m_maintainer_pattern = Table(
-    table_id=22,
+    table_id=23,
     table_name="m_maintainer_pattern",
     columns=(
         ("sec_id", "INT", "NOT NULL"),
@@ -666,13 +689,13 @@ m_maintainer_pattern = Table(
 )
 
 # -----------------------------------------------------------------------------
-# 24. m_maintainer_file (table_id=23): Materialized File-to-Section Bridge
+# 25. m_maintainer_file (table_id=24): Materialized File-to-Section Bridge
 #     - vid: Kernel Version ID (FK -> m_v_main.vid).
 #     - fid: File Instance ID (FK -> m_file.fid).
 #     - sec_id: Subsystem Section ID (FK -> m_maintainer_section.sec_id).
 # -----------------------------------------------------------------------------
 m_maintainer_file = Table(
-    table_id=23,
+    table_id=24,
     table_name="m_maintainer_file",
     columns=(
         ("vid", "INT", "NOT NULL"),
@@ -692,7 +715,7 @@ m_maintainer_file = Table(
 )
 
 # -----------------------------------------------------------------------------
-# 25. m_credits_entry (table_id=24): Contributor & Author Credits Registry
+# 26. m_credits_entry (table_id=25): Contributor & Author Credits Registry
 #     - credit_id: Unique Credit ID (PK with vid_s, AUTO_INCREMENT).
 #     - vid_s: Starting Version ID (FK -> m_v_main.vid).
 #     - vid_e: Ending Version ID (FK -> m_v_main.vid, 0 if active).
@@ -704,7 +727,7 @@ m_maintainer_file = Table(
 #     - ast_id: Associated AST Node ID (FK -> m_ast.ast_id).
 # -----------------------------------------------------------------------------
 m_credits_entry = Table(
-    table_id=24,
+    table_id=25,
     table_name="m_credits_entry",
     columns=(
         ("credit_id", "INT", "NOT NULL", "AUTO_INCREMENT"),
@@ -726,12 +749,12 @@ m_credits_entry = Table(
     ),
     initial_insert=None,
     no_duplicate=True,
-    te_cached=True,
+    te_cached=False,
     hashing_table=False,
 )
 
 # -----------------------------------------------------------------------------
-# 26. m_commit (table_id=25): Git Commit Registry
+# 27. m_commit (table_id=26): Git Commit Registry
 #     - commit_id: Unique Commit ID (PK, AUTO_INCREMENT).
 #     - vid: Target Kernel Version ID (FK -> m_v_main.vid).
 #     - commit_hash: 40-char SHA-1 Git commit hash.
@@ -743,7 +766,7 @@ m_credits_entry = Table(
 #     - message: Full commit message body (including trailers).
 # -----------------------------------------------------------------------------
 m_commit = Table(
-    table_id=25,
+    table_id=26,
     table_name="m_commit",
     columns=(
         ("commit_id", "INT", "NOT NULL", "AUTO_INCREMENT"),
@@ -769,14 +792,14 @@ m_commit = Table(
 )
 
 # -----------------------------------------------------------------------------
-# 27. m_bridge_commit_person (table_id=26): Commit Multi-Contributor Bridge
+# 28. m_bridge_commit_person (table_id=27): Commit Multi-Contributor Bridge
 #     - commit_id: Git Commit ID (FK -> m_commit.commit_id).
 #     - person_id: Contributor Person ID (FK -> m_maintainer_person.person_id).
 #     - role_type: Role (1: Author, 2: Committer, 3: Co-developed-by, 4: Signed-off-by, 5: Reviewed-by, 6: Acked-by, 7: Tested-by, 8: Reported-by, 9: Suggested-by).
 #     - priority: Occurrence order / rank.
 # -----------------------------------------------------------------------------
 m_bridge_commit_person = Table(
-    table_id=26,
+    table_id=27,
     table_name="m_bridge_commit_person",
     columns=(
         ("commit_id", "INT", "NOT NULL"),
@@ -796,14 +819,14 @@ m_bridge_commit_person = Table(
 )
 
 # -----------------------------------------------------------------------------
-# 28. m_bridge_commit_file (table_id=27): Commit Modified File Bridge
+# 29. m_bridge_commit_file (table_id=28): Commit Modified File Bridge
 #     - commit_id: Git Commit ID (FK -> m_commit.commit_id).
 #     - vid: Target Kernel Version ID (FK -> m_v_main.vid).
 #     - fid: Modified File Instance ID (FK -> m_file.fid).
 #     - change_type: Modification flag ('A'=Added, 'M'=Modified, 'D'=Deleted, 'R'=Renamed).
 # -----------------------------------------------------------------------------
 m_bridge_commit_file = Table(
-    table_id=27,
+    table_id=28,
     table_name="m_bridge_commit_file",
     columns=(
         ("commit_id", "INT", "NOT NULL"),
@@ -824,14 +847,14 @@ m_bridge_commit_file = Table(
 )
 
 # -----------------------------------------------------------------------------
-# 29. m_bridge_commit_tag (table_id=28): Multi-Commit Tag Mapping Bridge
+# 30. m_bridge_commit_tag (table_id=29): Multi-Commit Tag Mapping Bridge
 #     - commit_id: Git Commit ID (FK -> m_commit.commit_id).
 #     - vid: Target Kernel Version ID (FK -> m_v_main.vid).
 #     - fid: File Instance ID (FK -> m_file.fid).
 #     - tag_id: Code Snippet Tag ID (FK -> m_tag.tag_id).
 # -----------------------------------------------------------------------------
 m_bridge_commit_tag = Table(
-    table_id=28,
+    table_id=29,
     table_name="m_bridge_commit_tag",
     columns=(
         ("commit_id", "INT", "NOT NULL"),
@@ -863,6 +886,7 @@ TABLES: tuple[Table, ...] = (
     m_ast_container,
     m_ast_include,
     m_ast_debug,
+    m_tag_code,
     m_tag,
     m_bridge_tag,
     m_map_ast,
@@ -886,14 +910,14 @@ TABLES: tuple[Table, ...] = (
 
 
 def init_db_layout(gp=None) -> tuple[Table, ...]:
-    """Initialize and populate gp.Table_Array with the default 29 schema tables.
+    """Initialize and populate gp.Table_Array with the default 30 schema tables.
     
     Args:
         gp: Optional GreatProcessor instance to attach Table_Array to.
         
         
     Returns:
-        Immutable tuple of all 29 Table schema objects.
+        Immutable tuple of all 30 Table schema objects.
     """
     if gp is not None:
         gp.Table_Array = list(TABLES)

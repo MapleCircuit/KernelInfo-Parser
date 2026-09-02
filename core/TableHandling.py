@@ -89,6 +89,7 @@ from __future__ import annotations
 
 import sys
 import time
+import hashlib
 import logging
 from operator import itemgetter
 from typing import Any, Self
@@ -129,6 +130,7 @@ from core.globalstuff import (
     OperationType,
     SafeDataType,
     UnSafeDataType,
+    compute_code_hash,
 )
 from parser.c_ast.c_ast import c_ast_parse
 from parser.asm_ast.asm_ast import asm_ast_parse
@@ -159,20 +161,20 @@ def is_data_unsafe(data: tuple) -> bool:
 
 
 def to_safe_data(val: Any) -> SafeDataType:
-    """Convert a value into strict primitive SafeDataType (pure int, pure str, or None).
+    """Convert a value into strict primitive SafeDataType (pure int, pure str, pure bytes, or None).
 
     Ensures that IntEnum/Enum subclasses (like ASTT) or custom subclasses
-    are converted into pure native Python `int` or `str` objects before being sent
+    are converted into pure native Python `int`, `str`, or `bytes` objects before being sent
     to the Table Engine or database driver.
 
     Args:
         val: Any scalar value, enum member, or None.
 
     Returns:
-        Pure primitive `int`, `str`, or `None`.
+        Pure primitive `int`, `str`, `bytes`, or `None`.
     """
     t = type(val)
-    if t is int or t is str or val is None:
+    if t is int or t is str or t is bytes or val is None:
         return val
     if t is bool:
         return int(val)
@@ -180,7 +182,7 @@ def to_safe_data(val: Any) -> SafeDataType:
         v = val.value
         return int(v) if type(v) is int else str(v)
     val_attr = getattr(val, "value", None)
-    if val_attr is not None and (type(val_attr) is int or type(val_attr) is str):
+    if val_attr is not None and (type(val_attr) is int or type(val_attr) is str or type(val_attr) is bytes):
         return val_attr
     return val
 
@@ -196,7 +198,7 @@ def normalize_data_tuple(data: tuple) -> tuple[UnSafeDataType, ...]:
     """
     for col in data:
         t = type(col)
-        if not (t is int or t is str or t is tuple or col is None):
+        if not (t is int or t is str or t is bytes or t is tuple or col is None):
             return tuple(col if type(col) is tuple else to_safe_data(col) for col in data)
     return data
 
@@ -405,7 +407,7 @@ class ChangeSet:
                     raise REF_NOT_RESOLVABLE
                 out_append(to_safe_data(resolved))
             else:
-                out_append(val if (type(val) is int or type(val) is str or val is None) else to_safe_data(val))
+                out_append(val if (type(val) is int or type(val) is str or type(val) is bytes or val is None) else to_safe_data(val))
         return tuple(output_data)
 
     def execute(self) -> bool:
@@ -967,7 +969,7 @@ class Table:
         foreign: tuple[tuple[str, str, str], ...] | None = None,
         initial_insert: tuple[tuple[SafeDataType, ...], ...] | tuple[SafeDataType, ...] | None = None,
         no_duplicate: bool = False,
-        te_cached: bool = False,
+        te_cached: bool | tuple[str | int, ...] | list[str | int] = False,
         hashing_table: bool | str = False,
     ) -> None:
         """Initialize a Table schema definition, generate dynamic column pointers, and bind to parser.
@@ -980,7 +982,7 @@ class Table:
             foreign: Optional tuple of Foreign Key constraints: `(("local_col", "foreign_table", "foreign_col"), ...)`.
             initial_insert: Optional tuple of default rows inserted when table is created.
             no_duplicate: If True, `set()` automatically checks if a row exists in Table Engine (`G.TE`) via `get_set()`.
-            te_cached: Pre-loading caching strategy for Table Engine initialization.
+            te_cached: Pre-loading caching strategy for Table Engine initialization (bool or tuple of column names/indices).
             hashing_table: Name of the linked hashing table.
 
         Side Effects:
@@ -1007,7 +1009,27 @@ class Table:
         self.init_foreign = foreign
         self.initial_insert = initial_insert
         self.no_duplicate = no_duplicate
-        self.te_cached = te_cached
+
+        self.cached_columns: tuple[int, ...]
+        if te_cached is True:
+            self.cached_columns = tuple(range(self.length))
+            self.te_cached = True
+        elif not te_cached:
+            self.cached_columns = ()
+            self.te_cached = False
+        else:
+            resolved_cols = []
+            col_names = [col[0] for col in self.init_columns]
+            for item in te_cached:
+                if isinstance(item, int):
+                    resolved_cols.append(item)
+                elif item in col_names:
+                    resolved_cols.append(col_names.index(item))
+                else:
+                    raise ValueError(f"Unknown column '{item}' in te_cached for table '{table_name}'")
+            self.cached_columns = tuple(resolved_cols)
+            self.te_cached = self.cached_columns
+
         self.hashing_table = hashing_table
         self.has_auto_increment = any(any("AUTO_INCREMENT" in str(elem) for elem in col) for col in self.init_columns)
 

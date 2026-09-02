@@ -130,7 +130,7 @@ class TestRawAstParser(unittest.TestCase):
 
         # Check tag content is SHA-256 hash
         import hashlib
-        expected_hash = hashlib.sha256(SAMPLE_DOC_TEXT.encode("latin-1")).hexdigest()
+        expected_hash = hashlib.sha256(SAMPLE_DOC_TEXT.encode("latin-1")).digest()
         tag_rows = [row for row in cs.cs if isinstance(row, tuple) and len(row) == 3 and row[0] == m_tag.table_id]
         self.assertEqual(len(tag_rows), 1)
         self.assertEqual(tag_rows[0][2][3], expected_hash)
@@ -158,7 +158,7 @@ class TestRawAstParser(unittest.TestCase):
 
         # Check tag row has empty string hash
         import hashlib
-        empty_hash = hashlib.sha256(b"").hexdigest()
+        empty_hash = hashlib.sha256(b"").digest()
         tag_rows = [row for row in cs.cs if isinstance(row, tuple) and len(row) == 3 and row[0] == m_tag.table_id]
         self.assertEqual(len(tag_rows), 1)
         self.assertEqual(tag_rows[0][2][3], empty_hash)

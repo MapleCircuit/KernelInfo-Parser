@@ -6,7 +6,7 @@ Stateful caching, sequence coordination, relational view decomposition, and batc
 
 ## 1. Core Data Types & Schemas
 
-- **`SafeDataType`**: `int | str | None` &mdash; Primitive scalar values (Enums/IntEnums are converted to native `int`/`str`).
+- **`SafeDataType`**: `int | str | bytes | None` &mdash; Primitive scalar values (Enums/IntEnums are converted to native `int`/`str`).
 - **`PointerType`**: `tuple[int, int]` &mdash; `(table_id, col_idx)` pointing to a table's column.
 - **`JoinType`**: `tuple[PointerType, PointerType, int] | tuple[PointerType]` &mdash; `((from_t, from_c), (to_t, to_c), repeat_count)` or single-table root `((t_id, c_idx),)`.
 - **`JoinsType`**: `tuple[JoinType, ...]` &mdash; Immutable relational join graph.
@@ -17,7 +17,8 @@ Stateful caching, sequence coordination, relational view decomposition, and batc
   - `primary: tuple[int, ...]` &mdash; 0-indexed column indices forming Primary Key (e.g., `(0,)` or `(0, 1)`).
   - `no_duplicate: bool` &mdash; If `True`, deduplicates rows via in-memory key `columns[1:]`.
   - `initial_insert: tuple[...] | None` &mdash; Initial seed rows.
-  - `te_cached: bool` &mdash; If `True`, enables in-memory preloading and multi-indexing in `TECachedDB`.
+  - `te_cached: bool | tuple[str | int, ...]` &mdash; If configured (`True` or tuple of column names/indices), enables in-memory preloading and multi-indexing in `TECachedDB`.
+  - `cached_columns: tuple[int, ...]` &mdash; Canonical 0-indexed column indices retained in memory (defaults to all columns if `te_cached=True`, or empty if `False`).
   - `hashing_table: bool | str | int | Table` &mdash; If set (e.g. `"m_ast_hash"` or `True`), enables automatic structural hash deduplication and acceleration for views rooted at this table.
   - `init_columns: tuple` &mdash; Raw column definition tuples: `(("col_name", "DATA_TYPE", "CONSTRAINTS"), ...)`.
   - `init_primary: tuple[str, ...]` &mdash; Raw column names forming Primary Key: `("fnid",)`.
@@ -43,7 +44,7 @@ Stateful caching, sequence coordination, relational view decomposition, and batc
 
 | Attribute | Type | Purpose & Structure |
 | :--- | :--- | :--- |
-| `_cached_rows` | `dict[int, list[tuple]]` | Complete in-memory row storage for `te_cached=True` tables: `table_id -> [row_tuple, ...]`. |
+| `_cached_rows` | `dict[int, list[tuple]]` | In-memory row storage for `te_cached` tables: `table_id -> [projected_row_tuple, ...]`. |
 | `_pk_index` | `dict[int, dict[Any, tuple]]` | O(1) exact row lookup: `table_id -> {primary_key_val: row_tuple}`. |
 | `_nodup_index` | `dict[int, dict[tuple, int]]` | O(1) deduplication lookup: `table_id -> {columns[1:]: assigned_id}`. |
 | `_col_indices` | `dict[int, dict[int, dict[SafeDataType, list[tuple]]]]` | Inverted column index: `table_id -> {col_idx: {column_val: [matching_row, ...]}}`. |
@@ -52,11 +53,11 @@ Stateful caching, sequence coordination, relational view decomposition, and batc
 
 ## 3. Helper Functions & Utilities
 
-### 3.1. `compute_ast_hash(joins: JoinsType, filtered_columns: tuple[SafeDataType, ...]) -> str`
-Computes a deterministic SHA-256 hex string from the canonical join graph structure and non-None column data:
+### 3.1. `compute_ast_hash(joins: JoinsType, filtered_columns: tuple[SafeDataType, ...]) -> bytes`
+Computes a deterministic 32-byte binary SHA-256 digest from the canonical join graph structure and non-None column data:
 ```python
 key_str = f"{joins}:{filtered_columns}"
-return hashlib.sha256(key_str.encode("utf-8")).hexdigest()
+return hashlib.sha256(key_str.encode("utf-8")).digest()
 ```
 
 ### 3.2. `get_hashing_table(table: Table | None) -> Table | None`

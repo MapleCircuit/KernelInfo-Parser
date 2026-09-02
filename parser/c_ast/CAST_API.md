@@ -390,11 +390,12 @@ The C AST parser generates and references records across 8 core database tables:
 | m_ast_container     |    7     | (ast_id, priority, type_id, ref_ast_id)                            |
 | m_ast_include       |    8     | (ast_id, fnid)                                                     |
 | m_ast_debug         |    9     | (ast_id, ast_raw)                                                  |
-| m_tag               |   10     | (tag_id, vid_s, vid_e, code, ast_id, hl_s, hl_l)                  |
+| m_tag               |   10     | (tag_id, vid_s, vid_e, hash, ast_id, hl_s, hl_l)                  |
 | m_bridge_tag        |   11     | (fid, tag_id, line_s, line_e, char_s, char_e)                      |
 | m_map_ast           |   12     | (map_id, line_s, char_s, line_e, char_e, ast_id)                   |
 | m_bridge_map        |   13     | (tag_id, map_id)                                                   |
 | m_ast_hash          |   14     | (hash, ast_id)                                                     |
+| m_tag_code          |   29     | (hash, code)                                                       |
 +----------------------------------------------------------------------------------------------------+
 ```
 
@@ -433,9 +434,11 @@ The C AST parser generates and references records across 8 core database tables:
 
 3. **Spatial Tagging & Map Registration**:
    ```python
-   # 1. Tag definition
+   # 1. Tag code storage and tag definition
+   code_hash = compute_code_hash(extent.code)
+   CS.store(m_tag_code.get_set(code_hash, extent.code))
    with CS(REF_POS):
-       CS.store(m_tag.set(None, VID, 0, extent.code, CS.ref(m_ast.ast_id, *ast_id_route), 0, 0))
+       CS.store(m_tag.set(None, VID, 0, code_hash, CS.ref(m_ast.ast_id, *ast_id_route), 0, 0))
        tag_ref = ((m_tag.table_id, 0), OP_REF, (REF_POS, CS.route[-1]))
 
    # 2. Bridge tag (coordinates in source file)

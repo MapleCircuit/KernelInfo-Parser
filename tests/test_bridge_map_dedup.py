@@ -13,7 +13,7 @@ from typing import Any
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from core.globalstuff import G, OP_REF, REF_POS, REF_ROOT
+from core.globalstuff import G, OP_REF, REF_POS, REF_ROOT, compute_code_hash
 from core.GreatProcessor import GreatProcessor
 from core.FileHandler import MasterFile
 from core.TableHandling import Table, ChangeSet
@@ -147,8 +147,9 @@ class TestBridgeMapDeduplication(unittest.TestCase):
 
         # Seed prior tags
         dummy_code = "config EXT4_FS\n\ttristate \"The Extended 4 (ext4) filesystem\""
-        cs.prior_tags = [(0, 101, 1, 0, dummy_code, 1, 0, 0)]
-        cs.prior_tags_map = {dummy_code: [(0, 101)]}
+        code_hash = compute_code_hash(dummy_code)
+        cs.prior_tags = [(0, 101, 1, 0, code_hash, 1, 0, 0)]
+        cs.prior_tags_map = {code_hash: [(0, 101)]}
         cs.active_tag_list = set()
 
         mgr = KconfigManager(cs)

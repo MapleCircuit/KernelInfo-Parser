@@ -110,6 +110,7 @@ from core.DBLayout import (
     m_bridge_commit_person,
     m_bridge_commit_file,
     m_bridge_commit_tag,
+    m_tag_code,
 )
 
 
@@ -448,7 +449,8 @@ def main() -> None:
             missing = db.test_tables(gp.Table_Array)
             if missing:
                 logger.info(f"Missing tables detected ({missing}), creating tables...")
-                db.create_table(gp.Table_Array)
+                missing_tables = [tbl for tbl in gp.Table_Array if tbl.table_name in missing]
+                db.create_table(missing_tables)
                 try:
                     db.create_index("v_main_index", m_v_main, (m_v_main.vname,))
                 except Exception:
@@ -645,6 +647,16 @@ def arg_handling() -> argparse.Namespace:
         gp.create_table_all()
         G.emergency_shutdown(0)
     if args.unit_test is not None:
+        try:
+            with G.DB() as db:
+                missing = db.test_tables(gp.Table_Array)
+                if missing:
+                    logger.info(f"Missing tables detected ({missing}), creating tables...")
+                    missing_tables = [tbl for tbl in gp.Table_Array if tbl.table_name in missing]
+                    db.create_table(missing_tables)
+        except Exception as e:
+            logger.debug(f"DB check before unit tests: {e}")
+
         target = args.unit_test if args.unit_test != "" else None
         from tests.test_c_ast import run_c_ast_tests
         if target:
