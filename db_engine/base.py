@@ -153,6 +153,31 @@ class BaseDBEngine(ABC):
         """
 
     @abstractmethod
+    def select_preload(
+        self,
+        table: Table,
+        cached_columns: tuple[int, ...] | None = None,
+        min_vid: int | None = None,
+    ) -> list[tuple[SafeDataType, ...]]:
+        """Query records for TableEngine startup preloading with column projection and version filtering.
+
+        Args:
+            table (Table): Target Table schema instance.
+            cached_columns (tuple[int, ...] | None): Optional tuple of 0-indexed column positions to select.
+                If None or covering all columns, selects all columns.
+            min_vid (int | None): Optional minimum active version ID for version-scoped tables.
+
+        Process:
+            Constructs a SELECT query requesting only `cached_columns` (e.g. `SELECT col1, col2 FROM table`)
+            and applies a version-scoped predicate (`WHERE vid >= min_vid` or `WHERE (vid_e = 0 OR vid_e >= min_vid)`)
+            if `min_vid > 0`.
+
+        Outputs:
+            list[tuple[SafeDataType, ...]]: List of row tuples containing the selected columns in requested order.
+        """
+
+
+    @abstractmethod
     def insert(
         self,
         table: Table,
@@ -311,4 +336,14 @@ class BaseDBEngine(ABC):
             Queries catalog (`SHOW TABLES`), compares against registered tables, and identifies missing table names.
         Outputs:
             list[str] | None: List of missing table names, or None if all registered tables exist.
+        """
+
+    @abstractmethod
+    def verify_relational_integrity(self, tables: Sequence[Table]) -> dict[str, int]:
+        """Verify relational foreign key integrity across tables and return any orphan record counts.
+
+        Args:
+            tables (Sequence[Table]): Sequence of registered schema tables.
+        Outputs:
+            dict[str, int]: Dictionary mapping constraint names to orphan record counts (empty if all valid).
         """

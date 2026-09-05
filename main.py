@@ -268,6 +268,10 @@ def update(version: str) -> None:
 
     reclaim_system_memory()
 
+    # Disable TableEngine in-memory secondary indexing for write-only batch staging phases
+    if hasattr(G.TE, "update_in_mem_indexes"):
+        G.TE.update_in_mem_indexes = False
+
     # -------------------------------------------------------------------------
     # STEP 6.5: Parse Git Commits, Multi-Contributors & Bridge Tags to Commits
     # -------------------------------------------------------------------------
@@ -305,7 +309,7 @@ def update(version: str) -> None:
         with G.DB() as db:
             db.remove_indexes(tuple((item[0],item[1]) for item in performance_indexes))
 
-    G.TE.commit_all()
+    G.TE.commit_all(update_in_mem_indexes=False)
 
     if gp.VID == 1:
         with G.DB() as db:
@@ -1458,6 +1462,10 @@ def processing_maintainer_files(version: str) -> None:
             return sec_id
         sec_id_cache[name] = None
         return None
+
+    for sec in sections:
+        if sec.name and sec.name not in sec_id_cache:
+            get_sec_id_for_name(sec.name)
 
     try:
         file_list_raw = MF.git_file_list(gp.Version_Name)

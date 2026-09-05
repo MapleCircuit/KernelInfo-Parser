@@ -327,17 +327,17 @@ class TestMaintainerAndCreditsIntegration(unittest.TestCase):
         self.assertTrue(cs_cred.execute())
         G.TE.commit_all()
 
-        # Validate Maintainer Section rows in TE cache
-        sec_rows = G.TE._cached_rows.get(m_maintainer_section.table_id, [])
+        # Validate Maintainer Section rows committed to DB
+        sec_rows = MockDB._global_store.get(m_maintainer_section.table_name, {})
         self.assertEqual(len(sec_rows), 4)
 
-        # Validate Credits Entry rows in TE cache
-        cred_rows = G.TE._cached_rows.get(m_credits_entry.table_id, [])
+        # Validate Credits Entry rows committed to DB
+        cred_rows = MockDB._global_store.get(m_credits_entry.table_name, {})
         self.assertEqual(len(cred_rows), 3)
 
         # Validate Person Deduplication
         # Theodore Ts'o is in both MAINTAINERS and CREDITS with email tytso@mit.edu
-        person_rows = G.TE._cached_rows.get(m_maintainer_person.table_id, [])
+        person_rows = list(MockDB._global_store.get(m_maintainer_person.table_name, {}).values())
         tytso_entries = [r for r in person_rows if r[2] == "tytso@mit.edu"]
         self.assertEqual(len(tytso_entries), 1, "Theodore Ts'o must be deduplicated to a single person row")
 

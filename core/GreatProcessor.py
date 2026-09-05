@@ -72,11 +72,7 @@ class CompressedChangeSetDict(dict):
         # Compress into a single flat byte buffer
         raw_bytes = pickle.dumps(value, protocol=pickle.HIGHEST_PROTOCOL)
         self._compressed_store[key] = zlib.compress(raw_bytes, level=1)
-
-        # Keep in local LRU working cache
-        self._lru_cache[key] = value
-        self._lru_cache.move_to_end(key)
-        self._evict_lru()
+        self._lru_cache.pop(key, None)
 
     def __getitem__(self, key: str) -> Any:
         if key in self._lru_cache:

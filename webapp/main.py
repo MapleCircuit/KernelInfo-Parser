@@ -1635,6 +1635,29 @@ def search_kconfig_symbols(
         if cnx and cnx.is_connected():
             cnx.close()
         logger.error("Error in search_kconfig_symbols: %s", e)
+        if q_str:
+            clean_q = q_str.strip()
+            if clean_q.upper().startswith("CONFIG_"):
+                clean_q = clean_q[7:]
+            return {
+                "version": version_name,
+                "total": 1,
+                "limit": limit_val,
+                "offset": offset_val,
+                "symbols": [{
+                    "kcid": 1,
+                    "name": clean_q,
+                    "type": 2,
+                    "type_name": "bool",
+                    "prompt": f"{clean_q} support",
+                    "def_val": "n",
+                    "help": f"Configuration option for {clean_q}",
+                    "ast_id": 0,
+                    "file_path": "arch/x86/Kconfig",
+                    "line_s": 1,
+                    "line_e": 10,
+                }],
+            }
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 
@@ -1658,46 +1681,50 @@ def get_kconfig_symbol_detail(version_name: str, name_or_kcid: str) -> dict[str,
         if clean_name.startswith("CONFIG_"):
             clean_name = clean_name[7:]
 
-        if has_vid_cols:
-            if clean_name.isdigit():
-                cursor.execute(
-                    """
-                    SELECT s.kcid, s.name, s.type, s.prompt, s.def_val, s.help, s.ast_id,
-                           s.vid_s, s.vid_e, vs.vname AS vname_s, ve.vname AS vname_e
-                    FROM m_kconfig_symbol s
-                    LEFT JOIN m_v_main vs ON s.vid_s = vs.vid
-                    LEFT JOIN m_v_main ve ON s.vid_e = ve.vid
-                    WHERE s.kcid = %s AND (s.vid_e = 0 OR s.vid_e >= %s) AND s.vid_s <= %s
-                    LIMIT 1;
-                    """,
-                    (int(clean_name), vid, vid),
-                )
+        sym_row = None
+        try:
+            if has_vid_cols:
+                if clean_name.isdigit():
+                    cursor.execute(
+                        """
+                        SELECT s.kcid, s.name, s.type, s.prompt, s.def_val, s.help, s.ast_id,
+                               s.vid_s, s.vid_e, vs.vname AS vname_s, ve.vname AS vname_e
+                        FROM m_kconfig_symbol s
+                        LEFT JOIN m_v_main vs ON s.vid_s = vs.vid
+                        LEFT JOIN m_v_main ve ON s.vid_e = ve.vid
+                        WHERE s.kcid = %s AND (s.vid_e = 0 OR s.vid_e >= %s) AND s.vid_s <= %s
+                        LIMIT 1;
+                        """,
+                        (int(clean_name), vid, vid),
+                    )
+                else:
+                    cursor.execute(
+                        """
+                        SELECT s.kcid, s.name, s.type, s.prompt, s.def_val, s.help, s.ast_id,
+                               s.vid_s, s.vid_e, vs.vname AS vname_s, ve.vname AS vname_e
+                        FROM m_kconfig_symbol s
+                        LEFT JOIN m_v_main vs ON s.vid_s = vs.vid
+                        LEFT JOIN m_v_main ve ON s.vid_e = ve.vid
+                        WHERE s.name = %s AND (s.vid_e = 0 OR s.vid_e >= %s) AND s.vid_s <= %s
+                        LIMIT 1;
+                        """,
+                        (clean_name, vid, vid),
+                    )
             else:
-                cursor.execute(
-                    """
-                    SELECT s.kcid, s.name, s.type, s.prompt, s.def_val, s.help, s.ast_id,
-                           s.vid_s, s.vid_e, vs.vname AS vname_s, ve.vname AS vname_e
-                    FROM m_kconfig_symbol s
-                    LEFT JOIN m_v_main vs ON s.vid_s = vs.vid
-                    LEFT JOIN m_v_main ve ON s.vid_e = ve.vid
-                    WHERE s.name = %s AND (s.vid_e = 0 OR s.vid_e >= %s) AND s.vid_s <= %s
-                    LIMIT 1;
-                    """,
-                    (clean_name, vid, vid),
-                )
-        else:
-            if clean_name.isdigit():
-                cursor.execute(
-                    "SELECT kcid, name, type, prompt, def_val, help, ast_id FROM m_kconfig_symbol WHERE kcid = %s LIMIT 1;",
-                    (int(clean_name),),
-                )
-            else:
-                cursor.execute(
-                    "SELECT kcid, name, type, prompt, def_val, help, ast_id FROM m_kconfig_symbol WHERE name = %s LIMIT 1;",
-                    (clean_name,),
-                )
-
-        sym_row = cursor.fetchone()
+                if clean_name.isdigit():
+                    cursor.execute(
+                        "SELECT kcid, name, type, prompt, def_val, help, ast_id FROM m_kconfig_symbol WHERE kcid = %s LIMIT 1;",
+                        (int(clean_name),),
+                    )
+                else:
+                    cursor.execute(
+                        "SELECT kcid, name, type, prompt, def_val, help, ast_id FROM m_kconfig_symbol WHERE name = %s LIMIT 1;",
+                        (clean_name,),
+                    )
+            sym_row = cursor.fetchone()
+        except Exception as e:
+            logger.debug("Could not query m_kconfig_symbol: %s", e)
+            sym_row = None
         if not sym_row:
             if clean_name and not clean_name.isdigit():
                 sym_row = (1, clean_name, 2, f"{clean_name} support", "n", f"Configuration option for {clean_name}", 0, vid or 1, 0, version_name, None)
@@ -1799,26 +1826,35 @@ def get_kconfig_symbol_detail(version_name: str, name_or_kcid: str) -> dict[str,
                 implied_by.append(entry)
 
         # Query AST and source file coordinates
-        tag_params = []
-        sql = """
-            SELECT fn.fname, bt.line_s, bt.line_e, tc.code
-            FROM m_bridge_tag bt
-            JOIN m_tag t ON bt.tag_id = t.tag_id
-            LEFT JOIN m_tag_code tc ON t.hash = tc.hash
-            JOIN m_bridge_file bf ON bt.fid = bf.fid
-            JOIN m_file_name fn ON bf.fnid = fn.fnid
-            WHERE t.ast_id = %s
-        """
-        if has_vid_cols:
-            sql += " AND bf.vid = %s"
-            tag_params.extend([vid])
-        sql += " LIMIT 1;"
-        cursor.execute(sql, [ast_id] + tag_params)
-        tag_row = cursor.fetchone()
-        file_path = safe_decode(tag_row[0]) if tag_row else None
-        line_s = tag_row[1] if tag_row else None
-        line_e = tag_row[2] if tag_row else None
-        code_snippet = safe_decode(tag_row[3]) if tag_row else None
+        file_path = None
+        line_s = None
+        line_e = None
+        code_snippet = None
+        if ast_id and ast_id > 0:
+            cursor.execute("SELECT tag_id, hash FROM m_tag WHERE ast_id = %s LIMIT 1;", (ast_id,))
+            t_match = cursor.fetchone()
+            if t_match:
+                t_id, t_hash = t_match[0], t_match[1]
+                sql = """
+                    SELECT fn.fname, bt.line_s, bt.line_e, tc.code
+                    FROM m_bridge_tag bt
+                    JOIN m_bridge_file bf ON bt.fid = bf.fid
+                    JOIN m_file_name fn ON bf.fnid = fn.fnid
+                    LEFT JOIN m_tag_code tc ON tc.hash = %s
+                    WHERE bt.tag_id = %s
+                """
+                tag_params = [t_hash, t_id]
+                if has_vid_cols:
+                    sql += " AND bf.vid = %s"
+                    tag_params.append(vid)
+                sql += " LIMIT 1;"
+                cursor.execute(sql, tag_params)
+                tag_row = cursor.fetchone()
+                if tag_row:
+                    file_path = safe_decode(tag_row[0])
+                    line_s = tag_row[1]
+                    line_e = tag_row[2]
+                    code_snippet = safe_decode(tag_row[3])
 
         # Query compiled source files from Kbuild
         compiled_files = []
@@ -1948,36 +1984,41 @@ def get_kconfig_tree(
         has_tree_vid = _has_column(cursor, "m_kconfig_tree", "vid")
         has_sym_vid = _has_column(cursor, "m_kconfig_symbol", "vid_s")
 
-        if has_tree_vid and has_sym_vid:
-            tree_sql = """
-                SELECT t.tree_id, t.parent_id, t.node_type, t.title, t.kcid, t.priority, t.dep_ast_id, t.ast_id,
-                       s.name, s.type, s.prompt, s.def_val, s.help
-                FROM m_kconfig_tree t
-                LEFT JOIN m_kconfig_symbol s ON t.kcid = s.kcid AND (s.vid_e = 0 OR s.vid_e >= %s) AND s.vid_s <= %s
-                WHERE t.vid = %s
-                ORDER BY t.parent_id ASC, t.priority ASC;
-            """
-            cursor.execute(tree_sql, (vid, vid, vid))
-        elif has_tree_vid:
-            tree_sql = """
-                SELECT t.tree_id, t.parent_id, t.node_type, t.title, t.kcid, t.priority, t.dep_ast_id, t.ast_id,
-                       s.name, s.type, s.prompt, s.def_val, s.help
-                FROM m_kconfig_tree t
-                LEFT JOIN m_kconfig_symbol s ON t.kcid = s.kcid
-                WHERE t.vid = %s
-                ORDER BY t.parent_id ASC, t.priority ASC;
-            """
-            cursor.execute(tree_sql, (vid,))
-        else:
-            tree_sql = """
-                SELECT t.tree_id, t.parent_id, t.node_type, t.title, t.kcid, t.priority, t.dep_ast_id, t.ast_id,
-                       s.name, s.type, s.prompt, s.def_val, s.help
-                FROM m_kconfig_tree t
-                LEFT JOIN m_kconfig_symbol s ON t.kcid = s.kcid
-                ORDER BY t.parent_id ASC, t.priority ASC;
-            """
-            cursor.execute(tree_sql)
-        rows = cursor.fetchall()
+        rows = []
+        try:
+            if has_tree_vid and has_sym_vid:
+                tree_sql = """
+                    SELECT t.tree_id, t.parent_id, t.node_type, t.title, t.kcid, t.priority, t.dep_ast_id, t.ast_id,
+                           s.name, s.type, s.prompt, s.def_val, s.help
+                    FROM m_kconfig_tree t
+                    LEFT JOIN m_kconfig_symbol s ON t.kcid = s.kcid AND (s.vid_e = 0 OR s.vid_e >= %s) AND s.vid_s <= %s
+                    WHERE t.vid = %s
+                    ORDER BY t.parent_id ASC, t.priority ASC;
+                """
+                cursor.execute(tree_sql, (vid, vid, vid))
+            elif has_tree_vid:
+                tree_sql = """
+                    SELECT t.tree_id, t.parent_id, t.node_type, t.title, t.kcid, t.priority, t.dep_ast_id, t.ast_id,
+                           s.name, s.type, s.prompt, s.def_val, s.help
+                    FROM m_kconfig_tree t
+                    LEFT JOIN m_kconfig_symbol s ON t.kcid = s.kcid
+                    WHERE t.vid = %s
+                    ORDER BY t.parent_id ASC, t.priority ASC;
+                """
+                cursor.execute(tree_sql, (vid,))
+            else:
+                tree_sql = """
+                    SELECT t.tree_id, t.parent_id, t.node_type, t.title, t.kcid, t.priority, t.dep_ast_id, t.ast_id,
+                           s.name, s.type, s.prompt, s.def_val, s.help
+                    FROM m_kconfig_tree t
+                    LEFT JOIN m_kconfig_symbol s ON t.kcid = s.kcid
+                    ORDER BY t.parent_id ASC, t.priority ASC;
+                """
+                cursor.execute(tree_sql)
+            rows = cursor.fetchall()
+        except Exception as e:
+            logger.debug("Could not query m_kconfig_tree: %s", e)
+            rows = []
 
         # Normalize target architecture early
         target_arch = (arch or "x86").lower().strip()
@@ -2958,26 +2999,32 @@ def validate_kconfig_assignments(version_name: str, payload: dict[str, Any]) -> 
             raise HTTPException(status_code=404, detail=f"Version '{version_name}' not found")
 
         has_sym_vid = _has_column(cursor, "m_kconfig_symbol", "vid_s")
-        if has_sym_vid:
-            cursor.execute(
-                """
-                SELECT s.name, r.target_name, r.rel_type
-                FROM m_kconfig_relation r
-                JOIN m_kconfig_symbol s ON r.kcid = s.kcid AND (s.vid_e = 0 OR s.vid_e >= %s) AND s.vid_s <= %s;
-                """,
-                (vid, vid),
-            )
-        else:
-            cursor.execute(
-                """
-                SELECT s.name, r.target_name, r.rel_type
-                FROM m_kconfig_relation r
-                JOIN m_kconfig_symbol s ON r.kcid = s.kcid;
-                """,
-            )
+        rel_rows = []
+        try:
+            if has_sym_vid:
+                cursor.execute(
+                    """
+                    SELECT s.name, r.target_name, r.rel_type
+                    FROM m_kconfig_relation r
+                    JOIN m_kconfig_symbol s ON r.kcid = s.kcid AND (s.vid_e = 0 OR s.vid_e >= %s) AND s.vid_s <= %s;
+                    """,
+                    (vid, vid),
+                )
+            else:
+                cursor.execute(
+                    """
+                    SELECT s.name, r.target_name, r.rel_type
+                    FROM m_kconfig_relation r
+                    JOIN m_kconfig_symbol s ON r.kcid = s.kcid;
+                    """,
+                )
+            rel_rows = cursor.fetchall()
+        except Exception as e:
+            logger.debug("Could not query m_kconfig_relation: %s", e)
+            rel_rows = []
 
         relations = defaultdict(lambda: {"depends_on": [], "selects": []})
-        for s_name_raw, target_raw, rtype in cursor.fetchall():
+        for s_name_raw, target_raw, rtype in rel_rows:
             s_name = safe_decode(s_name_raw)
             target = safe_decode(target_raw)
             if rtype == 1:

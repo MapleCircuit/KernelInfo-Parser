@@ -183,6 +183,7 @@ fake_tbl_cached_bridge = Table(
     initial_insert=None,
     no_duplicate=False,
     te_cached=True,
+    version_scoped=True,
     hashing_table=False,
 )
 
@@ -389,6 +390,72 @@ class TestDBEngineIntegrity(unittest.TestCase):
         p1 = self.db.select(fake_tbl_parent, (10, None))
         self.assertEqual(p1, (10, "p_parent10"))
 
+    def test_verify_relational_integrity(self) -> None:
+        """Verify verify_relational_integrity accurately detects valid and orphaned foreign keys."""
+        # Clean state: insert valid parent and child
+        self.db.insert(fake_tbl_parent, ((1, "Parent_1"),))
+        self.db.insert(fake_tbl_child, ((1, 1, "Child_1"),))
+
+        violations = self.db.verify_relational_integrity([fake_tbl_parent, fake_tbl_child])
+        self.assertEqual(len(violations), 0)
+
+        # Inject orphan child (referencing parent_id 999 which does not exist)
+        self.db.insert(fake_tbl_child, ((2, 999, "Child_Orphan"),))
+        violations_orphan = self.db.verify_relational_integrity([fake_tbl_parent, fake_tbl_child])
+        self.assertGreater(len(violations_orphan), 0)
+        self.assertIn("_test_fake_child.pid -> _test_fake_parent.pid", violations_orphan)
+        self.assertEqual(violations_orphan["_test_fake_child.pid -> _test_fake_parent.pid"], 1)
+
+    def test_select_preload_selective_columns(self) -> None:
+        """Verify select_preload queries only requested columns and excludes un-cached columns."""
+        import hashlib
+        h1 = hashlib.sha256(b"code_1").digest()
+        h2 = hashlib.sha256(b"code_2").digest()
+        self.db.insert(fake_tbl_partial_cached, (
+            (h1, "long_code_payload_1"),
+            (h2, "long_code_payload_2"),
+        ))
+
+        # Query only column 0 (hash)
+        rows_hash_only = self.db.select_preload(fake_tbl_partial_cached, cached_columns=(0,))
+        self.assertEqual(len(rows_hash_only), 3)  # 1 initial_insert seed + 2 inserted
+        # Each row should only contain 1 element (the hash), not the code payload
+        for row in rows_hash_only:
+            self.assertEqual(len(row), 1)
+        self.assertIn((h1,), rows_hash_only)
+        self.assertIn((h2,), rows_hash_only)
+
+        # Query all columns (None or full range)
+        rows_full = self.db.select_preload(fake_tbl_partial_cached, cached_columns=None)
+        self.assertEqual(len(rows_full), 3)
+        for row in rows_full:
+            self.assertEqual(len(row), 2)
+        self.assertIn((h1, "long_code_payload_1"), rows_full)
+        self.assertIn((h2, "long_code_payload_2"), rows_full)
+
+
+    def test_select_preload_version_filtering(self) -> None:
+        """Verify select_preload filters out historical rows when min_vid is specified."""
+        self.db.insert(fake_tbl_cached_bridge, (
+            (1, 100, 10),
+            (2, 100, 20),
+            (3, 100, 30),
+        ))
+
+        # Without min_vid, returns all rows
+        rows_all = self.db.select_preload(fake_tbl_cached_bridge, min_vid=None)
+        self.assertEqual(len(rows_all), 3)
+
+        # With min_vid=2, returns only rows with vid >= 2
+        rows_v2 = self.db.select_preload(fake_tbl_cached_bridge, min_vid=2)
+        self.assertEqual(len(rows_v2), 2)
+        vids = [r[0] for r in rows_v2]
+        self.assertNotIn(1, vids)
+        self.assertIn(2, vids)
+        self.assertIn(3, vids)
+
+
+
 
 # =============================================================================
 # Test Suite 2: Table Engine Base Integrity (TEDirectDB / Common)
@@ -472,6 +539,22 @@ class TestTableEngineIntegrity(unittest.TestCase):
         res_found = self.te.get(fake_tbl_simple.table_id, (None, "committed_item", None))
         self.assertEqual(res_found, (1, "committed_item", 42))
 
+    def test_get_staged_wildcard_lookups_before_commit(self) -> None:
+        """Verify get() resolves partial/wildcard queries against uncommitted staged rows in queued_set."""
+        # 1. Staged row in non-no_duplicate table
+        self.te.set(fake_tbl_simple.table_id, (None, "staged_wildcard_target", 999))
+        # Query by column 1 with wildcard on column 0 and column 2
+        res_simple = self.te.get(fake_tbl_simple.table_id, (None, "staged_wildcard_target", None))
+        self.assertIsNotNone(res_simple)
+        self.assertEqual(res_simple, (1, "staged_wildcard_target", 999))
+
+        # 2. Staged row in no_duplicate table
+        self.te.set(fake_tbl_nodup.table_id, (None, "staged_nodup_target"))
+        res_nodup = self.te.get(fake_tbl_nodup.table_id, (None, "staged_nodup_target"))
+        self.assertIsNotNone(res_nodup)
+        self.assertEqual(res_nodup, (1, "staged_nodup_target"))
+
+
     def test_update_staging(self) -> None:
         """Verify update() stages rows in queued_update buffer."""
         self.te.update(fake_tbl_simple.table_id, (1, "staged_update", 99))
@@ -533,6 +616,37 @@ class TestTableEngineIntegrity(unittest.TestCase):
         row2 = self.db.select(fake_tbl_nodup, (2, None))
         self.assertEqual(row1, (1, "sym_1"))
         self.assertEqual(row2, (2, "sym_2"))
+
+    def test_commit_batch_presorting_by_primary_key(self) -> None:
+        """Verify commit() delivers insert payloads sorted strictly ascending by Primary Key."""
+        import hashlib
+
+        raw_keys = [f"key_{i}".encode("latin-1") for i in [9, 3, 7, 1, 5, 2, 8, 0, 4, 6]]
+        hashes = [hashlib.sha256(k).digest() for k in raw_keys]
+
+        inserted_batches = []
+        orig_insert = self.db.insert
+
+        def capture_insert(table, data):
+            inserted_batches.append((table, data))
+            return orig_insert(table, data)
+
+        self.db.insert = capture_insert
+
+        for h in hashes:
+            self.te.set(fake_tbl_partial_cached.table_id, (h, f"code_{h.hex()[:8]}"))
+
+        self.te.commit(fake_tbl_partial_cached.table_id)
+
+        self.assertTrue(len(inserted_batches) > 0)
+        table, payload = inserted_batches[0]
+        self.assertEqual(table.table_id, fake_tbl_partial_cached.table_id)
+
+        # Verify rows in payload are strictly sorted by PK (column 0)
+        extracted_keys = [row[0] for row in payload]
+        sorted_keys = sorted(hashes)
+        self.assertEqual(extracted_keys, sorted_keys, "Payload rows were not pre-sorted by primary key!")
+
 
     def test_commit_all_parallel_flush(self) -> None:
         """Verify commit_all flushes all staged sets and updates across all tables."""
@@ -762,6 +876,75 @@ class TestTECachedDBIntegrity(unittest.TestCase):
         db_row = self.db.select(fake_tbl_partial_cached, (h_new, None))
         self.assertEqual(db_row, (h_new, code_str))
 
+    def test_commit_all_skip_in_mem_indexes(self) -> None:
+        """Verify commit_all(update_in_mem_indexes=False) flushes to DB and clears in-memory caches."""
+        self.te.start(ALL_FAKE_TABLES, lambda: self.db)
+
+        self.te.set(fake_tbl_cached.table_id, (None, "teardown_key", 12345))
+        self.te.set(fake_tbl_cached_nodup.table_id, (None, "teardown_sym"))
+
+        # Verify cached structures contain the data prior to commit
+        self.assertIn(1, self.te._pk_index[fake_tbl_cached.table_id])
+        self.assertIn(("teardown_sym",), self.te._nodup_index[fake_tbl_cached_nodup.table_id])
+
+        # Commit without updating in-mem indexes (clears caches for shutdown)
+        self.te.commit_all(update_in_mem_indexes=False)
+
+        # Queued buffers must be empty
+        self.assertEqual(len(self.te.queued_set[fake_tbl_cached.table_id]), 0)
+        self.assertEqual(len(self.te.queued_set[fake_tbl_cached_nodup.table_id]), 0)
+
+        # Database must have committed records
+        db_cached = self.db.select(fake_tbl_cached, (1, None, None))
+        self.assertEqual(db_cached, (1, "teardown_key", 12345))
+        db_nodup = self.db.select(fake_tbl_cached_nodup, (1, None))
+        self.assertEqual(db_nodup, (1, "teardown_sym"))
+
+        # In-memory structures must be cleared
+        self.assertEqual(len(self.te._cached_rows), 0)
+        self.assertEqual(len(self.te._cached_rows_pos), 0)
+        self.assertEqual(len(self.te._pk_index), 0)
+        self.assertEqual(len(self.te._nodup_index), 0)
+        self.assertEqual(len(self.te._col_indices), 0)
+
+    def test_commit_single_table_skip_in_mem_indexes(self) -> None:
+        """Verify commit(table_id, update_in_mem_indexes=False) flushes and purges target table cache."""
+        self.te.start(ALL_FAKE_TABLES, lambda: self.db)
+
+        self.te.set(fake_tbl_cached.table_id, (None, "single_k", 555))
+        self.te.set(fake_tbl_cached_nodup.table_id, (None, "nodup_retain"))
+
+        # Commit only fake_tbl_cached with update_in_mem_indexes=False
+        self.te.commit(fake_tbl_cached.table_id, update_in_mem_indexes=False)
+
+        # Database must have the committed row
+        db_cached = self.db.select(fake_tbl_cached, (1, None, None))
+        self.assertEqual(db_cached, (1, "single_k", 555))
+
+        # fake_tbl_cached must be purged from cache structures
+        self.assertNotIn(fake_tbl_cached.table_id, self.te._cached_rows)
+        self.assertNotIn(fake_tbl_cached.table_id, self.te._pk_index)
+
+        # fake_tbl_cached_nodup must retain its in-memory cache
+        self.assertIn(fake_tbl_cached_nodup.table_id, self.te._nodup_index)
+        self.assertEqual(self.te._nodup_index[fake_tbl_cached_nodup.table_id][("nodup_retain",)], 1)
+
+    def test_dynamic_update_in_mem_indexes_toggle(self) -> None:
+        """Verify disabling update_in_mem_indexes skips in-memory index updates on set and update."""
+        self.te.start(ALL_FAKE_TABLES, lambda: self.db)
+
+        self.te.update_in_mem_indexes = False
+
+        # Staging a row when update_in_mem_indexes is False
+        res = self.te.set(fake_tbl_cached.table_id, (None, "bypass_index", 888))
+        self.assertEqual(res, (1, "bypass_index", 888))
+
+        # Row is staged in queued_set for DB
+        self.assertIn(1, self.te.queued_set[fake_tbl_cached.table_id])
+
+        # Row was NOT indexed in _pk_index or _cached_rows
+        self.assertNotIn(1, self.te._pk_index.get(fake_tbl_cached.table_id, {}))
+
     def test_schema_table_ordering_and_backward_foreign_keys(self) -> None:
         """Verify m_tag_code is table_id=10 and all foreign keys point strictly backward."""
         from core.DBLayout import TABLES, m_tag_code, m_tag
@@ -786,6 +969,230 @@ class TestTECachedDBIntegrity(unittest.TestCase):
                         tbl.table_id,
                         f"Forward FK constraint detected: {tbl.table_name} (id={tbl.table_id}) -> {foreign_tbl_name} (id={foreign_tbl_id})",
                     )
+
+    def test_high_volume_duplicate_pk_set_performance(self) -> None:
+        """Verify set() maintains O(1) sub-millisecond execution when re-setting existing PKs in large cache."""
+        import hashlib
+        import time
+
+        fake_tbl_perf = Table(
+            table_id=89,
+            table_name="m_fake_perf",
+            columns=(
+                ("hash", "BINARY(32)", "NOT NULL"),
+                ("code", "LONGTEXT", "NOT NULL"),
+            ),
+            primary=("hash",),
+            te_cached=("hash",),
+        )
+        self.te.start([fake_tbl_perf], MockDB)
+
+        # Seed 10,000 items in cache
+        base_hashes = [hashlib.sha256(f"seed_{i}".encode()).digest() for i in range(10000)]
+        for h in base_hashes:
+            self.te.set(fake_tbl_perf.table_id, (h, "sample_code"))
+
+        self.assertEqual(len(self.te._cached_rows[fake_tbl_perf.table_id]), 10000)
+
+        # Re-set 20,000 duplicate keys and verify speed
+        t0 = time.perf_counter()
+        for i in range(20000):
+            h = base_hashes[i % len(base_hashes)]
+            res = self.te.set(fake_tbl_perf.table_id, (h, "sample_code"))
+            self.assertEqual(res[0], h)
+        elapsed = time.perf_counter() - t0
+
+        # Should execute 20,000 duplicate checks in < 0.1s (well over 200,000 ops/sec)
+        self.assertLess(elapsed, 0.1, f"High volume duplicate set took too long: {elapsed:.4f}s")
+
+    def test_bytearray_preloading_and_indexing(self) -> None:
+        """Verify bytearray and memoryview instances returned by DB driver are converted to immutable bytes without error."""
+        import hashlib
+
+        fake_tbl_binary = Table(
+            table_id=90,
+            table_name="_test_fake_binary_cache",
+            columns=(
+                ("hash", "BINARY(32)", "NOT NULL"),
+                ("code", "LONGTEXT", "NOT NULL"),
+            ),
+            primary=("hash",),
+            te_cached=("hash",),
+        )
+
+        class MockDBReturningBytearray(MockDB):
+            def view_select_multiple(self, tables, joins, columns):
+                # Return rows with raw bytearray objects as mysql-connector does for BINARY columns
+                h = bytearray(hashlib.sha256(b"code_test").digest())
+                return [(h, "code_test_content")]
+
+            def select_preload(self, table, cached_columns=None, min_vid=None):
+                h = bytearray(hashlib.sha256(b"code_test").digest())
+                if cached_columns is not None and len(cached_columns) < table.length:
+                    return [(h,)]
+                return [(h, "code_test_content")]
+
+
+        self.te.start([fake_tbl_binary], MockDBReturningBytearray)
+
+        # Verify row is indexed without unhashable bytearray error
+        self.assertEqual(len(self.te._cached_rows[fake_tbl_binary.table_id]), 1)
+        cached_row = self.te._cached_rows[fake_tbl_binary.table_id][0]
+        self.assertIsInstance(cached_row[0], bytes)
+
+        # Query using bytes
+        expected_h = hashlib.sha256(b"code_test").digest()
+        got_row = self.te.get(fake_tbl_binary.table_id, (expected_h, None))
+        self.assertIsNotNone(got_row)
+        self.assertEqual(got_row[0], expected_h)
+
+        # Query using bytearray
+        got_row_ba = self.te.get(fake_tbl_binary.table_id, (bytearray(expected_h), None))
+        self.assertIsNotNone(got_row_ba)
+        self.assertEqual(got_row_ba[0], expected_h)
+
+    def test_version_scoped_table_schema_configuration(self) -> None:
+        """Verify Table supports version_scoped across bool, dict, and tuple te_cached configurations."""
+        # 1. Standalone keyword
+        tbl_kw = Table(
+            table_id=881,
+            table_name="_test_v_scoped_kw",
+            columns=(("vid", "INT", "NOT NULL"), ("fnid", "INT", "NOT NULL")),
+            primary=("vid", "fnid"),
+            te_cached=True,
+            version_scoped=True,
+        )
+        self.assertTrue(tbl_kw.version_scoped)
+        self.assertEqual(tbl_kw.cached_columns, (0, 1))
+
+        # 2. Combined with column projection
+        tbl_proj = Table(
+            table_id=882,
+            table_name="_test_v_scoped_proj",
+            columns=(("vid", "INT", "NOT NULL"), ("fnid", "INT", "NOT NULL"), ("data", "TEXT", "NOT NULL")),
+            primary=("vid", "fnid"),
+            te_cached=("vid", "fnid"),
+            version_scoped=True,
+        )
+        self.assertTrue(tbl_proj.version_scoped)
+        self.assertEqual(tbl_proj.cached_columns, (0, 1))
+
+        # 3. Dict configuration
+        tbl_dict = Table(
+            table_id=883,
+            table_name="_test_v_scoped_dict",
+            columns=(("vid", "INT", "NOT NULL"), ("fnid", "INT", "NOT NULL")),
+            primary=("vid", "fnid"),
+            te_cached={"columns": ("vid", "fnid"), "version_scoped": True},
+        )
+        self.assertTrue(tbl_dict.version_scoped)
+        self.assertEqual(tbl_dict.cached_columns, (0, 1))
+
+    def test_version_scoped_working_window_preloading_and_eviction(self) -> None:
+        """Verify version_scoped tables only preload active window (vid >= Old_VID) and fallback to DB for out-of-window."""
+        import sys
+        main_mod = sys.modules.get("__main__")
+        orig_gp = getattr(main_mod, "gp", None) if main_mod is not None else None
+
+        class DummyGP:
+            Old_VID = 2
+            VID = 3
+
+        try:
+            if main_mod is not None:
+                main_mod.gp = DummyGP()
+
+            # Seed database directly with rows for VID=1, VID=2, VID=3
+            self.db.insert(fake_tbl_cached_bridge, (1, 100, 10))
+            self.db.insert(fake_tbl_cached_bridge, (2, 100, 20))
+            self.db.insert(fake_tbl_cached_bridge, (3, 100, 30))
+
+            # Start TECachedDB with Old_VID = 2
+            v_te = TECachedDB()
+            v_te.start(ALL_FAKE_TABLES, lambda: self.db)
+            try:
+                # Assert that in-memory _cached_rows ONLY contains rows for VID >= 2 (VID=1 is evicted/not preloaded)
+                cached = v_te._cached_rows[fake_tbl_cached_bridge.table_id]
+                cached_vids = [r[0] for r in cached]
+                self.assertNotIn(1, cached_vids, "Historical VID=1 rows should not be preloaded into in-memory cache")
+                self.assertIn(2, cached_vids, "Active Old_VID=2 row must be preloaded in cache")
+                self.assertIn(3, cached_vids, "Active VID=3 row must be preloaded in cache")
+
+                # In-window lookups resolve from _pk_index in O(1)
+                r2 = v_te.get(fake_tbl_cached_bridge.table_id, (2, 100, None))
+                self.assertEqual(r2, (2, 100, 20))
+
+                r3 = v_te.get(fake_tbl_cached_bridge.table_id, (3, 100, None))
+                self.assertEqual(r3, (3, 100, 30))
+
+                # Out-of-window lookup (VID=1) is not in _pk_index, but safely falls back to DB query
+                r1 = v_te.get(fake_tbl_cached_bridge.table_id, (1, 100, None))
+                self.assertEqual(r1, (1, 100, 10))
+            finally:
+                v_te.close()
+        finally:
+            if main_mod is not None:
+                main_mod.gp = orig_gp
+
+    def test_selective_inverted_column_indexing_pk_exemption(self) -> None:
+        """Verify _col_indices does not create redundant inverted index buckets for primary key columns."""
+        te = TECachedDB()
+        te.start(ALL_FAKE_TABLES, lambda: self.db)
+        try:
+            # For fake_tbl_hash (primary=("hash",)), column 0 should be exempt from _col_indices
+            self.assertNotIn(
+                0,
+                te._col_indices[fake_tbl_hash.table_id],
+                "Primary key column 0 should be exempt from _col_indices",
+            )
+
+            # For fake_tbl_cached_bridge (primary=("vid", "fnid")), columns 0 and 1 should be exempt
+            self.assertNotIn(
+                0,
+                te._col_indices[fake_tbl_cached_bridge.table_id],
+                "Primary key column 'vid' should be exempt from _col_indices",
+            )
+            self.assertNotIn(
+                1,
+                te._col_indices[fake_tbl_cached_bridge.table_id],
+                "Primary key column 'fnid' should be exempt from _col_indices",
+            )
+            self.assertIn(
+                2,
+                te._col_indices[fake_tbl_cached_bridge.table_id],
+                "Non-primary column 'fid' should be present in _col_indices",
+            )
+        finally:
+            te.close()
+
+    def test_start_new_db_selective_preload_reconstruction(self) -> None:
+        """Verify start_new_db preloads partial column queries and accurately reconstructs canonical rows."""
+        import hashlib
+        h1 = hashlib.sha256(b"code_partial_1").digest()
+        h2 = hashlib.sha256(b"code_partial_2").digest()
+
+        self.db.insert(fake_tbl_partial_cached, (
+            (h1, "long_text_content_1"),
+            (h2, "long_text_content_2"),
+        ))
+
+        te = TECachedDB()
+        te.start(ALL_FAKE_TABLES, lambda: self.db)
+        try:
+            # Check that _cached_rows and _pk_index have canonical row (h, None)
+            self.assertEqual(len(te._cached_rows[fake_tbl_partial_cached.table_id]), 3)  # 1 initial_insert seed + 2 inserted
+            self.assertEqual(te._pk_index[fake_tbl_partial_cached.table_id][h1], (h1, None))
+            self.assertEqual(te._pk_index[fake_tbl_partial_cached.table_id][h2], (h2, None))
+
+            # Query via get
+            res1 = te.get(fake_tbl_partial_cached.table_id, (h1, None))
+            self.assertEqual(res1, (h1, None))
+        finally:
+            te.close()
+
+
+
+
 
 
 # =============================================================================

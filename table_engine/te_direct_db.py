@@ -80,6 +80,8 @@ class TEDirectDB:
         self.queued_update: dict[int, list[tuple[SafeDataType, ...]]] = {}
         self.queued_view: dict[JoinsType, dict[tuple[SafeDataType, ...], int]] = {}
         self.next_id: dict[int, int] = {}
+        self._pk_getters: dict[int, Callable[[tuple[SafeDataType, ...]], Any]] = {}
+        self._join_plan_cache: dict[JoinsType, list[tuple[int, int, int]]] = {}
         self.db: Any | None = None
 
     def close(self) -> None:
@@ -108,6 +110,16 @@ class TEDirectDB:
     def __del__(self) -> None:
         """Clean up resources upon garbage collection."""
         self.close()
+
+    def _register_table(self, table: Table) -> None:
+        """Register table schema and precompile primary key extractor."""
+        self.tables[table.table_id] = table
+        if table.primary:
+            if len(table.primary) == 1:
+                pk_idx = table.primary[0]
+                self._pk_getters[table.table_id] = lambda row, idx=pk_idx: row[idx]
+            else:
+                self._pk_getters[table.table_id] = itemgetter(*table.primary)
 
     def start_new_db(self, db: Callable[[], Any] | type[Any]) -> None:
         """Start or restart the database connection handle for Table Engine use.
@@ -144,7 +156,7 @@ class TEDirectDB:
 
         Process:
             1. Normalizes `tables` into a tuple if a single table was provided.
-            2. Registers tables into `self.tables`.
+            2. Registers tables into `self.tables` and precompiles PK getters.
             3. Starts a fresh database connection and initializes queues via `self.start_new_db(db)`.
 
         Outputs:
@@ -153,28 +165,43 @@ class TEDirectDB:
         if not isinstance(tables, (tuple, list)):
             tables = (tables,)
         for table in tables:
-            self.tables[table.table_id] = table
+            self._register_table(table)
         self.start_new_db(db)
+
+    @staticmethod
+    def _sanitize_key(key: Any) -> Any:
+        """Coerce mutable bytearray or memoryview objects inside keys to immutable hashable bytes."""
+        if type(key) in (int, str, bytes):
+            return key
+        if isinstance(key, (bytearray, memoryview)):
+            return bytes(key)
+        if isinstance(key, tuple):
+            if any(isinstance(x, (bytearray, memoryview)) for x in key):
+                return tuple(bytes(x) if isinstance(x, (bytearray, memoryview)) else x for x in key)
+        return key
 
     def get(
         self,
         table_id: int,
         columns: tuple[SafeDataType, ...],
     ) -> tuple[SafeDataType, ...] | None:
-        """Execute single-row SELECT query with wildcard column filtering.
+        """Query single matching row from queued staged operations or directly from database.
 
         Args:
             table_id: Target table identifier integer.
-            columns: Tuple of column filter values, where None represents wildcards.
+            columns: Tuple of column values where None represents a wildcard.
 
         Process:
-            1. Staging check: Checks local `queued_set` for staged rows.
-            2. Emptiness guard: If `next_id <= 1` and `table.initial_insert is None`,
-               the table is empty, avoiding unnecessary database queries.
-            3. Executes parameterized SELECT query via `self.db.select(table, columns)`.
+            1. Staging check in `queued_set`:
+               - If `no_duplicate=True`: checks staged dictionary using `columns[1:]`.
+               - If explicit PK provided: checks staged dictionary via PK key.
+               - Otherwise: scans staged dictionary entries matching non-None column filters.
+            2. Emptiness guard: If table has `has_auto_increment=True`, `initial_insert=None`,
+               and `next_id <= 1`, returns `None` immediately without issuing SQL queries.
+            3. Fallback: Executes direct database select via `self.db.select(table, columns)`.
 
         Outputs:
-            Matching row tuple `tuple[SafeDataType, ...]` or None if no match is found.
+            Matching row tuple `tuple[SafeDataType, ...]` or None.
         """
         table = self.tables[table_id]
 
@@ -182,27 +209,48 @@ class TEDirectDB:
         if table_id in self.queued_set:
             if table.no_duplicate:
                 if len(columns) > 1 and all(c is not None for c in columns[1:]):
-                    cached_id = self.queued_set[table_id].get(columns[1:])
+                    key = self._sanitize_key(columns[1:])
+                    cached_id = self.queued_set[table_id].get(key)
                     if cached_id is not None:
                         row = (cached_id, *columns[1:])
                         if columns[0] is None or row[0] == columns[0]:
                             return row
+                else:
+                    for k, v in self.queued_set[table_id].items():
+                        staged_row = (v, *k) if isinstance(k, tuple) else (v, k)
+                        match = True
+                        for i, val in enumerate(columns):
+                            if val is not None and (i >= len(staged_row) or staged_row[i] != val):
+                                match = False
+                                break
+                        if match:
+                            return staged_row
             else:
                 pk_specified = all(columns[i] is not None for i in table.primary)
                 if pk_specified:
-                    pk = itemgetter(*table.primary)(columns)
+                    pk_fn = self._pk_getters.get(table_id)
+                    pk = self._sanitize_key(pk_fn(columns) if pk_fn is not None else itemgetter(*table.primary)(columns))
                     staged_row = self.queued_set[table_id].get(pk)
                     if staged_row is not None:
                         match = True
                         for i, val in enumerate(columns):
-                            if val is not None and staged_row[i] != val:
+                            if val is not None and (i >= len(staged_row) or staged_row[i] != val):
+                                match = False
+                                break
+                        if match:
+                            return staged_row
+                else:
+                    for staged_row in self.queued_set[table_id].values():
+                        match = True
+                        for i, val in enumerate(columns):
+                            if val is not None and (i >= len(staged_row) or staged_row[i] != val):
                                 match = False
                                 break
                         if match:
                             return staged_row
 
         # 2. Emptiness guard: Table has never received data and has no seed insert
-        if getattr(table, "has_auto_increment", True) and table.initial_insert is None and self.next_id.get(table_id, 0) <= 1:
+        if getattr(table, "has_auto_increment", True) and table.initial_insert is None and self.next_id.get(table_id, 0) <= 1 and (table_id not in self.queued_set or not self.queued_set[table_id]):
             return None
 
         if self.db is None:
@@ -234,7 +282,7 @@ class TEDirectDB:
                - Stores `self.queued_set[table_id][assigned_id] = new_row`.
                - Returns `new_row`.
             3. If explicit primary key provided (`columns[0] is not None`):
-               - Extracts primary key keying via `itemgetter(*table.primary)(columns)`.
+               - Extracts primary key keying via `self._pk_getters[table_id]`.
                - Stores `self.queued_set[table_id][pk] = columns`.
                - Returns `columns`.
 
@@ -244,7 +292,7 @@ class TEDirectDB:
         table = self.tables[table_id]
 
         if table.no_duplicate:
-            key = columns[1:]
+            key = self._sanitize_key(columns[1:])
             current_set = self.queued_set[table_id].get(key)
             if current_set is not None:
                 return (current_set, *columns[1:])
@@ -261,7 +309,8 @@ class TEDirectDB:
             self.next_id[table_id] += 1
             return row
 
-        pk = itemgetter(*table.primary)(columns)
+        pk_fn = self._pk_getters.get(table_id)
+        pk = self._sanitize_key(pk_fn(columns) if pk_fn is not None else itemgetter(*table.primary)(columns))
         self.queued_set[table_id][pk] = columns
         return columns
 
@@ -429,14 +478,18 @@ class TEDirectDB:
 
             result = tuple(val if val is not None else current_view_id for val in columns)
 
-            # Decompose result across tables using self.set
+            # Decompose result across tables using cached join plan
+            if joins not in self._join_plan_cache:
+                self._join_plan_cache[joins] = [
+                    (pointer[0], self.tables[pointer[0]].length, repeat)
+                    for repeat, pointer in PointerGetter(joins)
+                ]
+
             data_offset = 0
-            for repeat, pointer in PointerGetter(joins):
-                target_table = self.tables[pointer[0]]
-                t_len = target_table.length
+            for t_id, t_len, repeat in self._join_plan_cache[joins]:
                 for _ in range(repeat):
                     row = result[data_offset : data_offset + t_len]
-                    self.set(pointer[0], row)
+                    self.set(t_id, row)
                     data_offset += t_len
 
             # Stage row in hash_table using self.set
@@ -450,13 +503,17 @@ class TEDirectDB:
 
         result = tuple(val if val is not None else current_view_id for val in columns)
 
+        if joins not in self._join_plan_cache:
+            self._join_plan_cache[joins] = [
+                (pointer[0], self.tables[pointer[0]].length, repeat)
+                for repeat, pointer in PointerGetter(joins)
+            ]
+
         data_offset = 0
-        for repeat, pointer in PointerGetter(joins):
-            target_table = self.tables[pointer[0]]
-            t_len = target_table.length
+        for t_id, t_len, repeat in self._join_plan_cache[joins]:
             for _ in range(repeat):
                 row = result[data_offset : data_offset + t_len]
-                self.set(pointer[0], row)
+                self.set(t_id, row)
                 data_offset += t_len
 
         return result
@@ -481,11 +538,12 @@ class TEDirectDB:
         self.queued_update[table_id].append(columns)
         return columns
 
-    def commit(self, table_id: int) -> None:
+    def commit(self, table_id: int, update_in_mem_indexes: bool = True) -> None:
         """Flush staged insert and update operations for target table to database and clear buffers.
 
         Args:
             table_id: Target table identifier integer.
+            update_in_mem_indexes: Whether in-memory index updates are enabled (passed to cached engines).
 
         Process:
             1. If `self.queued_set[table_id]` is non-empty:
@@ -504,14 +562,19 @@ class TEDirectDB:
 
         if self.queued_set[table_id]:
             if table.no_duplicate:
-                payload = tuple(
+                rows = [
                     v if isinstance(v, (tuple, list))
                     else ((v, *k) if isinstance(k, tuple) else (v, k))
                     for k, v in self.queued_set[table_id].items()
-                )
+                ]
             else:
-                payload = tuple(self.queued_set[table_id].values())
+                rows = list(self.queued_set[table_id].values())
 
+            if table.primary and len(rows) > 1:
+                pk_fn = self._pk_getters.get(table_id)
+                rows.sort(key=pk_fn if pk_fn is not None else itemgetter(*table.primary))
+
+            payload = tuple(rows)
             self.db.insert(table, payload)
             self.queued_set[table_id].clear()
 
@@ -519,11 +582,12 @@ class TEDirectDB:
             self.db.update(table, tuple(self.queued_update[table_id]))
             self.queued_update[table_id].clear()
 
-    def commit_all(self, max_workers: int | None = None) -> None:
+    def commit_all(self, max_workers: int | None = None, update_in_mem_indexes: bool = True) -> None:
         """Flush staged insert and update operations across ALL tables concurrently and clear buffers.
 
         Args:
             max_workers: Maximum concurrent worker threads.
+            update_in_mem_indexes: Whether in-memory index updates are enabled (passed to cached engines).
 
         Process:
             1. Collects payload tuples `(table, insert_payload, update_payload)` for all non-empty tables.
@@ -540,13 +604,19 @@ class TEDirectDB:
 
             if self.queued_set[table_id]:
                 if table.no_duplicate:
-                    insert_payload = tuple(
+                    rows = [
                         v if isinstance(v, (tuple, list))
                         else ((v, *k) if isinstance(k, tuple) else (v, k))
                         for k, v in self.queued_set[table_id].items()
-                    )
+                    ]
                 else:
-                    insert_payload = tuple(self.queued_set[table_id].values())
+                    rows = list(self.queued_set[table_id].values())
+
+                if table.primary and len(rows) > 1:
+                    pk_fn = self._pk_getters.get(table_id)
+                    rows.sort(key=pk_fn if pk_fn is not None else itemgetter(*table.primary))
+
+                insert_payload = tuple(rows)
 
             if self.queued_update[table_id]:
                 update_payload = tuple(self.queued_update[table_id])

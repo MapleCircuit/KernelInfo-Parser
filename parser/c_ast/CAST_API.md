@@ -390,12 +390,12 @@ The C AST parser generates and references records across 8 core database tables:
 | m_ast_container     |    7     | (ast_id, priority, type_id, ref_ast_id)                            |
 | m_ast_include       |    8     | (ast_id, fnid)                                                     |
 | m_ast_debug         |    9     | (ast_id, ast_raw)                                                  |
-| m_tag               |   10     | (tag_id, vid_s, vid_e, hash, ast_id, hl_s, hl_l)                  |
-| m_bridge_tag        |   11     | (fid, tag_id, line_s, line_e, char_s, char_e)                      |
-| m_map_ast           |   12     | (map_id, line_s, char_s, line_e, char_e, ast_id)                   |
-| m_bridge_map        |   13     | (tag_id, map_id)                                                   |
-| m_ast_hash          |   14     | (hash, ast_id)                                                     |
-| m_tag_code          |   29     | (hash, code)                                                       |
+| m_tag_code          |   10     | (hash, code)                                                       |
+| m_tag               |   11     | (tag_id, vid_s, vid_e, hash, ast_id, hl_s, hl_l)                  |
+| m_bridge_tag        |   12     | (fid, tag_id, line_s, line_e, char_s, char_e)                      |
+| m_map_ast           |   13     | (map_id, line_s, char_s, line_e, char_e, ast_id)                   |
+| m_bridge_map        |   14     | (tag_id, map_id)                                                   |
+| m_ast_hash          |   15     | (hash, ast_id)                                                     |
 +----------------------------------------------------------------------------------------------------+
 ```
 

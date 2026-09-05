@@ -6,6 +6,7 @@ and correlates code occurrence tags (m_tag) to commit revisions.
 """
 import re
 import os
+import bisect
 import subprocess
 import logging
 from pathlib import Path
@@ -904,19 +905,41 @@ class GitCommitParser:
         # Mode A: Direct hunk-to-commit mapping dictionary passed (e.g. in unit tests)
         if hunks_by_commit is not None:
             tag_to_cids: dict[int, list[int]] = {}
+            resolved_hunks: list[tuple[int, int, int]] = []
+            for cid, hunk_list in hunks_by_commit.items():
+                for h in hunk_list:
+                    hs = h.new_start
+                    he = h.new_start + max(1, h.new_count) - 1
+                    resolved_hunks.append((hs, he, cid))
+
+            if len(resolved_hunks) <= 8:
+                for t in tags:
+                    tid = t["tag_id"] if isinstance(t, dict) else (t[0] if len(t) > 0 else 0)
+                    ls = t["line_s"] if isinstance(t, dict) else (t[2] if len(t) > 2 else 1)
+                    le = t["line_e"] if isinstance(t, dict) else (t[3] if len(t) > 3 else ls)
+                    matched_cids: list[int] = []
+                    for hs, he, cid in resolved_hunks:
+                        if not (le < hs or ls > he):
+                            if cid not in matched_cids:
+                                matched_cids.append(cid)
+                    tag_to_cids[tid] = matched_cids
+                return tag_to_cids
+
+            resolved_hunks.sort(key=lambda x: x[0])
+            hunk_starts = [h[0] for h in resolved_hunks]
+
             for t in tags:
                 tid = t["tag_id"] if isinstance(t, dict) else (t[0] if len(t) > 0 else 0)
                 ls = t["line_s"] if isinstance(t, dict) else (t[2] if len(t) > 2 else 1)
                 le = t["line_e"] if isinstance(t, dict) else (t[3] if len(t) > 3 else ls)
-                matched_cids: list[int] = []
-
-                for cid, hunk_list in hunks_by_commit.items():
-                    for h in hunk_list:
-                        hs = h.new_start
-                        he = h.new_start + max(1, h.new_count) - 1
-                        if not (le < hs or ls > he):
-                            if cid not in matched_cids:
-                                matched_cids.append(cid)
+                matched_cids = []
+                seen_cids = set()
+                idx_end = bisect.bisect_right(hunk_starts, le)
+                for i in range(idx_end):
+                    hs, he, cid = resolved_hunks[i]
+                    if he >= ls and cid not in seen_cids:
+                        seen_cids.add(cid)
+                        matched_cids.append(cid)
                 tag_to_cids[tid] = matched_cids
             return tag_to_cids
 
@@ -925,9 +948,58 @@ class GitCommitParser:
             if commit_hash_to_id is None:
                 commit_hash_to_id = {}
 
-            hunks = file_hunks_map.get(file_path, [])
+            raw_hunks = file_hunks_map.get(file_path, [])
+            if not raw_hunks:
+                return []
+
+            first_cid: int | None = None
+            resolved_hunks = []
+            for hunk_s, hunk_e, c_hash in raw_hunks:
+                cid = commit_hash_to_id.get(c_hash)
+                if cid is not None:
+                    if first_cid is None:
+                        first_cid = cid
+                    resolved_hunks.append((hunk_s, hunk_e, cid))
+
+            if not resolved_hunks:
+                return []
+
             tag_commit_bridges: list[tuple[int, int, int]] = []
             seen_bridges: set[tuple[int, int]] = set()
+
+            if len(resolved_hunks) <= 8:
+                for t in tags:
+                    if isinstance(t, dict):
+                        tag_id = t.get("tag_id", 0)
+                        fid = t.get("fid", 0)
+                        line_s = t.get("line_s", 1)
+                        line_e = t.get("line_e", line_s)
+                    elif isinstance(t, (tuple, list)):
+                        tag_id = t[0] if len(t) > 0 else 0
+                        fid = t[1] if len(t) > 1 else 0
+                        line_s = t[2] if len(t) > 2 else 1
+                        line_e = t[3] if len(t) > 3 else line_s
+                    else:
+                        continue
+
+                    matched_commit_ids: set[int] = set()
+                    for hunk_s, hunk_e, cid in resolved_hunks:
+                        if not (line_e < hunk_s or line_s > hunk_e):
+                            matched_commit_ids.add(cid)
+
+                    if not matched_commit_ids and first_cid is not None:
+                        matched_commit_ids.add(first_cid)
+
+                    for cid in matched_commit_ids:
+                        bridge_key = (cid, tag_id)
+                        if bridge_key not in seen_bridges:
+                            seen_bridges.add(bridge_key)
+                            tag_commit_bridges.append((cid, fid, tag_id))
+
+                return tag_commit_bridges
+
+            resolved_hunks.sort(key=lambda x: x[0])
+            hunk_starts = [h[0] for h in resolved_hunks]
 
             for t in tags:
                 if isinstance(t, dict):
@@ -943,18 +1015,15 @@ class GitCommitParser:
                 else:
                     continue
 
-                matched_commit_ids: set[int] = set()
+                matched_commit_ids = set()
+                idx_end = bisect.bisect_right(hunk_starts, line_e)
+                for i in range(idx_end):
+                    hunk_s, hunk_e, cid = resolved_hunks[i]
+                    if hunk_e >= line_s:
+                        matched_commit_ids.add(cid)
 
-                for hunk_s, hunk_e, c_hash in hunks:
-                    if not (line_e < hunk_s or line_s > hunk_e):
-                        cid = commit_hash_to_id.get(c_hash)
-                        if cid is not None:
-                            matched_commit_ids.add(cid)
-
-                if not matched_commit_ids and hunks:
-                    first_cid = commit_hash_to_id.get(hunks[0][2])
-                    if first_cid is not None:
-                        matched_commit_ids.add(first_cid)
+                if not matched_commit_ids and first_cid is not None:
+                    matched_commit_ids.add(first_cid)
 
                 for cid in matched_commit_ids:
                     bridge_key = (cid, tag_id)
@@ -969,8 +1038,58 @@ class GitCommitParser:
             commit_hash_to_id = {}
 
         hunks_list = self.extract_file_hunks(old_rev, new_rev, file_path)
+        if not hunks_list:
+            return []
+
+        first_cid = None
+        resolved_hunks = []
+        for h in hunks_list:
+            cid = commit_hash_to_id.get(h.commit_hash)
+            if cid is not None:
+                if first_cid is None:
+                    first_cid = cid
+                hunk_s = h.new_start
+                hunk_e = h.new_start + max(1, h.new_count) - 1
+                resolved_hunks.append((hunk_s, hunk_e, cid))
+
+        if not resolved_hunks:
+            return []
+
         tag_commit_bridges = []
         seen_bridges = set()
+
+        if len(resolved_hunks) <= 8:
+            for t in tags:
+                if isinstance(t, dict):
+                    tag_id = t.get("tag_id", 0)
+                    fid = t.get("fid", 0)
+                    line_s = t.get("line_s", 1)
+                    line_e = t.get("line_e", line_s)
+                elif isinstance(t, (tuple, list)):
+                    tag_id = t[0] if len(t) > 0 else 0
+                    fid = t[1] if len(t) > 1 else 0
+                    line_s = t[2] if len(t) > 2 else 1
+                    line_e = t[3] if len(t) > 3 else line_s
+                else:
+                    continue
+
+                matched_commit_ids = set()
+                for hunk_s, hunk_e, cid in resolved_hunks:
+                    if not (line_e < hunk_s or line_s > hunk_e):
+                        matched_commit_ids.add(cid)
+
+                if not matched_commit_ids and first_cid is not None:
+                    matched_commit_ids.add(first_cid)
+
+                for cid in matched_commit_ids:
+                    bridge_key = (cid, tag_id)
+                    if bridge_key not in seen_bridges:
+                        seen_bridges.add(bridge_key)
+                        tag_commit_bridges.append((cid, fid, tag_id))
+            return tag_commit_bridges
+
+        resolved_hunks.sort(key=lambda x: x[0])
+        hunk_starts = [h[0] for h in resolved_hunks]
 
         for t in tags:
             if isinstance(t, dict):
@@ -987,19 +1106,14 @@ class GitCommitParser:
                 continue
 
             matched_commit_ids = set()
+            idx_end = bisect.bisect_right(hunk_starts, line_e)
+            for i in range(idx_end):
+                hunk_s, hunk_e, cid = resolved_hunks[i]
+                if hunk_e >= line_s:
+                    matched_commit_ids.add(cid)
 
-            for h in hunks_list:
-                hunk_s = h.new_start
-                hunk_e = h.new_start + max(1, h.new_count) - 1
-                if not (line_e < hunk_s or line_s > hunk_e):
-                    cid = commit_hash_to_id.get(h.commit_hash)
-                    if cid is not None:
-                        matched_commit_ids.add(cid)
-
-            if not matched_commit_ids and hunks_list:
-                first_cid = commit_hash_to_id.get(hunks_list[0].commit_hash)
-                if first_cid is not None:
-                    matched_commit_ids.add(first_cid)
+            if not matched_commit_ids and first_cid is not None:
+                matched_commit_ids.add(first_cid)
 
             for cid in matched_commit_ids:
                 bridge_key = (cid, tag_id)

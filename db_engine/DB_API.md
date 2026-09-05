@@ -35,6 +35,8 @@ Any database backend assigned to `G.DB` or passed to `TableEngine.start()` must 
   - Queries `COALESCE(MAX(pk), 0) + 1` on table primary key. Returns 1 if table is empty.
 - **`select(table: Table, data: tuple[SafeDataType, ...]) -> tuple[SafeDataType, ...] | None`**
   - Executes single-row query matching non-None column filters (`SELECT * FROM table WHERE ... LIMIT 1`). None positions act as wildcards.
+- **`select_preload(table: Table, cached_columns: tuple[int, ...] | None = None, min_vid: int | None = None) -> list[tuple[SafeDataType, ...]]`**
+  - Queries records for TableEngine startup preloading with column projection (e.g. `SELECT hash FROM m_tag_code`) and version filtering (`WHERE vid >= min_vid` or `WHERE (vid_e = 0 OR vid_e >= min_vid)`).
 
 ### 2.3. Multi-Table Relational Views
 - **`view_select(tables: Sequence[Table] | dict[int, Table], joins: JoinsType, columns: tuple[SafeDataType, ...]) -> tuple[SafeDataType, ...] | None`**

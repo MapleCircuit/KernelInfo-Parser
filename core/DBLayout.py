@@ -61,7 +61,7 @@ SCHEMA ENTITY-RELATIONSHIP GRAPH:
       |                                     |                                         |
       |-- (vid, fid, sec_id) ---------------> m_maintainer_file (vid, fid, sec_id)    |
       |                                        ^                                      |
-      |-- (vid_s, vid_e, person_id) --------> m_credits_entry (credit_id, vid_s, ...) -|
+      |-- (vid_s, vid_e, person_id) --------> m_credits_entry (credit_id, vid_s, vid_e, person_id, web_page, pgp_key, description, snail_mail, ast_id) -|
                                                ^
    m_file (fid, ...) --------------------------|
 
@@ -131,7 +131,7 @@ m_file_name = Table(
 #    - fid: Unique File Instance ID (PK, AUTO_INCREMENT).
 #    - vid_s: Starting Version ID (FK -> m_v_main.vid).
 #    - vid_e: Ending Version ID (FK -> m_v_main.vid, 0 if still active).
-#    - ftype: File category (0: Dir, 1: C code/header, 2: Kconfig, 3: Rust).
+#    - ftype: File category (0: Dir, 1: C code/header, 2: Kconfig, 3: Rust, 4: Assembly).
 #    - s_stat: Change status at inception ('A'=Added, 'M'=Modified, 'R'=Renamed).
 #    - e_stat: Change status at conclusion ('D'=Deleted, 'R'=Renamed, '0'=Active).
 # -----------------------------------------------------------------------------
@@ -147,7 +147,7 @@ m_file = Table(
         ("e_stat", "CHAR(1)", "NOT NULL"),
     ),
     primary=("fid",),
-    foreign=(("vid_s", "m_v_main", "vid"), ("vid_e", "m_v_main", "vid")),
+    foreign=None,
     initial_insert=((0, 0, 0, 0, 0, 0),),
     no_duplicate=False,
     te_cached=True,
@@ -177,6 +177,7 @@ m_bridge_file = Table(
     initial_insert=None,
     no_duplicate=False,
     te_cached=True,
+    version_scoped=True,
     hashing_table=False,
 )
 
@@ -344,12 +345,7 @@ m_tag = Table(
         ("hl_l", "INT", "NOT NULL"),
     ),
     primary=("tag_id", "vid_s"),
-    foreign=(
-        ("vid_s", "m_v_main", "vid"),
-        ("vid_e", "m_v_main", "vid"),
-        ("hash", "m_tag_code", "hash"),
-        ("ast_id", "m_ast", "ast_id"),
-    ),
+    foreign=None,
     initial_insert=((0, 0, 0, b"\x00" * 32, 0, 0, 0),),
     no_duplicate=False,
     te_cached=False,
@@ -475,8 +471,6 @@ m_kconfig_symbol = Table(
     ),
     primary=("kcid", "vid_s"),
     foreign=(
-        ("vid_s", "m_v_main", "vid"),
-        ("vid_e", "m_v_main", "vid"),
         ("ast_id", "m_ast", "ast_id"),
     ),
     initial_insert=None,
@@ -507,7 +501,7 @@ m_kconfig_relation = Table(
     foreign=(("kcid", "m_kconfig_symbol", "kcid"),),
     initial_insert=None,
     no_duplicate=False,
-    te_cached=False,
+    te_cached=True,
     hashing_table=False,
 )
 
@@ -539,12 +533,11 @@ m_kconfig_tree = Table(
     ),
     primary=("tree_id", "vid"),
     foreign=(
-        ("vid", "m_v_main", "vid"),
         ("ast_id", "m_ast", "ast_id"),
     ),
     initial_insert=None,
     no_duplicate=False,
-    te_cached=False,
+    te_cached=True,
     hashing_table=False,
 )
 
@@ -568,12 +561,11 @@ m_kconfig_kbuild = Table(
     ),
     primary=("kcid", "vid", "fid", "compile_mode"),
     foreign=(
-        ("vid", "m_v_main", "vid"),
         ("fid", "m_file", "fid"),
     ),
     initial_insert=None,
     no_duplicate=False,
-    te_cached=False,
+    te_cached=True,
     hashing_table=False,
 )
 
@@ -595,7 +587,7 @@ m_maintainer_person = Table(
     foreign=None,
     initial_insert=None,
     no_duplicate=True,
-    te_cached=False,
+    te_cached=True,
     hashing_table=False,
 )
 
@@ -627,13 +619,11 @@ m_maintainer_section = Table(
     ),
     primary=("sec_id", "vid_s"),
     foreign=(
-        ("vid_s", "m_v_main", "vid"),
-        ("vid_e", "m_v_main", "vid"),
         ("ast_id", "m_ast", "ast_id"),
     ),
     initial_insert=None,
     no_duplicate=True,
-    te_cached=False,
+    te_cached=True,
     hashing_table=False,
 )
 
@@ -660,7 +650,7 @@ m_maintainer_member = Table(
     ),
     initial_insert=None,
     no_duplicate=False,
-    te_cached=False,
+    te_cached=True,
     hashing_table=False,
 )
 
@@ -684,7 +674,7 @@ m_maintainer_pattern = Table(
     foreign=(("sec_id", "m_maintainer_section", "sec_id"),),
     initial_insert=None,
     no_duplicate=False,
-    te_cached=False,
+    te_cached=True,
     hashing_table=False,
 )
 
@@ -704,7 +694,6 @@ m_maintainer_file = Table(
     ),
     primary=("vid", "fid", "sec_id"),
     foreign=(
-        ("vid", "m_v_main", "vid"),
         ("fid", "m_file", "fid"),
         ("sec_id", "m_maintainer_section", "sec_id"),
     ),
@@ -742,14 +731,12 @@ m_credits_entry = Table(
     ),
     primary=("credit_id", "vid_s"),
     foreign=(
-        ("vid_s", "m_v_main", "vid"),
-        ("vid_e", "m_v_main", "vid"),
         ("person_id", "m_maintainer_person", "person_id"),
         ("ast_id", "m_ast", "ast_id"),
     ),
     initial_insert=None,
     no_duplicate=True,
-    te_cached=False,
+    te_cached=True,
     hashing_table=False,
 )
 
@@ -781,7 +768,6 @@ m_commit = Table(
     ),
     primary=("commit_id",),
     foreign=(
-        ("vid", "m_v_main", "vid"),
         ("author_id", "m_maintainer_person", "person_id"),
         ("committer_id", "m_maintainer_person", "person_id"),
     ),
@@ -837,7 +823,6 @@ m_bridge_commit_file = Table(
     primary=("commit_id", "fid"),
     foreign=(
         ("commit_id", "m_commit", "commit_id"),
-        ("vid", "m_v_main", "vid"),
         ("fid", "m_file", "fid"),
     ),
     initial_insert=None,
@@ -865,7 +850,6 @@ m_bridge_commit_tag = Table(
     primary=("commit_id", "tag_id"),
     foreign=(
         ("commit_id", "m_commit", "commit_id"),
-        ("vid", "m_v_main", "vid"),
         ("fid", "m_file", "fid"),
         ("tag_id", "m_tag", "tag_id"),
     ),
@@ -922,8 +906,3 @@ def init_db_layout(gp=None) -> tuple[Table, ...]:
     if gp is not None:
         gp.Table_Array = list(TABLES)
     return TABLES
-
-
-
-
-

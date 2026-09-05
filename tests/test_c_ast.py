@@ -372,19 +372,32 @@ class TestCASTParser(unittest.TestCase):
             G.MEMORY_MODE = orig_mode
             gp.init_cs_dict()
 
-        # 3. Test LRU eviction, decompress on-demand, mutation persistence
+        # 3. Test LRU bypass on insert, decompress on-demand, LRU eviction, mutation persistence
         c_dict = CompressedChangeSetDict(lru_cache_size=3)
         c_dict["a"] = {"count": 1}
         c_dict["b"] = {"count": 2}
         c_dict["c"] = {"count": 3}
         self.assertEqual(len(c_dict), 3)
+        self.assertEqual(len(c_dict._lru_cache), 0)  # Insert bypasses LRU cache
+
+        # Accessing items brings them into LRU cache
+        self.assertEqual(c_dict["a"], {"count": 1})
+        self.assertEqual(len(c_dict._lru_cache), 1)
+        self.assertIn("a", c_dict._lru_cache)
+
+        self.assertEqual(c_dict["b"], {"count": 2})
+        self.assertEqual(c_dict["c"], {"count": 3})
         self.assertEqual(len(c_dict._lru_cache), 3)
 
-        # Exceed LRU cache size
+        # Inserting a new item does not populate LRU
         c_dict["d"] = {"count": 4}
         self.assertEqual(len(c_dict), 4)
         self.assertEqual(len(c_dict._lru_cache), 3)
-        self.assertNotIn("a", c_dict._lru_cache)  # evicted to compressed store
+
+        # Accessing 'd' exceeds LRU capacity -> evicts least recently accessed ('a')
+        self.assertEqual(c_dict["d"], {"count": 4})
+        self.assertEqual(len(c_dict._lru_cache), 3)
+        self.assertNotIn("a", c_dict._lru_cache)
 
         # Access evicted item -> decompressed and brought back into LRU
         item_a = c_dict["a"]
@@ -393,10 +406,13 @@ class TestCASTParser(unittest.TestCase):
 
         # In-place mutation and eviction roundtrip
         item_a["count"] = 99
-        # Evict 'a' again by adding more items
+        # Evict 'a' again by accessing other items
         c_dict["e"] = {"count": 5}
         c_dict["f"] = {"count": 6}
         c_dict["g"] = {"count": 7}
+        _ = c_dict["e"]
+        _ = c_dict["f"]
+        _ = c_dict["g"]
         self.assertNotIn("a", c_dict._lru_cache)
 
         # Access again to verify mutated state was persisted

@@ -172,6 +172,99 @@ def benchmark_keyword_membership(iterations: int = 10) -> None:
     print(f"Speedup: {COLOR.green(f'{t1/t2:.2f}x faster')}\n")
 
 
+def benchmark_hash_insertion_and_sorting(row_count: int = 20000, batch_size: int = 1000) -> None:
+    """Microbenchmark hash serialization, in-memory staging, sorting, and B-Tree page locality."""
+    print(COLOR.cyan("\n=========================================================================================="))
+    print(COLOR.cyan("               BINARY(32) HASH INSERTION, SERIALIZATION & SORTING BENCHMARK               "))
+    print(COLOR.cyan("=========================================================================================="))
+
+    import hashlib
+    import random
+
+    # 1. Prepare synthetic code snippets and cryptographic hashes
+    raw_snippets = [f"static inline int func_{i}(void *ptr, u32 flags) {{ return {i} * 42; }}" for i in range(row_count)]
+    hashes = [hashlib.sha256(s.encode("latin-1")).digest() for s in raw_snippets]
+    hex_hashes = [h.hex() for h in hashes]
+    int_ids = list(range(1, row_count + 1))
+
+    # 2. Benchmark Serialization & Payload Construction
+    print(f"\n1. Serialization & Payload Construction ({row_count:,} rows):")
+    t_int = timeit.timeit(lambda: [(i, s) for i, s in zip(int_ids, raw_snippets)], number=20) / 20
+    t_bytes = timeit.timeit(lambda: [(h, s) for h, s in zip(hashes, raw_snippets)], number=20) / 20
+    t_hex = timeit.timeit(lambda: [(hx, s) for hx, s in zip(hex_hashes, raw_snippets)], number=20) / 20
+
+    print(f"   • Integer PK (INT AUTO_INCREMENT): {t_int * 1000:.3f} ms ({row_count / t_int:,.0f} rows/s)")
+    print(f"   • Binary Hash PK (BINARY(32)):     {t_bytes * 1000:.3f} ms ({row_count / t_bytes:,.0f} rows/s)")
+    print(f"   • Hex Hash PK (VARCHAR(64)):       {t_hex * 1000:.3f} ms ({row_count / t_hex:,.0f} rows/s)")
+
+    # 3. Benchmark In-Memory Dictionary Staging & Dedup Lookup
+    print(f"\n2. In-Memory Staging & Index Lookup ({row_count:,} items):")
+    def stage_dict(keys, values):
+        d = {}
+        for k, v in zip(keys, values):
+            d[k] = v
+        return d
+
+    t_stage_int = timeit.timeit(lambda: stage_dict(int_ids, raw_snippets), number=20) / 20
+    t_stage_bytes = timeit.timeit(lambda: stage_dict(hashes, raw_snippets), number=20) / 20
+
+    print(f"   • Integer Key Dict Staging:        {t_stage_int * 1000:.3f} ms ({row_count / t_stage_int:,.0f} ops/s)")
+    print(f"   • BINARY(32) Key Dict Staging:     {t_stage_bytes * 1000:.3f} ms ({row_count / t_stage_bytes:,.0f} ops/s)")
+
+    # 4. Benchmark Batch Pre-Sorting Overhead
+    print(f"\n3. Batch Pre-Sorting Overhead ({row_count:,} rows split into {batch_size:,}-row batches):")
+    batches = [list(zip(hashes[i : i + batch_size], raw_snippets[i : i + batch_size])) for i in range(0, row_count, batch_size)]
+
+    def sort_all_batches(batch_list):
+        return [sorted(b, key=lambda x: x[0]) for b in batch_list]
+
+    t_sort = timeit.timeit(lambda: sort_all_batches(batches), number=20) / 20
+    avg_per_batch = (t_sort / len(batches)) * 1000
+    print(f"   • Total Sort Time ({len(batches)} batches):   {t_sort * 1000:.3f} ms")
+    print(f"   • Average Cost per {batch_size:,}-row Batch: {COLOR.green(f'{avg_per_batch:.4f} ms')} (negligible in-memory cost)")
+
+    # 5. Simulated B+Tree Leaf Page Splits and Access Locality
+    print(f"\n4. Simulated InnoDB B+Tree Page Insertion Locality ({row_count:,} inserts, page capacity = 256 keys):")
+    PAGE_CAPACITY = 256
+
+    def simulate_btree_inserts(key_list):
+        pages = [[]]
+        page_splits = 0
+        page_switches = 0
+        last_page = 0
+        for k in key_list:
+            # Binary search for page
+            idx = 0
+            while idx < len(pages) - 1 and len(pages[idx]) > 0 and pages[idx][-1] < k:
+                idx += 1
+            if idx != last_page:
+                page_switches += 1
+                last_page = idx
+            page = pages[idx]
+            page.append(k)
+            if len(page) > PAGE_CAPACITY:
+                page.sort()
+                mid = len(page) // 2
+                pages.insert(idx + 1, page[mid:])
+                pages[idx] = page[:mid]
+                page_splits += 1
+        return page_splits, page_switches, len(pages)
+
+    splits_seq, switches_seq, total_p_seq = simulate_btree_inserts(int_ids)
+    splits_rand, switches_rand, total_p_rand = simulate_btree_inserts(hashes)
+    
+    # Simulate batch pre-sorted inserts
+    presorted_hashes = []
+    for b in batches:
+        presorted_hashes.extend([item[0] for item in sorted(b, key=lambda x: x[0])])
+    splits_presorted, switches_presorted, total_p_presorted = simulate_btree_inserts(presorted_hashes)
+
+    print(f"   • Sequential Keys (INT PK):          {splits_seq:,} splits | {switches_seq:,} page switches | {total_p_seq:,} total pages")
+    print(f"   • Random Unsorted (BINARY(32) PK):   {splits_rand:,} splits | {switches_rand:,} page switches | {total_p_rand:,} total pages")
+    print(f"   • Batch Pre-Sorted (BINARY(32) PK):  {splits_presorted:,} splits | {COLOR.green(f'{switches_presorted:,}')} page switches | {total_p_presorted:,} total pages")
+    print(f"   • Locality Gain: {COLOR.green(f'{switches_rand / max(switches_presorted, 1):.2f}x fewer page jumps')} across {batch_size}-row batches!\n")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="KernelInfo-Parser Performance & Benchmark Suite")
     parser.add_argument("--all", action="store_true", help="Run all benchmarks and profiling suites")
@@ -179,10 +272,11 @@ def main() -> None:
     parser.add_argument("--safe-data", action="store_true", help="Run to_safe_data microbenchmark")
     parser.add_argument("--maintainers", action="store_true", help="Run maintainer pattern matcher benchmark")
     parser.add_argument("--keywords", action="store_true", help="Run keyword membership benchmark")
+    parser.add_argument("--hashes", action="store_true", help="Run BINARY(32) hash insertion & sorting benchmark")
     args = parser.parse_args()
 
     # Default to running all if no specific benchmark selected
-    run_all = args.all or not any([args.profile_cast, args.safe_data, args.maintainers, args.keywords])
+    run_all = args.all or not any([args.profile_cast, args.safe_data, args.maintainers, args.keywords, args.hashes])
 
     if run_all or args.keywords:
         benchmark_keyword_membership()
@@ -190,9 +284,12 @@ def main() -> None:
         benchmark_to_safe_data()
     if run_all or args.maintainers:
         benchmark_maintainer_matching()
+    if run_all or args.hashes:
+        benchmark_hash_insertion_and_sorting()
     if run_all or args.profile_cast:
         benchmark_cast_profile()
 
 
 if __name__ == "__main__":
     main()
+

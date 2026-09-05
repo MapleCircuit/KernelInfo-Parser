@@ -176,6 +176,8 @@ def to_safe_data(val: Any) -> SafeDataType:
     t = type(val)
     if t is int or t is str or t is bytes or val is None:
         return val
+    if t is bytearray or t is memoryview:
+        return bytes(val)
     if t is bool:
         return int(val)
     if isinstance(val, Enum):
@@ -444,11 +446,12 @@ class ChangeSet:
                     operation = unpacked
                     op_type = operation[1]
 
-                data = self._resolve_ref_from_tuple(operation[2])
-
+                op_data = operation[2]
                 if op_type == OP_DONE or op_type == OP_VIEW_DONE:
-                    cs_res_append(data)
+                    cs_res_append(op_data)
                     continue
+
+                data = self._resolve_ref_from_tuple(op_data) if is_data_unsafe(op_data) else op_data
 
                 if op_type == OP_SET:
                     cs_res_append(te_set(operation[0], data))
@@ -969,7 +972,8 @@ class Table:
         foreign: tuple[tuple[str, str, str], ...] | None = None,
         initial_insert: tuple[tuple[SafeDataType, ...], ...] | tuple[SafeDataType, ...] | None = None,
         no_duplicate: bool = False,
-        te_cached: bool | tuple[str | int, ...] | list[str | int] = False,
+        te_cached: bool | tuple[str | int, ...] | list[str | int] | dict[str, Any] = False,
+        version_scoped: bool = False,
         hashing_table: bool | str = False,
     ) -> None:
         """Initialize a Table schema definition, generate dynamic column pointers, and bind to parser.
@@ -982,7 +986,8 @@ class Table:
             foreign: Optional tuple of Foreign Key constraints: `(("local_col", "foreign_table", "foreign_col"), ...)`.
             initial_insert: Optional tuple of default rows inserted when table is created.
             no_duplicate: If True, `set()` automatically checks if a row exists in Table Engine (`G.TE`) via `get_set()`.
-            te_cached: Pre-loading caching strategy for Table Engine initialization (bool or tuple of column names/indices).
+            te_cached: Pre-loading caching strategy for Table Engine initialization (bool, tuple, list, or dict).
+            version_scoped: If True, enables working-window preloading and historical pruning in Table Engine.
             hashing_table: Name of the linked hashing table.
 
         Side Effects:
@@ -1010,17 +1015,25 @@ class Table:
         self.initial_insert = initial_insert
         self.no_duplicate = no_duplicate
 
+        # Handle version_scoped and te_cached configuration
+        self.version_scoped = version_scoped
+        if isinstance(te_cached, dict):
+            self.version_scoped = te_cached.get("version_scoped", self.version_scoped)
+            raw_cols = te_cached.get("columns", True)
+        else:
+            raw_cols = te_cached
+
         self.cached_columns: tuple[int, ...]
-        if te_cached is True:
+        if raw_cols is True:
             self.cached_columns = tuple(range(self.length))
             self.te_cached = True
-        elif not te_cached:
+        elif not raw_cols:
             self.cached_columns = ()
             self.te_cached = False
         else:
             resolved_cols = []
             col_names = [col[0] for col in self.init_columns]
-            for item in te_cached:
+            for item in raw_cols:
                 if isinstance(item, int):
                     resolved_cols.append(item)
                 elif item in col_names:
@@ -1079,7 +1092,7 @@ class Table:
         if is_data_unsafe(columns):
             return (self.table_id, OP_UPDATE, normalize_data_tuple(columns))
 
-        sanitized_columns = tuple(to_safe_data(col) for col in columns)
+        sanitized_columns = normalize_data_tuple(columns)
 
         if None not in sanitized_columns:
             return (self.table_id, OP_UPDATE, sanitized_columns)
@@ -1118,7 +1131,7 @@ class Table:
             logger.error(columns)
             G.emergency_shutdown(55)
 
-        sanitized_columns = tuple(to_safe_data(col) for col in columns)
+        sanitized_columns = normalize_data_tuple(columns)
         result = G.TE.get(self.table_id, sanitized_columns)
         if result is None:
             return None
@@ -1139,7 +1152,7 @@ class Table:
             Operation tuple `(table_id, OP_DONE, result)` if found, else `(table_id, OP_SET, columns)`.
         """
         if not is_data_unsafe(columns):
-            sanitized_columns = tuple(to_safe_data(col) for col in columns)
+            sanitized_columns = normalize_data_tuple(columns)
             result = G.TE.get(self.table_id, sanitized_columns)
             if result:
                 return (self.table_id, OP_DONE, result)
@@ -1162,7 +1175,7 @@ class Table:
             Operation tuple `(joins, OP_VIEW_DONE, result)` if found, else `(joins, OP_VIEW_SET, data)`.
         """
         if not is_data_unsafe(data):
-            sanitized_data = tuple(to_safe_data(x) for x in data)
+            sanitized_data = normalize_data_tuple(data)
             result = G.TE.view_get(joins, sanitized_data)
             if result:
                 return (joins, OP_VIEW_DONE, result)
@@ -1185,7 +1198,7 @@ class Table:
             Operation tuple `(joins, OP_VIEW_DONE, result)` or None.
         """
         if not is_data_unsafe(data):
-            sanitized_data = tuple(to_safe_data(x) for x in data)
+            sanitized_data = normalize_data_tuple(data)
             result = G.TE.view_get(joins, sanitized_data)
             if result:
                 return (joins, OP_VIEW_DONE, result)

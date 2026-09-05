@@ -150,6 +150,10 @@ class MariaDB(BaseDBEngine):
         self.port = int(os.getenv("DB_PORT", "3306"))
         self.cnx = self.connect_sql()
         self.cursor = self.cnx.cursor()
+        self._select_sql_cache: dict[tuple[int, tuple[bool, ...]], str] = {}
+        self._preload_sql_cache: dict[tuple[int, tuple[int, ...] | None, bool], str] = {}
+        self._view_sql_cache: dict[tuple[JoinsType, tuple[bool, ...]], str] = {}
+        self._next_id_sql_cache: dict[int, str] = {}
         self._init_session()
 
     def _init_session(self) -> None:
@@ -168,6 +172,11 @@ class MariaDB(BaseDBEngine):
             None.
         """
         self.cursor.execute("SET SESSION sql_mode = 'NO_AUTO_VALUE_ON_ZERO';")
+        try:
+            self.cursor.execute("SET SESSION foreign_key_checks = 0;")
+            self.cursor.execute("SET SESSION unique_checks = 0;")
+        except mysql.connector.Error:
+            pass
         try:
             self.cursor.execute("SET SESSION wait_timeout = 28800;")
             self.cursor.execute("SET SESSION interactive_timeout = 28800;")
@@ -438,9 +447,11 @@ class MariaDB(BaseDBEngine):
             Next available sequence integer ID.
         """
         self.check_if_connected()
-        self.cursor.execute(
-            f"SELECT COALESCE(MAX({table.init_columns[0][0]}), 0)+1 FROM {table.table_name};",  # noqa: S608
-        )
+        if table.table_id not in self._next_id_sql_cache:
+            self._next_id_sql_cache[table.table_id] = (
+                f"SELECT COALESCE(MAX(`{table.init_columns[0][0]}`), 0)+1 FROM `{table.table_name}`;"
+            )
+        self.cursor.execute(self._next_id_sql_cache[table.table_id])
         return self.cursor.fetchone()[0]
 
     def insert(
@@ -469,15 +480,16 @@ class MariaDB(BaseDBEngine):
         sql = f"INSERT INTO `{table.table_name}` VALUES ({','.join(('%s',) * table.length)})"
 
         if isinstance(data[0], (tuple, list)):
-            batch_size = 1000  # Safe High-throughput batch size
+            batch_size = 10000 if table.length <= 8 else 2000
             for i in range(0, len(data), batch_size):
                 chunk = data[i : i + batch_size]
+                self.check_if_connected()
                 for attempt in range(3):
-                    self.check_if_connected()
                     try:
                         self.cursor.executemany(sql, chunk)
                         break
                     except (mysql.connector.OperationalError, mysql.connector.InterfaceError, OSError):
+                        self.check_if_connected()
                         if attempt == 2:
                             raise
                         self.close()
@@ -626,8 +638,7 @@ class MariaDB(BaseDBEngine):
             data: Tuple of column filter values (None values act as wildcards).
 
         Process:
-            1. Constructs `SELECT * FROM table WHERE col1=%s AND col2=%s LIMIT 1`
-               for non-None positions in `data`.
+            1. Checks template cache for parameterized SELECT query matching non-None mask.
             2. Executes query with filtered parameter tuple.
             3. Returns first matching row.
 
@@ -635,21 +646,25 @@ class MariaDB(BaseDBEngine):
             Matching row tuple `tuple[SafeDataType, ...]` or None.
         """
         self.check_if_connected()
-
-        sql = f"SELECT * FROM {table.table_name}"  # noqa: S608
-        where_clauses = []
-
-        for x, val in enumerate(data):
-            if val is not None:
-                where_clauses.append(f"{table.init_columns[x][0]}=%s")
-
-        if where_clauses:
-            sql += " WHERE " + " AND ".join(where_clauses)
-        sql += " LIMIT 1"
+        mask = tuple(val is not None for val in data)
+        cache_key = (table.table_id, mask)
+        sql = self._select_sql_cache.get(cache_key)
+        if sql is None:
+            where_clauses = [f"`{table.init_columns[x][0]}`=%s" for x, is_set in enumerate(mask) if is_set]
+            sql = f"SELECT * FROM `{table.table_name}`"
+            if where_clauses:
+                sql += " WHERE " + " AND ".join(where_clauses)
+            sql += " LIMIT 1"
+            self._select_sql_cache[cache_key] = sql
 
         params = tuple(val for val in data if val is not None)
         self.cursor.execute(sql, params)
-        return self.cursor.fetchone()
+        res = self.cursor.fetchone()
+        if res is None:
+            return None
+        if any(isinstance(val, (bytearray, memoryview)) for val in res):
+            return tuple(bytes(val) if isinstance(val, (bytearray, memoryview)) else val for val in res)
+        return tuple(res)
 
     def _build_view_query(
         self,
@@ -665,43 +680,47 @@ class MariaDB(BaseDBEngine):
             columns: Concatenated tuple of column filter values across joined tables.
 
         Process:
-            1. Identifies initial table pointer and sets primary alias `A1`.
-            2. Iterates over joined table pointers, generating `JOIN table A<offset> ON ...`.
-            3. Appends WHERE clauses matching non-None column filter positions.
-            4. Extracts parameter tuple of non-None values.
+            1. Checks template cache for join graph and column mask.
+            2. Generates JOIN query if not cached.
+            3. Extracts parameter tuple of non-None values.
 
         Outputs:
             Tuple `(sql_query_string, parameters_tuple)`.
         """
-        initial_pointer = PointerGetter(joins).get_first_pointer()
-        sql = f"SELECT * FROM {tables[initial_pointer[0]].table_name} AS A1"  # noqa: S608
+        mask = tuple(val is not None for val in columns)
+        cache_key = (joins, mask)
+        sql = self._view_sql_cache.get(cache_key)
+        if sql is None:
+            initial_pointer = PointerGetter(joins).get_first_pointer()
+            sql = f"SELECT * FROM `{tables[initial_pointer[0]].table_name}` AS A1"
 
-        data_offset = 0
-        where_clauses = []
-        for i, init_column in enumerate(tables[initial_pointer[0]].init_columns):
-            if columns[i] is not None:
-                where_clauses.append(f"A1.{init_column[0]}=%s")
-            data_offset += 1
+            data_offset = 0
+            where_clauses = []
+            for i, init_column in enumerate(tables[initial_pointer[0]].init_columns):
+                if columns[i] is not None:
+                    where_clauses.append(f"A1.`{init_column[0]}`=%s")
+                data_offset += 1
 
-        # Multi-table joins
-        if len(joins[0]) > 1:
-            table_id_to_alias_dict = {initial_pointer[0]: 1}
-            alias_offset = 1
+            # Multi-table joins
+            if len(joins[0]) > 1:
+                table_id_to_alias_dict = {initial_pointer[0]: 1}
+                alias_offset = 1
 
-            for join in joins:
-                for x in range(join[2]):
-                    alias_offset += 1
-                    if x == 0:
-                        table_id_to_alias_dict[join[1][0]] = alias_offset
-                    sql += f" JOIN {tables[join[1][0]].table_name} A{alias_offset} ON A{table_id_to_alias_dict[join[0][0]]}.{tables[join[0][0]].init_columns[join[0][1]][0]} = A{alias_offset}.{tables[join[1][0]].init_columns[join[1][1]][0]}"
+                for join in joins:
+                    for x in range(join[2]):
+                        alias_offset += 1
+                        if x == 0:
+                            table_id_to_alias_dict[join[1][0]] = alias_offset
+                        sql += f" JOIN `{tables[join[1][0]].table_name}` A{alias_offset} ON A{table_id_to_alias_dict[join[0][0]]}.`{tables[join[0][0]].init_columns[join[0][1]][0]}` = A{alias_offset}.`{tables[join[1][0]].init_columns[join[1][1]][0]}`"
 
-                    for init_column in tables[join[1][0]].init_columns:
-                        if data_offset < len(columns) and columns[data_offset] is not None:
-                            where_clauses.append(f"A{alias_offset}.{init_column[0]}=%s")
-                        data_offset += 1
+                        for init_column in tables[join[1][0]].init_columns:
+                            if data_offset < len(columns) and columns[data_offset] is not None:
+                                where_clauses.append(f"A{alias_offset}.`{init_column[0]}`=%s")
+                            data_offset += 1
 
-        if where_clauses:
-            sql += " WHERE " + " AND ".join(where_clauses)
+            if where_clauses:
+                sql += " WHERE " + " AND ".join(where_clauses)
+            self._view_sql_cache[cache_key] = sql
 
         params = tuple(val for val in columns if val is not None)
         return sql, params
@@ -856,7 +875,7 @@ class MariaDB(BaseDBEngine):
                 chunk_row = self.cursor.fetchone()
 
                 if chunk_row is not None:
-                    full_row.extend(chunk_row)
+                    full_row.extend(bytes(val) if isinstance(val, (bytearray, memoryview)) else val for val in chunk_row)
                 else:
                     if chunk_idx == 0:
                         full_row.extend([None] * parent_table.length)
@@ -900,7 +919,12 @@ class MariaDB(BaseDBEngine):
         sql, params = self._build_view_query(tables, joins, columns)
         sql += " LIMIT 1"
         self.cursor.execute(sql, params)
-        return self.cursor.fetchone()
+        res = self.cursor.fetchone()
+        if res is None:
+            return None
+        if any(isinstance(val, (bytearray, memoryview)) for val in res):
+            return tuple(bytes(val) if isinstance(val, (bytearray, memoryview)) else val for val in res)
+        return tuple(res)
 
     def view_select_multiple(
         self,
@@ -932,8 +956,65 @@ class MariaDB(BaseDBEngine):
 
         sql, params = self._build_view_query(tables, joins, columns)
         self.cursor.execute(sql, params)
-        return self.cursor.fetchall()
+        rows = self.cursor.fetchall()
+        if not rows:
+            return []
+        if any(isinstance(val, (bytearray, memoryview)) for val in rows[0]):
+            return [tuple(bytes(val) if isinstance(val, (bytearray, memoryview)) else val for val in row) for row in rows]
+        return [tuple(row) for row in rows]
 
+    def select_preload(
+        self,
+        table: Table,
+        cached_columns: tuple[int, ...] | None = None,
+        min_vid: int | None = None,
+    ) -> list[tuple[SafeDataType, ...]]:
+        """Query records for TableEngine startup preloading with column projection and version filtering.
+
+        Args:
+            table: Target Table schema instance.
+            cached_columns: Optional tuple of 0-indexed column positions to select.
+            min_vid: Optional minimum active version ID for version-scoped tables.
+
+        Outputs:
+            List of row tuples containing selected columns in requested order.
+        """
+        self.check_if_connected()
+        has_min_vid = min_vid is not None and min_vid > 0
+        cache_key = (table.table_id, cached_columns, has_min_vid)
+        sql = self._preload_sql_cache.get(cache_key)
+        if sql is None:
+            # 1. Determine SELECT column clause
+            if cached_columns is not None and len(cached_columns) < table.length:
+                cols_clause = ", ".join(f"`{table.init_columns[i][0]}`" for i in cached_columns)
+            else:
+                cols_clause = "*"
+
+            sql = f"SELECT {cols_clause} FROM `{table.table_name}`"  # noqa: S608
+            where_clauses = []
+
+            # 2. Determine version filter WHERE clause
+            if has_min_vid:
+                col_names = [col[0] for col in table.init_columns]
+                if "vid_s" in col_names and "vid_e" in col_names:
+                    where_clauses.append("(`vid_e` = 0 OR `vid_e` >= %s)")
+                elif "vid" in col_names:
+                    where_clauses.append("`vid` >= %s")
+                elif "vid_s" in col_names:
+                    where_clauses.append("`vid_s` >= %s")
+
+            if where_clauses:
+                sql += " WHERE " + " AND ".join(where_clauses)
+            self._preload_sql_cache[cache_key] = sql
+
+        params = (min_vid,) if has_min_vid else ()
+        self.cursor.execute(sql, params)
+        rows = self.cursor.fetchall()
+        if not rows:
+            return []
+        if any(isinstance(val, (bytearray, memoryview)) for val in rows[0]):
+            return [tuple(bytes(val) if isinstance(val, (bytearray, memoryview)) else val for val in row) for row in rows]
+        return [tuple(row) for row in rows]
 
     def index_exists(self, index_name: str, table: Table) -> bool:
         """Check if an index exists on the specified table."""
@@ -1082,3 +1163,38 @@ class MariaDB(BaseDBEngine):
 
         with ThreadPoolExecutor(max_workers=workers) as executor:
             list(executor.map(_worker_remove, indexes))
+
+    def verify_relational_integrity(self, tables: Sequence[Table]) -> dict[str, int]:
+        """Verify relational foreign key integrity across tables and return any orphan record counts.
+
+        Args:
+            tables (Sequence[Table]): Sequence of registered schema tables.
+
+        Process:
+            Iterates through registered tables with foreign key constraints, executing SQL anti-joins
+            to check for orphaned foreign key references.
+
+        Outputs:
+            dict[str, int]: Mapping of constraint description to orphan count (empty if valid).
+        """
+        self.check_if_connected()
+        violations: dict[str, int] = {}
+        for tbl in tables:
+            if not getattr(tbl, "init_foreign", None):
+                continue
+            for fk in tbl.init_foreign:
+                local_col, foreign_tbl, foreign_col = fk
+                query = (
+                    f"SELECT COUNT(*) FROM `{tbl.table_name}` child "
+                    f"LEFT JOIN `{foreign_tbl}` parent ON child.`{local_col}` = parent.`{foreign_col}` "
+                    f"WHERE child.`{local_col}` IS NOT NULL AND parent.`{foreign_col}` IS NULL;"
+                )
+                try:
+                    self.cursor.execute(query)
+                    res = self.cursor.fetchone()
+                    count = res[0] if res else 0
+                    if count > 0:
+                        violations[f"{tbl.table_name}.{local_col} -> {foreign_tbl}.{foreign_col}"] = count
+                except mysql.connector.Error:
+                    pass
+        return violations

@@ -107,25 +107,26 @@ The web application interfaces directly with the MySQL relational database defin
 | `m_ast_container` | 7 | `(ast_id, priority)` | `ast_id`, `priority`, `type_id`, `ref_ast_id` | Recursive parent-child AST relationships (struct members, function parameters, compound statement blocks) used for container depth computation. |
 | `m_ast_include` | 8 | `ast_id` | `ast_id`, `fnid` | Preprocessor `#include` directive dependencies. |
 | `m_ast_debug` | 9 | `ast_id` | `ast_id`, `ast_raw` | Serialized JSON AST dumps for dev inspection. |
-| `m_tag` | 10 | `(tag_id, vid_s)` | `tag_id`, `vid_s`, `vid_e`, `code`, `ast_id`, `hl_s`, `hl_l` | Source code snippets, base tokens, and multi-line code tags. |
-| `m_bridge_tag` | 11 | `(fid, tag_id)` | `fid`, `tag_id`, `line_s`, `line_e`, `char_s`, `char_e` | Tag spatial coordinates (line numbers and character offsets within source files). |
-| `m_map_ast` | 12 | `(map_id, ...)` | `map_id`, `line_s`, `char_s`, `line_e`, `char_e`, `ast_id` | High-precision token coordinate spans inside tag snippets. |
-| `m_bridge_map` | 13 | `(tag_id, map_id)`| `tag_id`, `map_id` | Bridges spatial AST token maps to their parent code tags. |
-| `m_ast_hash` | 14 | `hash` | `hash`, `ast_id` | SHA-256 structural deduplication cache for AST nodes. |
-| `m_kconfig_symbol` | 15 | `(kcid, vid_s)` | `kcid`, `vid_s`, `vid_e`, `name`, `type`, `prompt`, `def_val`, `help`, `ast_id` | Normalized Kconfig symbol definitions, types (`bool`, `tristate`, `string`, `hex`, `int`), prompts, default values, and help text. |
-| `m_kconfig_relation` | 16 | `(kcid, rel_type, ...)` | `kcid`, `target_name`, `rel_type`, `cond_ast_id`, `priority` | Directed relational dependency graph (`depends_on`=1, `select`=2, `imply`=3, `choice_member`=4). |
-| `m_kconfig_tree` | 17 | `(tree_id, vid)` | `tree_id`, `vid`, `parent_id`, `node_type`, `title`, `kcid`, `priority`, `dep_ast_id`, `ast_id` | Hierarchical Menuconfig tree nodes (`menu`=1, `choice`=2, `config`=3, `menuconfig`=4, `comment`=5) with sibling priorities. |
-| `m_kconfig_kbuild` | 18 | `(kcid, vid, ...)` | `kcid`, `vid`, `fid`, `compile_mode`, `target_obj` | Kbuild compilation map linking configuration symbols to compiled `.o` object files and source files (`obj-y`=1, `obj-m`=2, `conditional`=3). |
-| `m_maintainer_person` | 19 | `person_id` | `person_id`, `name`, `email` | Developer identity registry for maintainers, reviewers, authors, and committers. |
-| `m_maintainer_section` | 20 | `(sec_id, vid_s)` | `sec_id`, `vid_s`, `vid_e`, `name`, `status`, `scm_tree`, `web_page`, `mailing_list`, `ast_id` | Subsystem catalog (`EXT4 FILE SYSTEM`, `NETWORKING [GENERAL]`, `ARM ARCHITECTURE`, etc.). |
-| `m_maintainer_member` | 21 | `(sec_id, person_id, ...)` | `sec_id`, `person_id`, `role_type`, `priority` | Subsystem member rosters with roles (`Maintainer`=1, `Reviewer`=2, `Person`=3, `Other`=4). |
-| `m_maintainer_pattern` | 22 | `(sec_id, pat_type, ...)` | `sec_id`, `pat_type`, `pattern`, `priority` | Wildcard file matching rules (`File`=1, `Exclude`=2, `Keyword`=3, `Regex`=4). |
-| `m_maintainer_file` | 23 | `(vid, fid, sec_id)` | `vid`, `fid`, `sec_id` | Materialized bridge between files and their governing subsystems. |
-| `m_credits_entry` | 24 | `(credit_id, vid_s)` | `credit_id`, `vid_s`, `vid_e`, `person_id`, `web_page`, `pgp_key`, `description`, `snail_mail`, `ast_id` | Historical `CREDITS` file entries linking developers to contribution narratives, homepages, PGP keys, and snail mail. |
-| `m_commit` | 25 | `commit_id` | `commit_id`, `vid`, `commit_hash`, `author_id`, `author_date`, `committer_id`, `committer_date`, `subject`, `message` | Git commit log and patch registry. |
-| `m_bridge_commit_person` | 26 | `(commit_id, person_id, ...)` | `commit_id`, `person_id`, `role_type`, `priority` | Multi-contributor bridge (`Author`=1, `Committer`=2, `Co-developed-by`=3, `Signed-off-by`=4, `Reviewed-by`=5, `Acked-by`=6, `Tested-by`=7, `Reported-by`=8, `Suggested-by`=9, `Merged-by`=10, `Requested-by`=11). |
-| `m_bridge_commit_file` | 27 | `(commit_id, fid)` | `commit_id`, `vid`, `fid`, `change_type` | Files touched per commit. |
-| `m_bridge_commit_tag` | 28 | `(commit_id, tag_id)` | `commit_id`, `vid`, `fid`, `tag_id` | Code tags modified per commit. |
+| `m_tag_code` | 10 | `hash` | `hash`, `code` | Global deduplicated source code snippet text registry. |
+| `m_tag` | 11 | `(tag_id, vid_s)` | `tag_id`, `vid_s`, `vid_e`, `hash`, `ast_id`, `hl_s`, `hl_l` | Source code occurrence tags linking AST nodes to code snippets. |
+| `m_bridge_tag` | 12 | `(fid, tag_id)` | `fid`, `tag_id`, `line_s`, `line_e`, `char_s`, `char_e` | Tag spatial coordinates (line numbers and character offsets within source files). |
+| `m_map_ast` | 13 | `(map_id, ...)` | `map_id`, `line_s`, `char_s`, `line_e`, `char_e`, `ast_id` | High-precision token coordinate spans inside tag snippets. |
+| `m_bridge_map` | 14 | `(tag_id, map_id)`| `tag_id`, `map_id` | Bridges spatial AST token maps to their parent code tags. |
+| `m_ast_hash` | 15 | `hash` | `hash`, `ast_id` | SHA-256 structural deduplication cache for AST nodes. |
+| `m_kconfig_symbol` | 16 | `(kcid, vid_s)` | `kcid`, `vid_s`, `vid_e`, `name`, `type`, `prompt`, `def_val`, `help`, `ast_id` | Normalized Kconfig symbol definitions, types (`bool`, `tristate`, `string`, `hex`, `int`), prompts, default values, and help text. |
+| `m_kconfig_relation` | 17 | `(kcid, rel_type, ...)` | `kcid`, `target_name`, `rel_type`, `cond_ast_id`, `priority` | Directed relational dependency graph (`depends_on`=1, `select`=2, `imply`=3, `choice_member`=4). |
+| `m_kconfig_tree` | 18 | `(tree_id, vid)` | `tree_id`, `vid`, `parent_id`, `node_type`, `title`, `kcid`, `priority`, `dep_ast_id`, `ast_id` | Hierarchical Menuconfig tree nodes (`menu`=1, `choice`=2, `config`=3, `menuconfig`=4, `comment`=5) with sibling priorities. |
+| `m_kconfig_kbuild` | 19 | `(kcid, vid, ...)` | `kcid`, `vid`, `fid`, `compile_mode`, `target_obj` | Kbuild compilation map linking configuration symbols to compiled `.o` object files and source files (`obj-y`=1, `obj-m`=2, `conditional`=3). |
+| `m_maintainer_person` | 20 | `person_id` | `person_id`, `name`, `email` | Developer identity registry for maintainers, reviewers, authors, and committers. |
+| `m_maintainer_section` | 21 | `(sec_id, vid_s)` | `sec_id`, `vid_s`, `vid_e`, `name`, `status`, `scm_tree`, `web_page`, `mailing_list`, `ast_id` | Subsystem catalog (`EXT4 FILE SYSTEM`, `NETWORKING [GENERAL]`, `ARM ARCHITECTURE`, etc.). |
+| `m_maintainer_member` | 22 | `(sec_id, person_id, ...)` | `sec_id`, `person_id`, `role_type`, `priority` | Subsystem member rosters with roles (`Maintainer`=1, `Reviewer`=2, `Person`=3, `Other`=4). |
+| `m_maintainer_pattern` | 23 | `(sec_id, pat_type, ...)` | `sec_id`, `pat_type`, `pattern`, `priority` | Wildcard file matching rules (`File`=1, `Exclude`=2, `Keyword`=3, `Regex`=4). |
+| `m_maintainer_file` | 24 | `(vid, fid, sec_id)` | `vid`, `fid`, `sec_id` | Materialized bridge between files and their governing subsystems. |
+| `m_credits_entry` | 25 | `(credit_id, vid_s)` | `credit_id`, `vid_s`, `vid_e`, `person_id`, `web_page`, `pgp_key`, `description`, `snail_mail`, `ast_id` | Historical `CREDITS` file entries linking developers to contribution narratives, homepages, PGP keys, and snail mail. |
+| `m_commit` | 26 | `commit_id` | `commit_id`, `vid`, `commit_hash`, `author_id`, `author_date`, `committer_id`, `committer_date`, `subject`, `message` | Git commit log and patch registry. |
+| `m_bridge_commit_person` | 27 | `(commit_id, person_id, ...)` | `commit_id`, `person_id`, `role_type`, `priority` | Multi-contributor bridge (`Author`=1, `Committer`=2, `Co-developed-by`=3, `Signed-off-by`=4, `Reviewed-by`=5, `Acked-by`=6, `Tested-by`=7, `Reported-by`=8, `Suggested-by`=9, `Merged-by`=10, `Requested-by`=11). |
+| `m_bridge_commit_file` | 28 | `(commit_id, fid)` | `commit_id`, `vid`, `fid`, `change_type` | Files touched per commit. |
+| `m_bridge_commit_tag` | 29 | `(commit_id, tag_id)` | `commit_id`, `vid`, `fid`, `tag_id` | Code tags modified per commit. |
 
 ---
 

@@ -4506,7 +4506,7 @@
           const m = lineMaps[i];
           const cs = m.char_s || 1;
           const ce = m.char_e || 9999;
-          if (cs <= col && col <= ce) {
+          if (cs <= col && col < ce) {
             const span = (ce - cs);
             if (span < bestSpan) {
               bestSpan = span;
@@ -4679,7 +4679,7 @@
               // Token syntax highlighting for CPPro_if* applies ONLY to the directive line itself
               if (!lineMapsMap[abs_start_line]) lineMapsMap[abs_start_line] = [];
               const cs = (m_line_s === 1) ? (tagCharStart + (m.char_s - 1)) : (m.char_s || 1);
-              const ce = (t.line_e === t.line_s) ? (tagCharStart + ((t.char_e || m.char_e || 9999) - 1)) : 9999;
+              const ce = (t.line_e === t.line_s) ? ((m.char_e && m.char_e > 0) ? m.char_e : (t.char_e || 9999)) : 9999;
               lineMapsMap[abs_start_line].push({
                 char_s: cs,
                 char_e: ce,
@@ -4702,7 +4702,7 @@
               if (abs_start_line === abs_end_line) {
                 // Single-line map
                 cs = (m_line_s === 1) ? (tagCharStart + (m.char_s - 1)) : (m.char_s || 1);
-                ce = (m_line_s === 1) ? (tagCharStart + (m.char_e - 1)) : (m.char_e || 9999);
+                ce = (m.char_e && m.char_e > 0) ? m.char_e : (t.char_e || 9999);
               } else if (absL === abs_start_line) {
                 // First line of multi-line map
                 cs = (m_line_s === 1) ? (tagCharStart + (m.char_s - 1)) : (m.char_s || 1);
@@ -4710,7 +4710,7 @@
               } else if (absL === abs_end_line) {
                 // Last line of multi-line map
                 cs = 1;
-                ce = (m_line_e === 1) ? (tagCharStart + (m.char_e - 1)) : (m.char_e || 9999);
+                ce = (m.char_e && m.char_e > 0) ? m.char_e : (t.char_e || 9999);
               } else {
                 // Middle line of multi-line map
                 cs = 1;

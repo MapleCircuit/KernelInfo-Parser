@@ -223,15 +223,18 @@ class TestKconfigAstIntegration(unittest.TestCase):
         executed = cs.execute()
         self.assertTrue(executed)
 
-        # Validate that symbol and tree rows were created in TE cache
-        sym_rows = G.TE._cached_rows.get(m_kconfig_symbol.table_id, [])
-        self.assertGreater(len(sym_rows), 0)
-        sym_names = [row[3] for row in sym_rows]
-        self.assertIn("MODULES", sym_names)
-        self.assertIn("NETDEVICES", sym_names)
-        self.assertIn("DEFAULT_HOSTNAME", sym_names)
+        # Validate that symbols were created and resolvable via public TableEngine API
+        modules_sym = m_kconfig_symbol.get(None, None, None, "MODULES", None, None, None, None, None)
+        netdev_sym = m_kconfig_symbol.get(None, None, None, "NETDEVICES", None, None, None, None, None)
+        hostname_sym = m_kconfig_symbol.get(None, None, None, "DEFAULT_HOSTNAME", None, None, None, None, None)
+
+        self.assertIsNotNone(modules_sym)
+        self.assertIsNotNone(netdev_sym)
+        self.assertIsNotNone(hostname_sym)
+
         # Check version tracking on symbols
-        for row in sym_rows:
+        for sym_op in (modules_sym, netdev_sym, hostname_sym):
+            row = sym_op[2]
             self.assertEqual(row[1], self.gp.VID)  # vid_s
             self.assertEqual(row[2], 0)            # vid_e (active)
 

@@ -17,8 +17,9 @@ Stateful caching, sequence coordination, relational view decomposition, and batc
   - `primary: tuple[int, ...]` &mdash; 0-indexed column indices forming Primary Key (e.g., `(0,)` or `(0, 1)`).
   - `no_duplicate: bool` &mdash; If `True`, deduplicates rows via in-memory key `columns[1:]`.
   - `initial_insert: tuple[...] | None` &mdash; Initial seed rows.
-  - `te_cached: bool | tuple[str | int, ...]` &mdash; If configured (`True` or tuple of column names/indices), enables in-memory preloading and multi-indexing in `TECachedDB`.
+  - `te_cached: bool | tuple[str | int, ...] | dict[str, Any]` &mdash; If configured (`True`, tuple of column names/indices, or dict), enables in-memory preloading and multi-indexing in `TECachedDB`.
   - `cached_columns: tuple[int, ...]` &mdash; Canonical 0-indexed column indices retained in memory (defaults to all columns if `te_cached=True`, or empty if `False`).
+  - `version_scoped: bool` &mdash; If `True`, enables working-window preloading (`vid >= Old_VID`) and historical version pruning in `TECachedDB`.
   - `hashing_table: bool | str | int | Table` &mdash; If set (e.g. `"m_ast_hash"` or `True`), enables automatic structural hash deduplication and acceleration for views rooted at this table.
   - `init_columns: tuple` &mdash; Raw column definition tuples: `(("col_name", "DATA_TYPE", "CONSTRAINTS"), ...)`.
   - `init_primary: tuple[str, ...]` &mdash; Raw column names forming Primary Key: `("fnid",)`.
@@ -47,7 +48,7 @@ Stateful caching, sequence coordination, relational view decomposition, and batc
 | `_cached_rows` | `dict[int, list[tuple]]` | In-memory row storage for `te_cached` tables: `table_id -> [projected_row_tuple, ...]`. |
 | `_pk_index` | `dict[int, dict[Any, tuple]]` | O(1) exact row lookup: `table_id -> {primary_key_val: row_tuple}`. |
 | `_nodup_index` | `dict[int, dict[tuple, int]]` | O(1) deduplication lookup: `table_id -> {columns[1:]: assigned_id}`. |
-| `_col_indices` | `dict[int, dict[int, dict[SafeDataType, list[tuple]]]]` | Inverted column index: `table_id -> {col_idx: {column_val: [matching_row, ...]}}`. |
+| `_col_indices` | `dict[int, dict[int, dict[SafeDataType, list[tuple]]]]` | Selective inverted column index: `table_id -> {col_idx: {column_val: [matching_row, ...]}}` (exempts primary key columns). |
 
 ---
 
@@ -85,7 +86,9 @@ EngineClass = get_table_engine("direct")  # -> TEDirectDB
 ### 3.4. `TECachedDB` Internal Cache Management
 Internal helper methods used exclusively by `TECachedDB` to synchronize in-memory caches and indices without querying the database driver:
 - `_match_columns(row: tuple, filter_cols: tuple) -> bool`: Verifies if a row matches all non-None criteria in `filter_cols`.
-- `_index_row(table: Table, row: tuple) -> None`: Indexes a row into `_pk_index`, `_nodup_index`, and `_col_indices`.
+- `_is_version_scoped(table: Table) -> bool`: Returns `True` if `table.version_scoped` is enabled.
+- `_get_vid_col_idx(table: Table) -> int | None`: Locates the 0-indexed column position of the version column (`vid` or `vid_s`).
+- `_index_row(table: Table, row: tuple) -> None`: Indexes a row into `_pk_index`, `_nodup_index`, and selectively into `_col_indices` (exempting primary key columns).
 - `_unindex_row(table: Table, row: tuple) -> None`: Removes a row from all internal indices prior to updating.
 - `_ensure_table(table_id: int) -> None`: Initializes cache lists and index dictionaries for a table upon first access.
 
@@ -102,7 +105,11 @@ Internal helper methods used exclusively by `TECachedDB` to synchronize in-memor
   1. Safely closes active `self.db` (if present) and instantiates a new driver: `self.db = db()`.
   2. Resets `queued_view = {}`.
   3. For all registered `self.tables`: resets `queued_set[t_id] = {}`, `queued_update[t_id] = []`, and refreshes `next_id[t_id] = self.db.get_next_id(t)`.
-  4. In `TECachedDB`: Calls `clear_cache()`, ensures index structures exist, and unconditionally preloads all database records for all tables where `table.te_cached is True` via `db.view_select_multiple()`, populating `_cached_rows` and indexing all rows into `_pk_index`, `_nodup_index`, and `_col_indices`. If the database is empty and `table.initial_insert` is present, indexes initial seed rows.
+  4. In `TECachedDB`: Calls `clear_cache()`, ensures index structures exist, and preloads database records for tables where `table.te_cached` is truthy via `db.select_preload(table, cached_columns=cached_cols, min_vid=min_vid)`:
+     - **Selective Column Pushdown**: For column-level cached tables (e.g. `m_tag_code`), queries only configured columns (`SELECT hash FROM m_tag_code`) and reconstructs canonical rows with `None` in un-cached positions.
+     - **Version Window Predicate Pushdown**: For `version_scoped=True` tables, pushes the working-window filter (`vid >= Old_VID`) directly into the SQL query (`WHERE vid >= %s` or `WHERE (vid_e = 0 OR vid_e >= %s)`).
+     - For standard cached tables: Preloads all records.
+     - Indexes all rows into `_pk_index`, `_nodup_index`, and selectively into `_col_indices`.
 - **`start(tables: Sequence[Table] | Table, db: Callable[[], Any] | type[Any]) -> None`**
   1. Normalizes `tables` into a tuple/list.
   2. Registers all tables in `self.tables`.
@@ -120,16 +127,19 @@ Internal helper methods used exclusively by `TECachedDB` to synchronize in-memor
 
 - **`get(table_id: int, columns: tuple[SafeDataType, ...]) -> tuple[SafeDataType, ...] | None`**
   - **In `TECachedDB` (`te_cached=True` tables)**:
-    1. **Primary Key Fast-Path**: If all primary key columns are non-None, checks `_pk_index[table_id].get(pk)`, verifies full filter match via `_match_columns(row, columns)`, and returns the row or `None`.
+    1. **Primary Key Fast-Path**: If all primary key columns are non-None, checks `_pk_index[table_id].get(pk)`, verifies full filter match via `_match_columns(row, columns)`, and returns the row or `None`. If missing and `version_scoped=True`, falls back to `db.select()`.
     2. **Deduplication Key Fast-Path**: If `table.no_duplicate` and `columns[1:]` non-None, checks `_nodup_index[table_id].get(columns[1:])`, verifies via `_match_columns(row, columns)`.
-    3. **Column Index Accelerated Path**: Identifies all indexed non-None columns, selects the column index with the smallest candidate pool, and checks candidate matches via `_match_columns(row, columns)`.
-    4. **In-Memory Linear Scan**: Scans `_cached_rows[table_id]` using `_match_columns(row, columns)`.
-    - Zero SQL queries issued to the database.
+    3. **Column Index Accelerated Path**: Identifies all indexed non-None columns in `_col_indices`, selects the column index with the smallest candidate pool, and checks candidate matches via `_match_columns(row, columns)`. If missing and `version_scoped=True`, falls back to `db.select()`.
+    4. **In-Memory Linear Scan**: Scans `_cached_rows[table_id]` using `_match_columns(row, columns)`. Falls back to `db.select()` for out-of-window version-scoped queries.
   - **In `TEDirectDB` (or non-cached tables)**:
-    1. **Staged Memory Check**:
-       - `no_duplicate=True`: Checks `queued_set[table_id].get(columns[1:])`.
-       - Explicit PK: Checks `queued_set[table_id].get(pk)` for wildcard matches.
-    2. **Emptiness Guard**: If `getattr(table, "has_auto_increment", True) and table.initial_insert is None and self.next_id.get(table_id, 0) <= 1`, returns `None` immediately without querying DB.
+    1. **Staged Memory Check (`queued_set`)**:
+       - `no_duplicate=True`:
+         - Exact key: If all `columns[1:]` are non-None, checks `queued_set[table_id].get(columns[1:])`.
+         - Wildcard filter: Iterates `queued_set[table_id].items()`, checking `columns` match against staged rows `(v, *k)`.
+       - `no_duplicate=False`:
+         - Explicit PK: If all primary columns are non-None, checks `queued_set[table_id].get(pk)` for match.
+         - Wildcard filter: Iterates `queued_set[table_id].values()`, checking `columns` match against staged rows.
+    2. **Emptiness Guard**: If `getattr(table, "has_auto_increment", True) and table.initial_insert is None and self.next_id.get(table_id, 0) <= 1 and (table_id not in self.queued_set or not self.queued_set[table_id])`, returns `None` immediately without querying DB.
     3. **Database Query**: Executes `self.db.select(table, columns)`.
 - **`set(table_id: int, columns: tuple[SafeDataType, ...]) -> tuple[SafeDataType, ...]`**
   - **Case 1 (`table.no_duplicate == True`)**:
@@ -205,19 +215,22 @@ Internal helper methods used exclusively by `TECachedDB` to synchronize in-memor
 
 ### 4.4. Transaction Commit Protocol (`commit`, `commit_all`)
 
-- **`commit(table_id: int) -> None`**
+- **`commit(table_id: int, update_in_mem_indexes: bool = True) -> None`**
   1. **Inserts (`queued_set`)**: If `queued_set[table_id]` is non-empty:
      - `no_duplicate=True`: formats payload as `tuple(v if isinstance(v, (tuple, list)) else ((v, *k) if isinstance(k, tuple) else (v, k)) for k, v in self.queued_set[table_id].items())`.
      - `no_duplicate=False`: formats payload as `tuple(self.queued_set[table_id].values())`.
+     - **Batch Pre-Sorting (Cryptographic Hash Tables)**: For tables with explicit primary keys on pseudo-random binary hashes (e.g. `m_tag_code`, `m_ast_hash`), pre-sorting payloads by primary key prior to batch chunking ensures ascending B+Tree leaf insertion in InnoDB, reducing random page splits and improving locality by >5x.
      - Calls `self.db.insert(table, payload)` and clears `self.queued_set[table_id]`.
   2. **Updates (`queued_update`)**: If `queued_update[table_id]` is non-empty:
      - Calls `self.db.update(table, tuple(self.queued_update[table_id]))` and clears `self.queued_update[table_id]`.
+  3. **In-Memory Cache Management**: If `update_in_mem_indexes=False` in `TECachedDB`, purges `table_id` cache and indices from RAM.
 
-- **`commit_all(max_workers: int | None = None) -> None`**
+- **`commit_all(max_workers: int | None = None, update_in_mem_indexes: bool = True) -> None`**
   - Gathers payloads `(table, insert_payload, update_payload)` across all modified tables.
   - If `hasattr(self.db, "commit_tables_parallel")`, dispatches to `self.db.commit_tables_parallel(tables_data, max_workers=max_workers)`.
   - Fallback: Sequentially calls `self.db.insert()` and `self.db.update()` for all tables with pending payloads.
   - Clears `queued_set` and `queued_update` buffers across all tables.
+  - **In-Memory Index Teardown**: If `update_in_mem_indexes=False` in `TECachedDB`, immediately invokes `self.clear_cache()` to evacuate all cached rows, position maps, and indices from memory, avoiding redundant post-commit index synchronization before engine closure.
 
 ---
 
@@ -242,3 +255,5 @@ Any backend passed to `TableEngine` must implement:
 3. **Multiprocessing Isolation**: Re-invoke `start_new_db()` in child workers to ensure separate DB connection sockets.
 4. **Tuple Immutability**: All returned and cached rows must be immutable tuples of primitive `SafeDataType`.
 5. **Strict Upstream Deduplication**: Existing records in database/cache must be reused without allocating new sequence IDs, and strict `INSERT INTO` must be maintained at the database layer.
+6. **B+Tree Clustered Index Insertion Ordering**: For tables using random cryptographic hashes (`BINARY(32)`) as Primary Keys (`m_tag_code`, `m_ast_hash`), batch insert payloads should maintain sorted primary key ordering to minimize InnoDB page splits and buffer pool thrashing.
+
