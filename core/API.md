@@ -16,15 +16,20 @@ Dense architectural contract and state interaction reference across `globalstuff
   - `G.CPUS`: Worker process count for parallel parsing (default `8`).
   - `G.linux_directory`: `Path("linux")` repository location.
   - `G.CURRENT_PARSING_FILE`: Thread/process-local relative file path for log formatting.
+  - `G.LOW_MEMORY_MODE`: Enabled via `--low-mem`; throttles worker pool to `CPUS // 2` (batch size 50) and executes chunked commits every 500 ChangeSets.
+  - `G.VERY_LOW_MEMORY_MODE`: Enabled via `--very-low-mem`; limits workers to `min(2, CPUS // 4)` (batch size 25) with chunked commits every 300 ChangeSets for hosts with < 64GB RAM.
+  - `G.MEMORY_MODE`: String indicator (`"normal"`, `"low"`, `"very-low"`).
 - **Flags & Debugging**:
   - `G.DEBUG_TYPECHECK`: Enables runtime assertions on type validation decorators.
   - `G.BP_ON_SHUTDOWN`: Triggers `sys.breakpointhook()` on emergency exit.
   - `G.BP_ON_REF_FAIL`: Triggers `sys.breakpointhook()` when a `RefType` cannot be resolved.
   - `G.PROFILING_ENABLED`: Enables AST & execution duration profiling.
-- **Control Methods**:
+- **Control Methods & Utilities**:
   - `G.emergency_shutdown(code: int = 1) -> None`: Cleans all paths in `gp.PURGE_LIST` and exits.
   - `G.BP() -> None`: Drops into breakpoint hook (`sys.breakpointhook()`).
   - `G.type_check(*expected_types)`: Method decorator enforcing runtime type validation.
+  - `reclaim_system_memory() -> None`: Runs explicit garbage collection (`gc.collect()`) and invokes glibc `malloc_trim(0)` to return free memory pages to OS.
+  - `compute_code_hash(code: str) -> bytes`: Computes a deterministic 32-byte binary SHA-256 digest (`BINARY(32)`) from normalized code snippet strings for `m_tag_code`.
 
 ### 1.2. Core Data Types & Canonical Bounds
 - **`PointerType`**: `tuple[int, int]` &mdash; `(table_id, col_idx)` referencing a table column.
@@ -34,7 +39,7 @@ Dense architectural contract and state interaction reference across `globalstuff
 - **`LinkType`**: `int | str` &mdash; Context route marker (`REF_ROOT`, `REF_C_AST`, `REF_OLD`, `REF_POS`, `REF_MULTI`, `REF_FILE`, `REF_NO_REF`, or custom string identifier).
 - **`RouteType`**: `tuple[LinkType, ...] | list[LinkType, ...]` &mdash; Path sequence identifying a stored operation.
 - **`RefType`**: `tuple[PointerType, int, RouteType]` &mdash; Unresolved reference tuple: `(query_pointer, OP_REF, route_tuple)`.
-- **`SafeDataType`**: `int | str | bytes | None` &mdash; Primitive scalar values acceptable to TableEngine and SQL backends.
+- **`SafeDataType`**: `int | str | bytes | None` &mdash; Primitive scalar values acceptable to TableEngine and SQL backends (supports `bytes` for raw 32-byte binary SHA-256 digests).
 - **`UnSafeDataType`**: `SafeDataType | RefType` &mdash; Data scalar containing either a primitive or an unresolved reference.
 
 ### 1.3. Global Constants & Enums
@@ -55,7 +60,14 @@ Dense architectural contract and state interaction reference across `globalstuff
   - `REF_C_AST = 5`: C AST parser scope.
   - `REF_NO_REF = 6`: Null/no-reference marker (evaluates to `None`).
 - **File Types**:
-  - `T_DIR = 0`, `T_C = 1`, `T_KCONFIG = 2`, `T_RUST = 3`, `T_ASM = 4`.
+  - `T_DIR = 0`: Directory container.
+  - `T_C = 1`: C and Preprocessor source file (`.c`, `.h`).
+  - `T_KCONFIG = 2`: Kconfig menu definitions (`Kconfig*`).
+  - `T_RUST = 3`: Rust source file (`.rs`).
+  - `T_ASM = 4`: Architecture assembly source (`.S`, `.s`).
+  - `T_RAW = 5`: Fallback raw/unparsed text file (Documentation, README, licenses, build scripts).
+  - `T_MAINTAINERS = 6`: Kernel subsystem maintainer directory (`MAINTAINERS`).
+  - `T_CREDITS = 7`: Kernel contributor biographies (`CREDITS`).
 - **Helper Classes**:
   - `PointerGetter(joins)`: Iterator extracting `(repeat_count, pointer)` sequentially from `JoinsType`.
     - `get_first_pointer() -> PointerType`: Root table pointer.
@@ -77,6 +89,7 @@ Manages RAMDISK temporary working trees and Git repository extraction.
   - `add_version(version_name: str, purge_list: list) -> None`: Clones version tree into RAMDISK and registers in `purge_list`.
   - `git_clone(version: str) -> str`: Executes `git archive <version> | tar -x` and provisions `include/asm` and `include/uapi/asm` symlinks pointing to `asm-generic`.
   - `get_file(file_path: str, version: str) -> str`: Returns cached content from RAMDISK (latin-1) or queries `git show <version>:<file_path>`.
+  - `read_file(file_path: str, version: str) -> bytes`: Reads raw bytes from RAMDISK. Defensively inspects paths: if `p.is_symlink() and p.is_dir()` or on read errors, extracts link target via `os.readlink(p).encode("utf-8")` to eliminate `[Errno 21] Is a directory` exceptions on directory symlinks (e.g. `arch/*/boot/dts/include/dt-bindings`).
   - `generate_change_list(gp: GreatProcessor) -> list[str]`: Runs `git diff <Old_Version_Name> <Version_Name> --name-status` and sets `gp.Change_List`.
   - `git_file_list(version: str) -> str`: Executes `git ls-tree -r --name-only <version>`.
   - `get_dir_list(version_name: str) -> list[str]`: Executes `git ls-tree -r -d --name-only <version_name>`.
@@ -97,40 +110,46 @@ Central runtime container, schema registry, and worker IPC coordinator.
   - `Old_Version_Name: str | int`: Prior Git release tag.
   - `VID: int` / `Old_VID: int`: Monotonic database primary keys for current and prior versions in `m_v_main`.
   - `Change_List: list[str] | None`: Raw diff lines (`"M\tpath"`, `"R100\told\tnew"`).
+  - `Symlink_List: list[str]`: Buffers symlinks partitioned from `gp.Change_List` for zero-duplication deferred aliasing directly into `m_bridge_file` via `processing_symlinks()`.
   - `ChangeSet_Dict: dict[str, ChangeSet] | CompressedChangeSetDict`: Main process dictionary mapping relative file paths to parsed `ChangeSet` objects.
   - `Alt_ChangeSet_Dict: dict[str, ChangeSet] | CompressedChangeSetDict`: Secondary cache for on-demand parsed foreign `ChangeSets` during cross-file reference resolution.
   - `Shared_ChangeSet_Dict_List: list[bytes] | None`: IPC list holding worker `pickle.dumps()` payloads.
+- **Memory Compression (`CompressedChangeSetDict`)**:
+  - Implements an on-demand compressed store backed by `zlib.compress(pickle.dumps(cs), level=1)` and an in-memory LRU uncompressed cache (`OrderedDict`, default capacity 500 items). Prevents memory exhaustion during full-kernel parsing with hundreds of thousands of active AST ChangeSets.
 - **IPC Protocol**:
   - `start_manager() -> None`: Initializes `Shared_ChangeSet_Dict_List = []`.
   - `push_set_to_main() -> None`: Executed by worker; serializes `ChangeSet_Dict` via `pickle.dumps()` onto `Shared_ChangeSet_Dict_List`.
   - `stop_manager() -> None`: Executed by main process; deserializes (`pickle.loads()`) and merges worker dictionaries into `gp.ChangeSet_Dict`.
   - `safe_get_cs(path: str) -> ChangeSet`: Lookup sequence: `ChangeSet_Dict` &rarr; `Alt_ChangeSet_Dict` &rarr; creates `ChangeSet("M", path)`, triggers `CS.parse()`, stores in `Alt_ChangeSet_Dict`, and returns `CS`.
-  - `reset_cs() -> None`: Clears `Change_List`, `ChangeSet_Dict`, and `Alt_ChangeSet_Dict`.
+  - `reset_cs() -> None`: Clears `Change_List`, `Symlink_List`, `ChangeSet_Dict`, and `Alt_ChangeSet_Dict`.
 
 ---
 
 ## 4. Relational Database Schema Registry (`core/DBLayout.py`)
 
-30 Core Tables defined via `Table` instances and exported in `TABLES` tuple (`init_db_layout(gp)` sets `gp.Table_Array = list(TABLES)`):
+31 Core Tables defined via `Table` instances and exported in `TABLES` tuple (`init_db_layout(gp)` sets `gp.Table_Array = list(TABLES)`):
 
 | `table_id` | Table Name | Columns | Primary Key | `no_duplicate` | `te_cached` | `hashing_table` | Description |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
 | **0** | `m_v_main` | `(vid, vname)` | `("vid",)` | `True` | `True` | `False` | Version tag registry |
 | **1** | `m_file_name` | `(fnid, fname)` | `("fnid",)` | `True` | `True` | `False` | Unique file path registry |
 | **2** | `m_file` | `(fid, vid_s, vid_e, ftype, s_stat, e_stat)` | `("fid",)` | `False` | `True` | `False` | File lifecycle & status instance |
-| **3** | `m_bridge_file` | `(vid, fnid, fid)` | `("vid", "fnid")` | `False` | `True` | `False` | Version-to-file instance bridge |
+| **3** | `m_bridge_file` | `(vid, fnid, fid)` | `("vid", "fnid")` | `False` | `True` | `False` | Version-to-file instance bridge (N:1 aliases symlinks) |
 | **4** | `m_moved_file` | `(s_fid, e_fid)` | `("s_fid", "e_fid")`| `False` | `False`| `False` | File rename/movement tracking |
 | **5** | `m_type_descriptor`| `(type_id, name)` | `("type_id",)` | `False` | `True` | `False` | AST node type registry (seeded from `ASTT`) |
 | **6** | `m_ast` | `(ast_id, name, type_id)` | `("ast_id",)` | `False` | `False`| `"m_ast_hash"` | AST symbol nodes |
 | **7** | `m_ast_container` | `(ast_id, priority, type_id, ref_ast_id)`| `("ast_id", "priority")`| `False` | `False` | `False` | AST child hierarchy links |
 | **8** | `m_ast_include` | `(ast_id, fnid)` | `("ast_id",)` | `False` | `False`| `False` | AST `#include` / `source` references |
 | **9** | `m_ast_debug` | `(ast_id, ast_raw)` | `("ast_id",)` | `False` | `False`| `False` | JSON dumps of AST structures |
-| **10** | `m_tag_code` | `(hash, code)` | `("hash",)` | `False` | `("hash",)` | `False` | Code snippet text registry |
+| **10** | `m_tag_code` | `(hash, code)` | `("hash",)` | `False` | `("hash",)` | `False` | Code snippet registry (32-byte binary SHA-256 hash, single-column caching) |
 | **11** | `m_tag` | `(tag_id, vid_s, vid_e, hash, ast_id, hl_s, hl_l)` | `("tag_id", "vid_s")`| `False` | `False` | `False` | Code snippet occurrence tag |
 | **12** | `m_bridge_tag` | `(fid, tag_id, line_s, line_e, char_s, char_e)` | `("fid", "tag_id")` | `False` | `False` | `False` | Tag line & coordinate mapping |
 | **13** | `m_map_ast` | `(map_id, line_s, char_s, line_e, char_e, ast_id)`| `("map_id", "line_s", ...)`| `False` | `False`| `False` | Spatial AST coordinate region |
 | **14** | `m_bridge_map` | `(tag_id, map_id)` | `("tag_id", "map_id")` | `False` | `False` | `False` | Tag-to-AST spatial map bridge |
 | **15** | `m_ast_hash` | `(hash, ast_id)` | `("hash",)` | `False` | `True` | `False` | Binary 32-byte SHA-256 AST structural hash deduplication |
+
+> [!IMPORTANT]
+> **ChangeSet Tag Reference Order Invariant (Rule 12)**: When staging tags in ChangeSets (`with CS(REF_POS):`), `m_tag.set` MUST be the first operation inside the block so that `tag_ref = ((m_tag.table_id, 0), OP_REF, (REF_POS, CS.route[-1]))` points directly to `m_tag`. Auxiliary deduplication tables (such as `m_tag_code.get_set`) must always be staged after `m_tag.set` within the block.
 | **16** | `m_kconfig_symbol` | `(kcid, vid_s, vid_e, name, type, prompt, def_val, help, ast_id)` | `("kcid", "vid_s")` | `True` | `True` | `False` | Normalized Kconfig symbol definitions |
 | **17** | `m_kconfig_relation`| `(kcid, target_name, rel_type, cond_ast_id, priority)`| `("kcid", "rel_type", ...)`| `False` | `True` | `False` | Direct depends_on / select / imply dependency graph |
 | **18** | `m_kconfig_tree` | `(tree_id, vid, parent_id, node_type, title, kcid, priority, dep_ast_id, ast_id)` | `("tree_id", "vid")` | `False` | `True` | `False` | Hierarchical Menuconfig tree & UI ordering |
@@ -145,6 +164,7 @@ Central runtime container, schema registry, and worker IPC coordinator.
 | **27** | `m_bridge_commit_person`| `(commit_id, person_id, role_type, priority)` | `("commit_id", "person_id", "role_type")` | `False` | `False` | `False` | Commit author, committer, and trailers |
 | **28** | `m_bridge_commit_file`| `(commit_id, vid, fid, change_type)` | `("commit_id", "fid")` | `False` | `False` | `False` | Files touched per commit |
 | **29** | `m_bridge_commit_tag`| `(commit_id, vid, fid, tag_id)` | `("commit_id", "tag_id")` | `False` | `False` | `False` | Code tags modified per commit |
+| **30** | `m_moved_tag` | `(s_tag_id, e_tag_id)` | `("s_tag_id", "e_tag_id")` | `False` | `False` | `False` | Tag history & cross-version evolution tracking |
 
 ---
 
@@ -219,45 +239,59 @@ Represents a parsed file diff and acts as the relational staging buffer.
 ## 6. End-to-End Inter-Module Execution Lifecycle
 
 ```
-========================================================================================
-[1. INITIALIZATION & REPO EXTRACTION]
-----------------------------------------------------------------------------------------
-MasterFile (mf)                    GreatProcessor (gp)              DBLayout (TABLES)
-  |                                        |                                |
-  |-- add_version(vname)                   |-- init_db_layout(gp) --------->|
-  |   (Clones git tree to /dev/shm)        |   (Populates gp.Table_Array)   |
-  |-- generate_change_list(gp) ----------->|                                |
-      (Populates gp.Change_List)           |                                |
-========================================================================================
-[2. MULTIPROCESSING PARSING & IPC]
-----------------------------------------------------------------------------------------
-Main Process                               Worker Process (CPUs 1..N)
-  |                                                |
-  |-- gp.start_manager()                           |-- ChangeSet(diff_line)
-  |   (Allocates Shared_ChangeSet_Dict_List)       |-- CS.parse() -> AST Parsers
-  |                                                |-- Table.<op>() builders
-  |                                                |-- CS.store() (Buffers into CS.cs)
-  |                                                |-- CS.clear_bloat()
-  |                                                |-- gp.push_set_to_main()
-  |                                                |   (pickle.dumps -> Shared List)
-  |                                                |
-  |<-- gp.stop_manager() <-------------------------|
-       (pickle.loads -> Merges into gp.ChangeSet_Dict)
-========================================================================================
-[3. REFERENCE RESOLUTION & TABLE ENGINE COMMIT]
-----------------------------------------------------------------------------------------
-gp.ChangeSet_Dict                  TableEngine (G.TE)               Database (G.DB)
-  |                                        |                                |
-  |-- For each CS in ChangeSet_Dict:       |                                |
-  |   |-- CS.execute()                     |                                |
-  |   |   |-- CS.resolve_ref()             |                                |
-  |   |   |   (Resolves REF_FILE           |                                |
-  |   |   |    via gp.safe_get_cs)         |                                |
-  |   |   |-- CS._unpack_ref_view()        |                                |
-  |   |   |-- G.TE.set() / update() ------>| (Stages in queued_set/update)  |
-  |   |   |-- G.TE.view_set() ------------>| (Decomposes joins & hashes)    |
-  |                                        |                                |
-  |--------------------------------------->|-- G.TE.commit_all() ---------->|
-                                               (Parallel SQL batch flush)   |
-========================================================================================
+==================================================================================================
+[1. INITIALIZATION & REPOSITORY EXTRACTION]
+--------------------------------------------------------------------------------------------------
+MasterFile (MF)                   GreatProcessor (gp)               TableEngine (G.TE)
+  │                                       │                                 │
+  ├─ add_version(vname)                   ├─ init_db_layout(gp)             │
+  │  (Clones git tree to /dev/shm)        │  (Populates gp.Table_Array)     │
+  └─ generate_change_list(gp) ───────────►│                                 │
+     (Populates gp.Change_List)           └─ G.TE.start(gp.Table_Array) ────►
+==================================================================================================
+[2. MULTICORE PARTITIONING & PARALLEL WORKER PARSING]
+--------------------------------------------------------------------------------------------------
+Main Process (trigger_multicore)          Worker Process 1..N
+  │
+  ├─ Partition gp.Change_List:
+  │  ├── regular_files ──────────────────►│ ChangeSet(diff_line)
+  │  │                                    │ ├── CS.parse() -> Language AST Parsers
+  │  │                                    │ ├── Table.<op>() builders (m_ast, m_tag, m_tag_code)
+  │  │                                    │ ├── CS.store() (Buffers into CS.cs)
+  │  │                                    │ └── CS.clear_bloat()
+  │  │                                    └─► Worker IPC (Compressed pickle -> result_queue)
+  │  └── symlink_files
+  │      (Appended to gp.Symlink_List)
+  │
+  ├─ Merges worker batches into gp.ChangeSet_Dict
+  ├─ processing_dirs() (Staged directory ChangeSets)
+  └─ processing_unchanges() (Carryover unchanged files; defer unchanged symlinks to gp.Symlink_List)
+==================================================================================================
+[3. SEQUENTIAL EXECUTION, TAG EVACUATION & INTERMEDIATE COMMITS]
+--------------------------------------------------------------------------------------------------
+Main Process (STEP 6)                     TableEngine (G.TE)                Database (G.DB)
+  │                                               │                                 │
+  ├─ For each CS in ChangeSet_Dict queue:         │                                 │
+  │  ├─ CS.execute() ────────────────────────────►│ (Stages in queued_set / update) │
+  │  │  (Resolves references & dynamic views)     │                                 │
+  │  ├─ extract_tags_and_evacuate_cs(CS)          │                                 │
+  │  │  (Purges internal AST memory buffers)      │                                 │
+  │  └─ Periodic Chunk Commit:                    │                                 │
+  │     (if LOW_MEMORY_MODE: 300/500 items) ─────►├─ commit_all() ─────────────────►│
+  │                                               │   (Flushes queued SQL batches)  │
+  │                                               │                                 │
+  ├─ STEP 6.1: processing_symlinks()              │                                 │
+  │  ├─ norm_target = normpath(target)            │                                 │
+  │  ├─ target_fid = get_fid_for_path(norm_target)│                                 │
+  │  ├─ m_bridge_file.set(vid, sym_fnid, fid) ──►│ (Direct zero-duplication alias) │
+  │  └─ Broken symlink fallback -> file_processing│                                 │
+  │                                               │                                 │
+  ├─ Post-Processing Subsystems:                  │                                 │
+  │  ├─ processing_git_commits(version) ─────────►│                                 │
+  │  ├─ processing_maintainer_files(version) ────►│                                 │
+  │  └─ processing_kbuild(version) ──────────────►│                                 │
+  │                                               │                                 │
+  └─ Final Teardown Commit:                       │                                 │
+     └─ G.TE.commit_all(update_in_mem_indexes=False) ──────────────────────────────►│
+==================================================================================================
 ```

@@ -83,17 +83,28 @@ class MasterFile:
     def get_file(self, file_path: str, version: str) -> str:
         """Retrieve content of a file at a specific version (from disk cache or git show)."""
         if version not in self.version_dict:
-            command = ["git", "--git-dir=linux/.git", "show", f"{version}:{file_path}"]
-            raw_file = sp.run(command, capture_output=True, text=True, encoding="latin-1")  # noqa: PLW1510, S603
+            git_dir = f"{G.linux_directory}/.git" if Path(f"{G.linux_directory}/.git").exists() else "linux/.git"
+            command = ["git", f"--git-dir={git_dir}", "show", f"{version}:{file_path}"]
+            raw_file = sp.run(command, capture_output=True, text=True, encoding="latin-1")  # noqa: PLW1510
             return raw_file.stdout
 
         if version not in self.file_dict:
             self.file_dict[version] = {}
 
         if file_path not in self.file_dict[version]:
-            self.file_dict[version][file_path] = Path(
-                f"{self.version_dict[version]}/{file_path}",
-            ).read_text(encoding="latin-1")
+            p = Path(f"{self.version_dict[version]}/{file_path}")
+            if p.is_symlink():
+                if p.is_dir():
+                    self.file_dict[version][file_path] = os.readlink(p)
+                else:
+                    try:
+                        self.file_dict[version][file_path] = p.read_text(encoding="latin-1")
+                    except (OSError, FileNotFoundError):
+                        self.file_dict[version][file_path] = os.readlink(p)
+            elif p.is_dir():
+                self.file_dict[version][file_path] = ""
+            else:
+                self.file_dict[version][file_path] = p.read_text(encoding="latin-1")
         return self.file_dict[version][file_path]
 
     def generate_change_list(self, gp: object) -> list[str]:

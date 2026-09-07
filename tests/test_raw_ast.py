@@ -39,6 +39,7 @@ from core.DBLayout import (
     m_bridge_file,
     m_ast,
     m_tag,
+    m_moved_tag,
     m_bridge_tag,
     m_map_ast,
     m_bridge_map,
@@ -313,6 +314,14 @@ class TestRawAstParser(unittest.TestCase):
         self.assertEqual(len(close_tag_ops), 1, "Old m_tag should be updated to closed")
         self.assertEqual(close_tag_ops[0][2][2], 1, "Old tag vid_e should be set to Old_VID (1)")
 
+        # Should have staged m_moved_tag linking prior tag to new tag
+        moved_tag_ops = [
+            op for op in cs2.cs
+            if isinstance(op, tuple) and len(op) == 3 and op[0] == m_moved_tag.table_id and op[1] == 1  # OP_SET
+        ]
+        self.assertEqual(len(moved_tag_ops), 1, "m_moved_tag should be staged linking prior tag to new tag")
+        self.assertEqual(moved_tag_ops[0][2][0], close_tag_ops[0][2][0], "s_tag_id should match old tag id")
+
         success = cs2.execute()
         self.assertTrue(success, "ChangeSet v3.1 should execute cleanly")
 
@@ -401,6 +410,383 @@ class TestRawAstParser(unittest.TestCase):
         success = cs.execute()
         self.assertTrue(success)
         self.assertEqual(len(cs.cs_result), len(cs.cs))
+
+    def test_raw_ast_directory_symlink(self) -> None:
+        """Verify fallback parsing on a directory symlink like arch/arm/boot/dts/include/dt-bindings."""
+        target_dir = os.path.join(self.temp_dir, "include", "dt-bindings")
+        os.makedirs(target_dir, exist_ok=True)
+        link_dir = os.path.join(self.temp_dir, "arch", "arm", "boot", "dts", "include")
+        os.makedirs(link_dir, exist_ok=True)
+        link_path = os.path.join(link_dir, "dt-bindings")
+        rel_target = "../../../../../include/dt-bindings"
+        os.symlink(rel_target, link_path)
+
+        file_path = "arch/arm/boot/dts/include/dt-bindings"
+        cs = ChangeSet(f"A\t{file_path}")
+        cs.current_vid = 1
+        cs.gp = self.gp
+        cs.mf = self.mf
+        G.CURRENT_PARSING_FILE = file_path
+
+        cs.store(m_file_name.get_set(None, cs.current_path))
+        cs.store(m_file.set(None, self.gp.VID, 0, type_check(file_path), "A", 0))
+        cs.store(m_bridge_file.set(self.gp.VID, cs.ref(m_file_name.fnid), cs.ref(m_file.fid)))
+
+        cs.parse()
+        self.assertGreater(len(cs.cs), 3)
+
+        success = cs.execute()
+        self.assertTrue(success)
+        self.assertEqual(len(cs.cs_result), len(cs.cs))
+
+
+
+class TestSymlinkAliasing(unittest.TestCase):
+    """Unit and integration test suite for zero-duplication symlink aliasing."""
+
+    def setUp(self) -> None:
+        from main import MF as main_MF
+        from main import file_fid_cache
+        from main import gp as main_gp
+        G.DB = MockDB
+        G.TE = TECachedDB()
+        self.gp = GreatProcessor()
+        init_db_layout(self.gp)
+        G.TE.start(self.gp.Table_Array, G.DB)
+
+        self.mf = MasterFile()
+        self.temp_dir = self.mf.create_temp_dir()
+        self.mf.version_dict["v3.0"] = self.temp_dir
+        G.MF = self.mf
+        self.gp.Version_Name = "v3.0"
+        self.gp.VID = 1
+        self.gp.Old_VID = 0
+
+        # Sync main module globals to test instance
+        main_gp.Table_Array = list(self.gp.Table_Array)
+        main_gp.VID = 1
+        main_gp.Old_VID = 0
+        main_gp.Version_Name = "v3.0"
+        main_gp.Symlink_List = []
+        main_MF.version_dict["v3.0"] = self.temp_dir
+        file_fid_cache.clear()
+
+    def tearDown(self) -> None:
+        from main import file_fid_cache
+        file_fid_cache.clear()
+        if hasattr(self, "mf") and self.mf:
+            self.mf.clear_all_version()
+
+    def test_file_symlink_aliasing_zero_duplication(self) -> None:
+        """Verify file symlink aliases to target fid in m_bridge_file with 0 duplicate m_file/tags."""
+        from main import file_fid_cache, processing_symlinks
+
+        # 1. Setup real target file on disk and in database
+        target_rel = "arch/microblaze/platform/generic/system.dts"
+        target_full = os.path.join(self.temp_dir, target_rel)
+        os.makedirs(os.path.dirname(target_full), exist_ok=True)
+        with open(target_full, "w", encoding="utf-8") as f:
+            f.write('/dts-v1/;\n/ { model = "Generic"; };\n')
+
+        # Setup symlink on disk pointing to target
+        symlink_rel = "arch/microblaze/boot/dts/system.dts"
+        symlink_full = os.path.join(self.temp_dir, symlink_rel)
+        os.makedirs(os.path.dirname(symlink_full), exist_ok=True)
+        os.symlink("../../platform/generic/system.dts", symlink_full)
+
+        # Register target file in TE/DB
+        target_fn = G.TE.set(m_file_name.table_id, (None, target_rel))[0]
+        target_f = G.TE.set(m_file.table_id, (None, 1, 0, T_RAW, "A", 0))
+        target_fid = target_f[0]
+        G.TE.set(m_bridge_file.table_id, (1, target_fn, target_fid))
+        G.TE.commit_all()
+
+        m_file_count_before = len(MockDB._global_store.get(m_file.table_name, {}))
+        m_tag_count_before = len(MockDB._global_store.get(m_tag.table_name, {}))
+
+        # 2. Process symlink
+        processing_symlinks([f"A\t{symlink_rel}"])
+
+        # 3. Assertions
+        # Symlink file name registered
+        sym_fn_row = m_file_name.get(None, symlink_rel)
+        self.assertIsNotNone(sym_fn_row)
+        sym_fnid = sym_fn_row[2][0]
+
+        # m_bridge_file maps symlink fnid to target_fid
+        bf_row = m_bridge_file.get(1, sym_fnid, None)
+        self.assertIsNotNone(bf_row)
+        self.assertEqual(bf_row[2][2], target_fid)
+        self.assertEqual(file_fid_cache.get(symlink_rel), target_fid)
+
+        # Zero duplication: No new m_file or m_tag records created for the symlink
+        m_file_count_after = len(MockDB._global_store.get(m_file.table_name, {}))
+        m_tag_count_after = len(MockDB._global_store.get(m_tag.table_name, {}))
+        self.assertEqual(m_file_count_after, m_file_count_before, "Symlink aliasing must not create duplicate m_file")
+        self.assertEqual(m_tag_count_after, m_tag_count_before, "Symlink aliasing must not create duplicate m_tag")
+
+        # Verify staged symlink records commit cleanly through unified commit_all()
+        G.TE.commit_all()
+        self.assertIn(sym_fnid, MockDB._global_store.get(m_file_name.table_name, {}))
+        self.assertIn((1, sym_fnid), MockDB._global_store.get(m_bridge_file.table_name, {}))
+
+    def test_directory_symlink_aliasing(self) -> None:
+        """Verify directory symlink aliases directly to target directory fid without directory errors."""
+        from core.globalstuff import T_DIR
+        from main import file_fid_cache, processing_symlinks
+
+        # 1. Setup real target dir and symlink on disk
+        target_dir = os.path.join(self.temp_dir, "include", "dt-bindings")
+        os.makedirs(target_dir, exist_ok=True)
+        link_dir = os.path.join(self.temp_dir, "arch", "arm", "boot", "dts", "include")
+        os.makedirs(link_dir, exist_ok=True)
+        link_path = os.path.join(link_dir, "dt-bindings")
+        os.symlink("../../../../../include/dt-bindings", link_path)
+
+        dir_rel = "include/dt-bindings"
+        symlink_rel = "arch/arm/boot/dts/include/dt-bindings"
+
+        # Register target directory in TE/DB
+        dir_fn = G.TE.set(m_file_name.table_id, (None, dir_rel))[0]
+        dir_f = G.TE.set(m_file.table_id, (None, 1, 0, T_DIR, "A", 0))
+        dir_fid = dir_f[0]
+        G.TE.set(m_bridge_file.table_id, (1, dir_fn, dir_fid))
+        G.TE.commit_all()
+
+        m_file_count_before = len(MockDB._global_store.get(m_file.table_name, {}))
+
+        # 2. Process directory symlink
+        processing_symlinks([f"A\t{symlink_rel}"])
+
+        # 3. Assertions
+        sym_fn_row = m_file_name.get(None, symlink_rel)
+        self.assertIsNotNone(sym_fn_row)
+        sym_fnid = sym_fn_row[2][0]
+
+        bf_row = m_bridge_file.get(1, sym_fnid, None)
+        self.assertIsNotNone(bf_row)
+        self.assertEqual(bf_row[2][2], dir_fid)
+        self.assertEqual(file_fid_cache.get(symlink_rel), dir_fid)
+
+        m_file_count_after = len(MockDB._global_store.get(m_file.table_name, {}))
+        self.assertEqual(m_file_count_after, m_file_count_before, "Directory symlink aliasing must not create duplicate m_file")
+
+        # Verify staged directory symlink records commit cleanly through unified commit_all()
+        G.TE.commit_all()
+        self.assertIn(sym_fnid, MockDB._global_store.get(m_file_name.table_name, {}))
+        self.assertIn((1, sym_fnid), MockDB._global_store.get(m_bridge_file.table_name, {}))
+
+    def test_broken_symlink_fallback(self) -> None:
+        """Verify dangling/broken symlinks gracefully fall back to raw tracking."""
+        from main import processing_symlinks
+
+        broken_rel = "tools/broken_link.txt"
+        broken_full = os.path.join(self.temp_dir, broken_rel)
+        os.makedirs(os.path.dirname(broken_full), exist_ok=True)
+        os.symlink("missing_nonexistent_file.txt", broken_full)
+
+        # Process broken symlink
+        processing_symlinks([f"A\t{broken_rel}"])
+
+        # Should fall back to raw processing, registering m_file_name and m_bridge_file
+        sym_fn_row = m_file_name.get(None, broken_rel)
+        self.assertIsNotNone(sym_fn_row)
+        sym_fnid = sym_fn_row[2][0]
+
+        bf_row = m_bridge_file.get(1, sym_fnid, None)
+        self.assertIsNotNone(bf_row)
+        self.assertIsNotNone(bf_row[2][2])
+
+        # Verify fallback symlink records commit cleanly through unified commit_all()
+        G.TE.commit_all()
+        self.assertIn(sym_fnid, MockDB._global_store.get(m_file_name.table_name, {}))
+        self.assertIn((1, sym_fnid), MockDB._global_store.get(m_bridge_file.table_name, {}))
+
+    def test_symlink_deletion_does_not_close_target(self) -> None:
+        """Verify deleting an aliased symlink does not close the target m_file record."""
+        from main import MF as main_MF
+        from main import default_processing
+        from main import gp as main_gp
+
+        old_dir = self.mf.create_temp_dir()
+        self.mf.version_dict["v3.0"] = old_dir
+        main_MF.version_dict["v3.0"] = old_dir
+        self.gp.Old_Version_Name = "v3.0"
+        main_gp.Old_Version_Name = "v3.0"
+
+        # Create symlink on disk in Old_Version tree so islink evaluates True
+        sym_rel = "arch/arm/symlink.dts"
+        old_sym_full = os.path.join(old_dir, sym_rel)
+        os.makedirs(os.path.dirname(old_sym_full), exist_ok=True)
+        os.symlink("target.dts", old_sym_full)
+
+        # Setup target file fid=100 and symlink bridge in VID 1
+        target_fn = G.TE.set(m_file_name.table_id, (None, "arch/arm/target.dts"))[0]
+        G.TE.set(m_file.table_id, (100, 1, 0, T_RAW, "A", 0))
+        G.TE.set(m_bridge_file.table_id, (1, target_fn, 100))
+
+        sym_fn = G.TE.set(m_file_name.table_id, (None, sym_rel))[0]
+        G.TE.set(m_bridge_file.table_id, (1, sym_fn, 100))
+        G.TE.commit_all()
+
+        # Transition to VID 2
+        self.gp.Old_VID = 1
+        self.gp.VID = 2
+        main_gp.Old_VID = 1
+        main_gp.VID = 2
+
+        # Symlink is deleted in VID 2
+        cs_del = ChangeSet(f"D\t{sym_rel}")
+        cs_del.current_vid = 2
+        cs_del.gp = self.gp
+        cs_del.mf = self.mf
+
+        default_processing(cs_del)
+        self.assertTrue(cs_del.execute())
+        G.TE.commit_all()
+
+        # Target file (fid=100) must remain open (vid_e == 0, e_stat == 0)
+        target_f_row = m_file.get(100, None, None, None, None, None)
+        self.assertIsNotNone(target_f_row)
+        self.assertEqual(target_f_row[2][2], 0, "Target m_file vid_e must remain 0 (open)")
+        self.assertEqual(target_f_row[2][5], 0, "Target m_file e_stat must remain 0 (not closed with 'D')")
+
+    def test_symlink_topological_commit_ordering(self) -> None:
+        """Verify processing_symlinks does not flush m_bridge_file prematurely before commit_all."""
+        from main import processing_symlinks
+
+        # 1. Setup target file and symlink
+        target_rel = "arch/x86/boot/compressed/misc.h"
+        target_full = os.path.join(self.temp_dir, target_rel)
+        os.makedirs(os.path.dirname(target_full), exist_ok=True)
+        with open(target_full, "w", encoding="utf-8") as f:
+            f.write("/* header */\n")
+
+        symlink_rel = "arch/x86/include/asm/misc.h"
+        symlink_full = os.path.join(self.temp_dir, symlink_rel)
+        os.makedirs(os.path.dirname(symlink_full), exist_ok=True)
+        os.symlink("../../boot/compressed/misc.h", symlink_full)
+
+        # Target file registered and committed
+        target_fn = G.TE.set(m_file_name.table_id, (None, target_rel))[0]
+        target_f = G.TE.set(m_file.table_id, (None, 1, 0, T_RAW, "A", 0))
+        target_fid = target_f[0]
+        G.TE.set(m_bridge_file.table_id, (1, target_fn, target_fid))
+        G.TE.commit_all()
+
+        # Count records in MockDB prior to symlink processing
+        bridge_count_before = len(MockDB._global_store.get(m_bridge_file.table_name, {}))
+        fn_count_before = len(MockDB._global_store.get(m_file_name.table_name, {}))
+
+        # 2. Process symlink
+        processing_symlinks([f"A\t{symlink_rel}"])
+
+        # 3. Assert processing_symlinks did NOT prematurely commit to DB
+        bridge_count_staged = len(MockDB._global_store.get(m_bridge_file.table_name, {}))
+        fn_count_staged = len(MockDB._global_store.get(m_file_name.table_name, {}))
+        self.assertEqual(
+            bridge_count_staged,
+            bridge_count_before,
+            "processing_symlinks must NOT commit m_bridge_file prematurely before Step 7 commit_all()",
+        )
+        self.assertEqual(
+            fn_count_staged,
+            fn_count_before,
+            "processing_symlinks must NOT commit m_file_name prematurely before Step 7 commit_all()",
+        )
+
+        # 4. Commit all and verify both are committed in proper topological order
+        G.TE.commit_all()
+        bridge_store = MockDB._global_store.get(m_bridge_file.table_name, {})
+        fn_store = MockDB._global_store.get(m_file_name.table_name, {})
+
+        self.assertEqual(len(bridge_store), bridge_count_before + 1)
+        self.assertEqual(len(fn_store), fn_count_before + 1)
+
+        # Verify foreign key integrity in MockDB: every bridge row's fnid exists in fn_store
+        for (vid, fnid), b_row in bridge_store.items():
+            self.assertIn(fnid, fn_store, f"Foreign key violation: fnid {fnid} in m_bridge_file missing in m_file_name")
+
+    def test_file_symlink_aliasing_multi_version_unchanged(self) -> None:
+        """Verify unchanged symlinks in multi-version cycles resolve target fid from gp.Old_VID without duplicate m_file."""
+        from main import MF as main_MF
+        from main import file_fid_cache, get_fid_for_path, processing_symlinks
+        from main import gp as main_gp
+
+        # 1. Setup real target file on disk and in database for VID 1
+        target_rel = "arch/microblaze/platform/generic/system.dts"
+        target_full = os.path.join(self.temp_dir, target_rel)
+        os.makedirs(os.path.dirname(target_full), exist_ok=True)
+        with open(target_full, "w", encoding="utf-8") as f:
+            f.write('/dts-v1/;\n/ { model = "Generic"; };\n')
+
+        symlink_rel = "arch/microblaze/boot/dts/system.dts"
+        symlink_full = os.path.join(self.temp_dir, symlink_rel)
+        os.makedirs(os.path.dirname(symlink_full), exist_ok=True)
+        os.symlink("../../platform/generic/system.dts", symlink_full)
+
+        target_fn = G.TE.set(m_file_name.table_id, (None, target_rel))[0]
+        target_f = G.TE.set(m_file.table_id, (None, 1, 0, T_RAW, "A", 0))
+        target_fid = target_f[0]
+        G.TE.set(m_bridge_file.table_id, (1, target_fn, target_fid))
+
+        # Process symlink in VID 1
+        processing_symlinks([f"A\t{symlink_rel}"])
+        G.TE.commit_all()
+
+        m_file_count_v1 = len(MockDB._global_store.get(m_file.table_name, {}))
+
+        # 2. Advance to VID 2 (target and symlink are unchanged)
+        main_gp.Old_VID = 1
+        main_gp.VID = 2
+        main_gp.Version_Name = "v3.1"
+        self.gp.Old_VID = 1
+        self.gp.VID = 2
+        self.gp.Version_Name = "v3.1"
+        temp_dir_v2 = self.mf.create_temp_dir()
+        main_MF.version_dict["v3.1"] = temp_dir_v2
+        self.mf.version_dict["v3.1"] = temp_dir_v2
+
+        symlink_v2 = os.path.join(temp_dir_v2, symlink_rel)
+        os.makedirs(os.path.dirname(symlink_v2), exist_ok=True)
+        os.symlink("../../platform/generic/system.dts", symlink_v2)
+        file_fid_cache.clear()
+
+        # Simulate get_fid_for_path fallback to gp.Old_VID before target is staged
+        resolved_fid = get_fid_for_path(target_rel)
+        self.assertEqual(resolved_fid, target_fid, "get_fid_for_path must resolve target fid from gp.Old_VID")
+
+        # Process unchanged symlink in VID 2
+        file_fid_cache.clear()
+        processing_symlinks([f"U\t{symlink_rel}"])
+
+        # Assertions
+        sym_fn_row = m_file_name.get(None, symlink_rel)
+        self.assertIsNotNone(sym_fn_row)
+        sym_fnid = sym_fn_row[2][0]
+
+        bf_row_v2 = m_bridge_file.get(2, sym_fnid, None)
+        self.assertIsNotNone(bf_row_v2)
+        self.assertEqual(bf_row_v2[2][2], target_fid)
+        self.assertEqual(file_fid_cache.get(symlink_rel), target_fid)
+
+        # Zero new m_file records created in VID 2
+        m_file_count_v2 = len(MockDB._global_store.get(m_file.table_name, {}))
+        self.assertEqual(m_file_count_v2, m_file_count_v1, "Unchanged symlink in VID 2 must not allocate new m_file")
+
+    def test_raw_ast_operation_u_graceful(self) -> None:
+        """Verify raw_ast_parse handles file_operation 'U' without warnings or errors."""
+        from core.TableHandling import ChangeSet
+        from main import gp as main_gp
+        from parser.raw_ast.raw_ast import raw_ast_parse
+
+        cs = ChangeSet("U\tarch/microblaze/boot/dts/system.dts")
+        cs.file_operation = "U"
+        cs.current_path = "arch/microblaze/boot/dts/system.dts"
+        cs.gp = main_gp
+
+        # raw_ast_parse should execute cleanly
+        raw_ast_parse(cs)
 
 
 if __name__ == "__main__":

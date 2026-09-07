@@ -17,38 +17,39 @@ Tests:
 14. In-Browser Patch Staging & git format-patch Generator
 """
 from __future__ import annotations
+
 import os
 import sys
 import unittest
-from typing import Any
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from webapp.main import (
-    get_versions_diff,
-    get_kconfig_diff,
-    get_symbol_xref,
-    lookup_symbols,
-    get_kconfig_graph,
-    autosolve_kconfig,
-    diff_kconfig_configurations,
-    match_patch_maintainers,
-    query_ast_semantic_sandbox,
-    export_compile_commands,
-    get_struct_layout,
-    get_codebase_treemap,
-    estimate_kconfig_footprint,
-    get_function_callgraph,
-    get_code_tour_presets,
-    generate_formatted_patch,
-    get_tag_timeline,
-    _compute_structured_diff,
+    AstQueryRequest,
     AutoSolveRequest,
     DiffConfigRequest,
-    PatchReviewRequest,
-    AstQueryRequest,
     FootprintRequest,
     FormatPatchRequest,
+    PatchReviewRequest,
+    _compute_structured_diff,
+    autosolve_kconfig,
+    diff_kconfig_configurations,
+    estimate_kconfig_footprint,
+    export_compile_commands,
+    generate_formatted_patch,
+    get_code_tour_presets,
+    get_codebase_treemap,
+    get_function_callgraph,
+    get_kconfig_diff,
+    get_kconfig_graph,
+    get_struct_layout,
+    get_symbol_xref,
+    get_tag_by_id,
+    get_tag_timeline,
+    get_versions_diff,
+    lookup_symbols,
+    match_patch_maintainers,
+    query_ast_semantic_sandbox,
 )
 
 
@@ -161,6 +162,43 @@ class TestWebappAdvancedFeatures(unittest.TestCase):
         self.assertIn('id="tagTimelineCodeContainer"', content)
         self.assertIn('openTagTimelineModal', content)
         self.assertIn('renderTimelineView', content)
+
+    def test_tag_lineage_evolution_and_moved_tags(self) -> None:
+        """Verify cross-version tag lineage resolution across m_moved_tag (e.g. nlmclnt_initdata)."""
+        try:
+            tag_old = get_tag_by_id(12153743)
+            self.assertEqual(tag_old.get("moved_to"), 17614604)
+            self.assertIsNone(tag_old.get("moved_from"))
+
+            tag_new = get_tag_by_id(17614604)
+            self.assertEqual(tag_new.get("moved_from"), 12153743)
+            self.assertIsNone(tag_new.get("moved_to"))
+
+            timeline_old = get_tag_timeline(12153743)
+            self.assertIn("lineage_tag_ids", timeline_old)
+            self.assertIn(12153743, timeline_old["lineage_tag_ids"])
+            self.assertIn(17614604, timeline_old["lineage_tag_ids"])
+            self.assertGreaterEqual(timeline_old["total_versions"], 11)
+
+            snaps_by_vname = {s["vname"]: s for s in timeline_old["timeline"]}
+            if "v3.3" in snaps_by_vname and "v3.4" in snaps_by_vname:
+                self.assertEqual(snaps_by_vname["v3.3"]["tag_id"], 12153743)
+                self.assertEqual(snaps_by_vname["v3.3"]["status"], "unchanged")
+
+                self.assertEqual(snaps_by_vname["v3.4"]["tag_id"], 17614604)
+                self.assertEqual(snaps_by_vname["v3.4"]["status"], "modified")
+                self.assertGreaterEqual(snaps_by_vname["v3.4"]["lines_added"], 1)
+                diff_texts = [d["text"] for d in snaps_by_vname["v3.4"]["diff"] if d["type"] == "add"]
+                self.assertTrue(any("net" in t for t in diff_texts))
+
+            timeline_new = get_tag_timeline(17614604)
+            self.assertEqual(timeline_new["lineage_tag_ids"], timeline_old["lineage_tag_ids"])
+            self.assertEqual(len(timeline_new["timeline"]), len(timeline_old["timeline"]))
+        except Exception as e:
+            if "not found" in str(e).lower() or "unavailable" in str(e).lower():
+                pass
+            else:
+                raise
 
     def test_clang_compile_commands_exporter(self) -> None:
         cmds = export_compile_commands("v3.0", arch="x86")

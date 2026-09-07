@@ -34,6 +34,7 @@ from core.DBLayout import (
     m_bridge_map,
     m_ast_hash,
     m_tag_code,
+    m_moved_tag,
 )
 from core.globalstuff import compute_code_hash
 
@@ -186,11 +187,16 @@ class Ast_Rust:
                         self.map_ast(CS, ast_ref, tag[1], self.extent)
                         return
 
+        from parser.c_ast.c_ast import match_prior_tag_transition
+        s_tag_id = match_prior_tag_transition(CS, self.extent, getattr(self, "name", None), getattr(self, "type", None))
+
         # New Tag Creation
         with CS(REF_POS):
             CS.store(m_tag.set(*current_tag))
             tag_ref = ((m_tag.table_id, 0), OP_REF, (REF_POS, CS.route[-1]))
             CS.store(m_tag_code.get_set(code_hash, self.extent.code))
+            if s_tag_id is not None:
+                CS.store(m_moved_tag.set(s_tag_id, tag_ref))
 
         # Stage Bridge Tag
         CS.store(m_bridge_tag.set(

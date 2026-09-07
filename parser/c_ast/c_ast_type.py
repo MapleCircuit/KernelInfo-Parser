@@ -27,7 +27,7 @@ import random
 logger = logging.getLogger(__name__)
 
 # Linter bypass
-m_v_main = m_file_name = m_file = m_bridge_file = m_moved_file = m_type_descriptor = m_ast = m_ast_container = m_ast_include = m_ast_debug = m_tag = m_bridge_tag = m_map_ast = m_bridge_map = m_ast_hash = m_tag_code = None
+m_v_main = m_file_name = m_file = m_bridge_file = m_moved_file = m_type_descriptor = m_ast = m_ast_container = m_ast_include = m_ast_debug = m_tag = m_bridge_tag = m_map_ast = m_bridge_map = m_ast_hash = m_tag_code = m_moved_tag = None
 ChangeSetType = Any
 _DEF_TYPES = frozenset({ASTT.C_struct, ASTT.C_functionproto, ASTT.C_union, ASTT.C_enum})
 _PUNCT_IGNORED = frozenset({";", ",", ")", "}"})
@@ -455,11 +455,32 @@ class Ast:
                         ))
                         return
 
+        cur_ast_name = getattr(self, "name", None)
+        cur_ast_type = getattr(self, "type", None)
+        if ast_id_route is not None:
+            ast_pos = None
+            if isinstance(ast_id_route, (tuple, list)) and ast_id_route and isinstance(ast_id_route[-1], int):
+                ast_pos = ast_id_route[-1]
+            elif hasattr(CS, "store_dict"):
+                ast_pos = CS.store_dict.get(tuple(ast_id_route), {}).get(m_ast.table_id)
+            if ast_pos is not None and ast_pos < len(CS.cs):
+                ast_op = CS.cs[ast_pos]
+                if len(ast_op) >= 3 and isinstance(ast_op[2], (tuple, list)) and len(ast_op[2]) >= 3:
+                    if not cur_ast_name:
+                        cur_ast_name = ast_op[2][1]
+                    if cur_ast_type is None:
+                        cur_ast_type = ast_op[2][2]
+
+        from parser.c_ast.c_ast import match_prior_tag_transition
+        s_tag_id = match_prior_tag_transition(CS, self.extent, cur_ast_name, cur_ast_type)
+
         with CS(REF_POS):
             # Create tag
             CS.store(m_tag.set(*current_tag))
             tag_ref = ((m_tag.table_id, 0), OP_REF, (REF_POS, CS.route[-1]))
             CS.store(m_tag_code.get_set(code_hash, self.extent.code))
+            if s_tag_id is not None:
+                CS.store(m_moved_tag.set(s_tag_id, tag_ref))
 
         # Create bridge tag
         CS.store(m_bridge_tag.set(
@@ -633,6 +654,7 @@ class Ast_Comment(Ast):
     def __init__(self, extent: Line, comment: str = "") -> None:
         self.extent = extent
         self.comment = comment
+        self.type = ASTT.C_Comment
         self.need_processing = False
 
     def within_range(self, token, ast_kind) -> bool:
@@ -2533,18 +2555,19 @@ class TypeSegment():
                 view.extend((None, i, t_code, item[1]))
 
             view = tuple(view)
-            with CS(REF_POS):
-                CS.store(m_ast.view(
-                    ((m_ast.ast_id, m_ast_container.ast_id, len(compound)),),
-                    None,
-                    "",
-                    ASTT.C_Compound,
-                    *view,
-                ))
-                route_key = CS.get_route_parse()
+            with CS(REF_NO_REF):
+                with CS(REF_POS):
+                    CS.store(m_ast.view(
+                        ((m_ast.ast_id, m_ast_container.ast_id, len(compound)),),
+                        None,
+                        "",
+                        ASTT.C_Compound,
+                        *view,
+                    ))
+                    route_key = CS.get_route_parse()
 
-                self.ref_type = TSRef.Route_Ref
-                self.ref = route_key
+                    self.ref_type = TSRef.Route_Ref
+                    self.ref = route_key
 
 
 class Zone_Type(IntEnum):
@@ -2939,6 +2962,7 @@ class C_Type(Ast):
         # Allow us to capture arg from non func_decl function proto and
         # allow us to keep pointer+func_proto inside the same root index.
         self.func_proto = False
+        self.paren_depth = 0
 
         self.storage_class = None
 
@@ -2973,6 +2997,10 @@ class C_Type(Ast):
                 self.extent.grow(tline)
                 return True
 
+        if self.paren_depth > 0:
+            self.extent.grow(tline)
+            return True
+
         match self.end_mode:
             case End_Mode.No_Check:
                 self.extent.grow(tline)
@@ -2996,9 +3024,8 @@ class C_Type(Ast):
                 if not self.extent.is_inside(tline):
                     self.need_processing = False
                     return False
-                if ast_kind == AST_KIND.punctuation and tspelling in (";", ",", ")", "}"):
-                    if tspelling == ";":
-                        self.extent.grow(tline)
+                if ast_kind == AST_KIND.punctuation and tspelling == ";":
+                    self.extent.grow(tline)
                     self.need_processing = False
                     return False
 
@@ -3033,7 +3060,8 @@ class C_Type(Ast):
             type_constructor.append(typesegment)
 
             # Detects variable identifier tokens (type == 0) to split multiple declarators
-            if typesegment.content and typesegment.content[-1].type == 0:
+            # Only subsequent typesegments after root_type can be variable declarator identifiers
+            if typesegment is not root_type and typesegment.content and typesegment.content[-1].type == 0:
                 final_types.append(tuple(type_constructor))
                 type_constructor = [root_type]
 
@@ -3407,6 +3435,11 @@ class C_Type(Ast):
 
     def exec_punctuation(self, token, cursor):
         tspelling = token.spelling_str
+        if tspelling == "(":
+            self.paren_depth += 1
+        elif tspelling == ")":
+            self.paren_depth = max(0, self.paren_depth - 1)
+
         if self.zones:
             for zone in reversed(self.zones):
                 if not zone.completed and zone.check_exec(token, cursor, AST_KIND.punctuation):
@@ -3521,6 +3554,16 @@ class C_Type(Ast):
         tspelling = token.spelling_str
         # Ignore predefined identifiers in expression contexts
         if tspelling in {"__func__", "__FUNCTION__", "__PRETTY_FUNCTION__"}:
+            return
+
+        # Declarator identifier check (field, variable, or parameter declaration)
+        # Prevents declarator names from inheriting preceding type specifiers (typedef, struct, union, enum)
+        if (
+            cursor.kind in {cc.CursorKind.FIELD_DECL, cc.CursorKind.VAR_DECL, cc.CursorKind.PARM_DECL}
+            and tspelling == safe_cursor_spelling(cursor)
+        ):
+            self.content.append(TypeToken(token))
+            self.swap_out()
             return
 
         for typesegment in self.typedata:

@@ -107,15 +107,16 @@ def close_prior_tags(CS: ChangeSetType) -> None:
                 if x in CS.active_tag_list:
                     continue
                 if len(tag) >= 13:
-                    CS.store(m_tag.update(
-                        tag[6],          # m_tag.tag_id
-                        tag[7],          # m_tag.vid_s
-                        CS.gp.Old_VID,   # m_tag.vid_e
-                        tag[9],          # m_tag.hash
-                        tag[10],         # m_tag.ast_id
-                        tag[11],         # m_tag.hl_s
-                        tag[12],         # m_tag.hl_l
-                    ))
+                    with CS(REF_POS):
+                        CS.store(m_tag.update(
+                            tag[6],          # m_tag.tag_id
+                            tag[7],          # m_tag.vid_s
+                            CS.gp.Old_VID,   # m_tag.vid_e
+                            tag[9],          # m_tag.hash
+                            tag[10],         # m_tag.ast_id
+                            tag[11],         # m_tag.hl_s
+                            tag[12],         # m_tag.hl_l
+                        ))
 
 
 class Rust_Manager:

@@ -176,6 +176,7 @@ class GreatProcessor:
         self.VID = 0
         self.Old_VID = 0
         self.Change_List = None
+        self.Symlink_List = []
         self.ChangeSet_Dict = CompressedChangeSetDict(lru_cache_size=500)
         self.Alt_ChangeSet_Dict = CompressedChangeSetDict(lru_cache_size=500)
         self.Manager = None
@@ -227,5 +228,7 @@ class GreatProcessor:
         """Reset Change_List and ChangeSet_Dict upon completion of a version parsing pass."""
         self.Alt_ChangeSet_Dict.clear()
         self.Change_List = None
+        if hasattr(self, "Symlink_List") and self.Symlink_List:
+            self.Symlink_List.clear()
         self.ChangeSet_Dict.clear()
         return

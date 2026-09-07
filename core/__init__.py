@@ -105,6 +105,7 @@ from core.DBLayout import (
     m_bridge_commit_file,
     m_bridge_commit_tag,
     m_tag_code,
+    m_moved_tag,
 )
 
 __all__ = [
@@ -201,4 +202,5 @@ __all__ = [
     "m_bridge_commit_file",
     "m_bridge_commit_tag",
     "m_tag_code",
+    "m_moved_tag",
 ]

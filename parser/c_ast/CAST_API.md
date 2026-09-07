@@ -436,10 +436,12 @@ The C AST parser generates and references records across 8 core database tables:
    ```python
    # 1. Tag code storage and tag definition
    code_hash = compute_code_hash(extent.code)
-   CS.store(m_tag_code.get_set(code_hash, extent.code))
    with CS(REF_POS):
+       # m_tag.set MUST be the first operation inside with CS(REF_POS) (Rule 12)
        CS.store(m_tag.set(None, VID, 0, code_hash, CS.ref(m_ast.ast_id, *ast_id_route), 0, 0))
        tag_ref = ((m_tag.table_id, 0), OP_REF, (REF_POS, CS.route[-1]))
+       # Auxiliary deduplication table staged after m_tag.set within the block
+       CS.store(m_tag_code.get_set(code_hash, extent.code))
 
    # 2. Bridge tag (coordinates in source file)
    CS.store(m_bridge_tag.set(
@@ -475,4 +477,6 @@ To guarantee 100.00% exact character code coverage and zero orphaned characters 
 7. **Testing Command Rule**: When validating AST parser changes, execute `python3 -m unittest tests/test_c_ast.py` and run `python3 main.py -u` once.
 8. **Line Splitting & Form Feed Invariant**: Libclang strictly treats `\r\n` and `\n` as newlines and `\x0c` (ASCII Form Feed) as in-line whitespace. Python's `str.splitlines()` splits on `\x0c`, which desynchronizes line indices on files containing form-feed characters (such as `arch/powerpc/xmon/ppc-opc.c`). Always use `raw_content.replace("\r\n", "\n").split("\n")` for 1:1 line index parity with Libclang.
 9. **Default Tag Fidelity & Coverage**: The test runner (`python3 -m tests.test_c_ast` and `python3 main.py -u`) enforces tag fidelity and source code coverage auditing by default (`-f / --fidelity`), requiring 100.00% character coverage and 0 text mismatches across all benchmark targets.
+10. **Tag Staging Invariant (Rule 12)**: Inside `with CS(REF_POS):`, `m_tag.set` MUST be the first staged operation so `tag_ref = ((m_tag.table_id, 0), OP_REF, (REF_POS, CS.route[-1]))` points directly to the `m_tag` entry. Auxiliary deduplication entries (`m_tag_code.get_set`) must be staged immediately afterwards.
+11. **Code Hashing & Memory Evacuation (Rule 14)**: Code snippets must be hashed using `compute_code_hash(code)` into 32-byte binary SHA-256 digests (`BINARY(32)`). Once executed, ChangeSets in `main.py` are immediately stripped of memory bloat via `extract_tags_and_evacuate_cs()` to sustain low-memory execution across deep git histories.
 

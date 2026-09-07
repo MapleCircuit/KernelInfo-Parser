@@ -25,6 +25,7 @@ from core.DBLayout import (
     m_ast,
     m_tag_code,
     m_tag,
+    m_moved_tag,
     m_bridge_tag,
     m_map_ast,
     m_bridge_map,
@@ -47,6 +48,8 @@ def raw_ast_parse(CS: Any) -> None:
         elif CS.file_operation == "D":
             get_prior_tags(CS)
             close_prior_tags(CS)
+        elif CS.file_operation == "U":
+            get_prior_tags(CS)
         else:
             logger.warning("Unhandled file operation '%s' for %s", CS.file_operation, CS.current_path)
 
@@ -54,6 +57,7 @@ def raw_ast_parse(CS: Any) -> None:
 def get_prior_tags(CS: Any) -> None:
     """Query TableEngine for existing active tags registered in the previous version."""
     CS.active_tag_list = set()
+    CS.transitioned_tag_list = set()
     CS.prior_tags = None
     CS.prior_tags_map = {}
 
@@ -108,15 +112,16 @@ def close_prior_tags(CS: Any) -> None:
                 if x in CS.active_tag_list:
                     continue
                 if len(tag) >= 13:
-                    CS.store(m_tag.update(
-                        tag[6],          # m_tag.tag_id
-                        tag[7],          # m_tag.vid_s
-                        CS.gp.Old_VID,   # m_tag.vid_e
-                        tag[9],          # m_tag.code
-                        tag[10],         # m_tag.ast_id
-                        tag[11],         # m_tag.hl_s
-                        tag[12],         # m_tag.hl_l
-                    ))
+                    with CS(REF_POS):
+                        CS.store(m_tag.update(
+                            tag[6],          # m_tag.tag_id
+                            tag[7],          # m_tag.vid_s
+                            CS.gp.Old_VID,   # m_tag.vid_e
+                            tag[9],          # m_tag.code
+                            tag[10],         # m_tag.ast_id
+                            tag[11],         # m_tag.hl_s
+                            tag[12],         # m_tag.hl_l
+                        ))
 
 
 class RawManager:
@@ -161,6 +166,19 @@ class RawManager:
                             ))
                         return
 
+        # Check for prior tag transition (modified content)
+        s_tag_id = None
+        if getattr(CS, "prior_tags", None):
+            transitioned = getattr(CS, "transitioned_tag_list", None)
+            if transitioned is None:
+                transitioned = set()
+                CS.transitioned_tag_list = transitioned
+            for idx, tag in enumerate(CS.prior_tags):
+                if idx not in CS.active_tag_list and idx not in transitioned:
+                    transitioned.add(idx)
+                    s_tag_id = tag[6] if len(tag) > 6 and tag[6] is not None else (tag[1] if len(tag) > 1 and tag[1] is not None else tag[0])
+                    break
+
         # New tag required using content_hex for AST name and content_hash for m_tag
         with CS(REF_POS):
             CS.store(m_ast.get_set(
@@ -182,6 +200,8 @@ class RawManager:
             ))
             tag_ref = ((m_tag.table_id, 0), OP_REF, (REF_POS, CS.route[-1]))
             CS.store(m_tag_code.get_set(content_hash, content))
+            if s_tag_id is not None:
+                CS.store(m_moved_tag.set(s_tag_id, tag_ref))
 
         with CS(REF_POS):
             CS.store(m_bridge_tag.set(

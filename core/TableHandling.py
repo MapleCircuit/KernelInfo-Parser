@@ -311,7 +311,7 @@ class ChangeSet:
         self._cached_route = None
         count = self.route_count.pop()
         popped = self.route[-count:] if len(self.route) >= count else []
-        if REF_MULTI in popped and self.multi_stack:
+        if popped and popped[0] == REF_MULTI and self.multi_stack:
             self.multi_stack.pop()
         for _ in range(count):
             self.route.pop()

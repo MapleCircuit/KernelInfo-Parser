@@ -111,6 +111,7 @@ from core.DBLayout import (
     m_bridge_commit_file,
     m_bridge_commit_tag,
     m_tag_code,
+    m_moved_tag,
 )
 
 
@@ -140,13 +141,15 @@ file_fid_cache: dict[str, int | None] = {}
 
 
 def get_fid_for_path(path: str) -> int | None:
-    """Resolve m_file.fid for a given path in active gp.VID."""
+    """Resolve m_file.fid for a given path in active gp.VID (falling back to gp.Old_VID for unchanged files)."""
     if path in file_fid_cache:
         return file_fid_cache[path]
     fn_row = m_file_name.get(None, path)
     if fn_row and len(fn_row) >= 3 and fn_row[2]:
         fnid = fn_row[2][0]
         bf_row = m_bridge_file.get(gp.VID, fnid, None)
+        if (bf_row is None or len(bf_row) < 3 or not bf_row[2]) and getattr(gp, "Old_VID", 0) > 0:
+            bf_row = m_bridge_file.get(gp.Old_VID, fnid, None)
         if bf_row and len(bf_row) >= 3 and bf_row[2]:
             fid = bf_row[2][2]
             file_fid_cache[path] = fid
@@ -268,6 +271,11 @@ def update(version: str) -> None:
 
     reclaim_system_memory()
 
+    # -------------------------------------------------------------------------
+    # STEP 6.1: Resolve Symbolic Links & Alias directly in m_bridge_file
+    # -------------------------------------------------------------------------
+    processing_symlinks()
+
     # Disable TableEngine in-memory secondary indexing for write-only batch staging phases
     if hasattr(G.TE, "update_in_mem_indexes"):
         G.TE.update_in_mem_indexes = False
@@ -326,7 +334,27 @@ def update(version: str) -> None:
 def trigger_multicore(batch_size: int | None = None) -> None:
     """Distribute file parsing across parallel worker processes in dynamic batches."""
     change_list = gp.Change_List or []
-    total_files = len(change_list)
+    working_dir = MF.version_dict.get(gp.Version_Name)
+
+    regular_files = []
+    symlink_files = []
+
+    for item in change_list:
+        if not item:
+            continue
+        parts = item.split("\t")
+        op = parts[0]
+        fpath = parts[-1]
+        if not op.startswith("D") and working_dir and os.path.islink(os.path.join(working_dir, fpath)):
+            symlink_files.append(item)
+        else:
+            regular_files.append(item)
+
+    if not hasattr(gp, "Symlink_List") or gp.Symlink_List is None:
+        gp.Symlink_List = []
+    gp.Symlink_List.extend(symlink_files)
+
+    total_files = len(regular_files)
 
     if batch_size is None:
         if G.VERY_LOW_MEMORY_MODE:
@@ -359,7 +387,7 @@ def trigger_multicore(batch_size: int | None = None) -> None:
     error_queue = multiprocessing.Queue()
 
     for i in range(0, total_files, batch_size):
-        task_queue.put((i // batch_size, change_list[i : i + batch_size]))
+        task_queue.put((i // batch_size, regular_files[i : i + batch_size]))
 
     for _ in range(num_workers):
         task_queue.put(None)  # Sentinel to terminate each worker
@@ -685,6 +713,8 @@ def arg_handling() -> argparse.Namespace:
             "tests.test_kconfig_ast",
             "tests.test_webapp_defconfig",
             "tests.test_webapp_maintainer",
+            "tests.test_raw_ast",
+            "tests.test_rust_ast",
         ]
         suite = unittest.TestSuite()
         for mod_name in test_modules:
@@ -766,15 +796,19 @@ def default_processing(CS: ChangeSet) -> None:
                 ))
                 CS.last_not_none()
 
-                # Update FILE
-                CS.store(m_file.update(
-                    CS.ref(m_bridge_file.fid),
-                    None,
-                    gp.Old_VID,
-                    None,
-                    None,
-                    "D",
-                ))
+                old_working_dir = getattr(MF, "version_dict", {}).get(getattr(gp, "Old_Version_Name", None))
+                is_symlink_del = bool(old_working_dir and os.path.islink(os.path.join(old_working_dir, CS.current_path)))
+
+                if not is_symlink_del:
+                    # Update FILE
+                    CS.store(m_file.update(
+                        CS.ref(m_bridge_file.fid),
+                        None,
+                        gp.Old_VID,
+                        None,
+                        None,
+                        "D",
+                    ))
 
         elif CS.file_operation and CS.file_operation[0] == "R":
             if CS.file_operation == "R100":
@@ -1103,6 +1137,7 @@ def processing_unchanges() -> None:
     vid = gp.VID
     old_vid = gp.Old_VID
 
+    working_dir = MF.version_dict.get(gp.Version_Name)
     missing_unchanged = []
     for unchanged in unchanged_set:
         un_m_file_name = m_file_name.get(None, unchanged)
@@ -1115,6 +1150,13 @@ def processing_unchanges() -> None:
             missing_unchanged.append(unchanged)
             continue
 
+        # If unchanged is a symlink, defer resolution to processing_symlinks so target fid stays in sync
+        if working_dir and os.path.islink(os.path.join(working_dir, unchanged)):
+            if not hasattr(gp, "Symlink_List") or gp.Symlink_List is None:
+                gp.Symlink_List = []
+            gp.Symlink_List.append(f"U\t{unchanged}")
+            continue
+
         te_set(
             t_id,
             (
@@ -1123,13 +1165,28 @@ def processing_unchanges() -> None:
                 un_m_bridge_file[2][2],
             ),
         )
+        file_fid_cache[unchanged] = un_m_bridge_file[2][2]
 
     if missing_unchanged:
-        logger.warning(
-            f"Found {len(missing_unchanged)} files in unchanged_set missing from prior DB version (Old_VID {old_vid}). "
-            f"Self-healing by processing as new additions in VID {vid}..."
-        )
-        file_processing(0, 0, [f"A\t{x}" for x in missing_unchanged])
+        missing_syms = []
+        missing_regs = []
+        for x in missing_unchanged:
+            if working_dir and os.path.islink(os.path.join(working_dir, x)):
+                missing_syms.append(f"A\t{x}")
+            else:
+                missing_regs.append(f"A\t{x}")
+
+        if missing_regs:
+            logger.warning(
+                f"Found {len(missing_regs)} files in unchanged_set missing from prior DB version (Old_VID {old_vid}). "
+                f"Self-healing by processing as new additions in VID {vid}..."
+            )
+            file_processing(0, 0, missing_regs)
+
+        if missing_syms:
+            if not hasattr(gp, "Symlink_List") or gp.Symlink_List is None:
+                gp.Symlink_List = []
+            gp.Symlink_List.extend(missing_syms)
 
     return
 
@@ -1225,6 +1282,74 @@ def processing_dirs() -> None:  # noqa: C901
             ))
             gp.ChangeSet_Dict[single_dir] = CS
     return
+
+
+def processing_symlinks(override_symlinks: list[str] | None = None) -> None:
+    """Resolve symbolic links by aliasing to target fid in m_bridge_file without duplicating AST tags."""
+    symlink_list = override_symlinks if override_symlinks is not None else getattr(gp, "Symlink_List", None)
+    if not symlink_list or gp.VID == 0:
+        return
+
+    working_dir = MF.version_dict.get(gp.Version_Name)
+    if not working_dir:
+        return
+
+    te_set = G.TE.set
+    t_id = m_bridge_file.table_id
+    vid = gp.VID
+
+    # Deduplicate paths while preserving order
+    seen_paths = set()
+    unique_symlinks = []
+    for item in symlink_list:
+        parts = item.split("\t")
+        sym_path = parts[-1]
+        if sym_path not in seen_paths:
+            seen_paths.add(sym_path)
+            unique_symlinks.append((parts[0], sym_path))
+
+    fallback_files = []
+
+    for op, symlink_path in unique_symlinks:
+        full_p = os.path.join(working_dir, symlink_path)
+        try:
+            raw_target = os.readlink(full_p)
+        except OSError:
+            fallback_files.append(f"{op}\t{symlink_path}")
+            continue
+
+        # Normalize target relative to repository root
+        norm_target = os.path.normpath(os.path.join(os.path.dirname(symlink_path), raw_target))
+        if norm_target.startswith("./"):
+            norm_target = norm_target[2:]
+
+        # Lookup target fid in current version
+        target_fid = get_fid_for_path(norm_target)
+
+        if target_fid is not None:
+            sym_fn_res = G.TE.set(m_file_name.table_id, (None, symlink_path))
+            sym_fnid = sym_fn_res[0]
+            te_set(t_id, (vid, sym_fnid, target_fid))
+            file_fid_cache[symlink_path] = target_fid
+            logger.info(f"Symlink aliased: '{symlink_path}' -> '{norm_target}' (fid {target_fid})")
+        else:
+            logger.info(
+                f"Symlink target '{norm_target}' not found in active tree; falling back to raw processing for '{symlink_path}'"
+            )
+            fallback_op = "A" if op == "U" else op
+            fallback_files.append(f"{fallback_op}\t{symlink_path}")
+
+    if fallback_files:
+        file_processing(0, 0, fallback_files)
+        for fb in fallback_files:
+            fb_path = fb.split("\t")[-1]
+            if fb_path in gp.ChangeSet_Dict:
+                cs_obj = gp.ChangeSet_Dict[fb_path]
+                cs_obj.execute()
+                extract_tags_and_evacuate_cs(cs_obj)
+
+    if override_symlinks is None and hasattr(gp, "Symlink_List") and gp.Symlink_List:
+        gp.Symlink_List.clear()
 
 
 def processing_git_commits(version: str) -> None:

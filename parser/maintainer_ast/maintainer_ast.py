@@ -18,7 +18,7 @@ from core.globalstuff import (
 )
 
 m_file_name = m_file = m_bridge_file = m_type_descriptor = m_ast = m_ast_container = None
-m_tag_code = m_tag = m_bridge_tag = m_map_ast = m_bridge_map = None
+m_tag_code = m_tag = m_bridge_tag = m_map_ast = m_bridge_map = m_moved_tag = None
 m_maintainer_person = m_maintainer_section = m_maintainer_member = None
 m_maintainer_pattern = m_maintainer_file = m_credits_entry = None
 from core.globalstuff import compute_code_hash
@@ -26,7 +26,7 @@ from core.globalstuff import compute_code_hash
 
 def _init_tables() -> None:
     global m_file_name, m_file, m_bridge_file, m_type_descriptor, m_ast, m_ast_container
-    global m_tag_code, m_tag, m_bridge_tag, m_map_ast, m_bridge_map
+    global m_tag_code, m_tag, m_bridge_tag, m_map_ast, m_bridge_map, m_moved_tag
     global m_maintainer_person, m_maintainer_section, m_maintainer_member
     global m_maintainer_pattern, m_maintainer_file, m_credits_entry
     if m_file_name is not None:
@@ -43,6 +43,7 @@ def _init_tables() -> None:
     m_bridge_tag = db_layout.m_bridge_tag
     m_map_ast = db_layout.m_map_ast
     m_bridge_map = db_layout.m_bridge_map
+    m_moved_tag = db_layout.m_moved_tag
     m_maintainer_person = db_layout.m_maintainer_person
     m_maintainer_section = db_layout.m_maintainer_section
     m_maintainer_member = db_layout.m_maintainer_member
@@ -191,6 +192,8 @@ class MaintainerManager:
                 1,
                 1,
                 section.raw_text,
+                ast_name=section.name,
+                ast_type=ASTT.Maintainer_Section,
             )
 
             # 3. Store Subsystem Section descriptor ONLY if new or changed
@@ -237,7 +240,17 @@ class MaintainerManager:
                             pattern.priority,
                         ))
 
-    def _tag_and_map(self, ast_ref: Any, line_s: int, line_e: int, char_s: int, char_e: int, code: str) -> Any:
+    def _tag_and_map(
+        self,
+        ast_ref: Any,
+        line_s: int,
+        line_e: int,
+        char_s: int,
+        char_e: int,
+        code: str,
+        ast_name: str | None = None,
+        ast_type: Any = None,
+    ) -> Any:
         """Create or recycle m_tag, m_bridge_tag, m_map_ast, and m_bridge_map entries."""
         CS = self.CS
         extent = Line(line_s, line_e)
@@ -283,10 +296,15 @@ class MaintainerManager:
                             ))
                         return tag_id
 
+        from parser.c_ast.c_ast import match_prior_tag_transition
+        s_tag_id = match_prior_tag_transition(CS, extent, ast_name, ast_type)
+
         with CS(REF_POS):
             CS.store(m_tag.set(*current_tag))
             tag_ref = ((m_tag.table_id, 0), OP_REF, (REF_POS, CS.route[-1]))
             CS.store(m_tag_code.get_set(code_hash, code))
+            if s_tag_id is not None:
+                CS.store(m_moved_tag.set(s_tag_id, tag_ref))
 
         with CS(REF_POS):
             CS.store(m_bridge_tag.set(
@@ -411,6 +429,8 @@ class CreditsManager:
                 1,
                 1,
                 entry.raw_text,
+                ast_name=entry.name,
+                ast_type=ASTT.Credits_Entry,
             )
 
             # 3. Deduplicate / Store Contributor Person in m_maintainer_person
@@ -437,7 +457,17 @@ class CreditsManager:
                         ast_ref,
                     ))
 
-    def _tag_and_map(self, ast_ref: Any, line_s: int, line_e: int, char_s: int, char_e: int, code: str) -> Any:
+    def _tag_and_map(
+        self,
+        ast_ref: Any,
+        line_s: int,
+        line_e: int,
+        char_s: int,
+        char_e: int,
+        code: str,
+        ast_name: str | None = None,
+        ast_type: Any = None,
+    ) -> Any:
         """Create or recycle m_tag, m_bridge_tag, m_map_ast, and m_bridge_map entries."""
         CS = self.CS
         extent = Line(line_s, line_e)
@@ -483,10 +513,15 @@ class CreditsManager:
                             ))
                         return tag_id
 
+        from parser.c_ast.c_ast import match_prior_tag_transition
+        s_tag_id = match_prior_tag_transition(CS, extent, ast_name, ast_type)
+
         with CS(REF_POS):
             CS.store(m_tag.set(*current_tag))
             tag_ref = ((m_tag.table_id, 0), OP_REF, (REF_POS, CS.route[-1]))
             CS.store(m_tag_code.get_set(code_hash, code))
+            if s_tag_id is not None:
+                CS.store(m_moved_tag.set(s_tag_id, tag_ref))
 
         with CS(REF_POS):
             CS.store(m_bridge_tag.set(

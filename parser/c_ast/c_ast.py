@@ -52,7 +52,9 @@ source files (.c, .h, .S) into relational database operations staged in a Change
   - `close_prior_tags(CS)`: Marks removed or modified tags closed as of `Old_VID`.
 ===============================================================================
 """
-from core.globalstuff import G, COLOR, REF_ROOT, REF_OLD, REF_C_AST, FILE_ERROR, configure_logging
+from __future__ import annotations
+from typing import Any
+from core.globalstuff import G, COLOR, REF_ROOT, REF_OLD, REF_C_AST, REF_POS, REF_NO_REF, FILE_ERROR, configure_logging, ASTT
 from parser.c_ast.c_ast_type import (
     ChangeSetType,
     m_v_main,
@@ -143,10 +145,13 @@ def process_c_ast(CS: ChangeSetType) -> None:
 
 def get_prior_tags(CS: ChangeSetType) -> None:
     """Query Table Engine for existing active AST tags registered in the previous version."""
-    from core.DBLayout import m_file_name, m_bridge_file, m_bridge_tag, m_tag
+    from core.DBLayout import m_file_name, m_bridge_file, m_bridge_tag, m_tag, m_ast
     CS.active_tag_list = set()
+    CS.transitioned_tag_list = set()
     CS.prior_tags = None
     CS.prior_tags_map = {}
+    CS.prior_tags_by_name = {}
+    CS.prior_tags_by_pos = []
 
     old_vid = getattr(CS.gp, "Old_VID", 0)
     if old_vid <= 0:
@@ -181,15 +186,131 @@ def get_prior_tags(CS: ChangeSetType) -> None:
     )
     if CS.prior_tags:
         CS.prior_tags_map = {}
+        CS.prior_tags_by_name = {}
+        CS.prior_tags_by_pos = []
         for x, tag in enumerate(CS.prior_tags):
+            line_s = tag[2]
+            line_e = tag[3]
+            tag_id = tag[1] if len(tag) > 1 else tag[0]
             if len(tag) > 9:
                 tag_hash = tag[9]
                 if tag_hash:
                     if tag_hash not in CS.prior_tags_map:
                         CS.prior_tags_map[tag_hash] = []
-                    tag_id = tag[1] if len(tag) > 1 else tag[0]
                     CS.prior_tags_map[tag_hash].append((x, tag_id))
+
+            ast_id = tag[10] if len(tag) > 10 else 0
+            ast_name = ""
+            ast_type = None
+            if ast_id:
+                ast_row = m_ast.get(ast_id, None, None)
+                if ast_row and len(ast_row) >= 3 and ast_row[2]:
+                    ast_name = ast_row[2][1]
+                    ast_type = ast_row[2][2]
+
+            if ast_name:
+                key = (ast_name, ast_type)
+                CS.prior_tags_by_name.setdefault(key, []).append((x, tag_id, line_s, line_e))
+                CS.prior_tags_by_name.setdefault(ast_name, []).append((x, tag_id, line_s, line_e))
+
+            CS.prior_tags_by_pos.append((line_s, line_e, x, tag_id, ast_name, ast_type))
     return
+
+
+def match_prior_tag_transition(
+    CS: ChangeSetType,
+    extent: Any,
+    ast_name: str | None = None,
+    ast_type: Any = None,
+) -> int | None:
+    """Find the best matching un-recycled prior tag for a modified code construct."""
+    if not getattr(CS, "prior_tags", None):
+        return None
+
+    transitioned = getattr(CS, "transitioned_tag_list", None)
+    if transitioned is None:
+        CS.transitioned_tag_list = set()
+        transitioned = CS.transitioned_tag_list
+
+    active = getattr(CS, "active_tag_list", set())
+    if isinstance(active, list):
+        active_set = set(active)
+    else:
+        active_set = active
+
+    line_s = 0
+    line_e = 0
+    if hasattr(extent, "line_pos") and extent.line_pos:
+        line_s = extent.line_pos[0]
+        line_e = extent.line_pos[1]
+    elif hasattr(extent, "line_s"):
+        line_s = getattr(extent, "line_s", 0)
+        line_e = getattr(extent, "line_e", line_s)
+    elif isinstance(extent, (tuple, list)) and len(extent) >= 2:
+        line_s = extent[0]
+        line_e = extent[1]
+
+    COMMENT_TYPES = {
+        int(ASTT.C_Comment),
+        int(ASTT.ASM_Comment),
+        int(ASTT.Kconfig_Comment),
+        int(ASTT.Rust_DocComment),
+        int(ASTT.Rust_Comment),
+    }
+    type_val = int(ast_type) if ast_type is not None else None
+    is_comment = type_val in COMMENT_TYPES
+
+    # 1. Named Construct Match (Structs, Functions, Enums, Typedefs, Macros, Symbols, Sections)
+    if ast_name and not is_comment:
+        by_name = getattr(CS, "prior_tags_by_name", {})
+        candidates = by_name.get((ast_name, type_val))
+        if not candidates:
+            candidates = by_name.get(ast_name)
+        if candidates:
+            for item in candidates:
+                idx, tag_id, p_ls, p_le = item
+                if idx not in active_set and idx not in transitioned:
+                    transitioned.add(idx)
+                    return tag_id
+        return None
+
+    # 2. Spatial Overlap Match (Comments & Unnamed Blocks)
+    by_pos = getattr(CS, "prior_tags_by_pos", [])
+    if by_pos and (line_s > 0 or line_e > 0):
+        best_match = None
+        best_overlap = -1
+        for p_ls, p_le, idx, tag_id, p_name, p_type in by_pos:
+            if idx in active_set or idx in transitioned:
+                continue
+            p_type_val = int(p_type) if p_type is not None else None
+            p_is_comment = p_type_val in COMMENT_TYPES
+            if is_comment:
+                if not p_is_comment:
+                    continue
+            else:
+                if p_is_comment:
+                    continue
+                if p_name:
+                    continue
+                if type_val is not None and p_type_val is not None and int(p_type_val) != type_val:
+                    continue
+
+            overlap_s = max(line_s, p_ls)
+            overlap_e = min(line_e, p_le)
+            if overlap_e >= overlap_s:
+                overlap = overlap_e - overlap_s + 1
+                if overlap > best_overlap:
+                    best_overlap = overlap
+                    best_match = (idx, tag_id)
+            elif abs(line_s - p_ls) <= 2 and best_overlap < 0:
+                best_match = (idx, tag_id)
+
+        if best_match:
+            idx, tag_id = best_match
+            transitioned.add(idx)
+            return tag_id
+
+    return None
 
 
 def close_prior_tags(CS: ChangeSetType) -> None:
@@ -201,15 +322,16 @@ def close_prior_tags(CS: ChangeSetType) -> None:
                 if x in CS.active_tag_list:
                     continue
                 if len(tag) >= 13:
-                    CS.store(m_tag.update(
-                        tag[6],          # m_tag.tag_id
-                        tag[7],          # m_tag.vid_s
-                        CS.gp.Old_VID,   # m_tag.vid_e (closed)
-                        tag[9],          # m_tag.hash
-                        tag[10],         # m_tag.ast_id
-                        tag[11],         # m_tag.hl_s
-                        tag[12],         # m_tag.hl_l
-                    ))
+                    with CS(REF_POS):
+                        CS.store(m_tag.update(
+                            tag[6],          # m_tag.tag_id
+                            tag[7],          # m_tag.vid_s
+                            CS.gp.Old_VID,   # m_tag.vid_e (closed)
+                            tag[9],          # m_tag.hash
+                            tag[10],         # m_tag.ast_id
+                            tag[11],         # m_tag.hl_s
+                            tag[12],         # m_tag.hl_l
+                        ))
     return
 
 

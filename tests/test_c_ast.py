@@ -20,7 +20,7 @@ from typing import Any
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from core.globalstuff import G, COLOR
+from core.globalstuff import G, COLOR, REF_OLD, REF_ROOT
 from core.GreatProcessor import GreatProcessor, CompressedChangeSetDict
 from core.FileHandler import MasterFile
 from core.TableHandling import ChangeSet
@@ -31,6 +31,7 @@ from core.DBLayout import (
     m_bridge_file,
     m_tag_code,
     m_tag,
+    m_moved_tag,
     m_bridge_tag,
     m_ast,
 )
@@ -43,52 +44,52 @@ from parser.c_ast.c_ast_type import safe_spelling, safe_cursor_spelling
 TEST_SUITE: list[dict[str, Any]] = [
     {
         "file": "include/linux/drbd_tag_magic.h",
-        "baseline_ast_ops": 265,
+        "baseline_ast_ops": 319,
         "description": "Kernel Header (drbd_tag_magic.h)",
     },
     {
         "file": "virt/kvm/iodev.h",
-        "baseline_ast_ops": 395,
+        "baseline_ast_ops": 462,
         "description": "Kernel Header (virt/kvm/iodev.h)",
     },
     {
         "file": "include/linux/lockd/bind.h",
-        "baseline_ast_ops": 220,
+        "baseline_ast_ops": 238,
         "description": "Kernel Header (lockd/bind.h)",
     },
     {
         "file": "include/linux/netfilter_bridge/ebtables.h",
-        "baseline_ast_ops": 1479,
+        "baseline_ast_ops": 1857,
         "description": "Kernel Header (ebtables.h)",
     },
     {
         "file": "drivers/watchdog/w83627hf_wdt.c",
-        "baseline_ast_ops": 1789,
+        "baseline_ast_ops": 1983,
         "description": "Watchdog Driver (Latin-1 byte 0xe1 resilience)",
     },
     {
         "file": "drivers/usb/storage/isd200.c",
-        "baseline_ast_ops": 8452,
+        "baseline_ast_ops": 9760,
         "description": "USB Storage Driver (Latin-1 byte 0xf6 resilience)",
     },
     {
         "file": "include/linux/sched.h",
-        "baseline_ast_ops": 13085,
+        "baseline_ast_ops": 14206,
         "description": "Kernel Header (sched.h)",
     },
     {
         "file": "arch/mips/include/asm/mach-cavium-octeon/kernel-entry-init.h",
-        "baseline_ast_ops": 70,
+        "baseline_ast_ops": 84,
         "description": "Assembly Header (kernel-entry-init.h)",
     },
     {
         "file": "arch/alpha/lib/clear_page.S",
-        "baseline_ast_ops": 145,
+        "baseline_ast_ops": 174,
         "description": "Assembly Source (clear_page.S)",
     },
     {
         "file": "arch/powerpc/xmon/ppc-opc.c",
-        "baseline_ast_ops": 7296,
+        "baseline_ast_ops": 8692,
         "description": "PowerPC Opcode Table & Large Initializer Array (ppc-opc.c)",
     },
 ]
@@ -292,6 +293,14 @@ def run_single_file_worker(item: dict[str, Any]) -> dict[str, Any]:
 class TestCASTParser(unittest.TestCase):
     """Unit test suite for Clang C-AST parser and ChangeSet execution."""
 
+    def tearDown(self) -> None:
+        if G.TE:
+            try:
+                G.TE.close()
+            except Exception:
+                pass
+        MockDB._global_store.clear()
+
     def test_multicore_ast_suite(self) -> None:
         """Run multi-core parallel C-AST parsing and ChangeSet.execute() validation."""
         num_cpus = os.cpu_count() or 4
@@ -425,7 +434,7 @@ class TestCASTParser(unittest.TestCase):
         """Verify parsing and ChangeSet execution with TEDirectDB."""
         item = {
             "file": "virt/kvm/iodev.h",
-            "baseline_ast_ops": 470,
+            "baseline_ast_ops": 448,
             "description": "Kernel Header (virt/kvm/iodev.h)",
             "table_engine": "direct",
         }
@@ -872,6 +881,7 @@ int process_item(struct item *it) {
         """Verify struct definitions with intermediate and trailing #ifdef/#endif parse cleanly without leaking declarators."""
         temp_dir = None
         try:
+            MockDB._global_store.clear()
             G.DEBUG_TYPECHECK = True
             G.DB = MockDB
             G.TE = get_table_engine("cached")()
@@ -923,7 +933,8 @@ struct task_struct {
             tag_codes = []
             for op in cs.cs:
                 if op[0] == m_tag_code.table_id:
-                    tag_codes.append(op[2][1])
+                    if len(op[2]) > 1 and op[2][1] is not None:
+                        tag_codes.append(op[2][1])
                 elif isinstance(op[0], tuple) and len(op) >= 3 and isinstance(op[2], tuple):
                     name = op[2][1] if len(op[2]) > 1 else None
                     if name:
@@ -940,6 +951,177 @@ struct task_struct {
             self.assertTrue(len(struct_tags) > 0)
             self.assertTrue(any("rcu_read_lock_nesting" in t for t in struct_tags))
         finally:
+            if G.TE:
+                try:
+                    G.TE.close()
+                except Exception:
+                    pass
+            MockDB._global_store.clear()
+            if temp_dir and os.path.exists(temp_dir):
+                shutil.rmtree(temp_dir, ignore_errors=True)
+
+    def test_struct_function_pointer_members(self) -> None:
+        """Verify struct definitions with function pointers (e.g. struct nlmsvc_binding) produce exact member containers."""
+        temp_dir = None
+        try:
+            MockDB._global_store.clear()
+            G.DEBUG_TYPECHECK = True
+            G.DB = MockDB
+            G.TE = get_table_engine("cached")()
+            gp = GreatProcessor()
+            init_db_layout(gp)
+            G.TE.start(gp.Table_Array, G.DB)
+
+            mf = MasterFile()
+            temp_dir = mf.create_temp_dir()
+            mf.version_dict["v3.0"] = temp_dir
+            G.MF = mf
+            gp.Version_Name = "v3.0"
+            gp.VID = 1
+
+            file_path = "include/linux/lockd/bind.h"
+            full_path = os.path.join(temp_dir, file_path)
+            os.makedirs(os.path.dirname(full_path), exist_ok=True)
+            file_content = subprocess.check_output(
+                ["git", "-C", "linux", "show", f"v3.0:{file_path}"],
+                stderr=subprocess.PIPE,
+            )
+            with open(full_path, "wb") as f:
+                f.write(file_content)
+
+            cs = ChangeSet(f"A\t{file_path}")
+            cs.current_vid = 1
+            cs.gp = gp
+            cs.mf = mf
+            G.CURRENT_PARSING_FILE = file_path
+
+            default_processing(cs, gp)
+            cs.parse()
+            self.assertTrue(cs.execute())
+            G.TE.commit_all()
+
+            from core.globalstuff import ASTT
+            mock_containers = MockDB._global_store.get("m_ast_container", {})
+            mock_asts = MockDB._global_store.get("m_ast", {})
+
+            # Find nlmsvc_binding struct definition AST ID
+            nlmsvc_ast_id = None
+            for ast_row in mock_asts.values():
+                if ast_row[1] == "nlmsvc_binding" and ast_row[2] == ASTT.C_structdecl:
+                    nlmsvc_ast_id = ast_row[0]
+                    break
+
+            self.assertIsNotNone(nlmsvc_ast_id, "struct nlmsvc_binding C_structdecl not found in m_ast")
+
+            # Must have exactly 2 m_ast_container entries: fopen and fclose
+            nlmsvc_containers = [
+                row for row in mock_containers.values() if row[0] == nlmsvc_ast_id
+            ]
+            nlmsvc_containers.sort(key=lambda r: r[1])
+            self.assertEqual(len(nlmsvc_containers), 2, f"Expected 2 containers for nlmsvc_binding, got {len(nlmsvc_containers)}: {nlmsvc_containers}")
+
+            ref_ast_0 = mock_asts.get(nlmsvc_containers[0][3])
+            ref_ast_1 = mock_asts.get(nlmsvc_containers[1][3])
+            self.assertIsNotNone(ref_ast_0)
+            self.assertIsNotNone(ref_ast_1)
+            self.assertEqual(ref_ast_0[1], "fopen")
+            self.assertEqual(ref_ast_1[1], "fclose")
+
+            # Check nlmclnt_initdata has exactly 6 containers
+            initdata_ast_id = None
+            for ast_row in mock_asts.values():
+                if ast_row[1] == "nlmclnt_initdata" and ast_row[2] == ASTT.C_structdecl:
+                    initdata_ast_id = ast_row[0]
+                    break
+
+            self.assertIsNotNone(initdata_ast_id, "struct nlmclnt_initdata C_structdecl not found in m_ast")
+            initdata_containers = [
+                row for row in mock_containers.values() if row[0] == initdata_ast_id
+            ]
+            initdata_containers.sort(key=lambda r: r[1])
+            self.assertEqual(len(initdata_containers), 6, f"Expected 6 containers for nlmclnt_initdata, got {len(initdata_containers)}: {initdata_containers}")
+            initdata_member_names = [mock_asts[r[3]][1] for r in initdata_containers]
+            self.assertEqual(initdata_member_names, ["hostname", "address", "addrlen", "protocol", "nfs_version", "noresvport"])
+        finally:
+            if G.TE:
+                try:
+                    G.TE.close()
+                except Exception:
+                    pass
+            MockDB._global_store.clear()
+            if temp_dir and os.path.exists(temp_dir):
+                shutil.rmtree(temp_dir, ignore_errors=True)
+
+    def test_struct_typedef_members(self) -> None:
+        """Verify struct definitions with multiple typedef members extract all fields into m_ast_container."""
+        temp_dir = None
+        try:
+            MockDB._global_store.clear()
+            G.DEBUG_TYPECHECK = True
+            G.DB = MockDB
+            G.TE = get_table_engine("cached")()
+            gp = GreatProcessor()
+            init_db_layout(gp)
+            G.TE.start(gp.Table_Array, G.DB)
+
+            mf = MasterFile()
+            temp_dir = mf.create_temp_dir()
+            mf.version_dict["v3.0"] = temp_dir
+            G.MF = mf
+            gp.Version_Name = "v3.0"
+            gp.VID = 1
+
+            file_path = "test_typedef_members.c"
+            full_path = os.path.join(temp_dir, file_path)
+            snippet = """
+typedef unsigned long size_t;
+typedef unsigned int u32;
+typedef unsigned long long u64;
+
+struct custom_data {
+    size_t size;
+    u32 flags;
+    u64 offset;
+    int status;
+};
+"""
+            with open(full_path, "w") as f:
+                f.write(snippet)
+
+            cs = ChangeSet(f"A\t{file_path}")
+            cs.current_vid = 1
+            cs.gp = gp
+            cs.mf = mf
+            G.CURRENT_PARSING_FILE = file_path
+
+            default_processing(cs, gp)
+            cs.parse()
+            self.assertTrue(cs.execute())
+            G.TE.commit_all()
+
+            from core.globalstuff import ASTT
+            mock_containers = MockDB._global_store.get("m_ast_container", {})
+            mock_asts = MockDB._global_store.get("m_ast", {})
+
+            struct_ast_id = None
+            for ast_row in mock_asts.values():
+                if ast_row[1] == "custom_data" and ast_row[2] == ASTT.C_structdecl:
+                    struct_ast_id = ast_row[0]
+                    break
+
+            self.assertIsNotNone(struct_ast_id, "struct custom_data not found in m_ast")
+            containers = [r for r in mock_containers.values() if r[0] == struct_ast_id]
+            containers.sort(key=lambda r: r[1])
+            self.assertEqual(len(containers), 4)
+            names = [mock_asts[r[3]][1] for r in containers]
+            self.assertEqual(names, ["size", "flags", "offset", "status"])
+        finally:
+            if G.TE:
+                try:
+                    G.TE.close()
+                except Exception:
+                    pass
+            MockDB._global_store.clear()
             if temp_dir and os.path.exists(temp_dir):
                 shutil.rmtree(temp_dir, ignore_errors=True)
 
@@ -999,6 +1181,220 @@ struct task_struct {
         self.assertEqual(res["mismatches_count"], 0)
         self.assertEqual(res["uncovered_non_ws"], 0)
         self.assertEqual(res["coverage_ratio"], 1.0)
+
+    def test_tag_lineage_struct_and_comment_modification(self) -> None:
+        """Verify modifying a struct and comment records lineage in m_moved_tag and closes prior tags."""
+        temp_dir_v1 = None
+        temp_dir_v2 = None
+        try:
+            G.DEBUG_TYPECHECK = True
+            G.DB = MockDB
+            G.TE = get_table_engine("cached")()
+            gp = GreatProcessor()
+            init_db_layout(gp)
+            G.TE.start(gp.Table_Array, G.DB)
+
+            mf = MasterFile()
+            temp_dir_v1 = mf.create_temp_dir()
+            mf.version_dict["v3.0"] = temp_dir_v1
+            G.MF = mf
+            gp.Version_Name = "v3.0"
+            gp.VID = 1
+
+            file_path = "include/linux/test_binding.h"
+            full_path_v1 = os.path.join(temp_dir_v1, file_path)
+            os.makedirs(os.path.dirname(full_path_v1), exist_ok=True)
+            snippet_v1 = """/* Initial lockd binding */
+struct nlmsvc_binding {
+    int id;
+    void (*fclose)(void);
+};
+"""
+            with open(full_path_v1, "w") as f:
+                f.write(snippet_v1)
+
+            cs1 = ChangeSet(f"A\t{file_path}")
+            cs1.current_vid = 1
+            cs1.gp = gp
+            cs1.mf = mf
+            G.CURRENT_PARSING_FILE = file_path
+
+            default_processing(cs1, gp)
+            cs1.parse()
+            self.assertTrue(cs1.execute())
+            G.TE.commit_all()
+
+            # Record tags created in v1
+            v1_tags = {row[0]: row for row in MockDB._global_store.get("m_tag", {}).values()}
+            self.assertGreaterEqual(len(v1_tags), 2, "Expected at least comment and struct tags in v1")
+
+            # --- Version 2: Modified struct and comment ---
+            temp_dir_v2 = mf.create_temp_dir()
+            mf.version_dict["v3.1"] = temp_dir_v2
+            gp.Version_Name = "v3.1"
+            gp.VID = 2
+            gp.Old_VID = 1
+
+            full_path_v2 = os.path.join(temp_dir_v2, file_path)
+            os.makedirs(os.path.dirname(full_path_v2), exist_ok=True)
+            snippet_v2 = """/* Updated lockd binding with flags */
+struct nlmsvc_binding {
+    int id;
+    int flags;
+    void (*fclose)(void);
+};
+"""
+            with open(full_path_v2, "w") as f:
+                f.write(snippet_v2)
+
+            cs2 = ChangeSet(f"M\t{file_path}")
+            cs2.current_vid = 2
+            cs2.gp = gp
+            cs2.mf = mf
+            G.CURRENT_PARSING_FILE = file_path
+
+            cs2.store(m_file_name.get_set(None, cs2.current_path))
+            with cs2(REF_OLD):
+                cs2.store(m_bridge_file.view(
+                    ((m_bridge_file.fnid, m_file_name.fnid, 1),),
+                    1,
+                    cs2.ref(m_file_name.fnid, REF_ROOT),
+                    None,
+                    None,
+                    cs2.current_path,
+                ))
+                cs2.store(m_file.update(cs2.ref(m_bridge_file.fid), None, 1, None, None, "M"))
+            cs2.store(m_file.set(None, 2, 0, 1, "M", 0))
+            cs2.store(m_bridge_file.set(2, cs2.ref(m_file_name.fnid), cs2.ref(m_file.fid)))
+
+            cs2.parse()
+            self.assertTrue(cs2.execute())
+            G.TE.commit_all()
+
+            # Verify m_moved_tag entries exist linking v1 tags to v2 tags
+            moved_tags = MockDB._global_store.get("m_moved_tag", {})
+            self.assertGreaterEqual(len(moved_tags), 2, f"Expected at least 2 m_moved_tag records, got {len(moved_tags)}")
+
+            # Verify that each moved tag's s_tag_id belongs to v1 tags, and was marked closed (vid_e = 1)
+            v2_tag_by_id = {}
+            for (t_id, v_s), row in MockDB._global_store.get("m_tag", {}).items():
+                v2_tag_by_id.setdefault(t_id, {})[v_s] = row
+
+            for (s_tag_id, e_tag_id), row in moved_tags.items():
+                self.assertIn(s_tag_id, v1_tags, f"Source tag {s_tag_id} should have been from v1")
+                old_tag_row = v2_tag_by_id.get(s_tag_id, {}).get(1)
+                self.assertIsNotNone(old_tag_row)
+                self.assertEqual(old_tag_row[2], 1, f"Superseded tag {s_tag_id} should have vid_e = 1")
+                new_tag_row = v2_tag_by_id.get(e_tag_id, {}).get(2)
+                self.assertIsNotNone(new_tag_row)
+                self.assertEqual(new_tag_row[1], 2, f"New tag {e_tag_id} should have vid_s = 2")
+                self.assertEqual(new_tag_row[2], 0, f"New tag {e_tag_id} should have vid_e = 0")
+        finally:
+            if mf:
+                mf.clear_all_version()
+
+    def test_tag_lineage_unchanged_tags_recycled_without_movement(self) -> None:
+        """Verify identical tags are recycled across versions without creating m_moved_tag records."""
+        temp_dir_v1 = None
+        temp_dir_v2 = None
+        try:
+            G.DEBUG_TYPECHECK = True
+            G.DB = MockDB
+            G.TE = get_table_engine("cached")()
+            gp = GreatProcessor()
+            init_db_layout(gp)
+            G.TE.start(gp.Table_Array, G.DB)
+
+            mf = MasterFile()
+            temp_dir_v1 = mf.create_temp_dir()
+            mf.version_dict["v3.0"] = temp_dir_v1
+            G.MF = mf
+            gp.Version_Name = "v3.0"
+            gp.VID = 1
+
+            file_path = "include/linux/test_recycle.h"
+            full_path_v1 = os.path.join(temp_dir_v1, file_path)
+            os.makedirs(os.path.dirname(full_path_v1), exist_ok=True)
+            snippet_v1 = """/* Constant config */
+struct config_static {
+    int mode;
+};
+
+struct config_dynamic {
+    int threshold;
+};
+"""
+            with open(full_path_v1, "w") as f:
+                f.write(snippet_v1)
+
+            cs1 = ChangeSet(f"A\t{file_path}")
+            cs1.current_vid = 1
+            cs1.gp = gp
+            cs1.mf = mf
+            G.CURRENT_PARSING_FILE = file_path
+
+            default_processing(cs1, gp)
+            cs1.parse()
+            self.assertTrue(cs1.execute())
+            G.TE.commit_all()
+
+            # --- Version 2: Only config_dynamic modified, config_static & comment unchanged ---
+            temp_dir_v2 = mf.create_temp_dir()
+            mf.version_dict["v3.1"] = temp_dir_v2
+            gp.Version_Name = "v3.1"
+            gp.VID = 2
+            gp.Old_VID = 1
+
+            full_path_v2 = os.path.join(temp_dir_v2, file_path)
+            os.makedirs(os.path.dirname(full_path_v2), exist_ok=True)
+            snippet_v2 = """/* Constant config */
+struct config_static {
+    int mode;
+};
+
+struct config_dynamic {
+    int threshold;
+    int max_limit;
+};
+"""
+            with open(full_path_v2, "w") as f:
+                f.write(snippet_v2)
+
+            cs2 = ChangeSet(f"M\t{file_path}")
+            cs2.current_vid = 2
+            cs2.gp = gp
+            cs2.mf = mf
+            G.CURRENT_PARSING_FILE = file_path
+
+            cs2.store(m_file_name.get_set(None, cs2.current_path))
+            with cs2(REF_OLD):
+                cs2.store(m_bridge_file.view(
+                    ((m_bridge_file.fnid, m_file_name.fnid, 1),),
+                    1,
+                    cs2.ref(m_file_name.fnid, REF_ROOT),
+                    None,
+                    None,
+                    cs2.current_path,
+                ))
+                cs2.store(m_file.update(cs2.ref(m_bridge_file.fid), None, 1, None, None, "M"))
+            cs2.store(m_file.set(None, 2, 0, 1, "M", 0))
+            cs2.store(m_bridge_file.set(2, cs2.ref(m_file_name.fnid), cs2.ref(m_file.fid)))
+
+            cs2.parse()
+            self.assertTrue(cs2.execute())
+            G.TE.commit_all()
+
+            # Verify m_moved_tag was staged ONLY for config_dynamic and its modified field threshold
+            moved_tags = MockDB._global_store.get("m_moved_tag", {})
+            self.assertEqual(len(moved_tags), 2, f"Expected exactly 2 moved tags (config_dynamic and threshold), got {len(moved_tags)}")
+            moved_s_ids = {s_id for (s_id, e_id) in moved_tags}
+            # Tags 1 (comment), 2 (mode), 3 (config_static) should NOT be moved
+            self.assertNotIn(1, moved_s_ids, "Comment tag must not be moved")
+            self.assertNotIn(2, moved_s_ids, "config_static field mode must not be moved")
+            self.assertNotIn(3, moved_s_ids, "config_static struct must not be moved")
+        finally:
+            if mf:
+                mf.clear_all_version()
 
 
 

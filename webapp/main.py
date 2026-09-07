@@ -189,7 +189,7 @@ class DatabaseManager:
                     charset="utf8mb4",
                     collation="utf8mb4_bin",
                     autocommit=True,
-                    connection_timeout=10,
+                    connection_timeout=int(os.getenv("MYSQL_TIMEOUT", "10")),
                 )
                 self.database = db_name
                 logger.info("Connected to MySQL at %s:%d/%s", self.host, self.port, self.database)
@@ -216,7 +216,7 @@ class DatabaseManager:
                 database=self.database,
                 charset="utf8mb4",
                 collation="utf8mb4_bin",
-                connection_timeout=10,
+                connection_timeout=int(os.getenv("MYSQL_TIMEOUT", "10")),
             )
         except Exception as e:
             logger.error("Error connecting to MySQL: %s", e)
@@ -1090,6 +1090,15 @@ def get_tag_by_id(tag_id: int) -> dict[str, Any]:
             for r in cursor.fetchall()
         ]
 
+        # Fetch moved_from / moved_to relationships if available
+        cursor.execute("SELECT s_tag_id FROM m_moved_tag WHERE e_tag_id = %s LIMIT 1;", (tag_id,))
+        moved_from_row = cursor.fetchone()
+        moved_from = moved_from_row[0] if moved_from_row else None
+
+        cursor.execute("SELECT e_tag_id FROM m_moved_tag WHERE s_tag_id = %s LIMIT 1;", (tag_id,))
+        moved_to_row = cursor.fetchone()
+        moved_to = moved_to_row[0] if moved_to_row else None
+
         cursor.close()
         cnx.close()
         return {
@@ -1109,6 +1118,8 @@ def get_tag_by_id(tag_id: int) -> dict[str, Any]:
             "ast_type_id": tag_row[13],
             "ast_type_name": safe_decode(tag_row[14]),
             "ast_raw": safe_decode(tag_row[15]),
+            "moved_from": moved_from,
+            "moved_to": moved_to,
             "maps": maps,
         }
     except HTTPException:
@@ -1144,6 +1155,93 @@ def _compute_structured_diff(old_code: str, new_code: str) -> list[dict[str, Any
     return diff_res
 
 
+def _resolve_tag_lineage(cursor, tag_id: int) -> set[int]:
+    """Resolve all connected tag_ids across versions via m_moved_tag and symbol fallback."""
+    lineage: set[int] = {tag_id}
+    queue: list[int] = [tag_id]
+
+    # 1. Bidirectional BFS traversal across m_moved_tag
+    while queue:
+        curr = queue.pop(0)
+        # Backward traversal: curr is e_tag_id (descendant), find s_tag_id (ancestor)
+        cursor.execute("SELECT s_tag_id FROM m_moved_tag WHERE e_tag_id = %s;", (curr,))
+        for (parent,) in cursor.fetchall():
+            if parent not in lineage:
+                lineage.add(parent)
+                queue.append(parent)
+        # Forward traversal: curr is s_tag_id (ancestor), find e_tag_id (descendant)
+        cursor.execute("SELECT e_tag_id FROM m_moved_tag WHERE s_tag_id = %s;", (curr,))
+        for (child,) in cursor.fetchall():
+            if child not in lineage:
+                lineage.add(child)
+                queue.append(child)
+
+    # 2. Fallback / Lineage Gap Healing via AST Symbol Matching
+    # If m_moved_tag didn't link transitions, or to bridge gaps in historical records
+    cursor.execute(
+        """
+        SELECT fn.fname, a.name, a.type_id
+        FROM m_tag t
+        JOIN m_ast a ON t.ast_id = a.ast_id
+        JOIN m_bridge_tag bt ON t.tag_id = bt.tag_id
+        JOIN m_bridge_file bf ON bt.fid = bf.fid
+        JOIN m_file_name fn ON bf.fnid = fn.fnid
+        WHERE t.tag_id = %s
+        LIMIT 1;
+        """,
+        (tag_id,),
+    )
+    sym_info = cursor.fetchone()
+    if sym_info:
+        fname = safe_decode(sym_info[0]) or ""
+        ast_name = safe_decode(sym_info[1]) or ""
+        ast_type_id = sym_info[2]
+
+        if fname and ast_name and not ast_name.startswith("<anonymous"):
+            cursor.execute(
+                """
+                SELECT DISTINCT t.tag_id, t.vid_s, t.vid_e
+                FROM m_tag t
+                JOIN m_ast a ON t.ast_id = a.ast_id
+                JOIN m_bridge_tag bt ON t.tag_id = bt.tag_id
+                JOIN m_bridge_file bf ON bt.fid = bf.fid
+                JOIN m_file_name fn ON bf.fnid = fn.fnid
+                WHERE fn.fname = %s
+                  AND a.name = %s
+                  AND a.type_id = %s
+                ORDER BY t.vid_s ASC;
+                """,
+                (fname, ast_name, ast_type_id),
+            )
+            cand_rows = cursor.fetchall()
+
+            # Inspect active version intervals of existing lineage
+            placeholders = ", ".join(["%s"] * len(lineage))
+            cursor.execute(
+                f"SELECT tag_id, vid_s, vid_e FROM m_tag WHERE tag_id IN ({placeholders});",
+                tuple(lineage),
+            )
+            existing_ranges = [(r[1], r[2] if r[2] > 0 else 999999) for r in cursor.fetchall()]
+
+            for cand_id, c_vid_s, c_vid_e in cand_rows:
+                if cand_id in lineage:
+                    continue
+                c_end = c_vid_e if c_vid_e > 0 else 999999
+                # Check for interval overlap with any existing tag in lineage
+                overlap = any(max(c_vid_s, ex_s) <= min(c_end, ex_e) for ex_s, ex_e in existing_ranges)
+                if not overlap:
+                    lineage.add(cand_id)
+                    existing_ranges.append((c_vid_s, c_end))
+                    cursor.execute("SELECT s_tag_id FROM m_moved_tag WHERE e_tag_id = %s;", (cand_id,))
+                    for (p,) in cursor.fetchall():
+                        lineage.add(p)
+                    cursor.execute("SELECT e_tag_id FROM m_moved_tag WHERE s_tag_id = %s;", (cand_id,))
+                    for (c,) in cursor.fetchall():
+                        lineage.add(c)
+
+    return lineage
+
+
 @app.get("/api/tag/{tag_id}/timeline")
 def get_tag_timeline(tag_id: int) -> dict[str, Any]:
     """Fetch cross-version code evolution history, timeline snapshots, diffs, and commit contexts for a tag."""
@@ -1159,9 +1257,13 @@ def get_tag_timeline(tag_id: int) -> dict[str, Any]:
         version_dict: dict[int, str] = {r[0]: safe_decode(r[1]) for r in all_versions_rows}
         version_list = [{"vid": r[0], "vname": safe_decode(r[1])} for r in all_versions_rows]
 
-        # 2. Fetch all tag revisions for this tag_id
+        # 2. Resolve complete tag lineage across versions
+        lineage_tag_ids = _resolve_tag_lineage(cursor, tag_id)
+        placeholders = ", ".join(["%s"] * len(lineage_tag_ids))
+        lineage_tuple = tuple(lineage_tag_ids)
+
         cursor.execute(
-            """
+            f"""
             SELECT t.tag_id, t.vid_s, t.vid_e, tc.code, t.ast_id, t.hl_s, t.hl_l,
                    a.name AS ast_name, a.type_id AS ast_type_id, td.name AS ast_type_name,
                    ad.ast_raw
@@ -1170,10 +1272,10 @@ def get_tag_timeline(tag_id: int) -> dict[str, Any]:
             JOIN m_ast a ON t.ast_id = a.ast_id
             LEFT JOIN m_type_descriptor td ON a.type_id = td.type_id
             LEFT JOIN m_ast_debug ad ON a.ast_id = ad.ast_id
-            WHERE t.tag_id = %s
+            WHERE t.tag_id IN ({placeholders})
             ORDER BY t.vid_s ASC;
             """,
-            (tag_id,),
+            lineage_tuple,
         )
         tag_revisions = cursor.fetchall()
         if not tag_revisions:
@@ -1181,17 +1283,19 @@ def get_tag_timeline(tag_id: int) -> dict[str, Any]:
             cnx.close()
             raise HTTPException(status_code=404, detail=f"Tag tag_id={tag_id} not found")
 
-        # 3. Fetch spatial coordinates and file path info
+        revisions_by_id = {r[0]: r for r in tag_revisions}
+
+        # 3. Fetch spatial coordinates and file path info across lineage
         cursor.execute(
-            """
-            SELECT bt.fid, bt.line_s, bt.line_e, bt.char_s, bt.char_e, fn.fname, bf.vid
+            f"""
+            SELECT bt.fid, bt.line_s, bt.line_e, bt.char_s, bt.char_e, fn.fname, bf.vid, bt.tag_id
             FROM m_bridge_tag bt
             LEFT JOIN m_bridge_file bf ON bt.fid = bf.fid
             LEFT JOIN m_file_name fn ON bf.fnid = fn.fnid
-            WHERE bt.tag_id = %s
+            WHERE bt.tag_id IN ({placeholders})
             ORDER BY bf.vid ASC;
             """,
-            (tag_id,),
+            lineage_tuple,
         )
         loc_rows = cursor.fetchall()
         loc_by_vid: dict[int, dict[str, Any]] = {}
@@ -1201,7 +1305,7 @@ def get_tag_timeline(tag_id: int) -> dict[str, Any]:
         for lr in loc_rows:
             v_id = lr[6]
             fname_val = safe_decode(lr[5]) or ""
-            if not primary_fname and fname_val:
+            if (lr[7] == tag_id or not primary_fname) and fname_val:
                 primary_fname = fname_val
                 primary_line_s = lr[1] or 1
                 primary_line_e = lr[2] or primary_line_s
@@ -1212,33 +1316,39 @@ def get_tag_timeline(tag_id: int) -> dict[str, Any]:
                 "char_s": lr[3],
                 "char_e": lr[4],
                 "fname": fname_val,
+                "tag_id": lr[7],
             }
 
-        # 4. Fetch commits associated with this tag
+        # 4. Fetch commits associated with tags across lineage
         cursor.execute(
-            """
+            f"""
             SELECT bct.vid, bct.commit_id, c.commit_hash, c.subject, c.author_date,
                    p.name, p.email
             FROM m_bridge_commit_tag bct
             JOIN m_commit c ON bct.commit_id = c.commit_id
             LEFT JOIN m_bridge_commit_person bcp ON c.commit_id = bcp.commit_id AND bcp.role_type = 1
             LEFT JOIN m_maintainer_person p ON bcp.person_id = p.person_id
-            WHERE bct.tag_id = %s
+            WHERE bct.tag_id IN ({placeholders})
             ORDER BY c.author_date ASC;
             """,
-            (tag_id,),
+            lineage_tuple,
         )
         commit_rows = cursor.fetchall()
         commits_by_vid = defaultdict(list)
+        seen_commits_by_vid = defaultdict(set)
         for cr in commit_rows:
-            commits_by_vid[cr[0]].append({
-                "commit_id": cr[1],
-                "commit_hash": safe_decode(cr[2]),
-                "subject": safe_decode(cr[3]),
-                "author_date": str(cr[4]) if cr[4] else None,
-                "author_name": safe_decode(cr[5]) or "Unknown",
-                "author_email": safe_decode(cr[6]) or "",
-            })
+            v_id = cr[0]
+            commit_id = cr[1]
+            if commit_id not in seen_commits_by_vid[v_id]:
+                seen_commits_by_vid[v_id].add(commit_id)
+                commits_by_vid[v_id].append({
+                    "commit_id": commit_id,
+                    "commit_hash": safe_decode(cr[2]),
+                    "subject": safe_decode(cr[3]),
+                    "author_date": str(cr[4]) if cr[4] else None,
+                    "author_name": safe_decode(cr[5]) or "Unknown",
+                    "author_email": safe_decode(cr[6]) or "",
+                })
 
         cursor.close()
         cnx.close()
@@ -1253,7 +1363,7 @@ def get_tag_timeline(tag_id: int) -> dict[str, Any]:
 
         # If version_list is empty, synthesize versions from tag_revisions
         if not version_list:
-            v_ids = sorted(list(set([r[1] for r in tag_revisions] + [r[2] for r in tag_revisions if r[2] and r[2] > 0])))
+            v_ids = sorted(set([r[1] for r in tag_revisions] + [r[2] for r in tag_revisions if r[2] and r[2] > 0]))
             version_list = [{"vid": vid, "vname": f"v{vid}"} for vid in v_ids]
             version_dict = {v["vid"]: v["vname"] for v in version_list}
 
@@ -1267,14 +1377,20 @@ def get_tag_timeline(tag_id: int) -> dict[str, Any]:
 
             # Find matching tag revision active in v_id
             active_rev = None
-            for rev in tag_revisions:
-                vid_s = rev[1]
-                vid_e = rev[2]
-                if vid_s <= v_id and (vid_e == 0 or vid_e >= v_id):
-                    active_rev = rev
-                    break
+            loc_info = loc_by_vid.get(v_id) or {}
+            if loc_info.get("tag_id") and loc_info["tag_id"] in revisions_by_id:
+                active_rev = revisions_by_id[loc_info["tag_id"]]
+            else:
+                for rev in tag_revisions:
+                    vid_s = rev[1]
+                    vid_e = rev[2]
+                    if vid_s <= v_id and (vid_e == 0 or vid_e >= v_id):
+                        active_rev = rev
+                        break
 
-            loc_info = loc_by_vid.get(v_id) or (list(loc_by_vid.values())[0] if loc_by_vid else {})
+            if not loc_info:
+                loc_info = next(iter(loc_by_vid.values())) if loc_by_vid else {}
+
             commit_list = commits_by_vid.get(v_id, [])
 
             if active_rev:
@@ -1309,6 +1425,7 @@ def get_tag_timeline(tag_id: int) -> dict[str, Any]:
                 timeline.append({
                     "vid": v_id,
                     "vname": v_name,
+                    "tag_id": active_rev[0],
                     "is_active": True,
                     "status": status,
                     "code": code_text,
@@ -1343,9 +1460,11 @@ def get_tag_timeline(tag_id: int) -> dict[str, Any]:
                     diff_ops = []
                     lines_removed = 0
 
+                ref_rev = revisions_by_id.get(tag_id) or tag_revisions[0]
                 timeline.append({
                     "vid": v_id,
                     "vname": v_name,
+                    "tag_id": None,
                     "is_active": False,
                     "status": "deleted",
                     "code": "",
@@ -1353,10 +1472,10 @@ def get_tag_timeline(tag_id: int) -> dict[str, Any]:
                     "diff": diff_ops,
                     "lines_added": 0,
                     "lines_removed": lines_removed,
-                    "ast_id": tag_revisions[0][4],
-                    "ast_name": safe_decode(tag_revisions[0][7]) or "",
-                    "ast_type_id": tag_revisions[0][8],
-                    "ast_type_name": safe_decode(tag_revisions[0][9]) or "",
+                    "ast_id": ref_rev[4],
+                    "ast_name": safe_decode(ref_rev[7]) or "",
+                    "ast_type_id": ref_rev[8],
+                    "ast_type_name": safe_decode(ref_rev[9]) or "",
                     "ast_raw": None,
                     "vid_s": 0,
                     "vid_e": 0,
@@ -1372,17 +1491,18 @@ def get_tag_timeline(tag_id: int) -> dict[str, Any]:
                 })
                 prev_code = None
 
-        first_rev = tag_revisions[0]
+        req_rev = revisions_by_id.get(tag_id) or tag_revisions[0]
         return {
             "tag_id": tag_id,
-            "ast_id": first_rev[4],
-            "ast_name": safe_decode(first_rev[7]) or "Anonymous",
-            "ast_type_id": first_rev[8],
-            "ast_type_name": safe_decode(first_rev[9]) or "Undefined",
+            "lineage_tag_ids": sorted(list(lineage_tag_ids)),
+            "ast_id": req_rev[4],
+            "ast_name": safe_decode(req_rev[7]) or "Anonymous",
+            "ast_type_id": req_rev[8],
+            "ast_type_name": safe_decode(req_rev[9]) or "Undefined",
             "file_path": primary_fname,
             "total_versions": len(timeline),
             "total_mutations": total_mutations,
-            "introduced_version": introduced_version or (version_dict.get(first_rev[1], f"VID {first_rev[1]}")),
+            "introduced_version": introduced_version or (version_dict.get(min_vid_s, f"VID {min_vid_s}")),
             "latest_version": latest_version,
             "timeline": timeline,
         }

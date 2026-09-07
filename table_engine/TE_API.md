@@ -156,6 +156,7 @@ Internal helper methods used exclusively by `TECachedDB` to synchronize in-memor
     - Returns `row`.
   - **Case 3 (Explicit Primary Key Provided)**:
     - Extracts `pk = itemgetter(*table.primary)(columns)`.
+    - **O(1) Fast-Path (Rule 16)**: In `TECachedDB`, if `pk in _pk_index[table_id]`, checks if the projected row matches the cached row. If identical, returns `columns` immediately in $O(1)$ without re-indexing, memory allocations, or linear scans.
     - Stages `queued_set[table_id][pk] = columns`.
     - In `TECachedDB`: Unindexes any old row matching `pk`, appends `columns` to `_cached_rows`, and calls `_index_row()`.
     - Returns `columns`.
@@ -230,7 +231,7 @@ Internal helper methods used exclusively by `TECachedDB` to synchronize in-memor
   - If `hasattr(self.db, "commit_tables_parallel")`, dispatches to `self.db.commit_tables_parallel(tables_data, max_workers=max_workers)`.
   - Fallback: Sequentially calls `self.db.insert()` and `self.db.update()` for all tables with pending payloads.
   - Clears `queued_set` and `queued_update` buffers across all tables.
-  - **In-Memory Index Teardown**: If `update_in_mem_indexes=False` in `TECachedDB`, immediately invokes `self.clear_cache()` to evacuate all cached rows, position maps, and indices from memory, avoiding redundant post-commit index synchronization before engine closure.
+  - **In-Memory Index Teardown (Rule 17)**: If `update_in_mem_indexes=False` in `TECachedDB`, immediately invokes `self.clear_cache()` to evacuate all cached rows, position maps, and indices from memory, avoiding redundant post-commit index synchronization before engine closure.
 
 ---
 
@@ -256,4 +257,7 @@ Any backend passed to `TableEngine` must implement:
 4. **Tuple Immutability**: All returned and cached rows must be immutable tuples of primitive `SafeDataType`.
 5. **Strict Upstream Deduplication**: Existing records in database/cache must be reused without allocating new sequence IDs, and strict `INSERT INTO` must be maintained at the database layer.
 6. **B+Tree Clustered Index Insertion Ordering**: For tables using random cryptographic hashes (`BINARY(32)`) as Primary Keys (`m_tag_code`, `m_ast_hash`), batch insert payloads should maintain sorted primary key ordering to minimize InnoDB page splits and buffer pool thrashing.
+7. **Public Engine Invariant (Rule 15)**: Code, tests, and workflows must never assume tables are cached in memory or access private engine internals (e.g. `_cached_rows`, `_pk_index`). Queries must use public TableEngine APIs (`Table.get()`, `G.TE.get()`, `Table.get_set()`) or assert against database state (`MockDB._global_store`), ensuring complete compatibility regardless of the active TableEngine (`TEDirectDB` vs `TECachedDB`) or table caching configuration (`te_cached=True/False`).
+8. **Cryptographic Hash Fast-Path (Rule 16)**: For cryptographic hash lookup tables (e.g. `m_tag_code`), matching hashes guarantee identical content without database lookups. TableEngine `set()` operations on tables with explicit primary keys must maintain an $O(1)$ fast-path when re-setting matching projected rows to prevent $O(N)$ linear cache scans.
+9. **Teardown Commit Acceleration (Rule 17)**: When committing final update cycles, teardowns, or write-only batches before engine closure, use `G.TE.commit_all(update_in_mem_indexes=False)` (or `G.TE.commit(table_id, update_in_mem_indexes=False)`) to bypass redundant in-memory cache/index synchronization and immediately release cache memory before `G.TE.close()`.
 

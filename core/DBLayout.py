@@ -3,7 +3,7 @@
 ===============================================================================
 RELATIONAL DATABASE SCHEMA REFERENCE GUIDE FOR AI & PARSERS
 ===============================================================================
-This module defines the 30 core relational database tables used across the parser
+This module defines the 31 core relational database tables used across the parser
 pipeline (`Table_Array`).
 
 SCHEMA ENTITY-RELATIONSHIP GRAPH:
@@ -34,6 +34,7 @@ SCHEMA ENTITY-RELATIONSHIP GRAPH:
                                         ^           ^                     ^
                                         |           |--(vid_s, vid_e)     |--(ast_id -> m_ast.ast_id)
                                         |
+                                        |-- (s_tag_id, e_tag_id) ----------> m_moved_tag
                                         |-- (tag_id, fid -> m_file.fid) ---> m_bridge_tag (fid, tag_id, line_s, line_e, char_s, char_e)
                                         |-- (tag_id, map_id) --------------> m_bridge_map (tag_id, map_id)
                                                   ^
@@ -859,6 +860,29 @@ m_bridge_commit_tag = Table(
     hashing_table=False,
 )
 
+# -----------------------------------------------------------------------------
+# 31. m_moved_tag (table_id=30): Tag History / Modification Evolution
+#     - s_tag_id: Source Tag ID (FK -> m_tag.tag_id).
+#     - e_tag_id: Destination Tag ID (FK -> m_tag.tag_id).
+# -----------------------------------------------------------------------------
+m_moved_tag = Table(
+    table_id=30,
+    table_name="m_moved_tag",
+    columns=(
+        ("s_tag_id", "INT", "NOT NULL"),
+        ("e_tag_id", "INT", "NOT NULL"),
+    ),
+    primary=("s_tag_id", "e_tag_id"),
+    foreign=(
+        ("s_tag_id", "m_tag", "tag_id"),
+        ("e_tag_id", "m_tag", "tag_id"),
+    ),
+    initial_insert=None,
+    no_duplicate=False,
+    te_cached=False,
+    hashing_table=False,
+)
+
 TABLES: tuple[Table, ...] = (
     m_v_main,
     m_file_name,
@@ -890,19 +914,21 @@ TABLES: tuple[Table, ...] = (
     m_bridge_commit_person,
     m_bridge_commit_file,
     m_bridge_commit_tag,
+    m_moved_tag,
 )
 
 
 def init_db_layout(gp=None) -> tuple[Table, ...]:
-    """Initialize and populate gp.Table_Array with the default 30 schema tables.
+    """Initialize and populate gp.Table_Array with the default 31 schema tables.
     
     Args:
         gp: Optional GreatProcessor instance to attach Table_Array to.
         
         
     Returns:
-        Immutable tuple of all 30 Table schema objects.
+        Immutable tuple of all 31 Table schema objects.
     """
     if gp is not None:
         gp.Table_Array = list(TABLES)
     return TABLES
+

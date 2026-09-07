@@ -20,14 +20,14 @@ from core.globalstuff import (
     FILE_ERROR,
 )
 m_file_name = m_file = m_bridge_file = m_type_descriptor = m_ast = m_ast_container = None
-m_ast_include = m_ast_debug = m_tag_code = m_tag = m_bridge_tag = m_map_ast = m_bridge_map = None
+m_ast_include = m_ast_debug = m_tag_code = m_tag = m_bridge_tag = m_map_ast = m_bridge_map = m_moved_tag = None
 m_ast_hash = m_kconfig_symbol = m_kconfig_relation = m_kconfig_tree = None
 from core.globalstuff import compute_code_hash
 
 
 def _init_tables() -> None:
     global m_file_name, m_file, m_bridge_file, m_type_descriptor, m_ast, m_ast_container
-    global m_ast_include, m_ast_debug, m_tag_code, m_tag, m_bridge_tag, m_map_ast, m_bridge_map
+    global m_ast_include, m_ast_debug, m_tag_code, m_tag, m_bridge_tag, m_map_ast, m_bridge_map, m_moved_tag
     global m_ast_hash, m_kconfig_symbol, m_kconfig_relation, m_kconfig_tree
     if m_file_name is not None:
         return
@@ -46,6 +46,7 @@ def _init_tables() -> None:
     m_map_ast = db_layout.m_map_ast
     m_bridge_map = db_layout.m_bridge_map
     m_ast_hash = db_layout.m_ast_hash
+    m_moved_tag = db_layout.m_moved_tag
     m_kconfig_symbol = db_layout.m_kconfig_symbol
     m_kconfig_relation = db_layout.m_kconfig_relation
     m_kconfig_tree = db_layout.m_kconfig_tree
@@ -147,7 +148,17 @@ class KconfigManager:
             elif isinstance(item, KconfigSource):
                 self._extract_source(item, parent_tree_id, parent_dep_exprs)
 
-    def _tag_and_map(self, ast_ref: Any, line_s: int, line_e: int, char_s: int, char_e: int, code: str) -> Any:
+    def _tag_and_map(
+        self,
+        ast_ref: Any,
+        line_s: int,
+        line_e: int,
+        char_s: int,
+        char_e: int,
+        code: str,
+        ast_name: str | None = None,
+        ast_type: Any = None,
+    ) -> Any:
         """Create or recycle m_tag, m_bridge_tag, m_map_ast, and m_bridge_map entries."""
         CS = self.CS
         extent = Line(line_s, line_e)
@@ -194,10 +205,15 @@ class KconfigManager:
                             ))
                         return tag_id
 
+        from parser.c_ast.c_ast import match_prior_tag_transition
+        s_tag_id = match_prior_tag_transition(CS, extent, ast_name, ast_type)
+
         with CS(REF_POS):
             CS.store(m_tag.set(*current_tag))
             tag_ref = ((m_tag.table_id, 0), OP_REF, (REF_POS, CS.route[-1]))
             CS.store(m_tag_code.get_set(code_hash, code))
+            if s_tag_id is not None:
+                CS.store(m_moved_tag.set(s_tag_id, tag_ref))
 
         with CS(REF_POS):
             CS.store(m_bridge_tag.set(
@@ -289,7 +305,7 @@ class KconfigManager:
             CS.store(m_ast.set(None, node.title or "mainmenu", ASTT.Kconfig_Mainmenu.value))
             ast_ref = ((m_ast.table_id, 0), OP_REF, (REF_POS, CS.route[-1]))
 
-        self._tag_and_map(ast_ref, node.line_s, node.line_e, node.char_s, node.char_e, node.raw_code)
+        self._tag_and_map(ast_ref, node.line_s, node.line_e, node.char_s, node.char_e, node.raw_code, ast_name=node.title or "mainmenu", ast_type=ASTT.Kconfig_Mainmenu)
 
     def _extract_config(self, cfg: KconfigConfig, parent_tree_id: int | Any, parent_dep_exprs: list[KconfigExpr]) -> None:
         CS = self.CS
@@ -299,7 +315,7 @@ class KconfigManager:
             CS.store(m_ast.set(None, cfg.name, ast_type.value))
             ast_ref = ((m_ast.table_id, 0), OP_REF, (REF_POS, CS.route[-1]))
 
-        self._tag_and_map(ast_ref, cfg.line_s, cfg.line_e, cfg.char_s, cfg.char_e, cfg.raw_code)
+        self._tag_and_map(ast_ref, cfg.line_s, cfg.line_e, cfg.char_s, cfg.char_e, cfg.raw_code, ast_name=cfg.name, ast_type=ast_type)
 
         # Determine default value string
         def_val_str = ""
@@ -391,7 +407,7 @@ class KconfigManager:
             CS.store(m_ast.set(None, menu.title or "menu", ASTT.Kconfig_Menu.value))
             ast_ref = ((m_ast.table_id, 0), OP_REF, (REF_POS, CS.route[-1]))
 
-        self._tag_and_map(ast_ref, menu.line_s, menu.line_e, menu.char_s, menu.char_e, menu.raw_code)
+        self._tag_and_map(ast_ref, menu.line_s, menu.line_e, menu.char_s, menu.char_e, menu.raw_code, ast_name=menu.title or "menu", ast_type=ASTT.Kconfig_Menu)
 
         all_deps = list(parent_dep_exprs) + list(menu.depends_on)
         dep_ast_ref = self._extract_expr_ast(all_deps[0]) if all_deps else 0
@@ -422,7 +438,7 @@ class KconfigManager:
             CS.store(m_ast.set(None, choice_title, ASTT.Kconfig_Choice.value))
             ast_ref = ((m_ast.table_id, 0), OP_REF, (REF_POS, CS.route[-1]))
 
-        self._tag_and_map(ast_ref, choice.line_s, choice.line_e, choice.char_s, choice.char_e, choice.raw_code)
+        self._tag_and_map(ast_ref, choice.line_s, choice.line_e, choice.char_s, choice.char_e, choice.raw_code, ast_name=choice_title, ast_type=ASTT.Kconfig_Choice)
 
         all_deps = list(parent_dep_exprs) + list(choice.depends_on)
         dep_ast_ref = self._extract_expr_ast(all_deps[0]) if all_deps else 0
@@ -451,7 +467,7 @@ class KconfigManager:
             CS.store(m_ast.set(None, f"if {if_node.cond.to_string()}", ASTT.Kconfig_If.value))
             ast_ref = ((m_ast.table_id, 0), OP_REF, (REF_POS, CS.route[-1]))
 
-        self._tag_and_map(ast_ref, if_node.line_s, if_node.line_e, if_node.char_s, if_node.char_e, if_node.raw_code)
+        self._tag_and_map(ast_ref, if_node.line_s, if_node.line_e, if_node.char_s, if_node.char_e, if_node.raw_code, ast_name=f"if {if_node.cond.to_string()}", ast_type=ASTT.Kconfig_If)
 
         all_deps = list(parent_dep_exprs) + [if_node.cond]
         self._extract_items(if_node.children, parent_tree_id=parent_tree_id, parent_dep_exprs=all_deps)
@@ -462,7 +478,7 @@ class KconfigManager:
             CS.store(m_ast.set(None, comment.title or "comment", ASTT.Kconfig_Comment.value))
             ast_ref = ((m_ast.table_id, 0), OP_REF, (REF_POS, CS.route[-1]))
 
-        self._tag_and_map(ast_ref, comment.line_s, comment.line_e, comment.char_s, comment.char_e, comment.raw_code)
+        self._tag_and_map(ast_ref, comment.line_s, comment.line_e, comment.char_s, comment.char_e, comment.raw_code, ast_name=comment.title or "comment", ast_type=ASTT.Kconfig_Comment)
 
         all_deps = list(parent_dep_exprs) + list(comment.depends_on)
         dep_ast_ref = self._extract_expr_ast(all_deps[0]) if all_deps else 0
