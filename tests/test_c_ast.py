@@ -20,7 +20,7 @@ from typing import Any
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from core.globalstuff import G, COLOR, REF_OLD, REF_ROOT
+from core.globalstuff import G, COLOR, REF_OLD, REF_ROOT, ASTT
 from core.GreatProcessor import GreatProcessor, CompressedChangeSetDict
 from core.FileHandler import MasterFile
 from core.TableHandling import ChangeSet
@@ -34,6 +34,9 @@ from core.DBLayout import (
     m_moved_tag,
     m_bridge_tag,
     m_ast,
+    m_ast_container,
+    m_map_ast,
+    m_bridge_map,
 )
 from table_engine import TEDirectDB, TECachedDB, get_table_engine
 from db_engine import MockDB, MariaDB
@@ -49,7 +52,7 @@ TEST_SUITE: list[dict[str, Any]] = [
     },
     {
         "file": "virt/kvm/iodev.h",
-        "baseline_ast_ops": 462,
+        "baseline_ast_ops": 464,
         "description": "Kernel Header (virt/kvm/iodev.h)",
     },
     {
@@ -64,17 +67,17 @@ TEST_SUITE: list[dict[str, Any]] = [
     },
     {
         "file": "drivers/watchdog/w83627hf_wdt.c",
-        "baseline_ast_ops": 1983,
+        "baseline_ast_ops": 1989,
         "description": "Watchdog Driver (Latin-1 byte 0xe1 resilience)",
     },
     {
         "file": "drivers/usb/storage/isd200.c",
-        "baseline_ast_ops": 9760,
+        "baseline_ast_ops": 9742,
         "description": "USB Storage Driver (Latin-1 byte 0xf6 resilience)",
     },
     {
         "file": "include/linux/sched.h",
-        "baseline_ast_ops": 14206,
+        "baseline_ast_ops": 15250,
         "description": "Kernel Header (sched.h)",
     },
     {
@@ -89,7 +92,7 @@ TEST_SUITE: list[dict[str, Any]] = [
     },
     {
         "file": "arch/powerpc/xmon/ppc-opc.c",
-        "baseline_ast_ops": 8692,
+        "baseline_ast_ops": 8689,
         "description": "PowerPC Opcode Table & Large Initializer Array (ppc-opc.c)",
     },
 ]
@@ -318,6 +321,116 @@ class TestCASTParser(unittest.TestCase):
                 f"Operation result count mismatch for {r['file']}",
             )
 
+    def test_sched_task_struct_canonical_tag(self) -> None:
+        """Verify struct task_struct in sched.h produces a canonical C_structdecl tag rather than tsk."""
+        file_path = "include/linux/sched.h"
+        res = run_single_file_worker({
+            "file": file_path,
+            "baseline_ast_ops": 15250,
+            "description": "Kernel Header (sched.h)",
+        })
+        self.assertIsNone(res["error"])
+        self.assertTrue(res["execute_success"])
+
+        # Check DB state
+        asts = MockDB._global_store.get("m_ast", {})
+        bridge_tags = MockDB._global_store.get("m_bridge_tag", {})
+        tags = MockDB._global_store.get("m_tag", {})
+
+        # Find the tag spanning line 1220 to 1573
+        task_struct_tags = []
+        for b_pk, b_row in bridge_tags.items():
+            fid, tag_id, line_s, line_e, char_s, char_e = b_row
+            if line_s == 1220 and line_e == 1573:
+                tag = tags.get(tag_id) or tags.get((tag_id, 1))
+                if tag:
+                    ast_obj = asts.get(tag[4])
+                    task_struct_tags.append((tag_id, ast_obj))
+
+        self.assertEqual(len(task_struct_tags), 1, f"Expected exactly 1 tag spanning 1220..1573, found {task_struct_tags}")
+        tag_id, ast_obj = task_struct_tags[0]
+        self.assertIsNotNone(ast_obj)
+        self.assertEqual(ast_obj[1], "task_struct", f"Expected tag AST name 'task_struct', got {ast_obj[1]}")
+        self.assertEqual(ast_obj[2], ASTT.C_structdecl, f"Expected C_structdecl ({ASTT.C_structdecl}), got {ast_obj[2]}")
+
+    def test_struct_simple_members_no_compound_container(self) -> None:
+        """Verify simple struct members (e.g. int, long, char) generate zero rows in m_ast_container."""
+        snippet = (
+            "struct sample_device {\n"
+            "    int device_id;\n"
+            "    long timeout_ms;\n"
+            "    char active_state;\n"
+            "    unsigned int flags;\n"
+            "    int *buffer_ptr;\n"
+            "};\n"
+        )
+        MockDB._global_store.clear()
+        G.DEBUG_TYPECHECK = True
+        G.DB = MockDB
+        G.TE = TECachedDB()
+        gp = GreatProcessor()
+        init_db_layout(gp)
+        G.TE.start(gp.Table_Array, G.DB)
+
+        mf = MasterFile()
+        temp_dir = mf.create_temp_dir()
+        mf.version_dict["v3.0"] = temp_dir
+        G.MF = mf
+        gp.Version_Name = "v3.0"
+        gp.VID = 1
+
+        file_path = "sample_device.h"
+        full_path = os.path.join(temp_dir, file_path)
+        with open(full_path, "w") as f:
+            f.write(snippet)
+
+        try:
+            cs = ChangeSet(f"A\t{file_path}")
+            cs.current_vid = 1
+            cs.gp = gp
+            cs.mf = mf
+            G.CURRENT_PARSING_FILE = file_path
+
+            cs.store(m_file_name.get_set(None, cs.current_path))
+            cs.store(m_file.set(None, gp.VID, 0, 1, "A", 0))
+            cs.store(m_bridge_file.set(gp.VID, cs.ref(m_file_name.fnid), cs.ref(m_file.fid)))
+
+            cs.parse()
+            cs.execute()
+            G.TE.commit_all()
+
+            asts = MockDB._global_store.get("m_ast", {})
+            containers = MockDB._global_store.get("m_ast_container", {})
+
+            # Map by name
+            ast_by_name = {v[1]: (k, v) for k, v in asts.items() if v[1]}
+
+            # Simple members: device_id (int), timeout_ms (long), active_state (char)
+            for simple_name, expected_type in [("device_id", ASTT.C_int), ("timeout_ms", ASTT.C_long), ("active_state", ASTT.C_char)]:
+                self.assertIn(simple_name, ast_by_name)
+                aid, arow = ast_by_name[simple_name]
+                self.assertEqual(arow[2], expected_type)
+                # Verify ZERO container rows for this simple member AST
+                member_containers = [c for c in containers.values() if c[0] == aid]
+                self.assertEqual(len(member_containers), 0, f"Simple member {simple_name} should have 0 container rows, got {member_containers}")
+
+            # Compound members: flags (unsigned int -> C_unsigned with container ref), buffer_ptr (int * -> C_Compound)
+            self.assertIn("buffer_ptr", ast_by_name)
+            ptr_id, ptr_row = ast_by_name["buffer_ptr"]
+            self.assertEqual(ptr_row[2], ASTT.C_Compound)
+            ptr_containers = [c for c in containers.values() if c[0] == ptr_id]
+            self.assertGreater(len(ptr_containers), 0, "Compound member buffer_ptr must have container rows")
+
+            # Struct itself must link all members in its container
+            self.assertIn("sample_device", ast_by_name)
+            s_id, s_row = ast_by_name["sample_device"]
+            self.assertEqual(s_row[2], ASTT.C_structdecl)
+            struct_containers = [c for c in containers.values() if c[0] == s_id]
+            self.assertEqual(len(struct_containers), 5, f"Struct sample_device should have 5 member containers, got {len(struct_containers)}")
+        finally:
+            if temp_dir and os.path.exists(temp_dir):
+                shutil.rmtree(temp_dir, ignore_errors=True)
+
     def test_token_spelling_attributes(self) -> None:
         """Test safe_spelling and safe_cursor_spelling self-caching fallback."""
         class DummyToken:
@@ -434,7 +547,7 @@ class TestCASTParser(unittest.TestCase):
         """Verify parsing and ChangeSet execution with TEDirectDB."""
         item = {
             "file": "virt/kvm/iodev.h",
-            "baseline_ast_ops": 448,
+            "baseline_ast_ops": 464,
             "description": "Kernel Header (virt/kvm/iodev.h)",
             "table_engine": "direct",
         }
@@ -1153,6 +1266,179 @@ struct custom_data {
         self.assertEqual(res["mismatches_count"], 0)
         self.assertEqual(res["uncovered_non_ws"], 0)
         self.assertEqual(res["coverage_ratio"], 1.0)
+
+    def test_struct_nlmsvc_binding_clean_ast(self) -> None:
+        """Verify struct nlmsvc_binding and declarators contain zero type-0 or anonymous container rows."""
+        temp_dir = None
+        try:
+            MockDB._global_store.clear()
+            G.DEBUG_TYPECHECK = True
+            G.DB = MockDB
+            G.TE = get_table_engine("cached")()
+            gp = GreatProcessor()
+            init_db_layout(gp)
+            G.TE.start(gp.Table_Array, G.DB)
+
+            mf = MasterFile()
+            temp_dir = mf.create_temp_dir()
+            mf.version_dict["v3.0"] = temp_dir
+            G.MF = mf
+            gp.Version_Name = "v3.0"
+            gp.VID = 1
+
+            file_path = "include/linux/lockd/bind.h"
+            full_path = os.path.join(temp_dir, file_path)
+            os.makedirs(os.path.dirname(full_path), exist_ok=True)
+            file_content = subprocess.check_output(
+                ["git", "-C", "linux", "show", f"v3.0:{file_path}"],
+                stderr=subprocess.PIPE,
+            )
+            with open(full_path, "wb") as f:
+                f.write(file_content)
+
+            cs = ChangeSet(f"A\t{file_path}")
+            cs.current_vid = 1
+            cs.gp = gp
+            cs.mf = mf
+            G.CURRENT_PARSING_FILE = file_path
+
+            default_processing(cs, gp)
+            cs.parse()
+            self.assertTrue(cs.execute())
+            G.TE.commit_all()
+
+            containers = list(MockDB._global_store.get("m_ast_container", {}).values())
+            type_0_containers = [c for c in containers if c[2] == 0]
+            self.assertEqual(
+                len(type_0_containers),
+                0,
+                f"Found {len(type_0_containers)} type-0 containers in bind.h: {type_0_containers}",
+            )
+
+            asts = {r[0]: r for r in MockDB._global_store.get("m_ast", {}).values()}
+            nlmsvc_ops_asts = [a for a in asts.values() if a[1] == "nlmsvc_ops"]
+            self.assertTrue(bool(nlmsvc_ops_asts))
+            nlmsvc_ops_containers = [c for c in containers if c[0] == nlmsvc_ops_asts[0][0]]
+            # Should have exactly 2 valid containers: struct nlmsvc_binding and pointer (no trailing type 0)
+            self.assertEqual(len(nlmsvc_ops_containers), 2)
+            self.assertEqual(nlmsvc_ops_containers[0][2], ASTT.C_struct)
+            self.assertEqual(nlmsvc_ops_containers[1][2], ASTT.C_pointer)
+        finally:
+            if G.TE:
+                try:
+                    G.TE.close()
+                except Exception:
+                    pass
+            MockDB._global_store.clear()
+            if temp_dir and os.path.exists(temp_dir):
+                shutil.rmtree(temp_dir, ignore_errors=True)
+
+    def test_function_proto_parameter_container_depths(self) -> None:
+        """Verify function prototype parameters are linked in m_ast_container at depth 1 with function at depth 0."""
+        from collections import defaultdict
+        temp_dir = None
+        try:
+            MockDB._global_store.clear()
+            G.DEBUG_TYPECHECK = True
+            G.DB = MockDB
+            G.TE = get_table_engine("cached")()
+            gp = GreatProcessor()
+            init_db_layout(gp)
+            G.TE.start(gp.Table_Array, G.DB)
+
+            mf = MasterFile()
+            temp_dir = mf.create_temp_dir()
+            mf.version_dict["v3.0"] = temp_dir
+            G.MF = mf
+            gp.Version_Name = "v3.0"
+            gp.VID = 1
+
+            file_path = "include/linux/lockd/bind.h"
+            full_path = os.path.join(temp_dir, file_path)
+            os.makedirs(os.path.dirname(full_path), exist_ok=True)
+            file_content = subprocess.check_output(
+                ["git", "-C", "linux", "show", f"v3.0:{file_path}"],
+                stderr=subprocess.PIPE,
+            )
+            with open(full_path, "wb") as f:
+                f.write(file_content)
+
+            cs = ChangeSet(f"A\t{file_path}")
+            cs.current_vid = 1
+            cs.gp = gp
+            cs.mf = mf
+            G.CURRENT_PARSING_FILE = file_path
+
+            default_processing(cs, gp)
+            cs.parse()
+            self.assertTrue(cs.execute())
+            G.TE.commit_all()
+
+            asts = {r[0]: r for r in MockDB._global_store.get("m_ast", {}).values()}
+            containers = list(MockDB._global_store.get("m_ast_container", {}).values())
+
+            nlmclnt_proc_asts = [a for a in asts.values() if a[1] == "nlmclnt_proc"]
+            self.assertTrue(bool(nlmclnt_proc_asts))
+            proc_ast = nlmclnt_proc_asts[0]
+            proc_id = proc_ast[0]
+
+            proc_containers = sorted([c for c in containers if c[0] == proc_id], key=lambda x: x[1])
+            self.assertGreaterEqual(len(proc_containers), 4)
+            self.assertEqual(proc_containers[0][1], 0)
+            self.assertEqual(proc_containers[0][2], ASTT.C_int)
+            self.assertEqual(proc_containers[0][3], 0)
+
+            param1 = proc_containers[1]
+            param2 = proc_containers[2]
+            param3 = proc_containers[3]
+
+            self.assertEqual(asts[param1[3]][1], "host")
+            self.assertEqual(asts[param2[3]][1], "cmd")
+            self.assertEqual(asts[param3[3]][1], "fl")
+
+            parent_to_children = defaultdict(list)
+            child_to_parents = defaultdict(list)
+            all_container_nodes = set()
+            for c_row in containers:
+                p_id, _, _, child_id = c_row
+                all_container_nodes.add(p_id)
+                if child_id and child_id != 0:
+                    parent_to_children[p_id].append(child_id)
+                    all_container_nodes.add(child_id)
+                    child_to_parents[child_id].append(p_id)
+
+            root_nodes = [nid for nid in all_container_nodes if nid in parent_to_children and not child_to_parents.get(nid)]
+            ast_depth_map = {}
+            queue = [(r_id, 0) for r_id in root_nodes]
+            visited = set()
+            while queue:
+                curr_id, curr_depth = queue.pop(0)
+                if curr_id in visited:
+                    continue
+                visited.add(curr_id)
+                ast_depth_map[curr_id] = curr_depth
+                for ch_id in parent_to_children.get(curr_id, []):
+                    if ch_id and ch_id != 0 and ch_id not in visited:
+                        queue.append((ch_id, curr_depth + 1))
+
+            self.assertEqual(ast_depth_map.get(proc_id), 0)
+            self.assertEqual(ast_depth_map.get(param1[3]), 1)
+            self.assertEqual(ast_depth_map.get(param2[3]), 1)
+            self.assertEqual(ast_depth_map.get(param3[3]), 1)
+
+            host_containers = [c for c in containers if c[0] == param1[3] and c[3] != 0]
+            self.assertTrue(bool(host_containers))
+            nlm_host_ast_id = host_containers[0][3]
+            self.assertEqual(ast_depth_map.get(nlm_host_ast_id), 2)
+        finally:
+            if G.TE:
+                try:
+                    G.TE.close()
+                except Exception:
+                    pass
+            MockDB._global_store.clear()
+            if temp_dir and os.path.exists(temp_dir):
+                shutil.rmtree(temp_dir, ignore_errors=True)
 
     def test_tag_fidelity_ppc_opc(self) -> None:
         """Verify tag text fidelity on arch/powerpc/xmon/ppc-opc.c."""

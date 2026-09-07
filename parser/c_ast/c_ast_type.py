@@ -2535,6 +2535,8 @@ class TypeSegment():
                     compound.append((item, 0))
 
             for i, typetoken in enumerate(self.content):
+                if typetoken.type == 0 or typetoken.type == ASTT.Undefined:
+                    continue
                 if typetoken.type in {ASTT.C_struct, ASTT.C_functionproto, ASTT.C_union, ASTT.C_enum}:
                     if i > 0 and self.content[i - 1].type == typetoken.type:
                         notbind_type = get_notbind_type(typetoken.type)
@@ -2546,8 +2548,13 @@ class TypeSegment():
                                 notbind_type,
                             ))
                         compound.append((typetoken.type, CS.ref(m_ast.ast_id, REF_POS, op_idx)))
+                    elif typetoken.type == ASTT.C_functionproto:
+                        compound.append((typetoken.type, 0))
                 else:
                     compound.append((typetoken.type, 0))
+
+            if not compound:
+                return
 
             view = []
             for i, item in enumerate(compound):
@@ -2665,6 +2672,8 @@ class Zone:
             self.end_mode = End_Mode.Comma
 
     def _create_child_node(self, cursor, extent: Line) -> Ast:
+        if self.zone_type == Zone_Type.Function_Args:
+            return self.ast_type(extent, End_Mode.Comma)
         k = getattr(cursor, "kind", None) if cursor is not None else None
         if k in (cc.CursorKind.DECL_STMT, cc.CursorKind.VAR_DECL):
             return C_Type(extent, End_Mode.Extent)
@@ -2716,6 +2725,18 @@ class Zone:
         tline = token.line
         tspelling = token.spelling_str
 
+        # In Function_Args, closing ')' must terminate the zone before being absorbed by child nodes
+        if ast_kind == AST_KIND.punctuation and self.zone_type == Zone_Type.Function_Args:
+            if tspelling == ")":
+                self.paren_depth -= 1
+                if self.paren_depth <= 0:
+                    self.extent.grow(tline)
+                    self.preset_extents.clear()
+                    self.completed = True
+                    if self.children and getattr(self.children[-1], "need_processing", False):
+                        self.children[-1].need_processing = False
+                    return True
+
         # Fast path: check active last_child first before capturing comments or top-level tokens
         if self.children:
             last_child = self.children[-1]
@@ -2724,7 +2745,7 @@ class Zone:
                 return True
             if ast_kind == AST_KIND.punctuation:
                 if tspelling == "*":
-                    last_child.extent.grow(get_cursor_line(cursor))
+                    last_child.extent.grow(tline)
                     last_child.need_processing = True
                     last_child.exec_filter(token, cursor, ast_kind)
                     return True
@@ -3078,16 +3099,28 @@ class C_Type(Ast):
                             if item.type == ASTT.C_functionproto:
                                 # Determine return type from preceding segments in final_type
                                 ret_idx = final_type.index(typesegment)
-                                return_segments = final_type[:ret_idx]
-                                if not return_segments:
-                                    return_segments = [root_type] if root_type != typesegment else []
+                                item_idx = typesegment.content.index(item) if item in typesegment.content else len(typesegment.content)
+                                pre_tokens = [tok for tok in typesegment.content[:item_idx] if tok.type != 0 and tok.type != ASTT.Undefined]
 
-                                if len(return_segments) == 1:
-                                    ret_seg = return_segments[0]
-                                    ret_seg.generate_ast(CS)
-                                elif len(return_segments) > 1:
+                                valid_prev_segs = [
+                                    seg for seg in final_type[:ret_idx]
+                                    if seg.cqual != CQual.Empty
+                                    or seg.ref_type != TSRef.No_Ref
+                                    or any(tok.type != 0 and tok.type != ASTT.Undefined for tok in seg.content)
+                                ]
+
+                                if pre_tokens:
                                     ret_seg = TypeSegment()
-                                    for seg in return_segments:
+                                    for seg in valid_prev_segs:
+                                        ret_seg.extend(seg)
+                                    ret_seg.content.extend(pre_tokens)
+                                    ret_seg.generate_ast(CS)
+                                elif len(valid_prev_segs) == 1:
+                                    ret_seg = valid_prev_segs[0]
+                                    ret_seg.generate_ast(CS)
+                                elif len(valid_prev_segs) > 1:
+                                    ret_seg = TypeSegment()
+                                    for seg in valid_prev_segs:
                                         ret_seg.extend(seg)
                                     ret_seg.generate_ast(CS)
                                 else:
@@ -3096,11 +3129,12 @@ class C_Type(Ast):
                                     ret_seg.generate_ast(CS)
 
                                 ret_t_id = ret_seg.type_id
-                                if ret_t_id is None:
-                                    if ret_seg.ref_type == TSRef.Route_Ref and not ret_seg.content:
+                                if ret_t_id is None or ret_t_id == 0 or ret_t_id == ASTT.Undefined:
+                                    valid_toks = [t for t in ret_seg.content if t.type != 0 and t.type != ASTT.Undefined]
+                                    if ret_seg.ref_type == TSRef.Route_Ref and not valid_toks:
                                         ret_t_id = ASTT.C_Compound
-                                    elif ret_seg.content:
-                                        ret_t_id = ret_seg.content[0].type
+                                    elif valid_toks:
+                                        ret_t_id = valid_toks[0].type
                                     else:
                                         ret_t_id = ASTT.C_void
 
@@ -3217,12 +3251,22 @@ class C_Type(Ast):
             for typesegment in final_type:
                 typesegment.generate_ast(CS)
 
-            for i, typesegment in enumerate(final_type):
-                # Search for identifier token if available
+            # Extract variable/declarator name from identifier tokens
+            for typesegment in final_type:
                 for item in typesegment.content:
-                    if item.type == 0:
+                    if item.type == 0 or item.type == ASTT.Undefined:
                         name = item.code
 
+            # Filter final_type to only include segments providing type information
+            # (exclude segments that solely hold the declarator identifier)
+            type_segments = [
+                ts for ts in final_type
+                if ts.cqual != CQual.Empty
+                or ts.ref_type != TSRef.No_Ref
+                or any(item.type != 0 and item.type != ASTT.Undefined for item in ts.content)
+            ]
+
+            for i, typesegment in enumerate(type_segments):
                 t_id = typesegment.type_id
                 if t_id is None:
                     if typesegment.ref_type == TSRef.Route_Ref and not typesegment.content:
@@ -3244,25 +3288,54 @@ class C_Type(Ast):
             if not name:
                 name = self.name
 
-            if len(final_type) == 1:
-                main_t_id = final_type[0].type_id
-                if main_t_id is None:
-                    if final_type[0].content:
-                        main_t_id = final_type[0].content[0].type
-                    else:
-                        main_t_id = ASTT.C_Compound
+            if type_segments:
+                if len(type_segments) == 1:
+                    main_t_id = type_segments[0].type_id
+                    if main_t_id is None:
+                        if type_segments[0].content:
+                            main_t_id = type_segments[0].content[0].type
+                        else:
+                            main_t_id = ASTT.C_Compound
+                else:
+                    main_t_id = ASTT.C_Compound
+
+                is_simple_type = (
+                    len(type_segments) == 1
+                    and type_segments[0].ref_type == TSRef.No_Ref
+                    and type_segments[0].cqual == CQual.Empty
+                    and main_t_id != ASTT.C_Compound
+                    and main_t_id != 0
+                )
+
+                if is_simple_type:
+                    with CS(REF_POS):
+                        CS.store(m_ast.view(
+                            ((m_ast.ast_id,),),
+                            None,
+                            name,
+                            main_t_id,
+                        ))
+                        ast_id_route = CS.get_route_parse()
+                else:
+                    with CS(REF_POS):
+                        CS.store(m_ast.view(
+                            ((m_ast.ast_id, m_ast_container.ast_id, len(type_segments)),),
+                            None,
+                            name,
+                            main_t_id,
+                            *cs_inserter,
+                        ))
+                        ast_id_route = CS.get_route_parse()
             else:
                 main_t_id = ASTT.C_Compound
-
-            with CS(REF_POS):
-                CS.store(m_ast.view(
-                    ((m_ast.ast_id, m_ast_container.ast_id, len(final_type)),),
-                    None,
-                    name,
-                    main_t_id,
-                    *cs_inserter,
-                ))
-                ast_id_route = CS.get_route_parse()
+                with CS(REF_POS):
+                    CS.store(m_ast.view(
+                        ((m_ast.ast_id,),),
+                        None,
+                        name,
+                        main_t_id,
+                    ))
+                    ast_id_route = CS.get_route_parse()
 
             with CS(REF_NO_REF):
                 if G.OVERRIDE_FORCE_AST_DEBUG:
@@ -3595,6 +3668,15 @@ class C_Type(Ast):
                 return
 
         if cursor.type.kind == cc.TypeKind.TYPEDEF:
+            self.content.append(TypeToken(token, ASTT.C_SCtypedef))
+            self.content.get_foreign(cursor)
+            self.swap_out()
+            return
+
+        if (
+            cursor.kind in {cc.CursorKind.FIELD_DECL, cc.CursorKind.VAR_DECL, cc.CursorKind.PARM_DECL}
+            and tspelling != safe_cursor_spelling(cursor)
+        ):
             self.content.append(TypeToken(token, ASTT.C_SCtypedef))
             self.content.get_foreign(cursor)
             self.swap_out()
