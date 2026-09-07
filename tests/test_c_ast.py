@@ -1440,6 +1440,104 @@ struct custom_data {
             if temp_dir and os.path.exists(temp_dir):
                 shutil.rmtree(temp_dir, ignore_errors=True)
 
+    def test_function_proto_struct_return_container_depths(self) -> None:
+        """Verify function prototypes returning struct pointers (nlmclnt_init) are linked at depth 0 with parameters at depth 1."""
+        from collections import defaultdict
+        temp_dir = None
+        try:
+            MockDB._global_store.clear()
+            G.DEBUG_TYPECHECK = True
+            G.DB = MockDB
+            G.TE = get_table_engine("cached")()
+            gp = GreatProcessor()
+            init_db_layout(gp)
+            G.TE.start(gp.Table_Array, G.DB)
+
+            mf = MasterFile()
+            temp_dir = mf.create_temp_dir()
+            mf.version_dict["v3.0"] = temp_dir
+            G.MF = mf
+            gp.Version_Name = "v3.0"
+            gp.VID = 1
+
+            file_path = "include/linux/lockd/bind.h"
+            full_path = os.path.join(temp_dir, file_path)
+            os.makedirs(os.path.dirname(full_path), exist_ok=True)
+            file_content = subprocess.check_output(
+                ["git", "-C", "linux", "show", f"v3.0:{file_path}"],
+                stderr=subprocess.PIPE,
+            )
+            with open(full_path, "wb") as f:
+                f.write(file_content)
+
+            cs = ChangeSet(f"A\t{file_path}")
+            cs.current_vid = 1
+            cs.gp = gp
+            cs.mf = mf
+            G.CURRENT_PARSING_FILE = file_path
+
+            default_processing(cs, gp)
+            cs.parse()
+            self.assertTrue(cs.execute())
+            G.TE.commit_all()
+
+            asts = {r[0]: r for r in MockDB._global_store.get("m_ast", {}).values()}
+            containers = list(MockDB._global_store.get("m_ast_container", {}).values())
+
+            nlmclnt_init_asts = [a for a in asts.values() if a[1] == "nlmclnt_init"]
+            self.assertTrue(bool(nlmclnt_init_asts), "nlmclnt_init AST node not found")
+            init_ast = nlmclnt_init_asts[0]
+            init_id = init_ast[0]
+            self.assertEqual(init_ast[2], ASTT.C_functionprotodecl)
+
+            init_containers = sorted([c for c in containers if c[0] == init_id], key=lambda x: x[1])
+            self.assertGreaterEqual(len(init_containers), 2)
+            # Priority 0 is return type
+            self.assertEqual(init_containers[0][1], 0)
+            self.assertEqual(init_containers[0][2], ASTT.C_struct)
+            # Priority 1 is parameter nlm_init
+            self.assertEqual(init_containers[1][1], 1)
+            self.assertEqual(init_containers[1][2], ASTT.C_Compound)
+            param_init_id = init_containers[1][3]
+            self.assertEqual(asts[param_init_id][1], "nlm_init")
+
+            parent_to_children = defaultdict(list)
+            child_to_parents = defaultdict(list)
+            all_container_nodes = set()
+            for c_row in containers:
+                p_id, _, _, child_id = c_row
+                all_container_nodes.add(p_id)
+                if child_id and child_id != 0:
+                    parent_to_children[p_id].append(child_id)
+                    all_container_nodes.add(child_id)
+                    child_to_parents[child_id].append(p_id)
+
+            root_nodes = [nid for nid in all_container_nodes if nid in parent_to_children and not child_to_parents.get(nid)]
+            ast_depth_map = {}
+            queue = [(r_id, 0) for r_id in root_nodes]
+            visited = set()
+            while queue:
+                curr_id, curr_depth = queue.pop(0)
+                if curr_id in visited:
+                    continue
+                visited.add(curr_id)
+                ast_depth_map[curr_id] = curr_depth
+                for ch_id in parent_to_children.get(curr_id, []):
+                    if ch_id and ch_id != 0 and ch_id not in visited:
+                        queue.append((ch_id, curr_depth + 1))
+
+            self.assertEqual(ast_depth_map.get(init_id), 0)
+            self.assertEqual(ast_depth_map.get(param_init_id), 1)
+        finally:
+            if G.TE:
+                try:
+                    G.TE.close()
+                except Exception:
+                    pass
+            MockDB._global_store.clear()
+            if temp_dir and os.path.exists(temp_dir):
+                shutil.rmtree(temp_dir, ignore_errors=True)
+
     def test_tag_fidelity_ppc_opc(self) -> None:
         """Verify tag text fidelity on arch/powerpc/xmon/ppc-opc.c."""
         res = assert_file_tag_fidelity("arch/powerpc/xmon/ppc-opc.c", min_coverage=1.0)

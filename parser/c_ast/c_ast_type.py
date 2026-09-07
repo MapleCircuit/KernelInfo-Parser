@@ -3629,6 +3629,20 @@ class C_Type(Ast):
         if tspelling in {"__func__", "__FUNCTION__", "__PRETTY_FUNCTION__"}:
             return
 
+        # Function declaration identifier check
+        # Prevents function declarator names from inheriting preceding return type specifiers (struct, union, enum, typedef)
+        if (
+            cursor.kind in {cc.CursorKind.FUNCTION_DECL, cc.CursorKind.CXX_METHOD}
+            and tspelling == safe_cursor_spelling(cursor)
+        ):
+            self.name = tspelling
+            tt = TypeToken(token, ASTT.C_functionproto)
+            tt.is_definition = True
+            self.content.append(tt)
+            self.content.get_foreign(cursor)
+            self.swap_out()
+            return
+
         # Declarator identifier check (field, variable, or parameter declaration)
         # Prevents declarator names from inheriting preceding type specifiers (typedef, struct, union, enum)
         if (
@@ -3689,15 +3703,6 @@ class C_Type(Ast):
                 self.content.get_foreign(cursor)
                 self.swap_out()
                 return
-
-        if cursor.kind == cc.CursorKind.FUNCTION_DECL and tspelling == safe_cursor_spelling(cursor):
-            self.name = tspelling
-            tt = TypeToken(token, ASTT.C_functionproto)
-            tt.is_definition = True
-            self.content.append(tt)
-            self.content.get_foreign(cursor)
-            self.swap_out()
-            return
 
         self.content.append(TypeToken(token))
         self.swap_out()
