@@ -29,11 +29,53 @@ SafeDataType = int | str | bytes | None
 UnSafeDataType = SafeDataType | RefType
 
 
+import re
+
+
 def compute_code_hash(code: str) -> bytes:
     """Compute deterministic 32-byte binary SHA-256 hash for code snippet string."""
     return hashlib.sha256(code.encode("latin-1")).digest()
 
 
+_UNNAMED_PATTERN = re.compile(r"(\((?:unnamed|anonymous) at )([^)]+)(\))")
+
+
+def clean_unnamed_spelling(spelling: str) -> str:
+    """Normalize Libclang unnamed/anonymous cursor spellings by stripping host/RAMDISK prefixes down to relative git path."""
+    if not spelling or ("(unnamed at " not in spelling and "(anonymous at " not in spelling):
+        return spelling
+
+    def repl(m: re.Match[str]) -> str:
+        prefix, full_loc, suffix = m.group(1), m.group(2), m.group(3)
+        parts = full_loc.rsplit(":", 2)
+        if len(parts) == 3 and parts[1].isdigit() and parts[2].isdigit():
+            path_part, loc = parts[0], f":{parts[1]}:{parts[2]}"
+        elif len(parts) >= 2 and parts[-1].isdigit():
+            path_part, loc = full_loc.rsplit(":", 1)[0], f":{full_loc.rsplit(':', 1)[1]}"
+        else:
+            path_part, loc = full_loc, ""
+
+        current_file = getattr(G, "CURRENT_PARSING_FILE", None)
+        if current_file and path_part.endswith(current_file):
+            rel_path = current_file
+        else:
+            m_shm = re.match(
+                r"^/dev/shm/(?:code-parser\.[^/]+/[^/]+/|[^/]+/linux/|[^/]+/)?(.*)$",
+                path_part,
+            )
+            if m_shm and m_shm.group(1):
+                rel_path = m_shm.group(1)
+            elif path_part.startswith("/"):
+                if "/linux/" in path_part:
+                    rel_path = path_part.split("/linux/", 1)[1]
+                else:
+                    rel_path = path_part.lstrip("/")
+            else:
+                rel_path = path_part
+
+        return f"{prefix}{rel_path}{loc}{suffix}"
+
+    return _UNNAMED_PATTERN.sub(repl, spelling)
 
 
 class FILE_ERROR(Exception):  # noqa: D101, N801, N818
@@ -496,6 +538,60 @@ class ASTT(IntEnum):
     Rust_Comment = auto()
     ## Fallback / Raw Content Construct
     Raw_Content = auto()
+    ## Additional C Constructs
+    C_SizeofExpr = auto()
+    C_TypeRef = auto()
+
+
+class SymbolRole(IntEnum):
+    Declaration = 1
+    TypeUsage = 2
+    Call = 3
+    MemberRef = 4
+    DeclRef = 5
+
+
+STANDARD_C_KEYWORDS: dict[str, ASTT] = {
+    "if": ASTT.C_IfStmt,
+    "switch": ASTT.C_SwitchStmt,
+    "case": ASTT.C_CaseStmt,
+    "default": ASTT.C_DefaultStmt,
+    "while": ASTT.C_WhileStmt,
+    "do": ASTT.C_DoStmt,
+    "for": ASTT.C_ForStmt,
+    "return": ASTT.C_ReturnStmt,
+    "break": ASTT.C_BreakStmt,
+    "continue": ASTT.C_ContinueStmt,
+    "goto": ASTT.C_GotoStmt,
+    "asm": ASTT.C_AsmStmt,
+    "__asm__": ASTT.C_AsmStmt,
+    "__asm": ASTT.C_AsmStmt,
+    "sizeof": ASTT.C_SizeofExpr,
+    "auto": ASTT.C_SCauto,
+    "register": ASTT.C_SCregister,
+    "static": ASTT.C_SCstatic,
+    "extern": ASTT.C_SCextern,
+    "typedef": ASTT.C_SCtypedef,
+    "const": ASTT.C_Qconst,
+    "volatile": ASTT.C_Qvolatile,
+    "restrict": ASTT.C_Qrestrict,
+    "_Atomic": ASTT.C_Q_Atomic,
+    "inline": ASTT.C_FSinline,
+    "__inline__": ASTT.C_FSinline,
+    "__inline": ASTT.C_FSinline,
+    "void": ASTT.C_void,
+    "char": ASTT.C_char,
+    "short": ASTT.C_short,
+    "int": ASTT.C_int,
+    "long": ASTT.C_long,
+    "signed": ASTT.C_signed,
+    "unsigned": ASTT.C_unsigned,
+    "float": ASTT.C_float,
+    "double": ASTT.C_double,
+    "struct": ASTT.C_struct,
+    "union": ASTT.C_union,
+    "enum": ASTT.C_enum,
+}
 
 
 
@@ -520,3 +616,31 @@ def configure_logging(fmt: str = "%(asctime)s - %(levelname)s - %(message)s", le
 
 
 configure_logging()
+
+
+_MEMORY_GUARD_INITIALIZED: bool = False
+
+
+def setup_memory_limit(limit_gb: float = 60.0) -> None:
+    """Enforce a hard address space limit (RLIMIT_AS) to prevent Linux OOM kernel freezes."""
+    global _MEMORY_GUARD_INITIALIZED
+    if _MEMORY_GUARD_INITIALIZED:
+        return
+    if not sys.platform.startswith("linux"):
+        return
+    try:
+        import resource
+        limit_bytes = int(limit_gb * 1024 * 1024 * 1024)
+        soft, hard = resource.getrlimit(resource.RLIMIT_AS)
+        if hard != resource.RLIM_INFINITY:
+            limit_bytes = min(limit_bytes, hard)
+        resource.setrlimit(resource.RLIMIT_AS, (limit_bytes, hard))
+        _MEMORY_GUARD_INITIALIZED = True
+        logging.getLogger("core.globalstuff").info(
+            COLOR.green(f"[Memory Guard] Hard address space limit set to {limit_bytes / (1024**3):.1f} GB (RLIMIT_AS)")
+        )
+    except Exception as e:
+        logging.getLogger("core.globalstuff").warning(
+            COLOR.yellow(f"[Memory Guard] Could not configure RLIMIT_AS: {e}")
+        )
+

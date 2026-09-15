@@ -214,12 +214,15 @@ class MockDB(BaseDBEngine):
         if not current_composite_rows:
             return []
 
+        table_offsets: dict[int, int] = {first_table_id: 0}
         col_offset = t1.length
         for join in joins:
             if len(join) < 2:
                 continue
             from_ptr, to_ptr = join[0], join[1]
+            from_col_idx = table_offsets.get(from_ptr[0], 0) + from_ptr[1]
             t_target = tables_dict[to_ptr[0]]
+            table_offsets[to_ptr[0]] = col_offset
             t_target_rows = self.tables_data.get(t_target.table_name, {})
             if not t_target_rows:
                 return []
@@ -237,7 +240,7 @@ class MockDB(BaseDBEngine):
             if is_single_pk:
                 # O(1) direct dictionary lookup
                 for comp in current_composite_rows:
-                    from_val = comp[from_ptr[1]]
+                    from_val = comp[from_col_idx]
                     r_tgt = t_target_rows.get(from_val)
                     if r_tgt is not None:
                         if target_filters:
@@ -265,7 +268,7 @@ class MockDB(BaseDBEngine):
                     target_hash_index[r_tgt[to_col_idx]].append(r_tgt)
 
                 for comp in current_composite_rows:
-                    from_val = comp[from_ptr[1]]
+                    from_val = comp[from_col_idx]
                     matching_target_rows = target_hash_index.get(from_val)
                     if matching_target_rows:
                         for r_tgt in matching_target_rows:

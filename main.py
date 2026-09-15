@@ -56,6 +56,7 @@ from core.globalstuff import (
     T_CREDITS,
     ASTT,
     configure_logging,
+    setup_memory_limit,
 )
 import os
 import sys
@@ -66,14 +67,14 @@ import time
 import logging
 import argparse
 import multiprocessing
-from collections import deque
+import re
+from collections import deque, defaultdict
 import pickle
 import zlib
 import traceback
 import gc
 import ctypes
-from parser.c_ast.c_ast import c_ast_parse
-from parser.c_ast.c_ast_type import Line
+from parser.c_ast import c_ast_parse, Line
 from core.FileHandler import MasterFile
 from core.GreatProcessor import GreatProcessor
 from core.TableHandling import Table, ChangeSet
@@ -144,6 +145,9 @@ def get_fid_for_path(path: str) -> int | None:
     """Resolve m_file.fid for a given path in active gp.VID (falling back to gp.Old_VID for unchanged files)."""
     if path in file_fid_cache:
         return file_fid_cache[path]
+    te = getattr(G, "TE", None)
+    if not te or m_file_name.table_id not in getattr(te, "tables", {}) or m_bridge_file.table_id not in getattr(te, "tables", {}):
+        return None
     fn_row = m_file_name.get(None, path)
     if fn_row and len(fn_row) >= 3 and fn_row[2]:
         fnid = fn_row[2][0]
@@ -159,30 +163,89 @@ def get_fid_for_path(path: str) -> int | None:
 
 
 def extract_tags_and_evacuate_cs(cs_obj: ChangeSet) -> None:
-    """Extract bridge tags and purge internal AST buffers from an executed ChangeSet."""
+    """Extract bridge tags, preserve resolved symbols, and purge internal AST buffers from an executed ChangeSet."""
     c_path = getattr(cs_obj, "current_path", None)
     if not c_path:
         return
     fid = get_fid_for_path(c_path)
+
+    # 1. Preserve resolved symbol map before internal buffers are cleared
+    if hasattr(cs_obj, "symbol_dict") and cs_obj.symbol_dict:
+        resolved_symbols = {}
+        cs_res = getattr(cs_obj, "cs_result", None)
+        cs_ops = getattr(cs_obj, "cs", None)
+        for (sym_name, sym_type), op_pos in cs_obj.symbol_dict.items():
+            ast_id = None
+            if cs_res and op_pos < len(cs_res) and cs_res[op_pos] is not None:
+                res_row = cs_res[op_pos]
+                if len(res_row) > 0 and isinstance(res_row[0], int):
+                    ast_id = res_row[0]
+            elif cs_ops and op_pos < len(cs_ops) and cs_ops[op_pos] is not None:
+                op = cs_ops[op_pos]
+                if len(op) >= 3 and len(op[2]) > 0 and isinstance(op[2][0], int):
+                    ast_id = op[2][0]
+            if ast_id is not None:
+                resolved_symbols[(sym_name, sym_type)] = ast_id
+        cs_obj.resolved_symbols = resolved_symbols
+
+        # Register resolved symbols into GreatProcessor per-file symbol tables for O(1) lookups
+        gp_ref = getattr(cs_obj, "gp", None) or getattr(G, "GP", None)
+        if gp_ref is not None:
+            if hasattr(gp_ref, "file_symbols") and isinstance(gp_ref.file_symbols, dict):
+                gp_ref.file_symbols[c_path] = resolved_symbols
+            if hasattr(gp_ref, "file_names") and isinstance(gp_ref.file_names, dict):
+                gp_ref.file_names[c_path] = {s_name: a_id for (s_name, _), a_id in resolved_symbols.items()}
+            if hasattr(gp_ref, "_ast_staged_symbols") and isinstance(gp_ref._ast_staged_symbols, dict):
+                gp_ref._ast_staged_symbols.update(resolved_symbols)
+            if hasattr(gp_ref, "_ast_staged_names") and isinstance(gp_ref._ast_staged_names, dict):
+                for (s_name, _s_type), a_id in resolved_symbols.items():
+                    if s_name not in gp_ref._ast_staged_names:
+                        gp_ref._ast_staged_names[s_name] = a_id
+
+    # 2. Extract bridge tags with resolved tag_id from cs_result
     if fid is not None and not hasattr(cs_obj, "pre_extracted_tags"):
         file_tags = []
-        for op in getattr(cs_obj, "cs", []):
+        cs_ops = getattr(cs_obj, "cs", [])
+        cs_res = getattr(cs_obj, "cs_result", [])
+        for i, op in enumerate(cs_ops):
             if op and len(op) >= 3 and op[0] == m_bridge_tag.table_id:
                 cols = op[2]
                 if len(cols) >= 4:
-                    tag_id = cols[1] if not isinstance(cols[1], tuple) else None
+                    tag_id = None
+                    if i < len(cs_res) and cs_res[i] is not None and len(cs_res[i]) >= 2:
+                        res_val = cs_res[i][1]
+                        if isinstance(res_val, int):
+                            tag_id = res_val
+                    if tag_id is None and not isinstance(cols[1], tuple):
+                        tag_id = cols[1]
+
                     line_s = cols[2] if isinstance(cols[2], int) else 1
                     line_e = cols[3] if isinstance(cols[3], int) else line_s
                     if tag_id is not None:
                         file_tags.append((tag_id, fid, line_s, line_e))
         cs_obj.pre_extracted_tags = file_tags
 
+    # 3. Evacuate internal AST buffers and bloat
     if hasattr(cs_obj, "cs") and isinstance(cs_obj.cs, list):
         cs_obj.cs.clear()
     if hasattr(cs_obj, "store_dict") and isinstance(cs_obj.store_dict, dict):
         cs_obj.store_dict.clear()
     if hasattr(cs_obj, "cs_result") and isinstance(cs_obj.cs_result, list):
         cs_obj.cs_result.clear()
+    if hasattr(cs_obj, "symbol_dict") and isinstance(cs_obj.symbol_dict, dict):
+        cs_obj.symbol_dict.clear()
+    if hasattr(cs_obj, "foreign_deps") and isinstance(cs_obj.foreign_deps, set):
+        cs_obj.foreign_deps.clear()
+    if hasattr(cs_obj, "unresolved_indices") and cs_obj.unresolved_indices:
+        cs_obj.unresolved_indices.clear()
+    if hasattr(cs_obj, "clear_bloat"):
+        cs_obj.clear_bloat()
+    else:
+        cs_obj.gp = None
+        cs_obj.mf = None
+        cs_obj.parsers = {}
+        cs_obj.batch_cs_dict = None
+        cs_obj.file = None
 
 
 def update(version: str) -> None:
@@ -207,6 +270,10 @@ def update(version: str) -> None:
 
     logger.info(COLOR.green(f"=======================Working on {version}======================="))
 
+    # Ensure TableEngine in-memory indexing is enabled for the new update cycle
+    if hasattr(G.TE, "update_in_mem_indexes"):
+        G.TE.update_in_mem_indexes = True
+
     # -------------------------------------------------------------------------
     # STEP 2: Ensure performance B-tree indexes are active for worker queries (in parallel)
     # -------------------------------------------------------------------------
@@ -230,44 +297,12 @@ def update(version: str) -> None:
     G.TE.start(gp.Table_Array, G.DB)
 
     # -------------------------------------------------------------------------
-    # STEP 5: Spawn multicore workers to parse changed files in parallel
+    # STEP 5 & 6: Spawn multicore workers to parse files & stream ChangeSet execution
     # -------------------------------------------------------------------------
-    trigger_multicore()
-
-    # -------------------------------------------------------------------------
-    # STEP 6: Enqueue ChangeSets and resolve operations sequentially
-    # -------------------------------------------------------------------------
-    cs_queue = deque(gp.ChangeSet_Dict.keys())
-
-    max_loop = len(gp.ChangeSet_Dict) * G.OVERRIDE_FC_MAX_LOOP_EXEC_MULT
-    chunk_commit_interval = 300 if G.VERY_LOW_MEMORY_MODE else (500 if G.LOW_MEMORY_MODE else 0)
-    executed_count = 0
-
-    while cs_queue:
-        max_loop -= 1
-        if max_loop < 0:
-            logger.error(f"max loop ({len(gp.ChangeSet_Dict)*G.OVERRIDE_FC_MAX_LOOP_EXEC_MULT}) was brought to 0, printing queue:")
-            debug_unresolved = [gp.ChangeSet_Dict[k] for k in cs_queue]
-
-            G.BP_ON_REF_FAIL = True
-
-            for item in debug_unresolved:
-                item.execute()
-
-            G.emergency_shutdown(666)
-        current_cs = cs_queue.popleft()
-        cs_obj = gp.ChangeSet_Dict[current_cs]
-        if not cs_obj.execute():
-            cs_queue.append(current_cs)
-        else:
-            executed_count += 1
-            # Evacuate executed ChangeSet tags and clear internal AST buffers immediately
-            extract_tags_and_evacuate_cs(cs_obj)
-
-            # Periodic intermediate chunk commits in low/very-low memory modes
-            if chunk_commit_interval > 0 and executed_count % chunk_commit_interval == 0:
-                G.TE.commit_all()
-                reclaim_system_memory()
+    chunk_commit_interval = 300 if G.VERY_LOW_MEMORY_MODE else (500 if G.LOW_MEMORY_MODE else 1000)
+    scheduler = DependencyScheduler(gp, chunk_commit_interval=chunk_commit_interval, streaming=True)
+    trigger_multicore(scheduler=scheduler)
+    scheduler.finalize()
 
     reclaim_system_memory()
 
@@ -327,12 +362,338 @@ def update(version: str) -> None:
     MF.clear_version_cache(version)
     MF.trim_version(keep=1)
     G.TE.close()
+    if hasattr(G.TE, "update_in_mem_indexes"):
+        G.TE.update_in_mem_indexes = True
     reclaim_system_memory()
     return
 
 
-def trigger_multicore(batch_size: int | None = None) -> None:
-    """Distribute file parsing across parallel worker processes in dynamic batches."""
+_INCLUDE_REGEX = re.compile(r'^\s*#\s*include\s*["<]([^">]+)[">]', re.M)
+
+
+def order_changed_files(regular_files: list[str], working_dir: str | None) -> list[str]:
+    """Topologically sort changed files so header files (.h) are parsed before dependent .c/.S files."""
+    if not regular_files or not working_dir:
+        return regular_files
+
+    header_items = []
+    other_items = []
+    header_path_to_item = {}
+
+    for item in regular_files:
+        fpath = item.split("\t")[-1]
+        if fpath.endswith((".h", ".hpp", ".hxx")):
+            header_items.append(item)
+            header_path_to_item[fpath] = item
+        else:
+            other_items.append(item)
+
+    if len(header_items) <= 1:
+        return header_items + other_items
+
+    # Build dependency graph between changed headers
+    # edge A -> B means B includes A (A must be parsed before B)
+    graph = defaultdict(set)
+    in_degree = defaultdict(int)
+    for fpath in header_path_to_item:
+        in_degree[fpath] = 0
+
+    for fpath, item in header_path_to_item.items():
+        if item.startswith("D"):
+            continue
+        full_path = os.path.join(working_dir, fpath)
+        try:
+            with open(full_path, "r", encoding="latin-1", errors="ignore") as f:
+                content = f.read(131072)  # Read up to 128KB
+        except Exception:
+            continue
+
+        for inc_match in _INCLUDE_REGEX.finditer(content):
+            inc_target = inc_match.group(1)
+            target_fpath = None
+            if inc_target in header_path_to_item:
+                target_fpath = inc_target
+            elif f"include/{inc_target}" in header_path_to_item:
+                target_fpath = f"include/{inc_target}"
+            else:
+                rel_candidate = os.path.normpath(os.path.join(os.path.dirname(fpath), inc_target))
+                if rel_candidate in header_path_to_item:
+                    target_fpath = rel_candidate
+
+            if target_fpath and target_fpath != fpath:
+                if fpath not in graph[target_fpath]:
+                    graph[target_fpath].add(fpath)
+                    in_degree[fpath] += 1
+
+    # Kahn's algorithm for topological sort
+    zero_in = deque([f for f, deg in in_degree.items() if deg == 0])
+    sorted_header_paths = []
+
+    while zero_in:
+        node = zero_in.popleft()
+        sorted_header_paths.append(node)
+        for neighbor in graph[node]:
+            in_degree[neighbor] -= 1
+            if in_degree[neighbor] == 0:
+                zero_in.append(neighbor)
+
+    # If cyclic dependencies exist, append remaining headers in their original order
+    if len(sorted_header_paths) < len(header_path_to_item):
+        seen = set(sorted_header_paths)
+        for item in header_items:
+            fpath = item.split("\t")[-1]
+            if fpath not in seen:
+                sorted_header_paths.append(fpath)
+                seen.add(fpath)
+
+    sorted_headers = [header_path_to_item[fpath] for fpath in sorted_header_paths]
+    return sorted_headers + other_items
+
+
+class DependencyScheduler:
+    """Dependency-driven ChangeSet resolution and execution scheduler with two-stage streaming ingestion."""
+
+    def __init__(self, gp_ref: GreatProcessor, chunk_commit_interval: int = 0, streaming: bool = True) -> None:
+        self.gp = gp_ref
+        self.streaming = streaming
+        self.deferred_queue: deque[str] = deque()
+        self.completed: set[str] = set()
+        self.executed_count = 0
+        self.chunk_commit_interval = chunk_commit_interval if chunk_commit_interval > 0 else 1000
+
+    def ingest_batch(self, batch_dict: dict[str, ChangeSet], is_header_stage: bool = False) -> None:
+        """Ingest newly arrived ChangeSets from a worker batch into gp.ChangeSet_Dict."""
+        # 1. Extract lightweight foreign dependencies into gp.file_deps before compression
+        for path, cs_obj in batch_dict.items():
+            f_deps = getattr(cs_obj, "foreign_deps", None)
+            if f_deps:
+                self.gp.file_deps[path] = set(f_deps)
+            else:
+                self.gp.file_deps[path] = set()
+
+        purged = execute_and_purge(batch_dict)
+        self.gp.ChangeSet_Dict.update(purged)
+        for path, cs_obj in purged.items():
+            if getattr(cs_obj, "cs_processed", False):
+                self.completed.add(path)
+
+        if not is_header_stage:
+            # During source stage (or standalone test ingestion), execute ChangeSets immediately in streaming mode!
+            for path, cs_obj in purged.items():
+                if path in self.completed:
+                    continue
+                cs_obj.gp = self.gp
+                if cs_obj.execute():
+                    self.completed.add(path)
+                    self.executed_count += 1
+                    extract_tags_and_evacuate_cs(cs_obj)
+                    self.gp.ChangeSet_Dict[path] = cs_obj
+                    if self.executed_count % self.chunk_commit_interval == 0:
+                        G.TE.commit_all()
+                        reclaim_system_memory()
+                else:
+                    # Unresolvable reference: defer to final wave pass
+                    if hasattr(cs_obj, "clear_bloat"):
+                        cs_obj.clear_bloat()
+                    else:
+                        cs_obj.gp = None
+                    self.gp.ChangeSet_Dict[path] = cs_obj
+                    self.deferred_queue.append(path)
+
+    def resolve_headers(self) -> None:
+        """Resolve all remaining header ChangeSets in wave order, breaking circular deadlocks with stubs."""
+        execute_phase2_parallel_waves(self.gp, chunk_commit_interval=self.chunk_commit_interval, completed_set=self.completed)
+        self.completed.update(self.gp.ChangeSet_Dict.keys())
+        self.executed_count = len(self.completed)
+        G.TE.commit_all()
+        reclaim_system_memory()
+
+    def finalize(self) -> None:
+        """Finalize resolution of all remaining ChangeSets via Phase 2 wave-based execution."""
+        # 1. Drain deferred queue (rare C-to-C references) with force_stubs=True if needed
+        while self.deferred_queue:
+            current_cs = self.deferred_queue.popleft()
+            if current_cs in self.completed:
+                continue
+            cs_obj = self.gp.ChangeSet_Dict.get(current_cs)
+            if cs_obj is None:
+                continue
+            cs_obj.gp = self.gp
+            cs_obj.execute(force_stubs=True)
+            self.completed.add(current_cs)
+            self.executed_count += 1
+            extract_tags_and_evacuate_cs(cs_obj)
+            self.gp.ChangeSet_Dict[current_cs] = cs_obj
+
+        # 2. If any unexecuted ChangeSets remain, run wave resolution
+        execute_phase2_parallel_waves(self.gp, chunk_commit_interval=self.chunk_commit_interval, completed_set=self.completed)
+        self.completed.update(self.gp.ChangeSet_Dict.keys())
+        self.executed_count = len(self.completed)
+        G.TE.commit_all()
+        reclaim_system_memory()
+
+
+
+def execute_phase2_parallel_waves(
+    gp: GreatProcessor,
+    chunk_commit_interval: int = 0,
+    completed_set: set[str] | None = None,
+) -> None:
+    """Execute unexecuted ChangeSets using in-process O(1) wave-based resolution.
+
+    Eliminates 64GB memory spikes by tracking only path strings in remaining and deps (9MB DAG),
+    decompressing ChangeSets on-demand from LRU cache per wave, and immediately evacuating AST
+    buffers upon execution while committing to MariaDB every 1,000 ChangeSets.
+    """
+    if chunk_commit_interval <= 0:
+        chunk_commit_interval = 1000
+
+    if completed_set is None:
+        completed_set = set()
+
+    # If file_deps is not yet populated (e.g. synthetic test), populate from ChangeSet_Dict
+    if not gp.file_deps and gp.ChangeSet_Dict:
+        for path, cs_obj in gp.ChangeSet_Dict.items():
+            f_deps = getattr(cs_obj, "foreign_deps", None)
+            if f_deps is None:
+                f_deps = set()
+                cs_ops = getattr(cs_obj, "cs", [])
+                for op in cs_ops:
+                    if op and len(op) >= 3 and is_data_unsafe(op[2]):
+                        for col in op[2]:
+                            if type(col) is tuple and len(col) == 3 and col[1] == OP_REF and col[2] and col[2][0] == REF_FILE:
+                                f_deps.add(col[2][1])
+                cs_obj.foreign_deps = f_deps
+            gp.file_deps[path] = set(f_deps)
+            if getattr(cs_obj, "cs_processed", False):
+                completed_set.add(path)
+
+    # 1. Identify all remaining unexecuted paths (<2.5 MB)
+    remaining: set[str] = set()
+    for path in gp.file_deps.keys():
+        if path in completed_set:
+            continue
+        cs = gp.ChangeSet_Dict.get(path)
+        if cs is None:
+            continue
+        if not getattr(cs, "cs_processed", False) or (getattr(cs, "unresolved_indices", None) is not None and len(cs.unresolved_indices) > 0):
+            remaining.add(path)
+        else:
+            completed_set.add(path)
+
+    if not remaining:
+        return
+
+    logger.info(COLOR.cyan(f"[Phase 2] {len(remaining)} unexecuted ChangeSets entering wave resolution."))
+
+    # 2. Build lightweight dependency DAG and inverted dependent mapping (~10 MB)
+    dependents: dict[str, set[str]] = defaultdict(set)
+    deps: dict[str, set[str]] = {}
+    for path in remaining:
+        f_deps = {target for target in gp.file_deps.get(path, ()) if target in remaining and target != path}
+        deps[path] = f_deps
+        for target in f_deps:
+            dependents[target].add(path)
+
+    wave_num = 0
+    executed_count = 0
+    last_commit_count = 0
+    t_phase2_start = time.perf_counter()
+    resolution_succeeded = False
+
+    try:
+        while remaining:
+            wave_num += 1
+            t_wave_start = time.perf_counter()
+            # Wave selection: files with no unexecuted dependencies in remaining
+            wave = [p for p in remaining if not deps.get(p)]
+
+            if not wave:
+                # Deadlock detected: cycle breaking on candidate with most dependents
+                dep_counts = {p: len(dependents.get(p, ())) for p in remaining}
+                best_cand = max(remaining, key=lambda k: (dep_counts[k], -len(getattr(gp.ChangeSet_Dict.get(k), "cs", ()) or ())))
+                cand_cs = gp.ChangeSet_Dict[best_cand]
+                cand_cs.gp = gp
+                unresolved_cnt = len(cand_cs.unresolved_indices) if getattr(cand_cs, "unresolved_indices", None) is not None else len(getattr(cand_cs, "cs", ()) or ())
+                logger.warning(COLOR.yellow(
+                    f"[Phase 2] Breaking circular dependency deadlock: force-resolving stub for '{best_cand}' "
+                    f"({dep_counts[best_cand]} dependents, {unresolved_cnt} ops remaining)"
+                ))
+
+                cand_cs.execute(force_stubs=True)
+                extract_tags_and_evacuate_cs(cand_cs)
+                gp.ChangeSet_Dict[best_cand] = cand_cs
+                remaining.remove(best_cand)
+                completed_set.add(best_cand)
+                if best_cand in deps:
+                    del deps[best_cand]
+                for waiter in dependents.pop(best_cand, ()):
+                    if waiter in deps:
+                        deps[waiter].discard(best_cand)
+                executed_count += 1
+
+                if executed_count - last_commit_count >= chunk_commit_interval:
+                    logger.info(COLOR.yellow(
+                        f"[Phase 2] Chunk commit: committing batch at {executed_count} executed ChangeSets to database..."
+                    ))
+                    G.TE.commit_all()
+                    reclaim_system_memory()
+                    last_commit_count = executed_count
+                continue
+
+            logger.info(COLOR.cyan(
+                f"[Phase 2] Wave {wave_num}: resolving {len(wave)} files in parallel ({len(remaining)} remaining)..."
+            ))
+
+            for path in wave:
+                cs = gp.ChangeSet_Dict[path]
+                cs.gp = gp
+                cs.execute()
+                extract_tags_and_evacuate_cs(cs)
+                gp.ChangeSet_Dict[path] = cs
+                remaining.remove(path)
+                completed_set.add(path)
+                if path in deps:
+                    del deps[path]
+                for waiter in dependents.pop(path, ()):
+                    if waiter in deps:
+                        deps[waiter].discard(path)
+                executed_count += 1
+
+                if executed_count - last_commit_count >= chunk_commit_interval:
+                    logger.info(COLOR.yellow(
+                        f"[Phase 2] Chunk commit: committing batch at {executed_count} executed ChangeSets to database..."
+                    ))
+                    G.TE.commit_all()
+                    reclaim_system_memory()
+                    last_commit_count = executed_count
+
+            wave_elapsed = time.perf_counter() - t_wave_start
+            velocity = len(wave) / max(0.001, wave_elapsed)
+            logger.info(COLOR.green(
+                f"[Phase 2] Wave {wave_num} resolved {len(wave)} files in {wave_elapsed:.2f}s "
+                f"({velocity:.1f} files/s). {len(remaining)} files remaining."
+            ))
+
+        resolution_succeeded = True
+    finally:
+        if resolution_succeeded and executed_count > last_commit_count:
+            logger.info(COLOR.yellow(
+                f"[Phase 2] Chunk commit: committing final batch at {executed_count} executed ChangeSets to database..."
+            ))
+            G.TE.commit_all()
+            reclaim_system_memory()
+
+    total_phase2_time = time.perf_counter() - t_phase2_start
+    avg_velocity = executed_count / max(0.001, total_phase2_time)
+    logger.info(COLOR.green(
+        f"[Phase 2] Completed resolution of {executed_count} ChangeSets across {wave_num} waves "
+        f"in {total_phase2_time:.1f}s ({avg_velocity:.1f} files/s)."
+    ))
+
+
+def trigger_multicore(batch_size: int | None = None, scheduler: DependencyScheduler | None = None) -> None:
+    """Distribute file parsing across parallel worker processes in two persistent stages: headers first, then sources."""
     change_list = gp.Change_List or []
     working_dir = MF.version_dict.get(gp.Version_Name)
 
@@ -354,7 +715,22 @@ def trigger_multicore(batch_size: int | None = None) -> None:
         gp.Symlink_List = []
     gp.Symlink_List.extend(symlink_files)
 
+    # Order regular files: header DAG first
+    regular_files = order_changed_files(regular_files, working_dir)
+    gp._changed_paths_set = set(item.split("\t")[-1] for item in (regular_files + symlink_files) if item)
+
+    header_files = []
+    source_files = []
+    for item in regular_files:
+        fpath = item.split("\t")[-1]
+        if fpath.endswith((".h", ".hpp", ".hxx")):
+            header_files.append(item)
+        else:
+            source_files.append(item)
+
     total_files = len(regular_files)
+    total_headers = len(header_files)
+    total_sources = len(source_files)
 
     if batch_size is None:
         if G.VERY_LOW_MEMORY_MODE:
@@ -369,10 +745,12 @@ def trigger_multicore(batch_size: int | None = None) -> None:
     else:
         num_workers = max(1, int(G.CPUS - 1))
 
-    total_batches = (total_files + batch_size - 1) // batch_size if total_files > 0 else 0
+    total_header_batches = (total_headers + batch_size - 1) // batch_size if total_headers > 0 else 0
+    total_source_batches = (total_sources + batch_size - 1) // batch_size if total_sources > 0 else 0
+    total_batches = total_header_batches + total_source_batches
 
     logger.info(
-        f"Distributing {total_files} changed files in {total_batches} batches "
+        f"Distributing {total_files} changed files ({total_headers} headers, {total_sources} sources) in {total_batches} batches "
         f"(batch size: {batch_size}, memory mode: {G.MEMORY_MODE}) across {num_workers} parallel workers"
     )
 
@@ -380,17 +758,33 @@ def trigger_multicore(batch_size: int | None = None) -> None:
     if total_files == 0:
         processing_dirs()
         processing_unchanges()
+        if scheduler is not None and gp.ChangeSet_Dict:
+            scheduler.ingest_batch(dict(gp.ChangeSet_Dict), is_header_stage=False)
         return
+
+    # Close active DB connection in parent before forking child worker processes
+    # to prevent inherited socket file descriptor sharing / corruption across fork
+    if getattr(G.TE, "db", None) is not None:
+        try:
+            G.TE.db.close()
+        except Exception:
+            pass
+        G.TE.db = None
 
     task_queue = multiprocessing.Queue()
     result_queue = multiprocessing.Queue()
     error_queue = multiprocessing.Queue()
 
-    for i in range(0, total_files, batch_size):
-        task_queue.put((i // batch_size, regular_files[i : i + batch_size]))
+    # Enqueue all header batches first, followed immediately by all source batches
+    for i in range(0, total_headers, batch_size):
+        task_queue.put((i // batch_size, header_files[i : i + batch_size]))
 
+    for i in range(0, total_sources, batch_size):
+        task_queue.put((total_header_batches + i // batch_size, source_files[i : i + batch_size]))
+
+    # Enqueue termination sentinels for workers
     for _ in range(num_workers):
-        task_queue.put(None)  # Sentinel to terminate each worker
+        task_queue.put(None)
 
     processes = []
     for worker_id in range(num_workers):
@@ -401,34 +795,123 @@ def trigger_multicore(batch_size: int | None = None) -> None:
         processes.append(p)
         p.start()
 
+    # Re-initialize dedicated DB connection in parent process after workers have forked
+    G.TE.start_new_db(G.DB)
+
     # needs to be try: protected
     processing_dirs()
     processing_unchanges()
 
+    # Ingest initial directory and unchanged ChangeSets staged before worker results
+    if scheduler is not None and gp.ChangeSet_Dict:
+        scheduler.ingest_batch(dict(gp.ChangeSet_Dict), is_header_stage=True)
+
+    # Stage 1: Receive all header batches
+    header_batches_received = 0
+    early_source_batches: list[tuple[int, bytes]] = []
+    source_batches_received = 0
     finished_workers = 0
+    t_stage1_start = time.perf_counter()
+
+    while header_batches_received < total_header_batches:
+        try:
+            item = result_queue.get()
+            if item is None:
+                finished_workers += 1
+                continue
+            batch_id, compressed = item
+            if batch_id < total_header_batches:
+                header_batches_received += 1
+                if compressed is not None:
+                    try:
+                        raw_bytes = zlib.decompress(compressed)
+                        partial_dict = pickle.loads(raw_bytes)
+                        del raw_bytes
+                    except Exception:
+                        partial_dict = pickle.loads(compressed)
+
+                    if scheduler is not None:
+                        scheduler.ingest_batch(partial_dict, is_header_stage=True)
+                    else:
+                        gp.ChangeSet_Dict.update(execute_and_purge(partial_dict))
+                    del partial_dict
+
+                if header_batches_received % 10 == 0 or header_batches_received == total_header_batches:
+                    elapsed = time.perf_counter() - t_stage1_start
+                    velocity = header_batches_received / max(0.001, elapsed)
+                    logger.info(
+                        f"[Stage 1 - Headers] Ingested header batch {header_batches_received}/{total_header_batches} "
+                        f"({velocity:.1f} batches/s, elapsed {elapsed:.1f}s)"
+                    )
+            else:
+                # Source batch finished ahead of slower header batch: buffer compressed payload
+                if compressed is not None:
+                    early_source_batches.append((batch_id, compressed))
+        except Exception as e:
+            logger.error(f"Error reading header batch result: {e}")
+            break
+        reclaim_system_memory()
+
+    # Resolve Stage 1: All headers in wave order
+    if scheduler is not None and total_headers > 0:
+        logger.info(COLOR.cyan(f"[Stage 1 - Headers] Resolving {total_headers} header files in wave order..."))
+        scheduler.resolve_headers()
+        logger.info(COLOR.green(f"[Stage 1 - Headers] Header resolution complete. {len(gp.file_symbols)} header symbol tables indexed."))
+
+    # Stage 2: Stream source batches
+    t_stage2_start = time.perf_counter()
+
+    # First drain any early source batches that were buffered
+    if early_source_batches:
+        logger.info(f"[Stage 2 - Sources] Streaming {len(early_source_batches)} buffered source batches...")
+        for batch_id, compressed in early_source_batches:
+            source_batches_received += 1
+            try:
+                raw_bytes = zlib.decompress(compressed)
+                partial_dict = pickle.loads(raw_bytes)
+                del raw_bytes
+            except Exception:
+                partial_dict = pickle.loads(compressed)
+
+            if scheduler is not None:
+                scheduler.ingest_batch(partial_dict, is_header_stage=False)
+            else:
+                gp.ChangeSet_Dict.update(execute_and_purge(partial_dict))
+            del partial_dict
+        early_source_batches.clear()
+        reclaim_system_memory()
+
     while finished_workers < num_workers:
         try:
             item = result_queue.get()
             if item is None:
                 finished_workers += 1
-            else:
+                continue
+            batch_id, compressed = item
+            source_batches_received += 1
+            if compressed is not None:
                 try:
-                    raw_bytes = zlib.decompress(item)
+                    raw_bytes = zlib.decompress(compressed)
                     partial_dict = pickle.loads(raw_bytes)
                     del raw_bytes
                 except Exception:
-                    partial_dict = pickle.loads(item)
+                    partial_dict = pickle.loads(compressed)
 
-                try:
+                if scheduler is not None:
+                    scheduler.ingest_batch(partial_dict, is_header_stage=False)
+                else:
                     gp.ChangeSet_Dict.update(execute_and_purge(partial_dict))
-                except Exception as e:
-                    logger.error(f"Error executing and purging worker batch result: {e}")
-                    gp.ChangeSet_Dict.update(partial_dict)
-
                 del partial_dict
-            del item
+
+            if source_batches_received % 10 == 0 or source_batches_received == total_source_batches:
+                elapsed = time.perf_counter() - t_stage2_start
+                velocity = source_batches_received / max(0.001, elapsed)
+                logger.info(
+                    f"[Stage 2 - Sources] Streamed source batch {source_batches_received}/{total_source_batches} "
+                    f"({velocity:.1f} batches/s, {finished_workers}/{num_workers} workers done, elapsed {elapsed:.1f}s)"
+                )
         except Exception as e:
-            logger.error(f"Error reading worker batch result: {e}")
+            logger.error(f"Error reading source batch result: {e}")
             break
         reclaim_system_memory()
 
@@ -467,6 +950,7 @@ def trigger_multicore(batch_size: int | None = None) -> None:
 
 def main() -> None:
     """Set the plan for what version to parse."""
+    setup_memory_limit(60.0)
     args = arg_handling()
     with G.DB() as db:
         if getattr(args, "reset", False) or getattr(args, "Drop", False):
@@ -488,12 +972,12 @@ def main() -> None:
                 except Exception:
                     pass
 
-
-    update("v3.0")
-    update("v3.1")
-    if True:
-        update("v3.2")
-        update("v3.3")
+    try:
+        update("v3.0")
+        update("v3.1")
+        if True:
+            update("v3.2")
+            update("v3.3")
         update("v3.4")
         update("v3.5")
         update("v3.6")
@@ -574,7 +1058,9 @@ def main() -> None:
         update("v7.0")
         update("v7.1")
         update("v7.2")
-
+    except MemoryError:
+        logger.critical(COLOR.red("FATAL: Memory limit of 60.0 GB (RLIMIT_AS) exceeded! Terminating execution cleanly."))
+        sys.exit(1)
 
     logger.info("We are done! Closing")
     G.emergency_shutdown(0)
@@ -996,7 +1482,7 @@ def file_processing_worker(
     sys.setrecursionlimit(50000)
     # Ensure dedicated DB connection per worker process to avoid socket sharing across fork
     try:
-        G.TE.db = G.DB()
+        G.TE.start_new_db(G.DB)
     except Exception as e:
         logger.error(f"Worker {worker_id} failed to initialize DB connection: {e}")
 
@@ -1015,16 +1501,25 @@ def file_processing_worker(
             batch_id, changed_files = task
             batch_cs_dict = {}
 
-            for changed_file in changed_files:
+            for f_idx, changed_file in enumerate(changed_files):
                 try:
                     CS = ChangeSet(changed_file)
                     CS.current_vid = vid
                     CS.gp = gp_ref
                     CS.mf = mf_ref
+                    CS.batch_cs_dict = batch_cs_dict
                     G.CURRENT_PARSING_FILE = CS.current_path
 
                     default_processing(CS)
                     CS.parse()
+
+                    # Pre-unpack intra-file AST view schemas in parallel workers to distribute CPU load
+                    if not G.VERY_LOW_MEMORY_MODE:
+                        CS.preprocess_ref_views()
+
+                    # In normal memory mode, pre-resolve unchanged DB dependencies to prune foreign_deps
+                    if not G.LOW_MEMORY_MODE and not G.VERY_LOW_MEMORY_MODE:
+                        CS.prune_unchanged_dependencies()
 
                     # Clean bloat and store in batch dict
                     CS.clear_bloat()
@@ -1037,20 +1532,26 @@ def file_processing_worker(
                 finally:
                     G.CURRENT_PARSING_FILE = None
 
+                # Periodic memory reclamation every 25 files to return heap pages to OS
+                if (f_idx + 1) % 25 == 0:
+                    reclaim_system_memory()
+
             if batch_cs_dict:
                 try:
                     raw_bytes = pickle.dumps(batch_cs_dict, protocol=pickle.HIGHEST_PROTOCOL)
                     compressed = zlib.compress(raw_bytes, level=1)
-                    result_queue.put(compressed)
+                    result_queue.put((batch_id, compressed))
                     del raw_bytes
                     del compressed
                 except Exception as e:
                     logger.error(COLOR.red(f"Worker {worker_id} failed to serialize batch {batch_id}: {e}"))
                     error_queue.put((f"Batch-{batch_id}", str(e), traceback.format_exc()))
+                    result_queue.put((batch_id, None))
+            else:
+                result_queue.put((batch_id, None))
 
             del batch_cs_dict
-            if G.LOW_MEMORY_MODE:
-                reclaim_system_memory()
+            reclaim_system_memory()
     finally:
         if getattr(G.TE, "db", None) is not None:
             try:

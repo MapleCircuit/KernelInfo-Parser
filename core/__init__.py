@@ -49,6 +49,7 @@ from core.globalstuff import (
     RefType,
     SafeDataType,
     UnSafeDataType,
+    setup_memory_limit,
 )
 
 from core.StringWrangler import (
@@ -149,6 +150,7 @@ __all__ = [
     "RefType",
     "SafeDataType",
     "UnSafeDataType",
+    "setup_memory_limit",
     # StringWrangler
     "wrap_lines",
     "render_ansi_box",

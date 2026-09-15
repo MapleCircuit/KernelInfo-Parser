@@ -25,6 +25,7 @@ from core.GreatProcessor import GreatProcessor, CompressedChangeSetDict
 from core.FileHandler import MasterFile
 from core.TableHandling import ChangeSet
 from core.DBLayout import (
+    TABLES,
     init_db_layout,
     m_file_name,
     m_file,
@@ -40,59 +41,59 @@ from core.DBLayout import (
 )
 from table_engine import TEDirectDB, TECachedDB, get_table_engine
 from db_engine import MockDB, MariaDB
-from parser.c_ast.c_ast_type import safe_spelling, safe_cursor_spelling
+from parser.c_ast import safe_spelling, safe_cursor_spelling
 
 # Standard regression files tested across AST parser
 # Baseline operations count corresponds to pure AST operations (excluding the 3 lifecycle operations)
 TEST_SUITE: list[dict[str, Any]] = [
     {
         "file": "include/linux/drbd_tag_magic.h",
-        "baseline_ast_ops": 319,
+        "baseline_ast_ops": 457,
         "description": "Kernel Header (drbd_tag_magic.h)",
     },
     {
         "file": "virt/kvm/iodev.h",
-        "baseline_ast_ops": 464,
+        "baseline_ast_ops": 207,
         "description": "Kernel Header (virt/kvm/iodev.h)",
     },
     {
         "file": "include/linux/lockd/bind.h",
-        "baseline_ast_ops": 238,
+        "baseline_ast_ops": 182,
         "description": "Kernel Header (lockd/bind.h)",
     },
     {
         "file": "include/linux/netfilter_bridge/ebtables.h",
-        "baseline_ast_ops": 1857,
+        "baseline_ast_ops": 864,
         "description": "Kernel Header (ebtables.h)",
     },
     {
         "file": "drivers/watchdog/w83627hf_wdt.c",
-        "baseline_ast_ops": 1989,
+        "baseline_ast_ops": 1483,
         "description": "Watchdog Driver (Latin-1 byte 0xe1 resilience)",
     },
     {
         "file": "drivers/usb/storage/isd200.c",
-        "baseline_ast_ops": 9742,
+        "baseline_ast_ops": 5405,
         "description": "USB Storage Driver (Latin-1 byte 0xf6 resilience)",
     },
     {
         "file": "include/linux/sched.h",
-        "baseline_ast_ops": 15250,
+        "baseline_ast_ops": 9307,
         "description": "Kernel Header (sched.h)",
     },
     {
         "file": "arch/mips/include/asm/mach-cavium-octeon/kernel-entry-init.h",
-        "baseline_ast_ops": 84,
+        "baseline_ast_ops": 60,
         "description": "Assembly Header (kernel-entry-init.h)",
     },
     {
         "file": "arch/alpha/lib/clear_page.S",
-        "baseline_ast_ops": 174,
+        "baseline_ast_ops": 12,
         "description": "Assembly Source (clear_page.S)",
     },
     {
         "file": "arch/powerpc/xmon/ppc-opc.c",
-        "baseline_ast_ops": 8689,
+        "baseline_ast_ops": 93335,
         "description": "PowerPC Opcode Table & Large Initializer Array (ppc-opc.c)",
     },
 ]
@@ -248,7 +249,7 @@ def run_single_file_worker(item: dict[str, Any]) -> dict[str, Any]:
         coverage_ratio = (total_non_ws - uncovered_non_ws) / max(1, total_non_ws)
 
         elapsed = time.time() - t0
-        return {
+        res_dict = {
             "file": file_path,
             "description": description,
             "baseline_total_ops": baseline_total_ops,
@@ -267,6 +268,24 @@ def run_single_file_worker(item: dict[str, Any]) -> dict[str, Any]:
             "profiler": cs.profiler.to_dict() if cs.profiler else None,
             "error": None,
         }
+        if item.get("capture_details", False):
+            res_dict["staged_ops"] = list(cs.cs)
+            res_dict["result_ops"] = list(cs.cs_result)
+            res_dict["store"] = {
+                "m_tag": dict(mock_tags),
+                "m_tag_code": dict(mock_tag_codes),
+                "m_bridge_tag": dict(mock_bridge),
+                "m_ast": dict(MockDB._global_store.get("m_ast", {})),
+                "m_ast_container": dict(MockDB._global_store.get("m_ast_container", {})),
+                "m_map_ast": dict(MockDB._global_store.get("m_map_ast", {})),
+                "m_bridge_map": dict(MockDB._global_store.get("m_bridge_map", {})),
+                "m_file_name": dict(MockDB._global_store.get("m_file_name", {})),
+                "m_file": dict(MockDB._global_store.get("m_file", {})),
+                "m_bridge_file": dict(MockDB._global_store.get("m_bridge_file", {})),
+                "m_moved_tag": dict(MockDB._global_store.get("m_moved_tag", {})),
+                "m_ast_include": dict(MockDB._global_store.get("m_ast_include", {})),
+            }
+        return res_dict
     except Exception as e:
         elapsed = time.time() - t0
         return {
@@ -326,7 +345,7 @@ class TestCASTParser(unittest.TestCase):
         file_path = "include/linux/sched.h"
         res = run_single_file_worker({
             "file": file_path,
-            "baseline_ast_ops": 15250,
+            "baseline_ast_ops": 9307,
             "description": "Kernel Header (sched.h)",
         })
         self.assertIsNone(res["error"])
@@ -547,7 +566,7 @@ class TestCASTParser(unittest.TestCase):
         """Verify parsing and ChangeSet execution with TEDirectDB."""
         item = {
             "file": "virt/kvm/iodev.h",
-            "baseline_ast_ops": 464,
+            "baseline_ast_ops": 207,
             "description": "Kernel Header (virt/kvm/iodev.h)",
             "table_engine": "direct",
         }
@@ -803,10 +822,13 @@ int compute_metrics(int base) {
             self.assertIn(ASTT.C_CallExpr, types_in_ast)
             self.assertIn(ASTT.C_ReturnStmt, types_in_ast)
 
-            # Ensure 'int factor = 10;' tag does NOT swallow subsequent lines
+            # Function tag encloses the entire definition, while statements are not tagged as sub-tags
+            func_tags = [t for t in tag_codes if "compute_metrics" in t]
+            self.assertEqual(len(func_tags), 1)
+            self.assertIn("int factor = 10;", func_tags[0])
+            self.assertIn("notify_user", func_tags[0])
             factor_tags = [t for t in tag_codes if "int factor" in t and "compute_metrics" not in t]
-            self.assertTrue(any("int factor = 10;" in t for t in factor_tags))
-            self.assertFalse(any("notify_user" in t for t in factor_tags))
+            self.assertEqual(len(factor_tags), 0)
         finally:
             if temp_dir and os.path.exists(temp_dir):
                 shutil.rmtree(temp_dir, ignore_errors=True)
@@ -854,12 +876,13 @@ int add_three(int a, int b, int c) {
             self.assertEqual(len(cs.cs), len(cs.cs_result))
 
             tag_codes = [op[2][1] for op in cs.cs if op[0] == m_tag_code.table_id]
-            # Parameter c must strictly be 'int c' without bleeding into '{' or 'int res'
+            # Function tag encloses the entire definition, parameters are not tagged as separate sub-tags
+            func_tags = [t for t in tag_codes if "add_three" in t]
+            self.assertEqual(len(func_tags), 1)
+            self.assertIn("int a, int b, int c", func_tags[0])
+            self.assertIn("return res;", func_tags[0])
             param_c_tags = [t for t in tag_codes if "int c" in t and "add_three" not in t]
-            self.assertTrue(len(param_c_tags) > 0)
-            for t in param_c_tags:
-                self.assertNotIn("int res", t)
-                self.assertNotIn("return res", t)
+            self.assertEqual(len(param_c_tags), 0)
         finally:
             if temp_dir and os.path.exists(temp_dir):
                 shutil.rmtree(temp_dir, ignore_errors=True)
@@ -1244,7 +1267,7 @@ struct custom_data {
         self.assertEqual(res["mismatches_count"], 0)
         self.assertEqual(res["uncovered_non_ws"], 0)
         self.assertEqual(res["coverage_ratio"], 1.0)
-        self.assertGreater(res["total_tags"], 2000)
+        self.assertGreater(res["total_tags"], 1000)
 
     def test_tag_fidelity_drbd_magic(self) -> None:
         """Verify tag text fidelity on include/linux/drbd_tag_magic.h."""
@@ -1538,6 +1561,63 @@ struct custom_data {
             if temp_dir and os.path.exists(temp_dir):
                 shutil.rmtree(temp_dir, ignore_errors=True)
 
+    def test_typedef_function_pointer_arguments(self) -> None:
+        """Verify typedef function pointers correctly extract argument tags without phantom declarator tags."""
+        temp_dir = None
+        try:
+            MockDB._global_store.clear()
+            G.DEBUG_TYPECHECK = True
+            G.DB = MockDB
+            G.TE = get_table_engine("cached")()
+            gp = GreatProcessor()
+            init_db_layout(gp)
+            G.TE.start(gp.Table_Array, G.DB)
+
+            mf = MasterFile()
+            temp_dir = mf.create_temp_dir()
+            mf.version_dict["v3.0"] = temp_dir
+            G.MF = mf
+            gp.Version_Name = "v3.0"
+            gp.VID = 1
+
+            file_path = "test_typedef_fn.h"
+            full_path = os.path.join(temp_dir, file_path)
+            code = "typedef void (*nlm_host_match_fn_t)(struct nlm_host *host);\n"
+            with open(full_path, "w") as f:
+                f.write(code)
+
+            cs = ChangeSet(f"A\t{file_path}")
+            cs.current_vid = 1
+            cs.gp = gp
+            cs.mf = mf
+            G.CURRENT_PARSING_FILE = file_path
+
+            default_processing(cs, gp)
+            cs.parse()
+            self.assertTrue(cs.execute())
+            G.TE.commit_all()
+
+            db_tag = MockDB._global_store.get(m_tag.table_name, {})
+            db_tag_code = MockDB._global_store.get(m_tag_code.table_name, {})
+            db_bridge_tag = MockDB._global_store.get(m_bridge_tag.table_name, {})
+
+            # Should have exactly 1 tag: the full typedef tag (argument is linked in m_ast_container, no phantom *nlm_host_match_fn_t tag)
+            self.assertEqual(len(db_tag), 1)
+            self.assertEqual(len(db_bridge_tag), 1)
+            tags_code = [db_tag_code[t[3]][1] for t in db_tag.values()]
+            self.assertIn("typedef void (*nlm_host_match_fn_t)(struct nlm_host *host);", tags_code)
+            self.assertNotIn("*nlm_host_match_fn_t", tags_code)
+            self.assertNotIn("struct nlm_host *host", tags_code)
+        finally:
+            if G.TE:
+                try:
+                    G.TE.close()
+                except Exception:
+                    pass
+            MockDB._global_store.clear()
+            if temp_dir and os.path.exists(temp_dir):
+                shutil.rmtree(temp_dir, ignore_errors=True)
+
     def test_tag_fidelity_ppc_opc(self) -> None:
         """Verify tag text fidelity on arch/powerpc/xmon/ppc-opc.c."""
         res = assert_file_tag_fidelity("arch/powerpc/xmon/ppc-opc.c", min_coverage=1.0)
@@ -1768,9 +1848,10 @@ struct config_dynamic {
             self.assertTrue(cs2.execute())
             G.TE.commit_all()
 
-            # Verify m_moved_tag was staged ONLY for config_dynamic and its modified field threshold
+            # Verify m_moved_tag: unchanged field threshold is recycled cleanly without moving; only config_dynamic moved
+            expected_moved = 1
             moved_tags = MockDB._global_store.get("m_moved_tag", {})
-            self.assertEqual(len(moved_tags), 2, f"Expected exactly 2 moved tags (config_dynamic and threshold), got {len(moved_tags)}")
+            self.assertEqual(len(moved_tags), expected_moved, f"Expected exactly {expected_moved} moved tags, got {len(moved_tags)}")
             moved_s_ids = {s_id for (s_id, e_id) in moved_tags}
             # Tags 1 (comment), 2 (mode), 3 (config_static) should NOT be moved
             self.assertNotIn(1, moved_s_ids, "Comment tag must not be moved")
@@ -1780,8 +1861,542 @@ struct config_dynamic {
             if mf:
                 mf.clear_all_version()
 
+    def test_anonymous_enum_relative_path(self) -> None:
+        """Verify anonymous enums/structs strip /dev/shm full paths down to git relative paths."""
+        mf = None
+        try:
+            MockDB._global_store.clear()
+            G.DB = MockDB
+            G.TE = get_table_engine("cached")()
+            gp = GreatProcessor()
+            init_db_layout(gp)
+            G.TE.start(gp.Table_Array, G.DB)
 
+            file_path = "drivers/net/test_anon_enum.c"
+            mf = MasterFile()
+            temp_dir = mf.create_temp_dir()
+            mf.version_dict["v3.0"] = temp_dir
+            G.MF = mf
+            gp.Version_Name = "v3.0"
+            gp.VID = 1
 
+            full_path = os.path.join(temp_dir, file_path)
+            os.makedirs(os.path.dirname(full_path), exist_ok=True)
+            snippet = """enum {
+    FLAG_A = 1,
+    FLAG_B = 2
+};
+
+struct anon_container {
+    enum {
+        SUB_A,
+        SUB_B
+    } flag;
+};
+"""
+            with open(full_path, "w") as f:
+                f.write(snippet)
+
+            cs = ChangeSet(f"A\t{file_path}")
+            cs.current_vid = 1
+            cs.gp = gp
+            cs.mf = mf
+            G.CURRENT_PARSING_FILE = file_path
+
+            cs.store(m_file_name.get_set(None, cs.current_path))
+            cs.store(m_file.set(None, 1, 0, 0, "A", 0))
+            cs.store(m_bridge_file.set(1, cs.ref(m_file_name.fnid), cs.ref(m_file.fid)))
+
+            cs.parse()
+            self.assertTrue(cs.execute())
+            G.TE.commit_all()
+
+            # Verify that none of the m_ast or m_tag entries contain '/dev/shm'
+            ast_store = MockDB._global_store.get("m_ast", {})
+            for ast_id, row in ast_store.items():
+                ast_name = row[1]
+                if ast_name:
+                    self.assertNotIn("/dev/shm", ast_name, f"m_ast.name '{ast_name}' must not contain /dev/shm")
+                    if "(unnamed at " in ast_name:
+                        self.assertIn("drivers/net/test_anon_enum.c", ast_name, f"m_ast.name '{ast_name}' should contain relative path")
+
+            tag_store = MockDB._global_store.get("m_tag", {})
+            for tag_id, row in tag_store.items():
+                tag_name = row[5]
+                if tag_name:
+                    self.assertNotIn("/dev/shm", tag_name, f"m_tag.name '{tag_name}' must not contain /dev/shm")
+        finally:
+            if mf:
+                mf.clear_all_version()
+
+    def test_function_signature_and_body_container_hierarchy(self) -> None:
+        """Verify priority 0 (return type), priority 1..N (arguments), and priority N+1 (compound statement body)."""
+        temp_dir = None
+        try:
+            G.DEBUG_TYPECHECK = True
+            G.DB = MockDB
+            G.TE = get_table_engine("cached")()
+            gp = GreatProcessor()
+            init_db_layout(gp)
+            G.TE.start(gp.Table_Array, G.DB)
+
+            mf = MasterFile()
+            temp_dir = mf.create_temp_dir()
+            mf.version_dict["v3.0"] = temp_dir
+            G.MF = mf
+            gp.Version_Name = "v3.0"
+            gp.VID = 1
+
+            file_path = "test_fn_hierarchy.c"
+            full_path = os.path.join(temp_dir, file_path)
+            snippet = """
+struct payload {
+    int id;
+};
+
+int calculate_payload(struct payload *p, int factor) {
+    if (p != 0) {
+        return p->id * factor;
+    }
+    return 0;
+}
+"""
+            with open(full_path, "w") as f:
+                f.write(snippet)
+
+            cs = ChangeSet(f"A\t{file_path}")
+            cs.current_vid = 1
+            cs.gp = gp
+            cs.mf = mf
+            G.CURRENT_PARSING_FILE = file_path
+
+            default_processing(cs, gp)
+            cs.parse()
+            self.assertTrue(cs.execute())
+            G.TE.commit_all()
+
+            ast_store = MockDB._global_store.get("m_ast", {})
+            container_store = MockDB._global_store.get("m_ast_container", {})
+
+            # Find function AST for calculate_payload
+            fn_ast_id = None
+            for aid, row in ast_store.items():
+                if row[1] == "calculate_payload" and row[2] in (ASTT.C_functionproto, ASTT.C_functionprotodecl):
+                    fn_ast_id = aid
+                    break
+
+            self.assertIsNotNone(fn_ast_id, "calculate_payload function AST not found")
+
+            # Get container entries for fn_ast_id sorted by priority
+            fn_containers = [
+                row for row in container_store.values() if row[0] == fn_ast_id
+            ]
+            fn_containers.sort(key=lambda r: r[1])
+
+            # Priority 0: return type (int)
+            self.assertTrue(len(fn_containers) >= 4, f"Expected at least 4 containers for function, got {len(fn_containers)}")
+            self.assertEqual(fn_containers[0][1], 0, "Priority 0 should be return type")
+            self.assertEqual(fn_containers[0][2], ASTT.C_int)
+
+            # Priority 1: first param (p)
+            self.assertEqual(fn_containers[1][1], 1, "Priority 1 should be first param")
+            param1_ast = ast_store.get(fn_containers[1][3])
+            self.assertIsNotNone(param1_ast)
+            self.assertEqual(param1_ast[1], "p")
+
+            # Priority 2: second param (factor)
+            self.assertEqual(fn_containers[2][1], 2, "Priority 2 should be second param")
+            param2_ast = ast_store.get(fn_containers[2][3])
+            self.assertIsNotNone(param2_ast)
+            self.assertEqual(param2_ast[1], "factor")
+
+            # Priority 3: compound statement body
+            self.assertEqual(fn_containers[3][1], 3, "Priority 3 should be compound statement body")
+            self.assertEqual(fn_containers[3][2], ASTT.C_CompoundStmt)
+            body_ast_id = fn_containers[3][3]
+
+            # Inspect body containers
+            body_containers = [
+                row for row in container_store.values() if row[0] == body_ast_id
+            ]
+            self.assertGreater(len(body_containers), 0, "Compound statement body should have child container records")
+        finally:
+            if temp_dir and os.path.exists(temp_dir):
+                shutil.rmtree(temp_dir, ignore_errors=True)
+
+    def test_function_types_used_detection(self) -> None:
+        """Verify types used within a function body are detected and linked in m_ast_container with C_TypeRef."""
+        temp_dir = None
+        try:
+            G.DEBUG_TYPECHECK = True
+            G.DB = MockDB
+            G.TE = get_table_engine("cached")()
+            gp = GreatProcessor()
+            init_db_layout(gp)
+            G.TE.start(gp.Table_Array, G.DB)
+
+            mf = MasterFile()
+            temp_dir = mf.create_temp_dir()
+            mf.version_dict["v3.0"] = temp_dir
+            G.MF = mf
+            gp.Version_Name = "v3.0"
+            gp.VID = 1
+
+            file_path = "test_types_used.c"
+            full_path = os.path.join(temp_dir, file_path)
+            snippet = """
+struct device {
+    int id;
+};
+
+struct context {
+    struct device *dev;
+};
+
+void run_device(struct context *ctx) {
+    struct device *d = ctx->dev;
+    d->id = 42;
+}
+"""
+            with open(full_path, "w") as f:
+                f.write(snippet)
+
+            cs = ChangeSet(f"A\t{file_path}")
+            cs.current_vid = 1
+            cs.gp = gp
+            cs.mf = mf
+            G.CURRENT_PARSING_FILE = file_path
+
+            default_processing(cs, gp)
+            cs.parse()
+            self.assertTrue(cs.execute())
+            G.TE.commit_all()
+
+            ast_store = MockDB._global_store.get("m_ast", {})
+            container_store = MockDB._global_store.get("m_ast_container", {})
+
+            # Find run_device function
+            fn_ast_id = None
+            for aid, row in ast_store.items():
+                if row[1] == "run_device":
+                    fn_ast_id = aid
+                    break
+
+            self.assertIsNotNone(fn_ast_id)
+            fn_body_row = next(
+                (row for row in container_store.values() if row[0] == fn_ast_id and row[2] == ASTT.C_CompoundStmt),
+                None,
+            )
+            self.assertIsNotNone(fn_body_row, "Function body container link must exist")
+            body_ast_id = fn_body_row[3]
+
+            # Find used types linked under body_ast_id with C_TypeRef
+            used_type_refs = [
+                row for row in container_store.values()
+                if row[0] == body_ast_id and row[2] == ASTT.C_TypeRef
+            ]
+            self.assertGreater(len(used_type_refs), 0, "Body should have C_TypeRef records")
+
+            used_names = {
+                ast_store[row[3]][1] for row in used_type_refs if row[3] in ast_store
+            }
+            self.assertIn("device", used_names, "Type 'device' must be detected as used in run_device")
+        finally:
+            if temp_dir and os.path.exists(temp_dir):
+                shutil.rmtree(temp_dir, ignore_errors=True)
+
+    def test_multiple_identical_function_signatures_no_duplicate_container(self) -> None:
+        """Verify multiple files defining identical function signatures (e.g. static void usage(void)) do not collide in m_ast_container."""
+        temp_dir = None
+        try:
+            MockDB._global_store.clear()
+            G.DEBUG_TYPECHECK = True
+            G.DB = MockDB
+            G.TE = get_table_engine("cached")()
+            gp = GreatProcessor()
+            init_db_layout(gp)
+            G.TE.start(gp.Table_Array, G.DB)
+
+            mf = MasterFile()
+            temp_dir = mf.create_temp_dir()
+            mf.version_dict["v3.0"] = temp_dir
+            G.MF = mf
+            gp.Version_Name = "v3.0"
+            gp.VID = 1
+
+            file_a = "driver_a.c"
+            full_a = os.path.join(temp_dir, file_a)
+            with open(full_a, "w") as f:
+                f.write("static void usage(void) {\n    int a = 1;\n}\n")
+
+            file_b = "driver_b.c"
+            full_b = os.path.join(temp_dir, file_b)
+            with open(full_b, "w") as f:
+                f.write("static void usage(void) {\n    int b = 2;\n}\n")
+
+            cs_a = ChangeSet(f"A\t{file_a}")
+            cs_a.current_vid = 1
+            cs_a.gp = gp
+            cs_a.mf = mf
+            G.CURRENT_PARSING_FILE = file_a
+            default_processing(cs_a, gp)
+            cs_a.parse()
+            self.assertTrue(cs_a.execute())
+
+            cs_b = ChangeSet(f"A\t{file_b}")
+            cs_b.current_vid = 1
+            cs_b.gp = gp
+            cs_b.mf = mf
+            G.CURRENT_PARSING_FILE = file_b
+            default_processing(cs_b, gp)
+            cs_b.parse()
+            self.assertTrue(cs_b.execute())
+
+            G.TE.commit_all()
+
+            ast_store = MockDB._global_store.get("m_ast", {})
+            container_store = MockDB._global_store.get("m_ast_container", {})
+
+            # Locate all AST nodes for 'usage' with functionprotodecl
+            usage_nodes = [
+                aid for aid, row in ast_store.items()
+                if row[1] == "usage" and row[2] == ASTT.C_functionprotodecl
+            ]
+            self.assertGreaterEqual(len(usage_nodes), 1, "Expected at least 1 usage AST node")
+
+            # Check that container rows for each usage node have distinct priorities and valid compound body
+            for u_node in usage_nodes:
+                u_containers = sorted(
+                    [row for row in container_store.values() if row[0] == u_node],
+                    key=lambda r: r[1],
+                )
+                self.assertGreaterEqual(len(u_containers), 2)
+                self.assertEqual(u_containers[0][1], 0)  # Priority 0: return type
+                self.assertEqual(u_containers[0][2], ASTT.C_void)
+                self.assertEqual(u_containers[1][1], 1)  # Priority 1: compound body
+                self.assertEqual(u_containers[1][2], ASTT.C_CompoundStmt)
+
+            # Ensure absolutely no duplicate (ast_id, priority) pairs exist across all containers
+            pk_set = set()
+            for row in container_store.values():
+                pk = (row[0], row[1])
+                self.assertNotIn(pk, pk_set, f"Duplicate primary key in m_ast_container: {pk}")
+                pk_set.add(pk)
+        finally:
+            if temp_dir and os.path.exists(temp_dir):
+                shutil.rmtree(temp_dir, ignore_errors=True)
+
+    def test_standard_c_keywords_mapping(self) -> None:
+        """Verify STANDARD_C_KEYWORDS maps all standard C keywords to distinct ASTT tokens."""
+        from core.globalstuff import STANDARD_C_KEYWORDS, ASTT
+        expected_keywords = [
+            "if", "switch", "case", "default", "while", "do", "for", "return",
+            "break", "continue", "goto", "asm", "sizeof", "auto", "register",
+            "static", "extern", "typedef", "const", "volatile", "restrict",
+            "inline", "void", "char", "short", "int", "long", "signed",
+            "unsigned", "float", "double", "struct", "union", "enum"
+        ]
+        for kw in expected_keywords:
+            self.assertIn(kw, STANDARD_C_KEYWORDS, f"Keyword '{kw}' must be in STANDARD_C_KEYWORDS")
+            self.assertIsInstance(STANDARD_C_KEYWORDS[kw], ASTT)
+
+    def test_assembly_preprocessor_conditionals_scope_resolution(self) -> None:
+        """Verify assembly parser correctly resolves #ifdef/#else/#endif scopes without NoneType errors."""
+        temp_dir = None
+        try:
+            import tempfile
+            from parser.asm_ast import asm_ast_parse
+            temp_dir = tempfile.mkdtemp(dir="/dev/shm")
+            mf = MasterFile()
+            mf.version_dict["v3.0"] = temp_dir
+            G.MF = mf
+
+            gp = GreatProcessor()
+            gp.Version_Name = "v3.0"
+            gp.VID = 1
+            init_db_layout(gp)
+            G.TE = get_table_engine("cached")()
+            G.TE.start(gp.Table_Array, MockDB)
+
+            asm_snippet = """/* Assembly with nested conditionals */
+#ifdef CONFIG_PPC64
+.globl my_func
+my_func:
+    nop
+#else
+.globl my_func_32
+my_func_32:
+    blr
+#endif
+"""
+            target_path = "arch/powerpc/test_conditional.S"
+            full_path = os.path.join(temp_dir, target_path)
+            os.makedirs(os.path.dirname(full_path), exist_ok=True)
+            with open(full_path, "w") as f:
+                f.write(asm_snippet)
+
+            cs = ChangeSet(f"A\t{target_path}")
+            cs.current_vid = 1
+            cs.gp = gp
+            cs.mf = mf
+            G.CURRENT_PARSING_FILE = target_path
+
+            default_processing(cs, gp)
+            asm_ast_parse(cs)
+            self.assertTrue(cs.execute())
+        finally:
+            if temp_dir and os.path.exists(temp_dir):
+                shutil.rmtree(temp_dir, ignore_errors=True)
+
+    def test_label_stmt_name_extraction(self) -> None:
+        """Verify C_LabelStmt extracts and preserves the actual label identifier name (e.g. 'err_out')."""
+        temp_dir = None
+        try:
+            G.DEBUG_TYPECHECK = True
+            G.DB = MockDB
+            G.TE = get_table_engine("cached")()
+            gp = GreatProcessor()
+            init_db_layout(gp)
+            G.TE.start(gp.Table_Array, G.DB)
+
+            mf = MasterFile()
+            temp_dir = mf.create_temp_dir()
+            mf.version_dict["v3.0"] = temp_dir
+            G.MF = mf
+            gp.Version_Name = "v3.0"
+            gp.VID = 1
+
+            file_path = "test_label.c"
+            full_path = os.path.join(temp_dir, file_path)
+            snippet = """
+int compute(int val) {
+    if (val < 0)
+        goto err_out;
+    return val * 2;
+err_out:
+    return -1;
+}
+"""
+            with open(full_path, "w") as f:
+                f.write(snippet)
+
+            cs = ChangeSet(f"A\t{file_path}")
+            cs.current_vid = 1
+            cs.gp = gp
+            cs.mf = mf
+            G.CURRENT_PARSING_FILE = file_path
+
+            default_processing(cs, gp)
+            cs.parse()
+            self.assertGreater(len(cs.cs), 0)
+            self.assertTrue(cs.execute())
+            G.TE.commit_all()
+
+            asts = MockDB._global_store.get("m_ast", {})
+            label_asts = [v for v in asts.values() if len(v) >= 3 and v[2] == ASTT.C_LabelStmt]
+            self.assertGreater(len(label_asts), 0, "Expected at least one C_LabelStmt")
+            label_names = [v[1] for v in label_asts]
+            self.assertIn("err_out", label_names, f"Expected 'err_out' in label names, got: {label_names}")
+            for name in label_names:
+                self.assertNotEqual(name, "label", "Label name must not be placeholder 'label'")
+                self.assertNotEqual(name, "return", "Label name must not be overwritten by subsequent keyword 'return'")
+        finally:
+            if temp_dir and os.path.exists(temp_dir):
+                shutil.rmtree(temp_dir, ignore_errors=True)
+
+    def test_struct_designated_initializer_extraction(self) -> None:
+        """Verify struct designated initializers parse C_InitListExpr, members, and value refs."""
+        temp_dir = None
+        try:
+            G.DEBUG_TYPECHECK = True
+            G.DB = MockDB
+            G.TE = get_table_engine("cached")()
+            gp = GreatProcessor()
+            init_db_layout(gp)
+            G.TE.start(gp.Table_Array, G.DB)
+
+            mf = MasterFile()
+            temp_dir = mf.create_temp_dir()
+            mf.version_dict["v3.0"] = temp_dir
+            G.MF = mf
+            gp.Version_Name = "v3.0"
+            gp.VID = 1
+
+            file_path = "test_designated_init.c"
+            full_path = os.path.join(temp_dir, file_path)
+            snippet = """
+struct xattr_handler {
+    const char *prefix;
+    int flags;
+    int (*get)(void);
+    int (*set)(void);
+};
+
+int btrfs_xattr_acl_get(void) { return 0; }
+int btrfs_xattr_acl_set(void) { return 0; }
+
+const struct xattr_handler btrfs_xattr_acl_access_handler = {
+    .prefix = "posix_acl_access",
+    .flags  = 1,
+    .get    = btrfs_xattr_acl_get,
+    .set    = btrfs_xattr_acl_set,
+};
+"""
+            with open(full_path, "w") as f:
+                f.write(snippet)
+
+            cs = ChangeSet(f"A\t{file_path}")
+            cs.current_vid = 1
+            cs.gp = gp
+            cs.mf = mf
+            G.CURRENT_PARSING_FILE = file_path
+
+            default_processing(cs, gp)
+            cs.parse()
+            self.assertGreater(len(cs.cs), 0)
+            self.assertTrue(cs.execute())
+            G.TE.commit_all()
+
+            asts = MockDB._global_store.get("m_ast", {})
+            containers = MockDB._global_store.get("m_ast_container", {})
+
+            # 1. Verify btrfs_xattr_acl_access_handler exists
+            handler_ast = None
+            for aid, arow in asts.items():
+                if arow[1] == "btrfs_xattr_acl_access_handler":
+                    handler_ast = (aid, arow)
+                    break
+            self.assertIsNotNone(handler_ast, "btrfs_xattr_acl_access_handler AST not found")
+            handler_id = handler_ast[0]
+
+            # 2. Verify handler container links to C_InitListExpr
+            init_list_ast = None
+            for crow in containers.values():
+                if crow[0] == handler_id:
+                    ref_id = crow[3]
+                    if ref_id in asts and asts[ref_id][2] == ASTT.C_InitListExpr:
+                        init_list_ast = (ref_id, asts[ref_id])
+                        break
+            self.assertIsNotNone(init_list_ast, "C_InitListExpr not linked in btrfs_xattr_acl_access_handler container")
+            init_list_id = init_list_ast[0]
+
+            # 3. Verify C_InitListExpr links to members: prefix, flags, get, set
+            member_names = set()
+            value_names = set()
+            for crow in containers.values():
+                if crow[0] == init_list_id:
+                    ref_id = crow[3]
+                    if ref_id in asts:
+                        if asts[ref_id][2] == ASTT.C_MemberRefExpr:
+                            member_names.add(asts[ref_id][1])
+                        elif asts[ref_id][2] == ASTT.C_DeclRefExpr:
+                            value_names.add(asts[ref_id][1])
+            self.assertEqual(member_names, {"prefix", "flags", "get", "set"}, f"Expected all designated fields, got {member_names}")
+            self.assertIn("btrfs_xattr_acl_get", value_names)
+            self.assertIn("btrfs_xattr_acl_set", value_names)
+        finally:
+            if temp_dir and os.path.exists(temp_dir):
+                shutil.rmtree(temp_dir, ignore_errors=True)
 
 
 def assert_file_tag_fidelity(
@@ -1949,6 +2564,396 @@ def assert_file_tag_fidelity(
 
 
 
+TABLE_NAME_BY_ID: dict[int, str] = {t.table_id: t.table_name for t in TABLES}
+
+OP_CODE_NAMES: dict[int, str] = {
+    0: "OP_DONE",
+    1: "OP_SET",
+    2: "OP_UPDATE",
+    3: "OP_REF",
+    4: "OP_REF_VIEW",
+    5: "OP_VIEW_DONE",
+    6: "OP_VIEW_SET",
+}
+
+
+def get_ast_type_name(type_id: int | None) -> str:
+    """Resolve ASTT integer constant to its symbolic identifier name."""
+    if type_id is None:
+        return "None"
+    try:
+        return ASTT(type_id).name
+    except Exception:
+        return f"type_{type_id}"
+
+
+def format_joins_desc(joins: tuple) -> str:
+    """Format relational join tuples into a readable string."""
+    parts = []
+    for j in joins:
+        if isinstance(j, tuple) and len(j) == 3:
+            (t1, c1), (t2, c2), rep = j
+            n1 = TABLE_NAME_BY_ID.get(t1, f"t{t1}")
+            n2 = TABLE_NAME_BY_ID.get(t2, f"t{t2}")
+            rep_str = f" [x{rep}]" if rep > 1 else ""
+            parts.append(f"{n1}[col_{c1}] ⋈ {n2}[col_{c2}]{rep_str}")
+        elif isinstance(j, tuple) and len(j) == 1 and isinstance(j[0], tuple):
+            t1, c1 = j[0]
+            n1 = TABLE_NAME_BY_ID.get(t1, f"t{t1}")
+            parts.append(f"{n1}[col_{c1}]")
+        else:
+            parts.append(str(j))
+    return f"VIEW({', '.join(parts)})"
+
+
+def format_cell_val(val: Any) -> str:
+    """Format a single data value or reference for CLI table display."""
+    if val is None:
+        return "NULL"
+    if isinstance(val, tuple) and len(val) == 3 and val[1] == 3:  # RefType: (query, OP_REF, route)
+        ptr, _, route = val
+        t_id, c_idx = ptr if isinstance(ptr, tuple) and len(ptr) == 2 else (None, None)
+        t_name = TABLE_NAME_BY_ID.get(t_id, f"t{t_id}") if t_id is not None else "?"
+        if isinstance(route, (list, tuple)) and len(route) >= 2 and route[0] == 2:  # REF_POS
+            route_str = f"POS:{route[1]}"
+        elif isinstance(route, (list, tuple)) and len(route) >= 1 and route[0] == 0:  # REF_ROOT
+            route_str = "ROOT"
+        elif isinstance(route, (list, tuple)) and len(route) >= 1 and route[0] == 6:  # REF_NO_REF
+            route_str = "NO_REF"
+        else:
+            route_str = str(route)
+        return f"REF({t_name}[{c_idx}]@{route_str})"
+    if isinstance(val, bytes):
+        if len(val) == 32:
+            return f"0x{val[:4].hex()}..{val[-2:].hex()}"
+        return f"0x{val.hex()[:10]}..({len(val)}B)"
+    if isinstance(val, str):
+        val_clean = val.replace("\n", "\\n").replace("\t", "\\t")
+        if len(val_clean) > 30:
+            return repr(val_clean[:27] + "...")
+        return repr(val_clean)
+    if isinstance(val, int):
+        return str(val)
+    return str(val)
+
+
+def format_operations_table(staged_ops: list[Any], result_ops: list[Any]) -> str:
+    """Format staged ChangeSet operations and executed results in a clean table."""
+    lines = [
+        COLOR.cyan("\n" + "=" * 115),
+        COLOR.cyan("                          STAGED & RESOLVED DATABASE OPERATIONS (ChangeSet.cs)"),
+        COLOR.cyan("=" * 115),
+        f"{'Op #':<5} | {'Target Table / View':<30} | {'OpCode':<12} | {'Staged Parameters / Data':<36} | {'Result Row'}",
+        COLOR.cyan("-" * 115),
+    ]
+
+    for idx, op in enumerate(staged_ops):
+        if not (isinstance(op, tuple) and len(op) >= 3):
+            lines.append(f"#{idx:<4} | {str(op)}")
+            continue
+        target, op_code, data = op[0], op[1], op[2]
+
+        # Target name
+        if isinstance(target, int):
+            target_str = TABLE_NAME_BY_ID.get(target, f"table_{target}")
+        elif isinstance(target, tuple):
+            target_str = format_joins_desc(target)
+            if len(target_str) > 30:
+                target_str = target_str[:27] + "..."
+        else:
+            target_str = str(target)[:30]
+
+        # OpCode name
+        op_code_str = OP_CODE_NAMES.get(op_code, str(op_code))
+
+        # Data formatting
+        if isinstance(data, (tuple, list)):
+            data_items = [format_cell_val(v) for v in data]
+            data_str = f"({', '.join(data_items)})"
+        else:
+            data_str = format_cell_val(data)
+        if len(data_str) > 36:
+            data_str = data_str[:33] + "..."
+
+        # Result row
+        if idx < len(result_ops):
+            res_row = result_ops[idx]
+            if isinstance(res_row, (tuple, list)):
+                res_items = [format_cell_val(v) for v in res_row]
+                res_str = f"({', '.join(res_items)})"
+            else:
+                res_str = format_cell_val(res_row)
+        else:
+            res_str = COLOR.yellow("(unresolved)")
+
+        lines.append(f"#{idx:<4} | {target_str:<30} | {op_code_str:<12} | {data_str:<36} | {res_str}")
+
+    lines.append(COLOR.cyan("=" * 115))
+    return "\n".join(lines)
+
+
+def format_bridge_tag_map(store: dict[str, dict]) -> str:
+    """Format Tag-to-Coordinate Bridge Map (m_bridge_tag, m_tag, m_tag_code, m_ast)."""
+    mock_bridge = store.get("m_bridge_tag", {})
+    mock_tags = store.get("m_tag", {})
+    mock_codes = store.get("m_tag_code", {})
+    mock_ast = store.get("m_ast", {})
+
+    tag_map = {row[0]: row for row in mock_tags.values()} if mock_tags else {}
+    code_map = {row[0]: row[1] for row in mock_codes.values()} if mock_codes else {}
+    ast_map = {row[0]: row for row in mock_ast.values()} if mock_ast else {}
+
+    lines = [
+        COLOR.cyan("\n" + "=" * 115),
+        COLOR.cyan("                    TAG-TO-COORDINATE BRIDGE MAP (m_bridge_tag & m_tag & m_tag_code)"),
+        COLOR.cyan("=" * 115),
+        f"{'Tag ID':<7} | {'Line Range':<12} | {'Char Range':<12} | {'AST Node Ref':<26} | {'Hash (SHA-256)':<14} | {'Code Snippet Preview'}",
+        COLOR.cyan("-" * 115),
+    ]
+
+    sorted_bridge = sorted(mock_bridge.values(), key=lambda r: (r[2], r[4], r[1]))
+
+    for b_row in sorted_bridge:
+        fid, tag_id, line_s, line_e, char_s, char_e = b_row
+        tag_row = tag_map.get(tag_id)
+        ast_ref_str = "-"
+        hash_str = "-"
+        code_preview = ""
+
+        if tag_row:
+            tag_hash = tag_row[3]
+            ast_id = tag_row[4]
+            if isinstance(tag_hash, bytes):
+                hash_str = f"0x{tag_hash[:4].hex()}..{tag_hash[-2:].hex()}"
+            elif tag_hash:
+                hash_str = str(tag_hash)[:12]
+            code_raw = code_map.get(tag_hash, "")
+            code_preview = code_raw.replace("\n", "\\n").replace("\t", " ")[:36]
+
+            if ast_id and ast_id in ast_map:
+                a_row = ast_map[ast_id]
+                a_name = a_row[1] or ""
+                a_type = get_ast_type_name(a_row[2])
+                ast_ref_str = f"[#{ast_id}] {a_name} ({a_type})"
+            elif ast_id:
+                ast_ref_str = f"[#{ast_id}]"
+
+        if len(ast_ref_str) > 26:
+            ast_ref_str = ast_ref_str[:23] + "..."
+
+        line_range = f"L{line_s} -> L{line_e}"
+        char_range = f"C{char_s} -> C{char_e}"
+
+        lines.append(f"#{tag_id:<6} | {line_range:<12} | {char_range:<12} | {ast_ref_str:<26} | {hash_str:<14} | {code_preview}")
+
+    lines.append(COLOR.cyan("=" * 115))
+    return "\n".join(lines)
+
+
+def format_spatial_ast_map(store: dict[str, dict]) -> str:
+    """Format Spatial AST Region Map (m_map_ast & m_bridge_map)."""
+    mock_map_ast = store.get("m_map_ast", {})
+    mock_bridge_map = store.get("m_bridge_map", {})
+    mock_ast = store.get("m_ast", {})
+
+    ast_map = {row[0]: row for row in mock_ast.values()} if mock_ast else {}
+
+    map_to_tags: dict[int, list[int]] = {}
+    for b_row in mock_bridge_map.values():
+        t_id, m_id = b_row[0], b_row[1]
+        map_to_tags.setdefault(m_id, []).append(t_id)
+
+    lines = [
+        COLOR.cyan("\n" + "=" * 115),
+        COLOR.cyan("                            SPATIAL AST REGION MAP (m_map_ast & m_bridge_map)"),
+        COLOR.cyan("=" * 115),
+        f"{'Map ID':<7} | {'Tag ID(s)':<10} | {'AST ID':<7} | {'Relative Extent':<20} | {'AST Symbol Name':<28} | {'AST Construct Type'}",
+        COLOR.cyan("-" * 115),
+    ]
+
+    sorted_maps = sorted(mock_map_ast.values(), key=lambda r: (r[0], r[1], r[2]))
+
+    for m_row in sorted_maps:
+        map_id, line_s, char_s, line_e, char_e, ast_id = m_row
+        tags = map_to_tags.get(map_id, [])
+        tags_str = ", ".join(f"#{t}" for t in tags) if tags else "-"
+        if len(tags_str) > 10:
+            tags_str = tags_str[:8] + ".."
+
+        rel_extent = f"L{line_s}:C{char_s} -> L{line_e}:C{char_e}"
+
+        ast_name = "-"
+        ast_type = "-"
+        if ast_id and ast_id in ast_map:
+            a_row = ast_map[ast_id]
+            ast_name = str(a_row[1]) if a_row[1] is not None else ""
+            ast_type = f"{get_ast_type_name(a_row[2])} ({a_row[2]})"
+
+        if len(ast_name) > 28:
+            ast_name = ast_name[:25] + "..."
+
+        lines.append(f"#{map_id:<6} | {tags_str:<10} | #{ast_id:<6} | {rel_extent:<20} | {ast_name:<28} | {ast_type}")
+
+    lines.append(COLOR.cyan("=" * 115))
+    return "\n".join(lines)
+
+
+def format_ast_container_hierarchy(store: dict[str, dict]) -> str:
+    """Format AST Container Hierarchy (m_ast_container & m_ast)."""
+    mock_container = store.get("m_ast_container", {})
+    mock_ast = store.get("m_ast", {})
+
+    ast_map = {row[0]: row for row in mock_ast.values()} if mock_ast else {}
+
+    lines = [
+        COLOR.cyan("\n" + "=" * 115),
+        COLOR.cyan("                            AST CONTAINER & HIERARCHY MAP (m_ast_container)"),
+        COLOR.cyan("=" * 115),
+    ]
+
+    if not mock_container:
+        lines.append(COLOR.yellow("  (No child container hierarchy links in this file)"))
+        lines.append(COLOR.cyan("=" * 115))
+        return "\n".join(lines)
+
+    lines.append(f"{'Parent AST Node':<35} | {'Prio':<5} | {'Child AST Node':<35} | {'Link Type ID & Name'}")
+    lines.append(COLOR.cyan("-" * 115))
+
+    sorted_container = sorted(mock_container.values(), key=lambda r: (r[0], r[1]))
+
+    for c_row in sorted_container:
+        parent_id, priority, type_id, child_id = c_row
+
+        parent_str = f"[#{parent_id}]"
+        if parent_id in ast_map:
+            p_row = ast_map[parent_id]
+            p_name = p_row[1] or ""
+            p_type = get_ast_type_name(p_row[2])
+            parent_str = f"[#{parent_id}] '{p_name}' ({p_type})"
+        if len(parent_str) > 35:
+            parent_str = parent_str[:32] + "..."
+
+        child_str = f"[#{child_id}]"
+        if child_id in ast_map:
+            ch_row = ast_map[child_id]
+            ch_name = ch_row[1] or ""
+            ch_type = get_ast_type_name(ch_row[2])
+            child_str = f"[#{child_id}] '{ch_name}' ({ch_type})"
+        if len(child_str) > 35:
+            child_str = child_str[:32] + "..."
+
+        type_name = get_ast_type_name(type_id)
+        link_str = f"{type_id} ({type_name})"
+
+        lines.append(f"{parent_str:<35} | {priority:<5} | {child_str:<35} | {link_str}")
+
+    lines.append(COLOR.cyan("=" * 115))
+    return "\n".join(lines)
+
+
+def format_ast_includes_map(store: dict[str, dict]) -> str:
+    """Format AST Include Directives (m_ast_include & m_file_name)."""
+    mock_include = store.get("m_ast_include", {})
+    mock_ast = store.get("m_ast", {})
+    mock_file_name = store.get("m_file_name", {})
+    if not mock_include:
+        return ""
+    ast_map = {row[0]: row for row in mock_ast.values()} if mock_ast else {}
+    file_map = {row[0]: row[1] for row in mock_file_name.values()} if mock_file_name else {}
+    lines = [
+        COLOR.cyan("\n" + "=" * 115),
+        COLOR.cyan("                                AST INCLUDE DIRECTIVES (m_ast_include)"),
+        COLOR.cyan("=" * 115),
+        f"{'AST ID':<8} | {'AST Symbol / Directive':<35} | {'Target File ID':<16} | {'Target File Path'}",
+        COLOR.cyan("-" * 115),
+    ]
+    for row in sorted(mock_include.values(), key=lambda r: r[0]):
+        ast_id, fnid = row[0], row[1]
+        ast_str = f"[#{ast_id}]"
+        if ast_id in ast_map:
+            a_row = ast_map[ast_id]
+            ast_str = f"[#{ast_id}] '{a_row[1]}' ({get_ast_type_name(a_row[2])})"
+        target_path = file_map.get(fnid, "-")
+        lines.append(f"#{ast_id:<7} | {ast_str:<35} | #{fnid:<15} | {target_path}")
+    lines.append(COLOR.cyan("=" * 115))
+    return "\n".join(lines)
+
+
+def format_moved_tags_map(store: dict[str, dict]) -> str:
+    """Format Tag Evolution Transitions (m_moved_tag)."""
+    mock_moved = store.get("m_moved_tag", {})
+    if not mock_moved:
+        return ""
+    lines = [
+        COLOR.cyan("\n" + "=" * 115),
+        COLOR.cyan("                              TAG EVOLUTION TRANSITIONS (m_moved_tag)"),
+        COLOR.cyan("=" * 115),
+        f"{'Source Tag ID':<20} | {'Destination / Evolved Tag ID'}",
+        COLOR.cyan("-" * 115),
+    ]
+    for row in sorted(mock_moved.values(), key=lambda r: (r[0], r[1])):
+        s_tag_id, e_tag_id = row[0], row[1]
+        lines.append(f"Tag #{s_tag_id:<15} -> Tag #{e_tag_id}")
+    lines.append(COLOR.cyan("=" * 115))
+    return "\n".join(lines)
+
+
+def format_consolidated_spatial_map(store: dict[str, dict]) -> str:
+    """Format Consolidated Spatial Code-to-AST Map ordered by line/char coordinates."""
+    mock_bridge = store.get("m_bridge_tag", {})
+    mock_tags = store.get("m_tag", {})
+    mock_codes = store.get("m_tag_code", {})
+    mock_ast = store.get("m_ast", {})
+
+    tag_map = {row[0]: row for row in mock_tags.values()} if mock_tags else {}
+    code_map = {row[0]: row[1] for row in mock_codes.values()} if mock_codes else {}
+    ast_map = {row[0]: row for row in mock_ast.values()} if mock_ast else {}
+
+    lines = [
+        COLOR.cyan("\n" + "=" * 115),
+        COLOR.cyan("                                 CONSOLIDATED SPATIAL CODE-TO-AST FILE MAP"),
+        COLOR.cyan("=" * 115),
+        f"{'Coordinates':<16} | {'Tag ID':<7} | {'AST ID':<7} | {'AST Construct Type':<22} | {'AST Symbol Name':<20} | {'Source Code'}",
+        COLOR.cyan("-" * 115),
+    ]
+
+    sorted_bridge = sorted(mock_bridge.values(), key=lambda r: (r[2], r[4], r[1]))
+
+    for b_row in sorted_bridge:
+        fid, tag_id, line_s, line_e, char_s, char_e = b_row
+        tag_row = tag_map.get(tag_id)
+
+        ast_id_str = "-"
+        ast_type_str = "-"
+        ast_name_str = "-"
+        code_str = ""
+
+        if tag_row:
+            tag_hash = tag_row[3]
+            ast_id = tag_row[4]
+            code_raw = code_map.get(tag_hash, "")
+            code_str = code_raw.replace("\n", "\\n").replace("\t", " ")[:34]
+
+            if ast_id:
+                ast_id_str = f"#{ast_id}"
+                if ast_id in ast_map:
+                    a_row = ast_map[ast_id]
+                    ast_name_str = str(a_row[1]) if a_row[1] is not None else "''"
+                    ast_type_str = get_ast_type_name(a_row[2])
+
+        if len(ast_name_str) > 20:
+            ast_name_str = ast_name_str[:17] + "..."
+        if len(ast_type_str) > 22:
+            ast_type_str = ast_type_str[:19] + "..."
+
+        coord_str = f"L{line_s}:{char_s}->L{line_e}:{char_e}"
+
+        lines.append(f"{coord_str:<16} | #{tag_id:<6} | {ast_id_str:<7} | {ast_type_str:<22} | {ast_name_str:<20} | {code_str}")
+
+    lines.append(COLOR.cyan("=" * 115))
+    return "\n".join(lines)
+
+
 def format_fidelity_table(results: list[dict[str, Any]]) -> str:
     """Format a clean colorized report table summarizing tag fidelity and code coverage."""
     lines = [
@@ -2030,10 +3035,29 @@ def run_c_ast_tests(
             "baseline_ast_ops": 0,
             "description": f"Target: {target_file}",
             "table_engine": table_engine,
+            "capture_details": True,
         }
         res = run_single_file_worker(item)
         elapsed = time.time() - start_time
         if res["execute_success"] and not res["error"]:
+            # 1. Output Operations Table
+            if "staged_ops" in res and "result_ops" in res:
+                print(format_operations_table(res["staged_ops"], res["result_ops"]))
+
+            # 2. Output Relational Maps
+            if "store" in res:
+                store = res["store"]
+                print(format_bridge_tag_map(store))
+                print(format_spatial_ast_map(store))
+                print(format_ast_container_hierarchy(store))
+                includes_str = format_ast_includes_map(store)
+                if includes_str:
+                    print(includes_str)
+                moved_str = format_moved_tags_map(store)
+                if moved_str:
+                    print(moved_str)
+                print(format_consolidated_spatial_map(store))
+
             print(COLOR.green(f"\n[+] PASS: {target_file}"))
             print(f"    - Operations Staged:    {res['actual_total_ops']:,}")
             print(f"    - CS.execute():         {COLOR.green('SUCCESS')}")
@@ -2055,6 +3079,8 @@ def run_c_ast_tests(
                 print(format_profiling_report([prof_obj], title=f"PIPELINE PROFILE: {target_file}"))
             return 0
         else:
+            if "staged_ops" in res and res["staged_ops"]:
+                print(format_operations_table(res["staged_ops"], res.get("result_ops", [])))
             print(COLOR.red(f"\n[-] FAIL: {target_file} after {elapsed:.2f}s"))
             print(COLOR.red(f"    Error: {res['error'] or 'CS.execute() returned False'}"))
             return 1

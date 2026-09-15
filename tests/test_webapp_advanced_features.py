@@ -44,10 +44,12 @@ from webapp.main import (
     get_kconfig_graph,
     get_struct_layout,
     get_symbol_xref,
+    get_symbol_detail,
     get_tag_by_id,
     get_tag_timeline,
     get_versions_diff,
     lookup_symbols,
+    search_symbols,
     match_patch_maintainers,
     query_ast_semantic_sandbox,
 )
@@ -344,6 +346,20 @@ class TestWebappAdvancedFeatures(unittest.TestCase):
         self.assertIn('"subsystemWorkspace"', content)
         self.assertIn('"personWorkspace"', content)
         self.assertIn('"commitWorkspace"', content)
+
+    def test_symbol_endpoints(self) -> None:
+        from fastapi import HTTPException
+        try:
+            detail = get_symbol_detail("v3.0", "task_struct")
+            self.assertIn("symbol_name", detail)
+            self.assertEqual(detail["symbol_name"], "task_struct")
+            self.assertIn("declarations", detail)
+            self.assertIn("usages", detail)
+        except HTTPException as e:
+            self.assertEqual(e.status_code, 404)
+
+        results = search_symbols("v3.0", q="task", limit=10)
+        self.assertIsInstance(results, list)
 
 
 if __name__ == "__main__":

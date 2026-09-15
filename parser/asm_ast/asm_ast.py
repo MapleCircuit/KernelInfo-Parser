@@ -22,7 +22,7 @@ from core.globalstuff import (
 )
 from typing import Any
 ChangeSetType = Any
-from parser.c_ast.c_ast_type import (
+from parser.c_ast import (
     AST_KIND,
     Line,
     Ast_Comment,
@@ -49,11 +49,10 @@ from parser.c_ast.c_ast_type import (
     CPPro_pragma,
     End_Mode,
     get_cursor_line,
-)
-from parser.c_ast.c_ast import (
     TokenList,
     get_prior_tags,
     close_prior_tags,
+    resolve_cppro_scopes,
     _CLANG_GET_EXTENT,
     _CLANG_GET_RANGE_START,
     _CLANG_GET_RANGE_END,
@@ -210,28 +209,7 @@ class Asm_Manager:
 
     def resolve_cppro_scopes(self) -> None:
         """Resolve ending coordinates for preprocessor conditionals."""
-        cpp_stack = []
-        for item in self.children:
-            if isinstance(item, (CPPro_if, CPPro_ifdef, CPPro_ifndef)) and not isinstance(item, (CPPro_elif, CPPro_elifdef, CPPro_elifndef)):
-                cpp_stack.append([item])
-            elif isinstance(item, (CPPro_elif, CPPro_elifdef, CPPro_elifndef)):
-                if cpp_stack:
-                    prev_branch = cpp_stack[-1][-1]
-                    end_l = max(prev_branch.extent.line_pos[0], item.extent.line_pos[0] - 1)
-                    prev_branch.endif = Line(end_l, end_l)
-                    cpp_stack[-1].append(item)
-            elif isinstance(item, CPPro_else):
-                if cpp_stack:
-                    prev_branch = cpp_stack[-1][-1]
-                    end_l = max(prev_branch.extent.line_pos[0], item.extent.line_pos[0] - 1)
-                    prev_branch.endif = Line(end_l, end_l)
-                    cpp_stack[-1].append(item)
-            elif isinstance(item, CPPro_endif):
-                if cpp_stack:
-                    branches = cpp_stack.pop()
-                    for branch in branches:
-                        if not hasattr(branch, "endif") or branch.endif.line_pos[0] == 0:
-                            branch.endif = item.extent
+        resolve_cppro_scopes(self.children)
 
     def extract(self, CS: ChangeSetType) -> None:
         """Extract all AST nodes to ChangeSet operations."""

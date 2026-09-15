@@ -30,6 +30,9 @@ Dense architectural contract and state interaction reference across `globalstuff
   - `G.type_check(*expected_types)`: Method decorator enforcing runtime type validation.
   - `reclaim_system_memory() -> None`: Runs explicit garbage collection (`gc.collect()`) and invokes glibc `malloc_trim(0)` to return free memory pages to OS.
   - `compute_code_hash(code: str) -> bytes`: Computes a deterministic 32-byte binary SHA-256 digest (`BINARY(32)`) from normalized code snippet strings for `m_tag_code`.
+  - `clean_unnamed_spelling(spelling: str) -> str`: Normalizes Libclang anonymous/unnamed cursor spellings (e.g. `(unnamed at /dev/shm/.../include/linux/foo.h:12:1)`) down to clean relative git repository paths (`(unnamed at include/linux/foo.h:12:1)`), stripping host and RAMDISK prefix directories.
+  - `setup_memory_limit(limit_gb: float = 60.0) -> None`: Enforces a hard address space limit (`RLIMIT_AS`) on Linux hosts to eliminate catastrophic kernel lockups caused by runaway Clang C-heap memory allocation during massive multicore AST translation unit parsing.
+
 
 ### 1.2. Core Data Types & Canonical Bounds
 - **`PointerType`**: `tuple[int, int]` &mdash; `(table_id, col_idx)` referencing a table column.
@@ -73,7 +76,15 @@ Dense architectural contract and state interaction reference across `globalstuff
     - `get_first_pointer() -> PointerType`: Root table pointer.
     - `get_first_table_id() -> int`: Root table index.
     - `add_join(joins_list, join_tuple) -> None`: Upgrades single pointer or increments repeat counter.
-  - `ASTT(IntEnum)`: AST construct category identifiers across C (`C_struct`, `C_Compound`), Preprocessor (`CPPro_define`, `CPPro_include`), ASM (`ASM_Instruction`, `ASM_Macro`), and Kconfig (`Kconfig_Config`, `Kconfig_Menu`, `Kconfig_Choice`, `Kconfig_Depends_On`, `Kconfig_Select`, `Kconfig_Op_And`, etc.).
+  - `SymbolRole(IntEnum)`: Categorical classification for symbol occurrences staged in `m_symbol_ref`:
+    - `Declaration = 1`: Explicit symbol forward declaration or prototype.
+    - `TypeUsage = 2`: Use of symbol as a type specifier or typecast.
+    - `Call = 3`: Function invocation expression (`Ast_CallExpr`).
+    - `MemberRef = 4`: Struct, union, or enum member access (`Ast_MemberRefExpr`).
+    - `DeclRef = 5`: Direct variable, constant, or identifier reference (`Ast_DeclRefExpr`).
+  - `STANDARD_C_KEYWORDS: dict[str, ASTT]`: Fast keyword-to-AST category mapping covering C control flow (`if`, `switch`, `case`, `default`, `while`, `do`, `for`, `return`, `break`, `continue`, `goto`, `asm`), qualifiers (`const`, `volatile`, `restrict`, `_Atomic`), storage classes (`static`, `extern`, `typedef`, `inline`), and primitive types (`void`, `char`, `short`, `int`, `long`, `signed`, `unsigned`, `float`, `double`, `struct`, `union`, `enum`).
+  - `ASTT(IntEnum)`: AST construct category identifiers across C (`C_struct`, `C_Compound`, `C_SizeofExpr`, `C_TypeRef`), Preprocessor (`CPPro_define`, `CPPro_include`), ASM (`ASM_Instruction`, `ASM_Macro`), and Kconfig (`Kconfig_Config`, `Kconfig_Menu`, `Kconfig_Choice`, `Kconfig_Depends_On`, `Kconfig_Select`, `Kconfig_Op_And`, etc.).
+
 
 ---
 
@@ -114,20 +125,28 @@ Central runtime container, schema registry, and worker IPC coordinator.
   - `ChangeSet_Dict: dict[str, ChangeSet] | CompressedChangeSetDict`: Main process dictionary mapping relative file paths to parsed `ChangeSet` objects.
   - `Alt_ChangeSet_Dict: dict[str, ChangeSet] | CompressedChangeSetDict`: Secondary cache for on-demand parsed foreign `ChangeSets` during cross-file reference resolution.
   - `Shared_ChangeSet_Dict_List: list[bytes] | None`: IPC list holding worker `pickle.dumps()` payloads.
+  - `unchanged_symbol_cache: dict[str, dict[tuple[str, int], int]]`: In-memory cache of symbol mappings `(name, type_id) -> ast_id` queried from the database for unchanged files.
+  - `_changed_paths_set: set[str]`: Set of all relative file paths modified in the active release version.
+  - `file_deps: dict[str, set[str]]`: Lightweight dependency graph mapping each changed file path to its set of unresolved foreign file dependencies (`foreign_deps`).
+  - `file_symbols: dict[str, dict[tuple[str, int], int]]`: Per-file exported symbols map `rel_file -> {(sym_name, type_id): ast_id}` populated during Phase 1 staging.
+  - `file_names: dict[str, dict[str, int]]`: Per-file exported symbol names map `rel_file -> {sym_name: ast_id}` for name-only fallback resolution.
 - **Memory Compression (`CompressedChangeSetDict`)**:
-  - Implements an on-demand compressed store backed by `zlib.compress(pickle.dumps(cs), level=1)` and an in-memory LRU uncompressed cache (`OrderedDict`, default capacity 500 items). Prevents memory exhaustion during full-kernel parsing with hundreds of thousands of active AST ChangeSets.
-- **IPC Protocol**:
+  - Implements an on-demand compressed store backed by `zlib.compress(pickle.dumps(cs), level=1)` and an in-memory LRU uncompressed cache (`OrderedDict`, default capacity 500 items, throttled to 25 items under `--very-low-mem`).
+  - Tracks dirty uncompressed keys via `_dirty_keys` and gracefully falls back to uncompressed LRU caching if zlib compression fails.
+  - Provides `clear()` to thoroughly release compressed blobs, LRU instances, and dirty key sets upon completion of an update cycle.
+- **IPC Protocol & Query Helpers**:
   - `start_manager() -> None`: Initializes `Shared_ChangeSet_Dict_List = []`.
   - `push_set_to_main() -> None`: Executed by worker; serializes `ChangeSet_Dict` via `pickle.dumps()` onto `Shared_ChangeSet_Dict_List`.
   - `stop_manager() -> None`: Executed by main process; deserializes (`pickle.loads()`) and merges worker dictionaries into `gp.ChangeSet_Dict`.
-  - `safe_get_cs(path: str) -> ChangeSet`: Lookup sequence: `ChangeSet_Dict` &rarr; `Alt_ChangeSet_Dict` &rarr; creates `ChangeSet("M", path)`, triggers `CS.parse()`, stores in `Alt_ChangeSet_Dict`, and returns `CS`.
-  - `reset_cs() -> None`: Clears `Change_List`, `Symlink_List`, `ChangeSet_Dict`, and `Alt_ChangeSet_Dict`.
+  - `safe_get_cs(path: str) -> ChangeSet | None`: Lookup sequence: `ChangeSet_Dict` &rarr; `Alt_ChangeSet_Dict` &rarr; checks existence in RAMDISK tree (skips non-kernel system paths `/usr/`, `/etc/`, `/lib/`, `/opt/`) &rarr; creates `ChangeSet("M", path)`, triggers `CS.parse()`, stores in `Alt_ChangeSet_Dict`, and returns `CS`.
+  - `get_file_symbols_from_db(rel_file: str) -> dict[tuple[str, int], int] | None`: Queries TableEngine joined tables (`m_file_name` &rarr; `m_bridge_file` &rarr; `m_bridge_tag` &rarr; `m_tag` &rarr; `m_ast`) to extract active symbol mappings `(ast_name, ast_type) -> ast_id` for unchanged files without re-parsing source text.
+  - `reset_cs() -> None`: Clears `Change_List`, `Symlink_List`, `ChangeSet_Dict`, `Alt_ChangeSet_Dict`, `unchanged_symbol_cache`, `file_deps`, `file_symbols`, and `file_names`.
 
 ---
 
 ## 4. Relational Database Schema Registry (`core/DBLayout.py`)
 
-31 Core Tables defined via `Table` instances and exported in `TABLES` tuple (`init_db_layout(gp)` sets `gp.Table_Array = list(TABLES)`):
+33 Core Tables defined via `Table` instances and exported in `TABLES` tuple (`init_db_layout(gp)` sets `gp.Table_Array = list(TABLES)`):
 
 | `table_id` | Table Name | Columns | Primary Key | `no_duplicate` | `te_cached` | `hashing_table` | Description |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
@@ -151,7 +170,7 @@ Central runtime container, schema registry, and worker IPC coordinator.
 > [!IMPORTANT]
 > **ChangeSet Tag Reference Order Invariant (Rule 12)**: When staging tags in ChangeSets (`with CS(REF_POS):`), `m_tag.set` MUST be the first operation inside the block so that `tag_ref = ((m_tag.table_id, 0), OP_REF, (REF_POS, CS.route[-1]))` points directly to `m_tag`. Auxiliary deduplication tables (such as `m_tag_code.get_set`) must always be staged after `m_tag.set` within the block.
 | **16** | `m_kconfig_symbol` | `(kcid, vid_s, vid_e, name, type, prompt, def_val, help, ast_id)` | `("kcid", "vid_s")` | `True` | `True` | `False` | Normalized Kconfig symbol definitions |
-| **17** | `m_kconfig_relation`| `(kcid, target_name, rel_type, cond_ast_id, priority)`| `("kcid", "rel_type", ...)`| `False` | `True` | `False` | Direct depends_on / select / imply dependency graph |
+| **17** | `m_kconfig_relation`| `(rel_id, kcid, target_name, rel_type, cond_ast_id, priority)`| `("rel_id",)`| `True` | `True` | `False` | Direct depends_on / select / imply dependency graph |
 | **18** | `m_kconfig_tree` | `(tree_id, vid, parent_id, node_type, title, kcid, priority, dep_ast_id, ast_id)` | `("tree_id", "vid")` | `False` | `True` | `False` | Hierarchical Menuconfig tree & UI ordering |
 | **19** | `m_kconfig_kbuild`| `(kcid, vid, fid, compile_mode, target_obj)` | `("kcid", "vid", "fid", "compile_mode")` | `False` | `True` | `False` | Kconfig to compiled file/object map |
 | **20** | `m_maintainer_person`| `(person_id, name, email)` | `("person_id",)` | `True` | `True` | `False` | Unique maintainer & contributor identity registry |
@@ -165,6 +184,8 @@ Central runtime container, schema registry, and worker IPC coordinator.
 | **28** | `m_bridge_commit_file`| `(commit_id, vid, fid, change_type)` | `("commit_id", "fid")` | `False` | `False` | `False` | Files touched per commit |
 | **29** | `m_bridge_commit_tag`| `(commit_id, vid, fid, tag_id)` | `("commit_id", "tag_id")` | `False` | `False` | `False` | Code tags modified per commit |
 | **30** | `m_moved_tag` | `(s_tag_id, e_tag_id)` | `("s_tag_id", "e_tag_id")` | `False` | `False` | `False` | Tag history & cross-version evolution tracking |
+| **31** | `m_symbol_def` | `(def_id, vid, fid, tag_id, ast_id, name, type_id, line_s, line_e)` | `("def_id",)` | `False` | `True` | `False` | Authoritative Symbol Definition Registry (version-scoped) |
+| **32** | `m_symbol_ref` | `(ref_id, vid, fid, tag_id, ast_id, role, line, char_s)` | `("ref_id",)` | `False` | `False` | `False` | Symbol Declarations & Usages Reference Index (version-scoped) |
 
 ---
 
@@ -176,7 +197,7 @@ Central runtime container, schema registry, and worker IPC coordinator.
 - `normalize_data_tuple(data: tuple) -> tuple[UnSafeDataType, ...]`: Converts primitive elements via `to_safe_data()` while preserving reference tuples intact.
 
 ### 5.2. `Table` Class Interface
-- **Dynamic Pointer Attributes**: On init, sets `self.<col_name> = (table_id, col_idx)` (e.g. `m_file_name.fnid = (1, 0)`). Injects table instance into `parser.c_ast.c_ast_type.<table_name>`.
+- **Dynamic Pointer Attributes**: On init, sets `self.<col_name> = (table_id, col_idx)` (e.g. `m_file_name.fnid = (1, 0)`). Injects table instance into `parser.c_ast.c_ast` and `parser.c_ast`.
 - **Operation Builders**:
   - `set(*columns) -> OperationType`: Returns `(table_id, OP_SET, columns)` (redirects to `get_set()` if `table.no_duplicate == True`).
   - `update(*columns) -> OperationType`: Returns `(table_id, OP_UPDATE, columns)`. If partial row provided, queries `G.TE.get()` to populate missing values.
@@ -216,23 +237,33 @@ Represents a parsed file diff and acts as the relational staging buffer.
   - `ref(query: PointerType, *route_args: LinkType) -> UnSafeDataType`:
     - If resolvable immediately via `resolve_ref()`, returns primitive `SafeDataType`.
     - Otherwise returns reference tuple: `(query, OP_REF, parsed_route)`.
-- **Reference Resolution (`resolve_ref(query, parsed_route) -> SafeDataType | list`)**:
+- **Reference Resolution (`resolve_ref(query, parsed_route, force_stubs=False) -> SafeDataType | list`)**:
   1. `parsed_route[0] == REF_NO_REF`: Returns `None`.
-  2. `parsed_route[0] == REF_FILE`: Calls `gp.safe_get_cs(parsed_route[1]).resolve_ref(query, parsed_route[2:])`.
+  2. `parsed_route[0] == REF_FILE`: Evaluates foreign cross-file symbol lookups with multi-tier fast paths:
+     - **Step 0 (Per-File Symbols)**: Checks `gp.file_symbols[rel_file]` and `gp.file_names[rel_file]` for immediate $O(1)$ resolved symbol `ast_id`.
+     - **Step 0b (Phase 2 Snapshot)**: Checks `_phase2_symbols` and `_phase2_names` global symbol snapshots.
+     - **Step 1 (Active Batch / LRU Cache)**: Inspects `batch_cs_dict` or `ChangeSet_Dict._lru_cache[rel_file]`. If evacuated, reads from `foreign_cs.resolved_symbols`.
+     - **Step 1b (Rule 24 Blocking Guard)**: If `rel_file` is an in-flight incomplete ChangeSet (`is_in_flight_changed` in `gp._changed_paths_set` or active in `ChangeSet_Dict` without `cs_processed`) and `force_stubs` is `False`, sets `self.blocked_on = rel_file` and returns `None` immediately, preventing redundant linear cache scans.
+     - **Step 2 (Database Fallback)**: Calls `gp.get_file_symbols_from_db(rel_file)` to retrieve symbol mappings for unchanged kernel files directly from the database.
+     - **Step 3 (Circular Dependency Breaking)**: If `force_stubs=True` is enabled, stages a canonical `notbind` stub symbol via `m_ast.view` and logs a circular dependency warning.
   3. `parsed_route[0] == REF_POS`: Fetches directly from `self.cs[parsed_route[1]]` column `query[1]`.
   4. `parsed_route[0] == REF_MULTI`: Fetches list of column values across `store_dict[REF_MULTI][parsed_route[1]]`.
   5. Default: Looks up `pos = store_dict[parsed_route][query[0]]` and extracts column value `query[1]`.
+- **Worker Optimization & View Preprocessing**:
+  - `preprocess_ref_views() -> None`: Pre-unpacks intra-file `OP_REF_VIEW` operations into concrete `OP_VIEW_SET` on worker cores before IPC serialization, distributing schema pattern matching across CPU cores.
+  - `prune_unchanged_dependencies() -> None`: Queries `gp.get_file_symbols_from_db()` in workers during Phase 1 to pre-resolve references targeting unchanged files and prunes satisfied entries from `foreign_deps`.
+  - `pre_resolve_operations(resolved_symbols_map, resolved_names_map) -> list`: Worker-side method invoked during Phase 2 to resolve foreign `REF_FILE` references and return a pre-resolved operation list to the main process for sequential lock-free staging.
 - **Dynamic AST Views (`_unpack_ref_view(operation) -> OperationType | None`)**:
   - Evaluates AST rule schemas against records in `store_dict`, matches conditional rules (`schema_ifs`), dynamically constructs joined table graph (`schema_thens`), and converts `OP_REF_VIEW` into concrete `(joins_tuple, OP_VIEW_SET, data_tuple)`.
   - Queries candidate rows via `CS.get_available_data(route, target_table_id)`, which filters candidate operations strictly by `tableid` (handling both integer IDs and joined view tuples) to isolate `m_ast` records from co-located tag and bridge operations.
-- **Pipeline Execution (`execute() -> bool`)**:
+- **Pipeline Execution (`execute(force_stubs=False) -> bool`)**:
   - Iterates over `CS.cs` starting at `len(CS.cs_result)`.
   - Unpacks dynamic views (`OP_REF_VIEW` &rarr; `OP_VIEW_SET`).
   - Converts all reference tuples in data to `SafeDataType` via `_resolve_ref_from_tuple()`.
   - Dispatches operations downstream to `G.TE.set()`, `G.TE.update()`, or `G.TE.view_set()`.
   - Appends resulting rows to `CS.cs_result` and marks `cs_processed = True`.
 - **IPC Sanitization (`clear_bloat() -> None`)**:
-  - Drops unpicklable object handles (`self.gp = None`, `self.mf = None`, `self.debug = []`, `self.parsers = {}`) before worker IPC serialization.
+  - Drops unpicklable object handles (`self.gp = None`, `self.mf = None`, `self.file = None`, `self.debug = []`, `self.parsers = {}`, `self.prior_tags = None`, `self.prior_tags_map = None`, `self.active_tag_list = None`, `self.pending_symbol_refs = []`, `self.last_tag_ref = None`, `self._bridge_maps = set()`, `self.batch_cs_dict = None`, `self.blocked_on = None`) before worker IPC serialization.
 
 ---
 
@@ -249,36 +280,82 @@ MasterFile (MF)                   GreatProcessor (gp)               TableEngine 
   └─ generate_change_list(gp) ───────────►│                                 │
      (Populates gp.Change_List)           └─ G.TE.start(gp.Table_Array) ────►
 ==================================================================================================
-[2. MULTICORE PARTITIONING & PARALLEL WORKER PARSING]
+[2. MULTICORE PARTITIONING & TWO-STAGE PARALLEL WORKER PARSING]
 --------------------------------------------------------------------------------------------------
 Main Process (trigger_multicore)          Worker Process 1..N
   │
   ├─ Partition gp.Change_List:
-  │  ├── regular_files ──────────────────►│ ChangeSet(diff_line)
-  │  │                                    │ ├── CS.parse() -> Language AST Parsers
-  │  │                                    │ ├── Table.<op>() builders (m_ast, m_tag, m_tag_code)
-  │  │                                    │ ├── CS.store() (Buffers into CS.cs)
-  │  │                                    │ └── CS.clear_bloat()
-  │  │                                    └─► Worker IPC (Compressed pickle -> result_queue)
+  │  ├── order_changed_files()
+  │  │   └── Kahn's topological sort on header '#include' dependencies
+  │  ├── Stage 1: header_files (.h, .hpp) ──►│ ChangeSet(header_diff_line)
+  │  │                                       │ ├── CS.parse() -> C/ASM/Kconfig/Rust Parsers
+  │  │                                       │ ├── Table.<op>() builders (m_ast.view, m_tag.set)
+  │  │                                       │ ├── CS.preprocess_ref_views()
+  │  │                                       │ ├── CS.prune_unchanged_dependencies()
+  │  │                                       │ ├── CS.store() (Buffers into CS.cs)
+  │  │                                       │ └── CS.clear_bloat()
+  │  │                                       └─► Worker IPC (Compressed pickle -> result_queue)
+  │  ├── processing_dirs() (Staged directory ChangeSets)
+  │  ├── processing_unchanges() (Propagates unchanged files & bridges)
+  │  ├── scheduler.resolve_headers() (Resolves & evacuates header ChangeSets before sources)
+  │  │
+  │  ├── Stage 2: source_files (.c, .S) ───►│ ChangeSet(source_diff_line)
+  │  │                                       │ (Parallel worker parsing & view preprocessing)
+  │  │                                       └─► Streams into DependencyScheduler.ingest_batch()
   │  └── symlink_files
-  │      (Appended to gp.Symlink_List)
+  │      (Appended to gp.Symlink_List for zero-duplication deferred alias)
   │
-  ├─ Merges worker batches into gp.ChangeSet_Dict
-  ├─ processing_dirs() (Staged directory ChangeSets)
-  └─ processing_unchanges() (Carryover unchanged files; defer unchanged symlinks to gp.Symlink_List)
-==================================================================================================
-[3. SEQUENTIAL EXECUTION, TAG EVACUATION & INTERMEDIATE COMMITS]
+  └─ scheduler.finalize() (Drains deferred queue & triggers Phase 2 parallel waves)
+[3. TWO-PHASE EXECUTION: STREAMING LEAF RESOLUTION & WAVE-BASED MULTICORE STAGING]
 --------------------------------------------------------------------------------------------------
-Main Process (STEP 6)                     TableEngine (G.TE)                Database (G.DB)
-  │                                               │                                 │
-  ├─ For each CS in ChangeSet_Dict queue:         │                                 │
-  │  ├─ CS.execute() ────────────────────────────►│ (Stages in queued_set / update) │
-  │  │  (Resolves references & dynamic views)     │                                 │
-  │  ├─ extract_tags_and_evacuate_cs(CS)          │                                 │
-  │  │  (Purges internal AST memory buffers)      │                                 │
-  │  └─ Periodic Chunk Commit:                    │                                 │
-  │     (if LOW_MEMORY_MODE: 300/500 items) ─────►├─ commit_all() ─────────────────►│
-  │                                               │   (Flushes queued SQL batches)  │
+PHASE 1: Streaming Ingestion & Opportunistic Leaf Execution (main.py:trigger_multicore)
+  │
+  ├─ Worker Pool (G.CPUS) parses files, populating CS.foreign_deps in CS.ref()
+  ├─ Streams compressed batches into DependencyScheduler.ingest_batch()
+  ├─ Main Process drains immediately ready leaf ChangeSets (headers, self-contained files)
+  │  ├─ Success: extract_tags_and_evacuate_cs(CS) & registers resolved_symbols
+  │  └─ Blocked: skipped without spinning, deferred for Phase 2
+  ├─ As soon as parsing workers finish, trigger_multicore() exits immediately
+  └─ Phase 1 worker pool terminates cleanly -> Clang C-heap memory purged via reclaim_system_memory()
+--------------------------------------------------------------------------------------------------
+PHASE 2: Wave-Based Multicore Resolution & High-Speed Staging (main.py:execute_phase2_parallel_waves)
+Main Process                                  Phase 2 Worker Pool (resolution_worker)
+  │                                               │
+  ├─ Extracts remaining unexecuted ChangeSets     │
+  ├─ Builds wave DAG:                             │
+  │  deps[path] = {target in cs.foreign_deps if target in remaining}
+  │                                               │
+  ├─ Loop while remaining:                        │
+  │  ├─ Wave Selection:                           │
+  │  │  wave = [path for path in remaining if not deps[path]]
+  │  │                                            │
+  │  ├─ [DEADLOCK GUARD] If wave is empty:        │
+  │  │  ├─ Main core picks candidate with max dependents
+  │  │  ├─ cand_cs.execute(force_stubs=True)      │
+  │  │  └─ Evacuates buffers, updates resolved_symbols, unlocks next wave
+  │  │                                            │
+  │  ├─ [SMALL-WAVE BYPASS] If len(wave) < 4:    │
+  │  │  └─ Executes directly on main core (bypasses IPC overhead)
+  │  │                                            │
+  │  └─ [PARALLEL WAVE DISPATCH] len(wave) >= 4:  │
+  │     ├─ Sends chunks + resolved_symbols ──────►├─ Resolves foreign refs & unpacks views
+  │     │                                         ├─ Normalizes data tuples
+  │     │◄─ Returns (path, pre_resolved_cs) ──────┴─ Sends back lightweight operation list
+  │     │   (compact IPC payload)
+  │     │
+  │     ├─ Sequential High-Speed Staging:
+  │     │  ├─ cs.cs = pre_resolved_cs
+  │     │  ├─ cs.execute() against TableEngine (pure in-memory inserts, zero waiting)
+  │     │  ├─ extract_tags_and_evacuate_cs(cs)
+  │     │  └─ Updates resolved_symbols & prunes deps graph
+  │     │
+  │     └─ Chunk Commit:
+  │        └─ If LOW_MEMORY_MODE and executed_count >= threshold:
+  │           G.TE.commit_all() & reclaim_system_memory()
+  ▼
+Phase 2 Workers terminate cleanly
+--------------------------------------------------------------------------------------------------
+Main Process (STEP 6.1+: Post-Processing Subsystems) TableEngine (G.TE)          Database (G.DB)
   │                                               │                                 │
   ├─ STEP 6.1: processing_symlinks()              │                                 │
   │  ├─ norm_target = normpath(target)            │                                 │
@@ -291,7 +368,7 @@ Main Process (STEP 6)                     TableEngine (G.TE)                Data
   │  ├─ processing_maintainer_files(version) ────►│                                 │
   │  └─ processing_kbuild(version) ──────────────►│                                 │
   │                                               │                                 │
-  └─ Final Teardown Commit:                       │                                 │
-     └─ G.TE.commit_all(update_in_mem_indexes=False) ──────────────────────────────►│
+  ├─ Final Teardown Commit:                       │                                 │
+  │  └─ G.TE.commit_all(update_in_mem_indexes=False) ──────────────────────────────►│
 ==================================================================================================
 ```

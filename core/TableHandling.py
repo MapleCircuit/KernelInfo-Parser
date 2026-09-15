@@ -87,6 +87,7 @@ are converted into pure native `int` objects to maintain database driver compati
 """
 from __future__ import annotations
 
+import os
 import sys
 import time
 import hashlib
@@ -132,9 +133,6 @@ from core.globalstuff import (
     UnSafeDataType,
     compute_code_hash,
 )
-from parser.c_ast.c_ast import c_ast_parse
-from parser.asm_ast.asm_ast import asm_ast_parse
-from parser.kconfig_ast.kconfig_ast import kconfig_ast_parse
 from core.Profiler import PipelineProfiler
 
 logger = logging.getLogger(__name__)
@@ -176,16 +174,37 @@ def to_safe_data(val: Any) -> SafeDataType:
     t = type(val)
     if t is int or t is str or t is bytes or val is None:
         return val
-    if t is bytearray or t is memoryview:
-        return bytes(val)
     if t is bool:
         return int(val)
+    if t is bytearray or t is memoryview:
+        return bytes(val)
     if isinstance(val, Enum):
         v = val.value
-        return int(v) if type(v) is int else str(v)
+        if isinstance(v, Enum):
+            v = v.value
+        if type(v) is int or type(v) is str or type(v) is bytes:
+            return v
+        if isinstance(v, int):
+            return int(v)
+        if isinstance(v, (bytes, bytearray, memoryview)):
+            return bytes(v)
+        return str(v)
     val_attr = getattr(val, "value", None)
-    if val_attr is not None and (type(val_attr) is int or type(val_attr) is str or type(val_attr) is bytes):
-        return val_attr
+    if val_attr is not None:
+        if type(val_attr) is int or type(val_attr) is str or type(val_attr) is bytes:
+            return val_attr
+        if isinstance(val_attr, int):
+            return int(val_attr)
+        if isinstance(val_attr, (bytes, bytearray, memoryview)):
+            return bytes(val_attr)
+        if isinstance(val_attr, str):
+            return str(val_attr)
+    if isinstance(val, int):
+        return int(val)
+    if isinstance(val, str):
+        return str(val)
+    if isinstance(val, (bytes, bytearray, memoryview)):
+        return bytes(val)
     return val
 
 
@@ -255,11 +274,20 @@ class ChangeSet:
         self.route: list[LinkType] = [REF_ROOT]
         self.route_count: list[int] = []
         self.multi_stack: list[int] = []
+        self.no_ref_depth: int = 0
         self._cached_route: tuple[LinkType, ...] | None = (REF_ROOT,)
         self.prior_tags: Any | None = None
         self.parsers: dict[str, Any] = {}
         self.debug: list[Any] = []
         self._bridge_maps: set[tuple[Any, Any]] = set()
+        self.symbol_dict: dict[tuple[str, int], int] = {}
+        self.pending_symbol_refs: list[tuple[Any, int, int, int]] = []
+        self.last_tag_ref: Any = None
+        self._executing: bool = False
+        self.foreign_deps: set[str] = set()
+        self.batch_cs_dict: dict[str, ChangeSet] | None = None
+        self.unresolved_indices: set[int] | None = None
+        self.blocked_on: str | None = None
         self.profiler: PipelineProfiler | None = (
             PipelineProfiler(file_path=self.current_path or "") if G.PROFILING_ENABLED else None
         )
@@ -290,6 +318,8 @@ class ChangeSet:
                 self.route.append(multi_idx)
                 self.store_dict[REF_MULTI].append([])
                 self.multi_stack.append(multi_idx)
+            elif links[0] == REF_NO_REF:
+                self.no_ref_depth += 1
             return self
 
         self.route_count.append(len(links))
@@ -313,6 +343,8 @@ class ChangeSet:
         popped = self.route[-count:] if len(self.route) >= count else []
         if popped and popped[0] == REF_MULTI and self.multi_stack:
             self.multi_stack.pop()
+        elif popped and popped[0] == REF_NO_REF and self.no_ref_depth:
+            self.no_ref_depth -= 1
         for _ in range(count):
             self.route.pop()
             if len(self.route) == 0:
@@ -329,8 +361,8 @@ class ChangeSet:
             logger.error("Last not None Error")
             raise CONTINUE_EXCEPTION
 
-    @G.type_check(Self, PointerType, RouteType)
-    def resolve_ref(self, query: PointerType, parsed_route: RouteType) -> SafeDataType | list[SafeDataType]:
+    @G.type_check(Self, PointerType, RouteType, {bool})
+    def resolve_ref(self, query: PointerType, parsed_route: RouteType, force_stubs: bool = False) -> SafeDataType | list[SafeDataType]:
         """Resolve a pointer query using parsed route to locate value across CS index or external CS.
 
         Evaluates route links:
@@ -342,6 +374,7 @@ class ChangeSet:
         Args:
             query: PointerType `(table_id, col_idx)`.
             parsed_route: Canonical normalized route link tuple.
+            force_stubs: If True, forces unresolvable foreign AST references to stage notbind stubs in TableHandling.
 
         Returns:
             Resolved primitive value (`int`, `str`, `None`).
@@ -350,8 +383,174 @@ class ChangeSet:
             return None
 
         if parsed_route[0] == REF_FILE:
+            if len(parsed_route) >= 4 and isinstance(parsed_route[2], str):
+                sym_name, sym_type = parsed_route[2], parsed_route[3]
+                rel_file = parsed_route[1]
+
+                # 0. Fast check: Per-file symbol table in gp.file_symbols
+                if self.gp and hasattr(self.gp, "file_symbols"):
+                    f_syms = self.gp.file_symbols.get(rel_file)
+                    if f_syms:
+                        sym_key = (sym_name, sym_type)
+                        if sym_key in f_syms:
+                            return to_safe_data(f_syms[sym_key])
+                        if hasattr(self.gp, "file_names"):
+                            f_names = self.gp.file_names.get(rel_file)
+                            if f_names and sym_name in f_names:
+                                return to_safe_data(f_names[sym_name])
+                        for (k_name, _), a_id in f_syms.items():
+                            if k_name == sym_name:
+                                return to_safe_data(a_id)
+
+                # 0b. Fast check: Phase 2 global symbol table snapshot (if active)
+                sym_key = (sym_name, sym_type)
+                phase2_syms = getattr(self, "_phase2_symbols", None)
+                if phase2_syms:
+                    if sym_key in phase2_syms:
+                        return to_safe_data(phase2_syms[sym_key])
+                    phase2_names = getattr(self, "_phase2_names", None)
+                    if phase2_names and sym_name in phase2_names:
+                        return to_safe_data(phase2_names[sym_name])
+                    elif not phase2_names:
+                        for (k_name, k_type), a_id in phase2_syms.items():
+                            if k_name == sym_name:
+                                return to_safe_data(a_id)
+
+                # 1. Fast check: foreign file is already in batch_cs_dict or active LRU cache
+                foreign_cs = None
+                if self.batch_cs_dict and rel_file in self.batch_cs_dict:
+                    foreign_cs = self.batch_cs_dict[rel_file]
+                elif self.gp and hasattr(self.gp.ChangeSet_Dict, "_lru_cache") and rel_file in self.gp.ChangeSet_Dict._lru_cache:
+                    foreign_cs = self.gp.ChangeSet_Dict._lru_cache[rel_file]
+
+                if foreign_cs is not None:
+                    # 1a. Fast check: foreign file already evacuated buffers but preserved resolved_symbols
+                    if hasattr(foreign_cs, "resolved_symbols") and foreign_cs.resolved_symbols:
+                        sym_key = (sym_name, sym_type)
+                        if sym_key in foreign_cs.resolved_symbols:
+                            return to_safe_data(foreign_cs.resolved_symbols[sym_key])
+                        for (k_name, k_type), a_id in foreign_cs.resolved_symbols.items():
+                            if k_name == sym_name:
+                                return to_safe_data(a_id)
+
+                    # 1b. Check active un-evacuated symbol_dict
+                    if hasattr(foreign_cs, "symbol_dict") and foreign_cs.symbol_dict and getattr(foreign_cs, "cs", None):
+                        sym_key = (sym_name, sym_type)
+                        if sym_key in foreign_cs.symbol_dict:
+                            op_pos = foreign_cs.symbol_dict[sym_key]
+                            val = foreign_cs._get_value_at(query, op_pos)
+                            if val is not None:
+                                return to_safe_data(val)
+                        for (k_name, k_type), op_pos in foreign_cs.symbol_dict.items():
+                            if k_name == sym_name:
+                                val = foreign_cs._get_value_at(query, op_pos)
+                                if val is not None:
+                                    return to_safe_data(val)
+
+                # 1c. DB-backed symbol lookup for unchanged files (with caching into gp.file_symbols)
+                if self.gp and hasattr(self.gp, "get_file_symbols_from_db"):
+                    db_syms = self.gp.get_file_symbols_from_db(rel_file)
+                    if db_syms:
+                        if hasattr(self.gp, "file_symbols"):
+                            self.gp.file_symbols[rel_file] = db_syms
+                        if hasattr(self.gp, "file_names"):
+                            self.gp.file_names[rel_file] = {s_name: a_id for (s_name, _), a_id in db_syms.items()}
+                        sym_key = (sym_name, sym_type)
+                        if sym_key in db_syms:
+                            return to_safe_data(db_syms[sym_key])
+                        for (k_name, k_type), a_id in db_syms.items():
+                            if k_name == sym_name:
+                                return to_safe_data(a_id)
+
+                # 2. TableHandling Fast-Path for AST nodes (query[0] == m_ast.table_id)
+                from core.DBLayout import m_ast
+                if query[0] == m_ast.table_id:
+                    from parser.c_ast.ast_nodes import get_notbind_type
+                    notbind_type = get_notbind_type(sym_type)
+
+                    safe_sym_name = str(to_safe_data(sym_name))[:255] if sym_name is not None else None
+                    safe_sym_type = to_safe_data(sym_type)
+                    safe_notbind_type = to_safe_data(notbind_type)
+
+                    # Check whether target file is an active incomplete ChangeSet in this update (Rule 24)
+                    changed_paths = getattr(self.gp, "_changed_paths_set", None) if self.gp else None
+                    is_completed = bool(self.gp and hasattr(self.gp, "file_symbols") and rel_file in self.gp.file_symbols)
+                    is_in_flight_changed = bool(changed_paths and rel_file in changed_paths)
+                    is_in_dict = bool(self.gp and rel_file in self.gp.ChangeSet_Dict)
+                    is_active_foreign = (is_in_flight_changed or is_in_dict) and not is_completed
+
+                    # If the target file is an active incomplete ChangeSet, its symbols have not been
+                    # published yet. Suspend immediately without scanning queued_set or querying the DB.
+                    if is_active_foreign and not force_stubs:
+                        self.blocked_on = rel_file
+                        return None
+
+                    # Fast-path check via in-memory staged symbol index in GreatProcessor
+                    gp_staged_syms = getattr(self.gp, "_ast_staged_symbols", None) if self.gp else None
+                    gp_staged_names = getattr(self.gp, "_ast_staged_names", None) if self.gp else None
+                    if gp_staged_syms is not None:
+                        exact_id = gp_staged_syms.get((safe_sym_name, safe_sym_type))
+                        if exact_id is not None:
+                            return to_safe_data(exact_id)
+                        notbind_id = gp_staged_syms.get((safe_sym_name, safe_notbind_type))
+                        if notbind_id is not None:
+                            return to_safe_data(notbind_id)
+                        if gp_staged_names is not None:
+                            name_id = gp_staged_names.get(safe_sym_name)
+                            if name_id is not None:
+                                return to_safe_data(name_id)
+
+                    # Exact match check via TE
+                    res = G.TE.get(m_ast.table_id, (None, safe_sym_name, safe_sym_type))
+                    if res is not None and len(res) > query[1] and res[query[1]] is not None:
+                        found_id = res[query[1]]
+                        if gp_staged_syms is not None:
+                            gp_staged_syms[(safe_sym_name, safe_sym_type)] = found_id
+                            if gp_staged_names is not None and safe_sym_name not in gp_staged_names:
+                                gp_staged_names[safe_sym_name] = found_id
+                        return to_safe_data(found_id)
+
+                    # Notbind match check via TE
+                    res = G.TE.get(m_ast.table_id, (None, safe_sym_name, safe_notbind_type))
+                    if res is not None and len(res) > query[1] and res[query[1]] is not None:
+                        found_id = res[query[1]]
+                        if gp_staged_syms is not None:
+                            gp_staged_syms[(safe_sym_name, safe_notbind_type)] = found_id
+                            if gp_staged_names is not None and safe_sym_name not in gp_staged_names:
+                                gp_staged_names[safe_sym_name] = found_id
+                        return to_safe_data(found_id)
+
+                    # General name match check via TE
+                    res = G.TE.get(m_ast.table_id, (None, safe_sym_name, None))
+                    if res is not None and len(res) > query[1] and res[query[1]] is not None:
+                        found_id = res[query[1]]
+                        if gp_staged_names is not None:
+                            gp_staged_names[safe_sym_name] = found_id
+                        return to_safe_data(found_id)
+
+                    if force_stubs or not is_active_foreign:
+                        set_res = G.TE.set(m_ast.table_id, (None, safe_sym_name, safe_notbind_type))
+                        if set_res is not None and len(set_res) > query[1] and set_res[query[1]] is not None:
+                            stub_id = set_res[query[1]]
+                            if gp_staged_syms is not None:
+                                gp_staged_syms[(safe_sym_name, safe_notbind_type)] = stub_id
+                                if gp_staged_names is not None and safe_sym_name not in gp_staged_names:
+                                    gp_staged_names[safe_sym_name] = stub_id
+                            return to_safe_data(stub_id)
+
+                    # Suspended waiting on target file
+                    self.blocked_on = rel_file
+                    return None
+
+            # Fallback for non-AST foreign queries or legacy route lookups
+            if not self.gp:
+                return None
             foreign_cs = self.gp.safe_get_cs(parsed_route[1])
-            return foreign_cs.resolve_ref(query, parsed_route[2:])
+            if foreign_cs is None:
+                return None
+            if not foreign_cs.cs_processed or len(foreign_cs.cs_result) < len(foreign_cs.cs):
+                foreign_cs.execute(force_stubs=force_stubs)
+            return to_safe_data(foreign_cs.resolve_ref(query, parsed_route[2:], force_stubs=force_stubs))
 
         if parsed_route[0] == REF_POS:
             return self._get_value_at(query, parsed_route[1])
@@ -361,8 +560,8 @@ class ChangeSet:
 
         return self._get_value_at(query, self._get_pos_from_route(parsed_route, query[0]))
 
-    @G.type_check(Self, tuple)
-    def _resolve_ref_from_tuple(self, data: tuple) -> tuple[SafeDataType, ...]:
+    @G.type_check(Self, tuple, {bool})
+    def _resolve_ref_from_tuple(self, data: tuple, force_stubs: bool = False) -> tuple[SafeDataType, ...]:
         """Resolve all reference tuples in a data tuple into safe primitive values.
 
         Evaluates each element in `data`. If an element is a reference tuple `(query, OP_REF, route)`,
@@ -370,6 +569,7 @@ class ChangeSet:
 
         Args:
             data: Column values tuple, which may include unresolved reference tuples.
+            force_stubs: If True, forces unresolvable foreign references to generate notbind stubs.
 
         Returns:
             Tuple of resolved primitive values (`tuple[SafeDataType, ...]`).
@@ -387,7 +587,6 @@ class ChangeSet:
         out_append = output_data.append
         cs_res = self.cs_result
         cs_res_len = len(cs_res)
-
         for val in data:
             if type(val) is tuple:
                 if len(val) == 3 and val[1] == OP_REF:
@@ -400,9 +599,9 @@ class ChangeSet:
                             if res is not None and col_idx < len(res):
                                 resolved = res[col_idx]
                                 if type(resolved) is not tuple:
-                                    out_append(resolved)
+                                    out_append(to_safe_data(resolved))
                                     continue
-                resolved = self.resolve_ref(val[0], val[2])
+                resolved = self.resolve_ref(val[0], val[2], force_stubs=force_stubs)
                 if resolved is None:
                     if G.BP_ON_REF_FAIL:
                         G.BP()
@@ -412,69 +611,108 @@ class ChangeSet:
                 out_append(val if (type(val) is int or type(val) is str or type(val) is bytes or val is None) else to_safe_data(val))
         return tuple(output_data)
 
-    def execute(self) -> bool:
-        """Execute queued operations in `CS.cs` sequentially against Table Engine (`G.TE`).
+    def execute(self, force_stubs: bool = False) -> bool:
+        """Execute queued operations in `CS.cs` against Table Engine (`G.TE`).
 
-        Iterates over `CS.cs` starting from index `len(CS.cs_result)`. Resolves any embedded
-        references, unpacks dynamic AST view references (`OP_REF_VIEW`), submits operations to
-        `G.TE.set()`, `G.TE.update()`, or `G.TE.view_set()`, and records execution outputs in
-        `CS.cs_result`. Sets `cs_processed = True` upon completion.
+        Iterates over unresolved operations in `CS.cs`. Resolves references, unpacks dynamic
+        AST view references (`OP_REF_VIEW`), submits operations to `G.TE.set()`, `G.TE.update()`,
+        or `G.TE.view_set()`, and records execution outputs at their respective index in `CS.cs_result`.
+        Supports out-of-order execution so independent operations can publish symbols even if earlier
+        operations are deferred.
+
+        Args:
+            force_stubs: If True, forces unresolvable REF_FILE references to stage notbind stubs
+                         in TableHandling to break circular dependency deadlocks.
 
         Returns:
-            True if all operations were successfully resolved and executed, False if unresolved.
+            True if all operations were successfully resolved and executed, False if any deferred.
         """
-        if self.cs_processed:
+        if self.cs_processed and len(self.cs_result) == len(self.cs) and (self.unresolved_indices is None or len(self.unresolved_indices) == 0):
+            return True
+        if getattr(self, "_executing", False):
             return True
 
-        te = G.TE
-        operation_offset = len(self.cs_result)
-        t_exec_0 = time.perf_counter() if self.profiler is not None else 0.0
-        cs = self.cs
-        cs_result = self.cs_result
-        cs_res_append = cs_result.append
-        te_set = te.set
-        te_update = te.update
-        te_view_set = te.view_set
+        self._executing = True
+        try:
+            te = G.TE
+            t_exec_0 = time.perf_counter() if self.profiler is not None else 0.0
+            cs = self.cs
+            cs_len = len(cs)
 
-        for operation in cs[operation_offset:]:
-            try:
-                op_type = operation[1]
-                if op_type == OP_REF_VIEW:
-                    unpacked = self._unpack_ref_view(operation)
-                    if unpacked is None:
-                        raise REF_NOT_RESOLVABLE
-                    operation = unpacked
+            if not self.cs_result or len(self.cs_result) < cs_len:
+                if not self.cs_result:
+                    self.cs_result = [None] * cs_len
+                    self.unresolved_indices = set(range(cs_len))
+                else:
+                    existing_len = len(self.cs_result)
+                    self.cs_result.extend([None] * (cs_len - existing_len))
+                    if self.unresolved_indices is None:
+                        self.unresolved_indices = set(range(existing_len, cs_len))
+                    else:
+                        self.unresolved_indices.update(range(existing_len, cs_len))
+
+            if self.unresolved_indices is None:
+                self.unresolved_indices = set(i for i, r in enumerate(self.cs_result) if r is None)
+
+            te_set = te.set
+            te_update = te.update
+            te_view_set = te.view_set
+
+            self.blocked_on = None
+            resolved_this_round = []
+
+            for idx in sorted(self.unresolved_indices):
+                operation = cs[idx]
+                try:
                     op_type = operation[1]
+                    if op_type == OP_REF_VIEW:
+                        unpacked = self._unpack_ref_view(operation, force_stubs=force_stubs)
+                        if unpacked is None:
+                            raise REF_NOT_RESOLVABLE
+                        operation = unpacked
+                        op_type = operation[1]
 
-                op_data = operation[2]
-                if op_type == OP_DONE or op_type == OP_VIEW_DONE:
-                    cs_res_append(op_data)
+                    op_data = operation[2]
+                    if op_type == OP_DONE or op_type == OP_VIEW_DONE:
+                        self.cs_result[idx] = op_data
+                        resolved_this_round.append(idx)
+                        continue
+
+                    data = self._resolve_ref_from_tuple(op_data, force_stubs=force_stubs) if is_data_unsafe(op_data) else normalize_data_tuple(op_data)
+
+                    if op_type == OP_SET:
+                        self.cs_result[idx] = te_set(operation[0], data)
+                        resolved_this_round.append(idx)
+                        continue
+                    if op_type == OP_UPDATE:
+                        self.cs_result[idx] = te_update(operation[0], data)
+                        resolved_this_round.append(idx)
+                        continue
+                    if op_type == OP_VIEW_SET:
+                        self.cs_result[idx] = te_view_set(operation[0], data)
+                        resolved_this_round.append(idx)
+                        continue
+
+                    logger.error(f"ERROR, UNKNOWN OPERATION {operation}")
+                    self.cs_result[idx] = None
+                    resolved_this_round.append(idx)
+                except REF_NOT_RESOLVABLE:
                     continue
 
-                data = self._resolve_ref_from_tuple(op_data) if is_data_unsafe(op_data) else op_data
+            for idx in resolved_this_round:
+                self.unresolved_indices.discard(idx)
 
-                if op_type == OP_SET:
-                    cs_res_append(te_set(operation[0], data))
-                    continue
-                if op_type == OP_UPDATE:
-                    cs_res_append(te_update(operation[0], data))
-                    continue
-                if op_type == OP_VIEW_SET:
-                    cs_res_append(te_view_set(operation[0], data))
-                    continue
+            if self.profiler is not None:
+                self.profiler.cs_execute_s = time.perf_counter() - t_exec_0
 
-                logger.error(f"ERROR, UNKNOWN OPERATION {operation}")
-                cs_res_append(None)
-            except REF_NOT_RESOLVABLE:
-                if self.profiler is not None:
-                    self.profiler.cs_execute_s = time.perf_counter() - t_exec_0
-                return False
+            if len(self.unresolved_indices) == 0:
+                self.cs_processed = True
+                self.blocked_on = None
+                return True
 
-        if self.profiler is not None:
-            self.profiler.cs_execute_s = time.perf_counter() - t_exec_0
-
-        self.cs_processed = True
-        return True
+            return False
+        finally:
+            self._executing = False
 
     @G.type_check(Self, OperationType, {LinkType})
     def store(self, operation: OperationType, *route: LinkType) -> None:
@@ -488,6 +726,7 @@ class ChangeSet:
             `CS.store(m_file_name.set(None, CS.current_path))`
             `CS.store(m_ast.view(...), REF_C_AST)`
         """
+        self.cs_processed = False
         if self.file_operation is None:
             self.cs.append(operation)
             return
@@ -496,7 +735,7 @@ class ChangeSet:
             if route[-1] == REF_POS:
                 self.route_count.append(2)
                 op_idx = len(self.cs)
-                if self.multi_stack and REF_NO_REF not in self.route and REF_NO_REF not in route:
+                if self.multi_stack and not self.no_ref_depth and REF_NO_REF not in route:
                     multi_idx = self.multi_stack[-1]
                     if isinstance(multi_idx, int) and len(self.store_dict[REF_MULTI]) > multi_idx:
                         if self.store_dict[REF_MULTI][multi_idx] is None:
@@ -514,7 +753,7 @@ class ChangeSet:
         elif self.route[-1] == REF_POS:
             self.route_count[-1] = 2
             op_idx = len(self.cs)
-            if self.multi_stack and REF_NO_REF not in self.route:
+            if self.multi_stack and not self.no_ref_depth:
                 multi_idx = self.multi_stack[-1]
                 if isinstance(multi_idx, int) and len(self.store_dict[REF_MULTI]) > multi_idx:
                     if self.store_dict[REF_MULTI][multi_idx] is None:
@@ -524,7 +763,7 @@ class ChangeSet:
             self._cached_route = None
             self.cs.append(operation)
             return
-        elif self.route[-1] == REF_NO_REF:
+        elif self.no_ref_depth > 0:
             self.cs.append(operation)
             return
 
@@ -659,7 +898,7 @@ class ChangeSet:
 
         operation = self.cs[pos]
 
-        if len(self.cs_result) > pos:
+        if len(self.cs_result) > pos and self.cs_result[pos] is not None:
             data = self.cs_result[pos]
         else:
             data = operation[2]
@@ -696,7 +935,7 @@ class ChangeSet:
         for pos in multipos:
             operation = self.cs[pos]
 
-            if len(self.cs_result) > pos:
+            if len(self.cs_result) > pos and self.cs_result[pos] is not None:
                 data = self.cs_result[pos]
             else:
                 data = operation[2]
@@ -758,9 +997,9 @@ class ChangeSet:
 
                 target_processed = self.cs_result[target] if target < len(self.cs_result) else None
                 if target_processed is None:
-                    result.append((target_op, None))
+                    result.append((target_op, None, target))
                 else:
-                    result.append((target_op, tuple(to_safe_data(x) for x in target_processed)))
+                    result.append((target_op, tuple(to_safe_data(x) for x in target_processed), target))
 
         return result
 
@@ -787,19 +1026,25 @@ class ChangeSet:
         else:
             parsed_route = tuple(self.route_parse(self.route))
 
+        if parsed_route and parsed_route[0] == REF_FILE:
+            if len(parsed_route) > 1 and isinstance(parsed_route[1], str):
+                self.foreign_deps.add(parsed_route[1])
+            return (query, OP_REF, parsed_route)
+
         result = self.resolve_ref(query, parsed_route)
         if result is not None:
             return to_safe_data(result)
 
         return (query, OP_REF, parsed_route)
 
-    def _resolve_col_val(self, target_op, val_tuple, col_idx: int) -> SafeDataType:
+    def _resolve_col_val(self, target_op, val_tuple, col_idx: int, force_stubs: bool = False) -> SafeDataType:
         """Extract resolved column value from val_tuple or target_op[2] fallback.
 
         Args:
             target_op: Underlying operation tuple.
             val_tuple: Processed result tuple.
             col_idx: Target column position integer.
+            force_stubs: If True, forces unresolvable foreign references to generate notbind stubs.
 
         Returns:
             Resolved primitive value.
@@ -813,11 +1058,11 @@ class ChangeSet:
                 val = target_op[2][col_idx]
 
         if isinstance(val, tuple) and len(val) == 3 and val[1] == OP_REF:
-            val = self.resolve_ref(val[0], val[2])
+            val = self.resolve_ref(val[0], val[2], force_stubs=force_stubs)
 
         return to_safe_data(val)
 
-    def _unpack_ref_view(self, operation: OperationType) -> OperationType | None:
+    def _unpack_ref_view(self, operation: OperationType, force_stubs: bool = False) -> OperationType | None:
         """Expand dynamic AST view schema reference (`OP_REF_VIEW`) into concrete `OP_VIEW_SET`.
 
         Evaluates schema rules against AST nodes stored in `store_dict`, matches applicable rule,
@@ -825,6 +1070,7 @@ class ChangeSet:
 
         Args:
             operation: `(joins, OP_REF_VIEW, (..., schema))` operation tuple.
+            force_stubs: If True, forces unresolvable foreign references to generate notbind stubs.
 
         Returns:
             Concrete `(joins, OP_VIEW_SET, data)` operation or None if unresolved.
@@ -837,54 +1083,216 @@ class ChangeSet:
         schema_thens = schema[1]
         schema_route = schema[2]
         rank = schema[3] if len(schema) > 3 else 0
+        trailing_items = schema[4] if len(schema) > 4 else None
 
         if not schema_route:
             data_list = []
         else:
-            target_table_id = schema_ifs[0][0][0] if isinstance(schema_ifs[0][0], tuple) else schema_ifs[0][0]
+            target = schema_ifs[0][0]
+            while isinstance(target, tuple):
+                target = target[0]
+            target_table_id = target
             if schema_route[0] == REF_FILE:
-                foreign_cs = self.gp.safe_get_cs(schema_route[1])
-                data_list = foreign_cs.get_available_data(schema_route[2:], target_table_id)
+                foreign_cs = None
+                if self.gp and schema_route[1] in self.gp.ChangeSet_Dict:
+                    foreign_cs = self.gp.ChangeSet_Dict[schema_route[1]]
+                elif self.batch_cs_dict and schema_route[1] in self.batch_cs_dict:
+                    foreign_cs = self.batch_cs_dict[schema_route[1]]
+                if foreign_cs is None and self.gp:
+                    foreign_cs = self.gp.safe_get_cs(schema_route[1])
+                data_list = foreign_cs.get_available_data(schema_route[2:], target_table_id) if foreign_cs else []
             else:
                 data_list = self.get_available_data(schema_route, target_table_id)
 
-        if not data_list:
+        if not data_list and not trailing_items:
             return (tuple(joins), OP_VIEW_SET, tuple(data))
 
-        for target_op, val_tuple in data_list:
-            chosen_rule = -1
-            for i, rule in enumerate(schema_ifs):
-                testing_val = self._resolve_col_val(target_op, val_tuple, rule[0][1])
-                if testing_val is None:
-                    continue
-
-                expected = rule[1]
-                is_match = (testing_val in expected) if isinstance(expected, (tuple, list, set, dict)) else (testing_val == expected)
-                if is_match:
-                    chosen_rule = i
-                    break
-
-            rule_joins = schema_thens[chosen_rule][0] if chosen_rule != -1 else schema_thens[-1][0]
-            rule_items = schema_thens[chosen_rule][1] if chosen_rule != -1 else schema_thens[-1][1]
-
-            for item in rule_items:
-                if isinstance(item, tuple):
-                    if G.is_PointerType(item):
-                        val = self._resolve_col_val(target_op, val_tuple, item[1])
-                        if val is None:
-                            return None
-                        data.append(to_safe_data(val))
+        if data_list:
+            for item_data in data_list:
+                target_op = item_data[0]
+                val_tuple = item_data[1]
+                target_idx = item_data[2] if len(item_data) > 2 else None
+                chosen_rule = -1
+                for i, rule in enumerate(schema_ifs):
+                    testing_val = self._resolve_col_val(target_op, val_tuple, rule[0][1], force_stubs=force_stubs)
+                    if testing_val is None:
                         continue
-                    elif len(item) == 1 and item[0] == "rank":
-                        data.append(rank)
-                        rank += 1
-                        continue
-                data.append(to_safe_data(item))
 
-            for join in rule_joins:
-                PointerGetter.add_join(joins, join)
+                    expected = rule[1]
+                    is_match = (testing_val in expected) if isinstance(expected, (tuple, list, set, dict)) else (testing_val == expected)
+                    if is_match:
+                        chosen_rule = i
+                        break
+
+                rule_joins = schema_thens[chosen_rule][0] if chosen_rule != -1 else schema_thens[-1][0]
+                rule_items = schema_thens[chosen_rule][1] if chosen_rule != -1 else schema_thens[-1][1]
+
+                for item in rule_items:
+                    if isinstance(item, tuple):
+                        if G.is_PointerType(item):
+                            val = self._resolve_col_val(target_op, val_tuple, item[1], force_stubs=force_stubs)
+                            if val is None:
+                                if target_idx is not None:
+                                    val = (item, OP_REF, (REF_POS, target_idx))
+                                else:
+                                    return None
+                            data.append(to_safe_data(val))
+                            continue
+                        elif len(item) == 1 and item[0] == "rank":
+                            data.append(rank)
+                            rank += 1
+                            continue
+                    data.append(to_safe_data(item))
+
+                for join in rule_joins:
+                    PointerGetter.add_join(joins, join)
+
+        if trailing_items:
+            for rule_joins, rule_items in trailing_items:
+                for item in rule_items:
+                    if isinstance(item, tuple):
+                        if len(item) == 1 and item[0] == "rank":
+                            data.append(rank)
+                            rank += 1
+                            continue
+                    data.append(to_safe_data(item))
+
+                for join in rule_joins:
+                    PointerGetter.add_join(joins, join)
 
         return (tuple(joins), OP_VIEW_SET, tuple(data))
+
+    def preprocess_ref_views(self) -> None:
+        """Pre-unpack intra-file OP_REF_VIEW operations into concrete OP_VIEW_SET in parallel workers.
+
+        Distributes AST schema pattern-matching, join construction, and rule evaluation across
+        worker CPU cores before IPC serialization to minimize main-process execution latency.
+        """
+        if not self.cs:
+            return
+
+        for idx, op in enumerate(self.cs):
+            if op and len(op) >= 3 and op[1] == OP_REF_VIEW:
+                schema = op[2][-1] if op[2] else None
+                if not schema or not isinstance(schema, (tuple, list)):
+                    continue
+                schema_route = schema[2] if len(schema) > 2 else ()
+                # Only pre-unpack intra-file schemas or schemas resolvable in worker scope
+                if not schema_route or schema_route[0] != REF_FILE:
+                    unpacked = self._unpack_ref_view(op, force_stubs=False)
+                    if unpacked is not None:
+                        self.cs[idx] = unpacked
+
+    def prune_unchanged_dependencies(self) -> None:
+        """Pre-resolve references to unchanged files via DB and prune satisfied entries from foreign_deps.
+
+        Invoked in parallel workers during Phase 1 in normal memory mode.
+        """
+        if not self.foreign_deps or not self.cs:
+            return
+
+        gp = self.gp or getattr(G, "GP", None)
+        if gp is None or not hasattr(gp, "get_file_symbols_from_db"):
+            return
+
+        changed_paths = getattr(gp, "_changed_paths_set", None)
+
+        for rel_file in list(self.foreign_deps):
+            # If target file is modified in the active version, it is not an unchanged DB file
+            if changed_paths and rel_file in changed_paths:
+                continue
+
+            # Query DB for symbols defined by this unchanged file
+            db_syms = gp.get_file_symbols_from_db(rel_file)
+            if not db_syms:
+                continue
+
+            all_resolved = True
+            for idx, op in enumerate(self.cs):
+                if not op or len(op) < 3:
+                    continue
+                op_data = op[2]
+                if not is_data_unsafe(op_data):
+                    continue
+
+                new_data = []
+                modified = False
+                for col in op_data:
+                    if type(col) is tuple and len(col) == 3 and col[1] == OP_REF:
+                        route = col[2]
+                        if route and len(route) >= 4 and route[0] == REF_FILE and route[1] == rel_file:
+                            sym_name = route[2]
+                            sym_type = route[3]
+                            sym_key = (sym_name, sym_type)
+                            ast_id = db_syms.get(sym_key)
+                            if ast_id is None:
+                                for (k_name, k_type), a_id in db_syms.items():
+                                    if k_name == sym_name:
+                                        ast_id = a_id
+                                        break
+                            if ast_id is not None:
+                                new_data.append(to_safe_data(ast_id))
+                                modified = True
+                                continue
+                            else:
+                                all_resolved = False
+                    new_data.append(col)
+                if modified:
+                    self.cs[idx] = (op[0], op[1], tuple(new_data))
+
+            if all_resolved:
+                self.foreign_deps.discard(rel_file)
+
+    def pre_resolve_operations(self, resolved_symbols_map: dict[tuple[str, int], int], resolved_names_map: dict[str, int] | None = None) -> list[OperationType]:
+        """Pre-resolve foreign references and unpack dynamic views on worker cores during Phase 2.
+
+        Args:
+            resolved_symbols_map: Snapshot of known resolved symbols {(sym_name, sym_type): ast_id}.
+            resolved_names_map: Optional snapshot of symbol names to ast_id {sym_name: ast_id}.
+
+        Returns:
+            Pre-resolved list of operations in self.cs.
+        """
+        if not self.cs:
+            return []
+
+        self._phase2_symbols = resolved_symbols_map
+        if resolved_names_map is not None:
+            self._phase2_names = resolved_names_map
+        elif self._phase2_symbols:
+            self._phase2_names = {k[0]: v for k, v in self._phase2_symbols.items()}
+
+        # 1. Pre-unpack remaining dynamic views
+        for idx, op in enumerate(self.cs):
+            if op and len(op) >= 3 and op[1] == OP_REF_VIEW:
+                unpacked = self._unpack_ref_view(op, force_stubs=False)
+                if unpacked is not None:
+                    self.cs[idx] = unpacked
+
+        # 2. Pre-resolve foreign REF_FILE references in op data
+        for idx, op in enumerate(self.cs):
+            if not op or len(op) < 3:
+                continue
+            op_data = op[2]
+            if not is_data_unsafe(op_data):
+                continue
+
+            new_data = []
+            modified = False
+            for col in op_data:
+                if type(col) is tuple and len(col) == 3 and col[1] == OP_REF:
+                    route = col[2]
+                    if route and route[0] == REF_FILE:
+                        resolved = self.resolve_ref(col[0], route, force_stubs=False)
+                        if resolved is not None:
+                            new_data.append(to_safe_data(resolved))
+                            modified = True
+                            continue
+                new_data.append(col)
+            if modified:
+                self.cs[idx] = (op[0], op[1], tuple(new_data))
+
+        return self.cs
 
     def parse(self) -> None:
         """Select and invoke appropriate language AST parser based on current_path file type.
@@ -897,10 +1305,13 @@ class ChangeSet:
         try:
             current_type = type_check(self.current_path)
             if current_type == T_C:
+                from parser.c_ast.c_ast import c_ast_parse
                 c_ast_parse(self)
             elif current_type == T_ASM:
+                from parser.asm_ast.asm_ast import asm_ast_parse
                 asm_ast_parse(self)
             elif current_type == T_KCONFIG:
+                from parser.kconfig_ast.kconfig_ast import kconfig_ast_parse
                 kconfig_ast_parse(self)
             elif current_type == T_MAINTAINERS:
                 from parser.maintainer_ast.maintainer_ast import maintainer_ast_parse
@@ -932,7 +1343,11 @@ class ChangeSet:
         self.prior_tags = None
         self.prior_tags_map = None
         self.active_tag_list = None
+        self.pending_symbol_refs = []
+        self.last_tag_ref = None
         self._bridge_maps = set()
+        self.batch_cs_dict = None
+        self.blocked_on = None
         self.route = [REF_ROOT]
         self.route_count = []
         self.multi_stack = []
@@ -993,8 +1408,8 @@ class Table:
         Side Effects:
             1. Binds column attribute pointers directly on this instance:
                `self.<column_name> = (table_id, col_idx)`  (e.g., `m_file_name.fnid` becomes `(1, 0)`).
-            2. Injects this `Table` instance directly into the `parser.c_ast.c_ast_type` module namespace
-               under `self.table_name` for direct access during AST node extraction.
+            2. Injects this `Table` instance directly into the `parser.c_ast` module namespace
+                under `self.table_name` for direct access during AST node extraction.
         """
         self.table_id = table_id
         self.table_name = table_name
@@ -1050,11 +1465,11 @@ class Table:
         for x, column in enumerate(self.init_columns):
             setattr(self, column[0], (self.table_id, x))
 
-        # Step 2: Inject Table object reference into c_ast_type and c_ast module scopes for AST parsing
-        if mod := sys.modules.get("parser.c_ast.c_ast_type"):
-            setattr(mod, self.table_name, self)
+        # Step 2: Inject Table object reference into c_ast module scopes for AST parsing
         if mod_c := sys.modules.get("parser.c_ast.c_ast"):
             setattr(mod_c, self.table_name, self)
+        if mod_root := sys.modules.get("parser.c_ast"):
+            setattr(mod_root, self.table_name, self)
 
     def start_te(self) -> None:
         """Register table schema with active Table Engine (`G.TE`)."""

@@ -41,7 +41,7 @@ Raw / Fallback File (T_RAW, T_MAINTAINERS, T_CREDITS, etc.)
      │  │        [Zero duplicate m_tag or m_ast created]
      │  │
      │  └─ New Content / Modified Tag:
-     │     ├─ m_ast.get_set(None, content_hex, ASTT.Raw_Content)
+     │     ├─ m_ast.view(((m_ast.ast_id,),), None, content_hex, ASTT.Raw_Content) [Rule 23]
      │     ├─ with CS(REF_POS):
      │     │  ├─ m_tag.set(None, VID, 0, content_hash, ast_ref, 0, 0) [Rule 12]
      │     │  ├─ m_tag_code.get_set(content_hash, content)
@@ -138,9 +138,10 @@ Class orchestrating file content loading, hashing, line coordinate calculations,
 
 #### Relational Staging Contract
 ```python
-# 1. AST Symbol definition
+# 1. AST Symbol definition (Rule 23 view deduplication)
 with CS(REF_POS):
-    CS.store(m_ast.get_set(
+    CS.store(m_ast.view(
+        ((m_ast.ast_id,),),
         None,
         content_hex,
         ASTT.Raw_Content,

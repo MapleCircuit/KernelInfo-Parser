@@ -249,6 +249,45 @@ class TestKconfigAstIntegration(unittest.TestCase):
         for _, trow in tree_rows.items():
             self.assertEqual(trow[1], self.gp.VID)  # vid
 
+    def test_kconfig_multi_file_symbol_relations_dedup(self) -> None:
+        """Verify that multiple Kconfig files defining the same symbol with overlapping relations stage cleanly."""
+        file1_kconfig = (
+            "menuconfig VIRTUALIZATION\n"
+            "    bool \"Virtualization\"\n"
+            "    depends on HAVE_KVM || X86\n"
+            "    default y\n"
+        )
+        file2_kconfig = (
+            "menuconfig VIRTUALIZATION\n"
+            "    bool \"Virtualization\"\n"
+            "    depends on HAVE_KVM || IA64\n"
+            "    default y\n"
+        )
+
+        cs1 = ChangeSet("A", "arch/x86/kvm/Kconfig")
+        cs1.gp = self.gp
+        cs1.raw_content = file1_kconfig
+        cs1.store(m_file_name.set(None, "arch/x86/kvm/Kconfig"))
+        cs1.store(m_file.set(None, 1, 0, 2, "A", "0"))
+        cs1.store(m_bridge_file.set(1, ((m_file_name.table_id, 0), 3, (REF_ROOT,)), ((m_file.table_id, 0), 3, (REF_ROOT,))))
+        kconfig_ast_parse(cs1)
+        self.assertTrue(cs1.execute())
+
+        # Commit chunk 1
+        G.TE.commit_all()
+
+        cs2 = ChangeSet("A", "arch/ia64/kvm/Kconfig")
+        cs2.gp = self.gp
+        cs2.raw_content = file2_kconfig
+        cs2.store(m_file_name.set(None, "arch/ia64/kvm/Kconfig"))
+        cs2.store(m_file.set(None, 1, 0, 2, "A", "0"))
+        cs2.store(m_bridge_file.set(1, ((m_file_name.table_id, 0), 3, (REF_ROOT,)), ((m_file.table_id, 0), 3, (REF_ROOT,))))
+        kconfig_ast_parse(cs2)
+        self.assertTrue(cs2.execute())
+
+        # Commit chunk 2 - must not raise Duplicate entry '800-1-HAVE_KVM-0'
+        G.TE.commit_all()
+
     def test_kconfig_export_import_roundtrip(self) -> None:
         from webapp.main import export_kconfig_file, import_kconfig_file
         test_symbols = {

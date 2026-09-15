@@ -43,7 +43,7 @@ SCHEMA ENTITY-RELATIONSHIP GRAPH:
 4. Kconfig Relational Acceleration & Dependency Graph:
    m_kconfig_symbol (kcid, vid_s, vid_e, name, type, prompt, def_val, help, ast_id -> m_ast.ast_id)
       ^            ^
-      |            |-- (kcid) ---------> m_kconfig_relation (kcid, target_name, rel_type, cond_ast_id, priority)
+      |            |-- (kcid) ---------> m_kconfig_relation (rel_id, kcid, target_name, rel_type, cond_ast_id, priority)
       |
       |-- (kcid) ----------------------> m_kconfig_tree (tree_id, vid, parent_id, node_type, title, kcid, priority, dep_ast_id, ast_id)
       |
@@ -482,6 +482,7 @@ m_kconfig_symbol = Table(
 
 # -----------------------------------------------------------------------------
 # 18. m_kconfig_relation (table_id=17): Dependency & Reverse-Dependency Graph
+#     - rel_id: Unique Relation ID (PK, AUTO_INCREMENT).
 #     - kcid: Source Kconfig Symbol ID (FK -> m_kconfig_symbol.kcid).
 #     - target_name: Depended-upon or selected symbol name (e.g. "BLOCK", "CRC32").
 #     - rel_type: Category (1: depends_on, 2: select, 3: imply, 4: choice_member).
@@ -492,16 +493,17 @@ m_kconfig_relation = Table(
     table_id=17,
     table_name="m_kconfig_relation",
     columns=(
+        ("rel_id", "INT", "NOT NULL", "AUTO_INCREMENT"),
         ("kcid", "INT", "NOT NULL"),
         ("target_name", "VARCHAR(64)", "NOT NULL", "COLLATE utf8mb4_bin"),
         ("rel_type", "TINYINT", "UNSIGNED", "NOT NULL"),
         ("cond_ast_id", "INT", "NOT NULL"),
         ("priority", "SMALLINT", "UNSIGNED", "NOT NULL"),
     ),
-    primary=("kcid", "rel_type", "target_name", "priority"),
+    primary=("rel_id",),
     foreign=(("kcid", "m_kconfig_symbol", "kcid"),),
     initial_insert=None,
-    no_duplicate=False,
+    no_duplicate=True,
     te_cached=True,
     hashing_table=False,
 )
@@ -883,6 +885,84 @@ m_moved_tag = Table(
     hashing_table=False,
 )
 
+# -----------------------------------------------------------------------------
+# 32. m_symbol_def (table_id=31): Authoritative Symbol Definition Registry
+#     - def_id: Unique Definition ID (PK, AUTO_INCREMENT).
+#     - vid: Version ID (FK -> m_v_main.vid).
+#     - fid: File Instance ID (FK -> m_file.fid).
+#     - tag_id: Definition Tag ID (FK -> m_tag.tag_id).
+#     - ast_id: Associated Canonical AST Node ID (FK -> m_ast.ast_id).
+#     - name: Symbol identifier name (e.g. "task_struct", "schedule").
+#     - type_id: AST Category ID (FK -> m_type_descriptor.type_id).
+#     - line_s / line_e: Definition source start and end line numbers.
+# -----------------------------------------------------------------------------
+m_symbol_def = Table(
+    table_id=31,
+    table_name="m_symbol_def",
+    columns=(
+        ("def_id", "INT", "NOT NULL", "AUTO_INCREMENT"),
+        ("vid", "INT", "NOT NULL"),
+        ("fid", "INT", "NOT NULL"),
+        ("tag_id", "INT", "NOT NULL"),
+        ("ast_id", "INT", "NOT NULL"),
+        ("name", "VARCHAR(255)", "NOT NULL", "COLLATE utf8mb4_bin"),
+        ("type_id", "TINYINT", "UNSIGNED", "NOT NULL"),
+        ("line_s", "INT", "NOT NULL"),
+        ("line_e", "INT", "NOT NULL"),
+    ),
+    primary=("def_id",),
+    foreign=(
+        ("vid", "m_v_main", "vid"),
+        ("fid", "m_file", "fid"),
+        ("tag_id", "m_tag", "tag_id"),
+        ("ast_id", "m_ast", "ast_id"),
+        ("type_id", "m_type_descriptor", "type_id"),
+    ),
+    initial_insert=None,
+    no_duplicate=False,
+    te_cached=True,
+    version_scoped=True,
+    hashing_table=False,
+)
+
+# -----------------------------------------------------------------------------
+# 33. m_symbol_ref (table_id=32): Symbol Declarations & Usages Reference Index
+#     - ref_id: Unique Reference ID (PK, AUTO_INCREMENT).
+#     - vid: Version ID (FK -> m_v_main.vid).
+#     - fid: File Instance ID (FK -> m_file.fid).
+#     - tag_id: Enclosing Code Tag ID (FK -> m_tag.tag_id).
+#     - ast_id: Referenced Canonical AST Node ID (FK -> m_ast.ast_id).
+#     - role: SymbolRole category (1: Declaration, 2: TypeUsage, 3: Call, 4: MemberRef, 5: DeclRef).
+#     - line: Source line number of occurrence.
+#     - char_s: Source character column offset of occurrence.
+# -----------------------------------------------------------------------------
+m_symbol_ref = Table(
+    table_id=32,
+    table_name="m_symbol_ref",
+    columns=(
+        ("ref_id", "INT", "NOT NULL", "AUTO_INCREMENT"),
+        ("vid", "INT", "NOT NULL"),
+        ("fid", "INT", "NOT NULL"),
+        ("tag_id", "INT", "NOT NULL"),
+        ("ast_id", "INT", "NOT NULL"),
+        ("role", "TINYINT", "UNSIGNED", "NOT NULL"),
+        ("line", "INT", "NOT NULL"),
+        ("char_s", "INT", "NOT NULL"),
+    ),
+    primary=("ref_id",),
+    foreign=(
+        ("vid", "m_v_main", "vid"),
+        ("fid", "m_file", "fid"),
+        ("tag_id", "m_tag", "tag_id"),
+        ("ast_id", "m_ast", "ast_id"),
+    ),
+    initial_insert=None,
+    no_duplicate=False,
+    te_cached=False,
+    version_scoped=True,
+    hashing_table=False,
+)
+
 TABLES: tuple[Table, ...] = (
     m_v_main,
     m_file_name,
@@ -915,18 +995,20 @@ TABLES: tuple[Table, ...] = (
     m_bridge_commit_file,
     m_bridge_commit_tag,
     m_moved_tag,
+    m_symbol_def,
+    m_symbol_ref,
 )
 
 
 def init_db_layout(gp=None) -> tuple[Table, ...]:
-    """Initialize and populate gp.Table_Array with the default 31 schema tables.
+    """Initialize and populate gp.Table_Array with the default 33 schema tables.
     
     Args:
         gp: Optional GreatProcessor instance to attach Table_Array to.
         
         
     Returns:
-        Immutable tuple of all 31 Table schema objects.
+        Immutable tuple of all 33 Table schema objects.
     """
     if gp is not None:
         gp.Table_Array = list(TABLES)

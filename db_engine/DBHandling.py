@@ -959,7 +959,7 @@ class MariaDB(BaseDBEngine):
         rows = self.cursor.fetchall()
         if not rows:
             return []
-        if any(isinstance(val, (bytearray, memoryview)) for val in rows[0]):
+        if any(isinstance(val, (bytearray, memoryview)) for r in rows[:min(len(rows), 10)] for val in r):
             return [tuple(bytes(val) if isinstance(val, (bytearray, memoryview)) else val for val in row) for row in rows]
         return [tuple(row) for row in rows]
 
@@ -1012,8 +1012,32 @@ class MariaDB(BaseDBEngine):
         rows = self.cursor.fetchall()
         if not rows:
             return []
-        if any(isinstance(val, (bytearray, memoryview)) for val in rows[0]):
-            return [tuple(bytes(val) if isinstance(val, (bytearray, memoryview)) else val for val in row) for row in rows]
+
+        # Identify binary columns in projected output
+        target_cols = [table.init_columns[i] for i in cached_columns] if cached_columns is not None else table.init_columns
+        binary_indices = {
+            i for i, col in enumerate(target_cols)
+            if "BINARY" in col[1].upper() or "BLOB" in col[1].upper()
+        }
+
+        # Optimized fast-path for single-column binary projection (e.g. m_tag_code)
+        if len(target_cols) == 1 and 0 in binary_indices:
+            return [
+                ((row[0].encode("latin1") if isinstance(row[0], str) else bytes(row[0])),)
+                if row[0] is not None else (None,)
+                for row in rows
+            ]
+
+        if binary_indices or any(isinstance(val, (bytearray, memoryview)) for r in rows[:min(len(rows), 10)] for val in r):
+            return [
+                tuple(
+                    (val.encode("latin1") if isinstance(val, str) else bytes(val))
+                    if (idx in binary_indices or isinstance(val, (bytearray, memoryview))) and val is not None
+                    else val
+                    for idx, val in enumerate(row)
+                )
+                for row in rows
+            ]
         return [tuple(row) for row in rows]
 
     def index_exists(self, index_name: str, table: Table) -> bool:

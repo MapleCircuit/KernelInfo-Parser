@@ -51,8 +51,7 @@ def _init_tables() -> None:
     m_kconfig_relation = db_layout.m_kconfig_relation
     m_kconfig_tree = db_layout.m_kconfig_tree
 
-from parser.c_ast.c_ast_type import Line
-from parser.c_ast.c_ast import get_prior_tags, close_prior_tags
+from parser.c_ast import Line, get_prior_tags, close_prior_tags
 from parser.kconfig_ast.kconfig_lexer import KconfigLexer
 from parser.kconfig_ast.kconfig_parser import (
     KconfigParser,
@@ -205,7 +204,7 @@ class KconfigManager:
                             ))
                         return tag_id
 
-        from parser.c_ast.c_ast import match_prior_tag_transition
+        from parser.c_ast import match_prior_tag_transition
         s_tag_id = match_prior_tag_transition(CS, extent, ast_name, ast_type)
 
         with CS(REF_POS):
@@ -270,39 +269,48 @@ class KconfigManager:
         }
         astt_type, expr_name = op_type_map.get(expr.op, (ASTT.Undefined, ""))
 
-        with CS(REF_POS):
-            CS.store(m_ast.set(None, expr_name, astt_type.value))
-            expr_ast_ref = ((m_ast.table_id, 0), OP_REF, (REF_POS, CS.route[-1]))
-
-        # Container links for operands
-        priority = 0
+        operands = []
         if expr.left:
             left_ref = self._extract_expr_ast(expr.left)
-            with CS(REF_POS):
-                CS.store(m_ast_container.set(
-                    expr_ast_ref,
-                    priority,
-                    ASTT.Kconfig_Op_And.value,
-                    left_ref,
-                ))
-            priority += 1
+            operands.append((0, ASTT.Kconfig_Op_And.value, left_ref))
         if expr.right:
             right_ref = self._extract_expr_ast(expr.right)
+            operands.append((len(operands), ASTT.Kconfig_Op_And.value, right_ref))
+
+        if operands:
+            container_payload = []
+            for p, c_type, c_ref in operands:
+                container_payload.extend([None, p, c_type, c_ref])
             with CS(REF_POS):
-                CS.store(m_ast_container.set(
-                    expr_ast_ref,
-                    priority,
-                    ASTT.Kconfig_Op_And.value,
-                    right_ref,
+                CS.store(m_ast.view(
+                    ((m_ast.ast_id, m_ast_container.ast_id, len(operands)),),
+                    None,
+                    expr_name,
+                    astt_type.value,
+                    *container_payload,
                 ))
-            priority += 1
+                expr_ast_ref = ((m_ast.table_id, 0), OP_REF, (REF_POS, CS.route[-1]))
+        else:
+            with CS(REF_POS):
+                CS.store(m_ast.view(
+                    ((m_ast.ast_id,),),
+                    None,
+                    expr_name,
+                    astt_type.value,
+                ))
+                expr_ast_ref = ((m_ast.table_id, 0), OP_REF, (REF_POS, CS.route[-1]))
 
         return expr_ast_ref
 
     def _extract_mainmenu(self, node: KconfigMainmenu, parent_tree_id: int | Any, parent_dep_exprs: list[KconfigExpr]) -> None:
         CS = self.CS
         with CS(REF_POS):
-            CS.store(m_ast.set(None, node.title or "mainmenu", ASTT.Kconfig_Mainmenu.value))
+            CS.store(m_ast.view(
+                ((m_ast.ast_id,),),
+                None,
+                node.title or "mainmenu",
+                ASTT.Kconfig_Mainmenu.value,
+            ))
             ast_ref = ((m_ast.table_id, 0), OP_REF, (REF_POS, CS.route[-1]))
 
         self._tag_and_map(ast_ref, node.line_s, node.line_e, node.char_s, node.char_e, node.raw_code, ast_name=node.title or "mainmenu", ast_type=ASTT.Kconfig_Mainmenu)
@@ -312,7 +320,12 @@ class KconfigManager:
         ast_type = ASTT.Kconfig_Menuconfig if cfg.is_menuconfig else ASTT.Kconfig_Config
 
         with CS(REF_POS):
-            CS.store(m_ast.set(None, cfg.name, ast_type.value))
+            CS.store(m_ast.view(
+                ((m_ast.ast_id,),),
+                None,
+                cfg.name,
+                ast_type.value,
+            ))
             ast_ref = ((m_ast.table_id, 0), OP_REF, (REF_POS, CS.route[-1]))
 
         self._tag_and_map(ast_ref, cfg.line_s, cfg.line_e, cfg.char_s, cfg.char_e, cfg.raw_code, ast_name=cfg.name, ast_type=ast_type)
@@ -348,6 +361,7 @@ class KconfigManager:
             for target_sym in dep_expr.collect_symbols():
                 with CS(REF_POS):
                     CS.store(m_kconfig_relation.set(
+                        None,
                         kcid_ref,
                         target_sym,
                         1,  # depends_on
@@ -361,6 +375,7 @@ class KconfigManager:
             cond_ast_ref = self._extract_expr_ast(cond_expr) if cond_expr else 0
             with CS(REF_POS):
                 CS.store(m_kconfig_relation.set(
+                    None,
                     kcid_ref,
                     target_sym,
                     2,  # select
@@ -374,6 +389,7 @@ class KconfigManager:
             cond_ast_ref = self._extract_expr_ast(cond_expr) if cond_expr else 0
             with CS(REF_POS):
                 CS.store(m_kconfig_relation.set(
+                    None,
                     kcid_ref,
                     target_sym,
                     3,  # imply
@@ -404,7 +420,12 @@ class KconfigManager:
     def _extract_menu(self, menu: KconfigMenu, parent_tree_id: int | Any, parent_dep_exprs: list[KconfigExpr]) -> None:
         CS = self.CS
         with CS(REF_POS):
-            CS.store(m_ast.set(None, menu.title or "menu", ASTT.Kconfig_Menu.value))
+            CS.store(m_ast.view(
+                ((m_ast.ast_id,),),
+                None,
+                menu.title or "menu",
+                ASTT.Kconfig_Menu.value,
+            ))
             ast_ref = ((m_ast.table_id, 0), OP_REF, (REF_POS, CS.route[-1]))
 
         self._tag_and_map(ast_ref, menu.line_s, menu.line_e, menu.char_s, menu.char_e, menu.raw_code, ast_name=menu.title or "menu", ast_type=ASTT.Kconfig_Menu)
@@ -435,7 +456,12 @@ class KconfigManager:
         CS = self.CS
         choice_title = choice.prompt or choice.name or "Choice"
         with CS(REF_POS):
-            CS.store(m_ast.set(None, choice_title, ASTT.Kconfig_Choice.value))
+            CS.store(m_ast.view(
+                ((m_ast.ast_id,),),
+                None,
+                choice_title,
+                ASTT.Kconfig_Choice.value,
+            ))
             ast_ref = ((m_ast.table_id, 0), OP_REF, (REF_POS, CS.route[-1]))
 
         self._tag_and_map(ast_ref, choice.line_s, choice.line_e, choice.char_s, choice.char_e, choice.raw_code, ast_name=choice_title, ast_type=ASTT.Kconfig_Choice)
@@ -464,7 +490,12 @@ class KconfigManager:
     def _extract_if(self, if_node: KconfigIf, parent_tree_id: int | Any, parent_dep_exprs: list[KconfigExpr]) -> None:
         CS = self.CS
         with CS(REF_POS):
-            CS.store(m_ast.set(None, f"if {if_node.cond.to_string()}", ASTT.Kconfig_If.value))
+            CS.store(m_ast.view(
+                ((m_ast.ast_id,),),
+                None,
+                f"if {if_node.cond.to_string()}",
+                ASTT.Kconfig_If.value,
+            ))
             ast_ref = ((m_ast.table_id, 0), OP_REF, (REF_POS, CS.route[-1]))
 
         self._tag_and_map(ast_ref, if_node.line_s, if_node.line_e, if_node.char_s, if_node.char_e, if_node.raw_code, ast_name=f"if {if_node.cond.to_string()}", ast_type=ASTT.Kconfig_If)
@@ -475,7 +506,12 @@ class KconfigManager:
     def _extract_comment(self, comment: KconfigComment, parent_tree_id: int | Any, parent_dep_exprs: list[KconfigExpr]) -> None:
         CS = self.CS
         with CS(REF_POS):
-            CS.store(m_ast.set(None, comment.title or "comment", ASTT.Kconfig_Comment.value))
+            CS.store(m_ast.view(
+                ((m_ast.ast_id,),),
+                None,
+                comment.title or "comment",
+                ASTT.Kconfig_Comment.value,
+            ))
             ast_ref = ((m_ast.table_id, 0), OP_REF, (REF_POS, CS.route[-1]))
 
         self._tag_and_map(ast_ref, comment.line_s, comment.line_e, comment.char_s, comment.char_e, comment.raw_code, ast_name=comment.title or "comment", ast_type=ASTT.Kconfig_Comment)
@@ -501,16 +537,21 @@ class KconfigManager:
     def _extract_source(self, src: KconfigSource, parent_tree_id: int | Any, parent_dep_exprs: list[KconfigExpr]) -> None:
         CS = self.CS
         ast_type = ASTT.Kconfig_Rsource if src.is_rsource else ASTT.Kconfig_Source
-        with CS(REF_POS):
-            CS.store(m_ast.set(None, src.path, ast_type.value))
-            ast_ref = ((m_ast.table_id, 0), OP_REF, (REF_POS, CS.route[-1]))
 
-        self._tag_and_map(ast_ref, src.line_s, src.line_e, src.char_s, src.char_e, src.raw_code)
-
-        # Register included file path in m_ast_include
+        # Register included file path in m_file_name
         with CS(REF_POS):
             CS.store(m_file_name.set(None, src.path))
             fnid_ref = ((m_file_name.table_id, 0), OP_REF, (REF_POS, CS.route[-1]))
 
         with CS(REF_POS):
-            CS.store(m_ast_include.set(ast_ref, fnid_ref))
+            CS.store(m_ast.view(
+                ((m_ast.ast_id, m_ast_include.ast_id, 1),),
+                None,
+                src.path,
+                ast_type.value,
+                None,
+                fnid_ref,
+            ))
+            ast_ref = ((m_ast.table_id, 0), OP_REF, (REF_POS, CS.route[-1]))
+
+        self._tag_and_map(ast_ref, src.line_s, src.line_e, src.char_s, src.char_e, src.raw_code)

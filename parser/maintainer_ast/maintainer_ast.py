@@ -52,8 +52,7 @@ def _init_tables() -> None:
     m_credits_entry = db_layout.m_credits_entry
 
 
-from parser.c_ast.c_ast_type import Line
-from parser.c_ast.c_ast import get_prior_tags, close_prior_tags
+from parser.c_ast import Line, get_prior_tags, close_prior_tags
 from parser.maintainer_ast.maintainer_types import (
     MaintainerRole,
     PatternType,
@@ -177,7 +176,8 @@ class MaintainerManager:
 
             # 1. AST Node for Subsystem Section
             with CS(REF_POS):
-                CS.store(m_ast.set(
+                CS.store(m_ast.view(
+                    ((m_ast.ast_id,),),
                     None,
                     section.name,
                     ASTT.Maintainer_Section.value,
@@ -296,7 +296,7 @@ class MaintainerManager:
                             ))
                         return tag_id
 
-        from parser.c_ast.c_ast import match_prior_tag_transition
+        from parser.c_ast import match_prior_tag_transition
         s_tag_id = match_prior_tag_transition(CS, extent, ast_name, ast_type)
 
         with CS(REF_POS):
@@ -414,7 +414,8 @@ class CreditsManager:
 
             # 1. AST Node for Contributor Entry
             with CS(REF_POS):
-                CS.store(m_ast.set(
+                CS.store(m_ast.view(
+                    ((m_ast.ast_id,),),
                     None,
                     entry.name,
                     ASTT.Credits_Entry.value,
@@ -513,7 +514,7 @@ class CreditsManager:
                             ))
                         return tag_id
 
-        from parser.c_ast.c_ast import match_prior_tag_transition
+        from parser.c_ast import match_prior_tag_transition
         s_tag_id = match_prior_tag_transition(CS, extent, ast_name, ast_type)
 
         with CS(REF_POS):

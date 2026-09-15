@@ -29,12 +29,16 @@ change lists, and cross-process IPC communication during multicore parsing.
     all worker dictionaries into `gp.ChangeSet_Dict`, then safely terminates the manager.
 ===============================================================================
 """
+import logging
 import multiprocessing
 import pickle
 import zlib
 from collections import OrderedDict
 from typing import Any
+from core.globalstuff import G
 from core.TableHandling import ChangeSet
+
+logger = logging.getLogger("core.GreatProcessor")
 
 
 class CompressedChangeSetDict(dict):
@@ -49,30 +53,79 @@ class CompressedChangeSetDict(dict):
         self._compressed_store: dict[str, bytes | None] = {}
         self._lru_cache: OrderedDict[str, Any] = OrderedDict()
         self._lru_size = lru_cache_size
+        self._dirty_keys: set[str] = set()
         if args or kwargs:
             self.update(*args, **kwargs)
+
+    def __reduce__(self) -> tuple[Any, ...]:
+        return (CompressedChangeSetDict, (getattr(self, "_lru_size", 500),), {
+            "_compressed_store": getattr(self, "_compressed_store", {}),
+            "_lru_cache": getattr(self, "_lru_cache", OrderedDict()),
+            "_lru_size": getattr(self, "_lru_size", 500),
+            "_dirty_keys": getattr(self, "_dirty_keys", set()),
+        })
 
     def _evict_lru(self) -> None:
         """Evict oldest entries from LRU cache and re-compress to persist any in-place mutations."""
         while len(self._lru_cache) > self._lru_size:
             k, v = self._lru_cache.popitem(last=False)
             if v is not None and k in self._compressed_store:
+                orig_gp = getattr(v, "gp", None)
+                orig_mf = getattr(v, "mf", None)
+                orig_batch = getattr(v, "batch_cs_dict", None)
                 try:
+                    if orig_gp is not None:
+                        v.gp = None
+                    if orig_mf is not None:
+                        v.mf = None
+                    if orig_batch is not None:
+                        v.batch_cs_dict = None
                     raw_bytes = pickle.dumps(v, protocol=pickle.HIGHEST_PROTOCOL)
                     self._compressed_store[k] = zlib.compress(raw_bytes, level=1)
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.warning(f"[CompressedChangeSetDict] Failed to evict/recompress '{k}': {e}")
+                finally:
+                    if orig_gp is not None:
+                        v.gp = orig_gp
+                    if orig_mf is not None:
+                        v.mf = orig_mf
+                    if orig_batch is not None:
+                        v.batch_cs_dict = orig_batch
 
     def __setitem__(self, key: str, value: Any) -> None:
+        self._dirty_keys.discard(key)
         if value is None:
             self._compressed_store[key] = None
             self._lru_cache.pop(key, None)
             return
 
-        # Compress into a single flat byte buffer
-        raw_bytes = pickle.dumps(value, protocol=pickle.HIGHEST_PROTOCOL)
-        self._compressed_store[key] = zlib.compress(raw_bytes, level=1)
-        self._lru_cache.pop(key, None)
+        orig_gp = getattr(value, "gp", None)
+        orig_mf = getattr(value, "mf", None)
+        orig_batch = getattr(value, "batch_cs_dict", None)
+        try:
+            if orig_gp is not None:
+                value.gp = None
+            if orig_mf is not None:
+                value.mf = None
+            if orig_batch is not None:
+                value.batch_cs_dict = None
+
+            raw_bytes = pickle.dumps(value, protocol=pickle.HIGHEST_PROTOCOL)
+            self._compressed_store[key] = zlib.compress(raw_bytes, level=1)
+            self._lru_cache.pop(key, None)
+        except Exception as e:
+            logger.warning(f"[CompressedChangeSetDict] Failed to compress '{key}': {e}")
+            self._compressed_store[key] = None
+            self._lru_cache[key] = value
+            self._lru_cache.move_to_end(key)
+            self._evict_lru()
+        finally:
+            if orig_gp is not None:
+                value.gp = orig_gp
+            if orig_mf is not None:
+                value.mf = orig_mf
+            if orig_batch is not None:
+                value.batch_cs_dict = orig_batch
 
     def __getitem__(self, key: str) -> Any:
         if key in self._lru_cache:
@@ -86,7 +139,7 @@ class CompressedChangeSetDict(dict):
         if compressed is None:
             return None
 
-        # Decompress on-demand
+        # Decompress on-demand (clean, not dirty)
         obj = pickle.loads(zlib.decompress(compressed))  # noqa: S301
         self._lru_cache[key] = obj
         self._lru_cache.move_to_end(key)
@@ -94,17 +147,23 @@ class CompressedChangeSetDict(dict):
         return obj
 
     def __delitem__(self, key: str) -> None:
-        del self._compressed_store[key]
+        self._compressed_store.pop(key, None)
         self._lru_cache.pop(key, None)
+        self._dirty_keys.discard(key)
 
     def __contains__(self, key: object) -> bool:
-        return key in self._compressed_store
+        return key in self._compressed_store or key in self._lru_cache
 
     def __len__(self) -> int:
         return len(self._compressed_store)
 
     def __iter__(self):
         return iter(self._compressed_store)
+
+    def clear(self) -> None:
+        self._compressed_store.clear()
+        self._lru_cache.clear()
+        self._dirty_keys.clear()
 
     def get(self, key: str, default: Any = None) -> Any:
         if key in self._lru_cache:
@@ -179,12 +238,24 @@ class GreatProcessor:
         self.Symlink_List = []
         self.ChangeSet_Dict = CompressedChangeSetDict(lru_cache_size=500)
         self.Alt_ChangeSet_Dict = CompressedChangeSetDict(lru_cache_size=500)
+        self.unchanged_symbol_cache: dict[str, dict[tuple[str, int], int]] = {}
+        self._changed_paths_set: set[str] = set()
+        self._ast_staged_symbols: dict[tuple[str, int], int] = {}
+        self._ast_staged_names: dict[str, int] = {}
+        self.file_deps: dict[str, set[str]] = {}
+        self.file_symbols: dict[str, dict[tuple[str, int], int]] = {}
+        self.file_names: dict[str, dict[str, int]] = {}
         self.Manager = None
         self.Shared_ChangeSet_Dict_List = None
 
     def init_cs_dict(self) -> None:
         """Initialize or reset ChangeSet_Dict according to active G.MEMORY_MODE."""
         from core.globalstuff import G
+        self._ast_staged_symbols = {}
+        self._ast_staged_names = {}
+        self.file_deps = {}
+        self.file_symbols = {}
+        self.file_names = {}
         if G.VERY_LOW_MEMORY_MODE:
             self.ChangeSet_Dict = CompressedChangeSetDict(lru_cache_size=25)
             self.Alt_ChangeSet_Dict = CompressedChangeSetDict(lru_cache_size=25)
@@ -202,13 +273,28 @@ class GreatProcessor:
 
     # this is not optimized as reset_cs destroys our progress... might be too much to ask to keep 2 CS_list
     def safe_get_cs(self, path: str):
+        if not path or path.startswith(("/usr/", "usr/", "/etc/", "etc/", "/lib/", "lib/", "/opt/", "opt/")):
+            return None
         CS = self.ChangeSet_Dict.get(path)
         if CS is None:
             CS = self.Alt_ChangeSet_Dict.get(path)
             if CS is None:
+                mf = getattr(self, "mf", None) or getattr(G, "MF", None)
+                v_name = getattr(self, "Version_Name", "v3.0")
+                if mf and hasattr(mf, "version_dict") and v_name in mf.version_dict:
+                    import os
+                    mfdir = mf.version_dict[v_name]
+                    target_file = os.path.join(mfdir, path)
+                    if not os.path.exists(target_file):
+                        return None
                 CS = ChangeSet("M", path)
+                CS.gp = self
+                CS.mf = mf
+                try:
+                    CS.parse()
+                except Exception:
+                    pass
                 self.Alt_ChangeSet_Dict[path] = CS
-                CS.parse()
         return CS
 
     def start_manager(self) -> None:
@@ -224,9 +310,67 @@ class GreatProcessor:
         self.Shared_ChangeSet_Dict_List = []
         return
 
+    def get_file_symbols_from_db(self, rel_file: str) -> dict[tuple[str, int], int] | None:
+        """Query DB for symbol mappings (name, type_id) -> ast_id for a file not in active ChangeSet_Dict."""
+        if not rel_file:
+            return None
+        if hasattr(self, "unchanged_symbol_cache") and rel_file in self.unchanged_symbol_cache:
+            return self.unchanged_symbol_cache[rel_file]
+
+        from core.DBLayout import m_file_name, m_bridge_file, m_bridge_tag, m_tag, m_ast
+        te = getattr(G, "TE", None)
+        if te is None or not getattr(te, "tables", None):
+            return None
+        if m_file_name.table_id not in te.tables or m_bridge_file.table_id not in te.tables:
+            return None
+        if m_bridge_tag.table_id not in te.tables or m_tag.table_id not in te.tables:
+            return None
+
+        fn_row = m_file_name.get(None, rel_file)
+        if not fn_row or len(fn_row) < 3 or not fn_row[2]:
+            return None
+        fnid = fn_row[2][0]
+
+        vid = getattr(self, "VID", 0)
+        old_vid = getattr(self, "Old_VID", 0)
+        bf_row = m_bridge_file.get(vid, fnid, None)
+        if (bf_row is None or len(bf_row) < 3 or not bf_row[2]) and old_vid > 0:
+            bf_row = m_bridge_file.get(old_vid, fnid, None)
+        if not bf_row or len(bf_row) < 3 or not bf_row[2]:
+            return None
+        fid = bf_row[2][2]
+
+        joins = (
+            (m_bridge_tag.tag_id, m_tag.tag_id, 1),
+            (m_tag.ast_id, m_ast.ast_id, 1),
+        )
+        cols = (fid,) + (None,) * 15
+        rows = m_bridge_tag.view_get_multiple(joins, *cols)
+        if not rows:
+            if not hasattr(self, "unchanged_symbol_cache"):
+                self.unchanged_symbol_cache = {}
+            self.unchanged_symbol_cache[rel_file] = {}
+            return self.unchanged_symbol_cache[rel_file]
+
+        sym_map: dict[tuple[str, int], int] = {}
+        for row in rows:
+            if len(row) >= 16:
+                ast_id = row[10]
+                ast_name = row[14]
+                ast_type = row[15]
+                if ast_name and ast_id:
+                    sym_map[(ast_name, ast_type)] = ast_id
+
+        if not hasattr(self, "unchanged_symbol_cache"):
+            self.unchanged_symbol_cache = {}
+        self.unchanged_symbol_cache[rel_file] = sym_map
+        return sym_map
+
     def reset_cs(self) -> None:
         """Reset Change_List and ChangeSet_Dict upon completion of a version parsing pass."""
         self.Alt_ChangeSet_Dict.clear()
+        if hasattr(self, "unchanged_symbol_cache"):
+            self.unchanged_symbol_cache.clear()
         self.Change_List = None
         if hasattr(self, "Symlink_List") and self.Symlink_List:
             self.Symlink_List.clear()

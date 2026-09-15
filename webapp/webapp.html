@@ -424,11 +424,15 @@
     .token {
       border-radius: 2px;
       padding: 1px 2px;
-      cursor: pointer;
+      cursor: default;
       transition: background 0.1s ease;
     }
-    .token:hover {
-      outline: 1px solid #fff;
+    .token.token-clickable {
+      cursor: pointer;
+    }
+    .token.token-clickable:hover {
+      outline: 1px solid rgba(97, 175, 239, 0.7);
+      background: rgba(255, 255, 255, 0.08);
     }
     .token-keyword { color: var(--hl-keyword); font-weight: bold; }
     .token-comment { color: var(--hl-comment); font-style: italic; }
@@ -505,6 +509,27 @@
       gap: 6px;
     }
     .tree-node-title:hover { color: var(--accent); }
+    .tree-node-matched {
+      background: rgba(97, 175, 239, 0.12) !important;
+      border: 1.5px solid var(--accent) !important;
+      border-radius: 6px;
+      padding: 6px 10px !important;
+      margin: 6px 0 !important;
+      box-shadow: 0 0 12px rgba(97, 175, 239, 0.25);
+      animation: pulse-matched 2s ease-in-out infinite alternate;
+    }
+    @keyframes pulse-matched {
+      from { box-shadow: 0 0 6px rgba(97, 175, 239, 0.2); }
+      to { box-shadow: 0 0 16px rgba(97, 175, 239, 0.45); }
+    }
+    .matched-container-banner {
+      background: var(--bg-card);
+      border: 1px solid var(--border-color);
+      border-left: 3px solid var(--accent);
+      border-radius: 6px;
+      padding: 10px 14px;
+      margin-bottom: 12px;
+    }
 
     /* Color Palette Grid */
     .color-grid {
@@ -1177,14 +1202,16 @@
     .tag-chip {
       display: inline-flex;
       align-items: center;
-      gap: 3px;
-      padding: 1px 6px;
-      font-size: 10px;
+      gap: 2px;
+      padding: 0 4px;
+      font-size: 9px;
+      line-height: 14px;
+      height: 15px;
       font-family: var(--font-mono, monospace);
-      background: rgba(97, 175, 239, 0.12);
-      border: 1px solid rgba(97, 175, 239, 0.3);
+      background: rgba(97, 175, 239, 0.1);
+      border: 1px solid rgba(97, 175, 239, 0.25);
       color: #61afef;
-      border-radius: 4px;
+      border-radius: 3px;
       cursor: pointer;
       margin-left: 6px;
       user-select: none;
@@ -1194,7 +1221,7 @@
     .tag-chip:hover {
       background: rgba(97, 175, 239, 0.25);
       border-color: #61afef;
-      box-shadow: 0 0 8px rgba(97, 175, 239, 0.4);
+      box-shadow: 0 0 6px rgba(97, 175, 239, 0.35);
       transform: translateY(-1px);
     }
     .tag-timeline-scrubber-box {
@@ -2385,21 +2412,38 @@
 
   <!-- Highlight Settings Modal -->
   <div id="highlightModal" class="modal-overlay">
-    <div class="modal">
+    <div class="modal" style="max-width: 980px; width: 92%;">
       <div class="modal-header">
-        <h3>Highlight Color Palette & Visibility Manager</h3>
+        <div style="display: flex; align-items: center; gap: 10px;">
+          <h3 style="margin: 0;">🎨 Syntax Highlight Palette &amp; Visibility</h3>
+          <span class="badge badge-accent" id="hlActiveCategoryCount">Categories</span>
+        </div>
         <button class="btn" onclick="closeHighlightModal()">✕</button>
       </div>
-      <div class="modal-body">
-        <p style="font-size: 12px; color: var(--text-muted); margin-bottom: 14px;">
-          Customize colors and toggle visibility for AST syntax elements mapped via <code>m_map_ast</code>. Preferences persist across browser sessions.
+      <div class="modal-body" style="display: flex; flex-direction: column; gap: 14px; max-height: 70vh; overflow-y: auto;">
+        <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px; background: var(--bg-sidebar); padding: 10px 14px; border-radius: 6px; border: 1px solid var(--border-color);">
+          <div style="display: flex; gap: 6px; flex-wrap: wrap;" id="hlLanguageTabs">
+            <button class="btn btn-sm btn-active" onclick="setHighlightLanguageTab('all', this)">All Languages</button>
+            <button class="btn btn-sm" onclick="setHighlightLanguageTab('c', this)">C / C++</button>
+            <button class="btn btn-sm" onclick="setHighlightLanguageTab('cppro', this)">Preprocessor (CPPro)</button>
+            <button class="btn btn-sm" onclick="setHighlightLanguageTab('asm', this)">Assembly (ASM)</button>
+            <button class="btn btn-sm" onclick="setHighlightLanguageTab('kconfig', this)">Kconfig &amp; Metadata</button>
+          </div>
+          <div style="display: flex; align-items: center; gap: 8px;">
+            <input type="text" id="highlightSearchInput" class="kconfig-input" placeholder="🔍 Search syntax categories..." oninput="filterHighlightCategories()" style="width: 220px; padding: 4px 10px; font-size: 12px;">
+          </div>
+        </div>
+
+        <p style="font-size: 12px; color: var(--text-muted); margin: 0;">
+          Customize colors and visibility for AST syntax elements across languages. Changes apply in real-time and persist across browser sessions.
         </p>
-        <div id="colorPickerGrid" class="color-grid">
-          <!-- Dynamic Color Cards -->
+
+        <div id="colorPickerGrid" style="display: flex; flex-direction: column; gap: 16px;">
+          <!-- Dynamically Rendered Grouped Sections and Color Cards -->
         </div>
       </div>
-      <div class="modal-footer">
-        <button class="btn" onclick="resetHighlightDefaults()">Reset to Defaults</button>
+      <div class="modal-footer" style="display: flex; justify-content: space-between;">
+        <button class="btn btn-danger" onclick="resetHighlightDefaults()">Reset to Defaults</button>
         <button class="btn btn-accent" onclick="closeHighlightModal()">Done</button>
       </div>
     </div>
@@ -2915,40 +2959,177 @@
     let currentInspectorDepth = 3;
     let selectedLineStart = null;
 
-    // Highlight Categories & Default Palette
+    // Comprehensive One Dark Pro AST Syntax Palette & Construct Mapping
     const defaultHighlightSettings = {
-      "C_Keyword": { color: "#c678dd", enabled: true, label: "Keywords (if, static, return)" },
-      "C_Comment": { color: "#5c6370", enabled: true, label: "Comments (/* ... */, //)" },
-      "C_struct": { color: "#e5c07b", enabled: true, label: "Structs (struct)" },
-      "C_structdecl": { color: "#e5c07b", enabled: true, label: "Struct Declarations" },
-      "C_enum": { color: "#e5c07b", enabled: true, label: "Enums (enum)" },
-      "C_union": { color: "#e5c07b", enabled: true, label: "Unions (union)" },
-      "C_functionproto": { color: "#61afef", enabled: true, label: "Function Prototypes" },
-      "C_pointer": { color: "#56b6c2", enabled: true, label: "Pointers (*)" },
-      "C_Compound": { color: "#61afef", enabled: true, label: "Compound Statement Blocks" },
-      "CPPro_define": { color: "#d19a66", enabled: true, label: "Macros (#define)" },
-      "CPPro_include": { color: "#98c379", enabled: true, label: "Includes (#include)" },
-      "CPPro_if": { color: "#d19a66", enabled: true, label: "Conditionals (#if, #ifdef, #ifndef)" },
-      "CPPro_ifdef": { color: "#d19a66", enabled: true, label: "Conditionals (#ifdef)" },
-      "CPPro_ifndef": { color: "#d19a66", enabled: true, label: "Conditionals (#ifndef)" },
-      "CPPro_elif": { color: "#d19a66", enabled: true, label: "Conditionals (#elif)" },
-      "CPPro_else": { color: "#d19a66", enabled: true, label: "Conditionals (#else)" },
-      "CPPro_endif": { color: "#d19a66", enabled: true, label: "Conditionals (#endif)" },
-      "Undefined": { color: "#abb2bf", enabled: true, label: "Other AST Elements" }
-    };
-    // Container Hierarchy Depth Color Palette (Applied strictly to container items)
-    const defaultContainerDepthPalette = [
-      { depth: 0, color: "#e5c07b", label: "Container Level 0 (Color A - Outer Structs/Compounds)" },
-      { depth: 1, color: "#61afef", label: "Container Level 1 (Color B - Members & Function Prototypes)" },
-      { depth: 2, color: "#98c379", label: "Container Level 2 (Color C - Parameters & Return Types)" },
-      { depth: 3, color: "#c678dd", label: "Container Level 3 (Color D - Inner Qualifiers & Types)" },
-      { depth: 4, color: "#56b6c2", label: "Container Level 4 (Color E - Deep Nested Types)" },
-      { depth: 5, color: "#e06c75", label: "Container Level 5 (Color F - Level 5+ Containers)" }
-    ];
-    let containerDepthPalette = JSON.parse(localStorage.getItem("kernelinfo_container_palette")) || defaultContainerDepthPalette;
-    let containerColoringEnabled = true;
+      // C - Keywords & Control Flow (#c678dd / #d19a66 / #e06c75)
+      "C_Keyword": { color: "#c678dd", enabled: true, label: "Keywords (if, switch, return, while...)", lang: "c", group: "Keywords & Control Flow" },
+      "C_IfStmt": { color: "#c678dd", enabled: true, label: "If Statements", lang: "c", group: "Keywords & Control Flow" },
+      "C_SwitchStmt": { color: "#c678dd", enabled: true, label: "Switch Statements", lang: "c", group: "Keywords & Control Flow" },
+      "C_CaseStmt": { color: "#c678dd", enabled: true, label: "Case Statements", lang: "c", group: "Keywords & Control Flow" },
+      "C_DefaultStmt": { color: "#c678dd", enabled: true, label: "Default Statements", lang: "c", group: "Keywords & Control Flow" },
+      "C_WhileStmt": { color: "#c678dd", enabled: true, label: "While Loops", lang: "c", group: "Keywords & Control Flow" },
+      "C_DoStmt": { color: "#c678dd", enabled: true, label: "Do-While Loops", lang: "c", group: "Keywords & Control Flow" },
+      "C_ForStmt": { color: "#c678dd", enabled: true, label: "For Loops", lang: "c", group: "Keywords & Control Flow" },
+      "C_ReturnStmt": { color: "#c678dd", enabled: true, label: "Return Statements", lang: "c", group: "Keywords & Control Flow" },
+      "C_BreakStmt": { color: "#c678dd", enabled: true, label: "Break Statements", lang: "c", group: "Keywords & Control Flow" },
+      "C_ContinueStmt": { color: "#c678dd", enabled: true, label: "Continue Statements", lang: "c", group: "Keywords & Control Flow" },
+      "C_GotoStmt": { color: "#c678dd", enabled: true, label: "Goto Statements", lang: "c", group: "Keywords & Control Flow" },
+      "C_LabelStmt": { color: "#d19a66", enabled: true, label: "Label Statements", lang: "c", group: "Keywords & Control Flow" },
+      "C_AsmStmt": { color: "#e06c75", enabled: true, label: "Inline ASM Statements", lang: "c", group: "Keywords & Control Flow" },
 
-    let highlightSettings = JSON.parse(localStorage.getItem("kernelinfo_hl_settings")) || defaultHighlightSettings;
+      // C - Compound Types & Declarations (#e5c07b / #d19a66)
+      "C_struct": { color: "#e5c07b", enabled: true, label: "Structs (struct)", lang: "c", group: "Compound Types & Declarations" },
+      "C_structdecl": { color: "#e5c07b", enabled: true, label: "Struct Forward Declarations", lang: "c", group: "Compound Types & Declarations" },
+      "C_structnotbind": { color: "#e5c07b", enabled: true, label: "Unbound Structs", lang: "c", group: "Compound Types & Declarations" },
+      "C_union": { color: "#e5c07b", enabled: true, label: "Unions (union)", lang: "c", group: "Compound Types & Declarations" },
+      "C_uniondecl": { color: "#e5c07b", enabled: true, label: "Union Forward Declarations", lang: "c", group: "Compound Types & Declarations" },
+      "C_unionnotbind": { color: "#e5c07b", enabled: true, label: "Unbound Unions", lang: "c", group: "Compound Types & Declarations" },
+      "C_enum": { color: "#e5c07b", enabled: true, label: "Enums (enum)", lang: "c", group: "Compound Types & Declarations" },
+      "C_enumdecl": { color: "#e5c07b", enabled: true, label: "Enum Forward Declarations", lang: "c", group: "Compound Types & Declarations" },
+      "C_enumnotbind": { color: "#e5c07b", enabled: true, label: "Unbound Enums", lang: "c", group: "Compound Types & Declarations" },
+      "C_enumequal": { color: "#d19a66", enabled: true, label: "Enum Initializers", lang: "c", group: "Compound Types & Declarations" },
+
+      // C - Primitive Types (#56b6c2)
+      "C_void": { color: "#56b6c2", enabled: true, label: "void", lang: "c", group: "Primitive Types" },
+      "C_char": { color: "#56b6c2", enabled: true, label: "char", lang: "c", group: "Primitive Types" },
+      "C_short": { color: "#56b6c2", enabled: true, label: "short", lang: "c", group: "Primitive Types" },
+      "C_int": { color: "#56b6c2", enabled: true, label: "int", lang: "c", group: "Primitive Types" },
+      "C_long": { color: "#56b6c2", enabled: true, label: "long", lang: "c", group: "Primitive Types" },
+      "C_signed": { color: "#56b6c2", enabled: true, label: "signed", lang: "c", group: "Primitive Types" },
+      "C_unsigned": { color: "#56b6c2", enabled: true, label: "unsigned", lang: "c", group: "Primitive Types" },
+      "C_bool": { color: "#56b6c2", enabled: true, label: "bool / _Bool", lang: "c", group: "Primitive Types" },
+      "C_float": { color: "#56b6c2", enabled: true, label: "float", lang: "c", group: "Primitive Types" },
+      "C_double": { color: "#56b6c2", enabled: true, label: "double", lang: "c", group: "Primitive Types" },
+
+      // C - Storage Classes, Function & Alignment Specifiers (#c678dd)
+      "C_SCstatic": { color: "#c678dd", enabled: true, label: "static", lang: "c", group: "Storage Classes & Specifiers" },
+      "C_SCextern": { color: "#c678dd", enabled: true, label: "extern", lang: "c", group: "Storage Classes & Specifiers" },
+      "C_SCtypedef": { color: "#c678dd", enabled: true, label: "typedef", lang: "c", group: "Storage Classes & Specifiers" },
+      "C_SCauto": { color: "#c678dd", enabled: true, label: "auto", lang: "c", group: "Storage Classes & Specifiers" },
+      "C_SCregister": { color: "#c678dd", enabled: true, label: "register", lang: "c", group: "Storage Classes & Specifiers" },
+      "C_SC_Thread_local": { color: "#c678dd", enabled: true, label: "_Thread_local", lang: "c", group: "Storage Classes & Specifiers" },
+      "C_SCthread_local": { color: "#c678dd", enabled: true, label: "thread_local", lang: "c", group: "Storage Classes & Specifiers" },
+      "C_SCconstexpr": { color: "#c678dd", enabled: true, label: "constexpr", lang: "c", group: "Storage Classes & Specifiers" },
+      "C_FSinline": { color: "#c678dd", enabled: true, label: "inline", lang: "c", group: "Storage Classes & Specifiers" },
+      "C_FS_Noreturn": { color: "#c678dd", enabled: true, label: "_Noreturn", lang: "c", group: "Storage Classes & Specifiers" },
+      "C_AS__Alignas": { color: "#c678dd", enabled: true, label: "_Alignas", lang: "c", group: "Storage Classes & Specifiers" },
+      "C_AS_alignas": { color: "#c678dd", enabled: true, label: "alignas", lang: "c", group: "Storage Classes & Specifiers" },
+
+      // C - Qualifiers (#e5c07b)
+      "C_Qconst": { color: "#e5c07b", enabled: true, label: "const", lang: "c", group: "Type Qualifiers" },
+      "C_Qvolatile": { color: "#e5c07b", enabled: true, label: "volatile", lang: "c", group: "Type Qualifiers" },
+      "C_Qrestrict": { color: "#e5c07b", enabled: true, label: "restrict", lang: "c", group: "Type Qualifiers" },
+      "C_Q_Atomic": { color: "#e5c07b", enabled: true, label: "_Atomic", lang: "c", group: "Type Qualifiers" },
+
+      // C - Functions & Prototypes (#61afef)
+      "C_functionproto": { color: "#61afef", enabled: true, label: "Function Definitions & Prototypes", lang: "c", group: "Functions & Calls" },
+      "C_functionprotodecl": { color: "#61afef", enabled: true, label: "Function Forward Declarations", lang: "c", group: "Functions & Calls" },
+      "C_functionprotnotbind": { color: "#61afef", enabled: true, label: "Unbound Function Prototypes", lang: "c", group: "Functions & Calls" },
+      "C_CallExpr": { color: "#61afef", enabled: true, label: "Function Calls", lang: "c", group: "Functions & Calls" },
+
+      // C - Pointers, Arrays & Expressions (#56b6c2 / #abb2bf / #e06c75)
+      "C_pointer": { color: "#56b6c2", enabled: true, label: "Pointers (*)", lang: "c", group: "Pointers & Expressions" },
+      "C_array": { color: "#e5c07b", enabled: true, label: "Arrays ([N])", lang: "c", group: "Pointers & Expressions" },
+      "C_arrayempty": { color: "#e5c07b", enabled: true, label: "Unbounded Arrays ([])", lang: "c", group: "Pointers & Expressions" },
+      "C_Compound": { color: "#abb2bf", enabled: true, label: "Compound Statement Blocks", lang: "c", group: "Pointers & Expressions" },
+      "C_CompoundStmt": { color: "#abb2bf", enabled: true, label: "Compound Statements ({ ... })", lang: "c", group: "Pointers & Expressions" },
+      "C_BinaryOperator": { color: "#56b6c2", enabled: true, label: "Binary Operators (+, -, *, ==...)", lang: "c", group: "Pointers & Expressions" },
+      "C_UnaryOperator": { color: "#56b6c2", enabled: true, label: "Unary Operators (&, !, ~, ++...)", lang: "c", group: "Pointers & Expressions" },
+      "C_MemberRefExpr": { color: "#e06c75", enabled: true, label: "Member References (. ->)", lang: "c", group: "Pointers & Expressions" },
+      "C_DeclRefExpr": { color: "#abb2bf", enabled: true, label: "Variable References", lang: "c", group: "Pointers & Expressions" },
+      "C_ParenExpr": { color: "#abb2bf", enabled: true, label: "Parenthesized Expressions", lang: "c", group: "Pointers & Expressions" },
+      "C_InitListExpr": { color: "#e5c07b", enabled: true, label: "Initializer Lists ({ ... })", lang: "c", group: "Pointers & Expressions" },
+
+      // Comments (#5c6370)
+      "C_Comment": { color: "#5c6370", enabled: true, label: "Comments (/* ... */, //)", lang: "c", group: "Comments" },
+
+      // C - Literals & Constants (#98c379 / #d19a66)
+      "C_Literal_String": { color: "#98c379", enabled: true, label: "Strings & Characters (\"...\", '...')", lang: "c", group: "Literals & Constants" },
+      "C_Literal_Number": { color: "#d19a66", enabled: true, label: "Numeric & Hex Constants (0x..., 123)", lang: "c", group: "Literals & Constants" },
+
+      // Preprocessor (CPPro) (#d19a66 / #98c379 / #e06c75)
+      "CPPro_define": { color: "#d19a66", enabled: true, label: "#define Constants", lang: "cppro", group: "Macros & Defines" },
+      "CPPro_define_macro": { color: "#d19a66", enabled: true, label: "#define Function Macros", lang: "cppro", group: "Macros & Defines" },
+      "CPPro_undef": { color: "#d19a66", enabled: true, label: "#undef Directives", lang: "cppro", group: "Macros & Defines" },
+      "CPPro_include": { color: "#98c379", enabled: true, label: "#include Headers", lang: "cppro", group: "Includes & File Management" },
+      "CPPro_if": { color: "#d19a66", enabled: true, label: "#if Conditionals", lang: "cppro", group: "Conditional Scopes" },
+      "CPPro_ifdef": { color: "#d19a66", enabled: true, label: "#ifdef Conditionals", lang: "cppro", group: "Conditional Scopes" },
+      "CPPro_ifndef": { color: "#d19a66", enabled: true, label: "#ifndef Conditionals", lang: "cppro", group: "Conditional Scopes" },
+      "CPPro_elif": { color: "#d19a66", enabled: true, label: "#elif Conditionals", lang: "cppro", group: "Conditional Scopes" },
+      "CPPro_elifdef": { color: "#d19a66", enabled: true, label: "#elifdef Conditionals", lang: "cppro", group: "Conditional Scopes" },
+      "CPPro_elifndef": { color: "#d19a66", enabled: true, label: "#elifndef Conditionals", lang: "cppro", group: "Conditional Scopes" },
+      "CPPro_else": { color: "#d19a66", enabled: true, label: "#else Conditionals", lang: "cppro", group: "Conditional Scopes" },
+      "CPPro_endif": { color: "#d19a66", enabled: true, label: "#endif Conditionals", lang: "cppro", group: "Conditional Scopes" },
+      "CPPro_line": { color: "#d19a66", enabled: true, label: "#line Directives", lang: "cppro", group: "Diagnostics & Pragmas" },
+      "CPPro_error": { color: "#e06c75", enabled: true, label: "#error Directives", lang: "cppro", group: "Diagnostics & Pragmas" },
+      "CPPro_warning": { color: "#e5c07b", enabled: true, label: "#warning Directives", lang: "cppro", group: "Diagnostics & Pragmas" },
+      "CPPro_pragma": { color: "#d19a66", enabled: true, label: "#pragma Directives", lang: "cppro", group: "Diagnostics & Pragmas" },
+
+      // Assembly (ASM) (#d19a66 / #61afef / #e5c07b / #5c6370)
+      "ASM_Macro": { color: "#d19a66", enabled: true, label: "Assembly Macros (.macro)", lang: "asm", group: "Assembly Directives & Macros" },
+      "ASM_Directive": { color: "#d19a66", enabled: true, label: "Assembly Directives (.section, .globl)", lang: "asm", group: "Assembly Directives & Macros" },
+      "ASM_Instruction": { color: "#61afef", enabled: true, label: "Assembly Instructions (mov, jmp, nop)", lang: "asm", group: "Assembly Instructions & Labels" },
+      "ASM_Label": { color: "#e5c07b", enabled: true, label: "Assembly Labels (entry:, 1:)", lang: "asm", group: "Assembly Instructions & Labels" },
+      "ASM_Comment": { color: "#5c6370", enabled: true, label: "Assembly Comments (# ..., /* ... */)", lang: "asm", group: "Assembly Instructions & Labels" },
+
+      // Kconfig Grammar Constructs (#61afef / #e5c07b / #98c379 / #c678dd)
+      "Kconfig_Mainmenu": { color: "#61afef", enabled: true, label: "mainmenu", lang: "kconfig", group: "Menu & Structure" },
+      "Kconfig_Menu": { color: "#61afef", enabled: true, label: "menu ... endmenu", lang: "kconfig", group: "Menu & Structure" },
+      "Kconfig_Endmenu": { color: "#61afef", enabled: true, label: "endmenu", lang: "kconfig", group: "Menu & Structure" },
+      "Kconfig_Choice": { color: "#61afef", enabled: true, label: "choice ... endchoice", lang: "kconfig", group: "Menu & Structure" },
+      "Kconfig_Endchoice": { color: "#61afef", enabled: true, label: "endchoice", lang: "kconfig", group: "Menu & Structure" },
+      "Kconfig_If": { color: "#c678dd", enabled: true, label: "if ... endif", lang: "kconfig", group: "Menu & Structure" },
+      "Kconfig_Endif": { color: "#c678dd", enabled: true, label: "endif", lang: "kconfig", group: "Menu & Structure" },
+      "Kconfig_Source": { color: "#98c379", enabled: true, label: "source", lang: "kconfig", group: "Menu & Structure" },
+      "Kconfig_Rsource": { color: "#98c379", enabled: true, label: "rsource", lang: "kconfig", group: "Menu & Structure" },
+      "Kconfig_Comment": { color: "#5c6370", enabled: true, label: "Comments", lang: "kconfig", group: "Menu & Structure" },
+      "Kconfig_Config": { color: "#e5c07b", enabled: true, label: "config Symbols", lang: "kconfig", group: "Symbols & Properties" },
+      "Kconfig_Menuconfig": { color: "#e5c07b", enabled: true, label: "menuconfig Symbols", lang: "kconfig", group: "Symbols & Properties" },
+      "Kconfig_Prompt": { color: "#abb2bf", enabled: true, label: "Prompt Strings", lang: "kconfig", group: "Symbols & Properties" },
+      "Kconfig_Default": { color: "#d19a66", enabled: true, label: "default Values", lang: "kconfig", group: "Symbols & Properties" },
+      "Kconfig_Help": { color: "#5c6370", enabled: true, label: "help Text Blocks", lang: "kconfig", group: "Symbols & Properties" },
+      "Kconfig_Depends_On": { color: "#c678dd", enabled: true, label: "depends on Rules", lang: "kconfig", group: "Dependencies & Logic" },
+      "Kconfig_Select": { color: "#56b6c2", enabled: true, label: "select Rules", lang: "kconfig", group: "Dependencies & Logic" },
+      "Kconfig_Imply": { color: "#56b6c2", enabled: true, label: "imply Rules", lang: "kconfig", group: "Dependencies & Logic" },
+      "Kconfig_Range": { color: "#d19a66", enabled: true, label: "range Bounds", lang: "kconfig", group: "Dependencies & Logic" },
+      "Kconfig_Op_And": { color: "#56b6c2", enabled: true, label: "&& Logical AND", lang: "kconfig", group: "Dependencies & Logic" },
+      "Kconfig_Op_Or": { color: "#56b6c2", enabled: true, label: "|| Logical OR", lang: "kconfig", group: "Dependencies & Logic" },
+      "Kconfig_Op_Not": { color: "#56b6c2", enabled: true, label: "! Logical NOT", lang: "kconfig", group: "Dependencies & Logic" },
+      "Kconfig_Op_Equal": { color: "#56b6c2", enabled: true, label: "= Equality", lang: "kconfig", group: "Dependencies & Logic" },
+      "Kconfig_Op_Unequal": { color: "#56b6c2", enabled: true, label: "!= Inequality", lang: "kconfig", group: "Dependencies & Logic" },
+      "Kconfig_Symbol_Ref": { color: "#e5c07b", enabled: true, label: "Symbol References", lang: "kconfig", group: "Dependencies & Logic" },
+      "Kconfig_Constant": { color: "#d19a66", enabled: true, label: "Constants (y, m, n)", lang: "kconfig", group: "Dependencies & Logic" },
+      "Kconfig_Type_Bool": { color: "#56b6c2", enabled: true, label: "bool Type", lang: "kconfig", group: "Kconfig Types" },
+      "Kconfig_Type_Tristate": { color: "#56b6c2", enabled: true, label: "tristate Type", lang: "kconfig", group: "Kconfig Types" },
+      "Kconfig_Type_String": { color: "#56b6c2", enabled: true, label: "string Type", lang: "kconfig", group: "Kconfig Types" },
+      "Kconfig_Type_Hex": { color: "#56b6c2", enabled: true, label: "hex Type", lang: "kconfig", group: "Kconfig Types" },
+      "Kconfig_Type_Int": { color: "#56b6c2", enabled: true, label: "int Type", lang: "kconfig", group: "Kconfig Types" },
+
+      // Maintainers & Credits Metadata
+      "Maintainer_Section": { color: "#61afef", enabled: true, label: "Maintainer Subsystems", lang: "kconfig", group: "Maintainers & Credits" },
+      "Maintainer_Member": { color: "#98c379", enabled: true, label: "Maintainers & Reviewers", lang: "kconfig", group: "Maintainers & Credits" },
+      "Maintainer_Pattern": { color: "#e5c07b", enabled: true, label: "File Match Patterns", lang: "kconfig", group: "Maintainers & Credits" },
+      "Credits_Entry": { color: "#61afef", enabled: true, label: "CREDITS Entries", lang: "kconfig", group: "Maintainers & Credits" },
+
+      // Rust Constructs
+      "Rust_Struct": { color: "#e5c07b", enabled: true, label: "Rust Structs", lang: "c", group: "Compound Types & Declarations" },
+      "Rust_Field": { color: "#e06c75", enabled: true, label: "Rust Struct Fields", lang: "c", group: "Compound Types & Declarations" },
+      "Rust_Enum": { color: "#e5c07b", enabled: true, label: "Rust Enums", lang: "c", group: "Compound Types & Declarations" },
+
+      // Fallback
+      "Undefined": { color: "#abb2bf", enabled: true, label: "Default / General Identifiers", lang: "c", group: "General Identifiers" }
+    };
+
+    // Load saved settings merged with comprehensive defaults
+    let savedHlSettings = {};
+    try {
+      savedHlSettings = JSON.parse(localStorage.getItem("kernelinfo_hl_settings") || "{}");
+    } catch(e) {
+      savedHlSettings = {};
+    }
+    let highlightSettings = Object.assign({}, defaultHighlightSettings, savedHlSettings);
+    let activeHighlightLang = "all";
+    let highlightSearchQuery = "";
     let cpproHighlightEnabled = false;
     let activeCpproRanges = [];
 
@@ -4274,7 +4455,8 @@
           </div>
           <div style="display: flex; gap: 8px; align-items: center; flex-wrap: wrap;">
             <button id="btnToggleBlame" class="btn ${blameViewEnabled ? 'btn-active' : ''}" onclick="toggleGitBlameView()" title="Toggle interactive Git Blame line annotations with multi-commit tags and author highlights">🏷️ Git Blame</button>
-            <button id="btnToggleContainer" class="btn ${containerColoringEnabled ? 'btn-active' : ''}" onclick="toggleContainerColoring()" title="Toggle container hierarchy depth coloring (Color A, B, C...) applied strictly to container items">🎨 Container Depth Colors</button>
+            <button id="btnToggleTags" class="btn ${tagChipsEnabled ? 'btn-active' : ''}" onclick="toggleTagChips()" title="Toggle interactive tag chips (🏷️ #ID) displayed on lines starting AST tags">🏷️ Tag Chips</button>
+            <button id="btnOpenSyntaxPalette" class="btn" onclick="openHighlightModal()" title="Open Syntax Color Palette &amp; Visibility Manager to customize syntax colors">🎨 Syntax Palette</button>
             <button id="btnToggleCppro" class="btn ${cpproHighlightEnabled ? 'btn-active' : ''}" onclick="toggleCpproHighlighting()" title="Toggle visual highlighting of code governed by CPPro conditional scopes (#if/#ifdef/#elif/#else)">⚡ Highlight Conditionals</button>
             <button class="btn" onclick="collapseAllConditionals()" title="Collapse all #if/#ifdef conditional blocks">Collapse #if</button>
             <button class="btn" onclick="expandAllConditionals()" title="Expand all #if/#ifdef conditional blocks">Expand #if</button>
@@ -4400,9 +4582,19 @@
     }
 
     let blameViewEnabled = false;
+    let tagChipsEnabled = true;
     let activeFileBlame = null;
     let activeFileTags = null;
     let activeFileData = null;
+
+    function toggleTagChips() {
+      tagChipsEnabled = !tagChipsEnabled;
+      const btn = document.getElementById("btnToggleTags");
+      if (btn) btn.classList.toggle("btn-active", tagChipsEnabled);
+      if (activeFileTags) {
+        buildHighlightedSource(activeFileTags);
+      }
+    }
 
     function getAuthorColor(nameOrEmail) {
       if (!nameOrEmail) return "#61afef";
@@ -4442,13 +4634,626 @@
       }
     }
 
-    function renderSegmentWithKconfigTokens(segment, tok, tokenColor, isContainerItem) {
+    // ------------------------------------------------------------------------
+    // C / C++ & Preprocessor Lexical Tokenizer
+    // ------------------------------------------------------------------------
+    const C_KEYWORDS_MAP = {
+      "if": "C_IfStmt", "else": "C_Keyword", "switch": "C_SwitchStmt", "case": "C_CaseStmt",
+      "default": "C_DefaultStmt", "while": "C_WhileStmt", "do": "C_DoStmt", "for": "C_ForStmt",
+      "return": "C_ReturnStmt", "break": "C_BreakStmt", "continue": "C_ContinueStmt", "goto": "C_GotoStmt",
+      "sizeof": "C_Keyword", "typeof": "C_Keyword", "__typeof__": "C_Keyword", "__typeof": "C_Keyword",
+      "alignof": "C_Keyword", "_Alignof": "C_Keyword", "_Generic": "C_Keyword", "_Static_assert": "C_Keyword"
+    };
+
+    const C_STORAGE_QUAL_MAP = {
+      "static": "C_SCstatic", "extern": "C_SCextern", "typedef": "C_SCtypedef",
+      "auto": "C_SCauto", "register": "C_SCregister", "_Thread_local": "C_SC_Thread_local",
+      "__thread": "C_SC_Thread_local", "thread_local": "C_SCthread_local", "constexpr": "C_SCconstexpr",
+      "inline": "C_FSinline", "__inline__": "C_FSinline", "__inline": "C_FSinline",
+      "__always_inline": "C_FSinline", "__noinline": "C_FSinline", "_Noreturn": "C_FS_Noreturn",
+      "_Alignas": "C_AS__Alignas", "alignas": "C_AS_alignas",
+      "const": "C_Qconst", "__const__": "C_Qconst", "__const": "C_Qconst",
+      "volatile": "C_Qvolatile", "__volatile__": "C_Qvolatile", "__volatile": "C_Qvolatile",
+      "restrict": "C_Qrestrict", "__restrict__": "C_Qrestrict", "__restrict": "C_Qrestrict",
+      "_Atomic": "C_Q_Atomic",
+      "__user": "C_Qrestrict", "__kernel": "C_Qrestrict", "__iomem": "C_Qrestrict",
+      "__percpu": "C_Qrestrict", "__rcu": "C_Qrestrict", "__must_check": "C_FSinline",
+      "__init": "C_FSinline", "__exit": "C_FSinline", "__devinit": "C_FSinline", "__devexit": "C_FSinline"
+    };
+
+    const C_STRUCT_UNION_ENUM = {
+      "struct": "C_struct", "union": "C_union", "enum": "C_enum"
+    };
+
+    const C_PRIMITIVE_TYPES = {
+      "void": "C_void", "char": "C_char", "short": "C_short", "int": "C_int", "long": "C_long",
+      "signed": "C_signed", "unsigned": "C_unsigned", "bool": "C_bool", "_Bool": "C_bool",
+      "float": "C_float", "double": "C_double",
+      "size_t": "C_int", "ssize_t": "C_int", "off_t": "C_long", "pid_t": "C_int", "uid_t": "C_int", "gid_t": "C_int",
+      "mode_t": "C_int", "time_t": "C_long", "clock_t": "C_long", "uintptr_t": "C_long", "intptr_t": "C_long",
+      "ptrdiff_t": "C_long", "dma_addr_t": "C_long", "phys_addr_t": "C_long", "sector_t": "C_long", "gfp_t": "C_int",
+      "int8_t": "C_char", "int16_t": "C_short", "int32_t": "C_int", "int64_t": "C_long",
+      "uint8_t": "C_char", "uint16_t": "C_short", "uint32_t": "C_int", "uint64_t": "C_long",
+      "u8": "C_char", "u16": "C_short", "u32": "C_int", "u64": "C_long",
+      "s8": "C_char", "s16": "C_short", "s32": "C_int", "s64": "C_long",
+      "__u8": "C_char", "__u16": "C_short", "__u32": "C_int", "__u64": "C_long",
+      "__s8": "C_char", "__s16": "C_short", "__s32": "C_int", "__s64": "C_long",
+      "__be16": "C_short", "__be32": "C_int", "__be64": "C_long",
+      "__le16": "C_short", "__le32": "C_int", "__le64": "C_long",
+      "atomic_t": "C_int", "atomic64_t": "C_long", "spinlock_t": "C_structdecl", "rwlock_t": "C_structdecl",
+      "mutex_t": "C_structdecl", "ulong": "C_long", "uint": "C_int", "ushort": "C_short", "uchar": "C_char",
+      "bool_t": "C_bool", "fl_owner_t": "C_pointer", "wait_queue_head_t": "C_structdecl", "ktime_t": "C_long"
+    };
+
+    const CPPRO_DIRECTIVES_MAP = {
+      "include": "CPPro_include", "define": "CPPro_define", "undef": "CPPro_undef",
+      "if": "CPPro_if", "ifdef": "CPPro_ifdef", "ifndef": "CPPro_ifndef",
+      "elif": "CPPro_elif", "elifdef": "CPPro_elifdef", "elifndef": "CPPro_elifndef",
+      "else": "CPPro_else", "endif": "CPPro_endif", "pragma": "CPPro_pragma",
+      "error": "CPPro_error", "warning": "CPPro_warning", "line": "CPPro_line"
+    };
+
+    function escapeJsString(str) {
+      if (!str) return '';
+      return String(str).replace(/\\/g, '\\\\').replace(/'/g, "\\'").replace(/"/g, '\\"').replace(/\n/g, '\\n').replace(/\r/g, '');
+    }
+
+    const SEMANTIC_TOKEN_TYPES = new Set([
+      "C_DeclRefExpr", "C_MemberRefExpr", "C_CallExpr", "C_functionproto", "C_functionprotodecl", "C_functionprotnotbind",
+      "C_struct", "C_structdecl", "C_structnotbind", "C_union", "C_uniondecl", "C_enum", "C_enumdecl",
+      "C_void", "C_char", "C_short", "C_int", "C_long", "C_signed", "C_unsigned", "C_bool", "C_float", "C_double",
+      "C_SCtypedef", "C_TypeRef",
+      "C_IfStmt", "C_SwitchStmt", "C_CaseStmt", "C_DefaultStmt", "C_WhileStmt", "C_DoStmt", "C_ForStmt",
+      "C_ReturnStmt", "C_BreakStmt", "C_ContinueStmt", "C_GotoStmt", "C_LabelStmt",
+      "CPPro_define", "CPPro_define_macro", "CPPro_include", "CPPro_if", "CPPro_ifdef", "CPPro_ifndef",
+      "ASM_Instruction", "ASM_Label", "ASM_Macro", "ASM_Directive",
+      "Kconfig_Config", "Kconfig_Menu", "Kconfig_Depends_On"
+    ]);
+
+    function lexAsmLine(rawText, inCommentStart = false) {
+      const tokens = [];
+      if (!rawText) return { tokens: [], inComment: inCommentStart };
+
+      const len = rawText.length;
+      let idx = 0;
+      let inComment = inCommentStart;
+
+      if (inComment) {
+        const endIdx = rawText.indexOf("*/");
+        if (endIdx === -1) {
+          tokens.push({ text: rawText, start: 0, end: len, typeKey: "ASM_Comment", label: "Block Comment" });
+          return { tokens, inComment: true };
+        } else {
+          tokens.push({ text: rawText.substring(0, endIdx + 2), start: 0, end: endIdx + 2, typeKey: "ASM_Comment", label: "Block Comment" });
+          idx = endIdx + 2;
+          inComment = false;
+        }
+      }
+
+      while (idx < len) {
+        const ch = rawText[idx];
+
+        // Whitespace
+        if (ch === ' ' || ch === '\t' || ch === '\r' || ch === '\n') {
+          let wsEnd = idx + 1;
+          while (wsEnd < len && (rawText[wsEnd] === ' ' || rawText[wsEnd] === '\t' || rawText[wsEnd] === '\r' || rawText[wsEnd] === '\n')) wsEnd++;
+          tokens.push({ text: rawText.substring(idx, wsEnd), start: idx, end: wsEnd, typeKey: null, label: null });
+          idx = wsEnd;
+          continue;
+        }
+
+        // Comments (# or // or /*)
+        if (ch === '#' || (ch === '/' && idx + 1 < len && rawText[idx + 1] === '/')) {
+          tokens.push({ text: rawText.substring(idx), start: idx, end: len, typeKey: "ASM_Comment", label: "Assembly Comment" });
+          idx = len;
+          break;
+        }
+        if (ch === '/' && idx + 1 < len && rawText[idx + 1] === '*') {
+          const endIdx = rawText.indexOf("*/", idx + 2);
+          if (endIdx === -1) {
+            tokens.push({ text: rawText.substring(idx), start: idx, end: len, typeKey: "ASM_Comment", label: "Block Comment" });
+            inComment = true;
+            idx = len;
+            break;
+          } else {
+            tokens.push({ text: rawText.substring(idx, endIdx + 2), start: idx, end: endIdx + 2, typeKey: "ASM_Comment", label: "Block Comment" });
+            idx = endIdx + 2;
+            continue;
+          }
+        }
+
+        // Directives (.globl, .section, .align, .macro, etc.)
+        if (ch === '.') {
+          const dirMatch = rawText.substring(idx).match(/^\.[a-zA-Z0-9_]+/);
+          if (dirMatch) {
+            const dir = dirMatch[0];
+            const isMacro = dir === ".macro" || dir === ".endm";
+            tokens.push({ text: dir, start: idx, end: idx + dir.length, typeKey: isMacro ? "ASM_Macro" : "ASM_Directive", label: `Directive: ${dir}` });
+            idx += dir.length;
+            continue;
+          }
+        }
+
+        // Registers (%rax, %eax, r0, etc.)
+        if (ch === '%') {
+          const regMatch = rawText.substring(idx).match(/^%[a-zA-Z0-9]+/);
+          if (regMatch) {
+            tokens.push({ text: regMatch[0], start: idx, end: idx + regMatch[0].length, typeKey: "C_pointer", label: `Register: ${regMatch[0]}` });
+            idx += regMatch[0].length;
+            continue;
+          }
+        }
+
+        // Strings
+        if (ch === '"' || ch === '\'') {
+          const q = ch;
+          let sEnd = idx + 1;
+          while (sEnd < len && rawText[sEnd] !== q) {
+            if (rawText[sEnd] === '\\' && sEnd + 1 < len) sEnd++;
+            sEnd++;
+          }
+          if (sEnd < len) sEnd++;
+          tokens.push({ text: rawText.substring(idx, sEnd), start: idx, end: sEnd, typeKey: "C_Literal_String", label: "String Literal" });
+          idx = sEnd;
+          continue;
+        }
+
+        // Numbers & Immediates ($0x..., $123, 0x..., 123)
+        if (ch === '$' || (ch >= '0' && ch <= '9')) {
+          const numMatch = rawText.substring(idx).match(/^(\$)?(0[xX][0-9a-fA-F]+|[0-9]+)/);
+          if (numMatch) {
+            tokens.push({ text: numMatch[0], start: idx, end: idx + numMatch[0].length, typeKey: "C_Literal_Number", label: `Number: ${numMatch[0]}` });
+            idx += numMatch[0].length;
+            continue;
+          }
+        }
+
+        // Words (Instructions, Labels, Identifiers)
+        if ((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || ch === '_') {
+          let wEnd = idx + 1;
+          while (wEnd < len && /[a-zA-Z0-9_]/.test(rawText[wEnd])) wEnd++;
+          const word = rawText.substring(idx, wEnd);
+
+          // Check if followed by colon -> Label
+          let look = wEnd;
+          while (look < len && (rawText[look] === ' ' || rawText[look] === '\t')) look++;
+          if (look < len && rawText[look] === ':') {
+            tokens.push({ text: word, start: idx, end: wEnd, typeKey: "ASM_Label", label: `Label: ${word}` });
+            tokens.push({ text: ":", start: wEnd, end: look + 1, typeKey: null, label: "Colon" });
+            idx = look + 1;
+            continue;
+          }
+
+          // Check known assembly instructions
+          const lower = word.toLowerCase();
+          const isInst = /^(mov|push|pop|lea|call|jmp|je|jne|jz|jnz|jg|jge|jl|jle|ja|jae|jb|jbe|ret|nop|add|sub|mul|div|xor|or|and|not|cmp|test|syscall|int|cli|sti|hlt|inc|dec|shl|shr|sar|sal|bswap|clts|in|out|ins|outs|lret|iret|pause|wbinvd|invd|cpuid|rdmsr|wrmsr|rdtsc|xchg|cmpxchg|lock)$/.test(lower);
+          if (isInst) {
+            tokens.push({ text: word, start: idx, end: wEnd, typeKey: "ASM_Instruction", label: `Instruction: ${word}` });
+          } else {
+            tokens.push({ text: word, start: idx, end: wEnd, typeKey: "C_DeclRefExpr", label: `Identifier: ${word}` });
+          }
+          idx = wEnd;
+          continue;
+        }
+
+        // Other punctuation
+        tokens.push({ text: ch, start: idx, end: idx + 1, typeKey: null, label: `Punctuation: ${ch}` });
+        idx++;
+      }
+
+      return { tokens, inComment };
+    }
+
+    function lexKconfigLine(rawText) {
+      const tokens = [];
+      if (!rawText) return { tokens: [], inComment: false };
+
+      const len = rawText.length;
+      let idx = 0;
+
+      while (idx < len) {
+        const ch = rawText[idx];
+
+        // Whitespace
+        if (ch === ' ' || ch === '\t' || ch === '\r' || ch === '\n') {
+          let wsEnd = idx + 1;
+          while (wsEnd < len && (rawText[wsEnd] === ' ' || rawText[wsEnd] === '\t' || rawText[wsEnd] === '\r' || rawText[wsEnd] === '\n')) wsEnd++;
+          tokens.push({ text: rawText.substring(idx, wsEnd), start: idx, end: wsEnd, typeKey: null, label: null });
+          idx = wsEnd;
+          continue;
+        }
+
+        // Comment (# ...)
+        if (ch === '#') {
+          tokens.push({ text: rawText.substring(idx), start: idx, end: len, typeKey: "C_Comment", label: "Comment" });
+          idx = len;
+          break;
+        }
+
+        // Strings ("...")
+        if (ch === '"' || ch === '\'') {
+          const q = ch;
+          let sEnd = idx + 1;
+          while (sEnd < len && rawText[sEnd] !== q) {
+            if (rawText[sEnd] === '\\' && sEnd + 1 < len) sEnd++;
+            sEnd++;
+          }
+          if (sEnd < len) sEnd++;
+          tokens.push({ text: rawText.substring(idx, sEnd), start: idx, end: sEnd, typeKey: "C_Literal_String", label: "String" });
+          idx = sEnd;
+          continue;
+        }
+
+        // Words / Keywords / Symbols
+        if (/[a-zA-Z0-9_]/.test(ch)) {
+          let wEnd = idx + 1;
+          while (wEnd < len && /[a-zA-Z0-9_]/.test(rawText[wEnd])) wEnd++;
+          const word = rawText.substring(idx, wEnd);
+
+          const lower = word.toLowerCase();
+          if (/^(config|menuconfig|menu|endmenu|choice|endchoice|if|endif|source|mainmenu)$/.test(lower)) {
+            tokens.push({ text: word, start: idx, end: wEnd, typeKey: "Kconfig_Menu", label: `Kconfig Keyword: ${word}` });
+          } else if (/^(bool|tristate|string|hex|int|prompt)$/.test(lower)) {
+            tokens.push({ text: word, start: idx, end: wEnd, typeKey: "C_bool", label: `Type: ${word}` });
+          } else if (/^(default|depends|on|select|imply|range|help)$/.test(lower)) {
+            tokens.push({ text: word, start: idx, end: wEnd, typeKey: "Kconfig_Depends_On", label: `Directive: ${word}` });
+          } else if (word.startsWith("CONFIG_")) {
+            tokens.push({ text: word, start: idx, end: wEnd, typeKey: "Kconfig_Config", label: `Symbol: ${word}` });
+          } else {
+            tokens.push({ text: word, start: idx, end: wEnd, typeKey: "C_DeclRefExpr", label: `Identifier: ${word}` });
+          }
+          idx = wEnd;
+          continue;
+        }
+
+        // Punctuation / operators
+        tokens.push({ text: ch, start: idx, end: idx + 1, typeKey: null, label: `Punctuation: ${ch}` });
+        idx++;
+      }
+
+      return { tokens, inComment: false };
+    }
+
+    function lexCLine(rawText, inCommentStart = false) {
+      const tokens = [];
+      if (!rawText) return { tokens: [], inComment: inCommentStart };
+
+      const len = rawText.length;
+      let idx = 0;
+      let inComment = inCommentStart;
+
+      // If continuing a multi-line block comment
+      if (inComment) {
+        const endCommentIdx = rawText.indexOf("*/");
+        if (endCommentIdx === -1) {
+          tokens.push({
+            text: rawText,
+            start: 0,
+            end: len,
+            typeKey: "C_Comment",
+            label: "Block Comment"
+          });
+          return { tokens, inComment: true };
+        } else {
+          const commentEnd = endCommentIdx + 2;
+          tokens.push({
+            text: rawText.substring(0, commentEnd),
+            start: 0,
+            end: commentEnd,
+            typeKey: "C_Comment",
+            label: "Block Comment"
+          });
+          idx = commentEnd;
+          inComment = false;
+        }
+      }
+
+      const trimmedStart = rawText.search(/\S/);
+
+      let prevWord = "";
+      let prevNonWhitespace = "";
+
+      while (idx < len) {
+        const ch = rawText[idx];
+
+        // 1. Whitespace
+        if (ch === ' ' || ch === '\t' || ch === '\r' || ch === '\n') {
+          let wsEnd = idx + 1;
+          while (wsEnd < len && (rawText[wsEnd] === ' ' || rawText[wsEnd] === '\t' || rawText[wsEnd] === '\r' || rawText[wsEnd] === '\n')) {
+            wsEnd++;
+          }
+          tokens.push({
+            text: rawText.substring(idx, wsEnd),
+            start: idx,
+            end: wsEnd,
+            typeKey: null,
+            label: null
+          });
+          idx = wsEnd;
+          continue;
+        }
+
+        // 2. Comments
+        if (ch === '/' && idx + 1 < len) {
+          if (rawText[idx + 1] === '/') {
+            tokens.push({
+              text: rawText.substring(idx),
+              start: idx,
+              end: len,
+              typeKey: "C_Comment",
+              label: "Line Comment"
+            });
+            idx = len;
+            break;
+          } else if (rawText[idx + 1] === '*') {
+            const endCommentIdx = rawText.indexOf("*/", idx + 2);
+            if (endCommentIdx === -1) {
+              tokens.push({
+                text: rawText.substring(idx),
+                start: idx,
+                end: len,
+                typeKey: "C_Comment",
+                label: "Block Comment"
+              });
+              inComment = true;
+              idx = len;
+              break;
+            } else {
+              const commentEnd = endCommentIdx + 2;
+              tokens.push({
+                text: rawText.substring(idx, commentEnd),
+                start: idx,
+                end: commentEnd,
+                typeKey: "C_Comment",
+                label: "Block Comment"
+              });
+              idx = commentEnd;
+              continue;
+            }
+          }
+        }
+
+        // 3. Preprocessor Directives (#define, #include, #if, etc.)
+        if (ch === '#' && idx === trimmedStart) {
+          const matchDir = rawText.substring(idx).match(/^#\s*([a-zA-Z_]+)/);
+          if (matchDir) {
+            const fullDir = matchDir[0];
+            const dirName = matchDir[1];
+            const dirType = CPPRO_DIRECTIVES_MAP[dirName] || "CPPro_define";
+            tokens.push({
+              text: fullDir,
+              start: idx,
+              end: idx + fullDir.length,
+              typeKey: dirType,
+              label: `Preprocessor #${dirName}`
+            });
+            idx += fullDir.length;
+            prevNonWhitespace = "#";
+            prevWord = dirName;
+
+            if (dirName === "include") {
+              const restOfLine = rawText.substring(idx);
+              const incMatch = restOfLine.match(/^\s*(<[^>]+>|"[^"]+")/);
+              if (incMatch) {
+                const wsLen = incMatch[0].length - incMatch[1].length;
+                if (wsLen > 0) {
+                  tokens.push({
+                    text: restOfLine.substring(0, wsLen),
+                    start: idx,
+                    end: idx + wsLen,
+                    typeKey: null,
+                    label: null
+                  });
+                  idx += wsLen;
+                }
+                tokens.push({
+                  text: incMatch[1],
+                  start: idx,
+                  end: idx + incMatch[1].length,
+                  typeKey: "CPPro_include",
+                  label: "Include Header"
+                });
+                idx += incMatch[1].length;
+              }
+            }
+            continue;
+          }
+        }
+
+        // 4. String & Character Literals
+        if (ch === '"' || ch === '\'') {
+          const quote = ch;
+          let strEnd = idx + 1;
+          let escaped = false;
+          while (strEnd < len) {
+            const c = rawText[strEnd];
+            if (escaped) {
+              escaped = false;
+            } else if (c === '\\') {
+              escaped = true;
+            } else if (c === quote) {
+              strEnd++;
+              break;
+            }
+            strEnd++;
+          }
+          tokens.push({
+            text: rawText.substring(idx, strEnd),
+            start: idx,
+            end: strEnd,
+            typeKey: "C_Literal_String",
+            label: quote === '"' ? "String Literal" : "Character Constant"
+          });
+          prevNonWhitespace = quote;
+          idx = strEnd;
+          continue;
+        }
+
+        // 5. Numeric & Hex Literals
+        if ((ch >= '0' && ch <= '9') || (ch === '.' && idx + 1 < len && rawText[idx + 1] >= '0' && rawText[idx + 1] <= '9')) {
+          const numMatch = rawText.substring(idx).match(/^(0[xX][0-9a-fA-F]+[uUlL]*|0[bB][01]+[uUlL]*|[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?[fFlLuU]*)/);
+          if (numMatch) {
+            const numStr = numMatch[0];
+            tokens.push({
+              text: numStr,
+              start: idx,
+              end: idx + numStr.length,
+              typeKey: "C_Literal_Number",
+              label: "Numeric Constant"
+            });
+            prevNonWhitespace = "0";
+            idx += numStr.length;
+            continue;
+          }
+        }
+
+        // 6. Operators & Pointers
+        if (ch === '-' && idx + 1 < len && rawText[idx + 1] === '>') {
+          tokens.push({ text: "->", start: idx, end: idx + 2, typeKey: "C_MemberRefExpr", label: "Arrow Operator (->)" });
+          idx += 2;
+          prevNonWhitespace = "->";
+          continue;
+        }
+        if (ch === ':' && idx + 1 < len && rawText[idx + 1] === ':') {
+          tokens.push({ text: "::", start: idx, end: idx + 2, typeKey: "C_BinaryOperator", label: "Scope Resolution (::)" });
+          idx += 2;
+          prevNonWhitespace = "::";
+          continue;
+        }
+        if (ch === '<' && idx + 1 < len && rawText[idx + 1] === '<') {
+          tokens.push({ text: "<<", start: idx, end: idx + 2, typeKey: "C_BinaryOperator", label: "Left Shift (<<)" });
+          idx += 2;
+          prevNonWhitespace = "<<";
+          continue;
+        }
+        if (ch === '>' && idx + 1 < len && rawText[idx + 1] === '>') {
+          tokens.push({ text: ">>", start: idx, end: idx + 2, typeKey: "C_BinaryOperator", label: "Right Shift (>>)" });
+          idx += 2;
+          prevNonWhitespace = ">>";
+          continue;
+        }
+        if ((ch === '=' || ch === '!' || ch === '<' || ch === '>') && idx + 1 < len && rawText[idx + 1] === '=') {
+          const op = rawText.substring(idx, idx + 2);
+          tokens.push({ text: op, start: idx, end: idx + 2, typeKey: "C_BinaryOperator", label: `Comparison (${op})` });
+          idx += 2;
+          prevNonWhitespace = op;
+          continue;
+        }
+        if ((ch === '&' && rawText[idx + 1] === '&') || (ch === '|' && rawText[idx + 1] === '|')) {
+          const op = rawText.substring(idx, idx + 2);
+          tokens.push({ text: op, start: idx, end: idx + 2, typeKey: "C_BinaryOperator", label: `Logical Operator (${op})` });
+          idx += 2;
+          prevNonWhitespace = op;
+          continue;
+        }
+        if ((ch === '+' && rawText[idx + 1] === '+') || (ch === '-' && rawText[idx + 1] === '-')) {
+          const op = rawText.substring(idx, idx + 2);
+          tokens.push({ text: op, start: idx, end: idx + 2, typeKey: "C_UnaryOperator", label: `Increment/Decrement (${op})` });
+          idx += 2;
+          prevNonWhitespace = op;
+          continue;
+        }
+        if (ch === '*' || ch === '&') {
+          tokens.push({ text: ch, start: idx, end: idx + 1, typeKey: "C_pointer", label: ch === '*' ? "Pointer (*)" : "Address-Of (&)" });
+          idx++;
+          prevNonWhitespace = ch;
+          continue;
+        }
+        if (ch === '.') {
+          tokens.push({ text: ".", start: idx, end: idx + 1, typeKey: "C_MemberRefExpr", label: "Dot Member Operator (.)" });
+          idx++;
+          prevNonWhitespace = ".";
+          continue;
+        }
+
+        // 7. Words / Identifiers / Keywords
+        if ((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || ch === '_') {
+          let wEnd = idx + 1;
+          while (wEnd < len && ((rawText[wEnd] >= 'a' && rawText[wEnd] <= 'z') || (rawText[wEnd] >= 'A' && rawText[wEnd] <= 'Z') || (rawText[wEnd] >= '0' && rawText[wEnd] <= '9') || rawText[wEnd] === '_')) {
+            wEnd++;
+          }
+          const word = rawText.substring(idx, wEnd);
+
+          let nextChar = '';
+          let lookahead = wEnd;
+          while (lookahead < len && (rawText[lookahead] === ' ' || rawText[lookahead] === '\t')) {
+            lookahead++;
+          }
+          if (lookahead < len) {
+            nextChar = rawText[lookahead];
+          }
+
+          let typeKey = "Undefined";
+          let label = word;
+
+          if (C_KEYWORDS_MAP[word]) {
+            typeKey = C_KEYWORDS_MAP[word];
+            label = `Keyword: ${word}`;
+          } else if (C_STORAGE_QUAL_MAP[word]) {
+            typeKey = C_STORAGE_QUAL_MAP[word];
+            label = `Specifier/Qualifier: ${word}`;
+          } else if (C_STRUCT_UNION_ENUM[word]) {
+            typeKey = C_STRUCT_UNION_ENUM[word];
+            label = `${word} declaration`;
+          } else if (C_PRIMITIVE_TYPES[word]) {
+            typeKey = C_PRIMITIVE_TYPES[word];
+            label = `Type: ${word}`;
+          } else if (prevWord === "struct" || prevWord === "union" || prevWord === "enum") {
+            typeKey = prevWord === "struct" ? "C_struct" : (prevWord === "union" ? "C_union" : "C_enum");
+            label = `${prevWord} type: ${word}`;
+          } else if (prevNonWhitespace === "->" || prevNonWhitespace === ".") {
+            typeKey = "C_MemberRefExpr";
+            label = `Member: ${word}`;
+          } else if (nextChar === '(' && !C_KEYWORDS_MAP[word] && !C_STORAGE_QUAL_MAP[word] && !C_STRUCT_UNION_ENUM[word]) {
+            typeKey = "C_CallExpr";
+            label = `Function: ${word}()`;
+          } else if (nextChar === ':' && rawText[lookahead + 1] !== ':' && prevWord !== "case" && word !== "default") {
+            typeKey = "C_LabelStmt";
+            label = `Label: ${word}:`;
+          } else if (/^[A-Z_][A-Z0-9_]{1,}$/.test(word)) {
+            typeKey = "CPPro_define";
+            label = `Constant/Macro: ${word}`;
+          } else {
+            typeKey = "C_DeclRefExpr";
+            label = `Identifier: ${word}`;
+          }
+
+          tokens.push({
+            text: word,
+            start: idx,
+            end: wEnd,
+            typeKey: typeKey,
+            label: label
+          });
+
+          prevWord = word;
+          prevNonWhitespace = word;
+          idx = wEnd;
+          continue;
+        }
+
+        // 8. Delimiters and Other Punctuation
+        tokens.push({
+          text: ch,
+          start: idx,
+          end: idx + 1,
+          typeKey: (ch === '[' || ch === ']') ? "C_array" : ((ch === '{' || ch === '}') ? "C_Compound" : null),
+          label: `Punctuation: ${ch}`
+        });
+        prevNonWhitespace = ch;
+        idx++;
+      }
+
+      return { tokens, inComment };
+    }
+
+    function renderSegmentWithKconfigTokens(segment, tok, tokenColor) {
       if (!segment) return "";
       KCONFIG_SYM_REGEX.lastIndex = 0;
       if (!KCONFIG_SYM_REGEX.test(segment)) {
-        if (tok && tokenColor) {
-          const depthTitle = isContainerItem ? ` [Container Level ${tok.container_depth}]` : '';
-          return `<span class="token" style="color: ${tokenColor};" onclick="inspectAst(${tok.ast_id}, '${escapeHtml(tok.ast_name || '')}', '${tok.type_name}', event)" title="AST: ${escapeHtml(tok.ast_name || '')} (${tok.type_name})${depthTitle}">${escapeHtml(segment)}</span>`;
+        if (tok) {
+          const colorStyle = tokenColor ? `color: ${tokenColor};` : '';
+          return `<span class="token" style="${colorStyle}" onclick="inspectAst(${tok.ast_id}, '${escapeHtml(tok.ast_name || '')}', '${tok.type_name}', event)" title="AST: ${escapeHtml(tok.ast_name || '')} (${tok.type_name})">${escapeHtml(segment)}</span>`;
         }
         return escapeHtml(segment);
       }
@@ -4461,9 +5266,9 @@
       while ((m = KCONFIG_SYM_REGEX.exec(segment)) !== null) {
         const before = segment.substring(lastIndex, m.index);
         if (before) {
-          if (tok && tokenColor) {
-            const depthTitle = isContainerItem ? ` [Container Level ${tok.container_depth}]` : '';
-            resultHtml += `<span class="token" style="color: ${tokenColor};" onclick="inspectAst(${tok.ast_id}, '${escapeHtml(tok.ast_name || '')}', '${tok.type_name}', event)" title="AST: ${escapeHtml(tok.ast_name || '')} (${tok.type_name})${depthTitle}">${escapeHtml(before)}</span>`;
+          if (tok) {
+            const colorStyle = tokenColor ? `color: ${tokenColor};` : '';
+            resultHtml += `<span class="token" style="${colorStyle}" onclick="inspectAst(${tok.ast_id}, '${escapeHtml(tok.ast_name || '')}', '${tok.type_name}', event)" title="AST: ${escapeHtml(tok.ast_name || '')} (${tok.type_name})">${escapeHtml(before)}</span>`;
           } else {
             resultHtml += escapeHtml(before);
           }
@@ -4476,9 +5281,9 @@
 
       const after = segment.substring(lastIndex);
       if (after) {
-        if (tok && tokenColor) {
-          const depthTitle = isContainerItem ? ` [Container Level ${tok.container_depth}]` : '';
-          resultHtml += `<span class="token" style="color: ${tokenColor};" onclick="inspectAst(${tok.ast_id}, '${escapeHtml(tok.ast_name || '')}', '${tok.type_name}', event)" title="AST: ${escapeHtml(tok.ast_name || '')} (${tok.type_name})${depthTitle}">${escapeHtml(after)}</span>`;
+        if (tok) {
+          const colorStyle = tokenColor ? `color: ${tokenColor};` : '';
+          resultHtml += `<span class="token" style="${colorStyle}" onclick="inspectAst(${tok.ast_id}, '${escapeHtml(tok.ast_name || '')}', '${tok.type_name}', event)" title="AST: ${escapeHtml(tok.ast_name || '')} (${tok.type_name})">${escapeHtml(after)}</span>`;
         } else {
           resultHtml += escapeHtml(after);
         }
@@ -4487,74 +5292,111 @@
       return resultHtml;
     }
 
-    function highlightLineText(rawText, lineMaps) {
-      if (!rawText) return "";
-      if (!lineMaps || lineMaps.length === 0) {
-        return renderSegmentWithKconfigTokens(rawText, null, null, false);
+    function highlightLineText(rawText, lineMaps, inCommentState = false, ftype = 1, fname = "") {
+      if (!rawText) return { html: "", inComment: inCommentState };
+
+      let lexResult;
+      if (ftype === 4 || (fname && (fname.endsWith(".S") || fname.endsWith(".s")))) {
+        lexResult = lexAsmLine(rawText, inCommentState);
+      } else if (ftype === 2 || (fname && fname.includes("Kconfig"))) {
+        lexResult = lexKconfigLine(rawText);
+      } else {
+        lexResult = lexCLine(rawText, inCommentState);
       }
 
-      const len = rawText.length;
-      const charTokens = new Array(len);
+      const { tokens, inComment: nextInComment } = lexResult;
+      if (!tokens || tokens.length === 0) {
+        return { html: renderSegmentWithKconfigTokens(rawText, null, null), inComment: nextInComment };
+      }
 
-      // For each character column, find the innermost (smallest span) active token
-      for (let k = 0; k < len; k++) {
-        const col = k + 1; // 1-indexed column
-        let bestToken = null;
+      // Find dominant parent AST tag from lineMaps (e.g. C_struct, C_functionproto, CPPro_define)
+      let parentTok = null;
+      if (lineMaps && lineMaps.length > 0) {
+        parentTok = lineMaps[lineMaps.length - 1];
+      }
+
+      let resultHtml = "";
+
+      for (let i = 0; i < tokens.length; i++) {
+        const tok = tokens[i];
+        const text = tok.text;
+        if (!text) continue;
+
+        // Check if whitespace
+        if (tok.typeKey === null && /^\s+$/.test(text)) {
+          resultHtml += escapeHtml(text);
+          continue;
+        }
+
+        // Check for Kconfig CONFIG_ symbol
+        if (text.startsWith("CONFIG_") && text.length > 7) {
+          const symName = text.substring(7);
+          resultHtml += `<span class="token-kconfig-symbol" onclick="openKconfigSymbolModal('${escapeHtml(symName)}', event)" title="Kconfig Symbol: CONFIG_${escapeHtml(symName)} (Click for details &amp; live value)">${escapeHtml(text)}</span>`;
+          continue;
+        }
+
+        // Check specific fine-grained spatial maps at this token column if any exist
+        let winningMap = null;
         let bestSpan = Infinity;
-
-        for (let i = 0; i < lineMaps.length; i++) {
-          const m = lineMaps[i];
-          const cs = m.char_s || 1;
-          const ce = m.char_e || 9999;
-          if (cs <= col && col < ce) {
-            const span = (ce - cs);
-            if (span < bestSpan) {
-              bestSpan = span;
-              bestToken = m;
+        if (lineMaps && lineMaps.length > 0) {
+          const tokColStart = tok.start + 1;
+          const tokColEnd = tok.end + 1;
+          for (let mIdx = 0; mIdx < lineMaps.length; mIdx++) {
+            const m = lineMaps[mIdx];
+            const cs = m.char_s || 1;
+            const ce = m.char_e || 9999;
+            if (cs <= tokColStart && tokColEnd <= ce) {
+              const span = (m.total_spatial_span !== undefined && m.total_spatial_span !== null) ? m.total_spatial_span : (ce - cs);
+              if (span < bestSpan) {
+                bestSpan = span;
+                winningMap = m;
+              }
             }
           }
         }
-        charTokens[k] = bestToken;
-      }
 
-      // Group contiguous characters with the same winning token
-      let result = "";
-      let idx = 0;
+        // Resolve construct type key:
+        // 1. Lexical IDE coloring takes priority for granular elements (keywords, types, variables, comments, literals, operators)
+        let typeKey = tok.typeKey;
 
-      while (idx < len) {
-        const tok = charTokens[idx];
-        let runEnd = idx + 1;
-        while (runEnd < len && charTokens[runEnd] === tok) {
-          runEnd++;
-        }
-
-        const segment = rawText.substring(idx, runEnd);
-
-        if (!tok) {
-          result += renderSegmentWithKconfigTokens(segment, null, null, false);
-        } else {
-          let tokenColor = null;
-          const isContainerItem = (tok.container_depth !== undefined && tok.container_depth !== null);
-
-          if (containerColoringEnabled && isContainerItem) {
-            const depthIdx = Math.max(0, parseInt(tok.container_depth, 10));
-            const depthEntry = containerDepthPalette[depthIdx % containerDepthPalette.length];
-            tokenColor = depthEntry ? depthEntry.color : "#98c379";
-          } else {
-            const typeKey = tok.type_name || "Undefined";
-            const hlConfig = highlightSettings[typeKey] || highlightSettings["Undefined"] || { color: "#abb2bf", enabled: true };
-            if (hlConfig.enabled) {
-              tokenColor = hlConfig.color;
-            }
+        // 2. Only allow an explicit AST map to override if it is a specific, fine-grained sub-span map (not an entire multi-line function/struct map)
+        if (winningMap && winningMap.type_name && !winningMap.is_multi_line && winningMap.total_spatial_span < 1000 &&
+            winningMap.type_name !== "C_Compound" && winningMap.type_name !== "Undefined") {
+          if (!typeKey || typeKey === "C_DeclRefExpr" || typeKey === "Undefined") {
+            typeKey = winningMap.type_name;
           }
-
-          result += renderSegmentWithKconfigTokens(segment, tok, tokenColor, isContainerItem);
         }
 
-        idx = runEnd;
+        // 3. If token had no lexical type, fall back to map or parent tag
+        if (!typeKey || typeKey === "Undefined") {
+          typeKey = (winningMap && winningMap.type_name && winningMap.type_name !== "C_Compound" && winningMap.type_name !== "Undefined")
+            ? winningMap.type_name
+            : (parentTok ? parentTok.type_name : "Undefined");
+        }
+
+        const hlConfig = highlightSettings[typeKey] || highlightSettings["Undefined"] || { color: "#abb2bf", enabled: true };
+        const tokenColor = (hlConfig.enabled !== false) ? hlConfig.color : "#abb2bf";
+
+        const astContext = winningMap || parentTok;
+        const isSemantic = SEMANTIC_TOKEN_TYPES.has(typeKey) || (tok.typeKey && SEMANTIC_TOKEN_TYPES.has(tok.typeKey));
+
+        let clickAttr = "";
+        let classNames = "token";
+
+        if (isSemantic && astContext && astContext.ast_id) {
+          classNames += " token-clickable";
+          clickAttr = `onclick="inspectAstTarget(${astContext.ast_id}, '${escapeJsString(text)}', '${escapeJsString(typeKey)}', '${escapeJsString(astContext.ast_name || '')}', '${escapeJsString(astContext.type_name || astContext.ast_type_name || '')}', event)"`;
+        }
+
+        const astTitle = (astContext && astContext.ast_name)
+          ? ` • AST: ${escapeHtml(astContext.ast_name)} (${astContext.type_name || astContext.ast_type_name || ''})${isSemantic ? ' [Click to inspect container]' : ''}`
+          : "";
+        const titleAttr = `title="Token: ${escapeHtml(tok.label || typeKey)} (${typeKey})${astTitle}"`;
+
+        resultHtml += `<span class="${classNames}" style="color: ${tokenColor};" ${clickAttr} ${titleAttr}>${escapeHtml(text)}</span>`;
       }
 
-      return result;
+      return { html: resultHtml, inComment: nextInComment };
     }
 
     function buildHighlightedSource(tags) {
@@ -4648,11 +5490,42 @@
         });
       });
 
-      // 5. Gather token highlights for each line across ALL tags & multi-line maps
+      // Fallback: Ensure any lines with tags not covered by outerTags are populated
+      sortedTags.forEach((tag) => {
+        const tagCode = tag.code || "";
+        const tagLines = tagCode.split("\n");
+        const startL = tag.line_s || 1;
+        tagLines.forEach((lineText, lineIdxInTag) => {
+          const fileLineNum = startL + lineIdxInTag;
+          if (!fileLines[fileLineNum]) {
+            const isFirstLine = lineIdxInTag === 0;
+            const leadingSpaces = (isFirstLine && tag.char_s > 1) ? " ".repeat(tag.char_s - 1) : "";
+            fileLines[fileLineNum] = {
+              rawText: leadingSpaces + lineText,
+              collapseBtn: "",
+              outerIdx: null,
+              tag: tag,
+              isFirstLine: isFirstLine
+            };
+          }
+        });
+      });
+
+      // 5. Index all tags starting on each line for multi-tag margin chip rendering
+      const tagsStartingAtLine = {};
+      sortedTags.forEach(t => {
+        const sL = t.line_s || 1;
+        if (!tagsStartingAtLine[sL]) tagsStartingAtLine[sL] = [];
+        tagsStartingAtLine[sL].push(t);
+      });
+
+      // 6. Gather token highlights for each line across ALL tags & multi-line maps
       const lineMapsMap = {};
       sortedTags.forEach(t => {
         const tagLineStart = t.line_s || 1;
         const tagCharStart = t.char_s || 1;
+        const tagLineEnd = t.line_e || tagLineStart;
+        const tagTotalSpan = Math.max(0, tagLineEnd - tagLineStart) * 100000 + Math.max(1, (t.char_e || 100) - tagCharStart);
 
         if (t.maps && t.maps.length > 0) {
           t.maps.forEach((m, mIdx) => {
@@ -4660,6 +5533,9 @@
             const m_line_e = m.line_e || m_line_s;
             const abs_start_line = tagLineStart + (m_line_s - 1);
             const abs_end_line = tagLineStart + (m_line_e - 1);
+            const line_delta = Math.max(0, abs_end_line - abs_start_line);
+            const char_delta = (m.char_e && m.char_e > 0) ? Math.max(1, m.char_e - (m.char_s || 1)) : 100;
+            const total_spatial_span = (line_delta * 100000) + char_delta;
 
             const isCppro = m.type_name && m.type_name.startsWith("CPPro_");
             if (isCppro && abs_end_line > abs_start_line) {
@@ -4679,16 +5555,19 @@
               // Token syntax highlighting for CPPro_if* applies ONLY to the directive line itself
               if (!lineMapsMap[abs_start_line]) lineMapsMap[abs_start_line] = [];
               const cs = (m_line_s === 1) ? (tagCharStart + (m.char_s - 1)) : (m.char_s || 1);
-              const ce = (t.line_e === t.line_s) ? ((m.char_e && m.char_e > 0) ? m.char_e : (t.char_e || 9999)) : 9999;
+              const ce = (t.char_e && t.char_e > 0) ? t.char_e : 9999;
+              const directive_span = Math.max(1, ce - cs);
               lineMapsMap[abs_start_line].push({
                 char_s: cs,
                 char_e: ce,
                 ast_id: m.ast_id,
                 ast_name: m.ast_name,
                 type_name: m.type_name,
+                total_spatial_span: directive_span,
                 is_multi_line: false,
                 abs_start_line: abs_start_line,
-                abs_end_line: abs_start_line
+                abs_end_line: abs_start_line,
+                tag_id: t.tag_id
               });
               return;
             }
@@ -4728,9 +5607,11 @@
                 ast_name: m.ast_name,
                 type_name: m.type_name,
                 container_depth: eff_depth,
+                total_spatial_span: total_spatial_span,
                 is_multi_line: (abs_end_line > abs_start_line),
                 abs_start_line: abs_start_line,
-                abs_end_line: abs_end_line
+                abs_end_line: abs_end_line,
+                tag_id: t.tag_id
               });
             }
           });
@@ -4763,9 +5644,11 @@
               ast_name: t.ast_name,
               type_name: t.ast_type_name,
               container_depth: (t.container_depth !== undefined && t.container_depth !== null) ? t.container_depth : null,
+              total_spatial_span: tagTotalSpan,
               is_multi_line: (tag_end > tag_start),
               abs_start_line: tag_start,
-              abs_end_line: tag_end
+              abs_end_line: tag_end,
+              tag_id: t.tag_id
             });
           }
         }
@@ -4783,9 +5666,10 @@
         });
       }
 
-      // 6. Render gutter and code body
+      // 7. Render gutter and code body
       let gutterHtml = "";
       let bodyHtml = "";
+      let currentInComment = false;
 
       for (let l = 1; l <= maxLine; l++) {
         const lineData = fileLines[l] || { rawText: " ", collapseBtn: "", outerIdx: null, isFirstLine: false, tag: null };
@@ -4797,20 +5681,34 @@
         const inCpproScope = activeCpproRanges.some(r => l >= r.start && l <= r.end);
         const cpproClass = (cpproHighlightEnabled && inCpproScope) ? "cppro-scope-highlight" : "";
 
-        // Sort maps for this line: smallest span (innermost specific token) first
+        // Sort maps for this line: smallest total spatial span (innermost specific token) first
         const lineMaps = (lineMapsMap[l] || []).slice().sort((a, b) => {
-          const spanA = (a.char_e - a.char_s);
-          const spanB = (b.char_e - b.char_s);
+          const spanA = (a.total_spatial_span !== undefined && a.total_spatial_span !== null) ? a.total_spatial_span : (a.char_e - a.char_s);
+          const spanB = (b.total_spatial_span !== undefined && b.total_spatial_span !== null) ? b.total_spatial_span : (b.char_e - b.char_s);
           if (spanA !== spanB) return spanA - spanB;
-          return a.char_s - b.char_s;
+          return (a.char_s || 1) - (b.char_s || 1);
         });
 
-        const highlightedContent = highlightLineText(rawText, lineMaps);
+        const ftype = (activeFileData && activeFileData.file_info && activeFileData.file_info.ftype !== undefined) ? activeFileData.file_info.ftype : 1;
+        const fname = (activeFileData && activeFileData.file_info && activeFileData.file_info.fname) ? activeFileData.file_info.fname : "";
+        const { html: highlightedContent, inComment: nextInComment } = highlightLineText(rawText, lineMaps, currentInComment, ftype, fname);
+        currentInComment = nextInComment;
 
-        // Tag chip rendering for lines starting a tag block
-        const tagChipHtml = (lineData.isFirstLine && lineData.tag && lineData.tag.tag_id)
-          ? `<span class="tag-chip" onclick="openTagTimelineModal(${lineData.tag.tag_id}, '${currentVersion}')" title="Inspect Tag #${lineData.tag.tag_id} (${lineData.tag.ast_type_name || 'Tag'}) version history & evolution timeline">🏷️ #${lineData.tag.tag_id}</span>`
-          : "";
+        // Multi-tag chip rendering for all tags starting on line l
+        const startTags = tagsStartingAtLine[l] || [];
+        let tagChipHtml = "";
+        if (tagChipsEnabled && startTags.length === 1) {
+          const st = startTags[0];
+          tagChipHtml = `<span class="tag-chip" onclick="openTagTimelineModal(${st.tag_id}, '${currentVersion}')" title="Inspect Tag #${st.tag_id} (${st.ast_type_name || 'Tag'}) version history & evolution timeline">🏷️ #${st.tag_id}</span>`;
+        } else if (tagChipsEnabled && startTags.length > 1) {
+          const titles = startTags.map(st => `#${st.tag_id} (${st.ast_type_name || 'Tag'})`).join(", ");
+          const primaryTag = startTags[0];
+          tagChipHtml = `
+            <span class="tag-chip" onclick="openTagTimelineModal(${primaryTag.tag_id}, '${currentVersion}')" title="Tags starting on line ${l}: ${escapeHtml(titles)} (Click to view Tag #${primaryTag.tag_id} timeline)">
+              🏷️ #${primaryTag.tag_id} <span style="font-size: 8px; opacity: 0.8; margin-left: 2px;">(${startTags.length})</span>
+            </span>
+          `;
+        }
 
         // Blame cell rendering
         let blameCellHtml = "";
@@ -5280,24 +6178,124 @@
     // ------------------------------------------------------------------------
     // AST Container Hierarchy Inspector
     // ------------------------------------------------------------------------
-    async function inspectAst(astId, name, typeName, event) {
+    let currentTargetSymbol = null;
+    let currentTargetTypeKey = null;
+
+    async function inspectAstTarget(astId, targetSymbol, targetTypeKey, parentName, parentTypeName, event) {
+      if (event) event.stopPropagation();
+      currentTargetSymbol = targetSymbol;
+      currentTargetTypeKey = targetTypeKey;
+      await inspectAst(astId, parentName, parentTypeName, null, targetSymbol, targetTypeKey);
+    }
+
+    function findMatchedContainerNode(treeData, targetSymbol, targetTypeKey) {
+      if (!treeData) return null;
+      let bestMatch = null;
+      let bestScore = -1;
+
+      function scoreMatch(node, container, path) {
+        if (!container) return;
+        const refName = container.ref_ast_name || (container.child_node ? container.child_node.name : "");
+        const relType = container.rel_type_name || (container.child_node ? container.child_node.type_name : "");
+
+        let score = 0;
+        // Tier 1: Exact variable / parameter / member name
+        if (targetSymbol && refName && refName === targetSymbol) {
+          score = 100;
+        }
+        // Tier 2: Statement keyword (e.g. if -> C_IfStmt, return -> C_ReturnStmt, label -> C_LabelStmt)
+        else if (targetTypeKey && (relType === targetTypeKey || (container.child_node && container.child_node.type_name === targetTypeKey))) {
+          score = 80;
+        }
+        // Tier 3: Type Reference (e.g. posix_acl -> C_TypeRef with name posix_acl)
+        else if (targetSymbol && relType === "C_TypeRef" && refName === targetSymbol) {
+          score = 60;
+        }
+        // Tier 4: Case-insensitive match
+        else if (targetSymbol && refName && refName.toLowerCase() === targetSymbol.toLowerCase()) {
+          score = 40;
+        }
+
+        if (score > bestScore) {
+          bestScore = score;
+          bestMatch = { container, node, path: [...path, container] };
+        }
+      }
+
+      function traverse(currNode, path) {
+        if (!currNode || !currNode.containers) return;
+        for (let c of currNode.containers) {
+          scoreMatch(currNode, c, path);
+          if (c.child_node) {
+            traverse(c.child_node, [...path, c]);
+          }
+        }
+      }
+
+      traverse(treeData, []);
+      return bestMatch;
+    }
+
+    async function inspectAst(astId, name, typeName, event, targetSymbol = null, targetTypeKey = null) {
       if (event) event.stopPropagation();
       selectedAstId = astId;
+      if (targetSymbol !== null) currentTargetSymbol = targetSymbol;
+      if (targetTypeKey !== null) currentTargetTypeKey = targetTypeKey;
+
       const inspector = document.getElementById("astInspector");
       const content = document.getElementById("astInspectorContent");
       inspector.classList.add("open");
 
-      content.innerHTML = `<div style="color: var(--text-muted);">Fetching recursive AST hierarchy for AST ID: ${astId}...</div>`;
+      content.innerHTML = `<div style="color: var(--text-muted); padding: 10px;">Fetching recursive AST hierarchy for AST ID: ${astId}...</div>`;
       const data = await apiFetch(`/api/ast/${astId}/tree?depth=${currentInspectorDepth}`);
       if (!data) {
-        content.innerHTML = `<div style="color: var(--danger);">Failed to load AST container tree.</div>`;
+        content.innerHTML = `<div style="color: var(--danger); padding: 10px;">Failed to load AST container tree.</div>`;
         return;
       }
 
-      content.innerHTML = renderAstTreeNode(data);
+      const matchInfo = (currentTargetSymbol || currentTargetTypeKey)
+        ? findMatchedContainerNode(data, currentTargetSymbol, currentTargetTypeKey)
+        : null;
+
+      let bannerHtml = "";
+      if (currentTargetSymbol) {
+        let breadcrumbHtml = `<span style="color: var(--accent); font-weight: 600;">${escapeHtml(data.name || 'Root')}</span>`;
+        if (matchInfo && matchInfo.path && matchInfo.path.length > 0) {
+          matchInfo.path.forEach(step => {
+            const stepName = step.ref_ast_name || step.rel_type_name || 'Container';
+            breadcrumbHtml += ` <span style="color: var(--text-muted); margin: 0 4px;">›</span> <span style="color: var(--text-bright); font-weight: 500;">${escapeHtml(stepName)}</span>`;
+          });
+        }
+        bannerHtml = `
+          <div class="matched-container-banner">
+            <div style="display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px;">
+              <div>
+                <span style="font-size: 12px; font-weight: 600; color: var(--text-bright);">🎯 Target Symbol: </span>
+                <code style="background: rgba(97, 175, 239, 0.18); color: var(--accent); padding: 2px 6px; border-radius: 4px; font-weight: bold; font-size: 12px;">${escapeHtml(currentTargetSymbol)}</code>
+                ${currentTargetTypeKey ? `<span class="badge" style="margin-left: 6px; font-size: 10px;">${escapeHtml(currentTargetTypeKey)}</span>` : ''}
+              </div>
+              <span style="font-size: 11px; color: var(--text-muted);">Enclosing AST: #${astId} (${escapeHtml(name || data.name || '')})</span>
+            </div>
+            <div style="margin-top: 6px; font-size: 11px; color: var(--text-muted);">
+              Hierarchy: ${breadcrumbHtml}
+            </div>
+          </div>
+        `;
+      }
+
+      content.innerHTML = bannerHtml + renderAstTreeNode(data, matchInfo ? matchInfo.container : null);
+
+      if (matchInfo) {
+        setTimeout(() => {
+          const matchedElem = document.getElementById("matchedAstContainerNode");
+          if (matchedElem) {
+            matchedElem.scrollIntoView({ behavior: 'smooth', block: 'center' });
+          }
+        }, 100);
+      }
     }
 
-    function renderAstTreeNode(node) {
+    function renderAstTreeNode(node, matchedContainer = null) {
       if (!node) return "";
       let html = `
         <div class="tree-node">
@@ -5313,10 +6311,28 @@
       if (node.containers && node.containers.length > 0) {
         html += `<div style="margin-left: 12px; margin-top: 4px;">`;
         node.containers.forEach(c => {
+          const isMatched = (matchedContainer && c === matchedContainer);
+          const matchedClass = isMatched ? "tree-node-matched" : "";
+          const matchedId = isMatched ? `id="matchedAstContainerNode"` : "";
+
+          let roleBadge = '';
+          if (isMatched) {
+            roleBadge += `<span class="badge badge-accent" style="background: var(--accent); color: #181a1f; font-weight: bold; margin-right: 6px;">🎯 Matched Container</span>`;
+          }
+          if (c.priority === 0 && (c.rel_type_name === 'C_functionproto' || node.type_name === 'C_functionproto')) {
+            roleBadge += `<span class="badge" style="background: rgba(16, 185, 129, 0.2); color: #10b981; margin-right: 4px;">Return Type</span>`;
+          } else if (c.rel_type_name === 'C_CompoundStmt' || (c.child_node && c.child_node.type_name === 'C_CompoundStmt')) {
+            roleBadge += `<span class="badge" style="background: rgba(139, 92, 246, 0.2); color: #8b5cf6; margin-right: 4px;">Function Body</span>`;
+          } else if (c.rel_type_name === 'C_TypeRef') {
+            roleBadge += `<span class="badge" style="background: rgba(234, 179, 8, 0.2); color: #eab308; margin-right: 4px;">Used Type</span>`;
+          } else if (node.type_name === 'C_functionproto' && c.priority > 0) {
+            roleBadge += `<span class="badge" style="background: rgba(59, 130, 246, 0.2); color: #3b82f6; margin-right: 4px;">Param ${c.priority}</span>`;
+          }
           html += `
-            <div style="margin-top: 3px;">
-              <span style="color: var(--accent); font-size: 11px;">↳ [Priority ${c.priority}] (${c.rel_type_name}):</span>
-              ${renderAstTreeNode(c.child_node)}
+            <div ${matchedId} class="${matchedClass}" style="margin-top: 3px;">
+              <span style="color: var(--accent); font-size: 11px;">↳ [Priority ${c.priority}] (${escapeHtml(c.rel_type_name || 'Container')}):</span>
+              ${roleBadge}
+              ${c.child_node ? renderAstTreeNode(c.child_node, matchedContainer) : `<span style="font-size: 11px; color: var(--text-bright); font-weight: 500;">${escapeHtml(c.ref_ast_name || c.rel_type_name || 'void')}</span>`}
             </div>
           `;
         });
@@ -5342,20 +6358,129 @@
     }
 
     // ------------------------------------------------------------------------
-    // Highlight Palette Manager
+    // Highlight Palette & Syntax Customizer Manager
     // ------------------------------------------------------------------------
     function openHighlightModal() {
       document.getElementById("highlightModal").classList.add("open");
       renderColorPickers();
     }
 
-    function toggleContainerColoring() {
-      containerColoringEnabled = !containerColoringEnabled;
-      const btn = document.getElementById("btnToggleContainer");
-      if (btn) {
-        if (containerColoringEnabled) btn.classList.add("btn-active");
-        else btn.classList.remove("btn-active");
+    function setHighlightLanguageTab(lang, btnElem) {
+      activeHighlightLang = lang;
+      if (btnElem && btnElem.parentElement) {
+        btnElem.parentElement.querySelectorAll(".btn").forEach(b => b.classList.remove("btn-active"));
+        btnElem.classList.add("btn-active");
       }
+      renderColorPickers();
+    }
+
+    function filterHighlightCategories() {
+      const input = document.getElementById("highlightSearchInput");
+      highlightSearchQuery = input ? input.value.trim().toLowerCase() : "";
+      renderColorPickers();
+    }
+
+    function renderColorPickers() {
+      const container = document.getElementById("colorPickerGrid");
+      if (!container) return;
+
+      const q = highlightSearchQuery;
+      const activeLang = activeHighlightLang;
+
+      // Filter entries by active language tab and search term
+      const filteredEntries = Object.entries(highlightSettings).filter(([key, config]) => {
+        const langMatches = (activeLang === "all") || (config.lang === activeLang);
+        if (!langMatches) return false;
+
+        if (!q) return true;
+        const keyMatch = key.toLowerCase().includes(q);
+        const labelMatch = config.label && config.label.toLowerCase().includes(q);
+        const groupMatch = config.group && config.group.toLowerCase().includes(q);
+        return keyMatch || labelMatch || groupMatch;
+      });
+
+      const countBadge = document.getElementById("hlActiveCategoryCount");
+      if (countBadge) {
+        countBadge.innerText = `${filteredEntries.length} Categories`;
+      }
+
+      if (filteredEntries.length === 0) {
+        container.innerHTML = `
+          <div style="padding: 30px; text-align: center; color: var(--text-muted); background: var(--bg-sidebar); border-radius: 6px; border: 1px dashed var(--border-color);">
+            No syntax categories match filter "<strong>${escapeHtml(q)}</strong>".
+          </div>
+        `;
+        return;
+      }
+
+      // Group entries by group property
+      const grouped = {};
+      filteredEntries.forEach(([key, config]) => {
+        const groupName = config.group || "Other AST Elements";
+        if (!grouped[groupName]) grouped[groupName] = [];
+        grouped[groupName].push([key, config]);
+      });
+
+      let html = "";
+      for (const [groupName, items] of Object.entries(grouped)) {
+        html += `
+          <div class="highlight-group-section" style="background: var(--bg-card); border: 1px solid var(--border-color); border-radius: 6px; padding: 12px;">
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; border-bottom: 1px solid var(--border-color); padding-bottom: 6px;">
+              <h4 style="margin: 0; font-size: 13px; color: var(--accent); display: flex; align-items: center; gap: 6px;">
+                <span>📂</span> ${escapeHtml(groupName)}
+              </h4>
+              <span class="badge" style="font-size: 10px;">${items.length} items</span>
+            </div>
+            <div class="color-grid">
+        `;
+
+        items.forEach(([key, config]) => {
+          html += `
+            <div class="color-card" id="hlcard_${escapeHtml(key)}" style="border-left: 3px solid ${config.color};">
+              <label style="flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; margin-right: 6px;" title="${escapeHtml(config.label || key)} (${escapeHtml(key)})">
+                <input type="checkbox" ${config.enabled !== false ? 'checked' : ''} onchange="toggleHighlightCategory('${escapeHtml(key)}', this.checked)">
+                <span style="font-weight: 500; font-size: 12px; color: var(--text-bright);">${escapeHtml(config.label || key)}</span>
+              </label>
+              <div style="display: flex; align-items: center; gap: 6px;">
+                <span style="font-family: monospace; font-size: 10px; color: var(--text-muted);">${escapeHtml(config.color)}</span>
+                <input type="color" class="color-picker" value="${config.color}" onchange="changeHighlightColor('${escapeHtml(key)}', this.value)" title="Change color for ${escapeHtml(key)}">
+              </div>
+            </div>
+          `;
+        });
+
+        html += `
+            </div>
+          </div>
+        `;
+      }
+
+      container.innerHTML = html;
+    }
+
+    function toggleHighlightCategory(key, enabled) {
+      if (highlightSettings[key]) {
+        highlightSettings[key].enabled = enabled;
+      }
+      localStorage.setItem("kernelinfo_hl_settings", JSON.stringify(highlightSettings));
+      refreshActiveFileSyntaxHighlighting();
+    }
+
+    function changeHighlightColor(key, color) {
+      if (highlightSettings[key]) {
+        highlightSettings[key].color = color;
+        const card = document.getElementById(`hlcard_${key}`);
+        if (card) {
+          card.style.borderLeftColor = color;
+          const labelSpan = card.querySelector("span[style*='font-family: monospace']");
+          if (labelSpan) labelSpan.innerText = color;
+        }
+      }
+      localStorage.setItem("kernelinfo_hl_settings", JSON.stringify(highlightSettings));
+      refreshActiveFileSyntaxHighlighting();
+    }
+
+    function refreshActiveFileSyntaxHighlighting() {
       if (openTabs[activeTabIndex] && openTabs[activeTabIndex].type !== "directory") {
         const currentData = openTabs[activeTabIndex].data;
         if (currentData && currentData.tags) {
@@ -5364,91 +6489,52 @@
       }
     }
 
-    function renderColorPickers() {
-      const container = document.getElementById("colorPickerGrid");
-      let html = `
-        <div style="grid-column: 1 / -1; margin-bottom: 8px;">
-          <h4 style="margin: 0 0 4px 0; color: var(--accent);">Container Hierarchy Depth Colors (Container Items Only)</h4>
-          <p style="margin: 0 0 10px 0; font-size: 12px; color: var(--text-muted);">
-            Hierarchical color palette applied strictly to items inside AST containers (Level 0 = Root Struct/Compound [Color A], Level 1 = Members [Color B], Level 2 = Params/Return Types [Color C], etc.)
-          </p>
-        </div>
-      `;
-
-      html += containerDepthPalette.map((entry, idx) => {
-        return `
-          <div class="color-card" style="border-left: 3px solid ${entry.color};">
-            <label>
-              <span><strong>${entry.label}</strong></span>
-            </label>
-            <input type="color" class="color-picker" value="${entry.color}" onchange="changeContainerDepthColor(${idx}, this.value)">
-          </div>
-        `;
-      }).join("");
-
-      html += `
-        <div style="grid-column: 1 / -1; margin-top: 14px; margin-bottom: 8px; border-top: 1px solid var(--border); padding-top: 12px;">
-          <h4 style="margin: 0 0 4px 0; color: var(--text-bright);">Syntax Category Colors (Non-Container & Standalone Items)</h4>
-          <p style="margin: 0 0 10px 0; font-size: 12px; color: var(--text-muted);">
-            Colors for comments, keywords, macros, preprocessors, and uncontained syntax tokens.
-          </p>
-        </div>
-      `;
-
-      html += Object.entries(highlightSettings).map(([key, config]) => {
-        return `
-          <div class="color-card">
-            <label>
-              <input type="checkbox" ${config.enabled ? 'checked' : ''} onchange="toggleHighlightCategory('${key}', this.checked)">
-              <span>${config.label || key}</span>
-            </label>
-            <input type="color" class="color-picker" value="${config.color}" onchange="changeHighlightColor('${key}', this.value)">
-          </div>
-        `;
-      }).join("");
-
-      container.innerHTML = html;
-    }
-
-    function changeContainerDepthColor(idx, color) {
-      if (containerDepthPalette[idx]) {
-        containerDepthPalette[idx].color = color;
-      }
-    }
-
-    function toggleHighlightCategory(key, enabled) {
-      if (highlightSettings[key]) highlightSettings[key].enabled = enabled;
-    }
-
-    function changeHighlightColor(key, color) {
-      if (highlightSettings[key]) highlightSettings[key].color = color;
-    }
-
     function initHighlightManager() {
-      typeDescriptors.forEach(td => {
-        if (!highlightSettings[td.name]) {
-          highlightSettings[td.name] = { color: "#61afef", enabled: true, label: td.name };
-        }
-      });
+      if (Array.isArray(typeDescriptors)) {
+        typeDescriptors.forEach(td => {
+          if (!highlightSettings[td.name]) {
+            let lang = "c";
+            let group = "General Identifiers";
+            let color = "#abb2bf";
+            if (td.name.startsWith("CPPro_")) {
+              lang = "cppro";
+              group = "Preprocessor Directives";
+              color = "#d19a66";
+            } else if (td.name.startsWith("ASM_")) {
+              lang = "asm";
+              group = "Assembly Directives & Instructions";
+              color = "#e06c75";
+            } else if (td.name.startsWith("Kconfig_")) {
+              lang = "kconfig";
+              group = "Kconfig Constructs";
+              color = "#61afef";
+            } else if (td.name.startsWith("Maintainer_") || td.name.startsWith("Credits_")) {
+              lang = "kconfig";
+              group = "Maintainers & Credits";
+              color = "#98c379";
+            } else if (td.name.startsWith("Rust_")) {
+              lang = "c";
+              group = "Compound Types & Declarations";
+              color = "#e5c07b";
+            }
+            highlightSettings[td.name] = { color: color, enabled: true, label: td.name, lang: lang, group: group };
+          }
+        });
+      }
     }
 
     function closeHighlightModal() {
       document.getElementById("highlightModal").classList.remove("open");
       localStorage.setItem("kernelinfo_hl_settings", JSON.stringify(highlightSettings));
-      localStorage.setItem("kernelinfo_container_palette", JSON.stringify(containerDepthPalette));
-      // Re-render active code view
-      if (openTabs[activeTabIndex] && openTabs[activeTabIndex].type !== "directory") {
-        const currentData = openTabs[activeTabIndex].data;
-        if (currentData && currentData.tags) {
-          buildHighlightedSource(currentData.tags);
-        }
-      }
+      refreshActiveFileSyntaxHighlighting();
     }
 
     function resetHighlightDefaults() {
       highlightSettings = JSON.parse(JSON.stringify(defaultHighlightSettings));
-      containerDepthPalette = JSON.parse(JSON.stringify(defaultContainerDepthPalette));
+      localStorage.removeItem("kernelinfo_hl_settings");
+      localStorage.removeItem("kernelinfo_container_palette");
       renderColorPickers();
+      refreshActiveFileSyntaxHighlighting();
     }
 
     // ------------------------------------------------------------------------
@@ -8669,11 +9755,29 @@
         </tr>
       `).join("");
 
+      const fnsHtml = (data.functions_using_type || []).map(f => `
+        <div style="background: rgba(0,0,0,0.25); border: 1px solid var(--border-color); border-radius: 4px; padding: 8px 10px; margin-bottom: 6px; display: flex; justify-content: space-between; align-items: center;">
+          <div>
+            <span class="badge" style="background: rgba(139, 92, 246, 0.2); color: #8b5cf6;">${escapeHtml(f.fn_type || 'Function')}</span>
+            <strong style="color: var(--text-bright); margin-left: 6px;">${escapeHtml(f.fn_name)}()</strong>
+            <div style="font-size: 11px; color: var(--text-muted); margin-top: 2px;"><code>${escapeHtml(f.file_path)}</code> : lines ${f.line_s} - ${f.line_e}</div>
+          </div>
+          <button class="btn btn-sm" style="padding: 3px 8px; font-size: 11px;" onclick="closeXrefModal(); openPathAndHighlightLine('${escapeJs(f.file_path)}', ${f.line_s}, ${f.line_e});">Jump to Function ➔</button>
+        </div>
+      `).join("");
+
       area.innerHTML = `
         <div style="margin-bottom: 16px;">
           <h4 style="font-size: 13px; color: #98c379; margin-bottom: 8px;">Definitions (${data.definitions_count})</h4>
           ${defsHtml || '<div style="color: var(--text-muted); font-size: 12px;">No primary AST definition found in active kernel release.</div>'}
         </div>
+
+        ${data.functions_using_type && data.functions_using_type.length > 0 ? `
+        <div style="margin-bottom: 16px;">
+          <h4 style="font-size: 13px; color: #c678dd; margin-bottom: 8px;">Functions Using This Type (${data.functions_using_type.length})</h4>
+          ${fnsHtml}
+        </div>
+        ` : ''}
 
         <div>
           <h4 style="font-size: 13px; color: #61afef; margin-bottom: 8px;">Global Usages &amp; References (${data.references_count})</h4>

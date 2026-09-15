@@ -98,12 +98,19 @@ class TECachedDB(TEDirectDB):
     def _project_row(cls, table: Table, row: tuple[SafeDataType, ...]) -> tuple[SafeDataType, ...]:
         """Project row to only retain configured cached columns, substituting un-cached with None."""
         cached_cols = getattr(table, "cached_columns", None)
+        cols_def = table.init_columns
         if cached_cols is None or len(cached_cols) == table.length:
-            if any(isinstance(val, (bytearray, memoryview)) for val in row):
-                return tuple(bytes(val) if isinstance(val, (bytearray, memoryview)) else val for val in row)
-            return row
-        sanitized = tuple(bytes(val) if isinstance(val, (bytearray, memoryview)) else val for val in row)
-        return tuple(sanitized[i] if i in cached_cols else None for i in range(table.length))
+            return tuple(
+                (bytes(val) if isinstance(val, (bytearray, memoryview))
+                 else (val.encode("latin1") if isinstance(val, str) and cols_def[i][1].upper().startswith("BINARY") else val))
+                for i, val in enumerate(row)
+            )
+        return tuple(
+            (bytes(row[i]) if isinstance(row[i], (bytearray, memoryview))
+             else (row[i].encode("latin1") if isinstance(row[i], str) and cols_def[i][1].upper().startswith("BINARY") else row[i]))
+            if i in cached_cols else None
+            for i in range(table.length)
+        )
 
     @classmethod
     def _reconstruct_partial_row(
@@ -114,9 +121,14 @@ class TECachedDB(TEDirectDB):
     ) -> tuple[SafeDataType, ...]:
         """Reconstruct full canonical row of length table.length from a column-projected query result."""
         full_row = [None] * table.length
+        cols_def = table.init_columns
         for idx, col_pos in enumerate(cached_cols):
             val = selected_row[idx]
-            full_row[col_pos] = bytes(val) if isinstance(val, (bytearray, memoryview)) else val
+            if isinstance(val, (bytearray, memoryview)):
+                val = bytes(val)
+            elif isinstance(val, str) and cols_def[col_pos][1].upper().startswith("BINARY"):
+                val = val.encode("latin1")
+            full_row[col_pos] = val
         return tuple(full_row)
 
     @staticmethod
@@ -228,6 +240,7 @@ class TECachedDB(TEDirectDB):
         """
         super().start_new_db(db)
         self.clear_cache()
+        self.update_in_mem_indexes = True
 
         min_active_vid = self._get_min_active_vid()
 
@@ -411,7 +424,18 @@ class TECachedDB(TEDirectDB):
             Complete resolved row tuple.
         """
         table = self.tables[table_id]
-        if not self._is_cached(table) or not self.update_in_mem_indexes:
+        if not self._is_cached(table):
+            return super().set(table_id, columns)
+
+        if not self.update_in_mem_indexes:
+            if table.primary and not table.no_duplicate and columns[0] is not None:
+                pk_fn = self._pk_getters.get(table_id)
+                pk = self._sanitize_key(pk_fn(columns) if pk_fn is not None else itemgetter(*table.primary)(columns))
+                existing_row = self._pk_index.get(table_id, {}).get(pk)
+                if existing_row is not None:
+                    proj_row = self._project_row(table, columns)
+                    if existing_row == proj_row:
+                        return columns
             return super().set(table_id, columns)
 
         self._ensure_table(table_id)
@@ -562,4 +586,5 @@ class TECachedDB(TEDirectDB):
     def close(self) -> None:
         """Safely clean up in-memory cache structures and close DB connection."""
         self.clear_cache()
+        self.update_in_mem_indexes = True
         super().close()

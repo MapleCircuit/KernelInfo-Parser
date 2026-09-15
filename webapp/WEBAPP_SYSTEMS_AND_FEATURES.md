@@ -13,15 +13,15 @@ The KernelInfo-Parser Web Application is a high-performance developer introspect
 |                                                CLIENT BROWSER                                                 |
 |           Single-Page Application (Vanilla HTML5 / CSS3 / ES2022 JavaScript - Zero Dependencies)              |
 |                                                                                                               |
-|  +---------------------+  +---------------------+  +---------------------+  +-------------------------------+ |
-|  | Explorer & AST      |  | Kconfig Web GUI     |  | Terminal TUI        |  | Subsystems & Maintainers Hub  | |
-|  | - File Tree Sidebar |  | - Dual Mode (Drill/ |  | - Keyboard Nav      |  | - Subsystem Roster Grid       | |
-|  | - Token Resolution  |  |   Full Tree)        |  | - ANSI Dialogs      |  | - Maintainers & Reviewers     | |
-|  | - Line Linking/Hash |  | - 20-Pass Solver    |  | - Hotkeys (Y/N/M/?) |  | - Pattern Matching Engine     | |
-|  | - 6-Level Container |  | - Target Profile    |  | - Defconfig Selector|  | - Matching Files Table        | |
-|  | - Git Blame Gutter  |  | - Defconfig Loader  |  | - Search (/ )       |  | - CREDITS Cross-Reference     | |
-|  | - #if Folding Scope |  | - Import / Export   |  | - Profile Dialog    |  | - Section Detail Workspace/Mod| |
-|  +---------------------+  +---------------------+  +---------------------+  +-------------------------------+ |
+|  +---------------------------+  +---------------------------+  +-------------------------+  +-------------------------------+ |
+|  | Explorer & AST            |  | Kconfig Web GUI           |  | Terminal TUI            |  | Subsystems & Maintainers Hub  | |
+|  | - File Tree Sidebar       |  | - Dual Mode (Drill/Full)  |  | - Keyboard Nav          |  | - Subsystem Roster Grid       | |
+|  | - Token Resolution        |  | - 20-Pass Solver          |  | - ANSI Dialogs          |  | - Maintainers & Reviewers     | |
+|  | - Line Linking/Hash       |  | - Target Profile          |  | - Hotkeys (Y/N/M/?)     |  | - Pattern Matching Engine     | |
+|  | - Semantic AST Highlighting |  | - Call Graph Inspector    |  | - Defconfig Selector    |  | - Matching Files Table        | |
+|  | - Git Blame Annotations   |  | - Memory Hole Packing     |  | - Search & Autocomplete |  | - Contributor Bios & Rosters  | |
+|  | - #if Conditional Folding |  | - Import / Export         |  | - Symbol Auto-Solve     |  | - Direct Maintainer Matching  | |
+|  +---------------------------+  +---------------------------+  +-------------------------+  +-------------------------------+ |
 |  +---------------------+  +---------------------+  +---------------------+  +-------------------------------+ |
 |  | Credits Directory   |  | Commit Timeline     |  | Cross-Version Diff  |  | Patch Matcher & Studio        | |
 |  | - Credited Bios     |  | - Top 10 Ranking    |  | - File Tree Diff    |  | - get_maintainer.pl Matcher   | |
@@ -424,9 +424,8 @@ The client manages centralized state in JavaScript memory:
 | `activeTabIndex` | `number` | Index of the currently focused tab in `openTabs`. |
 | `selectedAstId` | `number \| null` | Focused AST node in AST Container Inspector. |
 | `currentInspectorDepth` | `number` | Depth slider value for recursive AST hierarchy tree (1 to 10). |
-| `highlightSettings` | `Record<string, { color, enabled }>` | Syntax category color palette with visibility toggles. |
-| `containerDepthPalette` | `Array<string>` | 6-level hierarchical color palette (`Color A` through `Color F`) applied to container items. |
-| `containerColoringEnabled` | `boolean` | Toggle state for AST container depth coloring. |
+| `highlightSettings` | `Record<string, { color, enabled, label, lang, group }>` | Semantic syntax category color palette with language tags and group classifications. |
+| `activeHighlightLang` | `string` | Active language filter tab (`"all"`, `"c"`, `"cppro"`, `"asm"`, `"kconfig"`). |
 | `cpproHighlightEnabled` | `boolean` | Toggle state for `#if`/`#ifdef`/`#elif`/`#else` conditional scope highlighting. |
 | `blameViewEnabled` | `boolean` | Toggle state for interactive Git Blame line annotations in the code gutter. |
 | `kconfigTreeData` | `Array<KconfigNode>` | Complete hierarchical Kconfig tree data for the active architecture. |
@@ -522,17 +521,36 @@ The frontend features **20 dedicated workspace views** and **21 tab types**:
 
 #### Highlighting & Token Resolution Algorithm (`buildHighlightedSource` & `highlightLineText`)
 - **Outer Tag Isolation**: Sorts tags by `line_s` ASC, `char_s` ASC, and span length DESC to identify primary outermost base lines.
-- **Innermost Token Winning Rule**: For each character column on a line, evaluates all overlapping spatial coordinate maps (`m_map_ast` and `m_bridge_tag`), assigning token ownership to the innermost (smallest character span) AST construct.
-- **Contiguous Run Compression**: Groups characters sharing the same winning AST token into a single HTML `<span>` tag, preventing DOM fragmentation and ensuring fast rendering.
-- **6-Level Container Depth Hierarchy Coloring**:
-  - Distinguishes between standalone syntax tokens and nested container elements (`m_ast_container`).
-  - Applies deterministic depth colors:
-    - **Level 0 (Color A - `#e5c07b`)**: Outer Structs and Compound blocks.
-    - **Level 1 (Color B - `#61afef`)**: Members and Function Prototypes.
-    - **Level 2 (Color C - `#98c379`)**: Parameters and Return Types.
-    - **Level 3 (Color D - `#c678dd`)**: Inner Qualifiers and Types.
-    - **Level 4 (Color E - `#56b6c2`)**: Deep Nested Types.
-    - **Level 5 (Color F - `#e06c75`)**: Level 5+ Containers.
+- **Client-Side Lexical Syntax Tokenizer (`lexCLine`)**:
+  - High-performance, single-pass lexical scanner that analyzes every source line into discrete tokens (keywords, storage classes, primitive types, struct/union/enum declarations, identifiers, member references, function calls, numeric/hex constants, string/char literals, operators, and preprocessor directives).
+  - Maintains state across multi-line block comments (`/* ... */`).
+  - Differentiates member accesses (`.` and `->`) to highlight member fields in Coral/Red (`#e06c75`).
+  - Differentiates function names/calls (`foo(...)`) in Blue (`#61afef`).
+  - Identifies uppercase macros/constants in Amber (`#d19a66`).
+  - Maps preprocessor directives (`#include`, `#define`, `#if`, `#ifdef`, etc.) and header strings (`<...>`, `"..."`).
+- **Sub-Token Semantic Coloring Inside Functions & Structs**:
+  - Eliminates monochromatic parent blocks: in constructs such as `struct s { int a; }` or function bodies, `struct s` receives struct styling, `int` is styled as a primitive type (`#56b6c2`), and `a` is styled as a member/identifier rather than uniformly inheriting the parent tag's type.
+  - Sub-tokens retain the enclosing AST parent tag's context (`ast_id`, `ast_name`, `type_name`) so clicking still opens the AST Inspector (`inspectAst()`).
+- **Innermost Spatial Token Resolution**:
+  - For each lexical token, resolves overlapping spatial coordinate maps (`m_map_ast` and `m_bridge_tag`). If a specific child map is found, its construct type takes priority over the lexical default.
+- **Dual-Context Rich Tooltips**:
+  - Displays both fine-grained token classification and enclosing AST node metadata: `Token: <token_label> (<typeKey>) • AST: <ast_name> (<type_name>)`.
+- **Comprehensive Semantic AST Syntax Highlighting**:
+  - Full construct-specific syntax coloring mapped directly to `ASTT` enum construct categories across all supported languages (C/C++, Preprocessor, Assembly, Kconfig, and Maintainers).
+  - Uses the **One Dark Pro** palette as standard:
+    - **Keywords & Control Flow (`#c678dd`)**: `C_Keyword`, `C_IfStmt`, `C_SwitchStmt`, `C_WhileStmt`, `C_ForStmt`, `C_ReturnStmt`, etc.
+    - **Compound Types & Declarations (`#e5c07b`)**: `C_struct`, `C_structdecl`, `C_union`, `C_enum`, `C_enumdecl`.
+    - **Primitive Types (`#56b6c2`)**: `C_void`, `C_int`, `C_char`, `C_short`, `C_long`, `C_bool`, `C_float`, `C_double`, `C_signed`, `C_unsigned`, kernel typedefs (`u8`, `u16`, `u32`, `u64`, `atomic_t`, etc.).
+    - **Storage Classes & Specifiers (`#c678dd`)**: `C_SCstatic`, `C_SCextern`, `C_SCtypedef`, `C_FSinline`, `C_AS__Alignas`.
+    - **Type Qualifiers (`#e5c07b`)**: `C_Qconst`, `C_Qvolatile`, `C_Qrestrict`, `C_Q_Atomic`.
+    - **Functions & Prototypes (`#61afef`)**: `C_functionproto`, `C_functionprotodecl`, `C_CallExpr`.
+    - **Pointers & Operators (`#56b6c2` / `#abb2bf`)**: `C_pointer`, `C_BinaryOperator`, `C_UnaryOperator`.
+    - **Member References (`#e06c75`)**: `C_MemberRefExpr` (`.` and `->`).
+    - **Literals & Constants (`#98c379` / `#d19a66`)**: `C_Literal_String` (strings/characters), `C_Literal_Number` (numbers/hex/floats).
+    - **Preprocessor & Conditionals (`#d19a66` / `#98c379` / `#e06c75`)**: `CPPro_define`, `CPPro_include`, `CPPro_if`, `CPPro_ifdef`, `CPPro_else`, `CPPro_error`.
+    - **Comments (`#5c6370`)**: `C_Comment`, `ASM_Comment`.
+    - **Assembly (`#d19a66` / `#61afef` / `#e5c07b`)**: `ASM_Macro`, `ASM_Directive`, `ASM_Instruction`, `ASM_Label`.
+    - **Kconfig Constructs (`#61afef` / `#e5c07b` / `#98c379` / `#c678dd`)**: `Kconfig_Menu`, `Kconfig_Config`, `Kconfig_Source`, `Kconfig_Depends_On`.
 - **Kconfig Symbol Auto-Linking**: Uses regular expressions (`\bCONFIG_([A-Za-z0-9_]+)\b`) to automatically detect configuration symbols within comments, macros, and source code, rendering clickable interactive chips that open the Kconfig Symbol Modal.
 - **CPPro Conditional Scope Folding & Highlighting**:
   - Identifies multi-line `#if`, `#ifdef`, `#ifndef`, `#elif`, `#else`, and `#endif` blocks.
@@ -650,7 +668,7 @@ The application provides **25 specialized modals** accessible via toolbars, hotk
 | `#fileHistoryModal` | `📜 File Revision Timeline` | Clicking `(Modified in v3.0)` badge in file header | Complete version lifespan table, inception release, concluding release, change status badges, open in version links. |
 | `#kconfigImportModal` | `📥 Import Linux Kernel .config File` | Toolbar `Import .config` button | File picker (`FileReader`), raw text input area, parse and batch-apply symbol values. |
 | `#kconfigExportModal` | `💾 Export Kernel-Compatible .config` | Toolbar `Export .config` button / `< Save >` | Linux `.config` syntax generator, 1-click copy to clipboard, download `.config` file. |
-| `#highlightModal` | `Highlight Color Palette & Visibility Manager` | Palette button in editor toolbar | Color pickers for 100+ construct types, visibility checkboxes, 6-level container depth color customizer, reset defaults. |
+| `#highlightModal` | `Highlight Color Palette & Visibility Manager` | Top nav / editor toolbar `🎨 Syntax Palette` button | Tabbed multi-language customizer (All, C, CPPro, ASM, Kconfig), grouped category sections, search/filter box, live swatches, visibility checkboxes, reset defaults. |
 | `#devModal` | `⚙️ Developer Introspection & Endpoint Runner` | Dev button in bottom footer | 25 database table row counts, IndexedDB cache stats, clear IDB cache, interactive API endpoint parameter runner. |
 | `#subsystemModal` | `🏷️ Subsystem Details` | Clicking subsystem title or maintainer badge | Maintainers/reviewers rosters, mailing list, SCM tree, web page, pattern rules, matching repository files table. |
 | `#personModal` | `👤 Developer & Contributor Profile` | Clicking developer avatar or maintainer name | Bio, CREDITS cross-reference (`⭐`), Git contribution counters, Latest Patch spotlight, maintained subsystems roster. |

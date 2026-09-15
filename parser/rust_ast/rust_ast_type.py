@@ -106,23 +106,31 @@ class Ast_Rust:
         symbol_name = self.get_symbol_name()
         type_id = int(self.ast_type)
 
-        with CS(REF_POS):
-            CS.store(m_ast.view(
-                ((m_ast.ast_id,),),
-                None,
-                symbol_name,
-                type_id,
-            ))
-            ast_ref = ((m_ast.table_id, 0), OP_REF, (REF_POS, CS.route[-1]))
+        child_refs = [child.extract_ast_node(CS) for child in self.children]
 
-        for priority, child in enumerate(self.children):
-            child_ref = child.extract_ast_node(CS)
-            CS.store(m_ast_container.set(
-                ast_ref,
-                priority,
-                int(child.ast_type),
-                child_ref,
-            ))
+        if child_refs:
+            container_payload = []
+            for priority, (child, child_ref) in enumerate(zip(self.children, child_refs)):
+                container_payload.extend([None, priority, int(child.ast_type), child_ref])
+
+            with CS(REF_POS):
+                CS.store(m_ast.view(
+                    ((m_ast.ast_id, m_ast_container.ast_id, len(child_refs)),),
+                    None,
+                    symbol_name,
+                    type_id,
+                    *container_payload,
+                ))
+                ast_ref = ((m_ast.table_id, 0), OP_REF, (REF_POS, CS.route[-1]))
+        else:
+            with CS(REF_POS):
+                CS.store(m_ast.view(
+                    ((m_ast.ast_id,),),
+                    None,
+                    symbol_name,
+                    type_id,
+                ))
+                ast_ref = ((m_ast.table_id, 0), OP_REF, (REF_POS, CS.route[-1]))
 
         return ast_ref
 
@@ -187,7 +195,7 @@ class Ast_Rust:
                         self.map_ast(CS, ast_ref, tag[1], self.extent)
                         return
 
-        from parser.c_ast.c_ast import match_prior_tag_transition
+        from parser.c_ast import match_prior_tag_transition
         s_tag_id = match_prior_tag_transition(CS, self.extent, getattr(self, "name", None), getattr(self, "type", None))
 
         # New Tag Creation

@@ -119,6 +119,7 @@ class MasterFile:
         ]
 
         gp.Change_List = sp.run(command, capture_output=True, text=True).stdout.splitlines()  # noqa: PLW1510, S603
+        gp._changed_paths_set = set(item.split("\t")[-1] for item in gp.Change_List if item)
         return gp.Change_List
 
     def git_file_list(self, version: str) -> str:

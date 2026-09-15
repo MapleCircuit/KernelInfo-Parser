@@ -1051,6 +1051,63 @@ class TestTECachedDBIntegrity(unittest.TestCase):
         self.assertIsNotNone(got_row_ba)
         self.assertEqual(got_row_ba[0], expected_h)
 
+    def test_update_in_mem_indexes_lifecycle_and_explicit_pk_guard(self) -> None:
+        """Verify update_in_mem_indexes resets across lifecycles and explicit PK tables prevent duplicate staging."""
+        import hashlib
+        from core.DBLayout import Table
+
+        fake_tbl = Table(
+            table_id=892,
+            table_name="m_fake_lifecycle_pk",
+            columns=(
+                ("hash", "BINARY(32)", "NOT NULL"),
+                ("code", "LONGTEXT", "NOT NULL"),
+            ),
+            primary=("hash",),
+            te_cached=("hash",),
+        )
+
+        h1 = hashlib.sha256(b"code_content_1").digest()
+        h2 = hashlib.sha256(b"code_content_2").digest()
+
+        class MockDBWithData(MockDB):
+            def select_preload(self, table, cached_columns=None, min_vid=None):
+                # Return string for h1 (like MariaDB null bytes) and bytearray for h2
+                return [
+                    (h1.decode("latin1"),),
+                    (bytearray(h2),),
+                ]
+
+        self.te.start([fake_tbl], MockDBWithData)
+        self.assertTrue(self.te.update_in_mem_indexes)
+
+        # Verify both hashes are in _pk_index as bytes
+        self.assertIn(h1, self.te._pk_index[fake_tbl.table_id])
+        self.assertIn(h2, self.te._pk_index[fake_tbl.table_id])
+
+        # 1. Normal set with update_in_mem_indexes=True does not stage existing PK
+        self.te.set(fake_tbl.table_id, (h1, "code_content_1"))
+        self.assertNotIn(h1, self.te.queued_set[fake_tbl.table_id])
+
+        # 2. Set with update_in_mem_indexes=False also does NOT stage existing PK
+        self.te.update_in_mem_indexes = False
+        self.te.set(fake_tbl.table_id, (h2, "code_content_2"))
+        self.assertNotIn(h2, self.te.queued_set[fake_tbl.table_id])
+
+        # 3. New unseen PK IS staged
+        h3 = hashlib.sha256(b"code_content_3").digest()
+        self.te.set(fake_tbl.table_id, (h3, "code_content_3"))
+        self.assertIn(h3, self.te.queued_set[fake_tbl.table_id])
+
+        # 4. start_new_db resets update_in_mem_indexes to True
+        self.te.start_new_db(MockDBWithData)
+        self.assertTrue(self.te.update_in_mem_indexes)
+
+        # 5. close() resets update_in_mem_indexes to True
+        self.te.update_in_mem_indexes = False
+        self.te.close()
+        self.assertTrue(self.te.update_in_mem_indexes)
+
     def test_version_scoped_table_schema_configuration(self) -> None:
         """Verify Table supports version_scoped across bool, dict, and tuple te_cached configurations."""
         # 1. Standalone keyword
@@ -1346,6 +1403,482 @@ class TestDBAndTEIntegration(unittest.TestCase):
         for v in (1, 2, 3):
             row = self.db.select(fake_tbl_cached_bridge, (v, fnid, None))
             self.assertEqual(row, (v, fnid, fid))
+
+    def test_tablehandling_astt_sanitization(self) -> None:
+        """Verify TableHandling strictly sanitizes ASTT enums to SafeDataType before reaching TE/DB."""
+        from core.globalstuff import ASTT, REF_FILE
+        from core.TableHandling import to_safe_data, normalize_data_tuple, ChangeSet
+        from core.DBLayout import m_ast
+
+        # 1. to_safe_data unwrap test
+        self.assertIs(type(to_safe_data(ASTT.C_struct)), int)
+        self.assertEqual(to_safe_data(ASTT.C_struct), int(ASTT.C_struct))
+        self.assertIs(type(to_safe_data(ASTT.C_structnotbind)), int)
+
+        # 2. normalize_data_tuple test
+        tup = (None, "task_struct", ASTT.C_struct)
+        normalized = normalize_data_tuple(tup)
+        self.assertIs(type(normalized[2]), int)
+        self.assertEqual(normalized[2], int(ASTT.C_struct))
+
+        # 3. ChangeSet resolve_ref fast-path with REF_FILE & ASTT
+        old_te = G.TE
+        G.TE = self.te
+        try:
+            if m_ast.table_id not in self.te.tables:
+                self.te.tables[m_ast.table_id] = m_ast
+                self.te.queued_set[m_ast.table_id] = {}
+                self.te.next_id[m_ast.table_id] = 1
+
+            cs = ChangeSet("A\ttest.c")
+            route = (REF_FILE, "include/linux/sched.h", "task_struct", ASTT.C_struct)
+            resolved = cs.resolve_ref((m_ast.table_id, 0), route)
+            self.assertIsNotNone(resolved)
+            self.assertIs(type(resolved), int)
+
+            # Verify that any staged row in TE has SafeDataType (int, not ASTT)
+            staged = self.te.queued_set[m_ast.table_id]
+            for val in staged.values():
+                if isinstance(val, tuple):
+                    for col in val:
+                        self.assertNotIsInstance(col, ASTT)
+        finally:
+            G.TE = old_te
+
+    def test_order_changed_files_dag(self) -> None:
+        """Verify order_changed_files prioritizes headers and resolves include dependencies."""
+        from main import order_changed_files
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Create files: a.h includes b.h; c.c includes a.h; d.h has circular include with e.h
+            inc_dir = os.path.join(tmpdir, "include")
+            os.makedirs(inc_dir, exist_ok=True)
+            src_dir = os.path.join(tmpdir, "kernel")
+            os.makedirs(src_dir, exist_ok=True)
+
+            with open(os.path.join(inc_dir, "b.h"), "w") as f:
+                f.write("// Base header b.h\nstruct B { int b; };\n")
+            with open(os.path.join(inc_dir, "a.h"), "w") as f:
+                f.write('#include "b.h"\nstruct A { struct B b; };\n')
+            with open(os.path.join(inc_dir, "d.h"), "w") as f:
+                f.write('#include "e.h"\n')
+            with open(os.path.join(inc_dir, "e.h"), "w") as f:
+                f.write('#include "d.h"\n')
+            with open(os.path.join(src_dir, "main.c"), "w") as f:
+                f.write('#include "a.h"\nint main() { return 0; }\n')
+
+            files = [
+                "M\tkernel/main.c",
+                "M\tinclude/a.h",
+                "M\tinclude/d.h",
+                "M\tinclude/e.h",
+                "M\tinclude/b.h",
+            ]
+            ordered = order_changed_files(files, tmpdir)
+            ordered_paths = [x.split("\t")[-1] for x in ordered]
+
+            # All headers must come before main.c
+            self.assertEqual(ordered_paths[-1], "kernel/main.c")
+            # b.h must come before a.h
+            self.assertLess(ordered_paths.index("include/b.h"), ordered_paths.index("include/a.h"))
+            # Both cyclic headers must be included
+            self.assertIn("include/d.h", ordered_paths)
+            self.assertIn("include/e.h", ordered_paths)
+
+    def test_tablehandling_out_of_order_execution(self) -> None:
+        """Verify ChangeSet executes resolvable operations out-of-order past deferred references."""
+        from core.TableHandling import ChangeSet
+        from core.DBLayout import m_ast, m_file_name
+        from core.globalstuff import ASTT, REF_FILE, REF_POS
+        from core.GreatProcessor import GreatProcessor
+
+        old_te = G.TE
+        from core.DBLayout import m_ast, m_ast_hash, m_ast_container, m_file_name
+        old_te = G.TE
+        G.TE = self.te
+        try:
+            for tbl in (m_ast, m_ast_hash, m_ast_container, m_file_name):
+                if tbl.table_id not in self.te.tables:
+                    self.te.tables[tbl.table_id] = tbl
+                    self.te.queued_set[tbl.table_id] = {}
+                    self.te.next_id[tbl.table_id] = 1
+
+            mock_gp = GreatProcessor()
+            mock_gp.init_cs_dict()
+
+            # Create foreign ChangeSet that is active but not processed
+            foreign_cs = ChangeSet("A\tforeign.h")
+            foreign_cs.gp = mock_gp
+            mock_gp.ChangeSet_Dict["foreign.h"] = foreign_cs
+
+            # Create consumer ChangeSet
+            consumer_cs = ChangeSet("A\tconsumer.c")
+            consumer_cs.gp = mock_gp
+
+            # Op 0: Resolvable m_file_name insert
+            consumer_cs.store(m_file_name.set(None, "consumer.c"))
+            # Op 1: Unresolvable REF_FILE pointing to symbol in incomplete foreign.h
+            with consumer_cs("op1"):
+                ref_tuple = consumer_cs.ref(m_ast.ast_id, REF_FILE, "foreign.h", "unresolved_struct", int(ASTT.C_struct))
+                consumer_cs.store(m_ast.view(((m_ast.ast_id, m_ast_container.ast_id, 1),), None, "local_alias", int(ASTT.C_TypeRef), None, 0, int(ASTT.C_TypeRef), ref_tuple))
+            # Op 2: Resolvable independent m_ast insert defining a published symbol
+            with consumer_cs("op2"):
+                consumer_cs.store(m_ast.view(((m_ast.ast_id,),), None, "independent_func", int(ASTT.C_functionproto)))
+            consumer_cs.symbol_dict[("independent_func", int(ASTT.C_functionproto))] = 2
+
+            # Execute: should return False (since op 1 is unresolvable), but op 0 and op 2 must execute!
+            success = consumer_cs.execute()
+            self.assertFalse(success)
+            self.assertEqual(consumer_cs.blocked_on, "foreign.h")
+            self.assertEqual(consumer_cs.unresolved_indices, {1})
+
+            # Verify op 0 and op 2 produced results in cs_result
+            self.assertIsNotNone(consumer_cs.cs_result[0])
+            self.assertIsNone(consumer_cs.cs_result[1])
+            self.assertIsNotNone(consumer_cs.cs_result[2])
+
+            # Verify op 2 is queryable via symbol_dict
+            val = consumer_cs._get_value_at((m_ast.table_id, 0), 2)
+            self.assertIsNotNone(val)
+        finally:
+            G.TE = old_te
+
+    def test_tablehandling_cycle_breaking(self) -> None:
+        """Verify force_stubs=True breaks circular dependency deadlocks by force-staging notbind stubs."""
+        from core.TableHandling import ChangeSet
+        from core.DBLayout import m_ast, m_ast_hash, m_ast_container
+        from core.globalstuff import ASTT, REF_FILE
+        from core.GreatProcessor import GreatProcessor
+
+        old_te = G.TE
+        G.TE = self.te
+        try:
+            for tbl in (m_ast, m_ast_hash, m_ast_container):
+                if tbl.table_id not in self.te.tables:
+                    self.te.tables[tbl.table_id] = tbl
+                    self.te.queued_set[tbl.table_id] = {}
+                    self.te.next_id[tbl.table_id] = 1
+
+            mock_gp = GreatProcessor()
+            mock_gp.init_cs_dict()
+
+            # cs_a needs struct_b from file_b
+            cs_a = ChangeSet("A\tfile_a.h")
+            cs_a.gp = mock_gp
+            mock_gp.ChangeSet_Dict["file_a.h"] = cs_a
+
+            # cs_b needs struct_a from file_a
+            cs_b = ChangeSet("A\tfile_b.h")
+            cs_b.gp = mock_gp
+            mock_gp.ChangeSet_Dict["file_b.h"] = cs_b
+
+            ref_b = cs_a.ref(m_ast.ast_id, REF_FILE, "file_b.h", "struct_b", int(ASTT.C_struct))
+            cs_a.store(m_ast.view(((m_ast.ast_id, m_ast_container.ast_id, 1),), None, "alias_b", int(ASTT.C_TypeRef), None, 0, int(ASTT.C_TypeRef), ref_b))
+
+            ref_a = cs_b.ref(m_ast.ast_id, REF_FILE, "file_a.h", "struct_a", int(ASTT.C_struct))
+            cs_b.store(m_ast.view(((m_ast.ast_id, m_ast_container.ast_id, 1),), None, "alias_a", int(ASTT.C_TypeRef), None, 0, int(ASTT.C_TypeRef), ref_a))
+
+            # Without force_stubs, both cannot execute
+            self.assertFalse(cs_a.execute())
+            self.assertFalse(cs_b.execute())
+
+            # Deadlock breaker: call execute(force_stubs=True) on cs_a
+            success_a = cs_a.execute(force_stubs=True)
+            self.assertTrue(success_a)
+            self.assertTrue(cs_a.cs_processed)
+
+            # Now cs_b can execute and complete
+            success_b = cs_b.execute(force_stubs=True)
+            self.assertTrue(success_b)
+            self.assertTrue(cs_b.cs_processed)
+        finally:
+            G.TE = old_te
+
+    def test_dependency_scheduler_streaming_and_evacuation(self) -> None:
+        """Verify DependencyScheduler streams batches, executes ready CSs, and preserves symbols across evacuation."""
+        from core.TableHandling import ChangeSet
+        from core.DBLayout import m_file_name, m_bridge_file, m_ast, m_ast_hash, m_ast_container, m_bridge_tag, m_tag
+        from core.globalstuff import ASTT, REF_FILE
+        from core.GreatProcessor import GreatProcessor
+        from main import DependencyScheduler
+
+        old_te = G.TE
+        G.TE = self.te
+        try:
+            for tbl in (m_file_name, m_bridge_file, m_ast, m_ast_hash, m_ast_container, m_bridge_tag, m_tag):
+                if tbl.table_id not in self.te.tables:
+                    self.te.tables[tbl.table_id] = tbl
+                    self.te.queued_set[tbl.table_id] = {}
+                    self.te.queued_update[tbl.table_id] = []
+                    self.te.next_id[tbl.table_id] = 1
+
+            mock_gp = GreatProcessor()
+            mock_gp.init_cs_dict()
+
+            scheduler = DependencyScheduler(mock_gp)
+
+            # Batch 1: Header defining a struct
+            cs_header = ChangeSet("A\tmy_header.h")
+            cs_header.gp = mock_gp
+            with cs_header("def"):
+                cs_header.store(m_ast.view(((m_ast.ast_id,),), None, "my_struct", int(ASTT.C_struct)))
+            cs_header.symbol_dict[("my_struct", int(ASTT.C_struct))] = 0
+
+            # Ingest Batch 1
+            scheduler.ingest_batch({"my_header.h": cs_header})
+
+            # my_header.h should be completed and evacuated in ChangeSet_Dict
+            self.assertIn("my_header.h", scheduler.completed)
+            evacuated_header = mock_gp.ChangeSet_Dict["my_header.h"]
+            self.assertEqual(len(evacuated_header.cs), 0)  # Evacuated
+            self.assertIn(("my_struct", int(ASTT.C_struct)), getattr(evacuated_header, "resolved_symbols", {}))
+
+            # Batch 2: Consumer referencing my_struct from my_header.h
+            cs_consumer = ChangeSet("A\tconsumer.c")
+            cs_consumer.gp = mock_gp
+            ref_struct = cs_consumer.ref(m_ast.ast_id, REF_FILE, "my_header.h", "my_struct", int(ASTT.C_struct))
+            cs_consumer.store(m_ast.view(((m_ast.ast_id, m_ast_container.ast_id, 1),), None, "consumer_alias", int(ASTT.C_TypeRef), None, 0, int(ASTT.C_TypeRef), ref_struct))
+
+            # Ingest Batch 2
+            scheduler.ingest_batch({"consumer.c": cs_consumer})
+
+            # consumer.c should execute and resolve my_struct from my_header.h's preserved resolved_symbols
+            self.assertIn("consumer.c", scheduler.completed)
+            self.assertEqual(scheduler.executed_count, 2)
+            scheduler.finalize()
+        finally:
+            G.TE = old_te
+
+    def test_dependency_scheduler_cycle_breaking(self) -> None:
+        """Verify DependencyScheduler breaks circular deadlocks during finalize()."""
+        from core.TableHandling import ChangeSet
+        from core.DBLayout import m_file_name, m_bridge_file, m_ast, m_ast_hash, m_ast_container, m_bridge_tag, m_tag
+        from core.globalstuff import ASTT, REF_FILE
+        from core.GreatProcessor import GreatProcessor
+        from main import DependencyScheduler
+
+        old_te = G.TE
+        G.TE = self.te
+        try:
+            for tbl in (m_file_name, m_bridge_file, m_ast, m_ast_hash, m_ast_container, m_bridge_tag, m_tag):
+                if tbl.table_id not in self.te.tables:
+                    self.te.tables[tbl.table_id] = tbl
+                    self.te.queued_set[tbl.table_id] = {}
+                    self.te.queued_update[tbl.table_id] = []
+                    self.te.next_id[tbl.table_id] = 1
+
+            mock_gp = GreatProcessor()
+            mock_gp.init_cs_dict()
+            scheduler = DependencyScheduler(mock_gp)
+
+            cs_a = ChangeSet("A\tcycle_a.h")
+            cs_a.gp = mock_gp
+            mock_gp.ChangeSet_Dict["cycle_a.h"] = cs_a
+
+            cs_b = ChangeSet("A\tcycle_b.h")
+            cs_b.gp = mock_gp
+            mock_gp.ChangeSet_Dict["cycle_b.h"] = cs_b
+
+            ref_b = cs_a.ref(m_ast.ast_id, REF_FILE, "cycle_b.h", "struct_b", int(ASTT.C_struct))
+            cs_a.store(m_ast.view(((m_ast.ast_id, m_ast_container.ast_id, 1),), None, "alias_b", int(ASTT.C_TypeRef), None, 0, int(ASTT.C_TypeRef), ref_b))
+
+            ref_a = cs_b.ref(m_ast.ast_id, REF_FILE, "cycle_a.h", "struct_a", int(ASTT.C_struct))
+            cs_b.store(m_ast.view(((m_ast.ast_id, m_ast_container.ast_id, 1),), None, "alias_a", int(ASTT.C_TypeRef), None, 0, int(ASTT.C_TypeRef), ref_a))
+
+            # Ingest both into scheduler
+            scheduler.ingest_batch({"cycle_a.h": cs_a, "cycle_b.h": cs_b})
+
+            # Both are mutually waiting so neither is completed yet
+            self.assertNotIn("cycle_a.h", scheduler.completed)
+            self.assertNotIn("cycle_b.h", scheduler.completed)
+
+            # Finalize breaks the cycle
+            scheduler.finalize()
+            self.assertIn("cycle_a.h", scheduler.completed)
+            self.assertIn("cycle_b.h", scheduler.completed)
+        finally:
+            G.TE = old_te
+
+    def test_phase2_parallel_wave_dispatch(self) -> None:
+        """Verify Phase 2 wave resolution executes multi-stage dependency DAG in waves."""
+        from core.TableHandling import ChangeSet
+        from core.DBLayout import m_file_name, m_bridge_file, m_ast, m_ast_hash, m_ast_container, m_bridge_tag, m_tag
+        from core.globalstuff import ASTT, REF_FILE
+        from core.GreatProcessor import GreatProcessor
+        from main import execute_phase2_parallel_waves
+
+        old_te = G.TE
+        G.TE = self.te
+        try:
+            for tbl in (m_file_name, m_bridge_file, m_ast, m_ast_hash, m_ast_container, m_bridge_tag, m_tag):
+                if tbl.table_id not in self.te.tables:
+                    self.te.tables[tbl.table_id] = tbl
+                    self.te.queued_set[tbl.table_id] = {}
+                    self.te.queued_update[tbl.table_id] = []
+                    self.te.next_id[tbl.table_id] = 1
+
+            mock_gp = GreatProcessor()
+            mock_gp.init_cs_dict()
+
+            # Create 5 files forming a 2-wave DAG
+            # Wave 1: Two independent headers defining structs
+            cs_h1 = ChangeSet("A\th1.h")
+            cs_h1.gp = mock_gp
+            cs_h1.store(m_ast.view(((m_ast.ast_id,),), None, "struct_1", int(ASTT.C_struct)))
+            cs_h1.symbol_dict[("struct_1", int(ASTT.C_struct))] = 0
+            mock_gp.ChangeSet_Dict["h1.h"] = cs_h1
+
+            cs_h2 = ChangeSet("A\th2.h")
+            cs_h2.gp = mock_gp
+            cs_h2.store(m_ast.view(((m_ast.ast_id,),), None, "struct_2", int(ASTT.C_struct)))
+            cs_h2.symbol_dict[("struct_2", int(ASTT.C_struct))] = 0
+            mock_gp.ChangeSet_Dict["h2.h"] = cs_h2
+
+            # Wave 2: Three consumers depending on h1.h and h2.h
+            cs_c1 = ChangeSet("A\tc1.c")
+            cs_c1.gp = mock_gp
+            ref1 = cs_c1.ref(m_ast.ast_id, REF_FILE, "h1.h", "struct_1", int(ASTT.C_struct))
+            cs_c1.store(m_ast.view(((m_ast.ast_id, m_ast_container.ast_id, 1),), None, "alias_c1", int(ASTT.C_TypeRef), None, 0, int(ASTT.C_TypeRef), ref1))
+            mock_gp.ChangeSet_Dict["c1.c"] = cs_c1
+
+            cs_c2 = ChangeSet("A\tc2.c")
+            cs_c2.gp = mock_gp
+            ref2 = cs_c2.ref(m_ast.ast_id, REF_FILE, "h1.h", "struct_1", int(ASTT.C_struct))
+            cs_c2.store(m_ast.view(((m_ast.ast_id, m_ast_container.ast_id, 1),), None, "alias_c2", int(ASTT.C_TypeRef), None, 0, int(ASTT.C_TypeRef), ref2))
+            mock_gp.ChangeSet_Dict["c2.c"] = cs_c2
+
+            cs_c3 = ChangeSet("A\tc3.c")
+            cs_c3.gp = mock_gp
+            ref3 = cs_c3.ref(m_ast.ast_id, REF_FILE, "h2.h", "struct_2", int(ASTT.C_struct))
+            cs_c3.store(m_ast.view(((m_ast.ast_id, m_ast_container.ast_id, 1),), None, "alias_c3", int(ASTT.C_TypeRef), None, 0, int(ASTT.C_TypeRef), ref3))
+            mock_gp.ChangeSet_Dict["c3.c"] = cs_c3
+
+            # Execute Phase 2
+            execute_phase2_parallel_waves(mock_gp)
+
+            # All 5 files must be fully processed and completed
+            for path in ("h1.h", "h2.h", "c1.c", "c2.c", "c3.c"):
+                cs = mock_gp.ChangeSet_Dict[path]
+                self.assertTrue(cs.cs_processed, f"{path} was not marked processed")
+                self.assertEqual(len(cs.cs), 0, f"{path} buffers were not evacuated")
+        finally:
+            G.TE = old_te
+
+    def test_db_backed_unchanged_file_symbol_resolution(self) -> None:
+        """Verify resolve_ref fetches symbols from DB for unchanged files without calling safe_get_cs."""
+        from core.TableHandling import ChangeSet
+        from core.DBLayout import m_file_name, m_bridge_file, m_bridge_tag, m_tag, m_ast, m_ast_hash
+        from core.globalstuff import ASTT, REF_FILE
+        from core.GreatProcessor import GreatProcessor
+
+        old_te = G.TE
+        G.TE = self.te
+        try:
+            for tbl in (m_file_name, m_bridge_file, m_bridge_tag, m_tag, m_ast, m_ast_hash):
+                if tbl.table_id not in self.te.tables:
+                    self.te.tables[tbl.table_id] = tbl
+                    self.te.queued_set[tbl.table_id] = {}
+                    self.te.queued_update[tbl.table_id] = []
+                    self.te.next_id[tbl.table_id] = 1
+
+            # Seed an "unchanged" header in the DB / TE
+            # 1. m_file_name
+            fn_row = self.te.set(m_file_name.table_id, (None, "include/linux/unchanged.h"))
+            fnid = fn_row[0]
+            # 2. m_bridge_file for Old_VID=1
+            self.te.set(m_bridge_file.table_id, (1, fnid, 50))  # vid=1, fnid, fid=50
+            # 3. m_ast symbol
+            ast_row = self.te.set(m_ast.table_id, (None, "unchanged_type", int(ASTT.C_struct)))
+            assigned_ast_id = ast_row[0]
+            # 4. m_tag
+            self.te.set(m_tag.table_id, (100, 1, 0, b"h" * 32, assigned_ast_id, 0, 0))
+            # 5. m_bridge_tag linking fid=50 -> tag_id=100
+            self.te.set(m_bridge_tag.table_id, (50, 100, 1, 10, 1, 20))
+            self.te.commit_all()
+
+            mock_gp = GreatProcessor()
+            mock_gp.init_cs_dict()
+            mock_gp.VID = 2
+            mock_gp.Old_VID = 1
+
+            # Test get_file_symbols_from_db directly
+            syms = mock_gp.get_file_symbols_from_db("include/linux/unchanged.h")
+            self.assertIsNotNone(syms)
+            self.assertEqual(syms.get(("unchanged_type", int(ASTT.C_struct))), assigned_ast_id)
+
+            # Test ChangeSet.resolve_ref uses get_file_symbols_from_db
+            cs = ChangeSet("A\tconsumer.c")
+            cs.gp = mock_gp
+            ref_val = cs.resolve_ref((m_ast.table_id, 0), [REF_FILE, "include/linux/unchanged.h", "unchanged_type", int(ASTT.C_struct)])
+            self.assertEqual(ref_val, assigned_ast_id)
+        finally:
+            G.TE = old_te
+
+    def test_changeset_preprocess_ref_views(self) -> None:
+        """Verify ChangeSet.preprocess_ref_views pre-unpacks intra-file OP_REF_VIEW into OP_VIEW_SET."""
+        from core.TableHandling import ChangeSet
+        from core.DBLayout import m_ast, m_ast_hash, m_ast_container
+        from core.globalstuff import ASTT, OP_REF_VIEW, OP_VIEW_SET, REF_MULTI, REF_POS
+        from core.GreatProcessor import GreatProcessor
+
+        old_te = G.TE
+        G.TE = self.te
+        try:
+            for tbl in (m_ast, m_ast_hash, m_ast_container):
+                if tbl.table_id not in self.te.tables:
+                    self.te.tables[tbl.table_id] = tbl
+                    self.te.queued_set[tbl.table_id] = {}
+                    self.te.queued_update[tbl.table_id] = []
+                    self.te.next_id[tbl.table_id] = 1
+
+            mock_gp = GreatProcessor()
+            mock_gp.init_cs_dict()
+
+            cs = ChangeSet("A\ttest.c")
+            cs.gp = mock_gp
+
+            # Store an AST node inside REF_MULTI / REF_POS context
+            with cs(REF_MULTI):
+                with cs(REF_POS):
+                    cs.store(m_ast.view(((m_ast.ast_id,),), None, "param_x", int(ASTT.C_DeclRefExpr)))
+                link = tuple(cs.route[-2:])
+
+            # Store ref_view with dynamic schema pointing to intra-file link
+            ref_view_op = m_ast.ref_view(
+                ((m_ast.ast_id,),),
+                None,
+                "func_decl",
+                int(ASTT.C_functionproto),
+                (
+                    ((m_ast.ast_id, None),),
+                    (
+                        (
+                            ((m_ast.ast_id, m_ast_container.ast_id, 1),),
+                            (None, ("rank",), m_ast.type_id, m_ast.ast_id),
+                        ),
+                    ),
+                    tuple(link),
+                ),
+            )
+            cs.store(ref_view_op)
+
+            # Before preprocessing, op 1 is OP_REF_VIEW
+            self.assertEqual(cs.cs[1][1], OP_REF_VIEW)
+
+            # Preprocess ref views
+            cs.preprocess_ref_views()
+
+            # After preprocessing, op 1 is OP_VIEW_SET!
+            self.assertEqual(cs.cs[1][1], OP_VIEW_SET)
+
+            # And it executes successfully
+            self.assertTrue(cs.execute())
+            self.assertTrue(cs.cs_processed)
+            self.assertEqual(cs.cs_result[0][1], "param_x")
+            self.assertEqual(cs.cs_result[1][1], "func_decl")
+        finally:
+            G.TE = old_te
 
 
 # =============================================================================

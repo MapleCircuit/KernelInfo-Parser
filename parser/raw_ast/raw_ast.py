@@ -181,7 +181,8 @@ class RawManager:
 
         # New tag required using content_hex for AST name and content_hash for m_tag
         with CS(REF_POS):
-            CS.store(m_ast.get_set(
+            CS.store(m_ast.view(
+                ((m_ast.ast_id,),),
                 None,
                 content_hex,
                 ASTT.Raw_Content,

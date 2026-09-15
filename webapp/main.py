@@ -345,10 +345,10 @@ def compute_container_depths(cursor, all_ast_ids: set[int]) -> dict[int, int]:
             f"""
             SELECT c.ast_id, c.priority, c.type_id, c.ref_ast_id
             FROM m_ast_container c
-            WHERE c.ast_id IN ({format_ast_strings}) OR c.ref_ast_id IN ({format_ast_strings})
+            WHERE c.ast_id IN ({format_ast_strings})
             ORDER BY c.ast_id ASC, c.priority ASC;
             """,
-            tuple(clean_ids) * 2,
+            tuple(clean_ids),
         )
         container_rows = cursor.fetchall()
         parent_to_children = defaultdict(list)
@@ -1075,6 +1075,11 @@ def get_tag_by_id(tag_id: int) -> dict[str, Any]:
             """,
             (tag_id,),
         )
+        raw_maps = cursor.fetchall()
+        tag_ast_id = tag_row[4]
+        all_ast_ids = set([tag_ast_id]) | set([r[5] for r in raw_maps if r[5]])
+        ast_depth_map = compute_container_depths(cursor, all_ast_ids)
+
         maps = [
             {
                 "map_id": r[0],
@@ -1086,8 +1091,9 @@ def get_tag_by_id(tag_id: int) -> dict[str, Any]:
                 "ast_name": safe_decode(r[6]),
                 "type_id": r[7],
                 "type_name": safe_decode(r[8]),
+                "container_depth": ast_depth_map.get(r[5], None),
             }
-            for r in cursor.fetchall()
+            for r in raw_maps
         ]
 
         # Fetch moved_from / moved_to relationships if available
@@ -1106,7 +1112,7 @@ def get_tag_by_id(tag_id: int) -> dict[str, Any]:
             "vid_s": tag_row[1],
             "vid_e": tag_row[2],
             "code": safe_decode(tag_row[3]),
-            "ast_id": tag_row[4],
+            "ast_id": tag_ast_id,
             "hl_s": tag_row[5],
             "hl_l": tag_row[6],
             "fid": tag_row[7],
@@ -1118,6 +1124,7 @@ def get_tag_by_id(tag_id: int) -> dict[str, Any]:
             "ast_type_id": tag_row[13],
             "ast_type_name": safe_decode(tag_row[14]),
             "ast_raw": safe_decode(tag_row[15]),
+            "container_depth": ast_depth_map.get(tag_ast_id, None),
             "moved_from": moved_from,
             "moved_to": moved_to,
             "maps": maps,
@@ -1563,7 +1570,7 @@ def get_ast_container_tree(
                    c.ref_ast_id, ra.name AS ref_name, ra.type_id AS ref_type_id, td.name AS ref_type_name
             FROM m_ast_container c
             LEFT JOIN m_type_descriptor rtd ON c.type_id = rtd.type_id
-            JOIN m_ast ra ON c.ref_ast_id = ra.ast_id
+            LEFT JOIN m_ast ra ON c.ref_ast_id = ra.ast_id
             LEFT JOIN m_type_descriptor td ON ra.type_id = td.type_id
             WHERE c.ast_id = %s
             ORDER BY c.priority ASC;
@@ -1574,15 +1581,15 @@ def get_ast_container_tree(
 
         for c_row in child_rows:
             ref_id = c_row[3]
-            child_tree = _fetch_node(cursor, ref_id, current_depth + 1, max_depth, set(visited))
+            child_tree = _fetch_node(cursor, ref_id, current_depth + 1, max_depth, set(visited)) if ref_id and ref_id > 0 else None
             node["containers"].append({
                 "priority": c_row[0],
                 "rel_type_id": c_row[1],
                 "rel_type_name": safe_decode(c_row[2]),
                 "ref_ast_id": ref_id,
-                "ref_ast_name": safe_decode(c_row[4]),
+                "ref_ast_name": safe_decode(c_row[4]) or safe_decode(c_row[2]),
                 "ref_type_id": c_row[5],
-                "ref_type_name": safe_decode(c_row[6]),
+                "ref_type_name": safe_decode(c_row[6]) or safe_decode(c_row[2]),
                 "child_node": child_tree,
             })
 
@@ -5381,6 +5388,42 @@ def get_symbol_xref(version_name: str, symbol_name: str) -> dict[str, Any]:
             for r in cursor.fetchall()
         ]
 
+        # 3. Look for functions using this type (via m_ast_container)
+        cursor.execute(
+            """
+            SELECT DISTINCT fn_a.ast_id, fn_a.name AS fn_name, fn_td.name AS fn_type,
+                   f.fname, fi.fid, bt.line_s, bt.line_e
+            FROM m_ast type_a
+            JOIN m_ast_container c ON type_a.ast_id = c.ref_ast_id
+            LEFT JOIN m_ast_container c_fn ON c.ast_id = c_fn.ref_ast_id
+            JOIN m_ast fn_a ON (fn_a.ast_id = c.ast_id OR fn_a.ast_id = c_fn.ast_id)
+            JOIN m_type_descriptor fn_td ON fn_a.type_id = fn_td.type_id
+            JOIN m_tag t ON fn_a.ast_id = t.ast_id
+            JOIN m_bridge_tag bt ON t.tag_id = bt.tag_id
+            JOIN m_file fi ON bt.fid = fi.fid
+            JOIN m_bridge_file bf ON fi.fid = bf.fid
+            JOIN m_file_name f ON bf.fnid = f.fnid
+            WHERE bf.vid = %s AND (t.vid_e = 0 OR t.vid_e >= %s) AND t.vid_s <= %s
+              AND type_a.name = %s
+              AND fn_td.name IN ('C_functionproto', 'C_function')
+            ORDER BY fn_a.name ASC
+            LIMIT 50;
+            """,
+            (vid, vid, vid, clean_sym),
+        )
+        functions_using_type = [
+            {
+                "ast_id": r[0],
+                "fn_name": safe_decode(r[1]),
+                "fn_type": safe_decode(r[2]),
+                "file_path": safe_decode(r[3]),
+                "fid": r[4],
+                "line_s": r[5],
+                "line_e": r[6],
+            }
+            for r in cursor.fetchall()
+        ]
+
         cursor.close()
         cnx.close()
         return {
@@ -5390,6 +5433,8 @@ def get_symbol_xref(version_name: str, symbol_name: str) -> dict[str, Any]:
             "definitions": definitions,
             "references_count": len(references),
             "references": references,
+            "functions_using_type_count": len(functions_using_type),
+            "functions_using_type": functions_using_type,
         }
     except Exception as e:
         if cnx and cnx.is_connected():
@@ -5398,39 +5443,192 @@ def get_symbol_xref(version_name: str, symbol_name: str) -> dict[str, Any]:
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 
-@app.get("/api/version/{version_name}/symbol_lookup")
-def lookup_symbols(version_name: str, q: str = Query("", min_length=1), limit: int = 30) -> list[dict[str, Any]]:
-    """Autocomplete / fast symbol lookup across AST identifiers."""
+@app.get("/api/version/{version_name}/symbol/{symbol_name}")
+def get_symbol_detail(version_name: str, symbol_name: str) -> dict[str, Any]:
+    """Retrieve authoritative symbol definition, declarations, and usages across the codebase."""
+    cnx = db.get_connection()
+    if not cnx:
+        raise HTTPException(status_code=500, detail="Database connection unavailable")
+    try:
+        vid, version_name = get_version_info(cnx, version_name)
+        cursor = cnx.cursor()
+        clean_name = symbol_name.strip()
+
+        # 1. Query m_symbol_def for authoritative definition
+        def_row = None
+        try:
+            cursor.execute(
+                """
+                SELECT d.def_id, d.fid, d.tag_id, d.ast_id, d.name, d.type_id, td.name, d.line_s, d.line_e, fn.fname
+                FROM m_symbol_def d
+                JOIN m_type_descriptor td ON d.type_id = td.type_id
+                JOIN m_bridge_file bf ON d.fid = bf.fid AND bf.vid = d.vid
+                JOIN m_file_name fn ON bf.fnid = fn.fnid
+                WHERE d.vid = %s AND (d.name = %s OR d.name = %s)
+                ORDER BY d.line_s ASC
+                LIMIT 1;
+                """,
+                (vid, clean_name, f"struct {clean_name}"),
+            )
+            def_row = cursor.fetchone()
+        except Exception:
+            def_row = None
+
+        definition = None
+        ast_id = None
+        if def_row:
+            ast_id = def_row[3]
+            definition = {
+                "def_id": def_row[0],
+                "fid": def_row[1],
+                "tag_id": def_row[2],
+                "ast_id": def_row[3],
+                "name": safe_decode(def_row[4]),
+                "type_id": def_row[5],
+                "type_name": safe_decode(def_row[6]),
+                "line_s": def_row[7],
+                "line_e": def_row[8],
+                "file_path": safe_decode(def_row[9]),
+            }
+        else:
+            # Fallback: Check m_ast for opaque / unbound types
+            cursor.execute(
+                """
+                SELECT a.ast_id, a.name, a.type_id, td.name
+                FROM m_ast a
+                JOIN m_type_descriptor td ON a.type_id = td.type_id
+                WHERE a.name = %s OR a.name = %s
+                LIMIT 1;
+                """,
+                (clean_name, f"struct {clean_name}"),
+            )
+            ast_row = cursor.fetchone()
+            if ast_row:
+                ast_id = ast_row[0]
+
+        declarations = []
+        usages = []
+
+        if ast_id is not None:
+            try:
+                cursor.execute(
+                    """
+                    SELECT r.ref_id, r.fid, r.tag_id, r.ast_id, r.role, r.line, r.char_s, fn.fname
+                    FROM m_symbol_ref r
+                    JOIN m_bridge_file bf ON r.fid = bf.fid AND bf.vid = r.vid
+                    JOIN m_file_name fn ON bf.fnid = fn.fnid
+                    WHERE r.vid = %s AND r.ast_id = %s
+                    ORDER BY fn.fname ASC, r.line ASC;
+                    """,
+                    (vid, ast_id),
+                )
+                role_names = {1: "Declaration", 2: "TypeUsage", 3: "Call", 4: "MemberRef", 5: "DeclRef"}
+                for r in cursor.fetchall():
+                    ref_item = {
+                        "ref_id": r[0],
+                        "fid": r[1],
+                        "tag_id": r[2],
+                        "ast_id": r[3],
+                        "role_id": r[4],
+                        "role": role_names.get(r[4], "Usage"),
+                        "line": r[5],
+                        "char_s": r[6],
+                        "file_path": safe_decode(r[7]),
+                    }
+                    if r[4] == 1:
+                        declarations.append(ref_item)
+                    else:
+                        usages.append(ref_item)
+            except Exception:
+                pass
+
+        cursor.close()
+
+        if not definition and not declarations and not usages:
+            raise HTTPException(status_code=404, detail=f"Symbol '{clean_name}' not found in version '{version_name}'")
+
+        return {
+            "version": version_name,
+            "symbol_name": clean_name,
+            "definition": definition,
+            "declarations": declarations,
+            "usages": usages,
+            "total_declarations": len(declarations),
+            "total_usages": len(usages),
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("Error in get_symbol_detail: %s", e)
+        raise HTTPException(status_code=500, detail=str(e)) from e
+    finally:
+        if cnx:
+            try:
+                cnx.close()
+            except Exception:
+                pass
+
+
+@app.get("/api/symbols/search")
+def search_symbols(
+    version_name: str = Query("v3.0"),
+    q: str = Query("", min_length=1),
+    limit: int = 30,
+) -> list[dict[str, Any]]:
+    """Fast prefix search across defined symbols using m_symbol_def."""
     cnx = db.get_connection()
     if not cnx:
         return []
     try:
         vid, version_name = get_version_info(cnx, version_name)
         cursor = cnx.cursor()
-        cursor.execute(
-            """
-            SELECT DISTINCT a.name, td.name AS type_name, f.fname, fi.fid
-            FROM m_ast a
-            JOIN m_type_descriptor td ON a.type_id = td.type_id
-            JOIN m_tag t ON a.ast_id = t.ast_id
-            JOIN m_bridge_tag bt ON t.tag_id = bt.tag_id
-            JOIN m_file fi ON bt.fid = fi.fid
-            JOIN m_bridge_file bf ON fi.fid = bf.fid
-            JOIN m_file_name f ON bf.fnid = f.fnid
-            WHERE bf.vid = %s AND (t.vid_e = 0 OR t.vid_e >= %s) AND t.vid_s <= %s AND a.name LIKE %s AND a.name != ''
-            ORDER BY LENGTH(a.name) ASC, a.name ASC
-            LIMIT %s;
-            """,
-            (vid, vid, vid, f"{q.strip()}%", limit),
-        )
+        rows = []
+        try:
+            cursor.execute(
+                """
+                SELECT DISTINCT d.name, td.name AS type_name, fn.fname, d.fid, d.line_s, d.line_e, d.ast_id
+                FROM m_symbol_def d
+                JOIN m_type_descriptor td ON d.type_id = td.type_id
+                JOIN m_bridge_file bf ON d.fid = bf.fid AND bf.vid = d.vid
+                JOIN m_file_name fn ON bf.fnid = fn.fnid
+                WHERE d.vid = %s AND d.name LIKE %s AND d.name != ''
+                ORDER BY LENGTH(d.name) ASC, d.name ASC
+                LIMIT %s;
+                """,
+                (vid, f"{q.strip()}%", limit),
+            )
+            rows = cursor.fetchall()
+        except Exception:
+            pass
+        if not rows:
+            cursor.execute(
+                """
+                SELECT DISTINCT a.name, td.name AS type_name, f.fname, fi.fid, bt.line_s, bt.line_e, a.ast_id
+                FROM m_ast a
+                JOIN m_type_descriptor td ON a.type_id = td.type_id
+                JOIN m_tag t ON a.ast_id = t.ast_id
+                JOIN m_bridge_tag bt ON t.tag_id = bt.tag_id
+                JOIN m_file fi ON bt.fid = fi.fid
+                JOIN m_bridge_file bf ON fi.fid = bf.fid
+                JOIN m_file_name f ON bf.fnid = f.fnid
+                WHERE bf.vid = %s AND (t.vid_e = 0 OR t.vid_e >= %s) AND t.vid_s <= %s AND a.name LIKE %s AND a.name != ''
+                ORDER BY LENGTH(a.name) ASC, a.name ASC
+                LIMIT %s;
+                """,
+                (vid, vid, vid, f"{q.strip()}%", limit),
+            )
+            rows = cursor.fetchall()
         results = [
             {
                 "name": safe_decode(r[0]),
                 "type_name": safe_decode(r[1]),
                 "file_path": safe_decode(r[2]),
                 "fid": r[3],
+                "line_s": r[4],
+                "line_e": r[5],
+                "ast_id": r[6],
             }
-            for r in cursor.fetchall()
+            for r in rows
         ]
         cursor.close()
         cnx.close()
@@ -5438,8 +5636,14 @@ def lookup_symbols(version_name: str, q: str = Query("", min_length=1), limit: i
     except Exception as e:
         if cnx and cnx.is_connected():
             cnx.close()
-        logger.debug("Error in lookup_symbols: %s", e)
+        logger.debug("Error in search_symbols: %s", e)
         return []
+
+
+@app.get("/api/version/{version_name}/symbol_lookup")
+def lookup_symbols(version_name: str, q: str = Query("", min_length=1), limit: int = 30) -> list[dict[str, Any]]:
+    """Autocomplete / fast symbol lookup across AST identifiers."""
+    return search_symbols(version_name=version_name, q=q, limit=limit)
 
 
 # =========================================================================
@@ -5918,23 +6122,42 @@ def get_struct_layout(version_name: str, struct_name: str) -> dict[str, Any]:
         if clean_name.startswith("struct "):
             clean_name = clean_name[7:]
 
-        # Query AST for struct node
-        cursor.execute(
-            """
-            SELECT a.ast_id, a.name, a.type_id, td.name, bt.line_s, bt.line_e, f.fname, fi.fid
-            FROM m_ast a
-            JOIN m_type_descriptor td ON a.type_id = td.type_id
-            JOIN m_tag t ON a.ast_id = t.ast_id
-            JOIN m_bridge_tag bt ON t.tag_id = bt.tag_id
-            JOIN m_file fi ON bt.fid = fi.fid
-            JOIN m_bridge_file bf ON fi.fid = bf.fid
-            JOIN m_file_name f ON bf.fnid = f.fnid
-            WHERE bf.vid = %s AND (a.name = %s OR a.name = %s)
-            LIMIT 1;
-            """,
-            (vid, clean_name, f"struct {clean_name}"),
-        )
-        row = cursor.fetchone()
+        # Query m_symbol_def first for struct definition
+        row = None
+        try:
+            cursor.execute(
+                """
+                SELECT d.ast_id, d.name, d.type_id, td.name, d.line_s, d.line_e, fn.fname, d.fid
+                FROM m_symbol_def d
+                JOIN m_type_descriptor td ON d.type_id = td.type_id
+                JOIN m_bridge_file bf ON d.fid = bf.fid AND bf.vid = d.vid
+                JOIN m_file_name fn ON bf.fnid = fn.fnid
+                WHERE d.vid = %s AND (d.name = %s OR d.name = %s) AND d.type_id IN (27, 28)
+                LIMIT 1;
+                """,
+                (vid, clean_name, f"struct {clean_name}"),
+            )
+            row = cursor.fetchone()
+        except Exception:
+            row = None
+        if not row:
+            # Fallback to general AST join
+            cursor.execute(
+                """
+                SELECT a.ast_id, a.name, a.type_id, td.name, bt.line_s, bt.line_e, f.fname, fi.fid
+                FROM m_ast a
+                JOIN m_type_descriptor td ON a.type_id = td.type_id
+                JOIN m_tag t ON a.ast_id = t.ast_id
+                JOIN m_bridge_tag bt ON t.tag_id = bt.tag_id
+                JOIN m_file fi ON bt.fid = fi.fid
+                JOIN m_bridge_file bf ON fi.fid = bf.fid
+                JOIN m_file_name f ON bf.fnid = f.fnid
+                WHERE bf.vid = %s AND (a.name = %s OR a.name = %s)
+                LIMIT 1;
+                """,
+                (vid, clean_name, f"struct {clean_name}"),
+            )
+            row = cursor.fetchone()
 
         file_path = safe_decode(row[6]) if row else f"include/linux/{clean_name}.h"
         line_s = row[4] if row else 1
@@ -6228,49 +6451,118 @@ def get_function_callgraph(version_name: str, function_name: str) -> dict[str, A
         cursor = cnx.cursor()
         clean_name = function_name.strip()
 
-        cursor.execute(
-            """
-            SELECT a.ast_id, a.name, bt.line_s, bt.line_e, f.fname, fi.fid
-            FROM m_ast a
-            JOIN m_tag t ON a.ast_id = t.ast_id
-            JOIN m_bridge_tag bt ON t.tag_id = bt.tag_id
-            JOIN m_file fi ON bt.fid = fi.fid
-            JOIN m_bridge_file bf ON fi.fid = bf.fid
-            JOIN m_file_name f ON bf.fnid = f.fnid
-            WHERE bf.vid = %s AND (t.vid_e = 0 OR t.vid_e >= %s) AND t.vid_s <= %s AND a.name = %s
-            LIMIT 1;
-            """,
-            (vid, vid, vid, clean_name),
-        )
-        def_row = cursor.fetchone()
+        # Query m_symbol_def first for function definition
+        def_row = None
+        try:
+            cursor.execute(
+                """
+                SELECT d.ast_id, d.name, d.line_s, d.line_e, fn.fname, d.fid, d.tag_id
+                FROM m_symbol_def d
+                JOIN m_bridge_file bf ON d.fid = bf.fid AND bf.vid = d.vid
+                JOIN m_file_name fn ON bf.fnid = fn.fnid
+                WHERE d.vid = %s AND d.name = %s AND d.type_id IN (20, 21)
+                LIMIT 1;
+                """,
+                (vid, clean_name),
+            )
+            def_row = cursor.fetchone()
+        except Exception:
+            def_row = None
+        if not def_row:
+            cursor.execute(
+                """
+                SELECT a.ast_id, a.name, bt.line_s, bt.line_e, f.fname, fi.fid
+                FROM m_ast a
+                JOIN m_tag t ON a.ast_id = t.ast_id
+                JOIN m_bridge_tag bt ON t.tag_id = bt.tag_id
+                JOIN m_file fi ON bt.fid = fi.fid
+                JOIN m_bridge_file bf ON fi.fid = bf.fid
+                JOIN m_file_name f ON bf.fnid = f.fnid
+                WHERE bf.vid = %s AND (t.vid_e = 0 OR t.vid_e >= %s) AND t.vid_s <= %s AND a.name = %s
+                LIMIT 1;
+                """,
+                (vid, vid, vid, clean_name),
+            )
+            def_row = cursor.fetchone()
 
         file_path = safe_decode(def_row[4]) if def_row else ""
         line_s = def_row[2] if def_row else 1
         line_e = def_row[3] if def_row else 100
 
-        cursor.execute(
-            """
-            SELECT DISTINCT f.fname, bt.line_s, tc.code
-            FROM m_ast a
-            JOIN m_tag t ON a.ast_id = t.ast_id
-            LEFT JOIN m_tag_code tc ON t.hash = tc.hash
-            JOIN m_bridge_tag bt ON t.tag_id = bt.tag_id
-            JOIN m_file fi ON bt.fid = fi.fid
-            JOIN m_bridge_file bf ON fi.fid = bf.fid
-            JOIN m_file_name f ON bf.fnid = f.fnid
-            WHERE bf.vid = %s AND (t.vid_e = 0 OR t.vid_e >= %s) AND t.vid_s <= %s AND a.name = %s AND f.fname != %s
-            LIMIT 30;
-            """,
-            (vid, vid, vid, clean_name, file_path),
-        )
-        callers = [
-            {
-                "file_path": safe_decode(r[0]),
-                "line_s": r[1],
-                "snippet": safe_decode(r[2])[:120],
-            }
-            for r in cursor.fetchall()
-        ]
+        if def_row:
+            fn_ast_id = def_row[0]
+            cursor.execute(
+                """
+                SELECT MAX(bt.line_e)
+                FROM m_ast_container c
+                JOIN m_tag t ON c.ref_ast_id = t.ast_id
+                JOIN m_bridge_tag bt ON t.tag_id = bt.tag_id
+                WHERE c.ast_id = %s;
+                """,
+                (fn_ast_id,),
+            )
+            body_line_e = cursor.fetchone()
+            if body_line_e and body_line_e[0]:
+                line_e = max(line_e, body_line_e[0])
+
+        callers = []
+        if def_row and def_row[0]:
+            fn_ast_id = def_row[0]
+            cursor.execute(
+                """
+                SELECT DISTINCT fn.fname, r.line, tc.code
+                FROM m_symbol_ref r
+                JOIN m_tag t ON r.tag_id = t.tag_id
+                LEFT JOIN m_tag_code tc ON t.hash = tc.hash
+                JOIN m_bridge_file bf ON r.fid = bf.fid AND bf.vid = r.vid
+                JOIN m_file_name fn ON bf.fnid = fn.fnid
+                WHERE r.vid = %s AND r.ast_id = %s AND r.role = 3 AND fn.fname != %s
+                LIMIT 30;
+                """,
+                (vid, fn_ast_id, file_path),
+            )
+            callers = [
+                {
+                    "file_path": safe_decode(r[0]),
+                    "line_s": r[1],
+                    "line_e": r[1],
+                    "caller_name": (
+                        safe_decode(r[2]).split("(")[0].split()[-1]
+                        if r[2] and "(" in safe_decode(r[2])
+                        else "caller"
+                    ),
+                }
+                for r in cursor.fetchall()
+            ]
+        if not callers:
+            cursor.execute(
+                """
+                SELECT DISTINCT f.fname, bt.line_s, tc.code
+                FROM m_ast a
+                JOIN m_tag t ON a.ast_id = t.ast_id
+                LEFT JOIN m_tag_code tc ON t.hash = tc.hash
+                JOIN m_bridge_tag bt ON t.tag_id = bt.tag_id
+                JOIN m_file fi ON bt.fid = fi.fid
+                JOIN m_bridge_file bf ON fi.fid = bf.fid
+                JOIN m_file_name f ON bf.fnid = f.fnid
+                WHERE bf.vid = %s AND (t.vid_e = 0 OR t.vid_e >= %s) AND t.vid_s <= %s AND a.name = %s AND f.fname != %s
+                LIMIT 30;
+                """,
+                (vid, vid, vid, clean_name, file_path),
+            )
+            callers = [
+                {
+                    "file_path": safe_decode(r[0]),
+                    "line_s": r[1],
+                    "line_e": r[1],
+                    "caller_name": (
+                        safe_decode(r[2]).split("(")[0].split()[-1]
+                        if r[2] and "(" in safe_decode(r[2])
+                        else "caller"
+                    ),
+                }
+                for r in cursor.fetchall()
+            ]
 
         callees = []
         if def_row:
