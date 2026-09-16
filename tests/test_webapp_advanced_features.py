@@ -25,19 +25,16 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from webapp.main import (
-    AstQueryRequest,
     AutoSolveRequest,
     DiffConfigRequest,
-    FootprintRequest,
     FormatPatchRequest,
     PatchReviewRequest,
     _compute_structured_diff,
     autosolve_kconfig,
     diff_kconfig_configurations,
-    estimate_kconfig_footprint,
     export_compile_commands,
     generate_formatted_patch,
-    get_code_tour_presets,
+    get_ast_container_tree,
     get_codebase_treemap,
     get_function_callgraph,
     get_kconfig_diff,
@@ -51,12 +48,11 @@ from webapp.main import (
     lookup_symbols,
     search_symbols,
     match_patch_maintainers,
-    query_ast_semantic_sandbox,
 )
 
 
 class TestWebappAdvancedFeatures(unittest.TestCase):
-    """Test suite for all 14 advanced web application systems."""
+    """Test suite for advanced web application systems."""
 
     def test_version_diff_and_kconfig_diff(self) -> None:
         # File Tree Diff (same version self-diff should be 100% unchanged)
@@ -77,12 +73,28 @@ class TestWebappAdvancedFeatures(unittest.TestCase):
         lookup = lookup_symbols("v3.0", q="ext4", limit=10)
         self.assertIsInstance(lookup, list)
 
+        # Rich symbol search from m_symbol_def
+        search_res = search_symbols("v3.0", q="ext4", limit=10)
+        self.assertIsInstance(search_res, list)
+        if len(search_res) > 0:
+            sym = search_res[0]
+            self.assertIn("name", sym)
+            self.assertIn("type_name", sym)
+            self.assertIn("file_path", sym)
+            self.assertIn("line_s", sym)
+            self.assertIn("ast_id", sym)
+
         # XRef search for kmalloc or ext4 symbol
         xref = get_symbol_xref("v3.0", "kmalloc")
         self.assertIn("symbol", xref)
         self.assertEqual(xref["symbol"], "kmalloc")
         self.assertIn("definitions", xref)
         self.assertIn("references", xref)
+        self.assertIn("calls", xref)
+        self.assertIn("member_refs", xref)
+        self.assertIn("type_usages", xref)
+        self.assertIn("declarations", xref)
+        self.assertIn("references_count", xref)
 
     def test_kconfig_dag_graph(self) -> None:
         # Graph for EXT4_FS
@@ -127,15 +139,46 @@ class TestWebappAdvancedFeatures(unittest.TestCase):
         self.assertIn("suggested_to", res)
         self.assertIn("suggested_cc", res)
 
-    def test_ast_semantic_query_sandbox(self) -> None:
-        req = AstQueryRequest(limit=20)
-        res = query_ast_semantic_sandbox("v3.0", req)
-        self.assertIn("total", res)
-        self.assertIn("items", res)
-        self.assertIsInstance(res["items"], list)
-        if len(res["items"]) > 0:
-            self.assertIn("ast_id", res["items"][0])
-            self.assertIn("file_path", res["items"][0])
+    def test_ast_container_tree_tag_ids(self) -> None:
+        """Verify AST container tree includes tag_id as int or None, correctly suppressing tags on inner expressions/statements."""
+        search_res = search_symbols("v3.0", q="ext4_fill_super", limit=1)
+        if not search_res:
+            search_res = search_symbols("v3.0", q="init", limit=1)
+        self.assertGreater(len(search_res), 0)
+        ast_id = search_res[0]["ast_id"]
+
+        tree = get_ast_container_tree(ast_id, version_name="v3.0")
+        self.assertIn("ast_id", tree)
+        self.assertIn("tag_id", tree)
+        self.assertTrue(tree["tag_id"] is None or isinstance(tree["tag_id"], int))
+        self.assertIn("containers", tree)
+        self.assertIsInstance(tree["containers"], list)
+
+        has_tagged = tree["tag_id"] is not None
+        has_untagged = tree["tag_id"] is None
+
+        # Recursively verify tag_id exists on all nodes
+        def verify_node(node: dict) -> None:
+            nonlocal has_tagged, has_untagged
+            self.assertIn("ast_id", node)
+            self.assertIn("tag_id", node)
+            self.assertTrue(node["tag_id"] is None or isinstance(node["tag_id"], int))
+            if node["tag_id"] is not None:
+                has_tagged = True
+            else:
+                has_untagged = True
+            for c in node.get("containers", []):
+                child = c.get("child_node")
+                if child:
+                    verify_node(child)
+
+        for c in tree["containers"]:
+            child = c.get("child_node")
+            if child:
+                verify_node(child)
+
+        self.assertTrue(has_tagged, "Expected at least one tagged node in tree")
+        self.assertTrue(has_untagged, "Expected at least one untagged node in tree")
 
     def test_tag_version_timeline_and_diff(self) -> None:
         """Verify GET /api/tag/{tag_id}/timeline and diff generation."""
@@ -228,27 +271,17 @@ class TestWebappAdvancedFeatures(unittest.TestCase):
         self.assertIn("children", tree)
         self.assertGreater(len(tree["children"]), 0)
 
-    def test_kconfig_footprint_bloatometer(self) -> None:
-        req = FootprintRequest(kconfig_values={"EXT4_FS": "y", "NET": "y"})
-        res = estimate_kconfig_footprint("v3.0", req)
-        self.assertIn("active_symbols_count", res)
-        self.assertIn("total_compiled_files", res)
-        self.assertIn("estimated_loc", res)
-        self.assertIn("estimated_binary_kb", res)
-        self.assertEqual(res["active_symbols_count"], 2)
-
     def test_function_callgraph(self) -> None:
         res = get_function_callgraph("v3.0", "ext4_fill_super")
         self.assertEqual(res["function_name"], "ext4_fill_super")
         self.assertIn("callers", res)
         self.assertIn("callees", res)
-
-    def test_code_tour_presets(self) -> None:
-        presets = get_code_tour_presets("v3.0")
-        self.assertIsInstance(presets, list)
-        self.assertGreater(len(presets), 0)
-        self.assertIn("steps", presets[0])
-        self.assertGreater(len(presets[0]["steps"]), 0)
+        self.assertIn("caller_count", res)
+        self.assertIn("callee_count", res)
+        if len(res["callees"]) > 0:
+            callee = res["callees"][0]
+            self.assertIn("name", callee)
+            self.assertIn("file_path", callee)
 
     def test_in_browser_patch_format(self) -> None:
         req = FormatPatchRequest(
@@ -264,13 +297,7 @@ class TestWebappAdvancedFeatures(unittest.TestCase):
         self.assertIn("Subject: [PATCH] ext4: update b value", res["formatted_patch"])
 
     def test_edge_cases_empty_and_fallback(self) -> None:
-        # 1. Empty Kconfig Footprint
-        empty_footprint = estimate_kconfig_footprint("v3.0", FootprintRequest(kconfig_values={}))
-        self.assertEqual(empty_footprint["active_symbols_count"], 0)
-        self.assertEqual(empty_footprint["total_compiled_files"], 0)
-        self.assertEqual(empty_footprint["estimated_loc"], 0)
-
-        # 2. Empty Patch Review
+        # 1. Empty Patch Review
         empty_patch = match_patch_maintainers("v3.0", PatchReviewRequest(patch_text=""))
         self.assertEqual(empty_patch["touched_files_count"], 0)
         self.assertEqual(len(empty_patch["files"]), 0)
@@ -342,10 +369,25 @@ class TestWebappAdvancedFeatures(unittest.TestCase):
         self.assertIn('case "person":', content)
         self.assertIn('case "commit":', content)
 
-        # Check allWorkspaces includes the workspaces
+        # Check allWorkspaces includes the active workspaces
         self.assertIn('"subsystemWorkspace"', content)
         self.assertIn('"personWorkspace"', content)
         self.assertIn('"commitWorkspace"', content)
+
+        # Assert excised non-working features are removed
+        self.assertNotIn('btnModeAstSandbox', content)
+        self.assertNotIn('astSandboxWorkspace', content)
+        self.assertNotIn('openCodeTourModal', content)
+        self.assertNotIn('tourWorkspace', content)
+        self.assertNotIn('openBloatometerModal', content)
+        self.assertNotIn('bloatometerWorkspace', content)
+
+        # Assert modernized features are present
+        self.assertIn('id="globalSymbolSearchInput"', content)
+        self.assertIn('id="globalSymbolSearchDropdown"', content)
+        self.assertIn('id="tokenActionPopover"', content)
+        self.assertIn('executeXrefSearch', content)
+        self.assertIn('openPathAndHighlightLine', content)
 
     def test_symbol_endpoints(self) -> None:
         from fastapi import HTTPException
@@ -360,6 +402,36 @@ class TestWebappAdvancedFeatures(unittest.TestCase):
 
         results = search_symbols("v3.0", q="task", limit=10)
         self.assertIsInstance(results, list)
+
+    def test_webapp_identifier_click_and_raw_files_unparsed(self) -> None:
+        """Verify DOM structure of tokenActionPopover and raw file bypass in webapp.html."""
+        html_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "webapp", "webapp.html")
+        with open(html_path, "r", encoding="utf-8") as f:
+            content = f.read()
+
+        # 1. Verify tagTimelineModal closes BEFORE tokenActionPopover
+        timeline_idx = content.find('id="tagTimelineModal"')
+        popover_idx = content.find('id="tokenActionPopover"')
+        self.assertGreater(timeline_idx, 0)
+        self.assertGreater(popover_idx, timeline_idx)
+        between = content[timeline_idx:popover_idx]
+        # Must have closed modal-footer, .modal, and #tagTimelineModal (3 closing tags before popover)
+        self.assertIn("</div>\n</div>\n</div>", between.replace(" ", "").replace("\t", "").replace("\r", ""))
+
+        # 2. Verify tokenActionPopover is fixed and stops propagation
+        self.assertIn('position: fixed;', content[popover_idx:popover_idx + 250])
+        self.assertIn('onclick="event.stopPropagation()"', content[popover_idx:popover_idx + 250])
+
+        # 3. Verify handleTokenClick and data attributes
+        self.assertIn('function handleTokenClick(el, event)', content)
+        self.assertIn('data-token-text=', content)
+        self.assertIn('data-token-type=', content)
+        self.assertIn('handleTokenClick(this, event)', content)
+
+        # 4. Verify raw files bypass in highlightLineText
+        self.assertIn('Raw files should NOT be parsed by any parser or lexer', content)
+        self.assertIn('if (!isC && !isAsm && !isKconfig && !isRust)', content)
+        self.assertIn('return { html: escapeHtml(rawText), inComment: false };', content)
 
 
 if __name__ == "__main__":

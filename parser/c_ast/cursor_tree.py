@@ -945,7 +945,7 @@ class AST_Initializer(AST_Expression):
             return
         self.data.append(spelling)
 
-    def extract(self, CS: Any, create_tag: bool = True) -> None:
+    def extract(self, CS: Any, create_tag: bool = False) -> None:
         if self.cur_entry is not None:
             self.entries.append(self.cur_entry)
             self.cur_entry = None
@@ -956,7 +956,7 @@ class AST_Initializer(AST_Expression):
             p = 0
             for entry in self.entries:
                 member_node = Ast_MemberRefExpr(entry.member_line, entry.member_name, cursor=entry.member_cursor)
-                member_node.extract(CS, create_tag=create_tag)
+                member_node.extract(CS, create_tag=False)
                 container_items.append((p, int(ASTT.C_MemberRefExpr), member_node.ast_ref))
                 p += 1
 
@@ -978,7 +978,7 @@ class AST_Initializer(AST_Expression):
                     val_name = str(val_tok.spelling_str)[:255] if val_tok is not None else ""
                     val_ext = entry.value_extent or (val_tok.line if val_tok is not None else entry.member_line)
                     val_node = Ast_DeclRefExpr(val_ext, val_name, cursor=val_cur)
-                    val_node.extract(CS, create_tag=create_tag)
+                    val_node.extract(CS, create_tag=False)
                     container_items.append((p, int(val_node.type_id), val_node.ast_ref))
                     p += 1
 
@@ -1011,19 +1011,19 @@ class AST_Initializer(AST_Expression):
         for call_expr in self.call_exprs:
             with CS(REF_NO_REF):
                 try:
-                    call_expr.extract(CS, create_tag=create_tag)
+                    call_expr.extract(CS, create_tag=False)
                 except TypeError:
                     call_expr.extract(CS)
         for member_ref in self.member_refs:
             with CS(REF_NO_REF):
                 try:
-                    member_ref.extract(CS, create_tag=create_tag)
+                    member_ref.extract(CS, create_tag=False)
                 except TypeError:
                     member_ref.extract(CS)
         for decl_ref in self.decl_refs:
             with CS(REF_NO_REF):
                 try:
-                    decl_ref.extract(CS, create_tag=create_tag)
+                    decl_ref.extract(CS, create_tag=False)
                 except TypeError:
                     decl_ref.extract(CS)
 
@@ -1138,6 +1138,10 @@ class C_Type(Ast):
                     return False
             case End_Mode.Extent:
                 if not self.extent.is_inside(tline):
+                    if ast_kind == AST_KIND.punctuation and tspelling == "=":
+                        self.end_mode = End_Mode.Auto
+                        self.extent.grow(tline)
+                        return True
                     self.need_processing = False
                     return False
                 if ast_kind == AST_KIND.punctuation and tspelling == ";":
@@ -1598,7 +1602,7 @@ class C_Type(Ast):
 
         for zone in self.zones:
             with CS(REF_MULTI):
-                zone.extract(CS, create_tags=(create_tag if zone.zone_type == Zone_Type.Initializer_Expr else False))
+                zone.extract(CS, create_tags=False)
                 link = tuple(CS.route[-2:])
                 if zone.zone_type == Zone_Type.Declared_Args:
                     declared_args_link = link

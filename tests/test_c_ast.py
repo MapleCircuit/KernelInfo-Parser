@@ -48,7 +48,7 @@ from parser.c_ast import safe_spelling, safe_cursor_spelling
 TEST_SUITE: list[dict[str, Any]] = [
     {
         "file": "include/linux/drbd_tag_magic.h",
-        "baseline_ast_ops": 457,
+        "baseline_ast_ops": 294,
         "description": "Kernel Header (drbd_tag_magic.h)",
     },
     {
@@ -58,27 +58,27 @@ TEST_SUITE: list[dict[str, Any]] = [
     },
     {
         "file": "include/linux/lockd/bind.h",
-        "baseline_ast_ops": 182,
+        "baseline_ast_ops": 189,
         "description": "Kernel Header (lockd/bind.h)",
     },
     {
         "file": "include/linux/netfilter_bridge/ebtables.h",
-        "baseline_ast_ops": 864,
+        "baseline_ast_ops": 868,
         "description": "Kernel Header (ebtables.h)",
     },
     {
         "file": "drivers/watchdog/w83627hf_wdt.c",
-        "baseline_ast_ops": 1483,
+        "baseline_ast_ops": 1247,
         "description": "Watchdog Driver (Latin-1 byte 0xe1 resilience)",
     },
     {
         "file": "drivers/usb/storage/isd200.c",
-        "baseline_ast_ops": 5405,
+        "baseline_ast_ops": 4074,
         "description": "USB Storage Driver (Latin-1 byte 0xf6 resilience)",
     },
     {
         "file": "include/linux/sched.h",
-        "baseline_ast_ops": 9307,
+        "baseline_ast_ops": 9343,
         "description": "Kernel Header (sched.h)",
     },
     {
@@ -93,7 +93,7 @@ TEST_SUITE: list[dict[str, Any]] = [
     },
     {
         "file": "arch/powerpc/xmon/ppc-opc.c",
-        "baseline_ast_ops": 93335,
+        "baseline_ast_ops": 4192,
         "description": "PowerPC Opcode Table & Large Initializer Array (ppc-opc.c)",
     },
 ]
@@ -2397,6 +2397,85 @@ const struct xattr_handler btrfs_xattr_acl_access_handler = {
         finally:
             if temp_dir and os.path.exists(temp_dir):
                 shutil.rmtree(temp_dir, ignore_errors=True)
+
+    def test_struct_designated_initializer_canonical_tag(self) -> None:
+        """Verify struct variable declarations with designated initializers produce exactly 1 tag covering the complete statement."""
+        temp_dir = None
+        try:
+            MockDB._global_store.clear()
+            G.DB = MockDB
+            G.TE = get_table_engine("cached")()
+            gp = GreatProcessor()
+            init_db_layout(gp)
+            G.TE.start(gp.Table_Array, G.DB)
+
+            mf = MasterFile()
+            temp_dir = mf.create_temp_dir()
+            mf.version_dict["v3.0"] = temp_dir
+            G.MF = mf
+            gp.Version_Name = "v3.0"
+            gp.VID = 1
+
+            file_path = "fs/9p/acl.c"
+            full_path = os.path.join(temp_dir, file_path)
+            os.makedirs(os.path.dirname(full_path), exist_ok=True)
+            snippet = """const struct xattr_handler v9fs_xattr_acl_access_handler = {
+\t.prefix\t= POSIX_ACL_XATTR_ACCESS,
+\t.flags\t= ACL_TYPE_ACCESS,
+\t.get\t= v9fs_xattr_get_acl,
+\t.set\t= v9fs_xattr_set_acl,
+};
+"""
+            with open(full_path, "w") as f:
+                f.write(snippet)
+
+            cs = ChangeSet(f"A\t{file_path}")
+            cs.current_vid = 1
+            cs.gp = gp
+            cs.mf = mf
+            G.CURRENT_PARSING_FILE = file_path
+
+            default_processing(cs, gp)
+            cs.parse()
+            self.assertTrue(cs.execute())
+            G.TE.commit_all()
+
+            db_tag = MockDB._global_store.get(m_tag.table_name, {})
+            db_tag_code = MockDB._global_store.get(m_tag_code.table_name, {})
+            db_ast = MockDB._global_store.get(m_ast.table_name, {})
+            db_cont = MockDB._global_store.get(m_ast_container.table_name, {})
+
+            # Exactly 1 tag produced for the complete struct declaration
+            self.assertEqual(len(db_tag), 1, f"Expected 1 tag for struct declaration, got {len(db_tag)}")
+            trow = next(iter(db_tag.values()))
+            tag_code = db_tag_code[trow[3]][1]
+            self.assertTrue(tag_code.startswith("const struct xattr_handler v9fs_xattr_acl_access_handler"))
+            self.assertTrue(tag_code.rstrip().endswith("};"))
+
+            # All inner members and values linked under C_InitListExpr in m_ast_container
+            handler_ast_id = trow[4]
+            self.assertEqual(db_ast[handler_ast_id][1], "v9fs_xattr_acl_access_handler")
+
+            init_list_id = None
+            for crow in db_cont.values():
+                if crow[0] == handler_ast_id and crow[2] == ASTT.C_InitListExpr:
+                    init_list_id = crow[3]
+                    break
+            self.assertIsNotNone(init_list_id, "C_InitListExpr not found in handler container")
+
+            member_names = {db_ast[crow[3]][1] for crow in db_cont.values() if crow[0] == init_list_id and crow[2] == ASTT.C_MemberRefExpr}
+            val_names = {db_ast[crow[3]][1] for crow in db_cont.values() if crow[0] == init_list_id and crow[2] == ASTT.C_DeclRefExpr}
+            self.assertEqual(member_names, {"prefix", "flags", "get", "set"})
+            self.assertEqual(val_names, {"POSIX_ACL_XATTR_ACCESS", "ACL_TYPE_ACCESS", "v9fs_xattr_get_acl", "v9fs_xattr_set_acl"})
+        finally:
+            if temp_dir and os.path.exists(temp_dir):
+                shutil.rmtree(temp_dir, ignore_errors=True)
+            if G.TE:
+                try:
+                    G.TE.close()
+                except Exception:
+                    pass
+
 
 
 def assert_file_tag_fidelity(

@@ -48,14 +48,15 @@ For exhaustive architectural specifications, endpoint schemas, state machines, a
 - `GET /api/commit?version={v}&commit_id={id}`: Full commit details, multi-contributor trailers, and modified files/tags.
 - `POST /api/patch/format`: Generate RFC-2822 compliant `git format-patch` emails with automated maintainer CC lists.
 
-### 5. Semantic Analysis & Visual Modeling Tools
+### 5. Semantic Analysis, Symbols & Visual Modeling Tools
 - `GET /api/dag/data?version={v}&symbol={sym}`: Dependency Directed Acyclic Graph (DAG) for canvas visualization.
 - `GET /api/treemap/data?version={v}&path={p}`: Squarified directory treemap with Lines-of-Code metrics.
 - `GET /api/struct/layout?version={v}&name={struct_name}`: Pahole-style memory alignment and padding analysis.
-- `GET /api/callgraph?version={v}&func={func_name}`: Bidirectional function caller/callee hierarchy.
-- `GET /api/codetour/presets`: Pre-configured guided tours of key kernel subsystems.
-- `POST /api/bloat/estimate`: Estimate `vmlinux` size impact from active configuration changes.
-- `GET /api/symbols/search?version={v}&q={prefix}`: Global symbol autocompletion across C and Kconfig.
-- `POST /api/ast/sandbox/query`: Multi-constraint relational AST search.
+- `GET /api/symbols/search?version_name={v}&q={prefix}&limit={n}`: Fast prefix search across defined symbols using `m_symbol_def`.
+- `GET /api/symbols/lookup?version_name={v}&q={prefix}&limit={n}`: Fast typeahead symbol name suggestions.
+- `GET /api/version/{version_name}/symbol/{symbol_name}`: Authoritative definition, declarations, and usages across the codebase.
+- `GET /api/version/{version_name}/xref/{symbol_name}`: Cross-reference definitions and categorized usage references (`calls`, `member_refs`, `type_usages`, `declarations`) powered by `m_symbol_def` and `m_symbol_ref`.
+- `GET /api/version/{version_name}/callgraph/{function_name}`: Bidirectional function caller/callee flow using `m_symbol_def` and `m_symbol_ref`.
+- `GET /api/ast/{ast_id}/tree?version_name={v}&depth={d}`: Recursive `m_ast_container` hierarchy traversal with `tag_id` annotation for tagged nodes (`None` for untagged statement/expression nodes).
 - `GET /api/tag/{tag_id}`: Direct tag metadata and spatial AST coordinate map inspection.
 - `GET /api/tag/{tag_id}/timeline`: Cross-version code evolution history, timeline snapshots, diffs, and commit contexts.

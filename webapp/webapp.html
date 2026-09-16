@@ -366,17 +366,20 @@
       color: var(--accent);
       cursor: pointer;
       opacity: 0.7;
+      user-select: none;
+      -webkit-user-select: none;
     }
     .collapse-btn:hover { opacity: 1; }
     .code-body {
       flex: 1;
       padding: 12px 16px;
-      white-space: pre;
+      white-space: normal;
     }
     .code-line {
       height: 21px;
       display: block;
       cursor: text;
+      white-space: pre;
     }
     .code-line.collapsed,
     .gutter-line.collapsed {
@@ -1575,6 +1578,74 @@
       background: rgba(224, 108, 117, 0.3);
       color: #e06c75;
     }
+    /* Global Symbol Search and Token Context Popover */
+    .global-symbol-search-box {
+      position: relative;
+      width: 250px;
+    }
+    .symbol-search-input {
+      width: 100%;
+      box-sizing: border-box;
+      background: var(--bg-card);
+      border: 1px solid var(--border-color);
+      color: var(--text-bright);
+      padding: 5px 10px;
+      border-radius: 4px;
+      font-size: 12px;
+      outline: none;
+      transition: border-color 0.15s ease, box-shadow 0.15s ease;
+    }
+    .symbol-search-input:focus {
+      border-color: var(--accent);
+      box-shadow: 0 0 0 2px rgba(97, 175, 239, 0.2);
+    }
+    .symbol-search-dropdown {
+      display: none;
+      position: absolute;
+      top: calc(100% + 4px);
+      left: 0;
+      right: 0;
+      max-height: 380px;
+      overflow-y: auto;
+      background: var(--bg-card);
+      border: 1px solid var(--border-color);
+      border-radius: 4px;
+      z-index: 10000;
+      box-shadow: 0 8px 24px rgba(0,0,0,0.6);
+    }
+    .symbol-search-item {
+      padding: 7px 12px;
+      cursor: pointer;
+      border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      transition: background 0.12s ease;
+    }
+    .symbol-search-item:hover, .symbol-search-item.selected {
+      background: rgba(97, 175, 239, 0.2);
+    }
+    .token-action-popover {
+      animation: fadeIn 0.1s ease-out;
+    }
+    .popover-action-btn {
+      background: none;
+      border: none;
+      color: var(--text-main);
+      padding: 6px 14px;
+      font-size: 12px;
+      text-align: left;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      width: 100%;
+      transition: background 0.12s ease;
+    }
+    .popover-action-btn:hover {
+      background: var(--border-color);
+      color: var(--text-bright);
+    }
   </style>
 </head>
 <body>
@@ -1591,7 +1662,6 @@
         <button id="btnModeTui" class="btn btn-mode" onclick="openNewTab('tui', currentVersion)">📟 Terminal Menuconfig</button>
         <button id="btnModeDiff" class="btn btn-mode" onclick="openDiffNewTab()">🔀 Version Diff</button>
         <button id="btnModePatch" class="btn btn-mode" onclick="openNewTab('patch', currentVersion)">📋 Patch Matcher</button>
-        <button id="btnModeAstSandbox" class="btn btn-mode" onclick="openNewTab('ast_sandbox', currentVersion)">🔍 AST Query Sandbox</button>
         <button id="btnModeTreemap" class="btn btn-mode" onclick="openNewTab('treemap', currentVersion)">🗺️ Treemap</button>
         <button id="btnModeMaintainers" class="btn btn-mode" onclick="openNewTab('maintainers', currentVersion)">👥 Subsystems</button>
         <button id="btnModeCredits" class="btn btn-mode" onclick="openNewTab('credits', currentVersion)">🏆 Credits</button>
@@ -1605,6 +1675,11 @@
       </div>
     </div>
     <div class="topbar-right">
+      <!-- Global Symbol Search Bar with Fast Typeahead Autocomplete -->
+      <div class="global-symbol-search-box">
+        <input type="text" id="globalSymbolSearchInput" class="symbol-search-input" placeholder="🔍 Search symbols... (Ctrl+K)" autocomplete="off" oninput="onGlobalSymbolSearchInput(this.value)" onkeydown="onGlobalSymbolSearchKeydown(event)">
+        <div id="globalSymbolSearchDropdown" class="symbol-search-dropdown"></div>
+      </div>
       <button class="btn" onclick="openXrefModal()" title="Global Symbol Cross-Reference &amp; Usages">
         <span>🌐</span> XRef
       </button>
@@ -1616,9 +1691,6 @@
       </button>
       <button class="btn" onclick="openCallGraphModal()" title="Function Call Graph &amp; Callers/Callees">
         <span>🌳</span> Call Graph
-      </button>
-      <button class="btn" onclick="openCodeTourModal()" title="Interactive Codebase Architecture Tours">
-        <span>🚀</span> Tours
       </button>
       <button class="btn" onclick="openPatchStudioModal()" title="In-Browser Patch Staging &amp; git format-patch">
         <span>✍️</span> Patch Studio
@@ -1719,7 +1791,6 @@
         <button class="btn" id="btnTargetProfile" onclick="openKconfigProfileModal()">🌐 Target Profile</button>
         <button class="btn" id="btnKconfigDefconfig" onclick="openKconfigDefconfigModal()">⚙️ Defconfig</button>
         <button class="btn" onclick="openKconfigCompareModal()">📊 Compare Defconfig</button>
-        <button class="btn" onclick="openBloatometerModal()">📈 Bloat-O-Meter</button>
         <button class="btn" onclick="resetKconfigDefaults()">🔄 Reset Defaults</button>
         <button class="btn" onclick="openKconfigImportModal()">📥 Import .config</button>
         <button class="btn btn-accent" onclick="openKconfigExportModal()">💾 Export .config</button>
@@ -1897,38 +1968,6 @@
     </div>
   </div>
 
-  <!-- AST Semantic Query Sandbox Workspace -->
-  <div id="astSandboxWorkspace" class="ast-sandbox-workspace" style="display: none; padding: 18px 24px;">
-    <div style="margin-bottom: 14px;">
-      <h2 style="font-size: 17px; color: var(--text-bright); margin-bottom: 4px;">🔍 AST Semantic Query Sandbox</h2>
-      <p style="font-size: 12px; color: var(--text-muted);">Search and filter kernel AST elements using structural constraints such as AST type, identifier pattern, file path prefix, and container depth.</p>
-    </div>
-
-    <div style="background: var(--bg-sidebar); border: 1px solid var(--border-color); border-radius: 6px; padding: 14px 18px; display: flex; gap: 14px; align-items: flex-end; flex-wrap: wrap; margin-bottom: 16px;">
-      <div>
-        <label style="font-size: 11px; color: var(--text-muted); display: block; margin-bottom: 4px;">AST Type Filter:</label>
-        <select id="astQueryTypeSelect" class="version-selector" style="min-width: 180px;">
-          <option value="">All Types (Struct, Func, Macro, etc.)</option>
-        </select>
-      </div>
-      <div>
-        <label style="font-size: 11px; color: var(--text-muted); display: block; margin-bottom: 4px;">Symbol Name Pattern (% wildcard):</label>
-        <input type="text" id="astQueryNamePattern" class="kconfig-input" placeholder="e.g. ext4_% or kmalloc" style="min-width: 180px;">
-      </div>
-      <div>
-        <label style="font-size: 11px; color: var(--text-muted); display: block; margin-bottom: 4px;">Path Prefix:</label>
-        <input type="text" id="astQueryPathPrefix" class="kconfig-input" placeholder="e.g. fs/ or drivers/net/" style="min-width: 160px;">
-      </div>
-      <button class="btn btn-accent" style="padding: 6px 16px; font-weight: bold;" onclick="runAstQuery(0)">▶ Execute Query</button>
-    </div>
-
-    <div id="astQueryResultsContainer">
-      <div style="text-align: center; color: var(--text-muted); padding: 40px; background: var(--bg-card); border: 1px solid var(--border-color); border-radius: 6px;">
-        Configure search parameters above and click "Execute Query" to inspect AST symbols.
-      </div>
-    </div>
-  </div>
-
   <!-- Interactive Codebase Treemap Workspace -->
   <div id="treemapWorkspace" class="treemap-workspace" style="display: none; padding: 18px 24px;">
     <div style="background: var(--bg-sidebar); border: 1px solid var(--border-color); border-radius: 6px; padding: 12px 18px; display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px; flex-wrap: wrap; gap: 12px;">
@@ -2013,21 +2052,6 @@
     </div>
   </div>
 
-  <!-- Dedicated Code Tour Tab Workspace -->
-  <div id="tourWorkspace" class="tour-workspace" style="display: none; padding: 18px 24px; overflow-y: auto;">
-    <div style="background: var(--bg-sidebar); border: 1px solid var(--border-color); border-radius: 6px; padding: 12px 18px; display: flex; gap: 14px; align-items: center; margin-bottom: 16px; flex-wrap: wrap;">
-      <span style="font-weight: bold; color: var(--text-bright);">🚀 Architecture Tours:</span>
-      <select id="tourWsSelect" class="version-selector" style="flex: 1; max-width: 450px;" onchange="onSelectTourPreset(this.value)">
-        <option value="vfs_open_journey">VFS Virtual File System: Path Lookup &amp; File Open</option>
-        <option value="slab_alloc_journey">Kernel Memory: SLAB / SLUB Cache Allocation</option>
-      </select>
-      <button class="btn btn-accent" onclick="startCurrentTour()">Start Tour</button>
-    </div>
-    <div id="tourWsStepContainer">
-      <!-- Dynamic Tour Steps -->
-    </div>
-  </div>
-
   <!-- Dedicated Patch Staging Studio Tab Workspace -->
   <div id="patchStudioWorkspace" class="patch-studio-workspace" style="display: none; padding: 18px 24px; overflow-y: auto;">
     <div style="background: var(--bg-sidebar); border: 1px solid var(--border-color); border-radius: 6px; padding: 12px 18px; margin-bottom: 16px;">
@@ -2053,16 +2077,6 @@
         <label style="font-size: 11px; color: var(--accent); font-weight: bold; display: block; margin-bottom: 4px;">Formatted RFC-2822 Output:</label>
         <textarea id="patchStudioWsOutput" class="patch-textarea" style="height: 180px; font-size: 11px;" readonly placeholder="Formatted git patch output..."></textarea>
       </div>
-    </div>
-  </div>
-
-  <!-- Dedicated Bloat-O-Meter Tab Workspace -->
-  <div id="bloatometerWorkspace" class="bloatometer-workspace" style="display: none; padding: 18px 24px; overflow-y: auto;">
-    <div style="background: var(--bg-sidebar); border: 1px solid var(--border-color); border-radius: 6px; padding: 12px 18px; margin-bottom: 16px;">
-      <h3 style="font-size: 15px; color: var(--text-bright); margin-bottom: 8px;">📈 Kconfig Binary Footprint &amp; Bloat-O-Meter</h3>
-      <p style="font-size: 12px; color: var(--text-muted); margin-bottom: 14px;">Estimates compiled C files, source lines of code (LOC), and uncompressed binary size for active kernel config.</p>
-      <div id="bloatometerWsSummaryCards" style="display: flex; gap: 12px; margin-bottom: 14px; flex-wrap: wrap;"></div>
-      <div id="bloatometerWsBreakdown"></div>
     </div>
   </div>
 
@@ -2754,38 +2768,6 @@
     </div>
   </div>
 
-  <!-- Interactive Code Tours Modal -->
-  <div id="codeTourModal" class="modal-overlay">
-    <div class="modal" style="max-width: 800px; max-height: 88vh; display: flex; flex-direction: column;">
-      <div class="modal-header">
-        <h3>🚀 Interactive Kernel Codebase Architecture Tours</h3>
-        <div style="display: flex; gap: 8px; align-items: center;">
-          <button class="btn" style="padding: 2px 8px; font-size: 11px;" onclick="openModalAsNewTab('codeTourModal')" title="Open this tool in a dedicated tab">↗ Open in new tab</button>
-          <button class="btn" onclick="closeCodeTourModal()">✕</button>
-        </div>
-      </div>
-      <div class="modal-body" style="padding: 20px; overflow-y: auto; flex: 1;">
-        <div style="display: flex; gap: 12px; align-items: center; margin-bottom: 16px;">
-          <select id="codeTourSelect" class="version-selector" style="flex: 1;" onchange="onSelectTourPreset(this.value)">
-            <option value="vfs_open_journey">VFS Virtual File System: Path Lookup &amp; File Open</option>
-            <option value="slab_alloc_journey">Kernel Memory: SLAB / SLUB Cache Allocation</option>
-          </select>
-          <button class="btn btn-accent" onclick="startCurrentTour()">Start Tour</button>
-        </div>
-        <div id="codeTourStepContainer">
-          <!-- Dynamic Tour Step Card -->
-        </div>
-      </div>
-      <div class="modal-footer" style="display: flex; justify-content: space-between;">
-        <div style="display: flex; gap: 8px;">
-          <button class="btn" id="btnTourPrev" onclick="navigateTourStep(-1)" disabled>◀ Previous Step</button>
-          <button class="btn btn-accent" id="btnTourNext" onclick="navigateTourStep(1)">Next Step ▶</button>
-        </div>
-        <button class="btn" onclick="closeCodeTourModal()">Close Tour</button>
-      </div>
-    </div>
-  </div>
-
   <!-- In-Browser Patch Staging Studio Modal -->
   <div id="patchStudioModal" class="modal-overlay">
     <div class="modal" style="max-width: 920px; max-height: 90vh; display: flex; flex-direction: column;">
@@ -2832,30 +2814,6 @@
         <button class="btn" onclick="copyFormattedPatch()">📋 Copy Patch</button>
         <button class="btn btn-accent" onclick="downloadFormattedPatchFile()">⬇️ Download .patch</button>
         <button class="btn" onclick="closePatchStudioModal()">Close</button>
-      </div>
-    </div>
-  </div>
-
-  <!-- Kconfig Bloat-O-Meter Modal -->
-  <div id="bloatometerModal" class="modal-overlay">
-    <div class="modal" style="max-width: 820px; max-height: 85vh; display: flex; flex-direction: column;">
-      <div class="modal-header">
-        <h3>📈 Kconfig Binary Footprint &amp; Size Estimator (Bloat-O-Meter)</h3>
-        <div style="display: flex; gap: 8px; align-items: center;">
-          <button class="btn" style="padding: 2px 8px; font-size: 11px;" onclick="openModalAsNewTab('bloatometerModal')" title="Open this tool in a dedicated tab">↗ Open in new tab</button>
-          <button class="btn" onclick="closeBloatometerModal()">✕</button>
-        </div>
-      </div>
-      <div class="modal-body" style="padding: 18px 22px; overflow-y: auto; flex: 1;">
-        <div id="bloatometerSummaryCards" style="display: flex; gap: 12px; margin-bottom: 16px; flex-wrap: wrap;">
-          <!-- Dynamic Bloat-O-Meter Cards -->
-        </div>
-        <div id="bloatometerBreakdownArea">
-          <!-- Dynamic Files List -->
-        </div>
-      </div>
-      <div class="modal-footer">
-        <button class="btn btn-accent" onclick="closeBloatometerModal()">Close</button>
       </div>
     </div>
   </div>
@@ -2934,6 +2892,28 @@
         </span>
         <button class="btn" onclick="closeTagTimelineModal()">Close</button>
       </div>
+    </div>
+  </div>
+
+  <!-- Floating Token Context Action Popover -->
+  <div id="tokenActionPopover" class="token-action-popover" onclick="event.stopPropagation()" style="display: none; position: fixed; z-index: 10001; background: var(--bg-card); border: 1px solid var(--border-color); border-radius: 6px; box-shadow: 0 8px 24px rgba(0,0,0,0.5); min-width: 220px; padding: 6px 0;">
+    <div id="tokenPopoverHeader" style="padding: 6px 12px; font-size: 11px; font-weight: bold; color: var(--accent); border-bottom: 1px solid var(--border-color); display: flex; justify-content: space-between; align-items: center;">
+      <span id="tokenPopoverSymbol">symbol</span>
+      <span id="tokenPopoverType" class="badge" style="font-size: 9px;">type</span>
+    </div>
+    <div style="display: flex; flex-direction: column; padding: 4px 0;">
+      <button class="popover-action-btn" id="btnPopoverGotoDef" onclick="popoverGotoDef()">
+        <span>📖</span> Go to Definition
+      </button>
+      <button class="popover-action-btn" id="btnPopoverXref" onclick="popoverOpenXref()">
+        <span>🌐</span> Find References (XRef)
+      </button>
+      <button class="popover-action-btn" id="btnPopoverCallGraph" onclick="popoverOpenCallGraph()">
+        <span>🌳</span> Function Call Graph
+      </button>
+      <button class="popover-action-btn" id="btnPopoverAst" onclick="popoverInspectAst()">
+        <span>🔍</span> Inspect AST Node
+      </button>
     </div>
   </div>
 
@@ -3463,12 +3443,8 @@
           return `📐 [${version}] Pahole: ${params.struct_name || 'task_struct'}`;
         case "callgraph":
           return `🌳 [${version}] Call: ${params.func_name || 'ext4_fill_super'}`;
-        case "tour":
-          return `🚀 [${version}] Tour: ${params.tour_id ? params.tour_id.split('_')[0].toUpperCase() : 'VFS'}`;
         case "patch_studio":
           return `✍️ [${version}] Patch Studio: ${params.path ? params.path.split('/').pop() : 'super.c'}`;
-        case "bloatometer":
-          return `📈 [${version}] Bloat-O-Meter`;
         case "xref":
           return `🌐 [${version}] XRef: ${params.symbol || 'Search'}`;
         case "diff_kconfig": {
@@ -3503,7 +3479,6 @@
         if (type === "dag") return (t.params.symbol || "") === (params.symbol || "");
         if (type === "struct") return (t.params.struct_name || "") === (params.struct_name || "");
         if (type === "callgraph") return (t.params.func_name || "") === (params.func_name || "");
-        if (type === "tour") return (t.params.tour_id || "") === (params.tour_id || "");
         if (type === "diff") return (t.params.diff_v2 || "") === (params.diff_v2 || "");
         if (type === "subsystem") return (t.params.section || "") === (params.section || "");
         if (type === "person") return (t.params.person || "") === (params.person || "");
@@ -3518,7 +3493,6 @@
         if (params.symbol !== undefined) existing.params.symbol = params.symbol;
         if (params.struct_name !== undefined) existing.params.struct_name = params.struct_name;
         if (params.func_name !== undefined) existing.params.func_name = params.func_name;
-        if (params.tour_id !== undefined) existing.params.tour_id = params.tour_id;
         if (params.section !== undefined) existing.params.section = params.section;
         if (params.person !== undefined) existing.params.person = params.person;
         if (params.commit !== undefined) existing.params.commit = params.commit;
@@ -3599,9 +3573,9 @@
       // Hide all workspaces
       const allWorkspaces = [
         "explorerWorkspace", "kconfigWorkspace", "tuiWorkspace", "diffWorkspace",
-        "patchWorkspace", "astSandboxWorkspace", "treemapWorkspace", "maintainersWorkspace",
+        "patchWorkspace", "treemapWorkspace", "maintainersWorkspace",
         "creditsWorkspace", "timelineWorkspace", "dagWorkspace", "structWorkspace",
-        "callgraphWorkspace", "tourWorkspace", "patchStudioWorkspace", "bloatometerWorkspace",
+        "callgraphWorkspace", "patchStudioWorkspace",
         "xrefWorkspace", "subsystemWorkspace", "personWorkspace", "commitWorkspace"
       ];
       allWorkspaces.forEach(wsId => {
@@ -3617,7 +3591,6 @@
         "tui": "btnModeTui",
         "diff": "btnModeDiff",
         "patch": "btnModePatch",
-        "ast_sandbox": "btnModeAstSandbox",
         "treemap": "btnModeTreemap",
         "maintainers": "btnModeMaintainers",
         "credits": "btnModeCredits",
@@ -3674,13 +3647,6 @@
         case "patch":
           const patchWs = document.getElementById("patchWorkspace");
           if (patchWs) patchWs.style.display = "block";
-          break;
-        case "ast_sandbox":
-          const astWs = document.getElementById("astSandboxWorkspace");
-          if (astWs) {
-            astWs.style.display = "block";
-            initAstSandboxWorkspace();
-          }
           break;
         case "treemap":
           const tmWs = document.getElementById("treemapWorkspace");
@@ -3785,16 +3751,6 @@
             loadFunctionCallGraph(fName);
           }
           break;
-        case "tour":
-          const tourWs = document.getElementById("tourWorkspace");
-          if (tourWs) {
-            tourWs.style.display = "block";
-            const tId = tab.params.tour_id || "vfs_open_journey";
-            const tSel = document.getElementById("tourWsSelect");
-            if (tSel) tSel.value = tId;
-            startCurrentTour();
-          }
-          break;
         case "patch_studio":
           const psWs = document.getElementById("patchStudioWorkspace");
           if (psWs) {
@@ -3803,13 +3759,6 @@
               const pInp = document.getElementById("patchStudioWsFilePath");
               if (pInp) pInp.value = tab.params.path;
             }
-          }
-          break;
-        case "bloatometer":
-          const bloatWs = document.getElementById("bloatometerWorkspace");
-          if (bloatWs) {
-            bloatWs.style.display = "block";
-            loadBloatometerFootprint();
           }
           break;
         case "xref":
@@ -3851,7 +3800,7 @@
       url.searchParams.set("v", tab.version);
       url.searchParams.set("mode", tab.type);
 
-      const keysToClear = ["file", "line", "sym", "struct", "func", "tour", "v1", "v2", "q", "depth", "section", "person", "commit"];
+      const keysToClear = ["file", "line", "sym", "struct", "func", "v1", "v2", "q", "depth", "section", "person", "commit"];
       keysToClear.forEach(k => url.searchParams.delete(k));
 
       if (tab.params) {
@@ -3860,7 +3809,6 @@
         if (tab.params.symbol) url.searchParams.set("sym", tab.params.symbol);
         if (tab.params.struct_name) url.searchParams.set("struct", tab.params.struct_name);
         if (tab.params.func_name) url.searchParams.set("func", tab.params.func_name);
-        if (tab.params.tour_id) url.searchParams.set("tour", tab.params.tour_id);
         if (tab.params.diff_v1) url.searchParams.set("v1", tab.params.diff_v1);
         if (tab.params.diff_v2) url.searchParams.set("v2", tab.params.diff_v2);
         if (tab.params.query) url.searchParams.set("q", tab.params.query);
@@ -3882,7 +3830,6 @@
       const symParam = url.searchParams.get("sym") || url.searchParams.get("symbol");
       const structParam = url.searchParams.get("struct");
       const funcParam = url.searchParams.get("func");
-      const tourParam = url.searchParams.get("tour");
       const v1Param = url.searchParams.get("v1");
       const v2Param = url.searchParams.get("v2");
       const qParam = url.searchParams.get("q");
@@ -3901,7 +3848,6 @@
       if (symParam) params.symbol = symParam;
       if (structParam) params.struct_name = structParam;
       if (funcParam) params.func_name = funcParam;
-      if (tourParam) params.tour_id = tourParam;
       if (v1Param) params.diff_v1 = v1Param;
       if (v2Param) params.diff_v2 = v2Param;
       if (sectionParam) params.section = sectionParam;
@@ -3936,18 +3882,9 @@
           openNewTab("callgraph", currentVersion, null, { func_name: func }, true);
           break;
         }
-        case "codeTourModal": {
-          const tour = (document.getElementById("codeTourSelect") && document.getElementById("codeTourSelect").value) || "vfs_open_journey";
-          openNewTab("tour", currentVersion, null, { tour_id: tour }, true);
-          break;
-        }
         case "patchStudioModal": {
           const file = (document.getElementById("patchStudioFilePath") && document.getElementById("patchStudioFilePath").value) || "";
           openNewTab("patch_studio", currentVersion, null, { path: file }, true);
-          break;
-        }
-        case "bloatometerModal": {
-          openNewTab("bloatometer", currentVersion, null, {}, true);
           break;
         }
         case "xrefModal": {
@@ -4060,7 +3997,6 @@
       const data = await apiFetchCached("/api/type_descriptors", "metadata", "type_descriptors");
       if (data) {
         typeDescriptors = data;
-        initAstSandboxWorkspace();
       }
     }
 
@@ -5292,16 +5228,30 @@
       return resultHtml;
     }
 
-    function highlightLineText(rawText, lineMaps, inCommentState = false, ftype = 1, fname = "") {
+    function highlightLineText(rawText, lineMaps, inCommentState = false, ftype = null, fname = "") {
       if (!rawText) return { html: "", inComment: inCommentState };
 
+      // Determine file grammar/language type
+      const isC = (ftype === 1) || (fname && (fname.endsWith(".c") || fname.endsWith(".h")));
+      const isAsm = (ftype === 4) || (fname && (fname.endsWith(".S") || fname.endsWith(".s")));
+      const isKconfig = (ftype === 2) || (fname && (fname.includes("Kconfig") || fname.startsWith("Kconfig")));
+      const isRust = (ftype === 3) || (fname && fname.endsWith(".rs"));
+
+      // Raw files (documentation, README, licenses, build scripts, plaintext, etc.):
+      // Raw files should NOT be parsed by any parser or lexer; just return escaped plain text.
+      if (!isC && !isAsm && !isKconfig && !isRust) {
+        return { html: escapeHtml(rawText), inComment: false };
+      }
+
       let lexResult;
-      if (ftype === 4 || (fname && (fname.endsWith(".S") || fname.endsWith(".s")))) {
+      if (isAsm) {
         lexResult = lexAsmLine(rawText, inCommentState);
-      } else if (ftype === 2 || (fname && fname.includes("Kconfig"))) {
+      } else if (isKconfig) {
         lexResult = lexKconfigLine(rawText);
-      } else {
+      } else if (isC) {
         lexResult = lexCLine(rawText, inCommentState);
+      } else {
+        return { html: escapeHtml(rawText), inComment: false };
       }
 
       const { tokens, inComment: nextInComment } = lexResult;
@@ -5378,22 +5328,35 @@
         const tokenColor = (hlConfig.enabled !== false) ? hlConfig.color : "#abb2bf";
 
         const astContext = winningMap || parentTok;
-        const isSemantic = SEMANTIC_TOKEN_TYPES.has(typeKey) || (tok.typeKey && SEMANTIC_TOKEN_TYPES.has(tok.typeKey));
+        const isClickableSymbol = (
+          typeKey === "C_DeclRefExpr" || typeKey === "C_MemberRefExpr" || typeKey === "C_CallExpr" ||
+          typeKey === "C_functionproto" || typeKey === "C_functionprotodecl" || typeKey === "C_functionprotnotbind" ||
+          typeKey === "C_struct" || typeKey === "C_structdecl" || typeKey === "C_structnotbind" ||
+          typeKey === "C_union" || typeKey === "C_uniondecl" || typeKey === "C_enum" || typeKey === "C_enumdecl" ||
+          typeKey === "C_SCtypedef" || typeKey === "C_TypeRef" || typeKey === "C_LabelStmt" ||
+          typeKey === "CPPro_define" || typeKey === "CPPro_define_macro" ||
+          typeKey === "ASM_Label" || typeKey === "ASM_Macro" ||
+          (tok.typeKey && (tok.typeKey === "C_DeclRefExpr" || tok.typeKey === "C_MemberRefExpr" || tok.typeKey === "C_CallExpr" || tok.typeKey === "CPPro_define")) ||
+          (/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(text) && !C_KEYWORDS_MAP[text] && !C_STORAGE_QUAL_MAP[text] && !C_PRIMITIVE_TYPES[text] && !C_STRUCT_UNION_ENUM[text])
+        );
 
         let clickAttr = "";
         let classNames = "token";
 
-        if (isSemantic && astContext && astContext.ast_id) {
+        if (isClickableSymbol) {
           classNames += " token-clickable";
-          clickAttr = `onclick="inspectAstTarget(${astContext.ast_id}, '${escapeJsString(text)}', '${escapeJsString(typeKey)}', '${escapeJsString(astContext.ast_name || '')}', '${escapeJsString(astContext.type_name || astContext.ast_type_name || '')}', event)"`;
+          const targetAstId = (astContext && astContext.ast_id) ? astContext.ast_id : "null";
+          const targetAstName = astContext ? (astContext.ast_name || "") : "";
+          const targetTypeName = astContext ? (astContext.type_name || astContext.ast_type_name || "") : "";
+          clickAttr = ` data-token-text="${escapeHtml(text)}" data-token-type="${escapeHtml(typeKey || 'Identifier')}" data-ast-id="${escapeHtml(String(targetAstId))}" data-ast-name="${escapeHtml(targetAstName)}" data-type-name="${escapeHtml(targetTypeName)}" onclick="handleTokenClick(this, event)"`;
         }
 
         const astTitle = (astContext && astContext.ast_name)
-          ? ` • AST: ${escapeHtml(astContext.ast_name)} (${astContext.type_name || astContext.ast_type_name || ''})${isSemantic ? ' [Click to inspect container]' : ''}`
+          ? ` • AST: ${escapeHtml(astContext.ast_name)} (${astContext.type_name || astContext.ast_type_name || ''})`
           : "";
-        const titleAttr = `title="Token: ${escapeHtml(tok.label || typeKey)} (${typeKey})${astTitle}"`;
+        const titleAttr = `title="Token: ${escapeHtml(tok.label || typeKey)} (${typeKey})${astTitle}${isClickableSymbol ? ' [Click for actions]' : ''}"`;
 
-        resultHtml += `<span class="${classNames}" style="color: ${tokenColor};" ${clickAttr} ${titleAttr}>${escapeHtml(text)}</span>`;
+        resultHtml += `<span class="${classNames}" style="color: ${tokenColor};"${clickAttr} ${titleAttr}>${escapeHtml(text)}</span>`;
       }
 
       return { html: resultHtml, inComment: nextInComment };
@@ -5689,8 +5652,15 @@
           return (a.char_s || 1) - (b.char_s || 1);
         });
 
-        const ftype = (activeFileData && activeFileData.file_info && activeFileData.file_info.ftype !== undefined) ? activeFileData.file_info.ftype : 1;
+        let ftype = (activeFileData && activeFileData.file_info && activeFileData.file_info.ftype !== undefined) ? activeFileData.file_info.ftype : null;
         const fname = (activeFileData && activeFileData.file_info && activeFileData.file_info.fname) ? activeFileData.file_info.fname : "";
+        if (ftype === null && fname) {
+          if (fname.endsWith(".c") || fname.endsWith(".h")) ftype = 1;
+          else if (fname.endsWith(".S") || fname.endsWith(".s")) ftype = 4;
+          else if (fname.includes("Kconfig") || fname.startsWith("Kconfig")) ftype = 2;
+          else if (fname.endsWith(".rs")) ftype = 3;
+          else ftype = 7;
+        }
         const { html: highlightedContent, inComment: nextInComment } = highlightLineText(rawText, lineMaps, currentInComment, ftype, fname);
         currentInComment = nextInComment;
 
@@ -5703,11 +5673,7 @@
         } else if (tagChipsEnabled && startTags.length > 1) {
           const titles = startTags.map(st => `#${st.tag_id} (${st.ast_type_name || 'Tag'})`).join(", ");
           const primaryTag = startTags[0];
-          tagChipHtml = `
-            <span class="tag-chip" onclick="openTagTimelineModal(${primaryTag.tag_id}, '${currentVersion}')" title="Tags starting on line ${l}: ${escapeHtml(titles)} (Click to view Tag #${primaryTag.tag_id} timeline)">
-              🏷️ #${primaryTag.tag_id} <span style="font-size: 8px; opacity: 0.8; margin-left: 2px;">(${startTags.length})</span>
-            </span>
-          `;
+          tagChipHtml = `<span class="tag-chip" onclick="openTagTimelineModal(${primaryTag.tag_id}, '${currentVersion}')" title="Tags starting on line ${l}: ${escapeHtml(titles)} (Click to view Tag #${primaryTag.tag_id} timeline)">🏷️ #${primaryTag.tag_id} <span style="font-size: 8px; opacity: 0.8; margin-left: 2px;">(${startTags.length})</span></span>`;
         }
 
         // Blame cell rendering
@@ -5927,19 +5893,19 @@
       if (!astId) return;
       if (activeFileTags && activeFileTags.length > 0) {
         const found = activeFileTags.find(t => t.ast_id === astId || (t.maps && t.maps.some(m => m.ast_id === astId)));
-        if (found) {
+        if (found && found.tag_id) {
           openTagTimelineModal(found.tag_id, currentVersion);
           return;
         }
       }
       try {
-        const res = await apiFetch(`/api/version/${currentVersion}/symbols/search?q=${astId}`);
-        if (res && res.symbols && res.symbols.length > 0 && res.symbols[0].tag_id) {
-          openTagTimelineModal(res.symbols[0].tag_id, currentVersion);
+        const res = await apiFetch(`/api/symbols/lookup?q=${astId}`);
+        if (res && res.length > 0 && res[0].tag_id) {
+          openTagTimelineModal(res[0].tag_id, currentVersion);
           return;
         }
       } catch (e) {}
-      openTagTimelineModal(astId, currentVersion);
+      alert(`AST node #${astId} does not have an associated tag in active release ${currentVersion}.`);
     }
 
     function closeTagTimelineModal(event) {
@@ -6247,7 +6213,7 @@
       inspector.classList.add("open");
 
       content.innerHTML = `<div style="color: var(--text-muted); padding: 10px;">Fetching recursive AST hierarchy for AST ID: ${astId}...</div>`;
-      const data = await apiFetch(`/api/ast/${astId}/tree?depth=${currentInspectorDepth}`);
+      const data = await apiFetch(`/api/ast/${astId}/tree?depth=${currentInspectorDepth}&version_name=${encodeURIComponent(currentVersion)}`);
       if (!data) {
         content.innerHTML = `<div style="color: var(--danger); padding: 10px;">Failed to load AST container tree.</div>`;
         return;
@@ -6297,14 +6263,30 @@
 
     function renderAstTreeNode(node, matchedContainer = null) {
       if (!node) return "";
+
+      let typeBadge = '';
+      const tName = node.type_name || '';
+      if (tName.endsWith('Stmt') || tName === 'C_CompoundStmt') {
+        typeBadge = `<span class="badge" style="background: rgba(239, 68, 68, 0.2); color: #f87171; margin-left: 4px;">Statement</span>`;
+      } else if (tName.endsWith('Expr') || tName === 'C_InitListExpr') {
+        typeBadge = `<span class="badge" style="background: rgba(245, 158, 11, 0.2); color: #fbbf24; margin-left: 4px;">Expression</span>`;
+      } else if (tName.startsWith('ASM_')) {
+        typeBadge = `<span class="badge" style="background: rgba(168, 85, 247, 0.2); color: #c084fc; margin-left: 4px;">Assembly</span>`;
+      }
+
+      const tagButtonHtml = (node.tag_id && node.tag_id > 0)
+        ? `<span class="badge" style="background: rgba(16, 185, 129, 0.2); color: #10b981; margin-left: 6px;">Tag #${node.tag_id}</span><button class="btn btn-sm" style="font-size: 10px; padding: 1px 6px; margin-left: 4px;" onclick="openTagTimelineModal(${node.tag_id}, currentVersion)" title="Inspect Tag evolution & cross-version timeline for Tag #${node.tag_id}">🕒 Tag Timeline</button>`
+        : '';
+
       let html = `
         <div class="tree-node">
           <div class="tree-node-title">
             <span class="badge badge-accent">AST: ${node.ast_id}</span>
             <strong style="color: var(--text-bright);">${node.name || 'Anonymous'}</strong>
             <span class="badge">${node.type_name || 'Undefined'}</span>
+            ${typeBadge}
             ${node.ast_raw ? `<span style="font-size: 10px; color: var(--text-muted); cursor: pointer;" onclick="alert(JSON.stringify(${escapeHtml(JSON.stringify(node.ast_raw))}, null, 2))">🔍 raw JSON</span>` : ''}
-            <button class="btn btn-sm" style="font-size: 10px; padding: 1px 6px; margin-left: 6px;" onclick="openTagTimelineByAst(${node.ast_id})" title="Inspect Tag evolution & cross-version timeline for AST #${node.ast_id}">🕒 Tag Timeline</button>
+            ${tagButtonHtml}
           </div>
       `;
 
@@ -6327,6 +6309,16 @@
             roleBadge += `<span class="badge" style="background: rgba(234, 179, 8, 0.2); color: #eab308; margin-right: 4px;">Used Type</span>`;
           } else if (node.type_name === 'C_functionproto' && c.priority > 0) {
             roleBadge += `<span class="badge" style="background: rgba(59, 130, 246, 0.2); color: #3b82f6; margin-right: 4px;">Param ${c.priority}</span>`;
+          } else if (c.rel_type_name === 'C_InitListExpr' || (c.child_node && c.child_node.type_name === 'C_InitListExpr')) {
+            roleBadge += `<span class="badge" style="background: rgba(245, 158, 11, 0.2); color: #fbbf24; margin-right: 4px;">Initializer List</span>`;
+          } else if (c.rel_type_name === 'C_MemberRefExpr' || (c.child_node && c.child_node.type_name === 'C_MemberRefExpr')) {
+            roleBadge += `<span class="badge" style="background: rgba(56, 189, 248, 0.2); color: #38bdf8; margin-right: 4px;">Member Ref</span>`;
+          } else if (c.rel_type_name === 'C_DeclRefExpr' || (c.child_node && c.child_node.type_name === 'C_DeclRefExpr')) {
+            roleBadge += `<span class="badge" style="background: rgba(52, 211, 153, 0.2); color: #34d399; margin-right: 4px;">Decl Ref</span>`;
+          } else if (c.rel_type_name && c.rel_type_name.endsWith('Stmt')) {
+            roleBadge += `<span class="badge" style="background: rgba(239, 68, 68, 0.2); color: #f87171; margin-right: 4px;">Statement</span>`;
+          } else if (c.rel_type_name && c.rel_type_name.startsWith('ASM_')) {
+            roleBadge += `<span class="badge" style="background: rgba(168, 85, 247, 0.2); color: #c084fc; margin-right: 4px;">Assembly</span>`;
           }
           html += `
             <div ${matchedId} class="${matchedClass}" style="margin-top: 3px;">
@@ -9589,97 +9581,306 @@
     }
 
     // =========================================================================
-    // 3. AST SEMANTIC QUERY SANDBOX CONTROLLER
+    // 3. GLOBAL SYMBOL SEARCH & TYPEAHEAD AUTOCOMPLETE CONTROLLER
     // =========================================================================
-    function initAstSandboxWorkspace() {
-      const select = document.getElementById("astQueryTypeSelect");
-      if (select && typeDescriptors.length > 0 && select.options.length <= 1) {
-        select.innerHTML = '<option value="">All Types (Struct, Func, Macro, etc.)</option>' +
-          typeDescriptors.map(t => `<option value="${t.type_id}">${escapeHtml(t.name)} (ID: ${t.type_id})</option>`).join("");
-      }
-    }
+    let globalSymbolSuggestions = [];
+    let globalSymbolSelectedIndex = -1;
 
-    async function runAstQuery(offset = 0) {
-      const typeIdVal = document.getElementById("astQueryTypeSelect").value;
-      const namePattern = document.getElementById("astQueryNamePattern").value;
-      const pathPrefix = document.getElementById("astQueryPathPrefix").value;
-      const container = document.getElementById("astQueryResultsContainer");
-
-      container.innerHTML = `<div style="text-align: center; color: var(--accent); padding: 40px; background: var(--bg-card); border: 1px solid var(--border-color); border-radius: 6px;">⏳ Searching AST database...</div>`;
-
-      const payload = {
-        type_id: typeIdVal ? parseInt(typeIdVal, 10) : null,
-        name_pattern: namePattern ? namePattern.trim() : null,
-        path_prefix: pathPrefix ? pathPrefix.trim() : null,
-        limit: 50,
-        offset: offset,
-      };
-
-      const data = await apiFetch(`/api/version/${currentVersion}/ast/query`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
-      });
-
-      if (!data || !data.items) {
-        container.innerHTML = `<div style="color: var(--danger); padding: 30px; text-align: center;">Error querying AST items.</div>`;
+    const onGlobalSymbolSearchInput = debounce(async function(val) {
+      const dropdown = document.getElementById("globalSymbolSearchDropdown");
+      if (!val || val.trim().length < 1) {
+        dropdown.style.display = "none";
+        globalSymbolSuggestions = [];
+        globalSymbolSelectedIndex = -1;
         return;
       }
-
-      if (data.items.length === 0) {
-        container.innerHTML = `<div style="color: var(--text-muted); padding: 40px; text-align: center; background: var(--bg-card); border: 1px solid var(--border-color); border-radius: 6px;">No AST elements matched query criteria.</div>`;
+      const data = await apiFetch(`/api/symbols/search?q=${encodeURIComponent(val.trim())}&limit=15`);
+      if (!data || !data.symbols || data.symbols.length === 0) {
+        dropdown.innerHTML = `<div style="padding: 10px; color: var(--text-muted); font-size: 11px; text-align: center;">No symbols found for "${escapeHtml(val)}"</div>`;
+        dropdown.style.display = "block";
+        globalSymbolSuggestions = [];
+        globalSymbolSelectedIndex = -1;
         return;
       }
+      globalSymbolSuggestions = data.symbols;
+      globalSymbolSelectedIndex = 0;
+      renderGlobalSymbolDropdown();
+    }, 120);
 
-      const rows = data.items.map(item => `
-        <tr>
-          <td><strong>${escapeHtml(item.name)}</strong></td>
-          <td><span class="badge badge-accent">${escapeHtml(item.type_name)}</span></td>
-          <td><code style="color: var(--accent);">${escapeHtml(item.file_path)}</code></td>
-          <td style="color: var(--text-muted); font-size: 11px;">Lines ${item.line_s} - ${item.line_e}</td>
-          <td>
-            <button class="btn" style="padding: 2px 8px; font-size: 11px;" onclick="openPathAndHighlightLine('${escapeJs(item.file_path)}', ${item.line_s}, ${item.line_e})">Jump to Source ➔</button>
-          </td>
-        </tr>
-      `).join("");
+    function renderGlobalSymbolDropdown() {
+      const dropdown = document.getElementById("globalSymbolSearchDropdown");
+      if (!dropdown || globalSymbolSuggestions.length === 0) return;
 
-      container.innerHTML = `
-        <div style="background: var(--bg-card); border: 1px solid var(--border-color); border-radius: 6px; padding: 16px;">
-          <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;">
-            <span style="font-size: 13px; color: var(--text-bright); font-weight: 600;">Matching Results: ${data.total} AST symbols found</span>
-            <div style="display: flex; gap: 8px;">
-              ${offset > 0 ? `<button class="btn" onclick="runAstQuery(${offset - 50})">◀ Prev 50</button>` : ''}
-              ${(offset + 50) < data.total ? `<button class="btn btn-accent" onclick="runAstQuery(${offset + 50})">Next 50 ▶</button>` : ''}
+      dropdown.innerHTML = globalSymbolSuggestions.map((sym, idx) => {
+        const isSelected = idx === globalSymbolSelectedIndex;
+        return `
+          <div class="symbol-search-item ${isSelected ? 'selected' : ''}" onclick="onSelectGlobalSymbol(${idx})" onmouseenter="globalSymbolSelectedIndex = ${idx}; renderGlobalSymbolDropdownHighlight();">
+            <div style="overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 170px;">
+              <strong style="color: var(--text-bright); font-size: 12px;">${escapeHtml(sym.name)}</strong>
+              <div style="font-size: 10px; color: var(--text-muted); overflow: hidden; text-overflow: ellipsis;">${escapeHtml(sym.file_path || '')}${sym.line_start ? ':' + sym.line_start : ''}</div>
+            </div>
+            <div style="display: flex; gap: 4px; align-items: center;">
+              <span class="badge badge-accent" style="font-size: 9px;">${escapeHtml(sym.type_name || 'sym')}</span>
             </div>
           </div>
-          <table class="diff-table">
-            <thead>
-              <tr>
-                <th>Symbol Name</th>
-                <th>AST Type</th>
-                <th>File Path</th>
-                <th>Line Range</th>
-                <th>Action</th>
-              </tr>
-            </thead>
-            <tbody>
-              ${rows}
-            </tbody>
-          </table>
+        `;
+      }).join("") + `
+        <div style="padding: 6px 10px; font-size: 10px; color: var(--accent); border-top: 1px solid var(--border-color); cursor: pointer; text-align: center;" onclick="openXrefModal(document.getElementById('globalSymbolSearchInput').value.trim())">
+          🌐 Open full XRef for "${escapeHtml(document.getElementById('globalSymbolSearchInput').value.trim())}" ➔
         </div>
       `;
+      dropdown.style.display = "block";
     }
 
-    function openPathAndHighlightLine(filePath, lineStart, lineEnd) {
-      switchAppMode("explorer");
-      openPath(filePath).then(() => {
-        if (lineStart) {
-          setTimeout(() => {
-            const el = document.getElementById(`line-${lineStart}`);
-            if (el) el.scrollIntoView({ behavior: "smooth", block: "center" });
-          }, 300);
+    function renderGlobalSymbolDropdownHighlight() {
+      const dropdown = document.getElementById("globalSymbolSearchDropdown");
+      if (!dropdown) return;
+      const items = dropdown.querySelectorAll(".symbol-search-item");
+      items.forEach((item, idx) => {
+        if (idx === globalSymbolSelectedIndex) item.classList.add("selected");
+        else item.classList.remove("selected");
+      });
+    }
+
+    function onGlobalSymbolSearchKeydown(event) {
+      const dropdown = document.getElementById("globalSymbolSearchDropdown");
+      if (dropdown && dropdown.style.display !== "none" && globalSymbolSuggestions.length > 0) {
+        if (event.key === "ArrowDown") {
+          event.preventDefault();
+          globalSymbolSelectedIndex = (globalSymbolSelectedIndex + 1) % globalSymbolSuggestions.length;
+          renderGlobalSymbolDropdownHighlight();
+          return;
+        }
+        if (event.key === "ArrowUp") {
+          event.preventDefault();
+          globalSymbolSelectedIndex = (globalSymbolSelectedIndex - 1 + globalSymbolSuggestions.length) % globalSymbolSuggestions.length;
+          renderGlobalSymbolDropdownHighlight();
+          return;
+        }
+        if (event.key === "Enter") {
+          event.preventDefault();
+          if (globalSymbolSelectedIndex >= 0 && globalSymbolSelectedIndex < globalSymbolSuggestions.length) {
+            onSelectGlobalSymbol(globalSymbolSelectedIndex);
+          } else {
+            const val = document.getElementById("globalSymbolSearchInput").value.trim();
+            if (val) openXrefModal(val);
+            dropdown.style.display = "none";
+          }
+          return;
+        }
+        if (event.key === "Escape") {
+          dropdown.style.display = "none";
+          return;
+        }
+      } else if (event.key === "Enter") {
+        const val = document.getElementById("globalSymbolSearchInput").value.trim();
+        if (val) openXrefModal(val);
+      }
+    }
+
+    function onSelectGlobalSymbol(idx) {
+      const dropdown = document.getElementById("globalSymbolSearchDropdown");
+      if (dropdown) dropdown.style.display = "none";
+      const sym = globalSymbolSuggestions[idx];
+      if (!sym) return;
+
+      if (sym.file_path) {
+        openPathAndHighlightLine(sym.file_path, sym.line_start, sym.line_end || sym.line_start);
+      } else {
+        openXrefModal(sym.name);
+      }
+    }
+
+    // Global keyboard shortcut: Ctrl+K or Cmd+K focuses global symbol search
+    document.addEventListener("keydown", (e) => {
+      if ((e.ctrlKey || e.metaKey) && (e.key === "k" || e.key === "K")) {
+        e.preventDefault();
+        const input = document.getElementById("globalSymbolSearchInput");
+        if (input) {
+          input.focus();
+          input.select();
+        }
+      }
+    });
+
+    // =========================================================================
+    // TOKEN CONTEXT ACTION POPOVER CONTROLLER
+    // =========================================================================
+    let currentPopoverToken = null;
+
+    function handleTokenClick(el, event) {
+      if (event) event.stopPropagation();
+      const text = el.getAttribute("data-token-text") || el.textContent;
+      const typeKey = el.getAttribute("data-token-type") || "Identifier";
+      const astIdStr = el.getAttribute("data-ast-id");
+      const astId = (astIdStr && astIdStr !== "null") ? parseInt(astIdStr, 10) : null;
+      const astName = el.getAttribute("data-ast-name") || "";
+      const parentTypeName = el.getAttribute("data-type-name") || "";
+      onSourceTokenClick(text, typeKey, astId, astName, parentTypeName, event);
+    }
+
+    function onSourceTokenClick(text, typeKey, astId, astName, parentTypeName, event) {
+      if (event) event.stopPropagation();
+      currentPopoverToken = { text, typeKey, astId, astName, parentTypeName };
+      const popover = document.getElementById("tokenActionPopover");
+      if (!popover) return;
+
+      const symEl = document.getElementById("tokenPopoverSymbol");
+      const typeEl = document.getElementById("tokenPopoverType");
+      if (symEl) symEl.innerText = text;
+      if (typeEl) typeEl.innerText = typeKey || "Identifier";
+
+      const btnCg = document.getElementById("btnPopoverCallGraph");
+      if (btnCg) {
+        const isCallable = typeKey === "C_functionproto" || typeKey === "C_CallExpr" || typeKey === "C_Function" || text.includes("(") || typeKey === "C_DeclRefExpr";
+        btnCg.style.display = isCallable ? "flex" : "none";
+      }
+
+      const btnAst = document.getElementById("btnPopoverAst");
+      if (btnAst) {
+        btnAst.style.display = (astId && astId !== "null" && astId !== 0) ? "flex" : "none";
+      }
+
+      popover.style.display = "block";
+      const clientX = (event && event.clientX !== undefined) ? event.clientX : 100;
+      const clientY = (event && event.clientY !== undefined) ? event.clientY : 100;
+      const popWidth = 240;
+      const popHeight = 200;
+      const x = Math.min(window.innerWidth - popWidth - 10, Math.max(10, clientX + 4));
+      const y = Math.min(window.innerHeight - popHeight - 10, Math.max(10, clientY + 14));
+      popover.style.position = "fixed";
+      popover.style.left = `${x}px`;
+      popover.style.top = `${y}px`;
+    }
+
+    async function popoverGotoDef() {
+      const popover = document.getElementById("tokenActionPopover");
+      if (popover) popover.style.display = "none";
+      if (!currentPopoverToken) return;
+
+      const text = currentPopoverToken.text;
+      const res = await apiFetch(`/api/symbols/lookup?q=${encodeURIComponent(text)}`);
+      if (res && res.length > 0 && res[0].file_path) {
+        openPathAndHighlightLine(res[0].file_path, res[0].line_start, res[0].line_end || res[0].line_start);
+      } else {
+        openXrefModal(text);
+      }
+    }
+
+    function popoverOpenXref() {
+      const popover = document.getElementById("tokenActionPopover");
+      if (popover) popover.style.display = "none";
+      if (currentPopoverToken) openXrefModal(currentPopoverToken.text);
+    }
+
+    function popoverOpenCallGraph() {
+      const popover = document.getElementById("tokenActionPopover");
+      if (popover) popover.style.display = "none";
+      if (currentPopoverToken) openCallGraphModal(currentPopoverToken.text);
+    }
+
+    function popoverInspectAst() {
+      const popover = document.getElementById("tokenActionPopover");
+      if (popover) popover.style.display = "none";
+      if (currentPopoverToken) {
+        inspectAstTarget(currentPopoverToken.astId, currentPopoverToken.text, currentPopoverToken.typeKey, currentPopoverToken.astName, currentPopoverToken.parentTypeName);
+      }
+    }
+
+    // Dismiss floating popovers on outside click
+    document.addEventListener("click", () => {
+      const popover = document.getElementById("tokenActionPopover");
+      if (popover) popover.style.display = "none";
+      const symDropdown = document.getElementById("globalSymbolSearchDropdown");
+      if (symDropdown) symDropdown.style.display = "none";
+    });
+
+    // Delegated click handler on codeBody as fallback for tokens
+    const codeBodyContainer = document.getElementById("codeBody");
+    if (codeBodyContainer) {
+      codeBodyContainer.addEventListener("click", (e) => {
+        const tokenEl = e.target.closest(".token-clickable");
+        if (tokenEl) {
+          handleTokenClick(tokenEl, e);
         }
       });
+    }
+
+    // Intercept copy events in Code Viewer to ensure clean 1:1 code copying without blank lines or UI artifacts
+    document.addEventListener("copy", (e) => {
+      const selection = window.getSelection();
+      if (!selection || selection.isCollapsed || selection.rangeCount === 0) return;
+
+      const codeBody = document.getElementById("codeBody");
+      if (!codeBody) return;
+
+      const range = selection.getRangeAt(0);
+      const common = range.commonAncestorContainer;
+      if (!codeBody.contains(common) && common !== codeBody) {
+        return;
+      }
+
+      const allLineEls = Array.from(codeBody.querySelectorAll(".code-line"));
+      const selectedLines = allLineEls.filter(el => selection.containsNode(el, true));
+
+      if (selectedLines.length === 0) return;
+
+      if (selectedLines.length === 1) {
+        let text = selection.toString();
+        text = text.replace(/🏷️\s*#\d+(\s*\(\d+\))?/g, "").replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+        e.clipboardData.setData("text/plain", text);
+        e.preventDefault();
+        return;
+      }
+
+      const lines = [];
+      for (let i = 0; i < selectedLines.length; i++) {
+        const lineEl = selectedLines[i];
+        if (i === 0) {
+          try {
+            const subRange = document.createRange();
+            subRange.setStart(range.startContainer, range.startOffset);
+            subRange.setEndAfter(lineEl.lastChild || lineEl);
+            const frag = subRange.cloneContents();
+            const div = document.createElement("div");
+            div.appendChild(frag);
+            div.querySelectorAll(".tag-chip, .collapse-btn").forEach(n => n.remove());
+            lines.push(div.textContent.replace(/\r\n/g, "").replace(/\n/g, ""));
+            continue;
+          } catch (_) {}
+        } else if (i === selectedLines.length - 1) {
+          try {
+            const subRange = document.createRange();
+            subRange.setStartBefore(lineEl.firstChild || lineEl);
+            subRange.setEnd(range.endContainer, range.endOffset);
+            const frag = subRange.cloneContents();
+            const div = document.createElement("div");
+            div.appendChild(frag);
+            div.querySelectorAll(".tag-chip, .collapse-btn").forEach(n => n.remove());
+            lines.push(div.textContent.replace(/\r\n/g, "").replace(/\n/g, ""));
+            continue;
+          } catch (_) {}
+        }
+
+        const clone = lineEl.cloneNode(true);
+        clone.querySelectorAll(".tag-chip, .collapse-btn").forEach(n => n.remove());
+        lines.push(clone.textContent.replace(/\r\n/g, "").replace(/\n/g, ""));
+      }
+
+      const cleanText = lines.join("\n");
+      e.clipboardData.setData("text/plain", cleanText);
+      e.preventDefault();
+    });
+
+    async function openPathAndHighlightLine(filePath, lineStart = null, lineEnd = null) {
+      await openPath(filePath, lineStart, lineEnd);
+      if (lineStart) {
+        highlightLineRange(lineStart, lineEnd || lineStart);
+        setTimeout(() => {
+          const el = document.getElementById(`l_${lineStart}`);
+          if (el) el.scrollIntoView({ behavior: "smooth", block: "center" });
+        }, 120);
+      }
     }
 
     // =========================================================================
@@ -9724,7 +9925,7 @@
     async function executeXrefSearch(symbol) {
       document.getElementById("xrefAutocomplete").style.display = "none";
       const area = document.getElementById("xrefResultsArea");
-      area.innerHTML = `<div style="text-align: center; color: var(--accent); padding: 30px;">⏳ Searching definitions and global usage tags for <strong>${escapeHtml(symbol)}</strong>...</div>`;
+      area.innerHTML = `<div style="text-align: center; color: var(--accent); padding: 30px;">⏳ Searching definitions and global usage references for <strong>${escapeHtml(symbol)}</strong>...</div>`;
 
       const data = await apiFetch(`/api/version/${currentVersion}/xref/${encodeURIComponent(symbol)}`);
       if (!data) {
@@ -9743,58 +9944,60 @@
         </div>
       `).join("");
 
-      const refsHtml = (data.references || []).map(r => `
-        <tr>
-          <td><span class="badge">${escapeHtml(r.tag_type)}</span></td>
-          <td><code>${escapeHtml(r.code)}</code></td>
-          <td><code style="color: var(--accent);">${escapeHtml(r.file_path)}</code></td>
-          <td style="color: var(--text-muted); font-size: 11px;">Line ${r.line_s}</td>
-          <td>
-            <button class="btn" style="padding: 2px 6px; font-size: 10px;" onclick="closeXrefModal(); openPathAndHighlightLine('${escapeJs(r.file_path)}', ${r.line_s}, ${r.line_e});">View ➔</button>
-          </td>
-        </tr>
-      `).join("");
-
-      const fnsHtml = (data.functions_using_type || []).map(f => `
-        <div style="background: rgba(0,0,0,0.25); border: 1px solid var(--border-color); border-radius: 4px; padding: 8px 10px; margin-bottom: 6px; display: flex; justify-content: space-between; align-items: center;">
-          <div>
-            <span class="badge" style="background: rgba(139, 92, 246, 0.2); color: #8b5cf6;">${escapeHtml(f.fn_type || 'Function')}</span>
-            <strong style="color: var(--text-bright); margin-left: 6px;">${escapeHtml(f.fn_name)}()</strong>
-            <div style="font-size: 11px; color: var(--text-muted); margin-top: 2px;"><code>${escapeHtml(f.file_path)}</code> : lines ${f.line_s} - ${f.line_e}</div>
-          </div>
-          <button class="btn btn-sm" style="padding: 3px 8px; font-size: 11px;" onclick="closeXrefModal(); openPathAndHighlightLine('${escapeJs(f.file_path)}', ${f.line_s}, ${f.line_e});">Jump to Function ➔</button>
-        </div>
-      `).join("");
-
-      area.innerHTML = `
-        <div style="margin-bottom: 16px;">
-          <h4 style="font-size: 13px; color: #98c379; margin-bottom: 8px;">Definitions (${data.definitions_count})</h4>
-          ${defsHtml || '<div style="color: var(--text-muted); font-size: 12px;">No primary AST definition found in active kernel release.</div>'}
-        </div>
-
-        ${data.functions_using_type && data.functions_using_type.length > 0 ? `
-        <div style="margin-bottom: 16px;">
-          <h4 style="font-size: 13px; color: #c678dd; margin-bottom: 8px;">Functions Using This Type (${data.functions_using_type.length})</h4>
-          ${fnsHtml}
-        </div>
-        ` : ''}
-
-        <div>
-          <h4 style="font-size: 13px; color: #61afef; margin-bottom: 8px;">Global Usages &amp; References (${data.references_count})</h4>
-          <table class="diff-table">
+      function renderRefTable(items, emptyMsg = "No references in this category.") {
+        if (!items || items.length === 0) {
+          return `<div style="color: var(--text-muted); font-size: 11px; padding: 8px 12px; background: rgba(0,0,0,0.15); border-radius: 4px;">${emptyMsg}</div>`;
+        }
+        return `
+          <table class="diff-table" style="margin-bottom: 8px;">
             <thead>
               <tr>
-                <th>Type</th>
-                <th>Token Code</th>
+                <th style="width: 110px;">Role</th>
                 <th>File Path</th>
-                <th>Line</th>
-                <th>Action</th>
+                <th style="width: 90px;">Line</th>
+                <th style="width: 90px;">Action</th>
               </tr>
             </thead>
             <tbody>
-              ${refsHtml || '<tr><td colspan="5" style="text-align: center; color: var(--text-muted); padding: 20px;">No references found.</td></tr>'}
+              ${items.map(r => `
+                <tr>
+                  <td><span class="badge" style="font-size: 10px;">${escapeHtml(r.tag_type || 'Usage')}</span></td>
+                  <td><code style="color: var(--accent);">${escapeHtml(r.file_path)}</code></td>
+                  <td style="color: var(--text-muted); font-size: 11px;">Line ${r.line_s}</td>
+                  <td>
+                    <button class="btn" style="padding: 2px 6px; font-size: 10px;" onclick="closeXrefModal(); openPathAndHighlightLine('${escapeJs(r.file_path)}', ${r.line_s}, ${r.line_e});">Jump ➔</button>
+                  </td>
+                </tr>
+              `).join("")}
             </tbody>
           </table>
+        `;
+      }
+
+      area.innerHTML = `
+        <div style="margin-bottom: 16px;">
+          <h4 style="font-size: 13px; color: #98c379; margin-bottom: 8px;">📖 Definitions (${data.definitions_count || 0})</h4>
+          ${defsHtml || '<div style="color: var(--text-muted); font-size: 12px;">No primary AST definition found in active kernel release.</div>'}
+        </div>
+
+        <div style="margin-bottom: 16px;">
+          <h4 style="font-size: 13px; color: #61afef; margin-bottom: 8px;">📞 Function Calls (${data.calls_count || 0})</h4>
+          ${renderRefTable(data.calls, "No function call references indexed for this symbol.")}
+        </div>
+
+        <div style="margin-bottom: 16px;">
+          <h4 style="font-size: 13px; color: #e5c07b; margin-bottom: 8px;">🧩 Member References (${data.member_refs_count || 0})</h4>
+          ${renderRefTable(data.member_refs, "No struct/union member references indexed.")}
+        </div>
+
+        <div style="margin-bottom: 16px;">
+          <h4 style="font-size: 13px; color: #c678dd; margin-bottom: 8px;">🧬 Type Usages (${data.type_usages_count || 0})</h4>
+          ${renderRefTable(data.type_usages, "No type usages indexed.")}
+        </div>
+
+        <div>
+          <h4 style="font-size: 13px; color: #abb2bf; margin-bottom: 8px;">📋 Declarations (${data.declarations_count || 0})</h4>
+          ${renderRefTable(data.declarations, "No forward declarations indexed.")}
         </div>
       `;
     }
@@ -11030,18 +11233,25 @@
       }
 
       const callersHtml = (data.callers || []).map(c => `
-        <div style="padding: 8px 12px; background: var(--bg-card); border: 1px solid var(--border-color); border-radius: 4px; margin-bottom: 6px; font-size: 12px;">
-          <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px;">
-            <span class="crumb-link" onclick="closeCallGraphModal(); openNewTab('explorer', currentVersion, null, { path: '${escapeHtml(c.file_path)}', line_s: ${c.line_s} })">${escapeHtml(c.file_path)}:${c.line_s}</span>
+        <div style="padding: 8px 12px; background: var(--bg-card); border: 1px solid var(--border-color); border-radius: 4px; margin-bottom: 6px; font-size: 12px; display: flex; justify-content: space-between; align-items: center;">
+          <div>
+            <strong style="color: var(--text-bright);">${escapeHtml(c.caller_name || 'caller')}</strong>
+            <div style="font-size: 11px; color: var(--text-muted); margin-top: 2px;"><code>${escapeHtml(c.file_path)}</code>:${c.line_s}</div>
           </div>
-          <div style="font-family: monospace; font-size: 11px; color: var(--text-muted);">${escapeHtml(c.snippet)}</div>
+          <button class="btn btn-sm" style="padding: 2px 8px; font-size: 10px;" onclick="closeCallGraphModal(); openPathAndHighlightLine('${escapeJs(c.file_path)}', ${c.line_s}, ${c.line_e});">Jump ➔</button>
         </div>
       `).join("") || '<div style="color: var(--text-muted); font-size: 12px; padding: 14px;">No external callers indexed.</div>';
 
       const calleesHtml = (data.callees || []).map(c => `
         <div style="padding: 8px 12px; background: var(--bg-card); border: 1px solid var(--border-color); border-radius: 4px; margin-bottom: 6px; font-size: 12px; display: flex; justify-content: space-between; align-items: center;">
-          <span style="font-family: monospace; font-weight: bold; color: #61afef; cursor: pointer;" onclick="loadFunctionCallGraph('${escapeHtml(c.name)}')">${escapeHtml(c.name)}()</span>
-          <span class="badge badge-accent" style="font-size: 10px;">${escapeHtml(c.type || 'func')}</span>
+          <div>
+            <span style="font-family: monospace; font-weight: bold; color: #61afef; cursor: pointer;" onclick="loadFunctionCallGraph('${escapeHtml(c.name)}')">${escapeHtml(c.name)}()</span>
+            <div style="font-size: 11px; color: var(--text-muted); margin-top: 2px;">Called at line ${c.line} ${c.file_path ? `in <code>${escapeHtml(c.file_path)}</code>` : ''}</div>
+          </div>
+          <div style="display: flex; gap: 4px; align-items: center;">
+            <span class="badge badge-accent" style="font-size: 10px;">${escapeHtml(c.type || 'func')}</span>
+            ${c.file_path ? `<button class="btn btn-sm" style="padding: 2px 6px; font-size: 10px;" onclick="closeCallGraphModal(); openPathAndHighlightLine('${escapeJs(c.file_path)}', ${c.def_line_s || c.line}, ${c.def_line_e || c.line});">Def ➔</button>` : ''}
+          </div>
         </div>
       `).join("") || '<div style="color: var(--text-muted); font-size: 12px; padding: 14px;">No internal child calls indexed.</div>';
 
@@ -11059,85 +11269,6 @@
       `;
 
       contents.forEach(el => { el.innerHTML = fullHtml; });
-    }
-
-    // =========================================================================
-    // 12. CODE TOUR STUDIO CONTROLLER
-    // =========================================================================
-    let activeTours = [];
-    let currentTour = null;
-    let currentTourStepIdx = 0;
-
-    function openCodeTourModal() {
-      const modal = document.getElementById("codeTourModal");
-      modal.classList.add("open");
-      loadCodeTourPresets();
-    }
-
-    function closeCodeTourModal() {
-      document.getElementById("codeTourModal").classList.remove("open");
-    }
-
-    async function loadCodeTourPresets() {
-      const data = await apiFetch(`/api/version/${currentVersion}/tours/presets`);
-      if (data && data.length > 0) {
-        activeTours = data;
-        const selects = [document.getElementById("codeTourSelect"), document.getElementById("tourWsSelect")].filter(Boolean);
-        selects.forEach(sel => {
-          sel.innerHTML = data.map(t => `<option value="${t.id}">${escapeHtml(t.title)}</option>`).join("");
-        });
-        startCurrentTour();
-      }
-    }
-
-    function onSelectTourPreset(tourId) {
-      currentTour = activeTours.find(t => t.id === tourId);
-      currentTourStepIdx = 0;
-      renderTourStep();
-    }
-
-    function startCurrentTour() {
-      const selModal = document.getElementById("codeTourSelect");
-      const selWs = document.getElementById("tourWsSelect");
-      const tourId = (selWs && selWs.value) || (selModal && selModal.value) || (activeTours[0] ? activeTours[0].id : "");
-      currentTour = activeTours.find(t => t.id === tourId) || activeTours[0];
-      currentTourStepIdx = 0;
-      renderTourStep();
-    }
-
-    function navigateTourStep(delta) {
-      if (!currentTour) return;
-      currentTourStepIdx = Math.max(0, Math.min(currentTour.steps.length - 1, currentTourStepIdx + delta));
-      renderTourStep();
-    }
-
-    function renderTourStep() {
-      if (!currentTour || !currentTour.steps) return;
-      const step = currentTour.steps[currentTourStepIdx];
-      const containers = [document.getElementById("codeTourStepContainer"), document.getElementById("tourWsStepContainer")].filter(Boolean);
-      const prevBtn = document.getElementById("btnTourPrev");
-      const nextBtn = document.getElementById("btnTourNext");
-
-      if (prevBtn) prevBtn.disabled = (currentTourStepIdx === 0);
-      if (nextBtn) nextBtn.disabled = (currentTourStepIdx === currentTour.steps.length - 1);
-
-      if (step) {
-        const stepHtml = `
-          <div style="background: var(--bg-card); border: 1px solid var(--border-color); border-radius: 6px; padding: 18px;">
-            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
-              <span class="badge badge-accent" style="font-size: 11px;">STEP ${step.step_num} OF ${currentTour.steps.length}</span>
-              <span class="badge" style="background: rgba(198,120,221,0.2); color: #c678dd; font-size: 11px;">${escapeHtml(step.concept)}</span>
-            </div>
-            <h3 style="color: var(--text-bright); font-size: 16px; margin-bottom: 8px;">${escapeHtml(step.title)}</h3>
-            <p style="font-size: 13px; color: var(--text-main); line-height: 1.5; margin-bottom: 14px;">${escapeHtml(step.description)}</p>
-            <div style="display: flex; justify-content: space-between; align-items: center; background: var(--bg-dark); padding: 8px 12px; border-radius: 4px;">
-              <span style="font-family: monospace; font-size: 12px; color: #61afef;">📁 ${escapeHtml(step.file_path)}:${step.line_s}-${step.line_e}</span>
-              <button class="btn btn-accent" style="padding: 3px 10px; font-size: 11px;" onclick="closeCodeTourModal(); openNewTab('explorer', currentVersion, null, { path: '${escapeHtml(step.file_path)}', line_s: ${step.line_s}, line_e: ${step.line_e} })">Jump to Code ➔</button>
-            </div>
-          </div>
-        `;
-        containers.forEach(el => { el.innerHTML = stepHtml; });
-      }
     }
 
     // =========================================================================
@@ -11206,75 +11337,6 @@
       a.click();
       document.body.removeChild(a);
       URL.revokeObjectURL(url);
-    }
-
-    // =========================================================================
-    // 14. KCONFIG BLOAT-O-METER CONTROLLER
-    // =========================================================================
-    function openBloatometerModal() {
-      const modal = document.getElementById("bloatometerModal");
-      modal.classList.add("open");
-      loadBloatometerFootprint();
-    }
-
-    function closeBloatometerModal() {
-      document.getElementById("bloatometerModal").classList.remove("open");
-    }
-
-    async function loadBloatometerFootprint() {
-      const cardContainers = [document.getElementById("bloatometerSummaryCards"), document.getElementById("bloatometerWsSummaryCards")].filter(Boolean);
-      const breakdownContainers = [document.getElementById("bloatometerBreakdownArea"), document.getElementById("bloatometerWsBreakdown")].filter(Boolean);
-
-      cardContainers.forEach(el => {
-        el.innerHTML = `<div style="color: var(--accent); padding: 20px;">⏳ Computing compiled file and binary footprint...</div>`;
-      });
-
-      const data = await apiFetch(`/api/version/${currentVersion}/kconfig/footprint`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ kconfig_values: kconfigValues }),
-      });
-
-      if (!data) {
-        cardContainers.forEach(el => {
-          el.innerHTML = `<div style="color: var(--danger); padding: 20px;">Failed to compute footprint.</div>`;
-        });
-        return;
-      }
-
-      const cardsHtml = `
-        <div class="diff-stat-card"><span style="font-size: 11px; color: var(--text-muted);">Active Config Symbols</span><span class="diff-stat-num" style="color: #61afef;">${data.active_symbols_count}</span></div>
-        <div class="diff-stat-card"><span style="font-size: 11px; color: var(--text-muted);">Compiled Source Files</span><span class="diff-stat-num" style="color: #98c379;">${data.total_compiled_files}</span></div>
-        <div class="diff-stat-card"><span style="font-size: 11px; color: var(--text-muted);">Estimated Source LOC</span><span class="diff-stat-num">${data.estimated_loc.toLocaleString()}</span></div>
-        <div class="diff-stat-card"><span style="font-size: 11px; color: var(--text-muted);">Estimated Binary Footprint</span><span class="diff-stat-num" style="color: #e5c07b;">${(data.estimated_binary_kb / 1024).toFixed(2)} MB</span></div>
-      `;
-      cardContainers.forEach(el => { el.innerHTML = cardsHtml; });
-
-      const rows = (data.files || []).map(f => `
-        <tr>
-          <td><span class="crumb-link" onclick="closeBloatometerModal(); openNewTab('explorer', currentVersion, null, { path: '${escapeHtml(f.file_path)}' })">${escapeHtml(f.file_path)}</span></td>
-          <td><code>CONFIG_${escapeHtml(f.symbol)}</code></td>
-          <td>${f.estimated_loc} LOC</td>
-          <td>${f.estimated_kb} KB</td>
-        </tr>
-      `).join("");
-
-      const breakdownHtml = `
-        <table class="diff-table">
-          <thead>
-            <tr>
-              <th>Compiled Source File</th>
-              <th>Enabling Kconfig Symbol</th>
-              <th>Estimated LOC</th>
-              <th>Estimated Binary Object</th>
-            </tr>
-          </thead>
-          <tbody>
-            ${rows || '<tr><td colspan="4" style="text-align: center; color: var(--text-muted); padding: 20px;">No compiled source files mapped for active config.</td></tr>'}
-          </tbody>
-        </table>
-      `;
-      breakdownContainers.forEach(el => { el.innerHTML = breakdownHtml; });
     }
 
     // =========================================================================

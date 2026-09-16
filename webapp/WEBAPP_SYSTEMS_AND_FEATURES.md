@@ -32,17 +32,18 @@ The KernelInfo-Parser Web Application is a high-performance developer introspect
 |  +---------------------+  +---------------------+  +---------------------+  +-------------------------------+ |
 |  | Interactive DAG     |  | Pahole Struct Layout|  | Squarified Treemap  |  | Function Call Graph           | |
 |  | - HTML5 Canvas 2D   |  | - Byte Offsets/Size |  | - Squarified Layout |  | - Bidirectional Callers/Callee| |
-|  | - Sugiyama (LR/TB)  |  | - Padding Holes     |  | - Depth Slider (1-5)|  | - Tag Snippet Previews        | |
+|  | - Sugiyama (LR/TB)  |  | - Padding Holes     |  | - Depth Slider (1-5)|  | - m_symbol_def / m_symbol_ref | |
 |  | - Force Simulation  |  | - 64B Cachelines    |  | - Subsystem Colors  |  | - 1-Click Jump to Source      | |
-|  | - Concentric Radial |  | - Reorder Optimizer |  | - Drill-Down Breadcr|  | - AST Cross-Linking           | |
+|  | - Concentric Radial |  | - Reorder Optimizer |  | - Drill-Down Breadcr|  | - Call Site File & Line Flow  | |
 |  | - SVG Export & Pan  |  | - Cache Split Alert |  | - LOC / File Metric |  | - Two-Column Flow Hierarchy   | |
 |  +---------------------+  +---------------------+  +---------------------+  +-------------------------------+ |
 |  +---------------------+  +---------------------+  +---------------------+  +-------------------------------+ |
-|  | Code Tour Studio    |  | Kconfig Bloat-O-Metr|  | AST Semantic Sandbox|  | Global Symbol XRef            | |
-|  | - Interactive Steps |  | - Active Config Sim |  | - Multi-Filter Query|  | - Primary AST Definition      | |
-|  | - VFS & Slab Presets|  | - Kbuild Object Map |  | - Wildcards & Depth |  | - Global Usage References Map | |
-|  | - Auto-Scroll / Nav |  | - Lines of Code Est.|  | - Paginated Results |  | - Instant Coordinate Jump     | |
-|  | - Subsystem Context |  | - vmlinux MB Size   |  | - Direct File Links |  | - Prefix Autocomplete Lookup  | |
+|  | Global Symbol Search|  | Token Context Action|  | Upgraded C-AST View |  | Global Symbol XRef            | |
+|  | - Topbar Search Bar |  | - Interactive Token |  | - Statements & Expr |  | - m_symbol_def Definitions   | |
+|  | - Ctrl+K Autocomplete| | - Go to Definition  |  | - Designated Inits  |  | - Categorized References      | |
+|  | - Debounced Typeahead | | - Find XRef Usages  |  | - Inline Assembly   |  | - Calls, MemberRefs, Types    | |
+|  | - Keyboard Navigation| | - Open Call Graph   |  | - Conditional Tags  |  | - Declarations & Other        | |
+|  | - Direct Line Jump  |  | - Inspect AST Node  |  | - Suppressed Subtags|  | - Instant Coordinate Jump     | |
 |  +---------------------+  +---------------------+  +---------------------+  +-------------------------------+ |
 |                                                                                                               |
 |  +---------------------------------------------------------------------------------------------------------+  |
@@ -65,13 +66,13 @@ The KernelInfo-Parser Web Application is a high-performance developer introspect
 |  | - File History & Lifecycle     |  | - Import / Export Formatter    |  | - Latest Patch Spotlight        |  |
 |  +--------------------------------+  +--------------------------------+  +---------------------------------+  |
 |  +--------------------------------+  +--------------------------------+  +---------------------------------+  |
-|  | Semantic Analysis & Diff       |  | Visual Modeling & Tools        |  | Database Connection Manager     |  |
+|  | Semantic Analysis & Diff       |  | Visual Modeling & Symbols      |  | Database Connection Manager     |  |
 |  | - Cross-Version Tree Diff      |  | - Canvas Dependency DAG Engine |  | - MySQL Connection Pooling      |  |
 |  | - Kconfig Evolution Analysis   |  | - Squarified Treemap Generator |  | - Docker & Local Host Failover  |  |
-|  | - AST Multi-Constraint Sandbox |  | - Pahole Memory Layout Engine  |  | - In-Memory Performance Caches  |  |
-|  | - Global Symbol XRef & Lookup  |  | - Function Callgraph Generator |  | - HTTP Cache-Control Headers    |  |
-|  | - Patch Maintainers Matcher    |  | - Code Tour Presets Service    |  | - Direct Integer `vid` Fastpaths|  |
-|  | - RFC-2822 format-patch Engine |  | - Bloat-O-Meter Size Estimator |  | - Dev Introspection Table Counts|  |
+|  | - Symbol XRef (m_symbol_ref)   |  | - Pahole Memory Layout Engine  |  | - In-Memory Performance Caches  |  |
+|  | - Fast Prefix Symbol Search    |  | - Function Call Graph Engine   |  | - Composite DB Index Fastpaths  |  |
+|  | - Patch Maintainers Matcher    |  | - Tag Hierarchy & Timelines    |  | - Direct Integer `vid` Fastpaths|  |
+|  | - RFC-2822 format-patch Engine |  | - AST Node Container Depth     |  | - Dev Introspection Table Counts|  |
 |  | - Clang compile_commands Expor |  | - Dev Endpoints Schema Catalog |  | - Robust Reconnection Fallback  |  |
 |  +--------------------------------+  +--------------------------------+  +---------------------------------+  |
 +----------------------------------------------------+----------------------------------------------------------+
@@ -127,6 +128,8 @@ The web application interfaces directly with the MySQL relational database defin
 | `m_bridge_commit_person` | 27 | `(commit_id, person_id, ...)` | `commit_id`, `person_id`, `role_type`, `priority` | Multi-contributor bridge (`Author`=1, `Committer`=2, `Co-developed-by`=3, `Signed-off-by`=4, `Reviewed-by`=5, `Acked-by`=6, `Tested-by`=7, `Reported-by`=8, `Suggested-by`=9, `Merged-by`=10, `Requested-by`=11). |
 | `m_bridge_commit_file` | 28 | `(commit_id, fid)` | `commit_id`, `vid`, `fid`, `change_type` | Files touched per commit. |
 | `m_bridge_commit_tag` | 29 | `(commit_id, tag_id)` | `commit_id`, `vid`, `fid`, `tag_id` | Code tags modified per commit. |
+| `m_symbol_def` | 30 | `def_id` | `def_id`, `vid`, `fid`, `tag_id`, `ast_id`, `name`, `type_id`, `line_s`, `line_e` | Authoritative symbol definitions across the kernel codebase. Indexed by `(vid, name)`. |
+| `m_symbol_ref` | 31 | `ref_id` | `ref_id`, `vid`, `fid`, `tag_id`, `ast_id`, `role`, `line`, `char_s` | Global symbol usage references (Declaration=1, TypeUsage=2, Call=3, MemberRef=4, DeclRef=5). Indexed by `(vid, ast_id)`. |
 
 ---
 
@@ -242,18 +245,18 @@ The backend exposes **49 route registrations (38 unique endpoints)** across 21 f
 | GET    | /api/diff/versions/{v1}/{v2}                      | get_versions_diff()                        |
 | GET    | /api/diff/kconfig/{v1}/{v2}                       | get_kconfig_diff()                         |
 | GET    | /api/version/{version_name}/xref/{symbol_name}    | get_symbol_xref()                          |
-| GET    | /api/version/{version_name}/symbol_lookup         | lookup_symbols()                           |
+| GET    | /api/version/{version_name}/symbol/{symbol_name}  | get_symbol_detail()                        |
+| GET    | /api/symbols/search                               | search_symbols()                           |
+| GET    | /api/symbols/lookup                               | lookup_symbols()                           |
+| GET    | /api/ast/{ast_id}/tree                            | get_ast_container_tree()                   |
 | GET    | /api/version/{version_name}/kconfig/graph/{symbol} | get_kconfig_graph()                        |
 | POST   | /api/version/{version_name}/kconfig/autosolve     | autosolve_kconfig()                        |
 | POST   | /api/version/{version_name}/kconfig/diff_config   | diff_kconfig_configurations()              |
 | POST   | /api/version/{version_name}/patch/maintainers     | match_patch_maintainers()                  |
-| POST   | /api/version/{version_name}/ast/query             | query_ast_semantic_sandbox()               |
 | GET    | /api/version/{version_name}/export/compile_commands| export_compile_commands()                  |
 | GET    | /api/version/{version_name}/struct/layout/{struct} | get_struct_layout()                         |
 | GET    | /api/version/{version_name}/treemap               | get_codebase_treemap()                     |
-| POST   | /api/version/{version_name}/kconfig/footprint     | estimate_kconfig_footprint()                |
 | GET    | /api/version/{version_name}/callgraph/{function}  | get_function_callgraph()                   |
-| GET    | /api/version/{version_name}/tours/presets         | get_code_tour_presets()                    |
 | POST   | /api/version/{version_name}/patch/format          | generate_formatted_patch()                  |
 +---------------------------------------------------------------------------------------------------------+
 ```
@@ -345,11 +348,15 @@ The backend exposes **49 route registrations (38 unique endpoints)** across 21 f
 - **`GET /api/diff/kconfig/{v1}/{v2}`** (`get_kconfig_diff`):
   - Compares Kconfig symbols across releases, tracking symbol additions, removals, prompt alterations, type changes, and default value modifications.
 
-#### 9. Global Symbol XRef & Autocomplete Endpoints
+#### 9. Global Symbol Search, XRef & Autocomplete Endpoints
 - **`GET /api/version/{version_name}/xref/{symbol_name}`** (`get_symbol_xref`):
-  - Locates the primary AST definition in `m_ast` joined with `m_type_descriptor`, `m_tag`, and `m_bridge_tag`. Queries all global usage tags across the kernel source tree with line and column coordinates.
-- **`GET /api/version/{version_name}/symbol_lookup?q={q}&limit=20`** (`lookup_symbols`):
-  - Fast autocomplete prefix search across all indexed AST identifiers with construct type tags.
+  - Locates the authoritative symbol definition in `m_symbol_def` and queries `m_symbol_ref` for all global references across the kernel source tree. Returns categorized references: `calls` (Call role=3), `member_refs` (MemberRef role=4), `type_usages` (TypeUsage role=2), `declarations` (Declaration role=1), and `other` with file paths, line numbers, and character spans. Backed by composite index `idx_symbol_ref_vid_ast` for sub-15ms latency.
+- **`GET /api/version/{version_name}/symbol/{symbol_name}`** (`get_symbol_detail`):
+  - Resolves authoritative symbol definition from `m_symbol_def`, declarations from `m_symbol_ref` (role=1), and usages from `m_symbol_ref` (roles 2-5).
+- **`GET /api/symbols/search?version_name={v}&q={q}&limit=30`** (`search_symbols`):
+  - Fast prefix search across all defined symbols in `m_symbol_def` using composite index `idx_symbol_def_vid_name`, returning symbol name, type descriptor (`C_functionprotodecl`, `C_structdecl`, etc.), file path, lines, `ast_id`, and `tag_id`.
+- **`GET /api/symbols/lookup?version_name={v}&q={q}&limit=20`** (`lookup_symbols`):
+  - Ultra-fast autocomplete prefix string suggestions for topbar search and quick lookup.
 
 #### 10. Interactive Dependency DAG Graph Endpoint
 - **`GET /api/version/{version_name}/kconfig/graph/{symbol_name}?depth=2`** (`get_kconfig_graph`):
@@ -365,9 +372,9 @@ The backend exposes **49 route registrations (38 unique endpoints)** across 21 f
 - **`POST /api/version/{version_name}/patch/maintainers`** (`match_patch_maintainers`):
   - Accepts `PatchReviewRequest`. Parses unified diff text, extracts touched files and line ranges, executes pattern matching against all 500+ kernel subsystems, and formats `get_maintainer.pl`-style `TO:` (Maintainers) and `CC:` (Reviewers & Mailing Lists) recipient rosters.
 
-#### 13. AST Semantic Query Sandbox Endpoint
-- **`POST /api/version/{version_name}/ast/query`** (`query_ast_semantic_sandbox`):
-  - Accepts `AstQueryRequest`. Enables multi-constraint searching over kernel AST nodes using `type_id`, `type_name`, `name_pattern` (wildcards), `container_depth`, and `path_prefix` filters with paginated results.
+#### 13. AST Container Tree & Hierarchy Endpoint
+- **`GET /api/ast/{ast_id}/tree?version_name={v}&depth=3`** (`get_ast_container_tree`):
+  - Recursively resolves `m_ast_container` child relationships down to requested depth (1-10). Annotates each node with `tag_id` using index `idx_tag_ast_id` on `m_tag`. Nodes without tags (such as inner statements, expressions, and initializers from the upgraded `c_ast` parser) return `tag_id: None`, enabling the UI to suppress tag timeline buttons and tag badges for untagged constructs.
 
 #### 14. Clang `compile_commands.json` Exporter Endpoint
 - **`GET /api/version/{version_name}/export/compile_commands?arch=x86`** (`export_compile_commands`):
@@ -381,27 +388,17 @@ The backend exposes **49 route registrations (38 unique endpoints)** across 21 f
 - **`GET /api/version/{version_name}/treemap?max_depth=3`** (`get_codebase_treemap`):
   - Returns nested directory and file hierarchies with file counts and line weights for squarified treemap rendering.
 
-#### 17. Kconfig Footprint & Binary Size Estimator (Bloat-O-Meter) Endpoint
-- **`POST /api/version/{version_name}/kconfig/footprint`** (`estimate_kconfig_footprint`):
-  - Accepts `FootprintRequest`. Traverses `m_kconfig_kbuild` and `m_bridge_file` for all active symbols (`=y` or `=m`), aggregating compiled C source files, estimating total Source Lines of Code (LOC), and uncompressed binary image footprint (`vmlinux` in MB).
-
-#### 18. Function Call Graph (Callers/Callees) Endpoint
+#### 17. Function Call Graph (Callers/Callees Flow) Endpoint
 - **`GET /api/version/{version_name}/callgraph/{function_name}`** (`get_function_callgraph`):
-  - Discovers function declaration in `m_ast` and maps all inbound call sites across other files via `m_tag`. Discovers outbound child function invocations and helper calls within the function's line boundaries.
+  - Discovers function definition in `m_symbol_def` and maps inbound call sites across other files via `m_symbol_ref` (Call role=3). Discovers outbound child function invocations and helper calls within the function's AST node boundaries. Backed by composite index lookups for immediate response.
 
-#### 19. Interactive Code Tour Presets Endpoint
-- **`GET /api/version/{version_name}/tours/presets`** (`get_code_tour_presets`):
-  - Returns pre-authored interactive architectural tours:
-    - **VFS File Open Journey**: `sys_open` $\rightarrow$ `do_sys_open` $\rightarrow$ `path_openat` $\rightarrow$ `ext4_file_open`.
-    - **Slab Memory Allocator Journey**: `kmalloc` $\rightarrow$ `kmem_cache_alloc` $\rightarrow$ `cache_grow`.
-
-#### 20. In-Browser Patch Staging & `git format-patch` Generator Endpoint
+#### 18. In-Browser Patch Staging & `git format-patch` Generator Endpoint
 - **`POST /api/version/{version_name}/patch/format`** (`generate_formatted_patch`):
   - Accepts `FormatPatchRequest`. Computes unified diffs with Python's `difflib`, resolves subsystem maintainers, and generates standard `git format-patch` RFC-2822 email text with `From:`, `Date:`, `Subject: [PATCH]`, `To:`, `Cc:`, `Signed-off-by:`, and diff statistics.
 
-#### 21. Dev Introspection Endpoints
+#### 19. Dev Introspection Endpoints
 - **`GET /api/dev/tables`** (`get_dev_table_counts`):
-  - Executes `SELECT COUNT(*)` across all 25 schema tables in MySQL and returns live row counts.
+  - Executes `SELECT COUNT(*)` across schema tables in MySQL and returns live row counts.
 - **`GET /api/dev/endpoints`** (`get_dev_endpoints`):
   - Returns an interactive schema catalog of all API endpoints with descriptions and sample test arguments.
 
@@ -477,14 +474,14 @@ The client synchronizes navigation state with browser URL hashes:
 
 ## 5. Client Workspaces & Feature Subsystems
 
-The frontend features **20 dedicated workspace views** and **21 tab types**:
+The frontend features **17 dedicated workspace views** and **18 tab types**:
 
 ```
 +---------------------------------------------------------------------------------------------------------------+
-|                                            20 FRONTEND WORKSPACES                                             |
+|                                            17 FRONTEND WORKSPACES                                             |
 +---------------------------------------------------------------------------------------------------------------+
-| 1. #explorerWorkspace      | Source code tree, code viewer, token maps, 6-level containers, git blame, #if    |
-| 2. #astInspector (panel)   | Slide-over panel for recursive AST container hierarchy inspection down to depth10|
+| 1. #explorerWorkspace      | Source code tree, code viewer, token maps, containers, git blame, token popover  |
+| 2. #astInspector (panel)   | Slide-over panel for recursive AST container hierarchy with conditional tags     |
 | 3. #kconfigWorkspace       | Menuconfig GUI: Drill-Down vs Full Tree, 20-pass constraint engine, search, insp |
 | 4. #tuiWorkspace           | Authentic Terminal Menuconfig emulator with full keyboard event interceptor      |
 | 5. #maintainersWorkspace   | Subsystem catalog grid, maintainers/reviewers rosters, pattern rules, CREDITS ⭐ |
@@ -492,18 +489,15 @@ The frontend features **20 dedicated workspace views** and **21 tab types**:
 | 7. #timelineWorkspace      | Top 10 Contributor Leaderboard ranking & chronological release patch stream      |
 | 8. #diffWorkspace          | Cross-Version Diff: File Tree Diff & Kconfig Symbol Evolution with delta stats   |
 | 9. #patchWorkspace         | Patch Reviewer & Subsystem Matcher (get_maintainer.pl TO/CC recipient generator) |
-| 10. #astSandboxWorkspace   | Structural AST Query Sandbox: multi-constraint filter form & paginated results   |
-| 11. #treemapWorkspace      | Interactive Squarified Codebase Treemap Map with breadcrumbs & directory colors  |
-| 12. #dagWorkspace          | HTML5 Canvas Dependency DAG Graph: Sugiyama (LR/TB), Force-Directed & Radial     |
-| 13. #structWorkspace       | C Struct Memory Layout & Pahole Visualizer: byte offsets, padding, 64B cachelines|
-| 14. #callgraphWorkspace    | Function Call Graph: bidirectional Inbound Callers & Outbound Callees flow trees |
-| 15. #tourWorkspace         | Interactive Code Tour & Architecture Walkthrough Studio (VFS, Slab Presets)      |
-| 16. #patchStudioWorkspace  | In-Browser Patch Staging Studio & RFC-2822 git format-patch email generator      |
-| 17. #bloatometerWorkspace  | Kconfig Bloat-O-Meter & Kernel Binary Footprint Estimator (LOC & vmlinux MB size)|
-| 18. #xrefWorkspace         | Global Symbol Cross-Reference Studio: primary AST definition & usage tags map    |
-| 19. #subsystemWorkspace    | Subsystem Detail Tab View: maintainers, reviewers, mailing lists, matching files |
-| 20. #personWorkspace       | Developer Profile Tab View: metrics, Latest Patch card, bio, CREDITS match, logs|
-| 21. #commitWorkspace       | Git Commit Detail Tab View: SHA, subject, body, trailers, touched files, tags    |
+| 10. #treemapWorkspace      | Interactive Squarified Codebase Treemap Map with breadcrumbs & directory colors  |
+| 11. #dagWorkspace          | HTML5 Canvas Dependency DAG Graph: Sugiyama (LR/TB), Force-Directed & Radial     |
+| 12. #structWorkspace       | C Struct Memory Layout & Pahole Visualizer: byte offsets, padding, 64B cachelines|
+| 13. #callgraphWorkspace    | Function Call Graph: bidirectional Inbound Callers & Outbound Callees flow trees |
+| 14. #patchStudioWorkspace  | In-Browser Patch Staging Studio & RFC-2822 git format-patch email generator      |
+| 15. #xrefWorkspace         | Global Symbol Cross-Reference Studio: definitions, categorized references map    |
+| 16. #subsystemWorkspace    | Subsystem Detail Tab View: maintainers, reviewers, mailing lists, matching files |
+| 17. #personWorkspace       | Developer Profile Tab View: metrics, Latest Patch card, bio, CREDITS match, logs|
+| 18. #commitWorkspace       | Git Commit Detail Tab View: SHA, subject, body, trailers, touched files, tags    |
 +---------------------------------------------------------------------------------------------------------------+
 ```
 
@@ -561,11 +555,26 @@ The frontend features **20 dedicated workspace views** and **21 tab types**:
   - Multi-commit badge (`+N`) for code blocks modified across multiple commits.
   - Hovering over a blame cell highlights all source lines belonging to that tag snippet (`tag-blame-highlight`).
   - Clicking a blame cell opens the developer profile modal or commit modal.
+- **Global Symbol Search Bar (`#globalSymbolSearchInput` & `#globalSymbolSearchDropdown`)**:
+  - Centered in the top navigation bar with `Ctrl+K` hotkey activation.
+  - Debounced (250ms) typeahead autocomplete querying `/api/symbols/search` powered by `m_symbol_def`.
+  - Supports keyboard navigation (`ArrowUp`, `ArrowDown`, `Enter`, `Escape`).
+  - Directly opens the target file and jumps to the symbol definition line (`openPathAndHighlightLine`).
+- **Interactive Token Context Action Popover (`#tokenActionPopover`)**:
+  - Clicking any semantic source code token in the viewer opens a lightweight context popover with 4 one-click actions:
+    1. **Go to Definition**: Looks up the symbol definition in `m_symbol_def` and navigates directly to the source file and line.
+    2. **Find References (XRef)**: Opens the Categorized XRef studio displaying all callers, member references, and type usages.
+    3. **Function Call Graph**: Opens the bidirectional Inbound Callers / Outbound Callees call graph.
+    4. **Inspect AST Node**: Slides open the AST Container Inspector for the enclosing AST node.
 
 ### 5.2. AST Container Hierarchy Inspector (`#astInspector`)
-- Slide-over panel for deep structural AST analysis.
+- Slide-over panel for deep structural AST analysis down to 10 container depth levels.
 - Displays AST Node ID, symbol name, construct type descriptor, and raw JSON parser dump.
-- Interactive slider controlling traversal depth (1 to 10 levels).
+- **Upgraded C-AST Parser Construct Badges**:
+  - Highlights specialized constructs from the upgraded `c_ast` parser: Statements (`is_stmt`), Expressions (`is_expr`), Designated Initializer Lists (`is_init`), and Assembly (`is_asm`).
+- **Conditional Tag Badge & Timeline Suppression**:
+  - Tag timeline badges/buttons (`🕒 Tag #...`) are strictly rendered *only* when the AST node has an associated tag in `m_tag` (`node.tag_id`).
+  - For untagged constructs (e.g. inner statements, sub-expressions, and initializers where tag creation is suppressed), tag buttons and timeline triggers are completely omitted, preventing phantom lookups.
 - Recursively renders child container relationships with priority ranks and relation types.
 
 ### 5.3. Kconfig Web Menuconfig GUI (`#kconfigWorkspace`)
@@ -609,52 +618,43 @@ The frontend features **20 dedicated workspace views** and **21 tab types**:
 - Displays color-coded directory clusters (`fs/`, `drivers/`, `net/`, `kernel/`, `mm/`, `arch/`) with adjustable depth slider (1-5), hover tooltips, and interactive drill-down breadcrumb navigation.
 
 ### 5.8. Function Call Graph Studio (`#callgraphWorkspace` & `#callGraphModal`)
-- Bidirectional call flow trees:
-  - **Inbound Callers**: Discovers all external call sites with file paths, line numbers, and code snippet previews.
+- Bidirectional call flow trees powered by `m_symbol_def` and `m_symbol_ref` (Call role=3):
+  - **Inbound Callers**: Discovers all external call sites with file paths, line numbers, and jump-to-source navigation.
   - **Outbound Callees**: Discovers child function invocations and helper calls within the function body.
 - 1-click jump-to-source navigation into the Explorer.
 
-### 5.9. Interactive Code Tour & Architecture Walkthrough Studio (`#tourWorkspace` & `#codeTourModal`)
-- Curated walkthrough presets:
-  - **VFS File Open Journey**: Traces `sys_open` $\rightarrow$ `do_sys_open` $\rightarrow$ `path_openat` $\rightarrow$ `ext4_file_open`.
-  - **Slab Memory Allocator Journey**: Traces `kmalloc` $\rightarrow$ `kmem_cache_alloc` $\rightarrow$ `cache_grow`.
-- Stepper UI with step progress indicators, explanatory cards, and automated file loading and line scrolling.
-
-### 5.10. In-Browser Patch Staging & `git format-patch` Studio (`#patchStudioWorkspace` & `#patchStudioModal`)
+### 5.9. In-Browser Patch Staging & `git format-patch` Studio (`#patchStudioWorkspace` & `#patchStudioModal`)
 - Side-by-side / unified diff computation using Python's `difflib`.
 - Auto-resolves subsystem maintainers and formats standard RFC-2822 `git format-patch` emails with `From:`, `Date:`, `Subject: [PATCH]`, `To:`, `Cc:`, `Signed-off-by:`, and diff statistics.
 - 1-click copy to clipboard and `.patch` file export.
 
-### 5.11. Kconfig Bloat-O-Meter & Footprint Estimator (`#bloatometerWorkspace` & `#bloatometerModal`)
-- Simulates active configuration against `m_kconfig_kbuild`.
-- Calculates estimated compiled C source files, Source Lines of Code (LOC), and uncompressed `vmlinux` binary image footprint in Megabytes (MB).
-- Interactive breakdown table linking compiled objects back to enabling Kconfig symbols.
-
-### 5.12. Cross-Version Semantic Diff (`#diffWorkspace`)
+### 5.10. Cross-Version Semantic Diff (`#diffWorkspace`)
 - Dual sub-tabs:
   - **File Tree Diff**: Categorizes file paths into `added`, `removed`, `modified`, and `unchanged` with delta summary cards and status filters.
   - **Kconfig Symbol Evolution**: Tracks symbol additions, removals, prompt alterations, type changes, and default value modifications across releases.
 
-### 5.13. Global Symbol Cross-Reference (XRef) (`#xrefWorkspace` & `#xrefModal`)
-- Locates primary AST definition with syntax construct tags.
-- Maps all global usage tags across the kernel source tree with line and column coordinates.
+### 5.11. Global Symbol Cross-Reference (XRef) (`#xrefWorkspace` & `#xrefModal`)
+- Powered by `m_symbol_def` and `m_symbol_ref` with composite database index acceleration (`idx_symbol_def_vid_name`, `idx_symbol_ref_vid_ast`).
+- Categorizes all occurrences into structured sections:
+  - **Authoritative Definitions**: Declared location with construct type, file path, and line bounds.
+  - **Function Calls (`Call`)**: Inbound call sites across the codebase.
+  - **Member References (`MemberRef`)**: Struct/union field accesses (`.` and `->`).
+  - **Type Usages (`TypeUsage`)**: Variable, parameter, and cast references.
+  - **Declarations (`Declaration`)**: Forward prototypes and external declarations.
+- 1-click coordinate jump (`openPathAndHighlightLine`) with smooth scrolling.
 
-### 5.14. Patch Reviewer & Subsystem Maintainers Matcher (`#patchWorkspace`)
+### 5.12. Patch Reviewer & Subsystem Maintainers Matcher (`#patchWorkspace`)
 - Parses unified diff text, extracts touched files and line ranges, and formats `get_maintainer.pl`-style `TO:` (Maintainers) and `CC:` (Reviewers & Mailing Lists) recipient rosters with 1-click clipboard copy.
 
-### 5.15. AST Semantic Query Sandbox (`#astSandboxWorkspace`)
-- Multi-constraint search over kernel AST nodes using construct type descriptor, name wildcards, container depth, and path prefix filters.
-- Paginated results table with jump-to-source links.
-
-### 5.16. Dev Introspection Dashboard & API Runner (`#devModal`)
-- Row count dashboard across all 25 MySQL schema tables with 1-click refresh.
+### 5.13. Dev Introspection Dashboard & API Runner (`#devModal`)
+- Row count dashboard across all schema tables with 1-click refresh.
 - Interactive API endpoint runner with parameter forms, dynamic URL builders, and live JSON response inspection.
 
 ---
 
-## 6. Complete Inventory of Client Modals (All 25 Modals)
+## 6. Complete Inventory of Client Modals
 
-The application provides **25 specialized modals** accessible via toolbars, hotkeys, or contextual actions:
+The application provides specialized modals accessible via toolbars, hotkeys, or contextual actions:
 
 | Modal ID | Modal Title / Purpose | Trigger Condition | Key Actions & Controls |
 | :--- | :--- | :--- | :--- |
@@ -669,20 +669,19 @@ The application provides **25 specialized modals** accessible via toolbars, hotk
 | `#kconfigImportModal` | `📥 Import Linux Kernel .config File` | Toolbar `Import .config` button | File picker (`FileReader`), raw text input area, parse and batch-apply symbol values. |
 | `#kconfigExportModal` | `💾 Export Kernel-Compatible .config` | Toolbar `Export .config` button / `< Save >` | Linux `.config` syntax generator, 1-click copy to clipboard, download `.config` file. |
 | `#highlightModal` | `Highlight Color Palette & Visibility Manager` | Top nav / editor toolbar `🎨 Syntax Palette` button | Tabbed multi-language customizer (All, C, CPPro, ASM, Kconfig), grouped category sections, search/filter box, live swatches, visibility checkboxes, reset defaults. |
-| `#devModal` | `⚙️ Developer Introspection & Endpoint Runner` | Dev button in bottom footer | 25 database table row counts, IndexedDB cache stats, clear IDB cache, interactive API endpoint parameter runner. |
+| `#devModal` | `⚙️ Developer Introspection & Endpoint Runner` | Dev button in bottom footer | Database table row counts, IndexedDB cache stats, clear IDB cache, interactive API endpoint parameter runner. |
 | `#subsystemModal` | `🏷️ Subsystem Details` | Clicking subsystem title or maintainer badge | Maintainers/reviewers rosters, mailing list, SCM tree, web page, pattern rules, matching repository files table. |
 | `#personModal` | `👤 Developer & Contributor Profile` | Clicking developer avatar or maintainer name | Bio, CREDITS cross-reference (`⭐`), Git contribution counters, Latest Patch spotlight, maintained subsystems roster. |
 | `#commitModal` | `📜 Commit Details` | Clicking commit hash or blame cell | SHA, subject, body, trailers, pull request merge origin (`🌿`), shortlog, touched files, modified tags. |
-| `#xrefModal` | `🌐 Global Symbol Cross-Reference (XRef)` | Top nav / editor context action | Symbol input, primary AST definition card, global usage references table with jump links. |
+| `#xrefModal` | `🌐 Global Symbol Cross-Reference (XRef)` | Top nav / editor context action | Symbol input, primary definition card, categorized usages table (Calls, MemberRefs, TypeUsages, Declarations) with jump links. |
 | `#graphModal` | `🕸️ Interactive Dependency & Container DAG` | Top nav / Kconfig inspector action | Fullscreen Canvas visualizer, layout mode selector (Sugiyama LR/TB, Force, Radial), node spacing, zoom, SVG export. |
 | `#exportModal` | `💾 Export Hub & Integration Tools` | Top nav export action | Clang `compile_commands.json` exporter, Linux `.config` downloader. |
 | `#kconfigCompareModal` | `📊 Compare Configuration with Defconfig` | Toolbar `Compare Defconfig` button | Active config vs defconfig selector, match percentage gauge, mismatch symbol comparison table. |
 | `#kconfigAutosolveModal` | `🪄 Auto-Solve Prerequisite Dependencies` | Clicking `🪄 Auto-Solve` badge on unmet symbol| Prerequisite dependency tree, minimal required toggles list, 1-click apply all toggles. |
 | `#structLayoutModal` | `📐 C Struct Memory Layout & Pahole Visualizer`| Top nav / AST inspector action | Struct name input, total size, padding bytes count, 64B cacheline block visualizer, alignment reordering panel. |
-| `#callGraphModal` | `🌳 Function Call Graph & Callers / Callees Flow`| Top nav / function context action | Function name input, two-column caller/callee trees with tag snippets and jump-to-source links. |
-| `#codeTourModal` | `🚀 Interactive Kernel Architecture Tours` | Top nav tour action | Tour preset selector (VFS, Slab), stepper controls (Prev/Next), step explanation cards, automated navigation. |
+| `#callGraphModal` | `🌳 Function Call Graph & Callers / Callees Flow`| Top nav / function context action | Function name input, two-column caller/callee trees with jump-to-source links. |
 | `#patchStudioModal` | `✍️ In-Browser Patch Staging Studio` | Top nav / editor patch action | File path input, original vs modified editor, real-time diff preview, RFC-2822 format-patch email generator. |
-| `#bloatometerModal` | `📈 Kconfig Binary Footprint (Bloat-O-Meter)`| Toolbar `Bloat-O-Meter` button | Active symbol footprint simulation, compiled C files count, LOC estimate, `vmlinux` MB size estimate, object breakdown. |
+| `#tagTimelineModal` | `🕒 Tag Evolution & Cross-Version Timeline` | Clicking `🕒 Tag #...` button in code or AST inspector | Cross-version timeline slider, status badges (unmodified, modified, moved), line additions/deletions, animated player. |
 
 ---
 
