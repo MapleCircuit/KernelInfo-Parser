@@ -6154,10 +6154,31 @@
       await inspectAst(astId, parentName, parentTypeName, null, targetSymbol, targetTypeKey);
     }
 
+    function isStatementOrKeywordConstruct(typeKey) {
+      if (!typeKey) return false;
+      return (
+        typeKey === "C_Keyword" ||
+        typeKey.endsWith("Stmt") ||
+        typeKey === "C_CompoundStmt" ||
+        typeKey.startsWith("ASM_")
+      );
+    }
+
     function findMatchedContainerNode(treeData, targetSymbol, targetTypeKey) {
       if (!treeData) return null;
+
+      // 1. Root AST Node Match (e.g. clicking 'nlmsvc_binding' on 'struct nlmsvc_binding')
+      const rootName = treeData.name || "";
+      if (rootName && targetSymbol) {
+        if (rootName === targetSymbol || rootName.toLowerCase() === targetSymbol.toLowerCase()) {
+          return { isRootMatch: true, container: null, node: treeData, path: [] };
+        }
+      }
+
       let bestMatch = null;
-      let bestScore = -1;
+      let bestScore = 0; // Require positive score (> 0) to avoid false-positive defaults
+
+      const isStatementOrKeyword = isStatementOrKeywordConstruct(targetTypeKey);
 
       function scoreMatch(node, container, path) {
         if (!container) return;
@@ -6170,7 +6191,8 @@
           score = 100;
         }
         // Tier 2: Statement keyword (e.g. if -> C_IfStmt, return -> C_ReturnStmt, label -> C_LabelStmt)
-        else if (targetTypeKey && (relType === targetTypeKey || (container.child_node && container.child_node.type_name === targetTypeKey))) {
+        // Restricted to statement/keyword construct types or when no symbol name is present
+        else if (targetTypeKey && (isStatementOrKeyword || !targetSymbol) && (relType === targetTypeKey || (container.child_node && container.child_node.type_name === targetTypeKey))) {
           score = 80;
         }
         // Tier 3: Type Reference (e.g. posix_acl -> C_TypeRef with name posix_acl)
@@ -6184,7 +6206,7 @@
 
         if (score > bestScore) {
           bestScore = score;
-          bestMatch = { container, node, path: [...path, container] };
+          bestMatch = { isRootMatch: false, container, node, path: [...path, container] };
         }
       }
 
@@ -6204,9 +6226,14 @@
 
     async function inspectAst(astId, name, typeName, event, targetSymbol = null, targetTypeKey = null) {
       if (event) event.stopPropagation();
+      if (selectedAstId !== astId) {
+        currentTargetSymbol = targetSymbol;
+        currentTargetTypeKey = targetTypeKey;
+      } else {
+        if (targetSymbol !== null) currentTargetSymbol = targetSymbol;
+        if (targetTypeKey !== null) currentTargetTypeKey = targetTypeKey;
+      }
       selectedAstId = astId;
-      if (targetSymbol !== null) currentTargetSymbol = targetSymbol;
-      if (targetTypeKey !== null) currentTargetTypeKey = targetTypeKey;
 
       const inspector = document.getElementById("astInspector");
       const content = document.getElementById("astInspectorContent");
@@ -6226,7 +6253,9 @@
       let bannerHtml = "";
       if (currentTargetSymbol) {
         let breadcrumbHtml = `<span style="color: var(--accent); font-weight: 600;">${escapeHtml(data.name || 'Root')}</span>`;
-        if (matchInfo && matchInfo.path && matchInfo.path.length > 0) {
+        if (matchInfo && matchInfo.isRootMatch) {
+          breadcrumbHtml += ` <span style="color: var(--text-muted); margin: 0 4px;">›</span> <span class="badge badge-accent" style="font-size: 10px; background: var(--accent); color: #181a1f; font-weight: bold;">Root AST Node</span>`;
+        } else if (matchInfo && matchInfo.path && matchInfo.path.length > 0) {
           matchInfo.path.forEach(step => {
             const stepName = step.ref_ast_name || step.rel_type_name || 'Container';
             breadcrumbHtml += ` <span style="color: var(--text-muted); margin: 0 4px;">›</span> <span style="color: var(--text-bright); font-weight: 500;">${escapeHtml(stepName)}</span>`;
@@ -6249,19 +6278,23 @@
         `;
       }
 
-      content.innerHTML = bannerHtml + renderAstTreeNode(data, matchInfo ? matchInfo.container : null);
+      content.innerHTML = bannerHtml + renderAstTreeNode(data, matchInfo ? matchInfo.container : null, matchInfo ? !!matchInfo.isRootMatch : false);
 
       if (matchInfo) {
         setTimeout(() => {
-          const matchedElem = document.getElementById("matchedAstContainerNode");
-          if (matchedElem) {
-            matchedElem.scrollIntoView({ behavior: 'smooth', block: 'center' });
+          if (matchInfo.isRootMatch) {
+            content.scrollTo({ top: 0, behavior: 'smooth' });
+          } else {
+            const matchedElem = document.getElementById("matchedAstContainerNode");
+            if (matchedElem) {
+              matchedElem.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            }
           }
         }, 100);
       }
     }
 
-    function renderAstTreeNode(node, matchedContainer = null) {
+    function renderAstTreeNode(node, matchedContainer = null, isRootMatch = false) {
       if (!node) return "";
 
       let typeBadge = '';
@@ -6278,13 +6311,18 @@
         ? `<span class="badge" style="background: rgba(16, 185, 129, 0.2); color: #10b981; margin-left: 6px;">Tag #${node.tag_id}</span><button class="btn btn-sm" style="font-size: 10px; padding: 1px 6px; margin-left: 4px;" onclick="openTagTimelineModal(${node.tag_id}, currentVersion)" title="Inspect Tag evolution & cross-version timeline for Tag #${node.tag_id}">🕒 Tag Timeline</button>`
         : '';
 
+      const rootMatchedClass = isRootMatch ? " tree-node-matched" : "";
+      const rootMatchedId = isRootMatch ? ' id="matchedAstContainerNode"' : "";
+      const rootBadge = isRootMatch ? `<span class="badge badge-accent" style="background: var(--accent); color: #181a1f; font-weight: bold; margin-left: 6px;">🎯 Matched Root AST</span>` : '';
+
       let html = `
         <div class="tree-node">
-          <div class="tree-node-title">
+          <div class="tree-node-title${rootMatchedClass}"${rootMatchedId}>
             <span class="badge badge-accent">AST: ${node.ast_id}</span>
             <strong style="color: var(--text-bright);">${node.name || 'Anonymous'}</strong>
             <span class="badge">${node.type_name || 'Undefined'}</span>
             ${typeBadge}
+            ${rootBadge}
             ${node.ast_raw ? `<span style="font-size: 10px; color: var(--text-muted); cursor: pointer;" onclick="alert(JSON.stringify(${escapeHtml(JSON.stringify(node.ast_raw))}, null, 2))">🔍 raw JSON</span>` : ''}
             ${tagButtonHtml}
           </div>
@@ -6324,7 +6362,7 @@
             <div ${matchedId} class="${matchedClass}" style="margin-top: 3px;">
               <span style="color: var(--accent); font-size: 11px;">↳ [Priority ${c.priority}] (${escapeHtml(c.rel_type_name || 'Container')}):</span>
               ${roleBadge}
-              ${c.child_node ? renderAstTreeNode(c.child_node, matchedContainer) : `<span style="font-size: 11px; color: var(--text-bright); font-weight: 500;">${escapeHtml(c.ref_ast_name || c.rel_type_name || 'void')}</span>`}
+              ${c.child_node ? renderAstTreeNode(c.child_node, matchedContainer, false) : `<span style="font-size: 11px; color: var(--text-bright); font-weight: 500;">${escapeHtml(c.ref_ast_name || c.rel_type_name || 'void')}</span>`}
             </div>
           `;
         });
