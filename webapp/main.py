@@ -48,6 +48,7 @@ from parser.git_ast.git_types import (
 )
 from parser.git_ast.git_commit_parser import GitCommitParser
 from core.globalstuff import type_check
+from core.config import get_db_config, get_webapp_config, init_config
 
 logging.basicConfig(
     level=logging.INFO,
@@ -157,25 +158,26 @@ class DatabaseManager:
     """Manage MySQL connection pool and execute queries with automatic reconnect resilience."""
 
     def __init__(self) -> None:
-        self.user = os.getenv("MYSQL_USER", "root")
-        self.password = os.getenv("MYSQL_PASSWORD", "Passe123")
-        self.database = os.getenv("MYSQL_DATABASE", "test")
-        self.port = int(os.getenv("MYSQL_PORT", "3306"))
-        self.host = self._resolve_host()
+        db_cfg = get_db_config()
+        self.user = db_cfg.get("user", "root")
+        self.password = db_cfg.get("password", "Passe123")
+        self.database = db_cfg.get("database", "test")
+        self.port = int(db_cfg.get("port", 3306))
+        self.host = str(db_cfg.get("host", "127.0.0.1"))
+        self.timeout = int(db_cfg.get("timeout", 10))
         self.pool: pooling.MySQLConnectionPool | None = None
         self._init_pool()
 
     def _resolve_host(self) -> str:
-        if env_host := os.getenv("MYSQL_HOST"):
-            return env_host
-        if os.path.exists("/.dockerenv"):
-            return "host.docker.internal"
-        return "127.0.0.1"
+        db_cfg = get_db_config()
+        return str(db_cfg.get("host", "127.0.0.1"))
 
     def _init_pool(self) -> None:
-        candidate_dbs = ["test"]
-        if self.database and self.database not in candidate_dbs:
+        candidate_dbs: list[str] = []
+        if self.database:
             candidate_dbs.append(self.database)
+        if "test" not in candidate_dbs:
+            candidate_dbs.append("test")
 
         for db_name in candidate_dbs:
             try:
@@ -190,7 +192,7 @@ class DatabaseManager:
                     charset="utf8mb4",
                     collation="utf8mb4_bin",
                     autocommit=True,
-                    connection_timeout=int(os.getenv("MYSQL_TIMEOUT", "10")),
+                    connection_timeout=getattr(self, "timeout", 10),
                 )
                 self.database = db_name
                 logger.info("Connected to MySQL at %s:%d/%s", self.host, self.port, self.database)
@@ -239,7 +241,7 @@ class DatabaseManager:
                 database=self.database,
                 charset="utf8mb4",
                 collation="utf8mb4_bin",
-                connection_timeout=int(os.getenv("MYSQL_TIMEOUT", "10")),
+                connection_timeout=getattr(self, "timeout", 10),
             )
         except Exception as e:
             logger.error("Error connecting to MySQL: %s", e)
@@ -6485,6 +6487,24 @@ KernelInfo-Parser Patch Studio
 
 
 if __name__ == "__main__":
+    import argparse
     import uvicorn
+
+    parser = argparse.ArgumentParser(description="KernelInfo-Parser Web Application Server")
+    parser.add_argument("-c", "--config", dest="config_path", default=None, help="Path to JSON configuration file")
+    parser.add_argument("--host", dest="host", default=None, help="Host network interface to bind (overrides config)")
+    parser.add_argument("--port", dest="port", type=int, default=None, help="Port number to bind (overrides config)")
+    parser.add_argument("--reload", dest="reload", action="store_true", default=None, help="Enable auto-reload on source code changes")
+    parser.add_argument("--no-reload", dest="reload", action="store_false", help="Disable auto-reload")
+    args = parser.parse_args()
+
+    if args.config_path:
+        init_config(args.config_path)
+
+    webapp_cfg = get_webapp_config()
+    host = args.host if args.host is not None else webapp_cfg["host"]
+    port = args.port if args.port is not None else webapp_cfg["port"]
+    reload_flag = args.reload if args.reload is not None else webapp_cfg["reload"]
+
     repo_dir = str(Path(__file__).resolve().parent.parent)
-    uvicorn.run("webapp.main:app", host="0.0.0.0", port=8000, reload=True, app_dir=repo_dir)
+    uvicorn.run("webapp.main:app", host=host, port=port, reload=reload_flag, app_dir=repo_dir)

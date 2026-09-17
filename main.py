@@ -58,6 +58,7 @@ from core.globalstuff import (
     configure_logging,
     setup_memory_limit,
 )
+from core.config import init_config, get_parser_config, get_db_config
 import os
 import sys
 
@@ -1071,6 +1072,12 @@ def arg_handling() -> argparse.Namespace:
     """Handle arguments passed with python."""
     parser = argparse.ArgumentParser()
     parser.add_argument(
+        "-c", "--config",
+        dest="config",
+        default=None,
+        help="Path to JSON configuration file",
+    )
+    parser.add_argument(
         "-r", "--reset", "--reset-db",
         dest="reset",
         action="store_true",
@@ -1105,7 +1112,7 @@ def arg_handling() -> argparse.Namespace:
         "-f", "--fidelity",
         dest="fidelity",
         action="store_true",
-        default=True,
+        default=None,
         help="Display full tag text & source code fidelity audit report across test files (default: True)",
     )
     parser.add_argument(
@@ -1129,34 +1136,43 @@ def arg_handling() -> argparse.Namespace:
     parser.add_argument(
         "--db", "--db-engine",
         dest="db_engine",
-        default="mariadb",
+        default=None,
         choices=["mariadb", "mysql", "mock", "mockdb", "inmemory"],
-        help="Select database backend engine (default: mariadb)",
+        help="Select database backend engine (default: from config or mariadb)",
     )
     parser.add_argument(
         "--te", "--table-engine",
         dest="table_engine",
-        default="cached",
+        default=None,
         choices=["cached", "direct", "tecacheddb", "tedirectdb"],
-        help="Select Table Engine architecture backend (default: cached)",
+        help="Select Table Engine architecture backend (default: from config or cached)",
     )
     args = parser.parse_args()
+
+    init_config(args.config)
+    parser_cfg = get_parser_config()
+    db_cfg = get_db_config()
 
     if args.very_low_mem:
         G.MEMORY_MODE = "very_low"
     elif args.low_mem:
         G.MEMORY_MODE = "low"
+    elif parser_cfg.get("memory_mode"):
+        G.MEMORY_MODE = parser_cfg["memory_mode"]
+
+    if args.fidelity is None:
+        args.fidelity = parser_cfg.get("fidelity", True)
 
     gp.init_cs_dict()
 
     if args.profile:
         G.PROFILING_ENABLED = True
 
-    if args.db_engine:
-        G.DB = get_db_engine(args.db_engine)
+    effective_db_engine = args.db_engine or db_cfg.get("engine") or "mariadb"
+    effective_table_engine = args.table_engine or parser_cfg.get("table_engine") or "cached"
 
-    if args.table_engine:
-        G.TE = get_table_engine(args.table_engine)()
+    G.DB = get_db_engine(effective_db_engine)
+    G.TE = get_table_engine(effective_table_engine)()
 
     if args.Drop:
         logger.info("Dropping all tables")
@@ -1201,6 +1217,7 @@ def arg_handling() -> argparse.Namespace:
             "tests.test_webapp_maintainer",
             "tests.test_raw_ast",
             "tests.test_rust_ast",
+            "tests.test_config",
         ]
         suite = unittest.TestSuite()
         for mod_name in test_modules:

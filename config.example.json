@@ -1,0 +1,21 @@
+{
+  "database": {
+    "host": "127.0.0.1",
+    "port": 3306,
+    "user": "root",
+    "password": "Passe123",
+    "database": "test",
+    "timeout": 10,
+    "engine": "mariadb"
+  },
+  "webapp": {
+    "host": "0.0.0.0",
+    "port": 8000,
+    "reload": true
+  },
+  "parser": {
+    "table_engine": "cached",
+    "memory_mode": "normal",
+    "fidelity": true
+  }
+}
