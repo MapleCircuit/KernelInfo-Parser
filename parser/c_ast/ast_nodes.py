@@ -10,7 +10,7 @@ from enum import Flag, IntEnum
 from typing import Any
 from pathlib import Path
 
-from core.globalstuff import G, ASTT, OP_REF, REF_ROOT, REF_POS, REF_NO_REF, REF_FILE, SymbolRole, compute_code_hash
+from core.globalstuff import G, ASTT, OP_REF, REF_ROOT, REF_POS, REF_NO_REF, REF_FILE, SymbolRole, compute_code_hash, normalize_repo_path
 from core.DBLayout import (
     m_ast,
     m_ast_container,
@@ -167,14 +167,18 @@ class Ast:
                 if G.OVERRIDE_FORCE_AST_DEBUG:
                     self.ast_debug(CS, ast_id_route)
                 tag_ref = self.tag(CS, ast_id_route, extent or self.extent, ast_name=safe_name, ast_type=type_id)
-                if type_id in {ASTT.ASM_Label, ASTT.ASM_Macro, ASTT.C_LabelStmt} and safe_name:
+                if type_id in {ASTT.ASM_Label, ASTT.ASM_Macro, ASTT.C_LabelStmt, ASTT.CPPro_define, ASTT.CPPro_define_macro} and safe_name:
                     if hasattr(CS, "symbol_dict"):
                         CS.symbol_dict[(safe_name, type_id)] = ast_id_route[1]
+                        if type_id in (ASTT.CPPro_define, ASTT.CPPro_define_macro):
+                            CS.symbol_dict[(safe_name, ASTT.CPPro_define)] = ast_id_route[1]
+                            CS.symbol_dict[(safe_name, ASTT.CPPro_define_macro)] = ast_id_route[1]
                     ext = extent or self.extent
+                    vid = getattr(CS.gp, "VID", 1) if getattr(CS, "gp", None) else getattr(CS, "VID", 1)
                     with CS(REF_POS):
                         CS.store(m_symbol_def.set(
                             None,
-                            CS.gp.VID,
+                            vid,
                             ((m_file.table_id, 0), OP_REF, (REF_ROOT,)),
                             tag_ref or getattr(self, "tag_ref", 0),
                             self.ast_ref,
@@ -271,7 +275,12 @@ class Ast:
     def _flush_pending_symbol_refs(self, CS: Any, tag_ref: Any) -> None:
         """Flush pending symbol references with the active tag reference."""
         if getattr(CS, "pending_symbol_refs", None):
+            seen: set[tuple[Any, int, int, int]] = set()
             for ref_ast_id, role, line, col in CS.pending_symbol_refs:
+                key = (ref_ast_id, role, line, col)
+                if key in seen:
+                    continue
+                seen.add(key)
                 with CS(REF_POS):
                     CS.store(m_symbol_ref.set(
                         None,
@@ -475,8 +484,12 @@ class CPPro(Ast):
         # Check backslash continuation from rawfile
         rawfile = getattr(G, "CURRENT_RAWFILE", None)
         if rawfile:
-            line_idx = cur_line - 1
-            if 0 <= line_idx < len(rawfile) and rawfile[line_idx].rstrip().endswith("\\"):
+            all_continued = True
+            for l in range(cur_line - 1, t_line - 1):
+                if not (0 <= l < len(rawfile) and rawfile[l].rstrip().endswith("\\")):
+                    all_continued = False
+                    break
+            if all_continued:
                 self.extent.grow(token.line)
                 return True
         self.need_processing = False
@@ -862,7 +875,7 @@ class CPPro_include(CPPro):
             try:
                 inc_file = cursor.get_included_file()
                 if inc_file is not None and inc_file.name:
-                    self.a_include = inc_file.name
+                    self.a_include = normalize_repo_path(inc_file.name, getattr(G, "CURRENT_PARSING_DIR", None))
             except Exception:
                 pass
 
@@ -883,24 +896,54 @@ class CPPro_include(CPPro):
         self._check_inc_cursor(cursor)
 
     def extract(self, CS: Any, create_tag: bool = True) -> None:
-        include_target = self.a_include if self.a_include else self.w_include
+        base_dir = getattr(CS, "mfdir", None) or getattr(G, "CURRENT_PARSING_DIR", None)
+        raw_target = self.a_include if self.a_include else self.w_include
+        include_target = normalize_repo_path(raw_target, base_dir)
         safe_target = str(include_target)[:255]
 
         with CS(REF_POS):
             CS.store(m_file_name.get_set(None, safe_target))
             fnid_route = CS.get_route_parse()
 
-        with CS(REF_POS):
-            CS.store(m_ast.view(
-                ((m_ast.ast_id, m_ast_include.ast_id, 1),),
-                None,
-                self.w_include[:255],
-                ASTT.CPPro_include,
-                None,
-                CS.ref(m_file_name.fnid, *fnid_route),
-            ))
-            ast_id_route = CS.get_route_parse()
-        self.ast_ref = CS.ref(m_ast.ast_id, *ast_id_route)
+        symbols = getattr(CS, "include_symbols", {}).get(self.extent.line_pos[0], [])
+        if symbols:
+            if not hasattr(CS, "include_symbol_refs"):
+                CS.include_symbol_refs = {}
+            flat_container_args = []
+            for priority, (sym_name, sym_type) in enumerate(symbols):
+                sym_key = (sym_name, sym_type)
+                if sym_key not in CS.include_symbol_refs:
+                    with CS(REF_POS):
+                        CS.store(m_ast.view(((m_ast.ast_id,),), None, sym_name[:255], sym_type))
+                        sym_route = CS.get_route_parse()
+                    CS.include_symbol_refs[sym_key] = CS.ref(m_ast.ast_id, *sym_route)
+                flat_container_args.extend([None, priority, int(sym_type), CS.include_symbol_refs[sym_key]])
+
+            joins = ((m_ast.ast_id, m_ast_include.ast_id, 1), (m_ast.ast_id, m_ast_container.ast_id, len(symbols)))
+            with CS(REF_POS):
+                CS.store(m_ast.view(
+                    joins,
+                    None,
+                    self.w_include[:255],
+                    ASTT.CPPro_include,
+                    None,
+                    CS.ref(m_file_name.fnid, *fnid_route),
+                    *flat_container_args
+                ))
+                ast_id_route = CS.get_route_parse()
+            self.ast_ref = CS.ref(m_ast.ast_id, *ast_id_route)
+        else:
+            with CS(REF_POS):
+                CS.store(m_ast.view(
+                    ((m_ast.ast_id, m_ast_include.ast_id, 1),),
+                    None,
+                    self.w_include[:255],
+                    ASTT.CPPro_include,
+                    None,
+                    CS.ref(m_file_name.fnid, *fnid_route),
+                ))
+                ast_id_route = CS.get_route_parse()
+            self.ast_ref = CS.ref(m_ast.ast_id, *ast_id_route)
 
         if create_tag:
             with CS(REF_NO_REF):
@@ -1257,6 +1300,21 @@ class Ast_DeclRefExpr(Ast):
                 self.tag(CS, ast_id_route, self.extent, ast_name=safe_name, ast_type=self.type_id)
 
 
+class Ast_MacroRefExpr(Ast):
+    def __init__(self, extent: Line, name: str = "", end_mode: int = End_Mode.Extent, cursor: Any = None) -> None:
+        super().__init__(extent, end_mode)
+        self.type_id = ASTT.CPPro_define
+        self.name = name
+        self.cursor = cursor
+
+    def extract(self, CS: Any, create_tag: bool = False) -> None:
+        from parser.c_ast.cursor_tree import resolve_cursor_type_ast
+        c = getattr(self, "cursor", None)
+        t_id, ref_ast_id = resolve_cursor_type_ast(CS, c)
+        if ref_ast_id != 0 and hasattr(CS, "pending_symbol_refs"):
+            CS.pending_symbol_refs.append((ref_ast_id, int(SymbolRole.MacroExpansion), self.extent.line_pos[0], self.extent.char_pos[0]))
+
+
 class Ast_BinaryOperator(Ast):
     def __init__(self, extent: Line, end_mode: int = End_Mode.Extent, cursor: Any = None) -> None:
         super().__init__(extent, end_mode)
@@ -1317,6 +1375,7 @@ class TypeSegment:
         self.ref: Any = None
         self.type_id: int | None = None
         self.ref_ast_id: Any = None
+        self.symbol_refs: list[tuple[Any, int, int]] | None = None
 
     def append(self, token: TypeToken) -> None:
         self.content.append(token)
@@ -1324,9 +1383,14 @@ class TypeSegment:
     def generate_ast(self, CS: Any) -> None:
         self.type_id = None
         self.ref_ast_id = None
+        self.symbol_refs = None
 
         if self.ref_type == TSRef.No_Ref:
-            if len(self.content) == 1 and self.cqual == CQual.Empty:
+            if (
+                len(self.content) == 1
+                and self.cqual == CQual.Empty
+                and self.content[0].type != ASTT.C_SCtypedef
+            ):
                 self.type_id = self.content[0].type
                 return
 
@@ -1340,15 +1404,19 @@ class TypeSegment:
                 decl_type = get_decl_type(self.content[0].type)
                 sym_name = self.content[1].foreign_name or self.content[1].code[:255]
                 f_file = self.content[1].foreign_file
+                tok_l = self.content[1].extent.line_pos[0]
+                tok_c = self.content[1].extent.char_pos[0]
                 if f_file:
                     self.ref = (REF_FILE, f_file, sym_name, int(decl_type))
                     self.type_id = self.content[0].type
                     self.ref_type = TSRef.Route_Ref
+                    self.symbol_refs = [(CS.ref(m_ast.ast_id, *self.ref), tok_l, tok_c)]
                     return
                 if hasattr(CS, "symbol_dict") and (sym_name, decl_type) in CS.symbol_dict:
                     self.ref = (REF_POS, CS.symbol_dict[(sym_name, decl_type)])
                     self.type_id = self.content[0].type
                     self.ref_type = TSRef.Route_Ref
+                    self.symbol_refs = [(CS.ref(m_ast.ast_id, *self.ref), tok_l, tok_c)]
                     return
                 notbind_type = get_notbind_type(self.content[0].type)
                 op_idx = len(CS.cs)
@@ -1363,6 +1431,37 @@ class TypeSegment:
                 self.type_id = self.content[0].type
                 self.ref_type = TSRef.Route_Ref
                 self.ref = route_key
+                self.symbol_refs = [(CS.ref(m_ast.ast_id, *self.ref), tok_l, tok_c)]
+                return
+
+            if (
+                self.content
+                and self.content[0].type == ASTT.C_SCtypedef
+                and len(self.content) == 1
+                and self.cqual == CQual.Empty
+                and self.content[0].code != "typedef"
+            ):
+                sym_name = self.content[0].foreign_name or self.content[0].code[:255]
+                f_file = self.content[0].foreign_file
+                tok_l = self.content[0].extent.line_pos[0]
+                tok_c = self.content[0].extent.char_pos[0]
+                if f_file:
+                    self.ref = (REF_FILE, f_file, sym_name, int(ASTT.C_SCtypedef))
+                elif hasattr(CS, "symbol_dict") and (sym_name, int(ASTT.C_SCtypedef)) in CS.symbol_dict:
+                    self.ref = (REF_POS, CS.symbol_dict[(sym_name, int(ASTT.C_SCtypedef))])
+                else:
+                    op_idx = len(CS.cs)
+                    with CS(REF_NO_REF):
+                        CS.store(m_ast.view(
+                            ((m_ast.ast_id,),),
+                            None,
+                            sym_name,
+                            ASTT.C_SCtypedef,
+                        ))
+                    self.ref = (REF_POS, op_idx)
+                self.type_id = ASTT.C_SCtypedef
+                self.ref_type = TSRef.Route_Ref
+                self.symbol_refs = [(CS.ref(m_ast.ast_id, *self.ref), tok_l, tok_c)]
                 return
 
             compound = []
@@ -1379,10 +1478,20 @@ class TypeSegment:
                         decl_type = get_decl_type(typetoken.type)
                         sym_name = typetoken.foreign_name or typetoken.code[:255]
                         f_file = typetoken.foreign_file
+                        tok_l = typetoken.extent.line_pos[0]
+                        tok_c = typetoken.extent.char_pos[0]
                         if f_file:
-                            compound.append((typetoken.type, CS.ref(m_ast.ast_id, REF_FILE, f_file, sym_name, int(decl_type))))
+                            target_ref = CS.ref(m_ast.ast_id, REF_FILE, f_file, sym_name, int(decl_type))
+                            compound.append((typetoken.type, target_ref))
+                            if self.symbol_refs is None:
+                                self.symbol_refs = []
+                            self.symbol_refs.append((target_ref, tok_l, tok_c))
                         elif hasattr(CS, "symbol_dict") and (sym_name, decl_type) in CS.symbol_dict:
-                            compound.append((typetoken.type, CS.ref(m_ast.ast_id, REF_POS, CS.symbol_dict[(sym_name, decl_type)])))
+                            target_ref = CS.ref(m_ast.ast_id, REF_POS, CS.symbol_dict[(sym_name, decl_type)])
+                            compound.append((typetoken.type, target_ref))
+                            if self.symbol_refs is None:
+                                self.symbol_refs = []
+                            self.symbol_refs.append((target_ref, tok_l, tok_c))
                         else:
                             notbind_type = get_notbind_type(typetoken.type)
                             op_idx = len(CS.cs)
@@ -1393,9 +1502,39 @@ class TypeSegment:
                                     sym_name,
                                     notbind_type,
                                 ))
-                            compound.append((typetoken.type, CS.ref(m_ast.ast_id, REF_POS, op_idx)))
+                            target_ref = CS.ref(m_ast.ast_id, REF_POS, op_idx)
+                            compound.append((typetoken.type, target_ref))
+                            if self.symbol_refs is None:
+                                self.symbol_refs = []
+                            self.symbol_refs.append((target_ref, tok_l, tok_c))
                     elif typetoken.type == ASTT.C_functionproto:
                         compound.append((typetoken.type, 0))
+                elif typetoken.type == ASTT.C_SCtypedef:
+                    if typetoken.code == "typedef":
+                        compound.append((typetoken.type, 0))
+                    else:
+                        sym_name = typetoken.foreign_name or typetoken.code[:255]
+                        f_file = typetoken.foreign_file
+                        tok_l = typetoken.extent.line_pos[0]
+                        tok_c = typetoken.extent.char_pos[0]
+                        if f_file:
+                            target_ref = CS.ref(m_ast.ast_id, REF_FILE, f_file, sym_name, int(ASTT.C_SCtypedef))
+                        elif hasattr(CS, "symbol_dict") and (sym_name, int(ASTT.C_SCtypedef)) in CS.symbol_dict:
+                            target_ref = CS.ref(m_ast.ast_id, REF_POS, CS.symbol_dict[(sym_name, int(ASTT.C_SCtypedef))])
+                        else:
+                            op_idx = len(CS.cs)
+                            with CS(REF_NO_REF):
+                                CS.store(m_ast.view(
+                                    ((m_ast.ast_id,),),
+                                    None,
+                                    sym_name,
+                                    ASTT.C_SCtypedef,
+                                ))
+                            target_ref = CS.ref(m_ast.ast_id, REF_POS, op_idx)
+                        compound.append((typetoken.type, target_ref))
+                        if self.symbol_refs is None:
+                            self.symbol_refs = []
+                        self.symbol_refs.append((target_ref, tok_l, tok_c))
                 else:
                     compound.append((typetoken.type, 0))
 

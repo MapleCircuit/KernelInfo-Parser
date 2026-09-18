@@ -48,42 +48,42 @@ from parser.c_ast import safe_spelling, safe_cursor_spelling
 TEST_SUITE: list[dict[str, Any]] = [
     {
         "file": "include/linux/drbd_tag_magic.h",
-        "baseline_ast_ops": 294,
+        "baseline_ast_ops": 328,
         "description": "Kernel Header (drbd_tag_magic.h)",
     },
     {
         "file": "virt/kvm/iodev.h",
-        "baseline_ast_ops": 207,
+        "baseline_ast_ops": 227,
         "description": "Kernel Header (virt/kvm/iodev.h)",
     },
     {
         "file": "include/linux/lockd/bind.h",
-        "baseline_ast_ops": 189,
+        "baseline_ast_ops": 207,
         "description": "Kernel Header (lockd/bind.h)",
     },
     {
         "file": "include/linux/netfilter_bridge/ebtables.h",
-        "baseline_ast_ops": 868,
+        "baseline_ast_ops": 1001,
         "description": "Kernel Header (ebtables.h)",
     },
     {
         "file": "drivers/watchdog/w83627hf_wdt.c",
-        "baseline_ast_ops": 1247,
+        "baseline_ast_ops": 1187,
         "description": "Watchdog Driver (Latin-1 byte 0xe1 resilience)",
     },
     {
         "file": "drivers/usb/storage/isd200.c",
-        "baseline_ast_ops": 4074,
+        "baseline_ast_ops": 4295,
         "description": "USB Storage Driver (Latin-1 byte 0xf6 resilience)",
     },
     {
         "file": "include/linux/sched.h",
-        "baseline_ast_ops": 9343,
+        "baseline_ast_ops": 10227,
         "description": "Kernel Header (sched.h)",
     },
     {
         "file": "arch/mips/include/asm/mach-cavium-octeon/kernel-entry-init.h",
-        "baseline_ast_ops": 60,
+        "baseline_ast_ops": 111,
         "description": "Assembly Header (kernel-entry-init.h)",
     },
     {
@@ -93,7 +93,7 @@ TEST_SUITE: list[dict[str, Any]] = [
     },
     {
         "file": "arch/powerpc/xmon/ppc-opc.c",
-        "baseline_ast_ops": 4192,
+        "baseline_ast_ops": 18700,
         "description": "PowerPC Opcode Table & Large Initializer Array (ppc-opc.c)",
     },
 ]
@@ -372,6 +372,34 @@ class TestCASTParser(unittest.TestCase):
         self.assertEqual(ast_obj[1], "task_struct", f"Expected tag AST name 'task_struct', got {ast_obj[1]}")
         self.assertEqual(ast_obj[2], ASTT.C_structdecl, f"Expected C_structdecl ({ASTT.C_structdecl}), got {ast_obj[2]}")
 
+    def test_macro_symbol_def_and_expansion_ref(self) -> None:
+        """Verify #define macros are staged in m_symbol_def and expansions are staged in m_symbol_ref as MacroExpansion."""
+        from core.globalstuff import SymbolRole
+        res = run_single_file_worker({
+            "file": "drivers/watchdog/w83627hf_wdt.c",
+            "baseline_ast_ops": 1187,
+            "description": "Watchdog Driver",
+        })
+        self.assertIsNone(res["error"])
+        self.assertTrue(res["execute_success"])
+
+        sym_defs = MockDB._global_store.get("m_symbol_def", {})
+        macro_defs = {row[5]: row for row in sym_defs.values() if row[6] in (int(ASTT.CPPro_define), int(ASTT.CPPro_define_macro))}
+        self.assertIn("WATCHDOG_NAME", macro_defs)
+        self.assertIn("WATCHDOG_TIMEOUT", macro_defs)
+        self.assertIn("WDT_EFER", macro_defs)
+        self.assertIn("WDT_EFIR", macro_defs)
+
+        # Verify line range on macro definition
+        wd_name_def = macro_defs["WATCHDOG_NAME"]
+        self.assertEqual(wd_name_def[7], 45) # line_s
+        self.assertEqual(wd_name_def[8], 45) # line_e
+
+        # Verify macro expansions in m_symbol_ref
+        sym_refs = MockDB._global_store.get("m_symbol_ref", {})
+        macro_expansions = [row for row in sym_refs.values() if row[5] == int(SymbolRole.MacroExpansion)]
+        self.assertGreaterEqual(len(macro_expansions), 5, f"Expected at least 5 macro expansions, found {len(macro_expansions)}")
+
     def test_struct_simple_members_no_compound_container(self) -> None:
         """Verify simple struct members (e.g. int, long, char) generate zero rows in m_ast_container."""
         snippet = (
@@ -566,7 +594,7 @@ class TestCASTParser(unittest.TestCase):
         """Verify parsing and ChangeSet execution with TEDirectDB."""
         item = {
             "file": "virt/kvm/iodev.h",
-            "baseline_ast_ops": 207,
+            "baseline_ast_ops": 227,
             "description": "Kernel Header (virt/kvm/iodev.h)",
             "table_engine": "direct",
         }
@@ -1251,6 +1279,93 @@ struct custom_data {
             self.assertEqual(len(containers), 4)
             names = [mock_asts[r[3]][1] for r in containers]
             self.assertEqual(names, ["size", "flags", "offset", "status"])
+        finally:
+            if G.TE:
+                try:
+                    G.TE.close()
+                except Exception:
+                    pass
+            MockDB._global_store.clear()
+            if temp_dir and os.path.exists(temp_dir):
+                shutil.rmtree(temp_dir, ignore_errors=True)
+
+    def test_typedef_definition_underlying_type_and_type_usage_refs(self) -> None:
+        """Verify typedef definitions link underlying types in m_ast_container and record TypeUsage in m_symbol_ref."""
+        temp_dir = None
+        try:
+            MockDB._global_store.clear()
+            G.DEBUG_TYPECHECK = True
+            G.DB = MockDB
+            G.TE = get_table_engine("cached")()
+            gp = GreatProcessor()
+            init_db_layout(gp)
+            G.TE.start(gp.Table_Array, G.DB)
+
+            mf = MasterFile()
+            temp_dir = mf.create_temp_dir()
+            mf.version_dict["v3.0"] = temp_dir
+            G.MF = mf
+            gp.Version_Name = "v3.0"
+            gp.VID = 1
+
+            file_path = "test_typedef_chain.c"
+            full_path = os.path.join(temp_dir, file_path)
+            snippet = """
+typedef unsigned int __u32;
+typedef __u32 __be32;
+
+struct nlmsvc_binding {
+    __be32 (*fopen)(int arg);
+};
+"""
+            with open(full_path, "w") as f:
+                f.write(snippet.strip())
+
+            cs = ChangeSet(f"A\t{file_path}")
+            cs.current_vid = 1
+            cs.gp = gp
+            cs.mf = mf
+            G.CURRENT_PARSING_FILE = file_path
+
+            default_processing(cs, gp)
+            cs.parse()
+            self.assertTrue(cs.execute())
+            G.TE.commit_all()
+
+            from core.globalstuff import ASTT, SymbolRole
+            mock_containers = MockDB._global_store.get("m_ast_container", {})
+            mock_asts = MockDB._global_store.get("m_ast", {})
+            mock_sym_defs = MockDB._global_store.get("m_symbol_def", {})
+            mock_sym_refs = MockDB._global_store.get("m_symbol_ref", {})
+
+            # 1. __u32 AST & container
+            u32_ast = next((row for row in mock_asts.values() if row[1] == "__u32" and row[2] == ASTT.C_SCtypedef), None)
+            self.assertIsNotNone(u32_ast, "__u32 typedef not found in m_ast")
+            u32_containers = [r for r in mock_containers.values() if r[0] == u32_ast[0]]
+            self.assertGreater(len(u32_containers), 0, "__u32 must have m_ast_container record")
+            u32_ref_ast_id = u32_containers[0][3]
+            self.assertGreater(u32_ref_ast_id, 0, "__u32 container must link underlying type compound")
+            underlying_compound = mock_asts.get(u32_ref_ast_id)
+            self.assertEqual(underlying_compound[2], ASTT.C_Compound)
+
+            # 2. __be32 AST & container pointing to __u32
+            be32_ast = next((row for row in mock_asts.values() if row[1] == "__be32" and row[2] == ASTT.C_SCtypedef), None)
+            self.assertIsNotNone(be32_ast, "__be32 typedef not found in m_ast")
+            be32_containers = [r for r in mock_containers.values() if r[0] == be32_ast[0]]
+            self.assertGreater(len(be32_containers), 0, "__be32 must have m_ast_container record")
+            self.assertEqual(be32_containers[0][3], u32_ast[0], "__be32 container must link directly to __u32 ast_id")
+
+            # 3. m_symbol_def has __u32 and __be32 with type_id = ASTT.C_SCtypedef
+            u32_def = next((row for row in mock_sym_defs.values() if row[5] == "__u32" and row[6] == ASTT.C_SCtypedef), None)
+            self.assertIsNotNone(u32_def, "__u32 not found in m_symbol_def")
+            be32_def = next((row for row in mock_sym_defs.values() if row[5] == "__be32" and row[6] == ASTT.C_SCtypedef), None)
+            self.assertIsNotNone(be32_def, "__be32 not found in m_symbol_def")
+
+            # 4. m_symbol_ref has TypeUsage for __u32 and __be32
+            u32_usage = next((row for row in mock_sym_refs.values() if row[4] == u32_ast[0] and row[5] == int(SymbolRole.TypeUsage)), None)
+            self.assertIsNotNone(u32_usage, "__u32 TypeUsage not found in m_symbol_ref")
+            be32_usage = next((row for row in mock_sym_refs.values() if row[4] == be32_ast[0] and row[5] == int(SymbolRole.TypeUsage)), None)
+            self.assertIsNotNone(be32_usage, "__be32 TypeUsage not found in m_symbol_ref")
         finally:
             if G.TE:
                 try:
@@ -2467,6 +2582,67 @@ const struct xattr_handler btrfs_xattr_acl_access_handler = {
             val_names = {db_ast[crow[3]][1] for crow in db_cont.values() if crow[0] == init_list_id and crow[2] == ASTT.C_DeclRefExpr}
             self.assertEqual(member_names, {"prefix", "flags", "get", "set"})
             self.assertEqual(val_names, {"POSIX_ACL_XATTR_ACCESS", "ACL_TYPE_ACCESS", "v9fs_xattr_get_acl", "v9fs_xattr_set_acl"})
+        finally:
+            if temp_dir and os.path.exists(temp_dir):
+                shutil.rmtree(temp_dir, ignore_errors=True)
+            if G.TE:
+                try:
+                    G.TE.close()
+                except Exception:
+                    pass
+
+    def test_include_target_path_normalization(self) -> None:
+        """Verify CPPro_include normalizes included file paths to clean relative repo paths without /dev/shm/code-parser."""
+        temp_dir = None
+        try:
+            MockDB._global_store.clear()
+            G.DEBUG_TYPECHECK = True
+            G.DB = MockDB
+            G.TE = get_table_engine("cached")()
+            gp = GreatProcessor()
+            init_db_layout(gp)
+            G.TE.start(gp.Table_Array, G.DB)
+
+            mf = MasterFile()
+            temp_dir = mf.create_temp_dir()
+            mf.version_dict["v3.0"] = temp_dir
+            G.MF = mf
+            gp.Version_Name = "v3.0"
+            gp.VID = 1
+
+            # Create header inside include/linux
+            hdr_dir = os.path.join(temp_dir, "include", "linux")
+            os.makedirs(hdr_dir, exist_ok=True)
+            with open(os.path.join(hdr_dir, "my_test_hdr.h"), "w") as f:
+                f.write("#define MY_TEST_MACRO 123\n")
+
+            # Create C file that includes it
+            c_dir = os.path.join(temp_dir, "drivers", "sample")
+            os.makedirs(c_dir, exist_ok=True)
+            c_file_path = "drivers/sample/main.c"
+            with open(os.path.join(temp_dir, c_file_path), "w") as f:
+                f.write('#include <linux/my_test_hdr.h>\nint foo = MY_TEST_MACRO;\n')
+
+            cs = ChangeSet(f"A\t{c_file_path}")
+            cs.current_vid = 1
+            cs.gp = gp
+            cs.mf = mf
+            G.CURRENT_PARSING_FILE = c_file_path
+
+            default_processing(cs, gp)
+            cs.parse()
+            self.assertTrue(cs.execute())
+            G.TE.commit_all()
+
+            db_fn = MockDB._global_store.get(m_file_name.table_name, {})
+            fnames = [row[1] for row in db_fn.values()]
+
+            # Must contain the clean relative path
+            self.assertIn("include/linux/my_test_hdr.h", fnames)
+            # Must NOT contain any /dev/shm or code-parser prefix
+            for fn in fnames:
+                self.assertNotIn("code-parser", fn)
+                self.assertFalse(fn.startswith("/dev/shm"))
         finally:
             if temp_dir and os.path.exists(temp_dir):
                 shutil.rmtree(temp_dir, ignore_errors=True)

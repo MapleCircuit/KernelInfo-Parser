@@ -18,6 +18,7 @@ import json
 import difflib
 import logging
 import subprocess
+import threading
 import urllib.parse
 from datetime import datetime, timezone
 from typing import Any
@@ -47,8 +48,10 @@ from parser.git_ast.git_types import (
     CommitDiffHunk,
 )
 from parser.git_ast.git_commit_parser import GitCommitParser
-from core.globalstuff import type_check
+from core.globalstuff import type_check, normalize_repo_path, ASTT, FileRefType
 from core.config import get_db_config, get_webapp_config, init_config
+
+_VID_HAS_INCLUDE_REFS: set[int] = set()
 
 logging.basicConfig(
     level=logging.INFO,
@@ -219,6 +222,79 @@ class DatabaseManager:
                     cur.execute(stmt)
                 except Exception:
                     pass
+
+            # Ensure m_file_reference table and performance indexes exist
+            try:
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS m_file_reference (
+                        ref_id INT AUTO_INCREMENT PRIMARY KEY,
+                        vid INT NOT NULL,
+                        source_fid INT NOT NULL,
+                        target_fnid INT NOT NULL,
+                        ref_type TINYINT UNSIGNED NOT NULL,
+                        line_no INT NOT NULL,
+                        details VARCHAR(255) DEFAULT '' COLLATE utf8mb4_bin,
+                        INDEX idx_file_ref_target (vid, target_fnid, ref_type),
+                        INDEX idx_file_ref_source (vid, source_fid)
+                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+                """)
+            except Exception:
+                pass
+
+            # Populate C/ASM and Kconfig include references from m_ast_include if not yet synchronized
+            try:
+                cur.execute("SELECT 1 FROM m_file_reference WHERE ref_type = 1 LIMIT 1;")
+                if not cur.fetchone():
+                    db_mgr = self
+
+                    def _async_backfill():
+                        try:
+                            backfill_cnx = mysql.connector.connect(
+                                host=db_mgr.host,
+                                port=db_mgr.port,
+                                user=db_mgr.user,
+                                password=db_mgr.password,
+                                database=db_mgr.database,
+                                charset="utf8mb4",
+                                collation="utf8mb4_bin",
+                                autocommit=True,
+                                connection_timeout=300,
+                            )
+                            b_cur = backfill_cnx.cursor()
+                            b_cur.execute("SELECT vid FROM m_v_main;")
+                            vids = [r[0] for r in b_cur.fetchall()]
+                            kconfig_types = (int(ASTT.Kconfig_Source), int(ASTT.Kconfig_Rsource))
+                            for v in vids:
+                                b_cur.execute(
+                                    "DELETE FROM m_file_reference WHERE vid = %s AND ref_type IN (%s, %s);",
+                                    (v, int(FileRefType.Include), int(FileRefType.Kconfig)),
+                                )
+                                b_cur.execute(f"""
+                                    INSERT IGNORE INTO m_file_reference (vid, source_fid, target_fnid, ref_type, line_no, details)
+                                    SELECT STRAIGHT_JOIN DISTINCT bf.vid, bf.fid, inc.fnid,
+                                           CASE WHEN a.type_id IN ({kconfig_types[0]}, {kconfig_types[1]}) THEN {int(FileRefType.Kconfig)} ELSE {int(FileRefType.Include)} END AS ref_type,
+                                           bt.line_s,
+                                           LEFT(a.name, 255)
+                                    FROM m_bridge_file bf
+                                    JOIN m_bridge_tag bt ON bf.fid = bt.fid
+                                    JOIN m_tag t ON bt.tag_id = t.tag_id
+                                    JOIN m_ast_include inc ON t.ast_id = inc.ast_id
+                                    JOIN m_ast a ON inc.ast_id = a.ast_id
+                                    WHERE bf.vid = %s;
+                                """, (v,))
+                                backfill_cnx.commit()
+                                _VID_HAS_INCLUDE_REFS.add(v)
+                            b_cur.close()
+                            backfill_cnx.close()
+                            logger.info("Asynchronous include backfill completed for versions: %s", vids)
+                        except Exception as ex:
+                            logger.warning("Error during asynchronous include backfill: %s", ex)
+
+                    t = threading.Thread(target=_async_backfill, daemon=True)
+                    t.start()
+            except Exception:
+                pass
+
             cur.close()
             cnx.close()
         except Exception:
@@ -431,6 +507,134 @@ def read_git_file_content(version_name: str, norm_path: str) -> str:
     return ""
 
 
+REF_TYPE_NAME_MAP: dict[int, str] = {
+    1: "include",
+    2: "kconfig",
+    3: "kbuild",
+    4: "makefile",
+    5: "documentation",
+}
+
+
+def get_file_references_internal(cnx, vid: int, target_fnid: int) -> dict[str, Any]:
+    """Query m_file_reference to find all files using target_fnid in the specified version."""
+    empty_result = {
+        "total": 0,
+        "counts": {
+            "include": 0,
+            "kbuild": 0,
+            "kconfig": 0,
+            "makefile": 0,
+            "documentation": 0,
+        },
+        "references": [],
+    }
+    if not cnx or not target_fnid or not vid:
+        return empty_result
+
+    try:
+        cur = cnx.cursor()
+        cur.execute(
+            """
+            SELECT r.ref_type, r.line_no, r.details, fn.fname, r.source_fid
+            FROM m_file_reference r
+            JOIN m_bridge_file bf ON r.source_fid = bf.fid AND bf.vid = r.vid
+            JOIN m_file_name fn ON bf.fnid = fn.fnid
+            WHERE r.vid = %s AND r.target_fnid = %s
+            ORDER BY r.ref_type ASC, fn.fname ASC, r.line_no ASC;
+            """,
+            (vid, target_fnid),
+        )
+        rows = cur.fetchall()
+        cur.close()
+
+        counts = {
+            "include": 0,
+            "kbuild": 0,
+            "kconfig": 0,
+            "makefile": 0,
+            "documentation": 0,
+        }
+        references = []
+        for r in rows:
+            ref_type_code = r[0]
+            type_name = REF_TYPE_NAME_MAP.get(ref_type_code, "unknown")
+            if type_name in counts:
+                counts[type_name] += 1
+            references.append({
+                "ref_type": ref_type_code,
+                "ref_type_name": type_name,
+                "line_no": r[1],
+                "details": safe_decode(r[2]) or "",
+                "source_fname": safe_decode(r[3]) or "",
+                "source_fid": r[4],
+            })
+
+        # If this version has not had include references confirmed in m_file_reference,
+        # verify or dynamically fall back to indexed m_ast_include
+        if vid not in _VID_HAS_INCLUDE_REFS:
+            try:
+                check_cur = cnx.cursor()
+                check_cur.execute("SELECT 1 FROM m_file_reference WHERE vid = %s AND ref_type = 1 LIMIT 1;", (vid,))
+                if check_cur.fetchone():
+                    _VID_HAS_INCLUDE_REFS.add(vid)
+                check_cur.close()
+            except Exception:
+                pass
+
+        if vid not in _VID_HAS_INCLUDE_REFS:
+            try:
+                fb_cur = cnx.cursor()
+                kconfig_types = (int(ASTT.Kconfig_Source), int(ASTT.Kconfig_Rsource))
+                fb_cur.execute(
+                    """
+                    SELECT DISTINCT CASE WHEN a.type_id IN (%s, %s) THEN 2 ELSE 1 END AS ref_type,
+                           bt.line_s, LEFT(a.name, 255) AS details, fn.fname, bf.fid
+                    FROM m_ast_include inc
+                    JOIN m_ast a ON inc.ast_id = a.ast_id
+                    JOIN m_tag t ON inc.ast_id = t.ast_id
+                    JOIN m_bridge_tag bt ON t.tag_id = bt.tag_id
+                    JOIN m_bridge_file bf ON bt.fid = bf.fid
+                    JOIN m_file_name fn ON bf.fnid = fn.fnid
+                    WHERE inc.fnid = %s AND bf.vid = %s;
+                    """,
+                    (kconfig_types[0], kconfig_types[1], target_fnid, vid),
+                )
+                dynamic_rows = fb_cur.fetchall()
+                fb_cur.close()
+
+                existing_keys = {(r["ref_type"], r["source_fid"], r["line_no"]) for r in references}
+                for r in dynamic_rows:
+                    ref_type_code = r[0]
+                    key = (ref_type_code, r[4], r[1])
+                    if key not in existing_keys:
+                        existing_keys.add(key)
+                        type_name = REF_TYPE_NAME_MAP.get(ref_type_code, "unknown")
+                        if type_name in counts:
+                            counts[type_name] += 1
+                        references.append({
+                            "ref_type": ref_type_code,
+                            "ref_type_name": type_name,
+                            "line_no": r[1],
+                            "details": safe_decode(r[2]) or "",
+                            "source_fname": safe_decode(r[3]) or "",
+                            "source_fid": r[4],
+                        })
+
+                references.sort(key=lambda x: (x["ref_type"], x["source_fname"], x["line_no"]))
+            except Exception as e:
+                logger.debug("Dynamic include fallback error in get_file_references_internal: %s", e)
+
+        return {
+            "total": len(references),
+            "counts": counts,
+            "references": references,
+        }
+    except Exception as e:
+        logger.debug("Error in get_file_references_internal: %s", e)
+        return empty_result
+
+
 @app.get("/api/version/{version_name}/browse/")
 @app.get("/api/version/{version_name}/browse/{path:path}")
 @app.get("/v/{version_name}/")
@@ -564,6 +768,11 @@ def browse_path(version_name: str, path: str = "") -> dict[str, Any]:
                         "map_ast": [],
                         "container_depth_map": {},
                         "subsystems": subsystems,
+                        "used_by": {
+                            "total": 0,
+                            "counts": {"include": 0, "kbuild": 0, "kconfig": 0, "makefile": 0, "documentation": 0},
+                            "references": [],
+                        },
                     }
             except Exception as e:
                 logger.debug("Could not verify file via git: %s", e)
@@ -790,6 +999,7 @@ def browse_path(version_name: str, path: str = "") -> dict[str, Any]:
             })
 
         file_subsystems = resolve_subsystems_for_file_internal(cnx, version_name, norm_path, fid)
+        used_by = get_file_references_internal(cnx, vid, fnid)
 
         try:
             cursor.close()
@@ -806,6 +1016,7 @@ def browse_path(version_name: str, path: str = "") -> dict[str, Any]:
             "file_info": file_meta,
             "tags": tags,
             "subsystems": file_subsystems,
+            "used_by": used_by,
         }
 
     except Exception as e:
@@ -815,6 +1026,50 @@ def browse_path(version_name: str, path: str = "") -> dict[str, Any]:
         except Exception:
             pass
         logger.error("Error in browse_path: %s", e)
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@app.get("/api/version/{version_name}/file/{fid}/used_by")
+def get_file_used_by(
+    version_name: str,
+    fid: int,
+    ref_type: str | None = Query(default=None, description="Filter by reference category: include, kbuild, kconfig, makefile, documentation"),
+) -> dict[str, Any]:
+    """Retrieve incoming cross-file references (Used By) for a given file ID in a version."""
+    cnx = db.get_connection()
+    if not cnx:
+        raise HTTPException(status_code=500, detail="Database connection unavailable")
+    try:
+        vid, version_name = get_version_info(cnx, version_name)
+        cursor = cnx.cursor()
+        cursor.execute("SELECT fnid FROM m_bridge_file WHERE fid = %s AND vid = %s LIMIT 1;", (fid, vid))
+        row = cursor.fetchone()
+        if not row:
+            cursor.execute("SELECT fnid FROM m_bridge_file WHERE fid = %s LIMIT 1;", (fid,))
+            row = cursor.fetchone()
+        cursor.close()
+
+        if not row:
+            cnx.close()
+            raise HTTPException(status_code=404, detail=f"File {fid} not found in version {version_name}")
+
+        target_fnid = row[0]
+        data = get_file_references_internal(cnx, vid, target_fnid)
+        cnx.close()
+
+        if ref_type and isinstance(ref_type, str):
+            clean_type = ref_type.lower()
+            filtered_refs = [r for r in data["references"] if r["ref_type_name"] == clean_type]
+            data["references"] = filtered_refs
+            data["filtered_count"] = len(filtered_refs)
+
+        return data
+    except HTTPException:
+        raise
+    except Exception as e:
+        if cnx and hasattr(cnx, "is_connected") and cnx.is_connected():
+            cnx.close()
+        logger.error("Error in get_file_used_by: %s", e)
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 
@@ -1652,6 +1907,166 @@ def get_ast_container_tree(
         if cnx and cnx.is_connected():
             cnx.close()
         logger.error("Error in get_ast_container_tree: %s", e)
+
+@app.get("/api/version/{version_name}/include/{ast_id}/symbols")
+def get_include_symbols(
+    version_name: str,
+    ast_id: int,
+    tag_id: int | None = Query(default=None, description="Optional tag_id fallback if ast_id is not known"),
+) -> dict[str, Any]:
+    """Retrieve imported symbols and target header file path for a CPPro_include AST node."""
+    cnx = db.get_connection()
+    if not cnx:
+        raise HTTPException(status_code=500, detail="Database connection unavailable")
+
+    try:
+        vid, version_name = get_version_info(cnx, version_name)
+        cursor = cnx.cursor()
+
+        target_ast_id = ast_id
+        if (target_ast_id <= 0 or target_ast_id is None) and tag_id:
+            cursor.execute("SELECT ast_id FROM m_tag WHERE tag_id = %s LIMIT 1;", (tag_id,))
+            t_row = cursor.fetchone()
+            if t_row and t_row[0]:
+                target_ast_id = t_row[0]
+
+        cursor.execute(
+            """
+            SELECT a.ast_id, a.name, a.type_id, td.name
+            FROM m_ast a
+            LEFT JOIN m_type_descriptor td ON a.type_id = td.type_id
+            WHERE a.ast_id = %s
+            LIMIT 1;
+            """,
+            (target_ast_id,),
+        )
+        ast_row = cursor.fetchone()
+        if not ast_row:
+            cursor.close()
+            cnx.close()
+            raise HTTPException(status_code=404, detail=f"Include AST node {target_ast_id} not found")
+
+        raw_include_text = safe_decode(ast_row[1])
+
+        cursor.execute(
+            """
+            SELECT fn.fnid, fn.fname
+            FROM m_ast_include ai
+            JOIN m_file_name fn ON ai.fnid = fn.fnid
+            WHERE ai.ast_id = %s
+            LIMIT 1;
+            """,
+            (target_ast_id,),
+        )
+        inc_row = cursor.fetchone()
+        raw_header = safe_decode(inc_row[1]) if inc_row else ""
+        header_file = normalize_repo_path(raw_header)
+        header_exists = bool(header_file)
+
+        cursor.execute(
+            """
+            SELECT c.priority, c.type_id, td.name AS type_name, ra.ast_id AS sym_ast_id, ra.name AS sym_name
+            FROM m_ast_container c
+            LEFT JOIN m_type_descriptor td ON c.type_id = td.type_id
+            LEFT JOIN m_ast ra ON c.ref_ast_id = ra.ast_id
+            WHERE c.ast_id = %s
+            ORDER BY c.priority ASC;
+            """,
+            (target_ast_id,),
+        )
+        cont_rows = cursor.fetchall()
+
+        symbol_names = [safe_decode(r[4]) for r in cont_rows if r[4]]
+
+        def_map = {}
+        if symbol_names:
+            format_strings = ",".join(["%s"] * len(symbol_names))
+            header_dir = (os.path.dirname(header_file) + "/%") if header_file else "%"
+            cursor.execute(
+                f"""
+                SELECT d.name, d.type_id, d.fid, d.line_s, d.line_e, fn.fname
+                FROM m_symbol_def d
+                JOIN m_bridge_file bf ON d.fid = bf.fid AND bf.vid = d.vid
+                JOIN m_file_name fn ON bf.fnid = fn.fnid
+                WHERE d.vid = %s AND d.name IN ({format_strings})
+                ORDER BY
+                    CASE
+                        WHEN fn.fname = %s THEN 0
+                        WHEN fn.fname LIKE %s THEN 1
+                        ELSE 2
+                    END,
+                    d.line_s ASC;
+                """,
+                (vid, *symbol_names, header_file, header_dir),
+            )
+            for d_row in cursor.fetchall():
+                d_name = safe_decode(d_row[0])
+                if d_name not in def_map:
+                    def_map[d_name] = {
+                        "fid": d_row[2],
+                        "line_s": d_row[3],
+                        "line_e": d_row[4],
+                        "def_file": safe_decode(d_row[5]),
+                    }
+
+        def _get_category(type_name: str) -> str:
+            if not type_name:
+                return "Symbol"
+            tl = type_name.lower()
+            if "struct" in tl:
+                return "Struct"
+            if "union" in tl:
+                return "Union"
+            if "enum" in tl:
+                return "Enum"
+            if "proto" in tl or "func" in tl:
+                return "Function"
+            if "typedef" in tl:
+                return "Typedef"
+            if "define" in tl or "macro" in tl:
+                return "Macro"
+            if "extern" in tl or "var" in tl:
+                return "Variable"
+            return "Symbol"
+
+        symbols_list = []
+        for r in cont_rows:
+            priority = r[0]
+            type_id = r[1]
+            type_name = safe_decode(r[2])
+            sym_ast_id = r[3]
+            sym_name = safe_decode(r[4])
+
+            def_info = def_map.get(sym_name)
+            symbols_list.append({
+                "priority": priority,
+                "ast_id": sym_ast_id,
+                "name": sym_name,
+                "type_id": type_id,
+                "type_name": type_name,
+                "category": _get_category(type_name),
+                "def_file": def_info["def_file"] if def_info else None,
+                "def_line_s": def_info["line_s"] if def_info else None,
+                "def_line_e": def_info["line_e"] if def_info else None,
+            })
+
+        cursor.close()
+        cnx.close()
+
+        return {
+            "ast_id": target_ast_id,
+            "include_text": raw_include_text,
+            "header_file": header_file,
+            "header_exists": header_exists,
+            "total_symbols": len(symbols_list),
+            "symbols": symbols_list,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        if cnx and cnx.is_connected():
+            cnx.close()
+        logger.error("Error in get_include_symbols: %s", e)
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 
@@ -5379,7 +5794,7 @@ def get_symbol_xref(version_name: str, symbol_name: str) -> dict[str, Any]:
                 "ast_id": r[0],
                 "name": safe_decode(r[1]),
                 "type_id": r[2],
-                "type_name": safe_decode(r[3]),
+                "type_name": "typedef" if safe_decode(r[3]) == "C_SCtypedef" else safe_decode(r[3]),
                 "line_s": r[4],
                 "line_e": r[5],
                 "file_path": safe_decode(r[6]),
@@ -5417,12 +5832,14 @@ def get_symbol_xref(version_name: str, symbol_name: str) -> dict[str, Any]:
                         "tag_id": None,
                     })
 
-        role_names = {1: "Declaration", 2: "TypeUsage", 3: "Call", 4: "MemberRef", 5: "DeclRef"}
+        role_names = {1: "Declaration", 2: "TypeUsage", 3: "Call", 4: "MemberRef", 5: "DeclRef", 6: "MacroExpansion"}
         references = []
         calls = []
         member_refs = []
         type_usages = []
         declarations = []
+        macro_expansions = []
+        decl_refs = []
 
         if ast_ids:
             format_ids = ','.join(['%s'] * len(ast_ids))
@@ -5463,8 +5880,10 @@ def get_symbol_xref(version_name: str, symbol_name: str) -> dict[str, Any]:
                     calls.append(ref_item)
                 elif r_role == 4:
                     member_refs.append(ref_item)
+                elif r_role == 6:
+                    macro_expansions.append(ref_item)
                 else:
-                    type_usages.append(ref_item)
+                    decl_refs.append(ref_item)
 
         cursor.close()
         cnx.close()
@@ -5483,6 +5902,10 @@ def get_symbol_xref(version_name: str, symbol_name: str) -> dict[str, Any]:
             "type_usages_count": len(type_usages),
             "declarations": declarations,
             "declarations_count": len(declarations),
+            "macro_expansions": macro_expansions,
+            "macro_expansions_count": len(macro_expansions),
+            "decl_refs": decl_refs,
+            "decl_refs_count": len(decl_refs),
             "functions_using_type": [],
             "functions_using_type_count": 0,
         }
@@ -5572,7 +5995,7 @@ def get_symbol_detail(version_name: str, symbol_name: str) -> dict[str, Any]:
                     """,
                     (vid, ast_id),
                 )
-                role_names = {1: "Declaration", 2: "TypeUsage", 3: "Call", 4: "MemberRef", 5: "DeclRef"}
+                role_names = {1: "Declaration", 2: "TypeUsage", 3: "Call", 4: "MemberRef", 5: "DeclRef", 6: "MacroExpansion"}
                 for r in cursor.fetchall():
                     ref_item = {
                         "ref_id": r[0],
@@ -5663,14 +6086,26 @@ def search_symbols(
             )
             rows = cursor.fetchall()
 
+        def _map_sym_type(t: str) -> str:
+            if t == "C_SCtypedef":
+                return "typedef"
+            if t.startswith("C_") and t.endswith("decl"):
+                return t[2:-4]
+            if t.startswith("C_"):
+                return t[2:]
+            return t
+
         results = [
             {
                 "name": safe_decode(r[0]),
-                "type_name": safe_decode(r[1]),
+                "type_name": _map_sym_type(safe_decode(r[1])),
+                "raw_type_name": safe_decode(r[1]),
                 "file_path": safe_decode(r[2]),
                 "fid": r[3],
                 "line_s": r[4],
                 "line_e": r[5],
+                "line_start": r[4],
+                "line_end": r[5],
                 "ast_id": r[6],
                 "tag_id": r[7],
             }
@@ -5684,6 +6119,16 @@ def search_symbols(
             cnx.close()
         logger.debug("Error in search_symbols: %s", e)
         return []
+
+
+@app.get("/api/symbols/lookup")
+def lookup_symbols_global(
+    version_name: str = Query("v3.0"),
+    q: str = Query("", min_length=1),
+    limit: int = 30,
+) -> list[dict[str, Any]]:
+    """Autocomplete / fast symbol lookup across AST identifiers."""
+    return search_symbols(version_name=version_name, q=q, limit=limit)
 
 
 @app.get("/api/version/{version_name}/symbol_lookup")

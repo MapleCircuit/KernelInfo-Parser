@@ -101,6 +101,7 @@ from core.globalstuff import (
     G,
     PointerGetter,
     type_check,
+    is_pure_asm_content,
     T_C,
     T_ASM,
     T_KCONFIG,
@@ -1294,16 +1295,34 @@ class ChangeSet:
 
         return self.cs
 
+    def get_file_type(self) -> int:
+        """Get and memoize file type for ChangeSet, inspecting content for pure ASM .c/.h files."""
+        if hasattr(self, "_file_type") and self._file_type is not None:
+            return self._file_type
+
+        base_type = type_check(self.current_path)
+        if base_type == T_C and getattr(self, "mf", None) and getattr(self, "gp", None):
+            try:
+                vname = getattr(self.gp, "Version_Name", None) or "v3.0"
+                content = self.mf.get_file(self.current_path, vname)
+                if content and is_pure_asm_content(content):
+                    self._file_type = T_ASM
+                    return T_ASM
+            except Exception:
+                pass
+        self._file_type = base_type
+        return self._file_type
+
     def parse(self) -> None:
         """Select and invoke appropriate language AST parser based on current_path file type.
 
-        Detects file language type using `type_check(current_path)` and triggers parser (e.g. `c_ast_parse(self)`).
+        Detects file language type using `self.get_file_type()` and triggers parser (e.g. `c_ast_parse(self)`).
         """
         if not self.current_path or self.file_operation == "R100":
             return
 
         try:
-            current_type = type_check(self.current_path)
+            current_type = self.get_file_type()
             if current_type == T_C:
                 from parser.c_ast.c_ast import c_ast_parse
                 c_ast_parse(self)

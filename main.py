@@ -57,6 +57,7 @@ from core.globalstuff import (
     ASTT,
     configure_logging,
     setup_memory_limit,
+    FileRefType,
 )
 from core.config import init_config, get_parser_config, get_db_config
 import os
@@ -80,7 +81,7 @@ from core.FileHandler import MasterFile
 from core.GreatProcessor import GreatProcessor
 from core.TableHandling import Table, ChangeSet
 from db_engine import MariaDB, MockDB, get_db_engine
-from table_engine import TEDirectDB, TECachedDB, get_table_engine
+from table_engine import TECachedDB, TEDirectDB, get_table_engine
 from core.DBLayout import (
     init_db_layout,
     m_v_main,
@@ -114,6 +115,7 @@ from core.DBLayout import (
     m_bridge_commit_tag,
     m_tag_code,
     m_moved_tag,
+    m_file_reference,
 )
 
 
@@ -140,6 +142,23 @@ def reclaim_system_memory() -> None:
 
 
 file_fid_cache: dict[str, int | None] = {}
+file_fnid_cache: dict[str, int | None] = {}
+
+
+def get_fnid_for_path(path: str) -> int | None:
+    """Resolve m_file_name.fnid for a given path."""
+    if path in file_fnid_cache:
+        return file_fnid_cache[path]
+    te = getattr(G, "TE", None)
+    if not te or m_file_name.table_id not in getattr(te, "tables", {}):
+        return None
+    fn_row = m_file_name.get(None, path)
+    if fn_row and len(fn_row) >= 3 and fn_row[2]:
+        fnid = fn_row[2][0]
+        file_fnid_cache[path] = fnid
+        return fnid
+    file_fnid_cache[path] = None
+    return None
 
 
 def get_fid_for_path(path: str) -> int | None:
@@ -282,6 +301,8 @@ def update(version: str) -> None:
         ("ast_index", m_ast, (m_ast.name, m_ast.type_id)),
         ("file_name_index", m_file_name, (m_file_name.fname,)),
         ("bridge_tag_fid_idx", m_bridge_tag, (m_bridge_tag.fid, m_bridge_tag.tag_id)),
+        ("file_ref_target_idx", m_file_reference, (m_file_reference.vid, m_file_reference.target_fnid, m_file_reference.ref_type)),
+        ("file_ref_source_idx", m_file_reference, (m_file_reference.vid, m_file_reference.source_fid)),
     )
     with G.DB() as db:
         db.create_indexes(performance_indexes)
@@ -322,9 +343,9 @@ def update(version: str) -> None:
     processing_git_commits(version)
 
     # -------------------------------------------------------------------------
-    # STEP 6.6: Parse Kbuild/Makefiles & Populate m_kconfig_kbuild
+    # STEP 6.6: Parse Kbuild/Makefiles, Documentation & Cross-File References
     # -------------------------------------------------------------------------
-    processing_kbuild(version)
+    processing_file_references(version)
 
     # -------------------------------------------------------------------------
     # STEP 6.7: Batch Match Maintainer Sections & Populate m_maintainer_file
@@ -360,6 +381,7 @@ def update(version: str) -> None:
             db.create_indexes(performance_indexes)
 
     file_fid_cache.clear()
+    file_fnid_cache.clear()
     MF.clear_version_cache(version)
     MF.trim_version(keep=1)
     G.TE.close()
@@ -1390,7 +1412,7 @@ def default_processing(CS: ChangeSet) -> None:
                     None,
                     gp.VID,
                     0,
-                    type_check(CS.current_path),
+                    CS.get_file_type() if hasattr(CS, "get_file_type") else type_check(CS.current_path),
                     "R",
                     0,
                 ))
@@ -1444,7 +1466,7 @@ def default_processing(CS: ChangeSet) -> None:
                 None,
                 gp.VID,
                 0,
-                type_check(CS.current_path),
+                CS.get_file_type() if hasattr(CS, "get_file_type") else type_check(CS.current_path),
                 "M",
                 0,
             ))
@@ -1473,7 +1495,7 @@ def default_processing(CS: ChangeSet) -> None:
             None,
             gp.VID,
             0,
-            type_check(CS.current_path),
+            CS.get_file_type() if hasattr(CS, "get_file_type") else type_check(CS.current_path),
             "A",
             0,
         ))
@@ -1999,7 +2021,7 @@ def processing_git_commits(version: str) -> None:
 
 
 def processing_kbuild(version: str) -> None:
-    """Parse Makefile and Kbuild files for active version and map Kconfig symbols to compiled sources."""
+    """Parse Makefile and Kbuild files for active version, map Kconfig symbols, and stage build references."""
     if gp.VID == 0:
         return
 
@@ -2039,19 +2061,26 @@ def processing_kbuild(version: str) -> None:
         return 0
 
     count = 0
+    ref_count = 0
     for mk_path in makefile_paths:
         try:
             content = MF.get_file(mk_path, gp.Version_Name)
             if not content:
                 continue
+            mk_fid = get_fid_for_path(mk_path)
             dir_path = os.path.dirname(mk_path)
             bindings = kbuild_parser.parse_makefile_content(content, dir_path=dir_path)
             for b in bindings:
+                target_fnid = get_fnid_for_path(b.source_file_rel)
                 fid = get_fid_for_path(b.source_file_rel)
                 if fid is None and b.source_file_rel.endswith(".c"):
                     alt_asm = b.source_file_rel[:-2] + ".S"
                     fid = get_fid_for_path(alt_asm)
-                if fid is not None:
+                    if target_fnid is None:
+                        target_fnid = get_fnid_for_path(alt_asm)
+
+                # 1. Populate m_kconfig_kbuild for compiled source files
+                if getattr(b, "ref_type", 3) == 3 and fid is not None:
                     kcid = get_kcid_for_sym(b.symbol_name)
                     G.TE.set(
                         m_kconfig_kbuild.table_id,
@@ -2064,10 +2093,164 @@ def processing_kbuild(version: str) -> None:
                         ),
                     )
                     count += 1
+
+                # 2. Populate m_file_reference for Kbuild compilations and Makefile includes/recursions
+                if mk_fid is not None and target_fnid is not None:
+                    ref_t = getattr(b, "ref_type", 3)
+                    G.TE.set(
+                        m_file_reference.table_id,
+                        (
+                            None,
+                            gp.VID,
+                            mk_fid,
+                            target_fnid,
+                            int(ref_t),
+                            int(getattr(b, "source_line", 1)),
+                            getattr(b, "details", "")[:255],
+                        ),
+                    )
+                    ref_count += 1
         except Exception as e:
             logger.debug(f"Error parsing kbuild file '{mk_path}': {e}")
 
-    logger.info(f"Staged {count} Kbuild symbol-to-source mappings into m_kconfig_kbuild for version '{version}'.")
+    logger.info(f"Staged {count} Kbuild symbol-to-source mappings and {ref_count} build references for version '{version}'.")
+
+
+def processing_doc_references(version: str) -> None:
+    """Scan documentation and text files for active version and map cross-file references into m_file_reference."""
+    if gp.VID == 0:
+        return
+
+    from parser.doc_parser import DocReferenceScanner
+    scanner = DocReferenceScanner()
+
+    try:
+        file_list_raw = MF.git_file_list(gp.Version_Name)
+    except Exception as e:
+        logger.debug(f"Failed to get git_file_list for doc reference parsing in {version}: {e}")
+        return
+
+    all_files = file_list_raw.splitlines() if file_list_raw else []
+    doc_paths = [f for f in all_files if scanner.is_doc_candidate(f)]
+    if not doc_paths:
+        return
+
+    logger.info(f"Processing {len(doc_paths)} documentation/text files for version '{version}'...")
+
+    fnid_by_path: dict[str, int] = {}
+    for p in all_files:
+        fnid = get_fnid_for_path(p)
+        if fnid is not None:
+            fnid_by_path[p] = fnid
+
+    count = 0
+    for doc_p in doc_paths:
+        try:
+            doc_fid = get_fid_for_path(doc_p)
+            if doc_fid is None:
+                continue
+            content = MF.get_file(doc_p, gp.Version_Name)
+            if not content:
+                continue
+            refs = scanner.scan_file_content(content, doc_fid, fnid_by_path, source_path=doc_p)
+            for r in refs:
+                G.TE.set(
+                    m_file_reference.table_id,
+                    (
+                        None,
+                        gp.VID,
+                        r.source_fid,
+                        r.target_fnid,
+                        int(FileRefType.Documentation),
+                        int(r.line_no),
+                        r.details[:255],
+                    ),
+                )
+                count += 1
+        except Exception as e:
+            logger.debug(f"Error parsing documentation references in '{doc_p}': {e}")
+
+    logger.info(f"Staged {count} documentation cross-file references into m_file_reference for version '{version}'.")
+
+
+def processing_include_references(version: str) -> None:
+    """Batch populate C/ASM and Kconfig include references into m_file_reference using set-based query."""
+    if gp.VID == 0:
+        return
+    try:
+        with G.DB() as db:
+            cur = db.cnx.cursor() if hasattr(db, "cnx") and db.cnx else None
+            if cur is None:
+                return
+
+            # Idempotent cleanup for this version's includes & Kconfig sources
+            cur.execute(
+                "DELETE FROM m_file_reference WHERE vid = %s AND ref_type IN (%s, %s);",
+                (gp.VID, int(FileRefType.Include), int(FileRefType.Kconfig)),
+            )
+
+            sync_query = f"""
+                INSERT IGNORE INTO m_file_reference (vid, source_fid, target_fnid, ref_type, line_no, details)
+                SELECT STRAIGHT_JOIN DISTINCT bf.vid, bf.fid, inc.fnid,
+                       CASE WHEN a.type_id IN ({ASTT.Kconfig_Source.value}, {ASTT.Kconfig_Rsource.value}) THEN {int(FileRefType.Kconfig)} ELSE {int(FileRefType.Include)} END AS ref_type,
+                       bt.line_s,
+                       LEFT(a.name, 255)
+                FROM m_bridge_file bf
+                JOIN m_bridge_tag bt ON bf.fid = bt.fid
+                JOIN m_tag t ON bt.tag_id = t.tag_id
+                JOIN m_ast_include inc ON t.ast_id = inc.ast_id
+                JOIN m_ast a ON inc.ast_id = a.ast_id
+                WHERE bf.vid = %s;
+            """
+            cur.execute(sync_query, (gp.VID,))
+            inserted = cur.rowcount
+            db.cnx.commit()
+            cur.close()
+            logger.info(f"Synchronized {inserted} include/Kconfig references into m_file_reference for version '{version}'.")
+    except Exception as e:
+        logger.warning(f"Error in processing_include_references for {version}: {e}", exc_info=True)
+
+
+def processing_file_references(version: str) -> None:
+    """Extract and consolidate all cross-file references (Kbuild, Makefiles, Documentation, Includes, Kconfig)."""
+    if gp.VID == 0:
+        return
+
+    # 1. Version-scoped clean reset for idempotency across pipeline re-runs
+    try:
+        with G.DB() as db:
+            cur = db.cnx.cursor() if hasattr(db, "cnx") and db.cnx else None
+            if cur:
+                cur.execute("DELETE FROM m_file_reference WHERE vid = %s;", (gp.VID,))
+                db.cnx.commit()
+                cur.close()
+    except Exception as e:
+        logger.debug(f"Note on clearing m_file_reference for {version}: {e}")
+
+    # 2. Resynchronize TableEngine sequence next_id before staging fresh rows
+    if hasattr(G.TE, "db") and G.TE.db:
+        try:
+            G.TE.next_id[m_file_reference.table_id] = G.TE.db.get_next_id(m_file_reference)
+        except Exception:
+            pass
+
+    # 3. Parse Kbuild and Documentation files and stage into TableEngine
+    processing_kbuild(version)
+    processing_doc_references(version)
+
+    # 4. Commit TableEngine queued rows immediately so they claim sequence IDs 1..N and empty the queue
+    if m_file_reference.table_id in G.TE.queued_set and G.TE.queued_set[m_file_reference.table_id]:
+        G.TE.commit(m_file_reference.table_id, update_in_mem_indexes=False)
+
+    # 5. Populate C/ASM and Kconfig include references using set-based SQL (claims N+1..M via server AUTO_INCREMENT)
+    processing_include_references(version)
+
+    # 6. Resynchronize next_id so subsequent operations and commit_all have the accurate sequence boundary
+    if hasattr(G.TE, "db") and G.TE.db:
+        try:
+            G.TE.next_id[m_file_reference.table_id] = G.TE.db.get_next_id(m_file_reference)
+        except Exception:
+            pass
 
 
 def processing_maintainer_files(version: str) -> None:

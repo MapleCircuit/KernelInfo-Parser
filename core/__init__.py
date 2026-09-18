@@ -50,6 +50,10 @@ from core.globalstuff import (
     SafeDataType,
     UnSafeDataType,
     setup_memory_limit,
+    normalize_repo_path,
+    FileRefType,
+    FILE_REF_TYPE_LABELS,
+    format_ref_type_label,
 )
 
 from core.StringWrangler import (
@@ -107,6 +111,9 @@ from core.DBLayout import (
     m_bridge_commit_tag,
     m_tag_code,
     m_moved_tag,
+    m_symbol_def,
+    m_symbol_ref,
+    m_file_reference,
 )
 
 __all__ = [
@@ -151,6 +158,7 @@ __all__ = [
     "SafeDataType",
     "UnSafeDataType",
     "setup_memory_limit",
+    "normalize_repo_path",
     # StringWrangler
     "wrap_lines",
     "render_ansi_box",
@@ -205,4 +213,10 @@ __all__ = [
     "m_bridge_commit_tag",
     "m_tag_code",
     "m_moved_tag",
+    "m_symbol_def",
+    "m_symbol_ref",
+    "m_file_reference",
+    "FileRefType",
+    "FILE_REF_TYPE_LABELS",
+    "format_ref_type_label",
 ]

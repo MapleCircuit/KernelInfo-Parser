@@ -12,6 +12,8 @@ import re
 import time
 import ctypes
 import logging
+import os
+from collections import defaultdict
 from pathlib import Path
 from typing import Any
 import clang.cindex as cc
@@ -24,6 +26,7 @@ from core.globalstuff import (
     FILE_ERROR,
     configure_logging,
     ASTT,
+    STANDARD_C_KEYWORDS,
 )
 from parser.c_ast.ctypes_bindings import (
     AST_KIND,
@@ -150,6 +153,116 @@ def process_c_ast(CS: Any) -> None:
     Ast_Manager(CS)
 
 
+def extract_include_symbols(parsed_tu: cc.TranslationUnit, fullfilename: str, CS: Any) -> None:
+    """Map direct #includes to the external symbols they import that are directly used in the file."""
+    CS.include_symbols = defaultdict(list)
+    CS.include_symbol_refs = {}
+
+    target_real = os.path.realpath(fullfilename)
+    direct_includes: dict[int, dict[str, Any]] = {}
+    current_direct_line = None
+
+    real_cache: dict[str, str] = {fullfilename: target_real}
+
+    def get_real(fname: str) -> str:
+        r = real_cache.get(fname)
+        if r is None:
+            r = os.path.realpath(fname)
+            real_cache[fname] = r
+        return r
+
+    try:
+        inclusions = parsed_tu.get_includes()
+    except Exception:
+        return
+
+    for inc in inclusions:
+        src = inc.source
+        inc_file = inc.include
+        if not src or not inc_file:
+            continue
+        src_name = src.name
+        inc_name = inc_file.name
+        if inc.depth == 1 and (src_name == fullfilename or get_real(src_name) == target_real):
+            current_direct_line = inc.location.line if inc.location else None
+            if current_direct_line is not None:
+                r_inc = get_real(inc_name)
+                direct_includes[current_direct_line] = {
+                    "target": r_inc,
+                    "target_name": inc_name,
+                    "headers": {r_inc},
+                }
+        elif current_direct_line is not None and inc.depth > 1:
+            direct_includes[current_direct_line]["headers"].add(get_real(inc_name))
+
+    if not direct_includes:
+        return
+
+    header_to_direct_line: dict[str, int] = {
+        data["target"]: line for line, data in direct_includes.items()
+    }
+
+    def find_include_line(header_real: str) -> int | None:
+        if header_real in header_to_direct_line:
+            return header_to_direct_line[header_real]
+        for line in sorted(direct_includes.keys()):
+            if header_real in direct_includes[line]["headers"]:
+                return line
+        return None
+
+    # Map cursor kinds to ASTT
+    cursor_kind_map = {
+        cc.CursorKind.FUNCTION_DECL: ASTT.C_functionproto,
+        cc.CursorKind.CXX_METHOD: ASTT.C_functionproto,
+        cc.CursorKind.STRUCT_DECL: ASTT.C_struct,
+        cc.CursorKind.UNION_DECL: ASTT.C_union,
+        cc.CursorKind.ENUM_DECL: ASTT.C_enum,
+        cc.CursorKind.ENUM_CONSTANT_DECL: ASTT.C_enumequal,
+        cc.CursorKind.TYPEDEF_DECL: ASTT.C_SCtypedef,
+        cc.CursorKind.VAR_DECL: ASTT.C_SCextern,
+        cc.CursorKind.MACRO_DEFINITION: ASTT.CPPro_define,
+    }
+
+    found_symbols_by_line: dict[int, set[tuple[str, int]]] = defaultdict(set)
+
+    def walk_file(node: cc.Cursor) -> None:
+        f_obj = node.location.file
+        if not f_obj:
+            return
+        f_name = f_obj.name
+        if f_name != fullfilename and get_real(f_name) != target_real:
+            return
+
+        ref = node.referenced
+        if ref:
+            ref_f = ref.location.file
+            if ref_f:
+                ref_name = ref_f.name
+                if ref_name != fullfilename:
+                    ref_real = get_real(ref_name)
+                    if ref_real != target_real:
+                        sym_name = ref.spelling
+                        if sym_name and sym_name not in STANDARD_C_KEYWORDS:
+                            if not (sym_name.startswith("__builtin_") or sym_name.startswith("__attribute__")):
+                                ast_type = cursor_kind_map.get(ref.kind)
+                                if ast_type is not None:
+                                    inc_line = find_include_line(ref_real)
+                                    if inc_line is not None:
+                                        found_symbols_by_line[inc_line].add((sym_name, ast_type))
+
+        for ch in node.get_children():
+            walk_file(ch)
+
+    try:
+        for c in parsed_tu.cursor.get_children():
+            walk_file(c)
+    except Exception as e:
+        logger.debug(f"Error walking file-bounded cursors for include symbols: {e}")
+
+    for line, syms_set in found_symbols_by_line.items():
+        CS.include_symbols[line] = sorted(syms_set, key=lambda s: (s[1], s[0]))
+
+
 class TokenList(TokenStream):
     """Token list maintaining API compatibility with TokenStream and legacy TokenList."""
 
@@ -201,6 +314,8 @@ class Ast_Manager:
 
     def __init__(self, CS: Any) -> None:
         self.mfdir = CS.mf.version_dict[CS.gp.Version_Name]
+        CS.mfdir = self.mfdir
+        G.CURRENT_PARSING_DIR = self.mfdir
         self.filename = CS.current_path
         self.fullfilename = f"{self.mfdir}/{self.filename}"
         G.CURRENT_PARSING_FILE = self.filename
@@ -251,6 +366,8 @@ class Ast_Manager:
             ],
             options=(cc.TranslationUnit.PARSE_DETAILED_PROCESSING_RECORD + 32768),
         )
+
+        extract_include_symbols(translation_unit, self.fullfilename, CS)
 
         if prof is not None:
             prof.clang_parse_tu_s = time.perf_counter() - t_parse_0

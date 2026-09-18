@@ -82,6 +82,15 @@ Dense architectural contract and state interaction reference across `globalstuff
     - `Call = 3`: Function invocation expression (`Ast_CallExpr`).
     - `MemberRef = 4`: Struct, union, or enum member access (`Ast_MemberRefExpr`).
     - `DeclRef = 5`: Direct variable, constant, or identifier reference (`Ast_DeclRefExpr`).
+    - `MacroExpansion = 6`: Preprocessor macro instantiation or expansion (`Ast_MacroRefExpr`).
+
+  - `FileRefType(IntEnum)`: Categorical classification for cross-file references staged in `m_file_reference`:
+    - `Include = 1`: C and Preprocessor `#include <...>` or Assembly include statements.
+    - `Kconfig = 2`: Kconfig `source` and `rsource` references.
+    - `Kbuild = 3`: Kbuild compilation object mappings (`obj-$(CONFIG_...) += ...` and `*-objs`).
+    - `Makefile = 4`: Makefile includes and subdirectory recursions.
+    - `Documentation = 5`: Documentation and plain text file cross-references.
+
   - `STANDARD_C_KEYWORDS: dict[str, ASTT]`: Fast keyword-to-AST category mapping covering C control flow (`if`, `switch`, `case`, `default`, `while`, `do`, `for`, `return`, `break`, `continue`, `goto`, `asm`), qualifiers (`const`, `volatile`, `restrict`, `_Atomic`), storage classes (`static`, `extern`, `typedef`, `inline`), and primitive types (`void`, `char`, `short`, `int`, `long`, `signed`, `unsigned`, `float`, `double`, `struct`, `union`, `enum`).
   - `ASTT(IntEnum)`: AST construct category identifiers across C (`C_struct`, `C_Compound`, `C_SizeofExpr`, `C_TypeRef`), Preprocessor (`CPPro_define`, `CPPro_include`), ASM (`ASM_Instruction`, `ASM_Macro`), and Kconfig (`Kconfig_Config`, `Kconfig_Menu`, `Kconfig_Choice`, `Kconfig_Depends_On`, `Kconfig_Select`, `Kconfig_Op_And`, etc.).
 
@@ -186,6 +195,7 @@ Central runtime container, schema registry, and worker IPC coordinator.
 | **30** | `m_moved_tag` | `(s_tag_id, e_tag_id)` | `("s_tag_id", "e_tag_id")` | `False` | `False` | `False` | Tag history & cross-version evolution tracking |
 | **31** | `m_symbol_def` | `(def_id, vid, fid, tag_id, ast_id, name, type_id, line_s, line_e)` | `("def_id",)` | `False` | `True` | `False` | Authoritative Symbol Definition Registry (version-scoped) |
 | **32** | `m_symbol_ref` | `(ref_id, vid, fid, tag_id, ast_id, role, line, char_s)` | `("ref_id",)` | `False` | `False` | `False` | Symbol Declarations & Usages Reference Index (version-scoped) |
+| **33** | `m_file_reference` | `(ref_id, vid, source_fid, target_fnid, ref_type, line_no, details)` | `("ref_id",)` | `False` | `False` | `False` | Cross-File Usage & Dependency Index (`Include`=1, `Kconfig`=2, `Kbuild`=3, `Makefile`=4, `Documentation`=5) (version-scoped) |
 
 ---
 

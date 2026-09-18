@@ -25,6 +25,8 @@ For exhaustive architectural specifications, endpoint schemas, state machines, a
 - `GET /api/versions`: List all release versions in `m_v_main`.
 - `GET /api/tree?version={v}&path={p}`: Directory hierarchy traversal and file listing.
 - `GET /api/file?version={v}&path={p}`: File content, AST token mapping, `#if` scopes, and container hierarchies.
+- `GET /api/version/{version_name}/browse/{path}`: Full-spectrum file and directory inspection endpoint delivering AST tokens, spatial coordinates, symbol definitions, and incoming cross-file references (`used_by` payload containing breakdown counts and itemized references).
+- `GET /api/version/{version_name}/references/{fid}?ref_type={category}`: Dedicated incoming cross-file references ("Used By") query for a file ID with optional category filter (`include`, `kconfig`, `kbuild`, `makefile`, `documentation`). Powered by `m_file_reference` and low-latency dynamic fallback on `m_ast_include`.
 - `GET /api/blame?version={v}&path={p}`: Git blame line annotations and commit references.
 - `GET /api/file/history?path={p}`: Cross-version lifecycle status (`Added`, `Modified`, `Deleted`).
 

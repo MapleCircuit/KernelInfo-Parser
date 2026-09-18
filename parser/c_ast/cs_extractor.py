@@ -27,6 +27,7 @@ from core.DBLayout import (
     m_ast,
     m_map_ast,
     m_bridge_map,
+    m_symbol_ref,
 )
 from parser.c_ast.tag_tracker import check_exact_match, match_prior_tag_transition
 
@@ -41,6 +42,27 @@ class CSExtractor:
         t_start = time.perf_counter() if prof is not None else 0.0
 
         zone.extract(CS)
+
+        if getattr(CS, "pending_symbol_refs", None):
+            last_tag = getattr(CS, "last_tag_ref", 0) or 0
+            seen: set[tuple[Any, int, int, int]] = set()
+            for ref_ast_id, role, line, col in CS.pending_symbol_refs:
+                key = (ref_ast_id, role, line, col)
+                if key in seen:
+                    continue
+                seen.add(key)
+                with CS(REF_POS):
+                    CS.store(m_symbol_ref.set(
+                        None,
+                        CS.gp.VID,
+                        ((m_file.table_id, 0), OP_REF, (REF_ROOT,)),
+                        last_tag,
+                        ref_ast_id,
+                        int(role),
+                        line,
+                        col,
+                    ))
+            CS.pending_symbol_refs.clear()
 
         if prof is not None:
             prof.ast_extraction_s = time.perf_counter() - t_start

@@ -932,7 +932,7 @@ m_symbol_def = Table(
 #     - fid: File Instance ID (FK -> m_file.fid).
 #     - tag_id: Enclosing Code Tag ID (FK -> m_tag.tag_id).
 #     - ast_id: Referenced Canonical AST Node ID (FK -> m_ast.ast_id).
-#     - role: SymbolRole category (1: Declaration, 2: TypeUsage, 3: Call, 4: MemberRef, 5: DeclRef).
+#     - role: SymbolRole category (1: Declaration, 2: TypeUsage, 3: Call, 4: MemberRef, 5: DeclRef, 6: MacroExpansion).
 #     - line: Source line number of occurrence.
 #     - char_s: Source character column offset of occurrence.
 # -----------------------------------------------------------------------------
@@ -955,6 +955,41 @@ m_symbol_ref = Table(
         ("fid", "m_file", "fid"),
         ("tag_id", "m_tag", "tag_id"),
         ("ast_id", "m_ast", "ast_id"),
+    ),
+    initial_insert=None,
+    no_duplicate=False,
+    te_cached=False,
+    version_scoped=True,
+    hashing_table=False,
+)
+
+# -----------------------------------------------------------------------------
+# 34. m_file_reference (table_id=33): Cross-File Usage & Dependency Index
+#     - ref_id: Unique Reference ID (PK, AUTO_INCREMENT).
+#     - vid: Version ID (FK -> m_v_main.vid).
+#     - source_fid: Referencing Source File ID (FK -> m_file.fid).
+#     - target_fnid: Target File Path ID being referenced/used (FK -> m_file_name.fnid).
+#     - ref_type: Reference Type (1: Include, 2: Kconfig, 3: Kbuild, 4: Makefile, 5: Documentation).
+#     - line_no: Source line number in referencing file.
+#     - details: Additional metadata/context snippet (e.g. target object, config symbol, directive).
+# -----------------------------------------------------------------------------
+m_file_reference = Table(
+    table_id=33,
+    table_name="m_file_reference",
+    columns=(
+        ("ref_id", "INT", "NOT NULL", "AUTO_INCREMENT"),
+        ("vid", "INT", "NOT NULL"),
+        ("source_fid", "INT", "NOT NULL"),
+        ("target_fnid", "INT", "NOT NULL"),
+        ("ref_type", "TINYINT", "UNSIGNED", "NOT NULL"),
+        ("line_no", "INT", "NOT NULL"),
+        ("details", "VARCHAR(255)", "DEFAULT ''", "COLLATE utf8mb4_bin"),
+    ),
+    primary=("ref_id",),
+    foreign=(
+        ("vid", "m_v_main", "vid"),
+        ("source_fid", "m_file", "fid"),
+        ("target_fnid", "m_file_name", "fnid"),
     ),
     initial_insert=None,
     no_duplicate=False,
@@ -997,18 +1032,19 @@ TABLES: tuple[Table, ...] = (
     m_moved_tag,
     m_symbol_def,
     m_symbol_ref,
+    m_file_reference,
 )
 
 
 def init_db_layout(gp=None) -> tuple[Table, ...]:
-    """Initialize and populate gp.Table_Array with the default 33 schema tables.
+    """Initialize and populate gp.Table_Array with the default 34 schema tables.
     
     Args:
         gp: Optional GreatProcessor instance to attach Table_Array to.
         
         
     Returns:
-        Immutable tuple of all 33 Table schema objects.
+        Immutable tuple of all 34 Table schema objects.
     """
     if gp is not None:
         gp.Table_Array = list(TABLES)

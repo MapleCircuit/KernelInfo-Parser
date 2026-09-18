@@ -281,7 +281,7 @@ Expands the target `Line` extent to encapsulate trailing punctuation delimiters 
 
 #### `Ast_Statement(Ast)` (Statement Interface)
 Base class in `cursor_tree.py` for executable statements (`Ast_CompoundStmt`, `Ast_IfStmt`, `Ast_SwitchStmt`, etc.):
-- Contains child collections: `zones: list[Zone]`, `operands: list[str]`, `call_exprs: list[Ast_CallExpr]`, `member_refs: list[Ast_MemberRefExpr]`, `decl_refs: list[Ast_DeclRefExpr]`.
+- Contains child collections: `zones: list[Zone]`, `operands: list[str]`, `call_exprs: list[Ast_CallExpr]`, `member_refs: list[Ast_MemberRefExpr]`, `decl_refs: list[Ast_DeclRefExpr]`, `macro_refs: list[Ast_MacroRefExpr]`.
 - Attributes: `self.type_id: int` (initialized from `self.__class__.type_id`), `self.ast_ref: Any = None`.
 - `_extract_nested(CS)`: Iterates and extracts child zones inside `with CS(REF_MULTI):` and extracts collected expressions inside `with CS(REF_NO_REF):`.
 - `extract(CS)`: Default statement extraction calling `self._extract_nested(CS)` followed by `self.extract_1arg(CS, type_id, name, self.extent)`.
@@ -329,10 +329,11 @@ Base class in `cursor_tree.py` for expression and sub-construct containers (`AST
   - Record types (`RECORD`) &rarr; stages `m_ast.view(((m_ast.ast_id,),), None, safe_name, ASTT.C_structnotbind)` and returns `(ASTT.C_struct, CS.ref(...))`.
   - Enum types (`ENUM`) &rarr; stages `m_ast.view(((m_ast.ast_id,),), None, safe_name, ASTT.C_enumnotbind)` and returns `(ASTT.C_enum, CS.ref(...))`.
   - Primitives (`INT`, `CHAR_S`, `LONG`, `POINTER`, etc.) &rarr; returns corresponding primitive `ASTT` enum value with `ref_ast_id = 0`.
-- **Expression Classes (`Ast_CallExpr`, `Ast_MemberRefExpr`, `Ast_DeclRefExpr`)**:
+- **Expression Classes (`Ast_CallExpr`, `Ast_MemberRefExpr`, `Ast_DeclRefExpr`, `Ast_MacroRefExpr`)**:
   - `Ast_CallExpr`: Function invocation `callee(...)`. If `ref_ast_id != 0`, stages joined view `m_ast.view(((m_ast.ast_id, m_ast_container.ast_id, 1),), None, name, ASTT.C_CallExpr, None, 0, t_id, ref_ast_id)`.
   - `Ast_MemberRefExpr`: Field access `x.y` / `x->y`. Links member identifier to parent record container.
   - `Ast_DeclRefExpr`: Variable or parameter reference. Links identifier to declaration reference.
+  - `Ast_MacroRefExpr`: Macro expansion or instantiation reference (`SymbolRole.MacroExpansion = 6`). Resolves macro definition and stages `m_symbol_ref`.
 
 ### 5.5 Comments, Assembly & Macros (`ast_nodes.py`)
 | Class | `ASTT` Type Constant | Symbolic Value | Stored Payload | Description |
@@ -362,7 +363,7 @@ All preprocessor directives begin as `CPPro(extent)`. Upon reading the directive
 | `CPPro_elifndef` | `ASTT.CPPro_elifndef`| 74 | Conditional macro identifier string. |
 | `CPPro_define` | `ASTT.CPPro_define` / `CPPro_define_macro` | 75 / 76 | Macro name and replacement body. Expands `extent` if trailing `\` continuation. |
 | `CPPro_undef` | `ASTT.CPPro_undef` | 77 | Undefined macro identifier name. |
-| `CPPro_include` | `ASTT.CPPro_include`| 78 | Resolves include target via `cursor.get_included_file()`. Stages `m_file_name.get_set` followed by multi-table view `m_ast.view(((m_ast.ast_id, m_ast_include.ast_id, 1),), None, w_include[:255], ASTT.CPPro_include, None, CS.ref(m_file_name.fnid, *fnid_route))`. |
+| `CPPro_include` | `ASTT.CPPro_include`| 78 | Resolves include target via `cursor.get_included_file()`. Stages `m_file_name.get_set`, extracts external symbols used in the file attributed to this include, stages child symbol nodes in `m_ast` in `REF_POS`, and emits joined view `m_ast.view(((m_ast.ast_id, m_ast_include.ast_id, 1), (m_ast.ast_id, m_ast_container.ast_id, N)), None, w_include[:255], ASTT.CPPro_include, None, CS.ref(m_file_name.fnid, *fnid_route), *flat_container_args)`. Falls back to single-relation view if `N == 0`. |
 | `CPPro_line` | `ASTT.CPPro_line` | 79 | Source line override: `"{lineno} {filename}"`. |
 | `CPPro_error` | `ASTT.CPPro_error` | 80 | `#error` message string. |
 | `CPPro_warning` | `ASTT.CPPro_warning`| 81 | `#warning` message string. |
@@ -394,8 +395,9 @@ class CQual(Flag):
   - Aggregates `content: list[TypeToken]`, `cqual: CQual`, `ref_type: TSRef`.
   - `generate_ast(CS: ChangeSet)`:
     - Single unqualified primitive: sets `type_id = content[0].type`.
+    - Single unqualified typedef (`content[0].type == ASTT.C_SCtypedef`, `code != "typedef"`): resolves `sym_name` and `foreign_file` via `REF_FILE` (`CS.ref(m_ast.ast_id, REF_FILE, f_file, sym_name, int(ASTT.C_SCtypedef))`), local `CS.symbol_dict[(sym_name, int(ASTT.C_SCtypedef))]`, or unbound stub in `REF_NO_REF`, setting `ref_type = TSRef.Route_Ref` and staging `self.symbol_refs.append((target_ref, line, col))` for `SymbolRole.TypeUsage`.
     - Unbound forward struct/union/enum/proto (e.g. `struct foo *`): emits `m_ast.view(((m_ast.ast_id,),), None, "foo", notbind_type)` in `REF_NO_REF` and sets `ref_type = TSRef.Route_Ref`.
-    - Qualified or compound types: constructs joined view `m_ast.view(((m_ast.ast_id, m_ast_container.ast_id, count),), None, "", ASTT.C_Compound, ...)` mapping all qualifier and type tokens into `m_ast_container`.
+    - Qualified or compound types: constructs joined view `m_ast.view(((m_ast.ast_id, m_ast_container.ast_id, count),), None, "", ASTT.C_Compound, ...)` mapping all qualifier and type tokens into `m_ast_container`. Compound `C_SCtypedef` tokens (e.g. `const __be32` or function pointer return types) resolve `target_ref`, append `(typetoken.type, target_ref)`, and stage `SymbolRole.TypeUsage` in `m_symbol_ref`.
 
 ### 6.3 Forward Declaration Resolution: `get_notbind_type(ast_type: int) -> int` (`ast_nodes.py`)
 Maps bound declaration type constants to unbound forward reference constants:
@@ -403,6 +405,7 @@ Maps bound declaration type constants to unbound forward reference constants:
 - `ASTT.C_union` / `ASTT.C_uniondecl` &rarr; `ASTT.C_unionnotbind` (35)
 - `ASTT.C_enum` / `ASTT.C_enumdecl` &rarr; `ASTT.C_enumnotbind` (32)
 - `ASTT.C_functionproto` / `ASTT.C_functionprotodecl` &rarr; `ASTT.C_functionprotnotbind` (22)
+- `ASTT.C_SCtypedef` &rarr; `ASTT.C_SCtypedef` (10)
 
 ### 6.4 Declaration Type Resolution: `get_decl_type(ast_type: int) -> int` (`cursor_tree.py`)
 Maps base construct type constants to definition declaration type constants:
@@ -410,6 +413,7 @@ Maps base construct type constants to definition declaration type constants:
 - `ASTT.C_union` &rarr; `ASTT.C_uniondecl` (34)
 - `ASTT.C_enum` &rarr; `ASTT.C_enumdecl` (31)
 - `ASTT.C_functionproto` &rarr; `ASTT.C_functionprotodecl` (21)
+- `ASTT.C_SCtypedef` &rarr; `ASTT.C_SCtypedef` (10)
 
 ---
 
@@ -510,6 +514,11 @@ class Zone_Type(IntEnum):
   - Token dispatch treats `(` as the pointer declarator grouping whenever `C_functionproto` has not yet been registered on the node, ensuring `Zone(Zone_Type.Function_Args)` is only spawned for the actual argument list, preventing phantom `*<name>` declarator tags and guaranteeing all parameter tags are correctly extracted and linked to the parent symbol at Container Level 1 in `m_ast_container`.
 - **Standalone Forward Declarations**:
   Standalone declarations (e.g. `struct svc_rqst;`) remain `ASTT.C_struct` (27) and are not marked as definitions (`C_structdecl`), preventing orphan empty container rows.
+- **Typedef Declarator Extraction & Chained Underlying Type Linking**:
+  - Declarator token isolation: When executing identifiers under `cc.CursorKind.TYPEDEF_DECL` matching `safe_cursor_spelling(cursor)`, the declarator receives default type `0` (avoiding phantom child container creation) and is assigned to `self.name`.
+  - Typedef definition categorization: Staged with `type_id = ASTT.C_SCtypedef` (10) in `m_ast` and registered in `m_symbol_def` with `type_id = ASTT.C_SCtypedef`, clearly classifying typedefs in symbol searches.
+  - Chained alias hierarchy: The underlying type is evaluated via `typesegment.generate_ast(CS)` and linked at Priority 0 in `m_ast_container`, with `ref_ast_id` pointing to the immediate underlying type's AST (forming an alias chain `__be32 -> __u32 -> unsigned int`).
+  - Usage tracking: All typed declarations (struct/union fields, function return types, parameters, variables, and typedef aliases) that reference a typedef resolve `target_ref` (via `REF_FILE` for foreign headers or `CS.symbol_dict` locally) and stage `(target_ref, SymbolRole.TypeUsage, line, col)` in `m_symbol_ref`.
 
 ---
 
@@ -742,8 +751,8 @@ Defined in `core/globalstuff.py`, `STANDARD_C_KEYWORDS: dict[str, ASTT]` provide
     - `REF_FILE` Deferred Resolution Invariant: `ChangeSet.ref()` must never eagerly evaluate `REF_FILE` routes or invoke `safe_get_cs` during AST parsing, returning `(query, OP_REF, parsed_route)` immediately to eliminate recursive Clang translation unit compilation cascades.
     - During parallel multicore parsing, `CS.batch_cs_dict` provides worker-local intra-batch scope for inspecting sibling ChangeSets parsed in the active batch.
     - During `ChangeSet.execute()`, `resolve_ref()` resolves `REF_FILE` references via TableHandling: checking `gp.ChangeSet_Dict` (or `batch_cs_dict`) if the defining file was modified in the active version, executing operations out-of-order so independent symbols publish immediately, tracking blocking dependencies in `self.blocked_on`, and otherwise staging `notbind` stubs directly in TableHandling (`m_ast`) via `force_stubs=True` to break circular dependency deadlocks with warning logs.
-    - `m_symbol_def` (Table 31): Staged during definition extraction for functions (`ASTT.C_functionproto`), structs (`ASTT.C_struct`, `ASTT.C_structdecl`), unions, enums, assembly labels/macros, and jump labels. Records `(def_id, vid, fid, tag_id, ast_id, name, type_id, line_s, line_e)`.
-    - `m_symbol_ref` (Table 32): Staged for every occurrence of a symbol: declarations (`SymbolRole.Declaration = 1`), type usages (`SymbolRole.TypeUsage = 2`), function calls (`SymbolRole.Call = 3`), struct member references (`SymbolRole.MemberRef = 4`), and identifier references (`SymbolRole.DeclRef = 5`). Records `(ref_id, vid, fid, tag_id, ast_id, role, line, char_s)`.
+    - `m_symbol_def` (Table 31): Staged during definition extraction for functions (`ASTT.C_functionproto`), structs (`ASTT.C_struct`, `ASTT.C_structdecl`), unions, enums, typedefs (`ASTT.C_SCtypedef`), preprocessor macros (`ASTT.CPPro_define`, `ASTT.CPPro_define_macro`), assembly labels/macros, and jump labels. Records `(def_id, vid, fid, tag_id, ast_id, name, type_id, line_s, line_e)`.
+    - `m_symbol_ref` (Table 32): Staged for every occurrence of a symbol: declarations (`SymbolRole.Declaration = 1`), type usages (`SymbolRole.TypeUsage = 2`), function calls (`SymbolRole.Call = 3`), struct member references (`SymbolRole.MemberRef = 4`), identifier references (`SymbolRole.DeclRef = 5`), and macro expansions (`SymbolRole.MacroExpansion = 6`). Records `(ref_id, vid, fid, tag_id, ast_id, role, line, char_s)`.
     - Co-declared structs and variables (e.g. `struct foo { int a; } my_var;`): The parser isolates the struct extent up through the closing brace `}` of `Declared_Args`, stages `m_symbol_def` for the canonical struct type, and then extracts the declared variable extent linking its container Priority 0 to the struct's `ast_id` and staging an `m_symbol_ref` with `SymbolRole.TypeUsage`.
 23. **Slot-Optimized Token, Deduplicated Streaming & Immediate Post-Extraction Teardown Invariant**:
     - Tokens streamed through `TokenStream` must use `ParsedToken` with `__slots__ = ("line", "spelling_str", "ast_kind", "_cursor")` to eliminate Python instance `__dict__` overhead on ctypes objects.

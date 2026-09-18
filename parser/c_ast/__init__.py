@@ -76,6 +76,7 @@ from parser.c_ast.ast_nodes import (
     Ast_CallExpr,
     Ast_MemberRefExpr,
     Ast_DeclRefExpr,
+    Ast_MacroRefExpr,
     Ast_MACRO_INSTANTIATION,
 )
 
@@ -206,6 +207,7 @@ __all__ = [
     "Ast_CallExpr",
     "Ast_MemberRefExpr",
     "Ast_DeclRefExpr",
+    "Ast_MacroRefExpr",
     "Ast_BinaryOperator",
     "Ast_UnaryOperator",
     "Ast_MACRO_INSTANTIATION",

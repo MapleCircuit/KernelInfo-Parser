@@ -1,7 +1,9 @@
 """globalstuff.py - Global objects and constants."""
+import os
 import sys
 import shutil
 import logging
+import re
 from pathlib import Path
 from core.StringWrangler import wrap_lines, render_ansi_box, render_with_indent
 import contextlib
@@ -37,6 +39,37 @@ def compute_code_hash(code: str) -> bytes:
     return hashlib.sha256(code.encode("latin-1")).digest()
 
 
+def normalize_repo_path(path: str, base_dir: str | None = None) -> str:
+    """Normalize absolute host/RAMDISK file paths into relative git repository paths."""
+    if not path:
+        return ""
+    s = path.strip()
+    if (s.startswith("<") and s.endswith(">")) or (s.startswith('"') and s.endswith('"')):
+        return s
+
+    norm = os.path.normpath(s)
+    base = base_dir or getattr(G, "CURRENT_PARSING_DIR", None)
+    if base:
+        b_norm = os.path.normpath(base)
+        if norm.startswith(b_norm + "/"):
+            return norm[len(b_norm) + 1:]
+        if norm == b_norm:
+            return ""
+
+    # Check for temporary clone directories in RAMDISK (/dev/shm or /tmp)
+    m = re.match(r"^(?:/dev/shm|/tmp)/(?:code-parser\.[^/]+(?:/linux)?/|[^/]+/linux/|[^/]+/)?(.*)$", norm)
+    if m and m.group(1):
+        return m.group(1)
+
+    if norm.startswith("/") and "/linux/" in norm:
+        return norm.split("/linux/", 1)[1]
+
+    if norm.startswith("/") and not norm.startswith(("/usr/", "/opt/", "/etc/", "/lib")):
+        return norm.lstrip("/")
+
+    return norm
+
+
 _UNNAMED_PATTERN = re.compile(r"(\((?:unnamed|anonymous) at )([^)]+)(\))")
 
 
@@ -59,19 +92,7 @@ def clean_unnamed_spelling(spelling: str) -> str:
         if current_file and path_part.endswith(current_file):
             rel_path = current_file
         else:
-            m_shm = re.match(
-                r"^/dev/shm/(?:code-parser\.[^/]+/[^/]+/|[^/]+/linux/|[^/]+/)?(.*)$",
-                path_part,
-            )
-            if m_shm and m_shm.group(1):
-                rel_path = m_shm.group(1)
-            elif path_part.startswith("/"):
-                if "/linux/" in path_part:
-                    rel_path = path_part.split("/linux/", 1)[1]
-                else:
-                    rel_path = path_part.lstrip("/")
-            else:
-                rel_path = path_part
+            rel_path = normalize_repo_path(path_part)
 
         return f"{prefix}{rel_path}{loc}{suffix}"
 
@@ -103,6 +124,7 @@ class GlobalStuff:
 
         # Active file context for logging
         self.CURRENT_PARSING_FILE: str | None = None
+        self.CURRENT_PARSING_DIR: str | None = None
 
         # FAIL CHECK
         self.OVERRIDE_FC_MAX_LOOP_EXEC_MULT = 2
@@ -360,9 +382,31 @@ class PointerGetter:
         joins.append(join)
 
 
-def type_check(name: str) -> int:
+_RE_C_DECLARATION = re.compile(
+    r"^\s*(#\s*include|typedef|struct\s+\w+\s*\{|union\s+\w+\s*\{|enum\s+\w+\s*\{|extern|static|inline|__inline__|void|int|char|long)\b",
+    re.MULTILINE,
+)
+_RE_ASM_PIPE_COMMENT = re.compile(r"^\s*\|(\s+[a-zA-Z0-9_-]|\s*$)", re.MULTILINE)
+_RE_ASM_DIRECTIVE = re.compile(
+    r"^\s*\.(set|globl|global|macro|endm|section|equ|equiv|ascii|asciz|byte|short|long|quad|word|space|align|balign|fill|text|data|bss)\s+[a-zA-Z0-9_.]+",
+    re.MULTILINE,
+)
+
+
+def is_pure_asm_content(content: str) -> bool:
+    """Detect whether a C or header source file is entirely architecture assembly."""
+    if not content:
+        return False
+    if _RE_C_DECLARATION.search(content):
+        return False
+    return bool(_RE_ASM_PIPE_COMMENT.search(content) or _RE_ASM_DIRECTIVE.search(content))
+
+
+def type_check(name: str, content: str | None = None) -> int:
     """Parse string to get file type."""
     if name.endswith((".c", ".h")):
+        if content is not None and is_pure_asm_content(content):
+            return T_ASM
         return T_C
     if name == "MAINTAINERS" or name.endswith("/MAINTAINERS"):
         return T_MAINTAINERS
@@ -549,6 +593,29 @@ class SymbolRole(IntEnum):
     Call = 3
     MemberRef = 4
     DeclRef = 5
+    MacroExpansion = 6
+
+
+class FileRefType(IntEnum):
+    Include = 1        # C/ASM #include <header.h>
+    Kconfig = 2        # Kconfig source/rsource "path"
+    Kbuild = 3         # Kbuild compilation (obj-* += foo.o -> foo.c)
+    Makefile = 4       # Makefile include (include path) or recursion (obj-* += dir/)
+    Documentation = 5  # Documentation / text reference (Documentation/, *.txt, *.rst, README)
+
+
+FILE_REF_TYPE_LABELS: dict[int, str] = {
+    FileRefType.Include: "Include",
+    FileRefType.Kconfig: "Kconfig",
+    FileRefType.Kbuild: "Kbuild",
+    FileRefType.Makefile: "Makefile",
+    FileRefType.Documentation: "Documentation",
+}
+
+
+def format_ref_type_label(ref_type: int) -> str:
+    """Return friendly label for a FileRefType code."""
+    return FILE_REF_TYPE_LABELS.get(ref_type, f"RefType({ref_type})")
 
 
 STANDARD_C_KEYWORDS: dict[str, ASTT] = {

@@ -44,6 +44,7 @@ from webapp.main import (
     get_symbol_detail,
     get_tag_by_id,
     get_tag_timeline,
+    get_include_symbols,
     get_versions_diff,
     lookup_symbols,
     search_symbols,
@@ -94,6 +95,8 @@ class TestWebappAdvancedFeatures(unittest.TestCase):
         self.assertIn("member_refs", xref)
         self.assertIn("type_usages", xref)
         self.assertIn("declarations", xref)
+        self.assertIn("macro_expansions", xref)
+        self.assertIn("macro_expansions_count", xref)
         self.assertIn("references_count", xref)
 
     def test_kconfig_dag_graph(self) -> None:
@@ -432,6 +435,128 @@ class TestWebappAdvancedFeatures(unittest.TestCase):
         self.assertIn('Raw files should NOT be parsed by any parser or lexer', content)
         self.assertIn('if (!isC && !isAsm && !isKconfig && !isRust)', content)
         self.assertIn('return { html: escapeHtml(rawText), inComment: false };', content)
+
+    def test_include_symbols_endpoint_and_dom(self) -> None:
+        """Verify get_include_symbols endpoint and includeSymbolsPopover UI structure."""
+        from fastapi import HTTPException
+        # 1. 404 on non-existent AST ID
+        with self.assertRaises(HTTPException) as ctx:
+            get_include_symbols("v3.0", 999999999)
+        self.assertEqual(ctx.exception.status_code, 404)
+
+        # 2. Existing AST ID query if any include exists in DB
+        from webapp.main import db
+        cnx = db.get_connection()
+        if cnx:
+            cursor = cnx.cursor()
+            cursor.execute("SELECT ast_id FROM m_ast_include LIMIT 1;")
+            row = cursor.fetchone()
+            cursor.close()
+            cnx.close()
+            if row:
+                res = get_include_symbols("v3.0", row[0])
+                self.assertIn("ast_id", res)
+                self.assertIn("include_text", res)
+                self.assertIn("header_file", res)
+                self.assertIn("header_exists", res)
+                self.assertIn("total_symbols", res)
+                self.assertIn("symbols", res)
+                self.assertIsInstance(res["symbols"], list)
+
+        # 3. Verify webapp.html popover elements and controller functions
+        html_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "webapp", "webapp.html")
+        with open(html_path, "r", encoding="utf-8") as f:
+            content = f.read()
+
+        self.assertIn('id="includeSymbolsPopover"', content)
+        self.assertIn('id="includeSymbolsSearchInput"', content)
+        self.assertIn('id="includeCategoryPills"', content)
+        self.assertIn('id="includeSymbolsList"', content)
+        self.assertIn('id="btnIncludeOpenHeader"', content)
+        self.assertIn('openIncludeSymbolsPopover', content)
+        self.assertIn('renderIncludeSymbolsContent', content)
+        self.assertIn('setIncludeCategoryFilter', content)
+        self.assertIn('onFilterIncludeSymbols', content)
+        self.assertIn('onIncludeSymbolClick', content)
+        self.assertIn('includePopoverOpenHeader', content)
+        self.assertIn('closeIncludeSymbolsPopover', content)
+        self.assertIn('typeKey === "CPPro_include"', content)
+        # Ensure includePopoverOpenHeader reads header_file before closeIncludeSymbolsPopover() clears currentIncludeData
+        self.assertIn('let headerFile = currentIncludeData.header_file;', content)
+
+    def test_normalize_repo_path(self) -> None:
+        """Verify normalize_repo_path strips RAMDISK and temp clone prefixes down to relative git paths."""
+        from core.globalstuff import normalize_repo_path
+
+        # 1. /dev/shm/code-parser.XXXXXX with ../../ traversal
+        p1 = "/dev/shm/code-parser.6sqil09b/Documentation/virtual/lguest/../../../include/linux/lguest_launcher.h"
+        self.assertEqual(normalize_repo_path(p1), "include/linux/lguest_launcher.h")
+
+        # 2. /dev/shm/code-parser.XXXXXX direct relative path
+        p2 = "/dev/shm/code-parser.6sqil09b/arch/alpha/kernel/pci_impl.h"
+        self.assertEqual(normalize_repo_path(p2), "arch/alpha/kernel/pci_impl.h")
+
+        # 3. /tmp/code-parser.XXXXXX
+        p3 = "/tmp/code-parser.xyz123/drivers/net/e1000.c"
+        self.assertEqual(normalize_repo_path(p3), "drivers/net/e1000.c")
+
+        # 4. Explicit base_dir
+        base = "/dev/shm/code-parser.custom"
+        p4 = "/dev/shm/code-parser.custom/include/linux/lockd/xdr.h"
+        self.assertEqual(normalize_repo_path(p4, base), "include/linux/lockd/xdr.h")
+
+        # 5. System headers preserved
+        p5 = "/usr/include/stdio.h"
+        self.assertEqual(normalize_repo_path(p5), "/usr/include/stdio.h")
+
+        # 6. Written include syntax preserved
+        self.assertEqual(normalize_repo_path("<linux/types.h>"), "<linux/types.h>")
+        self.assertEqual(normalize_repo_path('"lockd/xdr.h"'), '"lockd/xdr.h"')
+
+    def test_pure_asm_detection_and_classification(self) -> None:
+        """Verify is_pure_asm_content and type_check identify pure ASM .h/.c files as T_ASM."""
+        from core.globalstuff import is_pure_asm_content, type_check, T_C, T_ASM
+
+        # 1. Typical ASM header file like arch/m68k/fpsp040/fpsp.h
+        asm_header = """|
+| fpsp.h
+|
+| Motorola 68040 Floating Point Software Package
+|
+\t.set\tLOCAL_SIZE,128
+\t.set\tEXC_SR,0
+\t.global\t_fpsp_init
+_fpsp_init:
+\trts
+"""
+        self.assertTrue(is_pure_asm_content(asm_header))
+        self.assertEqual(type_check("arch/m68k/fpsp040/fpsp.h", asm_header), T_ASM)
+
+        # 2. Typical C header file
+        c_header = """#ifndef _LINUX_FOO_H
+#define _LINUX_FOO_H
+
+struct foo {
+    int x;
+};
+
+int get_foo(void);
+
+#endif
+"""
+        self.assertFalse(is_pure_asm_content(c_header))
+        self.assertEqual(type_check("include/linux/foo.h", c_header), T_C)
+
+        # 3. Typical C source file
+        c_source = """#include <linux/foo.h>
+
+int get_foo(void) {
+    return 42;
+}
+"""
+        self.assertFalse(is_pure_asm_content(c_source))
+        self.assertEqual(type_check("drivers/foo.c", c_source), T_C)
+
 
 
 if __name__ == "__main__":

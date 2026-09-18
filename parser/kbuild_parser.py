@@ -14,11 +14,14 @@ from typing import Any
 
 @dataclass
 class KbuildBinding:
-    """Represents a compiled source file binding associated with a Kconfig symbol."""
+    """Represents a compiled source file binding or Makefile dependency."""
     symbol_name: str  # without CONFIG_ prefix, or "y" for core built-in, "m" for module
     compile_mode: int  # 1: built-in (y), 2: module (m), 3: conditional (y/m)
-    target_obj: str  # e.g. "ext4.o", "drbd.o"
-    source_file_rel: str  # e.g. "fs/ext4/balloc.c"
+    target_obj: str  # e.g. "ext4.o", "drbd.o", "Makefile"
+    source_file_rel: str  # e.g. "fs/ext4/balloc.c", "drivers/net/Makefile"
+    source_line: int = 1  # 1-based source line number in Makefile
+    ref_type: int = 3  # FileRefType.Kbuild (3) or FileRefType.Makefile (4)
+    details: str = ""  # Rule or directive representation
     is_composite: bool = False
 
 
@@ -37,6 +40,11 @@ class KbuildParser:
         re.MULTILINE,
     )
 
+    # Matches -?include ...
+    MAKEFILE_INCLUDE_RE = re.compile(
+        r"^\s*-?include\s+(.*)$",
+    )
+
     def __init__(self, base_dir: str = "") -> None:
         self.base_dir = base_dir.replace("\\", "/").rstrip("/")
 
@@ -52,24 +60,28 @@ class KbuildParser:
         """
         clean_dir = dir_path.replace("\\", "/").strip("/")
         
-        # 1. Join line continuations (lines ending with \)
-        joined_lines = []
-        current_line = []
-        for line in content.splitlines():
+        # 1. Join line continuations while preserving starting 1-based line numbers
+        joined_lines: list[tuple[int, str]] = []
+        current_line: list[str] = []
+        current_start_line = 1
+
+        for idx, line in enumerate(content.splitlines(), start=1):
+            if not current_line:
+                current_start_line = idx
             stripped = line.rstrip()
             if stripped.endswith("\\"):
                 current_line.append(stripped[:-1].rstrip())
             else:
                 current_line.append(stripped)
-                joined_lines.append(" ".join(current_line))
+                joined_lines.append((current_start_line, " ".join(current_line)))
                 current_line = []
         if current_line:
-            joined_lines.append(" ".join(current_line))
+            joined_lines.append((current_start_line, " ".join(current_line)))
 
-        # 2. Extract composite object mappings: target_name -> list of constituent .o files
-        composites: dict[str, list[tuple[str, str | None]]] = {}
-        for line in joined_lines:
-            line_str = line.strip()
+        # 2. Extract composite object mappings: target_name -> list of constituent (comp_obj, sub_sym, line_no)
+        composites: dict[str, list[tuple[str, str | None, int]]] = {}
+        for start_line, line_str in joined_lines:
+            line_str = line_str.strip()
             if not line_str or line_str.startswith("#"):
                 continue
             m = self.COMPOSITE_RE.match(line_str)
@@ -82,13 +94,36 @@ class KbuildParser:
                 for v in vals:
                     clean_v = v.strip()
                     if clean_v.endswith(".o"):
-                        composites[target_base].append((clean_v, sub_cond))
+                        composites[target_base].append((clean_v, sub_cond, start_line))
 
-        # 3. Extract obj-* rules
+        # 3. Extract obj-* rules and Makefile include directives
         bindings: list[KbuildBinding] = []
-        for line in joined_lines:
-            line_str = line.strip()
+        for start_line, line_str in joined_lines:
+            line_str = line_str.strip()
             if not line_str or line_str.startswith("#"):
+                continue
+
+            # Check Makefile include directives: include scripts/Makefile.build
+            m_inc = self.MAKEFILE_INCLUDE_RE.match(line_str)
+            if m_inc:
+                raw_inc_paths = m_inc.group(1).split()
+                for inc_p in raw_inc_paths:
+                    clean_inc = inc_p.strip().strip("'\"")
+                    for prefix in ("$(srctree)/", "$srctree/", "$(src)/", "$src/", "$(obj)/", "$obj/", "$(TOPDIR)/"):
+                        if clean_inc.startswith(prefix):
+                            clean_inc = clean_inc[len(prefix):]
+                    clean_inc = clean_inc.strip("/")
+                    if clean_inc and not clean_inc.startswith("$"):
+                        bindings.append(KbuildBinding(
+                            symbol_name="",
+                            compile_mode=1,
+                            target_obj="Makefile",
+                            source_file_rel=clean_inc,
+                            source_line=start_line,
+                            ref_type=4,  # FileRefType.Makefile
+                            details=f"include {inc_p}",
+                            is_composite=False,
+                        ))
                 continue
 
             m = self.OBJ_ASSIGN_RE.match(line_str)
@@ -113,12 +148,27 @@ class KbuildParser:
                     clean_item = item.strip()
                     if clean_item.endswith("/"):
                         # Subdirectory recursion: e.g. ethernet/
+                        sub_dir_name = clean_item.rstrip("/")
+                        sub_dir = f"{clean_dir}/{sub_dir_name}" if clean_dir else sub_dir_name
+                        target_mk = f"{sub_dir}/Makefile"
+                        rule_desc = f"obj-$(CONFIG_{sym_name}) += {clean_item}" if mode == 3 else f"obj-{sym_name} += {clean_item}"
+                        bindings.append(KbuildBinding(
+                            symbol_name=sym_name,
+                            compile_mode=mode,
+                            target_obj="Makefile",
+                            source_file_rel=target_mk,
+                            source_line=start_line,
+                            ref_type=4,  # FileRefType.Makefile
+                            details=rule_desc,
+                            is_composite=False,
+                        ))
                         continue
                     elif clean_item.endswith(".o"):
                         target_base = clean_item[:-2]
+                        rule_desc = f"obj-$(CONFIG_{sym_name}) += {clean_item}" if mode == 3 else f"obj-{sym_name} += {clean_item}"
                         if target_base in composites:
                             # It's a composite object composed of multiple .o files
-                            for comp_obj, sub_sym in composites[target_base]:
+                            for comp_obj, sub_sym, comp_line in composites[target_base]:
                                 src_base = comp_obj[:-2]
                                 src_c = f"{clean_dir}/{src_base}.c" if clean_dir else f"{src_base}.c"
                                 bound_sym = sub_sym if sub_sym else sym_name
@@ -127,6 +177,9 @@ class KbuildParser:
                                     compile_mode=mode,
                                     target_obj=clean_item,
                                     source_file_rel=src_c,
+                                    source_line=comp_line or start_line,
+                                    ref_type=3,  # FileRefType.Kbuild
+                                    details=f"{rule_desc} ({target_base}-objs += {comp_obj})",
                                     is_composite=True,
                                 ))
                         else:
@@ -137,6 +190,9 @@ class KbuildParser:
                                 compile_mode=mode,
                                 target_obj=clean_item,
                                 source_file_rel=src_c,
+                                source_line=start_line,
+                                ref_type=3,  # FileRefType.Kbuild
+                                details=rule_desc,
                                 is_composite=False,
                             ))
 

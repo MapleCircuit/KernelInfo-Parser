@@ -26,6 +26,7 @@ from core.globalstuff import (
     SymbolRole,
     OP_REF,
     STANDARD_C_KEYWORDS,
+    normalize_repo_path,
 )
 from core.DBLayout import (
     m_file,
@@ -82,6 +83,7 @@ from parser.c_ast.ast_nodes import (
     Ast_CallExpr,
     Ast_MemberRefExpr,
     Ast_DeclRefExpr,
+    Ast_MacroRefExpr,
 )
 
 logger = logging.getLogger(__name__)
@@ -106,8 +108,7 @@ _SKIP_REF_KINDS = frozenset({
     cc.CursorKind.MACRO_DEFINITION,
     cc.CursorKind.INCLUSION_DIRECTIVE,
 })
-
-
+_tu_typedef_cache: dict[tuple[str, str], tuple[str | None, str | None]] = {}
 
 
 def filter_enclosing_cursors(cursors: list[cc.Cursor]) -> list[cc.Cursor]:
@@ -185,6 +186,8 @@ def get_decl_type(ast_type: int) -> int:
             return ASTT.C_enumdecl
         case ASTT.C_functionproto:
             return ASTT.C_functionprotodecl
+        case ASTT.C_SCtypedef:
+            return ASTT.C_SCtypedef
         case _:
             return ast_type + 1
 
@@ -336,6 +339,38 @@ def resolve_cursor_type_ast(CS: Any, cursor: Any) -> tuple[int, Any]:
     cur_file = getattr(CS, "current_path", "") or getattr(G, "CURRENT_PARSING_FILE", "")
 
     k = getattr(ref_cursor, "kind", None)
+    if k in (cc.CursorKind.MACRO_DEFINITION, cc.CursorKind.MACRO_INSTANTIATION):
+        spelling = safe_cursor_spelling(ref_cursor) or getattr(cursor, "spelling", "")
+        if spelling:
+            safe_name = str(spelling)[:255]
+            macro_cache = getattr(CS, "_macro_ast_cache", None)
+            if macro_cache is None:
+                macro_cache = {}
+                CS._macro_ast_cache = macro_cache
+            if safe_name in macro_cache:
+                return macro_cache[safe_name]
+
+            rel_file = get_rel_file_for_cursor(CS, ref_cursor)
+            if rel_file and rel_file != cur_file:
+                res = (ASTT.CPPro_define, CS.ref(m_ast.ast_id, REF_FILE, rel_file, safe_name, int(ASTT.CPPro_define)))
+                macro_cache[safe_name] = res
+                return res
+            if hasattr(CS, "symbol_dict"):
+                if (safe_name, ASTT.CPPro_define) in CS.symbol_dict:
+                    res = (ASTT.CPPro_define, CS.ref(m_ast.ast_id, REF_POS, CS.symbol_dict[(safe_name, ASTT.CPPro_define)]))
+                    macro_cache[safe_name] = res
+                    return res
+                if (safe_name, ASTT.CPPro_define_macro) in CS.symbol_dict:
+                    res = (ASTT.CPPro_define_macro, CS.ref(m_ast.ast_id, REF_POS, CS.symbol_dict[(safe_name, ASTT.CPPro_define_macro)]))
+                    macro_cache[safe_name] = res
+                    return res
+            if rel_file:
+                res = (ASTT.CPPro_define, CS.ref(m_ast.ast_id, REF_FILE, rel_file, safe_name, int(ASTT.CPPro_define)))
+                macro_cache[safe_name] = res
+                return res
+
+            return (ASTT.Undefined, 0)
+
     if k in (cc.CursorKind.FUNCTION_DECL, cc.CursorKind.CXX_METHOD):
         spelling = safe_cursor_spelling(ref_cursor)
         if spelling:
@@ -481,6 +516,7 @@ class Ast_Statement(Ast):
         self.call_exprs: list[Any] = []
         self.member_refs: list[Any] = []
         self.decl_refs: list[Any] = []
+        self.macro_refs: list[Any] = []
 
         if cursor is not None:
             try:
@@ -543,6 +579,9 @@ class Ast_Statement(Ast):
         elif k == cc.CursorKind.MEMBER_REF_EXPR:
             self.member_refs.append(Ast_MemberRefExpr(token.line, token.spelling_str, cursor=cursor))
             self.member_refs[-1].member_cursor = cursor
+        elif k == cc.CursorKind.MACRO_INSTANTIATION:
+            if token.spelling_str == getattr(cursor, "spelling", ""):
+                self.macro_refs.append(Ast_MacroRefExpr(token.line, token.spelling_str, cursor=cursor))
         elif k is not None and k not in _SKIP_REF_KINDS:
             ref = getattr(cursor, "referenced", None)
             ref_k = getattr(ref, "kind", None) if ref is not None else None
@@ -590,6 +629,9 @@ class Ast_Statement(Ast):
         for decl_ref in self.decl_refs:
             with CS(REF_NO_REF):
                 decl_ref.extract(CS, create_tag=create_tags)
+        for macro_ref in self.macro_refs:
+            with CS(REF_NO_REF):
+                macro_ref.extract(CS, create_tag=create_tags)
 
     def extract(self, CS: Any, create_tag: bool = True) -> None:
         self._extract_nested(CS, create_tags=False)
@@ -841,6 +883,7 @@ class AST_Initializer(AST_Expression):
         self.call_exprs: list[Ast_CallExpr] = []
         self.member_refs: list[Ast_MemberRefExpr] = []
         self.decl_refs: list[Ast_DeclRefExpr] = []
+        self.macro_refs: list[Ast_MacroRefExpr] = []
         self.entries: list[InitializerEntry] = []
         self.cur_entry: InitializerEntry | None = None
         self.entry_state: int = 0
@@ -887,6 +930,9 @@ class AST_Initializer(AST_Expression):
         elif k == cc.CursorKind.MEMBER_REF_EXPR:
             self.member_refs.append(Ast_MemberRefExpr(token.line, token.spelling_str, cursor=cursor))
             self.member_refs[-1].member_cursor = cursor
+        elif k == cc.CursorKind.MACRO_INSTANTIATION:
+            if token.spelling_str == getattr(cursor, "spelling", ""):
+                self.macro_refs.append(Ast_MacroRefExpr(token.line, token.spelling_str, cursor=cursor))
         elif k is not None and k not in _SKIP_REF_KINDS:
             ref = getattr(cursor, "referenced", None)
             ref_k = getattr(ref, "kind", None) if ref is not None else None
@@ -1026,6 +1072,12 @@ class AST_Initializer(AST_Expression):
                     decl_ref.extract(CS, create_tag=False)
                 except TypeError:
                     decl_ref.extract(CS)
+        for macro_ref in self.macro_refs:
+            with CS(REF_NO_REF):
+                try:
+                    macro_ref.extract(CS, create_tag=False)
+                except TypeError:
+                    macro_ref.extract(CS)
 
 
 class AST_Enum_Equal(AST_Expression):
@@ -1462,7 +1514,23 @@ class C_Type(Ast):
                     return
 
         tspelling = token.spelling_str
-        if tspelling in {"__func__", "__FUNCTION__", "__PRETTY_FUNCTION__"}:
+        if tspelling in {
+            "__func__",
+            "__FUNCTION__",
+            "__PRETTY_FUNCTION__",
+            "__bitwise",
+            "__bitwise__",
+            "__force",
+            "__user",
+            "__kernel",
+            "__safe",
+            "__rcu",
+            "__percpu",
+            "__nocast",
+            "__iomem",
+            "__must_check",
+            "__deprecated",
+        }:
             return
 
         # Function declaration identifier check
@@ -1506,9 +1574,9 @@ class C_Type(Ast):
                 self.swap_out()
                 return
 
-        # Declarator identifier check (field, variable, or parameter declaration)
+        # Declarator identifier check (field, variable, parameter, or typedef declaration)
         if (
-            cursor.kind in {cc.CursorKind.FIELD_DECL, cc.CursorKind.VAR_DECL, cc.CursorKind.PARM_DECL}
+            cursor.kind in {cc.CursorKind.FIELD_DECL, cc.CursorKind.VAR_DECL, cc.CursorKind.PARM_DECL, cc.CursorKind.TYPEDEF_DECL}
             and tspelling == safe_cursor_spelling(cursor)
         ):
             self.name = tspelling
@@ -1536,16 +1604,31 @@ class C_Type(Ast):
             return
 
 
-        if cursor.type.kind == cc.TypeKind.TYPEDEF:
-            self.content.append(TypeToken(token, ASTT.C_SCtypedef))
-            self.swap_out()
-            return
-
-        if (
+        if cursor.type.kind == cc.TypeKind.TYPEDEF or (
             cursor.kind in {cc.CursorKind.FIELD_DECL, cc.CursorKind.VAR_DECL, cc.CursorKind.PARM_DECL}
             and tspelling != safe_cursor_spelling(cursor)
         ):
-            self.content.append(TypeToken(token, ASTT.C_SCtypedef))
+            tt = TypeToken(token, ASTT.C_SCtypedef, cursor=cursor)
+            cur_f = getattr(G, "CURRENT_PARSING_FILE", "")
+            cache_key = (tspelling, cur_f)
+            cached = _tu_typedef_cache.get(cache_key)
+            if cached is not None:
+                tt.foreign_file, tt.foreign_name = cached
+            else:
+                try:
+                    decl = getattr(cursor, "type", None)
+                    decl = decl.get_declaration() if decl is not None and hasattr(decl, "get_declaration") else None
+                    if decl is None or not getattr(decl, "location", None) or not getattr(decl.location, "file", None):
+                        decl = getattr(cursor, "referenced", None) or cursor.get_definition()
+                    if decl is not None and getattr(decl, "location", None) and getattr(decl.location, "file", None):
+                        rf = get_rel_file_for_cursor(None, decl)
+                        if rf and rf != cur_f:
+                            tt.foreign_file = rf
+                            tt.foreign_name = safe_cursor_spelling(decl) or tspelling
+                    _tu_typedef_cache[cache_key] = (tt.foreign_file, tt.foreign_name)
+                except Exception:
+                    _tu_typedef_cache[cache_key] = (None, None)
+            self.content.append(tt)
             self.swap_out()
             return
 
@@ -1616,7 +1699,7 @@ class C_Type(Ast):
                     initializer_ref = getattr(zone, "initializer_ref", None)
 
         # 2. Parse self.typedata into distinct declarations (final_types)
-        root_type = TypeSegment()
+        root_type = None
         type_constructor = []
         final_types = []
 
@@ -1743,6 +1826,10 @@ class C_Type(Ast):
                                 ret_seg = TypeSegment()
                                 ret_seg.content.append(TypeToken(item, ASTT.C_void))
                                 ret_seg.generate_ast(CS)
+
+                            if getattr(ret_seg, "symbol_refs", None) and hasattr(CS, "pending_symbol_refs"):
+                                for sym_ref, s_line, s_col in ret_seg.symbol_refs:
+                                    CS.pending_symbol_refs.append((sym_ref, int(SymbolRole.TypeUsage), s_line, s_col))
 
                             ret_t_id = ret_seg.type_id
                             if ret_t_id is None or ret_t_id == 0 or ret_t_id == ASTT.Undefined:
@@ -1928,6 +2015,18 @@ class C_Type(Ast):
                                             self.extent.line_pos[0],
                                             self.extent.char_pos[0],
                                         ))
+                                elif decl_type in (ASTT.C_struct, ASTT.C_union, ASTT.C_enum) and not has_var and not declared_args_link and not enum_content_link:
+                                    with CS(REF_POS):
+                                        CS.store(m_symbol_ref.set(
+                                            None,
+                                            CS.gp.VID,
+                                            ((m_file.table_id, 0), OP_REF, (REF_ROOT,)),
+                                            tag_ref or getattr(self, "tag_ref", 0),
+                                            self.ast_ref,
+                                            int(SymbolRole.Declaration),
+                                            self.extent.line_pos[0],
+                                            self.extent.char_pos[0],
+                                        ))
 
         # 4. Insert Variable / Declarator ASTs into ChangeSet
         for final_type in final_types:
@@ -1945,10 +2044,10 @@ class C_Type(Ast):
             is_param = self.end_mode == End_Mode.Comma or (
                 self.cursor is not None and getattr(self.cursor, "kind", None) == cc.CursorKind.PARM_DECL
             )
-            if is_type_def and not is_param and (
-                not has_var
-                or is_func_decl
-                or (any(any(it.type == ASTT.C_functionproto for it in ts.content) for ts in final_type) and (function_args_link or compound_stmt_link))
+            if not is_param and (
+                is_func_decl
+                or any(any(it.type == ASTT.C_functionproto for it in ts.content) for ts in final_type)
+                or (is_type_def and not has_var)
             ):
                 continue
 
@@ -1995,7 +2094,14 @@ class C_Type(Ast):
                 name = cur_spelling if (is_param and cur_spelling) else (self.name if not (is_param and not has_var) else "")
             safe_name = str(name)[:255]
 
-            if type_segments:
+            is_typedef_def = (
+                (self.storage_class is not None and self.storage_class.type == ASTT.C_SCtypedef)
+                or (self.cursor is not None and getattr(self.cursor, "kind", None) == cc.CursorKind.TYPEDEF_DECL)
+            )
+
+            if is_typedef_def:
+                main_t_id = ASTT.C_SCtypedef
+            elif type_segments:
                 if len(type_segments) == 1:
                     main_t_id = type_segments[0].type_id
                     if main_t_id is None:
@@ -2005,10 +2111,14 @@ class C_Type(Ast):
                             main_t_id = ASTT.C_Compound
                 else:
                     main_t_id = ASTT.C_Compound
+            else:
+                main_t_id = ASTT.C_Compound
 
-                # Invariant E: Simple primitive struct members generate NO m_ast_container records
+            if type_segments:
+                # Invariant E: Simple primitive struct members generate NO m_ast_container records (never for typedefs)
                 is_simple_type = (
-                    len(type_segments) == 1
+                    not is_typedef_def
+                    and len(type_segments) == 1
                     and type_segments[0].ref_type == TSRef.No_Ref
                     and type_segments[0].cqual == CQual.Empty
                     and main_t_id != ASTT.C_Compound
@@ -2044,7 +2154,7 @@ class C_Type(Ast):
                         ast_id_route = CS.get_route_parse()
                         self.ast_ref = CS.ref(m_ast.ast_id, *ast_id_route)
             else:
-                main_t_id = ASTT.C_Compound
+                main_t_id = ASTT.C_SCtypedef if is_typedef_def else ASTT.C_Compound
                 if initializer_ref is not None:
                     cs_inserter = [None, 0, int(ASTT.C_InitListExpr), initializer_ref]
                     with CS(REF_POS):
@@ -2071,7 +2181,10 @@ class C_Type(Ast):
             if safe_name and hasattr(CS, "symbol_dict"):
                 CS.symbol_dict[(safe_name, main_t_id)] = ast_id_route[1]
                 CS.symbol_dict[(safe_name, ASTT.C_DeclRefExpr)] = ast_id_route[1]
+                if is_typedef_def:
+                    CS.symbol_dict[(safe_name, ASTT.C_SCtypedef)] = ast_id_route[1]
 
+            tag_ref = None
             if create_tag:
                 is_co_decl = is_type_def and any(z.zone_type in (Zone_Type.Declared_Args, Zone_Type.Enum_Content) for z in self.zones)
                 if is_co_decl:
@@ -2105,22 +2218,47 @@ class C_Type(Ast):
                             var_extent.line_pos[0],
                             var_extent.line_pos[1],
                         ))
-                if is_type_def and hasattr(self, "ast_ref"):
-                    for ts in final_type:
-                        if ts.ref_type in (TSRef.Route_Ref, TSRef.AST_Ref) and ts.ref is not None:
-                            type_ast_ref = CS.ref(m_ast.ast_id, *ts.ref) if ts.ref_type == TSRef.Route_Ref else ts.ref
+            else:
+                var_extent = self.extent
+
+            # Record TypeUsages across final_type
+            for ts in final_type:
+                if getattr(ts, "symbol_refs", None):
+                    for sym_ref, s_line, s_col in ts.symbol_refs:
+                        if create_tag and (tag_ref or getattr(self, "tag_ref", None)):
+                            active_tag = tag_ref or getattr(self, "tag_ref", 0)
                             with CS(REF_POS):
                                 CS.store(m_symbol_ref.set(
                                     None,
                                     CS.gp.VID,
                                     ((m_file.table_id, 0), OP_REF, (REF_ROOT,)),
-                                    tag_ref or getattr(self, "tag_ref", 0),
+                                    active_tag,
+                                    sym_ref,
+                                    int(SymbolRole.TypeUsage),
+                                    s_line,
+                                    s_col,
+                                ))
+                        elif hasattr(CS, "pending_symbol_refs"):
+                            CS.pending_symbol_refs.append((sym_ref, int(SymbolRole.TypeUsage), s_line, s_col))
+                elif is_type_def and hasattr(self, "ast_ref"):
+                    if ts.ref_type in (TSRef.Route_Ref, TSRef.AST_Ref) and ts.ref is not None:
+                        type_ast_ref = CS.ref(m_ast.ast_id, *ts.ref) if ts.ref_type == TSRef.Route_Ref else ts.ref
+                        if create_tag and (tag_ref or getattr(self, "tag_ref", None)):
+                            active_tag = tag_ref or getattr(self, "tag_ref", 0)
+                            with CS(REF_POS):
+                                CS.store(m_symbol_ref.set(
+                                    None,
+                                    CS.gp.VID,
+                                    ((m_file.table_id, 0), OP_REF, (REF_ROOT,)),
+                                    active_tag,
                                     type_ast_ref,
                                     int(SymbolRole.TypeUsage),
                                     var_extent.line_pos[0],
                                     var_extent.char_pos[0],
                                 ))
-                            break
+                        elif hasattr(CS, "pending_symbol_refs"):
+                            CS.pending_symbol_refs.append((type_ast_ref, int(SymbolRole.TypeUsage), var_extent.line_pos[0], var_extent.char_pos[0]))
+                        break
 def resolve_cppro_scopes(children: list[Any]) -> None:
     """Resolve preprocessor conditional branch bounds linking to terminating endif."""
     cpp_stack: list[list[Any]] = []
@@ -2297,6 +2435,8 @@ class Zone:
             return Ast_MemberRefExpr(extent, end_mode=End_Mode.Extent, cursor=cursor)
         elif k == cc.CursorKind.DECL_REF_EXPR:
             return Ast_DeclRefExpr(extent, end_mode=End_Mode.Extent, cursor=cursor)
+        elif k == cc.CursorKind.MACRO_INSTANTIATION:
+            return Ast_MacroRefExpr(extent, sp, end_mode=End_Mode.Extent, cursor=cursor)
         elif k == cc.CursorKind.BINARY_OPERATOR:
             return Ast_BinaryOperator(extent, end_mode=End_Mode.Extent, cursor=cursor)
         elif k == cc.CursorKind.UNARY_OPERATOR:
@@ -2487,7 +2627,7 @@ class Zone:
                     try:
                         inc_file = cursor.get_included_file()
                         if inc_file is not None and inc_file.name:
-                            node.a_include = inc_file.name
+                            node.a_include = normalize_repo_path(inc_file.name, getattr(G, "CURRENT_PARSING_DIR", None))
                     except Exception:
                         pass
                 self.children.append(node)
