@@ -103,6 +103,7 @@ class KconfigMenu:
     prompt_cond: KconfigExpr | None = None
     depends_on: list[KconfigExpr] = field(default_factory=list)
     visible_if: KconfigExpr | None = None
+    help_text: str = ""
     children: list[Any] = field(default_factory=list)
     line_s: int = 0
     char_s: int = 0
@@ -120,6 +121,7 @@ class KconfigChoice:
     is_optional: bool = False
     defaults: list[tuple[str, KconfigExpr | None]] = field(default_factory=list)
     depends_on: list[KconfigExpr] = field(default_factory=list)
+    help_text: str = ""
     children: list[Any] = field(default_factory=list)
     line_s: int = 0
     char_s: int = 0
@@ -248,6 +250,17 @@ class KconfigParser:
             return self._parse_comment()
         elif tok.type in (TokenType.SOURCE, TokenType.RSOURCE):
             return self._parse_source(is_rsource=(tok.type == TokenType.RSOURCE))
+        elif tok.type == TokenType.HELP:
+            self._advance()
+            self._skip_newlines()
+            if self._current().type == TokenType.HELP_TEXT:
+                self._advance()
+            self._skip_newlines()
+            return None
+        elif tok.type == TokenType.HELP_TEXT:
+            self._advance()
+            self._skip_newlines()
+            return None
         else:
             # Skip unhandled token on line
             self._advance()
@@ -431,11 +444,11 @@ class KconfigParser:
         cfg.options.append(" ".join(opt_str))
         self._skip_newlines()
 
-    def _parse_help(self, cfg: KconfigConfig) -> None:
+    def _parse_help(self, target: Any) -> None:
         self._advance()  # 'help' or '---help---'
         self._skip_newlines()
         if self._current().type == TokenType.HELP_TEXT:
-            cfg.help_text = self._advance().value
+            target.help_text = self._advance().value
         self._skip_newlines()
 
     def _parse_menu(self) -> KconfigMenu:
@@ -462,6 +475,8 @@ class KconfigParser:
                     self._advance()
                     menu.visible_if = self._parse_expr()
                 self._skip_newlines()
+            elif cur.type == TokenType.HELP:
+                self._parse_help(menu)
             else:
                 item = self._parse_top_level_item()
                 if item:
@@ -498,11 +513,17 @@ class KconfigParser:
                 self._advance()
                 if self._current().type in (TokenType.CONST_STRING, TokenType.SYMBOL):
                     choice.prompt = self._advance().value
+                if self._current().type == TokenType.IF:
+                    self._advance()
+                    choice.prompt_cond = self._parse_expr()
                 self._skip_newlines()
             elif cur.type == TokenType.PROMPT:
                 self._advance()
                 if self._current().type in (TokenType.CONST_STRING, TokenType.SYMBOL):
                     choice.prompt = self._advance().value
+                if self._current().type == TokenType.IF:
+                    self._advance()
+                    choice.prompt_cond = self._parse_expr()
                 self._skip_newlines()
             elif cur.type == TokenType.OPTIONAL:
                 self._advance()
@@ -520,6 +541,8 @@ class KconfigParser:
                 self._skip_newlines()
             elif cur.type == TokenType.DEPENDS:
                 self._parse_depends_on(choice.depends_on)
+            elif cur.type == TokenType.HELP:
+                self._parse_help(choice)
             else:
                 item = self._parse_top_level_item()
                 if item:
@@ -547,7 +570,7 @@ class KconfigParser:
             char_s=start_tok.col,
         )
 
-        while self._current().type not in (TokenType.ENDIF, TokenType.EOF):
+        while self._current().type not in (TokenType.ENDIF, TokenType.ENDCHOICE, TokenType.ENDMENU, TokenType.EOF):
             item = self._parse_top_level_item()
             if item:
                 if_node.children.append(item)

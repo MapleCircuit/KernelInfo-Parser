@@ -81,6 +81,8 @@ SCHEMA ENTITY-RELATIONSHIP GRAPH:
    m_tag (tag_id, ...) ------------------|--------> m_bridge_commit_tag (commit_id, vid, fid, tag_id)
 ===============================================================================
 """
+import secrets
+import time
 from core.globalstuff import ASTT
 from core.TableHandling import Table
 
@@ -998,6 +1000,27 @@ m_file_reference = Table(
     hashing_table=False,
 )
 
+# -----------------------------------------------------------------------------
+# 35. m_db_instance (table_id=34): Database Instance Lifecycle & Fingerprint
+#     - instance_hash: 64-character hexadecimal unique instance hash (PK).
+#     - created_at: Unix epoch timestamp when database instance was initialized.
+# -----------------------------------------------------------------------------
+m_db_instance = Table(
+    table_id=34,
+    table_name="m_db_instance",
+    columns=(
+        ("instance_hash", "VARCHAR(64)", "NOT NULL", "COLLATE utf8mb4_bin"),
+        ("created_at", "BIGINT", "NOT NULL"),
+    ),
+    primary=("instance_hash",),
+    foreign=None,
+    initial_insert=((secrets.token_hex(32), int(time.time())),),
+    no_duplicate=True,
+    te_cached=False,
+    version_scoped=False,
+    hashing_table=False,
+)
+
 TABLES: tuple[Table, ...] = (
     m_v_main,
     m_file_name,
@@ -1033,18 +1056,19 @@ TABLES: tuple[Table, ...] = (
     m_symbol_def,
     m_symbol_ref,
     m_file_reference,
+    m_db_instance,
 )
 
 
 def init_db_layout(gp=None) -> tuple[Table, ...]:
-    """Initialize and populate gp.Table_Array with the default 34 schema tables.
+    """Initialize and populate gp.Table_Array with the default 35 schema tables.
     
     Args:
         gp: Optional GreatProcessor instance to attach Table_Array to.
         
         
     Returns:
-        Immutable tuple of all 34 Table schema objects.
+        Immutable tuple of all 35 Table schema objects.
     """
     if gp is not None:
         gp.Table_Array = list(TABLES)

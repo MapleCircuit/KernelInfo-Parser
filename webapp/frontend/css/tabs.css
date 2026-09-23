@@ -1,0 +1,146 @@
+/* tabs.css - Multi-Tab, Tabstrip, and Split-Pane Controls */
+
+.tabstrip {
+  height: var(--tab-height);
+  background: var(--bg-secondary);
+  border-bottom: 1px solid var(--border-color);
+  display: flex;
+  align-items: center;
+  overflow-x: auto;
+  overflow-y: hidden;
+  user-select: none;
+}
+
+.tabstrip::-webkit-scrollbar {
+  height: 2px;
+}
+
+.tab-list {
+  display: flex;
+  align-items: center;
+  height: 100%;
+  flex: 1;
+}
+
+.tab {
+  height: 100%;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 12px;
+  font-size: 12px;
+  color: var(--text-secondary);
+  background: var(--bg-secondary);
+  border-right: 1px solid var(--border-color);
+  cursor: pointer;
+  white-space: nowrap;
+  position: relative;
+  transition: background var(--transition-fast), color var(--transition-fast);
+  max-width: 200px;
+}
+
+.tab:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+.tab.active {
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  font-weight: 500;
+}
+
+.tab.active::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 2px;
+  background: var(--accent-blue);
+}
+
+.tab-icon {
+  width: 14px;
+  height: 14px;
+  flex-shrink: 0;
+}
+
+.tab-icon.code { color: var(--accent-blue); }
+.tab-icon.kconfig { color: var(--accent-green); }
+.tab-icon.nodemap { color: var(--accent-purple); }
+.tab-icon.maintainers { color: var(--accent-orange); }
+.tab-icon.commits { color: var(--accent-yellow); }
+.tab-icon.pahole { color: var(--accent-cyan); }
+.tab-icon.callgraph { color: #f778ba; }
+.tab-icon.diff { color: #e36209; }
+
+.tab-title {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.tab-version {
+  font-size: 10px;
+  color: var(--text-muted);
+  background: var(--bg-tertiary);
+  padding: 1px 4px;
+  border-radius: 3px;
+}
+
+.tab-close {
+  width: 16px;
+  height: 16px;
+  border-radius: 3px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 1;
+  opacity: 0.6;
+  transition: opacity var(--transition-fast), background var(--transition-fast);
+}
+
+.tab-close:hover {
+  opacity: 1;
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+.tabstrip-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 0 8px;
+}
+
+.tabstrip-btn {
+  width: 24px;
+  height: 24px;
+  border-radius: var(--radius-sm);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-muted);
+  transition: var(--transition-fast);
+}
+
+.tabstrip-btn:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+.tabstrip-btn svg {
+  width: 14px;
+  height: 14px;
+  fill: currentColor;
+}
+
+.tab-content-container {
+  flex: 1;
+  overflow: hidden;
+  position: relative;
+  background: var(--bg-primary);
+}

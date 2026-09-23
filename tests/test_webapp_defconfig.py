@@ -37,6 +37,8 @@ class TestWebappDefconfig(unittest.TestCase):
         self.assertEqual(res["bits"], 64)
         self.assertGreater(res["symbol_count"], 50)
         self.assertIn("values", res)
+        self.assertIn("content", res)
+        self.assertGreater(len(res["content"]), 0)
         self.assertEqual(res["values"].get("64BIT"), "y")
         self.assertEqual(res["values"].get("EXPERIMENTAL"), "y")
 
@@ -47,6 +49,9 @@ class TestWebappDefconfig(unittest.TestCase):
         self.assertEqual(res["file_path"], "arch/x86/configs/x86_64_defconfig")
         self.assertEqual(res["bits"], 64)
         self.assertGreater(res["symbol_count"], 50)
+        self.assertIn("values", res)
+        self.assertIn("content", res)
+        self.assertGreater(len(res["content"]), 0)
         self.assertEqual(res["values"].get("64BIT"), "y")
 
     def test_get_kconfig_defconfig_content_i386(self) -> None:

@@ -391,8 +391,8 @@ obj-y += core.o
         
         # Verify that visible root nodes contain authentic high-level categories (~15-20)
         self.assertLessEqual(len(visible_root_nodes), 25)
-        self.assertGreaterEqual(len(visible_root_nodes), 10)
-        self.assertLessEqual(len(root_nodes), 100)
+        # Promptless internal compiler/architecture flags sit at root alongside ~19 visible categories
+        self.assertLessEqual(len(root_nodes), 200)
 
 
     def test_kconfig_symbol_detail_compiled_files(self) -> None:

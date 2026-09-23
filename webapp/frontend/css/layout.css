@@ -1,0 +1,367 @@
+/* layout.css - App Shell, Header, Sidebar, Workspace, and Statusbar */
+
+#app-container {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  width: 100vw;
+  background: var(--bg-primary);
+  overflow: hidden;
+}
+
+/* 1. Header Bar */
+#app-header {
+  height: var(--header-height);
+  background: var(--bg-secondary);
+  border-bottom: 1px solid var(--border-color);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 12px;
+  gap: 12px;
+  z-index: 100;
+}
+
+.header-left {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.app-brand {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-weight: 600;
+  font-size: 14px;
+  color: var(--accent-blue);
+  letter-spacing: 0.3px;
+}
+
+.brand-icon {
+  width: 24px;
+  height: 24px;
+}
+
+.version-selector-container {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  background: var(--bg-tertiary);
+  padding: 2px 8px;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--border-color);
+}
+
+.version-selector-container label {
+  color: var(--text-secondary);
+  font-size: 11px;
+  text-transform: uppercase;
+  font-weight: 600;
+}
+
+#version-select {
+  background: transparent;
+  border: none;
+  font-weight: 600;
+  color: var(--accent-blue);
+  cursor: pointer;
+}
+
+.header-center {
+  flex: 1;
+  max-width: 540px;
+}
+
+.global-search-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-md);
+  padding: 4px 10px;
+  color: var(--text-muted);
+  cursor: pointer;
+  transition: var(--transition-fast);
+}
+
+.global-search-bar:hover {
+  border-color: var(--border-focus);
+  color: var(--text-primary);
+}
+
+.global-search-bar input {
+  flex: 1;
+  background: transparent;
+  border: none;
+  padding: 0;
+  color: var(--text-primary);
+  font-size: 12px;
+}
+
+.search-shortcut {
+  font-size: 10px;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-color);
+  padding: 1px 5px;
+  border-radius: 3px;
+  color: var(--text-muted);
+}
+
+.header-right {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.header-btn {
+  padding: 5px 9px;
+  border-radius: var(--radius-sm);
+  color: var(--text-secondary);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  transition: var(--transition-fast);
+}
+
+.header-btn:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+.offline-badge {
+  font-size: 11px;
+  padding: 2px 6px;
+  border-radius: 10px;
+  background: rgba(63, 185, 80, 0.15);
+  color: var(--accent-green);
+  border: 1px solid rgba(63, 185, 80, 0.3);
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.offline-badge.offline {
+  background: rgba(248, 81, 73, 0.15);
+  color: var(--accent-red);
+  border-color: rgba(248, 81, 73, 0.3);
+}
+
+/* 2. Main Body Container */
+#main-body {
+  display: flex;
+  flex: 1;
+  overflow: hidden;
+  position: relative;
+}
+
+/* 3. Activity Bar */
+#activity-bar {
+  width: 48px;
+  background: var(--bg-secondary);
+  border-right: 1px solid var(--border-color);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: 8px 0;
+  gap: 8px;
+  z-index: 50;
+}
+
+.activity-btn {
+  width: 36px;
+  height: 36px;
+  border-radius: var(--radius-md);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-muted);
+  position: relative;
+  transition: var(--transition-fast);
+}
+
+.activity-btn:hover {
+  color: var(--text-primary);
+}
+
+.activity-btn.active {
+  color: var(--accent-blue);
+  background: var(--bg-tertiary);
+}
+
+.activity-btn.active::before {
+  content: "";
+  position: absolute;
+  left: -6px;
+  top: 6px;
+  bottom: 6px;
+  width: 3px;
+  background: var(--accent-blue);
+  border-radius: 0 2px 2px 0;
+}
+
+.activity-btn svg {
+  width: 20px;
+  height: 20px;
+  fill: currentColor;
+}
+
+/* 4. Sidebar */
+#sidebar {
+  width: var(--sidebar-width);
+  background: var(--bg-secondary);
+  border-right: 1px solid var(--border-color);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  transition: width var(--transition-norm);
+  z-index: 40;
+}
+
+#sidebar.collapsed {
+  width: 0;
+  border-right: none;
+}
+
+.sidebar-header {
+  padding: 8px 12px;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--text-muted);
+  border-bottom: 1px solid var(--border-color);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.sidebar-content {
+  flex: 1;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding: 4px 0;
+}
+
+.tree-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 8px;
+  cursor: pointer;
+  color: var(--text-secondary);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.tree-item:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+.tree-item.active {
+  background: var(--bg-active);
+  color: var(--accent-blue);
+}
+
+.tree-item .chevron {
+  width: 14px;
+  height: 14px;
+  transition: transform var(--transition-fast);
+  color: var(--text-muted);
+}
+
+.tree-item.expanded > .chevron {
+  transform: rotate(90deg);
+}
+
+/* 5. Workspace */
+#workspace {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-primary);
+  overflow: hidden;
+  position: relative;
+}
+
+.split-container {
+  flex: 1;
+  display: flex;
+  overflow: hidden;
+}
+
+.split-container.split-horizontal {
+  flex-direction: row;
+}
+
+.split-container.split-vertical {
+  flex-direction: column;
+}
+
+.pane {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-width: 200px;
+  min-height: 200px;
+  background: var(--bg-primary);
+  overflow: hidden;
+  position: relative;
+}
+
+.pane-divider {
+  background: var(--border-color);
+  transition: background var(--transition-fast);
+  z-index: 30;
+}
+
+.split-horizontal > .pane-divider {
+  width: 4px;
+  cursor: col-resize;
+}
+
+.split-vertical > .pane-divider {
+  height: 4px;
+  cursor: row-resize;
+}
+
+.pane-divider:hover, .pane-divider.dragging {
+  background: var(--accent-blue);
+}
+
+/* 6. Status Bar */
+#status-bar {
+  height: var(--statusbar-height);
+  background: var(--bg-secondary);
+  border-top: 1px solid var(--border-color);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 12px;
+  font-size: 11px;
+  color: var(--text-muted);
+  z-index: 100;
+}
+
+.status-left, .status-right {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.status-item {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.status-item.clickable {
+  cursor: pointer;
+}
+
+.status-item.clickable:hover {
+  color: var(--text-primary);
+}

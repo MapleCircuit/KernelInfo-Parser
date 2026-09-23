@@ -1,0 +1,188 @@
+/* maintainers.css - Subsystems Catalog, Maintainers Roster & CREDITS */
+
+.maintainers-view-container {
+  display: flex;
+  height: 100%;
+  width: 100%;
+  background: var(--bg-primary);
+  overflow: hidden;
+}
+
+.maintainers-sidebar {
+  width: 380px;
+  border-right: 1px solid var(--border-color);
+  background: var(--bg-secondary);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.maintainers-nav-tabs {
+  display: flex;
+  border-bottom: 1px solid var(--border-color);
+  background: var(--bg-tertiary);
+}
+
+.m-nav-tab {
+  flex: 1;
+  padding: 8px 12px;
+  text-align: center;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text-secondary);
+  border-bottom: 2px solid transparent;
+  cursor: pointer;
+}
+
+.m-nav-tab:hover {
+  color: var(--text-primary);
+}
+
+.m-nav-tab.active {
+  color: var(--accent-orange);
+  border-bottom-color: var(--accent-orange);
+  background: var(--bg-secondary);
+}
+
+.maintainers-list {
+  flex: 1;
+  overflow-y: auto;
+  padding: 8px 0;
+}
+
+.subsystem-card {
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border-muted);
+  cursor: pointer;
+  transition: background var(--transition-fast);
+}
+
+.subsystem-card:hover {
+  background: var(--bg-hover);
+}
+
+.subsystem-card.active {
+  background: var(--bg-active);
+  border-left: 3px solid var(--accent-orange);
+}
+
+.subsystem-name {
+  font-weight: 600;
+  font-size: 12px;
+  color: var(--text-primary);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.subsystem-status {
+  font-size: 10px;
+  padding: 1px 5px;
+  border-radius: 3px;
+  background: var(--bg-tertiary);
+  color: var(--accent-cyan);
+}
+
+.subsystem-lead {
+  font-size: 11px;
+  color: var(--text-muted);
+  margin-top: 2px;
+}
+
+/* Maintainer Detail View */
+.maintainers-detail {
+  flex: 1;
+  overflow-y: auto;
+  padding: 24px;
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+}
+
+.m-section-header {
+  border-bottom: 1px solid var(--border-color);
+  padding-bottom: 12px;
+}
+
+.m-section-title {
+  font-size: 20px;
+  font-weight: 600;
+  color: var(--accent-orange);
+}
+
+.m-grid-2col {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 16px;
+}
+
+.m-card {
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-md);
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.m-card-title {
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  letter-spacing: 0.5px;
+}
+
+.person-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 6px 0;
+  border-bottom: 1px solid var(--border-muted);
+}
+
+.person-info {
+  display: flex;
+  flex-direction: column;
+}
+
+.person-name {
+  font-weight: 500;
+  color: var(--text-primary);
+  cursor: pointer;
+}
+
+.person-name:hover {
+  color: var(--accent-blue);
+  text-decoration: underline;
+}
+
+.person-email {
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+/* Patch Analyzer Panel */
+.patch-analyzer-box {
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-md);
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.patch-input-textarea {
+  width: 100%;
+  height: 120px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-sm);
+  color: var(--text-primary);
+  padding: 8px;
+  resize: vertical;
+}

@@ -2652,6 +2652,243 @@ const struct xattr_handler btrfs_xattr_acl_access_handler = {
                 except Exception:
                     pass
 
+    def test_enum_constant_definition_staging(self) -> None:
+        """Verify that named and anonymous enum constants are staged into m_symbol_def with type C_enumequal."""
+        mf = None
+        try:
+            MockDB._global_store.clear()
+            G.DB = MockDB
+            G.TE = get_table_engine("cached")()
+            gp = GreatProcessor()
+            init_db_layout(gp)
+            G.TE.start(gp.Table_Array, G.DB)
+
+            file_path = "drivers/net/test_enum_defs.c"
+            mf = MasterFile()
+            temp_dir = mf.create_temp_dir()
+            mf.version_dict["v3.0"] = temp_dir
+            G.MF = mf
+            gp.Version_Name = "v3.0"
+            gp.VID = 1
+
+            full_path = os.path.join(temp_dir, file_path)
+            os.makedirs(os.path.dirname(full_path), exist_ok=True)
+            snippet = """enum my_color {
+    COLOR_RED = 1,
+    COLOR_GREEN,
+    COLOR_BLUE
+};
+
+enum {
+    FLAG_A = 10,
+    FLAG_B
+};
+"""
+            with open(full_path, "w") as f:
+                f.write(snippet)
+
+            cs = ChangeSet(f"A\t{file_path}")
+            cs.current_vid = 1
+            cs.gp = gp
+            cs.mf = mf
+            G.CURRENT_PARSING_FILE = file_path
+
+            cs.store(m_file_name.get_set(None, cs.current_path))
+            cs.store(m_file.set(None, 1, 0, 1, "A", 0))
+            cs.store(m_bridge_file.set(1, cs.ref(m_file_name.fnid), cs.ref(m_file.fid)))
+
+            cs.parse()
+            self.assertTrue(cs.execute())
+            G.TE.commit_all()
+
+            sym_defs = MockDB._global_store.get("m_symbol_def", {})
+            defs_by_name = {row[5]: row for row in sym_defs.values()}
+
+            # 1. Named enum definition exists
+            self.assertIn("my_color", defs_by_name)
+            self.assertEqual(defs_by_name["my_color"][6], int(ASTT.C_enumdecl))
+
+            # 2. Enumerator constants are staged with C_enumequal
+            for const_name in ("COLOR_RED", "COLOR_GREEN", "COLOR_BLUE", "FLAG_A", "FLAG_B"):
+                self.assertIn(const_name, defs_by_name, f"{const_name} must be staged in m_symbol_def")
+                self.assertEqual(defs_by_name[const_name][6], int(ASTT.C_enumequal))
+
+            # 3. Exact line numbers for each enumerator
+            self.assertEqual(defs_by_name["COLOR_RED"][7], 2)
+            self.assertEqual(defs_by_name["COLOR_GREEN"][7], 3)
+            self.assertEqual(defs_by_name["COLOR_BLUE"][7], 4)
+            self.assertEqual(defs_by_name["FLAG_A"][7], 8)
+            self.assertEqual(defs_by_name["FLAG_B"][7], 9)
+
+            # 4. Anonymous enum container ('(unnamed at ...)') is NOT staged in m_symbol_def
+            for row in sym_defs.values():
+                s_name = row[5]
+                self.assertNotIn("(unnamed at ", s_name)
+                self.assertNotIn("(anonymous at ", s_name)
+        finally:
+            if mf:
+                mf.clear_all_version()
+
+    def test_enum_constant_usage_staging(self) -> None:
+        """Verify that enum constant usages in statements are staged in m_symbol_ref as DeclRef."""
+        mf = None
+        try:
+            MockDB._global_store.clear()
+            G.DB = MockDB
+            G.TE = get_table_engine("cached")()
+            gp = GreatProcessor()
+            init_db_layout(gp)
+            G.TE.start(gp.Table_Array, G.DB)
+
+            file_path = "drivers/net/test_enum_refs.c"
+            mf = MasterFile()
+            temp_dir = mf.create_temp_dir()
+            mf.version_dict["v3.0"] = temp_dir
+            G.MF = mf
+            gp.Version_Name = "v3.0"
+            gp.VID = 1
+
+            full_path = os.path.join(temp_dir, file_path)
+            os.makedirs(os.path.dirname(full_path), exist_ok=True)
+            snippet = """enum my_state {
+    STATE_IDLE = 0,
+    STATE_RUNNING = 1,
+};
+
+int handle_state(enum my_state s) {
+    if (s == STATE_IDLE)
+        return STATE_RUNNING;
+    return 0;
+}
+"""
+            with open(full_path, "w") as f:
+                f.write(snippet)
+
+            cs = ChangeSet(f"A\t{file_path}")
+            cs.current_vid = 1
+            cs.gp = gp
+            cs.mf = mf
+            G.CURRENT_PARSING_FILE = file_path
+
+            cs.store(m_file_name.get_set(None, cs.current_path))
+            cs.store(m_file.set(None, 1, 0, 1, "A", 0))
+            cs.store(m_bridge_file.set(1, cs.ref(m_file_name.fnid), cs.ref(m_file.fid)))
+
+            cs.parse()
+            self.assertTrue(cs.execute())
+            G.TE.commit_all()
+
+            from core.globalstuff import SymbolRole
+            sym_defs = MockDB._global_store.get("m_symbol_def", {})
+            defs_by_name = {row[5]: row for row in sym_defs.values()}
+            idle_ast_id = defs_by_name["STATE_IDLE"][4]
+            running_ast_id = defs_by_name["STATE_RUNNING"][4]
+
+            sym_refs = MockDB._global_store.get("m_symbol_ref", {})
+            decl_refs = [r for r in sym_refs.values() if r[5] == int(SymbolRole.DeclRef)]
+
+            idle_refs = [r for r in decl_refs if r[4] == idle_ast_id]
+            running_refs = [r for r in decl_refs if r[4] == running_ast_id]
+
+            self.assertTrue(len(idle_refs) >= 1, "STATE_IDLE must be referenced in m_symbol_ref as DeclRef")
+            self.assertTrue(len(running_refs) >= 1, "STATE_RUNNING must be referenced in m_symbol_ref as DeclRef")
+            self.assertEqual(idle_refs[0][6], 7)
+            self.assertEqual(running_refs[0][6], 8)
+        finally:
+            if mf:
+                mf.clear_all_version()
+
+    def test_enum_constant_cross_file_reference(self) -> None:
+        """Verify cross-file enum constant reference resolution via REF_FILE."""
+        mf = None
+        try:
+            MockDB._global_store.clear()
+            G.DB = MockDB
+            G.TE = get_table_engine("cached")()
+            gp = GreatProcessor()
+            init_db_layout(gp)
+            G.TE.start(gp.Table_Array, G.DB)
+
+            mf = MasterFile()
+            temp_dir = mf.create_temp_dir()
+            mf.version_dict["v3.0"] = temp_dir
+            G.MF = mf
+            gp.Version_Name = "v3.0"
+            gp.VID = 1
+
+            header_path = "include/linux/test_status.h"
+            driver_path = "drivers/net/test_driver.c"
+
+            os.makedirs(os.path.dirname(os.path.join(temp_dir, header_path)), exist_ok=True)
+            os.makedirs(os.path.dirname(os.path.join(temp_dir, driver_path)), exist_ok=True)
+
+            header_code = """#ifndef _TEST_STATUS_H
+#define _TEST_STATUS_H
+enum net_status {
+    NET_DOWN = 0,
+    NET_UP = 1,
+};
+#endif
+"""
+            driver_code = """#include <linux/test_status.h>
+
+int check_link(int up) {
+    if (up)
+        return NET_UP;
+    return NET_DOWN;
+}
+"""
+            with open(os.path.join(temp_dir, header_path), "w") as f:
+                f.write(header_code)
+            with open(os.path.join(temp_dir, driver_path), "w") as f:
+                f.write(driver_code)
+
+            cs_h = ChangeSet(f"A\t{header_path}")
+            cs_h.current_vid = 1
+            cs_h.gp = gp
+            cs_h.mf = mf
+            G.CURRENT_PARSING_FILE = header_path
+            cs_h.store(m_file_name.get_set(None, cs_h.current_path))
+            cs_h.store(m_file.set(None, 1, 0, 1, "A", 0))
+            cs_h.store(m_bridge_file.set(1, cs_h.ref(m_file_name.fnid), cs_h.ref(m_file.fid)))
+            cs_h.parse()
+            self.assertTrue(cs_h.execute())
+
+            cs_d = ChangeSet(f"A\t{driver_path}")
+            cs_d.current_vid = 1
+            cs_d.gp = gp
+            cs_d.mf = mf
+            cs_d.batch_cs_dict = {header_path: cs_h}
+            G.CURRENT_PARSING_FILE = driver_path
+            cs_d.store(m_file_name.get_set(None, cs_d.current_path))
+            cs_d.store(m_file.set(None, 1, 0, 1, "A", 0))
+            cs_d.store(m_bridge_file.set(1, cs_d.ref(m_file_name.fnid), cs_d.ref(m_file.fid)))
+            cs_d.parse()
+            self.assertTrue(cs_d.execute())
+
+            G.TE.commit_all()
+
+            from core.globalstuff import SymbolRole
+            sym_defs = MockDB._global_store.get("m_symbol_def", {})
+            defs_by_name = {row[5]: row for row in sym_defs.values()}
+            self.assertIn("NET_UP", defs_by_name)
+            self.assertIn("NET_DOWN", defs_by_name)
+
+            net_up_ast_id = defs_by_name["NET_UP"][4]
+            net_down_ast_id = defs_by_name["NET_DOWN"][4]
+
+            sym_refs = MockDB._global_store.get("m_symbol_ref", {})
+            driver_refs = [row for row in sym_refs.values() if row[5] == int(SymbolRole.DeclRef)]
+
+            up_refs = [r for r in driver_refs if r[4] == net_up_ast_id]
+            down_refs = [r for r in driver_refs if r[4] == net_down_ast_id]
+
+            self.assertTrue(len(up_refs) >= 1, "NET_UP reference should be resolved across files")
+            self.assertTrue(len(down_refs) >= 1, "NET_DOWN reference should be resolved across files")
+        finally:
+            if mf:
+                mf.clear_all_version()
+
 
 
 def assert_file_tag_fidelity(

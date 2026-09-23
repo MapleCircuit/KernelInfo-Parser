@@ -405,6 +405,21 @@ def resolve_cursor_type_ast(CS: Any, cursor: Any) -> tuple[int, Any]:
                 CS.store(m_ast.view(((m_ast.ast_id,),), None, safe_name, ASTT.C_structnotbind))
             return (ASTT.C_struct, CS.ref(m_ast.ast_id, REF_POS, op_idx))
 
+    if k == cc.CursorKind.ENUM_CONSTANT_DECL:
+        spelling = safe_cursor_spelling(ref_cursor)
+        if spelling:
+            safe_name = str(spelling)[:255]
+            rel_file = get_rel_file_for_cursor(CS, ref_cursor)
+            if rel_file and rel_file != cur_file:
+                return (ASTT.C_enumequal, CS.ref(m_ast.ast_id, REF_FILE, rel_file, safe_name, int(ASTT.C_enumequal)))
+            if hasattr(CS, "symbol_dict"):
+                if (safe_name, ASTT.C_enumequal) in CS.symbol_dict:
+                    return (ASTT.C_enumequal, CS.ref(m_ast.ast_id, REF_POS, CS.symbol_dict[(safe_name, ASTT.C_enumequal)]))
+            op_idx = len(CS.cs)
+            with CS(REF_NO_REF):
+                CS.store(m_ast.view(((m_ast.ast_id,),), None, safe_name, ASTT.C_enumequal))
+            return (ASTT.C_enumequal, CS.ref(m_ast.ast_id, REF_POS, op_idx))
+
     if k in (cc.CursorKind.VAR_DECL, cc.CursorKind.PARM_DECL):
         type_obj = getattr(ref_cursor, "type", None)
         t_spelling = safe_cursor_spelling(ref_cursor)
@@ -591,7 +606,7 @@ class Ast_Statement(Ast):
             elif ref_k == cc.CursorKind.FIELD_DECL:
                 self.member_refs.append(Ast_MemberRefExpr(token.line, token.spelling_str, cursor=cursor))
                 self.member_refs[-1].member_cursor = cursor
-            elif ref_k in (cc.CursorKind.VAR_DECL, cc.CursorKind.PARM_DECL) or k == cc.CursorKind.DECL_REF_EXPR:
+            elif ref_k in (cc.CursorKind.VAR_DECL, cc.CursorKind.PARM_DECL, cc.CursorKind.ENUM_CONSTANT_DECL) or k == cc.CursorKind.DECL_REF_EXPR:
                 self.decl_refs.append(Ast_DeclRefExpr(token.line, token.spelling_str, cursor=cursor))
                 self.decl_refs[-1].decl_cursor = cursor
         self.operands.append(token.spelling_str)
@@ -942,7 +957,7 @@ class AST_Initializer(AST_Expression):
             elif ref_k == cc.CursorKind.FIELD_DECL:
                 self.member_refs.append(Ast_MemberRefExpr(token.line, token.spelling_str, cursor=cursor))
                 self.member_refs[-1].member_cursor = cursor
-            elif ref_k in (cc.CursorKind.VAR_DECL, cc.CursorKind.PARM_DECL) or k == cc.CursorKind.DECL_REF_EXPR:
+            elif ref_k in (cc.CursorKind.VAR_DECL, cc.CursorKind.PARM_DECL, cc.CursorKind.ENUM_CONSTANT_DECL) or k == cc.CursorKind.DECL_REF_EXPR:
                 self.decl_refs.append(Ast_DeclRefExpr(token.line, token.spelling_str, cursor=cursor))
                 self.decl_refs[-1].decl_cursor = cursor
         self.data.append(token.spelling_str)
@@ -1967,18 +1982,41 @@ class C_Type(Ast):
                                         ast_name=safe_item_name,
                                         ast_type=decl_type,
                                     )
-                                with CS(REF_POS):
-                                    CS.store(m_symbol_def.set(
-                                        None,
-                                        CS.gp.VID,
-                                        ((m_file.table_id, 0), OP_REF, (REF_ROOT,)),
-                                        def_tag_ref or getattr(self, "tag_ref", 0),
-                                        self.ast_ref,
-                                        safe_item_name,
-                                        decl_type,
-                                        def_extent.line_pos[0],
-                                        def_extent.line_pos[1],
-                                    ))
+                                if not (decl_type == ASTT.C_enumdecl and ("(unnamed at " in safe_item_name or "(anonymous at " in safe_item_name or not safe_item_name)):
+                                    with CS(REF_POS):
+                                        CS.store(m_symbol_def.set(
+                                            None,
+                                            CS.gp.VID,
+                                            ((m_file.table_id, 0), OP_REF, (REF_ROOT,)),
+                                            def_tag_ref or getattr(self, "tag_ref", 0),
+                                            self.ast_ref,
+                                            safe_item_name,
+                                            decl_type,
+                                            def_extent.line_pos[0],
+                                            def_extent.line_pos[1],
+                                        ))
+                                if decl_type == ASTT.C_enumdecl:
+                                    active_enum_tag = def_tag_ref or getattr(self, "tag_ref", 0)
+                                    enum_zone = next((z for z in self.zones if z.zone_type == Zone_Type.Enum_Content), None)
+                                    if enum_zone and active_enum_tag:
+                                        for ch in enum_zone.children:
+                                            ch_name = getattr(ch, "name", "")
+                                            ch_ast_ref = getattr(ch, "ast_ref", None)
+                                            ch_ext = getattr(ch, "extent", self.extent)
+                                            if ch_name and ch_ast_ref is not None:
+                                                safe_ch_name = str(ch_name)[:255]
+                                                with CS(REF_POS):
+                                                    CS.store(m_symbol_def.set(
+                                                        None,
+                                                        CS.gp.VID,
+                                                        ((m_file.table_id, 0), OP_REF, (REF_ROOT,)),
+                                                        active_enum_tag,
+                                                        ch_ast_ref,
+                                                        safe_ch_name,
+                                                        int(ASTT.C_enumequal),
+                                                        ch_ext.line_pos[0],
+                                                        ch_ext.line_pos[1],
+                                                    ))
                             else:
                                 with CS(REF_NO_REF):
                                     if G.OVERRIDE_FORCE_AST_DEBUG:
@@ -1991,18 +2029,41 @@ class C_Type(Ast):
                                         ast_type=decl_type,
                                     )
                                 if (decl_type in (ASTT.C_structdecl, ASTT.C_uniondecl, ASTT.C_enumdecl) or (item.type == ASTT.C_functionproto and (compound_stmt_link or is_func_decl))):
-                                    with CS(REF_POS):
-                                        CS.store(m_symbol_def.set(
-                                            None,
-                                            CS.gp.VID,
-                                            ((m_file.table_id, 0), OP_REF, (REF_ROOT,)),
-                                            tag_ref or getattr(self, "tag_ref", 0),
-                                            self.ast_ref,
-                                            safe_item_name,
-                                            decl_type,
-                                            self.extent.line_pos[0],
-                                            self.extent.line_pos[1],
-                                        ))
+                                    if not (decl_type == ASTT.C_enumdecl and ("(unnamed at " in safe_item_name or "(anonymous at " in safe_item_name or not safe_item_name)):
+                                        with CS(REF_POS):
+                                            CS.store(m_symbol_def.set(
+                                                None,
+                                                CS.gp.VID,
+                                                ((m_file.table_id, 0), OP_REF, (REF_ROOT,)),
+                                                tag_ref or getattr(self, "tag_ref", 0),
+                                                self.ast_ref,
+                                                safe_item_name,
+                                                decl_type,
+                                                self.extent.line_pos[0],
+                                                self.extent.line_pos[1],
+                                            ))
+                                    if decl_type == ASTT.C_enumdecl:
+                                        active_enum_tag = tag_ref or getattr(self, "tag_ref", 0)
+                                        enum_zone = next((z for z in self.zones if z.zone_type == Zone_Type.Enum_Content), None)
+                                        if enum_zone and active_enum_tag:
+                                            for ch in enum_zone.children:
+                                                ch_name = getattr(ch, "name", "")
+                                                ch_ast_ref = getattr(ch, "ast_ref", None)
+                                                ch_ext = getattr(ch, "extent", self.extent)
+                                                if ch_name and ch_ast_ref is not None:
+                                                    safe_ch_name = str(ch_name)[:255]
+                                                    with CS(REF_POS):
+                                                        CS.store(m_symbol_def.set(
+                                                            None,
+                                                            CS.gp.VID,
+                                                            ((m_file.table_id, 0), OP_REF, (REF_ROOT,)),
+                                                            active_enum_tag,
+                                                            ch_ast_ref,
+                                                            safe_ch_name,
+                                                            int(ASTT.C_enumequal),
+                                                            ch_ext.line_pos[0],
+                                                            ch_ext.line_pos[1],
+                                                        ))
                                 elif item.type == ASTT.C_functionproto and not compound_stmt_link:
                                     with CS(REF_POS):
                                         CS.store(m_symbol_ref.set(
@@ -2101,6 +2162,8 @@ class C_Type(Ast):
 
             if is_typedef_def:
                 main_t_id = ASTT.C_SCtypedef
+            elif getattr(self.cursor, "kind", None) == cc.CursorKind.ENUM_CONSTANT_DECL:
+                main_t_id = ASTT.C_enumequal
             elif type_segments:
                 if len(type_segments) == 1:
                     main_t_id = type_segments[0].type_id
@@ -2112,7 +2175,7 @@ class C_Type(Ast):
                 else:
                     main_t_id = ASTT.C_Compound
             else:
-                main_t_id = ASTT.C_Compound
+                main_t_id = ASTT.C_enumequal if getattr(self.cursor, "kind", None) == cc.CursorKind.ENUM_CONSTANT_DECL else ASTT.C_Compound
 
             if type_segments:
                 # Invariant E: Simple primitive struct members generate NO m_ast_container records (never for typedefs)
@@ -2154,7 +2217,7 @@ class C_Type(Ast):
                         ast_id_route = CS.get_route_parse()
                         self.ast_ref = CS.ref(m_ast.ast_id, *ast_id_route)
             else:
-                main_t_id = ASTT.C_SCtypedef if is_typedef_def else ASTT.C_Compound
+                main_t_id = ASTT.C_SCtypedef if is_typedef_def else (ASTT.C_enumequal if getattr(self.cursor, "kind", None) == cc.CursorKind.ENUM_CONSTANT_DECL else ASTT.C_Compound)
                 if initializer_ref is not None:
                     cs_inserter = [None, 0, int(ASTT.C_InitListExpr), initializer_ref]
                     with CS(REF_POS):
@@ -2179,10 +2242,13 @@ class C_Type(Ast):
                         self.ast_ref = CS.ref(m_ast.ast_id, *ast_id_route)
 
             if safe_name and hasattr(CS, "symbol_dict"):
-                CS.symbol_dict[(safe_name, main_t_id)] = ast_id_route[1]
-                CS.symbol_dict[(safe_name, ASTT.C_DeclRefExpr)] = ast_id_route[1]
+                pos_idx = ast_id_route[-1]
+                CS.symbol_dict[(safe_name, main_t_id)] = pos_idx
+                CS.symbol_dict[(safe_name, ASTT.C_DeclRefExpr)] = pos_idx
                 if is_typedef_def:
-                    CS.symbol_dict[(safe_name, ASTT.C_SCtypedef)] = ast_id_route[1]
+                    CS.symbol_dict[(safe_name, ASTT.C_SCtypedef)] = pos_idx
+                if getattr(self.cursor, "kind", None) == cc.CursorKind.ENUM_CONSTANT_DECL:
+                    CS.symbol_dict[(safe_name, ASTT.C_enumequal)] = pos_idx
 
             tag_ref = None
             if create_tag:

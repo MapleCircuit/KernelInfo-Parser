@@ -1,0 +1,112 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="description" content="High-Performance Linux Kernel Exploration & Architecture Platform with 100% Copy Fidelity, Client-Side KConfig Engine, and NodeMap Schematic Canvas." />
+  <meta name="theme-color" content="#161b22" />
+  <title>KernelInfo Developer IDE</title>
+
+  <!-- PWA Manifest & Icons -->
+  <link rel="manifest" href="/manifest.json" />
+  <link rel="icon" type="image/svg+xml" href="/static/assets/icon.svg" />
+
+  <!-- Design System & Stylesheets -->
+  <link rel="stylesheet" href="/static/css/variables.css" />
+  <link rel="stylesheet" href="/static/css/layout.css" />
+  <link rel="stylesheet" href="/static/css/tabs.css" />
+  <link rel="stylesheet" href="/static/css/codeview.css" />
+  <link rel="stylesheet" href="/static/css/nodemap.css" />
+  <link rel="stylesheet" href="/static/css/kconfig.css" />
+  <link rel="stylesheet" href="/static/css/maintainers.css" />
+  <link rel="stylesheet" href="/static/css/commits.css" />
+  <link rel="stylesheet" href="/static/css/tools.css" />
+  <link rel="stylesheet" href="/static/css/modals.css" />
+
+  <!-- Vendored Libraries -->
+  <script src="/static/vendor/two.min.js"></script>
+</head>
+<body>
+  <div id="app-container">
+    <!-- 1. Header Navigation -->
+    <header id="app-header">
+      <div class="header-left">
+        <div class="app-brand">
+          <img src="/static/assets/icon.svg" alt="KernelIDE Icon" class="brand-icon" />
+          <span>KernelInfo IDE</span>
+        </div>
+        <div class="version-selector-container">
+          <label for="version-select">Version:</label>
+          <select id="version-select">
+            <option value="v3.0">v3.0</option>
+          </select>
+        </div>
+      </div>
+      <div class="header-right">
+        <div id="offline-badge" class="offline-badge">● Online</div>
+      </div>
+    </header>
+
+    <!-- 2. Main Body (Activity Bar + Sidebar + Workspace) -->
+    <div id="main-body">
+      <!-- Activity Bar -->
+      <aside id="activity-bar">
+        <button class="activity-btn active" data-action="explorer" title="File Explorer">
+          <svg viewBox="0 0 16 16"><path d="M1.75 1A1.75 1.75 0 0 0 0 2.75v10.5C0 14.216.784 15 1.75 15h12.5A1.75 1.75 0 0 0 16 13.25v-8.5A1.75 1.75 0 0 0 14.25 3H7.5a.25.25 0 0 1-.2-.1l-.9-1.2C6.07 1.26 5.55 1 5 1H1.75z"/></svg>
+        </button>
+        <button class="activity-btn" data-action="kconfig" title="KConfig Engine & TUI">
+          <svg viewBox="0 0 16 16"><path d="M8 0a8 8 0 1 0 8 8A8 8 0 0 0 8 0zm3.5 7.5h-3v3H7v-3H4V6h3V3h1.5v3h3z"/></svg>
+        </button>
+        <button class="activity-btn" data-action="nodemap" title="NodeMap Schematic Canvas">
+          <svg viewBox="0 0 16 16"><path d="M6 1v3H1V1h5zM1 0a1 1 0 0 0-1 1v3a1 1 0 0 0 1 1h5a1 1 0 0 0 1-1V1a1 1 0 0 0-1-1H1zm14 12v3h-5v-3h5zm-5-1a1 1 0 0 0-1 1v3a1 1 0 0 0 1 1h5a1 1 0 0 0 1-1v-3a1 1 0 0 0-1-1h-5zM6 8a2 2 0 1 1-4 0 2 2 0 0 1 4 0z"/></svg>
+        </button>
+        <button class="activity-btn" data-action="maintainers" title="Subsystems & Maintainers">
+          <svg viewBox="0 0 16 16"><path d="M7 14s-1 0-1-1 1-4 5-4 5 3 5 4-1 1-1 1H7zm4-6a3 3 0 1 0 0-6 3 3 0 0 0 0 6zM5.5 9c-.83 0-1.5-.67-1.5-1.5S4.67 6 5.5 6s1.5.67 1.5 1.5S6.33 9 5.5 9zm0 1c1.33 0 4 .67 4 2v1H1v-1c0-1.33 2.67-2 4-2z"/></svg>
+        </button>
+        <button class="activity-btn" data-action="commits" title="Git Timeline & Commits">
+          <svg viewBox="0 0 16 16"><path d="M10.5 8a2.5 2.5 0 1 1-5 0 2.5 2.5 0 0 1 5 0zM0 8a8 8 0 1 1 16 0A8 8 0 0 1 0 8zm8-6.5a6.5 6.5 0 1 0 0 13 6.5 6.5 0 0 0 0-13z"/></svg>
+        </button>
+      </aside>
+
+      <!-- Sidebar -->
+      <nav id="sidebar">
+        <div class="sidebar-header">
+          <span>Repository Explorer</span>
+        </div>
+        <div class="sidebar-content" id="sidebar-tree-root"></div>
+      </nav>
+
+      <!-- Main Workspace -->
+      <main id="workspace"></main>
+    </div>
+
+    <!-- 3. Status Bar -->
+    <footer id="status-bar">
+      <div class="status-left">
+        <div class="status-item clickable" id="status-branch">
+          <svg width="12" height="12" viewBox="0 0 16 16" fill="currentColor"><path d="M11.75 2.5a.75.75 0 1 0 0 1.5.75.75 0 0 0 0-1.5zm-2.25.75a2.25 2.25 0 1 1 3 2.122V6A2.5 2.5 0 0 1 10 8.5H6a1 1 0 0 0-1 1v1.128a2.251 2.251 0 1 1-1.5 0V5.372a2.25 2.25 0 1 1 1.5 0v1.836A2.492 2.492 0 0 1 6 7h4a1 1 0 0 0 1-1v-.628A2.25 2.25 0 0 1 9.5 3.25z"/></svg>
+          <span id="status-ver-label">linux-3.0</span>
+        </div>
+        <div class="status-item">
+          <span>Encoding: UTF-8</span>
+        </div>
+      </div>
+
+      <div class="status-right">
+        <div class="status-item">
+          <span>Tab Size: 8</span>
+        </div>
+        <div class="status-item">
+          <span>High-Fidelity Copy: Active</span>
+        </div>
+      </div>
+    </footer>
+  </div>
+
+  <!-- Toast Notification Root -->
+  <div id="toast-container"></div>
+
+  <!-- Main ES-Module Application Bootstrap -->
+  <script type="module" src="/static/js/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,135 @@
+/* tools.css - Pahole Struct Layout, Callgraph Explorer, and Semantic Diff */
+
+.tools-view-container {
+  display: flex;
+  height: 100%;
+  width: 100%;
+  background: var(--bg-primary);
+  overflow-y: auto;
+  padding: 24px;
+  flex-direction: column;
+  gap: 20px;
+}
+
+/* 1. Pahole Struct Layout */
+.pahole-container {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  max-width: 900px;
+}
+
+.pahole-header {
+  border-bottom: 1px solid var(--border-color);
+  padding-bottom: 12px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.pahole-title {
+  font-size: 18px;
+  font-weight: 600;
+  color: var(--accent-cyan);
+  font-family: var(--font-mono);
+}
+
+.pahole-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-md);
+  overflow: hidden;
+}
+
+.pahole-table th, .pahole-table td {
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border-color);
+  text-align: left;
+}
+
+.pahole-table th {
+  background: var(--bg-tertiary);
+  color: var(--text-muted);
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+}
+
+.cacheline-boundary {
+  border-top: 2px dashed var(--accent-blue) !important;
+  background: rgba(88, 166, 255, 0.05);
+}
+
+.padding-hole-row {
+  background: rgba(248, 81, 73, 0.1);
+  color: var(--accent-red);
+}
+
+.padding-hole-badge {
+  font-size: 10px;
+  padding: 2px 6px;
+  border-radius: 3px;
+  background: rgba(248, 81, 73, 0.2);
+  color: var(--accent-red);
+  font-weight: bold;
+}
+
+/* 2. Callgraph Explorer */
+.callgraph-container {
+  display: flex;
+  gap: 20px;
+  height: 100%;
+}
+
+.callgraph-col {
+  flex: 1;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-md);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.callgraph-col-header {
+  padding: 10px 14px;
+  background: var(--bg-tertiary);
+  border-bottom: 1px solid var(--border-color);
+  font-weight: 600;
+  font-size: 12px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.callgraph-node-list {
+  flex: 1;
+  overflow-y: auto;
+  padding: 8px;
+}
+
+.callgraph-node-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 6px 10px;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  transition: background var(--transition-fast);
+}
+
+.callgraph-node-item:hover {
+  background: var(--bg-hover);
+  color: var(--accent-blue);
+}
+
+.callgraph-node-file {
+  font-size: 10px;
+  color: var(--text-muted);
+}

@@ -520,6 +520,20 @@ class Zone_Type(IntEnum):
   - Chained alias hierarchy: The underlying type is evaluated via `typesegment.generate_ast(CS)` and linked at Priority 0 in `m_ast_container`, with `ref_ast_id` pointing to the immediate underlying type's AST (forming an alias chain `__be32 -> __u32 -> unsigned int`).
   - Usage tracking: All typed declarations (struct/union fields, function return types, parameters, variables, and typedef aliases) that reference a typedef resolve `target_ref` (via `REF_FILE` for foreign headers or `CS.symbol_dict` locally) and stage `(target_ref, SymbolRole.TypeUsage, line, col)` in `m_symbol_ref`.
 
+- **Enum & Enumerator Constant Extraction & Symbol Tracking**:
+  - **Standardized Enumerator Type (`ASTT.C_enumequal`)**:
+    All enumerator constants (`ENUM_CONSTANT_DECL`), whether initialized with an explicit value (e.g. `FOO = 1`) or auto-incremented (e.g. `FOO`), are standardized to `ASTT.C_enumequal` (25) in `m_ast`.
+  - **Single Enclosing Composite Tag**:
+    The enclosing `enum` construct produces a single top-level tag spanning the enum declaration (from `enum` through the closing `}` or `;`), adhering to Rule 19's composite construct tag invariant. Inner enumerator constants do not emit recursive sub-tags.
+  - **Enumerator Symbol Definition Staging (`m_symbol_def`)**:
+    After emitting the enclosing enum's `tag_ref`, `C_Type.extract()` iterates through `Zone(Zone_Type.Enum_Content)` children and stages `m_symbol_def.set(vid, fid, tag_ref, child_ref, const_name, ASTT.C_enumequal, line_s, line_e)` for each enumerator constant, linking it to the enclosing enum's code tag while preserving its exact definition line coordinates.
+  - **Anonymous Enum Container Suppression**:
+    For anonymous enums (`enum { FLAG_A, FLAG_B };`), Libclang generates synthetic container names (e.g. `(unnamed at ...)` or `(anonymous at ...)`). The parser suppresses anonymous enum containers from `m_symbol_def`, while registering and indexing all named enumerator constants.
+  - **Enumerator Expression Usage Tracking (`m_symbol_ref`)**:
+    In statements and initializers, identifier tokens referencing `cc.CursorKind.ENUM_CONSTANT_DECL` are collected as `Ast_DeclRefExpr` (62), emitting `m_symbol_ref` records with `SymbolRole.DeclRef` (5).
+  - **Cross-File & Local Symbol Resolution**:
+    In `resolve_cursor_type_ast`, `ENUM_CONSTANT_DECL` references check foreign header origins via `REF_FILE` (`CS.ref(m_ast.ast_id, REF_FILE, rel_file, safe_name, int(ASTT.C_enumequal))`), local batch scope via `CS.symbol_dict[(safe_name, ASTT.C_enumequal)]`, and fall back to unbound `m_ast.view` nodes.
+
 ---
 
 ## 8. 4-Tier Prior Tag Evolution Matching Engine (`tag_tracker.py`)
@@ -762,4 +776,11 @@ Defined in `core/globalstuff.py`, `STANDARD_C_KEYWORDS: dict[str, ASTT]` provide
     - Identifier token dispatch in `Ast_Statement.exec_identifier` and `AST_Initializer.exec_identifier` must fast-path known expressions (`CALL_EXPR`, `MEMBER_REF_EXPR`) and filter out macros/directives (`_SKIP_REF_KINDS`), only lazily evaluating `cursor.referenced` when resolving declaration targets to eliminate tens of thousands of Libclang internal Python wrapper/dictionary allocations.
     - Dead data structures such as `A_Line_Dict` must be bypassed.
     - At the completion of `CSExtractor.extract_zone(CS, main_zone)`, `Ast_Manager` and `TokenList` must immediately clear `main_zone`, `tokens_array`, `token_group`, `parsed_tu`, and pop `CS.parsers["C_AM"]`, ensuring per-file heap memory drops immediately to ~2 MB upon completion of relational staging.
+24. **Enum & Enumerator Constant Definition and Usage Tracking**:
+    - All enumerator constants (e.g. `FOO_A`, `FOO_B`), regardless of explicit `= value` assignment, are extracted with `type_id = ASTT.C_enumequal` (25) in `m_ast` and registered in `CS.symbol_dict[(name, ASTT.C_enumequal)]`.
+    - Enumerator definitions are staged in `m_symbol_def` with `type_id = ASTT.C_enumequal` and exact definition lines, linked to the enclosing enum's top-level code tag (`tag_ref`).
+    - Anonymous enum container labels (`(unnamed at ...)` / `(anonymous at ...)`) are suppressed from `m_symbol_def`, indexing only the named enumerators.
+    - References to enumerator constants in expressions and initializers are dispatched as `Ast_DeclRefExpr` and recorded in `m_symbol_ref` with `SymbolRole.DeclRef` (5).
+    - Foreign enumerator constant references resolve via `REF_FILE` pointing to the declaring header file.
+
 

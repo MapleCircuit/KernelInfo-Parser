@@ -151,6 +151,14 @@ class KconfigLexer:
                         end_line=help_end_line,
                         end_col=len(self.lines[help_end_line - 1]) if help_end_line <= self.num_lines else 1,
                     ))
+                    tokens.append(Token(
+                        type=TokenType.NEWLINE,
+                        value="\n",
+                        line=help_end_line,
+                        col=tokens[-1].end_col,
+                        end_line=help_end_line,
+                        end_col=tokens[-1].end_col + 1,
+                    ))
                 line_idx = next_line_idx - 1
 
             line_idx += 1

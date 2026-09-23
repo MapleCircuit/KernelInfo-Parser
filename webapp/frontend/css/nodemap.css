@@ -1,0 +1,240 @@
+/* nodemap.css - Schematic Canvas Tool Styling */
+
+.nodemap-container {
+  display: flex;
+  height: 100%;
+  width: 100%;
+  background: #0a0d12;
+  position: relative;
+  overflow: hidden;
+}
+
+.nodemap-canvas-wrapper {
+  flex: 1;
+  height: 100%;
+  width: 100%;
+  position: relative;
+  cursor: grab;
+}
+
+.nodemap-canvas-wrapper:active {
+  cursor: grabbing;
+}
+
+/* 1. Floating Canvas Toolbar */
+.nodemap-toolbar {
+  position: absolute;
+  top: 12px;
+  left: 12px;
+  background: var(--bg-glass);
+  backdrop-filter: blur(10px);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-md);
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px;
+  box-shadow: var(--shadow-md);
+  z-index: 20;
+}
+
+.nodemap-btn {
+  padding: 6px 10px;
+  border-radius: var(--radius-sm);
+  color: var(--text-secondary);
+  font-size: 11px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  transition: var(--transition-fast);
+}
+
+.nodemap-btn:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+.nodemap-sep {
+  width: 1px;
+  height: 18px;
+  background: var(--border-color);
+  margin: 0 2px;
+}
+
+/* 2. Schematic Node Element (DOM Overlay for rich controls) */
+.nodemap-overlay-layer {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+  transform-origin: 0 0;
+}
+
+.schematic-node {
+  position: absolute;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-sm);
+  pointer-events: auto;
+  user-select: none;
+  min-width: 180px;
+  display: flex;
+  flex-direction: column;
+  transition: box-shadow var(--transition-fast), border-color var(--transition-fast);
+}
+
+.schematic-node:hover {
+  border-color: var(--border-focus);
+}
+
+.schematic-node.selected {
+  border-color: var(--accent-blue);
+  box-shadow: 0 0 0 2px rgba(88, 166, 255, 0.4), var(--shadow-md);
+}
+
+.node-header {
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--border-color);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  border-radius: var(--radius-md) var(--radius-md) 0 0;
+  background: rgba(255, 255, 255, 0.03);
+  cursor: move;
+}
+
+.node-title-group {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-weight: 600;
+  font-size: 12px;
+}
+
+.node-badge {
+  font-size: 9px;
+  padding: 1px 4px;
+  border-radius: 3px;
+  text-transform: uppercase;
+}
+
+.node-badge.struct { background: rgba(57, 197, 187, 0.2); color: var(--accent-cyan); }
+.node-badge.func { background: rgba(188, 140, 255, 0.2); color: var(--accent-purple); }
+.node-badge.file { background: rgba(88, 166, 255, 0.2); color: var(--accent-blue); }
+.node-badge.kconfig { background: rgba(63, 185, 80, 0.2); color: var(--accent-green); }
+
+.node-body {
+  padding: 8px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 11px;
+}
+
+.node-ports {
+  display: flex;
+  justify-content: space-between;
+  position: relative;
+  min-height: 16px;
+}
+
+.port-anchor {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--bg-tertiary);
+  border: 2px solid var(--accent-blue);
+  cursor: crosshair;
+  transition: transform var(--transition-fast);
+}
+
+.port-anchor:hover {
+  transform: scale(1.3);
+  background: var(--accent-blue);
+}
+
+.node-constituents-list {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  margin-top: 6px;
+  border-top: 1px solid var(--border-color);
+  padding-top: 6px;
+  max-height: 220px;
+  overflow-y: auto;
+}
+
+.node-constituent-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 3px 6px;
+  border-radius: var(--radius-sm);
+  background: rgba(255, 255, 255, 0.02);
+  border: 1px solid transparent;
+  gap: 6px;
+  transition: background var(--transition-fast), border-color var(--transition-fast);
+}
+
+.node-constituent-item:hover {
+  background: var(--bg-tertiary);
+  border-color: var(--border-muted);
+}
+
+.node-constituent-name {
+  font-size: 10px;
+  font-family: var(--font-mono);
+  color: var(--text-secondary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex: 1;
+}
+
+.port-anchor.constituent-port {
+  width: 8px;
+  height: 8px;
+  border-width: 1.5px;
+  flex-shrink: 0;
+}
+
+/* 3. NodeMap Inspector Sidebar */
+.nodemap-inspector {
+  width: 280px;
+  background: var(--bg-secondary);
+  border-left: 1px solid var(--border-color);
+  display: flex;
+  flex-direction: column;
+  overflow-y: auto;
+  padding: 12px;
+  gap: 12px;
+}
+
+.inspector-header {
+  font-weight: 600;
+  font-size: 13px;
+  color: var(--text-primary);
+  border-bottom: 1px solid var(--border-color);
+  padding-bottom: 8px;
+}
+
+.inspector-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.inspector-label {
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.inspector-val {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-primary);
+  word-break: break-all;
+}
