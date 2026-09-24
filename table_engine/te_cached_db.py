@@ -47,7 +47,7 @@ logger = logging.getLogger(__name__)
 class TECachedDB(TEDirectDB):
     """In-Memory Cached Table Engine with selective table preloading and internal indexing."""
 
-    def __init__(self) -> None:
+    def __init__(self, hugepages: str | None = None) -> None:
         """Initialize Table Engine state and in-memory cache structures."""
         super().__init__()
         self._cached_rows: dict[int, list[tuple[SafeDataType, ...]]] = {}
@@ -56,6 +56,14 @@ class TECachedDB(TEDirectDB):
         self._nodup_index: dict[int, dict[tuple[SafeDataType, ...], int]] = {}
         self._col_indices: dict[int, dict[int, dict[SafeDataType, list[tuple[SafeDataType, ...]]]]] = {}
         self.update_in_mem_indexes: bool = True
+        self._shared_buffer: Any | None = None
+        if hugepages is None:
+            try:
+                from core.config import get_parser_config
+                hugepages = get_parser_config().get("hugepages", "auto")
+            except Exception:
+                hugepages = "auto"
+        self.hugepages: str = str(hugepages).lower().strip()
 
     def _is_cached(self, table: Table) -> bool:
         """Check if target table is configured for in-memory caching."""
@@ -243,13 +251,35 @@ class TECachedDB(TEDirectDB):
         self._pk_index.clear()
         self._nodup_index.clear()
         self._col_indices.clear()
+        self._shared_buffer = None
 
-    def start_new_db(self, db: Callable[[], Any] | type[Any]) -> None:
+    def start_new_db(self, db: Callable[[], Any] | type[Any], is_worker: bool = False) -> None:
         """Start or restart database connection and preload cached tables.
 
         Args:
             db: Database class or factory callable (e.g., MariaDB or MockDB).
+            is_worker: If True, connects dedicated DB socket but retains inherited shared huge-page buffer.
         """
+        if is_worker and self._shared_buffer is not None:
+            if getattr(self, "db", None) is not None:
+                try:
+                    self.db.close()
+                except Exception:
+                    pass
+            self.db = db()
+            self.queued_view = {}
+            for table_id, table in self.tables.items():
+                self.queued_set[table_id] = {}
+                self.queued_update[table_id] = []
+                self._ensure_table(table_id)
+                if self.db is not None:
+                    try:
+                        self.next_id[table_id] = self.db.get_next_id(table)
+                    except Exception:
+                        pass
+            self.update_in_mem_indexes = True
+            return
+
         super().start_new_db(db)
         self.clear_cache()
         self.update_in_mem_indexes = True
@@ -309,6 +339,27 @@ class TECachedDB(TEDirectDB):
                             self._cached_rows_pos[table_id][pk] = pos
                         self._index_row(table, proj_row)
 
+        # Build structured shared memory segment with huge pages if enabled
+        if self.hugepages != "off" and any(self._cached_rows.values()):
+            try:
+                from table_engine.shared_buffer import SharedTableBuilder
+                builder = SharedTableBuilder(mode=self.hugepages)
+                for table in self.tables.values():
+                    t_id = table.table_id
+                    rows = self._cached_rows.get(t_id, [])
+                    if rows:
+                        builder.add_table(t_id, table.length, table.primary, rows)
+                self._shared_buffer = builder.build()
+                if self._shared_buffer:
+                    logger.info(
+                        f"[TECachedDB] Backed {len(self._shared_buffer.tables)} tables "
+                        f"({self._shared_buffer.total_size // (1024*1024)}MB) with structured shared memory "
+                        f"(page size: {self._shared_buffer.page_size // 1024}KB, mode: {self.hugepages})."
+                    )
+            except Exception as e:
+                logger.warning(f"[TECachedDB] Failed to build shared huge page buffer: {e}. Falling back to standard heap.")
+                self._shared_buffer = None
+
     def start(self, tables: Sequence[Table] | Table, db: Callable[[], Any] | type[Any]) -> None:
         """Initialize Table Engine, connect to database, and preload cached tables.
 
@@ -349,6 +400,10 @@ class TECachedDB(TEDirectDB):
             row = self._pk_index[table_id].get(pk)
             if row is not None and self._match_columns(table, row, columns):
                 return row
+            if self._shared_buffer is not None:
+                shared_row = self._shared_buffer.get_row_by_pk(table_id, pk)
+                if shared_row is not None and self._match_columns(table, shared_row, columns):
+                    return shared_row
             if self._is_version_scoped(table) and self.db is not None:
                 return self.db.select(table, columns)
             return None
@@ -413,6 +468,11 @@ class TECachedDB(TEDirectDB):
                 else:
                     if self._match_columns(table, row, columns):
                         return row
+
+        if self._shared_buffer is not None:
+            shared_row = self._shared_buffer.scan_matching(table_id, columns)
+            if shared_row is not None:
+                return shared_row
 
         if self._is_version_scoped(table) and self.db is not None:
             return self.db.select(table, columns)

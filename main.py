@@ -819,7 +819,7 @@ def trigger_multicore(batch_size: int | None = None, scheduler: DependencySchedu
         p.start()
 
     # Re-initialize dedicated DB connection in parent process after workers have forked
-    G.TE.start_new_db(G.DB)
+    G.TE.start_new_db(G.DB, is_worker=True)
 
     # needs to be try: protected
     processing_dirs()
@@ -1175,6 +1175,20 @@ def arg_handling() -> argparse.Namespace:
         choices=["cached", "direct", "tecacheddb", "tedirectdb"],
         help="Select Table Engine architecture backend (default: from config or cached)",
     )
+    parser.add_argument(
+        "--hugepages",
+        dest="hugepages",
+        default=None,
+        choices=["auto", "1g", "2m", "thp", "off"],
+        help="Configure huge-page backing for TableEngine shared memory (default: auto)",
+    )
+    parser.add_argument(
+        "--no-hugepages",
+        dest="hugepages",
+        action="store_const",
+        const="off",
+        help="Disable huge-page shared memory backing in TableEngine",
+    )
     args = parser.parse_args()
 
     init_config(args.config)
@@ -1201,9 +1215,14 @@ def arg_handling() -> argparse.Namespace:
 
     effective_db_engine = args.db_engine or db_cfg.get("engine") or "mariadb"
     effective_table_engine = args.table_engine or parser_cfg.get("table_engine") or "cached"
+    effective_hugepages = args.hugepages or parser_cfg.get("hugepages") or "auto"
 
     G.DB = get_db_engine(effective_db_engine)
-    G.TE = get_table_engine(effective_table_engine)()
+    EngineCls = get_table_engine(effective_table_engine)
+    if issubclass(EngineCls, TECachedDB):
+        G.TE = EngineCls(hugepages=effective_hugepages)
+    else:
+        G.TE = EngineCls()
 
     if args.Drop:
         logger.info("Dropping all tables")
@@ -1530,7 +1549,7 @@ def file_processing_worker(
     sys.setrecursionlimit(50000)
     # Ensure dedicated DB connection per worker process to avoid socket sharing across fork
     try:
-        G.TE.start_new_db(G.DB)
+        G.TE.start_new_db(G.DB, is_worker=True)
     except Exception as e:
         logger.error(f"Worker {worker_id} failed to initialize DB connection: {e}")
 

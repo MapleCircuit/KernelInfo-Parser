@@ -38,6 +38,7 @@ DEFAULT_CONFIG: dict[str, dict[str, Any]] = {
         "memory_mode": "normal",
         "fidelity": True,
         "mem_max": 60,
+        "hugepages": "auto",
     },
 }
 
@@ -148,6 +149,7 @@ def sync_environ(cfg: dict[str, dict[str, Any]]) -> None:
         "MYSQL_DATABASE": database,
         "DB_TIMEOUT": timeout,
         "MYSQL_TIMEOUT": timeout,
+        "TE_HUGEPAGES": str(cfg.get("parser", {}).get("hugepages", "auto")),
     }
     for k, v in vars_to_sync.items():
         os.environ[k] = v
@@ -234,6 +236,11 @@ def load_config(config_path: str | Path | None = None) -> dict[str, dict[str, An
         parser_sec["fidelity"] = _coerce_bool(env_p_fid, parser_sec["fidelity"])
     else:
         parser_sec["fidelity"] = _coerce_bool(parser_sec.get("fidelity"), True)
+
+    if env_p_hp := (_get_user_env("HUGEPAGES") or _get_user_env("TE_HUGEPAGES")):
+        parser_sec["hugepages"] = env_p_hp.lower().strip()
+    else:
+        parser_sec["hugepages"] = str(parser_sec.get("hugepages", "auto")).lower().strip()
 
     # 4. Synchronize into os.environ for low-level and child worker compatibility
     sync_environ(merged)

@@ -289,11 +289,14 @@ MasterFile (MF)                   GreatProcessor (gp)               TableEngine 
   │  (Clones git tree to /dev/shm)        │  (Populates gp.Table_Array)     │
   └─ generate_change_list(gp) ───────────►│                                 │
      (Populates gp.Change_List)           └─ G.TE.start(gp.Table_Array) ────►
+                                             (Preloads te_cached tables &
+                                              packs 1GB/2MB/THP shared buffer)
 ==================================================================================================
 [2. MULTICORE PARTITIONING & TWO-STAGE PARALLEL WORKER PARSING]
 --------------------------------------------------------------------------------------------------
 Main Process (trigger_multicore)          Worker Process 1..N
-  │
+  │                                       │ (Inherits shared huge-page mmap across fork;
+  │                                       │  calls G.TE.start_new_db(is_worker=True))
   ├─ Partition gp.Change_List:
   │  ├── order_changed_files()
   │  │   └── Kahn's topological sort on header '#include' dependencies

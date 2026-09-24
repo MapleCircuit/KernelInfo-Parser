@@ -1279,6 +1279,88 @@ class TestTECachedDBIntegrity(unittest.TestCase):
         finally:
             te.close()
 
+    def test_hugepage_shared_buffer_preload_and_query(self) -> None:
+        """Verify that TECachedDB creates a structured shared buffer with huge pages and resolves O(1) queries."""
+        self.db.insert(fake_tbl_cached, (
+            (1, "cached_alpha", 100),
+            (2, "cached_beta", 200),
+        ))
+        te = TECachedDB(hugepages="auto")
+        te.start(ALL_FAKE_TABLES, lambda: self.db)
+        try:
+            self.assertIsNotNone(te._shared_buffer)
+            self.assertGreaterEqual(te._shared_buffer.page_size, 4096)
+            self.assertIn(fake_tbl_cached.table_id, te._shared_buffer.tables)
+
+            # Query row from preloaded table through te.get
+            row = te.get(fake_tbl_cached.table_id, (1, None, None))
+            self.assertIsNotNone(row)
+            self.assertEqual(row[0], 1)
+            self.assertEqual(row[1], "cached_alpha")
+            self.assertEqual(row[2], 100)
+        finally:
+            te.close()
+
+    def test_hugepage_shared_buffer_worker_inheritance(self) -> None:
+        """Verify that worker processes retain inherited shared buffer without re-querying preload."""
+        self.db.insert(fake_tbl_cached, (
+            (1, "cached_alpha", 100),
+        ))
+        te = TECachedDB(hugepages="auto")
+        te.start(ALL_FAKE_TABLES, lambda: self.db)
+        try:
+            buf = te._shared_buffer
+            self.assertIsNotNone(buf)
+
+            # Simulate worker startup with is_worker=True
+            te.start_new_db(lambda: self.db, is_worker=True)
+            self.assertIs(te._shared_buffer, buf)
+
+            # Query should succeed through shared buffer
+            row = te.get(fake_tbl_cached.table_id, (1, None, None))
+            self.assertIsNotNone(row)
+            self.assertEqual(row[1], "cached_alpha")
+        finally:
+            te.close()
+
+    def test_hugepage_shared_buffer_local_overlay_precedence(self) -> None:
+        """Verify that local mutations in queued_set / _pk_index overlay take precedence over shared buffer."""
+        self.db.insert(fake_tbl_cached, (
+            (1, "cached_alpha", 100),
+        ))
+        te = TECachedDB(hugepages="auto")
+        te.start(ALL_FAKE_TABLES, lambda: self.db)
+        try:
+            # Baseline in shared buffer is 'cached_alpha'
+            old_row = te.get(fake_tbl_cached.table_id, (1, None, None))
+            self.assertEqual(old_row[1], "cached_alpha")
+
+            # Update row 1 locally
+            updated = te.set(fake_tbl_cached.table_id, (1, "cached_alpha_mutated", 999))
+            self.assertEqual(updated[1], "cached_alpha_mutated")
+
+            # te.get must return the local overlay, not the frozen baseline in shared buffer
+            curr_row = te.get(fake_tbl_cached.table_id, (1, None, None))
+            self.assertEqual(curr_row[1], "cached_alpha_mutated")
+            self.assertEqual(curr_row[2], 999)
+        finally:
+            te.close()
+
+    def test_hugepage_shared_buffer_off_mode(self) -> None:
+        """Verify that TECachedDB operates purely on standard Python heap when hugepages='off'."""
+        self.db.insert(fake_tbl_cached, (
+            (1, "cached_alpha", 100),
+        ))
+        te = TECachedDB(hugepages="off")
+        te.start(ALL_FAKE_TABLES, lambda: self.db)
+        try:
+            self.assertIsNone(te._shared_buffer)
+            row = te.get(fake_tbl_cached.table_id, (1, None, None))
+            self.assertIsNotNone(row)
+            self.assertEqual(row[1], "cached_alpha")
+        finally:
+            te.close()
+
 
 
 

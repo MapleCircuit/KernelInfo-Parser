@@ -49,6 +49,8 @@ Stateful caching, sequence coordination, relational view decomposition, and batc
 | `_pk_index` | `dict[int, dict[Any, tuple]]` | O(1) exact row lookup: `table_id -> {primary_key_val: row_tuple}`. |
 | `_nodup_index` | `dict[int, dict[tuple, int]]` | O(1) deduplication lookup: `table_id -> {columns[1:]: assigned_id}`. |
 | `_col_indices` | `dict[int, dict[int, dict[SafeDataType, list[tuple]]]]` | Selective inverted column index: `table_id -> {col_idx: {column_val: [matching_row, ...]}}` (exempts primary key columns). |
+| `_shared_buffer` | `SharedTableReader \| None` | Structured shared memory segment backed by huge pages (1GB/2MB/THP) containing preloaded baseline tables. |
+| `hugepages` | `str` | Active huge page allocation mode (`"auto"`, `"1g"`, `"2m"`, `"thp"`, `"off"`). |
 
 ---
 
@@ -93,6 +95,11 @@ Internal helper methods used exclusively by `TECachedDB` to synchronize in-memor
 - `_unindex_row(table: Table, row: tuple) -> None`: Removes a row from all internal indices prior to updating.
 - `_ensure_table(table_id: int) -> None`: Initializes cache lists and index dictionaries for a table upon first access.
 
+### 3.5. Structured Shared Memory with Huge Pages (`table_engine/shared_buffer.py`)
+- **`SharedBufferAllocator.allocate(size: int, mode: str = "auto") -> tuple[mmap.mmap, str, int]`**: Allocates shared memory with tiered fallback: `1GB HugeTLB` (`MAP_HUGE_1GB`) $\to$ `2MB HugeTLB` (`MAP_HUGE_2MB`) $\to$ `2MB Transparent Huge Pages` (`madvise(MADV_HUGEPAGE)`) $\to$ standard `4KB anonymous mmap`.
+- **`SharedTableBuilder`**: Packs preloaded relational tables and builds $O(1)$ open-addressing hash indices directly inside raw memory bytes during the parent process preloading phase.
+- **`SharedTableReader`**: Zero-deserialization reader providing lock-free $O(1)$ Primary Key probes (`get_row_by_pk`) and scan matching (`scan_matching`) against raw `mmap` memoryviews without allocating intermediate Python objects.
+
 ---
 
 ## 4. Exhaustive API Method Specifications
@@ -102,15 +109,18 @@ Internal helper methods used exclusively by `TECachedDB` to synchronize in-memor
 - **`__init__() -> None`**
   - Initializes empty state dictionaries (`tables`, `queued_set`, `queued_update`, `queued_view`, `next_id`) and sets `db = None`.
   - In `TECachedDB`: Also initializes empty index dictionaries (`_cached_rows`, `_pk_index`, `_nodup_index`, `_col_indices`).
-- **`start_new_db(db: Callable[[], Any] | type[Any]) -> None`**
+- **`start_new_db(db: Callable[[], Any] | type[Any], is_worker: bool = False) -> None`**
   1. Safely closes active `self.db` (if present) and instantiates a new driver: `self.db = db()`.
   2. Resets `queued_view = {}`.
   3. For all registered `self.tables`: resets `queued_set[t_id] = {}`, `queued_update[t_id] = []`, and refreshes `next_id[t_id] = self.db.get_next_id(t)`.
-  4. In `TECachedDB`: Calls `clear_cache()`, ensures index structures exist, and preloads database records for tables where `table.te_cached` is truthy via `db.select_preload(table, cached_columns=cached_cols, min_vid=min_vid)`:
-     - **Selective Column Pushdown**: For column-level cached tables (e.g. `m_tag_code`), queries only configured columns (`SELECT hash FROM m_tag_code`) and reconstructs canonical rows with `None` in un-cached positions.
-     - **Version Window Predicate Pushdown**: For `version_scoped=True` tables, pushes the working-window filter (`vid >= Old_VID`) directly into the SQL query (`WHERE vid >= %s` or `WHERE (vid_e = 0 OR vid_e >= %s)`).
-     - For standard cached tables: Preloads all records.
-     - Indexes all rows into `_pk_index`, `_nodup_index`, and selectively into `_col_indices`.
+  4. In `TECachedDB`:
+     - **Worker Bypass (`is_worker=True`)**: Forked worker processes retain the inherited read-only shared huge-page buffer (`_shared_buffer`), initializing empty local mutation overlays and bypassing redundant database preloading (`select_preload()`).
+     - **Parent Initialization**: Calls `clear_cache()`, ensures index structures exist, and preloads database records for tables where `table.te_cached` is truthy via `db.select_preload(table, cached_columns=cached_cols, min_vid=min_vid)`:
+       - **Selective Column Pushdown**: For column-level cached tables (e.g. `m_tag_code`), queries only configured columns (`SELECT hash FROM m_tag_code`) and reconstructs canonical rows with `None` in un-cached positions.
+       - **Version Window Predicate Pushdown**: For `version_scoped=True` tables, pushes the working-window filter (`vid >= Old_VID`) directly into the SQL query (`WHERE vid >= %s` or `WHERE (vid_e = 0 OR vid_e >= %s)`).
+       - For standard cached tables: Preloads all records.
+       - Indexes all rows into `_pk_index`, `_nodup_index`, and selectively into `_col_indices`.
+       - **Shared Huge-Page Packing**: If `hugepages != "off"`, serializes preloaded tables into structured shared memory via `SharedTableBuilder.build()`, backing lookups with 1GB/2MB/THP pages.
 - **`start(tables: Sequence[Table] | Table, db: Callable[[], Any] | type[Any]) -> None`**
   1. Normalizes `tables` into a tuple/list.
   2. Registers all tables in `self.tables`.
@@ -128,10 +138,10 @@ Internal helper methods used exclusively by `TECachedDB` to synchronize in-memor
 
 - **`get(table_id: int, columns: tuple[SafeDataType, ...]) -> tuple[SafeDataType, ...] | None`**
   - **In `TECachedDB` (`te_cached=True` tables)**:
-    1. **Primary Key Fast-Path**: If all primary key columns are non-None, checks `_pk_index[table_id].get(pk)`, verifies full filter match via `_match_columns(row, columns)`, and returns the row or `None`. If missing and `version_scoped=True`, falls back to `db.select()`.
+    1. **Primary Key Fast-Path**: If all primary key columns are non-None, checks local overlay `_pk_index[table_id].get(pk)`. If missing and `_shared_buffer` is active, probes the shared memory open-addressing hash index via `_shared_buffer.get_row_by_pk(table_id, pk)`. If missing and `version_scoped=True`, falls back to `db.select()`.
     2. **Deduplication Key Fast-Path**: If `table.no_duplicate` and `columns[1:]` non-None, checks `_nodup_index[table_id].get(columns[1:])`, verifies via `_match_columns(row, columns)`.
     3. **Column Index Accelerated Path**: Identifies all indexed non-None columns in `_col_indices`, selects the column index with the smallest candidate pool, and checks candidate matches via `_match_columns(row, columns)`. If missing and `version_scoped=True`, falls back to `db.select()`.
-    4. **In-Memory Linear Scan**: Scans `_cached_rows[table_id]` using `_match_columns(row, columns)`. Falls back to `db.select()` for out-of-window version-scoped queries.
+    4. **In-Memory Linear Scan & Shared Scan**: Scans `_cached_rows[table_id]` using `_match_columns(row, columns)`. If missing and `_shared_buffer` is active, scans shared memory records via `_shared_buffer.scan_matching(table_id, columns)`. Falls back to `db.select()` for out-of-window version-scoped queries.
   - **In `TEDirectDB` (or non-cached tables)**:
     1. **Staged Memory Check (`queued_set`)**:
        - `no_duplicate=True`:
@@ -261,4 +271,5 @@ Any backend passed to `TableEngine` must implement:
 7. **Public Engine Invariant (Rule 15)**: Code, tests, and workflows must never assume tables are cached in memory or access private engine internals (e.g. `_cached_rows`, `_pk_index`). Queries must use public TableEngine APIs (`Table.get()`, `G.TE.get()`, `Table.get_set()`) or assert against database state (`MockDB._global_store`), ensuring complete compatibility regardless of the active TableEngine (`TEDirectDB` vs `TECachedDB`) or table caching configuration (`te_cached=True/False`).
 8. **Cryptographic Hash Fast-Path (Rule 16)**: For cryptographic hash lookup tables (e.g. `m_tag_code`), matching hashes guarantee identical content without database lookups. TableEngine `set()` operations on tables with explicit primary keys must maintain an $O(1)$ fast-path when re-setting matching projected rows to prevent $O(N)$ linear cache scans.
 9. **Teardown Commit Acceleration (Rule 17)**: When committing final update cycles, teardowns, or write-only batches before engine closure, use `G.TE.commit_all(update_in_mem_indexes=False)` (or `G.TE.commit(table_id, update_in_mem_indexes=False)`) to bypass redundant in-memory cache/index synchronization and immediately release cache memory before `G.TE.close()`.
+10. **Huge-Page Shared Memory & Fork Inheritance**: Preloaded baseline tables stored in structured shared memory (`_shared_buffer`) must remain immutable across parallel worker processes. Workers calling `start_new_db(..., is_worker=True)` inherit the shared memory segment across `fork()`, isolating local mutation overlays in process-local heap and eliminating multi-worker database preload stampedes.
 
