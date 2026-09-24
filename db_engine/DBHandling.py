@@ -1020,10 +1020,20 @@ class MariaDB(BaseDBEngine):
             if "BINARY" in col[1].upper() or "BLOB" in col[1].upper()
         }
 
+        def _normalize_binary_val(val: Any) -> bytes:
+            if isinstance(val, (bytearray, memoryview)):
+                return bytes(val)
+            if isinstance(val, str):
+                try:
+                    return val.encode("latin1")
+                except UnicodeEncodeError:
+                    return val.encode("utf-8")
+            return bytes(val)
+
         # Optimized fast-path for single-column binary projection (e.g. m_tag_code)
         if len(target_cols) == 1 and 0 in binary_indices:
             return [
-                ((row[0].encode("latin1") if isinstance(row[0], str) else bytes(row[0])),)
+                (_normalize_binary_val(row[0]),)
                 if row[0] is not None else (None,)
                 for row in rows
             ]
@@ -1031,7 +1041,7 @@ class MariaDB(BaseDBEngine):
         if binary_indices or any(isinstance(val, (bytearray, memoryview)) for r in rows[:min(len(rows), 10)] for val in r):
             return [
                 tuple(
-                    (val.encode("latin1") if isinstance(val, str) else bytes(val))
+                    _normalize_binary_val(val)
                     if (idx in binary_indices or isinstance(val, (bytearray, memoryview))) and val is not None
                     else val
                     for idx, val in enumerate(row)

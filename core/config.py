@@ -37,6 +37,7 @@ DEFAULT_CONFIG: dict[str, dict[str, Any]] = {
         "table_engine": "cached",
         "memory_mode": "normal",
         "fidelity": True,
+        "mem_max": 60,
     },
 }
 

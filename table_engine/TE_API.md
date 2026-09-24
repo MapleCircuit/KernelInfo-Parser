@@ -85,6 +85,7 @@ EngineClass = get_table_engine("direct")  # -> TEDirectDB
 
 ### 3.4. `TECachedDB` Internal Cache Management
 Internal helper methods used exclusively by `TECachedDB` to synchronize in-memory caches and indices without querying the database driver:
+- `_normalize_binary_val(val: Any) -> bytes`: Coerces binary column values (`bytearray`, `memoryview`, or Latin-1/UTF-8 decoded `str`) to canonical `bytes`.
 - `_match_columns(row: tuple, filter_cols: tuple) -> bool`: Verifies if a row matches all non-None criteria in `filter_cols`.
 - `_is_version_scoped(table: Table) -> bool`: Returns `True` if `table.version_scoped` is enabled.
 - `_get_vid_col_idx(table: Table) -> int | None`: Locates the 0-indexed column position of the version column (`vid` or `vid_s`).

@@ -16,6 +16,7 @@
   "parser": {
     "table_engine": "cached",
     "memory_mode": "normal",
-    "fidelity": true
+    "fidelity": true,
+    "mem_max": 60
   }
 }

@@ -973,8 +973,8 @@ def trigger_multicore(batch_size: int | None = None, scheduler: DependencySchedu
 
 def main() -> None:
     """Set the plan for what version to parse."""
-    setup_memory_limit(60.0)
     args = arg_handling()
+    setup_memory_limit(float(args.mem_max))
     with G.DB() as db:
         if getattr(args, "reset", False) or getattr(args, "Drop", False):
             logger.info("Resetting and recreating all database tables...")
@@ -1156,6 +1156,12 @@ def arg_handling() -> argparse.Namespace:
         help="Enable Very Low Memory Mode: throttles CPU cores (<=2) with ultra-compact batch sizes and continuous memory compaction",
     )
     parser.add_argument(
+        "--mm", "--mem-max",
+        dest="mem_max",
+        default=60,
+        help="Set memory max limit in GB. Defaults to 60GB",
+    )
+    parser.add_argument(
         "--db", "--db-engine",
         dest="db_engine",
         default=None,
@@ -1184,6 +1190,9 @@ def arg_handling() -> argparse.Namespace:
 
     if args.fidelity is None:
         args.fidelity = parser_cfg.get("fidelity", True)
+
+    if args.mem_max == 60:
+        args.mem_max = parser_cfg.get("mem_max")
 
     gp.init_cs_dict()
 

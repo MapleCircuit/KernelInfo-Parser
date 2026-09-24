@@ -94,6 +94,18 @@ class TECachedDB(TEDirectDB):
                 return tuple(bytes(x) if isinstance(x, (bytearray, memoryview)) else x for x in key)
         return key
 
+    @staticmethod
+    def _normalize_binary_val(val: Any) -> bytes:
+        """Coerce binary column value (bytearray, bytes, or latin1/utf-8 decoded string) to canonical bytes."""
+        if isinstance(val, (bytearray, memoryview)):
+            return bytes(val)
+        if isinstance(val, str):
+            try:
+                return val.encode("latin1")
+            except UnicodeEncodeError:
+                return val.encode("utf-8")
+        return bytes(val)
+
     @classmethod
     def _project_row(cls, table: Table, row: tuple[SafeDataType, ...]) -> tuple[SafeDataType, ...]:
         """Project row to only retain configured cached columns, substituting un-cached with None."""
@@ -102,12 +114,12 @@ class TECachedDB(TEDirectDB):
         if cached_cols is None or len(cached_cols) == table.length:
             return tuple(
                 (bytes(val) if isinstance(val, (bytearray, memoryview))
-                 else (val.encode("latin1") if isinstance(val, str) and cols_def[i][1].upper().startswith("BINARY") else val))
+                 else (cls._normalize_binary_val(val) if isinstance(val, str) and cols_def[i][1].upper().startswith("BINARY") else val))
                 for i, val in enumerate(row)
             )
         return tuple(
             (bytes(row[i]) if isinstance(row[i], (bytearray, memoryview))
-             else (row[i].encode("latin1") if isinstance(row[i], str) and cols_def[i][1].upper().startswith("BINARY") else row[i]))
+             else (cls._normalize_binary_val(row[i]) if isinstance(row[i], str) and cols_def[i][1].upper().startswith("BINARY") else row[i]))
             if i in cached_cols else None
             for i in range(table.length)
         )
@@ -127,7 +139,7 @@ class TECachedDB(TEDirectDB):
             if isinstance(val, (bytearray, memoryview)):
                 val = bytes(val)
             elif isinstance(val, str) and cols_def[col_pos][1].upper().startswith("BINARY"):
-                val = val.encode("latin1")
+                val = cls._normalize_binary_val(val)
             full_row[col_pos] = val
         return tuple(full_row)
 
