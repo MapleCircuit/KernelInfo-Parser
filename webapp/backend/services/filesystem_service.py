@@ -10,7 +10,8 @@ from webapp.backend.database.helpers import (
     format_stat_label,
     get_version_info,
 )
-from webapp.backend.security.jail import resolve_and_verify_repo_path, LINUX_REPO_DIR
+from webapp.backend.security.jail import resolve_and_verify_repo_path, is_safe_rel_path, LINUX_REPO_DIR
+from webapp.backend.services.git_reader import git_reader
 from core.globalstuff import format_ref_type_label, FileRefType
 _INCLUDE_CACHE: dict[tuple[str, str, str | None], dict[str, Any]] = {}
 _FILE_TOKENS_CACHE: dict[tuple[str, str], list[list[int]]] = {}
@@ -103,13 +104,15 @@ class FilesystemService:
         norm_path = path.strip().strip("/")
         if not norm_path:
             raise HTTPException(status_code=400, detail="File path must be specified.")
+        if not is_safe_rel_path(norm_path):
+            raise HTTPException(status_code=400, detail="Path traversal attempt detected.")
 
         with get_db_cursor() as cursor:
             vid, vname = get_version_info(cursor, version_name)
             if vid is None:
                 raise HTTPException(status_code=404, detail=f"Version '{version_name}' not found.")
 
-            # 1. Query file metadata from m_bridge_file and m_file
+            # 1. Query file metadata from m_bridge_file and m_file (if indexed)
             cursor.execute(
                 """
                 SELECT f.fid, f.vid_s, f.vid_e, f.ftype, f.s_stat, f.e_stat, fn.fnid, fn.fname
@@ -122,15 +125,13 @@ class FilesystemService:
                 (vid, norm_path),
             )
             f_row = cursor.fetchone()
-            if not f_row:
-                raise HTTPException(status_code=404, detail=f"File '{norm_path}' not found in version '{version_name}'.")
 
-            fid = f_row["fid"]
-            fnid = f_row["fnid"]
+            # 2. Read version-specific source content from Git
+            raw_bytes, is_dir, sha1 = git_reader.read_file(vname, norm_path)
 
-            # 2. Read physical source code from repo jail
-            target_path = resolve_and_verify_repo_path(norm_path)
-            if target_path.is_dir() or f_row["ftype"] == 0 or str(f_row["ftype"]) == "0":
+            # Check if directory either in git tree or database ftype == 0
+            is_directory = is_dir or (f_row is not None and (f_row["ftype"] == 0 or str(f_row["ftype"]) == "0"))
+            if is_directory:
                 tree_data = self.get_tree(version_name, norm_path)
                 return {
                     "type": "dir",
@@ -139,8 +140,8 @@ class FilesystemService:
                     "vid": vid,
                     "path": norm_path,
                     "file_info": {
-                        "fid": fid,
-                        "fnid": fnid,
+                        "fid": f_row["fid"] if f_row else None,
+                        "fnid": f_row["fnid"] if f_row else None,
                         "fname": norm_path,
                         "ftype": "dir",
                     },
@@ -153,28 +154,89 @@ class FilesystemService:
                     "used_by": {"total": 0, "counts": {}, "references": []},
                 }
 
-            if not target_path.is_file():
-                # Attempt checkout if missing or not checked out
-                raise HTTPException(status_code=404, detail=f"Physical source file not found on disk at {norm_path}.")
+            if raw_bytes is None:
+                raise HTTPException(status_code=404, detail=f"File '{norm_path}' not found in version '{vname}'.")
+
+            file_size = len(raw_bytes)
 
             # Safeguard: detect binary files or oversized blobs
-            file_stat = target_path.stat()
-            file_size = file_stat.st_size
+            if b"\0" in raw_bytes[:1024]:
+                return {
+                    "is_binary": True,
+                    "file_size": file_size,
+                    "path": norm_path,
+                    "version": vname,
+                    "fid": f_row["fid"] if f_row else None,
+                    "message": "Binary file cannot be displayed.",
+                }
 
-            with open(target_path, "rb") as fp:
-                sample = fp.read(1024)
-                if b"\0" in sample:
-                    return {
-                        "is_binary": True,
+            if file_size > 10 * 1024 * 1024:
+                return {
+                    "is_binary": False,
+                    "is_oversized": True,
+                    "file_size": file_size,
+                    "path": norm_path,
+                    "version": vname,
+                    "fid": f_row["fid"] if f_row else None,
+                    "message": f"File size ({file_size / (1024*1024):.2f} MB) exceeds maximum viewer display limit of 10 MB.",
+                }
+
+            raw_content = raw_bytes.decode("utf-8", errors="replace")
+
+            # Graceful unindexed fallback: if file exists in Git but has no DB record in m_bridge_file
+            if not f_row:
+                from webapp.backend.services.maintainer_service import MaintainerService
+                maintainer_srv = MaintainerService()
+                subsystems = maintainer_srv.resolve_subsystems_for_file(vname, norm_path)
+
+                cursor.execute("SELECT fnid FROM m_file_name WHERE fname = %s LIMIT 1;", (norm_path,))
+                fn_match = cursor.fetchone()
+                fallback_fid = fn_match["fnid"] if fn_match else None
+
+                return {
+                    "type": "file",
+                    "is_binary": False,
+                    "version": vname,
+                    "vid": vid,
+                    "path": norm_path,
+                    "file_info": {
+                        "fid": fallback_fid,
+                        "fnid": fallback_fid,
+                        "fname": norm_path,
+                        "ftype": 1,
+                        "vid_s": vid,
+                        "vid_e": 0,
+                        "vname_s": vname,
+                        "vname_e": "Active",
+                        "added_version": vname,
+                        "s_stat": "A",
+                        "e_stat": "0",
+                        "s_stat_label": "Added",
+                        "e_stat_label": "Active",
                         "file_size": file_size,
-                        "path": norm_path,
-                        "version": vname,
-                        "fid": fid,
-                        "message": "Binary file cannot be displayed.",
-                    }
+                        "history": [
+                            {
+                                "fid": fallback_fid,
+                                "vid_s": vid,
+                                "vid_e": 0,
+                                "vname_s": vname,
+                                "vname_e": "Active",
+                                "s_stat": "A",
+                                "e_stat": "0",
+                                "s_stat_label": "Added",
+                                "e_stat_label": "Active",
+                            }
+                        ],
+                    },
+                    "content": raw_content,
+                    "tokens": [],
+                    "token_count": 0,
+                    "subsystems": subsystems,
+                    "used_by": {"total": 0, "counts": {}, "references": []},
+                }
 
-            with open(target_path, "r", encoding="utf-8", errors="replace") as fp:
-                raw_content = fp.read()
+            fid = f_row["fid"]
+            fnid = f_row["fnid"]
 
             # 3. Compact AST token maps: [line_s, char_s, line_e, char_e, ast_id, type_id]
             token_cache_key = (vname, norm_path)
@@ -288,14 +350,18 @@ class FilesystemService:
         norm_path = path.strip().strip("/")
         if not norm_path:
             return self.get_tree(version_name, "")
-        
-        target_path = resolve_and_verify_repo_path(norm_path)
-        if target_path.is_dir():
+        if not is_safe_rel_path(norm_path):
+            raise HTTPException(status_code=400, detail="Path traversal attempt detected.")
+
+        obj_type, _, _ = git_reader.read_object(version_name, norm_path)
+        if obj_type == "tree":
             return self.get_tree(version_name, norm_path)
         return self.get_file(version_name, norm_path)
 
-    def get_file_references(self, version_name: str, fid: int, ref_type: str | None = None) -> dict[str, Any]:
+    def get_file_references(self, version_name: str, fid: int | None, ref_type: str | None = None) -> dict[str, Any]:
         """Query incoming cross-file references from m_file_reference."""
+        if fid is None:
+            return {"total": 0, "counts": {}, "references": []}
         with get_db_cursor() as cursor:
             vid, vname = get_version_info(cursor, version_name)
             if vid is None:
@@ -377,6 +443,12 @@ class FilesystemService:
             )
             r = cursor.fetchone()
             if not r:
+                # Fallback: check if fid corresponds to an fnid in m_file_name
+                cursor.execute("SELECT fname FROM m_file_name WHERE fnid = %s LIMIT 1;", (fid,))
+                fn_r = cursor.fetchone()
+                if fn_r:
+                    v_target = version_name or "v3.0"
+                    return self.get_file(str(v_target), safe_decode(fn_r["fname"]))
                 raise HTTPException(status_code=404, detail=f"File with FID {fid} not found.")
 
             v_target = version_name or r["vid"]

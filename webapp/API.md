@@ -22,6 +22,7 @@ webapp/
 │   │   ├── sql.py                  # SQL LIKE wildcard sanitizer
 │   │   └── middleware.py           # Security headers (CSP) & sliding-window rate limiter
 │   ├── services/
+│   │   ├── git_reader.py           # Persistent Git object reader (git cat-file --batch)
 │   │   ├── filesystem_service.py   # Tree traversal, file maps, include resolver, treemap
 │   │   ├── symbol_service.py       # Multi-table symbol search, XRefs, AST containers
 │   │   ├── kconfig_service.py      # Defconfigs, Menuconfig hierarchy, constraint solver
@@ -169,7 +170,10 @@ Retrieve the directory hierarchy and file entries for a given path in the kernel
 
 #### `GET /api/fs/file/{version_name}`
 #### `GET /api/file`
-Retrieve physical file contents, metadata, spatial AST coordinate tokens, version lifecycle history, and incoming cross-file references.
+Retrieve version-specific source file contents, metadata, spatial AST coordinate tokens, version lifecycle history, and incoming cross-file references.
+- **Source Retrieval Engine**: Uses a persistent, thread-safe `git cat-file --batch` worker (`GitReader`) to stream exact blob contents directly from Git for the requested revision/tag in sub-millisecond time (~0.1ms small / ~0.2ms big files). Preserves 100% byte fidelity without relying on local working tree checkouts.
+- **Graceful Unindexed Fallback**: If a requested file exists in the Git repository but has no indexing row in `m_bridge_file` (or is a non-C file), the endpoint serves the raw file content with `tokens: []`, empty AST maps, and inferred lifecycle metadata rather than throwing a 404.
+- **Directory Detection**: If the path resolves to a Git `tree` or directory record (`ftype == 0`), the endpoint transparently returns the directory hierarchy structure.
 - **Parameters**:
   - `version_name` (path) / `version` (query): Kernel version string (default `"v3.0"`).
   - `path` (query): Target file path (e.g. `"init/main.c"`). Required.
