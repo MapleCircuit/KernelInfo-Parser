@@ -272,6 +272,10 @@ class TECachedDB(TEDirectDB):
                 self.queued_set[table_id] = {}
                 self.queued_update[table_id] = []
                 self._ensure_table(table_id)
+                if table.no_duplicate:
+                    self._committed_nodup_keys[table_id] = dict(self._nodup_index.get(table_id, {}))
+                if table.primary == ("hash",) or table.table_name in ("m_tag_code", "m_ast_hash"):
+                    self._committed_pks[table_id] = set(self._pk_index.get(table_id, {}).keys())
                 if self.db is not None:
                     try:
                         self.next_id[table_id] = self.db.get_next_id(table)
@@ -338,6 +342,13 @@ class TECachedDB(TEDirectDB):
                             pk = self._sanitize_key(pk_fn(proj_row) if pk_fn is not None else itemgetter(*table.primary)(proj_row))
                             self._cached_rows_pos[table_id][pk] = pos
                         self._index_row(table, proj_row)
+
+        for table in self.tables.values():
+            t_id = table.table_id
+            if table.no_duplicate:
+                self._committed_nodup_keys[t_id] = dict(self._nodup_index.get(t_id, {}))
+            if table.primary == ("hash",) or table.table_name in ("m_tag_code", "m_ast_hash"):
+                self._committed_pks[t_id] = set(self._pk_index.get(t_id, {}).keys())
 
         # Build structured shared memory segment with huge pages if enabled
         if self.hugepages != "off" and any(self._cached_rows.values()):

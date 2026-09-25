@@ -12,6 +12,7 @@ from core.config import (
     get_db_config,
     get_webapp_config,
     get_parser_config,
+    get_ssh_tunnel_config,
     init_config,
 )
 
@@ -27,3 +28,8 @@ def get_backend_db_config() -> dict[str, Any]:
 def get_backend_server_config() -> dict[str, Any]:
     """Retrieve verified web application server bindings."""
     return get_webapp_config()
+
+
+def get_backend_ssh_tunnel_config() -> dict[str, Any]:
+    """Retrieve verified SSH tunnel configuration."""
+    return get_ssh_tunnel_config()

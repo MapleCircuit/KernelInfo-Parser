@@ -47,9 +47,9 @@ Any database backend assigned to `G.DB` or passed to `TableEngine.start()` must 
 
 ### 2.4. Batch Insert, Upsert & Parallel Commits
 - **`insert(table: Table, data: tuple[tuple[SafeDataType, ...], ...] | tuple[SafeDataType, ...]) -> None`**
-  - Batch executes parameterized `INSERT INTO table VALUES (%s, ...)`. Chunks batches into 1000-row slices and commits.
+  - Batch executes parameterized `INSERT INTO table VALUES (%s, ...)`. Dynamically sizes batches based on table schema: tables with `TEXT`, `LONGTEXT`, or `BLOB` columns (e.g. `m_tag_code`) are capped at <= 500 rows and <= 4MB estimated payload, while regular tables use <= 2000 rows (or <= 5000 rows for short tables) and <= 8MB. On `OperationalError 1153` (`ER_NET_PACKET_TOO_LARGE` / `max_allowed_packet`), recursively bisects chunks into halves until execution succeeds. Commits transaction.
 - **`update(table: Table, data: tuple[tuple[SafeDataType, ...], ...] | tuple[SafeDataType, ...]) -> None`**
-  - Batch executes upsert `INSERT INTO table VALUES (...) ON DUPLICATE KEY UPDATE col=VALUES(col)` for all non-primary key columns.
+  - Batch executes upsert `INSERT INTO table VALUES (...) ON DUPLICATE KEY UPDATE col=VALUES(col)` for all non-primary key columns. Uses dynamic byte-bounded chunking and recursive bisection on packet limit errors. Commits transaction.
 - **`commit_tables_parallel(tables_data: Sequence[tuple[Table, Sequence[tuple], Sequence[tuple]]], max_workers: int | None = None) -> None`**
   - Flushes insert and update payloads across multiple tables concurrently using dedicated worker connection threads.
 

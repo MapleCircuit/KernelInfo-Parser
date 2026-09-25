@@ -27,6 +27,7 @@ DEFAULT_CONFIG: dict[str, dict[str, Any]] = {
         "database": "test",
         "timeout": 10,
         "engine": "mariadb",
+        "ssl_disabled": False,
     },
     "webapp": {
         "host": "0.0.0.0",
@@ -39,6 +40,19 @@ DEFAULT_CONFIG: dict[str, dict[str, Any]] = {
         "fidelity": True,
         "mem_max": 60,
         "hugepages": "auto",
+    },
+    "ssh_tunnel": {
+        "enabled": False,
+        "host": "",
+        "port": 22,
+        "user": "",
+        "password": "",
+        "key_file": "",
+        "remote_host": "127.0.0.1",
+        "remote_port": 3306,
+        "local_port": 0,
+        "strict_host_key_checking": "accept-new",
+        "connect_timeout": 10,
     },
 }
 
@@ -149,7 +163,10 @@ def sync_environ(cfg: dict[str, dict[str, Any]]) -> None:
         "MYSQL_DATABASE": database,
         "DB_TIMEOUT": timeout,
         "MYSQL_TIMEOUT": timeout,
+        "DB_SSL_DISABLED": "true" if db_cfg.get("ssl_disabled") else "false",
+        "MYSQL_SSL_DISABLED": "true" if db_cfg.get("ssl_disabled") else "false",
         "TE_HUGEPAGES": str(cfg.get("parser", {}).get("hugepages", "auto")),
+        "SSH_TUNNEL_ENABLED": "true" if cfg.get("ssh_tunnel", {}).get("enabled") else "false",
     }
     for k, v in vars_to_sync.items():
         os.environ[k] = v
@@ -214,6 +231,11 @@ def load_config(config_path: str | Path | None = None) -> dict[str, dict[str, An
     if env_db_engine := _get_user_env("DB_ENGINE"):
         db_sec["engine"] = env_db_engine
 
+    if env_db_ssl_disabled := (_get_user_env("DB_SSL_DISABLED") or _get_user_env("MYSQL_SSL_DISABLED")):
+        db_sec["ssl_disabled"] = _coerce_bool(env_db_ssl_disabled, db_sec.get("ssl_disabled", False))
+    else:
+        db_sec["ssl_disabled"] = _coerce_bool(db_sec.get("ssl_disabled"), False)
+
     webapp_sec = merged["webapp"]
     if env_wa_host := (_get_user_env("HOST") or _get_user_env("WEBAPP_HOST")):
         webapp_sec["host"] = env_wa_host
@@ -241,6 +263,48 @@ def load_config(config_path: str | Path | None = None) -> dict[str, dict[str, An
         parser_sec["hugepages"] = env_p_hp.lower().strip()
     else:
         parser_sec["hugepages"] = str(parser_sec.get("hugepages", "auto")).lower().strip()
+
+    if "ssh_tunnel" not in merged:
+        merged["ssh_tunnel"] = copy.deepcopy(DEFAULT_CONFIG["ssh_tunnel"])
+    ssh_sec = merged["ssh_tunnel"]
+
+    if env_ssh_enabled := (_get_user_env("SSH_TUNNEL_ENABLED") or _get_user_env("SSH_TUNNEL")):
+        ssh_sec["enabled"] = _coerce_bool(env_ssh_enabled, ssh_sec.get("enabled", False))
+    else:
+        ssh_sec["enabled"] = _coerce_bool(ssh_sec.get("enabled"), False)
+
+    if env_ssh_host := _get_user_env("SSH_HOST"):
+        ssh_sec["host"] = env_ssh_host
+    if env_ssh_port := _get_user_env("SSH_PORT"):
+        ssh_sec["port"] = _coerce_int(env_ssh_port, ssh_sec.get("port", 22))
+    else:
+        ssh_sec["port"] = _coerce_int(ssh_sec.get("port"), 22)
+
+    if env_ssh_user := _get_user_env("SSH_USER"):
+        ssh_sec["user"] = env_ssh_user
+    if env_ssh_pass := _get_user_env("SSH_PASSWORD"):
+        ssh_sec["password"] = env_ssh_pass
+    if env_ssh_key := _get_user_env("SSH_KEY_FILE"):
+        ssh_sec["key_file"] = env_ssh_key
+
+    if env_ssh_remote_host := _get_user_env("SSH_REMOTE_HOST"):
+        ssh_sec["remote_host"] = env_ssh_remote_host
+    if env_ssh_remote_port := _get_user_env("SSH_REMOTE_PORT"):
+        ssh_sec["remote_port"] = _coerce_int(env_ssh_remote_port, ssh_sec.get("remote_port", 3306))
+    else:
+        ssh_sec["remote_port"] = _coerce_int(ssh_sec.get("remote_port"), 3306)
+
+    if env_ssh_local_port := _get_user_env("SSH_LOCAL_PORT"):
+        ssh_sec["local_port"] = _coerce_int(env_ssh_local_port, ssh_sec.get("local_port", 0))
+    else:
+        ssh_sec["local_port"] = _coerce_int(ssh_sec.get("local_port"), 0)
+
+    if env_ssh_host_check := _get_user_env("SSH_STRICT_HOST_KEY_CHECKING"):
+        ssh_sec["strict_host_key_checking"] = env_ssh_host_check
+    if env_ssh_conn_timeout := _get_user_env("SSH_CONNECT_TIMEOUT"):
+        ssh_sec["connect_timeout"] = _coerce_int(env_ssh_conn_timeout, ssh_sec.get("connect_timeout", 10))
+    else:
+        ssh_sec["connect_timeout"] = _coerce_int(ssh_sec.get("connect_timeout"), 10)
 
     # 4. Synchronize into os.environ for low-level and child worker compatibility
     sync_environ(merged)
@@ -276,6 +340,11 @@ def get_webapp_config() -> dict[str, Any]:
 def get_parser_config() -> dict[str, Any]:
     """Retrieve active parser configuration section."""
     return get_config().get("parser", copy.deepcopy(DEFAULT_CONFIG["parser"]))
+
+
+def get_ssh_tunnel_config() -> dict[str, Any]:
+    """Retrieve active SSH tunnel configuration section."""
+    return get_config().get("ssh_tunnel", copy.deepcopy(DEFAULT_CONFIG["ssh_tunnel"]))
 
 
 def reset_config() -> None:

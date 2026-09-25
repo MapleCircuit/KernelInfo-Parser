@@ -4,6 +4,7 @@ import os
 import tempfile
 import unittest
 from unittest import mock
+from unittest.mock import patch
 from pathlib import Path
 
 from core.config import (
@@ -37,11 +38,12 @@ class TestConfigManagement(unittest.TestCase):
         for k in ["DB_HOST", "MYSQL_HOST", "DB_PORT", "MYSQL_PORT", "HOST", "PORT", "CONFIG_FILE"]:
             os.environ.pop(k, None)
 
-        cfg = load_config(config_path=None)
-        self.assertEqual(cfg["database"]["port"], 3306)
-        self.assertEqual(cfg["database"]["user"], "root")
-        self.assertEqual(cfg["webapp"]["port"], 8000)
-        self.assertEqual(cfg["parser"]["table_engine"], "cached")
+        with patch("core.config.find_config_path", return_value=None):
+            cfg = load_config(config_path=None)
+            self.assertEqual(cfg["database"]["port"], 3306)
+            self.assertEqual(cfg["database"]["user"], "root")
+            self.assertEqual(cfg["webapp"]["port"], 8000)
+            self.assertEqual(cfg["parser"]["table_engine"], "cached")
 
     def test_load_custom_config_file(self) -> None:
         """Config file values override defaults."""

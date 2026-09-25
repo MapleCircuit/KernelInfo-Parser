@@ -385,3 +385,41 @@ Main Process (STEP 6.1+: Post-Processing Subsystems) TableEngine (G.TE)         
   │  └─ G.TE.commit_all(update_in_mem_indexes=False) ──────────────────────────────►│
 ==================================================================================================
 ```
+
+---
+
+## 7. Configuration & SSH Port Forwarding Subsystem (`core/config.py` & `core/ssh_tunnel.py`)
+
+### 7.1. Unified Configuration Hierarchy
+- Configuration settings follow strict precedence: `CLI Flags > Environment Variables > config.json > Built-in Defaults`.
+- Sections:
+  - `"database"`: MariaDB/MySQL connection settings (`host`, `port`, `user`, `password`, `database`, `timeout`, `engine`).
+  - `"webapp"`: FastApi server settings (`host`, `port`, `reload`).
+  - `"parser"`: TableEngine, memory mode, fidelity auditing, memory limits (`table_engine`, `memory_mode`, `fidelity`, `mem_max`, `hugepages`).
+  - `"ssh_tunnel"`: Secure remote database port forwarding configuration (`enabled`, `host`, `port`, `user`, `password`, `key_file`, `remote_host`, `remote_port`, `local_port`, `strict_host_key_checking`, `connect_timeout`).
+- Functions: `init_config(path)`, `get_config()`, `get_db_config()`, `get_webapp_config()`, `get_parser_config()`, `get_ssh_tunnel_config()`, `sync_environ(cfg)`.
+
+### 7.2. SSH Tunnel Manager (`SSHTunnelManager`)
+- **Purpose**: Encrypts and forwards remote MariaDB connections across hosts, allowing local orchestration workers to fill remote database instances without exposing MariaDB directly over public networks. Disabled by default (`enabled: false`).
+- **Subprocess Execution**: Uses system OpenSSH binary (`/usr/bin/ssh`) via `subprocess.Popen` with `-N -L <local_port>:<remote_host>:<remote_port>`, `-o ExitOnForwardFailure=yes`, `-o ServerAliveInterval=15`, `-o ServerAliveCountMax=3`.
+- **Dynamic Port Binding**: If `local_port` is 0 or already occupied, dynamically allocates an ephemeral localhost port to avoid collisions with any local MySQL services running on 3306.
+- **Authentication**:
+  - Private key: Configurable path via `key_file` (`-i <key> -o IdentitiesOnly=yes`).
+  - Password: Supports non-interactive authentication via `sshpass` (if installed) or dynamically provisioned secure `SSH_ASKPASS` helper scripts (with `SSH_ASKPASS_REQUIRE=force`).
+  - User: Custom login username via `-l <user>` / `user@host`.
+  - Host Key Verification: Defaults to `accept-new`, configurable to `no` or `yes`.
+- **Lifecycle Integration**:
+  - Invoked during application startup (`start_ssh_tunnel(cfg)`).
+  - Probes local port socket connectivity until listening (up to `connect_timeout` seconds) before declaring readiness.
+  - Automatically updates active configuration `db_cfg["host"] = "127.0.0.1"`, `db_cfg["port"] = local_port` and calls `sync_environ()`, transparently routing `G.DB` and all multiprocessing workers through the tunnel.
+  - Teardown registered via `atexit.register(stop_ssh_tunnel)` and `G.emergency_shutdown()`.
+
+### 7.3. Cross-Chunk Deduplication & Multiprocessing Fork Safety
+- **Cross-Chunk Deduplication**: Intermediate chunk commits (`G.TE.commit_all()`) flush and clear staged queues (`queued_set`). To prevent subsequent ChangeSets or waves from attempting duplicate `INSERT INTO` queries for already-committed rows:
+  - TableEngine tracks committed records across chunks using `_committed_nodup_keys` (mapping unique column keys to assigned sequence IDs for `no_duplicate=True` tables such as `m_file_name`) and `_committed_pks` (tracking 32-byte cryptographic hashes for `m_tag_code` and `m_ast_hash`).
+  - During `commit()` and `commit_all()`, staged rows matching previously committed keys/hashes are filtered out before dispatching batch inserts.
+  - In `trigger_multicore()`, all file paths (`regular_files + symlink_files`) are pre-populated into `m_file_name` and committed before worker processes are forked, ensuring stable sequence ID assignment.
+- **Multiprocessing Socket Refresh**:
+  - The parent process must never call `start_new_db(..., is_worker=True)` after forking workers, as this resets in-memory caches and destroys preloaded table state.
+  - The parent process refreshes its dedicated database socket (`if G.TE.db: G.TE.db.close(); G.TE.db = G.DB()`) to avoid socket descriptor sharing across `fork()` without altering cached state or staging queues.
+

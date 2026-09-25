@@ -59,7 +59,8 @@ from core.globalstuff import (
     setup_memory_limit,
     FileRefType,
 )
-from core.config import init_config, get_parser_config, get_db_config
+from core.config import init_config, get_parser_config, get_db_config, get_ssh_tunnel_config
+from core.ssh_tunnel import start_ssh_tunnel, stop_ssh_tunnel
 import os
 import sys
 
@@ -512,7 +513,13 @@ class DependencyScheduler:
                     extract_tags_and_evacuate_cs(cs_obj)
                     self.gp.ChangeSet_Dict[path] = cs_obj
                     if self.executed_count % self.chunk_commit_interval == 0:
-                        G.TE.commit_all()
+                        try:
+                            G.TE.commit_all()
+                        except Exception as commit_err:
+                            logger.warning(f"Chunk commit hit transient error ({commit_err}); re-verifying DB connection and retrying...")
+                            if hasattr(G.DB, "check_if_connected"):
+                                G.DB.check_if_connected()
+                            G.TE.commit_all()
                         reclaim_system_memory()
                 else:
                     # Unresolvable reference: defer to final wave pass
@@ -785,6 +792,18 @@ def trigger_multicore(batch_size: int | None = None, scheduler: DependencySchedu
             scheduler.ingest_batch(dict(gp.ChangeSet_Dict), is_header_stage=False)
         return
 
+    # Pre-populate all file paths into m_file_name and commit before forking.
+    # This guarantees that all current version files exist in m_file_name with assigned IDs,
+    # preventing race conditions or duplicate sequence ID assignments across worker chunks.
+    for item in (regular_files + symlink_files):
+        if not item:
+            continue
+        parts = item.split("\t")
+        for p in parts[1:]:
+            if p:
+                G.TE.set(m_file_name.table_id, (None, p))
+    G.TE.commit(m_file_name.table_id)
+
     # Close active DB connection in parent before forking child worker processes
     # to prevent inherited socket file descriptor sharing / corruption across fork
     if getattr(G.TE, "db", None) is not None:
@@ -819,7 +838,13 @@ def trigger_multicore(batch_size: int | None = None, scheduler: DependencySchedu
         p.start()
 
     # Re-initialize dedicated DB connection in parent process after workers have forked
-    G.TE.start_new_db(G.DB, is_worker=True)
+    # without destroying parent in-memory caches and preloaded tables
+    if getattr(G.TE, "db", None) is not None:
+        try:
+            G.TE.db.close()
+        except Exception:
+            pass
+    G.TE.db = G.DB()
 
     # needs to be try: protected
     processing_dirs()
@@ -871,7 +896,10 @@ def trigger_multicore(batch_size: int | None = None, scheduler: DependencySchedu
                 if compressed is not None:
                     early_source_batches.append((batch_id, compressed))
         except Exception as e:
-            logger.error(f"Error reading header batch result: {e}")
+            logger.error(f"Error reading header batch result: {e}", exc_info=True)
+            for p in processes:
+                if p.is_alive():
+                    p.terminate()
             break
         reclaim_system_memory()
 
@@ -934,13 +962,19 @@ def trigger_multicore(batch_size: int | None = None, scheduler: DependencySchedu
                     f"({velocity:.1f} batches/s, {finished_workers}/{num_workers} workers done, elapsed {elapsed:.1f}s)"
                 )
         except Exception as e:
-            logger.error(f"Error reading source batch result: {e}")
+            logger.error(f"Error reading source batch result: {e}", exc_info=True)
+            for p in processes:
+                if p.is_alive():
+                    p.terminate()
             break
         reclaim_system_memory()
 
     failed_workers = 0
     for p in processes:
-        p.join()
+        p.join(timeout=5.0)
+        if p.is_alive():
+            p.kill()
+            p.join(timeout=1.0)
         if p.exitcode != 0:
             failed_workers += 1
             logger.error(COLOR.red(f"Worker PID {p.pid} terminated abnormally with exit code {p.exitcode}"))
@@ -984,6 +1018,8 @@ def main() -> None:
                 db.create_index("v_main_index", m_v_main, (m_v_main.vname,))
             except Exception:
                 pass
+            if hasattr(G.TE, "start_new_db") and getattr(G.TE, "tables", None):
+                G.TE.start_new_db(G.DB, is_worker=False)
         else:
             missing = db.test_tables(gp.Table_Array)
             if missing:
@@ -1189,11 +1225,110 @@ def arg_handling() -> argparse.Namespace:
         const="off",
         help="Disable huge-page shared memory backing in TableEngine",
     )
+    parser.add_argument(
+        "--ssh-tunnel",
+        dest="ssh_tunnel",
+        action="store_true",
+        default=None,
+        help="Enable SSH port forwarding tunnel to remote MariaDB server",
+    )
+    parser.add_argument(
+        "--no-ssh-tunnel",
+        dest="ssh_tunnel",
+        action="store_false",
+        help="Disable SSH port forwarding tunnel to remote MariaDB server",
+    )
+    parser.add_argument(
+        "--ssh-host",
+        dest="ssh_host",
+        default=None,
+        help="Remote SSH server hostname or IP address",
+    )
+    parser.add_argument(
+        "--ssh-port",
+        dest="ssh_port",
+        type=int,
+        default=None,
+        help="Remote SSH server port (default: 22)",
+    )
+    parser.add_argument(
+        "--ssh-user",
+        dest="ssh_user",
+        default=None,
+        help="Username for SSH authentication",
+    )
+    parser.add_argument(
+        "--ssh-password",
+        dest="ssh_password",
+        default=None,
+        help="Password for SSH authentication",
+    )
+    parser.add_argument(
+        "--ssh-key-file",
+        dest="ssh_key_file",
+        default=None,
+        help="Path to SSH private key file",
+    )
+    parser.add_argument(
+        "--ssh-remote-host",
+        dest="ssh_remote_host",
+        default=None,
+        help="Target database host from remote server perspective (default: 127.0.0.1)",
+    )
+    parser.add_argument(
+        "--ssh-remote-port",
+        dest="ssh_remote_port",
+        type=int,
+        default=None,
+        help="Target database port on remote server (default: 3306)",
+    )
+    parser.add_argument(
+        "--ssh-local-port",
+        dest="ssh_local_port",
+        type=int,
+        default=None,
+        help="Local port to bind SSH forward to (default: 0 for dynamic ephemeral port)",
+    )
+    parser.add_argument(
+        "--ssh-strict-host-key-checking",
+        dest="ssh_strict_host_key_checking",
+        choices=["accept-new", "no", "yes"],
+        default=None,
+        help="SSH host key verification mode (default: accept-new)",
+    )
     args = parser.parse_args()
 
     init_config(args.config)
     parser_cfg = get_parser_config()
     db_cfg = get_db_config()
+    ssh_cfg = get_ssh_tunnel_config()
+
+    # Apply CLI argument overrides for SSH tunnel (CLI > ENV > JSON > Defaults)
+    if args.ssh_tunnel is not None:
+        ssh_cfg["enabled"] = args.ssh_tunnel
+    if args.ssh_host is not None:
+        ssh_cfg["host"] = args.ssh_host
+    if args.ssh_port is not None:
+        ssh_cfg["port"] = args.ssh_port
+    if args.ssh_user is not None:
+        ssh_cfg["user"] = args.ssh_user
+    if args.ssh_password is not None:
+        ssh_cfg["password"] = args.ssh_password
+    if args.ssh_key_file is not None:
+        ssh_cfg["key_file"] = args.ssh_key_file
+    if args.ssh_remote_host is not None:
+        ssh_cfg["remote_host"] = args.ssh_remote_host
+    if args.ssh_remote_port is not None:
+        ssh_cfg["remote_port"] = args.ssh_remote_port
+    if args.ssh_local_port is not None:
+        ssh_cfg["local_port"] = args.ssh_local_port
+    if args.ssh_strict_host_key_checking is not None:
+        ssh_cfg["strict_host_key_checking"] = args.ssh_strict_host_key_checking
+
+    if ssh_cfg.get("enabled"):
+        start_ssh_tunnel(ssh_cfg)
+        # Re-fetch db_cfg since start_ssh_tunnel reroutes host and port
+        db_cfg = get_db_config()
 
     if args.very_low_mem:
         G.MEMORY_MODE = "very_low"

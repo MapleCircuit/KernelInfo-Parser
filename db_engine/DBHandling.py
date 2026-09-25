@@ -102,10 +102,45 @@ Any database driver class (e.g., MariaDB, PostgreSQL, SQLite, DuckDB) assigned t
 """
 from __future__ import annotations
 
+import logging
 import os
+import ssl
+import time
 from typing import TYPE_CHECKING, Any, Sequence, Self
 from types import TracebackType
 import mysql.connector
+
+# Python 3.12 compatibility shim: mysql.connector calls ssl.wrap_socket which was removed in 3.12
+if not hasattr(ssl, "wrap_socket"):
+    def _compat_wrap_socket(
+        sock: Any,
+        keyfile: str | None = None,
+        certfile: str | None = None,
+        server_side: bool = False,
+        cert_reqs: int = ssl.CERT_NONE,
+        ssl_version: Any = None,
+        ca_certs: str | None = None,
+        do_handshake_on_connect: bool = True,
+        suppress_ragged_eofs: bool = True,
+        ciphers: str | None = None,
+    ) -> Any:
+        context = ssl.create_default_context() if not server_side else ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.check_hostname = False
+        context.verify_mode = cert_reqs
+        if ca_certs:
+            context.load_verify_locations(ca_certs)
+        if certfile:
+            context.load_cert_chain(certfile, keyfile)
+        if ciphers:
+            context.set_ciphers(ciphers)
+        return context.wrap_socket(
+            sock,
+            server_side=server_side,
+            do_handshake_on_connect=do_handshake_on_connect,
+            suppress_ragged_eofs=suppress_ragged_eofs,
+        )
+
+    ssl.wrap_socket = _compat_wrap_socket
 from core.globalstuff import (
     G,
     PointerGetter,
@@ -123,6 +158,8 @@ MAX_ALLOWED_PACKET = 1073741824
 MAX_JOIN_TABLES = 50
 CHUNK_JOIN_SIZE = 30
 MAX_CANDIDATE_BATCH = 500
+
+logger = logging.getLogger(__name__)
 
 
 class MariaDB(BaseDBEngine):
@@ -148,6 +185,7 @@ class MariaDB(BaseDBEngine):
         self.db_name = os.getenv("DB_NAME", "test")
         self.host = os.getenv("DB_HOST")
         self.port = int(os.getenv("DB_PORT", "3306"))
+        self.ssl_disabled = os.getenv("DB_SSL_DISABLED", "").lower() in ("true", "1", "yes")
         self.cnx = self.connect_sql()
         self.cursor = self.cnx.cursor()
         self._select_sql_cache: dict[tuple[int, tuple[bool, ...]], str] = {}
@@ -286,14 +324,18 @@ class MariaDB(BaseDBEngine):
         else:
             mysql_host = "localhost"
 
-        return mysql.connector.connect(
-            host=mysql_host,
-            port=self.port,
-            user=self.user,
-            password=self.password,
-            database=self.db_name,
-            autocommit=True,
-        )
+        conn_kwargs: dict[str, Any] = {
+            "host": mysql_host,
+            "port": self.port,
+            "user": self.user,
+            "password": self.password,
+            "database": self.db_name,
+            "autocommit": True,
+        }
+        if self.ssl_disabled:
+            conn_kwargs["ssl_disabled"] = True
+
+        return mysql.connector.connect(**conn_kwargs)
 
     def check_if_connected(self) -> None:
         """Verify connection health and automatically reconnect if dropped.
@@ -318,7 +360,7 @@ class MariaDB(BaseDBEngine):
                     self.cursor = self.cnx.cursor()
                 return
             except Exception:
-                pass
+                self.close()
 
         for attempt in range(3):
             print(f"No SQL connection. Reconnection attempt {attempt + 1}/3...")
@@ -330,6 +372,7 @@ class MariaDB(BaseDBEngine):
             except (mysql.connector.Error, Exception) as e:
                 if attempt == 2:
                     raise ConnectionError(f"Failed to reconnect to database after 3 attempts: {e}") from e
+                time.sleep(0.5 * (attempt + 1))
 
     def test_tables(self, tables: Sequence[Table] | Table) -> list[str] | None:
         """Test existence of registered schema tables in database catalog.
@@ -479,30 +522,91 @@ class MariaDB(BaseDBEngine):
 
         sql = f"INSERT INTO `{table.table_name}` VALUES ({','.join(('%s',) * table.length)})"
 
-        if isinstance(data[0], (tuple, list)):
-            batch_size = 10000 if table.length <= 8 else 2000
-            for i in range(0, len(data), batch_size):
-                chunk = data[i : i + batch_size]
+        has_large_cols = any(
+            any(t in col[1].upper() for t in ("TEXT", "BLOB", "LONGTEXT", "MEDIUMTEXT"))
+            for col in table.init_columns
+        ) or table.table_name in ("m_tag_code", "m_commit", "m_credits_entry")
+
+        max_rows = 500 if has_large_cols else (5000 if table.length <= 4 else 2000)
+        max_bytes = 4 * 1024 * 1024 if has_large_cols else 8 * 1024 * 1024
+
+        def _estimate_row_bytes(row: Sequence[Any]) -> int:
+            return sum(len(x) if isinstance(x, (str, bytes, bytearray, memoryview)) else 8 for x in row)
+
+        def _exec_chunk(chunk_data: Sequence[tuple[SafeDataType, ...]]) -> None:
+            if not chunk_data:
+                return
+            for attempt in range(3):
                 self.check_if_connected()
-                for attempt in range(3):
-                    try:
-                        self.cursor.executemany(sql, chunk)
-                        break
-                    except (mysql.connector.OperationalError, mysql.connector.InterfaceError, OSError):
-                        self.check_if_connected()
+                try:
+                    self.cursor.executemany(sql, chunk_data)
+                    return
+                except mysql.connector.Error as err:
+                    # Adaptive bisection on packet too large (errno 1153)
+                    if (getattr(err, "errno", None) == 1153 or "max_allowed_packet" in str(err).lower()) and len(chunk_data) > 1:
+                        mid = len(chunk_data) // 2
+                        logger.warning(
+                            f"Packet exceeded max_allowed_packet inserting into '{table.table_name}' with {len(chunk_data)} rows. "
+                            f"Bisecting into chunks of {mid} and {len(chunk_data) - mid} rows..."
+                        )
+                        _exec_chunk(chunk_data[:mid])
+                        _exec_chunk(chunk_data[mid:])
+                        return
+                    if isinstance(err, (mysql.connector.OperationalError, mysql.connector.InterfaceError)):
+                        self.close()
                         if attempt == 2:
                             raise
-                        self.close()
+                        time.sleep(0.2 * (attempt + 1))
+                        continue
+                    logger.error(
+                        f"Database error executing executemany on table '{table.table_name}': {err}. "
+                        f"Batch size: {len(chunk_data)}, total data: {len(data)}. "
+                        f"First sample row: {chunk_data[0] if chunk_data else None}"
+                    )
+                    raise
+                except (OSError, AttributeError):
+                    self.close()
+                    if attempt == 2:
+                        raise
+                    time.sleep(0.2 * (attempt + 1))
+
+        if isinstance(data[0], (tuple, list)):
+            current_chunk = []
+            current_bytes = 0
+            for row in data:
+                r_bytes = _estimate_row_bytes(row)
+                if current_chunk and (len(current_chunk) >= max_rows or (current_bytes + r_bytes > max_bytes)):
+                    _exec_chunk(current_chunk)
+                    current_chunk = [row]
+                    current_bytes = r_bytes
+                else:
+                    current_chunk.append(row)
+                    current_bytes += r_bytes
+            if current_chunk:
+                _exec_chunk(current_chunk)
         else:
             for attempt in range(3):
                 self.check_if_connected()
                 try:
                     self.cursor.execute(sql, data)
                     break
-                except (mysql.connector.OperationalError, mysql.connector.InterfaceError, OSError):
+                except mysql.connector.Error as err:
+                    if isinstance(err, (mysql.connector.OperationalError, mysql.connector.InterfaceError)):
+                        self.close()
+                        if attempt == 2:
+                            raise
+                        time.sleep(0.2 * (attempt + 1))
+                        continue
+                    logger.error(
+                        f"Database error executing execute on table '{table.table_name}': {err}. "
+                        f"Row data: {data}"
+                    )
+                    raise
+                except (OSError, AttributeError):
+                    self.close()
                     if attempt == 2:
                         raise
-                    self.close()
+                    time.sleep(0.2 * (attempt + 1))
 
         self.check_if_connected()
         self.cnx.commit()
@@ -522,8 +626,8 @@ class MariaDB(BaseDBEngine):
             1. Constructs upsert SQL statement:
                `INSERT INTO table VALUES (...) ON DUPLICATE KEY UPDATE col=VALUES(col)`
                for all non-primary key columns.
-            2. If `data` is a batch tuple, chunks into 1000-row slices and executes `executemany` with auto-retry.
-            3. If single row, executes `execute` with auto-retry.
+            2. If `data` is a batch tuple, dynamically chunks rows by count and byte size.
+            3. On OperationalError 1153 (max_allowed_packet), bisects chunks into halves recursively.
             4. Commits transaction.
 
         Outputs:
@@ -541,29 +645,89 @@ class MariaDB(BaseDBEngine):
                 updatable_columns.append(f"`{column[0]}` = VALUES(`{column[0]}`)")
         sql += ", ".join(updatable_columns)
 
-        if isinstance(data[0], (tuple, list)):
-            batch_size = 1000
-            for i in range(0, len(data), batch_size):
-                chunk = data[i : i + batch_size]
-                for attempt in range(3):
-                    self.check_if_connected()
-                    try:
-                        self.cursor.executemany(sql, chunk)
-                        break
-                    except (mysql.connector.OperationalError, mysql.connector.InterfaceError, OSError):
+        has_large_cols = any(
+            any(t in col[1].upper() for t in ("TEXT", "BLOB", "LONGTEXT", "MEDIUMTEXT"))
+            for col in table.init_columns
+        ) or table.table_name in ("m_tag_code", "m_commit", "m_credits_entry")
+
+        max_rows = 500 if has_large_cols else 1000
+        max_bytes = 4 * 1024 * 1024 if has_large_cols else 8 * 1024 * 1024
+
+        def _estimate_row_bytes(row: Sequence[Any]) -> int:
+            return sum(len(x) if isinstance(x, (str, bytes, bytearray, memoryview)) else 8 for x in row)
+
+        def _exec_update_chunk(chunk_data: Sequence[tuple[SafeDataType, ...]]) -> None:
+            if not chunk_data:
+                return
+            for attempt in range(3):
+                self.check_if_connected()
+                try:
+                    self.cursor.executemany(sql, chunk_data)
+                    return
+                except mysql.connector.Error as err:
+                    if (getattr(err, "errno", None) == 1153 or "max_allowed_packet" in str(err).lower()) and len(chunk_data) > 1:
+                        mid = len(chunk_data) // 2
+                        logger.warning(
+                            f"Packet exceeded max_allowed_packet updating '{table.table_name}' with {len(chunk_data)} rows. "
+                            f"Bisecting into chunks of {mid} and {len(chunk_data) - mid} rows..."
+                        )
+                        _exec_update_chunk(chunk_data[:mid])
+                        _exec_update_chunk(chunk_data[mid:])
+                        return
+                    if isinstance(err, (mysql.connector.OperationalError, mysql.connector.InterfaceError)):
+                        self.close()
                         if attempt == 2:
                             raise
-                        self.close()
+                        time.sleep(0.2 * (attempt + 1))
+                        continue
+                    logger.error(
+                        f"Database error executing executemany update on table '{table.table_name}': {err}. "
+                        f"Batch size: {len(chunk_data)}. First sample row: {chunk_data[0] if chunk_data else None}"
+                    )
+                    raise
+                except (OSError, AttributeError):
+                    self.close()
+                    if attempt == 2:
+                        raise
+                    time.sleep(0.2 * (attempt + 1))
+
+        if isinstance(data[0], (tuple, list)):
+            current_chunk = []
+            current_bytes = 0
+            for row in data:
+                r_bytes = _estimate_row_bytes(row)
+                if current_chunk and (len(current_chunk) >= max_rows or (current_bytes + r_bytes > max_bytes)):
+                    _exec_update_chunk(current_chunk)
+                    current_chunk = [row]
+                    current_bytes = r_bytes
+                else:
+                    current_chunk.append(row)
+                    current_bytes += r_bytes
+            if current_chunk:
+                _exec_update_chunk(current_chunk)
         else:
             for attempt in range(3):
                 self.check_if_connected()
                 try:
                     self.cursor.execute(sql, data)
                     break
-                except (mysql.connector.OperationalError, mysql.connector.InterfaceError, OSError):
+                except mysql.connector.Error as err:
+                    if isinstance(err, (mysql.connector.OperationalError, mysql.connector.InterfaceError)):
+                        self.close()
+                        if attempt == 2:
+                            raise
+                        time.sleep(0.2 * (attempt + 1))
+                        continue
+                    logger.error(
+                        f"Database error executing execute update on table '{table.table_name}': {err}. "
+                        f"Row data: {data}"
+                    )
+                    raise
+                except (OSError, AttributeError):
+                    self.close()
                     if attempt == 2:
                         raise
-                    self.close()
+                    time.sleep(0.2 * (attempt + 1))
 
         self.check_if_connected()
         self.cnx.commit()
@@ -620,6 +784,12 @@ class MariaDB(BaseDBEngine):
                 except Exception:
                     pass
                 worker_db.cnx.commit()
+            except Exception as e:
+                logger.error(
+                    f"Failed parallel commit on table '{table.table_name}' "
+                    f"({len(insert_data)} inserts, {len(update_data)} updates): {e}"
+                )
+                raise
             finally:
                 worker_db.close()
 

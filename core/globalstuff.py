@@ -186,6 +186,9 @@ class GlobalStuff:
         for directory in sys.modules["__main__"].gp.PURGE_LIST:
             with contextlib.suppress(Exception):
                 shutil.rmtree(directory)
+        with contextlib.suppress(Exception):
+            from core.ssh_tunnel import stop_ssh_tunnel
+            stop_ssh_tunnel()
         sys.exit(number_error)
         return
 

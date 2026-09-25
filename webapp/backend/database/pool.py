@@ -1,5 +1,7 @@
 """webapp/backend/database/pool.py - Resilient Database Connection Pool."""
 from __future__ import annotations
+import os
+import ssl
 import time
 import logging
 from contextlib import contextmanager
@@ -7,6 +9,38 @@ from typing import Generator, Any
 import mysql.connector
 from mysql.connector import pooling
 from webapp.backend.config import get_backend_db_config
+
+# Python 3.12 compatibility shim: mysql.connector calls ssl.wrap_socket which was removed in 3.12
+if not hasattr(ssl, "wrap_socket"):
+    def _compat_wrap_socket(
+        sock: Any,
+        keyfile: str | None = None,
+        certfile: str | None = None,
+        server_side: bool = False,
+        cert_reqs: int = ssl.CERT_NONE,
+        ssl_version: Any = None,
+        ca_certs: str | None = None,
+        do_handshake_on_connect: bool = True,
+        suppress_ragged_eofs: bool = True,
+        ciphers: str | None = None,
+    ) -> Any:
+        context = ssl.create_default_context() if not server_side else ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.check_hostname = False
+        context.verify_mode = cert_reqs
+        if ca_certs:
+            context.load_verify_locations(ca_certs)
+        if certfile:
+            context.load_cert_chain(certfile, keyfile)
+        if ciphers:
+            context.set_ciphers(ciphers)
+        return context.wrap_socket(
+            sock,
+            server_side=server_side,
+            do_handshake_on_connect=do_handshake_on_connect,
+            suppress_ragged_eofs=suppress_ragged_eofs,
+        )
+
+    ssl.wrap_socket = _compat_wrap_socket
 
 logger = logging.getLogger(__name__)
 
@@ -18,18 +52,22 @@ def get_db_pool() -> pooling.MySQLConnectionPool:
     global _POOL
     if _POOL is None:
         cfg = get_backend_db_config()
-        _POOL = pooling.MySQLConnectionPool(
-            pool_name="kernelinfo_webapp_pool",
-            pool_size=32,
-            pool_reset_session=True,
-            host=cfg.get("host", "127.0.0.1"),
-            port=int(cfg.get("port", 3306)),
-            user=cfg.get("user", "root"),
-            password=cfg.get("password", "Passe123"),
-            database=cfg.get("database", "test"),
-            connection_timeout=int(cfg.get("timeout", 10)),
-            autocommit=True,
-        )
+        pool_kwargs: dict[str, Any] = {
+            "pool_name": "kernelinfo_webapp_pool",
+            "pool_size": 32,
+            "pool_reset_session": True,
+            "host": cfg.get("host", "127.0.0.1"),
+            "port": int(cfg.get("port", 3306)),
+            "user": cfg.get("user", "root"),
+            "password": cfg.get("password", "Passe123"),
+            "database": cfg.get("database", "test"),
+            "connection_timeout": int(cfg.get("timeout", 10)),
+            "autocommit": True,
+        }
+        if os.getenv("DB_SSL_DISABLED", "").lower() in ("true", "1", "yes") or cfg.get("ssl_disabled"):
+            pool_kwargs["ssl_disabled"] = True
+
+        _POOL = pooling.MySQLConnectionPool(**pool_kwargs)
         logger.info("Initialized MySQLConnectionPool with 32 connections.")
     return _POOL
 
@@ -77,7 +115,10 @@ class DatabaseManager:
         self._init_pool()
 
     def _init_pool(self) -> None:
-        get_db_pool()
+        try:
+            get_db_pool()
+        except Exception as exc:
+            logger.debug("Database pool initialization deferred on import: %s", exc)
 
     def get_connection(self) -> Any:
         return get_pooled_connection()

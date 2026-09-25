@@ -82,6 +82,8 @@ class TEDirectDB:
         self.next_id: dict[int, int] = {}
         self._pk_getters: dict[int, Callable[[tuple[SafeDataType, ...]], Any]] = {}
         self._join_plan_cache: dict[JoinsType, list[tuple[int, int, int]]] = {}
+        self._committed_pks: dict[int, set[Any]] = {}
+        self._committed_nodup_keys: dict[int, dict[Any, int]] = {}
         self.db: Any | None = None
 
     def close(self) -> None:
@@ -114,6 +116,8 @@ class TEDirectDB:
     def _register_table(self, table: Table) -> None:
         """Register table schema and precompile primary key extractor."""
         self.tables[table.table_id] = table
+        self._committed_pks.setdefault(table.table_id, set())
+        self._committed_nodup_keys.setdefault(table.table_id, {})
         if table.primary:
             if len(table.primary) == 1:
                 pk_idx = table.primary[0]
@@ -141,6 +145,17 @@ class TEDirectDB:
         for table_id, table in self.tables.items():
             self.queued_set[table_id] = {}
             self.queued_update[table_id] = []
+            self._committed_pks[table_id] = set()
+            self._committed_nodup_keys[table_id] = {}
+            if table.initial_insert:
+                for row in table.initial_insert:
+                    if table.no_duplicate and len(row) > 1:
+                        k = self._sanitize_key(row[1:])
+                        self._committed_nodup_keys[table_id][k] = row[0]
+                    if table.primary:
+                        pk_fn = self._pk_getters.get(table_id)
+                        pk = self._sanitize_key(pk_fn(row) if pk_fn is not None else itemgetter(*table.primary)(row))
+                        self._committed_pks[table_id].add(pk)
             if self.db is not None:
                 try:
                     self.next_id[table_id] = self.db.get_next_id(table)
@@ -213,6 +228,11 @@ class TEDirectDB:
                     cached_id = self.queued_set[table_id].get(key)
                     if cached_id is not None:
                         row = (cached_id, *columns[1:])
+                        if columns[0] is None or row[0] == columns[0]:
+                            return row
+                    committed_id = self._committed_nodup_keys.get(table_id, {}).get(key)
+                    if committed_id is not None:
+                        row = (committed_id, *columns[1:])
                         if columns[0] is None or row[0] == columns[0]:
                             return row
                 else:
@@ -297,6 +317,10 @@ class TEDirectDB:
             if current_set is not None:
                 return (current_set, *columns[1:])
 
+            committed_id = self._committed_nodup_keys.get(table_id, {}).get(key)
+            if committed_id is not None:
+                return (committed_id, *columns[1:])
+
             assigned_id = self.next_id[table_id]
             self.queued_set[table_id][key] = assigned_id
             self.next_id[table_id] += 1
@@ -311,6 +335,8 @@ class TEDirectDB:
 
         pk_fn = self._pk_getters.get(table_id)
         pk = self._sanitize_key(pk_fn(columns) if pk_fn is not None else itemgetter(*table.primary)(columns))
+        if (table.primary == ("hash",) or table.table_name in ("m_tag_code", "m_ast_hash")) and pk in self._committed_pks.get(table_id, set()):
+            return columns
         self.queued_set[table_id][pk] = columns
         return columns
 
@@ -562,20 +588,32 @@ class TEDirectDB:
 
         if self.queued_set[table_id]:
             if table.no_duplicate:
-                rows = [
-                    v if isinstance(v, (tuple, list))
-                    else ((v, *k) if isinstance(k, tuple) else (v, k))
-                    for k, v in self.queued_set[table_id].items()
-                ]
+                committed_map = self._committed_nodup_keys.setdefault(table_id, {})
+                rows = []
+                for k, v in self.queued_set[table_id].items():
+                    if k in committed_map:
+                        continue
+                    row = v if isinstance(v, (tuple, list)) else ((v, *k) if isinstance(k, tuple) else (v, k))
+                    rows.append(row)
+                    committed_map[k] = row[0]
+            elif table.primary == ("hash",) or table.table_name in ("m_tag_code", "m_ast_hash"):
+                committed_pks = self._committed_pks.setdefault(table_id, set())
+                rows = []
+                for pk, row in self.queued_set[table_id].items():
+                    if pk in committed_pks:
+                        continue
+                    rows.append(row)
+                    committed_pks.add(pk)
             else:
                 rows = list(self.queued_set[table_id].values())
 
-            if table.primary and len(rows) > 1:
-                pk_fn = self._pk_getters.get(table_id)
-                rows.sort(key=pk_fn if pk_fn is not None else itemgetter(*table.primary))
+            if rows:
+                if table.primary and len(rows) > 1:
+                    pk_fn = self._pk_getters.get(table_id)
+                    rows.sort(key=pk_fn if pk_fn is not None else itemgetter(*table.primary))
 
-            payload = tuple(rows)
-            self.db.insert(table, payload)
+                payload = tuple(rows)
+                self.db.insert(table, payload)
             self.queued_set[table_id].clear()
 
         if self.queued_update[table_id]:
@@ -604,19 +642,31 @@ class TEDirectDB:
 
             if self.queued_set[table_id]:
                 if table.no_duplicate:
-                    rows = [
-                        v if isinstance(v, (tuple, list))
-                        else ((v, *k) if isinstance(k, tuple) else (v, k))
-                        for k, v in self.queued_set[table_id].items()
-                    ]
+                    committed_map = self._committed_nodup_keys.setdefault(table_id, {})
+                    rows = []
+                    for k, v in self.queued_set[table_id].items():
+                        if k in committed_map:
+                            continue
+                        row = v if isinstance(v, (tuple, list)) else ((v, *k) if isinstance(k, tuple) else (v, k))
+                        rows.append(row)
+                        committed_map[k] = row[0]
+                elif table.primary == ("hash",) or table.table_name in ("m_tag_code", "m_ast_hash"):
+                    committed_pks = self._committed_pks.setdefault(table_id, set())
+                    rows = []
+                    for pk, row in self.queued_set[table_id].items():
+                        if pk in committed_pks:
+                            continue
+                        rows.append(row)
+                        committed_pks.add(pk)
                 else:
                     rows = list(self.queued_set[table_id].values())
 
-                if table.primary and len(rows) > 1:
-                    pk_fn = self._pk_getters.get(table_id)
-                    rows.sort(key=pk_fn if pk_fn is not None else itemgetter(*table.primary))
+                if rows:
+                    if table.primary and len(rows) > 1:
+                        pk_fn = self._pk_getters.get(table_id)
+                        rows.sort(key=pk_fn if pk_fn is not None else itemgetter(*table.primary))
 
-                insert_payload = tuple(rows)
+                    insert_payload = tuple(rows)
 
             if self.queued_update[table_id]:
                 update_payload = tuple(self.queued_update[table_id])

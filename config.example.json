@@ -18,5 +18,18 @@
     "memory_mode": "normal",
     "fidelity": true,
     "mem_max": 60
+  },
+  "ssh_tunnel": {
+    "enabled": false,
+    "host": "remote-server.example.com",
+    "port": 22,
+    "user": "ubuntu",
+    "password": "",
+    "key_file": "~/.ssh/id_ed25519",
+    "remote_host": "127.0.0.1",
+    "remote_port": 3306,
+    "local_port": 0,
+    "strict_host_key_checking": "accept-new",
+    "connect_timeout": 10
   }
 }
