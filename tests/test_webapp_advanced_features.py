@@ -463,8 +463,42 @@ class TestWebappAdvancedFeatures(unittest.TestCase):
                 self.assertIn("symbols", res)
                 self.assertIsInstance(res["symbols"], list)
 
-        # 3. Verify webapp.html popover elements and controller functions
-        html_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "webapp", "webapp.html")
+        # 3. Fallback resolution when AST ID is 0 or missing
+        fb_res = get_include_symbols("v3.0", 0, header="linux/const.h", file_path="include/linux/const.h")
+        self.assertIn("ast_id", fb_res)
+        self.assertIn("header_file", fb_res)
+        self.assertEqual(fb_res["header_file"], "include/linux/const.h")
+        self.assertTrue(fb_res["header_exists"])
+        self.assertEqual(fb_res["total_symbols"], 0)
+        self.assertEqual(fb_res["symbols"], [])
+
+        # 4. Verify modular frontend popover component and stylesheet
+        base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        popover_js = os.path.join(base_dir, "webapp", "frontend", "js", "components", "include_symbols_popover.js")
+        with open(popover_js, "r", encoding="utf-8") as f:
+            p_content = f.read()
+        self.assertIn("class IncludeSymbolsPopover", p_content)
+        self.assertIn("includeSymbolsPopover = new IncludeSymbolsPopover()", p_content)
+        self.assertIn("include-symbols-popover", p_content)
+        self.assertIn("include-category-pills", p_content)
+        self.assertIn("btn-include-open-header", p_content)
+
+        modals_css = os.path.join(base_dir, "webapp", "frontend", "css", "modals.css")
+        with open(modals_css, "r", encoding="utf-8") as f:
+            c_content = f.read()
+        self.assertIn(".include-symbols-popover", c_content)
+        self.assertIn(".include-category-pills", c_content)
+        self.assertIn(".include-badge-func", c_content)
+        self.assertIn(".include-badge-struct", c_content)
+
+        context_menu_js = os.path.join(base_dir, "webapp", "frontend", "js", "components", "context_menu.js")
+        with open(context_menu_js, "r", encoding="utf-8") as f:
+            cm_content = f.read()
+        self.assertIn("import { includeSymbolsPopover }", cm_content)
+        self.assertIn("includeSymbolsPopover.show", cm_content)
+
+        # 5. Verify webapp.html popover elements and controller functions
+        html_path = os.path.join(base_dir, "webapp", "webapp.html")
         with open(html_path, "r", encoding="utf-8") as f:
             content = f.read()
 

@@ -418,3 +418,334 @@
   letter-spacing: 0.3px;
 }
 
+/* 7. Include Symbols Popover */
+.include-symbols-popover {
+  position: fixed;
+  width: 480px;
+  max-height: 520px;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-lg);
+  box-shadow: 0 16px 36px rgba(0, 0, 0, 0.55), 0 4px 12px rgba(0, 0, 0, 0.3);
+  display: flex;
+  flex-direction: column;
+  z-index: 1050;
+  font-family: var(--font-sans);
+  overflow: hidden;
+  animation: includePopoverFadeIn 0.15s ease-out;
+}
+
+@keyframes includePopoverFadeIn {
+  from {
+    opacity: 0;
+    transform: translateY(-4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.include-popover-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--border-color);
+  background: var(--bg-tertiary);
+}
+
+.include-popover-title-group {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.include-popover-icon {
+  font-size: 14px;
+  flex-shrink: 0;
+}
+
+.include-popover-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--accent-blue);
+  font-family: var(--font-mono);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.include-popover-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+.btn-include-header {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  font-weight: 500;
+  padding: 4px 8px;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-sm);
+  color: var(--text-primary);
+  cursor: pointer;
+  transition: all var(--transition-fast);
+}
+
+.btn-include-header:hover {
+  border-color: var(--accent-blue);
+  color: var(--accent-blue);
+  background: var(--bg-hover);
+}
+
+.btn-include-close {
+  background: transparent;
+  border: none;
+  font-size: 18px;
+  color: var(--text-muted);
+  cursor: pointer;
+  line-height: 1;
+  padding: 2px 6px;
+  border-radius: var(--radius-sm);
+  transition: all var(--transition-fast);
+}
+
+.btn-include-close:hover {
+  color: var(--text-primary);
+  background: var(--bg-hover);
+}
+
+.include-popover-toolbar {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 8px 12px;
+  background: var(--bg-secondary);
+  border-bottom: 1px solid var(--border-color);
+}
+
+.include-search-wrapper {
+  position: relative;
+  display: flex;
+  align-items: center;
+}
+
+.include-search-icon {
+  position: absolute;
+  left: 8px;
+  font-size: 11px;
+  pointer-events: none;
+  color: var(--text-muted);
+}
+
+#include-symbols-search {
+  width: 100%;
+  padding: 5px 10px 5px 26px;
+  background: var(--bg-primary);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-md);
+  color: var(--text-primary);
+  font-size: 12px;
+  outline: none;
+  transition: border-color var(--transition-fast), box-shadow var(--transition-fast);
+}
+
+#include-symbols-search:focus {
+  border-color: var(--accent-blue);
+  box-shadow: 0 0 0 2px rgba(88, 166, 255, 0.2);
+}
+
+.include-category-pills {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  overflow-x: auto;
+  padding-bottom: 2px;
+  scrollbar-width: thin;
+}
+
+.include-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 8px;
+  font-size: 11px;
+  font-weight: 500;
+  border-radius: 12px;
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border-color);
+  color: var(--text-secondary);
+  cursor: pointer;
+  white-space: nowrap;
+  transition: all var(--transition-fast);
+}
+
+.include-pill:hover {
+  color: var(--text-primary);
+  border-color: var(--text-muted);
+}
+
+.include-pill.active {
+  background: rgba(88, 166, 255, 0.15);
+  border-color: var(--accent-blue);
+  color: var(--accent-blue);
+  font-weight: 600;
+}
+
+.include-pill-count {
+  font-size: 10px;
+  opacity: 0.8;
+}
+
+.include-symbols-list {
+  flex: 1;
+  overflow-y: auto;
+  max-height: 280px;
+  padding: 4px 0;
+}
+
+.include-symbol-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 6px 12px;
+  cursor: pointer;
+  transition: background var(--transition-fast);
+}
+
+.include-symbol-row:hover {
+  background: var(--bg-hover);
+}
+
+.include-symbol-info {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  flex: 1;
+}
+
+.include-symbol-name {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.include-symbol-name mark {
+  background: rgba(240, 136, 62, 0.35);
+  color: var(--accent-orange);
+  font-weight: 600;
+  padding: 0 2px;
+  border-radius: 2px;
+}
+
+.include-symbol-details {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.include-badge {
+  font-size: 10px;
+  font-weight: 600;
+  padding: 1px 6px;
+  border-radius: 3px;
+  text-transform: uppercase;
+  letter-spacing: 0.3px;
+}
+
+.include-badge-func {
+  background: rgba(88, 166, 255, 0.15);
+  color: var(--accent-blue);
+  border: 1px solid rgba(88, 166, 255, 0.3);
+}
+
+.include-badge-struct {
+  background: rgba(188, 140, 255, 0.15);
+  color: var(--accent-purple);
+  border: 1px solid rgba(188, 140, 255, 0.3);
+}
+
+.include-badge-macro {
+  background: rgba(240, 136, 62, 0.15);
+  color: var(--accent-orange);
+  border: 1px solid rgba(240, 136, 62, 0.3);
+}
+
+.include-badge-typedef {
+  background: rgba(57, 197, 187, 0.15);
+  color: var(--accent-cyan);
+  border: 1px solid rgba(57, 197, 187, 0.3);
+}
+
+.include-badge-enum {
+  background: rgba(210, 153, 34, 0.15);
+  color: var(--accent-yellow);
+  border: 1px solid rgba(210, 153, 34, 0.3);
+}
+
+.include-badge-var {
+  background: rgba(63, 185, 80, 0.15);
+  color: var(--accent-green);
+  border: 1px solid rgba(63, 185, 80, 0.3);
+}
+
+.include-badge-other {
+  background: var(--bg-tertiary);
+  color: var(--text-muted);
+  border: 1px solid var(--border-color);
+}
+
+.include-loc-badge {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-muted);
+  max-width: 140px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.include-symbol-jump {
+  color: var(--text-muted);
+  font-size: 12px;
+  transition: transform var(--transition-fast), color var(--transition-fast);
+}
+
+.include-symbol-row:hover .include-symbol-jump {
+  color: var(--accent-blue);
+  transform: translateX(2px);
+}
+
+.include-symbols-empty {
+  padding: 24px 16px;
+  text-align: center;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.include-popover-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 6px 12px;
+  background: var(--bg-tertiary);
+  border-top: 1px solid var(--border-color);
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+

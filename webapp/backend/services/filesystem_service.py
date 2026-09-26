@@ -695,3 +695,6 @@ class FilesystemService:
             _INCLUDE_CACHE[cache_key] = res
             return res
 
+
+filesystem_service = FilesystemService()
+

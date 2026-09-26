@@ -125,6 +125,8 @@ export class VirtualEditor {
         }
 
         e.stopPropagation();
+        const row = tokenSpan.closest(".code-row");
+        const lineNo = row ? parseInt(row.dataset.lineNo, 10) : 1;
         const astId = parseInt(tokenSpan.dataset.astId || "0", 10);
         const typeId = parseInt(tokenSpan.dataset.typeId || "0", 10);
         const name = tokenSpan.dataset.name || tokenSpan.textContent;
@@ -139,7 +141,8 @@ export class VirtualEditor {
           type_id: typeId,
           version: this.currentVersion,
           filePath: this.currentFilePath,
-          ftype: this.currentFtype
+          ftype: this.currentFtype,
+          line: lineNo
         });
       }
     });
@@ -156,6 +159,8 @@ export class VirtualEditor {
 
         e.preventDefault();
         e.stopPropagation();
+        const row = tokenSpan.closest(".code-row");
+        const lineNo = row ? parseInt(row.dataset.lineNo, 10) : 1;
         const astId = parseInt(tokenSpan.dataset.astId || "0", 10);
         const typeId = parseInt(tokenSpan.dataset.typeId || "0", 10);
         const name = tokenSpan.dataset.name || tokenSpan.textContent;
@@ -170,7 +175,8 @@ export class VirtualEditor {
           type_id: typeId,
           version: this.currentVersion,
           filePath: this.currentFilePath,
-          ftype: this.currentFtype
+          ftype: this.currentFtype,
+          line: lineNo
         }, { forceNew: true });
       }
     });
@@ -199,7 +205,8 @@ export class VirtualEditor {
           type_id: typeId,
           version: this.currentVersion,
           filePath: this.currentFilePath,
-          ftype: this.currentFtype
+          ftype: this.currentFtype,
+          line: lineNo
         };
       }
 

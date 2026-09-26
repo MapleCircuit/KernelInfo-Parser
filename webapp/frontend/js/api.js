@@ -156,9 +156,18 @@ class ApiClient {
     return this.request(`/api/fs/resolve_include?${params.toString()}`, {}, "files", cacheKey);
   }
 
-  async getIncludeSymbols(version, astId) {
+  async getIncludeSymbols(version, astId, options = {}) {
     const ver = this._sanitizeVer(version);
-    return this.request(`/api/symbols/${encodeURIComponent(ver)}/include/${astId}`, {}, "symbols", `inc_syms_${ver}_${astId}`);
+    const targetId = parseInt(astId || "0", 10);
+    const params = new URLSearchParams();
+    if (options.tagId) params.append("tag_id", options.tagId);
+    if (options.filePath) params.append("file_path", options.filePath);
+    if (options.line) params.append("line", options.line);
+    if (options.header) params.append("header", options.header);
+
+    const queryStr = params.toString() ? `?${params.toString()}` : "";
+    const cacheKey = `inc_syms_${ver}_${targetId}_${options.filePath || ""}_${options.line || ""}_${options.header || ""}`;
+    return this.request(`/api/symbols/${encodeURIComponent(ver)}/include/${targetId}${queryStr}`, {}, "symbols", cacheKey);
   }
 
   // --- Symbols ---

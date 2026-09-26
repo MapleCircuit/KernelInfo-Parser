@@ -523,7 +523,11 @@ Recursively inspect relational AST node container hierarchies.
 Retrieve imported symbols and target header file path for a preprocessor `CPPro_include` AST node.
 - **Parameters**:
   - `version_name` (path) / `version` (query): Kernel version string.
-  - `ast_id` (path): AST Node ID of the include directive.
+  - `ast_id` (path): AST Node ID of the include directive. If `ast_id <= 0`, falls back to database lookup using `file_path`, `line`, or `header`.
+  - `tag_id` (query): Optional tag ID of the include node.
+  - `file_path` (query): Path of the source file containing the include.
+  - `line` (query): 1-indexed line number of the include in the source file.
+  - `header` (query): Include header target (e.g. `<linux/init.h>` or `linux/init.h`).
 - **Response**:
 ```json
 {
@@ -1260,7 +1264,7 @@ Handles unified HTTP communication, response caching, and offline fallback:
 - `getDirectoryTree(version, path, depth)`: Fetches directory tree.
 - `getFileContent(version, path)`: Retrieves raw text and AST tokens.
 - `resolveInclude(version, header, astId, currentFile)`: Resolves `#include` directive targets.
-- `getIncludeSymbols(version, astId)`: Fetches imported symbols for an include.
+- `getIncludeSymbols(version, astId, options)`: Fetches imported symbols for an include, supporting fallback lookup options (`filePath`, `line`, `header`, `tagId`).
 - `getSymbolDetail(version, name)` / `getSymbolXref(version, name)`: Symbol inspection.
 - `getMaintainersOverview(version, query)` / `getMaintainerSection(version, secId)`: Subsystems.
 - `getPersonProfile(version, idOrEmail)`: Developer profiles.
@@ -1336,8 +1340,22 @@ Implements two-layer hybrid highlighting with map prioritization and client-side
   - Distinct top **"Definition"** card displaying primary definition file path, line numbers, and readable AST type badge (`FunctionDecl`, `StructDecl`, `EnumConstant`, `CPPro_define_macro`), with direct 1-click jump-to-code navigation.
   - Categorized **"References & Usages"** list showing caller context, file paths, line numbers, and readable reference type badges (`Call`, `MemberRef`, `TypeUsage`, `DeclRef`, `MacroExp`).
   - Purely displays indexed cross-references without non-functional search fallback buttons.
+- **Include Symbols Inspection**:
+  - Clicking or right-clicking `#include` directives provides an **"Inspect Included Symbols"** (`🔍`) action.
+  - Queries `api.getIncludeSymbols` with client-provided AST ID, file path, line coordinate, and header query fallback.
+  - Displays the floating `IncludeSymbolsPopover` adjacent to the clicked token.
 
-### 5.7. `KconfigView` (`webapp/frontend/js/views/kconfig/kconfig_view.js`) & `KconfigEngine` (`webapp/frontend/js/views/kconfig/kconfig_engine.js`)
+### 5.7. `IncludeSymbolsPopover` (`webapp/frontend/js/components/include_symbols_popover.js`)
+- **Anchored Floating Popover**: Clamped dynamically within viewport bounds adjacent to clicked `#include` lines.
+- **Live Search Filtering**: Client-side interactive search input (`#include-symbols-search`) with real-time text matching, substring highlighting (`<mark>`), and instant symbol filtering.
+- **Category Filter Pills**: Interactive pills with live counts (`All`, `Functions`, `Structs`, `Macros`, `Typedefs`, `Enums`, `Variables`) enabling one-click category filtering.
+- **Category Badges & Definition Coordinates**: Color-coded badges for symbol categories (`Func`, `Struct`, `Macro`, `Typedef`, `Enum`, `Var`), definition file paths, and line numbers (`def_file:line_s`).
+- **Navigation & Queuing**:
+  - Left-click on any symbol row immediately navigates to its definition (`state.openTab`).
+  - Middle-click opens the definition in a new tab without dismissing the popover, allowing rapid multi-tab queuing.
+  - Top-bar **"📄 Open Header"** action button quickly opens the included header file.
+
+### 5.8. `KconfigView` (`webapp/frontend/js/views/kconfig/kconfig_view.js`) & `KconfigEngine` (`webapp/frontend/js/views/kconfig/kconfig_engine.js`)
 - **Active Constraint Engine**: Active by default with live 3-valued boolean logic (`n=0, m=1, y=2`) and recursive default propagation fixpoint loop.
 - **Authentic Scoped Trees**: Inlines `source`/`rsource` statements within their authentic enclosing menus starting from `arch/<arch>/Kconfig`, eliminating cross-architecture menu pollution (e.g. S/390 menus appearing under x86).
 - **Architecture Switching Flow**:
@@ -1359,7 +1377,7 @@ Implements two-layer hybrid highlighting with map prioritization and client-side
 - **Persistent Folder Expansion & Scroll Preservation**:
   - The explorer tree tracks open folders via a persistent set of node IDs (`this.expandedNodeIds`). Selecting a kconfig symbol, toggling values, selecting choice members, solving prerequisites, or loading defconfigs re-renders the tree while preserving all opened folders, child hierarchy expansions, active row highlights, and the exact scroll offset (`scrollTop`). Clicking dependency badges expands all ancestor menus (`expandAncestors`) to reveal the target symbol in its authentic hierarchical place without collapsing any previously opened folders.
 
-### 5.8. Universal Middle-Click Tab & Navigation Capture
+### 5.9. Universal Middle-Click Tab & Navigation Capture
 The frontend implements systematic middle-click capture (`auxclick` with `e.button === 1`) across all interactive UI surfaces:
 1. **Force New Tab (`forceNew: true`)**:
    - `state.openTab(tabData, targetPaneId)` accepts `tabData.forceNew`.
@@ -1382,7 +1400,7 @@ The frontend implements systematic middle-click capture (`auxclick` with `e.butt
 5. **Modal Non-Dismissing Multi-Tab Queuing**:
    - In the **Cross-References (XRef)** and **Included Symbols** modals, middle-clicking definitions or usage links opens the target code tabs with `forceNew: true` while preserving the modal backdrop, allowing users to queue multiple references into separate tabs without re-opening search modals.
 
-### 5.9. Developer Profiles & Kconfig Compiled Source Navigation
+### 5.10. Developer Profiles & Kconfig Compiled Source Navigation
 1. **Interactive Developer Profile Modal (`showPersonModal`)**:
    - Clicking developer names across the workspace (Commit author headers, Contributors & Signoffs lists, Commit cards, Git Blame gutters, and Blame context popovers) activates the universal Developer Profile modal (`webapp/frontend/js/components/person_modal.js`).
    - Displays avatar initials, author email, CREDITS biographical data (description, project URL, PGP keys, snail mail), Git stats (authored commits count), and maintained subsystems.

@@ -8,6 +8,7 @@ import { state } from "../state.js";
 import { toast } from "./toast.js";
 import { copyToClipboard } from "../utils/clipboard.js";
 import { showPersonModal } from "./person_modal.js";
+import { includeSymbolsPopover } from "./include_symbols_popover.js";
 
 class ContextMenu {
   constructor() {
@@ -262,8 +263,13 @@ class ContextMenu {
         onClick: async () => {
           try {
             const astId = tokenData.ast_id || 0;
-            const incData = await api.getIncludeSymbols(v, astId);
-            this.showIncludeSymbolsModal(tokenData.header || tokenName, incData);
+            const incData = await api.getIncludeSymbols(v, astId, {
+              filePath: tokenData.filePath,
+              line: tokenData.line,
+              header: tokenData.header || tokenName,
+              tagId: tokenData.tag_id
+            });
+            includeSymbolsPopover.show(x, y, tokenData, incData);
           } catch (err) {
             toast.error(`Symbols lookup failed: ${err.message}`);
           }
@@ -407,8 +413,13 @@ class ContextMenu {
           onClick: async () => {
             try {
               const astId = token.ast_id || 0;
-              const incData = await api.getIncludeSymbols(v, astId);
-              this.showIncludeSymbolsModal(token.header || token.name, incData);
+              const incData = await api.getIncludeSymbols(v, astId, {
+                filePath: token.filePath,
+                line: token.line,
+                header: token.header || token.name,
+                tagId: token.tag_id
+              });
+              includeSymbolsPopover.show(x, y, token, incData);
             } catch (err) {
               toast.error(`Symbols lookup failed: ${err.message}`);
             }
@@ -1168,71 +1179,14 @@ class ContextMenu {
     }
   }
 
-  showIncludeSymbolsModal(name, incData) {
-    const backdrop = document.createElement("div");
-    backdrop.className = "palette-backdrop";
-    backdrop.onclick = () => backdrop.remove();
-
-    const box = document.createElement("div");
-    box.className = "palette-box";
-    box.onclick = (e) => e.stopPropagation();
-
-    const symbols = (incData && incData.imported_symbols) || (incData && incData.symbols) || [];
-    const targetFile = (incData && incData.header_file) || name;
-
-    box.innerHTML = `
-      <div style="padding:12px 16px;border-bottom:1px solid var(--border-color);display:flex;justify-content:space-between;align-items:center;">
-        <span style="font-weight:bold;color:var(--accent-blue);">Imported Symbols: ${this.escapeHtml(targetFile)}</span>
-        <button id="close-inc-btn" style="color:var(--text-muted);font-size:16px;">&times;</button>
-      </div>
-      <div style="max-height:360px;overflow-y:auto;padding:8px 16px;">
-        ${
-          symbols.length > 0
-            ? symbols.map((s) => `
-                <div class="palette-item inc-sym-item" data-name="${this.escapeHtml(s.name || s)}" data-file="${this.escapeHtml(s.def_file || targetFile)}" data-line="${s.line_s || 1}">
-                  <div>
-                    <div style="font-weight:500;color:var(--text-primary);">${this.escapeHtml(s.name || s)}</div>
-                    <div class="palette-item-desc">${this.escapeHtml(this.formatTypeName(s.type_name))} • ${this.escapeHtml(s.def_file || targetFile)}:${s.line_s || 1}</div>
-                  </div>
-                  <span style="font-size:10px;background:var(--bg-tertiary);padding:1px 4px;border-radius:3px;">${this.escapeHtml(this.formatTypeName(s.type_name))}</span>
-                </div>
-              `).join("")
-            : `<div style="color:var(--text-muted);padding:12px 0;">No direct imported symbols indexed for this include.</div>`
-        }
-      </div>
-    `;
-
-    backdrop.appendChild(box);
-    document.body.appendChild(backdrop);
-
-    box.querySelector("#close-inc-btn").onclick = () => backdrop.remove();
-    box.querySelectorAll(".inc-sym-item").forEach((el) => {
-      el.onclick = () => {
-        state.openTab({
-          type: "code",
-          title: el.dataset.file.split("/").pop(),
-          path: el.dataset.file,
-          cursorLine: parseInt(el.dataset.line || "1", 10),
-          version: state.currentVersion
-        });
-        backdrop.remove();
-      };
-      el.addEventListener("auxclick", (e) => {
-        if (e.button === 1) {
-          e.preventDefault();
-          e.stopPropagation();
-          state.openTab({
-            type: "code",
-            title: el.dataset.file.split("/").pop(),
-            path: el.dataset.file,
-            cursorLine: parseInt(el.dataset.line || "1", 10),
-            version: state.currentVersion,
-            forceNew: true
-          });
-          // Do not close backdrop - keeps modal open for queuing multiple tabs
-        }
-      });
-    });
+  showIncludeSymbolsModal(name, incData, x, y, includeInfo) {
+    const info = includeInfo || { header: name, name: name, version: state.currentVersion };
+    includeSymbolsPopover.show(
+      x || Math.max(16, window.innerWidth / 2 - 225),
+      y || Math.max(16, window.innerHeight / 4),
+      info,
+      incData
+    );
   }
 
   escapeHtml(str) {

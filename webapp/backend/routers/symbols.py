@@ -78,8 +78,19 @@ def get_include_symbols(
     ast_id: int,
     version: str = Query("v3.0", alias="version_name"),
     version_name: str | None = None,
+    tag_id: int | None = Query(None),
+    file_path: str | None = Query(None),
+    line: int | None = Query(None),
+    header: str | None = Query(None),
 ) -> dict[str, Any]:
     """Retrieve imported symbols and target header file path for a CPPro_include AST node."""
     v = version_name or version
-    return symbol_service.get_include_symbols(v, ast_id)
+    return symbol_service.get_include_symbols(
+        v,
+        ast_id,
+        tag_id=tag_id,
+        file_path=file_path,
+        line=line,
+        header=header,
+    )
 

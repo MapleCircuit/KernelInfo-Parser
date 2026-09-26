@@ -408,7 +408,15 @@ class SymbolService:
                 "timeline": timeline_snaps,
             }
 
-    def get_include_symbols(self, version_name: str, ast_id: int, tag_id: int | None = None) -> dict[str, Any]:
+    def get_include_symbols(
+        self,
+        version_name: str,
+        ast_id: int,
+        tag_id: int | None = None,
+        file_path: str | None = None,
+        line: int | None = None,
+        header: str | None = None,
+    ) -> dict[str, Any]:
         """Retrieve imported symbols and target header file path for a CPPro_include AST node."""
         import os
         from core.globalstuff import normalize_repo_path
@@ -425,19 +433,83 @@ class SymbolService:
                 if t_row and t_row["ast_id"]:
                     target_ast_id = t_row["ast_id"]
 
-            cursor.execute(
-                """
-                SELECT a.ast_id, a.name, a.type_id, td.name AS type_name
-                FROM m_ast a
-                LEFT JOIN m_type_descriptor td ON a.type_id = td.type_id
-                WHERE a.ast_id = %s
-                LIMIT 1;
-                """,
-                (target_ast_id,),
-            )
-            ast_row = cursor.fetchone()
+            if (target_ast_id <= 0 or target_ast_id is None) and file_path and line:
+                clean_file = file_path.strip().lstrip("/")
+                cursor.execute(
+                    """
+                    SELECT a.ast_id
+                    FROM m_bridge_file bf
+                    JOIN m_file_name fn ON bf.fnid = fn.fnid
+                    JOIN m_bridge_tag bt ON bf.fid = bt.fid
+                    JOIN m_tag t ON bt.tag_id = t.tag_id
+                    JOIN m_ast a ON t.ast_id = a.ast_id
+                    WHERE bf.vid = %s AND fn.fname = %s AND a.type_id = 78
+                      AND bt.line_s <= %s AND bt.line_e >= %s
+                    LIMIT 1;
+                    """,
+                    (vid, clean_file, line, line),
+                )
+                f_row = cursor.fetchone()
+                if f_row and f_row["ast_id"]:
+                    target_ast_id = f_row["ast_id"]
+
+            if (target_ast_id <= 0 or target_ast_id is None) and file_path and header:
+                clean_file = file_path.strip().lstrip("/")
+                clean_hdr = header.strip().strip("<>\"' ;")
+                cursor.execute(
+                    """
+                    SELECT a.ast_id
+                    FROM m_bridge_file bf
+                    JOIN m_file_name fn ON bf.fnid = fn.fnid
+                    JOIN m_bridge_tag bt ON bf.fid = bt.fid
+                    JOIN m_tag t ON bt.tag_id = t.tag_id
+                    JOIN m_ast a ON t.ast_id = a.ast_id
+                    WHERE bf.vid = %s AND fn.fname = %s AND a.type_id = 78
+                      AND a.name LIKE %s
+                    LIMIT 1;
+                    """,
+                    (vid, clean_file, f"%{clean_hdr}%"),
+                )
+                h_row = cursor.fetchone()
+                if h_row and h_row["ast_id"]:
+                    target_ast_id = h_row["ast_id"]
+
+            ast_row = None
+            if target_ast_id and target_ast_id > 0:
+                cursor.execute(
+                    """
+                    SELECT a.ast_id, a.name, a.type_id, td.name AS type_name
+                    FROM m_ast a
+                    LEFT JOIN m_type_descriptor td ON a.type_id = td.type_id
+                    WHERE a.ast_id = %s
+                    LIMIT 1;
+                    """,
+                    (target_ast_id,),
+                )
+                ast_row = cursor.fetchone()
+
             if not ast_row:
-                raise HTTPException(status_code=404, detail=f"Include AST node {target_ast_id} not found")
+                if (target_ast_id and target_ast_id > 0) and not header and not file_path:
+                    raise HTTPException(status_code=404, detail=f"Include AST node {target_ast_id} not found")
+
+                # If include AST node is unindexed or queried with fallback parameters, attempt to resolve header target path gracefully
+                hdr_file = ""
+                if header:
+                    from webapp.backend.services.filesystem_service import filesystem_service
+                    try:
+                        resolved = filesystem_service.resolve_include(version_name, header, current_file=file_path)
+                        hdr_file = resolved.get("path", "")
+                    except Exception:
+                        hdr_file = header.strip().strip("<>\"' ;")
+
+                return {
+                    "ast_id": target_ast_id or 0,
+                    "include_text": header or "#include",
+                    "header_file": hdr_file,
+                    "header_exists": bool(hdr_file),
+                    "total_symbols": 0,
+                    "symbols": [],
+                }
 
             raw_include_text = safe_decode(ast_row["name"])
 
