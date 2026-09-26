@@ -1291,7 +1291,12 @@ webapp/frontend/js/
 ```
 
 ### 5.1. `ApiClient` (`webapp/frontend/js/api.js`)
-Handles unified HTTP communication, response caching, and offline fallback:
+Handles unified HTTP communication, response caching, offline fallback, and network activity tracking:
+- **Global Loading Indicator & Anti-Flicker Lifecycle**:
+  - Replaces legacy static status bar with a sleek, floating circular loading spinner in the bottom-right viewport (`#global-loading-spinner`).
+  - Automatically tracks in-flight `fetch` requests via `this.activeRequests`.
+  - Employs a 150ms anti-flicker debounce timer so sub-150ms and IndexedDB cache hits never flash the UI.
+  - When network fetch duration exceeds 150ms, fades in the glowing spinning indicator and dispatches `app:loading` event; smoothly fades out when all requests finish.
 - `getVersions()`: Fetches release list.
 - `getDirectoryTree(version, path, depth)`: Fetches directory tree.
 - `getFileContent(version, path)`: Retrieves raw text and AST tokens.

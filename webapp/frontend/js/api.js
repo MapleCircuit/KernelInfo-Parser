@@ -8,6 +8,8 @@ class ApiClient {
   constructor() {
     this.baseUrl = "";
     this.isOnline = navigator.onLine;
+    this.activeRequests = 0;
+    this._showTimer = null;
 
     window.addEventListener("online", () => {
       this.isOnline = true;
@@ -17,6 +19,42 @@ class ApiClient {
       this.isOnline = false;
       document.dispatchEvent(new CustomEvent("app:offline"));
     });
+  }
+
+  _onRequestStart() {
+    this.activeRequests++;
+    if (this.activeRequests === 1) {
+      // 150ms debounce before displaying to avoid flicker on fast sub-150ms responses
+      if (this._showTimer) clearTimeout(this._showTimer);
+      this._showTimer = setTimeout(() => {
+        if (this.activeRequests > 0) {
+          this._setSpinnerActive(true);
+        }
+      }, 150);
+    }
+  }
+
+  _onRequestEnd() {
+    this.activeRequests = Math.max(0, this.activeRequests - 1);
+    if (this.activeRequests === 0) {
+      if (this._showTimer) {
+        clearTimeout(this._showTimer);
+        this._showTimer = null;
+      }
+      this._setSpinnerActive(false);
+    }
+  }
+
+  _setSpinnerActive(active) {
+    const el = document.getElementById("global-loading-spinner");
+    if (el) {
+      if (active) {
+        el.classList.add("active");
+      } else {
+        el.classList.remove("active");
+      }
+    }
+    document.dispatchEvent(new CustomEvent("app:loading", { detail: { loading: active } }));
   }
 
   /**
@@ -44,11 +82,16 @@ class ApiClient {
   }
 
   async getDbInstance() {
-    const res = await fetch(`${this.baseUrl}/api/db/instance`, {
-      headers: { Accept: "application/json" }
-    });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    return res.json();
+    this._onRequestStart();
+    try {
+      const res = await fetch(`${this.baseUrl}/api/db/instance`, {
+        headers: { Accept: "application/json" }
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      return await res.json();
+    } finally {
+      this._onRequestEnd();
+    }
   }
 
   async request(endpoint, options = {}, cacheStore = null, cacheKey = null) {
@@ -65,6 +108,7 @@ class ApiClient {
     // 2. Fetch with 10-second timeout
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 10000);
+    this._onRequestStart();
 
     try {
       const response = await fetch(url, {
@@ -111,6 +155,8 @@ class ApiClient {
         }
       }
       throw err;
+    } finally {
+      this._onRequestEnd();
     }
   }
 

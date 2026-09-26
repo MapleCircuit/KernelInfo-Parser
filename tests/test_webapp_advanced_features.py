@@ -591,8 +591,48 @@ int get_foo(void) {
         self.assertFalse(is_pure_asm_content(c_source))
         self.assertEqual(type_check("drivers/foo.c", c_source), T_C)
 
+    def test_statusbar_removal_and_global_loading_spinner(self) -> None:
+        """Verify status bar removal and bottom-right global loading spinner architecture."""
+        base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+        # 1. Verify index.html does NOT contain footer#status-bar and DOES contain #global-loading-spinner
+        index_html_path = os.path.join(base_dir, "webapp", "frontend", "index.html")
+        with open(index_html_path, "r", encoding="utf-8") as f:
+            html = f.read()
+
+        self.assertNotIn('<footer id="status-bar">', html)
+        self.assertNotIn('id="status-bar"', html)
+        self.assertNotIn('id="status-branch"', html)
+        self.assertIn('id="global-loading-spinner"', html)
+        self.assertIn('class="global-loading-spinner"', html)
+
+        # 2. Verify variables.css does NOT contain --statusbar-height
+        var_css_path = os.path.join(base_dir, "webapp", "frontend", "css", "variables.css")
+        with open(var_css_path, "r", encoding="utf-8") as f:
+            var_css = f.read()
+        self.assertNotIn("--statusbar-height", var_css)
+
+        # 3. Verify layout.css contains .global-loading-spinner styles and does NOT contain #status-bar rule
+        layout_css_path = os.path.join(base_dir, "webapp", "frontend", "css", "layout.css")
+        with open(layout_css_path, "r", encoding="utf-8") as f:
+            layout_css = f.read()
+        self.assertNotIn("#status-bar {", layout_css)
+        self.assertIn(".global-loading-spinner", layout_css)
+        self.assertIn("@keyframes spinnerRotate", layout_css)
+
+        # 4. Verify api.js implements activeRequests tracking and anti-flicker timing
+        api_js_path = os.path.join(base_dir, "webapp", "frontend", "js", "api.js")
+        with open(api_js_path, "r", encoding="utf-8") as f:
+            api_js = f.read()
+        self.assertIn("this.activeRequests", api_js)
+        self.assertIn("_onRequestStart", api_js)
+        self.assertIn("_onRequestEnd", api_js)
+        self.assertIn("_setSpinnerActive", api_js)
+        self.assertIn("global-loading-spinner", api_js)
+        self.assertIn("app:loading", api_js)
 
 
 if __name__ == "__main__":
     unittest.main()
+
 

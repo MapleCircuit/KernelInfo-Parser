@@ -332,36 +332,36 @@
   background: var(--accent-blue);
 }
 
-/* 6. Status Bar */
-#status-bar {
-  height: var(--statusbar-height);
-  background: var(--bg-secondary);
-  border-top: 1px solid var(--border-color);
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 0 12px;
-  font-size: 11px;
-  color: var(--text-muted);
-  z-index: 100;
+/* 6. Global Floating Loading Spinner (Bottom-Right) */
+.global-loading-spinner {
+  position: fixed;
+  bottom: 16px;
+  right: 16px;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  border: 2px solid rgba(88, 166, 255, 0.2);
+  border-top-color: var(--accent-blue);
+  box-shadow: 0 0 10px rgba(88, 166, 255, 0.35);
+  z-index: 9999;
+  pointer-events: none;
+  opacity: 0;
+  transform: scale(0.8);
+  transition: opacity var(--transition-norm), transform var(--transition-norm);
 }
 
-.status-left, .status-right {
-  display: flex;
-  align-items: center;
-  gap: 12px;
+.global-loading-spinner.active {
+  opacity: 1;
+  transform: scale(1);
+  animation: spinnerRotate 0.75s linear infinite;
 }
 
-.status-item {
-  display: flex;
-  align-items: center;
-  gap: 4px;
+@keyframes spinnerRotate {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
 }
 
-.status-item.clickable {
-  cursor: pointer;
-}
-
-.status-item.clickable:hover {
-  color: var(--text-primary);
-}
