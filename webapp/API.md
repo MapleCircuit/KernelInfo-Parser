@@ -81,6 +81,12 @@ Every response includes hardened security headers:
 ### 2.4. Sliding-Window Rate Limiting
 - `SlidingWindowRateLimiter`: Enforces an in-memory sliding window cap (default 600 requests / 60 seconds per client IP). Exceeding requests receive `HTTP 429 Too Many Requests` with a `Retry-After` header.
 
+### 2.5. Strict Read-Only Database Invariant (Rule 35)
+The `webapp/` backend operates exclusively as a read-only presentation and query tier. Under no circumstances may any router, service, middleware, or background task in `webapp/` execute database schema definitions (DDL: `CREATE`, `ALTER`, `DROP`, `TRUNCATE`) or data modification commands (DML: `INSERT`, `UPDATE`, `DELETE`, `REPLACE`).
+- All table creations, schema migrations, and initial seed rows (including `m_db_instance`) are the strict and exclusive responsibility of the parser engine (`core/DBLayout.py`, `main.py`).
+- Database cursors acquired via `get_db_cursor()` in `webapp/backend/database/pool.py` do not support or execute transaction commits.
+- If expected metadata tables or rows are absent, webapp endpoints must return appropriate HTTP error statuses or graceful process-level fallbacks without modifying the underlying database.
+
 ---
 
 ## 3. Database Schema & Underlying Tables
@@ -122,6 +128,9 @@ Retrieve all available kernel versions indexed in the database.
 #### `GET /api/db/instance`
 Retrieve the unique database instance hash and initialization timestamp, allowing frontend clients to verify whether the active database has been rebuilt.
 - **Query Parameters**: None
+- **Behavior**:
+  - Executes a strictly read-only `SELECT instance_hash, created_at FROM m_db_instance LIMIT 1;`.
+  - In compliance with Rule 35, never attempts to `CREATE TABLE` or `INSERT` instance records. If `m_db_instance` does not exist or contains no rows, the endpoint logs a warning and returns a stable process-level fallback hash and startup timestamp.
 - **Response**:
 ```json
 {

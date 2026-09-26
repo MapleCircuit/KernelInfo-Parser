@@ -88,14 +88,16 @@ def get_pooled_connection(max_retries: int = 3) -> Any:
 
 
 @contextmanager
-def get_db_cursor(commit: bool = False, dictionary: bool = True) -> Generator[Any, None, None]:
-    """Provide a managed database cursor, guaranteeing return of connection to pool."""
+def get_db_cursor(dictionary: bool = True) -> Generator[Any, None, None]:
+    """Provide a managed database cursor, guaranteeing return of connection to pool.
+
+    Enforces the web application's strict read-only database invariant (Rule 35).
+    All database mutations and commits are strictly forbidden in webapp backend services.
+    """
     cnx = get_pooled_connection()
     cursor = cnx.cursor(dictionary=dictionary)
     try:
         yield cursor
-        if commit:
-            cnx.commit()
     finally:
         cursor.close()
         cnx.close()

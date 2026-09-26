@@ -67,8 +67,10 @@ import sys
 # Raise recursion limit for parsing deeply nested ASTs in kernel source files
 sys.setrecursionlimit(50000)
 import time
+import secrets
 import logging
 import argparse
+from typing import Any
 import multiprocessing
 import re
 from collections import deque, defaultdict
@@ -117,6 +119,7 @@ from core.DBLayout import (
     m_tag_code,
     m_moved_tag,
     m_file_reference,
+    m_db_instance,
 )
 
 
@@ -140,6 +143,18 @@ def reclaim_system_memory() -> None:
         ctypes.CDLL("libc.so.6").malloc_trim(0)
     except Exception:
         pass
+
+
+def ensure_db_instance(db: Any) -> None:
+    """Ensure that the database instance fingerprint table m_db_instance has at least 1 seed row."""
+    try:
+        res = db.get(m_db_instance, None, None)
+        if not res:
+            logger.info("m_db_instance is empty; seeding initial database instance fingerprint...")
+            init_row = ((secrets.token_hex(32), int(time.time())),)
+            db.insert(m_db_instance, init_row)
+    except Exception as e:
+        logger.warning(f"ensure_db_instance check encountered error: {e}")
 
 
 file_fid_cache: dict[str, int | None] = {}
@@ -1018,6 +1033,7 @@ def main() -> None:
                 db.create_index("v_main_index", m_v_main, (m_v_main.vname,))
             except Exception:
                 pass
+            ensure_db_instance(db)
             if hasattr(G.TE, "start_new_db") and getattr(G.TE, "tables", None):
                 G.TE.start_new_db(G.DB, is_worker=False)
         else:
@@ -1030,6 +1046,7 @@ def main() -> None:
                     db.create_index("v_main_index", m_v_main, (m_v_main.vname,))
                 except Exception:
                     pass
+            ensure_db_instance(db)
 
     try:
         update("v3.0")
@@ -1373,6 +1390,7 @@ def arg_handling() -> argparse.Namespace:
                     logger.info(f"Missing tables detected ({missing}), creating tables...")
                     missing_tables = [tbl for tbl in gp.Table_Array if tbl.table_name in missing]
                     db.create_table(missing_tables)
+                ensure_db_instance(db)
         except Exception as e:
             logger.debug(f"DB check before unit tests: {e}")
 
@@ -1403,6 +1421,8 @@ def arg_handling() -> argparse.Namespace:
             "tests.test_raw_ast",
             "tests.test_rust_ast",
             "tests.test_config",
+            "tests.test_git_reader",
+            "tests.test_webapp_system",
         ]
         suite = unittest.TestSuite()
         for mod_name in test_modules:
