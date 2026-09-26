@@ -177,7 +177,10 @@ Central runtime container, schema registry, and worker IPC coordinator.
 | **15** | `m_ast_hash` | `(hash, ast_id)` | `("hash",)` | `False` | `True` | `False` | Binary 32-byte SHA-256 AST structural hash deduplication |
 
 > [!IMPORTANT]
-> **ChangeSet Tag Reference Order Invariant (Rule 12)**: When staging tags in ChangeSets (`with CS(REF_POS):`), `m_tag.set` MUST be the first operation inside the block so that `tag_ref = ((m_tag.table_id, 0), OP_REF, (REF_POS, CS.route[-1]))` points directly to `m_tag`. Auxiliary deduplication tables (such as `m_tag_code.get_set`) must always be staged after `m_tag.set` within the block.
+> **ChangeSet Tag Reference Order Invariant**: When staging tags in ChangeSets (`with CS(REF_POS):`), `m_tag.set` MUST be the first operation inside the block so that `tag_ref = ((m_tag.table_id, 0), OP_REF, (REF_POS, CS.route[-1]))` points directly to `m_tag`. Auxiliary deduplication tables (such as `m_tag_code.get_set`) must always be staged after `m_tag.set` within the block.
+
+> [!NOTE]
+> **Schema Table Ordering & Foreign Key Directionality**: Tables are created sequentially in ascending `table_id` order (0..34). When defining hashing/lookup tables or relations in `core/DBLayout.py`, avoid forward foreign key constraints pointing to tables with higher `table_id`s, as relational databases reject foreign key constraints referencing not-yet-created tables during initial DDL setup.
 | **16** | `m_kconfig_symbol` | `(kcid, vid_s, vid_e, name, type, prompt, def_val, help, ast_id)` | `("kcid", "vid_s")` | `True` | `True` | `False` | Normalized Kconfig symbol definitions |
 | **17** | `m_kconfig_relation`| `(rel_id, kcid, target_name, rel_type, cond_ast_id, priority)`| `("rel_id",)`| `True` | `True` | `False` | Direct depends_on / select / imply dependency graph |
 | **18** | `m_kconfig_tree` | `(tree_id, vid, parent_id, node_type, title, kcid, priority, dep_ast_id, ast_id)` | `("tree_id", "vid")` | `False` | `True` | `False` | Hierarchical Menuconfig tree & UI ordering |
@@ -253,7 +256,7 @@ Represents a parsed file diff and acts as the relational staging buffer.
      - **Step 0 (Per-File Symbols)**: Checks `gp.file_symbols[rel_file]` and `gp.file_names[rel_file]` for immediate $O(1)$ resolved symbol `ast_id`.
      - **Step 0b (Phase 2 Snapshot)**: Checks `_phase2_symbols` and `_phase2_names` global symbol snapshots.
      - **Step 1 (Active Batch / LRU Cache)**: Inspects `batch_cs_dict` or `ChangeSet_Dict._lru_cache[rel_file]`. If evacuated, reads from `foreign_cs.resolved_symbols`.
-     - **Step 1b (Rule 24 Blocking Guard)**: If `rel_file` is an in-flight incomplete ChangeSet (`is_in_flight_changed` in `gp._changed_paths_set` or active in `ChangeSet_Dict` without `cs_processed`) and `force_stubs` is `False`, sets `self.blocked_on = rel_file` and returns `None` immediately, preventing redundant linear cache scans.
+     - **Step 1b (In-Flight Dependency Blocking Guard)**: If `rel_file` is an in-flight incomplete ChangeSet (`is_in_flight_changed` in `gp._changed_paths_set` or active in `ChangeSet_Dict` without `cs_processed`) and `force_stubs` is `False`, `resolve_ref()` sets `self.blocked_on = rel_file` and returns `None` immediately, preventing redundant linear cache scans.
      - **Step 2 (Database Fallback)**: Calls `gp.get_file_symbols_from_db(rel_file)` to retrieve symbol mappings for unchanged kernel files directly from the database.
      - **Step 3 (Circular Dependency Breaking)**: If `force_stubs=True` is enabled, stages a canonical `notbind` stub symbol via `m_ast.view` and logs a circular dependency warning.
   3. `parsed_route[0] == REF_POS`: Fetches directly from `self.cs[parsed_route[1]]` column `query[1]`.
@@ -325,7 +328,8 @@ PHASE 1: Streaming Ingestion & Opportunistic Leaf Execution (main.py:trigger_mul
   │
   ├─ Worker Pool (G.CPUS) parses files, populating CS.foreign_deps in CS.ref()
   ├─ Streams compressed batches into DependencyScheduler.ingest_batch()
-  ├─ Main Process drains immediately ready leaf ChangeSets (headers, self-contained files)
+  ├─ Leaf Execution Invariant: Main process exclusively executes ready leaf ChangeSets whose foreign dependencies
+  │  are completely satisfied (len(unresolved_deps) == 0). Incomplete files buffer into gp.ChangeSet_Dict without cascading retries.
   │  ├─ Success: extract_tags_and_evacuate_cs(CS) & registers resolved_symbols
   │  └─ Blocked: skipped without spinning, deferred for Phase 2
   ├─ As soon as parsing workers finish, trigger_multicore() exits immediately
@@ -392,6 +396,7 @@ Main Process (STEP 6.1+: Post-Processing Subsystems) TableEngine (G.TE)         
 
 ### 7.1. Unified Configuration Hierarchy
 - Configuration settings follow strict precedence: `CLI Flags > Environment Variables > config.json > Built-in Defaults`.
+- When configuring or synchronizing database parameters, both `DB_*` and `MYSQL_*` environment variables remain synchronized via `sync_environ()`, tracking internally exported keys in `_EXPORTED_ENV_VARS` via `_get_user_env()` to prevent environment self-pollution during configuration reloads.
 - Sections:
   - `"database"`: MariaDB/MySQL connection settings (`host`, `port`, `user`, `password`, `database`, `timeout`, `engine`).
   - `"webapp"`: FastApi server settings (`host`, `port`, `reload`).
