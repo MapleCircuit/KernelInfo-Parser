@@ -270,6 +270,21 @@ class ApiClient {
     return this.request(`/api/maintainers/${encodeURIComponent(ver)}/credits?${q}`, {}, cacheStore, cacheKey);
   }
 
+  async getDevelopers(version, options = {}) {
+    const ver = this._sanitizeVer(version);
+    const query = options.query || options.q || "";
+    const role = options.role || "all";
+    const sort = options.sort || "activity";
+    const params = new URLSearchParams();
+    if (query) params.set("q", query);
+    if (role && role !== "all") params.set("role", role);
+    if (sort) params.set("sort", sort);
+    const qs = params.toString() ? `?${params.toString()}` : "";
+    const cacheStore = (!query && role === "all" && sort === "activity") ? "maintainers" : null;
+    const cacheKey = (!query && role === "all" && sort === "activity") ? `m_devs_${ver}` : null;
+    return this.request(`/api/maintainers/${encodeURIComponent(ver)}/developers${qs}`, {}, cacheStore, cacheKey);
+  }
+
   // --- Commits ---
   async getCommits(version, page = 1, limit = 50, query = "") {
     const ver = this._sanitizeVer(version);

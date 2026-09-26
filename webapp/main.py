@@ -83,6 +83,7 @@ get_maintainers_overview = maintainer_service.get_overview
 get_maintainer_section_detail = maintainer_service.get_section_detail
 get_person_profile = maintainer_service.get_person_profile
 get_credits_overview = maintainer_service.get_credits
+get_developers = maintainer_service.get_developers
 match_patch_maintainers = maintainer_service.match_maintainers
 
 get_blame = git_service.get_blame

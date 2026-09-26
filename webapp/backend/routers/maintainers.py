@@ -61,3 +61,21 @@ def get_credits(version: str = Query("v3.0"), q: str = Query(""), version_name: 
     """Search historical CREDITS directory."""
     v = version_name or version
     return maintainer_service.get_credits(v, q)
+
+
+@router.get("/developers")
+@router.get("/developers/{version_name}")
+@router.get("/maintainers/{version_name}/developers")
+def get_developers(
+    version: str = Query("v3.0"),
+    q: str = Query(""),
+    query: str = Query(""),
+    role: str = Query("all"),
+    sort: str = Query("activity"),
+    version_name: str | None = None,
+) -> dict[str, Any]:
+    """Search and list all kernel developers, maintainers, reviewers, and contributors."""
+    v = version_name or version
+    target_q = query or q
+    return maintainer_service.get_developers(v, query=target_q, role=role, sort=sort)
+

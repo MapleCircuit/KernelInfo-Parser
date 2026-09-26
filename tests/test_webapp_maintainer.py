@@ -16,6 +16,7 @@ from webapp.main import (
     get_maintainer_section_detail,
     get_person_profile,
     get_credits_overview,
+    get_developers,
     browse_path,
     get_file_by_id,
 )
@@ -23,6 +24,69 @@ from webapp.main import (
 
 class TestWebAppMaintainerEndpoints(unittest.TestCase):
     """Test web application backend endpoints for Maintainer and Credits subsystems."""
+
+    def test_developers_roster_and_filtering(self) -> None:
+        """Verify get_developers roster, role filtering, and sorting mechanics."""
+        # 1. Total developers count
+        res = get_developers("v3.0")
+        self.assertIn("developers", res)
+        self.assertGreaterEqual(res["total_count"], 1000)
+        self.assertGreaterEqual(len(res["developers"]), 1000)
+
+        # 2. Activity sorting check (most active maintainers first)
+        devs_activity = res["developers"]
+        self.assertGreater(devs_activity[0]["subsystems_count"], 5)
+        self.assertGreaterEqual(devs_activity[0]["subsystems_count"], devs_activity[-1]["subsystems_count"])
+
+        # 3. Alphabetical sorting check
+        res_alpha = get_developers("v3.0", sort="alpha")
+        self.assertEqual(res_alpha["sort"], "alpha")
+        names = [d["name"] for d in res_alpha["developers"] if d["name"]]
+        self.assertEqual(names, sorted(names))
+
+        # 4. Search query filter
+        res_linus = get_developers("v3.0", q="Torvalds")
+        self.assertGreaterEqual(res_linus["total_count"], 1)
+        linus = next((d for d in res_linus["developers"] if "Torvalds" in d["name"]), None)
+        self.assertIsNotNone(linus)
+        self.assertIn("Linus", linus["name"])
+
+        # 5. Role filter: maintainer
+        res_m = get_developers("v3.0", role="maintainer")
+        self.assertGreaterEqual(res_m["total_count"], 500)
+        for d in res_m["developers"][:20]:
+            self.assertTrue(d["is_maintainer"])
+            self.assertEqual(d["primary_role"], "Maintainer")
+
+        # 6. Role filter: credits
+        res_c = get_developers("v3.0", role="credits")
+        self.assertGreaterEqual(res_c["total_count"], 400)
+        for d in res_c["developers"][:20]:
+            self.assertTrue(d["in_credits"])
+
+        # 7. Frontend component and CSS checks
+        base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        m_view_path = os.path.join(base_dir, "webapp", "frontend", "js", "views", "maintainers", "maintainers_view.js")
+        with open(m_view_path, "r", encoding="utf-8") as f:
+            mv_content = f.read()
+
+        self.assertIn('data-tab="developers">Developers</div>', mv_content)
+        self.assertIn('id="m-filter-toolbar"', mv_content)
+        self.assertIn('data-role="maintainer"', mv_content)
+        self.assertIn('id="btn-dev-sort"', mv_content)
+        self.assertIn('renderDevelopersList', mv_content)
+        self.assertIn('btn-view-person-commits', mv_content)
+
+        css_path = os.path.join(base_dir, "webapp", "frontend", "css", "maintainers.css")
+        with open(css_path, "r", encoding="utf-8") as f:
+            css_content = f.read()
+
+        self.assertIn('.m-filter-toolbar', css_content)
+        self.assertIn('.m-role-pill', css_content)
+        self.assertIn('.btn-dev-sort', css_content)
+        self.assertIn('.m-role-badge-m', css_content)
+        self.assertIn('.m-role-badge-r', css_content)
+        self.assertIn('.m-role-badge-c', css_content)
 
     def test_maintainers_overview_and_search(self) -> None:
         # Search for ext4 subsystem

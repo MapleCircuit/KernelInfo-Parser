@@ -99,6 +99,110 @@ class MaintainerService:
 
             return {"version": vname, "total_count": len(sections), "sections": sections}
 
+    def get_developers(
+        self,
+        version_name: str,
+        query: str = "",
+        q: str = "",
+        role: str = "all",
+        sort: str = "activity",
+    ) -> dict[str, Any]:
+        """List all developers, maintainers, reviewers, and contributors recorded in the kernel persona registry."""
+        target_q = query or q
+        clean_q = sanitize_like_query(target_q)
+        clean_role = (role or "all").strip().lower()
+        clean_sort = (sort or "activity").strip().lower()
+
+        with get_db_cursor() as cursor:
+            vid, vname = get_version_info(cursor, version_name)
+            if vid is None:
+                raise HTTPException(status_code=404, detail=f"Version '{version_name}' not found.")
+
+            sql = """
+                SELECT 
+                    p.person_id,
+                    p.name,
+                    p.email,
+                    COUNT(DISTINCT s.sec_id) AS subsystems_count,
+                    MAX(CASE WHEN m.role_type = 1 THEN 1 ELSE 0 END) AS is_maintainer,
+                    MAX(CASE WHEN m.role_type = 2 THEN 1 ELSE 0 END) AS is_reviewer,
+                    EXISTS(SELECT 1 FROM m_credits_entry c WHERE c.person_id = p.person_id) AS in_credits,
+                    EXISTS(SELECT 1 FROM m_commit com WHERE com.author_id = p.person_id) AS has_commits
+                FROM m_maintainer_person p
+                LEFT JOIN m_maintainer_member m ON p.person_id = m.person_id
+                LEFT JOIN m_maintainer_section s ON m.sec_id = s.sec_id AND s.vid_s <= %s AND (s.vid_e >= %s OR s.vid_e = 0)
+            """
+            params: list[Any] = [vid, vid]
+
+            where_clauses = []
+            if clean_q:
+                where_clauses.append("(LOWER(p.name) LIKE LOWER(%s) OR LOWER(p.email) LIKE LOWER(%s))")
+                like_str = f"%{clean_q}%"
+                params.extend([like_str, like_str])
+
+            if clean_role == "maintainer":
+                where_clauses.append("EXISTS (SELECT 1 FROM m_maintainer_member mem JOIN m_maintainer_section sec ON mem.sec_id = sec.sec_id WHERE mem.person_id = p.person_id AND mem.role_type = 1 AND sec.vid_s <= %s AND (sec.vid_e >= %s OR sec.vid_e = 0))")
+                params.extend([vid, vid])
+            elif clean_role == "reviewer":
+                where_clauses.append("EXISTS (SELECT 1 FROM m_maintainer_member mem JOIN m_maintainer_section sec ON mem.sec_id = sec.sec_id WHERE mem.person_id = p.person_id AND mem.role_type = 2 AND sec.vid_s <= %s AND (sec.vid_e >= %s OR sec.vid_e = 0))")
+                params.extend([vid, vid])
+            elif clean_role == "credits":
+                where_clauses.append("EXISTS (SELECT 1 FROM m_credits_entry c WHERE c.person_id = p.person_id)")
+
+            if where_clauses:
+                sql += " WHERE " + " AND ".join(where_clauses)
+
+            sql += " GROUP BY p.person_id, p.name, p.email"
+
+            if clean_sort == "alpha":
+                sql += " ORDER BY p.name ASC, subsystems_count DESC;"
+            else:
+                sql += " ORDER BY subsystems_count DESC, p.name ASC;"
+
+            cursor.execute(sql, tuple(params))
+            rows = cursor.fetchall()
+
+            developers = []
+            for r in rows:
+                p_name = safe_decode(r["name"])
+                p_email = safe_decode(r["email"])
+                sub_count = int(r["subsystems_count"] or 0)
+                is_m = bool(r["is_maintainer"])
+                is_r = bool(r["is_reviewer"])
+                in_cred = bool(r["in_credits"])
+                has_c = bool(r["has_commits"])
+
+                if is_m:
+                    primary_role = "Maintainer"
+                elif is_r:
+                    primary_role = "Reviewer"
+                elif in_cred:
+                    primary_role = "Credits"
+                elif has_c:
+                    primary_role = "Author"
+                else:
+                    primary_role = "Developer"
+
+                developers.append({
+                    "person_id": r["person_id"],
+                    "name": p_name,
+                    "email": p_email,
+                    "subsystems_count": sub_count,
+                    "is_maintainer": is_m,
+                    "is_reviewer": is_r,
+                    "in_credits": in_cred,
+                    "has_commits": has_c,
+                    "primary_role": primary_role,
+                })
+
+            return {
+                "version": vname,
+                "total_count": len(developers),
+                "role_filter": clean_role,
+                "sort": clean_sort,
+                "developers": developers,
+            }
+
     def get_section_detail(self, version_name: str, section_name: str) -> dict[str, Any]:
         """Retrieve subsystem details, pattern rules, and file matches."""
         with get_db_cursor() as cursor:
@@ -646,3 +750,7 @@ class MaintainerService:
             "reviewers": [{**r, "roles": list(r["roles"]), "subsystems": list(r["subsystems"])} for r in all_reviewers.values()],
             "mailing_lists": sorted(all_lists),
         }
+
+
+maintainer_service = MaintainerService()
+

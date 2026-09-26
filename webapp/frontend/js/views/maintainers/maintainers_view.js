@@ -9,9 +9,13 @@ import { debounce } from "../../utils/debounce.js";
 export class MaintainersView {
   constructor() {
     this.currentVersion = "v3.0";
-    this.activeTab = "subsystems"; // 'subsystems' | 'credits' | 'patch'
+    this.activeTab = "subsystems"; // 'subsystems' | 'developers' | 'credits' | 'patch'
     this.subsystems = [];
+    this.developers = [];
     this.selectedSecId = null;
+    this.selectedPersonId = null;
+    this.currentDevRole = "all";
+    this.currentDevSort = "activity";
     this.containerEl = null;
   }
 
@@ -25,11 +29,24 @@ export class MaintainersView {
         <div class="maintainers-sidebar">
           <div class="maintainers-nav-tabs">
             <div class="m-nav-tab ${this.activeTab === "subsystems" ? "active" : ""}" data-tab="subsystems">Subsystems</div>
+            <div class="m-nav-tab ${this.activeTab === "developers" ? "active" : ""}" data-tab="developers">Developers</div>
             <div class="m-nav-tab ${this.activeTab === "credits" ? "active" : ""}" data-tab="credits">CREDITS</div>
             <div class="m-nav-tab ${this.activeTab === "patch" ? "active" : ""}" data-tab="patch">Patch Reviewer</div>
           </div>
           <div style="padding:8px 12px;border-bottom:1px solid var(--border-color);">
             <input type="text" id="m-search-input" placeholder="Search subsystems, names, emails..." style="width:100%;" />
+          </div>
+          <!-- Developers Filter & Sort Toolbar -->
+          <div id="m-filter-toolbar" class="m-filter-toolbar" style="${this.activeTab === "developers" ? "display:flex;" : "display:none;"}">
+            <div class="m-role-pills" id="m-role-pills">
+              <span class="m-role-pill ${this.currentDevRole === "all" ? "active" : ""}" data-role="all">All</span>
+              <span class="m-role-pill ${this.currentDevRole === "maintainer" ? "active" : ""}" data-role="maintainer">Maintainers</span>
+              <span class="m-role-pill ${this.currentDevRole === "reviewer" ? "active" : ""}" data-role="reviewer">Reviewers</span>
+              <span class="m-role-pill ${this.currentDevRole === "credits" ? "active" : ""}" data-role="credits">CREDITS</span>
+            </div>
+            <button id="btn-dev-sort" class="btn-dev-sort" title="Toggle Sort (Activity / A-Z)">
+              ${this.currentDevSort === "alpha" ? "🔤 A-Z" : "⚡ Activity"}
+            </button>
           </div>
           <div class="maintainers-list" id="m-list-container">
             <div style="padding:16px;color:var(--text-muted);">Loading subsystems...</div>
@@ -51,9 +68,48 @@ export class MaintainersView {
         this.activeTab = tab.dataset.tab;
         containerEl.querySelectorAll(".m-nav-tab").forEach((t) => t.classList.remove("active"));
         tab.classList.add("active");
-        this.loadList();
+
+        const filterToolbar = containerEl.querySelector("#m-filter-toolbar");
+        if (filterToolbar) {
+          filterToolbar.style.display = this.activeTab === "developers" ? "flex" : "none";
+        }
+
+        const searchInput = containerEl.querySelector("#m-search-input");
+        if (this.activeTab === "developers") {
+          searchInput.placeholder = "Search developers, names, emails...";
+        } else if (this.activeTab === "subsystems") {
+          searchInput.placeholder = "Search subsystems, names, emails...";
+        } else if (this.activeTab === "credits") {
+          searchInput.placeholder = "Search CREDITS entries...";
+        } else {
+          searchInput.placeholder = "Search...";
+        }
+
+        this.loadList(searchInput.value.trim());
       };
     });
+
+    // Developer role filter pills
+    containerEl.querySelectorAll(".m-role-pill").forEach((pill) => {
+      pill.onclick = () => {
+        this.currentDevRole = pill.dataset.role;
+        containerEl.querySelectorAll(".m-role-pill").forEach((p) => p.classList.remove("active"));
+        pill.classList.add("active");
+        const searchInput = containerEl.querySelector("#m-search-input");
+        this.loadList(searchInput.value.trim());
+      };
+    });
+
+    // Developer sort toggle
+    const sortBtn = containerEl.querySelector("#btn-dev-sort");
+    if (sortBtn) {
+      sortBtn.onclick = () => {
+        this.currentDevSort = this.currentDevSort === "activity" ? "alpha" : "activity";
+        sortBtn.textContent = this.currentDevSort === "alpha" ? "🔤 A-Z" : "⚡ Activity";
+        const searchInput = containerEl.querySelector("#m-search-input");
+        this.loadList(searchInput.value.trim());
+      };
+    }
 
     // Search filter
     const searchInput = containerEl.querySelector("#m-search-input");
@@ -82,6 +138,18 @@ export class MaintainersView {
       } catch (e) {
         listContainer.innerHTML = `<div style="padding:16px;color:var(--accent-red);">Failed: ${e.message}</div>`;
       }
+    } else if (this.activeTab === "developers") {
+      try {
+        const res = await api.getDevelopers(this.currentVersion, {
+          query,
+          role: this.currentDevRole,
+          sort: this.currentDevSort,
+        });
+        this.developers = res.developers || [];
+        this.renderDevelopersList(this.developers);
+      } catch (e) {
+        listContainer.innerHTML = `<div style="padding:16px;color:var(--accent-red);">Failed: ${e.message}</div>`;
+      }
     } else if (this.activeTab === "credits") {
       try {
         const res = await api.getCredits(this.currentVersion, query);
@@ -89,10 +157,69 @@ export class MaintainersView {
       } catch (e) {
         listContainer.innerHTML = `<div style="padding:16px;color:var(--accent-red);">Failed: ${e.message}</div>`;
       }
-
     } else if (this.activeTab === "patch") {
       this.renderPatchReviewer();
     }
+  }
+
+  renderDevelopersList(developers) {
+    const listContainer = this.containerEl.querySelector("#m-list-container");
+    listContainer.innerHTML = "";
+
+    if (!developers || developers.length === 0) {
+      listContainer.innerHTML = `<div style="padding:16px;color:var(--text-muted);text-align:center;">No developers matching the criteria.</div>`;
+      return;
+    }
+
+    developers.forEach((d) => {
+      const card = document.createElement("div");
+      card.className = `subsystem-card dev-card ${d.person_id === this.selectedPersonId ? "active" : ""}`;
+
+      const roleBadges = [];
+      if (d.is_maintainer) {
+        roleBadges.push(`<span class="m-role-badge m-role-badge-m">Maintainer</span>`);
+      }
+      if (d.is_reviewer) {
+        roleBadges.push(`<span class="m-role-badge m-role-badge-r">Reviewer</span>`);
+      }
+      if (d.in_credits) {
+        roleBadges.push(`<span class="m-role-badge m-role-badge-c">CREDITS</span>`);
+      }
+
+      card.innerHTML = `
+        <div class="subsystem-name">
+          <span style="font-weight:600;">${this.escapeHtml(d.name || d.email || "Unknown")}</span>
+          ${d.subsystems_count > 0 ? `<span class="dev-subsystems-count">${d.subsystems_count} ${d.subsystems_count === 1 ? "subsystem" : "subsystems"}</span>` : ""}
+        </div>
+        <div class="subsystem-lead" style="display:flex;align-items:center;justify-content:space-between;gap:6px;margin-top:4px;">
+          <span class="dev-email-text" title="${this.escapeHtml(d.email || "")}">${this.escapeHtml(d.email || "")}</span>
+          <div class="dev-badges-group">${roleBadges.join("")}</div>
+        </div>
+      `;
+
+      card.onclick = () => {
+        this.selectedPersonId = d.person_id;
+        this.containerEl.querySelectorAll(".subsystem-card").forEach((c) => c.classList.remove("active"));
+        card.classList.add("active");
+        this.inspectPerson(d.person_id || d.email || d.name);
+      };
+
+      card.addEventListener("auxclick", (e) => {
+        if (e.button === 1) {
+          e.preventDefault();
+          e.stopPropagation();
+          state.openTab({
+            type: "maintainers",
+            title: `Person: ${d.name || d.email}`,
+            version: this.currentVersion,
+            person: d.person_id || d.email,
+            forceNew: true
+          });
+        }
+      });
+
+      listContainer.appendChild(card);
+    });
   }
 
   renderSubsystemsList() {
@@ -344,6 +471,12 @@ export class MaintainersView {
             }
           </div>
         </div>
+
+        <div style="margin-top:16px;display:flex;gap:8px;">
+          <button id="btn-view-person-commits" class="code-btn active" style="font-size:12px;padding:6px 12px;cursor:pointer;">
+            View Commits by ${this.escapeHtml(p.name || p.email)}
+          </button>
+        </div>
       `;
 
       // Clicking a maintained subsystem opens it
@@ -351,14 +484,50 @@ export class MaintainersView {
         el.onclick = async () => {
           this.activeTab = "subsystems";
           this.containerEl.querySelectorAll(".m-nav-tab").forEach((t) => t.classList.toggle("active", t.dataset.tab === "subsystems"));
+          const filterToolbar = this.containerEl.querySelector("#m-filter-toolbar");
+          if (filterToolbar) filterToolbar.style.display = "none";
           this.selectedSecId = parseInt(el.dataset.id, 10);
           await this.loadList();
           this.inspectSection(el.dataset.id);
         };
+        el.addEventListener("auxclick", (e) => {
+          if (e.button === 1) {
+            e.preventDefault();
+            e.stopPropagation();
+            state.openTab({
+              type: "maintainers",
+              title: `Subsystem: ${el.querySelector("span")?.textContent || "Detail"}`,
+              version: this.currentVersion,
+              forceNew: true
+            });
+          }
+        });
       });
+
+      const commitsBtn = detailEl.querySelector("#btn-view-person-commits");
+      if (commitsBtn) {
+        commitsBtn.onclick = () => {
+          state.openTab({
+            type: "commits",
+            title: `Commits: ${p.name || p.email}`,
+            version: this.currentVersion,
+            query: p.name || p.email,
+          });
+        };
+      }
     } catch (e) {
       detailEl.innerHTML = `<div style="color:var(--accent-red);padding:16px;">Failed to load person profile: ${e.message}</div>`;
     }
+  }
+
+  escapeHtml(str) {
+    if (!str) return "";
+    return String(str)
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;")
+      .replace(/'/g, "&#039;");
   }
 
   renderPatchReviewer() {

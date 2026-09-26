@@ -981,6 +981,38 @@ Search historical `CREDITS` file entries and biographical details.
 }
 ```
 
+#### `GET /api/maintainers/{version_name}/developers`
+#### `GET /api/developers/{version_name}`
+#### `GET /api/developers`
+Search and list all kernel developers, maintainers, reviewers, and contributors recorded in the kernel persona registry (`m_maintainer_person`).
+- **Parameters**:
+  - `version_name` (path) / `version` (query): Kernel version string.
+  - `q` / `query` (query): Case-insensitive search on developer name or email.
+  - `role` (query): Role filter (`"all"`, `"maintainer"`, `"reviewer"`, `"credits"`). Default `"all"`.
+  - `sort` (query): Sort order (`"activity"` for subsystems count descending, or `"alpha"` for alphabetical A-Z). Default `"activity"`.
+- **Response**:
+```json
+{
+  "version": "v3.0",
+  "total_count": 1171,
+  "role_filter": "all",
+  "sort": "activity",
+  "developers": [
+    {
+      "person_id": 72,
+      "name": "Lennert Buytenhek",
+      "email": "kernel@wantstofly.org",
+      "subsystems_count": 20,
+      "is_maintainer": true,
+      "is_reviewer": false,
+      "in_credits": true,
+      "has_commits": false,
+      "primary_role": "Maintainer"
+    }
+  ]
+}
+```
+
 ---
 
 ### 4.6. Git Commits & Patch Management API
@@ -1267,6 +1299,7 @@ Handles unified HTTP communication, response caching, and offline fallback:
 - `getIncludeSymbols(version, astId, options)`: Fetches imported symbols for an include, supporting fallback lookup options (`filePath`, `line`, `header`, `tagId`).
 - `getSymbolDetail(version, name)` / `getSymbolXref(version, name)`: Symbol inspection.
 - `getMaintainersOverview(version, query)` / `getMaintainerSection(version, secId)`: Subsystems.
+- `getDevelopers(version, options)`: Full kernel persona directory with role filtering and activity/alpha sorting.
 - `getPersonProfile(version, idOrEmail)`: Developer profiles.
 
 ### 5.2. `AstOverlay` (`webapp/frontend/js/views/code_view/ast_overlay.js`)
@@ -1401,9 +1434,13 @@ The frontend implements systematic middle-click capture (`auxclick` with `e.butt
    - In the **Cross-References (XRef)** and **Included Symbols** modals, middle-clicking definitions or usage links opens the target code tabs with `forceNew: true` while preserving the modal backdrop, allowing users to queue multiple references into separate tabs without re-opening search modals.
 
 ### 5.10. Developer Profiles & Kconfig Compiled Source Navigation
-1. **Interactive Developer Profile Modal (`showPersonModal`)**:
+1. **Interactive Developer Profile Modal (`showPersonModal`) & Maintainers Sub-Tab**:
    - Clicking developer names across the workspace (Commit author headers, Contributors & Signoffs lists, Commit cards, Git Blame gutters, and Blame context popovers) activates the universal Developer Profile modal (`webapp/frontend/js/components/person_modal.js`).
    - Displays avatar initials, author email, CREDITS biographical data (description, project URL, PGP keys, snail mail), Git stats (authored commits count), and maintained subsystems.
+   - **Maintainers "Developers" Directory**:
+     - The Maintainers view incorporates a dedicated **"Developers"** directory (`Subsystems` | `Developers` | `CREDITS` | `Patch Reviewer`) listing all 1,170+ personas from `m_maintainer_person`.
+     - Supports live name/email search, category filter pills (`All`, `Maintainers`, `Reviewers`, `CREDITS`), and an Activity (subsystems count) vs. A-Z alphabetical sort toggle.
+     - Selecting any developer renders their complete profile card in the detail pane with maintained subsystems (clickable to jump into the Subsystems tab) and a direct "View All Commits" action button.
    - Provides 1-click elevation actions:
      - **Open in Maintainers Tab**: Focuses or launches `state.openTab({ type: "maintainers", person: ... })`, inspecting the developer's complete subsystem roster and contribution graph.
      - **View Commits**: Focuses or launches `state.openTab({ type: "commits", query: ... })`, filtering the commit history by author name or email.
@@ -1456,6 +1493,7 @@ from webapp.main import (
     get_maintainer_section_detail,
     get_person_profile,
     get_credits_overview,
+    get_developers,
     match_patch_maintainers,
     
     # Git & Blame
