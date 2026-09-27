@@ -335,8 +335,11 @@ class TEDirectDB:
 
         pk_fn = self._pk_getters.get(table_id)
         pk = self._sanitize_key(pk_fn(columns) if pk_fn is not None else itemgetter(*table.primary)(columns))
-        if (table.primary == ("hash",) or table.table_name in ("m_tag_code", "m_ast_hash")) and pk in self._committed_pks.get(table_id, set()):
-            return columns
+        if getattr(table, "init_primary", ()) == ("hash",) or table.table_name in ("m_tag_code", "m_ast_hash"):
+            if pk in self.queued_set[table_id] or pk in self._committed_pks.get(table_id, set()):
+                return columns
+        elif pk in self.queued_set[table_id]:
+            raise ValueError(f"Duplicate primary key '{pk}' in table '{table.table_name}'")
         self.queued_set[table_id][pk] = columns
         return columns
 
@@ -391,7 +394,12 @@ class TEDirectDB:
         table = self.tables.get(initial_table_id)
         if table is None:
             return None
-        if table.initial_insert is None and self.next_id.get(initial_table_id, 0) <= 1:
+        if (
+            getattr(table, "has_auto_increment", True)
+            and table.initial_insert is None
+            and self.next_id.get(initial_table_id, 0) <= 1
+            and (initial_table_id not in self.queued_set or not self.queued_set[initial_table_id])
+        ):
             return None
 
         filtered_columns = tuple(val for val in columns if val is not None)
@@ -596,7 +604,7 @@ class TEDirectDB:
                     row = v if isinstance(v, (tuple, list)) else ((v, *k) if isinstance(k, tuple) else (v, k))
                     rows.append(row)
                     committed_map[k] = row[0]
-            elif table.primary == ("hash",) or table.table_name in ("m_tag_code", "m_ast_hash"):
+            elif getattr(table, "init_primary", ()) == ("hash",) or table.table_name in ("m_tag_code", "m_ast_hash"):
                 committed_pks = self._committed_pks.setdefault(table_id, set())
                 rows = []
                 for pk, row in self.queued_set[table_id].items():
@@ -650,7 +658,7 @@ class TEDirectDB:
                         row = v if isinstance(v, (tuple, list)) else ((v, *k) if isinstance(k, tuple) else (v, k))
                         rows.append(row)
                         committed_map[k] = row[0]
-                elif table.primary == ("hash",) or table.table_name in ("m_tag_code", "m_ast_hash"):
+                elif getattr(table, "init_primary", ()) == ("hash",) or table.table_name in ("m_tag_code", "m_ast_hash"):
                     committed_pks = self._committed_pks.setdefault(table_id, set())
                     rows = []
                     for pk, row in self.queued_set[table_id].items():

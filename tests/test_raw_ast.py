@@ -68,6 +68,7 @@ class TestRawAstParser(unittest.TestCase):
     """Test suite for fallback raw content AST parser."""
 
     def setUp(self) -> None:
+        MockDB.reset()
         G.DB = MockDB
         G.TE = TECachedDB()
         self.gp = GreatProcessor()
@@ -448,6 +449,7 @@ class TestSymlinkAliasing(unittest.TestCase):
         from main import MF as main_MF
         from main import file_fid_cache
         from main import gp as main_gp
+        MockDB.reset()
         G.DB = MockDB
         G.TE = TECachedDB()
         self.gp = GreatProcessor()

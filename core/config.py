@@ -315,6 +315,8 @@ def load_config(config_path: str | Path | None = None) -> dict[str, dict[str, An
 def init_config(custom_path: str | Path | None = None) -> dict[str, dict[str, Any]]:
     """Initialize or re-initialize the active global configuration."""
     global _ACTIVE_CONFIG
+    if custom_path is None and _ACTIVE_CONFIG is not None:
+        return _ACTIVE_CONFIG
     _ACTIVE_CONFIG = load_config(custom_path)
     return _ACTIVE_CONFIG
 

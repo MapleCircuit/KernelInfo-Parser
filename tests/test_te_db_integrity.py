@@ -232,6 +232,8 @@ class TestDBEngineIntegrity(unittest.TestCase):
 
     def setUp(self) -> None:
         """Create fresh DB instance and create fake tables."""
+        if hasattr(CONFIGURED_DB_ENGINE_CLS, "reset"):
+            CONFIGURED_DB_ENGINE_CLS.reset()
         self.db = CONFIGURED_DB_ENGINE_CLS()
         self.addCleanup(self._cleanup_db)
         self.db.drop_table(ALL_FAKE_TABLES)
@@ -466,6 +468,8 @@ class TestTableEngineIntegrity(unittest.TestCase):
 
     def setUp(self) -> None:
         """Set up fresh database and start TableEngine with fake tables."""
+        if hasattr(CONFIGURED_DB_ENGINE_CLS, "reset"):
+            CONFIGURED_DB_ENGINE_CLS.reset()
         self.db = CONFIGURED_DB_ENGINE_CLS()
         self.db.drop_table(ALL_FAKE_TABLES)
         self.db.create_table(ALL_FAKE_TABLES)
@@ -682,6 +686,7 @@ class TestTECachedDBIntegrity(unittest.TestCase):
 
     def setUp(self) -> None:
         """Initialize DB and TECachedDB with clean fake tables."""
+        MockDB.reset()
         self.db = MockDB()
         self.db.drop_table(ALL_FAKE_TABLES)
         self.db.create_table(ALL_FAKE_TABLES)
@@ -1336,7 +1341,7 @@ class TestTECachedDBIntegrity(unittest.TestCase):
             self.assertEqual(old_row[1], "cached_alpha")
 
             # Update row 1 locally
-            updated = te.set(fake_tbl_cached.table_id, (1, "cached_alpha_mutated", 999))
+            updated = te.update(fake_tbl_cached.table_id, (1, "cached_alpha_mutated", 999))
             self.assertEqual(updated[1], "cached_alpha_mutated")
 
             # te.get must return the local overlay, not the frozen baseline in shared buffer
@@ -1375,6 +1380,8 @@ class TestDBAndTEIntegration(unittest.TestCase):
 
     def setUp(self) -> None:
         """Initialize DB and TE with clean fake tables."""
+        if hasattr(CONFIGURED_DB_ENGINE_CLS, "reset"):
+            CONFIGURED_DB_ENGINE_CLS.reset()
         self.db = CONFIGURED_DB_ENGINE_CLS()
         self.db.drop_table(ALL_FAKE_TABLES)
         self.db.create_table(ALL_FAKE_TABLES)

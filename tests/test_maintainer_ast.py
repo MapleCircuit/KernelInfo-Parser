@@ -290,6 +290,7 @@ class TestMaintainerAndCreditsIntegration(unittest.TestCase):
     """Test AST generation, ChangeSet emission, and database ingestion with MockDB."""
 
     def setUp(self) -> None:
+        MockDB.reset()
         G.DB = MockDB
         G.TE = TECachedDB()
         self.gp = GreatProcessor()

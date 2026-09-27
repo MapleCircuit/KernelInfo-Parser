@@ -76,12 +76,12 @@ class TestWebappSystem(unittest.TestCase):
         """Verify parser helper ensure_db_instance checks and seeds m_db_instance if empty."""
         mock_db = MagicMock()
         # Case 1: Already has row
-        mock_db.get.return_value = [(1, "hash123", 100)]
+        mock_db.select.return_value = ("hash123", 100)
         ensure_db_instance(mock_db)
         mock_db.insert.assert_not_called()
 
         # Case 2: Empty table
-        mock_db.get.return_value = None
+        mock_db.select.return_value = None
         ensure_db_instance(mock_db)
         mock_db.insert.assert_called_once()
         self.assertEqual(mock_db.insert.call_args[0][0], m_db_instance)

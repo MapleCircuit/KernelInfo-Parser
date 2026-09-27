@@ -183,9 +183,11 @@ class GlobalStuff:
         if self.BP_ON_SHUTDOWN:
             self.BP()
 
-        for directory in sys.modules["__main__"].gp.PURGE_LIST:
-            with contextlib.suppress(Exception):
-                shutil.rmtree(directory)
+        gp_obj = getattr(sys.modules.get("__main__"), "gp", None)
+        if gp_obj and hasattr(gp_obj, "PURGE_LIST"):
+            for directory in gp_obj.PURGE_LIST:
+                with contextlib.suppress(Exception):
+                    shutil.rmtree(directory)
         with contextlib.suppress(Exception):
             from core.ssh_tunnel import stop_ssh_tunnel
             stop_ssh_tunnel()

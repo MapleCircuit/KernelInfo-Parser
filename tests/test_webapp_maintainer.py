@@ -11,6 +11,7 @@ from typing import Any
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from webapp.backend.database.pool import get_db_cursor
 from webapp.main import (
     get_maintainers_overview,
     get_maintainer_section_detail,
@@ -24,6 +25,20 @@ from webapp.main import (
 
 class TestWebAppMaintainerEndpoints(unittest.TestCase):
     """Test web application backend endpoints for Maintainer and Credits subsystems."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        try:
+            with get_db_cursor() as cur:
+                cur.execute("SELECT COUNT(*) as c FROM m_maintainer_section;")
+                row = cur.fetchone()
+                count = row.get("c", 0) if isinstance(row, dict) else (row[0] if row else 0)
+                if count == 0:
+                    raise unittest.SkipTest("m_maintainer_section is not populated in active database.")
+        except unittest.SkipTest:
+            raise
+        except Exception as e:
+            raise unittest.SkipTest(f"Database check failed: {e}")
 
     def test_developers_roster_and_filtering(self) -> None:
         """Verify get_developers roster, role filtering, and sorting mechanics."""

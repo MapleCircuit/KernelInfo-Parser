@@ -148,7 +148,8 @@ def reclaim_system_memory() -> None:
 def ensure_db_instance(db: Any) -> None:
     """Ensure that the database instance fingerprint table m_db_instance has at least 1 seed row."""
     try:
-        res = db.get(m_db_instance, None, None)
+        empty_filter = (None,) * m_db_instance.length
+        res = db.select(m_db_instance, empty_filter)
         if not res:
             logger.info("m_db_instance is empty; seeding initial database instance fingerprint...")
             init_row = ((secrets.token_hex(32), int(time.time())),)
@@ -1315,7 +1316,8 @@ def arg_handling() -> argparse.Namespace:
     )
     args = parser.parse_args()
 
-    init_config(args.config)
+    if args.config is not None:
+        init_config(args.config)
     parser_cfg = get_parser_config()
     db_cfg = get_db_config()
     ssh_cfg = get_ssh_tunnel_config()
@@ -1410,6 +1412,9 @@ def arg_handling() -> argparse.Namespace:
         import unittest
         loader = unittest.TestLoader()
         test_modules = [
+            "unit_test.test_db_engine",
+            "unit_test.test_table_engine",
+            "unit_test.test_table_handling",
             "tests.test_maintainer_ast",
             "tests.test_credits_lifecycle",
             "tests.test_bridge_map_dedup",
@@ -2489,6 +2494,7 @@ def processing_maintainer_files(version: str) -> None:
     logger.info(f"Matching {len(all_files)} files against {len(sections)} maintainer sections for version '{version}'...")
 
     matched_count = 0
+    seen_pairs: set[tuple[int, int]] = set()
     for file_path in all_files:
         matched_sections = matcher.match_file(file_path)
         if not matched_sections:
@@ -2499,6 +2505,10 @@ def processing_maintainer_files(version: str) -> None:
         for sec in matched_sections:
             sec_id = get_sec_id_for_name(sec.name)
             if sec_id is not None:
+                pair = (fid, sec_id)
+                if pair in seen_pairs:
+                    continue
+                seen_pairs.add(pair)
                 G.TE.set(
                     m_maintainer_file.table_id,
                     (

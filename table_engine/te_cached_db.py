@@ -274,7 +274,7 @@ class TECachedDB(TEDirectDB):
                 self._ensure_table(table_id)
                 if table.no_duplicate:
                     self._committed_nodup_keys[table_id] = dict(self._nodup_index.get(table_id, {}))
-                if table.primary == ("hash",) or table.table_name in ("m_tag_code", "m_ast_hash"):
+                if getattr(table, "init_primary", ()) == ("hash",) or table.table_name in ("m_tag_code", "m_ast_hash"):
                     self._committed_pks[table_id] = set(self._pk_index.get(table_id, {}).keys())
                 if self.db is not None:
                     try:
@@ -347,7 +347,7 @@ class TECachedDB(TEDirectDB):
             t_id = table.table_id
             if table.no_duplicate:
                 self._committed_nodup_keys[t_id] = dict(self._nodup_index.get(t_id, {}))
-            if table.primary == ("hash",) or table.table_name in ("m_tag_code", "m_ast_hash"):
+            if getattr(table, "init_primary", ()) == ("hash",) or table.table_name in ("m_tag_code", "m_ast_hash"):
                 self._committed_pks[t_id] = set(self._pk_index.get(t_id, {}).keys())
 
         # Build structured shared memory segment with huge pages if enabled
@@ -566,29 +566,27 @@ class TECachedDB(TEDirectDB):
         pk_fn = self._pk_getters.get(table_id)
         pk = self._sanitize_key(pk_fn(columns) if pk_fn is not None else itemgetter(*table.primary)(columns))
 
-        existing_row = self._pk_index[table_id].get(pk)
-        if existing_row is not None:
-            proj_row = self._project_row(table, columns)
-            if existing_row == proj_row:
+        if getattr(table, "init_primary", ()) == ("hash",) or table.table_name in ("m_tag_code", "m_ast_hash"):
+            if pk in self.queued_set[table_id]:
                 return columns
-
-            self._unindex_row(table, existing_row)
-            pos = self._cached_rows_pos[table_id].get(pk)
-            if pos is not None and pos < len(self._cached_rows[table_id]) and self._cached_rows[table_id][pos] == existing_row:
-                self._cached_rows[table_id][pos] = proj_row
-            else:
-                try:
-                    self._cached_rows[table_id].remove(existing_row)
-                except ValueError:
-                    pass
-                pos = len(self._cached_rows[table_id])
-                self._cached_rows[table_id].append(proj_row)
-                self._cached_rows_pos[table_id][pk] = pos
+            existing_row = self._pk_index[table_id].get(pk)
+            if existing_row is not None:
+                proj_row = self._project_row(table, columns)
+                if existing_row == proj_row:
+                    return columns
+            if pk in self._committed_pks.get(table_id, set()):
+                return columns
         else:
-            proj_row = self._project_row(table, columns)
-            pos = len(self._cached_rows[table_id])
-            self._cached_rows[table_id].append(proj_row)
-            self._cached_rows_pos[table_id][pk] = pos
+            if pk in self.queued_set[table_id]:
+                raise ValueError(f"Duplicate primary key '{pk}' in table '{table.table_name}'")
+            existing_row = self._pk_index[table_id].get(pk)
+            if existing_row is not None:
+                raise ValueError(f"Duplicate primary key '{pk}' in table '{table.table_name}'")
+
+        proj_row = self._project_row(table, columns)
+        pos = len(self._cached_rows[table_id])
+        self._cached_rows[table_id].append(proj_row)
+        self._cached_rows_pos[table_id][pk] = pos
 
         self.queued_set[table_id][pk] = columns
         self._index_row(table, proj_row)

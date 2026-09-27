@@ -128,6 +128,52 @@ class MockDB(BaseDBEngine):
                 pk_idx = primaries[0]
                 for row in data:
                     pk = row[pk_idx]
+                    if pk in table_dict:
+                        raise ValueError(f"Duplicate entry for primary key '{pk}' in table '{table.table_name}'")
+                    table_dict[pk] = tuple(row)
+                    if isinstance(pk, int) and pk >= curr_next_id:
+                        curr_next_id = pk + 1
+            else:
+                pk_0 = primaries[0]
+                for row in data:
+                    pk = tuple(row[i] for i in primaries)
+                    if pk in table_dict:
+                        raise ValueError(f"Duplicate entry for primary key '{pk}' in table '{table.table_name}'")
+                    table_dict[pk] = tuple(row)
+                    first_val = row[pk_0]
+                    if isinstance(first_val, int) and first_val >= curr_next_id:
+                        curr_next_id = first_val + 1
+        else:
+            for row in data:
+                pk = row[0] if len(row) > 0 else id(row)
+                if pk in table_dict:
+                    raise ValueError(f"Duplicate entry for row in table '{table.table_name}'")
+                table_dict[pk] = tuple(row)
+                if isinstance(pk, int) and pk >= curr_next_id:
+                    curr_next_id = pk + 1
+
+        self.tables_next_id[table.table_name] = curr_next_id
+
+    def update(
+        self,
+        table: Table,
+        data: tuple[tuple[SafeDataType, ...], ...] | tuple[SafeDataType, ...],
+    ) -> None:
+        """Batch upsert/update rows into in-memory table store."""
+        if not data:
+            return
+        if not isinstance(data[0], (tuple, list)):
+            data = (data,)  # type: ignore[assignment]
+
+        table_dict = self.tables_data[table.table_name]
+        primaries = table.primary
+        curr_next_id = self.tables_next_id.get(table.table_name, 1)
+
+        if primaries:
+            if len(primaries) == 1:
+                pk_idx = primaries[0]
+                for row in data:
+                    pk = row[pk_idx]
                     table_dict[pk] = tuple(row)
                     if isinstance(pk, int) and pk >= curr_next_id:
                         curr_next_id = pk + 1
@@ -147,14 +193,6 @@ class MockDB(BaseDBEngine):
                     curr_next_id = pk + 1
 
         self.tables_next_id[table.table_name] = curr_next_id
-
-    def update(
-        self,
-        table: Table,
-        data: tuple[tuple[SafeDataType, ...], ...] | tuple[SafeDataType, ...],
-    ) -> None:
-        """Batch upsert/update rows into in-memory table store."""
-        self.insert(table, data)
 
     def commit_tables_parallel(
         self,

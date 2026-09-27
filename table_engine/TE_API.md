@@ -167,9 +167,10 @@ Internal helper methods used exclusively by `TECachedDB` to synchronize in-memor
     - Returns `row`.
   - **Case 3 (Explicit Primary Key Provided)**:
     - Extracts `pk = itemgetter(*table.primary)(columns)`.
-    - **O(1) Fast-Path (Rule 16)**: In `TECachedDB`, if `pk in _pk_index[table_id]`, checks if the projected row matches the cached row. If identical, returns `columns` immediately in $O(1)$ without re-indexing, memory allocations, or linear scans.
+    - **Cryptographic Hash Fast-Path**: For cryptographic hash tables (`init_primary == ("hash",)` or `m_tag_code`, `m_ast_hash`), returns existing row if already staged or present in committed cache.
+    - **Duplicate Primary Key Rejection**: For standard relational tables, `set()` enforces database-level primary key uniqueness: if `pk` is already staged in `queued_set[table_id]` (or present in cache for `TECachedDB`), `set()` raises `ValueError(f"Duplicate primary key '{pk}' in table '{table.table_name}'")`. Callers must use `update()` to modify existing records, or `get_set()` / `no_duplicate=True` to safely avoid duplicate inserts.
     - Stages `queued_set[table_id][pk] = columns`.
-    - In `TECachedDB`: Unindexes any old row matching `pk`, appends `columns` to `_cached_rows`, and calls `_index_row()`.
+    - In `TECachedDB`: Appends `columns` to `_cached_rows`, and calls `_index_row()`.
     - Returns `columns`.
 - **`update(table_id: int, columns: tuple[SafeDataType, ...]) -> tuple[SafeDataType, ...]`**
   - Appends `columns` to `self.queued_update[table_id]`.
@@ -182,7 +183,7 @@ Internal helper methods used exclusively by `TECachedDB` to synchronize in-memor
 
 - **`view_get(joins: JoinsType, columns: tuple[SafeDataType, ...]) -> tuple[SafeDataType, ...] | None`**
   - `initial_table_id = PointerGetter(joins).get_first_table_id()`.
-  - If `tables[initial_table_id].initial_insert is None and next_id[initial_table_id] <= 1`: returns `None`.
+  - If `getattr(table, "has_auto_increment", True) and table.initial_insert is None and next_id[initial_table_id] <= 1 and initial table has no staged entries`: returns `None`.
   - **Schema-Driven Hash Fast-Path**: If `table.hashing_table` is configured:
     1. Computes SHA-256 hash `h = compute_ast_hash(joins, filtered_columns)`.
     2. Checks staged buffer: `staged_row = self.queued_set.get(hash_table.table_id, {}).get(h)`. If found, returns view tuple with `ast_id = staged_row[1]`.
@@ -272,9 +273,23 @@ Any backend passed to `TableEngine` must implement:
 5. **Strict Upstream Deduplication**: Existing records in database/cache must be reused without allocating new sequence IDs, and strict `INSERT INTO` must be maintained at the database layer.
 6. **B+Tree Clustered Index Insertion Ordering**: For tables using random cryptographic hashes (`BINARY(32)`) as Primary Keys (`m_tag_code`, `m_ast_hash`), batch insert payloads should maintain sorted primary key ordering to minimize InnoDB page splits and buffer pool thrashing.
 7. **Public Engine Invariant**: Code, tests, and workflows must never assume tables are cached in memory or access private engine internals (e.g. `_cached_rows`, `_pk_index`). Queries must use public TableEngine APIs (`Table.get()`, `G.TE.get()`, `Table.get_set()`) or assert against database state (`MockDB._global_store`), ensuring complete compatibility regardless of the active TableEngine (`TEDirectDB` vs `TECachedDB`) or table caching configuration (`te_cached=True/False`).
-8. **Cryptographic Hash Fast-Path**: For cryptographic hash lookup tables (e.g. `m_tag_code`), matching hashes guarantee identical content without database lookups. TableEngine `set()` operations on tables with explicit primary keys must maintain an $O(1)$ fast-path when re-setting matching projected rows to prevent $O(N)$ linear cache scans.
+8. **Duplicate Primary Key Enforcement & Cryptographic Hash Fast-Path**: For standard relational tables, TableEngine `set()` enforces database-level primary key uniqueness: calling `set()` with an explicit primary key that is already staged in `queued_set` or present in cache raises `ValueError`. Callers must use `update()` to mutate existing records or `get_set()` / `no_duplicate=True` to safely avoid duplicate inserts. For cryptographic hash lookup tables (`m_tag_code`, `m_ast_hash`), matching hashes guarantee identical content and return the existing row via an $O(1)$ fast-path.
 9. **Teardown Commit Acceleration**: When committing final update cycles, teardowns, or write-only batches before engine closure, use `G.TE.commit_all(update_in_mem_indexes=False)` (or `G.TE.commit(table_id, update_in_mem_indexes=False)`) to bypass redundant in-memory cache/index synchronization and immediately release cache memory before `G.TE.close()`.
 10. **Huge-Page Shared Memory & Fork Inheritance**: Preloaded baseline tables stored in structured shared memory (`_shared_buffer`) must remain immutable across parallel worker processes. Workers calling `start_new_db(..., is_worker=True)` inherit the shared memory segment across `fork()`, isolating local mutation overlays in process-local heap and eliminating multi-worker database preload stampedes.
 11. **Cross-Chunk Deduplication Tracking**: TableEngine implementations (`TEDirectDB`, `TECachedDB`) maintain `_committed_nodup_keys` (mapping unique data keys to assigned IDs for `no_duplicate=True` tables) and `_committed_pks` (tracking primary keys for hash lookup tables like `m_tag_code` and `m_ast_hash`) across intermediate chunk commits. During `commit()` and `commit_all()`, staged rows matching previously committed keys/hashes are filtered out, and `set()` / `get()` provide $O(1)$ fast-path resolution, preventing duplicate `INSERT INTO` attempts in subsequent chunks.
 12. **Parent Process Fork Socket Refresh**: The parent process must never invoke `start_new_db(..., is_worker=True)` after forking workers. Calling `is_worker=True` without shared huge pages resets and wipes in-memory table caches, causing subsequent operations (e.g. `processing_unchanges()`) to treat existing records as missing. The parent process must only refresh its DB connection handle (`if G.TE.db: G.TE.db.close(); G.TE.db = G.DB()`) without modifying cached table state or staging queues.
+
+---
+
+## 7. Subsystem Verification & Regression Suite (`unit_test/test_table_engine.py`)
+
+Comprehensive contract verification and isolated testing for all TableEngine implementations (`TEDirectDB`, `TECachedDB`) is implemented in `unit_test/test_table_engine.py` using `unit_test/harness.py`.
+
+Key test capabilities:
+- **Complete Database Isolation**: Replaces live database engines with `RecordingDriver` (a test spy adhering to `BaseDBEngine`), completely isolating TableEngine buffer transformations, indexing, sequence allocation, and deduplication logic from database networking or storage dependencies.
+- **Dynamic Engine Discovery**: Automatically discovers all unique TableEngine implementations registered in `TABLE_ENGINE_MAP` and dynamically synthesizes corresponding test cases (`Test_TEDirectDBEngine`, `Test_TECachedDBEngine`).
+- **Feature Tracking & Dual-Trace Diagnostics**: Every test method uses `@test_feature(feature_name, depends_on=...)` and granular `with test_step("...", diagnostic="...")` context blocks. If an assertion or unexpected error occurs, the test harness reports both the high-level failing feature/sub-step context and the complete Python traceback.
+- **Relational View & Decomposition Testing**: Validates multi-table view decomposition (`view_set()`) across parent/child tables, AST hash deduplication via `compute_ast_hash()`, and broken view construction resilience (asserting explicit `KeyError` on unregistered table IDs and `IndexError` on malformed graphs or short column lengths).
+- **Deduplication & Collision Invariants**: Verifies `no_duplicate=True` sequence reuse, explicit primary key fast-path overwrites, and cross-chunk deduplication tracking (`_committed_nodup_keys`, `_committed_pks`) across multi-phase commit cycles.
+- **In-Memory Cache Capabilities (`TECachedDB`)**: Verifies startup selective column cache preloading, zero-DB query dispatch on cache hits, atomic mutation synchronization (`set()`, `update()`), and cache evacuation on `clear_cache()` and `commit_all(update_in_mem_indexes=False)`.
 

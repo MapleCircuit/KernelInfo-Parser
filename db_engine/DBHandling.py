@@ -542,6 +542,8 @@ class MariaDB(BaseDBEngine):
                     self.cursor.executemany(sql, chunk_data)
                     return
                 except mysql.connector.Error as err:
+                    if getattr(err, "errno", None) == 1062 or "duplicate entry" in str(err).lower():
+                        raise ValueError(f"Duplicate entry for primary key in table '{table.table_name}': {err}") from err
                     # Adaptive bisection on packet too large (errno 1153)
                     if (getattr(err, "errno", None) == 1153 or "max_allowed_packet" in str(err).lower()) and len(chunk_data) > 1:
                         mid = len(chunk_data) // 2
@@ -591,6 +593,8 @@ class MariaDB(BaseDBEngine):
                     self.cursor.execute(sql, data)
                     break
                 except mysql.connector.Error as err:
+                    if getattr(err, "errno", None) == 1062 or "duplicate entry" in str(err).lower():
+                        raise ValueError(f"Duplicate entry for primary key in table '{table.table_name}': {err}") from err
                     if isinstance(err, (mysql.connector.OperationalError, mysql.connector.InterfaceError)):
                         self.close()
                         if attempt == 2:
@@ -609,7 +613,12 @@ class MariaDB(BaseDBEngine):
                     time.sleep(0.2 * (attempt + 1))
 
         self.check_if_connected()
-        self.cnx.commit()
+        try:
+            self.cnx.commit()
+        except mysql.connector.Error as err:
+            if getattr(err, "errno", None) == 1062 or "duplicate entry" in str(err).lower():
+                raise ValueError(f"Duplicate entry for primary key in table '{table.table_name}': {err}") from err
+            raise
 
     def update(
         self,

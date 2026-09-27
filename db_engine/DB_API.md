@@ -47,7 +47,7 @@ Any database backend assigned to `G.DB` or passed to `TableEngine.start()` must 
 
 ### 2.4. Batch Insert, Upsert & Parallel Commits
 - **`insert(table: Table, data: tuple[tuple[SafeDataType, ...], ...] | tuple[SafeDataType, ...]) -> None`**
-  - Batch executes parameterized `INSERT INTO table VALUES (%s, ...)`. Dynamically sizes batches based on table schema: tables with `TEXT`, `LONGTEXT`, or `BLOB` columns (e.g. `m_tag_code`) are capped at <= 500 rows and <= 4MB estimated payload, while regular tables use <= 2000 rows (or <= 5000 rows for short tables) and <= 8MB. On `OperationalError 1153` (`ER_NET_PACKET_TOO_LARGE` / `max_allowed_packet`), recursively bisects chunks into halves until execution succeeds. Commits transaction.
+  - Batch executes parameterized `INSERT INTO table VALUES (%s, ...)`. Dynamically sizes batches based on table schema: tables with `TEXT`, `LONGTEXT`, or `BLOB` columns (e.g. `m_tag_code`) are capped at <= 500 rows and <= 4MB estimated payload, while regular tables use <= 2000 rows (or <= 5000 rows for short tables) and <= 8MB. On `OperationalError 1153` (`ER_NET_PACKET_TOO_LARGE` / `max_allowed_packet`), recursively bisects chunks into halves until execution succeeds. On duplicate primary key collisions (MySQL `errno 1062` / `IntegrityError` in `MariaDB`, or existing PK in `MockDB`), raises `ValueError` to preserve driver contract. Commits transaction.
 - **`update(table: Table, data: tuple[tuple[SafeDataType, ...], ...] | tuple[SafeDataType, ...]) -> None`**
   - Batch executes upsert `INSERT INTO table VALUES (...) ON DUPLICATE KEY UPDATE col=VALUES(col)` for all non-primary key columns. Uses dynamic byte-bounded chunking and recursive bisection on packet limit errors. Commits transaction.
 - **`commit_tables_parallel(tables_data: Sequence[tuple[Table, Sequence[tuple], Sequence[tuple]]], max_workers: int | None = None) -> None`**
@@ -86,3 +86,17 @@ EngineClass = get_db_engine("mock")     # -> MockDB
 | :--- | :--- | :--- |
 | `"mariadb"`, `"mysql"`, `None` | `MariaDB` | Production MySQL / MariaDB direct driver |
 | `"mock"`, `"mockdb"`, `"inmemory"` | `MockDB` | In-memory mock database driver |
+
+---
+
+## 4. Subsystem Verification & Regression Suite (`unit_test/test_db_engine.py`)
+
+Comprehensive unit testing and contract verification across all database engines is implemented in `unit_test/test_db_engine.py` using the reusable harness in `unit_test/harness.py`.
+
+Key test capabilities:
+- **Prefix Isolation**: Dynamically generates `t_*` test schemas from all tables in `core.DBLayout.TABLES`, rewriting foreign keys to eliminate collision with production `m_*` data.
+- **Automated Cleanup & DB Reload**: Drops `t_*` tables at suite start and tearDown, and automatically reloads clean schemas upon test failure.
+- **Dual Error Tracing**: On test failure, prints rich diagnostic reports featuring both feature-level error context and full Python tracebacks.
+- **Dependency Propagation**: Enforces prerequisites (e.g. `depends_on=["insert"]`), automatically labeling downstream dependent tests as `UNTESTABLE` if prerequisite features fail.
+- **Payload & Packet Resilience**: Tests handled recursive chunk bisection under `OperationalError 1153` (`max_allowed_packet`), verifies unhandled exception raising on oversized atomic rows, and exercises multi-megabyte byte-bounded chunking on live `LONGTEXT` columns.
+

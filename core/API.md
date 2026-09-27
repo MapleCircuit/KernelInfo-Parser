@@ -278,6 +278,17 @@ Represents a parsed file diff and acts as the relational staging buffer.
 - **IPC Sanitization (`clear_bloat() -> None`)**:
   - Drops unpicklable object handles (`self.gp = None`, `self.mf = None`, `self.file = None`, `self.debug = []`, `self.parsers = {}`, `self.prior_tags = None`, `self.prior_tags_map = None`, `self.active_tag_list = None`, `self.pending_symbol_refs = []`, `self.last_tag_ref = None`, `self._bridge_maps = set()`, `self.batch_cs_dict = None`, `self.blocked_on = None`) before worker IPC serialization.
 
+### 5.4. Subsystem Verification & Regression Suite (`unit_test/test_table_handling.py`)
+Comprehensive unit testing and behavioral verification of `TableHandling.py` is implemented in `unit_test/test_table_handling.py` using the reusable harness in `unit_test/harness.py`:
+- **Pure Unit Isolation**: Backed by a mock `RecordingTableEngine` stand-in, eliminating database socket and filesystem dependencies.
+- **Prefix Isolation**: Uses `TestTableCollection` with `t_*` schemas to ensure test execution never touches production database tables.
+- **Granular Test Coverage**: Divided across 5 focused test classes:
+  1. `Test_DataSanitization`: Primitives, Enum/IntEnum unboxing, boolean conversion, `is_data_unsafe` detection, `normalize_data_tuple`.
+  2. `Test_TableSchemaAndOperations`: Dynamic column pointers, auto-increment detection, `set` (and `no_duplicate` delegation), `update` backfill, `get` unsafe crash guard, `get_set`, relational views (`view`, `view_get`, `view_get_multiple`, `ref_view`).
+  3. `Test_ChangeSetRoutingAndStaging`: Git diff parsing, context manager routing (`with cs(...)`), route stack unwinding on exceptions, route canonicalization (`route_parse`), bucketed storing (`REF_MULTI`), `ref` generation, and `last_not_none`.
+  4. `Test_ChangeSetReferenceResolution`: `REF_NO_REF`, direct numerical `REF_POS`, array `REF_MULTI`, context route resolution, foreign `REF_FILE` fast-paths, in-flight dependency blocking (`blocked_on`), and circular dependency breaking (`force_stubs`).
+  5. `Test_ChangeSetExecutionAndLifecycle`: Multi-pass execution resolution loops, operation dispatch, unresolved dependency detection, `preprocess_ref_views`, `get_file_type` classification, `clear_bloat` IPC pickling, and bridge map deduplication.
+
 ---
 
 ## 6. End-to-End Inter-Module Execution Lifecycle

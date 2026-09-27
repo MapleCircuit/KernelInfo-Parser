@@ -166,6 +166,7 @@ To resolve file ownership across the entire kernel repository:
    - Specific directory patterns (e.g. `fs/ext4/`) take precedence over broad generic patterns (e.g. `fs/`).
 3. **Bridge Population**:
    - Inserts resolved `(vid, fid, sec_id)` triplets into `m_maintainer_file`.
+   - Deduplicates `(fid, sec_id)` pairs in-memory using a tracking set to prevent duplicate primary key violations when multiple repository paths (e.g. symlinks) resolve to the same file instance ID (`fid`).
    - Web application endpoints query `m_maintainer_file` to display the authoritative maintainers, mailing lists, and review channels for any viewed source file.
 
 ---

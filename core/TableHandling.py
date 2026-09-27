@@ -477,7 +477,8 @@ class ChangeSet:
                     changed_paths = getattr(self.gp, "_changed_paths_set", None) if self.gp else None
                     is_completed = bool(self.gp and hasattr(self.gp, "file_symbols") and rel_file in self.gp.file_symbols)
                     is_in_flight_changed = bool(changed_paths and rel_file in changed_paths)
-                    is_in_dict = bool(self.gp and rel_file in self.gp.ChangeSet_Dict)
+                    cs_dict = getattr(self.gp, "ChangeSet_Dict", None) if self.gp else None
+                    is_in_dict = bool(cs_dict and rel_file in cs_dict)
                     is_active_foreign = (is_in_flight_changed or is_in_dict) and not is_completed
 
                     # If the target file is an active incomplete ChangeSet, its symbols have not been
@@ -690,7 +691,11 @@ class ChangeSet:
                         resolved_this_round.append(idx)
                         continue
                     if op_type == OP_VIEW_SET:
-                        self.cs_result[idx] = te_view_set(operation[0], data)
+                        existing_view = G.TE.view_get(operation[0], data)
+                        if existing_view is not None:
+                            self.cs_result[idx] = existing_view
+                        else:
+                            self.cs_result[idx] = te_view_set(operation[0], data)
                         resolved_this_round.append(idx)
                         continue
 
