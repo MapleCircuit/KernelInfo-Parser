@@ -1,0 +1,93 @@
+{
+  "test_conf": {
+    "parser": "raw_ast",
+    "test_name": "added_file",
+    "file_operation": "A",
+    "file_path": "Documentation/ABI/testing/sysfs-kernel-fscaps",
+    "versions": [
+      "v3.0"
+    ],
+    "description": "Verify added raw file stages m_v_main, file prelude, AST tags, coordinates, and code content"
+  },
+  "tables": {
+    "m_v_main": [
+      {
+        "vid": 1,
+        "vname": "v3.0"
+      }
+    ],
+    "m_file_name": [
+      {
+        "fnid": "$fnid_0",
+        "fname": "Documentation/ABI/testing/sysfs-kernel-fscaps"
+      }
+    ],
+    "m_file": [
+      {
+        "fid": "$fid_0",
+        "vid_s": 1,
+        "vid_e": 0,
+        "ftype": "7 (T_RAW)",
+        "s_stat": "A",
+        "e_stat": 0
+      }
+    ],
+    "m_bridge_file": [
+      {
+        "vid": 1,
+        "fnid": "$fnid_0",
+        "fid": "$fid_0"
+      }
+    ],
+    "m_ast": [
+      {
+        "ast_id": "$ast_0",
+        "name": "6aad220acdedc2dc37ff426751ef51af8ee9fd3a41ef2ac2ff14516ad80fef02",
+        "type_id": "144 (Raw_Content)"
+      }
+    ],
+    "m_tag_code": [
+      {
+        "hash": "hex:6aad220acdedc2dc37ff426751ef51af8ee9fd3a41ef2ac2ff14516ad80fef02",
+        "code": "What:\t\t/sys/kernel/fscaps\nDate:\t\tFebruary 2011\nKernelVersion:\t2.6.38\nContact:\tLudwig Nussel <ludwig.nussel@suse.de>\nDescription\n\t\tShows whether file system capabilities are honored\n\t\twhen executing a binary\n\n"
+      }
+    ],
+    "m_tag": [
+      {
+        "tag_id": "$tag_0",
+        "vid_s": 1,
+        "vid_e": 0,
+        "hash": "hex:6aad220acdedc2dc37ff426751ef51af8ee9fd3a41ef2ac2ff14516ad80fef02",
+        "ast_id": "$ast_0",
+        "hl_s": 0,
+        "hl_l": 0
+      }
+    ],
+    "m_bridge_tag": [
+      {
+        "fid": "$fid_0",
+        "tag_id": "$tag_0",
+        "line_s": 1,
+        "line_e": 9,
+        "char_s": 1,
+        "char_e": 1
+      }
+    ],
+    "m_map_ast": [
+      {
+        "map_id": "$tag_0",
+        "line_s": 1,
+        "char_s": 1,
+        "line_e": 9,
+        "char_e": 1,
+        "ast_id": "$ast_0"
+      }
+    ],
+    "m_bridge_map": [
+      {
+        "tag_id": "$tag_0",
+        "map_id": "$tag_0"
+      }
+    ]
+  }
+}

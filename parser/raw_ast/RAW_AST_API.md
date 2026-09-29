@@ -204,3 +204,19 @@ if not hasattr(CS, "register_bridge_map") or CS.register_bridge_map(tag_ref, tag
 3. **Zero-Duplication Exact Renames**: `"R100"` operations are strict no-ops in `raw_ast_parse()` to avoid duplicate AST tags.
 4. **Latin-1 Safety**: Content must always be decoded/encoded using `latin-1` to prevent UTF-8 decode errors on binary or non-UTF8 source tree files.
 5. **Public Engine Queries (Rule 15)**: Tag lookups must strictly query public TableEngine APIs (`m_bridge_tag.view_get_multiple()`, `m_bridge_file.get()`, `m_file_name.get()`) without assuming in-memory table structures.
+
+---
+
+## 4. Unit Testing & Snapshot Verification Contract
+
+The fallback raw AST parser is verified through the reusable snapshot testing harness:
+
+- **Harness Module**: `unit_test/parser_harness.py`
+  - `stage_file_prelude(CS, gp)`: Reusable file lifecycle prelude (`m_file_name`, `m_file`, `m_bridge_file`, `m_moved_file`) matching `main.py default_processing()`.
+  - `extract_changeset_snapshot(CS | [CS, ...], test_conf=...)`: Extracts all executed operations from single or multi-version ChangeSets (`[cs_v1, cs_v2]`). Surrogate monotonic IDs (`tag_id`, `ast_id`, `fid`, `fnid`, `map_id`) are canonicalized into symbolic identifiers (`$tag_0`, `$ast_0`, `$fid_0`) based on natural entity keys, rendering snapshots completely order-agnostic while preserving concrete `vid` sequences. Updates on primary keys (`OP_UPDATE`) update existing rows in place. Table rows preserve exact database column definitions (`table.init_columns`), `type_id` values are formatted as `<id> (<name>)` (e.g., `"144 (Raw_Content)"`), and `ftype` values are formatted as `<id> (<name>)` (e.g., `"7 (T_RAW)"`).
+  - `assert_snapshot_matches(test_case, parser_name, test_name, snapshot)`: Verifies extracted ChangeSet tables and `test_conf` metadata against verified JSON baselines. Set `UPDATE_SNAPSHOTS=1` in the environment to re-generate baselines after human verification.
+- **Test Suite**: `unit_test/test_raw_parser.py`
+  - `test_01_added_raw_file`: Added (`A`) file parsing, verifying creation of `m_v_main`, file prelude, `m_ast`, `m_tag`, `m_tag_code`, `m_bridge_tag`, `m_map_ast`, and `m_bridge_map`.
+  - `test_02_modified_changed_raw_file`: Modified (`M`) file parsing across `v2.6.39` -> `v3.0`, validating evolutionary links via `m_moved_tag`, retention of both `m_tag_code` records, and prior tag closure (`vid_e=Old_VID`).
+  - `test_03_exact_rename_raw_file`: Exact rename (`R100`) file parsing across `v2.6.39` -> `v3.0`, verifying `m_v_main` progression, old `fid` reuse, dual `m_bridge_file` links, and zero duplicate AST tags.
+- **Snapshot Storage**: `unit_test/snapshots/raw_ast/*.json` containing `test_conf` metadata and `tables` mapping.
