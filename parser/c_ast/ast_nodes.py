@@ -899,7 +899,8 @@ class CPPro_include(CPPro):
         base_dir = getattr(CS, "mfdir", None) or getattr(G, "CURRENT_PARSING_DIR", None)
         raw_target = self.a_include if self.a_include else self.w_include
         include_target = normalize_repo_path(raw_target, base_dir)
-        safe_target = str(include_target)[:255]
+        clean_target = str(include_target).strip().strip("<>\"'").strip()
+        safe_target = clean_target[:255]
 
         with CS(REF_POS):
             CS.store(m_file_name.get_set(None, safe_target))

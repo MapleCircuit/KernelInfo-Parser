@@ -48,6 +48,16 @@ _CLANG_GET_SPELLING_LOC.argtypes = [
 ]
 _CLANG_GET_SPELLING_LOC.restype = None
 
+_CLANG_GET_FILE_LOC = cc.conf.lib.clang_getFileLocation
+_CLANG_GET_FILE_LOC.argtypes = [
+    cc.SourceLocation,
+    ctypes.c_void_p,
+    ctypes.POINTER(cc.c_uint),
+    ctypes.POINTER(cc.c_uint),
+    ctypes.c_void_p,
+]
+_CLANG_GET_FILE_LOC.restype = None
+
 _CLANG_GET_TOKEN_KIND = cc.conf.lib.clang_getTokenKind
 _CLANG_GET_TOKEN_KIND.argtypes = [cc.Token]
 _CLANG_GET_TOKEN_KIND.restype = ctypes.c_uint

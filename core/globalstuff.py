@@ -590,6 +590,11 @@ class ASTT(IntEnum):
     ## Additional C Constructs
     C_SizeofExpr = auto()
     C_TypeRef = auto()
+    C_SyscallDef = auto()
+    C_AsmEntry = auto()
+    C_ModuleAttr = auto()
+    C_MacroVarDef = auto()
+    C_TracepointDef = auto()
 
 
 class SymbolRole(IntEnum):

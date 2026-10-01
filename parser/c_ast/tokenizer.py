@@ -17,6 +17,7 @@ from parser.c_ast.ctypes_bindings import (
     _CLANG_GET_RANGE_START,
     _CLANG_GET_RANGE_END,
     _CLANG_GET_SPELLING_LOC,
+    _CLANG_GET_FILE_LOC,
     _CLANG_GET_TOKEN_KIND,
     _CLANG_TOKEN_KIND_MAP,
     _CLANG_GET_EXTENT,
@@ -246,12 +247,16 @@ def get_cursor_line(cursor: cc.Cursor) -> Line:
     ext = _CLANG_GET_CURSOR_EXTENT(cursor)
     st = _CLANG_GET_RANGE_START(ext)
     en = _CLANG_GET_RANGE_END(ext)
-    _CLANG_GET_SPELLING_LOC(st, None, _BYREF_S_LINE, _BYREF_S_COL, None)
-    _CLANG_GET_SPELLING_LOC(en, None, _BYREF_E_LINE, _BYREF_E_COL, None)
+    _CLANG_GET_FILE_LOC(st, None, _BYREF_S_LINE, _BYREF_S_COL, None)
+    _CLANG_GET_FILE_LOC(en, None, _BYREF_E_LINE, _BYREF_E_COL, None)
     cl = Line.__new__(Line)
     cl.code = ""
-    cl.line_pos = (_CTYPES_S_LINE.value, _CTYPES_E_LINE.value)
-    cl.char_pos = (_CTYPES_S_COL.value, _CTYPES_E_COL.value)
+    s_l = _CTYPES_S_LINE.value
+    e_l = _CTYPES_E_LINE.value
+    s_c = _CTYPES_S_COL.value
+    e_c = _CTYPES_E_COL.value
+    cl.line_pos = (s_l, max(s_l, e_l))
+    cl.char_pos = (s_c, e_c if e_l > s_l else max(s_c, e_c))
     cursor._cached_line = cl
     return cl
 
@@ -475,6 +480,9 @@ class TokenStream:
                     spelling_str = token.spelling or ""
                 except (UnicodeDecodeError, Exception):
                     spelling_str = ""
+
+            if "\\" in spelling_str and ("\\\n" in spelling_str or "\\\r\n" in spelling_str):
+                spelling_str = spelling_str.replace("\\\r\n", "").replace("\\\n", "")
 
             ast_kind = token_kind_map[token.int_data[0]]
             tokens_append(ParsedToken(l, spelling_str, ast_kind, cursor))

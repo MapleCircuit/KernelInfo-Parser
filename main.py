@@ -1416,6 +1416,7 @@ def arg_handling() -> argparse.Namespace:
             "unit_test.test_table_engine",
             "unit_test.test_table_handling",
             "unit_test.test_raw_parser",
+            "unit_test.test_c_parser",
             "tests.test_maintainer_ast",
             "tests.test_credits_lifecycle",
             "tests.test_bridge_map_dedup",

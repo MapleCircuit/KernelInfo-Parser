@@ -101,6 +101,97 @@ _VALID_TOP_KINDS = frozenset({
     cc.CursorKind.TYPEDEF_DECL,
 })
 _NON_NAME_TOKENS = frozenset({"struct", "union", "enum", "(", "*", ""})
+_VAR_DECL_MACROS = frozenset({
+    "DEFINE_SPINLOCK",
+    "DEFINE_RAW_SPINLOCK",
+    "DEFINE_RWLOCK",
+    "DEFINE_MUTEX",
+    "DEFINE_SEQLOCK",
+    "DECLARE_RWSEM",
+    "DECLARE_MUTEX",
+    "DECLARE_SEMAPHORE",
+    "DECLARE_BITMAP",
+    "LIST_HEAD",
+    "HLIST_HEAD",
+    "BLOCKING_NOTIFIER_HEAD",
+    "RAW_NOTIFIER_HEAD",
+    "ATOMIC_NOTIFIER_HEAD",
+    "SRCU_NOTIFIER_HEAD",
+    "DEFINE_TIMER",
+    "DECLARE_WORK",
+    "DECLARE_DELAYED_WORK",
+    "DECLARE_TASKLET",
+    "DECLARE_WAIT_QUEUE_HEAD",
+    "DECLARE_WAITQUEUE",
+    "DEFINE_WAIT",
+    "DEFINE_IDR",
+    "DEFINE_IDA",
+    "DECLARE_COMPLETION",
+    "DECLARE_COMPLETION_ONSTACK",
+    "DEFINE_SIMPLE_ATTRIBUTE",
+})
+_LOCK_MACROS = _VAR_DECL_MACROS
+_TRACE_MACROS_ARG0 = frozenset({
+    "TRACE_EVENT",
+    "TRACE_EVENT_CONDITION",
+    "TRACE_EVENT_FLAGS",
+    "TRACE_EVENT_FN",
+    "DECLARE_EVENT_CLASS",
+    "DECLARE_TRACE",
+    "DECLARE_TRACE_NOARGS",
+    "DECLARE_TRACE_CONDITION",
+    "DEFINE_TRACE",
+    "DEFINE_TRACE_NOARGS",
+    "DEFINE_WBC_EVENT",
+    "DEFINE_WRITEBACK_EVENT",
+    "DEFINE_WRITEBACK_WORK_EVENT",
+})
+_TRACE_MACROS_ARG1 = frozenset({
+    "DEFINE_EVENT",
+    "DEFINE_EVENT_CONDITION",
+    "DEFINE_EVENT_PRINT",
+})
+_TRACE_MACROS = _TRACE_MACROS_ARG0 | _TRACE_MACROS_ARG1
+_KNOWN_MACRO_FUNCS = frozenset({
+    "EXPORT_SYMBOL",
+    "EXPORT_SYMBOL_GPL",
+    "EXPORT_UNUSED_SYMBOL",
+    "EXPORT_UNUSED_SYMBOL_GPL",
+    "EXPORT_TRACEPOINT_SYMBOL",
+    "EXPORT_TRACEPOINT_SYMBOL_GPL",
+    "__setup",
+    "early_param",
+    "core_param",
+    "module_param",
+    "module_param_named",
+    "module_init",
+    "module_exit",
+    "subsys_initcall",
+    "fs_initcall",
+    "device_initcall",
+    "late_initcall",
+    "core_initcall",
+    "postcore_initcall",
+    "arch_initcall",
+    "console_initcall",
+    "security_initcall",
+    "__initcall",
+    "MODULE_AUTHOR",
+    "MODULE_DESCRIPTION",
+    "MODULE_LICENSE",
+    "MODULE_VERSION",
+    "MODULE_ALIAS",
+    "MODULE_DEVICE_TABLE",
+    "MODULE_FIRMWARE",
+    "MODULE_INFO",
+    "MODULE_PARM_DESC",
+    "RESERVE_BRK",
+    "LOOP_ATTR_RO",
+    "DO_ERROR",
+    "DO_ERROR_INFO",
+    *_LOCK_MACROS,
+    *_TRACE_MACROS,
+})
 _SKIP_REF_KINDS = frozenset({
     cc.CursorKind.MACRO_INSTANTIATION,
     cc.CursorKind.INVALID_FILE,
@@ -109,6 +200,69 @@ _SKIP_REF_KINDS = frozenset({
     cc.CursorKind.INCLUSION_DIRECTIVE,
 })
 _tu_typedef_cache: dict[tuple[str, str], tuple[str | None, str | None]] = {}
+_KNOWN_KERNEL_ATTRIBUTES = frozenset({
+    "__func__",
+    "__FUNCTION__",
+    "__PRETTY_FUNCTION__",
+    "__bitwise",
+    "__bitwise__",
+    "__force",
+    "__user",
+    "__kernel",
+    "__safe",
+    "__rcu",
+    "__percpu",
+    "__nocast",
+    "__iomem",
+    "__must_check",
+    "__deprecated",
+    "__init",
+    "__initdata",
+    "__initconst",
+    "__exit",
+    "__exitdata",
+    "__meminit",
+    "__meminitdata",
+    "__sched",
+    "__maybe_unused",
+    "__always_unused",
+    "__cacheline_aligned",
+    "__cacheline_aligned_in_smp",
+    "____cacheline_aligned",
+    "____cacheline_aligned_in_smp",
+    "__read_mostly",
+    "__used",
+    "noinline",
+    "__always_inline",
+    "notrace",
+    "__kprobes",
+    "__ref",
+    "__weak",
+    "__pure",
+    "__const",
+    "__cold",
+    "__hot",
+    "asmlinkage",
+    "FASTCALL",
+    "ACPI_SYSTEM_XFACE",
+    "__devinit",
+    "__devinitdata",
+    "__devinitconst",
+    "__devexit",
+    "__devexitdata",
+    "__devexitconst",
+    "__cpuinit",
+    "__cpuinitdata",
+    "__net_init",
+    "__net_initdata",
+    "__net_exit",
+    "__net_exitdata",
+    "__paginginit",
+    "__init_refok",
+    "__initdata_refok",
+    "dotraplinkage",
+    "__irq_entry",
+})
 
 
 def filter_enclosing_cursors(cursors: list[cc.Cursor]) -> list[cc.Cursor]:
@@ -532,12 +686,11 @@ class Ast_Statement(Ast):
         self.member_refs: list[Any] = []
         self.decl_refs: list[Any] = []
         self.macro_refs: list[Any] = []
+        self._compound_kids: list[Any] = []
 
         if cursor is not None:
             try:
-                compound_kids = [k for k in cursor.get_children() if k.kind == cc.CursorKind.COMPOUND_STMT]
-                if compound_kids:
-                    self.zones.append(Zone(Zone_Type.Compound_Stmt, compound_kids))
+                self._compound_kids = [k for k in cursor.get_children() if k.kind == cc.CursorKind.COMPOUND_STMT]
             except Exception:
                 pass
 
@@ -546,6 +699,20 @@ class Ast_Statement(Ast):
             return False
         tline = token.line
         tspelling = token.spelling_str
+        if ast_kind == AST_KIND.punctuation:
+            if tspelling == "(":
+                self.paren_depth += 1
+            elif tspelling == ")":
+                self.paren_depth = max(0, self.paren_depth - 1)
+            elif tspelling == "{":
+                self.brace_depth += 1
+            elif tspelling == "}":
+                self.brace_depth = max(0, self.brace_depth - 1)
+                if self.brace_depth <= 0 and (not self.zones or self.zones[-1].completed):
+                    self.extent.grow(tline)
+                    self.need_processing = False
+                    return True
+
         if self.end_mode == End_Mode.Extent:
             if not self.extent.is_inside(tline):
                 self.need_processing = False
@@ -554,9 +721,10 @@ class Ast_Statement(Ast):
             return True
         elif self.end_mode in (End_Mode.Auto, End_Mode.Semicolon):
             if ast_kind == AST_KIND.punctuation and tspelling == ";":
-                self.extent.grow(tline)
-                self.need_processing = False
-                return True
+                if self.paren_depth <= 0 and self.brace_depth <= 0:
+                    self.extent.grow(tline)
+                    self.need_processing = False
+                    return True
         self.extent.grow(tline)
         return True
 
@@ -571,16 +739,19 @@ class Ast_Statement(Ast):
                 return
         tspelling = token.spelling_str
         if tspelling == "{" and (not self.zones or self.zones[-1].completed):
-            self.zones.append(Zone(Zone_Type.Compound_Stmt, (cursor,)))
+            kids = self._compound_kids if self._compound_kids else (cursor,)
+            self.zones.append(Zone(Zone_Type.Compound_Stmt, kids))
             return
         self.operands.append(tspelling)
 
     def exec_keyword(self, token: Any, cursor: Any) -> None:
+        if not self.name:
+            self.name = token.spelling_str
+            self.operands.append(token.spelling_str)
+            return
         for zone in reversed(self.zones):
             if not zone.completed and zone.check_exec(token, cursor, AST_KIND.keyword):
                 return
-        if not self.name:
-            self.name = token.spelling_str
         self.operands.append(token.spelling_str)
 
     def exec_identifier(self, token: Any, cursor: Any) -> None:
@@ -1137,6 +1308,9 @@ class C_Type(Ast):
         self.struct_union_enum_type: ASTT | None = None
         self.sig_extent: Line | None = None
         self.ast_ref: Any = None
+        self.in_attribute: bool = False
+        self.attribute_paren_depth: int = 0
+        self._macro_paren_opened: bool = False
 
     def within_range(self, token: Any, ast_kind: int) -> bool:
         if not self.need_processing:
@@ -1144,6 +1318,29 @@ class C_Type(Ast):
 
         tline = token.line
         tspelling = token.spelling_str
+
+        if self.in_attribute:
+            self.extent.grow(tline)
+            return True
+
+        if ast_kind == AST_KIND.punctuation and tspelling == ";":
+            if self.paren_depth <= 0 and self.brace_depth <= 0:
+                has_active_brace_init = any(
+                    getattr(z, "brace_depth", 0) > 0 for z in getattr(self, "zones", ())
+                )
+                if not has_active_brace_init:
+                    for z in getattr(self, "zones", ()):
+                        if not getattr(z, "completed", True):
+                            z.completed = True
+                            z.paren_depth = 0
+                            z.brace_depth = 0
+                            if getattr(z, "children", None):
+                                for ch in z.children:
+                                    if hasattr(ch, "need_processing"):
+                                        ch.need_processing = False
+                    self.extent.grow(tline)
+                    self.need_processing = False
+                    return False
 
         if self.zones:
             last_z = self.zones[-1]
@@ -1184,6 +1381,19 @@ class C_Type(Ast):
             self.extent.grow(tline)
             return True
 
+        if (
+            getattr(self, "name", "") in _KNOWN_MACRO_FUNCS
+            and getattr(self, "_macro_paren_opened", False)
+            and self.paren_depth <= 0
+        ):
+            if ast_kind == AST_KIND.punctuation and tspelling == ";":
+                self.extent.grow(tline)
+                self.need_processing = False
+                return False
+            else:
+                self.need_processing = False
+                return False
+
         match self.end_mode:
             case End_Mode.No_Check:
                 self.extent.grow(tline)
@@ -1193,6 +1403,16 @@ class C_Type(Ast):
                     self.extent.grow(tline)
                     return True
                 if tspelling == ";":
+                    if self.paren_depth <= 0 and self.brace_depth <= 0:
+                        for z in getattr(self, "zones", ()):
+                            if not getattr(z, "completed", True):
+                                z.completed = True
+                                z.paren_depth = 0
+                                z.brace_depth = 0
+                                if getattr(z, "children", None):
+                                    for ch in z.children:
+                                        if hasattr(ch, "need_processing"):
+                                            ch.need_processing = False
                     self.extent.grow(tline)
                     self.need_processing = False
                     return False
@@ -1212,6 +1432,16 @@ class C_Type(Ast):
                     self.need_processing = False
                     return False
                 if ast_kind == AST_KIND.punctuation and tspelling == ";":
+                    if self.paren_depth <= 0 and self.brace_depth <= 0:
+                        for z in getattr(self, "zones", ()):
+                            if not getattr(z, "completed", True):
+                                z.completed = True
+                                z.paren_depth = 0
+                                z.brace_depth = 0
+                                if getattr(z, "children", None):
+                                    for ch in z.children:
+                                        if hasattr(ch, "need_processing"):
+                                            ch.need_processing = False
                     self.extent.grow(tline)
                     self.need_processing = False
                     return False
@@ -1371,6 +1601,8 @@ class C_Type(Ast):
         tspelling = token.spelling_str
         if tspelling == "(":
             self.paren_depth += 1
+            if getattr(self, "name", "") in _KNOWN_MACRO_FUNCS:
+                self._macro_paren_opened = True
         elif tspelling == ")":
             self.paren_depth = max(0, self.paren_depth - 1)
 
@@ -1404,8 +1636,15 @@ class C_Type(Ast):
                 has_func_proto = self.has_functionproto or (
                     bool(self.content.content) and self.content.content[-1].type == ASTT.C_functionproto
                 )
-                if not has_func_proto and cursor.kind not in {cc.CursorKind.FUNCTION_DECL, cc.CursorKind.CXX_METHOD}:
-                    self.func_proto = True
+                if not has_func_proto and (self.name and (self.func_proto or getattr(cursor, "kind", None) == cc.CursorKind.TYPEDEF_DECL or (self.cursor is not None and getattr(self.cursor, "kind", None) == cc.CursorKind.INVALID_FILE))):
+                    has_func_proto = True
+                    self.content.append(TypeToken(token, ASTT.C_functionproto))
+                    self.has_functionproto = True
+                    self.func_proto = False
+
+                if not has_func_proto:
+                    if cursor.kind not in {cc.CursorKind.FUNCTION_DECL, cc.CursorKind.CXX_METHOD}:
+                        self.func_proto = True
                     return
                 if self.func_proto:
                     self.func_proto = False
@@ -1529,35 +1768,27 @@ class C_Type(Ast):
                     return
 
         tspelling = token.spelling_str
-        if tspelling in {
-            "__func__",
-            "__FUNCTION__",
-            "__PRETTY_FUNCTION__",
-            "__bitwise",
-            "__bitwise__",
-            "__force",
-            "__user",
-            "__kernel",
-            "__safe",
-            "__rcu",
-            "__percpu",
-            "__nocast",
-            "__iomem",
-            "__must_check",
-            "__deprecated",
-        }:
+        if tspelling in _KNOWN_KERNEL_ATTRIBUTES:
             return
 
+        if tspelling in _KNOWN_MACRO_FUNCS and not getattr(self, "name", ""):
+            self.name = tspelling
+
         # Function declaration identifier check
+        fn_cur = (
+            self.cursor
+            if (self.cursor is not None and getattr(self.cursor, "kind", None) in {cc.CursorKind.FUNCTION_DECL, cc.CursorKind.CXX_METHOD})
+            else cursor
+        )
         if (
-            cursor.kind in {cc.CursorKind.FUNCTION_DECL, cc.CursorKind.CXX_METHOD}
-            and tspelling == safe_cursor_spelling(cursor)
+            fn_cur.kind in {cc.CursorKind.FUNCTION_DECL, cc.CursorKind.CXX_METHOD}
+            and tspelling == safe_cursor_spelling(fn_cur)
         ):
             self.name = tspelling
             tt = TypeToken(token, ASTT.C_functionproto)
             tt.is_definition = True
             self.content.append(tt)
-            self.content.content[-1].is_definition = cursor.is_definition()
+            self.content.content[-1].is_definition = fn_cur.is_definition()
             self.swap_out()
             self.has_functionproto = True
             return
@@ -1675,6 +1906,24 @@ class C_Type(Ast):
         return True
 
     def exec_filter(self, token: Any, cursor: Any, kind: int) -> None:
+        tspelling = token.spelling_str
+        if tspelling in ("__attribute__", "__attribute", "__declspec"):
+            self.in_attribute = True
+            self.attribute_paren_depth = 0
+            return
+        if self.in_attribute:
+            if tspelling == "(":
+                self.attribute_paren_depth += 1
+            elif tspelling == ")":
+                self.attribute_paren_depth -= 1
+                if self.attribute_paren_depth <= 0:
+                    self.in_attribute = False
+            elif self.attribute_paren_depth == 0 and kind != AST_KIND.comment:
+                self.in_attribute = False
+            else:
+                return
+            return
+
         match kind:
             case AST_KIND.comment:
                 self.exec_comment(token, cursor)
@@ -1692,6 +1941,21 @@ class C_Type(Ast):
             self.swap_out()
 
         # 1. Process Child Zones by Category
+        has_fn_args = any(z.zone_type == Zone_Type.Function_Args for z in self.zones)
+        if (
+            not has_fn_args
+            and self.cursor is not None
+            and getattr(self.cursor, "kind", None) in {cc.CursorKind.FUNCTION_DECL, cc.CursorKind.CXX_METHOD}
+        ):
+            arg_kids = [k for k in self.cursor.get_children() if k.kind == cc.CursorKind.PARM_DECL]
+            if arg_kids:
+                synth_zone = Zone(Zone_Type.Function_Args, arg_kids)
+                for pk in arg_kids:
+                    pext = Line(get_cursor_line(pk))
+                    pnode = synth_zone._create_child_node(pk, pext)
+                    synth_zone.children.append(pnode)
+                self.zones.append(synth_zone)
+
         declared_args_link = ()
         enum_content_link = ()
         function_args_link = ()
@@ -1742,6 +2006,10 @@ class C_Type(Ast):
             is_func_decl = (
                 self.cursor is not None
                 and getattr(self.cursor, "kind", None) in {cc.CursorKind.FUNCTION_DECL, cc.CursorKind.CXX_METHOD}
+            )
+            is_typedef_def = (
+                (self.storage_class is not None and self.storage_class.type == ASTT.C_SCtypedef)
+                or (self.cursor is not None and getattr(self.cursor, "kind", None) == cc.CursorKind.TYPEDEF_DECL)
             )
 
             for typesegment in final_type:
@@ -1802,6 +2070,31 @@ class C_Type(Ast):
                             safe_item_name = str(self.name)[:255]
                         if not safe_item_name:
                             safe_item_name = str(self.name)[:255]
+
+                        ast_staging_name = safe_item_name
+                        ast_staging_type = decl_type
+                        is_syscall = safe_item_name.startswith("SYSCALL_DEFINE") or safe_item_name.startswith("COMPAT_SYSCALL_DEFINE")
+                        if is_syscall:
+                            sys_raw = ""
+                            args_zone = next((z for z in getattr(self, "zones", ()) if getattr(z, "zone_type", None) == Zone_Type.Function_Args), None)
+                            if args_zone and args_zone.children:
+                                first_k = args_zone.children[0]
+                                raw = Line(first_k.extent).cc(getattr(G, "CURRENT_RAWFILE", None)).code.strip(" ,;\t\n\r") if getattr(G, "CURRENT_RAWFILE", None) else ""
+                                if not raw:
+                                    raw = getattr(first_k, "name", "")
+                                sys_raw = raw.split()[0] if raw else ""
+                            if not sys_raw and self.cursor is not None:
+                                sp = safe_cursor_spelling(self.cursor)
+                                if sp and sp.startswith(("sys_", "compat_sys_")):
+                                    sys_raw = sp
+                            if sys_raw:
+                                if sys_raw.startswith(("sys_", "compat_sys_")):
+                                    ast_staging_name = sys_raw
+                                else:
+                                    prefix = "compat_sys_" if "COMPAT" in safe_item_name else "sys_"
+                                    ast_staging_name = prefix + sys_raw
+                                ast_staging_type = ASTT.C_SyscallDef
+
                         if item.type == ASTT.C_functionproto:
                             ret_idx = final_type.index(typesegment)
                             item_idx = (
@@ -1884,8 +2177,8 @@ class C_Type(Ast):
                                     CS.store(m_ast.ref_view(
                                         ((m_ast.ast_id, m_ast_container.ast_id, 1),),
                                         None,
-                                        safe_item_name,
-                                        decl_type,
+                                        ast_staging_name,
+                                        ast_staging_type,
                                         None,
                                         0,
                                         ret_t_id,
@@ -1912,8 +2205,8 @@ class C_Type(Ast):
                                     CS.store(m_ast.view(
                                         ((m_ast.ast_id, m_ast_container.ast_id, 1),),
                                         None,
-                                        safe_item_name,
-                                        decl_type,
+                                        ast_staging_name,
+                                        ast_staging_type,
                                         None,
                                         0,
                                         ret_t_id,
@@ -1929,8 +2222,8 @@ class C_Type(Ast):
                                     CS.store(m_ast.ref_view(
                                         ((m_ast.ast_id,),),
                                         None,
-                                        safe_item_name,
-                                        decl_type,
+                                        ast_staging_name,
+                                        ast_staging_type,
                                         (
                                             ((m_ast.ast_id, None),),
                                             (
@@ -1951,8 +2244,8 @@ class C_Type(Ast):
                                     CS.store(m_ast.view(
                                         ((m_ast.ast_id,),),
                                         None,
-                                        safe_item_name,
-                                        decl_type,
+                                        ast_staging_name,
+                                        ast_staging_type,
                                     ))
                                     ast_id_route = CS.get_route_parse()
                                     self.ast_ref = CS.ref(m_ast.ast_id, *ast_id_route)
@@ -1965,6 +2258,9 @@ class C_Type(Ast):
                         if safe_item_name and hasattr(CS, "symbol_dict"):
                             CS.symbol_dict[(safe_item_name, decl_type)] = ast_id_route[1]
                             CS.symbol_dict[(safe_item_name, item.type)] = ast_id_route[1]
+                            if ast_staging_name != safe_item_name:
+                                CS.symbol_dict[(ast_staging_name, ast_staging_type)] = ast_id_route[1]
+                                CS.symbol_dict[(ast_staging_name, decl_type)] = ast_id_route[1]
 
                         if create_tag:
                             if has_var and item.type != ASTT.C_functionproto:
@@ -2025,23 +2321,134 @@ class C_Type(Ast):
                                         CS,
                                         ast_id_route,
                                         self.extent,
-                                        ast_name=safe_item_name,
-                                        ast_type=decl_type,
+                                        ast_name=ast_staging_name,
+                                        ast_type=ast_staging_type,
                                     )
-                                if (decl_type in (ASTT.C_structdecl, ASTT.C_uniondecl, ASTT.C_enumdecl) or (item.type == ASTT.C_functionproto and (compound_stmt_link or is_func_decl))):
+                                is_percpu = safe_item_name.startswith("DEFINE_PER_CPU") or safe_item_name.startswith("DECLARE_PER_CPU")
+                                is_lock = safe_item_name in _VAR_DECL_MACROS
+                                is_trace = safe_item_name in _TRACE_MACROS
+                                if (
+                                    decl_type in (ASTT.C_structdecl, ASTT.C_uniondecl, ASTT.C_enumdecl)
+                                    or is_percpu
+                                    or is_lock
+                                    or is_trace
+                                    or (item.type == ASTT.C_functionproto and (compound_stmt_link or is_func_decl))
+                                ):
                                     if not (decl_type == ASTT.C_enumdecl and ("(unnamed at " in safe_item_name or "(anonymous at " in safe_item_name or not safe_item_name)):
-                                        with CS(REF_POS):
-                                            CS.store(m_symbol_def.set(
-                                                None,
-                                                CS.gp.VID,
-                                                ((m_file.table_id, 0), OP_REF, (REF_ROOT,)),
-                                                tag_ref or getattr(self, "tag_ref", 0),
-                                                self.ast_ref,
-                                                safe_item_name,
-                                                decl_type,
-                                                self.extent.line_pos[0],
-                                                self.extent.line_pos[1],
-                                            ))
+                                        if is_percpu or is_lock:
+                                            p_var = ""
+                                            if self.cursor is not None:
+                                                for kid in self.cursor.get_children():
+                                                    sp = safe_cursor_spelling(kid)
+                                                    if sp and sp != safe_item_name:
+                                                        p_var = sp
+                                                        break
+                                            if not p_var and hasattr(self, "zones") and self.zones:
+                                                for ch in getattr(self.zones[0], "children", ()):
+                                                    ch_n = getattr(ch, "name", "")
+                                                    if not ch_n and getattr(ch, "typedata", None):
+                                                        for ts in ch.typedata:
+                                                            for tok in ts.content:
+                                                                if tok.code and tok.code != safe_item_name:
+                                                                    ch_n = tok.code
+                                                                    break
+                                                            if ch_n:
+                                                                break
+                                                    if not ch_n and getattr(ch, "content", None) and getattr(ch.content, "content", None):
+                                                        for tok in ch.content.content:
+                                                            if tok.code and tok.code != safe_item_name:
+                                                                ch_n = tok.code
+                                                                break
+                                                    if ch_n and ch_n != safe_item_name:
+                                                        p_var = ch_n
+                                                        break
+                                            if p_var:
+                                                v_type = getattr(ASTT, "C_MacroVarDef", ASTT.C_Compound)
+                                                with CS(REF_POS):
+                                                    CS.store(m_symbol_def.set(
+                                                        None,
+                                                        CS.gp.VID,
+                                                        ((m_file.table_id, 0), OP_REF, (REF_ROOT,)),
+                                                        tag_ref or getattr(self, "tag_ref", 0),
+                                                        self.ast_ref,
+                                                        str(p_var)[:255],
+                                                        int(v_type),
+                                                        self.extent.line_pos[0],
+                                                        self.extent.line_pos[1],
+                                                    ))
+                                                if hasattr(CS, "symbol_dict"):
+                                                    pos_idx = ast_id_route[-1]
+                                                    CS.symbol_dict[(str(p_var)[:255], int(v_type))] = pos_idx
+                                                    CS.symbol_dict[(str(p_var)[:255], int(ASTT.C_DeclRefExpr))] = pos_idx
+                                        elif is_trace:
+                                            p_tp = ""
+                                            target_idx = 1 if safe_item_name in _TRACE_MACROS_ARG1 else 0
+                                            if hasattr(self, "zones") and self.zones and len(self.zones[0].children) > target_idx:
+                                                ch = self.zones[0].children[target_idx]
+                                                ch_n = getattr(ch, "name", "")
+                                                if not ch_n and getattr(ch, "typedata", None):
+                                                    for ts in ch.typedata:
+                                                        for tok in ts.content:
+                                                            if tok.code and tok.code != safe_item_name:
+                                                                ch_n = tok.code
+                                                                break
+                                                        if ch_n:
+                                                            break
+                                                if not ch_n and getattr(ch, "content", None) and getattr(ch.content, "content", None):
+                                                    for tok in ch.content.content:
+                                                        if tok.code and tok.code != safe_item_name:
+                                                            ch_n = tok.code
+                                                            break
+                                                if ch_n and ch_n != safe_item_name:
+                                                    p_tp = ch_n
+                                            if p_tp:
+                                                tp_type = getattr(ASTT, "C_TracepointDef", ASTT.C_Compound)
+                                                with CS(REF_POS):
+                                                    CS.store(m_symbol_def.set(
+                                                        None,
+                                                        CS.gp.VID,
+                                                        ((m_file.table_id, 0), OP_REF, (REF_ROOT,)),
+                                                        tag_ref or getattr(self, "tag_ref", 0),
+                                                        self.ast_ref,
+                                                        str(p_tp)[:255],
+                                                        int(tp_type),
+                                                        self.extent.line_pos[0],
+                                                        self.extent.line_pos[1],
+                                                    ))
+                                                if hasattr(CS, "symbol_dict"):
+                                                    pos_idx = ast_id_route[-1]
+                                                    CS.symbol_dict[(str(p_tp)[:255], int(tp_type))] = pos_idx
+                                                    CS.symbol_dict[(str(p_tp)[:255], int(ASTT.C_DeclRefExpr))] = pos_idx
+                                        elif is_syscall and ast_staging_name:
+                                            with CS(REF_POS):
+                                                CS.store(m_symbol_def.set(
+                                                    None,
+                                                    CS.gp.VID,
+                                                    ((m_file.table_id, 0), OP_REF, (REF_ROOT,)),
+                                                    tag_ref or getattr(self, "tag_ref", 0),
+                                                    self.ast_ref,
+                                                    str(ast_staging_name)[:255],
+                                                    int(ASTT.C_SyscallDef),
+                                                    self.extent.line_pos[0],
+                                                    self.extent.line_pos[1],
+                                                ))
+                                            if hasattr(CS, "symbol_dict"):
+                                                pos_idx = ast_id_route[-1]
+                                                CS.symbol_dict[(str(ast_staging_name)[:255], int(ASTT.C_SyscallDef))] = pos_idx
+                                                CS.symbol_dict[(str(ast_staging_name)[:255], int(ASTT.C_functionprotodecl))] = pos_idx
+                                        elif safe_item_name not in _KNOWN_MACRO_FUNCS:
+                                            with CS(REF_POS):
+                                                CS.store(m_symbol_def.set(
+                                                    None,
+                                                    CS.gp.VID,
+                                                    ((m_file.table_id, 0), OP_REF, (REF_ROOT,)),
+                                                    tag_ref or getattr(self, "tag_ref", 0),
+                                                    self.ast_ref,
+                                                    safe_item_name,
+                                                    decl_type,
+                                                    self.extent.line_pos[0],
+                                                    self.extent.line_pos[1],
+                                                ))
                                     if decl_type == ASTT.C_enumdecl:
                                         active_enum_tag = tag_ref or getattr(self, "tag_ref", 0)
                                         enum_zone = next((z for z in self.zones if z.zone_type == Zone_Type.Enum_Content), None)
@@ -2064,7 +2471,7 @@ class C_Type(Ast):
                                                             ch_ext.line_pos[0],
                                                             ch_ext.line_pos[1],
                                                         ))
-                                elif item.type == ASTT.C_functionproto and not compound_stmt_link:
+                                elif item.type == ASTT.C_functionproto and not compound_stmt_link and not is_typedef_def and not is_trace:
                                     with CS(REF_POS):
                                         CS.store(m_symbol_ref.set(
                                             None,
@@ -2105,10 +2512,14 @@ class C_Type(Ast):
             is_param = self.end_mode == End_Mode.Comma or (
                 self.cursor is not None and getattr(self.cursor, "kind", None) == cc.CursorKind.PARM_DECL
             )
+            is_typedef_def = (
+                (self.storage_class is not None and self.storage_class.type == ASTT.C_SCtypedef)
+                or (self.cursor is not None and getattr(self.cursor, "kind", None) == cc.CursorKind.TYPEDEF_DECL)
+            )
             if not is_param and (
                 is_func_decl
-                or any(any(it.type == ASTT.C_functionproto for it in ts.content) for ts in final_type)
-                or (is_type_def and not has_var)
+                or (any(any(it.type == ASTT.C_functionproto for it in ts.content) for ts in final_type) and not is_typedef_def)
+                or (is_type_def and not has_var and not is_typedef_def)
             ):
                 continue
 
@@ -2560,7 +2971,7 @@ class Zone:
                     if not (last_ch and last_ch.within_range(token, ast_kind)):
                         self.brace_depth += 1
                 elif tspelling == "}":
-                    if not has_active_child_zones and self.brace_depth <= 1:
+                    if self.brace_depth <= 1:
                         self.brace_depth = 0
                         self.extent.grow(tline)
                         self.preset_extents.clear()
@@ -2568,7 +2979,7 @@ class Zone:
                         if last_ch and last_ch.need_processing:
                             last_ch.need_processing = False
                         return True
-                    elif not has_active_child_zones:
+                    else:
                         self.brace_depth -= 1
             elif self.zone_type in _BRACE_ZONE_TYPES:
                 if tspelling == "}":
@@ -2656,10 +3067,12 @@ class Zone:
                     self.completed = True
                     self.preset_extents.clear()
             elif tspelling == "{":
-                self.brace_depth += 1
+                if self.zone_type not in _BRACE_ZONE_TYPES:
+                    self.brace_depth += 1
             elif tspelling == "}":
-                self.brace_depth -= 1
-                if self.zone_type in _BRACE_ZONE_TYPES and self.brace_depth <= 0:
+                if self.zone_type not in _BRACE_ZONE_TYPES:
+                    self.brace_depth -= 1
+                elif self.brace_depth <= 0:
                     self.extent.grow(tline)
                     self.preset_extents.clear()
                     self.completed = True

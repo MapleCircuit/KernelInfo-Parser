@@ -112,14 +112,17 @@ Coordinates Clang TranslationUnit instantiation, tokenization, and processing:
   args = [
       "-ferror-limit=0",
       "-w",
-      "-D__KERNEL__",
+      *_CLANG_KERNEL_MACRO_DEFINES,
       *cppro_cindex_input,
+      f"-I{self.mfdir}/arch/x86/include",
+      f"-I{self.mfdir}/arch/x86/include/generated",
       f"-I{self.mfdir}/{inc_dir}",
       f"-I{self.mfdir}/include",
       f"-I{self.mfdir}/include/uapi",
   ]
   options = cc.TranslationUnit.PARSE_DETAILED_PROCESSING_RECORD + 32768
   ```
+  `_CLANG_KERNEL_MACRO_DEFINES` neutralizes kernel-specific attributes and lockdep annotations (`-D__KERNEL__`, `-D__user=`, `-D__init=`, `-D__exit=`, `-D__sched=`, `-D__weak=`, `-D__read_mostly=`, `-D__maybe_unused=`, `-D__always_unused=`, `-D__percpu=`, `-D__rcu=`, `-D__force=`, `-D__bitwise=`, `-D__bitwise__=`, `-D__nocast=`, `-D__iomem=`, `-D__must_check=`, `-D__deprecated=`, `-D__cpuinit=`, `-D__cpuinitdata=`, `-D__meminit=`, `-D__meminitdata=`, `-Dnoinline=`, `-D__always_inline=`, `-Dnotrace=`, `-D__kprobes=`, `-D__ref=`, `-D__pure=`, `-D__const=`, `-D__noreturn=`, `-D__malloc=`, `-Dasmlinkage=`, `-DFASTCALL=`, `-D__cold=`, `-D__hot=`, `-D__visible=`, `-D__releases(x)=`, `-D__acquires(x)=`, `-D__acquire(x)=`, `-D__release(x)=`, `-D__cond_lock(x,c)=(c)`, `-D__cacheline_aligned=`, `-D__cacheline_aligned_in_smp=`, `-D____cacheline_aligned=`, `-D____cacheline_aligned_in_smp=`, `-D__aligned(x)=`, `-Daligned(x)=`).
 - Collects profiler metrics: `prof.clang_parse_tu_s`, `prof.clang_tokenize_s`.
 - Registers `CS.parsers["C_AM"] = self`.
 - Instantiates `TokenList` (subclass of `TokenStream`) and calls `TL.process_tokens(CS)`.
@@ -169,6 +172,16 @@ _CLANG_GET_SPELLING_LOC.argtypes = [
     ctypes.c_void_p,
 ]
 _CLANG_GET_SPELLING_LOC.restype = None
+
+_CLANG_GET_FILE_LOC = cc.conf.lib.clang_getFileLocation
+_CLANG_GET_FILE_LOC.argtypes = [
+    cc.SourceLocation,
+    ctypes.c_void_p,
+    ctypes.POINTER(cc.c_uint),
+    ctypes.POINTER(cc.c_uint),
+    ctypes.c_void_p,
+]
+_CLANG_GET_FILE_LOC.restype = None
 
 _CLANG_GET_TOKEN_KIND = cc.conf.lib.clang_getTokenKind
 _CLANG_GET_TOKEN_KIND.argtypes = [cc.Token]
@@ -233,7 +246,7 @@ Slot-optimized spatial coordinate carrier (`__slots__ = ("line_pos", "char_pos",
 | `__eq__` | `(other: object) -> bool` | Equality check on `(line_pos, char_pos)`. |
 
 ### 4.2 Coordinate Fast-Path: `get_cursor_line(cursor: cc.Cursor) -> Line`
-Bypasses Python object allocation when cursor is already annotated; retrieves coordinates via `_CLANG_GET_SPELLING_LOC` in 2 C-calls passing `None` for file and offset pointers (bypassing Libclang FileID resolution) and caches directly on `cursor._cached_line`.
+Bypasses Python object allocation when cursor is already annotated; retrieves coordinates via `_CLANG_GET_FILE_LOC` (`clang_getFileLocation`) in 2 C-calls passing `None` for file and offset pointers. Using physical file locations rather than macro expansion spelling locations prevents cross-file coordinate extent drift across macros, while clamping character columns when lines wrap, and caches directly on `cursor._cached_line`.
 
 ### 4.3 Extent Token Retrieval: `get_tokens_in_extent(tokens: list[Any], extent: Line) -> list[Any]`
 Performs binary search over contiguous token list using `(s_l, s_c)` coordinates to locate the starting token index in $O(\log N)$ time, followed by a linear sweep bounded by `(e_l, e_c)` to return all tokens overlapping the given spatial extent.
@@ -283,6 +296,9 @@ Expands the target `Line` extent to encapsulate trailing punctuation delimiters 
 Base class in `cursor_tree.py` for executable statements (`Ast_CompoundStmt`, `Ast_IfStmt`, `Ast_SwitchStmt`, etc.):
 - Contains child collections: `zones: list[Zone]`, `operands: list[str]`, `call_exprs: list[Ast_CallExpr]`, `member_refs: list[Ast_MemberRefExpr]`, `decl_refs: list[Ast_DeclRefExpr]`, `macro_refs: list[Ast_MacroRefExpr]`.
 - Attributes: `self.type_id: int` (initialized from `self.__class__.type_id`), `self.ast_ref: Any = None`.
+- **Compound Body Zone Postponement**: `Ast_Statement` avoids pre-allocating a `Zone(Zone_Type.Compound_Stmt)` in `__init__`, postponing body zone creation until `{` is received in `exec_punctuation`. This ensures that condition tokens, expressions, and headers (`if (cond)`, `while (expr)`) remain within the statement scope without prematurely populating child body zones.
+- **Statement Keyword Consumption**: In `exec_keyword`, statement keywords (`if`, `while`, `for`, `switch`, etc.) set `self.name` directly on the active statement before delegating to child zones, preventing duplicate phantom child statements.
+- **Statement Semicolon & Depth Delimitation**: `within_range` tracks `self.paren_depth` and `self.brace_depth`. For `End_Mode.Auto` and `End_Mode.Semicolon`, encountering `;` only terminates the statement when `self.paren_depth <= 0` and `self.brace_depth <= 0`. On `}`, the statement terminates cleanly when `self.brace_depth <= 0` and all child zones are completed, allowing enclosing functions to close without swallowing subsequent declarations.
 - `_extract_nested(CS)`: Iterates and extracts child zones inside `with CS(REF_MULTI):` and extracts collected expressions inside `with CS(REF_NO_REF):`.
 - `extract(CS)`: Default statement extraction calling `self._extract_nested(CS)` followed by `self.extract_1arg(CS, type_id, name, self.extent)`.
 
@@ -363,7 +379,7 @@ All preprocessor directives begin as `CPPro(extent)`. Upon reading the directive
 | `CPPro_elifndef` | `ASTT.CPPro_elifndef`| 74 | Conditional macro identifier string. |
 | `CPPro_define` | `ASTT.CPPro_define` / `CPPro_define_macro` | 75 / 76 | Macro name and replacement body. Expands `extent` if trailing `\` continuation. |
 | `CPPro_undef` | `ASTT.CPPro_undef` | 77 | Undefined macro identifier name. |
-| `CPPro_include` | `ASTT.CPPro_include`| 78 | Resolves include target via `cursor.get_included_file()`. Stages `m_file_name.get_set`, extracts external symbols used in the file attributed to this include, stages child symbol nodes in `m_ast` in `REF_POS`, and emits joined view `m_ast.view(((m_ast.ast_id, m_ast_include.ast_id, 1), (m_ast.ast_id, m_ast_container.ast_id, N)), None, w_include[:255], ASTT.CPPro_include, None, CS.ref(m_file_name.fnid, *fnid_route), *flat_container_args)`. Falls back to single-relation view if `N == 0`. |
+| `CPPro_include` | `ASTT.CPPro_include`| 78 | Resolves include target via `cursor.get_included_file()`. Strips enclosing angle brackets (`<>`) and quotes (`""`) when registering the target path in `m_file_name.get_set`, extracts external symbols used in the file attributed to this include, stages child symbol nodes in `m_ast` in `REF_POS`, and emits joined view `m_ast.view(((m_ast.ast_id, m_ast_include.ast_id, 1), (m_ast.ast_id, m_ast_container.ast_id, N)), None, w_include[:255], ASTT.CPPro_include, None, CS.ref(m_file_name.fnid, *fnid_route), *flat_container_args)`. Preserves verbatim written include syntax in `m_ast.name`. Falls back to single-relation view if `N == 0`. |
 | `CPPro_line` | `ASTT.CPPro_line` | 79 | Source line override: `"{lineno} {filename}"`. |
 | `CPPro_error` | `ASTT.CPPro_error` | 80 | `#error` message string. |
 | `CPPro_warning` | `ASTT.CPPro_warning`| 81 | `#warning` message string. |
@@ -516,9 +532,46 @@ class Zone_Type(IntEnum):
   Standalone declarations (e.g. `struct svc_rqst;`) remain `ASTT.C_struct` (27) and are not marked as definitions (`C_structdecl`), preventing orphan empty container rows.
 - **Typedef Declarator Extraction & Chained Underlying Type Linking**:
   - Declarator token isolation: When executing identifiers under `cc.CursorKind.TYPEDEF_DECL` matching `safe_cursor_spelling(cursor)`, the declarator receives default type `0` (avoiding phantom child container creation) and is assigned to `self.name`.
-  - Typedef definition categorization: Staged with `type_id = ASTT.C_SCtypedef` (10) in `m_ast` and registered in `m_symbol_def` with `type_id = ASTT.C_SCtypedef`, clearly classifying typedefs in symbol searches.
+  - Function pointer & function type typedefs: Both function pointer typedefs (`typedef int (*get_block_t)(...);`) and direct function type typedefs (`typedef void compound_page_dtor(struct page *);`) are recognized in `C_Type.exec_punctuation`. When `(` follows an identifier under `cc.CursorKind.TYPEDEF_DECL` (or when `self.func_proto` is set), `ASTT.C_functionproto` is appended, `self.has_functionproto = True`, and `Zone(Zone_Type.Function_Args)` is spawned to parse parameter definitions.
+  - Typedef definition categorization: Staged with `type_id = ASTT.C_SCtypedef` (10) in `m_ast` and registered in `m_symbol_def` with `type_id = ASTT.C_SCtypedef` (for primitives, structs, function pointers, and function types), while Section 3 suppresses duplicate symbol references.
   - Chained alias hierarchy: The underlying type is evaluated via `typesegment.generate_ast(CS)` and linked at Priority 0 in `m_ast_container`, with `ref_ast_id` pointing to the immediate underlying type's AST (forming an alias chain `__be32 -> __u32 -> unsigned int`).
   - Usage tracking: All typed declarations (struct/union fields, function return types, parameters, variables, and typedef aliases) that reference a typedef resolve `target_ref` (via `REF_FILE` for foreign headers or `CS.symbol_dict` locally) and stage `(target_ref, SymbolRole.TypeUsage, line, col)` in `m_symbol_ref`.
+
+- **System Call Definition Extraction (`ASTT.C_SyscallDef = 147`)**:
+  - `SYSCALL_DEFINE*` and `COMPAT_SYSCALL_DEFINE*` macros define Linux kernel system calls whose actual C entry points are named `sys_<name>` or `compat_sys_<name>`.
+  - When encountering `SYSCALL_DEFINE*` / `COMPAT_SYSCALL_DEFINE*`, `C_Type.extract()` isolates the first argument from child `Zone(Zone_Type.Function_Args)` (or fallback cursor spelling) to construct the canonical syscall identifier (`sys_<name>` or `compat_sys_<name>`).
+  - Staged into `m_ast` and `m_symbol_def` with `type_id = ASTT.C_SyscallDef` (147), and indexed in `CS.symbol_dict` under both its canonical name and macro spelling, enabling unified symbol lookup and cross-referencing.
+
+- **Macro Invocation Demotion & Module Metadata**:
+  - Macro demotion: `_KNOWN_MACRO_FUNCS` (`EXPORT_SYMBOL*`, `EXPORT_TRACEPOINT_SYMBOL*`, `__setup`, `early_param`, `module_param*`, `*initcall`, `MODULE_AUTHOR`, `MODULE_DESCRIPTION`, `MODULE_LICENSE`, `MODULE_VERSION`, `MODULE_ALIAS`, `MODULE_DEVICE_TABLE`, `MODULE_FIRMWARE`, `MODULE_INFO`, `MODULE_PARM_DESC`, `RESERVE_BRK`, `LOOP_ATTR_RO`, `DO_ERROR`, `DO_ERROR_INFO`, `_VAR_DECL_MACROS`, `_TRACE_MACROS`) are excluded from function definitions in `m_symbol_def`, preventing kernel macro invocations, module metadata, and tracepoint definitions from masquerading as functions.
+  - Kernel Variable Declaration Macros (`ASTT.C_MacroVarDef = 150`):
+    - `_VAR_DECL_MACROS` in `parser/c_ast/cursor_tree.py` (`DEFINE_SPINLOCK`, `DEFINE_RAW_SPINLOCK`, `DEFINE_RWLOCK`, `DEFINE_MUTEX`, `DEFINE_SEQLOCK`, `DECLARE_RWSEM`, `DECLARE_MUTEX`, `DECLARE_SEMAPHORE`, `DECLARE_BITMAP`, `LIST_HEAD`, `HLIST_HEAD`, `BLOCKING_NOTIFIER_HEAD`, `RAW_NOTIFIER_HEAD`, `ATOMIC_NOTIFIER_HEAD`, `SRCU_NOTIFIER_HEAD`, `DEFINE_TIMER`, `DECLARE_WORK`, `DECLARE_DELAYED_WORK`, `DECLARE_TASKLET`, `DECLARE_WAIT_QUEUE_HEAD`, `DECLARE_WAITQUEUE`, `DEFINE_WAIT`, `DEFINE_IDR`, `DEFINE_IDA`, `DECLARE_COMPLETION`, `DECLARE_COMPLETION_ONSTACK`, `DEFINE_SIMPLE_ATTRIBUTE`, and `DEFINE_PER_CPU*` / `DECLARE_PER_CPU*`) extract the declared variable name (`p_var`) from child cursors or argument zones.
+    - Fallback Token Inspection: When standalone Clang parses without header expansion (`self.cursor is None`), parameter names often reside within child `typedata` (`ch.typedata[0].content[0].code`) or `ch.content` rather than `ch.name`. `C_Type.extract()` inspects child tokens to guarantee variable extraction.
+    - Staged into `m_ast` and `m_symbol_def` with `type_id = ASTT.C_MacroVarDef` (150), and indexed in `CS.symbol_dict` under both `(p_var, ASTT.C_MacroVarDef)` and `(p_var, ASTT.C_DeclRefExpr)` to support cross-referencing and jump-to-definition.
+  - Kernel Tracepoint Definitions (`ASTT.C_TracepointDef = 151`):
+    - `_TRACE_MACROS` in `parser/c_ast/cursor_tree.py` (`TRACE_EVENT*`, `DECLARE_EVENT_CLASS`, `DEFINE_EVENT*`, `DECLARE_TRACE*`, `DEFINE_TRACE*`, `DEFINE_WRITEBACK_EVENT*`, `DEFINE_WBC_EVENT*`, etc.) define Linux kernel static tracepoints.
+    - Parameter Isolation: Tracepoint name extraction isolates the trace identifier from child zones (`target_idx = 1` for `DEFINE_EVENT*` templates; `target_idx = 0` for `TRACE_EVENT*`, `DECLARE_EVENT_CLASS`, `DECLARE_TRACE*`, and `DEFINE_TRACE*`).
+    - Staged into `m_symbol_def` with `type_id = ASTT.C_TracepointDef` (151), and indexed in `CS.symbol_dict` under both `(p_tp, ASTT.C_TracepointDef)` and `(p_tp, ASTT.C_DeclRefExpr)` to enable unified tracepoint lookup and callsite cross-referencing.
+    - Macro names (`TRACE_EVENT`, `DEFINE_EVENT`, etc.) are demoted via `_KNOWN_MACRO_FUNCS` so they never masquerade as dummy function declarations.
+  - Synthesized parameter zones for macro-generated functions: For functions generated via token-pasting macros lacking source token parameter lists, parameter zones and container links are synthesized from Libclang `PARM_DECL` cursors into `m_ast_container`.
+  - Semicolonless Macro Invocation Termination & Parentheses Lifecycle (`_macro_paren_opened`):
+    Kernel macros such as `module_init(fn)`, `module_exit(fn)`, `*initcall(fn)`, `RESERVE_BRK(...)`, `LOOP_ATTR_RO(...)`, `DO_ERROR(...)` are frequently written at file scope without trailing semicolons. When standalone Clang parses files without full header expansion, an identifier followed by parentheses without a semicolon followed by declarations could be misinterpreted by Clang as an old-style K&R C function definition header, causing subsequent function definitions to be swallowed. To prevent this:
+    1. `_CLANG_KERNEL_MACRO_DEFINES` in `parser/c_ast/c_ast.py` defines initcall and reservation macros (`-Dmodule_init(x)=`, `-Dmodule_exit(x)=`, `-D*initcall(x)=`, `-DRESERVE_BRK(name,sz)=`) to empty strings.
+    2. `_KNOWN_MACRO_FUNCS` in `parser/c_ast/cursor_tree.py` tracks all such kernel macros.
+    3. `C_Type` maintains `self._macro_paren_opened: bool = False`. In `exec_identifier`, if `tspelling in _KNOWN_MACRO_FUNCS and not self.name`, `self.name` is recorded. In `exec_punctuation`, `(` sets `self._macro_paren_opened = True`.
+    4. In `C_Type.within_range`, when `getattr(self, "name", "") in _KNOWN_MACRO_FUNCS and self._macro_paren_opened and self.paren_depth <= 0`:
+       - If the next token is a semicolon `;`, `self.extent.grow(tline); self.need_processing = False; return False`, cleanly absorbing the semicolon into the macro extent.
+       - If the next token is NOT a semicolon (e.g. the return type or identifier of a subsequent function definition), `self.need_processing = False; return False`, terminating the macro scope immediately without swallowing the next declaration.
+
+- **Kernel Section Macro Defines**:
+  - `_CLANG_KERNEL_MACRO_DEFINES` in `parser/c_ast/c_ast.py` expands kernel section markers (`-D__devinit=`, `-D__devinitdata=`, `-D__devinitconst=`, `-D__devexit=`, `-D__devexitdata=`, `-D__devexitconst=`, `-D__net_init=`, `-D__net_initdata=`, `-D__net_exit=`, `-D__net_exitdata=`, `-D__paginginit=`, `-D__init_refok=`, `-D__initdata_refok=`, `-D__section(x)=`, `-Dmodule_init(x)=`, `-Dmodule_exit(x)=`, `-D*initcall(x)=`, `-DRESERVE_BRK(name,sz)=`) to empty strings during Libclang translation unit compilation, preventing Clang syntax errors and preventing parser confusion on annotated functions.
+
+- **Phase 2 Multiline Macro Continuation Splicing**:
+  - In `parser/c_ast/tokenizer.py`, `TokenStream` splices line-continuation backslash-newlines (`\\\n`, `\\\r\n`) within macro definitions per C translation Phase 2 rules, preventing trailing brace tokens from sticking to backslashes (e.g. `\\\n}`).
+
+- **Enum Content Unconditional Termination & Semicolon Scope Cleanup**:
+  - In `parser/c_ast/cursor_tree.py` (`Zone_Type.Enum_Content`), encountering `}` terminates the enum content scope when `brace_depth <= 1` without waiting for child constants, preventing following struct or function definitions from being swallowed into preceding enum zones.
+  - In `C_Type.within_range`, encountering top-level semicolons `;` outside braces and parentheses automatically closes and completes unclosed child zones (`Function_Args`, `Initializer_Expr`), preventing local cast expressions and unclosed zones from swallowing succeeding declarations.
 
 - **Enum & Enumerator Constant Extraction & Symbol Tracking**:
   - **Standardized Enumerator Type (`ASTT.C_enumequal`)**:
@@ -533,6 +586,12 @@ class Zone_Type(IntEnum):
     In statements and initializers, identifier tokens referencing `cc.CursorKind.ENUM_CONSTANT_DECL` are collected as `Ast_DeclRefExpr` (62), emitting `m_symbol_ref` records with `SymbolRole.DeclRef` (5).
   - **Cross-File & Local Symbol Resolution**:
     In `resolve_cursor_type_ast`, `ENUM_CONSTANT_DECL` references check foreign header origins via `REF_FILE` (`CS.ref(m_ast.ast_id, REF_FILE, rel_file, safe_name, int(ASTT.C_enumequal))`), local batch scope via `CS.symbol_dict[(safe_name, ASTT.C_enumequal)]`, and fall back to unbound `m_ast.view` nodes.
+
+- **Compiler Attribute & Keyword Masking Absorption**:
+  - `_KNOWN_KERNEL_ATTRIBUTES`: Filter set in `cursor_tree.py` ignoring kernel linkage, memory, and scheduler annotations (`__sched`, `__init`, `asmlinkage`, `__user`, `__percpu`, `__read_mostly`, `noinline`, `notrace`, etc.) in `exec_identifier` to prevent them from entering `typedata` as identifier tokens.
+  - `fn_cur` Resolution: In `exec_identifier`, checks `self.cursor` when it is a `FUNCTION_DECL`/`CXX_METHOD` to prevent intermediate `UNEXPOSED_ATTR` wrapper cursors from masking function prototype declarations.
+  - `in_attribute` Scope Tracking: In `C_Type.exec_filter`, encountering `__attribute__`, `__attribute`, or `__declspec` sets `self.in_attribute = True` and tracks `self.attribute_paren_depth` across `(` and `)`. All inner attribute tokens and parentheses are absorbed into `self.extent` while bypassing type segment generation, preventing attribute contents (e.g. `((weak))`) from corrupting declarators or triggering premature `Function_Args` zones.
+  - Parameter List Delimitation Guard: In `C_Type.exec_punctuation`, `case "("` requires `has_func_proto` to be `True` before spawning `Zone(Zone_Type.Function_Args)`, guaranteeing that parenthesized prefixes preceding the function declarator are never misinterpreted as the parameter list.
 
 ---
 
@@ -672,7 +731,7 @@ return tag_ref
 | :--- | :--- |
 | **Primitives** | `C_void (36)`, `C_unsigned (37)`, `C_signed (38)`, `C_char (39)`, `C_short (40)`, `C_int (41)`, `C_long (42)`, `C_bool (43)`, `C_float (44)`, `C_double (45)`, `C_pointer (26)`, `C_array (23)`, `C_arrayempty (24)` |
 | **Qualifiers** | `C_Qconst (16)`, `C_Qvolatile (17)`, `C_Qrestrict (18)`, `C_Q_Atomic (19)` |
-| **Declarations** | `C_functionproto (20)`, `C_functionprotodecl (21)`, `C_functionprotnotbind (22)`<br>`C_struct (27)`, `C_structdecl (28)`, `C_structnotbind (29)`<br>`C_enum (30)`, `C_enumdecl (31)`, `C_enumnotbind (32)`, `C_enumequal (25)`<br>`C_union (33)`, `C_uniondecl (34)`, `C_unionnotbind (35)` |
+| **Declarations** | `C_functionproto (20)`, `C_functionprotodecl (21)`, `C_functionprotnotbind (22)`, `C_SyscallDef (147)`, `C_AsmEntry (148)`, `C_ModuleAttr (149)`<br>`C_struct (27)`, `C_structdecl (28)`, `C_structnotbind (29)`<br>`C_enum (30)`, `C_enumdecl (31)`, `C_enumnotbind (32)`, `C_enumequal (25)`<br>`C_union (33)`, `C_uniondecl (34)`, `C_unionnotbind (35)` |
 | **Storage Class** | `C_SCauto (4)`, `C_SCregister (5)`, `C_SCstatic (6)`, `C_SCextern (7)`, `C_SC_Thread_local (8)`, `C_SCthread_local (9)`, `C_SCtypedef (10)`, `C_SCconstexpr (11)` |
 | **Function Spec** | `C_FSinline (12)`, `C_FS_Noreturn (13)` |
 | **Align / Misc** | `C_AS__Alignas (14)`, `C_AS_alignas (15)`, `C_Compound (1)`, `C_Comment (2)`, `C_Keyword (3)` |
@@ -782,5 +841,40 @@ Defined in `core/globalstuff.py`, `STANDARD_C_KEYWORDS: dict[str, ASTT]` provide
     - Anonymous enum container labels (`(unnamed at ...)` / `(anonymous at ...)`) are suppressed from `m_symbol_def`, indexing only the named enumerators.
     - References to enumerator constants in expressions and initializers are dispatched as `Ast_DeclRefExpr` and recorded in `m_symbol_ref` with `SymbolRole.DeclRef` (5).
     - Foreign enumerator constant references resolve via `REF_FILE` pointing to the declaring header file.
+25. **System Call Definition Extraction (`ASTT.C_SyscallDef = 147`)**:
+    - System calls defined via `SYSCALL_DEFINE*` or `COMPAT_SYSCALL_DEFINE*` extract the canonical function name (`sys_<name>` / `compat_sys_<name>`) from their first argument child or cursor spelling.
+    - Staged into `m_ast` and `m_symbol_def` with `type_id = ASTT.C_SyscallDef` (147), and indexed in `CS.symbol_dict` under both canonical syscall name and macro name.
+26. **Kernel Section Attributes & Multiline Macro Delimitation**:
+    - Kernel section annotations (`__devinit`, `__devexit`, `__net_init`, `__paginginit`, etc.) are pre-expanded in `_CLANG_KERNEL_MACRO_DEFINES` to prevent syntax parsing aborts.
+    - Multiline macro line-continuations (`\\\n`) are spliced during tokenization to prevent trailing punctuation sticking.
+27. **Semicolon Child Zone Cleanup & Scope Containment**:
+    - Semicolons outside parenthesized/braced expressions immediately close active child argument and initializer zones in `C_Type.within_range`, preventing scope leakage across top-level declarations or inside compound statements.
+28. **Macro Scope Termination and Semicolonless Invocation Invariant**:
+    - Top-level kernel macros (`_KNOWN_MACRO_FUNCS`, e.g. `module_init`, `*initcall`, `RESERVE_BRK`, `LOOP_ATTR_RO`, `DO_ERROR`, `DO_ERROR_INFO`) that may appear without trailing semicolons must track parameter parenthesis closure (`_macro_paren_opened`, `paren_depth <= 0`). In `C_Type.within_range`, once the argument parenthesis is closed, encountering a semicolon absorbs it into the extent, while encountering non-semicolon tokens immediately terminates the node scope (`need_processing = False; return False`), guaranteeing that trailing functions and declarations are never swallowed into preceding macro invocations.
+29. **Kernel Variable Declaration Macro Extraction (`ASTT.C_MacroVarDef = 150`)**:
+    - Variables defined via kernel declaration macros (`_VAR_DECL_MACROS`, `DEFINE_PER_CPU*`) must be extracted as variable definitions rather than function declarations.
+    - When `self.cursor` lacks child cursors, `C_Type.extract()` must inspect argument child zone `typedata` and `content` tokens for the declared variable identifier.
+    - Definitions must be staged in `m_symbol_def` with `type_id = ASTT.C_MacroVarDef` (150) and dual-indexed in `CS.symbol_dict` under `ASTT.C_MacroVarDef` and `ASTT.C_DeclRefExpr`.
+30. **Kernel Tracepoint Definition Extraction (`ASTT.C_TracepointDef = 151`)**:
+    - Kernel tracepoints defined via macros (`_TRACE_MACROS`, e.g. `TRACE_EVENT`, `DEFINE_EVENT`, `DECLARE_EVENT_CLASS`, `DECLARE_TRACE`, `DEFINE_TRACE`) must be extracted as tracepoint definitions rather than function declarations.
+    - The tracepoint symbol must be extracted from the appropriate argument position (Arg 1 for `DEFINE_EVENT*`, Arg 0 for all other trace macros).
+    - Definitions must be staged in `m_symbol_def` with `type_id = ASTT.C_TracepointDef` (151) and dual-indexed in `CS.symbol_dict` under `ASTT.C_TracepointDef` and `ASTT.C_DeclRefExpr`.
+
+---
+
+## 6. Unit Testing & Snapshot Verification Contract
+
+The C & Preprocessor AST parser is verified through the reusable snapshot testing harness:
+
+- **Harness Module**: `unit_test/parser_harness.py`
+  - `stage_file_prelude(CS, gp)`: Reusable file lifecycle prelude (`m_file_name`, `m_file`, `m_bridge_file`, `m_moved_file`) matching `main.py default_processing()`. Detects file language category (`T_C = 1` for `.c`/`.h`).
+  - `extract_changeset_snapshot(CS | [CS, ...], test_conf=...)`: Extracts all executed operations from single or multi-version ChangeSets (`[cs_v1, cs_v2]`). Rows within each table preserve strict operational insertion order. Surrogate monotonic IDs (`tag_id`, `ast_id`, `fid`, `fnid`, `map_id`, `def_id`, `ref_id`) are canonicalized into symbolic identifiers (`$tag_0`, `$ast_0`, `$fid_0`, `$def_0`, `$ref_0`) sequentially based on first-appearance order, rendering snapshots deterministic while preserving concrete `vid` sequences. Updates on primary keys (`OP_UPDATE`) update existing rows in place. Table rows preserve exact database column definitions (`table.init_columns`), `type_id` values are formatted as `<id> (<name>)` (e.g., `"21 (C_functionprotodecl)"`), `ftype` values as `<id> (<name>)` (e.g., `"1 (T_C)"`), and `role` values as `<id> (<name>)` (e.g., `"2 (TypeUsage)"`).
+  - `assert_snapshot_matches(test_case, parser_name, test_name, snapshot)`: Verifies extracted ChangeSet tables and `test_conf` metadata against verified JSON baselines. Set `UPDATE_SNAPSHOTS=1` in the environment to re-generate baselines after human verification.
+- **Test Suite**: `unit_test/test_c_parser.py`
+  - `test_01_added_c_file`: Added (`A`) file parsing of `include/linux/lockd/bind.h` on `v3.0`, verifying creation of `m_v_main`, file prelude, `m_ast`, `m_tag`, `m_tag_code`, `m_bridge_tag`, `m_map_ast`, `m_bridge_map`, `m_symbol_def`, and `m_symbol_ref`.
+  - `test_02_modified_changed_c_file`: Modified (`M`) file parsing across `v2.6.28` -> `v2.6.29` (kernel commit `0cb2659b` adding `noresvport` to `struct nlmclnt_initdata`), validating evolutionary links via `m_moved_tag: 1`, recycling of unchanged tags, retention of both struct tag codes, and prior struct tag closure (`vid_e = 1`).
+  - `test_03_exact_rename_c_file`: Exact rename (`R100`) file parsing across `v2.6.39` -> `v3.0`, verifying `m_v_main` progression, old `fid` reuse, dual `m_bridge_file` links, and zero duplicate AST tags.
+- **Snapshot Storage**: `unit_test/snapshots/c_ast/*.json` containing `test_conf` metadata and canonical `tables` mapping.
+
 
 
