@@ -75,6 +75,16 @@ def serialize_scalar(val: Any, col_name: str | None = None) -> Any:
             return int_val
         except (ValueError, TypeError):
             pass
+    if col_name == "role" and val is not None:
+        from core.globalstuff import SymbolRole
+        try:
+            if isinstance(val, SymbolRole):
+                return f"{val.value} ({val.name})"
+            int_val = int(val)
+            name = SymbolRole(int_val).name
+            return f"{int_val} ({name})"
+        except (ValueError, TypeError):
+            pass
     return to_safe_data(val)
 
 
@@ -281,73 +291,62 @@ def normalize_snapshot_ids(
     prior_tag_map: dict[Any, str] = {}
     prior_ast_map: dict[Any, str] = {}
 
-    # 1. m_ast normalization: natural key is (name, type_id)
-    if "m_ast" in raw_tables:
-        sorted_ast = sorted(
-            raw_tables["m_ast"],
-            key=lambda r: (str(r.get("name")), str(r.get("type_id"))),
-        )
-        for i, row in enumerate(sorted_ast):
-            concrete_id = row.get("ast_id")
-            if concrete_id is not None:
-                ast_id_map[concrete_id] = f"$ast_{i}"
-
-    # 2. Prior tags mapping (collected across all ChangeSets with prior_tags)
+    # 1. Prior tags and prior AST mapping (collected across all ChangeSets with prior_tags)
     for c in css:
         if getattr(c, "prior_tags", None):
-            sorted_prior = sorted(
-                c.prior_tags,
-                key=lambda t: (str(t[9]) if len(t) > 9 else "", str(t[2]) if len(t) > 2 else ""),
-            )
-            for j, ptag in enumerate(sorted_prior):
+            for j, ptag in enumerate(c.prior_tags):
                 ptag_id = ptag[6] if len(ptag) > 6 and ptag[6] is not None else (ptag[1] if len(ptag) > 1 else ptag[0])
                 if ptag_id is not None and ptag_id not in prior_tag_map:
-                    prior_tag_map[ptag_id] = f"$prior_tag_{j}"
+                    prior_tag_map[ptag_id] = f"$prior_tag_{len(prior_tag_map)}"
                 if len(ptag) > 10 and ptag[10] is not None and ptag[10] not in prior_ast_map:
-                    prior_ast_map[ptag[10]] = f"$prior_ast_{j}"
+                    prior_ast_map[ptag[10]] = f"$prior_ast_{len(prior_ast_map)}"
 
-    # 3. m_tag normalization: natural key is (hash, vid_s, vid_e, hl_s, hl_l)
+    # 2. Sequential first-appearance mapping for surrogate IDs based on insertion order
+    if "m_file_name" in raw_tables:
+        for row in raw_tables["m_file_name"]:
+            concrete_id = row.get("fnid")
+            if concrete_id is not None and concrete_id not in fnid_map:
+                fnid_map[concrete_id] = f"$fnid_{len(fnid_map)}"
+
+    if "m_file" in raw_tables:
+        for row in raw_tables["m_file"]:
+            concrete_id = row.get("fid")
+            if concrete_id is not None and concrete_id not in fid_map:
+                fid_map[concrete_id] = f"$fid_{len(fid_map)}"
+
+    if "m_ast" in raw_tables:
+        for row in raw_tables["m_ast"]:
+            concrete_id = row.get("ast_id")
+            if concrete_id is not None and concrete_id not in ast_id_map:
+                if concrete_id in prior_ast_map:
+                    ast_id_map[concrete_id] = prior_ast_map[concrete_id]
+                else:
+                    ast_id_map[concrete_id] = f"$ast_{len(ast_id_map)}"
+
     if "m_tag" in raw_tables:
-        sorted_tag = sorted(
-            raw_tables["m_tag"],
-            key=lambda r: (
-                str(r.get("hash")),
-                int(r.get("vid_s") or 0),
-                int(r.get("vid_e") or 0),
-                int(r.get("hl_s") or 0),
-                int(r.get("hl_l") or 0),
-            ),
-        )
-        tag_counter = 0
-        for row in sorted_tag:
+        for row in raw_tables["m_tag"]:
             concrete_id = row.get("tag_id")
-            if concrete_id is not None:
+            if concrete_id is not None and concrete_id not in tag_id_map:
                 if concrete_id in prior_tag_map:
                     tag_id_map[concrete_id] = prior_tag_map[concrete_id]
                 else:
-                    tag_id_map[concrete_id] = f"$tag_{tag_counter}"
-                    tag_counter += 1
+                    tag_id_map[concrete_id] = f"$tag_{len(tag_id_map)}"
 
-    # 4. m_file normalization: natural key is (vid_s, vid_e, ftype)
-    if "m_file" in raw_tables:
-        sorted_file = sorted(
-            raw_tables["m_file"],
-            key=lambda r: (int(r.get("vid_s") or 0), int(r.get("vid_e") or 0), str(r.get("ftype"))),
-        )
-        for i, row in enumerate(sorted_file):
-            concrete_id = row.get("fid")
-            if concrete_id is not None:
-                fid_map[concrete_id] = f"$fid_{i}"
+    def_id_map: dict[Any, str] = {}
+    if "m_symbol_def" in raw_tables:
+        for row in raw_tables["m_symbol_def"]:
+            concrete_id = row.get("def_id")
+            if concrete_id is not None and concrete_id not in def_id_map:
+                def_id_map[concrete_id] = f"$def_{len(def_id_map)}"
 
-    # 5. m_file_name normalization: natural key is fname
-    if "m_file_name" in raw_tables:
-        sorted_fn = sorted(raw_tables["m_file_name"], key=lambda r: str(r.get("fname")))
-        for i, row in enumerate(sorted_fn):
-            concrete_id = row.get("fnid")
-            if concrete_id is not None:
-                fnid_map[concrete_id] = f"$fnid_{i}"
+    ref_id_map: dict[Any, str] = {}
+    if "m_symbol_ref" in raw_tables:
+        for row in raw_tables["m_symbol_ref"]:
+            concrete_id = row.get("ref_id")
+            if concrete_id is not None and concrete_id not in ref_id_map:
+                ref_id_map[concrete_id] = f"$ref_{len(ref_id_map)}"
 
-    # Replace surrogate IDs in all tables
+    # Replace surrogate IDs in all tables preserving strict insertion order
     normalized: dict[str, list[dict[str, Any]]] = {}
 
     for tname, rows in raw_tables.items():
@@ -401,6 +400,12 @@ def normalize_snapshot_ids(
             if "fnid" in new_r and new_r["fnid"] in fnid_map:
                 new_r["fnid"] = fnid_map[new_r["fnid"]]
 
+            # Symbol definition and reference identifiers
+            if "def_id" in new_r and new_r["def_id"] in def_id_map:
+                new_r["def_id"] = def_id_map[new_r["def_id"]]
+            if "ref_id" in new_r and new_r["ref_id"] in ref_id_map:
+                new_r["ref_id"] = ref_id_map[new_r["ref_id"]]
+
             # Reorder keys in exact DB table schema column order
             table_obj = table_by_name.get(tname)
             if table_obj and hasattr(table_obj, "init_columns"):
@@ -416,8 +421,7 @@ def normalize_snapshot_ids(
             else:
                 new_rows.append(new_r)
 
-        # Sort rows deterministically by their canonical JSON representation
-        new_rows.sort(key=lambda item: json.dumps(item, sort_keys=True))
+        # Retain strict insertion order of rows as added
         normalized[tname] = new_rows
 
     # Sort entire dict by canonical DB table_id order

@@ -1,0 +1,1383 @@
+{
+  "test_conf": {
+    "parser": "c_ast",
+    "test_name": "added_file",
+    "file_operation": "A",
+    "file_path": "include/linux/lockd/bind.h",
+    "versions": [
+      "v3.0"
+    ],
+    "description": "Verify added C header stages AST nodes, tags, bridges, maps, symbol defs/refs, and matches snapshot"
+  },
+  "tables": {
+    "m_v_main": [
+      {
+        "vid": 1,
+        "vname": "v3.0"
+      }
+    ],
+    "m_file_name": [
+      {
+        "fnid": "$fnid_0",
+        "fname": "include/linux/lockd/bind.h"
+      },
+      {
+        "fnid": "$fnid_1",
+        "fname": "linux/lockd/nlm.h"
+      },
+      {
+        "fnid": "$fnid_2",
+        "fname": "linux/lockd/xdr.h"
+      },
+      {
+        "fnid": "$fnid_3",
+        "fname": "linux/lockd/xdr4.h"
+      }
+    ],
+    "m_file": [
+      {
+        "fid": "$fid_0",
+        "vid_s": 1,
+        "vid_e": 0,
+        "ftype": "1 (T_C)",
+        "s_stat": "A",
+        "e_stat": 0
+      }
+    ],
+    "m_bridge_file": [
+      {
+        "vid": 1,
+        "fnid": "$fnid_0",
+        "fid": "$fid_0"
+      }
+    ],
+    "m_ast": [
+      {
+        "ast_id": "$ast_0",
+        "name": "/*\n * linux/include/linux/lockd/bind.h\n *\n * This is the part of lockd visible to nfsd and the nfs client.\n *\n * Copyright (C) 1996, Olaf Kirch <okir@monad.swb.de>\n */",
+        "type_id": "2 (C_Comment)"
+      },
+      {
+        "ast_id": "$ast_1",
+        "name": "LINUX_LOCKD_BIND_H",
+        "type_id": "72 (CPPro_ifndef)"
+      },
+      {
+        "ast_id": "$ast_2",
+        "name": "LINUX_LOCKD_BIND_H",
+        "type_id": "75 (CPPro_define)"
+      },
+      {
+        "ast_id": "$ast_3",
+        "name": "<linux/lockd/nlm.h>",
+        "type_id": "78 (CPPro_include)"
+      },
+      {
+        "ast_id": "$ast_4",
+        "name": "/* need xdr-encoded error codes too, so... */",
+        "type_id": "2 (C_Comment)"
+      },
+      {
+        "ast_id": "$ast_5",
+        "name": "<linux/lockd/xdr.h>",
+        "type_id": "78 (CPPro_include)"
+      },
+      {
+        "ast_id": "$ast_6",
+        "name": "CONFIG_LOCKD_V4",
+        "type_id": "71 (CPPro_ifdef)"
+      },
+      {
+        "ast_id": "$ast_7",
+        "name": "<linux/lockd/xdr4.h>",
+        "type_id": "78 (CPPro_include)"
+      },
+      {
+        "ast_id": "$ast_8",
+        "name": "",
+        "type_id": "70 (CPPro_endif)"
+      },
+      {
+        "ast_id": "$ast_9",
+        "name": "/* Dummy declarations */",
+        "type_id": "2 (C_Comment)"
+      },
+      {
+        "ast_id": "$ast_10",
+        "name": "svc_rqst",
+        "type_id": "27 (C_struct)"
+      },
+      {
+        "ast_id": "$ast_11",
+        "name": "/*\n * This is the set of functions for lockd->nfsd communication\n */",
+        "type_id": "2 (C_Comment)"
+      },
+      {
+        "ast_id": "$ast_12",
+        "name": "svc_rqst",
+        "type_id": "29 (C_structnotbind)"
+      },
+      {
+        "ast_id": "$ast_13",
+        "name": "",
+        "type_id": "1 (C_Compound)"
+      },
+      {
+        "ast_id": "$ast_14",
+        "name": "nfs_fh",
+        "type_id": "29 (C_structnotbind)"
+      },
+      {
+        "ast_id": "$ast_15",
+        "name": "",
+        "type_id": "1 (C_Compound)"
+      },
+      {
+        "ast_id": "$ast_16",
+        "name": "file",
+        "type_id": "29 (C_structnotbind)"
+      },
+      {
+        "ast_id": "$ast_17",
+        "name": "",
+        "type_id": "1 (C_Compound)"
+      },
+      {
+        "ast_id": "$ast_18",
+        "name": "__be32",
+        "type_id": "10 (C_SCtypedef)"
+      },
+      {
+        "ast_id": "$ast_19",
+        "name": "",
+        "type_id": "1 (C_Compound)"
+      },
+      {
+        "ast_id": "$ast_20",
+        "name": "fopen",
+        "type_id": "21 (C_functionprotodecl)"
+      },
+      {
+        "ast_id": "$ast_21",
+        "name": "",
+        "type_id": "1 (C_Compound)"
+      },
+      {
+        "ast_id": "$ast_22",
+        "name": "",
+        "type_id": "1 (C_Compound)"
+      },
+      {
+        "ast_id": "$ast_23",
+        "name": "fclose",
+        "type_id": "21 (C_functionprotodecl)"
+      },
+      {
+        "ast_id": "$ast_24",
+        "name": "nlmsvc_binding",
+        "type_id": "28 (C_structdecl)"
+      },
+      {
+        "ast_id": "$ast_25",
+        "name": "nlmsvc_ops",
+        "type_id": "1 (C_Compound)"
+      },
+      {
+        "ast_id": "$ast_26",
+        "name": "/*\n * Similar to nfs_client_initdata, but without the NFS-specific\n * rpc_ops field.\n */",
+        "type_id": "2 (C_Comment)"
+      },
+      {
+        "ast_id": "$ast_27",
+        "name": "",
+        "type_id": "1 (C_Compound)"
+      },
+      {
+        "ast_id": "$ast_28",
+        "name": "hostname",
+        "type_id": "1 (C_Compound)"
+      },
+      {
+        "ast_id": "$ast_29",
+        "name": "sockaddr",
+        "type_id": "29 (C_structnotbind)"
+      },
+      {
+        "ast_id": "$ast_30",
+        "name": "",
+        "type_id": "1 (C_Compound)"
+      },
+      {
+        "ast_id": "$ast_31",
+        "name": "address",
+        "type_id": "1 (C_Compound)"
+      },
+      {
+        "ast_id": "$ast_32",
+        "name": "size_t",
+        "type_id": "10 (C_SCtypedef)"
+      },
+      {
+        "ast_id": "$ast_33",
+        "name": "addrlen",
+        "type_id": "10 (C_SCtypedef)"
+      },
+      {
+        "ast_id": "$ast_34",
+        "name": "",
+        "type_id": "1 (C_Compound)"
+      },
+      {
+        "ast_id": "$ast_35",
+        "name": "protocol",
+        "type_id": "37 (C_unsigned)"
+      },
+      {
+        "ast_id": "$ast_36",
+        "name": "u32",
+        "type_id": "10 (C_SCtypedef)"
+      },
+      {
+        "ast_id": "$ast_37",
+        "name": "nfs_version",
+        "type_id": "10 (C_SCtypedef)"
+      },
+      {
+        "ast_id": "$ast_38",
+        "name": "noresvport",
+        "type_id": "41 (C_int)"
+      },
+      {
+        "ast_id": "$ast_39",
+        "name": "nlmclnt_initdata",
+        "type_id": "28 (C_structdecl)"
+      },
+      {
+        "ast_id": "$ast_40",
+        "name": "/*\n * Functions exported by the lockd module\n */",
+        "type_id": "2 (C_Comment)"
+      },
+      {
+        "ast_id": "$ast_41",
+        "name": "",
+        "type_id": "1 (C_Compound)"
+      },
+      {
+        "ast_id": "$ast_42",
+        "name": "nlm_init",
+        "type_id": "1 (C_Compound)"
+      },
+      {
+        "ast_id": "$ast_43",
+        "name": "nlm_host",
+        "type_id": "29 (C_structnotbind)"
+      },
+      {
+        "ast_id": "$ast_44",
+        "name": "",
+        "type_id": "1 (C_Compound)"
+      },
+      {
+        "ast_id": "$ast_45",
+        "name": "nlmclnt_init",
+        "type_id": "21 (C_functionprotodecl)"
+      },
+      {
+        "ast_id": "$ast_46",
+        "name": "host",
+        "type_id": "1 (C_Compound)"
+      },
+      {
+        "ast_id": "$ast_47",
+        "name": "nlmclnt_done",
+        "type_id": "21 (C_functionprotodecl)"
+      },
+      {
+        "ast_id": "$ast_48",
+        "name": "cmd",
+        "type_id": "41 (C_int)"
+      },
+      {
+        "ast_id": "$ast_49",
+        "name": "file_lock",
+        "type_id": "29 (C_structnotbind)"
+      },
+      {
+        "ast_id": "$ast_50",
+        "name": "fl",
+        "type_id": "1 (C_Compound)"
+      },
+      {
+        "ast_id": "$ast_51",
+        "name": "nlmclnt_proc",
+        "type_id": "21 (C_functionprotodecl)"
+      },
+      {
+        "ast_id": "$ast_52",
+        "name": "lockd_up",
+        "type_id": "21 (C_functionprotodecl)"
+      },
+      {
+        "ast_id": "$ast_53",
+        "name": "lockd_down",
+        "type_id": "21 (C_functionprotodecl)"
+      },
+      {
+        "ast_id": "$ast_54",
+        "name": "/* LINUX_LOCKD_BIND_H */",
+        "type_id": "2 (C_Comment)"
+      }
+    ],
+    "m_tag_code": [
+      {
+        "hash": "hex:b2a3cf0c6cbb9cc0a82aa462592f4cbee160e411ef1af25270126b258e6a2067",
+        "code": "/*\n * linux/include/linux/lockd/bind.h\n *\n * This is the part of lockd visible to nfsd and the nfs client.\n *\n * Copyright (C) 1996, Olaf Kirch <okir@monad.swb.de>\n */"
+      },
+      {
+        "hash": "hex:1b46302c4fdf47ae4d373410254d223fba9d03269d38bcafe16e5e2a0e38dcce",
+        "code": "#ifndef LINUX_LOCKD_BIND_H"
+      },
+      {
+        "hash": "hex:6d37cc0e8e7a8372a2a806f6e8f2ae1c390ffa77dc6b04ea5e95b510c1902426",
+        "code": "#define LINUX_LOCKD_BIND_H"
+      },
+      {
+        "hash": "hex:48280cd3af5c6977d10880c23028259bc92348ca1c43928dd378821dfa595d91",
+        "code": "#include <linux/lockd/nlm.h>"
+      },
+      {
+        "hash": "hex:c59ce5cc0bd82b17970f5f839c7dfd7544d8a14e542d4cf58b4236c4fbcc0938",
+        "code": "/* need xdr-encoded error codes too, so... */"
+      },
+      {
+        "hash": "hex:cc495f7783a911d2fab0a7c5502f284adc66c333c2325520ae53abff9248adf2",
+        "code": "#include <linux/lockd/xdr.h>"
+      },
+      {
+        "hash": "hex:840196003c246c474f3c212a1ab5785c13e61b5b6ff2255cc5dc550eb9e35e25",
+        "code": "#ifdef CONFIG_LOCKD_V4"
+      },
+      {
+        "hash": "hex:592d976483096c272a78daf5676784efb9bf2751e93a2d21497c45154bae8205",
+        "code": "#include <linux/lockd/xdr4.h>"
+      },
+      {
+        "hash": "hex:1e258076b154c8a5a3303fe08eb08c3253d26728e5b64f90a29cc1752f787781",
+        "code": "#endif"
+      },
+      {
+        "hash": "hex:ab45556794034220de693e35d273ff27e10a8005ac2a4dcf71f9eb84f3074a6c",
+        "code": "/* Dummy declarations */"
+      },
+      {
+        "hash": "hex:73da0d430dc573c1155a47e1f89e6ced5541de633a1db78dd8db4d7535779d49",
+        "code": "struct svc_rqst;"
+      },
+      {
+        "hash": "hex:d4bbf096f27aff777bad017021dac5266ca8d0ff2c1fab25f8ccdf01928af87a",
+        "code": "/*\n * This is the set of functions for lockd->nfsd communication\n */"
+      },
+      {
+        "hash": "hex:c0531b962bff919f10d178e08a6cd40d89c2ae784afc9a50c8cdf9b3a82f76d8",
+        "code": "struct nlmsvc_binding {\n\t__be32\t\t\t(*fopen)(struct svc_rqst *,\n\t\t\t\t\t\tstruct nfs_fh *,\n\t\t\t\t\t\tstruct file **);\n\tvoid\t\t\t(*fclose)(struct file *);\n};"
+      },
+      {
+        "hash": "hex:a04a24911f5464594d6a087d0060a2f3f0701d3d54e4b67dab298c787ab80e41",
+        "code": "extern struct nlmsvc_binding *\tnlmsvc_ops;"
+      },
+      {
+        "hash": "hex:5db056ae78470983d3b0e3ac5ae8827f64a223d708aed61abf2f6dd008739d41",
+        "code": "/*\n * Similar to nfs_client_initdata, but without the NFS-specific\n * rpc_ops field.\n */"
+      },
+      {
+        "hash": "hex:67072cc78f5d610cfabe6a76ec99c1249e572830450cbdcb07d221f90eaa4a23",
+        "code": "struct nlmclnt_initdata {\n\tconst char\t\t*hostname;\n\tconst struct sockaddr\t*address;\n\tsize_t\t\t\taddrlen;\n\tunsigned short\t\tprotocol;\n\tu32\t\t\tnfs_version;\n\tint\t\t\tnoresvport;\n};"
+      },
+      {
+        "hash": "hex:5aadf4bc3a5de3c3d41b23d956a7a5af8a8d4caf67cefa77803b08fd87f03e26",
+        "code": "/*\n * Functions exported by the lockd module\n */"
+      },
+      {
+        "hash": "hex:1d205168dc3affe76dd9697cbec697c4c6a5544c2d0b5c4afa718c41e44b3cb5",
+        "code": "extern struct nlm_host *nlmclnt_init(const struct nlmclnt_initdata *nlm_init);"
+      },
+      {
+        "hash": "hex:6ab5deb92b032397754718a24c55351563b8c25942a8f3eec36e68ef9d48c2ec",
+        "code": "extern void\tnlmclnt_done(struct nlm_host *host);"
+      },
+      {
+        "hash": "hex:b9382d16009826b1b755ca80a8ebfb8e84c033d6fca13a839d69fcd612f59400",
+        "code": "extern int\tnlmclnt_proc(struct nlm_host *host, int cmd,\n\t\t\t\t\tstruct file_lock *fl);"
+      },
+      {
+        "hash": "hex:18216c8519e27f044b0b39384cc726a7e5a02296eaf3ca9f55609c0560373d85",
+        "code": "extern int\tlockd_up(void);"
+      },
+      {
+        "hash": "hex:7fdc2a89a178f508873c70cf571058074e1b212ae6148f198d145a15b4eade13",
+        "code": "extern void\tlockd_down(void);"
+      },
+      {
+        "hash": "hex:82b3f929b15c3b0cf7d35e93825bf18124b3123af78cd27d7b95c29569ac7ae2",
+        "code": "/* LINUX_LOCKD_BIND_H */"
+      }
+    ],
+    "m_tag": [
+      {
+        "tag_id": "$tag_0",
+        "vid_s": 1,
+        "vid_e": 0,
+        "hash": "hex:b2a3cf0c6cbb9cc0a82aa462592f4cbee160e411ef1af25270126b258e6a2067",
+        "ast_id": "$ast_0",
+        "hl_s": 0,
+        "hl_l": 0
+      },
+      {
+        "tag_id": "$tag_1",
+        "vid_s": 1,
+        "vid_e": 0,
+        "hash": "hex:1b46302c4fdf47ae4d373410254d223fba9d03269d38bcafe16e5e2a0e38dcce",
+        "ast_id": "$ast_1",
+        "hl_s": 0,
+        "hl_l": 0
+      },
+      {
+        "tag_id": "$tag_2",
+        "vid_s": 1,
+        "vid_e": 0,
+        "hash": "hex:6d37cc0e8e7a8372a2a806f6e8f2ae1c390ffa77dc6b04ea5e95b510c1902426",
+        "ast_id": "$ast_2",
+        "hl_s": 0,
+        "hl_l": 0
+      },
+      {
+        "tag_id": "$tag_3",
+        "vid_s": 1,
+        "vid_e": 0,
+        "hash": "hex:48280cd3af5c6977d10880c23028259bc92348ca1c43928dd378821dfa595d91",
+        "ast_id": "$ast_3",
+        "hl_s": 0,
+        "hl_l": 0
+      },
+      {
+        "tag_id": "$tag_4",
+        "vid_s": 1,
+        "vid_e": 0,
+        "hash": "hex:c59ce5cc0bd82b17970f5f839c7dfd7544d8a14e542d4cf58b4236c4fbcc0938",
+        "ast_id": "$ast_4",
+        "hl_s": 0,
+        "hl_l": 0
+      },
+      {
+        "tag_id": "$tag_5",
+        "vid_s": 1,
+        "vid_e": 0,
+        "hash": "hex:cc495f7783a911d2fab0a7c5502f284adc66c333c2325520ae53abff9248adf2",
+        "ast_id": "$ast_5",
+        "hl_s": 0,
+        "hl_l": 0
+      },
+      {
+        "tag_id": "$tag_6",
+        "vid_s": 1,
+        "vid_e": 0,
+        "hash": "hex:840196003c246c474f3c212a1ab5785c13e61b5b6ff2255cc5dc550eb9e35e25",
+        "ast_id": "$ast_6",
+        "hl_s": 0,
+        "hl_l": 0
+      },
+      {
+        "tag_id": "$tag_7",
+        "vid_s": 1,
+        "vid_e": 0,
+        "hash": "hex:592d976483096c272a78daf5676784efb9bf2751e93a2d21497c45154bae8205",
+        "ast_id": "$ast_7",
+        "hl_s": 0,
+        "hl_l": 0
+      },
+      {
+        "tag_id": "$tag_8",
+        "vid_s": 1,
+        "vid_e": 0,
+        "hash": "hex:1e258076b154c8a5a3303fe08eb08c3253d26728e5b64f90a29cc1752f787781",
+        "ast_id": "$ast_8",
+        "hl_s": 0,
+        "hl_l": 0
+      },
+      {
+        "tag_id": "$tag_9",
+        "vid_s": 1,
+        "vid_e": 0,
+        "hash": "hex:ab45556794034220de693e35d273ff27e10a8005ac2a4dcf71f9eb84f3074a6c",
+        "ast_id": "$ast_9",
+        "hl_s": 0,
+        "hl_l": 0
+      },
+      {
+        "tag_id": "$tag_10",
+        "vid_s": 1,
+        "vid_e": 0,
+        "hash": "hex:73da0d430dc573c1155a47e1f89e6ced5541de633a1db78dd8db4d7535779d49",
+        "ast_id": "$ast_10",
+        "hl_s": 0,
+        "hl_l": 0
+      },
+      {
+        "tag_id": "$tag_11",
+        "vid_s": 1,
+        "vid_e": 0,
+        "hash": "hex:d4bbf096f27aff777bad017021dac5266ca8d0ff2c1fab25f8ccdf01928af87a",
+        "ast_id": "$ast_11",
+        "hl_s": 0,
+        "hl_l": 0
+      },
+      {
+        "tag_id": "$tag_12",
+        "vid_s": 1,
+        "vid_e": 0,
+        "hash": "hex:c0531b962bff919f10d178e08a6cd40d89c2ae784afc9a50c8cdf9b3a82f76d8",
+        "ast_id": "$ast_24",
+        "hl_s": 0,
+        "hl_l": 0
+      },
+      {
+        "tag_id": "$tag_13",
+        "vid_s": 1,
+        "vid_e": 0,
+        "hash": "hex:a04a24911f5464594d6a087d0060a2f3f0701d3d54e4b67dab298c787ab80e41",
+        "ast_id": "$ast_25",
+        "hl_s": 0,
+        "hl_l": 0
+      },
+      {
+        "tag_id": "$tag_14",
+        "vid_s": 1,
+        "vid_e": 0,
+        "hash": "hex:5db056ae78470983d3b0e3ac5ae8827f64a223d708aed61abf2f6dd008739d41",
+        "ast_id": "$ast_26",
+        "hl_s": 0,
+        "hl_l": 0
+      },
+      {
+        "tag_id": "$tag_15",
+        "vid_s": 1,
+        "vid_e": 0,
+        "hash": "hex:67072cc78f5d610cfabe6a76ec99c1249e572830450cbdcb07d221f90eaa4a23",
+        "ast_id": "$ast_39",
+        "hl_s": 0,
+        "hl_l": 0
+      },
+      {
+        "tag_id": "$tag_16",
+        "vid_s": 1,
+        "vid_e": 0,
+        "hash": "hex:5aadf4bc3a5de3c3d41b23d956a7a5af8a8d4caf67cefa77803b08fd87f03e26",
+        "ast_id": "$ast_40",
+        "hl_s": 0,
+        "hl_l": 0
+      },
+      {
+        "tag_id": "$tag_17",
+        "vid_s": 1,
+        "vid_e": 0,
+        "hash": "hex:1d205168dc3affe76dd9697cbec697c4c6a5544c2d0b5c4afa718c41e44b3cb5",
+        "ast_id": "$ast_45",
+        "hl_s": 0,
+        "hl_l": 0
+      },
+      {
+        "tag_id": "$tag_18",
+        "vid_s": 1,
+        "vid_e": 0,
+        "hash": "hex:6ab5deb92b032397754718a24c55351563b8c25942a8f3eec36e68ef9d48c2ec",
+        "ast_id": "$ast_47",
+        "hl_s": 0,
+        "hl_l": 0
+      },
+      {
+        "tag_id": "$tag_19",
+        "vid_s": 1,
+        "vid_e": 0,
+        "hash": "hex:b9382d16009826b1b755ca80a8ebfb8e84c033d6fca13a839d69fcd612f59400",
+        "ast_id": "$ast_51",
+        "hl_s": 0,
+        "hl_l": 0
+      },
+      {
+        "tag_id": "$tag_20",
+        "vid_s": 1,
+        "vid_e": 0,
+        "hash": "hex:18216c8519e27f044b0b39384cc726a7e5a02296eaf3ca9f55609c0560373d85",
+        "ast_id": "$ast_52",
+        "hl_s": 0,
+        "hl_l": 0
+      },
+      {
+        "tag_id": "$tag_21",
+        "vid_s": 1,
+        "vid_e": 0,
+        "hash": "hex:7fdc2a89a178f508873c70cf571058074e1b212ae6148f198d145a15b4eade13",
+        "ast_id": "$ast_53",
+        "hl_s": 0,
+        "hl_l": 0
+      },
+      {
+        "tag_id": "$tag_22",
+        "vid_s": 1,
+        "vid_e": 0,
+        "hash": "hex:1e258076b154c8a5a3303fe08eb08c3253d26728e5b64f90a29cc1752f787781",
+        "ast_id": "$ast_8",
+        "hl_s": 0,
+        "hl_l": 0
+      },
+      {
+        "tag_id": "$tag_23",
+        "vid_s": 1,
+        "vid_e": 0,
+        "hash": "hex:82b3f929b15c3b0cf7d35e93825bf18124b3123af78cd27d7b95c29569ac7ae2",
+        "ast_id": "$ast_54",
+        "hl_s": 0,
+        "hl_l": 0
+      }
+    ],
+    "m_bridge_tag": [
+      {
+        "fid": "$fid_0",
+        "tag_id": "$tag_0",
+        "line_s": 1,
+        "line_e": 7,
+        "char_s": 1,
+        "char_e": 4
+      },
+      {
+        "fid": "$fid_0",
+        "tag_id": "$tag_1",
+        "line_s": 9,
+        "line_e": 9,
+        "char_s": 1,
+        "char_e": 27
+      },
+      {
+        "fid": "$fid_0",
+        "tag_id": "$tag_2",
+        "line_s": 10,
+        "line_e": 10,
+        "char_s": 1,
+        "char_e": 27
+      },
+      {
+        "fid": "$fid_0",
+        "tag_id": "$tag_3",
+        "line_s": 12,
+        "line_e": 12,
+        "char_s": 1,
+        "char_e": 29
+      },
+      {
+        "fid": "$fid_0",
+        "tag_id": "$tag_4",
+        "line_s": 13,
+        "line_e": 13,
+        "char_s": 1,
+        "char_e": 46
+      },
+      {
+        "fid": "$fid_0",
+        "tag_id": "$tag_5",
+        "line_s": 14,
+        "line_e": 14,
+        "char_s": 1,
+        "char_e": 29
+      },
+      {
+        "fid": "$fid_0",
+        "tag_id": "$tag_6",
+        "line_s": 15,
+        "line_e": 15,
+        "char_s": 1,
+        "char_e": 23
+      },
+      {
+        "fid": "$fid_0",
+        "tag_id": "$tag_7",
+        "line_s": 16,
+        "line_e": 16,
+        "char_s": 1,
+        "char_e": 30
+      },
+      {
+        "fid": "$fid_0",
+        "tag_id": "$tag_8",
+        "line_s": 17,
+        "line_e": 17,
+        "char_s": 1,
+        "char_e": 7
+      },
+      {
+        "fid": "$fid_0",
+        "tag_id": "$tag_9",
+        "line_s": 19,
+        "line_e": 19,
+        "char_s": 1,
+        "char_e": 25
+      },
+      {
+        "fid": "$fid_0",
+        "tag_id": "$tag_10",
+        "line_s": 20,
+        "line_e": 20,
+        "char_s": 1,
+        "char_e": 17
+      },
+      {
+        "fid": "$fid_0",
+        "tag_id": "$tag_11",
+        "line_s": 22,
+        "line_e": 24,
+        "char_s": 1,
+        "char_e": 4
+      },
+      {
+        "fid": "$fid_0",
+        "tag_id": "$tag_12",
+        "line_s": 25,
+        "line_e": 30,
+        "char_s": 1,
+        "char_e": 3
+      },
+      {
+        "fid": "$fid_0",
+        "tag_id": "$tag_13",
+        "line_s": 32,
+        "line_e": 32,
+        "char_s": 1,
+        "char_e": 43
+      },
+      {
+        "fid": "$fid_0",
+        "tag_id": "$tag_14",
+        "line_s": 34,
+        "line_e": 37,
+        "char_s": 1,
+        "char_e": 4
+      },
+      {
+        "fid": "$fid_0",
+        "tag_id": "$tag_15",
+        "line_s": 38,
+        "line_e": 45,
+        "char_s": 1,
+        "char_e": 3
+      },
+      {
+        "fid": "$fid_0",
+        "tag_id": "$tag_16",
+        "line_s": 47,
+        "line_e": 49,
+        "char_s": 1,
+        "char_e": 4
+      },
+      {
+        "fid": "$fid_0",
+        "tag_id": "$tag_17",
+        "line_s": 51,
+        "line_e": 51,
+        "char_s": 1,
+        "char_e": 79
+      },
+      {
+        "fid": "$fid_0",
+        "tag_id": "$tag_18",
+        "line_s": 52,
+        "line_e": 52,
+        "char_s": 1,
+        "char_e": 49
+      },
+      {
+        "fid": "$fid_0",
+        "tag_id": "$tag_19",
+        "line_s": 54,
+        "line_e": 55,
+        "char_s": 1,
+        "char_e": 28
+      },
+      {
+        "fid": "$fid_0",
+        "tag_id": "$tag_20",
+        "line_s": 56,
+        "line_e": 56,
+        "char_s": 1,
+        "char_e": 27
+      },
+      {
+        "fid": "$fid_0",
+        "tag_id": "$tag_21",
+        "line_s": 57,
+        "line_e": 57,
+        "char_s": 1,
+        "char_e": 30
+      },
+      {
+        "fid": "$fid_0",
+        "tag_id": "$tag_22",
+        "line_s": 59,
+        "line_e": 59,
+        "char_s": 1,
+        "char_e": 7
+      },
+      {
+        "fid": "$fid_0",
+        "tag_id": "$tag_23",
+        "line_s": 59,
+        "line_e": 59,
+        "char_s": 8,
+        "char_e": 32
+      }
+    ],
+    "m_map_ast": [
+      {
+        "map_id": "$tag_0",
+        "line_s": 1,
+        "char_s": 1,
+        "line_e": 7,
+        "char_e": 4,
+        "ast_id": "$ast_0"
+      },
+      {
+        "map_id": "$tag_1",
+        "line_s": 1,
+        "char_s": 1,
+        "line_e": 51,
+        "char_e": 7,
+        "ast_id": "$ast_1"
+      },
+      {
+        "map_id": "$tag_2",
+        "line_s": 1,
+        "char_s": 1,
+        "line_e": 1,
+        "char_e": 27,
+        "ast_id": "$ast_2"
+      },
+      {
+        "map_id": "$tag_3",
+        "line_s": 1,
+        "char_s": 1,
+        "line_e": 1,
+        "char_e": 29,
+        "ast_id": "$ast_3"
+      },
+      {
+        "map_id": "$tag_4",
+        "line_s": 1,
+        "char_s": 1,
+        "line_e": 1,
+        "char_e": 46,
+        "ast_id": "$ast_4"
+      },
+      {
+        "map_id": "$tag_5",
+        "line_s": 1,
+        "char_s": 1,
+        "line_e": 1,
+        "char_e": 29,
+        "ast_id": "$ast_5"
+      },
+      {
+        "map_id": "$tag_6",
+        "line_s": 1,
+        "char_s": 1,
+        "line_e": 3,
+        "char_e": 7,
+        "ast_id": "$ast_6"
+      },
+      {
+        "map_id": "$tag_7",
+        "line_s": 1,
+        "char_s": 1,
+        "line_e": 1,
+        "char_e": 30,
+        "ast_id": "$ast_7"
+      },
+      {
+        "map_id": "$tag_8",
+        "line_s": 1,
+        "char_s": 1,
+        "line_e": 1,
+        "char_e": 7,
+        "ast_id": "$ast_8"
+      },
+      {
+        "map_id": "$tag_9",
+        "line_s": 1,
+        "char_s": 1,
+        "line_e": 1,
+        "char_e": 25,
+        "ast_id": "$ast_9"
+      },
+      {
+        "map_id": "$tag_10",
+        "line_s": 1,
+        "char_s": 1,
+        "line_e": 1,
+        "char_e": 17,
+        "ast_id": "$ast_10"
+      },
+      {
+        "map_id": "$tag_11",
+        "line_s": 1,
+        "char_s": 1,
+        "line_e": 3,
+        "char_e": 4,
+        "ast_id": "$ast_11"
+      },
+      {
+        "map_id": "$tag_12",
+        "line_s": 1,
+        "char_s": 1,
+        "line_e": 6,
+        "char_e": 3,
+        "ast_id": "$ast_24"
+      },
+      {
+        "map_id": "$tag_13",
+        "line_s": 1,
+        "char_s": 1,
+        "line_e": 1,
+        "char_e": 43,
+        "ast_id": "$ast_25"
+      },
+      {
+        "map_id": "$tag_14",
+        "line_s": 1,
+        "char_s": 1,
+        "line_e": 4,
+        "char_e": 4,
+        "ast_id": "$ast_26"
+      },
+      {
+        "map_id": "$tag_15",
+        "line_s": 1,
+        "char_s": 1,
+        "line_e": 8,
+        "char_e": 3,
+        "ast_id": "$ast_39"
+      },
+      {
+        "map_id": "$tag_16",
+        "line_s": 1,
+        "char_s": 1,
+        "line_e": 3,
+        "char_e": 4,
+        "ast_id": "$ast_40"
+      },
+      {
+        "map_id": "$tag_17",
+        "line_s": 1,
+        "char_s": 1,
+        "line_e": 1,
+        "char_e": 79,
+        "ast_id": "$ast_45"
+      },
+      {
+        "map_id": "$tag_18",
+        "line_s": 1,
+        "char_s": 1,
+        "line_e": 1,
+        "char_e": 49,
+        "ast_id": "$ast_47"
+      },
+      {
+        "map_id": "$tag_19",
+        "line_s": 1,
+        "char_s": 1,
+        "line_e": 2,
+        "char_e": 28,
+        "ast_id": "$ast_51"
+      },
+      {
+        "map_id": "$tag_20",
+        "line_s": 1,
+        "char_s": 1,
+        "line_e": 1,
+        "char_e": 27,
+        "ast_id": "$ast_52"
+      },
+      {
+        "map_id": "$tag_21",
+        "line_s": 1,
+        "char_s": 1,
+        "line_e": 1,
+        "char_e": 30,
+        "ast_id": "$ast_53"
+      },
+      {
+        "map_id": "$tag_22",
+        "line_s": 1,
+        "char_s": 1,
+        "line_e": 1,
+        "char_e": 7,
+        "ast_id": "$ast_8"
+      },
+      {
+        "map_id": "$tag_23",
+        "line_s": 1,
+        "char_s": 1,
+        "line_e": 1,
+        "char_e": 32,
+        "ast_id": "$ast_54"
+      }
+    ],
+    "m_bridge_map": [
+      {
+        "tag_id": "$tag_0",
+        "map_id": "$tag_0"
+      },
+      {
+        "tag_id": "$tag_1",
+        "map_id": "$tag_1"
+      },
+      {
+        "tag_id": "$tag_2",
+        "map_id": "$tag_2"
+      },
+      {
+        "tag_id": "$tag_3",
+        "map_id": "$tag_3"
+      },
+      {
+        "tag_id": "$tag_4",
+        "map_id": "$tag_4"
+      },
+      {
+        "tag_id": "$tag_5",
+        "map_id": "$tag_5"
+      },
+      {
+        "tag_id": "$tag_6",
+        "map_id": "$tag_6"
+      },
+      {
+        "tag_id": "$tag_7",
+        "map_id": "$tag_7"
+      },
+      {
+        "tag_id": "$tag_8",
+        "map_id": "$tag_8"
+      },
+      {
+        "tag_id": "$tag_9",
+        "map_id": "$tag_9"
+      },
+      {
+        "tag_id": "$tag_10",
+        "map_id": "$tag_10"
+      },
+      {
+        "tag_id": "$tag_11",
+        "map_id": "$tag_11"
+      },
+      {
+        "tag_id": "$tag_12",
+        "map_id": "$tag_12"
+      },
+      {
+        "tag_id": "$tag_13",
+        "map_id": "$tag_13"
+      },
+      {
+        "tag_id": "$tag_14",
+        "map_id": "$tag_14"
+      },
+      {
+        "tag_id": "$tag_15",
+        "map_id": "$tag_15"
+      },
+      {
+        "tag_id": "$tag_16",
+        "map_id": "$tag_16"
+      },
+      {
+        "tag_id": "$tag_17",
+        "map_id": "$tag_17"
+      },
+      {
+        "tag_id": "$tag_18",
+        "map_id": "$tag_18"
+      },
+      {
+        "tag_id": "$tag_19",
+        "map_id": "$tag_19"
+      },
+      {
+        "tag_id": "$tag_20",
+        "map_id": "$tag_20"
+      },
+      {
+        "tag_id": "$tag_21",
+        "map_id": "$tag_21"
+      },
+      {
+        "tag_id": "$tag_22",
+        "map_id": "$tag_22"
+      },
+      {
+        "tag_id": "$tag_23",
+        "map_id": "$tag_23"
+      }
+    ],
+    "m_symbol_def": [
+      {
+        "def_id": "$def_0",
+        "vid": 1,
+        "fid": "$fid_0",
+        "tag_id": "$tag_2",
+        "ast_id": "$ast_2",
+        "name": "LINUX_LOCKD_BIND_H",
+        "type_id": "75 (CPPro_define)",
+        "line_s": 10,
+        "line_e": 10
+      },
+      {
+        "def_id": "$def_1",
+        "vid": 1,
+        "fid": "$fid_0",
+        "tag_id": "$tag_12",
+        "ast_id": "$ast_24",
+        "name": "nlmsvc_binding",
+        "type_id": "28 (C_structdecl)",
+        "line_s": 25,
+        "line_e": 30
+      },
+      {
+        "def_id": "$def_2",
+        "vid": 1,
+        "fid": "$fid_0",
+        "tag_id": "$tag_13",
+        "ast_id": "$ast_25",
+        "name": "nlmsvc_ops",
+        "type_id": "1 (C_Compound)",
+        "line_s": 32,
+        "line_e": 32
+      },
+      {
+        "def_id": "$def_3",
+        "vid": 1,
+        "fid": "$fid_0",
+        "tag_id": "$tag_15",
+        "ast_id": "$ast_39",
+        "name": "nlmclnt_initdata",
+        "type_id": "28 (C_structdecl)",
+        "line_s": 38,
+        "line_e": 45
+      },
+      {
+        "def_id": "$def_4",
+        "vid": 1,
+        "fid": "$fid_0",
+        "tag_id": "$tag_17",
+        "ast_id": "$ast_45",
+        "name": "nlmclnt_init",
+        "type_id": "21 (C_functionprotodecl)",
+        "line_s": 51,
+        "line_e": 51
+      },
+      {
+        "def_id": "$def_5",
+        "vid": 1,
+        "fid": "$fid_0",
+        "tag_id": "$tag_18",
+        "ast_id": "$ast_47",
+        "name": "nlmclnt_done",
+        "type_id": "21 (C_functionprotodecl)",
+        "line_s": 52,
+        "line_e": 52
+      },
+      {
+        "def_id": "$def_6",
+        "vid": 1,
+        "fid": "$fid_0",
+        "tag_id": "$tag_19",
+        "ast_id": "$ast_51",
+        "name": "nlmclnt_proc",
+        "type_id": "21 (C_functionprotodecl)",
+        "line_s": 54,
+        "line_e": 55
+      },
+      {
+        "def_id": "$def_7",
+        "vid": 1,
+        "fid": "$fid_0",
+        "tag_id": "$tag_20",
+        "ast_id": "$ast_52",
+        "name": "lockd_up",
+        "type_id": "21 (C_functionprotodecl)",
+        "line_s": 56,
+        "line_e": 56
+      },
+      {
+        "def_id": "$def_8",
+        "vid": 1,
+        "fid": "$fid_0",
+        "tag_id": "$tag_21",
+        "ast_id": "$ast_53",
+        "name": "lockd_down",
+        "type_id": "21 (C_functionprotodecl)",
+        "line_s": 57,
+        "line_e": 57
+      }
+    ],
+    "m_symbol_ref": [
+      {
+        "ref_id": "$ref_0",
+        "vid": 1,
+        "fid": "$fid_0",
+        "tag_id": "$tag_10",
+        "ast_id": "$ast_10",
+        "role": "1 (Declaration)",
+        "line": 20,
+        "char_s": 1
+      },
+      {
+        "ref_id": "$ref_1",
+        "vid": 1,
+        "fid": "$fid_0",
+        "tag_id": "$tag_12",
+        "ast_id": "$ast_12",
+        "role": "2 (TypeUsage)",
+        "line": 26,
+        "char_s": 27
+      },
+      {
+        "ref_id": "$ref_2",
+        "vid": 1,
+        "fid": "$fid_0",
+        "tag_id": "$tag_12",
+        "ast_id": "$ast_14",
+        "role": "2 (TypeUsage)",
+        "line": 27,
+        "char_s": 14
+      },
+      {
+        "ref_id": "$ref_3",
+        "vid": 1,
+        "fid": "$fid_0",
+        "tag_id": "$tag_12",
+        "ast_id": "$ast_16",
+        "role": "2 (TypeUsage)",
+        "line": 28,
+        "char_s": 14
+      },
+      {
+        "ref_id": "$ref_4",
+        "vid": 1,
+        "fid": "$fid_0",
+        "tag_id": "$tag_12",
+        "ast_id": "$ast_18",
+        "role": "2 (TypeUsage)",
+        "line": 26,
+        "char_s": 2
+      },
+      {
+        "ref_id": "$ref_5",
+        "vid": 1,
+        "fid": "$fid_0",
+        "tag_id": "$tag_12",
+        "ast_id": "$ast_16",
+        "role": "2 (TypeUsage)",
+        "line": 29,
+        "char_s": 26
+      },
+      {
+        "ref_id": "$ref_6",
+        "vid": 1,
+        "fid": "$fid_0",
+        "tag_id": "$tag_13",
+        "ast_id": "$ast_24",
+        "role": "2 (TypeUsage)",
+        "line": 32,
+        "char_s": 15
+      },
+      {
+        "ref_id": "$ref_7",
+        "vid": 1,
+        "fid": "$fid_0",
+        "tag_id": "$tag_15",
+        "ast_id": "$ast_29",
+        "role": "2 (TypeUsage)",
+        "line": 40,
+        "char_s": 15
+      },
+      {
+        "ref_id": "$ref_8",
+        "vid": 1,
+        "fid": "$fid_0",
+        "tag_id": "$tag_15",
+        "ast_id": "$ast_32",
+        "role": "2 (TypeUsage)",
+        "line": 41,
+        "char_s": 2
+      },
+      {
+        "ref_id": "$ref_9",
+        "vid": 1,
+        "fid": "$fid_0",
+        "tag_id": "$tag_15",
+        "ast_id": "$ast_36",
+        "role": "2 (TypeUsage)",
+        "line": 43,
+        "char_s": 2
+      },
+      {
+        "ref_id": "$ref_10",
+        "vid": 1,
+        "fid": "$fid_0",
+        "tag_id": "$tag_17",
+        "ast_id": "$ast_39",
+        "role": "2 (TypeUsage)",
+        "line": 51,
+        "char_s": 51
+      },
+      {
+        "ref_id": "$ref_11",
+        "vid": 1,
+        "fid": "$fid_0",
+        "tag_id": "$tag_17",
+        "ast_id": "$ast_43",
+        "role": "2 (TypeUsage)",
+        "line": 51,
+        "char_s": 15
+      },
+      {
+        "ref_id": "$ref_12",
+        "vid": 1,
+        "fid": "$fid_0",
+        "tag_id": "$tag_18",
+        "ast_id": "$ast_43",
+        "role": "2 (TypeUsage)",
+        "line": 52,
+        "char_s": 33
+      },
+      {
+        "ref_id": "$ref_13",
+        "vid": 1,
+        "fid": "$fid_0",
+        "tag_id": "$tag_19",
+        "ast_id": "$ast_43",
+        "role": "2 (TypeUsage)",
+        "line": 54,
+        "char_s": 32
+      },
+      {
+        "ref_id": "$ref_14",
+        "vid": 1,
+        "fid": "$fid_0",
+        "tag_id": "$tag_19",
+        "ast_id": "$ast_49",
+        "role": "2 (TypeUsage)",
+        "line": 55,
+        "char_s": 13
+      }
+    ]
+  }
+}

@@ -59,7 +59,7 @@
     ],
     "m_ast": [
       {
-        "ast_id": "$ast_0",
+        "ast_id": "$prior_ast_0",
         "name": "7d45295449dfd4ed64f288a57760b08cb429e492843d8b15af3ea0295d031754",
         "type_id": "144 (Raw_Content)"
       },
@@ -85,12 +85,12 @@
         "vid_s": 1,
         "vid_e": 1,
         "hash": "hex:7d45295449dfd4ed64f288a57760b08cb429e492843d8b15af3ea0295d031754",
-        "ast_id": "$ast_0",
+        "ast_id": "$prior_ast_0",
         "hl_s": 0,
         "hl_l": 0
       },
       {
-        "tag_id": "$tag_0",
+        "tag_id": "$tag_1",
         "vid_s": 2,
         "vid_e": 0,
         "hash": "hex:fa6c1d3b5633f6f200068708e558d6062a6a7243a7e78a48e661cd3201d0d343",
@@ -110,7 +110,7 @@
       },
       {
         "fid": "$fid_1",
-        "tag_id": "$tag_0",
+        "tag_id": "$tag_1",
         "line_s": 1,
         "line_e": 351,
         "char_s": 1,
@@ -124,10 +124,10 @@
         "char_s": 1,
         "line_e": 355,
         "char_e": 1,
-        "ast_id": "$ast_0"
+        "ast_id": "$prior_ast_0"
       },
       {
-        "map_id": "$tag_0",
+        "map_id": "$tag_1",
         "line_s": 1,
         "char_s": 1,
         "line_e": 351,
@@ -141,14 +141,14 @@
         "map_id": "$prior_tag_0"
       },
       {
-        "tag_id": "$tag_0",
-        "map_id": "$tag_0"
+        "tag_id": "$tag_1",
+        "map_id": "$tag_1"
       }
     ],
     "m_moved_tag": [
       {
         "s_tag_id": "$prior_tag_0",
-        "e_tag_id": "$tag_0"
+        "e_tag_id": "$tag_1"
       }
     ]
   }

@@ -25,11 +25,11 @@
     "m_file_name": [
       {
         "fnid": "$fnid_0",
-        "fname": "Documentation/hid/hiddev.txt"
+        "fname": "Documentation/usb/hiddev.txt"
       },
       {
         "fnid": "$fnid_1",
-        "fname": "Documentation/usb/hiddev.txt"
+        "fname": "Documentation/hid/hiddev.txt"
       }
     ],
     "m_file": [
@@ -44,12 +44,12 @@
     ],
     "m_bridge_file": [
       {
-        "vid": 2,
+        "vid": 1,
         "fnid": "$fnid_0",
         "fid": "$fid_0"
       },
       {
-        "vid": 1,
+        "vid": 2,
         "fnid": "$fnid_1",
         "fid": "$fid_0"
       }
