@@ -130,6 +130,9 @@ Subsystem File Ownership Resolution:
 - **Web Pages (`W:`)**: Emits `ASTT.Maintainer_Web` (104).
 - **SCM Trees (`T:`)**: Emits `ASTT.Maintainer_Tree` (105).
 - **Subsystem Status (`S:`)**: Emits `ASTT.Maintainer_Status` (106) with values: `Supported`, `Maintained`, `Odd Fixes`, `Orphan`, `Obsolete`.
+- **Bug Reporting & Tracking (`B:`)**: Emits `ASTT.Maintainer_Bug` (196).
+- **Chat & IRC Channels (`C:`)**: Emits `ASTT.Maintainer_Chat` (197).
+- **Patchwork (`Q:`)**: Emits `ASTT.Maintainer_Patchwork` (198).
 
 ### 3.2. CREDITS Entry Classification
 Parsed by `CreditsParser` into structured contributor blocks:

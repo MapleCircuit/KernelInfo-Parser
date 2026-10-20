@@ -36,6 +36,7 @@ from core.DBLayout import (
     m_file_name,
     m_symbol_def,
     m_symbol_ref,
+    m_ast_attribute,
 )
 from parser.c_ast.ctypes_bindings import (
     AST_KIND,
@@ -74,6 +75,8 @@ from parser.c_ast.ast_nodes import (
     CPPro_define,
     CPPro_undef,
     CPPro_include,
+    CPPro_include_next,
+    CPPro_ident,
     CPPro_embed,
     CPPro_line,
     CPPro_error,
@@ -99,6 +102,8 @@ _VALID_TOP_KINDS = frozenset({
     cc.CursorKind.CXX_METHOD,
     cc.CursorKind.VAR_DECL,
     cc.CursorKind.TYPEDEF_DECL,
+    cc.CursorKind.STATIC_ASSERT,
+    cc.CursorKind.ASM_STMT,
 })
 _NON_NAME_TOKENS = frozenset({"struct", "union", "enum", "(", "*", ""})
 _VAR_DECL_MACROS = frozenset({
@@ -129,6 +134,36 @@ _VAR_DECL_MACROS = frozenset({
     "DECLARE_COMPLETION",
     "DECLARE_COMPLETION_ONSTACK",
     "DEFINE_SIMPLE_ATTRIBUTE",
+    "DEFINE_KTHREAD_WORK",
+    "DEFINE_KTHREAD_WORKER",
+    "DEFINE_KTHREAD_WORKER_ONSTACK",
+    "DEFINE_KTHREAD_WORK_ONSTACK",
+    "DECLARE_DEFERRED_WORK",
+    "DECLARE_TASKLET_DISABLED",
+    "DEFINE_STATIC_KEY_TRUE",
+    "DEFINE_STATIC_KEY_FALSE",
+    "DECLARE_STATIC_KEY_TRUE",
+    "DECLARE_STATIC_KEY_FALSE",
+    "DEFINE_SRCU",
+    "DEFINE_STATIC_SRCU",
+    "DECLARE_WAIT_QUEUE_HEAD_ONSTACK",
+    "DECLARE_KFIFO",
+    "DECLARE_KFIFO_PTR",
+    "DEFINE_KFIFO",
+    "DEFINE_WW_MUTEX",
+    "DEFINE_STATIC_CALL",
+    "DEFINE_STATIC_CALL_NULL",
+    "DECLARE_STATIC_CALL",
+    "DEFINE_STATIC_KEY_TRUE_RO",
+    "DEFINE_STATIC_KEY_FALSE_RO",
+    "DECLARE_STATIC_KEY_TRUE_RO",
+    "DECLARE_STATIC_KEY_FALSE_RO",
+    "DEFINE_GUARD",
+    "DEFINE_LOCK_GUARD_1",
+    "DEFINE_LOCK_GUARD_2",
+    "DEFINE_SHOW_ATTRIBUTE",
+    "DEFINE_PROC_SHOW_ATTRIBUTE",
+    "DEFINE_DEBUGFS_ATTRIBUTE",
 })
 _LOCK_MACROS = _VAR_DECL_MACROS
 _TRACE_MACROS_ARG0 = frozenset({
@@ -152,18 +187,47 @@ _TRACE_MACROS_ARG1 = frozenset({
     "DEFINE_EVENT_PRINT",
 })
 _TRACE_MACROS = _TRACE_MACROS_ARG0 | _TRACE_MACROS_ARG1
-_KNOWN_MACRO_FUNCS = frozenset({
+_MODULE_PARAM_MACROS = frozenset({
+    "module_param",
+    "module_param_named",
+    "module_param_array",
+    "module_param_array_named",
+    "module_param_string",
+    "core_param",
+    "early_param",
+    "__setup",
+})
+_ASM_ENTRY_MACROS = frozenset({
+    "ENTRY",
+    "GLOBAL",
+    "DO_ERROR",
+    "DO_ERROR_INFO",
+})
+_PERCPU_MACROS = frozenset({
+    "DEFINE_PER_CPU",
+    "DEFINE_PER_CPU_SHARED_ALIGNED",
+    "DEFINE_PER_CPU_ALIGNED",
+    "DEFINE_PER_CPU_PAGE_ALIGNED",
+    "DEFINE_PER_CPU_READ_MOSTLY",
+    "DEFINE_PER_CPU_FIRST",
+    "DEFINE_PER_CPU_SECTION",
+    "DECLARE_PER_CPU",
+    "DECLARE_PER_CPU_SHARED_ALIGNED",
+    "DECLARE_PER_CPU_ALIGNED",
+    "DECLARE_PER_CPU_PAGE_ALIGNED",
+    "DECLARE_PER_CPU_READ_MOSTLY",
+    "DECLARE_PER_CPU_FIRST",
+    "DECLARE_PER_CPU_SECTION",
+})
+_EXPORT_MACROS = frozenset({
     "EXPORT_SYMBOL",
     "EXPORT_SYMBOL_GPL",
     "EXPORT_UNUSED_SYMBOL",
     "EXPORT_UNUSED_SYMBOL_GPL",
     "EXPORT_TRACEPOINT_SYMBOL",
     "EXPORT_TRACEPOINT_SYMBOL_GPL",
-    "__setup",
-    "early_param",
-    "core_param",
-    "module_param",
-    "module_param_named",
+})
+_INITCALL_MACROS = frozenset({
     "module_init",
     "module_exit",
     "subsys_initcall",
@@ -175,23 +239,68 @@ _KNOWN_MACRO_FUNCS = frozenset({
     "arch_initcall",
     "console_initcall",
     "security_initcall",
+    "early_initcall",
     "__initcall",
+})
+_DEVICE_TABLE_MACROS = frozenset({
+    "MODULE_DEVICE_TABLE",
+})
+_SYSFS_ATTR_MACROS = frozenset({
+    "DEVICE_ATTR",
+    "DEVICE_ATTR_RO",
+    "DEVICE_ATTR_RW",
+    "DEVICE_ATTR_WO",
+    "SYSFS_ATTR_RO",
+    "SYSFS_ATTR_RW",
+    "CLASS_ATTR_RW",
+    "CLASS_ATTR_RO",
+    "BUS_ATTR_RO",
+    "BUS_ATTR_RW",
+    "DRIVER_ATTR_RO",
+    "DRIVER_ATTR_RW",
+    "__ATTR",
+    "__ATTR_RO",
+    "__ATTR_RW",
+    "__ATTR_NULL",
+    "BIN_ATTR",
+    "BIN_ATTR_RO",
+    "BIN_ATTR_RW",
+    "BIN_ATTR_WO",
+    "SENSOR_ATTR",
+    "SENSOR_ATTR_2",
+    "SENSOR_DEVICE_ATTR",
+    "SENSOR_DEVICE_ATTR_2",
+    "IIO_DEVICE_ATTR",
+    "IIO_DEVICE_ATTR_RO",
+    "IIO_DEVICE_ATTR_RW",
+})
+_KNOWN_MACRO_FUNCS = frozenset({
     "MODULE_AUTHOR",
     "MODULE_DESCRIPTION",
     "MODULE_LICENSE",
     "MODULE_VERSION",
     "MODULE_ALIAS",
-    "MODULE_DEVICE_TABLE",
     "MODULE_FIRMWARE",
     "MODULE_INFO",
     "MODULE_PARM_DESC",
     "RESERVE_BRK",
     "LOOP_ATTR_RO",
-    "DO_ERROR",
-    "DO_ERROR_INFO",
+    "ENDPROC",
+    "END",
+    "WEAK",
+    "guard",
+    "scoped_guard",
     *_LOCK_MACROS,
     *_TRACE_MACROS,
+    *_MODULE_PARAM_MACROS,
+    *_ASM_ENTRY_MACROS,
+    *_PERCPU_MACROS,
+    *_EXPORT_MACROS,
+    *_INITCALL_MACROS,
+    *_DEVICE_TABLE_MACROS,
+    *_SYSFS_ATTR_MACROS,
 })
+
 _SKIP_REF_KINDS = frozenset({
     cc.CursorKind.MACRO_INSTANTIATION,
     cc.CursorKind.INVALID_FILE,
@@ -214,6 +323,12 @@ _KNOWN_KERNEL_ATTRIBUTES = frozenset({
     "__percpu",
     "__nocast",
     "__iomem",
+    "__section",
+    "__aligned",
+    "__attribute_const__",
+    "__attribute_pure__",
+    "__alias",
+    "__visible",
     "__must_check",
     "__deprecated",
     "__init",
@@ -577,48 +692,47 @@ def resolve_cursor_type_ast(CS: Any, cursor: Any) -> tuple[int, Any]:
     if k in (cc.CursorKind.VAR_DECL, cc.CursorKind.PARM_DECL):
         type_obj = getattr(ref_cursor, "type", None)
         t_spelling = safe_cursor_spelling(ref_cursor)
+        ref_ast_id = 0
+        if t_spelling:
+            safe_var_name = str(t_spelling)[:255]
+            rel_file = get_rel_file_for_cursor(CS, ref_cursor)
+            if rel_file and rel_file != cur_file:
+                ref_ast_id = CS.ref(m_ast.ast_id, REF_FILE, rel_file, safe_var_name, int(ASTT.C_DeclRefExpr))
+            elif hasattr(CS, "symbol_dict"):
+                if (safe_var_name, ASTT.C_DeclRefExpr) in CS.symbol_dict:
+                    ref_ast_id = CS.ref(m_ast.ast_id, REF_POS, CS.symbol_dict[(safe_var_name, ASTT.C_DeclRefExpr)])
+
         if type_obj is not None:
             t_kind = getattr(type_obj, "kind", None)
             if t_kind == cc.TypeKind.INT:
-                return (ASTT.C_int, 0)
+                return (ASTT.C_int, ref_ast_id)
             elif t_kind in (cc.TypeKind.CHAR_S, cc.TypeKind.CHAR_U):
-                return (ASTT.C_char, 0)
-            elif t_kind in (cc.TypeKind.LONG, cc.TypeKind.LONGLONG):
-                return (ASTT.C_long, 0)
+                return (ASTT.C_char, ref_ast_id)
+            elif t_kind == cc.TypeKind.LONG:
+                return (ASTT.C_long, ref_ast_id)
+            elif t_kind in (cc.TypeKind.LONGLONG, getattr(cc.TypeKind, "ULONGLONG", cc.TypeKind.LONGLONG)):
+                return (ASTT.C_longlong, ref_ast_id)
+            elif t_kind in (getattr(cc.TypeKind, "INT128", None), getattr(cc.TypeKind, "UINT128", None)):
+                return (ASTT.C_int128, ref_ast_id)
+            elif t_kind == getattr(cc.TypeKind, "COMPLEX", None):
+                return (ASTT.C_complex, ref_ast_id)
             elif t_kind == cc.TypeKind.SHORT:
-                return (ASTT.C_short, 0)
+                return (ASTT.C_short, ref_ast_id)
             elif t_kind == cc.TypeKind.FLOAT:
-                return (ASTT.C_float, 0)
+                return (ASTT.C_float, ref_ast_id)
             elif t_kind == cc.TypeKind.DOUBLE:
-                return (ASTT.C_double, 0)
+                return (ASTT.C_double, ref_ast_id)
             elif t_kind == cc.TypeKind.BOOL:
-                return (ASTT.C_bool, 0)
+                return (ASTT.C_bool, ref_ast_id)
             elif t_kind == cc.TypeKind.VOID:
-                return (ASTT.C_void, 0)
+                return (ASTT.C_void, ref_ast_id)
             elif t_kind == cc.TypeKind.POINTER:
-                return (ASTT.C_pointer, 0)
+                return (ASTT.C_pointer, ref_ast_id)
             elif t_kind == cc.TypeKind.RECORD:
-                try:
-                    decl_cursor = type_obj.get_declaration()
-                    tag_name = safe_cursor_spelling(decl_cursor) or t_spelling
-                except Exception:
-                    decl_cursor = None
-                    tag_name = t_spelling
-                if tag_name:
-                    safe_name = str(tag_name)[:255]
-                    rel_file = get_rel_file_for_cursor(CS, decl_cursor)
-                    if rel_file and rel_file != cur_file:
-                        return (ASTT.C_struct, CS.ref(m_ast.ast_id, REF_FILE, rel_file, safe_name, int(ASTT.C_structdecl)))
-                    if hasattr(CS, "symbol_dict"):
-                        if (safe_name, ASTT.C_structdecl) in CS.symbol_dict:
-                            return (ASTT.C_struct, CS.ref(m_ast.ast_id, REF_POS, CS.symbol_dict[(safe_name, ASTT.C_structdecl)]))
-                        if (safe_name, ASTT.C_struct) in CS.symbol_dict:
-                            return (ASTT.C_struct, CS.ref(m_ast.ast_id, REF_POS, CS.symbol_dict[(safe_name, ASTT.C_struct)]))
-                    op_idx = len(CS.cs)
-                    with CS(REF_NO_REF):
-                        CS.store(m_ast.view(((m_ast.ast_id,),), None, safe_name, ASTT.C_structnotbind))
-                    return (ASTT.C_struct, CS.ref(m_ast.ast_id, REF_POS, op_idx))
-        return (ASTT.C_DeclRefExpr, 0)
+                return (ASTT.C_struct, ref_ast_id)
+            elif t_kind == cc.TypeKind.ENUM:
+                return (ASTT.C_enum, ref_ast_id)
+        return (ASTT.C_DeclRefExpr, ref_ast_id)
 
     type_obj = getattr(ref_cursor, "type", None)
     if type_obj is not None:
@@ -1012,6 +1126,253 @@ class Ast_UnaryOperator(Ast_Statement):
         self.extract_1arg(CS, ASTT.C_UnaryOperator, op_name, self.extent, create_tag=create_tag)
 
 
+class Ast_CastExpr(Ast_Statement):
+    """AST node for C-style cast expressions ((type)expr)."""
+
+    def extract(self, CS: Any, create_tag: bool = True) -> None:
+        self._extract_nested(CS, create_tags=False)
+        cast_type = getattr(getattr(self.cursor, "type", None), "spelling", "") or "cast"
+        name = str(self.name or cast_type)[:255]
+        self.extract_1arg(CS, ASTT.C_CastExpr, name, self.extent, create_tag=create_tag)
+
+
+class Ast_ConditionalOperator(Ast_Statement):
+    """AST node for conditional ternary operators (? :)."""
+
+    def extract(self, CS: Any, create_tag: bool = True) -> None:
+        self._extract_nested(CS, create_tags=False)
+        op_name = str(self.name)[:255] if self.name else "?:"
+        self.extract_1arg(CS, ASTT.C_ConditionalOperator, op_name, self.extent, create_tag=create_tag)
+
+
+class Ast_ArraySubscriptExpr(Ast_Statement):
+    """AST node for array subscript expressions (a[i])."""
+
+    def extract(self, CS: Any, create_tag: bool = True) -> None:
+        self._extract_nested(CS, create_tags=False)
+        arr_name = str(self.name)[:255] if self.name else "[]"
+        self.extract_1arg(CS, ASTT.C_ArraySubscriptExpr, arr_name, self.extent, create_tag=create_tag)
+
+
+class Ast_DesignatedInitExpr(Ast_Statement):
+    """AST node for designated initializer expressions (.field = val)."""
+
+    def extract(self, CS: Any, create_tag: bool = True) -> None:
+        self._extract_nested(CS, create_tags=False)
+        init_name = str(self.name)[:255] if self.name else ".="
+        self.extract_1arg(CS, ASTT.C_DesignatedInitExpr, init_name, self.extent, create_tag=create_tag)
+
+
+class Ast_CompoundAssignOperator(Ast_Statement):
+    """AST node for compound assignment operators (+=, -=, etc.)."""
+
+    def extract(self, CS: Any, create_tag: bool = True) -> None:
+        self._extract_nested(CS, create_tags=False)
+        op_name = str(self.name)[:255] if self.name else "op="
+        self.extract_1arg(CS, ASTT.C_CompoundAssignOperator, op_name, self.extent, create_tag=create_tag)
+
+
+class Ast_CompoundLiteralExpr(Ast_Statement):
+    """AST node for compound literal expressions ((type){ ... })."""
+
+    def extract(self, CS: Any, create_tag: bool = True) -> None:
+        self._extract_nested(CS, create_tags=False)
+        lit_name = str(self.name)[:255] if self.name else "literal"
+        self.extract_1arg(CS, ASTT.C_CompoundLiteralExpr, lit_name, self.extent, create_tag=create_tag)
+
+
+class Ast_IndirectGotoStmt(Ast_Statement):
+    """AST node for indirect/computed goto statements (goto *expr;)."""
+
+    def extract(self, CS: Any, create_tag: bool = True) -> None:
+        self._extract_nested(CS, create_tags=False)
+        name = str(self.name)[:255] if self.name else "*goto"
+        self.extract_1arg(CS, ASTT.C_IndirectGotoStmt, name, self.extent, create_tag=create_tag)
+
+
+class Ast_AddrLabelExpr(Ast_Statement):
+    """AST node for address of label expressions (&&label)."""
+
+    def extract(self, CS: Any, create_tag: bool = True) -> None:
+        self._extract_nested(CS, create_tags=False)
+        name = str(self.name)[:255] if self.name else "&&"
+        self.extract_1arg(CS, ASTT.C_AddrLabelExpr, name, self.extent, create_tag=create_tag)
+
+
+class Ast_NullStmt(Ast_Statement):
+    """AST node for null/empty statements (;)."""
+
+    def extract(self, CS: Any, create_tag: bool = True) -> None:
+        self._extract_nested(CS, create_tags=False)
+        name = str(self.name)[:255] if self.name else ";"
+        self.extract_1arg(CS, ASTT.C_NullStmt, name, self.extent, create_tag=create_tag)
+
+
+class Ast_ParenExpr(Ast_Statement):
+    """AST node for parenthesized expressions ((expr))."""
+
+    def extract(self, CS: Any, create_tag: bool = True) -> None:
+        self._extract_nested(CS, create_tags=False)
+        name = str(self.name)[:255] if self.name else "()"
+        self.extract_1arg(CS, ASTT.C_ParenExpr, name, self.extent, create_tag=create_tag)
+
+
+class Ast_SizeofExpr(Ast_Statement):
+    """AST node for sizeof/alignof expressions."""
+
+    def extract(self, CS: Any, create_tag: bool = True) -> None:
+        self._extract_nested(CS, create_tags=False)
+        name = str(self.name)[:255] if self.name else "sizeof"
+        self.extract_1arg(CS, ASTT.C_SizeofExpr, name, self.extent, create_tag=create_tag)
+
+
+class Ast_StmtExpr(Ast_Statement):
+    """AST node for GNU statement expressions (({ ... }))."""
+
+    def extract(self, CS: Any, create_tag: bool = True) -> None:
+        self._extract_nested(CS, create_tags=False)
+        name = str(self.name)[:255] if self.name else "({ ... })"
+        self.extract_1arg(CS, ASTT.C_StmtExpr, name, self.extent, create_tag=create_tag)
+
+
+class Ast_GenericSelectionExpr(Ast_Statement):
+    """AST node for C11 _Generic expressions."""
+
+    def extract(self, CS: Any, create_tag: bool = True) -> None:
+        self._extract_nested(CS, create_tags=False)
+        name = str(self.name)[:255] if self.name else "_Generic"
+        self.extract_1arg(CS, ASTT.C_GenericSelectionExpr, name, self.extent, create_tag=create_tag)
+
+
+class Ast_VaArgExpr(Ast_Statement):
+    """AST node for va_arg expressions."""
+
+    def extract(self, CS: Any, create_tag: bool = True) -> None:
+        self._extract_nested(CS, create_tags=False)
+        name = str(self.name)[:255] if self.name else "va_arg"
+        self.extract_1arg(CS, ASTT.C_VaArgExpr, name, self.extent, create_tag=create_tag)
+
+
+class Ast_LabelRef(Ast_Statement):
+    """AST node for label references in goto/&&."""
+
+    def extract(self, CS: Any, create_tag: bool = True) -> None:
+        self._extract_nested(CS, create_tags=False)
+        name = str(self.name)[:255] if self.name else "label"
+        self.extract_1arg(CS, ASTT.C_LabelRef, name, self.extent, create_tag=create_tag)
+
+
+class Ast_IntegerLiteral(Ast_Statement):
+    """AST node for integer literal expressions."""
+
+    def extract(self, CS: Any, create_tag: bool = True) -> None:
+        self._extract_nested(CS, create_tags=False)
+        name = str(self.name)[:255] if self.name else "0"
+        self.extract_1arg(CS, ASTT.C_IntegerLiteral, name, self.extent, create_tag=create_tag)
+
+
+class Ast_FloatingLiteral(Ast_Statement):
+    """AST node for floating-point literal expressions."""
+
+    def extract(self, CS: Any, create_tag: bool = True) -> None:
+        self._extract_nested(CS, create_tags=False)
+        name = str(self.name)[:255] if self.name else "0.0"
+        self.extract_1arg(CS, ASTT.C_FloatingLiteral, name, self.extent, create_tag=create_tag)
+
+
+class Ast_StringLiteral(Ast_Statement):
+    """AST node for string literal expressions."""
+
+    def extract(self, CS: Any, create_tag: bool = True) -> None:
+        self._extract_nested(CS, create_tags=False)
+        name = str(self.name)[:255] if self.name else '""'
+        self.extract_1arg(CS, ASTT.C_StringLiteral, name, self.extent, create_tag=create_tag)
+
+
+class Ast_CharacterLiteral(Ast_Statement):
+    """AST node for character literal expressions."""
+
+    def extract(self, CS: Any, create_tag: bool = True) -> None:
+        self._extract_nested(CS, create_tags=False)
+        name = str(self.name)[:255] if self.name else "''"
+        self.extract_1arg(CS, ASTT.C_CharacterLiteral, name, self.extent, create_tag=create_tag)
+
+
+class Ast_MacroParam(Ast_Statement):
+    """AST node for macro parameters."""
+
+    def extract(self, CS: Any, create_tag: bool = True) -> None:
+        self._extract_nested(CS, create_tags=False)
+        name = str(self.name)[:255] if self.name else "param"
+        self.extract_1arg(CS, ASTT.C_MacroParam, name, self.extent, create_tag=create_tag)
+
+
+class Ast_StaticAssert(Ast_Statement):
+    """AST node for static_assert / _Static_assert declarations."""
+    type_id = ASTT.C_StaticAssert
+
+    def extract(self, CS: Any, create_tag: bool = True) -> None:
+        self._extract_nested(CS, create_tags=False)
+        name = str(self.name)[:255] if self.name else "static_assert"
+        self.extract_1arg(CS, ASTT.C_StaticAssert, name, self.extent, create_tag=create_tag)
+
+
+class Ast_TypeofExpr(Ast_Statement):
+    """AST node for GNU C typeof expressions."""
+
+    def extract(self, CS: Any, create_tag: bool = True) -> None:
+        self._extract_nested(CS, create_tags=False)
+        name = str(self.name)[:255] if self.name else "typeof"
+        self.extract_1arg(CS, ASTT.C_TypeofExpr, name, self.extent, create_tag=create_tag)
+
+
+class Ast_OffsetofExpr(Ast_Statement):
+    """AST node for __builtin_offsetof expressions."""
+
+    def extract(self, CS: Any, create_tag: bool = True) -> None:
+        self._extract_nested(CS, create_tags=False)
+        name = str(self.name)[:255] if self.name else "offsetof"
+        self.extract_1arg(CS, ASTT.C_OffsetofExpr, name, self.extent, create_tag=create_tag)
+
+
+class Ast_TypesCompatiblePExpr(Ast_Statement):
+    """AST node for __builtin_types_compatible_p expressions."""
+
+    def extract(self, CS: Any, create_tag: bool = True) -> None:
+        self._extract_nested(CS, create_tags=False)
+        name = str(self.name)[:255] if self.name else "types_compatible_p"
+        self.extract_1arg(CS, ASTT.C_TypesCompatiblePExpr, name, self.extent, create_tag=create_tag)
+
+
+class Ast_ChooseExpr(Ast_Statement):
+    """AST node for __builtin_choose_expr expressions."""
+
+    def extract(self, CS: Any, create_tag: bool = True) -> None:
+        self._extract_nested(CS, create_tags=False)
+        name = str(self.name)[:255] if self.name else "choose_expr"
+        self.extract_1arg(CS, ASTT.C_ChooseExpr, name, self.extent, create_tag=create_tag)
+
+
+class Ast_AlignofExpr(Ast_Statement):
+    """AST node for alignof / _Alignof / __alignof__ expressions."""
+    type_id = ASTT.C_AlignofExpr
+
+    def extract(self, CS: Any, create_tag: bool = True) -> None:
+        self._extract_nested(CS, create_tags=False)
+        name = str(self.name)[:255] if self.name else "alignof"
+        self.extract_1arg(CS, ASTT.C_AlignofExpr, name, self.extent, create_tag=create_tag)
+
+
+class Ast_AtomicExpr(Ast_Statement):
+    """AST node for C11 _Atomic operations."""
+    type_id = ASTT.C_AtomicExpr
+
+    def extract(self, CS: Any, create_tag: bool = True) -> None:
+        self._extract_nested(CS, create_tags=False)
+        name = str(self.name)[:255] if self.name else "_Atomic"
+        self.extract_1arg(CS, ASTT.C_AtomicExpr, name, self.extent, create_tag=create_tag)
+
+
 class AST_Array(AST_Expression):
     """AST container for array dimension extents ([...])."""
 
@@ -1311,6 +1672,43 @@ class C_Type(Ast):
         self.in_attribute: bool = False
         self.attribute_paren_depth: int = 0
         self._macro_paren_opened: bool = False
+        self.attributes: list[tuple[str, str]] = []
+        self._current_attr_tokens: list[str] = []
+
+    def _parse_attribute_tokens(self) -> None:
+        tokens = getattr(self, "_current_attr_tokens", None)
+        if not tokens:
+            return
+        i = 0
+        while i < len(tokens):
+            tok = tokens[i]
+            if tok in ("(", ")", ","):
+                i += 1
+                continue
+            attr_name = tok.strip("_")
+            attr_val = ""
+            if i + 1 < len(tokens) and tokens[i + 1] == "(":
+                depth = 1
+                j = i + 2
+                vals = []
+                while j < len(tokens):
+                    if tokens[j] == "(":
+                        depth += 1
+                    elif tokens[j] == ")":
+                        depth -= 1
+                        if depth == 0:
+                            break
+                    vals.append(tokens[j])
+                    j += 1
+                attr_val = " ".join(vals).strip('"\'')
+                i = j + 1
+            else:
+                i += 1
+            if not hasattr(self, "attributes"):
+                self.attributes = []
+            if (attr_name, attr_val) not in self.attributes:
+                self.attributes.append((attr_name[:64], attr_val[:255]))
+        self._current_attr_tokens = []
 
     def within_range(self, token: Any, ast_kind: int) -> bool:
         if not self.need_processing:
@@ -1568,7 +1966,10 @@ class C_Type(Ast):
                 self.content.append(TypeToken(token, ASTT.C_int))
                 self.swap_out()
             case "long":
-                self.content.append(TypeToken(token, ASTT.C_long))
+                if self.content.content and getattr(self.content.content[-1], "astt_type", None) == ASTT.C_long:
+                    self.content.content[-1] = TypeToken(token, ASTT.C_longlong)
+                else:
+                    self.content.append(TypeToken(token, ASTT.C_long))
                 self.swap_out()
             case "Bool" | "_Bool" | "bool":
                 self.content.append(TypeToken(token, ASTT.C_bool))
@@ -1579,7 +1980,13 @@ class C_Type(Ast):
             case "double":
                 self.content.append(TypeToken(token, ASTT.C_double))
                 self.swap_out()
-            case "_Complex" | "_Imaginary" | "__int128" | "__int128_t" | "__uint128_t" | "__builtin_va_list":
+            case "_Complex" | "_Imaginary":
+                self.content.append(TypeToken(token, ASTT.C_complex))
+                self.swap_out()
+            case "__int128" | "__int128_t" | "__uint128_t":
+                self.content.append(TypeToken(token, ASTT.C_int128))
+                self.swap_out()
+            case "__builtin_va_list":
                 self.swap_out()
             case "__func__" | "__FUNCTION__" | "__PRETTY_FUNCTION__":
                 return
@@ -1769,6 +2176,11 @@ class C_Type(Ast):
 
         tspelling = token.spelling_str
         if tspelling in _KNOWN_KERNEL_ATTRIBUTES:
+            attr_name = tspelling.lstrip("_") or tspelling
+            if not hasattr(self, "attributes"):
+                self.attributes = []
+            if (attr_name, "") not in self.attributes:
+                self.attributes.append((attr_name[:64], ""))
             return
 
         if tspelling in _KNOWN_MACRO_FUNCS and not getattr(self, "name", ""):
@@ -1800,11 +2212,13 @@ class C_Type(Ast):
                 ASTT.C_enum,
                 ASTT.C_functionproto,
             }:
-                if cursor.kind not in {cc.CursorKind.FIELD_DECL, cc.CursorKind.VAR_DECL, cc.CursorKind.PARM_DECL}:
+                if cursor.kind not in {cc.CursorKind.FIELD_DECL, cc.CursorKind.VAR_DECL, cc.CursorKind.PARM_DECL} and getattr(self, "name", "") not in _KNOWN_MACRO_FUNCS:
                     self.name = tspelling
                 tt = TypeToken(token, self.content.content[-1].type, cursor=cursor)
                 try:
                     decl = getattr(cursor, "type", None)
+                    while decl is not None and getattr(decl, "kind", None) in (cc.TypeKind.POINTER, cc.TypeKind.CONSTANTARRAY, cc.TypeKind.INCOMPLETEARRAY):
+                        decl = decl.get_pointee()
                     decl = decl.get_declaration() if decl is not None and hasattr(decl, "get_declaration") else None
                     if decl is None or not getattr(decl, "location", None) or not getattr(decl.location, "file", None):
                         decl = getattr(cursor, "referenced", None) or cursor.get_definition()
@@ -1824,6 +2238,7 @@ class C_Type(Ast):
         if (
             cursor.kind in {cc.CursorKind.FIELD_DECL, cc.CursorKind.VAR_DECL, cc.CursorKind.PARM_DECL, cc.CursorKind.TYPEDEF_DECL}
             and tspelling == safe_cursor_spelling(cursor)
+            and getattr(self, "name", "") not in _KNOWN_MACRO_FUNCS
         ):
             self.name = tspelling
             self.content.append(TypeToken(token, cursor=cursor))
@@ -1834,6 +2249,8 @@ class C_Type(Ast):
             tt = TypeToken(token, self.struct_union_enum_type, cursor=cursor)
             try:
                 decl = getattr(cursor, "type", None)
+                while decl is not None and getattr(decl, "kind", None) in (cc.TypeKind.POINTER, cc.TypeKind.CONSTANTARRAY, cc.TypeKind.INCOMPLETEARRAY):
+                    decl = decl.get_pointee()
                 decl = decl.get_declaration() if decl is not None and hasattr(decl, "get_declaration") else None
                 if decl is None or not getattr(decl, "location", None) or not getattr(decl.location, "file", None):
                     decl = getattr(cursor, "referenced", None) or cursor.get_definition()
@@ -1849,7 +2266,6 @@ class C_Type(Ast):
             self.swap_out()
             return
 
-
         if cursor.type.kind == cc.TypeKind.TYPEDEF or (
             cursor.kind in {cc.CursorKind.FIELD_DECL, cc.CursorKind.VAR_DECL, cc.CursorKind.PARM_DECL}
             and tspelling != safe_cursor_spelling(cursor)
@@ -1863,6 +2279,8 @@ class C_Type(Ast):
             else:
                 try:
                     decl = getattr(cursor, "type", None)
+                    while decl is not None and getattr(decl, "kind", None) in (cc.TypeKind.POINTER, cc.TypeKind.CONSTANTARRAY, cc.TypeKind.INCOMPLETEARRAY):
+                        decl = decl.get_pointee()
                     decl = decl.get_declaration() if decl is not None and hasattr(decl, "get_declaration") else None
                     if decl is None or not getattr(decl, "location", None) or not getattr(decl.location, "file", None):
                         decl = getattr(cursor, "referenced", None) or cursor.get_definition()
@@ -1877,19 +2295,6 @@ class C_Type(Ast):
             self.content.append(tt)
             self.swap_out()
             return
-
-        if self.content.content:
-            if self.content.content[-1].type in {
-                ASTT.C_struct,
-                ASTT.C_union,
-                ASTT.C_enum,
-                ASTT.C_functionproto,
-            }:
-                if cursor.kind not in {cc.CursorKind.FIELD_DECL, cc.CursorKind.VAR_DECL, cc.CursorKind.PARM_DECL}:
-                    self.name = tspelling
-                self.content.append(TypeToken(token, self.content.content[-1].type))
-                self.swap_out()
-                return
 
         self.content.append(TypeToken(token))
         self.swap_out()
@@ -1910,17 +2315,25 @@ class C_Type(Ast):
         if tspelling in ("__attribute__", "__attribute", "__declspec"):
             self.in_attribute = True
             self.attribute_paren_depth = 0
+            self._current_attr_tokens = []
             return
         if self.in_attribute:
             if tspelling == "(":
                 self.attribute_paren_depth += 1
+                if self.attribute_paren_depth > 2:
+                    self._current_attr_tokens.append(tspelling)
             elif tspelling == ")":
+                if self.attribute_paren_depth > 2:
+                    self._current_attr_tokens.append(tspelling)
                 self.attribute_paren_depth -= 1
                 if self.attribute_paren_depth <= 0:
                     self.in_attribute = False
+                    self._parse_attribute_tokens()
             elif self.attribute_paren_depth == 0 and kind != AST_KIND.comment:
                 self.in_attribute = False
+                self._parse_attribute_tokens()
             else:
+                self._current_attr_tokens.append(tspelling)
                 return
             return
 
@@ -1939,6 +2352,471 @@ class C_Type(Ast):
     def extract(self, CS: Any, create_tag: bool = True) -> None:
         if self.content:
             self.swap_out()
+
+        # Trace macro extraction (TRACE_EVENT, DECLARE_EVENT_CLASS, DEFINE_EVENT, etc.)
+        if getattr(self, "name", "") in _TRACE_MACROS:
+            target_idx = 1 if self.name in _TRACE_MACROS_ARG1 else 0
+            p_tp = ""
+            if getattr(self, "typedata", None) and len(self.typedata) > target_idx + 1:
+                for tok in self.typedata[target_idx + 1].content:
+                    if tok.code and tok.code != self.name and tok.code not in _KNOWN_MACRO_FUNCS:
+                        p_tp = tok.code
+                        break
+
+            if not p_tp and hasattr(self, "zones") and self.zones and len(self.zones[0].children) > target_idx:
+                ch = self.zones[0].children[target_idx]
+                ch_n = getattr(ch, "name", "")
+                if not ch_n and getattr(ch, "typedata", None):
+                    for ts in ch.typedata:
+                        for tok in ts.content:
+                            if tok.code and tok.code != self.name:
+                                ch_n = tok.code
+                                break
+                        if ch_n:
+                            break
+                if not ch_n and getattr(ch, "content", None) and getattr(ch.content, "content", None):
+                    for tok in ch.content.content:
+                        if tok.code and tok.code != self.name:
+                            ch_n = tok.code
+                            break
+                if ch_n and ch_n != self.name:
+                    p_tp = ch_n
+
+            with CS(REF_POS):
+                CS.store(m_ast.view(
+                    ((m_ast.ast_id,),),
+                    None,
+                    str(self.name)[:255],
+                    int(ASTT.C_functionproto),
+                ))
+                ast_id_route = CS.get_route_parse()
+                self.ast_ref = CS.ref(m_ast.ast_id, *ast_id_route)
+
+            with CS(REF_NO_REF):
+                tag_ref = self.tag(
+                    CS,
+                    ast_id_route,
+                    self.extent,
+                    ast_name=str(self.name)[:255],
+                    ast_type=int(ASTT.C_functionproto),
+                )
+
+            if p_tp:
+                tp_type = getattr(ASTT, "C_TracepointDef", ASTT.C_Compound)
+                with CS(REF_POS):
+                    CS.store(m_symbol_def.set(
+                        None,
+                        CS.gp.VID,
+                        ((m_file.table_id, 0), OP_REF, (REF_ROOT,)),
+                        tag_ref or getattr(self, "tag_ref", 0),
+                        self.ast_ref,
+                        str(p_tp)[:255],
+                        int(tp_type),
+                        self.extent.line_pos[0],
+                        self.extent.line_pos[1],
+                    ))
+                if hasattr(CS, "symbol_dict"):
+                    pos_idx = ast_id_route[-1]
+                    CS.symbol_dict[(str(p_tp)[:255], int(tp_type))] = pos_idx
+                    CS.symbol_dict[(str(p_tp)[:255], int(ASTT.C_DeclRefExpr))] = pos_idx
+            return
+
+        # Module and boot parameter extraction (module_param, early_param, __setup, etc.)
+        if getattr(self, "name", "") in _MODULE_PARAM_MACROS:
+            p_name = ""
+            if getattr(self, "typedata", None) and len(self.typedata) > 1:
+                for tok in self.typedata[1].content:
+                    if tok.code and tok.code != self.name and tok.code not in _KNOWN_MACRO_FUNCS:
+                        p_name = tok.code.strip('"\'')
+                        break
+
+            if not p_name and hasattr(self, "zones") and self.zones and len(self.zones[0].children) > 0:
+                ch = self.zones[0].children[0]
+                ch_n = getattr(ch, "name", "")
+                if not ch_n and getattr(ch, "typedata", None):
+                    for ts in ch.typedata:
+                        for tok in ts.content:
+                            if tok.code and tok.code != self.name:
+                                ch_n = tok.code.strip('"\'')
+                                break
+                        if ch_n:
+                            break
+                if not ch_n and getattr(ch, "content", None) and getattr(ch.content, "content", None):
+                    for tok in ch.content.content:
+                        if tok.code and tok.code != self.name:
+                            ch_n = tok.code.strip('"\'')
+                            break
+                if ch_n and ch_n != self.name:
+                    p_name = ch_n.strip('"\'')
+
+            with CS(REF_POS):
+                CS.store(m_ast.view(
+                    ((m_ast.ast_id,),),
+                    None,
+                    str(self.name)[:255],
+                    int(ASTT.C_functionproto),
+                ))
+                ast_id_route = CS.get_route_parse()
+                self.ast_ref = CS.ref(m_ast.ast_id, *ast_id_route)
+
+            with CS(REF_NO_REF):
+                tag_ref = self.tag(
+                    CS,
+                    ast_id_route,
+                    self.extent,
+                    ast_name=str(self.name)[:255],
+                    ast_type=int(ASTT.C_functionproto),
+                )
+
+            if p_name:
+                param_type = getattr(ASTT, "C_ModuleParamDef", ASTT.C_Compound)
+                with CS(REF_POS):
+                    CS.store(m_symbol_def.set(
+                        None,
+                        CS.gp.VID,
+                        ((m_file.table_id, 0), OP_REF, (REF_ROOT,)),
+                        tag_ref or getattr(self, "tag_ref", 0),
+                        self.ast_ref,
+                        str(p_name)[:255],
+                        int(param_type),
+                        self.extent.line_pos[0],
+                        self.extent.line_pos[1],
+                    ))
+                if hasattr(CS, "symbol_dict"):
+                    pos_idx = ast_id_route[-1]
+                    CS.symbol_dict[(str(p_name)[:255], int(param_type))] = pos_idx
+                    CS.symbol_dict[(str(p_name)[:255], int(ASTT.C_DeclRefExpr))] = pos_idx
+            return
+
+        # Assembly entry point extraction (ENTRY, GLOBAL, DO_ERROR, DO_ERROR_INFO)
+        if getattr(self, "name", "") in _ASM_ENTRY_MACROS:
+            p_entry = ""
+            target_idx = 3 if self.name in ("DO_ERROR", "DO_ERROR_INFO") else 0
+            if getattr(self, "typedata", None) and len(self.typedata) > target_idx + 1:
+                for tok in self.typedata[target_idx + 1].content:
+                    if tok.code and tok.code != self.name and tok.code not in _KNOWN_MACRO_FUNCS:
+                        p_entry = tok.code.strip('"\'')
+                        break
+
+            if not p_entry and hasattr(self, "zones") and self.zones and len(self.zones[0].children) > target_idx:
+                ch = self.zones[0].children[target_idx]
+                ch_n = getattr(ch, "name", "")
+                if not ch_n and getattr(ch, "typedata", None):
+                    for ts in ch.typedata:
+                        for tok in ts.content:
+                            if tok.code and tok.code != self.name:
+                                ch_n = tok.code.strip('"\'')
+                                break
+                        if ch_n:
+                            break
+                if not ch_n and getattr(ch, "content", None) and getattr(ch.content, "content", None):
+                    for tok in ch.content.content:
+                        if tok.code and tok.code != self.name:
+                            ch_n = tok.code.strip('"\'')
+                            break
+                if ch_n and ch_n != self.name:
+                    p_entry = ch_n.strip('"\'')
+
+            with CS(REF_POS):
+                CS.store(m_ast.view(
+                    ((m_ast.ast_id,),),
+                    None,
+                    str(self.name)[:255],
+                    int(ASTT.C_functionproto),
+                ))
+                ast_id_route = CS.get_route_parse()
+                self.ast_ref = CS.ref(m_ast.ast_id, *ast_id_route)
+
+            with CS(REF_NO_REF):
+                tag_ref = self.tag(
+                    CS,
+                    ast_id_route,
+                    self.extent,
+                    ast_name=str(self.name)[:255],
+                    ast_type=int(ASTT.C_functionproto),
+                )
+
+
+            if p_entry:
+                entry_type = getattr(ASTT, "C_AsmEntry", ASTT.C_Compound)
+                with CS(REF_POS):
+                    CS.store(m_symbol_def.set(
+                        None,
+                        CS.gp.VID,
+                        ((m_file.table_id, 0), OP_REF, (REF_ROOT,)),
+                        tag_ref or getattr(self, "tag_ref", 0),
+                        self.ast_ref,
+                        str(p_entry)[:255],
+                        int(entry_type),
+                        self.extent.line_pos[0],
+                        self.extent.line_pos[1],
+                    ))
+                if hasattr(CS, "symbol_dict"):
+                    pos_idx = ast_id_route[-1]
+                    CS.symbol_dict[(str(p_entry)[:255], int(entry_type))] = pos_idx
+                    CS.symbol_dict[(str(p_entry)[:255], int(ASTT.C_DeclRefExpr))] = pos_idx
+            return
+
+        # Initcall macro extraction (module_init, module_exit, fs_initcall, etc.)
+        if getattr(self, "name", "") in _INITCALL_MACROS:
+            p_init = ""
+            target_idx = 0
+            if getattr(self, "typedata", None) and len(self.typedata) > target_idx + 1:
+                for tok in self.typedata[target_idx + 1].content:
+                    if tok.code and tok.code != self.name and tok.code not in _KNOWN_MACRO_FUNCS:
+                        p_init = tok.code.strip('"\'')
+                        break
+
+            if not p_init and hasattr(self, "zones") and self.zones and len(self.zones[0].children) > target_idx:
+                ch = self.zones[0].children[target_idx]
+                ch_n = getattr(ch, "name", "")
+                if not ch_n and getattr(ch, "typedata", None):
+                    for ts in ch.typedata:
+                        for tok in ts.content:
+                            if tok.code and tok.code != self.name:
+                                ch_n = tok.code.strip('"\'')
+                                break
+                        if ch_n:
+                            break
+                if not ch_n and getattr(ch, "content", None) and getattr(ch.content, "content", None):
+                    for tok in ch.content.content:
+                        if tok.code and tok.code != self.name:
+                            ch_n = tok.code.strip('"\'')
+                            break
+                if ch_n and ch_n != self.name:
+                    p_init = ch_n.strip('"\'')
+
+            with CS(REF_POS):
+                CS.store(m_ast.view(
+                    ((m_ast.ast_id,),),
+                    None,
+                    str(self.name)[:255],
+                    int(ASTT.C_functionproto),
+                ))
+                ast_id_route = CS.get_route_parse()
+                self.ast_ref = CS.ref(m_ast.ast_id, *ast_id_route)
+
+            with CS(REF_NO_REF):
+                tag_ref = self.tag(
+                    CS,
+                    ast_id_route,
+                    self.extent,
+                    ast_name=str(self.name)[:255],
+                    ast_type=int(ASTT.C_functionproto),
+                )
+
+            if p_init:
+                entry_type = getattr(ASTT, "C_InitcallDef", ASTT.C_Compound)
+                with CS(REF_POS):
+                    CS.store(m_symbol_def.set(
+                        None,
+                        CS.gp.VID,
+                        ((m_file.table_id, 0), OP_REF, (REF_ROOT,)),
+                        tag_ref or getattr(self, "tag_ref", 0),
+                        self.ast_ref,
+                        str(p_init)[:255],
+                        int(entry_type),
+                        self.extent.line_pos[0],
+                        self.extent.line_pos[1],
+                    ))
+                if hasattr(CS, "symbol_dict"):
+                    pos_idx = ast_id_route[-1]
+                    CS.symbol_dict[(str(p_init)[:255], int(entry_type))] = pos_idx
+                    CS.symbol_dict[(str(p_init)[:255], int(ASTT.C_DeclRefExpr))] = pos_idx
+            return
+
+        # Export symbol macro extraction (EXPORT_SYMBOL, EXPORT_SYMBOL_GPL, etc.)
+        if getattr(self, "name", "") in _EXPORT_MACROS:
+            p_sym = ""
+            target_idx = 0
+            if getattr(self, "typedata", None) and len(self.typedata) > target_idx + 1:
+                for tok in self.typedata[target_idx + 1].content:
+                    if tok.code and tok.code != self.name and tok.code not in _KNOWN_MACRO_FUNCS:
+                        p_sym = tok.code.strip('"\'')
+                        break
+
+            if not p_sym and hasattr(self, "zones") and self.zones and len(self.zones[0].children) > target_idx:
+                ch = self.zones[0].children[target_idx]
+                ch_n = getattr(ch, "name", "")
+                if not ch_n and getattr(ch, "typedata", None):
+                    for ts in ch.typedata:
+                        for tok in ts.content:
+                            if tok.code and tok.code != self.name:
+                                ch_n = tok.code.strip('"\'')
+                                break
+                        if ch_n:
+                            break
+                if not ch_n and getattr(ch, "content", None) and getattr(ch.content, "content", None):
+                    for tok in ch.content.content:
+                        if tok.code and tok.code != self.name:
+                            ch_n = tok.code.strip('"\'')
+                            break
+                if ch_n and ch_n != self.name:
+                    p_sym = ch_n.strip('"\'')
+
+            with CS(REF_POS):
+                CS.store(m_ast.view(
+                    ((m_ast.ast_id,),),
+                    None,
+                    str(self.name)[:255],
+                    int(ASTT.C_functionproto),
+                ))
+                ast_id_route = CS.get_route_parse()
+                self.ast_ref = CS.ref(m_ast.ast_id, *ast_id_route)
+
+            with CS(REF_NO_REF):
+                tag_ref = self.tag(
+                    CS,
+                    ast_id_route,
+                    self.extent,
+                    ast_name=str(self.name)[:255],
+                    ast_type=int(ASTT.C_functionproto),
+                )
+
+            if p_sym:
+                entry_type = getattr(ASTT, "C_ExportSymbolDef", ASTT.C_Compound)
+                with CS(REF_POS):
+                    CS.store(m_symbol_def.set(
+                        None,
+                        CS.gp.VID,
+                        ((m_file.table_id, 0), OP_REF, (REF_ROOT,)),
+                        tag_ref or getattr(self, "tag_ref", 0),
+                        self.ast_ref,
+                        str(p_sym)[:255],
+                        int(entry_type),
+                        self.extent.line_pos[0],
+                        self.extent.line_pos[1],
+                    ))
+                if hasattr(CS, "symbol_dict"):
+                    pos_idx = ast_id_route[-1]
+                    CS.symbol_dict[(str(p_sym)[:255], int(entry_type))] = pos_idx
+                    CS.symbol_dict[(str(p_sym)[:255], int(ASTT.C_DeclRefExpr))] = pos_idx
+            return
+
+        # Device table macro extraction (MODULE_DEVICE_TABLE)
+        if getattr(self, "name", "") in _DEVICE_TABLE_MACROS:
+            p_sym = ""
+            if hasattr(self, "zones") and self.zones and len(self.zones[0].children) > 1:
+                ch = self.zones[0].children[1]
+                ch_n = getattr(ch, "name", "")
+                if not ch_n and getattr(ch, "typedata", None):
+                    for ts in ch.typedata:
+                        for tok in ts.content:
+                            if tok.code and tok.code != self.name:
+                                ch_n = tok.code.strip('"\'')
+                                break
+                        if ch_n:
+                            break
+                if ch_n:
+                    p_sym = ch_n.strip('"\'')
+
+            if not p_sym and getattr(self, "typedata", None) and len(self.typedata) > 2:
+                for tok in self.typedata[2].content:
+                    if tok.code and tok.code != self.name:
+                        p_sym = tok.code.strip('"\'')
+                        break
+
+            with CS(REF_POS):
+                CS.store(m_ast.view(
+                    ((m_ast.ast_id,),),
+                    None,
+                    str(self.name)[:255],
+                    int(ASTT.C_functionproto),
+                ))
+                ast_id_route = CS.get_route_parse()
+                self.ast_ref = CS.ref(m_ast.ast_id, *ast_id_route)
+
+            with CS(REF_NO_REF):
+                tag_ref = self.tag(
+                    CS,
+                    ast_id_route,
+                    self.extent,
+                    ast_name=str(self.name)[:255],
+                    ast_type=int(ASTT.C_functionproto),
+                )
+
+            if p_sym:
+                entry_type = getattr(ASTT, "C_DeviceTableDef", ASTT.C_Compound)
+                with CS(REF_POS):
+                    CS.store(m_symbol_def.set(
+                        None,
+                        CS.gp.VID,
+                        ((m_file.table_id, 0), OP_REF, (REF_ROOT,)),
+                        tag_ref or getattr(self, "tag_ref", 0),
+                        self.ast_ref,
+                        str(p_sym)[:255],
+                        int(entry_type),
+                        self.extent.line_pos[0],
+                        self.extent.line_pos[1],
+                    ))
+                if hasattr(CS, "symbol_dict"):
+                    pos_idx = ast_id_route[-1]
+                    CS.symbol_dict[(str(p_sym)[:255], int(entry_type))] = pos_idx
+                    CS.symbol_dict[(str(p_sym)[:255], int(ASTT.C_DeclRefExpr))] = pos_idx
+            return
+
+        # Sysfs attribute macro extraction (DEVICE_ATTR_RO, DEVICE_ATTR_RW, SYSFS_ATTR_RO, etc.)
+        if getattr(self, "name", "") in _SYSFS_ATTR_MACROS:
+            p_sym = ""
+            target_idx = 0
+            if getattr(self, "typedata", None) and len(self.typedata) > target_idx + 1:
+                for tok in self.typedata[target_idx + 1].content:
+                    if tok.code and tok.code != self.name and tok.code not in _KNOWN_MACRO_FUNCS:
+                        p_sym = tok.code.strip('"\'')
+                        break
+
+            if not p_sym and hasattr(self, "zones") and self.zones and len(self.zones[0].children) > target_idx:
+                ch = self.zones[0].children[target_idx]
+                ch_n = getattr(ch, "name", "")
+                if not ch_n and getattr(ch, "typedata", None):
+                    for ts in ch.typedata:
+                        for tok in ts.content:
+                            if tok.code and tok.code != self.name:
+                                ch_n = tok.code.strip('"\'')
+                                break
+                        if ch_n:
+                            break
+                if ch_n and ch_n != self.name:
+                    p_sym = ch_n.strip('"\'')
+
+            with CS(REF_POS):
+                CS.store(m_ast.view(
+                    ((m_ast.ast_id,),),
+                    None,
+                    str(self.name)[:255],
+                    int(ASTT.C_functionproto),
+                ))
+                ast_id_route = CS.get_route_parse()
+                self.ast_ref = CS.ref(m_ast.ast_id, *ast_id_route)
+
+            with CS(REF_NO_REF):
+                tag_ref = self.tag(
+                    CS,
+                    ast_id_route,
+                    self.extent,
+                    ast_name=str(self.name)[:255],
+                    ast_type=int(ASTT.C_functionproto),
+                )
+
+            if p_sym:
+                entry_type = getattr(ASTT, "C_SysfsAttrDef", ASTT.C_Compound)
+                with CS(REF_POS):
+                    CS.store(m_symbol_def.set(
+                        None,
+                        CS.gp.VID,
+                        ((m_file.table_id, 0), OP_REF, (REF_ROOT,)),
+                        tag_ref or getattr(self, "tag_ref", 0),
+                        self.ast_ref,
+                        str(p_sym)[:255],
+                        int(entry_type),
+                        self.extent.line_pos[0],
+                        self.extent.line_pos[1],
+                    ))
+                if hasattr(CS, "symbol_dict"):
+                    pos_idx = ast_id_route[-1]
+                    CS.symbol_dict[(str(p_sym)[:255], int(entry_type))] = pos_idx
+                    CS.symbol_dict[(str(p_sym)[:255], int(ASTT.C_DeclRefExpr))] = pos_idx
+            return
 
         # 1. Process Child Zones by Category
         has_fn_args = any(z.zone_type == Zone_Type.Function_Args for z in self.zones)
@@ -2201,17 +3079,19 @@ class C_Type(Ast):
                                     typesegment.ref_type = TSRef.Route_Ref
                                     typesegment.ref = ast_id_route
                             else:
+                                attrs = getattr(self, "attributes", ())
+                                flat_attrs = [val for idx, (a_name, a_val) in enumerate(attrs) for val in (None, idx, str(a_name)[:64], str(a_val)[:255])]
                                 with CS(REF_POS):
-                                    CS.store(m_ast.view(
-                                        ((m_ast.ast_id, m_ast_container.ast_id, 1),),
-                                        None,
-                                        ast_staging_name,
-                                        ast_staging_type,
-                                        None,
-                                        0,
-                                        ret_t_id,
-                                        ret_ref_ast_id,
-                                    ))
+                                    if attrs:
+                                        fn_joins = (
+                                            (m_ast.ast_id, m_ast_container.ast_id, 1),
+                                            (m_ast.ast_id, m_ast_attribute.ast_id, len(attrs)),
+                                        )
+                                        fn_data = [None, ast_staging_name, ast_staging_type, None, 0, ret_t_id, ret_ref_ast_id, *flat_attrs]
+                                    else:
+                                        fn_joins = ((m_ast.ast_id, m_ast_container.ast_id, 1),)
+                                        fn_data = [None, ast_staging_name, ast_staging_type, None, 0, ret_t_id, ret_ref_ast_id]
+                                    CS.store(m_ast.view(fn_joins, *fn_data))
                                     ast_id_route = CS.get_route_parse()
                                     self.ast_ref = CS.ref(m_ast.ast_id, *ast_id_route)
                                     typesegment.ref_type = TSRef.Route_Ref
@@ -2240,13 +3120,16 @@ class C_Type(Ast):
                                     typesegment.ref_type = TSRef.Route_Ref
                                     typesegment.ref = ast_id_route
                             else:
+                                attrs = getattr(self, "attributes", ())
+                                flat_attrs = [val for idx, (a_name, a_val) in enumerate(attrs) for val in (None, idx, str(a_name)[:64], str(a_val)[:255])]
                                 with CS(REF_POS):
-                                    CS.store(m_ast.view(
-                                        ((m_ast.ast_id,),),
-                                        None,
-                                        ast_staging_name,
-                                        ast_staging_type,
-                                    ))
+                                    if attrs:
+                                        fn_joins = ((m_ast.ast_id, m_ast_attribute.ast_id, len(attrs)),)
+                                        fn_data = [None, ast_staging_name, ast_staging_type, *flat_attrs]
+                                    else:
+                                        fn_joins = ((m_ast.ast_id,),)
+                                        fn_data = [None, ast_staging_name, ast_staging_type]
+                                    CS.store(m_ast.view(fn_joins, *fn_data))
                                     ast_id_route = CS.get_route_parse()
                                     self.ast_ref = CS.ref(m_ast.ast_id, *ast_id_route)
                                     typesegment.ref_type = TSRef.Route_Ref
@@ -2344,26 +3227,29 @@ class C_Type(Ast):
                                                         p_var = sp
                                                         break
                                             if not p_var and hasattr(self, "zones") and self.zones:
-                                                for ch in getattr(self.zones[0], "children", ()):
+                                                target_children = getattr(self.zones[0], "children", ())
+                                                if is_percpu and len(target_children) > 1:
+                                                    target_children = target_children[1:]
+                                                for ch in target_children:
                                                     ch_n = getattr(ch, "name", "")
                                                     if not ch_n and getattr(ch, "typedata", None):
                                                         for ts in ch.typedata:
                                                             for tok in ts.content:
-                                                                if tok.code and tok.code != safe_item_name:
+                                                                if tok.code and tok.code != safe_item_name and tok.code not in _NON_NAME_TOKENS:
                                                                     ch_n = tok.code
                                                                     break
                                                             if ch_n:
                                                                 break
                                                     if not ch_n and getattr(ch, "content", None) and getattr(ch.content, "content", None):
                                                         for tok in ch.content.content:
-                                                            if tok.code and tok.code != safe_item_name:
+                                                            if tok.code and tok.code != safe_item_name and tok.code not in _NON_NAME_TOKENS:
                                                                 ch_n = tok.code
                                                                 break
                                                     if ch_n and ch_n != safe_item_name:
                                                         p_var = ch_n
                                                         break
                                             if p_var:
-                                                v_type = getattr(ASTT, "C_MacroVarDef", ASTT.C_Compound)
+                                                v_type = getattr(ASTT, "C_PerCpuVarDef", ASTT.C_MacroVarDef) if is_percpu else getattr(ASTT, "C_MacroVarDef", ASTT.C_Compound)
                                                 with CS(REF_POS):
                                                     CS.store(m_symbol_def.set(
                                                         None,
@@ -2606,53 +3492,77 @@ class C_Type(Ast):
                 else:
                     total_containers = len(type_segments)
 
+                attrs = getattr(self, "attributes", ())
+                flat_attrs = [val for idx, (a_name, a_val) in enumerate(attrs) for val in (None, idx, str(a_name)[:64], str(a_val)[:255])]
+
                 if is_simple_type and initializer_ref is None:
+                    if attrs:
+                        joins = ((m_ast.ast_id, m_ast_attribute.ast_id, len(attrs)),)
+                        data = [None, safe_name, main_t_id, *flat_attrs]
+                    else:
+                        joins = ((m_ast.ast_id,),)
+                        data = [None, safe_name, main_t_id]
                     with CS(REF_POS):
-                        CS.store(m_ast.view(
-                            ((m_ast.ast_id,),),
-                            None,
-                            safe_name,
-                            main_t_id,
-                        ))
+                        CS.store(m_ast.view(joins, *data))
                         ast_id_route = CS.get_route_parse()
                         self.ast_ref = CS.ref(m_ast.ast_id, *ast_id_route)
                 else:
+                    if attrs:
+                        joins = (
+                            (m_ast.ast_id, m_ast_container.ast_id, total_containers),
+                            (m_ast.ast_id, m_ast_attribute.ast_id, len(attrs)),
+                        )
+                        data = [None, safe_name, main_t_id, *cs_inserter, *flat_attrs]
+                    else:
+                        joins = ((m_ast.ast_id, m_ast_container.ast_id, total_containers),)
+                        data = [None, safe_name, main_t_id, *cs_inserter]
                     with CS(REF_POS):
-                        CS.store(m_ast.view(
-                            ((m_ast.ast_id, m_ast_container.ast_id, total_containers),),
-                            None,
-                            safe_name,
-                            main_t_id,
-                            *cs_inserter,
-                        ))
+                        CS.store(m_ast.view(joins, *data))
                         ast_id_route = CS.get_route_parse()
                         self.ast_ref = CS.ref(m_ast.ast_id, *ast_id_route)
             else:
                 main_t_id = ASTT.C_SCtypedef if is_typedef_def else (ASTT.C_enumequal if getattr(self.cursor, "kind", None) == cc.CursorKind.ENUM_CONSTANT_DECL else ASTT.C_Compound)
+                attrs = getattr(self, "attributes", ())
+                flat_attrs = [val for idx, (a_name, a_val) in enumerate(attrs) for val in (None, idx, str(a_name)[:64], str(a_val)[:255])]
                 if initializer_ref is not None:
                     cs_inserter = [None, 0, int(ASTT.C_InitListExpr), initializer_ref]
+                    if attrs:
+                        joins = (
+                            (m_ast.ast_id, m_ast_container.ast_id, 1),
+                            (m_ast.ast_id, m_ast_attribute.ast_id, len(attrs)),
+                        )
+                        data = [None, safe_name, main_t_id, *cs_inserter, *flat_attrs]
+                    else:
+                        joins = ((m_ast.ast_id, m_ast_container.ast_id, 1),)
+                        data = [None, safe_name, main_t_id, *cs_inserter]
                     with CS(REF_POS):
-                        CS.store(m_ast.view(
-                            ((m_ast.ast_id, m_ast_container.ast_id, 1),),
-                            None,
-                            safe_name,
-                            main_t_id,
-                            *cs_inserter,
-                        ))
+                        CS.store(m_ast.view(joins, *data))
                         ast_id_route = CS.get_route_parse()
                         self.ast_ref = CS.ref(m_ast.ast_id, *ast_id_route)
                 else:
+                    if attrs:
+                        joins = ((m_ast.ast_id, m_ast_attribute.ast_id, len(attrs)),)
+                        data = [None, safe_name, main_t_id, *flat_attrs]
+                    else:
+                        joins = ((m_ast.ast_id,),)
+                        data = [None, safe_name, main_t_id]
                     with CS(REF_POS):
-                        CS.store(m_ast.view(
-                            ((m_ast.ast_id,),),
-                            None,
-                            safe_name,
-                            main_t_id,
-                        ))
+                        CS.store(m_ast.view(joins, *data))
                         ast_id_route = CS.get_route_parse()
                         self.ast_ref = CS.ref(m_ast.ast_id, *ast_id_route)
 
-            if safe_name and hasattr(CS, "symbol_dict"):
+            is_demoted_macro = (
+                getattr(self, "name", "") in _KNOWN_MACRO_FUNCS
+                and getattr(self, "name", "") not in _VAR_DECL_MACROS
+                and getattr(self, "name", "") not in _TRACE_MACROS
+                and getattr(self, "name", "") not in _MODULE_PARAM_MACROS
+                and getattr(self, "name", "") not in _ASM_ENTRY_MACROS
+                and getattr(self, "name", "") not in _PERCPU_MACROS
+                and getattr(self, "name", "") not in _INITCALL_MACROS
+                and getattr(self, "name", "") not in _EXPORT_MACROS
+            )
+
+            if safe_name and hasattr(CS, "symbol_dict") and not is_demoted_macro:
                 pos_idx = ast_id_route[-1]
                 CS.symbol_dict[(safe_name, main_t_id)] = pos_idx
                 CS.symbol_dict[(safe_name, ASTT.C_DeclRefExpr)] = pos_idx
@@ -2682,7 +3592,7 @@ class C_Type(Ast):
                         ast_name=safe_name,
                         ast_type=main_t_id,
                     )
-                if not is_param and safe_name:
+                if not is_param and safe_name and not is_demoted_macro:
                     with CS(REF_POS):
                         CS.store(m_symbol_def.set(
                             None,
@@ -2920,6 +3830,82 @@ class Zone:
             return Ast_UnaryOperator(extent, end_mode=End_Mode.Extent, cursor=cursor)
         elif k == cc.CursorKind.COMPOUND_STMT:
             return Ast_CompoundStmt(extent, end_mode=End_Mode.Extent, cursor=cursor)
+        elif k == cc.CursorKind.CSTYLE_CAST_EXPR:
+            return Ast_CastExpr(extent, end_mode=End_Mode.Extent, cursor=cursor)
+        elif k == cc.CursorKind.CONDITIONAL_OPERATOR:
+            return Ast_ConditionalOperator(extent, end_mode=End_Mode.Extent, cursor=cursor)
+        elif k == cc.CursorKind.ARRAY_SUBSCRIPT_EXPR:
+            return Ast_ArraySubscriptExpr(extent, end_mode=End_Mode.Extent, cursor=cursor)
+        elif k == getattr(cc.CursorKind, "DESIGNATED_INIT_EXPR", None):
+            return Ast_DesignatedInitExpr(extent, end_mode=End_Mode.Extent, cursor=cursor)
+        elif k == getattr(cc.CursorKind, "COMPOUND_ASSIGNMENT_OPERATOR", None):
+            return Ast_CompoundAssignOperator(extent, end_mode=End_Mode.Extent, cursor=cursor)
+        elif k == getattr(cc.CursorKind, "COMPOUND_LITERAL_EXPR", None):
+            return Ast_CompoundLiteralExpr(extent, end_mode=End_Mode.Extent, cursor=cursor)
+        elif k == getattr(cc.CursorKind, "INDIRECT_GOTO_STMT", None):
+            return Ast_IndirectGotoStmt(extent, end_mode=End_Mode.Extent, cursor=cursor)
+        elif k == getattr(cc.CursorKind, "ADDR_LABEL_EXPR", None):
+            return Ast_AddrLabelExpr(extent, end_mode=End_Mode.Extent, cursor=cursor)
+        elif k == getattr(cc.CursorKind, "NULL_STMT", None):
+            return Ast_NullStmt(extent, end_mode=End_Mode.Extent, cursor=cursor)
+        elif k == getattr(cc.CursorKind, "PAREN_EXPR", None):
+            return Ast_ParenExpr(extent, end_mode=End_Mode.Extent, cursor=cursor)
+        elif k in (getattr(cc.CursorKind, "CXX_UNARY_EXPR", None), getattr(cc.CursorKind, "UNARY_EXPR", None)):
+            if cursor is not None:
+                sp_lower = (safe_cursor_spelling(cursor) or "").lower()
+                if "alignof" in sp_lower:
+                    return Ast_AlignofExpr(extent, end_mode=End_Mode.Extent, cursor=cursor)
+                if hasattr(cursor, "get_tokens"):
+                    for t in cursor.get_tokens():
+                        tsp = (getattr(t, "spelling", "") or "").lower()
+                        if "alignof" in tsp:
+                            return Ast_AlignofExpr(extent, end_mode=End_Mode.Extent, cursor=cursor)
+                        break
+            return Ast_SizeofExpr(extent, end_mode=End_Mode.Extent, cursor=cursor)
+        elif k == getattr(cc.CursorKind, "ATOMIC_EXPR", None):
+            return Ast_AtomicExpr(extent, end_mode=End_Mode.Extent, cursor=cursor)
+        elif k in (getattr(cc.CursorKind, "StmtExpr", None), getattr(cc.CursorKind, "STMT_EXPR", None)):
+            return Ast_StmtExpr(extent, end_mode=End_Mode.Extent, cursor=cursor)
+        elif k == getattr(cc.CursorKind, "GENERIC_SELECTION_EXPR", None):
+            return Ast_GenericSelectionExpr(extent, end_mode=End_Mode.Extent, cursor=cursor)
+        elif k == getattr(cc.CursorKind, "VA_ARG_EXPR", None):
+            return Ast_VaArgExpr(extent, end_mode=End_Mode.Extent, cursor=cursor)
+        elif k == getattr(cc.CursorKind, "STATIC_ASSERT", None):
+            return Ast_StaticAssert(extent, end_mode=End_Mode.Extent, cursor=cursor)
+        elif k == getattr(cc.CursorKind, "LABEL_REF", None):
+            return Ast_LabelRef(extent, end_mode=End_Mode.Extent, cursor=cursor)
+        elif k == getattr(cc.CursorKind, "INTEGER_LITERAL", None):
+            node = Ast_IntegerLiteral(extent, end_mode=End_Mode.Extent, cursor=cursor)
+            if not sp and cursor is not None:
+                for t in cursor.get_tokens():
+                    sp = t.spelling
+                    break
+            if sp:
+                node.name = sp
+            return node
+        elif k == getattr(cc.CursorKind, "FLOATING_LITERAL", None):
+            node = Ast_FloatingLiteral(extent, end_mode=End_Mode.Extent, cursor=cursor)
+            if not sp and cursor is not None:
+                for t in cursor.get_tokens():
+                    sp = t.spelling
+                    break
+            if sp:
+                node.name = sp
+            return node
+        elif k == getattr(cc.CursorKind, "STRING_LITERAL", None):
+            node = Ast_StringLiteral(extent, end_mode=End_Mode.Extent, cursor=cursor)
+            if sp:
+                node.name = sp
+            return node
+        elif k == getattr(cc.CursorKind, "CHARACTER_LITERAL", None):
+            node = Ast_CharacterLiteral(extent, end_mode=End_Mode.Extent, cursor=cursor)
+            if not sp and cursor is not None:
+                for t in cursor.get_tokens():
+                    sp = t.spelling
+                    break
+            if sp:
+                node.name = sp
+            return node
         node = self.ast_type(extent, End_Mode.Extent, cursor=cursor)
         if sp:
             node.name = sp
@@ -3192,6 +4178,8 @@ class Zone:
                     self.children[-1].exec_keyword(token, cursor)
                     return True
                 case "_Static_assert" | "static_assert":
+                    return True
+                case "alignof" | "_Alignof" | "__alignof__" | "__alignof":
                     return True
 
         self.children.append(self.ast_type(tline, self.end_mode))

@@ -536,7 +536,12 @@ class KconfigManager:
 
     def _extract_source(self, src: KconfigSource, parent_tree_id: int | Any, parent_dep_exprs: list[KconfigExpr]) -> None:
         CS = self.CS
-        ast_type = ASTT.Kconfig_Rsource if src.is_rsource else ASTT.Kconfig_Source
+        if getattr(src, "is_osource", False):
+            ast_type = ASTT.Kconfig_Osource
+        elif src.is_rsource:
+            ast_type = ASTT.Kconfig_Rsource
+        else:
+            ast_type = ASTT.Kconfig_Source
 
         # Register included file path in m_file_name
         with CS(REF_POS):

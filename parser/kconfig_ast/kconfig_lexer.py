@@ -23,6 +23,7 @@ class TokenType(Enum):
     ENDIF = auto()
     SOURCE = auto()
     RSOURCE = auto()
+    OSOURCE = auto()
 
     # Types & Properties
     BOOL = auto()
@@ -87,6 +88,7 @@ KEYWORDS = {
     "endif": TokenType.ENDIF,
     "source": TokenType.SOURCE,
     "rsource": TokenType.RSOURCE,
+    "osource": TokenType.OSOURCE,
     "bool": TokenType.BOOL,
     "boolean": TokenType.BOOL,
     "tristate": TokenType.TRISTATE,

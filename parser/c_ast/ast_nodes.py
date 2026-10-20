@@ -540,6 +540,11 @@ class CPPro(Ast):
             case "include":
                 self.ccpro_start_flip(CPPro_include, token.line)
                 self._check_inc_cursor(cursor)
+            case "include_next":
+                self.ccpro_start_flip(CPPro_include_next, token.line)
+                self._check_inc_cursor(cursor)
+            case "ident":
+                self.ccpro_start_flip(CPPro_ident, token.line)
             case "line":
                 self.ccpro_start_flip(CPPro_line, token.line)
             case "error":
@@ -792,6 +797,11 @@ class CPPro_define(CPPro):
         if self.in_args:
             if token.spelling_str == ")":
                 self.in_args = False
+            elif token.spelling_str == "...":
+                if self.func_args:
+                    self.func_args[-1] += "..."
+                else:
+                    self.func_args.append("...")
             return
         if self.replacement is None:
             self.replacement = token.spelling_str
@@ -831,8 +841,61 @@ class CPPro_define(CPPro):
                     if end_col > self.extent.char_pos[1]:
                         self.extent.char_pos = (self.extent.char_pos[0], end_col)
 
-        type_const = ASTT.CPPro_define if not self.replacement else ASTT.CPPro_define_macro
-        self.extract_1arg(CS, type_const, self.identifier[:255], self.extent)
+        safe_name = str(self.identifier)[:255]
+        type_const = ASTT.CPPro_define_macro if (self.has_args or self.replacement) else ASTT.CPPro_define
+
+        if self.has_args and self.func_args:
+            param_refs = []
+            for p in self.func_args:
+                p_name = str(p).strip()[:255]
+                if not p_name:
+                    continue
+                with CS(REF_POS):
+                    CS.store(m_ast.view(((m_ast.ast_id,),), None, p_name, ASTT.C_MacroParam))
+                    p_route = CS.get_route_parse()
+                    param_refs.append(CS.ref(m_ast.ast_id, *p_route))
+
+            if param_refs:
+                joins = ((m_ast.ast_id, m_ast_container.ast_id, len(param_refs)),)
+                container_data = []
+                for priority, p_ref in enumerate(param_refs):
+                    container_data.extend([None, priority, int(ASTT.C_MacroParam), p_ref])
+                with CS(REF_POS):
+                    CS.store(m_ast.view(joins, None, safe_name, type_const, *container_data))
+                    ast_id_route = CS.get_route_parse()
+            else:
+                with CS(REF_POS):
+                    CS.store(m_ast.view(((m_ast.ast_id,),), None, safe_name, type_const))
+                    ast_id_route = CS.get_route_parse()
+        else:
+            with CS(REF_POS):
+                CS.store(m_ast.view(((m_ast.ast_id,),), None, safe_name, type_const))
+                ast_id_route = CS.get_route_parse()
+
+        self.ast_ref = CS.ref(m_ast.ast_id, *ast_id_route)
+        with CS(REF_NO_REF):
+            if G.OVERRIDE_FORCE_AST_DEBUG:
+                self.ast_debug(CS, ast_id_route)
+            tag_ref = self.tag(CS, ast_id_route, self.extent, ast_name=safe_name, ast_type=type_const)
+            if safe_name:
+                if hasattr(CS, "symbol_dict"):
+                    CS.symbol_dict[(safe_name, type_const)] = ast_id_route[1]
+                    CS.symbol_dict[(safe_name, ASTT.CPPro_define)] = ast_id_route[1]
+                    CS.symbol_dict[(safe_name, ASTT.CPPro_define_macro)] = ast_id_route[1]
+                ext = self.extent
+                vid = getattr(CS.gp, "VID", 1) if getattr(CS, "gp", None) else getattr(CS, "VID", 1)
+                with CS(REF_POS):
+                    CS.store(m_symbol_def.set(
+                        None,
+                        vid,
+                        ((m_file.table_id, 0), OP_REF, (REF_ROOT,)),
+                        tag_ref or getattr(self, "tag_ref", 0),
+                        self.ast_ref,
+                        safe_name,
+                        type_const,
+                        ext.line_pos[0],
+                        ext.line_pos[1],
+                    ))
 
 
 class CPPro_undef(CPPro):
@@ -953,6 +1016,72 @@ class CPPro_include(CPPro):
                 self.tag(CS, ast_id_route, self.extent, ast_name=self.w_include[:255], ast_type=ASTT.CPPro_include)
 
 
+class CPPro_include_next(CPPro_include):
+    type_id = ASTT.CPPro_include_next
+
+    def __init__(self, extent: Line, written_include: str = "", resolved_path: str = "") -> None:
+        super().__init__(extent, written_include, resolved_path)
+        self.type_id = ASTT.CPPro_include_next
+
+    def init_subclass(self) -> None:
+        super().init_subclass()
+        self.type_id = ASTT.CPPro_include_next
+
+    def extract(self, CS: Any, create_tag: bool = True) -> None:
+        base_dir = getattr(CS, "mfdir", None) or getattr(G, "CURRENT_PARSING_DIR", None)
+        raw_target = self.a_include if self.a_include else self.w_include
+        include_target = normalize_repo_path(raw_target, base_dir)
+        clean_target = str(include_target).strip().strip("<>\"'").strip()
+        safe_target = clean_target[:255]
+
+        with CS(REF_POS):
+            CS.store(m_file_name.get_set(None, safe_target))
+            fnid_route = CS.get_route_parse()
+
+        with CS(REF_POS):
+            CS.store(m_ast.view(
+                ((m_ast.ast_id, m_ast_include.ast_id, 1),),
+                None,
+                self.w_include[:255],
+                ASTT.CPPro_include_next,
+                None,
+                CS.ref(m_file_name.fnid, *fnid_route),
+            ))
+            ast_id_route = CS.get_route_parse()
+        self.ast_ref = CS.ref(m_ast.ast_id, *ast_id_route)
+
+        if create_tag:
+            with CS(REF_NO_REF):
+                if G.OVERRIDE_FORCE_AST_DEBUG:
+                    self.ast_debug(CS, ast_id_route)
+                self.tag(CS, ast_id_route, self.extent, ast_name=self.w_include[:255], ast_type=ASTT.CPPro_include_next)
+
+
+class CPPro_ident(CPPro):
+    type_id = ASTT.CPPro_ident
+
+    def __init__(self, extent: Line, ident_str: str = "") -> None:
+        super().__init__(extent)
+        self.ident_str = ident_str
+        self.type_id = ASTT.CPPro_ident
+
+    def init_subclass(self) -> None:
+        self.ident_str = ""
+        self.type_id = ASTT.CPPro_ident
+
+    def exec_literal(self, token: Any, cursor: Any) -> None:
+        self.ident_str += token.spelling_str
+
+    def exec_identifier(self, token: Any, cursor: Any) -> None:
+        self.ident_str += token.spelling_str
+
+    def exec_punctuation(self, token: Any, cursor: Any) -> None:
+        self.ident_str += token.spelling_str
+
+    def extract(self, CS: Any) -> None:
+        self.extract_1arg(CS, ASTT.CPPro_ident, self.ident_str[:255], self.extent)
+
+
 class CPPro_line(CPPro):
     type_id = ASTT.CPPro_line
 
@@ -1057,11 +1186,23 @@ class CPPro_pragma(CPPro):
 
 
 class CPPro_embed(CPPro):
-    pass
+    type_id = ASTT.CPPro_embed
+
+    def init_subclass(self) -> None:
+        self.type_id = ASTT.CPPro_embed
+
+    def extract(self, CS: Any) -> None:
+        self.extract_1arg(CS, ASTT.CPPro_embed, "", self.extent)
 
 
 class CPPro_defined(CPPro):
-    pass
+    type_id = ASTT.CPPro_defined
+
+    def init_subclass(self) -> None:
+        self.type_id = ASTT.CPPro_defined
+
+    def extract(self, CS: Any) -> None:
+        self.extract_1arg(CS, ASTT.CPPro_defined, "", self.extent)
 
 
 # --- Statements ---
@@ -1327,6 +1468,195 @@ class Ast_UnaryOperator(Ast):
     def __init__(self, extent: Line, end_mode: int = End_Mode.Extent, cursor: Any = None) -> None:
         super().__init__(extent, end_mode)
         self.type_id = ASTT.C_UnaryOperator
+        self.cursor = cursor
+
+
+class Ast_CastExpr(Ast):
+    def __init__(self, extent: Line, end_mode: int = End_Mode.Extent, cursor: Any = None) -> None:
+        super().__init__(extent, end_mode)
+        self.type_id = ASTT.C_CastExpr
+        self.cursor = cursor
+
+
+class Ast_ConditionalOperator(Ast):
+    def __init__(self, extent: Line, end_mode: int = End_Mode.Extent, cursor: Any = None) -> None:
+        super().__init__(extent, end_mode)
+        self.type_id = ASTT.C_ConditionalOperator
+        self.cursor = cursor
+
+
+class Ast_ArraySubscriptExpr(Ast):
+    def __init__(self, extent: Line, end_mode: int = End_Mode.Extent, cursor: Any = None) -> None:
+        super().__init__(extent, end_mode)
+        self.type_id = ASTT.C_ArraySubscriptExpr
+        self.cursor = cursor
+
+
+class Ast_DesignatedInitExpr(Ast):
+    def __init__(self, extent: Line, end_mode: int = End_Mode.Extent, cursor: Any = None) -> None:
+        super().__init__(extent, end_mode)
+        self.type_id = ASTT.C_DesignatedInitExpr
+        self.cursor = cursor
+
+
+class Ast_CompoundAssignOperator(Ast):
+    def __init__(self, extent: Line, end_mode: int = End_Mode.Extent, cursor: Any = None) -> None:
+        super().__init__(extent, end_mode)
+        self.type_id = ASTT.C_CompoundAssignOperator
+        self.cursor = cursor
+
+
+class Ast_CompoundLiteralExpr(Ast):
+    def __init__(self, extent: Line, end_mode: int = End_Mode.Extent, cursor: Any = None) -> None:
+        super().__init__(extent, end_mode)
+        self.type_id = ASTT.C_CompoundLiteralExpr
+        self.cursor = cursor
+
+
+class Ast_IndirectGotoStmt(Ast):
+    def __init__(self, extent: Line, end_mode: int = End_Mode.Extent, cursor: Any = None) -> None:
+        super().__init__(extent, end_mode)
+        self.type_id = ASTT.C_IndirectGotoStmt
+        self.cursor = cursor
+
+
+class Ast_AddrLabelExpr(Ast):
+    def __init__(self, extent: Line, end_mode: int = End_Mode.Extent, cursor: Any = None) -> None:
+        super().__init__(extent, end_mode)
+        self.type_id = ASTT.C_AddrLabelExpr
+        self.cursor = cursor
+
+
+class Ast_NullStmt(Ast):
+    def __init__(self, extent: Line, end_mode: int = End_Mode.Extent, cursor: Any = None) -> None:
+        super().__init__(extent, end_mode)
+        self.type_id = ASTT.C_NullStmt
+        self.cursor = cursor
+
+
+class Ast_ParenExpr(Ast):
+    def __init__(self, extent: Line, end_mode: int = End_Mode.Extent, cursor: Any = None) -> None:
+        super().__init__(extent, end_mode)
+        self.type_id = ASTT.C_ParenExpr
+        self.cursor = cursor
+
+
+class Ast_SizeofExpr(Ast):
+    def __init__(self, extent: Line, end_mode: int = End_Mode.Extent, cursor: Any = None) -> None:
+        super().__init__(extent, end_mode)
+        self.type_id = ASTT.C_SizeofExpr
+        self.cursor = cursor
+
+
+class Ast_StmtExpr(Ast):
+    def __init__(self, extent: Line, end_mode: int = End_Mode.Extent, cursor: Any = None) -> None:
+        super().__init__(extent, end_mode)
+        self.type_id = ASTT.C_StmtExpr
+        self.cursor = cursor
+
+
+class Ast_GenericSelectionExpr(Ast):
+    def __init__(self, extent: Line, end_mode: int = End_Mode.Extent, cursor: Any = None) -> None:
+        super().__init__(extent, end_mode)
+        self.type_id = ASTT.C_GenericSelectionExpr
+        self.cursor = cursor
+
+
+class Ast_VaArgExpr(Ast):
+    def __init__(self, extent: Line, end_mode: int = End_Mode.Extent, cursor: Any = None) -> None:
+        super().__init__(extent, end_mode)
+        self.type_id = ASTT.C_VaArgExpr
+        self.cursor = cursor
+
+
+class Ast_LabelRef(Ast):
+    def __init__(self, extent: Line, end_mode: int = End_Mode.Extent, cursor: Any = None) -> None:
+        super().__init__(extent, end_mode)
+        self.type_id = ASTT.C_LabelRef
+        self.cursor = cursor
+
+
+class Ast_IntegerLiteral(Ast):
+    def __init__(self, extent: Line, end_mode: int = End_Mode.Extent, cursor: Any = None) -> None:
+        super().__init__(extent, end_mode)
+        self.type_id = ASTT.C_IntegerLiteral
+        self.cursor = cursor
+
+
+class Ast_FloatingLiteral(Ast):
+    def __init__(self, extent: Line, end_mode: int = End_Mode.Extent, cursor: Any = None) -> None:
+        super().__init__(extent, end_mode)
+        self.type_id = ASTT.C_FloatingLiteral
+        self.cursor = cursor
+
+
+class Ast_StringLiteral(Ast):
+    def __init__(self, extent: Line, end_mode: int = End_Mode.Extent, cursor: Any = None) -> None:
+        super().__init__(extent, end_mode)
+        self.type_id = ASTT.C_StringLiteral
+        self.cursor = cursor
+
+
+class Ast_CharacterLiteral(Ast):
+    def __init__(self, extent: Line, end_mode: int = End_Mode.Extent, cursor: Any = None) -> None:
+        super().__init__(extent, end_mode)
+        self.type_id = ASTT.C_CharacterLiteral
+        self.cursor = cursor
+
+
+class Ast_MacroParam(Ast):
+    def __init__(self, extent: Line, end_mode: int = End_Mode.Extent, cursor: Any = None) -> None:
+        super().__init__(extent, end_mode)
+        self.type_id = ASTT.C_MacroParam
+        self.cursor = cursor
+
+
+class Ast_StaticAssert(Ast):
+    def __init__(self, extent: Line, end_mode: int = End_Mode.Extent, cursor: Any = None) -> None:
+        super().__init__(extent, end_mode)
+        self.type_id = ASTT.C_StaticAssert
+        self.cursor = cursor
+
+
+class Ast_TypeofExpr(Ast):
+    def __init__(self, extent: Line, end_mode: int = End_Mode.Extent, cursor: Any = None) -> None:
+        super().__init__(extent, end_mode)
+        self.type_id = ASTT.C_TypeofExpr
+        self.cursor = cursor
+
+
+class Ast_OffsetofExpr(Ast):
+    def __init__(self, extent: Line, end_mode: int = End_Mode.Extent, cursor: Any = None) -> None:
+        super().__init__(extent, end_mode)
+        self.type_id = ASTT.C_OffsetofExpr
+        self.cursor = cursor
+
+
+class Ast_TypesCompatiblePExpr(Ast):
+    def __init__(self, extent: Line, end_mode: int = End_Mode.Extent, cursor: Any = None) -> None:
+        super().__init__(extent, end_mode)
+        self.type_id = ASTT.C_TypesCompatiblePExpr
+        self.cursor = cursor
+
+
+class Ast_ChooseExpr(Ast):
+    def __init__(self, extent: Line, end_mode: int = End_Mode.Extent, cursor: Any = None) -> None:
+        super().__init__(extent, end_mode)
+        self.type_id = ASTT.C_ChooseExpr
+        self.cursor = cursor
+
+
+class Ast_AlignofExpr(Ast):
+    def __init__(self, extent: Line, end_mode: int = End_Mode.Extent, cursor: Any = None) -> None:
+        super().__init__(extent, end_mode)
+        self.type_id = ASTT.C_AlignofExpr
+        self.cursor = cursor
+
+
+class Ast_AtomicExpr(Ast):
+    def __init__(self, extent: Line, end_mode: int = End_Mode.Extent, cursor: Any = None) -> None:
+        super().__init__(extent, end_mode)
+        self.type_id = ASTT.C_AtomicExpr
         self.cursor = cursor
 
 

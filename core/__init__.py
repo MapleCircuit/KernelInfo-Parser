@@ -114,6 +114,7 @@ from core.DBLayout import (
     m_symbol_def,
     m_symbol_ref,
     m_file_reference,
+    m_ast_attribute,
 )
 
 __all__ = [
@@ -216,6 +217,7 @@ __all__ = [
     "m_symbol_def",
     "m_symbol_ref",
     "m_file_reference",
+    "m_ast_attribute",
     "FileRefType",
     "FILE_REF_TYPE_LABELS",
     "format_ref_type_label",

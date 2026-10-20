@@ -1,0 +1,131 @@
+{
+  "test_conf": {
+    "parser": "c_ast",
+    "test_name": "assembly_file",
+    "file_operation": "A",
+    "file_path": "arch/alpha/lib/clear_page.S",
+    "versions": [
+      "v3.0"
+    ],
+    "description": "Verify assembly source parsing (.S) into AST statements, tags, and bridge mappings with zero C-specific symbol hallucination"
+  },
+  "tables": {
+    "m_v_main": [
+      {
+        "vid": 1,
+        "vname": "v3.0"
+      }
+    ],
+    "m_file_name": [
+      {
+        "fnid": "$fnid_0",
+        "fname": "arch/alpha/lib/clear_page.S"
+      }
+    ],
+    "m_file": [
+      {
+        "fid": "$fid_0",
+        "vid_s": 1,
+        "vid_e": 0,
+        "ftype": "4 (T_ASM)",
+        "s_stat": "A",
+        "e_stat": 0
+      }
+    ],
+    "m_bridge_file": [
+      {
+        "vid": 1,
+        "fnid": "$fnid_0",
+        "fid": "$fid_0"
+      }
+    ],
+    "m_ast": [
+      {
+        "ast_id": "$ast_0",
+        "name": "/*\n * arch/alpha/lib/clear_page.S\n *\n * Zero an entire page.\n */",
+        "type_id": "2 (C_Comment)"
+      },
+      {
+        "ast_id": "$ast_1",
+        "name": ".",
+        "type_id": "84 (ASM_Directive)"
+      }
+    ],
+    "m_tag_code": [
+      {
+        "hash": "hex:984ca77b50d76b96672bb45c1f5571e98fe1e7edec41a71acf580f1fd96f719b",
+        "code": "/*\n * arch/alpha/lib/clear_page.S\n *\n * Zero an entire page.\n */"
+      },
+      {
+        "hash": "hex:a721a32737fc46115edcb63c32e9ec3de58866b62f971a3a37317acca553b5c9",
+        "code": ".text\n\t.align 4\n\t.global clear_page\n\t.ent clear_page\nclear_page:\n\t.prologue 0\n\n\tlda\t$0,128\n\tnop\n\tunop\n\tnop\n\n1:\tstq\t$31,0($16)\n\tstq\t$31,8($16)\n\tstq\t$31,16($16)\n\tstq\t$31,24($16)\n\n\tstq\t$31,32($16)\n\tstq\t$31,40($16)\n\tstq\t$31,48($16)\n\tsubq\t$0,1,$0\n\n\tstq\t$31,56($16)\n\taddq\t$16,64,$16\n\tunop\n\tbne\t$0,1b\n\n\tret\n\tnop\n\tunop\n\tnop\n\n\t.end clear_page"
+      }
+    ],
+    "m_tag": [
+      {
+        "tag_id": "$tag_0",
+        "vid_s": 1,
+        "vid_e": 0,
+        "hash": "hex:984ca77b50d76b96672bb45c1f5571e98fe1e7edec41a71acf580f1fd96f719b",
+        "ast_id": "$ast_0",
+        "hl_s": 0,
+        "hl_l": 0
+      },
+      {
+        "tag_id": "$tag_1",
+        "vid_s": 1,
+        "vid_e": 0,
+        "hash": "hex:a721a32737fc46115edcb63c32e9ec3de58866b62f971a3a37317acca553b5c9",
+        "ast_id": "$ast_1",
+        "hl_s": 0,
+        "hl_l": 0
+      }
+    ],
+    "m_bridge_tag": [
+      {
+        "fid": "$fid_0",
+        "tag_id": "$tag_0",
+        "line_s": 1,
+        "line_e": 5,
+        "char_s": 1,
+        "char_e": 4
+      },
+      {
+        "fid": "$fid_0",
+        "tag_id": "$tag_1",
+        "line_s": 7,
+        "line_e": 39,
+        "char_s": 2,
+        "char_e": 17
+      }
+    ],
+    "m_map_ast": [
+      {
+        "map_id": "$tag_0",
+        "line_s": 1,
+        "char_s": 1,
+        "line_e": 5,
+        "char_e": 4,
+        "ast_id": "$ast_0"
+      },
+      {
+        "map_id": "$tag_1",
+        "line_s": 1,
+        "char_s": 1,
+        "line_e": 33,
+        "char_e": 17,
+        "ast_id": "$ast_1"
+      }
+    ],
+    "m_bridge_map": [
+      {
+        "tag_id": "$tag_0",
+        "map_id": "$tag_0"
+      },
+      {
+        "tag_id": "$tag_1",
+        "map_id": "$tag_1"
+      }
+    ]
+  }
+}

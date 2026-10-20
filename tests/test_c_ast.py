@@ -36,6 +36,7 @@ from core.DBLayout import (
     m_bridge_tag,
     m_ast,
     m_ast_container,
+    m_ast_attribute,
     m_map_ast,
     m_bridge_map,
 )
@@ -284,6 +285,7 @@ def run_single_file_worker(item: dict[str, Any]) -> dict[str, Any]:
                 "m_bridge_file": dict(MockDB._global_store.get("m_bridge_file", {})),
                 "m_moved_tag": dict(MockDB._global_store.get("m_moved_tag", {})),
                 "m_ast_include": dict(MockDB._global_store.get("m_ast_include", {})),
+                "m_ast_attribute": dict(MockDB._global_store.get("m_ast_attribute", {})),
             }
         return res_dict
     except Exception as e:

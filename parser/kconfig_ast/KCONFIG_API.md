@@ -137,7 +137,7 @@ The parser implements a robust grammar for Linux Kconfig constructs:
 | **`KconfigMenu`** | `ASTT.Kconfig_Menu` | 89 | `menu "<TITLE>" ... endmenu`. Hierarchical menu container grouping configuration symbols. |
 | **`KconfigChoice`** | `ASTT.Kconfig_Choice` | 90 | `choice ... endchoice`. Mutual-exclusion selection block among child symbols. |
 | **`KconfigIf`** | `ASTT.Kconfig_If` | 91 | `if <EXPR> ... endif`. Scoped conditional block propagating parent dependencies to nested constructs. |
-| **`KconfigSource`** | `ASTT.Kconfig_Source` | 92 | `source "<PATH>"`. Dynamic include directive linking child Kconfig files. |
+| **`KconfigSource`** | `ASTT.Kconfig_Source`, `ASTT.Kconfig_Rsource`, `ASTT.Kconfig_Osource` | 92, 93, 188 | Dynamic include directives (`source "<PATH>"`, relative `rsource`, optional `osource`) linking child Kconfig files. |
 | **`KconfigComment`** | `ASTT.Kconfig_Comment` | 93 | `comment "<TITLE>"`. Non-configurable section heading displayed in menuconfig. |
 | **`KconfigMainmenu`** | `ASTT.Kconfig_Mainmenu` | 94 | `mainmenu "<TITLE>"`. Root title declaration for kernel configuration. |
 | **`KconfigExpr`** | Multiple | 95–99 | Boolean logic tree: `ASTT.Kconfig_Op_And` (95), `ASTT.Kconfig_Op_Or` (96), `ASTT.Kconfig_Op_Not` (97), `ASTT.Kconfig_Op_Equal` (98), `ASTT.Kconfig_Op_Unequal` (99). |

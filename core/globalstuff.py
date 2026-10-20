@@ -595,6 +595,63 @@ class ASTT(IntEnum):
     C_ModuleAttr = auto()
     C_MacroVarDef = auto()
     C_TracepointDef = auto()
+    C_PerCpuVarDef = auto()
+    C_ModuleParamDef = auto()
+    C_CastExpr = auto()
+    C_ConditionalOperator = auto()
+    C_ArraySubscriptExpr = auto()
+    C_DesignatedInitExpr = auto()
+    C_CompoundAssignOperator = auto()
+    C_CompoundLiteralExpr = auto()
+    C_IndirectGotoStmt = auto()
+    C_AddrLabelExpr = auto()
+    C_NullStmt = auto()
+    C_InitcallDef = auto()
+    C_ExportSymbolDef = auto()
+    CPPro_embed = auto()
+    CPPro_defined = auto()
+    C_StmtExpr = auto()
+    C_GenericSelectionExpr = auto()
+    C_VaArgExpr = auto()
+    C_LabelRef = auto()
+    C_IntegerLiteral = auto()
+    C_FloatingLiteral = auto()
+    C_StringLiteral = auto()
+    C_CharacterLiteral = auto()
+    C_DeviceTableDef = auto()
+    C_SysfsAttrDef = auto()
+    C_MacroParam = auto()
+    ## Maintainer Taxonomy
+    Maintainer_Person = auto()
+    Maintainer_List = auto()
+    Maintainer_Web = auto()
+    Maintainer_Tree = auto()
+    Maintainer_Status = auto()
+    ## C Basic Types
+    C_longlong = auto()
+    C_int128 = auto()
+    C_complex = auto()
+    ## GNU C & C11 Expressions
+    C_StaticAssert = auto()
+    C_TypeofExpr = auto()
+    C_OffsetofExpr = auto()
+    C_TypesCompatiblePExpr = auto()
+    C_ChooseExpr = auto()
+    ## Kconfig Additional Constructs
+    Kconfig_Osource = auto()
+    Kconfig_Def_Bool = auto()
+    Kconfig_Def_Tristate = auto()
+    Kconfig_Visible = auto()
+    ## Alignment & Atomic Operations
+    C_AlignofExpr = auto()
+    C_AtomicExpr = auto()
+    ## GNU Preprocessor Extensions
+    CPPro_include_next = auto()
+    CPPro_ident = auto()
+    ## Maintainer Extended Taxonomy
+    Maintainer_Bug = auto()
+    Maintainer_Chat = auto()
+    Maintainer_Patchwork = auto()
 
 
 class SymbolRole(IntEnum):
@@ -644,6 +701,12 @@ STANDARD_C_KEYWORDS: dict[str, ASTT] = {
     "__asm__": ASTT.C_AsmStmt,
     "__asm": ASTT.C_AsmStmt,
     "sizeof": ASTT.C_SizeofExpr,
+    "alignof": ASTT.C_AlignofExpr,
+    "_Alignof": ASTT.C_AlignofExpr,
+    "__alignof__": ASTT.C_AlignofExpr,
+    "__alignof": ASTT.C_AlignofExpr,
+    "alignas": ASTT.C_AS_alignas,
+    "_Alignas": ASTT.C_AS__Alignas,
     "auto": ASTT.C_SCauto,
     "register": ASTT.C_SCregister,
     "static": ASTT.C_SCstatic,
@@ -668,6 +731,13 @@ STANDARD_C_KEYWORDS: dict[str, ASTT] = {
     "struct": ASTT.C_struct,
     "union": ASTT.C_union,
     "enum": ASTT.C_enum,
+    "bool": ASTT.C_bool,
+    "_Bool": ASTT.C_bool,
+    "typeof": ASTT.C_TypeofExpr,
+    "__typeof__": ASTT.C_TypeofExpr,
+    "__typeof": ASTT.C_TypeofExpr,
+    "static_assert": ASTT.C_StaticAssert,
+    "_Static_assert": ASTT.C_StaticAssert,
 }
 
 

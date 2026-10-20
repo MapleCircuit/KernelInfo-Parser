@@ -1021,6 +1021,32 @@ m_db_instance = Table(
     hashing_table=False,
 )
 
+# -----------------------------------------------------------------------------
+# 36. m_ast_attribute (table_id=35): AST Compiler & Kernel Attributes
+#     - ast_id: Target AST Node ID (FK -> m_ast.ast_id).
+#     - priority: Positional rank/order index (0, 1, 2...).
+#     - name: Attribute identifier (e.g. "section", "aligned", "read_mostly").
+#     - val: Attribute argument or value string (e.g. ".init.text", "64", "").
+# -----------------------------------------------------------------------------
+m_ast_attribute = Table(
+    table_id=35,
+    table_name="m_ast_attribute",
+    columns=(
+        ("ast_id", "INT", "NOT NULL"),
+        ("priority", "SMALLINT", "UNSIGNED", "NOT NULL"),
+        ("name", "VARCHAR(64)", "NOT NULL", "COLLATE utf8mb4_bin"),
+        ("val", "VARCHAR(255)", "DEFAULT ''", "COLLATE utf8mb4_bin"),
+    ),
+    primary=("ast_id", "priority"),
+    foreign=(
+        ("ast_id", "m_ast", "ast_id"),
+    ),
+    initial_insert=None,
+    no_duplicate=False,
+    te_cached=False,
+    hashing_table=False,
+)
+
 TABLES: tuple[Table, ...] = (
     m_v_main,
     m_file_name,
@@ -1057,6 +1083,7 @@ TABLES: tuple[Table, ...] = (
     m_symbol_ref,
     m_file_reference,
     m_db_instance,
+    m_ast_attribute,
 )
 
 

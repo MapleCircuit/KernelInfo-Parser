@@ -1,0 +1,790 @@
+{
+  "test_conf": {
+    "parser": "c_ast",
+    "test_name": "tracepoint_file",
+    "file_operation": "A",
+    "file_path": "include/trace/events/net.h",
+    "versions": [
+      "v3.0"
+    ],
+    "description": "Verify tracepoint events (net_dev_xmit, net_dev_template, net_dev_queue, netif_receive_skb, netif_rx as C_TracepointDef 151), semicolonless macro scoping, and clean preprocessor symbol definitions"
+  },
+  "tables": {
+    "m_v_main": [
+      {
+        "vid": 1,
+        "vname": "v3.0"
+      }
+    ],
+    "m_file_name": [
+      {
+        "fnid": "$fnid_0",
+        "fname": "include/trace/events/net.h"
+      },
+      {
+        "fnid": "$fnid_1",
+        "fname": "linux/skbuff.h"
+      },
+      {
+        "fnid": "$fnid_2",
+        "fname": "netdevice.h"
+      },
+      {
+        "fnid": "$fnid_3",
+        "fname": "ip.h"
+      },
+      {
+        "fnid": "$fnid_4",
+        "fname": "linux/tracepoint.h"
+      },
+      {
+        "fnid": "$fnid_5",
+        "fname": "trace/define_trace.h"
+      }
+    ],
+    "m_file": [
+      {
+        "fid": "$fid_0",
+        "vid_s": 1,
+        "vid_e": 0,
+        "ftype": "1 (T_C)",
+        "s_stat": "A",
+        "e_stat": 0
+      }
+    ],
+    "m_bridge_file": [
+      {
+        "vid": 1,
+        "fnid": "$fnid_0",
+        "fid": "$fid_0"
+      }
+    ],
+    "m_ast": [
+      {
+        "ast_id": "$ast_0",
+        "name": "TRACE_SYSTEM",
+        "type_id": "77 (CPPro_undef)"
+      },
+      {
+        "ast_id": "$ast_1",
+        "name": "TRACE_SYSTEM",
+        "type_id": "76 (CPPro_define_macro)"
+      },
+      {
+        "ast_id": "$ast_2",
+        "name": "!defined(_TRACE_NET_H)||defined(TRACE_HEADER_MULTI_READ)",
+        "type_id": "67 (CPPro_if)"
+      },
+      {
+        "ast_id": "$ast_3",
+        "name": "_TRACE_NET_H",
+        "type_id": "75 (CPPro_define)"
+      },
+      {
+        "ast_id": "$ast_4",
+        "name": "<linux/skbuff.h>",
+        "type_id": "78 (CPPro_include)"
+      },
+      {
+        "ast_id": "$ast_5",
+        "name": "<linux/netdevice.h>",
+        "type_id": "78 (CPPro_include)"
+      },
+      {
+        "ast_id": "$ast_6",
+        "name": "<linux/ip.h>",
+        "type_id": "78 (CPPro_include)"
+      },
+      {
+        "ast_id": "$ast_7",
+        "name": "<linux/tracepoint.h>",
+        "type_id": "78 (CPPro_include)"
+      },
+      {
+        "ast_id": "$ast_8",
+        "name": "TRACE_EVENT",
+        "type_id": "20 (C_functionproto)"
+      },
+      {
+        "ast_id": "$ast_9",
+        "name": "DECLARE_EVENT_CLASS",
+        "type_id": "20 (C_functionproto)"
+      },
+      {
+        "ast_id": "$ast_10",
+        "name": "DEFINE_EVENT",
+        "type_id": "20 (C_functionproto)"
+      },
+      {
+        "ast_id": "$ast_11",
+        "name": "",
+        "type_id": "70 (CPPro_endif)"
+      },
+      {
+        "ast_id": "$ast_12",
+        "name": "/* _TRACE_NET_H */",
+        "type_id": "2 (C_Comment)"
+      },
+      {
+        "ast_id": "$ast_13",
+        "name": "/* This part must be outside protection */",
+        "type_id": "2 (C_Comment)"
+      },
+      {
+        "ast_id": "$ast_14",
+        "name": "<trace/define_trace.h>",
+        "type_id": "78 (CPPro_include)"
+      }
+    ],
+    "m_tag_code": [
+      {
+        "hash": "hex:e42f4711b28c32f15459a88925f0a90ba1616841d4a7a4a3026ecfb3982373a3",
+        "code": "#undef TRACE_SYSTEM"
+      },
+      {
+        "hash": "hex:8b4a01a21b1a1ef65ffefd33381b0747ceb3758a4bc82e900d26083bc8936ef4",
+        "code": "#define TRACE_SYSTEM net"
+      },
+      {
+        "hash": "hex:15fc85a9900c1064a96968c630f8051a1e93474bb8a527bab9e678b51a85b636",
+        "code": "#if !defined(_TRACE_NET_H) || defined(TRACE_HEADER_MULTI_READ)"
+      },
+      {
+        "hash": "hex:17944bd5050427ddce72cdca9112ca4b06d6d37de2d13fda8b5757067ed61aef",
+        "code": "#define _TRACE_NET_H"
+      },
+      {
+        "hash": "hex:588a01d21a38ffad99674ea9b705057d86bb47915e923e3b30e886d231f27304",
+        "code": "#include <linux/skbuff.h>"
+      },
+      {
+        "hash": "hex:bc5df93d0a1eda2d21e184646d8142545030e3bdedf7d88778c7b5f3c6c455c4",
+        "code": "#include <linux/netdevice.h>"
+      },
+      {
+        "hash": "hex:af518b74d71ab200cfa9ae330c9d7c0e62646f0c97ec74587f49686795bfbbef",
+        "code": "#include <linux/ip.h>"
+      },
+      {
+        "hash": "hex:644d94693ace0e7d1a7501c4394aef86a258a33d0941077760b4e24f63ffe316",
+        "code": "#include <linux/tracepoint.h>"
+      },
+      {
+        "hash": "hex:a9da58541da36838a4e649c6f0f440ba04ab765ae5cd2d8219cad57927629124",
+        "code": "TRACE_EVENT(net_dev_xmit,\n\n\tTP_PROTO(struct sk_buff *skb,\n\t\t int rc,\n\t\t struct net_device *dev,\n\t\t unsigned int skb_len),\n\n\tTP_ARGS(skb, rc, dev, skb_len),\n\n\tTP_STRUCT__entry(\n\t\t__field(\tvoid *,\t\tskbaddr\t\t)\n\t\t__field(\tunsigned int,\tlen\t\t)\n\t\t__field(\tint,\t\trc\t\t)\n\t\t__string(\tname,\t\tdev->name\t)\n\t),\n\n\tTP_fast_assign(\n\t\t__entry->skbaddr = skb;\n\t\t__entry->len = skb_len;\n\t\t__entry->rc = rc;\n\t\t__assign_str(name, dev->name);\n\t),\n\n\tTP_printk(\"dev=%s skbaddr=%p len=%u rc=%d\",\n\t\t__get_str(name), __entry->skbaddr, __entry->len, __entry->rc)\n);"
+      },
+      {
+        "hash": "hex:0146317883dfefff66c08019fa3a2d73ccc7f71f24da4e17fbee68e63c875b2c",
+        "code": "DECLARE_EVENT_CLASS(net_dev_template,\n\n\tTP_PROTO(struct sk_buff *skb),\n\n\tTP_ARGS(skb),\n\n\tTP_STRUCT__entry(\n\t\t__field(\tvoid *,\t\tskbaddr\t\t)\n\t\t__field(\tunsigned int,\tlen\t\t)\n\t\t__string(\tname,\t\tskb->dev->name\t)\n\t),\n\n\tTP_fast_assign(\n\t\t__entry->skbaddr = skb;\n\t\t__entry->len = skb->len;\n\t\t__assign_str(name, skb->dev->name);\n\t),\n\n\tTP_printk(\"dev=%s skbaddr=%p len=%u\",\n\t\t__get_str(name), __entry->skbaddr, __entry->len)\n)"
+      },
+      {
+        "hash": "hex:183a2c84c140c313ff598d3e1a5d49877390220671ed30038503e5b1fd652d2d",
+        "code": "DEFINE_EVENT(net_dev_template, net_dev_queue,\n\n\tTP_PROTO(struct sk_buff *skb),\n\n\tTP_ARGS(skb)\n);"
+      },
+      {
+        "hash": "hex:d58b80106ac48fe28e6022d5ad5a5c56a8262794c0cfec456c83205e36cba76c",
+        "code": "DEFINE_EVENT(net_dev_template, netif_receive_skb,\n\n\tTP_PROTO(struct sk_buff *skb),\n\n\tTP_ARGS(skb)\n);"
+      },
+      {
+        "hash": "hex:35c14743434f6ff2fe7c5cb5036299f9eb7ed7b0b821b890786e449f53882e33",
+        "code": "DEFINE_EVENT(net_dev_template, netif_rx,\n\n\tTP_PROTO(struct sk_buff *skb),\n\n\tTP_ARGS(skb)\n);"
+      },
+      {
+        "hash": "hex:1e258076b154c8a5a3303fe08eb08c3253d26728e5b64f90a29cc1752f787781",
+        "code": "#endif"
+      },
+      {
+        "hash": "hex:5943948da7f1c003fe1ce5d2521a652712013db017b05872795b031ca61533f0",
+        "code": "/* _TRACE_NET_H */"
+      },
+      {
+        "hash": "hex:186be7aa3cc06a0ddd8c9542df3909cde6bae3e4191ee48905b6a35f6b28633e",
+        "code": "/* This part must be outside protection */"
+      },
+      {
+        "hash": "hex:68b473cfa2b535dc4477f1cfbf4a0ef8467cd24894beceb6b02227a8893ad9a9",
+        "code": "#include <trace/define_trace.h>"
+      }
+    ],
+    "m_tag": [
+      {
+        "tag_id": "$tag_0",
+        "vid_s": 1,
+        "vid_e": 0,
+        "hash": "hex:e42f4711b28c32f15459a88925f0a90ba1616841d4a7a4a3026ecfb3982373a3",
+        "ast_id": "$ast_0",
+        "hl_s": 0,
+        "hl_l": 0
+      },
+      {
+        "tag_id": "$tag_1",
+        "vid_s": 1,
+        "vid_e": 0,
+        "hash": "hex:8b4a01a21b1a1ef65ffefd33381b0747ceb3758a4bc82e900d26083bc8936ef4",
+        "ast_id": "$ast_1",
+        "hl_s": 0,
+        "hl_l": 0
+      },
+      {
+        "tag_id": "$tag_2",
+        "vid_s": 1,
+        "vid_e": 0,
+        "hash": "hex:15fc85a9900c1064a96968c630f8051a1e93474bb8a527bab9e678b51a85b636",
+        "ast_id": "$ast_2",
+        "hl_s": 0,
+        "hl_l": 0
+      },
+      {
+        "tag_id": "$tag_3",
+        "vid_s": 1,
+        "vid_e": 0,
+        "hash": "hex:17944bd5050427ddce72cdca9112ca4b06d6d37de2d13fda8b5757067ed61aef",
+        "ast_id": "$ast_3",
+        "hl_s": 0,
+        "hl_l": 0
+      },
+      {
+        "tag_id": "$tag_4",
+        "vid_s": 1,
+        "vid_e": 0,
+        "hash": "hex:588a01d21a38ffad99674ea9b705057d86bb47915e923e3b30e886d231f27304",
+        "ast_id": "$ast_4",
+        "hl_s": 0,
+        "hl_l": 0
+      },
+      {
+        "tag_id": "$tag_5",
+        "vid_s": 1,
+        "vid_e": 0,
+        "hash": "hex:bc5df93d0a1eda2d21e184646d8142545030e3bdedf7d88778c7b5f3c6c455c4",
+        "ast_id": "$ast_5",
+        "hl_s": 0,
+        "hl_l": 0
+      },
+      {
+        "tag_id": "$tag_6",
+        "vid_s": 1,
+        "vid_e": 0,
+        "hash": "hex:af518b74d71ab200cfa9ae330c9d7c0e62646f0c97ec74587f49686795bfbbef",
+        "ast_id": "$ast_6",
+        "hl_s": 0,
+        "hl_l": 0
+      },
+      {
+        "tag_id": "$tag_7",
+        "vid_s": 1,
+        "vid_e": 0,
+        "hash": "hex:644d94693ace0e7d1a7501c4394aef86a258a33d0941077760b4e24f63ffe316",
+        "ast_id": "$ast_7",
+        "hl_s": 0,
+        "hl_l": 0
+      },
+      {
+        "tag_id": "$tag_8",
+        "vid_s": 1,
+        "vid_e": 0,
+        "hash": "hex:a9da58541da36838a4e649c6f0f440ba04ab765ae5cd2d8219cad57927629124",
+        "ast_id": "$ast_8",
+        "hl_s": 0,
+        "hl_l": 0
+      },
+      {
+        "tag_id": "$tag_9",
+        "vid_s": 1,
+        "vid_e": 0,
+        "hash": "hex:0146317883dfefff66c08019fa3a2d73ccc7f71f24da4e17fbee68e63c875b2c",
+        "ast_id": "$ast_9",
+        "hl_s": 0,
+        "hl_l": 0
+      },
+      {
+        "tag_id": "$tag_10",
+        "vid_s": 1,
+        "vid_e": 0,
+        "hash": "hex:183a2c84c140c313ff598d3e1a5d49877390220671ed30038503e5b1fd652d2d",
+        "ast_id": "$ast_10",
+        "hl_s": 0,
+        "hl_l": 0
+      },
+      {
+        "tag_id": "$tag_11",
+        "vid_s": 1,
+        "vid_e": 0,
+        "hash": "hex:d58b80106ac48fe28e6022d5ad5a5c56a8262794c0cfec456c83205e36cba76c",
+        "ast_id": "$ast_10",
+        "hl_s": 0,
+        "hl_l": 0
+      },
+      {
+        "tag_id": "$tag_12",
+        "vid_s": 1,
+        "vid_e": 0,
+        "hash": "hex:35c14743434f6ff2fe7c5cb5036299f9eb7ed7b0b821b890786e449f53882e33",
+        "ast_id": "$ast_10",
+        "hl_s": 0,
+        "hl_l": 0
+      },
+      {
+        "tag_id": "$tag_13",
+        "vid_s": 1,
+        "vid_e": 0,
+        "hash": "hex:1e258076b154c8a5a3303fe08eb08c3253d26728e5b64f90a29cc1752f787781",
+        "ast_id": "$ast_11",
+        "hl_s": 0,
+        "hl_l": 0
+      },
+      {
+        "tag_id": "$tag_14",
+        "vid_s": 1,
+        "vid_e": 0,
+        "hash": "hex:5943948da7f1c003fe1ce5d2521a652712013db017b05872795b031ca61533f0",
+        "ast_id": "$ast_12",
+        "hl_s": 0,
+        "hl_l": 0
+      },
+      {
+        "tag_id": "$tag_15",
+        "vid_s": 1,
+        "vid_e": 0,
+        "hash": "hex:186be7aa3cc06a0ddd8c9542df3909cde6bae3e4191ee48905b6a35f6b28633e",
+        "ast_id": "$ast_13",
+        "hl_s": 0,
+        "hl_l": 0
+      },
+      {
+        "tag_id": "$tag_16",
+        "vid_s": 1,
+        "vid_e": 0,
+        "hash": "hex:68b473cfa2b535dc4477f1cfbf4a0ef8467cd24894beceb6b02227a8893ad9a9",
+        "ast_id": "$ast_14",
+        "hl_s": 0,
+        "hl_l": 0
+      }
+    ],
+    "m_bridge_tag": [
+      {
+        "fid": "$fid_0",
+        "tag_id": "$tag_0",
+        "line_s": 1,
+        "line_e": 1,
+        "char_s": 1,
+        "char_e": 20
+      },
+      {
+        "fid": "$fid_0",
+        "tag_id": "$tag_1",
+        "line_s": 2,
+        "line_e": 2,
+        "char_s": 1,
+        "char_e": 25
+      },
+      {
+        "fid": "$fid_0",
+        "tag_id": "$tag_2",
+        "line_s": 4,
+        "line_e": 4,
+        "char_s": 1,
+        "char_e": 63
+      },
+      {
+        "fid": "$fid_0",
+        "tag_id": "$tag_3",
+        "line_s": 5,
+        "line_e": 5,
+        "char_s": 1,
+        "char_e": 21
+      },
+      {
+        "fid": "$fid_0",
+        "tag_id": "$tag_4",
+        "line_s": 7,
+        "line_e": 7,
+        "char_s": 1,
+        "char_e": 26
+      },
+      {
+        "fid": "$fid_0",
+        "tag_id": "$tag_5",
+        "line_s": 8,
+        "line_e": 8,
+        "char_s": 1,
+        "char_e": 29
+      },
+      {
+        "fid": "$fid_0",
+        "tag_id": "$tag_6",
+        "line_s": 9,
+        "line_e": 9,
+        "char_s": 1,
+        "char_e": 22
+      },
+      {
+        "fid": "$fid_0",
+        "tag_id": "$tag_7",
+        "line_s": 10,
+        "line_e": 10,
+        "char_s": 1,
+        "char_e": 30
+      },
+      {
+        "fid": "$fid_0",
+        "tag_id": "$tag_8",
+        "line_s": 12,
+        "line_e": 37,
+        "char_s": 1,
+        "char_e": 3
+      },
+      {
+        "fid": "$fid_0",
+        "tag_id": "$tag_9",
+        "line_s": 39,
+        "line_e": 59,
+        "char_s": 1,
+        "char_e": 2
+      },
+      {
+        "fid": "$fid_0",
+        "tag_id": "$tag_10",
+        "line_s": 61,
+        "line_e": 66,
+        "char_s": 1,
+        "char_e": 3
+      },
+      {
+        "fid": "$fid_0",
+        "tag_id": "$tag_11",
+        "line_s": 68,
+        "line_e": 73,
+        "char_s": 1,
+        "char_e": 3
+      },
+      {
+        "fid": "$fid_0",
+        "tag_id": "$tag_12",
+        "line_s": 75,
+        "line_e": 80,
+        "char_s": 1,
+        "char_e": 3
+      },
+      {
+        "fid": "$fid_0",
+        "tag_id": "$tag_13",
+        "line_s": 81,
+        "line_e": 81,
+        "char_s": 1,
+        "char_e": 7
+      },
+      {
+        "fid": "$fid_0",
+        "tag_id": "$tag_14",
+        "line_s": 81,
+        "line_e": 81,
+        "char_s": 8,
+        "char_e": 26
+      },
+      {
+        "fid": "$fid_0",
+        "tag_id": "$tag_15",
+        "line_s": 83,
+        "line_e": 83,
+        "char_s": 1,
+        "char_e": 43
+      },
+      {
+        "fid": "$fid_0",
+        "tag_id": "$tag_16",
+        "line_s": 84,
+        "line_e": 84,
+        "char_s": 1,
+        "char_e": 32
+      }
+    ],
+    "m_map_ast": [
+      {
+        "map_id": "$tag_0",
+        "line_s": 1,
+        "char_s": 1,
+        "line_e": 1,
+        "char_e": 20,
+        "ast_id": "$ast_0"
+      },
+      {
+        "map_id": "$tag_1",
+        "line_s": 1,
+        "char_s": 1,
+        "line_e": 1,
+        "char_e": 25,
+        "ast_id": "$ast_1"
+      },
+      {
+        "map_id": "$tag_2",
+        "line_s": 1,
+        "char_s": 1,
+        "line_e": 78,
+        "char_e": 7,
+        "ast_id": "$ast_2"
+      },
+      {
+        "map_id": "$tag_3",
+        "line_s": 1,
+        "char_s": 1,
+        "line_e": 1,
+        "char_e": 21,
+        "ast_id": "$ast_3"
+      },
+      {
+        "map_id": "$tag_4",
+        "line_s": 1,
+        "char_s": 1,
+        "line_e": 1,
+        "char_e": 26,
+        "ast_id": "$ast_4"
+      },
+      {
+        "map_id": "$tag_5",
+        "line_s": 1,
+        "char_s": 1,
+        "line_e": 1,
+        "char_e": 29,
+        "ast_id": "$ast_5"
+      },
+      {
+        "map_id": "$tag_6",
+        "line_s": 1,
+        "char_s": 1,
+        "line_e": 1,
+        "char_e": 22,
+        "ast_id": "$ast_6"
+      },
+      {
+        "map_id": "$tag_7",
+        "line_s": 1,
+        "char_s": 1,
+        "line_e": 1,
+        "char_e": 30,
+        "ast_id": "$ast_7"
+      },
+      {
+        "map_id": "$tag_8",
+        "line_s": 1,
+        "char_s": 1,
+        "line_e": 26,
+        "char_e": 3,
+        "ast_id": "$ast_8"
+      },
+      {
+        "map_id": "$tag_9",
+        "line_s": 1,
+        "char_s": 1,
+        "line_e": 21,
+        "char_e": 2,
+        "ast_id": "$ast_9"
+      },
+      {
+        "map_id": "$tag_10",
+        "line_s": 1,
+        "char_s": 1,
+        "line_e": 6,
+        "char_e": 3,
+        "ast_id": "$ast_10"
+      },
+      {
+        "map_id": "$tag_11",
+        "line_s": 1,
+        "char_s": 1,
+        "line_e": 6,
+        "char_e": 3,
+        "ast_id": "$ast_10"
+      },
+      {
+        "map_id": "$tag_12",
+        "line_s": 1,
+        "char_s": 1,
+        "line_e": 6,
+        "char_e": 3,
+        "ast_id": "$ast_10"
+      },
+      {
+        "map_id": "$tag_13",
+        "line_s": 1,
+        "char_s": 1,
+        "line_e": 1,
+        "char_e": 7,
+        "ast_id": "$ast_11"
+      },
+      {
+        "map_id": "$tag_14",
+        "line_s": 1,
+        "char_s": 1,
+        "line_e": 1,
+        "char_e": 26,
+        "ast_id": "$ast_12"
+      },
+      {
+        "map_id": "$tag_15",
+        "line_s": 1,
+        "char_s": 1,
+        "line_e": 1,
+        "char_e": 43,
+        "ast_id": "$ast_13"
+      },
+      {
+        "map_id": "$tag_16",
+        "line_s": 1,
+        "char_s": 1,
+        "line_e": 1,
+        "char_e": 32,
+        "ast_id": "$ast_14"
+      }
+    ],
+    "m_bridge_map": [
+      {
+        "tag_id": "$tag_0",
+        "map_id": "$tag_0"
+      },
+      {
+        "tag_id": "$tag_1",
+        "map_id": "$tag_1"
+      },
+      {
+        "tag_id": "$tag_2",
+        "map_id": "$tag_2"
+      },
+      {
+        "tag_id": "$tag_3",
+        "map_id": "$tag_3"
+      },
+      {
+        "tag_id": "$tag_4",
+        "map_id": "$tag_4"
+      },
+      {
+        "tag_id": "$tag_5",
+        "map_id": "$tag_5"
+      },
+      {
+        "tag_id": "$tag_6",
+        "map_id": "$tag_6"
+      },
+      {
+        "tag_id": "$tag_7",
+        "map_id": "$tag_7"
+      },
+      {
+        "tag_id": "$tag_8",
+        "map_id": "$tag_8"
+      },
+      {
+        "tag_id": "$tag_9",
+        "map_id": "$tag_9"
+      },
+      {
+        "tag_id": "$tag_10",
+        "map_id": "$tag_10"
+      },
+      {
+        "tag_id": "$tag_11",
+        "map_id": "$tag_11"
+      },
+      {
+        "tag_id": "$tag_12",
+        "map_id": "$tag_12"
+      },
+      {
+        "tag_id": "$tag_13",
+        "map_id": "$tag_13"
+      },
+      {
+        "tag_id": "$tag_14",
+        "map_id": "$tag_14"
+      },
+      {
+        "tag_id": "$tag_15",
+        "map_id": "$tag_15"
+      },
+      {
+        "tag_id": "$tag_16",
+        "map_id": "$tag_16"
+      }
+    ],
+    "m_symbol_def": [
+      {
+        "def_id": "$def_0",
+        "vid": 1,
+        "fid": "$fid_0",
+        "tag_id": "$tag_1",
+        "ast_id": "$ast_1",
+        "name": "TRACE_SYSTEM",
+        "type_id": "76 (CPPro_define_macro)",
+        "line_s": 2,
+        "line_e": 2
+      },
+      {
+        "def_id": "$def_1",
+        "vid": 1,
+        "fid": "$fid_0",
+        "tag_id": "$tag_3",
+        "ast_id": "$ast_3",
+        "name": "_TRACE_NET_H",
+        "type_id": "75 (CPPro_define)",
+        "line_s": 5,
+        "line_e": 5
+      },
+      {
+        "def_id": "$def_2",
+        "vid": 1,
+        "fid": "$fid_0",
+        "tag_id": "$tag_8",
+        "ast_id": "$ast_8",
+        "name": "net_dev_xmit",
+        "type_id": "151 (C_TracepointDef)",
+        "line_s": 12,
+        "line_e": 37
+      },
+      {
+        "def_id": "$def_3",
+        "vid": 1,
+        "fid": "$fid_0",
+        "tag_id": "$tag_9",
+        "ast_id": "$ast_9",
+        "name": "net_dev_template",
+        "type_id": "151 (C_TracepointDef)",
+        "line_s": 39,
+        "line_e": 59
+      },
+      {
+        "def_id": "$def_4",
+        "vid": 1,
+        "fid": "$fid_0",
+        "tag_id": "$tag_10",
+        "ast_id": "$ast_10",
+        "name": "net_dev_queue",
+        "type_id": "151 (C_TracepointDef)",
+        "line_s": 61,
+        "line_e": 66
+      },
+      {
+        "def_id": "$def_5",
+        "vid": 1,
+        "fid": "$fid_0",
+        "tag_id": "$tag_11",
+        "ast_id": "$ast_10",
+        "name": "netif_receive_skb",
+        "type_id": "151 (C_TracepointDef)",
+        "line_s": 68,
+        "line_e": 73
+      },
+      {
+        "def_id": "$def_6",
+        "vid": 1,
+        "fid": "$fid_0",
+        "tag_id": "$tag_12",
+        "ast_id": "$ast_10",
+        "name": "netif_rx",
+        "type_id": "151 (C_TracepointDef)",
+        "line_s": 75,
+        "line_e": 80
+      }
+    ]
+  }
+}

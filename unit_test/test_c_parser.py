@@ -290,5 +290,164 @@ class Test_CParserLifecycle(BaseCParserTestCase):
             assert_snapshot_matches(self, "c_ast", "exact_rename_file", snapshot)
 
 
+class Test_CParserCornerCases(BaseCParserTestCase):
+    """Corner-case snapshot unit tests validating advanced C-AST parser capabilities.
+
+    Covers:
+      1. System Call definitions (SYSCALL_DEFINE1) & module_init demotion in kernel/exec_domain.c
+      2. Synchronization & Macro variable declarations (DEFINE_SPINLOCK) & designated initializers in kernel/dma.c
+      3. Kernel tracepoint events (TRACE_EVENT, DECLARE_EVENT_CLASS, DEFINE_EVENT) in include/trace/events/net.h
+      4. Low-level assembly source file parsing (.S) in arch/alpha/lib/clear_page.S
+    """
+
+    @test_feature("c_ast_syscall_file")
+    def test_04_syscall_file(self) -> None:
+        """Validate system call parsing (SYSCALL_DEFINE1) and macro demotion in kernel/exec_domain.c."""
+        file_path = "kernel/exec_domain.c"
+        version = "v3.0"
+
+        with test_step(f"Prepare kernel source file {file_path} from git tag {version}"):
+            self.gp.Version_Name = version
+            self.gp.VID = 1
+            self.gp.Old_VID = 0
+            self.prepare_c_file(version, file_path)
+
+        with test_step("Parse file addition ChangeSet"):
+            cs = ChangeSet(f"A\t{file_path}")
+            cs.gp = self.gp
+            cs.mf = self.mf
+            cs.current_vid = 1
+            G.CURRENT_PARSING_FILE = file_path
+            cs.store(m_v_main.set(1, self.gp.Version_Name))
+            stage_file_prelude(cs, self.gp)
+            c_ast_parse(cs)
+            exec_ok = cs.execute()
+            self.assertTrue(exec_ok, "ChangeSet execution must succeed")
+            self.te.commit_all()
+
+        with test_step("Extract snapshot and assert match"):
+            test_conf = {
+                "parser": "c_ast",
+                "test_name": "syscall_file",
+                "file_operation": "A",
+                "file_path": file_path,
+                "versions": [version],
+                "description": "Verify system call parsing (sys_personality as C_SyscallDef 147), DEFINE_RWLOCK (exec_domains_lock as C_MacroVarDef 150), and exclusion of demoted module_init and EXPORT_SYMBOL from m_symbol_def",
+            }
+            snapshot = extract_changeset_snapshot(cs, test_conf=test_conf)
+            assert_snapshot_matches(self, "c_ast", "syscall_file", snapshot)
+
+    @test_feature("c_ast_macro_variable_file")
+    def test_05_macro_variable_file(self) -> None:
+        """Validate macro variable definitions and designated initializers in kernel/dma.c."""
+        file_path = "kernel/dma.c"
+        version = "v3.0"
+
+        with test_step(f"Prepare kernel source file {file_path} from git tag {version}"):
+            self.gp.Version_Name = version
+            self.gp.VID = 1
+            self.gp.Old_VID = 0
+            self.prepare_c_file(version, file_path)
+
+        with test_step("Parse file addition ChangeSet"):
+            cs = ChangeSet(f"A\t{file_path}")
+            cs.gp = self.gp
+            cs.mf = self.mf
+            cs.current_vid = 1
+            G.CURRENT_PARSING_FILE = file_path
+            cs.store(m_v_main.set(1, self.gp.Version_Name))
+            stage_file_prelude(cs, self.gp)
+            c_ast_parse(cs)
+            exec_ok = cs.execute()
+            self.assertTrue(exec_ok, "ChangeSet execution must succeed")
+            self.te.commit_all()
+
+        with test_step("Extract snapshot and assert match"):
+            test_conf = {
+                "parser": "c_ast",
+                "test_name": "macro_variable_file",
+                "file_operation": "A",
+                "file_path": file_path,
+                "versions": [version],
+                "description": "Verify DEFINE_SPINLOCK (dma_spin_lock as C_MacroVarDef 150), struct dma_chan declaration, designated initializers, and exclusion of demoted __initcall and EXPORT_SYMBOL from m_symbol_def",
+            }
+            snapshot = extract_changeset_snapshot(cs, test_conf=test_conf)
+            assert_snapshot_matches(self, "c_ast", "macro_variable_file", snapshot)
+
+    @test_feature("c_ast_tracepoint_file")
+    def test_06_tracepoint_file(self) -> None:
+        """Validate tracepoint definitions (TRACE_EVENT, DECLARE_EVENT_CLASS, DEFINE_EVENT) in include/trace/events/net.h."""
+        file_path = "include/trace/events/net.h"
+        version = "v3.0"
+
+        with test_step(f"Prepare kernel source file {file_path} from git tag {version}"):
+            self.gp.Version_Name = version
+            self.gp.VID = 1
+            self.gp.Old_VID = 0
+            self.prepare_c_file(version, file_path)
+
+        with test_step("Parse file addition ChangeSet"):
+            cs = ChangeSet(f"A\t{file_path}")
+            cs.gp = self.gp
+            cs.mf = self.mf
+            cs.current_vid = 1
+            G.CURRENT_PARSING_FILE = file_path
+            cs.store(m_v_main.set(1, self.gp.Version_Name))
+            stage_file_prelude(cs, self.gp)
+            c_ast_parse(cs)
+            exec_ok = cs.execute()
+            self.assertTrue(exec_ok, "ChangeSet execution must succeed")
+            self.te.commit_all()
+
+        with test_step("Extract snapshot and assert match"):
+            test_conf = {
+                "parser": "c_ast",
+                "test_name": "tracepoint_file",
+                "file_operation": "A",
+                "file_path": file_path,
+                "versions": [version],
+                "description": "Verify tracepoint events (net_dev_xmit, net_dev_template, net_dev_queue, netif_receive_skb, netif_rx as C_TracepointDef 151), semicolonless macro scoping, and clean preprocessor symbol definitions",
+            }
+            snapshot = extract_changeset_snapshot(cs, test_conf=test_conf)
+            assert_snapshot_matches(self, "c_ast", "tracepoint_file", snapshot)
+
+    @test_feature("c_ast_assembly_file")
+    def test_07_assembly_file(self) -> None:
+        """Validate assembly source parsing (.S) in arch/alpha/lib/clear_page.S."""
+        file_path = "arch/alpha/lib/clear_page.S"
+        version = "v3.0"
+
+        with test_step(f"Prepare kernel source file {file_path} from git tag {version}"):
+            self.gp.Version_Name = version
+            self.gp.VID = 1
+            self.gp.Old_VID = 0
+            self.prepare_c_file(version, file_path)
+
+        with test_step("Parse file addition ChangeSet"):
+            cs = ChangeSet(f"A\t{file_path}")
+            cs.gp = self.gp
+            cs.mf = self.mf
+            cs.current_vid = 1
+            G.CURRENT_PARSING_FILE = file_path
+            cs.store(m_v_main.set(1, self.gp.Version_Name))
+            stage_file_prelude(cs, self.gp)
+            c_ast_parse(cs)
+            exec_ok = cs.execute()
+            self.assertTrue(exec_ok, "ChangeSet execution must succeed")
+            self.te.commit_all()
+
+        with test_step("Extract snapshot and assert match"):
+            test_conf = {
+                "parser": "c_ast",
+                "test_name": "assembly_file",
+                "file_operation": "A",
+                "file_path": file_path,
+                "versions": [version],
+                "description": "Verify assembly source parsing (.S) into AST statements, tags, and bridge mappings with zero C-specific symbol hallucination",
+            }
+            snapshot = extract_changeset_snapshot(cs, test_conf=test_conf)
+            assert_snapshot_matches(self, "c_ast", "assembly_file", snapshot)
+
+
 if __name__ == "__main__":
     unittest.main()

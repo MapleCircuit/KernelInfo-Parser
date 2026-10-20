@@ -92,7 +92,7 @@ Dense architectural contract and state interaction reference across `globalstuff
     - `Documentation = 5`: Documentation and plain text file cross-references.
 
   - `STANDARD_C_KEYWORDS: dict[str, ASTT]`: Fast keyword-to-AST category mapping covering C control flow (`if`, `switch`, `case`, `default`, `while`, `do`, `for`, `return`, `break`, `continue`, `goto`, `asm`), qualifiers (`const`, `volatile`, `restrict`, `_Atomic`), storage classes (`static`, `extern`, `typedef`, `inline`), and primitive types (`void`, `char`, `short`, `int`, `long`, `signed`, `unsigned`, `float`, `double`, `struct`, `union`, `enum`).
-  - `ASTT(IntEnum)`: AST construct category identifiers across C (`C_struct`, `C_Compound`, `C_SizeofExpr`, `C_TypeRef`), Preprocessor (`CPPro_define`, `CPPro_include`), ASM (`ASM_Instruction`, `ASM_Macro`), and Kconfig (`Kconfig_Config`, `Kconfig_Menu`, `Kconfig_Choice`, `Kconfig_Depends_On`, `Kconfig_Select`, `Kconfig_Op_And`, etc.).
+  - `ASTT(IntEnum)`: AST construct category identifiers across C (`C_struct`, `C_Compound`, `C_SizeofExpr`, `C_TypeRef`, `C_PerCpuVarDef`, `C_ModuleParamDef`, `C_CastExpr`, `C_ConditionalOperator`, `C_ArraySubscriptExpr`, `C_DesignatedInitExpr`, `C_CompoundAssignOperator`, `C_CompoundLiteralExpr`, `C_IndirectGotoStmt`, `C_AddrLabelExpr`, `C_NullStmt`, `C_ParenExpr`, `C_InitcallDef`, `C_ExportSymbolDef`), Preprocessor (`CPPro_define`, `CPPro_include`), ASM (`ASM_Instruction`, `ASM_Macro`), and Kconfig (`Kconfig_Config`, `Kconfig_Menu`, `Kconfig_Choice`, `Kconfig_Depends_On`, `Kconfig_Select`, `Kconfig_Op_And`, etc.).
 
 
 ---
@@ -166,7 +166,7 @@ Central runtime container, schema registry, and worker IPC coordinator.
 | **4** | `m_moved_file` | `(s_fid, e_fid)` | `("s_fid", "e_fid")`| `False` | `False`| `False` | File rename/movement tracking |
 | **5** | `m_type_descriptor`| `(type_id, name)` | `("type_id",)` | `False` | `True` | `False` | AST node type registry (seeded from `ASTT`) |
 | **6** | `m_ast` | `(ast_id, name, type_id)` | `("ast_id",)` | `False` | `False`| `"m_ast_hash"` | AST symbol nodes |
-| **7** | `m_ast_container` | `(ast_id, priority, type_id, ref_ast_id)`| `("ast_id", "priority")`| `False` | `False` | `False` | AST child hierarchy links |
+| **7** | `m_ast_container` | `(ast_id, priority, type_id, ref_ast_id)`| `("ast_id", "priority")`| `False` | `False` | `False` | AST child hierarchy links (compound struct fields, function parameters, parameterized macro arguments) |
 | **8** | `m_ast_include` | `(ast_id, fnid)` | `("ast_id",)` | `False` | `False`| `False` | AST `#include` / `source` references |
 | **9** | `m_ast_debug` | `(ast_id, ast_raw)` | `("ast_id",)` | `False` | `False`| `False` | JSON dumps of AST structures |
 | **10** | `m_tag_code` | `(hash, code)` | `("hash",)` | `False` | `("hash",)` | `False` | Code snippet registry (32-byte binary SHA-256 hash, single-column caching) |
@@ -180,7 +180,7 @@ Central runtime container, schema registry, and worker IPC coordinator.
 > **ChangeSet Tag Reference Order Invariant**: When staging tags in ChangeSets (`with CS(REF_POS):`), `m_tag.set` MUST be the first operation inside the block so that `tag_ref = ((m_tag.table_id, 0), OP_REF, (REF_POS, CS.route[-1]))` points directly to `m_tag`. Auxiliary deduplication tables (such as `m_tag_code.get_set`) must always be staged after `m_tag.set` within the block.
 
 > [!NOTE]
-> **Schema Table Ordering & Foreign Key Directionality**: Tables are created sequentially in ascending `table_id` order (0..34). When defining hashing/lookup tables or relations in `core/DBLayout.py`, avoid forward foreign key constraints pointing to tables with higher `table_id`s, as relational databases reject foreign key constraints referencing not-yet-created tables during initial DDL setup.
+> **Schema Table Ordering & Foreign Key Directionality**: Tables are created sequentially in ascending `table_id` order (0..35). When defining hashing/lookup tables or relations in `core/DBLayout.py`, avoid forward foreign key constraints pointing to tables with higher `table_id`s, as relational databases reject foreign key constraints referencing not-yet-created tables during initial DDL setup.
 | **16** | `m_kconfig_symbol` | `(kcid, vid_s, vid_e, name, type, prompt, def_val, help, ast_id)` | `("kcid", "vid_s")` | `True` | `True` | `False` | Normalized Kconfig symbol definitions |
 | **17** | `m_kconfig_relation`| `(rel_id, kcid, target_name, rel_type, cond_ast_id, priority)`| `("rel_id",)`| `True` | `True` | `False` | Direct depends_on / select / imply dependency graph |
 | **18** | `m_kconfig_tree` | `(tree_id, vid, parent_id, node_type, title, kcid, priority, dep_ast_id, ast_id)` | `("tree_id", "vid")` | `False` | `True` | `False` | Hierarchical Menuconfig tree & UI ordering |
@@ -196,9 +196,11 @@ Central runtime container, schema registry, and worker IPC coordinator.
 | **28** | `m_bridge_commit_file`| `(commit_id, vid, fid, change_type)` | `("commit_id", "fid")` | `False` | `False` | `False` | Files touched per commit |
 | **29** | `m_bridge_commit_tag`| `(commit_id, vid, fid, tag_id)` | `("commit_id", "tag_id")` | `False` | `False` | `False` | Code tags modified per commit |
 | **30** | `m_moved_tag` | `(s_tag_id, e_tag_id)` | `("s_tag_id", "e_tag_id")` | `False` | `False` | `False` | Tag history & cross-version evolution tracking |
-| **31** | `m_symbol_def` | `(def_id, vid, fid, tag_id, ast_id, name, type_id, line_s, line_e)` | `("def_id",)` | `False` | `True` | `False` | Authoritative Symbol Definition Registry (version-scoped) |
+| **31** | `m_symbol_def` | `(def_id, vid, fid, tag_id, ast_id, name, type_id, line_s, line_e)` | `("def_id",)` | `False` | `True` | `False` | Authoritative Symbol Definition Registry (version-scoped; indexes C, Assembly, and Rust symbols) |
 | **32** | `m_symbol_ref` | `(ref_id, vid, fid, tag_id, ast_id, role, line, char_s)` | `("ref_id",)` | `False` | `False` | `False` | Symbol Declarations & Usages Reference Index (version-scoped) |
 | **33** | `m_file_reference` | `(ref_id, vid, source_fid, target_fnid, ref_type, line_no, details)` | `("ref_id",)` | `False` | `False` | `False` | Cross-File Usage & Dependency Index (`Include`=1, `Kconfig`=2, `Kbuild`=3, `Makefile`=4, `Documentation`=5) (version-scoped) |
+| **34** | `m_db_instance` | `(instance_hash, created_at)` | `("instance_hash",)` | `True` | `False` | `False` | Database Instance Lifecycle & Fingerprint |
+| **35** | `m_ast_attribute` | `(ast_id, priority, name, val)` | `("ast_id", "priority")` | `False` | `False` | `False` | AST Compiler & Kernel Attributes (`section`, `aligned`, `read_mostly`, `init`, etc.) |
 
 ---
 

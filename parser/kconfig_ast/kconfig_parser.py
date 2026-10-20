@@ -156,6 +156,7 @@ class KconfigComment:
 class KconfigSource:
     path: str
     is_rsource: bool = False
+    is_osource: bool = False
     line_s: int = 0
     char_s: int = 0
     line_e: int = 0
@@ -248,8 +249,8 @@ class KconfigParser:
             return self._parse_if()
         elif tok.type == TokenType.COMMENT:
             return self._parse_comment()
-        elif tok.type in (TokenType.SOURCE, TokenType.RSOURCE):
-            return self._parse_source(is_rsource=(tok.type == TokenType.RSOURCE))
+        elif tok.type in (TokenType.SOURCE, TokenType.RSOURCE, TokenType.OSOURCE):
+            return self._parse_source(is_rsource=(tok.type == TokenType.RSOURCE), is_osource=(tok.type == TokenType.OSOURCE))
         elif tok.type == TokenType.HELP:
             self._advance()
             self._skip_newlines()
@@ -317,6 +318,7 @@ class KconfigParser:
             TokenType.COMMENT,
             TokenType.SOURCE,
             TokenType.RSOURCE,
+            TokenType.OSOURCE,
             TokenType.MAINMENU,
             TokenType.EOF,
         ):
@@ -609,8 +611,8 @@ class KconfigParser:
         comment.raw_code = self._extract_raw(comment.line_s, comment.line_e)
         return comment
 
-    def _parse_source(self, is_rsource: bool) -> KconfigSource:
-        start_tok = self._advance()  # 'source' or 'rsource'
+    def _parse_source(self, is_rsource: bool, is_osource: bool = False) -> KconfigSource:
+        start_tok = self._advance()  # 'source', 'rsource', or 'osource'
         path_str = ""
         if self._current().type in (TokenType.CONST_STRING, TokenType.SYMBOL):
             path_str = self._advance().value
@@ -619,6 +621,7 @@ class KconfigParser:
         return KconfigSource(
             path=path_str,
             is_rsource=is_rsource,
+            is_osource=is_osource,
             line_s=start_tok.line,
             char_s=start_tok.col,
             line_e=start_tok.end_line,

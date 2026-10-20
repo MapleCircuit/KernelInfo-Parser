@@ -129,6 +129,23 @@ CS.store(m_map_ast.set(tag_ref, 1, 1, rel_line_e, rel_char_e, ast_ref))
 CS.store(m_bridge_map.set(tag_ref, tag_ref))
 ```
 
+### 2.4. Cross-Language Definition Indexing (`m_symbol_def`)
+Rust definition symbols (`Rust_Fn`, `Rust_Struct`, `Rust_Enum`, `Rust_Trait`) are staged into `m_symbol_def` (Table 31) across both top-level and nested constructs (such as methods in `impl` blocks or functions in `mod` blocks):
+```python
+with CS(REF_POS):
+    CS.store(m_symbol_def.set(
+        None,                                        # def_id (AUTO_INCREMENT)
+        CS.gp.VID,                                   # vid
+        ((m_file.table_id, 0), OP_REF, (REF_ROOT,)), # fid reference
+        actual_tag,                                  # tag_id (new tag_ref or recycled prior_tag_id)
+        node.ast_ref,                                # ast_id reference
+        safe_name,                                   # symbol name (e.g. "KernelBuffer", "reset")
+        int(node.ast_type),                          # type_id (ASTT.Rust_Fn, Rust_Struct, etc.)
+        node.extent.line_pos[0],                     # line_s
+        node.extent.line_pos[1],                     # line_e
+    ))
+```
+
 ---
 
 ## 3. Construct Taxonomy & Grammar

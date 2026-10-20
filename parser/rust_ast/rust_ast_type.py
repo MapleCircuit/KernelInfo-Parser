@@ -35,6 +35,7 @@ from core.DBLayout import (
     m_ast_hash,
     m_tag_code,
     m_moved_tag,
+    m_symbol_def,
 )
 from core.globalstuff import compute_code_hash
 
@@ -132,7 +133,34 @@ class Ast_Rust:
                 ))
                 ast_ref = ((m_ast.table_id, 0), OP_REF, (REF_POS, CS.route[-1]))
 
+        self.ast_ref = ast_ref
         return ast_ref
+
+    def stage_symbol_defs(self, CS: ChangeSetType, current_tag: Any) -> None:
+        """Stage definition symbols (Rust_Fn, Rust_Struct, Rust_Enum, Rust_Trait) into m_symbol_def."""
+        _RUST_DEF_TYPES = (
+            ASTT.Rust_Fn,
+            ASTT.Rust_Struct,
+            ASTT.Rust_Enum,
+            ASTT.Rust_Trait,
+        )
+        if self.ast_type in _RUST_DEF_TYPES and self.name and getattr(self, "ast_ref", None) is not None:
+            safe_name = str(self.name)[:255]
+            with CS(REF_POS):
+                CS.store(m_symbol_def.set(
+                    None,
+                    CS.gp.VID,
+                    ((m_file.table_id, 0), OP_REF, (REF_ROOT,)),
+                    current_tag,
+                    self.ast_ref,
+                    safe_name,
+                    int(self.ast_type),
+                    self.extent.line_pos[0],
+                    self.extent.line_pos[1],
+                ))
+        for child in self.children:
+            if hasattr(child, "stage_symbol_defs"):
+                child.stage_symbol_defs(CS, current_tag)
 
     def extract(self, CS: ChangeSetType) -> None:
         """Extract this top-level AST construct (AST + tag + bridge_tag + map_ast)."""
@@ -174,6 +202,7 @@ class Ast_Rust:
                         self.extent.char_pos[1],
                     ))
                     self.map_ast(CS, ast_ref, prior_tag_id, self.extent)
+                    self.stage_symbol_defs(CS, prior_tag_id)
                     return
             else:
                 for x, tag in enumerate(CS.prior_tags):
@@ -193,6 +222,7 @@ class Ast_Rust:
                             self.extent.char_pos[1],
                         ))
                         self.map_ast(CS, ast_ref, tag[1], self.extent)
+                        self.stage_symbol_defs(CS, tag[1])
                         return
 
         from parser.c_ast import match_prior_tag_transition
@@ -218,6 +248,7 @@ class Ast_Rust:
 
         # Stage Spatial Map and Bridge Map
         self.map_ast(CS, ast_ref, tag_ref, self.extent)
+        self.stage_symbol_defs(CS, tag_ref)
 
     def map_ast(
         self,
