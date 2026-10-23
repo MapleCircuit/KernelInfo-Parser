@@ -457,25 +457,34 @@ class MariaDB(BaseDBEngine):
             tables = (tables,)
 
         self.check_if_connected()
-
-        for table in tables:
-            sql_table = f"CREATE TABLE {table.table_name} "
-            sql_table += f"({', '.join(map(' '.join, table.init_columns))} "
-            sql_table += f", PRIMARY KEY ({', '.join(table.init_primary)}) "
-            if table.init_foreign:
-                sql_table += " ".join(
-                    f",FOREIGN KEY ({x[0]}) REFERENCES {x[1]}({x[2]})" for x in table.init_foreign
-                )
-            sql_table += ")"
-            if G.OVERRIDE_TABLE_CREATION_PRINT:
-                print(f"Created table:{table.table_name}")
-                print(sql_table)
-            self.check_if_connected()
-            self.cursor.execute(sql_table)
-            if table.initial_insert:
-                self.insert(table, table.initial_insert)
-
-        self.cnx.commit()
+        self.cursor.execute("SET foreign_key_checks = 0;")
+        try:
+            for table in tables:
+                sql_table = f"CREATE TABLE {table.table_name} "
+                sql_table += f"({', '.join(map(' '.join, table.init_columns))} "
+                sql_table += f", PRIMARY KEY ({', '.join(table.init_primary)}) "
+                if getattr(table, "unique_keys", None):
+                    for uk in table.unique_keys:
+                        sql_table += f", UNIQUE KEY ({', '.join(uk)}) "
+                if getattr(table, "indexes", None):
+                    for idx_name, idx_cols in table.indexes:
+                        sql_table += f", INDEX {idx_name} ({', '.join(idx_cols)}) "
+                if table.init_foreign:
+                    sql_table += " ".join(
+                        f",FOREIGN KEY ({x[0]}) REFERENCES {x[1]}({x[2]})" for x in table.init_foreign
+                    )
+                sql_table += ")"
+                if G.OVERRIDE_TABLE_CREATION_PRINT:
+                    print(f"Created table:{table.table_name}")
+                    print(sql_table)
+                self.check_if_connected()
+                self.cursor.execute(sql_table)
+                if table.initial_insert:
+                    self.insert(table, table.initial_insert)
+            self.cnx.commit()
+        finally:
+            self.cursor.execute("SET foreign_key_checks = 1;")
+            self.cnx.commit()
 
     def get_next_id(self, table: Table) -> int:
         """Query current maximum primary key sequence ID for target table.
@@ -543,6 +552,8 @@ class MariaDB(BaseDBEngine):
                     return
                 except mysql.connector.Error as err:
                     if getattr(err, "errno", None) == 1062 or "duplicate entry" in str(err).lower():
+                        if getattr(table, "idempotent_pk", False):
+                            return
                         raise ValueError(f"Duplicate entry for primary key in table '{table.table_name}': {err}") from err
                     # Adaptive bisection on packet too large (errno 1153)
                     if (getattr(err, "errno", None) == 1153 or "max_allowed_packet" in str(err).lower()) and len(chunk_data) > 1:
@@ -1181,6 +1192,10 @@ class MariaDB(BaseDBEngine):
                     where_clauses.append("`vid` >= %s")
                 elif "vid_s" in col_names:
                     where_clauses.append("`vid_s` >= %s")
+                elif "blob_id" in col_names:
+                    where_clauses.append("`blob_id` >= %s")
+                elif "commit_id" in col_names:
+                    where_clauses.append("`commit_id` >= %s")
 
             if where_clauses:
                 sql += " WHERE " + " AND ".join(where_clauses)

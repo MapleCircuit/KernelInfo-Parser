@@ -11,6 +11,7 @@ import copy
 import json
 import logging
 import os
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -40,6 +41,8 @@ DEFAULT_CONFIG: dict[str, dict[str, Any]] = {
         "fidelity": True,
         "mem_max": 60,
         "hugepages": "auto",
+        "single_version": False,
+        "include_pre_releases": True,
     },
     "ssh_tunnel": {
         "enabled": False,
@@ -54,7 +57,16 @@ DEFAULT_CONFIG: dict[str, dict[str, Any]] = {
         "strict_host_key_checking": "accept-new",
         "connect_timeout": 10,
     },
+    "workspace": {
+        "repos_dir": "repos",
+        "auto_detect_repos": True,
+    },
+    # Populated by sync_repositories() from Git repositories found under workspace.repos_dir
+    "repositories": [],
 }
+
+# Keys every repositories[] entry carries once detected (see detect_repository())
+REPOSITORY_KEYS = ("name", "path", "project", "default_branch", "git_url", "root_commit", "start_ref", "enabled")
 
 _ACTIVE_CONFIG: dict[str, dict[str, Any]] | None = None
 _LOADED_CONFIG_PATH: Path | None = None
@@ -349,11 +361,215 @@ def get_ssh_tunnel_config() -> dict[str, Any]:
     return get_config().get("ssh_tunnel", copy.deepcopy(DEFAULT_CONFIG["ssh_tunnel"]))
 
 
+def get_workspace_config() -> dict[str, Any]:
+    """Retrieve active workspace configuration section."""
+    return get_config().get("workspace", copy.deepcopy(DEFAULT_CONFIG["workspace"]))
+
+
+def get_repos_dir() -> Path:
+    """Absolute directory scanned for Git repositories (workspace.repos_dir, relative to REPO_ROOT)."""
+    raw = os.path.expanduser(str(get_workspace_config().get("repos_dir") or "repos"))
+    path = Path(raw)
+    return path if path.is_absolute() else REPO_ROOT / path
+
+
+def resolve_repo_path(entry: dict[str, Any]) -> Path:
+    """Absolute path of a repositories[] entry (relative paths resolve against REPO_ROOT)."""
+    path = Path(os.path.expanduser(str(entry.get("path") or "")))
+    return path if path.is_absolute() else REPO_ROOT / path
+
+
+def _git_out(repo: Path, *args: str, timeout: float = 120.0) -> str:
+    """Run a read-only git command in repo, returning stripped stdout ('' on failure)."""
+    try:
+        res = subprocess.run(
+            ["git", "-C", str(repo), *args],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return res.stdout.strip() if res.returncode == 0 else ""
+
+
+def is_git_repository(path: Path) -> bool:
+    """True for a work tree (.git dir or gitfile) or a bare repository."""
+    if (path / ".git").exists():
+        return True
+    return (path / "HEAD").is_file() and (path / "objects").is_dir() and (path / "refs").is_dir()
+
+
+def detect_default_branch(repo: Path) -> str:
+    """Branch the repository tracks: checked-out branch, else origin/HEAD, else master/main."""
+    branch = _git_out(repo, "symbolic-ref", "--quiet", "--short", "HEAD")
+    if branch:
+        return branch
+    remote_head = _git_out(repo, "symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD")
+    if remote_head:
+        return remote_head.split("/", 1)[-1]
+    for candidate in ("master", "main"):
+        if _git_out(repo, "rev-parse", "--verify", "--quiet", f"refs/heads/{candidate}"):
+            return candidate
+    return "HEAD"
+
+
+def detect_root_commit(repo: Path, rev: str = "HEAD") -> str:
+    """First commit of rev's history: the parentless commit reached by following first parents."""
+    roots = _git_out(repo, "rev-list", "--max-parents=0", "--first-parent", rev).splitlines()
+    return roots[-1] if roots else ""
+
+
+_DETECTED_REPO_CACHE: dict[str, dict[str, Any]] = {}
+
+
+def detect_repository(path: Path) -> dict[str, Any]:
+    """Build a repositories[] entry for the Git repository at path (cached per path for the process)."""
+    # abspath keeps symlinked repositories addressed through repos_dir instead of their target
+    path = Path(os.path.abspath(path))
+    if str(path) in _DETECTED_REPO_CACHE:
+        return dict(_DETECTED_REPO_CACHE[str(path)])
+    try:
+        rel_path = str(path.relative_to(REPO_ROOT))
+    except ValueError:
+        rel_path = str(path)
+    branch = detect_default_branch(path)
+    root_commit = detect_root_commit(path, branch)
+    entry = {
+        "name": path.name,
+        "path": rel_path,
+        "project": path.name,
+        "default_branch": branch,
+        "git_url": _git_out(path, "config", "--get", "remote.origin.url"),
+        "root_commit": root_commit,
+        # Parsing starts from the first commit of the repository unless overridden
+        "start_ref": root_commit,
+        "enabled": True,
+    }
+    _DETECTED_REPO_CACHE[str(path)] = entry
+    return dict(entry)
+
+
+def find_repository_dirs(repos_dir: Path | None = None) -> list[Path]:
+    """Git repositories directly under repos_dir (symlinked repositories included)."""
+    base = repos_dir or get_repos_dir()
+    if not base.is_dir():
+        return []
+    return [child for child in sorted(base.iterdir()) if child.is_dir() and is_git_repository(child)]
+
+
+def detect_repositories(repos_dir: Path | None = None) -> list[dict[str, Any]]:
+    """Detect and describe every Git repository directly under repos_dir."""
+    return [detect_repository(p) for p in find_repository_dirs(repos_dir)]
+
+
+def _missing_repo_keys(entry: dict[str, Any]) -> list[str]:
+    return [k for k in REPOSITORY_KEYS if k not in entry]
+
+
+def _merge_repositories(
+    existing: list[dict[str, Any]], repo_dirs: list[Path]
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Add repositories found in repo_dirs and fill keys missing from known ones; never overwrite user values.
+
+    Git metadata is only computed for repositories that are new or incomplete.
+    """
+    merged = [dict(e) for e in existing if isinstance(e, dict)]
+    known = {resolve_repo_path(e).resolve(): e for e in merged if e.get("path")}
+    changes: list[str] = []
+    for repo_dir in repo_dirs:
+        entry = known.get(repo_dir.resolve())
+        if entry is None:
+            repo = detect_repository(repo_dir)
+            merged.append(repo)
+            known[repo_dir.resolve()] = repo
+            changes.append(f"added '{repo['name']}' ({repo['path']})")
+            continue
+        missing = _missing_repo_keys(entry)
+        if not missing:
+            continue
+        repo = detect_repository(repo_dir)
+        for k in missing:
+            entry[k] = repo[k]
+        changes.append(f"completed '{entry.get('name', repo['name'])}' ({', '.join(missing)})")
+    return merged, changes
+
+
+def sync_repositories(write: bool = True) -> list[dict[str, Any]]:
+    """Detect repositories under workspace.repos_dir and register them in the active config.
+
+    New repositories are appended to "repositories" and missing keys of known entries are filled.
+    With write=True the result is persisted to the loaded config file (config.json under REPO_ROOT
+    when none was loaded), preserving every other key of that file.
+    """
+    cfg = get_config()
+    merged, changes = _merge_repositories(cfg.get("repositories") or [], find_repository_dirs())
+    cfg["repositories"] = merged
+    if not changes:
+        return merged
+    for change in changes:
+        logger.info("Repository auto-detection: %s", change)
+
+    if write:
+        target = _LOADED_CONFIG_PATH or REPO_ROOT / "config.json"
+        file_data: dict[str, Any] = {}
+        if target.is_file():
+            with open(target, "r", encoding="utf-8") as f:
+                file_data = json.load(f)
+        file_data["repositories"] = merged
+        file_data.setdefault("workspace", copy.deepcopy(cfg.get("workspace", DEFAULT_CONFIG["workspace"])))
+        tmp = target.with_suffix(target.suffix + ".tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(file_data, f, indent=2)
+            f.write("\n")
+        os.replace(tmp, target)
+        logger.info("Saved %d repository entr%s to %s", len(merged), "y" if len(merged) == 1 else "ies", target)
+    return merged
+
+
+def get_repositories_config() -> list[dict[str, Any]]:
+    """Retrieve configured repositories, merged in memory with repositories detected under repos_dir."""
+    repos = get_config().get("repositories") or []
+    if _coerce_bool(get_workspace_config().get("auto_detect_repos"), True):
+        repos, _ = _merge_repositories(repos, find_repository_dirs())
+    return [r for r in repos if _coerce_bool(r.get("enabled"), True)]
+
+
+def get_repository(name_or_path: str | None = None) -> dict[str, Any] | None:
+    """Look up a repository by name or path; without an argument return the default one.
+
+    The default is the entry flagged "default": true, else the first enabled repository.
+    """
+    repos = get_repositories_config()
+    if name_or_path:
+        for r in repos:
+            if r.get("name") == name_or_path or r.get("path") == name_or_path:
+                return r
+        candidate = Path(os.path.expanduser(name_or_path))
+        candidate = candidate if candidate.is_absolute() else REPO_ROOT / candidate
+        for r in repos:
+            if resolve_repo_path(r).resolve() == candidate.resolve():
+                return r
+        return None
+    for r in repos:
+        if _coerce_bool(r.get("default"), False):
+            return r
+    return repos[0] if repos else None
+
+
+def get_default_repo_path() -> Path:
+    """Absolute path of the default repository (falls back to <repos_dir>/linux)."""
+    repo = get_repository()
+    return resolve_repo_path(repo) if repo else get_repos_dir() / "linux"
+
+
 def reset_config() -> None:
     """Reset the active configuration to uninitialized state (useful for tests)."""
     global _ACTIVE_CONFIG, _LOADED_CONFIG_PATH, _EXPORTED_ENV_VARS
     _ACTIVE_CONFIG = None
     _LOADED_CONFIG_PATH = None
+    _DETECTED_REPO_CACHE.clear()
     for k in list(_EXPORTED_ENV_VARS.keys()):
         if os.environ.get(k) == _EXPORTED_ENV_VARS[k]:
             os.environ.pop(k, None)

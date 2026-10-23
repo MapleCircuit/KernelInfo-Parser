@@ -47,6 +47,9 @@ from core.DBLayout import (
 from db_engine import MockDB
 from table_engine import TECachedDB
 from parser.raw_ast.raw_ast import raw_ast_parse, get_prior_tags, close_prior_tags
+from core.config import get_default_repo_path
+
+LINUX_REPO = str(get_default_repo_path())
 
 
 SAMPLE_DOC_TEXT = """Linux Kernel Documentation
@@ -119,7 +122,7 @@ class TestRawAstParser(unittest.TestCase):
         G.CURRENT_PARSING_FILE = file_path
 
         cs.store(m_file_name.get_set(None, cs.current_path))
-        cs.store(m_file.set(None, self.gp.VID, 0, T_RAW, "A", 0))
+        cs.store(m_file.set(None, b"\x00" * 20, T_RAW))
         cs.store(m_bridge_file.set(self.gp.VID, cs.ref(m_file_name.fnid), cs.ref(m_file.fid)))
 
         cs.parse()
@@ -135,7 +138,7 @@ class TestRawAstParser(unittest.TestCase):
         expected_hash = hashlib.sha256(SAMPLE_DOC_TEXT.encode("latin-1")).digest()
         tag_rows = [row for row in cs.cs if isinstance(row, tuple) and len(row) == 3 and row[0] == m_tag.table_id]
         self.assertEqual(len(tag_rows), 1)
-        self.assertEqual(tag_rows[0][2][3], expected_hash)
+        self.assertEqual(tag_rows[0][2][1], expected_hash)
 
     def test_raw_ast_empty_file(self) -> None:
         """Verify adding an empty 0-byte file extracts cleanly with valid extents."""
@@ -151,7 +154,7 @@ class TestRawAstParser(unittest.TestCase):
         G.CURRENT_PARSING_FILE = file_path
 
         cs.store(m_file_name.get_set(None, cs.current_path))
-        cs.store(m_file.set(None, self.gp.VID, 0, T_RAW, "A", 0))
+        cs.store(m_file.set(None, b"\x00" * 20, T_RAW))
         cs.store(m_bridge_file.set(self.gp.VID, cs.ref(m_file_name.fnid), cs.ref(m_file.fid)))
 
         cs.parse()
@@ -163,7 +166,7 @@ class TestRawAstParser(unittest.TestCase):
         empty_hash = hashlib.sha256(b"").digest()
         tag_rows = [row for row in cs.cs if isinstance(row, tuple) and len(row) == 3 and row[0] == m_tag.table_id]
         self.assertEqual(len(tag_rows), 1)
-        self.assertEqual(tag_rows[0][2][3], empty_hash)
+        self.assertEqual(tag_rows[0][2][1], empty_hash)
 
     def test_raw_ast_r100_rename_noop(self) -> None:
         """Verify exact rename (R100) performs no operations in raw_ast_parse."""
@@ -192,7 +195,7 @@ class TestRawAstParser(unittest.TestCase):
         G.CURRENT_PARSING_FILE = file_path
 
         cs1.store(m_file_name.get_set(None, cs1.current_path))
-        cs1.store(m_file.set(None, 1, 0, T_RAW, "A", 0))
+        cs1.store(m_file.set(None, b"\x00" * 20, T_RAW))
         cs1.store(m_bridge_file.set(1, cs1.ref(m_file_name.fnid), cs1.ref(m_file.fid)))
         cs1.parse()
         cs1.execute()
@@ -226,8 +229,7 @@ class TestRawAstParser(unittest.TestCase):
                 None,
                 cs2.current_path,
             ))
-            cs2.store(m_file.update(cs2.ref(m_bridge_file.fid), None, 1, None, None, "M"))
-        cs2.store(m_file.set(None, 2, 0, T_RAW, "M", 0))
+        cs2.store(m_file.set(None, b"\x00" * 20, T_RAW))
         cs2.store(m_bridge_file.set(2, cs2.ref(m_file_name.fnid), cs2.ref(m_file.fid)))
 
         cs2.parse()
@@ -244,7 +246,7 @@ class TestRawAstParser(unittest.TestCase):
         self.assertTrue(success, "ChangeSet v3.1 should execute cleanly")
 
     def test_raw_ast_modified_changed_content_creates_new_tag_and_closes_old(self) -> None:
-        """Verify modifying a file with altered content stages new tag and closes previous tag."""
+        """Verify modifying a file with altered content stages new tag and links prior tag."""
         file_path = "Documentation/config.txt"
 
         # --- Version 1 (VID = 1) ---
@@ -260,7 +262,7 @@ class TestRawAstParser(unittest.TestCase):
         G.CURRENT_PARSING_FILE = file_path
 
         cs1.store(m_file_name.get_set(None, cs1.current_path))
-        cs1.store(m_file.set(None, 1, 0, T_RAW, "A", 0))
+        cs1.store(m_file.set(None, b"\x01" * 20, T_RAW))
         cs1.store(m_bridge_file.set(1, cs1.ref(m_file_name.fnid), cs1.ref(m_file.fid)))
         cs1.parse()
         cs1.execute()
@@ -294,8 +296,7 @@ class TestRawAstParser(unittest.TestCase):
                 None,
                 cs2.current_path,
             ))
-            cs2.store(m_file.update(cs2.ref(m_bridge_file.fid), None, 1, None, None, "M"))
-        cs2.store(m_file.set(None, 2, 0, T_RAW, "M", 0))
+        cs2.store(m_file.set(None, b"\x02" * 20, T_RAW))
         cs2.store(m_bridge_file.set(2, cs2.ref(m_file_name.fnid), cs2.ref(m_file.fid)))
 
         cs2.parse()
@@ -307,13 +308,12 @@ class TestRawAstParser(unittest.TestCase):
         ]
         self.assertEqual(len(new_tag_ops), 1, "New m_tag should be created when content changed")
 
-        # Should have staged an m_tag.update closing old tag
+        # Under Git DAG architecture, prior tags are immutable (no m_tag.update)
         close_tag_ops = [
             op for op in cs2.cs
             if isinstance(op, tuple) and len(op) == 3 and op[0] == m_tag.table_id and op[1] == 2  # OP_UPDATE
         ]
-        self.assertEqual(len(close_tag_ops), 1, "Old m_tag should be updated to closed")
-        self.assertEqual(close_tag_ops[0][2][2], 1, "Old tag vid_e should be set to Old_VID (1)")
+        self.assertEqual(len(close_tag_ops), 0, "Old m_tag must not be mutated under immutable DAG")
 
         # Should have staged m_moved_tag linking prior tag to new tag
         moved_tag_ops = [
@@ -321,13 +321,13 @@ class TestRawAstParser(unittest.TestCase):
             if isinstance(op, tuple) and len(op) == 3 and op[0] == m_moved_tag.table_id and op[1] == 1  # OP_SET
         ]
         self.assertEqual(len(moved_tag_ops), 1, "m_moved_tag should be staged linking prior tag to new tag")
-        self.assertEqual(moved_tag_ops[0][2][0], close_tag_ops[0][2][0], "s_tag_id should match old tag id")
+        self.assertEqual(moved_tag_ops[0][2][0], 1, "s_tag_id should match old tag id")
 
         success = cs2.execute()
         self.assertTrue(success, "ChangeSet v3.1 should execute cleanly")
 
     def test_raw_ast_deleted_file_closes_tag(self) -> None:
-        """Verify deleting a raw file closes the prior version's tag."""
+        """Verify deleting a raw file is a clean no-op for tags under immutable Git DAG architecture."""
         file_path = "Documentation/deprecated.txt"
 
         # --- Version 1 (VID = 1) ---
@@ -343,7 +343,7 @@ class TestRawAstParser(unittest.TestCase):
         G.CURRENT_PARSING_FILE = file_path
 
         cs1.store(m_file_name.get_set(None, cs1.current_path))
-        cs1.store(m_file.set(None, 1, 0, T_RAW, "A", 0))
+        cs1.store(m_file.set(None, b"\x01" * 20, T_RAW))
         cs1.store(m_bridge_file.set(1, cs1.ref(m_file_name.fnid), cs1.ref(m_file.fid)))
         cs1.parse()
         cs1.execute()
@@ -372,17 +372,15 @@ class TestRawAstParser(unittest.TestCase):
                 None,
                 cs2.current_path,
             ))
-            cs2.store(m_file.update(cs2.ref(m_bridge_file.fid), None, 1, None, None, "D"))
 
         cs2.parse()
 
-        # Should have staged an m_tag.update closing old tag
+        # Prior tags are immutable under Git DAG architecture
         close_tag_ops = [
             op for op in cs2.cs
             if isinstance(op, tuple) and len(op) == 3 and op[0] == m_tag.table_id and op[1] == 2  # OP_UPDATE
         ]
-        self.assertEqual(len(close_tag_ops), 1, "Old m_tag should be updated to closed on deletion")
-        self.assertEqual(close_tag_ops[0][2][2], 1, "Old tag vid_e should be set to Old_VID (1)")
+        self.assertEqual(len(close_tag_ops), 0, "m_tag must not be mutated on deletion under immutable DAG")
 
         success = cs2.execute()
         self.assertTrue(success)
@@ -391,7 +389,7 @@ class TestRawAstParser(unittest.TestCase):
         """Verify fallback parsing on a real Linux git tracked raw file."""
         file_path = "README"
         full_path = os.path.join(self.temp_dir, file_path)
-        content = subprocess.check_output(["git", "-C", "linux", "show", f"v3.0:{file_path}"])
+        content = subprocess.check_output(["git", "-C", LINUX_REPO, "show", f"v3.0:{file_path}"])
         with open(full_path, "wb") as f:
             f.write(content)
 
@@ -402,7 +400,7 @@ class TestRawAstParser(unittest.TestCase):
         G.CURRENT_PARSING_FILE = file_path
 
         cs.store(m_file_name.get_set(None, cs.current_path))
-        cs.store(m_file.set(None, self.gp.VID, 0, T_RAW, "A", 0))
+        cs.store(m_file.set(None, b"\x00" * 20, T_RAW))
         cs.store(m_bridge_file.set(self.gp.VID, cs.ref(m_file_name.fnid), cs.ref(m_file.fid)))
 
         cs.parse()
@@ -430,7 +428,7 @@ class TestRawAstParser(unittest.TestCase):
         G.CURRENT_PARSING_FILE = file_path
 
         cs.store(m_file_name.get_set(None, cs.current_path))
-        cs.store(m_file.set(None, self.gp.VID, 0, type_check(file_path), "A", 0))
+        cs.store(m_file.set(None, b"\x00" * 20, type_check(file_path)))
         cs.store(m_bridge_file.set(self.gp.VID, cs.ref(m_file_name.fnid), cs.ref(m_file.fid)))
 
         cs.parse()
@@ -498,7 +496,7 @@ class TestSymlinkAliasing(unittest.TestCase):
 
         # Register target file in TE/DB
         target_fn = G.TE.set(m_file_name.table_id, (None, target_rel))[0]
-        target_f = G.TE.set(m_file.table_id, (None, 1, 0, T_RAW, "A", 0))
+        target_f = G.TE.set(m_file.table_id, (None, b"\x01" * 20, T_RAW))
         target_fid = target_f[0]
         G.TE.set(m_bridge_file.table_id, (1, target_fn, target_fid))
         G.TE.commit_all()
@@ -550,7 +548,7 @@ class TestSymlinkAliasing(unittest.TestCase):
 
         # Register target directory in TE/DB
         dir_fn = G.TE.set(m_file_name.table_id, (None, dir_rel))[0]
-        dir_f = G.TE.set(m_file.table_id, (None, 1, 0, T_DIR, "A", 0))
+        dir_f = G.TE.set(m_file.table_id, (None, b"\x02" * 20, T_DIR))
         dir_fid = dir_f[0]
         G.TE.set(m_bridge_file.table_id, (1, dir_fn, dir_fid))
         G.TE.commit_all()
@@ -624,7 +622,7 @@ class TestSymlinkAliasing(unittest.TestCase):
 
         # Setup target file fid=100 and symlink bridge in VID 1
         target_fn = G.TE.set(m_file_name.table_id, (None, "arch/arm/target.dts"))[0]
-        G.TE.set(m_file.table_id, (100, 1, 0, T_RAW, "A", 0))
+        G.TE.set(m_file.table_id, (100, b"\x03" * 20, T_RAW))
         G.TE.set(m_bridge_file.table_id, (1, target_fn, 100))
 
         sym_fn = G.TE.set(m_file_name.table_id, (None, sym_rel))[0]
@@ -647,11 +645,10 @@ class TestSymlinkAliasing(unittest.TestCase):
         self.assertTrue(cs_del.execute())
         G.TE.commit_all()
 
-        # Target file (fid=100) must remain open (vid_e == 0, e_stat == 0)
-        target_f_row = m_file.get(100, None, None, None, None, None)
+        # Target file (fid=100) must remain present in m_file
+        target_f_row = m_file.get(100, None, None)
         self.assertIsNotNone(target_f_row)
-        self.assertEqual(target_f_row[2][2], 0, "Target m_file vid_e must remain 0 (open)")
-        self.assertEqual(target_f_row[2][5], 0, "Target m_file e_stat must remain 0 (not closed with 'D')")
+        self.assertEqual(target_f_row[2][0], 100, "Target m_file fid must remain valid")
 
     def test_symlink_topological_commit_ordering(self) -> None:
         """Verify processing_symlinks does not flush m_bridge_file prematurely before commit_all."""
@@ -671,7 +668,7 @@ class TestSymlinkAliasing(unittest.TestCase):
 
         # Target file registered and committed
         target_fn = G.TE.set(m_file_name.table_id, (None, target_rel))[0]
-        target_f = G.TE.set(m_file.table_id, (None, 1, 0, T_RAW, "A", 0))
+        target_f = G.TE.set(m_file.table_id, (None, b"\x04" * 20, T_RAW))
         target_fid = target_f[0]
         G.TE.set(m_bridge_file.table_id, (1, target_fn, target_fid))
         G.TE.commit_all()
@@ -728,7 +725,7 @@ class TestSymlinkAliasing(unittest.TestCase):
         os.symlink("../../platform/generic/system.dts", symlink_full)
 
         target_fn = G.TE.set(m_file_name.table_id, (None, target_rel))[0]
-        target_f = G.TE.set(m_file.table_id, (None, 1, 0, T_RAW, "A", 0))
+        target_f = G.TE.set(m_file.table_id, (None, b"\x05" * 20, T_RAW))
         target_fid = target_f[0]
         G.TE.set(m_bridge_file.table_id, (1, target_fn, target_fid))
 

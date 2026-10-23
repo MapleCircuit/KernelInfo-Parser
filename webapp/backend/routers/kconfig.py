@@ -23,7 +23,9 @@ def get_kconfig_tree(
 
 
 @router.get("/kconfig/symbol")
+@router.get("/version/{version_name}/kconfig/symbol")
 @router.get("/kconfig/{version_name}/symbol/{symbol_name}")
+@router.get("/version/{version_name}/kconfig/symbol/{symbol_name}")
 def get_kconfig_symbol(version: str = Query("v3.0"), name: str = Query(None), version_name: str | None = None, symbol_name: str | None = None) -> dict[str, Any]:
     """Retrieve symbol details, depends_on expressions, and reverse selects."""
     v = version_name or version
@@ -62,16 +64,19 @@ def get_defconfig_content(
 
 @router.get("/kconfig/graph")
 @router.get("/kconfig/{version_name}/graph")
+@router.get("/version/{version_name}/kconfig/graph")
+@router.get("/version/{version_name}/kconfig/graph/{symbol_name}")
 def get_kconfig_graph(
     version: str = Query("v3.0"),
     arch: str = Query("x86"),
     version_name: str | None = None,
     symbol: str | None = Query(None),
+    symbol_name: str | None = None,
     depth: int = Query(2),
 ) -> dict[str, Any]:
     """Extract full architecture dependency graph for client-side engine caching."""
     v = version_name or version
-    sym_or_arch = symbol or arch
+    sym_or_arch = symbol_name or symbol or arch
     return kconfig_service.get_graph(v, sym_or_arch, depth)
 
 
@@ -95,18 +100,61 @@ def autosolve_kconfig_get(
     return kconfig_service.autosolve(version_name, {"target_symbol": symbol})
 
 
-@router.post("/kconfig/{version_name}/diff")
-@router.post("/version/{version_name}/kconfig/diff")
-def diff_kconfig(
-    payload: dict[str, Any] = Body(...),
-    version_name: str = "v3.0",
-) -> dict[str, Any]:
-    """Compare active vs target Kconfig symbol values."""
-    return kconfig_service.diff_configurations(version_name, payload)
-
 
 @router.get("/kconfig/{version_name}/presets")
 @router.get("/version/{version_name}/kconfig/presets")
+@router.get("/version/{version_name}/kconfig/env-presets")
 def get_kconfig_presets(version_name: str = "v3.0") -> dict[str, Any]:
     """Retrieve preconfigured environment target presets (e.g. Tiny, Server, Security)."""
     return kconfig_service.get_env_presets(version_name)
+
+
+@router.get("/kconfig/{version_name}/search")
+@router.get("/version/{version_name}/kconfig/search")
+def search_kconfig_symbols(
+    version_name: str = "v3.0",
+    q: str = Query(""),
+    limit: int = Query(25),
+) -> dict[str, Any]:
+    """Search Kconfig symbols by name or prompt."""
+    return kconfig_service.search_symbols(version_name, q=q, limit=limit)
+
+
+@router.post("/kconfig/{version_name}/import")
+@router.post("/version/{version_name}/kconfig/import")
+def import_kconfig(
+    payload: dict[str, Any] = Body(...),
+    version_name: str = "v3.0",
+) -> dict[str, Any]:
+    """Parse raw configuration text into validated assignments."""
+    return kconfig_service.import_file(version_name, payload)
+
+
+@router.post("/kconfig/{version_name}/export")
+@router.post("/version/{version_name}/kconfig/export")
+def export_kconfig(
+    payload: dict[str, Any] = Body(...),
+    version_name: str = "v3.0",
+) -> dict[str, Any]:
+    """Format symbol assignments into standard Linux .config syntax."""
+    return kconfig_service.export_file(version_name, payload)
+
+
+@router.post("/kconfig/{version_name}/validate")
+@router.post("/version/{version_name}/kconfig/validate")
+def validate_kconfig(
+    payload: dict[str, Any] = Body(...),
+    version_name: str = "v3.0",
+) -> dict[str, Any]:
+    """Check assignments against select/depends constraints (forced, adjusted and conflicting symbols)."""
+    return kconfig_service.validate_assignments(version_name, payload)
+
+
+@router.post("/kconfig/{version_name}/diff-config")
+@router.post("/version/{version_name}/kconfig/diff-config")
+def diff_kconfig_configs(
+    payload: dict[str, Any] = Body(...),
+    version_name: str = "v3.0",
+) -> dict[str, Any]:
+    """Compare two configurations ({active_config, custom_config})."""
+    return kconfig_service.diff_configurations(version_name, payload)

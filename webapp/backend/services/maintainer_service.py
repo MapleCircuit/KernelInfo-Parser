@@ -1,5 +1,6 @@
 """webapp/backend/services/maintainer_service.py - Subsystems Catalog, Maintainers Roster & CREDITS."""
 from __future__ import annotations
+from webapp.backend.config import RepoScopedCache
 from datetime import datetime, timezone
 from typing import Any
 from fastapi import HTTPException
@@ -18,8 +19,8 @@ from parser.maintainer_ast.maintainer_types import (
 )
 from parser.maintainer_ast.maintainer_matcher import MaintainerMatcher
 
-_MAINTAINER_CACHE: dict[str, tuple[list[MaintainerSection], MaintainerMatcher]] = {}
-_FILE_SUBSYSTEMS_CACHE: dict[tuple[str, str], list[dict[str, Any]]] = {}
+_MAINTAINER_CACHE: dict[str, tuple[list[MaintainerSection], MaintainerMatcher]] = RepoScopedCache()
+_FILE_SUBSYSTEMS_CACHE: dict[tuple[str, str], list[dict[str, Any]]] = RepoScopedCache()
 
 
 class MaintainerService:
@@ -37,9 +38,9 @@ class MaintainerService:
             sql = """
                 SELECT s.sec_id, s.name, s.status, s.scm_tree, s.web_page, s.mailing_list
                 FROM m_maintainer_section s
-                WHERE s.vid_s <= %s AND (s.vid_e >= %s OR s.vid_e = 0)
+                WHERE s.sec_id > 0
             """
-            params: list[Any] = [vid, vid]
+            params: list[Any] = []
             if clean_q:
                 sql += """
                     AND (
@@ -130,22 +131,20 @@ class MaintainerService:
                     EXISTS(SELECT 1 FROM m_commit com WHERE com.author_id = p.person_id) AS has_commits
                 FROM m_maintainer_person p
                 LEFT JOIN m_maintainer_member m ON p.person_id = m.person_id
-                LEFT JOIN m_maintainer_section s ON m.sec_id = s.sec_id AND s.vid_s <= %s AND (s.vid_e >= %s OR s.vid_e = 0)
+                LEFT JOIN m_maintainer_section s ON m.sec_id = s.sec_id AND s.sec_id > 0
             """
-            params: list[Any] = [vid, vid]
+            params: list[Any] = []
 
-            where_clauses = []
+            where_clauses = ["p.person_id > 0"]
             if clean_q:
                 where_clauses.append("(LOWER(p.name) LIKE LOWER(%s) OR LOWER(p.email) LIKE LOWER(%s))")
                 like_str = f"%{clean_q}%"
                 params.extend([like_str, like_str])
 
             if clean_role == "maintainer":
-                where_clauses.append("EXISTS (SELECT 1 FROM m_maintainer_member mem JOIN m_maintainer_section sec ON mem.sec_id = sec.sec_id WHERE mem.person_id = p.person_id AND mem.role_type = 1 AND sec.vid_s <= %s AND (sec.vid_e >= %s OR sec.vid_e = 0))")
-                params.extend([vid, vid])
+                where_clauses.append("EXISTS (SELECT 1 FROM m_maintainer_member mem JOIN m_maintainer_section sec ON mem.sec_id = sec.sec_id WHERE mem.person_id = p.person_id AND mem.role_type = 1 AND sec.sec_id > 0)")
             elif clean_role == "reviewer":
-                where_clauses.append("EXISTS (SELECT 1 FROM m_maintainer_member mem JOIN m_maintainer_section sec ON mem.sec_id = sec.sec_id WHERE mem.person_id = p.person_id AND mem.role_type = 2 AND sec.vid_s <= %s AND (sec.vid_e >= %s OR sec.vid_e = 0))")
-                params.extend([vid, vid])
+                where_clauses.append("EXISTS (SELECT 1 FROM m_maintainer_member mem JOIN m_maintainer_section sec ON mem.sec_id = sec.sec_id WHERE mem.person_id = p.person_id AND mem.role_type = 2 AND sec.sec_id > 0)")
             elif clean_role == "credits":
                 where_clauses.append("EXISTS (SELECT 1 FROM m_credits_entry c WHERE c.person_id = p.person_id)")
 
@@ -216,20 +215,20 @@ class MaintainerService:
                     """
                     SELECT s.sec_id, s.name, s.status, s.scm_tree, s.web_page, s.mailing_list
                     FROM m_maintainer_section s
-                    WHERE s.vid_s <= %s AND (s.vid_e >= %s OR s.vid_e = 0) AND (s.sec_id = %s OR s.name = %s)
+                    WHERE s.sec_id > 0 AND (s.sec_id = %s OR s.name = %s)
                     LIMIT 1;
                     """,
-                    (vid, vid, int(sec_param), sec_param),
+                    (int(sec_param), sec_param),
                 )
             else:
                 cursor.execute(
                     """
                     SELECT s.sec_id, s.name, s.status, s.scm_tree, s.web_page, s.mailing_list
                     FROM m_maintainer_section s
-                    WHERE s.vid_s <= %s AND (s.vid_e >= %s OR s.vid_e = 0) AND s.name = %s
+                    WHERE s.sec_id > 0 AND s.name = %s
                     LIMIT 1;
                     """,
-                    (vid, vid, sec_param),
+                    (sec_param,),
                 )
             sec_row = cursor.fetchone()
             if not sec_row:
@@ -286,13 +285,12 @@ class MaintainerService:
                 """
                 SELECT DISTINCT fn.fname
                 FROM m_maintainer_file mf
-                JOIN m_bridge_file bf ON mf.fid = bf.fid AND bf.vid = mf.vid
-                JOIN m_file_name fn ON bf.fnid = fn.fnid
-                WHERE mf.vid = %s AND mf.sec_id = %s
+                JOIN m_file_name fn ON mf.fnid = fn.fnid
+                WHERE mf.sec_id = %s
                 ORDER BY fn.fname ASC
                 LIMIT 500;
                 """,
-                (vid, sec_id),
+                (sec_id,),
             )
             files = [{"fname": safe_decode(r["fname"])} for r in cursor.fetchall()]
 
@@ -516,13 +514,11 @@ class MaintainerService:
         with get_db_cursor() as cursor:
             cursor.execute(
                 """
-                SELECT s.sec_id, s.name, s.status, s.scm_tree, s.web_page, s.mailing_list, s.vid_s
+                SELECT s.sec_id, s.name, s.status, s.scm_tree, s.web_page, s.mailing_list
                 FROM m_maintainer_section s
-                JOIN m_v_main v ON (s.vid_s <= v.vid AND (s.vid_e = 0 OR s.vid_e >= v.vid))
-                WHERE v.vname = %s
-                ORDER BY s.vid_s DESC, s.sec_id ASC;
-                """,
-                (version_name,),
+                WHERE s.sec_id > 0
+                ORDER BY s.sec_id ASC;
+                """
             )
             sec_rows = cursor.fetchall()
             sec_map: dict[int, MaintainerSection] = {}

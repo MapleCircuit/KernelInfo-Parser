@@ -219,7 +219,7 @@ def clone_table_for_testing(table: Table, prefix: str = "t_") -> Table:
     if isinstance(new_hashing, str):
         new_hashing = prefix + (new_hashing[2:] if new_hashing.startswith("m_") else new_hashing)
 
-    return Table(
+    new_table = Table(
         table_id=table.table_id,
         table_name=new_name,
         columns=table.init_columns,
@@ -230,7 +230,19 @@ def clone_table_for_testing(table: Table, prefix: str = "t_") -> Table:
         te_cached=table.te_cached,
         version_scoped=table.version_scoped,
         hashing_table=new_hashing,
+        indexes=getattr(table, "indexes", ()),
+        unique_keys=getattr(table, "unique_keys", ()),
+        idempotent_pk=getattr(table, "idempotent_pk", False),
+        blob_scoped=getattr(table, "blob_scoped", False),
     )
+    for attr in ("fid", "vid", "vname", "vid_s", "vid_e", "s_fid", "e_fid"):
+        if hasattr(table, attr):
+            val = getattr(table, attr)
+            if isinstance(val, tuple) and len(val) == 2 and isinstance(val[0], int):
+                setattr(new_table, attr, (new_table.table_id, val[1]))
+            else:
+                setattr(new_table, attr, val)
+    return new_table
 
 
 class TestTableCollection:
@@ -241,6 +253,18 @@ class TestTableCollection:
         self.tables_list: list[Table] = [clone_table_for_testing(t, prefix=prefix) for t in gp.TABLES]
         self.tables_by_name: dict[str, Table] = {t.table_name: t for t in self.tables_list}
         self.tables_by_id: dict[int, Table] = {t.table_id: t for t in self.tables_list}
+
+        # Backward compatibility aliases for cloned test tables
+        compat_aliases = {
+            f"{prefix}file": f"{prefix}file_blob",
+            f"{prefix}bridge_file": f"{prefix}bridge_checkpoint",
+            f"{prefix}v_main": f"{prefix}git_ref",
+            f"{prefix}moved_file": f"{prefix}blob_transition",
+            f"{prefix}bridge_commit_file": f"{prefix}commit_file",
+        }
+        for alias_name, target_name in compat_aliases.items():
+            if target_name in self.tables_by_name:
+                self.tables_by_name[alias_name] = self.tables_by_name[target_name]
 
     def __getitem__(self, name_or_id: str | int) -> Table:
         if isinstance(name_or_id, int):

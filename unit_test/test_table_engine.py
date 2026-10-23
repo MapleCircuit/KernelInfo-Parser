@@ -254,18 +254,18 @@ class GenericTableEngineTestCase:
     @test_feature("set_and_get_staged", depends_on=["lifecycle_and_init"])
     def test_02_set_and_get_staged(self) -> None:
         """Verify set() stages row in memory and get() resolves it without DB queries."""
-        t_ver = self.test_tables.t_v_main
+        t_fn = self.test_tables.t_file_name
 
         with test_step("Calling set() with auto-increment generation (None at PK position)"):
-            row = self.te.set(t_ver.table_id, (None, "v3.0"))
-            self.assertEqual(row, (1, "v3.0"))
+            row = self.te.set(t_fn.table_id, (None, "kernel/sched.c"))
+            self.assertEqual(row, (1, "kernel/sched.c"))
 
         with test_step(
             "Calling get() to query staged row by primary key",
             diagnostic="TableEngine must resolve newly staged rows from memory without issuing a DB select query.",
         ):
-            queried = self.te.get(t_ver.table_id, (1, None))
-            self.assertEqual(queried, (1, "v3.0"))
+            queried = self.te.get(t_fn.table_id, (1, None))
+            self.assertEqual(queried, (1, "kernel/sched.c"))
             self.assertEqual(
                 len(self.driver.select_calls),
                 0,
@@ -276,8 +276,8 @@ class GenericTableEngineTestCase:
             "Verifying emptiness guard on non-existent query",
             diagnostic="Empty table with auto-increment and next_id <= 1 must return None without querying DB.",
         ):
-            t_fn = self.test_tables.t_file_name
-            res_none = self.te.get(t_fn.table_id, (None, "non_existent_file.c"))
+            t_cred = self.test_tables.t_credits_entry
+            res_none = self.te.get(t_cred.table_id, (None, "Nobody", "nobody@kernel.org", None, None, None, None, None))
             self.assertIsNone(res_none)
 
     @test_feature("no_duplicate_deduplication", depends_on=["set_and_get_staged"])
@@ -355,19 +355,19 @@ class GenericTableEngineTestCase:
     @test_feature("update_and_staging", depends_on=["set_and_get_staged"])
     def test_05_update_and_staging(self) -> None:
         """Verify update() stages modifications and commit() flushes to db.update()."""
-        t_ver = self.test_tables.t_v_main
+        t_fn = self.test_tables.t_file_name
 
         with test_step("Staging row update via update()"):
-            self.te.update(t_ver.table_id, (1, "v3.0-modified"))
-            self.assertEqual(len(self.te.queued_update[t_ver.table_id]), 1)
+            self.te.update(t_fn.table_id, (1, "kernel/sched_modified.c"))
+            self.assertEqual(len(self.te.queued_update[t_fn.table_id]), 1)
 
         with test_step("Flushing update via commit()"):
-            self.te.commit(t_ver.table_id)
+            self.te.commit(t_fn.table_id)
             self.assertEqual(len(self.driver.updates), 1)
             tbl_name, payload = self.driver.updates[0]
-            self.assertEqual(tbl_name, t_ver.table_name)
-            self.assertEqual(payload, ((1, "v3.0-modified"),))
-            self.assertEqual(len(self.te.queued_update[t_ver.table_id]), 0)
+            self.assertEqual(tbl_name, t_fn.table_name)
+            self.assertEqual(payload, ((1, "kernel/sched_modified.c"),))
+            self.assertEqual(len(self.te.queued_update[t_fn.table_id]), 0)
 
     @test_feature("cross_chunk_deduplication", depends_on=["no_duplicate_deduplication"])
     def test_06_cross_chunk_deduplication(self) -> None:
@@ -412,21 +412,21 @@ class GenericTableEngineTestCase:
         )
 
         with test_step("Executing view_set with concatenated multi-table columns"):
-            # Columns: 6 columns for t_file + 3 columns for t_bridge = 9 columns
-            # t_file: (fid (None), vid_s, vid_e, ftype, s_stat, e_stat)
-            # t_bridge: (vid, fnid, fid (None))
-            file_cols = [None, 1, 0, 1, "M", "M"]
+            # Columns: 3 columns for t_file + 3 columns for t_bridge = 6 columns
+            # t_file: (blob_id (None), blob_hash, ftype)
+            # t_bridge: (commit_id, fnid, blob_id (None))
+            file_cols = [None, b"\xaa" * 20, 1]
             bridge_cols = [1, 10, None]
             joined_cols = tuple(file_cols + bridge_cols)
 
             result = self.te.view_set(joins, joined_cols)
             self.assertIsNotNone(result)
             self.assertEqual(result[0], 1, "Expected view_id 1 assigned to t_file PK")
-            self.assertEqual(result[8], 1, "Expected view_id 1 decomposed into t_bridge fid position")
+            self.assertEqual(result[5], 1, "Expected view_id 1 decomposed into t_bridge blob_id position")
 
         with test_step("Verifying constituent rows were decomposed and staged in queued_set"):
-            self.assertIn(1, self.te.queued_set[t_file.table_id])
-            self.assertEqual(self.te.queued_set[t_file.table_id][1], (1, 1, 0, 1, "M", "M"))
+            self.assertIn((b"\xaa" * 20, 1), self.te.queued_set[t_file.table_id])
+            self.assertEqual(self.te.queued_set[t_file.table_id][(b"\xaa" * 20, 1)], 1)
             self.assertIn((1, 10), self.te.queued_set[t_bridge.table_id])
             self.assertEqual(self.te.queued_set[t_bridge.table_id][(1, 10)], (1, 10, 1))
 
@@ -495,26 +495,26 @@ class GenericTableEngineTestCase:
     @test_feature("commit_all_parallel_dispatch", depends_on=["set_and_get_staged"])
     def test_10_commit_all_parallel_dispatch(self) -> None:
         """Verify commit_all() flushes multi-table staged buffers via db.commit_tables_parallel()."""
-        t_ver = self.test_tables.t_v_main
         t_fn = self.test_tables.t_file_name
+        t_blob = self.test_tables.t_file_blob
 
         with test_step("Staging operations across multiple tables"):
-            self.te.set(t_ver.table_id, (None, "v5.0"))
             self.te.set(t_fn.table_id, (None, "lib/string.c"))
-            self.te.update(t_ver.table_id, (10, "v4.0-patch"))
+            self.te.set(t_blob.table_id, (None, b"\x11" * 20, 1))
+            self.te.update(t_fn.table_id, (10, "lib/string_opt.c"))
 
         with test_step("Calling commit_all() and asserting dispatch to commit_tables_parallel"):
             self.te.commit_all(max_workers=2)
             self.assertEqual(len(self.driver.parallel_commits), 1)
             commit_summary = self.driver.parallel_commits[0]
             comm_tbl_names = [item[0] for item in commit_summary]
-            self.assertIn(t_ver.table_name, comm_tbl_names)
             self.assertIn(t_fn.table_name, comm_tbl_names)
+            self.assertIn(t_blob.table_name, comm_tbl_names)
 
         with test_step("Verifying all queued buffers are empty after commit_all()"):
-            self.assertEqual(len(self.te.queued_set[t_ver.table_id]), 0)
             self.assertEqual(len(self.te.queued_set[t_fn.table_id]), 0)
-            self.assertEqual(len(self.te.queued_update[t_ver.table_id]), 0)
+            self.assertEqual(len(self.te.queued_set[t_blob.table_id]), 0)
+            self.assertEqual(len(self.te.queued_update[t_fn.table_id]), 0)
 
     @test_feature("cryptographic_hash_presorting", depends_on=["duplicate_primary_key_rejection"])
     def test_11_cryptographic_hash_presorting(self) -> None:
@@ -551,12 +551,12 @@ class GenericTableEngineTestCase:
         if not self.is_cached_engine:
             raise unittest.SkipTest(f"SKIPPED: Extended in-memory caching is not applicable to '{self.engine_name}'.")
 
-        t_ver = self.test_tables.t_v_main
+        t_fn = self.test_tables.t_file_name
         t_code = self.test_tables.t_tag_code
 
         with test_step("Configuring mock preloaded rows in RecordingDriver"):
             fresh_driver = RecordingDriver()
-            fresh_driver.preload_returns[t_ver.table_name] = [(1, "v3.0"), (2, "v3.1")]
+            fresh_driver.preload_returns[t_fn.table_name] = [(1, "fs/ext4/super.c"), (2, "fs/ext4/inode.c")]
             fresh_driver.preload_returns[t_code.table_name] = [(b"\x12" * 32,)]
 
         with test_step("Starting TECachedDB and asserting select_preload calls"):
@@ -565,12 +565,12 @@ class GenericTableEngineTestCase:
 
             # Assert select_preload was called for cached tables
             preload_tables = [item[0] for item in fresh_driver.preload_calls]
-            self.assertIn(t_ver.table_name, preload_tables)
+            self.assertIn(t_fn.table_name, preload_tables)
             self.assertIn(t_code.table_name, preload_tables)
 
         with test_step("Verifying preloaded rows were populated in in-memory cache and indices"):
-            cached_row = fresh_te.get(t_ver.table_id, (1, None))
-            self.assertEqual(cached_row, (1, "v3.0"))
+            cached_row = fresh_te.get(t_fn.table_id, (1, None))
+            self.assertEqual(cached_row, (1, "fs/ext4/super.c"))
             fresh_te.close()
 
     @test_feature("zero_db_queries_on_cache_hits", depends_on=["cache_preload_startup"])
@@ -579,11 +579,11 @@ class GenericTableEngineTestCase:
         if not self.is_cached_engine:
             raise unittest.SkipTest(f"SKIPPED: Extended in-memory caching is not applicable to '{self.engine_name}'.")
 
-        t_ver = self.test_tables.t_v_main
+        t_fn = self.test_tables.t_file_name
 
         with test_step("Preloading row into TECachedDB"):
             fresh_driver = RecordingDriver()
-            fresh_driver.preload_returns[t_ver.table_name] = [(10, "v4.0"), (11, "v4.1")]
+            fresh_driver.preload_returns[t_fn.table_name] = [(10, "init/main.c"), (11, "init/version.c")]
             fresh_te = self.te_class()
             fresh_te.start(self.test_tables.tables_list, lambda: fresh_driver)
 
@@ -591,16 +591,16 @@ class GenericTableEngineTestCase:
             "Querying by Primary Key asserts 0 DB select calls",
             diagnostic="Cached row lookup by primary key must hit _pk_index in O(1) without touching DB.",
         ):
-            row_pk = fresh_te.get(t_ver.table_id, (10, None))
-            self.assertEqual(row_pk, (10, "v4.0"))
+            row_pk = fresh_te.get(t_fn.table_id, (10, None))
+            self.assertEqual(row_pk, (10, "init/main.c"))
             self.assertEqual(len(fresh_driver.select_calls), 0)
 
         with test_step(
             "Querying by deduplication key (columns[1:]) asserts 0 DB select calls",
             diagnostic="Cached row lookup by unique data key must hit _nodup_index without touching DB.",
         ):
-            row_nodup = fresh_te.get(t_ver.table_id, (None, "v4.1"))
-            self.assertEqual(row_nodup, (11, "v4.1"))
+            row_nodup = fresh_te.get(t_fn.table_id, (None, "init/version.c"))
+            self.assertEqual(row_nodup, (11, "init/version.c"))
             self.assertEqual(len(fresh_driver.select_calls), 0)
 
         fresh_te.close()
@@ -611,22 +611,22 @@ class GenericTableEngineTestCase:
         if not self.is_cached_engine:
             raise unittest.SkipTest(f"SKIPPED: Extended in-memory caching is not applicable to '{self.engine_name}'.")
 
-        t_ver = self.test_tables.t_v_main
+        t_fn = self.test_tables.t_file_name
 
         with test_step("Calling set() asserts immediate availability in cache and indices"):
-            self.te.set(t_ver.table_id, (None, "v5.1"))
-            self.assertIn(1, self.te._pk_index[t_ver.table_id])
-            cached = self.te.get(t_ver.table_id, (1, None))
-            self.assertEqual(cached, (1, "v5.1"))
+            self.te.set(t_fn.table_id, (None, "kernel/panic.c"))
+            self.assertIn(1, self.te._pk_index[t_fn.table_id])
+            cached = self.te.get(t_fn.table_id, (1, None))
+            self.assertEqual(cached, (1, "kernel/panic.c"))
 
         with test_step(
             "Calling update() asserts old index values are purged and new values re-indexed",
             diagnostic="update() must call _unindex_row and _index_row to maintain index consistency.",
         ):
-            self.te.update(t_ver.table_id, (1, "v5.1-rc2"))
-            updated_row = self.te.get(t_ver.table_id, (1, None))
-            self.assertEqual(updated_row, (1, "v5.1-rc2"))
-            self.assertIn(("v5.1-rc2",), self.te._nodup_index[t_ver.table_id])
+            self.te.update(t_fn.table_id, (1, "kernel/panic_modified.c"))
+            updated_row = self.te.get(t_fn.table_id, (1, None))
+            self.assertEqual(updated_row, (1, "kernel/panic_modified.c"))
+            self.assertIn(("kernel/panic_modified.c",), self.te._nodup_index[t_fn.table_id])
 
     @test_feature("cache_purge_and_teardown", depends_on=["zero_db_queries_on_cache_hits"])
     def test_15_cache_purge_and_teardown(self) -> None:
@@ -634,11 +634,11 @@ class GenericTableEngineTestCase:
         if not self.is_cached_engine:
             raise unittest.SkipTest(f"SKIPPED: Extended in-memory caching is not applicable to '{self.engine_name}'.")
 
-        t_ver = self.test_tables.t_v_main
+        t_fn = self.test_tables.t_file_name
 
         with test_step("Populating cache and calling clear_cache()"):
-            self.te.set(t_ver.table_id, (None, "v6.0"))
-            self.assertGreater(len(self.te._cached_rows[t_ver.table_id]), 0)
+            self.te.set(t_fn.table_id, (None, "ipc/mqueue.c"))
+            self.assertGreater(len(self.te._cached_rows[t_fn.table_id]), 0)
             self.te.clear_cache()
             self.assertEqual(len(self.te._cached_rows), 0)
             self.assertEqual(len(self.te._pk_index), 0)
@@ -647,7 +647,7 @@ class GenericTableEngineTestCase:
             "Calling commit_all(update_in_mem_indexes=False) asserts immediate cache evacuation",
             diagnostic="When update_in_mem_indexes=False, TableEngine must clear in-memory caches on teardown.",
         ):
-            self.te.set(t_ver.table_id, (None, "v6.1"))
+            self.te.set(t_fn.table_id, (None, "ipc/msg.c"))
             self.te.commit_all(update_in_mem_indexes=False)
             self.assertEqual(len(self.te._cached_rows), 0)
 

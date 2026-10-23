@@ -10,7 +10,7 @@ from enum import Flag, IntEnum
 from typing import Any
 from pathlib import Path
 
-from core.globalstuff import G, ASTT, OP_REF, REF_ROOT, REF_POS, REF_NO_REF, REF_FILE, SymbolRole, compute_code_hash, normalize_repo_path
+from core.globalstuff import G, ASTT, OP_REF, REF_ROOT, REF_POS, REF_NO_REF, REF_FILE, SymbolRole, SymbolLinkage, compute_code_hash, normalize_repo_path
 from core.DBLayout import (
     m_ast,
     m_ast_container,
@@ -174,16 +174,16 @@ class Ast:
                             CS.symbol_dict[(safe_name, ASTT.CPPro_define)] = ast_id_route[1]
                             CS.symbol_dict[(safe_name, ASTT.CPPro_define_macro)] = ast_id_route[1]
                     ext = extent or self.extent
-                    vid = getattr(CS.gp, "VID", 1) if getattr(CS, "gp", None) else getattr(CS, "VID", 1)
+                    linkage = int(SymbolLinkage.MacroOrKernelDef) if type_id in (ASTT.CPPro_define, ASTT.CPPro_define_macro, ASTT.ASM_Macro) else int(SymbolLinkage.InternalStaticDef)
                     with CS(REF_POS):
                         CS.store(m_symbol_def.set(
                             None,
-                            vid,
                             ((m_file.table_id, 0), OP_REF, (REF_ROOT,)),
                             tag_ref or getattr(self, "tag_ref", 0),
                             self.ast_ref,
                             safe_name,
                             type_id,
+                            linkage,
                             ext.line_pos[0],
                             ext.line_pos[1],
                         ))
@@ -250,7 +250,7 @@ class Ast:
 
         # 3. Rule 12 Invariant: m_tag.set MUST be first inside with CS(REF_POS)
         with CS(REF_POS):
-            CS.store(m_tag.set(None, CS.gp.VID, 0, code_hash, ast_ref, 0, 0))
+            CS.store(m_tag.set(None, code_hash, ast_ref, 0, 0))
             tag_ref = ((m_tag.table_id, 0), OP_REF, (REF_POS, CS.route[-1]))
             CS.store(m_tag_code.get_set(code_hash, ext.code))
             if s_tag_id is not None:
@@ -284,10 +284,10 @@ class Ast:
                 with CS(REF_POS):
                     CS.store(m_symbol_ref.set(
                         None,
-                        CS.gp.VID,
                         ((m_file.table_id, 0), OP_REF, (REF_ROOT,)),
                         tag_ref,
                         ref_ast_id,
+                        0,
                         int(role),
                         line,
                         col,
@@ -883,16 +883,15 @@ class CPPro_define(CPPro):
                     CS.symbol_dict[(safe_name, ASTT.CPPro_define)] = ast_id_route[1]
                     CS.symbol_dict[(safe_name, ASTT.CPPro_define_macro)] = ast_id_route[1]
                 ext = self.extent
-                vid = getattr(CS.gp, "VID", 1) if getattr(CS, "gp", None) else getattr(CS, "VID", 1)
                 with CS(REF_POS):
                     CS.store(m_symbol_def.set(
                         None,
-                        vid,
                         ((m_file.table_id, 0), OP_REF, (REF_ROOT,)),
                         tag_ref or getattr(self, "tag_ref", 0),
                         self.ast_ref,
                         safe_name,
                         type_const,
+                        int(SymbolLinkage.MacroOrKernelDef),
                         ext.line_pos[0],
                         ext.line_pos[1],
                     ))
@@ -960,9 +959,13 @@ class CPPro_include(CPPro):
 
     def extract(self, CS: Any, create_tag: bool = True) -> None:
         base_dir = getattr(CS, "mfdir", None) or getattr(G, "CURRENT_PARSING_DIR", None)
-        raw_target = self.a_include if self.a_include else self.w_include
-        include_target = normalize_repo_path(raw_target, base_dir)
-        clean_target = str(include_target).strip().strip("<>\"'").strip()
+        resolved_inc = getattr(CS, "resolved_includes_by_line", {}).get(self.extent.line_pos[0])
+        if resolved_inc:
+            clean_target = resolved_inc
+        else:
+            raw_target = self.a_include if self.a_include else self.w_include
+            include_target = normalize_repo_path(raw_target, base_dir)
+            clean_target = str(include_target).strip().strip("<>\"'").strip()
         safe_target = clean_target[:255]
 
         with CS(REF_POS):

@@ -206,19 +206,16 @@ class Test_RawParserLifecycle(BaseRawParserTestCase):
             self.assertEqual(len(v_rows), 2, "Expected 2 versions in m_v_main (v2.6.39 and v3.0)")
             self.assertEqual(len(code_rows), 2, "Expected 2 m_tag_code entries across modified versions")
             self.assertEqual(len(moved_rows), 1)
-            self.assertEqual(len(tag_rows), 2, "Expected new tag and closed prior tag")
+            self.assertEqual(len(tag_rows), 2, "Expected new tag and prior tag")
 
-            # One tag must have vid_s=2, vid_e=0 (new tag)
-            new_tags = [t for t in tag_rows if t["vid_s"] == 2 and t["vid_e"] == 0]
-            self.assertEqual(len(new_tags), 1)
+            # Under immutable Git DAG architecture, m_moved_tag links prior tag to new tag
+            prior_tag_id = moved_rows[0]["s_tag_id"]
+            new_tag_id = moved_rows[0]["e_tag_id"]
+            self.assertNotEqual(prior_tag_id, new_tag_id)
 
-            # One tag must have vid_s=1, vid_e=1 (closed prior tag)
-            closed_tags = [t for t in tag_rows if t["vid_s"] == 1 and t["vid_e"] == 1]
-            self.assertEqual(len(closed_tags), 1)
-
-            # m_moved_tag links prior tag to new tag
-            self.assertEqual(moved_rows[0]["s_tag_id"], closed_tags[0]["tag_id"])
-            self.assertEqual(moved_rows[0]["e_tag_id"], new_tags[0]["tag_id"])
+            tag_ids = {t["tag_id"] for t in tag_rows}
+            self.assertIn(prior_tag_id, tag_ids)
+            self.assertIn(new_tag_id, tag_ids)
 
     @test_feature("raw_ast_exact_rename_file", depends_on=["raw_ast_added_file"])
     def test_03_exact_rename_raw_file(self) -> None:

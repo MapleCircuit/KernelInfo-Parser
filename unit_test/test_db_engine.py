@@ -219,13 +219,13 @@ class GenericDBEngineTestCase:
         t_ver = self.test_tables.t_v_main
         with test_step("Querying get_next_id for t_v_main (seeded with ID 0)"):
             next_id = self.db.get_next_id(t_ver)
-            self.assertEqual(next_id, 1, "Expected next_id to be 1 for t_v_main having seed row 0 ('latest')")
+            self.assertEqual(next_id, 1, "Expected next_id to be 1 for t_v_main having seed row 0")
 
         with test_step(
             "Inserting row ID 1 and verifying sequence increment via get_next_id",
             diagnostic="If this step fails, either insert() failed to commit or get_next_id() failed to query MAX(pk).",
         ):
-            self.db.insert(t_ver, ((1, "v3.0"),))
+            self.db.insert(t_ver, ((1, 0, 1, "v3.0", 0, None, None, None),))
             next_id_after = self.db.get_next_id(t_ver)
             self.assertEqual(next_id_after, 2, "Expected next_id to increment to 2 after inserting ID 1")
 
@@ -237,9 +237,9 @@ class GenericDBEngineTestCase:
 
         with test_step("Batch inserting multiple rows into t_v_main"):
             ver_rows = (
-                (10, "v4.0"),
-                (11, "v4.1"),
-                (12, "v4.2"),
+                (10, 0, 1, "v4.0", 0, None, None, None),
+                (11, 0, 1, "v4.1", 0, None, None, None),
+                (12, 0, 1, "v4.2", 0, None, None, None),
             )
             self.db.insert(t_ver, ver_rows)
 
@@ -261,9 +261,9 @@ class GenericDBEngineTestCase:
             "Querying single row by primary key",
             diagnostic="Failure indicates select() PK filter matching or parameterized query execution failed.",
         ):
-            row = self.db.select(t_ver, (10, None))
+            row = self.db.select(t_ver, (10,) + (None,) * 7)
             self.assertIsNotNone(row, "Expected row (10, 'v4.0') to be found by PK")
-            self.assertEqual(row, (10, "v4.0"))
+            self.assertEqual(row, (10, 0, 1, "v4.0", 0, None, None, None))
 
         with test_step(
             "Querying single row by secondary column with wildcard None in PK position",
@@ -300,8 +300,8 @@ class GenericDBEngineTestCase:
 
         with test_step("Executing batch update() with modified version names"):
             update_rows = (
-                (11, "v4.1-rc1"),
-                (12, "v4.2-final"),
+                (11, 0, 1, "v4.1-rc1", 0, None, None, None),
+                (12, 0, 1, "v4.2-final", 0, None, None, None),
             )
             self.db.update(t_ver, update_rows)
 
@@ -309,27 +309,27 @@ class GenericDBEngineTestCase:
             "Querying updated row (ID 11) to assert persisted modification",
             diagnostic="Failure indicates either update() did not perform upsert or select() returned stale data.",
         ):
-            row1 = self.db.select(t_ver, (11, None))
+            row1 = self.db.select(t_ver, (11,) + (None,) * 7)
             self.assertIsNotNone(row1)
-            self.assertEqual(row1, (11, "v4.1-rc1"))
+            self.assertEqual(row1, (11, 0, 1, "v4.1-rc1", 0, None, None, None))
 
         with test_step("Querying updated row (ID 12) to assert persisted modification"):
-            row2 = self.db.select(t_ver, (12, None))
+            row2 = self.db.select(t_ver, (12,) + (None,) * 7)
             self.assertIsNotNone(row2)
-            self.assertEqual(row2, (12, "v4.2-final"))
+            self.assertEqual(row2, (12, 0, 1, "v4.2-final", 0, None, None, None))
 
     @test_feature("select_preload", depends_on=["insert"])
     def test_09_select_preload(self) -> None:
         """Verify select_preload with column projection and version filtering."""
         t_ver = self.test_tables.t_v_main
 
-        with test_step("Executing select_preload with column projection (cached_columns=(1,))"):
-            projected = self.db.select_preload(t_ver, cached_columns=(1,))
+        with test_step("Executing select_preload with column projection (cached_columns=(3,))"):
+            projected = self.db.select_preload(t_ver, cached_columns=(3,))
             self.assertGreaterEqual(len(projected), 3, "Expected at least 3 version records in preload")
             self.assertTrue(all(len(r) == 1 for r in projected), "Expected projected rows to contain exactly 1 column")
 
         with test_step("Executing select_preload with version filtering (min_vid=11)"):
-            filtered = self.db.select_preload(t_ver, cached_columns=(0, 1), min_vid=11)
+            filtered = self.db.select_preload(t_ver, cached_columns=(0, 3), min_vid=11)
             self.assertTrue(all(r[0] >= 11 for r in filtered), "Expected all rows to satisfy vid >= 11 filter")
 
     # =========================================================================
@@ -342,10 +342,14 @@ class GenericDBEngineTestCase:
         t_sec = self.test_tables.t_maintainer_section
         t_pat = self.test_tables.t_maintainer_pattern
 
+        t_blob = self.test_tables.t_file_blob
         with test_step("Seeding parent sections and child patterns for join query"):
+            self.db.insert(t_blob, (
+                (1, b"a" * 20, 1),
+            ))
             self.db.insert(t_sec, (
-                (1, 1, 0, "EXT4 FILE SYSTEM", "Supported", "git://ext4", "https://ext4.org", "linux-ext4@vger", 0),
-                (2, 1, 0, "BTRFS FILE SYSTEM", "Maintained", "git://btrfs", "https://btrfs.org", "linux-btrfs@vger", 0),
+                (1, 1, "EXT4 FILE SYSTEM", "Supported", "git://ext4", "https://ext4.org", "linux-ext4@vger", 0),
+                (2, 1, "BTRFS FILE SYSTEM", "Maintained", "git://btrfs", "https://btrfs.org", "linux-btrfs@vger", 0),
             ))
             self.db.insert(t_pat, (
                 (1, 1, "fs/ext4/*", 10),
@@ -367,7 +371,7 @@ class GenericDBEngineTestCase:
             res_single = self.db.view_select(tables_dict, joins, tuple(query_cols))
             self.assertIsNotNone(res_single, "Expected view_select to return joined row")
             self.assertEqual(res_single[0], 1)
-            self.assertEqual(res_single[3], "EXT4 FILE SYSTEM")
+            self.assertEqual(res_single[2], "EXT4 FILE SYSTEM")
 
         with test_step("Executing joined multi-row query via view_select_multiple() matching section ID 1"):
             query_cols_multi = [None] * (t_sec.length + t_pat.length)

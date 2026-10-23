@@ -12,18 +12,16 @@ The maintainer subsystem parses two specialized root kernel documentation files:
 
 ```
 ==================================================================================================
-MAINTAINERS & CREDITS PARSING PIPELINE
+MAINTAINERS & CREDITS PARSING PIPELINE (Immutable Git DAG Content-Addressed)
 --------------------------------------------------------------------------------------------------
 Kernel Root Documentation (MAINTAINERS / CREDITS)
   │
   ├─ Git Operation: "R100" (Exact Rename) ──► No-op
   │
-  ├─ Git Operation: "D" (Deleted)
-  │  ├─ get_prior_tags(CS) ──► Queries old_vid tags via m_bridge_tag.view_get_multiple
-  │  └─ close_prior_tags(CS) ─► Closes unreferenced prior tags via m_tag.update(vid_e=Old_VID)
+  ├─ Git Operation: "D" (Deleted) ──► No-op under immutable Git DAG architecture
   │
   └─ Git Operation: "A" / "M" / "R*" (Added / Modified / Content Rename)
-     ├─ get_prior_tags(CS) (if M or R*)
+     ├─ get_prior_tags(CS) (if M or R*: queries prior tags via 11-col 2-way join m_bridge_tag -> m_tag)
      │
      ├── If MAINTAINERS -> MaintainerManager(CS):
      │     ├── MaintainerParser: Parses 3-line header blocks, section titles, and tags
@@ -32,9 +30,9 @@ Kernel Root Documentation (MAINTAINERS / CREDITS)
      │     │     └── Patterns: F (Files), X (Excludes), N (Regex), K (Keywords)
      │     └── Relational Staging:
      │           ├── AST Nodes: m_ast.view [Rule 23]
-     │           ├── Code Occurrence Tags: m_tag.set (Rule 12 order), m_tag_code, m_bridge_tag
+     │           ├── Code Occurrence Tags: m_tag.set (5-col, Rule 12 order), m_tag_code, m_bridge_tag (6-col)
      │           ├── Identities: m_maintainer_person (Table 20)
-     │           ├── Subsystems: m_maintainer_section (Table 21)
+     │           ├── Subsystems: m_maintainer_section (Table 21, 8-col with blob_ref)
      │           ├── Personnel Roles: m_maintainer_member (Table 22)
      │           └── Match Rules: m_maintainer_pattern (Table 23)
      │
@@ -42,15 +40,15 @@ Kernel Root Documentation (MAINTAINERS / CREDITS)
      │     ├── CreditsParser: Parses contributor blocks (N:, E:, W:, P:, D:, S:)
      │     └── Relational Staging:
      │           ├── Person Registry: m_maintainer_person (Table 20)
-     │           └── Contributor Biographies: m_credits_entry (Table 25)
+     │           └── Contributor Biographies: m_credits_entry (Table 25, 8-col with blob_ref)
      │
-     └─ close_prior_tags(CS) (if M or R*)
+     └─ close_prior_tags(CS) ──► No-op under immutable Git DAG architecture
   │
   ▼ [Post-Processing: processing_maintainer_files(version) (main.py + maintainer_matcher.py)]
 Subsystem File Ownership Resolution:
   ├── MaintainerMatcher: Compiles all active 'F:' and 'X:' patterns from m_maintainer_pattern
-  ├── Evaluates globs against all files active in m_bridge_file for target release version
-  └── Populates file ownership bridge: m_maintainer_file (Table 24: vid, fid, sec_id)
+  ├── Evaluates globs against all files active in repository tree for target release
+  └── Populates file ownership bridge: m_maintainer_file (Table 24: maintainers_blob_id, fnid, sec_id)
 ==================================================================================================
 ```
 
@@ -80,8 +78,6 @@ Subsystem File Ownership Resolution:
    with CS(REF_POS):
        CS.store(m_tag.set(
            None,            # tag_id (AUTO_INCREMENT)
-           CS.gp.VID,       # vid_s
-           0,               # vid_e (active = 0)
            code_hash,       # 32-byte binary SHA-256 digest
            ast_ref,         # reference to m_ast node
            0,               # hl_s
@@ -96,7 +92,7 @@ Subsystem File Ownership Resolution:
 3. **Spatial Coordinate Mapping**:
    ```python
    CS.store(m_bridge_tag.set(
-       ((m_file.table_id, 0), OP_REF, (REF_ROOT,)),
+       self.blob_ref,       # ((m_file.table_id, 0), OP_REF, (REF_ROOT,))
        tag_ref,
        extent.line_pos[0],
        extent.line_pos[1],
@@ -112,11 +108,11 @@ Subsystem File Ownership Resolution:
 | Table ID | Table Name | Columns | Primary Key | `no_duplicate` | Description |
 | :---: | :--- | :--- | :--- | :---: | :--- |
 | **20** | `m_maintainer_person` | `(person_id, name, email)` | `("person_id",)` | `True` | Unique contributor registry deduplicated by email address and name. |
-| **21** | `m_maintainer_section`| `(sec_id, vid_s, vid_e, name, status, scm_tree, web_page, mailing_list, ast_id)` | `("sec_id", "vid_s")` | `True` | Subsystem maintainer section definitions and official channels. |
+| **21** | `m_maintainer_section`| `(sec_id, blob_id, name, status, scm_tree, web_page, mailing_list, ast_id)` | `("sec_id",)` | `True` | Subsystem maintainer section definitions and official channels scoped to blob. |
 | **22** | `m_maintainer_member` | `(sec_id, person_id, role_type, priority)` | `("sec_id", "person_id", "role_type")` | `False` | Subsystem personnel roles: 1=Maintainer (`M:`), 2=Reviewer (`R:`), 3=Patch author (`P:`), 4=Credit (`C:`). |
 | **23** | `m_maintainer_pattern`| `(sec_id, pat_type, pattern, priority)` | `("sec_id", "pat_type", "pattern", "priority")` | `False` | Path matching rules: 1=File (`F:`), 2=Exclude (`X:`), 3=Regex (`N:`), 4=Keyword (`K:`). |
-| **24** | `m_maintainer_file` | `(vid, fid, sec_id)` | `("vid", "fid", "sec_id")` | `False` | Resolved subsystem file ownership bridge populated in post-processing. |
-| **25** | `m_credits_entry` | `(credit_id, vid_s, vid_e, person_id, web_page, pgp_key, description, snail_mail, ast_id)` | `("credit_id", "vid_s")` | `True` | Contributor biography records parsed from `CREDITS`. |
+| **24** | `m_maintainer_file` | `(maintainers_blob_id, fnid, sec_id)` | `("maintainers_blob_id", "fnid", "sec_id")` | `False` | Resolved subsystem file ownership bridge populated in post-processing. |
+| **25** | `m_credits_entry` | `(credit_id, blob_id, person_id, web_page, pgp_key, description, snail_mail, ast_id)` | `("credit_id",)` | `True` | Contributor biography records parsed from `CREDITS` scoped to blob. |
 
 ---
 
@@ -148,12 +144,11 @@ Parsed by `CreditsParser` into structured contributor blocks:
 
 ## 4. Tag Lifecycle & Prior Tag Evolution
 
-`maintainer_ast` tracks section and contributor evolution across kernel releases:
-
-1. **Section Continuity**:
-   If a subsystem section's title remains identical, its `sec_id` is preserved across versions. Changes to maintainer lists or file patterns emit an updated section record in `m_maintainer_section` with `vid_s = VID`, while the previous version's record is closed with `vid_e = Old_VID`.
+Under the immutable Git DAG content-addressable model:
+1. **Immutable Tags**:
+   All `m_tag` records are immutable and content-addressable. `close_prior_tags` is a no-op; tags are never closed with `vid_e` updates.
 2. **Prior Tag Transition (`match_prior_tag_transition`)**:
-   Individual section tags that modify their patterns or members transition gracefully with `m_moved_tag(s_tag_id, tag_ref)`.
+   When modifying a file, `get_prior_tags` queries prior tags using an 11-column 2-way join (`m_bridge_tag` -> `m_tag`), and `match_prior_tag_transition` emits `m_moved_tag(s_tag_id, tag_ref)` if tags evolve.
 3. **Person Deduplication**:
    `m_maintainer_person` uses `no_duplicate=True` on `(person_id,)` with in-memory caching to guarantee that contributors maintaining multiple subsystems share a single canonical `person_id`.
 
@@ -165,11 +160,11 @@ To resolve file ownership across the entire kernel repository:
 1. **Execution**: Triggered at Step 6.7 in `main.py:processing_maintainer_files(version)`.
 2. **Pattern Matching**:
    - Compiles `F:` file patterns and `X:` exclude patterns into normalized globs.
-   - Evaluates each active file path in `m_bridge_file` against all sections in priority order.
+   - Evaluates each active file path in the tree against all sections in priority order.
    - Specific directory patterns (e.g. `fs/ext4/`) take precedence over broad generic patterns (e.g. `fs/`).
 3. **Bridge Population**:
-   - Inserts resolved `(vid, fid, sec_id)` triplets into `m_maintainer_file`.
-   - Deduplicates `(fid, sec_id)` pairs in-memory using a tracking set to prevent duplicate primary key violations when multiple repository paths (e.g. symlinks) resolve to the same file instance ID (`fid`).
+   - Inserts resolved `(maintainers_blob_id, fnid, sec_id)` triplets into `m_maintainer_file`.
+   - Deduplicates `(fnid, sec_id)` pairs in-memory using a tracking set to prevent duplicate primary key violations when multiple repository paths resolve to the same file.
    - Web application endpoints query `m_maintainer_file` to display the authoritative maintainers, mailing lists, and review channels for any viewed source file.
 
 ---
@@ -183,4 +178,4 @@ To resolve file ownership across the entire kernel repository:
 3. **Person Email Normalization**:
    Email addresses are stripped of surrounding angle brackets (`< >`), whitespace, and `mailto:` prefixes before deduplication.
 4. **Batch DB Commit**:
-   `processing_maintainer_files()` aggregates thousands of file-to-subsystem mappings into single bulk `m_maintainer_file` operations to minimize database write transactions.
+   `processing_maintainer_files()` aggregates file-to-subsystem mappings into single bulk `m_maintainer_file` operations to minimize database write transactions.

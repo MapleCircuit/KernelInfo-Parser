@@ -128,5 +128,49 @@ class TestFilesystemServiceGetFile(unittest.TestCase):
         self.assertEqual(ctx.exception.status_code, 400)
 
 
+class TestGitBlameService(unittest.TestCase):
+    """Test suite for GitService blame annotation and router endpoints."""
+
+    def setUp(self) -> None:
+        from webapp.backend.services.git_service import GitService
+        self.svc = GitService()
+
+    def test_get_blame_success_and_schema(self) -> None:
+        """Verify git blame produces normalized and legacy keys expected by webapp frontends."""
+        res = self.svc.get_blame("v3.0", "include/linux/lockd/bind.h")
+        self.assertIn("lines", res)
+        self.assertIn("blame", res)
+        self.assertGreater(len(res["lines"]), 0)
+        self.assertEqual(len(res["lines"]), len(res["blame"]))
+
+        first = res["lines"][0]
+        # Frontend expectations
+        self.assertIn("line", first)
+        self.assertIn("commit_hash", first)
+        self.assertIn("author_name", first)
+        self.assertIn("author_email", first)
+        self.assertIn("date", first)
+        self.assertIn("subject", first)
+        # Backward compatibility expectations
+        self.assertIn("author", first)
+        self.assertIn("summary", first)
+        self.assertIn("final_line", first)
+        self.assertEqual(first["line"], 1)
+
+    def test_get_blame_router_scoped(self) -> None:
+        """Verify commits router get_blame_scoped properly proxies blame retrieval."""
+        from webapp.backend.routers.commits import get_blame_scoped
+        res = get_blame_scoped("v3.0", "include/linux/lockd/bind.h")
+        self.assertIn("lines", res)
+        self.assertGreater(len(res["lines"]), 0)
+
+    def test_get_blame_path_traversal(self) -> None:
+        """Verify blame with invalid/path-traversal path raises 400."""
+        with self.assertRaises(HTTPException) as ctx:
+            self.svc.get_blame("v3.0", "../../../etc/passwd")
+        self.assertEqual(ctx.exception.status_code, 400)
+
+
 if __name__ == "__main__":
     unittest.main()
+

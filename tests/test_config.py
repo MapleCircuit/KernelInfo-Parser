@@ -1,6 +1,7 @@
 """tests/test_config.py - Unit tests for unified configuration management."""
 import json
 import os
+import subprocess
 import tempfile
 import unittest
 from unittest import mock
@@ -18,6 +19,8 @@ from core.config import (
     load_config,
     reset_config,
     sync_environ,
+    get_repository,
+    sync_repositories,
 )
 from webapp.main import DatabaseManager
 
@@ -214,6 +217,157 @@ class TestConfigManagement(unittest.TestCase):
         self.assertEqual(args.host, "127.0.0.1")
         self.assertEqual(args.port, 9099)
         self.assertFalse(args.reload)
+
+    def test_default_continuous_parsing_arguments(self) -> None:
+        """Verify main.arg_handling defaults single_version to False for continuous parsing."""
+        import main
+        with mock.patch("sys.argv", ["main.py"]):
+            args = main.arg_handling()
+            self.assertFalse(args.single_version)
+
+    def test_cli_single_version_argument(self) -> None:
+        """Verify main.arg_handling recognizes --single-version and --single flags."""
+        import main
+        with mock.patch("sys.argv", ["main.py", "--single-version"]):
+            args = main.arg_handling()
+            self.assertTrue(args.single_version)
+
+        with mock.patch("sys.argv", ["main.py", "--single"]):
+            args = main.arg_handling()
+            self.assertTrue(args.single_version)
+
+    def test_cli_no_rc_argument(self) -> None:
+        """--no-rc / --releases-only disables pre-release discovery; the default includes them."""
+        import main
+        with mock.patch("sys.argv", ["main.py"]):
+            self.assertTrue(main.arg_handling().include_pre_releases)
+        with mock.patch("sys.argv", ["main.py", "--no-rc"]):
+            self.assertFalse(main.arg_handling().include_pre_releases)
+        with mock.patch("sys.argv", ["main.py", "--releases-only"]):
+            self.assertFalse(main.arg_handling().include_pre_releases)
+
+    def test_cli_rc_arguments(self) -> None:
+        """Verify main.arg_handling recognizes --rc, --include-rc, and --include-pre-releases flags."""
+        import main
+        with mock.patch("sys.argv", ["main.py", "--rc"]):
+            args = main.arg_handling()
+            self.assertTrue(args.include_pre_releases)
+
+        with mock.patch("sys.argv", ["main.py", "--include-rc"]):
+            args = main.arg_handling()
+            self.assertTrue(args.include_pre_releases)
+
+        with mock.patch("sys.argv", ["main.py", "--include-pre-releases"]):
+            args = main.arg_handling()
+            self.assertTrue(args.include_pre_releases)
+
+    def test_master_file_get_version_tags(self) -> None:
+        """Verify MasterFile.get_version_tags discovers sequential releases starting at target version."""
+        from core.FileHandler import MasterFile
+        mf = MasterFile()
+        # Test with mock git command output
+        # git tag --sort=v:refname with versionsort.suffix=-rc orders candidates before their release
+        mock_output = "v3.0-rc1\nv3.0-rc2\nv3.0\nv3.1-rc1\nv3.1\nv3.2\nv3.3\n"
+        with mock.patch("subprocess.run") as mock_run:
+            mock_run.return_value = mock.MagicMock(returncode=0, stdout=mock_output)
+            # Default: release candidates are included in version order
+            tags = mf.get_version_tags(start_ref="v3.0")
+            self.assertIn("v3.1-rc1", tags)
+            self.assertLess(tags.index("v3.1-rc1"), tags.index("v3.1"))
+
+            # include_pre_releases=False keeps final releases only
+            tags_rel = mf.get_version_tags(start_ref="v3.0", include_pre_releases=False)
+            self.assertEqual(tags_rel, ["v3.0", "v3.1", "v3.2", "v3.3"])
+
+            # Slicing from v3.1
+            tags_v31 = mf.get_version_tags(start_ref="v3.1", include_pre_releases=False)
+            self.assertEqual(tags_v31, ["v3.1", "v3.2", "v3.3"])
+
+            # Starting with -rc tag preserves pre-releases
+            tags_rc = mf.get_version_tags(start_ref="v3.0-rc1")
+            self.assertIn("v3.0-rc1", tags_rc)
+            self.assertIn("v3.0-rc2", tags_rc)
+
+
+
+def _make_git_repo(path: Path, commits: int = 3, tags: dict[int, str] | None = None) -> list[str]:
+    """Create a small Git repository with sequential commits; returns commit SHAs oldest first."""
+    env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
+    subprocess.run(["git", "init", "-q", "-b", "main", str(path)], check=True, env=env)
+    shas = []
+    for i in range(commits):
+        (path / "f.txt").write_text(f"{i}\n")
+        subprocess.run(["git", "-C", str(path), "add", "f.txt"], check=True, env=env)
+        subprocess.run(["git", "-C", str(path), "commit", "-q", "-m", f"c{i}"], check=True, env=env)
+        shas.append(subprocess.check_output(["git", "-C", str(path), "rev-parse", "HEAD"], text=True).strip())
+        if tags and i in tags:
+            subprocess.run(["git", "-C", str(path), "tag", tags[i]], check=True, env=env)
+    return shas
+
+
+class TestRepositoryDetection(unittest.TestCase):
+    """Repository auto-detection under workspace.repos_dir and config.json registration."""
+
+    def setUp(self) -> None:
+        reset_config()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.repos_dir = self.root / "repos"
+        self.repos_dir.mkdir()
+        self.shas = _make_git_repo(self.repos_dir / "demo")
+        (self.repos_dir / "not_a_repo").mkdir()
+        self.config_path = self.root / "config.json"
+        self.config_path.write_text(json.dumps({
+            "database": {"database": "keep_me"},
+            "workspace": {"repos_dir": str(self.repos_dir)},
+        }))
+        init_config(self.config_path)
+
+    def tearDown(self) -> None:
+        reset_config()
+        self.tmp.cleanup()
+
+    def test_sync_registers_detected_repository(self) -> None:
+        repos = sync_repositories(write=True)
+        self.assertEqual(len(repos), 1)
+        repo = repos[0]
+        self.assertEqual(repo["name"], "demo")
+        self.assertEqual(repo["default_branch"], "main")
+        self.assertEqual(repo["root_commit"], self.shas[0])
+        self.assertEqual(repo["start_ref"], self.shas[0])
+        self.assertTrue(repo["enabled"])
+
+        saved = json.loads(self.config_path.read_text())
+        self.assertEqual(saved["database"]["database"], "keep_me")
+        self.assertEqual(saved["repositories"][0]["root_commit"], self.shas[0])
+        self.assertEqual(get_repository()["name"], "demo")
+        self.assertEqual(get_repository("demo")["root_commit"], self.shas[0])
+
+    def test_sync_is_idempotent_and_preserves_user_values(self) -> None:
+        sync_repositories(write=True)
+        saved = json.loads(self.config_path.read_text())
+        saved["repositories"][0]["start_ref"] = self.shas[1]
+        del saved["repositories"][0]["git_url"]
+        self.config_path.write_text(json.dumps(saved))
+
+        reset_config()
+        init_config(self.config_path)
+        repos = sync_repositories(write=True)
+        self.assertEqual(len(repos), 1)
+        self.assertEqual(repos[0]["start_ref"], self.shas[1])
+        self.assertIn("git_url", json.loads(self.config_path.read_text())["repositories"][0])
+
+    def test_version_sequence_from_first_commit(self) -> None:
+        from core.FileHandler import MasterFile
+        repo = self.root / "tagged"
+        shas = _make_git_repo(repo, commits=4, tags={0: "v1.0-rc1", 2: "v1.0", 3: "v1.1"})
+        mf = MasterFile()
+        mf.set_repo_dir(repo)
+        self.assertEqual(mf.get_root_commit(), shas[0])
+        # The tag on the first commit names the snapshot; later releases follow in version order
+        self.assertEqual(mf.get_version_tags(start_ref=shas[0]), ["v1.0-rc1", "v1.0", "v1.1"])
+        # An untagged start commit keeps its SHA and continues through releases containing it
+        self.assertEqual(mf.get_version_tags(start_ref=shas[1]), [shas[1], "v1.0", "v1.1"])
 
 
 if __name__ == "__main__":

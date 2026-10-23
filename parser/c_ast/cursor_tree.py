@@ -24,6 +24,7 @@ from core.globalstuff import (
     REF_ROOT,
     REF_FILE,
     SymbolRole,
+    SymbolLinkage,
     OP_REF,
     STANDARD_C_KEYWORDS,
     normalize_repo_path,
@@ -42,6 +43,9 @@ from parser.c_ast.ctypes_bindings import (
     AST_KIND,
     safe_spelling,
     safe_cursor_spelling,
+    _CLANG_VISIT_CHILDREN,
+    _CLANG_GET_CURSOR_REFERENCED,
+    _CLANG_CURSOR_IS_NULL,
 )
 from parser.c_ast.tokenizer import (
     Line,
@@ -308,7 +312,26 @@ _SKIP_REF_KINDS = frozenset({
     cc.CursorKind.MACRO_DEFINITION,
     cc.CursorKind.INCLUSION_DIRECTIVE,
 })
-_tu_typedef_cache: dict[tuple[str, str], tuple[str | None, str | None]] = {}
+_tu_foreign_type_cache: dict[tuple[str, str], tuple[str | None, str | None]] = {}
+_tu_typedef_cache = _tu_foreign_type_cache
+
+
+def clear_tu_caches() -> None:
+    """Clear per-translation-unit caches to prevent cross-file state leakage."""
+    _tu_foreign_type_cache.clear()
+
+_PARAM_KERNEL_ATTRIBUTES = frozenset({
+    "__aligned",
+    "aligned",
+    "__section",
+    "__alias",
+    "__printf",
+    "__scanf",
+    "__alloc_size",
+    "__assume_aligned",
+    "__cleanup",
+    "__free",
+})
 _KNOWN_KERNEL_ATTRIBUTES = frozenset({
     "__func__",
     "__FUNCTION__",
@@ -325,9 +348,16 @@ _KNOWN_KERNEL_ATTRIBUTES = frozenset({
     "__iomem",
     "__section",
     "__aligned",
+    "aligned",
+    "__alias",
+    "__printf",
+    "__scanf",
+    "__alloc_size",
+    "__assume_aligned",
+    "__cleanup",
+    "__free",
     "__attribute_const__",
     "__attribute_pure__",
-    "__alias",
     "__visible",
     "__must_check",
     "__deprecated",
@@ -417,29 +447,47 @@ def get_top_level_cursors(parsed_tu: cc.TranslationUnit | None, fullfilename: st
     """Filter translation unit top-level declarations belonging to target source file."""
     if parsed_tu is None or not fullfilename:
         return []
-    resolved_full = Path(fullfilename).resolve()
-    resolved_cache: dict[str, bool] = {fullfilename: True}
+    target_file = cc.File.from_name(parsed_tu, fullfilename)
+    target_ptr = ctypes.cast(target_file._as_parameter_, ctypes.c_void_p).value if target_file else None
+
+    from parser.c_ast.ctypes_bindings import _CLANG_GET_CURSOR_LOC, _CLANG_GET_FILE_LOC
+    f_ptr = ctypes.c_void_p()
+    u_val = ctypes.c_uint()
+    get_loc = _CLANG_GET_CURSOR_LOC
+    get_file_loc = _CLANG_GET_FILE_LOC
+
     top_cursors: list[cc.Cursor] = []
     top_append = top_cursors.append
-    for c in parsed_tu.cursor.get_children():
-        if c.kind in _VALID_TOP_KINDS:
-            loc = c.location
-            ext_st = getattr(c.extent, "start", None)
-            f = getattr(loc, "file", None) or getattr(ext_st, "file", None)
-            if f:
-                fname = f.name
-                if fname == fullfilename:
+
+    if target_ptr is not None:
+        for c in parsed_tu.cursor.get_children():
+            if c.kind in _VALID_TOP_KINDS:
+                loc = get_loc(c)
+                get_file_loc(loc, ctypes.byref(f_ptr), ctypes.byref(u_val), ctypes.byref(u_val), ctypes.byref(u_val))
+                if f_ptr.value == target_ptr:
                     top_append(c)
-                else:
-                    is_match = resolved_cache.get(fname)
-                    if is_match is None:
-                        try:
-                            is_match = (Path(fname).resolve() == resolved_full)
-                        except Exception:
-                            is_match = False
-                        resolved_cache[fname] = is_match
-                    if is_match:
+    else:
+        resolved_full = Path(fullfilename).resolve()
+        resolved_cache: dict[str, bool] = {fullfilename: True}
+        for c in parsed_tu.cursor.get_children():
+            if c.kind in _VALID_TOP_KINDS:
+                loc = c.location
+                ext_st = getattr(c.extent, "start", None)
+                f = getattr(loc, "file", None) or getattr(ext_st, "file", None)
+                if f:
+                    fname = f.name
+                    if fname == fullfilename:
                         top_append(c)
+                    else:
+                        is_match = resolved_cache.get(fname)
+                        if is_match is None:
+                            try:
+                                is_match = (Path(fname).resolve() == resolved_full)
+                            except Exception:
+                                is_match = False
+                            resolved_cache[fname] = is_match
+                        if is_match:
+                            top_append(c)
     return filter_enclosing_cursors(top_cursors)
 
 
@@ -460,82 +508,102 @@ def get_decl_type(ast_type: int) -> int:
         case _:
             return ast_type + 1
 
-def collect_cursor_used_types(cursor: Any, used_types: set[str] | None = None) -> set[str]:
-    """Recursively collect distinct type names used within a Clang cursor subtree."""
-    if used_types is None:
-        used_types = set()
-    if cursor is None:
-        return used_types
+_CLEAN_TYPE_CACHE: dict[str, str] = {}
 
-    def _clean_type_name(t_name: str) -> str:
-        if not t_name:
-            return ""
-        clean = t_name.strip()
-        for prefix in ("const ", "volatile ", "restrict ", "struct ", "union ", "enum "):
-            if clean.startswith(prefix):
-                clean = clean[len(prefix):].strip()
-        clean = clean.split()[0].rstrip("*[]() ")
-        return clean
 
-    try:
-        k = getattr(cursor, "kind", None)
-        if k == cc.CursorKind.TYPE_REF:
-            sp = getattr(cursor, "spelling", "")
-            if sp:
+def _clean_type_name(t_name: str) -> str:
+    cached = _CLEAN_TYPE_CACHE.get(t_name)
+    if cached is not None:
+        return cached
+    if not t_name:
+        _CLEAN_TYPE_CACHE[t_name] = ""
+        return ""
+    clean = t_name.strip()
+    for prefix in ("const ", "volatile ", "restrict ", "struct ", "union ", "enum "):
+        if clean.startswith(prefix):
+            clean = clean[len(prefix):].strip()
+    clean = clean.split()[0].rstrip("*[]() ")
+    _CLEAN_TYPE_CACHE[t_name] = clean
+    return clean
+
+
+def _inspect_used_types_node(c: Any, tu: Any, used_types: set[str]) -> None:
+    c._tu = tu
+    k_id = getattr(c, "_kind_id", None)
+    if k_id == 43:  # cc.CursorKind.TYPE_REF
+        sp = getattr(c, "spelling", "")
+        if sp:
+            clean = _clean_type_name(sp)
+            if clean:
+                used_types.add(clean)
+    elif k_id in (9, 10):  # cc.CursorKind.VAR_DECL, cc.CursorKind.PARM_DECL
+        t = getattr(c, "type", None)
+        if t is not None:
+            sp = getattr(t, "spelling", "")
+            clean = _clean_type_name(sp)
+            if clean:
+                used_types.add(clean)
+            can = getattr(t, "get_canonical", None)
+            if callable(can):
+                can_t = can()
+                can_sp = getattr(can_t, "spelling", "")
+                can_clean = _clean_type_name(can_sp)
+                if can_clean:
+                    used_types.add(can_clean)
+            pt = getattr(t, "get_pointee", None)
+            if callable(pt):
+                p = pt()
+                p_sp = getattr(p, "spelling", "")
+                p_clean = _clean_type_name(p_sp)
+                if p_clean:
+                    used_types.add(p_clean)
+    elif k_id == 102:  # cc.CursorKind.MEMBER_REF_EXPR
+        for child in c.get_children():
+            ct = getattr(child, "type", None)
+            if ct is not None:
+                sp = getattr(ct, "spelling", "")
                 clean = _clean_type_name(sp)
                 if clean:
                     used_types.add(clean)
-        elif k in (cc.CursorKind.VAR_DECL, cc.CursorKind.PARM_DECL):
-            t = getattr(cursor, "type", None)
-            if t is not None:
-                sp = getattr(t, "spelling", "")
-                clean = _clean_type_name(sp)
-                if clean:
-                    used_types.add(clean)
-                can = getattr(t, "get_canonical", None)
+                can = getattr(ct, "get_canonical", None)
                 if callable(can):
                     can_t = can()
                     can_sp = getattr(can_t, "spelling", "")
                     can_clean = _clean_type_name(can_sp)
                     if can_clean:
                         used_types.add(can_clean)
-                pt = getattr(t, "get_pointee", None)
-                if callable(pt):
-                    p = pt()
-                    p_sp = getattr(p, "spelling", "")
-                    p_clean = _clean_type_name(p_sp)
-                    if p_clean:
-                        used_types.add(p_clean)
-        elif k == cc.CursorKind.MEMBER_REF_EXPR:
-            for child in cursor.get_children():
-                ct = getattr(child, "type", None)
-                if ct is not None:
-                    sp = getattr(ct, "spelling", "")
-                    clean = _clean_type_name(sp)
-                    if clean:
-                        used_types.add(clean)
-                    can = getattr(ct, "get_canonical", None)
-                    if callable(can):
-                        can_t = can()
-                        can_sp = getattr(can_t, "spelling", "")
-                        can_clean = _clean_type_name(can_sp)
-                        if can_clean:
-                            used_types.add(can_clean)
-        elif k == cc.CursorKind.CALL_EXPR:
-            ref = getattr(cursor, "referenced", None)
-            if ref is not None:
-                rt = getattr(ref, "result_type", None)
-                if rt is not None:
-                    sp = getattr(rt, "spelling", "")
-                    clean = _clean_type_name(sp)
-                    if clean:
-                        used_types.add(clean)
+    elif k_id == 103:  # cc.CursorKind.CALL_EXPR
+        ref = getattr(c, "referenced", None)
+        if ref is not None:
+            rt = getattr(ref, "result_type", None)
+            if rt is not None:
+                sp = getattr(rt, "spelling", "")
+                clean = _clean_type_name(sp)
+                if clean:
+                    used_types.add(clean)
 
-        for child in cursor.get_children():
-            collect_cursor_used_types(child, used_types)
+
+def _visit_collect_used_types(cursor: Any, parent: Any, client_data: Any) -> int:
+    tu, used_types = client_data
+    _inspect_used_types_node(cursor, tu, used_types)
+    return 2  # CXChildVisit_Recurse
+
+
+_CB_COLLECT_USED_TYPES = cc.cursor_visit_callback(_visit_collect_used_types)
+
+
+def collect_cursor_used_types(cursor: Any, used_types: set[str] | None = None) -> set[str]:
+    """Recursively collect distinct type names used within a Clang cursor subtree."""
+    if used_types is None:
+        used_types = set()
+    if cursor is None:
+        return used_types
+    try:
+        tu = getattr(cursor, "_tu", None)
+        _inspect_used_types_node(cursor, tu, used_types)
+        _CLANG_VISIT_CHILDREN(cursor, _CB_COLLECT_USED_TYPES, (tu, used_types))
     except Exception:
         pass
-
     return used_types
 
 
@@ -553,10 +621,21 @@ def get_rel_file_for_cursor(CS: Any, cursor: Any) -> str | None:
     except Exception:
         return None
 
+    cache = getattr(CS, "_rel_file_cache", None) if CS is not None else None
+    if cache is None and CS is not None:
+        cache = CS._rel_file_cache = {}
+
+    if cache is not None:
+        cached = cache.get(file_path)
+        if cached is not None or file_path in cache:
+            return cached
+
     # Exclude host system headers (server include directories)
     if file_path.startswith(("/usr/", "/etc/", "/opt/", "/var/", "/lib/", "/bin/", "/dev/")):
         # Exception: /dev/shm workspace used for repository checkouts
         if not file_path.startswith("/dev/shm/"):
+            if cache is not None:
+                cache[file_path] = None
             return None
 
     # Resolve via MasterFile temp dir
@@ -567,29 +646,76 @@ def get_rel_file_for_cursor(CS: Any, cursor: Any) -> str | None:
         mfdir = mf.version_dict.get(v_name, "")
         if mfdir and file_path.startswith(mfdir):
             rel = file_path[len(mfdir):].lstrip("/")
-            if rel.startswith(("usr/", "etc/", "opt/", "var/", "lib/")):
-                return None
-            return rel if rel else None
+            res = None if rel.startswith(("usr/", "etc/", "opt/", "var/", "lib/")) else (rel if rel else None)
+            if cache is not None:
+                cache[file_path] = res
+            return res
 
     cur_p = getattr(G, "CURRENT_PARSING_FILE", None) or (getattr(CS, "current_path", None) if CS is not None else None)
     if cur_p and (file_path == cur_p or file_path.endswith("/" + cur_p)):
+        if cache is not None:
+            cache[file_path] = cur_p
         return cur_p
 
     # If within a local git repository path containing /linux/
     if "/linux/" in file_path and not file_path.startswith(("/usr/", "/etc/", "/opt/", "/var/", "/lib/")):
         rel = file_path.split("/linux/", 1)[1]
         if rel and not rel.startswith(("usr/", "etc/", "opt/", "var/", "lib/")):
+            if cache is not None:
+                cache[file_path] = rel
             return rel
 
     # Reject any absolute path outside the repository workspace
     if os.path.isabs(file_path):
+        if cache is not None:
+            cache[file_path] = None
         return None
 
     # Reject relative paths that refer to system-like directories
     if file_path.startswith(("usr/", "etc/", "opt/", "var/", "lib/")):
+        if cache is not None:
+            cache[file_path] = None
         return None
 
-    return file_path.lstrip("/")
+    res = file_path.lstrip("/")
+    if cache is not None:
+        cache[file_path] = res
+    return res
+
+
+def resolve_cursor_foreign_info(tspelling: str, cursor: Any, cur_f: str) -> tuple[str | None, str | None]:
+    """Resolve and cache foreign file and spelling for a type declarator cursor."""
+    cache_key = (tspelling, cur_f)
+    cached = _tu_foreign_type_cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    foreign_file = None
+    foreign_name = None
+    try:
+        decl = getattr(cursor, "type", None)
+        while decl is not None and getattr(decl, "kind", None) in (
+            cc.TypeKind.POINTER,
+            cc.TypeKind.CONSTANTARRAY,
+            cc.TypeKind.INCOMPLETEARRAY,
+        ):
+            decl = decl.get_pointee()
+        decl = decl.get_declaration() if decl is not None and hasattr(decl, "get_declaration") else None
+        decl_loc = getattr(decl, "location", None) if decl is not None else None
+        if decl is None or decl_loc is None or getattr(decl_loc, "file", None) is None:
+            decl = getattr(cursor, "referenced", None) or cursor.get_definition()
+            decl_loc = getattr(decl, "location", None) if decl is not None else None
+
+        if decl is not None and decl_loc is not None and getattr(decl_loc, "file", None) is not None:
+            rf = get_rel_file_for_cursor(None, decl)
+            if rf and rf != cur_f:
+                foreign_file = rf
+                foreign_name = safe_cursor_spelling(decl) or tspelling
+        _tu_foreign_type_cache[cache_key] = (foreign_file, foreign_name)
+    except Exception:
+        _tu_foreign_type_cache[cache_key] = (None, None)
+
+    return _tu_foreign_type_cache[cache_key]
 
 
 def resolve_cursor_type_ast(CS: Any, cursor: Any) -> tuple[int, Any]:
@@ -598,17 +724,20 @@ def resolve_cursor_type_ast(CS: Any, cursor: Any) -> tuple[int, Any]:
         return (ASTT.Undefined, 0)
 
     try:
-        ref_cursor = getattr(cursor, "referenced", None) or cursor.get_definition()
+        ref = _CLANG_GET_CURSOR_REFERENCED(cursor)
+        if not _CLANG_CURSOR_IS_NULL(ref):
+            ref._tu = getattr(cursor, "_tu", None)
+            ref_cursor = ref
+        else:
+            defn = cursor.get_definition()
+            ref_cursor = defn if defn is not None else cursor
     except Exception:
-        ref_cursor = None
-
-    if ref_cursor is None:
         ref_cursor = cursor
 
     cur_file = getattr(CS, "current_path", "") or getattr(G, "CURRENT_PARSING_FILE", "")
 
-    k = getattr(ref_cursor, "kind", None)
-    if k in (cc.CursorKind.MACRO_DEFINITION, cc.CursorKind.MACRO_INSTANTIATION):
+    k_id = getattr(ref_cursor, "_kind_id", None)
+    if k_id in (501, 502):  # cc.CursorKind.MACRO_DEFINITION, cc.CursorKind.MACRO_INSTANTIATION
         spelling = safe_cursor_spelling(ref_cursor) or getattr(cursor, "spelling", "")
         if spelling:
             safe_name = str(spelling)[:255]
@@ -640,7 +769,7 @@ def resolve_cursor_type_ast(CS: Any, cursor: Any) -> tuple[int, Any]:
 
             return (ASTT.Undefined, 0)
 
-    if k in (cc.CursorKind.FUNCTION_DECL, cc.CursorKind.CXX_METHOD):
+    if k_id in (8, 21):  # cc.CursorKind.FUNCTION_DECL, cc.CursorKind.CXX_METHOD
         spelling = safe_cursor_spelling(ref_cursor)
         if spelling:
             safe_name = str(spelling)[:255]
@@ -657,7 +786,7 @@ def resolve_cursor_type_ast(CS: Any, cursor: Any) -> tuple[int, Any]:
                 CS.store(m_ast.view(((m_ast.ast_id,),), None, safe_name, ASTT.C_functionprotnotbind))
             return (ASTT.C_functionproto, CS.ref(m_ast.ast_id, REF_POS, op_idx))
 
-    if k == cc.CursorKind.FIELD_DECL:
+    if k_id == 6:  # cc.CursorKind.FIELD_DECL
         spelling = safe_cursor_spelling(ref_cursor)
         if spelling:
             safe_name = str(spelling)[:255]
@@ -674,7 +803,7 @@ def resolve_cursor_type_ast(CS: Any, cursor: Any) -> tuple[int, Any]:
                 CS.store(m_ast.view(((m_ast.ast_id,),), None, safe_name, ASTT.C_structnotbind))
             return (ASTT.C_struct, CS.ref(m_ast.ast_id, REF_POS, op_idx))
 
-    if k == cc.CursorKind.ENUM_CONSTANT_DECL:
+    if k_id == 7:  # cc.CursorKind.ENUM_CONSTANT_DECL
         spelling = safe_cursor_spelling(ref_cursor)
         if spelling:
             safe_name = str(spelling)[:255]
@@ -689,7 +818,7 @@ def resolve_cursor_type_ast(CS: Any, cursor: Any) -> tuple[int, Any]:
                 CS.store(m_ast.view(((m_ast.ast_id,),), None, safe_name, ASTT.C_enumequal))
             return (ASTT.C_enumequal, CS.ref(m_ast.ast_id, REF_POS, op_idx))
 
-    if k in (cc.CursorKind.VAR_DECL, cc.CursorKind.PARM_DECL):
+    if k_id in (9, 10):  # cc.CursorKind.VAR_DECL, cc.CursorKind.PARM_DECL
         type_obj = getattr(ref_cursor, "type", None)
         t_spelling = safe_cursor_spelling(ref_cursor)
         ref_ast_id = 0
@@ -704,31 +833,81 @@ def resolve_cursor_type_ast(CS: Any, cursor: Any) -> tuple[int, Any]:
 
         if type_obj is not None:
             t_kind = getattr(type_obj, "kind", None)
-            if t_kind == cc.TypeKind.INT:
+            if t_kind in (getattr(cc.TypeKind, "ELABORATED", None), getattr(cc.TypeKind, "ATTRIBUTED", None)):
+                try:
+                    type_obj = type_obj.get_named_type() if hasattr(type_obj, "get_named_type") else type_obj.get_canonical()
+                    t_kind = getattr(type_obj, "kind", t_kind)
+                except Exception:
+                    pass
+
+            if t_kind in (cc.TypeKind.INT, getattr(cc.TypeKind, "UINT", cc.TypeKind.INT)):
                 return (ASTT.C_int, ref_ast_id)
-            elif t_kind in (cc.TypeKind.CHAR_S, cc.TypeKind.CHAR_U):
+            elif t_kind in (
+                cc.TypeKind.CHAR_S,
+                cc.TypeKind.CHAR_U,
+                getattr(cc.TypeKind, "SCHAR", cc.TypeKind.CHAR_S),
+                getattr(cc.TypeKind, "UCHAR", cc.TypeKind.CHAR_U),
+            ):
                 return (ASTT.C_char, ref_ast_id)
-            elif t_kind == cc.TypeKind.LONG:
+            elif t_kind in (cc.TypeKind.LONG, getattr(cc.TypeKind, "ULONG", cc.TypeKind.LONG)):
                 return (ASTT.C_long, ref_ast_id)
             elif t_kind in (cc.TypeKind.LONGLONG, getattr(cc.TypeKind, "ULONGLONG", cc.TypeKind.LONGLONG)):
                 return (ASTT.C_longlong, ref_ast_id)
             elif t_kind in (getattr(cc.TypeKind, "INT128", None), getattr(cc.TypeKind, "UINT128", None)):
                 return (ASTT.C_int128, ref_ast_id)
+            elif t_kind == getattr(cc.TypeKind, "WCHAR", None):
+                return (ASTT.C_wchar, ref_ast_id)
+            elif t_kind == getattr(cc.TypeKind, "CHAR16", None):
+                return (ASTT.C_char16, ref_ast_id)
+            elif t_kind == getattr(cc.TypeKind, "CHAR32", None):
+                return (ASTT.C_char32, ref_ast_id)
             elif t_kind == getattr(cc.TypeKind, "COMPLEX", None):
                 return (ASTT.C_complex, ref_ast_id)
-            elif t_kind == cc.TypeKind.SHORT:
+            elif t_kind in (cc.TypeKind.SHORT, getattr(cc.TypeKind, "USHORT", cc.TypeKind.SHORT)):
                 return (ASTT.C_short, ref_ast_id)
             elif t_kind == cc.TypeKind.FLOAT:
                 return (ASTT.C_float, ref_ast_id)
             elif t_kind == cc.TypeKind.DOUBLE:
                 return (ASTT.C_double, ref_ast_id)
+            elif t_kind == getattr(cc.TypeKind, "LONGDOUBLE", None):
+                return (ASTT.C_longdouble, ref_ast_id)
+            elif t_kind == getattr(cc.TypeKind, "FLOAT128", None):
+                return (ASTT.C_float128, ref_ast_id)
+            elif t_kind in (getattr(cc.TypeKind, "HALF", None), getattr(cc.TypeKind, "FLOAT16", None)):
+                return (ASTT.C_float16, ref_ast_id)
             elif t_kind == cc.TypeKind.BOOL:
                 return (ASTT.C_bool, ref_ast_id)
             elif t_kind == cc.TypeKind.VOID:
                 return (ASTT.C_void, ref_ast_id)
-            elif t_kind == cc.TypeKind.POINTER:
+            elif t_kind in (
+                cc.TypeKind.POINTER,
+                getattr(cc.TypeKind, "BLOCKPOINTER", None),
+                getattr(cc.TypeKind, "LVALUEREFERENCE", None),
+                getattr(cc.TypeKind, "RVALUEREFERENCE", None),
+                getattr(cc.TypeKind, "MEMBERPOINTER", None),
+            ):
                 return (ASTT.C_pointer, ref_ast_id)
+            elif t_kind == getattr(cc.TypeKind, "CONSTANTARRAY", None):
+                return (ASTT.C_array, ref_ast_id)
+            elif t_kind == getattr(cc.TypeKind, "INCOMPLETEARRAY", None):
+                return (ASTT.C_arrayempty, ref_ast_id)
+            elif t_kind in (getattr(cc.TypeKind, "VARIABLEARRAY", None), getattr(cc.TypeKind, "DEPENDENTSIZEDARRAY", None)):
+                return (ASTT.C_vla, ref_ast_id)
+            elif t_kind in (getattr(cc.TypeKind, "VECTOR", None), getattr(cc.TypeKind, "EXTVECTOR", None)):
+                return (ASTT.C_Vector, ref_ast_id)
+            elif t_kind == getattr(cc.TypeKind, "ATOMIC", None):
+                return (ASTT.C_Q_Atomic, ref_ast_id)
+            elif t_kind in (getattr(cc.TypeKind, "FUNCTIONPROTO", None), getattr(cc.TypeKind, "FUNCTIONNOPROTO", None)):
+                return (ASTT.C_functionproto, ref_ast_id)
+            elif t_kind == getattr(cc.TypeKind, "TYPEDEF", None):
+                return (ASTT.C_SCtypedef, ref_ast_id)
             elif t_kind == cc.TypeKind.RECORD:
+                try:
+                    d_cur = type_obj.get_declaration()
+                    if d_cur and getattr(d_cur, "kind", None) == cc.CursorKind.UNION_DECL:
+                        return (ASTT.C_union, ref_ast_id)
+                except Exception:
+                    pass
                 return (ASTT.C_struct, ref_ast_id)
             elif t_kind == cc.TypeKind.ENUM:
                 return (ASTT.C_enum, ref_ast_id)
@@ -737,6 +916,12 @@ def resolve_cursor_type_ast(CS: Any, cursor: Any) -> tuple[int, Any]:
     type_obj = getattr(ref_cursor, "type", None)
     if type_obj is not None:
         t_kind = getattr(type_obj, "kind", None)
+        if t_kind in (getattr(cc.TypeKind, "ELABORATED", None), getattr(cc.TypeKind, "ATTRIBUTED", None)):
+            try:
+                type_obj = type_obj.get_named_type() if hasattr(type_obj, "get_named_type") else type_obj.get_canonical()
+                t_kind = getattr(type_obj, "kind", t_kind)
+            except Exception:
+                pass
         t_spelling = safe_cursor_spelling(ref_cursor)
         if t_kind == cc.TypeKind.RECORD:
             try:
@@ -745,20 +930,24 @@ def resolve_cursor_type_ast(CS: Any, cursor: Any) -> tuple[int, Any]:
             except Exception:
                 decl_cursor = None
                 tag_name = t_spelling
+            is_union = bool(decl_cursor and getattr(decl_cursor, "kind", None) == cc.CursorKind.UNION_DECL)
+            rec_astt = ASTT.C_union if is_union else ASTT.C_struct
+            rec_decl_astt = ASTT.C_uniondecl if is_union else ASTT.C_structdecl
+            rec_notbind_astt = ASTT.C_unionnotbind if is_union else ASTT.C_structnotbind
             if tag_name:
                 safe_name = str(tag_name)[:255]
                 rel_file = get_rel_file_for_cursor(CS, decl_cursor)
                 if rel_file and rel_file != cur_file:
-                    return (ASTT.C_struct, CS.ref(m_ast.ast_id, REF_FILE, rel_file, safe_name, int(ASTT.C_structdecl)))
+                    return (rec_astt, CS.ref(m_ast.ast_id, REF_FILE, rel_file, safe_name, int(rec_decl_astt)))
                 if hasattr(CS, "symbol_dict"):
-                    if (safe_name, ASTT.C_structdecl) in CS.symbol_dict:
-                        return (ASTT.C_struct, CS.ref(m_ast.ast_id, REF_POS, CS.symbol_dict[(safe_name, ASTT.C_structdecl)]))
-                    if (safe_name, ASTT.C_struct) in CS.symbol_dict:
-                        return (ASTT.C_struct, CS.ref(m_ast.ast_id, REF_POS, CS.symbol_dict[(safe_name, ASTT.C_struct)]))
+                    if (safe_name, rec_decl_astt) in CS.symbol_dict:
+                        return (rec_astt, CS.ref(m_ast.ast_id, REF_POS, CS.symbol_dict[(safe_name, rec_decl_astt)]))
+                    if (safe_name, rec_astt) in CS.symbol_dict:
+                        return (rec_astt, CS.ref(m_ast.ast_id, REF_POS, CS.symbol_dict[(safe_name, rec_astt)]))
                 op_idx = len(CS.cs)
                 with CS(REF_NO_REF):
-                    CS.store(m_ast.view(((m_ast.ast_id,),), None, safe_name, ASTT.C_structnotbind))
-                return (ASTT.C_struct, CS.ref(m_ast.ast_id, REF_POS, op_idx))
+                    CS.store(m_ast.view(((m_ast.ast_id,),), None, safe_name, rec_notbind_astt))
+                return (rec_astt, CS.ref(m_ast.ast_id, REF_POS, op_idx))
         elif t_kind == cc.TypeKind.ENUM:
             try:
                 decl_cursor = type_obj.get_declaration()
@@ -780,8 +969,110 @@ def resolve_cursor_type_ast(CS: Any, cursor: Any) -> tuple[int, Any]:
                 with CS(REF_NO_REF):
                     CS.store(m_ast.view(((m_ast.ast_id,),), None, safe_name, ASTT.C_enumnotbind))
                 return (ASTT.C_enum, CS.ref(m_ast.ast_id, REF_POS, op_idx))
+        elif t_kind == getattr(cc.TypeKind, "TYPEDEF", None):
+            try:
+                decl_cursor = type_obj.get_declaration()
+                tag_name = safe_cursor_spelling(decl_cursor) or t_spelling
+            except Exception:
+                decl_cursor = None
+                tag_name = t_spelling
+            if tag_name:
+                safe_name = str(tag_name)[:255]
+                rel_file = get_rel_file_for_cursor(CS, decl_cursor)
+                if rel_file and rel_file != cur_file:
+                    return (ASTT.C_SCtypedef, CS.ref(m_ast.ast_id, REF_FILE, rel_file, safe_name, int(ASTT.C_SCtypedef)))
+                if hasattr(CS, "symbol_dict"):
+                    if (safe_name, ASTT.C_SCtypedef) in CS.symbol_dict:
+                        return (ASTT.C_SCtypedef, CS.ref(m_ast.ast_id, REF_POS, CS.symbol_dict[(safe_name, ASTT.C_SCtypedef)]))
+                op_idx = len(CS.cs)
+                with CS(REF_NO_REF):
+                    CS.store(m_ast.view(((m_ast.ast_id,),), None, safe_name, ASTT.C_SCtypedef))
+                return (ASTT.C_SCtypedef, CS.ref(m_ast.ast_id, REF_POS, op_idx))
 
     return (ASTT.Undefined, 0)
+
+
+def get_target_fnid_for_cursor(CS: Any, cursor: Any) -> Any:
+    """Resolve the target repository file name ID (fnid) for a referenced cursor."""
+    if cursor is None:
+        return 0
+    try:
+        ref = getattr(cursor, "referenced", None) or cursor.get_definition() or cursor
+    except Exception:
+        ref = cursor
+    rel_path = get_rel_file_for_cursor(CS, ref)
+    if not rel_path:
+        return 0
+    cur_path = getattr(CS, "current_path", "")
+    if rel_path == cur_path:
+        return CS.ref(m_file_name.fnid, REF_POS, 0)
+
+    if not hasattr(CS, "_target_fnid_cache"):
+        CS._target_fnid_cache = {}
+    if rel_path in CS._target_fnid_cache:
+        return CS._target_fnid_cache[rel_path]
+
+    if G.TE:
+        row = G.TE.get(m_file_name.table_id, (None, rel_path[:255]))
+        if row is not None:
+            CS._target_fnid_cache[rel_path] = row[0]
+            return row[0]
+
+    target_idx = len(CS.cs)
+    with CS(REF_NO_REF):
+        CS.store(m_file_name.get_set(None, rel_path[:255]))
+    ref_val = CS.ref(m_file_name.fnid, REF_POS, target_idx)
+    CS._target_fnid_cache[rel_path] = ref_val
+    return ref_val
+
+
+def resolve_linkage(node: Any, default_linkage: int = SymbolLinkage.ExternalDef) -> int:
+    """Determine the SymbolLinkage (ExternalDef, InternalStaticDef, PrototypeDecl, InlineHeaderDef, WeakOrAliasDef, MacroOrKernelDef)."""
+    if default_linkage == SymbolLinkage.MacroOrKernelDef:
+        return int(SymbolLinkage.MacroOrKernelDef)
+    attrs = getattr(node, "attributes", ())
+    attr_names = {a[0] for a in attrs} if attrs else set()
+    if "weak" in attr_names or "__weak" in attr_names or "alias" in attr_names or "__alias" in attr_names:
+        return int(SymbolLinkage.WeakOrAliasDef)
+
+    cur_path = getattr(G, "CURRENT_PARSING_FILE", "")
+    is_header = cur_path.endswith((".h", ".hpp", ".hxx", ".inc"))
+
+    has_inline = False
+    has_static = False
+    if hasattr(node, "storage_class") and node.storage_class:
+        if node.storage_class.type == ASTT.C_SCstatic:
+            has_static = True
+    if hasattr(node, "typedata"):
+        for ts in node.typedata:
+            for tok in getattr(ts, "content", ()):
+                if getattr(tok, "type", 0) == ASTT.C_SCstatic:
+                    has_static = True
+                elif getattr(tok, "type", 0) == ASTT.C_FSinline:
+                    has_inline = True
+    if hasattr(node, "content") and getattr(node.content, "content", None):
+        for tok in node.content.content:
+            if getattr(tok, "type", 0) == ASTT.C_SCstatic:
+                has_static = True
+            elif getattr(tok, "type", 0) == ASTT.C_FSinline:
+                has_inline = True
+
+    if is_header and (has_inline or (has_static and has_inline)):
+        return int(SymbolLinkage.InlineHeaderDef)
+    if has_static:
+        return int(SymbolLinkage.InternalStaticDef)
+
+    is_def = getattr(node, "is_definition", True)
+    if hasattr(node, "cursor") and node.cursor is not None:
+        try:
+            if hasattr(node.cursor, "is_definition"):
+                is_def = node.cursor.is_definition()
+        except Exception:
+            pass
+    if not is_def:
+        return int(SymbolLinkage.PrototypeDecl)
+
+    return int(SymbolLinkage.ExternalDef)
 
 
 class Ast_Statement(Ast):
@@ -1323,7 +1614,27 @@ class Ast_TypeofExpr(Ast_Statement):
     def extract(self, CS: Any, create_tag: bool = True) -> None:
         self._extract_nested(CS, create_tags=False)
         name = str(self.name)[:255] if self.name else "typeof"
-        self.extract_1arg(CS, ASTT.C_TypeofExpr, name, self.extent, create_tag=create_tag)
+        res_type, res_ref = (0, 0)
+        if self.cursor is not None:
+            try:
+                res_type, res_ref = resolve_cursor_type_ast(CS, self.cursor)
+            except Exception:
+                res_type, res_ref = (0, 0)
+
+        if res_ref != 0:
+            with CS(REF_POS):
+                CS.store(m_ast.view(((m_ast.ast_id, m_ast_container.ast_id, 1),), None, name, ASTT.C_TypeofExpr, None, 0, int(res_type), res_ref))
+                ast_id_route = CS.get_route_parse()
+        else:
+            with CS(REF_POS):
+                CS.store(m_ast.view(((m_ast.ast_id,),), None, name, ASTT.C_TypeofExpr))
+                ast_id_route = CS.get_route_parse()
+        self.ast_ref = CS.ref(m_ast.ast_id, *ast_id_route)
+        if create_tag:
+            with CS(REF_NO_REF):
+                if G.OVERRIDE_FORCE_AST_DEBUG:
+                    self.ast_debug(CS, ast_id_route)
+                self.tag(CS, ast_id_route, self.extent, ast_name=name, ast_type=ASTT.C_TypeofExpr)
 
 
 class Ast_OffsetofExpr(Ast_Statement):
@@ -1380,6 +1691,7 @@ class AST_Array(AST_Expression):
         super().__init__(extent, end_mode=end_mode)
         self.data: list[str] = []
         self.bracket_depth = 1
+        self.ast_ref: Any = None
 
     def within_range(self, token: Any, ast_kind: int) -> bool:
         if not self.need_processing:
@@ -1402,8 +1714,29 @@ class AST_Array(AST_Expression):
             return
         self.data.append(token.spelling_str)
 
-    def extract(self, CS: Any) -> None:
-        pass
+    def extract(self, CS: Any, create_tag: bool = True) -> None:
+        dim_expr = "".join(self.data).strip()[:255]
+        t_id = int(ASTT.C_vla) if getattr(self, "is_vla", False) else (int(ASTT.C_arrayempty) if not dim_expr else int(ASTT.C_array))
+        with CS(REF_POS):
+            CS.store(m_ast.view(
+                ((m_ast.ast_id,),),
+                None,
+                dim_expr,
+                t_id,
+            ))
+            ast_id_route = CS.get_route_parse()
+            self.ast_ref = CS.ref(m_ast.ast_id, *ast_id_route)
+        if create_tag:
+            with CS(REF_NO_REF):
+                if G.OVERRIDE_FORCE_AST_DEBUG:
+                    self.ast_debug(CS, ast_id_route)
+                self.tag(
+                    CS,
+                    ast_id_route,
+                    self.extent,
+                    ast_name=dim_expr,
+                    ast_type=t_id,
+                )
 
 
 class InitializerEntry:
@@ -1674,6 +2007,9 @@ class C_Type(Ast):
         self._macro_paren_opened: bool = False
         self.attributes: list[tuple[str, str]] = []
         self._current_attr_tokens: list[str] = []
+        self.in_bitfield: bool = False
+        self.bitfield_tokens: list[str] = []
+        self.bitfield_width: str = ""
 
     def _parse_attribute_tokens(self) -> None:
         tokens = getattr(self, "_current_attr_tokens", None)
@@ -1717,23 +2053,27 @@ class C_Type(Ast):
         tline = token.line
         tspelling = token.spelling_str
 
-        if self.in_attribute:
+        if self.in_attribute or getattr(self, "in_bitfield", False):
             self.extent.grow(tline)
             return True
 
         if ast_kind == AST_KIND.punctuation and tspelling == ";":
             if self.paren_depth <= 0 and self.brace_depth <= 0:
-                has_active_brace_init = any(
-                    getattr(z, "brace_depth", 0) > 0 for z in getattr(self, "zones", ())
-                )
+                zones = getattr(self, "zones", ())
+                has_active_brace_init = False
+                for z in zones:
+                    if getattr(z, "brace_depth", 0) > 0:
+                        has_active_brace_init = True
+                        break
                 if not has_active_brace_init:
-                    for z in getattr(self, "zones", ()):
+                    for z in zones:
                         if not getattr(z, "completed", True):
                             z.completed = True
                             z.paren_depth = 0
                             z.brace_depth = 0
-                            if getattr(z, "children", None):
-                                for ch in z.children:
+                            ch_list = getattr(z, "children", None)
+                            if ch_list:
+                                for ch in ch_list:
                                     if hasattr(ch, "need_processing"):
                                         ch.need_processing = False
                     self.extent.grow(tline)
@@ -1963,13 +2303,22 @@ class C_Type(Ast):
                 self.content.append(TypeToken(token, ASTT.C_short))
                 self.swap_out()
             case "int":
+                if not self.content.content and self.typedata and self.typedata[-1].content and getattr(self.typedata[-1].content[-1], "type", None) in (ASTT.C_long, ASTT.C_longlong, ASTT.C_short):
+                    return
+                elif self.content.content and getattr(self.content.content[-1], "type", None) in (ASTT.C_long, ASTT.C_longlong, ASTT.C_short):
+                    self.swap_out()
+                    return
                 self.content.append(TypeToken(token, ASTT.C_int))
                 self.swap_out()
             case "long":
-                if self.content.content and getattr(self.content.content[-1], "astt_type", None) == ASTT.C_long:
-                    self.content.content[-1] = TypeToken(token, ASTT.C_longlong)
-                else:
-                    self.content.append(TypeToken(token, ASTT.C_long))
+                if not self.content.content and self.typedata and self.typedata[-1].content and getattr(self.typedata[-1].content[-1], "type", None) == ASTT.C_long:
+                    self.typedata[-1].content[-1].type = ASTT.C_longlong
+                    return
+                elif self.content.content and getattr(self.content.content[-1], "type", None) == ASTT.C_long:
+                    self.content.content[-1].type = ASTT.C_longlong
+                    self.swap_out()
+                    return
+                self.content.append(TypeToken(token, ASTT.C_long))
                 self.swap_out()
             case "Bool" | "_Bool" | "bool":
                 self.content.append(TypeToken(token, ASTT.C_bool))
@@ -1978,10 +2327,32 @@ class C_Type(Ast):
                 self.content.append(TypeToken(token, ASTT.C_float))
                 self.swap_out()
             case "double":
+                if not self.content.content and self.typedata and self.typedata[-1].content and getattr(self.typedata[-1].content[-1], "type", None) == ASTT.C_long:
+                    self.typedata[-1].content[-1].type = ASTT.C_longdouble
+                    return
+                elif self.content.content and getattr(self.content.content[-1], "type", None) == ASTT.C_long:
+                    self.content.content[-1].type = ASTT.C_longdouble
+                    self.swap_out()
+                    return
                 self.content.append(TypeToken(token, ASTT.C_double))
                 self.swap_out()
             case "_Complex" | "_Imaginary":
                 self.content.append(TypeToken(token, ASTT.C_complex))
+                self.swap_out()
+            case "wchar_t":
+                self.content.append(TypeToken(token, ASTT.C_wchar))
+                self.swap_out()
+            case "char16_t":
+                self.content.append(TypeToken(token, ASTT.C_char16))
+                self.swap_out()
+            case "char32_t":
+                self.content.append(TypeToken(token, ASTT.C_char32))
+                self.swap_out()
+            case "_Float128" | "__float128":
+                self.content.append(TypeToken(token, ASTT.C_float128))
+                self.swap_out()
+            case "_Float16" | "__fp16":
+                self.content.append(TypeToken(token, ASTT.C_float16))
                 self.swap_out()
             case "__int128" | "__int128_t" | "__uint128_t":
                 self.content.append(TypeToken(token, ASTT.C_int128))
@@ -2026,6 +2397,15 @@ class C_Type(Ast):
                     return
 
         match tspelling:
+            case ":":
+                is_field = bool(
+                    (self.cursor is not None and getattr(self.cursor, "kind", None) == cc.CursorKind.FIELD_DECL)
+                    or (cursor is not None and getattr(cursor, "kind", None) == cc.CursorKind.FIELD_DECL)
+                )
+                if is_field and self.paren_depth == 0 and self.brace_depth == 0:
+                    self.in_bitfield = True
+                    self.bitfield_tokens = []
+                    return
             case "*":
                 self.content.append(TypeToken(token, ASTT.C_pointer))
                 if self.func_proto:
@@ -2051,7 +2431,8 @@ class C_Type(Ast):
 
                 if not has_func_proto:
                     if cursor.kind not in {cc.CursorKind.FUNCTION_DECL, cc.CursorKind.CXX_METHOD}:
-                        self.func_proto = True
+                        if not (self.content.cqual & CQual._Atomic):
+                            self.func_proto = True
                     return
                 if self.func_proto:
                     self.func_proto = False
@@ -2175,6 +2556,12 @@ class C_Type(Ast):
                     return
 
         tspelling = token.spelling_str
+        if tspelling in _PARAM_KERNEL_ATTRIBUTES:
+            self.in_attribute = True
+            self.attribute_paren_depth = 0
+            self._current_attr_tokens = [tspelling]
+            return
+
         if tspelling in _KNOWN_KERNEL_ATTRIBUTES:
             attr_name = tspelling.lstrip("_") or tspelling
             if not hasattr(self, "attributes"):
@@ -2215,21 +2602,8 @@ class C_Type(Ast):
                 if cursor.kind not in {cc.CursorKind.FIELD_DECL, cc.CursorKind.VAR_DECL, cc.CursorKind.PARM_DECL} and getattr(self, "name", "") not in _KNOWN_MACRO_FUNCS:
                     self.name = tspelling
                 tt = TypeToken(token, self.content.content[-1].type, cursor=cursor)
-                try:
-                    decl = getattr(cursor, "type", None)
-                    while decl is not None and getattr(decl, "kind", None) in (cc.TypeKind.POINTER, cc.TypeKind.CONSTANTARRAY, cc.TypeKind.INCOMPLETEARRAY):
-                        decl = decl.get_pointee()
-                    decl = decl.get_declaration() if decl is not None and hasattr(decl, "get_declaration") else None
-                    if decl is None or not getattr(decl, "location", None) or not getattr(decl.location, "file", None):
-                        decl = getattr(cursor, "referenced", None) or cursor.get_definition()
-                    if decl is not None and getattr(decl, "location", None) and getattr(decl.location, "file", None):
-                        rf = get_rel_file_for_cursor(None, decl)
-                        cur_f = getattr(G, "CURRENT_PARSING_FILE", "")
-                        if rf and rf != cur_f:
-                            tt.foreign_file = rf
-                            tt.foreign_name = safe_cursor_spelling(decl) or tspelling
-                except Exception:
-                    pass
+                cur_f = getattr(G, "CURRENT_PARSING_FILE", "")
+                tt.foreign_file, tt.foreign_name = resolve_cursor_foreign_info(tspelling, cursor, cur_f)
                 self.content.append(tt)
                 self.swap_out()
                 return
@@ -2247,21 +2621,8 @@ class C_Type(Ast):
 
         if self.struct_union_enum_type is not None:
             tt = TypeToken(token, self.struct_union_enum_type, cursor=cursor)
-            try:
-                decl = getattr(cursor, "type", None)
-                while decl is not None and getattr(decl, "kind", None) in (cc.TypeKind.POINTER, cc.TypeKind.CONSTANTARRAY, cc.TypeKind.INCOMPLETEARRAY):
-                    decl = decl.get_pointee()
-                decl = decl.get_declaration() if decl is not None and hasattr(decl, "get_declaration") else None
-                if decl is None or not getattr(decl, "location", None) or not getattr(decl.location, "file", None):
-                    decl = getattr(cursor, "referenced", None) or cursor.get_definition()
-                if decl is not None and getattr(decl, "location", None) and getattr(decl.location, "file", None):
-                    rf = get_rel_file_for_cursor(None, decl)
-                    cur_f = getattr(G, "CURRENT_PARSING_FILE", "")
-                    if rf and rf != cur_f:
-                        tt.foreign_file = rf
-                        tt.foreign_name = safe_cursor_spelling(decl) or tspelling
-            except Exception:
-                pass
+            cur_f = getattr(G, "CURRENT_PARSING_FILE", "")
+            tt.foreign_file, tt.foreign_name = resolve_cursor_foreign_info(tspelling, cursor, cur_f)
             self.content.append(tt)
             self.swap_out()
             return
@@ -2272,26 +2633,7 @@ class C_Type(Ast):
         ):
             tt = TypeToken(token, ASTT.C_SCtypedef, cursor=cursor)
             cur_f = getattr(G, "CURRENT_PARSING_FILE", "")
-            cache_key = (tspelling, cur_f)
-            cached = _tu_typedef_cache.get(cache_key)
-            if cached is not None:
-                tt.foreign_file, tt.foreign_name = cached
-            else:
-                try:
-                    decl = getattr(cursor, "type", None)
-                    while decl is not None and getattr(decl, "kind", None) in (cc.TypeKind.POINTER, cc.TypeKind.CONSTANTARRAY, cc.TypeKind.INCOMPLETEARRAY):
-                        decl = decl.get_pointee()
-                    decl = decl.get_declaration() if decl is not None and hasattr(decl, "get_declaration") else None
-                    if decl is None or not getattr(decl, "location", None) or not getattr(decl.location, "file", None):
-                        decl = getattr(cursor, "referenced", None) or cursor.get_definition()
-                    if decl is not None and getattr(decl, "location", None) and getattr(decl.location, "file", None):
-                        rf = get_rel_file_for_cursor(None, decl)
-                        if rf and rf != cur_f:
-                            tt.foreign_file = rf
-                            tt.foreign_name = safe_cursor_spelling(decl) or tspelling
-                    _tu_typedef_cache[cache_key] = (tt.foreign_file, tt.foreign_name)
-                except Exception:
-                    _tu_typedef_cache[cache_key] = (None, None)
+            tt.foreign_file, tt.foreign_name = resolve_cursor_foreign_info(tspelling, cursor, cur_f)
             self.content.append(tt)
             self.swap_out()
             return
@@ -2312,18 +2654,28 @@ class C_Type(Ast):
 
     def exec_filter(self, token: Any, cursor: Any, kind: int) -> None:
         tspelling = token.spelling_str
+        if getattr(self, "in_bitfield", False):
+            if tspelling in (";", ","):
+                self.in_bitfield = False
+                self.bitfield_width = "".join(self.bitfield_tokens).strip()
+            else:
+                if kind != AST_KIND.comment:
+                    self.bitfield_tokens.append(tspelling)
+                return
+
         if tspelling in ("__attribute__", "__attribute", "__declspec"):
             self.in_attribute = True
             self.attribute_paren_depth = 0
             self._current_attr_tokens = []
             return
         if self.in_attribute:
+            is_param_macro = bool(self._current_attr_tokens and self._current_attr_tokens[0] in _PARAM_KERNEL_ATTRIBUTES)
             if tspelling == "(":
                 self.attribute_paren_depth += 1
-                if self.attribute_paren_depth > 2:
+                if is_param_macro or self.attribute_paren_depth > 2:
                     self._current_attr_tokens.append(tspelling)
             elif tspelling == ")":
-                if self.attribute_paren_depth > 2:
+                if is_param_macro or self.attribute_paren_depth > 2:
                     self._current_attr_tokens.append(tspelling)
                 self.attribute_paren_depth -= 1
                 if self.attribute_paren_depth <= 0:
@@ -2332,6 +2684,8 @@ class C_Type(Ast):
             elif self.attribute_paren_depth == 0 and kind != AST_KIND.comment:
                 self.in_attribute = False
                 self._parse_attribute_tokens()
+                self.exec_filter(token, cursor, kind)
+                return
             else:
                 self._current_attr_tokens.append(tspelling)
                 return
@@ -2406,12 +2760,12 @@ class C_Type(Ast):
                 with CS(REF_POS):
                     CS.store(m_symbol_def.set(
                         None,
-                        CS.gp.VID,
                         ((m_file.table_id, 0), OP_REF, (REF_ROOT,)),
                         tag_ref or getattr(self, "tag_ref", 0),
                         self.ast_ref,
                         str(p_tp)[:255],
                         int(tp_type),
+                        int(SymbolLinkage.MacroOrKernelDef),
                         self.extent.line_pos[0],
                         self.extent.line_pos[1],
                     ))
@@ -2473,12 +2827,12 @@ class C_Type(Ast):
                 with CS(REF_POS):
                     CS.store(m_symbol_def.set(
                         None,
-                        CS.gp.VID,
                         ((m_file.table_id, 0), OP_REF, (REF_ROOT,)),
                         tag_ref or getattr(self, "tag_ref", 0),
                         self.ast_ref,
                         str(p_name)[:255],
                         int(param_type),
+                        int(SymbolLinkage.MacroOrKernelDef),
                         self.extent.line_pos[0],
                         self.extent.line_pos[1],
                     ))
@@ -2542,12 +2896,12 @@ class C_Type(Ast):
                 with CS(REF_POS):
                     CS.store(m_symbol_def.set(
                         None,
-                        CS.gp.VID,
                         ((m_file.table_id, 0), OP_REF, (REF_ROOT,)),
                         tag_ref or getattr(self, "tag_ref", 0),
                         self.ast_ref,
                         str(p_entry)[:255],
                         int(entry_type),
+                        int(SymbolLinkage.MacroOrKernelDef),
                         self.extent.line_pos[0],
                         self.extent.line_pos[1],
                     ))
@@ -2610,12 +2964,12 @@ class C_Type(Ast):
                 with CS(REF_POS):
                     CS.store(m_symbol_def.set(
                         None,
-                        CS.gp.VID,
                         ((m_file.table_id, 0), OP_REF, (REF_ROOT,)),
                         tag_ref or getattr(self, "tag_ref", 0),
                         self.ast_ref,
                         str(p_init)[:255],
                         int(entry_type),
+                        int(SymbolLinkage.MacroOrKernelDef),
                         self.extent.line_pos[0],
                         self.extent.line_pos[1],
                     ))
@@ -2678,12 +3032,12 @@ class C_Type(Ast):
                 with CS(REF_POS):
                     CS.store(m_symbol_def.set(
                         None,
-                        CS.gp.VID,
                         ((m_file.table_id, 0), OP_REF, (REF_ROOT,)),
                         tag_ref or getattr(self, "tag_ref", 0),
                         self.ast_ref,
                         str(p_sym)[:255],
                         int(entry_type),
+                        int(SymbolLinkage.MacroOrKernelDef),
                         self.extent.line_pos[0],
                         self.extent.line_pos[1],
                     ))
@@ -2740,12 +3094,12 @@ class C_Type(Ast):
                 with CS(REF_POS):
                     CS.store(m_symbol_def.set(
                         None,
-                        CS.gp.VID,
                         ((m_file.table_id, 0), OP_REF, (REF_ROOT,)),
                         tag_ref or getattr(self, "tag_ref", 0),
                         self.ast_ref,
                         str(p_sym)[:255],
                         int(entry_type),
+                        int(SymbolLinkage.MacroOrKernelDef),
                         self.extent.line_pos[0],
                         self.extent.line_pos[1],
                     ))
@@ -2803,12 +3157,12 @@ class C_Type(Ast):
                 with CS(REF_POS):
                     CS.store(m_symbol_def.set(
                         None,
-                        CS.gp.VID,
                         ((m_file.table_id, 0), OP_REF, (REF_ROOT,)),
                         tag_ref or getattr(self, "tag_ref", 0),
                         self.ast_ref,
                         str(p_sym)[:255],
                         int(entry_type),
+                        int(SymbolLinkage.MacroOrKernelDef),
                         self.extent.line_pos[0],
                         self.extent.line_pos[1],
                     ))
@@ -2929,6 +3283,10 @@ class C_Type(Ast):
                         target_link = function_args_link
 
                 if is_def:
+                    is_typedef_def = (
+                        (self.storage_class is not None and self.storage_class.type == ASTT.C_SCtypedef)
+                        or (self.cursor is not None and getattr(self.cursor, "kind", None) == cc.CursorKind.TYPEDEF_DECL)
+                    )
                     def_candidates = [item for item in typesegment.content if item.type in _DEF_TYPES]
                     named_candidates = [
                         item for item in def_candidates 
@@ -3145,7 +3503,7 @@ class C_Type(Ast):
                                 CS.symbol_dict[(ast_staging_name, ast_staging_type)] = ast_id_route[1]
                                 CS.symbol_dict[(ast_staging_name, decl_type)] = ast_id_route[1]
 
-                        if create_tag:
+                        if create_tag and not is_typedef_def:
                             if has_var and item.type != ASTT.C_functionproto:
                                 declared_zone = next((z for z in self.zones if z.zone_type in (Zone_Type.Declared_Args, Zone_Type.Enum_Content)), None)
                                 def_end_line = declared_zone.extent.line_pos[1] if declared_zone else self.extent.line_pos[1]
@@ -3165,12 +3523,12 @@ class C_Type(Ast):
                                     with CS(REF_POS):
                                         CS.store(m_symbol_def.set(
                                             None,
-                                            CS.gp.VID,
                                             ((m_file.table_id, 0), OP_REF, (REF_ROOT,)),
                                             def_tag_ref or getattr(self, "tag_ref", 0),
                                             self.ast_ref,
                                             safe_item_name,
                                             decl_type,
+                                            resolve_linkage(self),
                                             def_extent.line_pos[0],
                                             def_extent.line_pos[1],
                                         ))
@@ -3187,12 +3545,12 @@ class C_Type(Ast):
                                                 with CS(REF_POS):
                                                     CS.store(m_symbol_def.set(
                                                         None,
-                                                        CS.gp.VID,
                                                         ((m_file.table_id, 0), OP_REF, (REF_ROOT,)),
                                                         active_enum_tag,
                                                         ch_ast_ref,
                                                         safe_ch_name,
                                                         int(ASTT.C_enumequal),
+                                                        resolve_linkage(self),
                                                         ch_ext.line_pos[0],
                                                         ch_ext.line_pos[1],
                                                     ))
@@ -3253,12 +3611,12 @@ class C_Type(Ast):
                                                 with CS(REF_POS):
                                                     CS.store(m_symbol_def.set(
                                                         None,
-                                                        CS.gp.VID,
                                                         ((m_file.table_id, 0), OP_REF, (REF_ROOT,)),
                                                         tag_ref or getattr(self, "tag_ref", 0),
                                                         self.ast_ref,
                                                         str(p_var)[:255],
                                                         int(v_type),
+                                                        int(SymbolLinkage.MacroOrKernelDef),
                                                         self.extent.line_pos[0],
                                                         self.extent.line_pos[1],
                                                     ))
@@ -3292,12 +3650,12 @@ class C_Type(Ast):
                                                 with CS(REF_POS):
                                                     CS.store(m_symbol_def.set(
                                                         None,
-                                                        CS.gp.VID,
                                                         ((m_file.table_id, 0), OP_REF, (REF_ROOT,)),
                                                         tag_ref or getattr(self, "tag_ref", 0),
                                                         self.ast_ref,
                                                         str(p_tp)[:255],
                                                         int(tp_type),
+                                                        int(SymbolLinkage.MacroOrKernelDef),
                                                         self.extent.line_pos[0],
                                                         self.extent.line_pos[1],
                                                     ))
@@ -3309,12 +3667,12 @@ class C_Type(Ast):
                                             with CS(REF_POS):
                                                 CS.store(m_symbol_def.set(
                                                     None,
-                                                    CS.gp.VID,
                                                     ((m_file.table_id, 0), OP_REF, (REF_ROOT,)),
                                                     tag_ref or getattr(self, "tag_ref", 0),
                                                     self.ast_ref,
                                                     str(ast_staging_name)[:255],
                                                     int(ASTT.C_SyscallDef),
+                                                    int(SymbolLinkage.MacroOrKernelDef),
                                                     self.extent.line_pos[0],
                                                     self.extent.line_pos[1],
                                                 ))
@@ -3322,16 +3680,16 @@ class C_Type(Ast):
                                                 pos_idx = ast_id_route[-1]
                                                 CS.symbol_dict[(str(ast_staging_name)[:255], int(ASTT.C_SyscallDef))] = pos_idx
                                                 CS.symbol_dict[(str(ast_staging_name)[:255], int(ASTT.C_functionprotodecl))] = pos_idx
-                                        elif safe_item_name not in _KNOWN_MACRO_FUNCS:
+                                        elif safe_item_name not in _KNOWN_MACRO_FUNCS and not is_typedef_def:
                                             with CS(REF_POS):
                                                 CS.store(m_symbol_def.set(
                                                     None,
-                                                    CS.gp.VID,
                                                     ((m_file.table_id, 0), OP_REF, (REF_ROOT,)),
                                                     tag_ref or getattr(self, "tag_ref", 0),
                                                     self.ast_ref,
                                                     safe_item_name,
                                                     decl_type,
+                                                    resolve_linkage(self),
                                                     self.extent.line_pos[0],
                                                     self.extent.line_pos[1],
                                                 ))
@@ -3348,12 +3706,12 @@ class C_Type(Ast):
                                                     with CS(REF_POS):
                                                         CS.store(m_symbol_def.set(
                                                             None,
-                                                            CS.gp.VID,
                                                             ((m_file.table_id, 0), OP_REF, (REF_ROOT,)),
                                                             active_enum_tag,
                                                             ch_ast_ref,
                                                             safe_ch_name,
                                                             int(ASTT.C_enumequal),
+                                                            resolve_linkage(self),
                                                             ch_ext.line_pos[0],
                                                             ch_ext.line_pos[1],
                                                         ))
@@ -3361,10 +3719,10 @@ class C_Type(Ast):
                                     with CS(REF_POS):
                                         CS.store(m_symbol_ref.set(
                                             None,
-                                            CS.gp.VID,
                                             ((m_file.table_id, 0), OP_REF, (REF_ROOT,)),
                                             tag_ref or getattr(self, "tag_ref", 0),
                                             self.ast_ref,
+                                            get_target_fnid_for_cursor(CS, getattr(self, "cursor", None)),
                                             int(SymbolRole.Declaration),
                                             self.extent.line_pos[0],
                                             self.extent.char_pos[0],
@@ -3373,16 +3731,48 @@ class C_Type(Ast):
                                     with CS(REF_POS):
                                         CS.store(m_symbol_ref.set(
                                             None,
-                                            CS.gp.VID,
                                             ((m_file.table_id, 0), OP_REF, (REF_ROOT,)),
                                             tag_ref or getattr(self, "tag_ref", 0),
                                             self.ast_ref,
+                                            get_target_fnid_for_cursor(CS, getattr(self, "cursor", None)),
                                             int(SymbolRole.Declaration),
                                             self.extent.line_pos[0],
                                             self.extent.char_pos[0],
                                         ))
 
         # 4. Insert Variable / Declarator ASTs into ChangeSet
+        if self.cursor is not None and getattr(self.cursor, "kind", None) == cc.CursorKind.FIELD_DECL:
+            if not hasattr(self, "attributes"):
+                self.attributes = []
+            try:
+                offset_bits = self.cursor.get_field_offsetof()
+                if offset_bits >= 0:
+                    self.attributes.append(("offset_bits", str(offset_bits)))
+            except Exception:
+                pass
+            try:
+                cur_t = getattr(self.cursor, "type", None)
+                if cur_t is not None:
+                    sz = cur_t.get_size()
+                    if sz >= 0:
+                        self.attributes.append(("size_bytes", str(sz)))
+            except Exception:
+                pass
+            bf_width = 0
+            try:
+                bf_width = self.cursor.get_bitfield_width()
+            except Exception:
+                pass
+            if not bf_width and getattr(self, "bitfield_width", ""):
+                try:
+                    bf_width = int(self.bitfield_width)
+                except Exception:
+                    pass
+            if bf_width > 0 or getattr(self, "bitfield_width", ""):
+                width_str = str(bf_width if bf_width > 0 else self.bitfield_width)
+                if ("bitfield_width", width_str) not in self.attributes:
+                    self.attributes.append(("bitfield_width", width_str))
+
         for final_type in final_types:
             if not final_type:
                 continue
@@ -3427,6 +3817,26 @@ class C_Type(Ast):
                 or ts.ref_type != TSRef.No_Ref
                 or any(item.type != 0 and item.type != ASTT.Undefined for item in ts.content)
             ]
+
+            if self.cursor is not None and getattr(self.cursor, "kind", None) == cc.CursorKind.FIELD_DECL:
+                bf_width = 0
+                try:
+                    bf_width = self.cursor.get_bitfield_width()
+                except Exception:
+                    pass
+                if not bf_width and getattr(self, "bitfield_width", ""):
+                    try:
+                        bf_width = int(self.bitfield_width)
+                    except Exception:
+                        pass
+                if bf_width > 0 or getattr(self, "bitfield_width", ""):
+                    width_str = str(bf_width if bf_width > 0 else self.bitfield_width)
+                    bf_ts = TypeSegment()
+                    bf_ts.type_id = ASTT.C_Bitfield
+                    tok = TypeToken(None, ASTT.C_Bitfield)
+                    tok.code = width_str
+                    bf_ts.content.append(tok)
+                    type_segments.append(bf_ts)
 
             for i, typesegment in enumerate(type_segments):
                 t_id = typesegment.type_id
@@ -3483,6 +3893,8 @@ class C_Type(Ast):
                     and type_segments[0].cqual == CQual.Empty
                     and main_t_id != ASTT.C_Compound
                     and main_t_id != 0
+                    and not getattr(self, "in_bitfield", False)
+                    and not getattr(self, "bitfield_width", "")
                 )
 
                 if initializer_ref is not None:
@@ -3596,12 +4008,12 @@ class C_Type(Ast):
                     with CS(REF_POS):
                         CS.store(m_symbol_def.set(
                             None,
-                            CS.gp.VID,
                             ((m_file.table_id, 0), OP_REF, (REF_ROOT,)),
                             tag_ref or getattr(self, "tag_ref", 0),
                             self.ast_ref,
                             safe_name,
                             main_t_id,
+                            resolve_linkage(self),
                             var_extent.line_pos[0],
                             var_extent.line_pos[1],
                         ))
@@ -3617,10 +4029,10 @@ class C_Type(Ast):
                             with CS(REF_POS):
                                 CS.store(m_symbol_ref.set(
                                     None,
-                                    CS.gp.VID,
                                     ((m_file.table_id, 0), OP_REF, (REF_ROOT,)),
                                     active_tag,
                                     sym_ref,
+                                    0,
                                     int(SymbolRole.TypeUsage),
                                     s_line,
                                     s_col,
@@ -3635,10 +4047,10 @@ class C_Type(Ast):
                             with CS(REF_POS):
                                 CS.store(m_symbol_ref.set(
                                     None,
-                                    CS.gp.VID,
                                     ((m_file.table_id, 0), OP_REF, (REF_ROOT,)),
                                     active_tag,
                                     type_ast_ref,
+                                    0,
                                     int(SymbolRole.TypeUsage),
                                     var_extent.line_pos[0],
                                     var_extent.char_pos[0],

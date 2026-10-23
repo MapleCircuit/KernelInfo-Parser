@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import subprocess
 import logging
+from webapp.backend.config import RepoScopedCache, get_repo_dir
 from typing import Any
 from fastapi import HTTPException
 from webapp.backend.database.pool import get_db_cursor
@@ -10,7 +11,7 @@ from webapp.backend.database.helpers import (
     safe_decode,
     get_version_info,
 )
-from webapp.backend.security.jail import resolve_and_verify_repo_path, LINUX_REPO_DIR
+from webapp.backend.security.jail import resolve_and_verify_repo_path
 from parser.kconfig_ast.kconfig_lexer import KconfigLexer
 from parser.kconfig_ast.kconfig_parser import (
     KconfigParser,
@@ -29,8 +30,8 @@ from parser.kconfig_ast.kconfig_parser import (
 
 logger = logging.getLogger(__name__)
 
-_DEFCONFIG_CACHE: dict[tuple[str, str, str], dict[str, Any]] = {}
-_TREE_CACHE: dict[tuple[str, str], dict[str, Any]] = {}
+_DEFCONFIG_CACHE: dict[tuple[str, str, str], dict[str, Any]] = RepoScopedCache()
+_TREE_CACHE: dict[tuple[str, str], dict[str, Any]] = RepoScopedCache()
 
 
 class KconfigService:
@@ -78,10 +79,10 @@ class KconfigService:
             if vid is not None:
                 cursor.execute(
                     """
-                    SELECT fn.fname, bf.fid
+                    SELECT fn.fname, bc.blob_id AS fid
                     FROM m_file_name fn
-                    JOIN m_bridge_file bf ON bf.fnid = fn.fnid
-                    WHERE bf.vid = %s AND (
+                    JOIN m_bridge_checkpoint bc ON bc.fnid = fn.fnid
+                    WHERE bc.commit_id = %s AND (
                         fn.fname LIKE %s OR fn.fname LIKE %s
                     )
                     ORDER BY fn.fname ASC;
@@ -94,7 +95,7 @@ class KconfigService:
         if not rows:
             try:
                 cmd = ["git", "ls-tree", "-r", "--name-only", str(version_name), f"arch/{arch_dir}"]
-                out = subprocess.run(cmd, cwd=str(LINUX_REPO_DIR), capture_output=True, text=True, check=True)
+                out = subprocess.run(cmd, cwd=str(get_repo_dir()), capture_output=True, text=True, check=True)
                 for line in out.stdout.splitlines():
                     clean = line.strip()
                     if "defconfig" in clean and (f"arch/{arch_dir}/configs/" in clean or clean == f"arch/{arch_dir}/defconfig"):
@@ -182,7 +183,7 @@ class KconfigService:
             try:
                 proc = subprocess.run(
                     ["git", "show", f"{version_name}:{cand}"],
-                    cwd=str(LINUX_REPO_DIR),
+                    cwd=str(get_repo_dir()),
                     capture_output=True,
                     text=True,
                     timeout=5,
@@ -197,7 +198,7 @@ class KconfigService:
         # 2. Try direct local file read
         if not raw_content:
             for cand in candidate_paths:
-                local_p = LINUX_REPO_DIR / cand
+                local_p = get_repo_dir() / cand
                 if local_p.is_file():
                     try:
                         with open(local_p, "r", encoding="utf-8", errors="replace") as f:
@@ -281,7 +282,7 @@ class KconfigService:
                 return file_content_cache[rel_p]
             clean = rel_p.strip().lstrip("/")
             content = ""
-            local_p = LINUX_REPO_DIR / clean
+            local_p = get_repo_dir() / clean
             if local_p.is_file():
                 try:
                     with open(local_p, "r", encoding="utf-8", errors="replace") as f:
@@ -292,7 +293,7 @@ class KconfigService:
                 try:
                     proc = subprocess.run(
                         ["git", "show", f"{version_name}:{clean}"],
-                        cwd=str(LINUX_REPO_DIR),
+                        cwd=str(get_repo_dir()),
                         capture_output=True,
                         text=True,
                         timeout=5,
@@ -603,24 +604,24 @@ class KconfigService:
 
             cursor.execute(
                 """
-                SELECT s.kcid, s.vid_s, s.vid_e, s.name, s.type, s.prompt, s.def_val, s.help, s.ast_id
+                SELECT s.kcid, s.name, s.type, s.prompt, s.def_val, s.help, s.ast_id
                 FROM m_kconfig_symbol s
-                WHERE s.vid_s <= %s AND (s.vid_e >= %s OR s.vid_e = 0) AND s.name = %s
+                WHERE s.name = %s
                 LIMIT 1;
                 """,
-                (vid, vid, clean_name),
+                (clean_name,),
             )
             s_row = cursor.fetchone()
             if not s_row:
                 raise HTTPException(status_code=404, detail=f"KConfig symbol '{clean_name}' not found.")
 
             kcid = s_row["kcid"]
-            vid_s = s_row["vid_s"]
-            vid_e = s_row["vid_e"]
-            _, vname_s = get_version_info(cursor, vid_s)
-            vname_e = "Active" if not vid_e or vid_e == 0 else get_version_info(cursor, vid_e)[1]
-            is_active = bool(not vid_e or vid_e == 0 or vid_e >= vid)
-            lifecycle_status = "Active" if is_active else "Deleted"
+            vid_s = vid
+            vid_e = 0
+            vname_s = vname
+            vname_e = "Active"
+            is_active = True
+            lifecycle_status = "Active"
 
             # Relations (depends_on, select)
             cursor.execute(
@@ -660,13 +661,70 @@ class KconfigService:
                 """
                 SELECT DISTINCT fn.fname
                 FROM m_kconfig_kbuild kb
-                JOIN m_bridge_file bf ON kb.fid = bf.fid AND bf.vid = kb.vid
-                JOIN m_file_name fn ON bf.fnid = fn.fnid
-                WHERE kb.kcid = %s AND kb.vid = %s;
+                JOIN m_file_name fn ON kb.target_fnid = fn.fnid
+                WHERE kb.kcid = %s;
                 """,
-                (kcid, vid),
+                (kcid,),
             )
             compiled_files = [{"file_path": safe_decode(r["fname"])} for r in cursor.fetchall()]
+
+            # Query declaration location(s) from m_kconfig_tree, m_bridge_checkpoint, m_file_name, and m_bridge_tag
+            cursor.execute(
+                """
+                SELECT DISTINCT fn.fname, bt.line_s, bt.line_e, bc.blob_id
+                FROM m_kconfig_symbol s
+                JOIN m_kconfig_tree kt ON kt.kcid = s.kcid
+                JOIN m_bridge_checkpoint bc ON bc.blob_id = kt.blob_id
+                JOIN m_file_name fn ON fn.fnid = bc.fnid
+                LEFT JOIN m_tag t ON t.ast_id = s.ast_id
+                LEFT JOIN m_bridge_tag bt ON bt.blob_id = kt.blob_id AND bt.tag_id = t.tag_id
+                WHERE s.kcid = %s
+                ORDER BY (bc.commit_id = %s) DESC, (bt.line_s IS NOT NULL) DESC
+                LIMIT 5;
+                """,
+                (kcid, vid or 0),
+            )
+            decl_rows = cursor.fetchall()
+            declarations: list[dict[str, Any]] = []
+            seen_decl = set()
+            for dr in decl_rows:
+                dfname = safe_decode(dr["fname"])
+                dline_s = dr["line_s"]
+                dline_e = dr["line_e"]
+                key = (dfname, dline_s)
+                if key not in seen_decl:
+                    seen_decl.add(key)
+                    declarations.append({
+                        "file_path": dfname,
+                        "line_s": dline_s,
+                        "line_e": dline_e,
+                        "blob_id": dr.get("blob_id"),
+                    })
+
+            # Fallback to fast git grep if declarations are empty or line_s is None
+            if not declarations or declarations[0]["line_s"] is None:
+                try:
+                    cmd = ["git", "grep", "-n", "-E", f"^(menu)?config[ \t]+{clean_name}$", str(vname), "--", "*Kconfig*"]
+                    g_out = subprocess.run(cmd, cwd=str(get_repo_dir()), capture_output=True, text=True, timeout=5)
+                    if g_out.returncode == 0:
+                        for g_line in g_out.stdout.splitlines():
+                            parts = g_line.strip().split(":", 3)
+                            if len(parts) >= 3:
+                                path_cand = parts[0] if not parts[0].startswith(str(vname)) else parts[1]
+                                line_num = int(parts[1]) if not parts[0].startswith(str(vname)) else int(parts[2])
+                                if not declarations:
+                                    declarations.append({"file_path": path_cand, "line_s": line_num, "line_e": line_num})
+                                elif declarations[0]["line_s"] is None:
+                                    declarations[0]["file_path"] = path_cand
+                                    declarations[0]["line_s"] = line_num
+                                    declarations[0]["line_e"] = line_num
+                                break
+                except Exception as grep_err:
+                    logger.debug("Kconfig grep fallback failed for %s: %s", clean_name, grep_err)
+
+            primary_file = declarations[0]["file_path"] if declarations else ""
+            primary_line_s = declarations[0]["line_s"] if declarations and declarations[0]["line_s"] is not None else 1
+            primary_line_e = declarations[0]["line_e"] if declarations and declarations[0]["line_e"] is not None else primary_line_s
 
             type_map = {1: "bool", 2: "tristate", 3: "string", 4: "hex", 5: "int"}
             raw_type = s_row["type"]
@@ -675,6 +733,19 @@ class KconfigService:
             return {
                 "version": vname,
                 "name": clean_name,
+                "symbol_name": clean_name,
+                "file_path": primary_file,
+                "line": primary_line_s,
+                "line_s": primary_line_s,
+                "line_e": primary_line_e,
+                "definition": {
+                    "file": primary_file,
+                    "file_path": primary_file,
+                    "line_s": primary_line_s,
+                    "line_e": primary_line_e,
+                    "line": primary_line_s,
+                },
+                "declarations": declarations,
                 "vid_s": vid_s,
                 "vid_e": vid_e,
                 "vname_s": vname_s,
@@ -718,9 +789,9 @@ class KconfigService:
                 SELECT r.rel_type, r.target_name
                 FROM m_kconfig_relation r
                 JOIN m_kconfig_symbol s ON r.kcid = s.kcid
-                WHERE s.vid_s <= %s AND (s.vid_e >= %s OR s.vid_e = 0) AND s.name = %s;
+                WHERE s.name = %s;
                 """,
-                (vid, vid, target_sym),
+                (target_sym,),
             )
             for r in cursor.fetchall():
                 tname = safe_decode(r["target_name"])
@@ -753,11 +824,14 @@ class KconfigService:
         if sym_name.startswith("CONFIG_"):
             sym_name = sym_name[7:]
 
-        details = self.get_symbol_detail(version_name, sym_name)
-        toggles = [{"symbol": sym_name, "set_to": "y"}]
-        for dep in details.get("depends_on", []):
-            clean_dep = dep.replace("CONFIG_", "").strip()
-            toggles.append({"symbol": clean_dep, "set_to": "y"})
+        try:
+            details = self.get_symbol_detail(version_name, sym_name)
+            toggles = [{"symbol": sym_name, "set_to": "y"}]
+            for dep in details.get("depends_on", []):
+                clean_dep = dep.replace("CONFIG_", "").strip()
+                toggles.append({"symbol": clean_dep, "set_to": "y"})
+        except HTTPException:
+            toggles = [{"symbol": sym_name, "set_to": "y"}]
 
         return {
             "version": version_name,
@@ -798,18 +872,31 @@ class KconfigService:
     def get_env_presets(self, version_name: str) -> dict[str, Any]:
         """Dynamically discover target architectures and compilers from database."""
         with get_db_cursor() as cursor:
-            vid, _ = get_version_info(cursor, version_name)
+            vid, vname = get_version_info(cursor, version_name)
             cursor.execute(
                 """
                 SELECT DISTINCT fn.fname
-                FROM m_bridge_file bf
-                JOIN m_file_name fn ON bf.fnid = fn.fnid
-                WHERE bf.vid = %s AND fn.fname LIKE 'arch/%/Kconfig'
+                FROM m_bridge_checkpoint bc
+                JOIN m_file_name fn ON bc.fnid = fn.fnid
+                WHERE bc.commit_id = %s AND fn.fname LIKE 'arch/%/Kconfig'
                 ORDER BY fn.fname ASC;
                 """,
                 (vid or 1,),
             )
             arch_files = [safe_decode(r["fname"]) for r in cursor.fetchall()]
+
+        if not arch_files or "x86" not in [f.split("/")[1] for f in arch_files if len(f.split("/")) >= 2]:
+            try:
+                from webapp.backend.services.git_service import GitService
+                stdout, _, code = GitService.run_git(["ls-tree", "--name-only", f"{vname}:arch"])
+                if code == 0 and stdout:
+                    for a_dir in stdout.splitlines():
+                        if a_dir and not a_dir.startswith(".") and a_dir != "Kconfig":
+                            k_path = f"arch/{a_dir}/Kconfig"
+                            if k_path not in arch_files:
+                                arch_files.append(k_path)
+            except Exception:
+                pass
 
         discovered_archs: list[dict[str, Any]] = []
         seen_arch_ids = set()
@@ -1080,12 +1167,11 @@ class KconfigService:
                 """
                 SELECT s.name, s.type, s.prompt, s.help
                 FROM m_kconfig_symbol s
-                WHERE s.vid_s <= %s AND (s.vid_e = 0 OR s.vid_e >= %s)
-                  AND (s.name LIKE %s OR s.prompt LIKE %s)
+                WHERE (s.name LIKE %s OR s.prompt LIKE %s)
                 ORDER BY (s.name = %s) DESC, s.name ASC
                 LIMIT %s OFFSET %s;
                 """,
-                (vid or 1, vid or 1, f"%{clean_q}%", f"%{clean_q}%", clean_q, limit, offset),
+                (f"%{clean_q}%", f"%{clean_q}%", clean_q, limit, offset),
             )
             type_names = {1: "bool", 2: "tristate", 3: "string", 4: "hex", 5: "int"}
             symbols = [

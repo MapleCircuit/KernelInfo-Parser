@@ -1825,9 +1825,18 @@
         <button id="btnModeCredits" class="btn btn-mode" onclick="openNewTab('credits', currentVersion)">🏆 Credits</button>
         <button id="btnModeTimeline" class="btn btn-mode" onclick="openNewTab('timeline', currentVersion)">⏱️ Timeline</button>
       </div>
-      <select id="versionSelect" class="version-selector" onchange="onVersionChange(this.value)">
-        <option value="">Loading versions...</option>
-      </select>
+      <div class="version-selector-container" style="display: flex; align-items: center; gap: 6px; margin: 0 4px;">
+        <select id="projectSelect" class="version-selector" style="max-width: 110px; font-size: 11px;" onchange="onProjectChange(this.value)" title="Active Project">
+          <option value="1">Linux Kernel</option>
+        </select>
+        <select id="branchSelect" class="version-selector" style="max-width: 90px; font-size: 11px;" onchange="onBranchChange(this.value)" title="Active Branch / Head">
+          <option value="master">master</option>
+        </select>
+        <select id="versionSelect" class="version-selector" style="max-width: 115px;" onchange="onVersionChange(this.value)" title="Release Version Tag">
+          <option value="">Loading versions...</option>
+        </select>
+        <input type="text" id="quickCommitInput" class="kconfig-input" placeholder="Go to SHA/-rc..." style="width: 105px; font-size: 11px; padding: 2px 6px; height: 26px;" title="Explore any arbitrary Git commit SHA, branch, or -rc tag" onkeydown="if(event.key==='Enter') onQuickCommitSubmit(this.value)">
+      </div>
       <div id="breadcrumbs" class="breadcrumbs">
         <span class="crumb-link" onclick="openPath('/')">/</span>
       </div>
@@ -2058,6 +2067,11 @@
       <div style="display: flex; gap: 10px; align-items: center; flex: 1; max-width: 700px;">
         <input type="text" id="timelineSearchInput" class="kconfig-input" placeholder="🔍 Search commits by subject, message, author, or SHA..." oninput="filterTimeline()" style="flex: 1;">
         <input type="text" id="timelineAuthorFilter" class="kconfig-input" placeholder="👤 Filter by author (e.g. Linus)..." oninput="filterTimeline()" style="width: 220px;">
+      </div>
+      <div style="display: flex; gap: 6px; align-items: center;">
+        <button class="btn" id="btnTimelineSeekFuture" onclick="seekTimelineDirection('future')" title="Seek into future (newer commits)">◀ Future</button>
+        <button class="btn btn-accent" id="btnTimelineSeekAnchor" onclick="seekTimelineDirection('around')" title="Center on version tag anchor commit">⊙ Tag Anchor</button>
+        <button class="btn" id="btnTimelineSeekPast" onclick="seekTimelineDirection('past')" title="Seek into past (older commits)">Past ▶</button>
       </div>
       <div style="display: flex; gap: 12px; align-items: center;">
         <span id="timelineCountBadge" class="badge badge-accent" style="font-size: 12px; padding: 4px 10px;">0 Commits</span>
@@ -3060,6 +3074,12 @@
       <span id="tokenPopoverType" class="badge" style="font-size: 9px;">type</span>
     </div>
     <div style="display: flex; flex-direction: column; padding: 4px 0;">
+      <button class="popover-action-btn" id="btnPopoverKconfigDecl" onclick="popoverGotoKconfigDecl()" style="display: none; color: var(--accent);">
+        <span>📍</span> Jump to Kconfig Declaration
+      </button>
+      <button class="popover-action-btn" id="btnPopoverKconfigView" onclick="popoverOpenKconfigView()" style="display: none;">
+        <span>⚙️</span> Open in Kconfig Viewer
+      </button>
       <button class="popover-action-btn" id="btnPopoverGotoDef" onclick="popoverGotoDef()">
         <span>📖</span> Go to Definition
       </button>
@@ -4175,15 +4195,75 @@
       return data;
     }
 
+    async function loadProjectsAndBranches() {
+      try {
+        const pData = await apiFetch("/api/projects");
+        const pSelect = document.getElementById("projectSelect");
+        if (pSelect && pData && pData.projects && pData.projects.length > 0) {
+          pSelect.innerHTML = pData.projects.map(p => `<option value="${p.project_id}">${escapeHtml(p.name)}</option>`).join("");
+        }
+      } catch (err) {
+        console.warn("Could not load projects:", err);
+      }
+
+      try {
+        const bData = await apiFetch("/api/branches");
+        const bSelect = document.getElementById("branchSelect");
+        if (bSelect && bData && bData.branches && bData.branches.length > 0) {
+          bSelect.innerHTML = bData.branches.map(b => `<option value="${b.name}" ${b.is_default ? 'selected' : ''}>${escapeHtml(b.name)}</option>`).join("");
+        }
+      } catch (err) {
+        console.warn("Could not load branches:", err);
+      }
+    }
+
+    function onProjectChange(val) {
+      showToast(`Switched active project: ${val}`, "info");
+    }
+
+    function onBranchChange(branchName) {
+      if (branchName) {
+        exploreAtCommit(branchName);
+      }
+    }
+
+    function onQuickCommitSubmit(val) {
+      const trimmed = (val || "").trim();
+      if (!trimmed) return;
+      exploreAtCommit(trimmed);
+      const inp = document.getElementById("quickCommitInput");
+      if (inp) inp.value = "";
+    }
+
+    function exploreAtCommit(commitHashOrRef) {
+      if (!commitHashOrRef) return;
+      currentVersion = commitHashOrRef;
+      const vSelect = document.getElementById("versionSelect");
+      if (vSelect) {
+        let opt = Array.from(vSelect.options).find(o => o.value === commitHashOrRef);
+        if (!opt) {
+          opt = document.createElement("option");
+          opt.value = commitHashOrRef;
+          opt.text = commitHashOrRef.length === 40 ? `SHA: ${commitHashOrRef.substring(0, 8)}...` : commitHashOrRef;
+          vSelect.appendChild(opt);
+        }
+        vSelect.value = commitHashOrRef;
+      }
+      showToast(`Exploring repository at ${commitHashOrRef.substring(0, 10)}`, "info");
+      onVersionChange(commitHashOrRef);
+    }
+
     async function loadVersions() {
-      const data = await apiFetchCached("/api/versions", "metadata", "versions");
+      await loadProjectsAndBranches();
+      const data = await apiFetchCached("/api/versions?include_rc=true", "metadata", "versions_with_rc");
       if (data && data.length > 0) {
         versionsList = data.map(v => typeof v === 'string' ? v : v.vname);
         const select = document.getElementById("versionSelect");
         select.innerHTML = data.map(v => {
           const vname = typeof v === 'string' ? v : v.vname;
           const vid = typeof v === 'object' && v.vid ? ` (VID: ${v.vid})` : '';
-          return `<option value="${vname}" ${vname === currentVersion ? 'selected' : ''}>${vname}${vid}</option>`;
+          const rcTag = typeof v === 'object' && v.is_prerelease ? ' [RC]' : '';
+          return `<option value="${vname}" ${vname === currentVersion ? 'selected' : ''}>${vname}${vid}${rcTag}</option>`;
         }).join("");
         currentVersion = select.value || (typeof data[0] === 'string' ? data[0] : data[0].vname);
         initDiffWorkspace();
@@ -4619,18 +4699,31 @@
         </div>
       `;
 
+      const lastChanged = fileInfo.last_changed || null;
+      let lastChangedHtml = "";
+      if (lastChanged) {
+        lastChangedHtml = `
+          <span class="lifecycle-chip" style="cursor: pointer;" onclick="openFileHistoryModal('${escapeJs(data.path)}')" title="Last commit: ${escapeHtml(lastChanged.subject || '')} (${escapeHtml(lastChanged.commit_hash_short || '')}) - Click for complete history">
+            🕒 <strong>Last Changed:</strong> <span style="color: var(--text-bright);">${escapeHtml(lastChanged.author_date_iso || '')}</span>
+            <span style="color: var(--text-muted); margin-left: 2px;">by</span> <span style="color: var(--accent); font-weight: bold;">${escapeHtml(lastChanged.author_name || 'Unknown')}</span>
+          </span>
+        `;
+      }
+
       let html = `
         <div class="file-meta-bar">
           <div class="file-meta-info" style="display: flex; align-items: center; flex-wrap: wrap; gap: 8px;">
             <span><strong>File:</strong> ${data.path}</span>
             <span><strong>FID:</strong> <code>${fileInfo.fid}</code></span>
             <span><strong>Version:</strong> <span class="badge badge-accent">${data.version}</span></span>
+            ${lastChangedHtml}
             ${lifecycleHtml}
             ${subsystemsHtml}
             <span><strong>Tags:</strong> ${tags.length}</span>
             <span><strong>Mapped Elements:</strong> ${totalMaps}</span>
           </div>
           <div style="display: flex; gap: 8px; align-items: center; flex-wrap: wrap;">
+            <button id="btnFileHistory" class="btn btn-accent" onclick="openFileHistoryModal('${escapeJs(data.path)}')" title="View complete Git commit history and changelog for this file">📜 File History</button>
             <button id="btnToggleBlame" class="btn ${blameViewEnabled ? 'btn-active' : ''}" onclick="toggleGitBlameView()" title="Toggle interactive Git Blame line annotations with multi-commit tags and author highlights">🏷️ Git Blame</button>
             <button id="btnToggleTags" class="btn ${tagChipsEnabled ? 'btn-active' : ''}" onclick="toggleTagChips()" title="Toggle interactive tag chips (🏷️ #ID) displayed on lines starting AST tags">🏷️ Tag Chips</button>
             <button id="btnOpenSyntaxPalette" class="btn" onclick="openHighlightModal()" title="Open Syntax Color Palette &amp; Visibility Manager to customize syntax colors">🎨 Syntax Palette</button>
@@ -4813,73 +4906,153 @@
       onVersionChange(resolvedVer);
     }
 
-    function openFileHistoryModal() {
+    let currentFileHistoryTab = "git";
+    let currentFileHistoryData = null;
+
+    async function openFileHistoryModal(targetPath = null) {
       const modal = document.getElementById("fileHistoryModal");
       const titleEl = document.getElementById("fileHistoryModalTitle");
       const bodyEl = document.getElementById("fileHistoryModalBody");
       const fileInfo = (activeFileData && activeFileData.file_info) ? activeFileData.file_info : {};
-      const history = fileInfo.history || [];
-      const filePath = fileInfo.fname || activePath || '';
+      const filePath = targetPath || fileInfo.fname || (activeFileData && activeFileData.path) || activePath || '';
 
-      titleEl.innerHTML = `📜 Revision Timeline: <code>${escapeHtml(filePath)}</code>`;
+      titleEl.innerHTML = `📜 File Commit History: <code>${escapeHtml(filePath)}</code>`;
+      bodyEl.innerHTML = `<div style="padding: 40px; text-align: center; color: var(--accent);">⏳ Loading Git commit history for ${escapeHtml(filePath)}...</div>`;
+      modal.classList.add("open");
 
-      let rowsHtml = "";
-      history.forEach((h) => {
-        const isCur = (h.fid === fileInfo.fid);
-        const sBadge = (h.s_stat === 'A') ? 'badge-success' : (h.s_stat === 'R') ? 'badge-warning' : 'badge-accent';
-        const isEndActive = (!h.vid_e || h.vid_e === 0);
-        const eBadge = isEndActive ? 'badge-success' : (h.e_stat === 'D') ? 'badge-danger' : 'badge-warning';
+      try {
+        const histData = await apiFetch(`/api/commits/${encodeURIComponent(currentVersion)}/history?path=${encodeURIComponent(filePath)}&limit=100`);
+        currentFileHistoryData = histData;
+        renderFileHistoryModalContent(filePath, histData, fileInfo);
+      } catch (err) {
+        bodyEl.innerHTML = `<div style="padding: 30px; color: var(--danger); text-align: center;">Failed to load Git history: ${escapeHtml(err.message || 'Unknown error')}</div>`;
+      }
+    }
 
-        // Resolve clean version names
-        let vStartName = h.vname_s;
-        if (!vStartName || vStartName.startsWith("VID-")) {
-          const vidNum = h.vid_s || (vStartName ? parseInt(vStartName.replace("VID-", ""), 10) : null);
-          const found = versionsList.find(v => (typeof v === "object" && v.vid === vidNum) || v === `v${vidNum}` || v.name === `v${vidNum}`);
-          vStartName = found ? (typeof found === "object" ? found.name : found) : (vidNum ? `v${vidNum}` : currentVersion);
-        }
+    function renderFileHistoryModalContent(filePath, histData, fileInfo) {
+      const bodyEl = document.getElementById("fileHistoryModalBody");
+      if (!bodyEl) return;
 
-        let vEndName = isEndActive ? 'Active' : h.vname_e;
-        if (!isEndActive && (!vEndName || vEndName.startsWith("VID-"))) {
-          const vidNum = h.vid_e || (vEndName ? parseInt(vEndName.replace("VID-", ""), 10) : null);
-          const found = versionsList.find(v => (typeof v === "object" && v.vid === vidNum) || v === `v${vidNum}` || v.name === `v${vidNum}`);
-          vEndName = found ? (typeof found === "object" ? found.name : found) : (vidNum ? `v${vidNum}` : 'Active');
-        }
+      const commits = (histData && histData.commits) ? histData.commits : [];
+      const lastChanged = (histData && histData.last_changed) || (fileInfo && fileInfo.last_changed) || (commits.length > 0 ? commits[0] : null);
+      const checkpoints = (fileInfo && fileInfo.history) ? fileInfo.history : [];
 
-        rowsHtml += `
-          <tr style="${isCur ? 'background: rgba(97, 175, 239, 0.15); font-weight: bold;' : ''}">
-            <td style="padding: 8px 12px; font-family: monospace;"><code>${h.fid}</code> ${isCur ? '<span class="badge badge-accent" style="font-size: 9px; margin-left: 4px;">CURRENT</span>' : ''}</td>
-            <td style="padding: 8px 12px;">
-              <span class="badge ${sBadge}">${escapeHtml(vStartName)}</span>
-              <span style="font-size: 11px; color: var(--text-muted); margin-left: 4px;">(${escapeHtml(h.s_stat_label)})</span>
-            </td>
-            <td style="padding: 8px 12px;">
-              <span class="badge ${eBadge}">${escapeHtml(vEndName)}</span>
-              <span style="font-size: 11px; color: var(--text-muted); margin-left: 4px;">(${escapeHtml(h.e_stat_label)})</span>
-            </td>
-            <td style="padding: 8px 12px; text-align: right;">
-              <button class="btn btn-accent" style="padding: 2px 8px; font-size: 11px;" onclick="openFileInVersion('${escapeHtml(vStartName)}', '${escapeHtml(filePath)}')">Open in ${escapeHtml(vStartName)} ➔</button>
-            </td>
-          </tr>
+      let lastChangedCardHtml = "";
+      if (lastChanged) {
+        lastChangedCardHtml = `
+          <div style="background: rgba(97, 175, 239, 0.08); border: 1px solid rgba(97, 175, 239, 0.25); border-radius: 6px; padding: 12px 16px; margin-bottom: 16px; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px;">
+            <div>
+              <div style="font-size: 11px; color: var(--accent); font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px;">🕒 Last Changed (${escapeHtml(currentVersion)})</div>
+              <div style="font-size: 14px; font-weight: bold; color: var(--text-bright); margin-top: 4px;">${escapeHtml(lastChanged.subject || 'No subject')}</div>
+              <div style="font-size: 12px; color: var(--text-muted); margin-top: 4px;">
+                <span>Author: <strong>${escapeHtml(lastChanged.author_name || 'Unknown')}</strong> &lt;${escapeHtml(lastChanged.author_email || '')}&gt;</span>
+                <span style="margin-left: 12px;">📅 ${escapeHtml(lastChanged.author_date_iso || '')}</span>
+              </div>
+            </div>
+            <div style="display: flex; gap: 8px; align-items: center;">
+              <span class="commit-hash-chip" onclick="openCommitModal('${escapeJs(lastChanged.commit_hash)}')"># ${escapeHtml(lastChanged.commit_hash_short || (lastChanged.commit_hash || '').substring(0, 10))}</span>
+              <button class="btn btn-sm btn-accent" style="padding: 3px 8px; font-size: 11px;" onclick="closeFileHistoryModal(); exploreAtCommit('${escapeJs(lastChanged.commit_hash)}')">Explore ➔</button>
+            </div>
+          </div>
         `;
-      });
+      }
 
-      bodyEl.innerHTML = `
-        <table style="width: 100%; border-collapse: collapse; font-size: 12px; text-align: left;">
-          <thead>
-            <tr style="border-bottom: 1px solid var(--border-color); color: var(--text-muted);">
-              <th style="padding: 8px 12px;">FID</th>
-              <th style="padding: 8px 12px;">Started / Added In</th>
-              <th style="padding: 8px 12px;">Ended / Replaced In</th>
-              <th style="padding: 8px 12px; text-align: right;">Action</th>
-            </tr>
-          </thead>
-          <tbody>
-            ${rowsHtml || '<tr><td colspan="4" style="padding: 16px; text-align: center; color: var(--text-muted);">No additional revision history recorded.</td></tr>'}
-          </tbody>
-        </table>
+      // Render tab bar
+      const tabBarHtml = `
+        <div style="display: flex; gap: 8px; margin-bottom: 14px; border-bottom: 1px solid var(--border-color); padding-bottom: 8px;">
+          <button class="btn ${currentFileHistoryTab === 'git' ? 'btn-accent' : ''}" style="padding: 4px 12px; font-size: 12px;" onclick="switchFileHistoryTab('git', '${escapeJs(filePath)}')">
+            📜 Git Commits (${commits.length})
+          </button>
+          <button class="btn ${currentFileHistoryTab === 'checkpoints' ? 'btn-accent' : ''}" style="padding: 4px 12px; font-size: 12px;" onclick="switchFileHistoryTab('checkpoints', '${escapeJs(filePath)}')">
+            🏷️ Release Checkpoints (${checkpoints.length})
+          </button>
+        </div>
       `;
 
-      modal.classList.add("open");
+      let mainTabContent = "";
+      if (currentFileHistoryTab === "git") {
+        if (commits.length === 0) {
+          mainTabContent = `<div style="padding: 30px; text-align: center; color: var(--text-muted);">No Git commits found modifying this file up to ${escapeHtml(currentVersion)}.</div>`;
+        } else {
+          mainTabContent = `
+            <div style="display: flex; flex-direction: column; gap: 10px;">
+              ${commits.map(c => `
+                <div class="timeline-card" style="margin: 0; padding: 12px 14px;" onclick="openCommitModal('${escapeJs(c.commit_hash)}')">
+                  <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 6px;">
+                    <div style="display: flex; align-items: center; gap: 8px;">
+                      <span class="commit-hash-chip" onclick="event.stopPropagation(); openCommitModal('${escapeJs(c.commit_hash)}')"># ${escapeHtml(c.commit_hash_short || c.commit_hash.substring(0, 10))}</span>
+                      <span style="font-weight: 600; font-size: 12px; color: var(--text-bright);">${escapeHtml(c.author_name || 'Unknown')}</span>
+                      <span style="font-size: 11px; color: var(--text-muted);">&lt;${escapeHtml(c.author_email || '')}&gt;</span>
+                    </div>
+                    <span style="font-size: 11px; color: var(--text-muted);">📅 ${escapeHtml(c.author_date_iso || '')}</span>
+                  </div>
+                  <div style="font-size: 13px; color: var(--text-primary); margin: 6px 0; font-weight: 500;">
+                    ${escapeHtml(c.subject || '')}
+                  </div>
+                  <div style="display: flex; justify-content: flex-end; gap: 8px; margin-top: 4px;">
+                    <button class="btn btn-sm" style="padding: 2px 8px; font-size: 11px;" onclick="event.stopPropagation(); navigator.clipboard.writeText('${escapeJs(c.commit_hash)}'); showToast('Copied SHA', 'info');">📋 Copy SHA</button>
+                    <button class="btn btn-sm" style="padding: 2px 8px; font-size: 11px;" onclick="event.stopPropagation(); closeFileHistoryModal(); exploreAtCommit('${escapeJs(c.commit_hash)}')">Explore at Commit ➔</button>
+                    <button class="btn btn-sm btn-accent" style="padding: 2px 8px; font-size: 11px;" onclick="event.stopPropagation(); openCommitModal('${escapeJs(c.commit_hash)}')">View Commit ➔</button>
+                  </div>
+                </div>
+              `).join('')}
+            </div>
+          `;
+        }
+      } else {
+        // Checkpoints table
+        let rowsHtml = "";
+        checkpoints.forEach((h) => {
+          const isCur = (fileInfo && h.fid === fileInfo.fid);
+          const sBadge = (h.s_stat === 'A') ? 'badge-success' : (h.s_stat === 'R') ? 'badge-warning' : 'badge-accent';
+          const isEndActive = (!h.vid_e || h.vid_e === 0);
+          const eBadge = isEndActive ? 'badge-success' : (h.e_stat === 'D') ? 'badge-danger' : 'badge-warning';
+
+          let vStartName = h.vname_s || (h.vid_s ? `v${h.vid_s}` : currentVersion);
+          let vEndName = isEndActive ? 'Active' : (h.vname_e || (h.vid_e ? `v${h.vid_e}` : 'Active'));
+
+          rowsHtml += `
+            <tr style="${isCur ? 'background: rgba(97, 175, 239, 0.15); font-weight: bold;' : ''}">
+              <td style="padding: 8px 12px; font-family: monospace;"><code>${h.fid}</code> ${isCur ? '<span class="badge badge-accent" style="font-size: 9px; margin-left: 4px;">CURRENT</span>' : ''}</td>
+              <td style="padding: 8px 12px;">
+                <span class="badge ${sBadge}">${escapeHtml(vStartName)}</span>
+                <span style="font-size: 11px; color: var(--text-muted); margin-left: 4px;">(${escapeHtml(h.s_stat_label || '')})</span>
+              </td>
+              <td style="padding: 8px 12px;">
+                <span class="badge ${eBadge}">${escapeHtml(vEndName)}</span>
+                <span style="font-size: 11px; color: var(--text-muted); margin-left: 4px;">(${escapeHtml(h.e_stat_label || '')})</span>
+              </td>
+              <td style="padding: 8px 12px; text-align: right;">
+                <button class="btn btn-accent" style="padding: 2px 8px; font-size: 11px;" onclick="openFileInVersion('${escapeHtml(vStartName)}', '${escapeHtml(filePath)}')">Open in ${escapeHtml(vStartName)} ➔</button>
+              </td>
+            </tr>
+          `;
+        });
+
+        mainTabContent = `
+          <table style="width: 100%; border-collapse: collapse; font-size: 12px; text-align: left;">
+            <thead>
+              <tr style="border-bottom: 1px solid var(--border-color); color: var(--text-muted);">
+                <th style="padding: 8px 12px;">FID</th>
+                <th style="padding: 8px 12px;">Started / Added In</th>
+                <th style="padding: 8px 12px;">Ended / Replaced In</th>
+                <th style="padding: 8px 12px; text-align: right;">Action</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${rowsHtml || '<tr><td colspan="4" style="padding: 16px; text-align: center; color: var(--text-muted);">No additional checkpoint history recorded.</td></tr>'}
+            </tbody>
+          </table>
+        `;
+      }
+
+      bodyEl.innerHTML = lastChangedCardHtml + tabBarHtml + mainTabContent;
+    }
+
+    function switchFileHistoryTab(tabName, filePath) {
+      currentFileHistoryTab = tabName;
+      const fileInfo = (activeFileData && activeFileData.file_info) ? activeFileData.file_info : {};
+      renderFileHistoryModalContent(filePath, currentFileHistoryData, fileInfo);
     }
 
     function closeFileHistoryModal(event) {
@@ -4930,11 +5103,19 @@
 
       if (blameViewEnabled) {
         const fid = activeFileData && activeFileData.file_info && activeFileData.file_info.fid;
-        if (fid && (!activeFileBlame || activeFileBlame.fid !== fid)) {
-          const bData = await apiFetchCached(`/api/version/${currentVersion}/file/${fid}/blame`, "blame_cache", `${currentVersion}:${fid}`);
+        const filePath = activeFileData && (activeFileData.path || (activeFileData.file_info && activeFileData.file_info.fname));
+        if ((fid || filePath) && (!activeFileBlame || (fid && activeFileBlame.fid !== fid) || (filePath && activeFileBlame.path !== filePath))) {
+          let bData = null;
+          if (filePath) {
+            bData = await apiFetchCached(`/api/commits/${currentVersion}/blame/${encodeURIComponent(filePath)}`, "blame_cache", `${currentVersion}:${filePath}`);
+          }
+          if (!bData && fid) {
+            bData = await apiFetchCached(`/api/version/${currentVersion}/file/${fid}/blame`, "blame_cache", `${currentVersion}:${fid}`);
+          }
           if (bData) activeFileBlame = bData;
         }
       }
+
 
       if (activeFileTags) {
         buildHighlightedSource(activeFileTags);
@@ -5992,15 +6173,30 @@
 
       // Build Blame Map for lines if Git Blame view is active
       const lineBlameMap = {};
-      if (blameViewEnabled && activeFileBlame && activeFileBlame.tags) {
-        activeFileBlame.tags.forEach(t => {
-          const ls = t.line_s || 1;
-          const le = t.line_e || ls;
-          for (let l = ls; l <= le; l++) {
-            if (!lineBlameMap[l]) lineBlameMap[l] = t;
-          }
-        });
+      if (blameViewEnabled && activeFileBlame) {
+        if (Array.isArray(activeFileBlame.lines)) {
+          activeFileBlame.lines.forEach(b => {
+            const lineNo = b.line || b.final_line;
+            lineBlameMap[lineNo] = {
+              line_s: lineNo,
+              line_e: lineNo,
+              primary_author: { name: b.author_name || b.author, email: b.author_email || b.author_mail },
+              primary_commit: { commit_hash: b.commit_hash, subject: b.subject || b.summary },
+              commits_count: 1
+            };
+          });
+        }
+        if (Array.isArray(activeFileBlame.tags)) {
+          activeFileBlame.tags.forEach(t => {
+            const ls = t.line_s || 1;
+            const le = t.line_e || ls;
+            for (let l = ls; l <= le; l++) {
+              if (!lineBlameMap[l] || !lineBlameMap[l].primary_author) lineBlameMap[l] = t;
+            }
+          });
+        }
       }
+
 
       // 7. Render gutter and code body
       let gutterHtml = "";
@@ -7660,8 +7856,11 @@
             "${escapeHtml(symData.prompt || 'Configuration Option')}"
           </div>
           ${symData.file_path ? `
-            <div style="font-size: 11px; color: var(--text-muted); margin-top: 4px;">
-              📁 Defined at: <span class="crumb-link" onclick="closeKconfigSymbolModal(); openPath('${escapeHtml(symData.file_path)}')">${escapeHtml(symData.file_path)}:${symData.line_s || 1}</span>
+            <div style="font-size: 11px; color: var(--text-muted); margin-top: 6px; display: flex; align-items: center; gap: 8px;">
+              <span>📁 Defined at:</span>
+              <button class="btn btn-sm btn-accent" style="padding: 2px 8px; font-size: 11px;" onclick="closeKconfigSymbolModal(); openPathAndHighlightLine('${escapeJs(symData.file_path)}', ${symData.line_s || 1}, ${symData.line_e || symData.line_s || 1})" title="Jump to declaration in Code View">
+                📄 ${escapeHtml(symData.file_path)}:${symData.line_s || 1}
+              </button>
             </div>
           ` : ''}
           <div style="display: flex; gap: 8px; flex-wrap: wrap; margin-top: 10px; font-size: 11px;">
@@ -8408,8 +8607,11 @@
           </div>
 
           ${symData.file_path ? `
-            <div style="font-size: 12px; color: var(--text-muted); margin-top: 6px;">
-              📁 Defined at: <span class="crumb-link" onclick="openPath('${escapeHtml(symData.file_path)}', ${symData.line_s || 1})">${escapeHtml(symData.file_path)}:${symData.line_s || 1}</span>
+            <div style="font-size: 12px; color: var(--text-muted); margin-top: 6px; display: flex; align-items: center; gap: 8px;">
+              <span>📁 Defined at:</span>
+              <button class="btn btn-sm btn-accent" style="padding: 2px 8px; font-size: 11px;" onclick="openPathAndHighlightLine('${escapeJs(symData.file_path)}', ${symData.line_s || 1}, ${symData.line_e || symData.line_s || 1})" title="Jump to declaration in Code View">
+                📄 ${escapeHtml(symData.file_path)}:${symData.line_s || 1}
+              </button>
             </div>
           ` : ''}
 
@@ -9403,7 +9605,10 @@
                 ${isMerge ? '<span class="badge" style="background: rgba(229, 192, 123, 0.2); color: #e5c07b; border: 1px solid #e5c07b;">🔀 Merge Commit</span>' : ''}
                 <span class="badge badge-accent">Version: ${escapeHtml(data.version || currentVersion)}</span>
               </div>
-              <button class="btn" style="padding: 4px 10px; font-size: 11px;" onclick="navigator.clipboard.writeText('${escapeJs(chash)}')">📋 Copy SHA</button>
+              <div style="display: flex; gap: 6px; align-items: center;">
+                <button class="btn btn-accent" style="padding: 4px 10px; font-size: 11px;" onclick="closeCommitModal(); exploreAtCommit('${escapeJs(chash)}')">🔍 Explore Files at this Commit</button>
+                <button class="btn" style="padding: 4px 10px; font-size: 11px;" onclick="navigator.clipboard.writeText('${escapeJs(chash)}')">📋 Copy SHA</button>
+              </div>
             </div>
             <h3 style="color: var(--text-bright); font-size: 16px; line-height: 1.4; margin: 4px 0;">${escapeHtml(data.subject)}</h3>
             <div style="display: flex; justify-content: space-between; align-items: center; font-size: 12px; color: var(--text-muted); flex-wrap: wrap; gap: 8px;">
@@ -9521,29 +9726,55 @@
     let timelineData = [];
     let timelineTopContributorsData = [];
     let timelineLoadedVersion = "";
+    let timelineDirection = "past";
+    let timelineAnchorCommit = null;
+    let timelineCursorId = null;
 
-    async function loadTimelineData(force = false) {
+    async function loadTimelineData(force = false, direction = null, cursorId = null) {
+      if (direction) timelineDirection = direction;
+      if (cursorId !== undefined) timelineCursorId = cursorId;
+
       const stream = document.getElementById("timelineStream");
       const topEl = document.getElementById("timelineTopContributors");
       const countBadge = document.getElementById("timelineCountBadge");
 
       if (!stream || !topEl) return;
-      stream.innerHTML = `<div style="padding: 40px; text-align: center; color: var(--accent);">⏳ Loading commit timeline for ${currentVersion}...</div>`;
+      stream.innerHTML = `<div style="padding: 40px; text-align: center; color: var(--accent);">⏳ Loading commit timeline for ${currentVersion} (${timelineDirection})...</div>`;
       topEl.innerHTML = `<div style="color: var(--text-muted); font-size: 11px;">Loading ranking...</div>`;
 
-      const data = await apiFetch(`/api/version/${currentVersion}/timeline?limit=150`);
+      let url = `/api/version/${currentVersion}/timeline?limit=100&direction=${encodeURIComponent(timelineDirection)}`;
+      if (timelineCursorId) url += `&cursor_id=${timelineCursorId}`;
+
+      const data = await apiFetch(url);
       if (!data || !data.timeline) {
         stream.innerHTML = `<div style="padding: 40px; text-align: center; color: var(--danger);">Failed to load commit timeline.</div>`;
         return;
       }
 
       timelineData = data.timeline || [];
+      timelineAnchorCommit = data.anchor_commit || null;
       timelineTopContributorsData = data.top_contributors || [];
       timelineLoadedVersion = currentVersion;
-      if (countBadge) countBadge.innerText = `${data.total_commits || timelineData.length} Commits`;
+      if (countBadge) countBadge.innerText = `${data.total_commits || timelineData.length} Commits (${timelineDirection})`;
 
       renderTimelineTopContributors();
       renderTimelineStream(timelineData);
+      updateTimelineDirectionButtons();
+    }
+
+    function seekTimelineDirection(dir) {
+      timelineDirection = dir;
+      timelineCursorId = null;
+      loadTimelineData(false, dir, null);
+    }
+
+    function updateTimelineDirectionButtons() {
+      const fut = document.getElementById("btnTimelineSeekFuture");
+      const anc = document.getElementById("btnTimelineSeekAnchor");
+      const past = document.getElementById("btnTimelineSeekPast");
+      if (fut) fut.className = `btn ${timelineDirection === 'future' ? 'btn-accent' : ''}`;
+      if (anc) anc.className = `btn ${timelineDirection === 'around' ? 'btn-accent' : ''}`;
+      if (past) past.className = `btn ${timelineDirection === 'past' ? 'btn-accent' : ''}`;
     }
 
     function renderTimelineTopContributors() {
@@ -9583,13 +9814,27 @@
         return;
       }
 
-      stream.innerHTML = commits.map(c => {
+      let headerBanner = "";
+      if (timelineAnchorCommit) {
+        headerBanner = `
+          <div style="background: rgba(97, 175, 239, 0.12); border: 1px solid rgba(97, 175, 239, 0.35); border-radius: 6px; padding: 10px 14px; margin-bottom: 8px; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px;">
+            <div>
+              <span style="font-weight: bold; color: var(--accent);">🏷️ Version Anchor: ${escapeHtml(currentVersion)}</span>
+              <span style="font-size: 12px; color: var(--text-muted); margin-left: 8px;">Commit #${escapeHtml((timelineAnchorCommit.commit_hash || '').substring(0, 10))} &mdash; "${escapeHtml(timelineAnchorCommit.subject || '')}"</span>
+            </div>
+            <button class="btn btn-sm btn-accent" style="padding: 2px 8px; font-size: 11px;" onclick="exploreAtCommit('${escapeJs(timelineAnchorCommit.commit_hash)}')">Explore at Anchor ➔</button>
+          </div>
+        `;
+      }
+
+      const cardsHtml = commits.map(c => {
         const auth = c.author || {};
         const authName = auth.name || auth.email || "Unknown";
         const initials = (authName.replace(/[^A-Za-z]/g, "").substring(0, 2) || "U").toUpperCase();
         const avatarBg = getAuthorColor(authName);
         const contribs = c.contributors || [];
         const coDevs = contribs.filter(cb => cb.role !== 1);
+        const isAnchor = timelineAnchorCommit && c.commit_hash === timelineAnchorCommit.commit_hash;
 
         const coDevsHtml = coDevs.slice(0, 3).map(cb => `
           <span class="badge" style="font-size: 10px; opacity: 0.85;" onclick="event.stopPropagation(); openPersonModal('${escapeJs(cb.email || cb.name)}')">
@@ -9598,13 +9843,14 @@
         `).join("");
 
         return `
-          <div class="timeline-card" onclick="openCommitModal('${escapeJs(c.commit_hash)}')">
+          <div class="timeline-card" style="${isAnchor ? 'border-left: 4px solid var(--accent); background: rgba(97, 175, 239, 0.05);' : ''}" onclick="openCommitModal('${escapeJs(c.commit_hash)}')">
             <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px;">
               <div style="display: flex; align-items: center; gap: 10px;">
                 <span class="author-avatar" style="background: ${avatarBg};">${initials}</span>
                 <div>
                   <a class="person-link" style="font-weight: bold; font-size: 13px;" onclick="event.stopPropagation(); openPersonModal('${escapeJs(auth.email || auth.name)}')">${escapeHtml(authName)}</a>
                   <span style="font-size: 11px; color: var(--text-muted); margin-left: 6px;">${escapeHtml(c.author_date_iso || '')}</span>
+                  ${isAnchor ? `<span class="badge" style="background: #61afef; color: #000; font-weight: bold; margin-left: 6px; font-size: 10px;">⭐ VERSION ANCHOR</span>` : ''}
                 </div>
               </div>
               <span class="commit-hash-chip" onclick="event.stopPropagation(); openCommitModal('${escapeJs(c.commit_hash)}')"># ${c.commit_hash.substring(0, 10)}</span>
@@ -9619,14 +9865,17 @@
                 ${coDevsHtml}
                 ${coDevs.length > 3 ? `<span style="color: var(--text-muted);">+${coDevs.length - 3} more</span>` : ''}
               </div>
-              <div style="display: flex; gap: 10px; align-items: center;">
+              <div style="display: flex; gap: 8px; align-items: center;">
                 <span>📁 ${c.files_count || 0} files</span>
+                <button class="btn btn-sm" style="padding: 2px 8px; font-size: 11px;" onclick="event.stopPropagation(); exploreAtCommit('${escapeJs(c.commit_hash)}')">Explore ➔</button>
                 <button class="btn btn-accent" style="padding: 2px 8px; font-size: 11px;" onclick="event.stopPropagation(); openCommitModal('${escapeJs(c.commit_hash)}')">Details ➔</button>
               </div>
             </div>
           </div>
         `;
       }).join("");
+
+      stream.innerHTML = headerBanner + cardsHtml;
     }
 
     const filterTimeline = debounce(function() {
@@ -10160,11 +10409,17 @@
         btnAst.style.display = (astId && astId !== "null" && astId !== 0) ? "flex" : "none";
       }
 
+      const isKconfig = text.startsWith("CONFIG_") || typeKey === "kconfig" || typeKey === "Kconfig" || typeKey === "token-kconfig-symbol";
+      const btnKdecl = document.getElementById("btnPopoverKconfigDecl");
+      const btnKview = document.getElementById("btnPopoverKconfigView");
+      if (btnKdecl) btnKdecl.style.display = isKconfig ? "flex" : "none";
+      if (btnKview) btnKview.style.display = isKconfig ? "flex" : "none";
+
       popover.style.display = "block";
       const clientX = (event && event.clientX !== undefined) ? event.clientX : 100;
       const clientY = (event && event.clientY !== undefined) ? event.clientY : 100;
       const popWidth = 240;
-      const popHeight = 200;
+      const popHeight = 220;
       const x = Math.min(window.innerWidth - popWidth - 10, Math.max(10, clientX + 4));
       const y = Math.min(window.innerHeight - popHeight - 10, Math.max(10, clientY + 14));
       popover.style.position = "fixed";
@@ -10178,12 +10433,46 @@
       if (!currentPopoverToken) return;
 
       const text = currentPopoverToken.text;
+      const typeKey = currentPopoverToken.typeKey || "";
+      if (text.startsWith("CONFIG_") || typeKey === "kconfig" || typeKey === "Kconfig") {
+        await popoverGotoKconfigDecl();
+        return;
+      }
+
       const res = await apiFetch(`/api/symbols/lookup?q=${encodeURIComponent(text)}`);
       if (res && res.length > 0 && res[0].file_path) {
         openPathAndHighlightLine(res[0].file_path, res[0].line_start, res[0].line_end || res[0].line_start);
       } else {
         openXrefModal(text);
       }
+    }
+
+    async function popoverGotoKconfigDecl() {
+      const popover = document.getElementById("tokenActionPopover");
+      if (popover) popover.style.display = "none";
+      if (!currentPopoverToken) return;
+      const text = currentPopoverToken.text;
+      const cleanSym = text.startsWith("CONFIG_") ? text.slice(7) : text;
+      try {
+        const symData = await apiFetch(`/api/version/${currentVersion}/kconfig/symbol/${encodeURIComponent(cleanSym)}`);
+        if (symData && symData.file_path) {
+          openPathAndHighlightLine(symData.file_path, symData.line_s || 1, symData.line_e || symData.line_s || 1);
+          showToast(`Jumped to declaration of CONFIG_${cleanSym}`, "success");
+          return;
+        }
+      } catch (e) {
+        console.warn("Kconfig declaration lookup failed", e);
+      }
+      showToast(`Declaration location not found for ${text}`, "warning");
+    }
+
+    function popoverOpenKconfigView() {
+      const popover = document.getElementById("tokenActionPopover");
+      if (popover) popover.style.display = "none";
+      if (!currentPopoverToken) return;
+      const text = currentPopoverToken.text;
+      const cleanSym = text.startsWith("CONFIG_") ? text.slice(7) : text;
+      openKconfigSymbolModal(cleanSym);
     }
 
     function popoverOpenXref() {
@@ -11983,8 +12272,9 @@
       const archSelect = document.getElementById("exportArchSelect");
       const arch = archSelect ? archSelect.value : "x86";
       const data = await apiFetch(`/api/version/${currentVersion}/export/compile_commands?arch=${encodeURIComponent(arch)}`);
-      if (data && data.compile_commands) {
-        const jsonStr = JSON.stringify(data.compile_commands, null, 2);
+      const cmds = (data && data.compile_commands) ? data.compile_commands : Array.isArray(data) ? data : null;
+      if (cmds) {
+        const jsonStr = JSON.stringify(cmds, null, 2);
         const blob = new Blob([jsonStr], { type: "application/json" });
         const url = URL.createObjectURL(blob);
         const a = document.createElement("a");

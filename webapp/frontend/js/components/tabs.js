@@ -3,6 +3,7 @@
  * Renders tab strips, pane splitters, and delegates active tab rendering to domain views.
  */
 import { state } from "../state.js";
+import { shortRef } from "./ref_picker.js";
 
 export class TabsComponent {
   constructor(containerEl, viewRenderers) {
@@ -46,6 +47,7 @@ export class TabsComponent {
       pane.tabs.forEach((tab) => {
         const tabEl = document.createElement("div");
         tabEl.className = `tab ${tab.id === pane.activeTabId ? "active" : ""}`;
+        tabEl.dataset.tabId = tab.id;
         tabEl.title = tab.path || tab.title;
 
         // Icon
@@ -61,7 +63,7 @@ export class TabsComponent {
         // Version badge if different from global
         const verSpan = document.createElement("span");
         verSpan.className = "tab-version";
-        verSpan.textContent = tab.version || state.currentVersion;
+        verSpan.textContent = shortRef(tab.version || state.currentVersion);
 
         // Close button
         const closeBtn = document.createElement("button");
@@ -181,6 +183,7 @@ export class TabsComponent {
       case "pahole": return "[P]";
       case "callgraph": return "[X]";
       case "diff": return "[D]";
+      case "treemap": return "[T]";
       default: return "[?]";
     }
   }

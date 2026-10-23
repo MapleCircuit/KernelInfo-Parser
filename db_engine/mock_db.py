@@ -123,12 +123,15 @@ class MockDB(BaseDBEngine):
         primaries = table.primary
         curr_next_id = self.tables_next_id.get(table.table_name, 1)
 
+        is_idempotent = getattr(table, "idempotent_pk", False)
         if primaries:
             if len(primaries) == 1:
                 pk_idx = primaries[0]
                 for row in data:
                     pk = row[pk_idx]
                     if pk in table_dict:
+                        if is_idempotent:
+                            continue
                         raise ValueError(f"Duplicate entry for primary key '{pk}' in table '{table.table_name}'")
                     table_dict[pk] = tuple(row)
                     if isinstance(pk, int) and pk >= curr_next_id:
@@ -138,6 +141,8 @@ class MockDB(BaseDBEngine):
                 for row in data:
                     pk = tuple(row[i] for i in primaries)
                     if pk in table_dict:
+                        if is_idempotent:
+                            continue
                         raise ValueError(f"Duplicate entry for primary key '{pk}' in table '{table.table_name}'")
                     table_dict[pk] = tuple(row)
                     first_val = row[pk_0]
@@ -334,10 +339,14 @@ class MockDB(BaseDBEngine):
         has_vids = "vid_s" in col_names and "vid_e" in col_names
         has_vid = "vid" in col_names
         has_vids_only = "vid_s" in col_names and not has_vids
+        has_blob = "blob_id" in col_names
+        has_commit = "commit_id" in col_names
 
         vid_s_idx = col_names.index("vid_s") if "vid_s" in col_names else None
         vid_e_idx = col_names.index("vid_e") if "vid_e" in col_names else None
         vid_idx = col_names.index("vid") if "vid" in col_names else None
+        blob_idx = col_names.index("blob_id") if "blob_id" in col_names else None
+        commit_idx = col_names.index("commit_id") if "commit_id" in col_names else None
 
         results = []
         is_partial = cached_columns is not None and len(cached_columns) < table.length
@@ -356,6 +365,14 @@ class MockDB(BaseDBEngine):
                 elif has_vids_only and vid_s_idx is not None:
                     vid_s_val = row[vid_s_idx]
                     if vid_s_val is not None and vid_s_val < min_vid:
+                        continue
+                elif has_blob and blob_idx is not None:
+                    blob_val = row[blob_idx]
+                    if blob_val is not None and blob_val < min_vid:
+                        continue
+                elif has_commit and commit_idx is not None:
+                    commit_val = row[commit_idx]
+                    if commit_val is not None and commit_val < min_vid:
                         continue
 
             # Slice cached columns if partial

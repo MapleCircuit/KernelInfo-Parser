@@ -14,6 +14,181 @@ class MasterFile:
         """Initialize tracking dictionaries for cloned version directories and file contents."""
         self.version_dict = {}
         self.file_dict = {}
+        self.workspace_dir: str | None = None
+        self._cat_file_proc: sp.Popen | None = None
+        self.repo_dir: Path = Path(G.linux_directory).resolve()
+
+    def set_repo_dir(self, repo_dir: str | Path) -> None:
+        """Set the active Git repository directory and restart cat-file subprocess if path changes."""
+        new_dir = Path(repo_dir).resolve()
+        if getattr(self, "repo_dir", None) != new_dir:
+            self._close_cat_file_proc()
+            self.repo_dir = new_dir
+            G.linux_directory = new_dir
+
+    def get_repo_dir(self) -> str:
+        """Get the active Git repository directory as a string path."""
+        repo = getattr(self, "repo_dir", None) or Path(G.linux_directory)
+        return str(repo)
+
+    def _get_git_dir(self) -> str:
+        """Resolve the active .git directory for Git subprocess execution."""
+        repo = getattr(self, "repo_dir", None) or Path(G.linux_directory)
+        dot_git = repo / ".git"
+        if dot_git.exists():
+            return str(dot_git)
+        return str(repo)
+
+    def _ensure_cat_file_proc(self) -> sp.Popen:
+        """Ensure persistent git cat-file --batch subprocess is alive."""
+        if self._cat_file_proc is not None and self._cat_file_proc.poll() is None:
+            return self._cat_file_proc
+
+        self._close_cat_file_proc()
+        git_dir = self._get_git_dir()
+        self._cat_file_proc = sp.Popen(
+            ["git", f"--git-dir={git_dir}", "cat-file", "--batch"],
+            stdin=sp.PIPE,
+            stdout=sp.PIPE,
+            stderr=sp.PIPE,
+            bufsize=0,
+        )
+        return self._cat_file_proc
+
+    def _close_cat_file_proc(self) -> None:
+        """Safely terminate persistent git cat-file --batch subprocess."""
+        if self._cat_file_proc is not None:
+            try:
+                if self._cat_file_proc.stdin:
+                    self._cat_file_proc.stdin.close()
+                if self._cat_file_proc.stdout:
+                    self._cat_file_proc.stdout.close()
+                if self._cat_file_proc.stderr:
+                    self._cat_file_proc.stderr.close()
+                self._cat_file_proc.terminate()
+                self._cat_file_proc.wait(timeout=1.0)
+            except Exception:
+                try:
+                    self._cat_file_proc.kill()
+                except Exception:
+                    pass
+            finally:
+                self._cat_file_proc = None
+
+    def _read_blob(self, target_spec: str) -> bytes | None:
+        """Read blob bytes from persistent git cat-file --batch subprocess."""
+        for attempt in range(2):
+            try:
+                proc = self._ensure_cat_file_proc()
+                assert proc.stdin is not None
+                assert proc.stdout is not None
+
+                proc.stdin.write(f"{target_spec}\n".encode("utf-8"))
+                proc.stdin.flush()
+
+                header_bytes = proc.stdout.readline()
+                if not header_bytes:
+                    raise BrokenPipeError("Empty header read from git cat-file stdout.")
+
+                header = header_bytes.decode("utf-8", errors="replace").strip()
+                if header.endswith("missing"):
+                    return None
+
+                parts = header.split()
+                if len(parts) < 3:
+                    return None
+
+                obj_type = parts[1]
+                size = int(parts[2])
+
+                data = bytearray()
+                while len(data) < size:
+                    chunk = proc.stdout.read(size - len(data))
+                    if not chunk:
+                        raise BrokenPipeError("Unexpected EOF while reading blob content.")
+                    data.extend(chunk)
+
+                # Consume trailing newline
+                _ = proc.stdout.read(1)
+
+                if obj_type != "blob":
+                    return None
+                return bytes(data)
+            except (BrokenPipeError, OSError, ValueError):
+                self._close_cat_file_proc()
+                if attempt == 1:
+                    raise
+        return None
+
+    def sync_workspace(self, target_rev: str, change_list: list[str]) -> str:
+        """Incrementally synchronize persistent RAMDISK workspace with target_rev using git cat-file."""
+        if not self.workspace_dir or not os.path.exists(self.workspace_dir):
+            self.workspace_dir = self.git_clone(target_rev)
+            self.version_dict[target_rev] = self.workspace_dir
+            self.file_dict.clear()
+            self.file_dict[target_rev] = {}
+            return self.workspace_dir
+
+        self.version_dict[target_rev] = self.workspace_dir
+        self.file_dict.clear()
+        self.file_dict[target_rev] = {}
+
+        for item in change_list:
+            if not item or not item.strip():
+                continue
+            tokens = item.strip().split("\t")
+            status = tokens[0].split()[-1] if " " in tokens[0] else tokens[0]
+
+            if status.startswith("D"):
+                path = tokens[1]
+                target_file = os.path.join(self.workspace_dir, path)
+                if os.path.exists(target_file) or os.path.islink(target_file):
+                    try:
+                        os.unlink(target_file)
+                    except OSError:
+                        pass
+            elif status.startswith("R"):
+                old_path = tokens[1]
+                new_path = tokens[2]
+                old_target = os.path.join(self.workspace_dir, old_path)
+                if os.path.exists(old_target) or os.path.islink(old_target):
+                    try:
+                        os.unlink(old_target)
+                    except OSError:
+                        pass
+                blob_bytes = self._read_blob(f"{target_rev}:{new_path}")
+                if blob_bytes is not None:
+                    new_target = os.path.join(self.workspace_dir, new_path)
+                    os.makedirs(os.path.dirname(new_target), exist_ok=True)
+                    with open(new_target, "wb") as f:
+                        f.write(blob_bytes)
+            elif status.startswith("A") or status.startswith("M") or status.startswith("C"):
+                path = tokens[1]
+                blob_bytes = self._read_blob(f"{target_rev}:{path}")
+                if blob_bytes is not None:
+                    target_file = os.path.join(self.workspace_dir, path)
+                    os.makedirs(os.path.dirname(target_file), exist_ok=True)
+                    with open(target_file, "wb") as f:
+                        f.write(blob_bytes)
+
+        # Ensure asm symlinks remain intact
+        asm_path = Path(f"{self.workspace_dir}/include/asm")
+        if not asm_path.exists() and not asm_path.is_symlink():
+            try:
+                os.symlink("asm-generic", asm_path)
+            except OSError:
+                sp.run(["ln", "-s", "asm-generic", str(asm_path)], check=False)
+
+        uapi_asm_parent = Path(f"{self.workspace_dir}/include/uapi")
+        if uapi_asm_parent.exists():
+            uapi_asm_path = Path(f"{self.workspace_dir}/include/uapi/asm")
+            if not uapi_asm_path.exists() and not uapi_asm_path.is_symlink():
+                try:
+                    os.symlink("asm-generic", uapi_asm_path)
+                except OSError:
+                    sp.run(["ln", "-s", "asm-generic", str(uapi_asm_path)], check=False)
+
+        return self.workspace_dir
 
     def create_temp_dir(self) -> str:
         """Create a new temporary directory in RAMDISK for cloning repository versions."""
@@ -45,16 +220,25 @@ class MasterFile:
 
     def clear_all_version(self) -> None:
         """Remove all cloned repository version directories from disk and clear state."""
+        self._close_cat_file_proc()
         for item in self.version_dict:
-            shutil.rmtree(self.version_dict[item])
+            if os.path.exists(self.version_dict[item]):
+                shutil.rmtree(self.version_dict[item], ignore_errors=True)
+        if self.workspace_dir and os.path.exists(self.workspace_dir):
+            shutil.rmtree(self.workspace_dir, ignore_errors=True)
+        self.workspace_dir = None
         self.version_dict.clear()
         self.file_dict.clear()
         return
 
+    def __del__(self) -> None:
+        """Safely clean up persistent subprocess on destruction."""
+        self._close_cat_file_proc()
+
     def git_clone(self, version: str) -> str:
         """Extract a repository version branch directly into RAMDISK and set up include symlinks."""
         temp_path = self.create_temp_dir()
-        git_dir = f"{G.linux_directory}/.git" if Path(f"{G.linux_directory}/.git").exists() else "linux/.git"
+        git_dir = self._get_git_dir()
         p_arch = sp.Popen(
             ["git", f"--git-dir={git_dir}", "archive", f"{version}"],
             stdout=sp.PIPE,
@@ -83,7 +267,7 @@ class MasterFile:
     def get_file(self, file_path: str, version: str) -> str:
         """Retrieve content of a file at a specific version (from disk cache or git show)."""
         if version not in self.version_dict:
-            git_dir = f"{G.linux_directory}/.git" if Path(f"{G.linux_directory}/.git").exists() else "linux/.git"
+            git_dir = self._get_git_dir()
             command = ["git", f"--git-dir={git_dir}", "show", f"{version}:{file_path}"]
             raw_file = sp.run(command, capture_output=True, text=True, encoding="latin-1")  # noqa: PLW1510
             return raw_file.stdout
@@ -107,14 +291,22 @@ class MasterFile:
                 self.file_dict[version][file_path] = p.read_text(encoding="latin-1")
         return self.file_dict[version][file_path]
 
-    def generate_change_list(self, gp: object) -> list[str]:
-        """Generate git diff change list (--name-status) between old and current version."""
+    def generate_change_list(self, gp: object, base_rev: str | None = None, target_rev: str | None = None) -> list[str]:
+        """Generate git diff change list (--name-status) between base_rev (or Old_Version_Name) and target_rev."""
+        old_rev = base_rev if base_rev is not None else getattr(gp, "Old_Version_Name", None)
+        new_rev = target_rev if target_rev is not None else getattr(gp, "Version_Name", None)
+        git_dir = self._get_git_dir()
+
+        EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+        if not old_rev or str(old_rev) == "0":
+            old_rev = EMPTY_TREE
+
         command = [
             "git",
-            "--git-dir=linux/.git",
+            f"--git-dir={git_dir}",
             "diff",
-            f"{gp.Old_Version_Name}",
-            f"{gp.Version_Name}",
+            f"{old_rev}",
+            f"{new_rev}",
             "--name-status",
         ]
 
@@ -124,9 +316,10 @@ class MasterFile:
 
     def git_file_list(self, version: str) -> str:
         """Retrieve full list of tracked files in git repository for a version."""
+        git_dir = self._get_git_dir()
         command = [
             "git",
-            "--git-dir=linux/.git",
+            f"--git-dir={git_dir}",
             "ls-tree",
             "-r",
             "--name-only",
@@ -137,9 +330,10 @@ class MasterFile:
 
     def get_dir_list(self, version_name: str) -> list[str]:
         """Retrieve full list of relative directory paths for a version from git repository."""
+        git_dir = self._get_git_dir()
         command = [
             "git",
-            "--git-dir=linux/.git",
+            f"--git-dir={git_dir}",
             "ls-tree",
             "-r",
             "-d",
@@ -155,3 +349,81 @@ class MasterFile:
                 return file_path[len(working_dir)+1:]
 
         return file_path
+
+    def get_version_tags(
+        self,
+        start_ref: str | None = None,
+        include_pre_releases: bool | None = None,
+    ) -> list[str]:
+        """Discover and sequence repository version tags starting from start_ref using git version sorting."""
+        git_dir = self._get_git_dir()
+        command = [
+            "git",
+            f"--git-dir={git_dir}",
+            "-c",
+            "versionsort.suffix=-rc",
+            "-c",
+            "versionsort.suffix=-pre",
+            "tag",
+            "-l",
+            "--sort=v:refname",
+        ]
+        res = sp.run(command, capture_output=True, text=True, check=False)
+        if res.returncode != 0 or not res.stdout.strip():
+            return [start_ref] if start_ref else ["v3.0"]
+
+        raw_tags = [t.strip() for t in res.stdout.splitlines() if t.strip()]
+        if not raw_tags:
+            return [start_ref] if start_ref else ["v3.0"]
+
+        start = start_ref or "v3.0"
+        # Release candidates are parsed by default (each -rc# becomes its own snapshot)
+        if include_pre_releases is None:
+            include_pre_releases = True
+
+        # "-tree" tags (e.g. v2.6.11-tree) point at trees, not commits
+        raw_tags = [t for t in raw_tags if not t.endswith("-tree")]
+        if not include_pre_releases:
+            tags = [t for t in raw_tags if not any(pre in t for pre in ("-rc", "-alpha", "-beta", "-pre"))]
+            if not tags:
+                tags = raw_tags
+        else:
+            tags = raw_tags
+
+        matched_idx = None
+        for candidate in [start, f"v{start}", start.lstrip("v")]:
+            if candidate in tags:
+                matched_idx = tags.index(candidate)
+                start = candidate
+                break
+
+        if matched_idx is None:
+            return self._commit_start_sequence(start, tags)
+
+        return tags[matched_idx:]
+
+    def _git_lines(self, *args: str) -> list[str]:
+        res = sp.run(["git", f"--git-dir={self._get_git_dir()}", *args], capture_output=True, text=True, check=False)
+        if res.returncode != 0:
+            return []
+        return [line.strip() for line in res.stdout.splitlines() if line.strip()]
+
+    def _commit_start_sequence(self, start: str, tags: list[str]) -> list[str]:
+        """Sequence for a start ref that is not a listed release tag (e.g. the repository's first commit).
+
+        Returns [start, <every listed tag whose history contains start>] in version order. A tag
+        pointing exactly at start replaces the raw SHA so the snapshot is registered under its name.
+        """
+        if not self._git_lines("rev-parse", "--verify", "--quiet", f"{start}^{{commit}}"):
+            return [start]
+        points_at = set(self._git_lines("tag", "--points-at", start))
+        descendants = set(self._git_lines("tag", "--contains", start)) - points_at
+        # Name the snapshot after a tag on that exact commit even when pre-release tags are filtered out
+        exact = sorted(t for t in points_at if not t.endswith("-tree"))
+        first = exact[0] if exact else start
+        return [first] + [t for t in tags if t in descendants]
+
+    def get_root_commit(self, rev: str = "HEAD") -> str | None:
+        """First commit of rev's history (the parentless commit reached by following first parents)."""
+        roots = self._git_lines("rev-list", "--max-parents=0", "--first-parent", rev)
+        return roots[-1] if roots else None

@@ -70,13 +70,13 @@ class TECachedDB(TEDirectDB):
         return bool(getattr(table, "te_cached", False))
 
     def _is_version_scoped(self, table: Table) -> bool:
-        """Check if target table is configured for version-scoped working-window caching."""
-        return bool(getattr(table, "version_scoped", False))
+        """Check if target table is configured for version-scoped or blob-scoped working-window caching."""
+        return bool(getattr(table, "blob_scoped", False) or getattr(table, "version_scoped", False))
 
     def _get_vid_col_idx(self, table: Table) -> int | None:
-        """Locate the 0-indexed column position of the version ID column ('vid' or 'vid_s')."""
+        """Locate the 0-indexed column position of scope ID column ('vid', 'vid_s', 'blob_id', or 'commit_id')."""
         for idx, col in enumerate(table.init_columns):
-            if col[0] in ("vid", "vid_s"):
+            if col[0] in ("vid", "vid_s", "blob_id", "commit_id"):
                 return idx
         return None
 
@@ -271,11 +271,13 @@ class TECachedDB(TEDirectDB):
             for table_id, table in self.tables.items():
                 self.queued_set[table_id] = {}
                 self.queued_update[table_id] = []
+                self._queued_sec_indexes[table_id] = {idx_cols: {} for idx_cols in self._table_sec_indexes.get(table_id, ())}
+                self._queued_single_col_indexes[table_id] = {col_idx: {} for col_idx in self._table_single_col_indexes.get(table_id, ())}
                 self._ensure_table(table_id)
                 if table.no_duplicate:
-                    self._committed_nodup_keys[table_id] = dict(self._nodup_index.get(table_id, {}))
+                    self._committed_nodup_keys[table_id] = {}
                 if getattr(table, "init_primary", ()) == ("hash",) or table.table_name in ("m_tag_code", "m_ast_hash"):
-                    self._committed_pks[table_id] = set(self._pk_index.get(table_id, {}).keys())
+                    self._committed_pks[table_id] = set()
                 if self.db is not None:
                     try:
                         self.next_id[table_id] = self.db.get_next_id(table)
@@ -362,10 +364,22 @@ class TECachedDB(TEDirectDB):
                         builder.add_table(t_id, table.length, table.primary, rows)
                 self._shared_buffer = builder.build()
                 if self._shared_buffer:
+                    # Replace heap cache structures with zero-copy shared memory views
+                    # to prevent duplicate memory usage across heap and mmap while satisfying sequence/dict lookups.
+                    from table_engine.shared_buffer import SharedTableRowSequenceView, SharedTablePKView
+                    for t_id in self._shared_buffer.tables:
+                        self._cached_rows[t_id] = SharedTableRowSequenceView(self._shared_buffer, t_id)
+                        self._cached_rows_pos[t_id] = {}
+                        self._pk_index[t_id] = SharedTablePKView(self._shared_buffer, t_id)
+                        self._col_indices[t_id] = {}
+                        self._committed_pks[t_id] = set()
+                        self._committed_nodup_keys[t_id] = {}
+                    from core.globalstuff import reclaim_system_memory
+                    reclaim_system_memory()
                     logger.info(
                         f"[TECachedDB] Backed {len(self._shared_buffer.tables)} tables "
                         f"({self._shared_buffer.total_size // (1024*1024)}MB) with structured shared memory "
-                        f"(page size: {self._shared_buffer.page_size // 1024}KB, mode: {self.hugepages})."
+                        f"(page size: {self._shared_buffer.page_size // 1024}KB, mode: {self.hugepages}) and activated zero-copy views."
                     )
             except Exception as e:
                 logger.warning(f"[TECachedDB] Failed to build shared huge page buffer: {e}. Falling back to standard heap.")
@@ -534,9 +548,14 @@ class TECachedDB(TEDirectDB):
             if staged_id is not None:
                 return (staged_id, *columns[1:])
 
-            assigned_id = self.next_id[table_id]
+            if columns[0] is not None:
+                assigned_id = columns[0]
+                if isinstance(assigned_id, int) and assigned_id >= self.next_id[table_id]:
+                    self.next_id[table_id] = assigned_id + 1
+            else:
+                assigned_id = self.next_id[table_id]
+                self.next_id[table_id] += 1
             self.queued_set[table_id][key] = assigned_id
-            self.next_id[table_id] += 1
             row = (assigned_id, *columns[1:])
             proj_row = self._project_row(table, row)
             pos = len(self._cached_rows[table_id])
@@ -546,6 +565,7 @@ class TECachedDB(TEDirectDB):
                 pk = self._sanitize_key(pk_fn(proj_row) if pk_fn is not None else itemgetter(*table.primary)(proj_row))
                 self._cached_rows_pos[table_id][pk] = pos
             self._index_row(table, proj_row)
+            self._index_staged_row(table_id, row)
             return row
 
         if columns[0] is None:
@@ -561,19 +581,18 @@ class TECachedDB(TEDirectDB):
                 pk = self._sanitize_key(pk_fn(proj_row) if pk_fn is not None else itemgetter(*table.primary)(proj_row))
                 self._cached_rows_pos[table_id][pk] = pos
             self._index_row(table, proj_row)
+            self._index_staged_row(table_id, row)
             return row
 
         pk_fn = self._pk_getters.get(table_id)
         pk = self._sanitize_key(pk_fn(columns) if pk_fn is not None else itemgetter(*table.primary)(columns))
 
-        if getattr(table, "init_primary", ()) == ("hash",) or table.table_name in ("m_tag_code", "m_ast_hash"):
+        if getattr(table, "idempotent_pk", False) or getattr(table, "init_primary", ()) == ("hash",) or table.table_name in ("m_tag_code", "m_ast_hash"):
             if pk in self.queued_set[table_id]:
-                return columns
+                return self.queued_set[table_id][pk]
             existing_row = self._pk_index[table_id].get(pk)
             if existing_row is not None:
-                proj_row = self._project_row(table, columns)
-                if existing_row == proj_row:
-                    return columns
+                return existing_row
             if pk in self._committed_pks.get(table_id, set()):
                 return columns
         else:
@@ -590,6 +609,7 @@ class TECachedDB(TEDirectDB):
 
         self.queued_set[table_id][pk] = columns
         self._index_row(table, proj_row)
+        self._index_staged_row(table_id, columns)
         return columns
 
     def update(
@@ -652,6 +672,17 @@ class TECachedDB(TEDirectDB):
             self._pk_index.pop(table_id, None)
             self._nodup_index.pop(table_id, None)
             self._col_indices.pop(table_id, None)
+        elif update_in_mem_indexes and table_id in self.tables:
+            table = self.tables[table_id]
+            # Write-heavy deduplicated/bridge tables are evicted from heap on commit to bound RAM
+            if table.table_name in ("m_ast_hash", "m_tag_code", "m_symbol_def", "m_ast_container", "m_bridge_tag", "m_bridge_checkpoint", "m_blob_transition"):
+                if table_id in self._pk_index:
+                    if table_id not in self._committed_pks:
+                        self._committed_pks[table_id] = set()
+                    self._committed_pks[table_id].update(self._pk_index[table_id].keys())
+                self._cached_rows[table_id] = []
+                self._cached_rows_pos[table_id] = {}
+                self._pk_index[table_id] = {}
 
     def commit_all(self, max_workers: int | None = None, update_in_mem_indexes: bool = True) -> None:
         """Flush staged operations across ALL tables and optionally clear in-memory caches.
@@ -663,6 +694,20 @@ class TECachedDB(TEDirectDB):
         super().commit_all(max_workers=max_workers, update_in_mem_indexes=update_in_mem_indexes)
         if not update_in_mem_indexes:
             self.clear_cache()
+        else:
+            # Bound RAM by purging write-heavy tables from heap cache while retaining compact deduplication keys
+            write_heavy = {"m_ast_hash", "m_tag_code", "m_symbol_def", "m_ast_container", "m_bridge_tag", "m_bridge_checkpoint", "m_blob_transition"}
+            for t_id, tbl in self.tables.items():
+                if tbl.table_name in write_heavy:
+                    if t_id in self._pk_index:
+                        if t_id not in self._committed_pks:
+                            self._committed_pks[t_id] = set()
+                        self._committed_pks[t_id].update(self._pk_index[t_id].keys())
+                    self._cached_rows[t_id] = []
+                    self._cached_rows_pos[t_id] = {}
+                    self._pk_index[t_id] = {}
+            from core.globalstuff import reclaim_system_memory
+            reclaim_system_memory()
 
     def close(self) -> None:
         """Safely clean up in-memory cache structures and close DB connection."""

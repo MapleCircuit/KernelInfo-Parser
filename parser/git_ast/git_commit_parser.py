@@ -69,7 +69,7 @@ class GitCommitParser:
         else:
             self.repo_dir = str(repo_dir)
 
-    def _run_git(self, cmd: list[str], max_output_bytes: int = 50 * 1024 * 1024) -> str:
+    def _run_git(self, cmd: list[str], max_output_bytes: int = 50 * 1024 * 1024, timeout: float = 120) -> str:
         """Execute git command safely with timeout and return decoded stdout."""
         full_cmd = ["git", "-C", self.repo_dir] + cmd
         try:
@@ -78,7 +78,7 @@ class GitCommitParser:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 check=False,
-                timeout=120,
+                timeout=timeout,
             )
             if res.returncode != 0:
                 err_msg = res.stderr.decode("utf-8", errors="replace").strip()
@@ -162,38 +162,36 @@ class GitCommitParser:
         old_rev: str | None,
         new_rev: str,
         limit: int | None = None,
+        with_files: bool = True,
     ) -> list[GitCommit]:
         """Extract all commits between old_rev and new_rev with full metadata and contributors.
 
         Args:
-            old_rev: Prior version git ref or tag (if None or empty tree, inspects up to new_rev).
+            old_rev: Prior version git ref or tag (if None or empty tree, inspects the whole history up to new_rev).
             new_rev: Target version git ref or tag (e.g. 'v3.0').
-            limit: Maximum commits to parse (optional limit for initial tags if needed).
+            limit: Maximum commits to parse (None = every commit in the range).
+            with_files: Include the --name-status file list of each commit.
 
         Returns:
             List of GitCommit objects with parsed trailers and modified file lists.
         """
         EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
         if not old_rev or old_rev == EMPTY_TREE or str(old_rev) == "0":
-            # Initial version: if limit not specified, get recent commits for initial release tag
+            # Initial version: the complete history so the commit DAG reaches the root commit
             revision_arg = new_rev
-            max_flag = [f"-n{limit}"] if limit else ["-n1000"]
         else:
             revision_arg = f"{old_rev}..{new_rev}"
-            max_flag = [f"-n{limit}"] if limit else []
+        max_flag = [f"-n{limit}"] if limit else []
 
         fmt_spec = (
             f"{RECORD_SEP}%H{FIELD_SEP}%P{FIELD_SEP}%an{FIELD_SEP}%ae{FIELD_SEP}%at{FIELD_SEP}"
             f"%cn{FIELD_SEP}%ce{FIELD_SEP}%ct{FIELD_SEP}%s{FIELD_SEP}%B{BODY_END_SEP}"
         )
 
-        git_args = [
-            "log",
-            f"--format={fmt_spec}",
-            "--name-status",
-        ] + max_flag + [revision_arg, "--"]
+        git_args = ["log", f"--format={fmt_spec}"] + (["--name-status"] if with_files else []) + max_flag + [revision_arg, "--"]
 
-        raw_output = self._run_git(git_args)
+        # Whole-history ranges (e.g. 250k+ commits up to v3.0) produce hundreds of MB of log output
+        raw_output = self._run_git(git_args, max_output_bytes=4 * 1024 * 1024 * 1024, timeout=1800)
         if not raw_output:
             return []
 
@@ -258,7 +256,9 @@ class GitCommitParser:
             raw_chunks = [c for c in raw_output.split("COMMIT_DELIM_START_") if c.strip()]
 
         for chunk in raw_chunks:
-            chunk = chunk.strip()
+            # str.strip() treats the \x1c-\x1f separators as whitespace; stripping them would drop
+            # the BODY_END_SEP of merge commits (which have no file list after it)
+            chunk = chunk.strip(" \t\r\n")
             if not chunk:
                 continue
 
@@ -526,7 +526,9 @@ class GitCommitParser:
             raw_chunks = [c for c in raw_output.split("COMMIT_DELIM_START_") if c.strip()]
 
         for chunk in raw_chunks:
-            chunk = chunk.strip()
+            # str.strip() treats the \x1c-\x1f separators as whitespace; stripping them would drop
+            # the BODY_END_SEP of merge commits (which have no file list after it)
+            chunk = chunk.strip(" \t\r\n")
             if not chunk:
                 continue
 
@@ -872,7 +874,9 @@ class GitCommitParser:
         chunks = raw_output.split(RECORD_SEP)
 
         for chunk in chunks:
-            chunk = chunk.strip()
+            # str.strip() treats the \x1c-\x1f separators as whitespace; stripping them would drop
+            # the BODY_END_SEP of merge commits (which have no file list after it)
+            chunk = chunk.strip(" \t\r\n")
             if not chunk:
                 continue
             lines = chunk.splitlines()

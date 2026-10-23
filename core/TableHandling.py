@@ -395,13 +395,13 @@ class ChangeSet:
                         sym_key = (sym_name, sym_type)
                         if sym_key in f_syms:
                             return to_safe_data(f_syms[sym_key])
-                        if hasattr(self.gp, "file_names"):
-                            f_names = self.gp.file_names.get(rel_file)
-                            if f_names and sym_name in f_names:
-                                return to_safe_data(f_names[sym_name])
-                        for (k_name, _), a_id in f_syms.items():
-                            if k_name == sym_name:
-                                return to_safe_data(a_id)
+                        f_names = self.gp.file_names.get(rel_file) if hasattr(self.gp, "file_names") else None
+                        if f_names is None:
+                            f_names = {s_name: a_id for (s_name, _), a_id in f_syms.items()}
+                            if hasattr(self.gp, "file_names"):
+                                self.gp.file_names[rel_file] = f_names
+                        if f_names and sym_name in f_names:
+                            return to_safe_data(f_names[sym_name])
 
                 # 0b. Fast check: Phase 2 global symbol table snapshot (if active)
                 sym_key = (sym_name, sym_type)
@@ -410,19 +410,27 @@ class ChangeSet:
                     if sym_key in phase2_syms:
                         return to_safe_data(phase2_syms[sym_key])
                     phase2_names = getattr(self, "_phase2_names", None)
+                    if phase2_names is None:
+                        if hasattr(phase2_syms, "get_name"):
+                            phase2_names = phase2_syms
+                        elif hasattr(phase2_syms, "items"):
+                            phase2_names = {s_name: a_id for (s_name, _), a_id in phase2_syms.items()}
+                        setattr(self, "_phase2_names", phase2_names)
                     if phase2_names and sym_name in phase2_names:
                         return to_safe_data(phase2_names[sym_name])
-                    elif not phase2_names:
-                        for (k_name, k_type), a_id in phase2_syms.items():
-                            if k_name == sym_name:
-                                return to_safe_data(a_id)
 
-                # 1. Fast check: foreign file is already in batch_cs_dict or active LRU cache
+                # 1. Fast check: foreign file is already in batch_cs_dict or active/evacuated CS stores
                 foreign_cs = None
                 if self.batch_cs_dict and rel_file in self.batch_cs_dict:
                     foreign_cs = self.batch_cs_dict[rel_file]
-                elif self.gp and hasattr(self.gp.ChangeSet_Dict, "_lru_cache") and rel_file in self.gp.ChangeSet_Dict._lru_cache:
-                    foreign_cs = self.gp.ChangeSet_Dict._lru_cache[rel_file]
+                elif self.gp and hasattr(self.gp, "ChangeSet_Dict") and self.gp.ChangeSet_Dict:
+                    cs_dict = self.gp.ChangeSet_Dict
+                    if hasattr(cs_dict, "_evacuated_store") and rel_file in cs_dict._evacuated_store:
+                        foreign_cs = cs_dict._evacuated_store[rel_file]
+                    elif hasattr(cs_dict, "_lru_cache") and rel_file in cs_dict._lru_cache:
+                        foreign_cs = cs_dict._lru_cache[rel_file]
+                    elif not hasattr(cs_dict, "_lru_cache") and rel_file in cs_dict:
+                        foreign_cs = cs_dict[rel_file]
 
                 if foreign_cs is not None:
                     # 1a. Fast check: foreign file already evacuated buffers but preserved resolved_symbols
@@ -430,9 +438,12 @@ class ChangeSet:
                         sym_key = (sym_name, sym_type)
                         if sym_key in foreign_cs.resolved_symbols:
                             return to_safe_data(foreign_cs.resolved_symbols[sym_key])
-                        for (k_name, k_type), a_id in foreign_cs.resolved_symbols.items():
-                            if k_name == sym_name:
-                                return to_safe_data(a_id)
+                        res_names = getattr(foreign_cs, "resolved_names", None)
+                        if res_names is None:
+                            res_names = {s_name: a_id for (s_name, _), a_id in foreign_cs.resolved_symbols.items()}
+                            foreign_cs.resolved_names = res_names
+                        if sym_name in res_names:
+                            return to_safe_data(res_names[sym_name])
 
                     # 1b. Check active un-evacuated symbol_dict
                     if hasattr(foreign_cs, "symbol_dict") and foreign_cs.symbol_dict and getattr(foreign_cs, "cs", None):
@@ -442,11 +453,14 @@ class ChangeSet:
                             val = foreign_cs._get_value_at(query, op_pos)
                             if val is not None:
                                 return to_safe_data(val)
-                        for (k_name, k_type), op_pos in foreign_cs.symbol_dict.items():
-                            if k_name == sym_name:
-                                val = foreign_cs._get_value_at(query, op_pos)
-                                if val is not None:
-                                    return to_safe_data(val)
+                        sym_names = getattr(foreign_cs, "symbol_name_dict", None)
+                        if sym_names is None:
+                            sym_names = {s_name: op_pos for (s_name, _), op_pos in foreign_cs.symbol_dict.items()}
+                            foreign_cs.symbol_name_dict = sym_names
+                        if sym_name in sym_names:
+                            val = foreign_cs._get_value_at(query, sym_names[sym_name])
+                            if val is not None:
+                                return to_safe_data(val)
 
                 # 1c. DB-backed symbol lookup for unchanged files (with caching into gp.file_symbols)
                 if self.gp and hasattr(self.gp, "get_file_symbols_from_db"):
@@ -459,9 +473,9 @@ class ChangeSet:
                         sym_key = (sym_name, sym_type)
                         if sym_key in db_syms:
                             return to_safe_data(db_syms[sym_key])
-                        for (k_name, k_type), a_id in db_syms.items():
-                            if k_name == sym_name:
-                                return to_safe_data(a_id)
+                        f_names = self.gp.file_names.get(rel_file) if hasattr(self.gp, "file_names") else None
+                        if f_names and sym_name in f_names:
+                            return to_safe_data(f_names[sym_name])
 
                 # 2. TableHandling Fast-Path for AST nodes (query[0] == m_ast.table_id)
                 from core.DBLayout import m_ast
@@ -486,6 +500,19 @@ class ChangeSet:
                     if is_active_foreign and not force_stubs:
                         self.blocked_on = rel_file
                         return None
+                    # Zero-copy shared memory symbol lookup fast-path
+                    gp_shared_syms = getattr(self.gp, "_shared_symbols", None) if self.gp else None
+                    if gp_shared_syms is not None and safe_sym_name is not None:
+                        exact_id = gp_shared_syms.get_symbol(safe_sym_name, safe_sym_type)
+                        if exact_id is not None:
+                            return to_safe_data(exact_id)
+                        if safe_notbind_type != safe_sym_type:
+                            notbind_id = gp_shared_syms.get_symbol(safe_sym_name, safe_notbind_type)
+                            if notbind_id is not None:
+                                return to_safe_data(notbind_id)
+                        name_id = gp_shared_syms.get_name(safe_sym_name)
+                        if name_id is not None:
+                            return to_safe_data(name_id)
 
                     # Fast-path check via in-memory staged symbol index in GreatProcessor
                     gp_staged_syms = getattr(self.gp, "_ast_staged_symbols", None) if self.gp else None
@@ -502,33 +529,42 @@ class ChangeSet:
                             if name_id is not None:
                                 return to_safe_data(name_id)
 
-                    # Exact match check via TE
-                    res = G.TE.get(m_ast.table_id, (None, safe_sym_name, safe_sym_type))
-                    if res is not None and len(res) > query[1] and res[query[1]] is not None:
-                        found_id = res[query[1]]
-                        if gp_staged_syms is not None:
-                            gp_staged_syms[(safe_sym_name, safe_sym_type)] = found_id
-                            if gp_staged_names is not None and safe_sym_name not in gp_staged_names:
-                                gp_staged_names[safe_sym_name] = found_id
-                        return to_safe_data(found_id)
+                    # Exact match check via TE with negative query caching
+                    gp_neg_cache = getattr(self.gp, "_ast_negative_cache", None) if self.gp else None
+                    neg_key = (safe_sym_name, safe_sym_type) if safe_sym_name is not None else None
+                    is_neg_cached = bool(gp_neg_cache is not None and neg_key in gp_neg_cache)
 
-                    # Notbind match check via TE
-                    res = G.TE.get(m_ast.table_id, (None, safe_sym_name, safe_notbind_type))
-                    if res is not None and len(res) > query[1] and res[query[1]] is not None:
-                        found_id = res[query[1]]
-                        if gp_staged_syms is not None:
-                            gp_staged_syms[(safe_sym_name, safe_notbind_type)] = found_id
-                            if gp_staged_names is not None and safe_sym_name not in gp_staged_names:
-                                gp_staged_names[safe_sym_name] = found_id
-                        return to_safe_data(found_id)
+                    if not is_neg_cached:
+                        res = G.TE.get(m_ast.table_id, (None, safe_sym_name, safe_sym_type))
+                        if res is not None and len(res) > query[1] and res[query[1]] is not None:
+                            found_id = res[query[1]]
+                            if gp_staged_syms is not None:
+                                gp_staged_syms[(safe_sym_name, safe_sym_type)] = found_id
+                                if gp_staged_names is not None and safe_sym_name not in gp_staged_names:
+                                    gp_staged_names[safe_sym_name] = found_id
+                            return to_safe_data(found_id)
 
-                    # General name match check via TE
-                    res = G.TE.get(m_ast.table_id, (None, safe_sym_name, None))
-                    if res is not None and len(res) > query[1] and res[query[1]] is not None:
-                        found_id = res[query[1]]
-                        if gp_staged_names is not None:
-                            gp_staged_names[safe_sym_name] = found_id
-                        return to_safe_data(found_id)
+                        # Notbind match check via TE
+                        res = G.TE.get(m_ast.table_id, (None, safe_sym_name, safe_notbind_type))
+                        if res is not None and len(res) > query[1] and res[query[1]] is not None:
+                            found_id = res[query[1]]
+                            if gp_staged_syms is not None:
+                                gp_staged_syms[(safe_sym_name, safe_notbind_type)] = found_id
+                                if gp_staged_names is not None and safe_sym_name not in gp_staged_names:
+                                    gp_staged_names[safe_sym_name] = found_id
+                            return to_safe_data(found_id)
+
+                        # General name match check via TE
+                        res = G.TE.get(m_ast.table_id, (None, safe_sym_name, None))
+                        if res is not None and len(res) > query[1] and res[query[1]] is not None:
+                            found_id = res[query[1]]
+                            if gp_staged_names is not None:
+                                gp_staged_names[safe_sym_name] = found_id
+                            return to_safe_data(found_id)
+
+                        # Record miss in negative cache
+                        if gp_neg_cache is not None and neg_key is not None:
+                            gp_neg_cache.add(neg_key)
 
                     if force_stubs or not is_active_foreign:
                         set_res = G.TE.set(m_ast.table_id, (None, safe_sym_name, safe_notbind_type))
@@ -538,6 +574,9 @@ class ChangeSet:
                                 gp_staged_syms[(safe_sym_name, safe_notbind_type)] = stub_id
                                 if gp_staged_names is not None and safe_sym_name not in gp_staged_names:
                                     gp_staged_names[safe_sym_name] = stub_id
+                            if gp_neg_cache is not None and neg_key is not None:
+                                gp_neg_cache.discard(neg_key)
+                                gp_neg_cache.discard((safe_sym_name, safe_notbind_type))
                             return to_safe_data(stub_id)
 
                     # Suspended waiting on target file
@@ -691,11 +730,7 @@ class ChangeSet:
                         resolved_this_round.append(idx)
                         continue
                     if op_type == OP_VIEW_SET:
-                        existing_view = G.TE.view_get(operation[0], data)
-                        if existing_view is not None:
-                            self.cs_result[idx] = existing_view
-                        else:
-                            self.cs_result[idx] = te_view_set(operation[0], data)
+                        self.cs_result[idx] = te_view_set(operation[0], data)
                         resolved_this_round.append(idx)
                         continue
 
@@ -1203,50 +1238,54 @@ class ChangeSet:
 
         changed_paths = getattr(gp, "_changed_paths_set", None)
 
-        for rel_file in list(self.foreign_deps):
-            # If target file is modified in the active version, it is not an unchanged DB file
+        unchanged_db_maps = {}
+        for rel_file in self.foreign_deps:
             if changed_paths and rel_file in changed_paths:
                 continue
-
-            # Query DB for symbols defined by this unchanged file
             db_syms = gp.get_file_symbols_from_db(rel_file)
-            if not db_syms:
+            if db_syms:
+                db_names = {s_name: a_id for (s_name, _), a_id in db_syms.items()}
+                unchanged_db_maps[rel_file] = (db_syms, db_names)
+
+        if not unchanged_db_maps:
+            return
+
+        unresolved_by_file = {rel_file: False for rel_file in unchanged_db_maps}
+
+        for idx, op in enumerate(self.cs):
+            if not op or len(op) < 3:
+                continue
+            op_data = op[2]
+            if not is_data_unsafe(op_data):
                 continue
 
-            all_resolved = True
-            for idx, op in enumerate(self.cs):
-                if not op or len(op) < 3:
-                    continue
-                op_data = op[2]
-                if not is_data_unsafe(op_data):
-                    continue
-
-                new_data = []
-                modified = False
-                for col in op_data:
-                    if type(col) is tuple and len(col) == 3 and col[1] == OP_REF:
-                        route = col[2]
-                        if route and len(route) >= 4 and route[0] == REF_FILE and route[1] == rel_file:
+            new_data = []
+            modified = False
+            for col in op_data:
+                if type(col) is tuple and len(col) == 3 and col[1] == OP_REF:
+                    route = col[2]
+                    if route and len(route) >= 4 and route[0] == REF_FILE:
+                        target_file = route[1]
+                        if target_file in unchanged_db_maps:
+                            db_syms, db_names = unchanged_db_maps[target_file]
                             sym_name = route[2]
                             sym_type = route[3]
                             sym_key = (sym_name, sym_type)
                             ast_id = db_syms.get(sym_key)
                             if ast_id is None:
-                                for (k_name, k_type), a_id in db_syms.items():
-                                    if k_name == sym_name:
-                                        ast_id = a_id
-                                        break
+                                ast_id = db_names.get(sym_name)
                             if ast_id is not None:
                                 new_data.append(to_safe_data(ast_id))
                                 modified = True
                                 continue
                             else:
-                                all_resolved = False
-                    new_data.append(col)
-                if modified:
-                    self.cs[idx] = (op[0], op[1], tuple(new_data))
+                                unresolved_by_file[target_file] = True
+                new_data.append(col)
+            if modified:
+                self.cs[idx] = (op[0], op[1], tuple(new_data))
 
-            if all_resolved:
+        for rel_file, has_unresolved in unresolved_by_file.items():
+            if not has_unresolved:
                 self.foreign_deps.discard(rel_file)
 
     def pre_resolve_operations(self, resolved_symbols_map: dict[tuple[str, int], int], resolved_names_map: dict[str, int] | None = None) -> list[OperationType]:
@@ -1268,17 +1307,16 @@ class ChangeSet:
         elif self._phase2_symbols:
             self._phase2_names = {k[0]: v for k, v in self._phase2_symbols.items()}
 
-        # 1. Pre-unpack remaining dynamic views
-        for idx, op in enumerate(self.cs):
-            if op and len(op) >= 3 and op[1] == OP_REF_VIEW:
-                unpacked = self._unpack_ref_view(op, force_stubs=False)
-                if unpacked is not None:
-                    self.cs[idx] = unpacked
-
-        # 2. Pre-resolve foreign REF_FILE references in op data
+        # Single pass: pre-unpack dynamic views and pre-resolve foreign references
         for idx, op in enumerate(self.cs):
             if not op or len(op) < 3:
                 continue
+            if op[1] == OP_REF_VIEW:
+                unpacked = self._unpack_ref_view(op, force_stubs=False)
+                if unpacked is not None:
+                    op = unpacked
+                    self.cs[idx] = op
+
             op_data = op[2]
             if not is_data_unsafe(op_data):
                 continue
@@ -1298,6 +1336,20 @@ class ChangeSet:
             if modified:
                 self.cs[idx] = (op[0], op[1], tuple(new_data))
 
+        # Prune foreign_deps if all references to target files were resolved
+        still_unresolved_deps = set()
+        for op in self.cs:
+            if op and len(op) >= 3 and is_data_unsafe(op[2]):
+                for col in op[2]:
+                    if type(col) is tuple and len(col) == 3 and col[1] == OP_REF:
+                        route = col[2]
+                        if route and route[0] == REF_FILE and len(route) > 1 and isinstance(route[1], str):
+                            still_unresolved_deps.add(route[1])
+        if hasattr(self, "foreign_deps") and isinstance(self.foreign_deps, set):
+            self.foreign_deps.intersection_update(still_unresolved_deps)
+
+        self._phase2_symbols = None
+        self._phase2_names = None
         return self.cs
 
     def get_file_type(self) -> int:
@@ -1376,6 +1428,8 @@ class ChangeSet:
         self.route_count = []
         self.multi_stack = []
         self._cached_route = (REF_ROOT,)
+        self._phase2_symbols = None
+        self._phase2_names = None
 
     def register_bridge_map(self, tag_ref: Any, map_ref: Any) -> bool:
         """Register a tag-to-map bridge association within this ChangeSet.
@@ -1414,6 +1468,10 @@ class Table:
         te_cached: bool | tuple[str | int, ...] | list[str | int] | dict[str, Any] = False,
         version_scoped: bool = False,
         hashing_table: bool | str = False,
+        indexes: tuple[tuple[str, tuple[str, ...]], ...] | None = None,
+        unique_keys: tuple[tuple[str, ...], ...] | None = None,
+        idempotent_pk: bool = False,
+        blob_scoped: bool = False,
     ) -> None:
         """Initialize a Table schema definition, generate dynamic column pointers, and bind to parser.
 
@@ -1428,6 +1486,10 @@ class Table:
             te_cached: Pre-loading caching strategy for Table Engine initialization (bool, tuple, list, or dict).
             version_scoped: If True, enables working-window preloading and historical pruning in Table Engine.
             hashing_table: Name of the linked hashing table.
+            indexes: Optional tuple of secondary index definitions: `(("idx_name", ("col1", "col2")), ...)`.
+            unique_keys: Optional tuple of unique key definitions: `(("col1",), ("col2", "col3"))`.
+            idempotent_pk: If True, duplicate primary key inserts are treated idempotently as no-ops.
+            blob_scoped: If True, enables content-addressable blob-scoped preloading and caching in Table Engine.
 
         Side Effects:
             1. Binds column attribute pointers directly on this instance:
@@ -1454,13 +1516,19 @@ class Table:
         self.initial_insert = initial_insert
         self.no_duplicate = no_duplicate
 
-        # Handle version_scoped and te_cached configuration
-        self.version_scoped = version_scoped
+        # Handle version_scoped, blob_scoped, and te_cached configuration
+        self.blob_scoped = blob_scoped or version_scoped
+        self.version_scoped = self.blob_scoped
         if isinstance(te_cached, dict):
-            self.version_scoped = te_cached.get("version_scoped", self.version_scoped)
+            self.blob_scoped = te_cached.get("blob_scoped", te_cached.get("version_scoped", self.blob_scoped))
+            self.version_scoped = self.blob_scoped
             raw_cols = te_cached.get("columns", True)
         else:
             raw_cols = te_cached
+
+        self.indexes = tuple(indexes) if indexes else ()
+        self.unique_keys = tuple(unique_keys) if unique_keys else ()
+        self.idempotent_pk = idempotent_pk
 
         self.cached_columns: tuple[int, ...]
         if raw_cols is True:
@@ -1512,6 +1580,10 @@ class Table:
         Returns:
             Operation tuple `(table_id, OP_SET, columns)`.
         """
+        if self.table_name == "m_git_ref" and len(columns) == 2:
+            # Legacy m_v_main compatibility shim: (vid, vname) -> (ref_id, repo_id, ref_type, ref_name, commit_id, tagger_id, tagger_date, tag_message)
+            columns = (None, 0, 4, columns[1], columns[0], None, None, None)
+
         if self.no_duplicate:
             return self.get_set(*columns)
 
@@ -1564,6 +1636,9 @@ class Table:
         Returns:
             Operation tuple `(table_id, OP_DONE, result)` or None.
         """
+        if self.table_name == "m_git_ref" and len(columns) == 2:
+            # Legacy m_v_main get shim: (vid, vname)
+            columns = (None, None, None, columns[1], columns[0], None, None, None)
         if is_data_unsafe(columns):
             logger.error(f"""An {self.table_name}.get was done with unresolved refs,
             This is unexpected behavior. CRASH""")

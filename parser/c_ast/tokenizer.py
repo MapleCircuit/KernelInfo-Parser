@@ -128,7 +128,7 @@ class Line:
 
     def new_end(self, target: Any) -> Line:
         """Update ending coordinates to match target range."""
-        if isinstance(target, Line):
+        if type(target) is Line:
             self.line_pos = (self.line_pos[0], target.line_pos[1])
             self.char_pos = (self.char_pos[0], target.char_pos[1])
         elif isinstance(target, cc.SourceRange):
@@ -136,7 +136,7 @@ class Line:
             _CLANG_GET_SPELLING_LOC(en, _BYREF_F_PTR, _BYREF_E_LINE, _BYREF_E_COL, _BYREF_E_OFF)
             self.line_pos = (self.line_pos[0], _CTYPES_E_LINE.value)
             self.char_pos = (self.char_pos[0], _CTYPES_E_COL.value)
-        elif hasattr(target, "line") and isinstance(getattr(target, "line"), Line):
+        elif hasattr(target, "line") and type(getattr(target, "line")) is Line:
             l = getattr(target, "line")
             self.line_pos = (self.line_pos[0], l.line_pos[1])
             self.char_pos = (self.char_pos[0], l.char_pos[1])
@@ -144,7 +144,7 @@ class Line:
 
     def new_end_reversed(self, target: Any) -> Line:
         """Update ending coordinates using the START position of target range."""
-        if isinstance(target, Line):
+        if type(target) is Line:
             self.line_pos = (self.line_pos[0], target.line_pos[0])
             self.char_pos = (self.char_pos[0], target.char_pos[0])
         elif isinstance(target, cc.SourceRange):
@@ -152,7 +152,7 @@ class Line:
             _CLANG_GET_SPELLING_LOC(st, _BYREF_F_PTR, _BYREF_S_LINE, _BYREF_S_COL, _BYREF_S_OFF)
             self.line_pos = (self.line_pos[0], _CTYPES_S_LINE.value)
             self.char_pos = (self.char_pos[0], _CTYPES_S_COL.value)
-        elif hasattr(target, "line") and isinstance(getattr(target, "line"), Line):
+        elif hasattr(target, "line") and type(getattr(target, "line")) is Line:
             l = getattr(target, "line")
             self.line_pos = (self.line_pos[0], l.line_pos[0])
             self.char_pos = (self.char_pos[0], l.char_pos[0])
@@ -163,19 +163,21 @@ class Line:
         if target is None:
             return self
 
-        if isinstance(target, Line):
+        ttype = type(target)
+        if ttype is Line:
             ts_l, te_l = target.line_pos
             ts_c, te_c = target.char_pos
-        elif hasattr(target, "line") and isinstance(getattr(target, "line"), Line):
-            t = getattr(target, "line")
-            ts_l, te_l = t.line_pos
-            ts_c, te_c = t.char_pos
-        elif isinstance(target, cc.SourceRange):
-            t = Line(target)
-            ts_l, te_l = t.line_pos
-            ts_c, te_c = t.char_pos
         else:
-            return self
+            t = getattr(target, "line", None)
+            if type(t) is Line:
+                ts_l, te_l = t.line_pos
+                ts_c, te_c = t.char_pos
+            elif isinstance(target, cc.SourceRange):
+                t = Line(target)
+                ts_l, te_l = t.line_pos
+                ts_c, te_c = t.char_pos
+            else:
+                return self
 
         if ts_l == 0 and te_l == 0:
             return self
@@ -220,14 +222,18 @@ class Line:
 
     def is_inside(self, extent: Line) -> bool:
         """Check if target extent is completely enclosed within self boundaries."""
-        if self.line_pos[0] < extent.line_pos[0] and self.line_pos[1] > extent.line_pos[1]:
+        s_l0, s_l1 = self.line_pos
+        e_l0, e_l1 = extent.line_pos
+        if s_l0 < e_l0 and s_l1 > e_l1:
             return True
-        if self.line_pos[0] == extent.line_pos[0] and self.line_pos[1] > extent.line_pos[1]:
-            return self.char_pos[0] <= extent.char_pos[0]
-        if self.line_pos[0] < extent.line_pos[0] and self.line_pos[1] == extent.line_pos[1]:
-            return self.char_pos[1] >= extent.char_pos[1]
-        if self.line_pos[0] == extent.line_pos[0] and self.line_pos[1] == extent.line_pos[1]:
-            return self.char_pos[0] <= extent.char_pos[0] and self.char_pos[1] >= extent.char_pos[1]
+        s_c0, s_c1 = self.char_pos
+        e_c0, e_c1 = extent.char_pos
+        if s_l0 == e_l0 and s_l1 > e_l1:
+            return s_c0 <= e_c0
+        if s_l0 < e_l0 and s_l1 == e_l1:
+            return s_c1 >= e_c1
+        if s_l0 == e_l0 and s_l1 == e_l1:
+            return s_c0 <= e_c0 and s_c1 >= e_c1
         return False
 
     def __eq__(self, other: object) -> bool:
@@ -427,21 +433,21 @@ class TokenStream:
         prev_e_l = -1
         prev_line_pos = (0, 0)
         prev_cursor = None
+        prev_bytes = b""
+        prev_kind = -1
+        prev_raw_line = ""
+        prev_line_idx = -1
 
         for i, token in enumerate(temp_tokens_array):
             raw_c = temp_cursors_array[i]
-            if (
-                prev_cursor is not None
-                and raw_c._kind_id == prev_cursor._kind_id
-                and raw_c.xdata == prev_cursor.xdata
-                and raw_c.data[0] == prev_cursor.data[0]
-                and raw_c.data[1] == prev_cursor.data[1]
-                and raw_c.data[2] == prev_cursor.data[2]
-            ):
+            k_id = raw_c._kind_id
+            if prev_cursor is not None and k_id == prev_kind and bytes(raw_c) == prev_bytes:
                 cursor = prev_cursor
             else:
                 cursor = raw_c
                 prev_cursor = cursor
+                prev_kind = k_id
+                prev_bytes = bytes(raw_c)
 
             # Direct SourceLocation configuration (bypasses 2 C-calls + 2 struct allocs + from_param)
             ext = get_extent(parsed_tu_ptr, token)
@@ -473,16 +479,18 @@ class TokenStream:
             l.char_pos = (s_col, e_col)
 
             if s_line == e_line and 0 < s_line <= rawfile_len:
-                spelling_str = rawfile[s_line - 1][s_col - 1 : e_col - 1]
+                if s_line != prev_line_idx:
+                    prev_line_idx = s_line
+                    prev_raw_line = rawfile[s_line - 1]
+                spelling_str = prev_raw_line[s_col - 1 : e_col - 1]
             else:
                 try:
                     token._tu = parsed_tu
                     spelling_str = token.spelling or ""
                 except (UnicodeDecodeError, Exception):
                     spelling_str = ""
-
-            if "\\" in spelling_str and ("\\\n" in spelling_str or "\\\r\n" in spelling_str):
-                spelling_str = spelling_str.replace("\\\r\n", "").replace("\\\n", "")
+                if "\\" in spelling_str and ("\\\n" in spelling_str or "\\\r\n" in spelling_str):
+                    spelling_str = spelling_str.replace("\\\r\n", "").replace("\\\n", "")
 
             ast_kind = token_kind_map[token.int_data[0]]
             tokens_append(ParsedToken(l, spelling_str, ast_kind, cursor))

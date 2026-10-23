@@ -179,3 +179,225 @@ def format_profiling_report(
     lines.append(border + "\n")
 
     return "\n".join(lines)
+
+
+def parse_duration(val: str | int | float | None) -> float | None:
+    """Parse duration strings like '30m', '1800s', '1h', '0.5h', '1800' into seconds."""
+    if val is None or val == "":
+        return None
+    if isinstance(val, (int, float)):
+        return float(val) if val > 0 else None
+    s = str(val).strip().lower()
+    if not s:
+        return None
+    try:
+        if s.endswith("s"):
+            return float(s[:-1])
+        elif s.endswith("m"):
+            return float(s[:-1]) * 60.0
+        elif s.endswith("h"):
+            return float(s[:-1]) * 3600.0
+        elif s.endswith("d"):
+            return float(s[:-1]) * 86400.0
+        return float(s)
+    except ValueError:
+        return None
+
+
+@dataclass
+class StageMetric:
+    """Tracks duration, counts, and throughput metrics for a discrete pipeline stage."""
+
+    name: str
+    elapsed_s: float = 0.0
+    start_time: float | None = None
+    count: int = 0
+    units: str = "items"
+    call_count: int = 0
+
+
+class PipelineStageProfiler:
+    """System-level stage timing, worker CPU accumulation, and bottleneck profiler."""
+
+    def __init__(self) -> None:
+        self.stages: dict[str, StageMetric] = {}
+        self.stage_order: list[str] = []
+        self.worker_aggregate: PipelineProfiler = PipelineProfiler(file_path="ALL_WORKERS_AGGREGATE")
+        self.worker_count: int = 0
+        self.start_wall_time: float = time.perf_counter()
+        self._active_stages: set[str] = set()
+
+    def start_stage(self, name: str) -> None:
+        """Begin measuring execution duration for a stage."""
+        if name not in self.stages:
+            self.stages[name] = StageMetric(name=name)
+            self.stage_order.append(name)
+        stage = self.stages[name]
+        stage.start_time = time.perf_counter()
+        stage.call_count += 1
+        self._active_stages.add(name)
+
+    def stop_stage(self, name: str, count: int = 0, units: str = "items") -> float:
+        """Stop measuring execution duration for a stage and update metrics."""
+        if name not in self.stages:
+            return 0.0
+        stage = self.stages[name]
+        if stage.start_time is not None:
+            delta = time.perf_counter() - stage.start_time
+            stage.elapsed_s += delta
+            stage.start_time = None
+        if count > 0:
+            stage.count += count
+            stage.units = units
+        self._active_stages.discard(name)
+        return stage.elapsed_s
+
+    import contextlib
+
+    @contextlib.contextmanager
+    def measure(self, name: str, count: int = 0, units: str = "items"):
+        """Context manager to measure the execution duration of a stage block."""
+        self.start_stage(name)
+        try:
+            yield
+        finally:
+            self.stop_stage(name, count=count, units=units)
+
+    def record_worker_profiler(self, prof: PipelineProfiler | dict | None) -> None:
+        """Accumulate micro-profiling metrics from an executed worker ChangeSet."""
+        if not prof:
+            return
+        if isinstance(prof, dict):
+            prof = PipelineProfiler.from_dict(prof)
+        self.worker_aggregate.add(prof)
+        self.worker_count += 1
+
+    def format_stage_report(self, title: str = "PIPELINE STAGE EXECUTION & BOTTLENECK PROFILE") -> str:
+        """Format an end-to-end report of all stages with identification of top bottlenecks."""
+        now = time.perf_counter()
+        total_wall_s = max(0.001, now - self.start_wall_time)
+
+        # Finalize any in-flight stages for reporting
+        stage_durations: dict[str, float] = {}
+        for name, stage in self.stages.items():
+            dur = stage.elapsed_s
+            if stage.start_time is not None:
+                dur += (now - stage.start_time)
+            stage_durations[name] = dur
+
+        total_stage_time = sum(stage_durations.values())
+        effective_total = max(total_wall_s, total_stage_time, 0.001)
+
+        lines = []
+        w_name = 44
+        sep_len = 104
+        border = "=" * sep_len
+
+        lines.append("\n" + border)
+        lines.append(COLOR.cyan(f"{title:^{sep_len}}"))
+        lines.append(border)
+        header = (
+            f"{'Pipeline Stage':<{w_name}} | "
+            f"{'Elapsed':>9} | "
+            f"{'% Total':>9} | "
+            f"{'Items / Count':>16} | "
+            f"{'Throughput':>14}"
+        )
+        lines.append(header)
+        lines.append("-" * sep_len)
+
+        for name in self.stage_order:
+            stage = self.stages[name]
+            dur = stage_durations.get(name, 0.0)
+            pct_str = _format_pct(dur, effective_total)
+            items_str = f"{stage.count:,} {stage.units}" if stage.count > 0 else ""
+            throughput_str = ""
+            if stage.count > 0 and dur > 0.0001:
+                rate = stage.count / dur
+                if rate >= 1000:
+                    throughput_str = f"{rate:,.0f} /s"
+                else:
+                    throughput_str = f"{rate:.1f} /s"
+
+            lines.append(
+                f"{name:<{w_name}} | "
+                f"{_format_ms(dur):>9} | "
+                f"{pct_str:>18} | "
+                f"{items_str:>16} | "
+                f"{throughput_str:>14}"
+            )
+
+        lines.append("=" * sep_len)
+        lines.append(
+            f"{COLOR.cyan('TOTAL PIPELINE WALL-CLOCK TIME'):<{w_name + 9}} | "
+            f"{_format_ms(total_wall_s):>9} | "
+            f"{'100.0%':>9} | "
+            f"{'':>16} | "
+            f"{'':>14}"
+        )
+        lines.append(border)
+
+        # Parallel worker CPU breakdown if collected
+        if self.worker_count > 0:
+            w_tot = self.worker_aggregate
+            tot_cpu = w_tot.total_elapsed_s or (
+                w_tot.clang_parse_tu_s
+                + w_tot.clang_tokenize_s
+                + w_tot.token_processing_s
+                + w_tot.ast_extraction_s
+                + w_tot.cs_execute_s
+                + w_tot.te_db_commit_s
+            )
+            if tot_cpu > 0.001:
+                lines.append(COLOR.cyan("\n--- PARALLEL WORKER CPU BREAKDOWN (Clang & AST Extraction) ---"))
+                lines.append(f"Aggregate across {self.worker_count:,} parsed files:")
+                lines.append(f"  • Clang TU Parse:     {_format_ms(w_tot.clang_parse_tu_s):>9} ({_format_pct(w_tot.clang_parse_tu_s, tot_cpu)} of worker CPU)")
+                lines.append(f"  • Clang Tokenize:     {_format_ms(w_tot.clang_tokenize_s):>9} ({_format_pct(w_tot.clang_tokenize_s, tot_cpu)} of worker CPU)")
+                lines.append(f"  • Token Processing:   {_format_ms(w_tot.token_processing_s):>9} ({_format_pct(w_tot.token_processing_s, tot_cpu)} of worker CPU)")
+                lines.append(f"  • AST Generation:     {_format_ms(w_tot.ast_extraction_s):>9} ({_format_pct(w_tot.ast_extraction_s, tot_cpu)} of worker CPU)")
+                lines.append(f"  • CS Execution:       {_format_ms(w_tot.cs_execute_s):>9} ({_format_pct(w_tot.cs_execute_s, tot_cpu)} of worker CPU)")
+                lines.append(f"  • TE DB Staging:      {_format_ms(w_tot.te_db_commit_s):>9} ({_format_pct(w_tot.te_db_commit_s, tot_cpu)} of worker CPU)")
+                lines.append(f"  • Total Worker CPU:   {_format_ms(tot_cpu):>9}")
+
+        # Bottleneck analysis & recommendations
+        sorted_stages = sorted(stage_durations.items(), key=lambda x: x[1], reverse=True)
+        bottlenecks = [s for s in sorted_stages if s[1] > 0.01][:3]
+        if bottlenecks:
+            lines.append("\n" + border)
+            lines.append(COLOR.yellow(f"{'TOP IDENTIFIED BOTTLENECKS & RECOMMENDATIONS':^{sep_len}}"))
+            lines.append(border)
+            for rank, (name, dur) in enumerate(bottlenecks, 1):
+                pct = (dur / effective_total) * 100.0
+                color_fn = COLOR.red if pct >= 30.0 else (COLOR.yellow if pct >= 15.0 else COLOR.green)
+                lines.append(color_fn(f"[BOTTLENECK #{rank}] {name}: {_format_ms(dur)} ({pct:.1f}% of total runtime)"))
+                low_name = name.lower()
+                if "source parsing" in low_name:
+                    lines.append("  -> Worker translation unit parsing and intra-file reference extraction.")
+                    lines.append("  -> Optimization: Increase worker concurrency (--cpus), tune batch sizes, or enable worker AST caching.")
+                elif "header" in low_name and "wave" in low_name:
+                    lines.append("  -> Topological sort and cycle-breaking deadlock resolution.")
+                    lines.append("  -> Optimization: Increase wave chunking threshold or expand wave batch force-resolving.")
+                elif "header" in low_name:
+                    lines.append("  -> Stage 1 header AST pre-resolution.")
+                    lines.append("  -> Optimization: Worker pre-resolution and compact shared memory table packing.")
+                elif "git commit" in low_name:
+                    lines.append("  -> Commit DAG traversal, hunk extraction, and tag bridging.")
+                    lines.append("  -> Optimization: Preload existing commit hashes in bulk queries and batch insert commit tags.")
+                elif "kbuild" in low_name or "make" in low_name:
+                    lines.append("  -> Sequential Makefile/Kbuild reading and parsing.")
+                    lines.append("  -> Optimization: Parallelize git cat-file reading or batch process directory trees.")
+                elif "maintainer" in low_name:
+                    lines.append("  -> Path matching against MAINTAINERS sections.")
+                    lines.append("  -> Optimization: Use prefix/exact indexing for MAINTAINERS patterns.")
+                elif "blob" in low_name or "dedup" in low_name:
+                    lines.append("  -> Step 4.5 content-addressable blob hash matching.")
+                    lines.append("  -> Optimization: Bulk prefetch known blob hashes into memory (already optimized).")
+                elif "db" in low_name or "commit" in low_name:
+                    lines.append("  -> TableEngine / MariaDB transaction commits and socket flushing.")
+                    lines.append("  -> Optimization: Increase chunk commit interval or optimize multi-row SQL insert chunking.")
+                else:
+                    lines.append(f"  -> Processed {dur:.2f}s of pipeline runtime.")
+            lines.append(border + "\n")
+
+        return "\n".join(lines)
+

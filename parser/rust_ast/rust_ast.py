@@ -28,6 +28,7 @@ from core.DBLayout import (
     m_bridge_file,
     m_tag,
     m_bridge_tag,
+    m_ast,
 )
 from parser.rust_ast.rust_ast_type import ChangeSetType
 from parser.rust_ast.rust_tree_parser import parse_rust_ast_tree
@@ -71,8 +72,12 @@ def get_prior_tags(CS: ChangeSetType) -> None:
         return
     old_fid = bf_row[2][2]
 
+    # 14-column 3-way join: m_bridge_tag (6 cols) -> m_tag (5 cols) -> m_ast (3 cols)
     CS.prior_tags = m_bridge_tag.view_get_multiple(
-        ((m_bridge_tag.tag_id, m_tag.tag_id, 1),),
+        (
+            (m_bridge_tag.tag_id, m_tag.tag_id, 1),
+            (m_tag.ast_id, m_ast.ast_id, 1),
+        ),
         old_fid,
         None,  # 1: m_bridge_tag.tag_id
         None,  # 2: m_bridge_tag.line_s
@@ -80,18 +85,19 @@ def get_prior_tags(CS: ChangeSetType) -> None:
         None,  # 4: m_bridge_tag.char_s
         None,  # 5: m_bridge_tag.char_e
         None,  # 6: m_tag.tag_id
-        None,  # 7: m_tag.vid_s
-        None,  # 8: m_tag.vid_e
-        None,  # 9: m_tag.hash
-        None,  # 10: m_tag.ast_id
-        None,  # 11: m_tag.hl_s
-        None,  # 12: m_tag.hl_l
+        None,  # 7: m_tag.hash
+        None,  # 8: m_tag.ast_id
+        None,  # 9: m_tag.hl_s
+        None,  # 10: m_tag.hl_l
+        None,  # 11: m_ast.ast_id
+        None,  # 12: m_ast.name
+        None,  # 13: m_ast.type_id
     )
     if CS.prior_tags:
         CS.prior_tags_map = {}
         for x, tag in enumerate(CS.prior_tags):
-            if len(tag) > 9:
-                tag_hash = tag[9]
+            if len(tag) > 7:
+                tag_hash = tag[7]
                 if tag_hash is not None:
                     if tag_hash not in CS.prior_tags_map:
                         CS.prior_tags_map[tag_hash] = []
@@ -100,23 +106,10 @@ def get_prior_tags(CS: ChangeSetType) -> None:
 
 
 def close_prior_tags(CS: ChangeSetType) -> None:
-    """Mark prior version tags as closed/inactive if they were not recycled in current version."""
-    if CS.prior_tags:
-        with CS(REF_OLD):
-            for x, tag in enumerate(CS.prior_tags):
-                if x in CS.active_tag_list:
-                    continue
-                if len(tag) >= 13:
-                    with CS(REF_POS):
-                        CS.store(m_tag.update(
-                            tag[6],          # m_tag.tag_id
-                            tag[7],          # m_tag.vid_s
-                            CS.gp.Old_VID,   # m_tag.vid_e
-                            tag[9],          # m_tag.hash
-                            tag[10],         # m_tag.ast_id
-                            tag[11],         # m_tag.hl_s
-                            tag[12],         # m_tag.hl_l
-                        ))
+    """In zero-VID Git-native DAG architecture, tags are immutable content records.
+    Tag retirement/closure is obsolete; unrecycled tags are preserved for lineage.
+    """
+    pass
 
 
 class Rust_Manager:

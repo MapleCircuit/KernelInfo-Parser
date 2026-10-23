@@ -146,15 +146,16 @@ class Ast_Rust:
         )
         if self.ast_type in _RUST_DEF_TYPES and self.name and getattr(self, "ast_ref", None) is not None:
             safe_name = str(self.name)[:255]
+            from core.globalstuff import SymbolLinkage
             with CS(REF_POS):
                 CS.store(m_symbol_def.set(
                     None,
-                    CS.gp.VID,
                     ((m_file.table_id, 0), OP_REF, (REF_ROOT,)),
                     current_tag,
                     self.ast_ref,
                     safe_name,
                     int(self.ast_type),
+                    SymbolLinkage.ExternalDef,
                     self.extent.line_pos[0],
                     self.extent.line_pos[1],
                 ))
@@ -170,8 +171,6 @@ class Ast_Rust:
 
         current_tag = (
             None,
-            CS.gp.VID,
-            0,
             code_hash,
             ast_ref,
             self.extent.char_pos[0],
@@ -208,7 +207,7 @@ class Ast_Rust:
                 for x, tag in enumerate(CS.prior_tags):
                     if x in CS.active_tag_list:
                         continue
-                    if len(tag) > 9 and tag[9] == code_hash:
+                    if len(tag) > 7 and tag[7] == code_hash:
                         if isinstance(CS.active_tag_list, set):
                             CS.active_tag_list.add(x)
                         else:

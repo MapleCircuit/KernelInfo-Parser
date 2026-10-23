@@ -1,0 +1,723 @@
+/* docs.css - kernel.org (Sphinx/Alabaster) documentation layout, adapted to the IDE dark theme */
+
+:root {
+  --kdoc-font-body: Georgia, "Goudy Old Style", "Minion Pro", "Bell MT", "Hiragino Mincho Pro", "DejaVu Serif", serif;
+  --kdoc-text: #d4d9df;
+  --kdoc-heading: #eef2f6;
+  --kdoc-link: #6cb6ff;
+  --kdoc-link-hover: #a5d6ff;
+  --kdoc-sidebar-bg: #11161d;
+  --kdoc-code-bg: #161b22;
+  --kdoc-inline-code-bg: rgba(110, 118, 129, 0.22);
+  --kdoc-rule: #2a313a;
+}
+
+.code-viewer-container [hidden] {
+  display: none !important;
+}
+
+.kdoc-viewport {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  overflow: hidden;
+  background: var(--bg-primary);
+}
+
+.kdoc {
+  display: flex;
+  width: 100%;
+  height: 100%;
+  font-family: var(--kdoc-font-body);
+  color: var(--kdoc-text);
+  user-select: text;
+}
+
+/* ---------------------------------------------------------------------------
+ * Sidebar (Alabaster "sphinxsidebar")
+ * ------------------------------------------------------------------------- */
+.kdoc-sidebar {
+  flex: 0 0 280px;
+  overflow-y: auto;
+  padding: 22px 20px 32px;
+  background: var(--kdoc-sidebar-bg);
+  border-right: 1px solid var(--kdoc-rule);
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+.kdoc-brand {
+  margin-bottom: 18px;
+}
+
+.kdoc-logo {
+  display: block;
+  font-size: 24px;
+  line-height: 1.2;
+  color: var(--kdoc-heading);
+  text-decoration: none;
+}
+
+.kdoc-logo:hover {
+  color: var(--kdoc-link-hover);
+}
+
+.kdoc-version {
+  margin-top: 4px;
+  font-size: 15px;
+  color: var(--text-secondary);
+}
+
+.kdoc-sidebar h3 {
+  margin: 20px 0 6px;
+  font-size: 18px;
+  font-weight: normal;
+  color: var(--kdoc-heading);
+}
+
+.kdoc-search h3 {
+  margin-top: 0;
+}
+
+.kdoc-search-form {
+  display: flex;
+}
+
+.kdoc-search-input {
+  flex: 1;
+  min-width: 0;
+  padding: 4px 6px;
+  border: 1px solid var(--border-color);
+  border-right: none;
+  border-radius: 3px 0 0 3px;
+  background: var(--bg-primary);
+  font-family: var(--font-sans);
+  font-size: 13px;
+  outline: none;
+}
+
+.kdoc-search-input:focus {
+  border-color: var(--border-focus);
+}
+
+.kdoc-search-btn {
+  padding: 4px 10px;
+  border: 1px solid var(--border-color);
+  border-radius: 0 3px 3px 0;
+  background: var(--bg-tertiary);
+  color: var(--text-primary);
+  font-family: var(--font-sans);
+  font-size: 13px;
+}
+
+.kdoc-search-btn:hover {
+  background: var(--bg-hover);
+}
+
+.kdoc-search-status {
+  min-height: 16px;
+  margin-top: 4px;
+  font-family: var(--font-sans);
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.kdoc-nav-links {
+  margin-top: 8px;
+}
+
+.kdoc-sidebar a {
+  color: var(--kdoc-text);
+  text-decoration: none;
+}
+
+.kdoc-sidebar a:hover {
+  color: var(--kdoc-link-hover);
+  text-decoration: underline;
+}
+
+.kdoc-localtoc ul,
+.kdoc-this-page {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.kdoc-localtoc ul ul {
+  margin-left: 14px;
+  font-size: 13.5px;
+}
+
+.kdoc-localtoc li {
+  margin: 2px 0;
+}
+
+.kdoc-localtoc a {
+  display: block;
+  padding: 1px 0 1px 8px;
+  border-left: 2px solid transparent;
+}
+
+.kdoc-localtoc a.current {
+  color: var(--kdoc-link);
+  border-left-color: var(--kdoc-link);
+}
+
+.kdoc-this-page li {
+  margin: 3px 0;
+}
+
+/* ---------------------------------------------------------------------------
+ * Body (Alabaster "document")
+ * ------------------------------------------------------------------------- */
+.kdoc-main {
+  flex: 1;
+  min-width: 0;
+  overflow-y: auto;
+  scroll-padding-top: 16px;
+}
+
+.kdoc-body {
+  max-width: 940px;
+  padding: 30px 48px 40px;
+  font-size: 16.5px;
+  line-height: 1.6;
+}
+
+.kdoc-body h1,
+.kdoc-body h2,
+.kdoc-body h3,
+.kdoc-body h4,
+.kdoc-body h5,
+.kdoc-body h6 {
+  font-family: var(--kdoc-font-body);
+  font-weight: normal;
+  color: var(--kdoc-heading);
+  line-height: 1.25;
+  margin: 30px 0 10px;
+  padding: 0;
+}
+
+.kdoc-body h1 { font-size: 2.1em; margin-top: 0; padding-bottom: 6px; border-bottom: 1px solid var(--kdoc-rule); }
+.kdoc-body h2 { font-size: 1.65em; }
+.kdoc-body h3 { font-size: 1.35em; }
+.kdoc-body h4 { font-size: 1.15em; }
+.kdoc-body h5 { font-size: 1em; }
+.kdoc-body h6 { font-size: 0.95em; font-style: italic; }
+
+.kdoc-headerlink {
+  margin-left: 6px;
+  padding: 0 4px;
+  font-size: 0.8em;
+  color: var(--text-muted) !important;
+  text-decoration: none !important;
+  border: none !important;
+  visibility: hidden;
+}
+
+.kdoc-body h1:hover .kdoc-headerlink,
+.kdoc-body h2:hover .kdoc-headerlink,
+.kdoc-body h3:hover .kdoc-headerlink,
+.kdoc-body h4:hover .kdoc-headerlink,
+.kdoc-body h5:hover .kdoc-headerlink,
+.kdoc-body h6:hover .kdoc-headerlink {
+  visibility: visible;
+}
+
+.kdoc-body p {
+  margin: 0 0 14px;
+}
+
+.kdoc-body a {
+  color: var(--kdoc-link);
+  text-decoration: none;
+  border-bottom: 1px dotted rgba(108, 182, 255, 0.55);
+}
+
+.kdoc-body a:hover {
+  color: var(--kdoc-link-hover);
+  border-bottom-style: solid;
+}
+
+.kdoc-body a.kdoc-missing {
+  color: var(--text-muted);
+  border-bottom-color: transparent;
+}
+
+.kdoc-body a code {
+  color: inherit;
+}
+
+.kdoc-body strong {
+  color: var(--kdoc-heading);
+}
+
+.kdoc-body hr.docutils {
+  margin: 28px auto;
+  width: 40%;
+  border: none;
+  border-top: 1px solid var(--kdoc-rule);
+}
+
+.kdoc-body ul,
+.kdoc-body ol {
+  margin: 0 0 14px;
+  padding-left: 30px;
+}
+
+.kdoc-body li {
+  margin: 3px 0;
+}
+
+.kdoc-body li > p:last-child {
+  margin-bottom: 4px;
+}
+
+.kdoc-body blockquote {
+  margin: 0 0 14px 28px;
+}
+
+/* Inline literals and code blocks */
+.kdoc-body code {
+  font-family: var(--font-mono);
+  font-size: 0.86em;
+  padding: 1px 5px;
+  border-radius: 3px;
+  background: var(--kdoc-inline-code-bg);
+  color: #e6edf3;
+}
+
+.kdoc-body code.xref {
+  background: rgba(56, 139, 253, 0.12);
+  color: #a5d6ff;
+}
+
+.kdoc-body pre {
+  margin: 0 0 16px;
+  padding: 10px 14px;
+  overflow-x: auto;
+  font-family: var(--font-mono);
+  font-size: 13px;
+  line-height: 1.45;
+  background: var(--kdoc-code-bg);
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+  color: #e6edf3;
+  white-space: pre;
+}
+
+.kdoc-body pre.plain-text {
+  background: transparent;
+  border-style: dashed;
+}
+
+.kdoc-body .hl-k { color: #ff7b72; }
+.kdoc-body .hl-s { color: #a5d6ff; }
+.kdoc-body .hl-c { color: #8b949e; font-style: italic; }
+.kdoc-body .hl-n { color: #79c0ff; }
+.kdoc-body .hl-p { color: #d2a8ff; }
+
+.kdoc-body kbd.kbd {
+  padding: 1px 6px;
+  font-family: var(--font-mono);
+  font-size: 0.82em;
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border-color);
+  border-bottom-width: 2px;
+  border-radius: 4px;
+}
+
+.kdoc-body .menuselection {
+  font-family: var(--font-sans);
+  font-size: 0.9em;
+  font-weight: 600;
+}
+
+.kdoc-body .kdoc-unresolved {
+  border-bottom: 1px dotted var(--text-muted);
+  cursor: help;
+}
+
+.kdoc-body .kdoc-muted,
+.kdoc-sidebar .kdoc-muted {
+  color: var(--text-muted);
+}
+
+/* Admonitions */
+.kdoc-body .admonition {
+  margin: 18px 0;
+  padding: 10px 16px 4px;
+  border: 1px solid var(--kdoc-rule);
+  border-left: 4px solid var(--accent-blue);
+  border-radius: 4px;
+  background: rgba(56, 139, 253, 0.08);
+}
+
+.kdoc-body .admonition-title {
+  margin: 0 0 6px;
+  font-size: 1.05em;
+  font-weight: bold;
+  color: var(--kdoc-heading);
+}
+
+.kdoc-body .admonition-title::after {
+  content: ":";
+}
+
+.kdoc-body .admonition.warning,
+.kdoc-body .admonition.danger,
+.kdoc-body .admonition.error,
+.kdoc-body .admonition.caution {
+  border-left-color: var(--accent-red);
+  background: rgba(248, 81, 73, 0.08);
+}
+
+.kdoc-body .admonition.attention,
+.kdoc-body .admonition.important,
+.kdoc-body .admonition.todo {
+  border-left-color: var(--accent-yellow);
+  background: rgba(210, 153, 34, 0.08);
+}
+
+.kdoc-body .admonition.tip,
+.kdoc-body .admonition.hint {
+  border-left-color: var(--accent-green);
+  background: rgba(63, 185, 80, 0.08);
+}
+
+.kdoc-body .admonition.seealso {
+  border-left-color: var(--accent-purple);
+  background: rgba(188, 140, 255, 0.08);
+}
+
+/* Tables */
+.kdoc-body table.docutils {
+  margin: 0 0 18px;
+  border-collapse: collapse;
+  font-size: 0.93em;
+}
+
+.kdoc-body table.docutils caption {
+  padding-bottom: 6px;
+  font-style: italic;
+  color: var(--text-secondary);
+  text-align: left;
+}
+
+.kdoc-body table.docutils th,
+.kdoc-body table.docutils td {
+  padding: 5px 10px;
+  border: 1px solid var(--border-color);
+  text-align: left;
+  vertical-align: top;
+}
+
+.kdoc-body table.docutils th {
+  background: var(--bg-tertiary);
+  color: var(--kdoc-heading);
+  font-weight: bold;
+}
+
+.kdoc-body table.docutils tbody tr:nth-child(even) td {
+  background: rgba(255, 255, 255, 0.02);
+}
+
+.kdoc-body table.docutils p {
+  margin: 0 0 6px;
+}
+
+/* Definition and field lists */
+.kdoc-body dl {
+  margin: 0 0 14px;
+}
+
+.kdoc-body dl dt {
+  font-weight: bold;
+  color: var(--kdoc-heading);
+}
+
+.kdoc-body dl dd {
+  margin: 2px 0 10px 30px;
+}
+
+.kdoc-body .classifier {
+  font-weight: normal;
+  font-style: italic;
+  color: var(--text-secondary);
+}
+
+.kdoc-body dl.field-list {
+  display: grid;
+  grid-template-columns: max-content auto;
+  column-gap: 14px;
+}
+
+.kdoc-body dl.field-list dt {
+  padding-right: 6px;
+}
+
+.kdoc-body dl.field-list dd {
+  margin: 0 0 6px;
+}
+
+.kdoc-body dl.c > dt.sig {
+  padding: 4px 10px;
+  border-left: 3px solid var(--accent-blue);
+  background: rgba(56, 139, 253, 0.08);
+  font-weight: normal;
+}
+
+.kdoc-body dl.c > dt.sig code {
+  background: none;
+  padding: 0;
+  font-size: 0.92em;
+}
+
+/* Toctree */
+.kdoc-body .toctree-wrapper {
+  margin: 4px 0 18px;
+}
+
+.kdoc-body .toctree-wrapper .caption {
+  margin: 0 0 4px;
+  font-size: 1.1em;
+  font-weight: bold;
+  color: var(--kdoc-heading);
+}
+
+.kdoc-body .toctree-wrapper ul {
+  margin: 0;
+  padding-left: 24px;
+  list-style: disc;
+}
+
+/* Topics, contents, rubric, footnotes, line blocks */
+.kdoc-body .topic {
+  margin: 14px 0;
+  padding: 10px 16px;
+  border: 1px solid var(--kdoc-rule);
+  border-radius: 4px;
+  background: var(--kdoc-code-bg);
+}
+
+.kdoc-body .topic-title {
+  margin: 0 0 4px;
+  font-weight: bold;
+  color: var(--kdoc-heading);
+}
+
+.kdoc-body .topic ul {
+  margin-bottom: 4px;
+}
+
+.kdoc-body .rubric {
+  margin-top: 22px;
+  font-weight: bold;
+  font-size: 1.1em;
+  color: var(--kdoc-heading);
+}
+
+.kdoc-body .caption {
+  font-style: italic;
+  color: var(--text-secondary);
+}
+
+.kdoc-body .footnote {
+  display: flex;
+  gap: 8px;
+  margin: 6px 0;
+  font-size: 0.9em;
+  color: var(--text-secondary);
+}
+
+.kdoc-body .footnote-label {
+  flex-shrink: 0;
+  color: var(--text-muted);
+}
+
+.kdoc-body .line-block {
+  margin: 0 0 14px;
+}
+
+.kdoc-body .versionmodified-label {
+  font-style: italic;
+  color: var(--text-secondary);
+}
+
+.kdoc-body .math pre {
+  text-align: center;
+  background: transparent;
+  border: none;
+}
+
+/* Directive cards (kernel-doc, include, figures we cannot inline) */
+.kdoc-body .kdoc-directive-card,
+.kdoc-body .kdoc-figure-placeholder {
+  margin: 14px 0;
+  padding: 10px 14px;
+  border: 1px dashed var(--border-color);
+  border-radius: 4px;
+  background: var(--kdoc-code-bg);
+  font-family: var(--font-sans);
+  font-size: 13px;
+}
+
+.kdoc-directive-head {
+  display: flex;
+  gap: 10px;
+  align-items: baseline;
+  margin-bottom: 4px;
+  color: var(--text-secondary);
+}
+
+.kdoc-directive-name {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  padding: 1px 6px;
+  border-radius: 3px;
+  background: rgba(240, 136, 62, 0.15);
+  color: var(--accent-orange);
+}
+
+.kdoc-opts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 6px;
+}
+
+.kdoc-opt {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.kdoc-body .kdoc-figure {
+  margin: 14px 0;
+}
+
+.kdoc-body .kdoc-figure figcaption {
+  font-size: 0.92em;
+  font-style: italic;
+  color: var(--text-secondary);
+}
+
+.kdoc-figure-alt {
+  margin-top: 4px;
+  color: var(--text-muted);
+}
+
+/* Quick search hits and anchor target flash */
+.kdoc-body mark.kdoc-hl {
+  background: rgba(210, 153, 34, 0.35);
+  color: inherit;
+  border-radius: 2px;
+}
+
+.kdoc-body mark.kdoc-hl.current {
+  background: rgba(240, 136, 62, 0.75);
+  color: #0d1117;
+}
+
+.kdoc-body .kdoc-target-flash {
+  animation: kdoc-flash 1.2s ease-out;
+}
+
+@keyframes kdoc-flash {
+  from { background: rgba(56, 139, 253, 0.25); }
+  to { background: transparent; }
+}
+
+.kdoc-footer {
+  max-width: 940px;
+  padding: 18px 48px 30px;
+  border-top: 1px solid var(--kdoc-rule);
+  font-size: 13px;
+  color: var(--text-muted);
+}
+
+.kdoc-footer a {
+  color: var(--text-secondary);
+}
+
+.kdoc-footer code {
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+
+@media (max-width: 900px) {
+  .kdoc {
+    flex-direction: column;
+  }
+
+  .kdoc-sidebar {
+    flex: 0 0 auto;
+    max-height: 40%;
+    border-right: none;
+    border-bottom: 1px solid var(--kdoc-rule);
+  }
+
+  .kdoc-body,
+  .kdoc-footer {
+    padding-left: 20px;
+    padding-right: 20px;
+  }
+}
+
+/* Inline figures (served from Git via /api/fs/raw) */
+.kdoc-body img.kdoc-img {
+  display: block;
+  max-width: 100%;
+  height: auto;
+  padding: 8px;
+  border-radius: 4px;
+  /* Most kernel figures are drawn for white pages */
+  background: #f6f8fa;
+}
+
+.kdoc-body .kdoc-align-center img.kdoc-img { margin: 0 auto; }
+.kdoc-body .kdoc-align-right img.kdoc-img { margin-left: auto; }
+
+/* kernel-doc API entries (Sphinx C domain) */
+.kdoc-body dl.c {
+  margin: 18px 0 22px;
+}
+
+.kdoc-body dl.c > dt.sig {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 6px 10px;
+  border-left: 3px solid var(--accent-blue);
+  background: rgba(56, 139, 253, 0.08);
+}
+
+.kdoc-body dl.c > dt.sig .sig-name {
+  white-space: pre-wrap;
+}
+
+.kdoc-body dl.c > dt.sig:hover .kdoc-headerlink {
+  visibility: visible;
+}
+
+.kdoc-body .kdoc-src-link {
+  margin-left: auto;
+  font-family: var(--font-sans);
+  font-size: 12px;
+  border-bottom: none;
+  color: var(--text-muted);
+}
+
+.kdoc-body .kdoc-src-link:hover {
+  color: var(--kdoc-link-hover);
+}
+
+.kdoc-body dl.c > dd {
+  margin: 8px 0 0 24px;
+}
+
+.kdoc-body dl.c .rubric {
+  margin: 14px 0 6px;
+  font-size: 1em;
+}

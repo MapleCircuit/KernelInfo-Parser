@@ -149,7 +149,20 @@ def _hash64(val: Any) -> int:
         else:
             h = int.from_bytes(hashlib.sha256(raw).digest()[:8], "little")
     elif isinstance(val, tuple):
-        h = int.from_bytes(hashlib.sha256(repr(val).encode("utf-8")).digest()[:8], "little")
+        # Fast SplitMix64 / FxHash tuple mixing for composite primary keys
+        h = 0xCBF29CE484222325
+        for item in val:
+            if isinstance(item, int):
+                ih = (item * 0x517CC1B727220A95) & 0xFFFFFFFFFFFFFFFF
+            elif isinstance(item, (bytes, bytearray, memoryview)):
+                raw = bytes(item)
+                if len(raw) >= 8:
+                    ih = struct.unpack("<Q", raw[:8])[0]
+                else:
+                    ih = int.from_bytes(hashlib.sha256(raw).digest()[:8], "little")
+            else:
+                ih = _hash64(item)
+            h = ((h ^ ih) * 0xBF58476D1CE4E5B9 + 0x517CC1B727220A95) & 0xFFFFFFFFFFFFFFFF
     else:
         h = int.from_bytes(hashlib.sha256(str(val).encode("utf-8")).digest()[:8], "little")
     return h if h != EMPTY_SLOT_HASH else 1
@@ -487,3 +500,516 @@ class SharedTableBuilder:
         )
 
         return SharedTableReader(mm)
+
+
+SHARED_SYMBOL_MAGIC = b"SYMB"
+SHARED_SYMBOL_VERSION = 1
+
+
+class SharedSymbolMappingView:
+    """Mapping-like view over a SharedSymbolReader for (name, type_id) -> ast_id lookups."""
+
+    def __init__(self, reader: SharedSymbolReader) -> None:
+        self._reader = reader
+
+    def __getitem__(self, key: tuple[str, int]) -> int:
+        val = self._reader.get_symbol(key[0], key[1])
+        if val is None:
+            raise KeyError(key)
+        return val
+
+    def get(self, key: tuple[str, int], default: Any = None) -> Any:
+        val = self._reader.get_symbol(key[0], key[1])
+        return val if val is not None else default
+
+    def __contains__(self, key: Any) -> bool:
+        if isinstance(key, tuple) and len(key) >= 2:
+            return self._reader.get_symbol(key[0], key[1]) is not None
+        return False
+
+    def __len__(self) -> int:
+        return self._reader.sym_count
+
+    def __bool__(self) -> bool:
+        return self._reader.sym_count > 0
+
+
+class SharedNameMappingView:
+    """Mapping-like view over a SharedSymbolReader for name -> ast_id lookups."""
+
+    def __init__(self, reader: SharedSymbolReader) -> None:
+        self._reader = reader
+
+    def __getitem__(self, key: str) -> int:
+        val = self._reader.get_name(key)
+        if val is None:
+            raise KeyError(key)
+        return val
+
+    def get(self, key: str, default: Any = None) -> Any:
+        val = self._reader.get_name(key)
+        return val if val is not None else default
+
+    def __contains__(self, key: Any) -> bool:
+        if isinstance(key, str):
+            return self._reader.get_name(key) is not None
+        return False
+
+    def __len__(self) -> int:
+        return self._reader.name_count
+
+    def __bool__(self) -> bool:
+        return self._reader.name_count > 0
+
+
+class SharedSymbolReader:
+    """Zero-deserialization lock-free reader querying symbols directly from shared memory."""
+
+    def __init__(self, mm: mmap.mmap) -> None:
+        self.mm = mm
+        self.mv = memoryview(mm)
+        (
+            magic,
+            version,
+            self.sym_count,
+            self.name_count,
+            self.sym_idx_offset,
+            self.sym_cap,
+            self.name_idx_offset,
+            self.name_cap,
+            self.str_offset,
+            self.str_size,
+        ) = struct.unpack_from("<4sIIQQQQQQQ", self.mv, 0)
+        self.sym_mask = self.sym_cap - 1
+        self.name_mask = self.name_cap - 1
+        self.symbols = SharedSymbolMappingView(self)
+        self.names = SharedNameMappingView(self)
+
+    def get_symbol(self, sym_name: str, sym_type: int) -> int | None:
+        """Query ast_id for (sym_name, sym_type) in O(1) time without heap allocations."""
+        if not sym_name:
+            return None
+        h64 = (_hash64(sym_name) ^ (sym_type * 0x9E3779B97F4A7C15)) & 0xFFFFFFFFFFFFFFFF
+        if h64 == 0:
+            h64 = 1
+        step = 1
+        slot = h64 & self.sym_mask
+        name_bytes = sym_name.encode("utf-8")
+        target_len = len(name_bytes)
+        SLOT_SIZE = 24
+        EMPTY_AST_ID = 0xFFFFFFFFFFFFFFFF
+
+        while True:
+            slot_off = self.sym_idx_offset + slot * SLOT_SIZE
+            cur_h64, s_off, s_len, cur_type, _ = struct.unpack_from("<QIHHI", self.mv, slot_off)
+            cur_ast_id = struct.unpack_from("<Q", self.mv, slot_off + 16)[0]
+            if cur_ast_id == EMPTY_AST_ID:
+                return None
+            if cur_h64 == h64 and cur_type == sym_type and s_len == target_len:
+                if self.mv[self.str_offset + s_off : self.str_offset + s_off + s_len] == name_bytes:
+                    return cur_ast_id
+            slot = (slot + step) & self.sym_mask
+            step += 1
+            if step > self.sym_cap:
+                return None
+
+    def get_name(self, sym_name: str) -> int | None:
+        """Query ast_id for sym_name in O(1) time."""
+        if not sym_name:
+            return None
+        h64 = _hash64(sym_name)
+        if h64 == 0:
+            h64 = 1
+        step = 1
+        slot = h64 & self.name_mask
+        name_bytes = sym_name.encode("utf-8")
+        target_len = len(name_bytes)
+        SLOT_SIZE = 24
+        EMPTY_AST_ID = 0xFFFFFFFFFFFFFFFF
+
+        while True:
+            slot_off = self.name_idx_offset + slot * SLOT_SIZE
+            cur_h64, s_off, s_len, _, _ = struct.unpack_from("<QIHHI", self.mv, slot_off)
+            cur_ast_id = struct.unpack_from("<Q", self.mv, slot_off + 16)[0]
+            if cur_ast_id == EMPTY_AST_ID:
+                return None
+            if cur_h64 == h64 and s_len == target_len:
+                if self.mv[self.str_offset + s_off : self.str_offset + s_off + s_len] == name_bytes:
+                    return cur_ast_id
+            slot = (slot + step) & self.name_mask
+            step += 1
+            if step > self.name_cap:
+                return None
+
+    def __contains__(self, key: Any) -> bool:
+        if isinstance(key, tuple) and len(key) >= 2:
+            return self.get_symbol(key[0], key[1]) is not None
+        if isinstance(key, str):
+            return self.get_name(key) is not None
+        return False
+
+    def __getitem__(self, key: Any) -> int:
+        if isinstance(key, tuple) and len(key) >= 2:
+            val = self.get_symbol(key[0], key[1])
+        elif isinstance(key, str):
+            val = self.get_name(key)
+        else:
+            raise KeyError(key)
+        if val is None:
+            raise KeyError(key)
+        return val
+
+    def get(self, key: Any, default: Any = None) -> Any:
+        if isinstance(key, tuple) and len(key) >= 2:
+            val = self.get_symbol(key[0], key[1])
+        elif isinstance(key, str):
+            val = self.get_name(key)
+        else:
+            return default
+        return val if val is not None else default
+
+    def __len__(self) -> int:
+        return self.sym_count
+
+    def __bool__(self) -> bool:
+        return self.sym_count > 0
+
+    def items(self):
+        """Yield ((sym_name, sym_type), ast_id) for all packed symbols directly from shared memory."""
+        SLOT_SIZE = 24
+        EMPTY_AST_ID = 0xFFFFFFFFFFFFFFFF
+        for slot in range(self.sym_cap):
+            slot_off = self.sym_idx_offset + slot * SLOT_SIZE
+            cur_h64, s_off, s_len, cur_type, _ = struct.unpack_from("<QIHHI", self.mv, slot_off)
+            cur_ast_id = struct.unpack_from("<Q", self.mv, slot_off + 16)[0]
+            if cur_ast_id != EMPTY_AST_ID:
+                sym_name = bytes(self.mv[self.str_offset + s_off : self.str_offset + s_off + s_len]).decode("utf-8")
+                yield (sym_name, cur_type), cur_ast_id
+
+    def close(self) -> None:
+        """Release memoryview and close underlying shared memory mapping."""
+        try:
+            if hasattr(self, "mv") and self.mv is not None:
+                self.mv.release()
+                self.mv = None
+        except Exception:
+            pass
+        try:
+            if hasattr(self, "mm") and self.mm is not None:
+                self.mm.close()
+                self.mm = None
+        except Exception:
+            pass
+
+
+class SharedSymbolBuilder:
+    """Builds a compact open-addressing shared memory hash table for header symbols."""
+
+    def __init__(self, mode: str = "auto") -> None:
+        self.mode = mode
+
+    def build(
+        self,
+        symbols_map: dict[tuple[str, int], int],
+        names_map: dict[str, int] | None = None,
+    ) -> SharedSymbolReader | None:
+        if not symbols_map and not names_map:
+            return None
+
+        if names_map is None:
+            names_map = {k[0]: v for k, v in symbols_map.items()}
+
+        unique_names = set(names_map.keys()) | {k[0] for k in symbols_map.keys()}
+        str_pool_bytes = bytearray()
+        str_offsets: dict[str, tuple[int, int]] = {}
+        for name in unique_names:
+            encoded = name.encode("utf-8")
+            str_offsets[name] = (len(str_pool_bytes), len(encoded))
+            str_pool_bytes.extend(encoded)
+
+        sym_cap = 16
+        while sym_cap < max(16, len(symbols_map) * 2):
+            sym_cap *= 2
+
+        name_cap = 16
+        while name_cap < max(16, len(names_map) * 2):
+            name_cap *= 2
+
+        HEADER_SIZE = 64
+        SLOT_SIZE = 24
+        sym_idx_size = sym_cap * SLOT_SIZE
+        name_idx_size = name_cap * SLOT_SIZE
+        str_size = len(str_pool_bytes)
+
+        total_size = HEADER_SIZE + sym_idx_size + name_idx_size + str_size + 1024
+        mm, mode_used, page_sz = SharedBufferAllocator.allocate(total_size, mode=self.mode)
+        mv = memoryview(mm)
+
+        sym_idx_offset = HEADER_SIZE
+        name_idx_offset = sym_idx_offset + sym_idx_size
+        str_offset = name_idx_offset + name_idx_size
+
+        struct.pack_into(
+            "<4sIIQQQQQQQ",
+            mv,
+            0,
+            SHARED_SYMBOL_MAGIC,
+            SHARED_SYMBOL_VERSION,
+            len(symbols_map),
+            len(names_map),
+            sym_idx_offset,
+            sym_cap,
+            name_idx_offset,
+            name_cap,
+            str_offset,
+            str_size,
+        )
+
+        EMPTY_AST_ID = 0xFFFFFFFFFFFFFFFF
+        for i in range(sym_cap):
+            off = sym_idx_offset + i * SLOT_SIZE
+            struct.pack_into("<QIHHI", mv, off, 0, 0, 0, 0, 0)
+            struct.pack_into("<Q", mv, off + 16, EMPTY_AST_ID)
+
+        for i in range(name_cap):
+            off = name_idx_offset + i * SLOT_SIZE
+            struct.pack_into("<QIHHI", mv, off, 0, 0, 0, 0, 0)
+            struct.pack_into("<Q", mv, off + 16, EMPTY_AST_ID)
+
+        mv[str_offset : str_offset + str_size] = str_pool_bytes
+
+        sym_mask = sym_cap - 1
+        for (sym_name, sym_type), ast_id in symbols_map.items():
+            s_off, s_len = str_offsets[sym_name]
+            h64 = (_hash64(sym_name) ^ (sym_type * 0x9E3779B97F4A7C15)) & 0xFFFFFFFFFFFFFFFF
+            if h64 == 0:
+                h64 = 1
+            step = 1
+            slot = h64 & sym_mask
+            while True:
+                slot_off = sym_idx_offset + slot * SLOT_SIZE
+                cur_ast_id = struct.unpack_from("<Q", mv, slot_off + 16)[0]
+                if cur_ast_id == EMPTY_AST_ID:
+                    struct.pack_into("<QIHHI", mv, slot_off, h64, s_off, s_len, sym_type, 0)
+                    struct.pack_into("<Q", mv, slot_off + 16, ast_id)
+                    break
+                slot = (slot + step) & sym_mask
+                step += 1
+
+        name_mask = name_cap - 1
+        for sym_name, ast_id in names_map.items():
+            s_off, s_len = str_offsets[sym_name]
+            h64 = _hash64(sym_name)
+            if h64 == 0:
+                h64 = 1
+            step = 1
+            slot = h64 & name_mask
+            while True:
+                slot_off = name_idx_offset + slot * SLOT_SIZE
+                cur_ast_id = struct.unpack_from("<Q", mv, slot_off + 16)[0]
+                if cur_ast_id == EMPTY_AST_ID:
+                    struct.pack_into("<QIHHI", mv, slot_off, h64, s_off, s_len, 0, 0)
+                    struct.pack_into("<Q", mv, slot_off + 16, ast_id)
+                    break
+                slot = (slot + step) & name_mask
+                step += 1
+
+        return SharedSymbolReader(mm)
+
+
+_MISSING = object()
+
+
+class SharedTableRowSequenceView:
+    """Zero-copy sequence view over a table in SharedTableReader with dynamic mutation support.
+    Evicts preloaded row heap collections while transparently fulfilling list-like operations."""
+
+    def __init__(self, reader: SharedTableReader, table_id: int) -> None:
+        self._reader = reader
+        self._table_id = table_id
+        self._meta = reader.tables.get(table_id, {})
+        self._shared_count = self._meta.get("row_count", 0)
+        self._rec_size = self._meta.get("col_count", 0) * 9
+        self._data_offset = self._meta.get("data_offset", 0)
+        self._appended: list[tuple] = []
+        self._overwritten: dict[int, tuple] = {}
+
+    def __len__(self) -> int:
+        return self._shared_count + len(self._appended)
+
+    def __bool__(self) -> bool:
+        return len(self) > 0
+
+    def __getitem__(self, idx: int | slice) -> Any:
+        if isinstance(idx, slice):
+            return [self[i] for i in range(*idx.indices(len(self)))]
+        total = len(self)
+        if idx < 0:
+            idx += total
+        if idx < 0 or idx >= total:
+            raise IndexError("SharedTableRowSequenceView index out of range")
+        if idx in self._overwritten:
+            return self._overwritten[idx]
+        if idx < self._shared_count:
+            rec_off = self._data_offset + idx * self._rec_size
+            return self._reader._unpack_row(self._meta, rec_off)
+        return self._appended[idx - self._shared_count]
+
+    def __setitem__(self, idx: int, value: tuple) -> None:
+        total = len(self)
+        if idx < 0:
+            idx += total
+        if idx < 0 or idx >= total:
+            raise IndexError("SharedTableRowSequenceView assignment index out of range")
+        if idx < self._shared_count:
+            self._overwritten[idx] = value
+        else:
+            self._appended[idx - self._shared_count] = value
+
+    def append(self, row: tuple) -> None:
+        self._appended.append(row)
+
+    def extend(self, rows: Sequence[tuple]) -> None:
+        self._appended.extend(rows)
+
+    def remove(self, row: tuple) -> None:
+        if row in self._appended:
+            self._appended.remove(row)
+            return
+        for i in range(self._shared_count):
+            if self[i] == row:
+                self._overwritten[i] = None
+                return
+        raise ValueError("row not found in SharedTableRowSequenceView")
+
+    def __iter__(self):
+        for i in range(self._shared_count):
+            if i in self._overwritten:
+                val = self._overwritten[i]
+                if val is not None:
+                    yield val
+            else:
+                rec_off = self._data_offset + i * self._rec_size
+                yield self._reader._unpack_row(self._meta, rec_off)
+        for row in self._appended:
+            yield row
+
+    def clear(self) -> None:
+        self._shared_count = 0
+        self._appended.clear()
+        self._overwritten.clear()
+
+
+class SharedTablePKView:
+    """Zero-copy mapping view over primary keys in SharedTableReader with dynamic mutation support."""
+
+    def __init__(self, reader: SharedTableReader, table_id: int) -> None:
+        self._reader = reader
+        self._table_id = table_id
+        self._meta = reader.tables.get(table_id, {})
+        self._local: dict[Any, tuple] = {}
+        self._deleted: set[Any] = set()
+
+    def _sanitize(self, key: Any) -> Any:
+        if isinstance(key, (bytearray, memoryview)):
+            return bytes(key)
+        if isinstance(key, tuple):
+            return tuple(bytes(x) if isinstance(x, (bytearray, memoryview)) else x for x in key)
+        return key
+
+    def __contains__(self, key: Any) -> bool:
+        k = self._sanitize(key)
+        if k in self._deleted:
+            return False
+        if k in self._local:
+            return True
+        return self._reader.get_row_by_pk(self._table_id, k) is not None
+
+    def get(self, key: Any, default: Any = None) -> Any:
+        k = self._sanitize(key)
+        if k in self._deleted:
+            return default
+        if k in self._local:
+            return self._local[k]
+        row = self._reader.get_row_by_pk(self._table_id, k)
+        return row if row is not None else default
+
+    def __getitem__(self, key: Any) -> Any:
+        val = self.get(key, _MISSING)
+        if val is _MISSING:
+            raise KeyError(key)
+        return val
+
+    def __setitem__(self, key: Any, value: tuple) -> None:
+        k = self._sanitize(key)
+        self._deleted.discard(k)
+        self._local[k] = value
+
+    def pop(self, key: Any, default: Any = _MISSING) -> Any:
+        k = self._sanitize(key)
+        if k in self._local:
+            return self._local.pop(k)
+        row = self._reader.get_row_by_pk(self._table_id, k)
+        if row is not None and k not in self._deleted:
+            self._deleted.add(k)
+            return row
+        if default is not _MISSING:
+            return default
+        raise KeyError(key)
+
+    def keys(self) -> set[Any]:
+        res = set(self._local.keys())
+        if self._reader.contains_table(self._table_id):
+            t_meta = self._meta
+            pk_cols = t_meta.get("primary", ())
+            if pk_cols:
+                rec_size = t_meta.get("col_count", 0) * 9
+                data_offset = t_meta.get("data_offset", 0)
+                for i in range(t_meta.get("row_count", 0)):
+                    rec_off = data_offset + i * rec_size
+                    row = self._reader._unpack_row(t_meta, rec_off)
+                    if len(pk_cols) == 1:
+                        pk = row[pk_cols[0]]
+                    else:
+                        pk = tuple(row[c] for c in pk_cols)
+                    pk = self._sanitize(pk)
+                    if pk not in self._deleted:
+                        res.add(pk)
+        return res
+
+    def __len__(self) -> int:
+        base_cnt = self._meta.get("row_count", 0) if self._reader.contains_table(self._table_id) else 0
+        return max(0, base_cnt + len(self._local) - len(self._deleted))
+
+    def __bool__(self) -> bool:
+        return len(self) > 0
+
+    def __iter__(self):
+        return iter(self.keys())
+
+    def items(self):
+        for k in self.keys():
+            yield k, self[k]
+
+    def values(self):
+        for k in self.keys():
+            yield self[k]
+
+    def clear(self) -> None:
+        self._local.clear()
+        if self._reader.contains_table(self._table_id):
+            t_meta = self._meta
+            pk_cols = t_meta.get("primary", ())
+            if pk_cols:
+                rec_size = t_meta.get("col_count", 0) * 9
+                data_offset = t_meta.get("data_offset", 0)
+                for i in range(t_meta.get("row_count", 0)):
+                    rec_off = data_offset + i * rec_size
+                    row = self._reader._unpack_row(t_meta, rec_off)
+                    if len(pk_cols) == 1:
+                        pk = row[pk_cols[0]]
+                    else:
+                        pk = tuple(row[c] for c in pk_cols)
+                    self._deleted.add(self._sanitize(pk))
+
+

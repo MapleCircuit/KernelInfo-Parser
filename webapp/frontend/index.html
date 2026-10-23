@@ -22,6 +22,7 @@
   <link rel="stylesheet" href="/static/css/commits.css" />
   <link rel="stylesheet" href="/static/css/tools.css" />
   <link rel="stylesheet" href="/static/css/modals.css" />
+  <link rel="stylesheet" href="/static/css/docs.css" />
 
   <!-- Vendored Libraries -->
   <script src="/static/vendor/two.min.js"></script>
@@ -35,14 +36,32 @@
           <img src="/static/assets/icon.svg" alt="KernelIDE Icon" class="brand-icon" />
           <span>KernelInfo IDE</span>
         </div>
-        <div class="version-selector-container">
-          <label for="version-select">Version:</label>
-          <select id="version-select">
+        <div class="version-selector-container" style="display: flex; align-items: center; gap: 8px;">
+          <label for="project-select">Project:</label>
+          <select id="project-select" style="max-width: 130px; font-size: 12px;">
+            <option value="1">Linux Kernel</option>
+          </select>
+          <label for="branch-select">Branch:</label>
+          <select id="branch-select" style="max-width: 100px; font-size: 12px;">
+            <option value="master">master</option>
+          </select>
+          <label for="version-select">Tag:</label>
+          <select id="version-select" style="max-width: 130px; font-size: 12px;">
             <option value="v3.0">v3.0</option>
           </select>
+          <label for="rc-select" id="rc-select-label" hidden>RC:</label>
+          <select id="rc-select" style="max-width: 120px; font-size: 12px;" title="Release candidates of the selected release" hidden></select>
+          <label for="commit-picker-btn">Commit:</label>
+          <button id="commit-picker-btn" class="commit-picker-btn" type="button" title="Select a specific commit">
+            <span id="commit-picker-label">—</span>
+            <span class="commit-picker-caret">▾</span>
+          </button>
         </div>
       </div>
       <div class="header-right">
+        <button id="global-search-btn" class="global-search-btn" type="button" title="Search files, symbols, commits and Kconfig options (Ctrl+K) · commands (Ctrl+Shift+P)">
+          <span>🔍 Search…</span><kbd>Ctrl K</kbd>
+        </button>
         <div id="offline-badge" class="offline-badge">● Online</div>
       </div>
     </header>
@@ -65,6 +84,9 @@
         </button>
         <button class="activity-btn" data-action="commits" title="Git Timeline & Commits">
           <svg viewBox="0 0 16 16"><path d="M10.5 8a2.5 2.5 0 1 1-5 0 2.5 2.5 0 0 1 5 0zM0 8a8 8 0 1 1 16 0A8 8 0 0 1 0 8zm8-6.5a6.5 6.5 0 1 0 0 13 6.5 6.5 0 0 0 0-13z"/></svg>
+        </button>
+        <button class="activity-btn" data-action="compare" title="Compare Versions & Commits">
+          <svg viewBox="0 0 16 16"><path d="M8.75 1.75V5H6.5L9.5 8 6.5 11h2.25v3.25a.75.75 0 0 1-1.5 0V12.5H2.75A1.75 1.75 0 0 1 1 10.75v-5.5C1 4.28 1.78 3.5 2.75 3.5h4.5V1.75a.75.75 0 0 1 1.5 0zM2.75 5a.25.25 0 0 0-.25.25v5.5c0 .14.11.25.25.25h4.5V5h-4.5zm7.75-1.5h2.75c.97 0 1.75.78 1.75 1.75v5.5c0 .97-.78 1.75-1.75 1.75H10.5V11h2.75a.25.25 0 0 0 .25-.25v-5.5a.25.25 0 0 0-.25-.25H10.5V3.5z"/></svg>
         </button>
       </aside>
 

@@ -17,8 +17,8 @@ Rust Source Code (.rs)
   ├─ Git Operation: "R100" (Exact Rename) ──► No-op (Reuses old fid automatically)
   │
   ├─ Git Operation: "D" (Deleted)
-  │  ├─ get_prior_tags(CS) ──► Queries old_vid tags via m_bridge_tag.view_get_multiple
-  │  └─ close_prior_tags(CS) ─► Closes unreferenced prior tags via m_tag.update(vid_e=Old_VID)
+  │  ├─ get_prior_tags(CS) ──► Queries old tags via m_bridge_tag.view_get_multiple
+  │  └─ close_prior_tags(CS) ─► No-op under immutable Git DAG architecture
   │
   └─ Git Operation: "A" / "M" / "R*" (Added / Modified / Content Rename)
      ├─ get_prior_tags(CS) (if M or R*)
@@ -44,16 +44,16 @@ Relational Extraction inside with CS(REF_NO_REF):
   │     ├── Tier 3-5: Positional anchors and spatial line proximity fallback
   │     │
   │     ├── Rule 12 Staging Order inside with CS(REF_POS):
-  │     │     ├── 1. m_tag.set(None, VID, 0, code_hash, ast_ref, 0, 0)  [MUST BE FIRST]
+  │     │     ├── 1. m_tag.set(None, code_hash, ast_ref, 0, 0)          [MUST BE FIRST, 5 columns: tag_id, hash, ast_id, hl_s, hl_l]
   │     │     │      tag_ref = ((m_tag.table_id, 0), OP_REF, (REF_POS, CS.route[-1]))
   │     │     ├── 2. m_tag_code.get_set(code_hash, code_str)             [Auxiliary hash table]
   │     │     └── 3. m_moved_tag.set(s_tag_id, tag_ref)                  [If evolved tag match]
   │     │
-  │     ├── File-to-Tag Bridge: m_bridge_tag.set(fid, tag_ref, line_s, line_e, char_s, char_e)
+  │     ├── File-to-Tag Bridge: m_bridge_tag.set(blob_id, tag_ref, line_s, line_e, char_s, char_e)
   │     ├── Spatial AST Map: m_map_ast.set(tag_ref, 1, 1, rel_line_e, rel_char_e, ast_ref)
   │     └── Bridge Map Link: m_bridge_map.set(tag_ref, tag_ref)
   │
-  └─ close_prior_tags(CS) (if M or R*)
+  └─ close_prior_tags(CS): In zero-VID DAG, tags are immutable content records; tag closure is a no-op
 ==================================================================================================
 ```
 
@@ -102,8 +102,6 @@ Inside `with CS(REF_POS):`, `m_tag.set` **must be the first operation** so that 
 with CS(REF_POS):
     CS.store(m_tag.set(
         None,            # tag_id (AUTO_INCREMENT)
-        CS.gp.VID,       # vid_s
-        0,               # vid_e (active = 0)
         code_hash,       # 32-byte binary SHA-256 digest
         ast_ref,         # reference to m_ast node
         0,               # hl_s
@@ -135,12 +133,12 @@ Rust definition symbols (`Rust_Fn`, `Rust_Struct`, `Rust_Enum`, `Rust_Trait`) ar
 with CS(REF_POS):
     CS.store(m_symbol_def.set(
         None,                                        # def_id (AUTO_INCREMENT)
-        CS.gp.VID,                                   # vid
-        ((m_file.table_id, 0), OP_REF, (REF_ROOT,)), # fid reference
+        ((m_file.table_id, 0), OP_REF, (REF_ROOT,)), # blob_id reference
         actual_tag,                                  # tag_id (new tag_ref or recycled prior_tag_id)
         node.ast_ref,                                # ast_id reference
         safe_name,                                   # symbol name (e.g. "KernelBuffer", "reset")
         int(node.ast_type),                          # type_id (ASTT.Rust_Fn, Rust_Struct, etc.)
+        SymbolLinkage.ExternalDef,                   # linkage (ExternalDef = 0)
         node.extent.line_pos[0],                     # line_s
         node.extent.line_pos[1],                     # line_e
     ))
@@ -178,8 +176,8 @@ The Rust AST parser defines dedicated `Ast_Rust` classes for every major languag
    If `compute_code_hash(self.extent.code)` matches an unconsumed prior tag, the existing `tag_id` is recycled directly into `m_bridge_tag`, producing zero duplicate entries in `m_tag` or `m_ast`.
 3. **Modified Tag Evolution (Tier 2)**:
    If code has changed, `match_prior_tag_transition` matches by symbol name and AST type constant, linking the old tag to the new tag via `m_moved_tag(s_tag_id, tag_ref)`.
-4. **Closing Obsolete Tags (`close_prior_tags`)**:
-   Un-recycled prior tags are marked closed by updating `vid_e = Old_VID` in `REF_OLD`.
+4. **Immutable Tag Closing (`close_prior_tags`)**:
+   Under the immutable Git DAG architecture, prior tags are permanent content records; `close_prior_tags` operates as a clean no-op.
 
 ---
 

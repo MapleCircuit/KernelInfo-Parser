@@ -54,6 +54,9 @@ from core.globalstuff import (
     FileRefType,
     FILE_REF_TYPE_LABELS,
     format_ref_type_label,
+    reclaim_system_memory,
+    freeze_system_memory,
+    unfreeze_system_memory,
 )
 
 from core.StringWrangler import (

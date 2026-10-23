@@ -43,16 +43,20 @@ Relational Database Mapping:
 
 ---
 
-## 2. Relational Schema Mapping (Tables 26–29)
+## 2. Relational Schema Mapping (Tables 26–29, 36–39)
 
-`git_ast` populates four core relational tables tracking commit metadata, contributors, affected files, and modified code tags:
+`git_ast` populates core relational tables tracking commit metadata, contributors, affected files, code tags, multi-remote networks, and DAG topology within the content-addressable Git DAG:
 
 | Table ID | Table Name | Columns | Primary Key | `no_duplicate` | Description |
 | :---: | :--- | :--- | :--- | :---: | :--- |
-| **26** | `m_commit` | `(commit_id, vid, commit_hash, author_id, author_date, committer_id, committer_date, subject, message)` | `("commit_id",)` | `False` | Git commit registry. Primary key `commit_id` is AUTO_INCREMENT. |
+| **26** | `m_commit` | `(commit_id, network_id, commit_hash, author_id, author_date, committer_id, committer_date, subject, message)` | `("commit_id",)` | `False` | Git commit registry. `commit_hash` is `BINARY(20)` SHA-1. Primary key `commit_id` is AUTO_INCREMENT. |
 | **27** | `m_bridge_commit_person` | `(commit_id, person_id, role_type, priority)` | `("commit_id", "person_id", "role_type")` | `False` | Contributor associations: author, committer, and trailers. |
-| **28** | `m_bridge_commit_file` | `(commit_id, vid, fid, change_type)` | `("commit_id", "fid")` | `False` | Files touched per commit (`change_type`: `"M"`, `"A"`, `"D"`, `"R"`). |
-| **29** | `m_bridge_commit_tag` | `(commit_id, vid, fid, tag_id)` | `("commit_id", "tag_id")` | `False` | Code tags modified per commit revision. |
+| **28** | `m_commit_file` | `(commit_id, fnid, blob_id, old_fnid, old_blob_id, change_type)` | `("commit_id", "fnid")` | `False` | First-parent commit tree deltas (aliased as `m_bridge_commit_file`). |
+| **29** | `m_bridge_commit_tag` | `(commit_id, blob_id, tag_id)` | `("commit_id", "tag_id")` | `False` | Code tags modified per commit revision. |
+| **36** | `m_git_network` | `(network_id, project_id, name, root_commit_hash)` | `("network_id",)` | `False` | Multi-remote repository network sharing the same initial root commit. |
+| **37** | `m_repository` | `(repo_id, network_id, name, git_url, default_branch)` | `("repo_id",)` | `False` | Tracked Git repository clone/remote instance. |
+| **38** | `m_git_ref` | `(ref_id, repo_id, ref_type, ref_name, commit_id, tagger_id, tagger_date, tag_message)` | `("ref_id",)` | `False` | Named Git reference (tag or branch), aliased as `m_v_main`. |
+| **39** | `m_commit_parent` | `(commit_id, parent_commit_id, parent_idx)` | `("commit_id", "parent_idx")` | `False` | Directed acyclic graph (DAG) parent lineage per commit. |
 
 ### 2.1. Staging Example
 
@@ -60,13 +64,13 @@ Relational Database Mapping:
 # 1. Register Commit
 commit_row = m_commit.set(
     None,            # commit_id (AUTO_INCREMENT)
-    VID,             # vid
-    commit_hash,     # 40-char git commit SHA
+    network_id,      # network_id (FK -> m_git_network)
+    commit_hash,     # 20-byte binary git commit SHA (bytes)
     author_id,       # FK -> m_maintainer_person.person_id
     author_date,     # Unix epoch timestamp
     committer_id,    # FK -> m_maintainer_person.person_id
     committer_date,  # Unix epoch timestamp
-    subject[:255],   # Commit subject line
+    subject[:500],   # Commit subject line
     body,            # Full commit message
 )
 commit_id = commit_row[2][0]
@@ -78,11 +82,11 @@ for priority, (person_id, role) in enumerate(trailers):
     m_bridge_commit_person.set(commit_id, person_id, role, priority + 2)
 
 # 3. Stage Modified Files & Tags
-for fid, change_type in modified_files:
-    m_bridge_commit_file.set(commit_id, VID, fid, change_type)
+for fnid, blob_id, old_fnid, old_blob_id, change_type in modified_files:
+    m_commit_file.set(commit_id, fnid, blob_id, old_fnid, old_blob_id, change_type)
 
-for fid, tag_id in affected_tags:
-    m_bridge_commit_tag.set(commit_id, VID, fid, tag_id)
+for blob_id, tag_id in affected_tags:
+    m_bridge_commit_tag.set(commit_id, blob_id, tag_id)
 ```
 
 ---
@@ -122,18 +126,52 @@ Contributors are sanitized and stored in `m_maintainer_person` (Table 20), linki
   tag_intervals = [(line_s, line_e, tag_id), ...]
   ```
 - Uses `bisect` over `tag_intervals` to locate code tags overlapping the diff hunk range `[new_start, new_start + new_count]`.
-- Correlated tags are staged into `m_bridge_commit_tag(commit_id, vid, fid, tag_id)`.
+- Correlated tags are staged into `m_bridge_commit_tag(commit_id, blob_id, tag_id)`.
 - This enables web applications and static analysis tools to query all commits that modified a specific function, struct, or macro across kernel versions in $O(1)$ time.
 
 ---
 
-## 5. Performance Invariants & Architectural Rules
+## 5. Multi-Tree DAG Ingestion & Cross-Tree Content Deduplication
+
+### 5.1. Root Commit Discovery & Git Network Resolution (`resolve_git_network_and_repo`)
+When indexing multiple Git repositories (e.g., mainline `torvalds/linux` alongside subsystem trees like `linux-next`), the parser discovers the repository's root commit via:
+```bash
+git rev-list --max-parents=0 HEAD
+```
+For Linux, this resolves to root commit `1da177e4c3f41524e886b7f1b8a0c1fc7321cac2` ("Linux-2.6.12-rc2").
+- Trees that share the identical root commit hash are registered under the same `m_git_network` record.
+- Distinct repositories pointing to that network are tracked individually in `m_repository(repo_id, network_id, name, git_url, default_branch)`.
+
+### 5.2. Complete Git DAG Ingestion (`ingest_git_dag`)
+The Git commit DAG is ingested upfront before file AST parsing:
+- **Topology**: Traverses full commit lineages, staging parents into `m_commit_parent(commit_id, parent_commit_id, parent_idx)`.
+- **References**: Registers tags and branches into `m_git_ref(ref_id, repo_id, ref_type, ref_name, commit_id, ...)`.
+- **Backward Compatibility**: `gp.VID` is anchored to the target Git reference's `head_commit_id`, ensuring downstream relational tables seamlessly align with `m_bridge_checkpoint` and `m_v_main`.
+
+### 5.3. Content-Addressable Blob Deduplication Across Trees
+Git trees are enumerated via `git ls-tree -r {version}` into 20-byte SHA-1 digests.
+- Before queuing files for parallel worker AST parsing, existing blobs in `m_file_blob` with matching `(blob_hash, ftype)` and valid `m_bridge_tag` records are linked directly into `m_bridge_checkpoint` and `m_commit_file`.
+- Deduplicated files bypass Phase 1 worker queues entirely, eliminating redundant AST extraction across branches or trees sharing identical source files.
+
+---
+
+## 6. Performance Invariants & Architectural Rules
 
 1. **Streaming Delimited Ingestion**:
    - Uses binary control characters (`RECORD_SEP`, `FIELD_SEP`, `BODY_END_SEP`) rather than custom regex or multiline string splits, preventing catastrophic backtracking and parsing 100,000+ kernel commits in seconds.
+   - Record chunks are trimmed with `strip(" \t\r\n")`, never bare `strip()`: Python treats `\x1c`–`\x1f` as whitespace, and a bare strip removes the trailing `BODY_END_SEP` of merge commits (which have no `--name-status` file list), silently dropping every merge and every DAG edge through it.
 2. **Subprocess Buffer Protection**:
-   - `_run_git()` caps output buffer at `max_output_bytes = 50MB` with explicit process timeouts (120s) to prevent host memory exhaustion during mega-merges.
+   - `_run_git()` caps output buffer at `max_output_bytes = 50MB` with explicit process timeouts (120s) by default; callers may raise both (e.g. `parse_version_commits()` allows 4 GiB / 1800 s for whole-history ranges).
+   - `parse_version_commits(old_rev, new_rev, limit=None, with_files=True)`: Without `old_rev` the complete history up to `new_rev` is returned (no implicit cap), so the commit DAG reaches the root commit; `limit` bounds the count. `with_files=False` omits `--name-status` for DAG-only ingestion (≈9 s for the 255k commits up to v3.0). `parse_version_commits_with_hunks()` keeps its `-n1000` cap on initial versions because `git log -p` over a whole history is prohibitively large.
 3. **Bisect Interval Queries**:
    - Spatial hunk-to-tag correlation uses $O(\log N)$ interval searching via Python's `bisect` module, avoiding $O(N \cdot M)$ scans between commits and tags.
 4. **Bulk Staging & Cache Bypass**:
    - Commit batches are staged with TableEngine secondary in-memory caching disabled (`update_in_mem_indexes=False`) to avoid maintaining hundreds of thousands of ephemeral commit indexes in RAM.
+5. **Commit DAG Parent Linking**:
+   - `git log` lists children before parents. `ingest_git_dag()` inserts commits oldest-first and links parents through `m_commit`; `processing_git_commits()` defers `m_commit_parent` rows until every commit of the range has an id, resolving parents outside the range by hash.
+   - `main.py --limit N` bounds the commits `ingest_git_dag()` records per version range (default: all).
+6. **Dynamic Repository Routing**:
+   - Multi-tree parsing dynamically routes git subprocess invocations to the active repository directory via `MF.set_repo_dir(repo_dir)`, maintaining independent Git repository context across diverse tree checkouts.
+7. **Binary vs Hexadecimal Commit Hash Formatting**:
+   - Relational tables store commit hashes in compact 20-byte `BINARY(20)` format. Public APIs, services, and webapp endpoints must format binary digests as 40-character lowercase hexadecimal strings (`format_commit_hash(val)`: `bytes(val).hex()`) and use `UNHEX(%s)` for SQL queries.
+

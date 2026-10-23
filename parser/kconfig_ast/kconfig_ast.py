@@ -122,6 +122,7 @@ class KconfigManager:
         # Emission state
         self.VID = CS.gp.VID if hasattr(CS, "gp") and hasattr(CS.gp, "VID") else 1
         self.Old_VID = CS.gp.Old_VID if hasattr(CS, "gp") and hasattr(CS.gp, "Old_VID") else 0
+        self.blob_ref = ((m_file.table_id, 0), OP_REF, (REF_ROOT,))
         self.tree_priority = 0
         self._extract_all()
 
@@ -168,8 +169,6 @@ class KconfigManager:
         code_hash = compute_code_hash(code)
         current_tag = (
             None,
-            CS.gp.VID,
-            0,
             code_hash,
             ast_ref,
             0,
@@ -340,8 +339,6 @@ class KconfigManager:
         with CS(REF_POS):
             CS.store(m_kconfig_symbol.set(
                 None,
-                self.VID,
-                0,  # vid_e (active)
                 cfg.name,
                 cfg.sym_type,
                 cfg.prompt or "",
@@ -407,7 +404,7 @@ class KconfigManager:
         with CS(REF_POS):
             CS.store(m_kconfig_tree.set(
                 None,
-                self.VID,
+                self.blob_ref,
                 parent_tree_id,
                 node_type,
                 display_title,
@@ -438,7 +435,7 @@ class KconfigManager:
         with CS(REF_POS):
             CS.store(m_kconfig_tree.set(
                 None,
-                self.VID,
+                self.blob_ref,
                 parent_tree_id,
                 1,  # menu
                 menu.title or "Menu",
@@ -474,7 +471,7 @@ class KconfigManager:
         with CS(REF_POS):
             CS.store(m_kconfig_tree.set(
                 None,
-                self.VID,
+                self.blob_ref,
                 parent_tree_id,
                 2,  # choice
                 choice_title,
@@ -524,7 +521,7 @@ class KconfigManager:
         with CS(REF_POS):
             CS.store(m_kconfig_tree.set(
                 None,
-                self.VID,
+                self.blob_ref,
                 parent_tree_id,
                 5,  # comment
                 comment.title or "Comment",

@@ -265,10 +265,103 @@ def benchmark_hash_insertion_and_sorting(row_count: int = 20000, batch_size: int
     print(f"   • Locality Gain: {COLOR.green(f'{switches_rand / max(switches_presorted, 1):.2f}x fewer page jumps')} across {batch_size}-row batches!\n")
 
 
+def benchmark_cast_stages(files: list[str] | None = None) -> None:
+    """Run stage-by-stage timing breakdown across key files in full-tree mode."""
+    print(COLOR.cyan("\n=========================================================================================="))
+    print(COLOR.cyan("                  C-AST PIPELINE STAGE TIMING BENCHMARK (FULL-TREE)                       "))
+    print(COLOR.cyan("=========================================================================================="))
+
+    import subprocess
+    import clang.cindex as cc
+    from tests.test_cast_golden import ensure_golden_tree
+    import parser.c_ast.c_ast as cmod
+    from parser.c_ast.cs_extractor import CSExtractor
+    from parser.c_ast import tokenizer as tokmod
+    from db_engine import MockDB
+    from table_engine import get_table_engine
+    from core.DBLayout import init_db_layout
+    from core.GreatProcessor import GreatProcessor
+    from core.FileHandler import MasterFile
+    from core.TableHandling import ChangeSet
+    from tests.test_c_ast import default_processing
+
+    tree_dir = ensure_golden_tree()
+    target_files = files or [
+        "drivers/watchdog/w83627hf_wdt.c",
+        "drivers/usb/storage/isd200.c",
+        "include/linux/sched.h",
+        "arch/powerpc/xmon/ppc-opc.c",
+        "kernel/sched.c",
+    ]
+
+    stage_times: dict[str, float] = {}
+
+    def wrap_fn(obj: Any, name: str, label: str) -> None:
+        orig = getattr(obj, name)
+        def wrapped(*a: Any, **k: Any) -> Any:
+            t = time.perf_counter()
+            try:
+                return orig(*a, **k)
+            finally:
+                stage_times[label] = stage_times.get(label, 0.0) + (time.perf_counter() - t)
+        setattr(obj, name, wrapped)
+
+    wrap_fn(cc.Index, "parse", "1_clang_parse")
+    wrap_fn(cmod, "extract_include_symbols", "2_include_walk")
+    wrap_fn(tokmod.TokenStream, "__init__", "3_tokenize")
+    wrap_fn(CSExtractor, "extract_zone", "5_extract_zone")
+
+    for fp in target_files:
+        stage_times.clear()
+        MockDB._global_store.clear()
+        MockDB._global_next_id.clear()
+        G.DB = MockDB
+        G.TE = get_table_engine("cached")()
+        gp = GreatProcessor()
+        init_db_layout(gp)
+        G.TE.start(gp.Table_Array, G.DB)
+
+        mf = MasterFile()
+        mf.version_dict["v3.0"] = tree_dir
+        G.MF = mf
+        gp.Version_Name = "v3.0"
+        gp.VID = 1
+
+        cs = ChangeSet(f"A\t{fp}")
+        cs.current_vid = 1
+        cs.gp = gp
+        cs.mf = mf
+        G.CURRENT_PARSING_FILE = fp
+
+        default_processing(cs, gp)
+        t0 = time.perf_counter()
+        cs.parse()
+        t1 = time.perf_counter()
+        cs.execute()
+        t2 = time.perf_counter()
+        G.TE.commit_all()
+
+        parse_total = t1 - t0
+        total_time = t2 - t0
+        accounted = sum(v for k, v in stage_times.items())
+        stage_times["4_token_loop(+misc)"] = max(0.0, parse_total - accounted)
+        stage_times["6_cs_execute"] = t2 - t1
+
+        full_p = os.path.join(tree_dir, fp)
+        line_count = sum(1 for _ in open(full_p, encoding="latin-1")) if os.path.exists(full_p) else 0
+
+        print(f"\n[*] {COLOR.cyan(fp)} ({line_count:,} lines, {len(cs.cs):,} ops) | Parse: {parse_total*1000:.1f}ms | Total: {total_time*1000:.1f}ms")
+        for k in sorted(stage_times):
+            dur_ms = stage_times[k] * 1000.0
+            pct = (stage_times[k] / total_time) * 100.0 if total_time > 0 else 0.0
+            print(f"     • {k:<22} {dur_ms:>8.1f} ms  ({pct:>5.1f}%)")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="KernelInfo-Parser Performance & Benchmark Suite")
     parser.add_argument("--all", action="store_true", help="Run all benchmarks and profiling suites")
     parser.add_argument("--profile-cast", action="store_true", help="Run cProfile on C-AST parser suite")
+    parser.add_argument("--profile-cast-stages", action="store_true", help="Run stage-by-stage C-AST pipeline benchmark")
     parser.add_argument("--safe-data", action="store_true", help="Run to_safe_data microbenchmark")
     parser.add_argument("--maintainers", action="store_true", help="Run maintainer pattern matcher benchmark")
     parser.add_argument("--keywords", action="store_true", help="Run keyword membership benchmark")
@@ -276,7 +369,7 @@ def main() -> None:
     args = parser.parse_args()
 
     # Default to running all if no specific benchmark selected
-    run_all = args.all or not any([args.profile_cast, args.safe_data, args.maintainers, args.keywords, args.hashes])
+    run_all = args.all or not any([args.profile_cast, args.profile_cast_stages, args.safe_data, args.maintainers, args.keywords, args.hashes])
 
     if run_all or args.keywords:
         benchmark_keyword_membership()
@@ -286,8 +379,10 @@ def main() -> None:
         benchmark_maintainer_matching()
     if run_all or args.hashes:
         benchmark_hash_insertion_and_sorting()
-    if run_all or args.profile_cast:
+    if args.profile_cast:
         benchmark_cast_profile()
+    if args.profile_cast_stages:
+        benchmark_cast_stages()
 
 
 if __name__ == "__main__":

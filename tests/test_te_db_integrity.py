@@ -204,6 +204,25 @@ fake_tbl_partial_cached = Table(
     hashing_table=False,
 )
 
+# 11. Staging Secondary Index table (mimics m_ast secondary indexing on (name, value))
+FAKE_TBL_SEC_IDX_ID = 110
+fake_tbl_sec_idx = Table(
+    table_id=FAKE_TBL_SEC_IDX_ID,
+    table_name="_test_fake_sec_idx",
+    columns=(
+        ("id", "INT", "NOT NULL", "AUTO_INCREMENT"),
+        ("name", "VARCHAR(64)", "NOT NULL"),
+        ("value", "INT", "NOT NULL"),
+    ),
+    primary=("id",),
+    foreign=None,
+    initial_insert=None,
+    no_duplicate=False,
+    te_cached=False,
+    hashing_table=False,
+    indexes=(("sec_name_val_idx", ("name", "value")),),
+)
+
 ALL_FAKE_TABLES = (
     fake_tbl_simple,
     fake_tbl_nodup,
@@ -215,6 +234,7 @@ ALL_FAKE_TABLES = (
     fake_tbl_hash,
     fake_tbl_cached_bridge,
     fake_tbl_partial_cached,
+    fake_tbl_sec_idx,
 )
 FAKE_TABLES_DICT = {tbl.table_id: tbl for tbl in ALL_FAKE_TABLES}
 
@@ -558,6 +578,49 @@ class TestTableEngineIntegrity(unittest.TestCase):
         self.assertIsNotNone(res_nodup)
         self.assertEqual(res_nodup, (1, "staged_nodup_target"))
 
+    def test_get_staged_secondary_index_lookups(self) -> None:
+        """Verify get() uses O(1) secondary queue indexes before commit and clears them after commit."""
+        # 1. Verify precompiled index structures
+        self.assertIn((1, 2), self.te._table_sec_indexes[fake_tbl_sec_idx.table_id])
+        self.assertIn(1, self.te._table_single_col_indexes[fake_tbl_sec_idx.table_id])
+        self.assertIn(2, self.te._table_single_col_indexes[fake_tbl_sec_idx.table_id])
+
+        # 2. Stage rows via set()
+        r1 = self.te.set(fake_tbl_sec_idx.table_id, (None, "sym_foo", 100))
+        r2 = self.te.set(fake_tbl_sec_idx.table_id, (None, "sym_bar", 200))
+        self.assertEqual(r1, (1, "sym_foo", 100))
+        self.assertEqual(r2, (2, "sym_bar", 200))
+
+        # Check secondary index dictionary contains the keys
+        sec_map = self.te._queued_sec_indexes[fake_tbl_sec_idx.table_id][(1, 2)]
+        self.assertIn(("sym_foo", 100), sec_map)
+        self.assertIn(("sym_bar", 200), sec_map)
+
+        # 3. Exact composite match via get() with None PK (columns[0] is None)
+        res_foo = self.te.get(fake_tbl_sec_idx.table_id, (None, "sym_foo", 100))
+        self.assertEqual(res_foo, (1, "sym_foo", 100))
+
+        # 4. Immediate miss on composite index (key absent in staging)
+        res_missing = self.te.get(fake_tbl_sec_idx.table_id, (None, "sym_unknown", 100))
+        self.assertIsNone(res_missing)
+
+        # 5. Single-column match via get() where value is None (columns[2] is None)
+        res_single = self.te.get(fake_tbl_sec_idx.table_id, (None, "sym_bar", None))
+        self.assertEqual(res_single, (2, "sym_bar", 200))
+
+        # 6. Immediate miss on single-column index
+        res_single_missing = self.te.get(fake_tbl_sec_idx.table_id, (None, "non_existent_sym", None))
+        self.assertIsNone(res_single_missing)
+
+        # 7. Commit flushes staged rows and purges secondary staging indexes
+        self.te.commit(fake_tbl_sec_idx.table_id)
+        self.assertEqual(len(self.te.queued_set[fake_tbl_sec_idx.table_id]), 0)
+        self.assertEqual(len(self.te._queued_sec_indexes[fake_tbl_sec_idx.table_id][(1, 2)]), 0)
+        self.assertEqual(len(self.te._queued_single_col_indexes[fake_tbl_sec_idx.table_id][1]), 0)
+
+        # 8. Post-commit query retrieves row directly from DB backend
+        res_post_commit = self.te.get(fake_tbl_sec_idx.table_id, (None, "sym_foo", 100))
+        self.assertEqual(res_post_commit, (1, "sym_foo", 100))
 
     def test_update_staging(self) -> None:
         """Verify update() stages rows in queued_update buffer."""
@@ -1913,7 +1976,7 @@ class TestDBAndTEIntegration(unittest.TestCase):
             ast_row = self.te.set(m_ast.table_id, (None, "unchanged_type", int(ASTT.C_struct)))
             assigned_ast_id = ast_row[0]
             # 4. m_tag
-            self.te.set(m_tag.table_id, (100, 1, 0, b"h" * 32, assigned_ast_id, 0, 0))
+            self.te.set(m_tag.table_id, (100, b"h" * 32, assigned_ast_id, 0, 0))
             # 5. m_bridge_tag linking fid=50 -> tag_id=100
             self.te.set(m_bridge_tag.table_id, (50, 100, 1, 10, 1, 20))
             self.te.commit_all()

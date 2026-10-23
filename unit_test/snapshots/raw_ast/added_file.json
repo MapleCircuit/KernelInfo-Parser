@@ -10,33 +10,24 @@
     "description": "Verify added raw file stages m_v_main, file prelude, AST tags, coordinates, and code content"
   },
   "tables": {
-    "m_v_main": [
-      {
-        "vid": 1,
-        "vname": "v3.0"
-      }
-    ],
     "m_file_name": [
       {
         "fnid": "$fnid_0",
         "fname": "Documentation/ABI/testing/sysfs-kernel-fscaps"
       }
     ],
-    "m_file": [
+    "m_file_blob": [
       {
-        "fid": "$fid_0",
-        "vid_s": 1,
-        "vid_e": 0,
-        "ftype": "7 (T_RAW)",
-        "s_stat": "A",
-        "e_stat": 0
+        "blob_id": "$fid_0",
+        "blob_hash": "hex:0000000000000000000000000000000000000000",
+        "ftype": "7 (T_RAW)"
       }
     ],
-    "m_bridge_file": [
+    "m_bridge_checkpoint": [
       {
-        "vid": 1,
+        "commit_id": 1,
         "fnid": "$fnid_0",
-        "fid": "$fid_0"
+        "blob_id": "$fid_0"
       }
     ],
     "m_ast": [
@@ -55,8 +46,6 @@
     "m_tag": [
       {
         "tag_id": "$tag_0",
-        "vid_s": 1,
-        "vid_e": 0,
         "hash": "hex:6aad220acdedc2dc37ff426751ef51af8ee9fd3a41ef2ac2ff14516ad80fef02",
         "ast_id": "$ast_0",
         "hl_s": 0,
@@ -65,7 +54,7 @@
     ],
     "m_bridge_tag": [
       {
-        "fid": "$fid_0",
+        "blob_id": "$fid_0",
         "tag_id": "$tag_0",
         "line_s": 1,
         "line_e": 9,
@@ -87,6 +76,18 @@
       {
         "tag_id": "$tag_0",
         "map_id": "$tag_0"
+      }
+    ],
+    "m_git_ref": [
+      {
+        "ref_id": 1,
+        "repo_id": 0,
+        "ref_type": 4,
+        "ref_name": "v3.0",
+        "commit_id": 1,
+        "tagger_id": null,
+        "tagger_date": null,
+        "tag_message": null
       }
     ]
   }

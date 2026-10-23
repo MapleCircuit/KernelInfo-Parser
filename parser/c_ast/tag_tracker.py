@@ -71,13 +71,12 @@ def get_prior_tags(CS: Any) -> None:
         return
     old_fid = bf_row[2][2]
 
-    # 3-way join: m_bridge_tag -> m_tag -> m_ast
-    # Resolves tag coordinates, version metadata, snippet hash, and AST symbol name/type in a single query
+    # 3-way join: m_bridge_tag (6 cols) -> m_tag (5 cols) -> m_ast (3 cols) = 14 cols
     joins = (
         (m_bridge_tag.tag_id, m_tag.tag_id, 1),
         (m_tag.ast_id, m_ast.ast_id, 1),
     )
-    cols = (old_fid,) + (None,) * 15
+    cols = (old_fid,) + (None,) * 13
     CS.prior_tags = m_bridge_tag.view_get_multiple(joins, *cols)
 
     if not CS.prior_tags:
@@ -92,20 +91,21 @@ def get_prior_tags(CS: Any) -> None:
         tag_id = tag[1] if len(tag) > 1 else tag[0]
 
         # Inverted Hash Index (Tier 1)
-        if len(tag) > 9:
-            tag_hash = tag[9]
-            if tag_hash:
-                CS.prior_tags_map.setdefault(tag_hash, []).append((x, tag_id))
+        if len(tag) >= 14:
+            tag_hash = tag[7]
+            ast_id = tag[8]
+            ast_name = tag[12] or ""
+            ast_type = tag[13]
+        else:
+            tag_hash = tag[9] if len(tag) > 9 else None
+            ast_id = tag[10] if len(tag) > 10 else 0
+            ast_name = tag[14] if len(tag) >= 16 else ""
+            ast_type = tag[15] if len(tag) >= 16 else None
 
-        ast_id = tag[10] if len(tag) > 10 else 0
-        ast_name = ""
-        ast_type = None
+        if tag_hash:
+            CS.prior_tags_map.setdefault(tag_hash, []).append((x, tag_id))
 
-        if len(tag) >= 16:
-            # Direct resolution from 3-way join (columns: m_ast.name at index 14, m_ast.type_id at index 15)
-            ast_name = tag[14] or ""
-            ast_type = tag[15]
-        elif ast_id:
+        if not ast_name and ast_id:
             # Fallback for 2-way join tuples with per-run dictionary memoization
             if ast_id in ast_cache:
                 ast_name, ast_type = ast_cache[ast_id]
@@ -337,27 +337,5 @@ def match_prior_tag_transition(
 
 
 def close_prior_tags(CS: Any) -> None:
-    """Mark prior version AST tags as closed (vid_e = Old_VID) if not recycled in the current version."""
-    if not getattr(CS, "prior_tags", None):
-        return
-
-    active_set = CS.active_tag_list if isinstance(CS.active_tag_list, set) else set(CS.active_tag_list)
-    old_vid = getattr(CS.gp, "Old_VID", 0)
-    if old_vid <= 0:
-        return
-
-    with CS(REF_OLD):
-        for x, tag in enumerate(CS.prior_tags):
-            if x in active_set:
-                continue
-            if len(tag) >= 13:
-                with CS(REF_POS):
-                    CS.store(m_tag.update(
-                        tag[6],      # m_tag.tag_id
-                        tag[7],      # m_tag.vid_s
-                        old_vid,     # m_tag.vid_e (marked closed)
-                        tag[9],      # m_tag.hash
-                        tag[10],     # m_tag.ast_id
-                        tag[11],     # m_tag.hl_s
-                        tag[12],     # m_tag.hl_l
-                    ))
+    """Under the immutable Git DAG architecture, prior tags are permanent content records; close_prior_tags is a no-op."""
+    return

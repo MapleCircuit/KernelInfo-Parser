@@ -98,6 +98,14 @@ class KbuildParser:
 
         # 3. Extract obj-* rules and Makefile include directives
         bindings: list[KbuildBinding] = []
+        seen_bindings: set[tuple[str, int, int, str, str]] = set()
+
+        def add_binding(b: KbuildBinding) -> None:
+            b_key = (b.source_file_rel, b.source_line, b.ref_type, b.symbol_name, b.target_obj)
+            if b_key not in seen_bindings:
+                seen_bindings.add(b_key)
+                bindings.append(b)
+
         for start_line, line_str in joined_lines:
             line_str = line_str.strip()
             if not line_str or line_str.startswith("#"):
@@ -114,7 +122,7 @@ class KbuildParser:
                             clean_inc = clean_inc[len(prefix):]
                     clean_inc = clean_inc.strip("/")
                     if clean_inc and not clean_inc.startswith("$"):
-                        bindings.append(KbuildBinding(
+                        add_binding(KbuildBinding(
                             symbol_name="",
                             compile_mode=1,
                             target_obj="Makefile",
@@ -152,7 +160,7 @@ class KbuildParser:
                         sub_dir = f"{clean_dir}/{sub_dir_name}" if clean_dir else sub_dir_name
                         target_mk = f"{sub_dir}/Makefile"
                         rule_desc = f"obj-$(CONFIG_{sym_name}) += {clean_item}" if mode == 3 else f"obj-{sym_name} += {clean_item}"
-                        bindings.append(KbuildBinding(
+                        add_binding(KbuildBinding(
                             symbol_name=sym_name,
                             compile_mode=mode,
                             target_obj="Makefile",
@@ -172,7 +180,7 @@ class KbuildParser:
                                 src_base = comp_obj[:-2]
                                 src_c = f"{clean_dir}/{src_base}.c" if clean_dir else f"{src_base}.c"
                                 bound_sym = sub_sym if sub_sym else sym_name
-                                bindings.append(KbuildBinding(
+                                add_binding(KbuildBinding(
                                     symbol_name=bound_sym,
                                     compile_mode=mode,
                                     target_obj=clean_item,
@@ -185,7 +193,7 @@ class KbuildParser:
                         else:
                             # Direct object -> .c file
                             src_c = f"{clean_dir}/{target_base}.c" if clean_dir else f"{target_base}.c"
-                            bindings.append(KbuildBinding(
+                            add_binding(KbuildBinding(
                                 symbol_name=sym_name,
                                 compile_mode=mode,
                                 target_obj=clean_item,

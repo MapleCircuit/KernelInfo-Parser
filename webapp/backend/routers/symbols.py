@@ -24,6 +24,8 @@ def search_symbols(
 
 @router.get("/symbols/lookup")
 @router.get("/symbols/{version_name}/lookup")
+@router.get("/version/{version_name}/symbol_lookup")
+@router.get("/version/{version_name}/lookup")
 def lookup_symbols(
     version: str = Query("v3.0", alias="version_name"),
     q: str = Query(""),
@@ -66,6 +68,17 @@ def get_ast_tree(
     return symbol_service.get_ast_tree(ast_id, depth, v)
 
 
+@router.get("/symbols/{version_name}/history")
+def get_symbol_history(
+    version_name: str,
+    path: str = Query(...),
+    line: int | None = Query(None),
+    ast_id: int | None = Query(None),
+) -> dict[str, Any]:
+    """History of the symbol defined at path:line across every indexed version."""
+    return symbol_service.get_symbol_history(version_name, path, ast_id=ast_id, line=line)
+
+
 @router.get("/tag/{tag_id}/timeline")
 def get_tag_timeline(tag_id: int) -> dict[str, Any]:
     """Trace cross-version tag evolution history."""
@@ -74,6 +87,8 @@ def get_tag_timeline(tag_id: int) -> dict[str, Any]:
 
 @router.get("/symbols/{version_name}/include/{ast_id}")
 @router.get("/include/{ast_id}")
+@router.get("/version/{version_name}/include/{ast_id}/symbols")
+@router.get("/version/{version_name}/include/{ast_id}")
 def get_include_symbols(
     ast_id: int,
     version: str = Query("v3.0", alias="version_name"),

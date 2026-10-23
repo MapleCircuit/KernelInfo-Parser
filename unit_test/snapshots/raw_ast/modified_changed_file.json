@@ -11,50 +11,29 @@
     "description": "Verify modified raw file captures tag evolution via m_moved_tag, closes prior tags, and retains both tag codes"
   },
   "tables": {
-    "m_v_main": [
-      {
-        "vid": 1,
-        "vname": "v2.6.39"
-      },
-      {
-        "vid": 2,
-        "vname": "v3.0"
-      }
-    ],
     "m_file_name": [
       {
         "fnid": "$fnid_0",
         "fname": "Documentation/00-INDEX"
       }
     ],
-    "m_file": [
+    "m_file_blob": [
       {
-        "fid": "$fid_0",
-        "vid_s": 1,
-        "vid_e": 1,
-        "ftype": "7 (T_RAW)",
-        "s_stat": "A",
-        "e_stat": "M"
-      },
-      {
-        "fid": "$fid_1",
-        "vid_s": 2,
-        "vid_e": 0,
-        "ftype": "7 (T_RAW)",
-        "s_stat": "M",
-        "e_stat": 0
+        "blob_id": "$fid_0",
+        "blob_hash": "hex:0000000000000000000000000000000000000000",
+        "ftype": "7 (T_RAW)"
       }
     ],
-    "m_bridge_file": [
+    "m_bridge_checkpoint": [
       {
-        "vid": 1,
+        "commit_id": 1,
         "fnid": "$fnid_0",
-        "fid": "$fid_0"
+        "blob_id": "$fid_0"
       },
       {
-        "vid": 2,
+        "commit_id": 2,
         "fnid": "$fnid_0",
-        "fid": "$fid_1"
+        "blob_id": "$fid_0"
       }
     ],
     "m_ast": [
@@ -82,8 +61,6 @@
     "m_tag": [
       {
         "tag_id": "$prior_tag_0",
-        "vid_s": 1,
-        "vid_e": 1,
         "hash": "hex:7d45295449dfd4ed64f288a57760b08cb429e492843d8b15af3ea0295d031754",
         "ast_id": "$prior_ast_0",
         "hl_s": 0,
@@ -91,8 +68,6 @@
       },
       {
         "tag_id": "$tag_1",
-        "vid_s": 2,
-        "vid_e": 0,
         "hash": "hex:fa6c1d3b5633f6f200068708e558d6062a6a7243a7e78a48e661cd3201d0d343",
         "ast_id": "$ast_1",
         "hl_s": 0,
@@ -101,7 +76,7 @@
     ],
     "m_bridge_tag": [
       {
-        "fid": "$fid_0",
+        "blob_id": "$fid_0",
         "tag_id": "$prior_tag_0",
         "line_s": 1,
         "line_e": 355,
@@ -109,7 +84,7 @@
         "char_e": 1
       },
       {
-        "fid": "$fid_1",
+        "blob_id": "$fid_0",
         "tag_id": "$tag_1",
         "line_s": 1,
         "line_e": 351,
@@ -149,6 +124,28 @@
       {
         "s_tag_id": "$prior_tag_0",
         "e_tag_id": "$tag_1"
+      }
+    ],
+    "m_git_ref": [
+      {
+        "ref_id": 1,
+        "repo_id": 0,
+        "ref_type": 4,
+        "ref_name": "v2.6.39",
+        "commit_id": 1,
+        "tagger_id": null,
+        "tagger_date": null,
+        "tag_message": null
+      },
+      {
+        "ref_id": 2,
+        "repo_id": 0,
+        "ref_type": 4,
+        "ref_name": "v3.0",
+        "commit_id": 2,
+        "tagger_id": null,
+        "tagger_date": null,
+        "tag_message": null
       }
     ]
   }

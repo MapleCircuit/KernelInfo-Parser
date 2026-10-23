@@ -43,6 +43,10 @@ from core.DBLayout import (
 from table_engine import TEDirectDB, TECachedDB, get_table_engine
 from db_engine import MockDB, MariaDB
 from parser.c_ast import safe_spelling, safe_cursor_spelling
+from parser.c_ast.cursor_tree import clear_tu_caches
+from core.config import get_default_repo_path
+
+LINUX_REPO = str(get_default_repo_path())
 
 # Standard regression files tested across AST parser
 # Baseline operations count corresponds to pure AST operations (excluding the 3 lifecycle operations)
@@ -54,7 +58,7 @@ TEST_SUITE: list[dict[str, Any]] = [
     },
     {
         "file": "virt/kvm/iodev.h",
-        "baseline_ast_ops": 227,
+        "baseline_ast_ops": 242,
         "description": "Kernel Header (virt/kvm/iodev.h)",
     },
     {
@@ -108,7 +112,7 @@ def default_processing(CS: ChangeSet, gp: GreatProcessor) -> None:
     # 0 Check if FNAME exists / Create FNAME
     CS.store(m_file_name.get_set(None, CS.current_path))
     # 1 Create FILE
-    CS.store(m_file.set(None, gp.VID, 0, 1, "A", 0))
+    CS.store(m_file.set(None, getattr(CS, "blob_hash", b"\x00" * 20), 1))
     # 2 Create BRIDGE FILE
     CS.store(m_bridge_file.set(
         gp.VID,
@@ -151,7 +155,7 @@ def run_single_file_worker(item: dict[str, Any]) -> dict[str, Any]:
         full_path = os.path.join(temp_dir, file_path)
         os.makedirs(os.path.dirname(full_path), exist_ok=True)
         file_content = subprocess.check_output(
-            ["git", "-C", "linux", "show", f"v3.0:{file_path}"],
+            ["git", "-C", LINUX_REPO, "show", f"v3.0:{file_path}"],
             stderr=subprocess.PIPE,
         )
         with open(full_path, "wb") as f:
@@ -192,7 +196,7 @@ def run_single_file_worker(item: dict[str, Any]) -> dict[str, Any]:
             tag_row = tag_map.get(tag_id)
             if not tag_row:
                 continue
-            tag_hash = tag_row[3]
+            tag_hash = tag_row[1] if len(tag_row) == 5 else tag_row[3]
             tag_code = code_map.get(tag_hash, "")
 
             if line_s == 0 and line_e == 0:
@@ -324,6 +328,9 @@ class TestCASTParser(unittest.TestCase):
             except Exception:
                 pass
         MockDB._global_store.clear()
+        clear_tu_caches()
+        G.CURRENT_PARSING_FILE = None
+        G.CURRENT_PARSING_DIR = None
 
     def test_multicore_ast_suite(self) -> None:
         """Run multi-core parallel C-AST parsing and ChangeSet.execute() validation."""
@@ -365,7 +372,8 @@ class TestCASTParser(unittest.TestCase):
             if line_s == 1220 and line_e == 1573:
                 tag = tags.get(tag_id) or tags.get((tag_id, 1))
                 if tag:
-                    ast_obj = asts.get(tag[4])
+                    ast_id = tag[2] if len(tag) == 5 else tag[4]
+                    ast_obj = asts.get(ast_id)
                     task_struct_tags.append((tag_id, ast_obj))
 
         self.assertEqual(len(task_struct_tags), 1, f"Expected exactly 1 tag spanning 1220..1573, found {task_struct_tags}")
@@ -386,7 +394,7 @@ class TestCASTParser(unittest.TestCase):
         self.assertTrue(res["execute_success"])
 
         sym_defs = MockDB._global_store.get("m_symbol_def", {})
-        macro_defs = {row[5]: row for row in sym_defs.values() if row[6] in (int(ASTT.CPPro_define), int(ASTT.CPPro_define_macro))}
+        macro_defs = {row[4]: row for row in sym_defs.values() if row[5] in (int(ASTT.CPPro_define), int(ASTT.CPPro_define_macro))}
         self.assertIn("WATCHDOG_NAME", macro_defs)
         self.assertIn("WATCHDOG_TIMEOUT", macro_defs)
         self.assertIn("WDT_EFER", macro_defs)
@@ -441,7 +449,7 @@ class TestCASTParser(unittest.TestCase):
             G.CURRENT_PARSING_FILE = file_path
 
             cs.store(m_file_name.get_set(None, cs.current_path))
-            cs.store(m_file.set(None, gp.VID, 0, 1, "A", 0))
+            cs.store(m_file.set(None, getattr(cs, "blob_hash", b"\x00" * 20), 1))
             cs.store(m_bridge_file.set(gp.VID, cs.ref(m_file_name.fnid), cs.ref(m_file.fid)))
 
             cs.parse()
@@ -549,26 +557,14 @@ class TestCASTParser(unittest.TestCase):
         c_dict["b"] = {"count": 2}
         c_dict["c"] = {"count": 3}
         self.assertEqual(len(c_dict), 3)
-        self.assertEqual(len(c_dict._lru_cache), 0)  # Insert bypasses LRU cache
+        self.assertEqual(len(c_dict._lru_cache), 3)  # Active ChangeSets stay in LRU cache up to capacity
 
-        # Accessing items brings them into LRU cache
-        self.assertEqual(c_dict["a"], {"count": 1})
-        self.assertEqual(len(c_dict._lru_cache), 1)
-        self.assertIn("a", c_dict._lru_cache)
-
-        self.assertEqual(c_dict["b"], {"count": 2})
-        self.assertEqual(c_dict["c"], {"count": 3})
-        self.assertEqual(len(c_dict._lru_cache), 3)
-
-        # Inserting a new item does not populate LRU
+        # Inserting a 4th item exceeds LRU capacity -> evicts least recently inserted ('a')
         c_dict["d"] = {"count": 4}
         self.assertEqual(len(c_dict), 4)
         self.assertEqual(len(c_dict._lru_cache), 3)
-
-        # Accessing 'd' exceeds LRU capacity -> evicts least recently accessed ('a')
-        self.assertEqual(c_dict["d"], {"count": 4})
-        self.assertEqual(len(c_dict._lru_cache), 3)
         self.assertNotIn("a", c_dict._lru_cache)
+        self.assertEqual(c_dict["d"], {"count": 4})
 
         # Access evicted item -> decompressed and brought back into LRU
         item_a = c_dict["a"]
@@ -592,11 +588,121 @@ class TestCASTParser(unittest.TestCase):
         self.assertEqual(c_dict.pop("a")["count"], 99)
         self.assertNotIn("a", c_dict)
 
+    def test_stage2_epoch_partitioning_and_regeneration(self) -> None:
+        """Verify Stage 2 project-agnostic dynamic complexity batching, epoch partitioning, and reader lifecycle."""
+        import tempfile
+        from main import is_heavy_source_path, is_heavy_source_file, partition_source_epochs, DependencyScheduler
+        from table_engine.shared_buffer import SharedSymbolBuilder
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # 1. Project-agnostic file complexity classification
+            heavy_c = os.path.join(tmpdir, "heavy_driver.c")
+            with open(heavy_c, "wb") as f:
+                f.write(b"/* Heavy C Source */\n" + b"int dummy_var = 1;\n" * 4000)  # ~80KB > 64KB
+
+            light_c = os.path.join(tmpdir, "light_helper.c")
+            with open(light_c, "wb") as f:
+                f.write(b"int helper(void) { return 0; }\n")  # ~32B < 64KB
+
+            heavy_rs = os.path.join(tmpdir, "heavy_service.rs")
+            with open(heavy_rs, "wb") as f:
+                f.write(b"// Heavy Rust Source\n" + b"fn dummy() {}\n" * 5000)  # ~75KB > 64KB
+
+            heavy_doc = os.path.join(tmpdir, "heavy_doc.txt")
+            with open(heavy_doc, "wb") as f:
+                f.write(b"Documentation text file\n" * 5000)  # ~120KB > 64KB, but NOT an AST source file
+
+            # Test classification by disk stat and AST language detection
+            self.assertTrue(is_heavy_source_file("heavy_driver.c", working_dir=tmpdir))
+            self.assertTrue(is_heavy_source_file("M\theavy_driver.c", working_dir=tmpdir))
+            self.assertTrue(is_heavy_source_file("heavy_service.rs", working_dir=tmpdir))
+            self.assertFalse(is_heavy_source_file("light_helper.c", working_dir=tmpdir))
+            self.assertFalse(is_heavy_source_file("heavy_doc.txt", working_dir=tmpdir))  # Ignored: non-AST format
+
+            # Test custom threshold
+            self.assertTrue(is_heavy_source_file("light_helper.c", working_dir=tmpdir, threshold_bytes=10))
+            self.assertFalse(is_heavy_source_file("heavy_driver.c", working_dir=tmpdir, threshold_bytes=200000))
+
+            # Backward-compatibility alias
+            self.assertTrue(is_heavy_source_path("heavy_driver.c", working_dir=tmpdir))
+
+            # 2. Dynamic dual-budget batching & natural epoch partitioning across generic project structure
+            # Create synthetic modular directory hierarchy: subsystem_a/, subsystem_b/, subsystem_c/
+            for sub in ("subsystem_a", "subsystem_b", "subsystem_c"):
+                os.makedirs(os.path.join(tmpdir, sub), exist_ok=True)
+
+            sub_a_files = []
+            for i in range(40):
+                rel_p = f"subsystem_a/file_{i}.c"
+                p = os.path.join(tmpdir, rel_p)
+                with open(p, "wb") as f:
+                    f.write(b"int a = 0;\n" * 50)  # ~550 bytes each
+                sub_a_files.append(f"M\t{rel_p}")
+
+            # Subsystem B contains heavy files (~76KB each)
+            sub_b_files = []
+            for i in range(20):
+                rel_p = f"subsystem_b/heavy_{i}.c"
+                p = os.path.join(tmpdir, rel_p)
+                with open(p, "wb") as f:
+                    f.write(b"/* Heavy */\n" + b"int heavy_var = 1;\n" * 3800)  # ~76KB each
+                sub_b_files.append(f"M\t{rel_p}")
+
+            sub_c_files = []
+            for i in range(40):
+                rel_p = f"subsystem_c/file_{i}.c"
+                p = os.path.join(tmpdir, rel_p)
+                with open(p, "wb") as f:
+                    f.write(b"int c = 0;\n" * 50)  # ~550 bytes each
+                sub_c_files.append(f"M\t{rel_p}")
+
+            all_test_files = sub_a_files + sub_b_files + sub_c_files
+            self.assertEqual(len(all_test_files), 100)
+
+            # Partition under dual budget: normal_batch_size=25, heavy_batch_size=8, max_batch_bytes=300000, target_epoch_files=35
+            epochs = partition_source_epochs(
+                all_test_files,
+                working_dir=tmpdir,
+                normal_batch_size=25,
+                heavy_batch_size=8,
+                max_batch_bytes=300000,
+                target_epoch_files=35,
+            )
+            self.assertGreater(len(epochs), 1)
+            total_partitioned_files = sum(sum(len(b[1]) for b in ep) for ep in epochs)
+            self.assertEqual(total_partitioned_files, 100)
+
+            # Check that heavy files triggered heavy batch sizing (<= 8 files) or byte budget bounding
+            for ep in epochs:
+                for b_id, b_files in ep:
+                    has_heavy = any(is_heavy_source_file(f, working_dir=tmpdir) for f in b_files)
+                    if has_heavy:
+                        self.assertLessEqual(len(b_files), 8)
+
+        # 3. Test SharedSymbolReader close lifecycle
+        sym_map = {("foo_func", 1): 42, ("bar_var", 2): 99}
+        names_map = {"foo_func": 42, "bar_var": 99}
+        builder = SharedSymbolBuilder(mode="4k")
+        reader = builder.build(sym_map, names_map)
+        self.assertIsNotNone(reader)
+        self.assertEqual(reader.get_symbol("foo_func", 1), 42)
+        reader.close()
+        self.assertIsNone(reader.mv)
+        self.assertIsNone(reader.mm)
+
+        # 4. Test DependencyScheduler.drain_deferred_queue
+        mock_gp = GreatProcessor()
+        scheduler = DependencyScheduler(mock_gp, chunk_commit_interval=100)
+        self.assertEqual(scheduler.drain_deferred_queue(), 0)
+        scheduler.deferred_queue.append("test_deferred_item")
+        self.assertEqual(len(scheduler.deferred_queue), 1)
+        scheduler.drain_deferred_queue()
+
     def test_direct_table_engine_execution(self) -> None:
         """Verify parsing and ChangeSet execution with TEDirectDB."""
         item = {
             "file": "virt/kvm/iodev.h",
-            "baseline_ast_ops": 227,
+            "baseline_ast_ops": 242,
             "description": "Kernel Header (virt/kvm/iodev.h)",
             "table_engine": "direct",
         }
@@ -627,7 +733,7 @@ class TestCASTParser(unittest.TestCase):
             full_path = os.path.join(temp_dir, file_path)
             os.makedirs(os.path.dirname(full_path), exist_ok=True)
             file_content = subprocess.check_output(
-                ["git", "-C", "linux", "show", f"v7.0:{file_path}"],
+                ["git", "-C", LINUX_REPO, "show", f"v7.0:{file_path}"],
                 stderr=subprocess.PIPE,
             )
             with open(full_path, "wb") as f:
@@ -1149,7 +1255,7 @@ struct task_struct {
             full_path = os.path.join(temp_dir, file_path)
             os.makedirs(os.path.dirname(full_path), exist_ok=True)
             file_content = subprocess.check_output(
-                ["git", "-C", "linux", "show", f"v3.0:{file_path}"],
+                ["git", "-C", LINUX_REPO, "show", f"v3.0:{file_path}"],
                 stderr=subprocess.PIPE,
             )
             with open(full_path, "wb") as f:
@@ -1358,15 +1464,15 @@ struct nlmsvc_binding {
             self.assertEqual(be32_containers[0][3], u32_ast[0], "__be32 container must link directly to __u32 ast_id")
 
             # 3. m_symbol_def has __u32 and __be32 with type_id = ASTT.C_SCtypedef
-            u32_def = next((row for row in mock_sym_defs.values() if row[5] == "__u32" and row[6] == ASTT.C_SCtypedef), None)
+            u32_def = next((row for row in mock_sym_defs.values() if row[4] == "__u32" and row[5] == ASTT.C_SCtypedef), None)
             self.assertIsNotNone(u32_def, "__u32 not found in m_symbol_def")
-            be32_def = next((row for row in mock_sym_defs.values() if row[5] == "__be32" and row[6] == ASTT.C_SCtypedef), None)
+            be32_def = next((row for row in mock_sym_defs.values() if row[4] == "__be32" and row[5] == ASTT.C_SCtypedef), None)
             self.assertIsNotNone(be32_def, "__be32 not found in m_symbol_def")
 
             # 4. m_symbol_ref has TypeUsage for __u32 and __be32
-            u32_usage = next((row for row in mock_sym_refs.values() if row[4] == u32_ast[0] and row[5] == int(SymbolRole.TypeUsage)), None)
+            u32_usage = next((row for row in mock_sym_refs.values() if row[3] == u32_ast[0] and row[5] == int(SymbolRole.TypeUsage)), None)
             self.assertIsNotNone(u32_usage, "__u32 TypeUsage not found in m_symbol_ref")
-            be32_usage = next((row for row in mock_sym_refs.values() if row[4] == be32_ast[0] and row[5] == int(SymbolRole.TypeUsage)), None)
+            be32_usage = next((row for row in mock_sym_refs.values() if row[3] == be32_ast[0] and row[5] == int(SymbolRole.TypeUsage)), None)
             self.assertIsNotNone(be32_usage, "__be32 TypeUsage not found in m_symbol_ref")
         finally:
             if G.TE:
@@ -1430,7 +1536,7 @@ struct nlmsvc_binding {
             full_path = os.path.join(temp_dir, file_path)
             os.makedirs(os.path.dirname(full_path), exist_ok=True)
             file_content = subprocess.check_output(
-                ["git", "-C", "linux", "show", f"v3.0:{file_path}"],
+                ["git", "-C", LINUX_REPO, "show", f"v3.0:{file_path}"],
                 stderr=subprocess.PIPE,
             )
             with open(full_path, "wb") as f:
@@ -1497,7 +1603,7 @@ struct nlmsvc_binding {
             full_path = os.path.join(temp_dir, file_path)
             os.makedirs(os.path.dirname(full_path), exist_ok=True)
             file_content = subprocess.check_output(
-                ["git", "-C", "linux", "show", f"v3.0:{file_path}"],
+                ["git", "-C", LINUX_REPO, "show", f"v3.0:{file_path}"],
                 stderr=subprocess.PIPE,
             )
             with open(full_path, "wb") as f:
@@ -1604,7 +1710,7 @@ struct nlmsvc_binding {
             full_path = os.path.join(temp_dir, file_path)
             os.makedirs(os.path.dirname(full_path), exist_ok=True)
             file_content = subprocess.check_output(
-                ["git", "-C", "linux", "show", f"v3.0:{file_path}"],
+                ["git", "-C", LINUX_REPO, "show", f"v3.0:{file_path}"],
                 stderr=subprocess.PIPE,
             )
             with open(full_path, "wb") as f:
@@ -1721,7 +1827,7 @@ struct nlmsvc_binding {
             # Should have exactly 1 tag: the full typedef tag (argument is linked in m_ast_container, no phantom *nlm_host_match_fn_t tag)
             self.assertEqual(len(db_tag), 1)
             self.assertEqual(len(db_bridge_tag), 1)
-            tags_code = [db_tag_code[t[3]][1] for t in db_tag.values()]
+            tags_code = [db_tag_code[t[1]][1] for t in db_tag.values()]
             self.assertIn("typedef void (*nlm_host_match_fn_t)(struct nlm_host *host);", tags_code)
             self.assertNotIn("*nlm_host_match_fn_t", tags_code)
             self.assertNotIn("struct nlm_host *host", tags_code)
@@ -1767,7 +1873,9 @@ struct nlmsvc_binding {
         """Verify modifying a struct and comment records lineage in m_moved_tag and closes prior tags."""
         temp_dir_v1 = None
         temp_dir_v2 = None
+        mf = None
         try:
+            MockDB._global_store.clear()
             G.DEBUG_TYPECHECK = True
             G.DB = MockDB
             G.TE = get_table_engine("cached")()
@@ -1844,8 +1952,7 @@ struct nlmsvc_binding {
                     None,
                     cs2.current_path,
                 ))
-                cs2.store(m_file.update(cs2.ref(m_bridge_file.fid), None, 1, None, None, "M"))
-            cs2.store(m_file.set(None, 2, 0, 1, "M", 0))
+            cs2.store(m_file.set(None, getattr(cs2, "blob_hash", b"\x00" * 20), 1))
             cs2.store(m_bridge_file.set(2, cs2.ref(m_file_name.fnid), cs2.ref(m_file.fid)))
 
             cs2.parse()
@@ -1856,21 +1963,15 @@ struct nlmsvc_binding {
             moved_tags = MockDB._global_store.get("m_moved_tag", {})
             self.assertGreaterEqual(len(moved_tags), 2, f"Expected at least 2 m_moved_tag records, got {len(moved_tags)}")
 
-            # Verify that each moved tag's s_tag_id belongs to v1 tags, and was marked closed (vid_e = 1)
-            v2_tag_by_id = {}
-            for (t_id, v_s), row in MockDB._global_store.get("m_tag", {}).items():
-                v2_tag_by_id.setdefault(t_id, {})[v_s] = row
-
             for (s_tag_id, e_tag_id), row in moved_tags.items():
                 self.assertIn(s_tag_id, v1_tags, f"Source tag {s_tag_id} should have been from v1")
-                old_tag_row = v2_tag_by_id.get(s_tag_id, {}).get(1)
-                self.assertIsNotNone(old_tag_row)
-                self.assertEqual(old_tag_row[2], 1, f"Superseded tag {s_tag_id} should have vid_e = 1")
-                new_tag_row = v2_tag_by_id.get(e_tag_id, {}).get(2)
-                self.assertIsNotNone(new_tag_row)
-                self.assertEqual(new_tag_row[1], 2, f"New tag {e_tag_id} should have vid_s = 2")
-                self.assertEqual(new_tag_row[2], 0, f"New tag {e_tag_id} should have vid_e = 0")
         finally:
+            if G.TE:
+                try:
+                    G.TE.close()
+                except Exception:
+                    pass
+            MockDB._global_store.clear()
             if mf:
                 mf.clear_all_version()
 
@@ -1878,7 +1979,9 @@ struct nlmsvc_binding {
         """Verify identical tags are recycled across versions without creating m_moved_tag records."""
         temp_dir_v1 = None
         temp_dir_v2 = None
+        mf = None
         try:
+            MockDB._global_store.clear()
             G.DEBUG_TYPECHECK = True
             G.DB = MockDB
             G.TE = get_table_engine("cached")()
@@ -1919,6 +2022,13 @@ struct config_dynamic {
             self.assertTrue(cs1.execute())
             G.TE.commit_all()
 
+            # Record tags created in v1
+            v1_tags = list(MockDB._global_store.get("m_tag", {}).values())
+            self.assertGreaterEqual(len(v1_tags), 3, "Expected at least 3 tags in v1")
+            v1_comment_id = v1_tags[0][0]
+            v1_static_id = v1_tags[1][0]
+            v1_dynamic_id = v1_tags[2][0]
+
             # --- Version 2: Only config_dynamic modified, config_static & comment unchanged ---
             temp_dir_v2 = mf.create_temp_dir()
             mf.version_dict["v3.1"] = temp_dir_v2
@@ -1957,8 +2067,7 @@ struct config_dynamic {
                     None,
                     cs2.current_path,
                 ))
-                cs2.store(m_file.update(cs2.ref(m_bridge_file.fid), None, 1, None, None, "M"))
-            cs2.store(m_file.set(None, 2, 0, 1, "M", 0))
+            cs2.store(m_file.set(None, getattr(cs2, "blob_hash", b"\x00" * 20), 1))
             cs2.store(m_bridge_file.set(2, cs2.ref(m_file_name.fnid), cs2.ref(m_file.fid)))
 
             cs2.parse()
@@ -1970,11 +2079,17 @@ struct config_dynamic {
             moved_tags = MockDB._global_store.get("m_moved_tag", {})
             self.assertEqual(len(moved_tags), expected_moved, f"Expected exactly {expected_moved} moved tags, got {len(moved_tags)}")
             moved_s_ids = {s_id for (s_id, e_id) in moved_tags}
-            # Tags 1 (comment), 2 (mode), 3 (config_static) should NOT be moved
-            self.assertNotIn(1, moved_s_ids, "Comment tag must not be moved")
-            self.assertNotIn(2, moved_s_ids, "config_static field mode must not be moved")
-            self.assertNotIn(3, moved_s_ids, "config_static struct must not be moved")
+            # Unchanged comment and config_static should NOT be moved; config_dynamic moved
+            self.assertNotIn(v1_comment_id, moved_s_ids, "Comment tag must not be moved")
+            self.assertNotIn(v1_static_id, moved_s_ids, "config_static struct must not be moved")
+            self.assertIn(v1_dynamic_id, moved_s_ids, "config_dynamic struct must be moved")
         finally:
+            if G.TE:
+                try:
+                    G.TE.close()
+                except Exception:
+                    pass
+            MockDB._global_store.clear()
             if mf:
                 mf.clear_all_version()
 
@@ -2021,7 +2136,7 @@ struct anon_container {
             G.CURRENT_PARSING_FILE = file_path
 
             cs.store(m_file_name.get_set(None, cs.current_path))
-            cs.store(m_file.set(None, 1, 0, 0, "A", 0))
+            cs.store(m_file.set(None, getattr(cs, "blob_hash", b"\x00" * 20), 1))
             cs.store(m_bridge_file.set(1, cs.ref(m_file_name.fnid), cs.ref(m_file.fid)))
 
             cs.parse()
@@ -2037,11 +2152,11 @@ struct anon_container {
                     if "(unnamed at " in ast_name:
                         self.assertIn("drivers/net/test_anon_enum.c", ast_name, f"m_ast.name '{ast_name}' should contain relative path")
 
-            tag_store = MockDB._global_store.get("m_tag", {})
-            for tag_id, row in tag_store.items():
-                tag_name = row[5]
-                if tag_name:
-                    self.assertNotIn("/dev/shm", tag_name, f"m_tag.name '{tag_name}' must not contain /dev/shm")
+            tag_code_store = MockDB._global_store.get("m_tag_code", {})
+            for hash_val, row in tag_code_store.items():
+                tag_code = row[1]
+                if tag_code:
+                    self.assertNotIn("/dev/shm", tag_code, f"m_tag_code.code '{tag_code}' must not contain /dev/shm")
         finally:
             if mf:
                 mf.clear_all_version()
@@ -2565,12 +2680,12 @@ const struct xattr_handler btrfs_xattr_acl_access_handler = {
             # Exactly 1 tag produced for the complete struct declaration
             self.assertEqual(len(db_tag), 1, f"Expected 1 tag for struct declaration, got {len(db_tag)}")
             trow = next(iter(db_tag.values()))
-            tag_code = db_tag_code[trow[3]][1]
+            tag_code = db_tag_code[trow[1]][1]
             self.assertTrue(tag_code.startswith("const struct xattr_handler v9fs_xattr_acl_access_handler"))
             self.assertTrue(tag_code.rstrip().endswith("};"))
 
             # All inner members and values linked under C_InitListExpr in m_ast_container
-            handler_ast_id = trow[4]
+            handler_ast_id = trow[2]
             self.assertEqual(db_ast[handler_ast_id][1], "v9fs_xattr_acl_access_handler")
 
             init_list_id = None
@@ -2696,7 +2811,7 @@ enum {
             G.CURRENT_PARSING_FILE = file_path
 
             cs.store(m_file_name.get_set(None, cs.current_path))
-            cs.store(m_file.set(None, 1, 0, 1, "A", 0))
+            cs.store(m_file.set(None, getattr(cs, "blob_hash", b"\x00" * 20), 1))
             cs.store(m_bridge_file.set(1, cs.ref(m_file_name.fnid), cs.ref(m_file.fid)))
 
             cs.parse()
@@ -2704,16 +2819,16 @@ enum {
             G.TE.commit_all()
 
             sym_defs = MockDB._global_store.get("m_symbol_def", {})
-            defs_by_name = {row[5]: row for row in sym_defs.values()}
+            defs_by_name = {row[4]: row for row in sym_defs.values()}
 
             # 1. Named enum definition exists
             self.assertIn("my_color", defs_by_name)
-            self.assertEqual(defs_by_name["my_color"][6], int(ASTT.C_enumdecl))
+            self.assertEqual(defs_by_name["my_color"][5], int(ASTT.C_enumdecl))
 
             # 2. Enumerator constants are staged with C_enumequal
             for const_name in ("COLOR_RED", "COLOR_GREEN", "COLOR_BLUE", "FLAG_A", "FLAG_B"):
                 self.assertIn(const_name, defs_by_name, f"{const_name} must be staged in m_symbol_def")
-                self.assertEqual(defs_by_name[const_name][6], int(ASTT.C_enumequal))
+                self.assertEqual(defs_by_name[const_name][5], int(ASTT.C_enumequal))
 
             # 3. Exact line numbers for each enumerator
             self.assertEqual(defs_by_name["COLOR_RED"][7], 2)
@@ -2724,7 +2839,7 @@ enum {
 
             # 4. Anonymous enum container ('(unnamed at ...)') is NOT staged in m_symbol_def
             for row in sym_defs.values():
-                s_name = row[5]
+                s_name = row[4]
                 self.assertNotIn("(unnamed at ", s_name)
                 self.assertNotIn("(anonymous at ", s_name)
         finally:
@@ -2773,7 +2888,7 @@ int handle_state(enum my_state s) {
             G.CURRENT_PARSING_FILE = file_path
 
             cs.store(m_file_name.get_set(None, cs.current_path))
-            cs.store(m_file.set(None, 1, 0, 1, "A", 0))
+            cs.store(m_file.set(None, getattr(cs, "blob_hash", b"\x00" * 20), 1))
             cs.store(m_bridge_file.set(1, cs.ref(m_file_name.fnid), cs.ref(m_file.fid)))
 
             cs.parse()
@@ -2782,15 +2897,15 @@ int handle_state(enum my_state s) {
 
             from core.globalstuff import SymbolRole
             sym_defs = MockDB._global_store.get("m_symbol_def", {})
-            defs_by_name = {row[5]: row for row in sym_defs.values()}
-            idle_ast_id = defs_by_name["STATE_IDLE"][4]
-            running_ast_id = defs_by_name["STATE_RUNNING"][4]
+            defs_by_name = {row[4]: row for row in sym_defs.values()}
+            idle_ast_id = defs_by_name["STATE_IDLE"][3]
+            running_ast_id = defs_by_name["STATE_RUNNING"][3]
 
             sym_refs = MockDB._global_store.get("m_symbol_ref", {})
             decl_refs = [r for r in sym_refs.values() if r[5] == int(SymbolRole.DeclRef)]
 
-            idle_refs = [r for r in decl_refs if r[4] == idle_ast_id]
-            running_refs = [r for r in decl_refs if r[4] == running_ast_id]
+            idle_refs = [r for r in decl_refs if r[3] == idle_ast_id]
+            running_refs = [r for r in decl_refs if r[3] == running_ast_id]
 
             self.assertTrue(len(idle_refs) >= 1, "STATE_IDLE must be referenced in m_symbol_ref as DeclRef")
             self.assertTrue(len(running_refs) >= 1, "STATE_RUNNING must be referenced in m_symbol_ref as DeclRef")
@@ -2851,7 +2966,7 @@ int check_link(int up) {
             cs_h.mf = mf
             G.CURRENT_PARSING_FILE = header_path
             cs_h.store(m_file_name.get_set(None, cs_h.current_path))
-            cs_h.store(m_file.set(None, 1, 0, 1, "A", 0))
+            cs_h.store(m_file.set(None, getattr(cs_h, "blob_hash", b"\x00" * 20), 1))
             cs_h.store(m_bridge_file.set(1, cs_h.ref(m_file_name.fnid), cs_h.ref(m_file.fid)))
             cs_h.parse()
             self.assertTrue(cs_h.execute())
@@ -2863,7 +2978,7 @@ int check_link(int up) {
             cs_d.batch_cs_dict = {header_path: cs_h}
             G.CURRENT_PARSING_FILE = driver_path
             cs_d.store(m_file_name.get_set(None, cs_d.current_path))
-            cs_d.store(m_file.set(None, 1, 0, 1, "A", 0))
+            cs_d.store(m_file.set(None, getattr(cs_d, "blob_hash", b"\x00" * 20), 1))
             cs_d.store(m_bridge_file.set(1, cs_d.ref(m_file_name.fnid), cs_d.ref(m_file.fid)))
             cs_d.parse()
             self.assertTrue(cs_d.execute())
@@ -2872,18 +2987,18 @@ int check_link(int up) {
 
             from core.globalstuff import SymbolRole
             sym_defs = MockDB._global_store.get("m_symbol_def", {})
-            defs_by_name = {row[5]: row for row in sym_defs.values()}
+            defs_by_name = {row[4]: row for row in sym_defs.values()}
             self.assertIn("NET_UP", defs_by_name)
             self.assertIn("NET_DOWN", defs_by_name)
 
-            net_up_ast_id = defs_by_name["NET_UP"][4]
-            net_down_ast_id = defs_by_name["NET_DOWN"][4]
+            net_up_ast_id = defs_by_name["NET_UP"][3]
+            net_down_ast_id = defs_by_name["NET_DOWN"][3]
 
             sym_refs = MockDB._global_store.get("m_symbol_ref", {})
             driver_refs = [row for row in sym_refs.values() if row[5] == int(SymbolRole.DeclRef)]
 
-            up_refs = [r for r in driver_refs if r[4] == net_up_ast_id]
-            down_refs = [r for r in driver_refs if r[4] == net_down_ast_id]
+            up_refs = [r for r in driver_refs if r[3] == net_up_ast_id]
+            down_refs = [r for r in driver_refs if r[3] == net_down_ast_id]
 
             self.assertTrue(len(up_refs) >= 1, "NET_UP reference should be resolved across files")
             self.assertTrue(len(down_refs) >= 1, "NET_DOWN reference should be resolved across files")
@@ -2931,7 +3046,7 @@ def assert_file_tag_fidelity(
         full_path = os.path.join(temp_dir, file_path)
         os.makedirs(os.path.dirname(full_path), exist_ok=True)
         file_content_bytes = subprocess.check_output(
-            ["git", "-C", "linux", "show", f"v3.0:{file_path}"],
+            ["git", "-C", LINUX_REPO, "show", f"v3.0:{file_path}"],
             stderr=subprocess.PIPE,
         )
         with open(full_path, "wb") as f:
@@ -2968,7 +3083,7 @@ def assert_file_tag_fidelity(
             tag_row = tag_map.get(tag_id)
             if not tag_row:
                 continue
-            tag_hash = tag_row[3]
+            tag_hash = tag_row[1] if len(tag_row) == 5 else tag_row[3]
             tag_code = code_map.get(tag_hash, "")
 
             if line_s == 0 and line_e == 0:

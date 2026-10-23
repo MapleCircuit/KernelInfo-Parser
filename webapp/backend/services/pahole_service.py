@@ -27,16 +27,15 @@ class PaholeService:
 
             cursor.execute(
                 """
-                SELECT a.ast_id, a.name, a.type_id, td.name AS type_name, bt.line_s, bt.line_e, f.fname, fi.fid,
+                SELECT a.ast_id, a.name, a.type_id, td.name AS type_name, bt.line_s, bt.line_e, f.fname, bt.blob_id,
                        (SELECT COUNT(*) FROM m_ast_container c WHERE c.ast_id = a.ast_id) AS member_count
                 FROM m_ast a
                 JOIN m_type_descriptor td ON a.type_id = td.type_id
                 JOIN m_tag t ON a.ast_id = t.ast_id
                 JOIN m_bridge_tag bt ON t.tag_id = bt.tag_id
-                JOIN m_file fi ON bt.fid = fi.fid
-                JOIN m_bridge_file bf ON fi.fid = bf.fid
-                JOIN m_file_name f ON bf.fnid = f.fnid
-                WHERE bf.vid = %s AND (a.name = %s OR a.name = %s)
+                LEFT JOIN m_bridge_checkpoint bc ON bt.blob_id = bc.blob_id AND bc.commit_id = %s
+                LEFT JOIN m_file_name f ON bc.fnid = f.fnid
+                WHERE (a.name = %s OR a.name = %s)
                 ORDER BY member_count DESC, bt.line_s ASC
                 LIMIT 1;
                 """,

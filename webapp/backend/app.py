@@ -7,7 +7,7 @@ from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, Response
 
-from webapp.backend.security.middleware import SecurityHeadersMiddleware, SlidingWindowRateLimiter
+from webapp.backend.security.middleware import RepoContextMiddleware, SecurityHeadersMiddleware, SlidingWindowRateLimiter
 from webapp.backend.routers import (
     versions_router,
     filesystem_router,
@@ -17,6 +17,7 @@ from webapp.backend.routers import (
     commits_router,
     tools_router,
     system_router,
+    docs_router,
 )
 
 FRONTEND_DIR = Path(__file__).resolve().parent.parent / "frontend"
@@ -41,6 +42,8 @@ def create_app() -> FastAPI:
         allow_methods=["*"],
         allow_headers=["*"],
     )
+    # Outermost: the selected repository must be visible to every inner middleware and endpoint
+    app.add_middleware(RepoContextMiddleware)
 
     # 2. Register API Routers
     app.include_router(versions_router)
@@ -51,6 +54,7 @@ def create_app() -> FastAPI:
     app.include_router(commits_router)
     app.include_router(tools_router)
     app.include_router(system_router)
+    app.include_router(docs_router)
 
     # 3. Mount Frontend Static Assets
     if FRONTEND_DIR.is_dir():

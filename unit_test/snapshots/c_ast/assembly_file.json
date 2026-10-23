@@ -10,33 +10,24 @@
     "description": "Verify assembly source parsing (.S) into AST statements, tags, and bridge mappings with zero C-specific symbol hallucination"
   },
   "tables": {
-    "m_v_main": [
-      {
-        "vid": 1,
-        "vname": "v3.0"
-      }
-    ],
     "m_file_name": [
       {
         "fnid": "$fnid_0",
         "fname": "arch/alpha/lib/clear_page.S"
       }
     ],
-    "m_file": [
+    "m_file_blob": [
       {
-        "fid": "$fid_0",
-        "vid_s": 1,
-        "vid_e": 0,
-        "ftype": "4 (T_ASM)",
-        "s_stat": "A",
-        "e_stat": 0
+        "blob_id": "$fid_0",
+        "blob_hash": "hex:0000000000000000000000000000000000000000",
+        "ftype": "4 (T_ASM)"
       }
     ],
-    "m_bridge_file": [
+    "m_bridge_checkpoint": [
       {
-        "vid": 1,
+        "commit_id": 1,
         "fnid": "$fnid_0",
-        "fid": "$fid_0"
+        "blob_id": "$fid_0"
       }
     ],
     "m_ast": [
@@ -64,8 +55,6 @@
     "m_tag": [
       {
         "tag_id": "$tag_0",
-        "vid_s": 1,
-        "vid_e": 0,
         "hash": "hex:984ca77b50d76b96672bb45c1f5571e98fe1e7edec41a71acf580f1fd96f719b",
         "ast_id": "$ast_0",
         "hl_s": 0,
@@ -73,8 +62,6 @@
       },
       {
         "tag_id": "$tag_1",
-        "vid_s": 1,
-        "vid_e": 0,
         "hash": "hex:a721a32737fc46115edcb63c32e9ec3de58866b62f971a3a37317acca553b5c9",
         "ast_id": "$ast_1",
         "hl_s": 0,
@@ -83,7 +70,7 @@
     ],
     "m_bridge_tag": [
       {
-        "fid": "$fid_0",
+        "blob_id": "$fid_0",
         "tag_id": "$tag_0",
         "line_s": 1,
         "line_e": 5,
@@ -91,7 +78,7 @@
         "char_e": 4
       },
       {
-        "fid": "$fid_0",
+        "blob_id": "$fid_0",
         "tag_id": "$tag_1",
         "line_s": 7,
         "line_e": 39,
@@ -125,6 +112,18 @@
       {
         "tag_id": "$tag_1",
         "map_id": "$tag_1"
+      }
+    ],
+    "m_git_ref": [
+      {
+        "ref_id": 1,
+        "repo_id": 0,
+        "ref_type": 4,
+        "ref_name": "v3.0",
+        "commit_id": 1,
+        "tagger_id": null,
+        "tagger_date": null,
+        "tag_message": null
       }
     ]
   }

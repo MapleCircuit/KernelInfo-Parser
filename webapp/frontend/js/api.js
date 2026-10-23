@@ -94,11 +94,20 @@ class ApiClient {
     }
   }
 
+  /** Repository selected in the header; sent with every request and namespacing offline cache keys. */
+  setRepository(name) {
+    this.repo = name || "";
+  }
+
   async request(endpoint, options = {}, cacheStore = null, cacheKey = null) {
     const url = `${this.baseUrl}${endpoint}`;
+    if (cacheKey && this.repo) cacheKey = `${this.repo}::${cacheKey}`;
 
     // 1. Cache-First: If cache info provided and not a mutating method, return cached immediately
-    if (cacheStore && cacheKey && (!options.method || options.method === "GET")) {
+    //    (catalog endpoints pass networkFirst so newly parsed versions/repositories show up)
+    const { networkFirst, ...fetchOptions } = options;
+    options = fetchOptions;
+    if (!networkFirst && cacheStore && cacheKey && (!options.method || options.method === "GET")) {
       const cached = await localDB.get(cacheStore, cacheKey);
       if (cached !== null && cached !== undefined) {
         return cached;
@@ -117,6 +126,7 @@ class ApiClient {
         headers: {
           "Content-Type": "application/json",
           Accept: "application/json",
+          ...(this.repo ? { "X-KI-Repo": this.repo } : {}),
           ...(options.headers || {})
         }
       });
@@ -167,16 +177,91 @@ class ApiClient {
     return v;
   }
 
-  // --- Versions ---
-  async getVersions() {
-    return this.request("/api/versions", {}, "files", "app_versions");
+  // --- Versions & Projects ---
+  async getProjects() {
+    return this.request("/api/projects", { networkFirst: true }, "files", "app_projects2");
+  }
+
+  async getBranches() {
+    return this.request("/api/branches", { networkFirst: true }, "files", "app_branches");
+  }
+
+  async getVersions(includeRc = true) {
+    const q = `?include_rc=${includeRc ? "true" : "false"}`;
+    return this.request(`/api/versions${q}`, { networkFirst: true }, "files", `app_versions_${includeRc ? "rc" : "rel"}`);
+  }
+
+  /** URL with ?repo= for requests that cannot carry headers (img src, downloads). */
+  withRepo(path) {
+    if (!this.repo) return path;
+    return `${path}${path.includes("?") ? "&" : "?"}repo=${encodeURIComponent(this.repo)}`;
+  }
+
+  getRawFileUrl(version, path) {
+    const ver = this._sanitizeVer(version);
+    return this.withRepo(`/api/fs/raw/${encodeURIComponent(ver)}?path=${encodeURIComponent(path)}`);
+  }
+
+  getCompileCommandsDownloadUrl(version, arch = "x86") {
+    const ver = this._sanitizeVer(version);
+    return this.withRepo(`/api/fs/compile_commands/${encodeURIComponent(ver)}/export?arch=${encodeURIComponent(arch)}`);
+  }
+
+  async searchFiles(version, query, limit = 50) {
+    const ver = this._sanitizeVer(version);
+    const q = new URLSearchParams({ q: query, limit }).toString();
+    return this.request(`/api/fs/search/${encodeURIComponent(ver)}?${q}`);
+  }
+
+  async getDocLabels(version) {
+    const ver = this._sanitizeVer(version);
+    return this.request(`/api/docs/${encodeURIComponent(ver)}/labels`, {}, "files", `doclabels_${ver}`);
+  }
+
+  async getKernelDoc(version, path, options = {}) {
+    const ver = this._sanitizeVer(version);
+    const params = new URLSearchParams({ path });
+    for (const key of ["export", "internal"]) if (options[key]) params.set(key, "true");
+    for (const key of ["functions", "doc", "no_identifiers"]) if (options[key]) params.set(key, options[key]);
+    return this.request(`/api/docs/${encodeURIComponent(ver)}/kernel-doc?${params.toString()}`, {}, "files", `kdoc_${ver}_${params.toString()}`);
+  }
+
+  async getSymbolHistory(version, path, line, astId = null) {
+    const ver = this._sanitizeVer(version);
+    const params = new URLSearchParams({ path, line });
+    if (astId) params.set("ast_id", astId);
+    return this.request(`/api/symbols/${encodeURIComponent(ver)}/history?${params.toString()}`);
+  }
+
+  async searchKconfig(version, query, limit = 25) {
+    const ver = this._sanitizeVer(version);
+    const q = new URLSearchParams({ q: query, limit }).toString();
+    return this.request(`/api/kconfig/${encodeURIComponent(ver)}/search?${q}`);
+  }
+
+  async importKconfig(version, content) {
+    const ver = this._sanitizeVer(version);
+    return this.request(`/api/kconfig/${encodeURIComponent(ver)}/import`, { method: "POST", body: JSON.stringify({ content }) });
+  }
+
+  async validateKconfig(version, symbols) {
+    const ver = this._sanitizeVer(version);
+    return this.request(`/api/kconfig/${encodeURIComponent(ver)}/validate`, { method: "POST", body: JSON.stringify({ symbols }) });
+  }
+
+  async diffKconfigConfigs(version, activeConfig, customConfig) {
+    const ver = this._sanitizeVer(version);
+    return this.request(`/api/kconfig/${encodeURIComponent(ver)}/diff-config`, {
+      method: "POST",
+      body: JSON.stringify({ active_config: activeConfig, custom_config: customConfig })
+    });
   }
 
   // --- Filesystem ---
   async getDirectoryTree(version, path = "", depth = 2) {
     const ver = this._sanitizeVer(version);
     const q = new URLSearchParams({ path, depth }).toString();
-    return this.request(`/api/fs/tree/${encodeURIComponent(ver)}?${q}`, {}, "files", `tree_${ver}_${path}_${depth}`);
+    return this.request(`/api/fs/tree/${encodeURIComponent(ver)}?${q}`, {}, "files", `tree2_${ver}_${path}_${depth}`);
   }
 
   async getFileContent(version, path) {
@@ -216,6 +301,18 @@ class ApiClient {
     return this.request(`/api/symbols/${encodeURIComponent(ver)}/include/${targetId}${queryStr}`, {}, "symbols", cacheKey);
   }
 
+  async getTreemap(version, maxDepth = 3, path = "") {
+    const ver = this._sanitizeVer(version);
+    const q = new URLSearchParams({ max_depth: maxDepth, path }).toString();
+    return this.request(`/api/version/${encodeURIComponent(ver)}/treemap?${q}`, {}, "files", `treemap_${ver}_${path}_${maxDepth}`);
+  }
+
+  async getCompileCommands(version, arch = "x86") {
+    const ver = this._sanitizeVer(version);
+    const q = new URLSearchParams({ arch }).toString();
+    return this.request(`/api/version/${encodeURIComponent(ver)}/compile_commands?${q}`);
+  }
+
   // --- Symbols ---
   async searchSymbols(version, query, limit = 50) {
     const ver = this._sanitizeVer(version);
@@ -237,6 +334,16 @@ class ApiClient {
   async getAstTree(version, astId) {
     const ver = this._sanitizeVer(version);
     return this.request(`/api/symbols/${encodeURIComponent(ver)}/ast/${astId}`, {}, "symbols", `ast_${ver}_${astId}`);
+  }
+
+  async lookupSymbols(version, query, limit = 20) {
+    const ver = this._sanitizeVer(version);
+    const q = new URLSearchParams({ q: query, limit }).toString();
+    return this.request(`/api/symbols/${encodeURIComponent(ver)}/lookup?${q}`);
+  }
+
+  async getTagTimeline(tagId) {
+    return this.request(`/api/tag/${encodeURIComponent(tagId)}/timeline`, {}, "symbols", `tag_${tagId}_timeline`);
   }
 
   // --- KConfig ---
@@ -274,6 +381,13 @@ class ApiClient {
   async getKconfigPresets(version) {
     const ver = this._sanitizeVer(version);
     return this.request(`/api/kconfig/${encodeURIComponent(ver)}/presets`, {}, "kconfigs", `presets_${ver}`);
+  }
+
+  async getKconfigGraph(version, arch = "x86", symbol = null, depth = 2) {
+    const ver = this._sanitizeVer(version);
+    const params = new URLSearchParams({ arch, depth });
+    if (symbol) params.set("symbol", symbol);
+    return this.request(`/api/kconfig/${encodeURIComponent(ver)}/graph?${params.toString()}`, {}, "kconfigs", `kgraph_${ver}_${arch}_${symbol || 'all'}_${depth}`);
   }
 
   // --- Maintainers ---
@@ -345,6 +459,38 @@ class ApiClient {
     return this.request(`/api/commits/${encodeURIComponent(ver)}/detail/${encodeURIComponent(commitIdOrHash)}`, {}, "commits", `commit_${ver}_${commitIdOrHash}`);
   }
 
+  async getCommitDiff(version, commitHash, context = 3) {
+    const ver = this._sanitizeVer(version);
+    return this.request(`/api/commits/${encodeURIComponent(ver)}/diff/${encodeURIComponent(commitHash)}?context=${context}`, {}, "commits", `cdiff_${commitHash}_${context}`);
+  }
+
+  async getCommitTimeline(version, limit = 100, direction = "past", cursorId = null) {
+    const ver = this._sanitizeVer(version);
+    const params = new URLSearchParams({ limit, direction });
+    if (cursorId !== null && cursorId !== undefined) params.set("cursor_id", cursorId);
+    return this.request(`/api/commits/${encodeURIComponent(ver)}/timeline?${params.toString()}`);
+  }
+
+  async searchCommits(version, query, limit = 25) {
+    const ver = this._sanitizeVer(version);
+    const q = new URLSearchParams({ q: query, limit }).toString();
+    return this.request(`/api/commits/${encodeURIComponent(ver)}/search?${q}`);
+  }
+
+  async getFileHistory(version, filePath, limit = 50) {
+    const ver = this._sanitizeVer(version);
+    const cleanPath = filePath.replace(/^\/+/, "");
+    return this.request(`/api/commits/${encodeURIComponent(ver)}/history/${encodeURIComponent(cleanPath)}?limit=${limit}`);
+  }
+
+  async formatPatch(version, payload) {
+    const ver = this._sanitizeVer(version);
+    return this.request(`/api/version/${encodeURIComponent(ver)}/patch/format`, {
+      method: "POST",
+      body: JSON.stringify(payload)
+    });
+  }
+
   // --- Tools ---
   async getPaholeLayout(version, structName) {
     const ver = this._sanitizeVer(version);
@@ -360,7 +506,21 @@ class ApiClient {
     const va = this._sanitizeVer(versionA);
     const vb = this._sanitizeVer(versionB);
     const q = new URLSearchParams({ version_a: va, version_b: vb }).toString();
-    return this.request(`/api/tools/diff/versions?${q}`, {}, "tools", `diff_${va}_${vb}`);
+    return this.request(`/api/tools/diff/versions?${q}`, {}, "tools", `diff2_${va}_${vb}`);
+  }
+
+  async getFileDiff(versionA, versionB, path, oldPath = "") {
+    const va = this._sanitizeVer(versionA);
+    const vb = this._sanitizeVer(versionB);
+    const params = new URLSearchParams({ version_a: va, version_b: vb, path });
+    if (oldPath && oldPath !== path) params.set("old_path", oldPath);
+    return this.request(`/api/tools/diff/file?${params.toString()}`, {}, "tools", `fdiff_${va}_${vb}_${oldPath || ""}_${path}`);
+  }
+
+  async getKconfigDiff(versionA, versionB) {
+    const va = this._sanitizeVer(versionA);
+    const vb = this._sanitizeVer(versionB);
+    return this.request(`/api/diff/kconfig/${encodeURIComponent(va)}/${encodeURIComponent(vb)}`, {}, "tools", `kdiff2_${va}_${vb}`);
   }
 }
 

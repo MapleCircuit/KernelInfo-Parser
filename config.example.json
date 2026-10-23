@@ -19,6 +19,22 @@
     "fidelity": true,
     "mem_max": 60
   },
+  "workspace": {
+    "repos_dir": "repos",
+    "auto_detect_repos": true
+  },
+  "repositories": [
+    {
+      "name": "linux",
+      "path": "repos/linux",
+      "project": "linux",
+      "default_branch": "master",
+      "git_url": "https://github.com/torvalds/linux",
+      "root_commit": "1da177e4c3f41524e886b7f1b8a0c1fc7321cac2",
+      "start_ref": "1da177e4c3f41524e886b7f1b8a0c1fc7321cac2",
+      "enabled": true
+    }
+  ],
   "ssh_tunnel": {
     "enabled": false,
     "host": "remote-server.example.com",

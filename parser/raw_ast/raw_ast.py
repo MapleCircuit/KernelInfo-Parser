@@ -85,18 +85,16 @@ def get_prior_tags(CS: Any) -> None:
         None,  # 4: m_bridge_tag.char_s
         None,  # 5: m_bridge_tag.char_e
         None,  # 6: m_tag.tag_id
-        None,  # 7: m_tag.vid_s
-        None,  # 8: m_tag.vid_e
-        None,  # 9: m_tag.code
-        None,  # 10: m_tag.ast_id
-        None,  # 11: m_tag.hl_s
-        None,  # 12: m_tag.hl_l
+        None,  # 7: m_tag.hash
+        None,  # 8: m_tag.ast_id
+        None,  # 9: m_tag.hl_s
+        None,  # 10: m_tag.hl_l
     )
     if CS.prior_tags:
         CS.prior_tags_map = {}
         for x, tag in enumerate(CS.prior_tags):
-            if len(tag) > 9:
-                code = tag[9]
+            if len(tag) > 7:
+                code = tag[7]
                 if code is not None:
                     if code not in CS.prior_tags_map:
                         CS.prior_tags_map[code] = []
@@ -105,23 +103,8 @@ def get_prior_tags(CS: Any) -> None:
 
 
 def close_prior_tags(CS: Any) -> None:
-    """Mark prior version tags as closed/inactive if they were not recycled in current version."""
-    if CS.prior_tags:
-        with CS(REF_OLD):
-            for x, tag in enumerate(CS.prior_tags):
-                if x in CS.active_tag_list:
-                    continue
-                if len(tag) >= 13:
-                    with CS(REF_POS):
-                        CS.store(m_tag.update(
-                            tag[6],          # m_tag.tag_id
-                            tag[7],          # m_tag.vid_s
-                            CS.gp.Old_VID,   # m_tag.vid_e
-                            tag[9],          # m_tag.code
-                            tag[10],         # m_tag.ast_id
-                            tag[11],         # m_tag.hl_s
-                            tag[12],         # m_tag.hl_l
-                        ))
+    """No-op under immutable Git DAG architecture."""
+    pass
 
 
 class RawManager:
@@ -192,8 +175,6 @@ class RawManager:
         with CS(REF_POS):
             CS.store(m_tag.set(
                 None,
-                CS.gp.VID,
-                0,
                 content_hash,
                 ast_ref,
                 0,

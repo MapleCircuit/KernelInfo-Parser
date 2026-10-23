@@ -20,6 +20,10 @@ Stateful caching, sequence coordination, relational view decomposition, and batc
   - `te_cached: bool | tuple[str | int, ...] | dict[str, Any]` &mdash; If configured (`True`, tuple of column names/indices, or dict), enables in-memory preloading and multi-indexing in `TECachedDB`.
   - `cached_columns: tuple[int, ...]` &mdash; Canonical 0-indexed column indices retained in memory (defaults to all columns if `te_cached=True`, or empty if `False`).
   - `version_scoped: bool` &mdash; If `True`, enables working-window preloading (`vid >= Old_VID`) and historical version pruning in `TECachedDB`.
+  - `blob_scoped: bool` &mdash; If `True`, marks table as scoped by content-addressed file blob (`blob_id`) for Git-native preloading.
+  - `idempotent_pk: bool` &mdash; If `True`, enables idempotent insert deduplication via `INSERT IGNORE INTO` and ignores duplicate key errno 1062.
+  - `unique_keys: tuple[tuple[str, ...], ...] | None` &mdash; Multi-column unique key definitions: `(("col_a", "col_b"), ...)`.
+  - `indexes: tuple[tuple[str, tuple[str, ...]], ...] | None` &mdash; Secondary table indexes: `(("idx_name", ("col_a", "col_b")), ...)`.
   - `hashing_table: bool | str | int | Table` &mdash; If set (e.g. `"m_ast_hash"` or `True`), enables automatic structural hash deduplication and acceleration for views rooted at this table.
   - `init_columns: tuple` &mdash; Raw column definition tuples: `(("col_name", "DATA_TYPE", "CONSTRAINTS"), ...)`.
   - `init_primary: tuple[str, ...]` &mdash; Raw column names forming Primary Key: `("fnid",)`.
@@ -39,14 +43,20 @@ Stateful caching, sequence coordination, relational view decomposition, and batc
 | `queued_update` | `dict[int, list[tuple]]` | Staged updates per table: `[row_tuple, ...]`. |
 | `queued_view` | `dict[JoinsType, dict[tuple, int]]` | Cache for views: `{joins: {non_none_column_tuple: assigned_view_id}}`. |
 | `next_id` | `dict[int, int]` | Monotonic auto-increment counter: `table_id -> current_int_id`. |
+| `_table_sec_indexes` | `dict[int, tuple[tuple[int, ...], ...]]` | Precompiled composite secondary index column positions for registered tables. |
+| `_table_unique_keys` | `dict[int, tuple[tuple[int, ...], ...]]` | Precompiled multi-column or single-column unique key column positions for registered tables. |
+| `_table_single_col_indexes` | `dict[int, tuple[int, ...]]` | Precompiled single-column secondary index column positions for registered tables. |
+| `_queued_sec_indexes` | `dict[int, dict[tuple, dict[tuple, list[tuple]]]]` | Staging composite secondary index lookup: `table_id -> {col_positions: {composite_key: [row, ...]}}`. |
+| `_queued_single_col_indexes` | `dict[int, dict[int, dict[SafeDataType, list[tuple]]]]` | Staging single-column index lookup: `table_id -> {col_idx: {val: [row, ...]}}`. |
+| `_committed_unique_keys` | `dict[int, dict[tuple, set[tuple]]]` | Historical committed unique key set per table and key definition: `table_id -> {col_positions: {u_key, ...}}`. |
 | `db` | `Any \| None` | Active database driver handle (or `None`). |
 
 ### 2.2. Extended In-Memory Caching State (`TECachedDB`)
 
 | Attribute | Type | Purpose & Structure |
 | :--- | :--- | :--- |
-| `_cached_rows` | `dict[int, list[tuple]]` | In-memory row storage for `te_cached` tables: `table_id -> [projected_row_tuple, ...]`. |
-| `_pk_index` | `dict[int, dict[Any, tuple]]` | O(1) exact row lookup: `table_id -> {primary_key_val: row_tuple}`. |
+| `_cached_rows` | `dict[int, list[tuple] | SharedTableRowSequenceView]` | In-memory row storage for `te_cached` tables: `table_id -> [projected_row_tuple, ...]`, backed by zero-copy `SharedTableRowSequenceView` when huge-page shared memory is active. |
+| `_pk_index` | `dict[int, dict[Any, tuple] | SharedTablePKView]` | O(1) exact row lookup: `table_id -> {primary_key_val: row_tuple}`, backed by zero-copy `SharedTablePKView` when huge-page shared memory is active. |
 | `_nodup_index` | `dict[int, dict[tuple, int]]` | O(1) deduplication lookup: `table_id -> {columns[1:]: assigned_id}`. |
 | `_col_indices` | `dict[int, dict[int, dict[SafeDataType, list[tuple]]]]` | Selective inverted column index: `table_id -> {col_idx: {column_val: [matching_row, ...]}}` (exempts primary key columns). |
 | `_shared_buffer` | `SharedTableReader \| None` | Structured shared memory segment backed by huge pages (1GB/2MB/THP) containing preloaded baseline tables. |
@@ -89,16 +99,17 @@ EngineClass = get_table_engine("direct")  # -> TEDirectDB
 Internal helper methods used exclusively by `TECachedDB` to synchronize in-memory caches and indices without querying the database driver:
 - `_normalize_binary_val(val: Any) -> bytes`: Coerces binary column values (`bytearray`, `memoryview`, or Latin-1/UTF-8 decoded `str`) to canonical `bytes`.
 - `_match_columns(row: tuple, filter_cols: tuple) -> bool`: Verifies if a row matches all non-None criteria in `filter_cols`.
-- `_is_version_scoped(table: Table) -> bool`: Returns `True` if `table.version_scoped` is enabled.
-- `_get_vid_col_idx(table: Table) -> int | None`: Locates the 0-indexed column position of the version column (`vid` or `vid_s`).
+- `_is_version_scoped(table: Table) -> bool`: Returns `True` if `table.version_scoped` or `table.blob_scoped` is enabled, or if table contains `blob_id`, `commit_id`, `vid`, or `vid_s`.
+- `_get_vid_col_idx(table: Table) -> int | None`: Locates the 0-indexed column position of the scoping column (`blob_id`, `commit_id`, `vid`, or `vid_s`).
 - `_index_row(table: Table, row: tuple) -> None`: Indexes a row into `_pk_index`, `_nodup_index`, and selectively into `_col_indices` (exempting primary key columns).
 - `_unindex_row(table: Table, row: tuple) -> None`: Removes a row from all internal indices prior to updating.
 - `_ensure_table(table_id: int) -> None`: Initializes cache lists and index dictionaries for a table upon first access.
 
 ### 3.5. Structured Shared Memory with Huge Pages (`table_engine/shared_buffer.py`)
 - **`SharedBufferAllocator.allocate(size: int, mode: str = "auto") -> tuple[mmap.mmap, str, int]`**: Allocates shared memory with tiered fallback: `1GB HugeTLB` (`MAP_HUGE_1GB`) $\to$ `2MB HugeTLB` (`MAP_HUGE_2MB`) $\to$ `2MB Transparent Huge Pages` (`madvise(MADV_HUGEPAGE)`) $\to$ standard `4KB anonymous mmap`.
-- **`SharedTableBuilder`**: Packs preloaded relational tables and builds $O(1)$ open-addressing hash indices directly inside raw memory bytes during the parent process preloading phase.
+- **`SharedTableBuilder`**: Packs preloaded relational tables and builds $O(1)$ open-addressing hash indices directly inside raw memory bytes during the parent process preloading phase using 64-bit SplitMix64 / FxHash composite key tuple mixing.
 - **`SharedTableReader`**: Zero-deserialization reader providing lock-free $O(1)$ Primary Key probes (`get_row_by_pk`) and scan matching (`scan_matching`) against raw `mmap` memoryviews without allocating intermediate Python objects.
+- **`SharedSymbolReader`**: Zero-copy shared memory reader querying pre-resolved header symbols in $O(1)$ lock-free time; supports transparent mapping interface (`__contains__`, `__getitem__`, `get`) with `(sym_name, sym_type)` or `sym_name`.
 
 ---
 
@@ -146,10 +157,12 @@ Internal helper methods used exclusively by `TECachedDB` to synchronize in-memor
     1. **Staged Memory Check (`queued_set`)**:
        - `no_duplicate=True`:
          - Exact key: If all `columns[1:]` are non-None, checks `queued_set[table_id].get(columns[1:])`.
+         - Secondary index fast-path: Checks `_queued_sec_indexes` and `_queued_single_col_indexes` in $O(1)$.
          - Wildcard filter: Iterates `queued_set[table_id].items()`, checking `columns` match against staged rows `(v, *k)`.
        - `no_duplicate=False`:
-         - Explicit PK: If all primary columns are non-None, checks `queued_set[table_id].get(pk)` for match.
-         - Wildcard filter: Iterates `queued_set[table_id].values()`, checking `columns` match against staged rows.
+         - Explicit PK: If all primary columns are non-None, checks `queued_set[table_id].get(pk)` for match in $O(1)$.
+         - Secondary index fast-path: When primary key is not specified (e.g. `(None, name, type_id)` or `(None, name, None)`), checks `_queued_sec_indexes` (composite keys) and `_queued_single_col_indexes` (single columns) in $O(1)$, resolving symbol hits and immediate misses without linear scans.
+         - Wildcard filter fallback: Iterates `queued_set[table_id].values()` only if table has no matching indexes.
     2. **Emptiness Guard**: If `getattr(table, "has_auto_increment", True) and table.initial_insert is None and self.next_id.get(table_id, 0) <= 1 and (table_id not in self.queued_set or not self.queued_set[table_id])`, returns `None` immediately without querying DB.
     3. **Database Query**: Executes `self.db.select(table, columns)`.
 - **`set(table_id: int, columns: tuple[SafeDataType, ...]) -> tuple[SafeDataType, ...]`**
@@ -160,6 +173,7 @@ Internal helper methods used exclusively by `TECachedDB` to synchronize in-memor
     - In `TECachedDB`: Appends row to `_cached_rows` and calls `_index_row()`.
     - Returns `(assigned_id, *columns[1:])`.
   - **Case 2 (`columns[0] is None` - Auto-Increment Generation)**:
+    - **Unique Key Deduplication**: If `table.unique_keys` is configured and matches an already staged row in `_queued_sec_indexes` or a committed row in `_committed_unique_keys` across all unique key columns, returns the existing record immediately without allocating a new ID or queuing duplicate entries.
     - Assigns `assigned_id = next_id[table_id]`, increments `next_id[table_id] += 1`.
     - Builds `row = (assigned_id, *columns[1:])`.
     - Stages `queued_set[table_id][assigned_id] = row`.
@@ -167,8 +181,8 @@ Internal helper methods used exclusively by `TECachedDB` to synchronize in-memor
     - Returns `row`.
   - **Case 3 (Explicit Primary Key Provided)**:
     - Extracts `pk = itemgetter(*table.primary)(columns)`.
-    - **Cryptographic Hash Fast-Path**: For cryptographic hash tables (`init_primary == ("hash",)` or `m_tag_code`, `m_ast_hash`), returns existing row if already staged or present in committed cache.
-    - **Duplicate Primary Key Rejection**: For standard relational tables, `set()` enforces database-level primary key uniqueness: if `pk` is already staged in `queued_set[table_id]` (or present in cache for `TECachedDB`), `set()` raises `ValueError(f"Duplicate primary key '{pk}' in table '{table.table_name}'")`. Callers must use `update()` to modify existing records, or `get_set()` / `no_duplicate=True` to safely avoid duplicate inserts.
+    - **Idempotent Primary Key & Cryptographic Hash Fast-Path**: For tables with `idempotent_pk=True` (e.g. `m_bridge_commit_person`) or cryptographic hash tables (`init_primary == ("hash",)` or `m_tag_code`, `m_ast_hash`), returns existing row if already staged in `queued_set` or present in `_pk_index` / committed cache, preventing duplicate queuing and preserving no-duplicate integrity.
+    - **Duplicate Primary Key Rejection**: For standard relational tables without `idempotent_pk`, `set()` enforces strict database-level primary key uniqueness: if `pk` is already staged in `queued_set[table_id]` (or present in cache for `TECachedDB`), `set()` raises `ValueError(f"Duplicate primary key '{pk}' in table '{table.table_name}'")`. Callers must use `update()` to modify existing records, or `get_set()` / `no_duplicate=True` to safely avoid duplicate inserts.
     - Stages `queued_set[table_id][pk] = columns`.
     - In `TECachedDB`: Appends `columns` to `_cached_rows`, and calls `_index_row()`.
     - Returns `columns`.
@@ -275,9 +289,12 @@ Any backend passed to `TableEngine` must implement:
 7. **Public Engine Invariant**: Code, tests, and workflows must never assume tables are cached in memory or access private engine internals (e.g. `_cached_rows`, `_pk_index`). Queries must use public TableEngine APIs (`Table.get()`, `G.TE.get()`, `Table.get_set()`) or assert against database state (`MockDB._global_store`), ensuring complete compatibility regardless of the active TableEngine (`TEDirectDB` vs `TECachedDB`) or table caching configuration (`te_cached=True/False`).
 8. **Duplicate Primary Key Enforcement & Cryptographic Hash Fast-Path**: For standard relational tables, TableEngine `set()` enforces database-level primary key uniqueness: calling `set()` with an explicit primary key that is already staged in `queued_set` or present in cache raises `ValueError`. Callers must use `update()` to mutate existing records or `get_set()` / `no_duplicate=True` to safely avoid duplicate inserts. For cryptographic hash lookup tables (`m_tag_code`, `m_ast_hash`), matching hashes guarantee identical content and return the existing row via an $O(1)$ fast-path.
 9. **Teardown Commit Acceleration**: When committing final update cycles, teardowns, or write-only batches before engine closure, use `G.TE.commit_all(update_in_mem_indexes=False)` (or `G.TE.commit(table_id, update_in_mem_indexes=False)`) to bypass redundant in-memory cache/index synchronization and immediately release cache memory before `G.TE.close()`.
-10. **Huge-Page Shared Memory & Fork Inheritance**: Preloaded baseline tables stored in structured shared memory (`_shared_buffer`) must remain immutable across parallel worker processes. Workers calling `start_new_db(..., is_worker=True)` inherit the shared memory segment across `fork()`, isolating local mutation overlays in process-local heap and eliminating multi-worker database preload stampedes.
+10. **Huge-Page Shared Memory & Fork Inheritance**: Preloaded baseline tables stored in structured shared memory (`_shared_buffer`) remain immutable across parallel worker processes. Workers calling `start_new_db(..., is_worker=True)` inherit the shared memory segment across `fork()`, isolating local mutation overlays in process-local heap and eliminating multi-worker database preload stampedes. When `_shared_buffer` is active, workers initialize `_committed_pks[table_id] = set()` and `_committed_nodup_keys[table_id] = {}` directly in $O(1)$ time without unpacking row keys from shared memory views, eliminating multi-gigabyte heap allocations and Copy-on-Write page duplication at worker startup.
 11. **Cross-Chunk Deduplication Tracking**: TableEngine implementations (`TEDirectDB`, `TECachedDB`) maintain `_committed_nodup_keys` (mapping unique data keys to assigned IDs for `no_duplicate=True` tables) and `_committed_pks` (tracking primary keys for hash lookup tables like `m_tag_code` and `m_ast_hash`) across intermediate chunk commits. During `commit()` and `commit_all()`, staged rows matching previously committed keys/hashes are filtered out, and `set()` / `get()` provide $O(1)$ fast-path resolution, preventing duplicate `INSERT INTO` attempts in subsequent chunks.
 12. **Parent Process Fork Socket Refresh**: The parent process must never invoke `start_new_db(..., is_worker=True)` after forking workers. Calling `is_worker=True` without shared huge pages resets and wipes in-memory table caches, causing subsequent operations (e.g. `processing_unchanges()`) to treat existing records as missing. The parent process must only refresh its DB connection handle (`if G.TE.db: G.TE.db.close(); G.TE.db = G.DB()`) without modifying cached table state or staging queues.
+13. **Zero-Copy Shared Memory Views & Heap Cache Eviction**: When `_shared_buffer` is constructed via `SharedTableBuilder`, preloaded table row heap collections (`_cached_rows`) and primary key indices (`_pk_index`) are immediately replaced with `SharedTableRowSequenceView` and `SharedTablePKView`. These zero-copy proxy views query the shared mmap buffer directly with dynamic mutation support and $O(1)$ length/truthiness checks (`__len__`, `__bool__`). Upon activation, redundant secondary column indices (`_col_indices`), committed hash caches (`_committed_pks`), and nodup key mappings (`_committed_nodup_keys`) for shared-backed tables are purged, evicting duplicate preloaded heap memory and releasing pages back to the OS via glibc `malloc_trim(0)`.
+14. **Write-Heavy Chunk Commit Heap Trimming**: During intermediate and final chunk commits (`commit()`, `commit_all()`), write-heavy relational tables (`m_ast_hash`, `m_tag_code`, `m_symbol_def`, `m_ast_container`, `m_bridge_tag`, `m_bridge_checkpoint`, `m_blob_transition`) are purged from heap caches (`_cached_rows`, `_pk_index`) while their compact 32-byte Primary Keys are recorded into `_committed_pks`. This bounds Python process heap growth during massive multi-thousand file ingestion runs while preserving full upstream deduplication guarantees.
+15. **Zero-Copy Shared Symbol Resolution & Stage 2 Multi-Epoch IPC Offloading**: During Phase 2 AST resolution waves and Stage 2 source streaming across parallel worker processes, large symbol and container maps are packed into read-only shared memory via `SharedSymbolBuilder` and accessed via `SharedSymbolReader` (`gp._shared_symbols`, `_phase2_shared_symbols`). Workers and AST execution engines (`TableHandling.resolve_ref()`) query these symbol tables directly via zero-copy fast-paths in $O(1)$ time without IPC serialization or heap duplication. In Stage 2 source streaming, the shared memory segment is periodically regenerated between epochs via `SharedSymbolReader.items()` to incorporate newly resolved source symbols, cleanly clearing process-local heap symbol dictionaries (`file_symbols`, `_ast_staged_symbols`) to prevent Copy-on-Write page duplication across forks. Intermediate chunk commits and deferred queue draining prevent uncommitted memory accumulation and eliminate worker starvation.
 
 ---
 

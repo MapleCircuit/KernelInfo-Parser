@@ -78,6 +78,17 @@ obj-$(CONFIG_CORE) += core.o
         self.assertEqual(len(direct_objs), 1)
         self.assertEqual(direct_objs[0].source_file_rel, "core.c")
 
+    def test_makefile_duplicate_rule_items_deduplication(self) -> None:
+        """Verify duplicate items in a single rule (e.g. traps.o in CRIS Makefile) do not produce duplicate bindings."""
+        makefile_content = """# CRIS duplicate object test
+obj-y := entry.o traps.o shadows.o debugport.o irq.o \\
+         process.o setup.o signal.o traps.o time.o
+"""
+        bindings = self.parser.parse_makefile_content(makefile_content, dir_path="arch/cris")
+        traps_bindings = [b for b in bindings if "traps.c" in b.source_file_rel]
+        self.assertEqual(len(traps_bindings), 1)
+        self.assertEqual(traps_bindings[0].source_line, 2)
+
 
 class TestDocReferenceScanner(unittest.TestCase):
     """Test suite for documentation cross-file reference scanner."""
@@ -168,6 +179,27 @@ class TestDBLayoutAndWebappReferenceAPI(unittest.TestCase):
         self.assertEqual(res["total"], 0)
         self.assertIn("counts", res)
         self.assertIn("include", res["counts"])
+
+    def test_m_file_reference_unique_key_and_table_engine_deduplication(self) -> None:
+        """Verify TableEngine deduplicates duplicate unique key entries for m_file_reference."""
+        from table_engine.te_direct_db import TEDirectDB
+        te = TEDirectDB()
+        te._register_table(m_file_reference)
+        te.next_id[m_file_reference.table_id] = 1
+
+        # First insert
+        row1 = te.set(m_file_reference.table_id, (None, 18278, 18291, 3, 9, "details 1"))
+        self.assertEqual(row1[0], 1)
+        self.assertEqual(row1[1], 18278)
+        self.assertEqual(row1[2], 18291)
+        self.assertEqual(row1[3], 3)
+        self.assertEqual(row1[4], 9)
+
+        # Duplicate insert with identical (source_blob_id, target_fnid, ref_type, line_no)
+        row2 = te.set(m_file_reference.table_id, (None, 18278, 18291, 3, 9, "details 2"))
+        # Must return the existing staged row without allocating a new ID
+        self.assertEqual(row2[0], 1)
+        self.assertEqual(len(te.queued_set[m_file_reference.table_id]), 1)
 
 
 if __name__ == "__main__":

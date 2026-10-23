@@ -21,11 +21,11 @@ class CallgraphService:
 
             cursor.execute(
                 """
-                SELECT s.def_id, s.ast_id, s.fid, fn.fname, s.line_s, s.line_e
+                SELECT s.def_id, s.ast_id, s.blob_id AS fid, fn.fname, s.line_s, s.line_e
                 FROM m_symbol_def s
-                JOIN m_bridge_file bf ON s.fid = bf.fid AND bf.vid = s.vid
-                JOIN m_file_name fn ON bf.fnid = fn.fnid
-                WHERE s.vid = %s AND s.name = %s
+                LEFT JOIN m_bridge_checkpoint bc ON s.blob_id = bc.blob_id AND bc.commit_id = %s
+                LEFT JOIN m_file_name fn ON bc.fnid = fn.fnid
+                WHERE s.name = %s
                 ORDER BY (s.type_id IN (1, 2)) DESC
                 LIMIT 1;
                 """,
@@ -57,10 +57,10 @@ class CallgraphService:
                 SELECT caller_sym.name AS caller_name, fn.fname AS file_name, r.line AS line_no
                 FROM m_symbol_ref r
                 JOIN m_tag t ON r.tag_id = t.tag_id
-                JOIN m_symbol_def caller_sym ON t.ast_id = caller_sym.ast_id AND caller_sym.vid = r.vid
-                JOIN m_bridge_file bf ON caller_sym.fid = bf.fid AND bf.vid = caller_sym.vid
-                JOIN m_file_name fn ON bf.fnid = fn.fnid
-                WHERE r.vid = %s AND r.ast_id = %s AND r.role = 3
+                JOIN m_symbol_def caller_sym ON t.ast_id = caller_sym.ast_id
+                LEFT JOIN m_bridge_checkpoint bc ON caller_sym.blob_id = bc.blob_id AND bc.commit_id = %s
+                LEFT JOIN m_file_name fn ON bc.fnid = fn.fnid
+                WHERE r.ast_id = %s AND r.role = 3
                 ORDER BY caller_sym.name ASC, r.line ASC;
                 """,
                 (vid, target_ast_id),
@@ -93,10 +93,10 @@ class CallgraphService:
                 """
                 SELECT callee_sym.name AS callee_name, fn.fname AS file_name, r.line AS line_no
                 FROM m_symbol_ref r
-                JOIN m_symbol_def callee_sym ON r.ast_id = callee_sym.ast_id AND callee_sym.vid = r.vid
-                JOIN m_bridge_file bf ON callee_sym.fid = bf.fid AND bf.vid = callee_sym.vid
-                JOIN m_file_name fn ON bf.fnid = fn.fnid
-                WHERE r.vid = %s AND r.fid = %s AND r.line BETWEEN %s AND %s AND r.role = 3
+                JOIN m_symbol_def callee_sym ON r.ast_id = callee_sym.ast_id
+                LEFT JOIN m_bridge_checkpoint bc ON callee_sym.blob_id = bc.blob_id AND bc.commit_id = %s
+                LEFT JOIN m_file_name fn ON bc.fnid = fn.fnid
+                WHERE r.blob_id = %s AND r.line BETWEEN %s AND %s AND r.role = 3
                 ORDER BY callee_sym.name ASC, r.line ASC;
                 """,
                 (vid, target_fid, fn_def["line_s"], fn_def["line_e"]),

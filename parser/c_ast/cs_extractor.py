@@ -54,10 +54,10 @@ class CSExtractor:
                 with CS(REF_POS):
                     CS.store(m_symbol_ref.set(
                         None,
-                        CS.gp.VID,
                         ((m_file.table_id, 0), OP_REF, (REF_ROOT,)),
                         last_tag,
                         ref_ast_id,
+                        0,
                         int(role),
                         line,
                         col,
@@ -107,7 +107,7 @@ class CSExtractor:
 
         # Rule 12 Invariant: m_tag.set MUST be first inside with CS(REF_POS)
         with CS(REF_POS):
-            CS.store(m_tag.set(None, CS.gp.VID, 0, code_hash, ast_ref, 0, 0))
+            CS.store(m_tag.set(None, code_hash, ast_ref, 0, 0))
             tag_ref = ((m_tag.table_id, 0), OP_REF, (REF_POS, CS.route[-1]))
             # Auxiliary deduplication table MUST be staged after m_tag.set
             CS.store(m_tag_code.get_set(code_hash, code_str))

@@ -36,6 +36,8 @@ from core.DBLayout import (
 from db_engine import MockDB
 from table_engine import TECachedDB
 from parser.c_ast.c_ast import c_ast_parse
+from parser.c_ast.cursor_tree import clear_tu_caches
+from core.config import get_default_repo_path
 from unit_test.harness import (
     FeatureRegistry,
     test_feature,
@@ -77,13 +79,16 @@ class BaseCParserTestCase(unittest.TestCase):
             self.te.close()
         if hasattr(self, "mf") and self.mf:
             self.mf.clear_all_version()
+        clear_tu_caches()
+        G.CURRENT_PARSING_FILE = None
+        G.CURRENT_PARSING_DIR = None
 
     def prepare_c_file(
         self,
         version: str,
         dest_path: str,
         src_path: str | None = None,
-        repo_path: str = "linux",
+        repo_path: str | None = None,
     ) -> str:
         """Extract git blob directly into temporary disk directory for libclang parsing."""
         if version not in self.mf.version_dict:
@@ -93,7 +98,7 @@ class BaseCParserTestCase(unittest.TestCase):
         os.makedirs(os.path.dirname(full_dest), exist_ok=True)
         git_target = src_path or dest_path
         content = subprocess.check_output(
-            ["git", "-C", repo_path, "show", f"{version}:{git_target}"],
+            ["git", "-C", repo_path or str(get_default_repo_path()), "show", f"{version}:{git_target}"],
             stderr=subprocess.PIPE,
         )
         with open(full_dest, "wb") as f:
@@ -218,10 +223,11 @@ class Test_CParserLifecycle(BaseCParserTestCase):
             tables = snapshot["tables"]
             self.assertIn("m_moved_tag", tables)
             self.assertEqual(len(tables["m_moved_tag"]), 1, "Expected exactly 1 evolved struct tag in m_moved_tag")
-
-            # Check that initial struct tag was closed (vid_e = 1)
-            prior_tags = [r for r in tables["m_tag"] if r.get("vid_e") == 1]
-            self.assertGreater(len(prior_tags), 0, "Prior modified tag should be marked closed with vid_e=1")
+            moved_row = tables["m_moved_tag"][0]
+            self.assertNotEqual(moved_row["s_tag_id"], moved_row["e_tag_id"])
+            all_tag_ids = {r["tag_id"] for r in tables["m_tag"]}
+            self.assertIn(moved_row["s_tag_id"], all_tag_ids)
+            self.assertIn(moved_row["e_tag_id"], all_tag_ids)
 
             assert_snapshot_matches(self, "c_ast", "modified_changed_file", snapshot)
 

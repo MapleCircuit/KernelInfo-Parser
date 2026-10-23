@@ -70,6 +70,8 @@ Any database backend assigned to `G.DB` or passed to `TableEngine.start()` must 
   - Removes multiple database indexes in parallel across worker connections.
 - **`test_tables(tables: Sequence[Table] | Table) -> list[str] | None`**
   - Checks if all registered schema tables exist in the database catalog; returns list of missing table names or `None`.
+- **`verify_relational_integrity(tables: Sequence[Table]) -> dict[str, int]`**
+  - Verifies relational foreign key integrity across tables and returns any orphan record counts (empty dictionary if all constraints valid).
 
 ---
 

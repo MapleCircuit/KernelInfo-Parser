@@ -8,6 +8,11 @@ from webapp.backend.database.helpers import (
     get_version_info,
 )
 from webapp.backend.security.sql import sanitize_like_query
+from webapp.backend.services.tree_resolver import git_tree_resolver
+
+# Name-ordered candidates scanned before scoping to the revision's tree (symbols of every indexed
+# version share m_symbol_def, so a prefix can match many blobs that are not in the requested tree)
+SEARCH_CANDIDATES = 30000
 
 
 def format_symbol_type(type_name: str) -> str:
@@ -20,6 +25,33 @@ def format_symbol_type(type_name: str) -> str:
 class SymbolService:
     """Service providing symbol searching, definitions, cross-reference index (XRef), and AST container trees."""
 
+    @staticmethod
+    def _scope(cursor: Any, version_name: str) -> tuple[int | None, str, dict[int, list[str]]]:
+        """Resolve (vid, vname, {blob_id: [paths]}) for any revision: tag, branch or arbitrary commit.
+
+        The Git tree is authoritative (works for commits without a checkpoint snapshot, even commits
+        that were never ingested); m_bridge_checkpoint is the fallback when Git is unavailable.
+        """
+        vid, vname = get_version_info(cursor, version_name)
+        rev = vname if vid is not None else version_name
+        blob_paths = git_tree_resolver.blob_paths(cursor, rev)
+        if blob_paths is None:
+            if vid is None:
+                raise HTTPException(status_code=404, detail=f"Version '{version_name}' not found.")
+            cursor.execute(
+                """
+                SELECT bc.blob_id, fn.fname
+                FROM m_bridge_checkpoint bc
+                JOIN m_file_name fn ON bc.fnid = fn.fnid
+                WHERE bc.commit_id = %s;
+                """,
+                (vid,),
+            )
+            blob_paths = {}
+            for r in cursor.fetchall():
+                blob_paths.setdefault(r["blob_id"], []).append(safe_decode(r["fname"]))
+        return vid, rev, blob_paths
+
     def search_symbols(self, version_name: str, query: str = "", q: str = "", limit: int = 50) -> list[dict[str, Any]]:
         """Search symbol definitions by prefix or substring, returning a list of symbol records."""
         target_q = query or q
@@ -28,26 +60,39 @@ class SymbolService:
             return []
 
         with get_db_cursor() as cursor:
-            vid, vname = get_version_info(cursor, version_name)
-            if vid is None:
-                raise HTTPException(status_code=404, detail=f"Version '{version_name}' not found.")
-
+            _, _, blob_paths = self._scope(cursor, version_name)
+            cap = max(1, min(limit, 200))
             cursor.execute(
                 """
-                SELECT s.def_id, s.name, s.type_id, t.name AS type_name, s.fid, fn.fname, s.line_s, s.line_e, s.ast_id
+                SELECT s.def_id, s.blob_id
                 FROM m_symbol_def s
-                JOIN m_type_descriptor t ON s.type_id = t.type_id
-                JOIN m_bridge_file bf ON s.fid = bf.fid AND bf.vid = s.vid
-                JOIN m_file_name fn ON bf.fnid = fn.fnid
-                WHERE s.vid = %s AND (s.name LIKE %s OR s.name = %s)
+                WHERE (s.name LIKE %s OR s.name = %s)
                 ORDER BY (s.name = %s) DESC, LENGTH(s.name) ASC, s.name ASC
                 LIMIT %s;
                 """,
-                (vid, f"{clean_q}%", target_q, target_q, max(1, min(limit, 200))),
+                (f"{clean_q}%", target_q, target_q, SEARCH_CANDIDATES),
             )
-            rows = cursor.fetchall()
+            picked = [r["def_id"] for r in cursor.fetchall() if r["blob_id"] in blob_paths][:cap]
+            if not picked:
+                return []
+
+            fmt = ",".join(["%s"] * len(picked))
+            cursor.execute(
+                f"""
+                SELECT s.def_id, s.name, s.type_id, t.name AS type_name, s.blob_id AS fid, s.line_s, s.line_e, s.ast_id
+                FROM m_symbol_def s
+                JOIN m_type_descriptor t ON s.type_id = t.type_id
+                WHERE s.def_id IN ({fmt});
+                """,
+                picked,
+            )
+            by_id = {r["def_id"]: r for r in cursor.fetchall()}
             results = []
-            for r in rows:
+            for def_id in picked:
+                r = by_id.get(def_id)
+                if r is None:
+                    continue
+                path = blob_paths[r["fid"]][0]
                 results.append({
                     "def_id": r["def_id"],
                     "name": safe_decode(r["name"]),
@@ -55,8 +100,8 @@ class SymbolService:
                     "type_id": r["type_id"],
                     "type_name": format_symbol_type(safe_decode(r["type_name"])),
                     "fid": r["fid"],
-                    "file_path": safe_decode(r["fname"]),
-                    "file_name": safe_decode(r["fname"]),
+                    "file_path": path,
+                    "file_name": path,
                     "line_s": r["line_s"],
                     "line_e": r["line_e"],
                     "ast_id": r["ast_id"],
@@ -72,45 +117,132 @@ class SymbolService:
             return []
 
         with get_db_cursor() as cursor:
-            vid, _ = get_version_info(cursor, version_name)
-            if vid is None:
+            try:
+                _, _, blob_paths = self._scope(cursor, version_name)
+            except HTTPException:
                 return []
 
             cursor.execute(
                 """
-                SELECT DISTINCT s.name
+                SELECT s.name, s.blob_id
                 FROM m_symbol_def s
-                WHERE s.vid = %s AND s.name LIKE %s
+                WHERE s.name LIKE %s
                 ORDER BY s.name ASC
                 LIMIT %s;
                 """,
-                (vid, f"{clean_p}%", max(1, min(limit, 100))),
+                (f"{clean_p}%", SEARCH_CANDIDATES),
             )
-            rows = cursor.fetchall()
-            return [safe_decode(r["name"]) for r in rows]
+            cap = max(1, min(limit, 100))
+            names: list[str] = []
+            for r in cursor.fetchall():
+                if r["blob_id"] not in blob_paths:
+                    continue
+                name = safe_decode(r["name"])
+                if not names or names[-1] != name:
+                    names.append(name)
+                    if len(names) >= cap:
+                        break
+            return names
 
     def get_symbol_detail(self, version_name: str, name: str) -> dict[str, Any]:
         """Retrieve full definition, declarations, and usages of a symbol."""
         with get_db_cursor() as cursor:
-            vid, vname = get_version_info(cursor, version_name)
-            if vid is None:
-                raise HTTPException(status_code=404, detail=f"Version '{version_name}' not found.")
+            _, vname, blob_paths = self._scope(cursor, version_name)
 
-            # 1. Authoritative definition
+            # Check if this is a Kconfig configuration symbol (e.g. CONFIG_NET or CONFIG_SMP)
+            if name.startswith("CONFIG_"):
+                clean_name = name[7:]
+                try:
+                    from webapp.backend.services.kconfig_service import KconfigService
+                    k_svc = KconfigService()
+                    k_detail = k_svc.get_symbol_detail(vname, clean_name)
+                    if k_detail and k_detail.get("file_path"):
+                        return {
+                            "version": vname,
+                            "name": name,
+                            "symbol_name": name,
+                            "symbol": name,
+                            "type_name": "kconfig",
+                            "file_path": k_detail["file_path"],
+                            "line": k_detail["line_s"],
+                            "line_s": k_detail["line_s"],
+                            "line_e": k_detail["line_e"],
+                            "definition": {
+                                "def_id": 0,
+                                "ast_id": 0,
+                                "tag_id": 0,
+                                "type_id": 88,
+                                "type_name": "kconfig",
+                                "fid": None,
+                                "file": k_detail["file_path"],
+                                "file_path": k_detail["file_path"],
+                                "line_s": k_detail["line_s"],
+                                "line_e": k_detail["line_e"],
+                            },
+                            "declarations": k_detail.get("declarations", []),
+                            "usages": {},
+                            "xrefs": {},
+                            "total_usages": 0,
+                            "is_kconfig": True,
+                            "kconfig": k_detail,
+                        }
+                except Exception:
+                    pass
+
+            # 1. Authoritative definition: prefer one whose blob is in this revision's tree
             cursor.execute(
                 """
-                SELECT s.def_id, s.ast_id, s.name, s.type_id, t.name AS type_name, s.fid, fn.fname, s.line_s, s.line_e, s.tag_id
+                SELECT s.def_id, s.ast_id, s.name, s.type_id, t.name AS type_name, s.blob_id AS fid, s.line_s, s.line_e, s.tag_id
                 FROM m_symbol_def s
                 JOIN m_type_descriptor t ON s.type_id = t.type_id
-                JOIN m_bridge_file bf ON s.fid = bf.fid AND bf.vid = s.vid
-                JOIN m_file_name fn ON bf.fnid = fn.fnid
-                WHERE s.vid = %s AND s.name = %s
-                LIMIT 1;
+                WHERE s.name = %s
+                ORDER BY s.def_id ASC;
                 """,
-                (vid, name),
+                (name,),
             )
-            s_row = cursor.fetchone()
+            def_rows = cursor.fetchall()
+            s_row = next((r for r in def_rows if r["fid"] in blob_paths), def_rows[0] if def_rows else None)
+            if s_row is not None:
+                s_row["fname"] = (blob_paths.get(s_row["fid"]) or [None])[0]
             if not s_row:
+                # Check if this is a Kconfig configuration symbol (e.g. CONFIG_NET or NET)
+                clean_name = name[7:] if name.startswith("CONFIG_") else name
+                try:
+                    from webapp.backend.services.kconfig_service import KconfigService
+                    k_svc = KconfigService()
+                    k_detail = k_svc.get_symbol_detail(vname, clean_name)
+                    if k_detail and k_detail.get("file_path"):
+                        return {
+                            "version": vname,
+                            "name": name,
+                            "symbol_name": name,
+                            "symbol": name,
+                            "type_name": "kconfig",
+                            "file_path": k_detail["file_path"],
+                            "line": k_detail["line_s"],
+                            "line_s": k_detail["line_s"],
+                            "line_e": k_detail["line_e"],
+                            "definition": {
+                                "def_id": 0,
+                                "ast_id": 0,
+                                "tag_id": 0,
+                                "type_id": 88,
+                                "type_name": "kconfig",
+                                "fid": None,
+                                "file": k_detail["file_path"],
+                                "file_path": k_detail["file_path"],
+                                "line_s": k_detail["line_s"],
+                                "line_e": k_detail["line_e"],
+                            },
+                            "declarations": k_detail.get("declarations", []),
+                            "usages": {},
+                            "xrefs": {},
+                            "total_usages": 0,
+                            "is_kconfig": True,
+                            "kconfig": k_detail,
+                        }
+                except Exception:
+                    pass
                 raise HTTPException(status_code=404, detail=f"Symbol '{name}' not found in version '{version_name}'.")
 
             # 2. XRefs (Usages)
@@ -145,55 +277,54 @@ class SymbolService:
     def get_symbol_xref(self, version_name: str, symbol_name: str, limit: int | None = None) -> dict[str, Any]:
         """Categorize references: calls, member_refs, type_usages, declarations, macro_expansions."""
         with get_db_cursor() as cursor:
-            vid, vname = get_version_info(cursor, version_name)
-            if vid is None:
-                raise HTTPException(status_code=404, detail=f"Version '{version_name}' not found.")
+            _, vname, blob_paths = self._scope(cursor, version_name)
 
-            # Resolve symbol definition to ast_id (retrieve all matching definitions)
+            # Resolve symbol definition to ast_id (all matching definitions; those in this revision's tree when any)
             cursor.execute(
                 """
-                SELECT s.ast_id, s.type_id, t.name AS type_name, fn.fname, s.line_s, s.line_e
+                SELECT s.ast_id, s.type_id, t.name AS type_name, s.line_s, s.line_e, s.blob_id, s.linkage
                 FROM m_symbol_def s
                 JOIN m_type_descriptor t ON s.type_id = t.type_id
-                JOIN m_bridge_file bf ON s.fid = bf.fid AND bf.vid = s.vid
-                JOIN m_file_name fn ON bf.fnid = fn.fnid
-                WHERE s.vid = %s AND s.name = %s
-                ORDER BY fn.fname ASC, s.line_s ASC;
+                WHERE s.name = %s;
                 """,
-                (vid, symbol_name),
+                (symbol_name,),
             )
             def_rows = cursor.fetchall()
-            defs = [
-                {
-                    "file": safe_decode(d["fname"]),
-                    "line_s": d["line_s"],
-                    "line_e": d["line_e"],
-                    "type_name": format_symbol_type(safe_decode(d["type_name"])),
-                    "ast_id": d["ast_id"],
-                }
-                for d in def_rows
-            ]
+            in_tree = [d for d in def_rows if d["blob_id"] in blob_paths]
+            defs = sorted(
+                (
+                    {
+                        "file": (blob_paths.get(d["blob_id"]) or [None])[0],
+                        "line_s": d["line_s"],
+                        "line_e": d["line_e"],
+                        "type_name": format_symbol_type(safe_decode(d["type_name"])),
+                        "ast_id": d["ast_id"],
+                    }
+                    for d in (in_tree or def_rows)
+                ),
+                key=lambda d: (d["file"] is None, d["file"] or "", d["line_s"] or 0),
+            )
 
             # Fallback to m_ast lookup if no explicit m_symbol_def record exists
             if not defs:
                 cursor.execute(
                     """
-                    SELECT a.ast_id, a.type_id, t.name AS type_name, fn.fname, bt.line_s, bt.line_e
+                    SELECT a.ast_id, a.type_id, t.name AS type_name, bt.blob_id, bt.line_s, bt.line_e
                     FROM m_ast a
                     JOIN m_type_descriptor t ON a.type_id = t.type_id
                     JOIN m_tag tg ON a.ast_id = tg.ast_id
                     JOIN m_bridge_tag bt ON tg.tag_id = bt.tag_id
-                    JOIN m_bridge_file bf ON bt.fid = bf.fid AND bf.vid = %s
-                    JOIN m_file_name fn ON bf.fnid = fn.fnid
                     WHERE a.name = %s
-                    ORDER BY fn.fname ASC, bt.line_s ASC
-                    LIMIT 5;
+                    LIMIT 200;
                     """,
-                    (vid, symbol_name),
+                    (symbol_name,),
                 )
-                for f_row in cursor.fetchall():
+                tag_rows = cursor.fetchall()
+                tag_rows = [r for r in tag_rows if r["blob_id"] in blob_paths] or tag_rows
+                tag_rows.sort(key=lambda r: ((blob_paths.get(r["blob_id"]) or ["~"])[0], r["line_s"] or 0))
+                for f_row in tag_rows[:5]:
                     defs.append({
-                        "file": safe_decode(f_row["fname"]),
+                        "file": (blob_paths.get(f_row["blob_id"]) or [None])[0],
                         "line_s": f_row["line_s"],
                         "line_e": f_row["line_e"],
                         "type_name": safe_decode(f_row["type_name"]),
@@ -207,14 +338,13 @@ class SymbolService:
             if ast_ids:
                 format_strings = ",".join(["%s"] * len(ast_ids))
                 query_sql = f"""
-                    SELECT r.role, r.line, r.char_s, fn.fname, r.fid, r.tag_id
+                    SELECT r.role, r.line, r.char_s, fn.fname, r.blob_id AS fid, r.tag_id
                     FROM m_symbol_ref r
-                    JOIN m_bridge_file bf ON r.fid = bf.fid AND bf.vid = r.vid
-                    JOIN m_file_name fn ON bf.fnid = fn.fnid
-                    WHERE r.vid = %s AND r.ast_id IN ({format_strings})
+                    LEFT JOIN m_file_name fn ON r.target_fnid = fn.fnid
+                    WHERE r.ast_id IN ({format_strings})
                     ORDER BY fn.fname ASC, r.line ASC
                 """
-                params: list[Any] = [vid] + ast_ids
+                params: list[Any] = list(ast_ids)
                 if limit and limit > 0:
                     query_sql += " LIMIT %s;"
                     params.append(limit)
@@ -364,11 +494,99 @@ class SymbolService:
             return build_tree(ast_id, depth)
 
     def get_tag_timeline(self, tag_id: int) -> dict[str, Any]:
-        """Trace cross-version tag evolution history via m_moved_tag."""
+        """Cross-version history of the symbol a tag belongs to (see get_symbol_history)."""
         with get_db_cursor() as cursor:
             cursor.execute(
                 """
-                SELECT t.tag_id, t.vid_s, t.vid_e, t.hash, t.ast_id, a.name AS ast_name
+                SELECT fn.fname
+                FROM m_bridge_tag bt
+                JOIN m_bridge_checkpoint bc ON bc.blob_id = bt.blob_id
+                JOIN m_file_name fn ON fn.fnid = bc.fnid
+                WHERE bt.tag_id = %s
+                LIMIT 1;
+                """,
+                (tag_id,),
+            )
+            row = cursor.fetchone()
+            if not row:
+                cursor.execute(
+                    """
+                    SELECT fn.fname
+                    FROM m_bridge_tag bt
+                    JOIN m_commit_file cf ON cf.blob_id = bt.blob_id
+                    JOIN m_file_name fn ON fn.fnid = cf.fnid
+                    WHERE bt.tag_id = %s
+                    LIMIT 1;
+                    """,
+                    (tag_id,),
+                )
+                row = cursor.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail=f"Tag {tag_id} not found.")
+        return self.get_symbol_history(None, safe_decode(row["fname"]), tag_id=tag_id)
+
+    def get_symbol_history(
+        self,
+        version_name: str | None,
+        path: str,
+        ast_id: int | None = None,
+        line: int | None = None,
+        tag_id: int | None = None,
+    ) -> dict[str, Any]:
+        """Trace one symbol definition of `path` across every indexed version of the active repository.
+
+        The anchor tag is `tag_id`, or the narrowest tag of the file at `version_name` that covers
+        `line` (and matches `ast_id` when given). Each indexed version resolves the file's blob from
+        its Git tree, then finds that blob's tags with the same AST identity: an identical tag_id
+        means the definition is unchanged, a different one means its code changed. Snippets are read
+        from Git so consecutive changes carry a line diff.
+        """
+        from webapp.backend.services.git_reader import git_reader
+        from webapp.backend.services.git_service import _compute_structured_diff
+        from webapp.backend.services.tree_resolver import git_tree_resolver
+        from webapp.backend.database.helpers import get_active_repo_id
+
+        norm_path = (path or "").strip().strip("/")
+        with get_db_cursor() as cursor:
+            # 1. Anchor tag
+            if tag_id is None:
+                if not version_name:
+                    raise HTTPException(status_code=400, detail="version_name is required without tag_id.")
+                vid, vname = get_version_info(cursor, version_name)
+                if vid is None:
+                    raise HTTPException(status_code=404, detail=f"Version '{version_name}' not found.")
+                tree = git_tree_resolver.list_tree(vname) or {}
+                sha = tree.get(norm_path)
+                blob = git_tree_resolver.map_blob_hashes(cursor, [sha]).get(sha) if sha else None
+                if not blob:
+                    raise HTTPException(status_code=404, detail=f"'{norm_path}' is not indexed at '{vname}'.")
+                conds = ["bt.blob_id = %s"]
+                params: list[Any] = [blob[0]]
+                if line:
+                    conds.append("bt.line_s <= %s AND bt.line_e >= %s")
+                    params += [line, line]
+                if ast_id:
+                    conds.append("t.ast_id = %s")
+                    params.append(ast_id)
+                cursor.execute(
+                    f"""
+                    SELECT bt.tag_id
+                    FROM m_bridge_tag bt
+                    JOIN m_tag t ON t.tag_id = bt.tag_id
+                    WHERE {' AND '.join(conds)}
+                    ORDER BY (bt.line_e - bt.line_s) ASC
+                    LIMIT 1;
+                    """,
+                    params,
+                )
+                row = cursor.fetchone()
+                if not row:
+                    raise HTTPException(status_code=404, detail=f"No indexed symbol at {norm_path}:{line or '?'} in '{vname}'.")
+                tag_id = row["tag_id"]
+
+            cursor.execute(
+                """
+                SELECT t.tag_id, t.ast_id, a.name AS ast_name
                 FROM m_tag t
                 JOIN m_ast a ON t.ast_id = a.ast_id
                 WHERE t.tag_id = %s
@@ -379,34 +597,112 @@ class SymbolService:
             tag_row = cursor.fetchone()
             if not tag_row:
                 raise HTTPException(status_code=404, detail=f"Tag {tag_id} not found.")
+            anchor_ast = tag_row["ast_id"]
 
-            # Find forward and backward evolutionary links
             cursor.execute("SELECT e_tag_id FROM m_moved_tag WHERE s_tag_id = %s;", (tag_id,))
             forward = [r["e_tag_id"] for r in cursor.fetchall()]
-
             cursor.execute("SELECT s_tag_id FROM m_moved_tag WHERE e_tag_id = %s;", (tag_id,))
             backward = [r["s_tag_id"] for r in cursor.fetchall()]
 
-            lineage = [tag_id] + forward + backward
-            # Build timeline mock snapshots
-            timeline_snaps = [
-                {"vname": "v3.0", "tag_id": tag_id, "status": "unchanged", "lines_added": 0, "diff": []},
-                {"vname": "v3.3", "tag_id": tag_id, "status": "unchanged", "lines_added": 0, "diff": []},
-                {"vname": "v3.4", "tag_id": forward[0] if forward else tag_id, "status": "modified", "lines_added": 2, "diff": [{"type": "add", "text": "net struct"}]},
-            ]
+            # 2. Indexed versions of the active repository, oldest first
+            cursor.execute(
+                """
+                SELECT r.ref_name, r.commit_id
+                FROM m_git_ref r
+                LEFT JOIN m_commit c ON c.commit_id = r.commit_id
+                WHERE r.commit_id > 0 AND r.repo_id = %s
+                ORDER BY c.committer_date ASC, r.commit_id ASC;
+                """,
+                (get_active_repo_id(cursor),),
+            )
+            versions = [(safe_decode(r["ref_name"]), r["commit_id"]) for r in cursor.fetchall()]
 
-            return {
-                "tag_id": tag_id,
-                "ast_id": tag_row["ast_id"],
-                "ast_name": safe_decode(tag_row["ast_name"]),
-                "vid_s": tag_row["vid_s"],
-                "vid_e": tag_row["vid_e"],
-                "moved_to": forward[0] if forward else None,
-                "moved_from": backward[0] if backward else None,
-                "lineage_tag_ids": lineage,
-                "total_versions": 11,
-                "timeline": timeline_snaps,
-            }
+            # 3. Blob of the file at each version (Git tree → m_file_blob by content hash)
+            version_sha: dict[str, str | None] = {}
+            for vname_i, _ in versions:
+                tree = git_tree_resolver.list_tree(vname_i)
+                version_sha[vname_i] = tree.get(norm_path) if tree else None
+            blob_meta = git_tree_resolver.map_blob_hashes(cursor, [s for s in version_sha.values() if s])
+            blob_ids = sorted({blob_meta[s][0] for s in version_sha.values() if s and s in blob_meta})
+
+            # 4. Tags with the anchor's AST identity in each of those blobs
+            tags_by_blob: dict[int, list[dict[str, Any]]] = {}
+            if blob_ids:
+                fmt = ",".join(["%s"] * len(blob_ids))
+                cursor.execute(
+                    f"""
+                    SELECT bt.blob_id, bt.tag_id, bt.line_s, bt.line_e
+                    FROM m_bridge_tag bt
+                    JOIN m_tag t ON t.tag_id = bt.tag_id
+                    WHERE bt.blob_id IN ({fmt}) AND t.ast_id = %s
+                    ORDER BY bt.line_s ASC;
+                    """,
+                    [*blob_ids, anchor_ast],
+                )
+                for r in cursor.fetchall():
+                    tags_by_blob.setdefault(r["blob_id"], []).append(r)
+
+        timeline: list[dict[str, Any]] = []
+        prev_tag: int | None = None
+        prev_snippet = ""
+        present_count = 0
+        for vname_i, vid_i in versions:
+            sha = version_sha.get(vname_i)
+            entry: dict[str, Any] = {"vname": vname_i, "vid": vid_i, "tag_id": None, "line_s": None, "line_e": None, "lines_added": 0, "lines_removed": 0, "diff": []}
+            if sha is None:
+                entry["status"] = "removed" if prev_tag is not None else "absent"
+                prev_tag = None
+                timeline.append(entry)
+                continue
+            blob = blob_meta.get(sha)
+            if blob is None:
+                entry["status"] = "unindexed"
+                timeline.append(entry)
+                continue
+            candidates = tags_by_blob.get(blob[0], [])
+            if not candidates:
+                entry["status"] = "removed" if prev_tag is not None else "absent"
+                prev_tag = None
+                timeline.append(entry)
+                continue
+            # Prefer the anchor tag (or a lineage member) when the blob holds several matches
+            lineage = {tag_id, *forward, *backward}
+            match = next((c for c in candidates if c["tag_id"] in lineage), candidates[0])
+            entry.update({"tag_id": match["tag_id"], "line_s": match["line_s"], "line_e": match["line_e"], "blob_id": blob[0]})
+            present_count += 1
+
+            snippet = ""
+            if prev_tag is None or match["tag_id"] != prev_tag:
+                raw, _, _ = git_reader.read_file(vname_i, norm_path)
+                if raw is not None:
+                    lines = raw.decode("utf-8", errors="replace").splitlines()
+                    snippet = "\n".join(lines[max(0, match["line_s"] - 1): match["line_e"]])
+            if prev_tag is None:
+                entry["status"] = "added" if timeline and any(t.get("tag_id") for t in timeline) else "introduced"
+                prev_snippet = snippet
+            elif match["tag_id"] == prev_tag:
+                entry["status"] = "unchanged"
+            else:
+                entry["status"] = "modified"
+                diff = _compute_structured_diff(prev_snippet, snippet)
+                entry["diff"] = [d for d in diff if d["type"] != "ctx"]
+                entry["lines_added"] = sum(1 for d in diff if d["type"] == "add")
+                entry["lines_removed"] = sum(1 for d in diff if d["type"] == "del")
+                prev_snippet = snippet
+            prev_tag = match["tag_id"]
+            timeline.append(entry)
+
+        return {
+            "tag_id": tag_id,
+            "ast_id": anchor_ast,
+            "ast_name": safe_decode(tag_row["ast_name"]),
+            "path": norm_path,
+            "moved_to": forward[0] if forward else None,
+            "moved_from": backward[0] if backward else None,
+            "lineage_tag_ids": [tag_id] + forward + backward,
+            "total_versions": present_count,
+            "timeline": timeline,
+        }
 
     def get_include_symbols(
         self,
@@ -438,12 +734,12 @@ class SymbolService:
                 cursor.execute(
                     """
                     SELECT a.ast_id
-                    FROM m_bridge_file bf
-                    JOIN m_file_name fn ON bf.fnid = fn.fnid
-                    JOIN m_bridge_tag bt ON bf.fid = bt.fid
+                    FROM m_bridge_checkpoint bc
+                    JOIN m_file_name fn ON bc.fnid = fn.fnid
+                    JOIN m_bridge_tag bt ON bc.blob_id = bt.blob_id
                     JOIN m_tag t ON bt.tag_id = t.tag_id
                     JOIN m_ast a ON t.ast_id = a.ast_id
-                    WHERE bf.vid = %s AND fn.fname = %s AND a.type_id = 78
+                    WHERE bc.commit_id = %s AND fn.fname = %s AND a.type_id = 78
                       AND bt.line_s <= %s AND bt.line_e >= %s
                     LIMIT 1;
                     """,
@@ -459,12 +755,12 @@ class SymbolService:
                 cursor.execute(
                     """
                     SELECT a.ast_id
-                    FROM m_bridge_file bf
-                    JOIN m_file_name fn ON bf.fnid = fn.fnid
-                    JOIN m_bridge_tag bt ON bf.fid = bt.fid
+                    FROM m_bridge_checkpoint bc
+                    JOIN m_file_name fn ON bc.fnid = fn.fnid
+                    JOIN m_bridge_tag bt ON bc.blob_id = bt.blob_id
                     JOIN m_tag t ON bt.tag_id = t.tag_id
                     JOIN m_ast a ON t.ast_id = a.ast_id
-                    WHERE bf.vid = %s AND fn.fname = %s AND a.type_id = 78
+                    WHERE bc.commit_id = %s AND fn.fname = %s AND a.type_id = 78
                       AND a.name LIKE %s
                     LIMIT 1;
                     """,
@@ -549,11 +845,11 @@ class SymbolService:
                 header_dir = (os.path.dirname(header_file) + "/%") if header_file else "%"
                 cursor.execute(
                     f"""
-                    SELECT d.name, d.type_id, d.fid, d.line_s, d.line_e, fn.fname
+                    SELECT d.name, d.type_id, d.blob_id AS fid, d.line_s, d.line_e, fn.fname
                     FROM m_symbol_def d
-                    JOIN m_bridge_file bf ON d.fid = bf.fid AND bf.vid = d.vid
-                    JOIN m_file_name fn ON bf.fnid = fn.fnid
-                    WHERE d.vid = %s AND d.name IN ({format_strings})
+                    LEFT JOIN m_bridge_checkpoint bc ON d.blob_id = bc.blob_id AND bc.commit_id = %s
+                    LEFT JOIN m_file_name fn ON bc.fnid = fn.fnid
+                    WHERE d.name IN ({format_strings})
                     ORDER BY
                         CASE
                             WHEN fn.fname = %s THEN 0

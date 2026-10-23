@@ -30,6 +30,10 @@ _CLANG_GET_CURSOR_EXTENT = cc.conf.lib.clang_getCursorExtent
 _CLANG_GET_CURSOR_EXTENT.argtypes = [cc.Cursor]
 _CLANG_GET_CURSOR_EXTENT.restype = cc.SourceRange
 
+_CLANG_GET_CURSOR_LOC = cc.conf.lib.clang_getCursorLocation
+_CLANG_GET_CURSOR_LOC.argtypes = [cc.Cursor]
+_CLANG_GET_CURSOR_LOC.restype = cc.SourceLocation
+
 _CLANG_GET_RANGE_START = cc.conf.lib.clang_getRangeStart
 _CLANG_GET_RANGE_START.argtypes = [cc.SourceRange]
 _CLANG_GET_RANGE_START.restype = cc.SourceLocation
@@ -61,6 +65,18 @@ _CLANG_GET_FILE_LOC.restype = None
 _CLANG_GET_TOKEN_KIND = cc.conf.lib.clang_getTokenKind
 _CLANG_GET_TOKEN_KIND.argtypes = [cc.Token]
 _CLANG_GET_TOKEN_KIND.restype = ctypes.c_uint
+
+_CLANG_CURSOR_IS_NULL = cc.conf.lib.clang_Cursor_isNull
+_CLANG_CURSOR_IS_NULL.argtypes = [cc.Cursor]
+_CLANG_CURSOR_IS_NULL.restype = ctypes.c_int
+
+_CLANG_GET_CURSOR_REFERENCED = cc.conf.lib.clang_getCursorReferenced
+_CLANG_GET_CURSOR_REFERENCED.argtypes = [cc.Cursor]
+_CLANG_GET_CURSOR_REFERENCED.restype = cc.Cursor
+
+_CLANG_VISIT_CHILDREN = cc.conf.lib.clang_visitChildren
+_CLANG_VISIT_CHILDREN.argtypes = [cc.Cursor, cc.cursor_visit_callback, ctypes.py_object]
+_CLANG_VISIT_CHILDREN.restype = ctypes.c_uint
 
 _CLANG_TOKEN_KIND_MAP = (
     AST_KIND.punctuation,

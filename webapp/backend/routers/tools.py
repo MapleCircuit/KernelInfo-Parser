@@ -14,6 +14,8 @@ diff_service = DiffService()
 
 @router.get("/struct/layout")
 @router.get("/tools/{version_name}/pahole/{struct_name}")
+@router.get("/version/{version_name}/struct/layout/{struct_name}")
+@router.get("/version/{version_name}/pahole/{struct_name}")
 def get_struct_layout(
     version: str = Query("v3.0", alias="version_name"),
     name: str = Query(None, alias="struct_name"),
@@ -35,12 +37,13 @@ def get_callgraph(version_name: str, function_name: str) -> dict[str, Any]:
 
 @router.get("/version/diff")
 @router.get("/tools/diff/versions")
+@router.get("/diff/versions/{v1}/{v2}")
 def get_version_diff(
-    v1: str = Query(None),
-    v2: str = Query(None),
+    v1: str | None = None,
+    v2: str | None = None,
     path: str = Query(""),
-    version_a: str = Query(None),
-    version_b: str = Query(None),
+    version_a: str | None = Query(None),
+    version_b: str | None = Query(None),
 ) -> dict[str, Any]:
     """Compare file changes across two releases."""
     va = version_a or v1 or "v3.0"
@@ -48,12 +51,27 @@ def get_version_diff(
     return diff_service.get_versions_diff(va, vb, path)
 
 
+@router.get("/tools/diff/file")
+@router.get("/diff/file")
+def get_file_diff(
+    version_a: str = Query(...),
+    version_b: str = Query(...),
+    path: str = Query(...),
+    old_path: str = Query(""),
+) -> dict[str, Any]:
+    """Unified diff of a single file between two releases or commits."""
+    return diff_service.get_file_diff(version_a, version_b, path, old_path)
+
+
 @router.get("/version/diff/kconfig")
 @router.get("/tools/{version_name}/diff/kconfig")
+@router.get("/diff/kconfig/{v1}/{v2}")
 def get_kconfig_diff(
     version_name: str = "v3.0",
-    v1: str = Query("v3.0"),
-    v2: str = Query("v3.0"),
+    v1: str | None = None,
+    v2: str | None = None,
 ) -> dict[str, Any]:
     """Compare KConfig symbol definitions and default values across two kernel releases."""
-    return diff_service.get_kconfig_diff(v1, v2)
+    ver1 = v1 or version_name or "v3.0"
+    ver2 = v2 or "v3.0"
+    return diff_service.get_kconfig_diff(ver1, ver2)

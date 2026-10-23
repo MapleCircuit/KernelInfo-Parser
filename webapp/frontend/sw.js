@@ -2,7 +2,7 @@
  * sw.js - Service Worker for KernelInfo-Parser Developer Web Application.
  * Provides offline caching for application shell, static assets, and API requests.
  */
-const CACHE_NAME = "kernel-ide-v2";
+const CACHE_NAME = "kernel-ide-v7";
 const STATIC_ASSETS = [
   "/",
   "/app",
@@ -19,6 +19,7 @@ const STATIC_ASSETS = [
   "/static/css/commits.css",
   "/static/css/tools.css",
   "/static/css/modals.css",
+  "/static/css/docs.css",
   "/static/js/api.js",
   "/static/js/db.js",
   "/static/js/state.js",
@@ -28,6 +29,13 @@ const STATIC_ASSETS = [
   "/static/js/components/context_menu.js",
   "/static/js/utils/clipboard.js",
   "/static/js/components/toast.js",
+  "/static/js/components/ref_picker.js",
+  "/static/js/components/command_palette.js",
+  "/static/js/components/modal.js",
+  "/static/js/components/symbol_history_modal.js",
+  "/static/js/components/patch_modal.js",
+  "/static/js/components/file_history_modal.js",
+  "/static/js/utils/debounce.js",
   "/static/js/views/code_view/virtual_editor.js",
   "/static/js/views/code_view/fidelity_clipboard.js",
   "/static/js/views/code_view/ast_overlay.js",
@@ -44,7 +52,10 @@ const STATIC_ASSETS = [
   "/static/js/views/commits/commits_view.js",
   "/static/js/views/pahole/pahole_view.js",
   "/static/js/views/callgraph/callgraph_view.js",
-  "/static/js/views/diff/diff_view.js"
+  "/static/js/views/diff/diff_view.js",
+  "/static/js/views/docs/rst_renderer.js",
+  "/static/js/views/docs/doc_page.js",
+  "/static/js/views/treemap/treemap_view.js"
 ];
 
 self.addEventListener("install", (event) => {

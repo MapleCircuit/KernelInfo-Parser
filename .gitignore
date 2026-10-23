@@ -1,5 +1,6 @@
 .vscode
 .agents
+.claude
 .temp
 .ruff_cache
 Notes
@@ -7,3 +8,4 @@ __pycache__
 linux
 scratch
 config.json
+CLAUDE.md

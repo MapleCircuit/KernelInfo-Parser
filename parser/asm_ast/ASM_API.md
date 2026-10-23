@@ -17,8 +17,8 @@ Assembly Source (.S / .s / .h)
   ├─ Git Operation: "R100" (Exact Rename) ──► No-op (Reuses old fid automatically)
   │
   ├─ Git Operation: "D" (Deleted)
-  │  ├─ get_prior_tags(CS) ──► Queries old_vid tags via m_bridge_tag.view_get_multiple
-  │  └─ close_prior_tags(CS) ─► Closes unreferenced prior tags via m_tag.update(vid_e=Old_VID)
+  │  ├─ get_prior_tags(CS) ──► Queries old tags via m_bridge_tag.view_get_multiple
+  │  └─ close_prior_tags(CS) ─► No-op under immutable Git DAG architecture
   │
   └─ Git Operation: "A" / "M" / "R*" (Added / Modified / Content Rename)
      ├─ get_prior_tags(CS) (if M or R*)
@@ -56,16 +56,16 @@ Relational Extraction inside with CS(REF_NO_REF):
   │     ├── Tier 3-5: Proximity & anchor fallback matching
   │     │
   │     ├── Rule 12 Staging Order inside with CS(REF_POS):
-  │     │     ├── 1. m_tag.set(None, VID, 0, code_hash, ast_ref, 0, 0)  [MUST BE FIRST]
+  │     │     ├── 1. m_tag.set(None, code_hash, ast_ref, 0, 0)          [MUST BE FIRST, 5 columns]
   │     │     │      tag_ref = ((m_tag.table_id, 0), OP_REF, (REF_POS, CS.route[-1]))
   │     │     ├── 2. m_tag_code.get_set(code_hash, code_str)             [Auxiliary hash table]
   │     │     └── 3. m_moved_tag.set(s_tag_id, tag_ref)                  [If evolved tag match]
   │     │
-  │     ├── File-to-Tag Bridge: m_bridge_tag.set(fid, tag_ref, line_s, line_e, char_s, char_e)
+  │     ├── File-to-Tag Bridge: m_bridge_tag.set(blob_id, tag_ref, line_s, line_e, char_s, char_e)
   │     ├── Spatial AST Map: m_map_ast.set(tag_ref, 1, 1, rel_line_e, rel_char_e, ast_ref)
   │     └── Bridge Map Link: m_bridge_map.set(tag_ref, tag_ref)
   │
-  └─ close_prior_tags(CS) (if M or R*)
+  └─ close_prior_tags(CS): In zero-VID DAG, tags are immutable content records; tag closure is a no-op
 ==================================================================================================
 ```
 
@@ -95,8 +95,6 @@ Relational Extraction inside with CS(REF_NO_REF):
    with CS(REF_POS):
        CS.store(m_tag.set(
            None,            # tag_id (AUTO_INCREMENT)
-           CS.gp.VID,       # vid_s
-           0,               # vid_e (0 = active)
            code_hash,       # 32-byte binary SHA-256 digest
            ast_ref,         # reference to m_ast node
            0,               # hl_s
@@ -168,8 +166,8 @@ Assembly files contain a mixture of assembler directives, hardware instructions,
    - **Tier 3 (Bulk Renames)**: Refactoring prefix/suffix changes.
    - **Tier 4 (Positional Anchors)**: Relative position between unchanged sibling labels.
    - **Tier 5 (Line Proximity)**: Fallback line overlap (drift $\le 2$ lines).
-3. **Closing Obsolete Tags (`close_prior_tags(CS)`)**:
-   - Any prior tags not recycled or transitioned are closed via `m_tag.update(vid_e = Old_VID)` inside `with CS(REF_OLD):`.
+3. **Immutable Tag Closing (`close_prior_tags(CS)`)**:
+   - In the zero-VID DAG architecture, tags are immutable content records; `close_prior_tags(CS)` operates as a safe no-op.
 
 ---
 

@@ -97,37 +97,33 @@ def stage_file_prelude(cs: ChangeSet, gp_inst: Any) -> None:
     op = cs.file_operation
     ftype = cs.get_file_type() if hasattr(cs, "get_file_type") else 7
 
+    blob_hash = getattr(cs, "blob_hash", b"\x00" * 20)
+    commit_id = getattr(gp_inst, "VID", 1)
+    old_commit_id = getattr(gp_inst, "Old_VID", 0)
+
     if op == "A":
         cs.store(gp.m_file_name.get_set(None, cs.current_path))
-        cs.store(gp.m_file.set(None, gp_inst.VID, 0, ftype, "A", 0))
-        cs.store(gp.m_bridge_file.set(gp_inst.VID, cs.ref(gp.m_file_name.fnid), cs.ref(gp.m_file.fid)))
+        cs.store(gp.m_file.set(None, blob_hash, ftype))
+        cs.store(gp.m_bridge_file.set(commit_id, cs.ref(gp.m_file_name.fnid), cs.ref(gp.m_file.fid)))
     elif op == "M":
         cs.store(gp.m_file_name.get_set(None, cs.current_path))
         with cs(REF_OLD):
             cs.store(gp.m_bridge_file.view(
                 ((gp.m_bridge_file.fnid, gp.m_file_name.fnid, 1),),
-                gp_inst.Old_VID,
+                old_commit_id,
                 cs.ref(gp.m_file_name.fnid, REF_ROOT),
                 None,
                 None,
                 cs.current_path,
             ))
-            cs.store(gp.m_file.update(
-                cs.ref(gp.m_bridge_file.fid),
-                None,
-                gp_inst.Old_VID,
-                None,
-                None,
-                "M",
-            ))
-        cs.store(gp.m_file.set(None, gp_inst.VID, 0, ftype, "M", 0))
-        cs.store(gp.m_bridge_file.set(gp_inst.VID, cs.ref(gp.m_file_name.fnid), cs.ref(gp.m_file.fid)))
+        cs.store(gp.m_file.set(None, blob_hash, ftype))
+        cs.store(gp.m_bridge_file.set(commit_id, cs.ref(gp.m_file_name.fnid), cs.ref(gp.m_file.fid)))
     elif op == "R100":
         with cs(REF_OLD):
             cs.store(gp.m_file_name.get_set(None, cs.old_path))
             cs.store(gp.m_bridge_file.view(
                 ((gp.m_bridge_file.fnid, gp.m_file_name.fnid, 1),),
-                gp_inst.Old_VID,
+                old_commit_id,
                 cs.ref(gp.m_file_name.fnid),
                 None,
                 None,
@@ -135,7 +131,7 @@ def stage_file_prelude(cs: ChangeSet, gp_inst: Any) -> None:
             ))
         cs.store(gp.m_file_name.get_set(None, cs.current_path))
         cs.store(gp.m_bridge_file.set(
-            gp_inst.VID,
+            commit_id,
             cs.ref(gp.m_file_name.fnid),
             cs.ref(gp.m_bridge_file.fid, REF_OLD),
         ))
@@ -269,8 +265,52 @@ def extract_changeset_snapshot(
     normalized_tables = normalize_snapshot_ids(raw_tables, css, table_map)
     return {
         "test_conf": test_conf or {},
-        "tables": normalized_tables,
+        "tables": SnapshotTablesDict(normalized_tables),
     }
+
+
+class SnapshotTablesDict(dict):
+    """Dictionary supporting backward-compatible table and column name aliasing."""
+
+    def __contains__(self, key: Any) -> bool:
+        if super().__contains__(key):
+            return True
+        if key == "m_v_main" and "m_git_ref" in self:
+            return True
+        if key == "m_file" and "m_file_blob" in self:
+            return True
+        if key == "m_bridge_file" and "m_bridge_checkpoint" in self:
+            return True
+        return False
+
+    def __getitem__(self, key: Any) -> Any:
+        if super().__contains__(key):
+            return super().__getitem__(key)
+        if key == "m_v_main" and "m_git_ref" in self:
+            rows = super().__getitem__("m_git_ref")
+            return [
+                dict(r, vname=r.get("ref_name"), vid=r.get("commit_id"))
+                for r in rows
+            ]
+        if key == "m_file" and "m_file_blob" in self:
+            rows = super().__getitem__("m_file_blob")
+            return [
+                dict(r, fid=r.get("blob_id"))
+                for r in rows
+            ]
+        if key == "m_bridge_file" and "m_bridge_checkpoint" in self:
+            rows = super().__getitem__("m_bridge_checkpoint")
+            return [
+                dict(r, vid=r.get("commit_id"), fid=r.get("blob_id"))
+                for r in rows
+            ]
+        return super().__getitem__(key)
+
+    def get(self, key: Any, default: Any = None) -> Any:
+        try:
+            return self[key]
+        except KeyError:
+            return default
 
 
 def normalize_snapshot_ids(
@@ -298,8 +338,12 @@ def normalize_snapshot_ids(
                 ptag_id = ptag[6] if len(ptag) > 6 and ptag[6] is not None else (ptag[1] if len(ptag) > 1 else ptag[0])
                 if ptag_id is not None and ptag_id not in prior_tag_map:
                     prior_tag_map[ptag_id] = f"$prior_tag_{len(prior_tag_map)}"
-                if len(ptag) > 10 and ptag[10] is not None and ptag[10] not in prior_ast_map:
-                    prior_ast_map[ptag[10]] = f"$prior_ast_{len(prior_ast_map)}"
+                past_id = (
+                    ptag[8] if len(ptag) == 11 and ptag[8] is not None
+                    else (ptag[10] if len(ptag) > 10 and ptag[10] is not None else None)
+                )
+                if past_id is not None and past_id not in prior_ast_map:
+                    prior_ast_map[past_id] = f"$prior_ast_{len(prior_ast_map)}"
 
     # 2. Sequential first-appearance mapping for surrogate IDs based on insertion order
     if "m_file_name" in raw_tables:
@@ -311,6 +355,12 @@ def normalize_snapshot_ids(
     if "m_file" in raw_tables:
         for row in raw_tables["m_file"]:
             concrete_id = row.get("fid")
+            if concrete_id is not None and concrete_id not in fid_map:
+                fid_map[concrete_id] = f"$fid_{len(fid_map)}"
+
+    if "m_file_blob" in raw_tables:
+        for row in raw_tables["m_file_blob"]:
+            concrete_id = row.get("blob_id")
             if concrete_id is not None and concrete_id not in fid_map:
                 fid_map[concrete_id] = f"$fid_{len(fid_map)}"
 
@@ -397,6 +447,8 @@ def normalize_snapshot_ids(
             # File references
             if "fid" in new_r and new_r["fid"] in fid_map:
                 new_r["fid"] = fid_map[new_r["fid"]]
+            if "blob_id" in new_r and new_r["blob_id"] in fid_map:
+                new_r["blob_id"] = fid_map[new_r["blob_id"]]
             if "fnid" in new_r and new_r["fnid"] in fnid_map:
                 new_r["fnid"] = fnid_map[new_r["fnid"]]
 

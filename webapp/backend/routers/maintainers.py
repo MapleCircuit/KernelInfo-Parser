@@ -10,6 +10,7 @@ maintainer_service = MaintainerService()
 
 @router.get("/maintainers")
 @router.get("/maintainers/{version_name}/overview")
+@router.get("/version/{version_name}/maintainers")
 def get_maintainers(version: str = Query("v3.0"), q: str = Query(""), version_name: str | None = None) -> dict[str, Any]:
     """Search and list kernel subsystems."""
     v = version_name or version
@@ -18,6 +19,7 @@ def get_maintainers(version: str = Query("v3.0"), q: str = Query(""), version_na
 
 @router.get("/maintainers/section")
 @router.get("/maintainers/{version_name}/section/{sec_id}")
+@router.get("/version/{version_name}/maintainer/section/{sec_id}")
 def get_section(version: str = Query("v3.0"), sec_name: str | None = None, sec_id: int | str | None = None, version_name: str | None = None) -> dict[str, Any]:
     """Retrieve subsystem details, pattern rules, and members."""
     v = version_name or version
@@ -28,6 +30,8 @@ def get_section(version: str = Query("v3.0"), sec_name: str | None = None, sec_i
 @router.get("/maintainers/person")
 @router.get("/maintainers/{version_name}/person")
 @router.get("/maintainers/{version_name}/person/{person_id_or_email}")
+@router.get("/version/{version_name}/person/{person_id_or_email}")
+@router.get("/version/{version_name}/person")
 def get_person(
     version: str = Query("v3.0"),
     person_id: int | str | None = Query(None),
@@ -48,6 +52,8 @@ def get_person(
 
 @router.post("/maintainers/match")
 @router.post("/maintainers/{version_name}/match")
+@router.post("/version/{version_name}/patch/maintainers")
+@router.post("/patch/maintainers")
 def match_maintainers(payload: dict[str, Any] = Body(...), version_name: str = "v3.0") -> dict[str, Any]:
     """Emulate get_maintainer.pl on file paths or patch content."""
     paths = payload.get("paths") or payload.get("touched_files") or []
@@ -57,6 +63,7 @@ def match_maintainers(payload: dict[str, Any] = Body(...), version_name: str = "
 
 @router.get("/credits")
 @router.get("/maintainers/{version_name}/credits")
+@router.get("/version/{version_name}/credits")
 def get_credits(version: str = Query("v3.0"), q: str = Query(""), version_name: str | None = None) -> dict[str, Any]:
     """Search historical CREDITS directory."""
     v = version_name or version

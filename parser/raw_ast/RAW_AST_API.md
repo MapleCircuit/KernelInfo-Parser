@@ -12,7 +12,7 @@ The Fallback Raw AST parser (`raw_ast.py`) serves as the universal parser for fi
 1. **Full-Extent Tagging**: Wraps the entire content of the raw file in a single cohesive occurrence tag (`m_tag`) spanning from line 1, char 1 to `line_count`, `last_char_count`.
 2. **Cryptographic Identity**: Computes deterministic SHA-256 hashes (`BINARY(32)` digest for `m_tag.hash` and hexadecimal string for `m_ast.name` with `ASTT.Raw_Content`).
 3. **Cross-Version Tag Recycling**: Detects identical content across kernel releases and recycles existing `tag_id`s into new `m_bridge_file` / `m_bridge_tag` links with zero duplicate `m_tag`, `m_ast`, or `m_tag_code` database entries.
-4. **History & Evolution Tracking**: When content changes across versions, records transitional links via `m_moved_tag(s_tag_id, tag_ref)` and closes obsolete prior tags with `vid_e = Old_VID`.
+4. **History & Evolution Tracking**: When content changes across versions, records transitional links via `m_moved_tag(s_tag_id, tag_ref)`. Under the immutable Git DAG architecture, prior tags are permanent content records; tag closure is a no-op.
 
 ```
 ==================================================================================================
@@ -20,11 +20,11 @@ RAW AST PIPELINE (raw_ast.py)
 --------------------------------------------------------------------------------------------------
 Raw / Fallback File (T_RAW, T_MAINTAINERS, T_CREDITS, etc.)
   │
-  ├─ Git Operation: "R100" (Exact Rename) ──► No-op (Reuses old fid automatically)
+  ├─ Git Operation: "R100" (Exact Rename) ──► No-op (Reuses old blob automatically)
   │
   ├─ Git Operation: "D" (Deleted)
-  │  ├─ get_prior_tags(CS) ──► Queries old_vid tags via m_bridge_tag.view_get_multiple
-  │  └─ close_prior_tags(CS) ─► Closes unreferenced prior tags via m_tag.update(vid_e=Old_VID)
+  │  ├─ get_prior_tags(CS) ──► Queries old_vid tags via 2-way join (m_bridge_tag -> m_tag)
+  │  └─ close_prior_tags(CS) ─► No-op under immutable Git DAG architecture
   │
   └─ Git Operation: "A" / "M" / "R*" (Added / Modified / Content Rename)
      ├─ get_prior_tags(CS) (if M or R*)
@@ -37,20 +37,20 @@ Raw / Fallback File (T_RAW, T_MAINTAINERS, T_CREDITS, etc.)
      │  ├─ Check Recycled Hash:
      │  │  └─ If content_hash in prior_tags_map:
      │  │     ├─ Mark prior tag active (CS.active_tag_list.add(x))
-     │  │     └─ m_bridge_tag.set(fid, recycled_tag_id, 1, line_count, 1, last_char_count)
+     │  │     └─ m_bridge_tag.set(blob_id, recycled_tag_id, 1, line_count, 1, last_char_count)
      │  │        [Zero duplicate m_tag or m_ast created]
      │  │
      │  └─ New Content / Modified Tag:
      │     ├─ m_ast.view(((m_ast.ast_id,),), None, content_hex, ASTT.Raw_Content) [Rule 23]
      │     ├─ with CS(REF_POS):
-     │     │  ├─ m_tag.set(None, VID, 0, content_hash, ast_ref, 0, 0) [Rule 12]
+     │     │  ├─ m_tag.set(None, content_hash, ast_ref, 0, 0) [5-col, Rule 12]
      │     │  ├─ m_tag_code.get_set(content_hash, content)
      │     │  └─ m_moved_tag.set(s_tag_id, tag_ref) (if modifying prior tag)
-     │     ├─ m_bridge_tag.set(fid, tag_ref, 1, line_count, 1, last_char_count)
+     │     ├─ m_bridge_tag.set(blob_id, tag_ref, 1, line_count, 1, last_char_count)
      │     ├─ m_map_ast.set(tag_ref, 1, 1, line_count, last_char_count, ast_ref)
      │     └─ m_bridge_map.set(tag_ref, tag_ref)
      │
-     └─ close_prior_tags(CS) (if M or R*)
+     └─ close_prior_tags(CS) (if M or R*, no-op)
 ==================================================================================================
 ```
 
@@ -69,10 +69,10 @@ Primary entry point dispatched by `main.py` when processing files typed as `T_RA
   - `CS.file_operation == "M"` or partial rename (`"R*"`):
     1. `get_prior_tags(CS)`: Queries and indexes tags from `Old_VID`.
     2. `RawManager(CS)`: Reconciles content hash; recycles existing tag or creates replacement tag with `m_moved_tag` link.
-    3. `close_prior_tags(CS)`: Closes any prior tags that were not recycled.
+    3. `close_prior_tags(CS)`: No-op under immutable Git DAG architecture.
   - `CS.file_operation == "D"`:
     1. `get_prior_tags(CS)`: Retrieves active tags from `Old_VID`.
-    2. `close_prior_tags(CS)`: Updates prior tags with `vid_e = Old_VID`.
+    2. `close_prior_tags(CS)`: No-op under immutable Git DAG architecture.
 
 ---
 
@@ -83,7 +83,7 @@ Queries TableEngine for existing active tags registered for the file in the prec
   1. Resolves filename: uses `CS.old_path` for renames (`R*`), otherwise `CS.current_path`.
   2. Resolves `fnid`: `m_file_name.get(None, lookup_path)`.
   3. Resolves `old_fid`: `m_bridge_file.get(old_vid, fnid, None)`.
-  4. Queries prior tags:
+  4. Queries prior tags via 11-column 2-way join (`m_bridge_tag` -> `m_tag`):
      ```python
      CS.prior_tags = m_bridge_tag.view_get_multiple(
          ((m_bridge_tag.tag_id, m_tag.tag_id, 1),),
@@ -94,38 +94,18 @@ Queries TableEngine for existing active tags registered for the file in the prec
          None,  # 4: m_bridge_tag.char_s
          None,  # 5: m_bridge_tag.char_e
          None,  # 6: m_tag.tag_id
-         None,  # 7: m_tag.vid_s
-         None,  # 8: m_tag.vid_e
-         None,  # 9: m_tag.code (hash)
-         None,  # 10: m_tag.ast_id
-         None,  # 11: m_tag.hl_s
-         None,  # 12: m_tag.hl_l
+         None,  # 7: m_tag.hash
+         None,  # 8: m_tag.ast_id
+         None,  # 9: m_tag.hl_s
+         None,  # 10: m_tag.hl_l
      )
      ```
-  5. Populates `CS.prior_tags_map = {code_hash: [(idx, tag_id), ...]}`.
+  5. Populates `CS.prior_tags_map = {code_hash: [(idx, tag_id), ...]}` where `code_hash = tag[7]`.
 
 ---
 
 ### 2.3. `close_prior_tags(CS: ChangeSet) -> None`
-Scans `CS.prior_tags` and marks any tag index not present in `CS.active_tag_list` as closed by staging an update with `vid_e = CS.gp.Old_VID`.
-
-- **Staging Pattern**:
-  ```python
-  with CS(REF_OLD):
-      for x, tag in enumerate(CS.prior_tags):
-          if x in CS.active_tag_list:
-              continue
-          with CS(REF_POS):
-              CS.store(m_tag.update(
-                  tag[6],          # m_tag.tag_id
-                  tag[7],          # m_tag.vid_s
-                  CS.gp.Old_VID,   # m_tag.vid_e
-                  tag[9],          # m_tag.hash
-                  tag[10],         # m_tag.ast_id
-                  tag[11],         # m_tag.hl_s
-                  tag[12],         # m_tag.hl_l
-              ))
-  ```
+Under the Git DAG architecture, prior tags are immutable and preserved content-addressably across history. `close_prior_tags(CS)` operates as a clean no-op.
 
 ---
 
@@ -152,8 +132,6 @@ with CS(REF_POS):
 with CS(REF_POS):
     CS.store(m_tag.set(
         None,
-        CS.gp.VID,
-        0,
         content_hash,
         ast_ref,
         0,
@@ -217,6 +195,6 @@ The fallback raw AST parser is verified through the reusable snapshot testing ha
   - `assert_snapshot_matches(test_case, parser_name, test_name, snapshot)`: Verifies extracted ChangeSet tables and `test_conf` metadata against verified JSON baselines. Set `UPDATE_SNAPSHOTS=1` in the environment to re-generate baselines after human verification.
 - **Test Suite**: `unit_test/test_raw_parser.py`
   - `test_01_added_raw_file`: Added (`A`) file parsing, verifying creation of `m_v_main`, file prelude, `m_ast`, `m_tag`, `m_tag_code`, `m_bridge_tag`, `m_map_ast`, and `m_bridge_map`.
-  - `test_02_modified_changed_raw_file`: Modified (`M`) file parsing across `v2.6.39` -> `v3.0`, validating evolutionary links via `m_moved_tag`, retention of both `m_tag_code` records, and prior tag closure (`vid_e=Old_VID`).
+  - `test_02_modified_changed_raw_file`: Modified (`M`) file parsing across `v2.6.39` -> `v3.0`, validating evolutionary links via `m_moved_tag`, retention of both `m_tag_code` records, and tag continuity.
   - `test_03_exact_rename_raw_file`: Exact rename (`R100`) file parsing across `v2.6.39` -> `v3.0`, verifying `m_v_main` progression, old `fid` reuse, dual `m_bridge_file` links, and zero duplicate AST tags.
 - **Snapshot Storage**: `unit_test/snapshots/raw_ast/*.json` containing `test_conf` metadata and `tables` mapping.

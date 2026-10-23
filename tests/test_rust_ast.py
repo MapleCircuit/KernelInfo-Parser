@@ -56,6 +56,9 @@ from parser.rust_ast.rust_ast_type import (
 )
 from parser.rust_ast.rust_tree_parser import parse_rust_ast_tree, parse_span_coords
 from parser.rust_ast.rust_ast import rust_ast_parse, get_prior_tags, close_prior_tags
+from core.config import get_default_repo_path
+
+LINUX_REPO = str(get_default_repo_path())
 
 
 SAMPLE_COMPREHENSIVE_RUST = """//! Comprehensive test module for Rust AST constructs.
@@ -268,7 +271,7 @@ class TestRustChangeSetExecution(unittest.TestCase):
         G.CURRENT_PARSING_FILE = file_path
 
         cs.store(m_file_name.get_set(None, cs.current_path))
-        cs.store(m_file.set(None, self.gp.VID, 0, 3, "A", 0))
+        cs.store(m_file.set(None, getattr(cs, "blob_hash", b"\x00" * 20), 3))
         cs.store(m_bridge_file.set(self.gp.VID, cs.ref(m_file_name.fnid), cs.ref(m_file.fid)))
 
         cs.parse()
@@ -282,7 +285,7 @@ class TestRustChangeSetExecution(unittest.TestCase):
         file_path = "drivers/android/binder/stats.rs"
         full_path = os.path.join(self.temp_dir, file_path)
         os.makedirs(os.path.dirname(full_path), exist_ok=True)
-        content = subprocess.check_output(["git", "-C", "linux", "show", f"v7.2:{file_path}"])
+        content = subprocess.check_output(["git", "-C", LINUX_REPO, "show", f"v7.2:{file_path}"])
         with open(full_path, "wb") as f:
             f.write(content)
 
@@ -293,7 +296,7 @@ class TestRustChangeSetExecution(unittest.TestCase):
         G.CURRENT_PARSING_FILE = file_path
 
         cs.store(m_file_name.get_set(None, cs.current_path))
-        cs.store(m_file.set(None, self.gp.VID, 0, 3, "A", 0))
+        cs.store(m_file.set(None, getattr(cs, "blob_hash", b"\x00" * 20), 3))
         cs.store(m_bridge_file.set(self.gp.VID, cs.ref(m_file_name.fnid), cs.ref(m_file.fid)))
 
         cs.parse()
@@ -306,7 +309,7 @@ class TestRustChangeSetExecution(unittest.TestCase):
         file_path = "drivers/android/binder/defs.rs"
         full_path = os.path.join(self.temp_dir, file_path)
         os.makedirs(os.path.dirname(full_path), exist_ok=True)
-        content = subprocess.check_output(["git", "-C", "linux", "show", f"v7.2:{file_path}"])
+        content = subprocess.check_output(["git", "-C", LINUX_REPO, "show", f"v7.2:{file_path}"])
         with open(full_path, "wb") as f:
             f.write(content)
 
@@ -317,7 +320,7 @@ class TestRustChangeSetExecution(unittest.TestCase):
         G.CURRENT_PARSING_FILE = file_path
 
         cs.store(m_file_name.get_set(None, cs.current_path))
-        cs.store(m_file.set(None, self.gp.VID, 0, 3, "A", 0))
+        cs.store(m_file.set(None, getattr(cs, "blob_hash", b"\x00" * 20), 3))
         cs.store(m_bridge_file.set(self.gp.VID, cs.ref(m_file_name.fnid), cs.ref(m_file.fid)))
 
         cs.parse()
@@ -330,7 +333,7 @@ class TestRustChangeSetExecution(unittest.TestCase):
         file_path = "drivers/block/rnull/rnull.rs"
         full_path = os.path.join(self.temp_dir, file_path)
         os.makedirs(os.path.dirname(full_path), exist_ok=True)
-        content = subprocess.check_output(["git", "-C", "linux", "show", f"v7.2:{file_path}"])
+        content = subprocess.check_output(["git", "-C", LINUX_REPO, "show", f"v7.2:{file_path}"])
         with open(full_path, "wb") as f:
             f.write(content)
 
@@ -341,7 +344,7 @@ class TestRustChangeSetExecution(unittest.TestCase):
         G.CURRENT_PARSING_FILE = file_path
 
         cs.store(m_file_name.get_set(None, cs.current_path))
-        cs.store(m_file.set(None, self.gp.VID, 0, 3, "A", 0))
+        cs.store(m_file.set(None, getattr(cs, "blob_hash", b"\x00" * 20), 3))
         cs.store(m_bridge_file.set(self.gp.VID, cs.ref(m_file_name.fnid), cs.ref(m_file.fid)))
 
         cs.parse()
@@ -354,7 +357,7 @@ class TestRustChangeSetExecution(unittest.TestCase):
         file_path = "rust/kernel/sync.rs"
         full_path = os.path.join(self.temp_dir, file_path)
         os.makedirs(os.path.dirname(full_path), exist_ok=True)
-        content = subprocess.check_output(["git", "-C", "linux", "show", f"v7.2:{file_path}"])
+        content = subprocess.check_output(["git", "-C", LINUX_REPO, "show", f"v7.2:{file_path}"])
         with open(full_path, "wb") as f:
             f.write(content)
 
@@ -365,7 +368,7 @@ class TestRustChangeSetExecution(unittest.TestCase):
         G.CURRENT_PARSING_FILE = file_path
 
         cs.store(m_file_name.get_set(None, cs.current_path))
-        cs.store(m_file.set(None, self.gp.VID, 0, 3, "A", 0))
+        cs.store(m_file.set(None, getattr(cs, "blob_hash", b"\x00" * 20), 3))
         cs.store(m_bridge_file.set(self.gp.VID, cs.ref(m_file_name.fnid), cs.ref(m_file.fid)))
 
         cs.parse()
@@ -378,7 +381,7 @@ class TestRustChangeSetExecution(unittest.TestCase):
         file_path = "rust/kernel/lib.rs"
         full_path = os.path.join(self.temp_dir, file_path)
         os.makedirs(os.path.dirname(full_path), exist_ok=True)
-        content = subprocess.check_output(["git", "-C", "linux", "show", f"v7.2:{file_path}"])
+        content = subprocess.check_output(["git", "-C", LINUX_REPO, "show", f"v7.2:{file_path}"])
         with open(full_path, "wb") as f:
             f.write(content)
 
@@ -389,7 +392,7 @@ class TestRustChangeSetExecution(unittest.TestCase):
         G.CURRENT_PARSING_FILE = file_path
 
         cs.store(m_file_name.get_set(None, cs.current_path))
-        cs.store(m_file.set(None, self.gp.VID, 0, 3, "A", 0))
+        cs.store(m_file.set(None, getattr(cs, "blob_hash", b"\x00" * 20), 3))
         cs.store(m_bridge_file.set(self.gp.VID, cs.ref(m_file_name.fnid), cs.ref(m_file.fid)))
 
         cs.parse()
@@ -440,7 +443,7 @@ class TestRustTagLifecycle(unittest.TestCase):
         G.CURRENT_PARSING_FILE = file_path
 
         cs1.store(m_file_name.get_set(None, cs1.current_path))
-        cs1.store(m_file.set(None, 1, 0, 3, "A", 0))
+        cs1.store(m_file.set(None, getattr(cs1, "blob_hash", b"\x00" * 20), 3))
         cs1.store(m_bridge_file.set(1, cs1.ref(m_file_name.fnid), cs1.ref(m_file.fid)))
         cs1.parse()
         cs1.execute()
@@ -474,8 +477,7 @@ class TestRustTagLifecycle(unittest.TestCase):
                 None,
                 cs2.current_path,
             ))
-            cs2.store(m_file.update(cs2.ref(m_bridge_file.fid), None, 1, None, None, "M"))
-        cs2.store(m_file.set(None, 2, 0, 3, "M", 0))
+        cs2.store(m_file.set(None, getattr(cs2, "blob_hash", b"\x00" * 20), 3))
         cs2.store(m_bridge_file.set(2, cs2.ref(m_file_name.fnid), cs2.ref(m_file.fid)))
 
         cs2.parse()

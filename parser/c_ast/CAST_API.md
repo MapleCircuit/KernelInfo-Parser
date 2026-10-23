@@ -68,19 +68,19 @@ CSExtractor.extract_zone(CS, main_zone) -> main_zone.extract(CS) (cs_extractor.p
   │     ├── Tier 5: Spatial line overlap & proximity fallback (<= 2 lines) -> Transition tag_id
   │     │
   │     ├── Rule 12 Staging Order inside with CS(REF_POS):
-  │     │     ├── 1. m_tag.set(None, VID, 0, code_hash, ast_ref, 0, 0)  [MUST BE FIRST]
+  │     │     ├── 1. m_tag.set(None, code_hash, ast_ref, 0, 0)          [MUST BE FIRST, 5 columns: tag_id, hash, ast_id, hl_s, hl_l]
   │     │     │      tag_ref = ((m_tag.table_id, 0), OP_REF, (REF_POS, CS.route[-1]))
   │     │     ├── 2. m_tag_code.get_set(code_hash, code_str)             [Auxiliary hash table]
   │     │     └── 3. m_moved_tag.set(s_tag_id, tag_ref)                  [If evolved tag match]
   │     │
-  │     ├── File-to-Tag Bridge: m_bridge_tag.set(fid, tag_ref, line_s, line_e, char_s, char_e)
+  │     ├── File-to-Tag Bridge: m_bridge_tag.set(blob_id, tag_ref, line_s, line_e, char_s, char_e)
   │     ├── Spatial AST Map: m_map_ast.set(tag_ref, 1, 1, rel_line_e, rel_char_e, ast_ref)
   │     │     └── (rel_line_e and rel_char_e computed against self.endif for preprocessor branches)
   │     ├── Bridge Map Link: m_bridge_map.set(tag_ref, tag_ref) (deduped via register_bridge_map)
   │     └── Debug serialization: m_ast_debug.set (when G.OVERRIDE_FORCE_AST_DEBUG is True)
   │
   └── Tag Lifecycle Finalization: close_prior_tags(CS) (tag_tracker.py)
-        └── Marks unrecycled prior tags closed: m_tag.update(vid_e = Old_VID) in REF_OLD
+        └── Immutable zero-VID DAG: tags remain permanent content records; tag retirement/closure is a no-op
 ==================================================================================================
 ```
 
@@ -120,16 +120,17 @@ Coordinates Clang TranslationUnit instantiation, tokenization, and processing:
       f"-I{self.mfdir}/include",
       f"-I{self.mfdir}/include/uapi",
   ]
-  options = cc.TranslationUnit.PARSE_DETAILED_PROCESSING_RECORD + 32768
+  options = cc.TranslationUnit.PARSE_DETAILED_PROCESSING_RECORD + 32768 + 16384
   ```
   `_CLANG_KERNEL_MACRO_DEFINES` neutralizes kernel-specific attributes and lockdep annotations (`-D__KERNEL__`, `-D__user=`, `-D__init=`, `-D__exit=`, `-D__sched=`, `-D__weak=`, `-D__read_mostly=`, `-D__maybe_unused=`, `-D__always_unused=`, `-D__percpu=`, `-D__rcu=`, `-D__force=`, `-D__bitwise=`, `-D__bitwise__=`, `-D__nocast=`, `-D__iomem=`, `-D__must_check=`, `-D__deprecated=`, `-D__cpuinit=`, `-D__cpuinitdata=`, `-D__meminit=`, `-D__meminitdata=`, `-Dnoinline=`, `-D__always_inline=`, `-Dnotrace=`, `-D__kprobes=`, `-D__ref=`, `-D__pure=`, `-D__const=`, `-D__noreturn=`, `-D__malloc=`, `-Dasmlinkage=`, `-DFASTCALL=`, `-D__cold=`, `-D__hot=`, `-D__visible=`, `-D__releases(x)=`, `-D__acquires(x)=`, `-D__acquire(x)=`, `-D__release(x)=`, `-D__cond_lock(x,c)=(c)`, `-D__cacheline_aligned=`, `-D__cacheline_aligned_in_smp=`, `-D____cacheline_aligned=`, `-D____cacheline_aligned_in_smp=`, `-D__aligned(x)=`, `-Daligned(x)=`).
+  Options combine `PARSE_DETAILED_PROCESSING_RECORD` (1), `CXTranslationUnit_RetainExcludedConditionalBlocks` (32768), and `CXTranslationUnit_IgnoreNonErrorsFromIncludedFiles` (16384) to eliminate unused diagnostic generation for foreign headers.
 - Collects profiler metrics: `prof.clang_parse_tu_s`, `prof.clang_tokenize_s`.
 - Registers `CS.parsers["C_AM"] = self`.
 - Instantiates `TokenList` (subclass of `TokenStream`) and calls `TL.process_tokens(CS)`.
 
 ### 2.5 `TokenList`
 Compatibility adapter connecting `TokenStream` with `Zone` execution:
-- Extracts file-scoped cursors via `top_cursors = get_top_level_cursors(self.parsed_tu, self.fullfilename)`.
+- Receives pre-filtered `top_cursors` from `extract_include_symbols` (or extracts file-scoped cursors via `get_top_level_cursors(self.parsed_tu, self.fullfilename)` if unprovided).
 - Initializes `self.main_zone = Zone(Zone_Type.Full_File, top_cursors, tokens_array=self.tokens_array)`.
 - Sets `G.CURRENT_RAWFILE = self.rawfile`.
 - Loops tokens directly over `self.tokens_array` (bypassing `zip()` tuple allocation via pre-associated `token._cursor`):
@@ -138,6 +139,14 @@ Compatibility adapter connecting `TokenStream` with `Zone` execution:
 - Records `prof.token_processing_s`.
 - Dispatches `CSExtractor.extract_zone(self.CS, self.main_zone)`.
 - Immediate Teardown: Clears `self.main_zone`, `self.tokens_array`, `self.token_group`, `self.parsed_tu`, and pops `CS.parsers["C_AM"]` to immediately release all AST/token memory.
+
+### 2.6 High-Throughput Worker Optimizations
+- **C-Level Visitor Include Symbol & Top Cursor Traversal (`extract_include_symbols`)**: Direct inclusion headers are mapped to direct include lines via `CXFile` pointer integers in an inverted $O(1)$ dictionary (`ptr_to_direct_line`). The AST walk traverses descendants at C speed via `clang_visitChildren` (`_CLANG_VISIT_CHILDREN`), pruning node visitation strictly to symbol-referencing cursor kinds (`_REFERENCING_KIND_IDS`) and raw integer kinds (`_CURSOR_KIND_ID_MAP`), while checking null references with `_CLANG_CURSOR_IS_NULL`. Top-level cursors are filtered strictly via low-level ctypes `clang_getFileLocation` pointer matching against `target_ptr`, completely eliminating Python list allocations, string allocations, `os.path.realpath`, and redundant second passes over the TU's child cursors in `TokenList`.
+- **Token Ingestion & Cursor Deduplication (`tokenizer.py`)**: `TokenStream.__init__` deduplicates adjacent cursor references via fast integer kind and raw byte matching (`k_id == prev_kind and bytes(raw_c) == prev_bytes`), eliminating 5-attribute struct access overhead. Single-line tokens memoize the active source line string across consecutive tokens on the same line. `Line.grow`, `Line.new_end`, and `Line.new_end_reversed` perform direct type checks (`type(target) is Line`) bypassing MRO and dynamic `hasattr` checks. `Line.is_inside` unpacks coordinate tuples once to eliminate repeated tuple indexing. Escaped newline string checks are scoped strictly to multi-line tokens.
+- **C-Level Traversal for Used Types (`collect_cursor_used_types`)**: Employs static module-level ctypes callback `_CB_COLLECT_USED_TYPES` dispatched directly via `_CLANG_VISIT_CHILDREN`, eliminating recursive Python function calls and intermediate child list allocations. Type cleanups are memoized through `_CLEAN_TYPE_CACHE`.
+- **Relative Path Resolution Cache (`get_rel_file_for_cursor`)**: Caches resolved repository-relative file paths by `file_path` on `CS._rel_file_cache` and `_GLOBAL_REL_FILE_CACHE`, bypassing multi-branch string slicing, prefix testing, and path normalization across tens of thousands of cursor lookups.
+- **Direct FFI AST Reference Resolution (`resolve_cursor_type_ast`)**: Uses low-level `_CLANG_GET_CURSOR_REFERENCED` and `_CLANG_CURSOR_IS_NULL` direct bindings with raw integer `_kind_id` branching, eliminating `CursorKind` enum instantiation on high-frequency reference lookups.
+- **Foreign Symbol & File Resolution Cache (`resolve_cursor_foreign_info`)**: Caches resolved `(foreign_file, foreign_name)` tuples across all `TypeToken` branches (`struct`, `union`, `enum`, `typedef`, `functionproto`) in `_tu_foreign_type_cache` keyed by `(tspelling, current_file)` to eliminate redundant Clang AST pointee and declaration resolution. To guarantee strict translation unit hermeticity and prevent cross-file state leakage (e.g. between isolated sandbox parses and full-tree parses), `clear_tu_caches()` clears this cache before and after every `c_ast_parse` cycle, in `Ast_Manager` teardown, and in test harness `tearDown` methods.
 
 ---
 
@@ -186,6 +195,18 @@ _CLANG_GET_FILE_LOC.restype = None
 _CLANG_GET_TOKEN_KIND = cc.conf.lib.clang_getTokenKind
 _CLANG_GET_TOKEN_KIND.argtypes = [cc.Token]
 _CLANG_GET_TOKEN_KIND.restype = ctypes.c_uint
+
+_CLANG_CURSOR_IS_NULL = cc.conf.lib.clang_Cursor_isNull
+_CLANG_CURSOR_IS_NULL.argtypes = [cc.Cursor]
+_CLANG_CURSOR_IS_NULL.restype = ctypes.c_int
+
+_CLANG_GET_CURSOR_REFERENCED = cc.conf.lib.clang_getCursorReferenced
+_CLANG_GET_CURSOR_REFERENCED.argtypes = [cc.Cursor]
+_CLANG_GET_CURSOR_REFERENCED.restype = cc.Cursor
+
+_CLANG_VISIT_CHILDREN = cc.conf.lib.clang_visitChildren
+_CLANG_VISIT_CHILDREN.argtypes = [cc.Cursor, cc.cursor_visit_callback, ctypes.py_object]
+_CLANG_VISIT_CHILDREN.restype = ctypes.c_uint
 ```
 
 ### 3.2 Direct C-Pointer Ingestion & NULL FileID Bypass
@@ -602,7 +623,7 @@ class Zone_Type(IntEnum):
   - **Single Enclosing Composite Tag**:
     The enclosing `enum` construct produces a single top-level tag spanning the enum declaration (from `enum` through the closing `}` or `;`), adhering to Rule 19's composite construct tag invariant. Inner enumerator constants do not emit recursive sub-tags.
   - **Enumerator Symbol Definition Staging (`m_symbol_def`)**:
-    After emitting the enclosing enum's `tag_ref`, `C_Type.extract()` iterates through `Zone(Zone_Type.Enum_Content)` children and stages `m_symbol_def.set(vid, fid, tag_ref, child_ref, const_name, ASTT.C_enumequal, line_s, line_e)` for each enumerator constant, linking it to the enclosing enum's code tag while preserving its exact definition line coordinates.
+    After emitting the enclosing enum's `tag_ref`, `C_Type.extract()` iterates through `Zone(Zone_Type.Enum_Content)` children and stages `m_symbol_def.set(None, blob_ref, tag_ref, child_ref, const_name, ASTT.C_enumequal, SymbolLinkage.NoLinkage, line_s, line_e)` for each enumerator constant, linking it to the enclosing enum's code tag while preserving its exact definition line coordinates.
   - **Anonymous Enum Container Suppression**:
     For anonymous enums (`enum { FLAG_A, FLAG_B };`), Libclang generates synthetic container names (e.g. `(unnamed at ...)` or `(anonymous at ...)`). The parser suppresses anonymous enum containers from `m_symbol_def`, while registering and indexing all named enumerator constants.
   - **Enumerator Expression Usage Tracking (`m_symbol_ref`)**:
@@ -681,25 +702,8 @@ Incoming Modified AST Node Extent & Metadata
       └── Matches modified anonymous blocks based on line overlap or <= 2 line distance -> Emits m_moved_tag
 ```
 
-### 8.3 Obsolete Tag Closure (`close_prior_tags`)
-Iterates prior tags from previous version; any tag index not present in `CS.active_tag_list` is marked closed by emitting:
-```python
-with CS(REF_OLD):
-    for x, tag in enumerate(CS.prior_tags):
-        if x in active_set:
-            continue
-        if len(tag) >= 13:
-            with CS(REF_POS):
-                CS.store(m_tag.update(
-                    tag[6],      # m_tag.tag_id
-                    tag[7],      # m_tag.vid_s
-                    old_vid,     # m_tag.vid_e (marked closed)
-                    tag[9],      # m_tag.hash
-                    tag[10],     # m_tag.ast_id
-                    tag[11],     # m_tag.hl_s
-                    tag[12],     # m_tag.hl_l
-                ))
-```
+### 8.3 Prior Tag Lifecycle (`close_prior_tags`)
+Under the immutable Git DAG architecture, `m_tag` records are permanent, content-addressable entities; `close_prior_tags(CS)` operates as a clean no-op without mutating existing tag entries.
 
 ---
 
@@ -736,7 +740,7 @@ ast_ref = (
 
 # 4. Rule 12 Staging Invariant: m_tag.set MUST BE FIRST inside with CS(REF_POS):
 with CS(REF_POS):
-    CS.store(m_tag.set(None, CS.gp.VID, 0, code_hash, ast_ref, 0, 0))
+    CS.store(m_tag.set(None, code_hash, ast_ref, 0, 0))
     tag_ref = ((m_tag.table_id, 0), OP_REF, (REF_POS, CS.route[-1]))
     # Auxiliary tables staged after m_tag.set
     CS.store(m_tag_code.get_set(code_hash, code_str))
@@ -800,21 +804,27 @@ Defined in `core/globalstuff.py`, `STANDARD_C_KEYWORDS: dict[str, ASTT]` provide
 +----------------------------------------------------------------------------------------------------+
 | Table Name          | Table ID | Schema Columns                                                     |
 | ------------------- | :------: | ------------------------------------------------------------------ |
-| m_v_main            |    0     | (vid, vname)                                                       |
+| m_project           |    0     | (project_id, name, slug)                                           |
 | m_file_name         |    1     | (fnid, fname)                                                      |
-| m_file              |    2     | (fid, vid_s, vid_e, ftype, s_stat, e_stat)                         |
-| m_bridge_file       |    3     | (vid, fnid, fid)                                                   |
+| m_file_blob         |    2     | (blob_id, blob_hash, ftype) [aliased as m_file]                    |
+| m_bridge_checkpoint |    3     | (commit_id, fnid, blob_id) [aliased as m_bridge_file]              |
+| m_blob_transition   |    4     | (old_blob_id, new_blob_id) [aliased as m_moved_file]               |
 | m_type_descriptor   |    5     | (type_id, name)                                                    |
 | m_ast               |    6     | (ast_id, name, type_id)                                            |
 | m_ast_container     |    7     | (ast_id, priority, type_id, ref_ast_id)                            |
 | m_ast_include       |    8     | (ast_id, fnid)                                                     |
 | m_ast_debug         |    9     | (ast_id, ast_raw)                                                  |
 | m_tag_code          |   10     | (hash, code)                                                       |
-| m_tag               |   11     | (tag_id, vid_s, vid_e, hash, ast_id, hl_s, hl_l)                  |
-| m_bridge_tag        |   12     | (fid, tag_id, line_s, line_e, char_s, char_e)                      |
+| m_tag               |   11     | (tag_id, hash, ast_id, hl_s, hl_l)                                 |
+| m_bridge_tag        |   12     | (blob_id, tag_id, line_s, line_e, char_s, char_e)                  |
 | m_map_ast           |   13     | (map_id, line_s, char_s, line_e, char_e, ast_id)                   |
 | m_bridge_map        |   14     | (tag_id, map_id)                                                   |
+| m_ast_hash          |   15     | (hash, ast_id)                                                     |
 | m_moved_tag         |   30     | (s_tag_id, e_tag_id)                                               |
+| m_symbol_def        |   31     | (def_id, blob_id, tag_id, ast_id, name, type_id, linkage, line_s, line_e) |
+| m_symbol_ref        |   32     | (ref_id, blob_id, tag_id, ast_id, target_fnid, role, line, char_s)  |
+| m_file_reference    |   33     | (ref_id, source_blob_id, target_fnid, ref_type, line_no, details)  |
+| m_ast_attribute     |   35     | (ast_id, priority, name, val)                                      |
 +----------------------------------------------------------------------------------------------------+
 ```
 
@@ -823,7 +833,7 @@ Defined in `core/globalstuff.py`, `STANDARD_C_KEYWORDS: dict[str, ASTT]` provide
 ## 11. Critical Engine Invariants & AI Development Guidelines
 
 1. **Relative File Paths**: All file links and documentation references must use relative paths from git root (e.g. `parser/c_ast/cursor_tree.py`). Never use absolute machine file URIs.
-2. **Tag Reference Order Invariant**: Inside `with CS(REF_POS):`, `m_tag.set` MUST be the first staged operation so `tag_ref = ((m_tag.table_id, 0), OP_REF, (REF_POS, CS.route[-1]))` points directly to `m_tag`. Auxiliary tables (`m_tag_code.get_set`, `m_moved_tag.set`) must follow `m_tag.set`.
+2. **Tag Reference Order Invariant**: Inside `with CS(REF_POS):`, `m_tag.set(None, code_hash, ast_ref, 0, 0)` (5 columns: `tag_id, hash, ast_id, hl_s, hl_l`) MUST be the first staged operation so `tag_ref = ((m_tag.table_id, 0), OP_REF, (REF_POS, CS.route[-1]))` points directly to `m_tag`. Auxiliary tables (`m_tag_code.get_set`, `m_moved_tag.set`) must follow `m_tag.set`.
 3. **Cryptographic Hashing Standard**: Code snippets must be hashed using `compute_code_hash(code)` from `core.globalstuff`, returning a 32-byte binary SHA-256 digest (`BINARY(32)`).
 4. **TableEngine Agnosticism**: Tests and workflows must never access private engine internals (e.g. `_cached_rows`, `_pk_index`). Queries must use public TableEngine APIs (`Table.get()`, `G.TE.get()`) or assert against database state (`MockDB._global_store`).
 5. **Form Feed & Line Splitting**: Never use `splitlines()` on source text. Use `raw_content.replace("\r\n", "\n").split("\n")` to preserve 1:1 line index parity with Libclang across files containing form-feed characters (`\x0c`).
@@ -869,17 +879,29 @@ Defined in `core/globalstuff.py`, `STANDARD_C_KEYWORDS: dict[str, ASTT]` provide
     - `REF_FILE` Deferred Resolution Invariant: `ChangeSet.ref()` must never eagerly evaluate `REF_FILE` routes or invoke `safe_get_cs` during AST parsing, returning `(query, OP_REF, parsed_route)` immediately to eliminate recursive Clang translation unit compilation cascades.
     - During parallel multicore parsing, `CS.batch_cs_dict` provides worker-local intra-batch scope for inspecting sibling ChangeSets parsed in the active batch.
     - During `ChangeSet.execute()`, `resolve_ref()` resolves `REF_FILE` references via TableHandling: checking `gp.ChangeSet_Dict` (or `batch_cs_dict`) if the defining file was modified in the active version, executing operations out-of-order so independent symbols publish immediately, tracking blocking dependencies in `self.blocked_on`, and otherwise staging `notbind` stubs directly in TableHandling (`m_ast`) via `force_stubs=True` to break circular dependency deadlocks with warning logs.
-    - `m_symbol_def` (Table 31): Staged during definition extraction for functions (`ASTT.C_functionproto`), structs (`ASTT.C_struct`, `ASTT.C_structdecl`), unions, enums, typedefs (`ASTT.C_SCtypedef`), preprocessor macros (`ASTT.CPPro_define`, `ASTT.CPPro_define_macro`), assembly labels/macros, and jump labels. Records `(def_id, vid, fid, tag_id, ast_id, name, type_id, line_s, line_e)`.
-    - `m_symbol_ref` (Table 32): Staged for every occurrence of a symbol: declarations (`SymbolRole.Declaration = 1`), type usages (`SymbolRole.TypeUsage = 2`), function calls (`SymbolRole.Call = 3`), struct member references (`SymbolRole.MemberRef = 4`), identifier references (`SymbolRole.DeclRef = 5`), and macro expansions (`SymbolRole.MacroExpansion = 6`). Records `(ref_id, vid, fid, tag_id, ast_id, role, line, char_s)`.
+    - `m_symbol_def` (Table 31): Staged during definition extraction for functions (`ASTT.C_functionproto`), structs (`ASTT.C_struct`, `ASTT.C_structdecl`), unions, enums, typedefs (`ASTT.C_SCtypedef`), preprocessor macros (`ASTT.CPPro_define`, `ASTT.CPPro_define_macro`), assembly labels/macros, and jump labels. Records `(def_id, blob_id, tag_id, ast_id, name, type_id, linkage, line_s, line_e)` (9 columns), where `linkage` is typed as `SymbolLinkage` (`ExternalDef = 0`, `InternalStaticDef = 1`, `PrototypeDecl = 2`, `InlineHeaderDef = 3`, `WeakOrAliasDef = 4`, `MacroOrKernelDef = 5`).
+    - `m_symbol_ref` (Table 32): Staged for every occurrence of a symbol: declarations (`SymbolRole.Declaration = 1`), type usages (`SymbolRole.TypeUsage = 2`), function calls (`SymbolRole.Call = 3`), struct member references (`SymbolRole.MemberRef = 4`), identifier references (`SymbolRole.DeclRef = 5`), and macro expansions (`SymbolRole.MacroExpansion = 6`). Records `(ref_id, blob_id, tag_id, ast_id, target_fnid, role, line, char_s)` (8 columns), where `target_fnid` tracks the declaring file ID or 0 if local.
     - Co-declared structs and variables (e.g. `struct foo { int a; } my_var;`): The parser isolates the struct extent up through the closing brace `}` of `Declared_Args`, stages `m_symbol_def` for the canonical struct type, and then extracts the declared variable extent linking its container Priority 0 to the struct's `ast_id` and staging an `m_symbol_ref` with `SymbolRole.TypeUsage`.
+    - Struct Bitfield Extraction & Pahole Layout Attributes:
+      - Bitfields (`type name : width;`) are parsed in `C_Type` with bitfield absorption in `exec_punctuation` (`:` handler), setting `in_bitfield` and `bitfield_width` without allowing the width literal to overwrite the declarator identifier name.
+      - Bitfield width is staged as `ASTT.C_Bitfield` in `m_ast`, and stored in `m_ast_attribute` with attributes `bitfield_width`, `offset_bits`, and `size_bytes`.
+    - Comprehensive Libclang Type Dispatch (`resolve_cursor_type_ast`):
+      - Recursively unwraps `ELABORATED` and `ATTRIBUTED` cursor type wrappers down to canonical underlying types.
+      - Maps scalar primitives, multi-token specifiers (`long long`, `long double`, `_Float128`, `_Float16`), vector extensions (`ASTT.C_Vector`), variable-length arrays (`ASTT.C_vla`), complex numbers, and atomic types.
+    - Tag Tracker 14-Column 3-Way Join & Immutable Tag Recycling:
+      - `get_prior_tags(CS)` joins `m_bridge_tag` (6 cols) &rarr; `m_tag` (5 cols) &rarr; `m_ast` (3 cols) = 14 columns total.
+      - Exact field offsets: `tag_hash` (index 7), `ast_id` (index 8), `ast_name` (index 12), `ast_type` (index 13).
+      - In zero-VID DAG, tags are permanent content-addressed entities; tag recycling never closes or mutates previous tags.
 23. **Slot-Optimized Token, Deduplicated Streaming & Immediate Post-Extraction Teardown Invariant**:
     - Tokens streamed through `TokenStream` must use `ParsedToken` with `__slots__ = ("line", "spelling_str", "ast_kind", "_cursor")` to eliminate Python instance `__dict__` overhead on ctypes objects.
     - Cursors must inherit translation unit reference via class-level `cc.Cursor._tu = parsed_tu` rather than per-instance dictionary assignment.
     - Consecutive tokens residing on the same line must reuse `(s_line, e_line)` tuples, eliminating tens of thousands of redundant tuple allocations.
-    - Consecutive tokens sharing identical underlying ctypes cursor struct fields (`_kind_id`, `xdata`, `data[0..2]`) must reuse the preceding `Cursor` instance, cutting Python cursor allocations by >50%.
+    - Adjacent tokens sharing identical cursor kinds and raw ctypes bytes (`k_id == prev_kind and bytes(raw_c) == prev_bytes`) must reuse the preceding `Cursor` instance, bypassing 5-attribute field comparisons and cutting Python cursor allocations by >50%.
+    - Single-line token slicing caches the current raw source line (`prev_raw_line`), eliminating repeated tuple indexing into `rawfile`.
     - Identifier token dispatch in `Ast_Statement.exec_identifier` and `AST_Initializer.exec_identifier` must fast-path known expressions (`CALL_EXPR`, `MEMBER_REF_EXPR`) and filter out macros/directives (`_SKIP_REF_KINDS`), only lazily evaluating `cursor.referenced` when resolving declaration targets to eliminate tens of thousands of Libclang internal Python wrapper/dictionary allocations.
-    - Dead data structures such as `A_Line_Dict` must be bypassed.
-    - At the completion of `CSExtractor.extract_zone(CS, main_zone)`, `Ast_Manager` and `TokenList` must immediately clear `main_zone`, `tokens_array`, `token_group`, `parsed_tu`, and pop `CS.parsers["C_AM"]`, ensuring per-file heap memory drops immediately to ~2 MB upon completion of relational staging.
+    - During pre-tokenization include symbol discovery (`extract_include_symbols`), traversal is executed via `_CLANG_VISIT_CHILDREN` filtering to `_REFERENCING_KIND_IDS` and checking `_CLANG_CURSOR_IS_NULL`, bypassing recursive Python calls and skipping statement nodes.
+    - During AST extraction, `collect_cursor_used_types` traverses descendants via `_CLANG_VISIT_CHILDREN` with static callback `_CB_COLLECT_USED_TYPES` and memoized `_clean_type_name`, while `get_rel_file_for_cursor` caches resolved repository paths in `_rel_file_cache`.
+    - At the completion of `CSExtractor.extract_zone(CS, main_zone)`, `Ast_Manager` and `TokenList` must immediately clear `main_zone`, `tokens_array`, `token_group`, `parsed_tu`, `top_cursors`, delete `translation_unit`, pop `CS.parsers["C_AM"]`, and invoke `clear_tu_caches()`, breaking circular references, preventing cross-file state leakage, and ensuring per-file heap memory drops immediately upon completion of relational staging.
 24. **Enum & Enumerator Constant Definition and Usage Tracking**:
     - All enumerator constants (e.g. `FOO_A`, `FOO_B`), regardless of explicit `= value` assignment, are extracted with `type_id = ASTT.C_enumequal` (25) in `m_ast` and registered in `CS.symbol_dict[(name, ASTT.C_enumequal)]`.
     - Enumerator definitions are staged in `m_symbol_def` with `type_id = ASTT.C_enumequal` and exact definition lines, linked to the enclosing enum's top-level code tag (`tag_ref`).
@@ -926,7 +948,7 @@ Defined in `core/globalstuff.py`, `STANDARD_C_KEYWORDS: dict[str, ASTT]` provide
 
 ---
 
-## 6. Unit Testing & Snapshot Verification Contract
+## 12. Unit Testing & Snapshot Verification Contract
 
 The C & Preprocessor AST parser is verified through the reusable snapshot testing harness:
 

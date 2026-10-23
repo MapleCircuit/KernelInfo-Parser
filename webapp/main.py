@@ -98,6 +98,7 @@ get_struct_layout = pahole_service.get_struct_layout
 get_function_callgraph = callgraph_service.get_function_callgraph
 get_versions_diff = diff_service.get_versions_diff
 get_kconfig_diff = diff_service.get_kconfig_diff
+get_file_diff = diff_service.get_file_diff
 
 
 if __name__ == "__main__":

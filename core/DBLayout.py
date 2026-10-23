@@ -1,86 +1,63 @@
-"""DBLayout.py - Relational Database Schema & Table Definitions.
+"""DBLayout.py - Relational Database Schema & Content-Addressable Table Definitions.
 
 ===============================================================================
-RELATIONAL DATABASE SCHEMA REFERENCE GUIDE FOR AI & PARSERS
+RELATIONAL DATABASE SCHEMA REFERENCE GUIDE FOR GIT DAG & CONTENT-ADDRESSABLE ARCH
 ===============================================================================
-This module defines the 31 core relational database tables used across the parser
-pipeline (`Table_Array`).
+This module defines the 41 core relational database tables used across the parser
+pipeline (`Table_Array` / `TABLES`).
 
 SCHEMA ENTITY-RELATIONSHIP GRAPH:
 -------------------------------------------------------------------------------
-1. Version & File Lifecycle:
-   m_v_main (vid, vname)
-      ^
-      |-- (vid_s, vid_e) --------> m_file (fid, vid_s, vid_e, ftype, s_stat, e_stat)
-      |-- (vid) -----------------> m_bridge_file (vid, fnid, fid)
-      |                                  ^            ^
-   m_file_name (fnid, fname) -----------|            |-- (s_fid, e_fid) -> m_moved_file
-      ^
-      |-- (fnid) ----------------> m_ast_include (ast_id, fnid)
+1. Project, Git Network, Repository & Ref Hierarchy:
+   m_project (project_id, name, slug)
+     └── m_git_network (network_id, project_id, name, root_commit_hash)
+           └── m_repository (repo_id, network_id, name, git_url, default_branch)
+                 └── m_git_ref (ref_id, repo_id, ref_type, ref_name, commit_id, tagger_id, tagger_date, tag_message)
 
-2. AST Hierarchy & Relationships:
-   m_type_descriptor (type_id, name)
-      ^
-      |-- (type_id) -------------> m_ast (ast_id, name, type_id)
-                                         ^
-      |-- (ast_id, ref_ast_id) ---|------|-> m_ast_container (ast_id, priority, type_id, ref_ast_id)
-      |-- (ast_id) ----------------------|-> m_ast_debug (ast_id, ast_raw)
-      |-- (ast_id) ----------------------|-> m_ast_hash (hash, ast_id)
+2. Git Commit DAG, Delta Snapshot & Checkpoint Layer:
+   m_commit (commit_id, network_id, commit_hash, author_id, author_date, committer_id, committer_date, subject, message)
+     ├── m_commit_parent (commit_id, parent_commit_id, parent_idx)
+     ├── m_commit_file (commit_id, fnid, blob_id, old_fnid, old_blob_id, change_type)
+     ├── m_bridge_checkpoint (commit_id, fnid, blob_id)
+     └── m_ingest_state (network_id, commit_id, status, updated_at)
 
-3. Code Tags & Source Coordinates:
+3. Universal Content-Addressable Stores:
+   m_file_name (fnid, fname)
+   m_file_blob (blob_id, blob_hash, ftype)
    m_tag_code (hash, code)
-      ^
-      |-- (hash) ------------------> m_tag (tag_id, vid_s, vid_e, hash, ast_id, hl_s, hl_l)
-                                        ^           ^                     ^
-                                        |           |--(vid_s, vid_e)     |--(ast_id -> m_ast.ast_id)
-                                        |
-                                        |-- (s_tag_id, e_tag_id) ----------> m_moved_tag
-                                        |-- (tag_id, fid -> m_file.fid) ---> m_bridge_tag (fid, tag_id, line_s, line_e, char_s, char_e)
-                                        |-- (tag_id, map_id) --------------> m_bridge_map (tag_id, map_id)
-                                                  ^
-   m_map_ast (map_id, line_s, char_s, line_e, char_e, ast_id) ----------------|
+   m_ast (ast_id, name, type_id)
+   m_ast_hash (hash, ast_id)
+   m_type_descriptor (type_id, name)
+   m_maintainer_person (person_id, name, email)
 
-4. Kconfig Relational Acceleration & Dependency Graph:
-   m_kconfig_symbol (kcid, vid_s, vid_e, name, type, prompt, def_val, help, ast_id -> m_ast.ast_id)
-      ^            ^
-      |            |-- (kcid) ---------> m_kconfig_relation (rel_id, kcid, target_name, rel_type, cond_ast_id, priority)
-      |
-      |-- (kcid) ----------------------> m_kconfig_tree (tree_id, vid, parent_id, node_type, title, kcid, priority, dep_ast_id, ast_id)
-      |
-      |-- (kcid, fid) -----------------> m_kconfig_kbuild (kcid, vid, fid, compile_mode, target_obj)
+4. Blob-Scoped Code Tags & Source Coordinates:
+   m_tag (tag_id, hash, ast_id, hl_s, hl_l)
+     ├── m_bridge_tag (blob_id, tag_id, line_s, line_e, char_s, char_e)
+     ├── m_moved_tag (s_tag_id, e_tag_id)
+     ├── m_bridge_commit_tag (commit_id, blob_id, tag_id)
+     └── m_bridge_map (tag_id, map_id) -> m_map_ast (map_id, line_s, char_s, line_e, char_e, ast_id)
 
-5. Maintainer & Ownership Subsystem:
-   m_v_main (vid, vname)
-      ^
-      |-- (vid_s, vid_e) ----------> m_maintainer_section (sec_id, vid_s, vid_e, name, status, scm_tree, web_page, mailing_list, ast_id)
-      |                                     ^                   ^
-      |                                     |                   |-- (sec_id) -> m_maintainer_pattern (sec_id, pat_type, pattern, priority)
-      |                                     |                   |
-      |                                     |                   |-- (sec_id) -> m_maintainer_member (sec_id, person_id, role_type, priority)
-      |                                     |                                         ^
-      |                                     |                                         |-- (person_id) -> m_maintainer_person (person_id, name, email)
-      |                                     |                                         |
-      |-- (vid, fid, sec_id) ---------------> m_maintainer_file (vid, fid, sec_id)    |
-      |                                        ^                                      |
-      |-- (vid_s, vid_e, person_id) --------> m_credits_entry (credit_id, vid_s, vid_e, person_id, web_page, pgp_key, description, snail_mail, ast_id) -|
-                                               ^
-   m_file (fid, ...) --------------------------|
+5. Blob-Scoped Symbol Definitions & References:
+   m_symbol_def (def_id, blob_id, tag_id, ast_id, name, type_id, linkage, line_s, line_e)
+   m_symbol_ref (ref_id, blob_id, tag_id, ast_id, target_fnid, role, line, char_s)
+   m_file_reference (ref_id, source_blob_id, target_fnid, ref_type, line_no, details)
 
-6. Git Commit, Multi-Contributor & Multi-Commit Tag Subsystem:
-   m_v_main (vid, vname)
-      ^
-      |-- (vid) ---------------------> m_commit (commit_id, vid, commit_hash, author_id, author_date,
-      |                                          committer_id, committer_date, subject, message)
-      |                                  ^              ^              ^
-   m_maintainer_person (person_id) ------| (author_id)  | (committer)  |
-      ^                                                                |
-      |-- (person_id) <------- m_bridge_commit_person (commit_id, person_id, role_type, priority)
-                                         ^
-   m_file (fid, ...) --------------------|--------> m_bridge_commit_file (commit_id, vid, fid, change_type)
-                                         |
-   m_tag (tag_id, ...) ------------------|--------> m_bridge_commit_tag (commit_id, vid, fid, tag_id)
+6. Kconfig Relational Hierarchy & Build Mapping:
+   m_kconfig_symbol (kcid, name, type, prompt, def_val, help, ast_id)
+     ├── m_kconfig_relation (rel_id, kcid, target_name, rel_type, cond_ast_id, priority)
+     ├── m_kconfig_tree (tree_id, blob_id, parent_id, node_type, title, kcid, priority, dep_ast_id, ast_id)
+     └── m_kconfig_kbuild (kcid, makefile_blob_id, target_fnid, compile_mode, target_obj)
+
+7. Maintainers & Credits Subsystem:
+   m_maintainer_section (sec_id, blob_id, name, status, scm_tree, web_page, mailing_list, ast_id)
+     ├── m_maintainer_member (sec_id, person_id, role_type, priority)
+     ├── m_maintainer_pattern (sec_id, pat_type, pattern, priority)
+     ├── m_maintainer_file (maintainers_blob_id, fnid, sec_id)
+   m_credits_entry (credit_id, blob_id, person_id, web_page, pgp_key, description, snail_mail, ast_id)
 ===============================================================================
 """
+from __future__ import annotations
+
 import secrets
 import time
 from core.globalstuff import ASTT
@@ -90,29 +67,27 @@ from core.TableHandling import Table
 m_type_descriptor_insert = tuple((ast.value, ast.name) for ast in ASTT)
 
 # -----------------------------------------------------------------------------
-# 1. m_v_main (table_id=0): Version Registry
-#    - vid: Unique Version ID (PK, AUTO_INCREMENT).
-#    - vname: Release tag name (e.g. "v3.0", "v3.1").
+# 0. m_project (table_id=0): Multi-Tenant Project / Ecosystem Scope
 # -----------------------------------------------------------------------------
-m_v_main = Table(
+m_project = Table(
     table_id=0,
-    table_name="m_v_main",
+    table_name="m_project",
     columns=(
-        ("vid", "INT", "NOT NULL", "AUTO_INCREMENT"),
-        ("vname", "VARCHAR(32)", "NOT NULL", "COLLATE utf8mb4_bin"),
+        ("project_id", "INT", "NOT NULL", "AUTO_INCREMENT"),
+        ("name", "VARCHAR(64)", "NOT NULL", "COLLATE utf8mb4_bin"),
+        ("slug", "VARCHAR(32)", "NOT NULL", "COLLATE utf8mb4_bin"),
     ),
-    primary=("vid",),
+    primary=("project_id",),
     foreign=None,
-    initial_insert=((0, "latest"),),
+    initial_insert=((0, "default", "default"),),
     no_duplicate=True,
     te_cached=True,
+    unique_keys=(("slug",),),
     hashing_table=False,
 )
 
 # -----------------------------------------------------------------------------
-# 2. m_file_name (table_id=1): Unique Path String Registry
-#    - fnid: Unique File Name ID (PK, AUTO_INCREMENT).
-#    - fname: Relative file or directory path string.
+# 1. m_file_name (table_id=1): Unique Repository Path String Registry
 # -----------------------------------------------------------------------------
 m_file_name = Table(
     table_id=1,
@@ -126,92 +101,96 @@ m_file_name = Table(
     initial_insert=((0, ""),),
     no_duplicate=True,
     te_cached=True,
+    indexes=(("file_name_index", ("fname",)),),
     hashing_table=False,
 )
 
 # -----------------------------------------------------------------------------
-# 3. m_file (table_id=2): File Lifecycle & Status Instance
-#    - fid: Unique File Instance ID (PK, AUTO_INCREMENT).
-#    - vid_s: Starting Version ID (FK -> m_v_main.vid).
-#    - vid_e: Ending Version ID (FK -> m_v_main.vid, 0 if still active).
-#    - ftype: File category (0: Dir, 1: C code/header, 2: Kconfig, 3: Rust, 4: Assembly).
-#    - s_stat: Change status at inception ('A'=Added, 'M'=Modified, 'R'=Renamed).
-#    - e_stat: Change status at conclusion ('D'=Deleted, 'R'=Renamed, '0'=Active).
+# 2. m_file_blob (table_id=2): Unique File Content Universal Store
 # -----------------------------------------------------------------------------
-m_file = Table(
+m_file_blob = Table(
     table_id=2,
-    table_name="m_file",
+    table_name="m_file_blob",
     columns=(
-        ("fid", "INT", "NOT NULL", "AUTO_INCREMENT"),
-        ("vid_s", "INT", "NOT NULL"),
-        ("vid_e", "INT", "NOT NULL"),
+        ("blob_id", "INT", "NOT NULL", "AUTO_INCREMENT"),
+        ("blob_hash", "BINARY(20)", "NOT NULL"),
         ("ftype", "TINYINT", "UNSIGNED", "NOT NULL"),
-        ("s_stat", "CHAR(1)", "NOT NULL"),
-        ("e_stat", "CHAR(1)", "NOT NULL"),
     ),
-    primary=("fid",),
+    primary=("blob_id",),
     foreign=None,
-    initial_insert=((0, 0, 0, 0, 0, 0),),
-    no_duplicate=False,
+    initial_insert=((0, b"\x00" * 20, 0),),
+    no_duplicate=True,
     te_cached=True,
+    unique_keys=(("blob_hash", "ftype"),),
     hashing_table=False,
 )
+m_file = m_file_blob
+setattr(m_file_blob, "fid", m_file_blob.blob_id)
+setattr(m_file_blob, "vid_s", (m_file_blob.table_id, 1))
+setattr(m_file_blob, "vid_e", (m_file_blob.table_id, 2))
 
 # -----------------------------------------------------------------------------
-# 4. m_bridge_file (table_id=3): Version to File Instance Mapping
-#    - vid: Version ID (FK -> m_v_main.vid).
-#    - fnid: File Name ID (FK -> m_file_name.fnid).
-#    - fid: File Instance ID (FK -> m_file.fid).
+# 3. m_bridge_checkpoint (table_id=3): Milestone Full-Tree Snapshots
 # -----------------------------------------------------------------------------
-m_bridge_file = Table(
+m_bridge_checkpoint = Table(
     table_id=3,
-    table_name="m_bridge_file",
+    table_name="m_bridge_checkpoint",
     columns=(
-        ("vid", "INT", "NOT NULL"),
+        ("commit_id", "INT", "NOT NULL"),
         ("fnid", "INT", "NOT NULL"),
-        ("fid", "INT", "NOT NULL"),
+        ("blob_id", "INT", "NOT NULL"),
     ),
-    primary=("vid", "fnid"),
+    primary=("commit_id", "fnid"),
     foreign=(
-        ("vid", "m_v_main", "vid"),
         ("fnid", "m_file_name", "fnid"),
-        ("fid", "m_file", "fid"),
+        ("blob_id", "m_file_blob", "blob_id"),
     ),
     initial_insert=None,
     no_duplicate=False,
     te_cached=True,
+    blob_scoped=True,
     version_scoped=True,
+    indexes=(("chk_blob_idx", ("blob_id",)),),
     hashing_table=False,
 )
+m_bridge_file = m_bridge_checkpoint
+setattr(m_bridge_checkpoint, "vid", m_bridge_checkpoint.commit_id)
+setattr(m_bridge_checkpoint, "fid", m_bridge_checkpoint.blob_id)
 
 # -----------------------------------------------------------------------------
-# 5. m_moved_file (table_id=4): File Rename / Movement History
-#    - s_fid: Source File Instance ID (FK -> m_file.fid).
-#    - e_fid: Destination File Instance ID (FK -> m_file.fid).
+# 4. m_blob_transition (table_id=4): Content Evolution & Cherry-Pick Registry
 # -----------------------------------------------------------------------------
-m_moved_file = Table(
+m_blob_transition = Table(
     table_id=4,
-    table_name="m_moved_file",
-    columns=(("s_fid", "INT", "NOT NULL"), ("e_fid", "INT", "NOT NULL")),
-    primary=("s_fid", "e_fid"),
-    foreign=(("s_fid", "m_file", "fid"), ("e_fid", "m_file", "fid")),
+    table_name="m_blob_transition",
+    columns=(
+        ("old_blob_id", "INT", "NOT NULL"),
+        ("new_blob_id", "INT", "NOT NULL"),
+    ),
+    primary=("old_blob_id", "new_blob_id"),
+    foreign=(
+        ("old_blob_id", "m_file_blob", "blob_id"),
+        ("new_blob_id", "m_file_blob", "blob_id"),
+    ),
     initial_insert=None,
     no_duplicate=False,
-    te_cached=False,
+    te_cached=True,
+    idempotent_pk=True,
     hashing_table=False,
 )
+m_moved_file = m_blob_transition
+setattr(m_blob_transition, "s_fid", m_blob_transition.old_blob_id)
+setattr(m_blob_transition, "e_fid", m_blob_transition.new_blob_id)
 
 # -----------------------------------------------------------------------------
-# 6. m_type_descriptor (table_id=5): AST Construct Category Registry
-#    - type_id: AST Type ID (PK, matched to ASTT enum value).
-#    - name: AST Category Name (e.g. "C_structdecl", "C_Compound").
+# 5. m_type_descriptor (table_id=5): AST Type Discriminator Catalog
 # -----------------------------------------------------------------------------
 m_type_descriptor = Table(
     table_id=5,
     table_name="m_type_descriptor",
     columns=(
-        ("type_id", "TINYINT", "UNSIGNED", "NOT NULL", "AUTO_INCREMENT"),
-        ("name", "VARCHAR(255)", "NOT NULL", "COLLATE utf8mb4_bin"),
+        ("type_id", "SMALLINT", "UNSIGNED", "NOT NULL"),
+        ("name", "VARCHAR(64)", "NOT NULL", "COLLATE utf8mb4_bin"),
     ),
     primary=("type_id",),
     foreign=None,
@@ -222,10 +201,7 @@ m_type_descriptor = Table(
 )
 
 # -----------------------------------------------------------------------------
-# 7. m_ast (table_id=6): AST Node Elements
-#    - ast_id: Unique AST Node ID (PK, AUTO_INCREMENT).
-#    - name: Symbol identifier or expression string.
-#    - type_id: AST Category ID (FK -> m_type_descriptor.type_id).
+# 6. m_ast (table_id=6): Relational AST Structure Catalog
 # -----------------------------------------------------------------------------
 m_ast = Table(
     table_id=6,
@@ -233,7 +209,7 @@ m_ast = Table(
     columns=(
         ("ast_id", "INT", "NOT NULL", "AUTO_INCREMENT"),
         ("name", "VARCHAR(255)", "NOT NULL", "COLLATE utf8mb4_bin"),
-        ("type_id", "TINYINT", "UNSIGNED", "NOT NULL"),
+        ("type_id", "SMALLINT", "UNSIGNED", "NOT NULL"),
     ),
     primary=("ast_id",),
     foreign=(("type_id", "m_type_descriptor", "type_id"),),
@@ -241,14 +217,11 @@ m_ast = Table(
     no_duplicate=False,
     te_cached=False,
     hashing_table="m_ast_hash",
+    indexes=(("ast_index", ("name", "type_id")),),
 )
 
 # -----------------------------------------------------------------------------
-# 8. m_ast_container (table_id=7): AST Hierarchy & Child Relationships
-#    - ast_id: Parent AST Node ID (FK -> m_ast.ast_id).
-#    - priority: Positional rank/order index (0, 1, 2...).
-#    - type_id: Child relationship type ID (FK -> m_type_descriptor.type_id).
-#    - ref_ast_id: Referenced Child AST Node ID (FK -> m_ast.ast_id).
+# 7. m_ast_container (table_id=7): AST Child Nesting & Parameter Relations
 # -----------------------------------------------------------------------------
 m_ast_container = Table(
     table_id=7,
@@ -256,7 +229,7 @@ m_ast_container = Table(
     columns=(
         ("ast_id", "INT", "NOT NULL"),
         ("priority", "SMALLINT", "UNSIGNED", "NOT NULL"),
-        ("type_id", "TINYINT", "UNSIGNED", "NOT NULL"),
+        ("type_id", "SMALLINT", "UNSIGNED", "NOT NULL"),
         ("ref_ast_id", "INT", "NOT NULL"),
     ),
     primary=("ast_id", "priority"),
@@ -269,34 +242,41 @@ m_ast_container = Table(
     no_duplicate=False,
     te_cached=False,
     hashing_table=False,
+    indexes=(("ast_cont_ref_idx", ("ref_ast_id",)),),
 )
 
 # -----------------------------------------------------------------------------
-# 9. m_ast_include (table_id=8): Preprocessor Include References
-#    - ast_id: Include directive AST Node ID (FK -> m_ast.ast_id).
-#    - fnid: Target included file path ID (FK -> m_file_name.fnid).
+# 8. m_ast_include (table_id=8): AST File Dependency Registry
 # -----------------------------------------------------------------------------
 m_ast_include = Table(
     table_id=8,
     table_name="m_ast_include",
-    columns=(("ast_id", "INT", "NOT NULL"), ("fnid", "INT", "NOT NULL")),
+    columns=(
+        ("ast_id", "INT", "NOT NULL"),
+        ("fnid", "INT", "NOT NULL"),
+    ),
     primary=("ast_id",),
-    foreign=(("ast_id", "m_ast", "ast_id"), ("fnid", "m_file_name", "fnid")),
+    foreign=(
+        ("ast_id", "m_ast", "ast_id"),
+        ("fnid", "m_file_name", "fnid"),
+    ),
     initial_insert=None,
     no_duplicate=False,
     te_cached=False,
     hashing_table=False,
+    indexes=(("ast_inc_fnid_idx", ("fnid",)),),
 )
 
 # -----------------------------------------------------------------------------
-# 10. m_ast_debug (table_id=9): AST Debug Dumps
-#     - ast_id: AST Node ID (FK -> m_ast.ast_id).
-#     - ast_raw: Serialized JSON representation of parser AST node.
+# 9. m_ast_debug (table_id=9): Raw Textual AST Diagnostics
 # -----------------------------------------------------------------------------
 m_ast_debug = Table(
     table_id=9,
     table_name="m_ast_debug",
-    columns=(("ast_id", "INT", "NOT NULL"), ("ast_raw", "MEDIUMTEXT", "NOT NULL")),
+    columns=(
+        ("ast_id", "INT", "NOT NULL"),
+        ("ast_raw", "MEDIUMTEXT", "NOT NULL"),
+    ),
     primary=("ast_id",),
     foreign=(("ast_id", "m_ast", "ast_id"),),
     initial_insert=None,
@@ -306,86 +286,79 @@ m_ast_debug = Table(
 )
 
 # -----------------------------------------------------------------------------
-# 11. m_tag_code (table_id=10): Code Snippet Text Registry
-#     - hash: 32-byte binary SHA-256 digest of code snippet string (PK).
-#     - code: Raw code snippet text content.
+# 10. m_tag_code (table_id=10): Content-Addressable Source Code Snippets
 # -----------------------------------------------------------------------------
 m_tag_code = Table(
     table_id=10,
     table_name="m_tag_code",
     columns=(
         ("hash", "BINARY(32)", "NOT NULL"),
-        ("code", "LONGTEXT", "NOT NULL"),
+        ("code", "MEDIUMTEXT", "NOT NULL"),
     ),
     primary=("hash",),
     foreign=None,
     initial_insert=((b"\x00" * 32, ""),),
     no_duplicate=False,
     te_cached=("hash",),
+    idempotent_pk=True,
     hashing_table=False,
 )
 
 # -----------------------------------------------------------------------------
-# 12. m_tag (table_id=11): Code Occurrence / AST Tag Instance
-#     - tag_id: Unique Tag ID (PK with vid_s).
-#     - vid_s: Starting Version ID (FK -> m_v_main.vid).
-#     - vid_e: Ending Version ID (FK -> m_v_main.vid, 0 if still active).
-#     - hash: Associated code snippet SHA-256 hash (FK -> m_tag_code.hash).
-#     - ast_id: Associated AST Node ID (FK -> m_ast.ast_id).
-#     - hl_s: Highlight start offset.
-#     - hl_l: Highlight length.
+# 11. m_tag (table_id=11): Immutable & Recyclable AST Code Tag Entity
 # -----------------------------------------------------------------------------
 m_tag = Table(
     table_id=11,
     table_name="m_tag",
     columns=(
         ("tag_id", "INT", "NOT NULL", "AUTO_INCREMENT"),
-        ("vid_s", "INT", "NOT NULL"),
-        ("vid_e", "INT", "NOT NULL"),
         ("hash", "BINARY(32)", "NOT NULL"),
         ("ast_id", "INT", "NOT NULL"),
         ("hl_s", "INT", "NOT NULL"),
         ("hl_l", "INT", "NOT NULL"),
     ),
-    primary=("tag_id", "vid_s"),
-    foreign=None,
-    initial_insert=((0, 0, 0, b"\x00" * 32, 0, 0, 0),),
+    primary=("tag_id",),
+    foreign=(
+        ("hash", "m_tag_code", "hash"),
+        ("ast_id", "m_ast", "ast_id"),
+    ),
+    initial_insert=((0, b"\x00" * 32, 0, 0, 0),),
     no_duplicate=False,
     te_cached=False,
     hashing_table=False,
+    indexes=(("tag_hash_idx", ("hash",)), ("tag_ast_idx", ("ast_id",))),
 )
 
 # -----------------------------------------------------------------------------
-# 13. m_bridge_tag (table_id=12): Tag to File & Line Range Mapping
-#     - fid: File Instance ID (FK -> m_file.fid).
-#     - tag_id: Tag ID (FK -> m_tag.tag_id).
-#     - line_s / line_e: Start / End line numbers in source file.
-#     - char_s / char_e: Start / End character column offsets.
+# 12. m_bridge_tag (table_id=12): Tag Occurrence Coordinates within Content Blob
 # -----------------------------------------------------------------------------
 m_bridge_tag = Table(
     table_id=12,
     table_name="m_bridge_tag",
     columns=(
-        ("fid", "INT", "NOT NULL"),
+        ("blob_id", "INT", "NOT NULL"),
         ("tag_id", "INT", "NOT NULL"),
         ("line_s", "INT", "NOT NULL"),
         ("line_e", "INT", "NOT NULL"),
         ("char_s", "INT", "NOT NULL"),
         ("char_e", "INT", "NOT NULL"),
     ),
-    primary=("fid", "tag_id"),
-    foreign=(("fid", "m_file", "fid"), ("tag_id", "m_tag", "tag_id")),
+    primary=("blob_id", "tag_id"),
+    foreign=(
+        ("blob_id", "m_file_blob", "blob_id"),
+        ("tag_id", "m_tag", "tag_id"),
+    ),
     initial_insert=None,
     no_duplicate=False,
     te_cached=False,
+    idempotent_pk=True,
+    indexes=(("bridge_tag_tid_idx", ("tag_id",)),),
     hashing_table=False,
 )
+setattr(m_bridge_tag, "fid", m_bridge_tag.blob_id)
 
 # -----------------------------------------------------------------------------
-# 14. m_map_ast (table_id=13): Spatial Source Region to AST Mapping
-#     - map_id: Map Set Grouping ID.
-#     - line_s / char_s / line_e / char_e: Coordinate region relative to tag snippet.
-#     - ast_id: Target AST Node ID (FK -> m_ast.ast_id).
+# 13. m_map_ast (table_id=13): Tag-Relative AST Overlay Spans
 # -----------------------------------------------------------------------------
 m_map_ast = Table(
     table_id=13,
@@ -400,16 +373,15 @@ m_map_ast = Table(
     ),
     primary=("map_id", "line_s", "char_s", "line_e", "char_e", "ast_id"),
     foreign=(("ast_id", "m_ast", "ast_id"),),
-    initial_insert=((0, 0, 0, 0, 0, 0),),
+    initial_insert=None,
     no_duplicate=False,
     te_cached=False,
+    idempotent_pk=True,
     hashing_table=False,
 )
 
 # -----------------------------------------------------------------------------
-# 15. m_bridge_map (table_id=14): Code Tag to AST Coordinate Map Bridge
-#     - tag_id: Code Tag ID (FK -> m_tag.tag_id).
-#     - map_id: Map Set ID (matching m_map_ast.map_id).
+# 14. m_bridge_map (table_id=14): Tag to AST Map Linkage
 # -----------------------------------------------------------------------------
 m_bridge_map = Table(
     table_id=14,
@@ -423,13 +395,12 @@ m_bridge_map = Table(
     initial_insert=None,
     no_duplicate=False,
     te_cached=False,
+    idempotent_pk=True,
     hashing_table=False,
 )
 
 # -----------------------------------------------------------------------------
-# 16. m_ast_hash (table_id=15): AST Structural Hash Deduplication Registry
-#     - hash: 32-byte binary SHA-256 digest of canonical AST node & children (PK).
-#     - ast_id: Assigned AST Node ID (FK -> m_ast.ast_id).
+# 15. m_ast_hash (table_id=15): Cryptographic AST Content Hash Index
 # -----------------------------------------------------------------------------
 m_ast_hash = Table(
     table_id=15,
@@ -440,31 +411,21 @@ m_ast_hash = Table(
     ),
     primary=("hash",),
     foreign=(("ast_id", "m_ast", "ast_id"),),
-    initial_insert=None,
+    initial_insert=((b"\x00" * 32, 0),),
     no_duplicate=False,
     te_cached=True,
+    idempotent_pk=True,
     hashing_table=False,
 )
 
 # -----------------------------------------------------------------------------
-# 17. m_kconfig_symbol (table_id=16): Kconfig Configuration Symbol Registry
-#     - kcid: Unique Kconfig Symbol ID (PK with vid_s).
-#     - vid_s: Starting Version ID (FK -> m_v_main.vid).
-#     - vid_e: Ending Version ID (FK -> m_v_main.vid, 0 if still active).
-#     - name: Symbol name without CONFIG_ prefix (e.g. "64BIT", "EXT4_FS").
-#     - type: Data type (1: bool, 2: tristate, 3: string, 4: hex, 5: int).
-#     - prompt: Primary user-visible prompt label.
-#     - def_val: Default value expression / literal string.
-#     - help: Multi-line help / documentation text.
-#     - ast_id: Associated AST Node ID (FK -> m_ast.ast_id).
+# 16. m_kconfig_symbol (table_id=16): Content-Deduplicated Kconfig Symbols
 # -----------------------------------------------------------------------------
 m_kconfig_symbol = Table(
     table_id=16,
     table_name="m_kconfig_symbol",
     columns=(
         ("kcid", "INT", "NOT NULL", "AUTO_INCREMENT"),
-        ("vid_s", "INT", "NOT NULL"),
-        ("vid_e", "INT", "NOT NULL"),
         ("name", "VARCHAR(64)", "NOT NULL", "COLLATE utf8mb4_bin"),
         ("type", "TINYINT", "UNSIGNED", "NOT NULL"),
         ("prompt", "VARCHAR(255)", "NOT NULL", "COLLATE utf8mb4_bin"),
@@ -472,24 +433,16 @@ m_kconfig_symbol = Table(
         ("help", "MEDIUMTEXT", "NOT NULL"),
         ("ast_id", "INT", "NOT NULL"),
     ),
-    primary=("kcid", "vid_s"),
-    foreign=(
-        ("ast_id", "m_ast", "ast_id"),
-    ),
-    initial_insert=None,
+    primary=("kcid",),
+    foreign=(("ast_id", "m_ast", "ast_id"),),
+    initial_insert=((0, "", 0, "", "", "", 0),),
     no_duplicate=True,
     te_cached=True,
     hashing_table=False,
 )
 
 # -----------------------------------------------------------------------------
-# 18. m_kconfig_relation (table_id=17): Dependency & Reverse-Dependency Graph
-#     - rel_id: Unique Relation ID (PK, AUTO_INCREMENT).
-#     - kcid: Source Kconfig Symbol ID (FK -> m_kconfig_symbol.kcid).
-#     - target_name: Depended-upon or selected symbol name (e.g. "BLOCK", "CRC32").
-#     - rel_type: Category (1: depends_on, 2: select, 3: imply, 4: choice_member).
-#     - cond_ast_id: Conditional guard AST Node ID (0 if unconditional).
-#     - priority: Positional rank in multi-clause expression lists.
+# 17. m_kconfig_relation (table_id=17): Kconfig Dependency & Select Rules
 # -----------------------------------------------------------------------------
 m_kconfig_relation = Table(
     table_id=17,
@@ -500,34 +453,29 @@ m_kconfig_relation = Table(
         ("target_name", "VARCHAR(64)", "NOT NULL", "COLLATE utf8mb4_bin"),
         ("rel_type", "TINYINT", "UNSIGNED", "NOT NULL"),
         ("cond_ast_id", "INT", "NOT NULL"),
-        ("priority", "SMALLINT", "UNSIGNED", "NOT NULL"),
+        ("priority", "INT", "NOT NULL"),
     ),
     primary=("rel_id",),
-    foreign=(("kcid", "m_kconfig_symbol", "kcid"),),
+    foreign=(
+        ("kcid", "m_kconfig_symbol", "kcid"),
+        ("cond_ast_id", "m_ast", "ast_id"),
+    ),
     initial_insert=None,
     no_duplicate=True,
     te_cached=True,
+    indexes=(("kc_rel_kcid_idx", ("kcid",)), ("kc_rel_tgt_idx", ("target_name",))),
     hashing_table=False,
 )
 
 # -----------------------------------------------------------------------------
-# 19. m_kconfig_tree (table_id=18): Menuconfig Hierarchy & Display Structure
-#     - tree_id: Unique Tree Item ID (PK with vid).
-#     - vid: Kernel Version ID (FK -> m_v_main.vid).
-#     - parent_id: Parent menu / choice tree ID (0 for root).
-#     - node_type: Category (1: menu, 2: choice, 3: config, 4: menuconfig, 5: comment).
-#     - title: Display prompt / menu header title.
-#     - kcid: Linked Symbol ID (FK -> m_kconfig_symbol.kcid, 0 if menu/comment).
-#     - priority: Sibling display ordering rank.
-#     - dep_ast_id: Visibility / conditional dependency AST ID (0 if unconditional).
-#     - ast_id: Associated AST Node ID (FK -> m_ast.ast_id).
+# 18. m_kconfig_tree (table_id=18): Blob-Scoped Menu Hierarchy
 # -----------------------------------------------------------------------------
 m_kconfig_tree = Table(
     table_id=18,
     table_name="m_kconfig_tree",
     columns=(
         ("tree_id", "INT", "NOT NULL", "AUTO_INCREMENT"),
-        ("vid", "INT", "NOT NULL"),
+        ("blob_id", "INT", "NOT NULL"),
         ("parent_id", "INT", "NOT NULL"),
         ("node_type", "TINYINT", "UNSIGNED", "NOT NULL"),
         ("title", "VARCHAR(255)", "NOT NULL", "COLLATE utf8mb4_bin"),
@@ -536,108 +484,93 @@ m_kconfig_tree = Table(
         ("dep_ast_id", "INT", "NOT NULL"),
         ("ast_id", "INT", "NOT NULL"),
     ),
-    primary=("tree_id", "vid"),
+    primary=("tree_id",),
     foreign=(
+        ("blob_id", "m_file_blob", "blob_id"),
         ("ast_id", "m_ast", "ast_id"),
     ),
     initial_insert=None,
     no_duplicate=False,
     te_cached=True,
+    indexes=(("kc_tree_blob_idx", ("blob_id", "parent_id", "priority")),),
     hashing_table=False,
 )
 
 # -----------------------------------------------------------------------------
-# 20. m_kconfig_kbuild (table_id=19): Kconfig to Source File Compilation Map
-#     - kcid: Target Kconfig Symbol ID (FK -> m_kconfig_symbol.kcid, 0 for core obj-y).
-#     - vid: Kernel Version ID (FK -> m_v_main.vid).
-#     - fid: Source File ID (FK -> m_file.fid).
-#     - compile_mode: Compilation state (1: built-in obj-y, 2: module obj-m, 3: conditional obj-$(CONFIG_...)).
-#     - target_obj: Target object or composite module name (e.g. "ext4.o", "drbd.o").
+# 19. m_kconfig_kbuild (table_id=19): Makefile Build Object Mappings
 # -----------------------------------------------------------------------------
 m_kconfig_kbuild = Table(
     table_id=19,
     table_name="m_kconfig_kbuild",
     columns=(
         ("kcid", "INT", "NOT NULL"),
-        ("vid", "INT", "NOT NULL"),
-        ("fid", "INT", "NOT NULL"),
+        ("makefile_blob_id", "INT", "NOT NULL"),
+        ("target_fnid", "INT", "NOT NULL"),
         ("compile_mode", "TINYINT", "UNSIGNED", "NOT NULL"),
         ("target_obj", "VARCHAR(64)", "NOT NULL", "COLLATE utf8mb4_bin"),
     ),
-    primary=("kcid", "vid", "fid", "compile_mode"),
+    primary=("kcid", "makefile_blob_id", "target_fnid", "compile_mode"),
     foreign=(
-        ("fid", "m_file", "fid"),
+        ("kcid", "m_kconfig_symbol", "kcid"),
+        ("makefile_blob_id", "m_file_blob", "blob_id"),
+        ("target_fnid", "m_file_name", "fnid"),
     ),
     initial_insert=None,
-    no_duplicate=False,
+    idempotent_pk=True,
     te_cached=True,
+    indexes=(("kc_kb_fnid_idx", ("target_fnid",)),),
     hashing_table=False,
 )
 
 # -----------------------------------------------------------------------------
-# 21. m_maintainer_person (table_id=20): Maintainer & Reviewer Persona Registry
-#     - person_id: Unique Person ID (PK, AUTO_INCREMENT).
-#     - name: Full name string (e.g. "Linus Torvalds").
-#     - email: Primary email address (e.g. "torvalds@linux-foundation.org").
+# 20. m_maintainer_person (table_id=20): Contributor Identity Registry
 # -----------------------------------------------------------------------------
 m_maintainer_person = Table(
     table_id=20,
     table_name="m_maintainer_person",
     columns=(
         ("person_id", "INT", "NOT NULL", "AUTO_INCREMENT"),
-        ("name", "VARCHAR(255)", "NOT NULL", "COLLATE utf8mb4_bin"),
-        ("email", "VARCHAR(255)", "NOT NULL", "COLLATE utf8mb4_bin"),
+        ("name", "VARCHAR(128)", "NOT NULL", "COLLATE utf8mb4_bin"),
+        ("email", "VARCHAR(128)", "NOT NULL", "COLLATE utf8mb4_bin"),
     ),
     primary=("person_id",),
     foreign=None,
-    initial_insert=None,
+    initial_insert=((0, "", ""),),
     no_duplicate=True,
     te_cached=True,
     hashing_table=False,
 )
 
 # -----------------------------------------------------------------------------
-# 22. m_maintainer_section (table_id=21): Subsystem Section Registry
-#     - sec_id: Unique Section ID (PK with vid_s, AUTO_INCREMENT).
-#     - vid_s: Starting Version ID (FK -> m_v_main.vid).
-#     - vid_e: Ending Version ID (FK -> m_v_main.vid, 0 if active).
-#     - name: Subsystem title/name (e.g. "EXT4 FILE SYSTEM").
-#     - status: Status string (e.g. "Maintained", "Supported", "Orphan").
-#     - scm_tree: SCM tree URL string (or "").
-#     - web_page: Web page URL string (or "").
-#     - mailing_list: Primary mailing list address (or "").
-#     - ast_id: Associated AST Node ID (FK -> m_ast.ast_id).
+# 21. m_maintainer_section (table_id=21): Blob-Scoped Subsystem Definitions
 # -----------------------------------------------------------------------------
 m_maintainer_section = Table(
     table_id=21,
     table_name="m_maintainer_section",
     columns=(
         ("sec_id", "INT", "NOT NULL", "AUTO_INCREMENT"),
-        ("vid_s", "INT", "NOT NULL"),
-        ("vid_e", "INT", "NOT NULL"),
-        ("name", "VARCHAR(255)", "NOT NULL", "COLLATE utf8mb4_bin"),
+        ("blob_id", "INT", "NOT NULL"),
+        ("name", "VARCHAR(128)", "NOT NULL", "COLLATE utf8mb4_bin"),
         ("status", "VARCHAR(32)", "NOT NULL", "COLLATE utf8mb4_bin"),
         ("scm_tree", "VARCHAR(255)", "NOT NULL", "COLLATE utf8mb4_bin"),
         ("web_page", "VARCHAR(255)", "NOT NULL", "COLLATE utf8mb4_bin"),
         ("mailing_list", "VARCHAR(255)", "NOT NULL", "COLLATE utf8mb4_bin"),
         ("ast_id", "INT", "NOT NULL"),
     ),
-    primary=("sec_id", "vid_s"),
+    primary=("sec_id",),
     foreign=(
+        ("blob_id", "m_file_blob", "blob_id"),
         ("ast_id", "m_ast", "ast_id"),
     ),
-    initial_insert=None,
+    initial_insert=((0, 0, "", "", "", "", "", 0),),
     no_duplicate=True,
     te_cached=True,
+    indexes=(("maint_sec_blob_idx", ("blob_id",)),),
     hashing_table=False,
 )
 
 # -----------------------------------------------------------------------------
-# 23. m_maintainer_member (table_id=22): Section to Person Role Mapping
-#     - sec_id: Subsystem Section ID (FK -> m_maintainer_section.sec_id).
-#     - person_id: Person ID (FK -> m_maintainer_person.person_id).
-#     - role_type: Role (1: Maintainer 'M', 2: Reviewer 'R', 3: Person 'P', 4: Other).
-#     - priority: Display order rank index.
+# 22. m_maintainer_member (table_id=22): Section Maintainer Members
 # -----------------------------------------------------------------------------
 m_maintainer_member = Table(
     table_id=22,
@@ -646,7 +579,7 @@ m_maintainer_member = Table(
         ("sec_id", "INT", "NOT NULL"),
         ("person_id", "INT", "NOT NULL"),
         ("role_type", "TINYINT", "UNSIGNED", "NOT NULL"),
-        ("priority", "SMALLINT", "UNSIGNED", "NOT NULL"),
+        ("priority", "INT", "NOT NULL"),
     ),
     primary=("sec_id", "person_id", "role_type"),
     foreign=(
@@ -656,15 +589,12 @@ m_maintainer_member = Table(
     initial_insert=None,
     no_duplicate=False,
     te_cached=True,
+    idempotent_pk=True,
     hashing_table=False,
 )
 
 # -----------------------------------------------------------------------------
-# 24. m_maintainer_pattern (table_id=23): Section Pattern & Rule Registry
-#     - sec_id: Subsystem Section ID (FK -> m_maintainer_section.sec_id).
-#     - pat_type: Pattern Type (1: File 'F', 2: Exclude 'X', 3: Keyword 'K', 4: Regex 'N').
-#     - pattern: Raw pattern string (e.g. "fs/ext4/", "drivers/net/3c505*").
-#     - priority: Rule evaluation order rank.
+# 23. m_maintainer_pattern (table_id=23): Section File Matching Patterns
 # -----------------------------------------------------------------------------
 m_maintainer_pattern = Table(
     table_id=23,
@@ -673,60 +603,51 @@ m_maintainer_pattern = Table(
         ("sec_id", "INT", "NOT NULL"),
         ("pat_type", "TINYINT", "UNSIGNED", "NOT NULL"),
         ("pattern", "VARCHAR(255)", "NOT NULL", "COLLATE utf8mb4_bin"),
-        ("priority", "SMALLINT", "UNSIGNED", "NOT NULL"),
+        ("priority", "INT", "NOT NULL"),
     ),
     primary=("sec_id", "pat_type", "pattern", "priority"),
     foreign=(("sec_id", "m_maintainer_section", "sec_id"),),
     initial_insert=None,
     no_duplicate=False,
     te_cached=True,
+    idempotent_pk=True,
     hashing_table=False,
 )
 
 # -----------------------------------------------------------------------------
-# 25. m_maintainer_file (table_id=24): Materialized File-to-Section Bridge
-#     - vid: Kernel Version ID (FK -> m_v_main.vid).
-#     - fid: File Instance ID (FK -> m_file.fid).
-#     - sec_id: Subsystem Section ID (FK -> m_maintainer_section.sec_id).
+# 24. m_maintainer_file (table_id=24): Path to Maintainer Section Resolution
 # -----------------------------------------------------------------------------
 m_maintainer_file = Table(
     table_id=24,
     table_name="m_maintainer_file",
     columns=(
-        ("vid", "INT", "NOT NULL"),
-        ("fid", "INT", "NOT NULL"),
+        ("maintainers_blob_id", "INT", "NOT NULL"),
+        ("fnid", "INT", "NOT NULL"),
         ("sec_id", "INT", "NOT NULL"),
     ),
-    primary=("vid", "fid", "sec_id"),
+    primary=("maintainers_blob_id", "fnid", "sec_id"),
     foreign=(
-        ("fid", "m_file", "fid"),
+        ("maintainers_blob_id", "m_file_blob", "blob_id"),
+        ("fnid", "m_file_name", "fnid"),
         ("sec_id", "m_maintainer_section", "sec_id"),
     ),
     initial_insert=None,
     no_duplicate=False,
     te_cached=False,
+    idempotent_pk=True,
+    indexes=(("maint_file_fnid_idx", ("maintainers_blob_id", "fnid")),),
     hashing_table=False,
 )
 
 # -----------------------------------------------------------------------------
-# 26. m_credits_entry (table_id=25): Contributor & Author Credits Registry
-#     - credit_id: Unique Credit ID (PK with vid_s, AUTO_INCREMENT).
-#     - vid_s: Starting Version ID (FK -> m_v_main.vid).
-#     - vid_e: Ending Version ID (FK -> m_v_main.vid, 0 if active).
-#     - person_id: Person ID (FK -> m_maintainer_person.person_id).
-#     - web_page: Contributor homepage / web address.
-#     - pgp_key: PGP key fingerprint / ID.
-#     - description: Detailed summary of contributions.
-#     - snail_mail: Postal / snail-mail address.
-#     - ast_id: Associated AST Node ID (FK -> m_ast.ast_id).
+# 25. m_credits_entry (table_id=25): Linux CREDITS Contributor Biographies
 # -----------------------------------------------------------------------------
 m_credits_entry = Table(
     table_id=25,
     table_name="m_credits_entry",
     columns=(
         ("credit_id", "INT", "NOT NULL", "AUTO_INCREMENT"),
-        ("vid_s", "INT", "NOT NULL"),
-        ("vid_e", "INT", "NOT NULL"),
+        ("blob_id", "INT", "NOT NULL"),
         ("person_id", "INT", "NOT NULL"),
         ("web_page", "VARCHAR(255)", "NOT NULL", "COLLATE utf8mb4_bin"),
         ("pgp_key", "VARCHAR(255)", "NOT NULL", "COLLATE utf8mb4_bin"),
@@ -734,36 +655,29 @@ m_credits_entry = Table(
         ("snail_mail", "MEDIUMTEXT", "NOT NULL"),
         ("ast_id", "INT", "NOT NULL"),
     ),
-    primary=("credit_id", "vid_s"),
+    primary=("credit_id",),
     foreign=(
+        ("blob_id", "m_file_blob", "blob_id"),
         ("person_id", "m_maintainer_person", "person_id"),
         ("ast_id", "m_ast", "ast_id"),
     ),
     initial_insert=None,
     no_duplicate=True,
     te_cached=True,
+    indexes=(("credits_blob_idx", ("blob_id",)),),
     hashing_table=False,
 )
 
 # -----------------------------------------------------------------------------
-# 27. m_commit (table_id=26): Git Commit Registry
-#     - commit_id: Unique Commit ID (PK, AUTO_INCREMENT).
-#     - vid: Target Kernel Version ID (FK -> m_v_main.vid).
-#     - commit_hash: 40-char SHA-1 Git commit hash.
-#     - author_id: Commit Author Person ID (FK -> m_maintainer_person.person_id).
-#     - author_date: Author date as Unix epoch timestamp.
-#     - committer_id: Committer Person ID (FK -> m_maintainer_person.person_id).
-#     - committer_date: Committer date as Unix epoch timestamp.
-#     - subject: Single-line commit subject / summary.
-#     - message: Full commit message body (including trailers).
+# 26. m_commit (table_id=26): Git Commit Metadata & Topology Node
 # -----------------------------------------------------------------------------
 m_commit = Table(
     table_id=26,
     table_name="m_commit",
     columns=(
         ("commit_id", "INT", "NOT NULL", "AUTO_INCREMENT"),
-        ("vid", "INT", "NOT NULL"),
-        ("commit_hash", "VARCHAR(40)", "NOT NULL", "COLLATE utf8mb4_bin"),
+        ("network_id", "INT", "NOT NULL"),
+        ("commit_hash", "BINARY(20)", "NOT NULL"),
         ("author_id", "INT", "NOT NULL"),
         ("author_date", "INT", "NOT NULL"),
         ("committer_id", "INT", "NOT NULL"),
@@ -776,18 +690,16 @@ m_commit = Table(
         ("author_id", "m_maintainer_person", "person_id"),
         ("committer_id", "m_maintainer_person", "person_id"),
     ),
-    initial_insert=None,
+    initial_insert=((0, 0, b"\x00" * 20, 0, 0, 0, 0, "", ""),),
     no_duplicate=False,
     te_cached=False,
+    unique_keys=(("network_id", "commit_hash"),),
+    indexes=(("commit_author_idx", ("author_id",)),),
     hashing_table=False,
 )
 
 # -----------------------------------------------------------------------------
-# 28. m_bridge_commit_person (table_id=27): Commit Multi-Contributor Bridge
-#     - commit_id: Git Commit ID (FK -> m_commit.commit_id).
-#     - person_id: Contributor Person ID (FK -> m_maintainer_person.person_id).
-#     - role_type: Role (1: Author, 2: Committer, 3: Co-developed-by, 4: Signed-off-by, 5: Reviewed-by, 6: Acked-by, 7: Tested-by, 8: Reported-by, 9: Suggested-by).
-#     - priority: Occurrence order / rank.
+# 27. m_bridge_commit_person (table_id=27): Git Commit Contributor Attribution
 # -----------------------------------------------------------------------------
 m_bridge_commit_person = Table(
     table_id=27,
@@ -805,69 +717,68 @@ m_bridge_commit_person = Table(
     ),
     initial_insert=None,
     no_duplicate=False,
-    te_cached=False,
+    te_cached=True,
+    idempotent_pk=True,
+    indexes=(("bcp_person_idx", ("person_id",)),),
     hashing_table=False,
 )
 
 # -----------------------------------------------------------------------------
-# 29. m_bridge_commit_file (table_id=28): Commit Modified File Bridge
-#     - commit_id: Git Commit ID (FK -> m_commit.commit_id).
-#     - vid: Target Kernel Version ID (FK -> m_v_main.vid).
-#     - fid: Modified File Instance ID (FK -> m_file.fid).
-#     - change_type: Modification flag ('A'=Added, 'M'=Modified, 'D'=Deleted, 'R'=Renamed).
+# 28. m_commit_file (table_id=28): First-Parent Commit Tree Delta
 # -----------------------------------------------------------------------------
-m_bridge_commit_file = Table(
+m_commit_file = Table(
     table_id=28,
-    table_name="m_bridge_commit_file",
+    table_name="m_commit_file",
     columns=(
         ("commit_id", "INT", "NOT NULL"),
-        ("vid", "INT", "NOT NULL"),
-        ("fid", "INT", "NOT NULL"),
+        ("fnid", "INT", "NOT NULL"),
+        ("blob_id", "INT", "NOT NULL"),
+        ("old_fnid", "INT", "NOT NULL"),
+        ("old_blob_id", "INT", "NOT NULL"),
         ("change_type", "CHAR(1)", "NOT NULL"),
     ),
-    primary=("commit_id", "fid"),
+    primary=("commit_id", "fnid"),
     foreign=(
         ("commit_id", "m_commit", "commit_id"),
-        ("fid", "m_file", "fid"),
+        ("fnid", "m_file_name", "fnid"),
+        ("blob_id", "m_file_blob", "blob_id"),
     ),
     initial_insert=None,
     no_duplicate=False,
     te_cached=False,
+    idempotent_pk=True,
+    indexes=(("cf_fnid_cid_idx", ("fnid", "commit_id")), ("cf_blob_idx", ("blob_id",))),
     hashing_table=False,
 )
+m_bridge_commit_file = m_commit_file
 
 # -----------------------------------------------------------------------------
-# 30. m_bridge_commit_tag (table_id=29): Multi-Commit Tag Mapping Bridge
-#     - commit_id: Git Commit ID (FK -> m_commit.commit_id).
-#     - vid: Target Kernel Version ID (FK -> m_v_main.vid).
-#     - fid: File Instance ID (FK -> m_file.fid).
-#     - tag_id: Code Snippet Tag ID (FK -> m_tag.tag_id).
+# 29. m_bridge_commit_tag (table_id=29): Tag Lifecycle Introduced in Commit
 # -----------------------------------------------------------------------------
 m_bridge_commit_tag = Table(
     table_id=29,
     table_name="m_bridge_commit_tag",
     columns=(
         ("commit_id", "INT", "NOT NULL"),
-        ("vid", "INT", "NOT NULL"),
-        ("fid", "INT", "NOT NULL"),
+        ("blob_id", "INT", "NOT NULL"),
         ("tag_id", "INT", "NOT NULL"),
     ),
     primary=("commit_id", "tag_id"),
     foreign=(
         ("commit_id", "m_commit", "commit_id"),
-        ("fid", "m_file", "fid"),
+        ("blob_id", "m_file_blob", "blob_id"),
         ("tag_id", "m_tag", "tag_id"),
     ),
     initial_insert=None,
     no_duplicate=False,
     te_cached=False,
+    idempotent_pk=True,
+    indexes=(("bct_tag_idx", ("tag_id",)),),
     hashing_table=False,
 )
 
 # -----------------------------------------------------------------------------
-# 31. m_moved_tag (table_id=30): Tag History / Modification Evolution
-#     - s_tag_id: Source Tag ID (FK -> m_tag.tag_id).
-#     - e_tag_id: Destination Tag ID (FK -> m_tag.tag_id).
+# 30. m_moved_tag (table_id=30): Content Tag Evolution (M:N Cross-Branch DAG)
 # -----------------------------------------------------------------------------
 m_moved_tag = Table(
     table_id=30,
@@ -884,104 +795,89 @@ m_moved_tag = Table(
     initial_insert=None,
     no_duplicate=False,
     te_cached=False,
+    idempotent_pk=True,
+    indexes=(("moved_tag_end_idx", ("e_tag_id",)),),
     hashing_table=False,
 )
 
 # -----------------------------------------------------------------------------
-# 32. m_symbol_def (table_id=31): Authoritative Symbol Definition Registry
-#     - def_id: Unique Definition ID (PK, AUTO_INCREMENT).
-#     - vid: Version ID (FK -> m_v_main.vid).
-#     - fid: File Instance ID (FK -> m_file.fid).
-#     - tag_id: Definition Tag ID (FK -> m_tag.tag_id).
-#     - ast_id: Associated Canonical AST Node ID (FK -> m_ast.ast_id).
-#     - name: Symbol identifier name (e.g. "task_struct", "schedule").
-#     - type_id: AST Category ID (FK -> m_type_descriptor.type_id).
-#     - line_s / line_e: Definition source start and end line numbers.
+# 31. m_symbol_def (table_id=31): Blob-Scoped Symbol Definitions
 # -----------------------------------------------------------------------------
 m_symbol_def = Table(
     table_id=31,
     table_name="m_symbol_def",
     columns=(
         ("def_id", "INT", "NOT NULL", "AUTO_INCREMENT"),
-        ("vid", "INT", "NOT NULL"),
-        ("fid", "INT", "NOT NULL"),
+        ("blob_id", "INT", "NOT NULL"),
         ("tag_id", "INT", "NOT NULL"),
         ("ast_id", "INT", "NOT NULL"),
         ("name", "VARCHAR(255)", "NOT NULL", "COLLATE utf8mb4_bin"),
         ("type_id", "TINYINT", "UNSIGNED", "NOT NULL"),
+        ("linkage", "TINYINT", "UNSIGNED", "NOT NULL", "DEFAULT 0"),
         ("line_s", "INT", "NOT NULL"),
         ("line_e", "INT", "NOT NULL"),
     ),
     primary=("def_id",),
     foreign=(
-        ("vid", "m_v_main", "vid"),
-        ("fid", "m_file", "fid"),
+        ("blob_id", "m_file_blob", "blob_id"),
         ("tag_id", "m_tag", "tag_id"),
         ("ast_id", "m_ast", "ast_id"),
-        ("type_id", "m_type_descriptor", "type_id"),
     ),
     initial_insert=None,
     no_duplicate=False,
     te_cached=True,
-    version_scoped=True,
+    blob_scoped=True,
+    indexes=(
+        ("sym_def_blob_name_idx", ("blob_id", "name", "type_id")),
+        ("sym_def_name_idx", ("name", "type_id")),
+        ("sym_def_ast_idx", ("ast_id",)),
+    ),
     hashing_table=False,
 )
 
 # -----------------------------------------------------------------------------
-# 33. m_symbol_ref (table_id=32): Symbol Declarations & Usages Reference Index
-#     - ref_id: Unique Reference ID (PK, AUTO_INCREMENT).
-#     - vid: Version ID (FK -> m_v_main.vid).
-#     - fid: File Instance ID (FK -> m_file.fid).
-#     - tag_id: Enclosing Code Tag ID (FK -> m_tag.tag_id).
-#     - ast_id: Referenced Canonical AST Node ID (FK -> m_ast.ast_id).
-#     - role: SymbolRole category (1: Declaration, 2: TypeUsage, 3: Call, 4: MemberRef, 5: DeclRef, 6: MacroExpansion).
-#     - line: Source line number of occurrence.
-#     - char_s: Source character column offset of occurrence.
+# 32. m_symbol_ref (table_id=32): Blob-Scoped Symbol Occurrences & Usages
 # -----------------------------------------------------------------------------
 m_symbol_ref = Table(
     table_id=32,
     table_name="m_symbol_ref",
     columns=(
         ("ref_id", "INT", "NOT NULL", "AUTO_INCREMENT"),
-        ("vid", "INT", "NOT NULL"),
-        ("fid", "INT", "NOT NULL"),
+        ("blob_id", "INT", "NOT NULL"),
         ("tag_id", "INT", "NOT NULL"),
         ("ast_id", "INT", "NOT NULL"),
+        ("target_fnid", "INT", "NOT NULL", "DEFAULT 0"),
         ("role", "TINYINT", "UNSIGNED", "NOT NULL"),
         ("line", "INT", "NOT NULL"),
         ("char_s", "INT", "NOT NULL"),
     ),
     primary=("ref_id",),
     foreign=(
-        ("vid", "m_v_main", "vid"),
-        ("fid", "m_file", "fid"),
+        ("blob_id", "m_file_blob", "blob_id"),
         ("tag_id", "m_tag", "tag_id"),
         ("ast_id", "m_ast", "ast_id"),
     ),
     initial_insert=None,
     no_duplicate=False,
     te_cached=False,
-    version_scoped=True,
+    blob_scoped=True,
+    indexes=(
+        ("sym_ref_blob_idx", ("blob_id",)),
+        ("sym_ref_ast_idx", ("ast_id", "role")),
+        ("sym_ref_tgt_idx", ("target_fnid", "ast_id")),
+    ),
     hashing_table=False,
 )
 
 # -----------------------------------------------------------------------------
-# 34. m_file_reference (table_id=33): Cross-File Usage & Dependency Index
-#     - ref_id: Unique Reference ID (PK, AUTO_INCREMENT).
-#     - vid: Version ID (FK -> m_v_main.vid).
-#     - source_fid: Referencing Source File ID (FK -> m_file.fid).
-#     - target_fnid: Target File Path ID being referenced/used (FK -> m_file_name.fnid).
-#     - ref_type: Reference Type (1: Include, 2: Kconfig, 3: Kbuild, 4: Makefile, 5: Documentation).
-#     - line_no: Source line number in referencing file.
-#     - details: Additional metadata/context snippet (e.g. target object, config symbol, directive).
+# 33. m_file_reference (table_id=33): Unified Blob-Scoped Cross-File Provenance
 # -----------------------------------------------------------------------------
 m_file_reference = Table(
     table_id=33,
     table_name="m_file_reference",
     columns=(
         ("ref_id", "INT", "NOT NULL", "AUTO_INCREMENT"),
-        ("vid", "INT", "NOT NULL"),
-        ("source_fid", "INT", "NOT NULL"),
+        ("source_blob_id", "INT", "NOT NULL"),
         ("target_fnid", "INT", "NOT NULL"),
         ("ref_type", "TINYINT", "UNSIGNED", "NOT NULL"),
         ("line_no", "INT", "NOT NULL"),
@@ -989,21 +885,24 @@ m_file_reference = Table(
     ),
     primary=("ref_id",),
     foreign=(
-        ("vid", "m_v_main", "vid"),
-        ("source_fid", "m_file", "fid"),
+        ("source_blob_id", "m_file_blob", "blob_id"),
         ("target_fnid", "m_file_name", "fnid"),
     ),
     initial_insert=None,
     no_duplicate=False,
     te_cached=False,
-    version_scoped=True,
+    blob_scoped=True,
+    indexes=(
+        ("fref_src_idx", ("source_blob_id", "ref_type")),
+        ("fref_tgt_idx", ("target_fnid", "ref_type")),
+    ),
+    unique_keys=(("source_blob_id", "target_fnid", "ref_type", "line_no"),),
     hashing_table=False,
 )
+setattr(m_file_reference, "source_fid", m_file_reference.source_blob_id)
 
 # -----------------------------------------------------------------------------
-# 35. m_db_instance (table_id=34): Database Instance Lifecycle & Fingerprint
-#     - instance_hash: 64-character hexadecimal unique instance hash (PK).
-#     - created_at: Unix epoch timestamp when database instance was initialized.
+# 34. m_db_instance (table_id=34): Database Instance Fingerprint
 # -----------------------------------------------------------------------------
 m_db_instance = Table(
     table_id=34,
@@ -1014,19 +913,15 @@ m_db_instance = Table(
     ),
     primary=("instance_hash",),
     foreign=None,
-    initial_insert=((secrets.token_hex(32), int(time.time())),),
-    no_duplicate=True,
+    initial_insert=None,
+    no_duplicate=False,
     te_cached=False,
-    version_scoped=False,
+    idempotent_pk=True,
     hashing_table=False,
 )
 
 # -----------------------------------------------------------------------------
-# 36. m_ast_attribute (table_id=35): AST Compiler & Kernel Attributes
-#     - ast_id: Target AST Node ID (FK -> m_ast.ast_id).
-#     - priority: Positional rank/order index (0, 1, 2...).
-#     - name: Attribute identifier (e.g. "section", "aligned", "read_mostly").
-#     - val: Attribute argument or value string (e.g. ".init.text", "64", "").
+# 35. m_ast_attribute (table_id=35): AST Compiler & Kernel Attributes
 # -----------------------------------------------------------------------------
 m_ast_attribute = Table(
     table_id=35,
@@ -1038,66 +933,196 @@ m_ast_attribute = Table(
         ("val", "VARCHAR(255)", "DEFAULT ''", "COLLATE utf8mb4_bin"),
     ),
     primary=("ast_id", "priority"),
+    foreign=(("ast_id", "m_ast", "ast_id"),),
+    initial_insert=None,
+    no_duplicate=False,
+    te_cached=False,
+    idempotent_pk=True,
+    hashing_table=False,
+)
+
+# -----------------------------------------------------------------------------
+# 36. m_git_network (table_id=36): Git Object Pool & Root Commit Scope
+# -----------------------------------------------------------------------------
+m_git_network = Table(
+    table_id=36,
+    table_name="m_git_network",
+    columns=(
+        ("network_id", "INT", "NOT NULL", "AUTO_INCREMENT"),
+        ("project_id", "INT", "NOT NULL"),
+        ("name", "VARCHAR(64)", "NOT NULL", "COLLATE utf8mb4_bin"),
+        ("root_commit_hash", "BINARY(20)", "NOT NULL"),
+    ),
+    primary=("network_id",),
+    foreign=(("project_id", "m_project", "project_id"),),
+    initial_insert=((0, 0, "default", b"\x00" * 20),),
+    no_duplicate=False,
+    te_cached=True,
+    unique_keys=(("root_commit_hash",),),
+    hashing_table=False,
+)
+
+# -----------------------------------------------------------------------------
+# 37. m_repository (table_id=37): Repository Remote / Clone Descriptor
+# -----------------------------------------------------------------------------
+m_repository = Table(
+    table_id=37,
+    table_name="m_repository",
+    columns=(
+        ("repo_id", "INT", "NOT NULL", "AUTO_INCREMENT"),
+        ("network_id", "INT", "NOT NULL"),
+        ("name", "VARCHAR(64)", "NOT NULL", "COLLATE utf8mb4_bin"),
+        ("git_url", "VARCHAR(255)", "NOT NULL", "COLLATE utf8mb4_bin"),
+        ("default_branch", "VARCHAR(64)", "NOT NULL", "DEFAULT 'main'", "COLLATE utf8mb4_bin"),
+    ),
+    primary=("repo_id",),
+    foreign=(("network_id", "m_git_network", "network_id"),),
+    initial_insert=((0, 0, "default", "", "main"),),
+    no_duplicate=True,
+    unique_keys=(("network_id", "name"),),
+    te_cached=True,
+    hashing_table=False,
+)
+
+# -----------------------------------------------------------------------------
+# 38. m_git_ref (table_id=38): Named Git Reference (Branch, Tag, Release)
+# -----------------------------------------------------------------------------
+m_git_ref = Table(
+    table_id=38,
+    table_name="m_git_ref",
+    columns=(
+        ("ref_id", "INT", "NOT NULL", "AUTO_INCREMENT"),
+        ("repo_id", "INT", "NOT NULL"),
+        ("ref_type", "TINYINT", "UNSIGNED", "NOT NULL"),
+        ("ref_name", "VARCHAR(255)", "NOT NULL", "COLLATE utf8mb4_bin"),
+        ("commit_id", "INT", "NOT NULL"),
+        ("tagger_id", "INT", "NULL"),
+        ("tagger_date", "INT", "NULL"),
+        ("tag_message", "TEXT", "NULL"),
+    ),
+    primary=("ref_id",),
     foreign=(
-        ("ast_id", "m_ast", "ast_id"),
+        ("repo_id", "m_repository", "repo_id"),
+        ("commit_id", "m_commit", "commit_id"),
+    ),
+    initial_insert=((0, 0, 1, "default", 0, None, None, None),),
+    no_duplicate=False,
+    te_cached=True,
+    unique_keys=(("repo_id", "ref_name"),),
+    indexes=(("git_ref_cid_idx", ("commit_id",)),),
+    hashing_table=False,
+)
+m_v_main = m_git_ref
+setattr(m_git_ref, "vid", m_git_ref.commit_id)
+setattr(m_git_ref, "vname", m_git_ref.ref_name)
+
+# -----------------------------------------------------------------------------
+# 39. m_commit_parent (table_id=39): Full Git Commit Topology (First & Merge Parents)
+# -----------------------------------------------------------------------------
+m_commit_parent = Table(
+    table_id=39,
+    table_name="m_commit_parent",
+    columns=(
+        ("commit_id", "INT", "NOT NULL"),
+        ("parent_commit_id", "INT", "NOT NULL"),
+        ("parent_idx", "SMALLINT", "UNSIGNED", "NOT NULL"),
+    ),
+    primary=("commit_id", "parent_idx"),
+    foreign=(
+        ("commit_id", "m_commit", "commit_id"),
+        ("parent_commit_id", "m_commit", "commit_id"),
+    ),
+    initial_insert=None,
+    no_duplicate=False,
+    te_cached=True,
+    idempotent_pk=True,
+    indexes=(("cp_parent_idx", ("parent_commit_id", "parent_idx")),),
+    hashing_table=False,
+)
+
+# -----------------------------------------------------------------------------
+# 40. m_ingest_state (table_id=40): Atomic Ingestion Progress & Crash Recovery
+# -----------------------------------------------------------------------------
+m_ingest_state = Table(
+    table_id=40,
+    table_name="m_ingest_state",
+    columns=(
+        ("network_id", "INT", "NOT NULL"),
+        ("commit_id", "INT", "NOT NULL"),
+        ("status", "TINYINT", "UNSIGNED", "NOT NULL"),
+        ("updated_at", "BIGINT", "NOT NULL"),
+    ),
+    primary=("network_id", "commit_id"),
+    foreign=(
+        ("network_id", "m_git_network", "network_id"),
+        ("commit_id", "m_commit", "commit_id"),
     ),
     initial_insert=None,
     no_duplicate=False,
     te_cached=False,
+    idempotent_pk=True,
     hashing_table=False,
 )
 
+# -----------------------------------------------------------------------------
+# Exported Table Array tuple
+# -----------------------------------------------------------------------------
 TABLES: tuple[Table, ...] = (
-    m_v_main,
-    m_file_name,
-    m_file,
-    m_bridge_file,
-    m_moved_file,
-    m_type_descriptor,
-    m_ast,
-    m_ast_container,
-    m_ast_include,
-    m_ast_debug,
-    m_tag_code,
-    m_tag,
-    m_bridge_tag,
-    m_map_ast,
-    m_bridge_map,
-    m_ast_hash,
-    m_kconfig_symbol,
-    m_kconfig_relation,
-    m_kconfig_tree,
-    m_kconfig_kbuild,
-    m_maintainer_person,
-    m_maintainer_section,
-    m_maintainer_member,
-    m_maintainer_pattern,
-    m_maintainer_file,
-    m_credits_entry,
-    m_commit,
-    m_bridge_commit_person,
-    m_bridge_commit_file,
-    m_bridge_commit_tag,
-    m_moved_tag,
-    m_symbol_def,
-    m_symbol_ref,
-    m_file_reference,
-    m_db_instance,
-    m_ast_attribute,
+    m_project,             # 0
+    m_file_name,           # 1
+    m_file_blob,           # 2
+    m_bridge_checkpoint,   # 3
+    m_blob_transition,     # 4
+    m_type_descriptor,     # 5
+    m_ast,                 # 6
+    m_ast_container,       # 7
+    m_ast_include,         # 8
+    m_ast_debug,           # 9
+    m_tag_code,            # 10
+    m_tag,                 # 11
+    m_bridge_tag,          # 12
+    m_map_ast,             # 13
+    m_bridge_map,          # 14
+    m_ast_hash,            # 15
+    m_kconfig_symbol,      # 16
+    m_kconfig_relation,    # 17
+    m_kconfig_tree,        # 18
+    m_kconfig_kbuild,      # 19
+    m_maintainer_person,   # 20
+    m_maintainer_section,  # 21
+    m_maintainer_member,   # 22
+    m_maintainer_pattern,  # 23
+    m_maintainer_file,     # 24
+    m_credits_entry,       # 25
+    m_commit,              # 26
+    m_bridge_commit_person,# 27
+    m_commit_file,         # 28
+    m_bridge_commit_tag,   # 29
+    m_moved_tag,           # 30
+    m_symbol_def,          # 31
+    m_symbol_ref,          # 32
+    m_file_reference,      # 33
+    m_db_instance,         # 34
+    m_ast_attribute,       # 35
+    m_git_network,         # 36
+    m_repository,          # 37
+    m_git_ref,             # 38
+    m_commit_parent,       # 39
+    m_ingest_state,        # 40
 )
+
+Table_Array = TABLES
 
 
 def init_db_layout(gp=None) -> tuple[Table, ...]:
-    """Initialize and populate gp.Table_Array with the default 35 schema tables.
-    
+    """Initialize and populate gp.Table_Array with all 41 schema tables.
+
     Args:
         gp: Optional GreatProcessor instance to attach Table_Array to.
-        
-        
+
     Returns:
-        Immutable tuple of all 35 Table schema objects.
+        Immutable tuple of all 41 Table schema objects.
     """
     if gp is not None:
         gp.Table_Array = list(TABLES)
     return TABLES
-

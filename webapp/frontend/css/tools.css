@@ -133,3 +133,452 @@
   font-size: 10px;
   color: var(--text-muted);
 }
+
+/* Compare view (versions / commits) */
+.compare-view {
+  gap: 14px;
+}
+
+.compare-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 12px;
+  border-bottom: 1px solid var(--border-color);
+  padding-bottom: 12px;
+}
+
+.compare-title {
+  font-size: 18px;
+  font-weight: 600;
+  color: var(--accent-orange);
+}
+
+.compare-subtitle {
+  font-size: 12px;
+  color: var(--text-muted);
+  margin-top: 4px;
+}
+
+.compare-refs {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.compare-ref-btn {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  min-width: 120px;
+  padding: 4px 10px;
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-md);
+  background: var(--bg-secondary);
+  text-align: left;
+}
+
+.compare-ref-btn:hover {
+  border-color: var(--border-focus);
+}
+
+.compare-ref-role {
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+
+.compare-ref-value {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--accent-blue);
+}
+
+.compare-modes {
+  display: flex;
+  gap: 8px;
+}
+
+.compare-mode-count {
+  font-family: var(--font-mono);
+  color: var(--text-muted);
+}
+
+.compare-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-bottom: 10px;
+}
+
+.compare-chips {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  font-size: 12px;
+}
+
+.compare-chip {
+  padding: 2px 10px;
+  border: 1px solid var(--border-color);
+  border-radius: 999px;
+  color: var(--text-secondary);
+  background: var(--bg-secondary);
+}
+
+.compare-chip:hover {
+  border-color: var(--border-focus);
+}
+
+.compare-chip.active {
+  color: var(--text-primary);
+  border-color: currentColor;
+}
+
+.compare-chip.added .compare-chip-count { color: var(--accent-green); }
+.compare-chip.modified .compare-chip-count { color: var(--accent-yellow); }
+.compare-chip.deleted .compare-chip-count { color: var(--accent-red); }
+.compare-chip.renamed .compare-chip-count { color: var(--accent-purple); }
+
+.compare-chip-count {
+  font-weight: 600;
+  font-family: var(--font-mono);
+}
+
+.compare-chip-static {
+  color: var(--text-muted);
+  padding: 2px 4px;
+}
+
+.compare-chip-sep {
+  width: 1px;
+  height: 14px;
+  background: var(--border-color);
+}
+
+.kc-added { color: var(--accent-green); }
+.kc-removed { color: var(--accent-red); }
+.kc-changed { color: var(--accent-yellow); }
+
+.compare-filter {
+  width: 260px;
+  max-width: 100%;
+  padding: 4px 8px;
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-sm);
+  font-size: 12px;
+  outline: none;
+}
+
+.compare-filter:focus {
+  border-color: var(--border-focus);
+}
+
+.compare-warning {
+  padding: 8px 12px;
+  margin-bottom: 10px;
+  border: 1px solid rgba(210, 153, 34, 0.4);
+  border-radius: var(--radius-md);
+  background: rgba(210, 153, 34, 0.08);
+  color: var(--accent-yellow);
+  font-size: 12px;
+}
+
+.compare-columns {
+  display: grid;
+  grid-template-columns: minmax(0, 3fr) minmax(0, 2fr);
+  gap: 14px;
+}
+
+@media (max-width: 1100px) {
+  .compare-columns {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+.compare-card .compare-list {
+  max-height: 60vh;
+  overflow-y: auto;
+}
+
+.compare-list {
+  display: flex;
+  flex-direction: column;
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+
+.compare-row {
+  border-bottom: 1px solid var(--border-muted);
+}
+
+.compare-row-main {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 4px 8px;
+  cursor: pointer;
+  border-radius: 3px;
+}
+
+.compare-row-main:hover,
+.compare-row.expanded > .compare-row-main {
+  background: var(--bg-hover);
+}
+
+.compare-status {
+  flex-shrink: 0;
+  width: 18px;
+  text-align: center;
+  font-weight: 700;
+}
+
+.compare-status.added { color: var(--accent-green); }
+.compare-status.modified,
+.compare-status.changed { color: var(--accent-yellow); }
+.compare-status.deleted,
+.compare-status.removed { color: var(--accent-red); }
+.compare-status.renamed { color: var(--accent-purple); }
+
+.compare-row-path {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-primary);
+}
+
+.compare-row-old {
+  color: var(--text-muted);
+  margin-right: 6px;
+}
+
+.compare-row-syms {
+  flex-shrink: 0;
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.compare-row-actions {
+  display: flex;
+  gap: 4px;
+  flex-shrink: 0;
+  opacity: 0;
+}
+
+.compare-row-main:hover .compare-row-actions,
+.compare-row.expanded .compare-row-actions {
+  opacity: 1;
+}
+
+.compare-row-diff {
+  margin: 4px 8px 10px 36px;
+}
+
+.compare-row-diff .diff-content {
+  max-height: 480px;
+  overflow: auto;
+  user-select: text;
+}
+
+.compare-diff-note {
+  margin-left: 8px;
+  color: var(--text-muted);
+  font-weight: normal;
+}
+
+.compare-diff-loading { color: var(--text-muted); }
+.compare-diff-error { color: var(--accent-red); }
+
+.compare-more {
+  margin: 8px auto;
+  padding: 4px 14px;
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-sm);
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+
+.compare-more:hover {
+  border-color: var(--border-focus);
+  color: var(--text-primary);
+}
+
+.compare-empty {
+  padding: 16px;
+  color: var(--text-muted);
+  font-family: var(--font-sans);
+  font-size: 12px;
+}
+
+.compare-empty.error {
+  color: var(--accent-red);
+}
+
+.compare-sym-detail {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+  margin: 2px 8px 10px 36px;
+  padding: 8px 10px;
+  background: var(--bg-primary);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-sm);
+  font-size: 11px;
+}
+
+.compare-sym-side-title {
+  font-weight: 600;
+  color: var(--text-muted);
+  margin-bottom: 4px;
+}
+
+.compare-sym-def {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 2px 0;
+}
+
+.compare-sym-file {
+  color: var(--accent-blue);
+  cursor: pointer;
+}
+
+.compare-sym-file:hover { text-decoration: underline; }
+.compare-sym-type { color: var(--accent-purple); }
+.compare-sym-prompt { color: var(--text-secondary); }
+.compare-sym-default { color: var(--accent-cyan); }
+.compare-sym-none { color: var(--text-muted); font-style: italic; }
+
+/* Treemap view */
+.treemap-view {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  background: var(--bg-primary);
+}
+
+.treemap-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 6px 12px;
+  background: var(--bg-secondary);
+  border-bottom: 1px solid var(--border-color);
+  font-size: 12px;
+}
+
+.treemap-crumbs a {
+  color: var(--accent-blue);
+  text-decoration: none;
+}
+
+.treemap-crumbs a:hover {
+  text-decoration: underline;
+}
+
+.treemap-sep {
+  margin: 0 4px;
+  color: var(--text-muted);
+}
+
+.treemap-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.treemap-summary {
+  margin-right: 6px;
+  color: var(--text-muted);
+}
+
+.treemap-canvas {
+  position: relative;
+  flex: 1;
+  margin: 8px;
+  overflow: hidden;
+}
+
+.treemap-loading {
+  padding: 20px;
+  color: var(--text-muted);
+}
+
+.treemap-loading.error {
+  color: var(--accent-red);
+}
+
+.treemap-cell {
+  position: absolute;
+  box-sizing: border-box;
+  border: 1px solid var(--bg-primary);
+  background: color-mix(in srgb, var(--tm-color) 28%, var(--bg-secondary));
+  overflow: hidden;
+  cursor: pointer;
+}
+
+.treemap-cell:hover {
+  background: color-mix(in srgb, var(--tm-color) 42%, var(--bg-secondary));
+}
+
+.treemap-label {
+  padding: 2px 5px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-primary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  pointer-events: none;
+}
+
+.treemap-sub {
+  position: absolute;
+  box-sizing: border-box;
+  border: 1px solid rgba(13, 17, 23, 0.55);
+  background: rgba(255, 255, 255, 0.04);
+  font-size: 10px;
+  color: var(--text-secondary);
+  overflow: hidden;
+}
+
+.treemap-sub span {
+  display: block;
+  padding: 1px 4px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  pointer-events: none;
+}
+
+.treemap-sub:hover {
+  background: rgba(255, 255, 255, 0.12);
+}
+
+.treemap-tooltip {
+  position: absolute;
+  z-index: 5;
+  max-width: 250px;
+  padding: 6px 9px;
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-md);
+  font-size: 11px;
+  pointer-events: none;
+}
+
+.treemap-tooltip span {
+  color: var(--text-muted);
+}

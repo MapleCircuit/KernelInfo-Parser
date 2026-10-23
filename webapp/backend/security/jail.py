@@ -5,9 +5,9 @@ and symbolic link escapes outside of the configured Linux repository directory.
 """
 from __future__ import annotations
 import os
+from webapp.backend.config import get_repo_dir
 from pathlib import Path
 from fastapi import HTTPException
-from webapp.backend.config import LINUX_REPO_DIR
 
 
 def is_safe_rel_path(path_str: str) -> bool:
@@ -37,7 +37,7 @@ def resolve_and_verify_repo_path(requested_path: str, repo_base: Path | None = N
     if "\0" in requested_path:
         raise HTTPException(status_code=400, detail="Malformed path: null byte detected.")
     
-    base_dir = (repo_base or LINUX_REPO_DIR).resolve()
+    base_dir = (repo_base or get_repo_dir()).resolve()
     
     # Normalize forward/backward slashes and remove leading root slashes
     clean_rel = os.path.normpath(requested_path.strip().replace("\\", "/"))

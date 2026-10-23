@@ -14,11 +14,11 @@ KCONFIG & KBUILD PARSING PIPELINE
 --------------------------------------------------------------------------------------------------
 Kconfig Source File (Kconfig*)
   │
-  ├─ Git Operation: "R100" (Exact Rename) ──► No-op (Preserves old fid and tags)
+  ├─ Git Operation: "R100" (Exact Rename) ──► No-op (Preserves old blob and tags)
   │
   ├─ Git Operation: "D" (Deleted)
-  │  ├─ get_prior_tags(CS) ──► Queries old_vid tags via m_bridge_tag.view_get_multiple
-  │  └─ close_prior_tags(CS) ─► Closes unreferenced prior tags via m_tag.update(vid_e=Old_VID)
+  │  ├─ get_prior_tags(CS) ──► Queries old_vid tags via 3-way join (m_bridge_tag -> m_tag -> m_ast)
+  │  └─ close_prior_tags(CS) ─► No-op under immutable Git DAG architecture
   │
   └─ Git Operation: "A" / "M" / "R*" (Added / Modified / Content Rename)
      ├─ get_prior_tags(CS) (if M or R*)
@@ -37,16 +37,16 @@ Lexical Scanning & Recursive Descent Grammar:
   ▼ [KconfigManager.extract_item() -> Relational ChangeSet Staging]
 Relational Database Mapping:
   ├── AST Symbol Staging: m_ast.view [Rule 23]
-  ├── Core Code Tag Staging: m_tag.set (Rule 12 order), m_tag_code, m_bridge_tag, m_map_ast, m_bridge_map
-  ├── Symbol Registry: m_kconfig_symbol (Table 16)
-  ├── Dependency & Reverse-Dependency Graph: m_kconfig_relation (Table 17)
-  └── Menuconfig UI Hierarchy: m_kconfig_tree (Table 18)
+  ├── Core Code Tag Staging: m_tag.set (5-col, Rule 12 order), m_tag_code, m_bridge_tag (6-col), m_map_ast, m_bridge_map
+  ├── Symbol Registry: m_kconfig_symbol (Table 16, 7-col content deduplicated)
+  ├── Dependency & Reverse-Dependency Graph: m_kconfig_relation (Table 17, 6-col)
+  └── Menuconfig UI Hierarchy: m_kconfig_tree (Table 18, 9-col blob-scoped)
   │
   ▼ [Post-Processing: processing_kbuild(version) (main.py + kbuild_parser.py)]
 Kbuild / Makefile Integration:
   ├── KbuildParser: Scans all Makefiles & Kbuild files in the kernel tree
   ├── Extracts bindings: obj-$(CONFIG_XYZ) += target.o, composite targets (target-objs := a.o b.o)
-  └── Staging: m_kconfig_kbuild (Table 19) links kcid -> (vid, fid, compile_mode, target_obj)
+  └── Staging: m_kconfig_kbuild (Table 19) links kcid -> (makefile_blob_id, target_fnid, compile_mode, target_obj)
 ==================================================================================================
 ```
 
@@ -71,13 +71,11 @@ Kbuild / Makefile Integration:
    ```
 
 2. **Occurrence Tagging & Deduplication (Rule 12 Order)**:
-   `m_tag.set` **must be the first operation** inside `with CS(REF_POS):`:
+   `m_tag.set` **must be the first operation** inside `with CS(REF_POS):` using the zero-VID 5-column schema:
    ```python
    with CS(REF_POS):
        CS.store(m_tag.set(
            None,            # tag_id (AUTO_INCREMENT)
-           CS.gp.VID,       # vid_s
-           0,               # vid_e (active = 0)
            code_hash,       # 32-byte binary SHA-256 digest
            ast_ref,         # reference to m_ast node
            0,               # hl_s
@@ -89,16 +87,17 @@ Kbuild / Makefile Integration:
            CS.store(m_moved_tag.set(s_tag_id, tag_ref))
    ```
 
-3. **Spatial Mapping**:
+3. **Spatial Mapping & Blob Bridging**:
    ```python
-   CS.store(m_bridge_tag.set(
-       ((m_file.table_id, 0), OP_REF, (REF_ROOT,)),
-       tag_ref,
-       extent.line_pos[0],
-       extent.line_pos[1],
-       extent.char_pos[0],
-       extent.char_pos[1],
-   ))
+   with CS(REF_POS):
+       CS.store(m_bridge_tag.set(
+           ((m_file.table_id, 0), OP_REF, (REF_ROOT,)),
+           tag_ref,
+           extent.line_pos[0],
+           extent.line_pos[1],
+           extent.char_pos[0],
+           extent.char_pos[1],
+       ))
    CS.store(m_map_ast.set(tag_ref, 1, 1, rel_line_e, rel_char_e, ast_ref))
    CS.store(m_bridge_map.set(tag_ref, tag_ref))
    ```
@@ -107,10 +106,10 @@ Kbuild / Makefile Integration:
 
 | Table ID | Table Name | Columns | Primary Key | `no_duplicate` | Description |
 | :---: | :--- | :--- | :--- | :---: | :--- |
-| **16** | `m_kconfig_symbol` | `(kcid, vid_s, vid_e, name, type, prompt, def_val, help, ast_id)` | `("kcid", "vid_s")` | `True` | Normalized Kconfig symbol definitions. Type codes: 1=bool, 2=tristate, 3=string, 4=hex, 5=int, 0=unknown. |
+| **16** | `m_kconfig_symbol` | `(kcid, name, type, prompt, def_val, help, ast_id)` | `("kcid",)` | `True` | Content-deduplicated Kconfig symbol definitions. Type codes: 1=bool, 2=tristate, 3=string, 4=hex, 5=int, 0=unknown. |
 | **17** | `m_kconfig_relation` | `(rel_id, kcid, target_name, rel_type, cond_ast_id, priority)` | `("rel_id",)` | `True` | Direct dependencies & reverse dependencies. Relation types: `1=depends_on`, `2=select`, `3=imply`, `4=choice_member`. |
-| **18** | `m_kconfig_tree` | `(tree_id, vid, parent_id, node_type, title, kcid, priority, dep_ast_id, ast_id)` | `("tree_id", "vid")` | `False` | Hierarchical Menuconfig tree. Node types: `1=root`, `2=menu`, `3=config`, `4=menuconfig`, `5=choice`, `6=if`, `7=comment`. |
-| **19** | `m_kconfig_kbuild` | `(kcid, vid, fid, compile_mode, target_obj)` | `("kcid", "vid", "fid", "compile_mode")` | `False` | Compiled file & object mappings. Compile modes: `1=built-in` (`y`), `2=module` (`m`), `3=conditional` (`y/m`). |
+| **18** | `m_kconfig_tree` | `(tree_id, blob_id, parent_id, node_type, title, kcid, priority, dep_ast_id, ast_id)` | `("tree_id",)` | `False` | Hierarchical Menuconfig tree scoped to `blob_id`. Node types: `1=menu`, `2=choice`, `3=config`, `4=menuconfig`, `5=comment`. |
+| **19** | `m_kconfig_kbuild` | `(kcid, makefile_blob_id, target_fnid, compile_mode, target_obj)` | `("kcid", "makefile_blob_id", "target_fnid", "compile_mode", "target_obj")` | `False` | Compiled file & object mappings scoped to Makefile blobs. Compile modes: `1=built-in` (`y`), `2=module` (`m`), `3=conditional` (`y/m`). |
 
 #### Example: Staging `m_kconfig_relation`
 ```python
@@ -144,7 +143,7 @@ The parser implements a robust grammar for Linux Kconfig constructs:
 
 ---
 
-## 4. Tag Lifecycle & Cross-Version Evolution
+## 4. Tag Lifecycle & Content Addressable Deduplication
 
 Kconfig files track tag continuity across kernel releases using `c_ast` tag tracking utilities ([tag_tracker.py](parser/c_ast/tag_tracker.py)):
 
@@ -153,7 +152,9 @@ Kconfig files track tag continuity across kernel releases using `c_ast` tag trac
 2. **Prior Tag Evolution (`match_prior_tag_transition`)**:
    When a Kconfig symbol's help text, prompt, or default values change between kernel versions, the transition engine detects the modified symbol and stages `m_moved_tag(s_tag_id, tag_ref)`.
 3. **Symbol Lifecycle (`m_kconfig_symbol`)**:
-   Unchanged symbols carry over across versions. Modified symbols close their prior record with `vid_e = Old_VID` and insert a new record for `VID`.
+   Symbols are content-deduplicated globally (`no_duplicate=True`) without version columns. Blob-specific hierarchy binds each menu node to its containing file via `m_kconfig_tree.blob_id`.
+4. **Immutable Tag Closing**:
+   Under the Git DAG architecture, prior tags are immutable; `close_prior_tags(CS)` operates as a safe no-op.
 
 ---
 
@@ -182,9 +183,9 @@ The Kbuild parser maps Kconfig configuration symbols to concrete C, ASM, and obj
      - `OBJ_ASSIGN_RE`: Matches `obj-$(CONFIG_XYZ) += target.o`, `obj-y += ...`, `obj-m += ...`.
      - `COMPOSITE_RE`: Matches composite object rules `target-y := a.o b.o`, `target-objs := ...`.
   4. Resolves `.o` object goals to underlying `.c` and `.S` source files.
-  5. Maps relative file paths to `fid` in `m_bridge_file`.
+  5. Maps relative file paths to `target_fnid` in `m_file_name`.
   6. Queries `m_kconfig_symbol` for `kcid` by symbol name.
-  7. Stages batches into `m_kconfig_kbuild.set(kcid, vid, fid, compile_mode, target_obj)`.
+  7. Stages batches into `m_kconfig_kbuild.set(kcid, makefile_blob_id, target_fnid, compile_mode, target_obj)`.
 
 ### 6.2. Compile Modes
 - `compile_mode = 1`: Built-in compilation (`y` / `obj-y`).
@@ -202,4 +203,4 @@ The Kbuild parser maps Kconfig configuration symbols to concrete C, ASM, and obj
 3. **Expression Tree Flattening**:
    Deep boolean expressions (e.g. chained `A && B && C && D`) are evaluated iteratively to prevent Python `RecursionError` exceptions on complex platform dependencies.
 4. **Zero-Duplication Kbuild Ingestion**:
-   `m_kconfig_kbuild` uses primary key `("kcid", "vid", "fid", "compile_mode")` with direct TableEngine caching to prevent redundant insertions across multi-directory Makefiles.
+   `m_kconfig_kbuild` uses primary key `("kcid", "makefile_blob_id", "target_fnid", "compile_mode")` with direct TableEngine caching to prevent redundant insertions across multi-directory Makefiles.

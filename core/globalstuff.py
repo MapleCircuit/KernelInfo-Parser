@@ -7,6 +7,7 @@ import re
 from pathlib import Path
 from core.StringWrangler import wrap_lines, render_ansi_box, render_with_indent
 import contextlib
+import time
 from typing import Self
 from functools import wraps
 import hashlib
@@ -116,7 +117,8 @@ class GlobalStuff:
         self.MF = None
         self.RAMDISK = "/dev/shm"  # noqa: S108
         self.CPUS = 8
-        self.linux_directory = Path("linux")
+        # Placeholder until main() / webapp config select the configured repository (core.config.get_repository)
+        self.linux_directory = Path(__file__).resolve().parent.parent / "repos" / "linux"
         self.CLEAN_PRINT = True
 
         self.BP_ON_SHUTDOWN = False
@@ -151,6 +153,8 @@ class GlobalStuff:
 
         # Profiling Facility
         self.PROFILING_ENABLED = False
+        self.EXECUTION_DEADLINE: float | None = None
+        self.STAGE_PROFILER: any = None
 
         # Memory Profile Management: "normal" | "low" | "very_low"
         self.MEMORY_MODE: str = "normal"
@@ -177,6 +181,39 @@ class GlobalStuff:
     def VERY_LOW_MEMORY_MODE(self) -> bool:
         """Return True if running in very low memory mode."""
         return self.MEMORY_MODE == "very_low"
+
+    def set_execution_deadline(self, duration_s: float | None) -> None:
+        """Set an execution deadline in seconds from now."""
+        if duration_s is not None:
+            self.EXECUTION_DEADLINE = time.time() + duration_s
+        else:
+            self.EXECUTION_DEADLINE = None
+
+    def is_deadline_exceeded(self) -> bool:
+        """Return True if execution deadline has been reached."""
+        if self.EXECUTION_DEADLINE is None:
+            return False
+        return time.time() >= self.EXECUTION_DEADLINE
+
+    def get_time_remaining(self) -> float | None:
+        """Return seconds remaining until deadline, or None if unlimited."""
+        if self.EXECUTION_DEADLINE is None:
+            return None
+        return max(0.0, self.EXECUTION_DEADLINE - time.time())
+
+    @contextlib.contextmanager
+    def measure_stage(self, name: str, count: int = 0, units: str = "items"):
+        """Context manager to measure the execution duration of a stage if profiling is active."""
+        if getattr(self, "STAGE_PROFILER", None) is not None:
+            self.STAGE_PROFILER.start_stage(name)
+            stage = self.STAGE_PROFILER.stages.get(name)
+            try:
+                yield stage
+            finally:
+                final_count = stage.count if (stage is not None and stage.count > 0) else count
+                self.STAGE_PROFILER.stop_stage(name, count=final_count, units=units)
+        else:
+            yield None
 
     def emergency_shutdown(self, number_error: int = 1) -> None:
         """Close the program cleanly by deleting the git files."""
@@ -652,6 +689,25 @@ class ASTT(IntEnum):
     Maintainer_Bug = auto()
     Maintainer_Chat = auto()
     Maintainer_Patchwork = auto()
+    ## Extended C Width, Floating-Point, Vector & Bitfield Types
+    C_Bitfield = auto()
+    C_char16 = auto()
+    C_char32 = auto()
+    C_wchar = auto()
+    C_longdouble = auto()
+    C_float128 = auto()
+    C_float16 = auto()
+    C_Vector = auto()
+    C_vla = auto()
+
+
+class SymbolLinkage(IntEnum):
+    ExternalDef = 0       # Global non-static definition
+    InternalStaticDef = 1 # File-local static definition in a .c file
+    PrototypeDecl = 2     # Forward declaration or header prototype without body
+    InlineHeaderDef = 3   # static inline or extern inline definition in a header (.h)
+    WeakOrAliasDef = 4    # __weak or __alias(...) definition
+    MacroOrKernelDef = 5  # Preprocessor #define, SYSCALL_DEFINE*, TRACE_EVENT, DEFINE_SPINLOCK, EXPORT_SYMBOL
 
 
 class SymbolRole(IntEnum):
@@ -738,6 +794,17 @@ STANDARD_C_KEYWORDS: dict[str, ASTT] = {
     "__typeof": ASTT.C_TypeofExpr,
     "static_assert": ASTT.C_StaticAssert,
     "_Static_assert": ASTT.C_StaticAssert,
+    "_Float128": ASTT.C_float128,
+    "__float128": ASTT.C_float128,
+    "_Float16": ASTT.C_float16,
+    "__fp16": ASTT.C_float16,
+    "char16_t": ASTT.C_char16,
+    "char32_t": ASTT.C_char32,
+    "wchar_t": ASTT.C_wchar,
+    "__int128": ASTT.C_int128,
+    "__int128_t": ASTT.C_int128,
+    "__uint128_t": ASTT.C_int128,
+    "_Complex": ASTT.C_complex,
 }
 
 
@@ -769,25 +836,137 @@ _MEMORY_GUARD_INITIALIZED: bool = False
 
 
 def setup_memory_limit(limit_gb: float = 60.0) -> None:
-    """Enforce a hard address space limit (RLIMIT_AS) to prevent Linux OOM kernel freezes."""
+    """Enforce a 60GB boundary via Linux cgroups v2 (memory.max, memory.high, memory.oom.group)
+    with graceful fallback to per-process address space limit (RLIMIT_AS)."""
     global _MEMORY_GUARD_INITIALIZED
     if _MEMORY_GUARD_INITIALIZED:
         return
     if not sys.platform.startswith("linux"):
         return
+
+    limit_bytes = int(limit_gb * 1024 * 1024 * 1024)
+    high_bytes = int(limit_gb * 0.9 * 1024 * 1024 * 1024)
+    logger = logging.getLogger("core.globalstuff")
+
+    # 1. Check if process is already running inside an active cgroups v2 memory-constrained scope
+    try:
+        cg_path = None
+        if os.path.exists("/proc/self/cgroup"):
+            with open("/proc/self/cgroup", "r") as f:
+                for line in f:
+                    parts = line.strip().split(":")
+                    if len(parts) >= 3 and (parts[0] == "0" or not parts[1]):
+                        cg_path = parts[2]
+                        break
+
+        if cg_path:
+            full_cg_dir = f"/sys/fs/cgroup{cg_path}"
+            mem_max_file = os.path.join(full_cg_dir, "memory.max")
+            if os.path.isfile(mem_max_file):
+                with open(mem_max_file, "r") as f:
+                    val = f.read().strip()
+                if val != "max" and int(val) <= limit_bytes:
+                    # Already constrained by cgroups v2
+                    oom_group_file = os.path.join(full_cg_dir, "memory.oom.group")
+                    if os.path.isfile(oom_group_file) and os.access(oom_group_file, os.W_OK):
+                        with open(oom_group_file, "w") as f:
+                            f.write("1")
+                    mem_high_file = os.path.join(full_cg_dir, "memory.high")
+                    if os.path.isfile(mem_high_file) and os.access(mem_high_file, os.W_OK):
+                        with open(mem_high_file, "w") as f:
+                            f.write(str(high_bytes))
+
+                    _MEMORY_GUARD_INITIALIZED = True
+                    logger.info(
+                        COLOR.green(
+                            f"[Memory Guard] Active cgroups v2 boundary verified: "
+                            f"max={int(val) / (1024**3):.1f} GB, high={high_bytes / (1024**3):.1f} GB, oom.group=1 ({cg_path})"
+                        )
+                    )
+                    return
+    except Exception as e:
+        logger.debug(f"[Memory Guard] cgroups inspection check skipped: {e}")
+
+    # 2. If unconstrained and systemd-run is available, re-exec inside a dedicated cgroup scope (except in unit tests)
+    is_unit_test = any(arg in sys.argv for arg in ("-u", "--unit-test")) or "unittest" in sys.modules or "pytest" in sys.modules
+    if not is_unit_test and os.environ.get("KERNELINFO_CGROUP_ACTIVE") != "1" and shutil.which("systemd-run"):
+        try:
+            os.environ["KERNELINFO_CGROUP_ACTIVE"] = "1"
+            logger.info(COLOR.cyan(f"[Memory Guard] Activating cgroups v2 scope via systemd-run: max={limit_gb:.1f} GB, high={limit_gb*0.9:.1f} GB..."))
+            os.execvp(
+                "systemd-run",
+                [
+                    "systemd-run",
+                    "--user",
+                    "--scope",
+                    "-p",
+                    f"MemoryMax={int(limit_gb)}G",
+                    "-p",
+                    f"MemoryHigh={int(limit_gb * 0.9)}G",
+                    sys.executable,
+                ]
+                + sys.argv,
+            )
+        except Exception as e:
+            logger.warning(COLOR.yellow(f"[Memory Guard] systemd-run scope activation failed: {e}. Falling back to RLIMIT_AS."))
+
+    # 3. Fallback: enforce RLIMIT_AS address space limit
     try:
         import resource
-        limit_bytes = int(limit_gb * 1024 * 1024 * 1024)
         soft, hard = resource.getrlimit(resource.RLIMIT_AS)
         if hard != resource.RLIM_INFINITY:
             limit_bytes = min(limit_bytes, hard)
         resource.setrlimit(resource.RLIMIT_AS, (limit_bytes, hard))
         _MEMORY_GUARD_INITIALIZED = True
-        logging.getLogger("core.globalstuff").info(
+        logger.info(
             COLOR.green(f"[Memory Guard] Hard address space limit set to {limit_bytes / (1024**3):.1f} GB (RLIMIT_AS)")
         )
     except Exception as e:
-        logging.getLogger("core.globalstuff").warning(
+        logger.warning(
             COLOR.yellow(f"[Memory Guard] Could not configure RLIMIT_AS: {e}")
         )
+
+
+try:
+    import ctypes
+    _libc = ctypes.CDLL("libc.so.6")
+    _malloc_trim = _libc.malloc_trim
+    _malloc_trim.argtypes = [ctypes.c_size_t]
+    _malloc_trim.restype = ctypes.c_int
+except Exception:
+    _malloc_trim = None
+
+
+def reclaim_system_memory() -> None:
+    """Force CPython garbage collection and release heap pages back to OS via glibc malloc_trim."""
+    import gc
+    gc.collect()
+    if _malloc_trim is not None:
+        try:
+            _malloc_trim(0)
+        except Exception:
+            pass
+
+
+def freeze_system_memory() -> None:
+    """Reclaim unreferenced memory and freeze living objects into permanent GC generation for CoW safety."""
+    import gc
+    reclaim_system_memory()
+    if hasattr(gc, "freeze"):
+        try:
+            gc.freeze()
+        except Exception:
+            pass
+
+
+def unfreeze_system_memory() -> None:
+    """Unfreeze permanent GC generation back into normal generational tracking."""
+    import gc
+    if hasattr(gc, "unfreeze"):
+        try:
+            gc.unfreeze()
+        except Exception:
+            pass
+
+
 

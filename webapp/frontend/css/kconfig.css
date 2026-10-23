@@ -335,3 +335,33 @@
   flex-direction: column;
   gap: 6px;
 }
+
+/* Compare-with-defconfig table */
+.kconfig-cmp-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+
+.kconfig-cmp-table th,
+.kconfig-cmp-table td {
+  padding: 4px 8px;
+  border-bottom: 1px solid var(--border-color);
+  text-align: left;
+}
+
+.kconfig-cmp-table th {
+  position: sticky;
+  top: 0;
+  background: var(--bg-tertiary);
+  color: var(--text-secondary);
+}
+
+.kconfig-cmp-table tbody tr {
+  cursor: pointer;
+}
+
+.kconfig-cmp-table tbody tr:hover {
+  background: var(--bg-hover);
+}

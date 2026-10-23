@@ -27,6 +27,9 @@ from core.DBLayout import (
 )
 from table_engine import TECachedDB
 from db_engine import MockDB
+from core.config import get_default_repo_path
+
+LINUX_REPO = str(get_default_repo_path())
 
 
 class TestBridgeMapDeduplication(unittest.TestCase):
@@ -76,7 +79,7 @@ class TestBridgeMapDeduplication(unittest.TestCase):
         full_path = os.path.join(temp_dir, target_file)
         os.makedirs(os.path.dirname(full_path), exist_ok=True)
         file_content = subprocess.check_output(
-            ["git", "-C", "linux", "show", f"v3.0:{target_file}"],
+            ["git", "-C", LINUX_REPO, "show", f"v3.0:{target_file}"],
             stderr=subprocess.PIPE,
         )
         with open(full_path, "wb") as f:

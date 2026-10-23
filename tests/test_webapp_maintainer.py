@@ -30,7 +30,7 @@ class TestWebAppMaintainerEndpoints(unittest.TestCase):
     def setUpClass(cls) -> None:
         try:
             with get_db_cursor() as cur:
-                cur.execute("SELECT COUNT(*) as c FROM m_maintainer_section;")
+                cur.execute("SELECT COUNT(*) as c FROM m_maintainer_section WHERE sec_id > 0;")
                 row = cur.fetchone()
                 count = row.get("c", 0) if isinstance(row, dict) else (row[0] if row else 0)
                 if count == 0:

@@ -871,7 +871,7 @@ class Test_ChangeSetExecutionAndLifecycle(BaseTableHandlingTestCase):
         with test_step("Staging OP_SET, OP_UPDATE, and OP_DONE"):
             cs.store(t_fn.set(None, "kernel/fork.c"))  # OP_SET
             cs.store(t_file.update(10, 1, 0, 1, "M", "M"))  # OP_UPDATE
-            cs.store((t_fn.table_id, OP_DONE, (5, "pre_done.c")))  # OP_DONE
+            cs.store((t_fn.table_id, OP_DONE, (5, "pre_done.c")), 2)  # OP_DONE
 
         with test_step("Executing dispatches to mock TE set and update"):
             self.assertTrue(cs.execute())

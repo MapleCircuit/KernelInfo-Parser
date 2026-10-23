@@ -13,7 +13,7 @@ import subprocess
 import threading
 from typing import Any
 
-from webapp.backend.config import LINUX_REPO_DIR
+from webapp.backend.config import LINUX_REPO_DIR, get_repo_dir
 
 logger = logging.getLogger(__name__)
 
@@ -170,6 +170,39 @@ class GitReader:
         return (None, False, None)
 
 
-# Default module-level singleton instance
-git_reader = GitReader()
+class GitReaderPool:
+    """Dispatches reads to one persistent GitReader per repository (the request's active repository)."""
+
+    def __init__(self) -> None:
+        self._readers: dict[str, GitReader] = {}
+        self._lock = threading.Lock()
+
+    def _reader(self) -> GitReader:
+        key = str(get_repo_dir())
+        with self._lock:
+            reader = self._readers.get(key)
+            if reader is None:
+                reader = GitReader(key)
+                self._readers[key] = reader
+            return reader
+
+    def read_object(self, rev: str, path: str) -> tuple[str, bytes | None, str | None]:
+        return self._reader().read_object(rev, path)
+
+    def read_file(self, rev: str, path: str) -> tuple[bytes | None, bool, str | None]:
+        return self._reader().read_file(rev, path)
+
+    def close(self) -> None:
+        with self._lock:
+            for reader in self._readers.values():
+                reader.close()
+            self._readers.clear()
+
+    def __getattr__(self, name: str) -> Any:
+        # Remaining GitReader attributes (repo_dir, _proc, ...) refer to the active repository's reader
+        return getattr(self._reader(), name)
+
+
+# Default module-level instance (routes reads to the active repository)
+git_reader = GitReaderPool()
 atexit.register(git_reader.close)

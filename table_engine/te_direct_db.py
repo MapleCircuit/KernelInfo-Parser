@@ -84,6 +84,12 @@ class TEDirectDB:
         self._join_plan_cache: dict[JoinsType, list[tuple[int, int, int]]] = {}
         self._committed_pks: dict[int, set[Any]] = {}
         self._committed_nodup_keys: dict[int, dict[Any, int]] = {}
+        self._committed_unique_keys: dict[int, dict[tuple[int, ...], set[tuple[SafeDataType, ...]]]] = {}
+        self._table_unique_keys: dict[int, tuple[tuple[int, ...], ...]] = {}
+        self._table_sec_indexes: dict[int, tuple[tuple[int, ...], ...]] = {}
+        self._table_single_col_indexes: dict[int, tuple[int, ...]] = {}
+        self._queued_sec_indexes: dict[int, dict[tuple[int, ...], dict[tuple[SafeDataType, ...], list[tuple[SafeDataType, ...]]]]] = {}
+        self._queued_single_col_indexes: dict[int, dict[int, dict[SafeDataType, list[tuple[SafeDataType, ...]]]]] = {}
         self.db: Any | None = None
 
     def close(self) -> None:
@@ -114,16 +120,66 @@ class TEDirectDB:
         self.close()
 
     def _register_table(self, table: Table) -> None:
-        """Register table schema and precompile primary key extractor."""
-        self.tables[table.table_id] = table
-        self._committed_pks.setdefault(table.table_id, set())
-        self._committed_nodup_keys.setdefault(table.table_id, {})
+        """Register table schema, precompile PK extractors, and build secondary index structures."""
+        table_id = table.table_id
+        self.tables[table_id] = table
+        self.queued_set.setdefault(table_id, {})
+        self.queued_update.setdefault(table_id, [])
+        self.next_id.setdefault(table_id, 1)
+        self._committed_pks.setdefault(table_id, set())
+        self._committed_nodup_keys.setdefault(table_id, {})
         if table.primary:
             if len(table.primary) == 1:
                 pk_idx = table.primary[0]
-                self._pk_getters[table.table_id] = lambda row, idx=pk_idx: row[idx]
+                self._pk_getters[table_id] = lambda row, idx=pk_idx: row[idx]
             else:
-                self._pk_getters[table.table_id] = itemgetter(*table.primary)
+                self._pk_getters[table_id] = itemgetter(*table.primary)
+
+        # Precompile secondary index and unique key column positions
+        col_name_to_idx = {col[0]: idx for idx, col in enumerate(table.init_columns)}
+        sec_indexes: list[tuple[int, ...]] = []
+        single_indexes: set[int] = set()
+
+        for idx_def in getattr(table, "indexes", ()) or ():
+            col_names = ()
+            if isinstance(idx_def, (tuple, list)):
+                if len(idx_def) >= 2 and isinstance(idx_def[1], (tuple, list)):
+                    col_names = idx_def[1]
+                elif len(idx_def) == 1 and isinstance(idx_def[0], (tuple, list)):
+                    col_names = idx_def[0]
+                elif all(isinstance(x, str) for x in idx_def):
+                    col_names = idx_def
+            if col_names:
+                col_indices = tuple(col_name_to_idx[c] for c in col_names if c in col_name_to_idx)
+                if len(col_indices) == len(col_names) and col_indices:
+                    if len(col_indices) > 1 and col_indices not in sec_indexes:
+                        sec_indexes.append(col_indices)
+                    for c in col_indices:
+                        single_indexes.add(c)
+
+        unique_indexes: list[tuple[int, ...]] = []
+        for u_def in getattr(table, "unique_keys", ()) or ():
+            col_names = ()
+            if isinstance(u_def, (tuple, list)):
+                if all(isinstance(x, str) for x in u_def):
+                    col_names = u_def
+                elif len(u_def) >= 2 and isinstance(u_def[1], (tuple, list)):
+                    col_names = u_def[1]
+            if col_names:
+                col_indices = tuple(col_name_to_idx[c] for c in col_names if c in col_name_to_idx)
+                if len(col_indices) == len(col_names) and col_indices:
+                    if col_indices not in unique_indexes:
+                        unique_indexes.append(col_indices)
+                    if len(col_indices) > 1 and col_indices not in sec_indexes:
+                        sec_indexes.append(col_indices)
+                    for c in col_indices:
+                        single_indexes.add(c)
+
+        self._table_unique_keys[table_id] = tuple(unique_indexes)
+        self._table_sec_indexes[table_id] = tuple(sec_indexes)
+        self._table_single_col_indexes[table_id] = tuple(sorted(single_indexes))
+        self._queued_sec_indexes[table_id] = {idx_cols: {} for idx_cols in self._table_sec_indexes[table_id]}
+        self._queued_single_col_indexes[table_id] = {col_idx: {} for col_idx in self._table_single_col_indexes[table_id]}
 
     def start_new_db(self, db: Callable[[], Any] | type[Any]) -> None:
         """Start or restart the database connection handle for Table Engine use.
@@ -145,6 +201,8 @@ class TEDirectDB:
         for table_id, table in self.tables.items():
             self.queued_set[table_id] = {}
             self.queued_update[table_id] = []
+            self._queued_sec_indexes[table_id] = {idx_cols: {} for idx_cols in self._table_sec_indexes.get(table_id, ())}
+            self._queued_single_col_indexes[table_id] = {col_idx: {} for col_idx in self._table_single_col_indexes.get(table_id, ())}
             self._committed_pks[table_id] = set()
             self._committed_nodup_keys[table_id] = {}
             if table.initial_insert:
@@ -195,6 +253,38 @@ class TEDirectDB:
                 return tuple(bytes(x) if isinstance(x, (bytearray, memoryview)) else x for x in key)
         return key
 
+    def _index_staged_row(self, table_id: int, row: tuple[SafeDataType, ...]) -> None:
+        """Index a staged row into secondary and single-column in-memory queue indexes."""
+        sec_indexes = self._table_sec_indexes.get(table_id)
+        if sec_indexes:
+            sec_dict = self._queued_sec_indexes.get(table_id)
+            if sec_dict is not None:
+                for col_positions in sec_indexes:
+                    if all(c < len(row) and row[c] is not None for c in col_positions):
+                        key = tuple(self._sanitize_key(row[c]) for c in col_positions)
+                        idx_map = sec_dict.setdefault(col_positions, {})
+                        bucket = idx_map.get(key)
+                        if bucket is None:
+                            idx_map[key] = [row]
+                        else:
+                            bucket.append(row)
+
+        single_indexes = self._table_single_col_indexes.get(table_id)
+        if single_indexes:
+            single_dict = self._queued_single_col_indexes.get(table_id)
+            if single_dict is not None:
+                for col_idx in single_indexes:
+                    if col_idx < len(row):
+                        val = row[col_idx]
+                        if val is not None:
+                            key = self._sanitize_key(val)
+                            col_map = single_dict.setdefault(col_idx, {})
+                            bucket = col_map.get(key)
+                            if bucket is None:
+                                col_map[key] = [row]
+                            else:
+                                bucket.append(row)
+
     def get(
         self,
         table_id: int,
@@ -210,7 +300,8 @@ class TEDirectDB:
             1. Staging check in `queued_set`:
                - If `no_duplicate=True`: checks staged dictionary using `columns[1:]`.
                - If explicit PK provided: checks staged dictionary via PK key.
-               - Otherwise: scans staged dictionary entries matching non-None column filters.
+               - Otherwise: consults secondary and single-column queue indexes in O(1)
+                 before falling back to scanning staged dictionary entries.
             2. Emptiness guard: If table has `has_auto_increment=True`, `initial_insert=None`,
                and `next_id <= 1`, returns `None` immediately without issuing SQL queries.
             3. Fallback: Executes direct database select via `self.db.select(table, columns)`.
@@ -236,15 +327,67 @@ class TEDirectDB:
                         if columns[0] is None or row[0] == columns[0]:
                             return row
                 else:
-                    for k, v in self.queued_set[table_id].items():
-                        staged_row = (v, *k) if isinstance(k, tuple) else (v, k)
-                        match = True
-                        for i, val in enumerate(columns):
-                            if val is not None and (i >= len(staged_row) or staged_row[i] != val):
-                                match = False
+                    found_sec_index = False
+                    sec_indexes = self._table_sec_indexes.get(table_id)
+                    if sec_indexes and table_id in self._queued_sec_indexes:
+                        sec_dict = self._queued_sec_indexes[table_id]
+                        for col_positions in sec_indexes:
+                            if all(c < len(columns) and columns[c] is not None for c in col_positions):
+                                found_sec_index = True
+                                key = tuple(self._sanitize_key(columns[c]) for c in col_positions)
+                                candidates = sec_dict.get(col_positions, {}).get(key)
+                                if candidates:
+                                    for staged_row in candidates:
+                                        match = True
+                                        for i, val in enumerate(columns):
+                                            if val is not None and (i >= len(staged_row) or staged_row[i] != val):
+                                                match = False
+                                                break
+                                        if match:
+                                            return staged_row
                                 break
-                        if match:
-                            return staged_row
+
+                    if not found_sec_index:
+                        single_indexes = self._table_single_col_indexes.get(table_id)
+                        if single_indexes and table_id in self._queued_single_col_indexes:
+                            single_dict = self._queued_single_col_indexes[table_id]
+                            matching_cols = [
+                                c for c in single_indexes
+                                if c < len(columns) and columns[c] is not None
+                            ]
+                            if matching_cols:
+                                best_candidates: list[tuple[SafeDataType, ...]] | None = None
+                                for c in matching_cols:
+                                    val_key = self._sanitize_key(columns[c])
+                                    c_candidates = single_dict.get(c, {}).get(val_key)
+                                    if c_candidates is None:
+                                        best_candidates = None
+                                        found_sec_index = True
+                                        break
+                                    if best_candidates is None or len(c_candidates) < len(best_candidates):
+                                        best_candidates = c_candidates
+                                        found_sec_index = True
+
+                                if best_candidates is not None:
+                                    for staged_row in best_candidates:
+                                        match = True
+                                        for i, val in enumerate(columns):
+                                            if val is not None and (i >= len(staged_row) or staged_row[i] != val):
+                                                match = False
+                                                break
+                                        if match:
+                                            return staged_row
+
+                    if not found_sec_index:
+                        for k, v in self.queued_set[table_id].items():
+                            staged_row = (v, *k) if isinstance(k, tuple) else (v, k)
+                            match = True
+                            for i, val in enumerate(columns):
+                                if val is not None and (i >= len(staged_row) or staged_row[i] != val):
+                                    match = False
+                                    break
+                            if match:
+                                return staged_row
             else:
                 pk_specified = all(columns[i] is not None for i in table.primary)
                 if pk_specified:
@@ -260,14 +403,66 @@ class TEDirectDB:
                         if match:
                             return staged_row
                 else:
-                    for staged_row in self.queued_set[table_id].values():
-                        match = True
-                        for i, val in enumerate(columns):
-                            if val is not None and (i >= len(staged_row) or staged_row[i] != val):
-                                match = False
+                    found_sec_index = False
+                    sec_indexes = self._table_sec_indexes.get(table_id)
+                    if sec_indexes and table_id in self._queued_sec_indexes:
+                        sec_dict = self._queued_sec_indexes[table_id]
+                        for col_positions in sec_indexes:
+                            if all(c < len(columns) and columns[c] is not None for c in col_positions):
+                                found_sec_index = True
+                                key = tuple(self._sanitize_key(columns[c]) for c in col_positions)
+                                candidates = sec_dict.get(col_positions, {}).get(key)
+                                if candidates:
+                                    for staged_row in candidates:
+                                        match = True
+                                        for i, val in enumerate(columns):
+                                            if val is not None and (i >= len(staged_row) or staged_row[i] != val):
+                                                match = False
+                                                break
+                                        if match:
+                                            return staged_row
                                 break
-                        if match:
-                            return staged_row
+
+                    if not found_sec_index:
+                        single_indexes = self._table_single_col_indexes.get(table_id)
+                        if single_indexes and table_id in self._queued_single_col_indexes:
+                            single_dict = self._queued_single_col_indexes[table_id]
+                            matching_cols = [
+                                c for c in single_indexes
+                                if c < len(columns) and columns[c] is not None
+                            ]
+                            if matching_cols:
+                                best_candidates: list[tuple[SafeDataType, ...]] | None = None
+                                for c in matching_cols:
+                                    val_key = self._sanitize_key(columns[c])
+                                    c_candidates = single_dict.get(c, {}).get(val_key)
+                                    if c_candidates is None:
+                                        best_candidates = None
+                                        found_sec_index = True
+                                        break
+                                    if best_candidates is None or len(c_candidates) < len(best_candidates):
+                                        best_candidates = c_candidates
+                                        found_sec_index = True
+
+                                if best_candidates is not None:
+                                    for staged_row in best_candidates:
+                                        match = True
+                                        for i, val in enumerate(columns):
+                                            if val is not None and (i >= len(staged_row) or staged_row[i] != val):
+                                                match = False
+                                                break
+                                        if match:
+                                            return staged_row
+
+                    if not found_sec_index:
+                        for staged_row in self.queued_set[table_id].values():
+                            match = True
+                            for i, val in enumerate(columns):
+                                if val is not None and (i >= len(staged_row) or staged_row[i] != val):
+                                    match = False
+                                    break
+                            if match:
+                                return staged_row
 
         # 2. Emptiness guard: Table has never received data and has no seed insert
         if getattr(table, "has_auto_increment", True) and table.initial_insert is None and self.next_id.get(table_id, 0) <= 1 and (table_id not in self.queued_set or not self.queued_set[table_id]):
@@ -321,26 +516,57 @@ class TEDirectDB:
             if committed_id is not None:
                 return (committed_id, *columns[1:])
 
-            assigned_id = self.next_id[table_id]
+            if columns[0] is not None:
+                assigned_id = columns[0]
+                if isinstance(assigned_id, int) and assigned_id >= self.next_id[table_id]:
+                    self.next_id[table_id] = assigned_id + 1
+            else:
+                assigned_id = self.next_id[table_id]
+                self.next_id[table_id] += 1
             self.queued_set[table_id][key] = assigned_id
-            self.next_id[table_id] += 1
-            return (assigned_id, *columns[1:])
+            row = (assigned_id, *columns[1:])
+            self._index_staged_row(table_id, row)
+            return row
 
         if columns[0] is None:
+            u_indexes = self._table_unique_keys.get(table_id)
+            if u_indexes:
+                sec_dict = self._queued_sec_indexes.get(table_id, {})
+                single_dict = self._queued_single_col_indexes.get(table_id, {})
+                for col_positions in u_indexes:
+                    if all(c < len(columns) and columns[c] is not None for c in col_positions):
+                        u_key = tuple(self._sanitize_key(columns[c]) for c in col_positions)
+                        if len(col_positions) > 1:
+                            existing_rows = sec_dict.get(col_positions, {}).get(u_key)
+                            if existing_rows:
+                                return existing_rows[0]
+                        else:
+                            c_idx = col_positions[0]
+                            existing_rows = single_dict.get(c_idx, {}).get(u_key[0])
+                            if existing_rows:
+                                return existing_rows[0]
+                        committed_u = self._committed_unique_keys.get(table_id, {}).get(col_positions)
+                        if committed_u and u_key in committed_u:
+                            return (None, *columns[1:])
+
             assigned_id = self.next_id[table_id]
             row = (assigned_id, *columns[1:])
             self.queued_set[table_id][assigned_id] = row
             self.next_id[table_id] += 1
+            self._index_staged_row(table_id, row)
             return row
 
         pk_fn = self._pk_getters.get(table_id)
         pk = self._sanitize_key(pk_fn(columns) if pk_fn is not None else itemgetter(*table.primary)(columns))
-        if getattr(table, "init_primary", ()) == ("hash",) or table.table_name in ("m_tag_code", "m_ast_hash"):
-            if pk in self.queued_set[table_id] or pk in self._committed_pks.get(table_id, set()):
+        if getattr(table, "idempotent_pk", False) or getattr(table, "init_primary", ()) == ("hash",) or table.table_name in ("m_tag_code", "m_ast_hash"):
+            if pk in self.queued_set[table_id]:
+                return self.queued_set[table_id][pk]
+            if pk in self._committed_pks.get(table_id, set()):
                 return columns
         elif pk in self.queued_set[table_id]:
             raise ValueError(f"Duplicate primary key '{pk}' in table '{table.table_name}'")
         self.queued_set[table_id][pk] = columns
+        self._index_staged_row(table_id, columns)
         return columns
 
     def get_hashing_table(self, table: Table | None) -> Table | None:
@@ -604,7 +830,7 @@ class TEDirectDB:
                     row = v if isinstance(v, (tuple, list)) else ((v, *k) if isinstance(k, tuple) else (v, k))
                     rows.append(row)
                     committed_map[k] = row[0]
-            elif getattr(table, "init_primary", ()) == ("hash",) or table.table_name in ("m_tag_code", "m_ast_hash"):
+            elif getattr(table, "idempotent_pk", False) or getattr(table, "init_primary", ()) == ("hash",) or table.table_name in ("m_tag_code", "m_ast_hash"):
                 committed_pks = self._committed_pks.setdefault(table_id, set())
                 rows = []
                 for pk, row in self.queued_set[table_id].items():
@@ -620,9 +846,22 @@ class TEDirectDB:
                     pk_fn = self._pk_getters.get(table_id)
                     rows.sort(key=pk_fn if pk_fn is not None else itemgetter(*table.primary))
 
+                u_indexes = self._table_unique_keys.get(table_id)
+                if u_indexes:
+                    committed_u = self._committed_unique_keys.setdefault(table_id, {})
+                    for col_positions in u_indexes:
+                        u_set = committed_u.setdefault(col_positions, set())
+                        for r in rows:
+                            if all(c < len(r) and r[c] is not None for c in col_positions):
+                                u_set.add(tuple(self._sanitize_key(r[c]) for c in col_positions))
+
                 payload = tuple(rows)
                 self.db.insert(table, payload)
             self.queued_set[table_id].clear()
+            if table_id in self._queued_sec_indexes:
+                self._queued_sec_indexes[table_id] = {idx_cols: {} for idx_cols in self._table_sec_indexes.get(table_id, ())}
+            if table_id in self._queued_single_col_indexes:
+                self._queued_single_col_indexes[table_id] = {col_idx: {} for col_idx in self._table_single_col_indexes.get(table_id, ())}
 
         if self.queued_update[table_id]:
             self.db.update(table, tuple(self.queued_update[table_id]))
@@ -658,7 +897,7 @@ class TEDirectDB:
                         row = v if isinstance(v, (tuple, list)) else ((v, *k) if isinstance(k, tuple) else (v, k))
                         rows.append(row)
                         committed_map[k] = row[0]
-                elif getattr(table, "init_primary", ()) == ("hash",) or table.table_name in ("m_tag_code", "m_ast_hash"):
+                elif getattr(table, "idempotent_pk", False) or getattr(table, "init_primary", ()) == ("hash",) or table.table_name in ("m_tag_code", "m_ast_hash"):
                     committed_pks = self._committed_pks.setdefault(table_id, set())
                     rows = []
                     for pk, row in self.queued_set[table_id].items():
@@ -673,6 +912,15 @@ class TEDirectDB:
                     if table.primary and len(rows) > 1:
                         pk_fn = self._pk_getters.get(table_id)
                         rows.sort(key=pk_fn if pk_fn is not None else itemgetter(*table.primary))
+
+                    u_indexes = self._table_unique_keys.get(table_id)
+                    if u_indexes:
+                        committed_u = self._committed_unique_keys.setdefault(table_id, {})
+                        for col_positions in u_indexes:
+                            u_set = committed_u.setdefault(col_positions, set())
+                            for r in rows:
+                                if all(c < len(r) and r[c] is not None for c in col_positions):
+                                    u_set.add(tuple(self._sanitize_key(r[c]) for c in col_positions))
 
                     insert_payload = tuple(rows)
 
@@ -695,3 +943,7 @@ class TEDirectDB:
             for table_id in self.tables:
                 self.queued_set[table_id].clear()
                 self.queued_update[table_id].clear()
+                if table_id in self._queued_sec_indexes:
+                    self._queued_sec_indexes[table_id] = {idx_cols: {} for idx_cols in self._table_sec_indexes.get(table_id, ())}
+                if table_id in self._queued_single_col_indexes:
+                    self._queued_single_col_indexes[table_id] = {col_idx: {} for col_idx in self._table_single_col_indexes.get(table_id, ())}

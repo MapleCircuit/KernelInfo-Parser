@@ -358,6 +358,49 @@ class TestWebAppGitEndpoints(unittest.TestCase):
         self.assertIn("tags", res)
         self.assertIn("total_tags", res)
 
+    def test_m_bridge_commit_person_table_engine_deduplication(self) -> None:
+        """Verify TableEngine deduplicates duplicate contributor roles in memory and avoids duplicate commits."""
+        from core.DBLayout import m_bridge_commit_person
+        from table_engine.te_cached_db import TECachedDB
+        from table_engine.te_direct_db import TEDirectDB
+
+        self.assertTrue(m_bridge_commit_person.te_cached)
+        self.assertTrue(m_bridge_commit_person.idempotent_pk)
+        self.assertEqual(m_bridge_commit_person.primary, (0, 1, 2))
+
+        # 1. Test TECachedDB in-batch and preloaded deduplication
+        te_cached = TECachedDB()
+        te_cached._register_table(m_bridge_commit_person)
+        te_cached._ensure_table(m_bridge_commit_person.table_id)
+
+        # First insert stages row
+        r1 = te_cached.set(m_bridge_commit_person.table_id, (10, 20, 1, 0))
+        self.assertEqual(r1, (10, 20, 1, 0))
+        self.assertEqual(len(te_cached.queued_set[m_bridge_commit_person.table_id]), 1)
+
+        # Duplicate insert in same batch (same commit_id, person_id, role_type, even if different priority)
+        r2 = te_cached.set(m_bridge_commit_person.table_id, (10, 20, 1, 5))
+        self.assertEqual(r2, (10, 20, 1, 0))
+        self.assertEqual(len(te_cached.queued_set[m_bridge_commit_person.table_id]), 1)
+
+        # Simulate row already existing in DB (indexed in _pk_index)
+        te_cached._index_row(m_bridge_commit_person, (11, 21, 2, 0))
+        self.assertIn((11, 21, 2), te_cached._pk_index[m_bridge_commit_person.table_id])
+        r3 = te_cached.set(m_bridge_commit_person.table_id, (11, 21, 2, 0))
+        self.assertEqual(r3, (11, 21, 2, 0))
+        # Pre-existing row must NOT be queued for insert
+        self.assertNotIn((11, 21, 2), te_cached.queued_set[m_bridge_commit_person.table_id])
+        self.assertEqual(len(te_cached.queued_set[m_bridge_commit_person.table_id]), 1)
+
+        # 2. Test TEDirectDB deduplication
+        te_direct = TEDirectDB()
+        te_direct._register_table(m_bridge_commit_person)
+        dr1 = te_direct.set(m_bridge_commit_person.table_id, (10, 20, 1, 0))
+        dr2 = te_direct.set(m_bridge_commit_person.table_id, (10, 20, 1, 3))
+        self.assertEqual(dr1, (10, 20, 1, 0))
+        self.assertEqual(dr2, (10, 20, 1, 0))
+        self.assertEqual(len(te_direct.queued_set[m_bridge_commit_person.table_id]), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -9,6 +9,8 @@ import { toast } from "./toast.js";
 import { copyToClipboard } from "../utils/clipboard.js";
 import { showPersonModal } from "./person_modal.js";
 import { includeSymbolsPopover } from "./include_symbols_popover.js";
+import { showSymbolHistoryModal } from "./symbol_history_modal.js";
+import { showPatchModal } from "./patch_modal.js";
 
 class ContextMenu {
   constructor() {
@@ -192,6 +194,21 @@ class ContextMenu {
         toast.error(`Header lookup failed: ${err.message}`);
       }
     } else if (isKconfig) {
+      try {
+        const detail = await api.getSymbolDetail(v, tokenName);
+        if (detail && detail.file_path) {
+          state.openTab({
+            type: "code",
+            title: detail.file_path.split("/").pop(),
+            path: detail.file_path,
+            cursorLine: detail.definition?.line_s || detail.line_s || detail.line || 1,
+            version: v,
+            forceNew: Boolean(options?.forceNew)
+          });
+          toast.success(`Jumped to Kconfig declaration of ${tokenName}`);
+          return;
+        }
+      } catch (_) {}
       this.openKconfigViewer(tokenName, v, options);
     } else {
       try {
@@ -276,6 +293,29 @@ class ContextMenu {
         }
       });
     } else if (isKconfig) {
+      items.push({
+        label: "Jump to Kconfig Declaration",
+        icon: "📍",
+        onClick: async () => {
+          try {
+            const detail = await api.getSymbolDetail(v, tokenName);
+            if (detail && detail.file_path) {
+              state.openTab({
+                type: "code",
+                title: detail.file_path.split("/").pop(),
+                path: detail.file_path,
+                cursorLine: detail.definition?.line_s || detail.line_s || detail.line || 1,
+                version: v
+              });
+              toast.success(`Jumped to Kconfig declaration of ${tokenName}`);
+            } else {
+              toast.info(`Could not locate declaration file for ${tokenName}`);
+            }
+          } catch (err) {
+            toast.error(`Lookup failed: ${err.message}`);
+          }
+        }
+      });
       items.push({
         label: "Open in Kconfig Viewer",
         icon: "⚙️",
@@ -543,6 +583,12 @@ class ContextMenu {
         }
       });
 
+      items.push({
+        label: "Symbol History Across Versions",
+        icon: "🕰",
+        onClick: () => showSymbolHistoryModal(v, filePath, line, token.ast_id || null, token.name)
+      });
+
       items.push({ separator: true });
     } else if (selection && this.isKconfigToken({ name: selection }, filePath, ftype)) {
       items.push({
@@ -556,6 +602,18 @@ class ContextMenu {
     }
 
     // 3. Git & History Actions
+    if (!token) {
+      items.push({
+        label: "Symbol History at This Line",
+        icon: "🕰",
+        onClick: () => showSymbolHistoryModal(v, filePath, line)
+      });
+    }
+    items.push({
+      label: "Create Patch from This File…",
+      icon: "✎",
+      onClick: () => showPatchModal(v, filePath)
+    });
     items.push({
       label: "View Line Blame & Commit Details",
       icon: "🕒",
@@ -625,6 +683,11 @@ class ContextMenu {
         })
       });
       items.push({
+        label: "Show Treemap of Folder",
+        icon: "▦",
+        onClick: () => state.openTab({ type: "treemap", title: `Treemap: ${item.name}`, path, version: v })
+      });
+      items.push({
         label: "Copy Folder Path",
         icon: "📋",
         onClick: async () => {
@@ -661,6 +724,11 @@ class ContextMenu {
           if (ok) toast.success(`Copied filename: ${item.name}`);
           else toast.error("Failed to copy filename");
         }
+      });
+      items.push({
+        label: "Create Patch…",
+        icon: "✎",
+        onClick: () => showPatchModal(v, path)
       });
       items.push({ separator: true });
       items.push({

@@ -7,6 +7,10 @@ import { urlSync } from "./url_sync.js";
 import { toast } from "./components/toast.js";
 import { TabsComponent } from "./components/tabs.js";
 import { contextMenu } from "./components/context_menu.js";
+import { refPicker, shortRef, isCommitRef } from "./components/ref_picker.js";
+import { commandPalette } from "./components/command_palette.js";
+import { showPatchModal } from "./components/patch_modal.js";
+import { showSymbolHistoryModal } from "./components/symbol_history_modal.js";
 import { localDB } from "./db.js";
 
 // View Renderers
@@ -18,6 +22,7 @@ import { CommitsView } from "./views/commits/commits_view.js";
 import { PaholeView } from "./views/pahole/pahole_view.js";
 import { CallgraphView } from "./views/callgraph/callgraph_view.js";
 import { DiffView } from "./views/diff/diff_view.js";
+import { TreemapView } from "./views/treemap/treemap_view.js";
 
 export class KernelIdeApp {
   constructor() {
@@ -30,7 +35,8 @@ export class KernelIdeApp {
       commits: new CommitsView(),
       pahole: new PaholeView(),
       callgraph: new CallgraphView(),
-      diff: new DiffView()
+      diff: new DiffView(),
+      treemap: new TreemapView()
     };
   }
 
@@ -42,6 +48,9 @@ export class KernelIdeApp {
 
     // 2. Setup Online/Offline Status Indicator
     this.setupNetworkStatus();
+
+    // 2a. Repository selected in a previous session scopes every API request
+    api.setRepository(state.currentRepo);
 
     // 2b. Synchronize with Database Instance Hash
     try {
@@ -65,18 +74,21 @@ export class KernelIdeApp {
     // 6. Initialize URL Synchronization
     urlSync.init();
 
+    // 7. Command palette (Ctrl+K / Ctrl+P search, Ctrl+Shift+P commands)
+    commandPalette.setCommandProvider(() => this.paletteCommands());
+    commandPalette.init();
+    document.getElementById("global-search-btn")?.addEventListener("click", () => commandPalette.open(""));
+
     // Re-render tabs and sidebar when global version changes
     state.subscribe("version:changed", async () => {
+      this.updateVersionSelectorDisplay();
       await this.loadSidebarFileTree();
       this.tabsComponent.render();
     });
 
-    // Synchronize top selector dropdown when tab with different version is selected
-    state.subscribe("version:synced", async (v) => {
-      const select = document.getElementById("version-select");
-      if (select && select.value !== v) {
-        select.value = v;
-      }
+    // Synchronize top selectors when a tab with a different version is selected
+    state.subscribe("version:synced", async () => {
+      this.updateVersionSelectorDisplay();
       await this.loadSidebarFileTree();
     });
 
@@ -348,38 +360,297 @@ export class KernelIdeApp {
 
   async initVersionSelector() {
     const select = document.getElementById("version-select");
+    const projSelect = document.getElementById("project-select");
+    const branchSelect = document.getElementById("branch-select");
+
+    // 1. Projects (configured repositories; selection is sent as X-KI-Repo with every request)
+    if (projSelect) {
+      try {
+        const pRes = await api.getProjects();
+        this.projects = pRes.projects || [];
+        if (!state.currentRepo || !this.projects.some((p) => p.repo === state.currentRepo)) {
+          state.currentRepo = pRes.active || this.projects[0]?.repo || "";
+          api.setRepository(state.currentRepo);
+          state.saveState();
+        }
+        projSelect.innerHTML = this.projects.map((p) => {
+          const label = `${p.name}${p.indexed ? "" : " (git only)"}${p.available ? "" : " — missing"}`;
+          return `<option value="${escapeAttr(p.repo)}" ${p.repo === state.currentRepo ? "selected" : ""} ${p.available ? "" : "disabled"}>${escapeAttr(label)}</option>`;
+        }).join("");
+        projSelect.title = "Repository (projects detected under workspace.repos_dir)";
+        projSelect.onchange = () => this.switchProject(projSelect.value);
+      } catch (err) {
+        console.warn("Could not load projects:", err);
+      }
+    }
+
+    // 2. Branches
+    if (branchSelect) {
+      try {
+        const bRes = await api.getBranches();
+        const branches = bRes.branches || [{ name: "master" }];
+        branchSelect.innerHTML = branches.map(b => `<option value="${b.name}" ${b.is_default ? "selected" : ""}>${b.name}</option>`).join("");
+        branchSelect.onchange = (e) => {
+          const val = e.target.value;
+          if (val) state.setVersion(val);
+        };
+      } catch (err) {
+        console.warn("Could not load branches:", err);
+      }
+    }
+
+    // 3. Versions (release tags)
     if (!select) return;
-
     try {
-      const res = await api.getVersions();
-      const rawVersions = res.versions || ["v3.0"];
-      const versionNames = rawVersions.map((v) =>
-        typeof v === "string" ? v : (v.vname || v.name || "v3.0")
-      );
+      // Every tag including release candidates; releases fill the Tag selector, -rc# the RC selector
+      const res = await api.getVersions(true);
+      this.buildVersionCatalog(res.versions || ["v3.0"]);
+      const branchNames = Array.from(branchSelect?.options || []).map((o) => o.value);
 
-      // Validate and sanitize state.currentVersion
-      if (!versionNames.includes(state.currentVersion)) {
-        state.currentVersion = versionNames.includes("v3.0") ? "v3.0" : (versionNames[0] || "v3.0");
+      // Validate and sanitize state.currentVersion (commit SHAs and branch names are valid targets too)
+      const cur = state.currentVersion;
+      if (!this.versionByName.has(cur) && !isCommitRef(cur) && !branchNames.includes(cur)) {
+        const indexed = this.tagVersions.filter((t) => t.indexed && !t.rcOnly);
+        state.currentVersion = (indexed[indexed.length - 1] || this.tagVersions[this.tagVersions.length - 1] || { vname: "v3.0" }).vname;
       }
 
-      select.innerHTML = "";
-      versionNames.forEach((verName) => {
-        const opt = document.createElement("option");
-        opt.value = verName;
-        opt.textContent = verName;
-        if (verName === state.currentVersion) opt.selected = true;
-        select.appendChild(opt);
-      });
-
+      // Picking a release selects its final tag (or its latest -rc when it was never released)
       select.onchange = (e) => {
-        const val = e.target.value;
-        if (val && !val.includes("object")) {
-          state.setVersion(val);
-        }
+        const base = e.target.value;
+        if (!base || base.includes("object")) return;
+        const target = this.versionByName.has(base) ? base : (this.rcsByBase.get(base) || []).slice(-1)[0]?.vname;
+        if (target && target !== state.currentVersion) state.setVersion(target);
       };
+
+      const rcSelect = document.getElementById("rc-select");
+      if (rcSelect) {
+        rcSelect.onchange = (e) => {
+          const val = e.target.value;
+          if (val && val !== state.currentVersion) state.setVersion(val);
+        };
+      }
     } catch (e) {
       console.warn("Could not load versions list:", e);
     }
+
+    // 4. Commit picker
+    const commitBtn = document.getElementById("commit-picker-btn");
+    if (commitBtn) {
+      commitBtn.onclick = (e) => {
+        e.stopPropagation();
+        refPicker.open(commitBtn, {
+          current: state.currentVersion,
+          onSelect: (ref) => {
+            if (ref && ref !== state.currentVersion) state.setVersion(ref);
+          }
+        });
+      };
+    }
+
+    this.updateVersionSelectorDisplay();
+  }
+
+  /** Reflect state.currentVersion in the Tag dropdown, Branch dropdown and Commit picker button. */
+  /**
+   * Split the version catalog into releases (Tag selector) and pre-releases grouped under the release
+   * they lead to (RC selector): v3.1-rc1..rc10 belong to v3.1. A release that only has candidates so
+   * far (e.g. v7.3-rc1 before v7.3 is tagged) gets an "rc only" entry in the Tag selector.
+   */
+  buildVersionCatalog(rawVersions) {
+    const entries = rawVersions
+      .map((v) => (typeof v === "string"
+        ? { vname: v, commit_hash: "", indexed: true, ref_type: 1, is_prerelease: /-(rc|pre|alpha|beta)\d*$/.test(v) }
+        : { vname: v.vname || v.name, commit_hash: v.commit_hash || "", indexed: v.indexed !== false, ref_type: v.ref_type ?? 1, is_prerelease: Boolean(v.is_prerelease) }))
+      .filter((v) => v.vname);
+    this.versionByName = new Map(entries.map((v) => [v.vname, v]));
+    this.rcsByBase = new Map();
+    const releases = [];
+    const seenBases = new Set();
+    for (const v of entries) {
+      if (v.ref_type === 2 || v.ref_type === 3) continue; // branches and bare commits are not releases
+      const base = this.releaseOf(v.vname);
+      if (base !== v.vname) {
+        if (!this.rcsByBase.has(base)) this.rcsByBase.set(base, []);
+        this.rcsByBase.get(base).push(v);
+        if (!this.versionByName.has(base) && !seenBases.has(base)) {
+          seenBases.add(base);
+          releases.push({ vname: base, commit_hash: "", indexed: v.indexed, rcOnly: true });
+        }
+      } else if (!seenBases.has(v.vname)) {
+        seenBases.add(v.vname);
+        releases.push(v);
+      }
+    }
+    // A release counts as parsed when its final tag, or any of its candidates, was parsed
+    for (const r of releases) {
+      if (r.rcOnly) r.indexed = (this.rcsByBase.get(r.vname) || []).some((rc) => rc.indexed);
+    }
+    this.tagVersions = releases;
+  }
+
+  /** Release a tag belongs to: "v3.1-rc4" → "v3.1"; releases map to themselves. */
+  releaseOf(vname) {
+    const m = /^(.*?)-(rc|pre|alpha|beta)\d*$/.exec(vname || "");
+    return m ? m[1] : vname;
+  }
+
+  updateVersionSelectorDisplay() {
+    const cur = state.currentVersion;
+    const tags = this.tagVersions || [];
+    const tag = this.versionByName?.get(cur);
+    const base = tag ? this.releaseOf(cur) : null;
+
+    const select = document.getElementById("version-select");
+    if (select) {
+      select.innerHTML = "";
+      if (!tag) {
+        // Detached target (commit SHA or branch): keep a visible placeholder so the dropdown never lies
+        const opt = document.createElement("option");
+        opt.value = cur;
+        opt.textContent = "— none —";
+        opt.selected = true;
+        select.appendChild(opt);
+      }
+      // Parsed versions first; tags only present in Git stay browsable (tree, files, diffs)
+      const groups = [
+        { label: "Parsed", items: tags.filter((t) => t.indexed) },
+        { label: "Git only (not parsed)", items: tags.filter((t) => !t.indexed) },
+      ].filter((g) => g.items.length);
+      groups.forEach((g) => {
+        const parent = groups.length > 1 ? document.createElement("optgroup") : select;
+        if (parent !== select) parent.label = g.label;
+        g.items.forEach((t) => {
+          const opt = document.createElement("option");
+          opt.value = t.vname;
+          opt.textContent = t.rcOnly ? `${t.vname} (rc only)` : t.vname;
+          if (t.vname === base) opt.selected = true;
+          parent.appendChild(opt);
+        });
+        if (parent !== select) select.appendChild(parent);
+      });
+    }
+
+    // RC selector: the selected release's candidates, plus its final tag when it exists
+    const rcSelect = document.getElementById("rc-select");
+    const rcLabel = document.getElementById("rc-select-label");
+    const rcs = base ? this.rcsByBase?.get(base) || [] : [];
+    if (rcSelect) {
+      const show = rcs.length > 0;
+      rcSelect.hidden = !show;
+      if (rcLabel) rcLabel.hidden = !show;
+      rcSelect.innerHTML = "";
+      if (show) {
+        const finalTag = this.versionByName.get(base);
+        const options = [
+          ...(finalTag ? [{ value: base, text: "final", indexed: finalTag.indexed }] : []),
+          ...rcs.slice().reverse().map((rc) => ({ value: rc.vname, text: rc.vname.slice(base.length + 1), indexed: rc.indexed })),
+        ];
+        for (const o of options) {
+          const opt = document.createElement("option");
+          opt.value = o.value;
+          opt.textContent = o.indexed ? o.text : `${o.text} (git only)`;
+          if (o.value === cur) opt.selected = true;
+          rcSelect.appendChild(opt);
+        }
+        rcSelect.title = `${rcs.length} release candidate${rcs.length === 1 ? "" : "s"} of ${base}`;
+      }
+    }
+
+    const branchSelect = document.getElementById("branch-select");
+    if (branchSelect && Array.from(branchSelect.options).some((o) => o.value === cur)) {
+      branchSelect.value = cur;
+    }
+
+    const label = document.getElementById("commit-picker-label");
+    const commitBtn = document.getElementById("commit-picker-btn");
+    if (label && commitBtn) {
+      if (tag) {
+        label.textContent = tag.commit_hash ? shortRef(tag.commit_hash) : "tag head";
+        commitBtn.classList.remove("detached");
+        commitBtn.title = `Tag ${tag.vname}${tag.commit_hash ? ` → ${tag.commit_hash}` : ""}\nClick to select a specific commit`;
+      } else {
+        label.textContent = shortRef(cur);
+        commitBtn.classList.add("detached");
+        commitBtn.title = `Exploring ${cur}\nClick to select another commit`;
+      }
+    }
+  }
+
+  /** Switch the active repository: resets the workspace and reloads the version catalog. */
+  async switchProject(repo) {
+    const projSelect = document.getElementById("project-select");
+    if (!repo || repo === state.currentRepo) return;
+    const openTabs = state.panes.reduce((n, p) => n + p.tabs.length, 0);
+    if (openTabs > 0 && !confirm(`Switch project to '${repo}'? Open tabs (${openTabs}) belong to the current repository and will be closed.`)) {
+      if (projSelect) projSelect.value = state.currentRepo;
+      return;
+    }
+    api.setRepository(repo);
+    let defaultVersion = "";
+    try {
+      const res = await api.getVersions(true);
+      const versions = (res.versions || []).filter((v) => !v.is_prerelease);
+      const indexed = versions.filter((v) => v.indexed !== false && v.ref_type !== 3);
+      defaultVersion = (indexed[indexed.length - 1] || versions[versions.length - 1] || {}).vname || "";
+    } catch (err) {
+      console.warn("Could not load versions for project:", err);
+    }
+    if (!defaultVersion) {
+      const project = (this.projects || []).find((p) => p.repo === repo);
+      defaultVersion = project?.default_branch || "HEAD";
+    }
+    state.setRepository(repo, defaultVersion);
+    await this.initVersionSelector();
+    toast.success(`Switched to ${repo} @ ${shortRef(defaultVersion)}`);
+  }
+
+  /** Commands listed in the palette (">" prefix). */
+  paletteCommands() {
+    const v = () => state.getActiveTab()?.version || state.currentVersion;
+    const activeCode = () => {
+      const tab = state.getActiveTab();
+      return tab && tab.type === "code" && tab.path ? tab : null;
+    };
+    const commands = [
+      { title: "Compare versions or commits", hint: "Files & Kconfig changes", keywords: "diff compare", run: () => state.openTab({ type: "diff", title: "Compare" }) },
+      { title: "Select commit…", hint: "Tags and commits", keywords: "version checkout ref", run: () => document.getElementById("commit-picker-btn")?.click() },
+      { title: "Open source treemap", hint: "Bytes / files per directory", keywords: "size disk usage", run: () => state.openTab({ type: "treemap", title: "Treemap: root", path: "", version: v() }) },
+      {
+        title: "Export compile_commands.json", hint: "clang compilation database (x86)", keywords: "clangd lsp download",
+        run: () => {
+          window.location.href = api.getCompileCommandsDownloadUrl(v(), "x86");
+          toast.info("Generating compile_commands.json…");
+        }
+      },
+      { title: "Open KConfig engine", hint: "Menuconfig, defconfigs, dependencies", keywords: "config", run: () => state.openTab({ type: "kconfig", title: "KConfig (x86)", arch: "x86" }) },
+      {
+        title: `${state.kconfigEngineActive ? "Disable" : "Enable"} KConfig engine (#ifdef dimming)`, hint: "Dims compiled-out preprocessor branches", keywords: "ifdef dim preprocessor",
+        run: () => {
+          state.setKconfigEngineActive(!state.kconfigEngineActive);
+          toast.info(`KConfig engine ${state.kconfigEngineActive ? "enabled" : "disabled"}`);
+        }
+      },
+      { title: "Open Git commits timeline", hint: "History of the version", keywords: "log", run: () => state.openTab({ type: "commits", title: "Commits" }) },
+      { title: "Open subsystems & maintainers", hint: "MAINTAINERS, CREDITS", keywords: "people", run: () => state.openTab({ type: "maintainers", title: "Maintainers" }) },
+      { title: "Open NodeMap canvas", hint: "Schematic view", keywords: "graph", run: () => state.openTab({ type: "nodemap", title: "NodeMap Canvas" }) },
+      { title: "Open kernel documentation", hint: "Documentation/index.rst", keywords: "docs rst", run: () => state.openTab({ type: "code", title: "index.rst", path: "Documentation/index.rst", version: v() }) },
+      { title: "Toggle file explorer", hint: "Sidebar", keywords: "sidebar tree", run: () => document.querySelector('.activity-btn[data-action="explorer"]')?.click() },
+    ];
+    const tab = activeCode();
+    if (tab) {
+      commands.unshift(
+        { title: `Create patch from ${tab.path.split("/").pop()}…`, hint: "Edit & git format-patch", keywords: "patch edit", run: () => showPatchModal(tab.version || v(), tab.path) },
+        { title: "Symbol history at cursor line", hint: `${tab.path}:${tab.cursorLine || 1}`, keywords: "timeline versions", run: () => showSymbolHistoryModal(tab.version || v(), tab.path, tab.cursorLine || 1) },
+      );
+    }
+    if ((this.projects || []).length > 1) {
+      for (const p of this.projects) {
+        if (p.repo !== state.currentRepo && p.available) {
+          commands.push({ title: `Switch project: ${p.name}`, hint: p.path, keywords: "repository project", run: () => this.switchProject(p.repo) });
+        }
+      }
+    }
+    return commands;
   }
 
   setupActivityBar() {
@@ -401,8 +672,8 @@ export class KernelIdeApp {
           state.openTab({ type: "maintainers", title: "Maintainers" });
         } else if (action === "commits") {
           state.openTab({ type: "commits", title: "Commits" });
-        } else if (action === "tools") {
-          state.openTab({ type: "diff", title: "Version Diff" });
+        } else if (action === "compare" || action === "tools") {
+          state.openTab({ type: "diff", title: "Compare" });
         }
       });
     });
@@ -434,6 +705,9 @@ export class KernelIdeApp {
         }
       });
     }
+
+    const headerLabel = document.querySelector("#sidebar .sidebar-header span");
+    if (headerLabel) headerLabel.textContent = `Repository Explorer · ${shortRef(state.currentVersion)}`;
 
     treeContainer.innerHTML = `<div style="padding:12px;color:var(--text-muted);">Loading files...</div>`;
 
@@ -531,6 +805,10 @@ export class KernelIdeApp {
       });
     }
   }
+}
+
+function escapeAttr(str) {
+  return String(str ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 }
 
 // Bootstrap on DOM ready

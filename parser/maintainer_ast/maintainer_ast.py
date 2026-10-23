@@ -133,6 +133,7 @@ class MaintainerManager:
 
         self.VID = CS.gp.VID if hasattr(CS, "gp") and hasattr(CS.gp, "VID") else 1
         self.Old_VID = CS.gp.Old_VID if hasattr(CS, "gp") and hasattr(CS.gp, "Old_VID") else 0
+        self.blob_ref = ((m_file.table_id, 0), OP_REF, (REF_ROOT,))
 
         self.old_sections_map: dict[str, MaintainerSection] = {}
         if self.Old_VID != 0 and CS.mf and CS.gp and getattr(CS.gp, "Old_Version_Name", None):
@@ -201,8 +202,7 @@ class MaintainerManager:
                 with CS(REF_POS):
                     CS.store(m_maintainer_section.get_set(
                         None,
-                        self.VID,
-                        0,
+                        self.blob_ref,
                         section.name,
                         section.status,
                         section.scm_tree,
@@ -261,8 +261,6 @@ class MaintainerManager:
         code_hash = compute_code_hash(code)
         current_tag = (
             None,
-            self.VID,
-            0,
             code_hash,
             ast_ref,
             0,
@@ -380,6 +378,7 @@ class CreditsManager:
 
         self.VID = CS.gp.VID if hasattr(CS, "gp") and hasattr(CS.gp, "VID") else 1
         self.Old_VID = CS.gp.Old_VID if hasattr(CS, "gp") and hasattr(CS.gp, "Old_VID") else 0
+        self.blob_ref = ((m_file.table_id, 0), OP_REF, (REF_ROOT,))
 
         self.old_entries_map: dict[tuple[str, str], CreditsEntry] = {}
         if self.Old_VID != 0 and CS.mf and CS.gp and getattr(CS.gp, "Old_Version_Name", None):
@@ -448,8 +447,7 @@ class CreditsManager:
                 with CS(REF_POS):
                     CS.store(m_credits_entry.get_set(
                         None,
-                        self.VID,
-                        0,
+                        self.blob_ref,
                         person_ref,
                         entry.web_page,
                         entry.pgp_key,
@@ -479,8 +477,6 @@ class CreditsManager:
         code_hash = compute_code_hash(code)
         current_tag = (
             None,
-            self.VID,
-            0,
             code_hash,
             ast_ref,
             0,

@@ -10,6 +10,8 @@ class GlobalState {
 
     // Default State
     this.currentVersion = "v3.0";
+    this.currentRepo = ""; // configured repository name ("" = server default)
+    this.kconfigEngineActive = true; // Kconfig constraint engine (KConfig view); gates #ifdef dimming in code views
     this.splitMode = "single"; // 'single' | 'horizontal' | 'vertical'
     this.activePaneId = "pane-1";
     this.panes = [
@@ -85,6 +87,28 @@ class GlobalState {
     this.saveState();
   }
 
+  /** Switch the active repository (project); tabs belong to one repository so the workspace resets. */
+  setRepository(name, defaultVersion) {
+    if (!name || name === this.currentRepo) return;
+    this.currentRepo = name;
+    this.currentVersion = defaultVersion || this.currentVersion;
+    this.panes = [{ id: "pane-1", activeTabId: null, tabs: [] }];
+    this.activePaneId = "pane-1";
+    this.splitMode = "single";
+    this.saveState();
+    this.emit("repo:changed", name);
+    this.emit("layout:changed", { splitMode: this.splitMode, panes: this.panes });
+    this.emit("version:changed", this.currentVersion);
+  }
+
+  setKconfigEngineActive(active) {
+    const val = Boolean(active);
+    if (val === this.kconfigEngineActive) return;
+    this.kconfigEngineActive = val;
+    this.emit("kconfig:engine:changed", val);
+    this.saveState();
+  }
+
   syncVersionFromTab(version) {
     const vStr = typeof version === "string" ? version : (version?.vname || version?.name || "v3.0");
     if (!vStr || vStr === "[object Object]" || vStr.includes("object")) return;
@@ -150,12 +174,14 @@ class GlobalState {
           if (t.type === "code") return t.path === tabData.path && t.version === tabData.version;
           if (t.type === "kconfig") return t.arch === tabData.arch && t.version === tabData.version;
           if (t.type === "nodemap" && (tabData.initialNodes || tabData.initialNode)) return false;
+          if (t.type === "diff") return true;
           return t.title === tabData.title;
         });
 
     if (existing) {
       pane.activeTabId = existing.id;
       if (tabData.cursorLine) existing.cursorLine = tabData.cursorLine;
+      if ("diffMarks" in tabData) existing.diffMarks = tabData.diffMarks;
       if (tabData.symbol) existing.symbol = tabData.symbol;
       if (tabData.title) existing.title = tabData.title;
     } else {
@@ -227,6 +253,8 @@ class GlobalState {
     try {
       const stateObj = {
         version: this.currentVersion,
+        repo: this.currentRepo,
+        kconfigEngineActive: this.kconfigEngineActive,
         splitMode: this.splitMode,
         activePaneId: this.activePaneId,
         panes: this.panes,
@@ -249,6 +277,8 @@ class GlobalState {
         } else {
           this.currentVersion = "v3.0";
         }
+        if (typeof parsed.repo === "string") this.currentRepo = parsed.repo;
+        if (typeof parsed.kconfigEngineActive === "boolean") this.kconfigEngineActive = parsed.kconfigEngineActive;
         if (parsed.splitMode) this.splitMode = parsed.splitMode;
         if (parsed.activePaneId) this.activePaneId = parsed.activePaneId;
         if (Array.isArray(parsed.panes) && parsed.panes.length > 0) {

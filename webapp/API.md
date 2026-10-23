@@ -22,7 +22,9 @@ webapp/
 │   │   ├── sql.py                  # SQL LIKE wildcard sanitizer
 │   │   └── middleware.py           # Security headers (CSP) & sliding-window rate limiter
 │   ├── services/
-│   │   ├── git_reader.py           # Persistent Git object reader (git cat-file --batch)
+│   │   ├── git_reader.py           # Persistent Git object readers (git cat-file --batch), one per repository
+│   │   ├── docs_service.py         # Documentation label index & kernel-doc comment extraction
+│   │   ├── tree_resolver.py        # Tri-Path Git tree resolver & 6-Tier symbol disambiguation
 │   │   ├── filesystem_service.py   # Tree traversal, file maps, include resolver, treemap
 │   │   ├── symbol_service.py       # Multi-table symbol search, XRefs, AST containers
 │   │   ├── kconfig_service.py      # Defconfigs, Menuconfig hierarchy, constraint solver
@@ -38,6 +40,7 @@ webapp/
 │       ├── kconfig.py              # Kconfig trees, symbol relations, defconfigs
 │       ├── maintainers.py          # Subsystems, maintainers, CREDITS, patch reviewer
 │       ├── commits.py              # Git commit log, detail, and blame annotations
+│       ├── docs.py                 # Documentation labels & kernel-doc
 │       └── tools.py                # Pahole layout, callgraph, semantic version diff
 ├── frontend/
 │   ├── index.html                  # Semantic single-page application shell
@@ -88,27 +91,69 @@ The `webapp/` backend operates exclusively as a read-only presentation and query
 - If expected metadata tables or rows are absent, webapp endpoints must return appropriate HTTP error statuses or graceful process-level fallbacks without modifying the underlying database.
 
 ### 2.6. Frontend & Service Architectural Invariants
-1. **Directory Path Filtering & Polymorphic Navigation**: In database queries on `m_file`, directory records have `ftype == 0` while regular files have `ftype != 0`. All file search, path lookup, and `#include` header resolution queries must explicitly filter `m_file.ftype != 0` so directories sharing names or paths with header files are never returned as file matches. File viewer endpoints (`get_file`) and frontend code views (`virtual_editor.js`) support polymorphic path navigation: opening directory paths returns child hierarchies (`entries`, `tree`) and renders interactive navigation tables/grids rather than returning 404 errors.
+1. **Directory Path Filtering & Polymorphic Navigation**: In database queries on `m_file_blob`, directory records have `ftype == 0` while regular files have `ftype != 0`. All file search, path lookup, and `#include` header resolution queries explicitly filter `ftype != 0` so directories sharing names or paths with header files are never returned as file matches. File viewer endpoints (`get_file`) and frontend code views (`virtual_editor.js`) support polymorphic path navigation: opening directory paths returns child hierarchies (`entries`, `tree`) and renders interactive navigation tables/grids rather than returning 404 errors.
 2. **Lexical Comment Prioritization & Directive Matching**: In dual-layer syntax and AST overlays (`webapp/frontend/js/views/code_view/ast_overlay.js`), lexical tokenizers prioritize matching block comments (`/* ... */`) and line comments (`// ...`) *before* general identifier regexes, rendering them as non-clickable `<span class="tok-comment">` elements to prevent comment tokens from leaking into `.ast-token` or triggering symbol context menus. Preprocessor directive matching on snippet-relative coordinate slices allows optional leading hashes (e.g. `^(\s*#?\s*define\s+)`) so directive keywords are styled as preprocessors (`tok-macro`) and never tagged as clickable symbol identifiers.
 3. **Flat Coordinate Projection & Defensive Navigation**: Symbol detail backend endpoints (`webapp/backend/services/symbol_service.py:get_symbol_detail`) expose definition coordinate fields as flat scalars (`line: row["line_s"]`, `line_s: row["line_s"]`) at the root of the response payload alongside the nested `definition` record. Frontend jump-to-definition callers (`webapp/frontend/js/views/code_view/context_menu.js`) resolve coordinates defensively across `detail.definition?.line_s || detail.line_s || detail.line || 1` to ensure virtual editors navigate to and highlight the exact symbol definition line.
 4. **Maintainer Query Sanitization & Parameter Preference**: Developer identity and maintainer endpoints (`webapp/backend/routers/maintainers.py`, `webapp/backend/services/maintainer_service.py`) support query parameter lookups (`/api/maintainers/person?email=...&version=...`) alongside URL path parameters. Frontend API clients sanitize patch trailers and email strings (stripping `<>`, quotes, and whitespace) and prefer query parameters when identifiers contain special characters (`@`, `<`, `>`, `/`) to prevent URL decoding and route matching failures.
 5. **Context Menu Interaction Preservation**: Right-click context menus (`contextmenu`) across webapp workspaces (virtual code editor, file explorer sidebar, nodemap canvas) intercept default browser menus and offer context-adaptive actions (definitions, references, git blame popovers, command palette search, coordinate copying), while strictly preserving primary left-click interactions (inline AST token inspector popups, file navigation, node selection) without collision, event race conditions, or lingering ghost menus.
 6. **Structured Cross-Reference Classification**: Symbol cross-reference backend services (`get_symbol_xref`) and frontend inspectors (`showXrefModal`) return and render both primary and multi-declaration definition locations (`definitions: [...]` with file path, line bounds, and AST declaration type) alongside categorized usage references (`references: [...]` with caller function, file, line, and typed badges `Call`, `MemberRef`, `TypeUsage`, `DeclRef`, `MacroExpansion`), providing direct 1-click jump navigation for both definitions and usages.
-7. **Offline Status & Granular Storage Reset Controls**: Web application connection status badges (`#offline-badge`) anchor a settings popover detailing real-time network connectivity (`navigator.onLine`) and local storage breakdowns (IndexedDB cached file/symbol counts, active tabs), backed by granular reset controls: (1) clearing offline cache stores (`localDB.clearStore`), (2) resetting workspace tab sessions (`localStorage` and `tabs_state`), and (3) a confirmation-guarded full reset that wipes all IndexedDB stores (`localDB.clearAllStores`), clears `localStorage`, purges browser caches (`window.caches`), and reloads the application.
+
+### 2.7. Tri-Path Tree Resolution & 6-Tier Symbol Disambiguation (`webapp/backend/services/tree_resolver.py`)
+1. **Database Tree Resolution (`TreeResolverService`, module singleton `tree_resolver`)**:
+   - **Path A (Single-File Lookup, `<0.2ms`)**: Resolves the exact `blob_id` of a specific `fnid` at any `commit_id` by walking `parent_idx = 0` backwards to the nearest `m_bridge_checkpoint`. If an `m_commit_file` delta intervened along that chain, returns the delta's `blob_id` (or `None` if deleted with `change_type == 'D'`). If untouched, returns the checkpoint's baseline `blob_id`.
+   - **Path B (Full-Tree Resolution, `<15ms`, LRU Cached)**: Assembles the entire active `{fnid: blob_id}` repository tree at any `commit_id` by loading baseline snapshot records from `m_bridge_checkpoint` and chronologically applying forward `m_commit_file` deltas along the first-parent DAG. Results are cached in an in-memory `OrderedDict` LRU cache.
+   - **Limitation**: Paths A/B only reach a checkpoint when every first-parent ancestor is ingested in `m_commit`/`m_commit_parent`. The parser ingests a bounded commit window, so many intermediate commits have broken chains; Paths A/B are therefore used only as a fallback when the Git repository is unavailable.
+2. **Git-Native Tree Resolution (`GitTreeResolver`, module singleton `git_tree_resolver`)**:
+   - **Path C (Full-Tree Listing, `~50ms` cold, LRU Cached per commit SHA)**: `list_tree(rev)` resolves any revision (tag, branch, full/short SHA, even commits never ingested into `m_commit`) via `git rev-parse --verify <rev>^{commit}` and returns `{path: blob_sha}` from `git ls-tree -r -z --full-tree`. Submodule entries are skipped. This is the authoritative file list for every revision.
+   - `map_blob_hashes(cursor, blob_shas)` joins the Git blob SHAs to `m_file_blob.blob_hash` (`blob_hash` == Git blob SHA-1) and returns `{blob_sha: (blob_id, ftype)}`, preferring typed (`ftype != 0`) rows. Blobs absent from the map were never parsed (unindexed).
+   - `blob_paths(cursor, rev)` returns `{blob_id: [paths]}` for the indexed blobs of the revision's tree (sorted paths; one blob may sit at several paths). It is cached per commit SHA (8 entries) for `BLOB_PATHS_TTL` = 120 s, so blobs indexed by a running parse appear without a restart. Symbol services use it to scope `m_symbol_def` (content-addressed by `blob_id`) to any revision; see §4 *Revision scoping of symbol queries*.
+3. **6-Tier Symbol Disambiguation Engine (`DisambiguationEngine`)**:
+   When multiple candidates match a queried symbol name, candidate definitions are ranked by a deterministic composite scoring rule:
+   - **Tier 1 (Score 100.0)**: Same-blob local scope (`cand.blob_id == ref.source_blob_id`). Foreign `InternalStaticDef` definitions in other blobs are disqualified (`Score = -1.0`).
+   - **Tier 2 (Score 95.0)**: Compiler-verified target path provenance (`cand.fnid == ref.target_fnid`).
+   - **Tier 3 (Score 88.0 / 82.0)**: Include graph closure via `m_file_reference` (direct depth 1 = 88.0, transitive depth <= 4 = 82.0).
+   - **Tier 4 (Score 75.0+)**: Kbuild compilation unit match (same `.o`/`.ko` target or same `CONFIG_*` gate) with directory proximity prefix bonus.
+   - **Tier 5 (Score 65.0+)**: Exact structural AST signature match (`cand.ast_id == ref.ref_ast_id`) + architecture subtree affinity (`arch/<target_arch>/`).
+   - **Tier 6 (Score 55.0+)**: Strong `ExternalDef` vs. `WeakOrAliasDef` (-10.0 penalty) + `EXPORT_SYMBOL` authority (+3.0 boost).
+
+### 2.8. 3-Level Semantic Cross-Version Diff Engine (`webapp/backend/services/diff_service.py`)
+Either side of a comparison may be a release tag, a branch, or an arbitrary commit SHA. Comparison is evaluated in three progressive tiers to optimize latency:
+1. **Level 1 (O(1) Content Blob Filter)**: Resolves `{path: blob_sha}` for both revisions via `GitTreeResolver` (Path C), falling back to `{path: blob_id}` from `m_bridge_checkpoint` / `TreeResolverService` only when Git is unavailable on both sides. Unchanged files (equal content keys) are short-circuited in $O(1)$. A deleted path whose exact content reappears under an added path is reported as `renamed`.
+2. **Level 2 (AST & Symbol Structural Diff)**: For the first 50 modified files whose blobs are indexed on both sides, compares symbol definition records in `m_symbol_def` by `(name, type_id)` to surface added and removed definitions.
+3. **Level 3 (Kconfig Scoped Diff)**: Lists added/removed/modified Kconfig source files (`Kconfig`, `Kconfig.*`) from the Git trees (always complete), and diffs option definitions (`type`, `prompt`, `def_val` per defining file) from `m_kconfig_symbol` via `m_bridge_tag`. A Kconfig file contributes options only if its blob is indexed on every side it exists on; otherwise it is listed in `unindexed_files` and excluded, so unparsed blobs never surface as spurious additions or removals.
+
+### 2.9. Git-Native Database Architecture & Commit Hash Formatting
+1. **Zero-VID Native Table Queries & Elimination of View Dependencies**:
+   All webapp backend routers and services operate directly on Git-native content-addressable relational tables, completely bypassing legacy SQL compatibility views (`m_v_main`, `m_file`, `m_bridge_file`, `m_bridge_commit_file`):
+   - Version catalog and resolution query `m_git_ref` joined with `m_commit`.
+   - Filesystem tree and directory hierarchies list the Git tree of the requested revision (`GitTreeResolver`, Path C) and annotate files with `blob_id`/`ftype` from `m_file_blob` via the content-addressed `blob_hash`, so tags, branches, and intermediate commits all return their complete file list. Without a Git repository, they fall back to `m_bridge_checkpoint` and `TreeResolverService`.
+   - The code view (`get_file`) resolves a file's indexed blob from `m_bridge_checkpoint`, or—for non-checkpoint commits—from the Git blob SHA returned by `git cat-file`, joined to `m_file_blob.blob_hash`.
+   - Cross-version and file diffing use Git trees (Path C) with `m_file_blob` blob-hash annotation, falling back to `m_bridge_checkpoint` and `TreeResolverService.resolve_tree`.
+   - Preprocessor `#include` resolution leverages compiler-verified `m_file_reference` (`ref_type=1`) provenance.
+   - Backward-compatible JSON field mappings (`vid` = `commit_id`, `fid` = `blob_id`) are preserved so all frontend clients continue functioning seamlessly.
+2. **Commit Hash Formatting (`format_commit_hash`)**:
+   `m_commit.commit_hash` stores 20-byte binary Git SHA-1 digests (`BINARY(20)`). Backend services (`git_service.py`, `helpers.py`) format binary hashes using `format_commit_hash(val)` (`bytes(val).hex()`), ensuring 40-character lowercase hexadecimal strings in all JSON API responses. API endpoints support both 40-character hexadecimal queries (using SQL `UNHEX(%s)`), short commit hash prefixes, and legacy integer `commit_id` values.
 
 ---
+
+### 2.10. Multi-Repository Request Scoping (`webapp/backend/config.py`, `webapp/backend/security/middleware.py`)
+1. **Repository selection**: `RepoContextMiddleware` (pure ASGI, outermost) reads the `X-KI-Repo` header or `?repo=` query parameter and stores the matching configured repository (core config `"repositories"`, see `core/API.md` §7.1.1) in a `ContextVar`. Unknown or missing names fall back to the default repository. Because it is pure ASGI, sync endpoints running in the threadpool inherit the value.
+2. **Git access**: Every service resolves the work tree through `get_repo_dir()`; `git_reader` is a `GitReaderPool` with one persistent `git cat-file --batch` process per repository, and `GitTreeResolver.repo_dir` follows the request unless pinned.
+3. **Database scoping**: `get_active_repo_id(cursor)` maps the repository to `m_repository.repo_id` (by name, then `git_url`; `-1` when never parsed). Version resolution (`get_version_info`) and the version/branch catalogs only consider that repository's `m_git_ref` rows. Commit ids, blobs and tags are global and need no scoping.
+4. **Caches**: Module caches keyed by version names (`_FILE_TOKENS_CACHE`, `_INCLUDE_CACHE`, `_TREEMAP_CACHE`, `_DEFCONFIG_CACHE`, `_TREE_CACHE`, `_MAINTAINER_CACHE`, `_FILE_SUBSYSTEMS_CACHE`, version name/id caches) are `RepoScopedCache` instances that transparently prefix keys with the repository name; the git file-history LRU cache takes the repository path as an argument.
+5. **Unparsed repositories** remain browsable: tags absent from `m_git_ref` resolve through `git rev-parse` to `vid = 0`, and trees, files, searches, diffs and treemaps read Git directly.
 
 ## 3. Database Schema & Underlying Tables
 
 | Domain Area | Key Database Tables | Primary Role |
 | :--- | :--- | :--- |
-| **Versions** | `m_v_main` | Version identifiers (`vid`, `vname`) |
-| **Filesystem** | `m_file`, `m_file_name`, `m_bridge_file` | File instances, paths, file types (0=Dir, 1=C, 2=Kconfig, 3=Rust, 4=Asm, 5=Maintainers, 6=Credits, 7=Raw), and change status |
-| **AST & Spatial Maps** | `m_ast`, `m_ast_container`, `m_ast_include`, `m_bridge_tag`, `m_bridge_map`, `m_map_ast` | Relational AST nodes, preprocessor `#include` links, container hierarchies, and coordinate regions (`line_s`, `char_s`, `line_e`, `char_e`) |
-| **Symbols & XRefs** | `m_symbol_def`, `m_symbol_ref` | Definitions and usage cross-references (calls, field access, type usages) |
-| **Kconfig** | `m_kconfig_tree`, `m_kconfig_relation`, `m_kconfig_kbuild` | Hierarchical menus, architecture-scoped symbol dependencies, and compiled source mappings |
+| **Versions / Git Refs** | `m_git_ref`, `m_commit` | Version and reference identifiers (`ref_id`, `commit_id`, `ref_name`), chronological author dates, commit SHAs |
+| **Filesystem & Blobs** | `m_file_blob`, `m_file_name`, `m_bridge_checkpoint`, `m_file_reference` | File instances, content blobs, paths, file types (0=Dir, 1=C, 2=Kconfig, 3=Rust, 4=Asm, 5=Maintainers, 6=Credits, 7=Raw), and compiler-verified `#include` / Kbuild provenance |
+| **AST & Spatial Maps** | `m_ast`, `m_ast_container`, `m_ast_include`, `m_bridge_tag`, `m_bridge_map`, `m_map_ast`, `m_tag`, `m_tag_code` | Relational AST nodes, preprocessor `#include` links, container hierarchies, and coordinate regions (`line_s`, `char_s`, `line_e`, `char_e`) |
+| **Symbols & XRefs** | `m_symbol_def`, `m_symbol_ref` | Definitions and usage cross-references (calls, field access, type usages, macro expansions) |
+| **Kconfig** | `m_kconfig_symbol`, `m_kconfig_tree`, `m_kconfig_relation`, `m_kconfig_kbuild` | Hierarchical menus, architecture-scoped symbol dependencies, and compiled source mappings |
 | **Maintainers** | `m_maintainer_section`, `m_maintainer_member`, `m_maintainer_person`, `m_maintainer_pattern`, `m_maintainer_file`, `m_credits_entry` | Subsystem sections, pattern rules, maintainers, reviewers, and historical `CREDITS` biographies |
-| **Git & Commits** | `m_commit`, `m_bridge_commit_file`, `m_commit_trailer` | Commit metadata, modified files, multi-contributor trailers (Signed-off-by, Acked-by, Reviewed-by) |
+| **Git & Commits** | `m_commit`, `m_commit_file`, `m_bridge_commit_person`, `m_commit_parent`, `m_git_network`, `m_repository` | Commit metadata, DAG topology, modified files, multi-contributor trailers (Signed-off-by, Acked-by, Reviewed-by) |
 | **System & State** | `m_db_instance` | Unique database instance hash (`instance_hash`, `created_at`) used by clients to detect database rebuilds |
 
 ---
@@ -122,14 +167,57 @@ All API endpoints reside under the `/api` prefix. Both canonical version-scoped 
 ### 4.1. Version Catalog
 
 #### `GET /api/versions`
-Retrieve all available kernel versions indexed in the database.
-- **Query Parameters**: None
+Versions of the active repository (§2.10): parsed refs from `m_git_ref` (`"indexed": true`) plus every commit-pointing Git tag that was not parsed (`"indexed": false`, `vid: 0`), sorted in Git version order (`versionsort`). Tags pointing at trees (e.g. `v2.6.11`) are skipped.
+- **Query Parameters**:
+  - `include_rc` (query, bool): If `true`, unparsed pre-release tags (`-rc`, `-pre`, `-alpha`, `-beta`) are included; parsed refs are always listed. Default `true`.
+- **Entry fields**: `vid`, `vname`, `commit_hash`, `is_prerelease`, `ref_type` (1 tag, 2 branch, 3 commit), `indexed`.
 - **Response**:
 ```json
 {
   "total": 1,
   "versions": [
-    { "vid": 1, "vname": "v3.0" }
+    {
+      "vid": 1,
+      "vname": "v3.0",
+      "commit_hash": "02f8c6aee8df311261e6da8ba96bd41704aa9623",
+      "is_prerelease": false
+    }
+  ]
+}
+```
+
+#### `GET /api/projects`
+List the configured repositories (core config `"repositories"`, auto-detected under `workspace.repos_dir`) joined with `m_repository`/`m_project`. Each entry has `repo` (the name sent as `X-KI-Repo`), `name`, `slug`, `path`, `default_branch`, `git_url`, `repo_id`, `indexed` (parsed into the database), `available` (work tree present) and `active`; the envelope adds `active`.
+- **Query Parameters**: None
+- **Response**:
+```json
+{
+  "total": 1,
+  "projects": [
+    {
+      "project_id": 1,
+      "name": "Linux Kernel",
+      "repo_path": "/home/scottviger/kernelinfo/linux",
+      "default_branch": "master",
+      "is_active": true
+    }
+  ]
+}
+```
+
+#### `GET /api/branches`
+Retrieve the active repository's Git branches: indexed refs (`m_git_ref.ref_type = 2` for its `repo_id`) followed by local Git branches.
+- **Query Parameters**: None
+- **Response**:
+```json
+{
+  "total": 1,
+  "branches": [
+    {
+      "name": "master",
+      "commit_hash": "02f8c6aee8df311261e6da8ba96bd41704aa9623",
+      "is_default": true
+    }
   ]
 }
 ```
@@ -159,6 +247,7 @@ Retrieve the directory hierarchy and file entries for a given path in the kernel
   - `version_name` (path) / `version` (query): Kernel version string (default `"v3.0"`).
   - `path` (query): Directory path relative to repository root (e.g. `"kernel"`, `""` for root).
 - **Behavior**:
+  - `version_name` may be a release tag, a branch, or any full/short commit SHA. The listing comes from the Git tree of that revision (complete for every commit); file entries are annotated with `fid` (`blob_id`) and `ftype` from `m_file_blob` by blob hash. Files whose blobs were never parsed have `fid: null` and `ftype: 7` (Raw).
   - Automatically identifies subdirectories and filters out directory records (`ftype == 0`) from the file entries list to prevent duplication.
   - Returns sorted entries: directories first, followed by files alphabetically.
 - **Response**:
@@ -190,7 +279,7 @@ Retrieve the directory hierarchy and file entries for a given path in the kernel
 #### `GET /api/file`
 Retrieve version-specific source file contents, metadata, spatial AST coordinate tokens, version lifecycle history, and incoming cross-file references.
 - **Source Retrieval Engine**: Uses a persistent, thread-safe `git cat-file --batch` worker (`GitReader`) to stream exact blob contents directly from Git for the requested revision/tag in sub-millisecond time (~0.1ms small / ~0.2ms big files). Preserves 100% byte fidelity without relying on local working tree checkouts.
-- **Graceful Unindexed Fallback**: If a requested file exists in the Git repository but has no indexing row in `m_bridge_file` (or is a non-C file), the endpoint serves the raw file content with `tokens: []`, empty AST maps, and inferred lifecycle metadata rather than throwing a 404.
+- **Graceful Unindexed Fallback**: If a requested file exists in the Git repository but has no indexing row in `m_bridge_checkpoint` (or is a non-C file), the endpoint serves the raw file content with `tokens: []`, empty AST maps, and inferred lifecycle metadata rather than throwing a 404.
 - **Directory Detection**: If the path resolves to a Git `tree` or directory record (`ftype == 0`), the endpoint transparently returns the directory hierarchy structure.
 - **Parameters**:
   - `version_name` (path) / `version` (query): Kernel version string (default `"v3.0"`).
@@ -257,17 +346,18 @@ Retrieve version-specific source file contents, metadata, spatial AST coordinate
 
 #### `GET /api/fs/resolve_include`
 #### `GET /api/resolve_include`
-Resolve a preprocessor `#include <...>` or `#include "..."` directive to an authoritative git repository file path. Guarantees directory exclusion (`m_file.ftype != 0`) to prevent directory false-positives.
+Resolve a preprocessor `#include <...>` or `#include "..."` directive to an authoritative git repository file path. Guarantees directory exclusion (`ftype != 0`) to prevent directory false-positives.
 - **Parameters**:
   - `version` (query): Kernel version string (default `"v3.0"`).
   - `header` (query): Raw or cleaned include path (e.g. `"<linux/init.h>"`, `"linux/init.h"`, `"#include <linux/init.h>"`). Required.
   - `ast_id` (query): Optional AST Node ID of the include directive to check direct `m_ast_include` links.
   - `current_file` (query): Optional referring source file path (e.g. `"arch/x86/kernel/setup.c"`) to prioritize architecture-specific or relative header matches.
 - **Resolution Strategy**:
-  1. If `ast_id` is supplied, queries `m_ast_include` join `m_file_name`.
-  2. Generates candidate search paths: relative to `current_file` directory, `header`, `include/{header}`, `include/uapi/{header}`, and `arch/{arch}/include/{header}`.
-  3. Matches candidates against active non-directory indexed files (`m_file.ftype != 0`) in `m_bridge_file` / `m_file_name`.
-  4. Falls back to physical repo jail disk verification.
+  1. If `current_file` is supplied, queries compiler-verified provenance from `m_file_reference` (`ref_type=1`).
+  2. If `ast_id` is supplied, queries `m_ast_include` join `m_file_name`.
+  3. Generates prioritized candidate search paths: relative to `current_file` directory, `header`, `include/{header}`, `include/uapi/{header}`, and `arch/{arch}/include/{header}`.
+  4. Matches candidates against active non-directory indexed files (`ftype != 0`) in `m_bridge_checkpoint` / `m_file_blob` / `m_file_name`.
+  5. Falls back to physical repo jail disk verification.
 - **Response**:
 ```json
 {
@@ -280,23 +370,32 @@ Resolve a preprocessor `#include <...>` or `#include "..."` directive to an auth
 
 #### `GET /api/blame`
 #### `GET /api/commits/{version_name}/blame/{path:path}`
-Retrieve line-by-line git blame provenance annotations.
+#### `GET /api/commits/{version_name}/blame?path={path}`
+#### `GET /api/version/{version_name}/file/{fid}/blame`
+Retrieve line-by-line git blame provenance annotations and commit attributions.
 - **Parameters**:
-  - `version` (query) / `version_name` (path): Kernel version string.
-  - `path` (query or path): File path in repository.
+  - `version` (query) / `version_name` (path): Kernel version string (e.g. `"v3.0"`).
+  - `path` (query or path): File path in repository (e.g. `"init/main.c"`).
+  - `fid` (path): Integer file ID (when querying by file ID).
 - **Response**:
 ```json
 {
   "path": "init/main.c",
+  "total_lines": 890,
   "lines": [
     {
       "line": 1,
       "commit_hash": "1da177e4c3f41524e886b7f1b8a0c1fc7321cac2",
+      "author_name": "Linus Torvalds",
+      "author_email": "torvalds@ppc970.osdl.org",
+      "date": 1113690036,
+      "subject": "Linux-2.6.12-rc2",
       "author": "Linus Torvalds",
-      "date": "2005-04-16",
-      "summary": "Linux-2.6.12-rc2"
+      "summary": "Linux-2.6.12-rc2",
+      "final_line": 1
     }
-  ]
+  ],
+  "blame": [ ... ]
 }
 ```
 
@@ -306,59 +405,42 @@ Polymorphic unified browse endpoint that automatically detects whether the targe
   - `version_name` (path): Kernel version string.
   - `path` (path): Repository path (empty string for repository root).
 - **Response**: Returns either directory entries or file content payload based on path classification.
-
-#### `GET /api/version/{version_name}/references/{fid}`
-Retrieve all incoming cross-file references targeting a specific file ID (`fid`), including `#include` references, Kconfig relations, and Kbuild Makefile linkages.
-- **Parameters**:
-  - `version_name` (path): Kernel version string.
-  - `fid` (path): Integer file ID.
-  - `ref_type` (query): Optional filter (`"include"`, `"kconfig"`, `"kbuild"`, `"makefile"`, `"documentation"`).
-- **Response**:
-```json
-{
-  "fid": 684,
-  "path": "include/linux/init.h",
-  "total": 4,
-  "breakdown": { "include": 4, "kconfig": 0, "kbuild": 0, "makefile": 0, "documentation": 0 },
-  "references": [
-    { "fid": 912, "source_file": "kernel/sched.c", "ref_type": "include", "ref_label": "Included By" }
-  ]
-}
-```
-
 #### `GET /api/fs/treemap/{version_name}`
 #### `GET /api/version/{version_name}/treemap`
-Generate a hierarchical squarified treemap data structure representing file and directory size distribution across the codebase for visual disk/complexity analytics.
+Directory hierarchy of the revision weighted by bytes and file counts, built from `git ls-tree -r -l` (`GitTreeResolver.list_tree_sizes`, LRU cached). Children are sorted by size, descending.
 - **Parameters**:
-  - `version_name` (path): Kernel version string.
-  - `max_depth` (query): Tree depth limit (default 3).
-  - `path` (query): Subdirectory prefix filter (default `""` for root).
+  - `version_name` (path): Revision.
+  - `max_depth` (query): Levels below `path` (1–8, default 3).
+  - `path` (query): Subdirectory to zoom into (default `""` for root).
 - **Response**:
 ```json
 {
+  "version": "v3.0",
+  "max_depth": 1,
   "name": "root",
   "path": "",
-  "file_count": 35412,
+  "type": "dir",
+  "size": 421358238,
+  "file_count": 36783,
   "children": [
-    {
-      "name": "drivers",
-      "path": "drivers",
-      "file_count": 18230,
-      "children": []
-    },
-    {
-      "name": "arch",
-      "path": "arch",
-      "file_count": 8940,
-      "children": []
-    }
+    { "name": "drivers", "path": "drivers", "type": "dir", "size": 222873639, "file_count": 15270, "children": [] }
   ]
 }
 ```
+
+#### `GET /api/fs/search/{version_name}`
+Fuzzy file-path search over the revision's Git tree (used by the Ctrl+K palette).
+- **Parameters**: `q` (query), `limit` (query, default 50, max 200).
+- **Ranking**: exact basename → basename prefix → basename substring → path substring → subsequence (fewest gaps first).
+- **Response**: `{ "version", "query", "total", "files": [{ "path", "name", "score" }] }`
+
+#### `GET /api/fs/raw/{version_name}`
+Serve an image blob of the revision (documentation figures). Only `svg`, `png`, `jpg`/`jpeg`, `gif` are served (else 404); a `name.*` path picks the first existing of `.svg/.png/.jpg/.jpeg/.gif` (Sphinx convention). Responses carry `Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; sandbox` so scripts embedded in SVG never run; files over 10 MiB return 413.
+- **Parameters**: `path` (query, jailed relative path), `repo` (query, optional repository for `<img>` requests that cannot send headers).
 
 #### `GET /api/fs/compile_commands/{version_name}`
 #### `GET /api/version/{version_name}/compile_commands`
-Export a Clang JSON Compilation Database (`compile_commands.json`) containing compilation command lines and include flags for all indexed C source files in the specified architecture.
+Export a Clang JSON Compilation Database (`compile_commands.json`) with one entry per `.c` file of the revision's Git tree, excluding other architectures' `arch/<name>/` subtrees. Commands include the arch/generic include paths, `include/linux/kconfig.h`, `-D__KERNEL__` and `-nostdinc`.
 - **Parameters**:
   - `version_name` (path): Kernel version string.
   - `arch` (query): Target architecture (e.g. `"x86"`, `"arm"`, default `"x86"`).
@@ -373,6 +455,39 @@ Export a Clang JSON Compilation Database (`compile_commands.json`) containing co
 ]
 ```
 
+#### `GET /api/fs/compile_commands/{version_name}/export`
+#### `GET /api/version/{version_name}/export/compile_commands.json`
+Same database as an attachment download (`Content-Disposition: attachment; filename="compile_commands-<version>-<arch>.json"`).
+
+#### `GET /api/version/{version_name}/export/compile_commands`
+#### `GET /api/fs/compile_commands/{version_name}/export`
+Export compilation commands wrapped in an envelope object (`{"compile_commands": [...], "commands": [...]}`) for client-side download consumers expecting wrapped payloads.
+- **Parameters**:
+  - `version_name` (path): Kernel version string.
+  - `arch` (query): Target architecture (default `"x86"`).
+- **Response**:
+```json
+{
+  "version": "v3.0",
+  "arch": "x86",
+  "total": 1,
+  "compile_commands": [
+    {
+      "directory": "/kernel",
+      "file": "init/main.c",
+      "command": "gcc -nostdinc -isystem ... -Iarch/x86/include -Iinclude -c init/main.c -o init/main.o"
+    }
+  ],
+  "commands": [
+    {
+      "directory": "/kernel",
+      "file": "init/main.c",
+      "command": "gcc -nostdinc -isystem ... -Iarch/x86/include -Iinclude -c init/main.c -o init/main.o"
+    }
+  ]
+}
+```
+
 ---
 
 ### 4.3. Symbols, Cross-References & AST Inspection API
@@ -380,6 +495,7 @@ Export a Clang JSON Compilation Database (`compile_commands.json`) containing co
 #### `GET /api/symbols/search`
 #### `GET /api/symbols/{version_name}/search`
 Search symbol definitions by prefix or substring across functions, variables, structs, enums, enumerator constants (`EnumConstant`), typedefs, and macros.
+- **Revision scoping of symbol queries** (also `lookup`, `symbol/{name}`, `xref/{name}`): `version_name` may be a tag, branch, or any commit SHA, including commits that were never ingested into `m_commit`. `SymbolService._scope` builds `{blob_id: [paths]}` from the revision's Git tree (`GitTreeResolver.blob_paths`) and falls back to `m_bridge_checkpoint` only when Git is unavailable. Only definitions whose blob is in that tree are returned, with `file_path` taken from the tree. A symbol is therefore found at a commit whenever its file's exact content was parsed in any version; files whose content was never parsed contribute no symbols. Search scans up to `SEARCH_CANDIDATES` (30000) name-ordered candidates before scoping, then fetches details for the kept `def_id`s. The first query per commit costs ~0.3 s to build the blob map; later queries are cached.
 - **Parameters**:
   - `version` / `version_name` (query): Kernel version string (default `"v3.0"`).
   - `q` (query): Search prefix or substring.
@@ -407,10 +523,12 @@ Search symbol definitions by prefix or substring across functions, variables, st
 
 #### `GET /api/symbols/lookup`
 #### `GET /api/symbols/{version_name}/lookup`
+#### `GET /api/version/{version_name}/symbol_lookup`
+#### `GET /api/version/{version_name}/lookup`
 Fast typeahead symbol name suggestion endpoint.
 - **Parameters**:
-  - `version` / `version_name` (query): Kernel version string (default `"v3.0"`).
-  - `q` (query): Symbol prefix.
+  - `version` / `version_name` (query or path): Kernel version string (default `"v3.0"`).
+  - `q` / `query` (query): Symbol prefix.
   - `limit` (query): Maximum results (default 20).
 - **Response**:
 ```json
@@ -520,6 +638,8 @@ Recursively inspect relational AST node container hierarchies.
 
 #### `GET /api/symbols/{version_name}/include/{ast_id}`
 #### `GET /api/include/{ast_id}`
+#### `GET /api/version/{version_name}/include/{ast_id}/symbols`
+#### `GET /api/version/{version_name}/include/{ast_id}`
 Retrieve imported symbols and target header file path for a preprocessor `CPPro_include` AST node.
 - **Parameters**:
   - `version_name` (path) / `version` (query): Kernel version string.
@@ -548,25 +668,37 @@ Retrieve imported symbols and target header file path for a preprocessor `CPPro_
 }
 ```
 
+#### `GET /api/symbols/{version_name}/history`
 #### `GET /api/tag/{tag_id}/timeline`
-Retrieve cross-version code evolution history and diff tracking for a persistent tag.
-- **Parameters**:
-  - `tag_id` (path): Unique tag ID.
+History of one symbol definition across every indexed version of the active repository (`SymbolService.get_symbol_history`).
+- **Parameters**: `path` and `line` (query, plus optional `ast_id`) select the narrowest tag of the file covering that line at `version_name`; the tag route uses `tag_id` and locates its file through `m_bridge_checkpoint`/`m_commit_file`.
+- **Algorithm**: For each parsed ref (oldest first) the file's blob comes from the Git tree (content hash → `m_file_blob`); that blob's tags with the anchor's `ast_id` are compared with the previous version's: same `tag_id` → `unchanged`, different → `modified` (with a line diff of the definition read from Git), first appearance → `introduced` (`added` when it reappears), missing → `removed`/`absent`, blob never parsed → `unindexed`. `m_moved_tag` lineage is preferred when a blob holds several matches.
 - **Response**:
 ```json
 {
-  "tag_id": 105,
-  "total_versions": 1,
+  "tag_id": 999657,
+  "ast_id": 1123,
+  "ast_name": "do_fork",
+  "path": "kernel/fork.c",
+  "moved_to": null,
+  "moved_from": null,
+  "lineage_tag_ids": [999657],
+  "total_versions": 6,
   "timeline": [
-    {
-      "vid": 1,
-      "vname": "v3.0",
-      "status": "Active",
-      "code_snippet": "asmlinkage void __init start_kernel(void)"
-    }
+    { "vname": "v2.6.12-rc2", "vid": 1, "status": "introduced", "tag_id": 999657, "line_s": 1192, "line_e": 1250, "lines_added": 0, "lines_removed": 0, "diff": [] },
+    { "vname": "v2.6.13", "vid": 3400, "status": "modified", "tag_id": 1004417, "line_s": 1205, "line_e": 1266, "lines_added": 3, "lines_removed": 2, "diff": [{ "type": "add", "text": "..." }] }
   ]
 }
 ```
+
+#### `GET /api/docs/{version_name}/labels`
+Index of every `.. _label:` target under `Documentation/` at the revision (`git grep` with context, LRU cached per commit), used to resolve `:ref:` across documents.
+- **Response**: `{ "version", "total", "labels": { "<label>": { "path", "line", "title" } } }` (labels lowercased; `title` is the section the label precedes, when one follows).
+
+#### `GET /api/docs/{version_name}/kernel-doc`
+kernel-doc comments of a source file, filtered like the `.. kernel-doc::` directive.
+- **Parameters**: `path` (query), `export` / `internal` (bool: only / never `EXPORT_SYMBOL*` identifiers), `functions` (space- or comma-separated identifiers), `doc` (a `DOC:` section title), `no_identifiers`.
+- **Response**: `{ "version", "path", "total", "exported": [...], "entries": [{ "kind": "function|macro|struct|union|enum|typedef|doc", "name", "brief", "signature", "params": [{ "name", "desc" }], "sections": [{ "title", "body" }], "line" }] }`. Descriptions keep kernel-doc markup (`@param`, `%CONST`, `&struct foo`) for the client to render.
 
 ---
 
@@ -623,24 +755,54 @@ Retrieve the authentic scoped Menuconfig tree for an architecture. Performs auth
 ```
 
 #### `GET /api/kconfig/{version_name}/symbol/{symbol_name}`
+#### `GET /api/version/{version_name}/kconfig/symbol/{symbol_name}`
 #### `GET /api/kconfig/symbol`
-Retrieve comprehensive metadata for a Kconfig symbol, including definitions, prompt, dependencies, reverse selects, and compiled C files.
+#### `GET /api/version/{version_name}/kconfig/symbol`
+Retrieve comprehensive metadata for a Kconfig symbol, including declaring source file coordinates (`file_path`, `line_s`, `line_e`), prompt, dependencies, reverse selects, and compiled C files. If spatial coordinates are unindexed in `m_kconfig_tree`, transparently falls back to sub-50ms repository `git grep` detection.
 - **Parameters**:
   - `version_name` (path) / `version` (query): Kernel version string.
-  - `symbol_name` (path or query): Kconfig symbol name without `CONFIG_` prefix (e.g. `"SMP"`).
+  - `symbol_name` (path or query): Kconfig symbol name with or without `CONFIG_` prefix (e.g. `"SMP"` or `"CONFIG_SMP"`).
 - **Response**:
 ```json
 {
   "name": "SMP",
   "type": "bool",
+  "type_name": "bool",
   "prompt": "Symmetric multi-processing support",
-  "depends_on": "X86_LOCAL_APIC",
+  "file_path": "arch/x86/Kconfig",
+  "line_s": 298,
+  "line_e": 315,
+  "declarations": [
+    {
+      "file_path": "arch/x86/Kconfig",
+      "line_s": 298,
+      "line_e": 315
+    }
+  ],
+  "definition": {
+    "file_path": "arch/x86/Kconfig",
+    "line_s": 298,
+    "line_e": 315
+  },
+  "depends_on": ["X86_LOCAL_APIC"],
   "selects": ["USE_GENERIC_SMP_HELPERS"],
   "selected_by": ["MAXSMP"],
-  "compiled_files": ["kernel/smp.c", "arch/x86/kernel/smp.c"]
+  "compiled_files": [
+    { "file_path": "kernel/smp.c", "compile_mode": "built-in" },
+    { "file_path": "arch/x86/kernel/smp.c", "compile_mode": "built-in" }
+  ]
 }
 ```
 
+#### `POST /api/kconfig/{version_name}/validate`
+#### `POST /api/version/{version_name}/kconfig/validate`
+Check `{"symbols": {...}}` against select/depends constraints. Response: `{ "version", "forced_symbols", "adjusted_symbols", "conflicts" }`.
+
+#### `POST /api/kconfig/{version_name}/diff-config`
+#### `POST /api/version/{version_name}/kconfig/diff-config`
+Compare `{"active_config": {...}, "custom_config": {...}}`. Response: `{ "version", "matching_symbols", "mismatched_symbols", "differences": [{ "symbol", "val1", "val2" }] }`.
+
+#### `GET /api/version/{version_name}/kconfig/defconfigs`
 #### `GET /api/kconfig/{version_name}/defconfigs`
 #### `GET /api/kconfig/defconfigs`
 List discovered defconfig files for an architecture.
@@ -659,6 +821,7 @@ List discovered defconfig files for an architecture.
 }
 ```
 
+#### `GET /api/version/{version_name}/kconfig/defconfig/content`
 #### `GET /api/kconfig/{version_name}/defconfig`
 #### `GET /api/kconfig/defconfig/content`
 Retrieve parsed key-value assignments and raw content from an authentic defconfig file.
@@ -694,11 +857,13 @@ Retrieve parsed key-value assignments and raw content from an authentic defconfi
 
 #### `GET /api/kconfig/graph`
 #### `GET /api/kconfig/{version_name}/graph`
+#### `GET /api/version/{version_name}/kconfig/graph`
+#### `GET /api/version/{version_name}/kconfig/graph/{symbol_name}`
 Retrieve the full architecture dependency graph for client-side constraint evaluation, dependency tree traversal, and visual DAG rendering.
 - **Parameters**:
   - `version` / `version_name` (query or path): Kernel version string.
   - `arch` (query): Target architecture.
-  - `symbol` (query): Optional root symbol filter.
+  - `symbol` / `symbol_name` (query or path): Optional root symbol filter.
   - `depth` (query): Max dependency expansion depth (default 2).
 - **Response**:
 ```json
@@ -738,32 +903,9 @@ Evaluate prerequisite dependency trees for blocked or unmet Kconfig symbols and 
   "total_toggles": 1
 }
 ```
-
-#### `POST /api/kconfig/{version_name}/diff`
-#### `POST /api/version/{version_name}/kconfig/diff`
-Compare two configuration assignment sets (active vs custom/saved) to highlight modified, added, and conflicting symbols.
-- **Parameters**:
-  - `version_name` (path): Kernel version string.
-  - **Body** (`application/json`):
-    ```json
-    {
-      "active_config": { "CONFIG_EXT4_FS": "y", "CONFIG_BTRFS_FS": "n" },
-      "custom_config": { "CONFIG_EXT4_FS": "y", "CONFIG_BTRFS_FS": "y" }
-    }
-    ```
-- **Response**:
-```json
-{
-  "matching_symbols": 1,
-  "mismatched_symbols": 1,
-  "differences": [
-    { "symbol": "CONFIG_BTRFS_FS", "active": "n", "custom": "y" }
-  ]
-}
-```
-
 #### `GET /api/kconfig/{version_name}/presets`
 #### `GET /api/version/{version_name}/kconfig/presets`
+#### `GET /api/version/{version_name}/kconfig/env-presets`
 Retrieve discovered CPU architectures, canonical defconfigs, architectural symbol bindings, and compiler presets.
 - **Parameters**:
   - `version_name` (path): Kernel version string.
@@ -812,12 +954,89 @@ Retrieve discovered CPU architectures, canonical defconfigs, architectural symbo
 }
 ```
 
+#### `GET /api/kconfig/{version_name}/search`
+#### `GET /api/version/{version_name}/kconfig/search`
+Search Kconfig symbol names, prompts, and types by query prefix or substring.
+- **Parameters**:
+  - `version_name` (path): Kernel version string.
+  - `q` / `query` (query): Search query string.
+  - `limit` (query): Maximum matches to return (default 50).
+- **Response**:
+```json
+{
+  "version": "v3.0",
+  "query": "SMP",
+  "count": 2,
+  "symbols": [
+    {
+      "name": "SMP",
+      "prompt": "Symmetric multi-processing support",
+      "type": 1,
+      "type_name": "bool",
+      "file_path": "arch/x86/Kconfig"
+    }
+  ]
+}
+```
+
+#### `POST /api/kconfig/{version_name}/import`
+#### `POST /api/version/{version_name}/kconfig/import`
+Parse and validate raw uploaded `.config` configuration file content against the active architecture's Kconfig symbol dictionary.
+- **Parameters**:
+  - `version_name` (path): Kernel version string.
+  - `arch` (query): Target architecture (default `"x86"`).
+  - **Body** (`application/json`):
+    ```json
+    {
+      "content": "CONFIG_64BIT=y\nCONFIG_SMP=y\n"
+    }
+    ```
+- **Response**:
+```json
+{
+  "version": "v3.0",
+  "arch": "x86",
+  "total_parsed": 2,
+  "valid_symbols": 2,
+  "unknown_symbols": 0,
+  "assignments": {
+    "CONFIG_64BIT": "y",
+    "CONFIG_SMP": "y"
+  }
+}
+```
+
+#### `POST /api/kconfig/{version_name}/export`
+#### `POST /api/version/{version_name}/kconfig/export`
+Serialize an in-memory dictionary of configuration assignments into standard kernel `.config` file text format.
+- **Parameters**:
+  - `version_name` (path): Kernel version string.
+  - `arch` (query): Target architecture (default `"x86"`).
+  - **Body** (`application/json`):
+    ```json
+    {
+      "assignments": {
+        "64BIT": "y",
+        "SMP": "y"
+      }
+    }
+    ```
+- **Response**:
+```json
+{
+  "version": "v3.0",
+  "arch": "x86",
+  "content": "#\n# Automatically generated make config: don't edit\n# Linux Kernel Configuration\nCONFIG_64BIT=y\nCONFIG_SMP=y\n"
+}
+```
+
 ---
 
 ### 4.5. Maintainers & CREDITS API
 
 #### `GET /api/maintainers/{version_name}/overview`
 #### `GET /api/maintainers`
+#### `GET /api/version/{version_name}/maintainers`
 Search and list kernel subsystems from the authoritative `MAINTAINERS` file database.
 - **Parameters**:
   - `version_name` (path) / `version` (query): Kernel version string.
@@ -851,6 +1070,7 @@ Search and list kernel subsystems from the authoritative `MAINTAINERS` file data
 
 #### `GET /api/maintainers/{version_name}/section/{sec_id}`
 #### `GET /api/maintainers/section`
+#### `GET /api/version/{version_name}/maintainer/section/{sec_id}`
 Retrieve comprehensive details for a subsystem section, including member rosters, file matching rules (`F:`, `X:`), and touched files.
 - **Parameters**:
   - `version_name` (path) / `version` (query): Kernel version string.
@@ -890,6 +1110,8 @@ Retrieve comprehensive details for a subsystem section, including member rosters
 #### `GET /api/maintainers/{version_name}/person/{person_id_or_email}`
 #### `GET /api/maintainers/{version_name}/person`
 #### `GET /api/maintainers/person`
+#### `GET /api/version/{version_name}/person/{person_id_or_email}`
+#### `GET /api/version/{version_name}/person`
 Retrieve developer profile, CREDITS biographical data, maintained subsystems, and git contribution statistics. Supports both URI path parameters and query parameters to safely handle email addresses containing special characters.
 - **Parameters**:
   - `version_name` (path) / `version` (query): Kernel version string.
@@ -928,6 +1150,8 @@ Retrieve developer profile, CREDITS biographical data, maintained subsystems, an
 
 #### `POST /api/maintainers/{version_name}/match`
 #### `POST /api/maintainers/match`
+#### `POST /api/version/{version_name}/patch/maintainers`
+#### `POST /api/patch/maintainers`
 Emulate `scripts/get_maintainer.pl` by evaluating touched paths or raw patch content against subsystem pattern rules.
 - **Parameters**:
   - `version_name` (path): Kernel version string.
@@ -960,6 +1184,7 @@ Emulate `scripts/get_maintainer.pl` by evaluating touched paths or raw patch con
 
 #### `GET /api/maintainers/{version_name}/credits`
 #### `GET /api/credits`
+#### `GET /api/version/{version_name}/credits`
 Search historical `CREDITS` file entries and biographical details.
 - **Parameters**:
   - `version_name` (path) / `version` (query): Kernel version string.
@@ -1024,7 +1249,7 @@ Retrieve paginated commit history and contributor summaries.
   - `version_name` (path) / `version` (query): Kernel version string.
   - `page` (query): Page number (default 1).
   - `limit` (query): Commits per page (default 50).
-  - `q` (query): Filter by commit message, hash, or author.
+  - `q` (query): Filter by commit subject, hash prefix (matched case-insensitively against `HEX(commit_hash)`), or author name.
 - **Response**:
 ```json
 {
@@ -1047,6 +1272,7 @@ Retrieve paginated commit history and contributor summaries.
 
 #### `GET /api/commits/{version_name}/detail/{commit_id_or_hash}`
 #### `GET /api/commit`
+#### `GET /api/version/{version_name}/commit/{commit_id_or_hash}`
 Retrieve detailed metadata for a commit, including multi-contributor trailers and modified files.
 - **Parameters**:
   - `version_name` (path) / `version` (query): Kernel version string.
@@ -1070,32 +1296,152 @@ Retrieve detailed metadata for a commit, including multi-contributor trailers an
 }
 ```
 
+#### `GET /api/commits/timeline`
 #### `GET /api/commits/{version_name}/timeline`
-Retrieve a chronological commit timeline along with author leaderboards and trailer summary metrics.
+#### `GET /api/version/{version_name}/timeline`
+Retrieve an anchored, bi-directional chronological commit timeline relative to a release tag or version commit. Resolves the version's anchor commit (e.g. `v3.0` -> commit 854 "Linux 3.0") and navigates forward into newer commits (`direction="future"`), backward into older commits (`direction="past"`), or centered around the anchor (`direction="around"`). Uses primary key indexed ordering on `commit_id` for instantaneous (<0.002s) execution.
 - **Parameters**:
-  - `version_name` (path): Kernel version string.
-  - `limit` (query): Maximum commits to summarize (default 100).
+  - `version_name` (path): Kernel version string, branch, or commit SHA.
+  - `limit` (query): Maximum commits to retrieve (default 50).
+  - `direction` (query): Seek direction: `"past"` (commits leading up to or before anchor, default), `"future"` (commits after anchor), or `"around"` (centered around anchor commit).
+  - `cursor_id` (query): Optional integer commit ID pagination cursor.
 - **Response**:
 ```json
 {
   "version": "v3.0",
-  "total_commits": 100,
+  "direction": "past",
+  "anchor_commit": {
+    "commit_id": 854,
+    "commit_hash": "02f8c6aee8df311261e6da8ba96bd41704aa9623",
+    "subject": "Linux 3.0",
+    "author": { "name": "Linus Torvalds", "email": "torvalds@linux-foundation.org" },
+    "author_date": 1311299908,
+    "author_date_iso": "2011-07-21 18:58:28"
+  },
+  "total_commits": 50,
+  "has_past": true,
+  "has_future": true,
+  "next_past_cursor": 804,
+  "next_future_cursor": 855,
   "timeline": [
     {
-      "commit_hash": "1da177e4c3f41524e886b7f1b8a0c1fc7321cac2",
-      "author": "Linus Torvalds",
-      "date": "2005-04-16",
-      "subject": "Linux-2.6.12-rc2"
+      "commit_id": 854,
+      "commit_hash": "02f8c6aee8df311261e6da8ba96bd41704aa9623",
+      "author": { "name": "Linus Torvalds", "email": "torvalds@linux-foundation.org" },
+      "author_date": 1311299908,
+      "author_date_iso": "2011-07-21 18:58:28",
+      "subject": "Linux 3.0",
+      "files_count": 1,
+      "contributors": []
     }
   ],
-  "top_authors": [
-    { "author": "Linus Torvalds", "count": 45 }
+  "top_contributors": [
+    { "name": "Linus Torvalds", "email": "torvalds@linux-foundation.org", "commits_count": 18 }
+  ]
+}
+```
+
+#### `GET /api/commits/{version_name}/search`
+#### `GET /api/commits/search`
+Fast full-text search across commit subjects, messages, author names, and hashes.
+- **Parameters**:
+  - `version_name` (path): Kernel version string.
+  - `q` (query): Search query string (minimum 2 characters).
+  - `limit` (query): Maximum matches to return (default 50).
+- **Response**:
+```json
+{
+  "version": "v3.0",
+  "query": "ext4",
+  "count": 4,
+  "commits": [
+    {
+      "commit_id": 412,
+      "commit_hash": "748805f9c4262145b23d578ebc61141c2ec71253",
+      "author": { "name": "Theodore Ts'o", "email": "tytso@mit.edu" },
+      "subject": "ext4: fix ext4_da_write_end bug",
+      "date": "2011-07-02"
+    }
+  ]
+}
+```
+
+#### `GET /api/commits/{version_name}/diff/{commit_hash}`
+Structured unified diff of one commit against its **first parent** (root commits diff against the empty tree; merges show what the merge brought into the first-parent line). Read straight from Git (`git diff -M -U<context> <parent> <commit>`), so it works for any commit in the repository, parsed or not.
+- **Parameters**:
+  - `commit_hash` (path): 4–40 hex digits (anything else → `400`; unknown commit → `404`).
+  - `context` (query): Context lines per hunk (default 3, 0–20).
+- **Limits**: Git output is streamed and cut at 8 MiB; at most 6000 rows are returned. Past the row cap the remaining rows are only counted, so `additions`/`deletions` stay exact and affected files carry `truncated: true` (their remaining hunks are omitted). Rows longer than 400 characters are clipped.
+- **Rows**: `[kind, old_line, new_line, text]` with `kind` `"+"`, `"-"` or `" "`; the side a row does not exist on is `null`.
+- **Response**:
+```json
+{
+  "commit_hash": "c3b92c8787367a8bb53d57d9789b558f1295cc96",
+  "parent_hash": "6a0596583fadd15dca293736114abdea306d3d7c",
+  "is_merge": false,
+  "context": 0,
+  "additions": 1,
+  "deletions": 1,
+  "truncated": false,
+  "files": [
+    {
+      "path": "Makefile", "old_path": "Makefile", "status": "M",
+      "additions": 1, "deletions": 1, "binary": false, "truncated": false,
+      "hunks": [
+        {
+          "old_start": 4, "old_count": 1, "new_start": 4, "new_count": 1, "heading": "SUBLEVEL = 0",
+          "lines": [["-", 4, null, "EXTRAVERSION = -rc10"], ["+", null, 4, "EXTRAVERSION ="]]
+        }
+      ]
+    }
+  ]
+}
+```
+`status` is `A`, `M`, `D` or `R` (for renames `old_path` differs from `path`).
+
+#### `GET /api/commits/{version_name}/history/{path:path}`
+#### `GET /api/commits/{version_name}/history?path={path}`
+#### `GET /api/version/{version_name}/file/{path:path}/history`
+Retrieve chronological Git commit history touching a specific file up to a given version/tag/commit, along with immediate `last_changed` metadata.
+- **In-Memory LRU Caching**: Leverages a 1024-entry thread-safe LRU cache (`_cached_git_file_history`) on `(rev, rel_path, limit)`, providing instantaneous (<0.05ms) sub-millisecond responses on repeated queries without spawning subprocesses.
+- **Resilience Guard**: Wrapped with an 8-second execution timeout guard returning `HTTP 504 Gateway Timeout` on prolonged Git operations. Caller services (`FilesystemService`) safely fallback to `None` if unindexed or missing, preventing file viewer crashes.
+- **Parameters**:
+  - `version_name` (path) / `version` (query): Kernel version string, tag, branch, or commit SHA.
+  - `path` (path or query): Relative file path within the repository (e.g. `"init/main.c"`).
+  - `limit` (query): Maximum commits to retrieve (default 50, maximum 200).
+- **Response**:
+```json
+{
+  "version": "v3.0",
+  "path": "init/main.c",
+  "total_commits": 50,
+  "last_changed": {
+    "commit_hash": "2f40b79cf44e311f42d2a02b378170c8a3014a40",
+    "commit_hash_short": "2f40b79cf4",
+    "author_name": "Linus Torvalds",
+    "author_email": "torvalds@linux-foundation.org",
+    "author_date": 1311299908,
+    "author_date_iso": "2011-07-21 18:58:28",
+    "subject": "Linux 3.0"
+  },
+  "commits": [
+    {
+      "commit_hash": "2f40b79cf44e311f42d2a02b378170c8a3014a40",
+      "commit_hash_short": "2f40b79cf4",
+      "author_name": "Linus Torvalds",
+      "author_email": "torvalds@linux-foundation.org",
+      "author_date": 1311299908,
+      "author_date_iso": "2011-07-21 18:58:28",
+      "subject": "Linux 3.0"
+    }
   ]
 }
 ```
 
 #### `POST /api/commits/{version_name}/format_patch`
 #### `POST /api/commits/format_patch`
+#### `POST /api/version/{version_name}/patch/format`
+#### `POST /api/patch/format`
 Generate an authentic RFC-2822 standard email formatted patch file (`git format-patch`) from in-browser virtual editor modifications.
 - **Parameters**:
   - `version_name` (path): Kernel version string.
@@ -1106,10 +1452,12 @@ Generate an authentic RFC-2822 standard email formatted patch file (`git format-
       "original_content": "int a = 1;\nint b = 2;\n",
       "modified_content": "int a = 1;\nint b = 3;\n",
       "commit_subject": "ext4: update b value",
+      "commit_body": "Explain the change (optional; defaults to \"Update <file>.\").",
       "author_name": "Kernel Developer",
       "author_email": "dev@kernel.org"
     }
     ```
+- **Behavior**: The diffstat (`N +-`, insertions/deletions) is computed from the unified diff; `diff` is empty and no `diff --git` header is emitted when the contents are identical.
 - **Response**:
 ```json
 {
@@ -1124,6 +1472,8 @@ Generate an authentic RFC-2822 standard email formatted patch file (`git format-
 
 #### `GET /api/tools/{version_name}/pahole/{struct_name}`
 #### `GET /api/struct/layout`
+#### `GET /api/version/{version_name}/struct/layout/{struct_name}`
+#### `GET /api/version/{version_name}/pahole/{struct_name}`
 Pahole-style memory alignment, member offset calculation, and 64-byte cacheline analysis for C struct and union definitions. Prioritizes struct definitions with AST member containers over forward declarations.
 - **Parameters**:
   - `version_name` (path) / `version` (query): Kernel version string.
@@ -1202,52 +1552,98 @@ Retrieve bidirectional caller and callee execution flow. Consolidates multiple c
 
 #### `GET /api/tools/diff/versions`
 #### `GET /api/version/diff`
-Compare file changes across two releases.
+#### `GET /api/diff/versions/{v1}/{v2}`
+Compare file changes between two revisions (release tags, branches, or commit SHAs).
 - **Parameters**:
-  - `v1` / `version_a` (query): Base kernel version (e.g. `"v3.0"`).
-  - `v2` / `version_b` (query): Target kernel version (e.g. `"v3.1"`).
+  - `v1` / `version_a` (query or path): Base revision (e.g. `"v3.0"` or `"1052cff317e7"`).
+  - `v2` / `version_b` (query or path): Target revision (e.g. `"v3.1"`).
   - `path` (query): Optional directory prefix filter.
+- **Behavior**: See §2.8. `source` is `"git"` when both trees came from Git (Path C) and `"db"` for the database fallback. `fid`, `fid_old`, `fid_new` are indexed `blob_id`s, or `0` when the blob was never parsed. `changes` is sorted by path.
 - **Response**:
 ```json
 {
-  "version_a": "v3.0",
-  "version_b": "v3.1",
+  "v1": "v3.0",
+  "v2": "v3.1",
+  "path": "",
+  "source": "git",
   "summary": {
-    "added_count": 1284,
-    "removed_count": 961,
-    "modified_count": 7033,
-    "unchanged_count": 31053
+    "added_count": 1065,
+    "removed_count": 762,
+    "modified_count": 7032,
+    "renamed_count": 161,
+    "unchanged_count": 28828
   },
   "changes": [
-    { "type": "added", "file": "Documentation/ABI/stable/firewire-cdev", "file_path": "Documentation/ABI/stable/firewire-cdev", "fid": 41156 },
-    { "type": "modified", "file": "Makefile", "file_path": "Makefile", "fid": 17858 }
+    { "type": "added", "file": "Documentation/ABI/stable/firewire-cdev", "file_path": "Documentation/ABI/stable/firewire-cdev", "fid": 0 },
+    { "type": "renamed", "file": "Documentation/DocBook/media/dvb/dvbstb.pdf", "file_path": "Documentation/DocBook/media/dvb/dvbstb.pdf", "old_file": "Documentation/DocBook/dvb/dvbstb.pdf", "fid": 13635 },
+    { "type": "modified", "file": "Makefile", "file_path": "Makefile", "fid_old": 15495, "fid_new": 0, "symbols_added": 0, "symbols_removed": 0 }
   ],
-  "added": [ { "file": "Documentation/ABI/stable/firewire-cdev", "fid": 41156 } ],
-  "modified": [ { "file": "Makefile", "fid": 17858 } ],
+  "added": [ { "file": "Documentation/ABI/stable/firewire-cdev", "fid": 0 } ],
+  "modified": [ { "file": "Makefile", "fid_old": 15495, "fid_new": 0 } ],
+  "renamed": [ { "file": "Documentation/DocBook/media/dvb/dvbstb.pdf", "old_file": "Documentation/DocBook/dvb/dvbstb.pdf", "fid": 13635 } ],
   "deleted": []
+}
+```
+
+#### `GET /api/tools/diff/file`
+#### `GET /api/diff/file`
+Unified Git diff of a single file between two revisions.
+- **Parameters**:
+  - `version_a` (query, required): Base revision.
+  - `version_b` (query, required): Target revision.
+  - `path` (query, required): Repository-relative file path (validated with `is_safe_rel_path`).
+  - `old_path` (query): Base-side path for renamed files.
+- **Behavior**: Both revisions are resolved with `git rev-parse --verify` (option-like names are rejected) and diffed with `git diff -M`. Output above 512 KiB is truncated (`truncated: true`).
+- **Response**:
+```json
+{
+  "v1": "v3.0",
+  "v2": "v3.1",
+  "path": "Makefile",
+  "old_path": "Makefile",
+  "diff": "diff --git a/Makefile b/Makefile\n...",
+  "additions": 4,
+  "deletions": 3,
+  "is_binary": false,
+  "truncated": false
 }
 ```
 
 #### `GET /api/tools/{version_name}/diff/kconfig`
 #### `GET /api/version/diff/kconfig`
-Compare KConfig symbol definitions and default values across two kernel releases.
+#### `GET /api/diff/kconfig/{v1}/{v2}`
+Compare Kconfig source files and option definitions between two revisions (release tags, branches, or commit SHAs).
 - **Parameters**:
   - `version_name` (path): Context kernel version string.
-  - `v1` (query): Base kernel version (e.g. `"v3.0"`).
-  - `v2` (query): Target kernel version (e.g. `"v3.1"`).
+  - `v1` (query): Base revision (e.g. `"v3.0"`).
+  - `v2` (query): Target revision (e.g. `"v3.1"`).
+- **Behavior**: See §2.8 Level 3. `files` is computed from the Git trees and is always complete; `symbols` only covers Kconfig files indexed on every side (`unindexed_files` lists the rest). An option is `changed` when its set of `(file, type, prompt, def_val)` definitions differs.
 - **Response**:
 ```json
 {
   "v1": "v3.0",
   "v2": "v3.1",
   "summary": {
-    "added": 12,
-    "removed": 2,
-    "changed": 5
+    "added": 0,
+    "removed": 39,
+    "changed": 0,
+    "files_added": 12,
+    "files_removed": 11,
+    "files_modified": 174
   },
-  "added": ["NEW_DRIVER_OPTION"],
-  "removed": ["DEPRECATED_FEATURE"],
-  "changed": ["MAXSMP"]
+  "added": [],
+  "removed": ["A2232"],
+  "changed": [],
+  "symbols": [
+    {
+      "name": "A2232",
+      "change": "removed",
+      "before": [ { "file": "drivers/staging/generic_serial/Kconfig", "type": 2, "prompt": "Commodore A2232 serial support (EXPERIMENTAL)", "def_val": "" } ],
+      "after": []
+    }
+  ],
+  "files": [ { "file": "drivers/staging/tty/Kconfig", "change": "removed" } ],
+  "unindexed_files": ["arch/arm/Kconfig"]
 }
 ```
 
@@ -1267,9 +1663,15 @@ webapp/frontend/js/
 ├── components/
 │   ├── tabs.js            # Multi-pane split manager (single, horizontal, vertical)
 │   ├── context_menu.js    # Context-adaptive menus (CodeView, Explorer, NodeMap, Commits)
+│   ├── command_palette.js # Ctrl+K search (files, symbols, Kconfig, commits) & Ctrl+Shift+P commands
+│   ├── modal.js           # Shared modal dialog + download helper
+│   ├── patch_modal.js     # In-browser patch staging (edit → git format-patch)
+│   ├── symbol_history_modal.js # Symbol definition history across versions
+│   ├── ref_picker.js      # Git reference picker popover (release tags + searchable commits)
 │   └── toast.js           # Ephemeral status toasts
 ├── utils/
-│   └── clipboard.js       # Universal fallback clipboard copier (navigator + execCommand)
+│   ├── clipboard.js       # Universal fallback clipboard copier (navigator + execCommand)
+│   └── debounce.js        # Function debouncer
 └── views/
     ├── code_view/
     │   ├── virtual_editor.js     # Virtualized line scroller with minimap
@@ -1287,7 +1689,13 @@ webapp/frontend/js/
     │   ├── kconfig_parser.js     # .config deserializer & serializer
     │   ├── menuconfig_tui.js     # Curses-style terminal TUI
     │   └── directive_evaluator.js# #ifdef conditional code dimming
-    └── maintainers/maintainers_view.js
+    ├── maintainers/maintainers_view.js
+    ├── commits/commits_view.js
+    ├── diff/diff_view.js         # Compare view: files & Kconfig between any two tags/commits
+    ├── treemap/treemap_view.js   # Squarified source treemap (bytes / files)
+    └── docs/
+        ├── rst_renderer.js       # reStructuredText / legacy plain-text → escaped HTML renderer
+        └── doc_page.js           # kernel.org-style documentation page (sidebar, TOC, quick search)
 ```
 
 ### 5.1. `ApiClient` (`webapp/frontend/js/api.js`)
@@ -1300,9 +1708,16 @@ Handles unified HTTP communication, response caching, offline fallback, and netw
 - `getVersions()`: Fetches release list.
 - `getDirectoryTree(version, path, depth)`: Fetches directory tree.
 - `getFileContent(version, path)`: Retrieves raw text and AST tokens.
+- `getTreemap(version, maxDepth, path)`: Retrieves hierarchical squarified codebase treemap.
+- `getCompileCommands(version, arch)`: Retrieves Clang compilation commands database.
 - `resolveInclude(version, header, astId, currentFile)`: Resolves `#include` directive targets.
 - `getIncludeSymbols(version, astId, options)`: Fetches imported symbols for an include, supporting fallback lookup options (`filePath`, `line`, `header`, `tagId`).
 - `getSymbolDetail(version, name)` / `getSymbolXref(version, name)`: Symbol inspection.
+- `lookupSymbols(version, query, limit)`: Fast typeahead symbol name suggestion list.
+- `getTagTimeline(tagId)`: Cross-version evolution history for a persistent AST tag.
+- `getKconfigGraph(version, arch, symbol, depth)`: Full architecture dependency DAG graph.
+- `getKconfigDiff(versionA, versionB)`: Cross-release KConfig symbol definition and default differences.
+- `formatPatch(version, payload)`: Generates RFC-2822 standard git format patch from content edits.
 - `getMaintainersOverview(version, query)` / `getMaintainerSection(version, secId)`: Subsystems.
 - `getDevelopers(version, options)`: Full kernel persona directory with role filtering and activity/alpha sorting.
 - `getPersonProfile(version, idOrEmail)`: Developer profiles.
@@ -1453,7 +1868,60 @@ The frontend implements systematic middle-click capture (`auxclick` with `e.butt
    - `sym.compiled_files` records (`{"file_path": "..."}`) are normalized and displayed with source file icons (`📄 kernel/smp.c`) and associated target object badges (`smp.o`).
    - Clicking any compiled file item (`.compiled-file-link`) immediately opens the target source file in the virtual code editor (`state.openTab({ type: "code", path: filePath })`), supporting both left-click in-place navigation and middle-click multi-tab queuing.
 
+### 5.11. Compare View: Files & Kconfig Between Any Two Revisions (`webapp/frontend/js/views/diff/diff_view.js`)
+1. **Activity Bar Entry**: The **Compare** activity-bar button (`data-action="compare"`) opens a single `diff` tab (re-clicking focuses it). The tab persists `versionA`, `versionB`, and `mode` in its tab data, and its title reflects the pair (`Compare v3.0…v3.1`).
+2. **Revision Selection**: Base and Target buttons open the shared `refPicker` (§5.13), so either side can be a release tag or any commit. When no base is stored, it defaults to the tag preceding the target (or the latest tag when the target is a commit). A ⇄ button swaps the sides.
+3. **Files Mode** (`api.getVersionsDiff`): Status chips (added / modified / deleted / renamed, with unchanged count) act as toggle filters alongside a path filter. Rows render in pages of 500. Clicking a row expands an inline unified diff from `api.getFileDiff`; per-row buttons open the file at the base or target revision, and middle-click opens it in a new tab.
+4. **Kconfig Mode** (`api.getKconfigDiff`): Shows option counts and Kconfig file counts, a warning listing unindexed Kconfig files when option coverage is partial, an **Options** list (expand for per-file `type` / `prompt` / `default` before and after, or **Inspect** to open the KConfig view on that symbol), and a **Kconfig Files** list with the same inline diff and open actions as Files mode.
+
+### 5.12. Git Commits Timeline & Bi-Directional Pagination (`webapp/frontend/js/views/commits/commits_view.js`)
+- **Clean Full-Width Search Header**: Replaced legacy direction toggle buttons (`◀ Future`, `⊙ Anchor`, `Past ▶`, and `🏷️ v3.0`) with a clean, focused typeahead search bar (`#commit-search-input`).
+- **Bi-Directional "Load 50 More Commits" Pagination**:
+  - **Top Pagination Button (`#btn-load-more-top`)**: Automatically renders at the top of the commit timeline when commits exist above the current viewport (`has_future`). Seamlessly fetches 50 commits using `direction="future"` and `next_future_cursor`, prepends them in continuous chronological descending order, and preserves exact vertical scroll position (`scrollTop`) without layout jumping.
+  - **Bottom Pagination Button (`#btn-load-more-bottom`)**: Automatically renders at the bottom of the timeline when older commits exist (`has_past`). Fetches 50 commits using `direction="past"` and `next_past_cursor` and appends them to the bottom of the list.
+  - **Search Pagination**: In commit search mode, the bottom button paginates sequentially through matching commits across pages.
+- **Commit Inspection & File Jumping**: Selecting any commit card displays subject, author, UTC date, Git SHA, Lore LKML thread link, structured trailers/signoffs badges, full commit message, and touched file list with middle-click multi-tab queuing.
+
+- **Inline Commit Diff (`#btn-commit-diff`)**: The bottom of a selected commit's detail has a **± Show changes** button. It loads `GET /api/commits/{v}/diff/{hash}` once per commit (IndexedDB `commits` store, key `cdiff_<hash>_<context>`) and renders a compact per-file diff (status badge, `+/−` counts, old/new line-number gutters). Files with more than 120 rows, or after the 25th file, start collapsed; each file body scrolls at 420px.
+  - **Jump to the edited lines**: Clicking an added or context row opens the file **at the commit** on that line; clicking a removed row opens the file **at the parent commit** on the old line (deleted files always open at the parent). Hunk headers and the per-file **Open ↗** button jump to the first change. Ctrl/Cmd+click or middle-click opens a new tab. Selecting text in the diff does not navigate.
+  - **Change markers in the code view**: The opened tab carries `diffMarks: { kind: "add" | "del", commit, ranges: [[start, end], ...] }`. `VirtualEditor` tints those lines green (added) or red (removed), adds a gutter bar and minimap ticks, and shows a `± <hash>: N lines changed` chip with **↑/↓** (previous/next change block) and **✕** (clear markers). Re-opening an already open file tab replaces its markers.
+
+### 5.13. Header Version Selector & Commit Picker (`webapp/frontend/js/app.js`, `webapp/frontend/js/components/ref_picker.js`)
+- **Selectors**: `.version-selector-container` holds Project, Branch, Tag (`#version-select`, releases), RC (`#rc-select`, candidates of the selected release; see §5.18), and Commit (`#commit-picker-btn`) controls. `state.currentVersion` may be a tag, a branch name, or a commit SHA; startup sanitization only resets values that are none of these.
+- **Commit Picker**: `#commit-picker-btn` opens `refPicker`, a popover with a search box that lists matching release tags (`api.getVersions`) and commits (`api.getCommits`, matching subject, author, or hash prefix). Arrow keys navigate, Enter selects, and any pasted SHA or ref name not in the lists is offered as a raw revision (resolved server-side via `git rev-parse`). Selecting calls `state.setVersion(ref)`.
+- **Display Sync** (`updateVersionSelectorDisplay`, on `version:changed` / `version:synced`): On a tag, the Tag dropdown selects it and the Commit button shows the tag's short SHA. On a commit, the Tag dropdown shows `— none —` and the Commit button shows the short SHA highlighted as detached. The explorer header and tab version badges show the same short form (`shortRef`, 12 hex chars).
+- **Cache Keys**: Directory trees are cached under `tree2_*` and diffs under `diff2_*` / `kdiff2_*` / `fdiff_*` so responses cached before Git-native tree resolution are not reused; the Service Worker cache is `kernel-ide-v3`.
+
 ---
+
+### 5.14. Documentation Viewer (`webapp/frontend/js/views/docs/`, `webapp/frontend/css/docs.css`)
+- **Activation**: `isDocumentationPath(path)` selects `*.rst`, `README*`, and `Documentation/` files that are `.txt` or extension-less (excluding `Makefile`/`Kconfig`/`Kbuild`). Such code tabs open in **Rendered** mode (`tabData.docMode = "rendered"`) unless a specific `cursorLine` was requested; the toolbar's **📖 Rendered / </> Source** button toggles back to the virtual editor, and enabling Git Blame switches to source.
+- **Layout**: Mirrors https://www.kernel.org/doc/html/latest/ (Sphinx/Alabaster): a left sidebar with *The Linux Kernel* title and the tab's version, **Quick search** (in-page highlight; Enter cycles matches), **Contents** (nested local TOC with scroll-spy), **Navigation** (directory `index.rst`/`00-INDEX` and `Documentation/index.rst`), and **This Page → Show Source**, beside a serif body and a footer. Colors come from the IDE dark tokens.
+- **Renderer** (`renderDocument(source, path)`): `.rst` (or `.txt` that uses rST markup) is parsed as reStructuredText: over/underlined sections (levels by first appearance, `¶` permalinks), transitions, bullet/enumerated/field/definition/line lists, `::` and quoted literal blocks, block quotes, grid and simple tables, footnotes, substitutions, hyperlink targets and labels, and directives (`code-block`/`highlight` with C and shell highlighting, admonitions, `toctree`, `contents`, `list-table`/`flat-table`/`csv-table`, `kernel-doc`/`include`/`literalinclude`/`kernel-*` as source-link cards, figures as placeholders, `c:function`-style domain entries, `versionadded`/`deprecated`, `only`, `rubric`, `topic`). Inline markup covers literals, emphasis, roles (`:doc:`, `:ref:`, `:c:func:`/`:c:type:`…, `:manpage:`, `:kbd:`, `:abbr:`, `:menuselection:`…), embedded and named links, bare URLs, `Documentation/…` paths, and kernel automarkup (`func()`, `struct foo`, `CONFIG_FOO`). Legacy plain-text docs keep aligned/indented text as preformatted blocks and promote tab-centered lines to headings. All source text is HTML-escaped.
+- **Figures**: `image`/`figure`/`kernel-figure` render inline from `/api/fs/raw` (on a light backing for legibility); unrenderable formats (e.g. `.dot`) fall back to a source link.
+- **kernel-doc**: `.. kernel-doc::` blocks are replaced by the extracted API documentation (`/api/docs/{v}/kernel-doc` with the directive's options): Sphinx C-domain entries with highlighted signatures, Parameters/Members, Definition (types), Description/Return/Context sections rendered as reStructuredText after translating kernel-doc markup (`@param` → bold, `%CONST` → literal, `&struct foo` → type link), and a *[source]* link to the comment's line.
+- **Cross-document `:ref:`**: unresolved labels are looked up in `/api/docs/{v}/labels` and become links to `<doc>#<label>` showing the target section's title.
+- **Links**: `:doc:`/toctree/`Documentation/` links navigate in place (`tabData.docHistory` backs the sidebar **← Back**; Ctrl/middle-click opens a new tab), toctree labels are filled from each target's first title, `func()`/`struct` links jump to the symbol definition via `api.getSymbolDetail`, `CONFIG_*` opens the KConfig view, directive cards open the referenced source, and in-page anchors scroll without touching `location.hash`.
+
+### 5.15. Command Palette (`webapp/frontend/js/components/command_palette.js`)
+- **Opening**: `Ctrl/Cmd+K` or `Ctrl/Cmd+P` (search), `Ctrl/Cmd+Shift+P` (commands), or the header **🔍 Search…** button.
+- **Modes by prefix**: none — files (`/api/fs/search`), symbols (`api.searchSymbols`) and Kconfig options (`api.searchKconfig`) together; `>` commands; `@` symbols; `#` commits (`api.searchCommits`, selecting one switches the version); `?` Kconfig options; `:` go to line in the active code tab. Results are grouped by section with match highlighting; ↑/↓ navigate, Enter opens, Ctrl+Enter opens in a new tab.
+- **Commands** (`KernelIdeApp.paletteCommands()`): compare, select commit, source treemap, export `compile_commands.json` (download via `api.getCompileCommandsDownloadUrl`), KConfig view, toggle the KConfig engine, commits, maintainers, NodeMap, documentation, explorer toggle, plus *Create patch* / *Symbol history* for the active code tab and *Switch project* entries.
+
+### 5.16. `#ifdef` Dimming (`webapp/frontend/js/views/kconfig/directive_evaluator.js`)
+- **Gate**: Only while the KConfig constraint engine is enabled (`state.kconfigEngineActive`, toggled in the KConfig view and persisted) **and** a resolved configuration is loaded (≥ 50 symbols, i.e. a defconfig), for preprocessed sources (`.c .h .S .lds .dts .dtsi .inc`). A toolbar chip shows the number of compiled-out lines.
+- **Semantics**: Three-valued evaluation of `#if/#ifdef/#ifndef/#elif/#else/#endif` (with `\` continuations). Only `CONFIG_*` macros are known, following `autoconf.h`: `CONFIG_FOO` is defined for `y` and string/int values, `CONFIG_FOO_MODULE` for `m`; `IS_ENABLED/IS_BUILTIN/IS_MODULE/IS_REACHABLE`, `defined()`, `!`, `&&`, `||`, parentheses and numeric comparisons are supported. Any other macro (header guards, `__KERNEL__`, arch macros) is unknown and a branch with an unknown condition is never dimmed, nor are its alternatives. Directive lines are dimmed only when their enclosing region is compiled out.
+- **Live updates**: `VirtualEditor` recomputes on `kconfig:engine:changed`, `kconfig:assignments:updated` and `kconfig:assignment:changed`.
+
+### 5.17. Treemap, Symbol History & Patch Staging
+- **Treemap** (`views/treemap/treemap_view.js`, tab type `treemap`): squarified layout of `/api/version/{v}/treemap` two levels deep, Bytes/Files metric toggle, breadcrumb zoom, click a directory to zoom in or a file to open (middle-click: new tab). Opened from the explorer's folder context menu (*Show Treemap of Folder*) or the palette.
+- **Symbol history** (`components/symbol_history_modal.js`): editor context menu *Symbol History Across Versions* (or *at This Line*) shows `/api/symbols/{v}/history` as a timeline with per-version status, line ranges, inline diffs of modified definitions, and *Open* at that version.
+- **Patch staging** (`components/patch_modal.js`): code toolbar **✎ Patch**, editor/explorer context menu, or palette. Edit the file in a textarea (Tab inserts a tab), set subject, description and identity (remembered in `localStorage`), then *Generate patch* → `api.formatPatch`; copy or download `0001-<subject>.patch`.
+- **KConfig additions**: **Import .config** (server-side `import`), **Validate** (`validate`, with *Apply fixes*), **Compare…** with a defconfig (`diff-config`), and a per-symbol **Dependency Graph** (`api.getKconfigGraph`, depends-on left / selects right, colored by current value, nodes clickable).
+
+### 5.18. Projects (Multiple Repositories)
+- The header **Project** selector lists `/api/projects` (parsed repositories plus *git only* ones). `api.setRepository(name)` adds `X-KI-Repo` to every request, prefixes IndexedDB cache keys with the repository, and `withRepo()` appends `?repo=` to URLs used directly (images, downloads). Switching asks for confirmation, closes the workspace tabs (`state.setRepository`), and selects the repository's latest parsed version (else its default branch).
+- The **Tag** dropdown lists final releases grouped into *Parsed* and *Git only (not parsed)*; a release that so far only has candidates appears as `vX.Y (rc only)` and selects its latest candidate. The **RC** dropdown (shown when the selected release has candidates) lists `final` plus that release's `-rc#` tags, newest first, with `(git only)` marking unparsed ones; `KernelIdeApp.buildVersionCatalog()` groups tags by `releaseOf()` (`v3.1-rc4` → `v3.1`) from `/api/versions?include_rc=true`. Catalog requests (`projects`, `branches`, `versions`) are network-first so newly parsed versions appear without clearing the cache.
 
 ## 6. Programmatic Python Service Delegates (`webapp/main.py`)
 
@@ -1535,6 +2003,8 @@ Environment variables synchronized via `core.config.sync_environ()` include:
 - `WEBAPP_HOST` (default `"0.0.0.0"`)
 - `WEBAPP_PORT` (default `8000`)
 - `WEBAPP_RELOAD` (default `true`)
+
+The Git repository served by the webapp (`webapp/backend/config.py:LINUX_REPO_DIR`) is the default entry of the `"repositories"` config list (`core.config.get_default_repo_path()`), auto-detected under `workspace.repos_dir` (default `repos/`).
 
 ### 7.2. Starting the Server
 Start the application from the repository root:

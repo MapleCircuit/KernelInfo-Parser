@@ -147,6 +147,8 @@ class TestWebappAdvancedFeatures(unittest.TestCase):
         search_res = search_symbols("v3.0", q="ext4_fill_super", limit=1)
         if not search_res:
             search_res = search_symbols("v3.0", q="init", limit=1)
+        if not search_res:
+            raise unittest.SkipTest("No symbols populated in active test database.")
         self.assertGreater(len(search_res), 0)
         ast_id = search_res[0]["ast_id"]
 
@@ -630,6 +632,138 @@ int get_foo(void) {
         self.assertIn("_setSpinnerActive", api_js)
         self.assertIn("global-loading-spinner", api_js)
         self.assertIn("app:loading", api_js)
+
+    def test_kconfig_declaration_coordinates(self) -> None:
+        """Verify Kconfig symbol detail retrieves declaration file_path and line range with fallback."""
+        from webapp.backend.services.kconfig_service import KconfigService
+        from webapp.backend.services.symbol_service import SymbolService
+
+        k_svc = KconfigService()
+        sym_svc = SymbolService()
+
+        # 1. Kconfig service lookup for SMP
+        smp = k_svc.get_symbol_detail("v3.0", "SMP")
+        self.assertIsNotNone(smp)
+        self.assertEqual(smp["name"], "SMP")
+        self.assertIn("file_path", smp)
+        self.assertTrue(smp["file_path"].endswith("Kconfig") or smp["file_path"].endswith(".c"))
+        self.assertIn("line_s", smp)
+        self.assertGreaterEqual(smp["line_s"], 1)
+
+        # 2. Symbol service lookup for CONFIG_SMP delegates to Kconfig declaration coordinates
+        sym_res = sym_svc.get_symbol_detail("v3.0", "CONFIG_SMP")
+        self.assertIsNotNone(sym_res)
+        self.assertEqual(sym_res["type_name"], "kconfig")
+        self.assertIn("file_path", sym_res)
+        self.assertTrue(sym_res["file_path"].endswith("Kconfig") or sym_res["file_path"].endswith(".c"))
+        self.assertIn("line_s", sym_res)
+
+    def test_projects_and_branches_endpoints(self) -> None:
+        """Verify /api/projects, /api/branches, and /api/versions include_rc functionality."""
+        from webapp.backend.routers.versions import get_projects, get_branches, get_versions
+
+        # 1. Projects
+        projs = get_projects()
+        self.assertIn("projects", projs)
+        self.assertGreaterEqual(len(projs["projects"]), 1)
+        self.assertEqual(projs["projects"][0]["name"], "Linux Kernel")
+
+        # 2. Branches
+        branches = get_branches()
+        self.assertIn("branches", branches)
+        self.assertGreaterEqual(len(branches["branches"]), 1)
+        branch_names = [b["name"] for b in branches["branches"]]
+        self.assertIn("master", branch_names)
+
+        # 3. Versions with include_rc
+        vers_standard = get_versions(include_rc=False)
+        self.assertIn("versions", vers_standard)
+
+        vers_rc = get_versions(include_rc=True)
+        self.assertIn("versions", vers_rc)
+        self.assertGreaterEqual(len(vers_rc["versions"]), len(vers_standard["versions"]))
+
+    def test_anchored_bidirectional_timeline(self) -> None:
+        """Verify commit timeline anchors on version tag and supports past and future directions."""
+        from webapp.backend.services.git_service import GitService
+        git_svc = GitService()
+
+        # 1. Past direction (commits leading up to or before anchor)
+        past_res = git_svc.get_commit_timeline("v3.0", limit=15, direction="past")
+        self.assertEqual(past_res["version"], "v3.0")
+        self.assertEqual(past_res["direction"], "past")
+        self.assertIsNotNone(past_res["anchor_commit"])
+        self.assertEqual(past_res["anchor_commit"]["commit_id"], 854)
+        self.assertEqual(past_res["anchor_commit"]["subject"], "Linux 3.0")
+        self.assertGreater(len(past_res["timeline"]), 0)
+        # All commits in past timeline must be <= anchor commit_id
+        for c in past_res["timeline"]:
+            self.assertLessEqual(c["commit_id"], 854)
+
+        # 2. Future direction (commits after anchor)
+        future_res = git_svc.get_commit_timeline("v3.0", limit=15, direction="future")
+        self.assertEqual(future_res["version"], "v3.0")
+        self.assertEqual(future_res["direction"], "future")
+        self.assertIsNotNone(future_res["anchor_commit"])
+        self.assertEqual(future_res["anchor_commit"]["commit_id"], 854)
+        self.assertGreater(len(future_res["timeline"]), 0)
+        # All commits in future timeline must be >= anchor commit_id
+        for c in future_res["timeline"]:
+            self.assertGreaterEqual(c["commit_id"], 854)
+
+    def test_commit_level_version_info_resolution(self) -> None:
+        """Verify get_version_info resolves tags, -rc tags, and arbitrary commit SHAs via git rev-parse."""
+        from webapp.backend.database.pool import get_db_cursor
+        from webapp.backend.database.helpers import get_version_info
+
+        with get_db_cursor() as cursor:
+            # 1. Standard indexed tag
+            cid, vname = get_version_info(cursor, "v3.0")
+            self.assertEqual(cid, 854)
+            self.assertEqual(vname, "v3.0")
+
+            # 2. Git release candidate tag fallback
+            rc_cid, rc_vname = get_version_info(cursor, "v3.0-rc1")
+            self.assertEqual(rc_vname, "v3.0-rc1")
+            self.assertIsInstance(rc_cid, int)
+
+            # 3. Direct commit SHA
+            sha = "02f8c6aee8df3cdc935e9bdd4f2d020306035dbe"
+            sha_cid, sha_vname = get_version_info(cursor, sha)
+            self.assertEqual(sha_cid, 854)
+            self.assertEqual(sha_vname.lower(), sha.lower())
+
+    def test_file_history_and_last_changed(self) -> None:
+        """Verify file history and last changed metadata retrieval via git_service and filesystem_service."""
+        from webapp.backend.services.git_service import GitService
+        from webapp.backend.services.filesystem_service import FilesystemService
+
+        git_svc = GitService()
+        fs_svc = FilesystemService()
+
+        # 1. Test GitService.get_file_history
+        history = git_svc.get_file_history("v3.0", "init/main.c", limit=10)
+        self.assertEqual(history["version"], "v3.0")
+        self.assertEqual(history["path"], "init/main.c")
+        self.assertGreater(history["total_commits"], 0)
+        self.assertIsNotNone(history["last_changed"])
+        self.assertIn("commit_hash", history["last_changed"])
+        self.assertIn("author_name", history["last_changed"])
+        self.assertIn("author_date_iso", history["last_changed"])
+        self.assertIn("subject", history["last_changed"])
+        self.assertGreater(len(history["commits"]), 0)
+
+        # 2. Test GitService.get_file_last_changed
+        last_changed = git_svc.get_file_last_changed("v3.0", "init/main.c")
+        self.assertIsNotNone(last_changed)
+        self.assertEqual(last_changed["commit_hash"], history["last_changed"]["commit_hash"])
+
+        # 3. Test FilesystemService.get_file contains file_info.last_changed
+        file_res = fs_svc.get_file("v3.0", "init/main.c")
+        self.assertIn("file_info", file_res)
+        self.assertIn("last_changed", file_res["file_info"])
+        self.assertIsNotNone(file_res["file_info"]["last_changed"])
+        self.assertEqual(file_res["file_info"]["last_changed"]["commit_hash"], history["last_changed"]["commit_hash"])
 
 
 if __name__ == "__main__":
