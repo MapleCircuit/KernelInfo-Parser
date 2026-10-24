@@ -388,6 +388,9 @@ _CLANG_KERNEL_MACRO_DEFINES: tuple[str, ...] = (
     "-D__malloc=",
     "-Dasmlinkage=",
     "-DFASTCALL=",
+    # linux/linkage.h only defines fastcall under #ifndef FASTCALL: without it every
+    # "<type> fastcall f(...)" definition (2.6.x) is a syntax error and its body leaks to file scope
+    "-Dfastcall=",
     "-D__cold=",
     "-D__hot=",
     "-D__visible=",

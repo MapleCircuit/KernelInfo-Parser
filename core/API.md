@@ -161,6 +161,7 @@ Central runtime container, schema registry, and worker IPC coordinator.
   - `_changed_paths_set: set[str]`: Set of all relative file paths modified in the active release version.
   - `file_deps: dict[str, set[str]]`: Lightweight dependency graph mapping each changed file path to its set of unresolved foreign file dependencies (`foreign_deps`).
   - `file_symbols: dict[str, dict[tuple[str, int], int]]`: Per-file exported symbols map `rel_file -> {(sym_name, type_id): ast_id}` populated during Phase 1 staging.
+  - `completed_paths: set[str]`: Paths whose ChangeSet executed in the current update, recorded by `extract_tags_and_evacuate_cs()` (even when the file publishes no symbol). `resolve_ref()` treats these as completed after Stage 2 clears `file_symbols` (symbols moved to `_shared_symbols`); reset by `init_cs_dict()`.
   - `file_names: dict[str, dict[str, int]]`: Per-file exported symbol names map `rel_file -> {sym_name: ast_id}` for name-only fallback resolution.
   - `file_pre_extracted_tags: dict[str, list[tuple[int, int, int, int]]]`: Lightweight bridge tags map `rel_file -> [(tag_id, blob_id, line_s, line_e)]` populated upon ChangeSet evacuation to allow zero-decompression tag-to-commit mapping during post-processing.
   - `file_blob_ids: dict[str, int]`: Mapping `rel_file -> blob_id` populated during ChangeSet evacuation to enable $O(1)$ checkpoint staging without decompressing pickled ChangeSets.
@@ -305,7 +306,7 @@ Represents a parsed file diff and acts as the relational staging buffer.
      - **Step 0 (Per-File Symbols)**: Checks `gp.file_symbols[rel_file]` and `gp.file_names[rel_file]` for immediate $O(1)$ resolved symbol `ast_id`.
      - **Step 0b (Phase 2 Snapshot)**: Checks `_phase2_symbols` and `_phase2_names` global symbol snapshots.
      - **Step 1 (Active Batch / Evacuated & LRU Stores)**: Inspects `batch_cs_dict`, `ChangeSet_Dict._evacuated_store[rel_file]`, or `ChangeSet_Dict._lru_cache[rel_file]`. For evacuated ChangeSets, reads from `foreign_cs.resolved_symbols` in $O(1)$ memory without deserialization or DB queries.
-     - **Step 1b (In-Flight Dependency Blocking Guard)**: If `rel_file` is an in-flight incomplete ChangeSet (`is_in_flight_changed` in `gp._changed_paths_set` or active in `ChangeSet_Dict` without `cs_processed`) and `force_stubs` is `False`, `resolve_ref()` sets `self.blocked_on = rel_file` and returns `None` immediately, preventing redundant linear cache scans.
+     - **Step 1b (In-Flight Dependency Blocking Guard)**: If `rel_file` is an in-flight incomplete ChangeSet (`is_in_flight_changed` in `gp._changed_paths_set` or present in `ChangeSet_Dict`, and in neither `gp.completed_paths` nor `gp.file_symbols`) and `force_stubs` is `False`, `resolve_ref()` sets `self.blocked_on = rel_file` and returns `None` immediately, preventing redundant linear cache scans.
      - **Step 2 (Database Fallback & Negative Caching)**: Checks `gp._ast_negative_cache` for verified non-existent symbols before querying TableEngine / MariaDB via `gp.get_file_symbols_from_db(rel_file)` or `G.TE.get(m_ast.table_id, ...)`. Misses are recorded in `gp._ast_negative_cache` and `unchanged_symbol_cache` to bypass repeated redundant SELECT queries across waves.
      - **Step 3 (Circular Dependency Breaking)**: If `force_stubs=True` is enabled, stages a canonical `notbind` stub symbol via `m_ast.view` (discarding negative cache entries) and logs a circular dependency warning.
   3. `parsed_route[0] == REF_POS`: Fetches directly from `self.cs[parsed_route[1]]` column `query[1]`.
@@ -436,6 +437,9 @@ Main Process (In-Process Wave Resolution)       TableEngine & Database
   │  └─ [IN-PROCESS WAVE RESOLUTION]              │
   │     ├─ Iterates over wave directly in-process (zero IPC, zero pickling)
   │     ├─ cs.execute() resolves against in-memory symbols & TableEngine
+  │     ├─ Still blocked although every dependency executed (e.g. a symbol the changed
+  │     │  header never defines, such as a Clang implicit declaration): re-executes with
+  │     │  force_stubs=True; a ChangeSet is never evacuated with unresolved operations
   │     ├─ extract_tags_and_evacuate_cs(cs) evacuates AST buffers
   │     ├─ Preserves negative query cache across micro-commits
   │     └─ G.TE.commit_all() every chunk_commit_interval (e.g. 1000 files)

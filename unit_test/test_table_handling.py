@@ -793,6 +793,43 @@ class Test_ChangeSetReferenceResolution(BaseTableHandlingTestCase):
             self.assertEqual(tid, t_ast.table_id)
             self.assertEqual(data[1], "btrfs_trans_handle")
 
+    @test_feature("resolve_ref_foreign_completed_path", depends_on=["resolve_ref_foreign_in_flight_blocking"])
+    def test_07b_resolve_ref_foreign_completed_path(self) -> None:
+        """Verify a changed foreign file that already executed is not treated as in-flight.
+
+        Stage 2 clears gp.file_symbols once header symbols move to shared memory, so completion is
+        tracked in gp.completed_paths; a symbol the header does not define (e.g. a Clang implicit
+        declaration placed at its first use inside the header) must resolve instead of blocking forever.
+        """
+        cs = ChangeSet("M\tkernel/fork.c")
+        t_ast = self.test_tables.t_ast
+
+        class MockChangeSetDict(dict):
+            _lru_cache = {}
+
+        class MockStage2GP:
+            def __init__(self) -> None:
+                self.file_symbols = {}
+                self.file_names = {}
+                self._changed_paths_set = {"include/linux/sched.h"}
+                self.ChangeSet_Dict = MockChangeSetDict()
+                self.completed_paths = {"include/linux/sched.h"}
+
+        cs.gp = MockStage2GP()
+        self.mock_te.next_id[t_ast.table_id] = 700
+
+        with test_step("Completed changed header: unknown symbol resolves to a stub instead of blocking"):
+            route = (REF_FILE, "include/linux/sched.h", "atomic_inc", 21)
+            val = cs.resolve_ref(t_ast.ast_id, route, force_stubs=False)
+            self.assertEqual(val, 700)
+            self.assertIsNone(cs.blocked_on)
+
+        with test_step("Without completion the same reference still waits for the header"):
+            cs.gp.completed_paths = set()
+            cs.blocked_on = None
+            self.assertIsNone(cs.resolve_ref(t_ast.ast_id, route, force_stubs=False))
+            self.assertEqual(cs.blocked_on, "include/linux/sched.h")
+
     @test_feature("resolve_ref_from_tuple", depends_on=["resolve_ref_context_route"])
     def test_08_resolve_ref_from_tuple(self) -> None:
         """Verify _resolve_ref_from_tuple resolves embedded RefType references inside tuples."""

@@ -1949,6 +1949,51 @@ class TestDBAndTEIntegration(unittest.TestCase):
         finally:
             G.TE = old_te
 
+    def test_phase2_wave_never_drops_blocked_operations(self) -> None:
+        """Verify a wave file still blocked after its dependencies executed is stub-resolved, not evacuated.
+
+        Regression: a reference to a changed file that never publishes the symbol (e.g. a Clang implicit
+        declaration attributed to a changed header) kept execute() returning False; the wave evacuated the
+        ChangeSet anyway and silently dropped every operation depending on it (tags, definitions, refs).
+        """
+        from core.TableHandling import ChangeSet
+        from core.DBLayout import m_file_name, m_bridge_file, m_ast, m_ast_hash, m_ast_container, m_bridge_tag, m_tag
+        from core.globalstuff import ASTT, REF_FILE
+        from core.GreatProcessor import GreatProcessor
+        from main import execute_phase2_parallel_waves
+
+        old_te = G.TE
+        G.TE = self.te
+        try:
+            for tbl in (m_file_name, m_bridge_file, m_ast, m_ast_hash, m_ast_container, m_bridge_tag, m_tag):
+                if tbl.table_id not in self.te.tables:
+                    self.te.tables[tbl.table_id] = tbl
+                    self.te.queued_set[tbl.table_id] = {}
+                    self.te.queued_update[tbl.table_id] = []
+                    self.te.next_id[tbl.table_id] = 1
+
+            mock_gp = GreatProcessor()
+            mock_gp.init_cs_dict()
+            # The changed header is part of this update but never yields a ChangeSet publishing the symbol
+            mock_gp._changed_paths_set = {"include/linux/changed.h", "kernel/user.c"}
+
+            cs_c = ChangeSet("M\tkernel/user.c")
+            cs_c.gp = mock_gp
+            ref = cs_c.ref(m_ast.ast_id, REF_FILE, "include/linux/changed.h", "implicit_fn", int(ASTT.C_functionproto))
+            cs_c.store(m_ast.view(((m_ast.ast_id, m_ast_container.ast_id, 1),), None, "user_fn", int(ASTT.C_functionproto), None, 0, int(ASTT.C_CallExpr), ref))
+            mock_gp.ChangeSet_Dict["kernel/user.c"] = cs_c
+
+            self.assertFalse(cs_c.execute(), "the reference must block while the header is in flight")
+            execute_phase2_parallel_waves(mock_gp)
+
+            self.assertTrue(cs_c.cs_processed)
+            row = self.te.get(m_ast.table_id, (None, "user_fn", int(ASTT.C_functionproto)))
+            self.assertIsNotNone(row, "the blocked definition was dropped instead of resolved with a stub")
+            stub = self.te.get(m_ast.table_id, (None, "implicit_fn", int(ASTT.C_functionprotnotbind)))
+            self.assertIsNotNone(stub)
+        finally:
+            G.TE = old_te
+
     def test_db_backed_unchanged_file_symbol_resolution(self) -> None:
         """Verify resolve_ref fetches symbols from DB for unchanged files without calling safe_get_cs."""
         from core.TableHandling import ChangeSet

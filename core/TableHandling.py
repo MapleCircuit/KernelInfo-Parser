@@ -489,7 +489,10 @@ class ChangeSet:
 
                     # Check whether target file is an active incomplete ChangeSet in this update (Rule 24)
                     changed_paths = getattr(self.gp, "_changed_paths_set", None) if self.gp else None
-                    is_completed = bool(self.gp and hasattr(self.gp, "file_symbols") and rel_file in self.gp.file_symbols)
+                    is_completed = bool(self.gp and (
+                        rel_file in getattr(self.gp, "completed_paths", ())
+                        or (hasattr(self.gp, "file_symbols") and rel_file in self.gp.file_symbols)
+                    ))
                     is_in_flight_changed = bool(changed_paths and rel_file in changed_paths)
                     cs_dict = getattr(self.gp, "ChangeSet_Dict", None) if self.gp else None
                     is_in_dict = bool(cs_dict and rel_file in cs_dict)

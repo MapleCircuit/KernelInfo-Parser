@@ -245,6 +245,9 @@ def extract_tags_and_evacuate_cs(cs_obj: ChangeSet) -> None:
     if not c_path:
         return
     fid = get_fid_for_path(c_path)
+    gp_ref = getattr(cs_obj, "gp", None) or getattr(G, "GP", None) or gp
+    if hasattr(gp_ref, "completed_paths"):
+        gp_ref.completed_paths.add(c_path)
 
     # 1. Preserve resolved symbol map before internal buffers are cleared
     if hasattr(cs_obj, "symbol_dict") and cs_obj.symbol_dict:
@@ -266,7 +269,6 @@ def extract_tags_and_evacuate_cs(cs_obj: ChangeSet) -> None:
         cs_obj.resolved_symbols = resolved_symbols
 
         # Register resolved symbols into GreatProcessor per-file symbol tables for O(1) lookups
-        gp_ref = getattr(cs_obj, "gp", None) or getattr(G, "GP", None)
         if gp_ref is not None:
             if hasattr(gp_ref, "file_symbols") and isinstance(gp_ref.file_symbols, dict):
                 gp_ref.file_symbols[c_path] = resolved_symbols
@@ -1234,7 +1236,15 @@ def execute_phase2_parallel_waves(
             for path in wave:
                 cs = gp.ChangeSet_Dict[path]
                 cs.gp = gp
-                cs.execute()
+                if not cs.execute():
+                    # Every dependency of a wave file has executed: references still blocked can only
+                    # be resolved by stubs. Evacuating now would silently drop those operations.
+                    blocked_on = cs.blocked_on
+                    if not cs.execute(force_stubs=True):
+                        logger.error(COLOR.red(
+                            f"[Phase 2] '{path}': {len(cs.unresolved_indices or ())} operations remain unresolved "
+                            f"after stub resolution (blocked on '{cs.blocked_on or blocked_on}'); they are dropped."
+                        ))
                 extract_tags_and_evacuate_cs(cs)
                 gp.ChangeSet_Dict[path] = cs
                 remaining.remove(path)
@@ -3340,7 +3350,10 @@ def processing_symlinks(override_symlinks: list[str] | None = None) -> None:
             fb_path = fb.split("\t")[-1]
             if fb_path in gp.ChangeSet_Dict:
                 cs_obj = gp.ChangeSet_Dict[fb_path]
-                cs_obj.execute()
+                cs_obj.gp = gp
+                # Runs after every file of the version executed: unresolved references fall back to stubs
+                if not cs_obj.execute():
+                    cs_obj.execute(force_stubs=True)
                 extract_tags_and_evacuate_cs(cs_obj)
 
     if override_symlinks is None and hasattr(gp, "Symlink_List") and gp.Symlink_List:

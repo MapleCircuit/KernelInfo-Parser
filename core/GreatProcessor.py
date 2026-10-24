@@ -360,6 +360,9 @@ class GreatProcessor:
         self.file_deps: dict[str, set[str]] = {}
         self.file_symbols: dict[str, dict[tuple[str, int], int]] = {}
         self.file_names: dict[str, dict[str, int]] = {}
+        # Paths whose ChangeSet executed in this update: their symbols are published (file_symbols may be
+        # cleared once they move to the shared-memory table, so it cannot tell completion on its own)
+        self.completed_paths: set[str] = set()
         self.parsed_blob_ids: set[int] = set()
         self.file_pre_extracted_tags: dict[str, list[tuple[int, int, int, int]]] = {}
         self.file_blob_ids: dict[str, int] = {}
@@ -375,6 +378,7 @@ class GreatProcessor:
         self.file_deps = {}
         self.file_symbols = {}
         self.file_names = {}
+        self.completed_paths = set()
         self.file_pre_extracted_tags = {}
         self.file_blob_ids = {}
         self._ast_negative_cache = set()

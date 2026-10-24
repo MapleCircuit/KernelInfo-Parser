@@ -389,6 +389,7 @@ _KNOWN_KERNEL_ATTRIBUTES = frozenset({
     "__hot",
     "asmlinkage",
     "FASTCALL",
+    "fastcall",
     "ACPI_SYSTEM_XFACE",
     "__devinit",
     "__devinitdata",

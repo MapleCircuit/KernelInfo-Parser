@@ -39,6 +39,7 @@ from core.DBLayout import (
     m_ast_attribute,
     m_map_ast,
     m_bridge_map,
+    m_symbol_def,
 )
 from table_engine import TEDirectDB, TECachedDB, get_table_engine
 from db_engine import MockDB, MariaDB
@@ -799,6 +800,56 @@ static inline int test_compat_fn(int x, long y) {
             self.assertGreater(len(cs.cs), 0)
             self.assertTrue(cs.execute())
             self.assertEqual(len(cs.cs), len(cs.cs_result))
+        finally:
+            if temp_dir and os.path.exists(temp_dir):
+                shutil.rmtree(temp_dir, ignore_errors=True)
+
+    def test_fastcall_function_definitions(self) -> None:
+        """Verify 2.6.x `<type> fastcall f(...)` functions parse as definitions without leaking their bodies.
+
+        linux/linkage.h only defines `fastcall` under `#ifndef FASTCALL`; with `-DFASTCALL=` alone the
+        definition was a syntax error and body statements such as `schedule();` (fs/aio.c:324 in
+        v2.6.15) were staged as file-scope C_Compound symbol definitions.
+        """
+        temp_dir = None
+        try:
+            G.DB = MockDB
+            G.TE = get_table_engine("cached")()
+            gp = GreatProcessor()
+            init_db_layout(gp)
+            G.TE.start(gp.Table_Array, G.DB)
+
+            mf = MasterFile()
+            temp_dir = mf.create_temp_dir()
+            mf.version_dict["v2.6.15"] = temp_dir
+            G.MF = mf
+            gp.Version_Name = "v2.6.15"
+            gp.VID = 1
+
+            file_path = "fs/aio.c"
+            full_path = os.path.join(temp_dir, file_path)
+            os.makedirs(os.path.dirname(full_path), exist_ok=True)
+            with open(full_path, "wb") as f:
+                f.write(subprocess.check_output(["git", "-C", LINUX_REPO, "show", f"v2.6.15:{file_path}"], stderr=subprocess.PIPE))
+
+            cs = ChangeSet(f"A\t{file_path}")
+            cs.current_vid = 1
+            cs.gp = gp
+            cs.mf = mf
+            G.CURRENT_PARSING_FILE = file_path
+
+            default_processing(cs, gp)
+            cs.parse()
+            self.assertTrue(cs.execute())
+            defs = [op[2] for op in cs.cs if op and op[0] == m_symbol_def.table_id]
+            by_name = {}
+            for d in defs:
+                by_name.setdefault(d[4], []).append((int(d[5]), d[7], d[8]))
+            self.assertIn((int(ASTT.C_functionprotodecl), 318, 328), by_name.get("wait_on_sync_kiocb", []))
+            self.assertIn("aio_complete", by_name)
+            # Calls inside fastcall function bodies are not definitions
+            self.assertNotIn("schedule", by_name)
+            self.assertNotIn("spin_lock_irq", by_name)
         finally:
             if temp_dir and os.path.exists(temp_dir):
                 shutil.rmtree(temp_dir, ignore_errors=True)
