@@ -23,16 +23,29 @@ class KbuildBinding:
     ref_type: int = 3  # FileRefType.Kbuild (3) or FileRefType.Makefile (4)
     details: str = ""  # Rule or directive representation
     is_composite: bool = False
+    # CONFIG_* symbols of enclosing ifeq/ifneq/ifdef/ifndef blocks (the rule only applies under them)
+    cond_symbols: list[str] = field(default_factory=list)
+    is_directory: bool = False  # obj-$(CONFIG_X) += dir/ : the whole sub-directory is built
 
 
 class KbuildParser:
     """Deterministic parser for Linux Makefile and Kbuild syntax."""
 
-    # Matches obj-$(CONFIG_XYZ) += ... or obj-y += ... or obj-m += ...
+    # Matches obj-$(CONFIG_XYZ) += ... or obj-y += ... or obj-m += ... (also obj-$(subst m,y,$(CONFIG_XYZ)))
     OBJ_ASSIGN_RE = re.compile(
-        r"^(?:obj-\$\(CONFIG_([A-Za-z0-9_]+)\)|obj-([ym]))\s*([:+?]?=)\s*(.*)$",
+        r"^(?:obj-\$\(CONFIG_([A-Za-z0-9_]+)\)|obj-\$\(subst m,y,\$\(CONFIG_([A-Za-z0-9_]+)\)\)|obj-([ym]))"
+        r"\s*([:+?]?=)\s*(.*)$",
         re.MULTILINE,
     )
+
+    # lib-* (relative to the Makefile) and the top-level goal lists of arch Makefiles (relative to srctree)
+    GOAL_ASSIGN_RE = re.compile(
+        r"^(lib|core|drivers|libs|net|init|head)-(?:\$\(CONFIG_([A-Za-z0-9_]+)\)|([ym]))\s*([:+?]?=)\s*(.*)$",
+    )
+
+    # ifeq ($(CONFIG_X),y) / ifneq ($(CONFIG_X),) / ifdef CONFIG_X / ifndef CONFIG_X
+    COND_RE = re.compile(r"^(ifeq|ifneq|ifdef|ifndef)\b(.*)$")
+    CONFIG_REF_RE = re.compile(r"CONFIG_([A-Za-z0-9_]+)")
 
     # Matches composite target-y := ... or target-objs := ...
     COMPOSITE_RE = re.compile(
@@ -99,16 +112,60 @@ class KbuildParser:
         # 3. Extract obj-* rules and Makefile include directives
         bindings: list[KbuildBinding] = []
         seen_bindings: set[tuple[str, int, int, str, str]] = set()
+        cond_stack: list[list[str]] = []
 
         def add_binding(b: KbuildBinding) -> None:
             b_key = (b.source_file_rel, b.source_line, b.ref_type, b.symbol_name, b.target_obj)
             if b_key not in seen_bindings:
                 seen_bindings.add(b_key)
+                b.cond_symbols = [sym for frame in cond_stack for sym in frame]
                 bindings.append(b)
 
         for start_line, line_str in joined_lines:
             line_str = line_str.strip()
             if not line_str or line_str.startswith("#"):
+                continue
+
+            # Conditional blocks: rules inside only apply under the referenced CONFIG_* symbols
+            m_cond = self.COND_RE.match(line_str)
+            if m_cond:
+                cond_stack.append(self.CONFIG_REF_RE.findall(m_cond.group(2)))
+                continue
+            if line_str.startswith("else"):
+                rest = line_str[4:].strip()
+                m_else = self.COND_RE.match(rest)
+                if m_else and cond_stack:
+                    cond_stack[-1] = cond_stack[-1] + self.CONFIG_REF_RE.findall(m_else.group(2))
+                continue
+            if line_str.startswith("endif"):
+                if cond_stack:
+                    cond_stack.pop()
+                continue
+
+            m_goal = self.GOAL_ASSIGN_RE.match(line_str)
+            if m_goal:
+                var, goal_sym, goal_mode = m_goal.group(1), m_goal.group(2), m_goal.group(3)
+                sym_name = goal_sym or goal_mode
+                mode = 3 if goal_sym else (1 if goal_mode == "y" else 2)
+                for item in m_goal.group(5).split():
+                    if "$" in item:
+                        continue
+                    # core-y/drivers-y/... in arch Makefiles name paths from the source root
+                    base = clean_dir if var == "lib" else ""
+                    rel = os.path.normpath(f"{base}/{item}" if base else item).replace("\\", "/")
+                    rule_desc = f"{var}-$(CONFIG_{sym_name}) += {item}" if mode == 3 else f"{var}-{sym_name} += {item}"
+                    if item.endswith("/"):
+                        add_binding(KbuildBinding(
+                            symbol_name=sym_name, compile_mode=mode, target_obj="Makefile",
+                            source_file_rel=f"{rel}/Makefile", source_line=start_line, ref_type=4,
+                            details=rule_desc, is_directory=True,
+                        ))
+                    elif item.endswith(".o"):
+                        add_binding(KbuildBinding(
+                            symbol_name=sym_name, compile_mode=mode, target_obj=os.path.basename(item),
+                            source_file_rel=rel[:-2] + ".c", source_line=start_line, ref_type=3,
+                            details=rule_desc,
+                        ))
                 continue
 
             # Check Makefile include directives: include scripts/Makefile.build
@@ -136,9 +193,9 @@ class KbuildParser:
 
             m = self.OBJ_ASSIGN_RE.match(line_str)
             if m:
-                config_sym = m.group(1)
-                direct_mode = m.group(2)  # 'y' or 'm'
-                items = m.group(4).split()
+                config_sym = m.group(1) or m.group(2)
+                direct_mode = m.group(3)  # 'y' or 'm'
+                items = m.group(5).split()
 
                 if config_sym:
                     sym_name = config_sym
@@ -169,6 +226,7 @@ class KbuildParser:
                             ref_type=4,  # FileRefType.Makefile
                             details=rule_desc,
                             is_composite=False,
+                            is_directory=True,
                         ))
                         continue
                     elif clean_item.endswith(".o"):

@@ -622,7 +622,7 @@ export class KernelIdeApp {
           toast.info("Generating compile_commands.json…");
         }
       },
-      { title: "Open KConfig engine", hint: "Menuconfig, defconfigs, dependencies", keywords: "config", run: () => state.openTab({ type: "kconfig", title: "KConfig (x86)", arch: "x86" }) },
+      { title: "Open KConfig engine", hint: "Menuconfig, defconfigs, dependencies", keywords: "config", run: () => state.openTab({ type: "kconfig", title: "KConfig (x86_64)", arch: "x86_64" }) },
       {
         title: `${state.kconfigEngineActive ? "Disable" : "Enable"} KConfig engine (#ifdef dimming)`, hint: "Dims compiled-out preprocessor branches", keywords: "ifdef dim preprocessor",
         run: () => {
@@ -665,7 +665,7 @@ export class KernelIdeApp {
           sidebar.classList.toggle("collapsed");
           btn.classList.toggle("active", !sidebar.classList.contains("collapsed"));
         } else if (action === "kconfig") {
-          state.openTab({ type: "kconfig", title: "KConfig (x86)", arch: "x86" });
+          state.openTab({ type: "kconfig", title: "KConfig (x86_64)", arch: "x86_64" });
         } else if (action === "nodemap") {
           state.openTab({ type: "nodemap", title: "NodeMap Canvas" });
         } else if (action === "maintainers") {

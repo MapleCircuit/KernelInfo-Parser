@@ -32,21 +32,14 @@ class GlobalState {
       }
     ];
 
-    // Client-side KConfig symbol assignments (for constraint evaluation & #ifdef dimming)
-    this.kconfigAssignments = {
-      "64BIT": "y",
-      "CONFIG_64BIT": "y",
-      "SMP": "y",
-      "CONFIG_SMP": "y",
-      "MODULES": "y",
-      "CONFIG_MODULES": "y",
-      "X86": "y",
-      "CONFIG_X86": "y",
-      "PRINTK": "y",
-      "CONFIG_PRINTK": "y",
-      "MAGIC_SYSRQ": "y",
-      "CONFIG_MAGIC_SYSRQ": "y"
-    };
+    // Active KConfig configuration (bare and CONFIG_ keys) used for #ifdef dimming. Filled by the
+    // KConfig view: the engine's resolved .config values, or raw values while the engine is off.
+    this.kconfigAssignments = {};
+    // Saved configuration per "version|ARCH" (bare keys), so switching architecture keeps each config
+    this.kconfigProfiles = {};
+    this.kconfigProfileKey = "";
+    // Toolchain profile per "version|ARCH" (compiler, versions, env and probe overrides; see the API docs)
+    this.kconfigToolchains = {};
 
     // Load persisted state if available
     this.loadState();
@@ -237,15 +230,39 @@ class GlobalState {
     this.saveState();
   }
 
-  setKconfigAssignments(newAssignments) {
+  setKconfigAssignments(newAssignments, profileKey = null) {
     const normalized = {};
+    const bareOnly = {};
     for (const [k, v] of Object.entries(newAssignments || {})) {
       const bare = k.startsWith("CONFIG_") ? k.substring(7) : k;
       normalized[bare] = v;
       normalized[`CONFIG_${bare}`] = v;
+      bareOnly[bare] = v;
     }
+    if (profileKey) this.kconfigProfileKey = profileKey;
+    if (this.kconfigProfileKey) this.kconfigProfiles[this.kconfigProfileKey] = bareOnly;
     this.kconfigAssignments = normalized;
     this.emit("kconfig:assignments:updated", this.kconfigAssignments);
+    this.saveState();
+  }
+
+  /** Saved configuration (bare keys) of a "version|ARCH" profile, or null. */
+  getKconfigProfile(profileKey) {
+    return this.kconfigProfiles[profileKey] || null;
+  }
+
+  getKconfigToolchain(profileKey) {
+    return this.kconfigToolchains[profileKey] || {};
+  }
+
+  setKconfigToolchain(profileKey, toolchain) {
+    if (toolchain && Object.keys(toolchain).length) this.kconfigToolchains[profileKey] = toolchain;
+    else delete this.kconfigToolchains[profileKey];
+    this.saveState();
+  }
+
+  dropKconfigProfile(profileKey) {
+    delete this.kconfigProfiles[profileKey];
     this.saveState();
   }
 
@@ -258,7 +275,10 @@ class GlobalState {
         splitMode: this.splitMode,
         activePaneId: this.activePaneId,
         panes: this.panes,
-        kconfigAssignments: this.kconfigAssignments
+        kconfigAssignments: this.kconfigAssignments,
+        kconfigProfiles: this.kconfigProfiles,
+        kconfigProfileKey: this.kconfigProfileKey,
+        kconfigToolchains: this.kconfigToolchains
       };
       localStorage.setItem("kernel_ide_state", JSON.stringify(stateObj));
       localDB.set("tabs_state", "current_session", stateObj).catch(() => {});
@@ -294,6 +314,9 @@ class GlobalState {
           this.panes = parsed.panes;
         }
         if (parsed.kconfigAssignments) this.kconfigAssignments = parsed.kconfigAssignments;
+        if (parsed.kconfigProfiles && typeof parsed.kconfigProfiles === "object") this.kconfigProfiles = parsed.kconfigProfiles;
+        if (typeof parsed.kconfigProfileKey === "string") this.kconfigProfileKey = parsed.kconfigProfileKey;
+        if (parsed.kconfigToolchains && typeof parsed.kconfigToolchains === "object") this.kconfigToolchains = parsed.kconfigToolchains;
       }
     } catch (e) {
       console.warn("Failed to load saved state:", e);

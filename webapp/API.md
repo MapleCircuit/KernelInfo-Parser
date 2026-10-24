@@ -704,331 +704,98 @@ kernel-doc comments of a source file, filtered like the `.. kernel-doc::` direct
 
 ### 4.4. Kconfig & Architecture Defconfigs API
 
+All Kconfig endpoints read the Git objects of the requested revision (never the work tree), accept an optional **toolchain profile** (`toolchain` query parameter holding JSON on GET endpoints, `toolchain` body field on POST endpoints; see `GET /toolchain` below) and are scoped by an **ARCH value** (`arch` parameter, default `x86_64`): the value `make ARCH=<arch>` would receive. The top Makefile maps some values onto another source directory (`i386`/`x86_64` -> `x86`, `sparc32`/`sparc64` -> `sparc`, `sh64` -> `sh`, ...); `x86`, `sparc` and `sh` themselves are the generic forms whose bitness is chosen in menuconfig. The model is built by `parser/kconfig_ast/kconfig_model.py` and evaluated by `parser/kconfig_ast/kconfig_eval.py` (server) and `kconfig_engine.js` (browser); both reproduce the kernel's `conf` output byte for byte (see `parser/kconfig_ast/KCONFIG_API.md` section 8). Models are cached per (repository, revision, ARCH, toolchain) in a 6-entry LRU.
+
+#### `GET /api/kconfig/{version_name}/toolchain`
+#### `GET /api/version/{version_name}/kconfig/toolchain`
+Default toolchain profiles of a revision. Linux 4.18+ Kconfig runs `$(shell,...)` checks against the compiler, linker and assembler while it is parsed; the server answers them from a profile (`parser/kconfig_ast/kconfig_toolchain.py`). Response: `{ "version", "arch", "kernelversion", "macros": true, "gcc": {profile}, "clang": {profile} }` where a profile is `{ "cc", "cc_version", "ld", "ld_version", "assembler", "binutils_version", "cross_compile", "llvm_utils", "pahole_version", "rustc_version", "gcc_plugins", "host_release", "env", "probes" }`. `macros: false` means the revision predates the macro language: only environment variables (`option env=`) matter.
+- **Toolchain parameter**: any subset of the profile, e.g. `{"cc": "clang", "cc_version": "18.1.3", "env": {"CC_VERSION_TEXT": "Ubuntu clang version 18.1.3"}, "probes": {"cc-option:-fsanitize=kcfi": "n"}}`. Missing fields take the defaults of that kernel release. `env` overrides any environment variable Kconfig reads; `probes` forces a check (`"y"`/`"n"`) or a command output (text), keyed as reported in the model's `toolchain.probes`.
+
 #### `GET /api/kconfig/{version_name}/tree`
 #### `GET /api/kconfig/tree`
-Retrieve the authentic scoped Menuconfig tree for an architecture. Performs authentic recursive source-inclusion traversal starting from `arch/<arch>/Kconfig`, inlining `source` and `rsource` declarations into enclosing menus. Attaches full boolean dependency expressions (`depends_on_expr`), default expressions with conditions (`defaults`), mutual-exclusion choice metadata (`choice`), and symbol types (`type`, `type_name`). Employs in-memory LRU tree caching (`_TREE_CACHE`) for zero-overhead retrieval (<0.001s latency).
-- **Parameters**:
-  - `version_name` (path) / `version` (query): Kernel version string (default `"v3.0"`).
-  - `arch` (query): Target CPU architecture (e.g. `"x86"`, `"arm"`, `"arm64"`, `"mips"`, `"powerpc"`, `"sparc"`).
-  - `include_tree` (query, bool): If `true`, returns the recursively assembled hierarchical tree under root categories (key `"tree"`). Default `false`.
-  - `include_relations` (query, bool): If `true`, includes global `relations` and `reverse_relations` maps. Default `false`.
-- **Response**:
+The finalized configuration model of one ARCH, in compact transport form, for the client-side engine (`decodeModel()` in `kconfig_engine.js`).
+- **Parameters**: `version_name` (path) / `version` (query); `arch` (query, default `x86_64`); `include_nodes` / `include_tree` (bool: also return readable per-entry `nodes` with `tree_id`, `parent_id`, `node_type`, `title`, `prompt`, `symbol_name`, `file_path`, `line_s`, `depends_on_expr`, `depends_on`, `defaults`, `selects`, `selected_by`, `implies`, `implied_by`, `choice`); `include_relations` (bool: `relations` / `reverse_relations` maps).
+- **Response** (abridged):
 ```json
 {
-  "version": "v3.0",
-  "arch": "x86",
-  "total_nodes": 8564,
-  "total_count": 8564,
-  "nodes": [
-    {
-      "tree_id": 1,
-      "parent_id": 0,
-      "node_type": 1,
-      "title": "General setup",
-      "symbol_name": null,
-      "depends_on": [],
-      "depends_on_expr": null,
-      "defaults": [],
-      "selects": [],
-      "implies": [],
-      "choice": null
-    },
-    {
-      "tree_id": 105,
-      "parent_id": 1,
-      "node_type": 3,
-      "title": "64-bit kernel",
-      "symbol_name": "64BIT",
-      "type": 1,
-      "type_name": "bool",
-      "depends_on": ["!UML"],
-      "depends_on_expr": "!UML",
-      "defaults": [
-        { "value": "y", "expr": null }
-      ],
-      "selects": [],
-      "implies": [],
-      "choice": null
-    }
-  ]
-}
-```
-
-#### `GET /api/kconfig/{version_name}/symbol/{symbol_name}`
-#### `GET /api/version/{version_name}/kconfig/symbol/{symbol_name}`
-#### `GET /api/kconfig/symbol`
-#### `GET /api/version/{version_name}/kconfig/symbol`
-Retrieve comprehensive metadata for a Kconfig symbol, including declaring source file coordinates (`file_path`, `line_s`, `line_e`), prompt, dependencies, reverse selects, and compiled C files. If spatial coordinates are unindexed in `m_kconfig_tree`, transparently falls back to sub-50ms repository `git grep` detection.
-- **Parameters**:
-  - `version_name` (path) / `version` (query): Kernel version string.
-  - `symbol_name` (path or query): Kconfig symbol name with or without `CONFIG_` prefix (e.g. `"SMP"` or `"CONFIG_SMP"`).
-- **Response**:
-```json
-{
-  "name": "SMP",
-  "type": "bool",
-  "type_name": "bool",
-  "prompt": "Symmetric multi-processing support",
-  "file_path": "arch/x86/Kconfig",
-  "line_s": 298,
-  "line_e": 315,
-  "declarations": [
-    {
-      "file_path": "arch/x86/Kconfig",
-      "line_s": 298,
-      "line_e": 315
-    }
-  ],
-  "definition": {
-    "file_path": "arch/x86/Kconfig",
-    "line_s": 298,
-    "line_e": 315
-  },
-  "depends_on": ["X86_LOCAL_APIC"],
-  "selects": ["USE_GENERIC_SMP_HELPERS"],
-  "selected_by": ["MAXSMP"],
-  "compiled_files": [
-    { "file_path": "kernel/smp.c", "compile_mode": "built-in" },
-    { "file_path": "arch/x86/kernel/smp.c", "compile_mode": "built-in" }
-  ]
-}
-```
-
-#### `POST /api/kconfig/{version_name}/validate`
-#### `POST /api/version/{version_name}/kconfig/validate`
-Check `{"symbols": {...}}` against select/depends constraints. Response: `{ "version", "forced_symbols", "adjusted_symbols", "conflicts" }`.
-
-#### `POST /api/kconfig/{version_name}/diff-config`
-#### `POST /api/version/{version_name}/kconfig/diff-config`
-Compare `{"active_config": {...}, "custom_config": {...}}`. Response: `{ "version", "matching_symbols", "mismatched_symbols", "differences": [{ "symbol", "val1", "val2" }] }`.
-
-#### `GET /api/version/{version_name}/kconfig/defconfigs`
-#### `GET /api/kconfig/{version_name}/defconfigs`
-#### `GET /api/kconfig/defconfigs`
-List discovered defconfig files for an architecture.
-- **Parameters**:
-  - `version_name` (path) / `version` (query): Kernel version string.
-  - `arch` (query): Target architecture (default `"x86"`).
-- **Response**:
-```json
-{
-  "version": "v3.0",
-  "arch": "x86",
-  "defconfigs": [
-    { "name": "x86_64_defconfig", "path": "arch/x86/configs/x86_64_defconfig" },
-    { "name": "i386_defconfig", "path": "arch/x86/configs/i386_defconfig" }
-  ]
-}
-```
-
-#### `GET /api/version/{version_name}/kconfig/defconfig/content`
-#### `GET /api/kconfig/{version_name}/defconfig`
-#### `GET /api/kconfig/defconfig/content`
-Retrieve parsed key-value assignments and raw content from an authentic defconfig file.
-- **Parameters**:
-  - `version_name` (path) / `version` (query): Kernel version string.
-  - `defconfig` / `file_path` (query): Defconfig identifier or relative path.
-  - `arch` (query): Target architecture.
-- **Response**:
-```json
-{
-  "version": "v3.0",
-  "name": "x86_64_defconfig",
-  "file_path": "arch/x86/configs/x86_64_defconfig",
-  "arch": "x86",
-  "bits": 64,
-  "symbol_count": 892,
-  "values": {
-    "64BIT": "y",
-    "SMP": "y",
-    "NR_CPUS": "64"
-  },
-  "content": "#\n# Automatically generated make config: don't edit\n# Linux Kernel Configuration\nCONFIG_64BIT=y\nCONFIG_SMP=y\nCONFIG_NR_CPUS=64\n..."
-}
-```
-
-##### Menuconfig TUI & Constraint Engine
-- **Fixed Viewport Modal & Window Layout**: The curses terminal modal (`.menuconfig-tui-modal`) is styled with `position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; z-index: 9999; overflow: hidden;`. The inner flex body (`.tui-body`) uses `align-items: flex-start; padding: 24px 20px; box-sizing: border-box; overflow: hidden; min-height: 0;` to anchor the dialog window (`.tui-window`) at a stable, fixed distance from the top border of the window, independent of item count. The dialog window (`height: calc(100vh - 80px); max-height: calc(100vh - 80px);`) confines option scrolling strictly inside `.tui-menu-list` (`flex: 1; min-height: 0; overflow-y: auto;`), ensuring header titles, instructions, and footer action buttons remain anchored and visible without window jumping or downward scroll drift.
-- **Authentic Hierarchical Navigation**: Flat tree nodes (`m_kconfig_tree`) are indexed by `parent_id`. The main menu displays authentic top-level categories (`parent_id === 0`). Submenu indicators (`--->`) are dynamically determined from child node counts (`nodesByParent.get(node.tree_id)`).
-- **Navigation Controls**: `<Enter>` or `< Select >` navigates into submenus; `<Space>` toggles symbol configuration state (`[*]`/`[ ]`); `<Esc>` or `< Exit >` navigates up the menu hierarchy or exits cleanly back to the IDE view; `<S>` exports or saves configuration; mouse click selects an item and double-click enters/toggles.
-- **Bidirectional Key Synchronization**: Client state (`state.kconfigAssignments`) and constraint solver (`KconfigEngine.propagate`) maintain synchronized entries for both bare symbol keys (`"64BIT"`) and `CONFIG_` prefixed keys (`"CONFIG_64BIT"`), with `KconfigParser.serialize` deduplicating output.
-- **Kconfig Choice & Help Block Parsing**: `KconfigLexer` emits clean line-delimited `HELP_TEXT` tokens, and `KconfigParser` (`_parse_choice`, `_parse_menu`) explicitly parses and binds `help_text`. Choice blocks containing multi-line help documentation cleanly encapsulate child choices without line/token swallowing, preventing prompt overwriting (e.g. choice prompt being overwritten by the last choice's prompt such as `"LZO"`) or swallowing subsequent top-level symbols into pseudo-choice folders.
-
-
-#### `GET /api/kconfig/graph`
-#### `GET /api/kconfig/{version_name}/graph`
-#### `GET /api/version/{version_name}/kconfig/graph`
-#### `GET /api/version/{version_name}/kconfig/graph/{symbol_name}`
-Retrieve the full architecture dependency graph for client-side constraint evaluation, dependency tree traversal, and visual DAG rendering.
-- **Parameters**:
-  - `version` / `version_name` (query or path): Kernel version string.
-  - `arch` (query): Target architecture.
-  - `symbol` / `symbol_name` (query or path): Optional root symbol filter.
-  - `depth` (query): Max dependency expansion depth (default 2).
-- **Response**:
-```json
-{
-  "nodes": [
-    { "id": "EXT4_FS", "label": "The Extended 4 (ext4) filesystem", "type": "tristate", "value": "y", "is_root": true }
-  ],
-  "edges": [
-    { "source": "EXT4_FS", "target": "BLOCK", "type": "depends_on" }
-  ]
-}
-```
-
-#### `GET /api/kconfig/{version_name}/autosolve/{symbol}`
-#### `GET /api/version/{version_name}/kconfig/autosolve/{symbol}`
-#### `POST /api/kconfig/{version_name}/autosolve`
-#### `POST /api/version/{version_name}/kconfig/autosolve`
-Evaluate prerequisite dependency trees for blocked or unmet Kconfig symbols and compute the minimal set of required symbol toggles to satisfy all constraints. Supports both single-symbol GET queries and customized configuration POST payloads.
-- **Parameters**:
-  - `version_name` (path): Kernel version string.
-  - `symbol` (path, for GET): Target symbol identifier (e.g. `"SMP"`).
-  - **Body** (`application/json`, for POST):
-    ```json
-    {
-      "target_symbol": "EXT4_FS",
-      "current_values": { "BLOCK": "n" }
-    }
-    ```
-- **Response**:
-```json
-{
-  "solution_found": true,
-  "target_symbol": "EXT4_FS",
-  "toggles_needed": [
-    { "symbol": "BLOCK", "from": "n", "to": "y", "reason": "prerequisite" }
-  ],
-  "total_toggles": 1
-}
-```
-#### `GET /api/kconfig/{version_name}/presets`
-#### `GET /api/version/{version_name}/kconfig/presets`
-#### `GET /api/version/{version_name}/kconfig/env-presets`
-Retrieve discovered CPU architectures, canonical defconfigs, architectural symbol bindings, and compiler presets.
-- **Parameters**:
-  - `version_name` (path): Kernel version string.
-- **Response**:
-```json
-{
-  "version": "v3.0",
-  "targets": [
-    {
-      "id": "x86_64",
-      "label": "x86_64 (64-bit x86)",
-      "arch": "x86",
-      "srcarch": "x86",
-      "kconfig_path": "arch/x86/Kconfig",
-      "canonical_defconfig": "x86_64_defconfig",
-      "bits": 64,
-      "symbols": {
-        "64BIT": "y",
-        "X86_64": "y",
-        "X86": "y",
-        "X86_32": "n",
-        "ARCH": "x86",
-        "SRCARCH": "x86"
-      }
-    },
-    {
-      "id": "arm",
-      "label": "ARM (32-bit ARM)",
-      "arch": "arm",
-      "srcarch": "arm",
-      "kconfig_path": "arch/arm/Kconfig",
-      "canonical_defconfig": "versatile_defconfig",
-      "bits": 32,
-      "symbols": {
-        "ARM": "y",
-        "ARCH": "arm",
-        "SRCARCH": "arm",
-        "64BIT": "n"
-      }
-    }
-  ],
-  "compilers": [
-    { "id": "gcc", "label": "GNU Compiler Collection (gcc)", "symbols": { "CC_IS_GCC": "y" } },
-    { "id": "clang", "label": "LLVM Clang (clang)", "symbols": { "CC_IS_CLANG": "y" } }
-  ]
-}
-```
-
-#### `GET /api/kconfig/{version_name}/search`
-#### `GET /api/version/{version_name}/kconfig/search`
-Search Kconfig symbol names, prompts, and types by query prefix or substring.
-- **Parameters**:
-  - `version_name` (path): Kernel version string.
-  - `q` / `query` (query): Search query string.
-  - `limit` (query): Maximum matches to return (default 50).
-- **Response**:
-```json
-{
-  "version": "v3.0",
-  "query": "SMP",
-  "count": 2,
-  "symbols": [
-    {
-      "name": "SMP",
-      "prompt": "Symmetric multi-processing support",
-      "type": 1,
-      "type_name": "bool",
-      "file_path": "arch/x86/Kconfig"
-    }
-  ]
-}
-```
-
-#### `POST /api/kconfig/{version_name}/import`
-#### `POST /api/version/{version_name}/kconfig/import`
-Parse and validate raw uploaded `.config` configuration file content against the active architecture's Kconfig symbol dictionary.
-- **Parameters**:
-  - `version_name` (path): Kernel version string.
-  - `arch` (query): Target architecture (default `"x86"`).
-  - **Body** (`application/json`):
-    ```json
-    {
-      "content": "CONFIG_64BIT=y\nCONFIG_SMP=y\n"
-    }
-    ```
-- **Response**:
-```json
-{
-  "version": "v3.0",
-  "arch": "x86",
-  "total_parsed": 2,
-  "valid_symbols": 2,
-  "unknown_symbols": 0,
-  "assignments": {
-    "CONFIG_64BIT": "y",
-    "CONFIG_SMP": "y"
+  "format": 2, "version": "v3.0", "arch": "x86_64", "srcarch": "x86",
+  "env": {"ARCH": "x86_64", "SRCARCH": "x86", "KERNELVERSION": "3.0.0"},
+  "mainmenu": "Linux/x86_64 3.0.0 Kernel Configuration",
+  "config_header": "Automatically generated make config: don't edit",
+  "modules_sym": "MODULES", "root_kconfig": "Kconfig", "total_nodes": 8255,
+  "exprs": [["s", "64BIT"], ["c", "x86_64"], ["=", 3, 1], ["&", 0, 2]],
+  "menu_fields": ["parent", "kind", "sym", "prompt", "pvis", "vis_if", "dep", "file", "line_s", "line_e", "has_help"],
+  "menus": [[-1, 0, null, "Linux/x86_64 3.0.0 Kernel Configuration", -1, -1, -1, 0, 6, 0, 0], [0, 3, "64BIT", "64-bit kernel", 12, -1, -1, 1, 2, 9, 1]],
+  "files": ["Kconfig", "arch/x86/Kconfig"],
+  "symbols": {"64BIT": {"t": "bool", "p": [12], "d": [[14, -1]], "m": [1]}},
+  "warnings": [],
+  "semantics": {"write_on_nonzero_default": false, "menu_end_comments": false, "int_hex_zero_default": false, "tristate_choice_mod_hidden": false},
+  "toolchain": {
+    "macros": false, "summary": "gcc 5.4.0 · GNU ld 2.25", "profile": {...}, "env": {"CC": "gcc", "...": "..."},
+    "env_used": [{"name": "ARCH", "value": "x86_64", "overridden": false}],
+    "probes": [{"key": "cc-option:-fsanitize=kcfi", "kind": "cc-option", "label": "Compiler accepts -fsanitize=kcfi", "command": "...", "result": "n", "source": "knowledge", "note": "gcc >= never, clang >= 16.0", "locations": [{"file": "arch/Kconfig", "line": 790, "symbol": "CFI_CLANG"}]}],
+    "messages": [{"level": "error", "text": "Sorry, this C compiler is not supported.", "file": "scripts/Kconfig.include", "line": 44}]
   }
 }
 ```
+  `semantics` lists `conf` behaviours of this revision (detected from its `scripts/kconfig` sources) that both engines follow. `toolchain` reports what the build environment contributed: every environment variable read (`env_used`), every toolchain check with its answer and source (`toolchain` = derived from the profile, `knowledge` = known first gcc/clang versions, `assumed` = no data, assumed to succeed, `override`), the Kconfig entries using it, and `$(error-if)`/`$(warning-if)`/`$(info)` messages.
+  Expression nodes: `["s", name]`, `["c", text]`, `["&"|"|", a, b]`, `["!", a]`, `["="|"!="|"<"|"<="|">"|">=", a, b]`; `-1` = no expression. Menu `kind` codes: 0 root, 1 menu, 2 choice, 3 config, 4 menuconfig, 5 comment, 6 if. Symbol keys: `t` type, `p` prompt visibilities, `d` defaults `[value, condition]`, `r` ranges, `s` selects, `i` implies, `rd` reverse dependency, `im` implied-by, `dd` direct dependency, `m` defining menu entries, `ch` choice of a choice value, `ic`/`op`/`mb` choice flags and members, `au` automatic (env/choice), `env`.
 
-#### `POST /api/kconfig/{version_name}/export`
-#### `POST /api/version/{version_name}/kconfig/export`
-Serialize an in-memory dictionary of configuration assignments into standard kernel `.config` file text format.
-- **Parameters**:
-  - `version_name` (path): Kernel version string.
-  - `arch` (query): Target architecture (default `"x86"`).
-  - **Body** (`application/json`):
-    ```json
-    {
-      "assignments": {
-        "64BIT": "y",
-        "SMP": "y"
-      }
-    }
-    ```
-- **Response**:
-```json
-{
-  "version": "v3.0",
-  "arch": "x86",
-  "content": "#\n# Automatically generated make config: don't edit\n# Linux Kernel Configuration\nCONFIG_64BIT=y\nCONFIG_SMP=y\n"
-}
-```
+#### `GET /api/kconfig/{version_name}/symbol/{symbol_name}`
+#### `GET /api/version/{version_name}/kconfig/symbol/{symbol_name}`
+#### `GET /api/kconfig/symbol` / `GET /api/version/{version_name}/kconfig/symbol` (`name` query)
+Arch-scoped details of a symbol (with or without `CONFIG_`). The same name can be declared in different files per architecture (e.g. `64BIT`: `arch/x86/Kconfig` for x86_64, `arch/sparc/Kconfig` for sparc64).
+- **Parameters**: `arch` (query, default `x86_64`).
+- **Response**: `name`, `arch`, `srcarch`, `defined_for_arch`, `type` (1 bool, 2 tristate, 3 string, 4 hex, 5 int) / `type_name`, `prompt`, `prompts`, `help`, primary `file_path` / `line_s` / `line_e` / `definition`, `declarations` and `definitions` (every definition for this ARCH: `file_path`, `line_s`, `line_e`, `prompt`, `kind`, `depends_on_expr`, `visible_expr`, `help`, `menu_path`), `dir_dep_expr`, `rev_dep_expr`, `implied_expr`, `depends_on` (symbols named by its own `depends on` lines), `selects`, `select_conditions`, `implies`, `selected_by`, `implied_by`, `defaults` (`[{value, cond}]`), `def_val`, `ranges`, `choice`, `choice_members`, `env`, `kconfig_refs` (entries referring to it), `kbuild` (Makefile rules, see usage), `compiled_files` (`[{file_path, target_obj, compile_mode, makefile, line, other_arch}]`, Git scan merged with `m_kconfig_kbuild` rows), plus compatibility fields `vid_s`, `vid_e`, `vname_s`, `vname_e`, `added_version`, `is_active`, `lifecycle_status`.
+- When the symbol is not declared for this ARCH: `defined_for_arch: false` and `declarations` lists its declarations in other architectures' Kconfig files (404 if declared nowhere).
+
+#### `GET /api/kconfig/{version_name}/symbol/{symbol_name}/usage`
+#### `GET /api/version/{version_name}/kconfig/symbol/{symbol_name}/usage`
+Where `CONFIG_<symbol>` is used (Git grep of the revision, cached).
+- **Parameters**: `arch` (default `x86_64`), `limit` (1-2000, default 400).
+- **Response**: `kbuild` (`[{makefile, line, rule, target_obj, path, exists, kind: object|composite|directory, via: rule|condition, compile_mode, other_arch}]`: objects and directories built when the option is enabled, including rules inside `ifeq ($(CONFIG_X),y)` blocks), `source_refs` (`[{file_path, line, text, other_arch}]` in `.c .h .S .lds .dts .dtsi`, `CONFIG_X` and `CONFIG_X_MODULE`), `source_ref_count`, `source_file_count`, `kconfig_refs` (`[{kind: depends_on|select|imply|default|prompt_condition|select_condition|imply_condition, by, file, line}]`). `other_arch` marks paths under another architecture's `arch/` directory.
+
+#### `GET /api/version/{version_name}/kconfig/defconfigs`
+#### `GET /api/kconfig/{version_name}/defconfigs` / `GET /api/kconfig/defconfigs`
+Defconfigs of the ARCH's source directory: `arch/<srcarch>/defconfig` and every file under `arch/<srcarch>/configs/` (nested ones such as powerpc `40x/acadia_defconfig` included). `canonical_default` is what `make ARCH=<arch> defconfig` loads: `KBUILD_DEFCONFIG` from `arch/<srcarch>/Makefile` evaluated with ARCH/SRCARCH known, `CONFIG_*` undefined and `CROSS_COMPILE` set (e.g. `x86` -> `i386_defconfig`, `x86_64` -> `x86_64_defconfig`, `powerpc` -> `ppc64_defconfig`), else `arch/<srcarch>/defconfig`.
+- **Response**: `{ "version", "arch", "arch_dir", "total_count", "canonical_default", "defconfigs": [{ "name", "file_path", "fid", "is_canonical" }] }`.
+
+#### `GET /api/version/{version_name}/kconfig/defconfig/content`
+#### `GET /api/kconfig/{version_name}/defconfig` / `GET /api/kconfig/defconfig/content`
+Raw defconfig text and its literal assignments. Nothing is injected: everything a defconfig leaves out is derived by kconfig when it is loaded.
+- **Parameters**: `defconfig` / `file_path` (name or path; empty = the ARCH's default defconfig), `arch`.
+- **Response**: `{ "version", "name", "file_path", "arch", "srcarch", "bits", "symbol_count", "values", "content" }`; `bits` is `64BIT` after resolving the defconfig with kconfig (null for architectures without that symbol).
+
+#### `GET /api/kconfig/{version_name}/presets`
+#### `GET /api/version/{version_name}/kconfig/presets` / `.../kconfig/env-presets`
+Every ARCH value of the revision: one per `arch/*` directory plus the top Makefile's aliases.
+- **Response**: `{ "version", "default_arch", "targets": [{ "id", "label", "arch", "srcarch", "kconfig_path", "canonical_defconfig", "bits", "env": {"ARCH", "SRCARCH", "KERNELVERSION"} }], "architectures": (same list), "compilers": [...] }`. `compilers` only matters from Linux 4.18 (`CC_IS_GCC`/`CC_IS_CLANG`), whose `$(shell,...)` macros the model does not evaluate.
+
+#### `GET /api/kconfig/{version_name}/search`
+#### `GET /api/version/{version_name}/kconfig/search`
+Search symbol names and prompts of the ARCH model (`CONFIG_` prefix optional). Parameters: `q`, `limit` (default 25), `arch`. Response: `{ "version", "arch", "query", "count", "total", "symbols": [{ "name", "type", "type_name", "prompt", "help", "file_path", "line_s" }] }`.
+
+#### `GET /api/kconfig/graph` / `GET /api/kconfig/{version_name}/graph`
+#### `GET /api/version/{version_name}/kconfig/graph` / `.../kconfig/graph/{symbol_name}`
+Direct relations of one symbol in the ARCH model: its own `depends on` symbols (`depends_on` edges), `selects` / `implies` targets, and selectors (`selects` edges into it). Parameters: `symbol` / `symbol_name`, `arch`, `depth` (kept for compatibility). Response: `{ "version", "arch", "symbol", "nodes": [{ "id", "label", "is_root", "type" }], "edges": [{ "from", "to", "type" }] }`.
+
+#### `POST /api/kconfig/{version_name}/autosolve` / `POST /api/version/{version_name}/kconfig/autosolve`
+#### `GET /api/kconfig/{version_name}/autosolve/{symbol}` / `GET /api/version/{version_name}/kconfig/autosolve/{symbol}`
+Legal changes (the ones menuconfig would accept, applied in order) that make `target_symbol` reach `value` from `current_values`. The solver satisfies prompt visibility recursively (AND: both sides, OR: cheapest side, `!X`: lowers X), selects prompt-less symbols through a selector, and refuses symbols forced by select, fixed by the architecture or without prompt.
+- **Body**: `{ "target_symbol": "KVM_INTEL", "value": "y", "arch": "x86_64", "toolchain": {...}, "current_values": {"KVM": "n"} }` (GET: empty configuration, `arch` query).
+- **Response**: `{ "solution_found": true, "toggles_needed": [{ "symbol": "KVM", "from": "n", "set_to": "y", "to": "y" }, { "symbol": "KVM_INTEL", "from": "n", "set_to": "y", "to": "y" }], "total_toggles": 2, "blocked_by": [], "final_value": "y", "target": "KVM_INTEL", "arch": "x86_64" }`.
+
+#### `POST /api/kconfig/{version_name}/validate` / `POST /api/version/{version_name}/kconfig/validate`
+Loads `{"symbols": {...}, "arch": ...}` like `conf_read` and reports every value kconfig would not keep. Response: `{ "version", "arch", "forced_symbols": {name: value}, "adjusted_symbols": {name: value}, "details": [{ "symbol", "requested", "value", "reason", "depends_on" }], "conflicts": [{ "symbol", "message", "selected_by", "depends_on" }], "unknown_symbols", "invalid_values" }`. `conflicts` are kconfig's "selects X which has unmet direct dependencies" warnings.
+
+#### `POST /api/kconfig/{version_name}/diff-config` / `POST /api/version/{version_name}/kconfig/diff-config`
+Compare `{"active_config": {...}, "custom_config": {...}}`. Response: `{ "version", "matching_symbols", "mismatched_symbols", "differences": [{ "symbol", "val1", "val2" }] }`.
+
+#### `POST /api/kconfig/{version_name}/import` / `POST /api/version/{version_name}/kconfig/import`
+Parse `.config` text (`{"content": "...", "arch": optional}`) into `{ "version", "symbol_count", "symbols" }` (strings unescaped). With `arch`, also `unknown_symbols`, `invalid_values` and `warnings` as kconfig reports them.
+
+#### `POST /api/kconfig/{version_name}/export` / `POST /api/version/{version_name}/kconfig/export`
+Body `{"symbols": {...}, "arch": optional, "format": "config"|"defconfig"}`. With `arch`, the assignments are resolved by kconfig and the result is exactly what `conf` writes (`format: "defconfig"`: `make savedefconfig` output); response `{ "version", "arch", "content", "symbol_count", "resolved": true, "unknown_symbols", "invalid_values" }`. Without `arch`, the assignments are only formatted (`resolved: false`).
 
 ---
 
@@ -1684,10 +1451,10 @@ webapp/frontend/js/
     │   ├── edge_router.js        # Cubic bezier spline router
     │   └── node_model.js         # Node and wire data structures
     ├── kconfig/
-    │   ├── kconfig_view.js       # Interactive Kconfig hierarchy explorer, search & dependency inspector
-    │   ├── kconfig_engine.js     # 20-pass constraint propagation engine
-    │   ├── kconfig_parser.js     # .config deserializer & serializer
-    │   ├── menuconfig_tui.js     # Curses-style terminal TUI
+    │   ├── kconfig_view.js       # Web menuconfig tree, symbol inspector, per-ARCH configurations
+    │   ├── kconfig_engine.js     # scripts/kconfig port: values, legal edits, .config/defconfig I/O
+    │   ├── kconfig_parser.js     # .config reader & raw (engine-off) writer
+    │   ├── menuconfig_tui.js     # mconf-style terminal menuconfig
     │   └── directive_evaluator.js# #ifdef conditional code dimming
     ├── maintainers/maintainers_view.js
     ├── commits/commits_view.js
@@ -1809,26 +1576,14 @@ Implements two-layer hybrid highlighting with map prioritization and client-side
   - Top-bar **"📄 Open Header"** action button quickly opens the included header file.
 
 ### 5.8. `KconfigView` (`webapp/frontend/js/views/kconfig/kconfig_view.js`) & `KconfigEngine` (`webapp/frontend/js/views/kconfig/kconfig_engine.js`)
-- **Active Constraint Engine**: Active by default with live 3-valued boolean logic (`n=0, m=1, y=2`) and recursive default propagation fixpoint loop.
-- **Authentic Scoped Trees**: Inlines `source`/`rsource` statements within their authentic enclosing menus starting from `arch/<arch>/Kconfig`, eliminating cross-architecture menu pollution (e.g. S/390 menus appearing under x86).
-- **Architecture Switching Flow**:
-  - Switching the target architecture dropdown checks if custom configuration selections exist and presents a confirmation modal before clearing old selections.
-  - Automatically fetches architecture presets (`getKconfigPresets`), sets target architectural symbols (`ARCH`, `SRCARCH`, `64BIT`, `X86_64`, `ARM`, etc.), loads the architecture's canonical defconfig (`x86_64_defconfig`, `versatile_defconfig`, etc.), and executes recursive default propagation.
-- **Mutual-Exclusion Choice Solver**:
-  - Detects choice blocks (`choice.id`) and enforces single-member selection.
-  - Renders choice members as radio options `( )` and `(*)`. Selecting any member automatically demotes competing choice members to `n` and triggers recursive propagation.
-- **Type-Aware Cycling & TUI Navigation**:
-  - Tristate symbols cycle across `[ ]` &rarr; `<M>` &rarr; `[*]`.
-  - Boolean symbols toggle between `[ ]` and `[*]`.
-  - Terminal Curses Menuconfig TUI (`menuconfig_tui.js`) supports spacebar tristate cycling and choice radio selection.
-- **Evaluated Dependency Badges & Failing Breakdown**:
-  - Evaluates direct dependencies in real time against the active configuration, rendering status badges: `✓ <expr> (y)` (`dep-met`), `~ <expr> (m)` (`dep-mod`), and `✗ <expr> (n)` (`dep-unmet`).
-  - Nodes with unmet dependencies are visually dimmed (`.kconfig-node-disabled`) with hover tooltips detailing failing clauses.
-  - Evaluates default conditions (`default <val> if <expr>`) in the inspector to show which defaults are actively triggered.
-- **Clickable In-Place Dependency Navigation**:
-  - Clicking any dependency badge cleans expressions (stripping negation `!`, prefix `CONFIG_`, and compound logic bounds), searches and highlights the target symbol in the active tree, updates tab title/state in place, and loads the target symbol's inspection panel without opening redundant duplicate tabs.
-- **Persistent Folder Expansion & Scroll Preservation**:
-  - The explorer tree tracks open folders via a persistent set of node IDs (`this.expandedNodeIds`). Selecting a kconfig symbol, toggling values, selecting choice members, solving prerequisites, or loading defconfigs re-renders the tree while preserving all opened folders, child hierarchy expansions, active row highlights, and the exact scroll offset (`scrollTop`). Clicking dependency badges expands all ancestor menus (`expandAncestors`) to reveal the target symbol in its authentic hierarchical place without collapsing any previously opened folders.
+- **Engine**: `KconfigEngine` decodes the model of `GET /api/kconfig/{v}/tree` (`decodeModel`) and evaluates it with kconfig's algorithms (twin of `parser/kconfig_ast/kconfig_eval.py`): `value`, `visibility`, `revDep`, `getType` (tristate degrades to bool without `MODULES`), `choiceSelection`, `isChangeable`, `menuVisible` (`menu_is_visible`); legal setters `setTristate` / `setValue` / `toggle` (refuse what kconfig refuses; `refusalReason` explains why); `loadConfig` (conf_read report: unknown, invalid, warnings), `loadAssignments`, `setAllNewSymbols`, `writeConfig` (full `.config`, byte-identical to `conf`), `writeDefconfig` (`make savedefconfig`), `configValues`, `exprStr(id, withValues)`, `orTerms`, `menuPath`.
+- **Engine on/off** (`state.kconfigEngineActive`, persisted, also gates `#ifdef` dimming): on, every edit goes through the engine so only valid configurations exist, and the published values are the resolved `.config` values. Off, values are edited raw (no constraints, export marked unvalidated); turning it back on resolves the raw values through kconfig and reports how many were adjusted.
+- **Architectures**: the dropdown lists `GET /presets` grouped by source directory (ARCH values such as `x86_64`, `i386`, `x86`, `sparc64`). Each `version|ARCH` keeps its own configuration in `state.kconfigProfiles`; switching restores it, or loads the ARCH's default defconfig (`canonical_defconfig`) the first time. The active profile is published as `state.kconfigAssignments` (bare and `CONFIG_` keys) for dimming.
+- **Tree (web menuconfig)**: entries from the finalized model in menuconfig order, with implicit submenus. Only entries menuconfig shows are listed (`menuVisible`); **Show All** adds invisible prompted entries (dimmed, tooltip with the failing prompt condition). Markers follow mconf: `[*]`/`[ ]` bool, `<*>`/`<M>`/`< >` tristate, `-*-`/`-M-` forced by select, `(X)`/`( )` choice values, `(value)` int/hex/string, `--->` submenus, `*** comment ***`; choices show their selected member. Clicking the marker changes the value (toggle, choice selection, or a prompt for int/hex/string); refused changes show the reason. Search filters symbol names and prompts and shows each match's menu location.
+- **Inspector**: value with its origin (explicit, default, forced by select, choice), n/m/y buttons enabled only for legal values (or an input for int/hex/string), evaluated prompt visibility, direct dependencies and "Selected by"/"Implied by" terms with `[=value]` annotations, every definition for the ARCH (file:line buttons opening the code view, prompt, menu location, visibility), defaults with the active one highlighted, ranges, selects/implies, choice group, help text, files built when enabled (other architectures collapsed), directories descended into, **Find usages** (source references grouped by file, Makefile conditions, Kconfig entries referring to it), **Auto-solve** (server solver, changes applied through the engine), and the dependency graph. Symbols not declared for the ARCH list their declarations elsewhere.
+- **Toolchain** (Linux 4.18+; button **Toolchain…** or the toolchain summary in the status line): compiler (GCC/Clang) and version, linker (GNU ld/LLD) and version, assembler, binutils version, `CROSS_COMPILE`, LLVM utilities, pahole/rustc versions, GCC plugin headers, build host `uname -r`; a table of every environment variable Kconfig read with an override field (plus *add any variable*); a filterable table of every toolchain check with its result, source and the options using it, each overridable (auto / force y / force n, or text for command outputs); and `$(error-if)` messages (e.g. compiler below the minimum version). *Apply* stores the profile per `version|ARCH` (`state.kconfigToolchains`), rebuilds the model with it and re-resolves the current values through it; *Reset to defaults* clears it. For older revisions the dialog explains that only environment variables matter.
+- **Configurations**: **Load Defconfig** (filterable list, default one tagged), **Import .config** (conf_read in the engine; unknown/invalid entries reported), **Export .config** (`<arch>-<version>.config`, the resolved `.config` to place in the kernel tree), **Save defconfig** (minimal `make savedefconfig` file), **Validate** (values kconfig would not keep with reasons, unknown symbols, select-with-unmet-dependency warnings, *Apply kconfig resolution*), **Compare…** (resolved values against a resolved defconfig).
+- **TUI** (`menuconfig_tui.js`): mconf-style modal over the same engine: `menu`/`menuconfig`/`choice` open submenus, other children are listed indented; keys Up/Down/PgUp/PgDn/Home/End, Enter, Space, Y/M/N, Esc/Left, `/` search, `?`/H help (help text plus Symbol/Type/Prompt/Defined at/Depends on/Location/Selects/Selected by), Z show all, S save `.config`, D save defconfig.
 
 ### 5.9. Universal Middle-Click Tab & Navigation Capture
 The frontend implements systematic middle-click capture (`auxclick` with `e.button === 1`) across all interactive UI surfaces:
@@ -1910,14 +1665,14 @@ The frontend implements systematic middle-click capture (`auxclick` with `e.butt
 
 ### 5.16. `#ifdef` Dimming (`webapp/frontend/js/views/kconfig/directive_evaluator.js`)
 - **Gate**: Only while the KConfig constraint engine is enabled (`state.kconfigEngineActive`, toggled in the KConfig view and persisted) **and** a resolved configuration is loaded (≥ 50 symbols, i.e. a defconfig), for preprocessed sources (`.c .h .S .lds .dts .dtsi .inc`). A toolbar chip shows the number of compiled-out lines.
-- **Semantics**: Three-valued evaluation of `#if/#ifdef/#ifndef/#elif/#else/#endif` (with `\` continuations). Only `CONFIG_*` macros are known, following `autoconf.h`: `CONFIG_FOO` is defined for `y` and string/int values, `CONFIG_FOO_MODULE` for `m`; `IS_ENABLED/IS_BUILTIN/IS_MODULE/IS_REACHABLE`, `defined()`, `!`, `&&`, `||`, parentheses and numeric comparisons are supported. Any other macro (header guards, `__KERNEL__`, arch macros) is unknown and a branch with an unknown condition is never dimmed, nor are its alternatives. Directive lines are dimmed only when their enclosing region is compiled out.
+- **Semantics**: Three-valued evaluation of `#if/#ifdef/#ifndef/#elif/#else/#endif` (with `\` continuations). Only `CONFIG_*` macros are known, following `autoconf.h`: `CONFIG_FOO` is defined for `y` and every string/int/hex value (even empty), `CONFIG_FOO_MODULE` for `m`, symbols that are `n` or absent are undefined; `IS_BUILTIN` is true for `y` (or an int equal to 1), `IS_ENABLED`/`IS_REACHABLE` for `y`/`m`; `IS_ENABLED/IS_BUILTIN/IS_MODULE/IS_REACHABLE`, `defined()`, `!`, `&&`, `||`, parentheses and numeric comparisons are supported. Any other macro (header guards, `__KERNEL__`, arch macros) is unknown and a branch with an unknown condition is never dimmed, nor are its alternatives. Directive lines are dimmed only when their enclosing region is compiled out.
 - **Live updates**: `VirtualEditor` recomputes on `kconfig:engine:changed`, `kconfig:assignments:updated` and `kconfig:assignment:changed`.
 
 ### 5.17. Treemap, Symbol History & Patch Staging
 - **Treemap** (`views/treemap/treemap_view.js`, tab type `treemap`): squarified layout of `/api/version/{v}/treemap` two levels deep, Bytes/Files metric toggle, breadcrumb zoom, click a directory to zoom in or a file to open (middle-click: new tab). Opened from the explorer's folder context menu (*Show Treemap of Folder*) or the palette.
 - **Symbol history** (`components/symbol_history_modal.js`): editor context menu *Symbol History Across Versions* (or *at This Line*) shows `/api/symbols/{v}/history` as a timeline with per-version status, line ranges, inline diffs of modified definitions, and *Open* at that version.
 - **Patch staging** (`components/patch_modal.js`): code toolbar **✎ Patch**, editor/explorer context menu, or palette. Edit the file in a textarea (Tab inserts a tab), set subject, description and identity (remembered in `localStorage`), then *Generate patch* → `api.formatPatch`; copy or download `0001-<subject>.patch`.
-- **KConfig additions**: **Import .config** (server-side `import`), **Validate** (`validate`, with *Apply fixes*), **Compare…** with a defconfig (`diff-config`), and a per-symbol **Dependency Graph** (`api.getKconfigGraph`, depends-on left / selects right, colored by current value, nodes clickable).
+- **KConfig additions**: **Import .config**, **Validate** and **Compare…** run in the browser engine (see 5.8); the per-symbol **Dependency Graph** uses `api.getKconfigGraph` (own depends-on left, selects/implies right, colored by current value, nodes clickable).
 
 ### 5.18. Projects (Multiple Repositories)
 - The header **Project** selector lists `/api/projects` (parsed repositories plus *git only* ones). `api.setRepository(name)` adds `X-KI-Repo` to every request, prefixes IndexedDB cache keys with the repository, and `withRepo()` appends `?repo=` to URLs used directly (images, downloads). Switching asks for confirmation, closes the workspace tabs (`state.setRepository`), and selects the repository's latest parsed version (else its default branch).

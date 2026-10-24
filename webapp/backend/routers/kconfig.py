@@ -1,8 +1,8 @@
-"""webapp/backend/routers/kconfig.py - KConfig Architecture Defconfigs & Dependency Graph."""
+"""webapp/backend/routers/kconfig.py - Kconfig models, defconfigs, symbol provenance and constraint tools."""
 from __future__ import annotations
 from typing import Any
 from fastapi import APIRouter, Query, Body
-from webapp.backend.services.kconfig_service import KconfigService
+from webapp.backend.services.kconfig_service import DEFAULT_ARCH, KconfigService
 
 router = APIRouter(prefix="/api", tags=["kconfig"])
 kconfig_service = KconfigService()
@@ -12,25 +12,55 @@ kconfig_service = KconfigService()
 @router.get("/kconfig/{version_name}/tree")
 def get_kconfig_tree(
     version: str = Query("v3.0"),
-    arch: str = Query("x86"),
+    arch: str = Query(DEFAULT_ARCH),
     version_name: str | None = None,
     include_tree: bool = Query(False),
     include_relations: bool = Query(False),
+    include_nodes: bool = Query(False),
+    toolchain: str | None = Query(None, description="Toolchain profile (JSON) answering Kconfig $(shell,...) calls"),
 ) -> dict[str, Any]:
-    """Retrieve hierarchical Menuconfig tree scoped by architecture."""
+    """Finalized Kconfig model (menus, symbols, expressions) for one ARCH and toolchain, evaluated client-side."""
     v = version_name or version
-    return kconfig_service.get_tree(v, arch, include_tree=include_tree, include_relations=include_relations)
+    return kconfig_service.get_tree(v, arch, include_tree=include_tree, include_relations=include_relations,
+                                    include_nodes=include_nodes, toolchain=toolchain)
+
+
+@router.get("/kconfig/{version_name}/toolchain")
+@router.get("/version/{version_name}/kconfig/toolchain")
+def get_kconfig_toolchain_defaults(version_name: str, arch: str = Query(DEFAULT_ARCH)) -> dict[str, Any]:
+    """Default gcc/clang toolchain profiles of a revision and whether its Kconfig uses $(...) macros."""
+    return kconfig_service.toolchain_defaults(version_name, arch)
 
 
 @router.get("/kconfig/symbol")
 @router.get("/version/{version_name}/kconfig/symbol")
 @router.get("/kconfig/{version_name}/symbol/{symbol_name}")
 @router.get("/version/{version_name}/kconfig/symbol/{symbol_name}")
-def get_kconfig_symbol(version: str = Query("v3.0"), name: str = Query(None), version_name: str | None = None, symbol_name: str | None = None) -> dict[str, Any]:
-    """Retrieve symbol details, depends_on expressions, and reverse selects."""
+def get_kconfig_symbol(
+    version: str = Query("v3.0"),
+    name: str = Query(None),
+    version_name: str | None = None,
+    symbol_name: str | None = None,
+    arch: str = Query(DEFAULT_ARCH),
+    toolchain: str | None = Query(None, description="Toolchain profile (JSON) answering Kconfig $(shell,...) calls"),
+) -> dict[str, Any]:
+    """Arch-scoped definitions (file:line), dependencies, reverse dependencies, help and compiled files."""
     v = version_name or version
     sym = symbol_name or name
-    return kconfig_service.get_symbol_detail(v, sym)
+    return kconfig_service.get_symbol_detail(v, sym, arch, toolchain)
+
+
+@router.get("/kconfig/{version_name}/symbol/{symbol_name}/usage")
+@router.get("/version/{version_name}/kconfig/symbol/{symbol_name}/usage")
+def get_kconfig_symbol_usage(
+    version_name: str,
+    symbol_name: str,
+    arch: str = Query(DEFAULT_ARCH),
+    limit: int = Query(400, ge=1, le=2000),
+    toolchain: str | None = Query(None, description="Toolchain profile (JSON) answering Kconfig $(shell,...) calls"),
+) -> dict[str, Any]:
+    """Where CONFIG_<symbol> is used: Kbuild rules, C/ASM/linker sources and Kconfig references."""
+    return kconfig_service.get_symbol_usage(version_name, symbol_name, arch, limit, toolchain)
 
 
 @router.get("/version/{version_name}/kconfig/defconfigs")
@@ -39,7 +69,7 @@ def get_kconfig_symbol(version: str = Query("v3.0"), name: str = Query(None), ve
 def get_defconfigs(
     version_name: str = "v3.0",
     version: str | None = None,
-    arch: str = Query("x86"),
+    arch: str = Query(DEFAULT_ARCH),
 ) -> dict[str, Any]:
     """Retrieve all available defconfigs for an architecture."""
     target_ver = version or version_name
@@ -54,12 +84,13 @@ def get_defconfig_content(
     version: str | None = None,
     defconfig: str | None = None,
     file_path: str | None = None,
-    arch: str = Query("x86"),
+    arch: str = Query(DEFAULT_ARCH),
+    toolchain: str | None = Query(None, description="Toolchain profile (JSON) answering Kconfig $(shell,...) calls"),
 ) -> dict[str, Any]:
-    """Parse defconfig into key-value pairs."""
+    """Raw defconfig text and its literal assignments (empty name: the arch's default defconfig)."""
     target_ver = version or version_name
-    target_p = defconfig or file_path or "x86_64_defconfig"
-    return kconfig_service.get_defconfig_content(target_ver, target_p, arch)
+    target_p = defconfig or file_path or ""
+    return kconfig_service.get_defconfig_content(target_ver, target_p, arch, toolchain=toolchain)
 
 
 @router.get("/kconfig/graph")
@@ -68,16 +99,16 @@ def get_defconfig_content(
 @router.get("/version/{version_name}/kconfig/graph/{symbol_name}")
 def get_kconfig_graph(
     version: str = Query("v3.0"),
-    arch: str = Query("x86"),
+    arch: str = Query(DEFAULT_ARCH),
     version_name: str | None = None,
     symbol: str | None = Query(None),
     symbol_name: str | None = None,
     depth: int = Query(2),
+    toolchain: str | None = Query(None, description="Toolchain profile (JSON) answering Kconfig $(shell,...) calls"),
 ) -> dict[str, Any]:
-    """Extract full architecture dependency graph for client-side engine caching."""
+    """Direct relations of a symbol (own dependencies, selects, implies, selected by)."""
     v = version_name or version
-    sym_or_arch = symbol_name or symbol or arch
-    return kconfig_service.get_graph(v, sym_or_arch, depth)
+    return kconfig_service.get_graph(v, symbol_name or symbol or "", depth, arch, toolchain)
 
 
 @router.post("/kconfig/{version_name}/autosolve")
@@ -86,7 +117,7 @@ def autosolve_kconfig(
     payload: dict[str, Any] = Body(...),
     version_name: str = "v3.0",
 ) -> dict[str, Any]:
-    """Evaluate prerequisite dependency trees and compute minimal symbol toggles."""
+    """Legal user changes that make `target_symbol` reach `value` (default y) from `current_values`."""
     return kconfig_service.autosolve(version_name, payload)
 
 
@@ -95,17 +126,17 @@ def autosolve_kconfig(
 def autosolve_kconfig_get(
     symbol: str,
     version_name: str = "v3.0",
+    arch: str = Query(DEFAULT_ARCH),
 ) -> dict[str, Any]:
-    """Evaluate prerequisite dependency trees and compute minimal symbol toggles for a single symbol."""
-    return kconfig_service.autosolve(version_name, {"target_symbol": symbol})
-
+    """Prerequisite changes for a single symbol starting from an empty (all-default) configuration."""
+    return kconfig_service.autosolve(version_name, {"target_symbol": symbol, "arch": arch})
 
 
 @router.get("/kconfig/{version_name}/presets")
 @router.get("/version/{version_name}/kconfig/presets")
 @router.get("/version/{version_name}/kconfig/env-presets")
 def get_kconfig_presets(version_name: str = "v3.0") -> dict[str, Any]:
-    """Retrieve preconfigured environment target presets (e.g. Tiny, Server, Security)."""
+    """ARCH values accepted by this revision, with their kconfig environment and default defconfig."""
     return kconfig_service.get_env_presets(version_name)
 
 
@@ -115,9 +146,11 @@ def search_kconfig_symbols(
     version_name: str = "v3.0",
     q: str = Query(""),
     limit: int = Query(25),
+    arch: str = Query(DEFAULT_ARCH),
+    toolchain: str | None = Query(None, description="Toolchain profile (JSON) answering Kconfig $(shell,...) calls"),
 ) -> dict[str, Any]:
     """Search Kconfig symbols by name or prompt."""
-    return kconfig_service.search_symbols(version_name, q=q, limit=limit)
+    return kconfig_service.search_symbols(version_name, q=q, limit=limit, arch=arch, toolchain=toolchain)
 
 
 @router.post("/kconfig/{version_name}/import")
@@ -126,7 +159,7 @@ def import_kconfig(
     payload: dict[str, Any] = Body(...),
     version_name: str = "v3.0",
 ) -> dict[str, Any]:
-    """Parse raw configuration text into validated assignments."""
+    """Parse raw configuration text into assignments (with `arch`: unknown/invalid entries reported)."""
     return kconfig_service.import_file(version_name, payload)
 
 
@@ -136,7 +169,7 @@ def export_kconfig(
     payload: dict[str, Any] = Body(...),
     version_name: str = "v3.0",
 ) -> dict[str, Any]:
-    """Format symbol assignments into standard Linux .config syntax."""
+    """Format assignments as .config (with `arch`: resolved by kconfig; `format`: config | defconfig)."""
     return kconfig_service.export_file(version_name, payload)
 
 
@@ -146,7 +179,7 @@ def validate_kconfig(
     payload: dict[str, Any] = Body(...),
     version_name: str = "v3.0",
 ) -> dict[str, Any]:
-    """Check assignments against select/depends constraints (forced, adjusted and conflicting symbols)."""
+    """Resolve assignments through kconfig: forced, adjusted, unknown and unmet-dependency entries."""
     return kconfig_service.validate_assignments(version_name, payload)
 
 

@@ -124,6 +124,7 @@ class KconfigManager:
         self.Old_VID = CS.gp.Old_VID if hasattr(CS, "gp") and hasattr(CS.gp, "Old_VID") else 0
         self.blob_ref = ((m_file.table_id, 0), OP_REF, (REF_ROOT,))
         self.tree_priority = 0
+        self._choice_stack: list[str] = []
         self._extract_all()
 
     def _extract_all(self) -> None:
@@ -265,6 +266,11 @@ class KconfigManager:
             ExprOp.OR: (ASTT.Kconfig_Op_Or, "||"),
             ExprOp.EQUAL: (ASTT.Kconfig_Op_Equal, "="),
             ExprOp.UNEQUAL: (ASTT.Kconfig_Op_Unequal, "!="),
+            # Relational operators (Linux 4.x+) have no dedicated ASTT member: the operator text names the node
+            ExprOp.LESS: (ASTT.Undefined, "<"),
+            ExprOp.LESS_EQUAL: (ASTT.Undefined, "<="),
+            ExprOp.GREATER: (ASTT.Undefined, ">"),
+            ExprOp.GREATER_EQUAL: (ASTT.Undefined, ">="),
         }
         astt_type, expr_name = op_type_map.get(expr.op, (ASTT.Undefined, ""))
 
@@ -300,6 +306,17 @@ class KconfigManager:
                 expr_ast_ref = ((m_ast.table_id, 0), OP_REF, (REF_POS, CS.route[-1]))
 
         return expr_ast_ref
+
+    @staticmethod
+    def _combine_deps(deps: list[KconfigExpr]) -> KconfigExpr | None:
+        """AND together inherited and own 'depends on' expressions (the effective dependency of an entry)."""
+        combined: KconfigExpr | None = None
+        for dep in deps:
+            combined = dep if combined is None else KconfigExpr(
+                op=ExprOp.AND, left=combined, right=dep,
+                line_s=combined.line_s, char_s=combined.char_s, line_e=dep.line_e, char_e=dep.char_e,
+            )
+        return combined
 
     def _extract_mainmenu(self, node: KconfigMainmenu, parent_tree_id: int | Any, parent_dep_exprs: list[KconfigExpr]) -> None:
         CS = self.CS
@@ -395,9 +412,22 @@ class KconfigManager:
                 ))
             rel_priority += 1
 
+        # Choice membership (rel_type=4): target_name is the enclosing choice's name or prompt
+        if self._choice_stack:
+            with CS(REF_POS):
+                CS.store(m_kconfig_relation.set(
+                    None,
+                    kcid_ref,
+                    self._choice_stack[-1][:64],
+                    4,  # choice_member
+                    0,
+                    rel_priority,
+                ))
+            rel_priority += 1
+
         # Tree hierarchy record: node_type: 3=config, 4=menuconfig
         node_type = 4 if cfg.is_menuconfig else 3
-        dep_ast_ref = self._extract_expr_ast(all_deps[0]) if all_deps else 0
+        dep_ast_ref = self._extract_expr_ast(self._combine_deps(all_deps))
         display_title = cfg.prompt or cfg.name
         self.tree_priority += 1
 
@@ -428,7 +458,7 @@ class KconfigManager:
         self._tag_and_map(ast_ref, menu.line_s, menu.line_e, menu.char_s, menu.char_e, menu.raw_code, ast_name=menu.title or "menu", ast_type=ASTT.Kconfig_Menu)
 
         all_deps = list(parent_dep_exprs) + list(menu.depends_on)
-        dep_ast_ref = self._extract_expr_ast(all_deps[0]) if all_deps else 0
+        dep_ast_ref = self._extract_expr_ast(self._combine_deps(all_deps))
         self.tree_priority += 1
 
         # Tree hierarchy for menu (node_type=1)
@@ -464,7 +494,7 @@ class KconfigManager:
         self._tag_and_map(ast_ref, choice.line_s, choice.line_e, choice.char_s, choice.char_e, choice.raw_code, ast_name=choice_title, ast_type=ASTT.Kconfig_Choice)
 
         all_deps = list(parent_dep_exprs) + list(choice.depends_on)
-        dep_ast_ref = self._extract_expr_ast(all_deps[0]) if all_deps else 0
+        dep_ast_ref = self._extract_expr_ast(self._combine_deps(all_deps))
         self.tree_priority += 1
 
         # Tree hierarchy for choice (node_type=2)
@@ -482,7 +512,9 @@ class KconfigManager:
             ))
             current_tree_id = ((m_kconfig_tree.table_id, 0), OP_REF, (REF_POS, CS.route[-1]))
 
+        self._choice_stack.append(choice.name or choice_title)
         self._extract_items(choice.children, parent_tree_id=current_tree_id, parent_dep_exprs=all_deps)
+        self._choice_stack.pop()
 
     def _extract_if(self, if_node: KconfigIf, parent_tree_id: int | Any, parent_dep_exprs: list[KconfigExpr]) -> None:
         CS = self.CS
@@ -514,7 +546,7 @@ class KconfigManager:
         self._tag_and_map(ast_ref, comment.line_s, comment.line_e, comment.char_s, comment.char_e, comment.raw_code, ast_name=comment.title or "comment", ast_type=ASTT.Kconfig_Comment)
 
         all_deps = list(parent_dep_exprs) + list(comment.depends_on)
-        dep_ast_ref = self._extract_expr_ast(all_deps[0]) if all_deps else 0
+        dep_ast_ref = self._extract_expr_ast(self._combine_deps(all_deps))
         self.tree_priority += 1
 
         # Tree hierarchy for comment (node_type=5)

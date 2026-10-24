@@ -1,6 +1,10 @@
 # Linux Kconfig & Kbuild Subsystem API & Architectural Contract Specification (`kconfig_ast`)
 
-Authoritative architectural specification and relational staging reference for `parser/kconfig_ast/` ([kconfig_ast.py](parser/kconfig_ast/kconfig_ast.py), [kconfig_lexer.py](parser/kconfig_ast/kconfig_lexer.py), [kconfig_parser.py](parser/kconfig_ast/kconfig_parser.py)) and the associated build system parser [kbuild_parser.py](parser/kbuild_parser.py). Designed as an exhaustive reference for AI agents extending, maintaining, or querying the Linux kernel configuration and build dependency graph.
+Authoritative architectural specification and relational staging reference for `parser/kconfig_ast/` ([kconfig_ast.py](parser/kconfig_ast/kconfig_ast.py), [kconfig_lexer.py](parser/kconfig_ast/kconfig_lexer.py), [kconfig_parser.py](parser/kconfig_ast/kconfig_parser.py), [kconfig_model.py](parser/kconfig_ast/kconfig_model.py), [kconfig_eval.py](parser/kconfig_ast/kconfig_eval.py)) and the associated build system parser [kbuild_parser.py](parser/kbuild_parser.py). Designed as an exhaustive reference for AI agents extending, maintaining, or querying the Linux kernel configuration and build dependency graph.
+
+Two consumers share the lexer/parser:
+- **Database pipeline** (`kconfig_ast.py`): per-file AST, tags and relational rows (sections 1-4).
+- **Semantic model + evaluator** (`kconfig_model.py`, `kconfig_eval.py`, section 8): a port of `scripts/kconfig` used by the web application's configuration engine. It reproduces the kernel's own `conf` output byte for byte.
 
 ---
 
@@ -107,8 +111,8 @@ Kbuild / Makefile Integration:
 | Table ID | Table Name | Columns | Primary Key | `no_duplicate` | Description |
 | :---: | :--- | :--- | :--- | :---: | :--- |
 | **16** | `m_kconfig_symbol` | `(kcid, name, type, prompt, def_val, help, ast_id)` | `("kcid",)` | `True` | Content-deduplicated Kconfig symbol definitions. Type codes: 1=bool, 2=tristate, 3=string, 4=hex, 5=int, 0=unknown. |
-| **17** | `m_kconfig_relation` | `(rel_id, kcid, target_name, rel_type, cond_ast_id, priority)` | `("rel_id",)` | `True` | Direct dependencies & reverse dependencies. Relation types: `1=depends_on`, `2=select`, `3=imply`, `4=choice_member`. |
-| **18** | `m_kconfig_tree` | `(tree_id, blob_id, parent_id, node_type, title, kcid, priority, dep_ast_id, ast_id)` | `("tree_id",)` | `False` | Hierarchical Menuconfig tree scoped to `blob_id`. Node types: `1=menu`, `2=choice`, `3=config`, `4=menuconfig`, `5=comment`. |
+| **17** | `m_kconfig_relation` | `(rel_id, kcid, target_name, rel_type, cond_ast_id, priority)` | `("rel_id",)` | `True` | Direct dependencies & reverse dependencies. Relation types: `1=depends_on`, `2=select`, `3=imply`, `4=choice_member` (`target_name` = the enclosing choice's name, or its prompt for anonymous choices; also emitted for members nested in `if` blocks). |
+| **18** | `m_kconfig_tree` | `(tree_id, blob_id, parent_id, node_type, title, kcid, priority, dep_ast_id, ast_id)` | `("tree_id",)` | `False` | Hierarchical Menuconfig tree scoped to `blob_id`. Node types: `1=menu`, `2=choice`, `3=config`, `4=menuconfig`, `5=comment`. `dep_ast_id` is the entry's whole effective dependency within the file: the AND of inherited (`menu`/`if`/`choice`) and own `depends on` expressions. |
 | **19** | `m_kconfig_kbuild` | `(kcid, makefile_blob_id, target_fnid, compile_mode, target_obj)` | `("kcid", "makefile_blob_id", "target_fnid", "compile_mode", "target_obj")` | `False` | Compiled file & object mappings scoped to Makefile blobs. Compile modes: `1=built-in` (`y`), `2=module` (`m`), `3=conditional` (`y/m`). |
 
 #### Example: Staging `m_kconfig_relation`
@@ -139,7 +143,18 @@ The parser implements a robust grammar for Linux Kconfig constructs:
 | **`KconfigSource`** | `ASTT.Kconfig_Source`, `ASTT.Kconfig_Rsource`, `ASTT.Kconfig_Osource` | 92, 93, 188 | Dynamic include directives (`source "<PATH>"`, relative `rsource`, optional `osource`) linking child Kconfig files. |
 | **`KconfigComment`** | `ASTT.Kconfig_Comment` | 93 | `comment "<TITLE>"`. Non-configurable section heading displayed in menuconfig. |
 | **`KconfigMainmenu`** | `ASTT.Kconfig_Mainmenu` | 94 | `mainmenu "<TITLE>"`. Root title declaration for kernel configuration. |
-| **`KconfigExpr`** | Multiple | 95–99 | Boolean logic tree: `ASTT.Kconfig_Op_And` (95), `ASTT.Kconfig_Op_Or` (96), `ASTT.Kconfig_Op_Not` (97), `ASTT.Kconfig_Op_Equal` (98), `ASTT.Kconfig_Op_Unequal` (99). |
+| **`KconfigExpr`** | Multiple | 95–99 | Boolean logic tree: `ASTT.Kconfig_Op_And` (95), `ASTT.Kconfig_Op_Or` (96), `ASTT.Kconfig_Op_Not` (97), `ASTT.Kconfig_Op_Equal` (98), `ASTT.Kconfig_Op_Unequal` (99). Relational operators `<`, `<=`, `>`, `>=` (Linux 4.x+) are staged as `ASTT.Undefined` nodes named by the operator text. |
+
+### 3.1. Lexer and Grammar Details
+
+- **Keywords are case-sensitive** (as in `zconf.gperf`): `Bool` or `HELP` are symbol names, not keywords.
+- **Operators**: `&&`, `||`, `!`, `=`, `!=`, `<`, `<=`, `>`, `>=`, parentheses. Precedence: `||` < `&&` < `!` < comparison < primary.
+- **Macro language** (Linux 4.18+): with a `KconfigPreprocessor` (section 8.6), `KconfigLexer` executes `name := value` / `name = value` / `name += value` lines and expands `$(...)` while lexing, exactly where kconfig does: a token containing `$` becomes one `SYMBOL` token (empty results vanish), quoted strings are expanded in place, help texts are not. `iter_tokens()` lexes lazily so a sourced file is read before the rest of its parent (`KconfigParser(on_source=...)` fills `KconfigSource.items`/`resolved_path`). Without a preprocessor (older trees, DB pipeline) a `$(...)` reference is one `MACRO` token parsed as a `CONSTANT` holding the raw text.
+- **Constants vs symbols**: quoted words are `ExprOp.CONSTANT`. Bare words (`y`, `0x1000`, `-1`, `FOO`) are `ExprOp.SYMBOL_REF`; kconfig treats an undefined word as a constant whose value is its own name.
+- **`KconfigConfig` properties**: `sym_type`, `prompt`/`prompt_cond`, `defaults` (value, condition) in source order, `depends_on`, `selects`, `implies`, `ranges` (min/max as expressions, so bounds may name other int/hex symbols), `help_text`, raw `options` plus structured `env` (`option env="X"`), `is_modules` (`option modules` or `modules`), `is_defconfig_list`, `allnoconfig_y`.
+- **Unknown property lines** are skipped whole, so a trailing `if` is never taken for an `if` block.
+- **`KconfigChoice.sym_type`** stays `TYPE_UNKNOWN` when the choice declares no type; kconfig then uses the first typed member's type.
+- **`KconfigMenu.visible_if`**: successive `visible if` lines are ANDed.
 
 ---
 
@@ -194,6 +209,14 @@ The Kbuild parser maps Kconfig configuration symbols to concrete C, ASM, and obj
 
 ---
 
+### 6.3. Conditional Blocks, Goal Lists and Directories
+- `ifeq`/`ifneq`/`ifdef`/`ifndef` blocks are tracked: every binding records the `CONFIG_*` symbols of its enclosing conditions in `KbuildBinding.cond_symbols` (`else` keeps the block's symbols). A rule like `ifeq ($(CONFIG_X86_32),y) obj-y += foo.o` is therefore attributed to `X86_32`.
+- `obj-$(subst m,y,$(CONFIG_X))` is attributed to `X`.
+- `lib-*` (relative to the Makefile) and the arch goal lists `core-*`, `drivers-*`, `libs-*`, `net-*`, `init-*`, `head-*` (relative to the source root) are parsed like `obj-*`.
+- `obj-$(CONFIG_X) += dir/` produces a binding with `is_directory=True` (`source_file_rel` = `dir/Makefile`): the whole sub-directory is built when `X` is enabled.
+
+---
+
 ## 7. Performance Invariants & Architectural Rules
 
 1. **Rule 12 Staging Order**:
@@ -204,3 +227,74 @@ The Kbuild parser maps Kconfig configuration symbols to concrete C, ASM, and obj
    Deep boolean expressions (e.g. chained `A && B && C && D`) are evaluated iteratively to prevent Python `RecursionError` exceptions on complex platform dependencies.
 4. **Zero-Duplication Kbuild Ingestion**:
    `m_kconfig_kbuild` uses primary key `("kcid", "makefile_blob_id", "target_fnid", "compile_mode")` with direct TableEngine caching to prevent redundant insertions across multi-directory Makefiles.
+
+---
+
+## 8. Semantic Model & Evaluator (`kconfig_model.py`, `kconfig_eval.py`)
+
+The web configuration engine needs kconfig's *semantics*, not only its syntax. These two modules port `scripts/kconfig` (`zconf.y` parse actions, `menu.c:menu_finalize`, `symbol.c`, `confdata.c`).
+
+### 8.1. Building a Model
+```python
+from parser.kconfig_ast.kconfig_model import KconfigModelBuilder, KconfigEnv
+builder = KconfigModelBuilder(read_file, KconfigEnv(ARCH="x86_64", SRCARCH="x86", KERNELVERSION="3.0.0"))
+model = builder.build("Kconfig")  # root: top-level Kconfig (arch/$SRCARCH/Kconfig on very old trees)
+```
+`read_file(path) -> str | None` returns a file of the revision being modelled (the web app reads Git objects). The builder:
+1. **Sources** files recursively, expanding `$VAR` from the environment (`source "arch/$SRCARCH/Kconfig"`); `rsource` is relative to the current file, `osource` may be missing. A file may be sourced more than once (each inclusion creates entries); only recursive inclusion is refused.
+2. **Applies parse actions**: one menu entry per `config`/`menuconfig`/`menu`/`choice`/`comment`/`if`; properties are attached to the entry where they are written; `depends on` accumulates in the entry's dependency; `visible if` of every enclosing menu is ANDed into config prompts; every dependency and property condition has `m` rewritten to `m && <modules symbol>` (the symbol with `option modules`, else `MODULES`); `option env="X"` makes the symbol automatic (never written) with the environment value as default.
+3. **Finalizes** (`menu_finalize`): parent dependencies flow into each entry and each of its properties; `select`/`imply` build reverse dependencies (`target.rev_dep |= owner && condition`); `FOO!=n` is rewritten to `FOO` for tristate `FOO` in properties of non-tristate symbols (`expr_trans_bool`); choices take the first typed member's type and collect their members; values of tristate choices that are bool depend on `choice=y`; entries depending on the preceding symbol become its children (implicit submenus); prompt-less entries (`if` blocks) hand their children to their parent; non-optional choices get `rev_dep = prompt && m`.
+
+### 8.2. Model Format
+Expressions are hash-consed into `model["exprs"]` (shared parent dependency chains stay small). Ids index the table, `-1` means "no expression" (always y):
+`["s", name]` (word: y/m/n, defined or undefined symbol), `["c", text]` (quoted constant), `["&", a, b]`, `["|", a, b]`, `["!", a]`, `["=", a, b]`, `["!=", a, b]`, `["<"|"<="|">"|">=", a, b]`.
+
+- `model["symbols"][name]`: `type`, `prompts` (visibility expression of each prompt), `defaults` (`[value, condition]` in kconfig order across all definitions), `ranges`, `selects`/`implies` (`[target, condition]`), `rev_dep`, `implied`, `dir_dep`, `menus` (definition entries), plus `choice` (for choice values), `is_choice`/`optional`/`members` (choices, keyed `<choice-N>` or `<choice:NAME>`), `auto`, `env`.
+- `model["nodes"]`: entries in menu order (pre-order, root first): `tree_id`, `parent_id`, `kind` (`root`/`menu`/`choice`/`config`/`menuconfig`/`comment`/`if`), `node_type`, `symbol_name`, `prompt`, `pvis` (prompt visibility), `vis_if`, `dep`, `file_path`, `line_s`, `line_e`, `has_help`, `children`.
+- `env`, `mainmenu` (expanded), `modules_sym`, `defconfig_list`, `files` (every Kconfig file read), `warnings`.
+- `builder.references[name]`: the direct references made by entries' own properties (`depends_on`, `select`, `imply`, `default`, `prompt_condition`, ...) with file and line. `builder.help_texts()` and `builder.menu_help()` hold the help texts kept out of the model.
+- `compact_model(model)` is the transport form served to the browser (short keys, menu rows as arrays, interned file paths).
+
+### 8.3. Evaluating
+```python
+from parser.kconfig_ast.kconfig_eval import KconfigEvaluator, solve
+ev = KconfigEvaluator(model)
+report = ev.load_config(defconfig_text)   # conf_read: {"unknown", "invalid", "warnings", "unsaved"}
+ev.set_all_new_symbols("default")         # conf_set_all_new_symbols ("yes"/"mod"/"no" = all*config)
+ev.value("SMP"); ev.visibility("SMP"); ev.rev_dep("SMP")
+ev.set_value("NR_CPUS", "8")              # sym_set_string_value: False when kconfig would refuse it
+ev.toggle("EXT4_FS")                       # sym_toggle_tristate_value
+ev.write_config()                          # conf_write: full .config with menu comment blocks
+ev.write_defconfig()                       # conf_write_defconfig: make savedefconfig
+solve(ev, "KVM_INTEL")                     # legal changes reaching the target (Auto-solve)
+```
+Values are computed lazily and memoized until the next change (kconfig's `SYMBOL_VALID`); a symbol read while it is being computed yields its provisional value, as in kconfig. Only legal changes are accepted by the setters: tristate values must lie between the reverse dependency and the prompt visibility, `m` needs modules, choice values are changed by selecting another member, and int/hex values must be valid and inside the active `range`.
+
+`webapp/frontend/js/views/kconfig/kconfig_engine.js` is the client-side twin (same algorithm, same model); keep both in sync.
+
+### 8.4. Fidelity and Limits
+- Verified byte for byte against the real `conf` of Linux v3.0 (x86_64, i386, arm, sparc, mips, powerpc defconfigs, allno/allyes/allmodconfig, savedefconfig), v4.15 (x86_64, arm64, allmodconfig) and v6.8 (x86_64_defconfig with the macro language, once with gcc 13.3.0 + binutils 2.42 and once with clang 18.1.3, reproduced from toolchain profiles). Fixtures and tests: `tests/test_kconfig_engine.py`, `tests/fixtures/kconfig/`. Configurations produced by random sequences of legal edits are fixed points of `conf --oldnoconfig`.
+- `conf` behaviours that changed over time are detected from the revision's own `scripts/kconfig` sources (`model["semantics"]`): `write_on_nonzero_default` (a default evaluating to n no longer writes "is not set"), `menu_end_comments` (`# end of <menu>` lines), `int_hex_zero_default` (int/hex without value are `0`/`0x0`), `tristate_choice_mod_hidden` (m-visible tristate values of a y choice are hidden). `model["config_header"]` holds the header wording of that revision.
+- Toolchain answers come from a profile (section 8.6), not a real compiler: identity-derived answers (versions, `CC_IS_*`, `LD_IS_*`, minimum versions) are exact; feature checks use a table of known first gcc/clang versions, and anything else is assumed to succeed. Every answer is reported with its source so it can be overridden.
+- `dir_dep` uses the modern OR-of-definitions rule (v3.0 kept the last definition's); it only affects `imply` (absent in v3.0) and unmet-dependency warnings.
+- Range bounds are evaluated as 64-bit integers (Linux 4.x+ `strtoll`); v3.0 used 32-bit `int`, which only differs for out-of-range values beyond 2^31.
+
+### 8.5. Architecture Environment Helpers
+- `arch_aliases(top_makefile)`: ARCH values remapped to another SRCARCH (`i386`/`x86_64` -> `x86`, `sparc32`/`sparc64` -> `sparc`, `sh64` -> `sh`, ...).
+- `kernel_version_string(top_makefile)`: `KERNELVERSION` as the top Makefile computes it.
+- `resolve_kbuild_defconfig(arch_makefile, arch, srcarch)`: the `KBUILD_DEFCONFIG` that `make ARCH=<arch> defconfig` loads, evaluating `ifeq`/`ifdef` blocks with ARCH/SRCARCH known, every `CONFIG_*` undefined (no `.config` is read for configuration targets) and `CROSS_COMPILE` set.
+
+### 8.6. Macro Language and Toolchain (`kconfig_preprocess.py`, `kconfig_toolchain.py`)
+Linux 4.18+ Kconfig asks the build environment questions while it is parsed (`scripts/Kconfig.include`: `$(cc-option,...)`, `$(ld-option,...)`, `$(as-instr,...)`, `$(success,...)`, `cc-version.sh`, ...). Pass a preprocessor to the builder when the revision has `scripts/kconfig/preprocess.c`:
+```python
+from parser.kconfig_ast.kconfig_preprocess import KconfigPreprocessor
+from parser.kconfig_ast.kconfig_toolchain import ToolchainProfile, ToolchainShell
+profile = ToolchainProfile.from_dict({"cc": "clang", "cc_version": "18.1.3", "probes": {"cc-option:-fsanitize=kcfi": "n"}}, "6.8.0")
+env = profile.environment("x86_64", "x86", "6.8.0")      # CC, LD, CLANG_FLAGS, CC_VERSION_TEXT, ... + profile.env overrides
+shell = ToolchainShell(profile, env, "x86", read_file)
+pp = KconfigPreprocessor(env, shell); shell.pp = pp       # pp records env_used, shell_calls, messages
+model = KconfigModelBuilder(read_file, KconfigEnv("x86_64", "x86", "6.8.0", extra=env), pp).build("Kconfig")
+```
+- **`KconfigPreprocessor`** (port of `preprocess.c`): simple (`:=`), recursive (`=`) and append (`+=`) variables, `$(1)`... arguments, built-ins `shell`, `info`, `warning-if`, `error-if`, `filename`, `lineno`, then environment variables. `error-if`/`warning-if`/`info` are recorded in `messages` (the real kconfig exits on `error-if`; here parsing continues so the problem can be shown). `env_used` lists every environment variable read.
+- **`ToolchainProfile`**: `cc` (gcc|clang), `cc_version`, `ld` (bfd|lld), `ld_version`, `assembler` (gnu|llvm), `binutils_version`, `cross_compile`, `llvm_utils`, `pahole_version` (`"none"` = not installed), `rustc_version`, `gcc_plugins`, `host_release` (`uname -r`), `env` (overrides of any environment variable) and `probes` (overrides of probe answers). Missing versions default to a toolchain contemporary with the kernel release.
+- **`ToolchainShell`** interprets the shell subset Kconfig uses (`{ }`, `&&`, `||`, `;`, pipes, redirections, `test`, `echo`, `printf`, `set --`, `grep`, `head`, `sed`, `cut`, `command -v`, `env`, `uname`) and classifies external commands into probes keyed for overrides: `cc-option:<flags>`, `ld-option:<flags>`, `as-instr:<instruction>`, `cc-snippet:<code>`, `script:<name> [args]`, `file:<path>`, `cc-print:<file>`, `cmd:<command>`. Version scripts (`cc-version.sh`, `gcc-version.sh`, `clang-version.sh`, `ld-version.sh`, `lld-version.sh`, `as-version.sh`, `pahole-version.sh`, `rustc-version.sh`) print the format of the revision's own script and honour `scripts/min-tool-version.sh`. `probes` maps each key to `{key, kind, label, command, result, source: toolchain|knowledge|assumed|override, note, locations}`.

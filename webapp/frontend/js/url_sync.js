@@ -35,7 +35,7 @@ class UrlSynchronizer {
       const tabType = params.get("tab") || "code";
       const file = params.get("file");
       const line = parseInt(params.get("line") || "1", 10);
-      const arch = params.get("arch") || "x86";
+      const arch = params.get("arch") || "x86_64";
 
       if (v) state.setVersion(v);
 

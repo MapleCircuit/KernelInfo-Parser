@@ -43,12 +43,14 @@ class TokenType(Enum):
     RANGE = auto()
     OPTION = auto()
     OPTIONAL = auto()
+    MODULES = auto()
     HELP = auto()
 
     # Literals & Identifiers
     SYMBOL = auto()
     CONST_STRING = auto()
     NUMBER = auto()
+    MACRO = auto()
     HELP_TEXT = auto()
 
     # Operators & Delimiters
@@ -59,6 +61,10 @@ class TokenType(Enum):
     PIPE_PIPE = auto()
     EQUAL = auto()
     NOT_EQUAL = auto()
+    LESS = auto()
+    LESS_EQUAL = auto()
+    GREATER = auto()
+    GREATER_EQUAL = auto()
 
     # Layout
     NEWLINE = auto()
@@ -108,21 +114,36 @@ KEYWORDS = {
     "range": TokenType.RANGE,
     "option": TokenType.OPTION,
     "optional": TokenType.OPTIONAL,
+    "modules": TokenType.MODULES,
     "help": TokenType.HELP,
     "---help---": TokenType.HELP,
 }
 
 
-class KconfigLexer:
-    """Deterministic, whitespace-aware tokenizer for Linux Kconfig source."""
+_ASSIGN_RE = re.compile(r"^[ \t]*((?:[A-Za-z0-9_-]|\$\([^\n]*?\))+)[ \t]*(:=|\+=|=)(.*)$")
 
-    def __init__(self, text: str) -> None:
+
+class KconfigLexer:
+    """Deterministic, whitespace-aware tokenizer for Linux Kconfig source.
+
+    With a `preprocessor` (Linux 4.18+ macro language, see kconfig_preprocess.py), variable
+    assignments are executed and `$(...)` references expanded while lexing, exactly where kconfig
+    expands them: a token containing `$` becomes one SYMBOL token, quoted strings are expanded in
+    place, help texts are left alone. Use iter_tokens() so expansion follows the parse order.
+    """
+
+    def __init__(self, text: str, preprocessor=None, filename: str = "") -> None:
         self.text = text
         self.lines = text.splitlines(keepends=True)
         self.num_lines = len(self.lines)
+        self.pp = preprocessor
+        self.filename = filename
 
     def tokenize(self) -> list[Token]:
-        tokens: list[Token] = []
+        return list(self.iter_tokens())
+
+    def iter_tokens(self):
+        """Tokens produced lazily, one source line at a time."""
         line_idx = 0
 
         while line_idx < self.num_lines:
@@ -138,35 +159,50 @@ class KconfigLexer:
                 end_line_no = line_idx + 1
 
             # Process line content
+            if self.pp is not None:
+                self.pp.file, self.pp.lineno = self.filename, line_no
+                if self._assignment(combined_line):
+                    yield Token(TokenType.NEWLINE, "\n", line_no, 1, end_line_no, 1)
+                    line_idx += 1
+                    continue
             line_tokens, in_help = self._tokenize_line(combined_line, line_no, end_line_no)
-            tokens.extend(line_tokens)
+            yield from line_tokens
 
             if in_help:
                 # Capture subsequent indented help text
                 help_text, help_start_line, help_end_line, next_line_idx = self._consume_help_block(line_idx + 1)
                 if help_text is not None:
-                    tokens.append(Token(
+                    end_col = len(self.lines[help_end_line - 1]) if help_end_line <= self.num_lines else 1
+                    yield Token(
                         type=TokenType.HELP_TEXT,
                         value=help_text,
                         line=help_start_line,
                         col=1,
                         end_line=help_end_line,
-                        end_col=len(self.lines[help_end_line - 1]) if help_end_line <= self.num_lines else 1,
-                    ))
-                    tokens.append(Token(
+                        end_col=end_col,
+                    )
+                    yield Token(
                         type=TokenType.NEWLINE,
                         value="\n",
                         line=help_end_line,
-                        col=tokens[-1].end_col,
+                        col=end_col,
                         end_line=help_end_line,
-                        end_col=tokens[-1].end_col + 1,
-                    ))
+                        end_col=end_col + 1,
+                    )
                 line_idx = next_line_idx - 1
 
             line_idx += 1
 
-        tokens.append(Token(TokenType.EOF, "", self.num_lines + 1, 1, self.num_lines + 1, 1))
-        return tokens
+        yield Token(TokenType.EOF, "", self.num_lines + 1, 1, self.num_lines + 1, 1)
+
+    def _assignment(self, line: str) -> bool:
+        """`name := value` / `name = value` / `name += value` statements (variable definitions)."""
+        m = _ASSIGN_RE.match(line.rstrip("\r\n"))
+        if not m or KEYWORDS.get(m.group(1)) is not None:
+            return False
+        name = self.pp.expand_string(m.group(1)) if "$" in m.group(1) else m.group(1)
+        self.pp.add_variable(name, m.group(3).lstrip(" \t"), m.group(2))
+        return True
 
     def _tokenize_line(self, line_text: str, line_no: int, end_line_no: int) -> tuple[list[Token], bool]:
         tokens: list[Token] = []
@@ -200,6 +236,10 @@ class KconfigLexer:
                 idx += 1
                 str_buf = []
                 while idx < n and line_text[idx] != quote_char:
+                    if self.pp is not None and line_text[idx] == "$":
+                        value, idx = self.pp.expand_dollar(line_text, idx + 1)
+                        str_buf.append(value)
+                        continue
                     if line_text[idx] == "\\" and idx + 1 < n:
                         idx += 1
                         str_buf.append(line_text[idx])
@@ -231,9 +271,53 @@ class KconfigLexer:
                 tokens.append(Token(TokenType.NOT_EQUAL, "!=", line_no, idx + 1, end_line_no, idx + 2))
                 idx += 2
                 continue
+            if line_text.startswith("<=", idx):
+                tokens.append(Token(TokenType.LESS_EQUAL, "<=", line_no, idx + 1, end_line_no, idx + 2))
+                idx += 2
+                continue
+            if line_text.startswith(">=", idx):
+                tokens.append(Token(TokenType.GREATER_EQUAL, ">=", line_no, idx + 1, end_line_no, idx + 2))
+                idx += 2
+                continue
+            if ch == "<":
+                tokens.append(Token(TokenType.LESS, "<", line_no, idx + 1, end_line_no, idx + 1))
+                idx += 1
+                continue
+            if ch == ">":
+                tokens.append(Token(TokenType.GREATER, ">", line_no, idx + 1, end_line_no, idx + 1))
+                idx += 1
+                continue
             if ch == "=":
                 tokens.append(Token(TokenType.EQUAL, "=", line_no, idx + 1, end_line_no, idx + 1))
                 idx += 1
+                continue
+            # Linux 4.18+ token with references: expanded into one word (empty results vanish)
+            if self.pp is not None and re.match(r"[A-Za-z0-9_\-$]*\$", line_text[idx:]):
+                start_col = idx + 1
+                value, consumed = self.pp.expand_one_token(line_text[idx:].rstrip("\r\n"))
+                idx += max(consumed, 1)
+                if value:
+                    tokens.append(Token(TokenType.SYMBOL, value, line_no, start_col, end_line_no, idx))
+                continue
+
+            # Macro reference without a preprocessor (old trees): kept verbatim, never evaluated
+            if line_text.startswith("$(", idx):
+                start_col = idx + 1
+                depth = 0
+                end = idx
+                while end < n:
+                    if line_text[end] == "(":
+                        depth += 1
+                    elif line_text[end] == ")":
+                        depth -= 1
+                        if depth == 0:
+                            end += 1
+                            break
+                    elif line_text[end] == "\n":
+                        break
+                    end += 1
+                tokens.append(Token(TokenType.MACRO, line_text[idx:end], line_no, start_col, end_line_no, end))
+                idx = end
                 continue
             if ch == "!":
                 tokens.append(Token(TokenType.EXCLAMATION, "!", line_no, idx + 1, end_line_no, idx + 1))
@@ -262,8 +346,8 @@ class KconfigLexer:
             if m:
                 val = m.group(0)
                 idx += len(val)
-                lower_val = val.lower()
-                tok_type = KEYWORDS.get(lower_val, TokenType.SYMBOL)
+                # Keywords are case-sensitive in kconfig (zconf.gperf uses strncmp)
+                tok_type = KEYWORDS.get(val, TokenType.SYMBOL)
                 if tok_type == TokenType.HELP:
                     saw_help = True
                 tokens.append(Token(tok_type, val, line_no, start_col, end_line_no, idx))

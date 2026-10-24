@@ -233,20 +233,20 @@ class ApiClient {
     return this.request(`/api/symbols/${encodeURIComponent(ver)}/history?${params.toString()}`);
   }
 
-  async searchKconfig(version, query, limit = 25) {
+  async searchKconfig(version, query, limit = 25, arch = "x86_64") {
     const ver = this._sanitizeVer(version);
-    const q = new URLSearchParams({ q: query, limit }).toString();
+    const q = new URLSearchParams({ q: query, limit, arch }).toString();
     return this.request(`/api/kconfig/${encodeURIComponent(ver)}/search?${q}`);
   }
 
-  async importKconfig(version, content) {
+  async importKconfig(version, content, arch = null) {
     const ver = this._sanitizeVer(version);
-    return this.request(`/api/kconfig/${encodeURIComponent(ver)}/import`, { method: "POST", body: JSON.stringify({ content }) });
+    return this.request(`/api/kconfig/${encodeURIComponent(ver)}/import`, { method: "POST", body: JSON.stringify({ content, ...(arch ? { arch } : {}) }) });
   }
 
-  async validateKconfig(version, symbols) {
+  async validateKconfig(version, symbols, arch = null) {
     const ver = this._sanitizeVer(version);
-    return this.request(`/api/kconfig/${encodeURIComponent(ver)}/validate`, { method: "POST", body: JSON.stringify({ symbols }) });
+    return this.request(`/api/kconfig/${encodeURIComponent(ver)}/validate`, { method: "POST", body: JSON.stringify({ symbols, ...(arch ? { arch } : {}) }) });
   }
 
   async diffKconfigConfigs(version, activeConfig, customConfig) {
@@ -347,27 +347,57 @@ class ApiClient {
   }
 
   // --- KConfig ---
-  async getKconfigTree(version, arch = "x86") {
-    const ver = this._sanitizeVer(version);
-    const q = new URLSearchParams({ arch }).toString();
-    return this.request(`/api/kconfig/${encodeURIComponent(ver)}/tree?${q}`, {}, "kconfigs", `ktree_${ver}_${arch}`);
+  /** Query parameters + cache-key suffix for an optional Kconfig toolchain profile. */
+  _toolchainParams(params, toolchain) {
+    const json = toolchain && Object.keys(toolchain).length ? JSON.stringify(toolchain) : "";
+    if (json) params.set("toolchain", json);
+    let h = 0;
+    for (let i = 0; i < json.length; i++) h = (h * 31 + json.charCodeAt(i)) | 0;
+    return json ? `_tc${(h >>> 0).toString(36)}` : "";
   }
 
-  async getKconfigDefconfigs(version, arch = "x86") {
+  /** Finalized Kconfig model for one ARCH value and toolchain (format 2: decoded by kconfig_engine.js). */
+  async getKconfigTree(version, arch = "x86_64", toolchain = null) {
+    const ver = this._sanitizeVer(version);
+    const params = new URLSearchParams({ arch });
+    const suffix = this._toolchainParams(params, toolchain);
+    return this.request(`/api/kconfig/${encodeURIComponent(ver)}/tree?${params}`, {}, "kconfigs", `kmodel3_${ver}_${arch}${suffix}`);
+  }
+
+  /** Default gcc/clang toolchain profiles of a revision (and whether its Kconfig has $(...) macros). */
+  async getKconfigToolchainDefaults(version, arch = "x86_64") {
+    const ver = this._sanitizeVer(version);
+    const q = new URLSearchParams({ arch }).toString();
+    return this.request(`/api/kconfig/${encodeURIComponent(ver)}/toolchain?${q}`, {}, "kconfigs", `ktoolchain_${ver}_${arch}`);
+  }
+
+  async getKconfigDefconfigs(version, arch = "x86_64") {
     const ver = this._sanitizeVer(version);
     const q = new URLSearchParams({ arch }).toString();
     return this.request(`/api/kconfig/${encodeURIComponent(ver)}/defconfigs?${q}`, {}, "kconfigs", `defconfigs_${ver}_${arch}`);
   }
 
-  async getKconfigDefconfigContent(version, filePath) {
+  /** Defconfig text (empty filePath: the arch's default, i.e. what `make ARCH=<arch> defconfig` loads). */
+  async getKconfigDefconfigContent(version, filePath, arch = "x86_64", toolchain = null) {
     const ver = this._sanitizeVer(version);
-    const q = new URLSearchParams({ file_path: filePath }).toString();
-    return this.request(`/api/kconfig/${encodeURIComponent(ver)}/defconfig?${q}`, {}, "kconfigs", `defconfig_content_${ver}_${filePath}`);
+    const params = new URLSearchParams({ file_path: filePath || "", arch });
+    const suffix = this._toolchainParams(params, toolchain);
+    return this.request(`/api/kconfig/${encodeURIComponent(ver)}/defconfig?${params}`, {}, "kconfigs", `defconfig3_${ver}_${arch}_${filePath || "default"}${suffix}`);
   }
 
-  async getKconfigSymbol(version, symbolName) {
+  async getKconfigSymbol(version, symbolName, arch = "x86_64", toolchain = null) {
     const ver = this._sanitizeVer(version);
-    return this.request(`/api/kconfig/${encodeURIComponent(ver)}/symbol/${encodeURIComponent(symbolName)}`, {}, "kconfigs", `ksym_${ver}_${symbolName}`);
+    const params = new URLSearchParams({ arch });
+    const suffix = this._toolchainParams(params, toolchain);
+    return this.request(`/api/kconfig/${encodeURIComponent(ver)}/symbol/${encodeURIComponent(symbolName)}?${params}`, {}, "kconfigs", `ksym3_${ver}_${arch}_${symbolName}${suffix}`);
+  }
+
+  /** Kbuild rules, source references and Kconfig references of CONFIG_<symbolName>. */
+  async getKconfigUsage(version, symbolName, arch = "x86_64", toolchain = null) {
+    const ver = this._sanitizeVer(version);
+    const params = new URLSearchParams({ arch });
+    const suffix = this._toolchainParams(params, toolchain);
+    return this.request(`/api/kconfig/${encodeURIComponent(ver)}/symbol/${encodeURIComponent(symbolName)}/usage?${params}`, {}, "kconfigs", `kusage2_${ver}_${arch}_${symbolName}${suffix}`);
   }
 
   async autosolveKconfig(version, payload) {
@@ -380,14 +410,15 @@ class ApiClient {
 
   async getKconfigPresets(version) {
     const ver = this._sanitizeVer(version);
-    return this.request(`/api/kconfig/${encodeURIComponent(ver)}/presets`, {}, "kconfigs", `presets_${ver}`);
+    return this.request(`/api/kconfig/${encodeURIComponent(ver)}/presets`, {}, "kconfigs", `presets2_${ver}`);
   }
 
-  async getKconfigGraph(version, arch = "x86", symbol = null, depth = 2) {
+  async getKconfigGraph(version, arch = "x86_64", symbol = null, depth = 2, toolchain = null) {
     const ver = this._sanitizeVer(version);
     const params = new URLSearchParams({ arch, depth });
     if (symbol) params.set("symbol", symbol);
-    return this.request(`/api/kconfig/${encodeURIComponent(ver)}/graph?${params.toString()}`, {}, "kconfigs", `kgraph_${ver}_${arch}_${symbol || 'all'}_${depth}`);
+    const suffix = this._toolchainParams(params, toolchain);
+    return this.request(`/api/kconfig/${encodeURIComponent(ver)}/graph?${params.toString()}`, {}, "kconfigs", `kgraph3_${ver}_${arch}_${symbol || 'all'}_${depth}${suffix}`);
   }
 
   // --- Maintainers ---

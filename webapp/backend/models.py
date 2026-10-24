@@ -7,6 +7,9 @@ from pydantic import BaseModel, Field
 class AutoSolveRequest(BaseModel):
     target_symbol: str = Field(..., description="Target Kconfig symbol name to enable")
     current_values: dict[str, str] = Field(default_factory=dict, description="Active symbol values")
+    arch: str | None = Field(default=None, description="ARCH value whose Kconfig model is used (default x86_64)")
+    value: str | None = Field(default=None, description="Value to reach: 'y' (default) or 'm'")
+    toolchain: dict[str, Any] | None = Field(default=None, description="Toolchain profile answering Kconfig $(shell,...) calls")
 
 
 class DiffConfigRequest(BaseModel):

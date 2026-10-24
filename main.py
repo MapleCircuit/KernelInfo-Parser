@@ -2357,6 +2357,7 @@ def arg_handling() -> argparse.Namespace:
             "tests.test_tree_resolver",
             "tests.test_te_db_integrity",
             "tests.test_kconfig_ast",
+            "tests.test_kconfig_engine",
             "tests.test_webapp_defconfig",
             "tests.test_webapp_maintainer",
             "tests.test_raw_ast",

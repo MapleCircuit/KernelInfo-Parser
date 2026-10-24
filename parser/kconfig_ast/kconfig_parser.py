@@ -18,6 +18,20 @@ class ExprOp(Enum):
     OR = auto()
     EQUAL = auto()
     UNEQUAL = auto()
+    LESS = auto()
+    LESS_EQUAL = auto()
+    GREATER = auto()
+    GREATER_EQUAL = auto()
+
+
+RELATIONAL_TEXT = {
+    ExprOp.EQUAL: "=",
+    ExprOp.UNEQUAL: "!=",
+    ExprOp.LESS: "<",
+    ExprOp.LESS_EQUAL: "<=",
+    ExprOp.GREATER: ">",
+    ExprOp.GREATER_EQUAL: ">=",
+}
 
 
 @dataclass
@@ -46,14 +60,10 @@ class KconfigExpr:
             l_str = self.left.to_string() if self.left else ""
             r_str = self.right.to_string() if self.right else ""
             return f"({l_str} || {r_str})"
-        elif self.op == ExprOp.EQUAL:
+        elif self.op in RELATIONAL_TEXT:
             l_str = self.left.to_string() if self.left else ""
             r_str = self.right.to_string() if self.right else ""
-            return f"{l_str} = {r_str}"
-        elif self.op == ExprOp.UNEQUAL:
-            l_str = self.left.to_string() if self.left else ""
-            r_str = self.right.to_string() if self.right else ""
-            return f"{l_str} != {r_str}"
+            return f"{l_str} {RELATIONAL_TEXT[self.op]} {r_str}"
         return ""
 
     def collect_symbols(self) -> list[str]:
@@ -87,9 +97,14 @@ class KconfigConfig:
     depends_on: list[KconfigExpr] = field(default_factory=list)
     selects: list[tuple[str, KconfigExpr | None]] = field(default_factory=list)
     implies: list[tuple[str, KconfigExpr | None]] = field(default_factory=list)
-    ranges: list[tuple[str, str, KconfigExpr | None]] = field(default_factory=list)
+    # (min, max, condition): bounds are SYMBOL_REF (word, may name another int/hex symbol) or CONSTANT (quoted)
+    ranges: list[tuple[KconfigExpr, KconfigExpr, KconfigExpr | None]] = field(default_factory=list)
     help_text: str = ""
     options: list[str] = field(default_factory=list)
+    env: str | None = None  # option env="VAR"
+    is_modules: bool = False  # option modules / modules
+    is_defconfig_list: bool = False  # option defconfig_list
+    allnoconfig_y: bool = False  # option allnoconfig_y
     line_s: int = 0
     char_s: int = 0
     line_e: int = 0
@@ -115,7 +130,7 @@ class KconfigMenu:
 @dataclass
 class KconfigChoice:
     name: str | None = None
-    sym_type: int = TYPE_BOOL
+    sym_type: int = TYPE_UNKNOWN  # unset: kconfig takes the first typed member's type
     prompt: str = ""
     prompt_cond: KconfigExpr | None = None
     is_optional: bool = False
@@ -162,6 +177,9 @@ class KconfigSource:
     line_e: int = 0
     char_e: int = 0
     raw_code: str = ""
+    # Items of the sourced file when the parser was given an `on_source` callback (parsed in place)
+    items: list[Any] | None = None
+    resolved_path: str = ""
 
 
 @dataclass
@@ -174,31 +192,59 @@ class KconfigMainmenu:
     raw_code: str = ""
 
 
-class KconfigParser:
-    """Parses Kconfig token stream into structured syntax tree."""
+class _TokenBuffer:
+    """Index access over a token iterator, pulling tokens only when the parser needs them."""
 
-    def __init__(self, tokens: list[Token], raw_text: str = "") -> None:
-        self.tokens = tokens
+    def __init__(self, tokens) -> None:
+        self._it = iter(tokens)
+        self._buf: list[Token] = []
+        self._done = False
+
+    def get(self, idx: int) -> Token:
+        while len(self._buf) <= idx and not self._done:
+            tok = next(self._it, None)
+            if tok is None:
+                self._done = True
+            else:
+                self._buf.append(tok)
+        return self._buf[idx] if idx < len(self._buf) else self._buf[-1]
+
+    def has(self, idx: int) -> bool:
+        self.get(idx)
+        return idx < len(self._buf)
+
+
+class KconfigParser:
+    """Parses Kconfig token stream into structured syntax tree.
+
+    `tokens` may be a list or a lazy iterator (KconfigLexer.iter_tokens). With `on_source`, every
+    `source` statement is handed to the callback as soon as it is read and the returned items are
+    stored in KconfigSource.items: the sourced file is then lexed before the rest of this one, which
+    is the order the Kconfig macro language expects (variables defined in a sourced file are
+    visible to the lines after the `source`).
+    """
+
+    def __init__(self, tokens, raw_text: str = "", on_source=None) -> None:
+        self.tokens = _TokenBuffer(tokens)
         self.pos = 0
         self.raw_text = raw_text
         self.raw_lines = raw_text.splitlines(keepends=True) if raw_text else []
+        self.on_source = on_source
 
     def _current(self) -> Token:
-        if self.pos < len(self.tokens):
-            return self.tokens[self.pos]
-        return self.tokens[-1]
+        return self.tokens.get(self.pos)
 
     def _peek(self, offset: int = 1) -> Token:
-        idx = self.pos + offset
-        if idx < len(self.tokens):
-            return self.tokens[idx]
-        return self.tokens[-1]
+        return self.tokens.get(self.pos + offset)
 
     def _advance(self) -> Token:
         tok = self._current()
-        if self.pos < len(self.tokens):
+        if self.tokens.has(self.pos):
             self.pos += 1
         return tok
+
+    def _previous(self) -> Token:
+        return self.tokens.get(self.pos - 1)
 
     def _match(self, *types: TokenType) -> bool:
         if self._current().type in types:
@@ -216,6 +262,11 @@ class KconfigParser:
     def _skip_newlines(self) -> None:
         while self._current().type == TokenType.NEWLINE:
             self._advance()
+
+    def _skip_line(self) -> None:
+        while self._current().type not in (TokenType.NEWLINE, TokenType.EOF):
+            self._advance()
+        self._skip_newlines()
 
     def _extract_raw(self, line_s: int, line_e: int) -> str:
         if not self.raw_lines or line_s <= 0:
@@ -341,13 +392,17 @@ class KconfigParser:
                 self._parse_range(cfg)
             elif prop_tok.type == TokenType.OPTION:
                 self._parse_option(cfg)
+            elif prop_tok.type == TokenType.MODULES:
+                cfg.is_modules = True
+                self._skip_line()
             elif prop_tok.type == TokenType.HELP:
                 self._parse_help(cfg)
             else:
-                self._advance()
+                # Unknown property: drop the whole line so a trailing 'if' is not mistaken for a block
+                self._skip_line()
 
-            last_line = self.tokens[self.pos - 1].end_line if self.pos > 0 else last_line
-            last_col = self.tokens[self.pos - 1].end_col if self.pos > 0 else last_col
+            last_line = self._previous().end_line if self.pos > 0 else last_line
+            last_col = self._previous().end_col if self.pos > 0 else last_col
             self._skip_newlines()
 
         cfg.line_e = last_line
@@ -428,21 +483,33 @@ class KconfigParser:
 
     def _parse_range(self, cfg: KconfigConfig) -> None:
         self._advance()  # 'range'
-        min_val = self._advance().value if self._current().type in (TokenType.SYMBOL, TokenType.NUMBER, TokenType.CONST_STRING) else ""
-        max_val = self._advance().value if self._current().type in (TokenType.SYMBOL, TokenType.NUMBER, TokenType.CONST_STRING) else ""
+        min_val = self._parse_primary_expr()
+        max_val = self._parse_primary_expr()
         cond = None
         if self._current().type == TokenType.IF:
             self._advance()
             cond = self._parse_expr()
-        if min_val and max_val:
+        if min_val is not None and max_val is not None:
             cfg.ranges.append((min_val, max_val, cond))
-        self._skip_newlines()
+        self._skip_line()
 
     def _parse_option(self, cfg: KconfigConfig) -> None:
         self._advance()  # 'option'
         opt_str = []
         while self._current().type not in (TokenType.NEWLINE, TokenType.EOF):
-            opt_str.append(self._advance().value)
+            tok = self._advance()
+            opt_str.append(tok.value)
+            if tok.value == "env" and self._current().type == TokenType.EQUAL:
+                opt_str.append(self._advance().value)
+                if self._current().type in (TokenType.CONST_STRING, TokenType.SYMBOL):
+                    cfg.env = self._advance().value
+                    opt_str.append(cfg.env)
+            elif tok.value == "defconfig_list":
+                cfg.is_defconfig_list = True
+            elif tok.value == "modules":
+                cfg.is_modules = True
+            elif tok.value == "allnoconfig_y":
+                cfg.allnoconfig_y = True
         cfg.options.append(" ".join(opt_str))
         self._skip_newlines()
 
@@ -475,7 +542,14 @@ class KconfigParser:
                 self._advance()
                 if self._current().type == TokenType.IF:
                     self._advance()
-                    menu.visible_if = self._parse_expr()
+                    vis = self._parse_expr()
+                    if vis is not None:
+                        # Successive 'visible if' lines are ANDed (menu_add_visibility)
+                        menu.visible_if = vis if menu.visible_if is None else KconfigExpr(
+                            op=ExprOp.AND, left=menu.visible_if, right=vis,
+                            line_s=menu.visible_if.line_s, char_s=menu.visible_if.char_s,
+                            line_e=vis.line_e, char_e=vis.char_e,
+                        )
                 self._skip_newlines()
             elif cur.type == TokenType.HELP:
                 self._parse_help(menu)
@@ -605,7 +679,7 @@ class KconfigParser:
             self._parse_depends_on(comment.depends_on)
             self._skip_newlines()
 
-        last_tok = self.tokens[self.pos - 1] if self.pos > 0 else start_tok
+        last_tok = self._previous() if self.pos > 0 else start_tok
         comment.line_e = last_tok.end_line
         comment.char_e = last_tok.end_col
         comment.raw_code = self._extract_raw(comment.line_s, comment.line_e)
@@ -616,9 +690,7 @@ class KconfigParser:
         path_str = ""
         if self._current().type in (TokenType.CONST_STRING, TokenType.SYMBOL):
             path_str = self._advance().value
-        self._skip_newlines()
-
-        return KconfigSource(
+        src = KconfigSource(
             path=path_str,
             is_rsource=is_rsource,
             is_osource=is_osource,
@@ -628,6 +700,11 @@ class KconfigParser:
             char_e=start_tok.end_col,
             raw_code=self._extract_raw(start_tok.line, start_tok.end_line),
         )
+        if self.on_source is not None:
+            # Before the next line is lexed (it may use variables the sourced file defines)
+            src.items = self.on_source(src)
+        self._skip_newlines()
+        return src
 
     # -------------------------------------------------------------------------
     # Expression Parsing with Precedence Climbing:
@@ -689,12 +766,21 @@ class KconfigParser:
                 )
         return self._parse_relational_expr()
 
+    _RELATIONAL_TOKENS = {
+        TokenType.EQUAL: ExprOp.EQUAL,
+        TokenType.NOT_EQUAL: ExprOp.UNEQUAL,
+        TokenType.LESS: ExprOp.LESS,
+        TokenType.LESS_EQUAL: ExprOp.LESS_EQUAL,
+        TokenType.GREATER: ExprOp.GREATER,
+        TokenType.GREATER_EQUAL: ExprOp.GREATER_EQUAL,
+    }
+
     def _parse_relational_expr(self) -> KconfigExpr | None:
         left = self._parse_primary_expr()
-        if self._current().type in (TokenType.EQUAL, TokenType.NOT_EQUAL):
+        if self._current().type in self._RELATIONAL_TOKENS:
             op_tok = self._advance()
             right = self._parse_primary_expr()
-            op = ExprOp.EQUAL if op_tok.type == TokenType.EQUAL else ExprOp.UNEQUAL
+            op = self._RELATIONAL_TOKENS[op_tok.type]
             if left and right:
                 return KconfigExpr(
                     op=op,
@@ -714,7 +800,8 @@ class KconfigParser:
             expr = self._parse_expr()
             self._match(TokenType.RPAREN)
             return expr
-        elif cur.type == TokenType.CONST_STRING:
+        elif cur.type in (TokenType.CONST_STRING, TokenType.MACRO):
+            # A $(macro) reference is kept verbatim as a constant: it is never expanded here
             tok = self._advance()
             return KconfigExpr(
                 op=ExprOp.CONSTANT,

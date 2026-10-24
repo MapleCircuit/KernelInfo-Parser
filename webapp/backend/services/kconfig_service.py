@@ -1,844 +1,873 @@
-"""webapp/backend/services/kconfig_service.py - KConfig Architecture Defconfigs & Dependency Resolver."""
+"""webapp/backend/services/kconfig_service.py - Kconfig models, defconfigs, symbol provenance and usage.
+
+Everything is read from the Git objects of the requested revision (never the work tree), so any
+version can be configured regardless of what is checked out. The configuration model is built by
+parser/kconfig_ast/kconfig_model.py (a port of scripts/kconfig parsing + menu_finalize) and
+evaluated by parser/kconfig_ast/kconfig_eval.py, which reproduces `make <defconfig>`,
+`make all{no,yes,mod}config` and `make savedefconfig` byte for byte.
+
+An architecture is identified by its ARCH value (x86_64, i386, x86, arm, sparc64, ...): ARCH and
+SRCARCH are what kconfig sees through `option env=`, and the same symbol name can be declared in
+different files (and with different dependencies) per architecture, e.g. 64BIT.
+"""
 from __future__ import annotations
-import os
-import subprocess
+
+import hashlib
+import json
 import logging
-from webapp.backend.config import RepoScopedCache, get_repo_dir
+import os
+import re
+import subprocess
+import threading
 from typing import Any
+
 from fastapi import HTTPException
+
+from parser.kbuild_parser import KbuildParser
+from parser.kconfig_ast.kconfig_eval import KconfigEvaluator, escape_string, solve
+from parser.kconfig_ast.kconfig_preprocess import KconfigPreprocessor
+from parser.kconfig_ast.kconfig_toolchain import ToolchainProfile, ToolchainShell
+from parser.kconfig_ast.kconfig_model import (
+    KconfigEnv,
+    KconfigModelBuilder,
+    arch_aliases,
+    compact_model,
+    kernel_version_string,
+    resolve_kbuild_defconfig,
+)
+from webapp.backend.config import RepoScopedCache, get_active_repo_name, get_repo_dir
+from webapp.backend.database.helpers import get_version_info, safe_decode
 from webapp.backend.database.pool import get_db_cursor
-from webapp.backend.database.helpers import (
-    safe_decode,
-    get_version_info,
-)
-from webapp.backend.security.jail import resolve_and_verify_repo_path
-from parser.kconfig_ast.kconfig_lexer import KconfigLexer
-from parser.kconfig_ast.kconfig_parser import (
-    KconfigParser,
-    KconfigSource,
-    KconfigMenu,
-    KconfigConfig,
-    KconfigIf,
-    KconfigChoice,
-    KconfigComment,
-    TYPE_BOOL,
-    TYPE_TRISTATE,
-    TYPE_STRING,
-    TYPE_HEX,
-    TYPE_INT,
-)
+from webapp.backend.services.git_reader import git_reader
 
 logger = logging.getLogger(__name__)
 
-_DEFCONFIG_CACHE: dict[tuple[str, str, str], dict[str, Any]] = RepoScopedCache()
-_TREE_CACHE: dict[tuple[str, str], dict[str, Any]] = RepoScopedCache()
+DEFAULT_ARCH = "x86_64"
+TYPE_CODES = {"bool": 1, "tristate": 2, "string": 3, "hex": 4, "int": 5}
+# Spellings older clients used for the same ARCH values
+_ARCH_SYNONYMS = {"aarch64": "arm64", "arm32": "arm", "ppc": "powerpc", "x86_32": "i386", "amd64": "x86_64"}
+_MODEL_CACHE_SIZE = 6
+_USAGE_LIMIT = 400
+
+
+class _ModelEntry:
+    """A built model plus server-side extras (help texts, reverse indexes, expression printer)."""
+
+    def __init__(self, builder: KconfigModelBuilder, model: dict[str, Any], arch: dict[str, Any]) -> None:
+        self.builder = builder
+        self.model = model
+        self.arch = arch
+        self.compact = compact_model(model)
+        self.help = builder.help_texts()
+        self.menu_help = builder.menu_help()
+        self.selected_by: dict[str, list[tuple[str, int]]] = {}
+        self.implied_by: dict[str, list[tuple[str, int]]] = {}
+        # Symbols named by each entry's own `depends on` lines (not inherited from menus/ifs)
+        self.own_depends: dict[str, list[str]] = {}
+        for target, refs in builder.references.items():
+            for by in {r["by"] for r in refs if r["kind"] == "depends_on"}:
+                self.own_depends.setdefault(by, []).append(target)
+        for deps in self.own_depends.values():
+            deps.sort()
+        for name, sym in model["symbols"].items():
+            for target, vis in sym["selects"]:
+                self.selected_by.setdefault(target, []).append((name, vis))
+            for target, vis in sym["implies"]:
+                self.implied_by.setdefault(target, []).append((name, vis))
+
+    def expr(self, eid: int) -> str:
+        return self.builder.exprs.to_string(None if eid < 0 else eid)
+
+    def evaluator(self) -> KconfigEvaluator:
+        return KconfigEvaluator(self.model)
+
+
+_MODELS: "RepoScopedCache" = RepoScopedCache()
+_MODEL_LOCK = threading.Lock()
+_LISTING_CACHE: "RepoScopedCache" = RepoScopedCache()
+_USAGE_CACHE: "RepoScopedCache" = RepoScopedCache()
 
 
 class KconfigService:
-    """Service providing defconfig discovery, content parsing, and KConfig dependency graph access."""
+    """Kconfig configuration models, defconfigs, symbol details, usage and constraint services."""
+
+    # ------------------------------------------------------------------ git access
+    @staticmethod
+    def _rev(version_name: str) -> str:
+        """Git revision for a version name (numeric ids are resolved through the database)."""
+        ver = str(version_name or "v3.0").strip()
+        if ver.isdigit():
+            try:
+                with get_db_cursor() as cursor:
+                    _, vname = get_version_info(cursor, ver)
+                    return vname or ver
+            except Exception as exc:
+                logger.debug("Version id %s not resolvable: %s", ver, exc)
+        return ver
 
     @staticmethod
-    def normalize_arch(arch: str) -> tuple[str, str, int]:
-        """Normalize architecture string to canonical arch name, directory, and bit width."""
-        arch_norm = (arch or "x86").lower().strip()
-        bits = 64 if ("64" in arch_norm or "aarch64" in arch_norm) else 32
+    def _read(rev: str, path: str) -> str | None:
+        try:
+            raw, is_dir, _ = git_reader.read_file(rev, path)
+        except Exception as exc:
+            logger.debug("git read %s:%s failed: %s", rev, path, exc)
+            return None
+        if raw is None or is_dir:
+            return None
+        return raw.decode("utf-8", errors="replace")
 
-        if arch_norm in ("x86_64", "i386", "x86_32", "x86"):
-            arch_dir = "x86"
-            arch_canon = "x86_64" if bits == 64 else "i386"
-        elif arch_norm in ("arm64", "aarch64"):
-            arch_dir = "arm64"
-            arch_canon = "arm64"
-            bits = 64
-        elif arch_norm in ("arm", "arm32"):
-            arch_dir = "arm"
-            arch_canon = "arm"
-            bits = 32
-        elif arch_norm.startswith("powerpc") or arch_norm == "ppc":
-            arch_dir = "powerpc"
-            arch_canon = "ppc64" if bits == 64 else "ppc32"
-        elif arch_norm.startswith("mips"):
-            arch_dir = "mips"
-            arch_canon = "mips64" if bits == 64 else "mips"
-        elif arch_norm.startswith("riscv"):
-            arch_dir = "riscv"
-            arch_canon = "riscv64" if bits == 64 else "riscv32"
-        else:
-            arch_dir = arch_norm
-            arch_canon = arch_norm
+    @staticmethod
+    def _git(args: list[str], timeout: float = 20.0) -> str:
+        try:
+            proc = subprocess.run(["git", *args], cwd=str(get_repo_dir()), capture_output=True, text=True, timeout=timeout)
+        except Exception as exc:
+            logger.debug("git %s failed: %s", args[:2], exc)
+            return ""
+        return proc.stdout if proc.returncode in (0, 1) else ""
 
-        return arch_canon, arch_dir, bits
+    def _tree_listing(self, rev: str, path: str, recursive: bool = False) -> list[str]:
+        key = ("ls", rev, path, recursive)
+        if key not in _LISTING_CACHE:
+            args = ["ls-tree", "--name-only"] + (["-r"] if recursive else [])
+            out = self._git(args + ([f"{rev}:{path}"] if path else [rev]))
+            _LISTING_CACHE[key] = [line.strip() for line in out.splitlines() if line.strip()]
+        return _LISTING_CACHE[key]
 
-    def get_defconfigs(self, version_name: str, arch: str = "x86") -> dict[str, Any]:
-        """Retrieve all discovered defconfig profiles for an architecture."""
-        arch_canon, arch_dir, default_bits = self.normalize_arch(arch)
+    def _all_paths(self, rev: str) -> set[str]:
+        key = ("all", rev)
+        if key not in _LISTING_CACHE:
+            _LISTING_CACHE[key] = set(self._git(["ls-tree", "-r", "--name-only", rev], timeout=60).splitlines())
+        return _LISTING_CACHE[key]
 
-        with get_db_cursor() as cursor:
-            vid, vname = get_version_info(cursor, version_name)
-            rows = []
-            if vid is not None:
-                cursor.execute(
-                    """
-                    SELECT fn.fname, bc.blob_id AS fid
-                    FROM m_file_name fn
-                    JOIN m_bridge_checkpoint bc ON bc.fnid = fn.fnid
-                    WHERE bc.commit_id = %s AND (
-                        fn.fname LIKE %s OR fn.fname LIKE %s
-                    )
-                    ORDER BY fn.fname ASC;
-                    """,
-                    (vid, f"arch/{arch_dir}/configs/%defconfig%", f"arch/{arch_dir}/defconfig%"),
-                )
-                rows = [(r["fname"], r["fid"]) for r in cursor.fetchall()]
-
-        # Fallback to git ls-tree if database rows empty
-        if not rows:
-            try:
-                cmd = ["git", "ls-tree", "-r", "--name-only", str(version_name), f"arch/{arch_dir}"]
-                out = subprocess.run(cmd, cwd=str(get_repo_dir()), capture_output=True, text=True, check=True)
-                for line in out.stdout.splitlines():
-                    clean = line.strip()
-                    if "defconfig" in clean and (f"arch/{arch_dir}/configs/" in clean or clean == f"arch/{arch_dir}/defconfig"):
-                        rows.append((clean, 0))
-            except Exception as e:
-                logger.debug("Could not discover defconfigs via git: %s", e)
-
-        defconfigs: list[dict[str, Any]] = []
-        canonical: dict[str, Any] | None = None
-
-        for fname_raw, fid in rows:
-            fname = safe_decode(fname_raw)
-            base_name = os.path.basename(fname)
-            is_canonical = False
-
-            # Determine canonical default for this arch
-            if arch_dir == "x86" and base_name == "x86_64_defconfig":
-                is_canonical = True
-            elif arch_dir == "arm64" and base_name == "defconfig":
-                is_canonical = True
-            elif arch_dir == "arm" and base_name in ("versatile_defconfig", "omap2plus_defconfig"):
-                is_canonical = True
-            elif base_name == "defconfig":
-                is_canonical = True
-
-            item = {
-                "name": base_name,
-                "file_path": fname,
-                "fid": fid,
-                "is_canonical": is_canonical,
-            }
-            if is_canonical and not canonical:
-                canonical = item
-            defconfigs.append(item)
-
-        if not canonical and defconfigs:
-            canonical = defconfigs[0]
-            canonical["is_canonical"] = True
-
-        if not defconfigs:
-            fallback_name = "x86_64_defconfig" if default_bits == 64 else "i386_defconfig"
-            defconfigs = [{
-                "name": fallback_name,
-                "file_path": f"arch/{arch_dir}/configs/{fallback_name}",
-                "fid": 0,
-                "is_canonical": True,
-            }]
-            canonical = defconfigs[0]
-
+    # ------------------------------------------------------------------ architectures
+    def resolve_arch(self, version_name: str, arch: str | None) -> dict[str, Any]:
+        """ARCH/SRCARCH/KERNELVERSION for an ARCH value, following the top Makefile."""
+        rev = self._rev(version_name)
+        arch_id = (arch or DEFAULT_ARCH).strip().lower()
+        arch_id = _ARCH_SYNONYMS.get(arch_id, arch_id)
+        makefile = self._read(rev, "Makefile") or ""
+        aliases = arch_aliases(makefile)
+        arch_dirs = set(self._tree_listing(rev, "arch"))
+        srcarch = aliases.get(arch_id, arch_id)
+        if srcarch not in arch_dirs:
+            raise HTTPException(status_code=404, detail=f"Architecture '{arch_id}' does not exist in {rev}.")
         return {
-            "version": version_name,
-            "arch": arch,
-            "arch_dir": arch_dir,
-            "total_count": len(defconfigs),
-            "canonical_default": canonical,
-            "defconfigs": defconfigs,
+            "rev": rev,
+            "arch": arch_id,
+            "srcarch": srcarch,
+            "kernelversion": kernel_version_string(makefile),
         }
 
-    def get_defconfig_content(self, version_name: str, name_or_path: str = "", arch: str = "x86", file_path: str = "") -> dict[str, Any]:
-        """Parse defconfig into a dictionary of KConfig key-value pairs."""
-        target_path = file_path or name_or_path
-        clean_path = target_path.strip().lstrip("/")
-        arch_canon, arch_dir, _ = self.normalize_arch(arch)
+    def _root_kconfig(self, rev: str, srcarch: str) -> str:
+        # Top-level Kconfig (sourcing arch/$SRCARCH/Kconfig) since 2.6.x; older trees start in arch/
+        return "Kconfig" if self._read(rev, "Kconfig") is not None else f"arch/{srcarch}/Kconfig"
 
-        cache_key = (version_name, clean_path, arch_dir)
-        if cache_key in _DEFCONFIG_CACHE:
-            return _DEFCONFIG_CACHE[cache_key]
+    @staticmethod
+    def parse_toolchain(value: Any) -> dict[str, Any]:
+        """Toolchain spec from a query parameter (JSON text) or a request body field (object)."""
+        if not value:
+            return {}
+        if isinstance(value, dict):
+            return value
+        try:
+            spec = json.loads(value)
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail=f"Invalid toolchain JSON: {exc}") from exc
+        if not isinstance(spec, dict):
+            raise HTTPException(status_code=400, detail="toolchain must be a JSON object")
+        return spec
 
-        candidate_paths: list[str] = []
-        if clean_path.startswith("arch/"):
-            candidate_paths.append(clean_path)
-        elif clean_path.startswith("configs/"):
-            candidate_paths.append(f"arch/{arch_dir}/{clean_path}")
-        else:
-            candidate_paths.append(f"arch/{arch_dir}/configs/{clean_path}")
-            candidate_paths.append(f"arch/{arch_dir}/{clean_path}")
-            if not clean_path.endswith("defconfig"):
-                candidate_paths.append(f"arch/{arch_dir}/configs/{clean_path}_defconfig")
-
-        raw_content = ""
-        resolved_path = candidate_paths[0]
-
-        # 1. Try git show
-        for cand in candidate_paths:
-            try:
-                proc = subprocess.run(
-                    ["git", "show", f"{version_name}:{cand}"],
-                    cwd=str(get_repo_dir()),
-                    capture_output=True,
-                    text=True,
-                    timeout=5,
-                )
-                if proc.returncode == 0 and proc.stdout:
-                    raw_content = proc.stdout
-                    resolved_path = cand
-                    break
-            except Exception as e:
-                logger.debug("Git show error for %s: %s", cand, e)
-
-        # 2. Try direct local file read
-        if not raw_content:
-            for cand in candidate_paths:
-                local_p = get_repo_dir() / cand
-                if local_p.is_file():
-                    try:
-                        with open(local_p, "r", encoding="utf-8", errors="replace") as f:
-                            raw_content = f.read()
-                            resolved_path = cand
-                            break
-                    except Exception as e:
-                        logger.debug("Local read error for %s: %s", local_p, e)
-
-        # Parse key-value symbols
-        values: dict[str, str] = {}
-        if raw_content:
-            for line in raw_content.splitlines():
-                line = line.strip()
-                if not line:
-                    continue
-                if line.startswith("# CONFIG_") and line.endswith(" is not set"):
-                    sym = line[9:-11].strip()
-                    values[sym] = "n"
-                elif line.startswith("CONFIG_") and "=" in line:
-                    sym, val = line[7:].split("=", 1)
-                    values[sym.strip()] = val.strip().strip('"')
-
-        # Determine architecture bitness
-        name_lower = os.path.basename(resolved_path).lower()
-        if "64" in name_lower or arch_canon == "arm64":
-            bits = 64
-        elif "32" in name_lower or "i386" in name_lower or arch_canon == "arm":
-            bits = 32
-        elif values.get("64BIT") == "y":
-            bits = 64
-        else:
-            bits = 64 if arch_dir in ("x86", "powerpc", "sparc") else 32
-
-        # Ensure architectural defaults
-        if bits == 64:
-            values.setdefault("64BIT", "y")
-        else:
-            values["64BIT"] = "n"
-
-        if arch_dir == "x86":
-            values.setdefault("X86", "y")
-            if bits == 64:
-                values.setdefault("X86_64", "y")
-                values["X86_32"] = "n"
-            else:
-                values.setdefault("X86_32", "y")
-                values["X86_64"] = "n"
-
-        result = {
+    def toolchain_defaults(self, version_name: str, arch: str | None = None) -> dict[str, Any]:
+        """Default gcc and clang profiles for a revision, and whether it has the Kconfig macro language."""
+        info = self.resolve_arch(version_name, arch)
+        kv = info["kernelversion"]
+        return {
             "version": version_name,
-            "name": os.path.basename(resolved_path),
-            "file_path": resolved_path,
-            "arch": arch_dir,
+            "arch": info["arch"],
+            "kernelversion": kv,
+            "macros": self._read(info["rev"], "scripts/kconfig/preprocess.c") is not None,
+            "gcc": ToolchainProfile.from_dict({"cc": "gcc"}, kv).to_dict(),
+            "clang": ToolchainProfile.from_dict({"cc": "clang"}, kv).to_dict(),
+        }
+
+    def get_model(self, version_name: str, arch: str | None = None, toolchain: Any = None) -> _ModelEntry:
+        """Build (or fetch from the LRU cache) the finalized Kconfig model for one revision, ARCH and toolchain."""
+        info = self.resolve_arch(version_name, arch)
+        rev = info["rev"]
+        profile = ToolchainProfile.from_dict(self.parse_toolchain(toolchain), info["kernelversion"])
+        spec_hash = hashlib.sha1(json.dumps(profile.to_dict(), sort_keys=True).encode()).hexdigest()[:16]
+        key = (rev, info["arch"], spec_hash)
+        with _MODEL_LOCK:
+            entry = _MODELS.get(key)
+            if entry is not None:
+                return entry
+            read = lambda p: self._read(rev, p)  # noqa: E731
+            env_vars = profile.environment(info["arch"], info["srcarch"], info["kernelversion"])
+            env_vars.setdefault("KBUILD_DEFCONFIG", self._default_defconfig(rev, info["arch"], info["srcarch"]) or "")
+            if info["arch"] == "um":
+                env_vars.setdefault("SUBARCH", "x86")
+            env = KconfigEnv(ARCH=env_vars["ARCH"], SRCARCH=env_vars["SRCARCH"], KERNELVERSION=env_vars["KERNELVERSION"], extra=env_vars)
+            macros = read("scripts/kconfig/preprocess.c") is not None
+            shell = pp = None
+            if macros:
+                shell = ToolchainShell(profile, env_vars, info["srcarch"], read)
+                pp = KconfigPreprocessor(env_vars, shell)
+                shell.pp = pp
+            builder = KconfigModelBuilder(read, env, pp)
+            model = builder.build(self._root_kconfig(rev, info["srcarch"]))
+            model["version"] = version_name
+            model["arch"] = info["arch"]
+            model["srcarch"] = info["srcarch"]
+            model["toolchain"] = self._toolchain_report(model, profile, env_vars, macros, pp, shell)
+            entry = _ModelEntry(builder, model, info)
+            # Bounded LRU per repository (each model holds a few tens of MB once indexed)
+            repo = get_active_repo_name()
+            same_repo = [k for k in dict.keys(_MODELS) if k[0] == repo]
+            if len(same_repo) >= _MODEL_CACHE_SIZE:
+                dict.pop(_MODELS, same_repo[0], None)
+            _MODELS[key] = entry
+            return entry
+
+    @staticmethod
+    def _toolchain_report(model: dict[str, Any], profile: ToolchainProfile, env_vars: dict[str, str], macros: bool,
+                          pp: KconfigPreprocessor | None, shell: ToolchainShell | None) -> dict[str, Any]:
+        """What the build environment contributed: variables read, probe answers, $(error-if) messages."""
+        spans: dict[str, list[tuple[int, int, str]]] = {}
+        for node in model["nodes"]:
+            if node["symbol_name"] and node["file_path"]:
+                spans.setdefault(node["file_path"], []).append((node["line_s"], node["line_e"], node["symbol_name"]))
+
+        def symbol_at(file: str, line: int) -> str | None:
+            hits = [(e - s, sym) for s, e, sym in spans.get(file, []) if s <= line <= e]
+            return min(hits)[1] if hits else None
+
+        probes = []
+        for probe in (shell.probes.values() if shell else []):
+            locations = [dict(loc, symbol=symbol_at(loc["file"], loc["line"])) for loc in probe["locations"]]
+            probes.append({**probe, "locations": locations})
+        if pp is not None:
+            used = {k: v for k, v in pp.env_used.items() if not k.isdigit()}
+        else:
+            used = {s["env"]: env_vars.get(s["env"]) for s in model["symbols"].values() if s.get("env")}
+        return {
+            "macros": macros,
+            "profile": profile.to_dict(),
+            "summary": profile.summary(),
+            "env": env_vars,
+            "env_used": [{"name": k, "value": v, "overridden": k in profile.env} for k, v in sorted(used.items())],
+            "probes": sorted(probes, key=lambda p: (p["kind"], p["key"])),
+            "messages": list(pp.messages) if pp is not None else [],
+        }
+
+    def get_env_presets(self, version_name: str) -> dict[str, Any]:
+        """Every ARCH value kconfig accepts at this revision, with its environment and default defconfig."""
+        rev = self._rev(version_name)
+        makefile = self._read(rev, "Makefile") or ""
+        aliases = arch_aliases(makefile)
+        kernelversion = kernel_version_string(makefile)
+        arch_dirs = [d for d in self._tree_listing(rev, "arch") if "." not in d and d != "Kconfig"]
+        presets: list[dict[str, Any]] = []
+        for srcarch in sorted(arch_dirs):
+            variants = [a for a, target in sorted(aliases.items()) if target == srcarch]
+            if srcarch not in variants:
+                variants.append(srcarch)
+            # Prefer the 64-bit spelling first (x86_64 before i386 before the generic x86)
+            variants.sort(key=lambda a: (0 if "64" in a else 1 if a != srcarch else 2, a))
+            for arch_id in variants:
+                defconfig = self._default_defconfig(rev, arch_id, srcarch)
+                label = arch_id if arch_id == srcarch else f"{arch_id} ({srcarch})"
+                if arch_id == srcarch and len(variants) > 1:
+                    label = f"{arch_id} (generic: bitness chosen in menuconfig)"
+                presets.append({
+                    "id": arch_id,
+                    "label": label,
+                    "arch": arch_id,
+                    "srcarch": srcarch,
+                    "kconfig_path": f"arch/{srcarch}/Kconfig",
+                    "canonical_defconfig": defconfig,
+                    "bits": 64 if "64" in arch_id else None,
+                    "env": {"ARCH": arch_id, "SRCARCH": srcarch, "KERNELVERSION": kernelversion},
+                })
+        presets.sort(key=lambda p: (0 if p["id"] == DEFAULT_ARCH else 1, p["srcarch"]))
+        return {
+            "version": version_name,
+            "default_arch": DEFAULT_ARCH if any(p["id"] == DEFAULT_ARCH for p in presets) else (presets[0]["id"] if presets else None),
+            "targets": presets,
+            "architectures": presets,
+            # Compiler identity only reaches Kconfig from Linux 4.18 on (CC_IS_GCC/CC_IS_CLANG are
+            # computed by $(shell,...) macros, which this model does not evaluate)
+            "compilers": [
+                {"id": "gcc", "label": "GNU Compiler Collection (gcc)", "symbols": {"CC_IS_GCC": "y"}},
+                {"id": "clang", "label": "LLVM Clang (clang)", "symbols": {"CC_IS_CLANG": "y"}},
+            ],
+        }
+
+    def _default_defconfig(self, rev: str, arch_id: str, srcarch: str) -> str | None:
+        """What `make ARCH=<arch> defconfig` loads: KBUILD_DEFCONFIG, else arch/$SRCARCH/defconfig."""
+        arch_mk = self._read(rev, f"arch/{srcarch}/Makefile") or ""
+        name = resolve_kbuild_defconfig(arch_mk, arch_id, srcarch)
+        configs = self._tree_listing(rev, f"arch/{srcarch}/configs", recursive=True)
+        if name and name in configs:
+            return name
+        if "defconfig" in self._tree_listing(rev, f"arch/{srcarch}"):
+            return "defconfig"
+        if f"{arch_id}_defconfig" in configs:
+            return f"{arch_id}_defconfig"
+        files = [c for c in configs if "defconfig" in c]
+        return files[0] if files else None
+
+    # ------------------------------------------------------------------ defconfigs
+    def get_defconfigs(self, version_name: str, arch: str = DEFAULT_ARCH) -> dict[str, Any]:
+        """List arch/$SRCARCH/configs/* (and arch/$SRCARCH/defconfig) with the default one flagged."""
+        info = self.resolve_arch(version_name, arch)
+        rev, srcarch = info["rev"], info["srcarch"]
+        default = self._default_defconfig(rev, info["arch"], srcarch)
+        items: list[dict[str, Any]] = []
+        if "defconfig" in self._tree_listing(rev, f"arch/{srcarch}"):
+            items.append({"name": "defconfig", "file_path": f"arch/{srcarch}/defconfig"})
+        # Nested ones (powerpc: configs/40x/acadia_defconfig) load as `make 40x/acadia_defconfig`
+        for name in sorted(self._tree_listing(rev, f"arch/{srcarch}/configs", recursive=True)):
+            items.append({"name": name, "file_path": f"arch/{srcarch}/configs/{name}"})
+        canonical = None
+        for item in items:
+            item["fid"] = 0
+            item["is_canonical"] = item["name"] == default and canonical is None
+            if item["is_canonical"]:
+                canonical = item
+        return {
+            "version": version_name,
+            "arch": info["arch"],
+            "arch_dir": srcarch,
+            "total_count": len(items),
+            "canonical_default": canonical,
+            "defconfigs": items,
+        }
+
+    def get_defconfig_content(self, version_name: str, name_or_path: str = "", arch: str = DEFAULT_ARCH, file_path: str = "", toolchain: Any = None) -> dict[str, Any]:
+        """Raw defconfig text plus its literal assignments (nothing injected: kconfig derives the rest)."""
+        info = self.resolve_arch(version_name, arch)
+        rev, srcarch = info["rev"], info["srcarch"]
+        clean = (file_path or name_or_path or "").strip().lstrip("/")
+        if not clean:
+            clean = self._default_defconfig(rev, info["arch"], srcarch) or ""
+        if clean.startswith("arch/"):
+            candidates = [clean]
+        elif clean.startswith("configs/"):
+            candidates = [f"arch/{srcarch}/{clean}"]
+        else:
+            candidates = [f"arch/{srcarch}/configs/{clean}", f"arch/{srcarch}/{clean}", f"arch/{srcarch}/configs/{clean}_defconfig"]
+        content, resolved = None, candidates[0]
+        for cand in candidates:
+            content = self._read(rev, cand)
+            if content is not None:
+                resolved = cand
+                break
+        if content is None:
+            raise HTTPException(status_code=404, detail=f"Defconfig '{clean}' not found for {info['arch']} in {rev}.")
+        values = self.import_file(version_name, {"content": content})["symbols"]
+        bits = None
+        try:
+            ev = self.get_model(version_name, info["arch"], toolchain).evaluator()
+            ev.load_config(content)
+            ev.set_all_new_symbols("default")
+            if "64BIT" in ev.syms:
+                bits = 64 if ev.value("64BIT") == "y" else 32
+        except HTTPException:
+            pass
+        return {
+            "version": version_name,
+            "name": os.path.basename(resolved),
+            "file_path": resolved,
+            "arch": info["arch"],
+            "srcarch": srcarch,
             "bits": bits,
             "symbol_count": len(values),
             "values": values,
-            "content": raw_content,
-        }
-        _DEFCONFIG_CACHE[cache_key] = result
-        return result
-
-    def build_authentic_tree(self, version_name: str, arch_dir: str) -> dict[str, Any]:
-        """Build authentic architecture-scoped hierarchical menu tree by parsing the inclusion tree."""
-        from collections import defaultdict
-
-        type_name_map = {
-            TYPE_BOOL: "bool",
-            TYPE_TRISTATE: "tristate",
-            TYPE_STRING: "string",
-            TYPE_HEX: "hex",
-            TYPE_INT: "int",
+            "content": content,
         }
 
-        seen_files: set[str] = set()
-        node_id_counter = 0
-        file_content_cache: dict[str, str] = {}
-
-        def read_file(rel_p: str) -> str:
-            if rel_p in file_content_cache:
-                return file_content_cache[rel_p]
-            clean = rel_p.strip().lstrip("/")
-            content = ""
-            local_p = get_repo_dir() / clean
-            if local_p.is_file():
-                try:
-                    with open(local_p, "r", encoding="utf-8", errors="replace") as f:
-                        content = f.read()
-                except Exception as e:
-                    logger.debug("Failed reading %s: %s", local_p, e)
-            if not content:
-                try:
-                    proc = subprocess.run(
-                        ["git", "show", f"{version_name}:{clean}"],
-                        cwd=str(get_repo_dir()),
-                        capture_output=True,
-                        text=True,
-                        timeout=5,
-                    )
-                    if proc.returncode == 0 and proc.stdout:
-                        content = proc.stdout
-                except Exception as e:
-                    logger.debug("Git show error for %s: %s", clean, e)
-            file_content_cache[rel_p] = content
-            return content
-
-        flat_nodes: list[dict[str, Any]] = []
-        relations_map: dict[str, dict[str, list[str]]] = defaultdict(lambda: {"depends_on": [], "selects": [], "implies": []})
-        reverse_relations_map: dict[str, dict[str, list[dict[str, Any]]]] = defaultdict(lambda: {"selected_by": [], "implied_by": []})
-
-        def parse_file(rel_path: str, parent_deps: list[str], parent_id: int) -> list[dict[str, Any]]:
-            clean_p = rel_path.strip().strip('"').strip("'")
-            clean_p = clean_p.replace("$SRCARCH", arch_dir).replace("$ARCH", arch_dir)
-            if clean_p in seen_files:
-                return []
-            seen_files.add(clean_p)
-
-            content = read_file(clean_p)
-            if not content:
-                return []
-
-            lexer = KconfigLexer(content)
-            tokens = lexer.tokenize()
-            parser = KconfigParser(tokens, content)
-            items = parser.parse()
-
-            file_dir = os.path.dirname(clean_p)
-            return process_items(items, file_dir, parent_deps, clean_p, parent_id)
-
-        def process_items(items: list[Any], current_dir: str, parent_deps: list[str], current_file: str, parent_id: int) -> list[dict[str, Any]]:
-            nonlocal node_id_counter
-            result = []
-            active_menuconfig: tuple[str, dict[str, Any]] | None = None
-
-            for item in items:
-                if isinstance(item, KconfigConfig):
-                    node_id_counter += 1
-                    curr_id = node_id_counter
-                    deps = list(parent_deps)
-                    dep_syms = []
-                    for d in item.depends_on:
-                        d_str = d.to_string()
-                        if d_str:
-                            deps.append(d_str)
-                        dep_syms.extend(d.collect_symbols())
-
-                    combined_deps = " && ".join(f"({d})" for d in deps) if deps else ""
-
-                    defaults = []
-                    for d_val, d_cond in item.defaults:
-                        val_str = d_val.to_string() if d_val else ""
-                        cond_str = d_cond.to_string() if d_cond else None
-                        defaults.append({"value": val_str, "cond": cond_str})
-
-                    selects = []
-                    for s_target, s_cond in item.selects:
-                        cond_str = s_cond.to_string() if s_cond else None
-                        selects.append({"target": s_target, "cond": cond_str})
-                        relations_map[item.name]["selects"].append(s_target)
-                        reverse_relations_map[s_target]["selected_by"].append({
-                            "name": item.name,
-                            "prompt": item.prompt or item.name,
-                            "cond": cond_str,
-                        })
-
-                    implies = []
-                    for i_target, i_cond in item.implies:
-                        cond_str = i_cond.to_string() if i_cond else None
-                        implies.append({"target": i_target, "cond": cond_str})
-                        relations_map[item.name]["implies"].append(i_target)
-                        reverse_relations_map[i_target]["implied_by"].append({
-                            "name": item.name,
-                            "prompt": item.prompt or item.name,
-                            "cond": cond_str,
-                        })
-
-                    for ds in dep_syms:
-                        relations_map[item.name]["depends_on"].append(ds)
-
-                    node_dict = {
-                        "id": curr_id,
-                        "tree_id": curr_id,
-                        "parent_id": parent_id,
-                        "node_type": 4 if item.is_menuconfig else 3,
-                        "symbol_name": item.name,
-                        "symbol": item.name,
-                        "type": item.sym_type,
-                        "type_name": type_name_map.get(item.sym_type, "tristate"),
-                        "title": item.prompt or item.name,
-                        "prompt": item.prompt or "",
-                        "is_menuconfig": item.is_menuconfig,
-                        "depends_on_expr": combined_deps,
-                        "depends_on": dep_syms,
-                        "defaults": defaults,
-                        "def_val": defaults[0]["value"] if defaults else "",
-                        "selects": selects,
-                        "implies": implies,
-                        "selected_by": reverse_relations_map[item.name]["selected_by"],
-                        "implied_by": reverse_relations_map[item.name]["implied_by"],
-                        "help": item.help_text or "",
-                        "file_path": current_file,
-                        "children": [],
-                    }
-
-                    if item.is_menuconfig:
-                        active_menuconfig = (item.name, node_dict)
-                        flat_nodes.append(node_dict)
-                        result.append(node_dict)
-                    elif active_menuconfig and (active_menuconfig[0] in dep_syms or any(active_menuconfig[0] in d for d in dep_syms)):
-                        node_dict["parent_id"] = active_menuconfig[1]["id"]
-                        active_menuconfig[1]["children"].append(node_dict)
-                        flat_nodes.append(node_dict)
-                    else:
-                        active_menuconfig = None
-                        flat_nodes.append(node_dict)
-                        result.append(node_dict)
-
-                elif isinstance(item, KconfigMenu):
-                    active_menuconfig = None
-                    node_id_counter += 1
-                    curr_id = node_id_counter
-                    deps = list(parent_deps)
-                    for d in item.depends_on:
-                        d_str = d.to_string()
-                        if d_str:
-                            deps.append(d_str)
-                    combined_deps = " && ".join(f"({d})" for d in deps) if deps else ""
-
-                    children = process_items(item.children, current_dir, deps, current_file, curr_id)
-
-                    node_dict = {
-                        "id": curr_id,
-                        "tree_id": curr_id,
-                        "parent_id": parent_id,
-                        "node_type": 1,
-                        "symbol_name": None,
-                        "symbol": None,
-                        "title": item.title or "Menu",
-                        "prompt": item.title or "Menu",
-                        "is_menu": True,
-                        "depends_on_expr": combined_deps,
-                        "depends_on": [],
-                        "selects": [],
-                        "selected_by": [],
-                        "implies": [],
-                        "implied_by": [],
-                        "defaults": [],
-                        "file_path": current_file,
-                        "children": children,
-                    }
-                    flat_nodes.append(node_dict)
-                    result.append(node_dict)
-
-                elif isinstance(item, KconfigChoice):
-                    active_menuconfig = None
-                    node_id_counter += 1
-                    curr_id = node_id_counter
-                    deps = list(parent_deps)
-                    for d in item.depends_on:
-                        d_str = d.to_string()
-                        if d_str:
-                            deps.append(d_str)
-                    combined_deps = " && ".join(f"({d})" for d in deps) if deps else ""
-
-                    children = process_items(item.children, current_dir, deps, current_file, curr_id)
-                    choice_members = [c["symbol_name"] for c in children if c.get("symbol_name")]
-
-                    choice_meta = {
-                        "id": curr_id,
-                        "choice_id": curr_id,
-                        "type": type_name_map.get(item.sym_type, "bool"),
-                        "optional": item.is_optional,
-                        "members": choice_members,
-                    }
-                    for c in children:
-                        c["choice"] = choice_meta
-
-                    node_dict = {
-                        "id": curr_id,
-                        "tree_id": curr_id,
-                        "parent_id": parent_id,
-                        "node_type": 2,
-                        "symbol_name": None,
-                        "symbol": None,
-                        "title": item.prompt or item.name or "Choice",
-                        "prompt": item.prompt or item.name or "Choice",
-                        "is_choice": True,
-                        "choice": choice_meta,
-                        "depends_on_expr": combined_deps,
-                        "depends_on": [],
-                        "selects": [],
-                        "selected_by": [],
-                        "implies": [],
-                        "implied_by": [],
-                        "defaults": [],
-                        "file_path": current_file,
-                        "children": children,
-                    }
-                    flat_nodes.append(node_dict)
-                    result.append(node_dict)
-
-                elif isinstance(item, KconfigIf):
-                    cond_str = item.cond.to_string() if item.cond else ""
-                    new_deps = list(parent_deps)
-                    if cond_str:
-                        new_deps.append(cond_str)
-                    if active_menuconfig and (active_menuconfig[0] in cond_str or cond_str == active_menuconfig[0]):
-                        children = process_items(item.children, current_dir, new_deps, current_file, active_menuconfig[1]["id"])
-                        active_menuconfig[1]["children"].extend(children)
-                    else:
-                        active_menuconfig = None
-                        children = process_items(item.children, current_dir, new_deps, current_file, parent_id)
-                        result.extend(children)
-
-                elif isinstance(item, KconfigComment):
-                    node_id_counter += 1
-                    curr_id = node_id_counter
-                    node_dict = {
-                        "id": curr_id,
-                        "tree_id": curr_id,
-                        "parent_id": parent_id,
-                        "node_type": 5,
-                        "symbol_name": None,
-                        "symbol": None,
-                        "title": item.title or "Comment",
-                        "prompt": item.title or "Comment",
-                        "is_comment": True,
-                        "depends_on_expr": "",
-                        "depends_on": [],
-                        "selects": [],
-                        "selected_by": [],
-                        "implies": [],
-                        "implied_by": [],
-                        "defaults": [],
-                        "file_path": current_file,
-                        "children": [],
-                    }
-                    flat_nodes.append(node_dict)
-                    result.append(node_dict)
-
-                elif isinstance(item, KconfigSource):
-                    s_path = item.path.strip().strip('"').strip("'").replace("$SRCARCH", arch_dir).replace("$ARCH", arch_dir)
-                    target_p = os.path.normpath(os.path.join(current_dir, s_path)) if item.is_rsource else s_path
-                    sourced_children = parse_file(target_p, parent_deps, parent_id)
-                    result.extend(sourced_children)
-
-            return result
-
-        root_file = f"arch/{arch_dir}/Kconfig"
-        nested_tree = parse_file(root_file, [], 0)
-
-        res = {
-            "version": version_name,
-            "arch": arch_dir,
-            "total_nodes": len(flat_nodes),
-            "total_count": len(flat_nodes),
-            "nodes": flat_nodes,
-            "tree": nested_tree,
-            "relations": relations_map,
-            "reverse_relations": reverse_relations_map,
-        }
-        return res
-
+    # ------------------------------------------------------------------ tree / model
     def get_tree(
         self,
         version_name: str,
-        arch: str = "x86",
+        arch: str = DEFAULT_ARCH,
         include_tree: bool = False,
         include_relations: bool = False,
+        include_nodes: bool = False,
+        toolchain: Any = None,
     ) -> dict[str, Any]:
-        """Retrieve authentic, scoped hierarchical menu tree structure for a given kernel version and architecture."""
-        arch_canon, arch_dir, bits = self.normalize_arch(arch)
-        cache_key = (version_name, arch_dir)
-
-        if cache_key not in _TREE_CACHE:
-            _TREE_CACHE[cache_key] = self.build_authentic_tree(version_name, arch_dir)
-
-        cached_res = _TREE_CACHE[cache_key]
-        res: dict[str, Any] = {
-            "version": cached_res["version"],
-            "arch": cached_res["arch"],
-            "total_nodes": cached_res["total_nodes"],
-            "total_count": cached_res["total_count"],
-            "nodes": cached_res["nodes"],
-            "tree": cached_res["tree"],
-        }
+        """The finalized configuration model (compact transport form) for the client-side engine."""
+        entry = self.get_model(version_name, arch, toolchain)
+        res = dict(entry.compact)
+        res["version"] = version_name
+        res["total_nodes"] = res["total_count"] = len(entry.model["nodes"])
+        if include_nodes or include_tree:
+            res["nodes"] = [self._legacy_node(entry, n) for n in entry.model["nodes"][1:]]
         if include_relations:
-            res["relations"] = cached_res["relations"]
-            res["reverse_relations"] = cached_res["reverse_relations"]
-
+            relations: dict[str, dict[str, list[str]]] = {}
+            reverse: dict[str, dict[str, list[dict[str, Any]]]] = {}
+            for ref_target, refs in entry.builder.references.items():
+                for ref in refs:
+                    kind = {"depends_on": "depends_on", "select": "selects", "imply": "implies"}.get(ref["kind"])
+                    if kind:
+                        relations.setdefault(ref["by"], {"depends_on": [], "selects": [], "implies": []})[kind].append(ref_target)
+            for target, by in entry.selected_by.items():
+                reverse.setdefault(target, {"selected_by": [], "implied_by": []})["selected_by"] = [{"name": n, "cond": entry.expr(v)} for n, v in by]
+            for target, by in entry.implied_by.items():
+                reverse.setdefault(target, {"selected_by": [], "implied_by": []})["implied_by"] = [{"name": n, "cond": entry.expr(v)} for n, v in by]
+            res["relations"] = relations
+            res["reverse_relations"] = reverse
         return res
 
-    def get_symbol_detail(self, version_name: str, name: str) -> dict[str, Any]:
-        """Fetch symbol attributes, depends_on expressions, reverse selects, and lifecycle metadata."""
-        clean_name = name.strip()
-        if clean_name.startswith("CONFIG_"):
-            clean_name = clean_name[7:]
-
-        with get_db_cursor() as cursor:
-            vid, vname = get_version_info(cursor, version_name)
-            if vid is None:
-                raise HTTPException(status_code=404, detail=f"Version '{version_name}' not found.")
-
-            cursor.execute(
-                """
-                SELECT s.kcid, s.name, s.type, s.prompt, s.def_val, s.help, s.ast_id
-                FROM m_kconfig_symbol s
-                WHERE s.name = %s
-                LIMIT 1;
-                """,
-                (clean_name,),
-            )
-            s_row = cursor.fetchone()
-            if not s_row:
-                raise HTTPException(status_code=404, detail=f"KConfig symbol '{clean_name}' not found.")
-
-            kcid = s_row["kcid"]
-            vid_s = vid
-            vid_e = 0
-            vname_s = vname
-            vname_e = "Active"
-            is_active = True
-            lifecycle_status = "Active"
-
-            # Relations (depends_on, select)
-            cursor.execute(
-                """
-                SELECT r.rel_type, r.target_name, r.priority
-                FROM m_kconfig_relation r
-                WHERE r.kcid = %s
-                ORDER BY r.priority ASC;
-                """,
-                (kcid,),
-            )
-            relations = cursor.fetchall()
-            depends_on = []
-            selects = []
-            for r in relations:
-                t_name = safe_decode(r["target_name"])
-                if r["rel_type"] == 1:  # depends on
-                    depends_on.append(t_name)
-                elif r["rel_type"] == 2:  # select
-                    selects.append(t_name)
-
-            # Reverse dependencies (symbols that select this symbol)
-            cursor.execute(
-                """
-                SELECT DISTINCT s.name
-                FROM m_kconfig_relation r
-                JOIN m_kconfig_symbol s ON r.kcid = s.kcid
-                WHERE r.rel_type = 2 AND r.target_name = %s
-                ORDER BY s.name ASC;
-                """,
-                (clean_name,),
-            )
-            selected_by = [safe_decode(r["name"]) for r in cursor.fetchall()]
-
-            # Compiled source files from m_kconfig_kbuild
-            cursor.execute(
-                """
-                SELECT DISTINCT fn.fname
-                FROM m_kconfig_kbuild kb
-                JOIN m_file_name fn ON kb.target_fnid = fn.fnid
-                WHERE kb.kcid = %s;
-                """,
-                (kcid,),
-            )
-            compiled_files = [{"file_path": safe_decode(r["fname"])} for r in cursor.fetchall()]
-
-            # Query declaration location(s) from m_kconfig_tree, m_bridge_checkpoint, m_file_name, and m_bridge_tag
-            cursor.execute(
-                """
-                SELECT DISTINCT fn.fname, bt.line_s, bt.line_e, bc.blob_id
-                FROM m_kconfig_symbol s
-                JOIN m_kconfig_tree kt ON kt.kcid = s.kcid
-                JOIN m_bridge_checkpoint bc ON bc.blob_id = kt.blob_id
-                JOIN m_file_name fn ON fn.fnid = bc.fnid
-                LEFT JOIN m_tag t ON t.ast_id = s.ast_id
-                LEFT JOIN m_bridge_tag bt ON bt.blob_id = kt.blob_id AND bt.tag_id = t.tag_id
-                WHERE s.kcid = %s
-                ORDER BY (bc.commit_id = %s) DESC, (bt.line_s IS NOT NULL) DESC
-                LIMIT 5;
-                """,
-                (kcid, vid or 0),
-            )
-            decl_rows = cursor.fetchall()
-            declarations: list[dict[str, Any]] = []
-            seen_decl = set()
-            for dr in decl_rows:
-                dfname = safe_decode(dr["fname"])
-                dline_s = dr["line_s"]
-                dline_e = dr["line_e"]
-                key = (dfname, dline_s)
-                if key not in seen_decl:
-                    seen_decl.add(key)
-                    declarations.append({
-                        "file_path": dfname,
-                        "line_s": dline_s,
-                        "line_e": dline_e,
-                        "blob_id": dr.get("blob_id"),
-                    })
-
-            # Fallback to fast git grep if declarations are empty or line_s is None
-            if not declarations or declarations[0]["line_s"] is None:
-                try:
-                    cmd = ["git", "grep", "-n", "-E", f"^(menu)?config[ \t]+{clean_name}$", str(vname), "--", "*Kconfig*"]
-                    g_out = subprocess.run(cmd, cwd=str(get_repo_dir()), capture_output=True, text=True, timeout=5)
-                    if g_out.returncode == 0:
-                        for g_line in g_out.stdout.splitlines():
-                            parts = g_line.strip().split(":", 3)
-                            if len(parts) >= 3:
-                                path_cand = parts[0] if not parts[0].startswith(str(vname)) else parts[1]
-                                line_num = int(parts[1]) if not parts[0].startswith(str(vname)) else int(parts[2])
-                                if not declarations:
-                                    declarations.append({"file_path": path_cand, "line_s": line_num, "line_e": line_num})
-                                elif declarations[0]["line_s"] is None:
-                                    declarations[0]["file_path"] = path_cand
-                                    declarations[0]["line_s"] = line_num
-                                    declarations[0]["line_e"] = line_num
-                                break
-                except Exception as grep_err:
-                    logger.debug("Kconfig grep fallback failed for %s: %s", clean_name, grep_err)
-
-            primary_file = declarations[0]["file_path"] if declarations else ""
-            primary_line_s = declarations[0]["line_s"] if declarations and declarations[0]["line_s"] is not None else 1
-            primary_line_e = declarations[0]["line_e"] if declarations and declarations[0]["line_e"] is not None else primary_line_s
-
-            type_map = {1: "bool", 2: "tristate", 3: "string", 4: "hex", 5: "int"}
-            raw_type = s_row["type"]
-            type_name = type_map.get(raw_type, "tristate") if isinstance(raw_type, int) else "tristate"
-
-            return {
-                "version": vname,
-                "name": clean_name,
-                "symbol_name": clean_name,
-                "file_path": primary_file,
-                "line": primary_line_s,
-                "line_s": primary_line_s,
-                "line_e": primary_line_e,
-                "definition": {
-                    "file": primary_file,
-                    "file_path": primary_file,
-                    "line_s": primary_line_s,
-                    "line_e": primary_line_e,
-                    "line": primary_line_s,
-                },
-                "declarations": declarations,
-                "vid_s": vid_s,
-                "vid_e": vid_e,
-                "vname_s": vname_s,
-                "vname_e": vname_e,
-                "added_version": vname_s,
-                "is_active": is_active,
-                "lifecycle_status": lifecycle_status,
-                "type": raw_type,
-                "type_name": type_name,
-                "prompt": safe_decode(s_row["prompt"]),
-                "def_val": safe_decode(s_row["def_val"]),
-                "help": safe_decode(s_row["help"]),
-                "depends_on": depends_on,
-                "selects": selects,
-                "selected_by": selected_by,
-                "compiled_files": compiled_files,
-            }
-
-    def get_graph(self, version_name: str, symbol_or_arch: str = "x86", depth: int = 2) -> dict[str, Any]:
-        """Extract DAG graph (nodes, edges) for a symbol or the full architecture."""
-        target_sym = symbol_or_arch.strip()
-        if target_sym.startswith("CONFIG_"):
-            target_sym = target_sym[7:]
-
-        with get_db_cursor() as cursor:
-            vid, vname = get_version_info(cursor, version_name)
-            if vid is None:
-                raise HTTPException(status_code=404, detail=f"Version '{version_name}' not found.")
-
-            nodes = [{
-                "id": target_sym,
-                "label": target_sym,
-                "is_root": True,
-                "type": "symbol",
-            }]
-            edges = []
-
-            # Retrieve dependencies for target symbol
-            cursor.execute(
-                """
-                SELECT r.rel_type, r.target_name
-                FROM m_kconfig_relation r
-                JOIN m_kconfig_symbol s ON r.kcid = s.kcid
-                WHERE s.name = %s;
-                """,
-                (target_sym,),
-            )
-            for r in cursor.fetchall():
-                tname = safe_decode(r["target_name"])
-                nodes.append({
-                    "id": tname,
-                    "label": tname,
-                    "is_root": False,
-                    "type": "dependency" if r["rel_type"] == 1 else "select",
-                })
-                edges.append({
-                    "from": target_sym,
-                    "to": tname,
-                    "type": "depends_on" if r["rel_type"] == 1 else "selects",
-                })
-
-            return {
-                "version": vname,
-                "symbol": target_sym,
-                "nodes": nodes,
-                "edges": edges,
-            }
-
-    def autosolve(self, version_name: str, req: Any) -> dict[str, Any]:
-        """Auto-solve dependencies for a target Kconfig symbol."""
-        if isinstance(req, dict):
-            sym_name = (req.get("target_symbol") or req.get("symbol") or "").strip()
+    def _legacy_node(self, entry: _ModelEntry, node: dict[str, Any]) -> dict[str, Any]:
+        """Readable per-entry view (tree_id/parent_id/node_type...) with relation names resolved."""
+        sym_name = node["symbol_name"]
+        sym = entry.model["symbols"].get(sym_name) if sym_name else None
+        out = {k: v for k, v in node.items() if k != "children"}
+        out["parent_id"] = max(node["parent_id"], 0)
+        out["depends_on_expr"] = entry.expr(node["dep"]) if node["dep"] >= 0 else ""
+        out["depends_on"] = []
+        if sym is not None:
+            out["type"] = TYPE_CODES.get(sym["type"], 0)
+            out["type_name"] = sym["type"]
+            out["selects"] = [{"target": t, "cond": entry.expr(v)} for t, v in sym["selects"]]
+            out["implies"] = [{"target": t, "cond": entry.expr(v)} for t, v in sym["implies"]]
+            out["selected_by"] = [{"name": n, "cond": entry.expr(v)} for n, v in entry.selected_by.get(sym_name, [])]
+            out["implied_by"] = [{"name": n, "cond": entry.expr(v)} for n, v in entry.implied_by.get(sym_name, [])]
+            out["defaults"] = [{"value": entry.expr(v), "cond": entry.expr(c) if c >= 0 else None} for v, c in sym["defaults"]]
+            out["depends_on"] = entry.own_depends.get(sym_name, [])
+            if sym.get("choice"):
+                out["choice"] = {"id": sym["choice"], "members": entry.model["symbols"][sym["choice"]]["members"]}
         else:
-            sym_name = (getattr(req, "target_symbol", None) or getattr(req, "symbol", "") or "").strip()
+            out.update({"selects": [], "implies": [], "selected_by": [], "implied_by": [], "defaults": []})
+        return out
 
-        if sym_name.startswith("CONFIG_"):
-            sym_name = sym_name[7:]
+    # ------------------------------------------------------------------ symbols
+    def _definitions(self, entry: _ModelEntry, name: str) -> list[dict[str, Any]]:
+        nodes = entry.model["nodes"]
+        out = []
+        for mid in entry.model["symbols"][name]["menus"]:
+            node = nodes[mid]
+            out.append({
+                "file_path": node["file_path"],
+                "line_s": node["line_s"],
+                "line_e": node["line_e"],
+                "prompt": node["prompt"],
+                "kind": node["kind"],
+                "depends_on_expr": entry.expr(node["dep"]) if node["dep"] >= 0 else "",
+                "visible_expr": entry.expr(node["pvis"]) if node["pvis"] >= 0 else ("" if node["prompt"] else None),
+                "help": entry.menu_help.get(mid, ""),
+                "menu_path": self._menu_path(entry, mid),
+            })
+        return out
 
+    @staticmethod
+    def _menu_path(entry: _ModelEntry, mid: int) -> list[str]:
+        """Prompts of the enclosing menus (menuconfig's "Location:")."""
+        nodes = entry.model["nodes"]
+        path: list[str] = []
+        parent = nodes[mid]["parent_id"]
+        while parent > 0:
+            node = nodes[parent]
+            if node["prompt"]:
+                path.append(node["prompt"])
+            parent = node["parent_id"]
+        return list(reversed(path))
+
+    def _other_arch_definitions(self, rev: str, name: str) -> list[dict[str, Any]]:
+        out = self._git(["grep", "-n", "-E", rf"^\s*(menu)?config\s+{re.escape(name)}\s*$", rev, "--", "*Kconfig*"])
+        defs = []
+        for line in out.splitlines()[:50]:
+            parts = line.split(":", 3)
+            if len(parts) == 4 and parts[2].isdigit():
+                defs.append({"file_path": parts[1], "line_s": int(parts[2]), "line_e": int(parts[2])})
+        return defs
+
+    def get_symbol_detail(self, version_name: str, name: str, arch: str = DEFAULT_ARCH, toolchain: Any = None) -> dict[str, Any]:
+        """Arch-scoped definition(s), dependencies, reverse dependencies, help and compiled files of a symbol."""
+        clean = (name or "").strip()
+        if clean.startswith("CONFIG_"):
+            clean = clean[7:]
+        entry = self.get_model(version_name, arch, toolchain)
+        sym = entry.model["symbols"].get(clean)
+        rev = entry.arch["rev"]
+        if sym is None or sym.get("is_choice"):
+            others = self._other_arch_definitions(rev, clean)
+            if not others:
+                raise HTTPException(status_code=404, detail=f"KConfig symbol '{clean}' not found in {version_name}.")
+            first = others[0]
+            return {
+                "version": version_name, "arch": entry.arch["arch"], "name": clean, "symbol_name": clean,
+                "defined_for_arch": False, "type": 0, "type_name": "unknown", "prompt": "", "help": "",
+                "file_path": first["file_path"], "line": first["line_s"], "line_s": first["line_s"], "line_e": first["line_e"],
+                "definition": {**first, "file": first["file_path"], "line": first["line_s"]},
+                "declarations": others, "definitions": [], "depends_on": [], "selects": [], "selected_by": [],
+                "implies": [], "implied_by": [], "defaults": [], "compiled_files": [], "kbuild": [],
+                "kconfig_refs": [], "vid_s": None, "vid_e": 0, "vname_s": version_name, "vname_e": "Active",
+                "added_version": version_name, "is_active": True, "lifecycle_status": "Active", "def_val": "",
+            }
+        definitions = self._definitions(entry, clean)
+        primary = definitions[0] if definitions else {"file_path": "", "line_s": 1, "line_e": 1}
+        prompts = [d["prompt"] for d in definitions if d["prompt"]]
+        defaults = [{"value": entry.expr(v), "cond": entry.expr(c) if c >= 0 else None} for v, c in sym["defaults"]]
+        kbuild = self.kbuild_usage(version_name, clean, entry.arch["arch"])
+        detail = {
+            "version": version_name,
+            "arch": entry.arch["arch"],
+            "srcarch": entry.arch["srcarch"],
+            "name": clean,
+            "symbol_name": clean,
+            "defined_for_arch": True,
+            "type": TYPE_CODES.get(sym["type"], 0),
+            "type_name": sym["type"],
+            "prompt": prompts[0] if prompts else "",
+            "prompts": prompts,
+            "help": entry.help.get(clean, ""),
+            "file_path": primary["file_path"],
+            "line": primary["line_s"],
+            "line_s": primary["line_s"],
+            "line_e": primary["line_e"],
+            "definition": {**primary, "file": primary["file_path"], "line": primary["line_s"]},
+            "declarations": [{k: d[k] for k in ("file_path", "line_s", "line_e")} for d in definitions],
+            "definitions": definitions,
+            "dir_dep_expr": entry.expr(sym["dir_dep"]) if sym["dir_dep"] >= 0 else "",
+            "rev_dep_expr": entry.expr(sym["rev_dep"]) if sym["rev_dep"] >= 0 else "",
+            "implied_expr": entry.expr(sym["implied"]) if sym["implied"] >= 0 else "",
+            "depends_on": entry.own_depends.get(clean, []),
+            "selects": [t for t, _ in sym["selects"]],
+            "select_conditions": [{"target": t, "cond": entry.expr(v)} for t, v in sym["selects"]],
+            "implies": [t for t, _ in sym["implies"]],
+            "selected_by": sorted({n for n, _ in entry.selected_by.get(clean, [])}),
+            "implied_by": sorted({n for n, _ in entry.implied_by.get(clean, [])}),
+            "defaults": defaults,
+            "def_val": defaults[0]["value"] if defaults else "",
+            "ranges": [{"min": entry.expr(lo), "max": entry.expr(hi), "cond": entry.expr(c) if c >= 0 else None} for lo, hi, c in sym["ranges"]],
+            "choice": sym.get("choice"),
+            "choice_members": entry.model["symbols"][sym["choice"]]["members"] if sym.get("choice") else [],
+            "env": sym.get("env"),
+            "kconfig_refs": entry.builder.references.get(clean, [])[:_USAGE_LIMIT],
+            "kbuild": kbuild,
+            "compiled_files": self._compiled_files(kbuild, clean, version_name),
+            # Lifecycle fields kept for API compatibility (the model is per revision)
+            "vid_s": None,
+            "vid_e": 0,
+            "vname_s": version_name,
+            "vname_e": "Active",
+            "added_version": version_name,
+            "is_active": True,
+            "lifecycle_status": "Active",
+        }
+        return detail
+
+    # ------------------------------------------------------------------ usage (git)
+    def kbuild_usage(self, version_name: str, name: str, arch: str = DEFAULT_ARCH) -> list[dict[str, Any]]:
+        """Makefile/Kbuild rules governed by CONFIG_<name>: objects and directories it builds."""
+        info = self.resolve_arch(version_name, arch)
+        rev, srcarch = info["rev"], info["srcarch"]
+        key = ("kbuild", rev, name)
+        if key in _USAGE_CACHE:
+            rules = _USAGE_CACHE[key]
+        else:
+            out = self._git(["grep", "-l", "-w", "-e", f"CONFIG_{name}", rev, "--", "*Makefile*", "*Kbuild*"])
+            makefiles = sorted({line.split(":", 1)[1] for line in out.splitlines() if ":" in line})
+            paths = self._all_paths(rev)
+            parser = KbuildParser()
+            rules = []
+            for mk in makefiles[:200]:
+                content = self._read(rev, mk)
+                if not content:
+                    continue
+                for b in parser.parse_makefile_content(content, dir_path=os.path.dirname(mk)):
+                    if b.symbol_name != name and name not in b.cond_symbols:
+                        continue
+                    target = b.source_file_rel
+                    exists = target in paths
+                    if not exists and target.endswith(".c") and target[:-2] + ".S" in paths:
+                        target, exists = target[:-2] + ".S", True
+                    if b.is_directory:
+                        target = target[: -len("/Makefile")] + "/" if target.endswith("/Makefile") else target
+                        exists = any(p.startswith(target) for p in paths) if not exists else True
+                    rules.append({
+                        "makefile": mk,
+                        "line": b.source_line,
+                        "rule": b.details,
+                        "target_obj": b.target_obj,
+                        "path": target,
+                        "exists": exists,
+                        "kind": "directory" if b.is_directory else ("composite" if b.is_composite else "object"),
+                        "via": "condition" if b.symbol_name != name else "rule",
+                        "compile_mode": {1: "built-in", 2: "module", 3: "conditional"}.get(b.compile_mode, "conditional"),
+                    })
+            _USAGE_CACHE[key] = rules
+        own = f"arch/{srcarch}/"
+        return [dict(r, other_arch=r["path"].startswith("arch/") and not r["path"].startswith(own)) for r in rules]
+
+    def _compiled_files(self, kbuild: list[dict[str, Any]], name: str, version_name: str) -> list[dict[str, Any]]:
+        files: dict[str, dict[str, Any]] = {}
+        for rule in kbuild:
+            if rule["kind"] == "directory" or not rule["exists"]:
+                continue
+            files.setdefault(rule["path"], {
+                "file_path": rule["path"], "target_obj": rule["target_obj"], "compile_mode": rule["compile_mode"],
+                "makefile": rule["makefile"], "line": rule["line"], "other_arch": rule["other_arch"],
+            })
+        # Rows indexed by the parsing pipeline (m_kconfig_kbuild) complement the Git scan
         try:
-            details = self.get_symbol_detail(version_name, sym_name)
-            toggles = [{"symbol": sym_name, "set_to": "y"}]
-            for dep in details.get("depends_on", []):
-                clean_dep = dep.replace("CONFIG_", "").strip()
-                toggles.append({"symbol": clean_dep, "set_to": "y"})
-        except HTTPException:
-            toggles = [{"symbol": sym_name, "set_to": "y"}]
+            with get_db_cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT DISTINCT fn.fname, kb.target_obj
+                    FROM m_kconfig_kbuild kb
+                    JOIN m_kconfig_symbol s ON s.kcid = kb.kcid
+                    JOIN m_file_name fn ON kb.target_fnid = fn.fnid
+                    WHERE s.name = %s
+                    LIMIT 500;
+                    """,
+                    (name,),
+                )
+                for row in cursor.fetchall():
+                    path = safe_decode(row["fname"])
+                    files.setdefault(path, {"file_path": path, "target_obj": safe_decode(row["target_obj"]), "compile_mode": "conditional"})
+        except Exception as exc:
+            logger.debug("m_kconfig_kbuild lookup skipped: %s", exc)
+        return sorted(files.values(), key=lambda f: f["file_path"])
 
+    def get_symbol_usage(self, version_name: str, name: str, arch: str = DEFAULT_ARCH, limit: int = _USAGE_LIMIT, toolchain: Any = None) -> dict[str, Any]:
+        """Where CONFIG_<name> is used: Kbuild rules, C/assembly/linker sources, and other Kconfig entries."""
+        clean = name[7:] if name.startswith("CONFIG_") else name
+        entry = self.get_model(version_name, arch, toolchain)
+        rev, srcarch = entry.arch["rev"], entry.arch["srcarch"]
+        key = ("src", rev, clean)
+        if key not in _USAGE_CACHE:
+            out = self._git(["grep", "-n", "-w", "-E", f"CONFIG_{clean}(_MODULE)?", rev, "--",
+                             "*.c", "*.h", "*.S", "*.lds", "*.lds.S", "*.dts", "*.dtsi"])
+            refs = []
+            for line in out.splitlines():
+                parts = line.split(":", 3)
+                if len(parts) == 4 and parts[2].isdigit():
+                    refs.append({"file_path": parts[1], "line": int(parts[2]), "text": parts[3].strip()[:200]})
+            _USAGE_CACHE[key] = refs
+        refs = _USAGE_CACHE[key]
+        own = f"arch/{srcarch}/"
+        sources = [dict(r, other_arch=r["file_path"].startswith("arch/") and not r["file_path"].startswith(own)) for r in refs]
         return {
             "version": version_name,
-            "target": sym_name,
-            "solution_found": True,
-            "toggles_needed": toggles,
+            "arch": entry.arch["arch"],
+            "name": clean,
+            "kbuild": self.kbuild_usage(version_name, clean, entry.arch["arch"]),
+            "source_refs": sources[:limit],
+            "source_ref_count": len(sources),
+            "source_file_count": len({r["file_path"] for r in sources}),
+            "kconfig_refs": entry.builder.references.get(clean, [])[:limit],
         }
+
+    def get_graph(self, version_name: str, symbol_or_arch: str = "x86", depth: int = 2, arch: str = DEFAULT_ARCH, toolchain: Any = None) -> dict[str, Any]:
+        """Direct relations of a symbol: its own dependencies (left) and what it selects/implies (right)."""
+        target = (symbol_or_arch or "").strip()
+        if target.startswith("CONFIG_"):
+            target = target[7:]
+        entry = self.get_model(version_name, arch, toolchain)
+        nodes = [{"id": target, "label": target, "is_root": True, "type": "symbol"}]
+        edges: list[dict[str, Any]] = []
+        sym = entry.model["symbols"].get(target)
+        if sym is not None:
+            for dep in entry.own_depends.get(target, []):
+                nodes.append({"id": dep, "label": dep, "is_root": False, "type": "dependency"})
+                edges.append({"from": target, "to": dep, "type": "depends_on"})
+            for kind, items in (("selects", sym["selects"]), ("implies", sym["implies"])):
+                for t, _ in items:
+                    nodes.append({"id": t, "label": t, "is_root": False, "type": kind[:-1]})
+                    edges.append({"from": target, "to": t, "type": kind})
+            for n, _ in entry.selected_by.get(target, []):
+                nodes.append({"id": n, "label": n, "is_root": False, "type": "selected_by"})
+                edges.append({"from": n, "to": target, "type": "selects"})
+        return {"version": version_name, "arch": entry.arch["arch"], "symbol": target, "nodes": nodes, "edges": edges}
+
+    def search_symbols(self, version_name: str, q: str = "", limit: int = 50, offset: int = 0, arch: str | None = None, toolchain: Any = None) -> dict[str, Any]:
+        """Search symbol names and prompts (CONFIG_ prefix optional) in the arch model."""
+        clean_q = q.strip()
+        if clean_q.startswith("CONFIG_"):
+            clean_q = clean_q[7:]
+        needle = clean_q.lower()
+        entry = self.get_model(version_name, arch, toolchain)
+        nodes = entry.model["nodes"]
+        hits = []
+        for sym_name, sym in entry.model["symbols"].items():
+            if sym.get("is_choice"):
+                continue
+            prompt = next((nodes[m]["prompt"] for m in sym["menus"] if nodes[m]["prompt"]), "") or ""
+            if needle in sym_name.lower() or needle in prompt.lower():
+                first = nodes[sym["menus"][0]] if sym["menus"] else None
+                hits.append({
+                    "name": sym_name,
+                    "type": TYPE_CODES.get(sym["type"], 0),
+                    "type_name": sym["type"],
+                    "prompt": prompt,
+                    "help": entry.help.get(sym_name, ""),
+                    "file_path": first["file_path"] if first else "",
+                    "line_s": first["line_s"] if first else 0,
+                })
+        hits.sort(key=lambda h: (h["name"].lower() != needle, not h["name"].lower().startswith(needle), h["name"]))
+        page = hits[offset:offset + limit]
+        return {"version": version_name, "arch": entry.arch["arch"], "query": q, "count": len(page), "total": len(hits), "symbols": page}
+
+    # ------------------------------------------------------------------ configurations
+    @staticmethod
+    def _assignments_to_config(symbols: dict[str, Any]) -> str:
+        """Render {NAME: value} as .config lines, so it is loaded with exact conf_read semantics."""
+        lines = []
+        for raw_name, val in symbols.items():
+            name = raw_name[7:] if raw_name.startswith("CONFIG_") else raw_name
+            text = "" if val is None else str(val)
+            if text in ("n", "N", "false", "False"):
+                lines.append(f"# CONFIG_{name} is not set")
+            elif text in ("y", "Y", "true", "True"):
+                lines.append(f"CONFIG_{name}=y")
+            elif text in ("m", "M"):
+                lines.append(f"CONFIG_{name}=m")
+            else:
+                lines.append(f'CONFIG_{name}="{escape_string(text)}"' if not re.fullmatch(r"-?\d+|0[xX][0-9a-fA-F]+", text) else f"CONFIG_{name}={text}")
+        return "\n".join(lines) + "\n"
+
+    def _load(self, version_name: str, arch: str | None, payload: dict[str, Any]) -> tuple[_ModelEntry, KconfigEvaluator, dict[str, Any]]:
+        entry = self.get_model(version_name, arch, payload.get("toolchain"))
+        ev = entry.evaluator()
+        content = payload.get("content")
+        if content is None:
+            symbols = payload.get("symbols") or payload.get("current_values") or payload.get("assignments") or {}
+            # String-typed symbols must be quoted in .config syntax; types come from the model
+            lines = []
+            for raw_name, val in symbols.items():
+                bare = raw_name[7:] if raw_name.startswith("CONFIG_") else raw_name
+                t = ev.syms.get(bare, {}).get("type")
+                if t == "string":
+                    lines.append(f'CONFIG_{bare}="{escape_string(str(val))}"')
+                else:
+                    lines.append(self._assignments_to_config({bare: val}).strip())
+            content = "\n".join(lines) + "\n"
+        report = ev.load_config(content)
+        return entry, ev, report
+
+    def export_file(self, version_name: str, payload: dict[str, Any]) -> dict[str, Any]:
+        """.config text for assignments. With `arch`, the assignments are resolved exactly like
+        `make olddefconfig` would (`format`: "config" full file, "defconfig" minimal savedefconfig)."""
+        symbols = payload.get("symbols") or payload.get("assignments") or {}
+        arch = payload.get("arch")
+        if not arch:
+            body = self._assignments_to_config(dict(sorted(symbols.items())))
+            content = "#\n# Automatically generated by KernelInfo-Parser Web Menuconfig\n" f"# Linux Kernel Version {version_name} Configuration\n#\n" + body
+            return {"version": version_name, "content": content, "symbol_count": len(symbols), "resolved": False}
+        entry, ev, report = self._load(version_name, arch, {"symbols": symbols, "toolchain": payload.get("toolchain")})
+        ev.set_all_new_symbols("default")
+        if payload.get("format") == "defconfig":
+            content = ev.write_defconfig()
+        else:
+            content = ev.write_config()
+        return {
+            "version": version_name,
+            "arch": entry.arch["arch"],
+            "content": content,
+            "symbol_count": len(symbols),
+            "resolved": True,
+            "unknown_symbols": report["unknown"],
+            "invalid_values": report["invalid"],
+        }
+
+    def import_file(self, version_name: str, payload: dict[str, Any]) -> dict[str, Any]:
+        """Parse .config text into assignments (with `arch`: also report unknown/invalid entries)."""
+        content = payload.get("content", "") or ""
+        symbols: dict[str, str] = {}
+        for line in content.splitlines():
+            stripped = line.strip()
+            m = re.match(r"^# CONFIG_(\S+) is not set", stripped)
+            if m:
+                symbols[m.group(1)] = "n"
+                continue
+            if stripped.startswith("CONFIG_") and "=" in stripped:
+                name, val = stripped[7:].split("=", 1)
+                if val.startswith('"'):
+                    out, i = [], 1
+                    while i < len(val) and val[i] != '"':
+                        if val[i] == "\\" and i + 1 < len(val):
+                            i += 1
+                        out.append(val[i])
+                        i += 1
+                    val = "".join(out)
+                symbols[name.strip()] = val
+        res: dict[str, Any] = {"version": version_name, "symbol_count": len(symbols), "symbols": symbols}
+        if payload.get("arch"):
+            _, _, report = self._load(version_name, payload["arch"], {"content": content, "toolchain": payload.get("toolchain")})
+            res["unknown_symbols"] = report["unknown"]
+            res["invalid_values"] = report["invalid"]
+            res["warnings"] = report["warnings"]
+        return res
+
+    def validate_assignments(self, version_name: str, payload: dict[str, Any]) -> dict[str, Any]:
+        """Resolve assignments through kconfig and report every value kconfig would not keep."""
+        symbols = payload.get("symbols") or {}
+        entry, ev, report = self._load(version_name, payload.get("arch"), {"symbols": symbols, "toolchain": payload.get("toolchain")})
+        forced: dict[str, str] = {}
+        adjusted: dict[str, str] = {}
+        details: list[dict[str, Any]] = []
+        conflicts: list[dict[str, Any]] = []
+        for raw_name, val in symbols.items():
+            name = raw_name[7:] if raw_name.startswith("CONFIG_") else raw_name
+            if name not in ev.syms or ev.syms[name].get("auto") or ev.syms[name]["type"] == "unknown":
+                continue
+            want = str(val)
+            got = ev.value(name)
+            if ev.syms[name]["type"] in ("bool", "tristate"):
+                want = {"true": "y", "false": "n"}.get(want.lower(), want.lower()[:1])
+            if want == got:
+                continue
+            if ev.rev_dep(name) > 0 and got in ("y", "m") and want in ("n", "m"):
+                reason = "forced by select"
+                forced[name] = got
+            elif ev.visibility(name) == 0:
+                prompts = " || ".join(ev.expr_str(p, with_values=True) for p in ev.syms[name]["prompts"])
+                reason = f"prompt not visible: {prompts}" if prompts else "no prompt (value comes from defaults)"
+                adjusted[name] = got
+            else:
+                reason = "limited by dependencies or range"
+                adjusted[name] = got
+            details.append({"symbol": name, "requested": want, "value": got, "reason": reason,
+                            "depends_on": ev.expr_str(ev.syms[name]["dir_dep"], with_values=True)})
+        for name, s in ev.syms.items():
+            if s["type"] in ("bool", "tristate") and not s.get("choice") and ev.rev_dep(name) > 0 and ev.dir_dep(name) == 0:
+                conflicts.append({
+                    "symbol": name,
+                    "message": f"{name} is selected while its direct dependencies are unmet",
+                    "selected_by": ev.expr_str(s["rev_dep"], with_values=True),
+                    "depends_on": ev.expr_str(s["dir_dep"], with_values=True),
+                })
+        return {
+            "version": version_name,
+            "arch": entry.arch["arch"],
+            "forced_symbols": forced,
+            "adjusted_symbols": adjusted,
+            "details": details,
+            "conflicts": conflicts,
+            "unknown_symbols": report["unknown"],
+            "invalid_values": report["invalid"],
+        }
+
+    def autosolve(self, version_name: str, req: Any) -> dict[str, Any]:
+        """Legal user changes that make a symbol reach the requested value from the current config."""
+        data = req if isinstance(req, dict) else {
+            "target_symbol": getattr(req, "target_symbol", ""),
+            "current_values": getattr(req, "current_values", {}) or {},
+            "arch": getattr(req, "arch", None),
+            "value": getattr(req, "value", None),
+            "toolchain": getattr(req, "toolchain", None),
+        }
+        sym_name = (data.get("target_symbol") or data.get("symbol") or "").strip()
+        if sym_name.startswith("CONFIG_"):
+            sym_name = sym_name[7:]
+        entry, ev, _ = self._load(version_name, data.get("arch"), {"symbols": data.get("current_values") or {}, "toolchain": data.get("toolchain")})
+        want = 1 if str(data.get("value") or "y").lower() == "m" else 2
+        result = solve(ev, sym_name, want)
+        result.update({"version": version_name, "arch": entry.arch["arch"], "target": sym_name, "target_symbol": sym_name})
+        return result
 
     def diff_configurations(self, version_name: str, req: Any) -> dict[str, Any]:
         """Compare two KConfig configuration dictionaries."""
@@ -853,7 +882,7 @@ class KconfigService:
         matching = 0
         mismatched = 0
         diffs = []
-        for k in all_keys:
+        for k in sorted(all_keys):
             v1 = cfg1.get(k)
             v2 = cfg2.get(k)
             if v1 == v2:
@@ -868,353 +897,3 @@ class KconfigService:
             "mismatched_symbols": mismatched,
             "differences": diffs,
         }
-
-    def get_env_presets(self, version_name: str) -> dict[str, Any]:
-        """Dynamically discover target architectures and compilers from database."""
-        with get_db_cursor() as cursor:
-            vid, vname = get_version_info(cursor, version_name)
-            cursor.execute(
-                """
-                SELECT DISTINCT fn.fname
-                FROM m_bridge_checkpoint bc
-                JOIN m_file_name fn ON bc.fnid = fn.fnid
-                WHERE bc.commit_id = %s AND fn.fname LIKE 'arch/%/Kconfig'
-                ORDER BY fn.fname ASC;
-                """,
-                (vid or 1,),
-            )
-            arch_files = [safe_decode(r["fname"]) for r in cursor.fetchall()]
-
-        if not arch_files or "x86" not in [f.split("/")[1] for f in arch_files if len(f.split("/")) >= 2]:
-            try:
-                from webapp.backend.services.git_service import GitService
-                stdout, _, code = GitService.run_git(["ls-tree", "--name-only", f"{vname}:arch"])
-                if code == 0 and stdout:
-                    for a_dir in stdout.splitlines():
-                        if a_dir and not a_dir.startswith(".") and a_dir != "Kconfig":
-                            k_path = f"arch/{a_dir}/Kconfig"
-                            if k_path not in arch_files:
-                                arch_files.append(k_path)
-            except Exception:
-                pass
-
-        discovered_archs: list[dict[str, Any]] = []
-        seen_arch_ids = set()
-
-        for fname in arch_files:
-            parts = fname.split("/")
-            if len(parts) >= 2 and parts[0] == "arch":
-                raw_arch = parts[1].strip().lower()
-                if not raw_arch or raw_arch in seen_arch_ids:
-                    continue
-                seen_arch_ids.add(raw_arch)
-
-                if raw_arch == "x86":
-                    discovered_archs.append({
-                        "id": "x86_64",
-                        "label": "x86_64 (64-bit x86)",
-                        "arch": "x86",
-                        "srcarch": "x86",
-                        "kconfig_path": fname,
-                        "canonical_defconfig": "x86_64_defconfig",
-                        "bits": 64,
-                        "symbols": {
-                            "64BIT": "y",
-                            "X86_64": "y",
-                            "X86": "y",
-                            "X86_32": "n",
-                            "ARCH": "x86",
-                            "SRCARCH": "x86",
-                        },
-                    })
-                    discovered_archs.append({
-                        "id": "i386",
-                        "label": "i386 / x86_32 (32-bit x86)",
-                        "arch": "x86",
-                        "srcarch": "x86",
-                        "kconfig_path": fname,
-                        "canonical_defconfig": "i386_defconfig",
-                        "bits": 32,
-                        "symbols": {
-                            "64BIT": "n",
-                            "X86_32": "y",
-                            "X86": "y",
-                            "X86_64": "n",
-                            "ARCH": "x86",
-                            "SRCARCH": "x86",
-                        },
-                    })
-                elif raw_arch in ("powerpc", "ppc"):
-                    discovered_archs.append({
-                        "id": "powerpc_64",
-                        "label": "powerpc (64-bit PPC64)",
-                        "arch": "powerpc",
-                        "srcarch": "powerpc",
-                        "kconfig_path": fname,
-                        "canonical_defconfig": "ppc64_defconfig",
-                        "bits": 64,
-                        "symbols": {
-                            "64BIT": "y",
-                            "PPC64": "y",
-                            "PPC": "y",
-                            "PPC32": "n",
-                            "ARCH": "powerpc",
-                            "SRCARCH": "powerpc",
-                        },
-                    })
-                    discovered_archs.append({
-                        "id": "powerpc_32",
-                        "label": "powerpc (32-bit PPC32)",
-                        "arch": "powerpc",
-                        "srcarch": "powerpc",
-                        "kconfig_path": fname,
-                        "canonical_defconfig": "pmac32_defconfig",
-                        "bits": 32,
-                        "symbols": {
-                            "64BIT": "n",
-                            "PPC32": "y",
-                            "PPC": "y",
-                            "PPC64": "n",
-                            "ARCH": "powerpc",
-                            "SRCARCH": "powerpc",
-                        },
-                    })
-                elif raw_arch in ("sparc", "sparc64"):
-                    discovered_archs.append({
-                        "id": "sparc64",
-                        "label": "sparc64 (64-bit SPARC)",
-                        "arch": "sparc",
-                        "srcarch": "sparc",
-                        "kconfig_path": fname,
-                        "canonical_defconfig": "sparc64_defconfig",
-                        "bits": 64,
-                        "symbols": {
-                            "64BIT": "y",
-                            "SPARC64": "y",
-                            "SPARC": "y",
-                            "SPARC32": "n",
-                            "ARCH": "sparc",
-                            "SRCARCH": "sparc",
-                        },
-                    })
-                    discovered_archs.append({
-                        "id": "sparc32",
-                        "label": "sparc32 (32-bit SPARC)",
-                        "arch": "sparc",
-                        "srcarch": "sparc",
-                        "kconfig_path": fname,
-                        "canonical_defconfig": "sparc32_defconfig",
-                        "bits": 32,
-                        "symbols": {
-                            "64BIT": "n",
-                            "SPARC32": "y",
-                            "SPARC": "y",
-                            "SPARC64": "n",
-                            "ARCH": "sparc",
-                            "SRCARCH": "sparc",
-                        },
-                    })
-                elif raw_arch == "arm":
-                    discovered_archs.append({
-                        "id": "arm",
-                        "label": "ARM (32-bit ARM)",
-                        "arch": "arm",
-                        "srcarch": "arm",
-                        "kconfig_path": fname,
-                        "canonical_defconfig": "versatile_defconfig",
-                        "bits": 32,
-                        "symbols": {
-                            "ARM": "y",
-                            "ARCH": "arm",
-                            "SRCARCH": "arm",
-                            "64BIT": "n",
-                        },
-                    })
-                elif raw_arch in ("arm64", "aarch64"):
-                    discovered_archs.append({
-                        "id": "arm64",
-                        "label": "ARM64 (64-bit aarch64)",
-                        "arch": "arm64",
-                        "srcarch": "arm64",
-                        "kconfig_path": fname,
-                        "canonical_defconfig": "defconfig",
-                        "bits": 64,
-                        "symbols": {
-                            "ARM64": "y",
-                            "ARCH": "arm64",
-                            "SRCARCH": "arm64",
-                            "64BIT": "y",
-                        },
-                    })
-                elif raw_arch.startswith("mips"):
-                    discovered_archs.append({
-                        "id": "mips",
-                        "label": "MIPS",
-                        "arch": "mips",
-                        "srcarch": "mips",
-                        "kconfig_path": fname,
-                        "canonical_defconfig": "malta_defconfig",
-                        "bits": 32,
-                        "symbols": {
-                            "MIPS": "y",
-                            "ARCH": "mips",
-                            "SRCARCH": "mips",
-                        },
-                    })
-                else:
-                    upper_arch = raw_arch.upper()
-                    discovered_archs.append({
-                        "id": raw_arch,
-                        "label": f"{raw_arch} ({upper_arch})",
-                        "arch": raw_arch,
-                        "srcarch": raw_arch,
-                        "kconfig_path": fname,
-                        "canonical_defconfig": "defconfig",
-                        "bits": 64 if "64" in raw_arch else 32,
-                        "symbols": {
-                            upper_arch: "y",
-                            "ARCH": raw_arch,
-                            "SRCARCH": raw_arch,
-                        },
-                    })
-
-        compilers = [
-            {"id": "gcc", "label": "GNU Compiler Collection (gcc)", "symbols": {"CC_IS_GCC": "y"}},
-            {"id": "clang", "label": "LLVM Clang (clang)", "symbols": {"CC_IS_CLANG": "y"}},
-        ]
-
-        return {
-            "version": version_name,
-            "targets": discovered_archs,
-            "architectures": discovered_archs,
-            "compilers": compilers,
-        }
-
-    def export_file(self, version_name: str, payload: dict[str, Any]) -> dict[str, Any]:
-        """Generate Linux kernel compatible .config file text from provided symbol assignments."""
-        symbols = payload.get("symbols", {})
-        lines = [
-            "#",
-            "# Automatically generated by KernelInfo-Parser Web Menuconfig",
-            f"# Linux Kernel Version {version_name} Configuration",
-            "#",
-        ]
-
-        for raw_name, val in sorted(symbols.items()):
-            name = raw_name if not raw_name.startswith("CONFIG_") else raw_name[7:]
-            val_str = str(val).strip() if val is not None else ""
-
-            if val_str in ("y", "Y", "1", "true", "True"):
-                lines.append(f"CONFIG_{name}=y")
-            elif val_str in ("m", "M"):
-                lines.append(f"CONFIG_{name}=m")
-            elif val_str in ("n", "N", "0", "false", "False", ""):
-                lines.append(f"# CONFIG_{name} is not set")
-            else:
-                if (val_str.startswith('"') and val_str.endswith('"')) or val_str.isdigit() or val_str.startswith("0x"):
-                    lines.append(f"CONFIG_{name}={val_str}")
-                else:
-                    lines.append(f'CONFIG_{name}="{val_str}"')
-
-        content = "\n".join(lines) + "\n"
-        return {
-            "version": version_name,
-            "content": content,
-            "symbol_count": len(symbols),
-        }
-
-    def import_file(self, version_name: str, payload: dict[str, Any]) -> dict[str, Any]:
-        """Parse imported Linux .config text payload into symbol assignments dictionary."""
-        content = payload.get("content", "")
-        symbols: dict[str, str] = {}
-        lines = content.splitlines()
-
-        for line in lines:
-            stripped = line.strip()
-            if not stripped:
-                continue
-
-            if stripped.startswith("# CONFIG_") and stripped.endswith(" is not set"):
-                sym = stripped[9:-11].strip()
-                if sym:
-                    symbols[sym] = "n"
-                continue
-
-            if stripped.startswith("#"):
-                continue
-
-            if "=" in stripped and stripped.startswith("CONFIG_"):
-                parts = stripped[7:].split("=", 1)
-                sym = parts[0].strip()
-                val = parts[1].strip().strip('"')
-                symbols[sym] = val
-
-        return {
-            "version": version_name,
-            "symbol_count": len(symbols),
-            "symbols": symbols,
-        }
-
-    def search_symbols(self, version_name: str, q: str = "", limit: int = 50, offset: int = 0) -> dict[str, Any]:
-        """Search Kconfig symbols with or without CONFIG_ prefix."""
-        clean_q = q.strip()
-        if clean_q.startswith("CONFIG_"):
-            clean_q = clean_q[7:]
-
-        with get_db_cursor() as cursor:
-            vid, _ = get_version_info(cursor, version_name)
-            cursor.execute(
-                """
-                SELECT s.name, s.type, s.prompt, s.help
-                FROM m_kconfig_symbol s
-                WHERE (s.name LIKE %s OR s.prompt LIKE %s)
-                ORDER BY (s.name = %s) DESC, s.name ASC
-                LIMIT %s OFFSET %s;
-                """,
-                (f"%{clean_q}%", f"%{clean_q}%", clean_q, limit, offset),
-            )
-            type_names = {1: "bool", 2: "tristate", 3: "string", 4: "hex", 5: "int"}
-            symbols = [
-                {
-                    "name": safe_decode(r["name"]),
-                    "type": r["type"],
-                    "type_name": type_names.get(r["type"], "tristate"),
-                    "prompt": safe_decode(r["prompt"]),
-                    "help": safe_decode(r["help"]),
-                }
-                for r in cursor.fetchall()
-            ]
-
-        return {"version": version_name, "query": q, "count": len(symbols), "symbols": symbols}
-
-    def validate_assignments(self, version_name: str, payload: dict[str, Any]) -> dict[str, Any]:
-        """Validate symbols against dependencies and select constraints."""
-        symbols = payload.get("symbols", {})
-        forced_symbols: dict[str, str] = {}
-        adjusted_symbols: dict[str, str] = {}
-
-        with get_db_cursor() as cursor:
-            vid, _ = get_version_info(cursor, version_name)
-            for sym, val in symbols.items():
-                if val in ("y", "m"):
-                    cursor.execute(
-                        """
-                        SELECT r.target_name
-                        FROM m_kconfig_relation r
-                        JOIN m_kconfig_symbol s ON r.kcid = s.kcid
-                        WHERE s.name = %s AND r.rel_type = 2;
-                        """,
-                        (sym,),
-                    )
-                    for r in cursor.fetchall():
-                        t_name = safe_decode(r["target_name"])
-                        forced_symbols[t_name] = "y"
-                        adjusted_symbols[t_name] = "y"
-
-        return {
-            "version": version_name,
-            "forced_symbols": forced_symbols,
-            "adjusted_symbols": adjusted_symbols,
-            "conflicts": [],
-        }
-

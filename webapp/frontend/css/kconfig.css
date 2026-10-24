@@ -365,3 +365,318 @@
 .kconfig-cmp-table tbody tr:hover {
   background: var(--bg-hover);
 }
+
+/* 5. Engine-driven explorer details */
+.kconfig-btn-row {
+  display: flex;
+  gap: 6px;
+}
+
+.kconfig-btn-row .code-btn {
+  flex: 1;
+}
+
+.kconfig-status {
+  font-size: 10px;
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+}
+
+.kconfig-empty,
+.kconfig-muted {
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+.kconfig-empty {
+  padding: 16px;
+}
+
+.kconfig-error {
+  color: var(--accent-red);
+  padding: 8px;
+  font-size: 12px;
+}
+
+.kconfig-warning {
+  color: var(--accent-orange);
+  font-size: 11px;
+}
+
+.kconfig-node-name {
+  flex: 1;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.kconfig-node-sym,
+.kconfig-node-loc {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+.kconfig-node-loc {
+  max-width: 140px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.kconfig-node-comment .kconfig-node-name {
+  color: var(--text-muted);
+  font-style: italic;
+}
+
+.kconfig-submenu {
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+}
+
+.kconfig-value-line {
+  margin-top: 6px;
+  font-size: 12px;
+}
+
+.kconfig-value-controls {
+  display: flex;
+  gap: 4px;
+  align-items: center;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.kconfig-set-btn {
+  min-width: 28px;
+  font-family: var(--font-mono);
+}
+
+.kconfig-set-btn:disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
+}
+
+.kconfig-value-input {
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-sm);
+  color: var(--text-primary);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  padding: 3px 6px;
+  min-width: 160px;
+}
+
+.kconfig-expr {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-secondary);
+  word-break: break-word;
+}
+
+.kconfig-tri {
+  display: inline-block;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  padding: 0 5px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-color);
+}
+
+.kconfig-tri-y {
+  color: var(--accent-green);
+}
+
+.kconfig-tri-m {
+  color: var(--accent-yellow);
+}
+
+.kconfig-tri-n {
+  color: var(--accent-red);
+}
+
+.kconfig-tag {
+  font-size: 9px;
+  text-transform: uppercase;
+  padding: 0 4px;
+  border-radius: var(--radius-sm);
+  background: rgba(63, 185, 80, 0.15);
+  color: var(--accent-green);
+}
+
+.kconfig-default {
+  font-size: 11px;
+  opacity: 0.7;
+}
+
+.kconfig-default.active {
+  opacity: 1;
+}
+
+.kconfig-def-row,
+.kconfig-file-row,
+.kconfig-rel-row,
+.kconfig-validate-row,
+.kconfig-usage-line {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+  font-size: 11px;
+}
+
+.kconfig-def-row {
+  padding: 4px 0;
+  border-bottom: 1px dashed var(--border-color);
+}
+
+.kconfig-location {
+  width: 100%;
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+
+.kconfig-file-link {
+  padding: 1px 6px;
+  font-size: 11px;
+  color: var(--accent-blue);
+  font-family: var(--font-mono);
+}
+
+.kconfig-other-arch {
+  opacity: 0.5;
+}
+
+.kconfig-help {
+  white-space: pre-wrap;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-secondary);
+  margin: 0;
+  max-height: 260px;
+  overflow-y: auto;
+}
+
+.kconfig-usage-file summary {
+  cursor: pointer;
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+
+.kconfig-usage-line code {
+  font-size: 11px;
+  white-space: pre-wrap;
+}
+
+/* TUI extras */
+.tui-sym {
+  color: #333377;
+  font-size: 11px;
+  margin-left: 6px;
+}
+
+.tui-menu-item.selected .tui-sym {
+  color: #aaaaff;
+}
+
+.tui-menu-item {
+  white-space: pre;
+}
+
+.tui-menu-item.tui-invisible {
+  color: #555555;
+}
+
+.tui-help {
+  position: absolute;
+  inset: 0;
+  background: rgba(0, 0, 80, 0.6);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.tui-help-window {
+  width: 80%;
+  max-width: 820px;
+  max-height: 80vh;
+  margin: 8vh auto;
+  background: #aaaaaa;
+  color: #000000;
+  border: 2px solid #ffffff;
+  box-shadow: 6px 6px 0 #000000;
+  display: flex;
+  flex-direction: column;
+}
+
+.tui-help-window pre {
+  flex: 1;
+  overflow-y: auto;
+  margin: 0;
+  padding: 10px;
+  white-space: pre-wrap;
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+
+/* Toolchain dialog */
+.kconfig-tc-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(210px, 1fr));
+  gap: 8px 12px;
+}
+
+.kconfig-tc-field {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+
+.kconfig-tc-field select,
+.kconfig-tc-table select {
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-sm);
+  color: var(--text-primary);
+  font-size: 12px;
+  padding: 3px 6px;
+}
+
+.kconfig-tc-table td {
+  vertical-align: top;
+}
+
+.kconfig-tc-table .kconfig-value-input {
+  min-width: 120px;
+  width: 100%;
+  box-sizing: border-box;
+}
+
+.kconfig-tc-src {
+  font-size: 9px;
+  text-transform: uppercase;
+  padding: 0 5px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-color);
+}
+
+.kconfig-tc-src-assumed {
+  color: var(--accent-yellow);
+}
+
+.kconfig-tc-src-override {
+  color: var(--accent-purple);
+}
+
+.kconfig-tc-src-knowledge,
+.kconfig-tc-src-toolchain {
+  color: var(--accent-green);
+}
+
+.kconfig-status-link {
+  color: var(--accent-blue);
+  text-decoration: none;
+}

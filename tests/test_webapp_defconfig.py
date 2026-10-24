@@ -18,8 +18,8 @@ class TestWebappDefconfig(unittest.TestCase):
     """Test defconfig listing, content retrieval, architecture-scoped dependencies, and symbol lifecycle."""
 
     def test_get_kconfig_defconfigs_x86(self) -> None:
-        """Test retrieving x86 architecture defconfigs."""
-        res = get_kconfig_defconfigs("v3.0", "x86")
+        """Test retrieving x86 architecture defconfigs (default = what `make ARCH=<arch> defconfig` loads)."""
+        res = get_kconfig_defconfigs("v3.0", "x86_64")
         self.assertIn("defconfigs", res)
         self.assertIn("canonical_default", res)
         self.assertGreaterEqual(res["total_count"], 1)
@@ -28,6 +28,9 @@ class TestWebappDefconfig(unittest.TestCase):
         self.assertIsNotNone(canonical)
         self.assertEqual(canonical["name"], "x86_64_defconfig")
         self.assertTrue(canonical["is_canonical"])
+
+        # arch/x86/Makefile: ARCH=x86 selects i386_defconfig
+        self.assertEqual(get_kconfig_defconfigs("v3.0", "x86")["canonical_default"]["name"], "i386_defconfig")
 
     def test_get_kconfig_defconfig_content_full_path(self) -> None:
         """Test parsing defconfig using full relative file path."""
@@ -71,7 +74,7 @@ class TestWebappDefconfig(unittest.TestCase):
 
     def test_x86_tree_scoped_arch_dependencies(self) -> None:
         """Verify that x86 menu tree only retains x86 architecture dependencies."""
-        tree = get_kconfig_tree("v3.0", "x86")
+        tree = get_kconfig_tree("v3.0", "x86", include_nodes=True)
         self.assertIn("nodes", tree)
 
         sym_64bit_node = None

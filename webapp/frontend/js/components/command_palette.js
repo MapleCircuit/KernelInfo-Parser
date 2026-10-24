@@ -189,7 +189,7 @@ class CommandPalette {
       for (const k of val(kconfig)?.symbols || []) {
         items.push({
           section: "Kconfig", icon: "⚙", title: `CONFIG_${k.name}`, detail: k.prompt || k.type_name || "", highlightQuery: query,
-          run: () => state.openTab({ type: "kconfig", title: "KConfig (x86)", arch: "x86", version, symbol: k.name }),
+          run: () => state.openTab({ type: "kconfig", title: "KConfig (x86_64)", arch: "x86_64", version, symbol: k.name }),
         });
       }
       for (const c of val(commits)?.commits || []) {

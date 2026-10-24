@@ -328,7 +328,7 @@ class TestKconfigAstIntegration(unittest.TestCase):
         self.assertIn("arm", arch_ids)
         self.assertIn("alpha", arch_ids)
         self.assertIn("mips", arch_ids)
-        self.assertIn("powerpc_64", arch_ids)
+        self.assertIn("powerpc", arch_ids)
         self.assertIn("s390", arch_ids)
         self.assertIn("sparc64", arch_ids)
         self.assertIn("xtensa", arch_ids)
@@ -338,10 +338,12 @@ class TestKconfigAstIntegration(unittest.TestCase):
         self.assertIn("gcc", compiler_ids)
         self.assertIn("clang", compiler_ids)
 
+        # Presets are the kconfig environment (ARCH/SRCARCH), not hand-picked symbol values:
+        # 64BIT/X86_64 follow from ARCH=x86_64 through arch/x86/Kconfig itself
         x86_64_preset = next(a for a in presets["architectures"] if a["id"] == "x86_64")
-        self.assertEqual(x86_64_preset["symbols"]["64BIT"], "y")
-        self.assertEqual(x86_64_preset["symbols"]["X86_64"], "y")
-        self.assertEqual(x86_64_preset["symbols"]["ARCH"], "x86")
+        self.assertEqual(x86_64_preset["env"]["ARCH"], "x86_64")
+        self.assertEqual(x86_64_preset["env"]["SRCARCH"], "x86")
+        self.assertEqual(x86_64_preset["canonical_defconfig"], "x86_64_defconfig")
 
     def test_kbuild_parser_composite_and_direct(self) -> None:
         from parser.kbuild_parser import KbuildParser
@@ -383,7 +385,7 @@ obj-y += core.o
 
     def test_kconfig_tree_scoped_hierarchy(self) -> None:
         from webapp.main import get_kconfig_tree
-        tree_res = get_kconfig_tree("v3.0", arch="x86")
+        tree_res = get_kconfig_tree("v3.0", arch="x86", include_nodes=True)
         self.assertIn("nodes", tree_res)
         self.assertEqual(tree_res["arch"], "x86")
 
@@ -436,8 +438,8 @@ obj-y += core.o
 
     def test_kconfig_defconfig_discovery(self) -> None:
         from webapp.main import get_kconfig_defconfigs
-        # Test x86 defconfigs
-        x86_res = get_kconfig_defconfigs("v3.0", arch="x86")
+        # Test x86 defconfigs (ARCH=x86_64: `make defconfig` loads x86_64_defconfig)
+        x86_res = get_kconfig_defconfigs("v3.0", arch="x86_64")
         self.assertIn("defconfigs", x86_res)
         self.assertGreaterEqual(x86_res["total_count"], 2)
         names = [d["name"] for d in x86_res["defconfigs"]]
@@ -483,7 +485,7 @@ obj-y += core.o
 
     def test_kconfig_tree_relations(self) -> None:
         from webapp.main import get_kconfig_tree
-        tree_res = get_kconfig_tree("v3.0", arch="x86")
+        tree_res = get_kconfig_tree("v3.0", arch="x86", include_relations=True, include_nodes=True)
         self.assertIn("nodes", tree_res)
         if "relations" in tree_res:
             self.assertIn("reverse_relations", tree_res)

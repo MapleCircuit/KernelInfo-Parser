@@ -1,5 +1,13 @@
 /**
- * kconfig_view.js - KConfig Explorer, Constraint Inspector & .config Manager.
+ * kconfig_view.js - KConfig explorer: web menuconfig, symbol inspector and .config manager.
+ *
+ * The configuration model of the selected ARCH comes from GET /api/kconfig/{version}/tree and is
+ * evaluated in the browser by KconfigEngine (scripts/kconfig semantics). While the engine is on,
+ * every edit goes through kconfig's own setters, so only valid configurations can be produced and
+ * exported. With the engine off, values are edited raw (no constraints) for exploration.
+ *
+ * One configuration is kept per "version|ARCH" profile (state.kconfigProfiles); the active one is
+ * published as state.kconfigAssignments for #ifdef dimming in code views.
  */
 import { api } from "../../api.js";
 import { state } from "../../state.js";
@@ -7,1051 +15,960 @@ import { toast } from "../../components/toast.js";
 import { KconfigEngine } from "./kconfig_engine.js";
 import { KconfigParser } from "./kconfig_parser.js";
 import { MenuconfigTui } from "./menuconfig_tui.js";
-import { openModal, escapeHtml } from "../../components/modal.js";
+import { openModal, escapeHtml, downloadText } from "../../components/modal.js";
+
+const DEFAULT_ARCH = "x86_64";
+const TRI_CHAR = ["n", "m", "y"];
+const SEARCH_LIMIT = 150;
 
 export class KconfigView {
   constructor() {
-    this.treeNodes = [];
     this.engine = new KconfigEngine();
-    this.showUnmet = false; // Clean Linux menuconfig tree by default
-    this.currentArch = "x86";
+    this.showUnmet = false;
+    this.currentArch = DEFAULT_ARCH;
     this.currentVersion = "v3.0";
     this.selectedSymbol = null;
     this.selectedNodeId = null;
     this.expandedNodeIds = new Set();
-    this.nodesByParent = new Map();
-    this.nodesById = new Map();
-    this.nodesBySymbol = new Map();
     this.containerEl = null;
     this.archPresets = [];
+    this.detailToken = 0;
+    // Raw assignments (bare names) while the engine is off; resolved values while it is on
+    this.rawValues = {};
   }
 
-  /** The constraint engine switch is global so code views can gate #ifdef dimming on it. */
+  /** The engine switch is global so code views can gate #ifdef dimming on it. */
   get engineActive() {
     return state.kconfigEngineActive;
+  }
+
+  get profileKey() {
+    return `${this.currentVersion}|${this.currentArch}`;
+  }
+
+  /** Toolchain profile of this version|ARCH (only the fields the user set; server fills defaults). */
+  get toolchain() {
+    return state.getKconfigToolchain(this.profileKey);
+  }
+
+  get nodes() {
+    return this.engine.loaded ? this.engine.nodes : [];
   }
 
   async render(containerEl, tabData) {
     this.containerEl = containerEl;
     this.currentVersion = tabData.version || state.currentVersion;
-    this.currentArch = tabData.arch || "x86";
+    this.currentArch = tabData.arch || DEFAULT_ARCH;
 
     containerEl.innerHTML = `
       <div class="kconfig-view-container">
-        <!-- 1. Left Explorer Column -->
         <div class="kconfig-explorer-col">
           <div class="kconfig-filter-bar">
             <div class="kconfig-arch-presets">
-              <select id="kconfig-arch-select" style="flex:1;">
-                <option value="x86" ${this.currentArch === "x86" ? "selected" : ""}>x86 (i386 / x86_64)</option>
-                <option value="arm" ${this.currentArch === "arm" ? "selected" : ""}>ARM</option>
-                <option value="arm64" ${this.currentArch === "arm64" ? "selected" : ""}>ARM64 (aarch64)</option>
-                <option value="mips" ${this.currentArch === "mips" ? "selected" : ""}>MIPS</option>
-                <option value="powerpc" ${this.currentArch === "powerpc" ? "selected" : ""}>PowerPC</option>
-                <option value="sparc" ${this.currentArch === "sparc" ? "selected" : ""}>SPARC</option>
+              <select id="kconfig-arch-select" style="flex:1;" title="ARCH value passed to kconfig (decides which Kconfig files and definitions apply)">
+                <option value="${escapeHtml(this.currentArch)}">${escapeHtml(this.currentArch)}</option>
               </select>
-              <button class="code-btn" id="btn-open-tui" title="Open Terminal Menuconfig">TUI</button>
+              <button class="code-btn" id="btn-toolchain" title="Compiler, linker, environment variables and toolchain checks Kconfig depends on">Toolchain…</button>
+              <button class="code-btn" id="btn-open-tui" title="Open terminal-style menuconfig">TUI</button>
             </div>
             <div class="kconfig-search-box">
-              <input type="text" placeholder="Filter symbols..." id="kconfig-search-input" />
+              <input type="text" placeholder="Search symbols or prompts..." id="kconfig-search-input" />
             </div>
-            <div style="display:flex;gap:6px;align-items:center;margin-bottom:6px;">
-              <button class="code-btn ${this.engineActive ? "active" : ""}" id="btn-toggle-engine" style="flex:1;">
-                ${this.engineActive ? "✓ Engine Active" : "⚡ Enable Engine"}
-              </button>
-              <button class="code-btn ${this.showUnmet ? "active" : ""}" id="btn-toggle-unmet" style="flex:1;" title="Toggle visibility of inactive/unmet options">
-                ${this.showUnmet ? "✓ Showing Unmet" : "👁 Show Unmet"}
-              </button>
+            <div class="kconfig-btn-row">
+              <button class="code-btn ${this.engineActive ? "active" : ""}" id="btn-toggle-engine" title="Constraint engine: only values kconfig accepts can be set">${this.engineActive ? "✓ Engine Active" : "⚡ Enable Engine"}</button>
+              <button class="code-btn ${this.showUnmet ? "active" : ""}" id="btn-toggle-unmet" title="Also list entries whose dependencies are not met">${this.showUnmet ? "✓ Showing All" : "👁 Show All"}</button>
             </div>
-            <div style="display:flex;gap:6px;">
-              <button class="code-btn" id="btn-export-config" style="flex:1;">Export .config</button>
-              <button class="code-btn" id="btn-load-defconfig" style="flex:1;">Load Defconfig</button>
+            <div class="kconfig-btn-row">
+              <button class="code-btn" id="btn-export-config" title="Download the full .config (what make writes)">Export .config</button>
+              <button class="code-btn" id="btn-export-defconfig" title="Download a minimal defconfig (make savedefconfig)">Save defconfig</button>
+              <button class="code-btn" id="btn-load-defconfig" title="Load one of the architecture's defconfigs">Load Defconfig</button>
             </div>
-            <div style="display:flex;gap:6px;margin-top:6px;">
-              <button class="code-btn" id="btn-import-config" style="flex:1;" title="Load a .config file">Import .config</button>
-              <button class="code-btn" id="btn-validate-config" style="flex:1;" title="Check select/depends constraints">Validate</button>
-              <button class="code-btn" id="btn-compare-config" style="flex:1;" title="Compare the current configuration with a defconfig">Compare…</button>
+            <div class="kconfig-btn-row">
+              <button class="code-btn" id="btn-import-config" title="Load a .config or defconfig file">Import .config</button>
+              <button class="code-btn" id="btn-validate-config" title="Check the configuration against Kconfig constraints">Validate</button>
+              <button class="code-btn" id="btn-compare-config" title="Compare the current configuration with a defconfig">Compare…</button>
               <input type="file" id="kconfig-import-file" accept=".config,text/plain,*" hidden />
             </div>
+            <div class="kconfig-status" id="kconfig-status"></div>
           </div>
           <div class="kconfig-tree-scroll" id="kconfig-tree-scroll">
-            <div style="padding:16px;color:var(--text-muted);">Loading KConfig tree for ${this.currentArch}...</div>
+            <div class="kconfig-empty">Loading KConfig model for ${escapeHtml(this.currentArch)}...</div>
           </div>
         </div>
-
-        <!-- 2. Right Symbol Detail Column -->
         <div class="kconfig-detail-col" id="kconfig-detail-col">
-          <div style="color:var(--text-muted);padding-top:40px;text-align:center;">
-            Select a configuration option from the left tree to inspect its dependencies and compiled targets.
+          <div class="kconfig-empty" style="padding-top:40px;text-align:center;">
+            Select a configuration option to inspect where it is declared, what it depends on and which files it builds.
           </div>
         </div>
       </div>
     `;
+    this.bindToolbar();
 
-    // Arch change with confirmation prompt if config has selections
-    const archSelect = containerEl.querySelector("#kconfig-arch-select");
-    archSelect.onchange = (e) => {
-      const targetArch = e.target.value;
-      if (targetArch === this.currentArch) return;
-
-      const hasCustomAssignments = Object.keys(state.kconfigAssignments || {}).length > 0;
-      if (hasCustomAssignments) {
-        this.showConfirmModal({
-          title: "Switch Architecture?",
-          message: `Switching to <strong>${targetArch}</strong> will reset your current configuration selections and load the target architecture defaults.`,
-          confirmText: `Switch to ${targetArch}`,
-          cancelText: "Keep Current",
-          onConfirm: async () => {
-            await this.switchArchitecture(targetArch);
-          },
-          onCancel: () => {
-            archSelect.value = this.currentArch;
-          }
-        });
-      } else {
-        this.switchArchitecture(targetArch);
-      }
-    };
-
-    // Engine activation toggle
-    const engineBtn = containerEl.querySelector("#btn-toggle-engine");
-    engineBtn.onclick = () => {
-      state.setKconfigEngineActive(!state.kconfigEngineActive);
-      engineBtn.classList.toggle("active", this.engineActive);
-      engineBtn.textContent = this.engineActive ? "✓ Engine Active" : "⚡ Enable Engine";
-      if (this.engineActive) {
-        const resolved = this.engine.propagate(state.kconfigAssignments);
-        state.setKconfigAssignments(resolved);
-        this.renderTree();
-        toast.success("Constraint engine activated: live propagation and #ifdef dimming in code views");
-      } else {
-        toast.info("Constraint engine dormant (fast browsing mode, #ifdef dimming off)");
-      }
-    };
-
-    // Unmet / inactive visibility toggle
-    const unmetBtn = containerEl.querySelector("#btn-toggle-unmet");
-    unmetBtn.onclick = () => {
-      this.showUnmet = !this.showUnmet;
-      unmetBtn.classList.toggle("active", this.showUnmet);
-      unmetBtn.textContent = this.showUnmet ? "✓ Showing Unmet" : "👁 Show Unmet";
-      this.renderTree();
-      toast.info(this.showUnmet ? "Showing all options including unmet dependencies" : "Showing only active/visible options");
-    };
-
-    // TUI Menuconfig trigger
-    containerEl.querySelector("#btn-open-tui").onclick = () => {
-      const tui = new MenuconfigTui(this.treeNodes, this.engine, {
-        getVal: (sym) => {
-          const bare = sym.startsWith("CONFIG_") ? sym.substring(7) : sym;
-          return state.kconfigAssignments[bare] || state.kconfigAssignments[`CONFIG_${bare}`] || "n";
-        },
-        setVal: (sym, val) => {
-          state.setKconfigAssignment(sym, val);
-          if (this.engineActive) {
-            const resolved = this.engine.propagate(state.kconfigAssignments);
-            state.setKconfigAssignments(resolved);
-          }
-          this.renderTree();
-        },
-        save: () => this.exportConfig()
-      });
-      tui.show();
-    };
-
-    // Export .config
-    containerEl.querySelector("#btn-export-config").onclick = () => this.exportConfig();
-
-    // Import .config (server-side parsing into assignments)
-    const importInput = containerEl.querySelector("#kconfig-import-file");
-    containerEl.querySelector("#btn-import-config").onclick = () => importInput.click();
-    importInput.onchange = async () => {
-      const file = importInput.files?.[0];
-      importInput.value = "";
-      if (!file) return;
-      try {
-        const res = await api.importKconfig(this.currentVersion, await file.text());
-        const symbols = res.symbols || res.assignments || {};
-        const count = Object.keys(symbols).length;
-        if (!count) {
-          toast.error("No CONFIG_ assignments found in that file");
-          return;
-        }
-        state.setKconfigAssignments(this.engineActive ? this.engine.propagate(symbols) : symbols);
-        this.renderTree();
-        toast.success(`Imported ${count} symbols from ${file.name}`);
-      } catch (err) {
-        toast.error(`Import failed: ${err.message}`);
-      }
-    };
-
-    containerEl.querySelector("#btn-validate-config").onclick = () => this.showValidation();
-    containerEl.querySelector("#btn-compare-config").onclick = () => this.showCompareWithDefconfig();
-
-    // Load Defconfig via Selector Modal
-    containerEl.querySelector("#btn-load-defconfig").onclick = async () => {
-      try {
-        const defs = await api.getKconfigDefconfigs(this.currentVersion, this.currentArch);
-        const list = (defs && defs.defconfigs) || [];
-        if (list.length === 0) {
-          toast.info("No architecture defconfig found.");
-          return;
-        }
-        this.showDefconfigModal(list);
-      } catch (err) {
-        toast.error(`Failed to fetch defconfigs: ${err.message}`);
-      }
-    };
-
-    // Search filter
-    const searchInput = containerEl.querySelector("#kconfig-search-input");
-    searchInput.oninput = () => {
-      const q = searchInput.value.trim().toLowerCase();
-      this.filterTree(q);
-    };
-
-    // Fetch architecture presets
     try {
       const presetsRes = await api.getKconfigPresets(this.currentVersion);
       this.archPresets = (presetsRes && (presetsRes.targets || presetsRes.architectures)) || [];
+      if (!this.archPresets.some((p) => p.id === this.currentArch)) {
+        const fallback = presetsRes?.default_arch || this.archPresets[0]?.id || DEFAULT_ARCH;
+        if (this.archPresets.length) toast.info(`ARCH=${this.currentArch} does not exist in ${this.currentVersion}; using ${fallback}`);
+        this.currentArch = fallback;
+      }
+      this.fillArchSelect();
     } catch (err) {
       console.warn("Could not fetch arch presets:", err);
     }
 
-    // Initial load: if state does not have architecture defconfig loaded (less than 50 symbols), load defaults
-    const hasAssignments = Object.keys(state.kconfigAssignments || {}).length >= 50;
-    if (!hasAssignments) {
-      await this.switchArchitecture(this.currentArch);
-    } else {
-      await this.loadTree();
-    }
-
-    if (tabData && tabData.symbol) {
-      this.selectAndInspectSymbol(tabData.symbol);
-    }
+    await this.activateArch(this.currentArch);
+    if (tabData && tabData.symbol) this.selectAndInspectSymbol(tabData.symbol);
   }
 
-  async switchArchitecture(targetArch) {
-    if (this.currentArch !== targetArch) {
+  bindToolbar() {
+    const c = this.containerEl;
+    const archSelect = c.querySelector("#kconfig-arch-select");
+    archSelect.onchange = async (e) => {
+      const target = e.target.value;
+      if (target !== this.currentArch) await this.activateArch(target);
+    };
+
+    const engineBtn = c.querySelector("#btn-toggle-engine");
+    engineBtn.onclick = () => this.setEngineActive(!this.engineActive);
+
+    const unmetBtn = c.querySelector("#btn-toggle-unmet");
+    unmetBtn.onclick = () => {
+      this.showUnmet = !this.showUnmet;
+      unmetBtn.classList.toggle("active", this.showUnmet);
+      unmetBtn.textContent = this.showUnmet ? "✓ Showing All" : "👁 Show All";
+      this.renderTree();
+    };
+
+    c.querySelector("#btn-toolchain").onclick = () => this.showToolchainModal();
+    c.querySelector("#btn-open-tui").onclick = () => {
+      if (!this.engine.loaded) return;
+      new MenuconfigTui(this).show();
+    };
+    c.querySelector("#btn-export-config").onclick = () => this.exportConfig();
+    c.querySelector("#btn-export-defconfig").onclick = () => this.exportDefconfig();
+    c.querySelector("#btn-load-defconfig").onclick = () => this.showDefconfigModal();
+
+    const importInput = c.querySelector("#kconfig-import-file");
+    c.querySelector("#btn-import-config").onclick = () => importInput.click();
+    importInput.onchange = async () => {
+      const file = importInput.files?.[0];
+      importInput.value = "";
+      if (file) this.loadConfigText(await file.text(), file.name);
+    };
+    c.querySelector("#btn-validate-config").onclick = () => this.showValidation();
+    c.querySelector("#btn-compare-config").onclick = () => this.showCompareWithDefconfig();
+
+    const searchInput = c.querySelector("#kconfig-search-input");
+    searchInput.oninput = () => this.filterTree(searchInput.value.trim());
+  }
+
+  fillArchSelect() {
+    const select = this.containerEl?.querySelector("#kconfig-arch-select");
+    if (!select || !this.archPresets.length) return;
+    const groups = new Map();
+    for (const p of this.archPresets) {
+      if (!groups.has(p.srcarch)) groups.set(p.srcarch, []);
+      groups.get(p.srcarch).push(p);
+    }
+    select.innerHTML = [...groups.entries()].map(([srcarch, list]) => `
+      <optgroup label="arch/${escapeHtml(srcarch)}">
+        ${list.map((p) => `<option value="${escapeHtml(p.id)}" ${p.id === this.currentArch ? "selected" : ""}>${escapeHtml(p.label || p.id)}</option>`).join("")}
+      </optgroup>`).join("");
+  }
+
+  // ------------------------------------------------------------------ configuration lifecycle
+  /** Load the ARCH's model and restore its saved configuration (or its default defconfig). */
+  async activateArch(arch) {
+    if (this.currentArch !== arch) {
       this.expandedNodeIds.clear();
       this.selectedSymbol = null;
       this.selectedNodeId = null;
     }
-    this.currentArch = targetArch;
-    const archSelect = this.containerEl?.querySelector("#kconfig-arch-select");
-    if (archSelect) archSelect.value = targetArch;
-
+    this.currentArch = arch;
+    const select = this.containerEl?.querySelector("#kconfig-arch-select");
+    if (select) select.value = arch;
     const scrollEl = this.containerEl?.querySelector("#kconfig-tree-scroll");
-    if (scrollEl) {
-      scrollEl.innerHTML = `<div style="padding:16px;color:var(--text-muted);">Switching architecture to ${targetArch}...</div>`;
+    if (scrollEl) scrollEl.innerHTML = `<div class="kconfig-empty">Loading KConfig model for ARCH=${escapeHtml(arch)}...</div>`;
+
+    try {
+      const raw = await api.getKconfigTree(this.currentVersion, arch, this.toolchain);
+      this.engine.setModel(raw);
+    } catch (err) {
+      if (scrollEl) scrollEl.innerHTML = `<div class="kconfig-error">Failed to load the Kconfig model: ${escapeHtml(err.message)}</div>`;
+      return;
     }
 
-    // Find preset target
-    if (this.archPresets.length === 0) {
-      try {
-        const presetsRes = await api.getKconfigPresets(this.currentVersion);
-        this.archPresets = (presetsRes && (presetsRes.targets || presetsRes.architectures)) || [];
-      } catch (e) {
-        console.warn("Error fetching presets:", e);
-      }
+    const saved = state.getKconfigProfile(this.profileKey);
+    if (saved && Object.keys(saved).length) {
+      if (this.engineActive) this.engine.loadAssignments(saved);
+      this.rawValues = { ...saved };
+      this.commit();
+    } else {
+      await this.loadDefconfig("", { quiet: true });
     }
 
-    let target = this.archPresets.find((p) => p.id === targetArch || p.arch === targetArch);
-    if (!target) {
-      target = {
-        id: targetArch,
-        arch: targetArch,
-        srcarch: targetArch,
-        canonical_defconfig: targetArch === "x86" ? "x86_64_defconfig" : (targetArch === "arm" ? "versatile_defconfig" : "defconfig"),
-        symbols: {
-          [targetArch.toUpperCase()]: "y",
-          "ARCH": targetArch,
-          "SRCARCH": targetArch
-        }
+    const activeTab = state.getActiveTab();
+    if (activeTab && activeTab.type === "kconfig") {
+      activeTab.arch = arch;
+      activeTab.title = `KConfig (${arch})`;
+      state.saveState();
+    }
+    this.renderTree();
+    if (this.selectedSymbol) this.inspectSymbol(this.selectedSymbol);
+  }
+
+  /** Publish the current configuration (resolved values when the engine is on). */
+  commit() {
+    if (this.engineActive) {
+      this.rawValues = this.engine.configValues();
+    }
+    state.setKconfigAssignments(this.rawValues || {}, this.profileKey);
+    this.updateStatus();
+  }
+
+  /** Refresh tree and inspector after a change. */
+  changed() {
+    this.commit();
+    this.renderTree();
+    if (this.selectedSymbol) this.inspectSymbol(this.selectedSymbol, this.selectedNodeId, { keepScroll: true });
+  }
+
+  setEngineActive(active) {
+    const btn = this.containerEl?.querySelector("#btn-toggle-engine");
+    state.setKconfigEngineActive(active);
+    if (btn) {
+      btn.classList.toggle("active", this.engineActive);
+      btn.textContent = this.engineActive ? "✓ Engine Active" : "⚡ Enable Engine";
+    }
+    if (this.engineActive && this.engine.loaded) {
+      const before = { ...(this.rawValues || {}) };
+      const report = this.engine.loadAssignments(before);
+      this.commit();
+      const after = this.rawValues;
+      const adjusted = Object.keys(before).filter((k) => {
+        const s = this.engine.syms[k];
+        if (!s || s.auto) return false;
+        const got = after[k] ?? (s.type === "bool" || s.type === "tristate" ? "n" : "");
+        return got !== String(before[k]);
+      }).length;
+      toast.success(`Engine on: configuration resolved by kconfig (${adjusted} values adjusted, ${report.unknown.length} unknown symbols dropped)`);
+      this.renderTree();
+    } else {
+      toast.info("Engine off: values are edited without constraints (export will be unvalidated)");
+      this.updateStatus();
+    }
+  }
+
+  /** Load a defconfig of this ARCH ("" = the default `make defconfig` one). */
+  async loadDefconfig(path, { quiet = false } = {}) {
+    let res;
+    try {
+      res = await api.getKconfigDefconfigContent(this.currentVersion, path, this.currentArch, this.toolchain);
+    } catch (err) {
+      if (!quiet) toast.error(`Failed to load defconfig: ${err.message}`);
+      this.engine.loadConfig("");
+      this.engine.setAllNewSymbols("default");
+      this.rawValues = {};
+      this.commit();
+      return;
+    }
+    const report = this.engine.loadConfig(res.content || "");
+    this.engine.setAllNewSymbols("default");
+    if (this.engineActive) {
+      this.commit();
+    } else {
+      this.rawValues = Object.fromEntries(Object.entries(KconfigParser.parse(res.content)).map(([k, v]) => [k.slice(7), v]));
+      this.commit();
+    }
+    const extra = report.unknown.length ? `, ${report.unknown.length} unknown symbols ignored` : "";
+    if (!quiet || report.unknown.length) toast.success(`Loaded ${res.name} for ARCH=${this.currentArch}${extra}`);
+    this.renderTree();
+  }
+
+  /** Load .config text (import): conf_read semantics when the engine is on. */
+  loadConfigText(text, label = "configuration") {
+    const parsed = KconfigParser.parse(text);
+    if (!Object.keys(parsed).length) {
+      toast.error("No CONFIG_ assignments found in that file");
+      return;
+    }
+    if (this.engineActive) {
+      const report = this.engine.loadConfig(text);
+      this.engine.setAllNewSymbols("default");
+      this.commit();
+      const notes = [];
+      if (report.unknown.length) notes.push(`${report.unknown.length} unknown for ARCH=${this.currentArch}`);
+      if (report.invalid.length) notes.push(`${report.invalid.length} invalid values`);
+      toast.success(`Imported ${label}${notes.length ? ` (${notes.join(", ")})` : ""}`);
+    } else {
+      this.rawValues = Object.fromEntries(Object.entries(parsed).map(([k, v]) => [k.slice(7), v]));
+      this.commit();
+      toast.success(`Imported ${Object.keys(parsed).length} raw assignments from ${label}`);
+    }
+    this.renderTree();
+  }
+
+  updateStatus() {
+    const el = this.containerEl?.querySelector("#kconfig-status");
+    if (!el || !this.engine.loaded) return;
+    const written = Object.keys(this.rawValues || {}).length;
+    const env = this.engine.model.env || {};
+    const tc = this.engine.model.toolchain;
+    const errors = (tc?.messages || []).filter((m) => m.level === "error").length;
+    const toolchain = tc?.macros ? ` · <a href="#" class="kconfig-status-link" id="kconfig-status-toolchain">${escapeHtml(tc.summary)}${errors ? ` <span style="color:var(--accent-red);">⚠ ${errors} error(s)</span>` : ""}</a>` : "";
+    el.innerHTML = `ARCH=${escapeHtml(env.ARCH || this.currentArch)} SRCARCH=${escapeHtml(env.SRCARCH || "")} · ${escapeHtml(this.currentVersion)} · ${written} symbols${this.engineActive ? " · engine resolved" : " · <span style=\"color:var(--accent-yellow);\">unvalidated (engine off)</span>"}${toolchain}`;
+    const link = el.querySelector("#kconfig-status-toolchain");
+    if (link) {
+      link.onclick = (ev) => {
+        ev.preventDefault();
+        this.showToolchainModal();
       };
     }
+  }
 
-    let seedConfig = { ...(target.symbols || {}) };
+  // ------------------------------------------------------------------ value access & edits
+  /** Current value of a symbol (engine-resolved, or raw when the engine is off). */
+  valueOf(name) {
+    if (this.engineActive) return this.engine.isDefined(name) ? this.engine.value(name) : "n";
+    const raw = (this.rawValues || {})[name];
+    if (raw !== undefined) return raw;
+    const t = this.engine.syms[name]?.type;
+    return t === "bool" || t === "tristate" ? "n" : "";
+  }
 
-    // Load canonical defconfig for target architecture
-    if (target.canonical_defconfig) {
-      try {
-        const defRes = await api.getKconfigDefconfigContent(this.currentVersion, target.canonical_defconfig, this.currentArch);
-        if (defRes && defRes.content) {
-          const parsed = KconfigParser.parse(defRes.content);
-          seedConfig = { ...seedConfig, ...parsed };
-        } else if (defRes && defRes.values) {
-          seedConfig = { ...seedConfig, ...defRes.values };
-        }
-      } catch (err) {
-        console.warn(`Could not load ${target.canonical_defconfig}:`, err);
-      }
+  nodeVisible(node) {
+    if (!node || node.prompt === null || node.prompt === undefined) return false;
+    if (this.showUnmet || !this.engineActive) return true;
+    return this.engine.menuVisible(node.id);
+  }
+
+  visibleChildren(node) {
+    return node.children.map((id) => this.nodes[id]).filter((n) => this.nodeVisible(n));
+  }
+
+  /** menuconfig-style rendering of an entry: { marker, title, submenu, dim }. */
+  describe(node) {
+    const e = this.engine;
+    const hasChildren = this.visibleChildren(node).length > 0;
+    if (node.kind === "menu") return { marker: "", title: node.prompt, submenu: true, dim: !e.menuVisible(node.id) };
+    if (node.kind === "comment") return { marker: "", title: `*** ${node.prompt} ***`, submenu: false, comment: true, dim: !e.menuVisible(node.id) };
+    const sym = node.sym;
+    const s = e.syms[sym];
+    if (!s) return { marker: "", title: node.prompt || sym || "", submenu: hasChildren };
+    const dim = this.engineActive && !e.menuVisible(node.id);
+    if (s.is_choice) {
+      const sel = this.engineActive ? e.choiceSelection(sym) : (s.members.find((m) => this.valueOf(m) === "y") || null);
+      const selPrompt = sel ? (e.nodes[e.syms[sel].menus[0]]?.prompt || sel) : "";
+      return { marker: "", title: `${node.prompt}${selPrompt ? ` (${selPrompt})` : ""}`, submenu: true, dim };
     }
-
-    // Load the target architecture's Kconfig tree
-    await this.loadTree();
-
-    // Propagate defaults cleanly through constraint engine
-    if (this.engineActive) {
-      const resolved = this.engine.propagate(seedConfig);
-      state.setKconfigAssignments(resolved);
+    const val = this.valueOf(sym);
+    let marker;
+    if (s.type === "bool" || s.type === "tristate") {
+      const tri = { n: 0, m: 1, y: 2 }[val] ?? 0;
+      const choiceY = s.choice && this.engineActive && e.symTri(s.choice) === 2;
+      const changeable = !this.engineActive || e.isChangeable(sym);
+      const asBool = s.type === "bool" || (this.engineActive && e.getType(sym) === "bool");
+      if (choiceY || (s.choice && !this.engineActive)) marker = tri === 2 ? "(X)" : "( )";
+      else if (!changeable) marker = tri === 2 ? "-*-" : (tri === 1 ? "-M-" : "---");
+      else if (asBool) marker = tri ? "[*]" : "[ ]";
+      else marker = tri === 2 ? "<*>" : (tri === 1 ? "<M>" : "< >");
     } else {
-      state.setKconfigAssignments(seedConfig);
+      marker = `(${val})`;
     }
-
-    this.renderTree();
-    const count = Object.keys(state.kconfigAssignments).length / 2;
-    toast.success(`Switched to ${target.label || targetArch} (${Math.round(count)} symbols loaded)`);
+    return { marker, title: node.prompt, submenu: node.kind === "menuconfig" || hasChildren, dim };
   }
 
-  showConfirmModal({ title, message, confirmText = "Confirm", cancelText = "Cancel", onConfirm, onCancel }) {
-    const backdrop = document.createElement("div");
-    backdrop.className = "palette-backdrop";
-    backdrop.onclick = () => {
-      backdrop.remove();
-      if (typeof onCancel === "function") onCancel();
-    };
-
-    const box = document.createElement("div");
-    box.className = "palette-box";
-    box.style.maxWidth = "420px";
-    box.onclick = (e) => e.stopPropagation();
-
-    box.innerHTML = `
-      <div style="padding:14px 18px;border-bottom:1px solid var(--border-color);font-weight:600;color:var(--text-primary);font-size:14px;">
-        ${title}
-      </div>
-      <div style="padding:16px 18px;color:var(--text-secondary);font-size:12px;line-height:1.5;">
-        ${message}
-      </div>
-      <div style="padding:12px 18px;border-top:1px solid var(--border-color);display:flex;justify-content:flex-end;gap:8px;">
-        <button class="code-btn" id="modal-cancel-btn">${cancelText}</button>
-        <button class="code-btn active" id="modal-confirm-btn">${confirmText}</button>
-      </div>
-    `;
-
-    backdrop.appendChild(box);
-    document.body.appendChild(backdrop);
-
-    box.querySelector("#modal-cancel-btn").onclick = () => {
-      backdrop.remove();
-      if (typeof onCancel === "function") onCancel();
-    };
-
-    box.querySelector("#modal-confirm-btn").onclick = () => {
-      backdrop.remove();
-      if (typeof onConfirm === "function") onConfirm();
-    };
+  /** Change a symbol's value as menuconfig does; returns true when the configuration changed. */
+  async changeValue(node, explicit = null) {
+    const sym = node?.sym;
+    const s = sym && this.engine.syms[sym];
+    if (!s || s.is_choice) return false;
+    if (s.type !== "bool" && s.type !== "tristate") {
+      const current = this.valueOf(sym);
+      const range = this.engineActive ? this.engine.activeRange(sym) : null;
+      const hint = range ? ` (range ${s.type === "hex" ? `0x${range.lo.toString(16)}..0x${range.hi.toString(16)}` : `${range.lo}..${range.hi}`})` : "";
+      const text = explicit ?? window.prompt(`CONFIG_${sym} (${s.type})${hint}`, current);
+      if (text === null || text === undefined) return false;
+      return this.applyValue(sym, text);
+    }
+    if (!this.engineActive) {
+      const order = s.type === "tristate" ? ["n", "m", "y"] : ["n", "y"];
+      const cur = this.valueOf(sym);
+      const next = explicit ?? order[(order.indexOf(cur) + 1) % order.length];
+      return this.applyValue(sym, next);
+    }
+    if (explicit !== null) return this.applyValue(sym, explicit);
+    if (s.choice && this.engine.symTri(s.choice) === 2) return this.applyValue(sym, "y");
+    const before = this.engine.symTri(sym);
+    const after = this.engine.toggle(sym);
+    if (before === after) {
+      toast.info(`CONFIG_${sym} cannot change: ${this.engine.refusalReason(sym, (before + 1) % 3) || "fixed by its dependencies"}`);
+      return false;
+    }
+    this.changed();
+    return true;
   }
 
-  expandAncestors(node) {
-    if (!node) return;
-    let curr = node;
-    while (curr && curr.parent_id) {
-      this.expandedNodeIds.add(curr.parent_id);
-      curr = this.nodesById?.get(curr.parent_id);
+  /** Set a value (y/m/n or text); with the engine on it is refused unless kconfig accepts it. */
+  applyValue(sym, text) {
+    if (!this.engineActive) {
+      this.rawValues = { ...(this.rawValues || {}), [sym]: text };
+      this.changed();
+      return true;
     }
+    const s = this.engine.syms[sym];
+    const tri = s.type === "bool" || s.type === "tristate" ? { n: 0, m: 1, y: 2 }[String(text).toLowerCase()[0]] : null;
+    if (!this.engine.setValue(sym, text)) {
+      toast.error(`CONFIG_${sym}=${text} refused: ${this.engine.refusalReason(sym, tri ?? text) || "not accepted by kconfig"}`);
+      return false;
+    }
+    this.changed();
+    return true;
+  }
+
+  // ------------------------------------------------------------------ tree
+  expandAncestors(nodeId) {
+    let parent = this.nodes[nodeId]?.parent;
+    while (parent > 0) {
+      this.expandedNodeIds.add(parent);
+      parent = this.nodes[parent].parent;
+    }
+  }
+
+  /** First menu entry of a symbol (the one with a prompt if any). */
+  primaryNode(sym) {
+    const s = this.engine.syms[sym];
+    if (!s || !s.menus.length) return null;
+    const ids = s.menus;
+    return this.nodes[ids.find((id) => this.nodes[id].prompt) ?? ids[0]];
   }
 
   selectAndInspectSymbol(symbolName) {
     if (!symbolName) return;
-    const cleanSym = symbolName.startsWith("CONFIG_") ? symbolName.slice(7) : symbolName;
-
-    const node = (this.nodesBySymbol && this.nodesBySymbol.get(cleanSym)) ||
-      this.treeNodes.find((n) => n.symbol_name === cleanSym);
-
+    const clean = symbolName.startsWith("CONFIG_") ? symbolName.slice(7) : symbolName;
+    const node = this.primaryNode(clean);
     if (node) {
-      if (!this.shouldShowNode(node)) {
+      if (!this.nodeVisible(node) && node.prompt) {
         this.showUnmet = true;
         const unmetBtn = this.containerEl?.querySelector("#btn-toggle-unmet");
         if (unmetBtn) {
           unmetBtn.classList.add("active");
-          unmetBtn.textContent = "✓ Showing Unmet";
+          unmetBtn.textContent = "✓ Showing All";
         }
       }
-
-      this.expandAncestors(node);
-      this.selectedSymbol = cleanSym;
-      this.selectedNodeId = node.tree_id;
-
-      // Clear search filter so full tree is visible with ancestors open
+      this.expandAncestors(node.id);
       const searchInput = this.containerEl?.querySelector("#kconfig-search-input");
-      if (searchInput && searchInput.value) {
-        searchInput.value = "";
-      }
-
-      this.renderTree();
-
-      // Highlight row and scroll into view
-      const row = this.containerEl?.querySelector(`.kconfig-node-row[data-symbol="${cleanSym}"]`);
-      if (row) {
-        this.containerEl.querySelectorAll(".kconfig-node-row").forEach((r) => r.classList.remove("active"));
-        row.classList.add("active");
-        row.scrollIntoView({ block: "nearest", behavior: "smooth" });
-      }
+      if (searchInput) searchInput.value = "";
     }
+    this.selectedSymbol = clean;
+    this.selectedNodeId = node ? node.id : null;
+    this.renderTree();
+    const row = this.containerEl?.querySelector(`.kconfig-node-row[data-node-id="${node?.id}"]`);
+    if (row) row.scrollIntoView({ block: "nearest", behavior: "smooth" });
+    this.inspectSymbol(clean, node?.id);
 
-    this.inspectSymbol(cleanSym, node || {});
-
-    // Update active tab state and title
     const activeTab = state.getActiveTab();
     if (activeTab && activeTab.type === "kconfig") {
-      activeTab.symbol = cleanSym;
-      activeTab.title = `KConfig (${cleanSym})`;
+      activeTab.symbol = clean;
+      activeTab.title = `KConfig (${clean})`;
       state.saveState();
     }
   }
 
-  escapeHtml(str) {
-    if (!str) return "";
-    return String(str)
-      .replace(/&/g, "&amp;")
-      .replace(/</g, "&lt;")
-      .replace(/>/g, "&gt;")
-      .replace(/"/g, "&quot;")
-      .replace(/'/g, "&#039;");
-  }
-
-  async loadTree() {
-    const scrollEl = this.containerEl?.querySelector("#kconfig-tree-scroll");
-    if (scrollEl) {
-      scrollEl.innerHTML = `<div style="padding:16px;color:var(--text-muted);">Loading ${this.currentArch} tree...</div>`;
-    }
-
-    try {
-      const res = await api.getKconfigTree(this.currentVersion, this.currentArch);
-      this.treeNodes = res.nodes || [];
-      this.engine.setNodes(this.treeNodes);
-
-      if (this.engineActive) {
-        const resolved = this.engine.propagate(state.kconfigAssignments);
-        state.setKconfigAssignments(resolved);
-      }
-
-      this.renderTree();
-    } catch (e) {
-      if (scrollEl) {
-        scrollEl.innerHTML = `<div style="padding:16px;color:var(--accent-red);">Failed to load tree: ${e.message}</div>`;
-      }
-    }
-  }
-
-  shouldShowNode(node) {
-    if (!node) return false;
-
-    const isConfig = Boolean(node.symbol_name);
-    const hasPrompt = Boolean(node.prompt && String(node.prompt).trim().length > 0);
-
-    // 1. Promptless configs are internal compilation symbols (e.g. HAVE_AOUT); never show in interactive menu tree
-    if (isConfig && !hasPrompt) {
-      return false;
-    }
-
-    // 2. If showUnmet is enabled, show all prompted nodes regardless of dependency state
-    if (this.showUnmet) {
-      return true;
-    }
-
-    // 3. For configs with prompts: check if symbol dependencies are satisfied
-    if (isConfig) {
-      return this.engine.isSymbolVisible(node.symbol_name, state.kconfigAssignments);
-    }
-
-    // 4. For choices/menus/comments: check direct expression if defined
-    if (node.depends_on_expr) {
-      return this.engine.evalExpr(node.depends_on_expr, state.kconfigAssignments) > 0;
-    }
-
-    return true;
-  }
-
   renderTree() {
     const scrollEl = this.containerEl?.querySelector("#kconfig-tree-scroll");
-    if (!scrollEl) return;
+    if (!scrollEl || !this.engine.loaded) return;
+    const query = this.containerEl.querySelector("#kconfig-search-input")?.value.trim();
+    if (query) {
+      this.filterTree(query);
+      return;
+    }
     const prevScrollTop = scrollEl.scrollTop;
     scrollEl.innerHTML = "";
-
-    // Build children index and lookups for fast on-demand hierarchical expansion
-    this.nodesByParent = new Map();
-    this.nodesById = new Map();
-    this.nodesBySymbol = new Map();
-    this.treeNodes.forEach((node) => {
-      if (node.tree_id) this.nodesById.set(node.tree_id, node);
-      if (node.symbol_name) this.nodesBySymbol.set(node.symbol_name, node);
-      const pid = node.parent_id || 0;
-      if (!this.nodesByParent.has(pid)) {
-        this.nodesByParent.set(pid, []);
-      }
-      this.nodesByParent.get(pid).push(node);
-    });
-
-    const rootNodes = (this.nodesByParent.get(0) || []).filter((node) => this.shouldShowNode(node));
-    if (rootNodes.length === 0) {
-      const fallbackNodes = this.treeNodes.filter((node) => this.shouldShowNode(node)).slice(0, 50);
-      fallbackNodes.forEach((node) => {
-        this.renderTreeNode(scrollEl, node, 0);
-      });
-    } else {
-      rootNodes.forEach((node) => {
-        this.renderTreeNode(scrollEl, node, 0);
-      });
-    }
-
-    // Preserve scroll position
+    const roots = this.visibleChildren(this.nodes[0]);
+    if (!roots.length) scrollEl.innerHTML = `<div class="kconfig-empty">No visible entries.</div>`;
+    const frag = document.createDocumentFragment();
+    roots.forEach((node) => this.renderTreeNode(frag, node, 0));
+    scrollEl.appendChild(frag);
     scrollEl.scrollTop = prevScrollTop;
-
-    // Restore active row highlight if selected
-    if (this.selectedSymbol) {
-      const activeRow = scrollEl.querySelector(`.kconfig-node-row[data-symbol="${this.selectedSymbol}"]`);
-      if (activeRow) activeRow.classList.add("active");
-    } else if (this.selectedNodeId) {
-      const activeRow = scrollEl.querySelector(`.kconfig-node-row[data-node-id="${this.selectedNodeId}"]`);
-      if (activeRow) activeRow.classList.add("active");
-    }
   }
 
-  renderTreeNode(container, node, depth) {
+  renderTreeNode(container, node, depth, flat = false) {
+    const d = this.describe(node);
+    const childList = flat ? [] : this.visibleChildren(node);
+    const hasChildren = childList.length > 0;
     const row = document.createElement("div");
     row.className = "kconfig-node-row";
-    row.style.paddingLeft = `${12 + depth * 14}px`;
-    row.dataset.symbol = node.symbol_name || "";
-    row.dataset.nodeId = String(node.tree_id || "");
-
-    const rawChildList = (this.nodesByParent && this.nodesByParent.get(node.tree_id))
-      ? this.nodesByParent.get(node.tree_id)
-      : (Array.isArray(node.children) ? node.children : []);
-    const childList = rawChildList.filter((c) => this.shouldShowNode(c));
-    const hasChildren = childList.length > 0;
-    const isConfig = Boolean(node.symbol_name);
-    const isChoice = Boolean(node.choice && node.choice.id);
-
-    let stateStr = "   ";
-    let val = "n";
-    if (isConfig) {
-      val = state.kconfigAssignments[node.symbol_name] || state.kconfigAssignments[`CONFIG_${node.symbol_name}`] || "n";
-      const isTristate = node.type === 2 || node.type_name === "tristate";
-
-      if (isChoice) {
-        stateStr = val === "y" ? "(*)" : "( )";
-      } else if (isTristate) {
-        stateStr = val === "y" ? "[*]" : (val === "m" ? "<M>" : "[ ]");
-      } else {
-        stateStr = val === "y" ? "[*]" : "[ ]";
-      }
-    }
-
-    // Visibility and dependency validation
-    const isVis = isConfig ? this.engine.isSymbolVisible(node.symbol_name, state.kconfigAssignments) : true;
-    if (!isVis && isConfig) {
-      row.classList.add("kconfig-node-disabled");
-      const failing = this.engine.getFailingDependencies(node, state.kconfigAssignments);
-      if (failing.length > 0) {
-        row.title = `Fails dependencies: ${failing.join(" && ")}`;
-      }
-    }
-
-    if (this.selectedSymbol && node.symbol_name === this.selectedSymbol) {
-      row.classList.add("active");
-    } else if (!this.selectedSymbol && this.selectedNodeId && node.tree_id === this.selectedNodeId) {
-      row.classList.add("active");
-    }
-
-    const isExpanded = hasChildren && this.expandedNodeIds.has(node.tree_id);
-    const displayName = node.prompt || node.title || node.symbol_name || "Option";
-
+    if (d.dim) row.classList.add("kconfig-node-disabled");
+    if (d.comment) row.classList.add("kconfig-node-comment");
+    if (node.id === this.selectedNodeId || (node.sym && node.sym === this.selectedSymbol && this.selectedNodeId === null)) row.classList.add("active");
+    row.style.paddingLeft = `${10 + depth * 14}px`;
+    row.dataset.symbol = node.sym || "";
+    row.dataset.nodeId = String(node.id);
+    const isExpanded = hasChildren && this.expandedNodeIds.has(node.id);
+    const location = flat ? this.engine.menuPath(node.id).join(" › ") : "";
+    const arrow = d.submenu && (hasChildren || node.kind === "menu" || node.kind === "choice");
     row.innerHTML = `
-      <span class="chevron" style="visibility:${hasChildren ? 'visible' : 'hidden'};">${hasChildren ? (isExpanded ? '▼' : '▶') : '&nbsp;'}</span>
-      <span class="kconfig-node-state" title="Click to cycle or select">${stateStr}</span>
-      <span class="kconfig-node-name">${displayName}</span>
-      ${node.symbol_name ? `<span class="kconfig-node-sym">(${node.symbol_name})</span>` : ""}
+      <span class="chevron" style="visibility:${hasChildren ? "visible" : "hidden"};">${isExpanded ? "▼" : "▶"}</span>
+      <span class="kconfig-node-state" title="Click to change">${escapeHtml(d.marker)}</span>
+      <span class="kconfig-node-name">${escapeHtml(d.title || "")}${arrow ? ' <span class="kconfig-submenu">---&gt;</span>' : ""}</span>
+      ${node.sym && !this.engine.syms[node.sym]?.is_choice ? `<span class="kconfig-node-sym">${escapeHtml(node.sym)}</span>` : ""}
+      ${location ? `<span class="kconfig-node-loc">${escapeHtml(location)}</span>` : ""}
     `;
-
+    if (d.dim && node.sym && this.engine.syms[node.sym]) {
+      row.title = `Not visible: depends on ${this.engine.exprStr(node.pvis, true)}`;
+    }
     container.appendChild(row);
 
     const childContainer = document.createElement("div");
     childContainer.style.display = isExpanded ? "block" : "none";
     container.appendChild(childContainer);
-
-    // If already expanded in set, render children immediately
-    if (isExpanded && hasChildren) {
-      childList.forEach((c) => this.renderTreeNode(childContainer, c, depth + 1));
-    }
+    if (isExpanded) childList.forEach((c) => this.renderTreeNode(childContainer, c, depth + 1));
 
     const chevron = row.querySelector(".chevron");
-    chevron.onclick = (e) => {
-      e.stopPropagation();
-      const nextExpanded = !this.expandedNodeIds.has(node.tree_id);
-      if (nextExpanded) {
-        this.expandedNodeIds.add(node.tree_id);
-        chevron.textContent = "▼";
-        childContainer.style.display = "block";
-        if (childContainer.children.length === 0 && hasChildren) {
-          childList.forEach((c) => this.renderTreeNode(childContainer, c, depth + 1));
-        }
-      } else {
-        this.expandedNodeIds.delete(node.tree_id);
+    const toggleExpand = () => {
+      if (!hasChildren) return;
+      if (this.expandedNodeIds.has(node.id)) {
+        this.expandedNodeIds.delete(node.id);
         chevron.textContent = "▶";
         childContainer.style.display = "none";
-      }
-    };
-
-    // State marker click to cycle or select choice member
-    const stateEl = row.querySelector(".kconfig-node-state");
-    stateEl.onclick = (e) => {
-      e.stopPropagation();
-      if (!isConfig) return;
-
-      this.selectedSymbol = node.symbol_name;
-      this.selectedNodeId = node.tree_id;
-
-      if (isChoice) {
-        const updated = this.engine.selectChoiceMember(node.choice.id, node.symbol_name, state.kconfigAssignments);
-        state.setKconfigAssignments(updated);
-        toast.info(`Selected choice member CONFIG_${node.symbol_name}`);
       } else {
-        const nextVal = this.engine.cycleValue(node.symbol_name, val, node, state.kconfigAssignments);
-        state.setKconfigAssignment(node.symbol_name, nextVal);
-        if (this.engineActive) {
-          const resolved = this.engine.propagate(state.kconfigAssignments);
-          state.setKconfigAssignments(resolved);
-        }
-        toast.info(`Set CONFIG_${node.symbol_name}=${nextVal}`);
+        this.expandedNodeIds.add(node.id);
+        chevron.textContent = "▼";
+        childContainer.style.display = "block";
+        if (!childContainer.children.length) childList.forEach((c) => this.renderTreeNode(childContainer, c, depth + 1));
       }
-
-      this.renderTree();
-      this.inspectSymbol(node.symbol_name, node);
     };
-
-    // Row selection
+    chevron.onclick = (e) => {
+      e.stopPropagation();
+      toggleExpand();
+    };
+    row.querySelector(".kconfig-node-state").onclick = (e) => {
+      e.stopPropagation();
+      if (node.sym && !this.engine.syms[node.sym]?.is_choice) {
+        this.selectedSymbol = node.sym;
+        this.selectedNodeId = node.id;
+        this.changeValue(node);
+      } else {
+        toggleExpand();
+      }
+    };
     row.onclick = () => {
-      if (hasChildren && !node.symbol_name) {
-        // Clicking folder row toggles expansion
-        chevron.click();
+      if (!node.sym || this.engine.syms[node.sym]?.is_choice) {
+        if (flat) this.selectAndRevealNode(node);
+        else toggleExpand();
         return;
       }
-      this.containerEl.querySelectorAll(".kconfig-node-row").forEach((r) => r.classList.remove("active"));
+      this.containerEl.querySelectorAll(".kconfig-node-row.active").forEach((r) => r.classList.remove("active"));
       row.classList.add("active");
-      this.selectedSymbol = node.symbol_name || null;
-      this.selectedNodeId = node.tree_id;
-      if (node.symbol_name) {
-        this.inspectSymbol(node.symbol_name, node);
-      }
+      this.selectedSymbol = node.sym;
+      this.selectedNodeId = node.id;
+      this.inspectSymbol(node.sym, node.id);
     };
-
-    row.ondblclick = () => {
-      if (hasChildren) {
-        chevron.click();
-      }
-    };
-
+    row.ondblclick = () => toggleExpand();
     row.addEventListener("auxclick", (e) => {
-      if (e.button === 1 && node.symbol_name) {
+      if (e.button === 1 && node.sym) {
         e.preventDefault();
         e.stopPropagation();
-        state.openTab({
-          type: "kconfig",
-          title: `KConfig (${node.symbol_name})`,
-          arch: this.currentArch,
-          symbol: node.symbol_name,
-          version: this.currentVersion,
-          forceNew: true
-        });
+        this.openSymbolTab(node.sym);
       }
     });
   }
 
+  selectAndRevealNode(node) {
+    const searchInput = this.containerEl?.querySelector("#kconfig-search-input");
+    if (searchInput) searchInput.value = "";
+    this.expandAncestors(node.id);
+    this.expandedNodeIds.add(node.id);
+    this.renderTree();
+  }
+
+  openSymbolTab(sym) {
+    state.openTab({ type: "kconfig", title: `KConfig (${sym})`, arch: this.currentArch, symbol: sym, version: this.currentVersion, forceNew: true });
+  }
+
+  /** Flat list of entries whose symbol or prompt matches, with their menu location. */
   filterTree(query) {
+    const scrollEl = this.containerEl?.querySelector("#kconfig-tree-scroll");
+    if (!scrollEl || !this.engine.loaded) return;
     if (!query) {
       this.renderTree();
       return;
     }
-    const scrollEl = this.containerEl.querySelector("#kconfig-tree-scroll");
-    if (!scrollEl) return;
+    const q = query.replace(/^CONFIG_/i, "").toLowerCase();
+    const matches = this.nodes.filter((n) => n.prompt && ((n.sym || "").toLowerCase().includes(q) || n.prompt.toLowerCase().includes(q)))
+      .sort((a, b) => Number((b.sym || "").toLowerCase() === q) - Number((a.sym || "").toLowerCase() === q));
     scrollEl.innerHTML = "";
+    if (!matches.length) {
+      scrollEl.innerHTML = `<div class="kconfig-empty">No entries matching "${escapeHtml(query)}" for ARCH=${escapeHtml(this.currentArch)}</div>`;
+      return;
+    }
+    matches.slice(0, SEARCH_LIMIT).forEach((node) => this.renderTreeNode(scrollEl, node, 0, true));
+    if (matches.length > SEARCH_LIMIT) {
+      scrollEl.insertAdjacentHTML("beforeend", `<div class="kconfig-empty">Showing ${SEARCH_LIMIT} of ${matches.length} matches. Refine the filter for more.</div>`);
+    }
+  }
 
-    const cleanQ = query.toLowerCase();
-    const matches = this.treeNodes.filter((n) => {
-      const sym = (n.symbol_name || "").toLowerCase();
-      const title = (n.title || "").toLowerCase();
-      const prompt = (n.prompt || "").toLowerCase();
-      return sym.includes(cleanQ) || title.includes(cleanQ) || prompt.includes(cleanQ);
-    });
+  // ------------------------------------------------------------------ inspector
+  triBadge(tri) {
+    return `<span class="kconfig-tri kconfig-tri-${TRI_CHAR[tri]}">${TRI_CHAR[tri]}</span>`;
+  }
 
-    if (matches.length === 0) {
-      scrollEl.innerHTML = `<div style="padding:16px;color:var(--text-muted);">No symbols matching "${this.escapeHtml(query)}"</div>`;
+  exprHtml(id) {
+    if (id === null || id === undefined || id < 0) return `<span class="kconfig-muted">none</span>`;
+    const tri = this.engine.exprTri(id);
+    return `<code class="kconfig-expr">${escapeHtml(this.engine.exprStr(id, true))}</code> ${this.triBadge(tri)}`;
+  }
+
+  symLink(name) {
+    const defined = this.engine.isDefined(name);
+    const val = defined ? this.engine.value(name) : "undefined";
+    const cls = val === "y" ? "dep-met" : (val === "m" ? "dep-mod" : "dep-unmet");
+    return `<span class="kconfig-badge kconfig-badge-link ${cls}" data-symbol="${escapeHtml(name)}" title="CONFIG_${escapeHtml(name)} = ${escapeHtml(val)}">${escapeHtml(name)}=${escapeHtml(val)}</span>`;
+  }
+
+  fileLink(path, line, label = null) {
+    return `<button class="code-btn kconfig-file-link" data-path="${escapeHtml(path)}" data-line="${line || 1}" title="Open ${escapeHtml(path)}:${line || 1}">📄 ${escapeHtml(label || `${path}:${line || 1}`)}</button>`;
+  }
+
+  /** Why the symbol has its current value (engine on). */
+  explainValue(sym) {
+    const e = this.engine;
+    const s = e.syms[sym];
+    const vis = e.visibility(sym);
+    const rev = e.revDep(sym);
+    if (s.choice && vis === 2) return `chosen in its choice group (${e.choiceSelection(s.choice) === sym ? "selected" : "another member is selected"})`;
+    if (vis !== 0 && e.hasUser(sym)) {
+      if ((s.type === "bool" || s.type === "tristate") && rev > ({ n: 0, m: 1, y: 2 }[e.user.get(sym)] ?? 0)) return "raised by select (your value is lower than what selects force)";
+      return "set explicitly (loaded from the configuration or changed by you)";
+    }
+    if (rev > 0 && (s.type === "bool" || s.type === "tristate")) return `forced by select: ${e.exprStr(s.rev_dep, true)}`;
+    const def = e.defaultProp(sym);
+    if (def) return `default ${e.exprStr(def.valueId)}${s.defaults.length > 1 ? " (first default whose condition holds)" : ""}`;
+    if (!s.prompts.length) return "no prompt and no active default: n / empty";
+    return vis === 0 ? "dependencies not met" : "no default (n / empty)";
+  }
+
+  async inspectSymbol(symbolName, nodeId = null, { keepScroll = false } = {}) {
+    const detailCol = this.containerEl?.querySelector("#kconfig-detail-col");
+    if (!detailCol || !this.engine.loaded) return;
+    const token = ++this.detailToken;
+    const sym = symbolName.startsWith("CONFIG_") ? symbolName.slice(7) : symbolName;
+    this.selectedSymbol = sym;
+    const e = this.engine;
+    const s = e.syms[sym];
+    const scrollTop = detailCol.scrollTop;
+
+    if (!s) {
+      detailCol.innerHTML = `<div class="kconfig-symbol-title">CONFIG_${escapeHtml(sym)}</div>
+        <div class="kconfig-prop-card" id="kconfig-detail-remote"><div class="kconfig-muted">Not defined for ARCH=${escapeHtml(this.currentArch)}. Looking up other definitions…</div></div>`;
+      this.fillRemoteDetail(sym, token, detailCol);
       return;
     }
 
-    matches.slice(0, 100).forEach((node) => {
-      this.renderTreeNode(scrollEl, node, 0);
+    const val = this.valueOf(sym);
+    const isTri = s.type === "bool" || s.type === "tristate";
+    const typeLabel = s.type === "tristate" && this.engineActive && e.getType(sym) === "bool" ? "tristate (as bool: MODULES=n or y-choice)" : s.type;
+    const controls = [];
+    if (isTri && !(s.choice && this.engineActive && e.symTri(s.choice) === 2)) {
+      for (const v of s.type === "tristate" ? ["n", "m", "y"] : ["n", "y"]) {
+        const allowed = !this.engineActive || v === val || e.tristateWithinRange(sym, { n: 0, m: 1, y: 2 }[v]);
+        controls.push(`<button class="code-btn kconfig-set-btn ${v === val ? "active" : ""}" data-value="${v}" ${allowed ? "" : "disabled"} title="${allowed ? `Set CONFIG_${sym}=${v}` : escapeHtml(e.refusalReason(sym, { n: 0, m: 1, y: 2 }[v]))}">${v}</button>`);
+      }
+    } else if (isTri) {
+      controls.push(`<button class="code-btn kconfig-set-btn ${val === "y" ? "active" : ""}" data-value="y">${val === "y" ? "(X) selected" : "Select"}</button>`);
+    } else {
+      controls.push(`<input class="kconfig-value-input" id="kconfig-value-input" value="${escapeHtml(val)}" spellcheck="false" />
+        <button class="code-btn" id="kconfig-value-set">Set</button>`);
+    }
+    if (this.engineActive && isTri && val === "n") controls.push(`<button class="code-btn" id="btn-autosolve-sym" title="Find the legal changes that enable this option">🪄 Auto-solve</button>`);
+
+    const defs = s.menus.map((id) => this.nodes[id]);
+    const definitionsHtml = defs.map((n) => `
+      <div class="kconfig-def-row">
+        ${this.fileLink(n.file, n.line)}
+        <span class="kconfig-muted">${escapeHtml(n.prompt ? `"${n.prompt}"` : "(no prompt)")}</span>
+        <div class="kconfig-location">Location: ${escapeHtml(["Main menu", ...e.menuPath(n.id)].join(" › "))}</div>
+        ${n.prompt ? `<div class="kconfig-muted">Visible if: ${this.exprHtml(n.pvis)}</div>` : ""}
+      </div>`).join("");
+
+    const defaultsHtml = s.defaults.length
+      ? s.defaults.map(([v, c], i) => {
+        const active = this.engineActive && e.exprTri(c) !== 0 && s.defaults.findIndex(([, cc]) => e.exprTri(cc) !== 0) === i;
+        return `<div class="kconfig-default ${active ? "active" : ""}"><code>default ${escapeHtml(e.exprStr(v))}</code>${c >= 0 ? ` <span class="kconfig-muted">if</span> ${this.exprHtml(c)}` : ""}${active ? ' <span class="kconfig-tag">active</span>' : ""}</div>`;
+      }).join("")
+      : `<span class="kconfig-muted">No defaults (n / empty)</span>`;
+
+    const relList = (items) => items.length
+      ? items.map(([target, cond]) => `<div class="kconfig-rel-row">${this.symLink(target)} <span class="kconfig-muted">when</span> ${this.exprHtml(cond)}</div>`).join("")
+      : `<span class="kconfig-muted">None</span>`;
+
+    const revTerms = e.orTerms(s.rev_dep).filter((id) => !(e.exprs[id][0] === "&" && e.exprs[e.exprs[id][2]]?.[0] === "s" && e.exprs[e.exprs[id][2]][1] === "m"));
+    const selectedByHtml = revTerms.length
+      ? revTerms.map((id) => `<div class="kconfig-rel-row">${this.exprHtml(id)}</div>`).join("")
+      : `<span class="kconfig-muted">Not selected by any option</span>`;
+    const impliedByHtml = s.implied >= 0 ? e.orTerms(s.implied).map((id) => `<div class="kconfig-rel-row">${this.exprHtml(id)}</div>`).join("") : "";
+
+    let choiceHtml = "";
+    if (s.choice) {
+      const cs = e.syms[s.choice];
+      const selected = this.engineActive ? e.choiceSelection(s.choice) : null;
+      choiceHtml = `
+        <div class="kconfig-prop-card">
+          <div class="kconfig-prop-title">Choice group${cs.optional ? " (optional)" : ""}</div>
+          <div class="kconfig-badge-list">${cs.members.map((m) => `<span class="kconfig-badge kconfig-badge-link ${m === selected || this.valueOf(m) === "y" ? "dep-met" : ""}" data-symbol="${escapeHtml(m)}">${m === selected ? "(X)" : "( )"} ${escapeHtml(m)}</span>`).join("")}</div>
+        </div>`;
+    }
+
+    const rangesHtml = s.ranges.length
+      ? `<div class="kconfig-prop-card"><div class="kconfig-prop-title">Ranges</div>${s.ranges.map(([lo, hi, c]) => `<div><code>range ${escapeHtml(e.exprStr(lo))} ${escapeHtml(e.exprStr(hi))}</code>${c >= 0 ? ` <span class="kconfig-muted">if</span> ${this.exprHtml(c)}` : ""}</div>`).join("")}</div>`
+      : "";
+
+    detailCol.innerHTML = `
+      <div class="kconfig-symbol-header">
+        <div>
+          <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
+            <div class="kconfig-symbol-title">CONFIG_${escapeHtml(sym)}</div>
+            <span class="kconfig-type-badge">${escapeHtml(typeLabel)}</span>
+            ${s.env ? `<span class="kconfig-type-badge">env ${escapeHtml(s.env)}</span>` : ""}
+          </div>
+          <div class="kconfig-prompt">${escapeHtml(defs.find((n) => n.prompt)?.prompt || "No prompt (set only through defaults or select)")}</div>
+          <div class="kconfig-value-line">Value: <code>${escapeHtml(val)}</code>${this.engineActive ? ` <span class="kconfig-muted">— ${escapeHtml(this.explainValue(sym))}</span>` : ' <span class="kconfig-muted">— raw (engine off)</span>'}</div>
+        </div>
+        <div class="kconfig-value-controls">${controls.join("")}</div>
+      </div>
+
+      ${this.engineActive ? `
+      <div class="kconfig-prop-card">
+        <div class="kconfig-prop-title">Dependencies (evaluated for ARCH=${escapeHtml(this.currentArch)})</div>
+        <div>Prompt visible: ${this.triBadge(e.visibility(sym))}${!s.prompts.length ? ' <span class="kconfig-muted">(no prompt)</span>' : ""}</div>
+        <div>Depends on: ${this.exprHtml(s.dir_dep)}</div>
+        <div>Selected by: ${revTerms.length ? "" : '<span class="kconfig-muted">none</span>'}</div>${revTerms.length ? selectedByHtml : ""}
+        ${impliedByHtml ? `<div>Implied by:</div>${impliedByHtml}` : ""}
+        ${e.revDep(sym) > 0 && e.dirDep(sym) === 0 ? `<div class="kconfig-warning">⚠ Selected while its direct dependencies are unmet (kconfig warns about this, the value is still forced).</div>` : ""}
+      </div>` : ""}
+
+      <div class="kconfig-prop-card">
+        <div class="kconfig-prop-title">Defined in (${defs.length} definition${defs.length === 1 ? "" : "s"} for ARCH=${escapeHtml(this.currentArch)})</div>
+        ${definitionsHtml || '<span class="kconfig-muted">No definition</span>'}
+      </div>
+
+      ${choiceHtml}
+
+      <div class="kconfig-prop-card">
+        <div class="kconfig-prop-title">Defaults</div>
+        ${defaultsHtml}
+      </div>
+      ${rangesHtml}
+
+      <div class="kconfig-prop-card">
+        <div class="kconfig-prop-title">Selects (forces on)</div>
+        ${relList(s.selects)}
+        ${s.implies.length ? `<div class="kconfig-prop-title" style="margin-top:6px;">Implies (weak default)</div>${relList(s.implies)}` : ""}
+      </div>
+
+      <div class="kconfig-prop-card" id="kconfig-detail-remote">
+        <div class="kconfig-muted">Loading help and build information…</div>
+      </div>
+
+      <div class="kconfig-prop-card">
+        <div class="kconfig-prop-title" style="display:flex;justify-content:space-between;align-items:center;">
+          <span>Where CONFIG_${escapeHtml(sym)} is used</span>
+          <button class="code-btn" id="btn-kconfig-usage" type="button">Find usages</button>
+        </div>
+        <div id="kconfig-usage"></div>
+      </div>
+
+      <div class="kconfig-prop-card">
+        <div class="kconfig-prop-title" style="display:flex;justify-content:space-between;align-items:center;">
+          <span>Dependency graph</span>
+          <button class="code-btn" id="btn-kconfig-graph" type="button">Show graph</button>
+        </div>
+        <div id="kconfig-dep-graph"></div>
+      </div>
+    `;
+    if (keepScroll) detailCol.scrollTop = scrollTop;
+    this.bindDetail(detailCol, sym);
+    this.fillRemoteDetail(sym, token, detailCol);
+  }
+
+  bindDetail(detailCol, sym) {
+    detailCol.querySelectorAll(".kconfig-set-btn").forEach((btn) => {
+      btn.onclick = () => this.applyValue(sym, btn.dataset.value);
     });
-
-    if (matches.length > 100) {
-      const more = document.createElement("div");
-      more.style.padding = "8px 12px";
-      more.style.color = "var(--text-muted)";
-      more.style.fontSize = "11px";
-      more.textContent = `Showing 100 of ${matches.length} matches. Refine filter for more.`;
-      scrollEl.appendChild(more);
+    const input = detailCol.querySelector("#kconfig-value-input");
+    if (input) {
+      const submit = () => this.applyValue(sym, input.value);
+      detailCol.querySelector("#kconfig-value-set").onclick = submit;
+      input.onkeydown = (ev) => {
+        if (ev.key === "Enter") submit();
+      };
     }
+    const autosolveBtn = detailCol.querySelector("#btn-autosolve-sym");
+    if (autosolveBtn) autosolveBtn.onclick = () => this.autosolve(sym);
+    detailCol.querySelector("#btn-kconfig-graph").onclick = (ev) => {
+      ev.target.disabled = true;
+      this.renderDependencyGraph(sym, detailCol.querySelector("#kconfig-dep-graph")).finally(() => {
+        ev.target.disabled = false;
+      });
+    };
+    detailCol.querySelector("#btn-kconfig-usage").onclick = (ev) => {
+      ev.target.disabled = true;
+      this.renderUsage(sym, detailCol.querySelector("#kconfig-usage")).finally(() => {
+        ev.target.disabled = false;
+      });
+    };
+    this.bindLinks(detailCol);
   }
 
-  async inspectSymbol(symbolName, nodeData = {}) {
-    this.selectedSymbol = symbolName;
-    if (nodeData && nodeData.tree_id) {
-      this.selectedNodeId = nodeData.tree_id;
-    }
-    const detailCol = this.containerEl.querySelector("#kconfig-detail-col");
-    detailCol.innerHTML = `<div style="color:var(--text-muted);">Loading detail for ${symbolName}...</div>`;
+  bindLinks(root) {
+    root.querySelectorAll(".kconfig-badge-link[data-symbol]").forEach((badge) => {
+      if (badge.dataset.bound) return;
+      badge.dataset.bound = "1";
+      badge.onclick = (ev) => {
+        ev.stopPropagation();
+        if (badge.dataset.symbol) this.selectAndInspectSymbol(badge.dataset.symbol);
+      };
+      badge.addEventListener("auxclick", (ev) => {
+        if (ev.button === 1 && badge.dataset.symbol) {
+          ev.preventDefault();
+          this.openSymbolTab(badge.dataset.symbol);
+        }
+      });
+    });
+    root.querySelectorAll(".kconfig-file-link").forEach((btn) => {
+      if (btn.dataset.bound) return;
+      btn.dataset.bound = "1";
+      const open = (forceNew) => {
+        const path = btn.dataset.path;
+        const line = parseInt(btn.dataset.line || "1", 10);
+        if (path.endsWith("/")) {
+          toast.info(`${path} is a directory (built when the rule applies)`);
+          return;
+        }
+        state.openTab({ type: "code", title: path.split("/").pop(), path, cursorLine: line, version: this.currentVersion, forceNew });
+      };
+      btn.onclick = () => open(true);
+      btn.addEventListener("auxclick", (ev) => {
+        if (ev.button === 1) {
+          ev.preventDefault();
+          open(true);
+        }
+      });
+    });
+  }
 
+  /** Help text and compiled files from the server (arch-scoped). */
+  async fillRemoteDetail(sym, token, detailCol) {
+    let detail;
     try {
-      const detail = await api.getKconfigSymbol(this.currentVersion, symbolName);
-      const sym = detail.symbol || detail;
-
-      const currentVal = state.kconfigAssignments[symbolName] || state.kconfigAssignments[`CONFIG_${symbolName}`] || "n";
-      const isChoice = Boolean(nodeData.choice && nodeData.choice.id);
-      const isTristate = nodeData.type === 2 || nodeData.type_name === "tristate" || sym.type === 2 || sym.type_name === "tristate";
-      const typeLabel = isChoice ? "choice member" : (isTristate ? "tristate" : (nodeData.type_name || sym.type_name || "bool"));
-
-      // Direct dependencies (depends_on)
-      const rawDeps = (Array.isArray(nodeData.depends_on) && nodeData.depends_on.length > 0)
-        ? nodeData.depends_on
-        : (sym.depends_on || []);
-
-      const rawRevDeps = (Array.isArray(nodeData.selected_by) && nodeData.selected_by.length > 0)
-        ? nodeData.selected_by
-        : (sym.selected_by || []);
-
-      const rawSelects = (Array.isArray(nodeData.selects) && nodeData.selects.length > 0)
-        ? nodeData.selects
-        : (sym.selects || []);
-
-      const rawDefaults = (Array.isArray(nodeData.defaults) && nodeData.defaults.length > 0)
-        ? nodeData.defaults
-        : (sym.defaults || []);
-
-      // Evaluated dependencies badge renderer
-      const renderEvaluatedDeps = (deps) => {
-        if (!Array.isArray(deps) || deps.length === 0) {
-          return `<span style="color:var(--text-muted);font-size:11px;">Unconditional / None</span>`;
-        }
-        return deps.map((dep) => {
-          const raw = typeof dep === "string" ? dep : (dep.name || dep.symbol || "");
-          const clean = raw.replace(/^[!]/, "").replace(/^CONFIG_/, "").trim();
-          const evalVal = this.engine.evalExpr(raw, state.kconfigAssignments);
-          const statusClass = evalVal === 2 ? "dep-met" : (evalVal === 1 ? "dep-mod" : "dep-unmet");
-          const statusPrefix = evalVal === 2 ? "✓ " : (evalVal === 1 ? "~ " : "✗ ");
-          const statusSuffix = evalVal === 2 ? " (y)" : (evalVal === 1 ? " (m)" : " (n)");
-
-          return `
-            <span class="kconfig-badge kconfig-badge-link ${statusClass}" data-symbol="${this.escapeHtml(clean)}" title="Expression: ${this.escapeHtml(raw)} &rarr; evaluated ${evalVal}">
-              ${statusPrefix}${this.escapeHtml(raw)}${statusSuffix}
-            </span>
-          `;
-        }).join("");
-      };
-
-      const renderBadges = (list) => {
-        if (!Array.isArray(list) || list.length === 0) {
-          return `<span style="color:var(--text-muted);font-size:11px;">None</span>`;
-        }
-        return list.map((item) => {
-          const raw = typeof item === "string" ? item : (item.name || item.symbol || "");
-          const clean = raw.replace(/^[!]/, "").replace(/^CONFIG_/, "").trim();
-          return `<span class="kconfig-badge kconfig-badge-link" data-symbol="${this.escapeHtml(clean)}" title="Jump to CONFIG_${this.escapeHtml(clean)}">${this.escapeHtml(raw)}</span>`;
-        }).join("");
-      };
-
-      const renderDefaults = (defs) => {
-        if (!Array.isArray(defs) || defs.length === 0) {
-          return `<span style="color:var(--text-muted);font-size:11px;">Default is 'n'</span>`;
-        }
-        return defs.map((d) => {
-          const val = typeof d === "object" ? (d.value || d.expr || "y") : d;
-          const cond = typeof d === "object" ? d.expr || d.cond : null;
-          const condActive = cond ? this.engine.evalExpr(cond, state.kconfigAssignments) > 0 : true;
-
-          return `
-            <div style="font-family:var(--font-mono);font-size:11px;display:flex;align-items:center;gap:8px;">
-              <span style="color:${condActive ? 'var(--accent-green)' : 'var(--text-muted)'};font-weight:600;">default ${this.escapeHtml(val)}</span>
-              ${cond ? `<span style="color:var(--text-muted);font-size:10px;">if ${this.escapeHtml(cond)} (${condActive ? 'met' : 'unmet'})</span>` : ""}
-            </div>
-          `;
-        }).join("");
-      };
-
-      detailCol.innerHTML = `
-        <div class="kconfig-symbol-header">
-          <div>
-            <div style="display:flex;align-items:center;gap:8px;">
-              <div class="kconfig-symbol-title">CONFIG_${sym.name || symbolName}</div>
-              <span class="kconfig-type-badge">${typeLabel}</span>
-            </div>
-            <div class="kconfig-prompt">${sym.prompt || nodeData.prompt || "No prompt available"}</div>
-            ${(sym.file_path || nodeData.file_path) ? `
-              <div style="font-size:11px;color:var(--text-muted);margin-top:6px;display:flex;align-items:center;gap:6px;">
-                <span>📁 Declared in:</span>
-                <button class="code-btn" id="btn-jump-kconfig-decl" style="padding:2px 8px;font-size:11px;color:var(--accent-blue);" title="Jump to declaration in Code View">
-                  📄 ${this.escapeHtml(sym.file_path || nodeData.file_path)}:${sym.line_s || nodeData.line_s || 1}
-                </button>
-              </div>
-            ` : ""}
-          </div>
-          <div style="display:flex;gap:8px;align-items:center;">
-            ${
-              rawDeps.length > 0
-                ? `<button class="code-btn" id="btn-autosolve-sym" title="Auto-solve prerequisite dependencies">🪄 Auto-Solve</button>`
-                : ""
-            }
-            <button class="code-btn ${currentVal !== 'n' ? 'active' : ''}" id="btn-toggle-sym">
-              Value: ${currentVal === 'y' ? 'CONFIG_y' : (currentVal === 'm' ? 'CONFIG_m' : 'Not Set (n)')}
-            </button>
-          </div>
-        </div>
-
-        ${
-          isChoice ? `
-            <div class="kconfig-choice-box">
-              <div style="font-size:11px;font-weight:600;color:var(--accent-blue);text-transform:uppercase;">
-                Choice Block: ${this.escapeHtml(nodeData.choice.prompt || nodeData.choice.name || "Mutually Exclusive Choice")}
-              </div>
-              <div style="font-size:11px;color:var(--text-secondary);">
-                Only one member of this choice block can be selected at a time.
-              </div>
-              <button class="code-btn active" id="btn-select-this-choice" style="align-self:flex-start;margin-top:4px;">
-                Select CONFIG_${symbolName}
-              </button>
-            </div>
-          ` : ""
-        }
-
-        <!-- Dependencies -->
-        <div class="kconfig-prop-card">
-          <div class="kconfig-prop-title">Direct Dependencies (depends on)</div>
-          <div class="kconfig-badge-list">
-            ${renderEvaluatedDeps(rawDeps)}
-          </div>
-        </div>
-
-        <!-- Defaults -->
-        <div class="kconfig-prop-card">
-          <div class="kconfig-prop-title">Defaults</div>
-          <div style="display:flex;flex-direction:column;gap:4px;">
-            ${renderDefaults(rawDefaults)}
-          </div>
-        </div>
-
-        <!-- Reverse Dependencies -->
-        <div class="kconfig-prop-card">
-          <div class="kconfig-prop-title">Reverse Dependencies (selected by)</div>
-          <div class="kconfig-badge-list">
-            ${renderBadges(rawRevDeps)}
-          </div>
-        </div>
-
-        <!-- Selects -->
-        <div class="kconfig-prop-card">
-          <div class="kconfig-prop-title">Selects (Forces Active)</div>
-          <div class="kconfig-badge-list">
-            ${renderBadges(rawSelects)}
-          </div>
-        </div>
-
-        <!-- Dependency graph -->
-        <div class="kconfig-prop-card">
-          <div class="kconfig-prop-title" style="display:flex;justify-content:space-between;align-items:center;">
-            <span>Dependency Graph</span>
-            <button class="code-btn" id="btn-kconfig-graph" type="button">Show graph</button>
-          </div>
-          <div id="kconfig-dep-graph"></div>
-        </div>
-
-        <!-- Compiled Files -->
-        <div class="kconfig-prop-card">
-          <div class="kconfig-prop-title">Compiled Objects & Source Files</div>
-          <div style="display:flex;flex-direction:column;gap:4px;font-family:var(--font-mono);font-size:11px;">
-            ${
-              Array.isArray(sym.compiled_files) && sym.compiled_files.length > 0
-                ? sym.compiled_files.map((cf) => {
-                    const filePath = typeof cf === "object" && cf !== null ? (cf.file_path || cf.path || "") : String(cf);
-                    const targetObj = typeof cf === "object" && cf !== null && cf.target_obj ? `<span style="color:var(--text-muted);font-size:10px;margin-left:6px;">(${cf.target_obj})</span>` : "";
-                    return `
-                      <div style="color:var(--accent-blue);cursor:pointer;display:flex;align-items:center;padding:4px 6px;border-radius:3px;background:rgba(255,255,255,0.02);border:1px solid rgba(255,255,255,0.05);" class="compiled-file-link" data-path="${filePath}" title="Open ${filePath} in editor">
-                        <span style="margin-right:6px;">📄</span>
-                        <span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${filePath}</span>
-                        ${targetObj}
-                      </div>
-                    `;
-                  }).join("")
-                : `<span style="color:var(--text-muted);font-size:11px;">No direct obj-y compiled sources associated.</span>`
-            }
-          </div>
-        </div>
-      `;
-
-      const graphBtn = detailCol.querySelector("#btn-kconfig-graph");
-      graphBtn.onclick = () => {
-        graphBtn.disabled = true;
-        this.renderDependencyGraph(symbolName, detailCol.querySelector("#kconfig-dep-graph")).finally(() => {
-          graphBtn.disabled = false;
-        });
-      };
-
-      // Jump to Kconfig declaration in code view
-      const declBtn = detailCol.querySelector("#btn-jump-kconfig-decl");
-      if (declBtn && (sym.file_path || nodeData.file_path)) {
-        const filePath = sym.file_path || nodeData.file_path;
-        const line = sym.line_s || nodeData.line_s || 1;
-        declBtn.onclick = () => {
-          state.openTab({
-            type: "code",
-            title: filePath.split("/").pop(),
-            path: filePath,
-            cursorLine: line,
-            version: this.currentVersion,
-            forceNew: true,
-          });
-          toast.success(`Opened ${filePath} at line ${line}`);
-        };
+      detail = await api.getKconfigSymbol(this.currentVersion, sym, this.currentArch, this.toolchain);
+    } catch (err) {
+      if (token === this.detailToken) {
+        const box = detailCol.querySelector("#kconfig-detail-remote");
+        if (box) box.innerHTML = `<div class="kconfig-error">${escapeHtml(err.message)}</div>`;
       }
-
-      // Choice selection button
-      const choiceBtn = detailCol.querySelector("#btn-select-this-choice");
-      if (choiceBtn && isChoice) {
-        choiceBtn.onclick = () => {
-          const updated = this.engine.selectChoiceMember(nodeData.choice.id, symbolName, state.kconfigAssignments);
-          state.setKconfigAssignments(updated);
-          this.inspectSymbol(symbolName, nodeData);
-          this.renderTree();
-          toast.success(`Selected choice member CONFIG_${symbolName}`);
-        };
-      }
-
-      // Auto-solve symbol prerequisites
-      const autosolveBtn = detailCol.querySelector("#btn-autosolve-sym");
-      if (autosolveBtn) {
-        autosolveBtn.onclick = async () => {
-          try {
-            toast.info(`Auto-solving prerequisites for CONFIG_${symbolName}...`);
-            const res = await api.autosolveKconfig(this.currentVersion, { target_symbol: symbolName });
-            const toggles = (res && res.toggles_needed) || [];
-            if (toggles.length > 0) {
-              toggles.forEach((t) => {
-                state.setKconfigAssignment(t.symbol, t.set_to || "y");
-              });
-              if (this.engineActive) {
-                const resolved = this.engine.propagate(state.kconfigAssignments);
-                state.setKconfigAssignments(resolved);
-              }
-              this.inspectSymbol(symbolName, nodeData);
-              this.renderTree();
-              toast.success(`Applied ${toggles.length} prerequisite toggles for CONFIG_${symbolName}`);
-            } else {
-              toast.info(`No missing prerequisites for CONFIG_${symbolName}`);
-            }
-          } catch (err) {
-            toast.error(`Autosolve failed: ${err.message}`);
-          }
-        };
-      }
-
-      // Toggle symbol
-      const toggleBtn = detailCol.querySelector("#btn-toggle-sym");
-      toggleBtn.onclick = () => {
-        if (isChoice) {
-          const updated = this.engine.selectChoiceMember(nodeData.choice.id, symbolName, state.kconfigAssignments);
-          state.setKconfigAssignments(updated);
-        } else {
-          const nextVal = this.engine.cycleValue(symbolName, currentVal, nodeData, state.kconfigAssignments);
-          state.setKconfigAssignment(symbolName, nextVal);
-          if (this.engineActive) {
-            const resolved = this.engine.propagate(state.kconfigAssignments);
-            state.setKconfigAssignments(resolved);
-          }
-        }
-        this.inspectSymbol(symbolName, nodeData);
-        this.renderTree();
-      };
-
-      // Jump to dependency/select symbol
-      detailCol.querySelectorAll(".kconfig-badge-link").forEach((badge) => {
-        badge.onclick = (e) => {
-          e.stopPropagation();
-          const targetSym = badge.dataset.symbol;
-          if (targetSym) {
-            this.selectAndInspectSymbol(targetSym);
-          }
-        };
-        badge.addEventListener("auxclick", (e) => {
-          if (e.button === 1) {
-            e.preventDefault();
-            e.stopPropagation();
-            const targetSym = badge.dataset.symbol;
-            if (targetSym) {
-              state.openTab({
-                type: "kconfig",
-                title: `KConfig (${targetSym})`,
-                arch: this.currentArch,
-                symbol: targetSym,
-                version: this.currentVersion,
-                forceNew: true
-              });
-            }
-          }
-        });
-      });
-
-      // Jump to compiled file
-      detailCol.querySelectorAll(".compiled-file-link").forEach((link) => {
-        link.onclick = () => {
-          state.openTab({
-            type: "code",
-            title: link.dataset.path.split("/").pop(),
-            path: link.dataset.path,
-            version: this.currentVersion
-          });
-        };
-        link.addEventListener("auxclick", (e) => {
-          if (e.button === 1) {
-            e.preventDefault();
-            e.stopPropagation();
-            state.openTab({
-              type: "code",
-              title: link.dataset.path.split("/").pop(),
-              path: link.dataset.path,
-              version: this.currentVersion,
-              forceNew: true
-            });
-          }
-        });
-      });
-    } catch (e) {
-      detailCol.innerHTML = `<div style="color:var(--accent-red);padding:16px;">Failed to fetch detail: ${e.message}</div>`;
+      return;
     }
+    if (token !== this.detailToken) return;
+    const box = detailCol.querySelector("#kconfig-detail-remote");
+    if (!box) return;
+    if (detail.defined_for_arch === false) {
+      box.innerHTML = `
+        <div class="kconfig-prop-title">Not defined for ARCH=${escapeHtml(this.currentArch)}</div>
+        <div class="kconfig-muted">Declared for other architectures in:</div>
+        ${(detail.declarations || []).map((d) => `<div>${this.fileLink(d.file_path, d.line_s)}</div>`).join("") || '<span class="kconfig-muted">nowhere</span>'}`;
+      this.bindLinks(box);
+      return;
+    }
+    const compiled = detail.compiled_files || [];
+    const rules = (detail.kbuild || []).filter((r) => r.kind === "directory" && !r.other_arch);
+    const own = compiled.filter((f) => !f.other_arch);
+    const other = compiled.filter((f) => f.other_arch);
+    const fileRow = (f) => `<div class="kconfig-file-row ${f.other_arch ? "kconfig-other-arch" : ""}">
+        ${this.fileLink(f.file_path, 1, f.file_path)}
+        <span class="kconfig-muted">${escapeHtml(f.target_obj || "")} · ${escapeHtml(f.compile_mode || "")}</span>
+        ${f.makefile ? this.fileLink(f.makefile, f.line, `${f.makefile}:${f.line}`) : ""}
+      </div>`;
+    box.innerHTML = `
+      <div class="kconfig-prop-title">Help</div>
+      <pre class="kconfig-help">${escapeHtml(detail.help || "There is no help available for this option.")}</pre>
+      <div class="kconfig-prop-title" style="margin-top:8px;">Files built when enabled (${own.length})</div>
+      ${own.map(fileRow).join("") || '<span class="kconfig-muted">No Makefile rule names this option directly.</span>'}
+      ${rules.length ? `<div class="kconfig-prop-title" style="margin-top:8px;">Directories descended into</div>
+        ${rules.map((r) => `<div class="kconfig-file-row ${r.other_arch ? "kconfig-other-arch" : ""}"><code>${escapeHtml(r.path)}</code> ${this.fileLink(r.makefile, r.line, `${r.makefile}:${r.line}`)}</div>`).join("")}` : ""}
+      ${other.length ? `<details style="margin-top:6px;"><summary class="kconfig-muted">${other.length} file(s) under other architectures</summary>${other.map(fileRow).join("")}</details>` : ""}
+    `;
+    this.bindLinks(box);
   }
 
-  valueOf(symbol) {
-    return state.kconfigAssignments[symbol] || state.kconfigAssignments[`CONFIG_${symbol}`] || "n";
+  async renderUsage(sym, container) {
+    container.innerHTML = `<div class="kconfig-muted">Searching ${escapeHtml(this.currentVersion)}…</div>`;
+    let usage;
+    try {
+      usage = await api.getKconfigUsage(this.currentVersion, sym, this.currentArch, this.toolchain);
+    } catch (err) {
+      container.innerHTML = `<div class="kconfig-error">${escapeHtml(err.message)}</div>`;
+      return;
+    }
+    const byFile = new Map();
+    for (const r of usage.source_refs || []) {
+      if (!byFile.has(r.file_path)) byFile.set(r.file_path, []);
+      byFile.get(r.file_path).push(r);
+    }
+    const kconfigRefs = usage.kconfig_refs || [];
+    const kbuild = (usage.kbuild || []).filter((r) => r.via === "condition" || r.kind === "directory");
+    container.innerHTML = `
+      <div class="kconfig-muted">${usage.source_ref_count} reference(s) in ${usage.source_file_count} source file(s)${usage.source_ref_count > (usage.source_refs || []).length ? ` (first ${(usage.source_refs || []).length} shown)` : ""}</div>
+      ${[...byFile.entries()].map(([file, refs]) => `
+        <details class="kconfig-usage-file ${refs[0].other_arch ? "kconfig-other-arch" : ""}">
+          <summary>${escapeHtml(file)} <span class="kconfig-muted">(${refs.length})</span></summary>
+          ${refs.map((r) => `<div class="kconfig-usage-line">${this.fileLink(r.file_path, r.line, String(r.line))} <code>${escapeHtml(r.text)}</code></div>`).join("")}
+        </details>`).join("")}
+      ${kbuild.length ? `<div class="kconfig-prop-title" style="margin-top:8px;">Makefile conditions</div>${kbuild.map((r) => `<div>${this.fileLink(r.makefile, r.line, `${r.makefile}:${r.line}`)} <code>${escapeHtml(r.rule)}</code></div>`).join("")}` : ""}
+      <div class="kconfig-prop-title" style="margin-top:8px;">Kconfig entries referring to it (${kconfigRefs.length})</div>
+      ${kconfigRefs.map((r) => `<div class="kconfig-rel-row">${this.symLink(r.by)} <span class="kconfig-muted">${escapeHtml(r.kind.replace(/_/g, " "))}</span> ${this.fileLink(r.file, r.line)}</div>`).join("") || '<span class="kconfig-muted">None</span>'}
+    `;
+    this.bindLinks(container);
   }
 
-  /** Depends-on (left) and selects (right) relations of a symbol as a clickable SVG graph. */
+  async autosolve(sym) {
+    toast.info(`Searching prerequisites for CONFIG_${sym}…`);
+    let res;
+    try {
+      res = await api.autosolveKconfig(this.currentVersion, { target_symbol: sym, arch: this.currentArch, toolchain: this.toolchain, current_values: this.engine.configValues() });
+    } catch (err) {
+      toast.error(`Auto-solve failed: ${err.message}`);
+      return;
+    }
+    const toggles = res.toggles_needed || [];
+    let applied = 0;
+    for (const t of toggles) {
+      if (this.engine.setValue(t.symbol, t.set_to || t.to || "y")) applied++;
+    }
+    if (applied) this.changed();
+    if (this.engine.value(sym) !== "n") toast.success(`CONFIG_${sym}=${this.engine.value(sym)} after ${applied} change(s): ${toggles.map((t) => `${t.symbol}=${t.set_to}`).join(", ")}`);
+    else toast.error(`CONFIG_${sym} cannot be enabled: ${(res.blocked_by || []).join("; ") || "no legal path"}`);
+  }
+
+  /** Depends-on (left) and selects/implies (right) relations of a symbol as a clickable SVG graph. */
   async renderDependencyGraph(symbolName, container) {
-    container.innerHTML = `<div style="color:var(--text-muted);font-size:11px;padding:6px 0;">Loading graph…</div>`;
+    container.innerHTML = `<div class="kconfig-muted">Loading graph…</div>`;
     let graph;
     try {
-      graph = await api.getKconfigGraph(this.currentVersion, this.currentArch, symbolName, 1);
+      graph = await api.getKconfigGraph(this.currentVersion, this.currentArch, symbolName, 1, this.toolchain);
     } catch (err) {
-      container.innerHTML = `<div style="color:var(--accent-red);font-size:11px;">${escapeHtml(err.message)}</div>`;
+      container.innerHTML = `<div class="kconfig-error">${escapeHtml(err.message)}</div>`;
       return;
     }
     const edges = graph.edges || [];
     const left = [...new Set(edges.filter((e) => e.type === "depends_on" && e.from === symbolName).map((e) => e.to))];
     const right = [...new Set(edges.filter((e) => e.type !== "depends_on" && e.from === symbolName).map((e) => e.to))];
     if (!left.length && !right.length) {
-      container.innerHTML = `<div style="color:var(--text-muted);font-size:11px;padding:6px 0;">No depends-on or select relations recorded.</div>`;
+      container.innerHTML = `<div class="kconfig-muted">No own depends-on, select or imply relations.</div>`;
       return;
     }
-
     const ROW = 26;
     const NODE_W = 170;
     const W = 620;
@@ -1059,76 +976,94 @@ export class KconfigView {
     const H = rows * ROW + 30;
     const rootY = H / 2;
     const colY = (count, i) => (H - count * ROW) / 2 + i * ROW + ROW / 2;
-    const fill = (sym) => ({ y: "rgba(63,185,80,0.25)", m: "rgba(210,153,34,0.25)" }[this.valueOf(sym)] || "rgba(110,118,129,0.18)");
-    const stroke = (sym) => ({ y: "#3fb950", m: "#d29922" }[this.valueOf(sym)] || "#6e7681");
+    const val = (sym) => (this.engine.isDefined(sym) ? this.valueOf(sym) : "?");
+    const fill = (sym) => ({ y: "rgba(63,185,80,0.25)", m: "rgba(210,153,34,0.25)" }[val(sym)] || "rgba(110,118,129,0.18)");
+    const stroke = (sym) => ({ y: "#3fb950", m: "#d29922" }[val(sym)] || "#6e7681");
     const node = (sym, x, y, isRoot = false) => `
       <g class="kgraph-node" data-symbol="${escapeHtml(sym)}" style="cursor:pointer;">
         <rect x="${x}" y="${y - 10}" width="${NODE_W}" height="20" rx="4" fill="${isRoot ? "rgba(56,139,253,0.25)" : fill(sym)}" stroke="${isRoot ? "#58a6ff" : stroke(sym)}" />
-        <text x="${x + 8}" y="${y + 4}" font-size="11" font-family="var(--font-mono)" fill="#c9d1d9">${escapeHtml(sym.length > 22 ? `${sym.slice(0, 21)}…` : sym)} = ${escapeHtml(this.valueOf(sym))}</text>
-        <title>CONFIG_${escapeHtml(sym)} = ${escapeHtml(this.valueOf(sym))}</title>
+        <text x="${x + 8}" y="${y + 4}" font-size="11" font-family="var(--font-mono)" fill="#c9d1d9">${escapeHtml(sym.length > 22 ? `${sym.slice(0, 21)}…` : sym)} = ${escapeHtml(val(sym))}</text>
+        <title>CONFIG_${escapeHtml(sym)} = ${escapeHtml(val(sym))}</title>
       </g>`;
     const rootX = (W - NODE_W) / 2;
     let svg = `<svg viewBox="0 0 ${W} ${H}" width="100%" style="max-width:${W}px;display:block;">
       <text x="10" y="14" font-size="10" fill="#8b949e">depends on</text>
-      <text x="${W - 10}" y="14" font-size="10" fill="#8b949e" text-anchor="end">selects</text>`;
-    left.forEach((sym, i) => {
+      <text x="${W - 10}" y="14" font-size="10" fill="#8b949e" text-anchor="end">selects / implies</text>`;
+    left.forEach((_sym, i) => {
       const y = colY(left.length, i);
       svg += `<path d="M ${10 + NODE_W} ${y} C ${rootX - 30} ${y}, ${rootX - 30} ${rootY}, ${rootX} ${rootY}" fill="none" stroke="#6e7681" stroke-opacity="0.6" />`;
     });
-    right.forEach((sym, i) => {
+    right.forEach((_sym, i) => {
       const y = colY(right.length, i);
       svg += `<path d="M ${rootX + NODE_W} ${rootY} C ${W - NODE_W - 40} ${rootY}, ${W - NODE_W - 40} ${y}, ${W - NODE_W - 10} ${y}" fill="none" stroke="#bc8cff" stroke-opacity="0.6" />`;
     });
     left.forEach((sym, i) => { svg += node(sym, 10, colY(left.length, i)); });
     right.forEach((sym, i) => { svg += node(sym, W - NODE_W - 10, colY(right.length, i)); });
     svg += node(symbolName, rootX, rootY, true);
-    svg += `</svg>
-      <div style="font-size:10px;color:var(--text-muted);margin-top:4px;">Green = y, amber = m, grey = n/unset under the current configuration. Click a node to inspect it.</div>`;
+    svg += `</svg><div class="kconfig-muted" style="font-size:10px;margin-top:4px;">Green = y, amber = m, grey = n under the current configuration. Click a node to inspect it.</div>`;
     container.innerHTML = svg;
     container.querySelectorAll(".kgraph-node").forEach((g) => {
       g.addEventListener("click", () => {
-        const sym = g.dataset.symbol;
-        if (sym && sym !== symbolName) this.selectAndInspectSymbol(sym);
+        if (g.dataset.symbol && g.dataset.symbol !== symbolName) this.selectAndInspectSymbol(g.dataset.symbol);
       });
     });
   }
 
-  /** Server-side constraint check of the current assignments. */
-  async showValidation() {
-    const modal = openModal({ title: "Validate configuration", subtitle: `${this.currentArch} @ ${this.currentVersion}`, width: "640px" });
-    modal.body.innerHTML = `<div class="ki-modal-empty">Checking select / depends-on constraints…</div>`;
-    try {
-      const bare = {};
-      for (const [k, v] of Object.entries(state.kconfigAssignments)) if (!k.startsWith("CONFIG_")) bare[k] = v;
-      const res = await api.validateKconfig(this.currentVersion, bare);
-      const forced = Object.entries(res.forced_symbols || {});
-      const adjusted = Object.entries(res.adjusted_symbols || {});
-      const conflicts = res.conflicts || [];
-      const list = (title, rows, color) => rows.length ? `
-        <div class="kconfig-prop-card"><div class="kconfig-prop-title" style="color:${color};">${title} (${rows.length})</div>
-          <div style="font-family:var(--font-mono);font-size:11px;display:flex;flex-direction:column;gap:2px;">${rows.join("")}</div></div>` : "";
-      modal.body.innerHTML = (forced.length || adjusted.length || conflicts.length)
-        ? list("Forced by select", forced.map(([k, v]) => `<div>CONFIG_${escapeHtml(k)} → ${escapeHtml(v)}</div>`), "var(--accent-blue)")
-          + list("Adjusted (unmet dependencies)", adjusted.map(([k, v]) => `<div>CONFIG_${escapeHtml(k)} → ${escapeHtml(v)}</div>`), "var(--accent-yellow)")
-          + list("Conflicts", conflicts.map((c) => `<div>${escapeHtml(typeof c === "string" ? c : JSON.stringify(c))}</div>`), "var(--accent-red)")
-        : `<div class="ki-modal-empty">✓ No constraint violations found for ${Object.keys(bare).length} symbols.</div>`;
-      if (forced.length || adjusted.length) {
-        modal.footer.insertAdjacentHTML("afterbegin", `<button class="code-btn active" id="btn-apply-validation" type="button">Apply ${forced.length + adjusted.length} fixes</button>`);
-        modal.footer.querySelector("#btn-apply-validation").onclick = () => {
-          state.setKconfigAssignments({ ...bare, ...Object.fromEntries(forced), ...Object.fromEntries(adjusted) });
-          this.renderTree();
-          modal.close();
-          toast.success("Applied validation fixes");
-        };
+  // ------------------------------------------------------------------ validation / compare / export
+  /** Kconfig consistency: engine-on configs are valid by construction, raw ones are resolved. */
+  showValidation() {
+    if (!this.engine.loaded) return;
+    const modal = openModal({ title: "Validate configuration", subtitle: `ARCH=${this.currentArch} @ ${this.currentVersion}`, width: "720px" });
+    const probe = new KconfigEngine(this.engine.model);
+    const raw = { ...(this.rawValues || {}) };
+    const report = probe.loadAssignments(raw);
+    const resolved = probe.configValues();
+    const adjusted = [];
+    for (const [name, want] of Object.entries(raw)) {
+      const s = probe.syms[name];
+      if (!s || s.auto) continue;
+      const got = resolved[name] ?? (s.type === "bool" || s.type === "tristate" ? "n" : "");
+      if (String(want) !== got) {
+        const reason = probe.revDep(name) > 0 && got !== "n" ? `forced by select: ${probe.exprStr(s.rev_dep, true)}`
+          : probe.visibility(name) === 0 ? (s.prompts.length ? `prompt not visible: ${s.prompts.map((p) => probe.exprStr(p, true)).join(" || ")}` : "no prompt (value comes from defaults)")
+          : "limited by dependencies or range";
+        adjusted.push({ name, want, got, reason });
       }
-    } catch (err) {
-      modal.body.innerHTML = `<div class="ki-modal-error">${escapeHtml(err.message)}</div>`;
+    }
+    const warnings = Object.keys(probe.syms).filter((n) => {
+      const s = probe.syms[n];
+      return (s.type === "bool" || s.type === "tristate") && !s.choice && probe.revDep(n) > 0 && probe.dirDep(n) === 0;
+    });
+    const row = (html) => `<div class="kconfig-validate-row">${html}</div>`;
+    modal.body.innerHTML = `
+      ${adjusted.length
+        ? `<div class="kconfig-prop-card"><div class="kconfig-prop-title" style="color:var(--accent-yellow);">Values kconfig would not keep (${adjusted.length})</div>
+            ${adjusted.slice(0, 400).map((a) => row(`<code>CONFIG_${escapeHtml(a.name)}</code> ${escapeHtml(a.want)} → <strong>${escapeHtml(a.got || '""')}</strong> <span class="kconfig-muted">${escapeHtml(a.reason)}</span>`)).join("")}</div>`
+        : `<div class="ki-modal-empty">✓ Every value is accepted by kconfig for ARCH=${escapeHtml(this.currentArch)}${this.engineActive ? " (the engine only allows valid values)" : ""}.</div>`}
+      ${report.unknown.length ? `<div class="kconfig-prop-card"><div class="kconfig-prop-title">Unknown for ARCH=${escapeHtml(this.currentArch)} (${report.unknown.length}, dropped by kconfig)</div><div class="kconfig-muted" style="font-family:var(--font-mono);font-size:11px;">${report.unknown.slice(0, 200).map(escapeHtml).join(" ")}</div></div>` : ""}
+      ${warnings.length ? `<div class="kconfig-prop-card"><div class="kconfig-prop-title" style="color:var(--accent-orange);">kconfig warnings: selected with unmet direct dependencies (${warnings.length})</div>
+          ${warnings.map((n) => row(`<code>CONFIG_${escapeHtml(n)}</code> <span class="kconfig-muted">selected by ${escapeHtml(probe.exprStr(probe.syms[n].rev_dep, true))}; depends on ${escapeHtml(probe.exprStr(probe.syms[n].dir_dep, true))}</span>`)).join("")}
+          <div class="kconfig-muted">The real kconfig prints the same warning and keeps the value; the build may still fail for these options.</div></div>` : ""}
+    `;
+    if (adjusted.length || report.unknown.length) {
+      modal.footer.insertAdjacentHTML("afterbegin", `<button class="code-btn active" id="btn-apply-validation" type="button">Apply kconfig resolution</button>`);
+      modal.footer.querySelector("#btn-apply-validation").onclick = () => {
+        this.engine.loadAssignments(raw);
+        if (this.engineActive) this.commit();
+        else {
+          this.rawValues = resolved;
+          this.commit();
+        }
+        this.renderTree();
+        modal.close();
+        toast.success("Configuration replaced by its kconfig resolution");
+      };
     }
   }
 
-  /** Compare the current configuration with one of the architecture's defconfigs. */
+  /** Compare resolved values with a defconfig resolved for the same ARCH. */
   async showCompareWithDefconfig() {
-    const modal = openModal({ title: "Compare with defconfig", subtitle: `${this.currentArch} @ ${this.currentVersion}`, width: "720px" });
+    const modal = openModal({ title: "Compare with defconfig", subtitle: `ARCH=${this.currentArch} @ ${this.currentVersion}`, width: "760px" });
     modal.body.innerHTML = `<div class="ki-modal-empty">Loading defconfigs…</div>`;
     let list = [];
     try {
@@ -1139,13 +1074,12 @@ export class KconfigView {
       return;
     }
     if (!list.length) {
-      modal.body.innerHTML = `<div class="ki-modal-empty">No defconfigs found for ${escapeHtml(this.currentArch)}.</div>`;
+      modal.body.innerHTML = `<div class="ki-modal-empty">No defconfigs found for ARCH=${escapeHtml(this.currentArch)}.</div>`;
       return;
     }
-    const nameOf = (d) => (typeof d === "string" ? d : d.name || d.file_name || d.path || "");
     modal.body.innerHTML = `
       <div class="ki-form-row"><label>Defconfig
-        <select id="cmp-defconfig">${list.map((d) => `<option value="${escapeHtml(nameOf(d))}">${escapeHtml(nameOf(d).split("/").pop())}</option>`).join("")}</select>
+        <select id="cmp-defconfig">${list.map((d) => `<option value="${escapeHtml(d.file_path)}" ${d.is_canonical ? "selected" : ""}>${escapeHtml(d.name)}</option>`).join("")}</select>
       </label></div>
       <div id="cmp-defconfig-result"></div>`;
     const select = modal.body.querySelector("#cmp-defconfig");
@@ -1153,15 +1087,18 @@ export class KconfigView {
       const out = modal.body.querySelector("#cmp-defconfig-result");
       out.innerHTML = `<div class="ki-modal-empty">Comparing…</div>`;
       try {
-        const defRes = await api.getKconfigDefconfigContent(this.currentVersion, select.value, this.currentArch);
-        const other = defRes?.content ? KconfigParser.parse(defRes.content) : (defRes?.values || {});
-        const bareOf = (cfg) => Object.fromEntries(Object.entries(cfg).filter(([k]) => !k.startsWith("CONFIG_")).map(([k, v]) => [k, String(v)]));
-        const res = await api.diffKconfigConfigs(this.currentVersion, bareOf(state.kconfigAssignments), bareOf(other));
-        const diffs = res.differences || [];
+        const defRes = await api.getKconfigDefconfigContent(this.currentVersion, select.value, this.currentArch, this.toolchain);
+        const probe = new KconfigEngine(this.engine.model);
+        probe.loadConfig(defRes.content || "");
+        probe.setAllNewSymbols("default");
+        const other = probe.configValues();
+        const mine = this.rawValues || {};
+        const keys = [...new Set([...Object.keys(mine), ...Object.keys(other)])].sort();
+        const diffs = keys.filter((k) => (mine[k] ?? "—") !== (other[k] ?? "—"));
         out.innerHTML = `
-          <div style="font-size:12px;color:var(--text-secondary);margin:6px 0 10px;">${res.matching_symbols} matching · <strong>${res.mismatched_symbols}</strong> different</div>
-          <table class="kconfig-cmp-table"><thead><tr><th>Option</th><th>Current</th><th>${escapeHtml(select.value.split("/").pop())}</th></tr></thead>
-          <tbody>${diffs.map((d) => `<tr data-symbol="${escapeHtml(d.symbol)}"><td>CONFIG_${escapeHtml(d.symbol)}</td><td>${escapeHtml(d.val1 ?? "—")}</td><td>${escapeHtml(d.val2 ?? "—")}</td></tr>`).join("")}</tbody></table>`;
+          <div class="kconfig-muted" style="margin:6px 0 10px;">${keys.length - diffs.length} matching · <strong>${diffs.length}</strong> different (resolved values)</div>
+          <table class="kconfig-cmp-table"><thead><tr><th>Option</th><th>Current</th><th>${escapeHtml(defRes.name)}</th></tr></thead>
+          <tbody>${diffs.map((k) => `<tr data-symbol="${escapeHtml(k)}"><td>CONFIG_${escapeHtml(k)}</td><td>${escapeHtml(mine[k] ?? "—")}</td><td>${escapeHtml(other[k] ?? "—")}</td></tr>`).join("")}</tbody></table>`;
         out.querySelectorAll("tr[data-symbol]").forEach((tr) => {
           tr.onclick = () => {
             modal.close();
@@ -1176,108 +1113,229 @@ export class KconfigView {
     run();
   }
 
+  /** Full .config, byte-identical to what scripts/kconfig writes (engine on). */
   exportConfig() {
-    const text = KconfigParser.serialize(state.kconfigAssignments, this.currentVersion, this.currentArch);
-    const blob = new Blob([text], { type: "text/plain" });
-    const a = document.createElement("a");
-    a.href = URL.createObjectURL(blob);
-    a.download = `.config_${this.currentArch}`;
-    a.click();
-    toast.success(`Exported .config_${this.currentArch}`);
+    if (!this.engine.loaded) return;
+    const text = this.engineActive
+      ? this.engine.writeConfig()
+      : KconfigParser.serialize(this.rawValues || {}, this.currentVersion, this.currentArch, (n) => this.engine.syms[n]?.type);
+    const name = `${this.currentArch}-${this.currentVersion}.config`;
+    downloadText(name, text);
+    toast.success(this.engineActive
+      ? `Exported ${name}: copy it to <kernel tree>/.config and run make ARCH=${this.currentArch}`
+      : `Exported ${name} (unvalidated: run make ARCH=${this.currentArch} olddefconfig first)`);
   }
 
-  showDefconfigModal(defconfigs) {
-    const backdrop = document.createElement("div");
-    backdrop.className = "palette-backdrop";
-    backdrop.onclick = () => backdrop.remove();
+  /** Minimal defconfig (make savedefconfig); loadable with make <name>_defconfig. */
+  exportDefconfig() {
+    if (!this.engine.loaded) return;
+    if (!this.engineActive) {
+      toast.error("Enable the engine to compute a minimal defconfig");
+      return;
+    }
+    const name = `${this.currentArch}_custom_defconfig`;
+    downloadText(name, this.engine.writeDefconfig());
+    toast.success(`Saved ${name}: place it in arch/${this.engine.model.srcarch}/configs/ and run make ARCH=${this.currentArch} ${name}`);
+  }
 
-    const box = document.createElement("div");
-    box.className = "palette-box";
-    box.onclick = (e) => e.stopPropagation();
-
-    box.innerHTML = `
-      <div style="padding:12px 16px;border-bottom:1px solid var(--border-color);display:flex;justify-content:space-between;align-items:center;">
-        <span style="font-weight:bold;color:var(--accent-blue);">Select Architecture Defconfig (${this.currentArch})</span>
-        <button id="close-def-btn" style="color:var(--text-muted);font-size:16px;">&times;</button>
-      </div>
-      <div style="max-height:360px;overflow-y:auto;padding:8px 16px;display:flex;flex-direction:column;gap:6px;">
-        ${
-          defconfigs.map((d) => `
-            <div class="palette-item def-item" style="display:flex;justify-content:space-between;align-items:center;padding:8px 12px;">
-              <div>
-                <div style="font-weight:600;color:var(--text-primary);">${d.name || d.file_path}</div>
-                <div class="palette-item-desc">${d.file_path || ""}</div>
-              </div>
-              <button class="code-btn active btn-load-single-def" data-path="${d.file_path || d.path || d.name}">Load</button>
+  async showDefconfigModal() {
+    let list = [];
+    try {
+      const defs = await api.getKconfigDefconfigs(this.currentVersion, this.currentArch);
+      list = (defs && defs.defconfigs) || [];
+    } catch (err) {
+      toast.error(`Failed to fetch defconfigs: ${err.message}`);
+      return;
+    }
+    if (!list.length) {
+      toast.info(`No defconfig found for ARCH=${this.currentArch}.`);
+      return;
+    }
+    const modal = openModal({ title: `Defconfigs (ARCH=${this.currentArch})`, subtitle: `${list.length} in ${this.currentVersion}`, width: "560px" });
+    modal.body.innerHTML = `
+      <input type="text" class="kconfig-value-input" id="defconfig-filter" placeholder="Filter…" style="width:100%;margin-bottom:8px;" />
+      <div id="defconfig-list" style="max-height:420px;overflow-y:auto;display:flex;flex-direction:column;gap:4px;">
+        ${list.map((d) => `
+          <div class="palette-item def-item" data-name="${escapeHtml(d.name.toLowerCase())}" style="display:flex;justify-content:space-between;align-items:center;padding:6px 10px;">
+            <div>
+              <div style="font-weight:600;color:var(--text-primary);">${escapeHtml(d.name)}${d.is_canonical ? ' <span class="kconfig-tag">make defconfig</span>' : ""}</div>
+              <div class="palette-item-desc">${escapeHtml(d.file_path)}</div>
             </div>
-          `).join("")
-        }
-      </div>
-    `;
-
-    backdrop.appendChild(box);
-    document.body.appendChild(backdrop);
-
-    box.querySelector("#close-def-btn").onclick = () => backdrop.remove();
-
-    box.querySelectorAll(".btn-load-single-def").forEach((btn) => {
-      btn.onclick = async (e) => {
-        e.stopPropagation();
-        const p = btn.dataset.path;
-        backdrop.remove();
-        toast.info(`Loading defconfig: ${p}...`);
-        try {
-          const res = await api.getKconfigDefconfigContent(this.currentVersion, p, this.currentArch);
-          let parsed = {};
-          if (res.content) {
-            parsed = KconfigParser.parse(res.content);
-          } else if (res.values) {
-            parsed = res.values;
-          }
-
-          // Preserve preset arch symbols for the active architecture
-          let target = this.archPresets.find((pr) => pr.id === this.currentArch || pr.arch === this.currentArch);
-          const archSymbols = (target && target.symbols) || {
-            [this.currentArch.toUpperCase()]: "y",
-            "ARCH": this.currentArch,
-            "SRCARCH": this.currentArch
-          };
-
-          const merged = { ...archSymbols, ...parsed };
-
-          if (this.engineActive) {
-            const resolved = this.engine.propagate(merged);
-            state.setKconfigAssignments(resolved);
-          } else {
-            state.setKconfigAssignments(merged);
-          }
-          const symCount = Object.keys(parsed).length;
-          toast.success(`Loaded defconfig: ${p.split("/").pop()} (${symCount} symbols)`);
-          this.renderTree();
-        } catch (err) {
-          toast.error(`Failed to load defconfig: ${err.message}`);
-        }
+            <button class="code-btn active btn-load-single-def" data-path="${escapeHtml(d.file_path)}">Load</button>
+          </div>`).join("")}
+      </div>`;
+    const filter = modal.body.querySelector("#defconfig-filter");
+    filter.oninput = () => {
+      const q = filter.value.trim().toLowerCase();
+      modal.body.querySelectorAll(".def-item").forEach((el) => {
+        el.style.display = el.dataset.name.includes(q) ? "" : "none";
+      });
+    };
+    modal.body.querySelectorAll(".btn-load-single-def").forEach((btn) => {
+      btn.onclick = async () => {
+        modal.close();
+        await this.loadDefconfig(btn.dataset.path);
+        if (this.selectedSymbol) this.inspectSymbol(this.selectedSymbol);
       };
     });
+  }
 
-    box.querySelectorAll(".palette-item.def-item").forEach((itemEl) => {
-      itemEl.addEventListener("auxclick", (e) => {
-        if (e.button === 1) {
-          e.preventDefault();
-          e.stopPropagation();
-          const btn = itemEl.querySelector(".btn-load-single-def");
-          const p = btn?.dataset.path;
-          if (p) {
-            state.openTab({
-              type: "kconfig",
-              title: `KConfig (${p.split("/").pop()})`,
-              arch: this.currentArch,
-              version: this.currentVersion,
-              forceNew: true
-            });
-          }
-        }
+  // ------------------------------------------------------------------ toolchain
+  /** Re-fetch the model (new toolchain) and resolve the current values through it. */
+  async reloadModel() {
+    const before = { ...(this.rawValues || {}) };
+    const raw = await api.getKconfigTree(this.currentVersion, this.currentArch, this.toolchain);
+    this.engine.setModel(raw);
+    if (this.engineActive) this.engine.loadAssignments(before);
+    this.commit();
+    this.renderTree();
+    if (this.selectedSymbol) this.inspectSymbol(this.selectedSymbol);
+    const after = this.rawValues || {};
+    const keys = new Set([...Object.keys(before), ...Object.keys(after)]);
+    return [...keys].filter((k) => before[k] !== after[k]).length;
+  }
+
+  /**
+   * Toolchain dialog: compiler/linker identity, every environment variable Kconfig read and every
+   * toolchain check ($(cc-option,...), version scripts, compile tests) with how it was answered.
+   */
+  async showToolchainModal() {
+    if (!this.engine.loaded) return;
+    const report = this.engine.model.toolchain || { macros: false, profile: {}, env_used: [], probes: [], messages: [] };
+    const spec = JSON.parse(JSON.stringify(this.toolchain || {}));
+    spec.env = spec.env || {};
+    spec.probes = spec.probes || {};
+    let defaults = null;
+    try {
+      defaults = await api.getKconfigToolchainDefaults(this.currentVersion, this.currentArch);
+    } catch (err) {
+      console.warn("Toolchain defaults unavailable:", err);
+    }
+    const eff = report.profile || {};
+    const modal = openModal({ title: "Toolchain & Kconfig environment", subtitle: `ARCH=${this.currentArch} @ ${this.currentVersion}`, width: "980px" });
+    const BOOL_KINDS = new Set(["cc-option", "ld-option", "as-instr", "cc-compile", "script", "file", "command"]);
+    const field = (key, label, placeholder, hint = "") => `
+      <label class="kconfig-tc-field"><span>${escapeHtml(label)}</span>
+        <input class="kconfig-value-input" data-key="${key}" value="${escapeHtml(spec[key] ?? "")}" placeholder="${escapeHtml(placeholder ?? "")}" spellcheck="false" />
+        ${hint ? `<small class="kconfig-muted">${escapeHtml(hint)}</small>` : ""}</label>`;
+    const select = (key, label, options) => `
+      <label class="kconfig-tc-field"><span>${escapeHtml(label)}</span>
+        <select data-key="${key}">${options.map(([v, t]) => `<option value="${v}" ${String(spec[key] ?? "") === v ? "selected" : ""}>${escapeHtml(t)}</option>`).join("")}</select></label>`;
+    const sourceBadge = (src) => `<span class="kconfig-tc-src kconfig-tc-src-${src}">${escapeHtml(src)}</span>`;
+    const usedBy = (p) => (p.locations || []).slice(0, 4).map((l) => l.symbol
+      ? `<span class="kconfig-badge kconfig-badge-link" data-symbol="${escapeHtml(l.symbol)}">${escapeHtml(l.symbol)}</span>`
+      : this.fileLink(l.file, l.line)).join(" ") + ((p.locations || []).length > 4 ? ` <span class="kconfig-muted">+${p.locations.length - 4}</span>` : "");
+    const probeRow = (p) => {
+      const override = spec.probes[p.key];
+      const control = BOOL_KINDS.has(p.kind)
+        ? `<select class="kconfig-tc-probe" data-probe="${escapeHtml(p.key)}">
+             <option value="" ${override === undefined ? "selected" : ""}>auto</option>
+             <option value="y" ${override === "y" ? "selected" : ""}>force y</option>
+             <option value="n" ${override === "n" ? "selected" : ""}>force n</option></select>`
+        : `<input class="kconfig-value-input kconfig-tc-probe" data-probe="${escapeHtml(p.key)}" value="${escapeHtml(override ?? "")}" placeholder="${escapeHtml(p.result)}" spellcheck="false" />`;
+      return `<tr data-filter="${escapeHtml(`${p.label} ${p.key} ${(p.locations || []).map((l) => l.symbol || "").join(" ")}`.toLowerCase())}">
+        <td><div title="${escapeHtml(p.command)}">${escapeHtml(p.label)}</div><small class="kconfig-muted">${escapeHtml(p.note || p.kind)}</small></td>
+        <td><code>${escapeHtml(p.result === "" ? '""' : p.result)}</code></td>
+        <td>${sourceBadge(p.source)}</td>
+        <td>${usedBy(p)}</td>
+        <td>${control}</td></tr>`;
+    };
+    const assumed = (report.probes || []).filter((p) => p.source === "assumed").length;
+    modal.body.innerHTML = `
+      ${(report.messages || []).length ? `<div class="kconfig-prop-card">${report.messages.map((m) => `<div class="${m.level === "error" ? "kconfig-error" : "kconfig-warning"}">${escapeHtml(m.level)}: ${escapeHtml(m.text)} <span class="kconfig-muted">(${escapeHtml(m.file)}:${m.line})</span></div>`).join("")}
+        ${report.messages.some((m) => m.level === "error") ? '<div class="kconfig-muted">The real kconfig stops on these errors; the configuration below is what it would compute if it went on.</div>' : ""}</div>` : ""}
+      ${report.macros ? "" : `<div class="kconfig-prop-card kconfig-muted">This revision predates the Kconfig macro language (Linux 4.18): the compiler cannot influence the configuration. Only the environment variables below (read through <code>option env=</code>) matter.</div>`}
+      <div class="kconfig-prop-card">
+        <div class="kconfig-prop-title">Toolchain${report.macros ? "" : " (no effect on this revision)"}</div>
+        <div class="kconfig-tc-grid">
+          ${select("cc", "Compiler", [["gcc", "GCC"], ["clang", "Clang / LLVM"]])}
+          ${field("cc_version", "Compiler version", eff.cc_version)}
+          ${select("ld", "Linker", [["", `auto (${eff.ld === "lld" ? "LLD" : "GNU ld"})`], ["bfd", "GNU ld (BFD)"], ["lld", "LLD"]])}
+          ${field("ld_version", "Linker version", eff.ld_version)}
+          ${select("assembler", "Assembler", [["", `auto (${eff.assembler === "llvm" ? "integrated" : "GNU as"})`], ["gnu", "GNU as"], ["llvm", "LLVM integrated"]])}
+          ${field("binutils_version", "Binutils version", eff.binutils_version)}
+          ${field("cross_compile", "CROSS_COMPILE", "", "e.g. aarch64-linux-gnu-")}
+          ${select("llvm_utils", "LLVM utilities (LLVM=1)", [["", `auto (${eff.llvm_utils ? "yes" : "no"})`], ["true", "yes"], ["false", "no"]])}
+          ${field("pahole_version", "pahole version", eff.pahole_version || "not installed", '"none" = not installed')}
+          ${field("rustc_version", "rustc version", eff.rustc_version || "not installed", 'e.g. 1.75.0; "none" = no Rust toolchain')}
+          ${select("gcc_plugins", "GCC plugin headers", [["", eff.gcc_plugins ? "auto (yes)" : "auto (no)"], ["true", "installed"], ["false", "missing"]])}
+          ${field("host_release", "Build host uname -r", eff.host_release)}
+        </div>
+        ${defaults ? `<div class="kconfig-muted">Defaults for Linux ${escapeHtml(defaults.kernelversion)}: gcc ${escapeHtml(defaults.gcc.cc_version)} + binutils ${escapeHtml(defaults.gcc.binutils_version)}, or clang/LLD ${escapeHtml(defaults.clang.cc_version)}. Empty fields use them.</div>` : ""}
+      </div>
+      <div class="kconfig-prop-card">
+        <div class="kconfig-prop-title">Environment variables read by Kconfig (${(report.env_used || []).length})</div>
+        <table class="kconfig-cmp-table kconfig-tc-table"><thead><tr><th>Variable</th><th>Value</th><th>Override</th></tr></thead><tbody>
+          ${(report.env_used || []).map((e) => `<tr><td><code>${escapeHtml(e.name)}</code></td><td><code>${escapeHtml(e.value ?? "(unset)")}</code></td>
+            <td><input class="kconfig-value-input kconfig-tc-env" data-env="${escapeHtml(e.name)}" value="${escapeHtml(spec.env[e.name] ?? "")}" placeholder="${escapeHtml(e.value ?? "")}" spellcheck="false" /></td></tr>`).join("")}
+          ${Object.keys(spec.env).filter((k) => !(report.env_used || []).some((e) => e.name === k)).map((k) => `<tr><td><code>${escapeHtml(k)}</code></td><td class="kconfig-muted">not read</td>
+            <td><input class="kconfig-value-input kconfig-tc-env" data-env="${escapeHtml(k)}" value="${escapeHtml(spec.env[k])}" spellcheck="false" /></td></tr>`).join("")}
+          <tr><td><input class="kconfig-value-input" id="kconfig-tc-newvar" placeholder="NEW_VARIABLE" spellcheck="false" /></td><td class="kconfig-muted">add any variable</td>
+            <td><input class="kconfig-value-input" id="kconfig-tc-newval" placeholder="value" spellcheck="false" /></td></tr>
+        </tbody></table>
+      </div>
+      ${report.macros ? `<div class="kconfig-prop-card">
+        <div class="kconfig-prop-title" style="display:flex;justify-content:space-between;align-items:center;">
+          <span>Toolchain checks run by Kconfig (${(report.probes || []).length}, ${assumed} assumed)</span>
+          <input class="kconfig-value-input" id="kconfig-tc-filter" placeholder="Filter checks or symbols…" spellcheck="false" />
+        </div>
+        <div class="kconfig-muted">Sources: <b>toolchain</b> = derived from the profile above, <b>knowledge</b> = known first gcc/clang versions, <b>assumed</b> = no data (assumed to succeed), <b>override</b> = set here.</div>
+        <div style="max-height:420px;overflow-y:auto;">
+        <table class="kconfig-cmp-table kconfig-tc-table"><thead><tr><th>Check</th><th>Result</th><th>Source</th><th>Used by</th><th>Override</th></tr></thead>
+          <tbody>${(report.probes || []).map(probeRow).join("")}</tbody></table></div>
+      </div>` : ""}
+    `;
+    this.bindLinks(modal.body);
+    modal.body.querySelectorAll(".kconfig-badge-link[data-symbol]").forEach((b) => b.addEventListener("click", () => modal.close()));
+    const filter = modal.body.querySelector("#kconfig-tc-filter");
+    if (filter) {
+      filter.oninput = () => {
+        const q = filter.value.trim().toLowerCase();
+        modal.body.querySelectorAll("tr[data-filter]").forEach((tr) => {
+          tr.style.display = tr.dataset.filter.includes(q) ? "" : "none";
+        });
+      };
+    }
+    modal.footer.insertAdjacentHTML("afterbegin", `
+      <button class="code-btn" id="btn-tc-reset" type="button">Reset to defaults</button>
+      <button class="code-btn active" id="btn-tc-apply" type="button">Apply</button>`);
+    const apply = async (next) => {
+      state.setKconfigToolchain(this.profileKey, next);
+      modal.close();
+      toast.info("Rebuilding the Kconfig model for this toolchain…");
+      try {
+        const changed = await this.reloadModel();
+        const tc = this.engine.model.toolchain;
+        toast.success(`Toolchain ${tc?.summary || ""}: ${changed} configuration value(s) changed`);
+      } catch (err) {
+        toast.error(`Failed to rebuild the model: ${err.message}`);
+      }
+    };
+    modal.footer.querySelector("#btn-tc-reset").onclick = () => apply({});
+    modal.footer.querySelector("#btn-tc-apply").onclick = () => {
+      const next = {};
+      modal.body.querySelectorAll("[data-key]").forEach((el) => {
+        const v = el.value.trim();
+        if (!v) return;
+        next[el.dataset.key] = v === "true" ? true : v === "false" ? false : v;
       });
-    });
+      if (next.cc && next.cc !== eff.cc) {
+        // Switching compiler: versions typed for the other compiler would not make sense
+        for (const k of ["cc_version", "ld_version"]) if (next[k] !== undefined && next[k] === this.toolchain[k]) delete next[k];
+      }
+      const env = {};
+      modal.body.querySelectorAll(".kconfig-tc-env").forEach((el) => {
+        if (el.value !== "") env[el.dataset.env] = el.value;
+      });
+      const newVar = modal.body.querySelector("#kconfig-tc-newvar").value.trim();
+      if (newVar) env[newVar] = modal.body.querySelector("#kconfig-tc-newval").value;
+      if (Object.keys(env).length) next.env = env;
+      const probes = {};
+      modal.body.querySelectorAll(".kconfig-tc-probe").forEach((el) => {
+        if (el.value !== "") probes[el.dataset.probe] = el.value;
+      });
+      if (Object.keys(probes).length) next.probes = probes;
+      apply(next);
+    };
   }
 }

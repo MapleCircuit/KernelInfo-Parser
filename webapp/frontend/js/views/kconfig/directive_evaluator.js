@@ -3,8 +3,9 @@
  *
  * Computes which source lines are compiled out under the current Kconfig assignments.
  * Evaluation is three-valued: only CONFIG_* macros are known (from the resolved configuration,
- * following include/generated/autoconf.h semantics: CONFIG_FOO is defined for "y" and string/int
- * values, CONFIG_FOO_MODULE for "m"); any other macro is unknown, and a branch whose condition
+ * following include/generated/autoconf.h semantics: CONFIG_FOO is defined for "y" and every
+ * string/int/hex value (even an empty string), CONFIG_FOO_MODULE for "m"; symbols that are "n" or
+ * absent from the configuration are undefined); any other macro is unknown, and a branch whose condition
  * is unknown is never dimmed — nor are its #else/#elif alternatives.
  */
 
@@ -51,7 +52,7 @@ export class DirectiveEvaluator {
       if (base !== undefined) return base === "m" ? TRUE : FALSE;
     }
     const val = this.valueOf(bare);
-    if (val === undefined || val === "n" || val === "") return FALSE;
+    if (val === undefined || val === null || val === "n") return FALSE;
     return val === "m" ? FALSE : TRUE;
   }
 
@@ -59,7 +60,8 @@ export class DirectiveEvaluator {
   configTest(fn, macro) {
     if (!macro.startsWith("CONFIG_")) return UNKNOWN;
     const val = this.valueOf(macro.slice(7));
-    const isY = val !== undefined && val !== "n" && val !== "m" && val !== "";
+    // __is_defined() only sees macros expanding to 1: y, or an int symbol whose value is 1
+    const isY = val === "y" || val === "1";
     const isM = val === "m";
     switch (fn) {
       case "IS_BUILTIN": return isY ? TRUE : FALSE;
