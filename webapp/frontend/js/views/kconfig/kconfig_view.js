@@ -16,6 +16,7 @@ import { KconfigEngine } from "./kconfig_engine.js";
 import { KconfigParser } from "./kconfig_parser.js";
 import { MenuconfigTui } from "./menuconfig_tui.js";
 import { openModal, escapeHtml, downloadText } from "../../components/modal.js";
+import { showKconfigHistoryModal } from "../../components/symbol_history_modal.js";
 
 const DEFAULT_ARCH = "x86_64";
 const TRI_CHAR = ["n", "m", "y"];
@@ -782,6 +783,13 @@ export class KconfigView {
 
       <div class="kconfig-prop-card">
         <div class="kconfig-prop-title" style="display:flex;justify-content:space-between;align-items:center;">
+          <span>History across releases</span>
+          <button class="code-btn" id="btn-kconfig-history" type="button" title="When CONFIG_${escapeHtml(sym)} changed and what changed (type, prompt, depends on, select, help…)">🕰 History</button>
+        </div>
+      </div>
+
+      <div class="kconfig-prop-card">
+        <div class="kconfig-prop-title" style="display:flex;justify-content:space-between;align-items:center;">
           <span>Dependency graph</span>
           <button class="code-btn" id="btn-kconfig-graph" type="button">Show graph</button>
         </div>
@@ -807,6 +815,7 @@ export class KconfigView {
     }
     const autosolveBtn = detailCol.querySelector("#btn-autosolve-sym");
     if (autosolveBtn) autosolveBtn.onclick = () => this.autosolve(sym);
+    detailCol.querySelector("#btn-kconfig-history").onclick = () => showKconfigHistoryModal(this.currentVersion, sym);
     detailCol.querySelector("#btn-kconfig-graph").onclick = (ev) => {
       ev.target.disabled = true;
       this.renderDependencyGraph(sym, detailCol.querySelector("#kconfig-dep-graph")).finally(() => {

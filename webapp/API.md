@@ -27,6 +27,7 @@ webapp/
 │   │   ├── tree_resolver.py        # Tri-Path Git tree resolver & 6-Tier symbol disambiguation
 │   │   ├── filesystem_service.py   # Tree traversal, file maps, include resolver, treemap
 │   │   ├── symbol_service.py       # Multi-table symbol search, XRefs, AST containers
+│   │   ├── history_service.py      # Release-by-release history of definitions & Kconfig symbols
 │   │   ├── kconfig_service.py      # Defconfigs, Menuconfig hierarchy, constraint solver
 │   │   ├── maintainer_service.py   # Subsystems catalog, CREDITS, patch match engine
 │   │   ├── git_service.py          # Line-by-line blame, commits log, RFC-2822 format-patch
@@ -670,26 +671,46 @@ Retrieve imported symbols and target header file path for a preprocessor `CPPro_
 
 #### `GET /api/symbols/{version_name}/history`
 #### `GET /api/tag/{tag_id}/timeline`
-History of one symbol definition across every indexed version of the active repository (`SymbolService.get_symbol_history`).
-- **Parameters**: `path` and `line` (query, plus optional `ast_id`) select the narrowest tag of the file covering that line at `version_name`; the tag route uses `tag_id` and locates its file through `m_bridge_checkpoint`/`m_commit_file`.
-- **Algorithm**: For each parsed ref (oldest first) the file's blob comes from the Git tree (content hash → `m_file_blob`); that blob's tags with the anchor's `ast_id` are compared with the previous version's: same `tag_id` → `unchanged`, different → `modified` (with a line diff of the definition read from Git), first appearance → `introduced` (`added` when it reappears), missing → `removed`/`absent`, blob never parsed → `unindexed`. `m_moved_tag` lineage is preferred when a blob holds several matches.
+Release-by-release history of one definition (function, struct, union, enum, typedef, macro, global, ASM label, Rust item...) in the active repository (`HistoryService.get_symbol_history`, `webapp/backend/services/history_service.py`).
+- **Parameters**: `path` and `line` (query) plus optional `name` (the symbol under the cursor) and `ast_id` select the anchor: the narrowest tag of the file at `version_name` covering `line` that is named `name` (else has `ast_id`, else is a definition in `m_symbol_def`). When `name` is not defined at `path:line` (the cursor is on a use), the definition is located through `m_symbol_def` (the requested file first, then definitions with a body, then `.c` files). An anchor that is a Kconfig `config`/`menuconfig` entry returns the Kconfig history below. `include_rc` (bool, default `false`): also list `-rc` tags; by default only final releases (and non-tag refs) are listed. The tag route takes `tag_id` and locates its file through `m_bridge_checkpoint`/`m_commit_file`.
+- **Identity**: versions are matched by the anchor's identity, `m_ast.name` + `type_id`, never by `ast_id` (a function's `ast_id` hashes signature + body, so it changes with every code change). When a blob holds several matches, a member of the anchor's `m_moved_tag` lineage (transitive, both directions, bounded to 500 tags) wins, then the one closest to the previous version's line; a renamed lineage member is used only when no tag of the same name remains.
+- **Algorithm**: the file's blob at every listed ref comes from one `git cat-file --batch-check` (content hash → `m_file_blob`). Per ref: same `tag_id` as the previous ref → `unchanged`; another tag → `modified`, or `cosmetic` when the code is identical once comments and whitespace are removed; first appearance → `introduced` (`added` when it reappears); no match → `removed`/`absent`; blob never parsed → `unindexed`; blob parsed without the definition although a non-indented line of the file still names the symbol → `unparsed` (an indexing gap, the previous state is kept). Code comes from `m_tag_code`; diffs (with context lines) compare against the last present version.
 - **Response**:
 ```json
 {
-  "tag_id": 999657,
-  "ast_id": 1123,
-  "ast_name": "do_fork",
+  "kind": "symbol",
+  "tag_id": 1352034,
+  "ast_id": 2832542,
+  "ast_name": "copy_process",
+  "type_id": 21,
+  "type_name": "C_functionprotodecl",
   "path": "kernel/fork.c",
-  "moved_to": null,
-  "moved_from": null,
-  "lineage_tag_ids": [999657],
-  "total_versions": 6,
+  "include_rc": false,
+  "moved_to": 1404325,
+  "moved_from": 1350084,
+  "lineage_tag_ids": [1352034, 1267003, 1338314, 1350084, 1404325],
+  "total_versions": 5,
+  "change_count": 4,
+  "snippets": { "982012": "static task_t *copy_process(...", "1142713": "..." },
   "timeline": [
-    { "vname": "v2.6.12-rc2", "vid": 1, "status": "introduced", "tag_id": 999657, "line_s": 1192, "line_e": 1250, "lines_added": 0, "lines_removed": 0, "diff": [] },
-    { "vname": "v2.6.13", "vid": 3400, "status": "modified", "tag_id": 1004417, "line_s": 1205, "line_e": 1266, "lines_added": 3, "lines_removed": 2, "diff": [{ "type": "add", "text": "..." }] }
+    { "vname": "v2.6.12", "vid": 1860, "is_release": true, "prev_vname": null, "status": "introduced", "path": "kernel/fork.c", "tag_id": 982012, "line_s": 838, "line_e": 1149, "lines_added": 0, "lines_removed": 0, "diff": [], "defs": [{ "path": "kernel/fork.c", "status": "introduced", "tag_id": 982012, "line_s": 838, "line_e": 1149, "diff": [], "lines_added": 0, "lines_removed": 0 }] },
+    { "vname": "v2.6.13", "vid": 6034, "is_release": true, "prev_vname": "v2.6.12", "status": "modified", "tag_id": 1142713, "line_s": 843, "line_e": 1162, "lines_added": 17, "lines_removed": 9, "diff": [{ "type": "ctx", "text": "..." }, { "type": "add", "text": "..." }], "defs": ["..."] }
   ]
 }
 ```
+
+#### `GET /api/kconfig/{version_name}/symbol/{symbol_name}/history`
+#### `GET /api/version/{version_name}/kconfig/symbol/{symbol_name}/history`
+Release-by-release history of every definition of `CONFIG_<symbol>` (`CONFIG_` prefix optional) across all Kconfig files (`HistoryService.get_kconfig_history`).
+- **Parameters**: `include_rc` (bool, default `false`) as above; `version_name` only picks the reported `path`.
+- **Algorithm**: the Kconfig tags of the symbol (`m_ast` name + `Kconfig_Config`/`Kconfig_Menuconfig` → `m_tag` → `m_bridge_tag`) give the blobs defining it and, through `m_bridge_checkpoint`/`m_commit_file`, the candidate paths; one `git cat-file --batch-check` resolves every (ref, path). Each defining file is parsed with `KconfigParser` (cached per blob SHA) to extract the definition's properties, including the dependencies inherited from enclosing `if`/`menu`/`choice` blocks. Definitions are paired per path (in line order) between consecutive refs: `added`, `removed`, `unchanged` (same tag), `modified` (a property changed) or `cosmetic` (text changed, properties identical). The entry status aggregates them (`introduced`, `added`, `modified`, `cosmetic`, `removed`, `unchanged`, `absent`, `unindexed`).
+- **Response**: `{ "kind": "kconfig", "name", "ast_name": "CONFIG_<name>", "path", "paths", "include_rc", "total_versions", "change_count", "snippets": {tag_id: code}, "timeline": [{ "vname", "vid", "is_release", "prev_vname", "status", "lines_added", "lines_removed", "defs": [{ "path", "status", "tag_id", "line_s", "line_e", "facts", "changes", "diff", "lines_added", "lines_removed" }] }] }`. `facts` = `{ line_s, line_e, kind: config|menuconfig, type, prompt, defaults[], depends_on[], inherited_depends[], selects[], implies[], ranges[], choice, options[], help }` (conditions rendered as `X if COND`); `changes` = `[{ field, before, after }]` for scalar fields (`kind`, `type`, `prompt`, `choice`, `help`) and `[{ field, added[], removed[], before[], after[] }]` for list fields.
+
+#### `GET /api/history/commits`
+Commits behind one change of a history timeline (`HistoryService.get_change_commits`).
+- **Parameters**: `path`, `to` (the version where the change is observed), `from` (the previous timeline version; omitted: the whole history up to `to`), `line_s`/`line_e` (the definition's lines at `to`), `limit` (1-500, default 100). Revisions must match `^[A-Za-z0-9][A-Za-z0-9._/+-]*$`.
+- **Algorithm**: `git log -L<line_s>,<line_e>:<path> --no-patch from..to` (exact: the commits that touched those lines); without a line range (a removed definition) `git log from..to -- path`. LRU cached (1024 entries) per repository, path, range and lines.
+- **Response**: `{ "path", "from", "to", "line_s", "line_e", "total", "commits": [{ "commit_hash", "commit_hash_short", "author_name", "author_email", "author_date", "subject" }] }`.
 
 #### `GET /api/docs/{version_name}/labels`
 Index of every `.. _label:` target under `Documentation/` at the revision (`git grep` with context, LRU cached per commit), used to resolve `:ref:` across documents.
@@ -1433,7 +1454,7 @@ webapp/frontend/js/
 │   ├── command_palette.js # Ctrl+K search (files, symbols, Kconfig, commits) & Ctrl+Shift+P commands
 │   ├── modal.js           # Shared modal dialog + download helper
 │   ├── patch_modal.js     # In-browser patch staging (edit → git format-patch)
-│   ├── symbol_history_modal.js # Symbol definition history across versions
+│   ├── symbol_history_modal.js # Release slider over the history of a definition or Kconfig symbol
 │   ├── ref_picker.js      # Git reference picker popover (release tags + searchable commits)
 │   └── toast.js           # Ephemeral status toasts
 ├── utils/
@@ -1481,7 +1502,9 @@ Handles unified HTTP communication, response caching, offline fallback, and netw
 - `getIncludeSymbols(version, astId, options)`: Fetches imported symbols for an include, supporting fallback lookup options (`filePath`, `line`, `header`, `tagId`).
 - `getSymbolDetail(version, name)` / `getSymbolXref(version, name)`: Symbol inspection.
 - `lookupSymbols(version, query, limit)`: Fast typeahead symbol name suggestion list.
-- `getTagTimeline(tagId)`: Cross-version evolution history for a persistent AST tag.
+- `getSymbolHistory(version, path, line, astId, { name, includeRc })` / `getTagTimeline(tagId, { includeRc })`: Release-by-release history of a definition.
+- `getKconfigHistory(version, name, { includeRc })`: Release-by-release history of a Kconfig symbol with property-level changes.
+- `getHistoryCommits({ path, to, from, lineS, lineE })`: Commits behind one history change (`git log -L`).
 - `getKconfigGraph(version, arch, symbol, depth)`: Full architecture dependency DAG graph.
 - `getKconfigDiff(versionA, versionB)`: Cross-release KConfig symbol definition and default differences.
 - `formatPatch(version, payload)`: Generates RFC-2822 standard git format patch from content edits.
@@ -1670,7 +1693,9 @@ The frontend implements systematic middle-click capture (`auxclick` with `e.butt
 
 ### 5.17. Treemap, Symbol History & Patch Staging
 - **Treemap** (`views/treemap/treemap_view.js`, tab type `treemap`): squarified layout of `/api/version/{v}/treemap` two levels deep, Bytes/Files metric toggle, breadcrumb zoom, click a directory to zoom in or a file to open (middle-click: new tab). Opened from the explorer's folder context menu (*Show Treemap of Folder*) or the palette.
-- **Symbol history** (`components/symbol_history_modal.js`): editor context menu *Symbol History Across Versions* (or *at This Line*) shows `/api/symbols/{v}/history` as a timeline with per-version status, line ranges, inline diffs of modified definitions, and *Open* at that version.
+- **Symbol & Kconfig history** (`components/symbol_history_modal.js`): `showSymbolHistoryModal(version, path, line, astId, name)` (editor context menu *Symbol History Across Releases* on a symbol, *Symbol History at This Line*, palette *Symbol history at cursor line*) and `showKconfigHistoryModal(version, name)` (context menu *Kconfig History Across Releases* on a `CONFIG_*`/Kconfig token or selection, KConfig view **🕰 History** card).
+  - **Slider**: one stop per release where the definition changed (introduced, modified, formatting-only, removed, re-added) plus the first and the newest indexed version; each run of releases without change collapses into a `…` gap (click expands it). ◀/▶ buttons, ←/→ keys and **Play** step through the stops. **All releases** disables collapsing; **Include RCs** refetches with `include_rc=true`. The stop at or before the version the history was opened from is selected first.
+  - **Detail**: status, `prev → version` range and line counts; **Diff** (unchanged runs longer than 3 lines folded) or **Code** of each definition. Kconfig stops list only the files whose definition changed (**Show all N definitions** toggles) with a table of the changed properties (`depends on`, `inherited depends`, `select`, `default`, `type`, `prompt`, `help`...). **Commits** loads `api.getHistoryCommits` for that definition (click a hash to open the commit); **Open @ version** opens the file at the definition.
 - **Patch staging** (`components/patch_modal.js`): code toolbar **✎ Patch**, editor/explorer context menu, or palette. Edit the file in a textarea (Tab inserts a tab), set subject, description and identity (remembered in `localStorage`), then *Generate patch* → `api.formatPatch`; copy or download `0001-<subject>.patch`.
 - **KConfig additions**: **Import .config**, **Validate** and **Compare…** run in the browser engine (see 5.8); the per-symbol **Dependency Graph** uses `api.getKconfigGraph` (own depends-on left, selects/implies right, colored by current value, nodes clickable).
 

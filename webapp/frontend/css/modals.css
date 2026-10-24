@@ -877,48 +877,112 @@
   tab-size: 8;
 }
 
-/* Symbol history timeline */
+/* Symbol / Kconfig history: release slider + detail of the selected change */
 .symhist-meta {
   display: flex;
   flex-wrap: wrap;
   gap: 14px;
-  margin-bottom: 12px;
+  margin-bottom: 10px;
   font-size: 12px;
   color: var(--text-secondary);
 }
 
-.symhist-timeline {
+.symhist-controls {
   display: flex;
-  flex-direction: column;
-}
-
-.symhist-row {
-  display: grid;
-  grid-template-columns: 110px 96px 1fr auto;
+  flex-wrap: wrap;
   align-items: center;
-  gap: 10px;
-  padding: 5px 8px;
-  border-left: 2px solid var(--border-color);
-  margin-left: 6px;
+  gap: 8px;
+  margin-bottom: 8px;
   font-size: 12px;
 }
 
-.symhist-row.changed {
-  border-left-color: var(--accent-yellow);
+.symhist-controls input[type="range"] {
+  flex: 1;
+  min-width: 160px;
+  accent-color: var(--accent-blue);
 }
 
-.symhist-row.introduced,
-.symhist-row.added {
-  border-left-color: var(--accent-green);
+.symhist-controls label {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--text-secondary);
+  cursor: pointer;
 }
 
-.symhist-row.removed {
-  border-left-color: var(--accent-red);
+.symhist-track {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px;
+  padding: 8px;
+  margin-bottom: 12px;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-md);
+}
+
+.symhist-chip {
+  display: inline-flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 1px;
+  padding: 3px 8px;
+  border: 1px solid var(--border-color);
+  border-top: 3px solid var(--text-muted);
+  border-radius: var(--radius-sm);
+  background: var(--bg-tertiary);
+  color: var(--text-primary);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.symhist-chip small {
+  font-family: var(--font-sans);
+  font-size: 9px;
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+
+.symhist-chip.selected {
+  background: var(--bg-active);
+  border-color: var(--accent-blue);
+  box-shadow: 0 0 0 1px var(--accent-blue);
+}
+
+.symhist-chip.rc { opacity: 0.8; font-style: italic; }
+.symhist-chip.introduced,
+.symhist-chip.added { border-top-color: var(--accent-green); }
+.symhist-chip.modified { border-top-color: var(--accent-yellow); }
+.symhist-chip.cosmetic { border-top-color: var(--accent-blue); }
+.symhist-chip.removed { border-top-color: var(--accent-red); }
+
+.symhist-gap {
+  padding: 2px 6px;
+  border: 1px dashed var(--border-color);
+  border-radius: var(--radius-sm);
+  background: none;
+  color: var(--text-muted);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.symhist-gap:hover { color: var(--text-primary); border-color: var(--text-muted); }
+
+.symhist-detail-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 8px;
+  font-size: 12px;
 }
 
 .symhist-version {
   font-family: var(--font-mono);
   font-weight: 600;
+  font-size: 13px;
   color: var(--text-primary);
 }
 
@@ -930,13 +994,84 @@
 
 .symhist-status.unchanged { color: var(--text-muted); }
 .symhist-status.modified { color: var(--accent-yellow); }
+.symhist-status.cosmetic { color: var(--accent-blue); }
 .symhist-status.introduced,
 .symhist-status.added { color: var(--accent-green); }
 .symhist-status.removed { color: var(--accent-red); }
 .symhist-status.absent,
+.symhist-status.unparsed,
 .symhist-status.unindexed { color: var(--text-muted); font-style: italic; }
 
-.symhist-diff {
-  grid-column: 1 / -1;
-  margin: 4px 0 6px;
+.symhist-spacer { flex: 1; }
+
+.symhist-def {
+  margin-bottom: 10px;
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-md);
+  overflow: hidden;
 }
+
+.symhist-def-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  background: var(--bg-tertiary);
+  border-bottom: 1px solid var(--border-color);
+  font-size: 12px;
+}
+
+.symhist-def-head code { color: var(--text-primary); }
+
+.symhist-fields {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+
+.symhist-fields td {
+  padding: 4px 10px;
+  border-bottom: 1px solid var(--border-muted);
+  vertical-align: top;
+}
+
+.symhist-fields td:first-child {
+  width: 150px;
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+
+.symhist-fields code {
+  display: inline-block;
+  margin: 1px 4px 1px 0;
+  padding: 0 4px;
+  border-radius: var(--radius-sm);
+  font-size: 11px;
+}
+
+.symhist-code {
+  max-height: 420px;
+  overflow: auto;
+  border: none;
+  border-radius: 0;
+}
+
+.symhist-code .diff-content > div { min-height: 18px; }
+
+.symhist-commits {
+  padding: 6px 10px;
+  border-top: 1px solid var(--border-color);
+  font-size: 12px;
+}
+
+.symhist-commit {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 3px 0;
+}
+
+.symhist-commit code { color: var(--accent-blue); cursor: pointer; }
+.symhist-commit .symhist-commit-subject { flex: 1; color: var(--text-primary); }
+.symhist-commit .symhist-commit-meta { color: var(--text-muted); white-space: nowrap; }

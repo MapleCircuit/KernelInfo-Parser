@@ -42,7 +42,6 @@ from webapp.main import (
     get_struct_layout,
     get_symbol_xref,
     get_symbol_detail,
-    get_tag_by_id,
     get_tag_timeline,
     get_include_symbols,
     get_versions_diff,
@@ -201,54 +200,18 @@ class TestWebappAdvancedFeatures(unittest.TestCase):
         with self.assertRaises(HTTPException):
             get_tag_timeline(99999999)
 
-        # 3. Test HTML elements exist in webapp.html
-        html_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "webapp", "webapp.html")
-        with open(html_path, "r", encoding="utf-8") as f:
+        # 3. The release slider lives in the modular frontend (the legacy webapp.html page is gone)
+        base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        self.assertFalse(os.path.exists(os.path.join(base_dir, "webapp", "webapp.html")))
+        modal_js = os.path.join(base_dir, "webapp", "frontend", "js", "components", "symbol_history_modal.js")
+        with open(modal_js, "r", encoding="utf-8") as f:
             content = f.read()
-        self.assertIn('id="tagTimelineModal"', content)
-        self.assertIn('id="tagTimelineSlider"', content)
-        self.assertIn('id="tagTimelineNodes"', content)
-        self.assertIn('id="btnPlayTimeline"', content)
-        self.assertIn('id="tagTimelineCodeContainer"', content)
-        self.assertIn('openTagTimelineModal', content)
-        self.assertIn('renderTimelineView', content)
-
-    def test_tag_lineage_evolution_and_moved_tags(self) -> None:
-        """Verify cross-version tag lineage resolution across m_moved_tag (e.g. nlmclnt_initdata)."""
-        try:
-            tag_old = get_tag_by_id(12153743)
-            self.assertEqual(tag_old.get("moved_to"), 17614604)
-            self.assertIsNone(tag_old.get("moved_from"))
-
-            tag_new = get_tag_by_id(17614604)
-            self.assertEqual(tag_new.get("moved_from"), 12153743)
-            self.assertIsNone(tag_new.get("moved_to"))
-
-            timeline_old = get_tag_timeline(12153743)
-            self.assertIn("lineage_tag_ids", timeline_old)
-            self.assertIn(12153743, timeline_old["lineage_tag_ids"])
-            self.assertIn(17614604, timeline_old["lineage_tag_ids"])
-            self.assertGreaterEqual(timeline_old["total_versions"], 11)
-
-            snaps_by_vname = {s["vname"]: s for s in timeline_old["timeline"]}
-            if "v3.3" in snaps_by_vname and "v3.4" in snaps_by_vname:
-                self.assertEqual(snaps_by_vname["v3.3"]["tag_id"], 12153743)
-                self.assertEqual(snaps_by_vname["v3.3"]["status"], "unchanged")
-
-                self.assertEqual(snaps_by_vname["v3.4"]["tag_id"], 17614604)
-                self.assertEqual(snaps_by_vname["v3.4"]["status"], "modified")
-                self.assertGreaterEqual(snaps_by_vname["v3.4"]["lines_added"], 1)
-                diff_texts = [d["text"] for d in snaps_by_vname["v3.4"]["diff"] if d["type"] == "add"]
-                self.assertTrue(any("net" in t for t in diff_texts))
-
-            timeline_new = get_tag_timeline(17614604)
-            self.assertEqual(timeline_new["lineage_tag_ids"], timeline_old["lineage_tag_ids"])
-            self.assertEqual(len(timeline_new["timeline"]), len(timeline_old["timeline"]))
-        except Exception as e:
-            if "not found" in str(e).lower() or "unavailable" in str(e).lower():
-                pass
-            else:
-                raise
+        self.assertIn("export function showSymbolHistoryModal", content)
+        self.assertIn("export function showKconfigHistoryModal", content)
+        self.assertIn('type="range"', content)
+        self.assertIn("symhist-gap", content)
+        self.assertIn('data-act="rc"', content)
+        self.assertIn("api.getHistoryCommits", content)
 
     def test_clang_compile_commands_exporter(self) -> None:
         cmds = export_compile_commands("v3.0", arch="x86")
@@ -352,48 +315,6 @@ class TestWebappAdvancedFeatures(unittest.TestCase):
         self.assertGreater(len(g1["nodes"]), 0)
         self.assertGreater(len(g2["nodes"]), 0)
 
-    def test_webapp_html_tabs_and_modals(self) -> None:
-        html_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "webapp", "webapp.html")
-        with open(html_path, "r", encoding="utf-8") as f:
-            content = f.read()
-
-        # Check dedicated workspaces exist in DOM
-        self.assertIn('id="subsystemWorkspace"', content)
-        self.assertIn('id="personWorkspace"', content)
-        self.assertIn('id="commitWorkspace"', content)
-        self.assertIn('id="dagWorkspace"', content)
-        self.assertIn('id="structWorkspace"', content)
-
-        # Check openModalAsNewTab has cases for subsystem, person, commit
-        self.assertIn('case "subsystemModal":', content)
-        self.assertIn('case "personModal":', content)
-        self.assertIn('case "commitModal":', content)
-
-        # Check tab title formatters
-        self.assertIn('case "subsystem":', content)
-        self.assertIn('case "person":', content)
-        self.assertIn('case "commit":', content)
-
-        # Check allWorkspaces includes the active workspaces
-        self.assertIn('"subsystemWorkspace"', content)
-        self.assertIn('"personWorkspace"', content)
-        self.assertIn('"commitWorkspace"', content)
-
-        # Assert excised non-working features are removed
-        self.assertNotIn('btnModeAstSandbox', content)
-        self.assertNotIn('astSandboxWorkspace', content)
-        self.assertNotIn('openCodeTourModal', content)
-        self.assertNotIn('tourWorkspace', content)
-        self.assertNotIn('openBloatometerModal', content)
-        self.assertNotIn('bloatometerWorkspace', content)
-
-        # Assert modernized features are present
-        self.assertIn('id="globalSymbolSearchInput"', content)
-        self.assertIn('id="globalSymbolSearchDropdown"', content)
-        self.assertIn('id="tokenActionPopover"', content)
-        self.assertIn('executeXrefSearch', content)
-        self.assertIn('openPathAndHighlightLine', content)
-
     def test_symbol_endpoints(self) -> None:
         from fastapi import HTTPException
         try:
@@ -407,36 +328,6 @@ class TestWebappAdvancedFeatures(unittest.TestCase):
 
         results = search_symbols("v3.0", q="task", limit=10)
         self.assertIsInstance(results, list)
-
-    def test_webapp_identifier_click_and_raw_files_unparsed(self) -> None:
-        """Verify DOM structure of tokenActionPopover and raw file bypass in webapp.html."""
-        html_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "webapp", "webapp.html")
-        with open(html_path, "r", encoding="utf-8") as f:
-            content = f.read()
-
-        # 1. Verify tagTimelineModal closes BEFORE tokenActionPopover
-        timeline_idx = content.find('id="tagTimelineModal"')
-        popover_idx = content.find('id="tokenActionPopover"')
-        self.assertGreater(timeline_idx, 0)
-        self.assertGreater(popover_idx, timeline_idx)
-        between = content[timeline_idx:popover_idx]
-        # Must have closed modal-footer, .modal, and #tagTimelineModal (3 closing tags before popover)
-        self.assertIn("</div>\n</div>\n</div>", between.replace(" ", "").replace("\t", "").replace("\r", ""))
-
-        # 2. Verify tokenActionPopover is fixed and stops propagation
-        self.assertIn('position: fixed;', content[popover_idx:popover_idx + 250])
-        self.assertIn('onclick="event.stopPropagation()"', content[popover_idx:popover_idx + 250])
-
-        # 3. Verify handleTokenClick and data attributes
-        self.assertIn('function handleTokenClick(el, event)', content)
-        self.assertIn('data-token-text=', content)
-        self.assertIn('data-token-type=', content)
-        self.assertIn('handleTokenClick(this, event)', content)
-
-        # 4. Verify raw files bypass in highlightLineText
-        self.assertIn('Raw files should NOT be parsed by any parser or lexer', content)
-        self.assertIn('if (!isC && !isAsm && !isKconfig && !isRust)', content)
-        self.assertIn('return { html: escapeHtml(rawText), inComment: false };', content)
 
     def test_include_symbols_endpoint_and_dom(self) -> None:
         """Verify get_include_symbols endpoint and includeSymbolsPopover UI structure."""
@@ -498,27 +389,6 @@ class TestWebappAdvancedFeatures(unittest.TestCase):
             cm_content = f.read()
         self.assertIn("import { includeSymbolsPopover }", cm_content)
         self.assertIn("includeSymbolsPopover.show", cm_content)
-
-        # 5. Verify webapp.html popover elements and controller functions
-        html_path = os.path.join(base_dir, "webapp", "webapp.html")
-        with open(html_path, "r", encoding="utf-8") as f:
-            content = f.read()
-
-        self.assertIn('id="includeSymbolsPopover"', content)
-        self.assertIn('id="includeSymbolsSearchInput"', content)
-        self.assertIn('id="includeCategoryPills"', content)
-        self.assertIn('id="includeSymbolsList"', content)
-        self.assertIn('id="btnIncludeOpenHeader"', content)
-        self.assertIn('openIncludeSymbolsPopover', content)
-        self.assertIn('renderIncludeSymbolsContent', content)
-        self.assertIn('setIncludeCategoryFilter', content)
-        self.assertIn('onFilterIncludeSymbols', content)
-        self.assertIn('onIncludeSymbolClick', content)
-        self.assertIn('includePopoverOpenHeader', content)
-        self.assertIn('closeIncludeSymbolsPopover', content)
-        self.assertIn('typeKey === "CPPro_include"', content)
-        # Ensure includePopoverOpenHeader reads header_file before closeIncludeSymbolsPopover() clears currentIncludeData
-        self.assertIn('let headerFile = currentIncludeData.header_file;', content)
 
     def test_normalize_repo_path(self) -> None:
         """Verify normalize_repo_path strips RAMDISK and temp clone prefixes down to relative git paths."""

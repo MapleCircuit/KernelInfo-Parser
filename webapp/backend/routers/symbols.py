@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any
 from fastapi import APIRouter, Query
 from webapp.backend.services.symbol_service import SymbolService
+from webapp.backend.services.history_service import history_service
 
 router = APIRouter(prefix="/api", tags=["symbols"])
 symbol_service = SymbolService()
@@ -74,15 +75,30 @@ def get_symbol_history(
     path: str = Query(...),
     line: int | None = Query(None),
     ast_id: int | None = Query(None),
+    name: str | None = Query(None, description="Symbol under the cursor: anchors on its definition"),
+    include_rc: bool = Query(False, description="Also list release candidates"),
 ) -> dict[str, Any]:
-    """History of the symbol defined at path:line across every indexed version."""
-    return symbol_service.get_symbol_history(version_name, path, ast_id=ast_id, line=line)
+    """Release-by-release history of the definition at path:line (a Kconfig entry returns its Kconfig history)."""
+    return history_service.get_symbol_history(version_name, path, ast_id=ast_id, line=line, name=name, include_rc=include_rc)
 
 
 @router.get("/tag/{tag_id}/timeline")
-def get_tag_timeline(tag_id: int) -> dict[str, Any]:
-    """Trace cross-version tag evolution history."""
-    return symbol_service.get_tag_timeline(tag_id)
+def get_tag_timeline(tag_id: int, include_rc: bool = Query(False)) -> dict[str, Any]:
+    """Release-by-release history of the definition a tag belongs to."""
+    return history_service.get_tag_history(tag_id, include_rc=include_rc)
+
+
+@router.get("/history/commits")
+def get_history_commits(
+    path: str = Query(...),
+    to: str = Query(..., description="Version (or commit) where the change is observed"),
+    from_rev: str | None = Query(None, alias="from", description="Previous version of the timeline"),
+    line_s: int | None = Query(None),
+    line_e: int | None = Query(None),
+    limit: int = Query(100, ge=1, le=500),
+) -> dict[str, Any]:
+    """Commits of from..to that touched lines line_s..line_e (at `to`) of path (`git log -L`)."""
+    return history_service.get_change_commits(path, to, from_rev, line_s, line_e, limit)
 
 
 @router.get("/symbols/{version_name}/include/{ast_id}")

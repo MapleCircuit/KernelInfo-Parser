@@ -2370,6 +2370,7 @@ def arg_handling() -> argparse.Namespace:
             "tests.test_quit_listener",
             "tests.test_commit_diff",
             "tests.test_webapp_advanced_features",
+            "tests.test_history_service",
             "tests.test_cast_golden",
         ]
         suite = unittest.TestSuite()

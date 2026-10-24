@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any
 from fastapi import APIRouter, Query, Body
 from webapp.backend.services.kconfig_service import DEFAULT_ARCH, KconfigService
+from webapp.backend.services.history_service import history_service
 
 router = APIRouter(prefix="/api", tags=["kconfig"])
 kconfig_service = KconfigService()
@@ -61,6 +62,17 @@ def get_kconfig_symbol_usage(
 ) -> dict[str, Any]:
     """Where CONFIG_<symbol> is used: Kbuild rules, C/ASM/linker sources and Kconfig references."""
     return kconfig_service.get_symbol_usage(version_name, symbol_name, arch, limit, toolchain)
+
+
+@router.get("/kconfig/{version_name}/symbol/{symbol_name}/history")
+@router.get("/version/{version_name}/kconfig/symbol/{symbol_name}/history")
+def get_kconfig_symbol_history(
+    version_name: str,
+    symbol_name: str,
+    include_rc: bool = Query(False, description="Also list release candidates"),
+) -> dict[str, Any]:
+    """Release-by-release history of every definition of CONFIG_<symbol>, with property-level changes."""
+    return history_service.get_kconfig_history(symbol_name, version_name, include_rc)
 
 
 @router.get("/version/{version_name}/kconfig/defconfigs")

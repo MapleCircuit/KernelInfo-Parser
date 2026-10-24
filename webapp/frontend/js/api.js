@@ -226,11 +226,32 @@ class ApiClient {
     return this.request(`/api/docs/${encodeURIComponent(ver)}/kernel-doc?${params.toString()}`, {}, "files", `kdoc_${ver}_${params.toString()}`);
   }
 
-  async getSymbolHistory(version, path, line, astId = null) {
+  /** Release-by-release history of the definition at path:line (`name`: symbol under the cursor). */
+  async getSymbolHistory(version, path, line, astId = null, { name = "", includeRc = false } = {}) {
     const ver = this._sanitizeVer(version);
     const params = new URLSearchParams({ path, line });
     if (astId) params.set("ast_id", astId);
+    if (name) params.set("name", name);
+    if (includeRc) params.set("include_rc", "true");
     return this.request(`/api/symbols/${encodeURIComponent(ver)}/history?${params.toString()}`);
+  }
+
+  /** Release-by-release history of every definition of CONFIG_<name>, with property-level changes. */
+  async getKconfigHistory(version, name, { includeRc = false } = {}) {
+    const ver = this._sanitizeVer(version);
+    const q = includeRc ? "?include_rc=true" : "";
+    return this.request(`/api/kconfig/${encodeURIComponent(ver)}/symbol/${encodeURIComponent(name)}/history${q}`);
+  }
+
+  /** Commits of from..to that touched lines lineS..lineE (at `to`) of path. */
+  async getHistoryCommits({ path, to, from = null, lineS = null, lineE = null }) {
+    const params = new URLSearchParams({ path, to });
+    if (from) params.set("from", from);
+    if (lineS && lineE) {
+      params.set("line_s", lineS);
+      params.set("line_e", lineE);
+    }
+    return this.request(`/api/history/commits?${params.toString()}`, {}, "files", `histcommits_${params.toString()}`);
   }
 
   async searchKconfig(version, query, limit = 25, arch = "x86_64") {
@@ -342,8 +363,8 @@ class ApiClient {
     return this.request(`/api/symbols/${encodeURIComponent(ver)}/lookup?${q}`);
   }
 
-  async getTagTimeline(tagId) {
-    return this.request(`/api/tag/${encodeURIComponent(tagId)}/timeline`, {}, "symbols", `tag_${tagId}_timeline`);
+  async getTagTimeline(tagId, { includeRc = false } = {}) {
+    return this.request(`/api/tag/${encodeURIComponent(tagId)}/timeline${includeRc ? "?include_rc=true" : ""}`);
   }
 
   // --- KConfig ---

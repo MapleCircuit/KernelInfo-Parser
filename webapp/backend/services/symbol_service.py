@@ -493,37 +493,10 @@ class SymbolService:
 
             return build_tree(ast_id, depth)
 
-    def get_tag_timeline(self, tag_id: int) -> dict[str, Any]:
-        """Cross-version history of the symbol a tag belongs to (see get_symbol_history)."""
-        with get_db_cursor() as cursor:
-            cursor.execute(
-                """
-                SELECT fn.fname
-                FROM m_bridge_tag bt
-                JOIN m_bridge_checkpoint bc ON bc.blob_id = bt.blob_id
-                JOIN m_file_name fn ON fn.fnid = bc.fnid
-                WHERE bt.tag_id = %s
-                LIMIT 1;
-                """,
-                (tag_id,),
-            )
-            row = cursor.fetchone()
-            if not row:
-                cursor.execute(
-                    """
-                    SELECT fn.fname
-                    FROM m_bridge_tag bt
-                    JOIN m_commit_file cf ON cf.blob_id = bt.blob_id
-                    JOIN m_file_name fn ON fn.fnid = cf.fnid
-                    WHERE bt.tag_id = %s
-                    LIMIT 1;
-                    """,
-                    (tag_id,),
-                )
-                row = cursor.fetchone()
-        if not row:
-            raise HTTPException(status_code=404, detail=f"Tag {tag_id} not found.")
-        return self.get_symbol_history(None, safe_decode(row["fname"]), tag_id=tag_id)
+    def get_tag_timeline(self, tag_id: int, include_rc: bool = False) -> dict[str, Any]:
+        """Cross-version history of the symbol a tag belongs to (see HistoryService)."""
+        from webapp.backend.services.history_service import history_service
+        return history_service.get_tag_history(tag_id, include_rc=include_rc)
 
     def get_symbol_history(
         self,
@@ -532,177 +505,14 @@ class SymbolService:
         ast_id: int | None = None,
         line: int | None = None,
         tag_id: int | None = None,
+        name: str | None = None,
+        include_rc: bool = False,
     ) -> dict[str, Any]:
-        """Trace one symbol definition of `path` across every indexed version of the active repository.
-
-        The anchor tag is `tag_id`, or the narrowest tag of the file at `version_name` that covers
-        `line` (and matches `ast_id` when given). Each indexed version resolves the file's blob from
-        its Git tree, then finds that blob's tags with the same AST identity: an identical tag_id
-        means the definition is unchanged, a different one means its code changed. Snippets are read
-        from Git so consecutive changes carry a line diff.
-        """
-        from webapp.backend.services.git_reader import git_reader
-        from webapp.backend.services.git_service import _compute_structured_diff
-        from webapp.backend.services.tree_resolver import git_tree_resolver
-        from webapp.backend.database.helpers import get_active_repo_id
-
-        norm_path = (path or "").strip().strip("/")
-        with get_db_cursor() as cursor:
-            # 1. Anchor tag
-            if tag_id is None:
-                if not version_name:
-                    raise HTTPException(status_code=400, detail="version_name is required without tag_id.")
-                vid, vname = get_version_info(cursor, version_name)
-                if vid is None:
-                    raise HTTPException(status_code=404, detail=f"Version '{version_name}' not found.")
-                tree = git_tree_resolver.list_tree(vname) or {}
-                sha = tree.get(norm_path)
-                blob = git_tree_resolver.map_blob_hashes(cursor, [sha]).get(sha) if sha else None
-                if not blob:
-                    raise HTTPException(status_code=404, detail=f"'{norm_path}' is not indexed at '{vname}'.")
-                conds = ["bt.blob_id = %s"]
-                params: list[Any] = [blob[0]]
-                if line:
-                    conds.append("bt.line_s <= %s AND bt.line_e >= %s")
-                    params += [line, line]
-                if ast_id:
-                    conds.append("t.ast_id = %s")
-                    params.append(ast_id)
-                cursor.execute(
-                    f"""
-                    SELECT bt.tag_id
-                    FROM m_bridge_tag bt
-                    JOIN m_tag t ON t.tag_id = bt.tag_id
-                    WHERE {' AND '.join(conds)}
-                    ORDER BY (bt.line_e - bt.line_s) ASC
-                    LIMIT 1;
-                    """,
-                    params,
-                )
-                row = cursor.fetchone()
-                if not row:
-                    raise HTTPException(status_code=404, detail=f"No indexed symbol at {norm_path}:{line or '?'} in '{vname}'.")
-                tag_id = row["tag_id"]
-
-            cursor.execute(
-                """
-                SELECT t.tag_id, t.ast_id, a.name AS ast_name
-                FROM m_tag t
-                JOIN m_ast a ON t.ast_id = a.ast_id
-                WHERE t.tag_id = %s
-                LIMIT 1;
-                """,
-                (tag_id,),
-            )
-            tag_row = cursor.fetchone()
-            if not tag_row:
-                raise HTTPException(status_code=404, detail=f"Tag {tag_id} not found.")
-            anchor_ast = tag_row["ast_id"]
-
-            cursor.execute("SELECT e_tag_id FROM m_moved_tag WHERE s_tag_id = %s;", (tag_id,))
-            forward = [r["e_tag_id"] for r in cursor.fetchall()]
-            cursor.execute("SELECT s_tag_id FROM m_moved_tag WHERE e_tag_id = %s;", (tag_id,))
-            backward = [r["s_tag_id"] for r in cursor.fetchall()]
-
-            # 2. Indexed versions of the active repository, oldest first
-            cursor.execute(
-                """
-                SELECT r.ref_name, r.commit_id
-                FROM m_git_ref r
-                LEFT JOIN m_commit c ON c.commit_id = r.commit_id
-                WHERE r.commit_id > 0 AND r.repo_id = %s
-                ORDER BY c.committer_date ASC, r.commit_id ASC;
-                """,
-                (get_active_repo_id(cursor),),
-            )
-            versions = [(safe_decode(r["ref_name"]), r["commit_id"]) for r in cursor.fetchall()]
-
-            # 3. Blob of the file at each version (Git tree → m_file_blob by content hash)
-            version_sha: dict[str, str | None] = {}
-            for vname_i, _ in versions:
-                tree = git_tree_resolver.list_tree(vname_i)
-                version_sha[vname_i] = tree.get(norm_path) if tree else None
-            blob_meta = git_tree_resolver.map_blob_hashes(cursor, [s for s in version_sha.values() if s])
-            blob_ids = sorted({blob_meta[s][0] for s in version_sha.values() if s and s in blob_meta})
-
-            # 4. Tags with the anchor's AST identity in each of those blobs
-            tags_by_blob: dict[int, list[dict[str, Any]]] = {}
-            if blob_ids:
-                fmt = ",".join(["%s"] * len(blob_ids))
-                cursor.execute(
-                    f"""
-                    SELECT bt.blob_id, bt.tag_id, bt.line_s, bt.line_e
-                    FROM m_bridge_tag bt
-                    JOIN m_tag t ON t.tag_id = bt.tag_id
-                    WHERE bt.blob_id IN ({fmt}) AND t.ast_id = %s
-                    ORDER BY bt.line_s ASC;
-                    """,
-                    [*blob_ids, anchor_ast],
-                )
-                for r in cursor.fetchall():
-                    tags_by_blob.setdefault(r["blob_id"], []).append(r)
-
-        timeline: list[dict[str, Any]] = []
-        prev_tag: int | None = None
-        prev_snippet = ""
-        present_count = 0
-        for vname_i, vid_i in versions:
-            sha = version_sha.get(vname_i)
-            entry: dict[str, Any] = {"vname": vname_i, "vid": vid_i, "tag_id": None, "line_s": None, "line_e": None, "lines_added": 0, "lines_removed": 0, "diff": []}
-            if sha is None:
-                entry["status"] = "removed" if prev_tag is not None else "absent"
-                prev_tag = None
-                timeline.append(entry)
-                continue
-            blob = blob_meta.get(sha)
-            if blob is None:
-                entry["status"] = "unindexed"
-                timeline.append(entry)
-                continue
-            candidates = tags_by_blob.get(blob[0], [])
-            if not candidates:
-                entry["status"] = "removed" if prev_tag is not None else "absent"
-                prev_tag = None
-                timeline.append(entry)
-                continue
-            # Prefer the anchor tag (or a lineage member) when the blob holds several matches
-            lineage = {tag_id, *forward, *backward}
-            match = next((c for c in candidates if c["tag_id"] in lineage), candidates[0])
-            entry.update({"tag_id": match["tag_id"], "line_s": match["line_s"], "line_e": match["line_e"], "blob_id": blob[0]})
-            present_count += 1
-
-            snippet = ""
-            if prev_tag is None or match["tag_id"] != prev_tag:
-                raw, _, _ = git_reader.read_file(vname_i, norm_path)
-                if raw is not None:
-                    lines = raw.decode("utf-8", errors="replace").splitlines()
-                    snippet = "\n".join(lines[max(0, match["line_s"] - 1): match["line_e"]])
-            if prev_tag is None:
-                entry["status"] = "added" if timeline and any(t.get("tag_id") for t in timeline) else "introduced"
-                prev_snippet = snippet
-            elif match["tag_id"] == prev_tag:
-                entry["status"] = "unchanged"
-            else:
-                entry["status"] = "modified"
-                diff = _compute_structured_diff(prev_snippet, snippet)
-                entry["diff"] = [d for d in diff if d["type"] != "ctx"]
-                entry["lines_added"] = sum(1 for d in diff if d["type"] == "add")
-                entry["lines_removed"] = sum(1 for d in diff if d["type"] == "del")
-                prev_snippet = snippet
-            prev_tag = match["tag_id"]
-            timeline.append(entry)
-
-        return {
-            "tag_id": tag_id,
-            "ast_id": anchor_ast,
-            "ast_name": safe_decode(tag_row["ast_name"]),
-            "path": norm_path,
-            "moved_to": forward[0] if forward else None,
-            "moved_from": backward[0] if backward else None,
-            "lineage_tag_ids": [tag_id] + forward + backward,
-            "total_versions": present_count,
-            "timeline": timeline,
-        }
+        """Release-by-release history of the definition at path:line (see HistoryService)."""
+        from webapp.backend.services.history_service import history_service
+        return history_service.get_symbol_history(
+            version_name, path, ast_id=ast_id, line=line, tag_id=tag_id, name=name, include_rc=include_rc,
+        )
 
     def get_include_symbols(
         self,

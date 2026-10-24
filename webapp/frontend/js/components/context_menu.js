@@ -9,7 +9,7 @@ import { toast } from "./toast.js";
 import { copyToClipboard } from "../utils/clipboard.js";
 import { showPersonModal } from "./person_modal.js";
 import { includeSymbolsPopover } from "./include_symbols_popover.js";
-import { showSymbolHistoryModal } from "./symbol_history_modal.js";
+import { showSymbolHistoryModal, showKconfigHistoryModal } from "./symbol_history_modal.js";
 import { showPatchModal } from "./patch_modal.js";
 
 class ContextMenu {
@@ -473,6 +473,11 @@ class ContextMenu {
             this.openKconfigViewer(token.name, v);
           }
         });
+        items.push({
+          label: "Kconfig History Across Releases",
+          icon: "🕰",
+          onClick: () => showKconfigHistoryModal(v, this.getKconfigSymbolName(token.name))
+        });
       } else {
         items.push({
           label: "Go to Definition",
@@ -583,11 +588,13 @@ class ContextMenu {
         }
       });
 
-      items.push({
-        label: "Symbol History Across Versions",
-        icon: "🕰",
-        onClick: () => showSymbolHistoryModal(v, filePath, line, token.ast_id || null, token.name)
-      });
+      if (!isKconfig) {
+        items.push({
+          label: "Symbol History Across Releases",
+          icon: "🕰",
+          onClick: () => showSymbolHistoryModal(v, filePath, line, token.ast_id || null, token.name)
+        });
+      }
 
       items.push({ separator: true });
     } else if (selection && this.isKconfigToken({ name: selection }, filePath, ftype)) {
@@ -597,6 +604,11 @@ class ContextMenu {
         onClick: () => {
           this.openKconfigViewer(selection, v);
         }
+      });
+      items.push({
+        label: `Kconfig History Across Releases (${this.getKconfigSymbolName(selection)})`,
+        icon: "🕰",
+        onClick: () => showKconfigHistoryModal(v, this.getKconfigSymbolName(selection))
       });
       items.push({ separator: true });
     }

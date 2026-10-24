@@ -2,7 +2,7 @@
  * sw.js - Service Worker for KernelInfo-Parser Developer Web Application.
  * Provides offline caching for application shell, static assets, and API requests.
  */
-const CACHE_NAME = "kernel-ide-v9";
+const CACHE_NAME = "kernel-ide-v10";
 const STATIC_ASSETS = [
   "/",
   "/app",
