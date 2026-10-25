@@ -9,6 +9,8 @@
  * - frontend: when the page opens and the last check is more than an hour old, a newer build than the
  *   one this page runs (window.KIP_BUILD, see boot.js) is announced and the page reloads into it after
  *   5 seconds ("Later" postpones it to the next check).
+ * - checkNow() (Settings "Check for Updates"): all four tokens recomputed by the server, version stamps
+ *   refetched and the frontend build compared regardless of the hourly delay.
  */
 import { api } from "./api.js";
 import { localDB } from "./db.js";
@@ -68,10 +70,11 @@ class SyncManager {
     return this.queue;
   }
 
-  async apply(sync, { notify }) {
+  /** Returns the version changes of refreshVersions() when the versions were refetched, else null. */
+  async apply(sync, { notify, force = false }) {
     const prev = this.tokens;
     const next = { ...prev };
-    let refresh = !Object.keys(api.versionStamps).length;
+    let refresh = force || !Object.keys(api.versionStamps).length;
 
     if (sync.db && sync.db !== prev.db) {
       if (prev.db) {
@@ -92,7 +95,35 @@ class SyncManager {
     }
     this.tokens = next;
     await localDB.set("meta", "sync_tokens", next);
-    if (refresh) await this.refreshVersions({ notify });
+    return refresh ? this.refreshVersions({ notify }) : null;
+  }
+
+  /**
+   * Manual check: server tokens recomputed (`?fresh=true`), version stamps always refetched, frontend build
+   * compared without the hourly delay. Resolves to {db, parsed, git, frontend, changed, removed, added,
+   * newBuild}: the first four tell which token changed, newBuild is the server build when it differs from
+   * the running page's (the reload banner is then shown). Rejects when the server is unreachable.
+   */
+  async checkNow() {
+    const sync = await api.getSync({ fresh: true });
+    const prev = { ...this.tokens };
+    const run = this.queue.then(() => this.apply(sync, { notify: true, force: true }));
+    this.queue = run.catch((err) => console.warn("[Sync] Update failed:", err));
+    const versions = (await run) || { changed: [], removed: [], added: [] };
+    try {
+      localStorage.setItem(LAST_FRONTEND_CHECK_KEY, String(Date.now()));
+    } catch { /* storage unavailable */ }
+    const newBuild = sync.frontend && this.build && !this.build.startsWith("__") && sync.frontend !== this.build ? sync.frontend : null;
+    if (newBuild) this.announceUpdate(newBuild);
+    const changedToken = (k) => Boolean(sync[k] && prev[k] && sync[k] !== prev[k]);
+    return {
+      db: changedToken("db"),
+      parsed: changedToken("parsed"),
+      git: changedToken("git"),
+      frontend: Boolean(newBuild),
+      ...versions,
+      newBuild,
+    };
   }
 
   /** Refetch version and branch stamps; drop cached data of versions whose stamp changed. */
@@ -118,6 +149,7 @@ class SyncManager {
       const newlyIndexed = changed.filter((v) => prevStamps[v].endsWith(".git") && !nextStamps[v].endsWith(".git"));
       state.emit("versions:updated", { changed, removed, added, newlyIndexed });
     }
+    return { changed, removed, added };
   }
 
   // ------------------------------------------------------------------ frontend build

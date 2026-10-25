@@ -46,11 +46,12 @@ def get_db_instance() -> dict[str, Any]:
 
 
 @sync_router.get("/sync")
-def get_sync() -> dict[str, Any]:
+def get_sync(fresh: bool = False) -> dict[str, Any]:
     """Change tokens of the server: database instance, frontend build, parsed versions and Git refs.
 
     Clients compare them with the ones they saw last (webapp/frontend/js/sync.js); see
-    webapp/backend/services/sync_service.py for what each one covers.
+    webapp/backend/services/sync_service.py for what each one covers. `fresh=true` recomputes the
+    tokens instead of serving the cached ones (manual "Check for Updates").
     """
     from webapp.backend.services.sync_service import sync_service
-    return sync_service.snapshot()
+    return sync_service.snapshot(fresh=fresh)

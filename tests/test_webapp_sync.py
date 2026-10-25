@@ -126,6 +126,18 @@ class TestTokens(unittest.TestCase):
         ttl.get("k", lambda: calls.append(1) or "v")
         self.assertEqual(len(calls), 3)
 
+    def test_fresh_snapshot_recomputes_cached_tokens(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            svc = ss.SyncService(Path(tmp))
+            counter = iter(range(100))
+            with patch.object(ss, "get_db_cursor", side_effect=lambda: (_ for _ in ()).throw(RuntimeError("no db"))), \
+                 patch.object(ss, "get_active_repo_name", return_value="linux"), \
+                 patch.object(ss, "get_repo_dir", return_value=tmp), \
+                 patch.object(ss.subprocess, "run", side_effect=lambda *a, **k: MagicMock(stdout=f"{next(counter)} refs/tags/v3.0")):
+                first = svc.snapshot()["git"]
+                self.assertEqual(svc.snapshot()["git"], first)  # cached for 15 s
+                self.assertNotEqual(svc.snapshot(fresh=True)["git"], first)  # manual check recomputes
+
 
 class TestVersionStamps(unittest.TestCase):
     def test_stamp_changes_when_parsed_or_moved(self) -> None:

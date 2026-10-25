@@ -378,6 +378,12 @@
   color: var(--accent-blue);
 }
 
+.settings-btn:disabled {
+  opacity: 0.6;
+  cursor: default;
+  pointer-events: none;
+}
+
 .settings-btn.danger {
   color: #e06c75;
 }

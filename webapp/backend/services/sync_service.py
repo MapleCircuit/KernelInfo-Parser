@@ -8,7 +8,8 @@ Four tokens (short hex digests), each with its own client reaction (webapp/front
 - `git`: the active repository's refs (git for-each-ref); tag/branch lists are refetched.
 
 They are cached (frontend 5 s, db 30 s, parsed/git 15 s) so `/api/sync` and the `X-KIP-Sync`
-header of every API response cost no database or Git work on most requests.
+header of every API response cost no database or Git work on most requests; `/api/sync?fresh=true`
+(the "Check for Updates" button) recomputes them all.
 """
 from __future__ import annotations
 
@@ -45,18 +46,18 @@ def _digest(parts: list[str]) -> str:
 
 
 class _Ttl:
-    """value_fn() cached for `ttl` seconds per key."""
+    """value_fn() cached for `ttl` seconds per key (`fresh` recomputes it)."""
 
     def __init__(self, ttl: float) -> None:
         self.ttl = ttl
         self._values: dict[Any, tuple[float, str]] = {}
         self._lock = threading.Lock()
 
-    def get(self, key: Any, value_fn: Callable[[], str]) -> str:
+    def get(self, key: Any, value_fn: Callable[[], str], fresh: bool = False) -> str:
         now = time.monotonic()
         with self._lock:
             hit = self._values.get(key)
-            if hit and now - hit[0] < self.ttl:
+            if hit and not fresh and now - hit[0] < self.ttl:
                 return hit[1]
         value = value_fn()
         with self._lock:
@@ -93,11 +94,11 @@ class SyncService:
                 files.append((path.relative_to(self.frontend_dir).as_posix(), st.st_size, st.st_mtime_ns, st.st_ctime_ns, st.st_ino))
         return files
 
-    def frontend_build(self) -> str:
+    def frontend_build(self, fresh: bool = False) -> str:
         """Content digest of the frontend files; recomputed only when a file's size or mtime changed."""
         with self._frontend_lock:
             now = time.monotonic()
-            if self._frontend_build and now - self._frontend_checked < _FRONTEND_TTL:
+            if self._frontend_build and not fresh and now - self._frontend_checked < _FRONTEND_TTL:
                 return self._frontend_build
             self._frontend_checked = now
             files = self._frontend_files()
@@ -120,7 +121,7 @@ class SyncService:
             return self._frontend_build
 
     # ------------------------------------------------------------------ database / repository
-    def db_token(self) -> str:
+    def db_token(self, fresh: bool = False) -> str:
         def compute() -> str:
             try:
                 with get_db_cursor() as cursor:
@@ -130,9 +131,9 @@ class SyncService:
             except Exception as exc:
                 logger.debug("db token unavailable: %s", exc)
                 return ""
-        return self._db.get("db", compute)
+        return self._db.get("db", compute, fresh)
 
-    def parsed_token(self) -> str:
+    def parsed_token(self, fresh: bool = False) -> str:
         """Digest of the active repository's finished versions (ref, commit, completion time)."""
         repo = get_active_repo_name()
 
@@ -162,9 +163,9 @@ class SyncService:
                 logger.info("Parsed versions of '%s' changed; version caches cleared.", repo)
             self._last_parsed[repo] = token
             return token
-        return self._parsed.get(repo, compute)
+        return self._parsed.get(repo, compute, fresh)
 
-    def git_token(self) -> str:
+    def git_token(self, fresh: bool = False) -> str:
         """Digest of the active repository's refs (tags, branches, remotes)."""
         repo_dir = str(get_repo_dir())
 
@@ -178,15 +179,16 @@ class SyncService:
                 logger.debug("git token unavailable: %s", exc)
                 return ""
             return _digest(out.splitlines())
-        return self._git.get(repo_dir, compute)
+        return self._git.get(repo_dir, compute, fresh)
 
     # ------------------------------------------------------------------ API
-    def snapshot(self) -> dict[str, str]:
+    def snapshot(self, fresh: bool = False) -> dict[str, str]:
+        """All four tokens; `fresh` recomputes them instead of using the cached values."""
         return {
-            "db": self.db_token(),
-            "frontend": self.frontend_build(),
-            "parsed": self.parsed_token(),
-            "git": self.git_token(),
+            "db": self.db_token(fresh),
+            "frontend": self.frontend_build(fresh),
+            "parsed": self.parsed_token(fresh),
+            "git": self.git_token(fresh),
             "repo": get_active_repo_name(),
         }
 

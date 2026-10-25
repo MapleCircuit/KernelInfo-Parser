@@ -158,6 +158,7 @@ Clients must follow server changes without the user knowing to reload. The serve
 | `git` | Tags fetched, branches moved | `git for-each-ref` of the repository (15 s) | Same as `parsed` |
 - **Delivery**: `GET /api/sync` returns all four. `SyncHeaderMiddleware` (inside `RepoContextMiddleware`, so tokens are those of the request's repository) adds `X-KIP-Sync: <db>.<parsed>.<git>` to every `/api/` response, so any request reveals a change without polling.
 - **When clients check**: `syncManager.start()` runs once when the page opens (replacing the former `api.checkDbSync()`): it compares `db`, `parsed` and `git` with the tokens seen last (`meta/sync_tokens`), then follows the `X-KIP-Sync` headers. The `frontend` token is only compared when the page opens **and** the last frontend check (`localStorage["kip-last-frontend-check"]`) is more than an hour old; there is no polling.
+- **Manual check** (`syncManager.checkNow()`, Settings popover **🔄 Check for Updates**, §5.5): requests `GET /api/sync?fresh=true`, so the server recomputes all four tokens instead of serving its cached ones, applies them like a header change, always refetches the version/branch stamps (`apply(…, {force: true})`), and compares the frontend build regardless of the hourly delay (a newer build shows the reload banner). Resolves to `{db, parsed, git, frontend, changed, removed, added, newBuild}`; the popover reports *Up to date* or what changed in a toast. It compares against the server's local Git repository; it does not `git fetch` from a remote.
 - **Version stamps**: `/api/versions` and `/api/branches` give each version a `stamp` (`<commit sha[:12]>.<parse completion time>`, `.0` for versions parsed before `m_ingest_state`, `.git` when not parsed; a branch uses its current Git head). `api._vk(version)` puts `"<name>@<stamp>~"` into every version-scoped cache key, so a re-parsed version or a moved branch never serves older cached data; `syncManager.refreshVersions()` deletes the entries of versions whose stamp changed (`localDB.deleteDataWhere`, `isStaleKey`) and emits `versions:updated` (`{changed, removed, added, newlyIndexed}`); `app.js` then rebuilds the selectors, toasts newly indexed versions and re-renders open views of changed versions. A change of cache-key layout (`CACHE_LAYOUT`) clears the data stores once.
 - **Build-bound assets**: `GET /` renders `index.html` with `__KIP_BUILD__` replaced by the current build (`<meta name="kip-build">`) and every `"/static/` URL rewritten to `"/b/<build>/` (`render_index()`); relative ES-module imports inherit the prefix. `GET /b/{build}/{path}` serves the current build's files with `Cache-Control: public, max-age=31536000, immutable` and answers **409** for any other build, so a page never mixes modules of two builds. The shell and `/boot.js` are sent with `Cache-Control: private, max-age=3600`, `sw.js` with `no-cache`. Legacy `/static/`, `/js/`, `/css/` mounts stay for direct access.
 - **`boot.js`** (classic external script, the CSP forbids inline ones): sets `window.KIP_BUILD` and imports the build's `app.js` (`data-entry`). If the import fails (409: the cached shell is older than the server's build and its modules are not cached), it deletes the `kip-shell`/`kip-assets` caches and reloads once (`sessionStorage["kip-stale-build-reload"]` prevents a loop; a second failure shows an error box). `window.KIP_RELOAD_TO_LATEST()` does the same on request. `app.js` starts on `DOMContentLoaded`, or immediately when the import resolves after it.
@@ -246,6 +247,7 @@ Retrieve the active repository's Git branches: finished indexed refs (`m_git_ref
 
 #### `GET /api/sync`
 Change tokens of the server (§2.11): `{"db", "frontend", "parsed", "git", "repo"}`. Never cached by the service worker.
+- **Query Parameters**: `fresh` (bool, default `false`): recompute every token instead of serving the server-side cached values (frontend 5 s, db 30 s, parsed/git 15 s). Used by the manual *Check for Updates*.
 ```json
 { "db": "4cf36a4c8bf6", "frontend": "65c1f2a0583b", "parsed": "af7532653070", "git": "07886de81433", "repo": "linux" }
 ```
@@ -1558,7 +1560,7 @@ Handles unified HTTP communication, response caching, offline fallback, and netw
   - Employs a 150ms anti-flicker debounce timer so sub-150ms and IndexedDB cache hits never flash the UI.
   - When network fetch duration exceeds 150ms, fades in the glowing spinning indicator and dispatches `app:loading` event; smoothly fades out when all requests finish.
 - `getVersions()`: Fetches release list.
-- `getSync()`: Server change tokens (`GET /api/sync`, never cached); `onSyncHeader` receives the `X-KIP-Sync` header of every response; `versionStamps` / `_vk(version)` stamp version-scoped cache keys (§2.11).
+- `getSync({fresh})`: Server change tokens (`GET /api/sync`, never cached; `fresh` adds `?fresh=true`); `onSyncHeader` receives the `X-KIP-Sync` header of every response; `versionStamps` / `_vk(version)` stamp version-scoped cache keys (§2.11).
 - `getDirectoryTree(version, path, depth)`: Fetches directory tree.
 - `getFileContent(version, path)`: Retrieves raw text and AST tokens.
 - `getTreemap(version, maxDepth, path)`: Retrieves hierarchical squarified codebase treemap.
@@ -1630,6 +1632,7 @@ Implements two-layer hybrid highlighting with map prioritization and client-side
 - **Revamped Settings Popover (`#offline-badge`)**:
   - Clicking the top-right Online/Offline badge opens an anchored settings popover dropdown.
   - **Database & Network**: Real-time network status (`navigator.onLine`) alongside the verified DB Instance Hash badge with synchronization indicator (`● Synced`).
+  - **🔄 Check for Updates** (`app.checkForUpdates()`, disabled offline): runs `syncManager.checkNow()` (§2.11) and shows *Checking… / Up to date / Updated / Failed* on the button, with a toast listing what changed (new frontend build, database rebuilt, versions re-parsed or moved, new or removed versions/branches).
   - **Cached Data Stores Breakdown**: 6-card metric grid showing counts for Files, Symbols, Kconfig, Maintainers, Commits, and Tools, plus total entries and disk footprint in MB.
   - **Granular Per-Store Clear Chips**: Fast one-click buttons to flush individual stores (`Clear Kconfig`, `Clear Files`, `Clear Symbols`, etc.).
   - **Storage Actions**:

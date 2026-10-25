@@ -147,9 +147,9 @@ class ApiClient {
     return stamp ? `${v}@${stamp}~` : v;
   }
 
-  /** Server change tokens {db, frontend, parsed, git, repo}; never cached. */
-  async getSync() {
-    const res = await fetch(`${this.baseUrl}/api/sync`, {
+  /** Server change tokens {db, frontend, parsed, git, repo}; never cached. `fresh` makes the server recompute them. */
+  async getSync({ fresh = false } = {}) {
+    const res = await fetch(`${this.baseUrl}/api/sync${fresh ? "?fresh=true" : ""}`, {
       headers: { Accept: "application/json", ...(this.repo ? { "X-KI-Repo": this.repo } : {}) },
       cache: "no-store",
     });
