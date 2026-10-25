@@ -24,18 +24,20 @@ Dense architectural contract and state interaction reference across `globalstuff
   - `G.BP_ON_SHUTDOWN`: Triggers `sys.breakpointhook()` on emergency exit.
   - `G.BP_ON_REF_FAIL`: Triggers `sys.breakpointhook()` when a `RefType` cannot be resolved.
   - `G.PROFILING_ENABLED`: Enables AST & execution duration profiling.
-  - `G.STAGE_PROFILER`: System-level `PipelineStageProfiler` instance tracking end-to-end stage wall-clock timings, items/throughput, parallel worker CPU breakdowns, and top identified bottlenecks.
+  - `G.STAGE_PROFILER`: System-level `PipelineStageProfiler` instance tracking end-to-end stage wall-clock timings, items/throughput, parallel worker CPU breakdowns, and top identified bottlenecks. Worker profiles with no measured time (e.g. directory ChangeSets) are not counted as parsed files; the CPU breakdown lists only measured components, with `include_symbols_s` (`extract_include_symbols()`) separate from the libclang parse; percent cells are padded before they are coloured, so columns stay aligned.
   - `G.EXECUTION_DEADLINE`: Optional UNIX timestamp epoch after which pipeline stages halt early and print diagnostic profiling summaries.
 - **Control Methods & Utilities**:
   - `G.set_execution_deadline(duration_s: float | None) -> None`: Sets an execution deadline duration in seconds from invocation.
   - `G.is_deadline_exceeded() -> bool`: Returns True if the execution deadline has been reached.
   - `G.get_time_remaining() -> float | None`: Returns remaining seconds until execution deadline.
 - **Interactive quit (`core/quit_listener.py`)**: `GracefulQuitListener` puts an interactive POSIX terminal in cbreak mode (no echo or line buffering; Ctrl+C still raises SIGINT) and reads keys on a daemon thread. Pressing `q`/`Q` sets `requested` and logs `[Quit Requested]`; the release loop in `main()` checks it before each version, so the version being parsed finishes and commits, the remaining versions are skipped, and the profiler report and normal shutdown run. Terminal settings are restored on stop and via `atexit`. The listener stays off when stdin is not a TTY (pipes, CI, `nohup`) or a debugger is attached (`sys.gettrace()`), since debuggers need stdin.
-  - `G.measure_stage(name: str, count: int = 0, units: str = "items")`: Context manager measuring wall-clock duration and throughput for discrete pipeline stages when profiling is active.
+  - `G.measure_stage(name: str, count: int = 0, units: str = "items")`: Context manager measuring wall-clock duration and throughput for discrete pipeline stages when profiling is active. It yields this call's metric: its `count` (initially `count`; the block may assign a better one) is added once to the stage's total, so a stage measured once per version reports the sum over all versions.
   - `G.emergency_shutdown(code: int = 1) -> None`: Cleans all paths in `gp.PURGE_LIST` and exits.
   - `G.BP() -> None`: Drops into breakpoint hook (`sys.breakpointhook()`).
   - `G.type_check(*expected_types)`: Method decorator enforcing runtime type validation.
   - `reclaim_system_memory() -> None`: Runs explicit garbage collection (`gc.collect()`) and invokes glibc `malloc_trim(0)` to return free memory pages to OS.
+  - `trim_heap() -> None`: Only invokes glibc `malloc_trim(0)` (no garbage collection pass); used after TableEngine commits, whose freed rows need no cycle collection.
+  - `MEMORY_RECLAIM_STATS`: Per-process calls and seconds of both helpers (`collect_calls`, `collect_s`, `trim_calls`, `trim_s`); the stage time split reports their difference as GC/trim time.
   - `freeze_system_memory() -> None`: Reclaims unreferenced memory and moves living parent objects into permanent GC generation (`gc.freeze()`), making them immune to worker GC cycle traversal and preventing Copy-on-Write page duplication.
   - `unfreeze_system_memory() -> None`: Restores permanent GC generation back to generational tracking (`gc.unfreeze()`).
   - `compute_code_hash(code: str) -> bytes`: Computes a deterministic 32-byte binary SHA-256 digest (`BINARY(32)`) from normalized code snippet strings for `m_tag_code`.
@@ -131,7 +133,7 @@ Manages RAMDISK temporary working trees and Git repository extraction.
   - `get_file(file_path: str, version: str) -> str`: Returns cached content from RAMDISK (latin-1) or queries `git show <version>:<file_path>`.
   - `read_file(file_path: str, version: str) -> bytes`: Reads raw bytes from RAMDISK. Defensively inspects paths: if `p.is_symlink() and p.is_dir()` or on read errors, extracts link target via `os.readlink(p).encode("utf-8")` to eliminate `[Errno 21] Is a directory` exceptions on directory symlinks (e.g. `arch/*/boot/dts/include/dt-bindings`).
   - `generate_change_list(gp: GreatProcessor) -> list[str]`: Runs `git diff <Old_Version_Name> <Version_Name> --name-status` and sets `gp.Change_List`.
-  - `git_file_list(version: str) -> str`: Executes `git ls-tree -r --name-only <version>`.
+  - `git_file_list(version: str) -> str`: Executes `git ls-tree -r --name-only <version>`; successful listings are cached per (repository, version) (at most 4, dropped by `clear_version_cache()` / `clear_all_version()` / `set_repo_dir()`), since one version is listed by several pipeline steps.
   - `get_dir_list(version_name: str) -> list[str]`: Executes `git ls-tree -r -d --name-only <version_name>`.
   - `get_version_tags(start_ref: str | None = None, include_pre_releases: bool | None = None) -> list[str]`: Discovers and sequences repository release tags using `git -c versionsort.suffix=-rc -c versionsort.suffix=-pre tag -l --sort=v:refname`, ensuring `-rc#` pre-releases are correctly ordered prior to final releases. Release candidates and other pre-releases (`-rc`, `-pre`, `-alpha`, `-beta`) are included by default (`include_pre_releases=None` → `True`, config `parser.include_pre_releases`, default `true`), so a run walks e.g. `v3.0 → v3.1-rc1 … v3.1-rc10 → v3.1`; `--no-rc` / `--releases-only` (or `"include_pre_releases": false`) keeps final releases only. `-tree` tags always are skipped (they point at trees, not commits). When `start_ref` is not a listed tag but resolves to a commit (e.g. the repository's first commit), `_commit_start_sequence()` returns `[start, *tags containing start]` in version order; a tag pointing exactly at `start` (e.g. `v2.6.12-rc2` on Linux's root commit) replaces the raw SHA as the first snapshot name.
   - `get_root_commit(rev="HEAD") -> str | None`: First commit of `rev`'s history (`git rev-list --max-parents=0 --first-parent`).
@@ -152,28 +154,38 @@ Central runtime container, schema registry, and worker IPC coordinator.
   - `Old_Version_Name: str | int`: Prior Git release tag.
   - `VID: int` / `Old_VID: int`: Monotonic database primary keys for current and prior versions in `m_v_main`.
   - `Change_List: list[str] | None`: Raw diff lines (`"M\tpath"`, `"R100\told\tnew"`).
-  - `worker_change_list: list[str] | None`: Filtered subset of changed files passed to multicore workers after content-addressable blob deduplication (`Step 4.5`), preserving authoritative git diff status in `gp.Change_List`.
+  - `worker_change_list: list[str] | None`: Filtered subset of changed files passed to multicore workers after content-addressable blob deduplication (`Step 4.5`), preserving authoritative git diff status in `gp.Change_List`. `None` means Step 4.5 did not filter (workers parse `gp.Change_List`); an empty list means every change was deduplicated and nothing is parsed (`main._select_worker_changes()`).
   - `Symlink_List: list[str]`: Buffers symlinks partitioned from `gp.Change_List` for zero-duplication deferred aliasing directly into `m_bridge_file` via `processing_symlinks()`.
   - `ChangeSet_Dict: dict[str, ChangeSet] | CompressedChangeSetDict`: Main process dictionary mapping relative file paths to parsed `ChangeSet` objects.
   - `Alt_ChangeSet_Dict: dict[str, ChangeSet] | CompressedChangeSetDict`: Secondary cache for on-demand parsed foreign `ChangeSets` during cross-file reference resolution.
   - `Shared_ChangeSet_Dict_List: list[bytes] | None`: IPC list holding worker `pickle.dumps()` payloads.
   - `unchanged_symbol_cache: dict[str, dict[tuple[str, int], int]]`: In-memory cache of symbol mappings `(name, type_id) -> ast_id` queried from the database for unchanged files.
+  - `blob_symbol_cache: dict[int, dict[tuple[str, int], int]]`: The same maps by blob id, kept across versions (a blob's rows never change), filled only for files unchanged in the current update. `get_file_symbols_from_db()` checks it before querying. Forked workers read the parent's copy and collect what they load (`_blob_symbols_fetched`) and look up (`_blob_symbols_used`); their done frame carries both and `_run_worker_stage` merges them (`merge_blob_symbols()`). `prune_blob_symbol_cache(max_idle_versions=8)`, called by `reset_cs()`, advances the version counter and drops maps not looked up for 8 versions (`blob_symbol_used`). Each worker used to re-query every unchanged header it needed in every version (8–30s of worker time per small version).
   - `_changed_paths_set: set[str]`: Set of all relative file paths modified in the active release version.
   - `file_deps: dict[str, set[str]]`: Lightweight dependency graph mapping each changed file path to its set of unresolved foreign file dependencies (`foreign_deps`).
+  - `cs_op_counts: dict[str, int]`: Operation count of each ingested ChangeSet, recorded by `DependencyScheduler.ingest_batch()`; the wave pass breaks cycles with it instead of decompressing stored ChangeSets.
+  - `commit_ids_by_hash: dict[str, int]`: Commit hash -> `commit_id` for the version's range, registered in bulk by `ingest_git_dag()` (Step 1) and reused by `processing_git_commits()` (Step 6.5).
+  - `deduped_paths: set[str]`: Changed paths whose blob Step 4.5 reused instead of parsing; `processing_git_commits()` loads their tags from `m_bridge_tag` to link them to this range's commits.
   - `file_symbols: dict[str, dict[tuple[str, int], int]]`: Per-file exported symbols map `rel_file -> {(sym_name, type_id): ast_id}` populated during Phase 1 staging.
   - `completed_paths: set[str]`: Paths whose ChangeSet executed in the current update, recorded by `extract_tags_and_evacuate_cs()` (even when the file publishes no symbol). `resolve_ref()` treats these as completed after Stage 2 clears `file_symbols` (symbols moved to `_shared_symbols`); reset by `init_cs_dict()`.
   - `file_names: dict[str, dict[str, int]]`: Per-file exported symbol names map `rel_file -> {sym_name: ast_id}` for name-only fallback resolution.
   - `file_pre_extracted_tags: dict[str, list[tuple[int, int, int, int]]]`: Lightweight bridge tags map `rel_file -> [(tag_id, blob_id, line_s, line_e)]` populated upon ChangeSet evacuation to allow zero-decompression tag-to-commit mapping during post-processing.
   - `file_blob_ids: dict[str, int]`: Mapping `rel_file -> blob_id` populated during ChangeSet evacuation to enable $O(1)$ checkpoint staging without decompressing pickled ChangeSets.
   - `_ast_negative_cache: set[tuple[str, int]]`: Negative query cache tracking verified non-existent `(symbol_name, type_id)` AST symbols across TableEngine and database queries, cleared upon chunk commits.
-  - `_shared_symbols`: `SharedSymbolReader | None` &mdash; Zero-copy lock-free shared memory symbol hash table built via `SharedSymbolBuilder`, inherited by forked Phase 2 workers and AST execution engines (`TableHandling.resolve_ref()`) to resolve cross-file symbols in $O(1)$ time without heap memory duplication or IPC serialization overhead.
+  - `_shared_symbols`: `SharedSymbolChain | None` &mdash; File-scoped shared memory symbol segments published during Stage 2 (`main._publish_file_symbols()`), inherited by forked Stage 2 workers and read by `TableHandling.resolve_ref()` (step 0b) to resolve cross-file symbols in $O(1)$ time without heap duplication or IPC serialization. Released by `close_shared_symbols()` from `DependencyScheduler.finalize()`, `init_cs_dict()` and `reset_cs()`, so a version never resolves against a previous version's table.
+  - `_commit_proc` / `_commit_result_dir`: Background git commit parser process (`main._git_commit_worker`, forked by `update()` right after Step 4) and the RAMDISK directory (registered in `PURGE_LIST`) where it pickles `(commits, file_hunks_map)` before exiting. `processing_git_commits()` waits for it via `main._collect_git_commit_result()`; `stop_commit_worker()` terminates it and deletes the directory.
   - `parsed_blob_ids: set[int]`: Registry of parsed content `blob_id`s in current wave/run to eliminate redundant worker dispatches on identical copies (C100).
 - **Worker Lifecycle, Multi-Epoch Streaming & Copy-on-Write Isolation**:
-  - **Worker Heap Isolation**: Workers shallow-copy `gp_ref` on startup and re-point large symbol/ChangeSet collections (`ChangeSet_Dict`, `_ast_staged_symbols`, `_ast_staged_names`, `unchanged_symbol_cache`, `file_symbols`, `file_names`) to empty process-local dictionaries. This ensures that any worker-local query or symbol cache mutation never dirties parent memory pages or triggers Copy-on-Write physical page duplication across worker forks.
+  - **Worker Heap Isolation**: Workers shallow-copy `gp_ref` on startup and re-point large symbol/ChangeSet collections (`ChangeSet_Dict`, `_ast_staged_symbols`, `_ast_staged_names`, `unchanged_symbol_cache`, `file_symbols`, `file_names`, `_ast_negative_cache`, `_blob_symbols_fetched`, `_blob_symbols_used`) to empty process-local containers (`blob_symbol_cache` stays shared and is only read), and set `gp_ref._is_worker = True` so `resolve_ref()` never stages stubs into the worker's never-committed TableEngine. Worker-local mutations never dirty parent memory pages or trigger Copy-on-Write duplication.
   - Workers invoke `reclaim_system_memory()` after processing each batch to release fragmented C-heap pages back to the OS via glibc `malloc_trim(0)`.
-  - **Stage 2 Multi-Epoch Streaming**: Source files are partitioned into natural subsystem-aligned epochs (~4,500–5,000 files each, bounded at modular directory transitions) using project-agnostic dynamic complexity batching. Batches are bounded by both file count (50 files/batch when heavy AST files &ge;64KB are present vs 200 files/batch for lightweight files) and a cumulative byte weight limit (1.5MB max source bytes per batch in normal mode, scaled down in low-memory modes), preventing worker CPU/RAM starvation across any repository structure.
-  - Workers run for the duration of an epoch (~700 files/worker), then terminate and are cleanly reaped (`p.join()`) at the epoch boundary to eliminate zombie processes and prevent Copy-on-Write heap bloat across forks.
-  - **Inter-Epoch Regeneration & Deferred Drain**: At each epoch boundary, `DependencyScheduler.drain_deferred_queue()` unblocks deferred ChangeSets, TableEngine commits staged rows (`G.TE.commit_all()`), and `SharedSymbolBuilder` packs all resolved symbols (headers + completed sources) into an updated huge-page shared hashtable (`gp._shared_symbols`), enabling later epochs to pre-resolve cross-file symbols in $O(1)$ time. Parent heap symbol dictionaries (`file_symbols`, `_ast_staged_symbols`) are cleared after shared memory generation to maintain low parent resident memory.
+  - **Worker Stage Runner (`main._run_worker_stage`)**: Stage 1, every Stage 2 epoch and retries share one runner. Workers are forked from the `fork` multiprocessing context with the parent DB socket closed and reopened around the fork (`on_started` callbacks run after the reopen). Each worker owns a duplex pipe (no shared task queue or lock): the parent's reader thread sends it batches in order, two ahead of the one it parses, and a stop frame once none is left; the worker answers each with one result frame (pickled once, `(batch_cs_dict, per_file_errors)`, zlib-compressed in low memory modes) and ends with a done frame. The reader thread hands at most 2 serialized batches to the ingest thread, and `send_bytes` blocks while the parent is behind, so memory stays bounded on both sides. A pipe closed without its done frame marks the worker as crashed: the oldest batch it had not returned is the one it died on (re-parsed one file per batch), and its other queued batches go back to the surviving workers. Retry rounds continue while they make progress; files that kill a worker again are reported. If no worker can initialize (an init-failure frame from every worker, e.g. the database is unreachable), the stage raises. Ingest failures are recorded per batch without stopping the stage. The deadline is checked while waiting, so an idle stage still stops on time. Stage 1 header batches are bounded by bytes and kept in include order; Stage 1 and each epoch log their parsing time and the gap between the first and the last worker exit.
+  - **Background commits during stages**: Between forking its workers and reaping them, `_run_worker_stage` sets `G.TE.async_commits` (`_begin_background_commits()`), so chunk commits triggered while ingesting are written by the TableEngine's writer thread while the parent keeps ingesting. `_end_background_commits()` switches them off and joins the last one before anything forks again (also called first thing in every stage); a failed background commit put its rows back into staging, and they are committed again there through `_commit_all_with_retry()`. While the parent waits for worker results (a 1s poll without a batch), `_maybe_idle_commit()` also starts a background commit once 100k rows are staged (`_IDLE_COMMIT_MIN_ROWS`, `G.TE.staged_rows`) and none is running: chunk commits come every 1000 executed files, so a small version used to write all its rows in one commit after parsing with every worker idle. Commits outside the stages (header resolution, epoch boundaries, Phase 2, Steps 6.x and 7) stay synchronous.
+  - **Stage time split**: Each stage logs `<label> time split: ...` (`_stage_time_split()`, `_format_time_split()`): how long the parent waited for results, decoded and ingested them (with its database reads), how long it was blocked by commits out of how long they took to write and how many rows, its GC/trim time, and the workers' share of time parsing (dependency pruning and database reads called out), blocked sending results to the parent, without a task (including the time a worker had already exited while another still parsed, `worker_tail_idle_s`), and in GC. Workers measure their part and send it with their done frame (`_WORKER_SPLIT_KEYS`; a bare done frame is still accepted). In normal memory modes the parent no longer runs a full collection every 10 ingested batches (the automatic collector and the trim after each commit cover it). Batch sizes shrink for small stages (`_balanced_batch_size()`: about 4 batches per worker, at least 4 files each, at most the memory profile's size) so a version with a few hundred changed files does not leave most workers waiting on one large batch. When Stage 2's sources (or Stage 1's headers, kept in include order) fit in one epoch, `partition_source_epochs(num_workers=...)` also caps a batch's bytes at an equal share (`_BATCHES_PER_WORKER` batches per worker), so batches cost about the same.
+  - **Symbol counters**: Workers send `core/SymbolRows.STATS` with their done frame (`symbol_stats`), and each version logs `[Symbols] '<version>': N items stored in tags (M of them in reused tags, not rewritten); K per blob (changed reused tag, conflicting key, outside tag, without tag); R keys refined by position` (`_log_symbol_stats()`). Many items per blob under "changed reused tag" means reused tags are not being shared.
+  - **Memory Modes (`main._memory_profile()`)**: normal: `CPUS - 1` workers, 200-file header batches, Stage 2 batches of 200 (50 with heavy files) up to 1.5MB, ~4,500-file epochs; low: `CPUS // 2` workers, 50 / 50 (25) / 750KB / 4,500; very-low: `min(2, CPUS // 4)` workers, 25 / 25 (10) / 350KB / 2,000.
+  - **Stage 2 Multi-Epoch Streaming**: Source files are partitioned into natural subsystem-aligned epochs (bounded at modular directory transitions) using project-agnostic dynamic complexity batching: batches are bounded by file count (smaller when heavy AST files &ge;64KB are present) and cumulative source bytes, and each epoch's batches are queued largest-first so the epoch does not end waiting on one late heavy batch.
+  - Workers run for the duration of an epoch, then exit and are reaped at the epoch boundary. Each epoch logs its parsing time, the gap between the first and the last worker exit, the boundary time, parent RSS and `gc.get_freeze_count()`, after its time split line.
+  - **Inter-Epoch Publishing & Deferred Drain**: At each epoch boundary, `DependencyScheduler.drain_deferred_queue()` unblocks deferred ChangeSets, TableEngine commits staged rows (`G.TE.commit_all()`), and the symbols published since the previous boundary are packed into one new file-scoped segment appended to `gp._shared_symbols`, so later epochs pre-resolve cross-file symbols in $O(1)$ time. Parent heap symbol dictionaries (`file_symbols`, `_ast_staged_symbols`) are cleared after publishing to keep parent resident memory low.
 - **Memory Compression (`CompressedChangeSetDict`)**:
   - Implements a hybrid zero-overhead store backed by `_evacuated_store` (storing lightweight evacuated ChangeSets directly in memory with zero `pickle` or `zlib` CPU cost) and an LRU cache (`OrderedDict`, default capacity 500 items, throttled to 25 items under `--very-low-mem`).
   - Active ChangeSets remain in `_lru_cache` uncompressed upon insertion, and are only serialized and compressed (`zlib.compress(pickle.dumps(cs), level=1)`) into `_compressed_store` when evicted from `_lru_cache` upon exceeding capacity.
@@ -185,14 +197,14 @@ Central runtime container, schema registry, and worker IPC coordinator.
   - `push_set_to_main() -> None`: Executed by worker; serializes `ChangeSet_Dict` via `pickle.dumps()` onto `Shared_ChangeSet_Dict_List`.
   - `stop_manager() -> None`: Executed by main process; deserializes (`pickle.loads()`) and merges worker dictionaries into `gp.ChangeSet_Dict`.
   - `safe_get_cs(path: str) -> ChangeSet | None`: Lookup sequence: `ChangeSet_Dict` &rarr; `Alt_ChangeSet_Dict` &rarr; checks existence in RAMDISK tree (skips non-kernel system paths `/usr/`, `/etc/`, `/lib/`, `/opt/`) &rarr; creates `ChangeSet("M", path)`, triggers `CS.parse()`, stores in `Alt_ChangeSet_Dict`, and returns `CS`.
-  - `get_file_symbols_from_db(rel_file: str) -> dict[tuple[str, int], int] | None`: Queries TableEngine joined tables (`m_file_name` &rarr; `m_bridge_file` &rarr; `m_bridge_tag` &rarr; `m_tag` &rarr; `m_ast`) to extract active symbol mappings `(ast_name, ast_type) -> ast_id` for unchanged files without re-parsing source text.
-  - `reset_cs() -> None`: Clears `Change_List`, `Symlink_List`, `ChangeSet_Dict`, `Alt_ChangeSet_Dict`, `unchanged_symbol_cache`, `file_deps`, `file_symbols`, `file_names`, `file_pre_extracted_tags`, `file_blob_ids`, and `_ast_negative_cache`.
+  - `get_file_symbols_from_db(rel_file: str) -> dict[tuple[str, int], int] | None`: Queries TableEngine joined tables (`m_file_name` &rarr; `m_bridge_file` &rarr; `m_bridge_tag` &rarr; `m_tag` &rarr; `m_ast`) to extract active symbol mappings `(ast_name, ast_type) -> ast_id` for unchanged files without re-parsing source text. Falls back to `Old_VID` only for files outside `_changed_paths_set`: a changed file without a `VID` row yet returns `None` uncached, since its previous version's symbols would be stale.
+  - `reset_cs() -> None`: Clears `Change_List`, `Symlink_List`, `ChangeSet_Dict`, `Alt_ChangeSet_Dict`, `unchanged_symbol_cache`, `file_deps`, `file_symbols`, `file_names`, `file_pre_extracted_tags`, `file_blob_ids`, and `_ast_negative_cache`, prunes `blob_symbol_cache`; stops the git commit worker (`stop_commit_worker()`) and unmaps the shared symbol segments (`close_shared_symbols()`).
 
 ---
 
 ## 4. Relational Database Schema Registry (`core/DBLayout.py`)
 
-41 Zero-VID Git-Native Core Tables defined via `Table` instances and exported in `TABLES` tuple (`init_db_layout(gp)` sets `gp.Table_Array = list(TABLES)`). The database schema eliminates synthetic linear release versions (`vid`), modeling the kernel codebase directly as a Git DAG rooted at `m_repository` $\to$ `m_commit` $\to$ `m_bridge_checkpoint` $\to$ `m_file_blob`:
+45 Zero-VID Git-Native Core Tables defined via `Table` instances and exported in `TABLES` tuple (`init_db_layout(gp)` sets `gp.Table_Array = list(TABLES)`). The database schema eliminates synthetic linear release versions (`vid`), modeling the kernel codebase directly as a Git DAG rooted at `m_repository` $\to$ `m_commit` $\to$ `m_bridge_checkpoint` $\to$ `m_file_blob`:
 
 | `table_id` | Table Name | Columns | Primary Key | `no_duplicate` | `te_cached` | `hashing_table` | Description |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
@@ -223,20 +235,27 @@ Central runtime container, schema registry, and worker IPC coordinator.
 | **24** | `m_maintainer_file`| `(maintainers_blob_id, fnid, sec_id)` | `("maintainers_blob_id", "fnid", "sec_id")` | `False` | `False` | `False` | Path to maintainer section resolution |
 | **25** | `m_credits_entry` | `(credit_id, blob_id, person_id, web_page, pgp_key, description, snail_mail, ast_id)` | `("credit_id",)` | `True` | `True` | `False` | CREDITS contributor biographies |
 | **26** | `m_commit` | `(commit_id, network_id, commit_hash, author_id, author_date, committer_id, committer_date, subject, message)` | `("commit_id",)` | `False` | `False` | `False` | Git commit metadata registry |
-| **27** | `m_bridge_commit_person`| `(commit_id, person_id, role_type, priority)` | `("commit_id", "person_id", "role_type")` | `False` | `True` | `False` | Commit author, committer, and trailers |
+| **27** | `m_bridge_commit_person`| `(commit_id, person_id, role_type, priority)` | `("commit_id", "person_id", "role_type")` | `False` | `False` | `False` | Commit author, committer, and trailers (write-only, idempotent: not preloaded) |
 | **28** | `m_commit_file` | `(commit_id, fnid, blob_id, old_fnid, old_blob_id, change_type)` | `("commit_id", "fnid")` | `False` | `False` | `False` | Files touched per commit (aliased as `m_bridge_commit_file`) |
 | **29** | `m_bridge_commit_tag`| `(commit_id, blob_id, tag_id)` | `("commit_id", "tag_id")` | `False` | `False` | `False` | Tags affected per commit |
 | **30** | `m_moved_tag` | `(s_tag_id, e_tag_id)` | `("s_tag_id", "e_tag_id")` | `False` | `False` | `False` | Tag cross-blob evolution tracking |
-| **31** | `m_symbol_def` | `(def_id, blob_id, tag_id, ast_id, name, type_id, linkage, line_s, line_e)` | `("def_id",)` | `False` | `True` | `False` | Blob-scoped symbol definitions |
-| **32** | `m_symbol_ref` | `(ref_id, blob_id, tag_id, ast_id, target_fnid, role, line, char_s)` | `("ref_id",)` | `False` | `False` | `False` | Blob-scoped symbol references |
+| **31** | `m_blob_symbol_def` | `(def_id, blob_id, tag_id, ast_id, name, type_id, linkage, line_s, line_e)` | `("def_id",)` | `False` | `False` | `False` | Symbol definitions stored per blob: outside their tag, tagless, or a recycled tag whose definitions changed (see `m_symbol_def` view) |
+| **32** | `m_blob_symbol_ref` | `(ref_id, blob_id, tag_id, ast_id, target_fnid, role, line, char_s)` | `("ref_id",)` | `False` | `False` | `False` | Symbol references stored per blob (same cases) |
 | **33** | `m_file_reference` | `(ref_id, source_blob_id, target_fnid, ref_type, line_no, details)` | `("ref_id",)` | `False` | `False` | `False` | Cross-file usage and includes |
 | **34** | `m_db_instance` | `(instance_hash, created_at)` | `("instance_hash",)` | `True` | `False` | `False` | Database instance fingerprint |
 | **35** | `m_ast_attribute` | `(ast_id, priority, name, val)` | `("ast_id", "priority")` | `False` | `False` | `False` | AST compiler/kernel attributes |
 | **36** | `m_git_network` | `(network_id, project_id, name, root_commit_hash)` | `("network_id",)` | `False` | `True` | `False` | Multi-remote repository network |
 | **37** | `m_repository` | `(repo_id, network_id, name, git_url, default_branch)` | `("repo_id",)` | `False` | `True` | `False` | Tracked Git repository instance |
 | **38** | `m_git_ref` | `(ref_id, repo_id, ref_type, ref_name, commit_id, tagger_id, tagger_date, tag_message)` | `("ref_id",)` | `False` | `True` | `False` | Named Git reference (aliased as `m_v_main`); `ref_type`: 1 = tag, 2 = branch (local or remote), 3 = bare commit |
-| **39** | `m_commit_parent` | `(commit_id, parent_commit_id, parent_idx)` | `("commit_id", "parent_idx")` | `False` | `True` | `False` | Full Git commit DAG topology |
+| **39** | `m_commit_parent` | `(commit_id, parent_commit_id, parent_idx)` | `("commit_id", "parent_idx")` | `False` | `False` | `False` | Full Git commit DAG topology (write-only, idempotent: not preloaded) |
 | **40** | `m_ingest_state` | `(network_id, commit_id, status, updated_at)` | `("network_id", "commit_id")` | `False` | `False` | `False` | Incremental ingestion state tracker |
+| **41** | `m_tag_def` | `(tag_id, def_idx, sym_key, name, type_id, linkage, rel_line_s, rel_line_e)` | `("tag_id", "def_idx")` | `False` | `False` | `False` | A tag's definitions, lines relative to the tag, written once when the tag is new |
+| **42** | `m_tag_ref` | `(tag_id, ref_idx, sym_key, role, rel_line, char_s)` | `("tag_id", "ref_idx")` | `False` | `False` | `False` | A tag's references, written once when the tag is new |
+| **43** | `m_blob_symbol` | `(blob_id, sym_key, target_ast_id, target_fnid)` | `("blob_id", "sym_key")` | `False` | `False` | `False` | Per-blob resolution of the keys the shared rows use (idempotent) |
+| **44** | `m_symbol_own` | `(blob_id, tag_id, kind)` | `("blob_id", "tag_id", "kind")` | `False` | `False` | `False` | Tag placements whose references (1) / definitions (2) are stored per blob instead (idempotent) |
+
+> [!NOTE]
+> **Symbol views** (`core/SymbolRows.py`, created by `main.ensure_db_views()`): `m_symbol_def` and `m_symbol_ref` are SQL views returning, in the former per-blob shape, the per-blob rows plus the shared rows placed through `m_bridge_tag` (`line = bt.line_s + rel_line`, target from `m_blob_symbol`), skipping placements marked in `m_symbol_own`. A shared definition's `def_id` is computed (`1 << 62 | blob_id << 37 | tag_id << 6 | def_idx`) and a shared reference's `ref_id` is NULL, so neither can be looked up by id efficiently. `symbol_view_rows()` computes the same rows from in-memory tables (MockDB, tests). Filtering a view by `ast_id` is slow (the database joins each blob using the target with every tag holding its key); `rows_of_targets_sql(view, n)` returns the same rows for `n` target AST ids starting from their keys (`m_blob_symbol.target_ast_id` → `m_tag_ref` / `m_tag_def` by `sym_key` → `m_bridge_tag` → `m_blob_symbol`), for use as a derived table. Keys come from the tag's text (`parser/c_ast/CAST_API.md` §9.3); `m_tag_def` and `m_tag_ref` are indexed on `(sym_key, tag_id)`. A database that still has `m_symbol_def` / `m_symbol_ref` as tables is refused (run `--reset`; the reset drops them).
 
 > [!IMPORTANT]
 > **ChangeSet Tag Reference Order Invariant**: When staging tags in ChangeSets (`with CS(REF_POS):`), `m_tag.set` MUST be the first operation inside the block (`m_tag.set(None, code_hash, ast_ref, 0, 0)`) so that `tag_ref = ((m_tag.table_id, 0), OP_REF, (REF_POS, CS.route[-1]))` points directly to `m_tag`. Auxiliary deduplication tables (such as `m_tag_code.get_set`) must always be staged after `m_tag.set` within the block.
@@ -258,7 +277,7 @@ Central runtime container, schema registry, and worker IPC coordinator.
 - **Extended Schema Attributes**:
   - `table.indexes`: Secondary multi-column indices: `(("idx_name", ("col_a", "col_b")), ...)`.
   - `table.unique_keys`: Explicit unique key constraints: `(("col_a", "col_b"), ...)`.
-  - `table.idempotent_pk`: Flag enabling deduplicated insertion via `INSERT IGNORE INTO`.
+  - `table.idempotent_pk`: Flag enabling deduplicated insertion: rows whose primary key already exists are skipped individually (`MariaDB.insert` appends a no-op `ON DUPLICATE KEY UPDATE`).
   - `table.blob_scoped`: Flag marking blob-scoped content-addressable preloading.
   - Backward-compatible column aliases: `m_file_blob.fid = m_file_blob.blob_id`, `m_git_ref.vid = m_git_ref.commit_id`, `m_git_ref.vname = m_git_ref.ref_name`.
 - **Operation Builders**:
@@ -304,18 +323,19 @@ Represents a parsed file diff and acts as the relational staging buffer.
   1. `parsed_route[0] == REF_NO_REF`: Returns `None`.
   2. `parsed_route[0] == REF_FILE`: Evaluates foreign cross-file symbol lookups with multi-tier fast paths:
      - **Step 0 (Per-File Symbols)**: Checks `gp.file_symbols[rel_file]` and `gp.file_names[rel_file]` for immediate $O(1)$ resolved symbol `ast_id`.
-     - **Step 0b (Phase 2 Snapshot)**: Checks `_phase2_symbols` and `_phase2_names` global symbol snapshots.
+     - **Step 0b (File-Scoped Shared Symbols)**: Queries the file-scoped shared table (`_phase2_symbols` set by `pre_resolve_operations()` in workers, else `gp._shared_symbols`) for `(sym_name, sym_type)` then `sym_name` defined in `rel_file`, the same semantics as step 0. Plain `(name, type)` snapshot dicts passed to `pre_resolve_operations()` are still matched globally.
      - **Step 1 (Active Batch / Evacuated & LRU Stores)**: Inspects `batch_cs_dict`, `ChangeSet_Dict._evacuated_store[rel_file]`, or `ChangeSet_Dict._lru_cache[rel_file]`. For evacuated ChangeSets, reads from `foreign_cs.resolved_symbols` in $O(1)$ memory without deserialization or DB queries.
-     - **Step 1b (In-Flight Dependency Blocking Guard)**: If `rel_file` is an in-flight incomplete ChangeSet (`is_in_flight_changed` in `gp._changed_paths_set` or present in `ChangeSet_Dict`, and in neither `gp.completed_paths` nor `gp.file_symbols`) and `force_stubs` is `False`, `resolve_ref()` sets `self.blocked_on = rel_file` and returns `None` immediately, preventing redundant linear cache scans.
-     - **Step 2 (Database Fallback & Negative Caching)**: Checks `gp._ast_negative_cache` for verified non-existent symbols before querying TableEngine / MariaDB via `gp.get_file_symbols_from_db(rel_file)` or `G.TE.get(m_ast.table_id, ...)`. Misses are recorded in `gp._ast_negative_cache` and `unchanged_symbol_cache` to bypass repeated redundant SELECT queries across waves.
-     - **Step 3 (Circular Dependency Breaking)**: If `force_stubs=True` is enabled, stages a canonical `notbind` stub symbol via `m_ast.view` (discarding negative cache entries) and logs a circular dependency warning.
+     - **Step 1b (In-Flight Check)**: `rel_file` is in flight when it is in `gp._changed_paths_set` or `ChangeSet_Dict` and in neither `gp.completed_paths` nor `gp.file_symbols`. An in-flight file is never looked up in the DB (the DB still holds its previous version), and for AST queries with `force_stubs=False` `resolve_ref()` sets `self.blocked_on = rel_file` and returns `None`.
+     - **Step 1c (Database Lookup)**: For files not in flight, `gp.get_file_symbols_from_db(rel_file)` returns the file's symbols, cached into `gp.file_symbols` / `gp.file_names`.
+     - **Step 2 (Global Fallback & Negative Caching)**: Checks `gp._ast_staged_symbols`, then `gp._ast_negative_cache` before global `G.TE.get(m_ast.table_id, ...)` lookups by `(name, type)`, notbind type and name. Misses are recorded in `gp._ast_negative_cache`.
+     - **Step 3 (Stubs)**: With `force_stubs=True`, or for a file that is not in flight, stages a canonical `notbind` stub symbol (discarding negative cache entries). Parsing workers (`gp._is_worker`) never stage stubs: their TableEngine is never committed, so the reference is left for the parent.
   3. `parsed_route[0] == REF_POS`: Fetches directly from `self.cs[parsed_route[1]]` column `query[1]`.
   4. `parsed_route[0] == REF_MULTI`: Fetches list of column values across `store_dict[REF_MULTI][parsed_route[1]]`.
   5. Default: Looks up `pos = store_dict[parsed_route][query[0]]` and extracts column value `query[1]`.
 - **Worker Optimization & View Preprocessing**:
   - `preprocess_ref_views() -> None`: Pre-unpacks intra-file `OP_REF_VIEW` operations into concrete `OP_VIEW_SET` on worker cores before IPC serialization, distributing schema pattern matching across CPU cores.
   - `prune_unchanged_dependencies() -> None`: Queries `gp.get_file_symbols_from_db()` in workers during Phase 1 to pre-resolve references targeting unchanged files in a single unified pass over `self.cs` and prunes satisfied entries from `foreign_deps`.
-  - `pre_resolve_operations(resolved_symbols_map, resolved_names_map) -> list`: Worker-side method invoked during Phase 2 to resolve foreign `REF_FILE` references and unpack dynamic views in a fused single iteration over `self.cs`, returning a pre-resolved operation list to the main process for sequential lock-free staging.
+  - `pre_resolve_operations(resolved_symbols_map, resolved_names_map=None) -> list`: Worker-side method invoked during Stage 2 to resolve foreign `REF_FILE` references and unpack dynamic views in a fused single iteration over `self.cs`, returning a pre-resolved operation list to the main process for sequential lock-free staging. `resolved_symbols_map` is the file-scoped `SharedSymbolChain` / `SharedSymbolReader` (queried per target file), or a plain `{(name, type): ast_id}` snapshot.
 - **Dynamic AST Views (`_unpack_ref_view(operation) -> OperationType | None`)**:
   - Evaluates AST rule schemas against records in `store_dict`, matches conditional rules (`schema_ifs`), dynamically constructs joined table graph (`schema_thens`), and converts `OP_REF_VIEW` into concrete `(joins_tuple, OP_VIEW_SET, data_tuple)`.
   - Queries candidate rows via `CS.get_available_data(route, target_table_id)`, which filters candidate operations strictly by `tableid` (handling both integer IDs and joined view tuples) to isolate `m_ast` records from co-located tag and bridge operations.
@@ -360,14 +380,13 @@ MasterFile (MF)                   GreatProcessor (gp)               TableEngine 
   ├─ Content Blob Hash Enumeration:       │                                 │
   │  └── git ls-tree -r {version} ───────►│ Populates gp.file_blob_hashes   │
   │                                       │                                 │
-  ├─ Content-Addressable Blob Dedup:      │                                 │
-  │  └── Matches (blob_hash, ftype) against m_file_blob & m_bridge_tag:     │
-  │      - Reused files: directly links m_bridge_checkpoint & m_commit_file │
-  │      - Remaining new/modified files: dispatched to multicore workers    │
+  ├─ G.TE.start(gp.Table_Array) ──────────┼────────────────────────────────►
+  │  (Step 4.4, timed: preloads te_cached tables & packs 1GB/2MB/THP shared buffer)
   │                                       │                                 │
-  └─ G.TE.start(gp.Table_Array) ──────────┴────────────────────────────────►
-                                             (Preloads te_cached tables &
-                                              packs 1GB/2MB/THP shared buffer)
+  └─ Content-Addressable Blob Dedup (Step 4.5, _reuse_parsed_blobs):       │
+     └── Looks (blob_hash, ftype) up in the TableEngine m_file_blob cache; one query on m_bridge_tag
+         - Reused files: m_file_name / m_bridge_checkpoint / m_commit_file staged via the TableEngine
+         - Remaining new/modified files: dispatched to multicore workers
 ==================================================================================================
 [2. MULTICORE PARTITIONING & TWO-STAGE PARALLEL WORKER PARSING]
 --------------------------------------------------------------------------------------------------
@@ -385,23 +404,24 @@ Main Process (trigger_multicore)          Worker Process 1..N
   │  │                                       │ ├── CS.prune_unchanged_dependencies()
   │  │                                       │ ├── CS.store() (Buffers into CS.cs)
   │  │                                       │ └── CS.clear_bloat()
-  │  │                                       └─► Double-Buffered Worker IPC (Background serializer thread -> result_queue)
-  │  ├── processing_dirs() (Staged directory ChangeSets)
-  │  ├── processing_unchanges() (Propagates unchanged files & bridges into m_bridge_checkpoint)
+  │  │                                       └─► Per-worker pipe: one pickled result frame per batch, then a done frame
+  │  ├── processing_dirs() (Returns new directory ChangeSets, ingested while workers parse)
+  │  ├── processing_unchanges() (Propagates unchanged files into m_bridge_checkpoint; returns forgotten /
+  │  │   missing files, parsed by workers as an extra Stage 1 batch set before header resolution)
   │  ├── scheduler.resolve_headers() (Resolves & evacuates header ChangeSets; Stage 1 workers terminate & Clang memory is reclaimed)
   │  │
-  │  ├── Stage 2: source_files (.c, .S) ───►│ Spawn Stage 2 Workers with zero-copy shared memory
+  │  ├── Stage 2: source_files (.c, .S) ───►│ Spawn Stage 2 Workers per epoch with file-scoped shared symbol segments
   │  │                                       │ ├── CS.blob_hash = gp.file_blob_hashes[path]
   │  │                                       │ ├── CS.parse() -> C/ASM/Kconfig/Rust Parsers
   │  │                                       │ ├── CS.preprocess_ref_views()
   │  │                                       │ ├── CS.pre_resolve_operations(shared_symbols) (Worker-side view unpacking & ref resolution)
   │  │                                       │ ├── CS.clear_bloat()
-  │  │                                       │ └── Pipelined IPC -> Coordinator prefetcher (Capacity: 2 * CPUS)
+  │  │                                       │ └── Per-worker pipe -> reader thread (holds at most 2 serialized batches)
   │  │                                       └─► DependencyScheduler.ingest_batch() (Sub-millisecond lock-free staging into TableEngine)
   │  └── symlink_files
   │      (Appended to gp.Symlink_List for zero-duplication deferred alias)
   │
-  └─ scheduler.finalize() (Drains deferred queue & triggers Phase 2 parallel waves)
+  └─ scheduler.finalize() (Drains deferred queue, runs Phase 2 waves, unmaps the shared symbol segments)
 [3. TWO-PHASE EXECUTION: STREAMING LEAF RESOLUTION & WAVE-BASED MULTICORE STAGING]
 --------------------------------------------------------------------------------------------------
 PHASE 1: Streaming Ingestion & Opportunistic Leaf Execution (main.py:trigger_multicore)
@@ -410,10 +430,11 @@ PHASE 1: Streaming Ingestion & Opportunistic Leaf Execution (main.py:trigger_mul
   ├─ Streams uncompressed batches into DependencyScheduler.ingest_batch()
   ├─ Single-Compression Streaming Ingestion: Source ChangeSets execute directly on arrival, evacuating internal
   │  AST buffers before storing into gp.ChangeSet_Dict (eliminating double-compression of bloated un-evacuated ASTs).
-  ├─ Leaf Execution Invariant: Main process exclusively executes ready leaf ChangeSets whose foreign dependencies
-  │  are completely satisfied (len(unresolved_deps) == 0). Incomplete files buffer into gp.ChangeSet_Dict without cascading retries.
+  ├─ Event-Driven Wakeups: a ChangeSet blocked on a file of this update that is still in flight waits on it
+  │  (headers wait on every in-flight file they reference before running); when that file executes, its waiters
+  │  run immediately, cascading, so most files resolve while the workers are still parsing.
   │  ├─ Success: extract_tags_and_evacuate_cs(CS) & registers resolved_symbols, file_pre_extracted_tags, file_blob_ids
-  │  └─ Blocked: skipped without spinning, deferred for Phase 2
+  │  └─ Blocked on nothing that will complete: deferred (retried at epoch boundaries, stubbed by Phase 2)
   ├─ As soon as parsing workers finish, trigger_multicore() exits immediately
   └─ Phase 1 worker pool terminates cleanly -> Clang C-heap memory purged via reclaim_system_memory()
 --------------------------------------------------------------------------------------------------
@@ -425,8 +446,8 @@ Main Process (In-Process Wave Resolution)       TableEngine & Database
   │  deps[path] = {target in cs.foreign_deps if target in remaining}
   │                                               │
   ├─ Loop while remaining:                        │
-  │  ├─ Wave Selection:                           │
-  │  │  wave = [path for path in remaining if not deps[path]]
+  │  ├─ Wave Selection (ready queue, sorted):      │
+  │  │  wave = files whose deps all executed; completions feed the next wave
   │  ├─ [PRECISION CYCLE BREAKING] If wave empty: │
   │  │  ├─ Selects single top candidate with most │
   │  │  │  dependents in remaining DAG            │
@@ -473,9 +494,9 @@ Main Process (STEP 6.1+: Post-Processing Subsystems) TableEngine (G.TE)         
 - Configuration settings follow strict precedence: `CLI Flags > Environment Variables > config.json > Built-in Defaults`.
 - When configuring or synchronizing database parameters, both `DB_*` and `MYSQL_*` environment variables remain synchronized via `sync_environ()`, tracking internally exported keys in `_EXPORTED_ENV_VARS` via `_get_user_env()` to prevent environment self-pollution during configuration reloads.
 - Sections:
-  - `"database"`: MariaDB/MySQL connection settings (`host`, `port`, `user`, `password`, `database`, `timeout`, `engine`).
+  - `"database"`: MariaDB/MySQL connection settings (`host`, `port`, `user`, `password`, `database`, `timeout`, `engine`) and `server_tuning`: server variables `main()` raises once per run with `MariaDB.apply_server_tuning()` (`_apply_db_server_tuning()`; defaults `innodb_buffer_pool_size` 8G, `innodb_log_file_size` 2G, `innodb_flush_log_at_trx_commit` 2, `innodb_io_capacity` 1000; `{}` disables it). A local server's buffer pool is capped at a quarter of RAM, and a warning is logged when `parser.mem_max` plus the pool exceed RAM. Runtime values last until the server restarts, and MariaDB 10.11 only grows the buffer pool up to `innodb_buffer_pool_size_max`, fixed at server start, so the pool size also belongs in the server's configuration (the log says `capped at ...` otherwise).
   - `"webapp"`: FastApi server settings (`host`, `port`, `reload`).
-  - `"parser"`: TableEngine, memory mode, fidelity auditing, memory limits (`table_engine`, `memory_mode`, `fidelity`, `mem_max`, `hugepages`).
+  - `"parser"`: TableEngine, memory mode, fidelity auditing, memory limits (`table_engine`, `memory_mode`, `fidelity`, `mem_max`, `hugepages`) and `symbol_layout` (`"tag"`, default: symbol rows stored once per tag; `"blob"`: per blob, sets `G.SYMBOL_LAYOUT`).
   - `"ssh_tunnel"`: Secure remote database port forwarding configuration (`enabled`, `host`, `port`, `user`, `password`, `key_file`, `remote_host`, `remote_port`, `local_port`, `strict_host_key_checking`, `connect_timeout`).
   - `"workspace"`: `repos_dir` (default `"repos"`, relative to the project root) holding the Git repositories to parse, and `auto_detect_repos` (default `true`).
   - `"repositories"`: List of tracked repositories. Each entry carries `name`, `path` (relative to the project root; symlinked repositories keep their `repos/<name>` path), `project`, `default_branch`, `git_url`, `root_commit`, `start_ref` (default: `root_commit`), `enabled`, and optionally `"default": true`.
@@ -508,12 +529,12 @@ Main Process (STEP 6.1+: Post-Processing Subsystems) TableEngine (G.TE)         
   - TableEngine tracks committed records across chunks using `_committed_nodup_keys` (mapping unique column keys to assigned sequence IDs for `no_duplicate=True` tables such as `m_file_name`), `_committed_pks` (tracking 32-byte cryptographic hashes for `m_tag_code` and `m_ast_hash`), and `_committed_unique_keys` (tracking composite/single unique key values for tables with `unique_keys` such as `m_file_reference`).
   - In `TEDirectDB.set()`, when auto-increment generation is requested (`columns[0] is None`), if `table.unique_keys` is configured and matches an already staged row or a committed unique key in `_committed_unique_keys`, `set()` returns the existing record immediately without generating a duplicate sequence ID or queuing a duplicate row.
   - During `commit()` and `commit_all()`, staged rows matching previously committed keys/hashes are filtered out before dispatching batch inserts.
-  - In `trigger_multicore()`, all file paths (`regular_files + symlink_files`) are pre-populated into `m_file_name` and committed before worker processes are forked, ensuring stable sequence ID assignment.
+  - In `trigger_multicore()`, all file paths (`gp.Change_List`, plus the forgotten / missing files returned by `processing_unchanges()`) are registered into `m_file_name` and committed (`_register_file_names()`) before the workers that parse them are forked, ensuring stable sequence ID assignment.
 - **Content-Addressable Blob Deduplication (Step 4.5)**:
-  - Before worker dispatch, the pipeline pre-loads known content-addressed blobs from `m_file_blob`, tagged blob IDs from `m_bridge_tag`, and paths from `m_file_name` via bulk set queries. Unchanged files whose exact content hash has already been parsed in any prior version or tree are deduplicated in memory and directly registered into `m_bridge_checkpoint` and `m_commit_file` via batch inserts, skipping redundant worker translation units and eliminating tens of thousands of individual database roundtrips.
+  - Before worker dispatch (and after `G.TE.start()`), `_reuse_parsed_blobs()` looks each changed file's `(blob_hash, ftype)` up in the TableEngine's `m_file_blob` cache and confirms which matches already have tags with one targeted `m_bridge_tag` query (no full-table loads). Files whose exact content was already parsed in any prior version or tree are registered into `m_file_name`, `m_bridge_checkpoint` and `m_commit_file` through the TableEngine, skipping redundant worker translation units; their paths go to `gp.deduped_paths` so Step 6.5 still links their tags to this range's commits.
 - **Referential Integrity & Staged Pipeline Commit Boundaries**:
   - Multicore Stage 2 parsing (`scheduler.finalize()`) and git commit parsing (`processing_git_commits`) enforce full TableEngine commits (`G.TE.commit_all(update_in_mem_indexes=False)`) prior to initiating downstream child table staging (`m_file_reference`, `m_kconfig_kbuild`, `m_maintainer_file`).
-  - Step 6.6 (`processing_file_references`) commits all pending parent table rows (`m_file_blob`, `m_file_name`, `m_bridge_checkpoint`) and preloads valid database key sets (`valid_blob_ids`, `valid_fnids`), guarding foreign keys before batch execution to prevent MariaDB error 1452 foreign key constraint violations.
+  - Step 6.6 (`processing_file_references`) commits all pending parent table rows (`m_file_blob`, `m_file_name`, `m_bridge_checkpoint`), reads this version's blob ids from its checkpoint (valid source blobs), and only clears and recomputes the references of blobs that are new since `gp.Old_VID` (Makefile references, documentation scans and the include `INSERT IGNORE ... SELECT`): rows are keyed by source blob, so carried-over blobs keep theirs. Kbuild symbol mappings (`m_kconfig_kbuild`, idempotent) are still staged for every Makefile. Step 6.7 (`processing_maintainer_files`) skips files already mapped for the same MAINTAINERS blob.
   - Milestone checkpointing correctly targets active version `gp.VID` (falling back to HEAD commit id) rather than oldest ancestor commits.
 - **Milestone Release Checkpointing**:
   - Snapshot registration into `m_bridge_checkpoint` uses a one-shot count check (`COUNT(*) FROM m_bridge_checkpoint WHERE commit_id = %s`). If already complete, snapshot staging is bypassed in $0\text{ms}$; if partial or fresh, existing file IDs are filtered in memory and missing entries are staged directly without row-by-row `G.TE.get()` database roundtrips.

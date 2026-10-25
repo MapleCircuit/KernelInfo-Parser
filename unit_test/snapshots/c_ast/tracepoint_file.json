@@ -39,7 +39,7 @@
     "m_file_blob": [
       {
         "blob_id": "$fid_0",
-        "blob_hash": "hex:0000000000000000000000000000000000000000",
+        "blob_hash": "hex:33869f7eed69d963cbdb80320a1498a82d50bf9c",
         "ftype": "1 (T_C)"
       }
     ],
@@ -664,85 +664,6 @@
         "map_id": "$tag_16"
       }
     ],
-    "m_symbol_def": [
-      {
-        "def_id": "$def_0",
-        "blob_id": "$fid_0",
-        "tag_id": "$tag_1",
-        "ast_id": "$ast_1",
-        "name": "TRACE_SYSTEM",
-        "type_id": "76 (CPPro_define_macro)",
-        "linkage": 5,
-        "line_s": 2,
-        "line_e": 2
-      },
-      {
-        "def_id": "$def_1",
-        "blob_id": "$fid_0",
-        "tag_id": "$tag_3",
-        "ast_id": "$ast_3",
-        "name": "_TRACE_NET_H",
-        "type_id": "75 (CPPro_define)",
-        "linkage": 5,
-        "line_s": 5,
-        "line_e": 5
-      },
-      {
-        "def_id": "$def_2",
-        "blob_id": "$fid_0",
-        "tag_id": "$tag_8",
-        "ast_id": "$ast_8",
-        "name": "net_dev_xmit",
-        "type_id": "151 (C_TracepointDef)",
-        "linkage": 5,
-        "line_s": 12,
-        "line_e": 37
-      },
-      {
-        "def_id": "$def_3",
-        "blob_id": "$fid_0",
-        "tag_id": "$tag_9",
-        "ast_id": "$ast_9",
-        "name": "net_dev_template",
-        "type_id": "151 (C_TracepointDef)",
-        "linkage": 5,
-        "line_s": 39,
-        "line_e": 59
-      },
-      {
-        "def_id": "$def_4",
-        "blob_id": "$fid_0",
-        "tag_id": "$tag_10",
-        "ast_id": "$ast_10",
-        "name": "net_dev_queue",
-        "type_id": "151 (C_TracepointDef)",
-        "linkage": 5,
-        "line_s": 61,
-        "line_e": 66
-      },
-      {
-        "def_id": "$def_5",
-        "blob_id": "$fid_0",
-        "tag_id": "$tag_11",
-        "ast_id": "$ast_10",
-        "name": "netif_receive_skb",
-        "type_id": "151 (C_TracepointDef)",
-        "linkage": 5,
-        "line_s": 68,
-        "line_e": 73
-      },
-      {
-        "def_id": "$def_6",
-        "blob_id": "$fid_0",
-        "tag_id": "$tag_12",
-        "ast_id": "$ast_10",
-        "name": "netif_rx",
-        "type_id": "151 (C_TracepointDef)",
-        "linkage": 5,
-        "line_s": 75,
-        "line_e": 80
-      }
-    ],
     "m_git_ref": [
       {
         "ref_id": 1,
@@ -753,6 +674,78 @@
         "tagger_id": null,
         "tagger_date": null,
         "tag_message": null
+      }
+    ],
+    "m_symbol_def": [
+      {
+        "blob_id": "$fid_0",
+        "tag_id": "$tag_9",
+        "ast_id": "$ast_9",
+        "name": "net_dev_template",
+        "type_id": "151 (C_TracepointDef)",
+        "linkage": 5,
+        "line_s": 39,
+        "line_e": 59
+      },
+      {
+        "blob_id": "$fid_0",
+        "tag_id": "$tag_10",
+        "ast_id": "$ast_10",
+        "name": "net_dev_queue",
+        "type_id": "151 (C_TracepointDef)",
+        "linkage": 5,
+        "line_s": 61,
+        "line_e": 66
+      },
+      {
+        "blob_id": "$fid_0",
+        "tag_id": "$tag_11",
+        "ast_id": "$ast_10",
+        "name": "netif_receive_skb",
+        "type_id": "151 (C_TracepointDef)",
+        "linkage": 5,
+        "line_s": 68,
+        "line_e": 73
+      },
+      {
+        "blob_id": "$fid_0",
+        "tag_id": "$tag_12",
+        "ast_id": "$ast_10",
+        "name": "netif_rx",
+        "type_id": "151 (C_TracepointDef)",
+        "linkage": 5,
+        "line_s": 75,
+        "line_e": 80
+      },
+      {
+        "blob_id": "$fid_0",
+        "tag_id": "$tag_1",
+        "ast_id": "$ast_1",
+        "name": "TRACE_SYSTEM",
+        "type_id": "76 (CPPro_define_macro)",
+        "linkage": 5,
+        "line_s": 2,
+        "line_e": 2
+      },
+      {
+        "blob_id": "$fid_0",
+        "tag_id": "$tag_3",
+        "ast_id": "$ast_3",
+        "name": "_TRACE_NET_H",
+        "type_id": "75 (CPPro_define)",
+        "linkage": 5,
+        "line_s": 5,
+        "line_e": 5
+      },
+      {
+        "blob_id": "$fid_0",
+        "tag_id": "$tag_8",
+        "ast_id": "$ast_8",
+        "name": "net_dev_xmit",
+        "type_id": "151 (C_TracepointDef)",
+        "linkage": 5,
+        "line_s": 12,
+        "line_e": 37
       }
     ]
   }

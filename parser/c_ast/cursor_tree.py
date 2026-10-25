@@ -35,9 +35,11 @@ from core.DBLayout import (
     m_ast_container,
     m_ast_include,
     m_file_name,
-    m_symbol_def,
-    m_symbol_ref,
     m_ast_attribute,
+)
+from core.SymbolRows import (
+    record_def as record_symbol_def,
+    record_ref as record_symbol_ref,
 )
 from parser.c_ast.ctypes_bindings import (
     AST_KIND,
@@ -639,13 +641,19 @@ def get_rel_file_for_cursor(CS: Any, cursor: Any) -> str | None:
                 cache[file_path] = None
             return None
 
-    # Resolve via MasterFile temp dir
+    # Resolve via MasterFile temp dir (without a ChangeSet: the directory of the version being parsed)
     mf = (getattr(CS, "mf", None) if CS is not None else None) or getattr(G, "MF", None)
     gp = (getattr(CS, "gp", None) if CS is not None else None) or getattr(G, "GP", None)
     v_name = getattr(gp, "Version_Name", None) if gp is not None else getattr(G, "VERSION_NAME", "v3.0")
-    if mf is not None and hasattr(mf, "version_dict") and v_name in mf.version_dict:
+    mfdir = ""
+    if mf is not None and hasattr(mf, "version_dict") and v_name in mf.version_dict and gp is not None:
         mfdir = mf.version_dict.get(v_name, "")
-        if mfdir and file_path.startswith(mfdir):
+    if not mfdir:
+        mfdir = getattr(G, "CURRENT_PARSING_DIR", None) or ""
+    if not mfdir and mf is not None and hasattr(mf, "version_dict"):
+        mfdir = mf.version_dict.get(v_name, "")
+    if mfdir:
+        if file_path.startswith(mfdir):
             rel = file_path[len(mfdir):].lstrip("/")
             res = None if rel.startswith(("usr/", "etc/", "opt/", "var/", "lib/")) else (rel if rel else None)
             if cache is not None:
@@ -2759,9 +2767,8 @@ class C_Type(Ast):
             if p_tp:
                 tp_type = getattr(ASTT, "C_TracepointDef", ASTT.C_Compound)
                 with CS(REF_POS):
-                    CS.store(m_symbol_def.set(
-                        None,
-                        ((m_file.table_id, 0), OP_REF, (REF_ROOT,)),
+                    record_symbol_def(
+                        CS,
                         tag_ref or getattr(self, "tag_ref", 0),
                         self.ast_ref,
                         str(p_tp)[:255],
@@ -2769,7 +2776,7 @@ class C_Type(Ast):
                         int(SymbolLinkage.MacroOrKernelDef),
                         self.extent.line_pos[0],
                         self.extent.line_pos[1],
-                    ))
+                    )
                 if hasattr(CS, "symbol_dict"):
                     pos_idx = ast_id_route[-1]
                     CS.symbol_dict[(str(p_tp)[:255], int(tp_type))] = pos_idx
@@ -2826,9 +2833,8 @@ class C_Type(Ast):
             if p_name:
                 param_type = getattr(ASTT, "C_ModuleParamDef", ASTT.C_Compound)
                 with CS(REF_POS):
-                    CS.store(m_symbol_def.set(
-                        None,
-                        ((m_file.table_id, 0), OP_REF, (REF_ROOT,)),
+                    record_symbol_def(
+                        CS,
                         tag_ref or getattr(self, "tag_ref", 0),
                         self.ast_ref,
                         str(p_name)[:255],
@@ -2836,7 +2842,7 @@ class C_Type(Ast):
                         int(SymbolLinkage.MacroOrKernelDef),
                         self.extent.line_pos[0],
                         self.extent.line_pos[1],
-                    ))
+                    )
                 if hasattr(CS, "symbol_dict"):
                     pos_idx = ast_id_route[-1]
                     CS.symbol_dict[(str(p_name)[:255], int(param_type))] = pos_idx
@@ -2895,9 +2901,8 @@ class C_Type(Ast):
             if p_entry:
                 entry_type = getattr(ASTT, "C_AsmEntry", ASTT.C_Compound)
                 with CS(REF_POS):
-                    CS.store(m_symbol_def.set(
-                        None,
-                        ((m_file.table_id, 0), OP_REF, (REF_ROOT,)),
+                    record_symbol_def(
+                        CS,
                         tag_ref or getattr(self, "tag_ref", 0),
                         self.ast_ref,
                         str(p_entry)[:255],
@@ -2905,7 +2910,7 @@ class C_Type(Ast):
                         int(SymbolLinkage.MacroOrKernelDef),
                         self.extent.line_pos[0],
                         self.extent.line_pos[1],
-                    ))
+                    )
                 if hasattr(CS, "symbol_dict"):
                     pos_idx = ast_id_route[-1]
                     CS.symbol_dict[(str(p_entry)[:255], int(entry_type))] = pos_idx
@@ -2963,9 +2968,8 @@ class C_Type(Ast):
             if p_init:
                 entry_type = getattr(ASTT, "C_InitcallDef", ASTT.C_Compound)
                 with CS(REF_POS):
-                    CS.store(m_symbol_def.set(
-                        None,
-                        ((m_file.table_id, 0), OP_REF, (REF_ROOT,)),
+                    record_symbol_def(
+                        CS,
                         tag_ref or getattr(self, "tag_ref", 0),
                         self.ast_ref,
                         str(p_init)[:255],
@@ -2973,7 +2977,7 @@ class C_Type(Ast):
                         int(SymbolLinkage.MacroOrKernelDef),
                         self.extent.line_pos[0],
                         self.extent.line_pos[1],
-                    ))
+                    )
                 if hasattr(CS, "symbol_dict"):
                     pos_idx = ast_id_route[-1]
                     CS.symbol_dict[(str(p_init)[:255], int(entry_type))] = pos_idx
@@ -3031,9 +3035,8 @@ class C_Type(Ast):
             if p_sym:
                 entry_type = getattr(ASTT, "C_ExportSymbolDef", ASTT.C_Compound)
                 with CS(REF_POS):
-                    CS.store(m_symbol_def.set(
-                        None,
-                        ((m_file.table_id, 0), OP_REF, (REF_ROOT,)),
+                    record_symbol_def(
+                        CS,
                         tag_ref or getattr(self, "tag_ref", 0),
                         self.ast_ref,
                         str(p_sym)[:255],
@@ -3041,7 +3044,7 @@ class C_Type(Ast):
                         int(SymbolLinkage.MacroOrKernelDef),
                         self.extent.line_pos[0],
                         self.extent.line_pos[1],
-                    ))
+                    )
                 if hasattr(CS, "symbol_dict"):
                     pos_idx = ast_id_route[-1]
                     CS.symbol_dict[(str(p_sym)[:255], int(entry_type))] = pos_idx
@@ -3093,9 +3096,8 @@ class C_Type(Ast):
             if p_sym:
                 entry_type = getattr(ASTT, "C_DeviceTableDef", ASTT.C_Compound)
                 with CS(REF_POS):
-                    CS.store(m_symbol_def.set(
-                        None,
-                        ((m_file.table_id, 0), OP_REF, (REF_ROOT,)),
+                    record_symbol_def(
+                        CS,
                         tag_ref or getattr(self, "tag_ref", 0),
                         self.ast_ref,
                         str(p_sym)[:255],
@@ -3103,7 +3105,7 @@ class C_Type(Ast):
                         int(SymbolLinkage.MacroOrKernelDef),
                         self.extent.line_pos[0],
                         self.extent.line_pos[1],
-                    ))
+                    )
                 if hasattr(CS, "symbol_dict"):
                     pos_idx = ast_id_route[-1]
                     CS.symbol_dict[(str(p_sym)[:255], int(entry_type))] = pos_idx
@@ -3156,9 +3158,8 @@ class C_Type(Ast):
             if p_sym:
                 entry_type = getattr(ASTT, "C_SysfsAttrDef", ASTT.C_Compound)
                 with CS(REF_POS):
-                    CS.store(m_symbol_def.set(
-                        None,
-                        ((m_file.table_id, 0), OP_REF, (REF_ROOT,)),
+                    record_symbol_def(
+                        CS,
                         tag_ref or getattr(self, "tag_ref", 0),
                         self.ast_ref,
                         str(p_sym)[:255],
@@ -3166,7 +3167,7 @@ class C_Type(Ast):
                         int(SymbolLinkage.MacroOrKernelDef),
                         self.extent.line_pos[0],
                         self.extent.line_pos[1],
-                    ))
+                    )
                 if hasattr(CS, "symbol_dict"):
                     pos_idx = ast_id_route[-1]
                     CS.symbol_dict[(str(p_sym)[:255], int(entry_type))] = pos_idx
@@ -3522,9 +3523,8 @@ class C_Type(Ast):
                                     )
                                 if not (decl_type == ASTT.C_enumdecl and ("(unnamed at " in safe_item_name or "(anonymous at " in safe_item_name or not safe_item_name)):
                                     with CS(REF_POS):
-                                        CS.store(m_symbol_def.set(
-                                            None,
-                                            ((m_file.table_id, 0), OP_REF, (REF_ROOT,)),
+                                        record_symbol_def(
+                                            CS,
                                             def_tag_ref or getattr(self, "tag_ref", 0),
                                             self.ast_ref,
                                             safe_item_name,
@@ -3532,7 +3532,7 @@ class C_Type(Ast):
                                             resolve_linkage(self),
                                             def_extent.line_pos[0],
                                             def_extent.line_pos[1],
-                                        ))
+                                        )
                                 if decl_type == ASTT.C_enumdecl:
                                     active_enum_tag = def_tag_ref or getattr(self, "tag_ref", 0)
                                     enum_zone = next((z for z in self.zones if z.zone_type == Zone_Type.Enum_Content), None)
@@ -3544,9 +3544,8 @@ class C_Type(Ast):
                                             if ch_name and ch_ast_ref is not None:
                                                 safe_ch_name = str(ch_name)[:255]
                                                 with CS(REF_POS):
-                                                    CS.store(m_symbol_def.set(
-                                                        None,
-                                                        ((m_file.table_id, 0), OP_REF, (REF_ROOT,)),
+                                                    record_symbol_def(
+                                                        CS,
                                                         active_enum_tag,
                                                         ch_ast_ref,
                                                         safe_ch_name,
@@ -3554,7 +3553,7 @@ class C_Type(Ast):
                                                         resolve_linkage(self),
                                                         ch_ext.line_pos[0],
                                                         ch_ext.line_pos[1],
-                                                    ))
+                                                    )
                             else:
                                 with CS(REF_NO_REF):
                                     if G.OVERRIDE_FORCE_AST_DEBUG:
@@ -3610,9 +3609,8 @@ class C_Type(Ast):
                                             if p_var:
                                                 v_type = getattr(ASTT, "C_PerCpuVarDef", ASTT.C_MacroVarDef) if is_percpu else getattr(ASTT, "C_MacroVarDef", ASTT.C_Compound)
                                                 with CS(REF_POS):
-                                                    CS.store(m_symbol_def.set(
-                                                        None,
-                                                        ((m_file.table_id, 0), OP_REF, (REF_ROOT,)),
+                                                    record_symbol_def(
+                                                        CS,
                                                         tag_ref or getattr(self, "tag_ref", 0),
                                                         self.ast_ref,
                                                         str(p_var)[:255],
@@ -3620,7 +3618,7 @@ class C_Type(Ast):
                                                         int(SymbolLinkage.MacroOrKernelDef),
                                                         self.extent.line_pos[0],
                                                         self.extent.line_pos[1],
-                                                    ))
+                                                    )
                                                 if hasattr(CS, "symbol_dict"):
                                                     pos_idx = ast_id_route[-1]
                                                     CS.symbol_dict[(str(p_var)[:255], int(v_type))] = pos_idx
@@ -3649,9 +3647,8 @@ class C_Type(Ast):
                                             if p_tp:
                                                 tp_type = getattr(ASTT, "C_TracepointDef", ASTT.C_Compound)
                                                 with CS(REF_POS):
-                                                    CS.store(m_symbol_def.set(
-                                                        None,
-                                                        ((m_file.table_id, 0), OP_REF, (REF_ROOT,)),
+                                                    record_symbol_def(
+                                                        CS,
                                                         tag_ref or getattr(self, "tag_ref", 0),
                                                         self.ast_ref,
                                                         str(p_tp)[:255],
@@ -3659,16 +3656,15 @@ class C_Type(Ast):
                                                         int(SymbolLinkage.MacroOrKernelDef),
                                                         self.extent.line_pos[0],
                                                         self.extent.line_pos[1],
-                                                    ))
+                                                    )
                                                 if hasattr(CS, "symbol_dict"):
                                                     pos_idx = ast_id_route[-1]
                                                     CS.symbol_dict[(str(p_tp)[:255], int(tp_type))] = pos_idx
                                                     CS.symbol_dict[(str(p_tp)[:255], int(ASTT.C_DeclRefExpr))] = pos_idx
                                         elif is_syscall and ast_staging_name:
                                             with CS(REF_POS):
-                                                CS.store(m_symbol_def.set(
-                                                    None,
-                                                    ((m_file.table_id, 0), OP_REF, (REF_ROOT,)),
+                                                record_symbol_def(
+                                                    CS,
                                                     tag_ref or getattr(self, "tag_ref", 0),
                                                     self.ast_ref,
                                                     str(ast_staging_name)[:255],
@@ -3676,16 +3672,15 @@ class C_Type(Ast):
                                                     int(SymbolLinkage.MacroOrKernelDef),
                                                     self.extent.line_pos[0],
                                                     self.extent.line_pos[1],
-                                                ))
+                                                )
                                             if hasattr(CS, "symbol_dict"):
                                                 pos_idx = ast_id_route[-1]
                                                 CS.symbol_dict[(str(ast_staging_name)[:255], int(ASTT.C_SyscallDef))] = pos_idx
                                                 CS.symbol_dict[(str(ast_staging_name)[:255], int(ASTT.C_functionprotodecl))] = pos_idx
                                         elif safe_item_name not in _KNOWN_MACRO_FUNCS and not is_typedef_def:
                                             with CS(REF_POS):
-                                                CS.store(m_symbol_def.set(
-                                                    None,
-                                                    ((m_file.table_id, 0), OP_REF, (REF_ROOT,)),
+                                                record_symbol_def(
+                                                    CS,
                                                     tag_ref or getattr(self, "tag_ref", 0),
                                                     self.ast_ref,
                                                     safe_item_name,
@@ -3693,7 +3688,7 @@ class C_Type(Ast):
                                                     resolve_linkage(self),
                                                     self.extent.line_pos[0],
                                                     self.extent.line_pos[1],
-                                                ))
+                                                )
                                     if decl_type == ASTT.C_enumdecl:
                                         active_enum_tag = tag_ref or getattr(self, "tag_ref", 0)
                                         enum_zone = next((z for z in self.zones if z.zone_type == Zone_Type.Enum_Content), None)
@@ -3705,9 +3700,8 @@ class C_Type(Ast):
                                                 if ch_name and ch_ast_ref is not None:
                                                     safe_ch_name = str(ch_name)[:255]
                                                     with CS(REF_POS):
-                                                        CS.store(m_symbol_def.set(
-                                                            None,
-                                                            ((m_file.table_id, 0), OP_REF, (REF_ROOT,)),
+                                                        record_symbol_def(
+                                                            CS,
                                                             active_enum_tag,
                                                             ch_ast_ref,
                                                             safe_ch_name,
@@ -3715,31 +3709,29 @@ class C_Type(Ast):
                                                             resolve_linkage(self),
                                                             ch_ext.line_pos[0],
                                                             ch_ext.line_pos[1],
-                                                        ))
+                                                        )
                                 elif item.type == ASTT.C_functionproto and not compound_stmt_link and not is_typedef_def and not is_trace:
                                     with CS(REF_POS):
-                                        CS.store(m_symbol_ref.set(
-                                            None,
-                                            ((m_file.table_id, 0), OP_REF, (REF_ROOT,)),
+                                        record_symbol_ref(
+                                            CS,
                                             tag_ref or getattr(self, "tag_ref", 0),
                                             self.ast_ref,
                                             get_target_fnid_for_cursor(CS, getattr(self, "cursor", None)),
                                             int(SymbolRole.Declaration),
                                             self.extent.line_pos[0],
                                             self.extent.char_pos[0],
-                                        ))
+                                        )
                                 elif decl_type in (ASTT.C_struct, ASTT.C_union, ASTT.C_enum) and not has_var and not declared_args_link and not enum_content_link:
                                     with CS(REF_POS):
-                                        CS.store(m_symbol_ref.set(
-                                            None,
-                                            ((m_file.table_id, 0), OP_REF, (REF_ROOT,)),
+                                        record_symbol_ref(
+                                            CS,
                                             tag_ref or getattr(self, "tag_ref", 0),
                                             self.ast_ref,
                                             get_target_fnid_for_cursor(CS, getattr(self, "cursor", None)),
                                             int(SymbolRole.Declaration),
                                             self.extent.line_pos[0],
                                             self.extent.char_pos[0],
-                                        ))
+                                        )
 
         # 4. Insert Variable / Declarator ASTs into ChangeSet
         if self.cursor is not None and getattr(self.cursor, "kind", None) == cc.CursorKind.FIELD_DECL:
@@ -4007,9 +3999,8 @@ class C_Type(Ast):
                     )
                 if not is_param and safe_name and not is_demoted_macro:
                     with CS(REF_POS):
-                        CS.store(m_symbol_def.set(
-                            None,
-                            ((m_file.table_id, 0), OP_REF, (REF_ROOT,)),
+                        record_symbol_def(
+                            CS,
                             tag_ref or getattr(self, "tag_ref", 0),
                             self.ast_ref,
                             safe_name,
@@ -4017,7 +4008,7 @@ class C_Type(Ast):
                             resolve_linkage(self),
                             var_extent.line_pos[0],
                             var_extent.line_pos[1],
-                        ))
+                        )
             else:
                 var_extent = self.extent
 
@@ -4028,16 +4019,15 @@ class C_Type(Ast):
                         if create_tag and (tag_ref or getattr(self, "tag_ref", None)):
                             active_tag = tag_ref or getattr(self, "tag_ref", 0)
                             with CS(REF_POS):
-                                CS.store(m_symbol_ref.set(
-                                    None,
-                                    ((m_file.table_id, 0), OP_REF, (REF_ROOT,)),
+                                record_symbol_ref(
+                                    CS,
                                     active_tag,
                                     sym_ref,
                                     0,
                                     int(SymbolRole.TypeUsage),
                                     s_line,
                                     s_col,
-                                ))
+                                )
                         elif hasattr(CS, "pending_symbol_refs"):
                             CS.pending_symbol_refs.append((sym_ref, int(SymbolRole.TypeUsage), s_line, s_col))
                 elif is_type_def and hasattr(self, "ast_ref"):
@@ -4046,16 +4036,15 @@ class C_Type(Ast):
                         if create_tag and (tag_ref or getattr(self, "tag_ref", None)):
                             active_tag = tag_ref or getattr(self, "tag_ref", 0)
                             with CS(REF_POS):
-                                CS.store(m_symbol_ref.set(
-                                    None,
-                                    ((m_file.table_id, 0), OP_REF, (REF_ROOT,)),
+                                record_symbol_ref(
+                                    CS,
                                     active_tag,
                                     type_ast_ref,
                                     0,
                                     int(SymbolRole.TypeUsage),
                                     var_extent.line_pos[0],
                                     var_extent.char_pos[0],
-                                ))
+                                )
                         elif hasattr(CS, "pending_symbol_refs"):
                             CS.pending_symbol_refs.append((type_ast_ref, int(SymbolRole.TypeUsage), var_extent.line_pos[0], var_extent.char_pos[0]))
                         break

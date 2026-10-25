@@ -60,6 +60,45 @@ URL_MAINTAINER_RE = re.compile(
 )
 
 
+class _HunkIndex:
+    """Hunks sorted by start line with a max-end segment tree.
+
+    Finds the hunks overlapping `[line_s, line_e]` in O(log H + matches), instead of scanning every hunk
+    that starts before `line_e` for each tag; results come in start order, as the linear scan returned them.
+    """
+
+    def __init__(self, hunks: list[tuple[int, int, int]]) -> None:
+        self.hunks = sorted(hunks, key=lambda h: h[0])
+        self.starts = [h[0] for h in self.hunks]
+        size = 1
+        while size < len(self.hunks):
+            size *= 2
+        self.size = size
+        tree = [-1] * (2 * size)
+        for i, (_start, end, _cid) in enumerate(self.hunks):
+            tree[size + i] = end
+        for i in range(size - 1, 0, -1):
+            tree[i] = max(tree[2 * i], tree[2 * i + 1])
+        self.tree = tree
+
+    def overlapping(self, line_s: int, line_e: int) -> list[int]:
+        """Commit ids of the hunks with `start <= line_e` and `end >= line_s`, in hunk start order."""
+        idx_end = bisect.bisect_right(self.starts, line_e)
+        found: list[int] = []
+        stack = [(1, 0, self.size)]
+        while stack:
+            node, lo, hi = stack.pop()
+            if lo >= idx_end or self.tree[node] < line_s:
+                continue
+            if hi - lo == 1:
+                found.append(self.hunks[lo][2])
+                continue
+            mid = (lo + hi) // 2
+            stack.append((2 * node + 1, mid, hi))
+            stack.append((2 * node, lo, mid))
+        return found
+
+
 class GitCommitParser:
     """Parser for git commits, merge lineages, multi-person trailers, and tag-to-commit mappings."""
 
@@ -929,22 +968,13 @@ class GitCommitParser:
                     tag_to_cids[tid] = matched_cids
                 return tag_to_cids
 
-            resolved_hunks.sort(key=lambda x: x[0])
-            hunk_starts = [h[0] for h in resolved_hunks]
+            hunk_index = _HunkIndex(resolved_hunks)
 
             for t in tags:
                 tid = t["tag_id"] if isinstance(t, dict) else (t[0] if len(t) > 0 else 0)
                 ls = t["line_s"] if isinstance(t, dict) else (t[2] if len(t) > 2 else 1)
                 le = t["line_e"] if isinstance(t, dict) else (t[3] if len(t) > 3 else ls)
-                matched_cids = []
-                seen_cids = set()
-                idx_end = bisect.bisect_right(hunk_starts, le)
-                for i in range(idx_end):
-                    hs, he, cid = resolved_hunks[i]
-                    if he >= ls and cid not in seen_cids:
-                        seen_cids.add(cid)
-                        matched_cids.append(cid)
-                tag_to_cids[tid] = matched_cids
+                tag_to_cids[tid] = list(dict.fromkeys(hunk_index.overlapping(ls, le)))
             return tag_to_cids
 
         # Mode B: Pre-indexed single-pass in-memory file hunks map
@@ -1002,8 +1032,7 @@ class GitCommitParser:
 
                 return tag_commit_bridges
 
-            resolved_hunks.sort(key=lambda x: x[0])
-            hunk_starts = [h[0] for h in resolved_hunks]
+            hunk_index = _HunkIndex(resolved_hunks)
 
             for t in tags:
                 if isinstance(t, dict):
@@ -1019,12 +1048,7 @@ class GitCommitParser:
                 else:
                     continue
 
-                matched_commit_ids = set()
-                idx_end = bisect.bisect_right(hunk_starts, line_e)
-                for i in range(idx_end):
-                    hunk_s, hunk_e, cid = resolved_hunks[i]
-                    if hunk_e >= line_s:
-                        matched_commit_ids.add(cid)
+                matched_commit_ids = set(hunk_index.overlapping(line_s, line_e))
 
                 if not matched_commit_ids and first_cid is not None:
                     matched_commit_ids.add(first_cid)

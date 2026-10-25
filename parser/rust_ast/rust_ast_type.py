@@ -35,7 +35,7 @@ from core.DBLayout import (
     m_ast_hash,
     m_tag_code,
     m_moved_tag,
-    m_symbol_def,
+    m_blob_symbol_def,
 )
 from core.globalstuff import compute_code_hash
 
@@ -137,7 +137,7 @@ class Ast_Rust:
         return ast_ref
 
     def stage_symbol_defs(self, CS: ChangeSetType, current_tag: Any) -> None:
-        """Stage definition symbols (Rust_Fn, Rust_Struct, Rust_Enum, Rust_Trait) into m_symbol_def."""
+        """Stage definition symbols (Rust_Fn, Rust_Struct, Rust_Enum, Rust_Trait) into m_blob_symbol_def (per blob)."""
         _RUST_DEF_TYPES = (
             ASTT.Rust_Fn,
             ASTT.Rust_Struct,
@@ -148,7 +148,7 @@ class Ast_Rust:
             safe_name = str(self.name)[:255]
             from core.globalstuff import SymbolLinkage
             with CS(REF_POS):
-                CS.store(m_symbol_def.set(
+                CS.store(m_blob_symbol_def.set(
                     None,
                     ((m_file.table_id, 0), OP_REF, (REF_ROOT,)),
                     current_tag,

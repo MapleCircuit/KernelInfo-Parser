@@ -31,7 +31,9 @@ from core.globalstuff import (
     T_RAW,
 )
 from core.TableHandling import ChangeSet, Table, is_data_unsafe, to_safe_data
+from core.SymbolRows import symbol_view_rows
 import core.DBLayout as gp
+import hashlib
 
 SNAPSHOT_DIR = Path(__file__).resolve().parent / "snapshots"
 
@@ -88,6 +90,50 @@ def serialize_scalar(val: Any, col_name: str | None = None) -> Any:
     return to_safe_data(val)
 
 
+def _content_hash(cs: ChangeSet, gp_inst: Any) -> bytes:
+    """Git-like blob identity of the file on disk, so each version of a file is its own blob (zeros if unreadable)."""
+    try:
+        root = cs.mf.version_dict[gp_inst.Version_Name]
+        with open(os.path.join(root, cs.current_path), "rb") as f:
+            return hashlib.sha1(f.read()).digest()
+    except Exception:
+        return b"\x00" * 20
+
+
+# Physical symbol tables (core/SymbolRows.py); snapshots hold the layout-independent view rows instead
+_PHYSICAL_SYMBOL_TABLES = ("m_blob_symbol_def", "m_blob_symbol_ref", "m_tag_def", "m_tag_ref", "m_blob_symbol", "m_symbol_own")
+_SYMBOL_VIEW_COLUMNS = {
+    "m_symbol_def": ("blob_id", "tag_id", "ast_id", "name", "type_id", "linkage", "line_s", "line_e"),
+    "m_symbol_ref": ("blob_id", "tag_id", "ast_id", "target_fnid", "role", "line", "char_s"),
+}
+
+
+def _logical_symbol_tables(
+    raw_tables: dict[str, list[dict[str, Any]]], table_map: dict[int, Table]
+) -> dict[str, list[dict[str, Any]]]:
+    """Replace the physical symbol tables with the `m_symbol_def` / `m_symbol_ref` view rows.
+
+    The rows are those of either storage layout (per tag or per blob), without the surrogate def_id/ref_id, in a
+    canonical order.
+    """
+    if not any(name in raw_tables for name in _PHYSICAL_SYMBOL_TABLES):
+        return raw_tables
+    by_name = {t.table_name: t for t in table_map.values()}
+    sources = {}
+    for name in (*_PHYSICAL_SYMBOL_TABLES, "m_bridge_tag"):
+        table = by_name.get(name)
+        if table is not None:
+            cols = [c[0] for c in table.init_columns]
+            sources[name] = [tuple(r.get(c) for c in cols) for r in raw_tables.get(name, [])]
+    out = {name: rows for name, rows in raw_tables.items() if name not in _PHYSICAL_SYMBOL_TABLES}
+    for view, cols in _SYMBOL_VIEW_COLUMNS.items():
+        rows = [dict(zip(cols, row[1:])) for row in symbol_view_rows(sources, view)]
+        if rows:
+            rows.sort(key=lambda r: json.dumps(r, sort_keys=True, default=str))
+            out[view] = rows
+    return out
+
+
 def stage_file_prelude(cs: ChangeSet, gp_inst: Any) -> None:
     """Stage standard file lifecycle prelude operations (m_file_name, m_file, m_bridge_file, etc.).
     
@@ -97,7 +143,7 @@ def stage_file_prelude(cs: ChangeSet, gp_inst: Any) -> None:
     op = cs.file_operation
     ftype = cs.get_file_type() if hasattr(cs, "get_file_type") else 7
 
-    blob_hash = getattr(cs, "blob_hash", b"\x00" * 20)
+    blob_hash = getattr(cs, "blob_hash", None) or _content_hash(cs, gp_inst)
     commit_id = getattr(gp_inst, "VID", 1)
     old_commit_id = getattr(gp_inst, "Old_VID", 0)
 
@@ -260,6 +306,8 @@ def extract_changeset_snapshot(
             else:
                 if row_dict not in raw_tables[table.table_name]:
                     raw_tables[table.table_name].append(row_dict)
+
+    raw_tables = _logical_symbol_tables(raw_tables, table_map)
 
     # Normalize surrogate IDs into symbolic references and preserve DB schema order
     normalized_tables = normalize_snapshot_ids(raw_tables, css, table_map)

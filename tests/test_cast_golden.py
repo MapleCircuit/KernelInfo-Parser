@@ -30,6 +30,7 @@ from core.GreatProcessor import GreatProcessor
 from core.FileHandler import MasterFile
 from core.TableHandling import ChangeSet
 from core.DBLayout import init_db_layout
+from core.SymbolRows import symbol_view_rows
 from table_engine import get_table_engine
 from db_engine import MockDB
 from parser.c_ast.cursor_tree import clear_tu_caches
@@ -39,6 +40,8 @@ from core.config import get_default_repo_path
 LINUX_REPO = str(get_default_repo_path())
 
 FIXTURE_PATH = os.path.join(ROOT, "tests", "fixtures", "cast_golden.json")
+# Physical symbol tables: hashed through their m_symbol_def / m_symbol_ref view rows instead (core/SymbolRows.py)
+_PHYSICAL_SYMBOL_TABLES = frozenset({"m_blob_symbol_def", "m_blob_symbol_ref", "m_tag_def", "m_tag_ref", "m_blob_symbol", "m_symbol_own"})
 GOLDEN_CACHE = "/dev/shm/kip_v30_golden_cache"
 
 
@@ -65,6 +68,7 @@ def execute_parse(mode: str, file_path: str, tree_dir: str) -> tuple[list[str], 
     """Execute parsing and return list of staged operation reprs and dict of table store hashes."""
     MockDB._global_store.clear()
     MockDB._global_next_id.clear()
+    saved_typecheck = G.DEBUG_TYPECHECK
     G.DEBUG_TYPECHECK = True
     G.DB = MockDB
     G.TE = get_table_engine("cached")()
@@ -104,9 +108,16 @@ def execute_parse(mode: str, file_path: str, tree_dir: str) -> tuple[list[str], 
         ops_reprs = [repr(op) for op in cs.cs]
         table_hashes = {}
         for tbl_name, rows_dict in MockDB._global_store.items():
-            if rows_dict:
+            if rows_dict and tbl_name not in _PHYSICAL_SYMBOL_TABLES:
                 sorted_rows = sorted(repr(r) for r in rows_dict.values())
                 table_hashes[tbl_name] = hashlib.sha256("\n".join(sorted_rows).encode("utf-8")).hexdigest()[:16]
+        # Symbol rows as the m_symbol_def / m_symbol_ref views return them (either storage layout), without the
+        # surrogate def_id / ref_id
+        for view in ("m_symbol_def", "m_symbol_ref"):
+            rows = symbol_view_rows(MockDB._global_store, view)
+            if rows:
+                sorted_rows = sorted(repr(r[1:]) for r in rows)
+                table_hashes[view] = hashlib.sha256("\n".join(sorted_rows).encode("utf-8")).hexdigest()[:16]
 
         return ops_reprs, table_hashes
     finally:
@@ -115,6 +126,7 @@ def execute_parse(mode: str, file_path: str, tree_dir: str) -> tuple[list[str], 
         clear_tu_caches()
         G.CURRENT_PARSING_FILE = None
         G.CURRENT_PARSING_DIR = None
+        G.DEBUG_TYPECHECK = saved_typecheck
         if G.TE:
             try:
                 G.TE.close()

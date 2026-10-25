@@ -3,7 +3,7 @@
 ===============================================================================
 RELATIONAL DATABASE SCHEMA REFERENCE GUIDE FOR GIT DAG & CONTENT-ADDRESSABLE ARCH
 ===============================================================================
-This module defines the 41 core relational database tables used across the parser
+This module defines the 45 core relational database tables used across the parser
 pipeline (`Table_Array` / `TABLES`).
 
 SCHEMA ENTITY-RELATIONSHIP GRAPH:
@@ -37,9 +37,14 @@ SCHEMA ENTITY-RELATIONSHIP GRAPH:
      ├── m_bridge_commit_tag (commit_id, blob_id, tag_id)
      └── m_bridge_map (tag_id, map_id) -> m_map_ast (map_id, line_s, char_s, line_e, char_e, ast_id)
 
-5. Blob-Scoped Symbol Definitions & References:
-   m_symbol_def (def_id, blob_id, tag_id, ast_id, name, type_id, linkage, line_s, line_e)
-   m_symbol_ref (ref_id, blob_id, tag_id, ast_id, target_fnid, role, line, char_s)
+5. Symbol Definitions & References (written once per tag, see core/SymbolRows.py):
+   m_tag_def (tag_id, def_idx, sym_key, name, type_id, linkage, rel_line_s, rel_line_e)
+   m_tag_ref (tag_id, ref_idx, sym_key, role, rel_line, char_s)
+   m_blob_symbol (blob_id, sym_key, target_ast_id, target_fnid)   -- per-blob resolution of sym_key
+   m_symbol_own (blob_id, tag_id, kind)                           -- placements stored per blob instead
+   m_blob_symbol_def (def_id, blob_id, tag_id, ast_id, name, type_id, linkage, line_s, line_e)
+   m_blob_symbol_ref (ref_id, blob_id, tag_id, ast_id, target_fnid, role, line, char_s)
+   Views m_symbol_def / m_symbol_ref (main.ensure_db_views) return both layouts in the per-blob shape.
    m_file_reference (ref_id, source_blob_id, target_fnid, ref_type, line_no, details)
 
 6. Kconfig Relational Hierarchy & Build Mapping:
@@ -717,7 +722,9 @@ m_bridge_commit_person = Table(
     ),
     initial_insert=None,
     no_duplicate=False,
-    te_cached=True,
+    # Write-only for the pipeline and idempotent: duplicate rows are skipped by the database, so the
+    # table is not preloaded every version (it grows with every ingested commit)
+    te_cached=False,
     idempotent_pk=True,
     indexes=(("bcp_person_idx", ("person_id",)),),
     hashing_table=False,
@@ -801,11 +808,13 @@ m_moved_tag = Table(
 )
 
 # -----------------------------------------------------------------------------
-# 31. m_symbol_def (table_id=31): Blob-Scoped Symbol Definitions
+# 31. m_blob_symbol_def (table_id=31): Per-Blob Symbol Definitions
+#     Definitions that cannot be stored once per tag (outside their tag's lines, tagless, ambiguous key, or a
+#     reused tag whose definitions changed); the m_symbol_def view adds the m_tag_def rows (core/SymbolRows.py)
 # -----------------------------------------------------------------------------
-m_symbol_def = Table(
+m_blob_symbol_def = Table(
     table_id=31,
-    table_name="m_symbol_def",
+    table_name="m_blob_symbol_def",
     columns=(
         ("def_id", "INT", "NOT NULL", "AUTO_INCREMENT"),
         ("blob_id", "INT", "NOT NULL"),
@@ -825,7 +834,9 @@ m_symbol_def = Table(
     ),
     initial_insert=None,
     no_duplicate=False,
-    te_cached=True,
+    # Write-only for the parser (rows are only staged with set()): caching them would maintain in-memory rows
+    # and indexes per definition, and the startup preload would filter blob_id against a commit id (Old_VID)
+    te_cached=False,
     blob_scoped=True,
     indexes=(
         ("sym_def_blob_name_idx", ("blob_id", "name", "type_id")),
@@ -836,11 +847,13 @@ m_symbol_def = Table(
 )
 
 # -----------------------------------------------------------------------------
-# 32. m_symbol_ref (table_id=32): Blob-Scoped Symbol Occurrences & Usages
+# 32. m_blob_symbol_ref (table_id=32): Per-Blob Symbol Occurrences & Usages
+#     References that cannot be stored once per tag (same cases as m_blob_symbol_def); the m_symbol_ref view
+#     adds the m_tag_ref rows resolved through m_blob_symbol
 # -----------------------------------------------------------------------------
-m_symbol_ref = Table(
+m_blob_symbol_ref = Table(
     table_id=32,
-    table_name="m_symbol_ref",
+    table_name="m_blob_symbol_ref",
     columns=(
         ("ref_id", "INT", "NOT NULL", "AUTO_INCREMENT"),
         ("blob_id", "INT", "NOT NULL"),
@@ -1034,7 +1047,9 @@ m_commit_parent = Table(
     ),
     initial_insert=None,
     no_duplicate=False,
-    te_cached=True,
+    # Write-only for the pipeline and idempotent: duplicate rows are skipped by the database, so the
+    # table is not preloaded every version (it grows with every ingested commit)
+    te_cached=False,
     idempotent_pk=True,
     indexes=(("cp_parent_idx", ("parent_commit_id", "parent_idx")),),
     hashing_table=False,
@@ -1056,6 +1071,110 @@ m_ingest_state = Table(
     foreign=(
         ("network_id", "m_git_network", "network_id"),
         ("commit_id", "m_commit", "commit_id"),
+    ),
+    initial_insert=None,
+    no_duplicate=False,
+    te_cached=False,
+    idempotent_pk=True,
+    hashing_table=False,
+)
+
+# -----------------------------------------------------------------------------
+# 41. m_tag_def (table_id=41): Symbol Definitions of a Tag, Relative to the Tag's First Line
+#     Written once, when the tag is new; every blob placing the tag (m_bridge_tag) shares them. ast_id is not
+#     stored: it is resolved per blob through m_blob_symbol (sym_key), like a reference's target.
+# -----------------------------------------------------------------------------
+m_tag_def = Table(
+    table_id=41,
+    table_name="m_tag_def",
+    columns=(
+        ("tag_id", "INT", "NOT NULL"),
+        ("def_idx", "SMALLINT", "UNSIGNED", "NOT NULL"),
+        ("sym_key", "BIGINT", "NOT NULL"),
+        ("name", "VARCHAR(255)", "NOT NULL", "COLLATE utf8mb4_bin"),
+        ("type_id", "TINYINT", "UNSIGNED", "NOT NULL"),
+        ("linkage", "TINYINT", "UNSIGNED", "NOT NULL", "DEFAULT 0"),
+        ("rel_line_s", "INT", "NOT NULL"),
+        ("rel_line_e", "INT", "NOT NULL"),
+    ),
+    primary=("tag_id", "def_idx"),
+    foreign=(("tag_id", "m_tag", "tag_id"),),
+    initial_insert=None,
+    no_duplicate=False,
+    te_cached=False,
+    indexes=(("tag_def_name_idx", ("name", "type_id")), ("tag_def_key_idx", ("sym_key", "tag_id"))),
+    hashing_table=False,
+)
+
+# -----------------------------------------------------------------------------
+# 42. m_tag_ref (table_id=42): Symbol References of a Tag, Relative to the Tag's First Line
+#     Written once, when the tag is new. sym_key identifies the target without resolving it (core/SymbolRows.py);
+#     m_blob_symbol resolves it per blob, since a target's AST id changes whenever its definition does.
+# -----------------------------------------------------------------------------
+m_tag_ref = Table(
+    table_id=42,
+    table_name="m_tag_ref",
+    columns=(
+        ("tag_id", "INT", "NOT NULL"),
+        ("ref_idx", "INT", "UNSIGNED", "NOT NULL"),
+        ("sym_key", "BIGINT", "NOT NULL"),
+        ("role", "TINYINT", "UNSIGNED", "NOT NULL"),
+        ("rel_line", "INT", "NOT NULL"),
+        ("char_s", "INT", "NOT NULL"),
+    ),
+    primary=("tag_id", "ref_idx"),
+    foreign=(("tag_id", "m_tag", "tag_id"),),
+    initial_insert=None,
+    no_duplicate=False,
+    te_cached=False,
+    indexes=(("tag_ref_key_idx", ("sym_key", "tag_id")),),
+    hashing_table=False,
+)
+
+# -----------------------------------------------------------------------------
+# 43. m_blob_symbol (table_id=43): Per-Blob Resolution of Symbol Keys
+#     One row per distinct sym_key the blob's shared tag rows use: the AST id (and file) it resolves to here.
+# -----------------------------------------------------------------------------
+m_blob_symbol = Table(
+    table_id=43,
+    table_name="m_blob_symbol",
+    columns=(
+        ("blob_id", "INT", "NOT NULL"),
+        ("sym_key", "BIGINT", "NOT NULL"),
+        ("target_ast_id", "INT", "NOT NULL"),
+        ("target_fnid", "INT", "NOT NULL", "DEFAULT 0"),
+    ),
+    primary=("blob_id", "sym_key"),
+    foreign=(
+        ("blob_id", "m_file_blob", "blob_id"),
+        ("target_ast_id", "m_ast", "ast_id"),
+    ),
+    initial_insert=None,
+    no_duplicate=False,
+    te_cached=False,
+    # A blob parsed twice in one run writes the same rows: duplicates are skipped
+    idempotent_pk=True,
+    indexes=(("blob_symbol_target_idx", ("target_ast_id",)),),
+    hashing_table=False,
+)
+
+# -----------------------------------------------------------------------------
+# 44. m_symbol_own (table_id=44): Tag Placements Whose Symbols Are Stored Per Blob
+#     kind 1 = references, 2 = definitions: the views skip that tag's shared rows in that blob and the
+#     m_blob_symbol_ref / m_blob_symbol_def rows stand in for them.
+# -----------------------------------------------------------------------------
+m_symbol_own = Table(
+    table_id=44,
+    table_name="m_symbol_own",
+    columns=(
+        ("blob_id", "INT", "NOT NULL"),
+        ("tag_id", "INT", "NOT NULL"),
+        ("kind", "TINYINT", "UNSIGNED", "NOT NULL"),
+    ),
+    primary=("blob_id", "tag_id", "kind"),
+    foreign=(
+        ("blob_id", "m_file_blob", "blob_id"),
+        ("tag_id", "m_tag", "tag_id"),
     ),
     initial_insert=None,
     no_duplicate=False,
@@ -1099,8 +1218,8 @@ TABLES: tuple[Table, ...] = (
     m_commit_file,         # 28
     m_bridge_commit_tag,   # 29
     m_moved_tag,           # 30
-    m_symbol_def,          # 31
-    m_symbol_ref,          # 32
+    m_blob_symbol_def,     # 31
+    m_blob_symbol_ref,     # 32
     m_file_reference,      # 33
     m_db_instance,         # 34
     m_ast_attribute,       # 35
@@ -1109,19 +1228,23 @@ TABLES: tuple[Table, ...] = (
     m_git_ref,             # 38
     m_commit_parent,       # 39
     m_ingest_state,        # 40
+    m_tag_def,             # 41
+    m_tag_ref,             # 42
+    m_blob_symbol,         # 43
+    m_symbol_own,          # 44
 )
 
 Table_Array = TABLES
 
 
 def init_db_layout(gp=None) -> tuple[Table, ...]:
-    """Initialize and populate gp.Table_Array with all 41 schema tables.
+    """Initialize and populate gp.Table_Array with all 45 schema tables.
 
     Args:
         gp: Optional GreatProcessor instance to attach Table_Array to.
 
     Returns:
-        Immutable tuple of all 41 Table schema objects.
+        Immutable tuple of all 45 Table schema objects.
     """
     if gp is not None:
         gp.Table_Array = list(TABLES)

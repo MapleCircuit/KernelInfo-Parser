@@ -9,6 +9,8 @@ class PipelineProfiler:
 
     file_path: str = ""
     clang_parse_tu_s: float = 0.0
+    # extract_include_symbols(): Python walk over the TU's includes and imported declarations
+    include_symbols_s: float = 0.0
     clang_tokenize_s: float = 0.0
     token_processing_s: float = 0.0
     ast_extraction_s: float = 0.0
@@ -16,24 +18,30 @@ class PipelineProfiler:
     te_db_commit_s: float = 0.0
     total_elapsed_s: float = 0.0
 
+    def component_total(self) -> float:
+        """Sum of the measured components (`total_elapsed_s` when it was set explicitly)."""
+        return self.total_elapsed_s or (
+            self.clang_parse_tu_s
+            + self.include_symbols_s
+            + self.clang_tokenize_s
+            + self.token_processing_s
+            + self.ast_extraction_s
+            + self.cs_execute_s
+            + self.te_db_commit_s
+        )
+
     def to_dict(self) -> dict[str, float | str]:
         """Convert profiler metrics to a serializable dictionary."""
         return {
             "file_path": self.file_path,
             "clang_parse_tu_s": self.clang_parse_tu_s,
+            "include_symbols_s": self.include_symbols_s,
             "clang_tokenize_s": self.clang_tokenize_s,
             "token_processing_s": self.token_processing_s,
             "ast_extraction_s": self.ast_extraction_s,
             "cs_execute_s": self.cs_execute_s,
             "te_db_commit_s": self.te_db_commit_s,
-            "total_elapsed_s": self.total_elapsed_s or (
-                self.clang_parse_tu_s
-                + self.clang_tokenize_s
-                + self.token_processing_s
-                + self.ast_extraction_s
-                + self.cs_execute_s
-                + self.te_db_commit_s
-            ),
+            "total_elapsed_s": self.component_total(),
         }
 
     @classmethod
@@ -42,6 +50,7 @@ class PipelineProfiler:
         return cls(
             file_path=str(data.get("file_path", "")),
             clang_parse_tu_s=float(data.get("clang_parse_tu_s", 0.0)),
+            include_symbols_s=float(data.get("include_symbols_s", 0.0)),
             clang_tokenize_s=float(data.get("clang_tokenize_s", 0.0)),
             token_processing_s=float(data.get("token_processing_s", 0.0)),
             ast_extraction_s=float(data.get("ast_extraction_s", 0.0)),
@@ -53,6 +62,7 @@ class PipelineProfiler:
     def add(self, other: "PipelineProfiler") -> None:
         """Accumulate metrics from another profiler instance."""
         self.clang_parse_tu_s += other.clang_parse_tu_s
+        self.include_symbols_s += other.include_symbols_s
         self.clang_tokenize_s += other.clang_tokenize_s
         self.token_processing_s += other.token_processing_s
         self.ast_extraction_s += other.ast_extraction_s
@@ -72,12 +82,10 @@ def _format_ms(val_s: float) -> str:
         return f"{ms:5.2f}ms"
 
 
-def _format_pct(val_s: float, total_s: float) -> str:
-    """Format percentage of total with threshold-based ANSI highlighting."""
-    if total_s <= 0.0:
-        return "  0.0%"
-    pct = (val_s / total_s) * 100.0
-    formatted = f"{pct:5.1f}%"
+def _format_pct(val_s: float, total_s: float, width: int = 0) -> str:
+    """Format percentage of total, right-aligned to `width` visible characters, with threshold-based ANSI colour."""
+    pct = (val_s / total_s) * 100.0 if total_s > 0.0 else 0.0
+    formatted = f"{f'{pct:5.1f}%':>{width}}"
     if pct >= 50.0:
         return COLOR.red(formatted)
     elif pct >= 25.0:
@@ -95,7 +103,7 @@ def format_profiling_report(
 
     lines = []
     w_file = 38
-    sep_len = w_file + 7 * 11 + 3
+    sep_len = w_file + 8 * 11 + 3
     border = "=" * sep_len
 
     lines.append("\n" + border)
@@ -104,6 +112,7 @@ def format_profiling_report(
     header = (
         f"{'Target File':<{w_file}} | "
         f"{'Clang TU':>9} | "
+        f"{'Includes':>9} | "
         f"{'Tokenize':>9} | "
         f"{'Process':>9} | "
         f"{'AST Gen':>9} | "
@@ -121,18 +130,12 @@ def format_profiling_report(
         if len(f_display) > w_file:
             f_display = "..." + f_display[-(w_file - 3):]
 
-        p_total = p.total_elapsed_s or (
-            p.clang_parse_tu_s
-            + p.clang_tokenize_s
-            + p.token_processing_s
-            + p.ast_extraction_s
-            + p.cs_execute_s
-            + p.te_db_commit_s
-        )
+        p_total = p.component_total()
 
         row = (
             f"{f_display:<{w_file}} | "
             f"{_format_ms(p.clang_parse_tu_s):>9} | "
+            f"{_format_ms(p.include_symbols_s):>9} | "
             f"{_format_ms(p.clang_tokenize_s):>9} | "
             f"{_format_ms(p.token_processing_s):>9} | "
             f"{_format_ms(p.ast_extraction_s):>9} | "
@@ -144,18 +147,12 @@ def format_profiling_report(
 
     lines.append("=" * sep_len)
 
-    grand_total = tot.total_elapsed_s or (
-        tot.clang_parse_tu_s
-        + tot.clang_tokenize_s
-        + tot.token_processing_s
-        + tot.ast_extraction_s
-        + tot.cs_execute_s
-        + tot.te_db_commit_s
-    )
+    grand_total = tot.component_total()
 
     tot_row = (
         f"{COLOR.cyan('TOTAL AGGREGATE'):<{w_file + 9}} | "
         f"{_format_ms(tot.clang_parse_tu_s):>9} | "
+        f"{_format_ms(tot.include_symbols_s):>9} | "
         f"{_format_ms(tot.clang_tokenize_s):>9} | "
         f"{_format_ms(tot.token_processing_s):>9} | "
         f"{_format_ms(tot.ast_extraction_s):>9} | "
@@ -167,12 +164,13 @@ def format_profiling_report(
 
     pct_row = (
         f"{COLOR.cyan('PERCENTAGE OF TOTAL'):<{w_file + 9}} | "
-        f"{_format_pct(tot.clang_parse_tu_s, grand_total):>18} | "
-        f"{_format_pct(tot.clang_tokenize_s, grand_total):>18} | "
-        f"{_format_pct(tot.token_processing_s, grand_total):>18} | "
-        f"{_format_pct(tot.ast_extraction_s, grand_total):>18} | "
-        f"{_format_pct(tot.cs_execute_s, grand_total):>18} | "
-        f"{_format_pct(tot.te_db_commit_s, grand_total):>18} | "
+        f"{_format_pct(tot.clang_parse_tu_s, grand_total, 9)} | "
+        f"{_format_pct(tot.include_symbols_s, grand_total, 9)} | "
+        f"{_format_pct(tot.clang_tokenize_s, grand_total, 9)} | "
+        f"{_format_pct(tot.token_processing_s, grand_total, 9)} | "
+        f"{_format_pct(tot.ast_extraction_s, grand_total, 9)} | "
+        f"{_format_pct(tot.cs_execute_s, grand_total, 9)} | "
+        f"{_format_pct(tot.te_db_commit_s, grand_total, 9)} | "
         f"{'100.0%':>9}"
     )
     lines.append(pct_row)
@@ -269,6 +267,8 @@ class PipelineStageProfiler:
             return
         if isinstance(prof, dict):
             prof = PipelineProfiler.from_dict(prof)
+        if prof.component_total() <= 0.0:
+            return
         self.worker_aggregate.add(prof)
         self.worker_count += 1
 
@@ -309,7 +309,7 @@ class PipelineStageProfiler:
         for name in self.stage_order:
             stage = self.stages[name]
             dur = stage_durations.get(name, 0.0)
-            pct_str = _format_pct(dur, effective_total)
+            pct_str = _format_pct(dur, effective_total, 9)
             items_str = f"{stage.count:,} {stage.units}" if stage.count > 0 else ""
             throughput_str = ""
             if stage.count > 0 and dur > 0.0001:
@@ -322,7 +322,7 @@ class PipelineStageProfiler:
             lines.append(
                 f"{name:<{w_name}} | "
                 f"{_format_ms(dur):>9} | "
-                f"{pct_str:>18} | "
+                f"{pct_str} | "
                 f"{items_str:>16} | "
                 f"{throughput_str:>14}"
             )
@@ -340,23 +340,22 @@ class PipelineStageProfiler:
         # Parallel worker CPU breakdown if collected
         if self.worker_count > 0:
             w_tot = self.worker_aggregate
-            tot_cpu = w_tot.total_elapsed_s or (
-                w_tot.clang_parse_tu_s
-                + w_tot.clang_tokenize_s
-                + w_tot.token_processing_s
-                + w_tot.ast_extraction_s
-                + w_tot.cs_execute_s
-                + w_tot.te_db_commit_s
-            )
+            tot_cpu = w_tot.component_total()
             if tot_cpu > 0.001:
                 lines.append(COLOR.cyan("\n--- PARALLEL WORKER CPU BREAKDOWN (Clang & AST Extraction) ---"))
                 lines.append(f"Aggregate across {self.worker_count:,} parsed files:")
-                lines.append(f"  • Clang TU Parse:     {_format_ms(w_tot.clang_parse_tu_s):>9} ({_format_pct(w_tot.clang_parse_tu_s, tot_cpu)} of worker CPU)")
-                lines.append(f"  • Clang Tokenize:     {_format_ms(w_tot.clang_tokenize_s):>9} ({_format_pct(w_tot.clang_tokenize_s, tot_cpu)} of worker CPU)")
-                lines.append(f"  • Token Processing:   {_format_ms(w_tot.token_processing_s):>9} ({_format_pct(w_tot.token_processing_s, tot_cpu)} of worker CPU)")
-                lines.append(f"  • AST Generation:     {_format_ms(w_tot.ast_extraction_s):>9} ({_format_pct(w_tot.ast_extraction_s, tot_cpu)} of worker CPU)")
-                lines.append(f"  • CS Execution:       {_format_ms(w_tot.cs_execute_s):>9} ({_format_pct(w_tot.cs_execute_s, tot_cpu)} of worker CPU)")
-                lines.append(f"  • TE DB Staging:      {_format_ms(w_tot.te_db_commit_s):>9} ({_format_pct(w_tot.te_db_commit_s, tot_cpu)} of worker CPU)")
+                for label, val in (
+                    ("Clang TU Parse:", w_tot.clang_parse_tu_s),
+                    ("Include Symbols:", w_tot.include_symbols_s),
+                    ("Clang Tokenize:", w_tot.clang_tokenize_s),
+                    ("Token Processing:", w_tot.token_processing_s),
+                    ("AST Generation:", w_tot.ast_extraction_s),
+                    ("CS Execution:", w_tot.cs_execute_s),
+                    ("TE DB Staging:", w_tot.te_db_commit_s),
+                ):
+                    # Components no worker measured (e.g. ChangeSets now execute in the parent) are left out
+                    if val > 0.0:
+                        lines.append(f"  • {label:<19} {_format_ms(val):>9} ({_format_pct(val, tot_cpu)} of worker CPU)")
                 lines.append(f"  • Total Worker CPU:   {_format_ms(tot_cpu):>9}")
 
         # Bottleneck analysis & recommendations
@@ -371,9 +370,15 @@ class PipelineStageProfiler:
                 color_fn = COLOR.red if pct >= 30.0 else (COLOR.yellow if pct >= 15.0 else COLOR.green)
                 lines.append(color_fn(f"[BOTTLENECK #{rank}] {name}: {_format_ms(dur)} ({pct:.1f}% of total runtime)"))
                 low_name = name.lower()
-                if "source parsing" in low_name:
-                    lines.append("  -> Worker translation unit parsing and intra-file reference extraction.")
-                    lines.append("  -> Optimization: Increase worker concurrency (--cpus), tune batch sizes, or enable worker AST caching.")
+                if "source" in low_name and "parsing" in low_name:
+                    lines.append("  -> Worker translation unit parsing, parent ChangeSet execution and in-stage commits.")
+                    lines.append("  -> See the per-stage 'time split' log lines for how parent, workers and commits share it.")
+                elif "preload" in low_name:
+                    lines.append("  -> TableEngine cache preload (carried hash tables are reused or rebuilt from memory).")
+                    lines.append("  -> A long preload means a cold first load or a carried-table rebuild; see the [TECachedDB] lines.")
+                elif "file references" in low_name:
+                    lines.append("  -> Mostly the include/Kconfig reference INSERT...SELECT for new blobs; Kbuild and docs are a small share.")
+                    lines.append("  -> Optimization: database-side (InnoDB buffer pool size, indexes on m_file_reference).")
                 elif "header" in low_name and "wave" in low_name:
                     lines.append("  -> Topological sort and cycle-breaking deadlock resolution.")
                     lines.append("  -> Optimization: Increase wave chunking threshold or expand wave batch force-resolving.")

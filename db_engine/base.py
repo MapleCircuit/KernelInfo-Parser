@@ -8,12 +8,21 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
 from types import TracebackType
-from typing import TYPE_CHECKING, Self
+from typing import TYPE_CHECKING, NamedTuple, Self
 
 from core.globalstuff import JoinsType, PointerType, SafeDataType
 
 if TYPE_CHECKING:
     from core.TableHandling import Table
+
+
+class TableCommitStat(NamedTuple):
+    """Rows one `commit_tables_parallel()` call wrote to one table, and the seconds that table took."""
+
+    table_name: str
+    inserted: int
+    updated: int
+    seconds: float
 
 
 class BaseDBEngine(ABC):
@@ -24,7 +33,11 @@ class BaseDBEngine(ABC):
         - Transactions: DDL and DML operations auto-commit; context manager rolls back on unhandled error.
         - Wildcard Matching: Tuple queries treat `None` values as wildcards (omitted from WHERE filters).
         - Joins: Multi-table join queries map columns in joined order, chunking graphs > 50 tables into slices of <= 30.
+        - Background commits: a driver whose `commit_tables_parallel(..., dedicated=True)` uses only connections of
+          its own sets `supports_background_commit = True`, so the TableEngine may run it on a writer thread.
     """
+
+    supports_background_commit = False
 
     @abstractmethod
     def __init__(self) -> None:
@@ -152,6 +165,18 @@ class BaseDBEngine(ABC):
             list[tuple[SafeDataType, ...]]: List of flat concatenated row tuples for all matching records.
         """
 
+    def select_in(self, table: Table, col_idx: int, values: Sequence[SafeDataType]) -> list[tuple[SafeDataType, ...]]:
+        """Fetch every row of `table` whose column `col_idx` is one of `values`.
+
+        Default implementation: one `view_select_multiple()` per value; drivers override it with an `IN` query.
+        """
+        rows: list[tuple[SafeDataType, ...]] = []
+        joins: JoinsType = (((table.table_id, 0),),)
+        for val in dict.fromkeys(values):
+            cols = tuple(val if i == col_idx else None for i in range(table.length))
+            rows.extend(self.view_select_multiple({table.table_id: table}, joins, cols))
+        return rows
+
     @abstractmethod
     def select_preload(
         self,
@@ -220,16 +245,20 @@ class BaseDBEngine(ABC):
         self,
         tables_data: Sequence[tuple[Table, Sequence[tuple[SafeDataType, ...]], Sequence[tuple[SafeDataType, ...]]]],
         max_workers: int | None = None,
-    ) -> None:
+        dedicated: bool = False,
+    ) -> list[TableCommitStat]:
         """Commit inserts and updates for multiple tables concurrently across worker connection threads.
 
         Args:
             tables_data: Sequence of tuples `(table, insert_payload, update_payload)`.
             max_workers: Maximum concurrent database worker threads (defaults to min(len(tables_data), G.CPUS)).
+            dedicated: Use only connections opened for this call, never the instance's own (background writers).
         Process:
-            Executes table insert/update operations in parallel across isolated database connections and commits.
+            Executes table insert/update operations in parallel across isolated database connections and commits,
+            each table atomically. On failure the first error is raised after all tables finished, carrying
+            `failed_table_ids` (the tables not committed; every other table is).
         Outputs:
-            None.
+            One `TableCommitStat` per written table.
         """
 
     @abstractmethod

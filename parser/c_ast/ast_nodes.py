@@ -24,8 +24,11 @@ from core.DBLayout import (
     m_map_ast,
     m_bridge_map,
     m_moved_tag,
-    m_symbol_def,
-    m_symbol_ref,
+)
+from core.SymbolRows import (
+    flush_pending_refs as flush_pending_symbol_refs,
+    record_def as record_symbol_def,
+    register_tag as register_symbol_tag,
 )
 from parser.c_ast.tokenizer import AST_KIND, Line, get_cursor_line
 from parser.c_ast.tag_tracker import match_prior_tag_transition
@@ -176,9 +179,8 @@ class Ast:
                     ext = extent or self.extent
                     linkage = int(SymbolLinkage.MacroOrKernelDef) if type_id in (ASTT.CPPro_define, ASTT.CPPro_define_macro, ASTT.ASM_Macro) else int(SymbolLinkage.InternalStaticDef)
                     with CS(REF_POS):
-                        CS.store(m_symbol_def.set(
-                            None,
-                            ((m_file.table_id, 0), OP_REF, (REF_ROOT,)),
+                        record_symbol_def(
+                            CS,
                             tag_ref or getattr(self, "tag_ref", 0),
                             self.ast_ref,
                             safe_name,
@@ -186,7 +188,7 @@ class Ast:
                             linkage,
                             ext.line_pos[0],
                             ext.line_pos[1],
-                        ))
+                        )
 
     def ast_debug(self, CS: Any, ast_id_route: Any) -> None:
         """Stage JSON debug serialization in m_ast_debug."""
@@ -238,6 +240,7 @@ class Ast:
                         self.tag_ref = tag_id
                         if hasattr(CS, "last_tag_ref"):
                             CS.last_tag_ref = tag_id
+                        register_symbol_tag(CS, tag_id, ext.line_pos[0], ext.line_pos[1], ext.char_pos[0], ext.code)
                         self._flush_pending_symbol_refs(CS, tag_id)
                         return tag_id
 
@@ -269,30 +272,13 @@ class Ast:
         self.tag_ref = tag_ref
         if hasattr(CS, "last_tag_ref"):
             CS.last_tag_ref = tag_ref
+        register_symbol_tag(CS, tag_ref, ext.line_pos[0], ext.line_pos[1], ext.char_pos[0], ext.code)
         self._flush_pending_symbol_refs(CS, tag_ref)
         return tag_ref
 
     def _flush_pending_symbol_refs(self, CS: Any, tag_ref: Any) -> None:
-        """Flush pending symbol references with the active tag reference."""
-        if getattr(CS, "pending_symbol_refs", None):
-            seen: set[tuple[Any, int, int, int]] = set()
-            for ref_ast_id, role, line, col in CS.pending_symbol_refs:
-                key = (ref_ast_id, role, line, col)
-                if key in seen:
-                    continue
-                seen.add(key)
-                with CS(REF_POS):
-                    CS.store(m_symbol_ref.set(
-                        None,
-                        ((m_file.table_id, 0), OP_REF, (REF_ROOT,)),
-                        tag_ref,
-                        ref_ast_id,
-                        0,
-                        int(role),
-                        line,
-                        col,
-                    ))
-            CS.pending_symbol_refs.clear()
+        """Record pending symbol references against the active tag (emitted when the file's parse ends)."""
+        flush_pending_symbol_refs(CS, tag_ref)
 
     def map_ast(
         self,
@@ -884,9 +870,8 @@ class CPPro_define(CPPro):
                     CS.symbol_dict[(safe_name, ASTT.CPPro_define_macro)] = ast_id_route[1]
                 ext = self.extent
                 with CS(REF_POS):
-                    CS.store(m_symbol_def.set(
-                        None,
-                        ((m_file.table_id, 0), OP_REF, (REF_ROOT,)),
+                    record_symbol_def(
+                        CS,
                         tag_ref or getattr(self, "tag_ref", 0),
                         self.ast_ref,
                         safe_name,
@@ -894,7 +879,7 @@ class CPPro_define(CPPro):
                         int(SymbolLinkage.MacroOrKernelDef),
                         ext.line_pos[0],
                         ext.line_pos[1],
-                    ))
+                    )
 
 
 class CPPro_undef(CPPro):

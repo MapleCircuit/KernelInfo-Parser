@@ -17,12 +17,15 @@ class MasterFile:
         self.workspace_dir: str | None = None
         self._cat_file_proc: sp.Popen | None = None
         self.repo_dir: Path = Path(G.linux_directory).resolve()
+        # (repo_dir, version) -> `git ls-tree -r --name-only` output: one version is listed by several steps
+        self._file_list_cache: dict[tuple[Path, str], str] = {}
 
     def set_repo_dir(self, repo_dir: str | Path) -> None:
         """Set the active Git repository directory and restart cat-file subprocess if path changes."""
         new_dir = Path(repo_dir).resolve()
         if getattr(self, "repo_dir", None) != new_dir:
             self._close_cat_file_proc()
+            self._file_list_cache.clear()
             self.repo_dir = new_dir
             G.linux_directory = new_dir
 
@@ -201,7 +204,9 @@ class MasterFile:
         self.file_dict[version_name] = {}
 
     def clear_version_cache(self, version: str) -> None:
-        """Evict cached file contents for a completed version."""
+        """Evict cached file contents and file listings for a completed version."""
+        for key in [k for k in self._file_list_cache if k[1] == version]:
+            del self._file_list_cache[key]
         if version in self.file_dict:
             self.file_dict[version].clear()
             del self.file_dict[version]
@@ -229,6 +234,7 @@ class MasterFile:
         self.workspace_dir = None
         self.version_dict.clear()
         self.file_dict.clear()
+        self._file_list_cache.clear()
         return
 
     def __del__(self) -> None:
@@ -315,7 +321,11 @@ class MasterFile:
         return gp.Change_List
 
     def git_file_list(self, version: str) -> str:
-        """Retrieve full list of tracked files in git repository for a version."""
+        """Retrieve full list of tracked files in git repository for a version (cached per version)."""
+        cache_key = (self.repo_dir, str(version))
+        cached = self._file_list_cache.get(cache_key)
+        if cached is not None:
+            return cached
         git_dir = self._get_git_dir()
         command = [
             "git",
@@ -326,6 +336,10 @@ class MasterFile:
             f"{version}",
         ]
         raw_file = sp.run(command, capture_output=True, text=True)  # noqa: PLW1510, S603
+        if raw_file.returncode == 0:
+            self._file_list_cache[cache_key] = raw_file.stdout
+            while len(self._file_list_cache) > 4:
+                del self._file_list_cache[next(iter(self._file_list_cache))]
         return raw_file.stdout
 
     def get_dir_list(self, version_name: str) -> list[str]:

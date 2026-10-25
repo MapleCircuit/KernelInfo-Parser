@@ -446,8 +446,7 @@ class HistoryService:
                 params += [line, line]
             cursor.execute(
                 f"""
-                SELECT bt.tag_id, bt.line_s, bt.line_e, t.ast_id, a.name, a.type_id,
-                       EXISTS(SELECT 1 FROM m_symbol_def d WHERE d.blob_id = bt.blob_id AND d.tag_id = bt.tag_id) AS is_def
+                SELECT bt.tag_id, bt.line_s, bt.line_e, t.ast_id, a.name, a.type_id
                 FROM m_bridge_tag bt
                 JOIN m_tag t ON t.tag_id = bt.tag_id
                 JOIN m_ast a ON a.ast_id = t.ast_id
@@ -457,8 +456,13 @@ class HistoryService:
                 params,
             )
             rows = cursor.fetchall()
+            # Tags of this blob holding a definition: one query filtered by blob (a correlated EXISTS on the
+            # m_symbol_def view per tag took seconds)
+            cursor.execute("SELECT DISTINCT tag_id FROM m_symbol_def WHERE blob_id = %s;", (blob[0],))
+            def_tags = {r["tag_id"] for r in cursor.fetchall()}
             for r in rows:
                 r["name"] = safe_decode(r["name"]) or ""
+                r["is_def"] = r["tag_id"] in def_tags
         named = [r for r in rows if r["is_def"] or r["type_id"] in KCONFIG_TYPES]
         pick = None
         if name:

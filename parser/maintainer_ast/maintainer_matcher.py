@@ -19,6 +19,19 @@ from parser.maintainer_ast.maintainer_types import (
 )
 
 
+_WILDCARD_CHARS = ("*", "?", "[")
+
+
+def _literal_dir_prefix(pattern: str) -> str:
+    """Directory part of a wildcard pattern's literal prefix ('drivers/net/3c505*' -> 'drivers/net/').
+
+    Every path the pattern matches starts with it, because fnmatch patterns are anchored at the start.
+    Returns '' when the pattern has a wildcard before its first '/'.
+    """
+    cut = min((i for i in (pattern.find(c) for c in _WILDCARD_CHARS) if i != -1), default=len(pattern))
+    return pattern[: pattern.rfind("/", 0, cut) + 1]
+
+
 def _pattern_to_regex(pattern: str) -> re.Pattern:
     """Convert a MAINTAINERS file/exclude pattern to a compiled regex."""
     pattern = pattern.strip()
@@ -45,6 +58,8 @@ class CompiledSectionRules:
         self.exact_includes: set[str] = set()
         self.prefix_includes: list[str] = []
         self.regex_includes: list[re.Pattern] = []
+        # Directory prefixes every regex include requires ('' when one can match anywhere)
+        self.regex_include_dirs: set[str] = set()
 
         self.exact_excludes: set[str] = set()
         self.prefix_excludes: list[str] = []
@@ -60,6 +75,7 @@ class CompiledSectionRules:
                     self.prefix_includes.append(pat)
                 elif "*" in pat or "?" in pat or "[" in pat:
                     self.regex_includes.append(_pattern_to_regex(pat))
+                    self.regex_include_dirs.add(_literal_dir_prefix(pat))
                 else:
                     self.exact_includes.add(pat)
                     self.prefix_includes.append(f"{pat}/")
@@ -118,19 +134,27 @@ class MaintainerMatcher:
         # Fast lookup indices by exact paths and exact directory prefixes
         self.exact_index: dict[str, list[CompiledSectionRules]] = defaultdict(list)
         self.dir_prefix_map: dict[str, list[CompiledSectionRules]] = defaultdict(list)
+        # Sections with wildcard 'F:' patterns, in section order. Each is filed under the directory prefixes
+        # its wildcards require, so a file only tests the ones filed under its ancestor directories (plus
+        # those whose wildcards can match anywhere). Sections without any 'F:' pattern never match.
         self.general_rules: list[CompiledSectionRules] = []
+        self._wildcard_dir_index: dict[str, list[int]] = defaultdict(list)
+        self._wildcard_anywhere: list[int] = []
         self._cache: dict[str, list[MaintainerSection]] = {}
 
         for rule in self.compiled_rules:
-            has_specific = False
             for exact_path in rule.exact_includes:
                 self.exact_index[exact_path].append(rule)
-                has_specific = True
             for pfx in rule.prefix_includes:
                 self.dir_prefix_map[pfx].append(rule)
-                has_specific = True
-            if rule.regex_includes or not has_specific:
+            if rule.regex_includes:
+                pos = len(self.general_rules)
                 self.general_rules.append(rule)
+                if "" in rule.regex_include_dirs:
+                    self._wildcard_anywhere.append(pos)
+                else:
+                    for dir_prefix in rule.regex_include_dirs:
+                        self._wildcard_dir_index[dir_prefix].append(pos)
 
     def match_file(self, file_path: str) -> list[MaintainerSection]:
         """Find all maintainer sections responsible for the given file path using indexed lookups."""
@@ -151,6 +175,7 @@ class MaintainerMatcher:
                 matching_sections.append(rule.section)
 
         # 2. Hierarchical ancestor directory prefix matches
+        wildcard_candidates = set(self._wildcard_anywhere)
         slash_idx = file_path.find("/")
         while slash_idx != -1:
             pfx = file_path[: slash_idx + 1]
@@ -158,10 +183,12 @@ class MaintainerMatcher:
                 if rule.section.name not in seen_secs and rule.matches(file_path):
                     seen_secs.add(rule.section.name)
                     matching_sections.append(rule.section)
+            wildcard_candidates.update(self._wildcard_dir_index.get(pfx, ()))
             slash_idx = file_path.find("/", slash_idx + 1)
 
-        # 3. General regex / root wildcard fallback rules
-        for rule in self.general_rules:
+        # 3. Wildcard rules that can match this path, in section order
+        for pos in sorted(wildcard_candidates):
+            rule = self.general_rules[pos]
             if rule.section.name not in seen_secs and rule.matches(file_path):
                 seen_secs.add(rule.section.name)
                 matching_sections.append(rule.section)

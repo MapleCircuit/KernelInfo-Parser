@@ -32,7 +32,12 @@
     "m_file_blob": [
       {
         "blob_id": "$fid_0",
-        "blob_hash": "hex:0000000000000000000000000000000000000000",
+        "blob_hash": "hex:80571eec17ec0458498d0239483054e43c4a153b",
+        "ftype": "1 (T_C)"
+      },
+      {
+        "blob_id": "$fid_1",
+        "blob_hash": "hex:74c75315c98db3161c1f82d316e2450a4133d410",
         "ftype": "1 (T_C)"
       }
     ],
@@ -45,7 +50,7 @@
       {
         "commit_id": 2,
         "fnid": "$fnid_0",
-        "blob_id": "$fid_0"
+        "blob_id": "$fid_1"
       }
     ],
     "m_ast": [
@@ -814,7 +819,127 @@
         "char_e": 32
       },
       {
-        "blob_id": "$fid_0",
+        "blob_id": "$fid_1",
+        "tag_id": "$prior_tag_0",
+        "line_s": 1,
+        "line_e": 7,
+        "char_s": 1,
+        "char_e": 4
+      },
+      {
+        "blob_id": "$fid_1",
+        "tag_id": "$prior_tag_1",
+        "line_s": 9,
+        "line_e": 9,
+        "char_s": 1,
+        "char_e": 27
+      },
+      {
+        "blob_id": "$fid_1",
+        "tag_id": "$prior_tag_2",
+        "line_s": 10,
+        "line_e": 10,
+        "char_s": 1,
+        "char_e": 27
+      },
+      {
+        "blob_id": "$fid_1",
+        "tag_id": "$prior_tag_3",
+        "line_s": 12,
+        "line_e": 12,
+        "char_s": 1,
+        "char_e": 29
+      },
+      {
+        "blob_id": "$fid_1",
+        "tag_id": "$prior_tag_4",
+        "line_s": 13,
+        "line_e": 13,
+        "char_s": 1,
+        "char_e": 46
+      },
+      {
+        "blob_id": "$fid_1",
+        "tag_id": "$prior_tag_5",
+        "line_s": 14,
+        "line_e": 14,
+        "char_s": 1,
+        "char_e": 29
+      },
+      {
+        "blob_id": "$fid_1",
+        "tag_id": "$prior_tag_6",
+        "line_s": 15,
+        "line_e": 15,
+        "char_s": 1,
+        "char_e": 23
+      },
+      {
+        "blob_id": "$fid_1",
+        "tag_id": "$prior_tag_7",
+        "line_s": 16,
+        "line_e": 16,
+        "char_s": 1,
+        "char_e": 30
+      },
+      {
+        "blob_id": "$fid_1",
+        "tag_id": "$prior_tag_8",
+        "line_s": 17,
+        "line_e": 17,
+        "char_s": 1,
+        "char_e": 7
+      },
+      {
+        "blob_id": "$fid_1",
+        "tag_id": "$prior_tag_9",
+        "line_s": 19,
+        "line_e": 19,
+        "char_s": 1,
+        "char_e": 25
+      },
+      {
+        "blob_id": "$fid_1",
+        "tag_id": "$prior_tag_10",
+        "line_s": 20,
+        "line_e": 20,
+        "char_s": 1,
+        "char_e": 17
+      },
+      {
+        "blob_id": "$fid_1",
+        "tag_id": "$prior_tag_11",
+        "line_s": 22,
+        "line_e": 24,
+        "char_s": 1,
+        "char_e": 4
+      },
+      {
+        "blob_id": "$fid_1",
+        "tag_id": "$prior_tag_12",
+        "line_s": 25,
+        "line_e": 30,
+        "char_s": 1,
+        "char_e": 3
+      },
+      {
+        "blob_id": "$fid_1",
+        "tag_id": "$prior_tag_13",
+        "line_s": 32,
+        "line_e": 32,
+        "char_s": 1,
+        "char_e": 43
+      },
+      {
+        "blob_id": "$fid_1",
+        "tag_id": "$prior_tag_14",
+        "line_s": 34,
+        "line_e": 37,
+        "char_s": 1,
+        "char_e": 4
+      },
+      {
+        "blob_id": "$fid_1",
         "tag_id": "$tag_24",
         "line_s": 38,
         "line_e": 45,
@@ -822,7 +947,7 @@
         "char_e": 3
       },
       {
-        "blob_id": "$fid_0",
+        "blob_id": "$fid_1",
         "tag_id": "$prior_tag_16",
         "line_s": 47,
         "line_e": 49,
@@ -830,7 +955,7 @@
         "char_e": 4
       },
       {
-        "blob_id": "$fid_0",
+        "blob_id": "$fid_1",
         "tag_id": "$prior_tag_17",
         "line_s": 51,
         "line_e": 51,
@@ -838,7 +963,7 @@
         "char_e": 79
       },
       {
-        "blob_id": "$fid_0",
+        "blob_id": "$fid_1",
         "tag_id": "$prior_tag_18",
         "line_s": 52,
         "line_e": 52,
@@ -846,7 +971,7 @@
         "char_e": 49
       },
       {
-        "blob_id": "$fid_0",
+        "blob_id": "$fid_1",
         "tag_id": "$prior_tag_19",
         "line_s": 54,
         "line_e": 55,
@@ -854,7 +979,7 @@
         "char_e": 28
       },
       {
-        "blob_id": "$fid_0",
+        "blob_id": "$fid_1",
         "tag_id": "$prior_tag_20",
         "line_s": 56,
         "line_e": 56,
@@ -862,7 +987,7 @@
         "char_e": 27
       },
       {
-        "blob_id": "$fid_0",
+        "blob_id": "$fid_1",
         "tag_id": "$prior_tag_21",
         "line_s": 57,
         "line_e": 57,
@@ -870,7 +995,7 @@
         "char_e": 30
       },
       {
-        "blob_id": "$fid_0",
+        "blob_id": "$fid_1",
         "tag_id": "$prior_tag_22",
         "line_s": 59,
         "line_e": 59,
@@ -878,7 +1003,7 @@
         "char_e": 7
       },
       {
-        "blob_id": "$fid_0",
+        "blob_id": "$fid_1",
         "tag_id": "$prior_tag_23",
         "line_s": 59,
         "line_e": 59,
@@ -1196,20 +1321,30 @@
         "e_tag_id": "$tag_24"
       }
     ],
-    "m_symbol_def": [
+    "m_git_ref": [
       {
-        "def_id": "$def_0",
-        "blob_id": "$fid_0",
-        "tag_id": "$prior_tag_2",
-        "ast_id": "$ast_2",
-        "name": "LINUX_LOCKD_BIND_H",
-        "type_id": "75 (CPPro_define)",
-        "linkage": 5,
-        "line_s": 10,
-        "line_e": 10
+        "ref_id": 1,
+        "repo_id": 0,
+        "ref_type": 4,
+        "ref_name": "v2.6.28",
+        "commit_id": 1,
+        "tagger_id": null,
+        "tagger_date": null,
+        "tag_message": null
       },
       {
-        "def_id": "$def_1",
+        "ref_id": 2,
+        "repo_id": 0,
+        "ref_type": 4,
+        "ref_name": "v2.6.29",
+        "commit_id": 2,
+        "tagger_id": null,
+        "tagger_date": null,
+        "tag_message": null
+      }
+    ],
+    "m_symbol_def": [
+      {
         "blob_id": "$fid_0",
         "tag_id": "$prior_tag_12",
         "ast_id": "$ast_24",
@@ -1220,7 +1355,16 @@
         "line_e": 30
       },
       {
-        "def_id": "$def_2",
+        "blob_id": "$fid_1",
+        "tag_id": "$prior_tag_12",
+        "ast_id": "$ast_24",
+        "name": "nlmsvc_binding",
+        "type_id": "28 (C_structdecl)",
+        "linkage": 0,
+        "line_s": 25,
+        "line_e": 30
+      },
+      {
         "blob_id": "$fid_0",
         "tag_id": "$prior_tag_13",
         "ast_id": "$ast_25",
@@ -1231,7 +1375,36 @@
         "line_e": 32
       },
       {
-        "def_id": "$def_3",
+        "blob_id": "$fid_1",
+        "tag_id": "$prior_tag_13",
+        "ast_id": "$ast_25",
+        "name": "nlmsvc_ops",
+        "type_id": "1 (C_Compound)",
+        "linkage": 2,
+        "line_s": 32,
+        "line_e": 32
+      },
+      {
+        "blob_id": "$fid_0",
+        "tag_id": "$prior_tag_2",
+        "ast_id": "$ast_2",
+        "name": "LINUX_LOCKD_BIND_H",
+        "type_id": "75 (CPPro_define)",
+        "linkage": 5,
+        "line_s": 10,
+        "line_e": 10
+      },
+      {
+        "blob_id": "$fid_1",
+        "tag_id": "$prior_tag_2",
+        "ast_id": "$ast_2",
+        "name": "LINUX_LOCKD_BIND_H",
+        "type_id": "75 (CPPro_define)",
+        "linkage": 5,
+        "line_s": 10,
+        "line_e": 10
+      },
+      {
         "blob_id": "$fid_0",
         "tag_id": "$prior_tag_15",
         "ast_id": "$ast_38",
@@ -1242,7 +1415,6 @@
         "line_e": 44
       },
       {
-        "def_id": "$def_4",
         "blob_id": "$fid_0",
         "tag_id": "$prior_tag_17",
         "ast_id": "$ast_44",
@@ -1253,7 +1425,6 @@
         "line_e": 50
       },
       {
-        "def_id": "$def_5",
         "blob_id": "$fid_0",
         "tag_id": "$prior_tag_18",
         "ast_id": "$ast_46",
@@ -1264,7 +1435,16 @@
         "line_e": 51
       },
       {
-        "def_id": "$def_6",
+        "blob_id": "$fid_1",
+        "tag_id": "$prior_tag_18",
+        "ast_id": "$ast_46",
+        "name": "nlmclnt_done",
+        "type_id": "21 (C_functionprotodecl)",
+        "linkage": 2,
+        "line_s": 52,
+        "line_e": 52
+      },
+      {
         "blob_id": "$fid_0",
         "tag_id": "$prior_tag_19",
         "ast_id": "$ast_50",
@@ -1275,7 +1455,16 @@
         "line_e": 54
       },
       {
-        "def_id": "$def_7",
+        "blob_id": "$fid_1",
+        "tag_id": "$prior_tag_19",
+        "ast_id": "$ast_50",
+        "name": "nlmclnt_proc",
+        "type_id": "21 (C_functionprotodecl)",
+        "linkage": 2,
+        "line_s": 54,
+        "line_e": 55
+      },
+      {
         "blob_id": "$fid_0",
         "tag_id": "$prior_tag_20",
         "ast_id": "$ast_51",
@@ -1286,96 +1475,7 @@
         "line_e": 55
       },
       {
-        "def_id": "$def_8",
-        "blob_id": "$fid_0",
-        "tag_id": "$prior_tag_21",
-        "ast_id": "$ast_52",
-        "name": "lockd_down",
-        "type_id": "21 (C_functionprotodecl)",
-        "linkage": 2,
-        "line_s": 56,
-        "line_e": 56
-      },
-      {
-        "def_id": "$def_9",
-        "blob_id": "$fid_0",
-        "tag_id": "$prior_tag_2",
-        "ast_id": "$ast_2",
-        "name": "LINUX_LOCKD_BIND_H",
-        "type_id": "75 (CPPro_define)",
-        "linkage": 5,
-        "line_s": 10,
-        "line_e": 10
-      },
-      {
-        "def_id": "$def_10",
-        "blob_id": "$fid_0",
-        "tag_id": "$prior_tag_12",
-        "ast_id": "$ast_24",
-        "name": "nlmsvc_binding",
-        "type_id": "28 (C_structdecl)",
-        "linkage": 0,
-        "line_s": 25,
-        "line_e": 30
-      },
-      {
-        "def_id": "$def_11",
-        "blob_id": "$fid_0",
-        "tag_id": "$prior_tag_13",
-        "ast_id": "$ast_25",
-        "name": "nlmsvc_ops",
-        "type_id": "1 (C_Compound)",
-        "linkage": 2,
-        "line_s": 32,
-        "line_e": 32
-      },
-      {
-        "def_id": "$def_12",
-        "blob_id": "$fid_0",
-        "tag_id": "$tag_24",
-        "ast_id": "$ast_55",
-        "name": "nlmclnt_initdata",
-        "type_id": "28 (C_structdecl)",
-        "linkage": 0,
-        "line_s": 38,
-        "line_e": 45
-      },
-      {
-        "def_id": "$def_13",
-        "blob_id": "$fid_0",
-        "tag_id": "$prior_tag_17",
-        "ast_id": "$ast_58",
-        "name": "nlmclnt_init",
-        "type_id": "21 (C_functionprotodecl)",
-        "linkage": 2,
-        "line_s": 51,
-        "line_e": 51
-      },
-      {
-        "def_id": "$def_14",
-        "blob_id": "$fid_0",
-        "tag_id": "$prior_tag_18",
-        "ast_id": "$ast_46",
-        "name": "nlmclnt_done",
-        "type_id": "21 (C_functionprotodecl)",
-        "linkage": 2,
-        "line_s": 52,
-        "line_e": 52
-      },
-      {
-        "def_id": "$def_15",
-        "blob_id": "$fid_0",
-        "tag_id": "$prior_tag_19",
-        "ast_id": "$ast_50",
-        "name": "nlmclnt_proc",
-        "type_id": "21 (C_functionprotodecl)",
-        "linkage": 2,
-        "line_s": 54,
-        "line_e": 55
-      },
-      {
-        "def_id": "$def_16",
-        "blob_id": "$fid_0",
+        "blob_id": "$fid_1",
         "tag_id": "$prior_tag_20",
         "ast_id": "$ast_51",
         "name": "lockd_up",
@@ -1385,8 +1485,17 @@
         "line_e": 56
       },
       {
-        "def_id": "$def_17",
         "blob_id": "$fid_0",
+        "tag_id": "$prior_tag_21",
+        "ast_id": "$ast_52",
+        "name": "lockd_down",
+        "type_id": "21 (C_functionprotodecl)",
+        "linkage": 2,
+        "line_s": 56,
+        "line_e": 56
+      },
+      {
+        "blob_id": "$fid_1",
         "tag_id": "$prior_tag_21",
         "ast_id": "$ast_52",
         "name": "lockd_down",
@@ -1394,11 +1503,30 @@
         "linkage": 2,
         "line_s": 57,
         "line_e": 57
+      },
+      {
+        "blob_id": "$fid_1",
+        "tag_id": "$tag_24",
+        "ast_id": "$ast_55",
+        "name": "nlmclnt_initdata",
+        "type_id": "28 (C_structdecl)",
+        "linkage": 0,
+        "line_s": 38,
+        "line_e": 45
+      },
+      {
+        "blob_id": "$fid_1",
+        "tag_id": "$prior_tag_17",
+        "ast_id": "$ast_58",
+        "name": "nlmclnt_init",
+        "type_id": "21 (C_functionprotodecl)",
+        "linkage": 2,
+        "line_s": 51,
+        "line_e": 51
       }
     ],
     "m_symbol_ref": [
       {
-        "ref_id": "$ref_0",
         "blob_id": "$fid_0",
         "tag_id": "$prior_tag_10",
         "ast_id": "$ast_10",
@@ -1408,7 +1536,15 @@
         "char_s": 1
       },
       {
-        "ref_id": "$ref_1",
+        "blob_id": "$fid_1",
+        "tag_id": "$prior_tag_10",
+        "ast_id": "$ast_10",
+        "target_fnid": 2,
+        "role": "1 (Declaration)",
+        "line": 20,
+        "char_s": 1
+      },
+      {
         "blob_id": "$fid_0",
         "tag_id": "$prior_tag_12",
         "ast_id": "$ast_12",
@@ -1418,7 +1554,15 @@
         "char_s": 27
       },
       {
-        "ref_id": "$ref_2",
+        "blob_id": "$fid_1",
+        "tag_id": "$prior_tag_12",
+        "ast_id": "$ast_12",
+        "target_fnid": 0,
+        "role": "2 (TypeUsage)",
+        "line": 26,
+        "char_s": 27
+      },
+      {
         "blob_id": "$fid_0",
         "tag_id": "$prior_tag_12",
         "ast_id": "$ast_14",
@@ -1428,7 +1572,15 @@
         "char_s": 14
       },
       {
-        "ref_id": "$ref_3",
+        "blob_id": "$fid_1",
+        "tag_id": "$prior_tag_12",
+        "ast_id": "$ast_14",
+        "target_fnid": 0,
+        "role": "2 (TypeUsage)",
+        "line": 27,
+        "char_s": 14
+      },
+      {
         "blob_id": "$fid_0",
         "tag_id": "$prior_tag_12",
         "ast_id": "$ast_16",
@@ -1438,17 +1590,6 @@
         "char_s": 14
       },
       {
-        "ref_id": "$ref_4",
-        "blob_id": "$fid_0",
-        "tag_id": "$prior_tag_12",
-        "ast_id": "$ast_18",
-        "target_fnid": 0,
-        "role": "2 (TypeUsage)",
-        "line": 26,
-        "char_s": 2
-      },
-      {
-        "ref_id": "$ref_5",
         "blob_id": "$fid_0",
         "tag_id": "$prior_tag_12",
         "ast_id": "$ast_16",
@@ -1458,7 +1599,42 @@
         "char_s": 26
       },
       {
-        "ref_id": "$ref_6",
+        "blob_id": "$fid_1",
+        "tag_id": "$prior_tag_12",
+        "ast_id": "$ast_16",
+        "target_fnid": 0,
+        "role": "2 (TypeUsage)",
+        "line": 28,
+        "char_s": 14
+      },
+      {
+        "blob_id": "$fid_1",
+        "tag_id": "$prior_tag_12",
+        "ast_id": "$ast_16",
+        "target_fnid": 0,
+        "role": "2 (TypeUsage)",
+        "line": 29,
+        "char_s": 26
+      },
+      {
+        "blob_id": "$fid_0",
+        "tag_id": "$prior_tag_12",
+        "ast_id": "$ast_18",
+        "target_fnid": 0,
+        "role": "2 (TypeUsage)",
+        "line": 26,
+        "char_s": 2
+      },
+      {
+        "blob_id": "$fid_1",
+        "tag_id": "$prior_tag_12",
+        "ast_id": "$ast_18",
+        "target_fnid": 0,
+        "role": "2 (TypeUsage)",
+        "line": 26,
+        "char_s": 2
+      },
+      {
         "blob_id": "$fid_0",
         "tag_id": "$prior_tag_13",
         "ast_id": "$ast_24",
@@ -1468,7 +1644,15 @@
         "char_s": 15
       },
       {
-        "ref_id": "$ref_7",
+        "blob_id": "$fid_1",
+        "tag_id": "$prior_tag_13",
+        "ast_id": "$ast_24",
+        "target_fnid": 0,
+        "role": "2 (TypeUsage)",
+        "line": 32,
+        "char_s": 15
+      },
+      {
         "blob_id": "$fid_0",
         "tag_id": "$prior_tag_15",
         "ast_id": "$ast_29",
@@ -1478,7 +1662,15 @@
         "char_s": 15
       },
       {
-        "ref_id": "$ref_8",
+        "blob_id": "$fid_1",
+        "tag_id": "$tag_24",
+        "ast_id": "$ast_29",
+        "target_fnid": 0,
+        "role": "2 (TypeUsage)",
+        "line": 40,
+        "char_s": 15
+      },
+      {
         "blob_id": "$fid_0",
         "tag_id": "$prior_tag_15",
         "ast_id": "$ast_32",
@@ -1488,7 +1680,15 @@
         "char_s": 2
       },
       {
-        "ref_id": "$ref_9",
+        "blob_id": "$fid_1",
+        "tag_id": "$tag_24",
+        "ast_id": "$ast_32",
+        "target_fnid": 0,
+        "role": "2 (TypeUsage)",
+        "line": 41,
+        "char_s": 2
+      },
+      {
         "blob_id": "$fid_0",
         "tag_id": "$prior_tag_15",
         "ast_id": "$ast_36",
@@ -1498,7 +1698,15 @@
         "char_s": 2
       },
       {
-        "ref_id": "$ref_10",
+        "blob_id": "$fid_1",
+        "tag_id": "$tag_24",
+        "ast_id": "$ast_36",
+        "target_fnid": 0,
+        "role": "2 (TypeUsage)",
+        "line": 43,
+        "char_s": 2
+      },
+      {
         "blob_id": "$fid_0",
         "tag_id": "$prior_tag_17",
         "ast_id": "$ast_38",
@@ -1508,7 +1716,6 @@
         "char_s": 51
       },
       {
-        "ref_id": "$ref_11",
         "blob_id": "$fid_0",
         "tag_id": "$prior_tag_17",
         "ast_id": "$ast_42",
@@ -1518,17 +1725,6 @@
         "char_s": 15
       },
       {
-        "ref_id": "$ref_12",
-        "blob_id": "$fid_0",
-        "tag_id": "$prior_tag_18",
-        "ast_id": "$ast_42",
-        "target_fnid": 0,
-        "role": "2 (TypeUsage)",
-        "line": 51,
-        "char_s": 33
-      },
-      {
-        "ref_id": "$ref_13",
         "blob_id": "$fid_0",
         "tag_id": "$prior_tag_19",
         "ast_id": "$ast_42",
@@ -1538,148 +1734,25 @@
         "char_s": 32
       },
       {
-        "ref_id": "$ref_14",
-        "blob_id": "$fid_0",
-        "tag_id": "$prior_tag_19",
-        "ast_id": "$ast_48",
-        "target_fnid": 0,
-        "role": "2 (TypeUsage)",
-        "line": 54,
-        "char_s": 13
-      },
-      {
-        "ref_id": "$ref_15",
-        "blob_id": "$fid_0",
-        "tag_id": "$prior_tag_10",
-        "ast_id": "$ast_10",
-        "target_fnid": 2,
-        "role": "1 (Declaration)",
-        "line": 20,
-        "char_s": 1
-      },
-      {
-        "ref_id": "$ref_16",
-        "blob_id": "$fid_0",
-        "tag_id": "$prior_tag_12",
-        "ast_id": "$ast_12",
-        "target_fnid": 0,
-        "role": "2 (TypeUsage)",
-        "line": 26,
-        "char_s": 27
-      },
-      {
-        "ref_id": "$ref_17",
-        "blob_id": "$fid_0",
-        "tag_id": "$prior_tag_12",
-        "ast_id": "$ast_14",
-        "target_fnid": 0,
-        "role": "2 (TypeUsage)",
-        "line": 27,
-        "char_s": 14
-      },
-      {
-        "ref_id": "$ref_18",
-        "blob_id": "$fid_0",
-        "tag_id": "$prior_tag_12",
-        "ast_id": "$ast_16",
-        "target_fnid": 0,
-        "role": "2 (TypeUsage)",
-        "line": 28,
-        "char_s": 14
-      },
-      {
-        "ref_id": "$ref_19",
-        "blob_id": "$fid_0",
-        "tag_id": "$prior_tag_12",
-        "ast_id": "$ast_18",
-        "target_fnid": 0,
-        "role": "2 (TypeUsage)",
-        "line": 26,
-        "char_s": 2
-      },
-      {
-        "ref_id": "$ref_20",
-        "blob_id": "$fid_0",
-        "tag_id": "$prior_tag_12",
-        "ast_id": "$ast_16",
-        "target_fnid": 0,
-        "role": "2 (TypeUsage)",
-        "line": 29,
-        "char_s": 26
-      },
-      {
-        "ref_id": "$ref_21",
-        "blob_id": "$fid_0",
-        "tag_id": "$prior_tag_13",
-        "ast_id": "$ast_24",
-        "target_fnid": 0,
-        "role": "2 (TypeUsage)",
-        "line": 32,
-        "char_s": 15
-      },
-      {
-        "ref_id": "$ref_22",
-        "blob_id": "$fid_0",
-        "tag_id": "$tag_24",
-        "ast_id": "$ast_29",
-        "target_fnid": 0,
-        "role": "2 (TypeUsage)",
-        "line": 40,
-        "char_s": 15
-      },
-      {
-        "ref_id": "$ref_23",
-        "blob_id": "$fid_0",
-        "tag_id": "$tag_24",
-        "ast_id": "$ast_32",
-        "target_fnid": 0,
-        "role": "2 (TypeUsage)",
-        "line": 41,
-        "char_s": 2
-      },
-      {
-        "ref_id": "$ref_24",
-        "blob_id": "$fid_0",
-        "tag_id": "$tag_24",
-        "ast_id": "$ast_36",
-        "target_fnid": 0,
-        "role": "2 (TypeUsage)",
-        "line": 43,
-        "char_s": 2
-      },
-      {
-        "ref_id": "$ref_25",
-        "blob_id": "$fid_0",
-        "tag_id": "$prior_tag_17",
-        "ast_id": "$ast_55",
-        "target_fnid": 0,
-        "role": "2 (TypeUsage)",
-        "line": 51,
-        "char_s": 51
-      },
-      {
-        "ref_id": "$ref_26",
-        "blob_id": "$fid_0",
-        "tag_id": "$prior_tag_17",
-        "ast_id": "$ast_42",
-        "target_fnid": 0,
-        "role": "2 (TypeUsage)",
-        "line": 51,
-        "char_s": 15
-      },
-      {
-        "ref_id": "$ref_27",
         "blob_id": "$fid_0",
         "tag_id": "$prior_tag_18",
         "ast_id": "$ast_42",
         "target_fnid": 0,
         "role": "2 (TypeUsage)",
-        "line": 52,
+        "line": 51,
         "char_s": 33
       },
       {
-        "ref_id": "$ref_28",
-        "blob_id": "$fid_0",
+        "blob_id": "$fid_1",
+        "tag_id": "$prior_tag_17",
+        "ast_id": "$ast_42",
+        "target_fnid": 0,
+        "role": "2 (TypeUsage)",
+        "line": 51,
+        "char_s": 15
+      },
+      {
+        "blob_id": "$fid_1",
         "tag_id": "$prior_tag_19",
         "ast_id": "$ast_42",
         "target_fnid": 0,
@@ -1688,36 +1761,40 @@
         "char_s": 32
       },
       {
-        "ref_id": "$ref_29",
+        "blob_id": "$fid_1",
+        "tag_id": "$prior_tag_18",
+        "ast_id": "$ast_42",
+        "target_fnid": 0,
+        "role": "2 (TypeUsage)",
+        "line": 52,
+        "char_s": 33
+      },
+      {
         "blob_id": "$fid_0",
+        "tag_id": "$prior_tag_19",
+        "ast_id": "$ast_48",
+        "target_fnid": 0,
+        "role": "2 (TypeUsage)",
+        "line": 54,
+        "char_s": 13
+      },
+      {
+        "blob_id": "$fid_1",
         "tag_id": "$prior_tag_19",
         "ast_id": "$ast_48",
         "target_fnid": 0,
         "role": "2 (TypeUsage)",
         "line": 55,
         "char_s": 13
-      }
-    ],
-    "m_git_ref": [
-      {
-        "ref_id": "$ref_0",
-        "repo_id": 0,
-        "ref_type": 4,
-        "ref_name": "v2.6.28",
-        "commit_id": 1,
-        "tagger_id": null,
-        "tagger_date": null,
-        "tag_message": null
       },
       {
-        "ref_id": "$ref_1",
-        "repo_id": 0,
-        "ref_type": 4,
-        "ref_name": "v2.6.29",
-        "commit_id": 2,
-        "tagger_id": null,
-        "tagger_date": null,
-        "tag_message": null
+        "blob_id": "$fid_1",
+        "tag_id": "$prior_tag_17",
+        "ast_id": "$ast_55",
+        "target_fnid": 0,
+        "role": "2 (TypeUsage)",
+        "line": 51,
+        "char_s": 51
       }
     ]
   }

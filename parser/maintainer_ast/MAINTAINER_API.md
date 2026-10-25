@@ -162,6 +162,8 @@ To resolve file ownership across the entire kernel repository:
    - Compiles `F:` file patterns and `X:` exclude patterns into normalized globs.
    - Evaluates each active file path in the tree against all sections in priority order.
    - Specific directory patterns (e.g. `fs/ext4/`) take precedence over broad generic patterns (e.g. `fs/`).
+   - Indexed lookup: exact paths and directory prefixes are dictionary lookups; sections with wildcard patterns are filed under the directory part of each wildcard's literal prefix (`drivers/net/3c505*` -> `drivers/net/`), so a file only tests the wildcard sections filed under its ancestor directories plus those whose wildcards can match anywhere (e.g. `*/net/*`), still in section order. Sections without any `F:` pattern are skipped (they cannot match). On v3.0 (36,783 files, 925 sections) matching takes 0.5 s instead of 6.6 s with identical results.
+   - `processing_maintainer_files()` skips files already mapped for the same MAINTAINERS blob in an earlier version.
 3. **Bridge Population**:
    - Inserts resolved `(maintainers_blob_id, fnid, sec_id)` triplets into `m_maintainer_file`.
    - Deduplicates `(fnid, sec_id)` pairs in-memory using a tracking set to prevent duplicate primary key violations when multiple repository paths resolve to the same file.

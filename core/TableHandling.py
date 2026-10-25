@@ -284,6 +284,8 @@ class ChangeSet:
         self.symbol_dict: dict[tuple[str, int], int] = {}
         self.pending_symbol_refs: list[tuple[Any, int, int, int]] = []
         self.last_tag_ref: Any = None
+        # Symbol items recorded while parsing, emitted by core.SymbolRows.finish() when the parse ends
+        self.symbol_rows: Any = None
         self._executing: bool = False
         self.foreign_deps: set[str] = set()
         self.batch_cs_dict: dict[str, ChangeSet] | None = None
@@ -403,10 +405,23 @@ class ChangeSet:
                         if f_names and sym_name in f_names:
                             return to_safe_data(f_names[sym_name])
 
-                # 0b. Fast check: Phase 2 global symbol table snapshot (if active)
+                # 0b. Fast check: file-scoped shared memory table (worker pre-resolution snapshot, else the
+                # parent's Stage 2 segments). Same semantics as step 0: exact (name, type), then name, in rel_file.
                 sym_key = (sym_name, sym_type)
                 phase2_syms = getattr(self, "_phase2_symbols", None)
-                if phase2_syms:
+                scoped_syms = phase2_syms if hasattr(phase2_syms, "get_file_symbol") else None
+                if scoped_syms is None and phase2_syms is None and self.gp:
+                    gp_shared = getattr(self.gp, "_shared_symbols", None)
+                    if hasattr(gp_shared, "get_file_symbol"):
+                        scoped_syms = gp_shared
+                if scoped_syms is not None:
+                    scoped_id = scoped_syms.get_file_symbol(rel_file, sym_name, sym_type)
+                    if scoped_id is None:
+                        scoped_id = scoped_syms.get_file_name(rel_file, sym_name)
+                    if scoped_id is not None:
+                        return to_safe_data(scoped_id)
+                elif phase2_syms:
+                    # Plain (name, type) snapshot maps: not file-scoped, kept for direct callers
                     if sym_key in phase2_syms:
                         return to_safe_data(phase2_syms[sym_key])
                     phase2_names = getattr(self, "_phase2_names", None)
@@ -462,8 +477,20 @@ class ChangeSet:
                             if val is not None:
                                 return to_safe_data(val)
 
-                # 1c. DB-backed symbol lookup for unchanged files (with caching into gp.file_symbols)
-                if self.gp and hasattr(self.gp, "get_file_symbols_from_db"):
+                # In-flight check (Rule 24): a changed file that has not executed yet has published no
+                # symbols, and the DB still describes its previous version, so neither may answer for it.
+                changed_paths = getattr(self.gp, "_changed_paths_set", None) if self.gp else None
+                is_completed = bool(self.gp and (
+                    rel_file in getattr(self.gp, "completed_paths", ())
+                    or (hasattr(self.gp, "file_symbols") and rel_file in self.gp.file_symbols)
+                ))
+                is_in_flight_changed = bool(changed_paths and rel_file in changed_paths)
+                cs_dict = getattr(self.gp, "ChangeSet_Dict", None) if self.gp else None
+                is_in_dict = bool(cs_dict and rel_file in cs_dict)
+                is_active_foreign = (is_in_flight_changed or is_in_dict) and not is_completed
+
+                # 1c. DB-backed symbol lookup for unchanged or already executed files (cached into gp.file_symbols)
+                if not is_active_foreign and self.gp and hasattr(self.gp, "get_file_symbols_from_db"):
                     db_syms = self.gp.get_file_symbols_from_db(rel_file)
                     if db_syms:
                         if hasattr(self.gp, "file_symbols"):
@@ -487,36 +514,11 @@ class ChangeSet:
                     safe_sym_type = to_safe_data(sym_type)
                     safe_notbind_type = to_safe_data(notbind_type)
 
-                    # Check whether target file is an active incomplete ChangeSet in this update (Rule 24)
-                    changed_paths = getattr(self.gp, "_changed_paths_set", None) if self.gp else None
-                    is_completed = bool(self.gp and (
-                        rel_file in getattr(self.gp, "completed_paths", ())
-                        or (hasattr(self.gp, "file_symbols") and rel_file in self.gp.file_symbols)
-                    ))
-                    is_in_flight_changed = bool(changed_paths and rel_file in changed_paths)
-                    cs_dict = getattr(self.gp, "ChangeSet_Dict", None) if self.gp else None
-                    is_in_dict = bool(cs_dict and rel_file in cs_dict)
-                    is_active_foreign = (is_in_flight_changed or is_in_dict) and not is_completed
-
                     # If the target file is an active incomplete ChangeSet, its symbols have not been
                     # published yet. Suspend immediately without scanning queued_set or querying the DB.
                     if is_active_foreign and not force_stubs:
                         self.blocked_on = rel_file
                         return None
-                    # Zero-copy shared memory symbol lookup fast-path
-                    gp_shared_syms = getattr(self.gp, "_shared_symbols", None) if self.gp else None
-                    if gp_shared_syms is not None and safe_sym_name is not None:
-                        exact_id = gp_shared_syms.get_symbol(safe_sym_name, safe_sym_type)
-                        if exact_id is not None:
-                            return to_safe_data(exact_id)
-                        if safe_notbind_type != safe_sym_type:
-                            notbind_id = gp_shared_syms.get_symbol(safe_sym_name, safe_notbind_type)
-                            if notbind_id is not None:
-                                return to_safe_data(notbind_id)
-                        name_id = gp_shared_syms.get_name(safe_sym_name)
-                        if name_id is not None:
-                            return to_safe_data(name_id)
-
                     # Fast-path check via in-memory staged symbol index in GreatProcessor
                     gp_staged_syms = getattr(self.gp, "_ast_staged_symbols", None) if self.gp else None
                     gp_staged_names = getattr(self.gp, "_ast_staged_names", None) if self.gp else None
@@ -569,7 +571,10 @@ class ChangeSet:
                         if gp_neg_cache is not None and neg_key is not None:
                             gp_neg_cache.add(neg_key)
 
-                    if force_stubs or not is_active_foreign:
+                    # Parsing workers never commit their TableEngine: a stub staged there would carry a
+                    # worker-local id with no m_ast row, so the parent stages it when it executes the ref.
+                    is_worker = bool(self.gp and getattr(self.gp, "_is_worker", False))
+                    if (force_stubs or not is_active_foreign) and not is_worker:
                         set_res = G.TE.set(m_ast.table_id, (None, safe_sym_name, safe_notbind_type))
                         if set_res is not None and len(set_res) > query[1] and set_res[query[1]] is not None:
                             stub_id = set_res[query[1]]
@@ -1291,12 +1296,13 @@ class ChangeSet:
             if not has_unresolved:
                 self.foreign_deps.discard(rel_file)
 
-    def pre_resolve_operations(self, resolved_symbols_map: dict[tuple[str, int], int], resolved_names_map: dict[str, int] | None = None) -> list[OperationType]:
+    def pre_resolve_operations(self, resolved_symbols_map: Any, resolved_names_map: dict[str, int] | None = None) -> list[OperationType]:
         """Pre-resolve foreign references and unpack dynamic views on worker cores during Phase 2.
 
         Args:
-            resolved_symbols_map: Snapshot of known resolved symbols {(sym_name, sym_type): ast_id}.
-            resolved_names_map: Optional snapshot of symbol names to ast_id {sym_name: ast_id}.
+            resolved_symbols_map: File-scoped shared table (`SharedSymbolReader` / `SharedSymbolChain`,
+                queried per target file), or a plain snapshot {(sym_name, sym_type): ast_id}.
+            resolved_names_map: Optional plain snapshot of symbol names to ast_id {sym_name: ast_id}.
 
         Returns:
             Pre-resolved list of operations in self.cs.
@@ -1307,7 +1313,7 @@ class ChangeSet:
         self._phase2_symbols = resolved_symbols_map
         if resolved_names_map is not None:
             self._phase2_names = resolved_names_map
-        elif self._phase2_symbols:
+        elif self._phase2_symbols and not hasattr(self._phase2_symbols, "get_file_symbol"):
             self._phase2_names = {k[0]: v for k, v in self._phase2_symbols.items()}
 
         # Single pass: pre-unpack dynamic views and pre-resolve foreign references
@@ -1411,6 +1417,9 @@ class ChangeSet:
             logger.error(f"FILE_ERROR for '{self.file_operation}'={self.current_path}")
             logger.error(e)
             self.cs = []
+            self.symbol_rows = None
+        from core.SymbolRows import finish as finish_symbol_rows
+        finish_symbol_rows(self)
 
     def clear_bloat(self) -> None:
         """Remove un-picklable and ephemeral parsing structures before IPC serialization."""
@@ -1424,6 +1433,7 @@ class ChangeSet:
         self.active_tag_list = None
         self.pending_symbol_refs = []
         self.last_tag_ref = None
+        self.symbol_rows = None
         self._bridge_maps = set()
         self.batch_cs_dict = None
         self.blocked_on = None

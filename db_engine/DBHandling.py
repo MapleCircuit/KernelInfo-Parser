@@ -102,11 +102,13 @@ Any database driver class (e.g., MariaDB, PostgreSQL, SQLite, DuckDB) assigned t
 """
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
+import re
 import ssl
 import time
-from typing import TYPE_CHECKING, Any, Sequence, Self
+from typing import TYPE_CHECKING, Any, Iterator, Sequence, Self
 from types import TracebackType
 import mysql.connector
 
@@ -149,7 +151,7 @@ from core.globalstuff import (
     PointerType,
 )
 
-from db_engine.base import BaseDBEngine
+from db_engine.base import BaseDBEngine, TableCommitStat
 
 if TYPE_CHECKING:
     from core.TableHandling import Table
@@ -159,11 +161,34 @@ MAX_JOIN_TABLES = 50
 CHUNK_JOIN_SIZE = 30
 MAX_CANDIDATE_BATCH = 500
 
+# apply_server_tuning(): the I/O ceiling goes first (innodb_io_capacity may not exceed it); sizes and I/O
+# capacities are only ever raised, never lowered below what the server already runs with
+_TUNING_FIRST = ("innodb_io_capacity_max",)
+_TUNING_GROW_ONLY = frozenset({"innodb_buffer_pool_size", "innodb_log_file_size", "innodb_io_capacity", "innodb_io_capacity_max"})
+_SIZE_SUFFIXES = {"K": 1024, "M": 1024**2, "G": 1024**3, "T": 1024**4}
+
+
+def parse_server_setting(value: Any) -> int | str:
+    """Server variable value from config: an int, a size with a K/M/G/T suffix (`"8G"`), or a plain string."""
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int):
+        return value
+    text = str(value).strip()
+    m = re.fullmatch(r"(\d+)\s*([KMGTkmgt])?", text)
+    if m:
+        return int(m.group(1)) * _SIZE_SUFFIXES.get((m.group(2) or "").upper(), 1)
+    return text
+
 logger = logging.getLogger(__name__)
 
 
 class MariaDB(BaseDBEngine):
     """MariaDB / MySQL implementation of the Database Backend Contract."""
+
+    # commit_tables_parallel(dedicated=True) only uses its own connections, so a background thread may run it
+    supports_background_commit = True
+    _in_txn = False
 
     def __init__(self) -> None:
         """Initialize database connection parameters and open session.
@@ -186,6 +211,8 @@ class MariaDB(BaseDBEngine):
         self.host = os.getenv("DB_HOST")
         self.port = int(os.getenv("DB_PORT", "3306"))
         self.ssl_disabled = os.getenv("DB_SSL_DISABLED", "").lower() in ("true", "1", "yes")
+        # Inside transaction(): a dropped connection fails the transaction instead of silently reconnecting
+        self._in_txn = False
         self.cnx = self.connect_sql()
         self.cursor = self.cnx.cursor()
         self._select_sql_cache: dict[tuple[int, tuple[bool, ...]], str] = {}
@@ -193,6 +220,59 @@ class MariaDB(BaseDBEngine):
         self._view_sql_cache: dict[tuple[JoinsType, tuple[bool, ...]], str] = {}
         self._next_id_sql_cache: dict[int, str] = {}
         self._init_session()
+
+    def apply_server_tuning(self, settings: dict[str, Any]) -> list[str]:
+        """Raise global server variables to `settings` with `SET GLOBAL` (needs the SUPER privilege).
+
+        Args:
+            settings: `{variable_name: value}`; sizes may carry a K/M/G/T suffix. Variables in
+                `_TUNING_GROW_ONLY` are never lowered.
+
+        Outputs:
+            One note per variable that changed or could not be changed (unchanged variables are omitted).
+            Runtime changes last until the server restarts.
+        """
+        notes: list[str] = []
+        self.check_if_connected()
+        for name in sorted(settings, key=lambda n: (n not in _TUNING_FIRST, n)):
+            if not re.fullmatch(r"[a-z0-9_]+", name):
+                notes.append(f"{name}: skipped (not a server variable name)")
+                continue
+            want = parse_server_setting(settings[name])
+            try:
+                self.cursor.execute(f"SELECT @@GLOBAL.{name}")
+                row = self.cursor.fetchone()
+            except mysql.connector.Error as e:
+                notes.append(f"{name}: not available on this server ({getattr(e, 'msg', e)})")
+                continue
+            current = row[0] if row else None
+            if isinstance(current, (bytes, bytearray)):
+                current = current.decode()
+            if isinstance(current, str) and current.isdigit():
+                current = int(current)
+            if isinstance(want, str) and isinstance(current, str) and want.lower() == current.lower():
+                continue
+            if current == want or (
+                name in _TUNING_GROW_ONLY and isinstance(current, int) and isinstance(want, int) and current >= want
+            ):
+                continue
+            try:
+                self.cursor.execute(f"SET GLOBAL {name} = %s", (want,))
+                self.cursor.execute(f"SELECT @@GLOBAL.{name}")
+                row = self.cursor.fetchone()
+            except mysql.connector.Error as e:
+                notes.append(f"{name}: kept {current} ({getattr(e, 'msg', e)})")
+                continue
+            now = row[0] if row else None
+            if isinstance(now, int) and isinstance(want, int) and now < want:
+                # e.g. innodb_buffer_pool_size beyond innodb_buffer_pool_size_max, which only a restart raises
+                limit = " (raise it in the server configuration and restart)"
+                if name == "innodb_buffer_pool_size":
+                    limit = " (innodb_buffer_pool_size_max is fixed at server start: set the size in my.cnf and restart)"
+                notes.append(f"{name}: capped at {now} instead of {want}{limit}")
+            else:
+                notes.append(f"{name}: {current} -> {now if now is not None else want}")
+        return notes
 
     def _init_session(self) -> None:
         """Set session parameters and attempt global packet configuration.
@@ -345,22 +425,37 @@ class MariaDB(BaseDBEngine):
 
         Process:
             Checks active connection via `ping(reconnect=True)`. If disconnected, attempts up to 3 reconnects,
-            re-creating the cursor and re-initializing session state.
+            re-creating the cursor and re-initializing session state. A reconnect made by the ping itself also
+            re-initializes the session (the new session would otherwise lack `sql_mode` and the disabled checks).
+            Inside `transaction()` nothing reconnects: the server rolled the transaction back, so it fails.
 
         Outputs:
             None. Guarantees healthy connection or raises ConnectionError.
 
         Raises:
-            ConnectionError: If connection cannot be re-established after 3 attempts.
+            ConnectionError: If connection cannot be re-established after 3 attempts, or was lost in a transaction.
         """
+        in_txn = getattr(self, "_in_txn", False)
         if getattr(self, "cnx", None) is not None:
+            if in_txn:
+                try:
+                    self.cnx.ping(reconnect=False)
+                    return
+                except Exception as e:
+                    raise ConnectionError(f"Database connection lost inside a transaction: {e}") from e
             try:
+                conn_id = getattr(self.cnx, "connection_id", None)
                 self.cnx.ping(reconnect=True, attempts=3, delay=1)
-                if getattr(self, "cursor", None) is None:
+                if getattr(self.cnx, "connection_id", None) != conn_id:
+                    self.cursor = self.cnx.cursor()
+                    self._init_session()
+                elif getattr(self, "cursor", None) is None:
                     self.cursor = self.cnx.cursor()
                 return
             except Exception:
                 self.close()
+        if in_txn:
+            raise ConnectionError("Database connection lost inside a transaction")
 
         for attempt in range(3):
             print(f"No SQL connection. Reconnection attempt {attempt + 1}/3...")
@@ -373,6 +468,32 @@ class MariaDB(BaseDBEngine):
                 if attempt == 2:
                     raise ConnectionError(f"Failed to reconnect to database after 3 attempts: {e}") from e
                 time.sleep(0.5 * (attempt + 1))
+
+    @contextlib.contextmanager
+    def transaction(self) -> Iterator[Self]:
+        """Run the block's `insert()`/`update()` calls as one transaction, committed on exit.
+
+        Inside it the per-chunk reconnect-and-retry is disabled: a lost connection rolls the whole transaction
+        back on the server, so it fails (`ConnectionError` or the driver error) and the caller retries all of it.
+        """
+        self.check_if_connected()
+        self.cnx.autocommit = False
+        self._in_txn = True
+        try:
+            yield self
+            self.cnx.commit()
+        except BaseException:
+            try:
+                self.cnx.rollback()
+            except Exception:
+                pass
+            raise
+        finally:
+            self._in_txn = False
+            try:
+                self.cnx.autocommit = True
+            except Exception:
+                pass
 
     def test_tables(self, tables: Sequence[Table] | Table) -> list[str] | None:
         """Test existence of registered schema tables in database catalog.
@@ -506,6 +627,21 @@ class MariaDB(BaseDBEngine):
         self.cursor.execute(self._next_id_sql_cache[table.table_id])
         return self.cursor.fetchone()[0]
 
+    @staticmethod
+    def _insert_sql(table: Table) -> str:
+        """Build the parameterized INSERT statement for `table`.
+
+        For `idempotent_pk` tables, rows whose primary key already exists are skipped individually via a
+        no-op `ON DUPLICATE KEY UPDATE`: a plain multi-row INSERT fails as a whole on one duplicate, which
+        would drop every other row of the chunk. (`INSERT IGNORE` would skip the same rows, but
+        mysql-connector stops batching it into multi-row statements and sends one round trip per row.)
+        """
+        sql = f"INSERT INTO `{table.table_name}` VALUES ({','.join(('%s',) * table.length)})"
+        if getattr(table, "idempotent_pk", False) and table.init_primary:
+            pk_col = table.init_primary[0]
+            sql += f" ON DUPLICATE KEY UPDATE `{pk_col}` = `{pk_col}`"
+        return sql
+
     def insert(
         self,
         table: Table,
@@ -518,7 +654,8 @@ class MariaDB(BaseDBEngine):
             data: Single row tuple or batch tuple of row tuples.
 
         Process:
-            1. Constructs parameterized `INSERT INTO table VALUES (%s, ...)`.
+            1. Constructs parameterized `INSERT INTO table VALUES (%s, ...)` (`_insert_sql()`; `idempotent_pk`
+               tables add a no-op `ON DUPLICATE KEY UPDATE` so only already-present rows are skipped).
             2. If `data` is a batch tuple, chunks into 1000-row slices and executes `executemany` with auto-retry.
             3. If `data` is a single row tuple, executes `execute` with auto-retry.
             4. Commits transaction.
@@ -529,7 +666,7 @@ class MariaDB(BaseDBEngine):
         if not data:
             return
 
-        sql = f"INSERT INTO `{table.table_name}` VALUES ({','.join(('%s',) * table.length)})"
+        sql = self._insert_sql(table)
 
         has_large_cols = any(
             any(t in col[1].upper() for t in ("TEXT", "BLOB", "LONGTEXT", "MEDIUMTEXT"))
@@ -566,6 +703,8 @@ class MariaDB(BaseDBEngine):
                         _exec_chunk(chunk_data[mid:])
                         return
                     if isinstance(err, (mysql.connector.OperationalError, mysql.connector.InterfaceError)):
+                        if self._in_txn:
+                            raise
                         self.close()
                         if attempt == 2:
                             raise
@@ -578,6 +717,8 @@ class MariaDB(BaseDBEngine):
                     )
                     raise
                 except (OSError, AttributeError):
+                    if self._in_txn:
+                        raise
                     self.close()
                     if attempt == 2:
                         raise
@@ -607,6 +748,8 @@ class MariaDB(BaseDBEngine):
                     if getattr(err, "errno", None) == 1062 or "duplicate entry" in str(err).lower():
                         raise ValueError(f"Duplicate entry for primary key in table '{table.table_name}': {err}") from err
                     if isinstance(err, (mysql.connector.OperationalError, mysql.connector.InterfaceError)):
+                        if self._in_txn:
+                            raise
                         self.close()
                         if attempt == 2:
                             raise
@@ -618,11 +761,15 @@ class MariaDB(BaseDBEngine):
                     )
                     raise
                 except (OSError, AttributeError):
+                    if self._in_txn:
+                        raise
                     self.close()
                     if attempt == 2:
                         raise
                     time.sleep(0.2 * (attempt + 1))
 
+        if self._in_txn:
+            return
         self.check_if_connected()
         try:
             self.cnx.commit()
@@ -695,6 +842,8 @@ class MariaDB(BaseDBEngine):
                         _exec_update_chunk(chunk_data[mid:])
                         return
                     if isinstance(err, (mysql.connector.OperationalError, mysql.connector.InterfaceError)):
+                        if self._in_txn:
+                            raise
                         self.close()
                         if attempt == 2:
                             raise
@@ -706,6 +855,8 @@ class MariaDB(BaseDBEngine):
                     )
                     raise
                 except (OSError, AttributeError):
+                    if self._in_txn:
+                        raise
                     self.close()
                     if attempt == 2:
                         raise
@@ -733,6 +884,8 @@ class MariaDB(BaseDBEngine):
                     break
                 except mysql.connector.Error as err:
                     if isinstance(err, (mysql.connector.OperationalError, mysql.connector.InterfaceError)):
+                        if self._in_txn:
+                            raise
                         self.close()
                         if attempt == 2:
                             raise
@@ -744,77 +897,108 @@ class MariaDB(BaseDBEngine):
                     )
                     raise
                 except (OSError, AttributeError):
+                    if self._in_txn:
+                        raise
                     self.close()
                     if attempt == 2:
                         raise
                     time.sleep(0.2 * (attempt + 1))
 
-        self.check_if_connected()
-        self.cnx.commit()
+        if not self._in_txn:
+            self.check_if_connected()
+            self.cnx.commit()
 
     def commit_tables_parallel(
         self,
         tables_data: Sequence[tuple[Table, Sequence[tuple[SafeDataType, ...]], Sequence[tuple[SafeDataType, ...]]]],
         max_workers: int | None = None,
-    ) -> None:
+        dedicated: bool = False,
+    ) -> list[TableCommitStat]:
         """Commit inserts and updates for multiple tables concurrently across worker connection threads.
 
         Args:
             tables_data: Sequence of tuples `(table, insert_payload, update_payload)`.
             max_workers: Maximum concurrent database worker threads (defaults to min(len(tables_data), 8)).
+            dedicated: Never use this instance's connection, even for a single table (set when the call runs on a
+                background writer thread while the owner keeps using its connection).
 
         Process:
             1. Filters non-empty table payloads.
-            2. If single table, executes directly on current connection.
-            3. If multiple tables, dispatches concurrently via ThreadPoolExecutor.
-            4. Each worker thread opens an isolated MariaDB connection, disables foreign key and unique checks,
-               executes batch operations, commits, and releases resources.
+            2. If single table (and not `dedicated`), executes directly on current connection.
+            3. Otherwise dispatches concurrently via ThreadPoolExecutor. Each table is written by its own MariaDB
+               connection as one transaction (`transaction()`); a lost connection rolls that table back and the
+               table is written again on a new connection (3 attempts).
+            4. If any table fails, the first error is raised once every table has finished, with
+               `failed_table_ids` naming all tables that were not committed (the others are).
+
+        Outputs:
+            One `TableCommitStat` per written table (rows inserted/updated, seconds).
         """
         valid_items = [item for item in tables_data if item[1] or item[2]]
         if not valid_items:
-            return
+            return []
 
-        if len(valid_items) == 1:
+        if len(valid_items) == 1 and not dedicated:
             table, insert_data, update_data = valid_items[0]
-            if insert_data:
-                self.insert(table, insert_data)
-            if update_data:
-                self.update(table, update_data)
-            return
+            t_start = time.perf_counter()
+            try:
+                if insert_data:
+                    self.insert(table, insert_data)
+                if update_data:
+                    self.update(table, update_data)
+            except Exception as e:
+                e.failed_table_ids = {table.table_id}
+                raise
+            return [TableCommitStat(table.table_name, len(insert_data), len(update_data), time.perf_counter() - t_start)]
 
         from concurrent.futures import ThreadPoolExecutor
         workers = min(len(valid_items), max_workers or 8)
+        transient = (mysql.connector.OperationalError, mysql.connector.InterfaceError, ConnectionError, OSError)
 
-        def _worker_commit(item: tuple[Table, Sequence[tuple[SafeDataType, ...]], Sequence[tuple[SafeDataType, ...]]]) -> None:
+        def _commit_table(
+            item: tuple[Table, Sequence[tuple[SafeDataType, ...]], Sequence[tuple[SafeDataType, ...]]],
+        ) -> TableCommitStat:
             table, insert_data, update_data = item
-            worker_db = MariaDB()
-            try:
+            t_start = time.perf_counter()
+            for attempt in range(3):
+                worker_db = None
                 try:
-                    worker_db.cursor.execute("SET unique_checks = 0; SET foreign_key_checks = 0; SET autocommit = 0;")
-                except Exception:
-                    pass
+                    worker_db = MariaDB()
+                    with worker_db.transaction():
+                        if insert_data:
+                            worker_db.insert(table, insert_data)
+                        if update_data:
+                            worker_db.update(table, update_data)
+                    break
+                except transient as e:
+                    if attempt == 2:
+                        raise
+                    logger.warning(
+                        f"Parallel commit of '{table.table_name}' lost its connection ({e}); "
+                        f"rolled back, writing it again (attempt {attempt + 2}/3)..."
+                    )
+                    time.sleep(0.5 * (attempt + 1))
+                finally:
+                    if worker_db is not None:
+                        worker_db.close()
+            return TableCommitStat(table.table_name, len(insert_data), len(update_data), time.perf_counter() - t_start)
 
-                if insert_data:
-                    worker_db.insert(table, insert_data)
-                if update_data:
-                    worker_db.update(table, update_data)
-
-                try:
-                    worker_db.cursor.execute("SET unique_checks = 1; SET foreign_key_checks = 1; SET autocommit = 1;")
-                except Exception:
-                    pass
-                worker_db.cnx.commit()
-            except Exception as e:
-                logger.error(
-                    f"Failed parallel commit on table '{table.table_name}' "
-                    f"({len(insert_data)} inserts, {len(update_data)} updates): {e}"
-                )
-                raise
-            finally:
-                worker_db.close()
-
+        stats: list[TableCommitStat] = []
+        failed: list[tuple[Table, BaseException]] = []
         with ThreadPoolExecutor(max_workers=workers) as executor:
-            list(executor.map(_worker_commit, valid_items))
+            futures = [(item[0], executor.submit(_commit_table, item)) for item in valid_items]
+            for table, future in futures:
+                try:
+                    stats.append(future.result())
+                except Exception as e:
+                    failed.append((table, e))
+        if failed:
+            for table, e in failed:
+                logger.error(f"Failed parallel commit on table '{table.table_name}': {e}")
+            first = failed[0][1]
+            first.failed_table_ids = {table.table_id for table, _ in failed}
+            raise first
+        return stats
 
     def select(
         self,
@@ -1153,6 +1337,23 @@ class MariaDB(BaseDBEngine):
             return [tuple(bytes(val) if isinstance(val, (bytearray, memoryview)) else val for val in row) for row in rows]
         return [tuple(row) for row in rows]
 
+    def select_in(self, table: Table, col_idx: int, values: Sequence[SafeDataType]) -> list[tuple[SafeDataType, ...]]:
+        """Fetch every row of `table` whose column `col_idx` is one of `values` (`IN` queries of 1000 values)."""
+        uniq = list(dict.fromkeys(v for v in values if v is not None))
+        if not uniq:
+            return []
+        col = table.init_columns[col_idx][0]
+        rows: list[tuple[SafeDataType, ...]] = []
+        self.check_if_connected()
+        for start in range(0, len(uniq), 1000):
+            chunk = uniq[start:start + 1000]
+            self.cursor.execute(
+                f"SELECT * FROM `{table.table_name}` WHERE `{col}` IN ({','.join(['%s'] * len(chunk))})",  # noqa: S608
+                tuple(chunk),
+            )
+            rows.extend(tuple(r) for r in self.cursor.fetchall())
+        return rows
+
     def select_preload(
         self,
         table: Table,
@@ -1192,9 +1393,8 @@ class MariaDB(BaseDBEngine):
                     where_clauses.append("`vid` >= %s")
                 elif "vid_s" in col_names:
                     where_clauses.append("`vid_s` >= %s")
-                elif "blob_id" in col_names:
-                    where_clauses.append("`blob_id` >= %s")
                 elif "commit_id" in col_names:
+                    # min_vid is a commit id; blob ids live in another id space and are never filtered by it
                     where_clauses.append("`commit_id` >= %s")
 
             if where_clauses:

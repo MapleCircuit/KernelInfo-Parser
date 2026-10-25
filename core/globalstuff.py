@@ -7,6 +7,7 @@ import re
 from pathlib import Path
 from core.StringWrangler import wrap_lines, render_ansi_box, render_with_indent
 import contextlib
+import types
 import time
 from typing import Self
 from functools import wraps
@@ -151,6 +152,9 @@ class GlobalStuff:
         # TypeCheck
         self.DEBUG_TYPECHECK = False
 
+        # Symbol definitions/references: "tag" stores them once per tag (core/SymbolRows.py), "blob" per blob
+        self.SYMBOL_LAYOUT = "tag"
+
         # Profiling Facility
         self.PROFILING_ENABLED = False
         self.EXECUTION_DEADLINE: float | None = None
@@ -203,15 +207,18 @@ class GlobalStuff:
 
     @contextlib.contextmanager
     def measure_stage(self, name: str, count: int = 0, units: str = "items"):
-        """Context manager to measure the execution duration of a stage if profiling is active."""
+        """Context manager to measure the execution duration of a stage if profiling is active.
+
+        Yields this call's metric: its `count` (initially `count`; the block may replace it) is added once to the
+        stage's total, so a stage measured once per version reports the sum over all versions.
+        """
         if getattr(self, "STAGE_PROFILER", None) is not None:
             self.STAGE_PROFILER.start_stage(name)
-            stage = self.STAGE_PROFILER.stages.get(name)
+            call = types.SimpleNamespace(count=count)
             try:
-                yield stage
+                yield call
             finally:
-                final_count = stage.count if (stage is not None and stage.count > 0) else count
-                self.STAGE_PROFILER.stop_stage(name, count=final_count, units=units)
+                self.STAGE_PROFILER.stop_stage(name, count=call.count, units=units)
         else:
             yield None
 
@@ -937,15 +944,31 @@ except Exception:
     _malloc_trim = None
 
 
+# Calls and seconds of this process's full collections (reclaim_system_memory) and heap trims (both helpers);
+# stages report the difference over their run
+MEMORY_RECLAIM_STATS: dict[str, float] = {"collect_calls": 0, "collect_s": 0.0, "trim_calls": 0, "trim_s": 0.0}
+
+
 def reclaim_system_memory() -> None:
     """Force CPython garbage collection and release heap pages back to OS via glibc malloc_trim."""
     import gc
+    t_start = time.perf_counter()
     gc.collect()
+    MEMORY_RECLAIM_STATS["collect_calls"] += 1
+    MEMORY_RECLAIM_STATS["collect_s"] += time.perf_counter() - t_start
+    trim_heap()
+
+
+def trim_heap() -> None:
+    """Return freed C heap pages to the OS via glibc malloc_trim, without a garbage collection pass."""
     if _malloc_trim is not None:
+        t_start = time.perf_counter()
         try:
             _malloc_trim(0)
         except Exception:
             pass
+        MEMORY_RECLAIM_STATS["trim_calls"] += 1
+        MEMORY_RECLAIM_STATS["trim_s"] += time.perf_counter() - t_start
 
 
 def freeze_system_memory() -> None:

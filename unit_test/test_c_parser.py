@@ -30,8 +30,6 @@ from core.DBLayout import (
     m_tag_code,
     m_map_ast,
     m_bridge_map,
-    m_symbol_def,
-    m_symbol_ref,
 )
 from db_engine import MockDB
 from table_engine import TECachedDB

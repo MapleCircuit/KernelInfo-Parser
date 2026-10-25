@@ -29,11 +29,13 @@ change lists, and cross-process IPC communication during multicore parsing.
     all worker dictionaries into `gp.ChangeSet_Dict`, then safely terminates the manager.
 ===============================================================================
 """
+import itertools
 import logging
 import multiprocessing
 import pickle
 import zlib
 from collections import OrderedDict
+from collections.abc import Iterable
 from typing import Any
 from core.globalstuff import G
 from core.TableHandling import ChangeSet
@@ -354,10 +356,21 @@ class GreatProcessor:
         self.ChangeSet_Dict = CompressedChangeSetDict(lru_cache_size=500)
         self.Alt_ChangeSet_Dict = CompressedChangeSetDict(lru_cache_size=500)
         self.unchanged_symbol_cache: dict[str, dict[tuple[str, int], int]] = {}
+        # Symbol maps of unchanged files by blob id, kept across versions (a blob's rows never change). Workers
+        # inherit it when forked, collect what they load in `_blob_symbols_fetched` / `_blob_symbols_used` and
+        # send both back with their done frame (`merge_blob_symbols()`).
+        self.blob_symbol_cache: dict[int, dict[tuple[str, int], int]] = {}
+        # blob id -> version counter (`_blob_symbol_generation`) of its last lookup; unused maps are dropped
+        self.blob_symbol_used: dict[int, int] = {}
+        self._blob_symbol_generation = 0
+        self._blob_symbols_fetched: dict[int, dict[tuple[str, int], int]] = {}
+        self._blob_symbols_used: set[int] = set()
         self._changed_paths_set: set[str] = set()
         self._ast_staged_symbols: dict[tuple[str, int], int] = {}
         self._ast_staged_names: dict[str, int] = {}
         self.file_deps: dict[str, set[str]] = {}
+        # Operation count of each ingested ChangeSet (cycle-breaking tie-break without decompressing it)
+        self.cs_op_counts: dict[str, int] = {}
         self.file_symbols: dict[str, dict[tuple[str, int], int]] = {}
         self.file_names: dict[str, dict[str, int]] = {}
         # Paths whose ChangeSet executed in this update: their symbols are published (file_symbols may be
@@ -367,15 +380,26 @@ class GreatProcessor:
         self.file_pre_extracted_tags: dict[str, list[tuple[int, int, int, int]]] = {}
         self.file_blob_ids: dict[str, int] = {}
         self._ast_negative_cache: set[tuple[str, int]] = set()
+        # File-scoped shared memory symbol segments published during Stage 2 (SharedSymbolChain)
+        self._shared_symbols = None
+        # Commit hash -> commit_id for the version's commit range, registered by ingest_git_dag()
+        self.commit_ids_by_hash: dict[str, int] = {}
+        # Changed paths whose blob was already parsed and reused by Step 4.5 instead of being parsed again
+        self.deduped_paths: set[str] = set()
+        # Background git commit parser (`main._git_commit_worker`) and the directory holding its result
+        self._commit_proc = None
+        self._commit_result_dir: str | None = None
         self.Manager = None
         self.Shared_ChangeSet_Dict_List = None
 
     def init_cs_dict(self) -> None:
         """Initialize or reset ChangeSet_Dict according to active G.MEMORY_MODE."""
         from core.globalstuff import G
+        self.close_shared_symbols()
         self._ast_staged_symbols = {}
         self._ast_staged_names = {}
         self.file_deps = {}
+        self.cs_op_counts = {}
         self.file_symbols = {}
         self.file_names = {}
         self.completed_paths = set()
@@ -463,14 +487,31 @@ class GreatProcessor:
         vid = getattr(self, "VID", 0)
         old_vid = getattr(self, "Old_VID", 0)
         bf_row = m_bridge_file.get(vid, fnid, None)
-        if (bf_row is None or len(bf_row) < 3 or not bf_row[2]) and old_vid > 0:
-            bf_row = m_bridge_file.get(old_vid, fnid, None)
+        if bf_row is None or len(bf_row) < 3 or not bf_row[2]:
+            # A file changed in this update has no current-version row until it executes; its previous
+            # version's symbols would be stale, so report nothing (and cache nothing) until then.
+            if rel_file in getattr(self, "_changed_paths_set", ()):
+                return None
+            if old_vid > 0:
+                bf_row = m_bridge_file.get(old_vid, fnid, None)
         if not bf_row or len(bf_row) < 3 or not bf_row[2]:
             if not hasattr(self, "unchanged_symbol_cache"):
                 self.unchanged_symbol_cache = {}
             self.unchanged_symbol_cache[rel_file] = {}
             return self.unchanged_symbol_cache[rel_file]
         fid = bf_row[2][2]
+        # A file unchanged in this update points at a blob written by an earlier version: its map is final
+        complete_blob = rel_file not in getattr(self, "_changed_paths_set", ())
+        if complete_blob:
+            known = self.blob_symbol_cache.get(fid)
+            if known is None:
+                known = self._blob_symbols_fetched.get(fid)
+            if known is not None:
+                self._note_blob_symbols_used(fid)
+                if not hasattr(self, "unchanged_symbol_cache"):
+                    self.unchanged_symbol_cache = {}
+                self.unchanged_symbol_cache[rel_file] = known
+                return known
 
         joins = (
             (m_bridge_tag.tag_id, m_tag.tag_id, 1),
@@ -480,6 +521,8 @@ class GreatProcessor:
         cols = (fid,) + (None,) * (total_cols - 1)
         rows = m_bridge_tag.view_get_multiple(joins, *cols)
         if not rows:
+            if complete_blob:
+                self._store_blob_symbols(fid, {})
             if not hasattr(self, "unchanged_symbol_cache"):
                 self.unchanged_symbol_cache = {}
             self.unchanged_symbol_cache[rel_file] = {}
@@ -498,16 +541,57 @@ class GreatProcessor:
                 if ast_name and ast_id:
                     sym_map[(ast_name, ast_type)] = ast_id
 
+        if complete_blob:
+            self._store_blob_symbols(fid, sym_map)
         if not hasattr(self, "unchanged_symbol_cache"):
             self.unchanged_symbol_cache = {}
         self.unchanged_symbol_cache[rel_file] = sym_map
         return sym_map
+
+    def _store_blob_symbols(self, fid: int, sym_map: dict[tuple[str, int], int]) -> None:
+        """Keep a complete blob's symbol map: in the cache (parent), or to send to the parent (worker)."""
+        if getattr(self, "_is_worker", False):
+            self._blob_symbols_fetched[fid] = sym_map
+        else:
+            self.blob_symbol_cache[fid] = sym_map
+        self._note_blob_symbols_used(fid)
+
+    def _note_blob_symbols_used(self, fid: int) -> None:
+        if getattr(self, "_is_worker", False):
+            self._blob_symbols_used.add(fid)
+        else:
+            self.blob_symbol_used[fid] = self._blob_symbol_generation
+
+    def merge_blob_symbols(self, fetched: dict[int, dict[tuple[str, int], int]] | None, used: Iterable[int] | None) -> None:
+        """Add the symbol maps a worker loaded, and mark the blobs it looked up as used in this version."""
+        if fetched:
+            for fid, sym_map in fetched.items():
+                self.blob_symbol_cache.setdefault(fid, sym_map)
+        generation = self._blob_symbol_generation
+        for fid in itertools.chain(fetched or (), used or ()):
+            self.blob_symbol_used[fid] = generation
+
+    def prune_blob_symbol_cache(self, max_idle_versions: int = 8) -> int:
+        """Start the next version's counter and drop maps no lookup used in the last `max_idle_versions` versions.
+
+        Returns:
+            Number of blob maps dropped.
+        """
+        self._blob_symbol_generation += 1
+        oldest = self._blob_symbol_generation - max_idle_versions
+        stale = [fid for fid in self.blob_symbol_cache if self.blob_symbol_used.get(fid, -1) < oldest]
+        for fid in stale:
+            del self.blob_symbol_cache[fid]
+            self.blob_symbol_used.pop(fid, None)
+        return len(stale)
 
     def reset_cs(self) -> None:
         """Reset Change_List and ChangeSet_Dict upon completion of a version parsing pass."""
         self.Alt_ChangeSet_Dict.clear()
         if hasattr(self, "unchanged_symbol_cache"):
             self.unchanged_symbol_cache.clear()
+        if hasattr(self, "blob_symbol_cache"):
+            self.prune_blob_symbol_cache()
         if hasattr(self, "file_pre_extracted_tags"):
             self.file_pre_extracted_tags.clear()
         if hasattr(self, "file_blob_ids"):
@@ -516,16 +600,40 @@ class GreatProcessor:
             self._ast_negative_cache.clear()
         self.Change_List = None
         self.worker_change_list = None
+        self.commit_ids_by_hash = {}
+        self.deduped_paths = set()
         if hasattr(self, "Symlink_List") and self.Symlink_List:
             self.Symlink_List.clear()
-        if hasattr(self, "_commit_queue"):
-            self._commit_queue = None
-        if hasattr(self, "_commit_proc") and self._commit_proc is not None:
-            try:
-                if self._commit_proc.is_alive():
-                    self._commit_proc.terminate()
-            except Exception:
-                pass
-            self._commit_proc = None
+        self.stop_commit_worker()
+        self.close_shared_symbols()
         self.ChangeSet_Dict.clear()
         return
+
+    def close_shared_symbols(self) -> None:
+        """Unmap the shared memory symbol segments so they never leak into the next version."""
+        shared = getattr(self, "_shared_symbols", None)
+        self._shared_symbols = None
+        if shared is not None:
+            try:
+                shared.close()
+            except Exception as e:
+                logger.debug(f"Closing shared symbol table failed: {e}")
+
+    def stop_commit_worker(self) -> None:
+        """Terminate the background git commit parser if still running and delete its result directory."""
+        proc = getattr(self, "_commit_proc", None)
+        self._commit_proc = None
+        if proc is not None:
+            try:
+                if proc.is_alive():
+                    proc.terminate()
+                proc.join(timeout=5.0)
+            except Exception:
+                pass
+        result_dir = getattr(self, "_commit_result_dir", None)
+        self._commit_result_dir = None
+        if result_dir:
+            import shutil
+            shutil.rmtree(result_dir, ignore_errors=True)
+            if result_dir in self.PURGE_LIST:
+                self.PURGE_LIST.remove(result_dir)

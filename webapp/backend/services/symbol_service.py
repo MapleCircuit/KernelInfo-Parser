@@ -2,6 +2,7 @@
 from __future__ import annotations
 from typing import Any
 from fastapi import HTTPException
+from core.SymbolRows import rows_of_targets_sql
 from webapp.backend.database.pool import get_db_cursor
 from webapp.backend.database.helpers import (
     safe_decode,
@@ -62,36 +63,22 @@ class SymbolService:
         with get_db_cursor() as cursor:
             _, _, blob_paths = self._scope(cursor, version_name)
             cap = max(1, min(limit, 200))
+            # One query: m_symbol_def is a view whose shared rows have computed def_ids, so a second lookup by
+            # def_id could not use an index
             cursor.execute(
                 """
-                SELECT s.def_id, s.blob_id
+                SELECT s.def_id, s.name, s.type_id, t.name AS type_name, s.blob_id AS fid, s.line_s, s.line_e, s.ast_id
                 FROM m_symbol_def s
+                JOIN m_type_descriptor t ON s.type_id = t.type_id
                 WHERE (s.name LIKE %s OR s.name = %s)
                 ORDER BY (s.name = %s) DESC, LENGTH(s.name) ASC, s.name ASC
                 LIMIT %s;
                 """,
                 (f"{clean_q}%", target_q, target_q, SEARCH_CANDIDATES),
             )
-            picked = [r["def_id"] for r in cursor.fetchall() if r["blob_id"] in blob_paths][:cap]
-            if not picked:
-                return []
-
-            fmt = ",".join(["%s"] * len(picked))
-            cursor.execute(
-                f"""
-                SELECT s.def_id, s.name, s.type_id, t.name AS type_name, s.blob_id AS fid, s.line_s, s.line_e, s.ast_id
-                FROM m_symbol_def s
-                JOIN m_type_descriptor t ON s.type_id = t.type_id
-                WHERE s.def_id IN ({fmt});
-                """,
-                picked,
-            )
-            by_id = {r["def_id"]: r for r in cursor.fetchall()}
+            picked = [r for r in cursor.fetchall() if r["fid"] in blob_paths][:cap]
             results = []
-            for def_id in picked:
-                r = by_id.get(def_id)
-                if r is None:
-                    continue
+            for r in picked:
                 path = blob_paths[r["fid"]][0]
                 results.append({
                     "def_id": r["def_id"],
@@ -336,15 +323,15 @@ class SymbolService:
 
             ref_rows = []
             if ast_ids:
-                format_strings = ",".join(["%s"] * len(ast_ids))
+                # Key-first form of `m_symbol_ref WHERE ast_id IN (...)` (the view itself takes seconds per target)
+                refs_sql, repeat = rows_of_targets_sql("m_symbol_ref", len(ast_ids))
                 query_sql = f"""
                     SELECT r.role, r.line, r.char_s, fn.fname, r.blob_id AS fid, r.tag_id
-                    FROM m_symbol_ref r
+                    FROM ({refs_sql}) r
                     LEFT JOIN m_file_name fn ON r.target_fnid = fn.fnid
-                    WHERE r.ast_id IN ({format_strings})
                     ORDER BY fn.fname ASC, r.line ASC
                 """
-                params: list[Any] = list(ast_ids)
+                params: list[Any] = list(ast_ids) * repeat
                 if limit and limit > 0:
                     query_sql += " LIMIT %s;"
                     params.append(limit)

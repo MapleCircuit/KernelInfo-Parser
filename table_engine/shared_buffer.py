@@ -55,8 +55,11 @@ class SharedBufferAllocator:
             return False
 
     @classmethod
-    def allocate(cls, size: int, mode: str = "auto") -> tuple[mmap.mmap, str, int]:
+    def allocate(cls, size: int, mode: str = "auto", allow_1g: bool = True) -> tuple[mmap.mmap, str, int]:
         """Allocate a shared memory mapping adhering to mode preference with graceful fallbacks.
+
+        `allow_1g=False` skips 1GB HugeTLB pages (for mappings far smaller than a 1GB page) while keeping the
+        quiet fallbacks of `auto`.
 
         Modes:
             - '1g': Require/attempt 1GB HugeTLB.
@@ -78,7 +81,7 @@ class SharedBufferAllocator:
         aligned_size = max(aligned_size, min_align)
 
         # 1. Attempt 1GB Huge Pages
-        if mode in ("auto", "1g") and sys.platform.startswith("linux"):
+        if mode in ("auto", "1g") and allow_1g and sys.platform.startswith("linux"):
             one_gb_align = 1024 * 1024 * 1024
             sz_1g = ((aligned_size + one_gb_align - 1) // one_gb_align) * one_gb_align
             try:
@@ -505,6 +508,16 @@ class SharedTableBuilder:
 SHARED_SYMBOL_MAGIC = b"SYMB"
 SHARED_SYMBOL_VERSION = 1
 
+# Separator joining a repository-relative file path and a symbol name into one file-scoped key
+FILE_SCOPE_SEP = "\x00"
+SYMBOL_SLOT_SIZE = 24
+EMPTY_SYMBOL_SLOT = b"\x00" * 16 + b"\xff" * 8
+
+
+def file_scoped_key(rel_file: str, sym_name: str) -> str:
+    """Return the shared-table key binding `sym_name` to the file that defines it."""
+    return f"{rel_file}{FILE_SCOPE_SEP}{sym_name}"
+
 
 class SharedSymbolMappingView:
     """Mapping-like view over a SharedSymbolReader for (name, type_id) -> ast_id lookups."""
@@ -641,6 +654,23 @@ class SharedSymbolReader:
             if step > self.name_cap:
                 return None
 
+    def get_file_symbol(self, rel_file: str, sym_name: str, sym_type: int) -> int | None:
+        """Query ast_id for `(sym_name, sym_type)` defined in `rel_file` (tables built by `build_file_scoped`)."""
+        if not rel_file or not sym_name:
+            return None
+        return self.get_symbol(file_scoped_key(rel_file, sym_name), sym_type)
+
+    def get_file_name(self, rel_file: str, sym_name: str) -> int | None:
+        """Query ast_id for `sym_name` of any type defined in `rel_file` (tables built by `build_file_scoped`)."""
+        if not rel_file or not sym_name:
+            return None
+        return self.get_name(file_scoped_key(rel_file, sym_name))
+
+    @property
+    def nbytes(self) -> int:
+        """Size of the shared memory mapping in bytes (0 once closed)."""
+        return len(self.mv) if self.mv is not None else 0
+
     def __contains__(self, key: Any) -> bool:
         if isinstance(key, tuple) and len(key) >= 2:
             return self.get_symbol(key[0], key[1]) is not None
@@ -706,7 +736,29 @@ class SharedSymbolBuilder:
     """Builds a compact open-addressing shared memory hash table for header symbols."""
 
     def __init__(self, mode: str = "auto") -> None:
-        self.mode = mode
+        self.mode = "off" if mode == "4k" else mode
+
+    def build_file_scoped(self, file_symbols: dict[str, dict[tuple[str, int], int]]) -> SharedSymbolReader | None:
+        """Build a table keyed by defining file, queried with `get_file_symbol()` / `get_file_name()`.
+
+        Args:
+            file_symbols: Per-file symbol maps `rel_file -> {(sym_name, sym_type): ast_id}`.
+
+        Returns:
+            Reader over the packed table, or None when no file publishes a symbol.
+        """
+        symbols_map: dict[tuple[str, int], int] = {}
+        names_map: dict[str, int] = {}
+        for rel_file, f_syms in file_symbols.items():
+            if not rel_file or not f_syms:
+                continue
+            for (sym_name, sym_type), ast_id in f_syms.items():
+                if not sym_name or ast_id is None:
+                    continue
+                key = file_scoped_key(rel_file, sym_name)
+                symbols_map[(key, sym_type)] = ast_id
+                names_map[key] = ast_id
+        return self.build(symbols_map, names_map)
 
     def build(
         self,
@@ -742,7 +794,8 @@ class SharedSymbolBuilder:
         str_size = len(str_pool_bytes)
 
         total_size = HEADER_SIZE + sym_idx_size + name_idx_size + str_size + 1024
-        mm, mode_used, page_sz = SharedBufferAllocator.allocate(total_size, mode=self.mode)
+        # Symbol tables are tens to hundreds of MB: a 1GB HugeTLB page would waste most of a page per table
+        mm, mode_used, page_sz = SharedBufferAllocator.allocate(total_size, mode=self.mode, allow_1g=False)
         mv = memoryview(mm)
 
         sym_idx_offset = HEADER_SIZE
@@ -766,15 +819,9 @@ class SharedSymbolBuilder:
         )
 
         EMPTY_AST_ID = 0xFFFFFFFFFFFFFFFF
-        for i in range(sym_cap):
-            off = sym_idx_offset + i * SLOT_SIZE
-            struct.pack_into("<QIHHI", mv, off, 0, 0, 0, 0, 0)
-            struct.pack_into("<Q", mv, off + 16, EMPTY_AST_ID)
-
-        for i in range(name_cap):
-            off = name_idx_offset + i * SLOT_SIZE
-            struct.pack_into("<QIHHI", mv, off, 0, 0, 0, 0, 0)
-            struct.pack_into("<Q", mv, off + 16, EMPTY_AST_ID)
+        # Initialize every empty slot with one bulk copy instead of two struct calls per slot
+        mv[sym_idx_offset : sym_idx_offset + sym_idx_size] = EMPTY_SYMBOL_SLOT * sym_cap
+        mv[name_idx_offset : name_idx_offset + name_idx_size] = EMPTY_SYMBOL_SLOT * name_cap
 
         mv[str_offset : str_offset + str_size] = str_pool_bytes
 
@@ -815,6 +862,55 @@ class SharedSymbolBuilder:
                 step += 1
 
         return SharedSymbolReader(mm)
+
+
+class SharedSymbolChain:
+    """Ordered set of file-scoped symbol segments queried newest-first.
+
+    Stage 2 appends one segment per epoch holding only the symbols published since the previous
+    segment, instead of re-packing every symbol at each epoch boundary. A newer segment shadows an
+    older one for the same file.
+    """
+
+    def __init__(self) -> None:
+        self.segments: list[SharedSymbolReader] = []
+
+    def append(self, segment: SharedSymbolReader) -> None:
+        self.segments.append(segment)
+
+    def get_file_symbol(self, rel_file: str, sym_name: str, sym_type: int) -> int | None:
+        for segment in reversed(self.segments):
+            val = segment.get_file_symbol(rel_file, sym_name, sym_type)
+            if val is not None:
+                return val
+        return None
+
+    def get_file_name(self, rel_file: str, sym_name: str) -> int | None:
+        for segment in reversed(self.segments):
+            val = segment.get_file_name(rel_file, sym_name)
+            if val is not None:
+                return val
+        return None
+
+    @property
+    def sym_count(self) -> int:
+        return sum(segment.sym_count for segment in self.segments)
+
+    @property
+    def nbytes(self) -> int:
+        return sum(segment.nbytes for segment in self.segments)
+
+    def __len__(self) -> int:
+        return self.sym_count
+
+    def __bool__(self) -> bool:
+        return any(segment.sym_count > 0 for segment in self.segments)
+
+    def close(self) -> None:
+        """Unmap every segment."""
+        for segment in self.segments:
+            segment.close()
+        self.segments = []
 
 
 _MISSING = object()
@@ -899,16 +995,27 @@ class SharedTableRowSequenceView:
         self._appended.clear()
         self._overwritten.clear()
 
+    def drop_appended(self) -> None:
+        """Forget rows appended on top of the shared snapshot (the snapshot rows stay readable)."""
+        self._appended.clear()
+
 
 class SharedTablePKView:
     """Zero-copy mapping view over primary keys in SharedTableReader with dynamic mutation support."""
 
-    def __init__(self, reader: SharedTableReader, table_id: int) -> None:
+    def __init__(self, reader: SharedTableReader, table_id: int, local: dict[Any, tuple] | None = None) -> None:
         self._reader = reader
         self._table_id = table_id
         self._meta = reader.tables.get(table_id, {})
-        self._local: dict[Any, tuple] = {}
+        # Rows added on top of the snapshot (may be a dict shared with the owner, e.g. a carried overlay)
+        self._local: dict[Any, tuple] = local if local is not None else {}
         self._deleted: set[Any] = set()
+
+    def drain_local(self) -> list[Any]:
+        """Remove and return the keys of rows added on top of the shared snapshot."""
+        keys = list(self._local)
+        self._local.clear()
+        return keys
 
     def _sanitize(self, key: Any) -> Any:
         if isinstance(key, (bytearray, memoryview)):

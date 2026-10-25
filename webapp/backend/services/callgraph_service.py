@@ -2,6 +2,7 @@
 from __future__ import annotations
 from typing import Any
 from fastapi import HTTPException
+from core.SymbolRows import rows_of_targets_sql
 from webapp.backend.database.pool import get_db_cursor
 from webapp.backend.database.helpers import (
     safe_decode,
@@ -51,19 +52,21 @@ class CallgraphService:
             target_fid = fn_def["fid"]
             file_path = safe_decode(fn_def["fname"])
 
-            # 1. Callers (incoming)
+            # 1. Callers (incoming): calls in this version's blobs, named by the AST of the tag they are in. The
+            # references come key first (rows_of_targets_sql); filtering the m_symbol_ref view by ast_id is slow.
+            refs_sql, repeat = rows_of_targets_sql("m_symbol_ref", 1)
             cursor.execute(
-                """
-                SELECT caller_sym.name AS caller_name, fn.fname AS file_name, r.line AS line_no
-                FROM m_symbol_ref r
+                f"""
+                SELECT a.name AS caller_name, fn.fname AS file_name, r.line AS line_no
+                FROM ({refs_sql}) r
                 JOIN m_tag t ON r.tag_id = t.tag_id
-                JOIN m_symbol_def caller_sym ON t.ast_id = caller_sym.ast_id
-                LEFT JOIN m_bridge_checkpoint bc ON caller_sym.blob_id = bc.blob_id AND bc.commit_id = %s
+                JOIN m_ast a ON a.ast_id = t.ast_id
+                JOIN m_bridge_checkpoint bc ON bc.blob_id = r.blob_id AND bc.commit_id = %s
                 LEFT JOIN m_file_name fn ON bc.fnid = fn.fnid
-                WHERE r.ast_id = %s AND r.role = 3
-                ORDER BY caller_sym.name ASC, r.line ASC;
+                WHERE r.role = 3
+                ORDER BY a.name ASC, r.line ASC;
                 """,
-                (vid, target_ast_id),
+                (target_ast_id,) * repeat + (vid,),
             )
             raw_callers = cursor.fetchall()
             callers_map: dict[tuple[str, str], dict[str, Any]] = {}
@@ -88,20 +91,39 @@ class CallgraphService:
 
             callers = list(callers_map.values())
 
-            # 2. Callees (outgoing)
+            # 2. Callees (outgoing): calls inside the function's lines, with the files defining each callee in
+            # this version (joining the m_symbol_def view by ast_id would materialize it)
             cursor.execute(
                 """
-                SELECT callee_sym.name AS callee_name, fn.fname AS file_name, r.line AS line_no
+                SELECT r.ast_id, a.name AS callee_name, r.line AS line_no
                 FROM m_symbol_ref r
-                JOIN m_symbol_def callee_sym ON r.ast_id = callee_sym.ast_id
-                LEFT JOIN m_bridge_checkpoint bc ON callee_sym.blob_id = bc.blob_id AND bc.commit_id = %s
-                LEFT JOIN m_file_name fn ON bc.fnid = fn.fnid
+                JOIN m_ast a ON a.ast_id = r.ast_id
                 WHERE r.blob_id = %s AND r.line BETWEEN %s AND %s AND r.role = 3
-                ORDER BY callee_sym.name ASC, r.line ASC;
+                ORDER BY a.name ASC, r.line ASC;
                 """,
-                (vid, target_fid, fn_def["line_s"], fn_def["line_e"]),
+                (target_fid, fn_def["line_s"], fn_def["line_e"]),
             )
-            raw_callees = cursor.fetchall()
+            call_rows = cursor.fetchall()
+            callee_ids = sorted({r["ast_id"] for r in call_rows})
+            callee_files: dict[int, list[Any]] = {}
+            if callee_ids:
+                defs_sql, repeat = rows_of_targets_sql("m_symbol_def", len(callee_ids))
+                cursor.execute(
+                    f"""
+                    SELECT DISTINCT d.ast_id, fn.fname
+                    FROM ({defs_sql}) d
+                    JOIN m_bridge_checkpoint bc ON bc.blob_id = d.blob_id AND bc.commit_id = %s
+                    JOIN m_file_name fn ON bc.fnid = fn.fnid;
+                    """,
+                    tuple(callee_ids) * repeat + (vid,),
+                )
+                for d_row in cursor.fetchall():
+                    callee_files.setdefault(d_row["ast_id"], []).append(d_row["fname"])
+            raw_callees = [
+                {"callee_name": r["callee_name"], "file_name": f_name, "line_no": r["line_no"]}
+                for r in call_rows
+                for f_name in (callee_files.get(r["ast_id"]) or [None])
+            ]
             callees_map: dict[tuple[str, str], dict[str, Any]] = {}
             for r in raw_callees:
                 c_name = safe_decode(r["callee_name"])

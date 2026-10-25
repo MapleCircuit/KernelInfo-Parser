@@ -48,6 +48,8 @@ from core.globalstuff import (
     type_check,
     REF_ROOT,
     REF_OLD,
+    REF_FILE,
+    OP_REF,
     REF_NOT_RESOLVABLE,
     CONTINUE_EXCEPTION,
     T_DIR,
@@ -87,11 +89,21 @@ import secrets
 import logging
 import argparse
 from typing import Any
+from collections.abc import Callable, Iterable
+from dataclasses import dataclass, field
+import contextlib
+import copy
+import io
+import math
 import multiprocessing
+from multiprocessing.connection import wait as mp_wait
 import queue
+import signal
+import struct
+import tempfile
 import threading
 import re
-from collections import deque, defaultdict
+from collections import Counter, deque, defaultdict
 import pickle
 import zlib
 import traceback
@@ -100,8 +112,13 @@ import ctypes
 from parser.c_ast import c_ast_parse, Line
 from core.FileHandler import MasterFile
 from core.GreatProcessor import GreatProcessor
-from core.TableHandling import Table, ChangeSet
+from core.TableHandling import Table, ChangeSet, is_data_unsafe
+from table_engine.shared_buffer import SharedSymbolBuilder, SharedSymbolChain
 from db_engine import MariaDB, MockDB, get_db_engine
+from db_engine.DBHandling import parse_server_setting
+from core.globalstuff import MEMORY_RECLAIM_STATS
+from core.SymbolRows import STATS as SYMBOL_STATS
+from core.SymbolRows import SYMBOL_VIEW_SQL
 from table_engine import TECachedDB, TEDirectDB, get_table_engine
 from core.DBLayout import (
     init_db_layout,
@@ -157,6 +174,10 @@ gp = GreatProcessor()
 configure_logging(level=logging.INFO, fmt="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
+# Workers rely on fork inheritance (gp, MF, TableEngine caches, shared memory symbols), so pin the start
+# method instead of following the platform default (forkserver from Python 3.14).
+_MP = multiprocessing.get_context("fork")
+
 init_db_layout(gp)
 
 T_NO_FOREIGN = frozenset({T_RAW, T_DIR, T_MAINTAINERS, T_CREDITS})
@@ -177,22 +198,63 @@ def ensure_db_instance(db: Any) -> None:
         logger.warning(f"ensure_db_instance check encountered error: {e}")
 
 
+def _legacy_symbol_tables(db: Any) -> list[str]:
+    """Names of symbol views (core.SymbolRows.SYMBOL_VIEW_SQL) that still exist as tables of the per-blob layout."""
+    if not (hasattr(db, "cnx") and db.cnx):
+        return []
+    names = tuple(SYMBOL_VIEW_SQL)
+    with contextlib.closing(db.cnx.cursor()) as cur:
+        cur.execute(
+            "SELECT table_name FROM information_schema.tables WHERE table_schema = DATABASE() "
+            f"AND table_type = 'BASE TABLE' AND table_name IN ({','.join(['%s'] * len(names))})",
+            names,
+        )
+        return sorted(r[0].decode() if isinstance(r[0], (bytes, bytearray)) else r[0] for r in cur.fetchall())
+
+
+def drop_legacy_symbol_tables(db: Any) -> None:
+    """On --reset, drop the per-blob symbol tables of the earlier layout so their names can become views."""
+    legacy = _legacy_symbol_tables(db)
+    if legacy:
+        with contextlib.closing(db.cnx.cursor()) as cur:
+            cur.execute("SET FOREIGN_KEY_CHECKS = 0;")
+            cur.execute(f"DROP TABLE IF EXISTS {', '.join(f'`{n}`' for n in legacy)};")
+            cur.execute("SET FOREIGN_KEY_CHECKS = 1;")
+        db.cnx.commit()
+        logger.info(f"Dropped tables of the per-blob symbol layout: {', '.join(legacy)}")
+
+
 def ensure_db_views(db: Any) -> None:
-    """Create or replace SQL compatibility views for legacy query interoperability."""
+    """Create or replace SQL compatibility views for legacy query interoperability.
+
+    Raises:
+        RuntimeError: The database still has `m_symbol_def` / `m_symbol_ref` tables from before symbol rows were
+            stored once per tag; its rows cannot be combined with the new layout, so it must be rebuilt (--reset).
+    """
+    legacy = _legacy_symbol_tables(db)
+    if legacy:
+        raise RuntimeError(
+            f"The database predates the shared symbol layout ({', '.join(legacy)} are tables, not views). "
+            "Rebuild it with --reset (core/SCHEMA_PLAN_SYMBOL_ROWS.md)."
+        )
     views = (
         ("m_v_main", "CREATE OR REPLACE VIEW m_v_main AS SELECT commit_id AS vid, ref_name AS vname, repo_id, ref_type, tagger_id, tagger_date, tag_message FROM m_git_ref;"),
         ("m_bridge_file", "CREATE OR REPLACE VIEW m_bridge_file AS SELECT commit_id AS vid, fnid, blob_id AS fid FROM m_bridge_checkpoint;"),
         ("m_file", "CREATE OR REPLACE VIEW m_file AS SELECT fb.blob_id AS fid, COALESCE((SELECT MIN(bc.commit_id) FROM m_bridge_checkpoint bc WHERE bc.blob_id = fb.blob_id), 0) AS vid_s, 0 AS vid_e, fb.ftype, '0' AS s_stat, '0' AS e_stat, fb.blob_hash FROM m_file_blob fb;"),
         ("m_bridge_commit_file", "CREATE OR REPLACE VIEW m_bridge_commit_file AS SELECT commit_id, fnid, blob_id, 0 AS old_fnid, 0 AS old_blob_id, change_type FROM m_commit_file;"),
+        *SYMBOL_VIEW_SQL.items(),
     )
     for vname, ddl in views:
         try:
             if hasattr(db, "cnx") and db.cnx:
-                with db.cnx.cursor() as cur:
+                with contextlib.closing(db.cnx.cursor()) as cur:
                     cur.execute(ddl)
                 db.cnx.commit()
         except Exception as e:
-            logger.debug(f"ensure_db_views skipping view {vname}: {e}")
+            if vname in SYMBOL_VIEW_SQL:
+                logger.warning(COLOR.yellow(f"ensure_db_views could not create view {vname}: {e}"))
+            else:
+                logger.debug(f"ensure_db_views skipping view {vname}: {e}")
 
 
 file_fid_cache: dict[str, int | None] = {}
@@ -245,7 +307,8 @@ def extract_tags_and_evacuate_cs(cs_obj: ChangeSet) -> None:
     if not c_path:
         return
     fid = get_fid_for_path(c_path)
-    gp_ref = getattr(cs_obj, "gp", None) or getattr(G, "GP", None) or gp
+    # ChangeSets executed straight from a worker batch (execute_and_purge) arrive with gp cleared
+    gp_ref = getattr(cs_obj, "gp", None) or gp
     if hasattr(gp_ref, "completed_paths"):
         gp_ref.completed_paths.add(c_path)
 
@@ -310,12 +373,10 @@ def extract_tags_and_evacuate_cs(cs_obj: ChangeSet) -> None:
     blob_id = getattr(cs_obj, "blob_id", 0) or fid or 0
     if blob_id:
         cs_obj.blob_id = blob_id
-        gp_ref = getattr(cs_obj, "gp", None) or getattr(G, "GP", None)
         if gp_ref is not None and hasattr(gp_ref, "file_blob_ids") and isinstance(gp_ref.file_blob_ids, dict):
             gp_ref.file_blob_ids[c_path] = blob_id
 
     if hasattr(cs_obj, "pre_extracted_tags") and cs_obj.pre_extracted_tags:
-        gp_ref = getattr(cs_obj, "gp", None) or getattr(G, "GP", None)
         if gp_ref is not None and hasattr(gp_ref, "file_pre_extracted_tags") and isinstance(gp_ref.file_pre_extracted_tags, dict):
             gp_ref.file_pre_extracted_tags[c_path] = cs_obj.pre_extracted_tags
 
@@ -347,6 +408,122 @@ def extract_tags_and_evacuate_cs(cs_obj: ChangeSet) -> None:
         cs_obj.profiler = None
 
 
+_SQL_IN_CHUNK = 1000
+
+
+def _person_key(name: str | None, email: str | None) -> tuple[str, str]:
+    """Identity of an m_maintainer_person row: `(name, email)`, the TableEngine's no-duplicate key."""
+    email = email or ""
+    return (name or email or "Unknown", email)
+
+
+def _raw_cursor(db: Any) -> Any | None:
+    """A fresh cursor on a MariaDB connection, or None for drivers without SQL access (MockDB)."""
+    cnx = getattr(db, "cnx", None)
+    return cnx.cursor() if cnx else None
+
+
+def _log_preload_summary(elapsed_s: float) -> None:
+    """Log how long the TableEngine preload took and which cached tables are largest."""
+    cached_rows = getattr(G.TE, "_cached_rows", None) or {}
+    sizes = []
+    for table_id, rows in cached_rows.items():
+        try:
+            sizes.append((len(rows), G.TE.tables[table_id].table_name))
+        except Exception:
+            continue
+    largest = ", ".join(f"{name} {count:,}" for count, name in sorted(sizes, reverse=True)[:5])
+    logger.info(f"[TableEngine] Preloaded cached tables in {elapsed_s:.1f}s (parent RSS {_parent_rss_mb():.0f}MB); largest: {largest}")
+
+
+def _tagged_blob_ids(blob_ids: Iterable[int]) -> set[int]:
+    """The subset of `blob_ids` that already has tags in m_bridge_tag (their parse results are complete)."""
+    wanted = sorted(set(blob_ids))
+    tagged: set[int] = set()
+    if not wanted:
+        return tagged
+    with G.DB() as db:
+        cur = _raw_cursor(db)
+        if cur is None:
+            for blob_id in wanted:
+                if m_bridge_tag.view_get_multiple(((m_bridge_tag.blob_id,),), blob_id, None, None, None, None, None):
+                    tagged.add(blob_id)
+            return tagged
+        try:
+            for i in range(0, len(wanted), _SQL_IN_CHUNK):
+                chunk = wanted[i : i + _SQL_IN_CHUNK]
+                cur.execute(
+                    f"SELECT DISTINCT blob_id FROM m_bridge_tag WHERE blob_id IN ({','.join(['%s'] * len(chunk))})",  # noqa: S608
+                    tuple(chunk),
+                )
+                tagged.update(int(r[0]) for r in cur.fetchall())
+        finally:
+            cur.close()
+    return tagged
+
+
+def _reuse_parsed_blobs(file_blob_hashes: dict[str, bytes]) -> list[str]:
+    """Step 4.5: link changed files whose exact blob was already parsed instead of parsing them again.
+
+    Blobs and file names are looked up in the TableEngine caches (preloaded by `G.TE.start()`), tagged
+    blobs are confirmed with one targeted query, and the reused files' m_file_name, m_bridge_checkpoint
+    and m_commit_file rows are staged through the TableEngine. Reused paths are recorded in
+    `gp.deduped_paths` so `processing_git_commits()` can still link their tags to this range's commits.
+
+    Returns:
+        The change lines that still need parsing, in `gp.Change_List` order.
+    """
+    candidates: dict[str, tuple[str, str, int]] = {}
+    for item in gp.Change_List or ():
+        if not item:
+            continue
+        parts = item.split("\t")
+        op, fpath = parts[0], parts[-1]
+        if op.startswith("D"):
+            continue
+        b_hash = file_blob_hashes.get(fpath)
+        if not b_hash:
+            continue
+        blob_row = G.TE.get(m_file_blob.table_id, (None, b_hash, type_check(fpath)))
+        if blob_row is not None:
+            candidates[item] = (op, fpath, blob_row[0])
+
+    tagged = _tagged_blob_ids(b_id for _op, _path, b_id in candidates.values())
+    # Checkpoint rows of this version from an interrupted earlier run (one query instead of one per file)
+    checkpointed: set[int] | None = None
+    if tagged:
+        with G.DB() as db:
+            cur = _raw_cursor(db)
+            if cur is not None:
+                try:
+                    cur.execute("SELECT fnid FROM m_bridge_checkpoint WHERE commit_id = %s", (gp.VID,))
+                    checkpointed = {int(r[0]) for r in cur.fetchall()}
+                finally:
+                    cur.close()
+    reused: set[str] = set()
+    gp.deduped_paths = set()
+    for item, (op, fpath, b_id) in candidates.items():
+        if b_id not in tagged:
+            continue
+        fnid = G.TE.set(m_file_name.table_id, (None, fpath))[0]
+        if checkpointed is not None:
+            is_checkpointed = fnid in checkpointed
+            checkpointed.add(fnid)
+        else:
+            is_checkpointed = G.TE.get(m_bridge_checkpoint.table_id, (gp.VID, fnid, None)) is not None
+        if not is_checkpointed:
+            G.TE.set(m_bridge_checkpoint.table_id, (gp.VID, fnid, b_id))
+        G.TE.set(m_commit_file.table_id, (gp.VID, fnid, b_id, 0, 0, op[:1]))
+        gp.file_blob_ids[fpath] = b_id
+        file_fid_cache[fpath] = b_id
+        gp.deduped_paths.add(fpath)
+        reused.add(item)
+
+    if reused:
+        logger.info(COLOR.green(f"Content-Addressable Deduplication: Reused {len(reused)} existing file blobs directly without worker parsing."))
+    return [item for item in (gp.Change_List or ()) if item not in reused]
+
+
 def update(version: str, repo_path: str | None = None) -> None:
     """Execute the full version parsing and database ingestion pipeline for a target release version.
     
@@ -355,7 +532,8 @@ def update(version: str, repo_path: str | None = None) -> None:
     2. Build temporary performance B-tree indexes (`ast_index`, `file_name_index`).
     3. Clone repository branch into RAMDISK via `MF.add_version()`.
     4. Generate git diff change list (`MF.generate_change_list()`) & extract Git blob hashes.
-    4.5 Deduplicate files against `m_file_blob` across trees sharing root commit.
+    4.4 Start the TableEngine (preload cached tables).
+    4.5 Deduplicate files against `m_file_blob` across trees sharing root commit (TableEngine caches).
     5. Spawn parallel worker processes (`trigger_multicore()`) to parse file diffs into ChangeSets.
     6. Enqueue all generated `ChangeSet` objects into `cs_queue` and resolve operations sequentially.
     7. Remove temporary indexes, commit table transactions (`G.TE.commit()`), and reset state.
@@ -423,6 +601,9 @@ def update(version: str, repo_path: str | None = None) -> None:
             text=True,
             check=False,
         )
+        if ls_res.returncode != 0:
+            # Without blob hashes every parsed file would share the all-zero hash (one m_file_blob row per type)
+            raise RuntimeError(f"git ls-tree failed for '{version}': {ls_res.stderr.strip()}")
         file_blob_hashes: dict[str, bytes] = {}
         for line in ls_res.stdout.splitlines():
             if not line:
@@ -441,139 +622,42 @@ def update(version: str, repo_path: str | None = None) -> None:
         logger.warning(COLOR.yellow(f"[Duration Limit] Execution deadline reached after Step 4. Halting '{version}' early."))
         return
 
+    # Parse this version's git commits in the background while blobs are deduplicated and files parsed;
+    # forked before the TableEngine preload so the child shares as little parent memory as possible
+    _start_git_commit_worker()
+
+    # -------------------------------------------------------------------------
+    # STEP 4.4: TableEngine preload (te_cached tables, shared huge-page buffer)
+    # -------------------------------------------------------------------------
+    with G.measure_stage("Step 4.4: TableEngine Preload"):
+        t_preload = time.perf_counter()
+        G.TE.start(gp.Table_Array, G.DB)
+        _log_preload_summary(time.perf_counter() - t_preload)
+
     # -------------------------------------------------------------------------
     # STEP 4.5: Content-Addressable Blob Deduplication across Git trees
     # -------------------------------------------------------------------------
-    if getattr(G, "STAGE_PROFILER", None) is not None:
-        G.STAGE_PROFILER.start_stage("Step 4.5: Content-Addressable Blob Dedup")
-
-    dedup_count = 0
-    remaining_changes = []
-    has_any_blobs = False
-    try:
-        with G.DB() as db:
-            cur = db.cursor if hasattr(db, "cursor") else (db.cnx.cursor() if hasattr(db, "cnx") and db.cnx else None)
-            if cur:
-                cur.execute("SELECT 1 FROM m_file_blob WHERE blob_id > 0 LIMIT 1")
-                has_any_blobs = cur.fetchone() is not None
-                cur.close()
-    except Exception as e:
-        logger.debug(f"Note on checking m_file_blob for deduplication: {e}")
-
-    if not has_any_blobs:
-        # Initial run: database has no prior blobs to deduplicate against
-        remaining_changes = list(gp.Change_List)
-    else:
-        candidate_items = []
-        for item in gp.Change_List:
-            if not item:
-                continue
-            parts = item.split("\t")
-            op = parts[0]
-            fpath = parts[-1]
-            if op.startswith("D"):
-                remaining_changes.append(item)
-                continue
-            b_hash = file_blob_hashes.get(fpath)
-            if not b_hash:
-                remaining_changes.append(item)
-                continue
-            ftype = type_check(fpath)
-            candidate_items.append((item, op, fpath, b_hash, ftype))
-
-        known_blobs: dict[tuple[bytes, int], int] = {}
-        tagged_blob_ids: set[int] = set()
-        fname_to_fnid: dict[str, int] = {}
-        existing_chk_fnids: set[int] = set()
-        existing_cf_fnids: set[int] = set()
-        next_fnid = 1
-
-        try:
-            with G.DB() as db:
-                cur = db.cursor if hasattr(db, "cursor") else (db.cnx.cursor() if hasattr(db, "cnx") and db.cnx else None)
-                if cur:
-                    cur.execute("SELECT blob_hash, ftype, blob_id FROM m_file_blob WHERE blob_id > 0")
-                    for r in cur.fetchall():
-                        known_blobs[(bytes(r[0]), int(r[1]))] = int(r[2])
-
-                    cur.execute("SELECT DISTINCT blob_id FROM m_bridge_tag")
-                    tagged_blob_ids = {int(r[0]) for r in cur.fetchall()}
-
-                    cur.execute("SELECT fname, fnid FROM m_file_name")
-                    for r in cur.fetchall():
-                        fname_to_fnid[str(r[0])] = int(r[1])
-                    if fname_to_fnid:
-                        next_fnid = max(fname_to_fnid.values()) + 1
-
-                    cur.execute("SELECT fnid FROM m_bridge_checkpoint WHERE commit_id = %s", (gp.VID,))
-                    existing_chk_fnids = {int(r[0]) for r in cur.fetchall()}
-
-                    cur.execute("SELECT fnid FROM m_commit_file WHERE commit_id = %s", (gp.VID,))
-                    existing_cf_fnids = {int(r[0]) for r in cur.fetchall()}
-                    cur.close()
-        except Exception as e:
-            logger.warning(f"Error preloading tables for blob deduplication: {e}")
-
-        new_filenames: list[tuple[int, str]] = []
-        staged_checkpoints: list[tuple[int, int, int]] = []
-        staged_commit_files: list[tuple[int, int, int, int, int, str]] = []
-
-        for item, op, fpath, b_hash, ftype in candidate_items:
-            b_id = known_blobs.get((b_hash, ftype))
-            if b_id is not None and b_id in tagged_blob_ids:
-                fnid = fname_to_fnid.get(fpath)
-                if fnid is None:
-                    fnid = next_fnid
-                    next_fnid += 1
-                    fname_to_fnid[fpath] = fnid
-                    new_filenames.append((fnid, fpath))
-                if fnid not in existing_chk_fnids:
-                    existing_chk_fnids.add(fnid)
-                    staged_checkpoints.append((gp.VID, fnid, b_id))
-                if fnid not in existing_cf_fnids:
-                    existing_cf_fnids.add(fnid)
-                    staged_commit_files.append((gp.VID, fnid, b_id, 0, 0, op[:1]))
-                if hasattr(gp, "file_blob_ids") and isinstance(gp.file_blob_ids, dict):
-                    gp.file_blob_ids[fpath] = b_id
-                file_fid_cache[fpath] = b_id
-                dedup_count += 1
-            else:
-                remaining_changes.append(item)
-
-        if new_filenames or staged_checkpoints or staged_commit_files:
-            try:
-                with G.DB() as db:
-                    if new_filenames:
-                        db.insert(m_file_name, new_filenames)
-                    if staged_checkpoints:
-                        db.insert(m_bridge_checkpoint, staged_checkpoints)
-                    if staged_commit_files:
-                        db.insert(m_commit_file, staged_commit_files)
-            except Exception as e:
-                logger.warning(f"Error persisting deduplicated blob records: {e}")
-
-    if dedup_count > 0:
-        logger.info(COLOR.green(f"Content-Addressable Deduplication: Reused {dedup_count} existing file blobs directly without worker parsing."))
-        gp.worker_change_list = remaining_changes
-    else:
-        gp.worker_change_list = list(gp.Change_List)
-
-    if getattr(G, "STAGE_PROFILER", None) is not None:
-        G.STAGE_PROFILER.stop_stage("Step 4.5: Content-Addressable Blob Dedup", count=dedup_count, units="reused")
+    with G.measure_stage("Step 4.5: Content-Addressable Blob Dedup", units="reused") as dedup_metric:
+        gp.worker_change_list = _reuse_parsed_blobs(file_blob_hashes)
+        if dedup_metric is not None:
+            dedup_metric.count = len(gp.deduped_paths)
 
     if G.is_deadline_exceeded():
         logger.warning(COLOR.yellow(f"[Duration Limit] Execution deadline reached after Step 4.5. Finalizing '{version}' early."))
+        G.TE.commit_all(update_in_mem_indexes=False)
+        G.TE.close()
         return
-
-    G.TE.start(gp.Table_Array, G.DB)
 
     # -------------------------------------------------------------------------
     # STEP 5 & 6: Spawn multicore workers to parse files & stream ChangeSet execution
     # -------------------------------------------------------------------------
     chunk_commit_interval = 300 if G.VERY_LOW_MEMORY_MODE else (500 if G.LOW_MEMORY_MODE else 1000)
     scheduler = DependencyScheduler(gp, chunk_commit_interval=chunk_commit_interval, streaming=True)
+    symbols_base = Counter(SYMBOL_STATS)
+    WORKER_SYMBOL_STATS.clear()
     trigger_multicore(scheduler=scheduler)
     scheduler.finalize()
+    _log_symbol_stats(version, symbols_base)
 
     # Commit all pending rows from Multicore / Stage 2 execution before post-processing steps
     G.TE.commit_all(update_in_mem_indexes=False)
@@ -645,7 +729,8 @@ def update(version: str, repo_path: str | None = None) -> None:
     reclaim_system_memory()
 
     # -------------------------------------------------------------------------
-    # STEP 7: Drop secondary indexes, commit transactions, and rebuild indexes
+    # STEP 7: Commit the remaining staged rows (the indexes stay in place: the stages already
+    # streamed nearly every row of the version into them, so a drop/rebuild would only add work)
     # -------------------------------------------------------------------------
     with G.measure_stage("Step 7: Final DB Commit & Indexes"):
         if getattr(G.TE, "db", None) is not None and hasattr(G.TE.db, "cnx") and G.TE.db.cnx is not None:
@@ -654,15 +739,7 @@ def update(version: str, repo_path: str | None = None) -> None:
             except Exception:
                 pass
 
-        if gp.VID == 1:
-            with G.DB() as db:
-                db.remove_indexes(tuple((item[0],item[1]) for item in performance_indexes))
-
         G.TE.commit_all(update_in_mem_indexes=False)
-
-        if gp.VID == 1:
-            with G.DB() as db:
-                db.create_indexes(performance_indexes)
 
     file_fid_cache.clear()
     file_fnid_cache.clear()
@@ -757,6 +834,19 @@ def order_changed_files(regular_files: list[str], working_dir: str | None) -> li
     return sorted_headers + other_items
 
 
+_AST_SOURCE_EXTS = frozenset((
+    ".c", ".cpp", ".cc", ".cxx", ".c++", ".cp",
+    ".rs",
+    ".s", ".asm",
+    ".h", ".hpp", ".hxx",
+))
+
+
+def _is_ast_source_path(fpath: str) -> bool:
+    """Return True if `fpath` is in a language parsed into a full AST (C/C++, Rust, assembly)."""
+    return os.path.splitext(fpath)[1].lower() in _AST_SOURCE_EXTS
+
+
 def is_heavy_source_file(
     fpath: str,
     working_dir: str | None = None,
@@ -779,14 +869,7 @@ def is_heavy_source_file(
     if "\t" in fpath:
         fpath = fpath.split("\t")[-1]
 
-    ext = os.path.splitext(fpath)[1].lower()
-    is_ast_lang = ext in (
-        ".c", ".cpp", ".cc", ".cxx", ".c++", ".cp",
-        ".rs",
-        ".s", ".asm",
-        ".h", ".hpp", ".hxx",
-    )
-    if not is_ast_lang:
+    if not _is_ast_source_path(fpath):
         return False
 
     if working_dir is None:
@@ -818,6 +901,8 @@ def partition_source_epochs(
     max_batch_bytes: int = 1500000,
     heavy_file_threshold: int = 65536,
     target_epoch_files: int = 4500,
+    largest_first: bool = True,
+    num_workers: int = 0,
 ) -> list[list[tuple[int, list[str]]]]:
     """Partition source files into batches with dynamic complexity sizing and group them into natural subsystem-aligned epochs.
 
@@ -834,6 +919,10 @@ def partition_source_epochs(
         max_batch_bytes: Maximum cumulative source code bytes per batch (e.g. 1.5MB).
         heavy_file_threshold: File size threshold (bytes) to flag an AST file as heavy.
         target_epoch_files: Approximate target count of files per epoch (e.g. 4500).
+        largest_first: Order each epoch's batches by descending source bytes, so the heaviest batches
+            start first and the epoch does not end waiting on one late heavy batch.
+        num_workers: When given and the files fit in one epoch, the byte budget per batch is also capped at an
+            equal share of the bytes (`_BATCHES_PER_WORKER` batches per worker), so batches cost about the same.
 
     Returns:
         List of epochs, where each epoch is a list of (global_batch_id, batch_files) tuples.
@@ -848,12 +937,7 @@ def partition_source_epochs(
         except Exception:
             pass
 
-    batches: list[tuple[int, list[str]]] = []
-    current_batch: list[str] = []
-    current_batch_bytes = 0
-    current_has_heavy = False
-    batch_counter = 0
-
+    sizes: list[int] = []
     for item in source_files:
         fpath = item.split("\t")[-1]
         sz = 0
@@ -863,17 +947,29 @@ def partition_source_epochs(
                 sz = os.path.getsize(full_path)
             except Exception:
                 sz = 0
+        sizes.append(sz)
+    single_epoch = len(source_files) <= int(target_epoch_files * 1.3)
+    if num_workers > 0 and single_epoch:
+        equal_share = math.ceil(sum(sizes) / (num_workers * _BATCHES_PER_WORKER))
+        max_batch_bytes = min(max_batch_bytes, max(heavy_file_threshold, equal_share))
 
-        is_heavy = is_heavy_source_file(fpath, working_dir, threshold_bytes=heavy_file_threshold)
+    batches: list[tuple[int, list[str]]] = []
+    batch_bytes: dict[int, int] = {}
+    current_batch: list[str] = []
+    current_batch_bytes = 0
+    current_has_heavy = False
+    batch_counter = 0
+
+    for item, sz in zip(source_files, sizes):
+        fpath = item.split("\t")[-1]
+
+        is_heavy = sz >= heavy_file_threshold and _is_ast_source_path(fpath)
         limit = heavy_batch_size if (current_has_heavy or is_heavy) else normal_batch_size
 
-        if (
-            len(current_batch) >= limit
-            or (current_batch_bytes + sz > max_batch_bytes and len(current_batch) > 0)
-            or (is_heavy and len(current_batch) >= heavy_batch_size)
-        ):
+        if len(current_batch) >= limit or (current_batch_bytes + sz > max_batch_bytes and len(current_batch) > 0):
             if current_batch:
                 batches.append((batch_counter, current_batch))
+                batch_bytes[batch_counter] = current_batch_bytes
                 batch_counter += 1
                 current_batch = []
                 current_batch_bytes = 0
@@ -886,10 +982,16 @@ def partition_source_epochs(
 
     if current_batch:
         batches.append((batch_counter, current_batch))
+        batch_bytes[batch_counter] = current_batch_bytes
         batch_counter += 1
 
-    if len(source_files) <= int(target_epoch_files * 1.3):
-        return [batches]
+    def _ordered(epoch: list[tuple[int, list[str]]]) -> list[tuple[int, list[str]]]:
+        if not largest_first:
+            return epoch
+        return sorted(epoch, key=lambda batch: batch_bytes[batch[0]], reverse=True)
+
+    if single_epoch:
+        return [_ordered(batches)]
 
     epochs: list[list[tuple[int, list[str]]]] = []
     current_epoch: list[tuple[int, list[str]]] = []
@@ -908,29 +1010,109 @@ def partition_source_epochs(
             next_dir = os.sep.join(next_parts[:2]) if len(next_parts) > 1 else (next_parts[0] if next_parts else "")
 
             if curr_dir != next_dir or current_epoch_files >= int(target_epoch_files * 1.35):
-                epochs.append(current_epoch)
+                epochs.append(_ordered(current_epoch))
                 current_epoch = []
                 current_epoch_files = 0
 
     if current_epoch:
-        epochs.append(current_epoch)
+        epochs.append(_ordered(current_epoch))
 
     return epochs
 
 
 class DependencyScheduler:
-    """Dependency-driven ChangeSet resolution and execution scheduler with two-stage streaming ingestion."""
+    """Dependency-driven ChangeSet resolution and execution scheduler with two-stage streaming ingestion.
+
+    A ChangeSet that references files of this update still being parsed waits on them: when a file
+    completes, the ChangeSets waiting on it run right away, cascading. Most files therefore execute while
+    the workers are still parsing, and the serial wave passes (`resolve_headers()`, `finalize()`) only
+    handle dependency cycles and files nothing woke up.
+    """
 
     def __init__(self, gp_ref: GreatProcessor, chunk_commit_interval: int = 0, streaming: bool = True) -> None:
         self.gp = gp_ref
         self.streaming = streaming
+        # Blocked on something that will not complete during ingestion (retried at epoch boundaries / finalize)
         self.deferred_queue: deque[str] = deque()
         self.completed: set[str] = set()
         self.executed_count = 0
         self.chunk_commit_interval = chunk_commit_interval if chunk_commit_interval > 0 else 1000
+        # In-flight file -> ChangeSets to run again once it completes
+        self.waiters: defaultdict[str, set[str]] = defaultdict(set)
+        # Header ChangeSets held until every in-flight file they reference has completed
+        self.pending_deps: dict[str, set[str]] = {}
+        self._ready: deque[str] = deque()
+
+    def _in_flight(self, path: str) -> bool:
+        """True if `path` belongs to this update but has not executed yet, so it will complete later."""
+        if path in self.completed:
+            return False
+        return path in getattr(self.gp, "_changed_paths_set", ()) or path in self.gp.ChangeSet_Dict
+
+    def _complete(self, path: str) -> None:
+        """Record `path` as executed and queue the ChangeSets that were waiting only on it."""
+        self.completed.add(path)
+        for waiter in self.waiters.pop(path, ()):
+            pending = self.pending_deps.get(waiter)
+            if pending is not None:
+                pending.discard(path)
+                if pending:
+                    continue
+                del self.pending_deps[waiter]
+            self._ready.append(waiter)
+
+    def _store(self, path: str, cs_obj: ChangeSet) -> None:
+        cs_obj.batch_cs_dict = None
+        self.gp.ChangeSet_Dict[path] = cs_obj
+
+    def _maybe_chunk_commit(self) -> None:
+        if self.executed_count % self.chunk_commit_interval == 0:
+            _commit_all_with_retry("Chunk")
+            if hasattr(self.gp, "_ast_negative_cache"):
+                self.gp._ast_negative_cache.clear()
+            reclaim_system_memory()
+
+    def _execute(self, path: str, cs_obj: ChangeSet, defer: bool) -> bool:
+        """Execute a ChangeSet: on success evacuate it and wake its waiters, otherwise park it."""
+        cs_obj.gp = self.gp
+        if cs_obj.execute():
+            self.executed_count += 1
+            extract_tags_and_evacuate_cs(cs_obj)
+            self._store(path, cs_obj)
+            self._complete(path)
+            self._maybe_chunk_commit()
+            return True
+        blocked_on = cs_obj.blocked_on
+        if hasattr(cs_obj, "clear_bloat"):
+            cs_obj.clear_bloat()
+        else:
+            cs_obj.gp = None
+        self._store(path, cs_obj)
+        if blocked_on and blocked_on != path and self._in_flight(blocked_on):
+            self.waiters[blocked_on].add(path)
+        elif defer:
+            # Unresolvable for now: retried at epoch boundaries, stubbed by the final wave pass
+            self.deferred_queue.append(path)
+        return False
+
+    def _drain_ready(self) -> None:
+        """Run the ChangeSets woken by completed files, and in turn the ones they wake."""
+        while self._ready:
+            path = self._ready.popleft()
+            if path in self.completed:
+                continue
+            cs_obj = self.gp.ChangeSet_Dict.get(path)
+            if cs_obj is not None:
+                self._execute(path, cs_obj, defer=True)
+
+    def _wake_completed(self) -> None:
+        """Wake waiters of files completed outside the scheduler (e.g. by the wave passes)."""
+        for dep in [d for d in self.waiters if d in self.completed]:
+            self._complete(dep)
+        self._drain_ready()
 
     def ingest_batch(self, batch_dict: dict[str, ChangeSet], is_header_stage: bool = False) -> None:
-        """Ingest newly arrived ChangeSets from a worker batch into gp.ChangeSet_Dict."""
+        """Ingest newly arrived ChangeSets from a worker batch, executing every one whose dependencies allow."""
         # Collect worker micro-profiler metrics into StageProfiler if active
         if getattr(G, "STAGE_PROFILER", None) is not None:
             for cs_obj in batch_dict.values():
@@ -938,162 +1120,107 @@ class DependencyScheduler:
                     G.STAGE_PROFILER.record_worker_profiler(cs_obj.profiler)
                     cs_obj.profiler = None
 
-        # 1. Extract lightweight foreign dependencies into gp.file_deps before compression
+        # 1. Extract lightweight foreign dependencies and sizes into gp before compression
+        op_counts = getattr(self.gp, "cs_op_counts", None)
         for path, cs_obj in batch_dict.items():
             f_deps = getattr(cs_obj, "foreign_deps", None)
-            if f_deps:
-                self.gp.file_deps[path] = set(f_deps)
-            else:
-                self.gp.file_deps[path] = set()
+            self.gp.file_deps[path] = set(f_deps) if f_deps else set()
+            if op_counts is not None:
+                op_counts[path] = len(getattr(cs_obj, "cs", None) or ())
 
         purged = execute_and_purge(batch_dict)
-        if is_header_stage:
-            for path, cs_obj in purged.items():
-                cs_obj.batch_cs_dict = purged
+        for cs_obj in purged.values():
+            cs_obj.batch_cs_dict = purged
 
-            for path, cs_obj in purged.items():
-                if getattr(cs_obj, "cs_processed", False):
-                    self.completed.add(path)
-                    cs_obj.batch_cs_dict = None
-                    self.gp.ChangeSet_Dict[path] = cs_obj
+        for path, cs_obj in purged.items():
+            if getattr(cs_obj, "cs_processed", False):
+                # Executed by execute_and_purge (no foreign references)
+                self._store(path, cs_obj)
+                self._complete(path)
+                continue
+            if path in self.completed:
+                self._store(path, cs_obj)
+                continue
+            if is_header_stage:
+                # Hold headers until the in-flight files they reference have executed
+                pending = {d for d in (getattr(cs_obj, "foreign_deps", None) or ()) if d != path and self._in_flight(d)}
+                if pending:
+                    self.pending_deps[path] = pending
+                    for dep in pending:
+                        self.waiters[dep].add(path)
+                    self._store(path, cs_obj)
                     continue
-                if path in self.completed:
-                    cs_obj.batch_cs_dict = None
-                    self.gp.ChangeSet_Dict[path] = cs_obj
-                    continue
-                f_deps = getattr(cs_obj, "foreign_deps", None)
-                if not f_deps or all(dep in self.completed for dep in f_deps):
-                    cs_obj.gp = self.gp
-                    if cs_obj.execute():
-                        self.completed.add(path)
-                        self.executed_count += 1
-                        extract_tags_and_evacuate_cs(cs_obj)
-                        cs_obj.batch_cs_dict = None
-                        self.gp.ChangeSet_Dict[path] = cs_obj
-                        continue
-                cs_obj.batch_cs_dict = None
-                self.gp.ChangeSet_Dict[path] = cs_obj
-        else:
-            # During source stage (or standalone test ingestion), execute ChangeSets immediately in streaming mode!
-            # Avoid upfront double-compression: only store into ChangeSet_Dict after execution & evacuation.
-            for path, cs_obj in purged.items():
-                cs_obj.batch_cs_dict = purged
-
-            for path, cs_obj in purged.items():
-                if getattr(cs_obj, "cs_processed", False):
-                    self.completed.add(path)
-                    cs_obj.batch_cs_dict = None
-                    self.gp.ChangeSet_Dict[path] = cs_obj
-                    continue
-                if path in self.completed:
-                    cs_obj.batch_cs_dict = None
-                    self.gp.ChangeSet_Dict[path] = cs_obj
-                    continue
-                cs_obj.gp = self.gp
-                if cs_obj.execute():
-                    self.completed.add(path)
-                    self.executed_count += 1
-                    extract_tags_and_evacuate_cs(cs_obj)
-                    cs_obj.batch_cs_dict = None
-                    self.gp.ChangeSet_Dict[path] = cs_obj
-                    if self.executed_count % self.chunk_commit_interval == 0:
-                        try:
-                            G.TE.commit_all()
-                        except Exception as commit_err:
-                            logger.warning(f"Chunk commit hit transient error ({commit_err}); re-verifying DB connection and retrying...")
-                            if getattr(G.TE, "db", None) is not None and hasattr(G.TE.db, "check_if_connected"):
-                                G.TE.db.check_if_connected()
-                            G.TE.commit_all()
-                        if hasattr(self.gp, "_ast_negative_cache"):
-                            self.gp._ast_negative_cache.clear()
-                        reclaim_system_memory()
-                else:
-                    # Unresolvable reference: defer to final wave pass
-                    cs_obj.batch_cs_dict = None
-                    if hasattr(cs_obj, "clear_bloat"):
-                        cs_obj.clear_bloat()
-                    else:
-                        cs_obj.gp = None
-                    self.gp.ChangeSet_Dict[path] = cs_obj
-                    self.deferred_queue.append(path)
+            # Header failures stay for resolve_headers(); source failures are deferred
+            self._execute(path, cs_obj, defer=not is_header_stage)
+        self._drain_ready()
 
     def resolve_headers(self) -> None:
         """Resolve all remaining header ChangeSets in wave order, breaking circular deadlocks with stubs."""
         execute_phase2_parallel_waves(self.gp, chunk_commit_interval=self.chunk_commit_interval, completed_set=self.completed)
         self.completed.update(self.gp.ChangeSet_Dict.keys())
+        self.pending_deps.clear()
+        self._wake_completed()
         self.executed_count = len(self.completed)
         if hasattr(self.gp, "_ast_negative_cache"):
             self.gp._ast_negative_cache.clear()
         reclaim_system_memory()
 
     def drain_deferred_queue(self) -> int:
-        """Attempt non-stub execution for deferred queue items that may now be unblocked.
+        """Retry deferred ChangeSets (without stubs) and any woken waiters.
 
         Returns:
-            Number of newly unblocked and completed ChangeSets.
+            Number of newly executed ChangeSets.
         """
-        if not self.deferred_queue:
-            return 0
-        unblocked_count = 0
-        still_deferred = deque()
-        while self.deferred_queue:
-            current_cs = self.deferred_queue.popleft()
-            if current_cs in self.completed:
+        executed_before = self.executed_count
+        self._wake_completed()
+        deferred, self.deferred_queue = self.deferred_queue, deque()
+        for path in deferred:
+            if path in self.completed:
                 continue
-            cs_obj = self.gp.ChangeSet_Dict.get(current_cs)
-            if cs_obj is None:
-                continue
-            cs_obj.gp = self.gp
-            if cs_obj.execute(force_stubs=False):
-                self.completed.add(current_cs)
-                self.executed_count += 1
-                unblocked_count += 1
-                extract_tags_and_evacuate_cs(cs_obj)
-                self.gp.ChangeSet_Dict[current_cs] = cs_obj
-            else:
-                still_deferred.append(current_cs)
-
-        self.deferred_queue = still_deferred
-        return unblocked_count
+            cs_obj = self.gp.ChangeSet_Dict.get(path)
+            if cs_obj is not None:
+                self._execute(path, cs_obj, defer=True)
+        self._drain_ready()
+        return self.executed_count - executed_before
 
     def finalize(self) -> None:
         """Finalize resolution of all remaining ChangeSets via Phase 2 wave-based execution."""
         # 1. First attempt non-stub execution for deferred queue items that may now be unblocked
         self.drain_deferred_queue()
 
-        # 2. If any unexecuted ChangeSets remain, run wave resolution
+        # 2. Every ChangeSet still waiting (cycles, files that never arrived) goes through the wave pass
         execute_phase2_parallel_waves(self.gp, chunk_commit_interval=self.chunk_commit_interval, completed_set=self.completed)
         self.completed.update(self.gp.ChangeSet_Dict.keys())
+        self.waiters.clear()
+        self.pending_deps.clear()
         self.executed_count = len(self.completed)
         if hasattr(self.gp, "_ast_negative_cache"):
             self.gp._ast_negative_cache.clear()
         G.TE.commit_all(update_in_mem_indexes=False)
+        # Every ChangeSet has executed: the Stage 2 shared symbol segments are no longer read
+        self.gp.close_shared_symbols()
         reclaim_system_memory()
-_phase2_shared_symbols: Any | None = None
 
 
-def _phase2_resolve_worker(task: Any) -> tuple[str, list]:
-    """Worker task pre-resolving foreign references and unpacking views for a ChangeSet using zero-copy shared memory."""
-    global _phase2_shared_symbols
-    if isinstance(task, tuple) and len(task) == 3:
-        cs, resolved_symbols_map, resolved_names_map = task
-        cs.gp = None
-        pre_resolved = cs.pre_resolve_operations(resolved_symbols_map, resolved_names_map)
-        return cs.current_path, pre_resolved
+def _stored_changeset_executed(cs_dict: Any, path: str) -> bool | None:
+    """Whether the ChangeSet stored under `path` has fully executed (None if there is none).
 
-    cs = task
-    cs.gp = None
-    syms_view = None
-    names_view = None
-    if _phase2_shared_symbols is not None:
-        syms_view = _phase2_shared_symbols.symbols
-        names_view = _phase2_shared_symbols.names
-    elif getattr(gp, "_shared_symbols", None) is not None:
-        syms_view = gp._shared_symbols.symbols
-        names_view = gp._shared_symbols.names
-
-    pre_resolved = cs.pre_resolve_operations(syms_view, names_view)
-    return cs.current_path, pre_resolved
+    For a CompressedChangeSetDict the answer comes from where the entry lives, without decompressing it:
+    executed ChangeSets are evacuated into `_evacuated_store`, and evacuated ones are never compressed.
+    """
+    evacuated_store = getattr(cs_dict, "_evacuated_store", None)
+    if evacuated_store is not None:
+        if path in evacuated_store:
+            return True
+        cs = cs_dict._lru_cache.get(path)
+        if cs is None:
+            return False if cs_dict._compressed_store.get(path) is not None else None
+    else:
+        cs = cs_dict.get(path)
+        if cs is None:
+            return None
+    unresolved = getattr(cs, "unresolved_indices", None)
+    return bool(getattr(cs, "cs_processed", False)) and not unresolved
 
 
 def execute_phase2_parallel_waves(
@@ -1101,16 +1228,13 @@ def execute_phase2_parallel_waves(
     chunk_commit_interval: int = 0,
     completed_set: set[str] | None = None,
 ) -> None:
-    """Execute unexecuted ChangeSets using zero-copy shared memory wave-based resolution.
+    """Execute unexecuted ChangeSets in-process in dependency waves.
 
-    Eliminates memory spikes by:
-    1. Backing symbol lookups with SharedSymbolReader mmap across forked workers (zero IPC dict copying).
-    2. Enforcing micro-chunk database commits every wave or 150-250 files to bound TableEngine heap buffers.
-    3. Performing batch cycle breaking on strongly-connected circular dependency deadlocks.
-    4. Immediately evacuating AST buffers upon execution.
+    Bounds memory by:
+    1. Enforcing micro-chunk database commits every wave or 150-250 files to bound TableEngine heap buffers.
+    2. Performing batch cycle breaking on strongly-connected circular dependency deadlocks.
+    3. Immediately evacuating AST buffers upon execution.
     """
-    global _phase2_shared_symbols
-
     if chunk_commit_interval <= 0:
         chunk_commit_interval = 150 if G.VERY_LOW_MEMORY_MODE else (250 if G.LOW_MEMORY_MODE else 400)
 
@@ -1134,40 +1258,25 @@ def execute_phase2_parallel_waves(
             if getattr(cs_obj, "cs_processed", False):
                 completed_set.add(path)
 
-    # 1. Identify all remaining unexecuted paths (<2.5 MB)
+    # 1. Identify all remaining unexecuted paths without decompressing stored ChangeSets
     remaining: set[str] = set()
     for path in gp.file_deps.keys():
         if path in completed_set:
             continue
-        cs = gp.ChangeSet_Dict.get(path)
-        if cs is None:
+        executed = _stored_changeset_executed(gp.ChangeSet_Dict, path)
+        if executed is None:
             continue
-        if not getattr(cs, "cs_processed", False) or (getattr(cs, "unresolved_indices", None) is not None and len(cs.unresolved_indices) > 0):
-            remaining.add(path)
-        else:
+        if executed:
             completed_set.add(path)
+        else:
+            remaining.add(path)
 
     if not remaining:
         return
 
     logger.info(COLOR.cyan(f"[Phase 2] {len(remaining)} unexecuted ChangeSets entering wave resolution."))
 
-    # 2. Build or reuse structured shared memory symbols hashtable
-    from table_engine.shared_buffer import SharedSymbolBuilder
-    if getattr(gp, "_shared_symbols", None) is None and gp.file_symbols:
-        resolved_symbols_map: dict[tuple[str, int], int] = {}
-        for f_map in gp.file_symbols.values():
-            resolved_symbols_map.update(f_map)
-        resolved_names_map = {k[0]: v for k, v in resolved_symbols_map.items()}
-        sym_builder = SharedSymbolBuilder(mode=getattr(G.TE, "hugepages", "auto"))
-        gp._shared_symbols = sym_builder.build(resolved_symbols_map, resolved_names_map)
-        del resolved_symbols_map
-        del resolved_names_map
-        reclaim_system_memory()
-
-    _phase2_shared_symbols = getattr(gp, "_shared_symbols", None)
-
-    # 3. Build lightweight dependency DAG and inverted dependent mapping (~10 MB)
+    # 2. Build lightweight dependency DAG and inverted dependent mapping (~10 MB)
     dependents: dict[str, set[str]] = defaultdict(set)
     deps: dict[str, set[str]] = {}
     for path in remaining:
@@ -1181,6 +1290,20 @@ def execute_phase2_parallel_waves(
     last_commit_count = 0
     t_phase2_start = time.perf_counter()
     resolution_succeeded = False
+    op_counts = getattr(gp, "cs_op_counts", None) or {}
+    # Files whose dependencies have all executed; filled as files complete (next wave)
+    ready: set[str] = {p for p in remaining if not deps[p]}
+
+    def _finish(path: str) -> None:
+        remaining.discard(path)
+        completed_set.add(path)
+        deps.pop(path, None)
+        for waiter in dependents.pop(path, ()):
+            waiter_deps = deps.get(waiter)
+            if waiter_deps is not None:
+                waiter_deps.discard(path)
+                if not waiter_deps and waiter in remaining:
+                    ready.add(waiter)
 
     try:
         while remaining:
@@ -1189,21 +1312,17 @@ def execute_phase2_parallel_waves(
                 break
             wave_num += 1
             t_wave_start = time.perf_counter()
-            # Wave selection: files with no unexecuted dependencies in remaining
-            wave = [p for p in remaining if not deps.get(p)]
+            # Wave selection: files with no unexecuted dependencies in remaining (sorted for reproducible ids)
+            wave = sorted(ready)
+            ready.clear()
 
             if not wave:
-                # Deadlock detected: precision minimal cycle breaking on top candidate with most dependents
-                dep_counts = {p: len(dependents.get(p, ())) for p in remaining}
-                sorted_cands = sorted(
-                    remaining,
-                    key=lambda k: (dep_counts[k], -len(getattr(gp.ChangeSet_Dict.get(k), "cs", ()) or ())),
-                    reverse=True,
-                )
-                cand_path = sorted_cands[0]
+                # Deadlock: force the file most others wait on (ties: fewest operations to stub, then path).
+                # Chosen from the dependency counts alone: decompressing every candidate cost seconds per break.
+                cand_path = max(remaining, key=lambda k: (len(dependents.get(k, ())), -op_counts.get(k, 0), k))
                 logger.warning(COLOR.yellow(
                     f"[Phase 2] Breaking circular dependency deadlock: precision force-resolving 1 stub "
-                    f"(candidate '{cand_path}' has {dep_counts[cand_path]} dependents, {len(remaining)} files remaining)"
+                    f"(candidate '{cand_path}' has {len(dependents.get(cand_path, ()))} dependents, {len(remaining)} files remaining)"
                 ))
 
                 cand_cs = gp.ChangeSet_Dict[cand_path]
@@ -1211,13 +1330,7 @@ def execute_phase2_parallel_waves(
                 cand_cs.execute(force_stubs=True)
                 extract_tags_and_evacuate_cs(cand_cs)
                 gp.ChangeSet_Dict[cand_path] = cand_cs
-                remaining.remove(cand_path)
-                completed_set.add(cand_path)
-                if cand_path in deps:
-                    del deps[cand_path]
-                for waiter in dependents.pop(cand_path, ()):
-                    if waiter in deps:
-                        deps[waiter].discard(cand_path)
+                _finish(cand_path)
                 executed_count += 1
 
                 if executed_count - last_commit_count >= chunk_commit_interval:
@@ -1247,13 +1360,7 @@ def execute_phase2_parallel_waves(
                         ))
                 extract_tags_and_evacuate_cs(cs)
                 gp.ChangeSet_Dict[path] = cs
-                remaining.remove(path)
-                completed_set.add(path)
-                if path in deps:
-                    del deps[path]
-                for waiter in dependents.pop(path, ()):
-                    if waiter in deps:
-                        deps[waiter].discard(path)
+                _finish(path)
                 executed_count += 1
 
                 if executed_count - last_commit_count >= chunk_commit_interval:
@@ -1273,36 +1380,729 @@ def execute_phase2_parallel_waves(
 
         resolution_succeeded = True
     finally:
-        pass
-
+        resolution_time = time.perf_counter() - t_phase2_start
+        commit_time = 0.0
         if resolution_succeeded and executed_count > last_commit_count:
             logger.info(COLOR.yellow(
                 f"[Phase 2] Final commit: committing batch at {executed_count} executed ChangeSets to database..."
             ))
+            t_commit = time.perf_counter()
             G.TE.commit_all()
             if hasattr(gp, "_ast_negative_cache"):
                 gp._ast_negative_cache.clear()
             reclaim_system_memory()
+            commit_time = time.perf_counter() - t_commit
 
-        _phase2_shared_symbols = None
-
-    total_phase2_time = time.perf_counter() - t_phase2_start
-    avg_velocity = executed_count / max(0.001, total_phase2_time)
+    avg_velocity = executed_count / max(0.001, resolution_time)
     logger.info(COLOR.green(
         f"[Phase 2] Completed resolution of {executed_count} ChangeSets across {wave_num} waves "
-        f"in {total_phase2_time:.1f}s ({avg_velocity:.1f} files/s)."
+        f"in {resolution_time:.1f}s ({avg_velocity:.1f} files/s); final commit {commit_time:.1f}s."
     ))
 
 
+# Frames on each worker's private duplex pipe. The parent sends task frames (two ahead, so a worker never
+# waits for its next batch) and a stop frame once no batch is left; the worker answers each task with a
+# result frame and ends with a done frame. A pipe that closes before the done frame means the worker died
+# (signal, OOM kill, libclang abort) while parsing the oldest batch it had not returned.
+_FRAME_TASK = b"T"
+_FRAME_STOP = b"S"
+_FRAME_RESULT = b"R"
+_FRAME_INIT_FAILED = b"I"
+_FRAME_DONE = b"D"
+_RESULT_HEADER = struct.Struct("<cqB")  # frame tag, batch id, zlib-compressed flag
+_STAGE_END = object()
+# Batches sent to a worker ahead of the one it parses
+_TASKS_AHEAD = 2
+# Serialized batches the reader thread may hold for the ingest thread; more only adds parent memory
+_PREFETCH_DEPTH = 2
+
+
+def _recv_task(conn: Any) -> tuple[int, list[str]] | None:
+    """Worker side: wait for the next `(batch_id, files)` task, or None on the stop frame or a closed pipe."""
+    try:
+        frame = conn.recv_bytes()
+    except (EOFError, OSError):
+        return None
+    if frame[:1] != _FRAME_TASK:
+        return None
+    return pickle.loads(frame[1:])
+
+
+@dataclass
+class WorkerStageResult:
+    """Outcome of one `_run_worker_stage()` call."""
+
+    files_ingested: int = 0
+    failed_workers: int = 0
+    deadline_hit: bool = False
+    elapsed_s: float = 0.0
+    tail_idle_s: float = 0.0
+    lost_files: list[str] = field(default_factory=list)
+    # Where the stage's time went (see _stage_time_split())
+    split: dict[str, float] = field(default_factory=dict)
+
+
+def _encode_batch_result(
+    batch_id: int,
+    batch_cs_dict: dict[str, Any],
+    errors: list[tuple[str, str, str]],
+    compress: bool,
+) -> bytes | memoryview:
+    """Serialize a parsed batch and its per-file errors into one result frame."""
+    buf = io.BytesIO()
+    buf.write(_RESULT_HEADER.pack(_FRAME_RESULT, batch_id, 0))
+    pickle.dump((batch_cs_dict, errors), buf, protocol=pickle.HIGHEST_PROTOCOL)
+    if not compress:
+        return buf.getbuffer()
+    body = zlib.compress(buf.getbuffer()[_RESULT_HEADER.size :], level=1)
+    return _RESULT_HEADER.pack(_FRAME_RESULT, batch_id, 1) + body
+
+
+def _decode_batch_result(frame: bytes) -> tuple[int, bytes | memoryview]:
+    """Split a result frame into its batch id and pickled `(batch_cs_dict, errors)` body."""
+    _tag, batch_id, compressed = _RESULT_HEADER.unpack_from(frame, 0)
+    body = memoryview(frame)[_RESULT_HEADER.size :]
+    return batch_id, (zlib.decompress(body) if compressed else body)
+
+
+# Small stages are split into about this many batches per worker: with one large batch per worker the
+# others sit idle while the slowest finishes (10-40s per small version)
+_BATCHES_PER_WORKER = 4
+_MIN_BATCH_FILES = 4
+
+
+def _balanced_batch_size(n_files: int, num_workers: int, limit: int) -> int:
+    """Largest batch size up to `limit` that still gives each worker about `_BATCHES_PER_WORKER` batches."""
+    target = math.ceil(n_files / max(1, num_workers * _BATCHES_PER_WORKER))
+    return max(1, min(limit, max(_MIN_BATCH_FILES, target)))
+
+
+def _select_worker_changes() -> list[str]:
+    """Return the change lines workers must parse: Step 4.5's filtered list when it ran, else gp.Change_List.
+
+    An empty filtered list means every change was deduplicated, not "parse everything".
+    """
+    if gp.worker_change_list is not None:
+        return gp.worker_change_list
+    return gp.Change_List or []
+
+
+def _memory_profile() -> dict[str, int]:
+    """Worker count and batch budgets for the active memory mode (`G.MEMORY_MODE`)."""
+    cpus = int(G.CPUS)
+    if G.VERY_LOW_MEMORY_MODE:
+        return {"workers": max(1, min(2, cpus // 4)), "header_batch": 25, "normal_batch": 25,
+                "heavy_batch": 10, "max_batch_bytes": 350_000, "epoch_files": 2000}
+    if G.LOW_MEMORY_MODE:
+        return {"workers": max(1, cpus // 2), "header_batch": 50, "normal_batch": 50,
+                "heavy_batch": 25, "max_batch_bytes": 750_000, "epoch_files": 4500}
+    return {"workers": max(1, cpus - 1), "header_batch": 200, "normal_batch": 200,
+            "heavy_batch": 50, "max_batch_bytes": 1_500_000, "epoch_files": 4500}
+
+
+def _close_parent_db() -> None:
+    """Close the parent's TableEngine connection so no forked child inherits a live socket."""
+    db = getattr(G.TE, "db", None)
+    G.TE.db = None
+    if db is not None:
+        try:
+            db.close()
+        except Exception:
+            pass
+
+
+def _parent_rss_mb() -> float:
+    """Resident set size of this process in MB (0 when /proc is unavailable)."""
+    try:
+        with open("/proc/self/statm") as f:
+            return int(f.read().split()[1]) * os.sysconf("SC_PAGE_SIZE") / (1024 * 1024)
+    except Exception:
+        return 0.0
+
+
+def _register_file_names(items: list[str]) -> None:
+    """Assign m_file_name ids to every path in `items` and commit them before workers fork.
+
+    Workers find these ids in the inherited cache instead of allocating colliding ids of their own.
+    """
+    for item in items:
+        if not item:
+            continue
+        for p in item.split("\t")[1:]:
+            if p:
+                G.TE.set(m_file_name.table_id, (None, p))
+    G.TE.commit(m_file_name.table_id)
+
+
+def _commit_all_with_retry(context: str) -> None:
+    """Commit every staged TableEngine row, re-checking the DB connection once on a transient failure."""
+    try:
+        G.TE.commit_all()
+    except Exception as e:
+        logger.warning(f"{context} TableEngine commit hit transient error ({e}); re-verifying DB connection and retrying...")
+        if getattr(G.TE, "db", None) is not None and hasattr(G.TE.db, "check_if_connected"):
+            G.TE.db.check_if_connected()
+        G.TE.commit_all()
+
+
+def _begin_background_commits() -> None:
+    """Let in-stage commits run on the TableEngine's writer thread while this thread keeps ingesting."""
+    if hasattr(G.TE, "wait_for_commit"):
+        G.TE.async_commits = True
+
+
+def _end_background_commits(context: str) -> None:
+    """Switch background commits off and wait for the last one (nothing may fork while a writer runs).
+
+    A failed background commit put its rows back into staging; they are committed again here.
+    """
+    if not hasattr(G.TE, "wait_for_commit"):
+        return
+    G.TE.async_commits = False
+    try:
+        G.TE.wait_for_commit()
+    except Exception as e:
+        logger.warning(COLOR.yellow(f"{context} background commit failed ({e}); its rows were put back, committing them again..."))
+        _commit_all_with_retry(context)
+
+
+# Staged rows that make a parent waiting for its workers start a background commit (`_maybe_idle_commit()`)
+_IDLE_COMMIT_MIN_ROWS = 100_000
+
+
+def _maybe_idle_commit() -> None:
+    """Start a background commit while the parent waits for worker results.
+
+    Chunk commits come every `chunk_commit_interval` executed files, so a small version used to write all its rows
+    in one commit after parsing, with every worker idle. Committing while waiting overlaps that write with parsing.
+    """
+    te = G.TE
+    if not getattr(te, "async_commits", False) or te.pending_commit_rows or te.staged_rows < _IDLE_COMMIT_MIN_ROWS:
+        return
+    try:
+        te.commit_all()
+    except Exception as e:
+        # A failed batch is back in staging; the next commit writes it again
+        logger.warning(COLOR.yellow(f"Background commit while waiting for workers failed ({e}); retrying with the next commit."))
+
+
+def _parent_split_counters() -> dict[str, float]:
+    """Snapshot of the parent's commit, database-read and memory-reclaim counters (diffed per stage)."""
+    commit = getattr(G.TE, "commit_stats", None) or {}
+    return {
+        "commit_blocked_s": float(commit.get("blocked_s", 0.0)),
+        "commit_write_s": float(commit.get("write_s", 0.0)),
+        "commit_rows": float(commit.get("rows", 0)),
+        "db_reads": float(getattr(G.TE, "db_reads", 0)),
+        "db_read_s": float(getattr(G.TE, "db_read_s", 0.0)),
+        "gc_s": MEMORY_RECLAIM_STATS["collect_s"] + MEMORY_RECLAIM_STATS["trim_s"],
+    }
+
+
+# Per-worker counters a worker sends with its done frame (file_processing_worker)
+_WORKER_SPLIT_KEYS = (
+    "busy_s", "task_wait_s", "send_wait_s", "gc_s", "prune_s", "pre_resolve_s", "ref_views_s", "encode_s", "db_reads", "db_read_s",
+)
+
+
+def _stage_time_split(
+    parent: dict[str, float], base: dict[str, float], worker_stats: list[dict[str, float]]
+) -> dict[str, float]:
+    """Combine the parent's loop timings, its counter deltas since `base` and the workers' reported counters."""
+    split = dict(parent)
+    for key, value in _parent_split_counters().items():
+        split[key] = value - base.get(key, 0.0)
+    split["workers"] = float(len(worker_stats))
+    for key in _WORKER_SPLIT_KEYS:
+        split[f"worker_{key}"] = sum(float(ws.get(key, 0.0)) for ws in worker_stats)
+    return split
+
+
+def _format_time_split(split: dict[str, float]) -> str:
+    """One-line summary of `_stage_time_split()`."""
+    text = (
+        f"parent waited {split.get('wait_s', 0.0):.1f}s for results, decoded {split.get('decode_s', 0.0):.1f}s, "
+        f"ingested {split.get('ingest_s', 0.0):.1f}s (DB reads {int(split.get('db_reads', 0)):,} in "
+        f"{split.get('db_read_s', 0.0):.1f}s), blocked on commits {split.get('commit_blocked_s', 0.0):.1f}s of "
+        f"{split.get('commit_write_s', 0.0):.1f}s writing {int(split.get('commit_rows', 0)):,} rows, "
+        f"GC/trim {split.get('gc_s', 0.0):.1f}s"
+    )
+    total = sum(split.get(f"worker_{k}", 0.0) for k in ("busy_s", "task_wait_s", "send_wait_s", "gc_s", "tail_idle_s"))
+    if split.get("workers") and total > 0:
+        def pct(key: str) -> float:
+            return 100.0 * split.get(f"worker_{key}", 0.0) / total
+
+        text += (
+            f"; workers {pct('busy_s'):.0f}% parsing (dependency pruning {split.get('worker_prune_s', 0.0):.1f}s, "
+            f"DB reads {int(split.get('worker_db_reads', 0)):,} in {split.get('worker_db_read_s', 0.0):.1f}s), "
+            f"{pct('send_wait_s'):.0f}% blocked sending to the parent, "
+            f"{pct('task_wait_s') + pct('tail_idle_s'):.0f}% without a task (or exited), "
+            f"{pct('gc_s'):.0f}% GC"
+        )
+    return text
+
+
+# Symbol item counters (core/SymbolRows.STATS) reported by this version's parsing workers
+WORKER_SYMBOL_STATS: Counter = Counter()
+
+
+def _log_symbol_stats(version: str, parent_base: Counter) -> None:
+    """Log how this version's symbol items were stored: in tags (shared) or per blob, and why."""
+    stats = WORKER_SYMBOL_STATS + (SYMBOL_STATS - parent_base)
+    WORKER_SYMBOL_STATS.clear()
+    if not stats:
+        return
+    in_tags = sum(stats[f"{kind} {how}"] for kind in ("refs", "defs") for how in ("reused", "new tag"))
+    reused = stats["refs reused"] + stats["defs reused"]
+    reasons = ("changed reused tag", "conflicting key", "outside tag", "without tag")
+    per_blob = {how: stats[f"refs {how}"] + stats[f"defs {how}"] for how in reasons}
+    logger.info(
+        f"[Symbols] '{version}': {in_tags:,} items stored in tags ({reused:,} of them in reused tags, not rewritten); "
+        f"{sum(per_blob.values()):,} per blob (" + ", ".join(f"{how} {n:,}" for how, n in per_blob.items()) + "); "
+        f"{stats['keys refined']:,} keys refined by position"
+    )
+
+
+def _publish_file_symbols() -> None:
+    """Pack the symbols published since the previous call into a new file-scoped shared segment.
+
+    Forked workers query the segments (`gp._shared_symbols`) per target file without copying them,
+    so the parent's heap copies are dropped once packed.
+    """
+    if gp.file_symbols:
+        t_build = time.perf_counter()
+        builder = SharedSymbolBuilder(mode=getattr(G.TE, "hugepages", "auto"))
+        segment = builder.build_file_scoped(gp.file_symbols)
+        if segment is not None:
+            if gp._shared_symbols is None:
+                gp._shared_symbols = SharedSymbolChain()
+            gp._shared_symbols.append(segment)
+            logger.info(
+                f"[Stage 2 - Sources] Published {segment.sym_count} symbols of {len(gp.file_symbols)} files into shared "
+                f"segment {len(gp._shared_symbols.segments)} ({segment.nbytes // (1024 * 1024)}MB, "
+                f"{time.perf_counter() - t_build:.1f}s); {gp._shared_symbols.sym_count} shared symbols in total."
+            )
+    gp.file_symbols.clear()
+    gp.file_names.clear()
+    gp._ast_staged_symbols.clear()
+    gp._ast_staged_names.clear()
+    gp.unchanged_symbol_cache.clear()
+    reclaim_system_memory()
+
+
+def _run_worker_stage(
+    label: str,
+    batches: list[tuple[int, list[str]]],
+    ingest: Callable[[dict[str, Any]], None],
+    num_workers: int,
+    error_list: list[tuple[str, str, str]],
+    on_started: Callable[[], None] | None = None,
+    retry_lost: bool = True,
+    worker_target: Callable[..., None] | None = None,
+) -> WorkerStageResult:
+    """Parse `batches` on forked workers and stream every batch result into `ingest` on this thread.
+
+    Each worker owns a duplex pipe. A reader thread sends it batches in the given order (`_TASKS_AHEAD`
+    in advance), receives its result frames (blocking reads release the GIL) and hands at most
+    `_PREFETCH_DEPTH` serialized batches to this thread, so a parent that falls behind stalls the
+    workers instead of buffering their output. `on_started` runs once the workers are running.
+
+    A worker that dies is attributed the oldest batch it had not returned; its other queued batches go
+    back to the surviving workers. Batches that never came back are parsed again afterwards, the dead
+    workers' batches one file per batch to isolate the file that kills a worker. An `ingest` failure is
+    recorded with its batch and does not stop the stage. If no worker can start (e.g. the database is
+    unreachable), the stage raises.
+    """
+    result = WorkerStageResult()
+    if not batches:
+        if on_started is not None:
+            on_started()
+        return result
+
+    target = worker_target or file_processing_worker
+    batch_files = dict(batches)
+    num_workers = max(1, min(num_workers, len(batches)))
+    t_start = time.perf_counter()
+
+    procs: dict[int, Any] = {}
+    conns: dict[Any, int] = {}
+    _end_background_commits(label)
+    _close_parent_db()
+    try:
+        freeze_system_memory()
+        for worker_id in range(num_workers):
+            parent_conn, child_conn = _MP.Pipe(duplex=True)
+            p = _MP.Process(target=target, args=(child_conn, gp.VID, gp, MF, worker_id))
+            p.start()
+            # The worker now holds the only other end: its exit closes the pipe
+            child_conn.close()
+            procs[worker_id] = p
+            conns[parent_conn] = worker_id
+    finally:
+        G.TE.db = G.DB()
+
+    pending: deque[tuple[int, list[str]]] = deque(batches)
+    assigned: dict[int, deque[int]] = {worker_id: deque() for worker_id in procs}
+    stopped: set[int] = set()
+    done_workers: set[int] = set()
+    init_failed: set[int] = set()
+    suspect_batches: list[int] = []
+    finish_times: list[float] = []
+    frames: queue.Queue = queue.Queue(maxsize=_PREFETCH_DEPTH)
+    stop = threading.Event()
+    reader_failures: list[BaseException] = []
+    worker_stats: list[dict[str, float]] = []
+    # Per worker: (header symbol maps it loaded, blob ids it looked up), merged into gp.blob_symbol_cache
+    blob_symbol_reports: list[tuple[Any, Any]] = []
+
+    def _offer(item: Any) -> bool:
+        while not stop.is_set():
+            try:
+                frames.put(item, timeout=0.5)
+                return True
+            except queue.Full:
+                continue
+        return False
+
+    def _dispatch(conn: Any, worker_id: int) -> None:
+        """Send `worker_id` its next batch, or its stop frame once no batch is left."""
+        if worker_id in stopped:
+            return
+        try:
+            if pending:
+                b_id, b_files = pending.popleft()
+                assigned[worker_id].append(b_id)
+                conn.send_bytes(_FRAME_TASK + pickle.dumps((b_id, b_files), protocol=pickle.HIGHEST_PROTOCOL))
+            else:
+                stopped.add(worker_id)
+                conn.send_bytes(_FRAME_STOP)
+        except OSError:
+            # The worker is gone; its EOF is handled by the read loop
+            pass
+
+    def _reader_loop() -> None:
+        open_conns = dict(conns)
+        try:
+            for _ in range(_TASKS_AHEAD):
+                for conn, worker_id in open_conns.items():
+                    _dispatch(conn, worker_id)
+            while open_conns and not stop.is_set():
+                for conn in mp_wait(list(open_conns), timeout=0.5):
+                    worker_id = open_conns[conn]
+                    try:
+                        frame = conn.recv_bytes()
+                    except (EOFError, OSError):
+                        del open_conns[conn]
+                        conn.close()
+                        finish_times.append(time.perf_counter())
+                        unreturned = assigned[worker_id]
+                        if worker_id not in done_workers and unreturned:
+                            if worker_id not in init_failed:
+                                # The oldest unreturned batch was being parsed when the worker died
+                                suspect_batches.append(unreturned.popleft())
+                            # Queued but never started: back to the front for the surviving workers
+                            pending.extendleft(reversed([(b_id, batch_files[b_id]) for b_id in unreturned]))
+                            unreturned.clear()
+                            # Only top up workers below their queue depth, so no pipe fills up with tasks
+                            for other_conn, other_id in open_conns.items():
+                                if len(assigned[other_id]) < _TASKS_AHEAD:
+                                    _dispatch(other_conn, other_id)
+                        continue
+                    tag = frame[:1]
+                    if tag == _FRAME_DONE:
+                        done_workers.add(worker_id)
+                        if len(frame) > 1:
+                            try:
+                                stats = pickle.loads(frame[1:])
+                                WORKER_SYMBOL_STATS.update(stats.pop("symbol_stats", None) or {})
+                                blob_symbol_reports.append((stats.pop("blob_symbols", None), stats.pop("blob_symbols_used", None)))
+                                worker_stats.append(stats)
+                            except Exception:
+                                pass
+                    elif tag == _FRAME_INIT_FAILED:
+                        init_failed.add(worker_id)
+                        error_list.append(pickle.loads(frame[1:]))
+                    elif tag == _FRAME_RESULT:
+                        try:
+                            decoded = _decode_batch_result(frame)
+                        except Exception as e:
+                            # The batch stays unreceived and is parsed again
+                            error_list.append((f"{label} worker {worker_id}", f"Unreadable result frame: {e}", traceback.format_exc()))
+                            continue
+                        del frame
+                        if decoded[0] in assigned[worker_id]:
+                            assigned[worker_id].remove(decoded[0])
+                        # Keep the worker supplied before possibly blocking on the ingest thread
+                        _dispatch(conn, worker_id)
+                        if not _offer(decoded):
+                            return
+        except BaseException as e:
+            reader_failures.append(e)
+        finally:
+            for conn in open_conns:
+                conn.close()
+            _offer(_STAGE_END)
+
+    reader = threading.Thread(target=_reader_loop, name=f"{label} reader", daemon=True)
+    reader.start()
+
+    received: set[int] = set()
+    total = len(batches)
+    completed = False
+    parent_split = {"wait_s": 0.0, "decode_s": 0.0, "ingest_s": 0.0}
+    split_base = _parent_split_counters()
+    try:
+        if on_started is not None:
+            on_started()
+        _begin_background_commits()
+        while True:
+            t_wait = time.perf_counter()
+            try:
+                item = frames.get(timeout=1.0)
+            except queue.Empty:
+                parent_split["wait_s"] += time.perf_counter() - t_wait
+                _maybe_idle_commit()
+                if G.is_deadline_exceeded():
+                    logger.warning(COLOR.yellow(f"[Duration Limit] Execution deadline reached during {label}. Halting early..."))
+                    result.deadline_hit = True
+                    break
+                continue
+            parent_split["wait_s"] += time.perf_counter() - t_wait
+            if item is _STAGE_END:
+                break
+            b_id, body = item
+            del item
+            received.add(b_id)
+            t_decode = time.perf_counter()
+            try:
+                batch_dict, batch_errors = pickle.loads(body)
+            except Exception as e:
+                error_list.extend(
+                    (f, f"Batch {b_id} result could not be deserialized: {e}", traceback.format_exc())
+                    for f in batch_files.get(b_id, ())
+                )
+                continue
+            finally:
+                del body
+                parent_split["decode_s"] += time.perf_counter() - t_decode
+            error_list.extend(batch_errors)
+            t_ingest = time.perf_counter()
+            try:
+                ingest(batch_dict)
+                result.files_ingested += len(batch_dict)
+            except Exception as e:
+                logger.error(COLOR.red(f"{label}: ingesting batch {b_id} failed: {e}"), exc_info=True)
+                error_list.append((
+                    f"Batch {b_id} ({len(batch_files.get(b_id, ()))} files)", f"Ingest failed: {e}", traceback.format_exc()
+                ))
+            parent_split["ingest_s"] += time.perf_counter() - t_ingest
+            del batch_dict
+
+            n_received = len(received)
+            if n_received % 10 == 0 or n_received == total:
+                elapsed = time.perf_counter() - t_start
+                logger.info(
+                    f"{label} ingested batch {n_received}/{total} "
+                    f"({n_received / max(0.001, elapsed):.1f} batches/s, {len(done_workers)}/{num_workers} workers done, "
+                    f"elapsed {elapsed:.1f}s)"
+                )
+                # Normal modes rely on the automatic collector and the trim after each commit
+                if G.LOW_MEMORY_MODE:
+                    reclaim_system_memory()
+            if G.is_deadline_exceeded():
+                logger.warning(COLOR.yellow(f"[Duration Limit] Execution deadline reached during {label}. Halting early..."))
+                result.deadline_hit = True
+                break
+        if reader_failures:
+            raise reader_failures[0]
+        completed = not result.deadline_hit
+    finally:
+        stop.set()
+        if not completed:
+            for p in procs.values():
+                if p.is_alive():
+                    p.terminate()
+        reader.join(timeout=10.0)
+        for p in procs.values():
+            p.join(timeout=10.0 if completed else 2.0)
+            if p.is_alive():
+                p.kill()
+                p.join(timeout=2.0)
+        _end_background_commits(label)
+
+    if len(init_failed) == len(procs):
+        raise RuntimeError(
+            f"{label}: no parsing worker could start ({len(procs)} failed to initialize); "
+            f"first error: {next((e[1] for e in error_list if e[0].startswith('Worker ')), 'unknown')}"
+        )
+
+    for worker_id, p in procs.items():
+        if worker_id in done_workers or worker_id in init_failed:
+            continue
+        if result.deadline_hit and p.exitcode in (-signal.SIGTERM, -signal.SIGKILL):
+            logger.info(f"{label}: worker PID {p.pid} stopped on execution deadline.")
+            continue
+        result.failed_workers += 1
+        logger.error(COLOR.red(f"{label}: worker {worker_id} (PID {p.pid}) died before finishing (exit code {p.exitcode})"))
+
+    for fetched, used in blob_symbol_reports:
+        gp.merge_blob_symbols(fetched, used)
+
+    result.elapsed_s = time.perf_counter() - t_start
+    if len(finish_times) > 1:
+        result.tail_idle_s = max(finish_times) - min(finish_times)
+    result.split = _stage_time_split(parent_split, split_base, worker_stats)
+    if finish_times:
+        # Workers that exited before the last one were idle until the stage ended
+        result.split["worker_tail_idle_s"] = sum(max(finish_times) - t for t in finish_times)
+    logger.info(f"{label} time split: {_format_time_split(result.split)}")
+
+    if result.deadline_hit:
+        return result
+    suspects = [b_id for b_id in suspect_batches if b_id not in received]
+    unfinished = [b_id for b_id, _ in batches if b_id not in received and b_id not in suspects]
+    if not suspects and not unfinished:
+        return result
+
+    next_id = max(batch_files) + 1
+    if retry_lost:
+        # First failure of these batches: retry each file of a dead worker's batch on its own
+        suspect_files = [f for b_id in suspects for f in batch_files[b_id]]
+        retry_batches = [(next_id + i, [f]) for i, f in enumerate(suspect_files)]
+        logger.warning(COLOR.yellow(
+            f"{label}: {len(suspects)} batch(es) lost with a dead worker ({len(suspect_files)} files, re-parsed one "
+            f"file per batch) and {len(unfinished)} batch(es) not parsed yet; parsing them again."
+        ))
+    else:
+        # These single files killed a worker twice: report them and keep going with the rest
+        retry_batches = []
+        for b_id in suspects:
+            for f in batch_files[b_id]:
+                result.lost_files.append(f)
+                error_list.append((f, "A worker process died while parsing this file; it was not ingested.", ""))
+    next_id += len(retry_batches)
+    retry_batches += [(next_id + i, batch_files[b_id]) for i, b_id in enumerate(unfinished)]
+
+    if not retry_batches:
+        return result
+    if not retry_lost and not suspects and not received:
+        # No progress at all in this round: stop instead of retrying forever
+        for b_id in unfinished:
+            for f in batch_files[b_id]:
+                result.lost_files.append(f)
+                error_list.append((f, "No worker was left to parse this file; it was not ingested.", ""))
+        return result
+    retry = _run_worker_stage(
+        label if label.endswith("[retry]") else f"{label} [retry]",
+        retry_batches,
+        ingest,
+        num_workers,
+        error_list,
+        retry_lost=False,
+        worker_target=target,
+    )
+    result.files_ingested += retry.files_ingested
+    result.failed_workers += retry.failed_workers
+    result.deadline_hit = result.deadline_hit or retry.deadline_hit
+    result.lost_files += retry.lost_files
+    return result
+
+
+def _report_worker_errors(error_list: list[tuple[str, str, str]], failed_workers: int) -> None:
+    """Log every file error collected from the workers (tracebacks at debug level)."""
+    if error_list:
+        logger.error(COLOR.red(f"Multicore processing encountered {len(error_list)} file error(s):"))
+        for failed_file, err, tb in error_list:
+            logger.error(COLOR.red(f"  [ERROR] File: {failed_file} => {err}"))
+            if tb:
+                logger.debug(tb)
+    if failed_workers > 0 or error_list:
+        logger.error(COLOR.red(
+            f"Multicore execution completed with {failed_workers} crashed worker(s) and {len(error_list)} file error(s)!"
+        ))
+
+
+def _run_source_epochs(
+    source_files: list[str],
+    working_dir: str | None,
+    profile: dict[str, int],
+    scheduler: DependencyScheduler | None,
+    ingest: Callable[[dict[str, Any]], None],
+    error_list: list[tuple[str, str, str]],
+) -> tuple[int, int]:
+    """Run Stage 2: parse sources epoch by epoch, publishing each epoch's symbols for the epochs after it.
+
+    Returns:
+        (files ingested, workers that died).
+    """
+    _publish_file_symbols()
+    normal_batch = _balanced_batch_size(min(len(source_files), profile["epoch_files"]), profile["workers"], profile["normal_batch"])
+    source_epochs = partition_source_epochs(
+        source_files,
+        working_dir=working_dir,
+        normal_batch_size=normal_batch,
+        heavy_batch_size=min(normal_batch, profile["heavy_batch"]),
+        max_batch_bytes=profile["max_batch_bytes"],
+        target_epoch_files=profile["epoch_files"],
+        num_workers=profile["workers"],
+    )
+    total_epochs = len(source_epochs)
+    shared_count = gp._shared_symbols.sym_count if gp._shared_symbols is not None else 0
+    logger.info(
+        f"[Stage 2 - Sources] Partitioned {len(source_files)} source files into {total_epochs} epochs "
+        f"({sum(len(ep) for ep in source_epochs)} batches) with {shared_count} shared symbols "
+        f"across {profile['workers']} parallel workers"
+    )
+
+    files_streamed = 0
+    failed_workers = 0
+    for epoch_idx, epoch_batches in enumerate(source_epochs):
+        if G.is_deadline_exceeded():
+            logger.warning(COLOR.yellow("[Duration Limit] Execution deadline reached before the next Stage 2 epoch. Halting early..."))
+            break
+        label = f"[Stage 2 - Sources] Epoch {epoch_idx + 1}/{total_epochs}"
+        logger.info(f"{label}: {sum(len(b[1]) for b in epoch_batches)} files in {len(epoch_batches)} batches")
+        outcome = _run_worker_stage(label, epoch_batches, ingest, profile["workers"], error_list)
+        files_streamed += outcome.files_ingested
+        failed_workers += outcome.failed_workers
+        if outcome.deadline_hit:
+            break
+
+        t_boundary = time.perf_counter()
+        if epoch_idx < total_epochs - 1:
+            if scheduler is not None:
+                unblocked = scheduler.drain_deferred_queue()
+                if unblocked > 0:
+                    logger.info(
+                        f"{label}: deferred drain unblocked {unblocked} files ({len(scheduler.deferred_queue)} still deferred)."
+                    )
+            _commit_all_with_retry("Inter-epoch")
+            _publish_file_symbols()
+        logger.info(
+            f"{label} done: {outcome.elapsed_s:.1f}s parsing (last worker exited {outcome.tail_idle_s:.1f}s after the first), "
+            f"{time.perf_counter() - t_boundary:.1f}s boundary drain/commit/publish; parent RSS {_parent_rss_mb():.0f}MB, "
+            f"{gc.get_freeze_count()} frozen objects"
+        )
+    return files_streamed, failed_workers
+
+
 def trigger_multicore(batch_size: int | None = None, scheduler: DependencyScheduler | None = None) -> None:
-    """Distribute file parsing across parallel worker processes in two persistent stages: headers first, then sources."""
-    change_list = getattr(gp, "worker_change_list", None) or gp.Change_List or []
+    """Parse the version's changed files on forked workers in two stages: headers first, then sources.
+
+    Stage 1 parses headers while the parent propagates directories and unchanged files, then resolves
+    the headers in wave order. Stage 2 parses everything else epoch by epoch; each epoch's symbols are
+    published to a file-scoped shared segment that later epochs' workers resolve against. With a
+    scheduler, the segments stay mapped for `scheduler.finalize()`, which releases them.
+    """
     working_dir = MF.version_dict.get(gp.Version_Name)
+    profile = _memory_profile()
+    num_workers = profile["workers"]
+    if batch_size is None:
+        batch_size = profile["header_batch"]
 
-    regular_files = []
-    symlink_files = []
-
-    for item in change_list:
+    regular_files: list[str] = []
+    symlink_files: list[str] = []
+    for item in _select_worker_changes():
         if not item:
             continue
         parts = item.split("\t")
@@ -1320,570 +2120,171 @@ def trigger_multicore(batch_size: int | None = None, scheduler: DependencySchedu
     # Order regular files: header DAG first
     regular_files = order_changed_files(regular_files, working_dir)
     gp._changed_paths_set = set(item.split("\t")[-1] for item in (regular_files + symlink_files) if item)
+    gp.close_shared_symbols()
 
-    header_files = []
-    source_files = []
+    header_files: list[str] = []
+    source_files: list[str] = []
     for item in regular_files:
-        fpath = item.split("\t")[-1]
-        if fpath.endswith((".h", ".hpp", ".hxx")):
+        if item.split("\t")[-1].endswith((".h", ".hpp", ".hxx")):
             header_files.append(item)
         else:
             source_files.append(item)
 
-    total_files = len(regular_files)
-    total_headers = len(header_files)
-    total_sources = len(source_files)
-
-    if batch_size is None:
-        if G.VERY_LOW_MEMORY_MODE:
-            batch_size = 25
-        elif G.LOW_MEMORY_MODE:
-            batch_size = 50
-        else:
-            batch_size = 200
-
-    if G.VERY_LOW_MEMORY_MODE:
-        num_workers = max(1, min(2, int(G.CPUS // 4)))
-    else:
-        num_workers = max(1, int(G.CPUS - 1))
-
-    total_header_batches = (total_headers + batch_size - 1) // batch_size if total_headers > 0 else 0
-    total_source_batches = (total_sources + batch_size - 1) // batch_size if total_sources > 0 else 0
-    total_batches = total_header_batches + total_source_batches
-
+    # Byte-bounded batches kept in include order: headers that others wait on arrive first, so the
+    # scheduler can run their dependents while the workers are still parsing
+    header_batch = _balanced_batch_size(len(header_files), num_workers, batch_size)
+    header_epochs = partition_source_epochs(
+        header_files,
+        working_dir=working_dir,
+        normal_batch_size=header_batch,
+        heavy_batch_size=min(header_batch, profile["heavy_batch"]),
+        max_batch_bytes=profile["max_batch_bytes"],
+        target_epoch_files=len(header_files),
+        largest_first=False,
+        num_workers=num_workers,
+    )
+    header_batches = header_epochs[0] if header_epochs else []
     logger.info(
-        f"Distributing {total_files} changed files ({total_headers} headers, {total_sources} sources) in {total_batches} batches "
-        f"(batch size: {batch_size}, memory mode: {G.MEMORY_MODE}) across {num_workers} parallel workers"
+        f"Distributing {len(regular_files)} changed files ({len(header_files)} headers in {len(header_batches)} batches, "
+        f"{len(source_files)} sources) (memory mode: {G.MEMORY_MODE}) across {num_workers} parallel workers"
     )
 
-    # If no change within this version
-    if total_files == 0:
-        processing_dirs()
-        processing_unchanges()
-        if scheduler is not None and gp.ChangeSet_Dict:
-            scheduler.ingest_batch(dict(gp.ChangeSet_Dict), is_header_stage=False)
+    def _ingester(is_header_stage: bool) -> Callable[[dict[str, Any]], None]:
+        def _ingest(batch_dict: dict[str, Any]) -> None:
+            if scheduler is not None:
+                scheduler.ingest_batch(batch_dict, is_header_stage=is_header_stage)
+            else:
+                gp.ChangeSet_Dict.update(execute_and_purge(batch_dict))
+        return _ingest
+
+    extra_files: list[str] = []
+
+    def _propagate_tree(is_header_stage: bool) -> None:
+        """Stage new directories, carry unchanged files forward, and collect files that still need parsing."""
+        dir_changesets = processing_dirs()
+        if dir_changesets:
+            _ingester(is_header_stage)(dir_changesets)
+        missing = processing_unchanges()
+        if missing:
+            # Known before any of their dependents execute, so references to them wait instead of stubbing
+            gp._changed_paths_set.update(item.split("\t")[-1] for item in missing)
+            extra_files.extend(missing)
+
+    if not regular_files:
+        _propagate_tree(is_header_stage=False)
+        if not extra_files:
+            return
+    _register_file_names(gp.Change_List or (regular_files + symlink_files))
+
+    error_list: list[tuple[str, str, str]] = []
+    failed_workers = 0
+    try:
+        if header_files:
+            stage1 = _run_worker_stage(
+                "[Stage 1 - Headers]",
+                header_batches,
+                _ingester(True),
+                num_workers,
+                error_list,
+                on_started=lambda: _propagate_tree(is_header_stage=True),
+            )
+            failed_workers += stage1.failed_workers
+            logger.info(
+                f"[Stage 1 - Headers] done: {stage1.elapsed_s:.1f}s parsing (last worker exited {stage1.tail_idle_s:.1f}s "
+                f"after the first); parent RSS {_parent_rss_mb():.0f}MB"
+            )
+            if extra_files and not stage1.deadline_hit:
+                # Parsed before wave resolution, like the changed headers they may define symbols for
+                _register_file_names(extra_files)
+                logger.info(f"[Stage 1 - Headers] Parsing {len(extra_files)} files missing from the previous version.")
+                first_id = len(header_batches)
+                extra_size = _balanced_batch_size(len(extra_files), num_workers, batch_size)
+                extra_batches = [
+                    (first_id + i // extra_size, extra_files[i : i + extra_size]) for i in range(0, len(extra_files), extra_size)
+                ]
+                extra = _run_worker_stage("[Stage 1 - Missing files]", extra_batches, _ingester(True), num_workers, error_list)
+                failed_workers += extra.failed_workers
+            if scheduler is not None and not G.is_deadline_exceeded():
+                t_resolve = time.perf_counter()
+                with G.measure_stage("Stage 1: Header Wave Resolution", count=len(header_files), units="headers"):
+                    logger.info(COLOR.cyan(f"[Stage 1 - Headers] Resolving {len(header_files)} header files in wave order..."))
+                    scheduler.resolve_headers()
+                logger.info(COLOR.green(
+                    f"[Stage 1 - Headers] Header resolution complete in {time.perf_counter() - t_resolve:.1f}s "
+                    f"(no parsing workers run meanwhile). {len(gp.file_symbols)} header symbol tables indexed."
+                ))
+        else:
+            if regular_files:
+                _propagate_tree(is_header_stage=False)
+            if extra_files:
+                _register_file_names(extra_files)
+                source_files.extend(extra_files)
+
+        if source_files and G.is_deadline_exceeded():
+            logger.warning(COLOR.yellow(f"[Duration Limit] Execution deadline reached; skipping Stage 2 ({len(source_files)} sources)."))
+        elif source_files:
+            with G.measure_stage("Stage 2: Source Streaming & Parsing", count=len(source_files), units="sources") as stage2_metric:
+                files_streamed, stage2_failed = _run_source_epochs(
+                    source_files, working_dir, profile, scheduler, _ingester(False), error_list
+                )
+                failed_workers += stage2_failed
+                if stage2_metric is not None:
+                    stage2_metric.count = min(len(source_files), files_streamed)
+    except BaseException:
+        gp.close_shared_symbols()
+        raise
+    finally:
+        unfreeze_system_memory()
+        reclaim_system_memory()
+
+    if scheduler is None:
+        gp.close_shared_symbols()
+    _report_worker_errors(error_list, failed_workers)
+
+
+def _apply_db_server_tuning(db: Any, mem_max_gb: float) -> None:
+    """Raise the MariaDB settings listed in `database.server_tuning` (config) for this run.
+
+    The defaults trade an InnoDB buffer pool far above the 128MB default, a larger redo log and a once-per-second
+    log flush for commit throughput; the database can be rebuilt with --reset. A local server's buffer pool is
+    capped at a quarter of RAM.
+    """
+    settings = dict(get_db_config().get("server_tuning") or {})
+    if not settings or not hasattr(db, "apply_server_tuning"):
         return
-
-    # Pre-populate all file paths into m_file_name and commit before forking.
-    # This guarantees that all current version files exist in m_file_name with assigned IDs,
-    # preventing race conditions or duplicate sequence ID assignments across worker chunks.
-    for item in (gp.Change_List or (regular_files + symlink_files)):
-        if not item:
-            continue
-        parts = item.split("\t")
-        for p in parts[1:]:
-            if p:
-                G.TE.set(m_file_name.table_id, (None, p))
-    G.TE.commit(m_file_name.table_id)
-
-    # Close active DB connection in parent before forking child worker processes
-    # to prevent inherited socket file descriptor sharing / corruption across fork
-    if getattr(G.TE, "db", None) is not None:
+    host = getattr(db, "host", None) or "localhost"
+    local = host in ("localhost", "127.0.0.1", "::1") and not get_ssh_tunnel_config().get("enabled")
+    try:
+        ram = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+    except (ValueError, OSError, AttributeError):
+        ram = 0
+    pool = parse_server_setting(settings["innodb_buffer_pool_size"]) if "innodb_buffer_pool_size" in settings else None
+    if local and ram and isinstance(pool, int) and pool > ram // 4:
+        pool = (ram // 4) // (128 * 1024 * 1024) * (128 * 1024 * 1024)
+        settings["innodb_buffer_pool_size"] = pool
+    try:
+        notes = db.apply_server_tuning(settings)
+    except Exception as e:
+        logger.warning(COLOR.yellow(f"[DB Tuning] Could not apply database.server_tuning: {e}"))
+        return
+    for note in notes:
+        if " capped at " in note or ": kept " in note or "not available" in note:
+            logger.warning(COLOR.yellow(f"[DB Tuning] {note}"))
+        else:
+            logger.info(f"[DB Tuning] {note}")
+    if local and ram and isinstance(pool, int):
+        # The pool the server actually runs with (a pool capped at its startup maximum is smaller)
         try:
-            G.TE.db.close()
+            db.cursor.execute("SELECT @@GLOBAL.innodb_buffer_pool_size")
+            row = db.cursor.fetchone()
+            pool = int(row[0]) if row and row[0] is not None else pool
         except Exception:
             pass
-        G.TE.db = None
-    # Freeze living parent memory so worker GC cycles never scan or dirty inherited parent pages via Copy-on-Write
-    freeze_system_memory()
-    # Spawn background worker for Git commit and contributor parsing concurrently with AST workers
-    commit_queue = multiprocessing.Queue()
-    commit_proc = multiprocessing.Process(
-        target=_git_commit_worker,
-        args=(gp.Old_Version_Name, gp.Version_Name, commit_queue, MF.get_repo_dir()),
-    )
-    commit_proc.start()
-    gp._commit_queue = commit_queue
-    gp._commit_proc = commit_proc
-
-    failed_workers = 0
-    error_list = []
-
-    # =========================================================================
-    # STAGE 1: Parallel Header Parsing & Wave Resolution
-    # =========================================================================
-    if total_headers > 0:
-        header_task_queue = multiprocessing.Queue()
-        header_result_queue = multiprocessing.Queue()
-        header_error_queue = multiprocessing.Queue()
-
-        for i in range(0, total_headers, batch_size):
-            header_task_queue.put((i // batch_size, header_files[i : i + batch_size]))
-
-        for _ in range(num_workers):
-            header_task_queue.put(None)
-
-        if getattr(G.TE, "db", None) is not None:
-            try:
-                G.TE.db.close()
-            except Exception:
-                pass
-            G.TE.db = None
-
-        header_processes = []
-        for worker_id in range(num_workers):
-            p = multiprocessing.Process(
-                target=file_processing_worker,
-                args=(header_task_queue, header_error_queue, header_result_queue, gp.VID, gp, MF, worker_id),
-            )
-            header_processes.append(p)
-            p.start()
-
-        if getattr(G.TE, "db", None) is not None:
-            try:
-                G.TE.db.close()
-            except Exception:
-                pass
-        G.TE.db = G.DB()
-
-        header_prefetch_queue: queue.Queue = queue.Queue(maxsize=max(8, num_workers * 2))
-
-        def _header_prefetch_loop() -> None:
-            workers_done = 0
-            while workers_done < num_workers:
-                try:
-                    item = header_result_queue.get()
-                except Exception:
-                    break
-                if item is None:
-                    workers_done += 1
-                    header_prefetch_queue.put(None)
-                    continue
-                if isinstance(item, tuple) and len(item) == 2 and item[0] == "__WORKER_RECYCLE__":
-                    recycle_id = item[1]
-                    new_p = multiprocessing.Process(
-                        target=file_processing_worker,
-                        args=(header_task_queue, header_error_queue, header_result_queue, gp.VID, gp, MF, recycle_id),
-                    )
-                    header_processes.append(new_p)
-                    new_p.start()
-                    continue
-
-                b_id, payload = item
-                if payload is None:
-                    header_prefetch_queue.put((b_id, None))
-                    continue
-
-                try:
-                    try:
-                        raw_bytes = zlib.decompress(payload)
-                        partial_dict = pickle.loads(raw_bytes)
-                        del raw_bytes
-                    except Exception:
-                        partial_dict = pickle.loads(payload)
-                    header_prefetch_queue.put((b_id, partial_dict))
-                    del partial_dict
-                except Exception as e:
-                    logger.error(f"Prefetcher failed to deserialize header batch {b_id}: {e}")
-                    header_prefetch_queue.put((b_id, None))
-
-        header_prefetch_thread = threading.Thread(target=_header_prefetch_loop, daemon=True)
-        header_prefetch_thread.start()
-
-        processing_dirs()
-        processing_unchanges()
-
-        if scheduler is not None and gp.ChangeSet_Dict:
-            scheduler.ingest_batch(dict(gp.ChangeSet_Dict), is_header_stage=True)
-
-        header_batches_received = 0
-        finished_header_workers = 0
-        t_stage1_start = time.perf_counter()
-
-        while finished_header_workers < num_workers:
-            try:
-                item = header_prefetch_queue.get()
-                if item is None:
-                    finished_header_workers += 1
-                    continue
-                batch_id, partial_dict = item
-                header_batches_received += 1
-                if partial_dict is not None:
-                    if scheduler is not None:
-                        scheduler.ingest_batch(partial_dict, is_header_stage=True)
-                    else:
-                        gp.ChangeSet_Dict.update(execute_and_purge(partial_dict))
-                    del partial_dict
-
-                if G.is_deadline_exceeded():
-                    logger.warning(COLOR.yellow("[Duration Limit] Execution deadline reached during Stage 1 header streaming. Halting early..."))
-                    for p in header_processes:
-                        if p.is_alive():
-                            p.terminate()
-                    break
-
-                if header_batches_received % 10 == 0 or header_batches_received == total_header_batches:
-                    elapsed = time.perf_counter() - t_stage1_start
-                    velocity = header_batches_received / max(0.001, elapsed)
-                    logger.info(
-                        f"[Stage 1 - Headers] Ingested header batch {header_batches_received}/{total_header_batches} "
-                        f"({velocity:.1f} batches/s, elapsed {elapsed:.1f}s)"
-                    )
-            except Exception as e:
-                logger.error(f"Error reading header batch result: {e}", exc_info=True)
-                for p in header_processes:
-                    if p.is_alive():
-                        p.terminate()
-                if commit_proc.is_alive():
-                    commit_proc.terminate()
-                break
-            reclaim_system_memory()
-
-        for p in header_processes:
-            p.join(timeout=5.0)
-            if p.is_alive():
-                p.kill()
-                p.join(timeout=1.0)
-            if p.exitcode != 0:
-                if G.is_deadline_exceeded() and p.exitcode in (-15, -9):
-                    logger.info(f"Header Worker PID {p.pid} stopped gracefully on execution deadline.")
-                else:
-                    failed_workers += 1
-                    logger.error(COLOR.red(f"Header Worker PID {p.pid} terminated abnormally with exit code {p.exitcode}"))
-
-        while not header_error_queue.empty():
-            try:
-                error_list.append(header_error_queue.get_nowait())
-            except Exception:
-                break
-
-        del header_processes
-        reclaim_system_memory()
-
-        # Resolve Stage 1: All headers in wave order
-        if scheduler is not None:
-            with G.measure_stage("Stage 1: Header Wave Resolution", count=total_headers, units="headers"):
-                logger.info(COLOR.cyan(f"[Stage 1 - Headers] Resolving {total_headers} header files in wave order..."))
-                scheduler.resolve_headers()
-                logger.info(COLOR.green(f"[Stage 1 - Headers] Header resolution complete. {len(gp.file_symbols)} header symbol tables indexed."))
-    else:
-        processing_dirs()
-        processing_unchanges()
-        if scheduler is not None and gp.ChangeSet_Dict:
-            scheduler.ingest_batch(dict(gp.ChangeSet_Dict), is_header_stage=False)
-
-    # =========================================================================
-    # STAGE 2: Multi-Epoch Parallel Source Parsing with Periodic Shared Regeneration
-    # =========================================================================
-    if total_sources > 0:
-        stage2_metric_cm = G.measure_stage("Stage 2: Source Streaming & Parsing", count=total_sources, units="sources")
-        stage2_metric = stage2_metric_cm.__enter__()
-        resolved_symbols_map: dict[tuple[str, int], int] = {}
-        for f_map in gp.file_symbols.values():
-            resolved_symbols_map.update(f_map)
-        resolved_names_map = {k[0]: v for k, v in resolved_symbols_map.items()}
-
-        # Build initial structured shared memory index for Stage 2 workers from Stage 1 headers
-        from table_engine.shared_buffer import SharedSymbolBuilder
-        sym_builder = SharedSymbolBuilder(mode=getattr(G.TE, "hugepages", "auto"))
-        shared_sym_reader = sym_builder.build(resolved_symbols_map, resolved_names_map)
-        if shared_sym_reader:
-            logger.info(
-                f"[Stage 2 - Sources] Packed {shared_sym_reader.sym_count} symbols and "
-                f"{shared_sym_reader.name_count} names into {len(shared_sym_reader.mv) // (1024*1024)}MB shared memory hashtable."
-            )
-            gp._shared_symbols = shared_sym_reader
-            total_sym_count = shared_sym_reader.sym_count
-            del resolved_symbols_map
-            del resolved_names_map
-            gp.file_symbols.clear()
-            if hasattr(gp, "file_names"):
-                gp.file_names.clear()
-            if hasattr(gp, "_ast_staged_symbols"):
-                gp._ast_staged_symbols.clear()
-            if hasattr(gp, "_ast_staged_names"):
-                gp._ast_staged_names.clear()
-            if hasattr(gp, "unchanged_symbol_cache"):
-                gp.unchanged_symbol_cache.clear()
-            reclaim_system_memory()
-        else:
-            gp._shared_symbols = None
-            total_sym_count = len(resolved_symbols_map)
-
-        # Project-agnostic dynamic complexity batching and natural epoch partitioning
-        working_dir = MF.version_dict.get(gp.Version_Name)
-        normal_bs = 200 if not G.LOW_MEMORY_MODE and not G.VERY_LOW_MEMORY_MODE else (50 if G.LOW_MEMORY_MODE else 25)
-        heavy_bs = 50 if not G.LOW_MEMORY_MODE and not G.VERY_LOW_MEMORY_MODE else (25 if G.LOW_MEMORY_MODE else 10)
-        max_bytes = 1500000 if not G.LOW_MEMORY_MODE and not G.VERY_LOW_MEMORY_MODE else (750000 if G.LOW_MEMORY_MODE else 350000)
-        target_epoch_sz = 4500 if not G.VERY_LOW_MEMORY_MODE else 2000
-
-        source_epochs = partition_source_epochs(
-            source_files,
-            working_dir=working_dir,
-            normal_batch_size=normal_bs,
-            heavy_batch_size=heavy_bs,
-            max_batch_bytes=max_bytes,
-            target_epoch_files=target_epoch_sz,
-        )
-        total_epochs = len(source_epochs)
-        total_source_batches = sum(len(ep) for ep in source_epochs)
-
-        logger.info(
-            f"[Stage 2 - Sources] Partitioned {total_sources} source files into {total_epochs} natural epochs "
-            f"({total_source_batches} complexity-binned batches) with {total_sym_count} resolved header symbols across {num_workers} parallel workers"
-        )
-
-        total_source_batches_received = 0
-        source_files_streamed = 0
-        t_stage2_start = time.perf_counter()
-
-        for epoch_idx, epoch_batches in enumerate(source_epochs):
-            epoch_num = epoch_idx + 1
-            epoch_files_count = sum(len(b[1]) for b in epoch_batches)
-            t_epoch_start = time.perf_counter()
-
-            logger.info(
-                f"[Stage 2 - Sources] Starting Epoch {epoch_num}/{total_epochs}: "
-                f"{epoch_files_count} files in {len(epoch_batches)} batches with {total_sym_count} resolved symbols across {num_workers} parallel workers"
-            )
-
-            epoch_task_queue = multiprocessing.Queue()
-            epoch_result_queue = multiprocessing.Queue()
-            epoch_error_queue = multiprocessing.Queue()
-
-            for b_id, b_files in epoch_batches:
-                epoch_task_queue.put((b_id, b_files))
-
-            for _ in range(num_workers):
-                epoch_task_queue.put(None)
-
-            if getattr(G.TE, "db", None) is not None:
-                try:
-                    G.TE.db.close()
-                except Exception:
-                    pass
-                G.TE.db = None
-
-            # Freeze living parent memory so worker GC cycles never scan or dirty inherited parent pages via Copy-on-Write
-            freeze_system_memory()
-
-            epoch_processes = []
-            for worker_id in range(num_workers):
-                p = multiprocessing.Process(
-                    target=file_processing_worker,
-                    args=(
-                        epoch_task_queue,
-                        epoch_error_queue,
-                        epoch_result_queue,
-                        gp.VID,
-                        gp,
-                        MF,
-                        worker_id,
-                        None,
-                        None,
-                        False,  # allow_mid_epoch_recycle=False (clean epoch-boundary lifecycle)
-                    ),
-                )
-                epoch_processes.append(p)
-                p.start()
-
-            if getattr(G.TE, "db", None) is not None:
-                try:
-                    G.TE.db.close()
-                except Exception:
-                    pass
-            G.TE.db = G.DB()
-
-            epoch_prefetch_queue: queue.Queue = queue.Queue(maxsize=max(8, num_workers * 2))
-
-            def _epoch_prefetch_loop(res_q=epoch_result_queue, pref_q=epoch_prefetch_queue) -> None:
-                workers_done = 0
-                while workers_done < num_workers:
-                    try:
-                        item = res_q.get()
-                    except Exception:
-                        break
-                    if item is None:
-                        workers_done += 1
-                        pref_q.put(None)
-                        continue
-
-                    b_id, payload = item
-                    if payload is None:
-                        pref_q.put((b_id, None))
-                        continue
-
-                    try:
-                        try:
-                            raw_bytes = zlib.decompress(payload)
-                            partial_dict = pickle.loads(raw_bytes)
-                            del raw_bytes
-                        except Exception:
-                            partial_dict = pickle.loads(payload)
-                        pref_q.put((b_id, partial_dict))
-                        del partial_dict
-                    except Exception as e:
-                        logger.error(f"Prefetcher failed to deserialize source batch {b_id}: {e}")
-                        pref_q.put((b_id, None))
-
-            prefetch_thread = threading.Thread(target=_epoch_prefetch_loop, daemon=True)
-            prefetch_thread.start()
-
-            epoch_batches_received = 0
-            finished_epoch_workers = 0
-
-            while finished_epoch_workers < num_workers:
-                try:
-                    item = epoch_prefetch_queue.get()
-                    if item is None:
-                        finished_epoch_workers += 1
-                        continue
-                    batch_id, partial_dict = item
-                    epoch_batches_received += 1
-                    total_source_batches_received += 1
-                    if partial_dict is not None:
-                        source_files_streamed += len(partial_dict)
-                        if scheduler is not None:
-                            scheduler.ingest_batch(partial_dict, is_header_stage=False)
-                        else:
-                            gp.ChangeSet_Dict.update(execute_and_purge(partial_dict))
-                        del partial_dict
-
-                    if G.is_deadline_exceeded():
-                        logger.warning(COLOR.yellow("[Duration Limit] Execution deadline reached during Stage 2 source streaming. Halting early..."))
-                        for p in epoch_processes:
-                            if p.is_alive():
-                                p.terminate()
-                        break
-
-                    if epoch_batches_received % 10 == 0 or epoch_batches_received == len(epoch_batches):
-                        elapsed_epoch = time.perf_counter() - t_epoch_start
-                        vel = epoch_batches_received / max(0.001, elapsed_epoch)
-                        logger.info(
-                            f"[Stage 2 - Sources] Epoch {epoch_num}/{total_epochs} streamed batch {epoch_batches_received}/{len(epoch_batches)} "
-                            f"(total: {total_source_batches_received}/{total_source_batches}, {vel:.1f} batches/s, "
-                            f"{finished_epoch_workers}/{num_workers} workers done, elapsed {elapsed_epoch:.1f}s)"
-                        )
-                except Exception as e:
-                    logger.error(f"Error reading source batch result: {e}", exc_info=True)
-                    for p in epoch_processes:
-                        if p.is_alive():
-                            p.terminate()
-                    if commit_proc.is_alive():
-                        commit_proc.terminate()
-                    break
-                if epoch_batches_received % 10 == 0:
-                    reclaim_system_memory()
-
-            # Cleanly reap all workers for this epoch
-            for p in epoch_processes:
-                p.join(timeout=5.0)
-                if p.is_alive():
-                    p.kill()
-                    p.join(timeout=1.0)
-                if p.exitcode != 0:
-                    if G.is_deadline_exceeded() and p.exitcode in (-15, -9):
-                        logger.info(f"Source Worker PID {p.pid} stopped gracefully on execution deadline.")
-                    else:
-                        failed_workers += 1
-                        logger.error(COLOR.red(f"Source Worker PID {p.pid} terminated abnormally with exit code {p.exitcode}"))
-
-            while not epoch_error_queue.empty():
-                try:
-                    error_list.append(epoch_error_queue.get_nowait())
-                except Exception:
-                    break
-
-            del epoch_processes
-            reclaim_system_memory()
-
-            if G.is_deadline_exceeded():
-                break
-
-            # =====================================================================
-            # INTER-EPOCH REGENERATION & DRAIN:
-            # 1. Drain deferred queue for any newly unblocked cross-file dependencies
-            # 2. Chunk commit TableEngine to flush staged rows & update DB
-            # 3. Rebuild SharedSymbolReader with all resolved symbols for next epoch
-            # =====================================================================
-            if epoch_idx < total_epochs - 1:
-                if scheduler is not None:
-                    unblocked = scheduler.drain_deferred_queue()
-                    if unblocked > 0:
-                        logger.info(
-                            f"[Stage 2 - Sources] Inter-epoch deferred drain unblocked {unblocked} files "
-                            f"({len(scheduler.deferred_queue)} still deferred)."
-                        )
-                try:
-                    G.TE.commit_all()
-                except Exception as e:
-                    logger.warning(f"Inter-epoch TableEngine commit encountered transient issue: {e}")
-                    if getattr(G.TE, "db", None) is not None and hasattr(G.TE.db, "check_if_connected"):
-                        G.TE.db.check_if_connected()
-                    G.TE.commit_all()
-
-                # Harvest all resolved symbols across headers + all completed sources
-                resolved_symbols_map = {}
-                if getattr(gp, "_shared_symbols", None) is not None:
-                    try:
-                        for sym_k, sym_id in gp._shared_symbols.items():
-                            resolved_symbols_map[sym_k] = sym_id
-                    except Exception:
-                        pass
-                for f_map in gp.file_symbols.values():
-                    resolved_symbols_map.update(f_map)
-                resolved_names_map = {k[0]: v for k, v in resolved_symbols_map.items()}
-
-                if getattr(gp, "_shared_symbols", None) is not None:
-                    try:
-                        gp._shared_symbols.close()
-                    except Exception:
-                        pass
-                    gp._shared_symbols = None
-
-                reclaim_system_memory()
-
-                sym_builder = SharedSymbolBuilder(mode=getattr(G.TE, "hugepages", "auto"))
-                shared_sym_reader = sym_builder.build(resolved_symbols_map, resolved_names_map)
-                if shared_sym_reader:
-                    logger.info(
-                        f"[Stage 2 - Sources] Epoch {epoch_num} complete. Rebuilt shared memory hashtable with "
-                        f"{shared_sym_reader.sym_count} symbols and {shared_sym_reader.name_count} names "
-                        f"({len(shared_sym_reader.mv) // (1024*1024)}MB) for subsequent epochs."
-                    )
-                    gp._shared_symbols = shared_sym_reader
-                    total_sym_count = shared_sym_reader.sym_count
-                del resolved_symbols_map
-                del resolved_names_map
-                gp.file_symbols.clear()
-                if hasattr(gp, "file_names"):
-                    gp.file_names.clear()
-                if hasattr(gp, "_ast_staged_symbols"):
-                    gp._ast_staged_symbols.clear()
-                if hasattr(gp, "_ast_staged_names"):
-                    gp._ast_staged_names.clear()
-                if hasattr(gp, "unchanged_symbol_cache"):
-                    gp.unchanged_symbol_cache.clear()
-                reclaim_system_memory()
-
-        if getattr(gp, "_shared_symbols", None) is not None:
-            try:
-                gp._shared_symbols.close()
-            except Exception:
-                pass
-            gp._shared_symbols = None
-        reclaim_system_memory()
-        if stage2_metric is not None:
-            stage2_metric.count = min(total_sources, source_files_streamed)
-        if stage2_metric_cm is not None:
-            stage2_metric_cm.__exit__(None, None, None)
-
-    if error_list:
-        logger.error(COLOR.red(f"Multicore processing encountered {len(error_list)} file error(s):"))
-        for failed_file, err, tb in error_list:
-            logger.error(COLOR.red(f"  [ERROR] File: {failed_file} => {err}"))
-
-    if failed_workers > 0 or error_list:
-        logger.error(
-            COLOR.red(
-                f"Multicore execution completed with {failed_workers} crashed worker(s) "
-                f"and {len(error_list)} file error(s)!"
-            )
-        )
-
-    unfreeze_system_memory()
-    reclaim_system_memory()
-    return
+    if local and ram and isinstance(pool, int) and mem_max_gb * 1024**3 + pool > ram:
+        logger.warning(COLOR.yellow(
+            f"[DB Tuning] The memory guard ({mem_max_gb:.0f} GB) plus the InnoDB buffer pool ({pool / 1024**3:.0f} GB) "
+            f"exceed this machine's {ram / 1024**3:.0f} GB of RAM; lower parser.mem_max if the parser ever gets close."
+        ))
 
 
 def main() -> None:
@@ -1891,9 +2292,11 @@ def main() -> None:
     args = arg_handling()
     setup_memory_limit(float(args.mem_max))
     with G.DB() as db:
+        _apply_db_server_tuning(db, float(args.mem_max))
         if getattr(args, "reset", False) or getattr(args, "Drop", False):
             logger.info("Resetting and recreating all database tables...")
             db.drop_table(gp.Table_Array)
+            drop_legacy_symbol_tables(db)
             db.create_table(gp.Table_Array)
             try:
                 db.create_index("v_main_index", m_v_main, (m_v_main.vname,))
@@ -2313,6 +2716,7 @@ def arg_handling() -> argparse.Namespace:
     effective_db_engine = args.db_engine or db_cfg.get("engine") or "mariadb"
     effective_table_engine = args.table_engine or parser_cfg.get("table_engine") or "cached"
     effective_hugepages = args.hugepages or parser_cfg.get("hugepages") or "auto"
+    G.SYMBOL_LAYOUT = "blob" if str(parser_cfg.get("symbol_layout", "tag")).lower() == "blob" else "tag"
 
     G.DB = get_db_engine(effective_db_engine)
     EngineCls = get_table_engine(effective_table_engine)
@@ -2366,6 +2770,10 @@ def arg_handling() -> argparse.Namespace:
             "tests.test_git_commit_parser",
             "tests.test_tree_resolver",
             "tests.test_te_db_integrity",
+            "tests.test_multicore_pipeline",
+            "tests.test_pipeline_steps",
+            "tests.test_commit_pipeline",
+            "tests.test_symbol_rows",
             "tests.test_kconfig_ast",
             "tests.test_kconfig_engine",
             "tests.test_webapp_defconfig",
@@ -2494,6 +2902,127 @@ def resolve_git_network_and_repo(
     return network_id, repo_id
 
 
+def _lookup_commit_ids(db: Any, network_id: int, hashes: Iterable[str]) -> dict[str, int]:
+    """Map 40-hex commit hashes already registered in m_commit for `network_id` to their commit ids."""
+    wanted = [h for h in dict.fromkeys(hashes) if isinstance(h, str) and len(h) == 40]
+    found: dict[str, int] = {}
+    if not wanted:
+        return found
+    cur = _raw_cursor(db)
+    if cur is None:
+        for h in wanted:
+            row = db.select(m_commit, (None, network_id, bytes.fromhex(h), None, None, None, None, None, None))
+            if row:
+                found[h] = row[0]
+        return found
+    try:
+        for i in range(0, len(wanted), _SQL_IN_CHUNK):
+            chunk = wanted[i : i + _SQL_IN_CHUNK]
+            cur.execute(
+                f"SELECT commit_hash, commit_id FROM m_commit WHERE network_id = %s "  # noqa: S608
+                f"AND commit_hash IN ({','.join(['%s'] * len(chunk))})",
+                (network_id, *(bytes.fromhex(h) for h in chunk)),
+            )
+            for c_hash, c_id in cur.fetchall():
+                found[bytes(c_hash).hex()] = int(c_id)
+    finally:
+        cur.close()
+    return found
+
+
+def _ingest_commit_range(db: Any, commits: list[Any], network_id: int) -> dict[str, int]:
+    """Register `commits` (newest first, as git log lists them) with their parents and contributors.
+
+    Existing commits and persons are looked up and new rows inserted in bulk: a few statements per
+    thousand commits instead of several round trips and transaction commits per commit.
+
+    Returns:
+        Commit hash -> commit_id for every commit of the range and every parent already registered.
+    """
+    if not commits:
+        return {}
+    ordered = [c for c in reversed(commits) if isinstance(c.commit_hash, str) and len(c.commit_hash) == 40]
+    in_range = [c.commit_hash for c in ordered]
+    outside_parents = {p for c in ordered for p in (c.parents or ())} - set(in_range)
+    commit_ids = _lookup_commit_ids(db, network_id, [*in_range, *outside_parents])
+
+    cur = _raw_cursor(db)
+    person_ids: dict[tuple[str, str], int] = {}
+    if cur is not None:
+        try:
+            cur.execute("SELECT person_id, name, email FROM m_maintainer_person")
+            person_ids = {_person_key(name, email): int(pid) for pid, name, email in cur.fetchall()}
+        finally:
+            cur.close()
+    new_persons: list[tuple[int, str, str]] = []
+    next_ids: dict[str, int] = {}
+
+    def _next_id(table: Table) -> int:
+        if table.table_name not in next_ids:
+            next_ids[table.table_name] = db.get_next_id(table)
+        assigned = next_ids[table.table_name]
+        next_ids[table.table_name] = assigned + 1
+        return assigned
+
+    def _person_id(name: str | None, email: str | None) -> int:
+        key = _person_key(name, email)
+        pid = person_ids.get(key)
+        if pid is None and cur is None:
+            row = db.select(m_maintainer_person, (None, key[0], key[1]))
+            pid = row[0] if row else None
+        if pid is None:
+            pid = _next_id(m_maintainer_person)
+            new_persons.append((pid, key[0], key[1]))
+        person_ids[key] = pid
+        return pid
+
+    new_commits: list[tuple] = []
+    for commit in ordered:
+        if commit.commit_hash in commit_ids:
+            continue
+        author_pid = _person_id(commit.author_name, commit.author_email)
+        committer_pid = _person_id(
+            commit.committer_name or commit.committer_email or commit.author_name,
+            commit.committer_email or commit.author_email,
+        )
+        c_id = _next_id(m_commit)
+        commit_ids[commit.commit_hash] = c_id
+        new_commits.append((
+            c_id,
+            network_id,
+            bytes.fromhex(commit.commit_hash),
+            author_pid,
+            int(commit.author_date or 0),
+            committer_pid,
+            int(commit.committer_date or 0),
+            (commit.subject or "")[:500],
+            commit.message or "",
+        ))
+
+    # Parents and contributors of every commit in the range (both tables skip rows already present)
+    parent_rows: list[tuple[int, int, int]] = []
+    contributor_rows: dict[tuple[int, int, int], tuple[int, int, int, int]] = {}
+    for commit in ordered:
+        c_id = commit_ids[commit.commit_hash]
+        for p_idx, p_hash in enumerate(commit.parents or ()):
+            p_cid = commit_ids.get(p_hash)
+            if p_cid is not None:
+                parent_rows.append((c_id, p_cid, p_idx))
+        for contrib in commit.contributors:
+            pid = _person_id(contrib.name, contrib.email)
+            contributor_rows.setdefault((c_id, pid, int(contrib.role)), (c_id, pid, int(contrib.role), int(contrib.priority)))
+
+    for table, rows in (
+        (m_maintainer_person, new_persons),
+        (m_commit, new_commits),
+        (m_commit_parent, parent_rows),
+        (m_bridge_commit_person, list(contributor_rows.values())),
+    ):
+        if rows:
+            db.insert(table, tuple(rows))
+    return commit_ids
+
+
 def ingest_git_dag(
     version_or_ref: str,
     network_id: int,
@@ -2615,6 +3144,7 @@ def ingest_git_dag(
             except Exception as clean_err:
                 logger.debug(f"Note on checking/purging partial head_commit_id records: {clean_err}")
 
+    gp.commit_ids_by_hash = {}
     if head_commit_id is None:
         from parser.git_ast import GitCommitParser
         git_parser = GitCommitParser(repo_dir=repo_path)
@@ -2622,79 +3152,10 @@ def ingest_git_dag(
         # The DAG only needs commit metadata and parents; per-commit file lists come from processing_git_commits
         commits = git_parser.parse_version_commits(old_rev=base_rev, new_rev=version_or_ref, limit=limit, with_files=False)
         logger.info(f"[Git DAG] Ingesting {len(commits)} commits up to '{version_or_ref}'")
-        commit_hash_to_id: dict[str, int] = {}
         with G.DB() as db:
-            for commit in reversed(commits):
-                a_name = commit.author_name or commit.author_email or "Unknown"
-                a_email = commit.author_email or ""
-                a_res = db.select(m_maintainer_person, (None, None, a_email)) if a_email else None
-                if a_res:
-                    author_pid = a_res[0]
-                else:
-                    author_pid = db.get_next_id(m_maintainer_person)
-                    db.insert(m_maintainer_person, (author_pid, a_name, a_email))
-
-                c_name = commit.committer_name or commit.committer_email or a_name
-                c_email = commit.committer_email or a_email
-                if c_email == a_email:
-                    committer_pid = author_pid
-                else:
-                    c_res = db.select(m_maintainer_person, (None, None, c_email)) if c_email else None
-                    if c_res:
-                        committer_pid = c_res[0]
-                    else:
-                        committer_pid = db.get_next_id(m_maintainer_person)
-                        db.insert(m_maintainer_person, (committer_pid, c_name, c_email))
-
-                c_hash = commit.commit_hash
-                c_bytes = bytes.fromhex(c_hash) if isinstance(c_hash, str) and len(c_hash) == 40 else b"\x00" * 20
-                c_match = db.select(m_commit, (None, network_id, c_bytes, None, None, None, None, None, None))
-                if c_match:
-                    c_id = c_match[0]
-                else:
-                    c_id = db.get_next_id(m_commit)
-                    db.insert(m_commit, (
-                        c_id,
-                        network_id,
-                        c_bytes,
-                        author_pid,
-                        int(commit.author_date or 0),
-                        committer_pid,
-                        int(commit.committer_date or 0),
-                        (commit.subject or "")[:500],
-                        commit.message or "",
-                    ))
-                commit_hash_to_id[c_hash] = c_id
-
-                if hasattr(commit, "parents") and commit.parents:
-                    for p_idx, p_hash in enumerate(commit.parents):
-                        p_cid = commit_hash_to_id.get(p_hash)
-                        if p_cid is None:
-                            p_bytes = bytes.fromhex(p_hash) if len(p_hash) == 40 else b"\x00" * 20
-                            p_match = db.select(m_commit, (None, network_id, p_bytes, None, None, None, None, None, None))
-                            if p_match:
-                                p_cid = p_match[0]
-                                commit_hash_to_id[p_hash] = p_cid
-                        if p_cid is not None:
-                            try:
-                                db.insert(m_commit_parent, (c_id, p_cid, p_idx))
-                            except Exception:
-                                pass
-
-                for prio, contrib in enumerate(commit.contributors):
-                    ct_email = contrib.email or ""
-                    ct_name = contrib.name or ct_email or "Unknown"
-                    ct_res = db.select(m_maintainer_person, (None, None, ct_email)) if ct_email else None
-                    if ct_res:
-                        t_pid = ct_res[0]
-                    else:
-                        t_pid = db.get_next_id(m_maintainer_person)
-                        db.insert(m_maintainer_person, (t_pid, ct_name, ct_email))
-                    try:
-                        db.insert(m_bridge_commit_person, (c_id, t_pid, int(contrib.role), int(contrib.priority)))
-                    except Exception:
-                        pass
-
+            commit_hash_to_id = _ingest_commit_range(db, commits, network_id)
+        # Reused by processing_git_commits() instead of one m_commit lookup per commit
+        gp.commit_ids_by_hash = commit_hash_to_id
         head_commit_id = commit_hash_to_id.get(head_commit_hex)
 
     if head_commit_id is None:
@@ -2743,21 +3204,10 @@ def default_processing(CS: ChangeSet) -> None:
     """Create m_file_name, m_file, m_bridge_file."""
     try:
         if CS.file_operation == "D":
-            # DELETE
+            # DELETE: the file is simply absent from gp.VID's checkpoint; parsers close its prior tags
             with CS(REF_OLD):
                 # Get old file_name
                 CS.store(m_file_name.get_set(
-                    None,
-                    CS.current_path,
-                ))
-                CS.last_not_none()
-
-                # Get old_bf
-                CS.store(m_bridge_file.view(
-                    ((m_bridge_file.fnid, m_file_name.fnid, 1),),
-                    gp.Old_VID,
-                    CS.ref(m_file_name.fnid),
-                    None,
                     None,
                     CS.current_path,
                 ))
@@ -2846,25 +3296,13 @@ def default_processing(CS: ChangeSet) -> None:
                 ))
 
         elif CS.file_operation == "M":
-            # MODIFY
+            # MODIFY (parsers look up the previous version's tags themselves; only renames reuse the old fid)
             # Get file_name
             CS.store(m_file_name.get_set(
                 None,
                 CS.current_path,
             ))
             CS.last_not_none()
-
-            with CS(REF_OLD):
-                # Get old_bf
-                CS.store(m_bridge_file.view(
-                    ((m_bridge_file.fnid, m_file_name.fnid, 1),),
-                    gp.Old_VID,
-                    CS.ref(m_file_name.fnid, REF_ROOT),
-                    None,
-                    None,
-                    CS.current_path,
-                ))
-                CS.last_not_none()
 
             # 1 Create FILE
             CS.store(m_file.set(
@@ -2907,105 +3345,191 @@ def default_processing(CS: ChangeSet) -> None:
         ))
     return
 
-def _git_commit_worker(old_ver: str | int, ver: str, out_q: multiprocessing.Queue, repo_dir: str | None = None) -> None:
-    """Worker process that parses git commits and diff hunks in parallel with file AST parsing."""
+def _attach_blob_hash(CS: ChangeSet, blob_hashes: dict[str, bytes] | None) -> bool:
+    """Set `CS.blob_hash` from the version's `git ls-tree` hashes.
+
+    Returns:
+        False when the version's hashes are known but the file, which needs one (it creates an m_file_blob
+        row), has none, e.g. a submodule gitlink: parsing it would file it under the all-zero hash shared
+        by every such file.
+    """
+    if not blob_hashes:
+        return True
+    blob_hash = blob_hashes.get(CS.current_path)
+    if blob_hash is not None:
+        CS.blob_hash = blob_hash
+        return True
+    return CS.file_operation in ("D", "R100")
+
+
+_GIT_COMMIT_RESULT = "commits.pkl"
+
+
+def _git_commit_worker(old_ver: str | int, ver: str, result_path: str, repo_dir: str | None = None) -> None:
+    """Worker process that parses git commits and diff hunks in parallel with file AST parsing.
+
+    The result is pickled to `result_path` instead of a queue so the process exits as soon as parsing
+    ends, and stops sharing the parent's fork-time memory long before the parent reads the result.
+    """
     try:
         from parser.git_ast import GitCommitParser
         git_parser = GitCommitParser(repo_dir=repo_dir)
         commits, file_hunks_map = git_parser.parse_version_commits_with_hunks(old_ver, ver)
-        out_q.put((commits, file_hunks_map))
+        tmp_path = f"{result_path}.tmp"
+        with open(tmp_path, "wb") as f:
+            pickle.dump((commits, file_hunks_map), f, protocol=pickle.HIGHEST_PROTOCOL)
+        os.replace(tmp_path, result_path)
     except Exception as e:
         logger.error(f"Git commit worker error: {e}", exc_info=True)
-        out_q.put((None, None))
+        sys.exit(1)
+
+
+def _start_git_commit_worker() -> None:
+    """Fork the git commit parser for gp.Old_Version_Name..gp.Version_Name to run alongside AST parsing."""
+    gp.stop_commit_worker()
+    base_dir = G.RAMDISK if os.path.isdir(G.RAMDISK) else None
+    result_dir = tempfile.mkdtemp(prefix="kip-commits-", dir=base_dir)
+    gp.PURGE_LIST.append(result_dir)
+    gp._commit_result_dir = result_dir
+    proc = _MP.Process(
+        target=_git_commit_worker,
+        args=(gp.Old_Version_Name, gp.Version_Name, os.path.join(result_dir, _GIT_COMMIT_RESULT), MF.get_repo_dir()),
+        name="git-commit-parser",
+        daemon=True,
+    )
+    proc.start()
+    gp._commit_proc = proc
+
+
+def _collect_git_commit_result() -> tuple[Any, Any] | None:
+    """Wait for the background git commit parser and load its result.
+
+    Returns:
+        `(commits, file_hunks_map)`, or None when no worker ran, it failed, or the deadline passed.
+    """
+    proc = getattr(gp, "_commit_proc", None)
+    result_dir = getattr(gp, "_commit_result_dir", None)
+    if proc is None or not result_dir:
+        return None
+    try:
+        while proc.is_alive():
+            proc.join(timeout=1.0)
+            if proc.is_alive() and G.is_deadline_exceeded():
+                logger.warning(COLOR.yellow("[Duration Limit] Execution deadline reached while waiting for the git commit worker."))
+                return None
+        if proc.exitcode != 0:
+            logger.warning(f"Git commit worker exited with code {proc.exitcode}; parsing commits in-process.")
+            return None
+        with open(os.path.join(result_dir, _GIT_COMMIT_RESULT), "rb") as f:
+            return pickle.load(f)  # noqa: S301
+    except Exception as e:
+        logger.warning(f"Failed to load precomputed commits from background worker: {e}")
+        return None
+    finally:
+        gp.stop_commit_worker()
 
 
 def file_processing_worker(
-    task_queue: multiprocessing.Queue,
-    error_queue: multiprocessing.Queue,
-    result_queue: multiprocessing.Queue,
+    conn: Any,
     vid: int,
     gp_ref: GreatProcessor,
     mf_ref: MasterFile,
     worker_id: int = 0,
-    resolved_symbols_map: dict[tuple[str, int], int] | None = None,
-    resolved_names_map: dict[str, int] | None = None,
-    allow_mid_epoch_recycle: bool = False,
 ) -> None:
-    """Worker process that continuously pulls and parses batches of files from `task_queue`."""
+    """Worker process that receives batches of changed files on `conn` and parses them into ChangeSets.
+
+    A serializer thread pickles each finished batch (zlib-compressed in low memory modes) together with
+    its per-file errors and sends it back on `conn` as one result frame, so parsing the next batch
+    (already queued by the parent) overlaps sending the last one. `send_bytes` blocks while the parent is
+    behind, which caps worker memory at the batches in flight. A done frame is sent last; closing the
+    pipe without it marks the worker as crashed.
+    """
     sys.setrecursionlimit(50000)
     # Detach worker gp from large parent-inherited caches to prevent Copy-on-Write page duplication
     if gp_ref is not None:
-        import copy
         gp_ref = copy.copy(gp_ref)
         gp_ref.ChangeSet_Dict = {}
         gp_ref._ast_staged_symbols = {}
         gp_ref._ast_staged_names = {}
         gp_ref.unchanged_symbol_cache = {}
+        # The parent's blob_symbol_cache is only read; what this worker loads goes back with its done frame
+        gp_ref._blob_symbols_fetched = {}
+        gp_ref._blob_symbols_used = set()
         gp_ref.file_symbols = {}
         gp_ref.file_names = {}
+        gp_ref._ast_negative_cache = set()
+        # This TableEngine is never committed: resolve_ref leaves stubs to the parent
+        gp_ref._is_worker = True
 
-    # Ensure dedicated DB connection per worker process to avoid socket sharing across fork
+    send_lock = threading.Lock()
+
+    def _send(frame: bytes | memoryview) -> None:
+        with send_lock:
+            conn.send_bytes(frame)
+
+    # Dedicated DB connection per worker process to avoid socket sharing across fork
     try:
         G.TE.start_new_db(G.DB, is_worker=True)
     except Exception as e:
-        logger.error(f"Worker {worker_id} failed to initialize DB connection: {e}")
+        logger.error(COLOR.red(f"Worker {worker_id} failed to initialize DB connection: {e}"))
+        try:
+            _send(_FRAME_INIT_FAILED + pickle.dumps((f"Worker {worker_id}", f"DB connection failed: {e}", traceback.format_exc())))
+        except OSError:
+            pass
+        conn.close()
+        return
 
-    # Determine effective symbol mapping: shared mmap if available, else passed dict
-    if resolved_symbols_map is None and getattr(gp_ref, "_shared_symbols", None) is not None:
-        effective_symbols = gp_ref._shared_symbols.symbols
-        effective_names = gp_ref._shared_symbols.names
-    else:
-        effective_symbols = resolved_symbols_map
-        effective_names = resolved_names_map
-
-    # Worker-side serialization double-buffering pipeline
+    # File-scoped shared symbol segments inherited from the parent (None during Stage 1)
+    shared_symbols = getattr(gp_ref, "_shared_symbols", None) if gp_ref is not None else None
+    compress = G.LOW_MEMORY_MODE
     worker_serialize_queue: queue.Queue = queue.Queue(maxsize=2)
+    # Time split sent to the parent with the done frame (keys: _WORKER_SPLIT_KEYS); the serializer thread
+    # keeps its own counter so the two threads never update the same entry
+    split = dict.fromkeys(_WORKER_SPLIT_KEYS, 0.0)
+    encode_s = [0.0]
+    reads_base = (getattr(G.TE, "db_reads", 0), getattr(G.TE, "db_read_s", 0.0))
+    symbols_base = Counter(SYMBOL_STATS)
 
     def _serializer_loop() -> None:
         while True:
             item = worker_serialize_queue.get()
             if item is None:
                 break
-            b_id, b_dict = item
-            if b_dict:
-                try:
-                    raw_bytes = pickle.dumps(b_dict, protocol=pickle.HIGHEST_PROTOCOL)
-                    if G.LOW_MEMORY_MODE or G.VERY_LOW_MEMORY_MODE:
-                        payload = zlib.compress(raw_bytes, level=1)
-                    else:
-                        payload = raw_bytes
-                    result_queue.put((b_id, payload))
-                    del raw_bytes
-                    del payload
-                except Exception as e:
-                    logger.error(COLOR.red(f"Worker {worker_id} failed to serialize batch {b_id}: {e}"))
-                    error_queue.put((f"Batch-{b_id}", str(e), traceback.format_exc()))
-                    result_queue.put((b_id, None))
-            else:
-                result_queue.put((b_id, None))
+            b_id, b_files, b_dict, b_errors = item
+            del item
+            t_encode = time.perf_counter()
+            try:
+                frame = _encode_batch_result(b_id, b_dict, b_errors, compress)
+            except Exception as e:
+                logger.error(COLOR.red(f"Worker {worker_id} failed to serialize batch {b_id}: {e}"))
+                tb_str = traceback.format_exc()
+                failed = [(f, f"Batch {b_id} could not be serialized: {e}", tb_str) for f in b_files]
+                frame = _encode_batch_result(b_id, {}, b_errors + failed, compress)
+            encode_s[0] += time.perf_counter() - t_encode
             del b_dict
+            try:
+                _send(frame)
+            except OSError:
+                # The parent stopped this stage and will terminate the worker
+                return
+            del frame
 
     serializer_thread = threading.Thread(target=_serializer_loop, daemon=True)
     serializer_thread.start()
 
-    is_recycling = False
-    processed_batches = 0
-    max_worker_batches = 5 if not G.VERY_LOW_MEMORY_MODE else 3  # Recycle worker after 5 batches (~1000 files) to prevent persistent Clang C-heap fragmentation
-
     try:
         while True:
-            try:
-                task = task_queue.get()
-            except Exception as e:
-                logger.error(f"Worker {worker_id} failed to get batch from queue: {e}")
-                break
-
+            t_wait = time.perf_counter()
+            task = _recv_task(conn)
+            t_task = time.perf_counter()
+            split["task_wait_s"] += t_task - t_wait
             if task is None:
-                # Sentinel received, gracefully exit
+                # Stop frame (or the parent went away)
                 break
 
             batch_id, changed_files = task
             batch_cs_dict = {}
+            batch_errors: list[tuple[str, str, str]] = []
 
             for f_idx, changed_file in enumerate(changed_files):
                 try:
@@ -3014,51 +3538,64 @@ def file_processing_worker(
                     CS.gp = gp_ref
                     CS.mf = mf_ref
                     CS.batch_cs_dict = batch_cs_dict
-                    if hasattr(gp_ref, "file_blob_hashes") and CS.current_path in gp_ref.file_blob_hashes:
-                        CS.blob_hash = gp_ref.file_blob_hashes[CS.current_path]
+                    if not _attach_blob_hash(CS, getattr(gp_ref, "file_blob_hashes", None)):
+                        batch_errors.append((
+                            changed_file, "No git blob hash in this version (not a regular file?); skipped.", ""
+                        ))
+                        continue
                     G.CURRENT_PARSING_FILE = CS.current_path
 
                     default_processing(CS)
                     CS.parse()
 
                     # Pre-unpack intra-file AST view schemas in parallel workers to distribute CPU load
+                    t_phase = time.perf_counter()
                     if not G.VERY_LOW_MEMORY_MODE:
                         CS.preprocess_ref_views()
+                    t_views = time.perf_counter()
+                    split["ref_views_s"] += t_views - t_phase
 
-                    # Pre-resolve foreign references against resolved header symbols across worker cores
-                    if effective_symbols:
-                        CS.pre_resolve_operations(effective_symbols, effective_names)
+                    # Pre-resolve foreign references against symbols published by earlier stages and epochs
+                    if shared_symbols:
+                        CS.pre_resolve_operations(shared_symbols)
+                    t_resolve = time.perf_counter()
+                    split["pre_resolve_s"] += t_resolve - t_views
 
                     # In normal memory mode, pre-resolve unchanged DB dependencies to prune foreign_deps
-                    if not G.LOW_MEMORY_MODE and not G.VERY_LOW_MEMORY_MODE:
+                    if not G.LOW_MEMORY_MODE:
                         CS.prune_unchanged_dependencies()
+                    split["prune_s"] += time.perf_counter() - t_resolve
 
                     # Clean bloat and store in batch dict
                     CS.clear_bloat()
                     batch_cs_dict[CS.current_path] = CS
                 except Exception as e:
                     err_str = str(e)
-                    tb_str = traceback.format_exc()
                     logger.error(COLOR.red(f"Worker {worker_id} error parsing '{changed_file}': {err_str}"))
-                    error_queue.put((changed_file, err_str, tb_str))
+                    batch_errors.append((changed_file, err_str, traceback.format_exc()))
                 finally:
                     G.CURRENT_PARSING_FILE = None
 
                 # Periodic memory reclamation in low/very-low memory modes
-                if (G.LOW_MEMORY_MODE or G.VERY_LOW_MEMORY_MODE) and (f_idx + 1) % 25 == 0:
+                if G.LOW_MEMORY_MODE and (f_idx + 1) % 25 == 0:
                     reclaim_system_memory()
 
-            worker_serialize_queue.put((batch_id, batch_cs_dict))
+            t_put = time.perf_counter()
+            split["busy_s"] += t_put - t_task
+            # Blocks while two finished batches wait for the parent to read them
+            worker_serialize_queue.put((batch_id, changed_files, batch_cs_dict, batch_errors))
+            t_queued = time.perf_counter()
+            split["send_wait_s"] += t_queued - t_put
             del batch_cs_dict
             reclaim_system_memory()
-
-            processed_batches += 1
-            if allow_mid_epoch_recycle and processed_batches >= max_worker_batches and not task_queue.empty():
-                is_recycling = True
-                result_queue.put(("__WORKER_RECYCLE__", worker_id))
-                break
+            split["gc_s"] += time.perf_counter() - t_queued
     finally:
-        worker_serialize_queue.put(None)
+        while serializer_thread.is_alive():
+            try:
+                worker_serialize_queue.put(None, timeout=1.0)
+                break
+            except queue.Full:
+                continue
         serializer_thread.join()
         if getattr(G.TE, "db", None) is not None:
             try:
@@ -3067,8 +3604,18 @@ def file_processing_worker(
                 pass
             G.TE.db = None
         reclaim_system_memory()
-        if not is_recycling:
-            result_queue.put(None)  # Worker done sentinel
+        split["encode_s"] = encode_s[0]
+        split["db_reads"] = getattr(G.TE, "db_reads", 0) - reads_base[0]
+        split["db_read_s"] = getattr(G.TE, "db_read_s", 0.0) - reads_base[1]
+        split["symbol_stats"] = dict(SYMBOL_STATS - symbols_base)
+        if gp_ref is not None:
+            split["blob_symbols"] = getattr(gp_ref, "_blob_symbols_fetched", None) or {}
+            split["blob_symbols_used"] = list(getattr(gp_ref, "_blob_symbols_used", ()))
+        try:
+            _send(_FRAME_DONE + pickle.dumps(split, protocol=pickle.HIGHEST_PROTOCOL))
+        except OSError:
+            pass
+        conn.close()
     return
 
 
@@ -3087,6 +3634,9 @@ def file_processing(start: int, end: int | None, override_list: list[str] | None
             CS.current_vid = gp.VID
             CS.gp = gp
             CS.mf = MF
+            if not _attach_blob_hash(CS, getattr(gp, "file_blob_hashes", None)):
+                logger.error(COLOR.red(f"Skipping '{changed_file}': no git blob hash in this version (not a regular file?)"))
+                continue
             G.CURRENT_PARSING_FILE = CS.current_path
 
             default_processing(CS)
@@ -3106,10 +3656,16 @@ def file_processing(start: int, end: int | None, override_list: list[str] | None
     return
 
 
-def processing_unchanges() -> None:
-    """Process everything outside gp.Change_List with self-healing for legacy unparsed files."""
+def processing_unchanges() -> list[str]:
+    """Carry files outside gp.Change_List forward into gp.VID and return the files that still need parsing.
+
+    Files the diff missed (forgotten deletes and additions) and unchanged files absent from the previous
+    version (self-healing) are returned as change lines for the parsing workers instead of being parsed
+    serially here.
+    """
+    to_parse: list[str] = []
     if gp.Old_VID == 0:
-        return
+        return to_parse
     full_set = set(MF.git_file_list(gp.Version_Name).splitlines())
 
     changed_set = set()
@@ -3140,14 +3696,14 @@ def processing_unchanges() -> None:
         logger.warning("There seems to be forgotten deletes... Processing...")
         if G.OVERRIDE_FORGOTTEN_PRINT:
             logger.debug(forgotten_delete)
-        file_processing(0, 0, (f"D\t{x}" for x in forgotten_delete))
+        to_parse.extend(f"D\t{x}" for x in sorted(forgotten_delete))
 
     forgotten_new = (full_set - old_full_set) - changed_set
     if forgotten_new:
         logger.warning(f"Found {len(forgotten_new)} forgotten new files... Processing...")
         if G.OVERRIDE_FORGOTTEN_PRINT:
             logger.debug(forgotten_new)
-        file_processing(0, 0, (f"A\t{x}" for x in forgotten_new))
+        to_parse.extend(f"A\t{x}" for x in sorted(forgotten_new))
 
     te_set = G.TE.set
     t_id = m_bridge_file.table_id
@@ -3204,18 +3760,19 @@ def processing_unchanges() -> None:
                 f"Found {len(missing_regs)} files in unchanged_set missing from prior DB version (Old_VID {old_vid}). "
                 f"Self-healing by processing as new additions in VID {vid}..."
             )
-            file_processing(0, 0, missing_regs)
+            to_parse.extend(sorted(missing_regs))
 
         if missing_syms:
             if not hasattr(gp, "Symlink_List") or gp.Symlink_List is None:
                 gp.Symlink_List = []
             gp.Symlink_List.extend(missing_syms)
 
-    return
+    return to_parse
 
 
-def processing_dirs() -> None:  # noqa: C901
-    """Process dirs."""
+def processing_dirs() -> dict[str, ChangeSet]:  # noqa: C901
+    """Carry unchanged directories forward into gp.VID and return ChangeSets for new directories."""
+    dir_changesets: dict[str, ChangeSet] = {}
     dir_list = set(MF.get_dir_list(gp.Version_Name))
 
     if gp.Old_VID != 0:
@@ -3267,7 +3824,7 @@ def processing_dirs() -> None:  # noqa: C901
                 CS.ref(m_file_name.fnid),
                 CS.ref(m_file.fid),
             ))
-            gp.ChangeSet_Dict[single_dir] = CS
+            dir_changesets[single_dir] = CS
 
     else:
         # If VID = 1, we need all dirs to be added
@@ -3283,8 +3840,8 @@ def processing_dirs() -> None:  # noqa: C901
                 CS.ref(m_file_name.fnid),
                 CS.ref(m_file.fid),
             ))
-            gp.ChangeSet_Dict[single_dir] = CS
-    return
+            dir_changesets[single_dir] = CS
+    return dir_changesets
 
 
 def processing_symlinks(override_symlinks: list[str] | None = None) -> None:
@@ -3360,6 +3917,33 @@ def processing_symlinks(override_symlinks: list[str] | None = None) -> None:
         gp.Symlink_List.clear()
 
 
+def _load_blob_tags(blob_ids: Iterable[int]) -> dict[int, list[tuple[int, int, int, int]]]:
+    """Tags of already-parsed blobs as `blob_id -> [(tag_id, blob_id, line_s, line_e), ...]` from m_bridge_tag."""
+    wanted = sorted(set(blob_ids))
+    tags: dict[int, list[tuple[int, int, int, int]]] = defaultdict(list)
+    if not wanted:
+        return tags
+    with G.DB() as db:
+        cur = _raw_cursor(db)
+        if cur is None:
+            for blob_id in wanted:
+                for row in m_bridge_tag.view_get_multiple(((m_bridge_tag.blob_id,),), blob_id, None, None, None, None, None) or ():
+                    tags[blob_id].append((row[1], blob_id, row[2], row[3]))
+            return tags
+        try:
+            for i in range(0, len(wanted), _SQL_IN_CHUNK):
+                chunk = wanted[i : i + _SQL_IN_CHUNK]
+                cur.execute(
+                    f"SELECT blob_id, tag_id, line_s, line_e FROM m_bridge_tag WHERE blob_id IN ({','.join(['%s'] * len(chunk))})",  # noqa: S608
+                    tuple(chunk),
+                )
+                for blob_id, tag_id, line_s, line_e in cur.fetchall():
+                    tags[int(blob_id)].append((int(tag_id), int(blob_id), int(line_s), int(line_e)))
+        finally:
+            cur.close()
+    return tags
+
+
 def processing_git_commits(version: str) -> None:
     """Parse git commits for active version, link contributors, and bridge tags to commits."""
     from parser.git_ast import GitCommitParser
@@ -3369,19 +3953,9 @@ def processing_git_commits(version: str) -> None:
 
     commits = None
     file_hunks_map = None
-    commit_queue = getattr(gp, "_commit_queue", None)
-    commit_proc = getattr(gp, "_commit_proc", None)
-    if commit_queue is not None:
-        try:
-            commits, file_hunks_map = commit_queue.get(timeout=120.0)
-        except Exception as e:
-            logger.warning(f"Failed to retrieve precomputed commits from background worker: {e}")
-            commits, file_hunks_map = None, None
-        finally:
-            gp._commit_queue = None
-            if commit_proc is not None:
-                commit_proc.join(timeout=2.0)
-                gp._commit_proc = None
+    precomputed = _collect_git_commit_result()
+    if precomputed is not None:
+        commits, file_hunks_map = precomputed
 
     if commits is None:
         commits, file_hunks_map = git_parser.parse_version_commits_with_hunks(
@@ -3392,39 +3966,37 @@ def processing_git_commits(version: str) -> None:
 
     logger.info(f"Processing {len(commits)} git commits for version '{version}'...")
 
-    commit_hash_to_id = {}
+    # Commit ids of the range: Step 1 (ingest_git_dag) registered them, anything else is looked up in bulk
+    commit_hash_to_id: dict[str, int] = {}
+    known_ids = dict(getattr(gp, "commit_ids_by_hash", None) or {})
+    unknown = [h for c in commits for h in (c.commit_hash, *(c.parents or ())) if h not in known_ids]
+    if unknown:
+        with G.DB() as db:
+            known_ids.update(_lookup_commit_ids(db, network_id, unknown))
+
     pending_parents: list[tuple[int, list[str]]] = []
     head_commit_id = None
     for commit in commits:
         if G.is_deadline_exceeded():
             logger.warning(COLOR.yellow("[Duration Limit] Execution deadline reached during commit processing. Stopping early..."))
             break
-        # Resolve author person_id
-        author_res = G.TE.set(
-            m_maintainer_person.table_id,
-            (None, commit.author_name or commit.author_email, commit.author_email),
-        )
-        author_pid = author_res[0] if author_res else 1
-
-        # Resolve committer person_id
-        committer_res = G.TE.set(
-            m_maintainer_person.table_id,
-            (None, commit.committer_name or commit.committer_email, commit.committer_email),
-        )
-        committer_pid = committer_res[0] if committer_res else author_pid
-
-        # Format commit_hash as 20 bytes
         c_hash = commit.commit_hash
-        if isinstance(c_hash, str):
-            c_hash_bytes = bytes.fromhex(c_hash) if len(c_hash) == 40 else c_hash.encode("ascii")
-        else:
-            c_hash_bytes = c_hash
-
-        # Check if commit is already present in DB or TE cache
-        c_match = G.TE.get(m_commit.table_id, (None, network_id, c_hash_bytes, None, None, None, None, None, None))
-        if c_match:
-            commit_id = c_match[0]
-        else:
+        commit_id = known_ids.get(c_hash)
+        c_match = commit_id is not None
+        if not c_match:
+            # Format commit_hash as 20 bytes
+            if isinstance(c_hash, str):
+                c_hash_bytes = bytes.fromhex(c_hash) if len(c_hash) == 40 else c_hash.encode("ascii")
+            else:
+                c_hash_bytes = c_hash
+            author_res = G.TE.set(m_maintainer_person.table_id, (None, *_person_key(commit.author_name, commit.author_email)))
+            author_pid = author_res[0] if author_res else 1
+            committer_res = G.TE.set(
+                m_maintainer_person.table_id,
+                (None, *_person_key(commit.committer_name or commit.committer_email or commit.author_name,
+                                    commit.committer_email or commit.author_email)),
+            )
+            committer_pid = committer_res[0] if committer_res else author_pid
             # Insert commit (commit_id, network_id, commit_hash, author_id, author_date, committer_id, committer_date, subject, message)
             commit_res = G.TE.set(
                 m_commit.table_id,
@@ -3453,10 +4025,7 @@ def processing_git_commits(version: str) -> None:
         # Insert contributors (Author, Committer, Co-developed-by, Signed-off-by, Reviewed-by, etc.)
         if not c_match:
             for contrib in commit.contributors:
-                c_res = G.TE.set(
-                    m_maintainer_person.table_id,
-                    (None, contrib.name or contrib.email, contrib.email),
-                )
+                c_res = G.TE.set(m_maintainer_person.table_id, (None, *_person_key(contrib.name, contrib.email)))
                 c_pid = c_res[0] if c_res else 1
                 G.TE.set(
                     m_bridge_commit_person.table_id,
@@ -3490,13 +4059,10 @@ def processing_git_commits(version: str) -> None:
                     ),
                 )
 
-    # Link parents now that every commit of the range has an id; parents outside the range are looked up
+    # Link parents now that every commit of the range has an id; parents outside the range were looked up above
     for commit_id, parent_hashes in pending_parents:
         for p_idx, p_hash in enumerate(parent_hashes):
-            p_cid = commit_hash_to_id.get(p_hash)
-            if p_cid is None and len(p_hash) == 40:
-                p_match = G.TE.get(m_commit.table_id, (None, network_id, bytes.fromhex(p_hash), None, None, None, None, None, None))
-                p_cid = p_match[0] if p_match else None
+            p_cid = commit_hash_to_id.get(p_hash) or known_ids.get(p_hash)
             if p_cid is not None:
                 G.TE.set(m_commit_parent.table_id, (commit_id, p_cid, p_idx))
 
@@ -3571,6 +4137,26 @@ def processing_git_commits(version: str) -> None:
             if hasattr(cs_obj, "cs_result") and isinstance(cs_obj.cs_result, list):
                 cs_obj.cs_result.clear()
 
+    # Files reused by Step 4.5's blob deduplication were not parsed: their tags come from m_bridge_tag
+    deduped = [
+        p for p in sorted(getattr(gp, "deduped_paths", ()))
+        if file_hunks_map and p in file_hunks_map and p not in gp.file_pre_extracted_tags and gp.file_blob_ids.get(p)
+    ]
+    if deduped:
+        blob_tags = _load_blob_tags({gp.file_blob_ids[p] for p in deduped})
+        for c_path in deduped:
+            file_tags = blob_tags.get(gp.file_blob_ids[c_path])
+            if not file_tags:
+                continue
+            tag_bridges = git_parser.map_tags_to_commits(
+                file_tags,
+                c_path,
+                commit_hash_to_id=commit_hash_to_id,
+                file_hunks_map=file_hunks_map,
+            )
+            for cid, b_id, tid in tag_bridges:
+                G.TE.set(m_bridge_commit_tag.table_id, (cid, b_id, tid))
+
     # Stage m_bridge_checkpoint for milestone release version
     checkpoint_cid = gp.VID if (gp.VID and gp.VID != 0) else head_commit_id
     if checkpoint_cid is not None and checkpoint_cid != 0:
@@ -3625,8 +4211,13 @@ def processing_kbuild(
     staged_file_refs: set[tuple[int, int, int, int]] | None = None,
     valid_blob_ids: set[int] | None = None,
     valid_fnids: set[int] | None = None,
+    new_blob_ids: set[int] | None = None,
 ) -> None:
-    """Parse Makefile and Kbuild files for active version, map Kconfig symbols, and stage build references."""
+    """Parse Makefile and Kbuild files for active version, map Kconfig symbols, and stage build references.
+
+    `new_blob_ids` limits m_file_reference staging to Makefile blobs whose references were cleared for
+    recomputation (None: every blob); m_kconfig_kbuild rows are staged for every Makefile.
+    """
     if gp.VID == 0:
         return
 
@@ -3714,6 +4305,8 @@ def processing_kbuild(
                 if mk_fid and target_fnid is not None:
                     if valid_blob_ids is not None and mk_fid not in valid_blob_ids:
                         continue
+                    if new_blob_ids is not None and mk_fid not in new_blob_ids:
+                        continue
                     ref_t = int(getattr(b, "ref_type", 3))
                     source_line = int(getattr(b, "source_line", 1))
                     ref_key = (mk_fid, target_fnid, ref_t, source_line)
@@ -3742,8 +4335,12 @@ def processing_doc_references(
     staged_file_refs: set[tuple[int, int, int, int]] | None = None,
     valid_blob_ids: set[int] | None = None,
     valid_fnids: set[int] | None = None,
+    new_blob_ids: set[int] | None = None,
 ) -> None:
-    """Scan documentation and text files for active version and map cross-file references into m_file_reference."""
+    """Scan documentation and text files for active version and map cross-file references into m_file_reference.
+
+    `new_blob_ids` limits the scan to documents whose references were cleared for recomputation (None: all).
+    """
     if gp.VID == 0:
         return
 
@@ -3761,6 +4358,8 @@ def processing_doc_references(
 
     all_files = file_list_raw.splitlines() if file_list_raw else []
     doc_paths = [f for f in all_files if scanner.is_doc_candidate(f)]
+    if new_blob_ids is not None:
+        doc_paths = [f for f in doc_paths if get_fid_for_path(f) in new_blob_ids]
     if not doc_paths:
         return
 
@@ -3810,7 +4409,11 @@ def processing_doc_references(
 
 
 def processing_include_references(version: str) -> None:
-    """Batch populate C/ASM and Kconfig include references into m_file_reference using set-based query."""
+    """Batch populate C/ASM and Kconfig include references into m_file_reference using set-based query.
+
+    Only blobs that are new in this version (absent from gp.Old_VID's checkpoint) are processed: their
+    previous rows were cleared by processing_file_references(), and carried-over blobs keep theirs.
+    """
     if gp.VID == 0:
         return
     try:
@@ -3819,17 +4422,6 @@ def processing_include_references(version: str) -> None:
             if cur is None:
                 return
 
-            # Idempotent cleanup for this version's includes & Kconfig sources
-            cur.execute(
-                """
-                DELETE FROM m_file_reference
-                WHERE source_blob_id IN (
-                    SELECT blob_id FROM m_bridge_checkpoint WHERE commit_id = %s
-                ) AND ref_type IN (%s, %s);
-                """,
-                (gp.VID, int(FileRefType.Include), int(FileRefType.Kconfig)),
-            )
-
             sync_query = f"""
                 INSERT IGNORE INTO m_file_reference (source_blob_id, target_fnid, ref_type, line_no, details)
                 SELECT STRAIGHT_JOIN DISTINCT bt.blob_id, inc.fnid,
@@ -3837,13 +4429,14 @@ def processing_include_references(version: str) -> None:
                        bt.line_s,
                        LEFT(a.name, 255)
                 FROM m_bridge_checkpoint bf
+                LEFT JOIN m_bridge_checkpoint old_v ON old_v.blob_id = bf.blob_id AND old_v.commit_id = %s
                 JOIN m_bridge_tag bt ON bf.blob_id = bt.blob_id
                 JOIN m_tag t ON bt.tag_id = t.tag_id
                 JOIN m_ast_include inc ON t.ast_id = inc.ast_id
                 JOIN m_ast a ON inc.ast_id = a.ast_id
-                WHERE bf.commit_id = %s;
+                WHERE bf.commit_id = %s AND old_v.blob_id IS NULL;
             """
-            cur.execute(sync_query, (gp.VID,))
+            cur.execute(sync_query, (gp.Old_VID or 0, gp.VID))
             inserted = cur.rowcount
             db.cnx.commit()
             cur.close()
@@ -3852,27 +4445,58 @@ def processing_include_references(version: str) -> None:
         logger.warning(f"Error in processing_include_references for {version}: {e}", exc_info=True)
 
 
+def _new_version_blob_ids() -> tuple[set[int], set[int]] | None:
+    """Blob ids of this version's tree, and the subset absent from gp.Old_VID's tree (new in this version).
+
+    Returns None when the driver has no SQL access (MockDB).
+    """
+    with G.DB() as db:
+        cur = _raw_cursor(db)
+        if cur is None:
+            return None
+        try:
+            cur.execute("SELECT DISTINCT blob_id FROM m_bridge_checkpoint WHERE commit_id = %s", (gp.VID,))
+            current = {int(r[0]) for r in cur.fetchall()}
+            previous: set[int] = set()
+            if gp.Old_VID:
+                cur.execute("SELECT DISTINCT blob_id FROM m_bridge_checkpoint WHERE commit_id = %s", (gp.Old_VID,))
+                previous = {int(r[0]) for r in cur.fetchall()}
+        finally:
+            cur.close()
+    return current, current - previous
+
+
 def processing_file_references(version: str) -> None:
-    """Extract and consolidate all cross-file references (Kbuild, Makefiles, Documentation, Includes, Kconfig)."""
+    """Extract and consolidate all cross-file references (Kbuild, Makefiles, Documentation, Includes, Kconfig).
+
+    m_file_reference rows are keyed by source blob, so only blobs that are new in this version (absent
+    from gp.Old_VID's tree) are cleared and recomputed; blobs carried over keep the rows computed when they
+    first appeared.
+    """
     if gp.VID == 0:
         return
 
     # Ensure all parent tables (m_file_blob, m_file_name, m_bridge_checkpoint) are committed before referencing
     G.TE.commit_all(update_in_mem_indexes=False)
 
-    # 1. Version-scoped clean reset for idempotency across pipeline re-runs
+    scope = _new_version_blob_ids()
+    valid_blob_ids, new_blob_ids = scope if scope is not None else (None, None)
+    if new_blob_ids is not None:
+        logger.info(f"Recomputing file references for {len(new_blob_ids)} of {len(valid_blob_ids)} blobs new in version '{version}'.")
+
+    # 1. Clear the rows of the blobs about to be recomputed (idempotent across pipeline re-runs)
     try:
         with G.DB() as db:
-            cur = db.cnx.cursor() if hasattr(db, "cnx") and db.cnx else None
+            cur = _raw_cursor(db)
             if cur:
                 cur.execute(
                     """
-                    DELETE FROM m_file_reference
-                    WHERE source_blob_id IN (
-                        SELECT blob_id FROM m_bridge_checkpoint WHERE commit_id = %s
-                    );
+                    DELETE r FROM m_file_reference r
+                    JOIN m_bridge_checkpoint cur_v ON cur_v.blob_id = r.source_blob_id AND cur_v.commit_id = %s
+                    LEFT JOIN m_bridge_checkpoint old_v ON old_v.blob_id = cur_v.blob_id AND old_v.commit_id = %s
+                    WHERE old_v.blob_id IS NULL;
                     """,
-                    (gp.VID,),
+                    (gp.VID, gp.Old_VID or 0),
                 )
                 db.cnx.commit()
                 cur.close()
@@ -3886,27 +4510,12 @@ def processing_file_references(version: str) -> None:
         except Exception:
             pass
 
+    # Rows staged for one source blob in this run (rows of other blobs were cleared or are not recomputed)
     staged_file_refs: set[tuple[int, int, int, int]] = set()
-    valid_blob_ids: set[int] = set()
-    valid_fnids: set[int] = set()
-    try:
-        with G.DB() as db:
-            cur = db.cnx.cursor() if hasattr(db, "cnx") and db.cnx else None
-            if cur:
-                cur.execute("SELECT blob_id FROM m_file_blob")
-                valid_blob_ids = {int(r[0]) for r in cur.fetchall()}
-                cur.execute("SELECT fnid FROM m_file_name")
-                valid_fnids = {int(r[0]) for r in cur.fetchall()}
-                cur.execute("SELECT source_blob_id, target_fnid, ref_type, line_no FROM m_file_reference")
-                for r in cur.fetchall():
-                    staged_file_refs.add((r[0], r[1], r[2], r[3]))
-                cur.close()
-    except Exception as e:
-        logger.debug(f"Preloading existing m_file_reference keys and valid IDs: {e}")
 
-    # 3. Parse Kbuild and Documentation files and stage into TableEngine
-    processing_kbuild(version, staged_file_refs=staged_file_refs, valid_blob_ids=valid_blob_ids, valid_fnids=valid_fnids)
-    processing_doc_references(version, staged_file_refs=staged_file_refs, valid_blob_ids=valid_blob_ids, valid_fnids=valid_fnids)
+    # 3. Parse Kbuild and Documentation files and stage into TableEngine (fnids come from the committed TE cache)
+    processing_kbuild(version, staged_file_refs=staged_file_refs, valid_blob_ids=valid_blob_ids, new_blob_ids=new_blob_ids)
+    processing_doc_references(version, staged_file_refs=staged_file_refs, valid_blob_ids=valid_blob_ids, new_blob_ids=new_blob_ids)
 
     # 4. Commit TableEngine queued rows immediately so they claim sequence IDs 1..N and empty the queue
     if m_file_reference.table_id in G.TE.queued_set and G.TE.queued_set[m_file_reference.table_id]:
@@ -3976,17 +4585,30 @@ def processing_maintainer_files(version: str) -> None:
     logger.info(f"Matching {len(all_files)} files against {len(sections)} maintainer sections for version '{version}'...")
 
     maintainers_blob_id = get_fid_for_path("MAINTAINERS") or 1
+    # Rows are keyed by the MAINTAINERS blob: files mapped for it in an earlier version need no matching
+    already_mapped: set[int] = set()
+    with G.DB() as db:
+        cur = _raw_cursor(db)
+        if cur is not None:
+            try:
+                cur.execute("SELECT DISTINCT fnid FROM m_maintainer_file WHERE maintainers_blob_id = %s", (maintainers_blob_id,))
+                already_mapped = {int(r[0]) for r in cur.fetchall()}
+            finally:
+                cur.close()
+    if already_mapped:
+        logger.info(f"{len(already_mapped)} files are already mapped for this MAINTAINERS blob; matching the others only.")
+
     matched_count = 0
     seen_pairs: set[tuple[int, int]] = set()
     for file_path in all_files:
         if G.is_deadline_exceeded():
             logger.warning(COLOR.yellow("[Duration Limit] Execution deadline reached during maintainer matching. Stopping early..."))
             break
+        fnid = get_fnid_for_path(file_path)
+        if fnid is None or fnid in already_mapped:
+            continue
         matched_sections = matcher.match_file(file_path)
         if not matched_sections:
-            continue
-        fnid = get_fnid_for_path(file_path)
-        if fnid is None:
             continue
         for sec in matched_sections:
             sec_id = get_sec_id_for_name(sec.name)

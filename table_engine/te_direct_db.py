@@ -25,8 +25,11 @@ KEY RESPONSIBILITIES:
    table rows, correctly slicing data offsets and keying on each table's primary key.
 
 4. TRANSACTION COMMIT:
-   `commit()` flushes all staged rows in high-throughput batch operations
-   using `db.insert()` and `db.update()`, and purges staged memory buffers.
+   `commit()` / `commit_all()` move the staged rows into a `CommitBatch` and write it
+   with `db.commit_tables_parallel()`. With `async_commits` on, `commit_all()` hands the
+   batch to a background writer thread and returns; every database read whose tables the
+   batch writes, the next commit, `start_new_db()` and `close()` first wait for it. Tables
+   the database did not commit go back to staging, so a retried commit writes them.
 
 5. RESOURCE MANAGEMENT:
    Safely manages database connection lifecycles during start, restart, and shutdown.
@@ -34,8 +37,12 @@ KEY RESPONSIBILITIES:
 """
 from __future__ import annotations
 
+import contextlib
 import hashlib
-from typing import TYPE_CHECKING, Any, Callable, Sequence, Self
+import threading
+import time
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any, Callable, Iterable, Sequence, Self
 from types import TracebackType
 from operator import itemgetter
 from core.globalstuff import (
@@ -53,6 +60,48 @@ def compute_ast_hash(joins: JoinsType, filtered_columns: tuple[SafeDataType, ...
     """Compute deterministic 32-byte binary SHA-256 hash for canonical AST join graph and filtered column data."""
     key_str = f"{joins}:{filtered_columns}"
     return hashlib.sha256(key_str.encode("utf-8")).digest()
+
+
+def _is_hash_keyed(table: Table) -> bool:
+    """Tables deduplicated by primary key across commits (`_committed_pks`): idempotent or content-hash keyed."""
+    return bool(
+        getattr(table, "idempotent_pk", False)
+        or getattr(table, "init_primary", ()) == ("hash",)
+        or table.table_name in ("m_tag_code", "m_ast_hash")
+    )
+
+
+@dataclass(eq=False)
+class CommitBatch:
+    """Rows one commit took out of the staging queues, kept until the database has written them.
+
+    `staged` keeps the swapped-out staging containers (`queued_set` dict, `queued_update` list per table) and the
+    `added_*` fields the keys this commit added to the committed-key sets, so the tables the database did not
+    commit can be put back (`TEDirectDB._restore_batch()`) for the next commit to write.
+    """
+
+    tables_data: list[tuple[Any, tuple[tuple[SafeDataType, ...], ...], tuple[tuple[SafeDataType, ...], ...]]] = field(
+        default_factory=list
+    )
+    staged: dict[int, tuple[dict[Any, Any], list[tuple[SafeDataType, ...]]]] = field(default_factory=dict)
+    added_nodup: dict[int, list[Any]] = field(default_factory=dict)
+    added_pks: dict[int, list[Any]] = field(default_factory=dict)
+    added_unique: dict[int, dict[tuple[int, ...], list[tuple[SafeDataType, ...]]]] = field(default_factory=dict)
+    table_ids: frozenset[int] = frozenset()
+    rows: int = 0
+    # (table_name, rows inserted, rows updated, seconds) per written table
+    stats: list[tuple[str, int, int, float]] = field(default_factory=list)
+    write_s: float = 0.0
+    wait_s: float = 0.0
+    background: bool = False
+    error: BaseException | None = None
+    thread: threading.Thread | None = None
+    restored: frozenset[int] = frozenset()
+
+    def slowest_tables(self, limit: int = 4) -> str:
+        """`name rows/seconds` of the tables that took longest (tables are written in parallel, so they overlap)."""
+        top = sorted(self.stats, key=lambda st: st[3], reverse=True)[:limit]
+        return ", ".join(f"{st[0]} {st[1] + st[2]:,} rows {st[3]:.1f}s" for st in top)
 
 
 class TEDirectDB:
@@ -91,9 +140,20 @@ class TEDirectDB:
         self._queued_sec_indexes: dict[int, dict[tuple[int, ...], dict[tuple[SafeDataType, ...], list[tuple[SafeDataType, ...]]]]] = {}
         self._queued_single_col_indexes: dict[int, dict[int, dict[SafeDataType, list[tuple[SafeDataType, ...]]]]] = {}
         self.db: Any | None = None
+        # Background commits: commit_all() returns once a writer thread has the rows (see wait_for_commit())
+        self.async_commits: bool = False
+        self._pending: CommitBatch | None = None
+        self._join_tables_cache: dict[JoinsType, frozenset[int]] = {}
+        # Cumulative counters (callers diff them per stage): commits, rows written, seconds the writes took,
+        # seconds the caller was blocked by them (all of a synchronous write, the join of a background one)
+        self.commit_stats: dict[str, float] = {"commits": 0, "background": 0, "rows": 0, "write_s": 0.0, "blocked_s": 0.0}
+        # Database reads issued by this engine (get/view fallbacks) and their seconds
+        self.db_reads: int = 0
+        self.db_read_s: float = 0.0
 
     def close(self) -> None:
-        """Safely close active database connection handle."""
+        """Wait for a pending background commit (raising its error), then safely close the database handle."""
+        self.wait_for_commit()
         if getattr(self, "db", None) is not None:
             if hasattr(self.db, "close") and callable(self.db.close):
                 try:
@@ -117,7 +177,10 @@ class TEDirectDB:
 
     def __del__(self) -> None:
         """Clean up resources upon garbage collection."""
-        self.close()
+        try:
+            self.close()
+        except Exception:
+            pass
 
     def _register_table(self, table: Table) -> None:
         """Register table schema, precompile PK extractors, and build secondary index structures."""
@@ -471,7 +534,7 @@ class TEDirectDB:
         if self.db is None:
             return None
 
-        return self.db.select(table, columns)
+        return self._db_read((table_id,), self.db.select, table, columns)
 
     def set(
         self,
@@ -651,7 +714,7 @@ class TEDirectDB:
         if self.db is None:
             return None
 
-        return self.db.view_select(self.tables, joins, columns)
+        return self._db_read(self._join_table_ids(joins), self.db.view_select, self.tables, joins, columns)
 
     def view_get_multiple(
         self,
@@ -672,7 +735,16 @@ class TEDirectDB:
         """
         if self.db is None:
             return []
-        return self.db.view_select_multiple(self.tables, joins, columns)
+        return self._db_read(self._join_table_ids(joins), self.db.view_select_multiple, self.tables, joins, columns)
+
+    def get_in(self, table_id: int, col_idx: int, values: Sequence[SafeDataType]) -> list[tuple[SafeDataType, ...]]:
+        """Fetch every committed row of a table whose column `col_idx` is one of `values` from the database.
+
+        Staged rows are not included. The read waits for a background commit writing the table (`_db_read()`).
+        """
+        if self.db is None or not values:
+            return []
+        return self._db_read((table_id,), self.db.select_in, self.tables[table_id], col_idx, tuple(values))
 
     def view_set(
         self,
@@ -806,66 +878,20 @@ class TEDirectDB:
             update_in_mem_indexes: Whether in-memory index updates are enabled (passed to cached engines).
 
         Process:
-            1. If `self.queued_set[table_id]` is non-empty:
-               - For `no_duplicate=True` tables: formats items as `((id_val, *data_key), ...)`.
-               - For other tables: formats values as `tuple(self.queued_set[table_id].values())`.
-               - Executes batch insert via `self.db.insert(table, payload)`.
-               - Clears `self.queued_set[table_id]`.
-            2. If `self.queued_update[table_id]` is non-empty:
-               - Executes batch upsert via `self.db.update(table, tuple(self.queued_update[table_id]))`.
-               - Clears `self.queued_update[table_id]`.
+            1. Waits for a pending background commit.
+            2. Moves the table's staged rows into a `CommitBatch` (`_take_staged()`): `no_duplicate=True` rows
+               become `(id_val, *data_key)`, keys already committed are skipped, rows are sorted by primary key.
+            3. Writes it on this thread with `db.insert()` / `db.update()` (inside `db.transaction()` when the
+               driver has one); if the database does not commit the table, its rows go back to staging and the
+               error is raised.
 
         Outputs:
             None.
         """
-        table = self.tables[table_id]
-
-        if self.queued_set[table_id]:
-            if table.no_duplicate:
-                committed_map = self._committed_nodup_keys.setdefault(table_id, {})
-                rows = []
-                for k, v in self.queued_set[table_id].items():
-                    if k in committed_map:
-                        continue
-                    row = v if isinstance(v, (tuple, list)) else ((v, *k) if isinstance(k, tuple) else (v, k))
-                    rows.append(row)
-                    committed_map[k] = row[0]
-            elif getattr(table, "idempotent_pk", False) or getattr(table, "init_primary", ()) == ("hash",) or table.table_name in ("m_tag_code", "m_ast_hash"):
-                committed_pks = self._committed_pks.setdefault(table_id, set())
-                rows = []
-                for pk, row in self.queued_set[table_id].items():
-                    if pk in committed_pks:
-                        continue
-                    rows.append(row)
-                    committed_pks.add(pk)
-            else:
-                rows = list(self.queued_set[table_id].values())
-
-            if rows:
-                if table.primary and len(rows) > 1:
-                    pk_fn = self._pk_getters.get(table_id)
-                    rows.sort(key=pk_fn if pk_fn is not None else itemgetter(*table.primary))
-
-                u_indexes = self._table_unique_keys.get(table_id)
-                if u_indexes:
-                    committed_u = self._committed_unique_keys.setdefault(table_id, {})
-                    for col_positions in u_indexes:
-                        u_set = committed_u.setdefault(col_positions, set())
-                        for r in rows:
-                            if all(c < len(r) and r[c] is not None for c in col_positions):
-                                u_set.add(tuple(self._sanitize_key(r[c]) for c in col_positions))
-
-                payload = tuple(rows)
-                self.db.insert(table, payload)
-            self.queued_set[table_id].clear()
-            if table_id in self._queued_sec_indexes:
-                self._queued_sec_indexes[table_id] = {idx_cols: {} for idx_cols in self._table_sec_indexes.get(table_id, ())}
-            if table_id in self._queued_single_col_indexes:
-                self._queued_single_col_indexes[table_id] = {col_idx: {} for col_idx in self._table_single_col_indexes.get(table_id, ())}
-
-        if self.queued_update[table_id]:
-            self.db.update(table, tuple(self.queued_update[table_id]))
-            self.queued_update[table_id].clear()
+        self.wait_for_commit()
+        batch = self._take_staged((table_id,))
+        if batch is not None:
+            self._write_batch(batch, None, parallel=False)
 
     def commit_all(self, max_workers: int | None = None, update_in_mem_indexes: bool = True) -> None:
         """Flush staged insert and update operations across ALL tables concurrently and clear buffers.
@@ -875,38 +901,73 @@ class TEDirectDB:
             update_in_mem_indexes: Whether in-memory index updates are enabled (passed to cached engines).
 
         Process:
-            1. Collects payload tuples `(table, insert_payload, update_payload)` for all non-empty tables.
-            2. Dispatches to `self.db.commit_tables_parallel(tables_data, max_workers=max_workers)`.
-            3. Clears all queued buffers.
+            1. Waits for the previous background commit (raising its error after restoring its rows).
+            2. Moves every table's staged rows into one `CommitBatch`.
+            3. With `async_commits` (and a driver with `supports_background_commit`), starts a writer thread
+               and returns; otherwise writes on this thread via `db.commit_tables_parallel()`.
 
         Outputs:
             None.
         """
-        tables_data = []
-        for table_id, table in self.tables.items():
-            insert_payload = ()
-            update_payload = ()
+        self.wait_for_commit()
+        batch = self._take_staged(tuple(self.tables))
+        if batch is None:
+            return
+        if self._background_commit_allowed(update_in_mem_indexes):
+            self._submit(batch, max_workers)
+        else:
+            self._write_batch(batch, max_workers)
 
-            if self.queued_set[table_id]:
+    # ------------------------------------------------------------------
+    # Commit batches, background writer and read-your-writes barrier
+    # ------------------------------------------------------------------
+    def _reset_staged_indexes(self, table_id: int) -> None:
+        """Replace a table's staged secondary indexes with empty ones."""
+        if table_id in self._queued_sec_indexes:
+            self._queued_sec_indexes[table_id] = {idx_cols: {} for idx_cols in self._table_sec_indexes.get(table_id, ())}
+        if table_id in self._queued_single_col_indexes:
+            self._queued_single_col_indexes[table_id] = {col_idx: {} for col_idx in self._table_single_col_indexes.get(table_id, ())}
+
+    def _take_staged(self, table_ids: Iterable[int]) -> CommitBatch | None:
+        """Move the staged rows of `table_ids` into a CommitBatch and record them as committed for deduplication.
+
+        The staging containers are swapped for empty ones, so rows staged from now on are not part of the batch.
+        Returns None when none of the tables has staged rows.
+        """
+        batch = CommitBatch()
+        for table_id in table_ids:
+            staged_set = self.queued_set.get(table_id)
+            staged_upd = self.queued_update.get(table_id)
+            if not staged_set and not staged_upd:
+                continue
+            table = self.tables[table_id]
+            insert_payload: tuple[tuple[SafeDataType, ...], ...] = ()
+            if staged_set:
                 if table.no_duplicate:
                     committed_map = self._committed_nodup_keys.setdefault(table_id, {})
+                    added: list[Any] = []
                     rows = []
-                    for k, v in self.queued_set[table_id].items():
+                    for k, v in staged_set.items():
                         if k in committed_map:
                             continue
                         row = v if isinstance(v, (tuple, list)) else ((v, *k) if isinstance(k, tuple) else (v, k))
                         rows.append(row)
                         committed_map[k] = row[0]
-                elif getattr(table, "idempotent_pk", False) or getattr(table, "init_primary", ()) == ("hash",) or table.table_name in ("m_tag_code", "m_ast_hash"):
+                        added.append(k)
+                    batch.added_nodup[table_id] = added
+                elif _is_hash_keyed(table) and self._tracks_committed_pks(table_id):
                     committed_pks = self._committed_pks.setdefault(table_id, set())
+                    added = []
                     rows = []
-                    for pk, row in self.queued_set[table_id].items():
+                    for pk, row in staged_set.items():
                         if pk in committed_pks:
                             continue
                         rows.append(row)
                         committed_pks.add(pk)
+                        added.append(pk)
+                    batch.added_pks[table_id] = added
                 else:
-                    rows = list(self.queued_set[table_id].values())
+                    rows = list(staged_set.values())
 
                 if rows:
                     if table.primary and len(rows) > 1:
@@ -916,34 +977,208 @@ class TEDirectDB:
                     u_indexes = self._table_unique_keys.get(table_id)
                     if u_indexes:
                         committed_u = self._committed_unique_keys.setdefault(table_id, {})
+                        added_u = batch.added_unique.setdefault(table_id, {})
                         for col_positions in u_indexes:
                             u_set = committed_u.setdefault(col_positions, set())
+                            new_keys = added_u.setdefault(col_positions, [])
                             for r in rows:
                                 if all(c < len(r) and r[c] is not None for c in col_positions):
-                                    u_set.add(tuple(self._sanitize_key(r[c]) for c in col_positions))
+                                    u_key = tuple(self._sanitize_key(r[c]) for c in col_positions)
+                                    if u_key not in u_set:
+                                        u_set.add(u_key)
+                                        new_keys.append(u_key)
 
                     insert_payload = tuple(rows)
+                self.queued_set[table_id] = {}
+                self._reset_staged_indexes(table_id)
 
-            if self.queued_update[table_id]:
-                update_payload = tuple(self.queued_update[table_id])
+            update_payload: tuple[tuple[SafeDataType, ...], ...] = ()
+            if staged_upd:
+                update_payload = tuple(staged_upd)
+                self.queued_update[table_id] = []
 
+            batch.staged[table_id] = (staged_set or {}, staged_upd or [])
             if insert_payload or update_payload:
-                tables_data.append((table, insert_payload, update_payload))
+                batch.tables_data.append((table, insert_payload, update_payload))
+                batch.rows += len(insert_payload) + len(update_payload)
+        if not batch.staged:
+            return None
+        batch.table_ids = frozenset(table.table_id for table, _ins, _upd in batch.tables_data)
+        return batch
 
-        if tables_data:
-            if hasattr(self.db, "commit_tables_parallel"):
-                self.db.commit_tables_parallel(tables_data, max_workers=max_workers)
+    def _tracks_committed_pks(self, table_id: int) -> bool:
+        """Whether committed primary keys of a hash-keyed table are kept in `_committed_pks` for deduplication."""
+        return True
+
+    def _write_tables(
+        self, batch: CommitBatch, db: Any, max_workers: int | None, dedicated: bool = False, parallel: bool = True
+    ) -> None:
+        """Write a batch with `db`; per-table stats land in `batch.stats`.
+
+        `parallel` uses `db.commit_tables_parallel()` when available; otherwise each table is written with
+        `db.insert()` / `db.update()`, as one transaction when the driver offers `transaction()`. A failure carries
+        `failed_table_ids` (the tables not committed) when that can be told.
+        """
+        if not batch.tables_data:
+            return
+        if parallel and hasattr(db, "commit_tables_parallel"):
+            if dedicated:
+                stats = db.commit_tables_parallel(batch.tables_data, max_workers=max_workers, dedicated=True)
             else:
-                for table, ins_p, upd_p in tables_data:
+                stats = db.commit_tables_parallel(batch.tables_data, max_workers=max_workers)
+            batch.stats = [tuple(st) for st in (stats or ())]
+            return
+        transaction = getattr(db, "transaction", None)
+        for pos, (table, ins_p, upd_p) in enumerate(batch.tables_data):
+            t_start = time.perf_counter()
+            try:
+                with transaction() if callable(transaction) else contextlib.nullcontext():
                     if ins_p:
-                        self.db.insert(table, ins_p)
+                        db.insert(table, ins_p)
                     if upd_p:
-                        self.db.update(table, upd_p)
+                        db.update(table, upd_p)
+            except Exception as e:
+                if getattr(e, "failed_table_ids", None) is None:
+                    e.failed_table_ids = {t.table_id for t, _ins, _upd in batch.tables_data[pos:]}
+                raise
+            batch.stats.append((table.table_name, len(ins_p), len(upd_p), time.perf_counter() - t_start))
 
-            for table_id in self.tables:
-                self.queued_set[table_id].clear()
-                self.queued_update[table_id].clear()
-                if table_id in self._queued_sec_indexes:
-                    self._queued_sec_indexes[table_id] = {idx_cols: {} for idx_cols in self._table_sec_indexes.get(table_id, ())}
-                if table_id in self._queued_single_col_indexes:
-                    self._queued_single_col_indexes[table_id] = {col_idx: {} for col_idx in self._table_single_col_indexes.get(table_id, ())}
+    def _write_batch(self, batch: CommitBatch, max_workers: int | None, parallel: bool = True) -> None:
+        """Write a batch on this thread; tables the database did not commit go back to staging and the error is raised."""
+        t_start = time.perf_counter()
+        try:
+            self._write_tables(batch, self.db, max_workers, parallel=parallel)
+        except BaseException as e:
+            batch.write_s = time.perf_counter() - t_start
+            self._account_commit(batch, blocked_s=batch.write_s)
+            self._restore_batch(batch, getattr(e, "failed_table_ids", None))
+            raise
+        batch.write_s = time.perf_counter() - t_start
+        self._account_commit(batch, blocked_s=batch.write_s)
+
+    def _background_commit_allowed(self, update_in_mem_indexes: bool) -> bool:
+        """Background writes need them switched on, a driver that writes on its own connections, and a live engine."""
+        return bool(
+            self.async_commits
+            and update_in_mem_indexes
+            and self.db is not None
+            and getattr(self.db, "supports_background_commit", False)
+        )
+
+    def _submit(self, batch: CommitBatch, max_workers: int | None) -> None:
+        """Write a batch on a background thread (`wait_for_commit()` joins it)."""
+        db = self.db
+
+        def _run() -> None:
+            t_start = time.perf_counter()
+            try:
+                self._write_tables(batch, db, max_workers, dedicated=True)
+            except BaseException as e:
+                batch.error = e
+            finally:
+                batch.write_s = time.perf_counter() - t_start
+
+        batch.background = True
+        batch.thread = threading.Thread(target=_run, name="TableEngine writer", daemon=True)
+        self._pending = batch
+        batch.thread.start()
+
+    @property
+    def pending_commit_rows(self) -> int:
+        """Rows of the background commit still being written (0 if none)."""
+        return self._pending.rows if self._pending is not None else 0
+
+    @property
+    def staged_rows(self) -> int:
+        """Rows staged for the next commit (inserts and updates, all tables)."""
+        return sum(len(q) for q in self.queued_set.values()) + sum(len(u) for u in self.queued_update.values())
+
+    def wait_for_commit(self) -> None:
+        """Join the pending background commit.
+
+        If it failed, the tables it did not commit go back to staging and its error is raised (a retried
+        `commit_all()` writes them again).
+        """
+        batch = getattr(self, "_pending", None)
+        if batch is None:
+            return
+        self._pending = None
+        t_start = time.perf_counter()
+        if batch.thread is not None:
+            batch.thread.join()
+        batch.wait_s = time.perf_counter() - t_start
+        self._account_commit(batch, blocked_s=batch.wait_s)
+        if batch.error is not None:
+            self._restore_batch(batch, getattr(batch.error, "failed_table_ids", None))
+            raise batch.error
+        self._on_background_commit_done(batch)
+
+    def _on_background_commit_done(self, batch: CommitBatch) -> None:
+        """Hook run after a background commit was joined successfully."""
+
+    def _account_commit(self, batch: CommitBatch, blocked_s: float) -> None:
+        """Add a finished write to `commit_stats`."""
+        stats = self.commit_stats
+        stats["commits"] += 1
+        stats["rows"] += batch.rows
+        stats["write_s"] += batch.write_s
+        stats["blocked_s"] += blocked_s
+        if batch.background:
+            stats["background"] += 1
+
+    def _restore_batch(self, batch: CommitBatch, failed_ids: Iterable[int] | None = None) -> None:
+        """Put the rows of the tables the database did not commit back into staging (all tables if unknown).
+
+        Their keys leave the committed-key sets again, so the next commit writes them instead of skipping them.
+        """
+        staged_ids = frozenset(batch.staged)
+        failed = staged_ids if failed_ids is None else frozenset(failed_ids) & staged_ids
+        batch.restored = failed
+        for table_id in failed:
+            staged_set, staged_upd = batch.staged[table_id]
+            committed_map = self._committed_nodup_keys.get(table_id)
+            if committed_map is not None:
+                for k in batch.added_nodup.get(table_id, ()):
+                    committed_map.pop(k, None)
+            if batch.added_pks.get(table_id):
+                self._committed_pks.setdefault(table_id, set()).difference_update(batch.added_pks[table_id])
+            for col_positions, keys in batch.added_unique.get(table_id, {}).items():
+                self._committed_unique_keys.get(table_id, {}).get(col_positions, set()).difference_update(keys)
+            if staged_set:
+                current = self.queued_set.setdefault(table_id, {})
+                for k, v in staged_set.items():
+                    if k in current:
+                        continue
+                    current[k] = v
+                    self._index_staged_row(
+                        table_id, v if isinstance(v, (tuple, list)) else ((v, *k) if isinstance(k, tuple) else (v, k))
+                    )
+            if staged_upd:
+                self.queued_update[table_id] = list(staged_upd) + self.queued_update.get(table_id, [])
+
+    def _await_writes(self, table_ids: Iterable[int] | None = None) -> None:
+        """Read-your-writes barrier: join the pending background commit if it writes any of `table_ids` (None: any)."""
+        batch = self._pending
+        if batch is not None and (table_ids is None or not batch.table_ids.isdisjoint(table_ids)):
+            self.wait_for_commit()
+
+    def _join_table_ids(self, joins: JoinsType) -> frozenset[int]:
+        """Ids of every table a join graph reads."""
+        ids = self._join_tables_cache.get(joins)
+        if ids is None:
+            if isinstance(joins, int):
+                ids = frozenset((joins,))
+            else:
+                ids = frozenset(pointer[0] for _repeat, pointer in PointerGetter(joins))
+            self._join_tables_cache[joins] = ids
+        return ids
+
+    def _db_read(self, table_ids: Iterable[int] | None, fn: Callable[..., Any], *args: Any) -> Any:
+        """Run a database read after the write barrier for `table_ids`, counting it in `db_reads`/`db_read_s`."""
+        self._await_writes(table_ids)
+        t_start = time.perf_counter()
+        try:
+            return fn(*args)
+        finally:
+            self.db_reads += 1
+            self.db_read_s += time.perf_counter() - t_start

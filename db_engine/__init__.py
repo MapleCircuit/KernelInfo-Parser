@@ -2,6 +2,7 @@
 
 Exports:
     - BaseDBEngine: Abstract base class interface for database backends.
+    - TableCommitStat: Per-table result of `commit_tables_parallel()`.
     - MariaDB: Production MySQL / MariaDB direct driver.
     - MockDB: Fast in-memory database driver for isolated unit testing.
     - get_db_engine: Factory function to retrieve engine class by name.
@@ -9,7 +10,7 @@ Exports:
 from __future__ import annotations
 
 from typing import Any
-from db_engine.base import BaseDBEngine
+from db_engine.base import BaseDBEngine, TableCommitStat
 from db_engine.DBHandling import MariaDB
 from db_engine.mock_db import MockDB
 
@@ -45,6 +46,7 @@ def get_db_engine(name: str | None = None) -> type[BaseDBEngine]:
 
 __all__ = [
     "BaseDBEngine",
+    "TableCommitStat",
     "MariaDB",
     "MockDB",
     "get_db_engine",

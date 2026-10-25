@@ -50,6 +50,11 @@ Stateful caching, sequence coordination, relational view decomposition, and batc
 | `_queued_single_col_indexes` | `dict[int, dict[int, dict[SafeDataType, list[tuple]]]]` | Staging single-column index lookup: `table_id -> {col_idx: {val: [row, ...]}}`. |
 | `_committed_unique_keys` | `dict[int, dict[tuple, set[tuple]]]` | Historical committed unique key set per table and key definition: `table_id -> {col_positions: {u_key, ...}}`. |
 | `db` | `Any \| None` | Active database driver handle (or `None`). |
+| `async_commits` | `bool` | When `True` (set by the pipeline for the duration of a parsing stage), `commit_all()` hands its rows to a background writer thread (see §4.4). |
+| `_pending` | `CommitBatch \| None` | The background commit still being written (`pending_commit_rows` reports its row count). |
+| `staged_rows` (property) | `int` | Rows staged for the next commit (inserts and updates of all tables); the pipeline starts a background commit from 100k while it waits for its workers. |
+| `commit_stats` | `dict[str, float]` | Cumulative `commits`, `background`, `rows`, `write_s` (seconds the writes took) and `blocked_s` (seconds the caller waited: a whole synchronous write, or the join of a background one). Stages report their difference. |
+| `db_reads`, `db_read_s` | `int`, `float` | Database reads issued by the engine (`get` / `view_get` / `view_get_multiple` fallbacks) and their seconds. |
 
 ### 2.2. Extended In-Memory Caching State (`TECachedDB`)
 
@@ -109,7 +114,9 @@ Internal helper methods used exclusively by `TECachedDB` to synchronize in-memor
 - **`SharedBufferAllocator.allocate(size: int, mode: str = "auto") -> tuple[mmap.mmap, str, int]`**: Allocates shared memory with tiered fallback: `1GB HugeTLB` (`MAP_HUGE_1GB`) $\to$ `2MB HugeTLB` (`MAP_HUGE_2MB`) $\to$ `2MB Transparent Huge Pages` (`madvise(MADV_HUGEPAGE)`) $\to$ standard `4KB anonymous mmap`.
 - **`SharedTableBuilder`**: Packs preloaded relational tables and builds $O(1)$ open-addressing hash indices directly inside raw memory bytes during the parent process preloading phase using 64-bit SplitMix64 / FxHash composite key tuple mixing.
 - **`SharedTableReader`**: Zero-deserialization reader providing lock-free $O(1)$ Primary Key probes (`get_row_by_pk`) and scan matching (`scan_matching`) against raw `mmap` memoryviews without allocating intermediate Python objects.
-- **`SharedSymbolReader`**: Zero-copy shared memory reader querying pre-resolved header symbols in $O(1)$ lock-free time; supports transparent mapping interface (`__contains__`, `__getitem__`, `get`) with `(sym_name, sym_type)` or `sym_name`.
+- **`SharedSymbolReader`**: Zero-copy shared memory reader querying pre-resolved symbols in $O(1)$ lock-free time; supports transparent mapping interface (`__contains__`, `__getitem__`, `get`) with `(sym_name, sym_type)` or `sym_name`. Tables built with `build_file_scoped()` are queried per defining file with `get_file_symbol(rel_file, sym_name, sym_type)` and `get_file_name(rel_file, sym_name)` (key `rel_file + "\x00" + sym_name`), so same-named symbols of different files never bind to each other. `nbytes` reports the mapping size; `close()` unmaps it.
+- **`SharedSymbolBuilder(mode)`**: Packs symbol maps into open-addressing tables (empty slots initialized with one bulk copy). `build(symbols_map, names_map)` builds a global `(name, type)` table; `build_file_scoped(file_symbols)` builds a table keyed by defining file from `rel_file -> {(name, type): ast_id}`. Symbol tables skip 1GB HugeTLB pages (`SharedBufferAllocator.allocate(..., allow_1g=False)`; a symbol table is far smaller than a 1GB page) and otherwise follow the mode's quiet fallbacks; `4k` maps to `off`.
+- **`SharedSymbolChain`**: Ordered list of file-scoped segments queried newest-first (`get_file_symbol`, `get_file_name`, `sym_count`, `nbytes`, `close()`); a newer segment shadows an older one for the same file. Stage 2 appends one segment per epoch instead of re-packing every symbol.
 
 ---
 
@@ -125,22 +132,24 @@ Internal helper methods used exclusively by `TECachedDB` to synchronize in-memor
   2. Resets `queued_view = {}`.
   3. For all registered `self.tables`: resets `queued_set[t_id] = {}`, `queued_update[t_id] = []`, and refreshes `next_id[t_id] = self.db.get_next_id(t)`.
   4. In `TECachedDB`:
-     - **Worker Bypass (`is_worker=True`)**: Forked worker processes retain the inherited read-only shared huge-page buffer (`_shared_buffer`), initializing empty local mutation overlays and bypassing redundant database preloading (`select_preload()`).
+     - **Worker Bypass (`is_worker=True`)**: Forked worker processes retain the inherited read-only shared huge-page buffers (`_shared_buffer` and the carried tables' buffer), initializing empty local mutation overlays and bypassing redundant database preloading (`select_preload()`).
      - **Parent Initialization**: Calls `clear_cache()`, ensures index structures exist, and preloads database records for tables where `table.te_cached` is truthy via `db.select_preload(table, cached_columns=cached_cols, min_vid=min_vid)`:
        - **Selective Column Pushdown**: For column-level cached tables (e.g. `m_tag_code`), queries only configured columns (`SELECT hash FROM m_tag_code`) and reconstructs canonical rows with `None` in un-cached positions.
-       - **Version Window Predicate Pushdown**: For `version_scoped=True` tables, pushes the working-window filter (`vid >= Old_VID`) directly into the SQL query (`WHERE vid >= %s` or `WHERE (vid_e = 0 OR vid_e >= %s)`).
+       - **Version Window Predicate Pushdown**: For `version_scoped=True` tables, pushes the working-window filter (`Old_VID` is a commit id) into the SQL query on the table's version column (`WHERE vid >= %s`, `WHERE (vid_e = 0 OR vid_e >= %s)`, or `WHERE commit_id >= %s` for `m_bridge_checkpoint`, i.e. the previous version's checkpoint). Blob ids are never compared with it.
+       - **Final misses inside the window**: a successful preload records `_preload_window[table_id] = (version column, first version)` for such tables. A primary-key `get()` miss whose version is at or after it returns `None` without a database read (`_miss_is_final()`): every row of the window is cached or staged. Rows committed and evicted from the heap since (`_committed_pks`) are still read. The window is dropped by `clear_cache()`, by `commit(update_in_mem_indexes=False)` for its table, and when a row is staged while `update_in_mem_indexes` is off. Before this, looking up the current version's checkpoint row of each unchanged file cost one query each (about 18k per version).
        - For standard cached tables: Preloads all records.
        - Indexes all rows into `_pk_index`, `_nodup_index`, and selectively into `_col_indices`.
        - **Shared Huge-Page Packing**: If `hugepages != "off"`, serializes preloaded tables into structured shared memory via `SharedTableBuilder.build()`, backing lookups with 1GB/2MB/THP pages.
+       - **Carried Hash Tables (`CARRIED_TABLES`: `m_ast_hash`, `m_tag_code`)**: These deduplication tables are only written through the parent's TableEngine and are needed in full, so they are not reloaded every version. The first load from a non-empty database (a reset database holds their seed rows) packs them into their own long-lived shared buffer (`_carried_reader`, without per-row heap indexing; on a completely empty database they stay in the heap for that version); every commit adds the rows it wrote to a per-table overlay (`_carried_overlays`, also the views' local layer); `close()` and the next `start_new_db()` drop rows that were staged but never committed. A later start reuses snapshot + overlay without a database query (`[TECachedDB] Reused carried tables` log line) until an overlay exceeds `CARRY_RELOAD_RATIO` (0.5) of its snapshot; then snapshot and overlay are repacked into a new buffer from memory (`_carried_rows_in_memory()`, `Rebuilt from memory` log line), since together they hold exactly what the database has. The database is only read again after the carried state was discarded: a commit that failed on a carried table discards it, since the database may hold part of its rows. Carried tables find committed keys through their overlay, so they skip the `_committed_pks` copy (`_tracks_committed_pks()`). `clear_cache()` keeps them attached.
 - **`start(tables: Sequence[Table] | Table, db: Callable[[], Any] | type[Any]) -> None`**
   1. Normalizes `tables` into a tuple/list.
   2. Registers all tables in `self.tables`.
   3. Calls `self.start_new_db(db)`.
 - **`clear_cache() -> None`** *(TECachedDB only)*
-  - Clears `_cached_rows`, `_pk_index`, `_nodup_index`, and `_col_indices`.
+  - Clears `_cached_rows`, `_pk_index`, `_nodup_index`, and `_col_indices` (carried tables are re-attached).
 - **`close() -> None`**
-  - Calls `self.db.close()` if available (ignoring exceptions) and sets `self.db = None`.
-  - In `TECachedDB`: Calls `clear_cache()` to release memory resources.
+  - Waits for a pending background commit (`wait_for_commit()`, raising its error), then calls `self.db.close()` if available (ignoring exceptions) and sets `self.db = None`. `start_new_db()` waits the same way.
+  - In `TECachedDB`: Drops uncommitted rows from the carried overlays, then calls `clear_cache()` to release memory resources; the carried tables survive for the next start.
 - **Context Manager**: `__enter__() -> Self`, `__exit__(...) -> close()`, `__del__() -> close()`.
 
 ---
@@ -164,7 +173,7 @@ Internal helper methods used exclusively by `TECachedDB` to synchronize in-memor
          - Secondary index fast-path: When primary key is not specified (e.g. `(None, name, type_id)` or `(None, name, None)`), checks `_queued_sec_indexes` (composite keys) and `_queued_single_col_indexes` (single columns) in $O(1)$, resolving symbol hits and immediate misses without linear scans.
          - Wildcard filter fallback: Iterates `queued_set[table_id].values()` only if table has no matching indexes.
     2. **Emptiness Guard**: If `getattr(table, "has_auto_increment", True) and table.initial_insert is None and self.next_id.get(table_id, 0) <= 1 and (table_id not in self.queued_set or not self.queued_set[table_id])`, returns `None` immediately without querying DB.
-    3. **Database Query**: Executes `self.db.select(table, columns)`.
+    3. **Database Query**: Executes `self.db.select(table, columns)` through `_db_read()`: it first joins a background commit that writes this table (read-your-writes barrier) and counts the read in `db_reads` / `db_read_s`. Every database fallback of `get()`, `view_get()` and `view_get_multiple()` (the join graph's tables) goes through it.
 - **`set(table_id: int, columns: tuple[SafeDataType, ...]) -> tuple[SafeDataType, ...]`**
   - **Case 1 (`table.no_duplicate == True`)**:
     - Key: `key = columns[1:]`.
@@ -204,6 +213,8 @@ Internal helper methods used exclusively by `TECachedDB` to synchronize in-memor
     3. Checks DB / cache: `hash_row = self.get(hash_table.table_id, (h, None))`. If found, returns view tuple with `ast_id = hash_row[1]`.
     4. If not found, returns `None` immediately.
   - **Fallback**: Returns `self.db.view_select(self.tables, joins, columns)`.
+- **`get_in(table_id: int, col_idx: int, values: Sequence[SafeDataType]) -> list[tuple[SafeDataType, ...]]`**
+  - Committed rows whose column `col_idx` is one of `values`, from `db.select_in()` through `_db_read()` (staged rows are not included).
 - **`view_get_multiple(joins: JoinsType, columns: tuple[SafeDataType, ...]) -> list[tuple[SafeDataType, ...]]`**
   - Returns `self.db.view_select_multiple(self.tables, joins, columns)`.
 - **`view_set(joins: JoinsType, columns: tuple[SafeDataType, ...]) -> tuple[SafeDataType, ...]`**
@@ -245,22 +256,28 @@ Internal helper methods used exclusively by `TECachedDB` to synchronize in-memor
 
 ### 4.4. Transaction Commit Protocol (`commit`, `commit_all`)
 
+Both build a **`CommitBatch`** with `_take_staged(table_ids)`:
+- **Inserts (`queued_set`)**: `no_duplicate=True` rows become `(assigned_id, *data_key)`; keys already in `_committed_nodup_keys` / `_committed_pks` (hash-keyed or `idempotent_pk` tables) are skipped; the rest are recorded there, together with `_committed_unique_keys`, and the keys this batch added are kept in the batch.
+- **Batch Pre-Sorting (Cryptographic Hash Tables)**: Payloads are sorted by primary key, so tables keyed by pseudo-random binary hashes (e.g. `m_tag_code`, `m_ast_hash`) are inserted in ascending B+Tree leaf order in InnoDB, reducing random page splits and improving locality by >5x.
+- **Updates (`queued_update`)** become the update payload.
+- The staging containers (`queued_set`, `queued_update`, staged secondary indexes) are swapped for empty ones, even when every row was filtered out, so rows staged from then on are a new generation.
+
+**Failure restore (`_restore_batch()`)**: if the database did not commit some tables (`failed_table_ids` on the driver's error, otherwise all of them), their rows go back to staging and the keys the batch added leave the committed-key sets again, so a retried commit writes them instead of skipping them. `TECachedDB` also re-caches rows the commit had evicted from the heap and discards the carried state when a carried table failed.
+
 - **`commit(table_id: int, update_in_mem_indexes: bool = True) -> None`**
-  1. **Inserts (`queued_set`)**: If `queued_set[table_id]` is non-empty:
-     - `no_duplicate=True`: formats payload as `tuple(v if isinstance(v, (tuple, list)) else ((v, *k) if isinstance(k, tuple) else (v, k)) for k, v in self.queued_set[table_id].items())`.
-     - `no_duplicate=False`: formats payload as `tuple(self.queued_set[table_id].values())`.
-     - **Batch Pre-Sorting (Cryptographic Hash Tables)**: For tables with explicit primary keys on pseudo-random binary hashes (e.g. `m_tag_code`, `m_ast_hash`), pre-sorting payloads by primary key prior to batch chunking ensures ascending B+Tree leaf insertion in InnoDB, reducing random page splits and improving locality by >5x.
-     - Calls `self.db.insert(table, payload)` and clears `self.queued_set[table_id]`.
-  2. **Updates (`queued_update`)**: If `queued_update[table_id]` is non-empty:
-     - Calls `self.db.update(table, tuple(self.queued_update[table_id]))` and clears `self.queued_update[table_id]`.
-  3. **In-Memory Cache Management**: If `update_in_mem_indexes=False` in `TECachedDB`, purges `table_id` cache and indices from RAM.
+  1. Waits for a pending background commit.
+  2. Takes the table's batch and writes it on the calling thread with `self.db.insert(table, payload)` / `self.db.update(table, payload)`, inside `self.db.transaction()` when the driver has one; restores and re-raises on failure.
+  3. **In-Memory Cache Management**: If `update_in_mem_indexes=False` in `TECachedDB`, purges `table_id` cache and indices from RAM. Otherwise write-heavy tables (`WRITE_HEAVY_TABLES`) drop their committed rows from the heap and keep only their keys in `_committed_pks`; for a table backed by a shared buffer, only the rows staged on top of the snapshot are moved (`SharedTablePKView.drain_local()`), and the view itself stays in place. Carried tables keep their rows (recorded in their overlay).
 
 - **`commit_all(max_workers: int | None = None, update_in_mem_indexes: bool = True) -> None`**
-  - Gathers payloads `(table, insert_payload, update_payload)` across all modified tables.
-  - If `hasattr(self.db, "commit_tables_parallel")`, dispatches to `self.db.commit_tables_parallel(tables_data, max_workers=max_workers)`.
-  - Fallback: Sequentially calls `self.db.insert()` and `self.db.update()` for all tables with pending payloads.
-  - Clears `queued_set` and `queued_update` buffers across all tables.
-  - **In-Memory Index Teardown**: If `update_in_mem_indexes=False` in `TECachedDB`, immediately invokes `self.clear_cache()` to evacuate all cached rows, position maps, and indices from memory, avoiding redundant post-commit index synchronization before engine closure.
+  1. Waits for the previous background commit (`wait_for_commit()`: on failure its rows are restored and its error raised, so `_commit_all_with_retry()` simply calls `commit_all()` again).
+  2. Takes one batch across all tables.
+  3. **Background write**: with `async_commits`, `update_in_mem_indexes=True` and a driver with `supports_background_commit`, starts a writer thread running `db.commit_tables_parallel(..., dedicated=True)` and returns. The cache upkeep below runs meanwhile as if the write had landed; any database read of the batch's tables joins it first (`_db_read()`), so lookups never miss rows that are being written.
+  4. Otherwise writes on the calling thread via `db.commit_tables_parallel(tables_data, max_workers=max_workers)` (fallback: `insert()` / `update()` per table).
+  5. **In-Memory Index Teardown**: If `update_in_mem_indexes=False` in `TECachedDB`, immediately invokes `self.clear_cache()` to evacuate all cached rows, position maps, and indices from memory, avoiding redundant post-commit index synchronization before engine closure. Otherwise evicts write-heavy tables as in `commit()`.
+  - `TECachedDB.commit_all()` ends with `trim_heap()` (glibc `malloc_trim` only: committed rows are freed by reference counting, so no full garbage collection pass) and logs `[TECachedDB] commit_all: N staged rows written in Xs, cache upkeep Ys; slowest tables: ...` when a synchronous commit takes 2 s or more; a background commit logs `[TECachedDB] background commit: N staged rows written in Xs (Ys overlapped, Zs waited); slowest tables: ...` when it is joined.
+
+- **`wait_for_commit() -> None`**: Joins the pending background commit (no-op without one); restores and raises on failure. Nothing may fork while a writer thread runs, so the pipeline calls it before forking workers and at the end of every stage.
 
 ---
 
@@ -273,7 +290,8 @@ Any backend passed to `TableEngine` must implement:
 - `view_select_multiple(tables: dict, joins: JoinsType, columns: tuple) -> list[tuple]`: Joined multi-row select.
 - `insert(table: Table, data: tuple[tuple, ...]) -> None`: Batch insert (e.g. 1000 rows/batch).
 - `update(table: Table, data: tuple[tuple, ...]) -> None`: Batch upsert (`ON DUPLICATE KEY UPDATE`).
-- `commit_tables_parallel(tables_data, max_workers=None) -> None`: Parallel table commit across worker threads.
+- `commit_tables_parallel(tables_data, max_workers=None, dedicated=False) -> list[TableCommitStat]`: Parallel table commit across worker threads, each table atomic; a failure carries `failed_table_ids`. `dedicated=True` (background writes, only requested when `supports_background_commit` is set) never uses the instance's own connection.
+- `transaction()` *(optional)*: Context manager making a table's `insert()` / `update()` one transaction (used by `commit()`).
 - `close() -> None`: Closes connections/cursors cleanly.
 
 ---
@@ -290,11 +308,12 @@ Any backend passed to `TableEngine` must implement:
 8. **Duplicate Primary Key Enforcement & Cryptographic Hash Fast-Path**: For standard relational tables, TableEngine `set()` enforces database-level primary key uniqueness: calling `set()` with an explicit primary key that is already staged in `queued_set` or present in cache raises `ValueError`. Callers must use `update()` to mutate existing records or `get_set()` / `no_duplicate=True` to safely avoid duplicate inserts. For cryptographic hash lookup tables (`m_tag_code`, `m_ast_hash`), matching hashes guarantee identical content and return the existing row via an $O(1)$ fast-path.
 9. **Teardown Commit Acceleration**: When committing final update cycles, teardowns, or write-only batches before engine closure, use `G.TE.commit_all(update_in_mem_indexes=False)` (or `G.TE.commit(table_id, update_in_mem_indexes=False)`) to bypass redundant in-memory cache/index synchronization and immediately release cache memory before `G.TE.close()`.
 10. **Huge-Page Shared Memory & Fork Inheritance**: Preloaded baseline tables stored in structured shared memory (`_shared_buffer`) remain immutable across parallel worker processes. Workers calling `start_new_db(..., is_worker=True)` inherit the shared memory segment across `fork()`, isolating local mutation overlays in process-local heap and eliminating multi-worker database preload stampedes. When `_shared_buffer` is active, workers initialize `_committed_pks[table_id] = set()` and `_committed_nodup_keys[table_id] = {}` directly in $O(1)$ time without unpacking row keys from shared memory views, eliminating multi-gigabyte heap allocations and Copy-on-Write page duplication at worker startup.
-11. **Cross-Chunk Deduplication Tracking**: TableEngine implementations (`TEDirectDB`, `TECachedDB`) maintain `_committed_nodup_keys` (mapping unique data keys to assigned IDs for `no_duplicate=True` tables) and `_committed_pks` (tracking primary keys for hash lookup tables like `m_tag_code` and `m_ast_hash`) across intermediate chunk commits. During `commit()` and `commit_all()`, staged rows matching previously committed keys/hashes are filtered out, and `set()` / `get()` provide $O(1)$ fast-path resolution, preventing duplicate `INSERT INTO` attempts in subsequent chunks.
+11. **Cross-Chunk Deduplication Tracking**: TableEngine implementations (`TEDirectDB`, `TECachedDB`) maintain `_committed_nodup_keys` (mapping unique data keys to assigned IDs for `no_duplicate=True` tables) and `_committed_pks` (tracking primary keys for hash lookup tables like `m_tag_code` and `m_ast_hash`; carried tables use their overlay instead) across intermediate chunk commits. During `commit()` and `commit_all()`, staged rows matching previously committed keys/hashes are filtered out, and `set()` / `get()` provide $O(1)$ fast-path resolution, preventing duplicate `INSERT INTO` attempts in subsequent chunks. Keys are recorded when the batch is taken and removed again for tables the database did not commit (`_restore_batch()`), so a retried commit cannot skip them.
+16. **Background Commits & Read-Your-Writes**: While `async_commits` is on, at most one `CommitBatch` is written in the background (the next commit joins it first). Rows of a batch leave staging when it is taken, so every database read the engine issues waits for a batch that writes one of the tables it reads (`_db_read()`), and code reading the database directly must call `wait_for_commit()` first. Forked children never own a writer (`start_new_db(..., is_worker=True)` drops `_pending`), and the parent joins before forking.
 12. **Parent Process Fork Socket Refresh**: The parent process must never invoke `start_new_db(..., is_worker=True)` after forking workers. Calling `is_worker=True` without shared huge pages resets and wipes in-memory table caches, causing subsequent operations (e.g. `processing_unchanges()`) to treat existing records as missing. The parent process must only refresh its DB connection handle (`if G.TE.db: G.TE.db.close(); G.TE.db = G.DB()`) without modifying cached table state or staging queues.
 13. **Zero-Copy Shared Memory Views & Heap Cache Eviction**: When `_shared_buffer` is constructed via `SharedTableBuilder`, preloaded table row heap collections (`_cached_rows`) and primary key indices (`_pk_index`) are immediately replaced with `SharedTableRowSequenceView` and `SharedTablePKView`. These zero-copy proxy views query the shared mmap buffer directly with dynamic mutation support and $O(1)$ length/truthiness checks (`__len__`, `__bool__`). Upon activation, redundant secondary column indices (`_col_indices`), committed hash caches (`_committed_pks`), and nodup key mappings (`_committed_nodup_keys`) for shared-backed tables are purged, evicting duplicate preloaded heap memory and releasing pages back to the OS via glibc `malloc_trim(0)`.
-14. **Write-Heavy Chunk Commit Heap Trimming**: During intermediate and final chunk commits (`commit()`, `commit_all()`), write-heavy relational tables (`m_ast_hash`, `m_tag_code`, `m_symbol_def`, `m_ast_container`, `m_bridge_tag`, `m_bridge_checkpoint`, `m_blob_transition`) are purged from heap caches (`_cached_rows`, `_pk_index`) while their compact 32-byte Primary Keys are recorded into `_committed_pks`. This bounds Python process heap growth during massive multi-thousand file ingestion runs while preserving full upstream deduplication guarantees.
-15. **Zero-Copy Shared Symbol Resolution & Stage 2 Multi-Epoch IPC Offloading**: During Phase 2 AST resolution waves and Stage 2 source streaming across parallel worker processes, large symbol and container maps are packed into read-only shared memory via `SharedSymbolBuilder` and accessed via `SharedSymbolReader` (`gp._shared_symbols`, `_phase2_shared_symbols`). Workers and AST execution engines (`TableHandling.resolve_ref()`) query these symbol tables directly via zero-copy fast-paths in $O(1)$ time without IPC serialization or heap duplication. In Stage 2 source streaming, the shared memory segment is periodically regenerated between epochs via `SharedSymbolReader.items()` to incorporate newly resolved source symbols, cleanly clearing process-local heap symbol dictionaries (`file_symbols`, `_ast_staged_symbols`) to prevent Copy-on-Write page duplication across forks. Intermediate chunk commits and deferred queue draining prevent uncommitted memory accumulation and eliminate worker starvation.
+14. **Write-Heavy Chunk Commit Heap Trimming**: During intermediate and final chunk commits (`commit()`, `commit_all()`), write-heavy relational tables (`m_ast_hash`, `m_tag_code`, `m_ast_container`, `m_bridge_tag`, `m_bridge_checkpoint`, `m_blob_transition`) are purged from heap caches (`_cached_rows`, `_pk_index`) while their compact 32-byte Primary Keys are recorded into `_committed_pks`. This bounds Python process heap growth during massive multi-thousand file ingestion runs while preserving full upstream deduplication guarantees.
+15. **Zero-Copy File-Scoped Shared Symbols & Stage 2 Multi-Epoch Offloading**: During Stage 2 source streaming, symbols published by executed files are packed into read-only file-scoped shared memory segments (`SharedSymbolBuilder.build_file_scoped()`) held in a `SharedSymbolChain` (`gp._shared_symbols`). Forked workers and the parent's `TableHandling.resolve_ref()` query them per target file in $O(1)$ time without IPC serialization or heap duplication. Before Stage 2 and at each epoch boundary only the symbols published since the previous segment are packed into a new segment (no re-packing of earlier symbols), and the process-local heap dictionaries (`file_symbols`, `_ast_staged_symbols`) are cleared to prevent Copy-on-Write page duplication across forks. `DependencyScheduler.finalize()`, `gp.init_cs_dict()` and `gp.reset_cs()` unmap the chain (`gp.close_shared_symbols()`), so no segment outlives its version. Intermediate chunk commits and deferred queue draining prevent uncommitted memory accumulation.
 
 ---
 

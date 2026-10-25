@@ -151,7 +151,7 @@ Either side of a comparison may be a release tag, a branch, or an arbitrary comm
 | **Versions / Git Refs** | `m_git_ref`, `m_commit` | Version and reference identifiers (`ref_id`, `commit_id`, `ref_name`), chronological author dates, commit SHAs |
 | **Filesystem & Blobs** | `m_file_blob`, `m_file_name`, `m_bridge_checkpoint`, `m_file_reference` | File instances, content blobs, paths, file types (0=Dir, 1=C, 2=Kconfig, 3=Rust, 4=Asm, 5=Maintainers, 6=Credits, 7=Raw), and compiler-verified `#include` / Kbuild provenance |
 | **AST & Spatial Maps** | `m_ast`, `m_ast_container`, `m_ast_include`, `m_bridge_tag`, `m_bridge_map`, `m_map_ast`, `m_tag`, `m_tag_code` | Relational AST nodes, preprocessor `#include` links, container hierarchies, and coordinate regions (`line_s`, `char_s`, `line_e`, `char_e`) |
-| **Symbols & XRefs** | `m_symbol_def`, `m_symbol_ref` | Definitions and usage cross-references (calls, field access, type usages, macro expansions) |
+| **Symbols & XRefs** | `m_symbol_def`, `m_symbol_ref` (views over `m_tag_def`, `m_tag_ref`, `m_blob_symbol`, `m_symbol_own`, `m_blob_symbol_def`, `m_blob_symbol_ref`; see `core/API.md`) | Definitions and usage cross-references (calls, field access, type usages, macro expansions). `def_id` of a definition stored once per tag is computed (not indexable) and `ref_id` may be NULL, so services select every needed column in the query that finds the rows instead of re-fetching by id. Rows of given target AST ids come from `rows_of_targets_sql()` (`core/SymbolRows.py`) instead of `WHERE ast_id IN (...)` on the views, which takes seconds per target |
 | **Kconfig** | `m_kconfig_symbol`, `m_kconfig_tree`, `m_kconfig_relation`, `m_kconfig_kbuild` | Hierarchical menus, architecture-scoped symbol dependencies, and compiled source mappings |
 | **Maintainers** | `m_maintainer_section`, `m_maintainer_member`, `m_maintainer_person`, `m_maintainer_pattern`, `m_maintainer_file`, `m_credits_entry` | Subsystem sections, pattern rules, maintainers, reviewers, and historical `CREDITS` biographies |
 | **Git & Commits** | `m_commit`, `m_commit_file`, `m_bridge_commit_person`, `m_commit_parent`, `m_git_network`, `m_repository` | Commit metadata, DAG topology, modified files, multi-contributor trailers (Signed-off-by, Acked-by, Reviewed-by) |
@@ -1314,6 +1314,7 @@ Pahole-style memory alignment, member offset calculation, and 64-byte cacheline 
 #### `GET /api/tools/{version_name}/callgraph/{function_name}`
 #### `GET /api/version/{version_name}/callgraph/{function_name}`
 Retrieve bidirectional caller and callee execution flow. Consolidates multiple call sites of the same function with call frequencies and coordinate tracking.
+- **Callers** are the calls to the function's AST found in this version's blobs, named after the AST of the tag containing the call. **Callees** are the calls inside the function's lines, each with the files defining the callee in this version (`file_path` is null when none does).
 - **Parameters**:
   - `version_name` (path): Kernel version string.
   - `function_name` (path): C function identifier.

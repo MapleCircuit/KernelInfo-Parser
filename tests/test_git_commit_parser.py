@@ -361,12 +361,20 @@ class TestWebAppGitEndpoints(unittest.TestCase):
     def test_m_bridge_commit_person_table_engine_deduplication(self) -> None:
         """Verify TableEngine deduplicates duplicate contributor roles in memory and avoids duplicate commits."""
         from core.DBLayout import m_bridge_commit_person
+        from db_engine import MockDB
         from table_engine.te_cached_db import TECachedDB
         from table_engine.te_direct_db import TEDirectDB
 
-        self.assertTrue(m_bridge_commit_person.te_cached)
+        # Write-only for the pipeline: rows already in the database are skipped by the idempotent insert, so the
+        # table (one row per contributor of every commit) is not preloaded into the cache every version
+        self.assertFalse(m_bridge_commit_person.te_cached)
         self.assertTrue(m_bridge_commit_person.idempotent_pk)
         self.assertEqual(m_bridge_commit_person.primary, (0, 1, 2))
+
+        db = MockDB(use_global=False)
+        db.insert(m_bridge_commit_person, ((10, 20, 1, 0), (11, 21, 2, 0)))
+        db.insert(m_bridge_commit_person, ((10, 20, 1, 0), (12, 22, 3, 0)))
+        self.assertEqual(len(db.tables_data[m_bridge_commit_person.table_name]), 3)
 
         # 1. Test TECachedDB in-batch and preloaded deduplication
         te_cached = TECachedDB()
@@ -383,12 +391,11 @@ class TestWebAppGitEndpoints(unittest.TestCase):
         self.assertEqual(r2, (10, 20, 1, 0))
         self.assertEqual(len(te_cached.queued_set[m_bridge_commit_person.table_id]), 1)
 
-        # Simulate row already existing in DB (indexed in _pk_index)
-        te_cached._index_row(m_bridge_commit_person, (11, 21, 2, 0))
-        self.assertIn((11, 21, 2), te_cached._pk_index[m_bridge_commit_person.table_id])
+        # Simulate a row committed earlier by this TableEngine (recorded in _committed_pks)
+        te_cached._committed_pks.setdefault(m_bridge_commit_person.table_id, set()).add((11, 21, 2))
         r3 = te_cached.set(m_bridge_commit_person.table_id, (11, 21, 2, 0))
         self.assertEqual(r3, (11, 21, 2, 0))
-        # Pre-existing row must NOT be queued for insert
+        # Already committed row must NOT be queued for insert again
         self.assertNotIn((11, 21, 2), te_cached.queued_set[m_bridge_commit_person.table_id])
         self.assertEqual(len(te_cached.queued_set[m_bridge_commit_person.table_id]), 1)
 

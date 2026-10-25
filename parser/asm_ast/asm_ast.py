@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 import clang.cindex as cc
 
+from core.SymbolRows import finish as finish_symbol_rows
 from core.globalstuff import (
     G,
     COLOR,
@@ -87,6 +88,8 @@ def asm_ast_parse(CS: ChangeSetType) -> None:
         elif CS.file_operation == "D":
             get_prior_tags(CS)
             close_prior_tags(CS)
+    # Emit the symbol definitions/references recorded while parsing (core/SymbolRows.py)
+    finish_symbol_rows(CS)
 
 
 class Asm_Manager:

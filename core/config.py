@@ -29,6 +29,15 @@ DEFAULT_CONFIG: dict[str, dict[str, Any]] = {
         "timeout": 10,
         "engine": "mariadb",
         "ssl_disabled": False,
+        # Raised once per pipeline run with SET GLOBAL (needs SUPER; lasts until the server restarts; sizes are
+        # never lowered). The buffer pool is capped at a quarter of RAM when the server runs on this machine.
+        # An empty object disables it.
+        "server_tuning": {
+            "innodb_buffer_pool_size": "8G",
+            "innodb_log_file_size": "2G",
+            "innodb_flush_log_at_trx_commit": 2,
+            "innodb_io_capacity": 1000,
+        },
     },
     "webapp": {
         "host": "0.0.0.0",
@@ -41,6 +50,8 @@ DEFAULT_CONFIG: dict[str, dict[str, Any]] = {
         "fidelity": True,
         "mem_max": 60,
         "hugepages": "auto",
+        # "tag": symbol definitions/references stored once per tag (core/SymbolRows.py); "blob": per blob
+        "symbol_layout": "tag",
         "single_version": False,
         "include_pre_releases": True,
     },

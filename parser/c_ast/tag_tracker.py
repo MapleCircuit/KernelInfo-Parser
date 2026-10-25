@@ -15,6 +15,7 @@ from typing import Any
 import logging
 from core.globalstuff import G, ASTT, compute_code_hash, REF_POS, REF_OLD
 from core.DBLayout import m_file_name, m_bridge_file, m_bridge_tag, m_tag, m_ast
+from core.SymbolRows import load_prior_items as load_prior_symbol_items
 
 logger = logging.getLogger(__name__)
 
@@ -81,6 +82,8 @@ def get_prior_tags(CS: Any) -> None:
 
     if not CS.prior_tags:
         return
+    # Their stored symbol items, compared with those of the tags recycled below (core/SymbolRows.py)
+    load_prior_symbol_items(CS, (tag[1] for tag in CS.prior_tags))
 
     # In-memory ast cache for fallback if caller provides shorter tuples
     ast_cache: dict[int, tuple[str, int | None]] = {}

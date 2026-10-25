@@ -5,10 +5,11 @@ BaseDBEngine specification for isolated unit testing and ChangeSet execution.
 """
 from __future__ import annotations
 
+import time
 from collections import defaultdict
 from typing import TYPE_CHECKING, Any, Sequence, Self
 from types import TracebackType
-from db_engine.base import BaseDBEngine
+from db_engine.base import BaseDBEngine, TableCommitStat
 from core.globalstuff import SafeDataType, JoinsType, PointerType, PointerGetter
 
 if TYPE_CHECKING:
@@ -203,13 +204,26 @@ class MockDB(BaseDBEngine):
         self,
         tables_data: Sequence[tuple[Table, Sequence[tuple[SafeDataType, ...]], Sequence[tuple[SafeDataType, ...]]]],
         max_workers: int | None = None,
-    ) -> None:
-        """Commit inserts and updates for multiple tables in mock database."""
-        for table, insert_data, update_data in tables_data:
-            if insert_data:
-                self.insert(table, insert_data)
-            if update_data:
-                self.update(table, update_data)
+        dedicated: bool = False,
+    ) -> list[TableCommitStat]:
+        """Commit inserts and updates for multiple tables in mock database, one table after the other.
+
+        A failing table and the tables after it are not committed (`failed_table_ids` on the raised error).
+        """
+        items = [item for item in tables_data if item[1] or item[2]]
+        stats: list[TableCommitStat] = []
+        for pos, (table, insert_data, update_data) in enumerate(items):
+            t_start = time.perf_counter()
+            try:
+                if insert_data:
+                    self.insert(table, insert_data)
+                if update_data:
+                    self.update(table, update_data)
+            except Exception as e:
+                e.failed_table_ids = {t.table_id for t, _, _ in items[pos:]}
+                raise
+            stats.append(TableCommitStat(table.table_name, len(insert_data), len(update_data), time.perf_counter() - t_start))
+        return stats
 
     def view_select(
         self,
@@ -324,6 +338,11 @@ class MockDB(BaseDBEngine):
 
         return [tuple(comp) for comp in current_composite_rows]
 
+    def select_in(self, table: Table, col_idx: int, values: Sequence[SafeDataType]) -> list[tuple[SafeDataType, ...]]:
+        """Every row whose column `col_idx` is one of `values`."""
+        wanted = set(values)
+        return [row for row in self.tables_data.get(table.table_name, {}).values() if col_idx < len(row) and row[col_idx] in wanted]
+
     def select_preload(
         self,
         table: Table,
@@ -339,13 +358,11 @@ class MockDB(BaseDBEngine):
         has_vids = "vid_s" in col_names and "vid_e" in col_names
         has_vid = "vid" in col_names
         has_vids_only = "vid_s" in col_names and not has_vids
-        has_blob = "blob_id" in col_names
         has_commit = "commit_id" in col_names
 
         vid_s_idx = col_names.index("vid_s") if "vid_s" in col_names else None
         vid_e_idx = col_names.index("vid_e") if "vid_e" in col_names else None
         vid_idx = col_names.index("vid") if "vid" in col_names else None
-        blob_idx = col_names.index("blob_id") if "blob_id" in col_names else None
         commit_idx = col_names.index("commit_id") if "commit_id" in col_names else None
 
         results = []
@@ -365,10 +382,6 @@ class MockDB(BaseDBEngine):
                 elif has_vids_only and vid_s_idx is not None:
                     vid_s_val = row[vid_s_idx]
                     if vid_s_val is not None and vid_s_val < min_vid:
-                        continue
-                elif has_blob and blob_idx is not None:
-                    blob_val = row[blob_idx]
-                    if blob_val is not None and blob_val < min_vid:
                         continue
                 elif has_commit and commit_idx is not None:
                     commit_val = row[commit_idx]

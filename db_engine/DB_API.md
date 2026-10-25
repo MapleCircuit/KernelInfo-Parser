@@ -28,7 +28,12 @@ Any database backend assigned to `G.DB` or passed to `TableEngine.start()` must 
 - **`close() -> None`**
   - Safely releases cursor and database connection socket handles.
 - **`check_if_connected() -> None`** *(MariaDB only)*
-  - Auto-reconnect retry loop (up to 3 attempts) with session parameter re-initialization if connection drops.
+  - Auto-reconnect retry loop (up to 3 attempts) with session parameter re-initialization if connection drops. A reconnect made by `ping(reconnect=True)` itself (new `connection_id`) also re-runs `_init_session()`, so the new session keeps `sql_mode` and the disabled checks.
+  - Inside `transaction()` it never reconnects: a lost connection raises `ConnectionError`, because the server already rolled the transaction back.
+- **`transaction() -> ContextManager[Self]`** *(MariaDB only)*
+  - Runs the block's `insert()` / `update()` calls as one transaction (`autocommit` off, one `COMMIT` on exit, `ROLLBACK` on error). Inside it `insert()` / `update()` neither commit per call nor reconnect and retry per chunk, so a table is written completely or not at all and can be retried as a whole.
+- **`apply_server_tuning(settings: dict[str, Any]) -> list[str]`** *(MariaDB only)*
+  - Raises global server variables with `SET GLOBAL` (needs SUPER; lasts until the server restarts) and returns one note per change or failure. Sizes may carry a K/M/G/T suffix (`parse_server_setting()`); `innodb_buffer_pool_size`, `innodb_log_file_size`, `innodb_io_capacity(_max)` are never lowered, and `innodb_io_capacity_max` goes first. Each value is read back: a server that caps it (e.g. `innodb_buffer_pool_size` beyond `innodb_buffer_pool_size_max`, which MariaDB 10.11 fixes at startup) is reported as `capped at ...` with the restart hint.
 
 ### 2.2. Sequence Tracking & Single-Row CRUD
 - **`get_next_id(table: Table) -> int`**
@@ -36,7 +41,10 @@ Any database backend assigned to `G.DB` or passed to `TableEngine.start()` must 
 - **`select(table: Table, data: tuple[SafeDataType, ...]) -> tuple[SafeDataType, ...] | None`**
   - Executes single-row query matching non-None column filters (`SELECT * FROM table WHERE ... LIMIT 1`). None positions act as wildcards.
 - **`select_preload(table: Table, cached_columns: tuple[int, ...] | None = None, min_vid: int | None = None) -> list[tuple[SafeDataType, ...]]`**
-  - Queries records for TableEngine startup preloading with column projection (e.g. `SELECT hash FROM m_tag_code`) and version filtering (`WHERE vid >= min_vid` or `WHERE (vid_e = 0 OR vid_e >= min_vid)`).
+  - Queries records for TableEngine startup preloading with column projection (e.g. `SELECT hash FROM m_tag_code`) and version filtering on the table's version column (`WHERE vid >= min_vid`, `WHERE (vid_e = 0 OR vid_e >= min_vid)`, or `WHERE commit_id >= min_vid` for `m_bridge_checkpoint`). `min_vid` is a commit id (`gp.Old_VID`), so tables without a version column are never filtered (blob ids are a different id space).
+
+- **`select_in(table: Table, col_idx: int, values: Sequence[SafeDataType]) -> list[tuple[SafeDataType, ...]]`**
+  - Every row whose column `col_idx` is one of `values` (`MariaDB`: `IN` queries of 1000 values; `MockDB`: filter; base default: one `view_select_multiple()` per value). Used to load the stored symbol items of a file's previous tags.
 
 ### 2.3. Multi-Table Relational Views
 - **`view_select(tables: Sequence[Table] | dict[int, Table], joins: JoinsType, columns: tuple[SafeDataType, ...]) -> tuple[SafeDataType, ...] | None`**
@@ -47,11 +55,15 @@ Any database backend assigned to `G.DB` or passed to `TableEngine.start()` must 
 
 ### 2.4. Batch Insert, Upsert & Parallel Commits
 - **`insert(table: Table, data: tuple[tuple[SafeDataType, ...], ...] | tuple[SafeDataType, ...]) -> None`**
-  - Batch executes parameterized `INSERT INTO table VALUES (%s, ...)`. Dynamically sizes batches based on table schema: tables with `TEXT`, `LONGTEXT`, or `BLOB` columns (e.g. `m_tag_code`) are capped at <= 500 rows and <= 4MB estimated payload, while regular tables use <= 2000 rows (or <= 5000 rows for short tables) and <= 8MB. On `OperationalError 1153` (`ER_NET_PACKET_TOO_LARGE` / `max_allowed_packet`), recursively bisects chunks into halves until execution succeeds. On duplicate primary key collisions (MySQL `errno 1062` / `IntegrityError` in `MariaDB`, or existing PK in `MockDB`), raises `ValueError` to preserve driver contract. Commits transaction.
+  - Batch executes parameterized `INSERT INTO table VALUES (%s, ...)`. Dynamically sizes batches based on table schema: tables with `TEXT`, `LONGTEXT`, or `BLOB` columns (e.g. `m_tag_code`) are capped at <= 500 rows and <= 4MB estimated payload, while regular tables use <= 2000 rows (or <= 5000 rows for short tables) and <= 8MB. On `OperationalError 1153` (`ER_NET_PACKET_TOO_LARGE` / `max_allowed_packet`), recursively bisects chunks into halves until execution succeeds. On duplicate primary key collisions (MySQL `errno 1062` / `IntegrityError` in `MariaDB`, or existing PK in `MockDB`), raises `ValueError` to preserve driver contract. Tables with `idempotent_pk=True` skip only the rows whose key already exists: `MariaDB` appends a no-op `ON DUPLICATE KEY UPDATE pk = pk` (`_insert_sql()`), since a plain multi-row INSERT fails as a whole on one duplicate and `INSERT IGNORE` is no longer batched by mysql-connector (one round trip per row); `MockDB` skips existing keys row by row. Commits transaction.
 - **`update(table: Table, data: tuple[tuple[SafeDataType, ...], ...] | tuple[SafeDataType, ...]) -> None`**
   - Batch executes upsert `INSERT INTO table VALUES (...) ON DUPLICATE KEY UPDATE col=VALUES(col)` for all non-primary key columns. Uses dynamic byte-bounded chunking and recursive bisection on packet limit errors. Commits transaction.
-- **`commit_tables_parallel(tables_data: Sequence[tuple[Table, Sequence[tuple], Sequence[tuple]]], max_workers: int | None = None) -> None`**
-  - Flushes insert and update payloads across multiple tables concurrently using dedicated worker connection threads.
+- **`commit_tables_parallel(tables_data: Sequence[tuple[Table, Sequence[tuple], Sequence[tuple]]], max_workers: int | None = None, dedicated: bool = False) -> list[TableCommitStat]`**
+  - Flushes insert and update payloads across multiple tables concurrently using dedicated worker connection threads (`MariaDB`); a single table is written on the instance's own connection unless `dedicated=True` (set by the TableEngine's background writer thread, which must never touch the owner's connection).
+  - Each table is written by its own connection as one `transaction()`. A lost connection rolls that table back and it is written again on a new connection (3 attempts); other errors are not retried.
+  - Every table runs to completion; if any failed, the first error is raised with `failed_table_ids` (the tables that were not committed; all others were). `MockDB` writes tables one after the other and names the failing table and the ones after it.
+  - Returns one `TableCommitStat(table_name, inserted, updated, seconds)` per written table (exported by `db_engine`).
+  - `supports_background_commit` (class attribute, `True` for `MariaDB`) tells the TableEngine that `dedicated=True` keeps the call off the instance's connection, so it may run on a writer thread.
 
 ### 2.5. DDL & Index Management
 - **`create_table(tables: Sequence[Table] | Table) -> None`**

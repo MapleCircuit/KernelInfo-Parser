@@ -2041,6 +2041,15 @@ class TestDBAndTEIntegration(unittest.TestCase):
             cs.gp = mock_gp
             ref_val = cs.resolve_ref((m_ast.table_id, 0), [REF_FILE, "include/linux/unchanged.h", "unchanged_type", int(ASTT.C_struct)])
             self.assertEqual(ref_val, assigned_ast_id)
+
+            # The same file changed in this update and not yet executed: its previous version must not answer
+            changed_gp = GreatProcessor()
+            changed_gp.init_cs_dict()
+            changed_gp.VID = 2
+            changed_gp.Old_VID = 1
+            changed_gp._changed_paths_set = {"include/linux/unchanged.h"}
+            self.assertIsNone(changed_gp.get_file_symbols_from_db("include/linux/unchanged.h"))
+            self.assertNotIn("include/linux/unchanged.h", changed_gp.unchanged_symbol_cache)
         finally:
             G.TE = old_te
 

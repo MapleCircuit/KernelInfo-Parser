@@ -39,8 +39,8 @@ from core.DBLayout import (
     m_ast_attribute,
     m_map_ast,
     m_bridge_map,
-    m_symbol_def,
 )
+from core.SymbolRows import symbol_view_rows
 from table_engine import TEDirectDB, TECachedDB, get_table_engine
 from db_engine import MockDB, MariaDB
 from parser.c_ast import safe_spelling, safe_cursor_spelling
@@ -120,6 +120,11 @@ def default_processing(CS: ChangeSet, gp: GreatProcessor) -> None:
         CS.ref(m_file_name.fnid),
         CS.ref(m_file.fid),
     ))
+
+
+def _symbol_store(view: str) -> dict[int, tuple]:
+    """Rows of the m_symbol_def / m_symbol_ref view over the MockDB store, keyed like a table store."""
+    return dict(enumerate(symbol_view_rows(MockDB._global_store, view)))
 
 
 def run_single_file_worker(item: dict[str, Any]) -> dict[str, Any]:
@@ -394,7 +399,7 @@ class TestCASTParser(unittest.TestCase):
         self.assertIsNone(res["error"])
         self.assertTrue(res["execute_success"])
 
-        sym_defs = MockDB._global_store.get("m_symbol_def", {})
+        sym_defs = _symbol_store("m_symbol_def")
         macro_defs = {row[4]: row for row in sym_defs.values() if row[5] in (int(ASTT.CPPro_define), int(ASTT.CPPro_define_macro))}
         self.assertIn("WATCHDOG_NAME", macro_defs)
         self.assertIn("WATCHDOG_TIMEOUT", macro_defs)
@@ -407,7 +412,7 @@ class TestCASTParser(unittest.TestCase):
         self.assertEqual(wd_name_def[8], 45) # line_e
 
         # Verify macro expansions in m_symbol_ref
-        sym_refs = MockDB._global_store.get("m_symbol_ref", {})
+        sym_refs = _symbol_store("m_symbol_ref")
         macro_expansions = [row for row in sym_refs.values() if row[5] == int(SymbolRole.MacroExpansion)]
         self.assertGreaterEqual(len(macro_expansions), 5, f"Expected at least 5 macro expansions, found {len(macro_expansions)}")
 
@@ -841,7 +846,8 @@ static inline int test_compat_fn(int x, long y) {
             default_processing(cs, gp)
             cs.parse()
             self.assertTrue(cs.execute())
-            defs = [op[2] for op in cs.cs if op and op[0] == m_symbol_def.table_id]
+            G.TE.commit_all()
+            defs = list(_symbol_store("m_symbol_def").values())
             by_name = {}
             for d in defs:
                 by_name.setdefault(d[4], []).append((int(d[5]), d[7], d[8]))
@@ -1494,8 +1500,8 @@ struct nlmsvc_binding {
             from core.globalstuff import ASTT, SymbolRole
             mock_containers = MockDB._global_store.get("m_ast_container", {})
             mock_asts = MockDB._global_store.get("m_ast", {})
-            mock_sym_defs = MockDB._global_store.get("m_symbol_def", {})
-            mock_sym_refs = MockDB._global_store.get("m_symbol_ref", {})
+            mock_sym_defs = _symbol_store("m_symbol_def")
+            mock_sym_refs = _symbol_store("m_symbol_ref")
 
             # 1. __u32 AST & container
             u32_ast = next((row for row in mock_asts.values() if row[1] == "__u32" and row[2] == ASTT.C_SCtypedef), None)
@@ -2869,7 +2875,7 @@ enum {
             self.assertTrue(cs.execute())
             G.TE.commit_all()
 
-            sym_defs = MockDB._global_store.get("m_symbol_def", {})
+            sym_defs = _symbol_store("m_symbol_def")
             defs_by_name = {row[4]: row for row in sym_defs.values()}
 
             # 1. Named enum definition exists
@@ -2947,12 +2953,12 @@ int handle_state(enum my_state s) {
             G.TE.commit_all()
 
             from core.globalstuff import SymbolRole
-            sym_defs = MockDB._global_store.get("m_symbol_def", {})
+            sym_defs = _symbol_store("m_symbol_def")
             defs_by_name = {row[4]: row for row in sym_defs.values()}
             idle_ast_id = defs_by_name["STATE_IDLE"][3]
             running_ast_id = defs_by_name["STATE_RUNNING"][3]
 
-            sym_refs = MockDB._global_store.get("m_symbol_ref", {})
+            sym_refs = _symbol_store("m_symbol_ref")
             decl_refs = [r for r in sym_refs.values() if r[5] == int(SymbolRole.DeclRef)]
 
             idle_refs = [r for r in decl_refs if r[3] == idle_ast_id]
@@ -3037,7 +3043,7 @@ int check_link(int up) {
             G.TE.commit_all()
 
             from core.globalstuff import SymbolRole
-            sym_defs = MockDB._global_store.get("m_symbol_def", {})
+            sym_defs = _symbol_store("m_symbol_def")
             defs_by_name = {row[4]: row for row in sym_defs.values()}
             self.assertIn("NET_UP", defs_by_name)
             self.assertIn("NET_DOWN", defs_by_name)
@@ -3045,7 +3051,7 @@ int check_link(int up) {
             net_up_ast_id = defs_by_name["NET_UP"][3]
             net_down_ast_id = defs_by_name["NET_DOWN"][3]
 
-            sym_refs = MockDB._global_store.get("m_symbol_ref", {})
+            sym_refs = _symbol_store("m_symbol_ref")
             driver_refs = [row for row in sym_refs.values() if row[5] == int(SymbolRole.DeclRef)]
 
             up_refs = [r for r in driver_refs if r[3] == net_up_ast_id]

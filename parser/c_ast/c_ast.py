@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any
 import clang.cindex as cc
 
+from core.SymbolRows import finish as finish_symbol_rows
 from core.globalstuff import (
     G,
     REF_C_AST,
@@ -156,6 +157,8 @@ def c_ast_parse(CS: Any) -> None:
                 close_prior_tags(CS)
             else:
                 logger.error(f"Unsupported file operation '{CS.file_operation}' in c_ast_parse")
+        # Emit the symbol definitions/references recorded while parsing (core/SymbolRows.py)
+        finish_symbol_rows(CS)
     finally:
         clear_tu_caches()
 
@@ -259,42 +262,64 @@ def extract_include_symbols(parsed_tu: cc.TranslationUnit, fullfilename: str, CS
     is_null = _CLANG_CURSOR_IS_NULL
     get_ref = _CLANG_GET_CURSOR_REFERENCED
     visit_children = _CLANG_VISIT_CHILDREN
+    # Most references in a file point at declarations it already referenced (every call of the same function,
+    # every use of the same type): resolve each referenced cursor once. Key: the raw CXCursor bytes.
+    resolved_refs: dict[bytes, tuple[int, tuple[str, ASTT]] | None] = {}
 
     def visitor(cursor: Any, parent: Any, client_data: Any) -> int:
         k_id = cursor._kind_id
         if k_id in _REFERENCING_KIND_IDS:
             ref = get_ref(cursor)
-            if not is_null(ref):
-                loc = get_loc(ref)
-                get_file_loc(loc, byref(f_ptr), byref(u_val), byref(u_val), byref(u_val))
-                ref_ptr = f_ptr.value
-                if ref_ptr and ref_ptr != target_ptr:
-                    inc_line = ptr_to_direct_line.get(ref_ptr)
-                    if inc_line is not None:
-                        ast_type = _CURSOR_KIND_ID_MAP.get(ref._kind_id)
-                        if ast_type is not None:
-                            cursor._tu = parsed_tu
-                            ref._tu = parsed_tu
-                            sym_name = ref.spelling
-                            if sym_name and sym_name not in STANDARD_C_KEYWORDS:
-                                if not (sym_name.startswith("__builtin_") or sym_name.startswith("__attribute__")):
-                                    found_symbols_by_line[inc_line].add((sym_name, ast_type))
+            ref_key = bytes(ref)
+            if ref_key in resolved_refs:
+                found = resolved_refs[ref_key]
+            else:
+                found = None
+                if not is_null(ref):
+                    loc = get_loc(ref)
+                    get_file_loc(loc, byref(f_ptr), byref(u_val), byref(u_val), byref(u_val))
+                    ref_ptr = f_ptr.value
+                    if ref_ptr and ref_ptr != target_ptr:
+                        inc_line = ptr_to_direct_line.get(ref_ptr)
+                        if inc_line is not None:
+                            ast_type = _CURSOR_KIND_ID_MAP.get(ref._kind_id)
+                            if ast_type is not None:
+                                ref._tu = parsed_tu
+                                sym_name = ref.spelling
+                                if sym_name and sym_name not in STANDARD_C_KEYWORDS:
+                                    if not (sym_name.startswith("__builtin_") or sym_name.startswith("__attribute__")):
+                                        found = (inc_line, (sym_name, ast_type))
+                resolved_refs[ref_key] = found
+            if found is not None:
+                found_symbols_by_line[found[0]].add(found[1])
         return 2  # CXChildVisit_Recurse
 
     cb_func = cc.cursor_visit_callback(visitor)
 
+    # Walk the TU's top-level cursors with clang_visitChildren directly: thousands of them come from headers,
+    # and cindex's get_children() spends two extra C calls per child on a null-cursor assertion
     top_decl_cursors: list[cc.Cursor] = []
-    try:
-        for c in parsed_tu.cursor.get_children():
-            loc = get_loc(c)
-            get_file_loc(loc, byref(f_ptr), byref(u_val), byref(u_val), byref(u_val))
+    walk_errors: list[Exception] = []
+    f_ref = byref(f_ptr)
+    tu_cursor = parsed_tu.cursor
+
+    def top_level_visitor(c: Any, parent: Any, client_data: Any) -> int:
+        try:
+            get_file_loc(get_loc(c), f_ref, None, None, None)
             if f_ptr.value == target_ptr or (target_ptr is None and c.location.file and (c.location.file.name == fullfilename or get_real(c.location.file.name) == target_real)):
-                visitor(c, parsed_tu.cursor, None)
+                c._tu = parsed_tu
+                visitor(c, tu_cursor, None)
                 visit_children(c, cb_func, None)
                 if c.kind in _VALID_TOP_KINDS:
                     top_decl_cursors.append(c)
-    except Exception as e:
-        logger.debug(f"Error walking file-bounded cursors for include symbols: {e}")
+        except Exception as e:
+            walk_errors.append(e)
+            return 0  # CXChildVisit_Break
+        return 1  # CXChildVisit_Continue
+
+    visit_children(tu_cursor, cc.cursor_visit_callback(top_level_visitor), None)
+    if walk_errors:
+        logger.debug(f"Error walking file-bounded cursors for include symbols: {walk_errors[0]}")
 
     for line, syms_set in found_symbols_by_line.items():
         CS.include_symbols[line] = sorted(syms_set, key=lambda s: (s[1], s[0]))
@@ -498,11 +523,13 @@ class Ast_Manager:
             ],
             options=(cc.TranslationUnit.PARSE_DETAILED_PROCESSING_RECORD + 32768 + 16384),
         )
+        t_includes_0 = time.perf_counter() if prof is not None else 0.0
 
         top_cursors = extract_include_symbols(translation_unit, self.fullfilename, CS)
 
         if prof is not None:
-            prof.clang_parse_tu_s = time.perf_counter() - t_parse_0
+            prof.clang_parse_tu_s = t_includes_0 - t_parse_0
+            prof.include_symbols_s = time.perf_counter() - t_includes_0
             t_tok_0 = time.perf_counter()
 
         self.TL = TokenList(translation_unit, self.fullfilename, self.rawfile, file_size=file_byte_size, top_cursors=top_cursors)

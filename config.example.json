@@ -17,7 +17,7 @@
     "table_engine": "cached",
     "memory_mode": "normal",
     "fidelity": true,
-    "mem_max": 60
+    "mem_max": 48
   },
   "workspace": {
     "repos_dir": "repos",

@@ -27,7 +27,10 @@ from core.DBLayout import (
     m_ast,
     m_map_ast,
     m_bridge_map,
-    m_symbol_ref,
+)
+from core.SymbolRows import (
+    flush_pending_refs as flush_pending_symbol_refs,
+    register_tag as register_symbol_tag,
 )
 from parser.c_ast.tag_tracker import check_exact_match, match_prior_tag_transition
 
@@ -43,26 +46,8 @@ class CSExtractor:
 
         zone.extract(CS)
 
-        if getattr(CS, "pending_symbol_refs", None):
-            last_tag = getattr(CS, "last_tag_ref", 0) or 0
-            seen: set[tuple[Any, int, int, int]] = set()
-            for ref_ast_id, role, line, col in CS.pending_symbol_refs:
-                key = (ref_ast_id, role, line, col)
-                if key in seen:
-                    continue
-                seen.add(key)
-                with CS(REF_POS):
-                    CS.store(m_symbol_ref.set(
-                        None,
-                        ((m_file.table_id, 0), OP_REF, (REF_ROOT,)),
-                        last_tag,
-                        ref_ast_id,
-                        0,
-                        int(role),
-                        line,
-                        col,
-                    ))
-            CS.pending_symbol_refs.clear()
+        # References left over after the last tag go to it (outside its lines, so they are stored per blob)
+        flush_pending_symbol_refs(CS, getattr(CS, "last_tag_ref", 0) or 0)
 
         if prof is not None:
             prof.ast_extraction_s = time.perf_counter() - t_start
@@ -94,6 +79,7 @@ class CSExtractor:
                     extent.line_pos[0], extent.line_pos[1],
                     extent.char_pos[0], extent.char_pos[1],
                 ))
+                register_symbol_tag(CS, recycled_tag_id, extent.line_pos[0], extent.line_pos[1], extent.char_pos[0], code_str)
                 return recycled_tag_id
 
         # Check evolved prior tag match via 5-tier tag_tracker
@@ -121,6 +107,7 @@ class CSExtractor:
             extent.line_pos[0], extent.line_pos[1],
             extent.char_pos[0], extent.char_pos[1],
         ))
+        register_symbol_tag(CS, tag_ref, extent.line_pos[0], extent.line_pos[1], extent.char_pos[0], code_str)
 
         # Stage Intra-Tag Spatial Mapping & Bridge Map (with deduplication)
         rel_line_e = max(1, extent.line_pos[1] - extent.line_pos[0] + 1)

@@ -163,12 +163,13 @@ Git trees are enumerated via `git ls-tree -r {version}` into 20-byte SHA-1 diges
 2. **Subprocess Buffer Protection**:
    - `_run_git()` caps output buffer at `max_output_bytes = 50MB` with explicit process timeouts (120s) by default; callers may raise both (e.g. `parse_version_commits()` allows 4 GiB / 1800 s for whole-history ranges).
    - `parse_version_commits(old_rev, new_rev, limit=None, with_files=True)`: Without `old_rev` the complete history up to `new_rev` is returned (no implicit cap), so the commit DAG reaches the root commit; `limit` bounds the count. `with_files=False` omits `--name-status` for DAG-only ingestion (≈9 s for the 255k commits up to v3.0). `parse_version_commits_with_hunks()` keeps its `-n1000` cap on initial versions because `git log -p` over a whole history is prohibitively large.
-3. **Bisect Interval Queries**:
-   - Spatial hunk-to-tag correlation uses $O(\log N)$ interval searching via Python's `bisect` module, avoiding $O(N \cdot M)$ scans between commits and tags.
+3. **Interval Index Queries**:
+   - Spatial hunk-to-tag correlation (`map_tags_to_commits`, more than 8 hunks) uses `_HunkIndex`: hunks sorted by start line with a max-end segment tree, returning the hunks overlapping a tag's line range in $O(\log H + \text{matches})$ (in hunk start order) instead of scanning every hunk that starts before the tag ends.
 4. **Bulk Staging & Cache Bypass**:
    - Commit batches are staged with TableEngine secondary in-memory caching disabled (`update_in_mem_indexes=False`) to avoid maintaining hundreds of thousands of ephemeral commit indexes in RAM.
 5. **Commit DAG Parent Linking**:
-   - `git log` lists children before parents. `ingest_git_dag()` inserts commits oldest-first and links parents through `m_commit`; `processing_git_commits()` defers `m_commit_parent` rows until every commit of the range has an id, resolving parents outside the range by hash.
+   - `git log` lists children before parents. `ingest_git_dag()` registers the range in bulk (`_ingest_commit_range()`): existing commits are looked up by hash in chunks of 1,000, persons are loaded once, and new persons, commits (ids assigned oldest-first), parents and contributors are inserted with multi-row statements instead of several round trips and transaction commits per commit. Persons are identified by `(name, email)` (`_person_key()`), the same key the TableEngine uses for `m_maintainer_person`. The resulting hash -> id map is kept on `gp.commit_ids_by_hash`; `processing_git_commits()` reuses it (looking any other hash, including out-of-range parents, up in one batch) and only creates persons for commits not yet registered. It defers `m_commit_parent` rows until every commit of the range has an id.
+   - Files reused by Step 4.5's blob deduplication (`gp.deduped_paths`) are not parsed: `processing_git_commits()` loads their tags from `m_bridge_tag` (`_load_blob_tags()`) and maps them to the range's commits like parsed files.
    - `main.py --limit N` bounds the commits `ingest_git_dag()` records per version range (default: all).
 6. **Dynamic Repository Routing**:
    - Multi-tree parsing dynamically routes git subprocess invocations to the active repository directory via `MF.set_repo_dir(repo_dir)`, maintaining independent Git repository context across diverse tree checkouts.
