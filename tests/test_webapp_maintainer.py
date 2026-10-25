@@ -11,6 +11,7 @@ from typing import Any
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from tests import require_indexed_ref
 from webapp.backend.database.pool import get_db_cursor
 from webapp.main import (
     get_maintainers_overview,
@@ -116,6 +117,7 @@ class TestWebAppMaintainerEndpoints(unittest.TestCase):
         self.assertGreaterEqual(len(ext4_sec["maintainers"]), 1)
 
     def test_maintainer_section_detail_and_files(self) -> None:
+        require_indexed_ref("v3.0")
         # Fetch EXT4 FILE SYSTEM section details
         res = get_maintainer_section_detail("v3.0", "EXT4 FILE SYSTEM")
         self.assertIn("section", res)
@@ -139,6 +141,7 @@ class TestWebAppMaintainerEndpoints(unittest.TestCase):
         self.assertTrue(any("ext4" in fn for fn in file_names))
 
     def test_person_profile_and_cross_referencing(self) -> None:
+        require_indexed_ref("v3.0")
         # Profile lookup for Theodore Ts'o
         res = get_person_profile("v3.0", "tytso@mit.edu")
         self.assertIn("person", res)
@@ -177,6 +180,7 @@ class TestWebAppMaintainerEndpoints(unittest.TestCase):
         self.assertIn("Original", linus["description"])
 
     def test_browse_file_subsystems_enrichment(self) -> None:
+        require_indexed_ref("v3.0")
         # Browse ext4 super.c
         res = browse_path("v3.0", "fs/ext4/super.c")
         self.assertEqual(res.get("type"), "file")
@@ -187,14 +191,16 @@ class TestWebAppMaintainerEndpoints(unittest.TestCase):
         self.assertGreaterEqual(len(subsystems[0]["maintainers"]), 1)
 
     def test_browse_file_lifecycle_metadata(self) -> None:
+        require_indexed_ref("v3.0")
         # Browse ext4 super.c and verify lifecycle metadata
         res = browse_path("v3.0", "fs/ext4/super.c")
         self.assertEqual(res.get("type"), "file")
         self.assertIn("file_info", res)
         fi = res["file_info"]
         self.assertEqual(fi["fname"], "fs/ext4/super.c")
-        self.assertEqual(fi["vname_s"], "v3.0")
-        self.assertEqual(fi["added_version"], "v3.0")
+        # The file's lifecycle starts at the first parsed version holding it (v3.0 only when parsing began there)
+        self.assertTrue(fi["vname_s"])
+        self.assertEqual(fi["added_version"], fi["vname_s"])
         self.assertIn("s_stat_label", fi)
         self.assertIn("e_stat_label", fi)
         self.assertIn(fi["s_stat_label"], ("Added", "Modified", "Renamed"))
@@ -202,7 +208,6 @@ class TestWebAppMaintainerEndpoints(unittest.TestCase):
         self.assertIn("history", fi)
         self.assertIsInstance(fi["history"], list)
         self.assertGreaterEqual(len(fi["history"]), 1)
-        self.assertEqual(fi["history"][0]["vname_s"], "v3.0")
 
         # Test get_file_by_id endpoint
         fid = fi["fid"]
@@ -210,7 +215,7 @@ class TestWebAppMaintainerEndpoints(unittest.TestCase):
         self.assertEqual(f_res.get("type"), "file")
         self.assertIn("file_info", f_res)
         self.assertEqual(f_res["file_info"]["fid"], fid)
-        self.assertEqual(f_res["file_info"]["added_version"], "v3.0")
+        self.assertEqual(f_res["file_info"]["added_version"], fi["added_version"])
         self.assertEqual(f_res["file_info"]["s_stat_label"], fi["s_stat_label"])
 
 

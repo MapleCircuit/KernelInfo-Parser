@@ -50,46 +50,47 @@ from core.config import get_default_repo_path
 LINUX_REPO = str(get_default_repo_path())
 
 # Standard regression files tested across AST parser
-# Baseline operations count corresponds to pure AST operations (excluding the 3 lifecycle operations)
+# Baseline operations count corresponds to pure AST operations (excluding the 3 lifecycle operations).
+# Rebaselined for the shared-symbol layout (m_tag_def / m_tag_ref shared per tag, per-blob m_blob_symbol rows).
 TEST_SUITE: list[dict[str, Any]] = [
     {
         "file": "include/linux/drbd_tag_magic.h",
-        "baseline_ast_ops": 328,
+        "baseline_ast_ops": 426,
         "description": "Kernel Header (drbd_tag_magic.h)",
     },
     {
         "file": "virt/kvm/iodev.h",
-        "baseline_ast_ops": 242,
+        "baseline_ast_ops": 276,
         "description": "Kernel Header (virt/kvm/iodev.h)",
     },
     {
         "file": "include/linux/lockd/bind.h",
-        "baseline_ast_ops": 207,
+        "baseline_ast_ops": 230,
         "description": "Kernel Header (lockd/bind.h)",
     },
     {
         "file": "include/linux/netfilter_bridge/ebtables.h",
-        "baseline_ast_ops": 1001,
+        "baseline_ast_ops": 1141,
         "description": "Kernel Header (ebtables.h)",
     },
     {
         "file": "drivers/watchdog/w83627hf_wdt.c",
-        "baseline_ast_ops": 1187,
+        "baseline_ast_ops": 1109,
         "description": "Watchdog Driver (Latin-1 byte 0xe1 resilience)",
     },
     {
         "file": "drivers/usb/storage/isd200.c",
-        "baseline_ast_ops": 4295,
+        "baseline_ast_ops": 4865,
         "description": "USB Storage Driver (Latin-1 byte 0xf6 resilience)",
     },
     {
         "file": "include/linux/sched.h",
-        "baseline_ast_ops": 10227,
+        "baseline_ast_ops": 11591,
         "description": "Kernel Header (sched.h)",
     },
     {
         "file": "arch/mips/include/asm/mach-cavium-octeon/kernel-entry-init.h",
-        "baseline_ast_ops": 111,
+        "baseline_ast_ops": 120,
         "description": "Assembly Header (kernel-entry-init.h)",
     },
     {
@@ -99,7 +100,7 @@ TEST_SUITE: list[dict[str, Any]] = [
     },
     {
         "file": "arch/powerpc/xmon/ppc-opc.c",
-        "baseline_ast_ops": 18700,
+        "baseline_ast_ops": 19979,
         "description": "PowerPC Opcode Table & Large Initializer Array (ppc-opc.c)",
     },
 ]
@@ -705,17 +706,19 @@ class TestCASTParser(unittest.TestCase):
         scheduler.drain_deferred_queue()
 
     def test_direct_table_engine_execution(self) -> None:
-        """Verify parsing and ChangeSet execution with TEDirectDB."""
+        """Verify parsing and ChangeSet execution with TEDirectDB stage the same operations as TECachedDB."""
         item = {
             "file": "virt/kvm/iodev.h",
-            "baseline_ast_ops": 242,
             "description": "Kernel Header (virt/kvm/iodev.h)",
-            "table_engine": "direct",
         }
-        res = run_single_file_worker(item)
+        cached = run_single_file_worker({**item, "table_engine": "cached"})
+        res = run_single_file_worker({**item, "table_engine": "direct"})
         self.assertIsNone(res["error"])
         self.assertTrue(res["execute_success"])
-        self.assertEqual(res["actual_total_ops"], res["baseline_total_ops"])
+        self.assertIsNone(cached["error"])
+        self.assertGreater(res["actual_total_ops"], LIFECYCLE_OPS_COUNT)
+        self.assertEqual(res["actual_total_ops"], cached["actual_total_ops"])
+        self.assertEqual(res["results_count"], cached["results_count"])
 
     def test_static_assert_keyword_handling(self) -> None:
         """Verify _Static_assert and static_assert are handled cleanly without warnings."""

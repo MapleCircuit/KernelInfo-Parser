@@ -24,6 +24,7 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from tests import require_indexed_ref
 from webapp.main import (
     AutoSolveRequest,
     DiffConfigRequest,
@@ -556,6 +557,7 @@ int get_foo(void) {
     def test_anchored_bidirectional_timeline(self) -> None:
         """Verify commit timeline anchors on version tag and supports past and future directions."""
         from webapp.backend.services.git_service import GitService
+        v30 = require_indexed_ref("v3.0")
         git_svc = GitService()
 
         # 1. Past direction (commits leading up to or before anchor)
@@ -563,33 +565,34 @@ int get_foo(void) {
         self.assertEqual(past_res["version"], "v3.0")
         self.assertEqual(past_res["direction"], "past")
         self.assertIsNotNone(past_res["anchor_commit"])
-        self.assertEqual(past_res["anchor_commit"]["commit_id"], 854)
+        self.assertEqual(past_res["anchor_commit"]["commit_id"], v30)
         self.assertEqual(past_res["anchor_commit"]["subject"], "Linux 3.0")
         self.assertGreater(len(past_res["timeline"]), 0)
         # All commits in past timeline must be <= anchor commit_id
         for c in past_res["timeline"]:
-            self.assertLessEqual(c["commit_id"], 854)
+            self.assertLessEqual(c["commit_id"], v30)
 
         # 2. Future direction (commits after anchor)
         future_res = git_svc.get_commit_timeline("v3.0", limit=15, direction="future")
         self.assertEqual(future_res["version"], "v3.0")
         self.assertEqual(future_res["direction"], "future")
         self.assertIsNotNone(future_res["anchor_commit"])
-        self.assertEqual(future_res["anchor_commit"]["commit_id"], 854)
+        self.assertEqual(future_res["anchor_commit"]["commit_id"], v30)
         self.assertGreater(len(future_res["timeline"]), 0)
         # All commits in future timeline must be >= anchor commit_id
         for c in future_res["timeline"]:
-            self.assertGreaterEqual(c["commit_id"], 854)
+            self.assertGreaterEqual(c["commit_id"], v30)
 
     def test_commit_level_version_info_resolution(self) -> None:
         """Verify get_version_info resolves tags, -rc tags, and arbitrary commit SHAs via git rev-parse."""
         from webapp.backend.database.pool import get_db_cursor
         from webapp.backend.database.helpers import get_version_info
 
+        v30 = require_indexed_ref("v3.0")
         with get_db_cursor() as cursor:
             # 1. Standard indexed tag
             cid, vname = get_version_info(cursor, "v3.0")
-            self.assertEqual(cid, 854)
+            self.assertEqual(cid, v30)
             self.assertEqual(vname, "v3.0")
 
             # 2. Git release candidate tag fallback
@@ -600,7 +603,7 @@ int get_foo(void) {
             # 3. Direct commit SHA
             sha = "02f8c6aee8df3cdc935e9bdd4f2d020306035dbe"
             sha_cid, sha_vname = get_version_info(cursor, sha)
-            self.assertEqual(sha_cid, 854)
+            self.assertEqual(sha_cid, v30)
             self.assertEqual(sha_vname.lower(), sha.lower())
 
     def test_file_history_and_last_changed(self) -> None:
