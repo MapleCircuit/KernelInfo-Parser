@@ -599,6 +599,7 @@ Retrieve both definition location(s) and categorized usage references (call site
   - `symbol_name` (path): Symbol identifier.
   - `limit` (query, optional int): Maximum number of reference records to return (useful for symbols with thousands of references like `kmalloc`).
   - `arch` (query, default `x86_64`): orders `definitions` for that ARCH (§2.7); `definition` is the first.
+- **References**: only references in blobs of the revision's tree are returned, ordered by file and line. `file` is the path of the referencing blob in that tree (best-ranked for `arch` when the blob sits at several paths; not `target_fnid`, which is the target's file), `caller` is the name of the AST of the tag the reference sits in (e.g. the enclosing function), `fid` the referencing blob, and `limit` applies after scoping.
 - **Response**:
 ```json
 {
@@ -625,18 +626,20 @@ Retrieve both definition location(s) and categorized usage references (call site
     {
       "caller": "x86_64_start_kernel",
       "file": "arch/x86/kernel/head64.c",
+      "fid": 138690,
       "line": 95,
-      "type": "Call",
-      "ref_type": 1,
-      "ast_id": 1054
+      "char_s": 2,
+      "tag_id": 2445459,
+      "type": "Call"
     },
     {
       "caller": "setup_arch",
       "file": "arch/x86/kernel/setup.c",
+      "fid": 138702,
       "line": 842,
-      "type": "Call",
-      "ref_type": 1,
-      "ast_id": 1289
+      "char_s": 2,
+      "tag_id": 2445512,
+      "type": "Call"
     }
   ]
 }
@@ -1643,7 +1646,7 @@ Implements two-layer hybrid highlighting with map prioritization and client-side
   - Clicking "Open in Kconfig Viewer" strips any `CONFIG_` prefix, opens/focuses the Kconfig explorer tab, highlights the matching symbol row, and immediately loads dependency constraints and auto-solve options in the inspector.
 - **Clean Cross-References (XRef) Modal**:
   - Distinct top **"Definition"** card displaying primary definition file path, line numbers, and readable AST type badge (`FunctionDecl`, `StructDecl`, `EnumConstant`, `CPPro_define_macro`), with direct 1-click jump-to-code navigation.
-  - Categorized **"References & Usages"** list showing caller context, file paths, line numbers, and readable reference type badges (`Call`, `MemberRef`, `TypeUsage`, `DeclRef`, `MacroExp`).
+  - Categorized **"References & Usages"** list showing caller context (enclosing function), file paths in the current revision, line numbers, and readable reference type badges (`Call`, `MemberRef`, `TypeUsage`, `DeclRef`, `MacroExp`).
   - Purely displays indexed cross-references without non-functional search fallback buttons.
 - **Include Symbols Inspection**:
   - Clicking or right-clicking `#include` directives provides an **"Inspect Included Symbols"** (`🔍`) action.

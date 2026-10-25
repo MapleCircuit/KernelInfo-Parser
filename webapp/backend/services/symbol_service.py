@@ -392,20 +392,25 @@ class SymbolService:
             if ast_ids:
                 # Key-first form of `m_symbol_ref WHERE ast_id IN (...)` (the view itself takes seconds per target)
                 refs_sql, repeat = rows_of_targets_sql("m_symbol_ref", len(ast_ids))
-                query_sql = f"""
-                    SELECT r.role, r.line, r.char_s, fn.fname, r.blob_id AS fid, r.tag_id
+                # The referencing file is the path of r.blob_id in this revision (target_fnid is the target's file);
+                # the caller is the AST of the tag the reference sits in
+                cursor.execute(
+                    f"""
+                    SELECT r.role, r.line, r.char_s, r.blob_id AS fid, r.tag_id, a.name AS caller
                     FROM ({refs_sql}) r
-                    LEFT JOIN m_file_name fn ON r.target_fnid = fn.fnid
-                    ORDER BY fn.fname ASC, r.line ASC
-                """
-                params: list[Any] = list(ast_ids) * repeat
+                    LEFT JOIN m_tag t ON r.tag_id = t.tag_id
+                    LEFT JOIN m_ast a ON a.ast_id = t.ast_id;
+                    """,
+                    list(ast_ids) * repeat,
+                )
+                ref_rows = [
+                    {**r, "fname": best_path(blob_paths[r["fid"]], srcarch, bits)}
+                    for r in cursor.fetchall()
+                    if r["fid"] in blob_paths
+                ]
+                ref_rows.sort(key=lambda r: (r["fname"], r["line"] or 0, r["char_s"] or 0))
                 if limit and limit > 0:
-                    query_sql += " LIMIT %s;"
-                    params.append(limit)
-                else:
-                    query_sql += ";"
-                cursor.execute(query_sql, params)
-                ref_rows = cursor.fetchall()
+                    ref_rows = ref_rows[:limit]
 
             role_map = {
                 1: ("declarations", "Decl"),
@@ -427,7 +432,8 @@ class SymbolService:
             for r in ref_rows:
                 category, role_type = role_map.get(r["role"], ("decl_refs", "Ref"))
                 item = {
-                    "file": safe_decode(r["fname"]),
+                    "file": r["fname"],
+                    "caller": safe_decode(r["caller"]) if r["caller"] else None,
                     "fid": r["fid"],
                     "line": r["line"],
                     "char_s": r["char_s"],
