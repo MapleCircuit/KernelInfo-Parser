@@ -23,7 +23,7 @@ from typing import Any
 
 from fastapi import HTTPException
 
-from parser.kbuild_conditions import KbuildConditionResolver
+from parser.kbuild_conditions import KbuildConditionResolver, is_other_arch_path
 from parser.kbuild_parser import KbuildParser
 from parser.kconfig_ast.kconfig_eval import KconfigEvaluator, escape_string, solve
 from parser.kconfig_ast.kconfig_preprocess import KconfigPreprocessor
@@ -606,8 +606,8 @@ class KconfigService:
                         "compile_mode": {1: "built-in", 2: "module", 3: "conditional"}.get(b.compile_mode, "conditional"),
                     })
             _USAGE_CACHE[key] = rules
-        own = f"arch/{srcarch}/"
-        return [dict(r, other_arch=r["path"].startswith("arch/") and not r["path"].startswith(own)) for r in rules]
+        trees = self._arch_trees(rev, info["arch"])
+        return [dict(r, other_arch=is_other_arch_path(r["path"], srcarch, trees)) for r in rules]
 
     def _compiled_files(self, kbuild: list[dict[str, Any]], name: str, version_name: str) -> list[dict[str, Any]]:
         files: dict[str, dict[str, Any]] = {}
@@ -648,6 +648,14 @@ class KconfigService:
             _USAGE_CACHE[key] = {re.split(r'[/"<]', line.strip().rstrip('">'))[-1] for line in out.splitlines() if line.strip()}
         return _USAGE_CACHE[key]
 
+    @staticmethod
+    def _arch_trees(rev: str, arch: str) -> set[str] | None:
+        """Architecture trees of the ARCH's build layout (None: fall back to own_arch_dirs)."""
+        from webapp.backend.services.arch_layout_service import arch_layout_service
+
+        layout = arch_layout_service.layout(rev, arch)
+        return layout.arch_trees() if layout else None
+
     def _build_resolver(self, version_name: str, arch: str) -> tuple[KbuildConditionResolver, dict[str, Any]]:
         info = self.resolve_arch(version_name, arch)
         rev = info["rev"]
@@ -658,7 +666,7 @@ class KconfigService:
                 paths = self._all_paths(rev)
                 entry = KbuildConditionResolver(
                     lambda p: self._read(rev, p) if p in paths else None, paths.__contains__,
-                    info["arch"], info["srcarch"], self._included_sources(rev),
+                    info["arch"], info["srcarch"], self._included_sources(rev), self._arch_trees(rev, info["arch"]),
                 )
                 if len(_BUILD_RESOLVERS) >= _BUILD_RESOLVER_CACHE_SIZE:
                     dict.pop(_BUILD_RESOLVERS, next(iter(_BUILD_RESOLVERS)))  # oldest (keys are repo-scoped)
@@ -694,8 +702,8 @@ class KconfigService:
                     refs.append({"file_path": parts[1], "line": int(parts[2]), "text": parts[3].strip()[:200]})
             _USAGE_CACHE[key] = refs
         refs = _USAGE_CACHE[key]
-        own = f"arch/{srcarch}/"
-        sources = [dict(r, other_arch=r["file_path"].startswith("arch/") and not r["file_path"].startswith(own)) for r in refs]
+        trees = self._arch_trees(rev, entry.arch["arch"])
+        sources = [dict(r, other_arch=is_other_arch_path(r["file_path"], srcarch, trees)) for r in refs]
         return {
             "version": version_name,
             "arch": entry.arch["arch"],

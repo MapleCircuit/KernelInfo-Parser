@@ -34,6 +34,8 @@ INGEST_DONE = 2
 _STATIC_TABLES = {"m_type_descriptor", "m_project", "m_git_network", "m_repository", "m_git_ref"}
 # Tables referencing blobs from a commit's point of view (rows of other versions point at the blob too)
 _COMMIT_SCOPED = {"m_bridge_checkpoint", "m_commit_file", "m_bridge_commit_tag", "m_blob_transition"}
+# Rows describing the version's head commit itself (written by the run, whatever the commit's id)
+_VERSION_ROWS = ("m_bridge_checkpoint", "m_arch_root")
 _DELETE_CHUNK = 50_000
 _IN_CHUNK = 1000
 
@@ -144,12 +146,12 @@ def rollback_plan(tables: Sequence[Any], marks: dict[str, int], commit_id: int, 
     Args:
         tables: the schema (core.DBLayout.TABLES).
         marks: table name -> highest id before the run (m_ingest_watermark).
-        commit_id: head commit of the interrupted version (its checkpoint rows are removed).
+        commit_id: head commit of the interrupted version (its checkpoint and arch layout rows are removed).
         blob_ids: blobs that existed before the run but were parsed by it (m_ingest_blob).
     """
     by_name = {t.table_name: t for t in tables}
     children = _children(tables)
-    plan: list[Delete] = [Delete("m_bridge_checkpoint", "commit_id = %s", (commit_id,))]
+    plan: list[Delete] = [Delete(name, "commit_id = %s", (commit_id,)) for name in _VERSION_ROWS]
 
     # 1. Rows derived from pre-existing blobs the run parsed (and the rows hanging off them)
     blobs = sorted(set(blob_ids))

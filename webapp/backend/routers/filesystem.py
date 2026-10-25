@@ -59,9 +59,10 @@ def resolve_include(
     header: str = Query(...),
     ast_id: int | None = Query(None),
     current_file: str | None = Query(None),
+    arch: str | None = Query(None, description="ARCH whose build layout resolves the include (default x86_64)"),
 ) -> dict[str, Any]:
     """Resolve an #include header directive into an authoritative git repo file path."""
-    return fs_service.resolve_include(version, header, ast_id, current_file)
+    return fs_service.resolve_include(version, header, ast_id, current_file, arch)
 
 
 @router.get("/fs/treemap/{version_name}")

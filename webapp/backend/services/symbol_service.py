@@ -9,6 +9,8 @@ from webapp.backend.database.helpers import (
     get_version_info,
 )
 from webapp.backend.security.sql import sanitize_like_query
+from parser.include_graph import include_chain
+from webapp.backend.services.arch_layout_service import arch_layout_service
 from webapp.backend.services.tree_resolver import (
     DEFAULT_DEFINITION_ARCH,
     best_path,
@@ -138,11 +140,36 @@ class SymbolService:
                         break
             return names
 
-    def get_symbol_detail(self, version_name: str, name: str, arch: str = DEFAULT_DEFINITION_ARCH) -> dict[str, Any]:
+    @staticmethod
+    def _prefer_reachable(rows: list[dict[str, Any]], blob_paths: dict[int, list[str]], rev: str, arch_id: str,
+                          from_file: str, scope: Any, bits: int | None) -> list[str]:
+        """Put first the definitions the compilation of `from_file` reaches through its #include chain for
+        ARCH=<arch_id> (arch_layout_service.reachable); prototypes stay last and weak definitions after
+        strong ones. Marks rows `visible` and returns the include chain of the first row ([] if unreached)."""
+        reached = arch_layout_service.reachable(rev, arch_id, from_file)
+        if not reached:
+            return []
+        for r in rows:
+            hit = next((p for p in blob_paths.get(r["fid"]) or () if p in reached), None)
+            r["visible"] = hit is not None
+            if hit:
+                r["fname"] = hit
+
+        def key(r: dict[str, Any]) -> tuple:
+            proto, group, bits_penalty, link_rank, path, line = definition_rank(r["fname"], r.get("linkage"), r["line_s"], scope, bits)
+            return (proto, 1 if link_rank == 1 else 0, 0 if r["visible"] else 1, group, bits_penalty, link_rank, path, line)
+
+        rows.sort(key=key)
+        return include_chain(reached, rows[0]["fname"]) if rows and rows[0]["visible"] else []
+
+    def get_symbol_detail(self, version_name: str, name: str, arch: str = DEFAULT_DEFINITION_ARCH,
+                          from_file: str | None = None) -> dict[str, Any]:
         """Retrieve full definition, declarations, and usages of a symbol.
 
-        Among several definitions the one for `arch` wins (see `definition_rank`); Kconfig symbols are
-        looked up in that ARCH's model. `definitions` lists every in-tree definition in rank order.
+        Among several definitions the one for `arch` wins (see `definition_rank`); with `from_file` (the
+        file the symbol is used in), the definitions its #include chain reaches for that ARCH come first
+        (`_prefer_reachable`). Kconfig symbols are looked up in that ARCH's model. `definitions` lists
+        every in-tree definition in rank order.
         """
         with get_db_cursor() as cursor:
             _, vname, blob_paths = self._scope(cursor, version_name)
@@ -205,6 +232,7 @@ class SymbolService:
             for r in in_tree:
                 r["fname"] = best_path(blob_paths[r["fid"]], srcarch, bits)
             in_tree.sort(key=lambda r: definition_rank(r["fname"], r.get("linkage"), r["line_s"], srcarch, bits))
+            chain = self._prefer_reachable(in_tree, blob_paths, vname, arch_id, from_file, srcarch, bits) if from_file and in_tree else []
             s_row = in_tree[0] if in_tree else (def_rows[0] if def_rows else None)
             if s_row is not None and not in_tree:
                 s_row["fname"] = None
@@ -281,10 +309,13 @@ class SymbolService:
                         "type_name": format_symbol_type(safe_decode(r["type_name"])),
                         "ast_id": r["ast_id"],
                         "linkage": r.get("linkage"),
+                        "visible": r.get("visible"),
                     }
                     for r in in_tree[:50]
                 ],
                 "arch": arch_id,
+                "from_file": from_file,
+                "include_chain": chain,
                 "declarations": xref_data.get("declarations", []),
                 "usages": xref_data.get("usages", {}),
                 "xrefs": xref_data.get("usages", {}),

@@ -2,7 +2,8 @@
  * definition_picker.js - Choose which of several per-architecture definitions "Go to Definition" opens.
  *
  * The backend ranks a symbol's definitions for the ARCH of `state.definitionContext()` (the KConfig
- * engine's ARCH while it is on with a resolved configuration, else x86_64). Among the leading candidate
+ * engine's ARCH while it is on with a resolved configuration, else x86_64), putting first those the
+ * file the symbol is used in reaches through its #include chain (`fromFile`). Among the leading candidate
  * files, the picker then skips definitions the configuration does not compile: files whose Kbuild
  * condition is "n" (GET /api/kconfig/{v}/build) and lines inside #if/#ifdef branches compiled out
  * (the same evaluation as #ifdef dimming, with the ARCH's compiler macros such as __x86_64__).
@@ -55,9 +56,9 @@ export async function pickConfiguredDefinition(version, defs, ctx = state.defini
 }
 
 /** getSymbolDetail() whose definition is the one the active configuration compiles. */
-export async function resolveDefinition(version, name) {
+export async function resolveDefinition(version, name, fromFile = null) {
   const ctx = state.definitionContext();
-  const detail = await api.getSymbolDetail(version, name, ctx.arch);
+  const detail = await api.getSymbolDetail(version, name, ctx.arch, fromFile);
   if (!detail || detail.is_kconfig || !Array.isArray(detail.definitions) || detail.definitions.length < 2) return detail;
   const pick = await pickConfiguredDefinition(version, detail.definitions, ctx);
   if (!pick || (pick.file === detail.file_path && pick.line_s === detail.line_s)) return detail;
@@ -71,9 +72,9 @@ export async function resolveDefinition(version, name) {
   };
 }
 
-/** Open the definition of `name` in a code tab; returns false when none was found. */
-export async function openDefinition(version, name, { forceNew = false } = {}) {
-  const detail = await resolveDefinition(version, name);
+/** Open the definition of `name` (used in `fromFile`, when known) in a code tab; false when none was found. */
+export async function openDefinition(version, name, { forceNew = false, fromFile = null } = {}) {
+  const detail = await resolveDefinition(version, name, fromFile);
   if (!detail || !detail.file_path) return false;
   state.openTab({
     type: "code",

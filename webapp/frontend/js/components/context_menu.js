@@ -214,7 +214,7 @@ class ContextMenu {
       this.openKconfigViewer(tokenName, v, options);
     } else {
       try {
-        if (await openDefinition(v, tokenName, { forceNew: options?.forceNew })) {
+        if (await openDefinition(v, tokenName, { forceNew: options?.forceNew, fromFile: tokenData.filePath })) {
           toast.success(`Jumped to definition of ${tokenName}`);
         } else {
           toast.info(`No definition found for ${tokenName}`);
@@ -323,7 +323,7 @@ class ContextMenu {
         shortcut: "F12",
         onClick: async () => {
           try {
-            if (await openDefinition(v, tokenName)) {
+            if (await openDefinition(v, tokenName, { fromFile: tokenData.filePath })) {
               toast.success(`Jumped to definition of ${tokenName}`);
             } else {
               toast.info(`No definition found for ${tokenName}`);
@@ -470,7 +470,7 @@ class ContextMenu {
           shortcut: "F12",
           onClick: async () => {
             try {
-              if (await openDefinition(v, token.name)) {
+              if (await openDefinition(v, token.name, { fromFile: filePath })) {
                 toast.success(`Jumped to definition of ${token.name}`);
               } else {
                 toast.info(`No definition found for ${token.name}`);

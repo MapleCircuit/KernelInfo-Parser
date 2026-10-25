@@ -87,6 +87,9 @@ def seeded() -> MemoryDB:
     db.add("m_blob_symbol_def", 1, 1, 1, 1, "schedule", 1, 0, 1, 5)
     db.add("m_blob_symbol_def", 12, 3, 1, 1, "schedule", 1, 0, 1, 5)
     db.add("m_ingest_state", 1, 10, I.INGEST_PARSING, 0)
+    db.add("m_arch_root", 5, "x86_64", 2, 0, "include/", "")
+    db.add("m_arch_root", 10, "x86_64", 2, 0, "include/", "")   # the interrupted version's layout
+    db.add("m_arch_root", 11, "x86_64", 2, 0, "include/", "")
     return db
 
 
@@ -128,6 +131,7 @@ class TestRollbackPlan(unittest.TestCase):
         self.assertEqual(rows["m_ast_hash"], [])
         # The version's checkpoint and the re-parsed blob's partial rows too
         self.assertEqual([r["commit_id"] for r in rows["m_bridge_checkpoint"]], [5])
+        self.assertEqual([r["commit_id"] for r in rows["m_arch_root"]], [5])
         self.assertEqual([r["blob_id"] for r in rows["m_bridge_tag"]], [1])
         self.assertEqual(rows["m_symbol_own"], [])
         self.assertEqual([r["def_id"] for r in rows["m_blob_symbol_def"]], [1])

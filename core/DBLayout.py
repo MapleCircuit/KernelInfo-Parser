@@ -3,7 +3,7 @@
 ===============================================================================
 RELATIONAL DATABASE SCHEMA REFERENCE GUIDE FOR GIT DAG & CONTENT-ADDRESSABLE ARCH
 ===============================================================================
-This module defines the 45 core relational database tables used across the parser
+This module defines the 48 core relational database tables used across the parser
 pipeline (`Table_Array` / `TABLES`).
 
 SCHEMA ENTITY-RELATIONSHIP GRAPH:
@@ -21,7 +21,8 @@ SCHEMA ENTITY-RELATIONSHIP GRAPH:
      ├── m_bridge_checkpoint (commit_id, fnid, blob_id)
      ├── m_ingest_state (network_id, commit_id, status, updated_at)
      ├── m_ingest_watermark (commit_id, marked_table_id, max_id)
-     └── m_ingest_blob (commit_id, blob_id)
+     ├── m_ingest_blob (commit_id, blob_id)
+     └── m_arch_root (commit_id, arch, role, priority, path, target)   -- build layout per ARCH
 
 3. Universal Content-Addressable Stores:
    m_file_name (fnid, fname)
@@ -1231,6 +1232,33 @@ m_ingest_blob = Table(
 )
 
 # -----------------------------------------------------------------------------
+# 47. m_arch_root (table_id=47): Build Layout of Each ARCH at a Version
+#     What `make ARCH=<arch>` uses at the version's head commit, evaluated from its Makefiles by
+#     parser/arch_layout.py: role 1 source directory, 2 include directory (priority = -I order),
+#     3 symlink the build creates (path -> target), 4 generated asm-generic wrapper (path -> the
+#     header it includes), 5 forced -include file. Directories end with "/".
+# -----------------------------------------------------------------------------
+m_arch_root = Table(
+    table_id=47,
+    table_name="m_arch_root",
+    columns=(
+        ("commit_id", "INT", "NOT NULL"),
+        ("arch", "VARCHAR(32)", "NOT NULL", "COLLATE utf8mb4_bin"),
+        ("role", "TINYINT", "UNSIGNED", "NOT NULL"),
+        ("priority", "SMALLINT", "UNSIGNED", "NOT NULL"),
+        ("path", "VARCHAR(255)", "NOT NULL", "COLLATE utf8mb4_bin"),
+        ("target", "VARCHAR(255)", "DEFAULT ''", "COLLATE utf8mb4_bin"),
+    ),
+    primary=("commit_id", "arch", "role", "path"),
+    foreign=(("commit_id", "m_commit", "commit_id"),),
+    initial_insert=None,
+    no_duplicate=False,
+    te_cached=False,
+    idempotent_pk=True,
+    hashing_table=False,
+)
+
+# -----------------------------------------------------------------------------
 # Exported Table Array tuple
 # -----------------------------------------------------------------------------
 TABLES: tuple[Table, ...] = (
@@ -1281,19 +1309,20 @@ TABLES: tuple[Table, ...] = (
     m_symbol_own,          # 44
     m_ingest_watermark,    # 45
     m_ingest_blob,         # 46
+    m_arch_root,           # 47
 )
 
 Table_Array = TABLES
 
 
 def init_db_layout(gp=None) -> tuple[Table, ...]:
-    """Initialize and populate gp.Table_Array with all 45 schema tables.
+    """Initialize and populate gp.Table_Array with all 48 schema tables.
 
     Args:
         gp: Optional GreatProcessor instance to attach Table_Array to.
 
     Returns:
-        Immutable tuple of all 45 Table schema objects.
+        Immutable tuple of all 48 Table schema objects.
     """
     if gp is not None:
         gp.Table_Array = list(TABLES)

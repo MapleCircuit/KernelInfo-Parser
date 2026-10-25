@@ -6,6 +6,7 @@ from unittest.mock import MagicMock
 
 from core.globalstuff import SymbolLinkage
 from webapp.backend.services.tree_resolver import (
+    ArchScope,
     GitTreeResolver,
     TreeResolverService,
     arch_bits,
@@ -199,6 +200,36 @@ class TestDefinitionRanking(unittest.TestCase):
             "arch/x86/include/asm/ptrace.h", "kernel/ptrace.c", "include/asm-generic/ptrace.h", "arch/alpha/include/asm/ptrace.h",
         ])
         self.assertEqual(self._order(defs, "alpha", 64)[0], "arch/alpha/include/asm/ptrace.h")
+
+    def test_include_asm_arch_headers_of_2_6_trees(self) -> None:
+        # v2.6.12: atomic_t per architecture in include/asm-<arch>/, ARCH=x86_64 builds from arch/x86_64/
+        defs = [(f"include/asm-{a}/atomic.h", SymbolLinkage.ExternalDef) for a in ("alpha", "arm", "i386", "x86_64")]
+        defs.append(("include/asm-generic/atomic.h", SymbolLinkage.ExternalDef))
+        self.assertEqual(self._order(defs, "x86_64", 64)[0], "include/asm-x86_64/atomic.h")
+        self.assertEqual(self._order(defs, "i386", 32)[0], "include/asm-i386/atomic.h")
+        self.assertEqual(self._order(defs, "x86_64", 64)[1], "include/asm-generic/atomic.h")
+        self.assertEqual(self._order(defs, "um", None)[0], "include/asm-x86_64/atomic.h")
+        # 2.6.24-2.6.28: merged x86 headers in include/asm-x86/
+        defs = [("include/asm-x86/atomic_32.h", SymbolLinkage.ExternalDef), ("include/asm-x86/atomic_64.h", SymbolLinkage.ExternalDef),
+                ("include/asm-sparc/atomic.h", SymbolLinkage.ExternalDef)]
+        self.assertEqual(self._order(defs, "x86", 64), ["include/asm-x86/atomic_64.h", "include/asm-x86/atomic_32.h", "include/asm-sparc/atomic.h"])
+
+    def test_build_layout_scope(self) -> None:
+        """An ArchScope from the build layout: its trees and the asm-generic headers its wrappers include."""
+        from parser.arch_layout import ArchLayout
+
+        layout = ArchLayout("x86_64", "x86", sources=["arch/x86/"], includes=["arch/x86/include/", "include/"],
+                            wrappers={"arch/x86/include/generated/asm/bug.h": "include/asm-generic/bug.h"})
+        scope = ArchScope.from_layout(layout)
+        defs = [("include/linux/bug.h", SymbolLinkage.ExternalDef), ("include/asm-generic/bug.h", SymbolLinkage.ExternalDef),
+                ("arch/arm/include/asm/bug.h", SymbolLinkage.ExternalDef)]
+        # The wrapper's header is the architecture's own; another asm-generic header is not
+        self.assertEqual(self._order(defs, scope, 64), ["include/asm-generic/bug.h", "include/linux/bug.h", "arch/arm/include/asm/bug.h"])
+        self.assertEqual(path_arch_group("include/asm-generic/atomic.h", scope), 2)
+        # m68knommu (2.6.29-2.6.37): headers from arch/m68k/ through hdr-arch
+        nommu = ArchScope.from_layout(ArchLayout("m68knommu", "m68knommu", sources=["arch/m68knommu/"], includes=["include/", "arch/m68k/include/"]))
+        self.assertEqual(path_arch_group("arch/m68k/include/asm/atomic.h", nommu), 0)
+        self.assertEqual(path_arch_group("arch/m68k/include/asm/atomic.h", "m68knommu"), 3)  # the SRCARCH-only fallback
 
     def test_word_size_and_linkage(self) -> None:
         defs = [

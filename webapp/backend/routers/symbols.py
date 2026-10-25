@@ -44,9 +44,14 @@ def lookup_symbols(
 
 @router.get("/version/{version_name}/symbol/{symbol_name}")
 @router.get("/symbols/{version_name}/detail/{symbol_name}")
-def get_symbol_detail(version_name: str, symbol_name: str, arch: ArchParam = DEFAULT_DEFINITION_ARCH) -> dict[str, Any]:
+def get_symbol_detail(
+    version_name: str,
+    symbol_name: str,
+    arch: ArchParam = DEFAULT_DEFINITION_ARCH,
+    from_file: Annotated[str | None, Query(description="File the symbol is used in: definitions its #include chain reaches win")] = None,
+) -> dict[str, Any]:
     """Get authoritative definition and usage overview for a symbol."""
-    return symbol_service.get_symbol_detail(version_name, symbol_name, arch)
+    return symbol_service.get_symbol_detail(version_name, symbol_name, arch, from_file)
 
 
 @router.get("/version/{version_name}/xref/{symbol_name}")

@@ -790,10 +790,17 @@ class FilesystemService:
         header: str,
         ast_id: int | None = None,
         current_file: str | None = None,
+        arch: str | None = None,
     ) -> dict[str, Any]:
-        """Resolve an #include header directive into an authoritative git repo file path."""
+        """Resolve an #include header directive into an authoritative git repo file path.
+
+        The ARCH's build layout decides first (the compiler's search: the including file's directory for
+        quoted names, the -I directories, build-time symlinks and generated wrappers; see
+        arch_layout_service.resolve_include); the database and search-path heuristics are fallbacks.
+        """
         import re
 
+        quoted = '"' in header or "<" not in header
         clean_header = header.strip()
         # Strip #include prefix if present
         if clean_header.startswith("#"):
@@ -805,7 +812,7 @@ class FilesystemService:
         if not clean_header:
             raise HTTPException(status_code=400, detail="Empty header specified.")
 
-        cache_key = (version_name, clean_header, current_file)
+        cache_key = (version_name, clean_header, current_file, arch, quoted)
         if cache_key in _INCLUDE_CACHE:
             return _INCLUDE_CACHE[cache_key]
 
@@ -813,6 +820,17 @@ class FilesystemService:
             vid, vname = get_version_info(cursor, version_name)
             if vid is None:
                 raise HTTPException(status_code=404, detail=f"Version '{version_name}' not found.")
+
+            # 0. The compiler's search for the ARCH's build layout
+            from webapp.backend.services.arch_layout_service import arch_layout_service
+            from webapp.backend.services.tree_resolver import definition_arch
+
+            arch_id = definition_arch(vname or version_name, arch)[0]
+            path = arch_layout_service.resolve_include(vname or version_name, arch_id, clean_header, current_file, quoted)
+            if path:
+                res = {"header": clean_header, "path": path, "resolved": True, "method": "build_layout", "arch": arch_id}
+                _INCLUDE_CACHE[cache_key] = res
+                return res
 
             # 1. Check compiler-verified m_file_reference if current_file is provided
             if current_file:

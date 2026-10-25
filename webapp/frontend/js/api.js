@@ -283,15 +283,16 @@ class ApiClient {
     return this.request(`/api/commits/${encodeURIComponent(ver)}/blame/${encodeURIComponent(path)}`, {}, "files", `blame_${this._vk(ver)}_${path}`);
   }
 
-  async resolveInclude(version, header, astId = null, currentFile = null) {
+  async resolveInclude(version, header, astId = null, currentFile = null, arch = state.definitionContext().arch) {
     const ver = this._sanitizeVer(version);
     const params = new URLSearchParams({
       version: ver,
       header: header || "",
+      arch,
     });
     if (astId) params.set("ast_id", astId);
     if (currentFile) params.set("current_file", currentFile);
-    const cacheKey = `inc_res_${this._vk(ver)}_${header || ''}_${astId || 0}_${currentFile || ''}`;
+    const cacheKey = `inc_res2_${this._vk(ver)}_${arch}_${header || ''}_${astId || 0}_${currentFile || ''}`;
     return this.request(`/api/fs/resolve_include?${params.toString()}`, {}, "files", cacheKey);
   }
 
@@ -329,10 +330,12 @@ class ApiClient {
   }
 
   /** Definition of a symbol; per-architecture definitions are ranked for `arch` (the KConfig engine's ARCH). */
-  async getSymbolDetail(version, symbolName, arch = state.definitionContext().arch) {
+  /** `fromFile`: the file the symbol is used in; definitions its #include chain reaches win. */
+  async getSymbolDetail(version, symbolName, arch = state.definitionContext().arch, fromFile = null) {
     const ver = this._sanitizeVer(version);
-    const q = new URLSearchParams({ arch }).toString();
-    return this.request(`/api/symbols/${encodeURIComponent(ver)}/detail/${encodeURIComponent(symbolName)}?${q}`, {}, "symbols", `sym2_${this._vk(ver)}_${arch}_${symbolName}`);
+    const params = new URLSearchParams({ arch });
+    if (fromFile) params.set("from_file", fromFile);
+    return this.request(`/api/symbols/${encodeURIComponent(ver)}/detail/${encodeURIComponent(symbolName)}?${params}`, {}, "symbols", `sym2_${this._vk(ver)}_${arch}_${symbolName}${fromFile ? `_from_${fromFile}` : ""}`);
   }
 
   async getSymbolXref(version, symbolName, limit = null, arch = state.definitionContext().arch) {

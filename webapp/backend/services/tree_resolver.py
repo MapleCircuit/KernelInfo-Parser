@@ -8,9 +8,11 @@ Implements:
    - Path C: Git-native full-tree listing (`git ls-tree -r`, LRU cached per commit SHA) for any revision,
      annotated with m_file_blob metadata through the content-addressed blob_hash.
 3. Definition ranking (`definition_rank`, `best_path`):
-   - Orders a symbol's definitions for one ARCH: arch/<srcarch>/ first, then generic code,
-     include/asm-generic/, other architectures; files of the other word size and weak definitions
-     after the rest, prototypes last.
+   - Orders a symbol's definitions for one ARCH: the architecture trees its build layout uses
+     (`ArchScope`, from parser/arch_layout.py: arch/x86/ for x86_64 at v3.0, include/asm-x86_64/ at
+     v2.6.12) and the asm-generic headers it takes through generated wrappers first, then generic
+     code, include/asm-generic/, other architectures; files of the other word size and weak
+     definitions after the rest, prototypes last.
 """
 from __future__ import annotations
 
@@ -22,10 +24,13 @@ import threading
 import time
 from collections import OrderedDict
 from collections.abc import Iterable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from core.globalstuff import SymbolLinkage
+from parser.arch_layout import ArchLayout, path_arch
+from parser.kbuild_conditions import own_arch_dirs
 from webapp.backend.config import get_repo_dir
 from webapp.backend.database.pool import get_db_cursor
 from webapp.backend.database.helpers import hash_hex, safe_decode
@@ -486,17 +491,36 @@ def arch_bits(arch: str) -> int | None:
     return None
 
 
-def own_arch_dirs(srcarch: str) -> set[str]:
-    """arch/ directories built for a source architecture (ARCH=um also builds the host's x86 sources)."""
-    return {srcarch} | ({"x86"} if srcarch == "um" else set())
+@dataclass(frozen=True)
+class ArchScope:
+    """What one ARCH uses at one revision, for ranking: its architecture trees (path_arch names) and the
+    asm-generic headers its generated wrappers include."""
+    srcarch: str
+    trees: frozenset[str]
+    headers: frozenset[str] = frozenset()
+
+    @classmethod
+    def of(cls, scope: ArchScope | str) -> ArchScope:
+        """The scope itself, or the fallback scope of a bare SRCARCH (own_arch_dirs)."""
+        if isinstance(scope, ArchScope):
+            return scope
+        return cls(scope, frozenset(own_arch_dirs(scope)))
+
+    @classmethod
+    def from_layout(cls, layout: ArchLayout) -> ArchScope:
+        return cls(layout.srcarch, frozenset(layout.arch_trees()), frozenset(layout.generic_headers()))
 
 
-def path_arch_group(path: str, srcarch: str) -> int:
-    """ARCH_OWN for arch/<srcarch>/, ARCH_OTHER for other arch/ trees, ARCH_ASM_GENERIC, else ARCH_GENERIC."""
-    parts = (path or "").split("/")
-    if len(parts) > 2 and parts[0] == "arch":
-        return ARCH_OWN if parts[1] in own_arch_dirs(srcarch) else ARCH_OTHER
-    if path.startswith("include/asm-generic/"):
+def path_arch_group(path: str, scope: ArchScope | str) -> int:
+    """ARCH_OWN for the ARCH's architecture trees and the asm-generic headers it uses, ARCH_OTHER for other
+    architecture trees, ARCH_ASM_GENERIC for the other asm-generic headers, else ARCH_GENERIC."""
+    scope = ArchScope.of(scope)
+    if path in scope.headers:
+        return ARCH_OWN
+    arch = path_arch(path)
+    if arch is not None:
+        return ARCH_OWN if arch in scope.trees else ARCH_OTHER
+    if path.startswith(("include/asm-generic/", "include/uapi/asm-generic/")):
         return ARCH_ASM_GENERIC
     return ARCH_GENERIC
 
@@ -510,19 +534,19 @@ def _bits_penalty(path: str, bits: int | None) -> int:
     return 1 if re.search(rf"(?:^|[_-]){other}(?:$|[_-])", stem) else 0
 
 
-def path_rank(path: str | None, srcarch: str, bits: int | None) -> tuple[int, int, str]:
+def path_rank(path: str | None, srcarch: ArchScope | str, bits: int | None) -> tuple[int, int, str]:
     """Sort key of a definition's path: own arch, generic, asm-generic, other arches; right word size first."""
     if not path:
         return (ARCH_OTHER + 1, 0, "")
     return (path_arch_group(path, srcarch), _bits_penalty(path, bits), path)
 
 
-def best_path(paths: list[str] | None, srcarch: str, bits: int | None) -> str | None:
+def best_path(paths: list[str] | None, srcarch: ArchScope | str, bits: int | None) -> str | None:
     """The best-ranked of the paths a blob sits at."""
     return min(paths, key=lambda p: path_rank(p, srcarch, bits)) if paths else None
 
 
-def definition_rank(path: str | None, linkage: Any, line_s: int | None, srcarch: str, bits: int | None) -> tuple:
+def definition_rank(path: str | None, linkage: Any, line_s: int | None, srcarch: ArchScope | str, bits: int | None) -> tuple:
     """Sort key of a symbol definition: real definitions before weak ones and prototypes, then by path."""
     try:
         link_rank = _LINKAGE_RANK.get(SymbolLinkage(int(linkage)), 0)
@@ -534,14 +558,22 @@ def definition_rank(path: str | None, linkage: Any, line_s: int | None, srcarch:
 DEFAULT_DEFINITION_ARCH = "x86_64"
 
 
-def definition_arch(version_name: str, arch: str | None) -> tuple[str, str, int | None]:
-    """(ARCH, SRCARCH, word size) used to rank definitions; unknown ARCH values fall back to x86_64."""
+def definition_arch(version_name: str, arch: str | None) -> tuple[str, ArchScope, int | None]:
+    """(ARCH, ArchScope, word size) used to rank definitions; unknown ARCH values fall back to x86_64.
+
+    The scope comes from the ARCH's build layout at the revision (webapp/backend/services/
+    arch_layout_service.py); without one, the SRCARCH's own_arch_dirs are assumed.
+    """
+    from webapp.backend.services.arch_layout_service import arch_layout_service
     from webapp.backend.services.kconfig_service import KconfigService
 
     for candidate in (arch or DEFAULT_DEFINITION_ARCH, DEFAULT_DEFINITION_ARCH):
         try:
             info = KconfigService().resolve_arch(version_name, candidate)
-            return info["arch"], info["srcarch"], arch_bits(info["arch"])
         except Exception as exc:
             logger.debug("ARCH %s not resolvable at %s: %s", candidate, version_name, exc)
-    return DEFAULT_DEFINITION_ARCH, "x86", 64
+            continue
+        layout = arch_layout_service.layout(info["rev"], info["arch"])
+        scope = ArchScope.from_layout(layout) if layout else ArchScope.of(info["srcarch"])
+        return info["arch"], scope, arch_bits(info["arch"])
+    return DEFAULT_DEFINITION_ARCH, ArchScope.of("x86"), 64

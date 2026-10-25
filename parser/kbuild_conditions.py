@@ -28,9 +28,11 @@ from __future__ import annotations
 
 import os
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from typing import Any
+
+from parser.arch_layout import path_arch
 
 Expr = Any
 
@@ -537,6 +539,21 @@ def _list_selects(kind: str, gate: Expr, wanted: str) -> Expr:
     return UNKNOWN
 
 
+# ---------------------------------------------------------------------------- architecture trees
+def own_arch_dirs(srcarch: str) -> set[str]:
+    """Fallback for revisions without a build layout (parser/arch_layout.py): the architecture trees
+    ARCH=<srcarch> is assumed to use (ARCH=um also the host's x86 / x86_64 trees)."""
+    return {srcarch} | ({"x86", "x86_64"} if srcarch == "um" else set())
+
+
+def is_other_arch_path(path: str, srcarch: str, trees: Iterable[str] | None = None) -> bool:
+    """Whether `path` lies in the tree of an architecture the build does not use. `trees` are the
+    architecture trees of the ARCH's build layout (ArchLayout.arch_trees()); without them
+    `own_arch_dirs(srcarch)` is assumed."""
+    arch = path_arch(path)
+    return arch is not None and arch not in (set(trees) if trees is not None else own_arch_dirs(srcarch))
+
+
 # ---------------------------------------------------------------------------- whole tree
 class KbuildConditionResolver:
     """Build conditions of the files of one revision for one ARCH.
@@ -547,17 +564,18 @@ class KbuildConditionResolver:
         arch: ARCH value (e.g. "x86_64").
         srcarch: its source directory under arch/ (e.g. "x86").
         included_sources: basenames of .c/.S files some other file #includes (never reported as unbuilt).
+        arch_trees: architecture trees the ARCH's build layout uses (ArchLayout.arch_trees()); files of
+            other architecture trees are "other_arch". Defaults to own_arch_dirs(srcarch).
     """
 
     def __init__(self, read: Callable[[str], str | None], exists: Callable[[str], bool], arch: str, srcarch: str,
-                 included_sources: set[str] | None = None) -> None:
+                 included_sources: set[str] | None = None, arch_trees: Iterable[str] | None = None) -> None:
         self.read = read
         self.exists = exists
         self.arch = arch
         self.srcarch = srcarch
         self.included_sources = included_sources or set()
-        # ARCH=um builds the host architecture's sources too
-        self.own_arch_dirs = {srcarch} | ({"x86"} if srcarch == "um" else set())
+        self.arch_trees = set(arch_trees) if arch_trees is not None else own_arch_dirs(srcarch)
         self._files: dict[str, KbuildFile | None] = {}
         self._dir_conds: dict[str, tuple[Expr, list[Rule]]] = {}
         self._top: KbuildFile | None = None
@@ -617,8 +635,7 @@ class KbuildConditionResolver:
         return self._files[directory]
 
     def is_other_arch(self, path: str) -> bool:
-        parts = path.split("/")
-        return len(parts) > 2 and parts[0] == "arch" and parts[1] not in self.own_arch_dirs
+        return is_other_arch_path(path, self.srcarch, self.arch_trees)
 
     def _mentioned_at_top(self, directory: str) -> bool:
         self._top_file()
@@ -635,7 +652,7 @@ class KbuildConditionResolver:
         top = self._top_file()
         if not directory:
             result = (Y, [])
-        elif directory.startswith("arch/") and directory.split("/")[1] not in self.own_arch_dirs:
+        elif self.is_other_arch(directory + "/"):
             result = (N, [])
         elif directory in top.subdirs:
             rules = top.subdirs[directory]
@@ -670,7 +687,7 @@ class KbuildConditionResolver:
         path = path.strip("/")
         if self.is_other_arch(path):
             return {"status": "other_arch", "expr": N, "rules": [],
-                    "reason": f"arch/{path.split('/')[1]}/ is not built for ARCH={self.arch}"}
+                    "reason": f"{'/'.join(path.split('/')[:2])}/ is not built for ARCH={self.arch}"}
         stem, ext = os.path.splitext(path)
         if path.endswith(".lds.S"):
             stem, ext = path[: -len(".lds.S")] + ".lds", ".S"

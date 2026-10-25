@@ -111,6 +111,8 @@ import traceback
 import gc
 import ctypes
 from parser.c_ast import c_ast_parse, Line
+from parser.arch_layout import compute_layouts
+from parser.make_eval import Tree
 from core.FileHandler import MasterFile
 from core.GreatProcessor import GreatProcessor
 from core.TableHandling import Table, ChangeSet, is_data_unsafe
@@ -742,6 +744,14 @@ def update(version: str, repo_path: str | None = None) -> None:
     # -------------------------------------------------------------------------
     with G.measure_stage("Step 6.7: Maintainer Files Matching"):
         processing_maintainer_files(version)
+
+    # -------------------------------------------------------------------------
+    # STEP 6.8: Build layout of every ARCH from the version's Makefiles (m_arch_root)
+    # -------------------------------------------------------------------------
+    with G.measure_stage("Step 6.8: Architecture Build Layouts", units="rows") as layout_metric:
+        stored = processing_arch_layouts(version)
+        if layout_metric is not None:
+            layout_metric.count = stored
 
     if G.PROFILING_ENABLED and gp.ChangeSet_Dict:
         from core.Profiler import format_profiling_report
@@ -2802,6 +2812,8 @@ def arg_handling() -> argparse.Namespace:
             "tests.test_kconfig_ast",
             "tests.test_kconfig_engine",
             "tests.test_kbuild_conditions",
+            "tests.test_arch_layout",
+            "tests.test_include_graph",
             "tests.test_ingest_state",
             "tests.test_webapp_defconfig",
             "tests.test_webapp_maintainer",
@@ -4687,6 +4699,48 @@ def processing_maintainer_files(version: str) -> None:
                 matched_count += 1
 
     logger.info(f"Staged {matched_count} file-to-section mappings into m_maintainer_file for version '{version}'.")
+
+def processing_arch_layouts(version: str) -> int:
+    """Store what `make ARCH=<arch>` uses at this version for every ARCH value (parser/arch_layout.py):
+    source and include directories, build-time symlinks, generated asm-generic wrappers and forced
+    includes, evaluated from the version's own Makefiles. Returns the number of rows stored."""
+    if gp.VID == 0 or not getattr(gp, "file_blob_hashes", None):
+        return 0
+    tree = Tree(gp.file_blob_hashes)
+
+    def read(path: str) -> str | None:
+        try:
+            return MF.get_file(path, gp.Version_Name)
+        except (OSError, UnicodeDecodeError) as exc:
+            logger.debug(f"[Arch Layout] cannot read {path}: {exc}")
+            return None
+
+    started = time.perf_counter()
+    layouts = compute_layouts(tree, read)
+    rows = [
+        (gp.VID, r.arch, r.role, r.priority, r.path[:255], r.target[:255])
+        for layout in layouts.values() for r in layout.rows()
+    ]
+    with G.DB() as db:
+        cur = _raw_cursor(db)
+        if cur is None:
+            return 0
+        try:
+            cur.execute("DELETE FROM m_arch_root WHERE commit_id = %s", (gp.VID,))
+            for i in range(0, len(rows), 1000):
+                cur.executemany(
+                    "INSERT INTO m_arch_root (commit_id, arch, role, priority, path, target) VALUES (%s, %s, %s, %s, %s, %s) "
+                    "ON DUPLICATE KEY UPDATE priority = VALUES(priority), target = VALUES(target)",
+                    rows[i:i + 1000],
+                )
+            db.cnx.commit()
+        finally:
+            cur.close()
+    logger.info(
+        f"[Arch Layout] '{version}': {len(layouts)} ARCH values, {len(rows)} rows in {time.perf_counter() - started:.1f}s."
+    )
+    return len(rows)
+
 
 def execute_and_purge(cs_dict: dict) -> dict:
     """Execute non-foreign ChangeSets immediately and purge internal AST buffers to minimize RAM usage."""
