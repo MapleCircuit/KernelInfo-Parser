@@ -1,6 +1,6 @@
 # Linux Kconfig & Kbuild Subsystem API & Architectural Contract Specification (`kconfig_ast`)
 
-Authoritative architectural specification and relational staging reference for `parser/kconfig_ast/` ([kconfig_ast.py](parser/kconfig_ast/kconfig_ast.py), [kconfig_lexer.py](parser/kconfig_ast/kconfig_lexer.py), [kconfig_parser.py](parser/kconfig_ast/kconfig_parser.py), [kconfig_model.py](parser/kconfig_ast/kconfig_model.py), [kconfig_eval.py](parser/kconfig_ast/kconfig_eval.py)) and the associated build system parser [kbuild_parser.py](parser/kbuild_parser.py). Designed as an exhaustive reference for AI agents extending, maintaining, or querying the Linux kernel configuration and build dependency graph.
+Authoritative architectural specification and relational staging reference for `parser/kconfig_ast/` ([kconfig_ast.py](parser/kconfig_ast/kconfig_ast.py), [kconfig_lexer.py](parser/kconfig_ast/kconfig_lexer.py), [kconfig_parser.py](parser/kconfig_ast/kconfig_parser.py), [kconfig_model.py](parser/kconfig_ast/kconfig_model.py), [kconfig_eval.py](parser/kconfig_ast/kconfig_eval.py)) and the associated build system parsers [kbuild_parser.py](parser/kbuild_parser.py) and [kbuild_conditions.py](parser/kbuild_conditions.py). Designed as an exhaustive reference for AI agents extending, maintaining, or querying the Linux kernel configuration and build dependency graph.
 
 Two consumers share the lexer/parser:
 - **Database pipeline** (`kconfig_ast.py`): per-file AST, tags and relational rows (sections 1-4).
@@ -214,6 +214,22 @@ The Kbuild parser maps Kconfig configuration symbols to concrete C, ASM, and obj
 - `obj-$(subst m,y,$(CONFIG_X))` is attributed to `X`.
 - `lib-*` (relative to the Makefile) and the arch goal lists `core-*`, `drivers-*`, `libs-*`, `net-*`, `init-*`, `head-*` (relative to the source root) are parsed like `obj-*`.
 - `obj-$(CONFIG_X) += dir/` produces a binding with `is_directory=True` (`source_file_rel` = `dir/Makefile`): the whole sub-directory is built when `X` is enabled.
+
+### 6.4. Build Conditions (`kbuild_conditions.py`)
+[parser/kbuild_conditions.py](parser/kbuild_conditions.py) answers "is this file compiled by `make ARCH=<arch>` under a given `.config`?" for the webapp (`GET /api/kconfig/{v}/build`, the code view's *not compiled* banner, and Go to Definition; see `webapp/API.md`). `KbuildParser` only records which symbols a rule mentions; this module keeps the full condition:
+- **`KbuildConditionResolver(read, exists, arch, srcarch, included_sources)`** reads files of one revision through callbacks (no Git or database access of its own) and memoizes parsed Kbuild files and directory conditions.
+- **Top level**: the goal lists (`core-*`, `drivers-*`, `net-*`, `init-*`, `libs-*`, `head-*`) of the top `Makefile` and `arch/<srcarch>/Makefile`, plus the root `Kbuild` file of newer kernels (`obj-y += init/ usr/ arch/$(SRCARCH)/ ...`), name the top directories. Branches on make-internal variables (`mixed-targets`, `KBUILD_EXTMOD`...) are transparent there, so the goal lists of the regular build branch apply.
+- **Directories**: each directory's Kbuild file (`Kbuild` when present, else `Makefile`) descends with `obj-*/subdir-* += dir/` or (older kernels) `obj-* += dir/built-in.o`; a directory's condition is its rule AND its parent's condition.
+- **Objects**: `obj-*`, `lib-*`, `extra-*`, `head-y` and composite members (`foo-y`, `foo-objs`, `foo-$(CONFIG_X)` of an `obj-* += foo.o`), list references (`bonding-objs += $(proc-y)`: the members of `proc-$(CONFIG_PROC_FS)` when it is `y`), `$(addprefix dir/, ...)`, and `sub/obj.o` named by an ancestor directory. Sources are `.c`, `.S` (also `*.lds.S`) and `.rs`.
+- **Conditionals keep their polarity**: `ifeq`/`ifneq`/`ifdef`/`ifndef`/`else [if...]` become expressions (`ifeq ($(CONFIG_X86_32),y)` → `{"eq": [[{"val": "X86_32"}], ["y"]]}`, the `else` branch its negation), `define`/`endef` blocks are skipped.
+- **Variables**: simple assignments of the Kbuild file and the variables the arch Makefile `export`s (e.g. `BITS := 32`/`64` under `ifeq ($(CONFIG_X86_32),y)`) are expanded per alternative (at most 4), each alternative carrying its condition: `obj-y += process_$(BITS).o` names `process_32.o` when `X86_32` is `y` and `process_64.o` otherwise. `ARCH` and `SRCARCH` are known.
+- **Expressions** (JSON, evaluated client-side by `webapp/frontend/js/views/kconfig/build_condition.js`; `evaluate()` is the Python twin): `"y"`/`"m"`/`"n"`/`"?"`, `{"sym": X}`, `{"def": X}`, `{"eq": [a, b]}`, `{"not": e}`, `{"and": [...]}`, `{"or": [...]}` (multiple rules for one object are OR-ed), folded by `and_`/`or_`/`not_`. Evaluation is three-valued: `and` with a definite `n` is `n`, `or` with a definite `y`/`m` is that value, otherwise unknown propagates.
+- **`file_condition(path)`** returns `{status, expr, rules, reason}`:
+  - `other_arch`: under another architecture's `arch/` tree (ARCH=um also builds `arch/x86/`).
+  - `rule`: Kbuild rules name the object (`rules`: its rule, then the directory chain).
+  - `no_rule`: the directory is reachable, its Kbuild file is fully parsed and does not mention the object at all.
+  - `unknown`: everything the resolver cannot prove: headers and non-Kbuild files, directories built by their own make targets (named in the top/arch Makefile, e.g. `arch/x86/boot`, or mentioned only by custom rules of the parent, e.g. `aicasm/`), objects mentioned by custom rules or lists (vdso objects, `targets`), host/user programs (`hostprogs`, `always`, `subdir-*`), lists computed by `$(shell)`/`$(wildcard)`, unexpandable references, Makefiles `include`-ing other Makefiles, and sources another file `#include`s (`included_sources`). Unknown is never reported as unbuilt.
+- **Measured coverage** (x86_64 defconfig, `.c`/`.S` files): v3.0 resolves 1754 `y`, 3 `m`, 9164 `n`, 5703 other-arch, 22 `no_rule`, 785 unknown in ~4 s; v7.2 resolves all but ~6100 unknown, mostly `tools/`, `drivers/gpu/` (included sub-Makefiles), `samples/` and `arch/x86/boot`, in ~10 s (one full pass; the webapp only resolves requested files).
 
 ---
 

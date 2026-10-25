@@ -7,6 +7,7 @@ from typing import Any
 from fastapi import HTTPException
 from webapp.backend.database.pool import get_db_cursor
 from webapp.backend.database.helpers import (
+    hash_hex,
     safe_decode,
     format_stat_label,
     get_version_info,
@@ -437,13 +438,13 @@ class FilesystemService:
                 if not h_vname_s or h_vname_s == "default" or h_vid_s == 0:
                     c_h = hr.get("commit_hash")
                     if c_h:
-                        h_vname_s = bytes(c_h).hex()[:8] if isinstance(c_h, (bytes, bytearray, memoryview)) else str(c_h)[:8]
+                        h_vname_s = hash_hex(c_h)[:8]
                     else:
                         h_vname_s = vname
                 c_hash_hex = ""
                 if hr.get("commit_hash"):
                     c_h = hr["commit_hash"]
-                    c_hash_hex = bytes(c_h).hex() if isinstance(c_h, (bytes, bytearray, memoryview)) else str(c_h)
+                    c_hash_hex = hash_hex(c_h)
                 s_stat_val = safe_decode(hr.get("s_stat")) or "0"
                 history.append({
                     "fid": hr["fid"],

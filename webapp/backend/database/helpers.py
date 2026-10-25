@@ -14,6 +14,16 @@ STAT_LABEL_MAP: dict[str, str] = {
     "0": "Active",
 }
 
+# m_ingest_state.status of a version whose ingestion has not finished (core/ingest_state.py)
+INGEST_PARSING = 1
+
+
+def finished_ref_sql(alias: str = "r") -> str:
+    """SQL condition keeping refs whose ingestion finished (or predates m_ingest_state): a version still
+    being parsed, or left interrupted, is hidden until its run completes."""
+    return f"NOT EXISTS (SELECT 1 FROM m_ingest_state s WHERE s.commit_id = {alias}.commit_id AND s.status = {INGEST_PARSING})"
+
+
 _NAME_TO_VID_CACHE: dict[str, int] = RepoScopedCache()
 _VID_TO_NAME_CACHE: dict[int, str] = RepoScopedCache()
 
@@ -28,6 +38,22 @@ def safe_decode(val: Any) -> Any:
         except UnicodeDecodeError:
             return bytes(val).decode("latin-1", errors="replace")
     return val
+
+
+def hash_hex(val: Any) -> str:
+    """Hex string of a BINARY(20) hash column, "" for NULL.
+
+    mysql-connector can return a binary hash whose bytes happen to be valid UTF-8 as str; such a str
+    re-encodes to 20 bytes, while an already hex-formatted hash is left as is.
+    """
+    if val is None:
+        return ""
+    if isinstance(val, (bytes, bytearray, memoryview)):
+        return bytes(val).hex()
+    if isinstance(val, str):
+        raw = val.encode("utf-8")
+        return raw.hex() if len(raw) == 20 else val
+    return str(val)
 
 
 def format_stat_label(stat: str | None, is_end: bool = False) -> str:
@@ -66,7 +92,8 @@ def preload_version_cache(cursor: Any) -> None:
     _VID_TO_NAME_CACHE["__loaded__"] = True
     try:
         cursor.execute(
-            "SELECT commit_id, ref_name FROM m_git_ref WHERE commit_id > 0 AND repo_id = %s ORDER BY commit_id ASC;",
+            f"SELECT r.commit_id, r.ref_name FROM m_git_ref r WHERE r.commit_id > 0 AND r.repo_id = %s AND {finished_ref_sql()} "
+            "ORDER BY r.commit_id ASC;",
             (get_active_repo_id(cursor),),
         )
         rows = cursor.fetchall()
@@ -109,7 +136,7 @@ def get_version_info(cursor: Any, version_name_or_id: str | int) -> tuple[int | 
     try:
         if ver_str.isdigit():
             cursor.execute(
-                "SELECT commit_id AS vid, ref_name AS vname FROM m_git_ref WHERE commit_id = %s AND repo_id = %s LIMIT 1;",
+                f"SELECT r.commit_id AS vid, r.ref_name AS vname FROM m_git_ref r WHERE r.commit_id = %s AND r.repo_id = %s AND {finished_ref_sql()} LIMIT 1;",
                 (int(ver_str), get_active_repo_id(cursor)),
             )
             row = cursor.fetchone()
@@ -122,7 +149,7 @@ def get_version_info(cursor: Any, version_name_or_id: str | int) -> tuple[int | 
                 if c_row:
                     cid = c_row["vid"] if isinstance(c_row, dict) else c_row[0]
                     c_h = c_row["commit_hash"] if isinstance(c_row, dict) else c_row[1]
-                    hex_str = bytes(c_h).hex() if isinstance(c_h, (bytes, bytearray, memoryview)) else str(c_h)
+                    hex_str = hash_hex(c_h)
                     _NAME_TO_VID_CACHE[hex_str] = cid
                     _NAME_TO_VID_CACHE[str(cid)] = cid
                     if cid not in _VID_TO_NAME_CACHE:
@@ -130,7 +157,7 @@ def get_version_info(cursor: Any, version_name_or_id: str | int) -> tuple[int | 
                     return cid, hex_str
         else:
             cursor.execute(
-                "SELECT commit_id AS vid, ref_name AS vname FROM m_git_ref WHERE ref_name = %s AND repo_id = %s LIMIT 1;",
+                f"SELECT r.commit_id AS vid, r.ref_name AS vname FROM m_git_ref r WHERE r.ref_name = %s AND r.repo_id = %s AND {finished_ref_sql()} LIMIT 1;",
                 (ver_str, get_active_repo_id(cursor)),
             )
             row = cursor.fetchone()
@@ -166,7 +193,7 @@ def get_version_info(cursor: Any, version_name_or_id: str | int) -> tuple[int | 
             if c_row:
                 cid = c_row["commit_id"] if isinstance(c_row, dict) else c_row[0]
                 c_h = c_row["commit_hash"] if isinstance(c_row, dict) else c_row[1]
-                hex_str = bytes(c_h).hex() if isinstance(c_h, (bytes, bytearray, memoryview)) else str(c_h)
+                hex_str = hash_hex(c_h)
                 _NAME_TO_VID_CACHE[hex_str] = cid
                 _NAME_TO_VID_CACHE[ver_str] = cid
                 _NAME_TO_VID_CACHE[str(cid)] = cid

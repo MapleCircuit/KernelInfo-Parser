@@ -437,8 +437,8 @@ export class DiffView {
         e.stopPropagation();
         state.openTab({
           type: "kconfig",
-          title: "KConfig (x86)",
-          arch: "x86",
+          title: `KConfig (${state.kconfigArch()})`,
+          arch: state.kconfigArch(),
           version: sym.change === "removed" ? this.versionA : this.versionB,
           symbol: sym.name
         });

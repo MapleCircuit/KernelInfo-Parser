@@ -1,4 +1,4 @@
-"""webapp/backend/services/tree_resolver.py - Tri-Path TreeResolver & 6-Tier Symbol Disambiguation.
+"""webapp/backend/services/tree_resolver.py - Tri-Path TreeResolver & Arch-Aware Definition Ranking.
 
 Implements:
 1. TreeResolverService:
@@ -7,60 +7,30 @@ Implements:
 2. GitTreeResolver:
    - Path C: Git-native full-tree listing (`git ls-tree -r`, LRU cached per commit SHA) for any revision,
      annotated with m_file_blob metadata through the content-addressed blob_hash.
-3. DisambiguationEngine:
-   - 6-Tier deterministic probability scoring for multi-declaration symbol resolution.
+3. Definition ranking (`definition_rank`, `best_path`):
+   - Orders a symbol's definitions for one ARCH: arch/<srcarch>/ first, then generic code,
+     include/asm-generic/, other architectures; files of the other word size and weak definitions
+     after the rest, prototypes last.
 """
 from __future__ import annotations
 
 import logging
 import os
+import re
 import subprocess
 import threading
 import time
 from collections import OrderedDict
 from collections.abc import Iterable
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from core.globalstuff import SymbolLinkage, SymbolRole
+from core.globalstuff import SymbolLinkage
 from webapp.backend.config import get_repo_dir
 from webapp.backend.database.pool import get_db_cursor
-from webapp.backend.database.helpers import safe_decode
+from webapp.backend.database.helpers import hash_hex, safe_decode
 
 logger = logging.getLogger(__name__)
-
-
-@dataclass
-class SymbolRefContext:
-    """Context of a symbol reference query to be disambiguated."""
-    name: str
-    source_fnid: int
-    source_blob_id: int
-    ref_ast_id: int
-    target_fnid: int | None = None
-    role: SymbolRole = SymbolRole.Call
-    source_path: str = ""
-    target_arch: str = ""
-    kbuild_target_obj: str = ""
-    kbuild_kcid: int = 0
-
-
-@dataclass
-class SymbolDefCandidate:
-    """A candidate symbol definition matching name/type."""
-    def_id: int
-    blob_id: int
-    fnid: int
-    file_path: str
-    name: str
-    type_id: int
-    ast_id: int
-    linkage: SymbolLinkage = SymbolLinkage.ExternalDef
-    has_export_symbol: bool = False
-    kbuild_target_obj: str = ""
-    kbuild_kcid: int = 0
-    include_depth: int | None = None  # None if unreachable, 1 for direct, 2+ for transitive
 
 
 class TreeResolverService:
@@ -488,7 +458,7 @@ class GitTreeResolver:
                 h = r["blob_hash"] if isinstance(r, dict) else r[0]
                 b_id = r["blob_id"] if isinstance(r, dict) else r[1]
                 ftype = r["ftype"] if isinstance(r, dict) else r[2]
-                key = bytes(h).hex()
+                key = hash_hex(h)
                 # The same content may be indexed under several ftypes; prefer a typed (non-directory) row
                 if key not in result or (result[key][1] == 0 and ftype != 0):
                     result[key] = (b_id, ftype)
@@ -500,79 +470,78 @@ tree_resolver = TreeResolverService()
 git_tree_resolver = GitTreeResolver()
 
 
-class DisambiguationEngine:
-    """6-Tier Deterministic Symbol Disambiguation and Probability Scoring Engine."""
+# ---------------------------------------------------------------------------- definition ranking
+# Ranking groups of a definition's path for one architecture
+ARCH_OWN, ARCH_GENERIC, ARCH_ASM_GENERIC, ARCH_OTHER = 0, 1, 2, 3
+_LINKAGE_RANK = {SymbolLinkage.WeakOrAliasDef: 1, SymbolLinkage.PrototypeDecl: 2}
 
-    @staticmethod
-    def score_candidate(ref: SymbolRefContext, cand: SymbolDefCandidate) -> float:
-        """Compute composite probability score for a candidate definition against a reference context."""
-        # Tier 1: Same-Blob Local Scope
-        if cand.blob_id == ref.source_blob_id:
-            return 100.0
 
-        # Disqualification: InternalStaticDef (file-static) in a foreign blob cannot be linked
-        if cand.linkage == SymbolLinkage.InternalStaticDef:
-            return -1.0
+def arch_bits(arch: str) -> int | None:
+    """Word size an ARCH value implies (x86_64 -> 64, i386 -> 32), None for generic ones (x86, sparc)."""
+    arch = (arch or "").lower()
+    if "64" in arch:
+        return 64
+    if arch in ("i386", "x86_32") or "32" in arch:
+        return 32
+    return None
 
-        # Tier 2: Compiler-Verified target_fnid Provenance
-        if ref.target_fnid and cand.fnid == ref.target_fnid:
-            return 95.0
 
-        # Tier 3: Include Graph Closure
-        if cand.include_depth is not None:
-            if cand.include_depth == 1:
-                return 88.0
-            elif cand.include_depth <= 4:
-                return 82.0
+def own_arch_dirs(srcarch: str) -> set[str]:
+    """arch/ directories built for a source architecture (ARCH=um also builds the host's x86 sources)."""
+    return {srcarch} | ({"x86"} if srcarch == "um" else set())
 
-        # Tier 4: Kbuild Compilation Unit & Directory Proximity
-        score = 0.0
-        if cand.kbuild_target_obj and ref.kbuild_target_obj and cand.kbuild_target_obj == ref.kbuild_target_obj:
-            score = 75.0
-        elif cand.kbuild_kcid and ref.kbuild_kcid and cand.kbuild_kcid == ref.kbuild_kcid:
-            score = 73.0
 
-        if ref.source_path and cand.file_path:
-            try:
-                common_prefix = os.path.commonpath([ref.source_path, cand.file_path])
-                if common_prefix and common_prefix != "/":
-                    depth_bonus = min(4.0, len(common_prefix.split("/")) * 0.8)
-                    if score > 0:
-                        score += depth_bonus
-                    elif depth_bonus >= 1.6:
-                        score = 70.0 + depth_bonus
-            except ValueError:
-                pass
+def path_arch_group(path: str, srcarch: str) -> int:
+    """ARCH_OWN for arch/<srcarch>/, ARCH_OTHER for other arch/ trees, ARCH_ASM_GENERIC, else ARCH_GENERIC."""
+    parts = (path or "").split("/")
+    if len(parts) > 2 and parts[0] == "arch":
+        return ARCH_OWN if parts[1] in own_arch_dirs(srcarch) else ARCH_OTHER
+    if path.startswith("include/asm-generic/"):
+        return ARCH_ASM_GENERIC
+    return ARCH_GENERIC
 
-        if score > 0:
-            return score
 
-        # Tier 5: Exact Structural ast_id Signature & Architecture Affinity
-        if cand.ast_id == ref.ref_ast_id and cand.ast_id != 0:
-            base_score = 65.0
-            if ref.target_arch and f"arch/{ref.target_arch}/" in cand.file_path:
-                base_score += 5.0
-            elif "include/linux/" in cand.file_path or "include/uapi/" in cand.file_path:
-                base_score += 2.0
-            return base_score
+def _bits_penalty(path: str, bits: int | None) -> int:
+    """1 for files of the other word size (process_32.c, page_64.h), else 0."""
+    if not bits:
+        return 0
+    other = 32 if bits == 64 else 64
+    stem = os.path.splitext(os.path.basename(path or ""))[0]
+    return 1 if re.search(rf"(?:^|[_-]){other}(?:$|[_-])", stem) else 0
 
-        # Tier 6: Strong vs. Weak Linkage & EXPORT_SYMBOL Authority
-        base_score = 55.0
-        if cand.linkage == SymbolLinkage.WeakOrAliasDef:
-            base_score -= 10.0
-        if cand.has_export_symbol:
-            base_score += 3.0
-        return base_score
 
-    @classmethod
-    def rank_candidates(
-        cls, ref: SymbolRefContext, candidates: list[SymbolDefCandidate]
-    ) -> list[tuple[float, SymbolDefCandidate]]:
-        """Rank candidate definitions descending by probability score, discarding disqualified (-1)."""
-        scored = []
-        for cand in candidates:
-            s = cls.score_candidate(ref, cand)
-            if s >= 0:
-                scored.append((s, cand))
-        scored.sort(key=lambda item: item[0], reverse=True)
-        return scored
+def path_rank(path: str | None, srcarch: str, bits: int | None) -> tuple[int, int, str]:
+    """Sort key of a definition's path: own arch, generic, asm-generic, other arches; right word size first."""
+    if not path:
+        return (ARCH_OTHER + 1, 0, "")
+    return (path_arch_group(path, srcarch), _bits_penalty(path, bits), path)
+
+
+def best_path(paths: list[str] | None, srcarch: str, bits: int | None) -> str | None:
+    """The best-ranked of the paths a blob sits at."""
+    return min(paths, key=lambda p: path_rank(p, srcarch, bits)) if paths else None
+
+
+def definition_rank(path: str | None, linkage: Any, line_s: int | None, srcarch: str, bits: int | None) -> tuple:
+    """Sort key of a symbol definition: real definitions before weak ones and prototypes, then by path."""
+    try:
+        link_rank = _LINKAGE_RANK.get(SymbolLinkage(int(linkage)), 0)
+    except (TypeError, ValueError):
+        link_rank = 0
+    return (1 if link_rank == 2 else 0, *path_rank(path, srcarch, bits)[:2], link_rank, path or "", line_s or 0)
+
+
+DEFAULT_DEFINITION_ARCH = "x86_64"
+
+
+def definition_arch(version_name: str, arch: str | None) -> tuple[str, str, int | None]:
+    """(ARCH, SRCARCH, word size) used to rank definitions; unknown ARCH values fall back to x86_64."""
+    from webapp.backend.services.kconfig_service import KconfigService
+
+    for candidate in (arch or DEFAULT_DEFINITION_ARCH, DEFAULT_DEFINITION_ARCH):
+        try:
+            info = KconfigService().resolve_arch(version_name, candidate)
+            return info["arch"], info["srcarch"], arch_bits(info["arch"])
+        except Exception as exc:
+            logger.debug("ARCH %s not resolvable at %s: %s", candidate, version_name, exc)
+    return DEFAULT_DEFINITION_ARCH, "x86", 64

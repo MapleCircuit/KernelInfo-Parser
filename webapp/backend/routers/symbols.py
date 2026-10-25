@@ -1,9 +1,13 @@
 """webapp/backend/routers/symbols.py - Symbol Search, XRefs & AST Container Inspection."""
 from __future__ import annotations
-from typing import Any
+from typing import Annotated, Any
 from fastapi import APIRouter, Query
 from webapp.backend.services.symbol_service import SymbolService
 from webapp.backend.services.history_service import history_service
+from webapp.backend.services.tree_resolver import DEFAULT_DEFINITION_ARCH
+
+# ARCH whose definitions win when a symbol is defined per architecture (the KConfig engine's ARCH)
+ArchParam = Annotated[str, Query(description="ARCH value ranking arch-specific definitions (default x86_64)")]
 
 router = APIRouter(prefix="/api", tags=["symbols"])
 symbol_service = SymbolService()
@@ -40,9 +44,9 @@ def lookup_symbols(
 
 @router.get("/version/{version_name}/symbol/{symbol_name}")
 @router.get("/symbols/{version_name}/detail/{symbol_name}")
-def get_symbol_detail(version_name: str, symbol_name: str) -> dict[str, Any]:
+def get_symbol_detail(version_name: str, symbol_name: str, arch: ArchParam = DEFAULT_DEFINITION_ARCH) -> dict[str, Any]:
     """Get authoritative definition and usage overview for a symbol."""
-    return symbol_service.get_symbol_detail(version_name, symbol_name)
+    return symbol_service.get_symbol_detail(version_name, symbol_name, arch)
 
 
 @router.get("/version/{version_name}/xref/{symbol_name}")
@@ -51,9 +55,10 @@ def get_symbol_xref(
     version_name: str,
     symbol_name: str,
     limit: int | None = Query(None),
+    arch: ArchParam = DEFAULT_DEFINITION_ARCH,
 ) -> dict[str, Any]:
     """Get itemized categorized references (calls, member_refs, type_usages) for a symbol."""
-    return symbol_service.get_symbol_xref(version_name, symbol_name, limit)
+    return symbol_service.get_symbol_xref(version_name, symbol_name, limit, arch)
 
 
 @router.get("/ast/{ast_id}/tree")
@@ -77,9 +82,11 @@ def get_symbol_history(
     ast_id: int | None = Query(None),
     name: str | None = Query(None, description="Symbol under the cursor: anchors on its definition"),
     include_rc: bool = Query(False, description="Also list release candidates"),
+    arch: ArchParam = DEFAULT_DEFINITION_ARCH,
 ) -> dict[str, Any]:
     """Release-by-release history of the definition at path:line (a Kconfig entry returns its Kconfig history)."""
-    return history_service.get_symbol_history(version_name, path, ast_id=ast_id, line=line, name=name, include_rc=include_rc)
+    return history_service.get_symbol_history(version_name, path, ast_id=ast_id, line=line, name=name,
+                                              include_rc=include_rc, arch=arch)
 
 
 @router.get("/tag/{tag_id}/timeline")

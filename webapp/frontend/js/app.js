@@ -2,6 +2,7 @@
  * app.js - Main Application Bootstrap & Lifecycle Orchestrator.
  */
 import { api } from "./api.js";
+import { syncManager } from "./sync.js";
 import { state } from "./state.js";
 import { urlSync } from "./url_sync.js";
 import { toast } from "./components/toast.js";
@@ -52,11 +53,11 @@ export class KernelIdeApp {
     // 2a. Repository selected in a previous session scopes every API request
     api.setRepository(state.currentRepo);
 
-    // 2b. Synchronize with Database Instance Hash
+    // 2b. Synchronize with the server's change tokens (database, parsed versions, Git refs, frontend build)
     try {
-      await api.checkDbSync();
+      await syncManager.start();
     } catch (e) {
-      console.warn("DB instance sync check error:", e);
+      console.warn("Server sync check error:", e);
     }
 
     // 3. Initialize Version Selector
@@ -84,6 +85,19 @@ export class KernelIdeApp {
       this.updateVersionSelectorDisplay();
       await this.loadSidebarFileTree();
       this.tabsComponent.render();
+    });
+
+    // A version finished parsing (or was rolled back), a branch moved or tags were fetched
+    state.subscribe("versions:updated", async ({ changed, removed, newlyIndexed }) => {
+      await this.initVersionSelector();
+      if (newlyIndexed.length) {
+        toast.success(`Now indexed: ${newlyIndexed.slice(0, 3).join(", ")}${newlyIndexed.length > 3 ? ` and ${newlyIndexed.length - 3} more` : ""}`);
+      }
+      const shown = new Set([state.currentVersion, ...state.panes.flatMap((p) => p.tabs.map((t) => t.version))]);
+      if ([...changed, ...removed].some((v) => shown.has(v))) {
+        await this.loadSidebarFileTree();
+        this.tabsComponent.render();
+      }
     });
 
     // Synchronize top selectors when a tab with a different version is selected
@@ -811,10 +825,15 @@ function escapeAttr(str) {
   return String(str ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 }
 
-// Bootstrap on DOM ready
-document.addEventListener("DOMContentLoaded", () => {
+// Bootstrap on DOM ready (boot.js imports this module, possibly after DOMContentLoaded fired)
+function startApp() {
   const app = new KernelIdeApp();
   app.init().catch((err) => {
     console.error("Critical failure during IDE initialization:", err);
   });
-});
+}
+if (document.readyState === "loading") {
+  document.addEventListener("DOMContentLoaded", startApp);
+} else {
+  startApp();
+}

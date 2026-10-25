@@ -10,6 +10,7 @@ from typing import Any
 from fastapi import HTTPException
 from webapp.backend.database.pool import get_db_cursor
 from webapp.backend.database.helpers import (
+    hash_hex,
     safe_decode,
     get_version_info,
 )
@@ -111,7 +112,7 @@ def format_commit_hash(val: Any) -> str:
         if len(b) == 20:
             return b.hex()
         return safe_decode(b)
-    return str(val)
+    return hash_hex(val) if isinstance(val, str) else str(val)
 
 
 @lru_cache(maxsize=1024)

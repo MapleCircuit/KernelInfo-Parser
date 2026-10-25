@@ -1,120 +1,81 @@
 /**
  * sw.js - Service Worker for KernelInfo-Parser Developer Web Application.
- * Provides offline caching for application shell, static assets, and API requests.
+ *
+ * Caches (all named "kip-*"; older caches are deleted on activation):
+ * - kip-shell: the app shell ("/") and /boot.js, cache-first. The page asks the server for a new
+ *   frontend build at most hourly (js/sync.js); when there is one it drops this cache and reloads.
+ * - kip-assets: /b/<build>/... files, cache-first (immutable per build). Entries of other builds are
+ *   pruned when the page tells the worker its build ({type: "prune", build}).
+ * - kip-api: API responses, network-first with cache fallback for offline use.
  */
-const CACHE_NAME = "kernel-ide-v10";
-const STATIC_ASSETS = [
-  "/",
-  "/app",
-  "/manifest.json",
-  "/static/assets/icon.svg",
-  "/static/vendor/two.min.js",
-  "/static/css/variables.css",
-  "/static/css/layout.css",
-  "/static/css/tabs.css",
-  "/static/css/codeview.css",
-  "/static/css/nodemap.css",
-  "/static/css/kconfig.css",
-  "/static/css/maintainers.css",
-  "/static/css/commits.css",
-  "/static/css/tools.css",
-  "/static/css/modals.css",
-  "/static/css/docs.css",
-  "/static/js/api.js",
-  "/static/js/db.js",
-  "/static/js/state.js",
-  "/static/js/url_sync.js",
-  "/static/js/app.js",
-  "/static/js/components/tabs.js",
-  "/static/js/components/context_menu.js",
-  "/static/js/utils/clipboard.js",
-  "/static/js/components/toast.js",
-  "/static/js/components/ref_picker.js",
-  "/static/js/components/command_palette.js",
-  "/static/js/components/modal.js",
-  "/static/js/components/symbol_history_modal.js",
-  "/static/js/components/patch_modal.js",
-  "/static/js/components/file_history_modal.js",
-  "/static/js/utils/debounce.js",
-  "/static/js/views/code_view/virtual_editor.js",
-  "/static/js/views/code_view/fidelity_clipboard.js",
-  "/static/js/views/code_view/ast_overlay.js",
-  "/static/js/views/code_view/blame_view.js",
-  "/static/js/views/kconfig/kconfig_engine.js",
-  "/static/js/views/kconfig/kconfig_parser.js",
-  "/static/js/views/kconfig/menuconfig_tui.js",
-  "/static/js/views/kconfig/directive_evaluator.js",
-  "/static/js/views/nodemap/nodemap_controller.js",
-  "/static/js/views/nodemap/node_model.js",
-  "/static/js/views/nodemap/node_renderer.js",
-  "/static/js/views/nodemap/edge_router.js",
-  "/static/js/views/maintainers/maintainers_view.js",
-  "/static/js/views/commits/commits_view.js",
-  "/static/js/views/pahole/pahole_view.js",
-  "/static/js/views/callgraph/callgraph_view.js",
-  "/static/js/views/diff/diff_view.js",
-  "/static/js/views/docs/rst_renderer.js",
-  "/static/js/views/docs/doc_page.js",
-  "/static/js/views/treemap/treemap_view.js"
-];
+const SHELL_CACHE = "kip-shell";
+const ASSET_CACHE = "kip-assets";
+const API_CACHE = "kip-api";
+const SHELL_PATHS = new Set(["/", "/app", "/webapp", "/boot.js"]);
 
-self.addEventListener("install", (event) => {
-  event.waitUntil(
-    caches.open(CACHE_NAME).then((cache) => {
-      return cache.addAll(STATIC_ASSETS).catch((err) => {
-        console.warn("ServiceWorker pre-cache incomplete:", err);
-      });
-    }).then(() => self.skipWaiting())
-  );
-});
+self.addEventListener("install", () => self.skipWaiting());
 
 self.addEventListener("activate", (event) => {
   event.waitUntil(
-    caches.keys().then((keys) => {
-      return Promise.all(
-        keys.filter((key) => key !== CACHE_NAME).map((key) => caches.delete(key))
-      );
-    }).then(() => self.clients.claim())
+    caches.keys()
+      .then((keys) => Promise.all(keys.filter((key) => !key.startsWith("kip-")).map((key) => caches.delete(key))))
+      .then(() => self.clients.claim())
   );
 });
 
-self.addEventListener("fetch", (event) => {
-  const url = new URL(event.request.url);
-
-  // For API calls: Network-First with Cache Fallback
-  if (url.pathname.startsWith("/api/")) {
-    event.respondWith(
-      fetch(event.request)
-        .then((response) => {
-          if (response && response.status === 200) {
-            const copy = response.clone();
-            caches.open(CACHE_NAME).then((cache) => cache.put(event.request, copy));
-          }
-          return response;
-        })
-        .catch(() => {
-          return caches.match(event.request).then((cached) => {
-            if (cached) return cached;
-            return new Response(JSON.stringify({ error: "Offline - data not cached yet" }), {
-              headers: { "Content-Type": "application/json" },
-              status: 503
-            });
-          });
-        })
+self.addEventListener("message", (event) => {
+  const data = event.data || {};
+  if (data.type === "prune" && data.build) {
+    const keep = `/b/${data.build}/`;
+    event.waitUntil(
+      caches.open(ASSET_CACHE).then((cache) => cache.keys().then((requests) => Promise.all(
+        requests.filter((req) => !new URL(req.url).pathname.startsWith(keep)).map((req) => cache.delete(req))
+      )))
     );
-    return;
   }
+});
 
-  // For static assets: Cache-First, fallback to Network
-  event.respondWith(
-    caches.match(event.request).then((cached) => {
-      return cached || fetch(event.request).then((response) => {
-        if (response && response.status === 200) {
-          const copy = response.clone();
-          caches.open(CACHE_NAME).then((cache) => cache.put(event.request, copy));
-        }
-        return response;
-      });
+function cacheFirst(request, cacheName, cacheKey = request) {
+  return caches.open(cacheName).then((cache) => cache.match(cacheKey).then((cached) => {
+    if (cached) return cached;
+    return fetch(request).then((response) => {
+      if (response && response.status === 200) cache.put(cacheKey, response.clone());
+      return response;
+    });
+  }));
+}
+
+function networkFirst(request, cacheName) {
+  return fetch(request)
+    .then((response) => {
+      if (response && response.status === 200) {
+        const copy = response.clone();
+        caches.open(cacheName).then((cache) => cache.put(request, copy));
+      }
+      return response;
     })
-  );
+    .catch(() => caches.match(request).then((cached) => cached || new Response(
+      JSON.stringify({ error: "Offline - data not cached yet" }),
+      { headers: { "Content-Type": "application/json" }, status: 503 }
+    )));
+}
+
+self.addEventListener("fetch", (event) => {
+  const { request } = event;
+  if (request.method !== "GET") return;
+  const url = new URL(request.url);
+  if (url.origin !== self.location.origin) return;
+
+  if (request.mode === "navigate" && SHELL_PATHS.has(url.pathname)) {
+    // One shell entry whatever the shell path or query (?repo=, deep links)
+    event.respondWith(cacheFirst(request, SHELL_CACHE, "/"));
+  } else if (url.pathname === "/boot.js") {
+    event.respondWith(cacheFirst(request, SHELL_CACHE));
+  } else if (url.pathname.startsWith("/b/")) {
+    event.respondWith(cacheFirst(request, ASSET_CACHE));
+  } else if (url.pathname.startsWith("/api/")) {
+    if (url.pathname === "/api/sync") return; // always asks the server
+    event.respondWith(networkFirst(request, API_CACHE));
+  }
+  // Anything else (legacy /static/ URLs, manifest, sw.js) goes to the network untouched
 });

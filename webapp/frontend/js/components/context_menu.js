@@ -11,6 +11,7 @@ import { showPersonModal } from "./person_modal.js";
 import { includeSymbolsPopover } from "./include_symbols_popover.js";
 import { showSymbolHistoryModal, showKconfigHistoryModal } from "./symbol_history_modal.js";
 import { showPatchModal } from "./patch_modal.js";
+import { openDefinition } from "../utils/definition_picker.js";
 
 class ContextMenu {
   constructor() {
@@ -142,10 +143,11 @@ class ContextMenu {
   openKconfigViewer(symbolName, version = null, options = {}) {
     const cleanSym = this.getKconfigSymbolName(symbolName);
     const v = version || state.currentVersion;
+    const arch = state.kconfigArch();
     state.openTab({
       type: "kconfig",
-      title: cleanSym ? `KConfig (${cleanSym})` : "KConfig (x86)",
-      arch: "x86",
+      title: cleanSym ? `KConfig (${cleanSym})` : `KConfig (${arch})`,
+      arch,
       symbol: cleanSym,
       version: v,
       forceNew: Boolean(options?.forceNew)
@@ -212,16 +214,7 @@ class ContextMenu {
       this.openKconfigViewer(tokenName, v, options);
     } else {
       try {
-        const detail = await api.getSymbolDetail(v, tokenName);
-        if (detail && detail.file_path) {
-          state.openTab({
-            type: "code",
-            title: detail.file_path.split("/").pop(),
-            path: detail.file_path,
-            cursorLine: detail.definition?.line_s || detail.line_s || detail.line || 1,
-            version: v,
-            forceNew: Boolean(options?.forceNew)
-          });
+        if (await openDefinition(v, tokenName, { forceNew: options?.forceNew })) {
           toast.success(`Jumped to definition of ${tokenName}`);
         } else {
           toast.info(`No definition found for ${tokenName}`);
@@ -330,15 +323,7 @@ class ContextMenu {
         shortcut: "F12",
         onClick: async () => {
           try {
-            const detail = await api.getSymbolDetail(v, tokenName);
-            if (detail && detail.file_path) {
-              state.openTab({
-                type: "code",
-                title: detail.file_path.split("/").pop(),
-                path: detail.file_path,
-                cursorLine: detail.definition?.line_s || detail.line_s || detail.line || 1,
-                version: v
-              });
+            if (await openDefinition(v, tokenName)) {
               toast.success(`Jumped to definition of ${tokenName}`);
             } else {
               toast.info(`No definition found for ${tokenName}`);
@@ -485,15 +470,7 @@ class ContextMenu {
           shortcut: "F12",
           onClick: async () => {
             try {
-              const detail = await api.getSymbolDetail(v, token.name);
-              if (detail && detail.file_path) {
-                state.openTab({
-                  type: "code",
-                  title: detail.file_path.split("/").pop(),
-                  path: detail.file_path,
-                  cursorLine: detail.definition?.line_s || detail.line_s || detail.line || 1,
-                  version: v
-                });
+              if (await openDefinition(v, token.name)) {
                 toast.success(`Jumped to definition of ${token.name}`);
               } else {
                 toast.info(`No definition found for ${token.name}`);
@@ -819,15 +796,7 @@ class ContextMenu {
         icon: "🎯",
         onClick: async () => {
           try {
-            const detail = await api.getSymbolDetail(v, nodeName);
-            if (detail && detail.file_path) {
-              state.openTab({
-                type: "code",
-                title: detail.file_path.split("/").pop(),
-                path: detail.file_path,
-                cursorLine: detail.definition?.line_s || detail.line_s || detail.line || 1,
-                version: v
-              });
+            if (await openDefinition(v, nodeName)) {
               toast.success(`Jumped to definition of ${nodeName}`);
             } else {
               toast.info(`No definition found for ${nodeName}`);

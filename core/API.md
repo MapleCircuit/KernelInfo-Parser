@@ -165,6 +165,7 @@ Central runtime container, schema registry, and worker IPC coordinator.
   - `file_deps: dict[str, set[str]]`: Lightweight dependency graph mapping each changed file path to its set of unresolved foreign file dependencies (`foreign_deps`).
   - `cs_op_counts: dict[str, int]`: Operation count of each ingested ChangeSet, recorded by `DependencyScheduler.ingest_batch()`; the wave pass breaks cycles with it instead of decompressing stored ChangeSets.
   - `commit_ids_by_hash: dict[str, int]`: Commit hash -> `commit_id` for the version's range, registered in bulk by `ingest_git_dag()` (Step 1) and reused by `processing_git_commits()` (Step 6.5).
+    `ingest_git_dag()` reports a version as already existing when its head commit's ingestion is done (`m_ingest_state`, §4.1), whether under this ref or another one (tags sharing a commit, e.g. `v2.6.32-rc1`/`v2.6.32-rc2`: the new ref is then only registered in `m_git_ref`, since re-ingesting the commit would insert duplicate `m_bridge_checkpoint` rows). An interrupted ingestion is rolled back and parsed again (§4.1).
   - `deduped_paths: set[str]`: Changed paths whose blob Step 4.5 reused instead of parsing; `processing_git_commits()` loads their tags from `m_bridge_tag` to link them to this range's commits.
   - `file_symbols: dict[str, dict[tuple[str, int], int]]`: Per-file exported symbols map `rel_file -> {(sym_name, type_id): ast_id}` populated during Phase 1 staging.
   - `completed_paths: set[str]`: Paths whose ChangeSet executed in the current update, recorded by `extract_tags_and_evacuate_cs()` (even when the file publishes no symbol). `resolve_ref()` treats these as completed after Stage 2 clears `file_symbols` (symbols moved to `_shared_symbols`); reset by `init_cs_dict()`.
@@ -204,7 +205,7 @@ Central runtime container, schema registry, and worker IPC coordinator.
 
 ## 4. Relational Database Schema Registry (`core/DBLayout.py`)
 
-45 Zero-VID Git-Native Core Tables defined via `Table` instances and exported in `TABLES` tuple (`init_db_layout(gp)` sets `gp.Table_Array = list(TABLES)`). The database schema eliminates synthetic linear release versions (`vid`), modeling the kernel codebase directly as a Git DAG rooted at `m_repository` $\to$ `m_commit` $\to$ `m_bridge_checkpoint` $\to$ `m_file_blob`:
+47 Zero-VID Git-Native Core Tables defined via `Table` instances and exported in `TABLES` tuple (`init_db_layout(gp)` sets `gp.Table_Array = list(TABLES)`). The database schema eliminates synthetic linear release versions (`vid`), modeling the kernel codebase directly as a Git DAG rooted at `m_repository` $\to$ `m_commit` $\to$ `m_bridge_checkpoint` $\to$ `m_file_blob`:
 
 | `table_id` | Table Name | Columns | Primary Key | `no_duplicate` | `te_cached` | `hashing_table` | Description |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
@@ -248,11 +249,13 @@ Central runtime container, schema registry, and worker IPC coordinator.
 | **37** | `m_repository` | `(repo_id, network_id, name, git_url, default_branch)` | `("repo_id",)` | `False` | `True` | `False` | Tracked Git repository instance |
 | **38** | `m_git_ref` | `(ref_id, repo_id, ref_type, ref_name, commit_id, tagger_id, tagger_date, tag_message)` | `("ref_id",)` | `False` | `True` | `False` | Named Git reference (aliased as `m_v_main`); `ref_type`: 1 = tag, 2 = branch (local or remote), 3 = bare commit |
 | **39** | `m_commit_parent` | `(commit_id, parent_commit_id, parent_idx)` | `("commit_id", "parent_idx")` | `False` | `False` | `False` | Full Git commit DAG topology (write-only, idempotent: not preloaded) |
-| **40** | `m_ingest_state` | `(network_id, commit_id, status, updated_at)` | `("network_id", "commit_id")` | `False` | `False` | `False` | Incremental ingestion state tracker |
+| **40** | `m_ingest_state` | `(network_id, commit_id, status, updated_at)` | `("network_id", "commit_id")` | `False` | `False` | `False` | Ingestion status of a version's head commit: 1 = parsing, 2 = done (§4.1); the webapp only lists done versions |
 | **41** | `m_tag_def` | `(tag_id, def_idx, sym_key, name, type_id, linkage, rel_line_s, rel_line_e)` | `("tag_id", "def_idx")` | `False` | `False` | `False` | A tag's definitions, lines relative to the tag, written once when the tag is new |
 | **42** | `m_tag_ref` | `(tag_id, ref_idx, sym_key, role, rel_line, char_s)` | `("tag_id", "ref_idx")` | `False` | `False` | `False` | A tag's references, written once when the tag is new |
 | **43** | `m_blob_symbol` | `(blob_id, sym_key, target_ast_id, target_fnid)` | `("blob_id", "sym_key")` | `False` | `False` | `False` | Per-blob resolution of the keys the shared rows use (idempotent) |
 | **44** | `m_symbol_own` | `(blob_id, tag_id, kind)` | `("blob_id", "tag_id", "kind")` | `False` | `False` | `False` | Tag placements whose references (1) / definitions (2) are stored per blob instead (idempotent) |
+| **45** | `m_ingest_watermark` | `(commit_id, marked_table_id, max_id)` | `("commit_id", "marked_table_id")` | `False` | `False` | `False` | Highest id of each id-allocating table when a version run started (§4.1); no foreign keys, removed when the version is done |
+| **46** | `m_ingest_blob` | `(commit_id, blob_id)` | `("commit_id", "blob_id")` | `False` | `False` | `False` | Pre-existing blobs (never parsed, e.g. from intermediate commits) a version run parses (§4.1); removed when the version is done |
 
 > [!NOTE]
 > **Symbol views** (`core/SymbolRows.py`, created by `main.ensure_db_views()`): `m_symbol_def` and `m_symbol_ref` are SQL views returning, in the former per-blob shape, the per-blob rows plus the shared rows placed through `m_bridge_tag` (`line = bt.line_s + rel_line`, target from `m_blob_symbol`), skipping placements marked in `m_symbol_own`. A shared definition's `def_id` is computed (`1 << 62 | blob_id << 37 | tag_id << 6 | def_idx`) and a shared reference's `ref_id` is NULL, so neither can be looked up by id efficiently. `symbol_view_rows()` computes the same rows from in-memory tables (MockDB, tests). Filtering a view by `ast_id` is slow (the database joins each blob using the target with every tag holding its key); `rows_of_targets_sql(view, n)` returns the same rows for `n` target AST ids starting from their keys (`m_blob_symbol.target_ast_id` → `m_tag_ref` / `m_tag_def` by `sym_key` → `m_bridge_tag` → `m_blob_symbol`), for use as a derived table. Keys come from the tag's text (`parser/c_ast/CAST_API.md` §9.3); `m_tag_def` and `m_tag_ref` are indexed on `(sym_key, tag_id)`. A database that still has `m_symbol_def` / `m_symbol_ref` as tables is refused (run `--reset`; the reset drops them).
@@ -262,6 +265,14 @@ Central runtime container, schema registry, and worker IPC coordinator.
 
 > [!NOTE]
 > **Foreign Key Handling During Setup**: Table creation wraps execution in `SET FOREIGN_KEY_CHECKS = 0;` and restores checks in a `finally` block, safely supporting forward and circular foreign key relationships.
+
+### 4.1. Version Ingestion State & Recovery of Interrupted Runs (`core/ingest_state.py`)
+The TableEngine commits each table atomically but tables independently, so a run stopped in the middle (crash, kill, `--duration` limit) can leave half-written rows: a blob with tags but without its symbol rows, a tag without its definitions, an AST node without its children. Content-addressed deduplication (`_reuse_parsed_blobs()`, tag and AST hashes) would reuse them in every later version. Each version run is therefore bracketed:
+- **Begin** (`ingest_state.begin()`, end of `ingest_git_dag()` once the head commit, its DAG and its `m_git_ref` row exist): `m_ingest_state` = `INGEST_PARSING` and one `m_ingest_watermark` row per id-allocating table (`marked_tables()`: single INT primary key that is not a foreign key, outside the static registries `m_type_descriptor`, `m_project`, `m_git_network`, `m_repository`, `m_git_ref`). Ids are allocated increasingly by a single writer, so every row above a watermark belongs to the run.
+- **Step 4.5** (`_record_reparsed_blobs()`): blobs that already exist but are parsed now (they are not reused) go to `m_ingest_blob` before any of their rows are written.
+- **Done** (`finish_version_ingest()`, end of `update()`, also after a graceful `q` quit, which finishes the version): `INGEST_DONE`, and the version's watermark and blob rows are removed. Early returns on the duration limit leave the version `INGEST_PARSING`.
+- **Next start** (`_previous_ingest()` in `ingest_git_dag()`): `done` skips the version (registering an alias ref when another ref ingested the commit); `interrupted` (`INGEST_PARSING`) calls `rollback_version()` and parses the version again from Step 1. Refs without a state row predate this mechanism: they count as done when their checkpoint covers at least 90% of the tree (`INGEST_DONE` is then backfilled), otherwise their version-scoped rows (`m_bridge_checkpoint`, `m_commit_file`, `m_bridge_commit_tag`, `m_bridge_commit_person` of the head commit) are purged as before; their blob-level rows cannot be identified.
+- **Rollback** (`rollback_plan()` + `rollback_version()`): first `precheck_queries()` look for rows older than the run (id at or below their table's watermark) that reference rows of the run; any hit raises `RecoveryError` instead of deleting older data. The plan then deletes, children before parents along the declared foreign keys: the version's `m_bridge_checkpoint` rows; every row derived from the `m_ingest_blob` blobs in the tables referencing `m_file_blob` (except the commit-scoped `m_bridge_checkpoint`, `m_commit_file`, `m_bridge_commit_tag`, `m_blob_transition`), including the rows hanging off them (e.g. `m_maintainer_member` of a deleted section); and for each watermarked table, in child-first order, the link-table rows referencing ids above its mark, then its own rows above the mark (a watermarked child's new rows go with its own mark). Statements run as `DELETE ... LIMIT 50000` loops, each chunk committed; every one uses the foreign-key indexes, and re-running a partially executed rollback is harmless. The TableEngine then drops its carried tables (`discard_carried()`) and `main.py` clears its in-process caches (`_forget_rolled_back_rows()`).
 
 ---
 
@@ -373,6 +384,8 @@ MasterFile (MF)                   GreatProcessor (gp)               TableEngine 
   │                                       │ and m_repository for target git tree
   ├─ ingest_git_dag(version_or_ref) ─────►│ Registers commit DAG, parents (m_commit_parent),
   │                                       │ contributors, and m_git_ref (m_v_main); gp.VID = head_cid
+  │                                       │ Done version: skipped. Interrupted one: rolled back (§4.1).
+  │                                       │ ingest_state.begin(): INGEST_PARSING + id watermarks
   ├─ add_version(vname)                   ├─ init_db_layout(gp)             │
   │  (Clones git tree to /dev/shm)        │  (Populates gp.Table_Array)     │
   ├─ generate_change_list(gp) ───────────►│                                 │
@@ -386,7 +399,8 @@ MasterFile (MF)                   GreatProcessor (gp)               TableEngine 
   └─ Content-Addressable Blob Dedup (Step 4.5, _reuse_parsed_blobs):       │
      └── Looks (blob_hash, ftype) up in the TableEngine m_file_blob cache; one query on m_bridge_tag
          - Reused files: m_file_name / m_bridge_checkpoint / m_commit_file staged via the TableEngine
-         - Remaining new/modified files: dispatched to multicore workers
+         - Remaining new/modified files: dispatched to multicore workers (pre-existing blobs among
+           them recorded in m_ingest_blob first, §4.1)
 ==================================================================================================
 [2. MULTICORE PARTITIONING & TWO-STAGE PARALLEL WORKER PARSING]
 --------------------------------------------------------------------------------------------------

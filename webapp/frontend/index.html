@@ -5,6 +5,8 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <meta name="description" content="High-Performance Linux Kernel Exploration & Architecture Platform with 100% Copy Fidelity, Client-Side KConfig Engine, and NodeMap Schematic Canvas." />
   <meta name="theme-color" content="#161b22" />
+  <!-- Frontend build this shell belongs to (filled in by the server, see webapp/backend/app.py) -->
+  <meta name="kip-build" content="__KIP_BUILD__" />
   <title>KernelInfo Developer IDE</title>
 
   <!-- PWA Manifest & Icons -->
@@ -109,7 +111,7 @@
   <!-- Toast Notification Root -->
   <div id="toast-container"></div>
 
-  <!-- Main ES-Module Application Bootstrap -->
-  <script type="module" src="/static/js/app.js"></script>
+  <!-- Main ES-Module Application Bootstrap (boot.js imports the build's app.js, recovering from a stale build) -->
+  <script src="/boot.js" data-entry="/static/js/app.js" defer></script>
 </body>
 </html>

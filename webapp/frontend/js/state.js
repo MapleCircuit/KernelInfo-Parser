@@ -4,6 +4,12 @@
  */
 import { localDB } from "./db.js";
 
+// A resolved configuration (defconfig loaded in the KConfig view) has far more than the default seeds
+export const MIN_CONFIG_SYMBOLS = 50;
+// ARCH (and what is known of its configuration) when the KConfig engine does not provide one
+export const DEFAULT_DEFINITION_ARCH = "x86_64";
+const DEFAULT_ARCH_BASELINE = { X86: "y", X86_64: "y", "64BIT": "y", X86_32: "n" };
+
 class GlobalState {
   constructor() {
     this.subscribers = new Map();
@@ -92,6 +98,30 @@ class GlobalState {
     this.emit("repo:changed", name);
     this.emit("layout:changed", { splitMode: this.splitMode, panes: this.panes });
     this.emit("version:changed", this.currentVersion);
+  }
+
+  /** Whether the KConfig engine is on with a resolved configuration (gates #ifdef dimming and build banners). */
+  kconfigConfigActive() {
+    return this.kconfigEngineActive
+      && Boolean(this.kconfigProfileKey.split("|")[1])
+      && Object.keys(this.kconfigAssignments || {}).length / 2 >= MIN_CONFIG_SYMBOLS;
+  }
+
+  /** ARCH of the KConfig view's active profile (x86_64 until one was chosen). */
+  kconfigArch() {
+    return this.kconfigProfileKey.split("|")[1] || DEFAULT_DEFINITION_ARCH;
+  }
+
+  /**
+   * ARCH and configuration deciding which of several per-architecture definitions applies.
+   * Engine on with a resolved configuration: its ARCH and values (`strict`: absent symbols are "n").
+   * Otherwise x86_64 with a baseline (X86, X86_64, 64BIT set, X86_32 not); other symbols are unknown.
+   */
+  definitionContext() {
+    if (this.kconfigConfigActive()) {
+      return { arch: this.kconfigProfileKey.split("|")[1], assignments: this.kconfigAssignments, strict: true };
+    }
+    return { arch: DEFAULT_DEFINITION_ARCH, assignments: DEFAULT_ARCH_BASELINE, strict: false };
   }
 
   setKconfigEngineActive(active) {

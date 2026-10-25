@@ -13,7 +13,7 @@ from webapp.backend.config import (
     list_repositories,
     resolve_repo_path,
 )
-from webapp.backend.database.helpers import get_active_repo_id, safe_decode
+from webapp.backend.database.helpers import finished_ref_sql, get_active_repo_id, hash_hex, safe_decode
 from webapp.backend.database.pool import get_db_cursor
 from webapp.backend.services.git_service import GitService
 
@@ -24,10 +24,14 @@ git_service = GitService()
 PRERELEASE_MARKERS = ("-rc", "-pre", "-alpha", "-beta")
 
 
+def _stamp(commit_hash: str, parsed_at: Any) -> str:
+    """Client cache generation of a version: its commit and when its ingestion finished ("git" if never).
+    Cached data of a version is dropped when its stamp changes (a branch moved, a tag got parsed)."""
+    return f"{(commit_hash or '')[:12]}.{parsed_at if parsed_at is not None else 'git'}"
+
+
 def _hex(val: Any) -> str:
-    if isinstance(val, (bytes, bytearray, memoryview)):
-        return bytes(val).hex()
-    return str(val) if val else ""
+    return hash_hex(val) if val else ""
 
 
 def _git_lines(args: list[str], timeout: float = 10.0) -> list[str]:
@@ -98,13 +102,20 @@ def get_branches() -> dict[str, Any]:
     branches = []
     seen = set()
 
+    git_heads = {}
+    for line in _git_lines(["branch", "--format=%(refname:short) %(objectname)"], timeout=5):
+        parts = line.split()
+        if parts and not parts[0].startswith("(HEAD"):
+            git_heads[parts[0]] = parts[1] if len(parts) > 1 else ""
+
     with get_db_cursor() as cursor:
         cursor.execute(
-            """
-            SELECT r.ref_name, r.commit_id, c.commit_hash
+            f"""
+            SELECT r.ref_name, r.commit_id, c.commit_hash, s.updated_at AS parsed_at
             FROM m_git_ref r
             LEFT JOIN m_commit c ON r.commit_id = c.commit_id
-            WHERE r.ref_type = 2 AND r.repo_id = %s
+            LEFT JOIN m_ingest_state s ON s.commit_id = r.commit_id
+            WHERE r.ref_type = 2 AND r.repo_id = %s AND {finished_ref_sql()}
             ORDER BY r.ref_name ASC;
             """,
             (get_active_repo_id(cursor),),
@@ -113,23 +124,25 @@ def get_branches() -> dict[str, Any]:
             bname = safe_decode(row["ref_name"])
             if bname and bname not in seen:
                 seen.add(bname)
+                commit_hash = _hex(row.get("commit_hash"))
                 branches.append({
                     "name": bname,
                     "commit_id": row["commit_id"],
-                    "commit_hash": _hex(row.get("commit_hash")),
+                    "commit_hash": commit_hash,
                     "is_default": bname in ("master", "main"),
+                    # The branch may have moved in Git since it was parsed
+                    "stamp": _stamp(git_heads.get(bname) or commit_hash, row.get("parsed_at") or 0),
                 })
 
-    for line in _git_lines(["branch", "--format=%(refname:short) %(objectname)"], timeout=5):
-        parts = line.split()
-        bname = parts[0]
-        if bname not in seen and not bname.startswith("(HEAD"):
+    for bname, head in git_heads.items():
+        if bname not in seen:
             seen.add(bname)
             branches.append({
                 "name": bname,
                 "commit_id": 0,
-                "commit_hash": parts[1] if len(parts) > 1 else "",
+                "commit_hash": head,
                 "is_default": bname in ("master", "main"),
+                "stamp": _stamp(head, None),
             })
 
     if not branches:
@@ -151,16 +164,18 @@ def get_versions(include_rc: bool = Query(True)) -> dict[str, Any]:
 
     with get_db_cursor() as cursor:
         cursor.execute(
-            """
+            f"""
             SELECT
                 r.commit_id AS vid,
                 r.ref_name AS vname,
                 r.ref_type,
                 c.commit_hash,
-                c.author_date
+                c.author_date,
+                s.updated_at AS parsed_at
             FROM m_git_ref r
             LEFT JOIN m_commit c ON r.commit_id = c.commit_id
-            WHERE r.commit_id > 0 AND r.repo_id = %s
+            LEFT JOIN m_ingest_state s ON s.commit_id = r.commit_id
+            WHERE r.commit_id > 0 AND r.repo_id = %s AND {finished_ref_sql()}
             ORDER BY c.author_date ASC, r.commit_id ASC;
             """,
             (get_active_repo_id(cursor),),
@@ -169,13 +184,15 @@ def get_versions(include_rc: bool = Query(True)) -> dict[str, Any]:
             vname = safe_decode(r["vname"]) or ""
             if vname and vname not in seen_vnames:
                 seen_vnames.add(vname)
+                commit_hash = _hex(r.get("commit_hash"))
                 versions.append({
                     "vid": r["vid"],
                     "vname": vname,
-                    "commit_hash": _hex(r.get("commit_hash")),
+                    "commit_hash": commit_hash,
                     "is_prerelease": any(m in vname for m in PRERELEASE_MARKERS),
                     "ref_type": r.get("ref_type"),
                     "indexed": True,
+                    "stamp": _stamp(commit_hash, r.get("parsed_at") or 0),
                 })
 
     # Git tags of the active repository that were not ingested, in version order
@@ -201,6 +218,7 @@ def get_versions(include_rc: bool = Query(True)) -> dict[str, Any]:
             "is_prerelease": is_pre,
             "ref_type": 1,
             "indexed": False,
+            "stamp": _stamp(parts[2], None),
         })
 
     # Version order (git versionsort) for tags; other indexed refs (branches, commits) keep DB order at the end

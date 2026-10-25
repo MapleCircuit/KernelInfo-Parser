@@ -19,7 +19,9 @@ SCHEMA ENTITY-RELATIONSHIP GRAPH:
      ├── m_commit_parent (commit_id, parent_commit_id, parent_idx)
      ├── m_commit_file (commit_id, fnid, blob_id, old_fnid, old_blob_id, change_type)
      ├── m_bridge_checkpoint (commit_id, fnid, blob_id)
-     └── m_ingest_state (network_id, commit_id, status, updated_at)
+     ├── m_ingest_state (network_id, commit_id, status, updated_at)
+     ├── m_ingest_watermark (commit_id, marked_table_id, max_id)
+     └── m_ingest_blob (commit_id, blob_id)
 
 3. Universal Content-Addressable Stores:
    m_file_name (fnid, fname)
@@ -1184,6 +1186,51 @@ m_symbol_own = Table(
 )
 
 # -----------------------------------------------------------------------------
+# 45. m_ingest_watermark (table_id=45): Highest Id of Each Id-Allocating Table When a Version Run Started
+#     Rows above these marks were created by that run; core/ingest_state.py rolls them back when the
+#     run was interrupted (m_ingest_state still INGEST_PARSING). Removed once the version is done.
+#     No foreign keys: the bookkeeping must survive the rollback it drives.
+# -----------------------------------------------------------------------------
+m_ingest_watermark = Table(
+    table_id=45,
+    table_name="m_ingest_watermark",
+    columns=(
+        ("commit_id", "INT", "NOT NULL"),
+        # Not "table_id": Table binds every column name as an attribute of the instance
+        ("marked_table_id", "SMALLINT", "UNSIGNED", "NOT NULL"),
+        ("max_id", "BIGINT", "NOT NULL"),
+    ),
+    primary=("commit_id", "marked_table_id"),
+    foreign=(),
+    initial_insert=None,
+    no_duplicate=False,
+    te_cached=False,
+    idempotent_pk=True,
+    hashing_table=False,
+)
+
+# -----------------------------------------------------------------------------
+# 46. m_ingest_blob (table_id=46): Pre-Existing Blobs a Version Run Parses
+#     Blobs created by earlier runs without being parsed (intermediate commits): their derived rows
+#     are cleared too when the run is rolled back. Removed once the version is done.
+# -----------------------------------------------------------------------------
+m_ingest_blob = Table(
+    table_id=46,
+    table_name="m_ingest_blob",
+    columns=(
+        ("commit_id", "INT", "NOT NULL"),
+        ("blob_id", "INT", "NOT NULL"),
+    ),
+    primary=("commit_id", "blob_id"),
+    foreign=(),
+    initial_insert=None,
+    no_duplicate=False,
+    te_cached=False,
+    idempotent_pk=True,
+    hashing_table=False,
+)
+
+# -----------------------------------------------------------------------------
 # Exported Table Array tuple
 # -----------------------------------------------------------------------------
 TABLES: tuple[Table, ...] = (
@@ -1232,6 +1279,8 @@ TABLES: tuple[Table, ...] = (
     m_tag_ref,             # 42
     m_blob_symbol,         # 43
     m_symbol_own,          # 44
+    m_ingest_watermark,    # 45
+    m_ingest_blob,         # 46
 )
 
 Table_Array = TABLES

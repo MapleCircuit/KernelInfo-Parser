@@ -15,12 +15,12 @@ import { showFileHistoryModal } from "../../components/file_history_modal.js";
 import { DocPage } from "../docs/doc_page.js";
 import { showPatchModal } from "../../components/patch_modal.js";
 import { isDocumentationPath } from "../docs/rst_renderer.js";
-import { DirectiveEvaluator } from "../kconfig/directive_evaluator.js";
+import { DirectiveEvaluator, PREPROCESSED_RE, archMacros } from "../kconfig/directive_evaluator.js";
+import { configLookup, evalBuild, explainBuild } from "../kconfig/build_condition.js";
+import { escapeHtml } from "../../components/modal.js";
 
-// Source types whose #if/#ifdef blocks follow C preprocessor semantics
-const PREPROCESSED_RE = /\.(c|h|S|lds|dts|dtsi|inc)$/i;
-// A resolved configuration (defconfig loaded in the KConfig view) has far more than the default seeds
-const MIN_CONFIG_SYMBOLS = 50;
+// Files the build banner reports on (sources Kbuild compiles and the headers/DTs they use)
+const BUILD_TRACKED_RE = /\.(c|h|S|rs|lds|dts|dtsi|inc)$/i;
 
 const ROW_HEIGHT = 20; // 20px per line
 const BUFFER_LINES = 15; // lines buffered above and below viewport
@@ -46,10 +46,16 @@ export class VirtualEditor {
 
     this.directiveEvaluator = new DirectiveEvaluator();
     this.dimmedLines = new Set();
+    // Compiled-out lines shown undimmed (toggled from the #ifdef chip; lasts until toggled back or reload)
+    this.dimSuspended = false;
+    // Build condition of the open file: { key: "version|arch|path", cond } (re-evaluated on config edits)
+    this.buildCond = null;
+    this.buildToken = 0;
     const refreshDimming = () => {
       if (!this.linesContainer || !this.rawLines.length) return;
       this.computeDimming();
       this.updateVisibleLines();
+      this.refreshBuildBanner();
     };
     state.subscribe("kconfig:engine:changed", refreshDimming);
     state.subscribe("kconfig:assignments:updated", refreshDimming);
@@ -58,9 +64,7 @@ export class VirtualEditor {
 
   /** #ifdef dimming is only active while the Kconfig engine is enabled with a resolved configuration. */
   dimmingAvailable() {
-    return state.kconfigEngineActive
-      && PREPROCESSED_RE.test(this.currentFilePath || "")
-      && Object.keys(state.kconfigAssignments || {}).length / 2 >= MIN_CONFIG_SYMBOLS;
+    return state.kconfigConfigActive() && PREPROCESSED_RE.test(this.currentFilePath || "");
   }
 
   computeDimming() {
@@ -70,13 +74,88 @@ export class VirtualEditor {
       if (chip) chip.style.display = "none";
       return;
     }
-    this.directiveEvaluator.setAssignments(state.kconfigAssignments);
+    const ctx = state.definitionContext();
+    this.directiveEvaluator.setAssignments(ctx.assignments);
+    this.directiveEvaluator.setMacros(archMacros(ctx.arch, ctx.assignments));
     this.dimmedLines = this.directiveEvaluator.evaluateDimmedLines(this.rawLines);
-    if (chip) {
-      chip.style.display = "inline-flex";
-      chip.textContent = `⚙ #ifdef: ${this.dimmedLines.size} line${this.dimmedLines.size === 1 ? "" : "s"} compiled out`;
-      chip.title = "Lines inside #if/#ifdef branches disabled by the KConfig engine's current configuration.\nToggle the engine in the KConfig view to turn dimming off.";
+    if (chip) this.updateDimChip(chip);
+  }
+
+  updateDimChip(chip) {
+    const count = `${this.dimmedLines.size} line${this.dimmedLines.size === 1 ? "" : "s"} compiled out`;
+    chip.style.display = "inline-flex";
+    chip.classList.toggle("suspended", this.dimSuspended);
+    chip.setAttribute("aria-pressed", String(this.dimSuspended));
+    chip.textContent = this.dimSuspended ? `⚙ #ifdef: ${count} (not dimmed)` : `⚙ #ifdef: ${count}`;
+    chip.title = this.dimSuspended
+      ? "Compiled-out lines are shown normally. Click to dim them again."
+      : "Lines inside #if/#ifdef branches disabled by the KConfig engine's current configuration.\nClick to stop dimming them for now (toggle the engine in the KConfig view to turn dimming off).";
+  }
+
+  /** Temporarily show compiled-out lines undimmed (or dim them again); not persisted. */
+  toggleDimSuspended() {
+    this.dimSuspended = !this.dimSuspended;
+    const chip = this.containerEl?.querySelector("#kconfig-dim-chip");
+    if (chip && this.dimmingAvailable()) this.updateDimChip(chip);
+    this.updateVisibleLines();
+  }
+
+  /**
+   * Banner at the top of the file when the KConfig engine's configuration does not compile it (Kbuild
+   * condition "n", e.g. obj-$(CONFIG_FOO) += foo.o with FOO=n, or another architecture's tree), and a
+   * note when it is only built as a module.
+   */
+  async refreshBuildBanner() {
+    const banner = this.containerEl?.querySelector("#code-build-banner");
+    if (!banner) return;
+    const path = this.currentFilePath || "";
+    if (!state.kconfigConfigActive() || this.isDoc || !BUILD_TRACKED_RE.test(path)) {
+      banner.hidden = true;
+      return;
     }
+    const ctx = state.definitionContext();
+    const key = `${this.currentVersion}|${ctx.arch}|${path}`;
+    if (this.buildCond?.key !== key) {
+      const token = ++this.buildToken;
+      let cond = null;
+      try {
+        cond = (await api.getBuildConditions(this.currentVersion, [path], ctx.arch))?.files?.[path] || null;
+      } catch (err) {
+        console.warn("Build condition unavailable:", err);
+      }
+      if (token !== this.buildToken || path !== this.currentFilePath) return;
+      this.buildCond = { key, cond };
+    }
+    const cond = this.buildCond.cond;
+    const lookup = configLookup(ctx);
+    const result = cond ? evalBuild(cond.expr, lookup) : "?";
+    const arch = escapeHtml(ctx.arch);
+    const rule = cond?.rules?.[0];
+    const ruleHtml = rule
+      ? `<button class="code-build-rule" data-mk="${escapeHtml(rule.makefile)}" data-line="${rule.line}" title="Open the Kbuild rule">${escapeHtml(rule.makefile)}:${rule.line} <code>${escapeHtml(rule.text)}</code></button>`
+      : "";
+    if (result === "n") {
+      let why = escapeHtml(cond.reason || "");
+      if (cond.status === "rule") {
+        const { symbols, more } = explainBuild(cond.expr, lookup);
+        why = `Needs ${symbols.map((s) => `<code>${escapeHtml(s.replace(/=.*$/, ""))}</code>`).join(" + ") || "its Kbuild condition"}`
+          + ` (currently ${symbols.map((s) => escapeHtml(s.replace(/^CONFIG_/, ""))).join(", ")})`
+          + (more ? `, or one of ${more} other rule${more === 1 ? "" : "s"}` : "");
+      }
+      banner.className = "code-build-banner not-built";
+      banner.innerHTML = `<span class="code-build-icon">⛔</span><span><strong>Not compiled</strong> for ARCH=${arch} with the current KConfig configuration. ${why}</span>${ruleHtml}`;
+    } else if (result === "m") {
+      banner.className = "code-build-banner module";
+      banner.innerHTML = `<span class="code-build-icon">📦</span><span>Built as a <strong>module</strong> for ARCH=${arch} with the current KConfig configuration.</span>${ruleHtml}`;
+    } else {
+      banner.hidden = true;
+      return;
+    }
+    banner.hidden = false;
+    banner.querySelector(".code-build-rule")?.addEventListener("click", (e) => {
+      const btn = e.currentTarget;
+      state.openTab({ type: "code", title: btn.dataset.mk.split("/").pop(), path: btn.dataset.mk, cursorLine: Number(btn.dataset.line) || 1, version: this.currentVersion });
+    });
   }
 
   async render(containerEl, tabData) {
@@ -119,7 +198,7 @@ export class VirtualEditor {
           </div>
           <div class="code-actions">
             ${this.isDoc ? `<button class="code-btn ${this.docMode === "rendered" ? "active" : ""}" id="btn-doc-toggle" title="Toggle rendered documentation / raw source">${this.docMode === "rendered" ? "📖 Rendered" : "&lt;/&gt; Source"}</button>` : ""}
-            <span id="kconfig-dim-chip" class="code-dim-chip" style="display:none;"></span>
+            <button type="button" id="kconfig-dim-chip" class="code-dim-chip" style="display:none;" aria-pressed="false"></button>
             ${this.diffMarks ? `<span class="code-diffmark-chip ${this.diffMarks.kind === "del" ? "del" : "add"}" title="Lines ${this.diffMarks.kind === "del" ? "removed" : "added or changed"} by commit ${this.diffMarks.commit || ""}">
               ± ${(this.diffMarks.commit || "").slice(0, 8)}: ${this.diffMarkedLines.size} line${this.diffMarkedLines.size === 1 ? "" : "s"} ${this.diffMarks.kind === "del" ? "removed" : "changed"}
               <button data-diffnav="-1" title="Previous change">↑</button><button data-diffnav="1" title="Next change">↓</button><button data-diffnav="0" title="Clear change markers">✕</button>
@@ -131,6 +210,7 @@ export class VirtualEditor {
             <button class="code-btn" id="btn-create-patch" title="Edit this file and generate a git format-patch">✎ Patch</button>
           </div>
         </div>
+        <div class="code-build-banner" id="code-build-banner" hidden></div>
         <div class="editor-body">
           <div class="virtual-scroll-viewport" id="editor-viewport">
             <div class="virtual-scroll-spacer" id="editor-spacer"></div>
@@ -163,6 +243,8 @@ export class VirtualEditor {
     clipboard.attach(this.linesContainer);
 
     // Toolbar actions
+    containerEl.querySelector("#kconfig-dim-chip").onclick = () => this.toggleDimSuspended();
+
     const docToggle = containerEl.querySelector("#btn-doc-toggle");
     if (docToggle) {
       docToggle.onclick = () => this.setDocMode(this.docMode === "rendered" ? "source" : "rendered");
@@ -429,6 +511,7 @@ export class VirtualEditor {
       }
 
       this.computeDimming();
+      this.refreshBuildBanner();
 
       if (this.docMode === "rendered") {
         this.renderDocPage(content);
@@ -541,7 +624,7 @@ export class VirtualEditor {
       const lineNo = i + 1;
       const rawText = this.rawLines[i];
       const isHighlighted = lineNo === this.targetCursorLine;
-      const isDimmed = this.dimmedLines.has(lineNo);
+      const isDimmed = !this.dimSuspended && this.dimmedLines.has(lineNo);
       const diffCls = this.diffMarkedLines.has(lineNo) ? (this.diffMarks.kind === "del" ? " diff-mark-del" : " diff-mark-add") : "";
 
       const blameHtml = this.showBlame ? this.blameView.renderGutterCell(lineNo) : "";

@@ -1,16 +1,17 @@
-"""tests/test_tree_resolver.py - Comprehensive Unit Tests for Dual-Path TreeResolver & 6-Tier Disambiguation."""
+"""tests/test_tree_resolver.py - Unit Tests for the Dual-Path TreeResolver, Git tree resolver & arch-aware definition ranking."""
 from __future__ import annotations
 
 import unittest
 from unittest.mock import MagicMock
 
-from core.globalstuff import SymbolLinkage, SymbolRole
+from core.globalstuff import SymbolLinkage
 from webapp.backend.services.tree_resolver import (
     GitTreeResolver,
     TreeResolverService,
-    DisambiguationEngine,
-    SymbolRefContext,
-    SymbolDefCandidate,
+    arch_bits,
+    best_path,
+    definition_rank,
+    path_arch_group,
 )
 
 
@@ -181,234 +182,70 @@ class TestGitTreeBlobPaths(unittest.TestCase):
         self.assertEqual([(r["def_id"], r["file_path"]) for r in results], [(2, "init/main.c"), (3, "mm/slab.c")])
 
 
-class TestDisambiguationEngine(unittest.TestCase):
-    """Test suite for the 6-Tier Disambiguation Engine."""
+class TestDefinitionRanking(unittest.TestCase):
+    """Arch-aware ordering of a symbol's definitions (definition_rank / best_path)."""
 
-    def test_tier_1_same_blob_and_static_disqualification(self) -> None:
-        """Verify Tier 1 awards 100 to same-blob definitions and disqualifies foreign static definitions."""
-        ref = SymbolRefContext(
-            name="foo",
-            source_fnid=1,
-            source_blob_id=10,
-            ref_ast_id=50,
-            source_path="kernel/sched/core.c",
-        )
+    def _order(self, defs: list[tuple[str, int]], srcarch: str = "x86", bits: int | None = 64) -> list[str]:
+        return [p for p, _ in sorted(defs, key=lambda d: definition_rank(d[0], d[1], 1, srcarch, bits))]
 
-        cand_local = SymbolDefCandidate(
-            def_id=1,
-            blob_id=10,  # same blob
-            fnid=1,
-            file_path="kernel/sched/core.c",
-            name="foo",
-            type_id=1,
-            ast_id=50,
-            linkage=SymbolLinkage.InternalStaticDef,
-        )
+    def test_own_arch_before_generic_asm_generic_and_other_arches(self) -> None:
+        defs = [
+            ("arch/alpha/include/asm/ptrace.h", SymbolLinkage.ExternalDef),
+            ("include/asm-generic/ptrace.h", SymbolLinkage.ExternalDef),
+            ("kernel/ptrace.c", SymbolLinkage.ExternalDef),
+            ("arch/x86/include/asm/ptrace.h", SymbolLinkage.ExternalDef),
+        ]
+        self.assertEqual(self._order(defs), [
+            "arch/x86/include/asm/ptrace.h", "kernel/ptrace.c", "include/asm-generic/ptrace.h", "arch/alpha/include/asm/ptrace.h",
+        ])
+        self.assertEqual(self._order(defs, "alpha", 64)[0], "arch/alpha/include/asm/ptrace.h")
 
-        cand_foreign_static = SymbolDefCandidate(
-            def_id=2,
-            blob_id=20,  # different blob
-            fnid=2,
-            file_path="kernel/fork.c",
-            name="foo",
-            type_id=1,
-            ast_id=50,
-            linkage=SymbolLinkage.InternalStaticDef,
-        )
+    def test_word_size_and_linkage(self) -> None:
+        defs = [
+            ("arch/x86/kernel/process_32.c", SymbolLinkage.ExternalDef),
+            ("arch/x86/kernel/process_64.c", SymbolLinkage.ExternalDef),
+        ]
+        self.assertEqual(self._order(defs, bits=64)[0], "arch/x86/kernel/process_64.c")
+        self.assertEqual(self._order(defs, bits=32)[0], "arch/x86/kernel/process_32.c")
+        # A prototype never wins over a body, even in the own arch tree; weak definitions come after strong ones
+        defs = [
+            ("arch/x86/include/asm/setup.h", SymbolLinkage.PrototypeDecl),
+            ("kernel/weak.c", SymbolLinkage.WeakOrAliasDef),
+            ("lib/strong.c", SymbolLinkage.ExternalDef),
+        ]
+        self.assertEqual(self._order(defs), ["lib/strong.c", "kernel/weak.c", "arch/x86/include/asm/setup.h"])
 
-        score_local = DisambiguationEngine.score_candidate(ref, cand_local)
-        self.assertEqual(score_local, 100.0)
+    def test_best_path_and_arch_helpers(self) -> None:
+        self.assertEqual(best_path(["arch/arm/x.h", "arch/x86/x.h", "include/x.h"], "x86", 64), "arch/x86/x.h")
+        self.assertEqual(best_path(["arch/x86/x.h", "arch/um/x.h"], "um", None), "arch/um/x.h")
+        self.assertIsNone(best_path([], "x86", 64))
+        self.assertEqual((arch_bits("x86_64"), arch_bits("i386"), arch_bits("x86"), arch_bits("arm64")), (64, 32, None, 64))
+        self.assertEqual(path_arch_group("arch/x86/kernel/setup.c", "um"), 0)
 
-        score_foreign_static = DisambiguationEngine.score_candidate(ref, cand_foreign_static)
-        self.assertEqual(score_foreign_static, -1.0)
+    def test_symbol_detail_picks_the_arch_definition(self) -> None:
+        from unittest.mock import patch
+        from webapp.backend.services import symbol_service as ss
 
-        ranked = DisambiguationEngine.rank_candidates(ref, [cand_local, cand_foreign_static])
-        self.assertEqual(len(ranked), 1)
-        self.assertEqual(ranked[0][1].def_id, 1)
-
-    def test_tier_2_compiler_target_fnid_provenance(self) -> None:
-        """Verify Tier 2 scores 95.0 when cand.fnid matches compiler-verified ref.target_fnid."""
-        ref = SymbolRefContext(
-            name="schedule",
-            source_fnid=1,
-            source_blob_id=10,
-            ref_ast_id=100,
-            target_fnid=7,  # include/linux/sched.h
-            source_path="kernel/sched/core.c",
-        )
-
-        cand_verified = SymbolDefCandidate(
-            def_id=10,
-            blob_id=70,
-            fnid=7,  # matches target_fnid
-            file_path="include/linux/sched.h",
-            name="schedule",
-            type_id=1,
-            ast_id=100,
-            linkage=SymbolLinkage.PrototypeDecl,
-        )
-
-        cand_unverified = SymbolDefCandidate(
-            def_id=11,
-            blob_id=80,
-            fnid=8,
-            file_path="drivers/net/other.h",
-            name="schedule",
-            type_id=1,
-            ast_id=100,
-            linkage=SymbolLinkage.PrototypeDecl,
-        )
-
-        ranked = DisambiguationEngine.rank_candidates(ref, [cand_unverified, cand_verified])
-        self.assertEqual(ranked[0][0], 95.0)
-        self.assertEqual(ranked[0][1].def_id, 10)
-
-    def test_tier_3_include_graph_closure(self) -> None:
-        """Verify Tier 3 scores 88.0 for direct includes (depth=1) and 82.0 for transitive includes."""
-        ref = SymbolRefContext(
-            name="kfree",
-            source_fnid=1,
-            source_blob_id=10,
-            ref_ast_id=200,
-            source_path="mm/slab.c",
-        )
-
-        cand_direct = SymbolDefCandidate(
-            def_id=1,
-            blob_id=20,
-            fnid=2,
-            file_path="include/linux/slab.h",
-            name="kfree",
-            type_id=1,
-            ast_id=200,
-            include_depth=1,
-        )
-
-        cand_transitive = SymbolDefCandidate(
-            def_id=2,
-            blob_id=30,
-            fnid=3,
-            file_path="include/linux/types.h",
-            name="kfree",
-            type_id=1,
-            ast_id=200,
-            include_depth=3,
-        )
-
-        self.assertEqual(DisambiguationEngine.score_candidate(ref, cand_direct), 88.0)
-        self.assertEqual(DisambiguationEngine.score_candidate(ref, cand_transitive), 82.0)
-
-    def test_tier_4_kbuild_compilation_unit_and_directory_proximity(self) -> None:
-        """Verify Tier 4 scores candidates in same Kbuild compilation unit and awards directory bonus."""
-        ref = SymbolRefContext(
-            name="e1000_init",
-            source_fnid=10,
-            source_blob_id=100,
-            ref_ast_id=300,
-            source_path="drivers/net/ethernet/intel/e1000/e1000_main.c",
-            kbuild_target_obj="drivers/net/ethernet/intel/e1000/e1000.o",
-        )
-
-        cand_same_unit = SymbolDefCandidate(
-            def_id=1,
-            blob_id=101,
-            fnid=11,
-            file_path="drivers/net/ethernet/intel/e1000/e1000_hw.c",
-            name="e1000_init",
-            type_id=1,
-            ast_id=300,
-            kbuild_target_obj="drivers/net/ethernet/intel/e1000/e1000.o",
-        )
-
-        cand_other_dir = SymbolDefCandidate(
-            def_id=2,
-            blob_id=200,
-            fnid=20,
-            file_path="sound/pci/e1000.c",
-            name="e1000_init",
-            type_id=1,
-            ast_id=300,
-            kbuild_target_obj="sound/pci/snd.o",
-        )
-
-        ranked = DisambiguationEngine.rank_candidates(ref, [cand_other_dir, cand_same_unit])
-        self.assertGreater(ranked[0][0], 75.0)
-        self.assertEqual(ranked[0][1].def_id, 1)
-
-    def test_tier_5_structural_ast_and_arch_affinity(self) -> None:
-        """Verify Tier 5 scores exact structural AST match and architecture affinity."""
-        ref = SymbolRefContext(
-            name="setup_arch",
-            source_fnid=1,
-            source_blob_id=10,
-            ref_ast_id=500,
-            source_path="init/main.c",
-            target_arch="x86",
-        )
-
-        cand_x86 = SymbolDefCandidate(
-            def_id=1,
-            blob_id=50,
-            fnid=5,
-            file_path="arch/x86/kernel/setup.c",
-            name="setup_arch",
-            type_id=1,
-            ast_id=500,
-        )
-
-        cand_arm = SymbolDefCandidate(
-            def_id=2,
-            blob_id=60,
-            fnid=6,
-            file_path="arch/arm/kernel/setup.c",
-            name="setup_arch",
-            type_id=1,
-            ast_id=500,
-        )
-
-        score_x86 = DisambiguationEngine.score_candidate(ref, cand_x86)
-        score_arm = DisambiguationEngine.score_candidate(ref, cand_arm)
-        self.assertEqual(score_x86, 70.0)  # 65 + 5 arch bonus
-        self.assertEqual(score_arm, 65.0)
-
-    def test_tier_6_weak_linkage_penalty_and_export_symbol_boost(self) -> None:
-        """Verify Tier 6 penalizes weak linkage and boosts EXPORT_SYMBOL definitions."""
-        ref = SymbolRefContext(
-            name="do_something",
-            source_fnid=1,
-            source_blob_id=10,
-            ref_ast_id=600,
-        )
-
-        cand_strong_exported = SymbolDefCandidate(
-            def_id=1,
-            blob_id=70,
-            fnid=7,
-            file_path="kernel/foo.c",
-            name="do_something",
-            type_id=1,
-            ast_id=999,  # different AST shape
-            linkage=SymbolLinkage.ExternalDef,
-            has_export_symbol=True,
-        )
-
-        cand_weak = SymbolDefCandidate(
-            def_id=2,
-            blob_id=80,
-            fnid=8,
-            file_path="kernel/bar.c",
-            name="do_something",
-            type_id=1,
-            ast_id=999,
-            linkage=SymbolLinkage.WeakOrAliasDef,
-            has_export_symbol=False,
-        )
-
-        score_strong = DisambiguationEngine.score_candidate(ref, cand_strong_exported)
-        score_weak = DisambiguationEngine.score_candidate(ref, cand_weak)
-
-        self.assertEqual(score_strong, 58.0)  # 55 + 3
-        self.assertEqual(score_weak, 45.0)    # 55 - 10
+        rows = [
+            {"def_id": d, "ast_id": d, "name": "setup_arch", "type_id": 1, "type_name": "C_function", "fid": b,
+             "line_s": 10 * d, "line_e": 10 * d + 5, "tag_id": d, "linkage": 0}
+            for d, b in ((1, 10), (2, 20), (3, 30))
+        ]
+        cursor = MagicMock()
+        cursor.fetchall.return_value = rows
+        ctx = MagicMock()
+        ctx.__enter__.return_value = cursor
+        blob_paths = {10: ["arch/alpha/kernel/setup.c"], 20: ["arch/x86/kernel/setup.c"], 30: ["arch/arm/kernel/setup.c"]}
+        with patch.object(ss, "get_db_cursor", return_value=ctx), \
+             patch.object(ss.SymbolService, "_scope", return_value=(1, "v3.0", blob_paths)), \
+             patch.object(ss, "definition_arch", side_effect=lambda v, a: (a, {"x86_64": "x86"}.get(a, a), 64)), \
+             patch.object(ss.SymbolService, "get_symbol_xref", return_value={}):
+            x86 = ss.SymbolService().get_symbol_detail("v3.0", "setup_arch", "x86_64")
+            arm = ss.SymbolService().get_symbol_detail("v3.0", "setup_arch", "arm")
+        self.assertEqual((x86["file_path"], x86["line_s"], x86["arch"]), ("arch/x86/kernel/setup.c", 20, "x86_64"))
+        self.assertEqual([d["file"] for d in x86["definitions"]],
+                         ["arch/x86/kernel/setup.c", "arch/alpha/kernel/setup.c", "arch/arm/kernel/setup.c"])
+        self.assertEqual(arm["file_path"], "arch/arm/kernel/setup.c")
 
 
 if __name__ == "__main__":

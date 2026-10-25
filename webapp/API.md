@@ -24,11 +24,12 @@ webapp/
 │   ├── services/
 │   │   ├── git_reader.py           # Persistent Git object readers (git cat-file --batch), one per repository
 │   │   ├── docs_service.py         # Documentation label index & kernel-doc comment extraction
-│   │   ├── tree_resolver.py        # Tri-Path Git tree resolver & 6-Tier symbol disambiguation
+│   │   ├── tree_resolver.py        # Tri-Path Git tree resolver & arch-aware definition ranking
 │   │   ├── filesystem_service.py   # Tree traversal, file maps, include resolver, treemap
 │   │   ├── symbol_service.py       # Multi-table symbol search, XRefs, AST containers
 │   │   ├── history_service.py      # Release-by-release history of definitions & Kconfig symbols
-│   │   ├── kconfig_service.py      # Defconfigs, Menuconfig hierarchy, constraint solver
+│   │   ├── kconfig_service.py      # Defconfigs, Menuconfig hierarchy, constraint solver, Kbuild build conditions
+│   │   ├── sync_service.py         # Change tokens (db, frontend, parsed, git) & X-KIP-Sync header
 │   │   ├── maintainer_service.py   # Subsystems catalog, CREDITS, patch match engine
 │   │   ├── git_service.py          # Line-by-line blame, commits log, RFC-2822 format-patch
 │   │   ├── pahole_service.py       # Struct memory alignment, padding holes, cachelines
@@ -44,13 +45,15 @@ webapp/
 │       ├── docs.py                 # Documentation labels & kernel-doc
 │       └── tools.py                # Pahole layout, callgraph, semantic version diff
 ├── frontend/
-│   ├── index.html                  # Semantic single-page application shell
+│   ├── index.html                  # Single-page application shell (served with its build's asset URLs)
+│   ├── boot.js                     # Loader of the build's modules, recovers from a stale cached shell
 │   ├── manifest.json               # Progressive Web App (PWA) manifest
-│   ├── sw.js                       # Service Worker with Cache-First offline caching
+│   ├── sw.js                       # Service Worker: cached shell, per-build assets, API offline fallback
 │   ├── vendor/two.min.js           # Vendored vector schematic engine
 │   ├── css/                        # Modular Design System tokens & layout
 │   └── js/
 │       ├── api.js                  # Frontend HTTP client with offline IndexedDB fallback
+│       ├── sync.js                 # Server change tokens: cache invalidation, version refresh, new builds
 │       ├── db.js                   # Client-side IndexedDB persistence layer
 │       ├── state.js                # Reactive global state bus & multi-tab persistence
 │       ├── url_sync.js             # Bi-directional URL hash routing
@@ -99,7 +102,7 @@ The `webapp/` backend operates exclusively as a read-only presentation and query
 5. **Context Menu Interaction Preservation**: Right-click context menus (`contextmenu`) across webapp workspaces (virtual code editor, file explorer sidebar, nodemap canvas) intercept default browser menus and offer context-adaptive actions (definitions, references, git blame popovers, command palette search, coordinate copying), while strictly preserving primary left-click interactions (inline AST token inspector popups, file navigation, node selection) without collision, event race conditions, or lingering ghost menus.
 6. **Structured Cross-Reference Classification**: Symbol cross-reference backend services (`get_symbol_xref`) and frontend inspectors (`showXrefModal`) return and render both primary and multi-declaration definition locations (`definitions: [...]` with file path, line bounds, and AST declaration type) alongside categorized usage references (`references: [...]` with caller function, file, line, and typed badges `Call`, `MemberRef`, `TypeUsage`, `DeclRef`, `MacroExpansion`), providing direct 1-click jump navigation for both definitions and usages.
 
-### 2.7. Tri-Path Tree Resolution & 6-Tier Symbol Disambiguation (`webapp/backend/services/tree_resolver.py`)
+### 2.7. Tri-Path Tree Resolution & Arch-Aware Definition Ranking (`webapp/backend/services/tree_resolver.py`)
 1. **Database Tree Resolution (`TreeResolverService`, module singleton `tree_resolver`)**:
    - **Path A (Single-File Lookup, `<0.2ms`)**: Resolves the exact `blob_id` of a specific `fnid` at any `commit_id` by walking `parent_idx = 0` backwards to the nearest `m_bridge_checkpoint`. If an `m_commit_file` delta intervened along that chain, returns the delta's `blob_id` (or `None` if deleted with `change_type == 'D'`). If untouched, returns the checkpoint's baseline `blob_id`.
    - **Path B (Full-Tree Resolution, `<15ms`, LRU Cached)**: Assembles the entire active `{fnid: blob_id}` repository tree at any `commit_id` by loading baseline snapshot records from `m_bridge_checkpoint` and chronologically applying forward `m_commit_file` deltas along the first-parent DAG. Results are cached in an in-memory `OrderedDict` LRU cache.
@@ -108,14 +111,13 @@ The `webapp/` backend operates exclusively as a read-only presentation and query
    - **Path C (Full-Tree Listing, `~50ms` cold, LRU Cached per commit SHA)**: `list_tree(rev)` resolves any revision (tag, branch, full/short SHA, even commits never ingested into `m_commit`) via `git rev-parse --verify <rev>^{commit}` and returns `{path: blob_sha}` from `git ls-tree -r -z --full-tree`. Submodule entries are skipped. This is the authoritative file list for every revision.
    - `map_blob_hashes(cursor, blob_shas)` joins the Git blob SHAs to `m_file_blob.blob_hash` (`blob_hash` == Git blob SHA-1) and returns `{blob_sha: (blob_id, ftype)}`, preferring typed (`ftype != 0`) rows. Blobs absent from the map were never parsed (unindexed).
    - `blob_paths(cursor, rev)` returns `{blob_id: [paths]}` for the indexed blobs of the revision's tree (sorted paths; one blob may sit at several paths). It is cached per commit SHA (8 entries) for `BLOB_PATHS_TTL` = 120 s, so blobs indexed by a running parse appear without a restart. Symbol services use it to scope `m_symbol_def` (content-addressed by `blob_id`) to any revision; see §4 *Revision scoping of symbol queries*.
-3. **6-Tier Symbol Disambiguation Engine (`DisambiguationEngine`)**:
-   When multiple candidates match a queried symbol name, candidate definitions are ranked by a deterministic composite scoring rule:
-   - **Tier 1 (Score 100.0)**: Same-blob local scope (`cand.blob_id == ref.source_blob_id`). Foreign `InternalStaticDef` definitions in other blobs are disqualified (`Score = -1.0`).
-   - **Tier 2 (Score 95.0)**: Compiler-verified target path provenance (`cand.fnid == ref.target_fnid`).
-   - **Tier 3 (Score 88.0 / 82.0)**: Include graph closure via `m_file_reference` (direct depth 1 = 88.0, transitive depth <= 4 = 82.0).
-   - **Tier 4 (Score 75.0+)**: Kbuild compilation unit match (same `.o`/`.ko` target or same `CONFIG_*` gate) with directory proximity prefix bonus.
-   - **Tier 5 (Score 65.0+)**: Exact structural AST signature match (`cand.ast_id == ref.ref_ast_id`) + architecture subtree affinity (`arch/<target_arch>/`).
-   - **Tier 6 (Score 55.0+)**: Strong `ExternalDef` vs. `WeakOrAliasDef` (-10.0 penalty) + `EXPORT_SYMBOL` authority (+3.0 boost).
+3. **Arch-Aware Definition Ranking (`definition_rank`, `best_path`, `definition_arch`)**:
+   A symbol defined once per architecture (`struct pt_regs`, `setup_arch`, `thread_struct`...) resolves to the definition of one ARCH value: the `arch` parameter of the symbol endpoints, which the frontend sets to the KConfig engine's ARCH while the engine is on with a resolved configuration, and to `x86_64` otherwise (§5.19). `definition_arch(version, arch)` maps the ARCH value to its source directory through `KconfigService.resolve_arch` (`x86_64`/`i386` → `x86`; unknown values fall back to `x86_64`) and its word size (`arch_bits`: `x86_64` → 64, `i386` → 32, generic `x86` → none). Definitions are ordered by:
+   - prototypes (`SymbolLinkage.PrototypeDecl`) after every definition with a body;
+   - path group (`path_arch_group`): `arch/<srcarch>/` (plus `arch/x86/` for ARCH=um), then generic code, then `include/asm-generic/`, then other architectures;
+   - word size: files of the other word size (`process_32.c` on x86_64, `page_64.h` on i386) after the others;
+   - weak/alias definitions (`WeakOrAliasDef`) after strong ones, then path and line.
+   A blob present at several paths is reported at its best-ranked path (`best_path`). Choosing between `#ifdef` branches of one file and between files Kbuild does not compile is done by the frontend against the actual configuration (§5.19).
 
 ### 2.8. 3-Level Semantic Cross-Version Diff Engine (`webapp/backend/services/diff_service.py`)
 Either side of a comparison may be a release tag, a branch, or an arbitrary commit SHA. Comparison is evaluated in three progressive tiers to optimize latency:
@@ -133,7 +135,7 @@ Either side of a comparison may be a release tag, a branch, or an arbitrary comm
    - Preprocessor `#include` resolution leverages compiler-verified `m_file_reference` (`ref_type=1`) provenance.
    - Backward-compatible JSON field mappings (`vid` = `commit_id`, `fid` = `blob_id`) are preserved so all frontend clients continue functioning seamlessly.
 2. **Commit Hash Formatting (`format_commit_hash`)**:
-   `m_commit.commit_hash` stores 20-byte binary Git SHA-1 digests (`BINARY(20)`). Backend services (`git_service.py`, `helpers.py`) format binary hashes using `format_commit_hash(val)` (`bytes(val).hex()`), ensuring 40-character lowercase hexadecimal strings in all JSON API responses. API endpoints support both 40-character hexadecimal queries (using SQL `UNHEX(%s)`), short commit hash prefixes, and legacy integer `commit_id` values.
+   `m_commit.commit_hash` stores 20-byte binary Git SHA-1 digests (`BINARY(20)`). Backend services (`git_service.py`, `helpers.py`) format binary hashes using `format_commit_hash(val)` / `hash_hex(val)` (`bytes(val).hex()`; a `str` that mysql-connector returned for a hash whose bytes happen to be valid UTF-8 is re-encoded to its 20 bytes first), ensuring 40-character lowercase hexadecimal strings in all JSON API responses. API endpoints support both 40-character hexadecimal queries (using SQL `UNHEX(%s)`), short commit hash prefixes, and legacy integer `commit_id` values.
 
 ---
 
@@ -143,6 +145,22 @@ Either side of a comparison may be a release tag, a branch, or an arbitrary comm
 3. **Database scoping**: `get_active_repo_id(cursor)` maps the repository to `m_repository.repo_id` (by name, then `git_url`; `-1` when never parsed). Version resolution (`get_version_info`) and the version/branch catalogs only consider that repository's `m_git_ref` rows. Commit ids, blobs and tags are global and need no scoping.
 4. **Caches**: Module caches keyed by version names (`_FILE_TOKENS_CACHE`, `_INCLUDE_CACHE`, `_TREEMAP_CACHE`, `_DEFCONFIG_CACHE`, `_TREE_CACHE`, `_MAINTAINER_CACHE`, `_FILE_SUBSYSTEMS_CACHE`, version name/id caches) are `RepoScopedCache` instances that transparently prefix keys with the repository name; the git file-history LRU cache takes the repository path as an argument.
 5. **Unparsed repositories** remain browsable: tags absent from `m_git_ref` resolve through `git rev-parse` to `vid = 0`, and trees, files, searches, diffs and treemaps read Git directly.
+
+### 2.11. Client Synchronization & Build-Bound Assets (`webapp/backend/services/sync_service.py`, `webapp/frontend/js/sync.js`)
+Clients must follow server changes without the user knowing to reload. The server keeps four change tokens (12-hex digests, cached so most requests cost no database or Git work):
+| Token | Covers | Computed from (cache) | Client reaction |
+|---|---|---|---|
+| `db` | Database rebuilt | `m_db_instance` (30 s) | Every cached API response is dropped |
+| `frontend` | Webapp code changed | SHA-256 of the files under `webapp/frontend/` (path + content), recomputed only when a file's size, mtime, ctime or inode changed (checked every 5 s); identical files give the same build across restarts | The page reloads into the new build (see below) |
+| `parsed` | Versions of the active repository finished, re-parsed or rolled back | `m_git_ref` + `m_ingest_state` of the repository, unfinished versions excluded (15 s) | Version/branch lists are refetched; cached data of versions whose stamp changed is dropped. On the server, a change also clears the per-version caches (`clear_parse_dependent_caches()`: version-name maps, file tokens, include resolution, maintainers, history facts, blob-path maps) |
+| `git` | Tags fetched, branches moved | `git for-each-ref` of the repository (15 s) | Same as `parsed` |
+- **Delivery**: `GET /api/sync` returns all four. `SyncHeaderMiddleware` (inside `RepoContextMiddleware`, so tokens are those of the request's repository) adds `X-KIP-Sync: <db>.<parsed>.<git>` to every `/api/` response, so any request reveals a change without polling.
+- **When clients check**: `syncManager.start()` runs once when the page opens (replacing the former `api.checkDbSync()`): it compares `db`, `parsed` and `git` with the tokens seen last (`meta/sync_tokens`), then follows the `X-KIP-Sync` headers. The `frontend` token is only compared when the page opens **and** the last frontend check (`localStorage["kip-last-frontend-check"]`) is more than an hour old; there is no polling.
+- **Version stamps**: `/api/versions` and `/api/branches` give each version a `stamp` (`<commit sha[:12]>.<parse completion time>`, `.0` for versions parsed before `m_ingest_state`, `.git` when not parsed; a branch uses its current Git head). `api._vk(version)` puts `"<name>@<stamp>~"` into every version-scoped cache key, so a re-parsed version or a moved branch never serves older cached data; `syncManager.refreshVersions()` deletes the entries of versions whose stamp changed (`localDB.deleteDataWhere`, `isStaleKey`) and emits `versions:updated` (`{changed, removed, added, newlyIndexed}`); `app.js` then rebuilds the selectors, toasts newly indexed versions and re-renders open views of changed versions. A change of cache-key layout (`CACHE_LAYOUT`) clears the data stores once.
+- **Build-bound assets**: `GET /` renders `index.html` with `__KIP_BUILD__` replaced by the current build (`<meta name="kip-build">`) and every `"/static/` URL rewritten to `"/b/<build>/` (`render_index()`); relative ES-module imports inherit the prefix. `GET /b/{build}/{path}` serves the current build's files with `Cache-Control: public, max-age=31536000, immutable` and answers **409** for any other build, so a page never mixes modules of two builds. The shell and `/boot.js` are sent with `Cache-Control: private, max-age=3600`, `sw.js` with `no-cache`. Legacy `/static/`, `/js/`, `/css/` mounts stay for direct access.
+- **`boot.js`** (classic external script, the CSP forbids inline ones): sets `window.KIP_BUILD` and imports the build's `app.js` (`data-entry`). If the import fails (409: the cached shell is older than the server's build and its modules are not cached), it deletes the `kip-shell`/`kip-assets` caches and reloads once (`sessionStorage["kip-stale-build-reload"]` prevents a loop; a second failure shows an error box). `window.KIP_RELOAD_TO_LATEST()` does the same on request. `app.js` starts on `DOMContentLoaded`, or immediately when the import resolves after it.
+- **Service worker** (`sw.js`): `kip-shell` holds `/` (every shell path and query share one entry) and `/boot.js`, cache-first; `kip-assets` holds `/b/<build>/…`, cache-first (the page posts `{type: "prune", build}` on start to drop other builds); `kip-api` holds API responses, network-first with cache fallback (`/api/sync` is never cached). Caches not named `kip-*` (e.g. the former `kernel-ide-v10`) are deleted on activation; there is no hand-maintained pre-cache list.
+- **New build announcement** (`syncManager.announceUpdate()`): a bottom banner *"KernelInfo was updated (build …). Reloading in 5 s…"* with **Reload now** and **Later**; the countdown waits while a dialog (`.ki-modal-backdrop`) is open. Reloading drops the cached shell first, so the next page is the new build; tabs and KConfig profiles survive (saved in `localStorage`). **Later** dismisses it until the next hourly check.
 
 ## 3. Database Schema & Underlying Tables
 
@@ -171,7 +189,8 @@ All API endpoints reside under the `/api` prefix. Both canonical version-scoped 
 Versions of the active repository (§2.10): parsed refs from `m_git_ref` (`"indexed": true`) plus every commit-pointing Git tag that was not parsed (`"indexed": false`, `vid: 0`), sorted in Git version order (`versionsort`). Tags pointing at trees (e.g. `v2.6.11`) are skipped.
 - **Query Parameters**:
   - `include_rc` (query, bool): If `true`, unparsed pre-release tags (`-rc`, `-pre`, `-alpha`, `-beta`) are included; parsed refs are always listed. Default `true`.
-- **Entry fields**: `vid`, `vname`, `commit_hash`, `is_prerelease`, `ref_type` (1 tag, 2 branch, 3 commit), `indexed`.
+- **Entry fields**: `vid`, `vname`, `commit_hash`, `is_prerelease`, `ref_type` (1 tag, 2 branch, 3 commit), `indexed`, `stamp` (client cache generation, §2.11).
+- **Unfinished versions**: a ref whose ingestion is still running or was interrupted (`m_ingest_state.status = 1`, see `core/API.md` §4.1) is not listed as indexed (`helpers.finished_ref_sql()`); its tag appears as unparsed (Git-only) until the run completes. Version-name resolution (`get_version_info`) and the history views (`indexed_versions`) apply the same rule.
 - **Response**:
 ```json
 {
@@ -207,7 +226,7 @@ List the configured repositories (core config `"repositories"`, auto-detected un
 ```
 
 #### `GET /api/branches`
-Retrieve the active repository's Git branches: indexed refs (`m_git_ref.ref_type = 2` for its `repo_id`) followed by local Git branches.
+Retrieve the active repository's Git branches: finished indexed refs (`m_git_ref.ref_type = 2` for its `repo_id`) followed by local Git branches. Each entry carries a `stamp` (§2.11) built from the branch's current Git head, so a branch that moved invalidates its cached data.
 - **Query Parameters**: None
 - **Response**:
 ```json
@@ -222,6 +241,13 @@ Retrieve the active repository's Git branches: indexed refs (`m_git_ref.ref_type
   ]
 }
 ```
+
+#### `GET /api/sync`
+Change tokens of the server (§2.11): `{"db", "frontend", "parsed", "git", "repo"}`. Never cached by the service worker.
+```json
+{ "db": "4cf36a4c8bf6", "frontend": "65c1f2a0583b", "parsed": "af7532653070", "git": "07886de81433", "repo": "linux" }
+```
+Every `/api/` response also carries `X-KIP-Sync: <db>.<parsed>.<git>`.
 
 #### `GET /api/db/instance`
 Retrieve the unique database instance hash and initialization timestamp, allowing frontend clients to verify whether the active database has been rebuilt.
@@ -542,6 +568,8 @@ Retrieve authoritative definition information, source location, and cross-refere
 - **Parameters**:
   - `version_name` (path): Kernel version string.
   - `symbol_name` (path): Symbol identifier.
+  - `arch` (query, default `x86_64`): ARCH value whose definition wins when the symbol is defined per architecture (§2.7); also the ARCH whose Kconfig model answers `CONFIG_*` / Kconfig symbols.
+- **Response** also carries `arch` and `definitions` (every in-tree definition in rank order, at most 50: `[{file, line_s, line_e, type_name, ast_id, linkage}]`); `file_path`/`definition` are the first one.
 - **Response**:
 ```json
 {
@@ -565,6 +593,7 @@ Retrieve both definition location(s) and categorized usage references (call site
   - `version_name` (path): Kernel version string.
   - `symbol_name` (path): Symbol identifier.
   - `limit` (query, optional int): Maximum number of reference records to return (useful for symbols with thousands of references like `kmalloc`).
+  - `arch` (query, default `x86_64`): orders `definitions` for that ARCH (§2.7); `definition` is the first.
 - **Response**:
 ```json
 {
@@ -672,7 +701,7 @@ Retrieve imported symbols and target header file path for a preprocessor `CPPro_
 #### `GET /api/symbols/{version_name}/history`
 #### `GET /api/tag/{tag_id}/timeline`
 Release-by-release history of one definition (function, struct, union, enum, typedef, macro, global, ASM label, Rust item...) in the active repository (`HistoryService.get_symbol_history`, `webapp/backend/services/history_service.py`).
-- **Parameters**: `path` and `line` (query) plus optional `name` (the symbol under the cursor) and `ast_id` select the anchor: the narrowest tag of the file at `version_name` covering `line` that is named `name` (else has `ast_id`, else is a definition in `m_symbol_def`). When `name` is not defined at `path:line` (the cursor is on a use), the definition is located through `m_symbol_def` (the requested file first, then definitions with a body, then `.c` files). An anchor that is a Kconfig `config`/`menuconfig` entry returns the Kconfig history below. `include_rc` (bool, default `false`): also list `-rc` tags; by default only final releases (and non-tag refs) are listed. The tag route takes `tag_id` and locates its file through `m_bridge_checkpoint`/`m_commit_file`.
+- **Parameters**: `path` and `line` (query) plus optional `name` (the symbol under the cursor) and `ast_id` select the anchor: the narrowest tag of the file at `version_name` covering `line` that is named `name` (else has `ast_id`, else is a definition in `m_symbol_def`). When `name` is not defined at `path:line` (the cursor is on a use), the definition is located through `m_symbol_def` (the requested file first, then the `arch` query parameter's ranking (§2.7, default `x86_64`), then definitions with a body, then `.c` files). An anchor that is a Kconfig `config`/`menuconfig` entry returns the Kconfig history below. `include_rc` (bool, default `false`): also list `-rc` tags; by default only final releases (and non-tag refs) are listed. The tag route takes `tag_id` and locates its file through `m_bridge_checkpoint`/`m_commit_file`.
 - **Identity**: versions are matched by the anchor's identity, `m_ast.name` + `type_id`, never by `ast_id` (a function's `ast_id` hashes signature + body, so it changes with every code change). When a blob holds several matches, a member of the anchor's `m_moved_tag` lineage (transitive, both directions, bounded to 500 tags) wins, then the one closest to the previous version's line; a renamed lineage member is used only when no tag of the same name remains.
 - **Algorithm**: the file's blob at every listed ref comes from one `git cat-file --batch-check` (content hash → `m_file_blob`). Per ref: same `tag_id` as the previous ref → `unchanged`; another tag → `modified`, or `cosmetic` when the code is identical once comments and whitespace are removed; first appearance → `introduced` (`added` when it reappears); no match → `removed`/`absent`; blob never parsed → `unindexed`; blob parsed without the definition although a non-indented line of the file still names the symbol → `unparsed` (an indexing gap, the previous state is kept). Code comes from `m_tag_code`; diffs (with context lines) compare against the last present version.
 - **Response**:
@@ -775,6 +804,29 @@ Arch-scoped details of a symbol (with or without `CONFIG_`). The same name can b
 Where `CONFIG_<symbol>` is used (Git grep of the revision, cached).
 - **Parameters**: `arch` (default `x86_64`), `limit` (1-2000, default 400).
 - **Response**: `kbuild` (`[{makefile, line, rule, target_obj, path, exists, kind: object|composite|directory, via: rule|condition, compile_mode, other_arch}]`: objects and directories built when the option is enabled, including rules inside `ifeq ($(CONFIG_X),y)` blocks), `source_refs` (`[{file_path, line, text, other_arch}]` in `.c .h .S .lds .dts .dtsi`, `CONFIG_X` and `CONFIG_X_MODULE`), `source_ref_count`, `source_file_count`, `kconfig_refs` (`[{kind: depends_on|select|imply|default|prompt_condition|select_condition|imply_condition, by, file, line}]`). `other_arch` marks paths under another architecture's `arch/` directory.
+
+#### `GET /api/kconfig/{version_name}/build`
+Kbuild build condition of source files: under which configuration `make ARCH=<arch>` compiles each one (`KconfigService.build_conditions`, `parser/kbuild_conditions.py`, see `parser/kconfig_ast/KCONFIG_API.md` §6.4). The condition is an expression over `CONFIG_*` symbols that the client evaluates against its own configuration (`build_condition.js`), so one response serves every configuration of the ARCH. Resolvers are cached per (revision, ARCH) (4 entries); the first request of a revision reads its Makefiles and greps it once for `#include "*.c"` sources (~1 s).
+- **Parameters**: `path` (query, repeatable, up to 64), `arch` (default `x86_64`).
+- **Response**: `{version, arch, srcarch, files: {path: {status, expr, rules, reason}}}`:
+  - `status`: `rule` (Kbuild rules name the object; `expr` says when it is built), `other_arch` (under another architecture's `arch/` tree: never built, `expr` = `"n"`), `no_rule` (the fully parsed Kbuild file of the directory does not mention the object: never built, `expr` = `"n"`), `unknown` (headers, files outside Kbuild, objects built by custom rules, host programs, `#include`d sources, lists computed by `$(shell)`/`$(wildcard)`: `expr` = `"?"`).
+  - `expr`: `"y"`/`"m"`/`"n"`/`"?"`, `{"sym": X}`, `{"def": X}`, `{"eq": [a, b]}` (make strings of literals and `{"val": X}`), `{"not": e}`, `{"and": [...]}`, `{"or": [...]}`; three-valued (unknown never yields `"n"` on its own).
+  - `rules`: `[{makefile, line, text}]`: the object's rule first, then the directory chain up to the top-level goal list.
+```json
+{
+  "version": "v3.0", "arch": "x86_64", "srcarch": "x86",
+  "files": {
+    "arch/x86/kernel/tls.c": {
+      "status": "rule",
+      "expr": { "or": [{ "sym": "X86_32" }, { "sym": "IA32_EMULATION" }] },
+      "rules": [{ "makefile": "arch/x86/kernel/Makefile", "line": 58, "text": "obj-$(CONFIG_X86_32) += tls.o" },
+                { "makefile": "arch/x86/Kbuild", "line": 10, "text": "obj-y += kernel/" },
+                { "makefile": "arch/x86/Makefile", "line": 131, "text": "core-y += arch/x86/" }],
+      "reason": ""
+    }
+  }
+}
+```
 
 #### `GET /api/version/{version_name}/kconfig/defconfigs`
 #### `GET /api/kconfig/{version_name}/defconfigs` / `GET /api/kconfig/defconfigs`
@@ -1445,6 +1497,7 @@ The frontend is a vanilla ES-Module single-page application requiring zero node/
 ```
 webapp/frontend/js/
 ├── api.js                 # ApiClient: centralized REST fetch client with offline fallbacks
+├── sync.js                # SyncManager: server change tokens, version stamps, new-build reload
 ├── db.js                  # LocalDatabase: IndexedDB offline cache manager
 ├── state.js               # StateStore: reactive pub/sub event store with localStorage persistence
 ├── url_sync.js            # UrlSync: bi-directional hash router
@@ -1460,7 +1513,8 @@ webapp/frontend/js/
 │   └── toast.js           # Ephemeral status toasts
 ├── utils/
 │   ├── clipboard.js       # Universal fallback clipboard copier (navigator + execCommand)
-│   └── debounce.js        # Function debouncer
+│   ├── debounce.js        # Function debouncer
+│   └── definition_picker.js # Go to Definition: the definition the active ARCH/configuration compiles
 └── views/
     ├── code_view/
     │   ├── virtual_editor.js     # Virtualized line scroller with minimap
@@ -1477,7 +1531,8 @@ webapp/frontend/js/
     │   ├── kconfig_engine.js     # scripts/kconfig port: values, legal edits, .config/defconfig I/O
     │   ├── kconfig_parser.js     # .config reader & raw (engine-off) writer
     │   ├── menuconfig_tui.js     # mconf-style terminal menuconfig
-    │   └── directive_evaluator.js# #ifdef conditional code dimming
+    │   ├── directive_evaluator.js# #ifdef conditional code dimming (+ ARCH compiler macros)
+    │   └── build_condition.js    # Kbuild build-condition evaluation & explanation
     ├── maintainers/maintainers_view.js
     ├── commits/commits_view.js
     ├── diff/diff_view.js         # Compare view: files & Kconfig between any two tags/commits
@@ -1495,15 +1550,17 @@ Handles unified HTTP communication, response caching, offline fallback, and netw
   - Employs a 150ms anti-flicker debounce timer so sub-150ms and IndexedDB cache hits never flash the UI.
   - When network fetch duration exceeds 150ms, fades in the glowing spinning indicator and dispatches `app:loading` event; smoothly fades out when all requests finish.
 - `getVersions()`: Fetches release list.
+- `getSync()`: Server change tokens (`GET /api/sync`, never cached); `onSyncHeader` receives the `X-KIP-Sync` header of every response; `versionStamps` / `_vk(version)` stamp version-scoped cache keys (§2.11).
 - `getDirectoryTree(version, path, depth)`: Fetches directory tree.
 - `getFileContent(version, path)`: Retrieves raw text and AST tokens.
 - `getTreemap(version, maxDepth, path)`: Retrieves hierarchical squarified codebase treemap.
 - `getCompileCommands(version, arch)`: Retrieves Clang compilation commands database.
 - `resolveInclude(version, header, astId, currentFile)`: Resolves `#include` directive targets.
 - `getIncludeSymbols(version, astId, options)`: Fetches imported symbols for an include, supporting fallback lookup options (`filePath`, `line`, `header`, `tagId`).
-- `getSymbolDetail(version, name)` / `getSymbolXref(version, name)`: Symbol inspection.
+- `getSymbolDetail(version, name, arch)` / `getSymbolXref(version, name, limit, arch)`: Symbol inspection; `arch` defaults to `state.definitionContext().arch` and is part of the cache key.
+- `getBuildConditions(version, paths, arch)`: Kbuild build conditions of files (`GET /api/kconfig/{v}/build`).
 - `lookupSymbols(version, query, limit)`: Fast typeahead symbol name suggestion list.
-- `getSymbolHistory(version, path, line, astId, { name, includeRc })` / `getTagTimeline(tagId, { includeRc })`: Release-by-release history of a definition.
+- `getSymbolHistory(version, path, line, astId, { name, includeRc })` / `getTagTimeline(tagId, { includeRc })`: Release-by-release history of a definition (sends the definition ARCH).
 - `getKconfigHistory(version, name, { includeRc })`: Release-by-release history of a Kconfig symbol with property-level changes.
 - `getHistoryCommits({ path, to, from, lineS, lineE })`: Commits behind one history change (`git log -L`).
 - `getKconfigGraph(version, arch, symbol, depth)`: Full architecture dependency DAG graph.
@@ -1550,10 +1607,7 @@ Implements two-layer hybrid highlighting with map prioritization and client-side
 
 ### 5.5. `LocalDatabase` & Storage Settings (`webapp/frontend/js/db.js`, `webapp/frontend/js/app.js`)
 - **Offline Cache Stores**: Persistent IndexedDB (`KernelInfoIDE_v2`, v3) caching `meta`, `files`, `symbols`, `kconfigs`, `maintainers`, `commits`, `tools`, `tabs_state`, and `nodemap_projects`.
-- **Database Instance Synchronization (`api.checkDbSync()`)**:
-  - Automatically queries `GET /api/db/instance` upon frontend bootstrap.
-  - Compares the remote `instance_hash` against `localDB.get("meta", "db_instance_hash")`.
-  - When a mismatch occurs (indicating the database was wiped and rebuilt), automatically purges all data caches (`files`, `symbols`, `kconfigs`, `maintainers`, `commits`, `tools`) and writes the new instance hash.
+- **Server Synchronization (`syncManager`, `js/sync.js`, §2.11)**: on bootstrap and on every `X-KIP-Sync` header, a changed `db` token purges all data caches (`files`, `symbols`, `kconfigs`, `maintainers`, `commits`, `tools`) and stores the token in `meta/db_instance_hash`; changed `parsed`/`git` tokens refresh the version stamps (`meta/version_stamps`) and drop the cached entries of changed versions.
 - **Cache-First Client Policy**:
   - All static analysis and versioned data requests query IndexedDB first.
   - If a cached record exists, it is served immediately without making network calls, ensuring instantaneous loading for heavy structures (such as Kconfig hierarchy trees and source file buffers).
@@ -1561,6 +1615,7 @@ Implements two-layer hybrid highlighting with map prioritization and client-side
 - **Storage Management API**:
   - `localDB.clearStore(storeName)`: Clears records for a single object store.
   - `localDB.clearDataStores()`: Clears all domain data stores while preserving workspace session tabs and nodemap diagrams.
+  - `localDB.deleteDataWhere(predicate)`: Deletes the data-store entries whose key matches (one key-cursor scan per store); returns the count.
   - `localDB.clearAllStores()`: Concurrently clears all configured object stores.
   - `localDB.getStorageEstimate()`: Queries `navigator.storage.estimate()` returning `{ usage, quota }`.
   - `localDB.getStoreCounts()`: Returns a dictionary `{ [storeName]: count }` of stored record counts.
@@ -1576,6 +1631,7 @@ Implements two-layer hybrid highlighting with map prioritization and client-side
 
 ### 5.6. Context Menu & Cross-References Modal (`webapp/frontend/js/components/context_menu.js`)
 - **Dual Mouse Navigation**: Left-click on AST tokens triggers quick inspector popup; right-click opens the contextual action menu (Go to Definition, Find References, Copy Symbol, Expand AST, NodeMap).
+- **Go to Definition** (menu items, middle-click default action, documentation `func()` links) goes through `openDefinition()` (`utils/definition_picker.js`, §5.19), so per-architecture symbols open the definition of the active ARCH/configuration. *Open in Kconfig Viewer* (and the Kconfig links of the docs and compare views) open the KConfig tab on the active profile's ARCH (`state.kconfigArch()`, `x86_64` by default).
 - **Context-Adaptive Kconfig Navigation**:
   - Automatically identifies Kconfig tokens across both C files and Kconfig files (via spatial AST types `88..118` from `m_map_ast`, `CONFIG_*` prefix matching, or Kconfig file category `ftype === 2`).
   - Replaces "Go to Definition" and "Find References / XRef" with **"Open in Kconfig Viewer"** (`⚙️`), preventing meaningless symbol lookups on configuration symbols.
@@ -1669,7 +1725,7 @@ The frontend implements systematic middle-click capture (`auxclick` with `e.butt
 - **Selectors**: `.version-selector-container` holds Project, Branch, Tag (`#version-select`, releases), RC (`#rc-select`, candidates of the selected release; see §5.18), and Commit (`#commit-picker-btn`) controls. `state.currentVersion` may be a tag, a branch name, or a commit SHA; startup sanitization only resets values that are none of these.
 - **Commit Picker**: `#commit-picker-btn` opens `refPicker`, a popover with a search box that lists matching release tags (`api.getVersions`) and commits (`api.getCommits`, matching subject, author, or hash prefix). Arrow keys navigate, Enter selects, and any pasted SHA or ref name not in the lists is offered as a raw revision (resolved server-side via `git rev-parse`). Selecting calls `state.setVersion(ref)`.
 - **Display Sync** (`updateVersionSelectorDisplay`, on `version:changed` / `version:synced`): On a tag, the Tag dropdown selects it and the Commit button shows the tag's short SHA. On a commit, the Tag dropdown shows `— none —` and the Commit button shows the short SHA highlighted as detached. The explorer header and tab version badges show the same short form (`shortRef`, 12 hex chars).
-- **Cache Keys**: Directory trees are cached under `tree2_*` and diffs under `diff2_*` / `kdiff2_*` / `fdiff_*` so responses cached before Git-native tree resolution are not reused; the Service Worker cache is `kernel-ide-v3`.
+- **Cache Keys**: Directory trees are cached under `tree2_*` and diffs under `diff2_*` / `kdiff2_*` / `fdiff_*` so responses cached before Git-native tree resolution are not reused; every version-scoped key embeds the version's stamp (`api._vk`, §2.11). Service Worker caches are described in §2.11.
 
 ---
 
@@ -1688,9 +1744,10 @@ The frontend implements systematic middle-click capture (`auxclick` with `e.butt
 - **Commands** (`KernelIdeApp.paletteCommands()`): compare, select commit, source treemap, export `compile_commands.json` (download via `api.getCompileCommandsDownloadUrl`), KConfig view, toggle the KConfig engine, commits, maintainers, NodeMap, documentation, explorer toggle, plus *Create patch* / *Symbol history* for the active code tab and *Switch project* entries.
 
 ### 5.16. `#ifdef` Dimming (`webapp/frontend/js/views/kconfig/directive_evaluator.js`)
-- **Gate**: Only while the KConfig constraint engine is enabled (`state.kconfigEngineActive`, toggled in the KConfig view and persisted) **and** a resolved configuration is loaded (≥ 50 symbols, i.e. a defconfig), for preprocessed sources (`.c .h .S .lds .dts .dtsi .inc`). A toolbar chip shows the number of compiled-out lines.
-- **Semantics**: Three-valued evaluation of `#if/#ifdef/#ifndef/#elif/#else/#endif` (with `\` continuations). Only `CONFIG_*` macros are known, following `autoconf.h`: `CONFIG_FOO` is defined for `y` and every string/int/hex value (even empty), `CONFIG_FOO_MODULE` for `m`, symbols that are `n` or absent are undefined; `IS_BUILTIN` is true for `y` (or an int equal to 1), `IS_ENABLED`/`IS_REACHABLE` for `y`/`m`; `IS_ENABLED/IS_BUILTIN/IS_MODULE/IS_REACHABLE`, `defined()`, `!`, `&&`, `||`, parentheses and numeric comparisons are supported. Any other macro (header guards, `__KERNEL__`, arch macros) is unknown and a branch with an unknown condition is never dimmed, nor are its alternatives. Directive lines are dimmed only when their enclosing region is compiled out.
+- **Gate**: Only while the KConfig constraint engine is enabled (`state.kconfigEngineActive`, toggled in the KConfig view and persisted) **and** a resolved configuration is loaded (≥ 50 symbols, i.e. a defconfig; `state.kconfigConfigActive()`), for preprocessed sources (`PREPROCESSED_RE`: `.c .h .S .lds .dts .dtsi .inc`). A toolbar chip shows the number of compiled-out lines; clicking it (`VirtualEditor.toggleDimSuspended()`) temporarily shows those lines undimmed (chip marked *not dimmed*, dashed) and clicking again restores the dimming. The choice applies to every code tab until toggled back or the page is reloaded (not persisted); the count, the build banner and Go to Definition are unaffected.
+- **Semantics**: Three-valued evaluation of `#if/#ifdef/#ifndef/#elif/#else/#endif` (with `\` continuations). Only `CONFIG_*` macros are known, following `autoconf.h`: `CONFIG_FOO` is defined for `y` and every string/int/hex value (even empty), `CONFIG_FOO_MODULE` for `m`, symbols that are `n` or absent are undefined; `IS_BUILTIN` is true for `y` (or an int equal to 1), `IS_ENABLED`/`IS_REACHABLE` for `y`/`m`; `IS_ENABLED/IS_BUILTIN/IS_MODULE/IS_REACHABLE`, `defined()`, `!`, `&&`, `||`, parentheses and numeric comparisons are supported. The compiler-predefined macros of the configuration's ARCH are known as well (`archMacros(arch, assignments)`): `__KERNEL__` is defined; the own architecture's macros are defined (`__x86_64__`/`__amd64__` or `__i386__` by word size, from `CONFIG_64BIT` when set, else from the ARCH value; `__arm__`, `__aarch64__`, `__powerpc__`/`__powerpc64__`, `__sparc__`/`__arch64__`, `__s390__`/`__s390x__`, `__mips__`, ...), every other architecture's macros, the other word size's macros, `__CHECKER__` and `__GENKSYMS__` are undefined, `__LP64__` follows the word size; in `#if` expressions known macros are 1 or 0. Any other macro (header guards, `__ASSEMBLY__`, `MODULE`) is unknown and a branch with an unknown condition is never dimmed, nor are its alternatives. With `partial: true` (used for the x86_64 baseline of §5.19), `CONFIG_*` symbols absent from the assignments are unknown instead of `n`. Directive lines are dimmed only when their enclosing region is compiled out.
 - **Live updates**: `VirtualEditor` recomputes on `kconfig:engine:changed`, `kconfig:assignments:updated` and `kconfig:assignment:changed`.
+- **Build banner**: with the same gate, `VirtualEditor.refreshBuildBanner()` fetches the open file's Kbuild condition (`api.getBuildConditions`, once per version/ARCH/path) and evaluates it against the configuration (`build_condition.js`, absent symbols are `n`). When it is `n`, a red banner above the code says the file is **not compiled** for the ARCH with the current configuration and why: the failing symbols with their values (e.g. *Needs `CONFIG_E1000E` (currently E1000E=n)*, plus how many alternative rules also fail), or the reason for `other_arch`/`no_rule` (*arch/arm/ is not built for ARCH=x86_64*, *drivers/net/Makefile does not build skeleton.o*). When it is `m`, a blue banner says the file is built as a module. The banner shows the object's Kbuild rule (`makefile:line text`), which opens the Makefile at that line. Unknown conditions (`?`, e.g. headers) show nothing. It is re-evaluated without refetching on every configuration change.
 
 ### 5.17. Treemap, Symbol History & Patch Staging
 - **Treemap** (`views/treemap/treemap_view.js`, tab type `treemap`): squarified layout of `/api/version/{v}/treemap` two levels deep, Bytes/Files metric toggle, breadcrumb zoom, click a directory to zoom in or a file to open (middle-click: new tab). Opened from the explorer's folder context menu (*Show Treemap of Folder*) or the palette.
@@ -1703,6 +1760,10 @@ The frontend implements systematic middle-click capture (`auxclick` with `e.butt
 ### 5.18. Projects (Multiple Repositories)
 - The header **Project** selector lists `/api/projects` (parsed repositories plus *git only* ones). `api.setRepository(name)` adds `X-KI-Repo` to every request, prefixes IndexedDB cache keys with the repository, and `withRepo()` appends `?repo=` to URLs used directly (images, downloads). Switching asks for confirmation, closes the workspace tabs (`state.setRepository`), and selects the repository's latest parsed version (else its default branch).
 - The **Tag** dropdown lists final releases grouped into *Parsed* and *Git only (not parsed)*; a release that so far only has candidates appears as `vX.Y (rc only)` and selects its latest candidate. The **RC** dropdown (shown when the selected release has candidates) lists `final` plus that release's `-rc#` tags, newest first, with `(git only)` marking unparsed ones; `KernelIdeApp.buildVersionCatalog()` groups tags by `releaseOf()` (`v3.1-rc4` → `v3.1`) from `/api/versions?include_rc=true`. Catalog requests (`projects`, `branches`, `versions`) are network-first so newly parsed versions appear without clearing the cache.
+
+### 5.19. Definition Context & Picker (`state.definitionContext()`, `webapp/frontend/js/utils/definition_picker.js`)
+- **Context**: `state.definitionContext()` returns `{arch, assignments, strict}`: while the KConfig engine is on with a resolved configuration (`state.kconfigConfigActive()`), the ARCH of the active profile (`kconfigProfileKey` = `version|ARCH`) and `state.kconfigAssignments` (`strict`: absent symbols are `n`); otherwise `x86_64` with a baseline (`X86`, `X86_64`, `64BIT` = `y`, `X86_32` = `n`; `strict: false`, every other symbol unknown). `api.getSymbolDetail`/`getSymbolXref`/`getSymbolHistory` send its `arch` (§2.7).
+- **Picker**: `resolveDefinition(version, name)` takes the backend's ranked `definitions` and, among those in the first 6 candidate files, returns the first one the context compiles: files whose Kbuild condition evaluates to `n` (`api.getBuildConditions`) are skipped, then definitions on lines `DirectiveEvaluator` compiles out with the context's assignments and `archMacros` (partial when not strict). On x86_64, `struct pt_regs` therefore opens the `__x86_64__` branch of `arch/x86/include/asm/ptrace.h` rather than its `__i386__` one, and `arch/x86/kernel/process_64.c` wins over `process_32.c`. When no candidate is known to be compiled, the backend's first choice is kept. `openDefinition(version, name, {forceNew})` opens the result in a code tab (used by the context menu, middle-click and documentation links).
 
 ## 6. Programmatic Python Service Delegates (`webapp/main.py`)
 

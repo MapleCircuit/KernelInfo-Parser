@@ -23,6 +23,7 @@ from typing import Any
 
 from fastapi import HTTPException
 
+from parser.kbuild_conditions import KbuildConditionResolver
 from parser.kbuild_parser import KbuildParser
 from parser.kconfig_ast.kconfig_eval import KconfigEvaluator, escape_string, solve
 from parser.kconfig_ast.kconfig_preprocess import KconfigPreprocessor
@@ -48,6 +49,10 @@ TYPE_CODES = {"bool": 1, "tristate": 2, "string": 3, "hex": 4, "int": 5}
 _ARCH_SYNONYMS = {"aarch64": "arm64", "arm32": "arm", "ppc": "powerpc", "x86_32": "i386", "amd64": "x86_64"}
 _MODEL_CACHE_SIZE = 6
 _USAGE_LIMIT = 400
+_BUILD_RESOLVER_CACHE_SIZE = 4
+_BUILD_PATHS_LIMIT = 64
+# #include "foo.c" / <bar.S>: sources compiled as part of another file
+_INCLUDED_SOURCE_RE = r'#\s*include\s*["<][^">]+\.(c|S)[">]'
 
 
 class _ModelEntry:
@@ -86,6 +91,8 @@ _MODELS: "RepoScopedCache" = RepoScopedCache()
 _MODEL_LOCK = threading.Lock()
 _LISTING_CACHE: "RepoScopedCache" = RepoScopedCache()
 _USAGE_CACHE: "RepoScopedCache" = RepoScopedCache()
+_BUILD_RESOLVERS: "RepoScopedCache" = RepoScopedCache()
+_BUILD_LOCK = threading.Lock()
 
 
 class KconfigService:
@@ -631,6 +638,45 @@ class KconfigService:
         except Exception as exc:
             logger.debug("m_kconfig_kbuild lookup skipped: %s", exc)
         return sorted(files.values(), key=lambda f: f["file_path"])
+
+    # ------------------------------------------------------------------ build conditions (git)
+    def _included_sources(self, rev: str) -> set[str]:
+        """Basenames of .c/.S files that another file #includes (compiled inside it, not on their own)."""
+        key = ("incsrc", rev)
+        if key not in _USAGE_CACHE:
+            out = self._git(["grep", "-h", "-o", "-E", _INCLUDED_SOURCE_RE, rev, "--", "*.c", "*.h", "*.S"], timeout=60)
+            _USAGE_CACHE[key] = {re.split(r'[/"<]', line.strip().rstrip('">'))[-1] for line in out.splitlines() if line.strip()}
+        return _USAGE_CACHE[key]
+
+    def _build_resolver(self, version_name: str, arch: str) -> tuple[KbuildConditionResolver, dict[str, Any]]:
+        info = self.resolve_arch(version_name, arch)
+        rev = info["rev"]
+        key = (rev, info["arch"])
+        with _BUILD_LOCK:
+            entry = _BUILD_RESOLVERS.get(key)
+            if entry is None:
+                paths = self._all_paths(rev)
+                entry = KbuildConditionResolver(
+                    lambda p: self._read(rev, p) if p in paths else None, paths.__contains__,
+                    info["arch"], info["srcarch"], self._included_sources(rev),
+                )
+                if len(_BUILD_RESOLVERS) >= _BUILD_RESOLVER_CACHE_SIZE:
+                    dict.pop(_BUILD_RESOLVERS, next(iter(_BUILD_RESOLVERS)))  # oldest (keys are repo-scoped)
+                _BUILD_RESOLVERS[key] = entry
+        return entry, info
+
+    def build_conditions(self, version_name: str, paths: list[str], arch: str = DEFAULT_ARCH) -> dict[str, Any]:
+        """Kbuild condition of each file: under which configuration `make ARCH=<arch>` compiles it.
+
+        Each entry is `{status, expr, rules, reason}` (see parser/kbuild_conditions.py): `expr` is a
+        tristate expression over CONFIG_* symbols the client evaluates against its configuration.
+        """
+        resolver, info = self._build_resolver(version_name, arch)
+        files: dict[str, Any] = {}
+        with _BUILD_LOCK:
+            for path in dict.fromkeys(p.strip().strip("/") for p in paths[:_BUILD_PATHS_LIMIT] if p and p.strip()):
+                files[path] = resolver.file_condition(path)
+        return {"version": version_name, "arch": info["arch"], "srcarch": info["srcarch"], "files": files}
 
     def get_symbol_usage(self, version_name: str, name: str, arch: str = DEFAULT_ARCH, limit: int = _USAGE_LIMIT, toolchain: Any = None) -> dict[str, Any]:
         """Where CONFIG_<name> is used: Kbuild rules, C/assembly/linker sources, and other Kconfig entries."""

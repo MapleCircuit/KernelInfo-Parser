@@ -21,10 +21,10 @@ from parser.kconfig_ast.kconfig_lexer import KconfigLexer
 from parser.kconfig_ast.kconfig_parser import KconfigChoice, KconfigConfig, KconfigIf, KconfigMenu, KconfigParser
 from webapp.backend.config import get_repo_dir
 from webapp.backend.database.pool import get_db_cursor
-from webapp.backend.database.helpers import get_active_repo_id, get_version_info, safe_decode
+from webapp.backend.database.helpers import finished_ref_sql, get_active_repo_id, get_version_info, hash_hex, safe_decode
 from webapp.backend.services.git_reader import git_reader
 from webapp.backend.services.git_service import _compute_structured_diff
-from webapp.backend.services.tree_resolver import git_tree_resolver
+from webapp.backend.services.tree_resolver import DEFAULT_DEFINITION_ARCH, definition_arch, definition_rank, git_tree_resolver
 
 logger = logging.getLogger(__name__)
 
@@ -80,11 +80,11 @@ def normalize_code(code: str, strip_c_comments: bool = True) -> str:
 def indexed_versions(cursor: Any, include_rc: bool = False) -> list[dict[str, Any]]:
     """Indexed refs of the active repository, oldest first; release candidates only with include_rc."""
     cursor.execute(
-        """
+        f"""
         SELECT r.ref_name, r.commit_id, r.ref_type
         FROM m_git_ref r
         LEFT JOIN m_commit c ON c.commit_id = r.commit_id
-        WHERE r.commit_id > 0 AND r.repo_id = %s
+        WHERE r.commit_id > 0 AND r.repo_id = %s AND {finished_ref_sql()}
         ORDER BY c.committer_date ASC, r.commit_id ASC;
         """,
         (get_active_repo_id(cursor),),
@@ -272,16 +272,18 @@ class HistoryService:
         tag_id: int | None = None,
         name: str | None = None,
         include_rc: bool = False,
+        arch: str = DEFAULT_DEFINITION_ARCH,
     ) -> dict[str, Any]:
         """Trace the definition anchored at path:line (or tag_id) across the indexed releases.
 
         The anchor is the narrowest definition covering `line` (preferring one named `name`, then
         `ast_id`); when `name` is not defined there (e.g. the cursor is on a call), the definition is
-        located through the symbol index first. A Kconfig anchor returns the Kconfig history instead.
+        located through the symbol index first, ranked for `arch`. A Kconfig anchor returns the Kconfig
+        history instead.
         """
         norm_path = (path or "").strip().strip("/")
         with get_db_cursor() as cursor:
-            anchor = self._resolve_anchor(cursor, version_name, norm_path, line, ast_id, tag_id, name)
+            anchor = self._resolve_anchor(cursor, version_name, norm_path, line, ast_id, tag_id, name, arch)
             if anchor["type_id"] in KCONFIG_TYPES:
                 return self.get_kconfig_history(anchor["name"], version_name, include_rc)
             norm_path = anchor["path"]
@@ -428,6 +430,7 @@ class HistoryService:
         ast_id: int | None,
         tag_id: int | None,
         name: str | None,
+        arch: str = DEFAULT_DEFINITION_ARCH,
     ) -> dict[str, Any]:
         if tag_id is not None:
             return self._anchor_row(cursor, tag_id, path)
@@ -472,7 +475,7 @@ class HistoryService:
             pick = next((r for r in rows if r["ast_id"] == ast_id), None)
         if pick is None and name:
             # Cursor on a use of the symbol: follow it to its definition
-            located = self._locate_definition(cursor, rev, name, {path})
+            located = self._locate_definition(cursor, rev, name, {path}, arch)
             if located:
                 return located
         if pick is None:
@@ -486,8 +489,10 @@ class HistoryService:
             "path": path, "line_s": pick["line_s"],
         }
 
-    def _locate_definition(self, cursor: Any, rev: str, name: str, prefer_paths: set[str]) -> dict[str, Any] | None:
+    def _locate_definition(self, cursor: Any, rev: str, name: str, prefer_paths: set[str],
+                           arch: str = DEFAULT_DEFINITION_ARCH) -> dict[str, Any] | None:
         blob_paths = git_tree_resolver.blob_paths(cursor, rev) or {}
+        _, srcarch, bits = definition_arch(rev, arch)
         # The definition's own tag (EXPORT_SYMBOL(name) rows carry another tag)
         cursor.execute(
             """
@@ -503,12 +508,19 @@ class HistoryService:
         defs = [r for r in cursor.fetchall() if r["blob_id"] in blob_paths]
         if not defs:
             return None
-        # Prefer the requested file, then definitions with a body over one-line declarations, then .c files
-        def rank(r: dict[str, Any]) -> tuple[int, int, int, str]:
-            p = blob_paths[r["blob_id"]][0]
-            return (0 if p in prefer_paths else 1, -(r["line_e"] - r["line_s"]), 0 if p.endswith(".c") else 1, p)
+        # Prefer the requested file, then the ARCH's definitions (definition_rank), then definitions with a
+        # body over one-line declarations, then .c files
+        def path_of(r: dict[str, Any]) -> str:
+            paths = blob_paths[r["blob_id"]]
+            return next((p for p in paths if p in prefer_paths), None) or min(
+                paths, key=lambda p: definition_rank(p, r["linkage"], r["line_s"], srcarch, bits))
+
+        def rank(r: dict[str, Any]) -> tuple:
+            p = path_of(r)
+            return (0 if p in prefer_paths else 1, *definition_rank(p, r["linkage"], r["line_s"], srcarch, bits)[:4],
+                    -(r["line_e"] - r["line_s"]), 0 if p.endswith(".c") else 1, p)
         best = min(defs, key=rank)
-        return self._anchor_row(cursor, best["tag_id"], blob_paths[best["blob_id"]][0], best["line_s"])
+        return self._anchor_row(cursor, best["tag_id"], path_of(best), best["line_s"])
 
     @staticmethod
     def _candidates(cursor: Any, blob_ids: list[int], anchor: dict[str, Any], lineage: set[int]) -> dict[int, list[dict[str, Any]]]:
@@ -601,7 +613,7 @@ class HistoryService:
             blob_ids = sorted(by_blob)
             fmt = ",".join(["%s"] * len(blob_ids))
             cursor.execute(f"SELECT blob_id, blob_hash FROM m_file_blob WHERE blob_id IN ({fmt});", blob_ids)
-            sha_to_blob = {bytes(r["blob_hash"]).hex(): r["blob_id"] for r in cursor.fetchall()}
+            sha_to_blob = {hash_hex(r["blob_hash"]): r["blob_id"] for r in cursor.fetchall()}
             cursor.execute(
                 f"""
                 SELECT DISTINCT fn.fname FROM m_bridge_checkpoint bc JOIN m_file_name fn ON fn.fnid = bc.fnid

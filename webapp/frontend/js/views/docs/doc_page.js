@@ -8,6 +8,7 @@ import { api } from "../../api.js";
 import { state } from "../../state.js";
 import { toast } from "../../components/toast.js";
 import { shortRef } from "../../components/ref_picker.js";
+import { openDefinition } from "../../utils/definition_picker.js";
 import { renderDocument, renderRstFragment, extractTitle, escapeHtml, highlightCode, slugify } from "./rst_renderer.js";
 
 const TITLE_FETCH_LIMIT = 80;
@@ -167,7 +168,7 @@ export class DocPage {
         await this.openSymbol(a.dataset.symbol, newTab);
       } else if (a.dataset.kconfig) {
         e.preventDefault();
-        state.openTab({ type: "kconfig", title: "KConfig (x86)", arch: "x86", version: this.opts.version, symbol: a.dataset.kconfig });
+        state.openTab({ type: "kconfig", title: `KConfig (${state.kconfigArch()})`, arch: state.kconfigArch(), version: this.opts.version, symbol: a.dataset.kconfig });
       } else if ((a.getAttribute("href") || "").startsWith("#")) {
         // In-page anchors must not touch location.hash (it drives the app router)
         e.preventDefault();
@@ -201,18 +202,7 @@ export class DocPage {
 
   async openSymbol(name, forceNew) {
     try {
-      const detail = await api.getSymbolDetail(this.opts.version, name);
-      if (detail && detail.file_path) {
-        state.openTab({
-          type: "code",
-          title: detail.file_path.split("/").pop(),
-          path: detail.file_path,
-          version: this.opts.version,
-          cursorLine: detail.definition?.line_s || detail.line_s || detail.line || 1,
-          forceNew,
-        });
-        return;
-      }
+      if (await openDefinition(this.opts.version, name, { forceNew })) return;
     } catch {
       // fall through to the toast below
     }

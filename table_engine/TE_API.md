@@ -150,6 +150,7 @@ Internal helper methods used exclusively by `TECachedDB` to synchronize in-memor
 - **`close() -> None`**
   - Waits for a pending background commit (`wait_for_commit()`, raising its error), then calls `self.db.close()` if available (ignoring exceptions) and sets `self.db = None`. `start_new_db()` waits the same way.
   - In `TECachedDB`: Drops uncommitted rows from the carried overlays, then calls `clear_cache()` to release memory resources; the carried tables survive for the next start.
+- `discard_carried() -> None` *(TECachedDB)*: Forgets the carried tables' snapshot and overlays, so the next start reloads them from the database. Called after rows were deleted outside the TableEngine (an interrupted version rolled back, `core/ingest_state.py`).
 - **Context Manager**: `__enter__() -> Self`, `__exit__(...) -> close()`, `__del__() -> close()`.
 
 ---

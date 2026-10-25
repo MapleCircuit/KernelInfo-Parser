@@ -64,6 +64,16 @@ def get_kconfig_symbol_usage(
     return kconfig_service.get_symbol_usage(version_name, symbol_name, arch, limit, toolchain)
 
 
+@router.get("/kconfig/{version_name}/build")
+def get_build_conditions(
+    version_name: str,
+    path: list[str] = Query([], description="Source paths (repeatable, up to 64)"),
+    arch: str = Query(DEFAULT_ARCH),
+) -> dict[str, Any]:
+    """Kbuild condition per file: when `make ARCH=<arch>` compiles it, as an expression over CONFIG_* symbols."""
+    return kconfig_service.build_conditions(version_name, path, arch)
+
+
 @router.get("/kconfig/{version_name}/symbol/{symbol_name}/history")
 @router.get("/version/{version_name}/kconfig/symbol/{symbol_name}/history")
 def get_kconfig_symbol_history(

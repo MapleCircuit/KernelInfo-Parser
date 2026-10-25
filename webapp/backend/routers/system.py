@@ -12,6 +12,7 @@ from webapp.backend.database.helpers import safe_decode
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/db", tags=["system"])
+sync_router = APIRouter(prefix="/api", tags=["system"])
 
 # Process-level fallback instance fingerprint if database table is missing or unseeded
 _FALLBACK_INSTANCE_HASH = secrets.token_hex(32)
@@ -42,3 +43,14 @@ def get_db_instance() -> dict[str, Any]:
         "instance_hash": _FALLBACK_INSTANCE_HASH,
         "created_at": _FALLBACK_CREATED_AT,
     }
+
+
+@sync_router.get("/sync")
+def get_sync() -> dict[str, Any]:
+    """Change tokens of the server: database instance, frontend build, parsed versions and Git refs.
+
+    Clients compare them with the ones they saw last (webapp/frontend/js/sync.js); see
+    webapp/backend/services/sync_service.py for what each one covers.
+    """
+    from webapp.backend.services.sync_service import sync_service
+    return sync_service.snapshot()

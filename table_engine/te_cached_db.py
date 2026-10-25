@@ -974,6 +974,11 @@ class TECachedDB(TEDirectDB):
                     self._committed_pks.get(t_id, set()).discard(pk)
                 self._cache_row(table, proj_row)
 
+    def discard_carried(self) -> None:
+        """Forget the carried tables' snapshot and overlays (rows were deleted outside the TableEngine,
+        e.g. an interrupted version rolled back); the next start reloads them from the database."""
+        self._detach_carried()
+
     def close(self) -> None:
         """Safely clean up in-memory cache structures and close DB connection (carried tables are kept)."""
         self.wait_for_commit()

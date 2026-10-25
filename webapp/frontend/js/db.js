@@ -3,6 +3,8 @@
  * Manages cached files, symbols, kconfigs, tab sessions, and nodemap diagrams.
  */
 const DB_NAME = "KernelInfoIDE_v2";
+// Stores of cached API data (meta, tabs_state and nodemap_projects hold user state)
+const DATA_STORES = ["files", "symbols", "kconfigs", "maintainers", "commits", "tools"];
 const DB_VERSION = 3;
 
 const REQUIRED_STORES = [
@@ -143,9 +145,36 @@ class LocalDatabase {
 
   async clearDataStores() {
     await this.ready;
-    const dataStores = ["files", "symbols", "kconfigs", "maintainers", "commits", "tools"];
-    await Promise.all(dataStores.map((s) => this.clearStore(s)));
+    await Promise.all(DATA_STORES.map((s) => this.clearStore(s)));
     return true;
+  }
+
+  /** Delete the cached API entries whose key matches `predicate` (one key scan per data store). Returns the count. */
+  async deleteDataWhere(predicate) {
+    await this.ready;
+    if (!this.db) return 0;
+    let count = 0;
+    await Promise.all(DATA_STORES.filter((s) => this.db.objectStoreNames.contains(s)).map((s) => new Promise((resolve) => {
+      try {
+        const tx = this.db.transaction(s, "readwrite");
+        const store = tx.objectStore(s);
+        const req = store.openKeyCursor();
+        req.onsuccess = () => {
+          const cursor = req.result;
+          if (!cursor) return;
+          if (predicate(String(cursor.key))) {
+            store.delete(cursor.primaryKey);
+            count++;
+          }
+          cursor.continue();
+        };
+        tx.oncomplete = tx.onerror = tx.onabort = () => resolve();
+      } catch (e) {
+        console.warn(`[LocalDB] Key scan failed for ${s}:`, e);
+        resolve();
+      }
+    })));
+    return count;
   }
 
   async getStorageEstimate() {

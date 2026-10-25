@@ -65,6 +65,7 @@ from core.globalstuff import (
     unfreeze_system_memory,
 )
 from core.quit_listener import GracefulQuitListener
+from core import ingest_state
 from core.config import (
     init_config,
     get_parser_config,
@@ -121,6 +122,7 @@ from core.SymbolRows import STATS as SYMBOL_STATS
 from core.SymbolRows import SYMBOL_VIEW_SQL
 from table_engine import TECachedDB, TEDirectDB, get_table_engine
 from core.DBLayout import (
+    TABLES,
     init_db_layout,
     m_v_main,
     m_file_name,
@@ -524,6 +526,27 @@ def _reuse_parsed_blobs(file_blob_hashes: dict[str, bytes]) -> list[str]:
     return [item for item in (gp.Change_List or ()) if item not in reused]
 
 
+def _record_reparsed_blobs(file_blob_hashes: dict[str, bytes]) -> None:
+    """Record blobs that already exist (unparsed blobs of intermediate commits) and are about to be parsed,
+    so an interruption can clear their partial rows (core/ingest_state.py)."""
+    blob_ids = set()
+    for item in [*(gp.worker_change_list or ()), *(getattr(gp, "Symlink_List", None) or ())]:
+        if not item:
+            continue
+        parts = item.split("\t")
+        if parts[0].startswith("D"):
+            continue
+        b_hash = file_blob_hashes.get(parts[-1])
+        if b_hash:
+            row = G.TE.get(m_file_blob.table_id, (None, b_hash, type_check(parts[-1])))
+            if row is not None:
+                blob_ids.add(row[0])
+    if blob_ids:
+        with G.DB() as db:
+            if getattr(db, "cnx", None) is not None:
+                ingest_state.record_blobs(db.cnx, gp.VID, blob_ids)
+
+
 def update(version: str, repo_path: str | None = None) -> None:
     """Execute the full version parsing and database ingestion pipeline for a target release version.
     
@@ -641,6 +664,7 @@ def update(version: str, repo_path: str | None = None) -> None:
         gp.worker_change_list = _reuse_parsed_blobs(file_blob_hashes)
         if dedup_metric is not None:
             dedup_metric.count = len(gp.deduped_paths)
+        _record_reparsed_blobs(file_blob_hashes)
 
     if G.is_deadline_exceeded():
         logger.warning(COLOR.yellow(f"[Duration Limit] Execution deadline reached after Step 4.5. Finalizing '{version}' early."))
@@ -748,6 +772,7 @@ def update(version: str, repo_path: str | None = None) -> None:
     G.TE.close()
     if hasattr(G.TE, "update_in_mem_indexes"):
         G.TE.update_in_mem_indexes = True
+    finish_version_ingest(gp.VID)
     reclaim_system_memory()
     return
 
@@ -2776,6 +2801,8 @@ def arg_handling() -> argparse.Namespace:
             "tests.test_symbol_rows",
             "tests.test_kconfig_ast",
             "tests.test_kconfig_engine",
+            "tests.test_kbuild_conditions",
+            "tests.test_ingest_state",
             "tests.test_webapp_defconfig",
             "tests.test_webapp_maintainer",
             "tests.test_raw_ast",
@@ -2783,6 +2810,7 @@ def arg_handling() -> argparse.Namespace:
             "tests.test_config",
             "tests.test_git_reader",
             "tests.test_webapp_system",
+            "tests.test_webapp_sync",
             "tests.test_file_references",
             "tests.test_duration_profiler",
             "tests.test_quit_listener",
@@ -2924,7 +2952,9 @@ def _lookup_commit_ids(db: Any, network_id: int, hashes: Iterable[str]) -> dict[
                 (network_id, *(bytes.fromhex(h) for h in chunk)),
             )
             for c_hash, c_id in cur.fetchall():
-                found[bytes(c_hash).hex()] = int(c_id)
+                # mysql-connector may hand back a BINARY(20) whose bytes happen to be valid UTF-8 as str.
+                raw = c_hash.encode("utf-8") if isinstance(c_hash, str) else bytes(c_hash)
+                found[raw.hex()] = int(c_id)
     finally:
         cur.close()
     return found
@@ -3032,6 +3062,9 @@ def ingest_git_dag(
 ) -> tuple[int, bool, bool]:
     """Ingest git commit DAG history up to version_or_ref and register git reference in m_git_ref.
 
+    `already_exists` is also True when version_or_ref is a new ref on a commit another ref already
+    checkpointed (tags sharing a commit, e.g. v2.6.32-rc1/-rc2): the ref is registered, nothing re-parsed.
+
     Returns:
         (head_commit_id, is_checkpoint, already_exists)
     """
@@ -3074,75 +3107,41 @@ def ingest_git_dag(
     ref_type = 1 if is_tag else (2 if branch_check.stdout.strip() else 3)
     is_checkpoint = is_tag or (gp.VID == 0 or getattr(gp, "Old_VID", 0) == 0)
 
-    # Check if already ingested in m_git_ref with committed checkpoint files
+    # A previous ingestion of this ref or commit: finished (skip it), or interrupted (roll it back and parse again)
+    already_ingested = False
     with G.DB() as db:
         ref_row = db.select(m_git_ref, (None, repo_id, None, version_or_ref, None, None, None, None))
-        if ref_row:
-            existing_cid = ref_row[4]
-            chk = db.select(m_bridge_checkpoint, (existing_cid, None, None))
-            is_complete = bool(chk)
-            if chk and is_checkpoint:
-                try:
-                    cur = db.cursor if hasattr(db, "cursor") else (db.cnx.cursor() if hasattr(db, "cnx") and db.cnx else None)
-                    if cur:
-                        cur.execute("SELECT COUNT(*) FROM m_bridge_checkpoint WHERE commit_id = %s", (existing_cid,))
-                        row_cnt = cur.fetchone()[0]
-                        cur.close()
-                        tree_files = len(MF.git_file_list(version_or_ref).splitlines())
-                        if tree_files > 0 and row_cnt < max(1, int(tree_files * 0.9)):
-                            is_complete = False
-                except Exception:
-                    pass
-            if is_complete:
-                gp.Old_VID = gp.VID
-                gp.VID = existing_cid
-                gp.Old_Version_Name = gp.Version_Name
-                gp.Version_Name = version_or_ref
-                return existing_cid, is_checkpoint, True
-            else:
-                # Prior ingestion was interrupted/incomplete: purge partial checkpoint & commit records for clean rebuild
-                logger.warning(
-                    f"Prior ingestion for ref '{version_or_ref}' (commit_id {existing_cid}) was incomplete; "
-                    f"purging partial checkpoint and commit records for a clean restart."
-                )
-                try:
-                    cur = db.cursor if hasattr(db, "cursor") else (db.cnx.cursor() if hasattr(db, "cnx") and db.cnx else None)
-                    if cur:
-                        cur.execute("DELETE FROM m_bridge_checkpoint WHERE commit_id = %s", (existing_cid,))
-                        cur.execute("DELETE FROM m_commit_file WHERE commit_id = %s", (existing_cid,))
-                        cur.execute("DELETE FROM m_bridge_commit_tag WHERE commit_id = %s", (existing_cid,))
-                        cur.execute("DELETE FROM m_bridge_commit_person WHERE commit_id = %s", (existing_cid,))
-                        if hasattr(db, "cnx") and db.cnx and hasattr(db.cnx, "commit"):
-                            db.cnx.commit()
-                        cur.close()
-                except Exception as clean_err:
-                    logger.debug(f"Note on purging partial commit records for existing_cid {existing_cid}: {clean_err}")
-
-    # Ingest commits leading up to target ref
-    with G.DB() as db:
         commit_row = db.select(m_commit, (None, network_id, head_commit_bytes, None, None, None, None, None, None))
         head_commit_id = commit_row[0] if commit_row else None
-        if head_commit_id is not None and is_checkpoint:
-            try:
-                cur = db.cursor if hasattr(db, "cursor") else (db.cnx.cursor() if hasattr(db, "cnx") and db.cnx else None)
-                if cur:
-                    cur.execute("SELECT COUNT(*) FROM m_bridge_checkpoint WHERE commit_id = %s", (head_commit_id,))
-                    row_cnt = cur.fetchone()[0]
-                    tree_files = len(MF.git_file_list(version_or_ref).splitlines())
-                    if tree_files > 0 and 0 < row_cnt < max(1, int(tree_files * 0.9)):
-                        logger.warning(
-                            f"Prior commit records for '{version_or_ref}' (commit_id {head_commit_id}) were incomplete ({row_cnt}/{tree_files} files); "
-                            f"purging partial records."
-                        )
-                        cur.execute("DELETE FROM m_bridge_checkpoint WHERE commit_id = %s", (head_commit_id,))
-                        cur.execute("DELETE FROM m_commit_file WHERE commit_id = %s", (head_commit_id,))
-                        cur.execute("DELETE FROM m_bridge_commit_tag WHERE commit_id = %s", (head_commit_id,))
-                        cur.execute("DELETE FROM m_bridge_commit_person WHERE commit_id = %s", (head_commit_id,))
-                        if hasattr(db, "cnx") and db.cnx and hasattr(db.cnx, "commit"):
-                            db.cnx.commit()
-                    cur.close()
-            except Exception as clean_err:
-                logger.debug(f"Note on checking/purging partial head_commit_id records: {clean_err}")
+        known_cid = ref_row[4] if ref_row else head_commit_id
+        state = _previous_ingest(db, network_id, known_cid, version_or_ref) if known_cid is not None and is_checkpoint else "new"
+        if state == "done":
+            if ref_row:
+                gp.Old_VID = gp.VID
+                gp.VID = known_cid
+                gp.Old_Version_Name = gp.Version_Name
+                gp.Version_Name = version_or_ref
+                return known_cid, is_checkpoint, True
+            # Another ref (e.g. v2.6.32-rc1 for v2.6.32-rc2) already ingested this commit: only register the ref
+            already_ingested = True
+            logger.info(
+                f"Ref '{version_or_ref}' points to commit_id {known_cid}, already ingested by another ref; "
+                f"registering it as an alias."
+            )
+        elif state == "interrupted":
+            logger.warning(
+                f"Ingestion of '{version_or_ref}' (commit_id {known_cid}) was interrupted; rolling back its partial rows."
+            )
+            if not ingest_state.rollback_version(db.cnx, network_id, known_cid, TABLES):
+                _purge_partial_version(db, known_cid)
+            _forget_rolled_back_rows()
+        elif state == "legacy_partial":
+            # Interrupted before ingestion states existed: only its version-scoped rows can be identified
+            logger.warning(
+                f"Prior ingestion for ref '{version_or_ref}' (commit_id {known_cid}) was incomplete; "
+                f"purging partial checkpoint and commit records for a clean restart."
+            )
+            _purge_partial_version(db, known_cid)
 
     gp.commit_ids_by_hash = {}
     if head_commit_id is None:
@@ -3184,12 +3183,72 @@ def ingest_git_dag(
         else:
             ref_id = db.get_next_id(m_git_ref)
             db.insert(m_git_ref, (ref_id, repo_id, ref_type, version_or_ref, head_commit_id, None, None, None))
+        if not already_ingested and getattr(db, "cnx", None) is not None:
+            # From here on every row the run writes lies above these watermarks (see core/ingest_state.py)
+            ingest_state.begin(db.cnx, network_id, head_commit_id, TABLES)
 
     gp.Old_VID = gp.VID
     gp.VID = head_commit_id
     gp.Old_Version_Name = gp.Version_Name
     gp.Version_Name = version_or_ref
-    return head_commit_id, is_checkpoint, False
+    return head_commit_id, is_checkpoint, already_ingested
+
+
+def _previous_ingest(db: Any, network_id: int, commit_id: int, version_or_ref: str) -> str:
+    """State of an earlier ingestion of `commit_id`: "done", "interrupted", "legacy_partial" or "new".
+
+    `m_ingest_state` decides when present. Versions ingested before it existed have no row: they count
+    as done when their checkpoint covers at least 90% of the tree (the row is then backfilled), else
+    as a partial legacy run when they have checkpoint rows.
+    """
+    cnx = getattr(db, "cnx", None)
+    if cnx is None:
+        return "done" if db.select(m_bridge_checkpoint, (commit_id, None, None)) else "new"
+    with contextlib.closing(cnx.cursor()) as cur:
+        status = ingest_state.get_status(cur, network_id, commit_id)
+        if status == ingest_state.INGEST_DONE:
+            return "done"
+        if status == ingest_state.INGEST_PARSING:
+            return "interrupted"
+        cur.execute("SELECT COUNT(*) FROM m_bridge_checkpoint WHERE commit_id = %s", (commit_id,))
+        row_cnt = cur.fetchone()[0]
+    if not row_cnt:
+        return "new"
+    tree_files = len(MF.git_file_list(version_or_ref).splitlines())
+    if tree_files > 0 and row_cnt >= max(1, int(tree_files * 0.9)):
+        ingest_state.set_status(cnx, network_id, commit_id, ingest_state.INGEST_DONE)
+        return "done"
+    return "legacy_partial"
+
+
+def _purge_partial_version(db: Any, commit_id: int) -> None:
+    """Remove the version-scoped rows of an interrupted run that left no watermarks."""
+    cnx = getattr(db, "cnx", None)
+    if cnx is None:
+        return
+    with contextlib.closing(cnx.cursor()) as cur:
+        for table in ("m_bridge_checkpoint", "m_commit_file", "m_bridge_commit_tag", "m_bridge_commit_person"):
+            cur.execute(f"DELETE FROM {table} WHERE commit_id = %s", (commit_id,))  # noqa: S608
+    cnx.commit()
+
+
+def _forget_rolled_back_rows() -> None:
+    """Drop in-process caches that may still hold rows a rollback removed."""
+    if hasattr(G.TE, "discard_carried"):
+        G.TE.discard_carried()
+    file_fid_cache.clear()
+    file_fnid_cache.clear()
+    for cache in ("blob_symbol_cache", "blob_symbol_used"):
+        getattr(gp, cache, {}).clear()
+
+
+def finish_version_ingest(commit_id: int | None) -> None:
+    """Mark the version as completely ingested (the webapp lists it from now on)."""
+    if not commit_id:
+        return
+    with G.DB() as db:
+        if getattr(db, "cnx", None) is not None:
+            ingest_state.set_status(db.cnx, getattr(gp, "network_id", 1), commit_id, ingest_state.INGEST_DONE)
 
 
 def create_new_vid(name: str) -> bool:

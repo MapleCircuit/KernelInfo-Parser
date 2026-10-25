@@ -9,7 +9,14 @@ from webapp.backend.database.helpers import (
     get_version_info,
 )
 from webapp.backend.security.sql import sanitize_like_query
-from webapp.backend.services.tree_resolver import git_tree_resolver
+from webapp.backend.services.tree_resolver import (
+    DEFAULT_DEFINITION_ARCH,
+    best_path,
+    definition_arch,
+    definition_rank,
+    git_tree_resolver,
+    path_rank,
+)
 
 # Name-ordered candidates scanned before scoping to the revision's tree (symbols of every indexed
 # version share m_symbol_def, so a prefix can match many blobs that are not in the requested tree)
@@ -131,10 +138,15 @@ class SymbolService:
                         break
             return names
 
-    def get_symbol_detail(self, version_name: str, name: str) -> dict[str, Any]:
-        """Retrieve full definition, declarations, and usages of a symbol."""
+    def get_symbol_detail(self, version_name: str, name: str, arch: str = DEFAULT_DEFINITION_ARCH) -> dict[str, Any]:
+        """Retrieve full definition, declarations, and usages of a symbol.
+
+        Among several definitions the one for `arch` wins (see `definition_rank`); Kconfig symbols are
+        looked up in that ARCH's model. `definitions` lists every in-tree definition in rank order.
+        """
         with get_db_cursor() as cursor:
             _, vname, blob_paths = self._scope(cursor, version_name)
+            arch_id, srcarch, bits = definition_arch(vname, arch)
 
             # Check if this is a Kconfig configuration symbol (e.g. CONFIG_NET or CONFIG_SMP)
             if name.startswith("CONFIG_"):
@@ -142,7 +154,7 @@ class SymbolService:
                 try:
                     from webapp.backend.services.kconfig_service import KconfigService
                     k_svc = KconfigService()
-                    k_detail = k_svc.get_symbol_detail(vname, clean_name)
+                    k_detail = k_svc.get_symbol_detail(vname, clean_name, arch_id)
                     if k_detail and k_detail.get("file_path"):
                         return {
                             "version": vname,
@@ -172,14 +184,15 @@ class SymbolService:
                             "total_usages": 0,
                             "is_kconfig": True,
                             "kconfig": k_detail,
+                            "arch": arch_id,
                         }
                 except Exception:
                     pass
 
-            # 1. Authoritative definition: prefer one whose blob is in this revision's tree
+            # 1. Authoritative definition: one whose blob is in this revision's tree, ranked for the ARCH
             cursor.execute(
                 """
-                SELECT s.def_id, s.ast_id, s.name, s.type_id, t.name AS type_name, s.blob_id AS fid, s.line_s, s.line_e, s.tag_id
+                SELECT s.def_id, s.ast_id, s.name, s.type_id, t.name AS type_name, s.blob_id AS fid, s.line_s, s.line_e, s.tag_id, s.linkage
                 FROM m_symbol_def s
                 JOIN m_type_descriptor t ON s.type_id = t.type_id
                 WHERE s.name = %s
@@ -188,16 +201,20 @@ class SymbolService:
                 (name,),
             )
             def_rows = cursor.fetchall()
-            s_row = next((r for r in def_rows if r["fid"] in blob_paths), def_rows[0] if def_rows else None)
-            if s_row is not None:
-                s_row["fname"] = (blob_paths.get(s_row["fid"]) or [None])[0]
+            in_tree = [r for r in def_rows if r["fid"] in blob_paths]
+            for r in in_tree:
+                r["fname"] = best_path(blob_paths[r["fid"]], srcarch, bits)
+            in_tree.sort(key=lambda r: definition_rank(r["fname"], r.get("linkage"), r["line_s"], srcarch, bits))
+            s_row = in_tree[0] if in_tree else (def_rows[0] if def_rows else None)
+            if s_row is not None and not in_tree:
+                s_row["fname"] = None
             if not s_row:
                 # Check if this is a Kconfig configuration symbol (e.g. CONFIG_NET or NET)
                 clean_name = name[7:] if name.startswith("CONFIG_") else name
                 try:
                     from webapp.backend.services.kconfig_service import KconfigService
                     k_svc = KconfigService()
-                    k_detail = k_svc.get_symbol_detail(vname, clean_name)
+                    k_detail = k_svc.get_symbol_detail(vname, clean_name, arch_id)
                     if k_detail and k_detail.get("file_path"):
                         return {
                             "version": vname,
@@ -227,13 +244,14 @@ class SymbolService:
                             "total_usages": 0,
                             "is_kconfig": True,
                             "kconfig": k_detail,
+                            "arch": arch_id,
                         }
                 except Exception:
                     pass
                 raise HTTPException(status_code=404, detail=f"Symbol '{name}' not found in version '{version_name}'.")
 
             # 2. XRefs (Usages)
-            xref_data = self.get_symbol_xref(vname, name)
+            xref_data = self.get_symbol_xref(vname, name, arch=arch_id)
 
             return {
                 "version": vname,
@@ -255,16 +273,33 @@ class SymbolService:
                     "line_s": s_row["line_s"],
                     "line_e": s_row["line_e"],
                 },
+                "definitions": [
+                    {
+                        "file": safe_decode(r["fname"]),
+                        "line_s": r["line_s"],
+                        "line_e": r["line_e"],
+                        "type_name": format_symbol_type(safe_decode(r["type_name"])),
+                        "ast_id": r["ast_id"],
+                        "linkage": r.get("linkage"),
+                    }
+                    for r in in_tree[:50]
+                ],
+                "arch": arch_id,
                 "declarations": xref_data.get("declarations", []),
                 "usages": xref_data.get("usages", {}),
                 "xrefs": xref_data.get("usages", {}),
                 "total_usages": xref_data.get("total_usages", 0),
             }
 
-    def get_symbol_xref(self, version_name: str, symbol_name: str, limit: int | None = None) -> dict[str, Any]:
-        """Categorize references: calls, member_refs, type_usages, declarations, macro_expansions."""
+    def get_symbol_xref(self, version_name: str, symbol_name: str, limit: int | None = None,
+                        arch: str = DEFAULT_DEFINITION_ARCH) -> dict[str, Any]:
+        """Categorize references: calls, member_refs, type_usages, declarations, macro_expansions.
+
+        `definitions` are ranked for `arch` (see `definition_rank`); `definition` is the first one.
+        """
         with get_db_cursor() as cursor:
             _, vname, blob_paths = self._scope(cursor, version_name)
+            arch_id, srcarch, bits = definition_arch(vname, arch)
 
             # Resolve symbol definition to ast_id (all matching definitions; those in this revision's tree when any)
             cursor.execute(
@@ -281,15 +316,16 @@ class SymbolService:
             defs = sorted(
                 (
                     {
-                        "file": (blob_paths.get(d["blob_id"]) or [None])[0],
+                        "file": best_path(blob_paths.get(d["blob_id"]), srcarch, bits),
                         "line_s": d["line_s"],
                         "line_e": d["line_e"],
                         "type_name": format_symbol_type(safe_decode(d["type_name"])),
                         "ast_id": d["ast_id"],
+                        "linkage": d["linkage"],
                     }
                     for d in (in_tree or def_rows)
                 ),
-                key=lambda d: (d["file"] is None, d["file"] or "", d["line_s"] or 0),
+                key=lambda d: definition_rank(d["file"], d["linkage"], d["line_s"], srcarch, bits),
             )
 
             # Fallback to m_ast lookup if no explicit m_symbol_def record exists
@@ -308,10 +344,10 @@ class SymbolService:
                 )
                 tag_rows = cursor.fetchall()
                 tag_rows = [r for r in tag_rows if r["blob_id"] in blob_paths] or tag_rows
-                tag_rows.sort(key=lambda r: ((blob_paths.get(r["blob_id"]) or ["~"])[0], r["line_s"] or 0))
+                tag_rows.sort(key=lambda r: (path_rank(best_path(blob_paths.get(r["blob_id"]), srcarch, bits), srcarch, bits), r["line_s"] or 0))
                 for f_row in tag_rows[:5]:
                     defs.append({
-                        "file": (blob_paths.get(f_row["blob_id"]) or [None])[0],
+                        "file": best_path(blob_paths.get(f_row["blob_id"]), srcarch, bits),
                         "line_s": f_row["line_s"],
                         "line_e": f_row["line_e"],
                         "type_name": safe_decode(f_row["type_name"]),
@@ -375,6 +411,7 @@ class SymbolService:
 
             return {
                 "version": vname,
+                "arch": arch_id,
                 "symbol": symbol_name,
                 "name": symbol_name,
                 "ast_id": primary_ast_id,
@@ -494,11 +531,12 @@ class SymbolService:
         tag_id: int | None = None,
         name: str | None = None,
         include_rc: bool = False,
+        arch: str = DEFAULT_DEFINITION_ARCH,
     ) -> dict[str, Any]:
         """Release-by-release history of the definition at path:line (see HistoryService)."""
         from webapp.backend.services.history_service import history_service
         return history_service.get_symbol_history(
-            version_name, path, ast_id=ast_id, line=line, tag_id=tag_id, name=name, include_rc=include_rc,
+            version_name, path, ast_id=ast_id, line=line, tag_id=tag_id, name=name, include_rc=include_rc, arch=arch,
         )
 
     def get_include_symbols(

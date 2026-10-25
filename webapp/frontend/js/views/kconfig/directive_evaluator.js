@@ -7,7 +7,16 @@
  * string/int/hex value (even an empty string), CONFIG_FOO_MODULE for "m"; symbols that are "n" or
  * absent from the configuration are undefined); any other macro is unknown, and a branch whose condition
  * is unknown is never dimmed — nor are its #else/#elif alternatives.
+ *
+ * Compiler-predefined macros of the configured ARCH are known too (`archMacros()`): on x86_64
+ * `__x86_64__` is defined and `__i386__` is not, `__KERNEL__` is defined, other architectures' macros
+ * (`__arm__`, `__powerpc__`...) are undefined. With `partial: true` (an incomplete configuration such as
+ * the x86_64 baseline used while the engine is off) symbols absent from the assignments are unknown
+ * instead of "n".
  */
+
+// Source types whose #if/#ifdef blocks follow C preprocessor semantics
+export const PREPROCESSED_RE = /\.(c|h|S|lds|dts|dtsi|inc)$/i;
 
 const TRUE = 1;
 const FALSE = 0;
@@ -29,13 +38,96 @@ function or(a, b) {
   return FALSE;
 }
 
+// ARCH value -> source directory (top Makefile SRCARCH aliases) and word size
+const ARCH_ALIASES = {
+  i386: ["x86", 32], x86_64: ["x86", 64], sparc32: ["sparc", 32], sparc64: ["sparc", 64], sh64: ["sh", 64],
+  parisc64: ["parisc", 64], arm64: ["arm64", 64], ppc64: ["powerpc", 64], ia64: ["ia64", 64], alpha: ["alpha", 64],
+  s390: ["s390", null], arm: ["arm", 32], m68k: ["m68k", 32],
+};
+// Compiler-predefined macros per source architecture: [always, 64-bit only, 32-bit only]
+const ARCH_PREDEFINED = {
+  x86: [[], ["__x86_64__", "__x86_64", "__amd64__", "__amd64"], ["__i386__", "__i386", "i386"]],
+  arm: [["__arm__"], [], []],
+  arm64: [["__aarch64__"], [], []],
+  powerpc: [["__powerpc__", "__PPC__"], ["__powerpc64__", "__PPC64__"], []],
+  sparc: [["__sparc__", "__sparc"], ["__sparc_v9__", "__arch64__"], []],
+  mips: [["__mips__", "__mips"], ["__mips64"], []],
+  s390: [["__s390__"], ["__s390x__"], []],
+  ia64: [["__ia64__"], [], []],
+  alpha: [["__alpha__"], [], []],
+  m68k: [["__mc68000__", "__m68k__"], [], []],
+  sh: [["__sh__"], [], []],
+  parisc: [["__hppa__"], [], []],
+  riscv: [["__riscv"], [], []],
+  loongarch: [["__loongarch__"], [], []],
+  microblaze: [["__microblaze__"], [], []],
+  xtensa: [["__xtensa__"], [], []],
+  arc: [["__arc__"], [], []],
+  openrisc: [["__or1k__"], [], []],
+  csky: [["__csky__"], [], []],
+  hexagon: [["__hexagon__"], [], []],
+  nios2: [["__nios2__"], [], []],
+  blackfin: [["__bfin__"], [], []],
+  avr32: [["__avr32__"], [], []],
+  frv: [["__frv__"], [], []],
+  cris: [["__CRIS__"], [], []],
+  m32r: [["__m32r__"], [], []],
+  h8300: [["__H8300__"], [], []],
+  mn10300: [["__mn10300__"], [], []],
+  score: [["__score__"], [], []],
+  tile: [["__tile__"], [], []],
+  unicore32: [["__unicore32__"], [], []],
+};
+
+/**
+ * Known compiler macros for an ARCH value: { defined: Set, undefined: Set }. The word size comes from the
+ * configuration (CONFIG_64BIT) when present, else from the ARCH value (x86_64, i386...).
+ */
+export function archMacros(arch, assignments = {}) {
+  const id = String(arch || "").toLowerCase();
+  const [srcarch, archBits] = ARCH_ALIASES[id] || [id, null];
+  const cfg64 = assignments["64BIT"] ?? assignments.CONFIG_64BIT;
+  const bits = cfg64 === "y" ? 64 : cfg64 === "n" ? 32 : archBits;
+  const defined = new Set(["__KERNEL__"]);
+  const undefinedSet = new Set(["__CHECKER__", "__GENKSYMS__"]);
+  for (const [name, [always, only64, only32]] of Object.entries(ARCH_PREDEFINED)) {
+    const own = name === srcarch || (srcarch === "um" && name === "x86");
+    for (const m of always) (own ? defined : undefinedSet).add(m);
+    // Word-size macros of the own architecture stay unknown when the word size is
+    for (const [macros, size] of [[only64, 64], [only32, 32]]) {
+      if (own && bits === null) continue;
+      for (const m of macros) (own && bits === size ? defined : undefinedSet).add(m);
+    }
+  }
+  if (bits === 64) defined.add("__LP64__").add("_LP64");
+  else if (bits === 32) undefinedSet.add("__LP64__").add("_LP64");
+  return { defined, undefined: undefinedSet };
+}
+
 export class DirectiveEvaluator {
-  constructor(assignments = {}) {
+  /**
+   * @param {object} assignments  Kconfig values (bare and/or CONFIG_ keys).
+   * @param {{partial?: boolean, macros?: {defined: Set, undefined: Set}}} options
+   */
+  constructor(assignments = {}, { partial = false, macros = null } = {}) {
     this.assignments = assignments;
+    this.partial = partial;
+    this.macros = macros || { defined: new Set(), undefined: new Set() };
   }
 
   setAssignments(assignments) {
     this.assignments = assignments || {};
+  }
+
+  setMacros(macros) {
+    this.macros = macros || { defined: new Set(), undefined: new Set() };
+  }
+
+  /** defined(MACRO) of a compiler-predefined (non-CONFIG) macro: TRUE, FALSE or UNKNOWN. */
+  predefined(macro) {
+    if (this.macros.defined.has(macro)) return TRUE;
+    if (this.macros.undefined.has(macro)) return FALSE;
+    return UNKNOWN;
   }
 
   /** Raw Kconfig value for CONFIG_<name> ("y", "m", "n", string/int) or undefined when unset. */
@@ -43,15 +135,16 @@ export class DirectiveEvaluator {
     return this.assignments[`CONFIG_${bare}`] ?? this.assignments[bare];
   }
 
-  /** defined(MACRO) for a CONFIG_* macro; UNKNOWN for any other macro. */
+  /** defined(MACRO) for a CONFIG_* or known predefined macro; UNKNOWN for any other macro. */
   isDefined(macro) {
-    if (!macro.startsWith("CONFIG_")) return UNKNOWN;
+    if (!macro.startsWith("CONFIG_")) return this.predefined(macro);
     let bare = macro.slice(7);
     if (bare.endsWith("_MODULE")) {
       const base = this.valueOf(bare.slice(0, -7));
       if (base !== undefined) return base === "m" ? TRUE : FALSE;
     }
     const val = this.valueOf(bare);
+    if (val === undefined && this.partial) return UNKNOWN;
     if (val === undefined || val === null || val === "n") return FALSE;
     return val === "m" ? FALSE : TRUE;
   }
@@ -60,6 +153,7 @@ export class DirectiveEvaluator {
   configTest(fn, macro) {
     if (!macro.startsWith("CONFIG_")) return UNKNOWN;
     const val = this.valueOf(macro.slice(7));
+    if (val === undefined && this.partial) return UNKNOWN;
     // __is_defined() only sees macros expanding to 1: y, or an int symbol whose value is 1
     const isY = val === "y" || val === "1";
     const isM = val === "m";
@@ -85,12 +179,15 @@ export class DirectiveEvaluator {
       if (/^\d/.test(tok)) return parseInt(tok, /^0x/i.test(tok) ? 16 : 10);
       if (tok.startsWith("CONFIG_")) {
         const val = this.valueOf(tok.slice(7));
+        if (val === undefined && this.partial) return null;
         if (val === undefined || val === "n") return 0;
         if (val === "y") return 1;
         const n = Number(val);
         return Number.isFinite(n) ? n : null;
       }
-      return null;
+      // Known predefined macros expand to 1; known-undefined identifiers are 0 in #if
+      const known = this.predefined(tok);
+      return known === UNKNOWN ? null : known;
     };
 
     const primary = () => {
