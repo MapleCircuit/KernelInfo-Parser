@@ -402,17 +402,19 @@ export class KconfigView {
     if (explicit !== null) return this.applyValue(sym, explicit);
     if (s.choice && this.engine.symTri(s.choice) === 2) return this.applyValue(sym, "y");
     const before = this.engine.symTri(sym);
-    const after = this.engine.toggle(sym);
-    if (before === after) {
+    const next = this.engine.toggleTarget(sym);
+    if (before === next) {
       toast.info(`CONFIG_${sym} cannot change: ${this.engine.refusalReason(sym, (before + 1) % 3) || "fixed by its dependencies"}`);
       return false;
     }
-    this.changed();
-    return true;
+    return this.applyValue(sym, ["n", "m", "y"][next]);
   }
 
-  /** Set a value (y/m/n or text); with the engine on it is refused unless kconfig accepts it. */
-  applyValue(sym, text) {
+  /**
+   * Set a value (y/m/n or text); with the engine on it is refused unless kconfig accepts it. Lowering a value
+   * that other options need (they depend on it or were selected by it) asks first, listing what they lose.
+   */
+  async applyValue(sym, text) {
     if (!this.engineActive) {
       this.rawValues = { ...(this.rawValues || {}), [sym]: text };
       this.changed();
@@ -420,12 +422,49 @@ export class KconfigView {
     }
     const s = this.engine.syms[sym];
     const tri = s.type === "bool" || s.type === "tristate" ? { n: 0, m: 1, y: 2 }[String(text).toLowerCase()[0]] : null;
+    if (tri !== null && tri !== undefined && tri < this.engine.symTri(sym)) {
+      const lowered = this.engine.previewLowered(sym, text);
+      if (lowered && lowered.length && !(await this.confirmSideEffects(sym, text, lowered))) return false;
+    }
     if (!this.engine.setValue(sym, text)) {
       toast.error(`CONFIG_${sym}=${text} refused: ${this.engine.refusalReason(sym, tri ?? text) || "not accepted by kconfig"}`);
       return false;
     }
     this.changed();
     return true;
+  }
+
+  /** Ask before a change that lowers other options; resolves true to go ahead. */
+  confirmSideEffects(sym, text, lowered) {
+    const MAX_ROWS = 300;
+    const value = String(text).toLowerCase()[0];
+    return new Promise((resolve) => {
+      let confirmed = false;
+      const modal = openModal({
+        title: `Set CONFIG_${sym}=${value}?`,
+        subtitle: `${lowered.length} other option${lowered.length === 1 ? "" : "s"} would change as a side effect`,
+        width: "820px",
+        footerHtml: `<button class="code-btn active" id="kconfig-confirm-lower" type="button">Set to ${escapeHtml(value)} anyway</button>`,
+        onClose: () => resolve(confirmed),
+      });
+      modal.body.innerHTML = `
+        <div class="kconfig-muted" style="margin-bottom:10px;">These options need CONFIG_${escapeHtml(sym)} (they depend on it or are selected through it) and are lowered with it:</div>
+        <table class="kconfig-cmp-table"><thead><tr><th>Option</th><th>Now</th><th>After</th><th>Why</th></tr></thead>
+        <tbody>${lowered.slice(0, MAX_ROWS).map((r) => `<tr data-symbol="${escapeHtml(r.name)}" title="Inspect CONFIG_${escapeHtml(r.name)} (cancels this change)"><td>CONFIG_${escapeHtml(r.name)}</td><td>${escapeHtml(r.before)}</td><td>${escapeHtml(r.after)}</td><td class="kconfig-muted">${escapeHtml(r.reason)}</td></tr>`).join("")}</tbody></table>
+        ${lowered.length > MAX_ROWS ? `<div class="kconfig-muted" style="margin-top:8px;">… and ${lowered.length - MAX_ROWS} more</div>` : ""}`;
+      modal.body.querySelectorAll("tr[data-symbol]").forEach((tr) => {
+        tr.onclick = () => {
+          modal.close();
+          this.selectAndInspectSymbol(tr.dataset.symbol);
+        };
+      });
+      const ok = modal.footer.querySelector("#kconfig-confirm-lower");
+      ok.onclick = () => {
+        confirmed = true;
+        modal.close();
+      };
+      ok.focus();
+    });
   }
 
   // ------------------------------------------------------------------ tree

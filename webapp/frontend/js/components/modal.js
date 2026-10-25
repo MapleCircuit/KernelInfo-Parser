@@ -3,10 +3,10 @@
  */
 
 /**
- * @param {{ title: string, subtitle?: string, width?: string, footerHtml?: string, className?: string }} opts
+ * @param {{ title: string, subtitle?: string, width?: string, footerHtml?: string, className?: string, onClose?: () => void }} opts
  * @returns {{ el: HTMLElement, body: HTMLElement, footer: HTMLElement, close: () => void }}
  */
-export function openModal({ title, subtitle = "", width = "760px", footerHtml = "", className = "" }) {
+export function openModal({ title, subtitle = "", width = "760px", footerHtml = "", className = "", onClose = null }) {
   const backdrop = document.createElement("div");
   backdrop.className = "ki-modal-backdrop";
   backdrop.innerHTML = `
@@ -29,8 +29,10 @@ export function openModal({ title, subtitle = "", width = "760px", footerHtml = 
     if (e.key === "Escape") close();
   };
   function close() {
+    if (!backdrop.isConnected) return;
     backdrop.remove();
     document.removeEventListener("keydown", onKey);
+    if (onClose) onClose();
   }
   document.addEventListener("keydown", onKey);
   backdrop.addEventListener("mousedown", (e) => {

@@ -559,15 +559,71 @@ export class KconfigEngine {
     return true;
   }
 
+  /** The value `toggle()` would set: the next of n -> m -> y -> n that is in range (the current one if none). */
+  toggleTarget(name) {
+    const old = this.symTri(name);
+    for (let step = 1; step < 3; step++) {
+      const next = (old + step) % 3;
+      if (this.tristateWithinRange(name, next)) return next;
+    }
+    return old;
+  }
+
   /** sym_toggle_tristate_value: n -> m -> y -> n, skipping values out of range. */
   toggle(name) {
-    const old = this.symTri(name);
-    let next = old;
-    do {
-      next = (next + 1) % 3;
-      if (this.setTristate(name, next)) break;
-    } while (next !== old);
+    const next = this.toggleTarget(name);
+    if (next !== this.symTri(name)) this.setTristate(name, next);
     return this.symTri(name);
+  }
+
+  /**
+   * What other options lose if `name` is set to `text` (as `setValue()` would): bool/tristate options whose value
+   * drops and other options no longer written to .config, each with the reason. Members of the same choice are
+   * left out (selecting one deselects the others). The configuration is left as it was.
+   * @returns {null | Array<{name: string, before: string, after: string, reason: string}>} null if kconfig refuses
+   */
+  previewLowered(name, text) {
+    const target = this.syms[name];
+    if (!target) return null;
+    const snapshot = (n) => {
+      const t = this.syms[n].type;
+      if (t === "bool" || t === "tristate") return this.symTri(n);
+      return this.writes(n) ? this.symStr(n) : null;
+    };
+    const names = Object.keys(this.syms).filter(
+      (n) => n !== name && this.isDefined(n) && !this.syms[n].is_choice && !(target.choice && this.syms[n].choice === target.choice)
+    );
+    const before = new Map(names.map((n) => [n, snapshot(n)]));
+    const saved = [new Map(this.user), new Map(this.choiceUser), new Map(this.choiceDefTri)];
+    const lowered = [];
+    try {
+      if (!this.setValue(name, text)) return null;
+      for (const n of names) {
+        const was = before.get(n);
+        const now = snapshot(n);
+        const s = this.syms[n];
+        const isTri = typeof was === "number";
+        if (isTri ? !(now < was) : !(was !== null && now === null)) continue;
+        let reason;
+        if (s.dir_dep >= 0 && this.dirDep(n) < (isTri ? was : 2)) reason = `depends on ${this.exprStr(s.dir_dep, true)}`;
+        else if (isTri && s.rev_dep >= 0 && this.revDep(n) < was) reason = `no longer selected: ${this.exprStr(s.rev_dep, true)}`;
+        else if (s.prompts.length && this.visibility(n) === 0) reason = `prompt hidden: ${s.prompts.map((pv) => this.exprStr(pv, true)).join(" || ")}`;
+        else reason = "its default no longer applies";
+        lowered.push({
+          name: n,
+          before: isTri ? TRI_CHAR[was] : was,
+          after: isTri ? TRI_CHAR[now] : "(not set)",
+          reason,
+        });
+      }
+    } finally {
+      for (const [map, copy] of [[this.user, saved[0]], [this.choiceUser, saved[1]], [this.choiceDefTri, saved[2]]]) {
+        map.clear();
+        for (const [k, v] of copy) map.set(k, v);
+      }
+      this.invalidate();
+    }
+    return lowered.sort((a, b) => a.name.localeCompare(b.name));
   }
 
   /** Why a value cannot be chosen (empty when it can). */

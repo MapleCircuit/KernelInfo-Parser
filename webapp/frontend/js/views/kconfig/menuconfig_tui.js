@@ -131,6 +131,8 @@ export class MenuconfigTui {
     this.keyHandler = (e) => {
       if (!this.modalEl) return;
       if (e.target && (e.target.tagName === "INPUT" || e.target.tagName === "TEXTAREA")) return;
+      // A dialog over the TUI (e.g. confirming a change that lowers other options) gets the keys
+      if (document.querySelector(".ki-modal-backdrop")) return;
       if (this.helpOpen) {
         if (["Escape", "Enter", " ", "q", "?", "h"].includes(e.key)) {
           e.preventDefault();
@@ -206,12 +208,12 @@ export class MenuconfigTui {
     this.render();
   }
 
-  handleSet(value) {
+  async handleSet(value) {
     const item = this.selectedItem();
     const sym = item?.node.sym;
     const s = sym && this.engine.syms[sym];
     if (!s || (s.type !== "bool" && s.type !== "tristate") || s.is_choice) return;
-    this.view.applyValue(sym, value);
+    await this.view.applyValue(sym, value);
     this.render();
   }
 

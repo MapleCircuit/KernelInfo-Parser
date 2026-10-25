@@ -139,6 +139,46 @@ class TestKconfigModelSemantics(unittest.TestCase):
         self.assertEqual(ev.dir_dep("T"), 0)
         self.assertFalse(ev.set_value("T", "n"))
 
+    def test_javascript_preview_of_lowering_side_effects(self) -> None:
+        """previewLowered() lists what dependents and selected options lose, without changing the configuration."""
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("node is not installed")
+        files = {"Kconfig": BASE + (
+            'config NET\n\tbool "net"\n\tdefault y\n'
+            'config INET\n\tbool "inet"\n\tdepends on NET\n\tdefault y\n'
+            'config IPV6\n\ttristate "ipv6"\n\tdepends on INET\n\tdefault m\n'
+            'config FEATURE\n\tbool "feature"\n\tdefault y\n\tselect LIB\n'
+            'config LIB\n\tbool\n'
+        )}
+        tmp = tempfile.mkdtemp(prefix="kconfig-js-")
+        try:
+            model = os.path.join(tmp, "model.json")
+            with open(model, "w") as fh:
+                json.dump(compact_model(build(files)), fh)
+            script = os.path.join(tmp, "run.mjs")
+            with open(script, "w") as fh:
+                fh.write(
+                    "import fs from 'fs';\n"
+                    f"const {{ KconfigEngine }} = await import({json.dumps(ENGINE_JS)});\n"
+                    "const e = new KconfigEngine(JSON.parse(fs.readFileSync(process.argv[2], 'utf8')));\n"
+                    "e.setAllNewSymbols('default');\n"
+                    "const before = e.writeConfig();\n"
+                    "const out = { net: e.previewLowered('NET', 'n'), feature: e.previewLowered('FEATURE', 'n'),\n"
+                    "  raise: e.previewLowered('IPV6', 'y'), toggle: e.toggleTarget('NET'), same: e.writeConfig() === before };\n"
+                    "console.log(JSON.stringify(out));\n"
+                )
+            out = json.loads(subprocess.run([node, script, model], check=True, capture_output=True, text=True, timeout=60).stdout)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+        self.assertEqual([(r["name"], r["before"], r["after"]) for r in out["net"]], [("INET", "y", "n"), ("IPV6", "m", "n")])
+        self.assertEqual(out["net"][0]["reason"], "depends on NET [=n]")
+        self.assertEqual([(r["name"], r["after"]) for r in out["feature"]], [("LIB", "n")])
+        self.assertTrue(out["feature"][0]["reason"].startswith("no longer selected"))
+        self.assertEqual(out["raise"], [])
+        self.assertEqual(out["toggle"], 0)
+        self.assertTrue(out["same"], "previewing must leave the configuration unchanged")
+
     def test_modules_off_degrades_tristate_and_m_dependencies(self) -> None:
         files = {"Kconfig": BASE + 'config D\n\ttristate "d"\n\tdefault m\nconfig E\n\tbool "e"\n\tdepends on m\n'}
         ev = evaluator(files)
