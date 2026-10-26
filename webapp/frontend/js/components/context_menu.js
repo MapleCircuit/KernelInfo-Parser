@@ -1076,8 +1076,13 @@ class ContextMenu {
     box.style.width = "540px";
     box.onclick = (e) => e.stopPropagation();
 
-    const defs = (xref && (xref.definitions || (xref.definition ? [xref.definition] : []))) || [];
+    const allDefs = (xref && (xref.definitions || (xref.definition ? [xref.definition] : []))) || [];
+    // A definition outside this revision's tree sits at no path here, so it can be neither shown nor jumped to
+    const defs = allDefs.filter((d) => d && d.file);
     const refs = (xref && (xref.references || [])) || [];
+    const noDefsNote = xref && xref.definition_unindexed
+      ? "Defined in other indexed revisions, but this revision's copy of the file was never parsed &mdash; the usages below still apply."
+      : "No direct definition indexed for this symbol.";
 
     const defsHtml = defs.length > 0
       ? defs.map((d) => `
@@ -1094,7 +1099,7 @@ class ContextMenu {
             <span style="font-size:11px;color:var(--accent-purple);font-weight:500;">Jump &rarr;</span>
           </div>
         `).join("")
-      : `<div style="font-size:11px;color:var(--text-muted);margin-bottom:12px;font-style:italic;">No direct definition indexed for this symbol.</div>`;
+      : `<div style="font-size:11px;color:var(--text-muted);margin-bottom:12px;font-style:italic;">${noDefsNote}</div>`;
 
     const refsHtml = refs.length > 0
       ? refs.map((r) => `

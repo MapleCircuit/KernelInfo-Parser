@@ -31,6 +31,9 @@ MAX_AST_TREE_DEPTH = 12
 MAX_AST_TREE_NODES = 20000
 # Most references one xref answer returns when the caller names no limit
 MAX_XREF_REFS = 5000
+# Most target ASTs one xref answer looks references up for. Only reached at a revision without an in-tree
+# definition, where every indexed definition of the name is a target (one per content of the defining file)
+MAX_XREF_TARGETS = 64
 
 
 def format_symbol_type(type_name: str) -> str:
@@ -38,6 +41,20 @@ def format_symbol_type(type_name: str) -> str:
     if type_name == "C_enumequal":
         return "EnumConstant"
     return type_name
+
+
+def _symbol_asts(def_rows: list[dict[str, Any]], symbol_name: str) -> list[int]:
+    """The ASTs of `def_rows` that are the symbol itself, deduplicated, at most MAX_XREF_TARGETS.
+
+    A marker definition (`EXPORT_SYMBOL(sym)`, an initcall) records the symbol's name against the AST of the
+    macro, which is content-addressed and therefore the same node for every symbol the kernel marks that way
+    (180k rows share 4 ASTs here). Its references are the references of all of them, so matching `m_ast.name`
+    against the symbol's name is what keeps them out of this symbol's cross-references.
+    """
+    return list(dict.fromkeys(
+        d["ast_id"] for d in def_rows
+        if d["ast_id"] and safe_decode(d.get("ast_name")) == symbol_name
+    ))[:MAX_XREF_TARGETS]
 
 
 class SymbolService:
@@ -334,24 +351,32 @@ class SymbolService:
                         arch: str = DEFAULT_DEFINITION_ARCH) -> dict[str, Any]:
         """Categorize references: calls, member_refs, type_usages, declarations, macro_expansions.
 
-        `definitions` are ranked for `arch` (see `definition_rank`); `definition` is the first one.
+        `definitions` are the definitions in this revision's tree, ranked for `arch` (see `definition_rank`);
+        `definition` is the first one. References are looked up for every AST that *is* the symbol, in the
+        tree or not, so a revision whose copy of the defining file was never parsed still resolves them.
         """
         with get_db_cursor() as cursor:
             _, vname, blob_paths = self._scope(cursor, version_name)
             arch_id, srcarch, bits = definition_arch(vname, arch)
 
-            # Resolve symbol definition to ast_id (all matching definitions; those in this revision's tree when any)
+            # Resolve symbol definition to ast_id. a.name tells the symbol's own AST from the AST of a marker
+            # definition (EXPORT_SYMBOL(sym), an initcall): that one is the macro's content-addressed node,
+            # shared by every symbol it marks, so it is shown but never a reference target (see ref_targets)
             cursor.execute(
                 """
-                SELECT s.ast_id, s.type_id, t.name AS type_name, s.line_s, s.line_e, s.blob_id, s.linkage
+                SELECT s.ast_id, s.type_id, t.name AS type_name, s.line_s, s.line_e, s.blob_id, s.linkage,
+                       a.name AS ast_name
                 FROM m_symbol_def s
                 JOIN m_type_descriptor t ON s.type_id = t.type_id
+                LEFT JOIN m_ast a ON a.ast_id = s.ast_id
                 WHERE s.name = %s;
                 """,
                 (symbol_name,),
             )
             def_rows = cursor.fetchall()
             in_tree = [d for d in def_rows if d["blob_id"] in blob_paths]
+            # Only definitions of this tree are definitions of this revision: an out-of-tree blob sits at no
+            # path here, so it has nothing to show and nothing to jump to
             defs = sorted(
                 (
                     {
@@ -362,13 +387,16 @@ class SymbolService:
                         "ast_id": d["ast_id"],
                         "linkage": d["linkage"],
                     }
-                    for d in (in_tree or def_rows)
+                    for d in in_tree
                 ),
                 key=lambda d: definition_rank(d["file"], d["linkage"], d["line_s"], srcarch, bits),
             )
+            # References are resolved against the AST of the definition the referencing blob was parsed
+            # with, so without an in-tree definition every indexed AST of the symbol is a candidate target
+            ref_targets = _symbol_asts(in_tree, symbol_name) or _symbol_asts(def_rows, symbol_name)
 
             # Fallback to m_ast lookup if no explicit m_symbol_def record exists
-            if not defs:
+            if not def_rows:
                 cursor.execute(
                     """
                     SELECT a.ast_id, a.type_id, t.name AS type_name, bt.blob_id, bt.line_s, bt.line_e
@@ -382,7 +410,8 @@ class SymbolService:
                     (symbol_name,),
                 )
                 tag_rows = cursor.fetchall()
-                tag_rows = [r for r in tag_rows if r["blob_id"] in blob_paths] or tag_rows
+                ref_targets = list(dict.fromkeys(r["ast_id"] for r in tag_rows if r["ast_id"]))[:MAX_XREF_TARGETS]
+                tag_rows = [r for r in tag_rows if r["blob_id"] in blob_paths]
                 tag_rows.sort(key=lambda r: (path_rank(best_path(blob_paths.get(r["blob_id"]), srcarch, bits), srcarch, bits), r["line_s"] or 0))
                 for f_row in tag_rows[:5]:
                     defs.append({
@@ -393,8 +422,9 @@ class SymbolService:
                         "ast_id": f_row["ast_id"],
                     })
 
-            ast_ids = [d["ast_id"] for d in defs if d.get("ast_id")]
-            primary_ast_id = ast_ids[0] if ast_ids else 0
+            ast_ids = ref_targets
+            targets = set(ast_ids)
+            primary_ast_id = next((d["ast_id"] for d in defs if d["ast_id"] in targets), ast_ids[0] if ast_ids else 0)
 
             ref_rows = []
             if ast_ids:
@@ -463,8 +493,13 @@ class SymbolService:
                 "ast_id": primary_ast_id,
                 "definitions": defs,
                 "definition": defs[0] if defs else None,
+                "total_definitions": len(defs),
+                # The index knows this symbol, but no definition of it sits in this revision's tree: the
+                # revision's copy of the defining file was never parsed (its references still resolve)
+                "definition_unindexed": bool(def_rows) and not defs,
                 "references": all_refs,
                 "references_count": len(all_refs),
+                "total_references": len(all_refs),
                 "calls": usages["calls"],
                 "member_refs": usages["member_refs"],
                 "type_usages": usages["type_usages"],
