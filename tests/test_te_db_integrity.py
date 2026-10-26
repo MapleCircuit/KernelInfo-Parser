@@ -997,6 +997,20 @@ class TestTECachedDBIntegrity(unittest.TestCase):
         self.assertIn(fake_tbl_cached_nodup.table_id, self.te._nodup_index)
         self.assertEqual(self.te._nodup_index[fake_tbl_cached_nodup.table_id][("nodup_retain",)], 1)
 
+    def test_write_heavy_eviction_after_clear_cache(self) -> None:
+        """Verify commit_all() after a cache-clearing commit_all(update_in_mem_indexes=False) keeps set() working
+        on write-heavy tables (eviction used to recreate only part of their cache structures)."""
+        self.te.start(ALL_FAKE_TABLES, lambda: self.db)
+        self.te.WRITE_HEAVY_TABLES = frozenset({fake_tbl_cached_bridge.table_name})
+        t_id = fake_tbl_cached_bridge.table_id
+
+        self.te.set(t_id, (1, 10, 100))
+        self.te.commit_all(update_in_mem_indexes=False)
+        self.te.commit_all()
+
+        self.te.set(t_id, (1, 11, 101))
+        self.assertEqual(self.te.get(t_id, (1, 11, None)), (1, 11, 101))
+
     def test_dynamic_update_in_mem_indexes_toggle(self) -> None:
         """Verify disabling update_in_mem_indexes skips in-memory index updates on set and update."""
         self.te.start(ALL_FAKE_TABLES, lambda: self.db)

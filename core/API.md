@@ -491,7 +491,10 @@ Main Process (STEP 6.1+: Post-Processing Subsystems) TableEngine (G.TE)         
   │  ├─ norm_target = normpath(target)            │                                 │
   │  ├─ target_fid = get_fid_for_path(norm_target)│                                 │
   │  ├─ m_bridge_file.set(vid, sym_fnid, fid) ──►│ (Direct zero-duplication alias) │
-  │  └─ Broken symlink fallback -> file_processing│                                 │
+  │  ├─ Broken symlink whose blob is already      │                                 │
+  │  │  parsed (tagged) -> relinked to that blob  │                                 │
+  │  │  (_reuse_parsed_symlink_blobs, no re-parse)│                                 │
+  │  └─ Other broken symlinks -> file_processing  │                                 │
   │                                               │                                 │
   ├─ Post-Processing Subsystems:                  │                                 │
   │  ├─ processing_git_commits(version) ─────────►│ (Zero-decompression tag mapping │
@@ -552,7 +555,7 @@ Main Process (STEP 6.1+: Post-Processing Subsystems) TableEngine (G.TE)         
 - **Content-Addressable Blob Deduplication (Step 4.5)**:
   - Before worker dispatch (and after `G.TE.start()`), `_reuse_parsed_blobs()` looks each changed file's `(blob_hash, ftype)` up in the TableEngine's `m_file_blob` cache and confirms which matches already have tags with one targeted `m_bridge_tag` query (no full-table loads). Files whose exact content was already parsed in any prior version or tree are registered into `m_file_name`, `m_bridge_checkpoint` and `m_commit_file` through the TableEngine, skipping redundant worker translation units; their paths go to `gp.deduped_paths` so Step 6.5 still links their tags to this range's commits.
 - **Referential Integrity & Staged Pipeline Commit Boundaries**:
-  - Multicore Stage 2 parsing (`scheduler.finalize()`) and git commit parsing (`processing_git_commits`) enforce full TableEngine commits (`G.TE.commit_all(update_in_mem_indexes=False)`) prior to initiating downstream child table staging (`m_file_reference`, `m_kconfig_kbuild`, `m_maintainer_file`).
+  - Multicore Stage 2 parsing (`scheduler.finalize()`) and git commit parsing (`processing_git_commits`) enforce full TableEngine commits prior to initiating downstream child table staging (`m_file_reference`, `m_kconfig_kbuild`, `m_maintainer_file`). The commit after Stage 2 keeps the in-memory caches (`G.TE.commit_all()`): Step 6.1 stages `m_file_name` / `m_file_blob` rows, and a cleared cache would mint new ids for paths and blobs already in the database (duplicate `m_file_name` rows, `m_file_blob` unique-key violations on `(blob_hash, ftype)`). The commit after git commit parsing clears them (`update_in_mem_indexes=False`).
   - Step 6.6 (`processing_file_references`) commits all pending parent table rows (`m_file_blob`, `m_file_name`, `m_bridge_checkpoint`), reads this version's blob ids from its checkpoint (valid source blobs), and only clears and recomputes the references of blobs that are new since `gp.Old_VID` (Makefile references, documentation scans and the include `INSERT IGNORE ... SELECT`): rows are keyed by source blob, so carried-over blobs keep theirs. Kbuild symbol mappings (`m_kconfig_kbuild`, idempotent) are still staged for every Makefile. Step 6.7 (`processing_maintainer_files`) skips files already mapped for the same MAINTAINERS blob. Step 6.8 (`processing_arch_layouts`) evaluates the version's Makefiles for every ARCH value (`parser/arch_layout.py` over the Step 4 tree listing and the RAMDISK files) and replaces the head commit's `m_arch_root` rows (about 90 rows at v2.6.12, 1,600 at v6.1).
   - Milestone checkpointing correctly targets active version `gp.VID` (falling back to HEAD commit id) rather than oldest ancestor commits.
 - **Milestone Release Checkpointing**:

@@ -685,8 +685,10 @@ def update(version: str, repo_path: str | None = None) -> None:
     scheduler.finalize()
     _log_symbol_stats(version, symbols_base)
 
-    # Commit all pending rows from Multicore / Stage 2 execution before post-processing steps
-    G.TE.commit_all(update_in_mem_indexes=False)
+    # Commit all pending rows from Multicore / Stage 2 execution before post-processing steps; the caches stay:
+    # Step 6.1 stages m_file_name / m_file_blob rows whose deduplication needs them (clearing them minted
+    # duplicate rows for paths and blobs already in the database)
+    G.TE.commit_all()
 
     reclaim_system_memory()
 
@@ -3973,6 +3975,9 @@ def processing_symlinks(override_symlinks: list[str] | None = None) -> None:
             fallback_files.append(f"{fallback_op}\t{symlink_path}")
 
     if fallback_files:
+        fallback_files = _reuse_parsed_symlink_blobs(fallback_files)
+
+    if fallback_files:
         file_processing(0, 0, fallback_files)
         for fb in fallback_files:
             fb_path = fb.split("\t")[-1]
@@ -3986,6 +3991,43 @@ def processing_symlinks(override_symlinks: list[str] | None = None) -> None:
 
     if override_symlinks is None and hasattr(gp, "Symlink_List") and gp.Symlink_List:
         gp.Symlink_List.clear()
+
+
+def _reuse_parsed_symlink_blobs(fallback_files: list[str]) -> list[str]:
+    """Link fallback symlinks whose blob was already parsed (e.g. an unchanged broken symlink) to that blob.
+
+    Parsing them again would stage a second m_file_blob row for the same `(blob_hash, ftype)` and m_bridge_tag
+    rows the blob already has.
+
+    Returns:
+        The fallback change lines that still need parsing.
+    """
+    blob_hashes = getattr(gp, "file_blob_hashes", None) or {}
+    parsed: dict[str, int] = {}
+    for item in fallback_files:
+        fpath = item.split("\t")[-1]
+        b_hash = blob_hashes.get(fpath)
+        if item.startswith("D") or not b_hash:
+            continue
+        blob_row = G.TE.get(m_file_blob.table_id, (None, b_hash, type_check(fpath)))
+        if blob_row is not None:
+            parsed[fpath] = blob_row[0]
+
+    tagged = _tagged_blob_ids(parsed.values())
+    remaining = []
+    for item in fallback_files:
+        fpath = item.split("\t")[-1]
+        b_id = parsed.get(fpath)
+        if b_id not in tagged:
+            remaining.append(item)
+            continue
+        fnid = G.TE.set(m_file_name.table_id, (None, fpath))[0]
+        if m_bridge_file.get(gp.VID, fnid, None) is None:
+            G.TE.set(m_bridge_file.table_id, (gp.VID, fnid, b_id))
+        file_fid_cache[fpath] = b_id
+        gp.file_blob_ids[fpath] = b_id
+        logger.info(f"Symlink '{fpath}' reuses its already parsed blob (fid {b_id})")
+    return remaining
 
 
 def _load_blob_tags(blob_ids: Iterable[int]) -> dict[int, list[tuple[int, int, int, int]]]:

@@ -854,9 +854,11 @@ class TECachedDB(TEDirectDB):
 
         Rows preloaded into a shared buffer stay reachable through its views, so only rows staged since then
         move to `_committed_pks` (copying every shared key into a set took seconds per commit). Carried tables
-        keep their rows: they are the snapshot extension the next version reuses.
+        keep their rows: they are the snapshot extension the next version reuses. A table without cache
+        structures (e.g. after `clear_cache()`) is left alone: recreating only some of them made `_ensure_table()`
+        skip the rest, and the next `set()` failed on `_col_indices`.
         """
-        if table_id in self._carried_overlays:
+        if table_id in self._carried_overlays or table_id not in self._cached_rows:
             return
         committed = self._committed_pks.setdefault(table_id, set())
         pk_index = self._pk_index.get(table_id)
