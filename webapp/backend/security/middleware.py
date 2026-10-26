@@ -18,7 +18,9 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         # Routes may set a stricter policy (e.g. sandboxed raw SVG); only fill in the default
         response.headers.setdefault("Content-Security-Policy", (
             "default-src 'self'; "
-            "script-src 'self' 'unsafe-eval'; "
+            # No frontend module evaluates code from a string (no eval, no new Function), so
+            # 'unsafe-eval' would only widen what an injected string could do.
+            "script-src 'self'; "
             "style-src 'self' 'unsafe-inline'; "
             "img-src 'self' data: blob:; "
             "connect-src 'self'; "

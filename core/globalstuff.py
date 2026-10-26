@@ -41,6 +41,36 @@ def compute_code_hash(code: str) -> bytes:
     return hashlib.sha256(code.encode("latin-1")).digest()
 
 
+# A revision a caller may name: a tag, a branch or a (short) commit SHA. Git parses an argument
+# starting with "-" as an option, so a revision placed before "--" must never start with one.
+_SAFE_GIT_REV_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/+-]{0,254}$")
+
+
+def is_safe_git_rev(rev: object) -> bool:
+    """True when rev is a plain tag, branch or commit SHA safe to pass to git as an argument.
+
+    Rejects option-looking values ("-o", "--output=...") and every character git gives a meaning
+    in a revision expression, so a caller-supplied name can only ever name a ref.
+    """
+    return isinstance(rev, str) and bool(_SAFE_GIT_REV_RE.match(rev))
+
+
+def is_safe_git_spec(spec: object) -> bool:
+    """True when spec (`<rev>:<path>`, written to `git cat-file --batch`) is one single request.
+
+    `cat-file --batch` reads one request per line, so a NUL or newline inside a spec injects
+    further requests and desynchronizes every later answer on that stream.
+    """
+    return (
+        isinstance(spec, str)
+        and bool(spec)
+        and not spec.startswith("-")
+        and "\n" not in spec
+        and "\r" not in spec
+        and "\0" not in spec
+    )
+
+
 def normalize_repo_path(path: str, base_dir: str | None = None) -> str:
     """Normalize absolute host/RAMDISK file paths into relative git repository paths."""
     if not path:

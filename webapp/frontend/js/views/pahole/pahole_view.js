@@ -3,6 +3,7 @@
  */
 import { api } from "../../api.js";
 import { state } from "../../state.js";
+import { escapeHtml } from "../../components/modal.js";
 
 export class PaholeView {
   constructor() {
@@ -201,7 +202,7 @@ export class PaholeView {
       });
 
     } catch (e) {
-      resultsContainer.innerHTML = `<div style="color:var(--accent-red);">Failed: ${e.message}</div>`;
+      resultsContainer.innerHTML = `<div style="color:var(--accent-red);">Failed: ${escapeHtml(e.message)}</div>`;
     }
   }
 }

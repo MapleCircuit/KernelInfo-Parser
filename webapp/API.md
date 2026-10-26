@@ -19,7 +19,8 @@ webapp/
 │   │   └── helpers.py              # Encoding safeguards, version metadata lookup
 │   ├── security/
 │   │   ├── jail.py                 # Canonical filesystem sandboxing & jail validation
-│   │   ├── sql.py                  # SQL LIKE wildcard sanitizer
+│   │   ├── git.py                  # Git revision & object-spec validation (argument injection)
+│   │   ├── sql.py                  # SQL LIKE wildcard sanitizer & identifier validation
 │   │   └── middleware.py           # Security headers (CSP) & sliding-window rate limiter
 │   ├── services/
 │   │   ├── git_reader.py           # Persistent Git object readers (git cat-file --batch), one per repository
@@ -76,15 +77,66 @@ All file requests are validated against `LINUX_REPO_DIR` (the root of the tracke
 - Path traversal sequences (`..`, `../`, `//`, null bytes) trigger immediate `HTTP 400 Bad Request`.
 - Accessing files outside the repository jail triggers `HTTP_403_FORBIDDEN`.
 
+### 2.1.1. Git Revision & Object-Spec Validation (`webapp/backend/security/git.py`)
+Every endpoint names a revision (a version name, a branch or a commit SHA) and the services pass it
+to `git` as a **positional argument** (`git blame <rev> -- <path>`). Git reads an argument starting
+with `-` as an option, so an unvalidated revision becomes one: `--contents=<file>` makes `git blame`
+print any file, and `--output=<file>` makes `git log` write one. A revision is therefore validated
+before it can reach a command line:
+- `safe_rev(rev) -> str`: returns the revision, or raises `HTTP 400 Bad Request`. Accepts only
+  `core.globalstuff.is_safe_git_rev()`: a name of at most 255 characters starting with `[A-Za-z0-9]`
+  and otherwise limited to `[A-Za-z0-9._/+-]`, which covers tags (`v2.6.32-rc1`), branches
+  (`origin/master`, `feature/x`) and full or short SHAs, and excludes options, whitespace, newlines
+  and every character git gives a meaning in a revision expression (`^`, `~`, `:`, `{`, `}`).
+- `is_safe_rev(rev) -> bool`: the non-raising form, for services that fall back instead of failing
+  (`TreeResolverService.resolve_commit_sha()` returns `None`, so callers answer 404 as before).
+- `safe_blob_spec(spec) -> str`: a `<rev>:<path>` spec for `git cat-file --batch`, which reads one
+  request per line. A newline or NUL inside a spec injects further requests and desynchronizes every
+  later answer on that long-lived stream, so such specs are never written to it: `GitReader`
+  (`git_reader.py`) answers `missing`, and `history_service.batch_blob_shas()` — which matches
+  answers to specs by position — leaves the offending spec out and reports `None` for it.
+
+Validation points (every revision a service passes to git goes through one of them):
+`GitService.get_blame()` / `get_file_history()` (`safe_rev`), `_cached_git_file_history()`
+(`is_safe_rev`), `KconfigService._rev()` (the single funnel for that service's `git grep` /
+`ls-tree` calls), `GitTreeResolver.resolve_commit_sha()` (Path C, and therefore the filesystem,
+diff, docs and history services), `HistoryService.get_change_commits()`, and
+`database/helpers.get_version_info()`, whose `git rev-parse` fallback is skipped for a name that
+would be read as an option (the unresolved name is still returned, so callers answer 404).
+`GitService.get_commit_diff()` keeps its stricter 4–40 hex check (`_HEX_REF`).
+
+### 2.1.2. Identifier Validation for Git Pattern Searches (`webapp/backend/security/sql.py`)
+A caller-supplied name also reaches `git grep` as a **pattern**, where metacharacters match far more
+than the name itself: `CONFIG_.*` finds every `CONFIG_` reference in the tree (44,485 lines at v3.0,
+3.0 MiB, versus 406 for a real symbol), and the whole result would be read, parsed and cached under
+a name the caller chose. `KconfigService._safe_symbol()` therefore strips the `CONFIG_` prefix and
+rejects anything `is_valid_identifier()` does not accept (`^[A-Za-z0-9_.~+-]+$`) with
+`HTTP 400 Bad Request`; it is the gate for `get_symbol_usage()` and `kbuild_usage()`. Patterns built
+from an accepted name are still escaped (`re.escape`, as `_other_arch_definitions()` does), the
+literal searches pass `-F` so git reads the name as text rather than a basic regex, and a symbol
+with more than `_USAGE_REF_LIMIT` (20,000) references is reported `source_refs_truncated: true`
+instead of being cached whole. `git grep -E` itself uses a DFA, so a pattern cannot make it
+backtrack; the control here is over how much it can match and retain.
+
 ### 2.2. SQL Wildcard Sanitization (`webapp/backend/security/sql.py`)
-- `sanitize_like_query(query: str) -> str`: Escapes user-supplied SQL wildcards (`%` and `_`) using `\%` and `\_` before inserting into parameterized `LIKE %s` queries, preventing regex-based timing denial-of-service.
+- `escape_like(value: str) -> str`: Escapes the SQL `LIKE` wildcards (`%`, `_`) and the escape character itself, leaving length untouched. For values that must keep their full length, such as a path prefix (`filesystem_service.get_tree()`, `diff_service._fetch_commit_files()`), where an unescaped `%` turns an anchored prefix match into a full scan.
+- `sanitize_like_query(query: str) -> str`: Truncates a search query to 100 characters, then escapes it with `escape_like()`. Used by the symbol, maintainer and commit searches. Commit search matters most: `q=%` previously made all three of its `LIKE` clauses match every row of `m_commit` (95,949 rows of the reference database, against 70 for the escaped, literal `%`).
+- `is_valid_identifier(name: str) -> bool`: `^[A-Za-z0-9_.~+-]+$`, the gate described in §2.1.2.
 
 ### 2.3. HTTP Security Headers (`webapp/backend/security/middleware.py`)
 Every response includes hardened security headers:
-- `Content-Security-Policy`: Restricts scripts, styles, and workers to `'self'` and `'unsafe-inline'` for style attributes.
+- `Content-Security-Policy`: `default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self'; frame-ancestors 'none'`. Scripts and workers are restricted to `'self'`, with `'unsafe-inline'` only for style attributes. `script-src` carries **no** `'unsafe-eval'`: no frontend module evaluates code from a string (no `eval`, no `new Function`, and the vendored `two.min.js` uses neither), so allowing it would only widen what an injected string could do. A route may set a stricter policy of its own (`GET /api/fs/raw/...` sandboxes raw SVG); the middleware only fills in the default.
 - `X-Frame-Options`: `DENY` (prevents clickjacking attacks).
 - `X-Content-Type-Options`: `nosniff`.
 - `Referrer-Policy`: `strict-origin-when-cross-origin`.
+
+### 2.3.1. CORS (`webapp/backend/app.py`)
+The API carries no cookie or header authentication, so any origin may read it (`allow_origins=["*"]`,
+methods `GET`, `POST`, `OPTIONS`) but **never with credentials** (`allow_credentials=False`). The two
+combined are what Starlette turns into a reflected `Access-Control-Allow-Origin` plus
+`Access-Control-Allow-Credentials: true`, which would let any page in a visitor's browser read this
+API as that visitor; with credentials off, the literal `*` is returned instead. Because the frontend
+is served from the same origin, it still reads `X-KIP-Sync` and every other response header.
 
 ### 2.4. Sliding-Window Rate Limiting
 - `SlidingWindowRateLimiter`: Enforces an in-memory sliding window cap (default 600 requests / 60 seconds per client IP). Exceeding requests receive `HTTP 429 Too Many Requests` with a `Retry-After` header.
@@ -102,6 +154,7 @@ The `webapp/` backend operates exclusively as a read-only presentation and query
 4. **Maintainer Query Sanitization & Parameter Preference**: Developer identity and maintainer endpoints (`webapp/backend/routers/maintainers.py`, `webapp/backend/services/maintainer_service.py`) support query parameter lookups (`/api/maintainers/person?email=...&version=...`) alongside URL path parameters. Frontend API clients sanitize patch trailers and email strings (stripping `<>`, quotes, and whitespace) and prefer query parameters when identifiers contain special characters (`@`, `<`, `>`, `/`) to prevent URL decoding and route matching failures.
 5. **Context Menu Interaction Preservation**: Right-click context menus (`contextmenu`) across webapp workspaces (virtual code editor, file explorer sidebar, nodemap canvas) intercept default browser menus and offer context-adaptive actions (definitions, references, git blame popovers, command palette search, coordinate copying), while strictly preserving primary left-click interactions (inline AST token inspector popups, file navigation, node selection) without collision, event race conditions, or lingering ghost menus.
 6. **Structured Cross-Reference Classification**: Symbol cross-reference backend services (`get_symbol_xref`) and frontend inspectors (`showXrefModal`) return and render both primary and multi-declaration definition locations (`definitions: [...]` with file path, line bounds, and AST declaration type) alongside categorized usage references (`references: [...]` with caller function, file, line, and typed badges `Call`, `MemberRef`, `TypeUsage`, `DeclRef`, `MacroExpansion`), providing direct 1-click jump navigation for both definitions and usages.
+7. **Escaping of Interpolated HTML**: every value interpolated into an `innerHTML` / `insertAdjacentHTML` template passes through `escapeHtml()` (exported by `webapp/frontend/js/components/modal.js`), including error text (`e.message`), repository data (git author names, file paths) and state values (the KConfig `arch`). Only values that are *already* rendered HTML are interpolated raw, and those are built from escaped parts (`doc_page.js` navigation links, the `virtual_editor.js` build-condition `why` / `ruleHtml` fragments). The CSP (§2.3) forbids inline scripts, so this is the layer that keeps repository content from entering the DOM as markup.
 
 ### 2.7. Tri-Path Tree Resolution & Arch-Aware Definition Ranking (`webapp/backend/services/tree_resolver.py`)
 1. **Database Tree Resolution (`TreeResolverService`, module singleton `tree_resolver`)**:
@@ -146,6 +199,7 @@ Either side of a comparison may be a release tag, a branch, or an arbitrary comm
 2. **Git access**: Every service resolves the work tree through `get_repo_dir()`; `git_reader` is a `GitReaderPool` with one persistent `git cat-file --batch` process per repository, and `GitTreeResolver.repo_dir` follows the request unless pinned.
 3. **Database scoping**: `get_active_repo_id(cursor)` maps the repository to `m_repository.repo_id` (by name, then `git_url`; `-1` when never parsed). Version resolution (`get_version_info`) and the version/branch catalogs only consider that repository's `m_git_ref` rows. Commit ids, blobs and tags are global and need no scoping.
 4. **Caches**: Module caches keyed by version names (`_FILE_TOKENS_CACHE`, `_INCLUDE_CACHE`, `_TREEMAP_CACHE`, `_DEFCONFIG_CACHE`, `_TREE_CACHE`, `_MAINTAINER_CACHE`, `_FILE_SUBSYSTEMS_CACHE`, version name/id caches) are `RepoScopedCache` instances that transparently prefix keys with the repository name; the git file-history LRU cache takes the repository path as an argument.
+   A `RepoScopedCache` takes an optional `maxsize` and then evicts the least recently used entry. Every cache whose key carries a request parameter is bounded, because otherwise each distinct value a caller sends adds an entry that is never released: `_INCLUDE_CACHE` (4096; keyed by header and referring file), `_FILE_TOKENS_CACHE` (512), `_TREEMAP_CACHE` (64; each entry is a whole subtree), `_FILE_SUBSYSTEMS_CACHE` (4096; keyed by file path), `_USAGE_CACHE` (256; keyed by Kconfig symbol), `_LISTING_CACHE` (64; keyed by revision) and `_PATHS_CACHE` (4, separate because one entry is a revision's whole file list: 36,783 paths / ~4.5 MiB at v3.0, more in later releases). Caches keyed only by what the repository itself defines stay unbounded, and the callers that evict by their own policy (`_MODELS`, `_BUILD_RESOLVERS`) reach through `dict.pop` and are unaffected. Because a bounded cache can evict between a membership test and a read, its callers read once into a local (`.get()`) rather than testing and then indexing.
 5. **Unparsed repositories** remain browsable: tags absent from `m_git_ref` resolve through `git rev-parse` to `vid = 0`, and trees, files, searches, diffs and treemaps read Git directly.
 
 ### 2.11. Client Synchronization & Build-Bound Assets (`webapp/backend/services/sync_service.py`, `webapp/frontend/js/sync.js`)
@@ -384,6 +438,7 @@ Resolve a preprocessor `#include <...>` or `#include "..."` directive to an auth
   - `ast_id` (query): Optional AST Node ID of the include directive to check direct `m_ast_include` links.
   - `current_file` (query): Optional referring source file path (e.g. `"arch/x86/kernel/setup.c"`) to prioritize architecture-specific or relative header matches.
   - `arch` (query, optional): ARCH whose build layout resolves the include (`definition_arch`: unknown values fall back to `x86_64`).
+- **Jailing**: `header` and `current_file` become candidate repository paths, one of which is probed on disk in step 5, so both are rejected with `HTTP 400 Bad Request` unless `is_safe_rel_path()` accepts them, and each candidate is re-checked against the repository root after `resolve()` (a traversing header such as `../../../../etc/passwd` would otherwise be reported as `resolved`, revealing whether an arbitrary host path exists).
 - **Resolution Strategy**:
   0. The compiler's search for the ARCH's build layout (`arch_layout_service.resolve_include`, §2.7 item 4): `"name"` in `current_file`'s directory first, then the `-I` directories, through build-time symlinks and generated wrappers (`<asm/atomic.h>` → `include/asm-x86_64/atomic.h` at v2.6.12 for x86_64, `arch/x86/include/asm/atomic.h` at v3.0); method `build_layout`, with `arch`. Steps 1-5 only run when it finds nothing (e.g. generated headers, `tools/`).
   1. If `current_file` is supplied, queries compiler-verified provenance from `m_file_reference` (`ref_type=1`).
@@ -599,7 +654,7 @@ Retrieve both definition location(s) and categorized usage references (call site
 - **Parameters**:
   - `version_name` (path): Kernel version string.
   - `symbol_name` (path): Symbol identifier.
-  - `limit` (query, optional int): Maximum number of reference records to return (useful for symbols with thousands of references like `kmalloc`).
+  - `limit` (query, optional int, 1-5000): Maximum number of reference records to return (useful for symbols with thousands of references like `kmalloc`). Always capped at `MAX_XREF_REFS` (5000), including when no limit is given.
   - `arch` (query, default `x86_64`): orders `definitions` for that ARCH (§2.7); `definition` is the first.
 - **References**: only references in blobs of the revision's tree are returned, ordered by file and line. `file` is the path of the referencing blob in that tree (best-ranked for `arch` when the blob sits at several paths; not `target_fnid`, which is the target's file), `caller` is the name of the AST of the tag the reference sits in (e.g. the enclosing function), `fid` the referencing blob, and `limit` applies after scoping.
 - **Response**:
@@ -653,7 +708,7 @@ Recursively inspect relational AST node container hierarchies.
 - **Parameters**:
   - `version_name` (path) / `version` (query): Kernel version string.
   - `ast_id` (path): Root AST Node ID to expand.
-  - `depth` (query): Traversal depth limit (default 3).
+  - `depth` (query): Traversal depth limit (0-12, default 3). AST nodes are content-addressed, so one subtree is referenced by many parents: subtrees are built once per (node, remaining depth) and reused, but each child still serializes twice (under `containers` and under `children`), so the body doubles at every level. `MAX_AST_TREE_NODES` (20,000 serialized positions, counted with that doubling) bounds it regardless of shape, and a node whose children were cut carries `truncated: true`.
 - **Response**:
 ```json
 {
@@ -764,12 +819,12 @@ kernel-doc comments of a source file, filtered like the `.. kernel-doc::` direct
 
 ### 4.4. Kconfig & Architecture Defconfigs API
 
-All Kconfig endpoints read the Git objects of the requested revision (never the work tree), accept an optional **toolchain profile** (`toolchain` query parameter holding JSON on GET endpoints, `toolchain` body field on POST endpoints; see `GET /toolchain` below) and are scoped by an **ARCH value** (`arch` parameter, default `x86_64`): the value `make ARCH=<arch>` would receive. The top Makefile maps some values onto another source directory (`i386`/`x86_64` -> `x86`, `sparc32`/`sparc64` -> `sparc`, `sh64` -> `sh`, ...); `x86`, `sparc` and `sh` themselves are the generic forms whose bitness is chosen in menuconfig. The model is built by `parser/kconfig_ast/kconfig_model.py` and evaluated by `parser/kconfig_ast/kconfig_eval.py` (server) and `kconfig_engine.js` (browser); both reproduce the kernel's `conf` output byte for byte (see `parser/kconfig_ast/KCONFIG_API.md` section 8). Models are cached per (repository, revision, ARCH, toolchain) in a 6-entry LRU.
+All Kconfig endpoints read the Git objects of the requested revision (never the work tree), accept an optional **toolchain profile** (`toolchain` query parameter holding JSON on GET endpoints, `toolchain` body field on POST endpoints; see `GET /toolchain` below) and are scoped by an **ARCH value** (`arch` parameter, default `x86_64`): the value `make ARCH=<arch>` would receive. The top Makefile maps some values onto another source directory (`i386`/`x86_64` -> `x86`, `sparc32`/`sparc64` -> `sparc`, `sh64` -> `sh`, ...); `x86`, `sparc` and `sh` themselves are the generic forms whose bitness is chosen in menuconfig. The model is built by `parser/kconfig_ast/kconfig_model.py` and evaluated by `parser/kconfig_ast/kconfig_eval.py` (server) and `kconfig_engine.js` (browser); both reproduce the kernel's `conf` output byte for byte (see `parser/kconfig_ast/KCONFIG_API.md` section 8). Models are cached per (repository, revision, ARCH, toolchain) in a 6-entry LRU. A build costs about a second of CPU and tens of MB, and the toolchain profile is part of the key, so builds are bounded: each key has its own lock (concurrent requests for one model wait for that single build instead of duplicating it, and never block requests for other models), at most two models are built at once across all keys, and the cache lock is never held while a model is built.
 
 #### `GET /api/kconfig/{version_name}/toolchain`
 #### `GET /api/version/{version_name}/kconfig/toolchain`
 Default toolchain profiles of a revision. Linux 4.18+ Kconfig runs `$(shell,...)` checks against the compiler, linker and assembler while it is parsed; the server answers them from a profile (`parser/kconfig_ast/kconfig_toolchain.py`). Response: `{ "version", "arch", "kernelversion", "macros": true, "gcc": {profile}, "clang": {profile} }` where a profile is `{ "cc", "cc_version", "ld", "ld_version", "assembler", "binutils_version", "cross_compile", "llvm_utils", "pahole_version", "rustc_version", "gcc_plugins", "host_release", "env", "probes" }`. `macros: false` means the revision predates the macro language: only environment variables (`option env=`) matter.
-- **Toolchain parameter**: any subset of the profile, e.g. `{"cc": "clang", "cc_version": "18.1.3", "env": {"CC_VERSION_TEXT": "Ubuntu clang version 18.1.3"}, "probes": {"cc-option:-fsanitize=kcfi": "n"}}`. Missing fields take the defaults of that kernel release. `env` overrides any environment variable Kconfig reads; `probes` forces a check (`"y"`/`"n"`) or a command output (text), keyed as reported in the model's `toolchain.probes`.
+- **Toolchain parameter**: validated before use — unknown keys are ignored, each value is coerced to its field's type, `env`/`probes` must be objects of at most 128 string entries (each value at most 512 characters), and a wrong shape (`{"env": "text"}`) answers `HTTP 400 Bad Request` rather than failing inside the model build. It is any subset of the profile, e.g. `{"cc": "clang", "cc_version": "18.1.3", "env": {"CC_VERSION_TEXT": "Ubuntu clang version 18.1.3"}, "probes": {"cc-option:-fsanitize=kcfi": "n"}}`. Missing fields take the defaults of that kernel release. `env` overrides any environment variable Kconfig reads; `probes` forces a check (`"y"`/`"n"`) or a command output (text), keyed as reported in the model's `toolchain.probes`.
 
 #### `GET /api/kconfig/{version_name}/tree`
 #### `GET /api/kconfig/tree`
@@ -812,8 +867,8 @@ Arch-scoped details of a symbol (with or without `CONFIG_`). The same name can b
 #### `GET /api/kconfig/{version_name}/symbol/{symbol_name}/usage`
 #### `GET /api/version/{version_name}/kconfig/symbol/{symbol_name}/usage`
 Where `CONFIG_<symbol>` is used (Git grep of the revision, cached).
-- **Parameters**: `arch` (default `x86_64`), `limit` (1-2000, default 400).
-- **Response**: `kbuild` (`[{makefile, line, rule, target_obj, path, exists, kind: object|composite|directory, via: rule|condition, compile_mode, other_arch}]`: objects and directories built when the option is enabled, including rules inside `ifeq ($(CONFIG_X),y)` blocks), `source_refs` (`[{file_path, line, text, other_arch}]` in `.c .h .S .lds .dts .dtsi`, `CONFIG_X` and `CONFIG_X_MODULE`), `source_ref_count`, `source_file_count`, `kconfig_refs` (`[{kind: depends_on|select|imply|default|prompt_condition|select_condition|imply_condition, by, file, line}]`). `other_arch` marks paths in an architecture tree (`arch/<a>/`, or `include/asm-<a>/` in 2.6.x) the ARCH's build layout does not use (§2.7).
+- **Parameters**: `arch` (default `x86_64`), `limit` (1-2000, default 400). `symbol_name` must be an identifier (§2.1.2) or the request is rejected with 400.
+- **Response**: `kbuild` (`[{makefile, line, rule, target_obj, path, exists, kind: object|composite|directory, via: rule|condition, compile_mode, other_arch}]`: objects and directories built when the option is enabled, including rules inside `ifeq ($(CONFIG_X),y)` blocks), `source_refs` (`[{file_path, line, text, other_arch}]` in `.c .h .S .lds .dts .dtsi`, `CONFIG_X` and `CONFIG_X_MODULE`), `source_ref_count`, `source_refs_truncated` (the symbol has more than 20,000 references, so the list was cut before being cached), `source_file_count`, `kconfig_refs` (`[{kind: depends_on|select|imply|default|prompt_condition|select_condition|imply_condition, by, file, line}]`). `other_arch` marks paths in an architecture tree (`arch/<a>/`, or `include/asm-<a>/` in 2.6.x) the ARCH's build layout does not use (§2.7).
 
 #### `GET /api/kconfig/{version_name}/build`
 Kbuild build condition of source files: under which configuration `make ARCH=<arch>` compiles each one (`KconfigService.build_conditions`, `parser/kbuild_conditions.py`, see `parser/kconfig_ast/KCONFIG_API.md` §6.4). The condition is an expression over `CONFIG_*` symbols that the client evaluates against its own configuration (`build_condition.js`), so one response serves every configuration of the ARCH. Resolvers are cached per (revision, ARCH) (4 entries); the first request of a revision reads its Makefiles and greps it once for `#include "*.c"` sources (~1 s).
@@ -1003,6 +1058,7 @@ Retrieve developer profile, CREDITS biographical data, maintained subsystems, an
 #### `POST /api/version/{version_name}/patch/maintainers`
 #### `POST /api/patch/maintainers`
 Emulate `scripts/get_maintainer.pl` by evaluating touched paths or raw patch content against subsystem pattern rules.
+Every file is matched against every MAINTAINERS pattern, so at most `MAX_PATCH_FILES` (200) files of one patch are resolved; the rest are counted in `skipped_files_count` and not matched (2,000 files took ~14 s before this cap, and the cost was paid even when nothing matched).
 - **Parameters**:
   - `version_name` (path): Kernel version string.
   - **Body** (`application/json`):
@@ -1097,9 +1153,9 @@ Search and list all kernel developers, maintainers, reviewers, and contributors 
 Retrieve paginated commit history and contributor summaries.
 - **Parameters**:
   - `version_name` (path) / `version` (query): Kernel version string.
-  - `page` (query): Page number (default 1).
-  - `limit` (query): Commits per page (default 50).
-  - `q` (query): Filter by commit subject, hash prefix (matched case-insensitively against `HEX(commit_hash)`), or author name.
+  - `page` (query): Page number (1 or more, default 1).
+  - `limit` (query): Commits per page (1-500, default 50). Bound again in the service, which also clamps the derived `OFFSET` (`MAX_COMMIT_PAGE`, `MAX_COMMIT_OFFSET`), since both are bound straight into SQL and the method is also an exported delegate.
+  - `q` (query): Filter by commit subject, hash prefix (matched case-insensitively against `HEX(commit_hash)`), or author name. Wildcards are escaped (§2.2), so `%` and `_` match literally.
 - **Response**:
 ```json
 {
@@ -1126,7 +1182,7 @@ Retrieve paginated commit history and contributor summaries.
 Retrieve detailed metadata for a commit, including multi-contributor trailers and modified files.
 - **Parameters**:
   - `version_name` (path) / `version` (query): Kernel version string.
-  - `commit_id_or_hash` (path) / `commit_id` (query): Commit integer ID or 40-character SHA-1 hash.
+  - `commit_id_or_hash` (path) / `commit_id` (query): Commit integer ID, 40-character SHA-1 hash, or a short hex prefix (4-40 digits, matched case-insensitively against `HEX(commit_hash)`). Anything else answers `HTTP 400 Bad Request`.
 - **Response**:
 ```json
 {

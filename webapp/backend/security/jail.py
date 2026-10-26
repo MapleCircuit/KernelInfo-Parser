@@ -25,11 +25,14 @@ def is_safe_rel_path(path_str: str) -> bool:
 
 def resolve_and_verify_repo_path(requested_path: str, repo_base: Path | None = None) -> Path:
     """Canonicalize and verify that requested_path resides strictly within repo_base.
-    
+
+    Existence is deliberately not checked: callers resolve paths for a past revision, where the
+    file may be absent from the current work tree (`git blame <rev> -- <path>` still works). A
+    caller that needs the file on disk checks for itself.
+
     Raises:
         HTTPException(400): If path is empty, malformed, contains null bytes, or uses '..'.
         HTTPException(403): If the resolved path escapes outside repo_base.
-        HTTPException(404): If requested file/directory does not exist.
     """
     if not requested_path or not isinstance(requested_path, str):
         raise HTTPException(status_code=400, detail="Path parameter cannot be empty.")

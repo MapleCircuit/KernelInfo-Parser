@@ -13,12 +13,15 @@ from webapp.backend.database.helpers import (
     get_version_info,
 )
 from webapp.backend.security.jail import resolve_and_verify_repo_path, is_safe_rel_path
+from webapp.backend.security.sql import escape_like
 from webapp.backend.services.git_reader import git_reader
 from webapp.backend.services.tree_resolver import tree_resolver, git_tree_resolver
 from core.globalstuff import format_ref_type_label, FileRefType
-_INCLUDE_CACHE: dict[tuple[str, str, str | None], dict[str, Any]] = RepoScopedCache()
-_FILE_TOKENS_CACHE: dict[tuple[str, str], list[list[int]]] = RepoScopedCache()
-_TREEMAP_CACHE: dict[tuple[str, int, str], dict[str, Any]] = RepoScopedCache()
+# Bounded: every key below carries a request parameter (a header, a path), so an unbounded cache
+# would grow with each distinct value a caller sends. Treemaps are whole subtrees, so fewer are kept.
+_INCLUDE_CACHE: dict[tuple[str, str, str | None], dict[str, Any]] = RepoScopedCache(maxsize=4096)
+_FILE_TOKENS_CACHE: dict[tuple[str, str], list[list[int]]] = RepoScopedCache(maxsize=512)
+_TREEMAP_CACHE: dict[tuple[str, int, str], dict[str, Any]] = RepoScopedCache(maxsize=64)
 # Only image types are served raw (documentation figures); everything else goes through get_file()
 RAW_MEDIA_TYPES = {"svg": "image/svg+xml", "png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg", "gif": "image/gif"}
 
@@ -35,7 +38,8 @@ class FilesystemService:
                 raise HTTPException(status_code=404, detail=f"Version '{version_name}' not found.")
 
             prefix = f"{norm_path}/" if norm_path else ""
-            like_pattern = f"{prefix}%" if prefix else "%"
+            # Wildcards in the requested path are escaped: only the trailing % is a wildcard
+            like_pattern = f"{escape_like(prefix)}%" if prefix else "%"
 
             # Path C: the Git tree is authoritative for every revision (tags, branches, arbitrary commits)
             git_tree = git_tree_resolver.list_tree(vname)
@@ -352,9 +356,9 @@ class FilesystemService:
 
             # 3. Compact AST token maps: [line_s, char_s, line_e, char_e, ast_id, type_id]
             token_cache_key = (vname, norm_path)
-            if token_cache_key in _FILE_TOKENS_CACHE:
-                compact_tokens = _FILE_TOKENS_CACHE[token_cache_key]
-            else:
+            # .get() into a local: the cache evicts, so contains-then-get could race a miss
+            compact_tokens = _FILE_TOKENS_CACHE.get(token_cache_key)
+            if compact_tokens is None:
                 cursor.execute(
                     """
                     SELECT bt.line_s, bt.char_s, bt.line_e, bt.char_e,
@@ -672,8 +676,9 @@ class FilesystemService:
             if vid is None:
                 raise HTTPException(status_code=404, detail=f"Version '{version_name}' not found.")
         treemap_key = (vname, max_depth, norm_path)
-        if treemap_key in _TREEMAP_CACHE:
-            return _TREEMAP_CACHE[treemap_key]
+        cached_map = _TREEMAP_CACHE.get(treemap_key)
+        if cached_map is not None:
+            return cached_map
 
         sizes = git_tree_resolver.list_tree_sizes(vname)
         if sizes is None:
@@ -811,10 +816,18 @@ class FilesystemService:
 
         if not clean_header:
             raise HTTPException(status_code=400, detail="Empty header specified.")
+        # The header becomes a candidate repository path, probed on disk further down. Without this
+        # check a traversing header ("../../../../etc/passwd") would be reported as resolved, which
+        # tells the caller whether an arbitrary host path exists.
+        if not is_safe_rel_path(clean_header):
+            raise HTTPException(status_code=400, detail="Path traversal attempt detected.")
+        if current_file and not is_safe_rel_path(current_file):
+            raise HTTPException(status_code=400, detail="Path traversal attempt detected.")
 
         cache_key = (version_name, clean_header, current_file, arch, quoted)
-        if cache_key in _INCLUDE_CACHE:
-            return _INCLUDE_CACHE[cache_key]
+        cached = _INCLUDE_CACHE.get(cache_key)
+        if cached is not None:
+            return cached
 
         with get_db_cursor() as cursor:
             vid, vname = get_version_info(cursor, version_name)
@@ -953,9 +966,13 @@ class FilesystemService:
                 _INCLUDE_CACHE[cache_key] = res
                 return res
 
-            # Check physical file if unindexed (must be file, never directory)
+            # Check physical file if unindexed (must be file, never directory, never outside the jail:
+            # candidates are built from the header, and a symlink in the tree can still point out)
+            repo_root = get_repo_dir().resolve()
             for cand in candidates:
-                cand_path = get_repo_dir() / cand
+                cand_path = (repo_root / cand).resolve()
+                if not cand_path.is_relative_to(repo_root):
+                    continue
                 if cand_path.is_file():
                     res = {
                         "header": clean_header,

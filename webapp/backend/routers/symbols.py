@@ -59,7 +59,7 @@ def get_symbol_detail(
 def get_symbol_xref(
     version_name: str,
     symbol_name: str,
-    limit: int | None = Query(None),
+    limit: int | None = Query(None, ge=1, le=5000),
     arch: ArchParam = DEFAULT_DEFINITION_ARCH,
 ) -> dict[str, Any]:
     """Get itemized categorized references (calls, member_refs, type_usages) for a symbol."""
@@ -71,7 +71,7 @@ def get_symbol_xref(
 def get_ast_tree(
     ast_id: int,
     version: str = Query("v3.0", alias="version_name"),
-    depth: int = Query(3),
+    depth: int = Query(3, ge=0, le=12),
     version_name: str | None = None,
 ) -> dict[str, Any]:
     """Recursive AST container inspection."""

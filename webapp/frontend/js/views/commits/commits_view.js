@@ -135,7 +135,7 @@ export class CommitsView {
       this.renderCommitList();
     } catch (e) {
       if (reset) {
-        listContainer.innerHTML = `<div style="color:var(--accent-red);padding:16px;">Failed: ${e.message}</div>`;
+        listContainer.innerHTML = `<div style="color:var(--accent-red);padding:16px;">Failed: ${escapeHtml(e.message)}</div>`;
       }
     }
   }
@@ -567,7 +567,7 @@ export class CommitsView {
         });
       });
     } catch (e) {
-      detailEl.innerHTML = `<div style="color:var(--accent-red);padding:16px;">Failed: ${e.message}</div>`;
+      detailEl.innerHTML = `<div style="color:var(--accent-red);padding:16px;">Failed: ${escapeHtml(e.message)}</div>`;
     }
   }
 }

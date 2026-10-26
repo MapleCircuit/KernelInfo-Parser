@@ -28,7 +28,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from core.globalstuff import SymbolLinkage
+from core.globalstuff import SymbolLinkage, is_safe_git_rev
 from parser.arch_layout import ArchLayout, path_arch
 from parser.kbuild_conditions import own_arch_dirs
 from webapp.backend.config import get_repo_dir
@@ -341,7 +341,8 @@ class GitTreeResolver:
 
     def resolve_commit_sha(self, rev: str) -> str | None:
         """Resolve any revision (tag, branch, short/full SHA) to its full 40-char commit SHA."""
-        if not rev or rev.startswith("-"):
+        # Only a plain ref name or SHA may reach the command line: git reads "-..." as an option
+        if not is_safe_git_rev(rev):
             return None
         out = self._run_git(["rev-parse", "--verify", "--quiet", f"{rev}^{{commit}}"], timeout=5.0)
         sha = out.decode("ascii", errors="replace").strip() if out else ""

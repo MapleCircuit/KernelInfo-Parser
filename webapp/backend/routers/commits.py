@@ -13,8 +13,8 @@ git_service = GitService()
 @router.get("/commits/{version_name}/list")
 def get_commits(
     version: str = Query("v3.0"),
-    page: int = Query(1),
-    limit: int = Query(50),
+    page: int = Query(1, ge=1),
+    limit: int = Query(50, ge=1, le=500),
     q: str = Query(""),
     version_name: str | None = None,
 ) -> dict[str, Any]:
@@ -91,7 +91,7 @@ def get_commit_timeline(
 def search_commits(
     q: str = Query(...),
     version_name: str = "v3.0",
-    limit: int = Query(25),
+    limit: int = Query(25, ge=1, le=500),
 ) -> dict[str, Any]:
     """Fast commit search by hash or message for commit-level exploration."""
     return git_service.get_commits(version_name, page=1, limit=limit, query=q)

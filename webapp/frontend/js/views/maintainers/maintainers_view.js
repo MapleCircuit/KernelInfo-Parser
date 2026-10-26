@@ -5,6 +5,7 @@ import { api } from "../../api.js";
 import { state } from "../../state.js";
 import { toast } from "../../components/toast.js";
 import { debounce } from "../../utils/debounce.js";
+import { escapeHtml } from "../../components/modal.js";
 
 export class MaintainersView {
   constructor() {
@@ -136,7 +137,7 @@ export class MaintainersView {
         this.subsystems = res.sections || [];
         this.renderSubsystemsList();
       } catch (e) {
-        listContainer.innerHTML = `<div style="padding:16px;color:var(--accent-red);">Failed: ${e.message}</div>`;
+        listContainer.innerHTML = `<div style="padding:16px;color:var(--accent-red);">Failed: ${escapeHtml(e.message)}</div>`;
       }
     } else if (this.activeTab === "developers") {
       try {
@@ -148,14 +149,14 @@ export class MaintainersView {
         this.developers = res.developers || [];
         this.renderDevelopersList(this.developers);
       } catch (e) {
-        listContainer.innerHTML = `<div style="padding:16px;color:var(--accent-red);">Failed: ${e.message}</div>`;
+        listContainer.innerHTML = `<div style="padding:16px;color:var(--accent-red);">Failed: ${escapeHtml(e.message)}</div>`;
       }
     } else if (this.activeTab === "credits") {
       try {
         const res = await api.getCredits(this.currentVersion, query);
         this.renderCreditsList(res.credits || res.entries || []);
       } catch (e) {
-        listContainer.innerHTML = `<div style="padding:16px;color:var(--accent-red);">Failed: ${e.message}</div>`;
+        listContainer.innerHTML = `<div style="padding:16px;color:var(--accent-red);">Failed: ${escapeHtml(e.message)}</div>`;
       }
     } else if (this.activeTab === "patch") {
       this.renderPatchReviewer();
@@ -389,7 +390,7 @@ export class MaintainersView {
       });
 
     } catch (e) {
-      detailEl.innerHTML = `<div style="color:var(--accent-red);padding:16px;">Failed: ${e.message}</div>`;
+      detailEl.innerHTML = `<div style="color:var(--accent-red);padding:16px;">Failed: ${escapeHtml(e.message)}</div>`;
     }
   }
 
@@ -516,7 +517,7 @@ export class MaintainersView {
         };
       }
     } catch (e) {
-      detailEl.innerHTML = `<div style="color:var(--accent-red);padding:16px;">Failed to load person profile: ${e.message}</div>`;
+      detailEl.innerHTML = `<div style="color:var(--accent-red);padding:16px;">Failed to load person profile: ${escapeHtml(e.message)}</div>`;
     }
   }
 
@@ -560,7 +561,7 @@ export class MaintainersView {
           </div>
         `;
       } catch (e) {
-        resContainer.innerHTML = `<div style="color:var(--accent-red);">Failed: ${e.message}</div>`;
+        resContainer.innerHTML = `<div style="color:var(--accent-red);">Failed: ${escapeHtml(e.message)}</div>`;
       }
     };
   }

@@ -65,16 +65,39 @@ class RepoScopedCache(dict):
 
     Module-level caches keyed by version names would otherwise collide between repositories that
     share tag names (e.g. two projects both tagging "v1.0").
+
+    `maxsize` bounds the cache, evicting the least recently used entry. A cache whose key holds a
+    request parameter (a header name, a path, a symbol) needs one: without it every distinct value a
+    caller sends adds an entry that is never released. Caches keyed only by data the repository
+    itself defines (version names) are left unbounded, and callers that evict by their own policy
+    (`_MODELS`, `_BUILD_RESOLVERS`) reach through `dict.pop` and are unaffected.
     """
+
+    def __init__(self, maxsize: int | None = None) -> None:
+        super().__init__()
+        self.maxsize = maxsize
 
     def _k(self, key: Any) -> tuple[str, Any]:
         return (get_active_repo_name(), key)
 
+    def _touch(self, scoped_key: Any) -> None:
+        """Re-insert an entry so it becomes the most recently used (dicts keep insertion order)."""
+        if self.maxsize is not None:
+            super().__setitem__(scoped_key, super().pop(scoped_key))
+
+    def _evict(self) -> None:
+        while self.maxsize is not None and len(self) > self.maxsize:
+            super().pop(next(iter(self)), None)
+
     def __getitem__(self, key: Any) -> Any:
-        return super().__getitem__(self._k(key))
+        scoped = self._k(key)
+        value = super().__getitem__(scoped)
+        self._touch(scoped)
+        return value
 
     def __setitem__(self, key: Any, value: Any) -> None:
         super().__setitem__(self._k(key), value)
+        self._evict()
 
     def __contains__(self, key: object) -> bool:
         return super().__contains__(self._k(key))
@@ -83,13 +106,20 @@ class RepoScopedCache(dict):
         super().__delitem__(self._k(key))
 
     def get(self, key: Any, default: Any = None) -> Any:
-        return super().get(self._k(key), default)
+        scoped = self._k(key)
+        if not super().__contains__(scoped):
+            return default
+        value = super().__getitem__(scoped)
+        self._touch(scoped)
+        return value
 
     def pop(self, key: Any, *default: Any) -> Any:
         return super().pop(self._k(key), *default)
 
     def setdefault(self, key: Any, default: Any = None) -> Any:
-        return super().setdefault(self._k(key), default)
+        value = super().setdefault(self._k(key), default)
+        self._evict()
+        return value
 
 
 def get_backend_db_config() -> dict[str, Any]:

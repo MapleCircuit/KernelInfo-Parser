@@ -13,6 +13,7 @@ import { commandPalette } from "./components/command_palette.js";
 import { showPatchModal } from "./components/patch_modal.js";
 import { showSymbolHistoryModal } from "./components/symbol_history_modal.js";
 import { localDB } from "./db.js";
+import { escapeHtml } from "./components/modal.js";
 
 // View Renderers
 import { VirtualEditor } from "./views/code_view/virtual_editor.js";
@@ -770,7 +771,7 @@ export class KernelIdeApp {
         this.renderFileTreeNode(treeContainer, item, 0);
       });
     } catch (e) {
-      treeContainer.innerHTML = `<div style="padding:12px;color:var(--accent-red);">Failed: ${e.message}</div>`;
+      treeContainer.innerHTML = `<div style="padding:12px;color:var(--accent-red);">Failed: ${escapeHtml(e.message)}</div>`;
     }
   }
 

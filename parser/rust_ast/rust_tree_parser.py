@@ -177,6 +177,54 @@ def extract_path_string(path_node: Any) -> str:
     return ""
 
 
+def unquote_string(token: str) -> str:
+    """Decode a quoted STRING token from rustc's AST dump into its text.
+
+    The escapes rustc emits (`\\n`, `\\t`, `\\"`, `\\\\`, `\\x41`, `\\u{1F600}`) are decoded here
+    instead of by evaluating the token as a Python literal: the token comes from a subprocess, so it
+    is data, and `unicode_escape` would also mangle non-ASCII bytes.
+    """
+    body = token[1:-1] if len(token) >= 2 and token.startswith('"') else token
+    out: list[str] = []
+    i = 0
+    while i < len(body):
+        ch = body[i]
+        if ch != "\\":
+            out.append(ch)
+            i += 1
+            continue
+        i += 1
+        if i >= len(body):
+            out.append("\\")
+            break
+        esc = body[i]
+        i += 1
+        if esc in _RUST_SIMPLE_ESCAPES:
+            out.append(_RUST_SIMPLE_ESCAPES[esc])
+        elif esc == "x" and i + 2 <= len(body):
+            out.append(_chr_or_raw(body[i:i + 2], f"\\x{body[i:i + 2]}"))
+            i += 2
+        elif esc == "u" and body[i:i + 1] == "{" and "}" in body[i:]:
+            end = body.index("}", i)
+            out.append(_chr_or_raw(body[i + 1:end], f"\\u{{{body[i + 1:end]}}}"))
+            i = end + 1
+        else:
+            # Unknown escape: keep it verbatim rather than dropping characters
+            out.append("\\" + esc)
+    return "".join(out)
+
+
+_RUST_SIMPLE_ESCAPES = {"n": "\n", "t": "\t", "r": "\r", "0": "\0", '"': '"', "'": "'", "\\": "\\"}
+
+
+def _chr_or_raw(hex_digits: str, fallback: str) -> str:
+    """Character for a hex escape's digits, or the escape verbatim when they are not valid."""
+    try:
+        return chr(int(hex_digits, 16))
+    except (ValueError, OverflowError):
+        return fallback
+
+
 class RustAstTreeTokenizer:
     """Fast regular-expression based tokenizer for rustc AST debug output."""
 
@@ -226,10 +274,7 @@ class RustAstTreeParser:
 
         if kind == "STRING":
             self.tok.next()
-            try:
-                return eval(val)
-            except Exception:
-                return val[1:-1]
+            return unquote_string(val)
         elif kind == "SPAN":
             self.tok.next()
             return {"_type": "Span", "span": val}

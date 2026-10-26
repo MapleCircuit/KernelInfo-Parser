@@ -143,10 +143,10 @@ export class VirtualEditor {
           + (more ? `, or one of ${more} other rule${more === 1 ? "" : "s"}` : "");
       }
       banner.className = "code-build-banner not-built";
-      banner.innerHTML = `<span class="code-build-icon">⛔</span><span><strong>Not compiled</strong> for ARCH=${arch} with the current KConfig configuration. ${why}</span>${ruleHtml}`;
+      banner.innerHTML = `<span class="code-build-icon">⛔</span><span><strong>Not compiled</strong> for ARCH=${escapeHtml(arch)} with the current KConfig configuration. ${why}</span>${ruleHtml}`;
     } else if (result === "m") {
       banner.className = "code-build-banner module";
-      banner.innerHTML = `<span class="code-build-icon">📦</span><span>Built as a <strong>module</strong> for ARCH=${arch} with the current KConfig configuration.</span>${ruleHtml}`;
+      banner.innerHTML = `<span class="code-build-icon">📦</span><span>Built as a <strong>module</strong> for ARCH=${escapeHtml(arch)} with the current KConfig configuration.</span>${ruleHtml}`;
     } else {
       banner.hidden = true;
       return;
@@ -431,7 +431,7 @@ export class VirtualEditor {
     if (lastChangedEl) {
       lastChangedEl.style.display = "none";
     }
-    this.linesContainer.innerHTML = `<div style="padding:20px;color:var(--text-muted);">Loading ${this.currentFilePath}...</div>`;
+    this.linesContainer.innerHTML = `<div style="padding:20px;color:var(--text-muted);">Loading ${escapeHtml(this.currentFilePath)}...</div>`;
     try {
       const res = await api.getFileContent(this.currentVersion, this.currentFilePath);
       if (!res) {
@@ -500,7 +500,7 @@ export class VirtualEditor {
           const dateStr = lc.author_date_iso ? lc.author_date_iso.split(" ")[0] : "";
           const authorStr = lc.author_name || "";
           lastChangedEl.style.display = "inline-flex";
-          lastChangedEl.innerHTML = `🕒 Last Changed: <strong style="color:var(--text-primary);margin-left:3px;">${dateStr}</strong><span style="opacity:0.75;margin-left:4px;">by ${authorStr}</span>`;
+          lastChangedEl.innerHTML = `🕒 Last Changed: <strong style="color:var(--text-primary);margin-left:3px;">${escapeHtml(dateStr)}</strong><span style="opacity:0.75;margin-left:4px;">by ${escapeHtml(authorStr)}</span>`;
           lastChangedEl.title = `Last changed: ${lc.author_date_iso} by ${authorStr}\nCommit: ${lc.commit_hash_short}\nSubject: ${lc.subject}\nClick to view full history`;
         }
       }

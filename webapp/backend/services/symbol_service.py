@@ -23,6 +23,14 @@ from webapp.backend.services.tree_resolver import (
 # Name-ordered candidates scanned before scoping to the revision's tree (symbols of every indexed
 # version share m_symbol_def, so a prefix can match many blobs that are not in the requested tree)
 SEARCH_CANDIDATES = 30000
+# Deepest m_ast_container expansion one request may ask for (see get_ast_tree)
+MAX_AST_TREE_DEPTH = 12
+# Tree positions one answer may carry. Shared subtrees are built once but still serialize at every
+# position they occupy, so the response grows multiplicatively with depth even when few nodes are
+# distinct: the depth cap alone does not bound the body, this does.
+MAX_AST_TREE_NODES = 20000
+# Most references one xref answer returns when the caller names no limit
+MAX_XREF_REFS = 5000
 
 
 def format_symbol_type(type_name: str) -> str:
@@ -409,8 +417,9 @@ class SymbolService:
                     if r["fid"] in blob_paths
                 ]
                 ref_rows.sort(key=lambda r: (r["fname"], r["line"] or 0, r["char_s"] or 0))
-                if limit and limit > 0:
-                    ref_rows = ref_rows[:limit]
+                # Always capped: without a limit, a symbol like kmalloc returns tens of thousands
+                cap = min(limit, MAX_XREF_REFS) if limit and limit > 0 else MAX_XREF_REFS
+                ref_rows = ref_rows[:cap]
 
             role_map = {
                 1: ("declarations", "Decl"),
@@ -468,8 +477,15 @@ class SymbolService:
 
     def get_ast_tree(self, ast_id: int, depth: int = 3, version_name: str = "v3.0") -> dict[str, Any]:
         """Recursive m_ast_container hierarchy inspection with tag_id annotations and batched queries."""
+        # AST nodes are content-addressed, so one subtree is referenced by many parents. Without a
+        # bound and without memoizing subtrees, a deep request re-expands every shared subtree once
+        # per path through it: queries and response size grow exponentially in the depth.
+        depth = max(0, min(int(depth), MAX_AST_TREE_DEPTH))
         with get_db_cursor() as cursor:
             node_cache: dict[int, dict[str, Any]] = {}
+            # (ast_id, remaining depth) -> (subtree, positions it serializes to)
+            subtree_cache: dict[tuple[int, int], tuple[dict[str, Any], int]] = {}
+            budget = [MAX_AST_TREE_NODES]
 
             def fetch_batch_nodes(ast_ids: list[int]) -> None:
                 missing = [aid for aid in ast_ids if aid not in node_cache]
@@ -492,7 +508,11 @@ class SymbolService:
                     for r in cursor.fetchall():
                         node_cache[r["ast_id"]] = r
 
-            def build_tree(curr_ast_id: int, curr_depth: int) -> dict[str, Any]:
+            def build_tree(curr_ast_id: int, curr_depth: int) -> tuple[dict[str, Any], int]:
+                """The subtree under curr_ast_id, and the number of positions it serializes to."""
+                memo = subtree_cache.get((curr_ast_id, curr_depth))
+                if memo is not None:
+                    return memo
                 node = node_cache.get(curr_ast_id)
                 if not node:
                     cursor.execute(
@@ -511,10 +531,11 @@ class SymbolService:
                         node_cache[curr_ast_id] = node
 
                 if not node:
-                    return {"ast_id": curr_ast_id, "tag_id": None, "name": "unknown", "type_id": 0, "containers": [], "children": []}
+                    return ({"ast_id": curr_ast_id, "tag_id": None, "name": "unknown", "type_id": 0,
+                             "containers": [], "children": []}, 1)
 
                 tid = node["tag_id"]
-                node_dict = {
+                node_dict: dict[str, Any] = {
                     "ast_id": curr_ast_id,
                     "tag_id": int(tid) if tid is not None else None,
                     "name": safe_decode(node["name"]),
@@ -524,7 +545,8 @@ class SymbolService:
                     "children": [],
                 }
                 if curr_depth <= 0:
-                    return node_dict
+                    subtree_cache[(curr_ast_id, curr_depth)] = (node_dict, 1)
+                    return (node_dict, 1)
 
                 cursor.execute(
                     """
@@ -539,20 +561,31 @@ class SymbolService:
                 if children:
                     fetch_batch_nodes([ch["ref_ast_id"] for ch in children])
 
+                # Each child is serialized twice (once under "containers", once under "children"),
+                # so a subtree's real cost doubles at every level: the budget counts it that way.
+                size = 1
                 for ch in children:
+                    if budget[0] <= 0:
+                        node_dict["truncated"] = True
+                        break
                     child_ast_id = ch["ref_ast_id"]
-                    child_tree = build_tree(child_ast_id, curr_depth - 1)
-                    # Suppress tag_id on untagged sub-expressions if inner statement/expression
-                    if child_tree["type_id"] > 20:
-                        child_tree["tag_id"] = None
+                    child_tree, child_size = build_tree(child_ast_id, curr_depth - 1)
+                    budget[0] -= 2 * child_size
+                    size += 2 * child_size
+                    # Suppress tag_id on untagged sub-expressions if inner statement/expression.
+                    # A memoized subtree may also be the root or another parent's child, so the
+                    # suppression goes on a shallow copy instead of mutating the shared node.
+                    if child_tree["type_id"] > 20 and child_tree["tag_id"] is not None:
+                        child_tree = {**child_tree, "tag_id": None}
                     node_dict["containers"].append({
                         "priority": ch["priority"],
                         "child_node": child_tree,
                     })
                     node_dict["children"].append(child_tree)
-                return node_dict
+                subtree_cache[(curr_ast_id, curr_depth)] = (node_dict, size)
+                return (node_dict, size)
 
-            return build_tree(ast_id, depth)
+            return build_tree(ast_id, depth)[0]
 
     def get_tag_timeline(self, tag_id: int, include_rc: bool = False) -> dict[str, Any]:
         """Cross-version history of the symbol a tag belongs to (see HistoryService)."""

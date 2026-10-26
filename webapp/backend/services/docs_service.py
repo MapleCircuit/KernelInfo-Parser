@@ -80,7 +80,8 @@ class DocsService:
                 check=False,
             )
         except (OSError, subprocess.SubprocessError) as e:
-            raise HTTPException(status_code=500, detail=f"git grep failed: {e}") from e
+            logger.warning("git grep for doc labels at %s failed: %s", sha, e)
+            raise HTTPException(status_code=500, detail="git grep failed") from e
 
         labels: dict[str, dict[str, Any]] = {}
         groups = out.stdout.decode("utf-8", errors="replace").split("\n--\n")

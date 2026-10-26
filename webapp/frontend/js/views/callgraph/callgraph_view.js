@@ -3,6 +3,7 @@
  */
 import { api } from "../../api.js";
 import { state } from "../../state.js";
+import { escapeHtml } from "../../components/modal.js";
 
 export class CallgraphView {
   constructor() {
@@ -225,7 +226,7 @@ export class CallgraphView {
         });
       });
     } catch (e) {
-      resContainer.innerHTML = `<div style="color:var(--accent-red);">Failed: ${e.message}</div>`;
+      resContainer.innerHTML = `<div style="color:var(--accent-red);">Failed: ${escapeHtml(e.message)}</div>`;
     }
   }
 }

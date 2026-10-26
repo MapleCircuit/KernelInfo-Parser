@@ -4,6 +4,7 @@
  */
 import { state } from "../state.js";
 import { shortRef } from "./ref_picker.js";
+import { escapeHtml } from "./modal.js";
 
 export class TabsComponent {
   constructor(containerEl, viewRenderers) {
@@ -169,7 +170,7 @@ export class TabsComponent {
     if (renderer && typeof renderer.render === "function") {
       renderer.render(containerEl, tab);
     } else {
-      containerEl.innerHTML = `<div style="padding:20px;">Unknown view type: ${tab.type}</div>`;
+      containerEl.innerHTML = `<div style="padding:20px;">Unknown view type: ${escapeHtml(tab.type)}</div>`;
     }
   }
 

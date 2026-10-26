@@ -55,6 +55,49 @@ def _canonical(text: str | None) -> int:
     return 10000 * major + 100 * minor + patch
 
 
+# A client's toolchain spec keys the Kconfig model cache, so its mappings are bounded as well as
+# typed: a huge env would be hashed into a key and kept alongside the model it built.
+_MAX_PROFILE_MAP_ENTRIES = 128
+_MAX_PROFILE_VALUE_CHARS = 512
+# Fields that are a free-form string, a tri-state flag, or a string->string mapping
+_PROFILE_BOOL_FIELDS = ("llvm_utils", "gcc_plugins")
+_PROFILE_MAP_FIELDS = ("env", "probes")
+_PROFILE_TRUE = ("true", "1", "yes", "on")
+_PROFILE_FALSE = ("false", "0", "no", "off")
+
+
+def _coerce_field(name: str, value: Any) -> Any:
+    """Coerce one client-supplied profile field to its declared type, or raise ValueError."""
+    if name in _PROFILE_MAP_FIELDS:
+        if not isinstance(value, dict):
+            raise ValueError(f"toolchain.{name} must be an object")
+        if len(value) > _MAX_PROFILE_MAP_ENTRIES:
+            raise ValueError(f"toolchain.{name} has more than {_MAX_PROFILE_MAP_ENTRIES} entries")
+        out: dict[str, str] = {}
+        for k, v in value.items():
+            if isinstance(v, (dict, list)):
+                raise ValueError(f"toolchain.{name}[{k!r}] must be a string")
+            out[str(k)[:_MAX_PROFILE_VALUE_CHARS]] = str(v)[:_MAX_PROFILE_VALUE_CHARS]
+        return out
+    if name in _PROFILE_BOOL_FIELDS:
+        if value is None or isinstance(value, bool):
+            return value
+        if isinstance(value, int):
+            return bool(value)
+        text = str(value).strip().lower()
+        if text in _PROFILE_TRUE:
+            return True
+        if text in _PROFILE_FALSE:
+            return False
+        raise ValueError(f"toolchain.{name} must be a boolean")
+    # Every remaining field is a string (pahole_version also accepts null for "not installed")
+    if value is None:
+        return None
+    if isinstance(value, (dict, list, bool)):
+        raise ValueError(f"toolchain.{name} must be a string")
+    return str(value)[:_MAX_PROFILE_VALUE_CHARS]
+
+
 @dataclass
 class ToolchainProfile:
     cc: str = "gcc"                 # gcc | clang
@@ -74,9 +117,15 @@ class ToolchainProfile:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None, kernelversion: str = "") -> "ToolchainProfile":
+        """Build a profile from a client-supplied mapping.
+
+        Unknown keys are ignored and every accepted value is coerced to the field's type, so a
+        wrong shape (`{"env": "text"}`) raises ValueError here instead of failing deep inside the
+        model build. Callers turn that into a 400 (see `KconfigService.get_model`).
+        """
         data = dict(data or {})
         known = {f for f in cls.__dataclass_fields__}
-        prof = cls(**{k: v for k, v in data.items() if k in known})
+        prof = cls(**{k: _coerce_field(k, v) for k, v in data.items() if k in known})
         for key in ("pahole_version", "rustc_version"):
             if isinstance(getattr(prof, key), str) and getattr(prof, key).strip().lower() == "none":
                 setattr(prof, key, "")  # explicitly not installed

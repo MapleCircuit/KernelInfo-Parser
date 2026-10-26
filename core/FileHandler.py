@@ -4,7 +4,7 @@ import shutil
 import tempfile
 import subprocess as sp
 from pathlib import Path
-from core.globalstuff import G
+from core.globalstuff import G, is_safe_git_rev, is_safe_git_spec
 
 
 class MasterFile:
@@ -78,8 +78,23 @@ class MasterFile:
             finally:
                 self._cat_file_proc = None
 
+    @staticmethod
+    def _checked_rev(rev: str) -> str:
+        """Validate a revision before it reaches a git argument.
+
+        A revision starting with "-" would be read as an option by every git command below
+        (`archive`, `diff`, `ls-tree`, `show`), so only plain refs and SHAs are accepted.
+        """
+        if not is_safe_git_rev(rev):
+            raise ValueError(f"Unsafe git revision: {rev!r}")
+        return rev
+
     def _read_blob(self, target_spec: str) -> bytes | None:
         """Read blob bytes from persistent git cat-file --batch subprocess."""
+        # cat-file --batch reads one request per line: a newline in the spec would inject further
+        # requests and desynchronize every later answer on this long-lived stream.
+        if not is_safe_git_spec(target_spec):
+            return None
         for attempt in range(2):
             try:
                 proc = self._ensure_cat_file_proc()
@@ -246,7 +261,7 @@ class MasterFile:
         temp_path = self.create_temp_dir()
         git_dir = self._get_git_dir()
         p_arch = sp.Popen(
-            ["git", f"--git-dir={git_dir}", "archive", f"{version}"],
+            ["git", f"--git-dir={git_dir}", "archive", self._checked_rev(version)],
             stdout=sp.PIPE,
         )
         sp.run(["tar", "-x", "-C", f"{temp_path}"], stdin=p_arch.stdout, check=True)  # noqa: S603, PLW1510
@@ -274,7 +289,7 @@ class MasterFile:
         """Retrieve content of a file at a specific version (from disk cache or git show)."""
         if version not in self.version_dict:
             git_dir = self._get_git_dir()
-            command = ["git", f"--git-dir={git_dir}", "show", f"{version}:{file_path}"]
+            command = ["git", f"--git-dir={git_dir}", "show", f"{self._checked_rev(version)}:{file_path}"]
             raw_file = sp.run(command, capture_output=True, text=True, encoding="latin-1")  # noqa: PLW1510
             return raw_file.stdout
 
@@ -311,8 +326,8 @@ class MasterFile:
             "git",
             f"--git-dir={git_dir}",
             "diff",
-            f"{old_rev}",
-            f"{new_rev}",
+            self._checked_rev(str(old_rev)),
+            self._checked_rev(str(new_rev)),
             "--name-status",
         ]
 
@@ -333,7 +348,7 @@ class MasterFile:
             "ls-tree",
             "-r",
             "--name-only",
-            f"{version}",
+            self._checked_rev(str(version)),
         ]
         raw_file = sp.run(command, capture_output=True, text=True)  # noqa: PLW1510, S603
         if raw_file.returncode == 0:
@@ -352,7 +367,7 @@ class MasterFile:
             "-r",
             "-d",
             "--name-only",
-            f"{version_name}",
+            self._checked_rev(str(version_name)),
         ]
         return sp.run(command, capture_output=True, text=True).stdout.splitlines()  # noqa: PLW1510, S603
 
@@ -428,7 +443,7 @@ class MasterFile:
         Returns [start, <every listed tag whose history contains start>] in version order. A tag
         pointing exactly at start replaces the raw SHA so the snapshot is registered under its name.
         """
-        if not self._git_lines("rev-parse", "--verify", "--quiet", f"{start}^{{commit}}"):
+        if not is_safe_git_rev(start) or not self._git_lines("rev-parse", "--verify", "--quiet", f"{start}^{{commit}}"):
             return [start]
         points_at = set(self._git_lines("tag", "--points-at", start))
         descendants = set(self._git_lines("tag", "--contains", start)) - points_at
@@ -439,5 +454,7 @@ class MasterFile:
 
     def get_root_commit(self, rev: str = "HEAD") -> str | None:
         """First commit of rev's history (the parentless commit reached by following first parents)."""
+        if not is_safe_git_rev(rev):
+            return None
         roots = self._git_lines("rev-list", "--max-parents=0", "--first-parent", rev)
         return roots[-1] if roots else None

@@ -19,6 +19,7 @@ from webapp.backend.database.helpers import (
     get_version_info,
 )
 from webapp.backend.security.jail import is_safe_rel_path
+from webapp.backend.security.sql import escape_like
 from webapp.backend.services.tree_resolver import tree_resolver, git_tree_resolver
 
 logger = logging.getLogger(__name__)
@@ -303,9 +304,13 @@ class DiffService:
                 check=False,
             )
         except (OSError, subprocess.SubprocessError) as e:
-            raise HTTPException(status_code=500, detail=f"git diff failed: {e}") from e
+            logger.warning("git diff %s..%s failed: %s", sha1, sha2, e)
+            raise HTTPException(status_code=500, detail="git diff failed") from e
         if out.returncode != 0:
-            raise HTTPException(status_code=500, detail=out.stderr.decode("utf-8", errors="replace").strip() or "git diff failed")
+            # stderr carries absolute repository paths: it is logged, not returned
+            logger.warning("git diff %s..%s -- %s failed: %s", sha1, sha2, norm_path,
+                           out.stderr.decode("utf-8", errors="replace").strip())
+            raise HTTPException(status_code=500, detail="git diff failed")
 
         raw = out.stdout
         truncated = len(raw) > MAX_FILE_DIFF_BYTES
@@ -379,7 +384,7 @@ class DiffService:
                 LEFT JOIN m_file_name fn ON bc.fnid = fn.fnid AND fn.fnid > 0
                 WHERE bc.commit_id = %s AND (fn.fname LIKE %s OR fn.fname = %s);
             """
-            cursor.execute(sql, (commit_id, f"{prefix}%", norm_path))
+            cursor.execute(sql, (commit_id, f"{escape_like(prefix)}%", norm_path))
         else:
             sql = """
                 SELECT COALESCE(NULLIF(fn.fname, ''), CONCAT('file_', bc.fnid)) AS fname, bc.blob_id
@@ -405,7 +410,7 @@ class DiffService:
             if prefix:
                 cursor.execute(
                     f"SELECT fnid, fname FROM m_file_name WHERE fnid IN ({fmt}) AND (fname LIKE %s OR fname = %s);",
-                    [*chunk, f"{prefix}%", norm_path],
+                    [*chunk, f"{escape_like(prefix)}%", norm_path],
                 )
             else:
                 cursor.execute(

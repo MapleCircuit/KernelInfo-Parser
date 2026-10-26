@@ -16,7 +16,7 @@ from collections import OrderedDict
 from functools import lru_cache
 from typing import Any
 from fastapi import HTTPException
-from core.globalstuff import ASTT
+from core.globalstuff import ASTT, is_safe_git_rev, is_safe_git_spec
 from parser.kconfig_ast.kconfig_lexer import KconfigLexer
 from parser.kconfig_ast.kconfig_parser import KconfigChoice, KconfigConfig, KconfigIf, KconfigMenu, KconfigParser
 from webapp.backend.config import get_repo_dir
@@ -36,7 +36,6 @@ CHANGE_STATUSES = ("introduced", "added", "modified", "cosmetic", "removed")
 LINEAGE_LIMIT = 500
 COMMIT_FORMAT = "--format=%H%x00%an%x00%ae%x00%at%x00%s"
 _C_COMMENT_RE = re.compile(r"/\*.*?\*/|//[^\n]*", re.S)
-_SAFE_REV_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/+-]*$")
 # (blob sha, symbol) -> Kconfig definition facts; content addressed, so shared by every repository
 _FACTS_CACHE: OrderedDict[tuple[str, str], tuple[dict[str, Any], ...]] = OrderedDict()
 _FACTS_LOCK = threading.Lock()
@@ -61,12 +60,18 @@ def batch_blob_shas(specs: list[str]) -> list[str | None]:
     """Resolve `<rev>:<path>` specs to blob SHAs (None when missing) with a single git process."""
     if not specs:
         return []
-    out = _git(["cat-file", "--batch-check=%(objectname) %(objecttype)"], stdin=("\n".join(specs) + "\n").encode())
+    # Answers are matched to specs by position, and cat-file reads one request per line, so a spec
+    # holding a newline would shift every later answer onto the wrong path: such specs are not sent.
+    sent = [i for i, spec in enumerate(specs) if is_safe_git_spec(spec)]
+    result: list[str | None] = [None] * len(specs)
+    if not sent:
+        return result
+    out = _git(["cat-file", "--batch-check=%(objectname) %(objecttype)"],
+               stdin=("\n".join(specs[i] for i in sent) + "\n").encode())
     lines = out.decode("utf-8", errors="replace").splitlines() if out else []
-    result: list[str | None] = []
-    for i in range(len(specs)):
-        head, _, kind = lines[i].rpartition(" ") if i < len(lines) else ("", "", "")
-        result.append(head if kind == "blob" and len(head) == 40 else None)
+    for pos, idx in enumerate(sent):
+        head, _, kind = lines[pos].rpartition(" ") if pos < len(lines) else ("", "", "")
+        result[idx] = head if kind == "blob" and len(head) == 40 else None
     return result
 
 
@@ -758,7 +763,7 @@ class HistoryService:
         """
         norm_path = (path or "").strip().strip("/")
         for rev in (to_rev, from_rev):
-            if rev and not _SAFE_REV_RE.match(rev):
+            if rev and not is_safe_git_rev(rev):
                 raise HTTPException(status_code=400, detail=f"Invalid revision '{rev}'.")
         if not norm_path or norm_path.startswith("-") or ".." in norm_path.split("/"):
             raise HTTPException(status_code=400, detail="Invalid path.")

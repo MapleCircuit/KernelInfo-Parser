@@ -2,6 +2,7 @@
 from __future__ import annotations
 import logging
 from webapp.backend.config import RepoScopedCache, get_active_repository, get_repo_dir
+from core.globalstuff import is_safe_git_rev
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -202,6 +203,9 @@ def get_version_info(cursor: Any, version_name_or_id: str | int) -> tuple[int | 
                 return cid, hex_str
 
         # If not matched in database tables, attempt git rev-parse resolution (for branches, -rc tags, arbitrary revisions)
+        if not is_safe_git_rev(ver_str):
+            # The name reaches git's command line below, where "-..." would be read as an option
+            return None, ver_str
         try:
             import subprocess
             out = subprocess.run(

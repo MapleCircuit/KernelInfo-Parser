@@ -13,6 +13,7 @@ import subprocess
 import threading
 from typing import Any
 
+from core.globalstuff import is_safe_git_spec
 from webapp.backend.config import LINUX_REPO_DIR, get_repo_dir
 
 logger = logging.getLogger(__name__)
@@ -95,6 +96,11 @@ class GitReader:
             target_spec = rev
         else:
             target_spec = f"{rev}:{clean_path}"
+
+        # One request per line: a newline inside the spec would inject further requests and
+        # desynchronize every later answer on this shared stream.
+        if not is_safe_git_spec(target_spec):
+            return ("missing", None, None)
 
         with self._lock:
             return self._read_with_retry(target_spec)

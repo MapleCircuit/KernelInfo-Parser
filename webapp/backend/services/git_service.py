@@ -14,6 +14,8 @@ from webapp.backend.database.helpers import (
     safe_decode,
     get_version_info,
 )
+from webapp.backend.security.git import is_safe_rev, safe_rev
+from webapp.backend.security.sql import sanitize_like_query
 from webapp.backend.security.jail import resolve_and_verify_repo_path
 
 logger = logging.getLogger(__name__)
@@ -24,6 +26,9 @@ _GIT_SEMAPHORE = asyncio.Semaphore(8)
 _HEX_REF = re.compile(r"[0-9a-f]{4,40}")
 _EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
 _HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@ ?(.*)$")
+MAX_COMMIT_PAGE = 500
+# A deeper page than this is a scan, not navigation: MySQL still walks every skipped row
+MAX_COMMIT_OFFSET = 1_000_000
 MAX_COMMIT_DIFF_BYTES = 8 * 1024 * 1024
 MAX_COMMIT_DIFF_LINES = 6000
 MAX_DIFF_LINE_CHARS = 400
@@ -120,6 +125,9 @@ def _cached_git_file_history(
     rev: str, rel_path: str, limit: int, repo_dir: str = ""
 ) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
     """Execute git log to fetch commits for rel_path up to rev, cached in memory."""
+    # rev reaches the command line before "--", where git would read "--output=..." as an option
+    if not is_safe_rev(rev):
+        return None, []
     args = [
         "log",
         f"-n{max(1, min(limit, 200))}",
@@ -193,7 +201,8 @@ class GitService:
 
         with get_db_cursor() as cursor:
             vid, vname = get_version_info(cursor, version_name)
-        rev = vname or str(version_name).strip()
+        # An unresolved version falls back to the raw name, which git would read as an option
+        rev = safe_rev(vname or str(version_name).strip(), "version")
 
         try:
             stdout, stderr, code = self.run_git(["blame", "--line-porcelain", rev, "--", rel_path])
@@ -272,7 +281,7 @@ class GitService:
 
         with get_db_cursor() as cursor:
             vid, vname = get_version_info(cursor, version_name)
-        rev = vname or str(version_name).strip()
+        rev = safe_rev(vname or str(version_name).strip(), "version")
 
         try:
             last_changed, commits = _cached_git_file_history(rev, rel_path, max(1, min(limit, 200)), str(get_repo_dir()))
@@ -358,7 +367,11 @@ class GitService:
 
     def get_commits(self, version_name: str, page: int = 1, limit: int = 50, query: str = "", offset: int | None = None) -> dict[str, Any]:
         """Retrieve paginated commit history from m_commit."""
+        # Bound here too: this method is also exported as a programmatic delegate (webapp/main.py),
+        # and limit/offset are bound straight into SQL LIMIT/OFFSET
+        limit = max(1, min(int(limit), MAX_COMMIT_PAGE))
         off = offset if offset is not None else (max(1, page) - 1) * limit
+        off = max(0, min(int(off), MAX_COMMIT_OFFSET))
         with get_db_cursor() as cursor:
             vid, vname = get_version_info(cursor, version_name)
             if vid is None:
@@ -374,9 +387,11 @@ class GitService:
             """
             params: list[Any] = []
             if query:
-                # commit_hash is BINARY(20): match hex prefixes against its HEX() rendering
+                # commit_hash is BINARY(20): match hex prefixes against its HEX() rendering.
+                # Wildcards are escaped: an unescaped "%" makes all three LIKEs match every row.
+                clean_q = sanitize_like_query(query)
                 sql += " AND (c.subject LIKE %s OR HEX(c.commit_hash) LIKE %s OR p.name LIKE %s)"
-                params.extend([f"%{query}%", f"{query.strip().upper()}%", f"%{query}%"])
+                params.extend([f"%{clean_q}%", f"{clean_q.upper()}%", f"%{clean_q}%"])
             sql += " ORDER BY c.author_date DESC LIMIT %s OFFSET %s;"
             params.extend([limit, off])
 
@@ -415,15 +430,18 @@ class GitService:
             if str(commit_id).isdigit():
                 cursor.execute("SELECT * FROM m_commit WHERE commit_id = %s LIMIT 1;", (int(commit_id),))
             else:
+                # commit_hash is BINARY(20); anything that is not hex cannot name a commit, and
+                # encoding it to latin-1 would raise on a non-latin-1 character
                 cid_str = str(commit_id).strip()
+                if not _HEX_REF.fullmatch(cid_str.lower()):
+                    raise HTTPException(status_code=400, detail="A commit id or hash (4-40 hex digits) must be specified.")
                 if len(cid_str) == 40:
-                    try:
-                        c_bytes = bytes.fromhex(cid_str)
-                    except ValueError:
-                        c_bytes = cid_str.encode("latin-1")
+                    c_bytes = bytes.fromhex(cid_str)
+                    cursor.execute("SELECT * FROM m_commit WHERE commit_hash = %s LIMIT 1;", (c_bytes,))
                 else:
-                    c_bytes = cid_str.encode("latin-1")
-                cursor.execute("SELECT * FROM m_commit WHERE commit_hash = %s LIMIT 1;", (c_bytes,))
+                    # Short prefix: match against the hex rendering
+                    cursor.execute("SELECT * FROM m_commit WHERE HEX(commit_hash) LIKE %s LIMIT 1;",
+                                   (f"{cid_str.upper()}%",))
             c_row = cursor.fetchone()
             if not c_row:
                 raise HTTPException(status_code=404, detail=f"Commit '{commit_id}' not found.")
@@ -586,7 +604,8 @@ class GitService:
         except subprocess.TimeoutExpired as e:
             raise HTTPException(status_code=504, detail="git diff timed out.") from e
         except OSError as e:
-            raise HTTPException(status_code=500, detail=f"git diff failed: {e}") from e
+            logger.warning("git diff for commit %s failed: %s", ref, e)
+            raise HTTPException(status_code=500, detail="git diff failed") from e
         if rc != 0 and not truncated:
             raise HTTPException(status_code=500, detail="git diff failed")
 

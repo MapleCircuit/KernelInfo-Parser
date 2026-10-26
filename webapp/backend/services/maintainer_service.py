@@ -20,7 +20,10 @@ from parser.maintainer_ast.maintainer_types import (
 from parser.maintainer_ast.maintainer_matcher import MaintainerMatcher
 
 _MAINTAINER_CACHE: dict[str, tuple[list[MaintainerSection], MaintainerMatcher]] = RepoScopedCache()
-_FILE_SUBSYSTEMS_CACHE: dict[tuple[str, str], list[dict[str, Any]]] = RepoScopedCache()
+# Bounded: the key carries the requested file path, so each distinct path a caller sends adds an entry
+_FILE_SUBSYSTEMS_CACHE: dict[tuple[str, str], list[dict[str, Any]]] = RepoScopedCache(maxsize=4096)
+# Files of one patch that match_maintainers() resolves; the rest are reported as skipped
+MAX_PATCH_FILES = 200
 
 
 class MaintainerService:
@@ -595,8 +598,9 @@ class MaintainerService:
         if not file_path:
             return []
         cache_key = (version_name, file_path)
-        if cache_key in _FILE_SUBSYSTEMS_CACHE:
-            return _FILE_SUBSYSTEMS_CACHE[cache_key]
+        cached = _FILE_SUBSYSTEMS_CACHE.get(cache_key)
+        if cached is not None:
+            return cached
 
         sections, matcher = self.get_maintainer_data(version_name)
         matched_secs = matcher.match_file(file_path)
@@ -699,6 +703,13 @@ class MaintainerService:
             for p in target:
                 touched_files[p] = 1
 
+        # Every file is matched against every MAINTAINERS pattern, so the work is linear in the
+        # number of files the patch names and is paid even when nothing matches (2,000 files took
+        # ~14s before this cap). The rest are counted and reported instead of matched.
+        skipped_files = max(0, len(touched_files) - MAX_PATCH_FILES)
+        if skipped_files:
+            touched_files = dict(list(touched_files.items())[:MAX_PATCH_FILES])
+
         all_maintainers: dict[str, dict[str, Any]] = {}
         all_reviewers: dict[str, dict[str, Any]] = {}
         all_lists: set[str] = set()
@@ -738,6 +749,7 @@ class MaintainerService:
         return {
             "version": vname,
             "touched_files_count": len(touched_files),
+            "skipped_files_count": skipped_files,
             "files": file_breakdown,
             "subsystems": sorted(all_subsystems),
             "suggested_to": to_list,

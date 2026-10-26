@@ -47,11 +47,14 @@ def create_app() -> FastAPI:
     app.add_middleware(GZipMiddleware, minimum_size=1000)
     app.add_middleware(SecurityHeadersMiddleware)
     app.add_middleware(SlidingWindowRateLimiter, max_requests=600, window_seconds=60)
+    # Read-only API with no cookie or header authentication: any origin may read it, but never with
+    # credentials. "*" together with allow_credentials makes Starlette reflect the caller's Origin
+    # and allow credentials, which would let any page read this API as the visitor.
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],
-        allow_credentials=True,
-        allow_methods=["*"],
+        allow_credentials=False,
+        allow_methods=["GET", "POST", "OPTIONS"],
         allow_headers=["*"],
     )
     # Inside RepoContextMiddleware: the change tokens are those of the request's repository

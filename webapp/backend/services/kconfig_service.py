@@ -39,6 +39,8 @@ from parser.kconfig_ast.kconfig_model import (
 from webapp.backend.config import RepoScopedCache, get_active_repo_name, get_repo_dir
 from webapp.backend.database.helpers import get_version_info, safe_decode
 from webapp.backend.database.pool import get_db_cursor
+from webapp.backend.security.git import safe_rev
+from webapp.backend.security.sql import is_valid_identifier
 from webapp.backend.services.git_reader import git_reader
 
 logger = logging.getLogger(__name__)
@@ -53,6 +55,9 @@ _BUILD_RESOLVER_CACHE_SIZE = 4
 _BUILD_PATHS_LIMIT = 64
 # #include "foo.c" / <bar.S>: sources compiled as part of another file
 _INCLUDED_SOURCE_RE = r'#\s*include\s*["<][^">]+\.(c|S)[">]'
+# Most source references a usage answer keeps. `git grep` for a symbol name is bounded by the tree,
+# but a name is caller-supplied, so the matches it can produce must not be: see _safe_symbol().
+_USAGE_REF_LIMIT = 20000
 
 
 class _ModelEntry:
@@ -88,9 +93,18 @@ class _ModelEntry:
 
 
 _MODELS: "RepoScopedCache" = RepoScopedCache()
+# Guards _MODELS and _MODEL_BUILD_LOCKS only; a model is never built while it is held
 _MODEL_LOCK = threading.Lock()
-_LISTING_CACHE: "RepoScopedCache" = RepoScopedCache()
-_USAGE_CACHE: "RepoScopedCache" = RepoScopedCache()
+# One lock per model key, held for that key's build and dropped once it is cached
+_MODEL_BUILD_LOCKS: dict[tuple[Any, ...], threading.Lock] = {}
+# Concurrent model builds allowed across all keys (each costs ~1s of CPU and tens of MB)
+_MODEL_BUILD_SEMAPHORE = threading.BoundedSemaphore(2)
+# Bounded: keyed by revision, and any revision a caller names adds an entry
+_LISTING_CACHE: "RepoScopedCache" = RepoScopedCache(maxsize=64)
+# Separate and much smaller: each entry is a revision's whole file list (~4.5 MiB at v3.0)
+_PATHS_CACHE: "RepoScopedCache" = RepoScopedCache(maxsize=4)
+# Bounded: keyed by the requested symbol name, and each entry holds that symbol's reference list
+_USAGE_CACHE: "RepoScopedCache" = RepoScopedCache(maxsize=256)
 _BUILD_RESOLVERS: "RepoScopedCache" = RepoScopedCache()
 _BUILD_LOCK = threading.Lock()
 
@@ -101,16 +115,22 @@ class KconfigService:
     # ------------------------------------------------------------------ git access
     @staticmethod
     def _rev(version_name: str) -> str:
-        """Git revision for a version name (numeric ids are resolved through the database)."""
+        """Git revision for a version name (numeric ids are resolved through the database).
+
+        The result reaches `git grep` / `git ls-tree` as a positional argument, so it is validated
+        here: every revision this service passes to git comes through this method.
+        """
         ver = str(version_name or "v3.0").strip()
         if ver.isdigit():
             try:
                 with get_db_cursor() as cursor:
                     _, vname = get_version_info(cursor, ver)
-                    return vname or ver
+                    return safe_rev(vname or ver, "version")
+            except HTTPException:
+                raise
             except Exception as exc:
                 logger.debug("Version id %s not resolvable: %s", ver, exc)
-        return ver
+        return safe_rev(ver, "version")
 
     @staticmethod
     def _read(rev: str, path: str) -> str | None:
@@ -124,6 +144,22 @@ class KconfigService:
         return raw.decode("utf-8", errors="replace")
 
     @staticmethod
+    def _safe_symbol(name: str) -> str:
+        """A Kconfig symbol name (without the CONFIG_ prefix), or HTTP 400.
+
+        The name reaches `git grep` patterns and keys the usage cache. A name carrying regex
+        metacharacters would match far more than itself (`CONFIG_.*` finds every CONFIG_ reference
+        in the tree), so the whole result would be read, parsed and cached under a name the caller
+        chose. Patterns built from a validated name are still escaped at the call site.
+        """
+        clean = (name or "").strip()
+        if clean.startswith("CONFIG_"):
+            clean = clean[7:]
+        if not is_valid_identifier(clean):
+            raise HTTPException(status_code=400, detail="Invalid KConfig symbol name.")
+        return clean
+
+    @staticmethod
     def _git(args: list[str], timeout: float = 20.0) -> str:
         try:
             proc = subprocess.run(["git", *args], cwd=str(get_repo_dir()), capture_output=True, text=True, timeout=timeout)
@@ -134,17 +170,24 @@ class KconfigService:
 
     def _tree_listing(self, rev: str, path: str, recursive: bool = False) -> list[str]:
         key = ("ls", rev, path, recursive)
-        if key not in _LISTING_CACHE:
+        # Read once into a local: both caches evict, so contains-then-get could race a miss
+        listing = _LISTING_CACHE.get(key)
+        if listing is None:
             args = ["ls-tree", "--name-only"] + (["-r"] if recursive else [])
             out = self._git(args + ([f"{rev}:{path}"] if path else [rev]))
-            _LISTING_CACHE[key] = [line.strip() for line in out.splitlines() if line.strip()]
-        return _LISTING_CACHE[key]
+            listing = [line.strip() for line in out.splitlines() if line.strip()]
+            _LISTING_CACHE[key] = listing
+        return listing
 
     def _all_paths(self, rev: str) -> set[str]:
-        key = ("all", rev)
-        if key not in _LISTING_CACHE:
-            _LISTING_CACHE[key] = set(self._git(["ls-tree", "-r", "--name-only", rev], timeout=60).splitlines())
-        return _LISTING_CACHE[key]
+        """Every path in the revision's tree. Kept in its own small cache: one entry is the whole
+        file list (36,783 paths / ~4.5 MiB at v3.0, more in later releases), and any revision a
+        caller names gets one, so only a few are retained."""
+        paths = _PATHS_CACHE.get(rev)
+        if paths is None:
+            paths = set(self._git(["ls-tree", "-r", "--name-only", rev], timeout=60).splitlines())
+            _PATHS_CACHE[rev] = paths
+        return paths
 
     # ------------------------------------------------------------------ architectures
     def resolve_arch(self, version_name: str, arch: str | None) -> dict[str, Any]:
@@ -201,39 +244,65 @@ class KconfigService:
         """Build (or fetch from the LRU cache) the finalized Kconfig model for one revision, ARCH and toolchain."""
         info = self.resolve_arch(version_name, arch)
         rev = info["rev"]
-        profile = ToolchainProfile.from_dict(self.parse_toolchain(toolchain), info["kernelversion"])
+        try:
+            profile = ToolchainProfile.from_dict(self.parse_toolchain(toolchain), info["kernelversion"])
+        except (ValueError, TypeError) as exc:
+            raise HTTPException(status_code=400, detail=f"Invalid toolchain profile: {exc}") from exc
         spec_hash = hashlib.sha1(json.dumps(profile.to_dict(), sort_keys=True).encode()).hexdigest()[:16]
         key = (rev, info["arch"], spec_hash)
         with _MODEL_LOCK:
             entry = _MODELS.get(key)
             if entry is not None:
                 return entry
-            read = lambda p: self._read(rev, p)  # noqa: E731
-            env_vars = profile.environment(info["arch"], info["srcarch"], info["kernelversion"])
-            env_vars.setdefault("KBUILD_DEFCONFIG", self._default_defconfig(rev, info["arch"], info["srcarch"]) or "")
-            if info["arch"] == "um":
-                env_vars.setdefault("SUBARCH", "x86")
-            env = KconfigEnv(ARCH=env_vars["ARCH"], SRCARCH=env_vars["SRCARCH"], KERNELVERSION=env_vars["KERNELVERSION"], extra=env_vars)
-            macros = read("scripts/kconfig/preprocess.c") is not None
-            shell = pp = None
-            if macros:
-                shell = ToolchainShell(profile, env_vars, info["srcarch"], read)
-                pp = KconfigPreprocessor(env_vars, shell)
-                shell.pp = pp
-            builder = KconfigModelBuilder(read, env, pp)
-            model = builder.build(self._root_kconfig(rev, info["srcarch"]))
-            model["version"] = version_name
-            model["arch"] = info["arch"]
-            model["srcarch"] = info["srcarch"]
-            model["toolchain"] = self._toolchain_report(model, profile, env_vars, macros, pp, shell)
-            entry = _ModelEntry(builder, model, info)
-            # Bounded LRU per repository (each model holds a few tens of MB once indexed)
-            repo = get_active_repo_name()
-            same_repo = [k for k in dict.keys(_MODELS) if k[0] == repo]
-            if len(same_repo) >= _MODEL_CACHE_SIZE:
-                dict.pop(_MODELS, same_repo[0], None)
-            _MODELS[key] = entry
+            # One lock per key: requests for the same model wait for that one build instead of
+            # duplicating it, while requests for other models are not blocked behind it. Building
+            # under the single global lock meant one ~1s build stalled every Kconfig request.
+            build_lock = _MODEL_BUILD_LOCKS.setdefault(key, threading.Lock())
+
+        with build_lock:
+            with _MODEL_LOCK:
+                entry = _MODELS.get(key)
+                if entry is not None:
+                    return entry
+            try:
+                # Caps how many models can be built at once, so distinct keys cannot be used to
+                # occupy every worker thread with a fresh build
+                with _MODEL_BUILD_SEMAPHORE:
+                    entry = self._build_model(rev, info, profile, version_name)
+            finally:
+                with _MODEL_LOCK:
+                    _MODEL_BUILD_LOCKS.pop(key, None)
+            with _MODEL_LOCK:
+                # Bounded LRU per repository (each model holds a few tens of MB once indexed)
+                repo = get_active_repo_name()
+                same_repo = [k for k in dict.keys(_MODELS) if k[0] == repo]
+                if len(same_repo) >= _MODEL_CACHE_SIZE:
+                    dict.pop(_MODELS, same_repo[0], None)
+                _MODELS[key] = entry
             return entry
+
+    def _build_model(self, rev: str, info: dict[str, Any], profile: ToolchainProfile,
+                     version_name: str) -> _ModelEntry:
+        """Parse and finalize one revision's Kconfig model. Runs without the model cache lock held."""
+        read = lambda p: self._read(rev, p)  # noqa: E731
+        env_vars = profile.environment(info["arch"], info["srcarch"], info["kernelversion"])
+        env_vars.setdefault("KBUILD_DEFCONFIG", self._default_defconfig(rev, info["arch"], info["srcarch"]) or "")
+        if info["arch"] == "um":
+            env_vars.setdefault("SUBARCH", "x86")
+        env = KconfigEnv(ARCH=env_vars["ARCH"], SRCARCH=env_vars["SRCARCH"], KERNELVERSION=env_vars["KERNELVERSION"], extra=env_vars)
+        macros = read("scripts/kconfig/preprocess.c") is not None
+        shell = pp = None
+        if macros:
+            shell = ToolchainShell(profile, env_vars, info["srcarch"], read)
+            pp = KconfigPreprocessor(env_vars, shell)
+            shell.pp = pp
+        builder = KconfigModelBuilder(read, env, pp)
+        model = builder.build(self._root_kconfig(rev, info["srcarch"]))
+        model["version"] = version_name
+        model["arch"] = info["arch"]
+        model["srcarch"] = info["srcarch"]
+        model["toolchain"] = self._toolchain_report(model, profile, env_vars, macros, pp, shell)
+        return _ModelEntry(builder, model, info)
 
     @staticmethod
     def _toolchain_report(model: dict[str, Any], profile: ToolchainProfile, env_vars: dict[str, str], macros: bool,
@@ -569,13 +638,15 @@ class KconfigService:
     # ------------------------------------------------------------------ usage (git)
     def kbuild_usage(self, version_name: str, name: str, arch: str = DEFAULT_ARCH) -> list[dict[str, Any]]:
         """Makefile/Kbuild rules governed by CONFIG_<name>: objects and directories it builds."""
+        name = self._safe_symbol(name)
         info = self.resolve_arch(version_name, arch)
         rev, srcarch = info["rev"], info["srcarch"]
         key = ("kbuild", rev, name)
-        if key in _USAGE_CACHE:
-            rules = _USAGE_CACHE[key]
-        else:
-            out = self._git(["grep", "-l", "-w", "-e", f"CONFIG_{name}", rev, "--", "*Makefile*", "*Kbuild*"])
+        rules = _USAGE_CACHE.get(key)
+        if rules is None:
+            # -F: the symbol name is a literal, not a pattern (without it git grep reads it as a
+            # basic regex, where `.` and `*` would still match beyond the name)
+            out = self._git(["grep", "-l", "-w", "-F", "-e", f"CONFIG_{name}", rev, "--", "*Makefile*", "*Kbuild*"])
             makefiles = sorted({line.split(":", 1)[1] for line in out.splitlines() if ":" in line})
             paths = self._all_paths(rev)
             parser = KbuildParser()
@@ -643,10 +714,13 @@ class KconfigService:
     def _included_sources(self, rev: str) -> set[str]:
         """Basenames of .c/.S files that another file #includes (compiled inside it, not on their own)."""
         key = ("incsrc", rev)
-        if key not in _USAGE_CACHE:
+        # Read into a local: the cache evicts, so re-reading after the write could miss
+        sources = _USAGE_CACHE.get(key)
+        if sources is None:
             out = self._git(["grep", "-h", "-o", "-E", _INCLUDED_SOURCE_RE, rev, "--", "*.c", "*.h", "*.S"], timeout=60)
-            _USAGE_CACHE[key] = {re.split(r'[/"<]', line.strip().rstrip('">'))[-1] for line in out.splitlines() if line.strip()}
-        return _USAGE_CACHE[key]
+            sources = {re.split(r'[/"<]', line.strip().rstrip('">'))[-1] for line in out.splitlines() if line.strip()}
+            _USAGE_CACHE[key] = sources
+        return sources
 
     @staticmethod
     def _arch_trees(rev: str, arch: str) -> set[str] | None:
@@ -688,20 +762,24 @@ class KconfigService:
 
     def get_symbol_usage(self, version_name: str, name: str, arch: str = DEFAULT_ARCH, limit: int = _USAGE_LIMIT, toolchain: Any = None) -> dict[str, Any]:
         """Where CONFIG_<name> is used: Kbuild rules, C/assembly/linker sources, and other Kconfig entries."""
-        clean = name[7:] if name.startswith("CONFIG_") else name
+        clean = self._safe_symbol(name)
+        limit = max(1, min(int(limit or _USAGE_LIMIT), _USAGE_REF_LIMIT))
         entry = self.get_model(version_name, arch, toolchain)
         rev, srcarch = entry.arch["rev"], entry.arch["srcarch"]
         key = ("src", rev, clean)
-        if key not in _USAGE_CACHE:
-            out = self._git(["grep", "-n", "-w", "-E", f"CONFIG_{clean}(_MODULE)?", rev, "--",
+        refs = _USAGE_CACHE.get(key)
+        if refs is None:
+            out = self._git(["grep", "-n", "-w", "-E", rf"CONFIG_{re.escape(clean)}(_MODULE)?", rev, "--",
                              "*.c", "*.h", "*.S", "*.lds", "*.lds.S", "*.dts", "*.dtsi"])
             refs = []
             for line in out.splitlines():
                 parts = line.split(":", 3)
                 if len(parts) == 4 and parts[2].isdigit():
                     refs.append({"file_path": parts[1], "line": int(parts[2]), "text": parts[3].strip()[:200]})
+                # A symbol with more references than this is reported truncated rather than cached whole
+                if len(refs) >= _USAGE_REF_LIMIT:
+                    break
             _USAGE_CACHE[key] = refs
-        refs = _USAGE_CACHE[key]
         trees = self._arch_trees(rev, entry.arch["arch"])
         sources = [dict(r, other_arch=is_other_arch_path(r["file_path"], srcarch, trees)) for r in refs]
         return {
@@ -711,6 +789,7 @@ class KconfigService:
             "kbuild": self.kbuild_usage(version_name, clean, entry.arch["arch"]),
             "source_refs": sources[:limit],
             "source_ref_count": len(sources),
+            "source_refs_truncated": len(refs) >= _USAGE_REF_LIMIT,
             "source_file_count": len({r["file_path"] for r in sources}),
             "kconfig_refs": entry.builder.references.get(clean, [])[:limit],
         }

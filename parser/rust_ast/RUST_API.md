@@ -30,6 +30,10 @@ Source Ingestion & AST Tree Parsing:
   └── parse_rust_ast_tree (rust_tree_parser.py):
         ├── Parses items: structs, enums, functions, traits, impls, modules, macros
         ├── Extracts generics, attributes (#[...]), doc comments (///), visibility (pub, pub(crate))
+        ├── unquote_string(token): decodes a quoted STRING token's escapes (\n, \t, \", \\, \xNN,
+        │   \u{...}); an unknown or malformed escape is kept verbatim. The dump is subprocess
+        │   output, so it is decoded as data and never evaluated as a Python literal (which would
+        │   also mangle non-ASCII bytes, e.g. "café")
         └── Instantiates strongly typed Ast_Rust node hierarchy
   │
   ▼ [Ast_Rust.extract() -> Relational ChangeSet Staging (rust_ast_type.py)]
