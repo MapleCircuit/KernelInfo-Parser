@@ -9,7 +9,7 @@ import { toast } from "./components/toast.js";
 import { TabsComponent } from "./components/tabs.js";
 import { contextMenu } from "./components/context_menu.js";
 import { refPicker, shortRef, isCommitRef } from "./components/ref_picker.js";
-import { requestVersionSwitch } from "./components/version_switch.js";
+import { requestVersionSwitch, openVersionInNewTab } from "./components/version_switch.js";
 import { commandPalette } from "./components/command_palette.js";
 import { showPatchModal } from "./components/patch_modal.js";
 import { showSymbolHistoryModal } from "./components/symbol_history_modal.js";
@@ -26,14 +26,17 @@ import { PaholeView } from "./views/pahole/pahole_view.js";
 import { CallgraphView } from "./views/callgraph/callgraph_view.js";
 import { DiffView } from "./views/diff/diff_view.js";
 import { TreemapView } from "./views/treemap/treemap_view.js";
+import { ExplorerView } from "./views/explorer/explorer_view.js";
 
 export class KernelIdeApp {
   constructor() {
     this.tabsComponent = null;
     this.viewRenderers = {
-      // One view per tab (code and kconfig): each keeps its own file, dimming and engine state
+      // One view per tab (code, kconfig, explorer): each keeps its own file, dimming, engine
+      // selection or browsed directory
       code: () => new VirtualEditor(),
       kconfig: () => new KconfigView(),
+      explorer: () => new ExplorerView(),
       nodemap: new NodeMapController(),
       maintainers: new MaintainersView(),
       commits: new CommitsView(),
@@ -108,6 +111,12 @@ export class KernelIdeApp {
       this.updateVersionSelectorDisplay();
       await this.loadSidebarFileTree();
     });
+
+    // Picking a revision in the header only moves the selection (Apply / New Tab act on it)
+    state.subscribe("version:selected", () => this.updateVersionSelectorDisplay());
+
+    // The active tab decides what Apply would switch, so the buttons follow tab changes
+    state.subscribe("tabs:changed", () => this.updateVersionSelectorDisplay());
 
     console.info("KernelInfo Developer IDE fully initialized.");
   }
@@ -445,7 +454,7 @@ export class KernelIdeApp {
         branchSelect.innerHTML = branches.map(b => `<option value="${b.name}" ${b.is_default ? "selected" : ""}>${b.name}</option>`).join("");
         branchSelect.onchange = (e) => {
           const val = e.target.value;
-          if (val) requestVersionSwitch(val);
+          if (val) state.setSelectedVersion(val);
         };
       } catch (err) {
         console.warn("Could not load branches:", err);
@@ -460,26 +469,30 @@ export class KernelIdeApp {
       this.buildVersionCatalog(res.versions || ["v3.0"]);
       const branchNames = Array.from(branchSelect?.options || []).map((o) => o.value);
 
-      // Validate and sanitize state.currentVersion (commit SHAs and branch names are valid targets too)
-      const cur = state.currentVersion;
-      if (!this.versionByName.has(cur) && !isCommitRef(cur) && !branchNames.includes(cur)) {
+      // Validate and sanitize the explored and the selected revision (commit SHAs and branch names
+      // are valid targets too)
+      const valid = (ref) => this.versionByName.has(ref) || isCommitRef(ref) || branchNames.includes(ref);
+      const fallback = () => {
         const indexed = this.tagVersions.filter((t) => t.indexed && !t.rcOnly);
-        state.currentVersion = (indexed[indexed.length - 1] || this.tagVersions[this.tagVersions.length - 1] || { vname: "v3.0" }).vname;
-      }
+        return (indexed[indexed.length - 1] || this.tagVersions[this.tagVersions.length - 1] || { vname: "v3.0" }).vname;
+      };
+      if (!valid(state.currentVersion)) state.currentVersion = fallback();
+      if (!valid(state.selectedVersion)) state.selectedVersion = state.currentVersion;
 
-      // Picking a release selects its final tag (or its latest -rc when it was never released)
+      // Picking a release selects its final tag (or its latest -rc when it was never released).
+      // Selecting changes nothing on its own: **Apply** or **New Tab** act on the selection.
       select.onchange = (e) => {
         const base = e.target.value;
         if (!base || base.includes("object")) return;
         const target = this.versionByName.has(base) ? base : (this.rcsByBase.get(base) || []).slice(-1)[0]?.vname;
-        if (target) requestVersionSwitch(target);
+        if (target) state.setSelectedVersion(target);
       };
 
       const rcSelect = document.getElementById("rc-select");
       if (rcSelect) {
         rcSelect.onchange = (e) => {
           const val = e.target.value;
-          if (val) requestVersionSwitch(val);
+          if (val) state.setSelectedVersion(val);
         };
       }
     } catch (e) {
@@ -492,18 +505,41 @@ export class KernelIdeApp {
       commitBtn.onclick = (e) => {
         e.stopPropagation();
         refPicker.open(commitBtn, {
-          current: state.currentVersion,
+          current: state.selectedVersion,
           onSelect: (ref) => {
-            if (ref) requestVersionSwitch(ref);
+            if (ref) state.setSelectedVersion(ref);
           }
         });
       };
     }
 
+    // 5. Apply (switch the current tab) and New Tab (repository explorer on the selection)
+    const applyBtn = document.getElementById("version-apply-btn");
+    if (applyBtn) {
+      applyBtn.onclick = async () => {
+        const target = state.selectedVersion;
+        const tab = state.getActiveTab();
+        if (!tab) {
+          openVersionInNewTab(target);
+          toast.info(`No tab to switch: opened a repository explorer on ${shortRef(target)}`);
+          return;
+        }
+        if (tab.version === target) {
+          toast.info(`${tab.title} is already on ${shortRef(target)}`);
+          return;
+        }
+        if (await requestVersionSwitch(target)) toast.success(`${tab.title} switched to ${shortRef(target)}`);
+      };
+    }
+    const newTabBtn = document.getElementById("version-newtab-btn");
+    if (newTabBtn) {
+      newTabBtn.onclick = () => openVersionInNewTab(state.selectedVersion);
+    }
+
     this.updateVersionSelectorDisplay();
   }
 
-  /** Reflect state.currentVersion in the Tag dropdown, Branch dropdown and Commit picker button. */
+  /** Reflect state.selectedVersion in the Tag dropdown, Branch dropdown and Commit picker button. */
   /**
    * Split the version catalog into releases (Tag selector) and pre-releases grouped under the release
    * they lead to (RC selector): v3.1-rc1..rc10 belong to v3.1. A release that only has candidates so
@@ -548,7 +584,7 @@ export class KernelIdeApp {
   }
 
   updateVersionSelectorDisplay() {
-    const cur = state.currentVersion;
+    const cur = state.selectedVersion;
     const tags = this.tagVersions || [];
     const tag = this.versionByName?.get(cur);
     const base = tag ? this.releaseOf(cur) : null;
@@ -624,9 +660,24 @@ export class KernelIdeApp {
       } else {
         label.textContent = shortRef(cur);
         commitBtn.classList.add("detached");
-        commitBtn.title = `Exploring ${cur}\nClick to select another commit`;
+        commitBtn.title = `Selected ${cur}\nClick to select another commit`;
       }
     }
+
+    // Apply stands out while the selection is not what the current tab shows
+    const applyBtn = document.getElementById("version-apply-btn");
+    const activeTab = state.getActiveTab();
+    if (applyBtn) {
+      const pending = Boolean(activeTab) && activeTab.version !== cur;
+      applyBtn.classList.toggle("pending", pending);
+      applyBtn.title = activeTab
+        ? (pending
+          ? `Switch ${activeTab.title} from ${shortRef(activeTab.version)} to ${shortRef(cur)}`
+          : `${activeTab.title} is already on ${shortRef(cur)}`)
+        : `Open ${shortRef(cur)} in a new tab`;
+    }
+    const newTabBtn = document.getElementById("version-newtab-btn");
+    if (newTabBtn) newTabBtn.title = `Open a repository explorer on ${shortRef(cur)} in a new tab`;
   }
 
   /** Switch the active repository: resets the workspace and reloads the version catalog. */
@@ -677,25 +728,29 @@ export class KernelIdeApp {
       },
       { title: "Open KConfig engine", hint: "Menuconfig, defconfigs, dependencies", keywords: "config", run: () => state.openTab({ type: "kconfig", title: "KConfig (x86_64)", arch: "x86_64" }) },
       {
-        title: `${state.kconfigEngineActive ? "Disable" : "Enable"} KConfig engine (#ifdef dimming)`, hint: "Dims compiled-out preprocessor branches", keywords: "ifdef dim preprocessor",
+        title: "Enable KConfig engine in a tab (#ifdef dimming)", hint: "Dims compiled-out preprocessor branches", keywords: "ifdef dim preprocessor config engine",
         run: () => {
-          if (state.kconfigEngineActive) {
-            const owner = state.kconfigEngineOwnerTab();
-            state.setKconfigEngineOwner(null);
-            toast.info(`KConfig engine disabled${owner ? ` in ${owner.title}` : ""} (its configuration is kept)`);
-            return;
-          }
-          // The engine resolves the configuration of one KConfig tab, so it needs one to belong to
+          // An engine resolves the configuration of one KConfig tab, so it needs one to belong to
           const active = state.getActiveTab();
-          const target = active && active.type === "kconfig" ? active : state.kconfigTabs()[0];
+          const target = active && active.type === "kconfig" && !state.isKconfigEngineOwner(active.id)
+            ? active
+            : state.kconfigTabs().find((t) => !state.isKconfigEngineOwner(t.id));
           if (!target) {
-            toast.info("Open a KConfig tab to enable the engine");
+            toast.info(state.kconfigTabs().length ? "Every open KConfig tab already runs its engine" : "Open a KConfig tab to enable an engine");
             return;
           }
           // The tab shows what resolving its values changes before it takes the engine (§5.0)
           state.requestKconfigEngine(target.id);
         }
       },
+      {
+        title: "Disable every KConfig engine", hint: `${state.kconfigEngineTabIds.length} running`, keywords: "ifdef dim config engine off",
+        run: () => {
+          const had = state.disableAllKconfigEngines();
+          toast.info(had.length ? `${had.length} KConfig engine(s) disabled (their configurations are kept)` : "No KConfig engine is running");
+        }
+      },
+      { title: "Open repository explorer tab", hint: "Browse the tree of this revision", keywords: "files tree browse", run: () => state.openTab({ type: "explorer", title: `Explorer ${v()}`, path: "", version: v(), forceNew: true }) },
       { title: "Open Git commits timeline", hint: "History of the version", keywords: "log", run: () => state.openTab({ type: "commits", title: "Commits" }) },
       { title: "Open subsystems & maintainers", hint: "MAINTAINERS, CREDITS", keywords: "people", run: () => state.openTab({ type: "maintainers", title: "Maintainers" }) },
       { title: "Open NodeMap canvas", hint: "Schematic view", keywords: "graph", run: () => state.openTab({ type: "nodemap", title: "NodeMap Canvas" }) },

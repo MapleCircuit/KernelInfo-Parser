@@ -213,6 +213,7 @@ export class TabsComponent {
       case "callgraph": return "[X]";
       case "diff": return "[D]";
       case "treemap": return "[T]";
+      case "explorer": return "[E]";
       default: return "[?]";
     }
   }

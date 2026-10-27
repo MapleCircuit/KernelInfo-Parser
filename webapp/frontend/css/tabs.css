@@ -74,6 +74,8 @@
 .tab-icon.pahole { color: var(--accent-cyan); }
 .tab-icon.callgraph { color: #f778ba; }
 .tab-icon.diff { color: #e36209; }
+.tab-icon.treemap { color: var(--accent-green); }
+.tab-icon.explorer { color: var(--accent-blue); }
 
 .tab-title {
   flex: 1;

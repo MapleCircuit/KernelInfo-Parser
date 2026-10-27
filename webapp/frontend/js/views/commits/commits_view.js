@@ -6,7 +6,6 @@ import { state } from "../../state.js";
 import { debounce } from "../../utils/debounce.js";
 import { showPersonModal } from "../../components/person_modal.js";
 import { toast } from "../../components/toast.js";
-import { requestVersionSwitch } from "../../components/version_switch.js";
 
 const STATUS_COLORS = { A: "var(--accent-green)", D: "var(--accent-red)", R: "#d2a8ff", M: "var(--accent-yellow)" };
 // Files whose diff is longer than this start collapsed in the inline commit diff
@@ -157,13 +156,19 @@ export class CommitsView {
     try {
       const res = await api.getCommitTimeline(this.currentVersion, 50, "future", this.nextFutureCursor);
       const newCommits = [...(res.timeline || [])].reverse();
-      this.commits = [...newCommits, ...this.commits];
+      const known = new Set(this.commits.map((c) => c.commit_id ?? c.commit_hash));
+      const fresh = newCommits.filter((c) => !known.has(c.commit_id ?? c.commit_hash));
+      this.commits = [...fresh, ...this.commits];
       this.hasFuture = Boolean(res.has_future);
       this.nextFutureCursor = res.next_future_cursor;
+      // Cleared before rendering: the new button is built from these flags, so a button rendered
+      // while they still said "loading" would stay disabled and keep reading "Loading..."
+      this.isLoadingTop = false;
       this.renderCommitList();
       listContainer.scrollTop = prevScrollTop + (listContainer.scrollHeight - prevScrollHeight);
     } catch (e) {
       console.error("Failed to load more commits (top):", e);
+      this.isLoadingTop = false;
       if (topBtn) {
         topBtn.textContent = "Failed to load - Retry";
         topBtn.disabled = false;
@@ -183,22 +188,26 @@ export class CommitsView {
     }
 
     try {
+      const known = new Set(this.commits.map((c) => c.commit_id ?? c.commit_hash));
       if (this.currentQuery) {
         this.currentPage += 1;
         const res = await api.getCommits(this.currentVersion, this.currentPage, 50, this.currentQuery);
         const newCommits = res.commits || [];
-        this.commits.push(...newCommits);
+        this.commits.push(...newCommits.filter((c) => !known.has(c.commit_id ?? c.commit_hash)));
         this.hasMore = newCommits.length === 50;
       } else {
         const res = await api.getCommitTimeline(this.currentVersion, 50, "past", this.nextPastCursor);
         const newCommits = res.timeline || [];
-        this.commits.push(...newCommits);
+        this.commits.push(...newCommits.filter((c) => !known.has(c.commit_id ?? c.commit_hash)));
         this.hasPast = Boolean(res.has_past);
         this.nextPastCursor = res.next_past_cursor;
       }
+      // Cleared before rendering, so the next "Load 50 More Commits" button is enabled (see loadMoreTop)
+      this.isLoadingBottom = false;
       this.renderCommitList();
     } catch (e) {
       console.error("Failed to load more commits (bottom):", e);
+      this.isLoadingBottom = false;
       if (bottomBtn) {
         bottomBtn.textContent = "Failed to load - Retry";
         bottomBtn.disabled = false;
@@ -522,17 +531,18 @@ export class CommitsView {
 
       const exploreCommitBtn = detailEl.querySelector("#btn-explore-commit");
       if (exploreCommitBtn && c.commit_hash) {
-        exploreCommitBtn.onclick = async () => {
-          // Declining leaves the explored revision (and any KConfig tab) alone; the commit still opens
-          await requestVersionSwitch(c.commit_hash);
-          toast.success(`Switched exploration target to commit ${c.commit_hash.slice(0, 8)}`);
+        exploreCommitBtn.onclick = () => {
+          // The commit becomes the header selection (Apply / New Tab act on it) and opens in a
+          // repository explorer of its own; no other tab's revision changes
+          state.setSelectedVersion(c.commit_hash);
           state.openTab({
-            type: "code",
-            title: "Makefile",
-            path: "Makefile",
+            type: "explorer",
+            title: `Explorer ${c.commit_hash.slice(0, 8)}`,
+            path: "",
             version: c.commit_hash,
             forceNew: true,
           });
+          toast.success(`Browsing the tree at commit ${c.commit_hash.slice(0, 8)}`);
         };
       }
 

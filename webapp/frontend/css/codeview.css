@@ -391,3 +391,67 @@
   background: transparent;
   color: var(--text-muted);
 }
+
+/* KConfig engine selector of the code toolbar (which engine this file follows, §5.16) */
+.engine-picker {
+  position: fixed;
+  z-index: 2000;
+  width: 320px;
+  max-width: calc(100vw - 16px);
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-md);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+  overflow: hidden;
+  font-size: 11px;
+}
+
+.engine-picker-header {
+  padding: 6px 10px;
+  background: var(--bg-tertiary);
+  border-bottom: 1px solid var(--border-color);
+  color: var(--text-secondary);
+  font-weight: 600;
+  text-transform: uppercase;
+  font-size: 10px;
+}
+
+.engine-picker-list {
+  max-height: 320px;
+  overflow-y: auto;
+}
+
+.engine-picker-item {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--border-color);
+  cursor: pointer;
+}
+
+.engine-picker-item:hover {
+  background: var(--bg-hover);
+}
+
+.engine-picker-item.current {
+  background: rgba(88, 166, 255, 0.12);
+}
+
+.engine-picker-title {
+  color: var(--text-primary);
+  font-weight: 600;
+}
+
+.engine-picker-meta,
+.engine-picker-empty {
+  color: var(--text-muted);
+  font-size: 10px;
+  font-family: var(--font-mono);
+}
+
+.engine-picker-empty {
+  padding: 10px;
+  font-family: var(--font-sans);
+  line-height: 1.5;
+}

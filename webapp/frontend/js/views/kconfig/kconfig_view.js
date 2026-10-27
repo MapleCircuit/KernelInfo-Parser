@@ -8,11 +8,13 @@
  *
  * One configuration is kept per "version|ARCH" profile (state.kconfigProfiles), plus one per named
  * copy ("version|ARCH|name", **Duplicate** / **Rename…**), so several configurations of the same
- * ARCH and revision can be kept and compared side by side. The active one is published as
- * state.kconfigAssignments for #ifdef dimming in code views.
+ * ARCH and revision can be kept and compared side by side. A tab running its engine publishes its
+ * resolved configuration under its own tab id (state.kconfigEngines), and the code tabs following
+ * that engine dim their #ifdef branches with it.
  *
- * The engine is off by default and belongs to a single KConfig tab at a time (state.kconfigEngineTabId):
- * enabling it in another tab asks whether to move it, so two configurations are never resolved at once.
+ * The engine is off by default and belongs to the tab that enables it (state.kconfigEngineTabIds).
+ * Several tabs may run their engine at the same time: each one resolves its own configuration and
+ * publishes it under its tab id, and a code tab picks which of them it follows (code toolbar, §5.16).
  * Disabling it keeps every value (the tab's profile is untouched; editing just stops being constrained).
  */
 import { api } from "../../api.js";
@@ -47,13 +49,17 @@ export class KconfigView {
     // Name telling this configuration apart from other copies of the same revision and ARCH
     this.configName = "";
     this.selfEngineChange = false;
+    // "version|ARCH|name" this tab's values were last loaded against (a switch reports what moved)
+    this.resolvedProfileKey = "";
 
-    // The engine can be moved or switched off elsewhere (another tab, the command palette, a tab
-    // being closed): follow it so the toolbar and the tree never claim an engine this tab lost.
-    this.unsubscribeEngine = state.subscribe("kconfig:engine:changed", () => {
+    // This tab's engine can be switched off elsewhere (the command palette's *Disable every KConfig
+    // engine*, a tab being closed): follow it so the toolbar and the tree never claim an engine this
+    // tab lost. Engines of other tabs are none of this view's business.
+    this.unsubscribeEngine = state.subscribe("kconfig:engine:changed", ({ tabId } = {}) => {
       if (this.selfEngineChange) return;
       if (!this.containerEl || !this.containerEl.isConnected) return;
       if (!state.findTab(this.tabId)) return; // this tab is being closed
+      if (tabId && tabId !== this.tabId) return; // another tab's engine
       this.followEngineChange();
     });
 
@@ -75,18 +81,18 @@ export class KconfigView {
     this.containerEl = null;
   }
 
-  /** The engine was switched off or moved by something other than this view. */
+  /** This tab's engine was switched on or off by something other than this view. */
   async followEngineChange() {
     // Gaining it resolves this tab's values, so it is confirmed like the toolbar button (§5.0)
     if (this.engineActive && this.engine.loaded && !(await this.confirmEngineResolution())) {
-      state.setKconfigEngineOwner(null);
+      state.setKconfigEngineEnabled(this.tabId, false);
       toast.info("Engine left off: the configuration is unchanged");
       return;
     }
     this.applyEngineState({ announce: false });
   }
 
-  /** Whether the engine is enabled for this tab (only one tab may hold it; off by default). */
+  /** Whether this tab runs its engine (off by default; other tabs may run theirs too). */
   get engineActive() {
     return state.isKconfigEngineOwner(this.tabId);
   }
@@ -144,18 +150,16 @@ export class KconfigView {
               <input type="text" placeholder="Search symbols or prompts..." id="kconfig-search-input" />
             </div>
             <div class="kconfig-btn-row">
-              <button class="code-btn ${this.engineActive ? "active" : ""}" id="btn-toggle-engine" title="Constraint engine: only values kconfig accepts can be set">${this.engineActive ? "✓ Engine Active" : "⚡ Enable Engine"}</button>
-              <button class="code-btn ${this.showUnmet ? "active" : ""}" id="btn-toggle-unmet" title="Also list entries whose dependencies are not met">${this.showUnmet ? "✓ Showing All" : "👁 Show All"}</button>
+              <button class="code-btn ${this.engineActive ? "active" : ""}" id="btn-toggle-engine" title="Constraint engine: only values kconfig accepts can be set (several tabs may run one)">${this.engineActive ? "✓ Engine Active" : "⚡ Enable Engine"}</button>
+              <button class="code-btn" id="btn-compare-config" title="Compare this configuration with a defconfig or with another KConfig tab">Compare…</button>
             </div>
             <div class="kconfig-btn-row">
               <button class="code-btn" id="btn-export-config" title="Download the full .config (what make writes)">Export .config</button>
-              <button class="code-btn" id="btn-export-defconfig" title="Download a minimal defconfig (make savedefconfig)">Save defconfig</button>
               <button class="code-btn" id="btn-load-defconfig" title="Load one of the architecture's defconfigs">Load Defconfig</button>
             </div>
             <div class="kconfig-btn-row">
               <button class="code-btn" id="btn-import-config" title="Load a .config or defconfig file">Import .config</button>
               <button class="code-btn" id="btn-validate-config" title="Check the configuration against Kconfig constraints">Validate</button>
-              <button class="code-btn" id="btn-compare-config" title="Compare this configuration with a defconfig or with another KConfig tab">Compare…</button>
               <input type="file" id="kconfig-import-file" accept=".config,text/plain,*" hidden />
             </div>
             <div class="kconfig-status" id="kconfig-status"></div>
@@ -203,14 +207,6 @@ export class KconfigView {
     const engineBtn = c.querySelector("#btn-toggle-engine");
     engineBtn.onclick = () => this.setEngineActive(!this.engineActive);
 
-    const unmetBtn = c.querySelector("#btn-toggle-unmet");
-    unmetBtn.onclick = () => {
-      this.showUnmet = !this.showUnmet;
-      unmetBtn.classList.toggle("active", this.showUnmet);
-      unmetBtn.textContent = this.showUnmet ? "✓ Showing All" : "👁 Show All";
-      this.renderTree();
-    };
-
     c.querySelector("#btn-rename-config").onclick = () => this.showRenameModal();
     c.querySelector("#btn-duplicate-config").onclick = () => this.duplicateConfig();
     c.querySelector("#btn-toolchain").onclick = () => this.showToolchainModal();
@@ -219,7 +215,6 @@ export class KconfigView {
       new MenuconfigTui(this).show();
     };
     c.querySelector("#btn-export-config").onclick = () => this.exportConfig();
-    c.querySelector("#btn-export-defconfig").onclick = () => this.exportDefconfig();
     c.querySelector("#btn-load-defconfig").onclick = () => this.showDefconfigModal();
 
     const importInput = c.querySelector("#kconfig-import-file");
@@ -282,13 +277,26 @@ export class KconfigView {
 
     const saved = state.getKconfigProfile(this.profileKey);
     if (saved && Object.keys(saved).length) {
-      if (this.engineActive) this.engine.loadAssignments(saved);
-      this.rawValues = { ...saved };
-      this.commit();
+      // Values carried over from another revision or ARCH (see `requestVersionSwitch`) are loaded
+      // against this model; with the engine on, kconfig resolves them and drops what it does not know
+      if (this.engineActive) {
+        const report = this.engine.loadAssignments(saved);
+        this.rawValues = { ...saved };
+        this.commit();
+        // Only when the configuration actually moved to another model, not on every re-render
+        if (this.resolvedProfileKey && this.resolvedProfileKey !== this.profileKey) {
+          const dropped = report.unknown.length ? `, ${report.unknown.length} unknown for ARCH=${this.currentArch} dropped` : "";
+          toast.info(`${Object.keys(saved).length} values loaded and resolved for ${this.currentVersion}${dropped}`);
+        }
+      } else {
+        this.rawValues = { ...saved };
+        this.commit();
+      }
     } else {
       await this.loadDefconfig("", { quiet: true });
     }
 
+    this.resolvedProfileKey = this.profileKey;
     this.renderTree();
     if (this.selectedSymbol) this.inspectSymbol(this.selectedSymbol);
   }
@@ -358,7 +366,7 @@ export class KconfigView {
   duplicateConfig() {
     const name = state.nextKconfigConfigName(this.currentVersion, this.currentArch);
     const key = kconfigProfileKey(this.currentVersion, this.currentArch, name);
-    state.setKconfigAssignments(this.rawValues || {}, key, { publish: false });
+    state.saveKconfigProfileValues(key, this.rawValues || {});
     const tc = this.toolchain;
     if (tc && Object.keys(tc).length) state.setKconfigToolchain(key, JSON.parse(JSON.stringify(tc)));
     state.openTab({
@@ -372,15 +380,20 @@ export class KconfigView {
     toast.success(`Copied ${Object.keys(this.rawValues || {}).length} values to ${name}; the engine is off in the copy`);
   }
 
-  /** Publish the current configuration (resolved values when the engine is on). */
+  /**
+   * Save the current configuration under this tab's profile. While this tab runs its engine, the
+   * resolved values are also published as *its* engine configuration, which the code tabs following
+   * this engine dim with; the engines of other tabs are untouched.
+   */
   commit() {
     if (this.engineActive) {
       this.rawValues = this.engine.configValues();
     }
-    // While another tab holds the engine, its resolved configuration stays the published one; this
-    // tab's values are still saved under their own profile, so nothing is lost either way.
-    const publish = this.engineActive || !state.kconfigEngineActive;
-    state.setKconfigAssignments(this.rawValues || {}, this.profileKey, { publish });
+    state.setKconfigAssignments(this.tabId, this.profileKey, this.rawValues || {}, {
+      version: this.currentVersion,
+      arch: this.currentArch,
+      configName: this.configName,
+    });
     this.updateStatus();
   }
 
@@ -392,19 +405,15 @@ export class KconfigView {
   }
 
   /**
-   * Turn the engine on for this tab or off. Only one KConfig tab may hold it, so enabling it while
-   * another tab does asks first (move it here, or leave it there and stay unconstrained here).
+   * Turn this tab's engine on or off. Engines are per tab and independent: enabling one here does
+   * not disturb another tab's, and code tabs choose which engine they follow.
    */
   async setEngineActive(active) {
-    if (active) {
-      const owner = state.kconfigEngineOwnerTab();
-      if (owner && owner.id !== this.tabId && !(await this.confirmEngineTakeover(owner))) return;
-      // Enabling it resolves the values through kconfig, which may change more than nothing
-      if (this.engine.loaded && !(await this.confirmEngineResolution())) return;
-    }
+    // Enabling it resolves the values through kconfig, which may change more than nothing (§5.0)
+    if (active && this.engine.loaded && !(await this.confirmEngineResolution())) return;
     this.selfEngineChange = true;
     try {
-      state.setKconfigEngineOwner(active ? this.tabId : null);
+      state.setKconfigEngineEnabled(this.tabId, Boolean(active));
     } finally {
       this.selfEngineChange = false;
     }
@@ -432,7 +441,7 @@ export class KconfigView {
         const got = after[k] ?? (s.type === "bool" || s.type === "tristate" ? "n" : "");
         return got !== String(before[k]);
       }).length;
-      if (announce) toast.success(`Engine on: configuration resolved by kconfig (${adjusted} values adjusted, ${report.unknown.length} unknown symbols dropped)`);
+      if (announce) toast.success(`Engine on in ${this.tabTitle()}: configuration resolved by kconfig (${adjusted} values adjusted, ${report.unknown.length} unknown symbols dropped)`);
       this.renderTree();
     } else {
       if (announce) toast.info("Engine off: values are edited without constraints (export will be unvalidated)");
@@ -440,34 +449,6 @@ export class KconfigView {
       if (this.engine.loaded) this.renderTree();
     }
     if (this.selectedSymbol) this.inspectSymbol(this.selectedSymbol, this.selectedNodeId, { keepScroll: true });
-  }
-
-  /** Ask before taking the engine from the tab holding it; resolves true to move it here. */
-  confirmEngineTakeover(ownerTab) {
-    return new Promise((resolve) => {
-      let takeOver = false;
-      const label = ownerTab.title || "another KConfig tab";
-      const modal = openModal({
-        title: "The KConfig engine is already enabled",
-        subtitle: `${label} holds it — only one tab can run it at a time`,
-        width: "560px",
-        footerHtml: `<button class="code-btn active" id="kconfig-engine-takeover" type="button">Disable it in ${escapeHtml(label)}</button>`,
-        onClose: () => resolve(takeOver),
-      });
-      modal.body.innerHTML = `
-        <div class="kconfig-muted" style="display:flex;flex-direction:column;gap:8px;">
-          <div>The constraint engine resolves one configuration and that configuration is what <code>#ifdef</code> dimming and per-architecture definitions follow, so it stays with a single tab.</div>
-          <div><strong>Disable it in ${escapeHtml(label)}</strong>: the engine moves here and resolves this tab's configuration (ARCH=${escapeHtml(this.currentArch)}).</div>
-          <div><strong>Close</strong>: the engine stays in ${escapeHtml(label)} and this tab keeps editing values without constraints.</div>
-          <div>No configuration is lost either way: every tab keeps its own values per <code>version|ARCH</code>.</div>
-        </div>`;
-      const ok = modal.footer.querySelector("#kconfig-engine-takeover");
-      ok.onclick = () => {
-        takeOver = true;
-        modal.close();
-      };
-      ok.focus();
-    });
   }
 
   /**
@@ -758,14 +739,8 @@ export class KconfigView {
     const clean = symbolName.startsWith("CONFIG_") ? symbolName.slice(7) : symbolName;
     const node = this.primaryNode(clean);
     if (node) {
-      if (!this.nodeVisible(node) && node.prompt) {
-        this.showUnmet = true;
-        const unmetBtn = this.containerEl?.querySelector("#btn-toggle-unmet");
-        if (unmetBtn) {
-          unmetBtn.classList.add("active");
-          unmetBtn.textContent = "✓ Showing All";
-        }
-      }
+      // An entry menuconfig hides is listed anyway so the inspected symbol can be reached
+      if (!this.nodeVisible(node) && node.prompt) this.showUnmet = true;
       this.expandAncestors(node.id);
       const searchInput = this.containerEl?.querySelector("#kconfig-search-input");
       if (searchInput) searchInput.value = "";

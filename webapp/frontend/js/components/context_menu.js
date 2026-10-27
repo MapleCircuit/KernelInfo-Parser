@@ -340,7 +340,7 @@ class ContextMenu {
         onClick: async () => {
           try {
             const xref = await api.getSymbolXref(v, tokenName, 250);
-            this.showXrefModal(tokenName, xref);
+            this.showXrefModal(tokenName, xref, v);
           } catch (err) {
             toast.error(`XRef lookup failed: ${err.message}`);
           }
@@ -487,7 +487,7 @@ class ContextMenu {
           onClick: async () => {
             try {
               const xref = await api.getSymbolXref(v, token.name, 250);
-              this.showXrefModal(token.name, xref);
+              this.showXrefModal(token.name, xref, v);
             } catch (err) {
               toast.error(`XRef lookup failed: ${err.message}`);
             }
@@ -746,7 +746,7 @@ class ContextMenu {
    */
   showNodeMapMenu(x, y, context) {
     const { node, isCanvas, controller, constituent, constituentIndex } = context;
-    const v = state.currentVersion;
+    const v = state.activeVersion();
     const items = [];
 
     if (node) {
@@ -1025,7 +1025,7 @@ class ContextMenu {
     const authorLink = box.querySelector(".commit-popover-author-link");
     if (authorLink) {
       authorLink.onclick = () => {
-        showPersonModal(state.currentVersion, author);
+        showPersonModal(state.activeVersion(), author);
       };
     }
 
@@ -1066,7 +1066,7 @@ class ContextMenu {
     return typeName;
   }
 
-  showXrefModal(name, xref) {
+  showXrefModal(name, xref, version = state.activeVersion()) {
     const backdrop = document.createElement("div");
     backdrop.className = "palette-backdrop";
     backdrop.onclick = () => backdrop.remove();
@@ -1144,7 +1144,7 @@ class ContextMenu {
           title: el.dataset.path.split("/").pop(),
           path: el.dataset.path,
           cursorLine: parseInt(el.dataset.line || "1", 10),
-          version: state.currentVersion
+          version
         });
         backdrop.remove();
       };
@@ -1157,7 +1157,7 @@ class ContextMenu {
             title: el.dataset.path.split("/").pop(),
             path: el.dataset.path,
             cursorLine: parseInt(el.dataset.line || "1", 10),
-            version: state.currentVersion,
+            version,
             forceNew: true
           });
           // Do not close backdrop - keeps modal open for queuing multiple tabs
@@ -1234,7 +1234,7 @@ class ContextMenu {
   }
 
   showIncludeSymbolsModal(name, incData, x, y, includeInfo) {
-    const info = includeInfo || { header: name, name: name, version: state.currentVersion };
+    const info = includeInfo || { header: name, name: name, version: state.activeVersion() };
     includeSymbolsPopover.show(
       x || Math.max(16, window.innerWidth / 2 - 225),
       y || Math.max(16, window.innerHeight / 4),

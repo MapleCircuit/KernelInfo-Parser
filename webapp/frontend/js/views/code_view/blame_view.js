@@ -10,10 +10,13 @@ export class BlameView {
   constructor() {
     this.blameData = null;
     this.blameByLine = new Map();
+    // Revision the blame belongs to: what the profiles and commit tabs it opens follow
+    this.version = "";
   }
 
   async loadBlame(version, filePath) {
     this.blameByLine.clear();
+    this.version = version;
     try {
       this.blameData = await api.getFileBlame(version, filePath);
       if (Array.isArray(this.blameData.lines)) {
@@ -48,7 +51,7 @@ export class BlameView {
       const authorEl = e.target.closest(".blame-author-link");
       if (authorEl && authorEl.dataset.author) {
         e.stopPropagation();
-        showPersonModal(state.currentVersion, authorEl.dataset.author);
+        showPersonModal(this.version || state.activeVersion(), authorEl.dataset.author);
         return;
       }
 
@@ -58,7 +61,7 @@ export class BlameView {
           type: "commits",
           title: `Commit ${cell.dataset.commit.substring(0, 7)}`,
           commitId: cell.dataset.commit,
-          version: state.currentVersion
+          version: this.version || state.activeVersion()
         });
       }
     });

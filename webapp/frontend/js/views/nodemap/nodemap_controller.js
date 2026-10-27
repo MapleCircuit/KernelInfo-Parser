@@ -37,6 +37,8 @@ export class NodeMapController {
 
   render(containerEl, tabData) {
     this.containerEl = containerEl;
+    // Everything this canvas looks up and opens follows its own tab's revision
+    this.currentVersion = tabData?.version || state.currentVersion;
 
     containerEl.innerHTML = `
       <div class="nodemap-container">
@@ -449,19 +451,19 @@ export class NodeMapController {
     if (node.expanded && (!node.constituents || node.constituents.length === 0)) {
       try {
         if (node.astId) {
-          const res = await api.getAstTree(state.currentVersion, node.astId);
+          const res = await api.getAstTree(this.currentVersion, node.astId);
           const children = res.node?.children || res.children || [];
           node.constituents = children.map((c) => ({ name: c.spelling || c.name || c.type_name }));
         } else if (node.title) {
           const cleanName = node.title.replace(/^struct\s+/, "").replace(/\(\)$/, "").trim();
           if (node.type === "struct" || node.title.startsWith("struct")) {
-            const res = await api.getPaholeLayout(state.currentVersion, cleanName);
+            const res = await api.getPaholeLayout(this.currentVersion, cleanName);
             if (res && Array.isArray(res.members) && res.members.length > 0) {
               node.constituents = res.members.map((m) => ({ name: `${m.type} ${m.name}` }));
             }
           }
           if (!node.constituents || node.constituents.length === 0) {
-            const detail = await api.getSymbolDetail(state.currentVersion, cleanName);
+            const detail = await api.getSymbolDetail(this.currentVersion, cleanName);
             if (detail && Array.isArray(detail.members) && detail.members.length > 0) {
               node.constituents = detail.members.map((m) => ({ name: m.name || m.spelling }));
             }
@@ -731,7 +733,7 @@ export class NodeMapController {
 
   exportJSON() {
     const data = {
-      version: state.currentVersion,
+      version: this.currentVersion || state.currentVersion,
       nodes: this.nodes.map((n) => n.toJSON()),
       edges: this.edges.map((e) => e.toJSON())
     };

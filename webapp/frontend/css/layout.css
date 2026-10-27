@@ -402,6 +402,33 @@
   color: var(--text-muted);
 }
 
+/* Apply / New Tab: the header selection only takes effect through these (see webapp/API.md 5.13) */
+.version-apply-btn,
+.version-newtab-btn {
+  padding: 2px 8px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-color);
+  background: var(--bg-primary);
+  color: var(--text-secondary);
+  font-size: 11px;
+  font-weight: 600;
+  transition: var(--transition-fast);
+}
+
+.version-apply-btn:hover,
+.version-newtab-btn:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+  border-color: var(--border-focus);
+}
+
+/* Highlighted while the selection differs from the current tab's revision */
+.version-apply-btn.pending {
+  background: rgba(88, 166, 255, 0.15);
+  color: var(--accent-blue);
+  border-color: var(--accent-blue);
+}
+
 /* Git reference picker popover (tags + commits) */
 .ref-picker {
   position: fixed;

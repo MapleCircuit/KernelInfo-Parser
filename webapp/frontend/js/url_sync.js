@@ -36,9 +36,11 @@ class UrlSynchronizer {
       const file = params.get("file");
       const line = parseInt(params.get("line") || "1", 10);
       const arch = params.get("arch") || "x86_64";
+      const dir = params.get("dir") || "";
       const cfg = params.get("cfg") || ""; // named copy of that ARCH's configuration, if any
 
-      if (v) state.setVersion(v);
+      // Restoring a revision from the hash selects it in the header; the tab opened below carries it
+      if (v) state.setSelectedVersion(v);
 
       if (tabType === "code" && file) {
         state.openTab({
@@ -54,6 +56,13 @@ class UrlSynchronizer {
           title: `KConfig (${arch})${cfg ? ` · ${cfg}` : ""}`,
           arch,
           configName: cfg,
+          version: v || state.currentVersion
+        });
+      } else if (tabType === "explorer") {
+        state.openTab({
+          type: "explorer",
+          title: dir ? dir.split("/").pop() : `Explorer ${v || state.currentVersion}`,
+          path: dir,
           version: v || state.currentVersion
         });
       } else if (tabType === "nodemap") {
@@ -83,6 +92,8 @@ class UrlSynchronizer {
       if (activeTab.cursorLine && activeTab.cursorLine > 1) {
         params.set("line", activeTab.cursorLine);
       }
+    } else if (activeTab.type === "explorer") {
+      if (activeTab.path) params.set("dir", activeTab.path);
     } else if (activeTab.type === "kconfig" && activeTab.arch) {
       params.set("arch", activeTab.arch);
       if (activeTab.configName) params.set("cfg", activeTab.configName);

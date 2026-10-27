@@ -54,10 +54,13 @@ export class VirtualEditor {
     this.buildToken = 0;
     // Tab this view renders (one view per code tab, built by TabsComponent)
     this.tabId = null;
+    // KConfig engine this tab follows ("" = none); picked in the toolbar, kept on the tab
+    this.engineTabId = "";
 
-    // Every change to the KConfig engine or its configuration changes which lines are compiled out
-    // and whether the file is compiled at all, so this tab recomputes both. A tab that is not on
-    // screen does nothing here: showing it re-renders it, which recomputes them from scratch.
+    // Every change to the KConfig engine this tab follows, or to its configuration, changes which
+    // lines are compiled out and whether the file is compiled at all, so this tab recomputes both.
+    // A tab that is not on screen does nothing here: showing it re-renders it, which recomputes
+    // them from scratch.
     const refreshDimming = () => {
       if (!this.isLive() || !this.rawLines.length) return;
       this.computeDimming();
@@ -65,9 +68,18 @@ export class VirtualEditor {
       this.refreshBuildBanner();
     };
     this.unsubscribers = [
-      state.subscribe("kconfig:engine:changed", refreshDimming),
-      state.subscribe("kconfig:assignments:updated", refreshDimming),
-      state.subscribe("kconfig:assignment:changed", refreshDimming),
+      state.subscribe("kconfig:engine:changed", () => {
+        if (!this.isLive()) return;
+        // An engine this tab followed may be gone, and a new one may now match its revision
+        this.resolveEngineSelection();
+        this.updateEngineButton();
+        refreshDimming();
+      }),
+      state.subscribe("kconfig:assignments:updated", ({ tabId } = {}) => {
+        if (tabId && tabId !== this.engineTabId) return;
+        this.updateEngineButton();
+        refreshDimming();
+      }),
       state.subscribe("code:dim-suspended", () => {
         if (!this.isLive()) return;
         const chip = this.containerEl?.querySelector("#kconfig-dim-chip");
@@ -75,6 +87,110 @@ export class VirtualEditor {
         this.updateVisibleLines();
       }),
     ];
+  }
+
+  /**
+   * Which engine this tab follows. A tab the user never set one on follows the first engine of its
+   * own revision, and none when no engine runs on that revision (it is then set by hand in the
+   * toolbar). A tab whose engine was picked by hand keeps that choice until that engine stops
+   * running, at which point it falls back to the same default.
+   */
+  resolveEngineSelection() {
+    const tab = state.findTab(this.tabId) || this.tabData;
+    const picked = tab ? tab.kconfigEngineTabId : undefined;
+    if (tab?.kconfigEngineUserPicked && (picked === "" || state.isKconfigEngineOwner(picked))) {
+      this.engineTabId = picked;
+      return this.engineTabId;
+    }
+    this.engineTabId = state.defaultEngineTabIdFor(tab);
+    if (tab) {
+      tab.kconfigEngineTabId = this.engineTabId;
+      delete tab.kconfigEngineUserPicked; // the engine it was set to is gone
+      state.saveState();
+    }
+    return this.engineTabId;
+  }
+
+  /** Follow another engine (or none) for this file only. */
+  setEngineSelection(engineTabId) {
+    const next = engineTabId && state.isKconfigEngineOwner(engineTabId) ? engineTabId : "";
+    this.engineTabId = next;
+    const tab = state.findTab(this.tabId) || this.tabData;
+    if (tab) {
+      tab.kconfigEngineTabId = next;
+      tab.kconfigEngineUserPicked = true; // a choice by hand outlives new engines appearing
+      state.saveState();
+    }
+    this.buildCond = null; // its ARCH decides the Kbuild condition
+    this.updateEngineButton();
+    if (this.rawLines.length) {
+      this.computeDimming();
+      this.updateVisibleLines();
+      this.refreshBuildBanner();
+    }
+    const engine = state.kconfigEngineList().find((e) => e.tabId === next);
+    toast.info(engine
+      ? `This file follows ${engine.title} (ARCH=${engine.arch} @ ${engine.version})`
+      : "This file follows no KConfig engine: no #ifdef dimming or build banner");
+  }
+
+  /** Label and tooltip of the toolbar's engine selector. */
+  updateEngineButton() {
+    const btn = this.containerEl?.querySelector("#btn-kconfig-engine");
+    if (!btn) return;
+    const engines = state.kconfigEngineList();
+    const engine = engines.find((e) => e.tabId === this.engineTabId);
+    btn.classList.toggle("active", Boolean(engine));
+    btn.textContent = engine ? `⚙ ${engine.arch}${engine.configName ? ` · ${engine.configName}` : ""} ▾` : "⚙ No engine ▾";
+    btn.title = engine
+      ? `This file follows ${engine.title} (ARCH=${engine.arch} @ ${engine.version}, ${engine.symbols} symbols${engine.resolved ? "" : " — not a resolved configuration yet"}).\nClick to follow another KConfig engine.`
+      : `${engines.length ? `${engines.length} KConfig engine(s) running` : "No KConfig engine is running"}: this file is shown without #ifdef dimming or build banner.\nClick to pick one.`;
+  }
+
+  /** Popover listing the running KConfig engines (plus "No engine") for this file. */
+  showEnginePicker(anchorEl) {
+    const existing = document.getElementById("code-engine-picker");
+    if (existing) {
+      existing.remove();
+      return;
+    }
+    const engines = state.kconfigEngineList();
+    const pop = document.createElement("div");
+    pop.id = "code-engine-picker";
+    pop.className = "engine-picker";
+    const rect = anchorEl.getBoundingClientRect();
+    pop.style.top = `${rect.bottom + 6}px`;
+    pop.style.left = `${Math.max(8, Math.min(rect.left, window.innerWidth - 328))}px`;
+    const rows = engines.map((e) => `
+      <div class="engine-picker-item ${e.tabId === this.engineTabId ? "current" : ""}" data-engine="${escapeHtml(e.tabId)}">
+        <span class="engine-picker-title">${escapeHtml(e.title)}</span>
+        <span class="engine-picker-meta">ARCH=${escapeHtml(e.arch)} · ${escapeHtml(e.version)}${e.version === this.currentVersion ? "" : " (other revision)"} · ${e.symbols} symbols${e.resolved ? "" : " · unresolved"}</span>
+      </div>`).join("");
+    pop.innerHTML = `
+      <div class="engine-picker-header">KConfig engine for this file</div>
+      <div class="engine-picker-list">
+        <div class="engine-picker-item ${this.engineTabId ? "" : "current"}" data-engine="">
+          <span class="engine-picker-title">No engine</span>
+          <span class="engine-picker-meta">No #ifdef dimming, no build banner</span>
+        </div>
+        ${rows || `<div class="engine-picker-empty">No KConfig tab runs its engine. Open a KConfig tab and press <strong>⚡ Enable Engine</strong>.</div>`}
+      </div>`;
+    document.body.appendChild(pop);
+
+    const close = () => {
+      pop.remove();
+      document.removeEventListener("mousedown", outside);
+    };
+    const outside = (e) => {
+      if (!pop.contains(e.target) && !anchorEl.contains(e.target)) close();
+    };
+    setTimeout(() => document.addEventListener("mousedown", outside), 0);
+    pop.querySelectorAll(".engine-picker-item").forEach((row) => {
+      row.onclick = () => {
+        close();
+        this.setEngineSelection(row.dataset.engine);
+      };
+    });
   }
 
   /** Compiled-out lines shown undimmed; the choice is shared by every code tab. */
@@ -95,6 +211,10 @@ export class VirtualEditor {
   dispose() {
     (this.unsubscribers || []).forEach((off) => off());
     this.unsubscribers = [];
+    this.resizeObserver?.disconnect();
+    this.resizeObserver = null;
+    clearTimeout(this._saveScrollTimer);
+    this._saveScrollTimer = null;
     this.containerEl = null;
     this.linesContainer = null;
     this.rawLines = [];
@@ -102,7 +222,7 @@ export class VirtualEditor {
 
   /** #ifdef dimming is only active while the Kconfig engine is enabled with a resolved configuration. */
   dimmingAvailable() {
-    return state.kconfigConfigActive() && PREPROCESSED_RE.test(this.currentFilePath || "");
+    return state.kconfigConfigActive(this.engineTabId) && PREPROCESSED_RE.test(this.currentFilePath || "");
   }
 
   computeDimming() {
@@ -112,7 +232,7 @@ export class VirtualEditor {
       if (chip) chip.style.display = "none";
       return;
     }
-    const ctx = state.definitionContext();
+    const ctx = state.definitionContext(this.engineTabId);
     this.directiveEvaluator.setAssignments(ctx.assignments);
     this.directiveEvaluator.setMacros(archMacros(ctx.arch, ctx.assignments));
     this.dimmedLines = this.directiveEvaluator.evaluateDimmedLines(this.rawLines);
@@ -148,11 +268,11 @@ export class VirtualEditor {
     const banner = this.containerEl?.querySelector("#code-build-banner");
     if (!banner) return;
     const path = this.currentFilePath || "";
-    if (!state.kconfigConfigActive() || this.isDoc || !BUILD_TRACKED_RE.test(path)) {
+    if (!state.kconfigConfigActive(this.engineTabId) || this.isDoc || !BUILD_TRACKED_RE.test(path)) {
       banner.hidden = true;
       return;
     }
-    const ctx = state.definitionContext();
+    const ctx = state.definitionContext(this.engineTabId);
     const key = `${this.currentVersion}|${ctx.arch}|${path}`;
     if (this.buildCond?.key !== key) {
       const token = ++this.buildToken;
@@ -201,6 +321,8 @@ export class VirtualEditor {
     this.tabData = tabData;
     this.tabId = tabData.id || null;
     this.containerEl = containerEl;
+    // Which KConfig engine this file follows (the first one of this revision by default, else none)
+    this.resolveEngineSelection();
     this.currentFilePath = tabData.path;
     this.currentVersion = tabData.version || state.currentVersion;
     this.targetCursorLine = tabData.cursorLine || 1;
@@ -216,17 +338,18 @@ export class VirtualEditor {
     }
     this.docMode = this.isDoc ? tabData.docMode : "source";
 
+    // Every segment of the path opens the repository explorer of this revision on that directory
     const pathParts = (this.currentFilePath || "").split("/").filter(Boolean);
-    let breadcrumbsHtml = `<span class="breadcrumb-item">${this.currentVersion}</span>`;
+    let breadcrumbsHtml = `<span class="breadcrumb-item breadcrumb-dir" data-path="" title="Browse ${escapeHtml(this.currentVersion)} in a repository explorer">${escapeHtml(this.currentVersion)}</span>`;
     let accumPath = "";
     pathParts.forEach((part, idx) => {
       accumPath += (accumPath ? "/" : "") + part;
       const isLast = idx === pathParts.length - 1;
       breadcrumbsHtml += `<span class="breadcrumb-sep">&gt;</span>`;
       if (isLast) {
-        breadcrumbsHtml += `<span class="breadcrumb-item active" style="font-weight:500;">${part}</span>`;
+        breadcrumbsHtml += `<span class="breadcrumb-item active" style="font-weight:500;">${escapeHtml(part)}</span>`;
       } else {
-        breadcrumbsHtml += `<span class="breadcrumb-item breadcrumb-dir" data-path="${accumPath}" style="cursor:pointer;color:var(--accent-blue);">${part}</span>`;
+        breadcrumbsHtml += `<span class="breadcrumb-item breadcrumb-dir" data-path="${escapeHtml(accumPath)}" title="Browse ${escapeHtml(accumPath)} in a repository explorer" style="cursor:pointer;color:var(--accent-blue);">${escapeHtml(part)}</span>`;
       }
     });
 
@@ -244,8 +367,9 @@ export class VirtualEditor {
               <button data-diffnav="-1" title="Previous change">↑</button><button data-diffnav="1" title="Next change">↓</button><button data-diffnav="0" title="Clear change markers">✕</button>
             </span>` : ""}
             <span id="file-last-changed" class="code-last-changed" style="display:none;font-size:11px;color:var(--text-muted);margin-right:8px;padding:3px 8px;background:var(--bg-tertiary);border-radius:4px;border:1px solid var(--border-color);align-items:center;gap:4px;cursor:pointer;" title="Click to view full commit history"></span>
-            <button class="code-btn" id="btn-file-history" title="View commit history for this file">📜 File History</button>
-            <button class="code-btn" id="btn-toggle-blame">Git Blame</button>
+            <button class="code-btn" id="btn-kconfig-engine" title="KConfig engine this file follows"></button>
+            <button class="code-btn" id="btn-file-history" title="View commit history for this file">📜 History</button>
+            <button class="code-btn" id="btn-toggle-blame" title="Annotate every line with the commit that last changed it">Blame</button>
             <button class="code-btn" id="btn-copy-raw">Copy File</button>
             <button class="code-btn" id="btn-create-patch" title="Edit this file and generate a git format-patch">✎ Patch</button>
           </div>
@@ -265,12 +389,22 @@ export class VirtualEditor {
       </div>
     `;
 
-    // Clickable breadcrumb segments reveal directories in sidebar explorer
+    // Clicking the path opens a full-tab repository explorer on that directory, same revision
     containerEl.querySelectorAll(".breadcrumb-dir").forEach((el) => {
-      el.onclick = () => {
-        state.emit("explorer:reveal", el.dataset.path);
-        toast.info(`Revealing ${el.dataset.path} in file explorer`);
-      };
+      const open = (forceNew) => state.openTab({
+        type: "explorer",
+        title: el.dataset.path ? el.dataset.path.split("/").pop() : `Explorer ${this.currentVersion}`,
+        path: el.dataset.path,
+        version: this.currentVersion,
+        forceNew,
+      });
+      el.onclick = () => open(false);
+      el.addEventListener("auxclick", (e) => {
+        if (e.button !== 1) return;
+        e.preventDefault();
+        e.stopPropagation();
+        open(true);
+      });
     });
 
     this.viewportEl = containerEl.querySelector("#editor-viewport");
@@ -284,6 +418,13 @@ export class VirtualEditor {
 
     // Toolbar actions
     containerEl.querySelector("#kconfig-dim-chip").onclick = () => this.toggleDimSuspended();
+
+    const engineBtn = containerEl.querySelector("#btn-kconfig-engine");
+    this.updateEngineButton();
+    engineBtn.onclick = (e) => {
+      e.stopPropagation();
+      this.showEnginePicker(engineBtn);
+    };
 
     const docToggle = containerEl.querySelector("#btn-doc-toggle");
     if (docToggle) {
@@ -456,11 +597,28 @@ export class VirtualEditor {
       });
     });
 
-    // Viewport scrolling
+    // Viewport scrolling: the position is kept on the tab, so coming back lands where it was left
     this.viewportEl.addEventListener("scroll", () => {
       this.updateVisibleLines();
       this.updateMinimapSlider();
+      this.rememberScrollPosition();
     });
+
+    // The minimap is to scale with the document, so clicking or dragging it scrolls there
+    this.attachMinimapScrubbing();
+
+    // A split, a resized window or a toggled sidebar changes the minimap's scale (one observer per
+    // render: the previous one watched the element this render just replaced)
+    this.resizeObserver?.disconnect();
+    if (typeof ResizeObserver === "function") {
+      this.resizeObserver = new ResizeObserver(() => {
+        if (!this.isLive() || !this.rawLines.length) return;
+        this.renderMinimap();
+        this.updateMinimapSlider();
+        this.updateVisibleLines();
+      });
+      this.resizeObserver.observe(containerEl.querySelector(".editor-body"));
+    }
 
     // Load file content from API
     await this.loadFileContent();
@@ -561,13 +719,18 @@ export class VirtualEditor {
       const totalHeight = this.rawLines.length * ROW_HEIGHT;
       this.spacerEl.style.height = `${totalHeight}px`;
 
-      // Jump to target cursor line if specified
-      if (this.targetCursorLine > 1) {
+      // Come back where the tab was left, unless a specific line was requested (navigation drops
+      // the saved position, see state.openTab)
+      const savedTop = Number(this.tabData?.scrollTop);
+      if (Number.isFinite(savedTop) && savedTop > 0) {
+        this.viewportEl.scrollTop = Math.min(savedTop, Math.max(0, totalHeight - this.viewportEl.clientHeight));
+      } else if (this.targetCursorLine > 1) {
         this.viewportEl.scrollTop = Math.max(0, (this.targetCursorLine - 5) * ROW_HEIGHT);
       }
 
       this.updateVisibleLines();
       this.renderMinimap();
+      this.updateMinimapSlider();
     } catch (err) {
       this.linesContainer.innerHTML = `
         <div style="padding:20px;color:var(--accent-red);">
@@ -646,6 +809,7 @@ export class VirtualEditor {
     this.tabData.cursorLine = target[0];
     this.viewportEl.scrollTop = Math.max(0, (target[0] - 5) * ROW_HEIGHT);
     this.updateVisibleLines();
+    this.rememberScrollPosition();
   }
 
   updateVisibleLines() {
@@ -682,53 +846,114 @@ export class VirtualEditor {
     this.linesContainer.innerHTML = html;
   }
 
+  /** Remember where this tab is scrolled to, so selecting it again comes back to that position. */
+  rememberScrollPosition() {
+    if (!this.tabData || !this.viewportEl) return;
+    const top = Math.round(this.viewportEl.scrollTop);
+    if (this.tabData.scrollTop === top) return;
+    this.tabData.scrollTop = top;
+    // The position is written on every scroll, so persisting is throttled to one write per idle frame
+    if (this._saveScrollTimer) return;
+    this._saveScrollTimer = setTimeout(() => {
+      this._saveScrollTimer = null;
+      state.saveState();
+    }, 400);
+  }
+
+  /** Document height the minimap maps, and the height it is drawn at (never taller than its track). */
+  minimapMetrics() {
+    const totalLines = this.rawLines.length;
+    const trackH = (this.minimapCanvas?.parentElement?.clientHeight) || 0;
+    if (!totalLines || !trackH) return null;
+    // One pixel per line at most: the drawing is exactly as deep as the file is long
+    const lineScale = Math.min(1, trackH / totalLines);
+    return {
+      totalLines,
+      trackH,
+      lineScale,
+      mapH: Math.min(trackH, totalLines * lineScale),
+      docH: totalLines * ROW_HEIGHT,
+      viewportH: this.viewportEl?.clientHeight || 0,
+    };
+  }
+
   renderMinimap() {
     if (!this.minimapCanvas) return;
     const canvas = this.minimapCanvas;
-    const ctx = canvas.getContext("2d");
+    const m = this.minimapMetrics();
     const w = canvas.parentElement.clientWidth || 90;
     const h = canvas.parentElement.clientHeight || 600;
 
     canvas.width = w;
     canvas.height = h;
 
+    const ctx = canvas.getContext("2d");
     ctx.clearRect(0, 0, w, h);
+    if (!m) return;
     ctx.fillStyle = "rgba(139, 148, 158, 0.4)";
 
-    const totalLines = this.rawLines.length;
-    if (totalLines === 0) return;
-
-    const lineScale = Math.min(1, h / totalLines);
-
-    for (let i = 0; i < totalLines; i++) {
+    for (let i = 0; i < m.totalLines; i++) {
       const len = Math.min(w - 10, (this.rawLines[i] || "").length * 0.8);
       if (len > 0) {
-        ctx.fillRect(4, i * lineScale, len, Math.max(1, lineScale));
+        ctx.fillRect(4, i * m.lineScale, len, Math.max(1, m.lineScale));
       }
     }
 
     if (this.diffMarks) {
       ctx.fillStyle = this.diffMarks.kind === "del" ? "rgba(248, 81, 73, 0.9)" : "rgba(63, 185, 80, 0.9)";
       for (const [a, b] of this.diffMarks.ranges) {
-        ctx.fillRect(0, (a - 1) * lineScale, 4, Math.max(2, (b - a + 1) * lineScale));
+        ctx.fillRect(0, (a - 1) * m.lineScale, 4, Math.max(2, (b - a + 1) * m.lineScale));
       }
+    }
+
+    // Below the last line the minimap shows nothing, so the track is marked as not part of the file
+    if (m.mapH < h) {
+      ctx.fillStyle = "rgba(0, 0, 0, 0.18)";
+      ctx.fillRect(0, m.mapH, w, h - m.mapH);
     }
   }
 
+  /**
+   * The slider covers the lines the viewport shows, on the same scale as the drawing: at the bottom
+   * of the file its lower edge meets the last line instead of running past it.
+   */
   updateMinimapSlider() {
-    const slider = document.getElementById("minimap-slider");
-    if (!slider || !this.viewportEl) return;
+    const slider = this.containerEl?.querySelector("#minimap-slider");
+    const m = this.minimapMetrics();
+    if (!slider || !m) return;
 
-    const totalHeight = this.rawLines.length * ROW_HEIGHT;
-    if (totalHeight === 0) return;
+    const maxScroll = Math.max(0, m.docH - m.viewportH);
+    const sliderH = Math.max(12, Math.min(m.mapH, (m.viewportH / m.docH) * m.mapH));
+    const progress = maxScroll > 0 ? Math.min(1, this.viewportEl.scrollTop / maxScroll) : 0;
 
-    const viewportH = this.viewportEl.clientHeight || 600;
-    const containerH = slider.parentElement.clientHeight || 600;
+    slider.style.height = `${sliderH}px`;
+    slider.style.top = `${progress * (m.mapH - sliderH)}px`;
+  }
 
-    const topPct = this.viewportEl.scrollTop / totalHeight;
-    const heightPct = Math.min(1, viewportH / totalHeight);
-
-    slider.style.top = `${topPct * containerH}px`;
-    slider.style.height = `${Math.max(12, heightPct * containerH)}px`;
+  /** Click or drag the minimap to scroll the file (the y position maps back to the document). */
+  attachMinimapScrubbing() {
+    const track = this.minimapCanvas?.parentElement;
+    if (!track) return;
+    const scrollToY = (clientY) => {
+      const m = this.minimapMetrics();
+      if (!m) return;
+      const rect = track.getBoundingClientRect();
+      const sliderH = Math.max(12, Math.min(m.mapH, (m.viewportH / m.docH) * m.mapH));
+      const span = Math.max(1, m.mapH - sliderH);
+      const y = Math.min(Math.max(clientY - rect.top - sliderH / 2, 0), span);
+      this.viewportEl.scrollTop = (y / span) * Math.max(0, m.docH - m.viewportH);
+    };
+    const onMove = (e) => scrollToY(e.clientY);
+    const onUp = () => {
+      document.removeEventListener("mousemove", onMove);
+      document.removeEventListener("mouseup", onUp);
+    };
+    track.addEventListener("mousedown", (e) => {
+      if (e.button !== 0) return;
+      e.preventDefault();
+      scrollToY(e.clientY);
+      document.addEventListener("mousemove", onMove);
+      document.addEventListener("mouseup", onUp);
+    });
   }
 }

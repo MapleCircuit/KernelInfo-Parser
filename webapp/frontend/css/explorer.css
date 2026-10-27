@@ -1,0 +1,132 @@
+/* explorer.css - Full-tab repository explorer (views/explorer/explorer_view.js) */
+
+.explorer-container {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  overflow: hidden;
+  background: var(--bg-primary);
+}
+
+.explorer-toolbar {
+  min-height: 32px;
+  background: var(--bg-secondary);
+  border-bottom: 1px solid var(--border-color);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 4px 12px;
+  font-family: var(--font-sans);
+  font-size: 11px;
+}
+
+.explorer-breadcrumbs {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  overflow: hidden;
+  white-space: nowrap;
+  color: var(--text-secondary);
+}
+
+.explorer-crumb-ref {
+  font-family: var(--font-mono);
+  color: var(--accent-orange);
+  font-weight: 600;
+}
+
+.explorer-crumb {
+  color: var(--accent-blue);
+  cursor: pointer;
+}
+
+.explorer-crumb:hover {
+  text-decoration: underline;
+}
+
+.explorer-crumb.active {
+  color: var(--text-primary);
+  font-weight: 600;
+  cursor: default;
+}
+
+.explorer-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+.explorer-filter {
+  width: 200px;
+  padding: 2px 8px;
+  font-size: 11px;
+  background: var(--bg-primary);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-sm);
+  color: var(--text-primary);
+}
+
+.explorer-listing {
+  flex: 1;
+  overflow-y: auto;
+}
+
+.explorer-row {
+  display: grid;
+  grid-template-columns: 24px 1fr 180px;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 16px;
+  border-bottom: 1px solid var(--border-color);
+  cursor: pointer;
+  font-size: 12px;
+}
+
+.explorer-row:hover {
+  background: var(--bg-hover);
+}
+
+.explorer-icon {
+  text-align: center;
+}
+
+.explorer-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-primary);
+}
+
+.explorer-name.dir {
+  color: var(--accent-blue);
+  font-weight: 600;
+}
+
+.explorer-meta {
+  font-size: 10px;
+  color: var(--text-muted);
+  text-align: right;
+  font-family: var(--font-mono);
+}
+
+.explorer-status {
+  border-top: 1px solid var(--border-color);
+  background: var(--bg-secondary);
+  padding: 4px 12px;
+  font-size: 10px;
+  color: var(--text-muted);
+}
+
+.explorer-empty,
+.explorer-error {
+  padding: 24px 16px;
+  text-align: center;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.explorer-error {
+  color: var(--accent-red);
+}

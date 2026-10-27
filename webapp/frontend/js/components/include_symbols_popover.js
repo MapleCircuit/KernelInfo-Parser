@@ -90,7 +90,7 @@ export class IncludeSymbolsPopover {
             title: hFile.split("/").pop(),
             path: hFile,
             cursorLine: 1,
-            version: state.currentVersion,
+            version: this.includeInfo.version || state.activeVersion(),
           });
           toast.success(`Opened header: ${hFile}`);
         }
@@ -244,7 +244,7 @@ export class IncludeSymbolsPopover {
         title: targetFile.split("/").pop(),
         path: targetFile,
         cursorLine: line,
-        version: state.currentVersion,
+        version: this.includeInfo.version || state.activeVersion(),
         forceNew: Boolean(forceNew),
       });
       toast.success(`Jumped to ${sym.name} in ${targetFile}:${line}`);
