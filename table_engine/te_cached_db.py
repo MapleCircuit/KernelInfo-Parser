@@ -67,6 +67,9 @@ class TECachedDB(TEDirectDB):
         self._cached_rows_pos: dict[int, dict[Any, int]] = {}
         self._pk_index: dict[int, dict[Any, tuple[SafeDataType, ...]]] = {}
         self._nodup_index: dict[int, dict[tuple[SafeDataType, ...], int]] = {}
+        # No-duplicate tables whose _nodup_index holds every row the database has (preloaded and indexed
+        # since): a key they miss is new, so it needs no lookup (`_committed_nodup_id()`).
+        self._nodup_complete: set[int] = set()
         self._col_indices: dict[int, dict[int, dict[SafeDataType, list[tuple[SafeDataType, ...]]]]] = {}
         self.update_in_mem_indexes: bool = True
         self._shared_buffer: Any | None = None
@@ -272,6 +275,7 @@ class TECachedDB(TEDirectDB):
         self._cached_rows_pos.clear()
         self._pk_index.clear()
         self._nodup_index.clear()
+        self._nodup_complete.clear()
         self._col_indices.clear()
         self._shared_buffer = None
         self._preload_window.clear()
@@ -445,6 +449,9 @@ class TECachedDB(TEDirectDB):
                     vid_col = self._get_vid_col_idx(table) if getattr(table, "version_scoped", False) else None
                     if vid_col is not None:
                         self._preload_window[table_id] = (vid_col, min_vid or 0)
+                    if table.no_duplicate and not is_v_scoped:
+                        # The query returned every row, so the index below answers every deduplication key
+                        self._nodup_complete.add(table_id)
 
                 if raw_rows:
                     is_partial_query = (
@@ -591,8 +598,7 @@ class TECachedDB(TEDirectDB):
 
         # 2. Deduplication Key Fast-Path (no_duplicate=True)
         if table.no_duplicate and len(columns) > 1 and all(c is not None for c in columns[1:]):
-            nodup_key = self._sanitize_key(columns[1:])
-            assigned_id = self._nodup_index[table_id].get(nodup_key)
+            assigned_id = self._committed_nodup_id(table_id, columns)
             if assigned_id is not None:
                 row = (assigned_id, *columns[1:])
                 if self._match_columns(table, row, columns):
@@ -660,6 +666,30 @@ class TECachedDB(TEDirectDB):
 
         return None
 
+    def _committed_nodup_id(self, table_id: int, columns: tuple[SafeDataType, ...]) -> int | None:
+        """The id a no-duplicate key already has in the database, or None when the key is new.
+
+        The in-memory indices answer this while they hold every row of the table. Once they were purged
+        (`clear_cache()`, `commit(update_in_mem_indexes=False)`), a key they miss is resolved with one
+        targeted read and memoized in `_committed_nodup_keys`, so staging it cannot mint a second id for
+        content the database already stores (duplicate m_file_name rows, m_file_blob unique-key violations).
+        """
+        key = self._sanitize_key(columns[1:])
+        assigned_id = self._nodup_index.get(table_id, {}).get(key)
+        if assigned_id is None:
+            assigned_id = self._committed_nodup_keys.get(table_id, {}).get(key)
+        if assigned_id is not None:
+            return assigned_id
+        if table_id in self._nodup_complete or self.db is None:
+            return None
+        table = self.tables[table_id]
+        filter_cols = (None, *columns[1:]) + (None,) * (table.length - len(columns))
+        row = self._db_read((table_id,), self.db.select, table, filter_cols)
+        if not row:
+            return None
+        self._committed_nodup_keys.setdefault(table_id, {})[key] = row[0]
+        return row[0]
+
     def _miss_is_final(self, table_id: int, columns: tuple[SafeDataType, ...], pk: Any) -> bool:
         """Whether a primary-key miss needs no database read: the key's version is inside the preloaded window,
         whose rows are all cached or staged, and it is not a row committed and evicted from the heap since.
@@ -698,6 +728,11 @@ class TECachedDB(TEDirectDB):
         if not self.update_in_mem_indexes:
             # Not indexed: the cache no longer holds every row of the window
             self._preload_window.pop(table_id, None)
+            if table.no_duplicate and len(columns) > 1 and all(c is not None for c in columns[1:]):
+                # Staging is not indexed, but a key the database already has must still resolve to its row
+                existing_id = self._committed_nodup_id(table_id, columns)
+                if existing_id is not None:
+                    return (existing_id, *columns[1:])
             if table.primary and not table.no_duplicate and columns[0] is not None:
                 pk_fn = self._pk_getters.get(table_id)
                 pk = self._sanitize_key(pk_fn(columns) if pk_fn is not None else itemgetter(*table.primary)(columns))
@@ -720,6 +755,14 @@ class TECachedDB(TEDirectDB):
             staged_id = self.queued_set[table_id].get(key)
             if staged_id is not None:
                 return (staged_id, *columns[1:])
+
+            committed_id = self._committed_nodup_id(table_id, columns)
+            if committed_id is not None:
+                # Already in the database although the index misses it (the cache was purged): cache that row
+                # instead of minting a second id for the same key
+                row = (committed_id, *columns[1:])
+                self._cache_row(table, self._project_row(table, row))
+                return row
 
             if columns[0] is not None:
                 assigned_id = columns[0]
@@ -892,6 +935,7 @@ class TECachedDB(TEDirectDB):
             self._cached_rows_pos.pop(table_id, None)
             self._pk_index.pop(table_id, None)
             self._nodup_index.pop(table_id, None)
+            self._nodup_complete.discard(table_id)
             self._col_indices.pop(table_id, None)
             self._attach_carried_views()
         elif update_in_mem_indexes and table_id in self.tables:

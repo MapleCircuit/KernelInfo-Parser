@@ -6,11 +6,17 @@
  * every edit goes through kconfig's own setters, so only valid configurations can be produced and
  * exported. With the engine off, values are edited raw (no constraints) for exploration.
  *
- * One configuration is kept per "version|ARCH" profile (state.kconfigProfiles); the active one is
- * published as state.kconfigAssignments for #ifdef dimming in code views.
+ * One configuration is kept per "version|ARCH" profile (state.kconfigProfiles), plus one per named
+ * copy ("version|ARCH|name", **Duplicate** / **Rename…**), so several configurations of the same
+ * ARCH and revision can be kept and compared side by side. The active one is published as
+ * state.kconfigAssignments for #ifdef dimming in code views.
+ *
+ * The engine is off by default and belongs to a single KConfig tab at a time (state.kconfigEngineTabId):
+ * enabling it in another tab asks whether to move it, so two configurations are never resolved at once.
+ * Disabling it keeps every value (the tab's profile is untouched; editing just stops being constrained).
  */
 import { api } from "../../api.js";
-import { state } from "../../state.js";
+import { state, kconfigProfileKey } from "../../state.js";
 import { toast } from "../../components/toast.js";
 import { KconfigEngine } from "./kconfig_engine.js";
 import { KconfigParser } from "./kconfig_parser.js";
@@ -36,18 +42,65 @@ export class KconfigView {
     this.detailToken = 0;
     // Raw assignments (bare names) while the engine is off; resolved values while it is on
     this.rawValues = {};
+    // Tab currently rendered by this view, and whether the engine change in flight is its own
+    this.tabId = null;
+    // Name telling this configuration apart from other copies of the same revision and ARCH
+    this.configName = "";
+    this.selfEngineChange = false;
+
+    // The engine can be moved or switched off elsewhere (another tab, the command palette, a tab
+    // being closed): follow it so the toolbar and the tree never claim an engine this tab lost.
+    this.unsubscribeEngine = state.subscribe("kconfig:engine:changed", () => {
+      if (this.selfEngineChange) return;
+      if (!this.containerEl || !this.containerEl.isConnected) return;
+      if (!state.findTab(this.tabId)) return; // this tab is being closed
+      this.followEngineChange();
+    });
+
+    // The command palette asks a tab to take the engine; taking it goes through the same dialog
+    this.unsubscribeEngineRequest = state.subscribe("kconfig:engine:requested", (tabId) => {
+      if (tabId !== this.tabId) return;
+      if (!this.containerEl || !this.containerEl.isConnected) return;
+      if (!state.takeKconfigEngineRequest(tabId)) return;
+      this.setEngineActive(true);
+    });
   }
 
-  /** The engine switch is global so code views can gate #ifdef dimming on it. */
+  /** Called when this tab is closed (TabsComponent.pruneTabViews). */
+  dispose() {
+    if (this.unsubscribeEngine) this.unsubscribeEngine();
+    if (this.unsubscribeEngineRequest) this.unsubscribeEngineRequest();
+    this.unsubscribeEngine = null;
+    this.unsubscribeEngineRequest = null;
+    this.containerEl = null;
+  }
+
+  /** The engine was switched off or moved by something other than this view. */
+  async followEngineChange() {
+    // Gaining it resolves this tab's values, so it is confirmed like the toolbar button (§5.0)
+    if (this.engineActive && this.engine.loaded && !(await this.confirmEngineResolution())) {
+      state.setKconfigEngineOwner(null);
+      toast.info("Engine left off: the configuration is unchanged");
+      return;
+    }
+    this.applyEngineState({ announce: false });
+  }
+
+  /** Whether the engine is enabled for this tab (only one tab may hold it; off by default). */
   get engineActive() {
-    return state.kconfigEngineActive;
+    return state.isKconfigEngineOwner(this.tabId);
   }
 
   get profileKey() {
-    return `${this.currentVersion}|${this.currentArch}`;
+    return kconfigProfileKey(this.currentVersion, this.currentArch, this.configName);
   }
 
-  /** Toolchain profile of this version|ARCH (only the fields the user set; server fills defaults). */
+  /** Tab title: the ARCH, plus the name when this is one of several configurations of it. */
+  tabTitle() {
+    return `KConfig (${this.currentArch})${this.configName ? ` · ${this.configName}` : ""}`;
+  }
+
+  /** Toolchain profile of this configuration (only the fields the user set; server fills defaults). */
   get toolchain() {
     return state.getKconfigToolchain(this.profileKey);
   }
@@ -58,8 +111,19 @@ export class KconfigView {
 
   async render(containerEl, tabData) {
     this.containerEl = containerEl;
+    this.tabId = tabData.id || null;
     this.currentVersion = tabData.version || state.currentVersion;
     this.currentArch = tabData.arch || DEFAULT_ARCH;
+    this.configName = tabData.configName || "";
+    // A revision or ARCH switch can land on another tab's configuration: take a free name instead
+    const ownTab = state.findTab(this.tabId);
+    if (ownTab) {
+      this.configName = state.ensureUniqueKconfigConfigName(ownTab);
+      if (ownTab.title !== this.tabTitle()) {
+        ownTab.title = this.tabTitle();
+        state.saveState();
+      }
+    }
 
     containerEl.innerHTML = `
       <div class="kconfig-view-container">
@@ -71,6 +135,10 @@ export class KconfigView {
               </select>
               <button class="code-btn" id="btn-toolchain" title="Compiler, linker, environment variables and toolchain checks Kconfig depends on">Toolchain…</button>
               <button class="code-btn" id="btn-open-tui" title="Open terminal-style menuconfig">TUI</button>
+            </div>
+            <div class="kconfig-btn-row">
+              <button class="code-btn" id="btn-rename-config" title="Name this configuration: copies of one ARCH and revision are told apart by their name">✎ ${escapeHtml(this.configName || "Unnamed")}</button>
+              <button class="code-btn" id="btn-duplicate-config" title="Open a copy of this configuration in a new tab (named v2, v3, …)">⧉ Duplicate</button>
             </div>
             <div class="kconfig-search-box">
               <input type="text" placeholder="Search symbols or prompts..." id="kconfig-search-input" />
@@ -87,7 +155,7 @@ export class KconfigView {
             <div class="kconfig-btn-row">
               <button class="code-btn" id="btn-import-config" title="Load a .config or defconfig file">Import .config</button>
               <button class="code-btn" id="btn-validate-config" title="Check the configuration against Kconfig constraints">Validate</button>
-              <button class="code-btn" id="btn-compare-config" title="Compare the current configuration with a defconfig">Compare…</button>
+              <button class="code-btn" id="btn-compare-config" title="Compare this configuration with a defconfig or with another KConfig tab">Compare…</button>
               <input type="file" id="kconfig-import-file" accept=".config,text/plain,*" hidden />
             </div>
             <div class="kconfig-status" id="kconfig-status"></div>
@@ -120,6 +188,8 @@ export class KconfigView {
 
     await this.activateArch(this.currentArch);
     if (tabData && tabData.symbol) this.selectAndInspectSymbol(tabData.symbol);
+    // The command palette may have asked this tab to take the engine while it was in the background
+    if (state.takeKconfigEngineRequest(this.tabId)) this.setEngineActive(true);
   }
 
   bindToolbar() {
@@ -141,6 +211,8 @@ export class KconfigView {
       this.renderTree();
     };
 
+    c.querySelector("#btn-rename-config").onclick = () => this.showRenameModal();
+    c.querySelector("#btn-duplicate-config").onclick = () => this.duplicateConfig();
     c.querySelector("#btn-toolchain").onclick = () => this.showToolchainModal();
     c.querySelector("#btn-open-tui").onclick = () => {
       if (!this.engine.loaded) return;
@@ -158,7 +230,7 @@ export class KconfigView {
       if (file) this.loadConfigText(await file.text(), file.name);
     };
     c.querySelector("#btn-validate-config").onclick = () => this.showValidation();
-    c.querySelector("#btn-compare-config").onclick = () => this.showCompareWithDefconfig();
+    c.querySelector("#btn-compare-config").onclick = () => this.showCompareModal();
 
     const searchInput = c.querySelector("#kconfig-search-input");
     searchInput.oninput = () => this.filterTree(searchInput.value.trim());
@@ -187,6 +259,14 @@ export class KconfigView {
       this.selectedNodeId = null;
     }
     this.currentArch = arch;
+    // The tab carries the ARCH and the name the profile key is built from, so update it first
+    const ownTab = state.findTab(this.tabId);
+    if (ownTab && ownTab.type === "kconfig") {
+      ownTab.arch = arch;
+      this.configName = state.ensureUniqueKconfigConfigName(ownTab);
+      ownTab.title = this.tabTitle();
+      state.saveState();
+    }
     const select = this.containerEl?.querySelector("#kconfig-arch-select");
     if (select) select.value = arch;
     const scrollEl = this.containerEl?.querySelector("#kconfig-tree-scroll");
@@ -209,14 +289,87 @@ export class KconfigView {
       await this.loadDefconfig("", { quiet: true });
     }
 
-    const activeTab = state.getActiveTab();
-    if (activeTab && activeTab.type === "kconfig") {
-      activeTab.arch = arch;
-      activeTab.title = `KConfig (${arch})`;
-      state.saveState();
-    }
     this.renderTree();
     if (this.selectedSymbol) this.inspectSymbol(this.selectedSymbol);
+  }
+
+  /**
+   * Name this configuration. Several configurations of one revision and ARCH are told apart by
+   * their name (it is part of the key they are saved under), so copies can be edited and compared
+   * independently; the saved values and toolchain profile move with the name.
+   */
+  showRenameModal() {
+    const taken = state.kconfigConfigNames(this.currentVersion, this.currentArch, this.tabId);
+    const modal = openModal({
+      title: "Name this configuration",
+      subtitle: `ARCH=${this.currentArch} @ ${this.currentVersion}`,
+      width: "520px",
+      footerHtml: `<button class="code-btn active" id="btn-rename-ok" type="button">Rename</button>`,
+    });
+    modal.body.innerHTML = `
+      <div class="ki-form-row"><label>Name
+        <input type="text" id="kconfig-rename-input" maxlength="40" placeholder="unnamed" value="${escapeHtml(this.configName)}" />
+      </label></div>
+      <div class="kconfig-muted">Copies of ARCH=${escapeHtml(this.currentArch)} @ ${escapeHtml(this.currentVersion)} are told apart by this name, and each keeps its own values. Leave it empty for the unnamed configuration.${taken.size ? ` Already used: ${escapeHtml([...taken].map((n) => n || "unnamed").join(", "))}.` : ""}</div>`;
+    const input = modal.body.querySelector("#kconfig-rename-input");
+    const submit = () => {
+      const name = input.value.trim().replace(/\|/g, "-");
+      if (name === this.configName) {
+        modal.close();
+        return;
+      }
+      if (taken.has(name)) {
+        toast.error(`“${name || "unnamed"}” is already used by another configuration of ARCH=${this.currentArch} @ ${this.currentVersion}`);
+        return;
+      }
+      modal.close();
+      this.renameConfig(name);
+    };
+    modal.footer.querySelector("#btn-rename-ok").onclick = submit;
+    input.onkeydown = (e) => {
+      if (e.key === "Enter") submit();
+    };
+    input.focus();
+    input.select();
+  }
+
+  /** Apply a new name: the saved configuration and toolchain profile move to the new key. */
+  renameConfig(name) {
+    const from = this.profileKey;
+    this.configName = name;
+    state.moveKconfigProfile(from, this.profileKey);
+    const tab = state.findTab(this.tabId);
+    if (tab) {
+      tab.configName = name;
+      tab.title = this.tabTitle();
+      state.saveState();
+      // Refresh the tab strip (and this view) under the new name
+      const pane = state.panes.find((p) => p.tabs.some((t) => t.id === this.tabId));
+      state.emit("tabs:changed", { paneId: pane?.id || state.activePaneId, activeTabId: pane?.activeTabId });
+    }
+    toast.success(`Configuration renamed to ${name || "unnamed"}`);
+  }
+
+  /**
+   * Open a copy of this configuration in its own tab, named v2, v3, … (the first free one). The
+   * copy owns its values from the start, so both tabs can be edited apart and compared (**Compare…**).
+   * The engine stays with whichever tab holds it; the copy opens unconstrained.
+   */
+  duplicateConfig() {
+    const name = state.nextKconfigConfigName(this.currentVersion, this.currentArch);
+    const key = kconfigProfileKey(this.currentVersion, this.currentArch, name);
+    state.setKconfigAssignments(this.rawValues || {}, key, { publish: false });
+    const tc = this.toolchain;
+    if (tc && Object.keys(tc).length) state.setKconfigToolchain(key, JSON.parse(JSON.stringify(tc)));
+    state.openTab({
+      type: "kconfig",
+      title: `KConfig (${this.currentArch}) · ${name}`,
+      arch: this.currentArch,
+      version: this.currentVersion,
+      configName: name,
+      forceNew: true,
+    });
+    toast.success(`Copied ${Object.keys(this.rawValues || {}).length} values to ${name}; the engine is off in the copy`);
   }
 
   /** Publish the current configuration (resolved values when the engine is on). */
@@ -224,7 +377,10 @@ export class KconfigView {
     if (this.engineActive) {
       this.rawValues = this.engine.configValues();
     }
-    state.setKconfigAssignments(this.rawValues || {}, this.profileKey);
+    // While another tab holds the engine, its resolved configuration stays the published one; this
+    // tab's values are still saved under their own profile, so nothing is lost either way.
+    const publish = this.engineActive || !state.kconfigEngineActive;
+    state.setKconfigAssignments(this.rawValues || {}, this.profileKey, { publish });
     this.updateStatus();
   }
 
@@ -235,9 +391,32 @@ export class KconfigView {
     if (this.selectedSymbol) this.inspectSymbol(this.selectedSymbol, this.selectedNodeId, { keepScroll: true });
   }
 
-  setEngineActive(active) {
+  /**
+   * Turn the engine on for this tab or off. Only one KConfig tab may hold it, so enabling it while
+   * another tab does asks first (move it here, or leave it there and stay unconstrained here).
+   */
+  async setEngineActive(active) {
+    if (active) {
+      const owner = state.kconfigEngineOwnerTab();
+      if (owner && owner.id !== this.tabId && !(await this.confirmEngineTakeover(owner))) return;
+      // Enabling it resolves the values through kconfig, which may change more than nothing
+      if (this.engine.loaded && !(await this.confirmEngineResolution())) return;
+    }
+    this.selfEngineChange = true;
+    try {
+      state.setKconfigEngineOwner(active ? this.tabId : null);
+    } finally {
+      this.selfEngineChange = false;
+    }
+    this.applyEngineState({ announce: true });
+  }
+
+  /**
+   * Bring the toolbar, the values and the tree in line with who holds the engine. Turning it on
+   * resolves this tab's values through kconfig; turning it off keeps them as they are (raw editing).
+   */
+  applyEngineState({ announce = true } = {}) {
     const btn = this.containerEl?.querySelector("#btn-toggle-engine");
-    state.setKconfigEngineActive(active);
     if (btn) {
       btn.classList.toggle("active", this.engineActive);
       btn.textContent = this.engineActive ? "✓ Engine Active" : "⚡ Enable Engine";
@@ -253,12 +432,102 @@ export class KconfigView {
         const got = after[k] ?? (s.type === "bool" || s.type === "tristate" ? "n" : "");
         return got !== String(before[k]);
       }).length;
-      toast.success(`Engine on: configuration resolved by kconfig (${adjusted} values adjusted, ${report.unknown.length} unknown symbols dropped)`);
+      if (announce) toast.success(`Engine on: configuration resolved by kconfig (${adjusted} values adjusted, ${report.unknown.length} unknown symbols dropped)`);
       this.renderTree();
     } else {
-      toast.info("Engine off: values are edited without constraints (export will be unvalidated)");
+      if (announce) toast.info("Engine off: values are edited without constraints (export will be unvalidated)");
       this.updateStatus();
+      if (this.engine.loaded) this.renderTree();
     }
+    if (this.selectedSymbol) this.inspectSymbol(this.selectedSymbol, this.selectedNodeId, { keepScroll: true });
+  }
+
+  /** Ask before taking the engine from the tab holding it; resolves true to move it here. */
+  confirmEngineTakeover(ownerTab) {
+    return new Promise((resolve) => {
+      let takeOver = false;
+      const label = ownerTab.title || "another KConfig tab";
+      const modal = openModal({
+        title: "The KConfig engine is already enabled",
+        subtitle: `${label} holds it — only one tab can run it at a time`,
+        width: "560px",
+        footerHtml: `<button class="code-btn active" id="kconfig-engine-takeover" type="button">Disable it in ${escapeHtml(label)}</button>`,
+        onClose: () => resolve(takeOver),
+      });
+      modal.body.innerHTML = `
+        <div class="kconfig-muted" style="display:flex;flex-direction:column;gap:8px;">
+          <div>The constraint engine resolves one configuration and that configuration is what <code>#ifdef</code> dimming and per-architecture definitions follow, so it stays with a single tab.</div>
+          <div><strong>Disable it in ${escapeHtml(label)}</strong>: the engine moves here and resolves this tab's configuration (ARCH=${escapeHtml(this.currentArch)}).</div>
+          <div><strong>Close</strong>: the engine stays in ${escapeHtml(label)} and this tab keeps editing values without constraints.</div>
+          <div>No configuration is lost either way: every tab keeps its own values per <code>version|ARCH</code>.</div>
+        </div>`;
+      const ok = modal.footer.querySelector("#kconfig-engine-takeover");
+      ok.onclick = () => {
+        takeOver = true;
+        modal.close();
+      };
+      ok.focus();
+    });
+  }
+
+  /**
+   * Enabling the engine resolves this tab's values through kconfig, which can change values other
+   * than the ones the user set (an edited or imported configuration, a raw edit kconfig refuses).
+   * Report exactly what would change and apply it only once confirmed; resolve true straight away
+   * when the resolution changes nothing.
+   */
+  confirmEngineResolution() {
+    const MAX_ROWS = 300;
+    const { adjusted, unknown } = this.resolutionDiff();
+    if (!adjusted.length && !unknown.length) return Promise.resolve(true);
+    return new Promise((resolve) => {
+      let confirmed = false;
+      const parts = [];
+      if (adjusted.length) parts.push(`${adjusted.length} value${adjusted.length === 1 ? "" : "s"} changed`);
+      if (unknown.length) parts.push(`${unknown.length} unknown symbol${unknown.length === 1 ? "" : "s"} dropped`);
+      const modal = openModal({
+        title: "Enabling the engine changes this configuration",
+        subtitle: `kconfig would not keep it as it is: ${parts.join(", ")}`,
+        width: "820px",
+        footerHtml: `<button class="code-btn active" id="kconfig-confirm-resolve" type="button">Enable engine and apply these changes</button>`,
+        onClose: () => resolve(confirmed),
+      });
+      modal.body.innerHTML = `
+        <div class="kconfig-muted" style="margin-bottom:10px;">With the engine on, only configurations kconfig accepts exist, so loading these values resolves them (ARCH=${escapeHtml(this.currentArch)} @ ${escapeHtml(this.currentVersion)}). <strong>Close</strong> leaves the engine off and the values exactly as they are.</div>
+        ${adjusted.length ? `<table class="kconfig-cmp-table"><thead><tr><th>Option</th><th>Now</th><th>After</th><th>Why</th></tr></thead>
+        <tbody>${adjusted.slice(0, MAX_ROWS).map((a) => `<tr><td>CONFIG_${escapeHtml(a.name)}</td><td>${escapeHtml(a.want || '""')}</td><td>${escapeHtml(a.got || '""')}</td><td class="kconfig-muted">${escapeHtml(a.reason)}</td></tr>`).join("")}</tbody></table>
+        ${adjusted.length > MAX_ROWS ? `<div class="kconfig-muted" style="margin-top:8px;">… and ${adjusted.length - MAX_ROWS} more</div>` : ""}` : ""}
+        ${unknown.length ? `<div class="kconfig-prop-card" style="margin-top:10px;"><div class="kconfig-prop-title">Unknown for ARCH=${escapeHtml(this.currentArch)} (${unknown.length}, dropped by kconfig)</div><div class="kconfig-muted" style="font-family:var(--font-mono);font-size:11px;">${unknown.slice(0, 200).map(escapeHtml).join(" ")}</div></div>` : ""}`;
+      const ok = modal.footer.querySelector("#kconfig-confirm-resolve");
+      ok.onclick = () => {
+        confirmed = true;
+        modal.close();
+      };
+      ok.focus();
+    });
+  }
+
+  /**
+   * Resolve this tab's values with a throwaway engine (the live one is untouched) and report what
+   * kconfig would not keep: `{ probe, raw, resolved, adjusted: [{name, want, got, reason}], unknown }`.
+   */
+  resolutionDiff() {
+    const raw = { ...(this.rawValues || {}) };
+    const probe = new KconfigEngine(this.engine.model);
+    const report = probe.loadAssignments(raw);
+    const resolved = probe.configValues();
+    const adjusted = [];
+    for (const [name, want] of Object.entries(raw)) {
+      const s = probe.syms[name];
+      if (!s || s.auto) continue;
+      const got = resolved[name] ?? (s.type === "bool" || s.type === "tristate" ? "n" : "");
+      if (String(want) === got) continue;
+      const reason = probe.revDep(name) > 0 && got !== "n" ? `forced by select: ${probe.exprStr(s.rev_dep, true)}`
+        : probe.visibility(name) === 0 ? (s.prompts.length ? `prompt not visible: ${s.prompts.map((pr) => probe.exprStr(pr, true)).join(" || ")}` : "no prompt (value comes from defaults)")
+        : "limited by dependencies or range";
+      adjusted.push({ name, want, got, reason });
+    }
+    return { probe, raw, resolved, adjusted, unknown: report.unknown };
   }
 
   /** Load a defconfig of this ARCH ("" = the default `make defconfig` one). */
@@ -318,7 +587,7 @@ export class KconfigView {
     const tc = this.engine.model.toolchain;
     const errors = (tc?.messages || []).filter((m) => m.level === "error").length;
     const toolchain = tc?.macros ? ` · <a href="#" class="kconfig-status-link" id="kconfig-status-toolchain">${escapeHtml(tc.summary)}${errors ? ` <span style="color:var(--accent-red);">⚠ ${errors} error(s)</span>` : ""}</a>` : "";
-    el.innerHTML = `ARCH=${escapeHtml(env.ARCH || this.currentArch)} SRCARCH=${escapeHtml(env.SRCARCH || "")} · ${escapeHtml(this.currentVersion)} · ${written} symbols${this.engineActive ? " · engine resolved" : " · <span style=\"color:var(--accent-yellow);\">unvalidated (engine off)</span>"}${toolchain}`;
+    el.innerHTML = `ARCH=${escapeHtml(env.ARCH || this.currentArch)} SRCARCH=${escapeHtml(env.SRCARCH || "")} · ${escapeHtml(this.currentVersion)}${this.configName ? ` · ${escapeHtml(this.configName)}` : ""} · ${written} symbols${this.engineActive ? " · engine resolved" : " · <span style=\"color:var(--accent-yellow);\">unvalidated (engine off)</span>"}${toolchain}`;
     const link = el.querySelector("#kconfig-status-toolchain");
     if (link) {
       link.onclick = (ev) => {
@@ -1062,22 +1331,7 @@ export class KconfigView {
   showValidation() {
     if (!this.engine.loaded) return;
     const modal = openModal({ title: "Validate configuration", subtitle: `ARCH=${this.currentArch} @ ${this.currentVersion}`, width: "720px" });
-    const probe = new KconfigEngine(this.engine.model);
-    const raw = { ...(this.rawValues || {}) };
-    const report = probe.loadAssignments(raw);
-    const resolved = probe.configValues();
-    const adjusted = [];
-    for (const [name, want] of Object.entries(raw)) {
-      const s = probe.syms[name];
-      if (!s || s.auto) continue;
-      const got = resolved[name] ?? (s.type === "bool" || s.type === "tristate" ? "n" : "");
-      if (String(want) !== got) {
-        const reason = probe.revDep(name) > 0 && got !== "n" ? `forced by select: ${probe.exprStr(s.rev_dep, true)}`
-          : probe.visibility(name) === 0 ? (s.prompts.length ? `prompt not visible: ${s.prompts.map((p) => probe.exprStr(p, true)).join(" || ")}` : "no prompt (value comes from defaults)")
-          : "limited by dependencies or range";
-        adjusted.push({ name, want, got, reason });
-      }
-    }
+    const { probe, raw, resolved, adjusted, unknown } = this.resolutionDiff();
     const warnings = Object.keys(probe.syms).filter((n) => {
       const s = probe.syms[n];
       return (s.type === "bool" || s.type === "tristate") && !s.choice && probe.revDep(n) > 0 && probe.dirDep(n) === 0;
@@ -1088,12 +1342,12 @@ export class KconfigView {
         ? `<div class="kconfig-prop-card"><div class="kconfig-prop-title" style="color:var(--accent-yellow);">Values kconfig would not keep (${adjusted.length})</div>
             ${adjusted.slice(0, 400).map((a) => row(`<code>CONFIG_${escapeHtml(a.name)}</code> ${escapeHtml(a.want)} → <strong>${escapeHtml(a.got || '""')}</strong> <span class="kconfig-muted">${escapeHtml(a.reason)}</span>`)).join("")}</div>`
         : `<div class="ki-modal-empty">✓ Every value is accepted by kconfig for ARCH=${escapeHtml(this.currentArch)}${this.engineActive ? " (the engine only allows valid values)" : ""}.</div>`}
-      ${report.unknown.length ? `<div class="kconfig-prop-card"><div class="kconfig-prop-title">Unknown for ARCH=${escapeHtml(this.currentArch)} (${report.unknown.length}, dropped by kconfig)</div><div class="kconfig-muted" style="font-family:var(--font-mono);font-size:11px;">${report.unknown.slice(0, 200).map(escapeHtml).join(" ")}</div></div>` : ""}
+      ${unknown.length ? `<div class="kconfig-prop-card"><div class="kconfig-prop-title">Unknown for ARCH=${escapeHtml(this.currentArch)} (${unknown.length}, dropped by kconfig)</div><div class="kconfig-muted" style="font-family:var(--font-mono);font-size:11px;">${unknown.slice(0, 200).map(escapeHtml).join(" ")}</div></div>` : ""}
       ${warnings.length ? `<div class="kconfig-prop-card"><div class="kconfig-prop-title" style="color:var(--accent-orange);">kconfig warnings: selected with unmet direct dependencies (${warnings.length})</div>
           ${warnings.map((n) => row(`<code>CONFIG_${escapeHtml(n)}</code> <span class="kconfig-muted">selected by ${escapeHtml(probe.exprStr(probe.syms[n].rev_dep, true))}; depends on ${escapeHtml(probe.exprStr(probe.syms[n].dir_dep, true))}</span>`)).join("")}
           <div class="kconfig-muted">The real kconfig prints the same warning and keeps the value; the build may still fail for these options.</div></div>` : ""}
     `;
-    if (adjusted.length || report.unknown.length) {
+    if (adjusted.length || unknown.length) {
       modal.footer.insertAdjacentHTML("afterbegin", `<button class="code-btn active" id="btn-apply-validation" type="button">Apply kconfig resolution</button>`);
       modal.footer.querySelector("#btn-apply-validation").onclick = () => {
         this.engine.loadAssignments(raw);
@@ -1109,56 +1363,109 @@ export class KconfigView {
     }
   }
 
-  /** Compare resolved values with a defconfig resolved for the same ARCH. */
-  async showCompareWithDefconfig() {
-    const modal = openModal({ title: "Compare with defconfig", subtitle: `ARCH=${this.currentArch} @ ${this.currentVersion}`, width: "760px" });
+  /** Compare this tab's configuration with a defconfig of its ARCH, or with another KConfig tab. */
+  async showCompareModal() {
+    const modal = openModal({ title: "Compare configurations", subtitle: `ARCH=${this.currentArch} @ ${this.currentVersion}`, width: "760px" });
     modal.body.innerHTML = `<div class="ki-modal-empty">Loading defconfigs…</div>`;
     let list = [];
+    let listError = "";
     try {
       const defs = await api.getKconfigDefconfigs(this.currentVersion, this.currentArch);
       list = (defs && defs.defconfigs) || [];
     } catch (err) {
-      modal.body.innerHTML = `<div class="ki-modal-error">${escapeHtml(err.message)}</div>`;
+      listError = err.message;
+    }
+    const otherTabs = state.kconfigTabs().filter((t) => t.id !== this.tabId);
+    if (!list.length && !otherTabs.length) {
+      modal.body.innerHTML = `<div class="ki-modal-empty">${listError
+        ? `Could not load the defconfigs of ARCH=${escapeHtml(this.currentArch)}: ${escapeHtml(listError)}`
+        : `No defconfig for ARCH=${escapeHtml(this.currentArch)} and no other KConfig tab open to compare with.`}</div>`;
       return;
     }
-    if (!list.length) {
-      modal.body.innerHTML = `<div class="ki-modal-empty">No defconfigs found for ARCH=${escapeHtml(this.currentArch)}.</div>`;
-      return;
-    }
+
     modal.body.innerHTML = `
-      <div class="ki-form-row"><label>Defconfig
+      <div class="ki-form-row"><label>Compare with
+        <select id="cmp-source">
+          ${list.length ? `<option value="defconfig">A defconfig of ARCH=${escapeHtml(this.currentArch)}</option>` : ""}
+          ${otherTabs.map((t) => `<option value="tab:${escapeHtml(t.id)}">${escapeHtml(t.title)} · ${escapeHtml(t.version)}</option>`).join("")}
+        </select>
+      </label></div>
+      <div class="ki-form-row" id="cmp-defconfig-row"><label>Defconfig
         <select id="cmp-defconfig">${list.map((d) => `<option value="${escapeHtml(d.file_path)}" ${d.is_canonical ? "selected" : ""}>${escapeHtml(d.name)}</option>`).join("")}</select>
       </label></div>
+      ${!list.length && listError ? `<div class="kconfig-muted">Defconfigs unavailable: ${escapeHtml(listError)}</div>` : ""}
       <div id="cmp-defconfig-result"></div>`;
-    const select = modal.body.querySelector("#cmp-defconfig");
+    const source = modal.body.querySelector("#cmp-source");
+    const defRow = modal.body.querySelector("#cmp-defconfig-row");
+    const defSelect = modal.body.querySelector("#cmp-defconfig");
     const run = async () => {
       const out = modal.body.querySelector("#cmp-defconfig-result");
+      const useDefconfig = source.value === "defconfig";
+      defRow.style.display = useDefconfig ? "" : "none";
       out.innerHTML = `<div class="ki-modal-empty">Comparing…</div>`;
       try {
-        const defRes = await api.getKconfigDefconfigContent(this.currentVersion, select.value, this.currentArch, this.toolchain);
-        const probe = new KconfigEngine(this.engine.model);
-        probe.loadConfig(defRes.content || "");
-        probe.setAllNewSymbols("default");
-        const other = probe.configValues();
-        const mine = this.rawValues || {};
-        const keys = [...new Set([...Object.keys(mine), ...Object.keys(other)])].sort();
-        const diffs = keys.filter((k) => (mine[k] ?? "—") !== (other[k] ?? "—"));
-        out.innerHTML = `
-          <div class="kconfig-muted" style="margin:6px 0 10px;">${keys.length - diffs.length} matching · <strong>${diffs.length}</strong> different (resolved values)</div>
-          <table class="kconfig-cmp-table"><thead><tr><th>Option</th><th>Current</th><th>${escapeHtml(defRes.name)}</th></tr></thead>
-          <tbody>${diffs.map((k) => `<tr data-symbol="${escapeHtml(k)}"><td>CONFIG_${escapeHtml(k)}</td><td>${escapeHtml(mine[k] ?? "—")}</td><td>${escapeHtml(other[k] ?? "—")}</td></tr>`).join("")}</tbody></table>`;
-        out.querySelectorAll("tr[data-symbol]").forEach((tr) => {
-          tr.onclick = () => {
-            modal.close();
-            this.selectAndInspectSymbol(tr.dataset.symbol);
-          };
-        });
+        const side = useDefconfig
+          ? await this.defconfigSide(defSelect.value)
+          : this.tabSide(source.value.slice(4));
+        this.renderComparison(out, modal, side);
       } catch (err) {
         out.innerHTML = `<div class="ki-modal-error">${escapeHtml(err.message)}</div>`;
       }
     };
-    select.onchange = run;
+    source.onchange = run;
+    defSelect.onchange = run;
     run();
+  }
+
+  /** Right-hand side of the compare window: a defconfig resolved for this ARCH. */
+  async defconfigSide(path) {
+    if (!this.engine.loaded) throw new Error("The Kconfig model of this tab is not loaded yet");
+    const res = await api.getKconfigDefconfigContent(this.currentVersion, path, this.currentArch, this.toolchain);
+    const probe = new KconfigEngine(this.engine.model);
+    probe.loadConfig(res.content || "");
+    probe.setAllNewSymbols("default");
+    return { label: res.name, values: probe.configValues(), notes: [] };
+  }
+
+  /**
+   * Right-hand side of the compare window: another KConfig tab's configuration, as that tab holds
+   * it (`state.kconfigProfiles`, resolved while its engine is on, raw while it is off). Its ARCH and
+   * revision may differ from this tab's, so the differences are reported with that caveat.
+   */
+  tabSide(tabId) {
+    const tab = state.findTab(tabId);
+    if (!tab || tab.type !== "kconfig") throw new Error("That KConfig tab is no longer open");
+    const key = state.kconfigProfileKeyOf(tab);
+    const label = `${tab.title} · ${tab.version}`;
+    const saved = state.getKconfigProfile(key);
+    if (!saved || !Object.keys(saved).length) {
+      return { label, values: {}, notes: [`${tab.title} has no configuration yet — open that tab once to load one.`] };
+    }
+    const notes = [];
+    if (tab.arch !== this.currentArch) notes.push(`Different ARCH (${tab.arch} vs ${this.currentArch}): options only one of them defines show “—” on the other side.`);
+    if (tab.version !== this.currentVersion) notes.push(`Different revision (${tab.version} vs ${this.currentVersion}).`);
+    if (!state.isKconfigEngineOwner(tab.id)) notes.push(`The engine is off in ${tab.title}, so its raw (unresolved) values are compared.`);
+    return { label, values: saved, notes };
+  }
+
+  /** Table of the options whose value differs between this tab and the chosen side. */
+  renderComparison(out, modal, { label, values, notes = [] }) {
+    const MAX_ROWS = 2000; // comparing two architectures differs in thousands of options
+    const mine = this.rawValues || {};
+    const keys = [...new Set([...Object.keys(mine), ...Object.keys(values)])].sort();
+    const diffs = keys.filter((k) => (mine[k] ?? "—") !== (values[k] ?? "—"));
+    out.innerHTML = `
+      ${notes.length ? `<div class="kconfig-muted" style="margin:6px 0;">${notes.map(escapeHtml).join(" ")}</div>` : ""}
+      <div class="kconfig-muted" style="margin:6px 0 10px;">${keys.length - diffs.length} matching · <strong>${diffs.length}</strong> different${this.engineActive ? " (resolved values)" : " (this tab's raw values: engine off)"}</div>
+      <table class="kconfig-cmp-table"><thead><tr><th>Option</th><th>Current</th><th>${escapeHtml(label)}</th></tr></thead>
+      <tbody>${diffs.slice(0, MAX_ROWS).map((k) => `<tr data-symbol="${escapeHtml(k)}" title="Inspect CONFIG_${escapeHtml(k)}"><td>CONFIG_${escapeHtml(k)}</td><td>${escapeHtml(mine[k] ?? "—")}</td><td>${escapeHtml(values[k] ?? "—")}</td></tr>`).join("")}</tbody></table>
+      ${diffs.length > MAX_ROWS ? `<div class="kconfig-muted" style="margin-top:8px;">… and ${diffs.length - MAX_ROWS} more</div>` : ""}`;
+    out.querySelectorAll("tr[data-symbol]").forEach((tr) => {
+      tr.onclick = () => {
+        modal.close();
+        this.selectAndInspectSymbol(tr.dataset.symbol);
+      };
+    });
   }
 
   /** Full .config, byte-identical to what scripts/kconfig writes (engine on). */
@@ -1229,18 +1536,59 @@ export class KconfigView {
   }
 
   // ------------------------------------------------------------------ toolchain
-  /** Re-fetch the model (new toolchain) and resolve the current values through it. */
+  /**
+   * Re-fetch the model (new toolchain) and resolve the current values through it. A different model
+   * resolves dependencies and defaults differently, so the values it would change are shown first
+   * and nothing is touched until they are confirmed (§5.0). Returns the number of values changed,
+   * or null when the user declined (model and values left as they were).
+   */
   async reloadModel() {
     const before = { ...(this.rawValues || {}) };
     const raw = await api.getKconfigTree(this.currentVersion, this.currentArch, this.toolchain);
+    // Resolve on a throwaway engine: the live one keeps the current model until this is accepted
+    let changes = [];
+    if (this.engineActive) {
+      const probe = new KconfigEngine(raw);
+      probe.loadAssignments(before);
+      const after = probe.configValues();
+      const names = new Set([...Object.keys(before), ...Object.keys(after)]);
+      changes = [...names]
+        .filter((n) => String(before[n] ?? "") !== String(after[n] ?? ""))
+        .map((n) => ({ name: n, want: String(before[n] ?? ""), got: String(after[n] ?? "") }));
+    }
+    if (changes.length && !(await this.confirmModelChanges(changes))) return null;
     this.engine.setModel(raw);
     if (this.engineActive) this.engine.loadAssignments(before);
     this.commit();
     this.renderTree();
     if (this.selectedSymbol) this.inspectSymbol(this.selectedSymbol);
-    const after = this.rawValues || {};
-    const keys = new Set([...Object.keys(before), ...Object.keys(after)]);
-    return [...keys].filter((k) => before[k] !== after[k]).length;
+    return changes.length;
+  }
+
+  /** Ask before keeping a rebuilt model that resolves the configuration differently. */
+  confirmModelChanges(changes) {
+    const MAX_ROWS = 300;
+    return new Promise((resolve) => {
+      let confirmed = false;
+      const modal = openModal({
+        title: "This toolchain changes the configuration",
+        subtitle: `${changes.length} value${changes.length === 1 ? "" : "s"} resolve differently with the rebuilt model`,
+        width: "760px",
+        footerHtml: `<button class="code-btn active" id="kconfig-confirm-model" type="button">Apply the toolchain and these changes</button>`,
+        onClose: () => resolve(confirmed),
+      });
+      modal.body.innerHTML = `
+        <div class="kconfig-muted" style="margin-bottom:10px;">The toolchain answers the <code>$(shell,…)</code> checks and environment variables Kconfig reads while it is parsed, so dependencies, defaults and ranges can differ. <strong>Close</strong> keeps the current toolchain, model and values.</div>
+        <table class="kconfig-cmp-table"><thead><tr><th>Option</th><th>Now</th><th>After</th></tr></thead>
+        <tbody>${changes.slice(0, MAX_ROWS).map((c) => `<tr><td>CONFIG_${escapeHtml(c.name)}</td><td>${escapeHtml(c.want || '""')}</td><td>${escapeHtml(c.got || '""')}</td></tr>`).join("")}</tbody></table>
+        ${changes.length > MAX_ROWS ? `<div class="kconfig-muted" style="margin-top:8px;">… and ${changes.length - MAX_ROWS} more</div>` : ""}`;
+      const ok = modal.footer.querySelector("#kconfig-confirm-model");
+      ok.onclick = () => {
+        confirmed = true;
+        modal.close();
+      };
+      ok.focus();
+    });
   }
 
   /**
@@ -1348,14 +1696,21 @@ export class KconfigView {
       <button class="code-btn" id="btn-tc-reset" type="button">Reset to defaults</button>
       <button class="code-btn active" id="btn-tc-apply" type="button">Apply</button>`);
     const apply = async (next) => {
+      const previous = JSON.parse(JSON.stringify(this.toolchain || {}));
       state.setKconfigToolchain(this.profileKey, next);
       modal.close();
       toast.info("Rebuilding the Kconfig model for this toolchain…");
       try {
         const changed = await this.reloadModel();
+        if (changed === null) {
+          state.setKconfigToolchain(this.profileKey, previous); // declined: nothing changed
+          toast.info("Toolchain profile left as it was");
+          return;
+        }
         const tc = this.engine.model.toolchain;
         toast.success(`Toolchain ${tc?.summary || ""}: ${changed} configuration value(s) changed`);
       } catch (err) {
+        state.setKconfigToolchain(this.profileKey, previous);
         toast.error(`Failed to rebuild the model: ${err.message}`);
       }
     };

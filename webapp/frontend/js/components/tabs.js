@@ -9,10 +9,16 @@ import { escapeHtml } from "./modal.js";
 export class TabsComponent {
   constructor(containerEl, viewRenderers) {
     this.container = containerEl;
-    this.viewRenderers = viewRenderers; // Map of tab type -> view instance
+    // Map of tab type -> view instance shared by every tab of that type, or a factory for types
+    // whose tabs each need their own instance (kconfig: one constraint engine per tab)
+    this.viewRenderers = viewRenderers;
+    this.perTabViews = new Map(); // tab id -> view instance of a factory type
 
     state.subscribe("layout:changed", () => this.render());
-    state.subscribe("tabs:changed", () => this.render());
+    state.subscribe("tabs:changed", () => {
+      this.pruneTabViews();
+      this.render();
+    });
     state.subscribe("pane:activated", () => this.highlightActivePane());
   }
 
@@ -164,9 +170,31 @@ export class TabsComponent {
     });
   }
 
+  /** View rendering a tab: the type's shared instance, or this tab's own one for factory types. */
+  rendererFor(tab) {
+    const entry = this.viewRenderers[tab.type];
+    if (typeof entry !== "function") return entry;
+    let view = this.perTabViews.get(tab.id);
+    if (!view) {
+      view = entry();
+      this.perTabViews.set(tab.id, view);
+    }
+    return view;
+  }
+
+  /** Release the views of tabs that were closed. */
+  pruneTabViews() {
+    const open = new Set(state.panes.flatMap((p) => p.tabs.map((t) => t.id)));
+    for (const [tabId, view] of [...this.perTabViews]) {
+      if (open.has(tabId)) continue;
+      if (typeof view.dispose === "function") view.dispose();
+      this.perTabViews.delete(tabId);
+    }
+  }
+
   renderTabContent(containerEl, tab) {
     containerEl.innerHTML = "";
-    const renderer = this.viewRenderers[tab.type];
+    const renderer = this.rendererFor(tab);
     if (renderer && typeof renderer.render === "function") {
       renderer.render(containerEl, tab);
     } else {

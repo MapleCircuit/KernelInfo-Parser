@@ -1233,7 +1233,10 @@ class DependencyScheduler:
         self.executed_count = len(self.completed)
         if hasattr(self.gp, "_ast_negative_cache"):
             self.gp._ast_negative_cache.clear()
-        G.TE.commit_all(update_in_mem_indexes=False)
+        # The caches stay: Step 6.1 (symlink resolution) still stages m_file_name / m_file_blob rows and a
+        # cleared cache mints new ids for paths and blobs already in the database. They are cleared after
+        # git commit processing, where nothing stages into those parent tables any more.
+        G.TE.commit_all()
         # Every ChangeSet has executed: the Stage 2 shared symbol segments are no longer read
         self.gp.close_shared_symbols()
         reclaim_system_memory()

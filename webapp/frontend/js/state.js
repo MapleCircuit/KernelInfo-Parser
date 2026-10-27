@@ -10,6 +10,12 @@ export const MIN_CONFIG_SYMBOLS = 50;
 export const DEFAULT_DEFINITION_ARCH = "x86_64";
 const DEFAULT_ARCH_BASELINE = { X86: "y", X86_64: "y", "64BIT": "y", X86_32: "n" };
 
+/** Key a KConfig configuration is saved under: "version|ARCH", plus "|name" for a named copy. */
+export function kconfigProfileKey(version, arch, configName = "") {
+  const name = (configName || "").trim();
+  return `${version}|${arch}${name ? `|${name}` : ""}`;
+}
+
 class GlobalState {
   constructor() {
     this.subscribers = new Map();
@@ -17,7 +23,12 @@ class GlobalState {
     // Default State
     this.currentVersion = "v3.0";
     this.currentRepo = ""; // configured repository name ("" = server default)
-    this.kconfigEngineActive = true; // Kconfig constraint engine (KConfig view); gates #ifdef dimming in code views
+    // Id of the KConfig tab holding the Kconfig constraint engine ("" = engine off, the default).
+    // Only one tab may hold it: its resolved configuration is the published one and gates #ifdef
+    // dimming in code views, so two tabs resolving two configurations at once cannot happen.
+    this.kconfigEngineTabId = "";
+    // KConfig tab asked to take the engine (command palette), until its view claims the request
+    this.kconfigEnginePendingTabId = "";
     this.splitMode = "single"; // 'single' | 'horizontal' | 'vertical'
     this.activePaneId = "pane-1";
     this.panes = [
@@ -94,10 +105,120 @@ class GlobalState {
     this.panes = [{ id: "pane-1", activeTabId: null, tabs: [] }];
     this.activePaneId = "pane-1";
     this.splitMode = "single";
+    const hadEngine = Boolean(this.kconfigEngineTabId);
+    this.kconfigEngineTabId = ""; // the tab that held it is gone
     this.saveState();
+    if (hadEngine) this.emit("kconfig:engine:changed", { active: false, tabId: "", previousTabId: "" });
     this.emit("repo:changed", name);
     this.emit("layout:changed", { splitMode: this.splitMode, panes: this.panes });
     this.emit("version:changed", this.currentVersion);
+  }
+
+  /**
+   * Profile key of a KConfig tab: "version|ARCH" for its first configuration, "version|ARCH|name"
+   * for a named copy, so several configurations of one ARCH and revision stay independent (and
+   * keys saved before names existed keep working).
+   */
+  kconfigProfileKeyOf(tab) {
+    if (!tab) return "";
+    return kconfigProfileKey(tab.version, tab.arch, tab.configName);
+  }
+
+  /** Names already used by the KConfig tabs of one revision and ARCH ("" = the unnamed first one). */
+  kconfigConfigNames(version, arch, exceptTabId = null) {
+    return new Set(this.kconfigTabs()
+      .filter((t) => t.id !== exceptTabId && t.version === version && t.arch === arch)
+      .map((t) => t.configName || ""));
+  }
+
+  /** First free copy name for a revision and ARCH: "v2", "v3", … (the unnamed one counts as v1). */
+  nextKconfigConfigName(version, arch, exceptTabId = null) {
+    const used = this.kconfigConfigNames(version, arch, exceptTabId);
+    for (let n = 2; ; n += 1) {
+      if (!used.has(`v${n}`)) return `v${n}`;
+    }
+  }
+
+  /**
+   * Give a KConfig tab a free name when another tab already holds its "version|ARCH|name" (after a
+   * revision or ARCH switch), so two tabs never share one configuration. Returns the name it got.
+   */
+  ensureUniqueKconfigConfigName(tab) {
+    if (!tab || tab.type !== "kconfig") return "";
+    const used = this.kconfigConfigNames(tab.version, tab.arch, tab.id);
+    if (!used.has(tab.configName || "")) return tab.configName || "";
+    tab.configName = this.nextKconfigConfigName(tab.version, tab.arch, tab.id);
+    this.saveState();
+    return tab.configName;
+  }
+
+  /** Move a saved configuration and its toolchain profile to another key (rename, ARCH switch). */
+  moveKconfigProfile(fromKey, toKey) {
+    if (!fromKey || !toKey || fromKey === toKey) return;
+    if (this.kconfigProfiles[fromKey]) {
+      this.kconfigProfiles[toKey] = this.kconfigProfiles[fromKey];
+      delete this.kconfigProfiles[fromKey];
+    }
+    if (this.kconfigToolchains[fromKey]) {
+      this.kconfigToolchains[toKey] = this.kconfigToolchains[fromKey];
+      delete this.kconfigToolchains[fromKey];
+    }
+    if (this.kconfigProfileKey === fromKey) this.kconfigProfileKey = toKey;
+    this.saveState();
+  }
+
+  /** Whether any KConfig tab holds the constraint engine. */
+  get kconfigEngineActive() {
+    return Boolean(this.kconfigEngineTabId);
+  }
+
+  /** Whether this KConfig tab is the one holding the engine. */
+  isKconfigEngineOwner(tabId) {
+    return Boolean(tabId) && this.kconfigEngineTabId === tabId;
+  }
+
+  /** The tab holding the engine, or null when it is off. */
+  kconfigEngineOwnerTab() {
+    return this.kconfigEngineTabId ? this.findTab(this.kconfigEngineTabId) : null;
+  }
+
+  /** Every open KConfig tab, in pane order. */
+  kconfigTabs() {
+    return this.panes.flatMap((p) => p.tabs.filter((t) => t.type === "kconfig"));
+  }
+
+  /**
+   * Ask a KConfig tab to take the engine. It is a request, not a decision: the tab's view asks the
+   * user about the values kconfig would change before taking it (webapp/API.md §5.0). A tab in the
+   * background is shown first, and claims the request when its view renders.
+   */
+  requestKconfigEngine(tabId) {
+    if (!tabId) return false;
+    this.kconfigEnginePendingTabId = tabId;
+    this.focusTab(tabId);
+    this.emit("kconfig:engine:requested", tabId);
+    return true;
+  }
+
+  /** Claim a pending engine request for this tab (true once). */
+  takeKconfigEngineRequest(tabId) {
+    if (!tabId || this.kconfigEnginePendingTabId !== tabId) return false;
+    this.kconfigEnginePendingTabId = "";
+    return true;
+  }
+
+  /**
+   * Hand the engine to one KConfig tab (by id) or turn it off (null/""). Handing it over takes it
+   * from whichever tab held it, so at most one engine is ever enabled. Configurations are untouched:
+   * each one stays in `kconfigProfiles` under its "version|ARCH" key.
+   */
+  setKconfigEngineOwner(tabId) {
+    const next = tabId || "";
+    if (next === this.kconfigEngineTabId) return;
+    const previousTabId = this.kconfigEngineTabId;
+    this.kconfigEngineTabId = next;
+    this.emit("kconfig:engine:changed", { active: Boolean(next), tabId: next, previousTabId });
+    this.saveState();
   }
 
   /** Whether the KConfig engine is on with a resolved configuration (gates #ifdef dimming and build banners). */
@@ -122,14 +243,6 @@ class GlobalState {
       return { arch: this.kconfigProfileKey.split("|")[1], assignments: this.kconfigAssignments, strict: true };
     }
     return { arch: DEFAULT_DEFINITION_ARCH, assignments: DEFAULT_ARCH_BASELINE, strict: false };
-  }
-
-  setKconfigEngineActive(active) {
-    const val = Boolean(active);
-    if (val === this.kconfigEngineActive) return;
-    this.kconfigEngineActive = val;
-    this.emit("kconfig:engine:changed", val);
-    this.saveState();
   }
 
   syncVersionFromTab(version) {
@@ -185,6 +298,30 @@ class GlobalState {
     return pane.tabs.find((t) => t.id === pane.activeTabId) || null;
   }
 
+  /** Tab with this id in any pane, or null. */
+  findTab(tabId) {
+    if (!tabId) return null;
+    for (const pane of this.panes) {
+      const tab = pane.tabs.find((t) => t.id === tabId);
+      if (tab) return tab;
+    }
+    return null;
+  }
+
+  /** Show an already open tab (and activate its pane) so its view renders. */
+  focusTab(tabId) {
+    const pane = this.panes.find((p) => p.tabs.some((t) => t.id === tabId));
+    if (!pane) return false;
+    const wasShown = pane.activeTabId === tabId && this.activePaneId === pane.id;
+    pane.activeTabId = tabId;
+    this.activePaneId = pane.id;
+    if (!wasShown) {
+      this.emit("tabs:changed", { paneId: pane.id, activeTabId: tabId });
+      this.saveState();
+    }
+    return true;
+  }
+
   openTab(tabData, targetPaneId = null) {
     const pane = targetPaneId ? this.getPane(targetPaneId) : this.getActivePane();
     if (!pane) return;
@@ -195,7 +332,7 @@ class GlobalState {
       : pane.tabs.find((t) => {
           if (t.type !== tabData.type) return false;
           if (t.type === "code") return t.path === tabData.path && t.version === tabData.version;
-          if (t.type === "kconfig") return t.arch === tabData.arch && t.version === tabData.version;
+          if (t.type === "kconfig") return t.arch === tabData.arch && t.version === tabData.version && (t.configName || "") === (tabData.configName || "");
           if (t.type === "nodemap" && (tabData.initialNodes || tabData.initialNode)) return false;
           if (t.type === "diff") return true;
           return t.title === tabData.title;
@@ -235,6 +372,10 @@ class GlobalState {
 
     pane.tabs.splice(idx, 1);
 
+    // A closed tab cannot hold the engine; its configuration stays in kconfigProfiles
+    const releasedEngine = this.kconfigEngineTabId === tabId;
+    if (releasedEngine) this.kconfigEngineTabId = "";
+
     if (pane.activeTabId === tabId) {
       if (pane.tabs.length > 0) {
         const nextTab = pane.tabs[Math.max(0, idx - 1)];
@@ -247,6 +388,9 @@ class GlobalState {
       }
     }
 
+    if (releasedEngine) {
+      this.emit("kconfig:engine:changed", { active: false, tabId: "", previousTabId: tabId });
+    }
     this.emit("tabs:changed", { paneId: pane.id, activeTabId: pane.activeTabId });
     this.saveState();
   }
@@ -260,7 +404,12 @@ class GlobalState {
     this.saveState();
   }
 
-  setKconfigAssignments(newAssignments, profileKey = null) {
+  /**
+   * Store a configuration under its "version|ARCH" profile. `publish` (the default) also makes it
+   * the active configuration used for dimming; a KConfig tab that does not hold the engine passes
+   * `publish: false` so it cannot overwrite the engine owner's resolved configuration.
+   */
+  setKconfigAssignments(newAssignments, profileKey = null, { publish = true } = {}) {
     const normalized = {};
     const bareOnly = {};
     for (const [k, v] of Object.entries(newAssignments || {})) {
@@ -268,6 +417,11 @@ class GlobalState {
       normalized[bare] = v;
       normalized[`CONFIG_${bare}`] = v;
       bareOnly[bare] = v;
+    }
+    if (!publish) {
+      if (profileKey) this.kconfigProfiles[profileKey] = bareOnly;
+      this.saveState();
+      return;
     }
     if (profileKey) this.kconfigProfileKey = profileKey;
     if (this.kconfigProfileKey) this.kconfigProfiles[this.kconfigProfileKey] = bareOnly;
@@ -301,7 +455,7 @@ class GlobalState {
       const stateObj = {
         version: this.currentVersion,
         repo: this.currentRepo,
-        kconfigEngineActive: this.kconfigEngineActive,
+        kconfigEngineTabId: this.kconfigEngineTabId,
         splitMode: this.splitMode,
         activePaneId: this.activePaneId,
         panes: this.panes,
@@ -328,7 +482,7 @@ class GlobalState {
           this.currentVersion = "v3.0";
         }
         if (typeof parsed.repo === "string") this.currentRepo = parsed.repo;
-        if (typeof parsed.kconfigEngineActive === "boolean") this.kconfigEngineActive = parsed.kconfigEngineActive;
+        if (typeof parsed.kconfigEngineTabId === "string") this.kconfigEngineTabId = parsed.kconfigEngineTabId;
         if (parsed.splitMode) this.splitMode = parsed.splitMode;
         if (parsed.activePaneId) this.activePaneId = parsed.activePaneId;
         if (Array.isArray(parsed.panes) && parsed.panes.length > 0) {
@@ -347,6 +501,10 @@ class GlobalState {
         if (parsed.kconfigProfiles && typeof parsed.kconfigProfiles === "object") this.kconfigProfiles = parsed.kconfigProfiles;
         if (typeof parsed.kconfigProfileKey === "string") this.kconfigProfileKey = parsed.kconfigProfileKey;
         if (parsed.kconfigToolchains && typeof parsed.kconfigToolchains === "object") this.kconfigToolchains = parsed.kconfigToolchains;
+        // The engine belongs to a live KConfig tab or to none (sessions saved before it was owned
+        // by a tab, and tabs closed since, leave it off; their configurations are kept)
+        const owner = this.findTab(this.kconfigEngineTabId);
+        if (!owner || owner.type !== "kconfig") this.kconfigEngineTabId = "";
       }
     } catch (e) {
       console.warn("Failed to load saved state:", e);

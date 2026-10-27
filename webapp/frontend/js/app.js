@@ -9,6 +9,7 @@ import { toast } from "./components/toast.js";
 import { TabsComponent } from "./components/tabs.js";
 import { contextMenu } from "./components/context_menu.js";
 import { refPicker, shortRef, isCommitRef } from "./components/ref_picker.js";
+import { requestVersionSwitch } from "./components/version_switch.js";
 import { commandPalette } from "./components/command_palette.js";
 import { showPatchModal } from "./components/patch_modal.js";
 import { showSymbolHistoryModal } from "./components/symbol_history_modal.js";
@@ -30,8 +31,9 @@ export class KernelIdeApp {
   constructor() {
     this.tabsComponent = null;
     this.viewRenderers = {
-      code: new VirtualEditor(),
-      kconfig: new KconfigView(),
+      // One view per tab (code and kconfig): each keeps its own file, dimming and engine state
+      code: () => new VirtualEditor(),
+      kconfig: () => new KconfigView(),
       nodemap: new NodeMapController(),
       maintainers: new MaintainersView(),
       commits: new CommitsView(),
@@ -443,7 +445,7 @@ export class KernelIdeApp {
         branchSelect.innerHTML = branches.map(b => `<option value="${b.name}" ${b.is_default ? "selected" : ""}>${b.name}</option>`).join("");
         branchSelect.onchange = (e) => {
           const val = e.target.value;
-          if (val) state.setVersion(val);
+          if (val) requestVersionSwitch(val);
         };
       } catch (err) {
         console.warn("Could not load branches:", err);
@@ -470,14 +472,14 @@ export class KernelIdeApp {
         const base = e.target.value;
         if (!base || base.includes("object")) return;
         const target = this.versionByName.has(base) ? base : (this.rcsByBase.get(base) || []).slice(-1)[0]?.vname;
-        if (target && target !== state.currentVersion) state.setVersion(target);
+        if (target) requestVersionSwitch(target);
       };
 
       const rcSelect = document.getElementById("rc-select");
       if (rcSelect) {
         rcSelect.onchange = (e) => {
           const val = e.target.value;
-          if (val && val !== state.currentVersion) state.setVersion(val);
+          if (val) requestVersionSwitch(val);
         };
       }
     } catch (e) {
@@ -492,7 +494,7 @@ export class KernelIdeApp {
         refPicker.open(commitBtn, {
           current: state.currentVersion,
           onSelect: (ref) => {
-            if (ref && ref !== state.currentVersion) state.setVersion(ref);
+            if (ref) requestVersionSwitch(ref);
           }
         });
       };
@@ -677,8 +679,21 @@ export class KernelIdeApp {
       {
         title: `${state.kconfigEngineActive ? "Disable" : "Enable"} KConfig engine (#ifdef dimming)`, hint: "Dims compiled-out preprocessor branches", keywords: "ifdef dim preprocessor",
         run: () => {
-          state.setKconfigEngineActive(!state.kconfigEngineActive);
-          toast.info(`KConfig engine ${state.kconfigEngineActive ? "enabled" : "disabled"}`);
+          if (state.kconfigEngineActive) {
+            const owner = state.kconfigEngineOwnerTab();
+            state.setKconfigEngineOwner(null);
+            toast.info(`KConfig engine disabled${owner ? ` in ${owner.title}` : ""} (its configuration is kept)`);
+            return;
+          }
+          // The engine resolves the configuration of one KConfig tab, so it needs one to belong to
+          const active = state.getActiveTab();
+          const target = active && active.type === "kconfig" ? active : state.kconfigTabs()[0];
+          if (!target) {
+            toast.info("Open a KConfig tab to enable the engine");
+            return;
+          }
+          // The tab shows what resolving its values changes before it takes the engine (§5.0)
+          state.requestKconfigEngine(target.id);
         }
       },
       { title: "Open Git commits timeline", hint: "History of the version", keywords: "log", run: () => state.openTab({ type: "commits", title: "Commits" }) },

@@ -6,6 +6,7 @@ import { state } from "../../state.js";
 import { debounce } from "../../utils/debounce.js";
 import { showPersonModal } from "../../components/person_modal.js";
 import { toast } from "../../components/toast.js";
+import { requestVersionSwitch } from "../../components/version_switch.js";
 
 const STATUS_COLORS = { A: "var(--accent-green)", D: "var(--accent-red)", R: "#d2a8ff", M: "var(--accent-yellow)" };
 // Files whose diff is longer than this start collapsed in the inline commit diff
@@ -521,8 +522,9 @@ export class CommitsView {
 
       const exploreCommitBtn = detailEl.querySelector("#btn-explore-commit");
       if (exploreCommitBtn && c.commit_hash) {
-        exploreCommitBtn.onclick = () => {
-          state.setVersion(c.commit_hash);
+        exploreCommitBtn.onclick = async () => {
+          // Declining leaves the explored revision (and any KConfig tab) alone; the commit still opens
+          await requestVersionSwitch(c.commit_hash);
           toast.success(`Switched exploration target to commit ${c.commit_hash.slice(0, 8)}`);
           state.openTab({
             type: "code",

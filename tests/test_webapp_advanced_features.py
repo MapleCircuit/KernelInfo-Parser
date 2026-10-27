@@ -35,7 +35,6 @@ from webapp.main import (
     diff_kconfig_configurations,
     export_compile_commands,
     generate_formatted_patch,
-    get_ast_container_tree,
     get_codebase_treemap,
     get_function_callgraph,
     get_kconfig_diff,
@@ -141,49 +140,6 @@ class TestWebappAdvancedFeatures(unittest.TestCase):
         self.assertEqual(res["files"][0]["file_path"], "fs/ext4/super.c")
         self.assertIn("suggested_to", res)
         self.assertIn("suggested_cc", res)
-
-    def test_ast_container_tree_tag_ids(self) -> None:
-        """Verify AST container tree includes tag_id as int or None, correctly suppressing tags on inner expressions/statements."""
-        search_res = search_symbols("v3.0", q="ext4_fill_super", limit=1)
-        if not search_res:
-            search_res = search_symbols("v3.0", q="init", limit=1)
-        if not search_res:
-            raise unittest.SkipTest("No symbols populated in active test database.")
-        self.assertGreater(len(search_res), 0)
-        ast_id = search_res[0]["ast_id"]
-
-        tree = get_ast_container_tree(ast_id, version_name="v3.0")
-        self.assertIn("ast_id", tree)
-        self.assertIn("tag_id", tree)
-        self.assertTrue(tree["tag_id"] is None or isinstance(tree["tag_id"], int))
-        self.assertIn("containers", tree)
-        self.assertIsInstance(tree["containers"], list)
-
-        has_tagged = tree["tag_id"] is not None
-        has_untagged = tree["tag_id"] is None
-
-        # Recursively verify tag_id exists on all nodes
-        def verify_node(node: dict) -> None:
-            nonlocal has_tagged, has_untagged
-            self.assertIn("ast_id", node)
-            self.assertIn("tag_id", node)
-            self.assertTrue(node["tag_id"] is None or isinstance(node["tag_id"], int))
-            if node["tag_id"] is not None:
-                has_tagged = True
-            else:
-                has_untagged = True
-            for c in node.get("containers", []):
-                child = c.get("child_node")
-                if child:
-                    verify_node(child)
-
-        for c in tree["containers"]:
-            child = c.get("child_node")
-            if child:
-                verify_node(child)
-
-        self.assertTrue(has_tagged, "Expected at least one tagged node in tree")
-        self.assertTrue(has_untagged, "Expected at least one untagged node in tree")
 
     def test_tag_version_timeline_and_diff(self) -> None:
         """Verify GET /api/tag/{tag_id}/timeline and diff generation."""

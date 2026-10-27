@@ -8,6 +8,7 @@ import { api } from "../api.js";
 import { state } from "../state.js";
 import { debounce } from "../utils/debounce.js";
 import { shortRef } from "./ref_picker.js";
+import { requestVersionSwitch } from "./version_switch.js";
 
 function escapeHtml(str) {
   return String(str ?? "")
@@ -195,7 +196,7 @@ class CommandPalette {
       for (const c of val(commits)?.commits || []) {
         items.push({
           section: "Commits", icon: "●", title: c.subject || c.commit_hash, detail: `${c.commit_hash.slice(0, 12)} · ${c.author_name || c.author_email || ""}`, highlightQuery: query,
-          run: () => state.setVersion(c.commit_hash),
+          run: () => requestVersionSwitch(c.commit_hash),
         });
       }
       if (items.length === 0) {

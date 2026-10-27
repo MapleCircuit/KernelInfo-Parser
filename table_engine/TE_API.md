@@ -63,6 +63,7 @@ Stateful caching, sequence coordination, relational view decomposition, and batc
 | `_cached_rows` | `dict[int, list[tuple] | SharedTableRowSequenceView]` | In-memory row storage for `te_cached` tables: `table_id -> [projected_row_tuple, ...]`, backed by zero-copy `SharedTableRowSequenceView` when huge-page shared memory is active. |
 | `_pk_index` | `dict[int, dict[Any, tuple] | SharedTablePKView]` | O(1) exact row lookup: `table_id -> {primary_key_val: row_tuple}`, backed by zero-copy `SharedTablePKView` when huge-page shared memory is active. |
 | `_nodup_index` | `dict[int, dict[tuple, int]]` | O(1) deduplication lookup: `table_id -> {columns[1:]: assigned_id}`. |
+| `_nodup_complete` | `set[int]` | `no_duplicate` tables whose `_nodup_index` holds every row of the database (preloaded in full and indexed since): a key it misses is new and needs no lookup. A table leaves the set when its cache is purged. |
 | `_col_indices` | `dict[int, dict[int, dict[SafeDataType, list[tuple]]]]` | Selective inverted column index: `table_id -> {col_idx: {column_val: [matching_row, ...]}}` (exempts primary key columns). |
 | `_shared_buffer` | `SharedTableReader \| None` | Structured shared memory segment backed by huge pages (1GB/2MB/THP) containing preloaded baseline tables. |
 | `hugepages` | `str` | Active huge page allocation mode (`"auto"`, `"1g"`, `"2m"`, `"thp"`, `"off"`). |
@@ -109,6 +110,7 @@ Internal helper methods used exclusively by `TECachedDB` to synchronize in-memor
 - `_index_row(table: Table, row: tuple) -> None`: Indexes a row into `_pk_index`, `_nodup_index`, and selectively into `_col_indices` (exempting primary key columns).
 - `_unindex_row(table: Table, row: tuple) -> None`: Removes a row from all internal indices prior to updating.
 - `_ensure_table(table_id: int) -> None`: Initializes cache lists and index dictionaries for a table upon first access.
+- `_committed_nodup_id(table_id: int, columns: tuple) -> int | None`: The id a `no_duplicate` key already has, from `_nodup_index`, then `_committed_nodup_keys`. A table outside `_nodup_complete` (its cache was purged by `clear_cache()` or a `commit(update_in_mem_indexes=False)`) resolves a miss with one targeted `db.select()` through `_db_read()`, memoized in `_committed_nodup_keys`. `None` means the key is new. Without it, staging after a purge minted a second id for content already stored (duplicate `m_file_name` rows, `m_file_blob` unique-key violations).
 
 ### 3.5. Structured Shared Memory with Huge Pages (`table_engine/shared_buffer.py`)
 - **`SharedBufferAllocator.allocate(size: int, mode: str = "auto") -> tuple[mmap.mmap, str, int]`**: Allocates shared memory with tiered fallback: `1GB HugeTLB` (`MAP_HUGE_1GB`) $\to$ `2MB HugeTLB` (`MAP_HUGE_2MB`) $\to$ `2MB Transparent Huge Pages` (`madvise(MADV_HUGEPAGE)`) $\to$ standard `4KB anonymous mmap`.
@@ -160,7 +162,7 @@ Internal helper methods used exclusively by `TECachedDB` to synchronize in-memor
 - **`get(table_id: int, columns: tuple[SafeDataType, ...]) -> tuple[SafeDataType, ...] | None`**
   - **In `TECachedDB` (`te_cached=True` tables)**:
     1. **Primary Key Fast-Path**: If all primary key columns are non-None, checks local overlay `_pk_index[table_id].get(pk)`. If missing and `_shared_buffer` is active, probes the shared memory open-addressing hash index via `_shared_buffer.get_row_by_pk(table_id, pk)`. If missing and `version_scoped=True`, falls back to `db.select()`.
-    2. **Deduplication Key Fast-Path**: If `table.no_duplicate` and `columns[1:]` non-None, checks `_nodup_index[table_id].get(columns[1:])`, verifies via `_match_columns(row, columns)`.
+    2. **Deduplication Key Fast-Path**: If `table.no_duplicate` and `columns[1:]` non-None, resolves the id with `_committed_nodup_id()` (see below) and verifies the row via `_match_columns(row, columns)`.
     3. **Column Index Accelerated Path**: Identifies all indexed non-None columns in `_col_indices`, selects the column index with the smallest candidate pool, and checks candidate matches via `_match_columns(row, columns)`. If missing and `version_scoped=True`, falls back to `db.select()`.
     4. **In-Memory Linear Scan & Shared Scan**: Scans `_cached_rows[table_id]` using `_match_columns(row, columns)`. If missing and `_shared_buffer` is active, scans shared memory records via `_shared_buffer.scan_matching(table_id, columns)`. Falls back to `db.select()` for out-of-window version-scoped queries.
   - **In `TEDirectDB` (or non-cached tables)**:
@@ -179,6 +181,7 @@ Internal helper methods used exclusively by `TECachedDB` to synchronize in-memor
   - **Case 1 (`table.no_duplicate == True`)**:
     - Key: `key = columns[1:]`.
     - If in cache/staged: returns `(assigned_id, *columns[1:])`.
+    - If the database already has the key (`_committed_nodup_id()`): returns its row and, in `TECachedDB`, caches it. This also applies with `update_in_mem_indexes=False`, where nothing is staged under a new id.
     - Else: assigns `assigned_id = next_id[table_id]`, increments `next_id[table_id] += 1`, stages `queued_set[table_id][key] = assigned_id`.
     - In `TECachedDB`: Appends row to `_cached_rows` and calls `_index_row()`.
     - Returns `(assigned_id, *columns[1:])`.

@@ -36,6 +36,7 @@ class UrlSynchronizer {
       const file = params.get("file");
       const line = parseInt(params.get("line") || "1", 10);
       const arch = params.get("arch") || "x86_64";
+      const cfg = params.get("cfg") || ""; // named copy of that ARCH's configuration, if any
 
       if (v) state.setVersion(v);
 
@@ -50,8 +51,9 @@ class UrlSynchronizer {
       } else if (tabType === "kconfig") {
         state.openTab({
           type: "kconfig",
-          title: `KConfig (${arch})`,
+          title: `KConfig (${arch})${cfg ? ` · ${cfg}` : ""}`,
           arch,
+          configName: cfg,
           version: v || state.currentVersion
         });
       } else if (tabType === "nodemap") {
@@ -83,6 +85,7 @@ class UrlSynchronizer {
       }
     } else if (activeTab.type === "kconfig" && activeTab.arch) {
       params.set("arch", activeTab.arch);
+      if (activeTab.configName) params.set("cfg", activeTab.configName);
     }
 
     const newHash = "#" + params.toString();

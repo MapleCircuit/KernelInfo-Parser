@@ -25,6 +25,9 @@ const BUILD_TRACKED_RE = /\.(c|h|S|rs|lds|dts|dtsi|inc)$/i;
 const ROW_HEIGHT = 20; // 20px per line
 const BUFFER_LINES = 15; // lines buffered above and below viewport
 
+// Compiled-out lines shown undimmed: one choice shared by every code tab (not persisted)
+let dimSuspendedAll = false;
+
 export class VirtualEditor {
   constructor() {
     this.rawLines = [];
@@ -46,20 +49,55 @@ export class VirtualEditor {
 
     this.directiveEvaluator = new DirectiveEvaluator();
     this.dimmedLines = new Set();
-    // Compiled-out lines shown undimmed (toggled from the #ifdef chip; lasts until toggled back or reload)
-    this.dimSuspended = false;
     // Build condition of the open file: { key: "version|arch|path", cond } (re-evaluated on config edits)
     this.buildCond = null;
     this.buildToken = 0;
+    // Tab this view renders (one view per code tab, built by TabsComponent)
+    this.tabId = null;
+
+    // Every change to the KConfig engine or its configuration changes which lines are compiled out
+    // and whether the file is compiled at all, so this tab recomputes both. A tab that is not on
+    // screen does nothing here: showing it re-renders it, which recomputes them from scratch.
     const refreshDimming = () => {
-      if (!this.linesContainer || !this.rawLines.length) return;
+      if (!this.isLive() || !this.rawLines.length) return;
       this.computeDimming();
       this.updateVisibleLines();
       this.refreshBuildBanner();
     };
-    state.subscribe("kconfig:engine:changed", refreshDimming);
-    state.subscribe("kconfig:assignments:updated", refreshDimming);
-    state.subscribe("kconfig:assignment:changed", refreshDimming);
+    this.unsubscribers = [
+      state.subscribe("kconfig:engine:changed", refreshDimming),
+      state.subscribe("kconfig:assignments:updated", refreshDimming),
+      state.subscribe("kconfig:assignment:changed", refreshDimming),
+      state.subscribe("code:dim-suspended", () => {
+        if (!this.isLive()) return;
+        const chip = this.containerEl?.querySelector("#kconfig-dim-chip");
+        if (chip && this.dimmingAvailable()) this.updateDimChip(chip);
+        this.updateVisibleLines();
+      }),
+    ];
+  }
+
+  /** Compiled-out lines shown undimmed; the choice is shared by every code tab. */
+  get dimSuspended() {
+    return dimSuspendedAll;
+  }
+
+  set dimSuspended(value) {
+    dimSuspendedAll = Boolean(value);
+  }
+
+  /** Whether this view's lines are the ones on screen (its tab may have been re-rendered or closed). */
+  isLive() {
+    return Boolean(this.linesContainer && this.linesContainer.isConnected);
+  }
+
+  /** Called when this tab is closed (TabsComponent.pruneTabViews). */
+  dispose() {
+    (this.unsubscribers || []).forEach((off) => off());
+    this.unsubscribers = [];
+    this.containerEl = null;
+    this.linesContainer = null;
+    this.rawLines = [];
   }
 
   /** #ifdef dimming is only active while the Kconfig engine is enabled with a resolved configuration. */
@@ -98,6 +136,7 @@ export class VirtualEditor {
     const chip = this.containerEl?.querySelector("#kconfig-dim-chip");
     if (chip && this.dimmingAvailable()) this.updateDimChip(chip);
     this.updateVisibleLines();
+    state.emit("code:dim-suspended", this.dimSuspended); // the choice applies to every code tab
   }
 
   /**
@@ -160,6 +199,7 @@ export class VirtualEditor {
 
   async render(containerEl, tabData) {
     this.tabData = tabData;
+    this.tabId = tabData.id || null;
     this.containerEl = containerEl;
     this.currentFilePath = tabData.path;
     this.currentVersion = tabData.version || state.currentVersion;

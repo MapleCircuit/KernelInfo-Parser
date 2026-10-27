@@ -1011,6 +1011,28 @@ class TestTECachedDBIntegrity(unittest.TestCase):
         self.te.set(t_id, (1, 11, 101))
         self.assertEqual(self.te.get(t_id, (1, 11, None)), (1, 11, 101))
 
+    def test_nodup_reuses_committed_id_after_cache_purge(self) -> None:
+        """Verify set() on a no_duplicate table resolves a key the database already holds after the caches
+        were purged (a cleared cache used to mint a second id for the same content)."""
+        self.te.start(ALL_FAKE_TABLES, lambda: self.db)
+        t_id = fake_tbl_cached_nodup.table_id
+
+        first = self.te.set(t_id, (None, "purge_sym"))
+        self.te.commit_all(update_in_mem_indexes=False)
+        self.assertNotIn(t_id, self.te._nodup_index)
+
+        # Staged with indexing back on (Step 6.1) and with it off (Step 6.5 onwards)
+        self.assertEqual(self.te.set(t_id, (None, "purge_sym")), first)
+        self.assertEqual(self.te.get(t_id, (None, "purge_sym")), first)
+        self.te.update_in_mem_indexes = False
+        self.assertEqual(self.te.set(t_id, (None, "purge_sym")), first)
+        self.te.update_in_mem_indexes = True
+
+        # No second id was minted for the key and nothing new was staged for it
+        self.assertEqual(self.te.next_id[t_id], first[0] + 1)
+        self.assertEqual(self.te.queued_set[t_id], {})
+        self.assertEqual(self.db.select(fake_tbl_cached_nodup, (None, "purge_sym")), first)
+
     def test_dynamic_update_in_mem_indexes_toggle(self) -> None:
         """Verify disabling update_in_mem_indexes skips in-memory index updates on set and update."""
         self.te.start(ALL_FAKE_TABLES, lambda: self.db)

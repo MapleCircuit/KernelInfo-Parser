@@ -5,6 +5,7 @@ import { api } from "../api.js";
 import { state } from "../state.js";
 import { toast } from "./toast.js";
 import { copyToClipboard } from "../utils/clipboard.js";
+import { requestVersionSwitch } from "./version_switch.js";
 
 export async function showFileHistoryModal(version, filePath) {
   // Remove existing modals if open
@@ -141,9 +142,9 @@ export async function showFileHistoryModal(version, filePath) {
     // Attach actions
     const summaryExploreBtn = bodyEl.querySelector("#btn-summary-explore");
     if (summaryExploreBtn && lastChanged) {
-      summaryExploreBtn.onclick = () => {
+      summaryExploreBtn.onclick = async () => {
         close();
-        state.setVersion(lastChanged.commit_hash);
+        await requestVersionSwitch(lastChanged.commit_hash);
         state.openTab({
           type: "code",
           title: cleanPath.split("/").pop(),
@@ -168,10 +169,10 @@ export async function showFileHistoryModal(version, filePath) {
     });
 
     bodyEl.querySelectorAll(".btn-explore-commit").forEach((btn) => {
-      btn.onclick = () => {
+      btn.onclick = async () => {
         const hash = btn.dataset.hash;
         close();
-        state.setVersion(hash);
+        await requestVersionSwitch(hash);
         state.openTab({
           type: "code",
           title: cleanPath.split("/").pop(),
