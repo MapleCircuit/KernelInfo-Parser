@@ -132,6 +132,6 @@ def get_backend_server_config() -> dict[str, Any]:
     return get_webapp_config()
 
 
-def get_backend_ssh_tunnel_config() -> dict[str, Any]:
+def get_backend_ssh_tunnel_config(feature: str = "database") -> dict[str, Any]:
     """Retrieve verified SSH tunnel configuration."""
-    return get_ssh_tunnel_config()
+    return get_ssh_tunnel_config(feature)

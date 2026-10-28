@@ -514,15 +514,17 @@ Main Process (STEP 6.1+: Post-Processing Subsystems) TableEngine (G.TE)         
 
 ### 7.1. Unified Configuration Hierarchy
 - Configuration settings follow strict precedence: `CLI Flags > Environment Variables > config.json > Built-in Defaults`.
-- When configuring or synchronizing database parameters, both `DB_*` and `MYSQL_*` environment variables remain synchronized via `sync_environ()`, tracking internally exported keys in `_EXPORTED_ENV_VARS` via `_get_user_env()` to prevent environment self-pollution during configuration reloads.
+- When configuring or synchronizing database parameters, `DB_*` and `MYSQL_*` environment variables (including `DB_SOCKET`, `MYSQL_UNIX_PORT`, `MYSQL_SOCKET`) remain synchronized via `sync_environ()`, tracking internally exported keys in `_EXPORTED_ENV_VARS` via `_get_user_env()` to prevent environment self-pollution during configuration reloads.
 - Sections:
-  - `"database"`: MariaDB/MySQL connection settings (`host`, `port`, `user`, `password`, `database`, `timeout`, `engine`) and `server_tuning`: server variables `main()` raises once per run with `MariaDB.apply_server_tuning()` (`_apply_db_server_tuning()`; defaults `innodb_buffer_pool_size` 8G, `innodb_log_file_size` 2G, `innodb_flush_log_at_trx_commit` 2, `innodb_io_capacity` 1000; `{}` disables it). A local server's buffer pool is capped at a quarter of RAM, and a warning is logged when `parser.mem_max` plus the pool exceed RAM. Runtime values last until the server restarts, and MariaDB 10.11 only grows the buffer pool up to `innodb_buffer_pool_size_max`, fixed at server start, so the pool size also belongs in the server's configuration (the log says `capped at ...` otherwise).
-  - `"webapp"`: FastApi server settings (`host`, `port`, `reload`).
+  - `"database"`: MariaDB/MySQL connection settings (`host`, `port`, `user`, `password`, `database`, `timeout`, `engine`, `unix_socket`), `server_tuning` (`innodb_buffer_pool_size`, `innodb_log_file_size`, `innodb_flush_log_at_trx_commit`, `innodb_io_capacity`), and embedded feature `ssh_tunnel` (`enabled`, `host`, `port`, `user`, `password`, `key_file`, `remote_host`, `remote_port`, `local_port`, `strict_host_key_checking`, `connect_timeout`).
+    - **Unix Domain Socket Support**: When `ssh_tunnel` is inactive, MariaDB connections on local hosts (`localhost`, `127.0.0.1`) can connect via low-latency Unix domain sockets (`/run/mysqld/mysqld.sock`, `/var/run/mysqld/mysqld.sock`, `/tmp/mysql.sock`), bypassing the TCP loopback network stack. Controlled by `"unix_socket"` (`"auto"`, explicit path, or `"disabled"`/`"none"` to force TCP), environment variables (`DB_SOCKET` / `MYSQL_UNIX_PORT`), or CLI flag `--db-socket`.
+  - `"webapp"`: FastAPI server settings (`host`, `port`, `reload`).
   - `"parser"`: TableEngine, memory mode, fidelity auditing, memory limits (`table_engine`, `memory_mode`, `fidelity`, `mem_max`, `hugepages`) and `symbol_layout` (`"tag"`, default: symbol rows stored once per tag; `"blob"`: per blob, sets `G.SYMBOL_LAYOUT`).
-  - `"ssh_tunnel"`: Secure remote database port forwarding configuration (`enabled`, `host`, `port`, `user`, `password`, `key_file`, `remote_host`, `remote_port`, `local_port`, `strict_host_key_checking`, `connect_timeout`).
+  - `"mailing_list"`: Mailing list ingestion feature configuration, including dedicated `ssh_tunnel` settings.
+  - `"ssh_tunnel"`: Backward compatibility alias mirroring `database.ssh_tunnel` for legacy configurations.
   - `"workspace"`: `repos_dir` (default `"repos"`, relative to the project root) holding the Git repositories to parse, and `auto_detect_repos` (default `true`).
   - `"repositories"`: List of tracked repositories. Each entry carries `name`, `path` (relative to the project root; symlinked repositories keep their `repos/<name>` path), `project`, `default_branch`, `git_url`, `root_commit`, `start_ref` (default: `root_commit`), `enabled`, and optionally `"default": true`.
-- Functions: `init_config(path)`, `get_config()`, `get_db_config()`, `get_webapp_config()`, `get_parser_config()`, `get_ssh_tunnel_config()`, `get_workspace_config()`, `sync_environ(cfg)`.
+- Functions: `init_config(path)`, `get_config()`, `get_db_config()`, `get_webapp_config()`, `get_parser_config()`, `get_mailing_list_config()`, `get_ssh_tunnel_config(feature="database")`, `get_workspace_config()`, `sync_environ(cfg)`, `resolve_unix_socket(socket_path, host)`.
 
 ### 7.1.1. Repository Auto-Detection & Selection
 - `find_repository_dirs()` lists Git repositories (work trees, gitfiles, or bare repositories) directly under `workspace.repos_dir`; `detect_repository(path)` describes one (`git symbolic-ref` for the branch, falling back to `origin/HEAD`, then `master`/`main`; `remote.origin.url`; `rev-list --max-parents=0 --first-parent <branch>` for `root_commit`). Results are cached per path for the process.
@@ -532,19 +534,23 @@ Main Process (STEP 6.1+: Post-Processing Subsystems) TableEngine (G.TE)         
 - **Default parse target**: Without `--ref`, `main()` starts at the selected repository's `start_ref` (its first commit by default) and continues through every subsequent release tag (`get_version_tags`). `--repo` accepts a configured repository name or a filesystem path.
 
 ### 7.2. SSH Tunnel Manager (`SSHTunnelManager`)
-- **Purpose**: Encrypts and forwards remote MariaDB connections across hosts, allowing local orchestration workers to fill remote database instances without exposing MariaDB directly over public networks. Disabled by default (`enabled: false`).
+- **Purpose**: Encrypts and forwards remote connections across hosts (e.g. MariaDB database or mailing list services), allowing local orchestration workers to reach remote instances securely without exposing ports over public networks. Disabled by default (`enabled: false`).
+- **Per-Feature Architecture**:
+  - Tunnels are configured per feature (embedded within each feature's configuration section such as `database.ssh_tunnel` and `mailing_list.ssh_tunnel`).
+  - Multiple feature tunnels can run concurrently without collision, each binding to its own configured or dynamically assigned local ephemeral port.
+  - Backward compatibility: Legacy flat `ssh_tunnel` definitions in configuration files automatically migrate into `database.ssh_tunnel`.
 - **Subprocess Execution**: Uses system OpenSSH binary (`/usr/bin/ssh`) via `subprocess.Popen` with `-N -L <local_port>:<remote_host>:<remote_port>`, `-o ExitOnForwardFailure=yes`, `-o ServerAliveInterval=15`, `-o ServerAliveCountMax=3`.
-- **Dynamic Port Binding**: If `local_port` is 0 or already occupied, dynamically allocates an ephemeral localhost port to avoid collisions with any local MySQL services running on 3306.
+- **Dynamic Port Binding**: If `local_port` is 0 or already occupied, dynamically allocates an ephemeral localhost port to avoid collisions with any local services.
 - **Authentication**:
   - Private key: Configurable path via `key_file` (`-i <key> -o IdentitiesOnly=yes`).
   - Password: Supports non-interactive authentication via `sshpass` (if installed) or dynamically provisioned secure `SSH_ASKPASS` helper scripts (with `SSH_ASKPASS_REQUIRE=force`).
   - User: Custom login username via `-l <user>` / `user@host`.
   - Host Key Verification: Defaults to `accept-new`, configurable to `no` or `yes`.
 - **Lifecycle Integration**:
-  - Invoked during application startup (`start_ssh_tunnel(cfg)`).
+  - Invoked during startup via `start_ssh_tunnel(cfg=None, feature="database")`.
   - Probes local port socket connectivity until listening (up to `connect_timeout` seconds) before declaring readiness.
-  - Automatically updates active configuration `db_cfg["host"] = "127.0.0.1"`, `db_cfg["port"] = local_port` and calls `sync_environ()`, transparently routing `G.DB` and all multiprocessing workers through the tunnel.
-  - Teardown registered via `atexit.register(stop_ssh_tunnel)` and `G.emergency_shutdown()`.
+  - Automatically updates active configuration: for `"database"`, sets `db_cfg["host"] = "127.0.0.1"`, `db_cfg["port"] = local_port` and calls `sync_environ()`, transparently routing `G.DB` and all multiprocessing workers through the tunnel. For other features (e.g. `"mailing_list"`), updates the feature's active host and port settings.
+  - Individual teardown via `stop_ssh_tunnel(feature)` or comprehensive teardown via `stop_ssh_tunnel()` (registered with `atexit` and `G.emergency_shutdown()`).
 
 ### 7.3. Cross-Chunk Deduplication & Multiprocessing Fork Safety
 - **Cross-Chunk Deduplication**: Intermediate chunk commits (`G.TE.commit_all()`) flush and clear staged queues (`queued_set`). To prevent subsequent ChangeSets or waves from attempting duplicate `INSERT INTO` queries for already-committed rows:
@@ -563,6 +569,90 @@ Main Process (STEP 6.1+: Post-Processing Subsystems) TableEngine (G.TE)         
 - **Multiprocessing Socket Refresh**:
   - The parent process must never call `start_new_db(..., is_worker=True)` after forking workers, as this resets in-memory caches and destroys preloaded table state.
   - The parent process refreshes its dedicated database socket (`if G.TE.db: G.TE.db.close(); G.TE.db = G.DB()`) to avoid socket descriptor sharing across `fork()` without altering cached state or staging queues.
+
+---
+
+## 8. Mailing List Commit Resolver Subsystem (`parser/mailing_list/`)
+
+### 8.1. High-Level Architecture
+The Mailing List subsystem maps Git revisions to corresponding patch submissions, series cover letters, and pull requests on the Linux Kernel Mailing List (LKML) via public-inbox v2 / extindex archives (`/srv/lore`).
+
+```
+==================================================================================================
+MAILING LIST COMMIT RESOLUTION PIPELINE
+--------------------------------------------------------------------------------------------------
+Kernel Git Revisions (m_commit)
+  │
+  ▼ [main.py: processing_git_commits(version) (Step 6.5) / standalone_resolve_mailing_list()]
+Feature Extraction:
+  ├── Message trailers (Link: https://lore.kernel.org/r/<mid>, Message-Id: <mid>)
+  ├── Cryptographic patch-id (git show <sha> | git patch-id --stable)
+  ├── Pre/post-image diff blob hashes (git diff-tree -r --no-commit-id <sha>)
+  └── Merge metadata (PULL_FROM_RE, BRANCH_MERGE_RE)
+  │
+  ▼ [parser/mailing_list/ml_client.py: MailingListClient]
+Execution Routing:
+  ├── Co-located: Direct in-process PublicInboxLocalStore & KernelCommitEmailResolver
+  └── Remote: HTTP batch resolution over SSH tunnel to ml_server.py daemon (port 8192)
+  │
+  ▼ [parser/mailing_list/ml_resolver.py: KernelCommitEmailResolver (5-Tier Waterfall)]
+Tier 1: Trailer Message-ID (Link: or Message-Id:)
+Tier 2: Stable Patch-ID match (XPATCHID)
+Tier 3: Post/Pre-Image blob hash match (XDFPOST / XDFPRE)
+Tier 4: Reverse commit SHA lookup in maintainer bot replies (XNQ)
+Tier 5: Constrained author, timestamp, and normalized subject window fallback
+Tier 6: Pull request ([GIT PULL]) thread match for merge commits
+  │
+  ▼ [TableEngine Staging]
+Relational Database Mapping:
+  └── m_commit_email (Table 48):
+        (commit_id, message_id, thread_id, relation_type, match_tier, patch_version, patch_idx, patch_total)
+  │
+  ▼ [Pull Request Propagation]
+Merge commit PR links propagated across all child commits (m_parents[0]..m_hash)
+==================================================================================================
+```
+
+### 8.2. Relational Schema Mapping (Table 48: `m_commit_email`)
+| Table ID | Table Name | Columns | Primary Key | `no_duplicate` | Description |
+| :---: | :--- | :--- | :--- | :---: | :--- |
+| **48** | `m_commit_email` | `(commit_id, message_id, thread_id, relation_type, match_tier, patch_version, patch_idx, patch_total)` | `("commit_id", "message_id", "relation_type")` | `False` | Bridge linking Git commits to public-inbox mailing list articles. Foreign key to `m_commit(commit_id)`. |
+
+- **Relation Types (`MLRelationType`)**:
+  - `1`: `Patch` — The specific patch email introducing this commit.
+  - `2`: `CoverLetter` — Series cover letter (`[PATCH 0/N]`).
+  - `3`: `SiblingPatch` — Other patches in the same patch series thread.
+  - `4`: `PullRequest` — Subsystem maintainer pull request thread (`[GIT PULL]`).
+- **Match Tiers (`MLMatchTier`)**:
+  - `1`: `Trailer` — Authoritative `Link:` or `Message-Id:` commit trailer.
+  - `2`: `PatchID` — Cryptographic `git patch-id --stable` hash match.
+  - `3`: `BlobHash` — Post-image or pre-image blob SHA-1 match.
+  - `4`: `BotReply` — Maintainer/bot reply referencing applied commit SHA.
+  - `5`: `MetadataFallback` — Constrained author, timestamp, and subject fallback.
+  - `6`: `PullRequest` — Matched pull request announcement for merge commits and children.
+
+### 8.3. Public-Inbox Storage & Micro-Daemon (`ml_store.py` & `ml_server.py`)
+- **Direct Storage Access**: Directly reads public-inbox v2 / extindex files without Perl dependencies:
+  - `over.sqlite3` (`?mode=ro`): Thread hierarchy (`tid`), timestamps (`ts`, `ds`), and zlib-compressed overview metadata (`ddd`). Ghost parent rows (`num <= 0`) are filtered.
+  - `msgmap.sqlite3` (`?mode=ro`): High-speed mapping of `mid` to article `num`.
+  - Sharded Xapian B-trees: Unified database querying with automatic `reopen()` recovery on concurrent writer updates (`DatabaseModifiedError`).
+  - `all.git`: Persistent `git cat-file --batch` coprocess for RFC822 raw header verification.
+- **Micro-Daemon (`ml_server.py`)**:
+  - Standalone HTTP query service listening on localhost port 8192 on the remote storage host.
+  - Endpoints:
+    - `GET /health`: Storage status, directory paths, and Xapian availability.
+    - `POST /resolve_commit`: Single commit resolution.
+    - `POST /resolve_batch`: Chunked batch commit resolution returning structured `ResolvedCommitContext` dictionaries.
+- **Client & Tunnel Management (`ml_client.py`)**:
+  - Automatically activates the dedicated `"mailing_list"` SSH tunnel if remote access is required.
+  - Verifies local archive presence when tunnel is disabled; returns descriptive errors if neither local archive nor SSH tunnel is available.
+  - Negotiates daemon version (`DAEMON_VERSION`) against `/health`; if inactive or outdated, synchronizes `parser/mailing_list` package to remote host, frees the target port via `fuser -k`, and detaches the remote daemon (`ssh -f -n` + `nohup`).
+  - Automatically terminates SSH tunnel on client close.
+  - Materializes pull request linkage across both the merge commit and all child commits in the merged branch lineage for $O(1)$ lookup performance.
+- **Store & Query Optimization (`ml_store.py`)**:
+  - Automatically resolves extindex archives under `all/` (e.g. `/srv/lore/all/ei15`).
+  - Utilizes indexed `xref3.oidbin` lookups for Git blob SHA-to-document ID resolution, avoiding full table scans over multi-million row PublicInbox archives.
+  - Provides thread and cover letter reconstruction via `over.sqlite3` indexed by `tid` and `ds`.
 
 
 

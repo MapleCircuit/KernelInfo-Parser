@@ -145,6 +145,7 @@ is served from the same origin, it still reads `X-KIP-Sync` and every other resp
 The `webapp/` backend operates exclusively as a read-only presentation and query tier. Under no circumstances may any router, service, middleware, or background task in `webapp/` execute database schema definitions (DDL: `CREATE`, `ALTER`, `DROP`, `TRUNCATE`) or data modification commands (DML: `INSERT`, `UPDATE`, `DELETE`, `REPLACE`).
 - All table creations, schema migrations, and initial seed rows (including `m_db_instance`) are the strict and exclusive responsibility of the parser engine (`core/DBLayout.py`, `main.py`).
 - Database cursors acquired via `get_db_cursor()` in `webapp/backend/database/pool.py` do not support or execute transaction commits.
+- Connection Pool: When `ssh_tunnel` is inactive and a local MariaDB instance is configured, `get_db_pool()` connects via Unix domain socket (`/run/mysqld/mysqld.sock`), automatically falling back to TCP (`127.0.0.1:3306`) if the socket is inaccessible.
 - If expected metadata tables or rows are absent, webapp endpoints must return appropriate HTTP error statuses or graceful process-level fallbacks without modifying the underlying database.
 
 ### 2.6. Frontend & Service Architectural Invariants

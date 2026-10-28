@@ -22,7 +22,7 @@ Any database backend assigned to `G.DB` or passed to `TableEngine.start()` must 
 
 ### 2.1. Lifecycle, Session & Health
 - **`__init__() -> None`**
-  - Connects to database socket and configures session variables (`sql_mode = 'NO_AUTO_VALUE_ON_ZERO'`, `max_allowed_packet = 1073741824`).
+  - Connects to database via Unix domain socket (`DB_SOCKET` / `MYSQL_UNIX_PORT`, e.g. `/run/mysqld/mysqld.sock`) when local and non-tunneled, or falls back to TCP socket (`DB_HOST`, `DB_PORT`). Configures session variables (`sql_mode = 'NO_AUTO_VALUE_ON_ZERO'`, `max_allowed_packet = 1073741824`).
 - **`__enter__() -> Self` & `__exit__(...) -> None`**
   - Context manager lifecycle; rolls back pending transaction on unhandled exception.
 - **`close() -> None`**

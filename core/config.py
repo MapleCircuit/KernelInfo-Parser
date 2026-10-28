@@ -11,6 +11,7 @@ import copy
 import json
 import logging
 import os
+import stat
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -19,7 +20,63 @@ logger = logging.getLogger(__name__)
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
-DEFAULT_CONFIG: dict[str, dict[str, Any]] = {
+DEFAULT_SSH_TUNNEL_CONFIG: dict[str, Any] = {
+    "enabled": False,
+    "host": "",
+    "port": 22,
+    "user": "",
+    "password": "",
+    "key_file": "",
+    "remote_host": "127.0.0.1",
+    "remote_port": 0,
+    "local_port": 0,
+    "strict_host_key_checking": "accept-new",
+    "connect_timeout": 10,
+}
+
+STANDARD_UNIX_SOCKETS: tuple[str, ...] = (
+    "/run/mysqld/mysqld.sock",
+    "/var/run/mysqld/mysqld.sock",
+    "/tmp/mysql.sock",
+)
+
+
+def resolve_unix_socket(socket_path: str | None = None, host: str | None = None) -> str | None:
+    """Resolve an existing Unix domain socket path for local MariaDB connections.
+
+    - If explicit socket_path is provided and not in ('auto', ''):
+      Checks if the path exists and is a Unix domain socket (stat.S_ISSOCK). Returns it if valid.
+    - If socket_path is disabled ('off', 'disabled', 'none', 'false', False):
+      Returns None (forces TCP connection).
+    - If socket_path is 'auto' (or empty/None) and host is local ('localhost', '127.0.0.1', ''):
+      Probes candidate standard sockets: /run/mysqld/mysqld.sock, /var/run/mysqld/mysqld.sock, /tmp/mysql.sock.
+      Returns the first valid socket path found, or None if none exist.
+    """
+    if socket_path is False or str(socket_path).strip().lower() in ("off", "disabled", "none", "false"):
+        return None
+
+    if socket_path and str(socket_path).strip().lower() not in ("auto", ""):
+        candidate = Path(str(socket_path).strip()).resolve()
+        try:
+            if candidate.exists() and stat.S_ISSOCK(candidate.stat().st_mode):
+                return str(candidate)
+        except OSError:
+            pass
+        return None
+
+    normalized_host = (host or "").strip().lower()
+    if normalized_host in ("localhost", "127.0.0.1", ""):
+        for candidate_str in STANDARD_UNIX_SOCKETS:
+            candidate = Path(candidate_str)
+            try:
+                if candidate.exists() and stat.S_ISSOCK(candidate.stat().st_mode):
+                    return str(candidate)
+            except OSError:
+                continue
+
+    return None
+
+DEFAULT_CONFIG: dict[str, Any] = {
     "database": {
         "host": "127.0.0.1",
         "port": 3306,
@@ -28,6 +85,7 @@ DEFAULT_CONFIG: dict[str, dict[str, Any]] = {
         "database": "test",
         "timeout": 10,
         "engine": "mariadb",
+        "unix_socket": "auto",
         "ssl_disabled": False,
         # Raised once per pipeline run with SET GLOBAL (needs SUPER; lasts until the server restarts; sizes are
         # never lowered). The buffer pool is capped at a quarter of RAM when the server runs on this machine.
@@ -37,6 +95,19 @@ DEFAULT_CONFIG: dict[str, dict[str, Any]] = {
             "innodb_log_file_size": "2G",
             "innodb_flush_log_at_trx_commit": 2,
             "innodb_io_capacity": 1000,
+        },
+        "ssh_tunnel": {
+            "enabled": False,
+            "host": "",
+            "port": 22,
+            "user": "",
+            "password": "",
+            "key_file": "",
+            "remote_host": "127.0.0.1",
+            "remote_port": 3306,
+            "local_port": 0,
+            "strict_host_key_checking": "accept-new",
+            "connect_timeout": 10,
         },
     },
     "webapp": {
@@ -54,6 +125,25 @@ DEFAULT_CONFIG: dict[str, dict[str, Any]] = {
         "symbol_layout": "tag",
         "single_version": False,
         "include_pre_releases": True,
+    },
+    "mailing_list": {
+        "storage_dir": "/srv/lore",
+        "port": 8192,
+        "batch_size": 200,
+        "auto_start_daemon": True,
+        "ssh_tunnel": {
+            "enabled": False,
+            "host": "",
+            "port": 22,
+            "user": "",
+            "password": "",
+            "key_file": "",
+            "remote_host": "127.0.0.1",
+            "remote_port": 8192,
+            "local_port": 0,
+            "strict_host_key_checking": "accept-new",
+            "connect_timeout": 10,
+        },
     },
     "ssh_tunnel": {
         "enabled": False,
@@ -172,6 +262,15 @@ def sync_environ(cfg: dict[str, dict[str, Any]]) -> None:
     database = str(db_cfg.get("database") or "test")
     timeout = str(db_cfg.get("timeout") or 10)
 
+    # Resolve Unix domain socket for local connections when SSH tunnel is disabled
+    ssh_tunnel_active = (db_cfg.get("ssh_tunnel") or cfg.get("ssh_tunnel", {})).get("enabled", False)
+    raw_socket = db_cfg.get("unix_socket", "auto")
+    resolved_socket = ""
+    if not ssh_tunnel_active and raw_socket not in ("disabled", "none", "false", False):
+        resolved_socket = resolve_unix_socket(raw_socket, host) or ""
+
+    db_cfg["resolved_unix_socket"] = resolved_socket
+
     # Export both DB_* and MYSQL_* keys for full subsystem consistency
     vars_to_sync = {
         "DB_HOST": host,
@@ -186,10 +285,13 @@ def sync_environ(cfg: dict[str, dict[str, Any]]) -> None:
         "MYSQL_DATABASE": database,
         "DB_TIMEOUT": timeout,
         "MYSQL_TIMEOUT": timeout,
+        "DB_SOCKET": resolved_socket,
+        "MYSQL_UNIX_PORT": resolved_socket,
+        "MYSQL_SOCKET": resolved_socket,
         "DB_SSL_DISABLED": "true" if db_cfg.get("ssl_disabled") else "false",
         "MYSQL_SSL_DISABLED": "true" if db_cfg.get("ssl_disabled") else "false",
         "TE_HUGEPAGES": str(cfg.get("parser", {}).get("hugepages", "auto")),
-        "SSH_TUNNEL_ENABLED": "true" if cfg.get("ssh_tunnel", {}).get("enabled") else "false",
+        "SSH_TUNNEL_ENABLED": "true" if ssh_tunnel_active else "false",
     }
     for k, v in vars_to_sync.items():
         os.environ[k] = v
@@ -215,6 +317,11 @@ def load_config(config_path: str | Path | None = None) -> dict[str, dict[str, An
                 file_data = json.load(f)
             if not isinstance(file_data, dict):
                 raise ValueError(f"Root JSON element must be an object, got {type(file_data).__name__}")
+            # Backward compatibility: migrate legacy top-level ssh_tunnel to database.ssh_tunnel if needed
+            if "ssh_tunnel" in file_data and isinstance(file_data["ssh_tunnel"], dict):
+                db_data = file_data.setdefault("database", {})
+                if isinstance(db_data, dict) and "ssh_tunnel" not in db_data:
+                    db_data["ssh_tunnel"] = copy.deepcopy(file_data["ssh_tunnel"])
             _deep_merge(merged, file_data)
             logger.info("Loaded configuration from %s", resolved_path)
         except json.JSONDecodeError as exc:
@@ -254,6 +361,9 @@ def load_config(config_path: str | Path | None = None) -> dict[str, dict[str, An
     if env_db_engine := _get_user_env("DB_ENGINE"):
         db_sec["engine"] = env_db_engine
 
+    if env_db_socket := (_get_user_env("DB_SOCKET") or _get_user_env("MYSQL_UNIX_PORT") or _get_user_env("MYSQL_SOCKET")):
+        db_sec["unix_socket"] = env_db_socket
+
     if env_db_ssl_disabled := (_get_user_env("DB_SSL_DISABLED") or _get_user_env("MYSQL_SSL_DISABLED")):
         db_sec["ssl_disabled"] = _coerce_bool(env_db_ssl_disabled, db_sec.get("ssl_disabled", False))
     else:
@@ -287,9 +397,15 @@ def load_config(config_path: str | Path | None = None) -> dict[str, dict[str, An
     else:
         parser_sec["hugepages"] = str(parser_sec.get("hugepages", "auto")).lower().strip()
 
-    if "ssh_tunnel" not in merged:
-        merged["ssh_tunnel"] = copy.deepcopy(DEFAULT_CONFIG["ssh_tunnel"])
-    ssh_sec = merged["ssh_tunnel"]
+    db_sec = merged.setdefault("database", copy.deepcopy(DEFAULT_CONFIG["database"]))
+    if "ssh_tunnel" not in db_sec or not isinstance(db_sec["ssh_tunnel"], dict):
+        db_sec["ssh_tunnel"] = copy.deepcopy(DEFAULT_CONFIG["database"]["ssh_tunnel"])
+    ssh_sec = db_sec["ssh_tunnel"]
+
+    # Keep top-level ssh_tunnel synchronized for backward compatibility
+    if "ssh_tunnel" in merged and merged["ssh_tunnel"] is not ssh_sec:
+        _deep_merge(ssh_sec, merged["ssh_tunnel"])
+    merged["ssh_tunnel"] = ssh_sec
 
     if env_ssh_enabled := (_get_user_env("SSH_TUNNEL_ENABLED") or _get_user_env("SSH_TUNNEL")):
         ssh_sec["enabled"] = _coerce_bool(env_ssh_enabled, ssh_sec.get("enabled", False))
@@ -329,6 +445,19 @@ def load_config(config_path: str | Path | None = None) -> dict[str, dict[str, An
     else:
         ssh_sec["connect_timeout"] = _coerce_int(ssh_sec.get("connect_timeout"), 10)
 
+    if "mailing_list" not in merged or not isinstance(merged["mailing_list"], dict):
+        merged["mailing_list"] = copy.deepcopy(DEFAULT_CONFIG["mailing_list"])
+    ml_sec = merged["mailing_list"]
+    ml_sec.setdefault("storage_dir", "/srv/lore")
+    ml_sec.setdefault("port", 8192)
+    ml_sec.setdefault("batch_size", 200)
+    ml_sec.setdefault("auto_start_daemon", True)
+    if "ssh_tunnel" not in ml_sec or not isinstance(ml_sec["ssh_tunnel"], dict):
+        ml_sec["ssh_tunnel"] = copy.deepcopy(DEFAULT_CONFIG["mailing_list"]["ssh_tunnel"])
+    else:
+        if not ml_sec["ssh_tunnel"].get("remote_port"):
+            ml_sec["ssh_tunnel"]["remote_port"] = 8192
+
     # 4. Synchronize into os.environ for low-level and child worker compatibility
     sync_environ(merged)
 
@@ -367,9 +496,25 @@ def get_parser_config() -> dict[str, Any]:
     return get_config().get("parser", copy.deepcopy(DEFAULT_CONFIG["parser"]))
 
 
-def get_ssh_tunnel_config() -> dict[str, Any]:
-    """Retrieve active SSH tunnel configuration section."""
-    return get_config().get("ssh_tunnel", copy.deepcopy(DEFAULT_CONFIG["ssh_tunnel"]))
+def get_ssh_tunnel_config(feature: str = "database") -> dict[str, Any]:
+    """Retrieve active SSH tunnel configuration section for a specific feature."""
+    cfg = get_config()
+    feature_sec = cfg.get(feature)
+    if isinstance(feature_sec, dict) and "ssh_tunnel" in feature_sec and isinstance(feature_sec["ssh_tunnel"], dict):
+        return feature_sec["ssh_tunnel"]
+    if feature == "database" and "ssh_tunnel" in cfg and isinstance(cfg["ssh_tunnel"], dict):
+        return cfg["ssh_tunnel"]
+    default_tunnel = copy.deepcopy(DEFAULT_SSH_TUNNEL_CONFIG)
+    if feature == "database":
+        default_tunnel["remote_port"] = 3306
+    elif feature == "mailing_list":
+        default_tunnel["remote_port"] = 8192
+    return default_tunnel
+
+
+def get_mailing_list_config() -> dict[str, Any]:
+    """Retrieve active mailing list configuration section."""
+    return get_config().get("mailing_list", copy.deepcopy(DEFAULT_CONFIG.get("mailing_list", {})))
 
 
 def get_workspace_config() -> dict[str, Any]:

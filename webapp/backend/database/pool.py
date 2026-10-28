@@ -61,14 +61,35 @@ def get_db_pool() -> pooling.MySQLConnectionPool:
             "user": cfg.get("user", "root"),
             "password": cfg.get("password", "Passe123"),
             "database": cfg.get("database", "test"),
-            "connection_timeout": int(cfg.get("timeout", 10)),
+            "connection_timeout": max(int(cfg.get("timeout", 10)), 30),
             "autocommit": True,
         }
         if os.getenv("DB_SSL_DISABLED", "").lower() in ("true", "1", "yes") or cfg.get("ssl_disabled"):
             pool_kwargs["ssl_disabled"] = True
 
+        # Attempt Unix domain socket connection for local non-tunneled configurations
+        ssh_tunnel_active = (cfg.get("ssh_tunnel") or {}).get("enabled", False)
+        socket_path = cfg.get("resolved_unix_socket") or os.getenv("DB_SOCKET") or os.getenv("MYSQL_UNIX_PORT")
+        if not ssh_tunnel_active and socket_path and os.path.exists(socket_path):
+            pool_kwargs["unix_socket"] = socket_path
+            try:
+                _POOL = pooling.MySQLConnectionPool(**pool_kwargs)
+                logger.info("Initialized MySQLConnectionPool with 32 connections via Unix socket (%s).", socket_path)
+                return _POOL
+            except Exception as e:
+                logger.warning(
+                    "Failed to initialize MySQLConnectionPool via Unix socket '%s' (%s); falling back to TCP...",
+                    socket_path,
+                    e,
+                )
+                pool_kwargs.pop("unix_socket", None)
+
         _POOL = pooling.MySQLConnectionPool(**pool_kwargs)
-        logger.info("Initialized MySQLConnectionPool with 32 connections.")
+        logger.info(
+            "Initialized MySQLConnectionPool with 32 connections via TCP (%s:%s).",
+            pool_kwargs.get("host"),
+            pool_kwargs.get("port"),
+        )
     return _POOL
 
 

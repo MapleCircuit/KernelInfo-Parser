@@ -22,7 +22,8 @@ SCHEMA ENTITY-RELATIONSHIP GRAPH:
      ├── m_ingest_state (network_id, commit_id, status, updated_at)
      ├── m_ingest_watermark (commit_id, marked_table_id, max_id)
      ├── m_ingest_blob (commit_id, blob_id)
-     └── m_arch_root (commit_id, arch, role, priority, path, target)   -- build layout per ARCH
+     ├── m_arch_root (commit_id, arch, role, priority, path, target)   -- build layout per ARCH
+     └── m_commit_email (commit_id, message_id, thread_id, relation_type, match_tier, patch_version, patch_idx, patch_total)
 
 3. Universal Content-Addressable Stores:
    m_file_name (fnid, fname)
@@ -1259,6 +1260,31 @@ m_arch_root = Table(
 )
 
 # -----------------------------------------------------------------------------
+# 48. m_commit_email (table_id=48): Git Commit to Mailing List Message Linkage
+# -----------------------------------------------------------------------------
+m_commit_email = Table(
+    table_id=48,
+    table_name="m_commit_email",
+    columns=(
+        ("commit_id", "INT", "NOT NULL"),
+        ("message_id", "VARCHAR(255)", "NOT NULL", "COLLATE utf8mb4_bin"),
+        ("thread_id", "BIGINT", "UNSIGNED", "NOT NULL", "DEFAULT 0"),
+        ("relation_type", "TINYINT", "UNSIGNED", "NOT NULL"),
+        ("match_tier", "TINYINT", "UNSIGNED", "NOT NULL"),
+        ("patch_version", "TINYINT", "UNSIGNED", "NOT NULL", "DEFAULT 1"),
+        ("patch_idx", "SMALLINT", "UNSIGNED", "NOT NULL", "DEFAULT 0"),
+        ("patch_total", "SMALLINT", "UNSIGNED", "NOT NULL", "DEFAULT 0"),
+    ),
+    primary=("commit_id", "message_id", "relation_type"),
+    foreign=(("commit_id", "m_commit", "commit_id"),),
+    initial_insert=None,
+    no_duplicate=False,
+    te_cached=False,
+    idempotent_pk=True,
+    hashing_table=False,
+)
+
+# -----------------------------------------------------------------------------
 # Exported Table Array tuple
 # -----------------------------------------------------------------------------
 TABLES: tuple[Table, ...] = (
@@ -1310,19 +1336,20 @@ TABLES: tuple[Table, ...] = (
     m_ingest_watermark,    # 45
     m_ingest_blob,         # 46
     m_arch_root,           # 47
+    m_commit_email,        # 48
 )
 
 Table_Array = TABLES
 
 
 def init_db_layout(gp=None) -> tuple[Table, ...]:
-    """Initialize and populate gp.Table_Array with all 48 schema tables.
+    """Initialize and populate gp.Table_Array with all 49 schema tables.
 
     Args:
         gp: Optional GreatProcessor instance to attach Table_Array to.
 
     Returns:
-        Immutable tuple of all 48 Table schema objects.
+        Immutable tuple of all 49 Table schema objects.
     """
     if gp is not None:
         gp.Table_Array = list(TABLES)

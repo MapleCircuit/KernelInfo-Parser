@@ -68,9 +68,12 @@ from core.quit_listener import GracefulQuitListener
 from core import ingest_state
 from core.config import (
     init_config,
+    get_config,
+    sync_environ,
     get_parser_config,
     get_db_config,
     get_ssh_tunnel_config,
+    get_mailing_list_config,
     get_workspace_config,
     get_repository,
     get_default_repo_path,
@@ -154,6 +157,7 @@ from core.DBLayout import (
     m_commit,
     m_commit_file,
     m_commit_parent,
+    m_commit_email,
     m_bridge_checkpoint,
     m_git_ref,
     m_bridge_commit_person,
@@ -2371,6 +2375,12 @@ def main() -> None:
     MF.set_repo_dir(repo_path)
     logger.info(f"[Repository] Using '{(repo_entry or {}).get('name', repo_path)}' at {repo_path}")
 
+    if getattr(args, "resolve_ml", False):
+        commit_range = getattr(args, "ml_range", None) or (args.ref[0] if getattr(args, "ref", None) else "HEAD~100..HEAD")
+        standalone_resolve_mailing_list(repo_path, commit_range, getattr(args, "ml_storage_dir", None))
+        G.emergency_shutdown(0)
+        return
+
     raw_refs = getattr(args, "ref", None)
     if not raw_refs:
         # Default: parse from the first commit of the repository, then every subsequent release
@@ -2577,6 +2587,12 @@ def arg_handling() -> argparse.Namespace:
         help="Select database backend engine (default: from config or mariadb)",
     )
     parser.add_argument(
+        "--db-socket",
+        dest="db_socket",
+        default=None,
+        help="Path to MariaDB Unix domain socket for local non-tunneled connections (or 'off'/'disabled' to force TCP)",
+    )
+    parser.add_argument(
         "--te", "--table-engine",
         dest="table_engine",
         default=None,
@@ -2668,6 +2684,24 @@ def arg_handling() -> argparse.Namespace:
         default=None,
         help="SSH host key verification mode (default: accept-new)",
     )
+    parser.add_argument(
+        "--resolve-ml",
+        dest="resolve_ml",
+        action="store_true",
+        help="Run standalone mailing list commit-to-email resolution",
+    )
+    parser.add_argument(
+        "--ml-range",
+        dest="ml_range",
+        default=None,
+        help="Git commit range for standalone mailing list resolution (e.g., 'v3.0..v3.1' or 'HEAD~100..HEAD')",
+    )
+    parser.add_argument(
+        "--ml-storage-dir",
+        dest="ml_storage_dir",
+        default=None,
+        help="Local or remote path to public-inbox storage directory (default: from config 'mailing_list.storage_dir')",
+    )
     args = parser.parse_args()
 
     if args.config is not None:
@@ -2689,10 +2723,21 @@ def arg_handling() -> argparse.Namespace:
     parser_cfg = get_parser_config()
     db_cfg = get_db_config()
     ssh_cfg = get_ssh_tunnel_config()
+    ml_cfg = get_mailing_list_config()
+
+    if args.ml_storage_dir is not None:
+        ml_cfg["storage_dir"] = args.ml_storage_dir
+
+    if args.db_socket is not None:
+        db_cfg["unix_socket"] = args.db_socket
+        sync_environ(get_config())
 
     # Apply CLI argument overrides for SSH tunnel (CLI > ENV > JSON > Defaults)
     if args.ssh_tunnel is not None:
         ssh_cfg["enabled"] = args.ssh_tunnel
+        ml_tunnel_cfg = get_ssh_tunnel_config("mailing_list")
+        if ml_tunnel_cfg:
+            ml_tunnel_cfg["enabled"] = args.ssh_tunnel
     if args.ssh_host is not None:
         ssh_cfg["host"] = args.ssh_host
     if args.ssh_port is not None:
@@ -2825,6 +2870,8 @@ def arg_handling() -> argparse.Namespace:
             "tests.test_raw_ast",
             "tests.test_rust_ast",
             "tests.test_config",
+            "tests.test_ssh_tunnel",
+            "tests.test_mailing_list",
             "tests.test_git_reader",
             "tests.test_webapp_system",
             "tests.test_webapp_sync",
@@ -3244,7 +3291,7 @@ def _purge_partial_version(db: Any, commit_id: int) -> None:
     if cnx is None:
         return
     with contextlib.closing(cnx.cursor()) as cur:
-        for table in ("m_bridge_checkpoint", "m_commit_file", "m_bridge_commit_tag", "m_bridge_commit_person"):
+        for table in ("m_bridge_checkpoint", "m_commit_file", "m_bridge_commit_tag", "m_bridge_commit_person", "m_commit_email"):
             cur.execute(f"DELETE FROM {table} WHERE commit_id = %s", (commit_id,))  # noqa: S608
     cnx.commit()
 
@@ -4320,6 +4367,198 @@ def processing_git_commits(version: str) -> None:
                             staged_count += 1
                 if staged_count > 0:
                     logger.info(f"Staged {staged_count} milestone snapshot files into m_bridge_checkpoint for commit {checkpoint_cid}.")
+
+    # Step 6.5: Resolve mailing list emails for ingested commits
+    try:
+        resolve_version_mailing_list_commits(commits, commit_hash_to_id, repo_path)
+    except Exception as e:
+        logger.warning(f"Mailing list email resolution skipped or encountered error: {e}")
+
+
+def resolve_version_mailing_list_commits(
+    commits: list,
+    commit_hash_to_id: dict[str, int],
+    repo_path: str | None = None,
+    storage_dir: str | None = None,
+) -> int:
+    """Resolve mailing list patch emails and pull request threads for commits in the active version."""
+    from parser.mailing_list.ml_client import MailingListClient
+    from parser.mailing_list.ml_types import CommitFeatures
+
+    ml_cfg = get_mailing_list_config()
+    if not ml_cfg.get("enabled", True):
+        logger.debug("Mailing list commit resolution is disabled in configuration.")
+        return 0
+
+    if not commits:
+        return 0
+
+    repo_dir = repo_path or getattr(gp, "repo_path", None) or MF.get_repo_dir()
+
+    features_list: list[CommitFeatures] = []
+    merge_commits: list[tuple[int, str, list[str]]] = []
+
+    for c in commits:
+        c_hash = c.commit_hash
+        c_id = commit_hash_to_id.get(c_hash)
+        if not c_id:
+            continue
+
+        parents = getattr(c, "parents", None) or []
+        if len(parents) >= 2:
+            merge_commits.append((c_id, c_hash, parents))
+
+        patch_id = None
+        try:
+            p_show = sp.run(
+                ["git", "-C", repo_dir, "show", "--format=", c_hash],
+                capture_output=True,
+                check=False,
+            )
+            if p_show.returncode == 0 and p_show.stdout:
+                p_patchid = sp.run(
+                    ["git", "patch-id", "--stable"],
+                    input=p_show.stdout,
+                    capture_output=True,
+                    check=False,
+                )
+                if p_patchid.returncode == 0 and p_patchid.stdout:
+                    parts = p_patchid.stdout.decode("ascii", errors="replace").split()
+                    if parts:
+                        patch_id = parts[0]
+        except Exception:
+            pass
+
+        blob_hashes: list[str] = []
+        try:
+            diff_res = sp.run(
+                ["git", "-C", repo_dir, "diff-tree", "-r", "--no-commit-id", c_hash],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if diff_res.returncode == 0:
+                for line in diff_res.stdout.splitlines():
+                    parts = line.split()
+                    if len(parts) >= 5:
+                        post_sha = parts[3]
+                        if len(post_sha) == 40 and post_sha != "0" * 40:
+                            blob_hashes.append(post_sha)
+        except Exception:
+            pass
+
+        features = CommitFeatures(
+            commit_id=c_id,
+            commit_hash=c_hash,
+            subject=getattr(c, "subject", "") or "",
+            author_name=getattr(c, "author_name", "") or "",
+            author_email=getattr(c, "author_email", "") or "",
+            author_date=int(getattr(c, "author_date", 0) or 0),
+            commit_message=getattr(c, "message", "") or "",
+            patch_id=patch_id,
+            blob_hashes=blob_hashes[:10],
+        )
+        features_list.append(features)
+
+    if not features_list:
+        return 0
+
+    client_kwargs = {}
+    if storage_dir:
+        client_kwargs["storage_dir"] = storage_dir
+    client = MailingListClient(**client_kwargs)
+
+    total_staged = 0
+    try:
+        results = client.resolve_commits(features_list)
+        for c_hash, ctx in results.items():
+            c_id = commit_hash_to_id.get(c_hash)
+            if c_id is not None:
+                staged_rows = client.stage_resolved_context(m_commit_email, c_id, ctx)
+                total_staged += len(staged_rows)
+
+        # Pull request propagation across merge commits
+        for m_cid, m_hash, m_parents in merge_commits:
+            ctx = results.get(m_hash)
+            if ctx and ctx.pull_request and ctx.pull_request.mids:
+                pr_mid = ctx.pull_request.mids[0]
+                pr_tid = ctx.pull_request.tid
+                try:
+                    rev_res = sp.run(
+                        ["git", "-C", repo_dir, "rev-list", f"{m_parents[0]}..{m_hash}"],
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                    )
+                    if rev_res.returncode == 0:
+                        child_hashes = [h.strip() for h in rev_res.stdout.splitlines() if h.strip() and h.strip() != m_hash]
+                        child_ids = [commit_hash_to_id[h] for h in child_hashes if h in commit_hash_to_id]
+                        if child_ids:
+                            propagated = client.propagate_pull_request_to_children(m_commit_email, child_ids, pr_mid, pr_tid)
+                            total_staged += propagated
+                except Exception as e:
+                    logger.debug(f"Pull request propagation error for merge {m_hash[:12]}: {e}")
+
+        logger.info(f"Resolved mailing list links for {len(results)} commits (staged {total_staged} m_commit_email rows).")
+    finally:
+        client.close()
+
+    return total_staged
+
+
+def standalone_resolve_mailing_list(
+    repo_path: str,
+    commit_range: str,
+    storage_dir: str | None = None,
+) -> None:
+    """Standalone CLI resolution of commits to mailing list emails."""
+    from parser.git_ast import GitCommitParser
+
+    logger.info(f"Starting standalone mailing list resolution for range '{commit_range}' in '{repo_path}'...")
+    git_parser = GitCommitParser(repo_dir=repo_path)
+    if ".." in commit_range:
+        old_rev, new_rev = commit_range.split("..", 1)
+    else:
+        old_rev, new_rev = None, commit_range
+
+    commits = git_parser.parse_version_commits(old_rev, new_rev, with_files=False)
+    if not commits:
+        logger.warning(f"No commits found in range '{commit_range}'.")
+        return
+
+    logger.info(f"Parsed {len(commits)} commits for mailing list resolution.")
+    network_id = getattr(gp, "network_id", 1)
+    commit_hashes = [c.commit_hash for c in commits]
+    commit_hash_to_id: dict[str, int] = {}
+    with G.DB() as db:
+        commit_hash_to_id = _lookup_commit_ids(db, network_id, commit_hashes)
+
+    unregistered = [c for c in commits if c.commit_hash not in commit_hash_to_id]
+    if unregistered:
+        logger.info(f"{len(unregistered)} commits are not yet in m_commit; resolving {len(commit_hash_to_id)} known commits.")
+
+    target_commits = [c for c in commits if c.commit_hash in commit_hash_to_id]
+    if not target_commits:
+        logger.warning("No commits from the specified range exist in m_commit. Ingest git DAG first.")
+        return
+
+    try:
+        if hasattr(G, "TE") and G.TE is not None and not getattr(G.TE, "tables", None):
+            G.TE.start([m_commit_email], G.DB)
+        staged = resolve_version_mailing_list_commits(
+            target_commits,
+            commit_hash_to_id,
+            repo_path=repo_path,
+            storage_dir=storage_dir,
+        )
+        if hasattr(G.TE, "commit_all"):
+            G.TE.commit_all()
+        elif hasattr(G.TE, "commit"):
+            G.TE.commit(m_commit_email.table_id)
+        logger.info(f"Standalone mailing list resolution complete: staged {staged} m_commit_email entries.")
+    except (FileNotFoundError, ConnectionError, RuntimeError) as exc:
+        logger.error(f"[Mailing List] {exc}")
+        G.emergency_shutdown(1)
 
 
 def processing_kbuild(

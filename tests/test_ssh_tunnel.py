@@ -17,6 +17,7 @@ from core.config import (
     DEFAULT_CONFIG,
     get_config,
     get_db_config,
+    get_mailing_list_config,
     get_ssh_tunnel_config,
     init_config,
     reset_config,
@@ -25,6 +26,7 @@ from core.ssh_tunnel import (
     SSHTunnelManager,
     _find_free_port,
     _is_port_in_use,
+    get_active_ssh_tunnel,
     is_ssh_tunnel_active,
     start_ssh_tunnel,
     stop_ssh_tunnel,
@@ -81,6 +83,47 @@ class TestSSHTunnelConfig(unittest.TestCase):
             self.assertEqual(cfg["local_port"], 3308)
             self.assertEqual(cfg["strict_host_key_checking"], "no")
             self.assertEqual(cfg["connect_timeout"], 15)
+
+    def test_per_feature_config(self) -> None:
+        """Database and mailing list features have distinct SSH tunnel configurations."""
+        with patch("core.config.find_config_path", return_value=None):
+            reset_config()
+            db_tunnel = get_ssh_tunnel_config("database")
+            ml_tunnel = get_ssh_tunnel_config("mailing_list")
+            self.assertEqual(db_tunnel["remote_port"], 3306)
+            self.assertEqual(ml_tunnel["remote_port"], 8192)
+            self.assertFalse(db_tunnel["enabled"])
+            self.assertFalse(ml_tunnel["enabled"])
+
+            ml_cfg = get_mailing_list_config()
+            self.assertIn("ssh_tunnel", ml_cfg)
+            self.assertEqual(ml_cfg["ssh_tunnel"]["remote_port"], 8192)
+
+    def test_legacy_flat_ssh_tunnel_backward_compatibility(self) -> None:
+        """Legacy flat top-level ssh_tunnel in config files must be migrated to database.ssh_tunnel."""
+        import json
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as tf:
+            json.dump({
+                "ssh_tunnel": {
+                    "enabled": True,
+                    "host": "legacy.remote.org",
+                    "port": 2200,
+                    "remote_port": 3306,
+                }
+            }, tf)
+            tf_path = Path(tf.name)
+
+        try:
+            with patch("core.config.find_config_path", return_value=tf_path):
+                reset_config()
+                cfg_db = get_ssh_tunnel_config("database")
+                cfg_default = get_ssh_tunnel_config()
+                self.assertTrue(cfg_db["enabled"])
+                self.assertEqual(cfg_db["host"], "legacy.remote.org")
+                self.assertEqual(cfg_db["port"], 2200)
+                self.assertEqual(cfg_default["host"], "legacy.remote.org")
+        finally:
+            tf_path.unlink(missing_ok=True)
 
 
 class TestSSHTunnelManager(unittest.TestCase):
@@ -206,6 +249,71 @@ class TestSSHTunnelManager(unittest.TestCase):
         with self.assertRaises(RuntimeError) as ctx:
             manager.start()
         self.assertIn("Permission denied", str(ctx.exception))
+
+    @patch("subprocess.Popen")
+    @patch("core.ssh_tunnel._is_port_in_use")
+    def test_per_feature_multi_tunnel_lifecycle(self, mock_port_in_use: MagicMock, mock_popen: MagicMock) -> None:
+        """Verify multiple feature tunnels can be started, queried, and stopped independently."""
+        mock_proc1 = MagicMock()
+        mock_proc1.poll.return_value = None
+        mock_proc1.pid = 11111
+
+        mock_proc2 = MagicMock()
+        mock_proc2.poll.return_value = None
+        mock_proc2.pid = 22222
+
+        mock_popen.side_effect = [mock_proc1, mock_proc2]
+        mock_port_in_use.side_effect = [False, True, False, True]
+
+        # Start mailing list tunnel
+        ml_cfg = {
+            "enabled": True,
+            "host": "mail.server.org",
+            "port": 22,
+            "remote_host": "127.0.0.1",
+            "remote_port": 993,
+            "local_port": 40001,
+            "connect_timeout": 2,
+        }
+        start_ssh_tunnel(ml_cfg, feature="mailing_list")
+
+        self.assertTrue(is_ssh_tunnel_active("mailing_list"))
+        self.assertFalse(is_ssh_tunnel_active("database"))
+
+        active_cfg = get_config()
+        self.assertEqual(active_cfg.get("mailing_list", {}).get("host"), "127.0.0.1")
+        self.assertEqual(active_cfg.get("mailing_list", {}).get("port"), 40001)
+
+        # Database config should remain untouched
+        db_cfg = get_db_config()
+        self.assertNotEqual(db_cfg.get("port"), 40001)
+
+        # Start database tunnel
+        db_tunnel_cfg = {
+            "enabled": True,
+            "host": "db.server.org",
+            "port": 22,
+            "remote_host": "127.0.0.1",
+            "remote_port": 3306,
+            "local_port": 40002,
+            "connect_timeout": 2,
+        }
+        start_ssh_tunnel(db_tunnel_cfg, feature="database")
+
+        self.assertTrue(is_ssh_tunnel_active("mailing_list"))
+        self.assertTrue(is_ssh_tunnel_active("database"))
+        self.assertEqual(get_db_config()["port"], 40002)
+
+        # Stop mailing list tunnel specifically
+        stop_ssh_tunnel("mailing_list")
+        mock_proc1.terminate.assert_called_once()
+        self.assertFalse(is_ssh_tunnel_active("mailing_list"))
+        self.assertTrue(is_ssh_tunnel_active("database"))
+
+        # Stop all tunnels
+        stop_ssh_tunnel()
+        mock_proc2.terminate.assert_called_once()
+        self.assertFalse(is_ssh_tunnel_active("database"))
 
 
 if __name__ == "__main__":

@@ -57,6 +57,7 @@ class SSHTunnelManager:
         local_port: int = 0,
         strict_host_key_checking: str = "accept-new",
         connect_timeout: int = 10,
+        feature: str = "database",
     ) -> None:
         self.host = host.strip()
         self.port = int(port or 22)
@@ -64,11 +65,12 @@ class SSHTunnelManager:
         self.password = password
         self.key_file = key_file.strip()
         self.remote_host = remote_host.strip() or "127.0.0.1"
-        self.remote_port = int(remote_port or 3306)
+        self.remote_port = int(remote_port or 0)
         self.configured_local_port = int(local_port or 0)
         self.local_port: int = 0
         self.strict_host_key_checking = strict_host_key_checking.strip() or "accept-new"
         self.connect_timeout = max(1, int(connect_timeout or 10))
+        self.feature = feature.strip() or "database"
 
         self.proc: subprocess.Popen[str] | None = None
         self._askpass_path: Path | None = None
@@ -248,17 +250,27 @@ class SSHTunnelManager:
         # Clean up temporary askpass script now that auth is complete
         self._cleanup_askpass()
 
-        # Update active database configuration and synchronize environment variables
+        # Update active configuration and synchronize environment variables
         active_cfg = get_config()
-        active_db = active_cfg.get("database", {})
-        active_db["host"] = "127.0.0.1"
-        active_db["port"] = self.local_port
-        sync_environ(active_cfg)
-
-        logger.info(
-            "SSH tunnel active! Rerouted database connection to 127.0.0.1:%d",
-            self.local_port,
-        )
+        if self.feature == "database":
+            active_db = active_cfg.get("database", {})
+            active_db["host"] = "127.0.0.1"
+            active_db["port"] = self.local_port
+            sync_environ(active_cfg)
+            logger.info(
+                "SSH tunnel active! Rerouted database connection to 127.0.0.1:%d",
+                self.local_port,
+            )
+        else:
+            feature_cfg = active_cfg.get(self.feature)
+            if isinstance(feature_cfg, dict):
+                feature_cfg["host"] = "127.0.0.1"
+                feature_cfg["port"] = self.local_port
+            logger.info(
+                "SSH tunnel active for '%s'! Rerouted connection to 127.0.0.1:%d",
+                self.feature,
+                self.local_port,
+            )
         return self.local_port
 
     def stop(self) -> None:
@@ -279,16 +291,24 @@ class SSHTunnelManager:
         self._is_active = False
 
 
+_TUNNELS: dict[str, SSHTunnelManager] = {}
 _GLOBAL_TUNNEL: SSHTunnelManager | None = None
 
 
-def start_ssh_tunnel(cfg: dict[str, Any] | None = None) -> SSHTunnelManager:
-    """Initialize and start the global SSH tunnel singleton based on active configuration."""
+def start_ssh_tunnel(
+    cfg: dict[str, Any] | str | None = None,
+    feature: str = "database",
+) -> SSHTunnelManager:
+    """Initialize and start an SSH tunnel for a specific feature (default: 'database')."""
     global _GLOBAL_TUNNEL
-    if _GLOBAL_TUNNEL is not None and _GLOBAL_TUNNEL.is_active():
-        return _GLOBAL_TUNNEL
+    if isinstance(cfg, str):
+        feature = cfg
+        cfg = None
 
-    tunnel_cfg = cfg or get_ssh_tunnel_config()
+    if feature in _TUNNELS and _TUNNELS[feature].is_active():
+        return _TUNNELS[feature]
+
+    tunnel_cfg = cfg or get_ssh_tunnel_config(feature)
     manager = SSHTunnelManager(
         host=tunnel_cfg.get("host", ""),
         port=tunnel_cfg.get("port", 22),
@@ -296,29 +316,54 @@ def start_ssh_tunnel(cfg: dict[str, Any] | None = None) -> SSHTunnelManager:
         password=tunnel_cfg.get("password", ""),
         key_file=tunnel_cfg.get("key_file", ""),
         remote_host=tunnel_cfg.get("remote_host", "127.0.0.1"),
-        remote_port=tunnel_cfg.get("remote_port", 3306),
+        remote_port=tunnel_cfg.get("remote_port", 3306 if feature == "database" else (8192 if feature == "mailing_list" else 0)),
         local_port=tunnel_cfg.get("local_port", 0),
         strict_host_key_checking=tunnel_cfg.get("strict_host_key_checking", "accept-new"),
         connect_timeout=tunnel_cfg.get("connect_timeout", 10),
+        feature=feature,
     )
     manager.start()
-    _GLOBAL_TUNNEL = manager
+    _TUNNELS[feature] = manager
+    if feature == "database":
+        _GLOBAL_TUNNEL = manager
     return manager
 
 
-def stop_ssh_tunnel() -> None:
-    """Terminate the global SSH tunnel singleton if active."""
+def stop_ssh_tunnel(feature: str | None = None) -> None:
+    """Terminate SSH tunnel(s). If feature is specified, stop that feature's tunnel.
+    If feature is None, stop all active tunnels.
+    """
     global _GLOBAL_TUNNEL
-    if _GLOBAL_TUNNEL is not None:
-        try:
-            _GLOBAL_TUNNEL.stop()
-        finally:
-            _GLOBAL_TUNNEL = None
+    if feature is None:
+        for feat, mgr in list(_TUNNELS.items()):
+            try:
+                mgr.stop()
+            except Exception as exc:
+                logger.warning("Error stopping SSH tunnel for '%s': %s", feat, exc)
+        _TUNNELS.clear()
+        _GLOBAL_TUNNEL = None
+    else:
+        if feature in _TUNNELS:
+            mgr = _TUNNELS.pop(feature)
+            try:
+                mgr.stop()
+            finally:
+                if feature == "database":
+                    _GLOBAL_TUNNEL = None
 
 
-def is_ssh_tunnel_active() -> bool:
-    """Check if the global SSH tunnel is currently active."""
-    return _GLOBAL_TUNNEL is not None and _GLOBAL_TUNNEL.is_active()
+def is_ssh_tunnel_active(feature: str = "database") -> bool:
+    """Check if the SSH tunnel for a given feature is currently active."""
+    mgr = _TUNNELS.get(feature)
+    return mgr is not None and mgr.is_active()
+
+
+def get_active_ssh_tunnel(feature: str = "database") -> SSHTunnelManager | None:
+    """Retrieve the active SSHTunnelManager instance for a feature, if any."""
+    mgr = _TUNNELS.get(feature)
+    if mgr is not None and mgr.is_active():
+        return mgr
+    return None
 
 
 # Automatically ensure tunnel teardown on interpreter exit

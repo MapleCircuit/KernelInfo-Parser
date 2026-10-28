@@ -211,6 +211,22 @@ class MariaDB(BaseDBEngine):
         self.host = os.getenv("DB_HOST")
         self.port = int(os.getenv("DB_PORT", "3306"))
         self.ssl_disabled = os.getenv("DB_SSL_DISABLED", "").lower() in ("true", "1", "yes")
+        ssh_tunnel_active = os.getenv("SSH_TUNNEL_ENABLED", "").lower() in ("true", "1", "yes")
+        env_socket = os.getenv("DB_SOCKET") or os.getenv("MYSQL_UNIX_PORT") or os.getenv("MYSQL_SOCKET")
+        if not ssh_tunnel_active and env_socket not in ("off", "disabled", "none", "false"):
+            if env_socket:
+                self.unix_socket = env_socket
+            elif not self.host or self.host in ("127.0.0.1", "localhost"):
+                for cand in ("/run/mysqld/mysqld.sock", "/var/run/mysqld/mysqld.sock", "/tmp/mysql.sock"):
+                    if os.path.exists(cand):
+                        self.unix_socket = cand
+                        break
+                else:
+                    self.unix_socket = None
+            else:
+                self.unix_socket = None
+        else:
+            self.unix_socket = None
         # Inside transaction(): a dropped connection fails the transaction instead of silently reconnecting
         self._in_txn = False
         self.cnx = self.connect_sql()
@@ -387,6 +403,24 @@ class MariaDB(BaseDBEngine):
         Outputs:
             Native MySQL connection socket handle.
         """
+        if self.unix_socket and os.path.exists(self.unix_socket):
+            conn_kwargs: dict[str, Any] = {
+                "user": self.user,
+                "password": self.password,
+                "database": self.db_name,
+                "autocommit": True,
+                "unix_socket": self.unix_socket,
+            }
+            if self.ssl_disabled:
+                conn_kwargs["ssl_disabled"] = True
+            try:
+                return mysql.connector.connect(**conn_kwargs)
+            except mysql.connector.Error as e:
+                logger.warning(
+                    f"[DB Socket] Failed connecting via Unix socket '{self.unix_socket}' ({e}); "
+                    "falling back to TCP..."
+                )
+
         if self.host:
             mysql_host = self.host
         elif os.path.exists("/.dockerenv"):
@@ -404,7 +438,7 @@ class MariaDB(BaseDBEngine):
         else:
             mysql_host = "localhost"
 
-        conn_kwargs: dict[str, Any] = {
+        conn_kwargs = {
             "host": mysql_host,
             "port": self.port,
             "user": self.user,
