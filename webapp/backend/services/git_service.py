@@ -551,9 +551,55 @@ class GitService:
                         contributors_map[key]["role_types"].append(t["role_type"])
             contributors = list(contributors_map.values())
 
+            # Linked mailing list emails from m_commit_email
+            relation_names = {
+                1: "Patch",
+                2: "Cover Letter",
+                3: "Sibling Patch",
+                4: "Pull Request",
+            }
+            tier_names = {
+                1: "Authoritative Link / Message-ID",
+                2: "Exact Patch-ID",
+                3: "Blob Hash Match",
+                4: "Maintainer / Bot Reference",
+                5: "Metadata Match",
+                6: "Pull Request Match",
+            }
+            linked_emails: list[dict[str, Any]] = []
+            try:
+                cursor.execute(
+                    """
+                    SELECT message_id, thread_id, relation_type, match_tier,
+                           patch_version, patch_idx, patch_total
+                    FROM m_commit_email
+                    WHERE commit_id = %s
+                    ORDER BY relation_type ASC, patch_idx ASC;
+                    """,
+                    (cid,),
+                )
+                for erow in cursor.fetchall():
+                    rel_type = erow["relation_type"]
+                    tier = erow["match_tier"]
+                    mid = safe_decode(erow["message_id"]).strip("<> ")
+                    linked_emails.append({
+                        "message_id": mid,
+                        "thread_id": erow["thread_id"],
+                        "relation_type": rel_type,
+                        "relation_name": relation_names.get(rel_type, "Email"),
+                        "match_tier": tier,
+                        "match_tier_name": tier_names.get(tier, "Matched"),
+                        "patch_version": erow["patch_version"],
+                        "patch_idx": erow["patch_idx"],
+                        "patch_total": erow["patch_total"],
+                        "lore_url": f"https://lore.kernel.org/all/{mid}/",
+                    })
+            except Exception as exc:
+                logger.debug("Failed to query m_commit_email for commit %d: %s", cid, exc)
+
             # LKML thread URL (forward-compatible lore.kernel.org link)
             subj = safe_decode(c_row["subject"])
-            lore_url = f"https://lore.kernel.org/all/?q={subj}"
+            lore_url = linked_emails[0]["lore_url"] if linked_emails else f"https://lore.kernel.org/all/?q={subj}"
 
             return {
                 "commit_id": cid,
@@ -572,7 +618,113 @@ class GitService:
                 "trailers": trailers,
                 "contributors": contributors,
                 "lore_url": lore_url,
+                "linked_emails": linked_emails,
             }
+
+    def resolve_commit_mail(self, version_name: str, commit_id_or_hash: str) -> dict[str, Any]:
+        """On-demand resolution of a commit against the mailing list archive."""
+        detail = self.get_commit_detail(version_name, commit_id_or_hash)
+        if detail.get("linked_emails"):
+            return {"resolved": True, "linked_emails": detail["linked_emails"], "cached": True}
+
+        from parser.mailing_list.ml_client import MailingListClient
+        from parser.mailing_list.ml_types import CommitFeatures, MLRelationType, MLMatchTier
+
+        repo_dir = str(get_repo_dir())
+        c_hash = detail["commit_hash"]
+        cid = detail["commit_id"]
+
+        patch_id = None
+        try:
+            p_show = subprocess.run(["git", "-C", repo_dir, "show", "--format=", c_hash], capture_output=True, check=False)
+            if p_show.returncode == 0 and p_show.stdout:
+                p_patchid = subprocess.run(["git", "patch-id", "--stable"], input=p_show.stdout, capture_output=True, check=False)
+                if p_patchid.returncode == 0 and p_patchid.stdout:
+                    parts = p_patchid.stdout.decode("ascii", errors="replace").split()
+                    if parts:
+                        patch_id = parts[0]
+        except Exception:
+            pass
+
+        blob_hashes: list[str] = []
+        try:
+            diff_res = subprocess.run(["git", "-C", repo_dir, "diff-tree", "-r", "--no-commit-id", c_hash], capture_output=True, text=True, check=False)
+            if diff_res.returncode == 0:
+                for line in diff_res.stdout.splitlines():
+                    parts = line.split()
+                    if len(parts) >= 5:
+                        post_sha = parts[3]
+                        if len(post_sha) == 40 and post_sha != "0" * 40:
+                            blob_hashes.append(post_sha)
+        except Exception:
+            pass
+
+        features = CommitFeatures(
+            commit_id=cid,
+            commit_hash=c_hash,
+            subject=detail.get("subject", ""),
+            author_name=detail.get("author_name", ""),
+            author_email=detail.get("author_email", ""),
+            author_date=int(detail.get("author_date", 0) or 0),
+            commit_message=detail.get("message", ""),
+            patch_id=patch_id,
+            blob_hashes=blob_hashes[:10],
+        )
+
+        try:
+            client = MailingListClient()
+            results = client.resolve_commits([features])
+            ctx = results.get(c_hash)
+            if not ctx:
+                return {"resolved": False, "linked_emails": [], "reason": "No matching mailing list email found"}
+
+            linked: list[dict[str, Any]] = []
+            if ctx.patch_email and ctx.patch_email.mids:
+                mid = ctx.patch_email.mids[0].strip("<> ")
+                linked.append({
+                    "message_id": mid,
+                    "thread_id": ctx.patch_email.tid,
+                    "relation_type": int(MLRelationType.Patch),
+                    "relation_name": "Patch",
+                    "match_tier": int(ctx.matched_tier),
+                    "match_tier_name": "Live Resolved",
+                    "patch_version": int(ctx.patch_version),
+                    "patch_idx": int(ctx.patch_idx),
+                    "patch_total": int(ctx.patch_total),
+                    "lore_url": f"https://lore.kernel.org/all/{mid}/",
+                })
+            if ctx.cover_letter and ctx.cover_letter.mids:
+                c_mid = ctx.cover_letter.mids[0].strip("<> ")
+                linked.append({
+                    "message_id": c_mid,
+                    "thread_id": ctx.cover_letter.tid,
+                    "relation_type": int(MLRelationType.CoverLetter),
+                    "relation_name": "Cover Letter",
+                    "match_tier": int(ctx.matched_tier),
+                    "match_tier_name": "Live Resolved",
+                    "patch_version": int(ctx.patch_version),
+                    "patch_idx": 0,
+                    "patch_total": int(ctx.patch_total),
+                    "lore_url": f"https://lore.kernel.org/all/{c_mid}/",
+                })
+            if ctx.pull_request and ctx.pull_request.mids:
+                pr_mid = ctx.pull_request.mids[0].strip("<> ")
+                linked.append({
+                    "message_id": pr_mid,
+                    "thread_id": ctx.pull_request.tid,
+                    "relation_type": int(MLRelationType.PullRequest),
+                    "relation_name": "Pull Request",
+                    "match_tier": int(MLMatchTier.PullRequest),
+                    "match_tier_name": "Pull Request",
+                    "patch_version": 1,
+                    "patch_idx": 0,
+                    "patch_total": 0,
+                    "lore_url": f"https://lore.kernel.org/all/{pr_mid}/",
+                })
+            return {"resolved": bool(linked), "linked_emails": linked, "cached": False}
+        except Exception as exc:
+            logger.warning("Live resolve error for commit %s: %s", c_hash, exc)
+            return {"resolved": False, "linked_emails": [], "error": str(exc)}
 
     def get_commit_diff(self, commit: str, context: int = 3) -> dict[str, Any]:
         """Structured unified diff of one commit against its first parent (root commits diff against the empty tree)."""

@@ -638,20 +638,33 @@ Merge commit PR links propagated across all child commits (m_parents[0]..m_hash)
   - Sharded Xapian B-trees: Unified database querying with automatic `reopen()` recovery on concurrent writer updates (`DatabaseModifiedError`).
   - `all.git`: Persistent `git cat-file --batch` coprocess for RFC822 raw header verification.
 - **Micro-Daemon (`ml_server.py`)**:
-  - Standalone HTTP query service listening on localhost port 8192 on the remote storage host.
+  - Standalone multi-threaded HTTP query service (`ThreadingHTTPServer`) listening on localhost port 8192 on the remote storage host (`DAEMON_VERSION = "1.4.1"`).
   - Endpoints:
-    - `GET /health`: Storage status, directory paths, and Xapian availability.
+    - `GET /health`: Storage status, directory paths, daemon version, and Xapian availability.
     - `POST /resolve_commit`: Single commit resolution.
     - `POST /resolve_batch`: Chunked batch commit resolution returning structured `ResolvedCommitContext` dictionaries.
+    - `GET /message` & `POST /message`: Fetch full email metadata, headers, body, raw RFC-822, and parsed diff hunks by `mid` or article sequential `num`.
+    - `GET /thread` & `POST /thread`: Fetch chronological thread messages by `tid` or starting `mid`, with participant and cover letter metadata.
+    - `GET /search` & `POST /search`: Full-text/Xapian search across subjects, authors, and patch metadata with pagination and filter types (`all`, `patch`, `cover`, `pull`).
+  - Thread safety: Every request runs in an isolated thread with top-level exception guards ensuring JSON HTTP responses and clean socket closure.
+- **Patch Parser (`ml_patch_parser.py`)**:
+  - Parses raw unified diffs within commit email bodies into structured AST dictionaries (`files`, `hunks`, `additions`, `deletions`, file modification types `M`, `A`, `D`, `R`, and new line offsets).
+  - Integrates directly with `ml_store.py` and `ml_server.py` to deliver pre-parsed, syntax-highlighted diff hunks directly to frontend viewers.
 - **Client & Tunnel Management (`ml_client.py`)**:
   - Automatically activates the dedicated `"mailing_list"` SSH tunnel if remote access is required.
   - Verifies local archive presence when tunnel is disabled; returns descriptive errors if neither local archive nor SSH tunnel is available.
-  - Negotiates daemon version (`DAEMON_VERSION`) against `/health`; if inactive or outdated, synchronizes `parser/mailing_list` package to remote host, frees the target port via `fuser -k`, and detaches the remote daemon (`ssh -f -n` + `nohup`).
+  - Negotiates daemon version (`DAEMON_VERSION = "1.4.1"`) against `/health`; if inactive or outdated, synchronizes `parser/mailing_list` package to remote host, frees the target port via `fuser -k`, and detaches the remote daemon (`ssh -f -n` + `nohup`).
   - Automatically terminates SSH tunnel on client close.
   - Materializes pull request linkage across both the merge commit and all child commits in the merged branch lineage for $O(1)$ lookup performance.
-- **Store & Query Optimization (`ml_store.py`)**:
+- **Store & Concurrency Architecture (`ml_store.py`)**:
   - Automatically resolves extindex archives under `all/` (e.g. `/srv/lore/all/ei15`).
-  - Utilizes indexed `xref3.oidbin` lookups for Git blob SHA-to-document ID resolution, avoiding full table scans over multi-million row PublicInbox archives.
+  - Resilient Concurrent Read-Only Architecture: Opens `over.sqlite3` and `msgmap.sqlite3` in read-only URI mode with `immutable=1` (`?mode=ro&immutable=1`), bypassing POSIX file locking (`F_SETLK`) and hot journal recovery to completely avoid write lock contention with background `public-inbox-extindex` processes.
+  - Thread-local handles (`threading.local`) and `isolation_level=None` (autocommit mode) ensure zero cursor contention across concurrent worker threads.
+  - Exponential backoff retry helper (`_execute_query`) with `PRAGMA busy_timeout = 60000;` and `PRAGMA query_only = ON;`.
+  - Serialized `git cat-file --batch` pipeline using `threading.Lock()` to prevent stream interleaving across threads.
+  - Chronological search querying indexed via `idx_ds` (`ORDER BY ds DESC`) for instant sub-millisecond retrieval without table-scan locks.
+  - Utilizes indexed `xref3.oidbin` lookups for Git blob SHA-to-document ID resolution, avoiding full table scans over multi-million row PublicInbox archives, with direct `xref3` fallback when `rec.git_blob` is missing in overview records.
+  - Multi-candidate Message-ID lookups supporting raw, unquoted, angle-bracketed, and space-to-plus (`+` query string space interpretation) variants.
   - Provides thread and cover letter reconstruction via `over.sqlite3` indexed by `tid` and `ds`.
 
 

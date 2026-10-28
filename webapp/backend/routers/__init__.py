@@ -9,6 +9,7 @@ from webapp.backend.routers.tools import router as tools_router
 from webapp.backend.routers.system import router as system_router
 from webapp.backend.routers.system import sync_router
 from webapp.backend.routers.docs import router as docs_router
+from webapp.backend.routers.mail import router as mail_router
 
 __all__ = [
     "versions_router",
@@ -21,4 +22,6 @@ __all__ = [
     "system_router",
     "sync_router",
     "docs_router",
+    "mail_router",
 ]
+

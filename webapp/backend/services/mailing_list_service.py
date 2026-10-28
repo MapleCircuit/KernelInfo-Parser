@@ -1,0 +1,303 @@
+"""webapp/backend/services/mailing_list_service.py - WebApp Mailing List & LKML Service.
+
+Connects the web application to the public-inbox / LKML archive (via in-process
+store or remote micro-daemon over SSH tunnel). Provides bounded caching, thread
+hierarchies, email beautification, search querying, and graceful offline fallback.
+"""
+from __future__ import annotations
+
+from collections import OrderedDict
+import logging
+import threading
+from typing import Any
+
+from core.config import get_mailing_list_config
+from parser.mailing_list.ml_client import MailingListClient
+
+logger = logging.getLogger(__name__)
+
+LORE_BASE_URL = "https://lore.kernel.org/all/"
+
+
+class MailingListService:
+    """Service providing LKML email and thread access for the WebApp."""
+
+    def __init__(
+        self,
+        max_email_cache: int = 512,
+        max_thread_cache: int = 128,
+        max_search_cache: int = 64,
+    ) -> None:
+        self._client: MailingListClient | None = None
+        self._client_init_failed = False
+        self._client_init_error = ""
+        self._lock = threading.Lock()
+
+        self._max_email_cache = max_email_cache
+        self._max_thread_cache = max_thread_cache
+        self._max_search_cache = max_search_cache
+
+        self._email_cache: OrderedDict[str, dict[str, Any]] = OrderedDict()
+        self._thread_cache: OrderedDict[int, dict[str, Any]] = OrderedDict()
+        self._search_cache: OrderedDict[str, dict[str, Any]] = OrderedDict()
+
+    def _get_client(self) -> MailingListClient | None:
+        """Lazily initialize client connection to in-process store or daemon."""
+        with self._lock:
+            if self._client is not None:
+                return self._client
+
+            cfg = get_mailing_list_config()
+            if not cfg.get("enabled", True):
+                self._client_init_error = "Mailing list subsystem is disabled in configuration."
+                return None
+
+            try:
+                self._client = MailingListClient()
+                self._client_init_failed = False
+                self._client_init_error = ""
+                return self._client
+            except Exception as exc:
+                self._client_init_failed = True
+                self._client_init_error = str(exc)
+                logger.warning("Could not initialize MailingListClient: %s", exc)
+                return None
+
+    def get_status(self) -> dict[str, Any]:
+        """Check status and reachability of the mailing list daemon/archive."""
+        cfg = get_mailing_list_config()
+        enabled = bool(cfg.get("enabled", True))
+        if not enabled:
+            return {
+                "enabled": False,
+                "available": False,
+                "reason": "Disabled in configuration",
+                "lore_url": LORE_BASE_URL,
+            }
+
+        client = self._get_client()
+        if client is None:
+            return {
+                "enabled": True,
+                "available": False,
+                "reason": self._client_init_error or "Mailing list archive unavailable",
+                "lore_url": LORE_BASE_URL,
+            }
+
+        is_healthy = False
+        try:
+            if client._in_process_resolver is not None:
+                is_healthy = True
+            else:
+                is_healthy = client._check_health(timeout=1.5)
+        except Exception:
+            is_healthy = False
+
+        return {
+            "enabled": True,
+            "available": is_healthy,
+            "use_tunnel": client.use_tunnel,
+            "port": client._effective_port,
+            "lore_url": LORE_BASE_URL,
+            "reason": None if is_healthy else "Mailing list daemon not responding on port",
+        }
+
+    def get_message(self, mid_or_num: str | int) -> dict[str, Any]:
+        """Fetch full email detail by message-ID or sequential article number."""
+        import urllib.parse
+        key = urllib.parse.unquote(str(mid_or_num)).strip("<> ")
+        if not key:
+            return {
+                "available": False,
+                "error": "Missing message identifier",
+                "lore_url": LORE_BASE_URL,
+            }
+
+        with self._lock:
+            if key in self._email_cache:
+                cached = self._email_cache[key]
+                if cached.get("available") and not cached.get("error"):
+                    self._email_cache.move_to_end(key)
+                    return cached
+
+        client = self._get_client()
+        if client is None:
+            return {
+                "available": False,
+                "message_id": key,
+                "error": self._client_init_error or "Mailing list archive unavailable",
+                "lore_url": f"{LORE_BASE_URL}{key}/",
+            }
+
+        try:
+            detail = client.get_email_detail(key)
+            if not detail and " " in key:
+                alt_key = key.replace(" ", "+")
+                detail = client.get_email_detail(alt_key)
+                if detail:
+                    key = alt_key
+
+            if not detail:
+                return {
+                    "available": False,
+                    "message_id": key,
+                    "error": f"Email '{key}' not found in public-inbox archive",
+                    "lore_url": f"{LORE_BASE_URL}{key}/",
+                }
+
+            result: dict[str, Any] = {
+                "available": True,
+                "lore_url": f"{LORE_BASE_URL}{key}/",
+                **detail,
+            }
+
+            with self._lock:
+                self._email_cache[key] = result
+                if len(self._email_cache) > self._max_email_cache:
+                    self._email_cache.popitem(last=False)
+
+            return result
+        except Exception as exc:
+            logger.debug("Error retrieving email %s: %s", key, exc)
+            return {
+                "available": False,
+                "message_id": key,
+                "error": str(exc),
+                "lore_url": f"{LORE_BASE_URL}{key}/",
+            }
+
+    def get_thread(self, tid: int, mid_hint: str = "") -> dict[str, Any]:
+        """Fetch all messages in a thread by thread ID or starting Message-ID."""
+        import urllib.parse
+        clean_mid = urllib.parse.unquote(mid_hint).strip("<> ")
+
+        # If tid is not provided or 0, attempt to look up tid from mid_hint
+        if tid <= 0 and clean_mid:
+            msg = self.get_message(clean_mid)
+            if (not msg.get("available") or not msg.get("tid")) and " " in clean_mid:
+                clean_mid = clean_mid.replace(" ", "+")
+                msg = self.get_message(clean_mid)
+            if msg.get("available") and msg.get("tid"):
+                tid = int(msg["tid"])
+
+        if tid <= 0:
+            return {
+                "available": False,
+                "tid": 0,
+                "error": "Thread identifier not found",
+                "lore_url": f"{LORE_BASE_URL}{clean_mid}/" if clean_mid else LORE_BASE_URL,
+                "total": 0,
+                "messages": [],
+            }
+
+        with self._lock:
+            if tid in self._thread_cache:
+                self._thread_cache.move_to_end(tid)
+                return self._thread_cache[tid]
+
+        client = self._get_client()
+        if client is None:
+            return {
+                "available": False,
+                "tid": tid,
+                "error": self._client_init_error or "Mailing list archive unavailable",
+                "lore_url": f"{LORE_BASE_URL}{clean_mid}/" if clean_mid else LORE_BASE_URL,
+                "total": 0,
+                "messages": [],
+            }
+
+        try:
+            thread_data = client.get_thread(tid)
+            result: dict[str, Any] = {
+                "available": True,
+                "lore_url": f"{LORE_BASE_URL}t/{tid}" if tid else LORE_BASE_URL,
+                **thread_data,
+            }
+
+            with self._lock:
+                self._thread_cache[tid] = result
+                if len(self._thread_cache) > self._max_thread_cache:
+                    self._thread_cache.popitem(last=False)
+
+            return result
+        except Exception as exc:
+            logger.debug("Error retrieving thread %d: %s", tid, exc)
+            return {
+                "available": False,
+                "tid": tid,
+                "error": str(exc),
+                "lore_url": LORE_BASE_URL,
+                "total": 0,
+                "messages": [],
+            }
+
+    def search(
+        self,
+        query: str = "",
+        page: int = 1,
+        limit: int = 50,
+        filter_type: str = "all",
+    ) -> dict[str, Any]:
+        """Search mailing list messages by query and filter with pagination."""
+        clean_q = (query or "").strip()
+        p = max(1, page)
+        lim = max(1, min(100, limit))
+        offset = (p - 1) * lim
+        cache_key = f"{clean_q}:{p}:{lim}:{filter_type}"
+
+        with self._lock:
+            if cache_key in self._search_cache:
+                self._search_cache.move_to_end(cache_key)
+                return self._search_cache[cache_key]
+
+        client = self._get_client()
+        if client is None:
+            return {
+                "available": False,
+                "query": clean_q,
+                "filter_type": filter_type,
+                "page": p,
+                "limit": lim,
+                "total": 0,
+                "results": [],
+                "error": self._client_init_error or "Mailing list archive unavailable",
+                "lore_url": f"{LORE_BASE_URL}?q={clean_q}" if clean_q else LORE_BASE_URL,
+            }
+
+        try:
+            search_data = client.search_emails(
+                query=clean_q,
+                limit=lim,
+                offset=offset,
+                filter_type=filter_type,
+            )
+            result: dict[str, Any] = {
+                "available": True,
+                "page": p,
+                "lore_url": f"{LORE_BASE_URL}?q={clean_q}" if clean_q else LORE_BASE_URL,
+                **search_data,
+            }
+
+            with self._lock:
+                self._search_cache[cache_key] = result
+                if len(self._search_cache) > self._max_search_cache:
+                    self._search_cache.popitem(last=False)
+
+            return result
+        except Exception as exc:
+            logger.debug("Error executing mailing list search '%s': %s", clean_q, exc)
+            return {
+                "available": False,
+                "query": clean_q,
+                "filter_type": filter_type,
+                "page": p,
+                "limit": lim,
+                "total": 0,
+                "results": [],
+                "error": str(exc),
+                "lore_url": f"{LORE_BASE_URL}?q={clean_q}" if clean_q else LORE_BASE_URL,
+            }
+
+
+# Singleton service export
+mailing_list_service = MailingListService()

@@ -454,6 +454,19 @@ export class CommitsView {
           </div>
         </div>
 
+        <!-- Mailing List Discussions & Linked Emails -->
+        <div class="m-card" style="margin-bottom:16px;" id="commit-mail-card">
+          <div class="m-card-title" style="display:flex;justify-content:space-between;align-items:center;">
+            <span>✉ Mailing List Discussions &amp; Patches (${(c.linked_emails || []).length})</span>
+            <button class="code-btn" id="btn-open-ml-search" style="font-size:10px;padding:2px 8px;" title="Search LKML for this commit subject">
+              Search LKML ↗
+            </button>
+          </div>
+          <div id="commit-linked-emails-body" style="display:flex;flex-direction:column;gap:6px;font-size:11px;">
+            ${this.renderLinkedEmailsHtml(c)}
+          </div>
+        </div>
+
         <!-- Contributors & Signoffs (Trailers) -->
         ${(() => {
           const contribList = Array.isArray(c.contributors) && c.contributors.length > 0 ? c.contributors : (Array.isArray(c.trailers) ? c.trailers : []);
@@ -554,6 +567,9 @@ export class CommitsView {
         };
       });
 
+      // Wire Mailing List discussions card events
+      this.wireLinkedEmailsEvents(detailEl, c);
+
       // Jump to file
       detailEl.querySelectorAll(".commit-file-link").forEach((link) => {
         link.onclick = () => {
@@ -582,4 +598,106 @@ export class CommitsView {
       detailEl.innerHTML = `<div style="color:var(--accent-red);padding:16px;">Failed: ${escapeHtml(e.message)}</div>`;
     }
   }
+
+  renderLinkedEmailsHtml(c) {
+    const emails = c.linked_emails || [];
+    if (!emails.length) {
+      return `
+        <div style="display:flex;justify-content:space-between;align-items:center;padding:4px 0;color:var(--text-muted);">
+          <span>No pre-indexed patch emails found for this commit.</span>
+          <button class="code-btn" id="btn-resolve-mail" style="font-size:10px;padding:2px 8px;" title="Query LKML archive live for this commit">
+            🔍 Auto-resolve from LKML
+          </button>
+        </div>
+      `;
+    }
+
+    return emails.map((item) => {
+      let badgeClass = "patch";
+      let badgeText = "Patch";
+      if (item.relation_type === 2) {
+        badgeClass = "cover";
+        badgeText = `Cover Letter [0/${item.patch_total || 'N'}]`;
+      } else if (item.relation_type === 4) {
+        badgeClass = "pull";
+        badgeText = "Pull Request";
+      } else if (item.patch_version || item.patch_idx) {
+        const v = item.patch_version > 1 ? ` v${item.patch_version}` : "";
+        const idx = item.patch_idx ? ` ${item.patch_idx}/${item.patch_total || '1'}` : "";
+        badgeText = `Patch${v}${idx}`;
+      }
+
+      return `
+        <div class="commit-linked-mail-row" data-tid="${item.thread_id || 0}" data-mid="${escapeHtml(item.message_id || '')}" style="display:flex;justify-content:space-between;align-items:center;padding:6px 10px;background:var(--bg-tertiary);border-radius:4px;cursor:pointer;transition:background 0.15s;" title="Click to open this email and thread in Mailing List tab">
+          <div style="display:flex;gap:8px;align-items:center;">
+            <span class="mail-badge ${badgeClass}">${escapeHtml(badgeText)}</span>
+            <code style="font-size:11px;color:var(--accent-blue);font-family:var(--font-mono);">${escapeHtml(item.message_id)}</code>
+          </div>
+          <div style="display:flex;gap:6px;align-items:center;">
+            <span style="font-size:10px;color:var(--text-muted);background:rgba(255,255,255,0.05);padding:1px 6px;border-radius:3px;">${escapeHtml(item.match_tier_name || 'Matched')}</span>
+            <span style="font-size:10px;color:var(--text-secondary);">Open ↗</span>
+          </div>
+        </div>
+      `;
+    }).join("");
+  }
+
+  wireLinkedEmailsEvents(detailEl, c) {
+    const searchBtn = detailEl.querySelector("#btn-open-ml-search");
+    if (searchBtn) {
+      searchBtn.onclick = () => {
+        state.openTab({
+          type: "mail",
+          title: `LKML: ${(c.subject || '').slice(0, 24)}`,
+          query: c.subject || c.commit_hash.slice(0, 10),
+          forceNew: false,
+        });
+      };
+    }
+
+    const resolveBtn = detailEl.querySelector("#btn-resolve-mail");
+    if (resolveBtn) {
+      resolveBtn.onclick = async () => {
+        resolveBtn.disabled = true;
+        resolveBtn.textContent = "Resolving...";
+        try {
+          const res = await api.resolveCommitMail(this.currentVersion, c.commit_hash || c.commit_id);
+          if (res.resolved && res.linked_emails?.length) {
+            c.linked_emails = res.linked_emails;
+            const bodyEl = detailEl.querySelector("#commit-linked-emails-body");
+            if (bodyEl) {
+              bodyEl.innerHTML = this.renderLinkedEmailsHtml(c);
+              this.wireLinkedEmailsEvents(detailEl, c);
+            }
+            toast.success(`Found ${res.linked_emails.length} matching email(s) on LKML`);
+          } else {
+            toast.info(res.reason || "No matching emails found in mailing list archive.");
+            resolveBtn.textContent = "Not found on LKML";
+          }
+        } catch (e) {
+          toast.error(`Resolution failed: ${e.message}`);
+          resolveBtn.textContent = "Retry Resolve";
+          resolveBtn.disabled = false;
+        }
+      };
+    }
+
+    detailEl.querySelectorAll(".commit-linked-mail-row").forEach((row) => {
+      row.onmouseenter = () => { row.style.background = "rgba(255,255,255,0.08)"; };
+      row.onmouseleave = () => { row.style.background = "var(--bg-tertiary)"; };
+      row.onclick = (e) => {
+        const tid = parseInt(row.dataset.tid || "0", 10);
+        const mid = row.dataset.mid || "";
+        const forceNew = e.ctrlKey || e.metaKey || e.button === 1;
+        state.openTab({
+          type: "mail",
+          title: `LKML: ${(c.subject || mid).slice(0, 28)}`,
+          threadId: tid,
+          messageId: mid,
+          forceNew,
+        });
+      };
+    });
+  }
 }
+

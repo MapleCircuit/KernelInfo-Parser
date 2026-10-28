@@ -29,7 +29,7 @@ from parser.mailing_list.ml_types import (
 logger = logging.getLogger(__name__)
 
 
-DAEMON_VERSION = "1.3.0"
+DAEMON_VERSION = "1.4.1"
 
 
 class MailingListClient:
@@ -237,6 +237,85 @@ class MailingListClient:
                 raise ConnectionError(f"Failed to query mailing list daemon at {url}: {exc}") from exc
 
         return results
+
+    def get_email_detail(self, mid_or_num: str | int) -> dict[str, Any] | None:
+        """Fetch full email detail by message ID or article number."""
+        if self._in_process_resolver is not None:
+            return self._in_process_resolver.store.get_email_detail(mid_or_num)
+
+        url = f"http://127.0.0.1:{self._effective_port}/message"
+        payload = json.dumps({"mid": str(mid_or_num)}).encode("utf-8")
+        req = urllib.request.Request(
+            url,
+            data=payload,
+            headers={"Content-Type": "application/json; charset=utf-8"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=30.0) as resp:
+                if resp.status == 200:
+                    data = json.loads(resp.read().decode("utf-8"))
+                    return data.get("message")
+        except urllib.error.HTTPError as exc:
+            if exc.code == 404:
+                return None
+            logger.warning("Mailing list server error for message %s: %s", mid_or_num, exc)
+            raise ConnectionError(f"Mailing list daemon returned {exc.code}: {exc.reason}") from exc
+        except Exception as exc:
+            logger.error("Failed to fetch email %s from daemon: %s", mid_or_num, exc)
+            raise ConnectionError(f"Failed to query mailing list daemon at {url}: {exc}") from exc
+        return None
+
+    def get_thread(self, tid: int) -> dict[str, Any]:
+        """Fetch all messages in a thread by thread ID."""
+        if self._in_process_resolver is not None:
+            return self._in_process_resolver.store.get_thread_messages(tid)
+
+        url = f"http://127.0.0.1:{self._effective_port}/thread?tid={tid}"
+        req = urllib.request.Request(url, method="GET")
+        try:
+            with urllib.request.urlopen(req, timeout=30.0) as resp:
+                if resp.status == 200:
+                    return json.loads(resp.read().decode("utf-8"))
+        except Exception as exc:
+            logger.error("Failed to fetch thread %d from daemon: %s", tid, exc)
+            return {"tid": tid, "subject": "", "total": 0, "participants": [], "messages": [], "error": str(exc)}
+        return {"tid": tid, "subject": "", "total": 0, "participants": [], "messages": []}
+
+    def search_emails(
+        self,
+        query: str = "",
+        limit: int = 50,
+        offset: int = 0,
+        filter_type: str = "all",
+    ) -> dict[str, Any]:
+        """Search mailing list messages by query and filter."""
+        if self._in_process_resolver is not None:
+            return self._in_process_resolver.store.search_emails(
+                query=query, limit=limit, offset=offset, filter_type=filter_type
+            )
+
+        url = f"http://127.0.0.1:{self._effective_port}/search"
+        payload = json.dumps({
+            "q": query,
+            "limit": limit,
+            "offset": offset,
+            "filter": filter_type,
+        }).encode("utf-8")
+        req = urllib.request.Request(
+            url,
+            data=payload,
+            headers={"Content-Type": "application/json; charset=utf-8"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=30.0) as resp:
+                if resp.status == 200:
+                    return json.loads(resp.read().decode("utf-8"))
+        except Exception as exc:
+            logger.error("Failed to search mailing list at %s: %s", url, exc)
+            return {"query": query, "filter_type": filter_type, "total": 0, "limit": limit, "offset": offset, "results": [], "error": str(exc)}
+        return {"query": query, "filter_type": filter_type, "total": 0, "limit": limit, "offset": offset, "results": []}
 
 
     @staticmethod

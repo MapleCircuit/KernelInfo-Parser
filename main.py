@@ -2872,6 +2872,7 @@ def arg_handling() -> argparse.Namespace:
             "tests.test_config",
             "tests.test_ssh_tunnel",
             "tests.test_mailing_list",
+            "tests.test_webapp_mail",
             "tests.test_git_reader",
             "tests.test_webapp_system",
             "tests.test_webapp_sync",

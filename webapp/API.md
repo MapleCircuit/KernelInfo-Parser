@@ -36,7 +36,8 @@ webapp/
 │   │   ├── git_service.py          # Line-by-line blame, commits log, RFC-2822 format-patch
 │   │   ├── pahole_service.py       # Struct memory alignment, padding holes, cachelines
 │   │   ├── callgraph_service.py    # Bidirectional function caller & callee graphs
-│   │   └── diff_service.py         # Cross-version semantic diffs & Kconfig diffing
+│   │   ├── diff_service.py         # Cross-version semantic diffs & Kconfig diffing
+│   │   └── mailing_list_service.py # LKML public-inbox archive, threads, patches & LRU caches
 │   └── routers/
 │       ├── versions.py             # Kernel versions catalog
 │       ├── filesystem.py           # Directory trees, source files, include resolution
@@ -44,6 +45,7 @@ webapp/
 │       ├── kconfig.py              # Kconfig trees, symbol relations, defconfigs
 │       ├── maintainers.py          # Subsystems, maintainers, CREDITS, patch reviewer
 │       ├── commits.py              # Git commit log, detail, and blame annotations
+│       ├── mail.py                 # Mailing list threads, messages, patch diffs, and search
 │       ├── docs.py                 # Documentation labels & kernel-doc
 │       └── tools.py                # Pahole layout, callgraph, semantic version diff
 ├── frontend/
@@ -1202,6 +1204,51 @@ Retrieve detailed metadata for a commit, including multi-contributor trailers an
   ],
   "files_changed": [
     { "path": "Makefile", "status": "M" }
+  ],
+  "linked_emails": [
+    {
+      "message_id": "20210515120000.1234-1-dev@kernel.org",
+      "thread_id": 98765,
+      "relation_type": 1,
+      "relation_name": "Patch",
+      "match_tier": 1,
+      "match_tier_name": "Trailer",
+      "patch_version": 1,
+      "patch_idx": 1,
+      "patch_total": 1,
+      "lore_url": "https://lore.kernel.org/all/20210515120000.1234-1-dev@kernel.org/"
+    }
+  ],
+  "lore_url": "https://lore.kernel.org/all/20210515120000.1234-1-dev@kernel.org/"
+}
+```
+
+#### `POST /api/commits/{version_name}/resolve_mail/{commit_id_or_hash}`
+#### `POST /api/commits/resolve_mail`
+Execute on-demand live resolution of a Git commit against the Public-Inbox / LKML archive without pre-indexed database writes.
+- **Parameters**:
+  - `version_name` (path) / `version` (query): Kernel version string.
+  - `commit_id_or_hash` (path) / `commit_id` (query): Commit integer ID or hex hash.
+- **Read-Only Safety**: Strictly adheres to the zero-write backend invariant; queries the commit features, extracts `git patch-id` and blob hashes, invokes `MailingListClient.resolve_commits()`, and synthesizes linked email records dynamically in memory without executing any `INSERT` or `UPDATE` SQL queries.
+- **Response**:
+```json
+{
+  "resolved": true,
+  "cached": false,
+  "resolved_count": 1,
+  "linked_emails": [
+    {
+      "message_id": "20210515120000.1234-1-dev@kernel.org",
+      "thread_id": 98765,
+      "relation_type": 1,
+      "relation_name": "Patch",
+      "match_tier": 2,
+      "match_tier_name": "Live Resolved",
+      "patch_version": 1,
+      "patch_idx": 1,
+      "patch_total": 1,
+      "lore_url": "https://lore.kernel.org/all/20210515120000.1234-1-dev@kernel.org/"
+    }
   ]
 }
 ```
@@ -1560,6 +1607,185 @@ Compare Kconfig source files and option definitions between two revisions (relea
 
 ---
 
+### 4.8. Linux Kernel Mailing List (LKML) & Public-Inbox API
+
+The Mailing List subsystem connects the web application to the public-inbox / LKML archive (via direct storage read or the lightweight remote micro-daemon over SSH tunnel), providing thread inspection, unified patch diff parsing, full-text search, and offline IndexedDB fallback.
+
+#### `GET /api/mail/status`
+Check daemon status, reachability, active port, and lore.kernel.org baseline availability.
+- **Response**:
+```json
+{
+  "enabled": true,
+  "available": true,
+  "use_tunnel": true,
+  "port": 8192,
+  "lore_url": "https://lore.kernel.org/all/",
+  "reason": null
+}
+```
+
+#### `GET /api/mail/message`
+Retrieve full email details including RFC-822 headers, body text, raw payload, and pre-parsed interactive patch diffs.
+- **Parameters**:
+  - `mid` (query): RFC-822 Message-ID (e.g. `"<20210515120000.1234-1-dev@kernel.org>"` or `"20210515120000.1234-1-dev@kernel.org"`). Automatically supports URL decoding, angle-bracket removal, space-to-plus recovery (`+` converted to space in query strings), and direct `xref3` binary OID fallback.
+  - `num` (query): Optional sequential article number in the Public-Inbox archive.
+- **In-Memory LRU Cache**: 512 entries cached in-memory in `MailingListService._email_cache`. Stale or error entries are automatically bypassed.
+- **Client Cache**: `api.getMailMessage` operates `networkFirst: true`. IndexedDB never caches failed or empty email responses.
+- **Response**:
+```json
+{
+  "available": true,
+  "num": 421890,
+  "message_id": "20210515120000.1234-1-dev@kernel.org",
+  "subject": "[PATCH v2 1/3] fs/ext4: fix use-after-free in ext4_ext_remove_space",
+  "from_name": "Developer Name",
+  "from_email": "dev@kernel.org",
+  "author": "Developer Name <dev@kernel.org>",
+  "date": 1621080000,
+  "date_iso": "2021-05-15 12:00:00",
+  "tid": 87654,
+  "headers": {
+    "from": "Developer Name <dev@kernel.org>",
+    "to": "linux-ext4@vger.kernel.org",
+    "subject": "[PATCH v2 1/3] fs/ext4: fix use-after-free in ext4_ext_remove_space",
+    "date": "Sat, 15 May 2021 12:00:00 +0000",
+    "message-id": "<20210515120000.1234-1-dev@kernel.org>"
+  },
+  "body": "Commit message body text...\n\nSigned-off-by: Developer Name <dev@kernel.org>\n---\n...",
+  "raw": "From: Developer Name <dev@kernel.org>\nTo: linux-ext4@vger.kernel.org\n...",
+  "is_patch": true,
+  "is_cover": false,
+  "is_pull": false,
+  "patch_version": 2,
+  "patch_idx": 1,
+  "patch_total": 3,
+  "diff": {
+    "additions": 14,
+    "deletions": 3,
+    "files": [
+      {
+        "path": "fs/ext4/extents.c",
+        "old_path": "fs/ext4/extents.c",
+        "status": "M",
+        "additions": 14,
+        "deletions": 3,
+        "binary": false,
+        "hunks": [
+          {
+            "old_start": 2840,
+            "old_count": 7,
+            "new_start": 2840,
+            "new_count": 18,
+            "heading": "ext4_ext_remove_space",
+            "lines": [
+              [" ", 2840, 2840, " static int ext4_ext_remove_space(struct inode *inode)"],
+              ["-", 2841, null, "     ext4_free_extents(inode);"],
+              ["+", null, 2841, "     if (ext4_valid_extent(inode))"],
+              ["+", null, 2842, "         ext4_free_extents(inode);"]
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "lore_url": "https://lore.kernel.org/all/20210515120000.1234-1-dev@kernel.org/"
+}
+```
+
+#### `GET /api/mail/thread/{tid}`
+#### `GET /api/mail/thread`
+Retrieve all messages in a discussion thread ordered chronologically by sequential number or date.
+- **Parameters**:
+  - `tid` (path or query): Thread integer identifier.
+  - `mid` (query): Optional Message-ID hint used to resolve `tid` automatically if `tid` is omitted or 0.
+- **In-Memory LRU Cache**: 128 entries cached in `MailingListService._thread_cache`.
+- **Response**:
+```json
+{
+  "available": true,
+  "tid": 87654,
+  "subject": "[PATCH v2 0/3] fs/ext4: extent tree cleanup & fix",
+  "total": 4,
+  "participants": [
+    "Developer Name <dev@kernel.org>",
+    "Theodore Ts'o <tytso@mit.edu>"
+  ],
+  "messages": [
+    {
+      "num": 421889,
+      "message_id": "20210515115900.1234-0-dev@kernel.org",
+      "tid": 87654,
+      "subject": "[PATCH v2 0/3] fs/ext4: extent tree cleanup & fix",
+      "author": "Developer Name <dev@kernel.org>",
+      "date": 1621079940,
+      "date_iso": "2021-05-15 11:59:00",
+      "is_patch": false,
+      "is_cover": true,
+      "is_pull": false,
+      "patch_version": 2,
+      "patch_idx": 0,
+      "patch_total": 3
+    },
+    {
+      "num": 421890,
+      "message_id": "20210515120000.1234-1-dev@kernel.org",
+      "tid": 87654,
+      "subject": "[PATCH v2 1/3] fs/ext4: fix use-after-free in ext4_ext_remove_space",
+      "author": "Developer Name <dev@kernel.org>",
+      "date": 1621080000,
+      "date_iso": "2021-05-15 12:00:00",
+      "is_patch": true,
+      "is_cover": false,
+      "is_pull": false,
+      "patch_version": 2,
+      "patch_idx": 1,
+      "patch_total": 3
+    }
+  ],
+  "lore_url": "https://lore.kernel.org/all/t/87654"
+}
+```
+
+#### `GET /api/mail/search`
+Full-text search across public-inbox mail archive with Boolean and term prefixes.
+- **Parameters**:
+  - `q` (query): Search terms or prefixes (e.g. `s:ext4`, `f:torvalds`, `m:20210515`).
+  - `page` (query): 1-indexed page number (default 1).
+  - `limit` (query): Items per page (1-100, default 50).
+  - `filter` / `filter_type` (query): Filtering preset: `"all"`, `"patch"`, `"cover"`, `"pull"`.
+- **In-Memory LRU Cache**: 64 entries cached in `MailingListService._search_cache`.
+- **Response**:
+```json
+{
+  "available": true,
+  "query": "ext4",
+  "filter_type": "patch",
+  "page": 1,
+  "limit": 50,
+  "total": 142,
+  "results": [
+    {
+      "num": 421890,
+      "message_id": "20210515120000.1234-1-dev@kernel.org",
+      "tid": 87654,
+      "subject": "[PATCH v2 1/3] fs/ext4: fix use-after-free in ext4_ext_remove_space",
+      "author": "Developer Name <dev@kernel.org>",
+      "date": 1621080000,
+      "date_iso": "2021-05-15 12:00:00",
+      "is_patch": true,
+      "is_cover": false,
+      "is_pull": false,
+      "patch_version": 2,
+      "patch_idx": 1,
+      "patch_total": 3
+    }
+  ]
+}
+```
+
+---
+
 ## 5. Frontend Client Architecture & Module Specifications
 
 The frontend is a vanilla ES-Module single-page application requiring zero node/npm build steps.
@@ -1865,6 +2091,39 @@ The frontend implements systematic middle-click capture (`auxclick` with `e.butt
 - **Saved position**: the viewport's `scrollTop` is kept on the tab (`tab.scrollTop`, written on scroll and persisted debounced), so selecting the tab again — which reloads and re-renders the file — comes back exactly where it was left. Opening an already open file *at a line* (`cursorLine`, e.g. from a definition, an XRef or a commit diff) drops that saved position (`state.openTab`), so navigation still wins over it; applying another revision to the tab drops it too.
 - **Minimap to scale**: `minimapMetrics()` maps the document (`lines × 20px`) onto at most one pixel per line, so the drawing is exactly as deep as the file is long and the track below the last line is shaded rather than pretending to be content. The slider's height is the share of the document the viewport shows and its travel is `mapHeight − sliderHeight`, so at the bottom of the file its lower edge meets the last line instead of running past it (it is also looked up inside the tab's own container, so split panes no longer share one slider). Clicking or dragging the minimap scrolls to that position, and a `ResizeObserver` on the editor body redraws it when the pane, the window or the sidebar changes its size.
 
+### 5.22. Mailing List & LKML Discussions Tab (`webapp/frontend/js/views/mail/mail_view.js`, `webapp/frontend/css/mail.css`)
+1. **Activity Bar & Navigation**:
+   - The Activity Bar features a dedicated **Mailing List** envelope icon (`data-action="mail"`) opening or focusing a singleton `mail` tab (`[L]` badge in tab strip).
+   - Bi-directional URL synchronization via `#tab=mail&tid=<threadId>&mid=<messageId>&q=<query>`.
+   - Command palette mode `"m"` (`m <search query>`) searches LKML discussions directly from any tab.
+2. **Integrated Two-Column Architecture**:
+   - **Left Column (Search & Threads)**:
+     - Real-time debounced typeahead search input (`s:`, `f:`, `m:` prefix support).
+     - Filter chips (`All`, `Patches`, `Cover Letters`, `Pull Requests`) with categorical badge highlights.
+     - Scrollable results roster with infinite-scroll pagination (`Load More (N of Total)`).
+     - Middle-click multi-tab opening: middle-clicking any search result opens the thread in a new standalone tab.
+   - **Right Column (Conversation & Patch Viewer)**:
+     - Top thread summary card showing root subject, message count, participant count, and external `Lore ↗` link.
+     - **Mini Timeline Outline**: Interactive horizontal chip strip (`Msg 1`, `[0/N]`, `[1/N]`, `[PULL]`) capped with vertical overflow scrolling (`max-height: 72px; overflow-y: auto`); clicking any chip expands and smoothly scrolls to the target email card via element lookup without selector escaping hazards.
+     - **Thread & Card Scroll Containment**: Enforces strict flexbox containment (`min-height: 0; min-width: 0; flex: 1 1 0%`) on `.tab-content-container`, `.mail-detail-col`, `.mail-thread-wrapper`, and `.mail-messages-container` with `flex-shrink: 0` on individual email cards (`.mail-card`). This guarantees that multi-thousand-line emails, large patch series, and raw RFC-822 payloads scroll vertically in their entirety without clipping.
+     - **Collapsible Message Cards**: Accordion-style email cards with author avatar/name, email, timestamp, and status badges.
+3. **Beautified & Raw Dual-Mode Viewing**:
+   - Segmented toggle (`Beautified` / `Raw`) on every message card:
+     - **Beautified Mode**: Formatted in monospace (`font-family: var(--font-mono)`) with `white-space: pre-wrap; word-break: break-word` to preserve indentation of kernel code snippets, ASCII diagrams, and stack traces; indented and tinted quote blocks (`> ...`), highlighted trailer lines (`Signed-off-by:`, `Acked-by:`, `Reviewed-by:`), collapsible RFC-822 header drawer, and structured interactive diff viewer.
+     - **Raw Mode**: Monospace view of the unparsed RFC-822 / git-am formatted message with horizontal scrolling for long lines.
+   - Action controls: `📋 Copy` RFC-822 text to clipboard, `⬇ Download` `.eml` / `.patch` file, and direct `Lore ↗` permalink.
+4. **Interactive Patch Viewer**:
+   - Unified diff hunks are parsed into structured file cards showing path, old/new line numbers, additions (`+N`), and deletions (`−N`).
+   - File cards feature a 1-click **Open ↗** button that opens the modified file directly in the Virtual Code Editor at the modified line.
+   - Clicking individual hunk diff rows navigates to the exact line in the code view.
+5. **Caching & Offline Resilience**:
+   - IndexedDB store (`localDB.mail` under DB version 4) acts as both an active read-through cache (preventing repetitive network and SSH tunnel requests for immutable emails) and an offline fallback when network connectivity is lost.
+   - Automatically displays an inline warning banner with a **Retry** button when the daemon or SSH tunnel is offline, smoothly rendering cached conversations.
+6. **Commit View Integration**:
+   - Commit detail cards display linked mailing list discussions (`Patch`, `Cover Letter`, `Pull Request`) with tier tags (`Trailer`, `Patch-ID`, `BlobHash`, `MetadataFallback`).
+   - Clicking any linked email opens the Mailing List tab focused on that specific thread and message.
+   - Incorporates an on-demand **Auto-resolve from LKML** action for unlinked commits, resolving against the micro-daemon over SSH tunnel dynamically without modifying MySQL tables.
+
 ## 6. Programmatic Python Service Delegates (`webapp/main.py`)
 
 For automated testing, scripting, and offline analysis, all core domain service functions are exported directly from [`webapp/main.py`](webapp/main.py):
@@ -1925,6 +2184,13 @@ from webapp.main import (
     get_function_callgraph,
     get_versions_diff,
     get_kconfig_diff,
+    
+    # Mailing List & LKML Discussions
+    get_mail_status,
+    get_mail_message,
+    get_mail_thread,
+    search_mail,
+    resolve_commit_mail,
 )
 ```
 
@@ -1975,9 +2241,11 @@ Open `http://localhost:8000` in any modern browser.
 | `500 Internal Error` | Database connection pool exhaustion or unhandled server exception | `{"detail": "Internal database error"}` |
 
 ### 8.1. Client-Side Offline Storage & Fallbacks (`IndexedDB`)
-The frontend client automatically falls back to IndexedDB (`KernelInfoDB` v1) whenever network operations fail or the server is temporarily offline:
+The frontend client automatically falls back to IndexedDB (`KernelInfoDB` v4) whenever network operations fail or the server is temporarily offline:
 - **`files` Store**: Cached file contents, AST tokens, directory trees, blame records.
 - **`symbols` Store**: Cached symbol search results, definition records, XRef usage graphs.
 - **`kconfigs` Store**: Architecture trees, defconfig mappings, dependency graphs.
 - **`subsystems` Store**: Maintainer sections, developer profiles, CREDITS catalog.
+- **`commits` Store**: Commit listings, commit details, structured diffs.
+- **`mail` Store**: Public-inbox email messages, parsed patch diffs, thread message rosters, search result sets. Functions as an active read-through cache preventing duplicate network/SSH requests for identical emails, as well as an offline store.
 - **`ui_state` Store**: Active layout tabs, open files, split-screen arrangements, editor cursor offsets.

@@ -19,6 +19,7 @@ from webapp.backend.routers import (
     system_router,
     sync_router,
     docs_router,
+    mail_router,
 )
 from webapp.backend.services.sync_service import SyncHeaderMiddleware, sync_service
 
@@ -73,6 +74,7 @@ def create_app() -> FastAPI:
     app.include_router(system_router)
     app.include_router(sync_router)
     app.include_router(docs_router)
+    app.include_router(mail_router)
 
     # 3. Mount Frontend Static Assets
     if FRONTEND_DIR.is_dir():

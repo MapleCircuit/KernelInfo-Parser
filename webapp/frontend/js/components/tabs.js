@@ -214,6 +214,7 @@ export class TabsComponent {
       case "diff": return "[D]";
       case "treemap": return "[T]";
       case "explorer": return "[E]";
+      case "mail": return "[L]";
       default: return "[?]";
     }
   }

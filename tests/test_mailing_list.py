@@ -312,6 +312,64 @@ class MockStore:
                 results.append(r)
         return results
 
+    def get_email_detail(self, mid_or_num):
+        rec = self.mid_map.get(str(mid_or_num))
+        if not rec:
+            for r in self.mid_map.values():
+                if r.num == mid_or_num or str(r.num) == str(mid_or_num):
+                    rec = r
+                    break
+        if not rec:
+            return None
+        return {
+            "num": rec.num,
+            "tid": rec.tid,
+            "sid": rec.sid,
+            "subject": rec.subject,
+            "author": rec.author,
+            "timestamp": rec.ts,
+            "message_id": rec.mids[0] if rec.mids else "",
+            "mids": rec.mids,
+            "body": "Mock body content",
+            "is_patch": "[patch" in rec.subject.lower(),
+            "raw": f"From: {rec.author}\nSubject: {rec.subject}\n\nMock body content\n",
+        }
+
+    def get_thread_messages(self, tid):
+        thread = self.threads.get(tid, [])
+        return {
+            "tid": tid,
+            "subject": thread[0].subject if thread else "",
+            "total": len(thread),
+            "participants": list({r.author for r in thread}),
+            "messages": [
+                {
+                    "num": r.num,
+                    "tid": r.tid,
+                    "sid": r.sid,
+                    "subject": r.subject,
+                    "author": r.author,
+                    "timestamp": r.ts,
+                    "message_id": r.mids[0] if r.mids else "",
+                }
+                for r in thread
+            ],
+        }
+
+    def search_emails(self, query="", limit=50, offset=0, filter_type="all"):
+        matches = []
+        for r in self.mid_map.values():
+            if not query or query.lower() in r.subject.lower():
+                matches.append(r)
+        return {
+            "query": query,
+            "total": len(matches),
+            "results": [
+                {"num": r.num, "tid": r.tid, "subject": r.subject, "message_id": r.mids[0] if r.mids else ""}
+                for r in matches[offset : offset + limit]
+            ],
+        }
+
     def close(self):
         pass
 
@@ -612,6 +670,33 @@ class TestServerClientHTTPRoundTrip(unittest.TestCase):
             res = ResolvedCommitContext.from_dict(results["ffff111122223333444455556666777788889999"])
             self.assertIsNotNone(res.patch_email)
             self.assertEqual(res.patch_email.mids[0], "http.test@example.org")
+
+    def test_get_message_over_http(self):
+        url = f"http://127.0.0.1:{self.port}/message?mid=http.test@example.org"
+        with urllib.request.urlopen(url, timeout=5.0) as resp:
+            self.assertEqual(resp.status, 200)
+            data = json.loads(resp.read().decode("utf-8"))
+            msg = data.get("message")
+            self.assertIsNotNone(msg)
+            self.assertEqual(msg.get("message_id"), "http.test@example.org")
+            self.assertEqual(msg.get("subject"), "[PATCH 1/1] net: http test")
+
+    def test_get_thread_over_http(self):
+        url = f"http://127.0.0.1:{self.port}/thread?tid=77"
+        with urllib.request.urlopen(url, timeout=5.0) as resp:
+            self.assertEqual(resp.status, 200)
+            data = json.loads(resp.read().decode("utf-8"))
+            self.assertEqual(data.get("tid"), 77)
+            self.assertEqual(data.get("total"), 1)
+            self.assertEqual(len(data.get("messages", [])), 1)
+
+    def test_search_over_http(self):
+        url = f"http://127.0.0.1:{self.port}/search?q=http+test"
+        with urllib.request.urlopen(url, timeout=5.0) as resp:
+            self.assertEqual(resp.status, 200)
+            data = json.loads(resp.read().decode("utf-8"))
+            self.assertGreaterEqual(data.get("total", 0), 1)
+            self.assertEqual(data.get("results")[0]["message_id"], "http.test@example.org")
 
 
 if __name__ == "__main__":

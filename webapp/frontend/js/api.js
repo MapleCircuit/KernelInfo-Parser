@@ -79,7 +79,12 @@ class ApiClient {
     if (!networkFirst && cacheStore && cacheKey && (!options.method || options.method === "GET")) {
       const cached = await localDB.get(cacheStore, cacheKey);
       if (cached !== null && cached !== undefined) {
-        return cached;
+        // If cached mail item is failed or missing body/raw, bypass stale cache to fetch fresh
+        if (cacheStore === "mail" && cached && (cached.available === false || cached.error || (!cached.raw && !cached.body && !cached.messages && !cached.results))) {
+          // Stale or incomplete mail entry, bypass cache
+        } else {
+          return cached;
+        }
       }
     }
 
@@ -120,7 +125,10 @@ class ApiClient {
 
       // 3. Cache successful response in IndexedDB
       if (cacheStore && cacheKey) {
-        localDB.set(cacheStore, cacheKey, data).catch((e) => console.warn("Cache write failed:", e));
+        // Do not cache failed or empty mail items in IndexedDB
+        if (cacheStore !== "mail" || (data && data.available !== false && !data.error && (data.raw || data.body || data.messages || data.results))) {
+          localDB.set(cacheStore, cacheKey, data).catch((e) => console.warn("Cache write failed:", e));
+        }
       }
 
       return data;
@@ -575,7 +583,66 @@ class ApiClient {
     const vb = this._sanitizeVer(versionB);
     return this.request(`/api/diff/kconfig/${encodeURIComponent(va)}/${encodeURIComponent(vb)}`, {}, "tools", `kdiff2_${this._vk(va)}_${this._vk(vb)}`);
   }
+
+  // --- Mailing List & LKML ---
+  async getMailStatus({ force = false } = {}) {
+    const now = Date.now();
+    if (!force && this._mailStatusCache && (now - (this._mailStatusCacheTime || 0) < 15000)) {
+      return this._mailStatusCache;
+    }
+    const data = await this.request("/api/mail/status", { networkFirst: true }, "mail", "daemon_status");
+    this._mailStatusCache = data;
+    this._mailStatusCacheTime = now;
+    return data;
+  }
+
+  async getMailMessage(midOrNum, { networkFirst = true } = {}) {
+    const target = encodeURIComponent(String(midOrNum).trim());
+    return this.request(
+      `/api/mail/message?mid=${target}`,
+      { networkFirst },
+      "mail",
+      `msg_${target}`
+    );
+  }
+
+  async getMailThread(tid, mid = "", { networkFirst = true } = {}) {
+    const params = new URLSearchParams();
+    if (tid) params.set("tid", tid);
+    if (mid) params.set("mid", mid);
+    const key = `thread_${tid || 0}_${mid || ""}`;
+    return this.request(
+      `/api/mail/thread?${params.toString()}`,
+      { networkFirst },
+      "mail",
+      key
+    );
+  }
+
+  async searchMailingList(query = "", { page = 1, limit = 50, filterType = "all", networkFirst = false } = {}) {
+    const params = new URLSearchParams({
+      q: query,
+      page,
+      limit,
+      filter: filterType,
+    });
+    return this.request(
+      `/api/mail/search?${params.toString()}`,
+      { networkFirst },
+      "mail",
+      `search_${query}_${page}_${limit}_${filterType}`
+    );
+  }
+
+  async resolveCommitMail(version, commitIdOrHash) {
+    const ver = this._sanitizeVer(version);
+    const cid = encodeURIComponent(String(commitIdOrHash).trim());
+    return this.request(`/api/commits/${encodeURIComponent(ver)}/resolve_mail/${cid}`, {
+      method: "POST",
+    });
+  }
 }
 
 export const api = new ApiClient();
+
 

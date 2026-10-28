@@ -514,6 +514,12 @@ class GlobalState {
           if (t.type === "explorer") return (t.path || "") === (tabData.path || "") && t.version === tabData.version;
           if (t.type === "kconfig") return t.arch === tabData.arch && t.version === tabData.version && (t.configName || "") === (tabData.configName || "");
           if (t.type === "nodemap" && (tabData.initialNodes || tabData.initialNode)) return false;
+          if (t.type === "mail") {
+            if (tabData.threadId || tabData.messageId) {
+              return t.threadId === tabData.threadId && t.messageId === tabData.messageId;
+            }
+            return t.title === tabData.title;
+          }
           if (t.type === "diff") return true;
           return t.title === tabData.title;
         });
@@ -528,6 +534,9 @@ class GlobalState {
       if ("diffMarks" in tabData) existing.diffMarks = tabData.diffMarks;
       if (tabData.symbol) existing.symbol = tabData.symbol;
       if (tabData.title) existing.title = tabData.title;
+      if (tabData.threadId !== undefined) existing.threadId = tabData.threadId;
+      if (tabData.messageId !== undefined) existing.messageId = tabData.messageId;
+      if (tabData.query !== undefined) existing.query = tabData.query;
     } else {
       const id = "tab-" + Math.random().toString(36).substring(2, 9);
       // A tab opened from another one inherits that tab's revision, never the header selection

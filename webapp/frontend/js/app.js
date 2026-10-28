@@ -27,16 +27,18 @@ import { CallgraphView } from "./views/callgraph/callgraph_view.js";
 import { DiffView } from "./views/diff/diff_view.js";
 import { TreemapView } from "./views/treemap/treemap_view.js";
 import { ExplorerView } from "./views/explorer/explorer_view.js";
+import { MailView } from "./views/mail/mail_view.js";
 
 export class KernelIdeApp {
   constructor() {
     this.tabsComponent = null;
     this.viewRenderers = {
-      // One view per tab (code, kconfig, explorer): each keeps its own file, dimming, engine
-      // selection or browsed directory
+      // One view per tab (code, kconfig, explorer, mail): each keeps its own file, dimming, engine
+      // selection, browsed directory or mail search/thread
       code: () => new VirtualEditor(),
       kconfig: () => new KconfigView(),
       explorer: () => new ExplorerView(),
+      mail: () => new MailView(),
       nodemap: new NodeMapController(),
       maintainers: new MaintainersView(),
       commits: new CommitsView(),
@@ -752,6 +754,7 @@ export class KernelIdeApp {
       },
       { title: "Open repository explorer tab", hint: "Browse the tree of this revision", keywords: "files tree browse", run: () => state.openTab({ type: "explorer", title: `Explorer ${v()}`, path: "", version: v(), forceNew: true }) },
       { title: "Open Git commits timeline", hint: "History of the version", keywords: "log", run: () => state.openTab({ type: "commits", title: "Commits" }) },
+      { title: "Open Mailing List & LKML search", hint: "Search patches and threads", keywords: "mail lkml lore patch thread", run: () => state.openTab({ type: "mail", title: "Mailing List" }) },
       { title: "Open subsystems & maintainers", hint: "MAINTAINERS, CREDITS", keywords: "people", run: () => state.openTab({ type: "maintainers", title: "Maintainers" }) },
       { title: "Open NodeMap canvas", hint: "Schematic view", keywords: "graph", run: () => state.openTab({ type: "nodemap", title: "NodeMap Canvas" }) },
       { title: "Open kernel documentation", hint: "Documentation/index.rst", keywords: "docs rst", run: () => state.openTab({ type: "code", title: "index.rst", path: "Documentation/index.rst", version: v() }) },
@@ -793,6 +796,8 @@ export class KernelIdeApp {
           state.openTab({ type: "maintainers", title: "Maintainers" });
         } else if (action === "commits") {
           state.openTab({ type: "commits", title: "Commits" });
+        } else if (action === "mail") {
+          state.openTab({ type: "mail", title: "Mailing List" });
         } else if (action === "compare" || action === "tools") {
           state.openTab({ type: "diff", title: "Compare" });
         }

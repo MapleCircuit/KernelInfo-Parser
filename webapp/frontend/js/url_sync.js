@@ -71,6 +71,15 @@ class UrlSynchronizer {
           title: "NodeMap Canvas",
           version: v || state.currentVersion
         });
+      } else if (tabType === "mail") {
+        state.openTab({
+          type: "mail",
+          title: "Mailing List",
+          threadId: parseInt(params.get("tid") || "0", 10),
+          messageId: params.get("mid") || "",
+          query: params.get("q") || "",
+          version: v || state.currentVersion
+        });
       }
     } finally {
       this.isUpdatingFromHash = false;
@@ -97,6 +106,10 @@ class UrlSynchronizer {
     } else if (activeTab.type === "kconfig" && activeTab.arch) {
       params.set("arch", activeTab.arch);
       if (activeTab.configName) params.set("cfg", activeTab.configName);
+    } else if (activeTab.type === "mail") {
+      if (activeTab.threadId) params.set("tid", activeTab.threadId);
+      if (activeTab.messageId) params.set("mid", activeTab.messageId);
+      if (activeTab.query) params.set("q", activeTab.query);
     }
 
     const newHash = "#" + params.toString();

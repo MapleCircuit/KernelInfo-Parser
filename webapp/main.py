@@ -23,6 +23,7 @@ from webapp.backend.services import (
     PaholeService,
     CallgraphService,
     DiffService,
+    MailingListService,
 )
 
 # Initialize application instance
@@ -37,6 +38,7 @@ git_service = GitService()
 pahole_service = PaholeService()
 callgraph_service = CallgraphService()
 diff_service = DiffService()
+mailing_list_service = MailingListService()
 
 # Models
 from webapp.backend.models import (
@@ -99,6 +101,12 @@ get_function_callgraph = callgraph_service.get_function_callgraph
 get_versions_diff = diff_service.get_versions_diff
 get_kconfig_diff = diff_service.get_kconfig_diff
 get_file_diff = diff_service.get_file_diff
+
+get_mail_status = mailing_list_service.get_status
+get_mail_message = mailing_list_service.get_message
+get_mail_thread = mailing_list_service.get_thread
+search_mail = mailing_list_service.search
+resolve_commit_mail = git_service.resolve_commit_mail
 
 
 if __name__ == "__main__":

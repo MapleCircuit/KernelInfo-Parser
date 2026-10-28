@@ -6,7 +6,7 @@ Listens on a TCP port (default: 8192) and serves batch commit resolution queries
 from __future__ import annotations
 
 import argparse
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import logging
 import os
@@ -31,11 +31,11 @@ logging.basicConfig(
 logger = logging.getLogger("ml_server")
 
 
-DAEMON_VERSION = "1.3.0"
+DAEMON_VERSION = "1.4.1"
 
 
 class MLServerRequestHandler(BaseHTTPRequestHandler):
-    """Handles HTTP health and batch resolution requests."""
+    """Handles HTTP health, batch resolution, thread, and email search requests."""
 
     @property
     def resolver(self) -> KernelCommitEmailResolver:
@@ -52,24 +52,71 @@ class MLServerRequestHandler(BaseHTTPRequestHandler):
         self.wfile.write(payload)
 
     def do_GET(self) -> None:
-        if self.path == "/health" or self.path == "/":
+        try:
+            import urllib.parse
+            parsed = urllib.parse.urlparse(self.path)
+            path = parsed.path
+            qs = urllib.parse.parse_qs(parsed.query)
+
             store = getattr(self.resolver, "store", None)
-            storage_dir = str(getattr(store, "root", "")) if store else ""
-            idx_dir = str(getattr(store, "idx_dir", "")) if store else ""
-            shards = int(getattr(store, "shard_count", 0)) if store else 0
-            self._send_json(
-                200,
-                {
-                    "status": "ok",
-                    "version": DAEMON_VERSION,
-                    "storage_dir": storage_dir,
-                    "idx_dir": idx_dir,
-                    "shards": shards,
-                    "has_xapian": HAS_XAPIAN,
-                },
-            )
-        else:
-            self._send_json(404, {"error": "Not found"})
+
+            if path == "/health" or path == "/":
+                storage_dir = str(getattr(store, "root", "")) if store else ""
+                idx_dir = str(getattr(store, "idx_dir", "")) if store else ""
+                shards = int(getattr(store, "shard_count", 0)) if store else 0
+                self._send_json(
+                    200,
+                    {
+                        "status": "ok",
+                        "version": DAEMON_VERSION,
+                        "storage_dir": storage_dir,
+                        "idx_dir": idx_dir,
+                        "shards": shards,
+                        "has_xapian": HAS_XAPIAN,
+                    },
+                )
+            elif path == "/message":
+                if not store:
+                    self._send_json(503, {"error": "Store not initialized"})
+                    return
+                mid = qs.get("mid", [None])[0]
+                num_str = qs.get("num", [None])[0]
+                target = num_str if num_str else mid
+                if not target:
+                    self._send_json(400, {"error": "Missing 'mid' or 'num' query parameter"})
+                    return
+                detail = store.get_email_detail(target)
+                if not detail:
+                    self._send_json(404, {"error": f"Email '{target}' not found"})
+                    return
+                self._send_json(200, {"message": detail})
+            elif path == "/thread":
+                if not store:
+                    self._send_json(503, {"error": "Store not initialized"})
+                    return
+                tid_str = qs.get("tid", ["0"])[0]
+                try:
+                    tid = int(tid_str)
+                except ValueError:
+                    self._send_json(400, {"error": "Invalid 'tid' query parameter"})
+                    return
+                thread_data = store.get_thread_messages(tid)
+                self._send_json(200, thread_data)
+            elif path == "/search":
+                if not store:
+                    self._send_json(503, {"error": "Store not initialized"})
+                    return
+                q = qs.get("q", [""])[0]
+                limit = int(qs.get("limit", [50])[0])
+                offset = int(qs.get("offset", [0])[0])
+                filter_type = qs.get("filter", ["all"])[0]
+                results = store.search_emails(q, limit=limit, offset=offset, filter_type=filter_type)
+                self._send_json(200, results)
+            else:
+                self._send_json(404, {"error": "Not found"})
+        except Exception as exc:
+            logger.error("Error processing GET %s: %s", self.path, exc, exc_info=True)
+            self._send_json(500, {"error": str(exc)})
 
     def do_POST(self) -> None:
         content_length = int(self.headers.get("Content-Length", 0))
@@ -83,6 +130,8 @@ class MLServerRequestHandler(BaseHTTPRequestHandler):
         except Exception as exc:
             self._send_json(400, {"error": f"Invalid JSON: {exc}"})
             return
+
+        store = getattr(self.resolver, "store", None)
 
         try:
             if self.path == "/resolve_batch":
@@ -103,11 +152,42 @@ class MLServerRequestHandler(BaseHTTPRequestHandler):
                     200,
                     {"result": ctx.to_dict() if ctx else None},
                 )
+            elif self.path == "/message":
+                if not store:
+                    self._send_json(503, {"error": "Store not initialized"})
+                    return
+                target = req_data.get("mid") or req_data.get("num")
+                if not target:
+                    self._send_json(400, {"error": "Missing 'mid' or 'num' in payload"})
+                    return
+                detail = store.get_email_detail(target)
+                if not detail:
+                    self._send_json(404, {"error": f"Email '{target}' not found"})
+                    return
+                self._send_json(200, {"message": detail})
+            elif self.path == "/thread":
+                if not store:
+                    self._send_json(503, {"error": "Store not initialized"})
+                    return
+                tid = int(req_data.get("tid", 0))
+                thread_data = store.get_thread_messages(tid)
+                self._send_json(200, thread_data)
+            elif self.path == "/search":
+                if not store:
+                    self._send_json(503, {"error": "Store not initialized"})
+                    return
+                q = str(req_data.get("q", ""))
+                limit = int(req_data.get("limit", 50))
+                offset = int(req_data.get("offset", 0))
+                filter_type = str(req_data.get("filter", "all"))
+                results = store.search_emails(q, limit=limit, offset=offset, filter_type=filter_type)
+                self._send_json(200, results)
             else:
                 self._send_json(404, {"error": "Not found"})
         except Exception as exc:
             logger.error("Error processing POST %s: %s", self.path, exc, exc_info=True)
             self._send_json(500, {"error": f"Internal server error: {exc}"})
+
 
     def log_message(self, format: str, *args: Any) -> None:
         # Reduce verbosity for routine requests
@@ -131,7 +211,8 @@ def run_server(
     MLServerRequestHandler.resolver = resolver
 
     server_address = (host, port)
-    httpd = HTTPServer(server_address, MLServerRequestHandler)
+    httpd = ThreadingHTTPServer(server_address, MLServerRequestHandler)
+    httpd.daemon_threads = True
     logger.info(
         "Mailing List Query Server listening on http://%s:%d (shards: %d, xapian: %s)",
         host,

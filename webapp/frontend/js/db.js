@@ -4,8 +4,8 @@
  */
 const DB_NAME = "KernelInfoIDE_v2";
 // Stores of cached API data (meta, tabs_state and nodemap_projects hold user state)
-const DATA_STORES = ["files", "symbols", "kconfigs", "maintainers", "commits", "tools"];
-const DB_VERSION = 3;
+const DATA_STORES = ["files", "symbols", "kconfigs", "maintainers", "commits", "tools", "mail"];
+const DB_VERSION = 4;
 
 const REQUIRED_STORES = [
   { name: "meta", keyPath: "key" },
@@ -15,6 +15,7 @@ const REQUIRED_STORES = [
   { name: "maintainers", keyPath: "key" },
   { name: "commits", keyPath: "key" },
   { name: "tools", keyPath: "key" },
+  { name: "mail", keyPath: "key" },
   { name: "tabs_state", keyPath: "key" },
   { name: "nodemap_projects", keyPath: "id" }
 ];

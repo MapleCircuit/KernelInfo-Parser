@@ -7,6 +7,7 @@ from webapp.backend.services.git_service import GitService
 from webapp.backend.services.pahole_service import PaholeService
 from webapp.backend.services.callgraph_service import CallgraphService
 from webapp.backend.services.diff_service import DiffService
+from webapp.backend.services.mailing_list_service import MailingListService
 
 __all__ = [
     "FilesystemService",
@@ -17,4 +18,5 @@ __all__ = [
     "PaholeService",
     "CallgraphService",
     "DiffService",
+    "MailingListService",
 ]

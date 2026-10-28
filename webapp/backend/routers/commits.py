@@ -38,6 +38,20 @@ def get_commit(
     return git_service.get_commit_detail(v, cid)
 
 
+@router.post("/commits/{version_name}/resolve_mail/{commit_id_or_hash}")
+@router.post("/commits/resolve_mail")
+def resolve_commit_mail(
+    version_name: str = "v3.0",
+    commit_id_or_hash: str = "",
+    version: str = Query("v3.0"),
+    commit_id: str = Query(""),
+) -> dict[str, Any]:
+    """On-demand resolution of commit against mailing list archive."""
+    v = version_name or version
+    cid = commit_id_or_hash or commit_id
+    return git_service.resolve_commit_mail(v, cid)
+
+
 @router.get("/commits/{version_name}/diff/{commit_hash}")
 def get_commit_diff(version_name: str, commit_hash: str, context: int = Query(3, ge=0, le=20)) -> dict[str, Any]:
     """Structured diff of one commit against its first parent, with old/new line numbers per row."""

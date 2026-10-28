@@ -45,6 +45,7 @@ const MODES = {
   "#": { label: "Commits", placeholder: "Search commits by subject, author or hash…" },
   "?": { label: "Kconfig", placeholder: "Search Kconfig options…" },
   ":": { label: "Go to line", placeholder: "Line number in the active file…" },
+  "m": { label: "Mailing List", placeholder: "Search LKML emails, patches, and threads…" },
 };
 
 class CommandPalette {
@@ -96,7 +97,7 @@ class CommandPalette {
         <div class="cmdp-results" role="listbox"></div>
         <div class="cmdp-footer">
           <span><kbd>↑↓</kbd> navigate</span><span><kbd>Enter</kbd> open</span><span><kbd>Ctrl+Enter</kbd> new tab</span>
-          <span class="cmdp-prefixes"><code>&gt;</code> commands <code>@</code> symbols <code>#</code> commits <code>?</code> kconfig <code>:</code> line</span>
+          <span class="cmdp-prefixes"><code>&gt;</code> commands <code>@</code> symbols <code>#</code> commits <code>?</code> kconfig <code>:</code> line <code>m</code> mail</span>
         </div>
       </div>`;
     document.body.appendChild(backdrop);
@@ -167,11 +168,13 @@ class CommandPalette {
       const wantSymbols = mode === "" || mode === "@";
       const wantKconfig = mode === "" || mode === "?";
       const wantCommits = mode === "#";
-      const [files, symbols, kconfig, commits] = await Promise.allSettled([
+      const wantMail = mode === "m" || (mode === "" && query.length >= 3);
+      const [files, symbols, kconfig, commits, mail] = await Promise.allSettled([
         wantFiles ? api.searchFiles(version, query, 25) : null,
         wantSymbols && query.length >= 2 ? api.searchSymbols(version, query, mode === "@" ? 50 : 15) : null,
         wantKconfig && query.length >= 2 ? api.searchKconfig(version, query.replace(/^CONFIG_/i, ""), mode === "?" ? 40 : 8) : null,
         wantCommits ? api.searchCommits(version, query, 40) : null,
+        wantMail ? api.searchMailingList(query, { limit: mode === "m" ? 30 : 6 }) : null,
       ]);
       if (seq !== this.seq || !this.el) return;
 
@@ -196,11 +199,26 @@ class CommandPalette {
         items.push({
           section: "Commits", icon: "●", title: c.subject || c.commit_hash, detail: `${c.commit_hash.slice(0, 12)} · ${c.author_name || c.author_email || ""}`, highlightQuery: query,
           run: () => {
-            // Selecting a commit does not move any open tab: it becomes the header selection and
-            // opens in a repository explorer of its own
             state.setSelectedVersion(c.commit_hash);
             state.openTab({ type: "explorer", title: `Explorer ${c.commit_hash.slice(0, 8)}`, path: "", version: c.commit_hash, forceNew: true });
           },
+        });
+      }
+      for (const m of val(mail)?.results || []) {
+        const shortSubj = m.subject || m.message_id || "Thread";
+        items.push({
+          section: "Mailing List",
+          icon: m.is_patch ? "✉" : "💬",
+          title: shortSubj,
+          detail: `${m.author || "Unknown"} · ${m.date_iso || ""}`,
+          highlightQuery: query,
+          run: (nt) => state.openTab({
+            type: "mail",
+            title: `LKML: ${shortSubj.slice(0, 32)}`,
+            threadId: m.tid,
+            messageId: m.message_id,
+            forceNew: Boolean(nt),
+          }),
         });
       }
       if (items.length === 0) {
