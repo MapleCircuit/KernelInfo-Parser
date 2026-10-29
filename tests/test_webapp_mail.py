@@ -3,7 +3,7 @@
 Tests:
 1. MailingListService lifecycle, status reporting, and fallback
 2. Email message fetching, patch diff parsing, and LRU caching
-3. Thread retrieval by TID and MID hint resolution
+3. Thread retrieval by TID and MID hint resolution, and series revision discovery
 4. Search querying, pagination, and filter types
 5. Commit-to-email linkage in get_commit_detail
 6. On-demand live commit mail resolution (resolve_commit_mail) with read-only DB safety
@@ -21,11 +21,16 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
-from webapp.backend.services.mailing_list_service import MailingListService, LORE_BASE_URL
+from webapp.backend.services.mailing_list_service import (
+    MailingListService,
+    LORE_BASE_URL,
+    normalize_series_subject,
+)
 from webapp.backend.routers.mail import (
     get_mail_status,
     get_mail_message,
     get_mail_thread,
+    get_mail_thread_versions,
     search_mailing_list,
 )
 from webapp.backend.routers.commits import resolve_commit_mail as router_resolve_commit_mail
@@ -156,7 +161,7 @@ class TestMailingListService(unittest.TestCase):
         msg = self.service.get_message("non-existent@kernel.org")
         self.assertFalse(msg["available"])
         self.assertIn("not found", msg["error"])
-        self.assertIn("lore.kernel.org", msg["lore_url"])
+        self.assertIn("lore.kernelinfo.org", msg["lore_url"])
 
     def test_get_thread_by_tid(self) -> None:
         mock_client = MagicMock()
@@ -225,6 +230,105 @@ class TestMailingListService(unittest.TestCase):
         self.assertEqual(mock_client.search_emails.call_count, 1)
 
 
+class TestSeriesVersionDiscovery(unittest.TestCase):
+    """Test base-subject normalization and multi-revision patch series grouping."""
+
+    @staticmethod
+    def _msg(num, tid, subject, ts, *, is_patch=True, is_cover=False, version=1, idx=1, total=2, refs=()):
+        return {
+            "num": num,
+            "tid": tid,
+            "subject": subject,
+            "author": f"Dev {num} <d{num}@kernel.org>",
+            "timestamp": ts,
+            "date_iso": "2021-05-15 12:00:00",
+            "message_id": f"m{num}@kernel.org",
+            "mids": [f"m{num}@kernel.org"],
+            "references": list(refs),
+            "is_patch": is_patch,
+            "is_cover": is_cover,
+            "is_pull": False,
+            "patch_version": version,
+            "patch_idx": idx,
+            "patch_total": total,
+        }
+
+    def setUp(self) -> None:
+        self.service = MailingListService(max_email_cache=5, max_thread_cache=5, max_search_cache=5)
+
+        self.threads = {
+            10: {
+                "tid": 10,
+                "subject": "[PATCH 0/2] mm: fix the thing",
+                "participants": ["Dev 1 <d1@kernel.org>"],
+                "messages": [
+                    self._msg(1, 10, "[PATCH 0/2] mm: fix the thing", 100, is_cover=True, idx=0),
+                    self._msg(2, 10, "[PATCH 1/2] mm: fix the thing part a", 101, idx=1, refs=["m1@kernel.org"]),
+                    self._msg(3, 10, "[PATCH 2/2] mm: fix the thing part b", 102, idx=2, refs=["m1@kernel.org"]),
+                    self._msg(4, 10, "Re: [PATCH 1/2] mm: fix the thing part a", 103,
+                              is_patch=False, refs=["m1@kernel.org", "m2@kernel.org"]),
+                ],
+            },
+            20: {
+                "tid": 20,
+                "subject": "[PATCH v2 0/2] mm: fix the thing",
+                "participants": ["Dev 5 <d5@kernel.org>"],
+                "messages": [
+                    self._msg(5, 20, "[PATCH v2 0/2] mm: fix the thing", 200, is_cover=True, version=2, idx=0),
+                    self._msg(6, 20, "[PATCH v2 1/2] mm: fix the thing part a", 201, version=2, idx=1, refs=["m5@kernel.org"]),
+                    self._msg(7, 20, "[PATCH v2 2/2] mm: fix the thing part b", 202, version=2, idx=2, refs=["m5@kernel.org"]),
+                ],
+            },
+        }
+
+        mock_client = MagicMock()
+        mock_client.get_thread.side_effect = lambda tid: self.threads.get(tid, {"tid": tid, "messages": []})
+        mock_client.search_emails.side_effect = lambda query="", limit=50, offset=0, filter_type="all": {
+            "total": 7,
+            "results": [m for t in self.threads.values() for m in t["messages"]],
+        }
+        self.mock_client = mock_client
+        self.service._client = mock_client
+
+    def test_normalize_series_subject_strips_reply_and_patch_tags(self) -> None:
+        self.assertEqual(normalize_series_subject("Re: [PATCH v3 2/5] mm: fix it"), "mm: fix it")
+        self.assertEqual(normalize_series_subject("[RFC PATCH 0/5]   mm: fix it "), "mm: fix it")
+        self.assertEqual(normalize_series_subject("mm: fix it"), "mm: fix it")
+        self.assertEqual(normalize_series_subject(""), "")
+
+    def test_get_thread_versions_groups_revisions(self) -> None:
+        res = self.service.get_thread_versions(10)
+        self.assertTrue(res["available"])
+        self.assertEqual(res["base_subject"], "mm: fix the thing")
+        self.assertEqual(res["current_version"], 1)
+        self.assertEqual(res["total_versions"], 2)
+
+        v1, v2 = res["versions"]
+        self.assertEqual((v1["version"], v1["tid"], v1["total"], v1["patches"]), (1, 10, 4, 3))
+        self.assertEqual((v2["version"], v2["tid"], v2["total"], v2["patches"]), (2, 20, 3, 3))
+        self.assertTrue(v1["is_current"])
+        self.assertFalse(v2["is_current"])
+        self.assertEqual(v1["cover_message_id"], "m1@kernel.org")
+        self.assertEqual(v2["cover_message_id"], "m5@kernel.org")
+
+    def test_get_thread_versions_marks_requested_revision_current(self) -> None:
+        res = self.service.get_thread_versions(20)
+        self.assertEqual(res["current_version"], 2)
+        self.assertTrue(next(v for v in res["versions"] if v["version"] == 2)["is_current"])
+
+    def test_get_thread_versions_is_cached(self) -> None:
+        self.service.get_thread_versions(10)
+        calls = self.mock_client.get_thread.call_count
+        self.service.get_thread_versions(10)
+        self.assertEqual(self.mock_client.get_thread.call_count, calls)
+
+    def test_get_thread_versions_without_thread_identifier(self) -> None:
+        res = self.service.get_thread_versions(0, mid_hint="")
+        self.assertFalse(res["available"])
+        self.assertEqual(res["versions"], [])
+        self.assertEqual(res["lore_url"], LORE_BASE_URL)
+
+
 class TestMailRouterEndpoints(unittest.TestCase):
     """Test FastAPI router functions for mail."""
 
@@ -234,6 +338,9 @@ class TestMailRouterEndpoints(unittest.TestCase):
         mock_service.get_message.return_value = {"available": True, "message_id": "m1@k.org"}
         mock_service.get_thread.return_value = {"available": True, "tid": 100, "messages": []}
         mock_service.search.return_value = {"available": True, "total": 0, "results": []}
+        mock_service.get_thread_versions.return_value = {
+            "available": True, "tid": 100, "current_version": 2, "versions": [{"version": 2}],
+        }
 
         # 1. Status
         st = get_mail_status()
@@ -250,6 +357,11 @@ class TestMailRouterEndpoints(unittest.TestCase):
         # 4. Search
         s = search_mailing_list(q="ext4", page=1, limit=50, filter_type="patch")
         self.assertEqual(s["total"], 0)
+
+        # 5. Series revisions
+        vers = get_mail_thread_versions(tid=100, mid="")
+        self.assertEqual(vers["current_version"], 2)
+        self.assertEqual(len(vers["versions"]), 1)
 
 
 class TestCommitMailIntegration(unittest.TestCase):
@@ -307,7 +419,7 @@ class TestCommitMailIntegration(unittest.TestCase):
             self.assertEqual(linked["message_id"], "patch-123@vger.kernel.org")
             self.assertEqual(linked["thread_id"], 7777)
             self.assertEqual(linked["relation_type"], 1)
-            self.assertIn("lore.kernel.org", linked["lore_url"])
+            self.assertIn("lore.kernelinfo.org", linked["lore_url"])
 
     def test_on_demand_resolve_commit_mail_read_only(self) -> None:
         git_svc = GitService()
@@ -386,7 +498,14 @@ class TestFrontendMailAssets(unittest.TestCase):
 
         self.assertIn("class MailView", content)
         self.assertIn("api.getMailThread", content)
+        self.assertIn("api.getMailThreadVersions", content)
         self.assertIn("renderThreadView", content)
+        self.assertIn("buildThreadTree", content)
+        self.assertIn("renderTree", content)
+        self.assertIn("setListMode", content)
+        self.assertIn("renderVersionSelector", content)
+        self.assertIn("lore.kernelinfo.org", content)
+        self.assertNotIn("mail-thread-outline", content)
         self.assertIn("renderPatchDiff", content)
         self.assertIn("wireDiffInteractions", content)
         self.assertIn("formatEmailBodyText", content)
@@ -400,7 +519,10 @@ class TestFrontendMailAssets(unittest.TestCase):
 
         self.assertIn(".mail-view-container", content)
         self.assertIn(".mail-list-col", content)
-        self.assertIn(".mail-thread-outline", content)
+        self.assertIn(".mail-list-switcher", content)
+        self.assertIn(".mail-tree-node", content)
+        self.assertIn(".mail-version-chip", content)
+        self.assertNotIn(".mail-thread-outline", content)
         self.assertIn(".mail-card", content)
         self.assertIn(".mail-raw-container", content)
 
@@ -420,6 +542,7 @@ class TestFrontendMailAssets(unittest.TestCase):
         self.assertIn("getMailStatus(", content)
         self.assertIn("getMailMessage(", content)
         self.assertIn("getMailThread(", content)
+        self.assertIn("getMailThreadVersions(", content)
         self.assertIn("searchMailingList(", content)
         self.assertIn("resolveCommitMail(", content)
 

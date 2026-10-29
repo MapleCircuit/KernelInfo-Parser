@@ -445,7 +445,7 @@ export class CommitsView {
             <div><strong>Author:</strong> <span class="commit-detail-author-link" style="color:var(--accent-blue);cursor:pointer;text-decoration:underline;" title="Click to view developer profile">${c.author?.name || c.author_name} &lt;${c.author?.email || c.author_email}&gt;</span></div>
             <div><strong>Date:</strong> ${dateStr}</div>
             <div><strong>Hash:</strong> <span class="commit-hash">${c.commit_hash}</span></div>
-            ${c.lore_url ? `<div><a href="${c.lore_url}" target="_blank" class="lore-link">Lore.kernel.org LKML Thread ↗</a></div>` : ""}
+            ${c.lore_url ? `<div><a href="${c.lore_url}" target="_blank" class="lore-link">lore.kernelinfo.org LKML Thread ↗</a></div>` : ""}
             <div style="margin-top:8px;">
               <button class="code-btn active" id="btn-explore-commit" style="font-size:11px;padding:4px 10px;">
                 🔍 Explore Files at this Commit (${c.commit_hash.slice(0, 8)})

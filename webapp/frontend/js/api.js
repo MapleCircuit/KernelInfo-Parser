@@ -80,7 +80,7 @@ class ApiClient {
       const cached = await localDB.get(cacheStore, cacheKey);
       if (cached !== null && cached !== undefined) {
         // If cached mail item is failed or missing body/raw, bypass stale cache to fetch fresh
-        if (cacheStore === "mail" && cached && (cached.available === false || cached.error || (!cached.raw && !cached.body && !cached.messages && !cached.results))) {
+        if (cacheStore === "mail" && cached && (cached.available === false || cached.error || (!cached.raw && !cached.body && !cached.messages && !cached.results && !cached.versions))) {
           // Stale or incomplete mail entry, bypass cache
         } else {
           return cached;
@@ -126,7 +126,7 @@ class ApiClient {
       // 3. Cache successful response in IndexedDB
       if (cacheStore && cacheKey) {
         // Do not cache failed or empty mail items in IndexedDB
-        if (cacheStore !== "mail" || (data && data.available !== false && !data.error && (data.raw || data.body || data.messages || data.results))) {
+        if (cacheStore !== "mail" || (data && data.available !== false && !data.error && (data.raw || data.body || data.messages || data.results || data.versions))) {
           localDB.set(cacheStore, cacheKey, data).catch((e) => console.warn("Cache write failed:", e));
         }
       }
@@ -613,6 +613,19 @@ class ApiClient {
     const key = `thread_${tid || 0}_${mid || ""}`;
     return this.request(
       `/api/mail/thread?${params.toString()}`,
+      { networkFirst },
+      "mail",
+      key
+    );
+  }
+
+  async getMailThreadVersions(tid, mid = "", { networkFirst = true } = {}) {
+    const params = new URLSearchParams();
+    if (tid) params.set("tid", tid);
+    if (mid) params.set("mid", mid);
+    const key = `versions_${tid || 0}_${mid || ""}`;
+    return this.request(
+      `/api/mail/versions?${params.toString()}`,
       { networkFirst },
       "mail",
       key

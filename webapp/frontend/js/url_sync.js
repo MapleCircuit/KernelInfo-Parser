@@ -78,6 +78,7 @@ class UrlSynchronizer {
           threadId: parseInt(params.get("tid") || "0", 10),
           messageId: params.get("mid") || "",
           query: params.get("q") || "",
+          listMode: params.get("mode") === "tree" ? "tree" : "search",
           version: v || state.currentVersion
         });
       }
@@ -110,6 +111,7 @@ class UrlSynchronizer {
       if (activeTab.threadId) params.set("tid", activeTab.threadId);
       if (activeTab.messageId) params.set("mid", activeTab.messageId);
       if (activeTab.query) params.set("q", activeTab.query);
+      if (activeTab.listMode === "tree") params.set("mode", "tree");
     }
 
     const newHash = "#" + params.toString();

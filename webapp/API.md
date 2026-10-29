@@ -1216,10 +1216,10 @@ Retrieve detailed metadata for a commit, including multi-contributor trailers an
       "patch_version": 1,
       "patch_idx": 1,
       "patch_total": 1,
-      "lore_url": "https://lore.kernel.org/all/20210515120000.1234-1-dev@kernel.org/"
+      "lore_url": "https://lore.kernelinfo.org/all/20210515120000.1234-1-dev@kernel.org/"
     }
   ],
-  "lore_url": "https://lore.kernel.org/all/20210515120000.1234-1-dev@kernel.org/"
+  "lore_url": "https://lore.kernelinfo.org/all/20210515120000.1234-1-dev@kernel.org/"
 }
 ```
 
@@ -1247,7 +1247,7 @@ Execute on-demand live resolution of a Git commit against the Public-Inbox / LKM
       "patch_version": 1,
       "patch_idx": 1,
       "patch_total": 1,
-      "lore_url": "https://lore.kernel.org/all/20210515120000.1234-1-dev@kernel.org/"
+      "lore_url": "https://lore.kernelinfo.org/all/20210515120000.1234-1-dev@kernel.org/"
     }
   ]
 }
@@ -1612,7 +1612,7 @@ Compare Kconfig source files and option definitions between two revisions (relea
 The Mailing List subsystem connects the web application to the public-inbox / LKML archive (via direct storage read or the lightweight remote micro-daemon over SSH tunnel), providing thread inspection, unified patch diff parsing, full-text search, and offline IndexedDB fallback.
 
 #### `GET /api/mail/status`
-Check daemon status, reachability, active port, and lore.kernel.org baseline availability.
+Check daemon status, reachability, active port, and the base URL of the self-hosted public-inbox mirror (`lore.kernelinfo.org`, a clone of `lore.kernel.org`).
 - **Response**:
 ```json
 {
@@ -1620,7 +1620,7 @@ Check daemon status, reachability, active port, and lore.kernel.org baseline ava
   "available": true,
   "use_tunnel": true,
   "port": 8192,
-  "lore_url": "https://lore.kernel.org/all/",
+  "lore_url": "https://lore.kernelinfo.org/all/",
   "reason": null
 }
 ```
@@ -1689,7 +1689,7 @@ Retrieve full email details including RFC-822 headers, body text, raw payload, a
       }
     ]
   },
-  "lore_url": "https://lore.kernel.org/all/20210515120000.1234-1-dev@kernel.org/"
+  "lore_url": "https://lore.kernelinfo.org/all/20210515120000.1234-1-dev@kernel.org/"
 }
 ```
 
@@ -1743,7 +1743,55 @@ Retrieve all messages in a discussion thread ordered chronologically by sequenti
       "patch_total": 3
     }
   ],
-  "lore_url": "https://lore.kernel.org/all/t/87654"
+  "lore_url": "https://lore.kernelinfo.org/all/t/87654"
+}
+```
+
+#### `GET /api/mail/versions/{tid}`
+#### `GET /api/mail/versions`
+List every revision (`v1`, `v2`, ...) of the patch series a thread belongs to. Revisions are normally posted as separate threads sharing one base subject, so the series is reconstructed by normalizing the requested thread's subject (`normalize_series_subject`: reply prefixes and leading `[PATCH v3 2/5]` tags removed) and matching that base subject against the archive search index. At most `MAX_VERSION_THREADS` (8) sibling threads are expanded.
+- **Parameters**:
+  - `tid` (path or query): Thread integer identifier.
+  - `mid` (query): Optional Message-ID, used both to resolve `tid` and to pin `current_version` when a single thread carries messages of more than one revision.
+- **Grouping**: every message of each thread is folded into the entry of its own revision (`patch_version`); a reply carrying no patch tag inherits the revision of the earliest series message in its thread. `total` counts all messages of the revision, `patches` only the patches, cover letters and pull requests.
+- **In-Memory LRU Cache**: keyed by `tid:mid`, bounded by the thread cache size (128 entries) in `MailingListService._version_cache`.
+- **Response**:
+```json
+{
+  "available": true,
+  "tid": 87654,
+  "base_subject": "fs/ext4: extent tree cleanup & fix",
+  "current_version": 2,
+  "total_versions": 2,
+  "versions": [
+    {
+      "version": 1,
+      "tid": 87001,
+      "subject": "[PATCH 0/3] fs/ext4: extent tree cleanup & fix",
+      "root_message_id": "20210501120000.99-0-dev@kernel.org",
+      "cover_message_id": "20210501120000.99-0-dev@kernel.org",
+      "author": "Developer Name <dev@kernel.org>",
+      "timestamp": 1619870400,
+      "date_iso": "2021-05-01 12:00:00",
+      "total": 6,
+      "patches": 4,
+      "is_current": false
+    },
+    {
+      "version": 2,
+      "tid": 87654,
+      "subject": "[PATCH v2 0/3] fs/ext4: extent tree cleanup & fix",
+      "root_message_id": "20210515115900.1234-0-dev@kernel.org",
+      "cover_message_id": "20210515115900.1234-0-dev@kernel.org",
+      "author": "Developer Name <dev@kernel.org>",
+      "timestamp": 1621079940,
+      "date_iso": "2021-05-15 11:59:00",
+      "total": 4,
+      "patches": 4,
+      "is_current": true
+    }
+  ],
+  "lore_url": "https://lore.kernelinfo.org/all/?q=fs/ext4%3A%20extent%20tree%20cleanup%20%26%20fix"
 }
 ```
 
@@ -2094,17 +2142,22 @@ The frontend implements systematic middle-click capture (`auxclick` with `e.butt
 ### 5.22. Mailing List & LKML Discussions Tab (`webapp/frontend/js/views/mail/mail_view.js`, `webapp/frontend/css/mail.css`)
 1. **Activity Bar & Navigation**:
    - The Activity Bar features a dedicated **Mailing List** envelope icon (`data-action="mail"`) opening or focusing a singleton `mail` tab (`[L]` badge in tab strip).
-   - Bi-directional URL synchronization via `#tab=mail&tid=<threadId>&mid=<messageId>&q=<query>`.
+   - Bi-directional URL synchronization via `#tab=mail&tid=<threadId>&mid=<messageId>&q=<query>&mode=<search|tree>`.
    - Command palette mode `"m"` (`m <search query>`) searches LKML discussions directly from any tab.
 2. **Integrated Two-Column Architecture**:
-   - **Left Column (Search & Threads)**:
-     - Real-time debounced typeahead search input (`s:`, `f:`, `m:` prefix support).
-     - Filter chips (`All`, `Patches`, `Cover Letters`, `Pull Requests`) with categorical badge highlights.
-     - Scrollable results roster with infinite-scroll pagination (`Load More (N of Total)`).
-     - Middle-click multi-tab opening: middle-clicking any search result opens the thread in a new standalone tab.
+   - **Left Column (two modes, `.mail-list-switcher`)**: a segmented switcher (`🔍 Search` / `🌲 Thread Tree`) swaps the two panes (`#mail-search-pane`, `#mail-tree-pane`; the inactive one carries `hidden`). The mode is kept on the tab (`tab.listMode`) and in the URL (`&mode=tree`), so a reopened or reloaded tab comes back in the mode it was left in. The offline banner stays above both panes.
+     - **Search mode** (`#mail-search-pane`):
+       - Real-time debounced typeahead search input (`s:`, `f:`, `m:` prefix support).
+       - Filter chips (`All`, `Patches`, `Cover Letters`, `Pull Requests`) with categorical badge highlights.
+       - Scrollable results roster with infinite-scroll pagination (`Load More (N of Total)`).
+       - Middle-click multi-tab opening: middle-clicking any search result opens the thread in a new standalone tab.
+     - **Thread Tree mode** (`#mail-tree-pane`, replaces the former mini timeline outline):
+       - **Revision picker** (`.mail-version-chips`): one chip per revision of the series (`v1`, `v2`, ... each with its message count), from `GET /api/mail/versions` (§4.8). The chip of the revision on screen is active; choosing another loads that revision's thread (`inspectThread` on its `tid`, focused on its cover letter) and redraws the tree, so a multi-version patch series is navigated without going back to search. A single-revision series states so instead of showing one chip; nothing is shown when no thread is open.
+       - **Reply tree** (`buildThreadTree`): the hierarchy is derived from each message's `References` chain — the closest reference that is present in the thread and is not already a descendant becomes the parent (cycle-safe), and a patch with no resolvable parent attaches to the series cover letter. Roots are ordered chronologically, as are the replies under each node.
+       - **Expandable nodes**: a node with replies carries a twisty (`▸`/`▾`) and a `↳ N` count of the messages below it; collapsed replies are revealed by expanding it. Root rows and the branch holding the focused message open by default, and an explicit expand or collapse is remembered for that thread (`treeOpen`). Each row shows its patch badge (`0/N`, `i/N`, `PULL`, `RE`), the subject with its reply prefixes and bracket tag stripped, the author, the date and the bracket tag itself.
+       - **Selection**: clicking a row expands and scrolls to that email card in the conversation column (`focusMessageCard`) and records it as the tab's `mid`; middle-clicking opens that message in a new standalone mail tab. When one thread carries several revisions, the tree shows only the branches of the selected revision.
    - **Right Column (Conversation & Patch Viewer)**:
-     - Top thread summary card showing root subject, message count, participant count, and external `Lore ↗` link.
-     - **Mini Timeline Outline**: Interactive horizontal chip strip (`Msg 1`, `[0/N]`, `[1/N]`, `[PULL]`) capped with vertical overflow scrolling (`max-height: 72px; overflow-y: auto`); clicking any chip expands and smoothly scrolls to the target email card via element lookup without selector escaping hazards.
+     - Top thread summary card showing root subject, message count, participant count, and external `lore.kernelinfo.org ↗` link.
      - **Thread & Card Scroll Containment**: Enforces strict flexbox containment (`min-height: 0; min-width: 0; flex: 1 1 0%`) on `.tab-content-container`, `.mail-detail-col`, `.mail-thread-wrapper`, and `.mail-messages-container` with `flex-shrink: 0` on individual email cards (`.mail-card`). This guarantees that multi-thousand-line emails, large patch series, and raw RFC-822 payloads scroll vertically in their entirety without clipping.
      - **Collapsible Message Cards**: Accordion-style email cards with author avatar/name, email, timestamp, and status badges.
 3. **Beautified & Raw Dual-Mode Viewing**:
@@ -2112,12 +2165,13 @@ The frontend implements systematic middle-click capture (`auxclick` with `e.butt
      - **Beautified Mode**: Formatted in monospace (`font-family: var(--font-mono)`) with `white-space: pre-wrap; word-break: break-word` to preserve indentation of kernel code snippets, ASCII diagrams, and stack traces; indented and tinted quote blocks (`> ...`), highlighted trailer lines (`Signed-off-by:`, `Acked-by:`, `Reviewed-by:`), collapsible RFC-822 header drawer, and structured interactive diff viewer.
      - **Raw Mode**: Monospace view of the unparsed RFC-822 / git-am formatted message with horizontal scrolling for long lines.
    - Action controls: `📋 Copy` RFC-822 text to clipboard, `⬇ Download` `.eml` / `.patch` file, and direct `Lore ↗` permalink.
+   - **Archive host**: every outbound permalink points at the self-hosted public-inbox mirror `https://lore.kernelinfo.org/all/` (a clone of `lore.kernel.org`), defined once per side as `LORE_BASE_URL` in `webapp/backend/services/mailing_list_service.py` (reused by `webapp/backend/services/git_service.py` for commit linkage) and in `webapp/frontend/js/views/mail/mail_view.js`. `Link:` trailers inside upstream commit messages are untouched: they are historical kernel data pointing at `lore.kernel.org`.
 4. **Interactive Patch Viewer**:
    - Unified diff hunks are parsed into structured file cards showing path, old/new line numbers, additions (`+N`), and deletions (`−N`).
    - File cards feature a 1-click **Open ↗** button that opens the modified file directly in the Virtual Code Editor at the modified line.
    - Clicking individual hunk diff rows navigates to the exact line in the code view.
 5. **Caching & Offline Resilience**:
-   - IndexedDB store (`localDB.mail` under DB version 4) acts as both an active read-through cache (preventing repetitive network and SSH tunnel requests for immutable emails) and an offline fallback when network connectivity is lost.
+   - IndexedDB store (`localDB.mail` under DB version 4) acts as both an active read-through cache (preventing repetitive network and SSH tunnel requests for immutable emails) and an offline fallback when network connectivity is lost. Search results, threads and revision lists (`versions`) are cached; failed or empty mail payloads never are.
    - Automatically displays an inline warning banner with a **Retry** button when the daemon or SSH tunnel is offline, smoothly rendering cached conversations.
 6. **Commit View Integration**:
    - Commit detail cards display linked mailing list discussions (`Patch`, `Cover Letter`, `Pull Request`) with tier tags (`Trailer`, `Patch-ID`, `BlobHash`, `MetadataFallback`).

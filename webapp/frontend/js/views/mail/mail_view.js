@@ -3,6 +3,9 @@
  *
  * Provides an integrated two-column interface for searching, browsing, beautifying,
  * and navigating LKML patch series and email discussion threads with direct code editor jumps.
+ *
+ * The left column switches between two modes: archive search, and a reply tree of the
+ * active thread with a revision picker for multi-version patch series.
  */
 import { api } from "../../api.js";
 import { state } from "../../state.js";
@@ -17,6 +20,43 @@ const STATUS_COLORS = {
   R: "#d2a8ff",
   M: "var(--accent-yellow)",
 };
+
+// Self-hosted public-inbox mirror (clone of lore.kernel.org).
+const LORE_BASE_URL = "https://lore.kernelinfo.org/all/";
+
+/** Normalize a Message-ID for comparison: percent-decoded, unbracketed, lowercased. */
+function normalizeMid(mid) {
+  let text = String(mid ?? "").trim();
+  try {
+    text = decodeURIComponent(text);
+  } catch {
+    // Keep the raw text when it is not valid percent-encoding
+  }
+  return text.replace(/^<|>$/g, "").trim().toLowerCase();
+}
+
+/** Split a subject into its leading bracket tag, reply marker, and remaining text. */
+function splitSubject(subject) {
+  let text = String(subject || "");
+  let isReply = false;
+  let tag = "";
+  for (;;) {
+    const reply = text.match(/^\s*(?:re|aw|fwd?)\s*:\s*/i);
+    if (reply) {
+      isReply = true;
+      text = text.slice(reply[0].length);
+      continue;
+    }
+    const bracket = text.match(/^\s*\[([^\]]*)\]\s*/);
+    if (bracket) {
+      if (!tag) tag = bracket[1].trim();
+      text = text.slice(bracket[0].length);
+      continue;
+    }
+    break;
+  }
+  return { tag, isReply, text: text.replace(/\s+/g, " ").trim() };
+}
 
 export class MailView {
   constructor() {
@@ -33,6 +73,13 @@ export class MailView {
     this.loadedMessageDetails = new Map(); // mid -> message detail object
     this.rawModeMap = new Map(); // mid -> boolean (true if in raw view)
 
+    // Left column mode: "search" (archive query) or "tree" (thread reply tree)
+    this.listMode = "search";
+    this.versionsData = null;
+    this.selectedVersion = 0;
+    this.isLoadingVersions = false;
+    this.treeOpen = new Map(); // normalized mid -> explicit user expand/collapse
+
     this.isLoadingSearch = false;
     this.isLoadingThread = false;
     this.daemonStatus = null;
@@ -44,32 +91,47 @@ export class MailView {
     if (tabData.query !== undefined) this.currentQuery = tabData.query;
     if (tabData.threadId) this.activeThreadId = parseInt(tabData.threadId, 10);
     if (tabData.messageId) this.activeMessageId = String(tabData.messageId).trim();
+    if (tabData.listMode === "tree" || tabData.listMode === "search") this.listMode = tabData.listMode;
+
+    const treeActive = this.listMode === "tree";
 
     containerEl.innerHTML = `
       <div class="mail-view-container">
-        <!-- Left Column: Search & Results List -->
+        <!-- Left Column: Search / Thread Tree -->
         <div class="mail-list-col">
-          <div class="mail-search-bar">
-            <div style="display:flex;gap:6px;align-items:center;">
-              <span style="font-size:14px;">✉</span>
-              <input type="text" id="mail-search-input" class="mail-search-input" placeholder="Search LKML subject, author, s:, f:, m:..." />
-              <button id="mail-search-clear-btn" class="mail-clear-btn" title="Clear search" style="display:none;">&times;</button>
-            </div>
-            <!-- Quick Filter Chips -->
-            <div class="mail-filter-chips">
-              <button class="mail-chip ${this.currentFilter === 'all' ? 'active' : ''}" data-filter="all">All</button>
-              <button class="mail-chip ${this.currentFilter === 'patch' ? 'active' : ''}" data-filter="patch">Patches</button>
-              <button class="mail-chip ${this.currentFilter === 'cover' ? 'active' : ''}" data-filter="cover">Cover Letters</button>
-              <button class="mail-chip ${this.currentFilter === 'pull' ? 'active' : ''}" data-filter="pull">Pull Requests</button>
-            </div>
+          <div class="mail-list-switcher">
+            <button class="mail-list-mode-btn ${treeActive ? '' : 'active'}" data-list-mode="search" title="Search the mailing list archive">🔍 Search</button>
+            <button class="mail-list-mode-btn ${treeActive ? 'active' : ''}" data-list-mode="tree" title="Browse the reply tree of the open thread">🌲 Thread Tree</button>
           </div>
 
           <div id="mail-status-banner" class="mail-status-banner" style="display:none;"></div>
 
-          <div class="mail-results-list" id="mail-results-container">
-            <div style="padding:16px;color:var(--text-muted);text-align:center;">
-              Loading mailing list...
+          <div class="mail-list-pane" id="mail-search-pane" ${treeActive ? 'hidden' : ''}>
+            <div class="mail-search-bar">
+              <div style="display:flex;gap:6px;align-items:center;">
+                <span style="font-size:14px;">✉</span>
+                <input type="text" id="mail-search-input" class="mail-search-input" placeholder="Search LKML subject, author, s:, f:, m:..." />
+                <button id="mail-search-clear-btn" class="mail-clear-btn" title="Clear search" style="display:none;">&times;</button>
+              </div>
+              <!-- Quick Filter Chips -->
+              <div class="mail-filter-chips">
+                <button class="mail-chip ${this.currentFilter === 'all' ? 'active' : ''}" data-filter="all">All</button>
+                <button class="mail-chip ${this.currentFilter === 'patch' ? 'active' : ''}" data-filter="patch">Patches</button>
+                <button class="mail-chip ${this.currentFilter === 'cover' ? 'active' : ''}" data-filter="cover">Cover Letters</button>
+                <button class="mail-chip ${this.currentFilter === 'pull' ? 'active' : ''}" data-filter="pull">Pull Requests</button>
+              </div>
             </div>
+
+            <div class="mail-results-list" id="mail-results-container">
+              <div style="padding:16px;color:var(--text-muted);text-align:center;">
+                Loading mailing list...
+              </div>
+            </div>
+          </div>
+
+          <div class="mail-list-pane" id="mail-tree-pane" ${treeActive ? '' : 'hidden'}>
+            <div class="mail-tree-versions" id="mail-tree-versions"></div>
+            <div class="mail-tree-body" id="mail-tree-container"></div>
           </div>
         </div>
 
@@ -119,14 +181,384 @@ export class MailView {
       };
     });
 
-    // 2. Initial checks & search in parallel
+    // 2. Wire the left column mode switcher
+    containerEl.querySelectorAll(".mail-list-mode-btn").forEach((btn) => {
+      btn.onclick = () => this.setListMode(btn.dataset.listMode);
+    });
+
+    // 3. Initial checks & search in parallel
     this.checkDaemonStatus();
 
-    // 3. If initial thread or message was requested, inspect it immediately
+    // 4. If initial thread or message was requested, inspect it immediately
     if (this.activeThreadId > 0 || this.activeMessageId) {
       this.inspectThread(this.activeThreadId, this.activeMessageId);
+    } else if (treeActive) {
+      this.renderTree();
     }
     this.loadSearch(true);
+  }
+
+  /** Switch the left column between archive search and the thread reply tree. */
+  setListMode(mode) {
+    const next = mode === "tree" ? "tree" : "search";
+    this.listMode = next;
+
+    const searchPane = this.containerEl?.querySelector("#mail-search-pane");
+    const treePane = this.containerEl?.querySelector("#mail-tree-pane");
+    if (searchPane) searchPane.hidden = next !== "search";
+    if (treePane) treePane.hidden = next !== "tree";
+
+    this.containerEl?.querySelectorAll(".mail-list-mode-btn").forEach((b) => {
+      b.classList.toggle("active", b.dataset.listMode === next);
+    });
+
+    const activeTab = state.getActiveTab();
+    if (activeTab && activeTab.type === "mail") {
+      activeTab.listMode = next;
+      state.saveState();
+    }
+
+    if (next === "tree") {
+      this.renderTree();
+      this.loadThreadVersions();
+    }
+  }
+
+  /** Load the revision list (v1, v2, ...) of the series the active thread belongs to. */
+  async loadThreadVersions() {
+    if (this.isLoadingVersions) return;
+    if (!this.activeThreadId && !this.activeMessageId) return;
+    if (this.versionsData && this.versionsData.tid === this.activeThreadId) {
+      this.renderVersionSelector();
+      return;
+    }
+
+    this.isLoadingVersions = true;
+    this.renderVersionSelector();
+    try {
+      const data = await api.getMailThreadVersions(this.activeThreadId, this.activeMessageId);
+      this.versionsData = data;
+      if (data?.available && data.current_version) {
+        this.selectedVersion = data.current_version;
+      }
+    } catch (e) {
+      this.versionsData = { available: false, error: e.message, versions: [] };
+    } finally {
+      this.isLoadingVersions = false;
+      this.renderVersionSelector();
+      this.renderTree();
+    }
+  }
+
+  /** Render the revision picker above the tree. */
+  renderVersionSelector() {
+    const host = this.containerEl?.querySelector("#mail-tree-versions");
+    if (!host) return;
+
+    if (this.isLoadingVersions && !this.versionsData) {
+      host.innerHTML = `<div class="mail-tree-versions-empty">Looking for other revisions of this series...</div>`;
+      return;
+    }
+
+    const versions = this.versionsData?.versions || [];
+    if (!versions.length) {
+      const reason = this.versionsData?.error;
+      host.innerHTML = this.activeThreadId
+        ? `<div class="mail-tree-versions-empty">${reason ? `Revisions unavailable: ${escapeHtml(reason)}` : 'No revision information for this thread.'}</div>`
+        : "";
+      return;
+    }
+
+    const chips = versions
+      .map((v) => {
+        const isActive = v.version === this.selectedVersion;
+        const count = v.patches || v.total || 0;
+        return `
+          <button class="mail-version-chip ${isActive ? 'active' : ''}" data-version="${v.version}"
+                  title="${escapeHtml(v.subject || '')}\n${escapeHtml(v.author || '')}${v.date_iso ? ' · ' + escapeHtml(v.date_iso) : ''}">
+            v${v.version}
+            <span class="mail-version-count">${count}</span>
+          </button>
+        `;
+      })
+      .join("");
+
+    host.innerHTML = `
+      <div class="mail-version-row">
+        <span class="mail-version-label" title="${escapeHtml(this.versionsData?.base_subject || '')}">Revision</span>
+        <div class="mail-version-chips">${chips}</div>
+      </div>
+    `;
+
+    host.querySelectorAll(".mail-version-chip").forEach((chip) => {
+      chip.onclick = () => this.selectVersion(parseInt(chip.dataset.version, 10));
+    });
+  }
+
+  /** Show the tree (and conversation) of one revision of the series. */
+  selectVersion(version) {
+    const entry = (this.versionsData?.versions || []).find((v) => v.version === version);
+    if (!entry) return;
+
+    this.selectedVersion = version;
+    this.renderVersionSelector();
+
+    if (entry.tid && entry.tid !== this.activeThreadId) {
+      // A different revision lives in its own thread: load it.
+      this.treeOpen = new Map();
+      this.inspectThread(entry.tid, entry.cover_message_id || entry.root_message_id || "");
+      return;
+    }
+
+    // Same thread holds several revisions: re-filter the tree in place.
+    this.renderTree();
+    const targetMid = entry.cover_message_id || entry.root_message_id;
+    if (targetMid) this.focusMessageCard(targetMid);
+  }
+
+  /**
+   * Build the reply hierarchy of a thread from each message's References chain.
+   * Patches with no resolvable parent attach to the series cover letter.
+   */
+  buildThreadTree(messages) {
+    const byMid = new Map();
+    const nodes = messages.map((msg) => ({ msg, children: [], parent: null, version: 0 }));
+
+    nodes.forEach((node) => {
+      const ids = [...(node.msg.mids || []), node.msg.message_id].filter(Boolean);
+      for (const id of ids) {
+        const key = normalizeMid(id);
+        if (key && !byMid.has(key)) byMid.set(key, node);
+      }
+    });
+
+    const ordered = [...nodes].sort(
+      (a, b) => (a.msg.timestamp || 0) - (b.msg.timestamp || 0) || (a.msg.num || 0) - (b.msg.num || 0)
+    );
+    const coverNode = ordered.find((n) => n.msg.is_cover) || null;
+
+    const isAncestor = (candidate, node) => {
+      let cur = candidate;
+      while (cur) {
+        if (cur === node) return true;
+        cur = cur.parent;
+      }
+      return false;
+    };
+
+    for (const node of ordered) {
+      const refs = [...(node.msg.references || [])].reverse();
+      let parent = null;
+      for (const ref of refs) {
+        const cand = byMid.get(normalizeMid(ref));
+        if (cand && cand !== node && !isAncestor(cand, node)) {
+          parent = cand;
+          break;
+        }
+      }
+      if (!parent && coverNode && coverNode !== node && node.msg.is_patch && !node.msg.is_cover) {
+        parent = coverNode;
+      }
+      if (parent) {
+        node.parent = parent;
+        parent.children.push(node);
+      }
+    }
+
+    // Each node inherits the revision of its nearest series ancestor, so that a
+    // plain "Re: ..." reply stays with the patch it answers.
+    const assignVersion = (node, inherited) => {
+      const own = node.msg.is_patch || node.msg.is_cover || node.msg.is_pull
+        ? parseInt(node.msg.patch_version, 10) || 1
+        : inherited;
+      node.version = own || inherited || 1;
+      node.children.forEach((child) => assignVersion(child, node.version));
+    };
+
+    const roots = ordered.filter((n) => !n.parent);
+    roots.forEach((root) => assignVersion(root, parseInt(root.msg.patch_version, 10) || 1));
+    return roots;
+  }
+
+  /** Render the reply tree of the active thread into the left column. */
+  renderTree() {
+    const host = this.containerEl?.querySelector("#mail-tree-container");
+    if (!host) return;
+
+    if (this.isLoadingThread && !this.activeThreadData) {
+      host.innerHTML = `<div class="mail-tree-empty">Loading thread...</div>`;
+      return;
+    }
+
+    const messages = this.activeThreadData?.messages || [];
+    if (!messages.length) {
+      host.innerHTML = `
+        <div class="mail-tree-empty">
+          <p>No thread open.</p>
+          <button class="code-btn" id="mail-tree-goto-search">Find a thread in Search</button>
+        </div>
+      `;
+      const gotoBtn = host.querySelector("#mail-tree-goto-search");
+      if (gotoBtn) gotoBtn.onclick = () => this.setListMode("search");
+      return;
+    }
+
+    const roots = this.buildThreadTree(messages);
+
+    // Keep only the revision being viewed when one thread carries several.
+    const allVersions = new Set();
+    const collectVersions = (node) => {
+      allVersions.add(node.version);
+      node.children.forEach(collectVersions);
+    };
+    roots.forEach(collectVersions);
+
+    let visibleRoots = roots;
+    if (allVersions.size > 1 && this.selectedVersion && allVersions.has(this.selectedVersion)) {
+      const prune = (node) => {
+        const children = node.children.map(prune).filter(Boolean);
+        if (node.version !== this.selectedVersion && !children.length) return null;
+        return { ...node, children };
+      };
+      visibleRoots = roots.map(prune).filter(Boolean);
+    }
+
+    host.innerHTML = "";
+    const activeMid = normalizeMid(this.activeMessageId);
+    visibleRoots.forEach((root) => host.appendChild(this.renderTreeNode(root, 0, activeMid)));
+  }
+
+  /** Render one tree row plus, when expanded, its replies. */
+  renderTreeNode(node, depth, activeMid) {
+    const msg = node.msg;
+    const mid = msg.message_id || String(msg.num || "");
+    const key = normalizeMid(mid);
+    const { tag, isReply, text } = splitSubject(msg.subject);
+    const authorShort = (msg.author || "Unknown").split("<")[0].trim();
+    const dateStr = (msg.date_iso || "").split(" ")[0];
+    const replyCount = this.countReplies(node);
+
+    const holdsActive = this.subtreeHasMid(node, activeMid);
+    const explicit = this.treeOpen.get(key);
+    const isOpen = explicit !== undefined ? explicit : (depth === 0 || holdsActive);
+
+    const wrapper = document.createElement("div");
+    wrapper.className = "mail-tree-branch";
+
+    const row = document.createElement("div");
+    row.className = `mail-tree-node ${activeMid && key === activeMid ? 'active' : ''}`;
+    row.dataset.mid = mid;
+    row.title = msg.subject || "";
+
+    let badge = "";
+    if (msg.is_pull) badge = `<span class="mail-badge pull">PULL</span>`;
+    else if (msg.is_cover) badge = `<span class="mail-badge cover">0/${msg.patch_total || 'N'}</span>`;
+    else if (msg.is_patch) badge = `<span class="mail-badge patch">${msg.patch_idx || 1}/${msg.patch_total || 1}</span>`;
+    else if (isReply) badge = `<span class="mail-badge reply">RE</span>`;
+
+    row.innerHTML = `
+      <button class="mail-tree-twisty ${node.children.length ? '' : 'leaf'}"
+              title="${node.children.length ? (isOpen ? 'Collapse replies' : `Show ${replyCount} repl${replyCount === 1 ? 'y' : 'ies'}`) : 'No replies'}">
+        ${node.children.length ? (isOpen ? '▾' : '▸') : '·'}
+      </button>
+      <div class="mail-tree-label">
+        <div class="mail-tree-subject">
+          ${badge}
+          <span class="mail-tree-text">${escapeHtml(text || msg.subject || '(no subject)')}</span>
+        </div>
+        <div class="mail-tree-meta">
+          <span class="mail-tree-author">${escapeHtml(authorShort)}</span>
+          ${dateStr ? `<span class="mail-tree-date">${escapeHtml(dateStr)}</span>` : ''}
+          ${node.children.length ? `<span class="mail-tree-replies" title="${replyCount} message${replyCount === 1 ? '' : 's'} below">↳ ${replyCount}</span>` : ''}
+        </div>
+      </div>
+      ${tag ? `<span class="mail-tree-tag" title="${escapeHtml(tag)}">${escapeHtml(tag.length > 18 ? tag.slice(0, 17) + '…' : tag)}</span>` : ''}
+    `;
+
+    const childrenHost = document.createElement("div");
+    childrenHost.className = "mail-tree-children";
+    childrenHost.hidden = !isOpen;
+
+    const twisty = row.querySelector(".mail-tree-twisty");
+    if (node.children.length) {
+      twisty.onclick = (e) => {
+        e.stopPropagation();
+        const nowOpen = childrenHost.hidden;
+        childrenHost.hidden = !nowOpen;
+        twisty.textContent = nowOpen ? "▾" : "▸";
+        this.treeOpen.set(key, nowOpen);
+      };
+    }
+
+    row.onclick = (e) => {
+      if (e.target.closest(".mail-tree-twisty")) return;
+      this.containerEl?.querySelectorAll(".mail-tree-node").forEach((n) => n.classList.remove("active"));
+      row.classList.add("active");
+      this.selectTreeMessage(mid);
+    };
+
+    row.addEventListener("auxclick", (e) => {
+      if (e.button !== 1) return;
+      e.preventDefault();
+      e.stopPropagation();
+      state.openTab({
+        type: "mail",
+        title: `LKML: ${(msg.subject || "Thread").slice(0, 32)}`,
+        threadId: msg.tid || this.activeThreadId,
+        messageId: mid,
+        forceNew: true,
+      });
+    });
+
+    wrapper.appendChild(row);
+    node.children
+      .slice()
+      .sort((a, b) => (a.msg.timestamp || 0) - (b.msg.timestamp || 0))
+      .forEach((child) => childrenHost.appendChild(this.renderTreeNode(child, depth + 1, activeMid)));
+    wrapper.appendChild(childrenHost);
+    return wrapper;
+  }
+
+  /** Total number of messages below a node. */
+  countReplies(node) {
+    return node.children.reduce((sum, child) => sum + 1 + this.countReplies(child), 0);
+  }
+
+  /** True when a node or any of its replies carries this normalized Message-ID. */
+  subtreeHasMid(node, normalizedMid) {
+    if (!normalizedMid) return false;
+    const ids = [...(node.msg.mids || []), node.msg.message_id, node.msg.num].filter(Boolean);
+    if (ids.some((id) => normalizeMid(id) === normalizedMid)) return true;
+    return node.children.some((child) => this.subtreeHasMid(child, normalizedMid));
+  }
+
+  /** Clicking a tree row focuses that message in the conversation column. */
+  selectTreeMessage(mid) {
+    this.activeMessageId = mid;
+    const activeTab = state.getActiveTab();
+    if (activeTab && activeTab.type === "mail") {
+      activeTab.messageId = mid;
+      state.saveState();
+    }
+    this.focusMessageCard(mid);
+  }
+
+  /** Expand and scroll to one message card in the conversation column. */
+  focusMessageCard(mid) {
+    const container = this.containerEl?.querySelector("#mail-detail-container");
+    if (!container) return;
+    const wanted = normalizeMid(mid);
+    const card = Array.from(container.querySelectorAll(".mail-card")).find(
+      (c) => normalizeMid(c.dataset.mid) === wanted
+    );
+    if (!card) return;
+
+    const bodyEl = card.querySelector(".mail-card-body");
+    if (bodyEl && bodyEl.style.display === "none") {
+      const toggle = card.querySelector(".mail-card-toggle");
+      if (toggle) toggle.click();
+    }
+    card.scrollIntoView({ behavior: "smooth", block: "start" });
   }
 
   async checkDaemonStatus() {
@@ -324,6 +756,12 @@ export class MailView {
       }
 
       this.renderThreadView(detailEl, threadData, targetMid);
+
+      // Keep the left column in step with the thread that was just loaded
+      if (this.listMode === "tree") {
+        this.renderTree();
+        this.loadThreadVersions();
+      }
     } catch (e) {
       detailEl.innerHTML = `
         <div style="padding:32px;color:var(--accent-red);text-align:center;">
@@ -340,35 +778,19 @@ export class MailView {
     const rootSubj = threadData.subject || "Discussion Thread";
     const participants = threadData.participants || [];
 
-    const cleanTargetMid = decodeURIComponent(targetMid || "").replace(/^<|>$/g, "").trim().toLowerCase();
+    const cleanTargetMid = normalizeMid(targetMid);
 
     // Find the intended target message (or default to the first message)
     let targetIdx = -1;
     if (cleanTargetMid) {
       targetIdx = messages.findIndex((m) => {
-        const mMid = decodeURIComponent(m.message_id || "").replace(/^<|>$/g, "").trim().toLowerCase();
+        const mMid = normalizeMid(m.message_id);
         return mMid === cleanTargetMid || String(m.num) === cleanTargetMid;
       });
     }
     if (targetIdx === -1) {
       targetIdx = 0;
     }
-
-    // Build timeline outline items
-    let outlineHtml = "";
-    messages.forEach((m, idx) => {
-      let label = `Msg ${idx + 1}`;
-      if (m.is_cover) label = `[0/${m.patch_total || 'N'}]`;
-      else if (m.is_patch) label = `[${m.patch_idx || idx + 1}/${m.patch_total || '1'}]`;
-      else if (m.is_pull) label = `[PULL]`;
-
-      const isTarget = (idx === targetIdx);
-      outlineHtml += `
-        <button class="mail-outline-btn ${isTarget ? 'active' : ''}" data-mid="${escapeHtml(m.message_id || m.num)}" title="${escapeHtml(m.subject)}">
-          ${escapeHtml(label)}
-        </button>
-      `;
-    });
 
     container.innerHTML = `
       <div class="mail-thread-wrapper">
@@ -379,37 +801,15 @@ export class MailView {
             <span><strong>${messages.length}</strong> message${messages.length === 1 ? '' : 's'}</span>
             <span>·</span>
             <span><strong>${participants.length}</strong> contributor${participants.length === 1 ? '' : 's'}</span>
-            ${threadData.lore_url ? `<span>·</span><a href="${threadData.lore_url}" target="_blank" class="lore-link">Lore.kernel.org ↗</a>` : ''}
+            <span>·</span>
+            <a href="${threadData.lore_url || (LORE_BASE_URL + 't/' + (threadData.tid || 0))}" target="_blank" class="lore-link">lore.kernelinfo.org ↗</a>
           </div>
-          <!-- Mini Timeline Outline -->
-          ${messages.length > 1 ? `<div class="mail-thread-outline">${outlineHtml}</div>` : ''}
         </div>
 
         <!-- Messages Conversation Cards -->
         <div class="mail-messages-container" id="mail-cards-list"></div>
       </div>
     `;
-
-    // Wire outline jump clicks
-    container.querySelectorAll(".mail-outline-btn").forEach((btn) => {
-      btn.onclick = () => {
-        container.querySelectorAll(".mail-outline-btn").forEach((b) => b.classList.remove("active"));
-        btn.classList.add("active");
-        const targetId = btn.dataset.mid;
-        const targetCard = Array.from(container.querySelectorAll(".mail-card")).find(
-          (c) => c.dataset.mid === targetId
-        );
-        if (targetCard) {
-          // Auto-expand card if collapsed
-          const bodyEl = targetCard.querySelector(".mail-card-body");
-          if (bodyEl && bodyEl.style.display === "none") {
-            const toggle = targetCard.querySelector(".mail-card-toggle");
-            if (toggle) toggle.click();
-          }
-          targetCard.scrollIntoView({ behavior: "smooth", block: "start" });
-        }
-      };
-    });
 
     const cardsContainer = container.querySelector("#mail-cards-list");
     let targetCardEl = null;
@@ -476,7 +876,7 @@ export class MailView {
             </div>
             <button class="code-btn mail-action-btn" data-act="copy" title="Copy RFC-822 payload to clipboard">📋 Copy</button>
             <button class="code-btn mail-action-btn" data-act="download" title="Download message as .eml / .patch">⬇ Download</button>
-            <a href="https://lore.kernel.org/all/${encodeURIComponent(msgSummary.message_id)}/" target="_blank" class="lore-link" title="Open on lore.kernel.org">Lore ↗</a>
+            <a href="${LORE_BASE_URL}${encodeURIComponent(msgSummary.message_id)}/" target="_blank" class="lore-link" title="Open on lore.kernelinfo.org">Lore ↗</a>
           </div>
         </div>
       </div>
@@ -610,7 +1010,7 @@ export class MailView {
             ${escapeHtml(detail?.error || "The message content could not be located in the local public-inbox mirror.")}
           </div>
           <div style="display:flex;gap:10px;align-items:center;">
-            ${detail?.lore_url ? `<a href="${detail.lore_url}" target="_blank" class="lore-link" style="font-size:12px;">View on Lore.kernel.org ↗</a>` : ""}
+            ${detail?.lore_url ? `<a href="${detail.lore_url}" target="_blank" class="lore-link" style="font-size:12px;">View on lore.kernelinfo.org ↗</a>` : ""}
             <button class="code-btn mail-retry-msg-btn" style="font-size:11px;padding:3px 10px;">Retry</button>
           </div>
         </div>

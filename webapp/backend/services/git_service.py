@@ -17,6 +17,7 @@ from webapp.backend.database.helpers import (
 from webapp.backend.security.git import is_safe_rev, safe_rev
 from webapp.backend.security.sql import sanitize_like_query
 from webapp.backend.security.jail import resolve_and_verify_repo_path
+from webapp.backend.services.mailing_list_service import LORE_BASE_URL
 
 logger = logging.getLogger(__name__)
 
@@ -592,14 +593,14 @@ class GitService:
                         "patch_version": erow["patch_version"],
                         "patch_idx": erow["patch_idx"],
                         "patch_total": erow["patch_total"],
-                        "lore_url": f"https://lore.kernel.org/all/{mid}/",
+                        "lore_url": f"{LORE_BASE_URL}{mid}/",
                     })
             except Exception as exc:
                 logger.debug("Failed to query m_commit_email for commit %d: %s", cid, exc)
 
-            # LKML thread URL (forward-compatible lore.kernel.org link)
+            # LKML thread URL on the self-hosted public-inbox mirror
             subj = safe_decode(c_row["subject"])
-            lore_url = linked_emails[0]["lore_url"] if linked_emails else f"https://lore.kernel.org/all/?q={subj}"
+            lore_url = linked_emails[0]["lore_url"] if linked_emails else f"{LORE_BASE_URL}?q={subj}"
 
             return {
                 "commit_id": cid,
@@ -691,7 +692,7 @@ class GitService:
                     "patch_version": int(ctx.patch_version),
                     "patch_idx": int(ctx.patch_idx),
                     "patch_total": int(ctx.patch_total),
-                    "lore_url": f"https://lore.kernel.org/all/{mid}/",
+                    "lore_url": f"{LORE_BASE_URL}{mid}/",
                 })
             if ctx.cover_letter and ctx.cover_letter.mids:
                 c_mid = ctx.cover_letter.mids[0].strip("<> ")
@@ -705,7 +706,7 @@ class GitService:
                     "patch_version": int(ctx.patch_version),
                     "patch_idx": 0,
                     "patch_total": int(ctx.patch_total),
-                    "lore_url": f"https://lore.kernel.org/all/{c_mid}/",
+                    "lore_url": f"{LORE_BASE_URL}{c_mid}/",
                 })
             if ctx.pull_request and ctx.pull_request.mids:
                 pr_mid = ctx.pull_request.mids[0].strip("<> ")
@@ -719,7 +720,7 @@ class GitService:
                     "patch_version": 1,
                     "patch_idx": 0,
                     "patch_total": 0,
-                    "lore_url": f"https://lore.kernel.org/all/{pr_mid}/",
+                    "lore_url": f"{LORE_BASE_URL}{pr_mid}/",
                 })
             return {"resolved": bool(linked), "linked_emails": linked, "cached": False}
         except Exception as exc:

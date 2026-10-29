@@ -39,6 +39,18 @@ def get_mail_thread(
     return mailing_list_service.get_thread(clean_tid, mid_hint=clean_mid)
 
 
+@router.get("/versions/{tid}")
+@router.get("/versions")
+def get_mail_thread_versions(
+    tid: int = 0,
+    mid: str = Query("", description="Optional Message-ID identifying the thread"),
+) -> dict[str, Any]:
+    """List every revision (v1, v2, ...) of the patch series a thread belongs to."""
+    clean_tid = tid if isinstance(tid, int) else 0
+    clean_mid = mid if isinstance(mid, str) else ""
+    return mailing_list_service.get_thread_versions(clean_tid, mid_hint=clean_mid)
+
+
 @router.get("/search")
 def search_mailing_list(
     q: str = Query("", description="Search keywords, boolean prefixes (s:, f:, m:), or terms"),
