@@ -162,8 +162,8 @@ class FakeCursor:
 
     def execute(self, sql: str, params=()) -> None:
         self.log.append((sql, tuple(params or ())))
-        self._last = next((v for k, v in self.results.items() if sql.startswith(k)), None)
-        self.rowcount = 0
+        self._last = next((v for k, v in self.results.items() if sql.startswith(k) or sql.strip().startswith(k)), None)
+        self.rowcount = len(self._last) if self._last and isinstance(self._last, list) else 1
 
     def executemany(self, sql: str, rows) -> None:
         self.log.extend((sql, tuple(r)) for r in rows)
@@ -217,6 +217,45 @@ class TestIngestStateDatabase(unittest.TestCase):
         with self.assertRaises(I.RecoveryError):
             I.rollback_version(cnx, 1, 10, TABLES)
 
+    def test_fetch_repo_version_states_classifies_correctly(self) -> None:
+        fake_rows = [
+            ("v1.0", 101, I.INGEST_DONE),
+            ("v1.1", 102, I.INGEST_PARSING),
+            ("v1.2", 103, None),
+        ]
+        cnx = FakeCnx({
+            "SELECT r.ref_name": fake_rows,
+            "SELECT COUNT(*) FROM m_bridge_checkpoint": [(50,)],
+        })
+        states = I.fetch_repo_version_states(cnx, repo_id=1, network_id=1)
+        self.assertEqual(states["v1.0"], (101, "done"))
+        self.assertEqual(states["v1.1"], (102, "interrupted"))
+        self.assertEqual(states["v1.2"], (103, "done"))
+
+    def test_purge_version_differential_rows_cleans_version_records(self) -> None:
+        cnx = FakeCnx({
+            "SELECT DISTINCT bt.tag_id": [(10,), (20,)],
+        })
+        deleted = I.purge_version_differential_rows(cnx, commit_id=50, pred_commit_id=40)
+        self.assertGreater(deleted, 0)
+        sqls = [sql.strip() for sql, _ in cnx.log]
+        self.assertTrue(any("DELETE FROM m_bridge_checkpoint" in s for s in sqls))
+        self.assertTrue(any("DELETE FROM m_commit_file" in s for s in sqls))
+        self.assertTrue(any("DELETE FROM m_moved_tag" in s for s in sqls))
+        self.assertTrue(any("UPDATE m_ingest_state SET status" in s for s in sqls))
+        self.assertGreater(cnx.commits, 0)
+
+    def test_cleanup_ramdisk_artifacts(self) -> None:
+        import tempfile
+        import os
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            test_target = tempfile.mkdtemp(prefix="code-parser.test-", dir=tmp_dir)
+            self.assertTrue(os.path.isdir(test_target))
+            removed = I.cleanup_ramdisk_artifacts(ramdisk_dir=tmp_dir, search_system_temps=False)
+            self.assertEqual(removed, 1)
+            self.assertFalse(os.path.isdir(test_target))
+
 
 if __name__ == "__main__":
     unittest.main()
+

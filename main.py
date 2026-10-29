@@ -2331,6 +2331,110 @@ def _apply_db_server_tuning(db: Any, mem_max_gb: float) -> None:
         ))
 
 
+def orchestrate_repair_pipeline(
+    canonical_tags: list[str],
+    version_states: dict[str, tuple[int, str]],
+    network_id: int,
+    repo_id: int,
+    repo_path: str,
+    backfill_target: str | None = None,
+    dry_run: bool = False,
+) -> bool:
+    """Detect missing/interrupted versions and re-align downstream differential links.
+
+    Returns True if repair operations were performed (or planned in dry_run).
+    """
+    gaps: list[tuple[str | None, list[str], str | None]] = []
+
+    if backfill_target:
+        target_clean = backfill_target.strip()
+        matched_idx = None
+        for candidate in (target_clean, f"v{target_clean}", target_clean.lstrip("v")):
+            if candidate in canonical_tags:
+                matched_idx = canonical_tags.index(candidate)
+                break
+        if matched_idx is None:
+            logger.error(COLOR.red(f"[Repair Pipeline] Target version '{backfill_target}' not found in repository tag sequence."))
+            return False
+        v_gap = canonical_tags[matched_idx]
+        v_pred = canonical_tags[matched_idx - 1] if matched_idx > 0 else None
+        v_succ = next((t for t in canonical_tags[matched_idx + 1:] if version_states.get(t, (0, "new"))[1] == "done"), None)
+        gaps.append((v_pred, [v_gap], v_succ))
+    else:
+        # General repair: scan canonical_tags for missing versions that have an ingested successor
+        i = 0
+        n = len(canonical_tags)
+        while i < n:
+            st = version_states.get(canonical_tags[i], (0, "new"))[1]
+            if st != "done":
+                gap_start = i
+                while i < n and version_states.get(canonical_tags[i], (0, "new"))[1] != "done":
+                    i += 1
+                missing_list = canonical_tags[gap_start:i]
+                v_succ = canonical_tags[i] if i < n and version_states.get(canonical_tags[i], (0, "new"))[1] == "done" else None
+                if v_succ:
+                    v_pred = canonical_tags[gap_start - 1] if gap_start > 0 else None
+                    gaps.append((v_pred, missing_list, v_succ))
+            else:
+                i += 1
+
+    if not gaps:
+        logger.info(COLOR.green("[Repair Pipeline] No missing versions or misaligned successors detected. Database history is contiguous."))
+        return False
+
+    if dry_run:
+        for pred, missing_list, succ in gaps:
+            logger.info(COLOR.cyan(
+                f"[Repair Pipeline - Dry Run] Gap detected: missing {missing_list} between predecessor '{pred}' and successor '{succ}'."
+            ))
+            logger.info(f"  -> Action 1: Ingest {missing_list} in sequence using baseline '{pred}'.")
+            if succ:
+                logger.info(f"  -> Action 2: Purge version differential rows of successor '{succ}' and re-ingest with base '{missing_list[-1]}'.")
+        return True
+
+    for pred, missing_list, succ in gaps:
+        current_base = pred
+        for m_ver in missing_list:
+            logger.info(COLOR.cyan(f"[Repair Pipeline] Backfilling missing version '{m_ver}' (prior base: '{current_base}')..."))
+            if current_base and current_base in version_states:
+                gp.Old_VID = version_states[current_base][0]
+                gp.Old_Version_Name = current_base
+            else:
+                gp.Old_VID = 0
+                gp.Old_Version_Name = None
+            cid_m, st_m = version_states.get(m_ver, (0, "new"))
+            if st_m == "interrupted" and cid_m > 0:
+                with G.DB() as db:
+                    if getattr(db, "cnx", None):
+                        if not ingest_state.rollback_version(db.cnx, network_id, cid_m, TABLES):
+                            _purge_partial_version(db, cid_m)
+                _forget_rolled_back_rows()
+            update(m_ver, repo_path=repo_path)
+            with G.DB() as db:
+                v_row = db.select(m_git_ref, (None, repo_id, None, m_ver, None, None, None, None))
+                if v_row and v_row[4]:
+                    version_states[m_ver] = (v_row[4], "done")
+            current_base = m_ver
+
+        if succ and succ in version_states:
+            succ_cid = version_states[succ][0]
+            logger.info(COLOR.yellow(
+                f"[Repair Pipeline] Re-aligning downstream successor '{succ}' (commit_id {succ_cid}) with new base '{current_base}'..."
+            ))
+            with G.DB() as db:
+                if getattr(db, "cnx", None):
+                    pred_cid = version_states.get(current_base, (0,))[0] if current_base else None
+                    ingest_state.purge_version_differential_rows(db.cnx, succ_cid, pred_commit_id=pred_cid)
+            _forget_rolled_back_rows()
+            if current_base and current_base in version_states:
+                gp.Old_VID = version_states[current_base][0]
+                gp.Old_Version_Name = current_base
+            update(succ, repo_path=repo_path)
+            logger.info(COLOR.green(f"[Repair Pipeline] Successfully re-aligned downstream successor '{succ}' with base '{current_base}'."))
+
+    return True
+
+
 def main() -> None:
     """Set the plan for what version to parse."""
     args = arg_handling()
@@ -2375,6 +2479,9 @@ def main() -> None:
     MF.set_repo_dir(repo_path)
     logger.info(f"[Repository] Using '{(repo_entry or {}).get('name', repo_path)}' at {repo_path}")
 
+    if getattr(args, "clean_temp", False):
+        ingest_state.cleanup_ramdisk_artifacts(getattr(G, "RAMDISK", None))
+
     if getattr(args, "resolve_ml", False):
         commit_range = getattr(args, "ml_range", None) or (args.ref[0] if getattr(args, "ref", None) else "HEAD~100..HEAD")
         standalone_resolve_mailing_list(repo_path, commit_range, getattr(args, "ml_storage_dir", None))
@@ -2410,6 +2517,82 @@ def main() -> None:
             target_refs = raw_refs
     else:
         target_refs = raw_refs
+
+    network_id, repo_id = resolve_git_network_and_repo(repo_path)
+    with G.DB() as db:
+        version_states = ingest_state.fetch_repo_version_states(getattr(db, "cnx", None), repo_id, network_id)
+
+    repair_mode = bool(getattr(args, "repair", False))
+    backfill_target = getattr(args, "backfill", None)
+    dry_run = bool(getattr(args, "dry_run", False))
+
+    if repair_mode or backfill_target:
+        canonical_tags = MF.get_version_tags(start_ref=target_refs[0] if target_refs else None, include_pre_releases=True)
+        orchestrate_repair_pipeline(
+            canonical_tags,
+            version_states,
+            network_id,
+            repo_id,
+            repo_path,
+            backfill_target=backfill_target,
+            dry_run=dry_run,
+        )
+        if backfill_target or dry_run:
+            G.emergency_shutdown(0)
+            return
+        with G.DB() as db:
+            version_states = ingest_state.fetch_repo_version_states(getattr(db, "cnx", None), repo_id, network_id)
+
+    # Fast-Forward Contiguous Prefix Scan
+    resume_idx = 0
+    for idx, ref in enumerate(target_refs):
+        st = version_states.get(ref, (0, "new"))[1]
+        if st == "done":
+            resume_idx = idx + 1
+        else:
+            break
+
+    if resume_idx == len(target_refs):
+        logger.info(COLOR.green(f"[Release Pipeline] All {len(target_refs)} version(s) already completed in DB. Nothing to parse."))
+        G.emergency_shutdown(0)
+        return
+
+    if resume_idx > 0:
+        last_ref = target_refs[resume_idx - 1]
+        last_cid = version_states[last_ref][0]
+        gp.Old_VID = last_cid
+        gp.Old_Version_Name = last_ref
+        logger.info(COLOR.cyan(
+            f"[Release Pipeline] Found {resume_idx} completed version(s) ({target_refs[0]} ... {last_ref}). "
+            f"Resuming from version {resume_idx + 1}/{len(target_refs)} ('{target_refs[resume_idx]}') "
+            f"using prior base '{last_ref}' (commit_id {last_cid})."
+        ))
+
+        resume_ref = target_refs[resume_idx]
+        r_cid, r_st = version_states.get(resume_ref, (0, "new"))
+        if r_st == "interrupted" and r_cid > 0:
+            with G.DB() as db:
+                if getattr(db, "cnx", None):
+                    if not ingest_state.rollback_version(db.cnx, network_id, r_cid, TABLES):
+                        _purge_partial_version(db, r_cid)
+            _forget_rolled_back_rows()
+            logger.warning(COLOR.yellow(
+                f"[Release Pipeline] Detected interrupted version '{resume_ref}' (commit_id {r_cid}). Rolled back partial database rows."
+            ))
+        elif r_st == "legacy_partial" and r_cid > 0:
+            with G.DB() as db:
+                _purge_partial_version(db, r_cid)
+            _forget_rolled_back_rows()
+            logger.warning(COLOR.yellow(
+                f"[Release Pipeline] Detected incomplete legacy version '{resume_ref}' (commit_id {r_cid}). Purged partial records."
+            ))
+
+        target_refs = target_refs[resume_idx:]
+
+    if dry_run:
+        logger.info(COLOR.cyan(f"[Release Pipeline - Dry Run] Would resume parsing at '{target_refs[0]}'. Halting without making changes."))
+        G.emergency_shutdown(0)
+        return
 
     # Interactive terminals: pressing 'q' finishes the version being parsed, then quits
     current = {"ref": None}
@@ -2547,6 +2730,30 @@ def arg_handling() -> argparse.Namespace:
         dest="duration",
         default=None,
         help="Maximum execution duration before graceful halt and profiling report (e.g., '30m', '1800s', '1h')",
+    )
+    parser.add_argument(
+        "--clean-temp",
+        dest="clean_temp",
+        action="store_true",
+        help="Purge orphaned /dev/shm/code-parser.* scratch directories left by prior crashed processes",
+    )
+    parser.add_argument(
+        "--repair",
+        dest="repair",
+        action="store_true",
+        help="Scan version sequence, backfill missing/interrupted versions in topological order, and re-align downstream differential links",
+    )
+    parser.add_argument(
+        "--backfill",
+        dest="backfill",
+        default=None,
+        help="Target a specific version for backfill, followed by re-aligning its immediate downstream successor",
+    )
+    parser.add_argument(
+        "--dry-run",
+        dest="dry_run",
+        action="store_true",
+        help="Preview version discovery, gap detection, and planned repair actions without modifying the database",
     )
     parser.add_argument(
         "-f", "--fidelity",

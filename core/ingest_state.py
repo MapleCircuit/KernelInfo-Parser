@@ -19,7 +19,11 @@ version is parsed again from scratch.
 from __future__ import annotations
 
 import contextlib
+import glob
 import logging
+import os
+import shutil
+import tempfile
 import time
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
@@ -284,3 +288,152 @@ def rollback_version(cnx: Any, network_id: int, commit_id: int, tables: Sequence
         f"({len(blob_ids)} pre-existing blobs re-queued) in {time.perf_counter() - started:.1f}s."
     )
     return True
+
+
+def cleanup_ramdisk_artifacts(ramdisk_dir: str | None = None, search_system_temps: bool = True) -> int:
+    """Purge orphaned scratch directories left in RAMDISK or temp directories from previous crashed parser runs.
+
+    Searches for directories matching 'code-parser.*', 'kip-commits-*', 'kip-*'.
+    Returns number of directories removed.
+    """
+    removed = 0
+    search_dirs: list[str] = []
+    if ramdisk_dir and os.path.isdir(ramdisk_dir):
+        search_dirs.append(ramdisk_dir)
+    if search_system_temps:
+        default_ramdisk = "/dev/shm"  # noqa: S108
+        if os.path.isdir(default_ramdisk) and default_ramdisk not in search_dirs:
+            search_dirs.append(default_ramdisk)
+        tmp = tempfile.gettempdir()
+        if tmp and os.path.isdir(tmp) and tmp not in search_dirs:
+            search_dirs.append(tmp)
+
+    for base in search_dirs:
+        for pattern in ("code-parser.*", "kip-commits-*", "kip-*"):
+            for path in glob.glob(os.path.join(base, pattern)):
+                if os.path.isdir(path) and not os.path.islink(path):
+                    try:
+                        shutil.rmtree(path, ignore_errors=True)
+                        removed += 1
+                        logger.debug(f"Removed stale scratch directory: {path}")
+                    except Exception as e:
+                        logger.warning(f"Could not remove scratch directory {path}: {e}")
+
+    logger.info(f"[Cleanup] Removed {removed} orphaned scratch directory/directories from RAMDISK/temp storage.")
+    return removed
+
+
+def fetch_repo_version_states(cnx: Any, repo_id: int, network_id: int) -> dict[str, tuple[int, str]]:
+    """Return map of ref_name -> (commit_id, state) for all registered refs of the repository.
+
+    States:
+        "done": fully ingested version (INGEST_DONE or legacy checkpoint with rows)
+        "interrupted": crashed or halted run with INGEST_PARSING
+        "new": registered ref that has not been ingested yet
+    """
+    states: dict[str, tuple[int, str]] = {}
+    if cnx is None:
+        return states
+    legacy_candidates: list[tuple[str, int]] = []
+    with contextlib.closing(cnx.cursor()) as cur:
+        cur.execute(
+            """
+            SELECT r.ref_name, r.commit_id, s.status
+            FROM m_git_ref r
+            LEFT JOIN m_ingest_state s ON s.commit_id = r.commit_id AND s.network_id = %s
+            WHERE r.repo_id = %s AND r.commit_id > 0
+            """,
+            (network_id, repo_id),
+        )
+        for row in cur.fetchall():
+            ref_name = row[0]
+            if isinstance(ref_name, (bytes, bytearray)):
+                ref_name = ref_name.decode("utf-8", errors="replace")
+            commit_id = int(row[1])
+            status = row[2]
+            if status == INGEST_DONE:
+                states[ref_name] = (commit_id, "done")
+            elif status == INGEST_PARSING:
+                states[ref_name] = (commit_id, "interrupted")
+            else:
+                legacy_candidates.append((ref_name, commit_id))
+
+        if legacy_candidates:
+            for rname, cid in legacy_candidates:
+                cur.execute("SELECT COUNT(*) FROM m_bridge_checkpoint WHERE commit_id = %s", (cid,))
+                row_chk = cur.fetchone()
+                cnt = int(row_chk[0]) if row_chk and row_chk[0] else 0
+                if cnt > 0:
+                    states[rname] = (cid, "done")
+                else:
+                    states[rname] = (cid, "new")
+    return states
+
+
+def purge_version_differential_rows(cnx: Any, commit_id: int, pred_commit_id: int | None = None) -> int:
+    """Purge version-scoped differential rows of a version to prepare clean re-alignment with a new Old_VID base.
+
+    Cleans:
+      - Inbound m_moved_tag transitions targeting tags in commit_id's tree
+      - m_bridge_checkpoint for commit_id
+      - m_commit_file, m_bridge_commit_tag, m_bridge_commit_person, m_commit_email for commit_id
+      - m_arch_root for commit_id
+      - Resets m_ingest_state to INGEST_PARSING
+
+    Leaves universal content-addressable tables (m_file_blob, m_ast, m_tag, m_tag_code) intact.
+    Returns total count of deleted rows.
+    """
+    total = 0
+    if cnx is None:
+        return 0
+    with contextlib.closing(cnx.cursor()) as cur:
+        # 1. Fetch tags placed in commit_id's checkpoint to delete inbound m_moved_tag
+        try:
+            cur.execute(
+                """
+                SELECT DISTINCT bt.tag_id
+                FROM m_bridge_tag bt
+                JOIN m_bridge_checkpoint bcp ON bcp.blob_id = bt.blob_id
+                WHERE bcp.commit_id = %s
+                """,
+                (commit_id,),
+            )
+            target_tag_ids = [int(r[0]) for r in cur.fetchall()]
+            for i in range(0, len(target_tag_ids), _IN_CHUNK):
+                chunk = tuple(target_tag_ids[i:i + _IN_CHUNK])
+                in_fmt = ",".join(["%s"] * len(chunk))
+                cur.execute(f"DELETE FROM m_moved_tag WHERE e_tag_id IN ({in_fmt})", chunk)
+                total += cur.rowcount or 0
+        except Exception as e:
+            logger.debug(f"Inbound m_moved_tag purge error for commit_id {commit_id}: {e}")
+
+        # 2. Delete version-scoped records
+        for table in (
+            "m_bridge_checkpoint",
+            "m_commit_file",
+            "m_bridge_commit_tag",
+            "m_bridge_commit_person",
+            "m_commit_email",
+            "m_arch_root",
+        ):
+            try:
+                cur.execute(f"DELETE FROM {table} WHERE commit_id = %s", (commit_id,))
+                total += cur.rowcount or 0
+            except Exception as e:
+                logger.debug(f"Version row delete error for {table} (commit_id {commit_id}): {e}")
+
+        # 3. Reset ingestion state to INGEST_PARSING
+        try:
+            cur.execute(
+                "UPDATE m_ingest_state SET status = %s, updated_at = %s WHERE commit_id = %s",
+                (INGEST_PARSING, int(time.time()), commit_id),
+            )
+        except Exception as e:
+            logger.debug(f"m_ingest_state status reset error for commit_id {commit_id}: {e}")
+
+    cnx.commit()
+    logger.info(
+        f"Purged {total} version-scoped differential rows for commit_id {commit_id} to prepare clean re-alignment."
+    )
+    return total
+
