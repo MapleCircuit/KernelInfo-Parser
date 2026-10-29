@@ -5,6 +5,7 @@
  */
 import { api } from "../api.js";
 import { state } from "../state.js";
+import { sessionManager } from "../session_manager.js";
 import { toast } from "./toast.js";
 import { copyToClipboard } from "../utils/clipboard.js";
 import { showPersonModal } from "./person_modal.js";
@@ -736,6 +737,117 @@ class ContextMenu {
       header: {
         title: isDir ? `📁 ${item.name}` : `📄 ${item.name}`,
         sub: path
+      },
+      items
+    });
+  }
+
+  /**
+   * Right-click menu of a commit hash (`.copy-hash`, §5.12). Left-clicking a hash copies it; this
+   * menu adds the explicit copy, opening the commit, and making it the header's work commit.
+   *
+   * @param {Object} ctx `{ hash, version, onView }` - `onView` lets a view that already shows
+   *   commits inspect the hash in place instead of opening a tab for it.
+   */
+  showCommitHashMenu(x, y, { hash, version, onView } = {}) {
+    const full = String(hash || "");
+    if (!full) return;
+    const short = full.slice(0, 12);
+    const v = version || state.activeVersion();
+    const isWorkCommit = state.selectedVersion === full;
+
+    this.renderMenu(x, y, {
+      header: { title: "Commit", sub: short },
+      items: [
+        {
+          label: "Copy Hash",
+          icon: "📋",
+          shortcut: "click",
+          onClick: async () => {
+            if (await copyToClipboard(full)) toast.success(`Copied ${short}… to clipboard`);
+            else toast.error("Failed to copy the commit hash");
+          }
+        },
+        { separator: true },
+        {
+          label: "View Commit",
+          icon: "🔍",
+          onClick: () => {
+            if (onView && onView(full)) return;
+            state.openTab({
+              type: "commits",
+              title: `Commit ${full.slice(0, 7)}`,
+              commitId: full,
+              version: v,
+              forceNew: true
+            });
+          }
+        },
+        {
+          // Only the header selection moves: no tab changes revision until Apply / New Tab (§5.13)
+          label: isWorkCommit ? "Already the Work Commit" : "Set as Work Commit",
+          icon: "🎯",
+          shortcut: isWorkCommit ? "" : "header",
+          disabled: isWorkCommit,
+          onClick: () => {
+            if (state.setSelectedVersion(full)) {
+              toast.success(`Work commit set to ${full.slice(0, 8)} - press Apply or New Tab to open it`);
+            }
+          }
+        }
+      ]
+    });
+  }
+
+  /**
+   * Right-click menu of a tab in the tabstrip (§5.24.5). The actions themselves are handed in by
+   * `TabsComponent`, which owns tab transfers; this only lays out the menu and the session list.
+   */
+  showTabMenu(x, y, { tab, onOpenInNewWindow, onPushToSession }) {
+    const sessions = sessionManager
+      .getSessionsIndex()
+      .filter((s) => s.id !== sessionManager.activeSessionId);
+
+    const items = [
+      {
+        label: "Open on New Browser Tab",
+        icon: "🗗",
+        shortcut: "moves it",
+        onClick: () => onOpenInNewWindow && onOpenInNewWindow()
+      },
+      { separator: true },
+      {
+        label: sessions.length > 0 ? "Push to Another Session…" : "No Other Session to Push To",
+        icon: "↪",
+        disabled: sessions.length === 0,
+        onClick: () => this.showTabPushMenu(x, y, { tab, sessions, onPushToSession })
+      }
+    ];
+
+    this.renderMenu(x, y, {
+      header: { title: tab.title || "Tab", sub: tab.path || tab.type || "" },
+      items
+    });
+  }
+
+  /** Second step of the tab menu: which session the tab is pushed to (§5.24.5). */
+  showTabPushMenu(x, y, { tab, sessions, onPushToSession }) {
+    const items = sessions.map((s) => {
+      const live = sessionManager.isSessionActiveInOtherWindow(s.id);
+      return {
+        // A session open in another window takes the tab live; one no window holds gets it written
+        // into its stored record, and shows it the next time it is opened.
+        label: s.name || s.id,
+        icon: live ? "🟢" : "💤",
+        shortcut: live ? "open" : "saved",
+        onClick: () => onPushToSession && onPushToSession(s)
+      };
+    });
+
+    this.renderMenu(x, y, {
+      header: {
+        title: `Push '${tab.title || "tab"}' to…`,
+        sub: "The tab leaves this session"
       },
       items
     });

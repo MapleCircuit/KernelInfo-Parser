@@ -15,6 +15,8 @@ import { showPatchModal } from "./components/patch_modal.js";
 import { showSymbolHistoryModal } from "./components/symbol_history_modal.js";
 import { localDB } from "./db.js";
 import { escapeHtml } from "./components/modal.js";
+import { sessionManager } from "./session_manager.js";
+import { showSessionPickerModal } from "./components/session_modal.js";
 
 // View Renderers
 import { VirtualEditor } from "./views/code_view/virtual_editor.js";
@@ -28,6 +30,9 @@ import { DiffView } from "./views/diff/diff_view.js";
 import { TreemapView } from "./views/treemap/treemap_view.js";
 import { ExplorerView } from "./views/explorer/explorer_view.js";
 import { MailView } from "./views/mail/mail_view.js";
+
+/** Per-browser UI preference: whether the left explorer sidebar is collapsed. */
+const SIDEBAR_COLLAPSED_KEY = "kernel_ide_sidebar_collapsed";
 
 export class KernelIdeApp {
   constructor() {
@@ -76,12 +81,23 @@ export class KernelIdeApp {
     this.tabsComponent = new TabsComponent(workspaceEl, this.viewRenderers);
     this.tabsComponent.render();
 
+    // 4a. Initialize Multi-Window Workspace Sessions
+    this.setupSessionControls();
+    if (!state.currentSessionId) {
+      // The hash is the address this window was opened to show, but adopting a session replaces
+      // the panes with that session's tabs. So the address is held and applied once a session is
+      // chosen, and the tab a link asked for opens inside it (§5.26).
+      urlSync.defer();
+      showSessionPickerModal({ allowClose: false, onSelect: () => { if (urlSync.deferred) urlSync.init(); } });
+    }
+
     // 5. Setup Activity Bar & Sidebar
     this.setupActivityBar();
+    this.setupSidebarCollapse();
     await this.loadSidebarFileTree();
 
-    // 6. Initialize URL Synchronization
-    urlSync.init();
+    // 6. Initialize URL Synchronization (held above while the startup session picker is open)
+    if (!urlSync.deferred) urlSync.init();
 
     // 7. Command palette (Ctrl+K / Ctrl+P search, Ctrl+Shift+P commands)
     commandPalette.setCommandProvider(() => this.paletteCommands());
@@ -140,24 +156,190 @@ export class KernelIdeApp {
     badge.style.cursor = "pointer";
     badge.title = "Click to open Network & Local Storage Settings";
 
+    // Three states: the link is down, the link is up but the backend does not answer (api.serverUp,
+    // fed by every request and by the heartbeat), or both are fine.
+    let shown = null;
     const updateBadge = () => {
-      if (navigator.onLine) {
+      const status = !navigator.onLine ? "offline" : api.serverUp ? "online" : "unreachable";
+      if (status === shown) return;
+      const first = shown === null;
+      shown = status;
+      if (status === "online") {
         badge.textContent = "● Online";
         badge.className = "offline-badge";
+        if (!first) toast.success("Server reachable again");
+      } else if (status === "unreachable") {
+        badge.textContent = "● Server Unreachable";
+        badge.className = "offline-badge unreachable";
+        toast.warning("Server not responding: viewing cached repository data");
       } else {
         badge.textContent = "● Offline (Cached)";
         badge.className = "offline-badge offline";
         toast.info("Offline mode active: viewing cached repository data");
       }
+      // Keep an open settings popover in step with the state it reports
+      if (document.getElementById("settings-popover-menu")) {
+        this.toggleSettingsPopover(badge);
+        this.toggleSettingsPopover(badge);
+      }
     };
 
     window.addEventListener("online", updateBadge);
     window.addEventListener("offline", updateBadge);
+    document.addEventListener("app:server-status", updateBadge);
     updateBadge();
+    api.startHeartbeat();
 
     badge.addEventListener("click", (e) => {
       e.stopPropagation();
       this.toggleSettingsPopover(badge);
+    });
+  }
+
+  setupSessionControls() {
+    const btn = document.getElementById("session-picker-btn");
+    const container = document.getElementById("session-selector-container");
+    const labelEl = document.getElementById("session-picker-label");
+
+    const updateLabel = () => {
+      if (labelEl) {
+        labelEl.textContent = state.currentSessionName || "Session";
+      }
+      if (btn) {
+        btn.title = `Workspace Session: ${state.currentSessionName || "Session"} (${state.currentSessionId || "none"})`;
+      }
+    };
+    updateLabel();
+
+    state.subscribe("session:adopted", () => {
+      updateLabel();
+      this.tabsComponent?.render();
+      this.updateVersionSelectorDisplay();
+    });
+
+    sessionManager.subscribe("session:renamed", ({ id, name }) => {
+      if (id === state.currentSessionId) {
+        state.currentSessionName = name;
+        updateLabel();
+      }
+    });
+
+    state.subscribe("session:taken_over", () => {
+      updateLabel();
+      toast.info("This session was opened in another window; it continues there. Choose a session to carry on here.");
+      showSessionPickerModal({ allowClose: false });
+    });
+
+    state.subscribe("session:closed", (closedSid) => {
+      if (closedSid === state.currentSessionId || !state.currentSessionId) {
+        updateLabel();
+        showSessionPickerModal({ allowClose: false });
+      }
+    });
+
+    if (!btn || !container) return;
+
+    btn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      const existingMenu = container.querySelector(".session-dropdown-menu");
+      if (existingMenu) {
+        existingMenu.remove();
+        return;
+      }
+
+      const menu = document.createElement("div");
+      menu.className = "session-dropdown-menu";
+      menu.innerHTML = `
+        <div class="session-dropdown-header">
+          <div style="font-weight: 600; color: var(--text-primary); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">
+            ${escapeHtml(state.currentSessionName || "Current Session")}
+          </div>
+          <div style="font-size: 10px; color: var(--text-muted); font-family: var(--font-mono); user-select: all; word-break: break-all;" title="Session ID: ${escapeHtml(state.currentSessionId || '')}">
+            ID: <span style="color: var(--accent-blue);">${escapeHtml(state.currentSessionId || "none")}</span>
+          </div>
+        </div>
+        <div class="session-menu-divider"></div>
+        <button type="button" class="session-menu-item" id="session-action-switch">
+          <span>🗂</span> Switch Session…
+        </button>
+        <button type="button" class="session-menu-item" id="session-action-new">
+          <span>➕</span> New Session…
+        </button>
+        <button type="button" class="session-menu-item" id="session-action-duplicate">
+          <span>⧉</span> Duplicate Session…
+        </button>
+        <button type="button" class="session-menu-item" id="session-action-rename">
+          <span>✏️</span> Rename Session…
+        </button>
+        <div class="session-menu-divider"></div>
+        <button type="button" class="session-menu-item danger" id="session-action-close">
+          <span>🗑</span> Close Session
+        </button>
+      `;
+
+      container.appendChild(menu);
+
+      const outsideClick = (ev) => {
+        if (!menu.contains(ev.target) && ev.target !== btn) {
+          menu.remove();
+          document.removeEventListener("click", outsideClick);
+        }
+      };
+      setTimeout(() => document.addEventListener("click", outsideClick), 10);
+
+      menu.querySelector("#session-action-switch")?.addEventListener("click", () => {
+        menu.remove();
+        showSessionPickerModal({ allowClose: true });
+      });
+
+      menu.querySelector("#session-action-new")?.addEventListener("click", () => {
+        menu.remove();
+        const count = sessionManager.getSessionsIndex().length;
+        const name = prompt("Enter a name for the new session:", "Session " + (count + 1));
+        if (name === null) return;
+        const newSession = sessionManager.createSession({
+          name: name.trim() || ("Session " + (count + 1)),
+          version: state.currentVersion || "v3.0",
+          repo: state.currentRepo || "",
+          pin: false
+        });
+        state.adoptSession(newSession);
+        toast.success("Created session '" + newSession.name + "'");
+      });
+
+      menu.querySelector("#session-action-duplicate")?.addEventListener("click", () => {
+        menu.remove();
+        if (!state.currentSessionId) return;
+        const dup = sessionManager.duplicateSession(state.currentSessionId);
+        if (dup) {
+          state.adoptSession(dup);
+          toast.success("Duplicated into '" + dup.name + "'");
+        }
+      });
+
+      menu.querySelector("#session-action-rename")?.addEventListener("click", () => {
+        menu.remove();
+        const currentName = state.currentSessionName || "Session";
+        const newName = prompt("Rename session:", currentName);
+        if (!newName || newName.trim() === currentName) return;
+        sessionManager.renameSession(state.currentSessionId, newName.trim());
+        state.currentSessionName = newName.trim();
+        updateLabel();
+        toast.success("Renamed session to '" + newName.trim() + "'");
+      });
+
+      menu.querySelector("#session-action-close")?.addEventListener("click", () => {
+        menu.remove();
+        const name = state.currentSessionName || "this session";
+        if (confirm("Are you sure you want to close '" + name + "'? The session will be deleted from your saved workspaces.")) {
+          const sid = state.currentSessionId;
+          sessionManager.deleteSession(sid); // unpins this window from it
+          state.currentSessionId = null;
+          state.currentSessionName = "";
+          updateLabel();
+          showSessionPickerModal({ allowClose: false });
+        }
+      });
     });
   }
 
@@ -190,7 +372,12 @@ export class KernelIdeApp {
       : Array.isArray(state.openTabs)
       ? state.openTabs.length
       : (state.panes?.reduce((sum, p) => sum + (p.tabs?.length || 0), 0) || 0);
-    const isOnline = navigator.onLine;
+    // Same three states as the header badge: link down, backend not answering, or connected.
+    const isOnline = navigator.onLine && api.serverUp;
+    const linkDown = !navigator.onLine;
+    const connLabel = isOnline ? "Online (Connected)" : linkDown ? "Offline (Cached)" : "Server Unreachable";
+    const connDetail = isOnline ? "REST API Active" : linkDown ? "Fallback DB" : "No response from backend";
+    const connColor = isOnline ? "var(--accent-green)" : linkDown ? "var(--accent-yellow)" : "var(--accent-red)";
 
     // Database instance hash and storage estimate
     const cachedHash = (await localDB.get("meta", "db_instance_hash")) || "Default";
@@ -213,10 +400,10 @@ export class KernelIdeApp {
           <div style="display:flex;flex-direction:column;gap:6px;">
             <div style="display:flex;align-items:center;justify-content:space-between;background:var(--bg-primary);padding:6px 10px;border-radius:var(--radius-md);border:1px solid var(--border-color);">
               <div style="display:flex;align-items:center;gap:6px;">
-                <span style="display:inline-block;width:7px;height:7px;border-radius:50%;background:${isOnline ? 'var(--accent-green)' : 'var(--accent-yellow)'};"></span>
-                <span style="font-weight:600;color:var(--text-primary);font-size:11px;">${isOnline ? 'Online (Connected)' : 'Offline (Cached)'}</span>
+                <span style="display:inline-block;width:7px;height:7px;border-radius:50%;background:${connColor};"></span>
+                <span style="font-weight:600;color:var(--text-primary);font-size:11px;">${connLabel}</span>
               </div>
-              <span style="font-size:10px;color:var(--text-muted);font-family:var(--font-mono);">${isOnline ? 'REST API Active' : 'Fallback DB'}</span>
+              <span style="font-size:10px;color:var(--text-muted);font-family:var(--font-mono);">${connDetail}</span>
             </div>
 
             <div style="display:flex;align-items:center;justify-content:space-between;background:var(--bg-primary);padding:6px 10px;border-radius:var(--radius-md);border:1px solid var(--border-color);" title="Database Instance: ${cachedHash}">
@@ -230,7 +417,7 @@ export class KernelIdeApp {
 
             <button class="settings-btn" id="btn-check-updates" ${isOnline ? "" : "disabled"} title="Check the frontend build, database, parsed versions and Git refs against the server">
               <span>🔄 Check for Updates</span>
-              <span id="check-updates-status" style="font-size:10px;color:var(--text-muted);">${isOnline ? "&rarr;" : "Offline"}</span>
+              <span id="check-updates-status" style="font-size:10px;color:var(--text-muted);">${isOnline ? "&rarr;" : linkDown ? "Offline" : "Unreachable"}</span>
             </button>
           </div>
         </div>
@@ -718,6 +905,34 @@ export class KernelIdeApp {
       return tab && tab.type === "code" && tab.path ? tab : null;
     };
     const commands = [
+      { title: "Switch workspace session…", hint: "Choose or open a saved session", keywords: "session workspace window", run: () => showSessionPickerModal({ allowClose: true }) },
+      {
+        title: "New workspace session…", hint: "Create a fresh session in this window", keywords: "session new workspace",
+        run: () => {
+          const count = sessionManager.getSessionsIndex().length;
+          const name = prompt("Enter a name for the new session:", `Session ${count + 1}`);
+          if (name === null) return;
+          const newSession = sessionManager.createSession({
+            name: name.trim() || `Session ${count + 1}`,
+            version: state.currentVersion || "v3.0",
+            repo: state.currentRepo || "",
+            pin: false
+          });
+          state.adoptSession(newSession);
+          toast.success(`Created session '${newSession.name}'`);
+        }
+      },
+      {
+        title: "Duplicate workspace session…", hint: "Clone current session into a new session", keywords: "session duplicate clone workspace",
+        run: () => {
+          if (!state.currentSessionId) return;
+          const dup = sessionManager.duplicateSession(state.currentSessionId);
+          if (dup) {
+            state.adoptSession(dup);
+            toast.success(`Duplicated into '${dup.name}'`);
+          }
+        }
+      },
       { title: "Compare versions or commits", hint: "Files & Kconfig changes", keywords: "diff compare", run: () => state.openTab({ type: "diff", title: "Compare" }) },
       { title: "Select commit…", hint: "Tags and commits", keywords: "version checkout ref", run: () => document.getElementById("commit-picker-btn")?.click() },
       { title: "Open source treemap", hint: "Bytes / files per directory", keywords: "size disk usage", run: () => state.openTab({ type: "treemap", title: "Treemap: root", path: "", version: v() }) },
@@ -758,7 +973,7 @@ export class KernelIdeApp {
       { title: "Open subsystems & maintainers", hint: "MAINTAINERS, CREDITS", keywords: "people", run: () => state.openTab({ type: "maintainers", title: "Maintainers" }) },
       { title: "Open NodeMap canvas", hint: "Schematic view", keywords: "graph", run: () => state.openTab({ type: "nodemap", title: "NodeMap Canvas" }) },
       { title: "Open kernel documentation", hint: "Documentation/index.rst", keywords: "docs rst", run: () => state.openTab({ type: "code", title: "index.rst", path: "Documentation/index.rst", version: v() }) },
-      { title: "Toggle file explorer", hint: "Sidebar", keywords: "sidebar tree", run: () => document.querySelector('.activity-btn[data-action="explorer"]')?.click() },
+      { title: "Toggle file explorer", hint: "Sidebar", keywords: "sidebar tree collapse", run: () => this.toggleSidebar() },
     ];
     const tab = activeCode();
     if (tab) {
@@ -777,17 +992,58 @@ export class KernelIdeApp {
     return commands;
   }
 
+  /**
+   * Single owner of the sidebar's collapsed state: the activity-bar Explorer button, the
+   * sidebar header's collapse button, the command palette and `explorer:reveal` all route
+   * here so the class, both buttons and the stored preference never disagree.
+   */
+  setSidebarCollapsed(collapsed) {
+    const sidebar = document.getElementById("sidebar");
+    if (!sidebar) return;
+
+    sidebar.classList.toggle("collapsed", collapsed);
+
+    const expBtn = document.querySelector('.activity-btn[data-action="explorer"]');
+    if (expBtn) expBtn.classList.toggle("active", !collapsed);
+
+    const collapseBtn = document.getElementById("sidebar-collapse");
+    if (collapseBtn) collapseBtn.setAttribute("aria-expanded", String(!collapsed));
+
+    try {
+      localStorage.setItem(SIDEBAR_COLLAPSED_KEY, collapsed ? "1" : "0");
+    } catch {
+      /* private mode or blocked storage: the sidebar still toggles, it just will not be remembered */
+    }
+  }
+
+  toggleSidebar() {
+    const sidebar = document.getElementById("sidebar");
+    if (!sidebar) return;
+    this.setSidebarCollapsed(!sidebar.classList.contains("collapsed"));
+  }
+
+  setupSidebarCollapse() {
+    const collapseBtn = document.getElementById("sidebar-collapse");
+    if (collapseBtn) collapseBtn.addEventListener("click", () => this.setSidebarCollapsed(true));
+
+    let collapsed = false;
+    try {
+      collapsed = localStorage.getItem(SIDEBAR_COLLAPSED_KEY) === "1";
+    } catch {
+      /* ignore: default to expanded */
+    }
+    this.setSidebarCollapsed(collapsed);
+  }
+
   setupActivityBar() {
     const buttons = document.querySelectorAll(".activity-btn");
-    const sidebar = document.getElementById("sidebar");
 
     buttons.forEach((btn) => {
       btn.addEventListener("click", () => {
         const action = btn.dataset.action;
 
         if (action === "explorer") {
-          sidebar.classList.toggle("collapsed");
-          btn.classList.toggle("active", !sidebar.classList.contains("collapsed"));
+          this.toggleSidebar();
         } else if (action === "kconfig") {
           state.openTab({ type: "kconfig", title: "KConfig (x86_64)", arch: "x86_64" });
         } else if (action === "nodemap") {
@@ -812,12 +1068,7 @@ export class KernelIdeApp {
     if (!this._explorerSubscribed) {
       this._explorerSubscribed = true;
       state.subscribe("explorer:reveal", async (dirPath) => {
-        const sidebar = document.getElementById("sidebar");
-        if (sidebar && sidebar.classList.contains("collapsed")) {
-          sidebar.classList.remove("collapsed");
-          const expBtn = document.querySelector('.activity-btn[data-action="explorer"]');
-          if (expBtn) expBtn.classList.add("active");
-        }
+        this.setSidebarCollapsed(false);
 
         if (!dirPath) return;
         const parts = dirPath.split("/").filter(Boolean);

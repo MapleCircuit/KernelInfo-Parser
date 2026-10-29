@@ -61,6 +61,7 @@ function splitSubject(subject) {
 export class MailView {
   constructor() {
     this.containerEl = null;
+    this.tabId = null;
     this.currentQuery = "";
     this.currentFilter = "all";
     this.currentPage = 1;
@@ -88,7 +89,9 @@ export class MailView {
 
   async render(containerEl, tabData = {}) {
     this.containerEl = containerEl;
+    this.tabId = tabData.id || null;
     if (tabData.query !== undefined) this.currentQuery = tabData.query;
+    if (tabData.filter) this.currentFilter = tabData.filter;
     if (tabData.threadId) this.activeThreadId = parseInt(tabData.threadId, 10);
     if (tabData.messageId) this.activeMessageId = String(tabData.messageId).trim();
     if (tabData.listMode === "tree" || tabData.listMode === "search") this.listMode = tabData.listMode;
@@ -156,6 +159,7 @@ export class MailView {
     const debouncedSearch = debounce((q) => {
       this.currentQuery = q;
       if (clearBtn) clearBtn.style.display = q ? "block" : "none";
+      this.persistTabState({ query: q });
       this.loadSearch(true);
     }, 250);
 
@@ -168,6 +172,7 @@ export class MailView {
         searchInput.value = "";
         clearBtn.style.display = "none";
         this.currentQuery = "";
+        this.persistTabState({ query: "" });
         this.loadSearch(true);
       };
     }
@@ -177,6 +182,7 @@ export class MailView {
         containerEl.querySelectorAll(".mail-chip").forEach((c) => c.classList.remove("active"));
         chip.classList.add("active");
         this.currentFilter = chip.dataset.filter;
+        this.persistTabState({ filter: this.currentFilter });
         this.loadSearch(true);
       };
     });
@@ -198,6 +204,15 @@ export class MailView {
     this.loadSearch(true);
   }
 
+  /**
+   * Record on this tab (and so in its URL, §5.26) what this view is showing. A view whose
+   * element was replaced by a re-render is stale: its state is nobody's address any more.
+   */
+  persistTabState(patch) {
+    if (!this.containerEl || !this.containerEl.isConnected) return null;
+    return state.updateTabState(this.tabId, patch);
+  }
+
   /** Switch the left column between archive search and the thread reply tree. */
   setListMode(mode) {
     const next = mode === "tree" ? "tree" : "search";
@@ -212,11 +227,7 @@ export class MailView {
       b.classList.toggle("active", b.dataset.listMode === next);
     });
 
-    const activeTab = state.getActiveTab();
-    if (activeTab && activeTab.type === "mail") {
-      activeTab.listMode = next;
-      state.saveState();
-    }
+    this.persistTabState({ listMode: next });
 
     if (next === "tree") {
       this.renderTree();
@@ -535,11 +546,7 @@ export class MailView {
   /** Clicking a tree row focuses that message in the conversation column. */
   selectTreeMessage(mid) {
     this.activeMessageId = mid;
-    const activeTab = state.getActiveTab();
-    if (activeTab && activeTab.type === "mail") {
-      activeTab.messageId = mid;
-      state.saveState();
-    }
+    this.persistTabState({ messageId: mid });
     this.focusMessageCard(mid);
   }
 
@@ -622,12 +629,24 @@ export class MailView {
         this.results = newItems;
       } else {
         const known = new Set(this.results.map((r) => r.message_id || r.num));
+        const before = this.results.length;
         for (const item of newItems) {
           if (!known.has(item.message_id || item.num)) {
             this.results.push(item);
           }
         }
+        // The archive reports the size of the candidate pool it searched, which can
+        // exceed what it will actually hand out; a page that adds nothing is the end
+        // of the roster, so the exhausted "Load More" control retires instead of
+        // promising rows that never arrive.
+        if (this.results.length === before) {
+          this.totalResults = this.results.length;
+          this.currentPage = Math.max(1, this.currentPage - 1);
+        }
       }
+      // Cleared before rendering: the roster draws its own "Load More" control, which
+      // must come back enabled once this page has landed.
+      this.isLoadingSearch = false;
       this.renderResultsList();
     } catch (e) {
       if (reset) {
@@ -718,6 +737,9 @@ export class MailView {
       moreBtn.textContent = this.isLoadingSearch ? "Loading..." : `Load More (${this.results.length} of ${this.totalResults})`;
       moreBtn.disabled = this.isLoadingSearch;
       moreBtn.onclick = () => {
+        if (this.isLoadingSearch) return;
+        moreBtn.disabled = true;
+        moreBtn.textContent = "Loading...";
         this.currentPage++;
         this.loadSearch(false);
       };
@@ -745,13 +767,13 @@ export class MailView {
 
       // Update active tab title in state & DOM directly without re-rendering tab content
       const title = threadData.subject ? `LKML: ${threadData.subject.slice(0, 30)}` : "LKML Thread";
-      const activeTab = state.getActiveTab();
-      if (activeTab && activeTab.type === "mail") {
-        activeTab.title = title;
-        activeTab.threadId = this.activeThreadId;
-        activeTab.messageId = this.activeMessageId;
-        state.saveState();
-        const tabEl = document.querySelector(`.tab[data-tab-id="${activeTab.id}"] .tab-title`);
+      const tab = this.persistTabState({
+        title,
+        threadId: this.activeThreadId,
+        messageId: this.activeMessageId
+      });
+      if (tab) {
+        const tabEl = document.querySelector(`.tab[data-tab-id="${tab.id}"] .tab-title`);
         if (tabEl) tabEl.textContent = title;
       }
 

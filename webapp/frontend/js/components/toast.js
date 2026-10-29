@@ -29,6 +29,7 @@ class ToastManager {
   success(msg) { this.show(msg, "success"); }
   error(msg) { this.show(msg, "error", 4500); }
   info(msg) { this.show(msg, "info"); }
+  warning(msg) { this.show(msg, "warning", 4000); }
 }
 
 export const toast = new ToastManager();

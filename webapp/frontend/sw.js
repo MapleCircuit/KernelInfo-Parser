@@ -45,6 +45,16 @@ function cacheFirst(request, cacheName, cacheKey = request) {
   }));
 }
 
+/**
+ * Copy of a cached response carrying `X-KIP-Offline: 1`, so the page can tell a reply that came from
+ * this cache after a failed request from one the server actually sent (js/api.js, the header badge).
+ */
+async function offlineCopy(cached) {
+  const headers = new Headers(cached.headers);
+  headers.set("X-KIP-Offline", "1");
+  return new Response(await cached.blob(), { status: cached.status, statusText: cached.statusText, headers });
+}
+
 function networkFirst(request, cacheName) {
   return fetch(request)
     .then((response) => {
@@ -54,9 +64,9 @@ function networkFirst(request, cacheName) {
       }
       return response;
     })
-    .catch(() => caches.match(request).then((cached) => cached || new Response(
+    .catch(() => caches.match(request).then((cached) => cached ? offlineCopy(cached) : new Response(
       JSON.stringify({ error: "Offline - data not cached yet" }),
-      { headers: { "Content-Type": "application/json" }, status: 503 }
+      { headers: { "Content-Type": "application/json", "X-KIP-Offline": "1" }, status: 503 }
     )));
 }
 

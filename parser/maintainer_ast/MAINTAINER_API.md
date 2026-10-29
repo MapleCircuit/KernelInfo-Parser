@@ -177,7 +177,14 @@ To resolve file ownership across the entire kernel repository:
    In `MaintainerManager._stage_tag()` and `CreditsManager._stage_tag()`, `m_tag.set` MUST be the first operation inside `with CS(REF_POS):` so `tag_ref` references `m_tag`. Auxiliary tables (`m_tag_code.get_set`, `m_moved_tag.set`) follow immediately within the block.
 2. **Rule 23 View Deduplication**:
    All AST nodes (`_stage_ast_node`) use `m_ast.view(((m_ast.ast_id,),), None, name, type_id)`.
-3. **Person Email Normalization**:
-   Email addresses are stripped of surrounding angle brackets (`< >`), whitespace, and `mailto:` prefixes before deduplication.
+3. **Person Identity Normalization** (`maintainer_types.clean_identity_text`):
+   Email addresses are stripped of surrounding angle brackets (`< >`), whitespace, and `mailto:` prefixes before deduplication. Both halves of the identity then pass through `clean_identity_text()`, which maps C0 control characters and `DEL` to a space and collapses every run of (Unicode) whitespace to one, because `.strip()` alone leaves such bytes where they sit **inside** the text and each one silently forks a contributor into a second `person_id`:
+   - commit `a929478f` signs off as `Olof Johansson\x01 <olof@lixom.net\x01>`, which also sorted differently under MySQL's collation than the same string does in Python;
+   - `Ruslan  Sushko`, `K.  Y.  Srinivasan` and `Giuseppe\tGORGOGLIONE` appear beside their single-spaced spellings;
+   - `Vitor\xa0Soares` (no-break space) is the same person as `Vitor Soares`.
+
+   The C1 range (`\x80`–`\x9f`) is deliberately **not** treated as control characters: in this corpus those bytes are the tail of a UTF-8 sequence that was decoded as latin-1 (`Michał` arriving as `MichaÅ\x82`), so rewriting them would mangle the name further and destroy what a later mojibake repair needs.
+
+   Applied at every point an identity is formed: `MaintainerPerson.__post_init__` and `CreditsEntry.__post_init__` (MAINTAINERS and CREDITS), and `main.py:_person_key()` for git commit authors, committers and trailer contributors. `_ingest_commit_range()` additionally prefers the row already stored in normalized form (lowest `person_id` among equals) when loading the existing registry, so rows written before normalization map onto the identity a merge would keep.
 4. **Batch DB Commit**:
    `processing_maintainer_files()` aggregates file-to-subsystem mappings into single bulk `m_maintainer_file` operations to minimize database write transactions.

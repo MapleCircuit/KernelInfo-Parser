@@ -27,6 +27,12 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+# A Date: header set in the future (a skewed sender clock or a forged header) sorts
+# ahead of every real message, so the chronological browse listing (an empty query)
+# stops at the present. A clock an hour fast is tolerated; an explicit search query
+# is never filtered, so those messages stay findable.
+FUTURE_DATE_SKEW_SECONDS = 3600
+
 
 class PublicInboxLocalStore:
     """Direct read-only interface to public-inbox SQLite, Xapian shards, and all.git."""
@@ -399,8 +405,12 @@ class PublicInboxLocalStore:
         rows = cursor.fetchall()
         return [self._unpack_row(r) for r in rows]
 
-    def search_over_subjects(self, pattern: str, limit: int = 20) -> list[SmsgRecord]:
-        """Query over table by subject substring pattern (fallback when Xapian unavailable)."""
+    def search_over_subjects(self, pattern: str, limit: int = 20, scan_limit: int = 500) -> list[SmsgRecord]:
+        """Query over table by subject substring pattern (fallback when Xapian unavailable).
+
+        `scan_limit` bounds how many of the newest rows are decompressed and tested, so
+        a deep page of results can still be reached without scanning the whole archive.
+        """
         cursor = self._execute_query(
             self.over_db,
             """
@@ -408,8 +418,9 @@ class PublicInboxLocalStore:
             FROM over
             WHERE num > 0
             ORDER BY ds DESC
-            LIMIT 500
+            LIMIT ?
             """,
+            (max(500, scan_limit),),
         )
         matches: list[SmsgRecord] = []
         pattern_lower = pattern.lower()
@@ -743,20 +754,21 @@ class PublicInboxLocalStore:
         # 2. Fallback to over.sqlite3 substring search
         if not matched_records:
             if clean_q:
-                matched_records = self.search_over_subjects(clean_q, limit=max(200, limit + offset))
+                pool = max(200, limit + offset)
+                matched_records = self.search_over_subjects(clean_q, limit=pool, scan_limit=pool * 4)
             else:
-                # Empty query: fetch recent messages ordered chronologically
+                # Empty query: recent messages ordered chronologically, future dates excluded
                 try:
                     cursor = self._execute_query(
                         self.over_db,
                         """
                         SELECT num, tid, sid, ts, ds, ddd
                         FROM over
-                        WHERE num > 0
+                        WHERE num > 0 AND (ds IS NULL OR ds <= ?)
                         ORDER BY ds DESC
                         LIMIT ?
                         """,
-                        (max(200, limit + offset),),
+                        (int(time.time()) + FUTURE_DATE_SKEW_SECONDS, max(200, limit + offset)),
                     )
                     matched_records = [self._unpack_row(r) for r in cursor.fetchall()]
                 except Exception as exc:

@@ -317,16 +317,23 @@ class SharedTableReader:
 class SharedTableBuilder:
     """Packs preloaded relational tables and builds open-addressing hash indices into a shared mmap."""
 
+    # A segment smaller than this wastes most of a 1GB huge page, so it is backed by 2MB pages instead
+    MIN_1G_BYTES = 512 * 1024 * 1024
+
     def __init__(self, mode: str = "auto") -> None:
         self.mode = mode
         self.table_data: dict[int, dict[str, Any]] = {}
 
     def add_table(self, table_id: int, col_count: int, primary: tuple[int, ...], rows: Sequence[tuple]) -> None:
-        """Register preloaded table rows for serialization into the shared buffer."""
+        """Register preloaded table rows for serialization into the shared buffer.
+
+        The rows are referenced, not copied: a caller that drops its own reference leaves them to this builder.
+        """
+        row_list = rows if isinstance(rows, list) else list(rows)
         self.table_data[table_id] = {
             "col_count": col_count,
             "primary": primary,
-            "rows": list(rows),
+            "rows": row_list,
         }
 
     def build(self) -> SharedTableReader | None:
@@ -379,8 +386,10 @@ class SharedTableBuilder:
             }
             total_needed += data_size + idx_size + pool_bytes + 1024  # padding
 
-        # 2. Allocate shared mmap
-        mm, mode_used, page_sz = SharedBufferAllocator.allocate(total_needed, mode=self.mode)
+        # 2. Allocate shared mmap (a segment far below a 1GB page is backed by 2MB pages instead)
+        mm, mode_used, page_sz = SharedBufferAllocator.allocate(
+            total_needed, mode=self.mode, allow_1g=total_needed >= self.MIN_1G_BYTES
+        )
         mv = memoryview(mm)
 
         # 3. Layout planning and writing
@@ -502,7 +511,90 @@ class SharedTableBuilder:
             dir_offset,
         )
 
+        # The rows are packed: drop the builder's hold on them so the heap copy can be freed at once
+        self.table_data.clear()
+        table_plans.clear()
+
         return SharedTableReader(mm)
+
+
+# Rows measured per table when estimating a batch's packed size (`estimate_packed_bytes`)
+_ESTIMATE_SAMPLE = 64
+
+
+def estimate_packed_bytes(col_count: int, rows: Sequence[tuple]) -> int:
+    """Estimate the shared-memory bytes `rows` will take, from a sample of them.
+
+    Used to decide when a preload batch is large enough to pack (`SharedTableBuilder.estimated_bytes`).
+    Measuring every cell of every table would cost about as much as the packing it schedules, so the
+    variable-length share is averaged over at most `_ESTIMATE_SAMPLE` rows spread across the table.
+    """
+    row_count = len(rows)
+    if row_count == 0:
+        return 0
+    step = max(1, row_count // _ESTIMATE_SAMPLE)
+    sampled = 0
+    var_bytes = 0
+    for i in range(0, row_count, step):
+        sampled += 1
+        for val in rows[i]:
+            if isinstance(val, str):
+                var_bytes += len(val)
+            elif isinstance(val, (bytes, bytearray, memoryview)):
+                var_bytes += len(val)
+    # 9 bytes per cell, 16 bytes per index slot at a capacity of at least twice the row count
+    return row_count * (col_count * 9 + 32 + var_bytes // sampled)
+
+
+class SharedTableSegments:
+    """Several shared-memory segments presented as one reader, each table living wholly in one of them.
+
+    Preloading packs a segment as soon as the tables it has read reach a byte budget and then drops their
+    heap rows, so the heap holds one batch at a time instead of every table at once while the packed copy
+    of all of them is built (`TECachedDB.start_new_db()`).
+    """
+
+    def __init__(self) -> None:
+        self.segments: list[SharedTableReader] = []
+        # Which segment holds a table, and the merged table metadata of all of them
+        self._owner: dict[int, SharedTableReader] = {}
+        self.tables: dict[int, dict[str, Any]] = {}
+        self.total_size = 0
+        # The weakest page size any segment got (they are allocated one by one)
+        self.page_size = 0
+
+    def add_segment(self, reader: SharedTableReader) -> None:
+        """Adopt a freshly packed segment and route its tables to it."""
+        self.segments.append(reader)
+        for t_id, meta in reader.tables.items():
+            self._owner[t_id] = reader
+            self.tables[t_id] = meta
+        self.total_size += reader.total_size
+        page_sz = getattr(reader, "page_size", 0) or 0
+        self.page_size = min(self.page_size, page_sz) if self.page_size else page_sz
+
+    def reader_for(self, table_id: int) -> SharedTableReader | None:
+        """The segment holding this table, which its zero-copy views are bound to."""
+        return self._owner.get(table_id)
+
+    def contains_table(self, table_id: int) -> bool:
+        return table_id in self._owner
+
+    def get_row_by_pk(self, table_id: int, pk_val: Any) -> tuple | None:
+        """O(1) Primary Key lookup in the segment holding the table."""
+        reader = self._owner.get(table_id)
+        return reader.get_row_by_pk(table_id, pk_val) if reader is not None else None
+
+    def scan_matching(self, table_id: int, filter_cols: tuple) -> tuple | None:
+        """Linear scan of the segment holding the table."""
+        reader = self._owner.get(table_id)
+        return reader.scan_matching(table_id, filter_cols) if reader is not None else None
+
+    def __len__(self) -> int:
+        return len(self.segments)
+
+    def __bool__(self) -> bool:
+        return bool(self.segments)
 
 
 SHARED_SYMBOL_MAGIC = b"SYMB"

@@ -5,10 +5,19 @@
 import { localDB } from "./db.js";
 import { state } from "./state.js";
 
+// Heartbeat probing GET /api/sync (cheap, server-cached): slow while the backend answers, fast while it
+// does not, so the badge recovers quickly once the server is back.
+const HEARTBEAT_UP_MS = 30000;
+const HEARTBEAT_DOWN_MS = 5000;
+const HEARTBEAT_TIMEOUT_MS = 5000;
+
 class ApiClient {
   constructor() {
     this.baseUrl = "";
     this.isOnline = navigator.onLine;
+    // Whether the backend itself answered last time we talked to it. navigator.onLine only reports the
+    // browser's link state, so it stays true when the server is down; this is what the badge follows.
+    this.serverUp = navigator.onLine;
     this.activeRequests = 0;
     // Version name -> stamp (commit + parse completion) from /api/versions and /api/branches; part of every
     // cache key of version data, so a re-parsed version or a moved branch never serves older cached data
@@ -16,15 +25,81 @@ class ApiClient {
     // Called with the X-KIP-Sync header of every API response (js/sync.js)
     this.onSyncHeader = null;
     this._showTimer = null;
+    this._heartbeatTimer = null;
 
     window.addEventListener("online", () => {
       this.isOnline = true;
       document.dispatchEvent(new CustomEvent("app:online"));
+      this.pingServer();
     });
     window.addEventListener("offline", () => {
       this.isOnline = false;
+      this._setServerUp(false);
       document.dispatchEvent(new CustomEvent("app:offline"));
     });
+    document.addEventListener("visibilitychange", () => {
+      if (!document.hidden) this.pingServer();
+    });
+  }
+
+  /** True once the connection is known to be usable: the link is up and the backend answers. */
+  get isConnected() {
+    return this.isOnline && this.serverUp;
+  }
+
+  /**
+   * Records whether the backend answered. Any HTTP response counts as reachable (a 500 still proves the
+   * server is there); only transport failures and timeouts count as unreachable. Emits
+   * `app:server-status` ({up}) on a change and re-paces the heartbeat.
+   */
+  _setServerUp(up) {
+    up = Boolean(up);
+    if (this.serverUp === up) return;
+    this.serverUp = up;
+    document.dispatchEvent(new CustomEvent("app:server-status", { detail: { up } }));
+    if (this._heartbeatTimer) this.startHeartbeat();
+  }
+
+  /** One heartbeat request; resolves to the reachability it observed. Never throws, never cached. */
+  async pingServer() {
+    if (!navigator.onLine) {
+      this._setServerUp(false);
+      return false;
+    }
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), HEARTBEAT_TIMEOUT_MS);
+    try {
+      await fetch(`${this.baseUrl}/api/sync`, {
+        method: "GET",
+        signal: controller.signal,
+        headers: { Accept: "application/json", ...(this.repo ? { "X-KI-Repo": this.repo } : {}) },
+        cache: "no-store",
+      });
+      this._setServerUp(true);
+      return true;
+    } catch {
+      this._setServerUp(false);
+      return false;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  /** Starts (or re-paces) the heartbeat. Idempotent; the interval follows the current server state. */
+  startHeartbeat() {
+    this.stopHeartbeat();
+    const period = this.serverUp ? HEARTBEAT_UP_MS : HEARTBEAT_DOWN_MS;
+    this._heartbeatTimer = setInterval(() => {
+      // A hidden tab cannot show the badge anyway; visibilitychange probes as soon as it comes back.
+      if (!document.hidden) this.pingServer();
+    }, period);
+  }
+
+  stopHeartbeat() {
+    if (this._heartbeatTimer) {
+      clearInterval(this._heartbeatTimer);
+      this._heartbeatTimer = null;
+    }
   }
 
   _onRequestStart() {
@@ -92,6 +167,7 @@ class ApiClient {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 10000);
     this._onRequestStart();
+    let answered = false;
 
     try {
       const response = await fetch(url, {
@@ -105,6 +181,10 @@ class ApiClient {
         }
       });
       clearTimeout(timer);
+      // The Service Worker answers from its own cache when the request failed (sw.js, networkFirst);
+      // such a reply carries X-KIP-Offline and says nothing about the server being up.
+      answered = !response.headers.get("X-KIP-Offline");
+      this._setServerUp(answered);
       const syncHeader = response.headers.get("X-KIP-Sync");
       if (syncHeader && this.onSyncHeader) this.onSyncHeader(syncHeader);
 
@@ -134,6 +214,9 @@ class ApiClient {
       return data;
     } catch (err) {
       clearTimeout(timer);
+      // Only a transport failure or the timeout means the server is unreachable; an HTTP error status
+      // threw above but already proved it answered.
+      if (!answered) this._setServerUp(false);
 
       // 4. On network failure, fallback to cache if available
       if (cacheStore && cacheKey) {
@@ -157,10 +240,17 @@ class ApiClient {
 
   /** Server change tokens {db, frontend, parsed, git, repo}; never cached. `fresh` makes the server recompute them. */
   async getSync({ fresh = false } = {}) {
-    const res = await fetch(`${this.baseUrl}/api/sync${fresh ? "?fresh=true" : ""}`, {
-      headers: { Accept: "application/json", ...(this.repo ? { "X-KI-Repo": this.repo } : {}) },
-      cache: "no-store",
-    });
+    let res;
+    try {
+      res = await fetch(`${this.baseUrl}/api/sync${fresh ? "?fresh=true" : ""}`, {
+        headers: { Accept: "application/json", ...(this.repo ? { "X-KI-Repo": this.repo } : {}) },
+        cache: "no-store",
+      });
+    } catch (err) {
+      this._setServerUp(false);
+      throw err;
+    }
+    this._setServerUp(true);
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     return res.json();
   }

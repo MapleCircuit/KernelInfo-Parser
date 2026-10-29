@@ -1,7 +1,32 @@
 """parser/maintainer_ast/maintainer_types.py - Data Models & Enums for Maintainer Subsystem."""
 from __future__ import annotations
+import re
 from dataclasses import dataclass, field
 from enum import IntEnum
+
+# C0 controls and DEL, which `str.strip()` leaves in place when they sit inside the text. Tab,
+# newline and carriage return are left to the `\s+` collapse below. The C1 range (\x80-\x9f) is
+# deliberately NOT included: in this corpus those bytes are the tail of a UTF-8 sequence decoded as
+# latin-1 ("Michał" arriving as "MichaÅ\x82"), so treating them as controls would mangle the name
+# further and destroy what a later mojibake repair needs.
+_CONTROL_CHARS_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+
+
+def clean_identity_text(text: str | None) -> str:
+    """
+    A contributor's name or e-mail as it is stored and deduplicated by.
+
+    Control characters become spaces and runs of whitespace collapse to one, because the kernel
+    sources carry stray bytes and doubled spaces that `.strip()` keeps: commit `a929478f` signs off
+    as `Olof Johansson\\x01 <olof@lixom.net\\x01>`, and `Ruslan  Sushko` appears beside
+    `Ruslan Sushko`. Neither is visible, so each silently forks one contributor into a second
+    `m_maintainer_person` identity, and a control byte also makes the name sort in MySQL's
+    collation differently from the same string in Python. No-break space (and the rest of Unicode
+    whitespace) collapses too, since `Vitor\\xa0Soares` is the same person as `Vitor Soares`.
+    """
+    if not text:
+        return ""
+    return re.sub(r"\s+", " ", _CONTROL_CHARS_RE.sub(" ", text)).strip()
 
 
 class MaintainerRole(IntEnum):
@@ -29,8 +54,8 @@ class MaintainerPerson:
     person_id: int | None = None
 
     def __post_init__(self) -> None:
-        self.name = self.name.strip().strip('"\'')
-        self.email = self.email.strip().strip("<>\"' \t\r\n")
+        self.name = clean_identity_text(self.name).strip('"\'').strip()
+        self.email = clean_identity_text(self.email).strip("<>\"'").strip()
 
 
 @dataclass(slots=True)
@@ -93,8 +118,8 @@ class CreditsEntry:
     person_id: int | None = None
 
     def __post_init__(self) -> None:
-        self.name = self.name.strip().strip('"\'')
-        self.email = self.email.strip().strip("<>\"' \t\r\n")
+        self.name = clean_identity_text(self.name).strip('"\'').strip()
+        self.email = clean_identity_text(self.email).strip("<>\"'").strip()
         self.web_page = self.web_page.strip()
         self.pgp_key = self.pgp_key.strip()
         self.description = self.description.strip()

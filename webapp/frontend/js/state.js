@@ -3,6 +3,7 @@
  * Manages versions, multi-pane tabs, active tab, kconfig engines and the event bus.
  */
 import { localDB } from "./db.js";
+import { sessionManager } from "./session_manager.js";
 
 // A resolved configuration (defconfig loaded in the KConfig view) has far more than the default seeds
 export const MIN_CONFIG_SYMBOLS = 50;
@@ -39,6 +40,10 @@ function bareAssignments(values) {
 class GlobalState {
   constructor() {
     this.subscribers = new Map();
+
+    // Active session identifier and human-readable name
+    this.currentSessionId = null;
+    this.currentSessionName = "Default Session";
 
     // Default State
     // Revision of the active tab: what links opened from it follow
@@ -80,8 +85,46 @@ class GlobalState {
     // Toolchain profile per "version|ARCH" (compiler, versions, env and probe overrides; see the API docs)
     this.kconfigToolchains = {};
 
+    // Cross-session synchronization via BroadcastChannel
+    // An engine appearing or going away in another session changes what the code tabs here can
+    // follow, so it is announced as an engine change — marked `remote`, because no KConfig tab of
+    // *this* window gained or lost its engine and none of them has anything to re-resolve.
+    sessionManager.subscribe("kconfig:remote_engines:updated", () => {
+      this.emit("kconfig:engine:changed", {
+        tabId: "",
+        remote: true,
+        active: this.kconfigEngineActive,
+        engineTabIds: [...this.kconfigEngineTabIds]
+      });
+    });
+
+    sessionManager.subscribe("kconfig:remote_assignments:updated", ({ tabId, assignments }) => {
+      this.emit("kconfig:assignments:updated", { tabId, assignments });
+    });
+
+    sessionManager.subscribe("kconfig:engines:requested", () => {
+      this.broadcastAllActiveEngines();
+    });
+
+    // Another window claimed the session this one held (§5.23): this window is signed out of it
+    // at once, so nothing more is written to a session it no longer owns, and the app opens the
+    // Session Picker. The workspace on screen is left alone until a session is chosen.
+    sessionManager.subscribe("session:taken_over", ({ sessionId }) => {
+      if (sessionId !== this.currentSessionId) return;
+      this.currentSessionId = null;
+      this.currentSessionName = "";
+      this.emit("session:taken_over", sessionId);
+    });
+
+    sessionManager.subscribe("session:closed_remotely", (sid) => {
+      if (sid === this.currentSessionId) {
+        this.emit("session:closed", sid);
+      }
+    });
+
     // Load persisted state if available
     this.loadState();
+    sessionManager.requestRemoteEngines();
   }
 
   subscribe(event, callback) {
@@ -240,11 +283,12 @@ class GlobalState {
   }
 
   /**
-   * Engines a code tab can follow, in pane order:
-   * `{ tabId, title, version, arch, configName, symbols, resolved }`.
+   * Engines a code tab can follow, in pane order: local engines running in this window,
+   * plus remote engines announced by other open browser sessions.
+   * `{ tabId, title, version, arch, configName, symbols, resolved, isRemote, sessionName }`.
    */
   kconfigEngineList() {
-    return this.kconfigEngineTabs().map((tab) => {
+    const local = this.kconfigEngineTabs().map((tab) => {
       const engine = this.kconfigEngines[tab.id] || {};
       const symbols = Math.floor(Object.keys(engine.assignments || {}).length / 2);
       return {
@@ -255,8 +299,65 @@ class GlobalState {
         configName: engine.configName || tab.configName || "",
         symbols,
         resolved: symbols >= MIN_CONFIG_SYMBOLS,
+        isRemote: false,
+        sessionName: this.currentSessionName,
       };
     });
+
+    const remote = sessionManager.getRemoteEngineList().map((eng) => {
+      const symbols = Math.floor(Object.keys(eng.assignments || {}).length / 2);
+      return {
+        tabId: eng.tabId,
+        title: `${eng.title} (${eng.sessionName})`,
+        version: eng.version,
+        arch: eng.arch,
+        configName: eng.configName || "",
+        symbols,
+        resolved: symbols >= MIN_CONFIG_SYMBOLS,
+        isRemote: true,
+        sessionName: eng.sessionName,
+        sessionId: eng.sessionId,
+      };
+    });
+
+    return [...local, ...remote];
+  }
+
+  /**
+   * Whether an engine with this tab id is running at all: in this window, or announced by a
+   * KConfig tab of another session (§5.23). Everything that asks "can this tab follow it?" goes
+   * through here, so an engine in another session is as selectable as a local one.
+   */
+  hasEngine(engineTabId) {
+    if (!engineTabId) return false;
+    return this.isKconfigEngineOwner(engineTabId) || sessionManager.remoteEngines.has(engineTabId);
+  }
+
+  /** Retrieve an engine (local or remote) by its tab ID. */
+  getEngine(engineTabId) {
+    if (!engineTabId) return null;
+    if (this.kconfigEngines[engineTabId]) return this.kconfigEngines[engineTabId];
+    if (sessionManager.remoteEngines.has(engineTabId)) return sessionManager.remoteEngines.get(engineTabId);
+    return null;
+  }
+
+  /** Broadcast all running engines from this window to other sessions. */
+  broadcastAllActiveEngines() {
+    for (const tabId of this.kconfigEngineTabIds) {
+      const tab = this.findTab(tabId);
+      const eng = this.kconfigEngines[tabId];
+      if (eng) {
+        sessionManager.broadcastEngineAnnounce({
+          tabId,
+          title: tab?.title || `KConfig (${eng.arch})`,
+          version: eng.version || tab?.version,
+          arch: eng.arch || tab?.arch,
+          configName: eng.configName || tab?.configName || "",
+          profileKey: eng.profileKey,
+          assignments: eng.assignments
+        });
+      }
+    }
   }
 
   /**
@@ -290,9 +391,22 @@ class GlobalState {
     if (held === Boolean(enabled)) return;
     if (enabled) {
       this.kconfigEngineTabIds = [...this.kconfigEngineTabIds, tabId];
+      const tab = this.findTab(tabId);
+      const profileKey = tab ? this.kconfigProfileKeyOf(tab) : "";
+      const assignments = normalizeAssignments(this.kconfigProfiles[profileKey] || {});
+      sessionManager.broadcastEngineAnnounce({
+        tabId,
+        title: tab?.title || "KConfig",
+        version: tab?.version || this.currentVersion,
+        arch: tab?.arch || DEFAULT_DEFINITION_ARCH,
+        configName: tab?.configName || "",
+        profileKey,
+        assignments
+      });
     } else {
       this.kconfigEngineTabIds = this.kconfigEngineTabIds.filter((id) => id !== tabId);
       delete this.kconfigEngines[tabId];
+      sessionManager.broadcastEngineRevoke(tabId);
     }
     this.emit("kconfig:engine:changed", { tabId, active: Boolean(enabled), engineTabIds: [...this.kconfigEngineTabIds] });
     this.saveState();
@@ -302,6 +416,9 @@ class GlobalState {
   disableAllKconfigEngines() {
     const had = [...this.kconfigEngineTabIds];
     if (!had.length) return had;
+    for (const tabId of had) {
+      sessionManager.broadcastEngineRevoke(tabId);
+    }
     this.kconfigEngineTabIds = [];
     this.kconfigEngines = {};
     this.emit("kconfig:engine:changed", { tabId: "", active: false, engineTabIds: [] });
@@ -313,6 +430,7 @@ class GlobalState {
   saveKconfigProfileValues(profileKey, values) {
     if (!profileKey) return;
     this.kconfigProfiles[profileKey] = bareAssignments(values);
+    sessionManager.saveSharedKconfigProfiles(this.kconfigProfiles);
     this.saveState();
   }
 
@@ -321,10 +439,22 @@ class GlobalState {
    * publish it as the engine's resolved configuration (what the code tabs following it dim with).
    */
   setKconfigAssignments(tabId, profileKey, values, { version = "", arch = "", configName = "" } = {}) {
-    if (profileKey) this.kconfigProfiles[profileKey] = bareAssignments(values);
+    if (profileKey) {
+      this.kconfigProfiles[profileKey] = bareAssignments(values);
+      sessionManager.saveSharedKconfigProfiles(this.kconfigProfiles);
+    }
     if (tabId && this.isKconfigEngineOwner(tabId)) {
       const assignments = normalizeAssignments(values);
       this.kconfigEngines[tabId] = { tabId, version, arch, configName, profileKey, assignments };
+      // Other sessions follow this engine too: they need the descriptor with the values, since the
+      // tab's ARCH, revision or name may have changed since it announced itself (§5.23)
+      sessionManager.broadcastEngineAssignments(tabId, assignments, {
+        title: this.findTab(tabId)?.title || "",
+        version,
+        arch,
+        configName,
+        profileKey,
+      });
       this.emit("kconfig:assignments:updated", { tabId, assignments });
     }
     this.saveState();
@@ -342,28 +472,30 @@ class GlobalState {
   setKconfigToolchain(profileKey, toolchain) {
     if (toolchain && Object.keys(toolchain).length) this.kconfigToolchains[profileKey] = toolchain;
     else delete this.kconfigToolchains[profileKey];
+    sessionManager.saveSharedKconfigToolchains(this.kconfigToolchains);
     this.saveState();
   }
 
   dropKconfigProfile(profileKey) {
     delete this.kconfigProfiles[profileKey];
+    sessionManager.saveSharedKconfigProfiles(this.kconfigProfiles);
     this.saveState();
   }
 
   /**
    * Engine a tab follows: the tab's own engine for a KConfig tab, the engine a code tab selected
-   * (`tab.kconfigEngineTabId`), or "" when it follows none.
+   * (`tab.kconfigEngineTabId`), or "" when it follows none. Checks both local and remote engines.
    */
   engineTabIdOf(tab) {
     if (!tab) return "";
     if (tab.type === "kconfig") return this.isKconfigEngineOwner(tab.id) ? tab.id : "";
     const picked = tab.kconfigEngineTabId;
-    return picked && this.isKconfigEngineOwner(picked) ? picked : "";
+    return this.hasEngine(picked) ? picked : "";
   }
 
   /**
    * Engine a code tab should follow when it has not picked one: the first engine of the tab's own
-   * revision, or none (the user picks one in the code toolbar themselves).
+   * revision (local or remote), or none (the user picks one in the code toolbar themselves).
    */
   defaultEngineTabIdFor(tab) {
     if (!tab) return "";
@@ -379,7 +511,7 @@ class GlobalState {
   /** Whether that engine (the active tab's by default) is on with a resolved configuration. */
   kconfigConfigActive(engineTabId = null) {
     const id = engineTabId === null ? this.activeEngineTabId() : engineTabId;
-    const engine = id ? this.kconfigEngines[id] : null;
+    const engine = this.getEngine(id);
     if (!engine || !engine.arch) return false;
     return Object.keys(engine.assignments || {}).length / 2 >= MIN_CONFIG_SYMBOLS;
   }
@@ -391,29 +523,26 @@ class GlobalState {
   fallbackEngineTabId() {
     const tab = this.getActiveTab();
     if (tab && (tab.type === "code" || tab.type === "kconfig")) return this.engineTabIdOf(tab);
-    return this.kconfigEngineTabs()[0]?.id || "";
+    return this.kconfigEngineTabs()[0]?.id || sessionManager.getRemoteEngineList()[0]?.tabId || "";
   }
 
   /**
-   * ARCH a new KConfig tab should open on (x86_64 when no engine applies). Unlike
-   * `definitionContext`, a tab that cannot follow an engine falls back to any running one, so
-   * opening a Kconfig symbol from Compare or the documentation lands on the ARCH being configured.
+   * ARCH a new KConfig tab should open on (x86_64 when no engine applies).
    */
   kconfigArch(engineTabId = null) {
     const id = engineTabId === null ? this.fallbackEngineTabId() : engineTabId;
-    return (id && this.kconfigEngines[id]?.arch) || DEFAULT_DEFINITION_ARCH;
+    const engine = this.getEngine(id);
+    return (engine && engine.arch) || DEFAULT_DEFINITION_ARCH;
   }
 
   /**
    * ARCH and configuration deciding which of several per-architecture definitions applies.
-   * An engine with a resolved configuration (the active tab's by default, or the one passed):
-   * its ARCH and values (`strict`: absent symbols are "n"). Otherwise x86_64 with a baseline
-   * (X86, X86_64, 64BIT set, X86_32 not); other symbols are unknown.
+   * An engine with a resolved configuration (local or remote): its ARCH and values.
    */
   definitionContext(engineTabId = null) {
     const id = engineTabId === null ? this.activeEngineTabId() : engineTabId;
     if (this.kconfigConfigActive(id)) {
-      const engine = this.kconfigEngines[id];
+      const engine = this.getEngine(id);
       return { arch: engine.arch, assignments: engine.assignments, strict: true, engineTabId: id };
     }
     return { arch: DEFAULT_DEFINITION_ARCH, assignments: DEFAULT_ARCH_BASELINE, strict: false, engineTabId: "" };
@@ -428,18 +557,22 @@ class GlobalState {
     this.saveState();
   }
 
-
   setSplitMode(mode) {
     if (this.splitMode === mode) return;
     this.splitMode = mode;
 
     if (mode !== "single" && this.panes.length === 1) {
-      // Add second pane
+      // Add second pane with cloned active tab and set it active
+      const activeTab = this.getActiveTab();
+      const clonedTab = activeTab
+        ? { ...activeTab, id: "tab-" + Math.random().toString(36).substring(2, 9) }
+        : null;
       this.panes.push({
         id: "pane-2",
-        activeTabId: null,
-        tabs: []
+        activeTabId: clonedTab ? clonedTab.id : null,
+        tabs: clonedTab ? [clonedTab] : []
       });
+      this.activePaneId = "pane-2";
     } else if (mode === "single" && this.panes.length > 1) {
       // Merge all tabs into pane-1
       const p2Tabs = this.panes[1].tabs;
@@ -501,6 +634,34 @@ class GlobalState {
     return true;
   }
 
+  /**
+   * Merge the view state a tab carries (its search query, its selection, its mode) into it.
+   * A view mutating its own tab saves the session but announces nothing, and the URL only
+   * follows tab and revision changes; an in-tab navigation is announced here instead, as
+   * `tab:state`, which `url_sync` reflects in the hash. It is not `tabs:changed`: that one
+   * redraws the pane, which would throw away the very view that reported the change.
+   */
+  updateTabState(tabId, patch = {}) {
+    const tab = this.findTab(tabId) || this.getActiveTab();
+    if (!tab) return null;
+    let changed = false;
+    for (const [key, value] of Object.entries(patch)) {
+      const empty = value === undefined || value === null || value === "" || value === 0;
+      if (empty) {
+        if (!(key in tab)) continue;
+        delete tab[key];
+      } else {
+        if (tab[key] === value) continue;
+        tab[key] = value;
+      }
+      changed = true;
+    }
+    if (!changed) return tab;
+    this.saveState();
+    this.emit("tab:state", { tabId: tab.id, patch });
+    return tab;
+  }
+
   openTab(tabData, targetPaneId = null) {
     const pane = targetPaneId ? this.getPane(targetPaneId) : this.getActivePane();
     if (!pane) return;
@@ -532,11 +693,16 @@ class GlobalState {
         delete existing.scrollTop;
       }
       if ("diffMarks" in tabData) existing.diffMarks = tabData.diffMarks;
-      if (tabData.symbol) existing.symbol = tabData.symbol;
+      if (tabData.symbol !== undefined) existing.symbol = tabData.symbol;
       if (tabData.title) existing.title = tabData.title;
       if (tabData.threadId !== undefined) existing.threadId = tabData.threadId;
       if (tabData.messageId !== undefined) existing.messageId = tabData.messageId;
       if (tabData.query !== undefined) existing.query = tabData.query;
+      // View state a deep link carries (§5.26): the tab reopened by it comes back on that
+      // search, that selection and that mode, not merely on the right kind of tab
+      if (tabData.listMode !== undefined) existing.listMode = tabData.listMode;
+      if (tabData.filter !== undefined) existing.filter = tabData.filter;
+      if (tabData.commitId !== undefined) existing.commitId = tabData.commitId;
     } else {
       const id = "tab-" + Math.random().toString(36).substring(2, 9);
       // A tab opened from another one inherits that tab's revision, never the header selection
@@ -549,7 +715,6 @@ class GlobalState {
       pane.tabs.push(newTab);
       pane.activeTabId = id;
     }
-
 
     this.emit("tabs:changed", { paneId: pane.id, activeTabId: pane.activeTabId });
     this.saveState();
@@ -569,6 +734,7 @@ class GlobalState {
     if (releasedEngine) {
       this.kconfigEngineTabIds = this.kconfigEngineTabIds.filter((id) => id !== tabId);
       delete this.kconfigEngines[tabId];
+      sessionManager.broadcastEngineRevoke(tabId);
     }
 
     if (pane.activeTabId === tabId) {
@@ -590,9 +756,188 @@ class GlobalState {
     this.saveState();
   }
 
+  // ------------------------------------------------------------------ Cross-window tab transfers
+  /**
+   * Everything that has to travel with a tab dragged out of this window (§5.24.4): the tab itself,
+   * where it came from, and — for a KConfig tab — the engine it is running. The configuration's
+   * values are not carried: they are shared across sessions under `profileKey`
+   * (`sessionManager.saveSharedKconfigProfiles`), so the window taking the tab reads them from there.
+   */
+  tabTransferPayload(tab, sourcePaneId) {
+    if (!tab) return null;
+    const payload = {
+      tabId: tab.id,
+      sourcePaneId,
+      sourceWinId: sessionManager.getWindowId(),
+      sourceSessionId: this.currentSessionId,
+      sourceSessionName: this.currentSessionName,
+      tabData: { ...tab }
+    };
+    if (tab.type === "kconfig") {
+      const engine = this.kconfigEngines[tab.id];
+      payload.kconfig = {
+        engineActive: this.isKconfigEngineOwner(tab.id),
+        profileKey: engine?.profileKey || this.kconfigProfileKeyOf(tab),
+        version: engine?.version || tab.version,
+        arch: engine?.arch || tab.arch,
+        configName: engine?.configName || tab.configName || ""
+      };
+    }
+    return payload;
+  }
+
+  /**
+   * Take a tab dragged in from another window's session. The tab keeps its contents and its
+   * position, and a KConfig tab keeps the engine it was running: the configuration being resolved
+   * travels with it instead of being switched off on the way. Returns the tab as it was inserted.
+   */
+  acceptTransferredTab(payload, targetPaneId = null, targetIndex = null) {
+    const tabData = payload?.tabData;
+    if (!tabData) return null;
+    const pane = targetPaneId ? this.getPane(targetPaneId) : this.getActivePane();
+    if (!pane) return null;
+
+    const tab = { ...tabData };
+    // Tab ids are unique per session, not globally: a duplicate of the source session may be open here
+    if (this.findTab(tab.id)) tab.id = `tab-${Math.random().toString(36).substring(2, 9)}`;
+    if (!GlobalState.refOf(tab.version)) tab.version = this.currentVersion;
+
+    const kc = payload.kconfig || null;
+    const profileKey = kc?.profileKey || (tab.type === "kconfig" ? this.kconfigProfileKeyOf(tab) : "");
+    if (profileKey) {
+      // Configurations and toolchains are shared across sessions, but this window may be holding an
+      // older copy in memory than the one the source window last saved.
+      const sharedProfile = sessionManager.getSharedKconfigProfiles()[profileKey];
+      if (sharedProfile) this.kconfigProfiles[profileKey] = sharedProfile;
+      const sharedToolchain = sessionManager.getSharedKconfigToolchains()[profileKey];
+      if (sharedToolchain) this.kconfigToolchains[profileKey] = sharedToolchain;
+    }
+
+    const idx = targetIndex === null || targetIndex === undefined
+      ? pane.tabs.length
+      : Math.max(0, Math.min(targetIndex, pane.tabs.length));
+    pane.tabs.splice(idx, 0, tab);
+    pane.activeTabId = tab.id;
+    this.setActivePane(pane.id);
+
+    const takesEngine = tab.type === "kconfig" && Boolean(kc?.engineActive) && !this.isKconfigEngineOwner(tab.id);
+    if (takesEngine) {
+      this.kconfigEngineTabIds = [...this.kconfigEngineTabIds, tab.id];
+      const assignments = normalizeAssignments(this.kconfigProfiles[profileKey] || {});
+      this.kconfigEngines[tab.id] = {
+        tabId: tab.id,
+        version: kc.version || tab.version,
+        arch: kc.arch || tab.arch || DEFAULT_DEFINITION_ARCH,
+        configName: kc.configName || tab.configName || "",
+        profileKey,
+        assignments
+      };
+      sessionManager.broadcastEngineAnnounce({
+        tabId: tab.id,
+        title: tab.title || "KConfig",
+        version: this.kconfigEngines[tab.id].version,
+        arch: this.kconfigEngines[tab.id].arch,
+        configName: this.kconfigEngines[tab.id].configName,
+        profileKey,
+        assignments
+      });
+    }
+
+    if (tab.version && tab.version !== this.currentVersion) this.syncVersionFromTab(tab.version);
+    if (takesEngine) {
+      this.emit("kconfig:engine:changed", { tabId: tab.id, active: true, engineTabIds: [...this.kconfigEngineTabIds] });
+    }
+    this.emit("tabs:changed", { paneId: pane.id, activeTabId: pane.activeTabId });
+    this.saveState();
+    return tab;
+  }
+
+  adoptSession(sessionData) {
+    if (!sessionData) return;
+    // The engines of the session this window is leaving stop running here, so the other windows
+    // must forget them: a code tab following one of them would otherwise dim against a
+    // configuration nobody resolves any more (§5.23.5).
+    for (const tabId of this.kconfigEngineTabIds) {
+      if (!sessionData.id || sessionData.id !== this.currentSessionId) {
+        sessionManager.broadcastEngineRevoke(tabId);
+      }
+    }
+    this.currentSessionId = sessionData.id;
+    this.currentSessionName = sessionData.name || "Session";
+    sessionManager.pinSessionToWindow(sessionData.id, this.currentSessionName);
+
+    this.currentVersion = GlobalState.refOf(sessionData.version) || "v3.0";
+    this.selectedVersion = GlobalState.refOf(sessionData.selectedVersion) || this.currentVersion;
+    if (typeof sessionData.repo === "string") this.currentRepo = sessionData.repo;
+    this.splitMode = sessionData.splitMode || "single";
+    this.activePaneId = sessionData.activePaneId || "pane-1";
+    if (Array.isArray(sessionData.panes) && sessionData.panes.length > 0) {
+      sessionData.panes.forEach((p) => {
+        if (Array.isArray(p.tabs)) {
+          p.tabs.forEach((t) => {
+            if (!GlobalState.refOf(t.version)) t.version = "v3.0";
+          });
+        }
+      });
+      this.panes = sessionData.panes;
+    } else {
+      this.panes = [
+        {
+          id: "pane-1",
+          activeTabId: "tab-default",
+          tabs: [
+            {
+              id: "tab-default",
+              type: "code",
+              title: "sched.c",
+              version: this.currentVersion,
+              path: "kernel/sched.c",
+              cursorLine: 1,
+              scrollLine: 1
+            }
+          ]
+        }
+      ];
+    }
+
+    // Shared profiles
+    const sharedProfiles = sessionManager.getSharedKconfigProfiles();
+    this.kconfigProfiles = { ...sharedProfiles, ...(sessionData.kconfigProfiles || {}) };
+    const sharedToolchains = sessionManager.getSharedKconfigToolchains();
+    this.kconfigToolchains = { ...sharedToolchains, ...(sessionData.kconfigToolchains || {}) };
+
+    // Rehydrate engines for live Kconfig tabs
+    const engineIds = Array.isArray(sessionData.kconfigEngineTabIds) ? sessionData.kconfigEngineTabIds : [];
+    this.kconfigEngineTabIds = engineIds.filter((id) => this.findTab(id)?.type === "kconfig");
+    this.kconfigEngines = {};
+    const descriptors = sessionData.kconfigEngineProfiles || {};
+    for (const tabId of this.kconfigEngineTabIds) {
+      const tab = this.findTab(tabId);
+      const d = descriptors[tabId] || {};
+      const profileKey = d.profileKey || this.kconfigProfileKeyOf(tab);
+      this.kconfigEngines[tabId] = {
+        tabId,
+        version: d.version || tab.version,
+        arch: d.arch || tab.arch,
+        configName: d.configName || tab.configName || "",
+        profileKey,
+        assignments: normalizeAssignments(this.kconfigProfiles[profileKey] || {}),
+      };
+    }
+
+    this.saveState();
+    sessionManager.requestRemoteEngines();
+    this.broadcastAllActiveEngines();
+    this.emit("session:adopted", sessionData);
+    this.emit("layout:changed", { splitMode: this.splitMode, panes: this.panes });
+    this.emit("tabs:changed", { paneId: this.activePaneId, activeTabId: this.getActiveTab()?.id });
+    this.emit("version:changed", this.currentVersion);
+  }
+
   saveState() {
     try {
       const stateObj = {
+        name: this.currentSessionName,
         version: this.currentVersion,
         selectedVersion: this.selectedVersion,
         repo: this.currentRepo,
@@ -608,6 +953,14 @@ class GlobalState {
         kconfigProfiles: this.kconfigProfiles,
         kconfigToolchains: this.kconfigToolchains
       };
+
+      if (this.currentSessionId) {
+        sessionManager.saveActiveSession(stateObj);
+      }
+      sessionManager.saveSharedKconfigProfiles(this.kconfigProfiles);
+      sessionManager.saveSharedKconfigToolchains(this.kconfigToolchains);
+
+      // Keep legacy item as backup for non-session consumers
       localStorage.setItem("kernel_ide_state", JSON.stringify(stateObj));
       localDB.set("tabs_state", "current_session", stateObj).catch(() => {});
     } catch (e) {
@@ -617,49 +970,37 @@ class GlobalState {
 
   loadState() {
     try {
-      const saved = localStorage.getItem("kernel_ide_state");
-      if (saved) {
-        const parsed = JSON.parse(saved);
-        this.currentVersion = GlobalState.refOf(parsed.version) || "v3.0";
-        this.selectedVersion = GlobalState.refOf(parsed.selectedVersion) || this.currentVersion;
-        if (typeof parsed.repo === "string") this.currentRepo = parsed.repo;
-        if (parsed.splitMode) this.splitMode = parsed.splitMode;
-        if (parsed.activePaneId) this.activePaneId = parsed.activePaneId;
-        if (Array.isArray(parsed.panes) && parsed.panes.length > 0) {
-          parsed.panes.forEach((p) => {
-            if (Array.isArray(p.tabs)) {
-              p.tabs.forEach((t) => {
-                if (!GlobalState.refOf(t.version)) t.version = "v3.0";
-              });
-            }
-          });
-          this.panes = parsed.panes;
-        }
-        if (parsed.kconfigProfiles && typeof parsed.kconfigProfiles === "object") this.kconfigProfiles = parsed.kconfigProfiles;
-        if (parsed.kconfigToolchains && typeof parsed.kconfigToolchains === "object") this.kconfigToolchains = parsed.kconfigToolchains;
-        // Engines belong to live KConfig tabs (sessions saved before engines were owned by tabs, and
-        // tabs closed since, come back with their engine off; their configurations are kept)
-        const engineIds = Array.isArray(parsed.kconfigEngineTabIds)
-          ? parsed.kconfigEngineTabIds
-          : (typeof parsed.kconfigEngineTabId === "string" && parsed.kconfigEngineTabId ? [parsed.kconfigEngineTabId] : []);
-        this.kconfigEngineTabIds = engineIds.filter((id) => this.findTab(id)?.type === "kconfig");
-        const descriptors = parsed.kconfigEngineProfiles || {};
-        for (const tabId of this.kconfigEngineTabIds) {
-          const tab = this.findTab(tabId);
-          const d = descriptors[tabId] || {};
-          const profileKey = d.profileKey || this.kconfigProfileKeyOf(tab);
-          this.kconfigEngines[tabId] = {
-            tabId,
-            version: d.version || tab.version,
-            arch: d.arch || tab.arch,
-            configName: d.configName || tab.configName || "",
-            profileKey,
-            assignments: normalizeAssignments(this.kconfigProfiles[profileKey] || {}),
-          };
+      const startupSessionId = sessionManager.resolveStartupSessionId();
+      if (startupSessionId) {
+        const sessionData = sessionManager.loadSession(startupSessionId);
+        if (sessionData) {
+          this.adoptSession(sessionData);
+          return true;
         }
       }
+
+      // Load shared profiles
+      this.kconfigProfiles = sessionManager.getSharedKconfigProfiles();
+      this.kconfigToolchains = sessionManager.getSharedKconfigToolchains();
+
+      // Check if any session exists in index
+      const index = sessionManager.getSessionsIndex();
+      if (index.length > 0) {
+        // We have sessions; don't adopt randomly so Session Picker can be shown
+        return false;
+      }
+
+      // Otherwise create a default session
+      const newSession = sessionManager.createSession({
+        name: "Default Session",
+        version: "v3.0",
+        repo: ""
+      });
+      this.adoptSession(newSession);
+      return true;
     } catch (e) {
       console.warn("Failed to load saved state:", e);
+      return false;
     }
   }
 

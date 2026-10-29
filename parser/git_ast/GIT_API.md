@@ -58,6 +58,12 @@ Relational Database Mapping:
 | **38** | `m_git_ref` | `(ref_id, repo_id, ref_type, ref_name, commit_id, tagger_id, tagger_date, tag_message)` | `("ref_id",)` | `False` | Named Git reference (tag or branch), aliased as `m_v_main`. |
 | **39** | `m_commit_parent` | `(commit_id, parent_commit_id, parent_idx)` | `("commit_id", "parent_idx")` | `False` | Directed acyclic graph (DAG) parent lineage per commit. |
 
+### 2.0. Merge Commits Stage No File Rows
+
+Commit file rows and diff hunks both come from one `git log -p -U0` stream (`parse_version_commits_with_hunks`). **`git log -p` prints no diff for a commit with more than one parent**, so a merge commit reaches `parse_commit_log_with_hunks` with an empty patch part and is staged with `files = []` — no `m_commit_file` rows and no `m_bridge_commit_tag` rows, even when the merge resolved a conflict itself (an "evil merge", e.g. `1f922d0770` in `v3.0`, which changes `arch/sparc/include/asm/ptrace.h`).
+
+This is deliberate: `--diff-merges=first-parent` would make each merge repeat the whole delta of the branch it merges, which on the full history up to `v3.0` grows the log stream from ~53 MB to ~734 MB per release range and would re-attribute every merged hunk to the merge commit as well. A merge's first-parent delta is instead resolved from Git **on demand** by the webapp (`webapp/backend/services/git_service.py:_fill_missing_commit_files`, `webapp/API.md` §`/api/commits/{v}/detail/{id}`), which is what keeps the *Modified Files* list in agreement with the commit's rendered diff.
+
 ### 2.1. Staging Example
 
 ```python

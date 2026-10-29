@@ -39,6 +39,29 @@
   max-width: 200px;
 }
 
+.tab.tab-dragging {
+  opacity: 0.35;
+  background: var(--bg-tertiary);
+  border-style: dashed;
+}
+
+.tab-drop-indicator {
+  width: 2px;
+  height: 24px;
+  background: var(--accent-blue);
+  box-shadow: 0 0 6px rgba(88, 166, 255, 0.8);
+  border-radius: 1px;
+  margin: 0 -1px;
+  z-index: 10;
+  pointer-events: none;
+  animation: pulseIndicator 1s ease-in-out infinite;
+}
+
+@keyframes pulseIndicator {
+  0%, 100% { opacity: 0.8; }
+  50% { opacity: 1; transform: scaleY(1.1); }
+}
+
 .tab:hover {
   background: var(--bg-hover);
   color: var(--text-primary);

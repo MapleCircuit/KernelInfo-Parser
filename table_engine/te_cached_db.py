@@ -37,7 +37,13 @@ from typing import TYPE_CHECKING, Any, Callable, Sequence
 from types import TracebackType
 
 from core.globalstuff import JoinsType, PointerGetter, SafeDataType
-from table_engine.shared_buffer import SharedTableBuilder, SharedTablePKView, SharedTableRowSequenceView
+from table_engine.shared_buffer import (
+    estimate_packed_bytes,
+    SharedTableBuilder,
+    SharedTablePKView,
+    SharedTableRowSequenceView,
+    SharedTableSegments,
+)
 from table_engine.te_direct_db import CommitBatch, TEDirectDB
 
 if TYPE_CHECKING:
@@ -55,6 +61,10 @@ class TECachedDB(TEDirectDB):
     CARRIED_TABLES = frozenset({"m_ast_hash", "m_tag_code"})
     # Reload carried tables from the database once rows committed since the snapshot exceed this share of it
     CARRY_RELOAD_RATIO = 0.5
+    # Default budget (MB) of preloaded rows held on the heap before they are packed into a shared-memory
+    # segment and dropped; overridden by `parser.preload_flush_mb`. Preloading every cached table first and
+    # packing afterwards needed the rows twice over (heap plus segment) at its peak.
+    PRELOAD_FLUSH_MB = 512
     # Tables whose committed rows leave the heap at each commit (their keys stay in _committed_pks)
     WRITE_HEAVY_TABLES = frozenset({
         "m_ast_hash", "m_tag_code", "m_blob_symbol_def", "m_ast_container", "m_bridge_tag", "m_bridge_checkpoint", "m_blob_transition",
@@ -79,13 +89,20 @@ class TECachedDB(TEDirectDB):
         # Version-scoped tables preloaded in full from a version on: table_id -> (version column, first version).
         # A primary-key miss at or after that version is final (`_miss_is_final()`).
         self._preload_window: dict[int, tuple[int, int]] = {}
+        try:
+            from core.config import get_parser_config
+            parser_cfg = get_parser_config()
+        except Exception:
+            parser_cfg = {}
         if hugepages is None:
-            try:
-                from core.config import get_parser_config
-                hugepages = get_parser_config().get("hugepages", "auto")
-            except Exception:
-                hugepages = "auto"
+            hugepages = parser_cfg.get("hugepages", "auto")
         self.hugepages: str = str(hugepages).lower().strip()
+        try:
+            flush_mb = max(16, int(parser_cfg.get("preload_flush_mb", self.PRELOAD_FLUSH_MB)))
+        except (TypeError, ValueError):
+            flush_mb = self.PRELOAD_FLUSH_MB
+        # Preloaded rows are packed into a shared-memory segment once a batch reaches this many bytes
+        self.preload_flush_bytes: int = flush_mb * 1024 * 1024
 
     def _is_cached(self, table: Table) -> bool:
         """Check if target table is configured for in-memory caching."""
@@ -210,10 +227,8 @@ class TECachedDB(TEDirectDB):
             self._pk_index[table_id][pk] = row
 
         # 2. Deduplication Index (for no_duplicate=True tables)
-        if table.no_duplicate and len(row) > 1:
-            if all(c is not None for c in row[1:]):
-                nodup_key = self._sanitize_key(row[1:])
-                self._nodup_index[table_id][nodup_key] = int(row[0]) if isinstance(row[0], int) else row[0]
+        if table.no_duplicate:
+            self._index_nodup_row(table, row)
 
         # 3. Secondary Column Indices (Skip columns covered by Primary Key to eliminate redundant memory allocations)
         for col_idx in range(table.length):
@@ -224,6 +239,16 @@ class TECachedDB(TEDirectDB):
                 if val is not None:
                     val = bytes(val) if isinstance(val, (bytearray, memoryview)) else val
                     self._col_indices[table_id].setdefault(col_idx, {}).setdefault(val, []).append(row)
+
+    def _index_nodup_row(self, table: Table, row: tuple[SafeDataType, ...]) -> None:
+        """Index a row's deduplication key, the one index a shared-memory backed table keeps on the heap.
+
+        Its primary-key and column lookups are answered by its segment, but a deduplication key is the
+        whole row minus its id, which no index inside the segment is keyed by.
+        """
+        if len(row) > 1 and all(c is not None for c in row[1:]):
+            nodup_key = self._sanitize_key(row[1:])
+            self._nodup_index[table.table_id][nodup_key] = int(row[0]) if isinstance(row[0], int) else row[0]
 
     def _unindex_row(self, table: Table, row: tuple[SafeDataType, ...]) -> None:
         """Remove row from internal indices prior to updating."""
@@ -424,106 +449,75 @@ class TECachedDB(TEDirectDB):
         skip_carried_load = reuse_carried or rebuilt_rows is not None
 
         min_active_vid = self._get_min_active_vid()
+        # Tables read but not packed yet, and the shared-memory bytes they are estimated to take. A batch is
+        # packed and dropped from the heap once it reaches `preload_flush_bytes`, before the next table is read.
+        segments = SharedTableSegments()
+        pending: dict[int, list[tuple[SafeDataType, ...]]] = {}
+        pending_bytes = 0
+        pack_shared = self.hugepages != "off"
 
         for table in self.tables.values():
             table_id = table.table_id
             if skip_carried_load and table_id in carried_ids:
                 continue
             self._ensure_table(table_id)
+            if not (self._is_cached(table) and self.db is not None):
+                continue
 
-            if self._is_cached(table) and self.db is not None:
-                is_v_scoped = self._is_version_scoped(table)
-                cached_cols = getattr(table, "cached_columns", None)
-                min_vid = min_active_vid if (is_v_scoped and min_active_vid > 0) else None
+            rows = self._load_preload_rows(table, min_active_vid)
+            if rows and table_id in carried_rows:
+                # Packed into the carried buffer below: no heap indexing for rows about to be replaced
+                carried_rows[table_id] = rows
+                continue
+            if not rows and table.initial_insert:
+                # The table holds no rows (or could not be read): its seed rows are the baseline
+                rows = [self._project_row(table, row) for row in table.initial_insert]
+            if not rows:
+                continue
 
-                try:
-                    if hasattr(self.db, "select_preload"):
-                        raw_rows = self.db.select_preload(table, cached_columns=cached_cols, min_vid=min_vid)
-                    else:
-                        joins: JoinsType = (((table.table_id, 0),),)
-                        cols = (None,) * table.length
-                        raw_rows = self.db.view_select_multiple(self.tables, joins, cols)
-                except Exception:
-                    raw_rows = None
-                else:
-                    vid_col = self._get_vid_col_idx(table) if getattr(table, "version_scoped", False) else None
-                    if vid_col is not None:
-                        self._preload_window[table_id] = (vid_col, min_vid or 0)
-                    if table.no_duplicate and not is_v_scoped:
-                        # The query returned every row, so the index below answers every deduplication key
-                        self._nodup_complete.add(table_id)
+            if not pack_shared:
+                for proj_row in rows:
+                    self._cache_row(table, proj_row)
+                continue
 
-                if raw_rows:
-                    is_partial_query = (
-                        cached_cols is not None
-                        and len(cached_cols) < table.length
-                        and hasattr(self.db, "select_preload")
-                    )
-                    for row in raw_rows:
-                        if is_partial_query:
-                            proj_row = self._reconstruct_partial_row(table, row, cached_cols)
-                        else:
-                            # Fallback version check if driver did not filter
-                            if is_v_scoped and min_active_vid > 0 and not hasattr(self.db, "select_preload"):
-                                vid_col = self._get_vid_col_idx(table)
-                                if vid_col is not None and row[vid_col] is not None and row[vid_col] < min_active_vid:
-                                    continue
-                            proj_row = self._project_row(table, row)
-                        if table_id in carried_rows:
-                            # Packed into the carried buffer below: no heap indexing for rows about to be replaced
-                            carried_rows[table_id].append(proj_row)
-                            continue
-                        self._cache_row(table, proj_row)
-                elif table.initial_insert:
-                    for row in table.initial_insert:
-                        self._cache_row(table, self._project_row(table, row))
+            # These rows are about to live in a segment: only the deduplication index survives packing,
+            # so the primary-key, position and column indices are never built for them.
+            if table.no_duplicate:
+                for proj_row in rows:
+                    self._index_nodup_row(table, proj_row)
+            pending[table_id] = rows
+            pending_bytes += estimate_packed_bytes(table.length, rows)
+            del rows
+            if pending_bytes >= self.preload_flush_bytes:
+                self._flush_preload_batch(pending, segments)
+                pending_bytes = 0
 
         # Nothing to carry on an empty database: the first version keeps the heap cache and its eviction
         if carried_rows and not (any(carried_rows.values()) and self._build_carried(carried_rows)):
             for table_id, rows in carried_rows.items():
                 for proj_row in rows:
                     self._cache_row(self.tables[table_id], proj_row)
+        carried_rows = {}
+
+        self._flush_preload_batch(pending, segments)
+        self._shared_buffer = segments if segments else None
 
         for table in self.tables.values():
             t_id = table.table_id
-            if t_id in self._carried_overlays:
+            if t_id in self._carried_overlays or segments.contains_table(t_id):
+                # A packed or carried table resolves committed keys through its segment and overlay instead
                 continue
             if table.no_duplicate:
                 self._committed_nodup_keys[t_id] = dict(self._nodup_index.get(t_id, {}))
             if getattr(table, "init_primary", ()) == ("hash",) or table.table_name in ("m_tag_code", "m_ast_hash"):
                 self._committed_pks[t_id] = set(self._pk_index.get(t_id, {}).keys())
 
-        # Build structured shared memory segment with huge pages if enabled (carried tables have their own)
-        version_tables = [t for t in self.tables.values() if t.table_id not in self._carried_overlays]
-        if self.hugepages != "off" and any(self._cached_rows.get(t.table_id) for t in version_tables):
-            try:
-                builder = SharedTableBuilder(mode=self.hugepages)
-                for table in version_tables:
-                    t_id = table.table_id
-                    rows = self._cached_rows.get(t_id, [])
-                    if rows:
-                        builder.add_table(t_id, table.length, table.primary, rows)
-                self._shared_buffer = builder.build()
-                if self._shared_buffer:
-                    # Replace heap cache structures with zero-copy shared memory views
-                    # to prevent duplicate memory usage across heap and mmap while satisfying sequence/dict lookups.
-                    for t_id in self._shared_buffer.tables:
-                        self._cached_rows[t_id] = SharedTableRowSequenceView(self._shared_buffer, t_id)
-                        self._cached_rows_pos[t_id] = {}
-                        self._pk_index[t_id] = SharedTablePKView(self._shared_buffer, t_id)
-                        self._col_indices[t_id] = {}
-                        self._committed_pks[t_id] = set()
-                        self._committed_nodup_keys[t_id] = {}
-                    from core.globalstuff import reclaim_system_memory
-                    reclaim_system_memory()
-                    logger.info(
-                        f"[TECachedDB] Backed {len(self._shared_buffer.tables)} tables "
-                        f"({self._shared_buffer.total_size // (1024*1024)}MB) with structured shared memory "
-                        f"(page size: {self._shared_buffer.page_size // 1024}KB, mode: {self.hugepages}) and activated zero-copy views."
-                    )
-            except Exception as e:
-                logger.warning(f"[TECachedDB] Failed to build shared huge page buffer: {e}. Falling back to standard heap.")
-                self._shared_buffer = None
+        if segments:
+            logger.info(
+                f"[TECachedDB] Backed {len(segments.tables)} tables ({segments.total_size // (1024*1024)}MB) with "
+                f"structured shared memory in {len(segments)} segment(s) "
+                f"(page size: {segments.page_size // 1024}KB, mode: {self.hugepages}) and activated zero-copy views."
+            )
         if self._carried_overlays:
             carried = ", ".join(
                 f"{self.tables[t_id].table_name} {self._carried_reader.tables[t_id]['row_count']:,}+{len(overlay):,}"
@@ -536,6 +530,102 @@ class TECachedDB(TEDirectDB):
             else:
                 how = "Loaded"
             logger.info(f"[TECachedDB] {how} carried tables (snapshot+since): {carried}")
+
+    def _load_preload_rows(self, table: Table, min_active_vid: int) -> list[tuple[SafeDataType, ...]]:
+        """Read a cached table's preload window from the database and project its rows.
+
+        The driver's list is drained as the projected rows are built, so a table is never held twice over.
+        Returns an empty list when the table has no rows in the window or could not be read.
+        """
+        table_id = table.table_id
+        is_v_scoped = self._is_version_scoped(table)
+        cached_cols = getattr(table, "cached_columns", None)
+        min_vid = min_active_vid if (is_v_scoped and min_active_vid > 0) else None
+        has_preload = hasattr(self.db, "select_preload")
+
+        try:
+            if has_preload:
+                raw_rows = self.db.select_preload(table, cached_columns=cached_cols, min_vid=min_vid)
+            else:
+                joins: JoinsType = (((table.table_id, 0),),)
+                raw_rows = self.db.view_select_multiple(self.tables, joins, (None,) * table.length)
+        except Exception:
+            return []
+
+        vid_col = self._get_vid_col_idx(table) if getattr(table, "version_scoped", False) else None
+        if vid_col is not None:
+            self._preload_window[table_id] = (vid_col, min_vid or 0)
+        if table.no_duplicate and not is_v_scoped:
+            # The query returned every row, so the index built below answers every deduplication key
+            self._nodup_complete.add(table_id)
+        if not raw_rows:
+            return []
+
+        is_partial_query = cached_cols is not None and len(cached_cols) < table.length and has_preload
+        # Fallback version check if the driver did not filter
+        fallback_vid_col = (
+            self._get_vid_col_idx(table) if (is_v_scoped and min_active_vid > 0 and not has_preload) else None
+        )
+        if not isinstance(raw_rows, list):
+            raw_rows = list(raw_rows)
+        # Hand the rows over one at a time, in order: the driver's list shrinks as the projected one grows
+        raw_rows.reverse()
+        rows: list[tuple[SafeDataType, ...]] = []
+        while raw_rows:
+            row = raw_rows.pop()
+            if is_partial_query:
+                rows.append(self._reconstruct_partial_row(table, row, cached_cols))
+                continue
+            if fallback_vid_col is not None and row[fallback_vid_col] is not None and row[fallback_vid_col] < min_active_vid:
+                continue
+            rows.append(self._project_row(table, row))
+        return rows
+
+    def _attach_shared_views(self, reader: Any, table_id: int) -> None:
+        """Expose a packed table through zero-copy views over its segment, dropping its heap structures.
+
+        The segment answers primary-key probes and scans, so the heap keeps no rows, positions or column
+        index for it; rows staged afterwards land in the views' local overlay.
+        """
+        self._cached_rows[table_id] = SharedTableRowSequenceView(reader, table_id)
+        self._cached_rows_pos[table_id] = {}
+        self._pk_index[table_id] = SharedTablePKView(reader, table_id)
+        self._col_indices[table_id] = {}
+        self._committed_pks[table_id] = set()
+        self._committed_nodup_keys[table_id] = {}
+
+    def _flush_preload_batch(self, pending: dict[int, list[tuple[SafeDataType, ...]]], segments: SharedTableSegments) -> None:
+        """Pack the preloaded tables held on the heap into their own shared-memory segment and free them.
+
+        Called while preloading, as soon as a batch reaches `preload_flush_bytes`, and once more for the
+        remainder: the heap then holds one batch at a time instead of every cached table at once. A segment
+        that cannot be allocated leaves its batch in the heap cache, fully indexed, as before.
+        """
+        if not pending:
+            return
+        try:
+            builder = SharedTableBuilder(mode=self.hugepages)
+            for t_id, rows in pending.items():
+                table = self.tables[t_id]
+                builder.add_table(t_id, table.length, table.primary, rows)
+            reader = builder.build()
+        except Exception as e:
+            logger.warning(f"[TECachedDB] Failed to pack a preload batch into shared memory: {e}. Falling back to standard heap.")
+            reader = None
+        if reader is None:
+            for t_id, rows in pending.items():
+                table = self.tables[t_id]
+                for proj_row in rows:
+                    self._cache_row(table, proj_row)
+            pending.clear()
+            return
+        segments.add_segment(reader)
+        for t_id in pending:
+            self._attach_shared_views(reader, t_id)
+        # The rows now live in the segment: release the heap copy before the next tables are read
+        pending.clear()
+        from core.globalstuff import reclaim_system_memory
+        reclaim_system_memory()
 
     def _cache_row(self, table: Table, proj_row: tuple[SafeDataType, ...]) -> None:
         """Append a preloaded row to the heap cache and index it."""

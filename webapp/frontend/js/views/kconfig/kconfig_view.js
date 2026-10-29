@@ -38,6 +38,9 @@ export class KconfigView {
     this.currentVersion = "v3.0";
     this.selectedSymbol = null;
     this.selectedNodeId = null;
+    // Text typed in the tree filter box; kept on the tab and in the URL so a copied link
+    // reopens this tab on the same search (§5.26)
+    this.searchQuery = "";
     this.expandedNodeIds = new Set();
     this.containerEl = null;
     this.archPresets = [];
@@ -55,8 +58,9 @@ export class KconfigView {
     // This tab's engine can be switched off elsewhere (the command palette's *Disable every KConfig
     // engine*, a tab being closed): follow it so the toolbar and the tree never claim an engine this
     // tab lost. Engines of other tabs are none of this view's business.
-    this.unsubscribeEngine = state.subscribe("kconfig:engine:changed", ({ tabId } = {}) => {
+    this.unsubscribeEngine = state.subscribe("kconfig:engine:changed", ({ tabId, remote } = {}) => {
       if (this.selfEngineChange) return;
+      if (remote) return; // an engine of another session: this tab neither gained nor lost its own
       if (!this.containerEl || !this.containerEl.isConnected) return;
       if (!state.findTab(this.tabId)) return; // this tab is being closed
       if (tabId && tabId !== this.tabId) return; // another tab's engine
@@ -121,6 +125,7 @@ export class KconfigView {
     this.currentVersion = tabData.version || state.currentVersion;
     this.currentArch = tabData.arch || DEFAULT_ARCH;
     this.configName = tabData.configName || "";
+    this.searchQuery = tabData.query || "";
     // A revision or ARCH switch can land on another tab's configuration: take a free name instead
     const ownTab = state.findTab(this.tabId);
     if (ownTab) {
@@ -139,6 +144,8 @@ export class KconfigView {
               <select id="kconfig-arch-select" style="flex:1;" title="ARCH value passed to kconfig (decides which Kconfig files and definitions apply)">
                 <option value="${escapeHtml(this.currentArch)}">${escapeHtml(this.currentArch)}</option>
               </select>
+            </div>
+            <div class="kconfig-btn-row">
               <button class="code-btn" id="btn-toolchain" title="Compiler, linker, environment variables and toolchain checks Kconfig depends on">Toolchain…</button>
               <button class="code-btn" id="btn-open-tui" title="Open terminal-style menuconfig">TUI</button>
             </div>
@@ -147,7 +154,7 @@ export class KconfigView {
               <button class="code-btn" id="btn-duplicate-config" title="Open a copy of this configuration in a new tab (named v2, v3, …)">⧉ Duplicate</button>
             </div>
             <div class="kconfig-search-box">
-              <input type="text" placeholder="Search symbols or prompts..." id="kconfig-search-input" />
+              <input type="text" placeholder="Search symbols or prompts..." id="kconfig-search-input" value="${escapeHtml(this.searchQuery)}" />
             </div>
             <div class="kconfig-btn-row">
               <button class="code-btn ${this.engineActive ? "active" : ""}" id="btn-toggle-engine" title="Constraint engine: only values kconfig accepts can be set (several tabs may run one)">${this.engineActive ? "✓ Engine Active" : "⚡ Enable Engine"}</button>
@@ -191,7 +198,7 @@ export class KconfigView {
     }
 
     await this.activateArch(this.currentArch);
-    if (tabData && tabData.symbol) this.selectAndInspectSymbol(tabData.symbol);
+    if (tabData && tabData.symbol) this.selectAndInspectSymbol(tabData.symbol, { keepFilter: Boolean(this.searchQuery) });
     // The command palette may have asked this tab to take the engine while it was in the background
     if (state.takeKconfigEngineRequest(this.tabId)) this.setEngineActive(true);
   }
@@ -228,7 +235,11 @@ export class KconfigView {
     c.querySelector("#btn-compare-config").onclick = () => this.showCompareModal();
 
     const searchInput = c.querySelector("#kconfig-search-input");
-    searchInput.oninput = () => this.filterTree(searchInput.value.trim());
+    searchInput.oninput = () => {
+      this.searchQuery = searchInput.value.trim();
+      this.filterTree(this.searchQuery);
+      this.persistTabState({ query: this.searchQuery });
+    };
   }
 
   fillArchSelect() {
@@ -248,19 +259,22 @@ export class KconfigView {
   // ------------------------------------------------------------------ configuration lifecycle
   /** Load the ARCH's model and restore its saved configuration (or its default defconfig). */
   async activateArch(arch) {
-    if (this.currentArch !== arch) {
+    const archChanged = this.currentArch !== arch;
+    if (archChanged) {
       this.expandedNodeIds.clear();
       this.selectedSymbol = null;
       this.selectedNodeId = null;
     }
     this.currentArch = arch;
-    // The tab carries the ARCH and the name the profile key is built from, so update it first
+    // The tab carries the ARCH and the name the profile key is built from, so update it first.
+    // The switch goes through the store so the URL follows it (§5.26), and a real switch drops
+    // the inspected symbol: it was a symbol of the ARCH being left. Re-activating the same ARCH
+    // (what every render does) keeps it, or a deep link's `sym` would be dropped before it is read.
     const ownTab = state.findTab(this.tabId);
     if (ownTab && ownTab.type === "kconfig") {
-      ownTab.arch = arch;
+      this.persistTabState(archChanged ? { arch, symbol: "" } : { arch });
       this.configName = state.ensureUniqueKconfigConfigName(ownTab);
-      ownTab.title = this.tabTitle();
-      state.saveState();
+      this.persistTabState({ configName: this.configName, title: this.tabTitle() });
     }
     const select = this.containerEl?.querySelector("#kconfig-arch-select");
     if (select) select.value = arch;
@@ -734,7 +748,7 @@ export class KconfigView {
     return this.nodes[ids.find((id) => this.nodes[id].prompt) ?? ids[0]];
   }
 
-  selectAndInspectSymbol(symbolName) {
+  selectAndInspectSymbol(symbolName, { keepFilter = false } = {}) {
     if (!symbolName) return;
     const clean = symbolName.startsWith("CONFIG_") ? symbolName.slice(7) : symbolName;
     const node = this.primaryNode(clean);
@@ -742,8 +756,13 @@ export class KconfigView {
       // An entry menuconfig hides is listed anyway so the inspected symbol can be reached
       if (!this.nodeVisible(node) && node.prompt) this.showUnmet = true;
       this.expandAncestors(node.id);
+      // Reaching the symbol in the tree means leaving the flat match list, unless the filter is
+      // what a deep link asked for: then both the search and the symbol are restored (§5.26)
       const searchInput = this.containerEl?.querySelector("#kconfig-search-input");
-      if (searchInput) searchInput.value = "";
+      if (searchInput && !keepFilter) {
+        searchInput.value = "";
+        this.searchQuery = "";
+      }
     }
     this.selectedSymbol = clean;
     this.selectedNodeId = node ? node.id : null;
@@ -752,18 +771,26 @@ export class KconfigView {
     if (row) row.scrollIntoView({ block: "nearest", behavior: "smooth" });
     this.inspectSymbol(clean, node?.id);
 
-    const activeTab = state.getActiveTab();
-    if (activeTab && activeTab.type === "kconfig") {
-      activeTab.symbol = clean;
-      activeTab.title = `KConfig (${clean})`;
-      state.saveState();
-    }
+    this.persistTabState({
+      symbol: clean,
+      query: this.searchQuery,
+      title: `KConfig (${clean})`
+    });
+  }
+
+  /**
+   * Record on this tab (and so in its URL, §5.26) what this view is showing. A view whose
+   * element was replaced by a re-render is stale: its state is nobody's address any more.
+   */
+  persistTabState(patch) {
+    if (!this.containerEl || !this.containerEl.isConnected) return null;
+    return state.updateTabState(this.tabId, patch);
   }
 
   renderTree() {
     const scrollEl = this.containerEl?.querySelector("#kconfig-tree-scroll");
     if (!scrollEl || !this.engine.loaded) return;
-    const query = this.containerEl.querySelector("#kconfig-search-input")?.value.trim();
+    const query = this.containerEl.querySelector("#kconfig-search-input")?.value.trim() ?? this.searchQuery;
     if (query) {
       this.filterTree(query);
       return;
@@ -849,6 +876,7 @@ export class KconfigView {
       this.selectedSymbol = node.sym;
       this.selectedNodeId = node.id;
       this.inspectSymbol(node.sym, node.id);
+      this.persistTabState({ symbol: node.sym });
     };
     row.ondblclick = () => toggleExpand();
     row.addEventListener("auxclick", (e) => {
@@ -863,6 +891,8 @@ export class KconfigView {
   selectAndRevealNode(node) {
     const searchInput = this.containerEl?.querySelector("#kconfig-search-input");
     if (searchInput) searchInput.value = "";
+    this.searchQuery = "";
+    this.persistTabState({ query: "" });
     this.expandAncestors(node.id);
     this.expandedNodeIds.add(node.id);
     this.renderTree();

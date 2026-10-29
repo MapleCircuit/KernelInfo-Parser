@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -228,6 +229,39 @@ class TestMailingListService(unittest.TestCase):
         res_cached = self.service.search(query="fix", page=1, limit=10, filter_type="patch")
         self.assertEqual(res_cached["total"], 12)
         self.assertEqual(mock_client.search_emails.call_count, 1)
+
+    @staticmethod
+    def _dated_rows() -> dict[str, object]:
+        """One past-dated and one future-dated search row, as the archive returns them."""
+        now = int(time.time())
+        return {
+            "total": 40,
+            "results": [
+                {"num": 2, "message_id": "future@k.org", "subject": "Dated ahead", "timestamp": now + 86400 * 400},
+                {"num": 1, "message_id": "past@k.org", "subject": "Dated now", "timestamp": now - 3600},
+            ],
+        }
+
+    def test_browse_listing_excludes_future_dated_messages(self) -> None:
+        mock_client = MagicMock()
+        mock_client.search_emails.return_value = self._dated_rows()
+        self.service._client = mock_client
+
+        res = self.service.search(query="", page=1, limit=10, filter_type="all")
+        mids = [r["message_id"] for r in res["results"]]
+        self.assertEqual(mids, ["past@k.org"])
+        # The reported total loses exactly what the page dropped.
+        self.assertEqual(res["total"], 39)
+
+    def test_explicit_query_keeps_future_dated_messages(self) -> None:
+        mock_client = MagicMock()
+        mock_client.search_emails.return_value = self._dated_rows()
+        self.service._client = mock_client
+
+        res = self.service.search(query="dated", page=1, limit=10, filter_type="all")
+        mids = [r["message_id"] for r in res["results"]]
+        self.assertEqual(mids, ["future@k.org", "past@k.org"])
+        self.assertEqual(res["total"], 40)
 
 
 class TestSeriesVersionDiscovery(unittest.TestCase):

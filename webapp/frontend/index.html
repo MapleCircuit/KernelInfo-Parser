@@ -63,6 +63,13 @@
           <button id="version-apply-btn" class="version-apply-btn" type="button" title="Switch the current tab to the selected revision">Apply</button>
           <button id="version-newtab-btn" class="version-newtab-btn" type="button" title="Open a repository explorer on the selected revision in a new tab">New Tab</button>
         </div>
+        <div class="session-selector-container" id="session-selector-container">
+          <button id="session-picker-btn" class="session-picker-btn" type="button" title="Workspace Sessions">
+            <span>🗂</span>
+            <span id="session-picker-label">Default Session</span>
+            <span style="font-size: 9px; color: var(--text-muted);">▾</span>
+          </button>
+        </div>
       </div>
       <div class="header-right">
         <button id="global-search-btn" class="global-search-btn" type="button" title="Search files, symbols, commits and Kconfig options (Ctrl+K) · commands (Ctrl+Shift+P)">
@@ -103,6 +110,9 @@
       <nav id="sidebar">
         <div class="sidebar-header">
           <span>Repository Explorer</span>
+          <button class="sidebar-collapse-btn" id="sidebar-collapse" title="Collapse sidebar" aria-label="Collapse sidebar" aria-controls="sidebar" aria-expanded="true">
+            <svg viewBox="0 0 16 16"><path d="M10.47 3.72a.75.75 0 0 1 0 1.06L7.31 8l3.16 3.22a.75.75 0 1 1-1.07 1.06l-3.69-3.75a.75.75 0 0 1 0-1.06l3.69-3.75a.75.75 0 0 1 1.07 0z"/><path d="M13.25 2.5a.75.75 0 0 1 .75.75v9.5a.75.75 0 0 1-1.5 0v-9.5a.75.75 0 0 1 .75-.75z"/></svg>
+          </button>
         </div>
         <div class="sidebar-content" id="sidebar-tree-root"></div>
       </nav>

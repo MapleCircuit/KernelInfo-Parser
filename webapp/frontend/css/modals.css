@@ -238,6 +238,7 @@
 .toast.success { border-left: 4px solid var(--accent-green); }
 .toast.error { border-left: 4px solid var(--accent-red); }
 .toast.info { border-left: 4px solid var(--accent-blue); }
+.toast.warning { border-left: 4px solid var(--accent-yellow); }
 
 @keyframes toastIn {
   from { opacity: 0; transform: translateY(12px); }
@@ -1081,3 +1082,207 @@
 .symhist-commit code { color: var(--accent-blue); cursor: pointer; }
 .symhist-commit .symhist-commit-subject { flex: 1; color: var(--text-primary); }
 .symhist-commit .symhist-commit-meta { color: var(--text-muted); white-space: nowrap; }
+
+/* Session Picker & Management Modal */
+.session-modal-backdrop {
+  z-index: 10500;
+}
+
+.session-modal-content {
+  max-height: 80vh;
+}
+
+.session-modal-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 16px;
+  overflow-y: auto;
+  max-height: calc(80vh - 80px);
+}
+
+.session-card {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-md);
+  padding: 12px 16px;
+  cursor: pointer;
+  transition: border-color var(--transition-fast), background var(--transition-fast);
+}
+
+.session-card:hover {
+  background: var(--bg-hover);
+  border-color: var(--accent-blue);
+}
+
+.session-card.current-session {
+  border-color: var(--accent-blue);
+  box-shadow: inset 2px 0 0 var(--accent-blue);
+}
+
+.session-card-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.session-card-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.session-card-name-group {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.session-card-name {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.session-card-badge {
+  font-size: 10px;
+  padding: 1px 6px;
+  border-radius: 10px;
+  background: rgba(88, 166, 255, 0.15);
+  color: var(--accent-blue);
+  border: 1px solid rgba(88, 166, 255, 0.3);
+}
+
+.session-card-time {
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.session-card-meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+
+.session-meta-tag {
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-color);
+  padding: 1px 6px;
+  border-radius: var(--radius-sm);
+  font-family: var(--font-mono);
+  font-size: 10px;
+}
+
+.session-card-tabs {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  margin-top: 2px;
+}
+
+.session-tab-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 10px;
+  color: var(--text-muted);
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-muted);
+  padding: 2px 6px;
+  border-radius: 3px;
+  max-width: 140px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.session-tab-chip .chip-type {
+  font-weight: 600;
+  color: var(--accent-blue);
+  text-transform: uppercase;
+}
+
+.session-card-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.session-btn {
+  padding: 4px 10px;
+  border-radius: var(--radius-sm);
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: var(--transition-fast);
+}
+
+.session-btn-open {
+  background: var(--accent-blue);
+  color: #fff;
+  border: 1px solid transparent;
+}
+
+.session-btn-open:hover {
+  background: #4a94e8;
+}
+
+.session-btn-duplicate {
+  background: var(--bg-tertiary);
+  color: var(--text-primary);
+  border: 1px solid var(--border-color);
+}
+
+.session-btn-duplicate:hover {
+  background: var(--bg-hover);
+  border-color: var(--accent-blue);
+  color: var(--accent-blue);
+}
+
+.session-btn-delete {
+  background: transparent;
+  color: var(--text-muted);
+  border: 1px solid transparent;
+  font-size: 14px;
+  padding: 4px 8px;
+}
+
+.session-btn-delete:hover {
+  background: rgba(248, 81, 73, 0.15);
+  color: var(--accent-red);
+  border-color: rgba(248, 81, 73, 0.3);
+}
+
+.session-btn-primary {
+  padding: 5px 12px;
+  border-radius: var(--radius-sm);
+  background: var(--accent-green);
+  color: #fff;
+  border: 1px solid transparent;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: var(--transition-fast);
+}
+
+.session-btn-primary:hover {
+  background: #34a853;
+}
+
+.session-empty-state {
+  text-align: center;
+  padding: 32px 16px;
+  color: var(--text-secondary);
+}
+

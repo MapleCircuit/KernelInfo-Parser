@@ -6,6 +6,8 @@ import { state } from "../../state.js";
 import { debounce } from "../../utils/debounce.js";
 import { showPersonModal } from "../../components/person_modal.js";
 import { toast } from "../../components/toast.js";
+import { copyToClipboard } from "../../utils/clipboard.js";
+import { contextMenu } from "../../components/context_menu.js";
 
 const STATUS_COLORS = { A: "var(--accent-green)", D: "var(--accent-red)", R: "#d2a8ff", M: "var(--accent-yellow)" };
 // Files whose diff is longer than this start collapsed in the inline commit diff
@@ -36,8 +38,63 @@ function changedRanges(file, kind) {
   return ranges;
 }
 
+/** A commit hash rendered as a one-click copy target; the full hash is copied whatever is shown. */
+function hashHtml(hash, { short = false, cls = "" } = {}) {
+  const full = String(hash ?? "");
+  if (!full) return "";
+  const label = short ? full.slice(0, 7) : full;
+  return `<span class="commit-hash copy-hash ${cls}" data-hash="${escapeHtml(full)}" role="button" tabindex="0" title="Click to copy ${escapeHtml(full)} - right-click for commit actions">${escapeHtml(label)}</span>`;
+}
+
+/**
+ * Copy-on-click and a right-click menu for every .copy-hash inside a container (delegated, so
+ * re-renders stay live). `onContext` receives the hash and opens the menu for it.
+ */
+function attachHashCopy(rootEl, onContext) {
+  if (!rootEl || rootEl.dataset.hashCopyBound === "1") return;
+  rootEl.dataset.hashCopyBound = "1";
+  const copy = async (el) => {
+    const hash = el.dataset.hash;
+    if (!hash) return;
+    if (await copyToClipboard(hash)) {
+      el.classList.add("copied");
+      setTimeout(() => el.classList.remove("copied"), 900);
+      toast.success(`Copied ${hash.slice(0, 12)}… to clipboard`);
+    } else {
+      toast.error("Failed to copy the commit hash");
+    }
+  };
+  // Capture phase: the hash sits inside clickable commit cards, whose own handler would otherwise
+  // run first - copying a hash must not also select or re-open the commit
+  rootEl.addEventListener("click", (e) => {
+    const el = e.target.closest(".copy-hash");
+    if (!el || !rootEl.contains(el)) return;
+    e.preventDefault();
+    e.stopPropagation();
+    // The event never reaches the document, which is what closes an open menu
+    contextMenu.hide();
+    copy(el);
+  }, true);
+  rootEl.addEventListener("keydown", (e) => {
+    if (e.key !== "Enter" && e.key !== " ") return;
+    const el = e.target.closest(".copy-hash");
+    if (!el || !rootEl.contains(el)) return;
+    e.preventDefault();
+    e.stopPropagation();
+    copy(el);
+  }, true);
+  rootEl.addEventListener("contextmenu", (e) => {
+    const el = e.target.closest(".copy-hash");
+    if (!el || !rootEl.contains(el) || !el.dataset.hash) return;
+    e.preventDefault();
+    e.stopPropagation();
+    if (onContext) onContext(el.dataset.hash, e);
+  }, true);
+}
+
 export class CommitsView {
   constructor() {
+    this.tabId = null;
     this.currentVersion = "v3.0";
     this.commits = [];
     this.selectedCommitId = null;
@@ -56,6 +113,7 @@ export class CommitsView {
 
   async render(containerEl, tabData) {
     this.containerEl = containerEl;
+    this.tabId = tabData.id || null;
     this.currentVersion = tabData.version || state.currentVersion;
     if (tabData.commitId) {
       this.selectedCommitId = tabData.commitId;
@@ -85,12 +143,24 @@ export class CommitsView {
       </div>
     `;
 
+    // One delegated listener covers every hash in the list, the detail pane and the diff panel
+    attachHashCopy(containerEl, (hash, e) => {
+      contextMenu.showCommitHashMenu(e.clientX, e.clientY, {
+        hash,
+        version: this.currentVersion,
+        // A hash of a commit already in the timeline is inspected in place; anything else (a parent
+        // commit outside the loaded range) falls back to the menu's own "open a tab" behaviour
+        onView: (full) => this.selectLoadedCommit(full),
+      });
+    });
+
     const searchInput = containerEl.querySelector("#commit-search-input");
     if (this.currentQuery && searchInput) {
       searchInput.value = this.currentQuery;
     }
 
     const debouncedSearch = debounce((q) => {
+      this.persistTabState({ query: q });
       this.loadCommits(q, true);
     }, 250);
     searchInput.oninput = () => {
@@ -101,6 +171,15 @@ export class CommitsView {
     if (this.selectedCommitId) {
       this.inspectCommit(this.selectedCommitId);
     }
+  }
+
+  /**
+   * Record on this tab (and so in its URL, §5.26) what this view is showing. A view whose
+   * element was replaced by a re-render is stale: its state is nobody's address any more.
+   */
+  persistTabState(patch) {
+    if (!this.containerEl || !this.containerEl.isConnected) return null;
+    return state.updateTabState(this.tabId, patch);
   }
 
   async loadCommits(query = "", reset = true) {
@@ -257,7 +336,7 @@ export class CommitsView {
           <span class="commit-author-link" style="color:var(--text-secondary);cursor:pointer;transition:color 0.15s;" title="View developer profile: ${authorName}">${authorName}</span>
           <div style="display:flex;gap:6px;align-items:center;">
             <span>${dateStr}</span>
-            <span class="commit-hash">${hashShort}</span>
+            ${hashHtml(c.commit_hash, { short: true })}
           </div>
         </div>
       `;
@@ -334,7 +413,7 @@ export class CommitsView {
   renderCommitDiff(panel, diff) {
     const files = diff.files || [];
     const short = (h) => (h || "").slice(0, 8);
-    const base = diff.parent_hash ? `vs ${diff.is_merge ? "first parent " : ""}<span class="commit-hash">${short(diff.parent_hash)}</span>` : "root commit";
+    const base = diff.parent_hash ? `vs ${diff.is_merge ? "first parent " : ""}${hashHtml(diff.parent_hash, { short: true })}` : "root commit";
     let html = `<div class="cdiff-summary">
       <span>${files.length} file${files.length === 1 ? "" : "s"} changed</span>
       <span class="cdiff-add">+${diff.additions}</span><span class="cdiff-del">−${diff.deletions}</span>
@@ -430,12 +509,33 @@ export class CommitsView {
     });
   }
 
+  /** Select and inspect a commit whose card is in the loaded timeline; false when it is not. */
+  selectLoadedCommit(hash) {
+    const idx = this.commits.findIndex((c) => c.commit_hash === hash);
+    if (idx === -1) return false;
+    const c = this.commits[idx];
+    this.selectedCommitId = c.commit_id || c.commit_hash;
+    const cards = this.containerEl.querySelectorAll(".commit-card");
+    cards.forEach((x) => x.classList.remove("active"));
+    // renderCommitList() may prepend a "Load 50 More Commits" button, so cards are matched by hash
+    const card = Array.from(cards).find((x) => x.querySelector(`.copy-hash[data-hash="${hash}"]`));
+    if (card) {
+      card.classList.add("active");
+      card.scrollIntoView({ block: "nearest" });
+    }
+    this.inspectCommit(this.selectedCommitId);
+    return true;
+  }
+
   async inspectCommit(commitIdOrHash) {
     const detailEl = this.containerEl.querySelector("#commit-detail-container");
     detailEl.innerHTML = `<div style="color:var(--text-muted);">Loading commit details...</div>`;
 
     try {
       const c = await api.getCommitDetail(this.currentVersion, commitIdOrHash);
+      // The commit on screen is recorded on the tab by its hash, never by the integer
+      // commit_id: a shared link has to survive a database rebuild (§5.26)
+      this.persistTabState({ commitId: c.commit_hash || String(commitIdOrHash) });
       const dateStr = c.author_date ? new Date(c.author_date * 1000).toUTCString() : "";
 
       detailEl.innerHTML = `
@@ -444,7 +544,7 @@ export class CommitsView {
           <div class="commit-detail-meta">
             <div><strong>Author:</strong> <span class="commit-detail-author-link" style="color:var(--accent-blue);cursor:pointer;text-decoration:underline;" title="Click to view developer profile">${c.author?.name || c.author_name} &lt;${c.author?.email || c.author_email}&gt;</span></div>
             <div><strong>Date:</strong> ${dateStr}</div>
-            <div><strong>Hash:</strong> <span class="commit-hash">${c.commit_hash}</span></div>
+            <div><strong>Hash:</strong> ${hashHtml(c.commit_hash)}</div>
             ${c.lore_url ? `<div><a href="${c.lore_url}" target="_blank" class="lore-link">lore.kernelinfo.org LKML Thread ↗</a></div>` : ""}
             <div style="margin-top:8px;">
               <button class="code-btn active" id="btn-explore-commit" style="font-size:11px;padding:4px 10px;">
@@ -506,18 +606,22 @@ export class CommitsView {
 
         <!-- Modified Files -->
         <div class="m-card">
-          <div class="m-card-title">Modified Files (${c.files?.length || 0})</div>
+          <div class="m-card-title">
+            Modified Files (${c.files?.length || 0}${c.files_truncated ? "+" : ""})
+            ${c.files_source === "git" ? `<span style="color:var(--text-muted);font-weight:normal;font-size:10px;margin-left:6px;" title="A merge records no tree delta of its own, so its change set is resolved from Git against the first parent - the same comparison the diff below shows">resolved from Git${c.is_merge ? " (merge, vs first parent)" : ""}</span>` : ""}
+          </div>
           <div style="display:flex;flex-direction:column;gap:6px;font-family:var(--font-mono);font-size:11px;">
             ${
               Array.isArray(c.files) && c.files.length > 0
                 ? c.files.map((f) => `
                     <div style="display:flex;gap:8px;align-items:center;">
-                      <span style="font-weight:bold;color:${f.change_type === 'M' ? 'var(--accent-yellow)' : 'var(--accent-green)'};">[${f.change_type}]</span>
-                      <span class="commit-file-link" data-path="${f.file}" style="color:var(--accent-blue);cursor:pointer;">${f.file}</span>
+                      <span style="font-weight:bold;color:${STATUS_COLORS[f.change_type] || "var(--accent-green)"};">[${escapeHtml(f.change_type)}]</span>
+                      <span class="commit-file-link" data-path="${escapeHtml(f.file)}" style="color:var(--accent-blue);cursor:pointer;">${escapeHtml(f.file)}</span>
                     </div>
                   `).join("")
-                : `<span style="color:var(--text-muted);">No modified files recorded</span>`
+                : `<span style="color:var(--text-muted);">This commit changes no files against its parent</span>`
             }
+            ${c.files_truncated ? `<span style="color:var(--text-muted);">… list truncated</span>` : ""}
           </div>
         </div>
 

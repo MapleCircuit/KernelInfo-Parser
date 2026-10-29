@@ -10,11 +10,13 @@ from collections import OrderedDict
 import logging
 import re
 import threading
+import time
 import urllib.parse
 from typing import Any
 
 from core.config import get_mailing_list_config
 from parser.mailing_list.ml_client import MailingListClient
+from parser.mailing_list.ml_store import FUTURE_DATE_SKEW_SECONDS
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +40,24 @@ def normalize_series_subject(subject: str) -> str:
             break
         text = stripped
     return re.sub(r"\s+", " ", text).strip()
+
+
+def _drop_future_dated(payload: dict[str, Any]) -> dict[str, Any]:
+    """Remove results whose Date: header lies in the future from a browse listing.
+
+    The archive store already excludes them from the empty-query listing; this guards
+    the same invariant when the page comes from a micro-daemon that predates it, so
+    `total` is lowered by what the page dropped rather than recomputed.
+    """
+    rows = list(payload.get("results") or [])
+    horizon = int(time.time()) + FUTURE_DATE_SKEW_SECONDS
+    kept = [r for r in rows if int(r.get("timestamp") or 0) <= horizon]
+    dropped = len(rows) - len(kept)
+    if not dropped:
+        return payload
+    payload["results"] = kept
+    payload["total"] = max(len(kept), int(payload.get("total") or 0) - dropped)
+    return payload
 
 
 def _is_series_message(msg: dict[str, Any]) -> bool:
@@ -472,6 +492,8 @@ class MailingListService:
                 offset=offset,
                 filter_type=filter_type,
             )
+            if not clean_q:
+                search_data = _drop_future_dated(search_data)
             result: dict[str, Any] = {
                 "available": True,
                 "page": p,

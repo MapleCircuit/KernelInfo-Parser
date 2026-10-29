@@ -7,8 +7,10 @@ from typing import Any
 
 from fastapi import APIRouter, Query
 
+from core.config import matches_branch_filter
 from webapp.backend.config import (
     get_active_repo_name,
+    get_active_repository,
     get_repo_dir,
     list_repositories,
     resolve_repo_path,
@@ -98,15 +100,48 @@ def get_projects() -> dict[str, Any]:
 
 @router.get("/branches")
 def get_branches() -> dict[str, Any]:
-    """List git branches of the active repository (indexed refs first, then local Git branches)."""
+    """List git branches of the active repository (indexed refs first, then Git branches)."""
     branches = []
     seen = set()
 
+    repo = get_active_repository()
+    branch_filter = repo.get("branch_filter")
+    default_branch = repo.get("default_branch") or "main"
+
+    local_branches: set[str] = set()
+    ref_entries: list[tuple[str, str, str]] = []  # (refname, short_name, obj)
+
+    for line in _git_lines(
+        ["for-each-ref", "--format=%(refname) %(refname:short) %(symref) %(objectname)", "refs/heads/", "refs/remotes/"],
+        timeout=5,
+    ):
+        parts = line.strip().split()
+        if not parts:
+            continue
+        refname = parts[0]
+        short_name = parts[1] if len(parts) > 1 else refname
+        symref = parts[2] if len(parts) > 2 and parts[2] != parts[-1] else ""
+        obj = parts[-1] if len(parts) >= 2 else ""
+
+        if symref or refname.endswith("/HEAD"):
+            continue
+
+        if refname.startswith("refs/heads/"):
+            local_branches.add(refname[len("refs/heads/"):])
+            local_branches.add(short_name)
+
+        ref_entries.append((refname, short_name, obj))
+
     git_heads = {}
-    for line in _git_lines(["branch", "--format=%(refname:short) %(objectname)"], timeout=5):
-        parts = line.split()
-        if parts and not parts[0].startswith("(HEAD"):
-            git_heads[parts[0]] = parts[1] if len(parts) > 1 else ""
+    for refname, short_name, obj in ref_entries:
+        if refname.startswith("refs/remotes/"):
+            rel = refname[len("refs/remotes/"):]
+            remote_name, _, remote_branch = rel.partition("/")
+            if remote_name == "origin" and remote_branch in local_branches:
+                continue
+
+        if short_name and matches_branch_filter(short_name, branch_filter):
+            git_heads[short_name] = obj
 
     with get_db_cursor() as cursor:
         cursor.execute(
@@ -122,14 +157,17 @@ def get_branches() -> dict[str, Any]:
         )
         for row in cursor.fetchall():
             bname = safe_decode(row["ref_name"])
-            if bname and bname not in seen:
+            if bname and bname.startswith("origin/") and bname[7:] in local_branches:
+                continue
+            if bname and bname not in seen and matches_branch_filter(bname, branch_filter):
                 seen.add(bname)
                 commit_hash = _hex(row.get("commit_hash"))
+                is_default = bname == default_branch or (not default_branch and bname in ("main", "master"))
                 branches.append({
                     "name": bname,
                     "commit_id": row["commit_id"],
                     "commit_hash": commit_hash,
-                    "is_default": bname in ("master", "main"),
+                    "is_default": is_default,
                     # The branch may have moved in Git since it was parsed
                     "stamp": _stamp(git_heads.get(bname) or commit_hash, row.get("parsed_at") or 0),
                 })
@@ -137,17 +175,27 @@ def get_branches() -> dict[str, Any]:
     for bname, head in git_heads.items():
         if bname not in seen:
             seen.add(bname)
+            is_default = bname == default_branch or (not default_branch and bname in ("main", "master"))
             branches.append({
                 "name": bname,
                 "commit_id": 0,
                 "commit_hash": head,
-                "is_default": bname in ("master", "main"),
+                "is_default": is_default,
                 "stamp": _stamp(head, None),
             })
 
     if not branches:
-        branches.append({"name": "master", "commit_id": 0, "commit_hash": "", "is_default": True})
+        fallback_name = default_branch or "main"
+        branches.append({"name": fallback_name, "commit_id": 0, "commit_hash": "", "is_default": True})
 
+    def branch_sort_key(b: dict[str, Any]) -> tuple[int, str]:
+        if b.get("is_default"):
+            return (0, b["name"])
+        if b["name"] in ("main", "master"):
+            return (1, b["name"])
+        return (2, b["name"])
+
+    branches.sort(key=branch_sort_key)
     return {"total": len(branches), "branches": branches}
 
 

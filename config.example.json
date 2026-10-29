@@ -65,7 +65,15 @@
       "git_url": "https://github.com/torvalds/linux",
       "root_commit": "1da177e4c3f41524e886b7f1b8a0c1fc7321cac2",
       "start_ref": "1da177e4c3f41524e886b7f1b8a0c1fc7321cac2",
-      "enabled": true
+      "enabled": true,
+      "branch_filter": {
+        "include": ["*"],
+        "exclude": ["*rc*"]
+      },
+      "branches": [
+        "master",
+        "stable/linux-6.6.y"
+      ]
     }
   ]
 }

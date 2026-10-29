@@ -5,6 +5,7 @@ import os
 import sqlite3
 import tempfile
 import threading
+import time
 import unittest
 import urllib.request
 import zlib
@@ -226,6 +227,39 @@ class TestPublicInboxLocalStore(unittest.TestCase):
         self.assertEqual(cover.num, 9)
         self.assertIn("0/2", cover.subj)
 
+    def _insert_future_dated_message(self):
+        """Add a message whose Date: header is a year ahead of now; returns its Message-ID."""
+        mid = "20990101.future@example.org"
+        raw = (
+            "[PATCH 1/1] driver: core: dated in the future\n"
+            "Bob Dev <bob@example.org>\n"
+            "\n"
+            f"{mid}\n"
+            ":abcdef010123456789abcdef0123456789abcdef\n"
+        ).encode("utf-8")
+        ahead = int(time.time()) + 86400 * 365
+        conn = sqlite3.connect(str(self.storage_dir / "over.sqlite3"))
+        conn.execute(
+            "INSERT INTO over (num, tid, sid, ts, ds, ddd) VALUES (?, ?, ?, ?, ?, ?)",
+            (11, 11, 2, ahead, ahead, zlib.compress(raw)),
+        )
+        conn.execute("INSERT INTO id2num (id, num) VALUES (?, ?)", (mid, 11))
+        conn.commit()
+        conn.close()
+        return mid
+
+    def test_empty_query_browse_excludes_future_dated(self):
+        self._insert_future_dated_message()
+        found = self.store.search_emails(query="", limit=50)
+        nums = sorted(r["num"] for r in found["results"])
+        self.assertEqual(nums, [9, 10])
+        self.assertEqual(found["total"], 2)
+
+    def test_explicit_query_still_finds_future_dated(self):
+        self._insert_future_dated_message()
+        found = self.store.search_emails(query="dated in the future", limit=50)
+        self.assertEqual([r["num"] for r in found["results"]], [11])
+
     def test_unpack_standard_public_inbox_ddd(self):
         raw_ddd = (
             "[GIT PULL] hwmon updates for v7.4\n"
@@ -288,7 +322,7 @@ class MockStore:
                 return r
         return None
 
-    def search_over_subjects(self, pattern: str, limit: int = 20) -> list[SmsgRecord]:
+    def search_over_subjects(self, pattern: str, limit: int = 20, scan_limit: int = 500) -> list[SmsgRecord]:
         matches = []
         for r in self.mid_map.values():
             if pattern.lower() in r.subject.lower():

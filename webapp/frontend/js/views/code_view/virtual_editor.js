@@ -98,7 +98,7 @@ export class VirtualEditor {
   resolveEngineSelection() {
     const tab = state.findTab(this.tabId) || this.tabData;
     const picked = tab ? tab.kconfigEngineTabId : undefined;
-    if (tab?.kconfigEngineUserPicked && (picked === "" || state.isKconfigEngineOwner(picked))) {
+    if (tab?.kconfigEngineUserPicked && (picked === "" || state.hasEngine(picked))) {
       this.engineTabId = picked;
       return this.engineTabId;
     }
@@ -113,7 +113,7 @@ export class VirtualEditor {
 
   /** Follow another engine (or none) for this file only. */
   setEngineSelection(engineTabId) {
-    const next = engineTabId && state.isKconfigEngineOwner(engineTabId) ? engineTabId : "";
+    const next = state.hasEngine(engineTabId) ? engineTabId : "";
     this.engineTabId = next;
     const tab = state.findTab(this.tabId) || this.tabData;
     if (tab) {

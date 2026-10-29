@@ -1,12 +1,26 @@
 /**
  * url_sync.js - Bi-directional URL synchronization.
- * Reflects current tab, file, version, and line in URL hash.
+ *
+ * The hash is the address of what the active tab is showing: its kind and revision, and the
+ * state inside it a reader would otherwise have to reproduce by hand — the file and line of a
+ * code tab, the ARCH, filter and inspected symbol of a KConfig tab, the query, thread and
+ * message of a mailing list tab, the query and commit of a commits tab. Copying the URL
+ * therefore reopens that same search and that same target (§5.26).
+ *
+ * Tab and revision changes are announced as `tabs:changed` / `version:changed`; a navigation
+ * *inside* a tab is announced as `tab:state` (`state.updateTabState`), because redrawing the
+ * pane would discard the view that reported it.
  */
 import { state } from "./state.js";
 
 class UrlSynchronizer {
   constructor() {
     this.isUpdatingFromHash = false;
+    // Address held while the startup session picker is open (`deferred`). Adopting a session
+    // replaces the panes and rewrites the hash, so a link opened in a new browser tab would
+    // lose its target if it were applied before that choice is made (§5.26).
+    this.deferred = false;
+    this.deferredHash = null;
 
     // Listen to hash changes (e.g. browser back/forward or user paste)
     window.addEventListener("hashchange", () => this.handleHashChange());
@@ -14,18 +28,45 @@ class UrlSynchronizer {
     // Listen to state changes
     state.subscribe("tabs:changed", () => this.updateHashFromState());
     state.subscribe("version:changed", () => this.updateHashFromState());
+    state.subscribe("tab:state", () => this.updateHashFromState());
+    // Whichever way a session is finally adopted, this window now has its tabs: the held
+    // address is applied on top of them, so the tab a link asked for opens inside that session.
+    state.subscribe("session:adopted", () => {
+      if (this.deferred) this.init();
+    });
+  }
+
+  /**
+   * Keep this window's address aside until `init`, because the session picker is open and the
+   * tabs this window will show are not loaded yet. The hash is neither read nor overwritten
+   * while held, so the tab a link asked for survives the session being adopted.
+   */
+  defer() {
+    this.deferredHash = window.location.hash.substring(1) || null;
+    this.deferred = true;
   }
 
   init() {
-    if (window.location.hash) {
-      this.handleHashChange();
+    this.deferred = false;
+    const hash = this.deferredHash || window.location.hash.substring(1);
+    this.deferredHash = null;
+    if (hash) {
+      this.applyHash(hash);
     } else {
       this.updateHashFromState();
     }
   }
 
   handleHashChange() {
-    const hash = window.location.hash.substring(1);
+    // While held, a hash change only updates what `init` will apply
+    if (this.deferred) {
+      this.deferredHash = window.location.hash.substring(1) || null;
+      return;
+    }
+    this.applyHash(window.location.hash.substring(1));
+  }
+
+  applyHash(hash) {
     if (!hash) return;
 
     this.isUpdatingFromHash = true;
@@ -38,6 +79,7 @@ class UrlSynchronizer {
       const arch = params.get("arch") || "x86_64";
       const dir = params.get("dir") || "";
       const cfg = params.get("cfg") || ""; // named copy of that ARCH's configuration, if any
+      const query = params.get("q") || ""; // search typed in the tab's own filter box
 
       // Restoring a revision from the hash selects it in the header; the tab opened below carries it
       if (v) state.setSelectedVersion(v);
@@ -56,6 +98,8 @@ class UrlSynchronizer {
           title: `KConfig (${arch})${cfg ? ` · ${cfg}` : ""}`,
           arch,
           configName: cfg,
+          query,
+          symbol: params.get("sym") || "",
           version: v || state.currentVersion
         });
       } else if (tabType === "explorer") {
@@ -77,8 +121,17 @@ class UrlSynchronizer {
           title: "Mailing List",
           threadId: parseInt(params.get("tid") || "0", 10),
           messageId: params.get("mid") || "",
-          query: params.get("q") || "",
+          query,
+          filter: params.get("f") || "all",
           listMode: params.get("mode") === "tree" ? "tree" : "search",
+          version: v || state.currentVersion
+        });
+      } else if (tabType === "commits") {
+        state.openTab({
+          type: "commits",
+          title: "Commits",
+          commitId: params.get("cid") || "",
+          query,
           version: v || state.currentVersion
         });
       }
@@ -88,7 +141,7 @@ class UrlSynchronizer {
   }
 
   updateHashFromState() {
-    if (this.isUpdatingFromHash) return;
+    if (this.isUpdatingFromHash || this.deferred) return;
 
     const activeTab = state.getActiveTab();
     if (!activeTab) return;
@@ -107,11 +160,17 @@ class UrlSynchronizer {
     } else if (activeTab.type === "kconfig" && activeTab.arch) {
       params.set("arch", activeTab.arch);
       if (activeTab.configName) params.set("cfg", activeTab.configName);
+      if (activeTab.symbol) params.set("sym", activeTab.symbol);
+      if (activeTab.query) params.set("q", activeTab.query);
     } else if (activeTab.type === "mail") {
       if (activeTab.threadId) params.set("tid", activeTab.threadId);
       if (activeTab.messageId) params.set("mid", activeTab.messageId);
       if (activeTab.query) params.set("q", activeTab.query);
+      if (activeTab.filter && activeTab.filter !== "all") params.set("f", activeTab.filter);
       if (activeTab.listMode === "tree") params.set("mode", "tree");
+    } else if (activeTab.type === "commits") {
+      if (activeTab.commitId) params.set("cid", activeTab.commitId);
+      if (activeTab.query) params.set("q", activeTab.query);
     }
 
     const newHash = "#" + params.toString();

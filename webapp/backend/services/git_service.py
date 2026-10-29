@@ -33,6 +33,8 @@ MAX_COMMIT_OFFSET = 1_000_000
 MAX_COMMIT_DIFF_BYTES = 8 * 1024 * 1024
 MAX_COMMIT_DIFF_LINES = 6000
 MAX_DIFF_LINE_CHARS = 400
+# Cap on a commit file list resolved live from Git (a merge of a long branch touches thousands)
+MAX_COMMIT_FILE_ROWS = 5000
 
 
 def _strip_diff_prefix(path: str, prefix: str) -> str:
@@ -602,7 +604,7 @@ class GitService:
             subj = safe_decode(c_row["subject"])
             lore_url = linked_emails[0]["lore_url"] if linked_emails else f"{LORE_BASE_URL}?q={subj}"
 
-            return {
+            detail = {
                 "commit_id": cid,
                 "commit_hash": format_commit_hash(c_row["commit_hash"]),
                 "subject": subj,
@@ -616,11 +618,59 @@ class GitService:
                 "author_date": c_row["author_date"],
                 "committer_date": c_row["committer_date"],
                 "files": files,
+                "files_source": "db" if files else "none",
+                "files_truncated": False,
+                "is_merge": False,
                 "trailers": trailers,
                 "contributors": contributors,
                 "lore_url": lore_url,
                 "linked_emails": linked_emails,
             }
+
+        # `git log -p` suppresses merge diffs, so the parser stages no m_commit_file rows for a
+        # merge: its first-parent delta is resolved from Git on demand, which keeps "Modified
+        # Files" in agreement with the "Show changes" panel (which diffs against the first parent).
+        self._fill_missing_commit_files(detail)
+        return detail
+
+    def _fill_missing_commit_files(self, detail: dict[str, Any]) -> None:
+        """Resolve a commit's first-parent file list from Git when no rows were staged for it."""
+        sha = detail.get("commit_hash") or ""
+        if not _HEX_REF.fullmatch(sha.lower()):
+            return
+        try:
+            out, _, rc = self.run_git(["rev-list", "--parents", "-n1", sha], timeout=10)
+            if rc != 0:
+                return
+            parents = out.split()[1:]
+            detail["is_merge"] = len(parents) > 1
+            if detail["files"]:
+                return
+            base = parents[0] if parents else _EMPTY_TREE
+            out, _, rc = self.run_git(
+                ["-c", "core.quotePath=false", "diff", "--no-color", "--no-ext-diff",
+                 "-M", "--name-status", base, sha],
+                timeout=60,
+            )
+            if rc != 0:
+                return
+        except (subprocess.SubprocessError, OSError) as exc:
+            logger.warning("Resolving the file list of commit %s from Git failed: %s", sha, exc)
+            return
+
+        files: list[dict[str, Any]] = []
+        for line in out.splitlines():
+            parts = line.split("\t")
+            if len(parts) < 2 or not parts[0]:
+                continue
+            # Renames and copies carry a similarity score ("R100") and both paths; the new path wins
+            files.append({"change_type": parts[0][0].upper(), "file": parts[-1].strip()})
+            if len(files) >= MAX_COMMIT_FILE_ROWS:
+                detail["files_truncated"] = True
+                break
+        if files:
+            detail["files"] = files
+            detail["files_source"] = "git"
 
     def resolve_commit_mail(self, version_name: str, commit_id_or_hash: str) -> dict[str, Any]:
         """On-demand resolution of a commit against the mailing list archive."""

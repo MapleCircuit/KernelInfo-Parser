@@ -8,6 +8,7 @@ and web application services with strict precedence:
 from __future__ import annotations
 
 import copy
+import fnmatch
 import json
 import logging
 import os
@@ -167,7 +168,18 @@ DEFAULT_CONFIG: dict[str, Any] = {
 }
 
 # Keys every repositories[] entry carries once detected (see detect_repository())
-REPOSITORY_KEYS = ("name", "path", "project", "default_branch", "git_url", "root_commit", "start_ref", "enabled")
+REPOSITORY_KEYS = (
+    "name",
+    "path",
+    "project",
+    "default_branch",
+    "git_url",
+    "root_commit",
+    "start_ref",
+    "enabled",
+    "branch_filter",
+    "branches",
+)
 
 _ACTIVE_CONFIG: dict[str, dict[str, Any]] | None = None
 _LOADED_CONFIG_PATH: Path | None = None
@@ -580,6 +592,102 @@ def detect_root_commit(repo: Path, rev: str = "HEAD") -> str:
 _DETECTED_REPO_CACHE: dict[str, dict[str, Any]] = {}
 
 
+DEFAULT_BRANCH_FILTER: dict[str, list[str]] = {
+    "include": ["*"],
+    "exclude": ["*rc*"],
+}
+
+
+def matches_branch_filter(branch: str, branch_filter: dict[str, Any] | None = None) -> bool:
+    """True if branch matches include patterns and does not match exclude patterns."""
+    bf = branch_filter if isinstance(branch_filter, dict) else DEFAULT_BRANCH_FILTER
+    includes = bf.get("include") or ["*"]
+    excludes = bf.get("exclude") or []
+    if isinstance(includes, str):
+        includes = [includes]
+    if isinstance(excludes, str):
+        excludes = [excludes]
+
+    if not any(fnmatch.fnmatch(branch, pat) for pat in includes):
+        return False
+    if any(fnmatch.fnmatch(branch, pat) for pat in excludes):
+        return False
+    return True
+
+
+def find_repository_branches(
+    repo: Path,
+    branch_filter: dict[str, Any] | None = None,
+    default_branch: str | None = None,
+) -> list[str]:
+    """Discover local and remote-tracking Git branches matching branch_filter.
+
+    Symbolic refs (e.g. origin/HEAD) are omitted. When a branch exists locally
+    (e.g. 'master'), its remote-tracking counterpart on origin (e.g. 'origin/master')
+    is deduplicated and omitted in favor of the local branch.
+
+    The default branch (or main/master) is placed first if present, followed by
+    remaining branches in alphabetical order.
+    """
+    raw_lines = _git_out(
+        repo,
+        "for-each-ref",
+        "--format=%(refname) %(refname:short) %(symref)",
+        "refs/heads/",
+        "refs/remotes/",
+    ).splitlines()
+
+    local_branches: set[str] = set()
+    ref_entries: list[tuple[str, str]] = []  # (refname, short_name)
+
+    for line in raw_lines:
+        parts = line.strip().split()
+        if not parts:
+            continue
+        refname = parts[0]
+        short_name = parts[1] if len(parts) > 1 else refname
+        symref = parts[2] if len(parts) > 2 and parts[2] != parts[-1] else ""
+
+        # Skip symbolic refs (e.g. refs/remotes/origin/HEAD)
+        if symref or refname.endswith("/HEAD"):
+            continue
+
+        if refname.startswith("refs/heads/"):
+            bname = refname[len("refs/heads/"):]
+            local_branches.add(bname)
+            local_branches.add(short_name)
+
+        ref_entries.append((refname, short_name))
+
+    candidates: list[str] = []
+    seen: set[str] = set()
+
+    for refname, short_name in ref_entries:
+        if refname.startswith("refs/remotes/"):
+            rel = refname[len("refs/remotes/"):]
+            remote_name, _, remote_branch = rel.partition("/")
+            # Deduplicate remote tracking branches on origin when a local branch exists with the same name
+            if remote_name == "origin" and remote_branch in local_branches:
+                continue
+
+        if short_name and short_name not in seen:
+            seen.add(short_name)
+            if matches_branch_filter(short_name, branch_filter):
+                candidates.append(short_name)
+
+    def_b = default_branch or ("main" if "main" in candidates else ("master" if "master" in candidates else ""))
+
+    def branch_sort_key(b: str) -> tuple[int, str]:
+        if def_b and b == def_b:
+            return (0, b)
+        if b in ("main", "master"):
+            return (1, b)
+        return (2, b)
+
+    candidates.sort(key=branch_sort_key)
+    return candidates
+
+
 def detect_repository(path: Path) -> dict[str, Any]:
     """Build a repositories[] entry for the Git repository at path (cached per path for the process)."""
     # abspath keeps symlinked repositories addressed through repos_dir instead of their target
@@ -592,6 +700,8 @@ def detect_repository(path: Path) -> dict[str, Any]:
         rel_path = str(path)
     branch = detect_default_branch(path)
     root_commit = detect_root_commit(path, branch)
+    branch_filter = copy.deepcopy(DEFAULT_BRANCH_FILTER)
+    branches = find_repository_branches(path, branch_filter, default_branch=branch)
     entry = {
         "name": path.name,
         "path": rel_path,
@@ -602,6 +712,8 @@ def detect_repository(path: Path) -> dict[str, Any]:
         # Parsing starts from the first commit of the repository unless overridden
         "start_ref": root_commit,
         "enabled": True,
+        "branch_filter": branch_filter,
+        "branches": branches,
     }
     _DETECTED_REPO_CACHE[str(path)] = entry
     return dict(entry)
@@ -718,6 +830,50 @@ def get_default_repo_path() -> Path:
     """Absolute path of the default repository (falls back to <repos_dir>/linux)."""
     repo = get_repository()
     return resolve_repo_path(repo) if repo else get_repos_dir() / "linux"
+
+
+def update_repository_branches(name_or_path: str | None = None, write: bool = True) -> list[str]:
+    """Refresh the 'branches' list for the repository matching name_or_path and optionally save to config."""
+    cfg = get_config()
+    repo = get_repository(name_or_path)
+    if not repo:
+        return []
+    repo_path = resolve_repo_path(repo)
+    bf = repo.get("branch_filter") or copy.deepcopy(DEFAULT_BRANCH_FILTER)
+    branches = find_repository_branches(repo_path, bf, default_branch=repo.get("default_branch"))
+    repo["branches"] = branches
+    repo.setdefault("branch_filter", copy.deepcopy(bf))
+
+    # Also update in cfg['repositories']
+    for r in cfg.get("repositories", []):
+        if r.get("name") == repo.get("name") or resolve_repo_path(r).resolve() == repo_path.resolve():
+            r["branches"] = branches
+            r.setdefault("branch_filter", copy.deepcopy(bf))
+            break
+
+    if write:
+        target = _LOADED_CONFIG_PATH or REPO_ROOT / "config.json"
+        if target.is_file():
+            file_data: dict[str, Any] = {}
+            with open(target, "r", encoding="utf-8") as f:
+                file_data = json.load(f)
+            file_repos = file_data.setdefault("repositories", copy.deepcopy(cfg.get("repositories", [])))
+            found = False
+            for r in file_repos:
+                if r.get("name") == repo.get("name") or resolve_repo_path(r).resolve() == repo_path.resolve():
+                    r["branches"] = branches
+                    r.setdefault("branch_filter", copy.deepcopy(bf))
+                    found = True
+                    break
+            if not found:
+                file_repos.append(copy.deepcopy(repo))
+            tmp = target.with_suffix(target.suffix + ".tmp")
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(file_data, f, indent=2)
+                f.write("\n")
+            os.replace(tmp, target)
+            logger.info("Updated %d branches for repository '%s' in %s", len(branches), repo.get("name"), target)
+    return branches
 
 
 def reset_config() -> None:

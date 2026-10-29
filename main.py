@@ -114,6 +114,7 @@ import traceback
 import gc
 import ctypes
 from parser.c_ast import c_ast_parse, Line
+from parser.maintainer_ast.maintainer_types import clean_identity_text
 from parser.arch_layout import compute_layouts
 from parser.make_eval import Tree
 from core.FileHandler import MasterFile
@@ -243,7 +244,7 @@ def ensure_db_views(db: Any) -> None:
     if legacy:
         raise RuntimeError(
             f"The database predates the shared symbol layout ({', '.join(legacy)} are tables, not views). "
-            "Rebuild it with --reset (core/SCHEMA_PLAN_SYMBOL_ROWS.md)."
+            "Rebuild it with --reset."
         )
     views = (
         ("m_v_main", "CREATE OR REPLACE VIEW m_v_main AS SELECT commit_id AS vid, ref_name AS vname, repo_id, ref_type, tagger_id, tagger_date, tag_message FROM m_git_ref;"),
@@ -420,9 +421,15 @@ _SQL_IN_CHUNK = 1000
 
 
 def _person_key(name: str | None, email: str | None) -> tuple[str, str]:
-    """Identity of an m_maintainer_person row: `(name, email)`, the TableEngine's no-duplicate key."""
-    email = email or ""
-    return (name or email or "Unknown", email)
+    """
+    Identity of an m_maintainer_person row: `(name, email)`, the TableEngine's no-duplicate key.
+
+    Both halves are normalized (`clean_identity_text`): a commit trailer carrying a stray control
+    byte — `Olof Johansson\\x01 <olof@lixom.net\\x01>` in `a929478f` — otherwise keys a second
+    identity for a contributor who already has one.
+    """
+    email = clean_identity_text(email)
+    return (clean_identity_text(name) or email or "Unknown", email)
 
 
 def _raw_cursor(db: Any) -> Any | None:
@@ -2488,35 +2495,50 @@ def main() -> None:
         G.emergency_shutdown(0)
         return
 
-    raw_refs = getattr(args, "ref", None)
-    if not raw_refs:
-        # Default: parse from the first commit of the repository, then every subsequent release
-        start_ref = (repo_entry or {}).get("start_ref") or (repo_entry or {}).get("root_commit") or MF.get_root_commit()
-        if not start_ref:
-            logger.critical(COLOR.red(f"Could not resolve the first commit of repository '{repo_path}'."))
-            sys.exit(1)
-        logger.info(f"[Release Pipeline] No --ref given; starting from the first commit {start_ref[:12]}")
-        raw_refs = [start_ref]
-    elif isinstance(raw_refs, str):
-        raw_refs = [raw_refs]
+    is_branch_pipeline = bool(getattr(args, "branches", False))
+    if is_branch_pipeline:
+        from core.config import update_repository_branches
+        discovered_branches = update_repository_branches((repo_entry or {}).get("name"), write=True)
+        if not discovered_branches:
+            logger.warning(COLOR.yellow(f"No branches matching branch_filter discovered for repository '{repo_path}'."))
+            G.emergency_shutdown(0)
+            return
+        logger.info(COLOR.cyan(
+            f"[Branch Pipeline] Discovered {len(discovered_branches)} branch(es) matching branch_filter; "
+            f"updated configuration: {', '.join(discovered_branches[:8])}{'...' if len(discovered_branches) > 8 else ''}"
+        ))
+        target_refs = discovered_branches
+        single_version = True
+    else:
+        raw_refs = getattr(args, "ref", None)
+        if not raw_refs:
+            # Default: parse from the first commit of the repository, then every subsequent release
+            start_ref = (repo_entry or {}).get("start_ref") or (repo_entry or {}).get("root_commit") or MF.get_root_commit()
+            if not start_ref:
+                logger.critical(COLOR.red(f"Could not resolve the first commit of repository '{repo_path}'."))
+                sys.exit(1)
+            logger.info(f"[Release Pipeline] No --ref given; starting from the first commit {start_ref[:12]}")
+            raw_refs = [start_ref]
+        elif isinstance(raw_refs, str):
+            raw_refs = [raw_refs]
 
-    # By default, keep parsing subsequent releases after the first version unless single_version is requested
-    single_version = bool(getattr(args, "single_version", False))
-    include_pre_releases = getattr(args, "include_pre_releases", None)
-    if len(raw_refs) == 1 and not single_version:
-        start_ref = raw_refs[0]
-        discovered = MF.get_version_tags(start_ref=start_ref, include_pre_releases=include_pre_releases)
-        if len(discovered) > 1:
-            logger.info(
-                f"[Release Pipeline] Continuous multi-version parsing active (default). "
-                f"Discovered {len(discovered)} sequential releases starting at '{start_ref}': "
-                f"{', '.join(discovered[:6])}{'...' if len(discovered) > 6 else ''}"
-            )
-            target_refs = discovered
+        # By default, keep parsing subsequent releases after the first version unless single_version is requested
+        single_version = bool(getattr(args, "single_version", False))
+        include_pre_releases = getattr(args, "include_pre_releases", None)
+        if len(raw_refs) == 1 and not single_version:
+            start_ref = raw_refs[0]
+            discovered = MF.get_version_tags(start_ref=start_ref, include_pre_releases=include_pre_releases)
+            if len(discovered) > 1:
+                logger.info(
+                    f"[Release Pipeline] Continuous multi-version parsing active (default). "
+                    f"Discovered {len(discovered)} sequential releases starting at '{start_ref}': "
+                    f"{', '.join(discovered[:6])}{'...' if len(discovered) > 6 else ''}"
+                )
+                target_refs = discovered
+            else:
+                target_refs = raw_refs
         else:
             target_refs = raw_refs
-    else:
-        target_refs = raw_refs
 
     network_id, repo_id = resolve_git_network_and_repo(repo_path)
     with G.DB() as db:
@@ -2543,51 +2565,59 @@ def main() -> None:
         with G.DB() as db:
             version_states = ingest_state.fetch_repo_version_states(getattr(db, "cnx", None), repo_id, network_id)
 
-    # Fast-Forward Contiguous Prefix Scan
-    resume_idx = 0
-    for idx, ref in enumerate(target_refs):
-        st = version_states.get(ref, (0, "new"))[1]
-        if st == "done":
-            resume_idx = idx + 1
-        else:
-            break
+    if is_branch_pipeline:
+        unparsed_branches = [ref for ref in target_refs if version_states.get(ref, (0, "new"))[1] != "done"]
+        if not unparsed_branches:
+            logger.info(COLOR.green(f"[Branch Pipeline] All {len(target_refs)} branch(es) already completed in DB. Nothing to parse."))
+            G.emergency_shutdown(0)
+            return
+        target_refs = unparsed_branches
+    else:
+        # Fast-Forward Contiguous Prefix Scan
+        resume_idx = 0
+        for idx, ref in enumerate(target_refs):
+            st = version_states.get(ref, (0, "new"))[1]
+            if st == "done":
+                resume_idx = idx + 1
+            else:
+                break
 
-    if resume_idx == len(target_refs):
-        logger.info(COLOR.green(f"[Release Pipeline] All {len(target_refs)} version(s) already completed in DB. Nothing to parse."))
-        G.emergency_shutdown(0)
-        return
+        if resume_idx == len(target_refs):
+            logger.info(COLOR.green(f"[Release Pipeline] All {len(target_refs)} version(s) already completed in DB. Nothing to parse."))
+            G.emergency_shutdown(0)
+            return
 
-    if resume_idx > 0:
-        last_ref = target_refs[resume_idx - 1]
-        last_cid = version_states[last_ref][0]
-        gp.Old_VID = last_cid
-        gp.Old_Version_Name = last_ref
-        logger.info(COLOR.cyan(
-            f"[Release Pipeline] Found {resume_idx} completed version(s) ({target_refs[0]} ... {last_ref}). "
-            f"Resuming from version {resume_idx + 1}/{len(target_refs)} ('{target_refs[resume_idx]}') "
-            f"using prior base '{last_ref}' (commit_id {last_cid})."
-        ))
-
-        resume_ref = target_refs[resume_idx]
-        r_cid, r_st = version_states.get(resume_ref, (0, "new"))
-        if r_st == "interrupted" and r_cid > 0:
-            with G.DB() as db:
-                if getattr(db, "cnx", None):
-                    if not ingest_state.rollback_version(db.cnx, network_id, r_cid, TABLES):
-                        _purge_partial_version(db, r_cid)
-            _forget_rolled_back_rows()
-            logger.warning(COLOR.yellow(
-                f"[Release Pipeline] Detected interrupted version '{resume_ref}' (commit_id {r_cid}). Rolled back partial database rows."
-            ))
-        elif r_st == "legacy_partial" and r_cid > 0:
-            with G.DB() as db:
-                _purge_partial_version(db, r_cid)
-            _forget_rolled_back_rows()
-            logger.warning(COLOR.yellow(
-                f"[Release Pipeline] Detected incomplete legacy version '{resume_ref}' (commit_id {r_cid}). Purged partial records."
+        if resume_idx > 0:
+            last_ref = target_refs[resume_idx - 1]
+            last_cid = version_states[last_ref][0]
+            gp.Old_VID = last_cid
+            gp.Old_Version_Name = last_ref
+            logger.info(COLOR.cyan(
+                f"[Release Pipeline] Found {resume_idx} completed version(s) ({target_refs[0]} ... {last_ref}). "
+                f"Resuming from version {resume_idx + 1}/{len(target_refs)} ('{target_refs[resume_idx]}') "
+                f"using prior base '{last_ref}' (commit_id {last_cid})."
             ))
 
-        target_refs = target_refs[resume_idx:]
+            resume_ref = target_refs[resume_idx]
+            r_cid, r_st = version_states.get(resume_ref, (0, "new"))
+            if r_st == "interrupted" and r_cid > 0:
+                with G.DB() as db:
+                    if getattr(db, "cnx", None):
+                        if not ingest_state.rollback_version(db.cnx, network_id, r_cid, TABLES):
+                            _purge_partial_version(db, r_cid)
+                _forget_rolled_back_rows()
+                logger.warning(COLOR.yellow(
+                    f"[Release Pipeline] Detected interrupted version '{resume_ref}' (commit_id {r_cid}). Rolled back partial database rows."
+                ))
+            elif r_st == "legacy_partial" and r_cid > 0:
+                with G.DB() as db:
+                    _purge_partial_version(db, r_cid)
+                _forget_rolled_back_rows()
+                logger.warning(COLOR.yellow(
+                    f"[Release Pipeline] Detected incomplete legacy version '{resume_ref}' (commit_id {r_cid}). Purged partial records."
+                ))
+
+            target_refs = target_refs[resume_idx:]
 
     if dry_run:
         logger.info(COLOR.cyan(f"[Release Pipeline - Dry Run] Would resume parsing at '{target_refs[0]}'. Halting without making changes."))
@@ -2616,9 +2646,13 @@ def main() -> None:
                     f"[Quit Requested] Stopping before '{ref}' ({total_targets - ref_idx} version(s) not parsed)."
                 ))
                 break
+            if is_branch_pipeline:
+                gp.Old_VID = 0
+                gp.Old_Version_Name = ""
             current["ref"] = ref
             if total_targets > 1:
-                logger.info(COLOR.cyan(f"[Release Pipeline] Progress: version {ref_idx + 1}/{total_targets} ('{ref}')"))
+                label = "branch" if is_branch_pipeline else "version"
+                logger.info(COLOR.cyan(f"[Release Pipeline] Progress: {label} {ref_idx + 1}/{total_targets} ('{ref}')"))
             update(ref, repo_path=repo_path)
     except MemoryError:
         logger.critical(COLOR.red("FATAL: Memory limit of 60.0 GB (RLIMIT_AS) exceeded! Terminating execution cleanly."))
@@ -2653,6 +2687,13 @@ def arg_handling() -> argparse.Namespace:
         dest="detect_repos",
         action="store_true",
         help="Detect Git repositories under workspace.repos_dir, register them in the config file, print them and exit",
+    )
+    parser.add_argument(
+        "-b", "--branches", "--all-branches",
+        dest="branches",
+        action="store_true",
+        default=False,
+        help="Discover and parse the tip commit of all branches matching the repository's branch_filter, updating config.json",
     )
     parser.add_argument(
         "-v", "--ref", "--version",
@@ -2921,9 +2962,10 @@ def arg_handling() -> argparse.Namespace:
             if not repos:
                 print("No repositories configured or detected.")
             for r in repos:
+                branches_count = len(r.get("branches") or [])
                 print(
                     f"{r.get('name', '?'):<16} {r.get('path', ''):<28} branch={r.get('default_branch', '')} "
-                    f"start={str(r.get('start_ref', ''))[:12]} enabled={r.get('enabled', True)}"
+                    f"branches={branches_count} start={str(r.get('start_ref', ''))[:12]} enabled={r.get('enabled', True)}"
                 )
             sys.exit(0)
 
@@ -3253,7 +3295,13 @@ def _ingest_commit_range(db: Any, commits: list[Any], network_id: int) -> dict[s
     if cur is not None:
         try:
             cur.execute("SELECT person_id, name, email FROM m_maintainer_person")
-            person_ids = {_person_key(name, email): int(pid) for pid, name, email in cur.fetchall()}
+            rows = [(int(pid), name or "", email or "") for pid, name, email in cur.fetchall()]
+            # Rows written before identities were normalized can carry stray control bytes, so two
+            # of them may now share one key. The row already stored in its normalized form wins
+            # (lowest id among equals), so commits map to the identity a merge would keep.
+            rows.sort(key=lambda r: ((r[1], r[2]) != _person_key(r[1], r[2]), r[0]))
+            for pid, name, email in rows:
+                person_ids.setdefault(_person_key(name, email), pid)
         finally:
             cur.close()
     new_persons: list[tuple[int, str, str]] = []

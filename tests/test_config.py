@@ -9,18 +9,22 @@ from unittest.mock import patch
 from pathlib import Path
 
 from core.config import (
+    DEFAULT_BRANCH_FILTER,
     DEFAULT_CONFIG,
     find_config_path,
+    find_repository_branches,
     get_config,
     get_db_config,
     get_parser_config,
+    get_repository,
     get_webapp_config,
     init_config,
     load_config,
+    matches_branch_filter,
     reset_config,
     sync_environ,
-    get_repository,
     sync_repositories,
+    update_repository_branches,
 )
 from webapp.main import DatabaseManager
 
@@ -368,6 +372,45 @@ class TestRepositoryDetection(unittest.TestCase):
         self.assertEqual(mf.get_version_tags(start_ref=shas[0]), ["v1.0-rc1", "v1.0", "v1.1"])
         # An untagged start commit keeps its SHA and continues through releases containing it
         self.assertEqual(mf.get_version_tags(start_ref=shas[1]), [shas[1], "v1.0", "v1.1"])
+
+    def test_branch_filtering(self) -> None:
+        self.assertTrue(matches_branch_filter("master"))
+        self.assertTrue(matches_branch_filter("main"))
+        self.assertTrue(matches_branch_filter("stable/linux-6.6.y"))
+        self.assertFalse(matches_branch_filter("v6.6-rc1"))
+        self.assertFalse(matches_branch_filter("test-rc2"))
+
+        custom_filter = {
+            "include": ["stable/*", "main"],
+            "exclude": ["*test*"],
+        }
+        self.assertTrue(matches_branch_filter("stable/linux-5.15.y", custom_filter))
+        self.assertTrue(matches_branch_filter("main", custom_filter))
+        self.assertFalse(matches_branch_filter("master", custom_filter))
+        self.assertFalse(matches_branch_filter("stable/test", custom_filter))
+
+    def test_find_and_sync_repository_branches(self) -> None:
+        repo_dir = self.repos_dir / "demo"
+        subprocess.run(["git", "-C", str(repo_dir), "branch", "feature-x"], check=True)
+        subprocess.run(["git", "-C", str(repo_dir), "branch", "feature-rc1"], check=True)
+        # Create a simulated remote tracking branch
+        subprocess.run(["git", "-C", str(repo_dir), "update-ref", "refs/remotes/stable/linux-1.0.y", "HEAD"], check=True)
+        # Create a simulated origin/main remote tracking branch that mirrors local main
+        subprocess.run(["git", "-C", str(repo_dir), "update-ref", "refs/remotes/origin/main", "HEAD"], check=True)
+
+        branches = find_repository_branches(repo_dir, DEFAULT_BRANCH_FILTER, default_branch="main")
+        self.assertIn("main", branches)
+        self.assertNotIn("origin/main", branches)
+        self.assertIn("feature-x", branches)
+        self.assertIn("stable/linux-1.0.y", branches)
+        self.assertNotIn("feature-rc1", branches)
+        self.assertEqual(branches[0], "main")
+
+        updated = update_repository_branches("demo", write=True)
+        self.assertEqual(updated, branches)
+        saved = json.loads(self.config_path.read_text())
+        self.assertEqual(saved["repositories"][0]["branches"], branches)
+        self.assertEqual(saved["repositories"][0]["branch_filter"], DEFAULT_BRANCH_FILTER)
 
 
 if __name__ == "__main__":

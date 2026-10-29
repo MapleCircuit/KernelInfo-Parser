@@ -69,6 +69,26 @@
   border-radius: 3px;
 }
 
+/* A hash that copies itself on click */
+.commit-hash.copy-hash {
+  cursor: pointer;
+  user-select: all;
+  border: 1px solid transparent;
+  transition: border-color 0.15s, background 0.15s, color 0.15s;
+}
+
+.commit-hash.copy-hash:hover,
+.commit-hash.copy-hash:focus-visible {
+  border-color: var(--accent-blue);
+  background: var(--bg-secondary);
+  outline: none;
+}
+
+.commit-hash.copy-hash.copied {
+  color: var(--accent-green);
+  border-color: var(--accent-green);
+}
+
 /* Commit Detail Column */
 .commit-detail-col {
   flex: 1;
@@ -158,6 +178,12 @@
   display: flex;
   flex-direction: column;
   gap: 8px;
+}
+
+/* The flex display above beats the UA [hidden] rule, so collapsing the panel
+   needs its own, more specific rule */
+.commit-diff-panel[hidden] {
+  display: none;
 }
 
 .cdiff-summary {
