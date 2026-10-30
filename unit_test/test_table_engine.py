@@ -242,9 +242,17 @@ class GenericTableEngineTestCase:
             self.assertIs(fresh_te.db, second_driver)
             self.assertTrue(fresh_driver.is_closed, "Expected first driver handle to be closed cleanly")
 
+        with test_step("Calling start_new_db(is_worker=True) to simulate worker DB rotation"):
+            worker_driver = RecordingDriver()
+            fresh_te.start_new_db(lambda: worker_driver, is_worker=True)
+            self.assertIs(fresh_te.db, worker_driver)
+            self.assertFalse(fresh_te.async_commits)
+            self.assertIsNone(fresh_te._pending)
+            self.assertTrue(second_driver.is_closed, "Expected second driver handle to be closed cleanly")
+
         with test_step("Calling close() to release DB handle"):
             fresh_te.close()
-            self.assertTrue(second_driver.is_closed)
+            self.assertTrue(worker_driver.is_closed)
             self.assertIsNone(fresh_te.db)
 
     # =========================================================================

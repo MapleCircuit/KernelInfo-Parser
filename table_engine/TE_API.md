@@ -55,6 +55,7 @@ Stateful caching, sequence coordination, relational view decomposition, and batc
 | `staged_rows` (property) | `int` | Rows staged for the next commit (inserts and updates of all tables); the pipeline starts a background commit from 100k while it waits for its workers. |
 | `commit_stats` | `dict[str, float]` | Cumulative `commits`, `background`, `rows`, `write_s` (seconds the writes took) and `blocked_s` (seconds the caller waited: a whole synchronous write, or the join of a background one). Stages report their difference. |
 | `db_reads`, `db_read_s` | `int`, `float` | Database reads issued by the engine (`get` / `view_get` / `view_get_multiple` fallbacks) and their seconds. |
+| `update_in_mem_indexes` | `bool` | Flag indicating whether in-memory index updates are enabled (`True` by default). |
 
 ### 2.2. Extended In-Memory Caching State (`TECachedDB`)
 

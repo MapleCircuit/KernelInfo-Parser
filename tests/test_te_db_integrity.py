@@ -1427,6 +1427,19 @@ class TestTECachedDBIntegrity(unittest.TestCase):
         finally:
             te.close()
 
+    def test_direct_db_worker_startup(self) -> None:
+        """Verify that TEDirectDB supports start_new_db(..., is_worker=True) and resets worker state."""
+        te = TEDirectDB()
+        te.start(ALL_FAKE_TABLES, lambda: self.db)
+        te.async_commits = True
+        try:
+            te.start_new_db(lambda: self.db, is_worker=True)
+            self.assertFalse(te.async_commits)
+            self.assertIsNone(te._pending)
+            self.assertIsNotNone(te.db)
+        finally:
+            te.close()
+
     def test_hugepage_shared_buffer_local_overlay_precedence(self) -> None:
         """Verify that local mutations in queued_set / _pk_index overlay take precedence over shared buffer."""
         self.db.insert(fake_tbl_cached, (

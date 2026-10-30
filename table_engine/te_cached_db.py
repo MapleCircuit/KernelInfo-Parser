@@ -450,7 +450,7 @@ class TECachedDB(TEDirectDB):
         # Rows still queued from an unfinished version never reached the database
         self.wait_for_commit()
         self._drop_uncommitted_carried()
-        super().start_new_db(db)
+        super().start_new_db(db, is_worker=is_worker)
         self.clear_cache()
         self.update_in_mem_indexes = True
 

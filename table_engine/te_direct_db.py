@@ -150,6 +150,7 @@ class TEDirectDB:
         # Database reads issued by this engine (get/view fallbacks) and their seconds
         self.db_reads: int = 0
         self.db_read_s: float = 0.0
+        self.update_in_mem_indexes: bool = True
 
     def close(self) -> None:
         """Wait for a pending background commit (raising its error), then safely close the database handle."""
@@ -244,11 +245,12 @@ class TEDirectDB:
         self._queued_sec_indexes[table_id] = {idx_cols: {} for idx_cols in self._table_sec_indexes[table_id]}
         self._queued_single_col_indexes[table_id] = {col_idx: {} for col_idx in self._table_single_col_indexes[table_id]}
 
-    def start_new_db(self, db: Callable[[], Any] | type[Any]) -> None:
+    def start_new_db(self, db: Callable[[], Any] | type[Any], is_worker: bool = False) -> None:
         """Start or restart the database connection handle for Table Engine use.
 
         Args:
             db: Database class or factory callable (e.g., MariaDB or G.DB).
+            is_worker: If True, indicates invocation in a forked worker process.
 
         Process:
             1. Closes any existing active database connection handle safely.
@@ -258,6 +260,10 @@ class TEDirectDB:
         Outputs:
             None.
         """
+        if is_worker:
+            # A forked worker never owns the parent's background commit
+            self._pending = None
+            self.async_commits = False
         self.close()
         self.db = db()
         self.queued_view = {}
@@ -282,6 +288,7 @@ class TEDirectDB:
                     self.next_id[table_id] = self.db.get_next_id(table)
                 except Exception:
                     pass
+        self.update_in_mem_indexes = True
 
     def start(self, tables: Sequence[Table] | Table, db: Callable[[], Any] | type[Any]) -> None:
         """Initialize Table Engine with schema tables and connect to database.
