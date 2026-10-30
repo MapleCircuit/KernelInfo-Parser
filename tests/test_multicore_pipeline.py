@@ -395,7 +395,7 @@ class TestGitCommitWorker(unittest.TestCase):
             def __init__(self, repo_dir=None) -> None:
                 pass
 
-            def parse_version_commits_with_hunks(self, old_ver, ver):
+            def parse_version_commits_with_hunks(self, old_ver, ver, limit=None):
                 if isinstance(result, Exception):
                     raise result
                 return result

@@ -143,6 +143,40 @@ if not hasattr(ssl, "wrap_socket"):
         )
 
     ssl.wrap_socket = _compat_wrap_socket
+
+
+def _patch_connector_statement_splitter() -> None:
+    """Send every statement to the server unchanged (mysql-connector 9.x pure-Python cursor).
+
+    `MySQLCursor.execute()` (and `executemany()`, which runs the built multi-row INSERT through it) passes the
+    final SQL to `split_multi_statement()`. Whenever the text matches its `DELIMITER` pattern anywhere -
+    including inside an escaped string value such as the kernel comment `/* Transmit delimiter */` - the
+    splitter strips "comments" with a literal tracker that ignores backslash escapes: after a value holding
+    `\\'` it treats the next `#`, `--` or `/*` inside a later value as a comment and cuts the statement, so
+    the server answers 1064 (`... near ''//' at line 1`). This driver never sends DELIMITER scripts or uses
+    `map_results`, so the statement is passed through as one unmodified partition.
+    """
+    try:
+        import mysql.connector.cursor as _connector_cursor
+        from mysql.connector._scripting import MySQLScriptPartition
+    except ImportError:
+        return
+    original = getattr(_connector_cursor, "split_multi_statement", None)
+    if original is None or getattr(original, "_kip_passthrough", False):
+        return
+    from collections import deque
+
+    def _passthrough_split(sql_code: bytes, map_results: bool = False) -> Iterator[Any]:
+        if map_results:
+            yield from original(sql_code=sql_code, map_results=map_results)
+            return
+        yield MySQLScriptPartition(single_stmts=deque([]), mappable_stmt=sql_code)
+
+    _passthrough_split._kip_passthrough = True  # type: ignore[attr-defined]
+    _connector_cursor.split_multi_statement = _passthrough_split
+
+
+_patch_connector_statement_splitter()
 from core.globalstuff import (
     G,
     PointerGetter,
@@ -246,6 +280,7 @@ class MariaDB(BaseDBEngine):
 
         Outputs:
             One note per variable that changed or could not be changed (unchanged variables are omitted).
+            A user without the SUPER privilege gets a single `server tuning skipped: ...` note instead.
             Runtime changes last until the server restarts.
         """
         notes: list[str] = []
@@ -277,6 +312,14 @@ class MariaDB(BaseDBEngine):
                 self.cursor.execute(f"SELECT @@GLOBAL.{name}")
                 row = self.cursor.fetchone()
             except mysql.connector.Error as e:
+                if getattr(e, "errno", None) in (1227, 1044, 1045):
+                    # ER_SPECIFIC_ACCESS_DENIED_ERROR: the user may not SET GLOBAL anything, so stop trying
+                    # (e.g. a shared/remote server); the server keeps its own configuration
+                    notes.append(
+                        f"server tuning skipped: user '{self.user}' lacks the SUPER privilege needed for SET GLOBAL "
+                        "(set database.server_tuning values in the server's my.cnf instead)"
+                    )
+                    break
                 notes.append(f"{name}: kept {current} ({getattr(e, 'msg', e)})")
                 continue
             now = row[0] if row else None

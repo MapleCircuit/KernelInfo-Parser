@@ -27,6 +27,13 @@ RECORD_SEP = "\x1e"  # Separates commits
 FIELD_SEP = "\x1f"   # Separates fields within a commit
 BODY_END_SEP = "\x1d"  # Separates body from file status list
 
+# `git log -p` streams every changed line of every commit, so the diff stream of a wide range (a branch
+# tip thousands of releases away from the prior one spans >1M commits) is gigabytes and hours of git time.
+# These caps bound the stream when no explicit limit is given: the commits beyond them keep their DAG rows
+# from ingest_git_dag(), they only get no m_commit_file/m_bridge_commit_tag rows.
+INITIAL_HUNK_COMMIT_CAP = 1000  # whole history up to new_rev (no old_rev)
+RANGE_HUNK_COMMIT_CAP = 20000   # old_rev..new_rev
+
 # Regex to extract structured git trailers
 TRAILER_PATTERN = re.compile(
     r"^(Co-developed-by|Signed-off-by|Reviewed-by|Acked-by|Tested-by|Reported-by|Suggested-by|Merged-by|Requested-by):\s*(.+?)\s*<([^>\n\r]+)>",
@@ -99,6 +106,11 @@ class _HunkIndex:
         return found
 
 
+def _describe_git_cmd(cmd: Sequence[str]) -> str:
+    """Render git arguments for a log line, eliding the control-character `--format=` spec."""
+    return " ".join("--format=<spec>" if a.startswith("--format=") else a for a in cmd)
+
+
 class GitCommitParser:
     """Parser for git commits, merge lineages, multi-person trailers, and tag-to-commit mappings."""
 
@@ -123,14 +135,28 @@ class GitCommitParser:
                 err_msg = res.stderr.decode("utf-8", errors="replace").strip()
                 logger.warning(f"Git command '{' '.join(full_cmd[:4])}...' returned {res.returncode}: {err_msg}")
                 return ""
+            if len(res.stdout) > max_output_bytes:
+                logger.warning(
+                    f"Git command '{_describe_git_cmd(cmd)}' produced {len(res.stdout) / 1048576:.0f}MB; "
+                    f"truncated to {max_output_bytes / 1048576:.0f}MB (the records past the cut are lost)"
+                )
             out = res.stdout[:max_output_bytes]
             return out.decode("utf-8", errors="replace")
         except subprocess.TimeoutExpired:
-            logger.error(f"Git command timed out: {' '.join(full_cmd[:4])}")
+            logger.error(f"Git command timed out after {timeout:.0f}s: git -C {self.repo_dir} {_describe_git_cmd(cmd)}")
             return ""
         except Exception as e:
             logger.error(f"Failed to execute git command: {e}")
             return ""
+
+    def count_commits(self, revision_arg: str) -> int:
+        """Commit count of a revision range (`A..B` or a single ref), or -1 when git cannot report it.
+
+        `git rev-list --count` walks the DAG without reading any blob, so it sizes even a 1.5M-commit
+        range in seconds; `parse_version_commits_with_hunks()` uses it to bound its diff stream.
+        """
+        out = self._run_git(["rev-list", "--count", revision_arg, "--"], max_output_bytes=4096, timeout=600).strip()
+        return int(out) if out.isdigit() else -1
 
     @classmethod
     def extract_merge_metadata(
@@ -255,12 +281,28 @@ class GitCommitParser:
               - Dictionary mapping file_path -> [(new_start, new_end, commit_hash), ...]
         """
         EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+        range_count = 0
         if not old_rev or old_rev == EMPTY_TREE or str(old_rev) == "0":
             revision_arg = new_rev
-            max_flag = [f"-n{limit}"] if limit else ["-n1000"]
+            effective_limit = limit or INITIAL_HUNK_COMMIT_CAP
         else:
             revision_arg = f"{old_rev}..{new_rev}"
-            max_flag = [f"-n{limit}"] if limit else []
+            effective_limit = limit
+            if effective_limit is None:
+                # Sizing the range first (seconds even over 1.5M commits) keeps a branch tip far from the
+                # prior release from starving the whole stream on the subprocess timeout
+                range_count = self.count_commits(revision_arg)
+                if range_count < 0 or range_count > RANGE_HUNK_COMMIT_CAP:
+                    effective_limit = RANGE_HUNK_COMMIT_CAP
+                    logger.warning(
+                        f"[Git] '{revision_arg}' spans "
+                        f"{range_count if range_count >= 0 else 'an unreportable number of'} commits: reading diff "
+                        f"hunks for the newest {RANGE_HUNK_COMMIT_CAP} only. The older commits of the range keep "
+                        f"their DAG rows but get no m_commit_file/m_bridge_commit_tag rows."
+                    )
+        max_flag = [f"-n{effective_limit}"] if effective_limit else []
+        # ~1,800 commits/s of -U0 patch text, with a floor for the pathological commit and a hard ceiling
+        timeout = min(3600.0, max(300.0, (effective_limit or range_count) / 100.0))
 
         fmt_spec = (
             f"{RECORD_SEP}%H{FIELD_SEP}%P{FIELD_SEP}%an{FIELD_SEP}%ae{FIELD_SEP}%at{FIELD_SEP}"
@@ -274,7 +316,7 @@ class GitCommitParser:
             f"--format={fmt_spec}",
         ] + max_flag + [revision_arg, "--"]
 
-        raw_output = self._run_git(git_args)
+        raw_output = self._run_git(git_args, max_output_bytes=1024 * 1024 * 1024, timeout=timeout)
         if not raw_output:
             return [], {}
 

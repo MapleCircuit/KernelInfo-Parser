@@ -3755,7 +3755,7 @@ def _attach_blob_hash(CS: ChangeSet, blob_hashes: dict[str, bytes] | None) -> bo
 _GIT_COMMIT_RESULT = "commits.pkl"
 
 
-def _git_commit_worker(old_ver: str | int, ver: str, result_path: str, repo_dir: str | None = None) -> None:
+def _git_commit_worker(old_ver: str | int, ver: str, result_path: str, repo_dir: str | None = None, limit: int | None = None) -> None:
     """Worker process that parses git commits and diff hunks in parallel with file AST parsing.
 
     The result is pickled to `result_path` instead of a queue so the process exits as soon as parsing
@@ -3764,7 +3764,7 @@ def _git_commit_worker(old_ver: str | int, ver: str, result_path: str, repo_dir:
     try:
         from parser.git_ast import GitCommitParser
         git_parser = GitCommitParser(repo_dir=repo_dir)
-        commits, file_hunks_map = git_parser.parse_version_commits_with_hunks(old_ver, ver)
+        commits, file_hunks_map = git_parser.parse_version_commits_with_hunks(old_ver, ver, limit=limit)
         tmp_path = f"{result_path}.tmp"
         with open(tmp_path, "wb") as f:
             pickle.dump((commits, file_hunks_map), f, protocol=pickle.HIGHEST_PROTOCOL)
@@ -3783,7 +3783,13 @@ def _start_git_commit_worker() -> None:
     gp._commit_result_dir = result_dir
     proc = _MP.Process(
         target=_git_commit_worker,
-        args=(gp.Old_Version_Name, gp.Version_Name, os.path.join(result_dir, _GIT_COMMIT_RESULT), MF.get_repo_dir()),
+        args=(
+            gp.Old_Version_Name,
+            gp.Version_Name,
+            os.path.join(result_dir, _GIT_COMMIT_RESULT),
+            MF.get_repo_dir(),
+            getattr(gp, "commit_limit", None),
+        ),
         name="git-commit-parser",
         daemon=True,
     )
@@ -4389,9 +4395,15 @@ def processing_git_commits(version: str) -> None:
 
     if commits is None:
         commits, file_hunks_map = git_parser.parse_version_commits_with_hunks(
-            gp.Old_Version_Name, gp.Version_Name
+            gp.Old_Version_Name, gp.Version_Name, limit=getattr(gp, "commit_limit", None)
         )
     if not commits:
+        # An empty diff stream (git timed out or the range is empty) leaves the version without
+        # m_commit_file/m_bridge_commit_tag rows, so it is never silent
+        logger.warning(
+            f"No commit diff stream for version '{version}' "
+            f"('{gp.Old_Version_Name}'..'{gp.Version_Name}'); no file or tag rows staged for its commits."
+        )
         return
 
     logger.info(f"Processing {len(commits)} git commits for version '{version}'...")

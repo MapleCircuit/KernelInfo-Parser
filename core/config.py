@@ -429,9 +429,10 @@ def load_config(config_path: str | Path | None = None) -> dict[str, dict[str, An
         db_sec["ssh_tunnel"] = copy.deepcopy(DEFAULT_CONFIG["database"]["ssh_tunnel"])
     ssh_sec = db_sec["ssh_tunnel"]
 
-    # Keep top-level ssh_tunnel synchronized for backward compatibility
-    if "ssh_tunnel" in merged and merged["ssh_tunnel"] is not ssh_sec:
-        _deep_merge(ssh_sec, merged["ssh_tunnel"])
+    # Keep top-level ssh_tunnel synchronized for backward compatibility.
+    # Legacy file-level top-level sections were already migrated into
+    # database.ssh_tunnel at load time; merging merged["ssh_tunnel"] here would
+    # overwrite the user's database.ssh_tunnel with the built-in defaults.
     merged["ssh_tunnel"] = ssh_sec
 
     if env_ssh_enabled := (_get_user_env("SSH_TUNNEL_ENABLED") or _get_user_env("SSH_TUNNEL")):
