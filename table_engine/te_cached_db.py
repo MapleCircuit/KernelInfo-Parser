@@ -70,8 +70,14 @@ class TECachedDB(TEDirectDB):
         "m_ast_hash", "m_tag_code", "m_blob_symbol_def", "m_ast_container", "m_bridge_tag", "m_bridge_checkpoint", "m_blob_transition",
     })
 
-    def __init__(self, hugepages: str | None = None) -> None:
-        """Initialize Table Engine state and in-memory cache structures."""
+    def __init__(self, hugepages: str | None = None, preload_flush_mb: int | None = None) -> None:
+        """Initialize Table Engine state and in-memory cache structures.
+
+        Args:
+            hugepages: Huge page allocation mode, or None for `parser.hugepages`.
+            preload_flush_mb: MB of preloaded rows held on the heap before they are packed into a
+                shared-memory segment, or None for `parser.preload_flush_mb`.
+        """
         super().__init__()
         self._cached_rows: dict[int, list[tuple[SafeDataType, ...]]] = {}
         self._cached_rows_pos: dict[int, dict[Any, int]] = {}
@@ -97,8 +103,10 @@ class TECachedDB(TEDirectDB):
         if hugepages is None:
             hugepages = parser_cfg.get("hugepages", "auto")
         self.hugepages: str = str(hugepages).lower().strip()
+        if preload_flush_mb is None:
+            preload_flush_mb = parser_cfg.get("preload_flush_mb", self.PRELOAD_FLUSH_MB)
         try:
-            flush_mb = max(16, int(parser_cfg.get("preload_flush_mb", self.PRELOAD_FLUSH_MB)))
+            flush_mb = max(1, int(preload_flush_mb))
         except (TypeError, ValueError):
             flush_mb = self.PRELOAD_FLUSH_MB
         # Preloaded rows are packed into a shared-memory segment once a batch reaches this many bytes
@@ -309,9 +317,10 @@ class TECachedDB(TEDirectDB):
     def _attach_carried_views(self) -> None:
         """Expose each carried table as a view over its snapshot whose local overlay holds the rows since."""
         for table_id, overlay in self._carried_overlays.items():
-            self._cached_rows[table_id] = SharedTableRowSequenceView(self._carried_reader, table_id)
+            reader = self._carried_reader.reader_for(table_id)
+            self._cached_rows[table_id] = SharedTableRowSequenceView(reader, table_id)
             self._cached_rows_pos[table_id] = {}
-            self._pk_index[table_id] = SharedTablePKView(self._carried_reader, table_id, local=overlay)
+            self._pk_index[table_id] = SharedTablePKView(reader, table_id, local=overlay)
             self._nodup_index[table_id] = {}
             self._col_indices[table_id] = {}
 
@@ -354,7 +363,7 @@ class TECachedDB(TEDirectDB):
             table = self.tables[table_id]
             pk_fn = self._pk_getters.get(table_id) or itemgetter(*table.primary)
             rows: list[tuple[SafeDataType, ...]] = []
-            for row in SharedTableRowSequenceView(self._carried_reader, table_id):
+            for row in SharedTableRowSequenceView(self._carried_reader.reader_for(table_id), table_id):
                 if overlay and self._sanitize_key(pk_fn(row)) in overlay:
                     continue
                 rows.append(row)
@@ -366,23 +375,40 @@ class TECachedDB(TEDirectDB):
         """Carried tables find committed rows through their overlay, so they skip the `_committed_pks` copy."""
         return table_id not in self._carried_overlays
 
-    def _build_carried(self, carried_rows: dict[int, list[tuple[SafeDataType, ...]]]) -> bool:
-        """Pack freshly loaded carried tables into their own long-lived shared buffer and attach their views."""
-        builder = SharedTableBuilder(mode=self.hugepages)
-        for table_id, rows in carried_rows.items():
+    def _build_carried(self, carried_rows: dict[int, list[tuple[SafeDataType, ...]]]) -> None:
+        """Pack the freshly loaded carried tables into their own long-lived buffer and attach their views.
+
+        Each table becomes its own segment and its rows are released as soon as that segment holds them, so
+        the carried tables are never all on the heap while a packed copy of all of them is built. The rows of
+        a table that could not be packed stay in `carried_rows` for the caller to cache on the heap; its
+        snapshot is then missing, which makes the next start reload all of them (`_carry_rebuildable()`).
+        """
+        from core.globalstuff import reclaim_system_memory
+        segments = SharedTableSegments()
+        overlays: dict[int, dict[Any, tuple[SafeDataType, ...]]] = {}
+        for table_id in list(carried_rows):
             table = self.tables[table_id]
-            builder.add_table(table_id, table.length, table.primary, rows)
-        try:
-            reader = builder.build()
-        except Exception as e:
-            logger.warning(f"[TECachedDB] Failed to build the carried tables' shared buffer: {e}. Using the heap.")
-            reader = None
-        if reader is None:
-            return False
-        self._carried_reader = reader
-        self._carried_overlays = {table_id: {} for table_id in carried_rows}
+            builder = SharedTableBuilder(mode=self.hugepages)
+            builder.add_table(table_id, table.length, table.primary, carried_rows[table_id])
+            try:
+                reader = builder.build()
+            except Exception as e:
+                logger.warning(
+                    f"[TECachedDB] Failed to build the carried table {table.table_name}'s shared buffer: {e}. Using the heap."
+                )
+                break
+            if reader is None:
+                break
+            segments.add_segment(reader)
+            overlays[table_id] = {}
+            # Packed: release the heap rows before the next carried table is packed
+            del carried_rows[table_id]
+            reclaim_system_memory()
+        if not segments:
+            return
+        self._carried_reader = segments
+        self._carried_overlays = overlays
         self._attach_carried_views()
-        return True
 
     def start_new_db(self, db: Callable[[], Any] | type[Any], is_worker: bool = False) -> None:
         """Start or restart database connection and preload cached tables.
@@ -493,10 +519,12 @@ class TECachedDB(TEDirectDB):
                 pending_bytes = 0
 
         # Nothing to carry on an empty database: the first version keeps the heap cache and its eviction
-        if carried_rows and not (any(carried_rows.values()) and self._build_carried(carried_rows)):
-            for table_id, rows in carried_rows.items():
-                for proj_row in rows:
-                    self._cache_row(self.tables[table_id], proj_row)
+        if any(carried_rows.values()):
+            self._build_carried(carried_rows)
+        # Whatever _build_carried could not pack (and the rows of an empty database) stays on the heap
+        for table_id, rows in carried_rows.items():
+            for proj_row in rows:
+                self._cache_row(self.tables[table_id], proj_row)
         carried_rows = {}
 
         self._flush_preload_batch(pending, segments)
@@ -534,7 +562,8 @@ class TECachedDB(TEDirectDB):
     def _load_preload_rows(self, table: Table, min_active_vid: int) -> list[tuple[SafeDataType, ...]]:
         """Read a cached table's preload window from the database and project its rows.
 
-        The driver's list is drained as the projected rows are built, so a table is never held twice over.
+        The rows are taken over one at a time as the projected rows are built, so a table is never held
+        twice over (the driver's own list is left untouched).
         Returns an empty list when the table has no rows in the window or could not be read.
         """
         table_id = table.table_id
@@ -566,13 +595,15 @@ class TECachedDB(TEDirectDB):
         fallback_vid_col = (
             self._get_vid_col_idx(table) if (is_v_scoped and min_active_vid > 0 and not has_preload) else None
         )
-        if not isinstance(raw_rows, list):
-            raw_rows = list(raw_rows)
-        # Hand the rows over one at a time, in order: the driver's list shrinks as the projected one grows
-        raw_rows.reverse()
+        # Take the rows over one at a time, in order, so they are released as the projected ones are built
+        # instead of a table being held twice over. The drained list is this engine's own copy of the
+        # references (cheap: one pointer per row), never the list the driver returned, which it may still own.
+        pending_raw = list(raw_rows)
+        del raw_rows
+        pending_raw.reverse()
         rows: list[tuple[SafeDataType, ...]] = []
-        while raw_rows:
-            row = raw_rows.pop()
+        while pending_raw:
+            row = pending_raw.pop()
             if is_partial_query:
                 rows.append(self._reconstruct_partial_row(table, row, cached_cols))
                 continue

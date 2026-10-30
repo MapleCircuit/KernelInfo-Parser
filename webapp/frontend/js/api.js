@@ -10,6 +10,10 @@ import { state } from "./state.js";
 const HEARTBEAT_UP_MS = 30000;
 const HEARTBEAT_DOWN_MS = 5000;
 const HEARTBEAT_TIMEOUT_MS = 5000;
+// Request timeout; `timeoutMs` in a request's options raises it for the few endpoints that compute
+// (branch reachability walks the whole history of a branch).
+const REQUEST_TIMEOUT_MS = 10000;
+const BRANCH_TAGS_TIMEOUT_MS = 180000;
 
 class ApiClient {
   constructor() {
@@ -149,7 +153,7 @@ class ApiClient {
 
     // 1. Cache-First: If cache info provided and not a mutating method, return cached immediately
     //    (catalog endpoints pass networkFirst so newly parsed versions/repositories show up)
-    const { networkFirst, ...fetchOptions } = options;
+    const { networkFirst, timeoutMs, ...fetchOptions } = options;
     options = fetchOptions;
     if (!networkFirst && cacheStore && cacheKey && (!options.method || options.method === "GET")) {
       const cached = await localDB.get(cacheStore, cacheKey);
@@ -163,9 +167,9 @@ class ApiClient {
       }
     }
 
-    // 2. Fetch with 10-second timeout
+    // 2. Fetch with the request timeout (10 s unless the endpoint asked for more)
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 10000);
+    const timer = setTimeout(() => controller.abort(), timeoutMs || REQUEST_TIMEOUT_MS);
     this._onRequestStart();
     let answered = false;
 
@@ -269,6 +273,23 @@ class ApiClient {
 
   async getBranches() {
     return this.request("/api/branches", { networkFirst: true }, "files", "app_branches");
+  }
+
+  /**
+   * Tag names reachable from a branch (`/api/branch/tags`): what the header's Branch selector scopes
+   * the Tag and RC lists with (§5.13). The server walks that branch's history for it, so the request
+   * gets a long timeout and the answer is cached under the branch's stamp — a branch that moved gets
+   * a new key and is recomputed, an unchanged one is read from IndexedDB.
+   */
+  async getBranchTags(branch) {
+    const b = typeof branch === "string" ? branch.trim() : "";
+    if (!b) return { branch: "", total: 0, tags: [] };
+    return this.request(
+      `/api/branch/tags?branch=${encodeURIComponent(b)}`,
+      { timeoutMs: BRANCH_TAGS_TIMEOUT_MS },
+      "files",
+      `branch_tags_${this._vk(b)}`,
+    );
   }
 
   async getVersions(includeRc = true) {

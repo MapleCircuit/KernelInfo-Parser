@@ -1465,6 +1465,61 @@ class TestTECachedDBIntegrity(unittest.TestCase):
         finally:
             te.close()
 
+    def test_preload_packs_batches_into_separate_segments(self) -> None:
+        """Verify the preload byte budget packs tables into separate segments that still answer every query."""
+        self.db.insert(fake_tbl_cached, (
+            (1, "cached_alpha", 100),
+            (2, "cached_beta", 200),
+        ))
+        self.db.insert(fake_tbl_cached_nodup, (
+            (1, "cached_sym_1"),
+            (2, "cached_sym_2"),
+        ))
+        te = TECachedDB(hugepages="auto")
+        # One byte of budget: every table is packed and dropped from the heap as soon as it is read
+        te.preload_flush_bytes = 1
+        te.start(ALL_FAKE_TABLES, lambda: self.db)
+        try:
+            self.assertIsNotNone(te._shared_buffer)
+            self.assertGreaterEqual(len(te._shared_buffer), 2, "Each table read should have become its own segment")
+            self.assertIsNot(
+                te._shared_buffer.reader_for(fake_tbl_cached.table_id),
+                te._shared_buffer.reader_for(fake_tbl_cached_nodup.table_id),
+                "Tables of separate batches must live in separate segments",
+            )
+
+            # Queries resolve against the segment holding the table
+            self.assertEqual(te.get(fake_tbl_cached.table_id, (1, None, None)), (1, "cached_alpha", 100))
+            self.assertEqual(te.get(fake_tbl_cached.table_id, (2, None, None)), (2, "cached_beta", 200))
+            self.assertEqual(te._cached_rows[fake_tbl_cached.table_id][1], (2, "cached_beta", 200))
+            self.assertEqual(len(te._cached_rows[fake_tbl_cached.table_id]), 2)
+
+            # The deduplication index survives packing (no index inside a segment is keyed by columns[1:])
+            self.assertEqual(te._nodup_index[fake_tbl_cached_nodup.table_id][("cached_sym_1",)], 1)
+            self.assertEqual(te.get(fake_tbl_cached_nodup.table_id, (None, "cached_sym_2")), (2, "cached_sym_2"))
+
+            # The heap structures that packing discards are never built for a packed table
+            self.assertEqual(te._col_indices[fake_tbl_cached.table_id], {})
+            self.assertEqual(te._cached_rows_pos[fake_tbl_cached.table_id], {})
+
+            # Rows staged after packing take precedence over the segment
+            te.update(fake_tbl_cached.table_id, (1, "cached_alpha_mutated", 999))
+            self.assertEqual(te.get(fake_tbl_cached.table_id, (1, None, None)), (1, "cached_alpha_mutated", 999))
+        finally:
+            te.close()
+
+    def test_preload_row_handover_preserves_order(self) -> None:
+        """Verify draining the driver's row list while projecting keeps the preloaded rows in order."""
+        self.db.insert(fake_tbl_cached, tuple((i, f"row_{i}", i * 10) for i in range(1, 6)))
+        te = TECachedDB(hugepages="off")
+        te.start(ALL_FAKE_TABLES, lambda: self.db)
+        try:
+            cached = te._cached_rows[fake_tbl_cached.table_id]
+            self.assertEqual([row[0] for row in cached], [1, 2, 3, 4, 5])
+            self.assertEqual([row[1] for row in cached], [f"row_{i}" for i in range(1, 6)])
+        finally:
+            te.close()
+
 
 
 

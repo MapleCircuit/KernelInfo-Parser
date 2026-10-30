@@ -51,6 +51,15 @@ class GlobalState {
     // Revision picked in the header (Tag / RC / Branch / Commit). It changes nothing on its own:
     // **Apply** moves the active tab to it, **New Tab** opens a repository explorer on it.
     this.selectedVersion = "v3.0";
+    // Branch the header's tag lists are scoped to ("" = every tag of the repository): only the tags
+    // reachable from it are offered, since v2.6.16.62 belongs to stable/linux-2.6.16.y and not to
+    // master. It scopes what can be picked; it never moves a tab on its own.
+    this.selectedBranch = "";
+    // The tags of that branch (`GET /api/branch/tags`), null while nothing scopes them. app.js fills
+    // it; every control that offers tags goes through tagOnSelectedBranch(), so the Tag and RC lists
+    // and the Commit picker's tag search all narrow to the same set.
+    this.branchTags = null;
+    this.branchTagsFor = "";
     this.currentRepo = ""; // configured repository name ("" = server default)
     // KConfig tabs holding the Kconfig constraint engine. Several may hold it at once: each one
     // resolves its own configuration, and a code tab picks which of them it follows.
@@ -168,6 +177,45 @@ class GlobalState {
     return true;
   }
 
+  /**
+   * Scope the header's tag lists to a branch ("" = no scope, every tag): the Tag and RC dropdowns
+   * and the Commit picker's tag search. Nothing is switched and no tab is touched (§5.13).
+   */
+  setSelectedBranch(branch) {
+    const bStr = typeof branch === "string" ? branch.trim() : "";
+    if (bStr === this.selectedBranch) return false;
+    this.selectedBranch = bStr;
+    // The tags in hand are the previous branch's: nothing is scoped until the new ones are read
+    if (this.branchTagsFor !== bStr) this.setBranchTags("", null);
+    this.emit("branch:selected", bStr);
+    this.saveState();
+    return true;
+  }
+
+  /**
+   * Hold the tags of `branch` (an iterable of names, or null to scope nothing). A set for a branch
+   * that is no longer the selected one is ignored, so an answer that arrives late never scopes the
+   * lists to the wrong branch.
+   */
+  setBranchTags(branch, tags) {
+    const bStr = typeof branch === "string" ? branch.trim() : "";
+    if (!bStr || !tags) {
+      this.branchTags = null;
+      this.branchTagsFor = "";
+      return false;
+    }
+    if (bStr !== this.selectedBranch) return false;
+    this.branchTags = tags instanceof Set ? tags : new Set(tags);
+    this.branchTagsFor = bStr;
+    return true;
+  }
+
+  /** True when a tag is offered under the current branch scope (always true without one). */
+  tagOnSelectedBranch(vname) {
+    if (!this.branchTags) return true;
+    return this.branchTags.has(typeof vname === "string" ? vname : (vname?.vname || ""));
+  }
+
   /** Move the active tab (and the explored revision) to `version`; see `requestVersionSwitch`. */
   setVersion(version) {
     const vStr = GlobalState.refOf(version);
@@ -193,6 +241,8 @@ class GlobalState {
     this.currentRepo = name;
     this.currentVersion = defaultVersion || this.currentVersion;
     this.selectedVersion = this.currentVersion;
+    this.selectedBranch = ""; // branches belong to one repository
+    this.setBranchTags("", null);
     this.panes = [{ id: "pane-1", activeTabId: null, tabs: [] }];
     this.activePaneId = "pane-1";
     this.splitMode = "single";
@@ -868,6 +918,8 @@ class GlobalState {
 
     this.currentVersion = GlobalState.refOf(sessionData.version) || "v3.0";
     this.selectedVersion = GlobalState.refOf(sessionData.selectedVersion) || this.currentVersion;
+    this.selectedBranch = typeof sessionData.selectedBranch === "string" ? sessionData.selectedBranch : "";
+    this.setBranchTags("", null); // app.js reads the tags of the adopted session's branch
     if (typeof sessionData.repo === "string") this.currentRepo = sessionData.repo;
     this.splitMode = sessionData.splitMode || "single";
     this.activePaneId = sessionData.activePaneId || "pane-1";
@@ -940,6 +992,7 @@ class GlobalState {
         name: this.currentSessionName,
         version: this.currentVersion,
         selectedVersion: this.selectedVersion,
+        selectedBranch: this.selectedBranch,
         repo: this.currentRepo,
         kconfigEngineTabIds: this.kconfigEngineTabIds,
         // Only the descriptors: each engine's values live in kconfigProfiles under profileKey

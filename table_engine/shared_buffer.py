@@ -525,7 +525,7 @@ _ESTIMATE_SAMPLE = 64
 def estimate_packed_bytes(col_count: int, rows: Sequence[tuple]) -> int:
     """Estimate the shared-memory bytes `rows` will take, from a sample of them.
 
-    Used to decide when a preload batch is large enough to pack (`SharedTableBuilder.estimated_bytes`).
+    Used to decide when a preload batch is large enough to pack (`TECachedDB.start_new_db()`).
     Measuring every cell of every table would cost about as much as the packing it schedules, so the
     variable-length share is averaged over at most `_ESTIMATE_SAMPLE` rows spread across the table.
     """
@@ -569,7 +569,7 @@ class SharedTableSegments:
         for t_id, meta in reader.tables.items():
             self._owner[t_id] = reader
             self.tables[t_id] = meta
-        self.total_size += reader.total_size
+        self.total_size += getattr(reader, "total_size", 0) or 0
         page_sz = getattr(reader, "page_size", 0) or 0
         self.page_size = min(self.page_size, page_sz) if self.page_size else page_sz
 

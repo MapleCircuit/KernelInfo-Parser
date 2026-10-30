@@ -31,7 +31,9 @@
     "table_engine": "cached",
     "memory_mode": "normal",
     "fidelity": true,
-    "mem_max": 48
+    "mem_max": 48,
+    "hugepages": "auto",
+    "preload_flush_mb": 512
   },
   "mailing_list": {
     "storage_dir": "/srv/lore",

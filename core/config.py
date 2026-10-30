@@ -122,6 +122,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "fidelity": True,
         "mem_max": 60,
         "hugepages": "auto",
+        # MB of preloaded rows held on the heap before they are packed into a shared-memory segment
+        "preload_flush_mb": 512,
         # "tag": symbol definitions/references stored once per tag (core/SymbolRows.py); "blob": per blob
         "symbol_layout": "tag",
         "single_version": False,
@@ -408,6 +410,11 @@ def load_config(config_path: str | Path | None = None) -> dict[str, dict[str, An
         parser_sec["hugepages"] = env_p_hp.lower().strip()
     else:
         parser_sec["hugepages"] = str(parser_sec.get("hugepages", "auto")).lower().strip()
+
+    if env_p_flush := _get_user_env("PRELOAD_FLUSH_MB"):
+        parser_sec["preload_flush_mb"] = _coerce_int(env_p_flush, 512)
+    else:
+        parser_sec["preload_flush_mb"] = _coerce_int(parser_sec.get("preload_flush_mb"), 512)
 
     db_sec = merged.setdefault("database", copy.deepcopy(DEFAULT_CONFIG["database"]))
     if "ssh_tunnel" not in db_sec or not isinstance(db_sec["ssh_tunnel"], dict):

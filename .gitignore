@@ -9,3 +9,4 @@ linux
 scratch
 config.json
 CLAUDE.md
+.env

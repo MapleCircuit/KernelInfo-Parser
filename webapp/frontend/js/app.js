@@ -635,16 +635,16 @@ export class KernelIdeApp {
       }
     }
 
-    // 2. Branches
+    // 2. Branches: the selected one scopes the Tag and RC lists to the tags reachable from it
     if (branchSelect) {
       try {
         const bRes = await api.getBranches();
-        const branches = bRes.branches || [{ name: "master" }];
-        branchSelect.innerHTML = branches.map(b => `<option value="${b.name}" ${b.is_default ? "selected" : ""}>${b.name}</option>`).join("");
-        branchSelect.onchange = (e) => {
-          const val = e.target.value;
-          if (val) state.setSelectedVersion(val);
-        };
+        this.branches = bRes.branches || [{ name: "master" }];
+        if (state.selectedBranch && !this.branches.some((b) => b.name === state.selectedBranch)) {
+          state.setSelectedBranch(""); // the stored scope is not a branch of this repository
+        }
+        this.renderBranchSelector();
+        branchSelect.onchange = () => this.selectBranch(branchSelect.value);
       } catch (err) {
         console.warn("Could not load branches:", err);
       }
@@ -656,7 +656,10 @@ export class KernelIdeApp {
       // Every tag including release candidates; releases fill the Tag selector, -rc# the RC selector
       const res = await api.getVersions(true);
       this.buildVersionCatalog(res.versions || ["v3.0"]);
-      const branchNames = Array.from(branchSelect?.options || []).map((o) => o.value);
+      const branchNames = (this.branches || []).map((b) => b.name);
+      // The branch scope only narrows what the dropdowns offer, so it is read in the background:
+      // the lists render complete and narrow once the walk of that branch's history comes back
+      this.loadBranchScope(state.selectedBranch).then(() => this.updateVersionSelectorDisplay());
 
       // Validate and sanitize the explored and the selected revision (commit SHAs and branch names
       // are valid targets too)
@@ -695,6 +698,7 @@ export class KernelIdeApp {
         e.stopPropagation();
         refPicker.open(commitBtn, {
           current: state.selectedVersion,
+          scoped: true, // its tag search offers the releases of the selected branch (§5.13)
           onSelect: (ref) => {
             if (ref) state.setSelectedVersion(ref);
           }
@@ -728,7 +732,73 @@ export class KernelIdeApp {
     this.updateVersionSelectorDisplay();
   }
 
-  /** Reflect state.selectedVersion in the Tag dropdown, Branch dropdown and Commit picker button. */
+  /** Branch dropdown: "any branch" (no scope) plus the repository's branches, the scope selected. */
+  renderBranchSelector() {
+    const branchSelect = document.getElementById("branch-select");
+    if (!branchSelect) return;
+    const scope = state.selectedBranch;
+    const options = [
+      { value: "", label: "\u2014 any branch \u2014" },
+      ...(this.branches || []).map((b) => ({ value: b.name, label: b.is_default ? `${b.name} (default)` : b.name })),
+    ];
+    branchSelect.innerHTML = options.map((o) =>
+      `<option value="${escapeAttr(o.value)}" ${o.value === scope ? "selected" : ""}>${escapeAttr(o.label)}</option>`
+    ).join("");
+    branchSelect.title = scope
+      ? `Tag and RC lists hold the releases of ${scope} only`
+      : "Every tag of the repository; pick a branch to list only the releases on it";
+  }
+
+  /**
+   * Pick the branch the Tag and RC lists are scoped to: only the tags reachable from it are offered
+   * (a stable branch's point releases are on it, master's are not). The branch head also becomes the
+   * selected revision, so **Apply** / **New Tab** act on it; no open tab is touched either way.
+   */
+  async selectBranch(name) {
+    const branch = typeof name === "string" ? name.trim() : "";
+    state.setSelectedBranch(branch);
+    if (branch) state.setSelectedVersion(branch);
+    this.renderBranchSelector();
+    await this.loadBranchScope(branch);
+    this.updateVersionSelectorDisplay();
+  }
+
+  /**
+   * Read the tags reachable from `branch` into `state.branchTags`, the one scope every control that
+   * offers tags goes through (the Tag and RC lists here, the Commit picker's tag search in
+   * `ref_picker.js`). No branch — or a request that failed — leaves it null and every tag offered: a
+   * scope narrows the catalog, it never hides it. The server walks that branch's history, which takes
+   * seconds on a large one, so the Tag dropdown says so while it runs and a selection made in the
+   * meantime wins (the answer of an abandoned branch is dropped by `state.setBranchTags`).
+   */
+  async loadBranchScope(branch) {
+    const b = typeof branch === "string" ? branch.trim() : "";
+    if (!b) {
+      state.setBranchTags("", null);
+      return;
+    }
+    if (state.branchTagsFor === b) return; // already in hand for this branch
+    const select = document.getElementById("version-select");
+    if (select) select.title = `Reading the releases of ${b}\u2026`;
+    try {
+      const res = await api.getBranchTags(b);
+      state.setBranchTags(b, res?.tags || []);
+    } catch (err) {
+      console.warn(`Could not list the tags of ${b}:`, err);
+      if (state.selectedBranch !== b) return;
+      state.setBranchTags("", null);
+      toast.warning(`Could not list the tags of ${b}: every tag stays listed`);
+    }
+  }
+
+  /** True when a release belongs to the selected branch (itself or any of its candidates reachable). */
+  releaseOnBranch(release) {
+    const scope = state.branchTags;
+    if (!scope || !release) return true;
+    if (scope.has(release.vname)) return true;
+    return (this.rcsByBase?.get(release.vname) || []).some((rc) => scope.has(rc.vname));
+  }
+
   /**
    * Split the version catalog into releases (Tag selector) and pre-releases grouped under the release
    * they lead to (RC selector): v3.1-rc1..rc10 belong to v3.1. A release that only has candidates so
@@ -772,9 +842,12 @@ export class KernelIdeApp {
     return m ? m[1] : vname;
   }
 
+  /** Reflect the selected revision and branch scope in the Tag, RC and Branch controls. */
   updateVersionSelectorDisplay() {
     const cur = state.selectedVersion;
-    const tags = this.tagVersions || [];
+    const scope = state.branchTags; // tags of the selected branch, null while no branch scopes them
+    const branch = state.selectedBranch;
+    const tags = (this.tagVersions || []).filter((t) => this.releaseOnBranch(t));
     const tag = this.versionByName?.get(cur);
     const base = tag ? this.releaseOf(cur) : null;
 
@@ -789,10 +862,16 @@ export class KernelIdeApp {
         opt.selected = true;
         select.appendChild(opt);
       }
+      // A release the branch scope excludes is still listed while it is the selection, under a group
+      // saying so, so the dropdown never hides what it is showing
+      const offBranch = (base && !tags.some((t) => t.vname === base))
+        ? [this.tagVersions.find((t) => t.vname === base) || { vname: base, indexed: tag.indexed }]
+        : [];
       // Parsed versions first; tags only present in Git stay browsable (tree, files, diffs)
       const groups = [
         { label: "Parsed", items: tags.filter((t) => t.indexed) },
         { label: "Git only (not parsed)", items: tags.filter((t) => !t.indexed) },
+        { label: `Not on ${branch}`, items: offBranch },
       ].filter((g) => g.items.length);
       groups.forEach((g) => {
         const parent = groups.length > 1 ? document.createElement("optgroup") : select;
@@ -806,12 +885,17 @@ export class KernelIdeApp {
         });
         if (parent !== select) select.appendChild(parent);
       });
+      select.title = branch && scope
+        ? `${tags.length} release${tags.length === 1 ? "" : "s"} on ${branch}`
+        : "Every release of the repository";
     }
 
     // RC selector: the selected release's candidates, plus its final tag when it exists
     const rcSelect = document.getElementById("rc-select");
     const rcLabel = document.getElementById("rc-select-label");
-    const rcs = base ? this.rcsByBase?.get(base) || [] : [];
+    const rcs = base
+      ? (this.rcsByBase?.get(base) || []).filter((rc) => !scope || scope.has(rc.vname) || rc.vname === cur)
+      : [];
     if (rcSelect) {
       const show = rcs.length > 0;
       rcSelect.hidden = !show;
@@ -819,8 +903,9 @@ export class KernelIdeApp {
       rcSelect.innerHTML = "";
       if (show) {
         const finalTag = this.versionByName.get(base);
+        const finalListed = finalTag && (!scope || scope.has(base) || base === cur);
         const options = [
-          ...(finalTag ? [{ value: base, text: "final", indexed: finalTag.indexed }] : []),
+          ...(finalListed ? [{ value: base, text: "final", indexed: finalTag.indexed }] : []),
           ...rcs.slice().reverse().map((rc) => ({ value: rc.vname, text: rc.vname.slice(base.length + 1), indexed: rc.indexed })),
         ];
         for (const o of options) {
@@ -834,9 +919,11 @@ export class KernelIdeApp {
       }
     }
 
+    // The Branch dropdown shows what scopes these lists, not the explored revision: picking a branch
+    // narrows them (and selects that branch head), picking a tag from them leaves the scope alone.
     const branchSelect = document.getElementById("branch-select");
-    if (branchSelect && Array.from(branchSelect.options).some((o) => o.value === cur)) {
-      branchSelect.value = cur;
+    if (branchSelect && Array.from(branchSelect.options).some((o) => o.value === branch)) {
+      branchSelect.value = branch;
     }
 
     const label = document.getElementById("commit-picker-label");

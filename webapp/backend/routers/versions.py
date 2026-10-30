@@ -3,9 +3,10 @@ from __future__ import annotations
 
 import logging
 import subprocess
+from collections import OrderedDict
 from typing import Any
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, HTTPException, Query
 
 from core.config import matches_branch_filter
 from webapp.backend.config import (
@@ -17,6 +18,7 @@ from webapp.backend.config import (
 )
 from webapp.backend.database.helpers import finished_ref_sql, get_active_repo_id, hash_hex, safe_decode
 from webapp.backend.database.pool import get_db_cursor
+from webapp.backend.security.git import safe_rev
 from webapp.backend.services.git_service import GitService
 
 logger = logging.getLogger(__name__)
@@ -24,6 +26,14 @@ router = APIRouter(prefix="/api", tags=["versions"])
 git_service = GitService()
 
 PRERELEASE_MARKERS = ("-rc", "-pre", "-alpha", "-beta")
+
+# Tags reachable from a branch, keyed by (repository, branch head): what the header's Branch selector
+# scopes the Tag/RC lists with (webapp/API.md section 5.13). Git computes it by walking the branch's
+# whole history (~18 s for master of linux with its 1.5 M commits, a fraction of that for a stable
+# branch or with a Git commit-graph written), so the answer is kept per head and only recomputed when
+# the branch moves.
+_BRANCH_TAGS_CACHE: OrderedDict[tuple[str, str], list[str]] = OrderedDict()
+_BRANCH_TAGS_CACHE_MAX = 32
 
 
 def _stamp(commit_hash: str, parsed_at: Any) -> str:
@@ -197,6 +207,37 @@ def get_branches() -> dict[str, Any]:
 
     branches.sort(key=branch_sort_key)
     return {"total": len(branches), "branches": branches}
+
+
+@router.get("/branch/tags")
+def get_branch_tags(branch: str = Query(..., min_length=1)) -> dict[str, Any]:
+    """Tag names reachable from `branch`: the releases that belong to that branch's history.
+
+    This is what makes the header's **Branch** selector scope the Tag and RC dropdowns (§5.13 of
+    `webapp/API.md`): `v2.6.16.62` was tagged on `stable/linux-2.6.16.y` and is not reachable from
+    `master`, so it is listed for that branch only. `head` is the branch's current commit, which is
+    also the cache generation of the answer (a branch that moved returns a new head).
+    """
+    safe_rev(branch, "branch")
+    head_lines = _git_lines(["rev-parse", "--verify", f"{branch}^{{commit}}"], timeout=5)
+    if not head_lines:
+        raise HTTPException(status_code=404, detail=f"Unknown branch: {branch}")
+    head = head_lines[0]
+
+    key = (str(get_repo_dir()), head)
+    tags = _BRANCH_TAGS_CACHE.get(key)
+    if tags is None:
+        # One reachability walk of the branch; the timeout covers the largest histories
+        tags = _git_lines(
+            ["for-each-ref", f"--merged={branch}", "--format=%(refname:short)", "refs/tags"],
+            timeout=180,
+        )
+        _BRANCH_TAGS_CACHE[key] = tags
+        while len(_BRANCH_TAGS_CACHE) > _BRANCH_TAGS_CACHE_MAX:
+            _BRANCH_TAGS_CACHE.popitem(last=False)
+    _BRANCH_TAGS_CACHE.move_to_end(key)
+
+    return {"branch": branch, "head": head, "total": len(tags), "tags": tags}
 
 
 @router.get("/versions")

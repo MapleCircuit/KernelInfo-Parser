@@ -1,8 +1,13 @@
 /**
  * ref_picker.js - Git reference picker popover (release tags + searchable commits).
  * Shared by the header version selector and the Compare view.
+ *
+ * `scoped: true` (the header's Commit picker) offers only the tags of the branch selected there
+ * (`state.branchTags`, §5.13), so its tag search holds the same releases as the Tag dropdown beside
+ * it. The Compare view opens it unscoped: comparing two branches means reaching tags of both.
  */
 import { api } from "../api.js";
+import { state } from "../state.js";
 import { debounce } from "../utils/debounce.js";
 
 const FULL_SHA_RE = /^[0-9a-f]{40}$/i;
@@ -48,9 +53,9 @@ class RefPicker {
   /**
    * Open the picker under anchorEl.
    * @param {HTMLElement} anchorEl
-   * @param {{ current?: string, onSelect: (ref: string) => void }} options
+   * @param {{ current?: string, onSelect: (ref: string) => void, scoped?: boolean }} options
    */
-  async open(anchorEl, { current = "", onSelect }) {
+  async open(anchorEl, { current = "", onSelect, scoped = false }) {
     if (this.popover && this.anchorEl === anchorEl) {
       this.close();
       return;
@@ -59,14 +64,16 @@ class RefPicker {
     this.anchorEl = anchorEl;
     this.onSelect = onSelect;
     this.current = current;
+    this.scoped = Boolean(scoped);
 
+    const branch = this.scoped ? state.selectedBranch : "";
     const rect = anchorEl.getBoundingClientRect();
     const pop = document.createElement("div");
     pop.className = "ref-picker";
     pop.style.top = `${rect.bottom + 6}px`;
     pop.style.left = `${Math.max(8, Math.min(rect.left, window.innerWidth - 448))}px`;
     pop.innerHTML = `
-      <input type="text" class="ref-picker-input" placeholder="Search tag, commit hash, subject or author…" spellcheck="false" autocomplete="off" />
+      <input type="text" class="ref-picker-input" placeholder="${branch ? `Search a tag of ${escapeHtml(branch)}, commit hash, subject or author…` : "Search tag, commit hash, subject or author…"}" spellcheck="false" autocomplete="off" />
       <div class="ref-picker-list"><div class="ref-picker-empty">Loading…</div></div>
       <div class="ref-picker-footer">↑↓ navigate · Enter select · paste any SHA or ref name</div>
     `;
@@ -112,9 +119,12 @@ class RefPicker {
     ]);
     if (seq !== this.searchSeq || !this.popover) return;
 
+    // Scoped: only the tags of the branch selected in the header, as in the Tag dropdown (§5.13);
+    // a tag of another branch stays reachable by pasting its name (the "Revision" entry below)
     const tags = (versionsRes.status === "fulfilled" ? versionsRes.value.versions || [] : [])
       .map((v) => (typeof v === "string" ? { vname: v } : v))
-      .filter((v) => v.vname && (!q || v.vname.toLowerCase().includes(q)));
+      .filter((v) => v.vname && (!q || v.vname.toLowerCase().includes(q)))
+      .filter((v) => !this.scoped || state.tagOnSelectedBranch(v.vname));
     const commits = commitsRes.status === "fulfilled" ? commitsRes.value.commits || [] : [];
 
     this.items = [];
@@ -148,7 +158,12 @@ class RefPicker {
     }
 
     let lastKind = null;
-    const sectionTitle = { tag: "Release Tags", commit: "Commits", raw: "Revision" };
+    const branch = this.scoped ? state.selectedBranch : "";
+    const sectionTitle = {
+      tag: branch ? `Release Tags on ${escapeHtml(branch)}` : "Release Tags",
+      commit: "Commits",
+      raw: "Revision",
+    };
     list.innerHTML = this.items
       .map((it, idx) => {
         const header = it.kind !== lastKind ? `<div class="ref-picker-section">${sectionTitle[it.kind]}</div>` : "";
