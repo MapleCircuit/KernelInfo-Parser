@@ -51,6 +51,8 @@ class RecordingDriver(BaseDBEngine):
         self.next_ids: dict[str, int] = defaultdict(lambda: 1)
         self.select_returns: dict[tuple[str, tuple], tuple | None] = {}
         self.preload_returns: dict[str, list[tuple]] = defaultdict(list)
+        self.table_sizes: dict[str, int] = {}
+        self.size_calls: list[tuple[str, tuple[int, ...] | None, int | None]] = []
         self.view_select_returns: dict[tuple, tuple | None] = {}
         self.view_select_multiple_returns: dict[tuple, list[tuple]] = defaultdict(list)
         self.is_closed: bool = False
@@ -88,6 +90,16 @@ class RecordingDriver(BaseDBEngine):
         self.calls.append(("select_preload", (table.table_name, cached_columns, min_vid), {}))
         self.preload_calls.append((table.table_name, cached_columns, min_vid))
         return list(self.preload_returns.get(table.table_name, []))
+
+    def table_size(
+        self,
+        table: Table,
+        cached_columns: tuple[int, ...] | None = None,
+        min_vid: int | None = None,
+    ) -> int:
+        self.calls.append(("table_size", (table.table_name, cached_columns, min_vid), {}))
+        self.size_calls.append((table.table_name, cached_columns, min_vid))
+        return self.table_sizes.get(table.table_name, 0)
 
     def view_select(
         self,
@@ -658,6 +670,83 @@ class GenericTableEngineTestCase:
             self.te.set(t_fn.table_id, (None, "ipc/msg.c"))
             self.te.commit_all(update_in_mem_indexes=False)
             self.assertEqual(len(self.te._cached_rows), 0)
+
+    @test_feature("cache_size_ceiling", depends_on=["cache_preload_startup"])
+    def test_16_cache_size_ceiling(self) -> None:
+        """Verify a cached table measured above `cache_max_bytes` is neither preloaded nor cached."""
+        if not self.is_cached_engine:
+            raise unittest.SkipTest(f"SKIPPED: Extended in-memory caching is not applicable to '{self.engine_name}'.")
+
+        t_fn = self.test_tables.t_file_name
+        t_code = self.test_tables.t_tag_code
+
+        with test_step("Reporting one cached table above and one below the 1MB ceiling"):
+            fresh_driver = RecordingDriver()
+            fresh_driver.table_sizes[t_fn.table_name] = 4 * 1024 * 1024
+            fresh_driver.table_sizes[t_code.table_name] = 64 * 1024
+            fresh_driver.preload_returns[t_fn.table_name] = [(1, "fs/ext4/super.c")]
+            fresh_driver.preload_returns[t_code.table_name] = [(b"\x12" * 32,)]
+            fresh_te = self.te_class(cache_max_table_mb=1)
+            fresh_te.start(self.test_tables.tables_list, lambda: fresh_driver)
+
+        with test_step(
+            "Asserting the oversized table is excluded and never preloaded",
+            diagnostic="A table above the ceiling must report as uncached so every read takes the TEDirectDB path.",
+        ):
+            self.assertIn(t_fn.table_id, fresh_te._oversized)
+            self.assertFalse(fresh_te._is_cached(t_fn))
+            preload_tables = [item[0] for item in fresh_driver.preload_calls]
+            self.assertNotIn(t_fn.table_name, preload_tables)
+
+        with test_step(
+            "Asserting each table was measured as it would be cached",
+            diagnostic="The ceiling must be compared against the cached column projection, not the whole row.",
+        ):
+            measured = {name: cols for name, cols, _vid in fresh_driver.size_calls}
+            self.assertEqual(measured.get(t_code.table_name), t_code.cached_columns)
+            self.assertEqual(measured.get(t_fn.table_name), t_fn.cached_columns)
+
+        with test_step("Asserting the table below the ceiling is still preloaded and cached"):
+            self.assertNotIn(t_code.table_id, fresh_te._oversized)
+            self.assertTrue(fresh_te._is_cached(t_code))
+            self.assertIn(t_code.table_name, [item[0] for item in fresh_driver.preload_calls])
+
+        with test_step(
+            "Asserting a read of the excluded table reaches the database",
+            diagnostic="Without preloaded rows the engine must query the driver instead of answering None.",
+        ):
+            fresh_driver.select_returns[(t_fn.table_name, (1, None))] = (1, "fs/ext4/super.c")
+            row = fresh_te.get(t_fn.table_id, (1, None))
+            self.assertEqual(row, (1, "fs/ext4/super.c"))
+            self.assertIn((t_fn.table_name, (1, None)), fresh_driver.select_calls)
+            fresh_te.close()
+
+        with test_step(
+            "Asserting the ceiling is measured per start and lifts when the table fits again",
+            diagnostic="A table back under the ceiling must be cached again on the next start_new_db().",
+        ):
+            small_driver = RecordingDriver()
+            small_driver.table_sizes[t_fn.table_name] = 32 * 1024
+            small_driver.preload_returns[t_fn.table_name] = [(1, "fs/ext4/super.c")]
+            lifted_te = self.te_class(cache_max_table_mb=1)
+            lifted_te.start(self.test_tables.tables_list, lambda: small_driver)
+            self.assertEqual(lifted_te._oversized, {})
+            self.assertTrue(lifted_te._is_cached(t_fn))
+            self.assertEqual(lifted_te.get(t_fn.table_id, (1, None)), (1, "fs/ext4/super.c"))
+            self.assertEqual(len(small_driver.select_calls), 0)
+            lifted_te.close()
+
+        with test_step(
+            "Asserting no ceiling (0) never measures a table",
+            diagnostic="cache_max_table_mb=0 must keep the previous behaviour: no table_size() calls at all.",
+        ):
+            off_driver = RecordingDriver()
+            off_driver.table_sizes[t_fn.table_name] = 4 * 1024 * 1024
+            off_te = self.te_class(cache_max_table_mb=0)
+            off_te.start(self.test_tables.tables_list, lambda: off_driver)
+            self.assertEqual(off_driver.size_calls, [])
+            self.assertTrue(off_te._is_cached(t_fn))
+            off_te.close()
 
 
 # =============================================================================

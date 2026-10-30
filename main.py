@@ -2862,6 +2862,14 @@ def arg_handling() -> argparse.Namespace:
         help="Disable huge-page shared memory backing in TableEngine",
     )
     parser.add_argument(
+        "--cache-max-table-mb",
+        dest="cache_max_table_mb",
+        type=int,
+        default=None,
+        help="Ceiling (MB) on the size of one TE-cached table; a bigger one is read straight from the "
+             "database instead of being cached (0: no ceiling, default: from config)",
+    )
+    parser.add_argument(
         "--ssh-tunnel",
         dest="ssh_tunnel",
         action="store_true",
@@ -3050,12 +3058,15 @@ def arg_handling() -> argparse.Namespace:
     effective_db_engine = args.db_engine or db_cfg.get("engine") or "mariadb"
     effective_table_engine = args.table_engine or parser_cfg.get("table_engine") or "cached"
     effective_hugepages = args.hugepages or parser_cfg.get("hugepages") or "auto"
+    effective_cache_max_mb = (
+        args.cache_max_table_mb if args.cache_max_table_mb is not None else parser_cfg.get("cache_max_table_mb", 0)
+    )
     G.SYMBOL_LAYOUT = "blob" if str(parser_cfg.get("symbol_layout", "tag")).lower() == "blob" else "tag"
 
     G.DB = get_db_engine(effective_db_engine)
     EngineCls = get_table_engine(effective_table_engine)
     if issubclass(EngineCls, TECachedDB):
-        G.TE = EngineCls(hugepages=effective_hugepages)
+        G.TE = EngineCls(hugepages=effective_hugepages, cache_max_table_mb=effective_cache_max_mb)
     else:
         G.TE = EngineCls()
 

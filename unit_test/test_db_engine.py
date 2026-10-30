@@ -7,7 +7,7 @@ synthesizes a dedicated TestCase class for each engine.
 Contract coverage according to db_engine/DB_API.md:
 1. Lifecycle, Session & Health: __init__, __enter__, __exit__, close, check_if_connected
 2. DDL & Catalog Management: drop_table, create_table, test_tables
-3. Sequence Tracking & Single-Row CRUD: get_next_id, insert, select, update, select_preload
+3. Sequence Tracking & Single-Row CRUD: get_next_id, insert, select, update, select_preload, table_size
 4. Multi-Table Relational Views: view_select, view_select_multiple
 5. Parallel Multi-Table Commits: commit_tables_parallel
 6. Index Management: create_index, index_exists, remove_index, create_indexes, remove_indexes
@@ -331,6 +331,30 @@ class GenericDBEngineTestCase:
         with test_step("Executing select_preload with version filtering (min_vid=11)"):
             filtered = self.db.select_preload(t_ver, cached_columns=(0, 3), min_vid=11)
             self.assertTrue(all(r[0] >= 11 for r in filtered), "Expected all rows to satisfy vid >= 11 filter")
+
+    @test_feature("table_size", depends_on=["insert"])
+    def test_09b_table_size(self) -> None:
+        """Verify table_size reports a table's size and scales it to a column projection."""
+        t_fn = self.test_tables.t_file_name
+
+        with test_step("Querying the full size of t_file_name"):
+            full = self.db.table_size(t_fn)
+            self.assertIsInstance(full, int)
+            self.assertGreaterEqual(full, 0, "Expected a non-negative size for an existing table")
+
+        with test_step(
+            "Querying the size of every column and asserting it equals the full size",
+            diagnostic="A projection covering the whole table must not be scaled down.",
+        ):
+            self.assertEqual(self.db.table_size(t_fn, tuple(range(t_fn.length))), full)
+
+        with test_step(
+            "Querying the size of the primary key column alone",
+            diagnostic="A narrower projection must never be reported as larger than the table itself.",
+        ):
+            projected = self.db.table_size(t_fn, (0,))
+            self.assertGreaterEqual(projected, 0)
+            self.assertLessEqual(projected, full, "Expected the projected size to stay within the table's size")
 
     # =========================================================================
     # 4. Multi-Table Relational Views

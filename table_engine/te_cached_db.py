@@ -13,6 +13,8 @@ KEY RESPONSIBILITIES:
    Preloads records from the database at startup (`start()`) for tables
    where `table.te_cached` is configured, eliminating repeated database SELECT queries.
    For tables with column-level caching, only cached columns are retained in memory.
+   A cached table measured above `cache_max_bytes` (`parser.cache_max_table_mb`) is left
+   out of the cache entirely and served straight from the database (`TEDirectDB`).
 
 2. MULTI-INDEX IN-MEMORY ACCELERATION:
    - `_pk_index`: O(1) row retrieval via Primary Key (`itemgetter(*table.primary)`).
@@ -65,18 +67,29 @@ class TECachedDB(TEDirectDB):
     # segment and dropped; overridden by `parser.preload_flush_mb`. Preloading every cached table first and
     # packing afterwards needed the rows twice over (heap plus segment) at its peak.
     PRELOAD_FLUSH_MB = 512
+    # Default ceiling (MB) on the size of one cached table; a table the database reports above it is not
+    # preloaded and not cached at all, however `te_cached` configures it. 0 disables the ceiling.
+    # Overridden by `parser.cache_max_table_mb`.
+    CACHE_MAX_TABLE_MB = 0
     # Tables whose committed rows leave the heap at each commit (their keys stay in _committed_pks)
     WRITE_HEAVY_TABLES = frozenset({
         "m_ast_hash", "m_tag_code", "m_blob_symbol_def", "m_ast_container", "m_bridge_tag", "m_bridge_checkpoint", "m_blob_transition",
     })
 
-    def __init__(self, hugepages: str | None = None, preload_flush_mb: int | None = None) -> None:
+    def __init__(
+        self,
+        hugepages: str | None = None,
+        preload_flush_mb: int | None = None,
+        cache_max_table_mb: int | None = None,
+    ) -> None:
         """Initialize Table Engine state and in-memory cache structures.
 
         Args:
             hugepages: Huge page allocation mode, or None for `parser.hugepages`.
             preload_flush_mb: MB of preloaded rows held on the heap before they are packed into a
                 shared-memory segment, or None for `parser.preload_flush_mb`.
+            cache_max_table_mb: Ceiling (MB) on the size of one cached table, 0 for no ceiling, or
+                None for `parser.cache_max_table_mb`.
         """
         super().__init__()
         self._cached_rows: dict[int, list[tuple[SafeDataType, ...]]] = {}
@@ -95,6 +108,8 @@ class TECachedDB(TEDirectDB):
         # Version-scoped tables preloaded in full from a version on: table_id -> (version column, first version).
         # A primary-key miss at or after that version is final (`_miss_is_final()`).
         self._preload_window: dict[int, tuple[int, int]] = {}
+        # Cached tables the size ceiling excluded at the last start: table_id -> measured bytes
+        self._oversized: dict[int, int] = {}
         try:
             from core.config import get_parser_config
             parser_cfg = get_parser_config()
@@ -111,10 +126,56 @@ class TECachedDB(TEDirectDB):
             flush_mb = self.PRELOAD_FLUSH_MB
         # Preloaded rows are packed into a shared-memory segment once a batch reaches this many bytes
         self.preload_flush_bytes: int = flush_mb * 1024 * 1024
+        if cache_max_table_mb is None:
+            cache_max_table_mb = parser_cfg.get("cache_max_table_mb", self.CACHE_MAX_TABLE_MB)
+        try:
+            max_table_mb = max(0, int(cache_max_table_mb))
+        except (TypeError, ValueError):
+            max_table_mb = self.CACHE_MAX_TABLE_MB
+        # A cached table measured above this many bytes is not cached at all (0: no ceiling)
+        self.cache_max_bytes: int = max_table_mb * 1024 * 1024
 
     def _is_cached(self, table: Table) -> bool:
-        """Check if target table is configured for in-memory caching."""
-        return bool(getattr(table, "te_cached", False))
+        """Check if target table is configured for in-memory caching and fits the cache size ceiling.
+
+        A table the ceiling excluded (`_apply_cache_ceiling()`) reports as uncached, so every one of its
+        reads and writes takes the `TEDirectDB` path to the database instead of the in-memory caches.
+        """
+        return bool(getattr(table, "te_cached", False)) and table.table_id not in self._oversized
+
+    def _apply_cache_ceiling(self) -> None:
+        """Measure every cached table and exclude the ones above `cache_max_bytes` from caching.
+
+        Each table is measured as it would be cached: only its cached columns, and for a version-scoped
+        table only its working window, which is what `_load_preload_rows()` goes on to read.
+        Run before preloading on each start, so a table that grew past the ceiling since the last version
+        is dropped from the cache instead of preloaded, and one that is back under it is cached again.
+        A table whose size the driver cannot report (no `table_size()`, or it raised) is cached as configured.
+        """
+        self._oversized = {}
+        if not self.cache_max_bytes or self.db is None or not hasattr(self.db, "table_size"):
+            return
+        min_active_vid = self._get_min_active_vid()
+        for table in self.tables.values():
+            if not getattr(table, "te_cached", False):
+                continue
+            min_vid = min_active_vid if (self._is_version_scoped(table) and min_active_vid > 0) else None
+            try:
+                size = self.db.table_size(table, getattr(table, "cached_columns", None), min_vid)
+            except Exception as e:
+                logger.warning(f"[TECachedDB] Could not measure {table.table_name}: {e}. Caching it as configured.")
+                continue
+            if size > self.cache_max_bytes:
+                self._oversized[table.table_id] = size
+        if self._oversized:
+            excluded = ", ".join(
+                f"{self.tables[t_id].table_name} {size // (1024 * 1024):,}MB"
+                for t_id, size in sorted(self._oversized.items(), key=lambda kv: -kv[1])
+            )
+            logger.info(
+                f"[TECachedDB] {len(self._oversized)} cached table(s) above the "
+                f"{self.cache_max_bytes // (1024 * 1024):,}MB ceiling are read straight from the database: {excluded}"
+            )
 
     def _is_version_scoped(self, table: Table) -> bool:
         """Check if target table is configured for version-scoped or blob-scoped working-window caching."""
@@ -453,6 +514,8 @@ class TECachedDB(TEDirectDB):
         super().start_new_db(db, is_worker=is_worker)
         self.clear_cache()
         self.update_in_mem_indexes = True
+        # Decided before anything is preloaded or carried: a table the ceiling excludes is not cached at all
+        self._apply_cache_ceiling()
 
         carried_ids = {
             t.table_id for t in self.tables.values() if t.table_name in self.CARRIED_TABLES and self._is_cached(t)

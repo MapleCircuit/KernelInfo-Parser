@@ -15,6 +15,11 @@ symbol rows, a tag without its definitions, an AST node without its children. Co
 deduplication would then reuse them forever. `rollback_plan()` lists the deletes that bring the
 database back to the state before the run; `rollback_version()` executes them, after which the
 version is parsed again from scratch.
+
+Watermarks only point at one run's rows while that run is the newest: once another version has been
+ingested to completion on top of an interrupted one, the ids above its marks belong to both.
+`rollback_version()` detects that (`_completed_after()`) and refuses to delete, so stale marks left by
+older interrupted runs cannot take a finished version down with them.
 """
 from __future__ import annotations
 
@@ -42,6 +47,8 @@ _COMMIT_SCOPED = {"m_bridge_checkpoint", "m_commit_file", "m_bridge_commit_tag",
 _VERSION_ROWS = ("m_bridge_checkpoint", "m_arch_root")
 _DELETE_CHUNK = 50_000
 _IN_CHUNK = 1000
+# A rollback deletes millions of rows; without this heartbeat a long step looks like a hang
+_PROGRESS_EVERY = 20.0
 
 
 class RecoveryError(RuntimeError):
@@ -200,6 +207,33 @@ def _fetch_marks(cur: Any, commit_id: int, tables: Sequence[Any]) -> dict[str, i
     return {names[int(tid)]: int(mid) for tid, mid in cur.fetchall() if int(tid) in names}
 
 
+def _completed_after(cur: Any, marks: dict[str, int]) -> int | None:
+    """Head commit of a version ingested to completion after `marks` were taken, else None.
+
+    Watermarks only identify a run's rows while that run is the newest one: `begin()` records the
+    highest commit id together with the other marks, so a finished version above it was ingested
+    afterwards and its rows sit above the marks too. Deleting everything above them would then
+    destroy that finished version instead of the interrupted run.
+    """
+    commit_mark = marks.get("m_commit")
+    if commit_mark is None:
+        return None
+    cur.execute(
+        "SELECT MIN(commit_id) FROM m_ingest_state WHERE status = %s AND commit_id > %s",
+        (INGEST_DONE, commit_mark),
+    )
+    row = cur.fetchone()
+    return int(row[0]) if row and row[0] is not None else None
+
+
+def discard_marks(cnx: Any, commit_id: int) -> None:
+    """Forget a run's watermarks and parsed blobs (spent after a rollback, unusable when stale)."""
+    with contextlib.closing(cnx.cursor()) as cur:
+        cur.execute("DELETE FROM m_ingest_watermark WHERE commit_id = %s", (commit_id,))
+        cur.execute("DELETE FROM m_ingest_blob WHERE commit_id = %s", (commit_id,))
+    cnx.commit()
+
+
 def get_status(cur: Any, network_id: int, commit_id: int) -> int | None:
     cur.execute("SELECT status FROM m_ingest_state WHERE network_id = %s AND commit_id = %s", (network_id, commit_id))
     row = cur.fetchone()
@@ -208,6 +242,10 @@ def get_status(cur: Any, network_id: int, commit_id: int) -> int | None:
 
 def set_status(cnx: Any, network_id: int, commit_id: int, status: int) -> None:
     """Record a version's ingestion status (upsert) and commit."""
+    if not commit_id:
+        # commit_id 0 is the "unresolved ref" sentinel of m_git_ref, not a version being ingested
+        logger.warning("Ignoring an ingestion status for commit_id 0 (the ref has no resolved head commit).")
+        return
     with contextlib.closing(cnx.cursor()) as cur:
         cur.execute(
             "INSERT INTO m_ingest_state (network_id, commit_id, status, updated_at) VALUES (%s, %s, %s, %s) "
@@ -223,6 +261,9 @@ def set_status(cnx: Any, network_id: int, commit_id: int, status: int) -> None:
 def begin(cnx: Any, network_id: int, commit_id: int, tables: Sequence[Any]) -> dict[str, int]:
     """Mark a version as being parsed and record the watermarks of its run. Returns the marks."""
     marks: dict[str, int] = {}
+    if not commit_id:
+        logger.warning("Not watermarking a run for commit_id 0 (the ref has no resolved head commit).")
+        return marks
     with contextlib.closing(cnx.cursor()) as cur:
         cur.execute("DELETE FROM m_ingest_watermark WHERE commit_id = %s", (commit_id,))
         cur.execute("DELETE FROM m_ingest_blob WHERE commit_id = %s", (commit_id,))
@@ -240,7 +281,7 @@ def begin(cnx: Any, network_id: int, commit_id: int, tables: Sequence[Any]) -> d
 def record_blobs(cnx: Any, commit_id: int, blob_ids: Iterable[int]) -> None:
     """Record pre-existing blobs the run is about to parse (before any of their rows are written)."""
     ids = sorted(set(blob_ids))
-    if not ids:
+    if not ids or not commit_id:
         return
     with contextlib.closing(cnx.cursor()) as cur:
         for i in range(0, len(ids), _IN_CHUNK):
@@ -253,11 +294,22 @@ def record_blobs(cnx: Any, commit_id: int, blob_ids: Iterable[int]) -> None:
 
 
 def rollback_version(cnx: Any, network_id: int, commit_id: int, tables: Sequence[Any]) -> bool:
-    """Undo the rows of an interrupted run of `commit_id`. Returns False when the run left no watermarks
-    (it predates them); raises RecoveryError when older rows reference rows of the run."""
+    """Undo the rows of an interrupted run of `commit_id`. Returns False when the run left no usable
+    watermarks (it predates them, or a later version finished on top of them and the caller has to fall
+    back to a version-scoped purge); raises RecoveryError when older rows reference rows of the run."""
     with contextlib.closing(cnx.cursor()) as cur:
         marks = _fetch_marks(cur, commit_id, tables)
         if not marks:
+            return False
+        newer = _completed_after(cur, marks)
+        if newer is not None:
+            logger.warning(
+                f"Watermarks of the interrupted run of commit_id {commit_id} are stale: version commit_id "
+                f"{newer} was ingested to completion after them, so the ids above the marks no longer "
+                "belong to this run alone. Discarding them instead of deleting a finished version; only "
+                "the version-scoped rows of the interrupted run are purged."
+            )
+            discard_marks(cnx, commit_id)
             return False
         for desc, sql, params in precheck_queries(tables, marks):
             cur.execute(sql, params)
@@ -272,17 +324,31 @@ def rollback_version(cnx: Any, network_id: int, commit_id: int, tables: Sequence
     plan = rollback_plan(tables, marks, commit_id, blob_ids)
     started = time.perf_counter()
     total = 0
+    logger.info(f"Rolling back the interrupted run of commit_id {commit_id}: {len(plan)} delete step(s) to run.")
     with contextlib.closing(cnx.cursor()) as cur:
-        for d in plan:
+        for step, d in enumerate(plan, 1):
+            # Most steps match nothing; probing first keeps them off the write path and out of the log
+            cur.execute(f"SELECT 1 FROM {d.table} WHERE {d.where} LIMIT 1", d.params)  # noqa: S608
+            if cur.fetchone() is None:
+                continue
+            step_started = last_logged = time.perf_counter()
+            removed = 0
             while True:
                 cur.execute(f"{d.sql()} LIMIT {_DELETE_CHUNK}", d.params)
                 deleted = cur.rowcount or 0
                 cnx.commit()
-                total += deleted
+                removed += deleted
                 if deleted < _DELETE_CHUNK:
                     break
-            if total and d.table in marks:
-                logger.debug("Rollback of commit_id %s: %s cleared above %s", commit_id, d.table, marks[d.table])
+                if time.perf_counter() - last_logged >= _PROGRESS_EVERY:
+                    last_logged = time.perf_counter()
+                    logger.info(f"  [{step}/{len(plan)}] {d.table} ({d.where}): {removed} rows removed so far...")
+            total += removed
+            logger.info(
+                f"  [{step}/{len(plan)}] {d.table} ({d.where}): {removed} rows "
+                f"in {time.perf_counter() - step_started:.1f}s (total {total})"
+            )
+    discard_marks(cnx, commit_id)
     logger.info(
         f"Rolled back the interrupted run of commit_id {commit_id}: {total} rows removed "
         f"({len(blob_ids)} pre-existing blobs re-queued) in {time.perf_counter() - started:.1f}s."

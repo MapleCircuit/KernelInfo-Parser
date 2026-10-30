@@ -151,7 +151,7 @@ from core.globalstuff import (
     PointerType,
 )
 
-from db_engine.base import BaseDBEngine, TableCommitStat
+from db_engine.base import BaseDBEngine, TableCommitStat, estimate_column_bytes
 
 if TYPE_CHECKING:
     from core.TableHandling import Table
@@ -1388,6 +1388,77 @@ class MariaDB(BaseDBEngine):
             rows.extend(tuple(r) for r in self.cursor.fetchall())
         return rows
 
+    @staticmethod
+    def _version_predicate(table: Table) -> str | None:
+        """The `WHERE` clause restricting `table` to the versions from one `min_vid` on, or None if it has none.
+
+        `min_vid` is a commit id, so blob ids (another id space) are never compared with it.
+        """
+        col_names = [col[0] for col in table.init_columns]
+        if "vid_s" in col_names and "vid_e" in col_names:
+            return "(`vid_e` = 0 OR `vid_e` >= %s)"
+        if "vid" in col_names:
+            return "`vid` >= %s"
+        if "vid_s" in col_names:
+            return "`vid_s` >= %s"
+        if "commit_id" in col_names:
+            return "`commit_id` >= %s"
+        return None
+
+    def table_size(
+        self,
+        table: Table,
+        cached_columns: tuple[int, ...] | None = None,
+        min_vid: int | None = None,
+    ) -> int:
+        """Size of `table` in bytes, from the server's catalog statistics, scaled to a projection and window.
+
+        Args:
+            table: Target Table schema instance.
+            cached_columns: Optional 0-indexed column positions the caller would keep. A projection narrower
+                than the table returns the share those columns are estimated to take
+                (`estimate_column_bytes()` per row), never more than the table's own size.
+            min_vid: Optional minimum active version ID. The size is then that of the rows
+                `select_preload()` would return for it, counted over the table's version column.
+
+        Process:
+            Reads `DATA_LENGTH + INDEX_LENGTH` and `TABLE_ROWS` for the table from `information_schema.TABLES`
+            (both InnoDB estimates, so the result is an approximation). With `min_vid` the rows of the window
+            are counted (`SELECT COUNT(*) ... WHERE <version predicate>`, an index range scan over the window
+            the caller is about to read anyway) and the size is scaled to them.
+
+        Outputs:
+            Size in bytes, or 0 if the table is not in the catalog (not created yet).
+        """
+        self.check_if_connected()
+        self.cursor.execute(
+            "SELECT COALESCE(DATA_LENGTH, 0) + COALESCE(INDEX_LENGTH, 0), COALESCE(TABLE_ROWS, 0) "
+            "FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = %s;",
+            (table.table_name,),
+        )
+        catalog = self.cursor.fetchone()
+        if not catalog:
+            return 0
+        stored_bytes, row_count = int(catalog[0] or 0), int(catalog[1] or 0)
+        if not stored_bytes:
+            return 0
+
+        predicate = self._version_predicate(table) if (min_vid is not None and min_vid > 0) else None
+        if predicate is not None and row_count > 0:
+            self.cursor.execute(
+                f"SELECT COUNT(*) FROM `{table.table_name}` WHERE {predicate};",  # noqa: S608
+                (min_vid,),
+            )
+            window = self.cursor.fetchone()
+            # A window wider than the catalog's row estimate is the estimate being stale, not a bigger table
+            row_count = min(row_count, int(window[0] or 0)) if window else row_count
+            stored_bytes = min(stored_bytes, int(stored_bytes * row_count / max(int(catalog[1] or 0), 1)))
+
+        if not cached_columns or len(cached_columns) >= table.length:
+            return stored_bytes
+        projected = row_count * sum(estimate_column_bytes(table.init_columns[i]) for i in cached_columns)
+        return min(stored_bytes, projected)
+
     def select_preload(
         self,
         table: Table,
@@ -1420,16 +1491,9 @@ class MariaDB(BaseDBEngine):
 
             # 2. Determine version filter WHERE clause
             if has_min_vid:
-                col_names = [col[0] for col in table.init_columns]
-                if "vid_s" in col_names and "vid_e" in col_names:
-                    where_clauses.append("(`vid_e` = 0 OR `vid_e` >= %s)")
-                elif "vid" in col_names:
-                    where_clauses.append("`vid` >= %s")
-                elif "vid_s" in col_names:
-                    where_clauses.append("`vid_s` >= %s")
-                elif "commit_id" in col_names:
-                    # min_vid is a commit id; blob ids live in another id space and are never filtered by it
-                    where_clauses.append("`commit_id` >= %s")
+                predicate = self._version_predicate(table)
+                if predicate is not None:
+                    where_clauses.append(predicate)
 
             if where_clauses:
                 sql += " WHERE " + " AND ".join(where_clauses)

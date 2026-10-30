@@ -5,6 +5,7 @@ Table Engine (TEDirectDB), and ChangeSet execution.
 """
 from __future__ import annotations
 
+import re
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
 from types import TracebackType
@@ -23,6 +24,36 @@ class TableCommitStat(NamedTuple):
     inserted: int
     updated: int
     seconds: float
+
+
+def estimate_column_bytes(col_def: Sequence[str]) -> int:
+    """Stored width in bytes of one column, from its DDL definition (`("hash", "BINARY(32)", "NOT NULL")`).
+
+    Fixed-width types are exact; a `CHAR`/`BINARY` column is taken at its declared length and a
+    `TEXT`/`BLOB` column at a nominal average, which is what makes a projected table size an estimate.
+    """
+    sql_type = str(col_def[1]).upper()
+    declared_match = re.search(r"\((\d+)", sql_type)
+    declared = int(declared_match.group(1)) if declared_match else 0
+    if "TINYINT" in sql_type or "BOOL" in sql_type:
+        return 1
+    if "SMALLINT" in sql_type:
+        return 2
+    if "MEDIUMINT" in sql_type:
+        return 3
+    if "BIGINT" in sql_type or "DOUBLE" in sql_type or "DATETIME" in sql_type or "TIMESTAMP" in sql_type:
+        return 8
+    if "INT" in sql_type or "FLOAT" in sql_type or "DATE" in sql_type:
+        return 4
+    if "LONGTEXT" in sql_type or "LONGBLOB" in sql_type:
+        return 4096
+    if "MEDIUMTEXT" in sql_type or "MEDIUMBLOB" in sql_type:
+        return 2048
+    if "TEXT" in sql_type or "BLOB" in sql_type:
+        return 512
+    if "BINARY" in sql_type or "CHAR" in sql_type:
+        return max(declared, 1) + (2 if "VAR" in sql_type else 0)
+    return max(declared, 8)
 
 
 class BaseDBEngine(ABC):
@@ -201,6 +232,39 @@ class BaseDBEngine(ABC):
             list[tuple[SafeDataType, ...]]: List of row tuples containing the selected columns in requested order.
         """
 
+
+    def table_size(
+        self,
+        table: Table,
+        cached_columns: tuple[int, ...] | None = None,
+        min_vid: int | None = None,
+    ) -> int:
+        """Bytes of `table` a caller holding `cached_columns` of the rows from `min_vid` on would be sized by.
+
+        Args:
+            table (Table): Target Table schema instance.
+            cached_columns (tuple[int, ...] | None): Optional tuple of 0-indexed column positions the caller
+                would keep. When it covers fewer columns than the table has, the returned size is the share
+                those columns are estimated to take (`estimate_column_bytes()` per row), capped by the
+                table's full size; otherwise the table's full size is measured.
+            min_vid (int | None): Optional minimum active version ID. Scales the size down to the rows
+                `select_preload()` would return for it, so a version-scoped table is sized by its working
+                window instead of its whole history.
+
+        Process:
+            Reads the size the backend reports for the table (data plus indexes) and scales it to the
+            requested column projection and version window. Only the window needs counting; the table's
+            bytes and row count come from the backend's own bookkeeping, never from a row scan.
+
+        Outputs:
+            int: Size in bytes, or 0 when the backend cannot report one (an unknown size is never a ceiling
+                violation, so callers that cap what they cache - `TECachedDB.cache_max_bytes` - cache as configured).
+
+        Note:
+            Drivers reporting a size from catalog statistics (`information_schema.TABLES` on InnoDB) return an
+            estimate, not an exact byte count.
+        """
+        return 0
 
     @abstractmethod
     def insert(

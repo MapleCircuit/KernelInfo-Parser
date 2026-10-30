@@ -46,6 +46,13 @@ Any database backend assigned to `G.DB` or passed to `TableEngine.start()` must 
 - **`select_in(table: Table, col_idx: int, values: Sequence[SafeDataType]) -> list[tuple[SafeDataType, ...]]`**
   - Every row whose column `col_idx` is one of `values` (`MariaDB`: `IN` queries of 1000 values; `MockDB`: filter; base default: one `view_select_multiple()` per value). Used to load the stored symbol items of a file's previous tags.
 
+- **`table_size(table: Table, cached_columns: tuple[int, ...] | None = None, min_vid: int | None = None) -> int`**
+  - Size of the table in bytes. `MariaDB` reads `DATA_LENGTH + INDEX_LENGTH` and `TABLE_ROWS` from `information_schema.TABLES` (InnoDB statistics, so an estimate) and returns 0 for a table that is not in the catalog; `MockDB` measures the stored values.
+  - With `cached_columns` narrower than the table, returns the share those columns are estimated to take (`estimate_column_bytes()` per row, capped by the table's own size), which keeps a table like `m_tag_code` (only `hash` cached, `code` stored as `MEDIUMTEXT`: 8.1GB stored, 232MB cached) from being judged by the payload it never caches.
+  - With `min_vid`, returns the size of the rows `select_preload()` would return for it, so a version-scoped table is sized by its working window and not by its whole history. `MariaDB` counts that window with the same version predicate `select_preload()` uses (`_version_predicate()`, an index range scan over the rows the caller is about to read anyway) and scales the catalog size to it; the table's bytes and total row count are never scanned.
+  - The base implementation returns 0, meaning the size is unknown: `TECachedDB.cache_max_bytes` then caches the table as configured.
+  - Used by `TECachedDB` to leave a cached table above `cache_max_bytes` (`parser.cache_max_table_mb`) out of the cache (`table_engine/TE_API.md` §2.2).
+
 ### 2.3. Multi-Table Relational Views
 - **`view_select(tables: Sequence[Table] | dict[int, Table], joins: JoinsType, columns: tuple[SafeDataType, ...]) -> tuple[SafeDataType, ...] | None`**
   - Executes joined single-row query across relational join graph (`JoinsType`) matching non-None column filters.

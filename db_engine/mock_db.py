@@ -343,6 +343,29 @@ class MockDB(BaseDBEngine):
         wanted = set(values)
         return [row for row in self.tables_data.get(table.table_name, {}).values() if col_idx < len(row) and row[col_idx] in wanted]
 
+    def table_size(
+        self,
+        table: Table,
+        cached_columns: tuple[int, ...] | None = None,
+        min_vid: int | None = None,
+    ) -> int:
+        """Bytes the rows of `table` take, limited to `cached_columns` and to the window from `min_vid` on.
+
+        The rows live in memory here, so their values are measured one by one instead of estimated; the
+        window is the one `select_preload()` returns, so both report the same rows.
+        """
+        if not self.tables_data.get(table.table_name):
+            return 0
+        is_partial = bool(cached_columns) and len(cached_columns) < table.length
+        rows = self.select_preload(table, cached_columns=cached_columns if is_partial else None, min_vid=min_vid)
+        total = 0
+        for row in rows:
+            for val in row:
+                if val is None:
+                    continue
+                total += len(val) if isinstance(val, (str, bytes, bytearray)) else 8
+        return total
+
     def select_preload(
         self,
         table: Table,
