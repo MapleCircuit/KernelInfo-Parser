@@ -197,6 +197,10 @@ class ToolchainProfile:
             "CROSS_COMPILE": self.cross_compile,
             "CLANG_FLAGS": clang_flags,
             "CC_VERSION_TEXT": self.cc_version_text(),
+            # Exported by the top Makefile and read by Kconfig: RUSTC_VERSION_TEXT since 6.12,
+            # PAHOLE_VERSION (scripts/pahole-version.sh output, "0" without pahole) since 7.0
+            "RUSTC_VERSION_TEXT": f"rustc {self.rustc_version}" if self.rustc_version else "",
+            "PAHOLE_VERSION": self.pahole_version_number(),
             "PAHOLE": "pahole" if self.pahole_version else "",
             "RUSTC": "rustc" if self.rustc_version else "",
             "BINDGEN": "bindgen" if self.rustc_version else "",
@@ -208,6 +212,13 @@ class ToolchainProfile:
         }
         env.update(self.env)
         return env
+
+    def pahole_version_number(self) -> str:
+        """What scripts/pahole-version.sh prints: 3-digit form (v1.27 -> 127), "0" when not installed."""
+        if not self.pahole_version:
+            return "0"
+        major, minor, _ = _parse_version(self.pahole_version)
+        return f"{major}{minor:02d}"
 
     def cc_version_text(self) -> str:
         if self.is_clang:
@@ -760,8 +771,7 @@ class ToolchainShell:
         if name == "pahole-version.sh":
             if not prof.pahole_version:
                 return out("0", "pahole not installed (toolchain profile)")
-            major, minor, _ = _parse_version(prof.pahole_version)
-            return out(f"{major}{minor:02d}")
+            return out(prof.pahole_version_number())
         if name in ("rustc-version.sh", "rustc-llvm-version.sh"):
             return out(str(_canonical(prof.rustc_version)) if prof.rustc_version else "0")
         if name == "gcc-plugin.sh" and args and not stdin and "-" not in args[-1] and len(args) >= 3:

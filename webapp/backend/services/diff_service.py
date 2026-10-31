@@ -7,9 +7,12 @@ Level 3: Scoped Kconfig file and symbol deltas.
 Every side of a comparison may be a release tag, a branch, or an arbitrary commit SHA.
 """
 from __future__ import annotations
+import json
 import logging
 import posixpath
 import subprocess
+import threading
+from collections import OrderedDict
 from webapp.backend.config import get_repo_dir
 from typing import Any
 from fastapi import HTTPException
@@ -21,12 +24,96 @@ from webapp.backend.database.helpers import (
 from webapp.backend.security.jail import is_safe_rel_path
 from webapp.backend.security.sql import escape_like
 from webapp.backend.services.tree_resolver import tree_resolver, git_tree_resolver
+from webapp.backend.services.history_service import KCONFIG_TYPE_NAMES, kconfig_definitions, kconfig_field_changes
+from core.globalstuff import ASTT, is_safe_git_rev
 
 logger = logging.getLogger(__name__)
 
 KCONFIG_FTYPE = 2
 MAX_SYMBOL_DIFF_FILES = 50
 MAX_FILE_DIFF_BYTES = 512 * 1024
+
+
+KCONFIG_TYPE_CODES = {name: code for code, name in KCONFIG_TYPE_NAMES.items()}
+# Kconfig blob SHA -> {symbol: [facts]}; content addressed, so valid for every revision and repository
+_DEFS_CACHE: OrderedDict[str, dict[str, list[dict[str, Any]]]] = OrderedDict()
+_DEFS_CACHE_SIZE = 4096
+_DEFS_LOCK = threading.Lock()
+
+
+def _read_kconfig_blobs(shas: set[str]) -> dict[str, str]:
+    """Text of the Git blobs not already parsed (one `git cat-file --batch` process)."""
+    with _DEFS_LOCK:
+        missing = sorted(s for s in shas if s not in _DEFS_CACHE)
+    if not missing:
+        return {}
+    try:
+        out = subprocess.run(
+            ["git", "-C", str(get_repo_dir()), "cat-file", "--batch"],
+            input="".join(f"{sha}\n" for sha in missing).encode(),
+            capture_output=True,
+            timeout=60,
+            check=False,
+        ).stdout
+    except (OSError, subprocess.SubprocessError) as e:
+        logger.warning("git cat-file for Kconfig blobs failed: %s", e)
+        return {}
+    texts: dict[str, str] = {}
+    pos = 0
+    for sha in missing:
+        nl = out.find(b"\n", pos)
+        if nl < 0:
+            break
+        header = out[pos:nl].split()
+        if len(header) < 3 or header[1] != b"blob":
+            pos = nl + 1
+            continue
+        size = int(header[2])
+        texts[sha] = out[nl + 1:nl + 1 + size].decode("utf-8", errors="replace")
+        pos = nl + 1 + size + 1
+    return texts
+
+
+def _blob_definitions(sha: str, text: str | None) -> dict[str, list[dict[str, Any]]]:
+    """kconfig_definitions() of one blob (cached by SHA), each with its raw prompt and first default."""
+    with _DEFS_LOCK:
+        cached = _DEFS_CACHE.get(sha)
+        if cached is not None:
+            _DEFS_CACHE.move_to_end(sha)
+            return cached
+    if text is None:  # evicted since the batch read
+        text = _read_kconfig_blobs({sha}).get(sha, "")
+    from parser.kconfig_ast.kconfig_lexer import KconfigLexer
+    from parser.kconfig_ast.kconfig_parser import KconfigParser, KconfigConfig, KconfigIf, KconfigMenu, KconfigChoice
+
+    defs = kconfig_definitions(text)
+    # The compatibility fields (`prompt` without its condition, `def_val` = first default value)
+    raw: dict[str, list[tuple[str, str]]] = {}
+    try:
+        items = KconfigParser(KconfigLexer(text).tokenize(), text).parse()
+    except Exception:
+        items = []
+
+    def walk(nodes: list[Any]) -> None:
+        for node in nodes:
+            if isinstance(node, KconfigConfig):
+                raw.setdefault(node.name, []).append((node.prompt or "", node.defaults[0][0].to_string() if node.defaults else ""))
+            elif isinstance(node, (KconfigIf, KconfigMenu, KconfigChoice)):
+                walk(node.children)
+
+    walk(items)
+    for name, entries in defs.items():
+        for facts, (prompt, first) in zip(entries, raw.get(name, [])):
+            facts["prompt_text"] = prompt
+            facts["first_default"] = first
+        for facts in entries:
+            facts.setdefault("prompt_text", "")
+            facts.setdefault("first_default", "")
+    with _DEFS_LOCK:
+        _DEFS_CACHE[sha] = defs
+        while len(_DEFS_CACHE) > _DEFS_CACHE_SIZE:
+            _DEFS_CACHE.popitem(last=False)
+    return defs
 
 
 def is_kconfig_path(path: str) -> bool:
@@ -183,7 +270,15 @@ class DiffService:
             }
 
     def get_kconfig_diff(self, v1: str, v2: str) -> dict[str, Any]:
-        """Compare Kconfig files and symbol definitions between two revisions (Level 3)."""
+        """Compare Kconfig files and symbol definitions between two revisions (Level 3).
+
+        Both trees come from Git and only the Kconfig files whose blob differs are parsed: a file with
+        the same blob on both sides defines the same entries. A symbol is `added`/`removed` when no
+        Kconfig file of the other side defines it, and `changed` when the definitions in the changed
+        files differ in a property (type, prompt, defaults, dependencies including those inherited
+        from enclosing if/menu/choice blocks, selects, implies, ranges, choice, options, help); a
+        definition that only moved lines is unchanged.
+        """
         with get_db_cursor() as cursor:
             vid1, vname1, vid2, vname2 = self._resolve_pair(cursor, v1, v2)
 
@@ -204,83 +299,141 @@ class DiffService:
             tree1 = git_tree_resolver.list_tree(vname1)
             tree2 = git_tree_resolver.list_tree(vname2)
             if tree1 is None or tree2 is None:
-                syms_v1 = self._fetch_kconfig_symbols(cursor, vid1)
-                syms_v2 = self._fetch_kconfig_symbols(cursor, vid2)
-                added = sorted(k for k in syms_v2 if k not in syms_v1)
-                removed = sorted(k for k in syms_v1 if k not in syms_v2)
-                changed = sorted(k for k in syms_v1 if k in syms_v2 and syms_v1[k] != syms_v2[k])
-                empty.update({
-                    "summary": {**empty["summary"], "added": len(added), "removed": len(removed), "changed": len(changed)},
-                    "added": added,
-                    "removed": removed,
-                    "changed": changed,
-                    "symbols": (
-                        [{"name": k, "change": "added"} for k in added]
-                        + [{"name": k, "change": "removed"} for k in removed]
-                        + [{"name": k, "change": "changed"} for k in changed]
-                    ),
-                })
-                return empty
+                return self._kconfig_diff_from_tags(cursor, empty, vid1, vid2)
 
-            k1 = {p: s for p, s in tree1.items() if is_kconfig_path(p)}
-            k2 = {p: s for p, s in tree2.items() if is_kconfig_path(p)}
+        k1 = {p: s for p, s in tree1.items() if is_kconfig_path(p)}
+        k2 = {p: s for p, s in tree2.items() if is_kconfig_path(p)}
 
-            files: list[dict[str, Any]] = []
-            for p in sorted(set(k1) | set(k2)):
-                if p not in k1:
-                    files.append({"file": p, "change": "added"})
-                elif p not in k2:
-                    files.append({"file": p, "change": "removed"})
-                elif k1[p] != k2[p]:
-                    files.append({"file": p, "change": "modified"})
+        files: list[dict[str, Any]] = []
+        for p in sorted(set(k1) | set(k2)):
+            if p not in k1:
+                files.append({"file": p, "change": "added"})
+            elif p not in k2:
+                files.append({"file": p, "change": "removed"})
+            elif k1[p] != k2[p]:
+                files.append({"file": p, "change": "modified"})
+        changed_paths = {f["file"] for f in files}
 
-            blob_meta = git_tree_resolver.map_blob_hashes(cursor, list(k1.values()) + list(k2.values()))
-            unindexed = sorted({p for p, s in k1.items() if s not in blob_meta} | {p for p, s in k2.items() if s not in blob_meta})
+        defs_v1 = self._kconfig_defs(k1, changed_paths)
+        defs_v2 = self._kconfig_defs(k2, changed_paths)
+        candidates = set(defs_v1) | set(defs_v2)
+        # Files with the same blob on both sides: whatever they define exists in both revisions
+        elsewhere = self._kconfig_names_in(vname2, {p for p in k2 if p not in changed_paths}, candidates)
 
-            # A file only contributes symbols when every side it exists on is indexed; otherwise an
-            # unparsed blob would surface its whole symbol set as spuriously added or removed.
-            comparable = {
-                p for p in set(k1) | set(k2)
-                if (p not in k1 or k1[p] in blob_meta) and (p not in k2 or k2[p] in blob_meta)
-            }
-            defs_v1 = self._kconfig_defs_by_blob(cursor, {p: s for p, s in k1.items() if p in comparable}, blob_meta)
-            defs_v2 = self._kconfig_defs_by_blob(cursor, {p: s for p, s in k2.items() if p in comparable}, blob_meta)
+        symbols: list[dict[str, Any]] = []
+        for name in sorted(candidates):
+            before = defs_v1.get(name, [])
+            after = defs_v2.get(name, [])
+            if [self._comparable(d) for d in before] == [self._comparable(d) for d in after]:
+                continue
+            if not before and name not in elsewhere:
+                change = "added"
+            elif not after and name not in elsewhere:
+                change = "removed"
+            else:
+                change = "changed"
+            entry: dict[str, Any] = {"name": name, "change": change, "before": before, "after": after}
+            if len(before) == 1 and len(after) == 1:
+                entry["changes"] = kconfig_field_changes(before[0]["facts"], after[0]["facts"])
+            symbols.append(entry)
 
-            symbols: list[dict[str, Any]] = []
-            for name in sorted(set(defs_v1) | set(defs_v2)):
-                before = defs_v1.get(name, [])
-                after = defs_v2.get(name, [])
-                if not before:
-                    change = "added"
-                elif not after:
-                    change = "removed"
-                elif before != after:
-                    change = "changed"
-                else:
-                    continue
-                symbols.append({"name": name, "change": change, "before": before, "after": after})
+        added = [s["name"] for s in symbols if s["change"] == "added"]
+        removed = [s["name"] for s in symbols if s["change"] == "removed"]
+        changed = [s["name"] for s in symbols if s["change"] == "changed"]
+        return {
+            "v1": vname1,
+            "v2": vname2,
+            "summary": {
+                "added": len(added),
+                "removed": len(removed),
+                "changed": len(changed),
+                "files_added": sum(1 for f in files if f["change"] == "added"),
+                "files_removed": sum(1 for f in files if f["change"] == "removed"),
+                "files_modified": sum(1 for f in files if f["change"] == "modified"),
+            },
+            "added": added,
+            "removed": removed,
+            "changed": changed,
+            "symbols": symbols,
+            "files": files,
+            # Both trees are read from Git, so every file is compared (kept for API compatibility)
+            "unindexed_files": [],
+        }
 
-            added = [s["name"] for s in symbols if s["change"] == "added"]
-            removed = [s["name"] for s in symbols if s["change"] == "removed"]
-            changed = [s["name"] for s in symbols if s["change"] == "changed"]
-            return {
-                "v1": vname1,
-                "v2": vname2,
-                "summary": {
-                    "added": len(added),
-                    "removed": len(removed),
-                    "changed": len(changed),
-                    "files_added": sum(1 for f in files if f["change"] == "added"),
-                    "files_removed": sum(1 for f in files if f["change"] == "removed"),
-                    "files_modified": sum(1 for f in files if f["change"] == "modified"),
-                },
-                "added": added,
-                "removed": removed,
-                "changed": changed,
-                "symbols": symbols,
-                "files": files,
-                "unindexed_files": unindexed,
-            }
+    @staticmethod
+    def _comparable(d: dict[str, Any]) -> tuple:
+        """A definition without its line numbers (a definition that only moved is unchanged)."""
+        facts = {k: v for k, v in d["facts"].items() if k not in ("line_s", "line_e")}
+        return d["file"], json.dumps(facts, sort_keys=True)
+
+    @staticmethod
+    def _kconfig_defs(tree: dict[str, str], paths: set[str]) -> dict[str, list[dict[str, Any]]]:
+        """{symbol: [definition, ...]} of the given Kconfig files of one tree, parsed from Git blobs."""
+        wanted = {p: tree[p] for p in paths if p in tree}
+        texts = _read_kconfig_blobs(set(wanted.values()))
+        defs: dict[str, list[dict[str, Any]]] = {}
+        for path in sorted(wanted):
+            for name, entries in _blob_definitions(wanted[path], texts.get(wanted[path])).items():
+                for facts in entries:
+                    defs.setdefault(name, []).append({
+                        "file": path,
+                        "line": facts["line_s"],
+                        "type": KCONFIG_TYPE_CODES.get(facts["type"], 0),
+                        "prompt": facts["prompt_text"],
+                        "def_val": facts["first_default"],
+                        "facts": {k: v for k, v in facts.items() if k not in ("prompt_text", "first_default")},
+                    })
+        return defs
+
+    @staticmethod
+    def _kconfig_names_in(rev: str, paths: set[str], names: set[str]) -> set[str]:
+        """The `names` some file of `paths` defines with `config`/`menuconfig` at `rev` (one git grep)."""
+        if not paths or not names or not is_safe_git_rev(rev):
+            return set()
+        try:
+            out = subprocess.run(
+                ["git", "-C", str(get_repo_dir()), "grep", "-I", "-H", "-o", "-E",
+                 r"^[[:space:]]*(menu)?config[[:space:]]+[A-Za-z0-9_]+", rev, "--", "*Kconfig*"],
+                capture_output=True,
+                timeout=30,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError) as e:
+            logger.warning("git grep for Kconfig definitions at %s failed: %s", rev, e)
+            return set()
+        found: set[str] = set()
+        prefix = f"{rev}:"
+        for line in out.stdout.decode("utf-8", errors="replace").splitlines():
+            if line.startswith(prefix):
+                line = line[len(prefix):]
+            path, _, match = line.partition(":")
+            if path not in paths:
+                continue
+            name = match.split()[-1] if match.split() else ""
+            if name in names:
+                found.add(name)
+        return found
+
+    @staticmethod
+    def _kconfig_diff_from_tags(cursor: Any, result: dict[str, Any], vid1: int, vid2: int) -> dict[str, Any]:
+        """Without Git trees: compare the Kconfig tags (name -> set of code hashes) of two indexed versions."""
+        side1 = DiffService._fetch_kconfig_symbols(cursor, vid1)
+        side2 = DiffService._fetch_kconfig_symbols(cursor, vid2)
+        added = sorted(k for k in side2 if k not in side1)
+        removed = sorted(k for k in side1 if k not in side2)
+        changed = sorted(k for k in side1 if k in side2 and side1[k] != side2[k])
+        result.update({
+            "summary": {**result["summary"], "added": len(added), "removed": len(removed), "changed": len(changed)},
+            "added": added,
+            "removed": removed,
+            "changed": changed,
+            "symbols": (
+                [{"name": k, "change": "added"} for k in added]
+                + [{"name": k, "change": "removed"} for k in removed]
+                + [{"name": k, "change": "changed"} for k in changed]
+            ),
+        })
+        return result
 
     def get_file_diff(self, v1: str, v2: str, path: str, old_path: str = "") -> dict[str, Any]:
         """Unified Git diff of one file between two revisions (old_path for renames)."""
@@ -334,48 +487,6 @@ class DiffService:
         }
 
     @staticmethod
-    def _kconfig_defs_by_blob(
-        cursor: Any, kfiles: dict[str, str], blob_meta: dict[str, tuple[int, int]]
-    ) -> dict[str, list[dict[str, Any]]]:
-        """Return {symbol: [{file, type, prompt, def_val}, ...]} for the indexed Kconfig blobs of one tree."""
-        blob_to_paths: dict[int, list[str]] = {}
-        for p, sha in kfiles.items():
-            if sha in blob_meta:
-                blob_to_paths.setdefault(blob_meta[sha][0], []).append(p)
-        if not blob_to_paths:
-            return {}
-
-        defs: dict[str, set[tuple[str, int, str, str]]] = {}
-        blob_ids = list(blob_to_paths)
-        chunk_size = 2000
-        for i in range(0, len(blob_ids), chunk_size):
-            chunk = blob_ids[i:i + chunk_size]
-            fmt = ",".join(["%s"] * len(chunk))
-            cursor.execute(
-                f"""
-                SELECT DISTINCT bt.blob_id, s.name, s.type, s.prompt, s.def_val
-                FROM m_kconfig_symbol s
-                JOIN m_tag t ON s.ast_id = t.ast_id
-                JOIN m_bridge_tag bt ON t.tag_id = bt.tag_id
-                WHERE bt.blob_id IN ({fmt});
-                """,
-                chunk,
-            )
-            for r in cursor.fetchall():
-                name = safe_decode(r["name"])
-                if not name:
-                    continue
-                for p in blob_to_paths.get(r["blob_id"], []):
-                    defs.setdefault(name, set()).add(
-                        (p, r["type"], safe_decode(r["prompt"]) or "", safe_decode(r["def_val"]) or "")
-                    )
-        # Sorted, de-duplicated records make the before/after comparison order-independent
-        return {
-            name: [{"file": f, "type": t, "prompt": pr, "def_val": dv} for f, t, pr, dv in sorted(entries)]
-            for name, entries in defs.items()
-        }
-
-    @staticmethod
     def _fetch_commit_files(cursor: Any, commit_id: int, prefix: str = "", norm_path: str = "") -> dict[str, int]:
         if prefix:
             sql = """
@@ -423,42 +534,41 @@ class DiffService:
         return res
 
     @staticmethod
-    def _fetch_kconfig_symbols(cursor: Any, commit_id: int) -> dict[str, str]:
+    def _fetch_kconfig_symbols(cursor: Any, commit_id: int) -> dict[str, frozenset[bytes]]:
+        """{symbol: code hashes of its Kconfig definition tags} of one indexed version.
+
+        Kconfig entries are tags (m_ast name with type Kconfig_Config/Kconfig_Menuconfig): the tag
+        hash identifies the definition text, so two versions differ exactly when the sets differ.
+        """
+        types = (int(ASTT.Kconfig_Config), int(ASTT.Kconfig_Menuconfig))
+        sql_tail = """
+            JOIN m_bridge_tag bt ON bt.blob_id = {blob}
+            JOIN m_tag t ON t.tag_id = bt.tag_id
+            JOIN m_ast a ON a.ast_id = t.ast_id
+            WHERE a.type_id IN (%s, %s)
+        """
         cursor.execute(
-            """
-            SELECT s.name, s.def_val
-            FROM m_kconfig_symbol s
-            JOIN m_tag t ON s.ast_id = t.ast_id
-            JOIN m_bridge_tag bt ON t.tag_id = bt.tag_id
-            JOIN m_bridge_checkpoint bc ON bt.blob_id = bc.blob_id
-            WHERE bc.commit_id = %s;
-            """,
-            (commit_id,),
+            "SELECT a.name, t.hash FROM m_bridge_checkpoint bc" + sql_tail.format(blob="bc.blob_id") + " AND bc.commit_id = %s;",
+            (*types, commit_id),
         )
         rows = cursor.fetchall()
-        if rows:
-            return {safe_decode(r["name"]): safe_decode(r["def_val"]) for r in rows}
+        if not rows:
+            tree_map = tree_resolver.resolve_tree(commit_id, cursor)
+            blob_ids = sorted(set(tree_map.values())) if tree_map else []
+            rows = []
+            for i in range(0, len(blob_ids), 5000):
+                chunk = blob_ids[i:i + 5000]
+                fmt = ",".join(["%s"] * len(chunk))
+                cursor.execute(
+                    f"""SELECT a.name, t.hash FROM m_bridge_tag bt
+                        JOIN m_tag t ON t.tag_id = bt.tag_id
+                        JOIN m_ast a ON a.ast_id = t.ast_id
+                        WHERE a.type_id IN (%s, %s) AND bt.blob_id IN ({fmt});""",
+                    (*types, *chunk),
+                )
+                rows.extend(cursor.fetchall())
+        out: dict[str, set[bytes]] = {}
+        for r in rows:
+            out.setdefault(safe_decode(r["name"]), set()).add(bytes(r["hash"]))
+        return {k: frozenset(v) for k, v in out.items()}
 
-        tree_map = tree_resolver.resolve_tree(commit_id, cursor)
-        if not tree_map:
-            return {}
-
-        blob_ids = list(set(tree_map.values()))
-        syms: dict[str, str] = {}
-        chunk_size = 5000
-        for i in range(0, len(blob_ids), chunk_size):
-            chunk = blob_ids[i:i + chunk_size]
-            fmt = ",".join(["%s"] * len(chunk))
-            cursor.execute(
-                f"""
-                SELECT s.name, s.def_val
-                FROM m_kconfig_symbol s
-                JOIN m_tag t ON s.ast_id = t.ast_id
-                JOIN m_bridge_tag bt ON t.tag_id = bt.tag_id
-                WHERE bt.blob_id IN ({fmt});
-                """,
-                chunk,
-            )
-            for r in cursor.fetchall():
-                syms[safe_decode(r["name"])] = safe_decode(r["def_val"])
-        return syms

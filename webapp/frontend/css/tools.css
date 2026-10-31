@@ -457,6 +457,14 @@
 .compare-sym-prompt { color: var(--text-secondary); }
 .compare-sym-default { color: var(--accent-cyan); }
 .compare-sym-none { color: var(--text-muted); font-style: italic; }
+.compare-sym-changes {
+  grid-column: 1 / -1;
+  border-top: 1px solid var(--border-color);
+  padding-top: 6px;
+}
+.compare-sym-change { display: flex; flex-wrap: wrap; gap: 6px; padding: 2px 0; }
+.compare-sym-field { color: var(--text-muted); min-width: 110px; }
+.compare-sym-change code { font-family: var(--font-mono); padding: 0 4px; border-radius: 3px; overflow-wrap: anywhere; }
 
 /* Treemap view */
 .treemap-view {

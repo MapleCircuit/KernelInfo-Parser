@@ -31,16 +31,16 @@ Kernel Root Documentation (MAINTAINERS / CREDITS)
      │     └── Relational Staging:
      │           ├── AST Nodes: m_ast.view [Rule 23]
      │           ├── Code Occurrence Tags: m_tag.set (5-col, Rule 12 order), m_tag_code, m_bridge_tag (6-col)
-     │           ├── Identities: m_maintainer_person (Table 20)
-     │           ├── Subsystems: m_maintainer_section (Table 21, 8-col with blob_ref)
-     │           ├── Personnel Roles: m_maintainer_member (Table 22)
-     │           └── Match Rules: m_maintainer_pattern (Table 23)
+     │           ├── Identities: m_maintainer_person (Table 16)
+     │           ├── Subsystems: m_maintainer_section (Table 17, 8-col with blob_ref)
+     │           ├── Personnel Roles: m_maintainer_member (Table 18)
+     │           └── Match Rules: m_maintainer_pattern (Table 19)
      │
      ├── If CREDITS -> CreditsManager(CS):
      │     ├── CreditsParser: Parses contributor blocks (N:, E:, W:, P:, D:, S:)
      │     └── Relational Staging:
-     │           ├── Person Registry: m_maintainer_person (Table 20)
-     │           └── Contributor Biographies: m_credits_entry (Table 25, 8-col with blob_ref)
+     │           ├── Person Registry: m_maintainer_person (Table 16)
+     │           └── Contributor Biographies: m_credits_entry (Table 21, 8-col with blob_ref)
      │
      └─ close_prior_tags(CS) ──► No-op under immutable Git DAG architecture
   │
@@ -48,7 +48,7 @@ Kernel Root Documentation (MAINTAINERS / CREDITS)
 Subsystem File Ownership Resolution:
   ├── MaintainerMatcher: Compiles all active 'F:' and 'X:' patterns from m_maintainer_pattern
   ├── Evaluates globs against all files active in repository tree for target release
-  └── Populates file ownership bridge: m_maintainer_file (Table 24: maintainers_blob_id, fnid, sec_id)
+  └── Populates file ownership bridge: m_maintainer_file (Table 20: maintainers_blob_id, fnid, sec_id)
 ==================================================================================================
 ```
 
@@ -107,12 +107,12 @@ Subsystem File Ownership Resolution:
 
 | Table ID | Table Name | Columns | Primary Key | `no_duplicate` | Description |
 | :---: | :--- | :--- | :--- | :---: | :--- |
-| **20** | `m_maintainer_person` | `(person_id, name, email)` | `("person_id",)` | `True` | Unique contributor registry deduplicated by email address and name. |
-| **21** | `m_maintainer_section`| `(sec_id, blob_id, name, status, scm_tree, web_page, mailing_list, ast_id)` | `("sec_id",)` | `True` | Subsystem maintainer section definitions and official channels scoped to blob. |
-| **22** | `m_maintainer_member` | `(sec_id, person_id, role_type, priority)` | `("sec_id", "person_id", "role_type")` | `False` | Subsystem personnel roles: 1=Maintainer (`M:`), 2=Reviewer (`R:`), 3=Patch author (`P:`), 4=Credit (`C:`). |
-| **23** | `m_maintainer_pattern`| `(sec_id, pat_type, pattern, priority)` | `("sec_id", "pat_type", "pattern", "priority")` | `False` | Path matching rules: 1=File (`F:`), 2=Exclude (`X:`), 3=Regex (`N:`), 4=Keyword (`K:`). |
-| **24** | `m_maintainer_file` | `(maintainers_blob_id, fnid, sec_id)` | `("maintainers_blob_id", "fnid", "sec_id")` | `False` | Resolved subsystem file ownership bridge populated in post-processing. |
-| **25** | `m_credits_entry` | `(credit_id, blob_id, person_id, web_page, pgp_key, description, snail_mail, ast_id)` | `("credit_id",)` | `True` | Contributor biography records parsed from `CREDITS` scoped to blob. |
+| **16** | `m_maintainer_person` | `(person_id, name, email)` | `("person_id",)` | `True` | Unique contributor registry deduplicated by email address and name. |
+| **17** | `m_maintainer_section`| `(sec_id, blob_id, name, status, scm_tree, web_page, mailing_list, ast_id)` | `("sec_id",)` | `True` | Subsystem maintainer section definitions and official channels scoped to blob. |
+| **18** | `m_maintainer_member` | `(sec_id, person_id, role_type, priority)` | `("sec_id", "person_id", "role_type")` | `False` | Subsystem personnel roles: 1=Maintainer (`M:`), 2=Reviewer (`R:`), 3=Patch author (`P:`), 4=Credit (`C:`). |
+| **19** | `m_maintainer_pattern`| `(sec_id, pat_type, pattern, priority)` | `("sec_id", "pat_type", "pattern", "priority")` | `False` | Path matching rules: 1=File (`F:`), 2=Exclude (`X:`), 3=Regex (`N:`), 4=Keyword (`K:`). |
+| **20** | `m_maintainer_file` | `(maintainers_blob_id, fnid, sec_id)` | `("maintainers_blob_id", "fnid", "sec_id")` | `False` | Resolved subsystem file ownership bridge populated in post-processing. |
+| **21** | `m_credits_entry` | `(credit_id, blob_id, person_id, web_page, pgp_key, description, snail_mail, ast_id)` | `("credit_id",)` | `True` | Contributor biography records parsed from `CREDITS` scoped to blob. |
 
 ---
 

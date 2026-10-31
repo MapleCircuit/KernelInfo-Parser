@@ -19,8 +19,8 @@ TRI_OF = {"n": 0, "m": 1, "y": 2}
 STRING_TYPES = ("string", "int", "hex")
 
 
-def _strtoll(text: str, base: int) -> int:
-    """C strtoll(): optional whitespace/sign, 0x prefix for base 16, stops at the first bad digit."""
+def _c_number(text: str, base: int) -> int:
+    """The unbounded value C strtoll()/strtoull() read: whitespace, sign, 0x prefix for base 16."""
     m = re.match(r"\s*([+-]?)(0[xX])?([0-9a-fA-F]*)" if base == 16 else r"\s*([+-]?)()([0-9]*)", text or "")
     if not m:
         return 0
@@ -32,9 +32,47 @@ def _strtoll(text: str, base: int) -> int:
     if not digits:
         return 0
     value = int(digits, base)
-    if m.group(1) == "-":
-        value = -value
-    return max(-(1 << 63), min((1 << 63) - 1, value))
+    return -value if m.group(1) == "-" else value
+
+
+def _strtoll(text: str, base: int) -> int:
+    """C strtoll(): optional whitespace/sign, 0x prefix for base 16, stops at the first bad digit."""
+    return max(-(1 << 63), min((1 << 63) - 1, _c_number(text, base)))
+
+
+def _strtoull(text: str, base: int) -> int:
+    """C strtoull(): like strtoll, saturating at 2^64-1; a leading '-' negates in unsigned arithmetic."""
+    value = _c_number(text, base)
+    if abs(value) > (1 << 64) - 1:
+        return (1 << 64) - 1
+    return value % (1 << 64)
+
+
+def _parse_number(text: str, base: int, unsigned: bool) -> int | None:
+    """strtoll/strtoull(text, &tail, base) when the whole text is one valid number in range, else None."""
+    m = re.fullmatch(r"([ \t\n\v\f\r]*)([+-]?)(.*)", text or "", re.S)
+    sign, body = m.group(2), m.group(3)
+    if base in (0, 16) and re.match(r"0[xX][0-9a-fA-F]", body):
+        body, base = body[2:], 16
+    elif base == 0:
+        base = 8 if body.startswith("0") else 10
+    digits = re.match({8: r"[0-7]*", 10: r"[0-9]*", 16: r"[0-9a-fA-F]*"}[base], body).group(0)
+    if not digits or digits != body:
+        return None
+    value = int(digits, base)
+    value = -value if sign == "-" else value
+    if unsigned:
+        return value % (1 << 64) if abs(value) <= (1 << 64) - 1 else None
+    return value if -(1 << 63) <= value <= (1 << 63) - 1 else None
+
+
+def numeric_in_bounds(sym_type: str, text: str) -> bool:
+    """sym_string_check_bounds (Linux 7.4+): int fits a signed, hex an unsigned 64-bit integer (no ERANGE)."""
+    if sym_type == "int":
+        return -(1 << 63) <= _c_number(text, 10) <= (1 << 63) - 1
+    if sym_type == "hex":
+        return abs(_c_number(text, 16)) <= (1 << 64) - 1
+    return True
 
 
 def string_valid(sym_type: str, text: str) -> bool:
@@ -72,8 +110,22 @@ class KconfigEvaluator:
         self.choice_user: dict[str, str] = {}
         # def[S_DEF_USER].tri of choices, kept when conf_read drops their "has value" flag
         self.choice_def_tri: dict[str, str] = {}
+        # 6.11+: choice members in priority order (menu::choice_members), declaration order at first
+        self.modern_choice = bool(self.sem.get("choice_priority"))
+        self.choice_order: dict[str, list[str]] = {}
+        self._reset_choice_order()
         self.warnings: list[str] = []
         self._clear()
+
+    def _reset_choice_order(self) -> None:
+        self.choice_order = {c: list(self.syms[c]["members"]) for c in self.choices}
+
+    def _promote(self, choice: str, member: str) -> None:
+        """list_move(&sym->choice_link, &choice->choice_members): `member` gets the highest priority."""
+        order = self.choice_order.setdefault(choice, list(self.syms[choice]["members"]))
+        if member in order:
+            order.remove(member)
+        order.insert(0, member)
 
     # ------------------------------------------------------------------ cache
     def _clear(self) -> None:
@@ -116,34 +168,53 @@ class KconfigEvaluator:
             val = max(self.expr_tri(node[1]), self.expr_tri(node[2]))
         elif op == "!":
             val = 2 - self.expr_tri(node[1])
-        elif op in ("=", "!="):
-            same = self.leaf_str(node[1]) == self.leaf_str(node[2])
-            val = 2 if same == (op == "=") else 0
         else:
-            val = self._relational(op, node[1], node[2])
+            val = self._compare(op, node[1], node[2])
         # Safe to memoize: kconfig rejects dependency loops, and choices are computed before their values
         self._expr_memo[eid] = val
         return val
 
-    def _relational(self, op: str, a: int, b: int) -> int:
-        """E_LTH/E_LEQ/E_GTH/E_GEQ (Linux 4.x+): numeric when both sides parse as int/hex, else strcmp."""
-        s1, s2 = self.leaf_str(a), self.leaf_str(b)
-        t1 = self._leaf_type(a)
-        t2 = self._leaf_type(b)
-
-        def parse(text: str, other_type: str) -> int | None:
-            if other_type == "hex" or re.fullmatch(r"0[xX][0-9a-fA-F]+", text or ""):
-                return _strtoll(text, 16) if re.fullmatch(r"(0[xX])?[0-9a-fA-F]+", text or "") else None
-            return int(text) if re.fullmatch(r"-?[0-9]+", text or "") else None
-
-        if t1 == "string" and t2 == "string":
-            res = (s1 > s2) - (s1 < s2)
+    def _parse_leaf(self, text: str, sym_type: str) -> tuple[str, int]:
+        """expr_parse_string: (kind, value), kind "signed" | "unsigned" | "string" (5.0+) / "invalid"."""
+        if sym_type in ("bool", "tristate"):
+            return "signed", TRI_OF.get(text, -1)
+        if sym_type == "int":
+            value, kind = _parse_number(text, 10, False), "signed"
+        elif sym_type == "hex":
+            value, kind = _parse_number(text, 16, True), "unsigned"
         else:
-            v1, v2 = parse(s1, t2), parse(s2, t1)
-            if v1 is None or v2 is None:
+            value, kind = _parse_number(text, 0, False), "signed"
+        if value is None:
+            return ("string" if self.sem.get("compare_fallback_strcmp") else "invalid"), 0
+        return kind, value
+
+    def _compare(self, op: str, a: int, b: int) -> int:
+        """E_EQUAL/E_UNEQUAL/E_LTH/E_LEQ/E_GTH/E_GEQ of expr_calc_value.
+
+        Before 4.2 (=, != only) the values are compared as strings. Since 4.2 both sides are parsed
+        by their symbol type (bool/tristate n<m<y, int signed, hex unsigned, others strtoll base 0)
+        and compared numerically; a side that does not parse makes `<`... false (4.x) or falls
+        back to strcmp (5.0+), and = / != compare the strings.
+        """
+        s1, s2 = self.leaf_str(a), self.leaf_str(b)
+        t1, t2 = self._leaf_type(a), self._leaf_type(b)
+        k1 = k2 = "string"
+        v1 = v2 = 0
+        if self.sem.get("typed_comparisons") and (t1 != "string" or t2 != "string"):
+            k1, v1 = self._parse_leaf(s1, t1)
+            k2, v2 = self._parse_leaf(s2, t2)
+        if k1 == "string" or k2 == "string":
+            res = (s1 > s2) - (s1 < s2)
+        elif k1 == "invalid" or k2 == "invalid":
+            if op not in ("=", "!="):
                 return 0
+            res = (s1 > s2) - (s1 < s2)
+        elif k1 == "unsigned" or k2 == "unsigned":
+            u1, u2 = v1 % (1 << 64), v2 % (1 << 64)
+            res = (u1 > u2) - (u1 < u2)
+        else:
             res = (v1 > v2) - (v1 < v2)
-        ok = {"<": res < 0, "<=": res <= 0, ">": res > 0, ">=": res >= 0}[op]
+        ok = {"=": res == 0, "!=": res != 0, "<": res < 0, "<=": res <= 0, ">": res > 0, ">=": res >= 0}[op]
         return 2 if ok else 0
 
     def expr_str(self, eid: int, with_values: bool = False) -> str:
@@ -175,6 +246,9 @@ class KconfigEvaluator:
         node = self.exprs[eid]
         if node[0] == "s" and node[1] in self.syms:
             return self.syms[node[1]]["type"]
+        # Quoted "y"/"m"/"n" are the same constant symbols (sym_lookup)
+        if node[1] in TRI_OF and self.sem.get("const_tristate_type"):
+            return "tristate"  # symbol_yes/mod/no are typed S_TRISTATE since 6.10
         return "unknown"
 
     # ------------------------------------------------------------------ symbol values
@@ -224,6 +298,11 @@ class KconfigEvaluator:
         if name in self._vis:
             return self._vis[name]
         s = self.syms[name]
+        if s.get("transitional"):
+            # SYMBOL_TRANS (6.18+): visible, so its .config value is used; dependencies are never computed
+            self._vis[name] = 2
+            self._dir[name] = self._rev[name] = self._implied[name] = 0
+            return 2
         vis = 0
         hide_mod = (self.sem.get("tristate_choice_mod_hidden") and s.get("choice") and s["type"] == "tristate"
                     and self.sym_tri(s["choice"]) == 2)
@@ -247,6 +326,8 @@ class KconfigEvaluator:
             rev = 2
         self._rev[name] = rev
         implied = self.expr_tri(s["implied"]) if s.get("implied", -1) >= 0 else 0
+        if implied and self.sem.get("implied_needs_dir_dep") and dir_dep == 0:
+            implied = 0  # 4.10-5.6: imply only acts on symbols whose dependencies are met
         if implied == 1 and self.get_type(name) == "bool":
             implied = 2
         self._implied[name] = implied
@@ -291,8 +372,12 @@ class KconfigEvaluator:
         rev = self._rev[name]
         stype = self.get_type(name)
         choice = s.get("choice")
+        prop = None  # the default property used (sym_calc_value's `prop`)
         if not string_type:
-            if choice and vis == 2:
+            if choice and self.modern_choice:
+                # sym_calc_choice sets the visible members (6.11+); a hidden member stays n
+                newval = 2 if vis != 0 and self.choice_selection(choice) == name else 0
+            elif choice and vis == 2:
                 newval = 2 if self.choice_selection(choice) == name else 0
             else:
                 newval = 0
@@ -315,10 +400,15 @@ class KconfigEvaluator:
                         implied = self._implied.get(name, 0)
                         if implied != 0:
                             write = True
-                            newval = min(max(newval, implied), self._dir[name])
+                            newval = max(newval, implied)
+                            if self.sem.get("imply_obeys_dir_dep", True):  # 5.7+
+                                newval = min(newval, self._dir[name])
                 newval = max(newval, rev)
             if newval == 1 and stype == "bool":
                 newval = 2
+            elif newval == 1 and self.sem.get("implied_y_forces_y") and self._implied.get(name, 0) == 2:
+                newval = 2  # 4.10-5.6: a symbol implied by y cannot be m
+            self._inherit_transitional(name, prop, TRI_CHAR[newval])
             self._cur[name] = newval
         else:
             newval = self._empty(s["type"])
@@ -331,10 +421,11 @@ class KconfigEvaluator:
                 if prop is not None:
                     write = True
                     newval = self.leaf_str(prop[0])
+            self._inherit_transitional(name, prop, newval)
             self._cur[name] = newval
             if s["type"] in ("int", "hex"):
                 self._validate_range(name)
-        if s.get("is_choice") and self._cur[name] == 2:
+        if s.get("is_choice") and self._cur[name] == 2 and not self.modern_choice:
             self._sel[name] = self._calc_choice(name)
         if choice:
             # A written choice writes its visible values (sticky SYMBOL_WRITE in kconfig)
@@ -342,34 +433,67 @@ class KconfigEvaluator:
                 write = True
         if s.get("is_choice"):
             self._write["\0raw:" + name] = write
-        if s.get("auto"):
+        if s.get("auto") or s.get("transitional"):
             write = False
         self._write[name] = write
+
+    def _inherit_transitional(self, name: str, prop: tuple[int, int] | None, newval: str) -> None:
+        """6.18+: a value defaulting to a transitional symbol that has a .config value becomes a user value."""
+        if prop is None or self.has_user(name):
+            return
+        node = self.exprs[prop[0]]
+        if node[0] == "s" and self.syms.get(node[1], {}).get("transitional") and self.has_user(node[1]):
+            self.user[name] = newval
 
     def _choice_raw_write(self, choice: str) -> bool:
         self._calc(choice)
         return self._write.get("\0raw:" + choice, False)
 
-    def _validate_range(self, name: str) -> None:
-        s = self.syms[name]
-        base = 16 if s["type"] == "hex" else 10
-        for lo_id, hi_id, vis_id in s["ranges"]:
-            if self.expr_tri(vis_id) == 0:
-                continue
-            val = _strtoll(self._cur[name], base)
-            bound = self._range_val(lo_id, base)
-            if val >= bound:
-                bound = self._range_val(hi_id, base)
-                if val <= bound:
-                    return
-            self._cur[name] = str(bound) if s["type"] == "int" else f"0x{bound & ((1 << 64) - 1):x}"
-            return
+    def _active_range(self, name: str) -> tuple[int, int] | None:
+        """sym_get_range_prop: the first range whose condition is not n."""
+        for lo_id, hi_id, vis_id in self.syms[name]["ranges"]:
+            if self.expr_tri(vis_id) != 0:
+                return lo_id, hi_id
+        return None
 
-    def _range_val(self, eid: int, base: int) -> int:
+    def _near_range_bound(self, name: str, value: str) -> int | None:
+        """sym_get_near_range_bound: the bound an out-of-range value is moved to (None: in range)."""
+        t = self.syms[name]["type"]
+        rng = self._active_range(name)
+        if rng is None or t not in ("int", "hex"):
+            return None
+        base = 16 if t == "hex" else 10
+        unsigned = base == 16 and self.sem.get("hex_range_unsigned")
+        conv = _strtoull if unsigned else _strtoll
+        val = conv(value, base)
+        if val >= self._range_val(rng[0], base, unsigned):
+            if val <= self._range_val(rng[1], base, unsigned):
+                return None
+            return rng[1]
+        return rng[0]
+
+    def _bound_text(self, name: str, bound_id: int) -> str:
+        """The value an out-of-range value becomes: the bound's own value (6.7+) or it reformatted."""
+        if self.sem.get("range_bound_text"):
+            return self.leaf_str(bound_id)
+        t = self.syms[name]["type"]
+        base = 16 if t == "hex" else 10
+        bound = self._range_val(bound_id, base)
+        return str(bound) if t == "int" else f"0x{bound & ((1 << 64) - 1):x}"
+
+    def _validate_range(self, name: str) -> None:
+        bound_id = self._near_range_bound(name, self._cur[name])
+        if bound_id is not None:
+            self._cur[name] = self._bound_text(name, bound_id)
+
+    def _range_val(self, eid: int, base: int, unsigned: bool = False) -> int:
+        """sym_get_range_val: a bound naming an int/hex symbol is read in that symbol's base."""
         node = self.exprs[eid]
         if node[0] == "s" and self.is_defined(node[1]):
             t = self.syms[node[1]]["type"]
             base = 10 if t == "int" else 16 if t == "hex" else base
+        if unsigned and base == 16:
+            return _strtoull(self.leaf_str(eid), base)
         return _strtoll(self.leaf_str(eid), base)
 
     def _choice_default(self, choice: str) -> str | None:
@@ -398,7 +522,27 @@ class KconfigEvaluator:
             self._cur[choice] = 0
         return selected
 
+    def _calc_choice_modern(self, choice: str) -> str | None:
+        """sym_calc_choice (6.11+): members by priority, then the default, then declaration order."""
+        members = self.syms[choice]["members"]
+        order = self.choice_order.get(choice) or members
+        res = next((m for m in order if self.visibility(m) != 0 and self.user.get(m) == "y"), None)
+        if res is None:
+            res = self._choice_default(choice)
+            if res is not None and self.user.get(res) == "n":
+                res = None
+        if res is None:
+            res = next((m for m in members if self.visibility(m) != 0 and not self.has_user(m)), None)
+        if res is None:
+            res = next((m for m in reversed(order) if self.visibility(m) != 0), None)
+        return res
+
     def choice_selection(self, choice: str) -> str | None:
+        if self.modern_choice:
+            if choice not in self._sel:
+                self._sel[choice] = None  # provisional value on recursion
+                self._sel[choice] = self._calc_choice_modern(choice)
+            return self._sel[choice]
         self._calc(choice)
         return self._sel.get(choice) if self._cur[choice] == 2 else None
 
@@ -408,6 +552,8 @@ class KconfigEvaluator:
 
     def is_changeable(self, name: str) -> bool:
         """sym_is_changable."""
+        if self.modern_choice and self.syms[name].get("is_choice"):
+            return False
         return self.visibility(name) > self.rev_dep(name)
 
     # ------------------------------------------------------------------ setting values (symbol.c)
@@ -421,7 +567,9 @@ class KconfigEvaluator:
             return False
         if vis <= self.rev_dep(name):
             return False
-        if s.get("choice") and vis == 2:
+        if val == 1 and self.sem.get("implied_y_forces_y") and self._implied.get(name, 0) == 2:
+            return False  # 4.10-5.6
+        if s.get("choice") and vis == 2 and not self.modern_choice:
             return val == 2
         return self.rev_dep(name) <= val <= vis
 
@@ -432,6 +580,9 @@ class KconfigEvaluator:
             return False
         s = self.syms[name]
         choice = s.get("choice")
+        if choice and val == 2 and self.modern_choice:
+            self.choice_set_value(choice, name)
+            return True
         if choice and val == 2:
             self.choice_user[choice] = name
             self.user.setdefault(choice, "n")
@@ -442,6 +593,15 @@ class KconfigEvaluator:
         self.invalidate()
         return True
 
+    def choice_set_value(self, choice: str, name: str) -> None:
+        """choice_set_value (6.11+): `name` y, the other visible members n, each promoted in turn."""
+        for member in self.syms[choice]["members"]:
+            if self.visibility(member) == 0:
+                continue
+            self.user[member] = "y" if member == name else "n"
+            self._promote(choice, member)
+        self.invalidate()
+
     def string_within_range(self, name: str, text: str) -> bool:
         s = self.syms[name]
         t = s["type"]
@@ -450,13 +610,15 @@ class KconfigEvaluator:
         if t in ("int", "hex"):
             if not string_valid(t, text):
                 return False
+            if self.sem.get("numeric_bounds_check") and not numeric_in_bounds(t, text):
+                return False
             base = 16 if t == "hex" else 10
-            for lo_id, hi_id, vis_id in s["ranges"]:
-                if self.expr_tri(vis_id) == 0:
-                    continue
-                val = _strtoll(text, base)
-                return self._range_val(lo_id, base) <= val <= self._range_val(hi_id, base)
-            return True
+            rng = self._active_range(name)
+            if rng is None:
+                return True
+            unsigned = base == 16 and self.sem.get("hex_range_unsigned")
+            val = (_strtoull if unsigned else _strtoll)(text, base)
+            return self._range_val(rng[0], base, unsigned) <= val <= self._range_val(rng[1], base, unsigned)
         if t in ("bool", "tristate") and text:
             return self.tristate_within_range(name, TRI_OF.get(text[0].lower(), -1))
         return False
@@ -479,6 +641,11 @@ class KconfigEvaluator:
 
     def toggle(self, name: str) -> int:
         """sym_toggle_tristate_value: n -> m -> y -> n, skipping values out of range."""
+        choice = self.syms[name].get("choice")
+        if choice and self.modern_choice:
+            # sym_toggle_tristate_value: a choice member is selected (6.11+)
+            self.choice_set_value(choice, name)
+            return self.sym_tri(name)
         old = new = self.sym_tri(name)
         while True:
             new = (new + 1) % 3
@@ -492,6 +659,7 @@ class KconfigEvaluator:
         self.user.clear()
         self.choice_user.clear()
         self.choice_def_tri.clear()
+        self._reset_choice_order()
         report: dict[str, Any] = {"unknown": [], "invalid": [], "warnings": []}
         choice_flag: dict[str, bool] = {c: True for c in self.choices}
         choice_tri: dict[str, int] = {c: 0 for c in self.choices}
@@ -500,6 +668,10 @@ class KconfigEvaluator:
             self.user[name] = val
             choice = self.syms[name].get("choice")
             if not choice:
+                return
+            if self.modern_choice:
+                # The last assignment to a member wins: it gets the highest priority (6.11+)
+                self._promote(choice, name)
                 return
             tri = TRI_OF.get(val, 0)
             if tri == 1 and choice_tri[choice] == 2:
@@ -565,8 +737,9 @@ class KconfigEvaluator:
                     self.user[name] = val
                 else:
                     report["invalid"].append({"symbol": name, "value": val})
-        for choice in self.choices:
-            self.user[choice] = self.choice_def_tri[choice] = TRI_CHAR[choice_tri[choice]]
+        if not self.modern_choice:
+            for choice in self.choices:
+                self.user[choice] = self.choice_def_tri[choice] = TRI_CHAR[choice_tri[choice]]
         self.invalidate()
 
         # conf_read: count values that differ from what would be saved, settle choice flags
@@ -575,9 +748,10 @@ class KconfigEvaluator:
             if s["type"] == "unknown":
                 continue
             if s.get("is_choice"):
-                for member in s["members"]:
-                    if self.visibility(member) != 0 and member not in self.user:
-                        choice_flag[name] = False
+                if not self.modern_choice:
+                    for member in s["members"]:
+                        if self.visibility(member) != 0 and member not in self.user:
+                            choice_flag[name] = False
                 continue
             if s.get("auto"):
                 continue
@@ -587,16 +761,20 @@ class KconfigEvaluator:
                     unsaved += 1
             elif self.has_user(name) or written:
                 unsaved += 1
-        for choice, keep in choice_flag.items():
-            if not keep:
-                self.user.pop(choice, None)
+        if not self.modern_choice:
+            for choice, keep in choice_flag.items():
+                if not keep:
+                    self.user.pop(choice, None)
+        keep_invisible = self.sem.get("conf_read_keeps_invisible")
+        keep_out_of_range = self.sem.get("conf_read_keeps_out_of_range")
         for name in list(self.user):
             s = self.syms.get(name)
             if s is None or s.get("choice"):
                 continue
-            if self.visibility(name) == 0 and not unsaved:
+            if self.visibility(name) == 0 and not unsaved and not keep_invisible:
                 del self.user[name]
-            elif s["type"] in STRING_TYPES and not self.string_within_range(name, self.user[name]):
+            elif (s["type"] in STRING_TYPES and not keep_out_of_range
+                  and not self.string_within_range(name, self.user[name])):
                 del self.user[name]
                 unsaved += 1
         self.invalidate()
@@ -607,11 +785,18 @@ class KconfigEvaluator:
         """conf_set_all_new_symbols for 'yes' / 'mod' / 'no' / 'default' (all*config, defconfig)."""
         fill = {"yes": "y", "mod": "m", "no": "n"}.get(mode)
         for name, s in self.syms.items():
-            if self.has_user(name) or s["type"] == "unknown":
+            # Transitional symbols have no prompt: conf_set_all_new_symbols never assigns them
+            if self.has_user(name) or s["type"] == "unknown" or s.get("transitional"):
+                continue
+            # 6.11+: choices and their members are left to sym_calc_choice
+            if self.modern_choice and (s.get("choice") or s.get("is_choice")):
                 continue
             if self.get_type(name) in ("bool", "tristate") and fill is not None:
-                self.user[name] = fill
+                # `option allnoconfig_y` (3.15-5.x): allnoconfig sets it to y
+                self.user[name] = "y" if mode == "no" and s.get("allnoconfig_y") else fill
         self.invalidate()
+        if self.modern_choice:
+            return
         for choice in self.choices:
             if self.has_user(choice):
                 continue
@@ -632,7 +817,7 @@ class KconfigEvaluator:
             self._calc(sym)
         if self.expr_tri(node["pvis"]) != 0:
             return True
-        if not sym or self.sym_tri(sym) == 0:
+        if not sym or self.sym_tri(sym) == 0 or self.sem.get("menu_visible_no_children"):
             return False
         return any(self.menu_visible(child) for child in node["children"])
 
@@ -674,7 +859,9 @@ class KconfigEvaluator:
                     out.append(line)
             for child in node["children"]:
                 walk(child)
-            if end_comments and not sym and node["kind"] == "menu" and self.menu_visible(node_id):
+            # Before 5.18 an empty menu got no "# end of" line (it was only written when leaving children)
+            if (end_comments and not sym and node["kind"] == "menu" and self.menu_visible(node_id)
+                    and (node["children"] or self.sem.get("end_comment_empty_menus", True))):
                 out.append(f"# end of {node['prompt']}")
                 need_newline = True
 
@@ -698,7 +885,17 @@ class KconfigEvaluator:
             val = 2
         if t == "bool" and val == 1:
             val = 2
-        return TRI_CHAR[val] if t in ("bool", "tristate") else text
+        # Adjust the default value if this symbol is implied by another (4.10+; 0 before `imply`)
+        val = max(val, self._implied.get(name, 0))
+        if t in ("bool", "tristate"):
+            return TRI_CHAR[val]
+        if not text and self.sem.get("int_hex_zero_default"):
+            text = {"int": "0", "hex": "0x0"}.get(t, text)
+        if self.sem.get("default_range_clamp"):
+            bound_id = self._near_range_bound(name, text)
+            if bound_id is not None:
+                text = self.leaf_str(bound_id)
+        return text
 
     def write_defconfig(self) -> str:
         """conf_write_defconfig(): minimal config (savedefconfig)."""

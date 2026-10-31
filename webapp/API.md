@@ -147,7 +147,8 @@ is served from the same origin, it still reads `X-KIP-Sync` and every other resp
 The `webapp/` backend operates exclusively as a read-only presentation and query tier. Under no circumstances may any router, service, middleware, or background task in `webapp/` execute database schema definitions (DDL: `CREATE`, `ALTER`, `DROP`, `TRUNCATE`) or data modification commands (DML: `INSERT`, `UPDATE`, `DELETE`, `REPLACE`).
 - All table creations, schema migrations, and initial seed rows (including `m_db_instance`) are the strict and exclusive responsibility of the parser engine (`core/DBLayout.py`, `main.py`).
 - Database cursors acquired via `get_db_cursor()` in `webapp/backend/database/pool.py` do not support or execute transaction commits.
-- Connection Pool: When `ssh_tunnel` is inactive and a local MariaDB instance is configured, `get_db_pool()` connects via Unix domain socket (`/run/mysqld/mysqld.sock`), automatically falling back to TCP (`127.0.0.1:3306`) if the socket is inaccessible.
+- Connection Pool: When `ssh_tunnel` is inactive and a local MariaDB instance is configured, `get_db_pool()` connects via Unix domain socket (`/run/mysqld/mysqld.sock`), automatically falling back to TCP (`127.0.0.1:3306`) if the socket is inaccessible. When `ssh_tunnel` is enabled in configuration (`database.ssh_tunnel.enabled: true`), `get_db_pool()` and FastAPI application startup (`webapp/backend/app.py:lifespan`) automatically initialize and verify the SSH tunnel forward (`core/ssh_tunnel.py`), reroute pool connection parameters to the forwarded port (`127.0.0.1:<local_port>`), and gracefully tear down the tunnel and connection pool on server shutdown.
+- Resilient Connection Management: `get_pooled_connection()` employs exponential backoff and session ping validation on connection acquisition; if transient network or tunnel drops occur, the pool resets and automatically re-verifies the SSH tunnel.
 - If expected metadata tables or rows are absent, webapp endpoints must return appropriate HTTP error statuses or graceful process-level fallbacks without modifying the underlying database.
 
 ### 2.6. Frontend & Service Architectural Invariants
@@ -181,7 +182,7 @@ The `webapp/` backend operates exclusively as a read-only presentation and query
 Either side of a comparison may be a release tag, a branch, or an arbitrary commit SHA. Comparison is evaluated in three progressive tiers to optimize latency:
 1. **Level 1 (O(1) Content Blob Filter)**: Resolves `{path: blob_sha}` for both revisions via `GitTreeResolver` (Path C), falling back to `{path: blob_id}` from `m_bridge_checkpoint` / `TreeResolverService` only when Git is unavailable on both sides. Unchanged files (equal content keys) are short-circuited in $O(1)$. A deleted path whose exact content reappears under an added path is reported as `renamed`.
 2. **Level 2 (AST & Symbol Structural Diff)**: For the first 50 modified files whose blobs are indexed on both sides, compares symbol definition records in `m_symbol_def` by `(name, type_id)` to surface added and removed definitions.
-3. **Level 3 (Kconfig Scoped Diff)**: Lists added/removed/modified Kconfig source files (`Kconfig`, `Kconfig.*`) from the Git trees (always complete), and diffs option definitions (`type`, `prompt`, `def_val` per defining file) from `m_kconfig_symbol` via `m_bridge_tag`. A Kconfig file contributes options only if its blob is indexed on every side it exists on; otherwise it is listed in `unindexed_files` and excluded, so unparsed blobs never surface as spurious additions or removals.
+3. **Level 3 (Kconfig Scoped Diff)**: Lists added/removed/modified Kconfig source files (`Kconfig`, `Kconfig.*`) from the Git trees, then parses only the files whose blob differs (from Git, cached per blob SHA) and compares each symbol's definitions there: properties (type, prompt, defaults, `depends on` including the dependencies inherited from enclosing `if`/`menu`/`choice` blocks, selects, implies, ranges, choice, options, `transitional`, help) per defining file. A definition that only moved lines is unchanged. A symbol is added/removed only when no Kconfig file of the other revision defines it (files with the same blob on both sides are checked with one `git grep`). Without Git trees (revisions Git cannot resolve), the indexed versions' Kconfig tags are compared instead (name -> set of definition text hashes, `DiffService._fetch_kconfig_symbols`).
 
 ### 2.9. Git-Native Database Architecture & Commit Hash Formatting
 1. **Zero-VID Native Table Queries & Elimination of View Dependencies**:
@@ -230,7 +231,7 @@ Clients must follow server changes without the user knowing to reload. The serve
 | **Filesystem & Blobs** | `m_file_blob`, `m_file_name`, `m_bridge_checkpoint`, `m_file_reference` | File instances, content blobs, paths, file types (0=Dir, 1=C, 2=Kconfig, 3=Rust, 4=Asm, 5=Maintainers, 6=Credits, 7=Raw), and compiler-verified `#include` / Kbuild provenance |
 | **AST & Spatial Maps** | `m_ast`, `m_ast_container`, `m_ast_include`, `m_bridge_tag`, `m_bridge_map`, `m_map_ast`, `m_tag`, `m_tag_code` | Relational AST nodes, preprocessor `#include` links, container hierarchies, and coordinate regions (`line_s`, `char_s`, `line_e`, `char_e`) |
 | **Symbols & XRefs** | `m_symbol_def`, `m_symbol_ref` (views over `m_tag_def`, `m_tag_ref`, `m_blob_symbol`, `m_symbol_own`, `m_blob_symbol_def`, `m_blob_symbol_ref`; see `core/API.md`) | Definitions and usage cross-references (calls, field access, type usages, macro expansions). `def_id` of a definition stored once per tag is computed (not indexable) and `ref_id` may be NULL, so services select every needed column in the query that finds the rows instead of re-fetching by id. Rows of given target AST ids come from `rows_of_targets_sql()` (`core/SymbolRows.py`) instead of `WHERE ast_id IN (...)` on the views, which takes seconds per target |
-| **Kconfig** | `m_kconfig_symbol`, `m_kconfig_tree`, `m_kconfig_relation`, `m_kconfig_kbuild` | Hierarchical menus, architecture-scoped symbol dependencies, and compiled source mappings |
+| **Kconfig** | `m_ast` (types `Kconfig_*`), `m_tag`, `m_bridge_tag` | Kconfig entries as tags (where each definition is, per blob and version). Menus, dependencies and values come from the semantic model built from Git per revision and ARCH (§4.4); there are no Kconfig tables |
 | **Maintainers** | `m_maintainer_section`, `m_maintainer_member`, `m_maintainer_person`, `m_maintainer_pattern`, `m_maintainer_file`, `m_credits_entry` | Subsystem sections, pattern rules, maintainers, reviewers, and historical `CREDITS` biographies |
 | **Git & Commits** | `m_commit`, `m_commit_file`, `m_bridge_commit_person`, `m_commit_parent`, `m_git_network`, `m_repository` | Commit metadata, DAG topology, modified files, multi-contributor trailers (Signed-off-by, Acked-by, Reviewed-by) |
 | **System & State** | `m_db_instance` | Unique database instance hash (`instance_hash`, `created_at`) used by clients to detect database rebuilds |
@@ -862,7 +863,7 @@ kernel-doc comments of a source file, filtered like the `.. kernel-doc::` direct
 
 ### 4.4. Kconfig & Architecture Defconfigs API
 
-All Kconfig endpoints read the Git objects of the requested revision (never the work tree), accept an optional **toolchain profile** (`toolchain` query parameter holding JSON on GET endpoints, `toolchain` body field on POST endpoints; see `GET /toolchain` below) and are scoped by an **ARCH value** (`arch` parameter, default `x86_64`): the value `make ARCH=<arch>` would receive. The top Makefile maps some values onto another source directory (`i386`/`x86_64` -> `x86`, `sparc32`/`sparc64` -> `sparc`, `sh64` -> `sh`, ...); `x86`, `sparc` and `sh` themselves are the generic forms whose bitness is chosen in menuconfig. The model is built by `parser/kconfig_ast/kconfig_model.py` and evaluated by `parser/kconfig_ast/kconfig_eval.py` (server) and `kconfig_engine.js` (browser); both reproduce the kernel's `conf` output byte for byte (see `parser/kconfig_ast/KCONFIG_API.md` section 8). Models are cached per (repository, revision, ARCH, toolchain) in a 6-entry LRU. A build costs about a second of CPU and tens of MB, and the toolchain profile is part of the key, so builds are bounded: each key has its own lock (concurrent requests for one model wait for that single build instead of duplicating it, and never block requests for other models), at most two models are built at once across all keys, and the cache lock is never held while a model is built.
+All Kconfig endpoints read the Git objects of the requested revision (never the work tree), accept an optional **toolchain profile** (`toolchain` query parameter holding JSON on GET endpoints, `toolchain` body field on POST endpoints; see `GET /toolchain` below) and are scoped by an **ARCH value** (`arch` parameter, default `x86_64`): the value `make ARCH=<arch>` would receive. The top Makefile maps some values onto another source directory (`i386`/`x86_64` -> `x86`, `sparc32`/`sparc64` -> `sparc`, `sh64` -> `sh`, ...); `x86`, `sparc` and `sh` themselves are the generic forms whose bitness is chosen in menuconfig. The model is built by `parser/kconfig_ast/kconfig_model.py` and evaluated by `parser/kconfig_ast/kconfig_eval.py` (server) and `kconfig_engine.js` (browser); both reproduce the kernel's `conf` output byte for byte (see `parser/kconfig_ast/KCONFIG_API.md` section 8). Models are cached per (repository, revision, ARCH, toolchain) in a 6-entry LRU, and persist across restarts as gzipped JSON under `~/.cache/kernelinfo/kconfig-models/` (`KERNELINFO_CACHE_DIR` overrides the base directory; 32 files, least recently used evicted, ~4 MB each for a modern tree), keyed by commit SHA, ARCH, toolchain profile and a hash of the model-building code, so a code change or a moved branch never reuses a stale model (a cold build of a modern tree takes ~2-3 s, a cached one ~0.3 s). A build costs about a second of CPU and tens of MB, and the toolchain profile is part of the key, so builds are bounded: each key has its own lock (concurrent requests for one model wait for that single build instead of duplicating it, and never block requests for other models), at most two models are built at once across all keys, and the cache lock is never held while a model is built.
 
 #### `GET /api/kconfig/{version_name}/toolchain`
 #### `GET /api/version/{version_name}/kconfig/toolchain`
@@ -904,7 +905,7 @@ The finalized configuration model of one ARCH, in compact transport form, for th
 #### `GET /api/kconfig/symbol` / `GET /api/version/{version_name}/kconfig/symbol` (`name` query)
 Arch-scoped details of a symbol (with or without `CONFIG_`). The same name can be declared in different files per architecture (e.g. `64BIT`: `arch/x86/Kconfig` for x86_64, `arch/sparc/Kconfig` for sparc64).
 - **Parameters**: `arch` (query, default `x86_64`).
-- **Response**: `name`, `arch`, `srcarch`, `defined_for_arch`, `type` (1 bool, 2 tristate, 3 string, 4 hex, 5 int) / `type_name`, `prompt`, `prompts`, `help`, primary `file_path` / `line_s` / `line_e` / `definition`, `declarations` and `definitions` (every definition for this ARCH: `file_path`, `line_s`, `line_e`, `prompt`, `kind`, `depends_on_expr`, `visible_expr`, `help`, `menu_path`), `dir_dep_expr`, `rev_dep_expr`, `implied_expr`, `depends_on` (symbols named by its own `depends on` lines), `selects`, `select_conditions`, `implies`, `selected_by`, `implied_by`, `defaults` (`[{value, cond}]`), `def_val`, `ranges`, `choice`, `choice_members`, `env`, `kconfig_refs` (entries referring to it), `kbuild` (Makefile rules, see usage), `compiled_files` (`[{file_path, target_obj, compile_mode, makefile, line, other_arch}]`, Git scan merged with `m_kconfig_kbuild` rows), plus compatibility fields `vid_s`, `vid_e`, `vname_s`, `vname_e`, `added_version`, `is_active`, `lifecycle_status`.
+- **Response**: `name`, `arch`, `srcarch`, `defined_for_arch`, `type` (1 bool, 2 tristate, 3 string, 4 hex, 5 int) / `type_name`, `prompt`, `prompts`, `help`, primary `file_path` / `line_s` / `line_e` / `definition`, `declarations` and `definitions` (every definition for this ARCH: `file_path`, `line_s`, `line_e`, `prompt`, `kind`, `depends_on_expr`, `visible_expr`, `help`, `menu_path`), `dir_dep_expr`, `rev_dep_expr`, `implied_expr`, `depends_on` (symbols named by its own `depends on` lines), `selects`, `select_conditions`, `implies`, `selected_by`, `implied_by`, `defaults` (`[{value, cond}]`), `def_val`, `ranges`, `choice`, `choice_members`, `env`, `kconfig_refs` (entries referring to it), `kbuild` (Makefile rules, see usage), `compiled_files` (`[{file_path, target_obj, compile_mode, makefile, line, other_arch}]`: the existing files among the `kbuild` rules of this revision), plus compatibility fields `vid_s`, `vid_e`, `vname_s`, `vname_e`, `added_version`, `is_active`, `lifecycle_status`.
 - When the symbol is not declared for this ARCH: `defined_for_arch: false` and `declarations` lists its declarations in other architectures' Kconfig files (404 if declared nowhere).
 
 #### `GET /api/kconfig/{version_name}/symbol/{symbol_name}/usage`
@@ -1616,33 +1617,34 @@ Compare Kconfig source files and option definitions between two revisions (relea
   - `version_name` (path): Context kernel version string.
   - `v1` (query): Base revision (e.g. `"v3.0"`).
   - `v2` (query): Target revision (e.g. `"v3.1"`).
-- **Behavior**: See §2.8 Level 3. `files` is computed from the Git trees and is always complete; `symbols` only covers Kconfig files indexed on every side (`unindexed_files` lists the rest). An option is `changed` when its set of `(file, type, prompt, def_val)` definitions differs.
+- **Behavior**: See §2.8 Level 3. Both `files` and `symbols` come from Git and are complete; `unindexed_files` is always empty (kept for compatibility). Each definition in `before`/`after` carries `file`, `line`, `type` (1 bool, 2 tristate, 3 string, 4 hex, 5 int), `prompt` (text without its condition), `def_val` (first default) and `facts` (the property record of the symbol history, `GET /api/kconfig/{version_name}/symbol/{symbol_name}/history`); a symbol with one definition on each side also gets `changes` (`[{field, before, after}]` / `[{field, added, removed, before, after}]`). Measured: v3.0 -> v3.1 takes ~2 s (174 modified files), v6.17 -> v6.18 ~3 s.
 - **Response**:
 ```json
 {
   "v1": "v3.0",
   "v2": "v3.1",
   "summary": {
-    "added": 0,
-    "removed": 39,
-    "changed": 0,
+    "added": 221,
+    "removed": 110,
+    "changed": 343,
     "files_added": 12,
     "files_removed": 11,
     "files_modified": 174
   },
-  "added": [],
-  "removed": ["A2232"],
-  "changed": [],
+  "added": ["..."],
+  "removed": ["A2232", "..."],
+  "changed": ["ACPI_APEI_GHES", "..."],
   "symbols": [
     {
-      "name": "A2232",
-      "change": "removed",
-      "before": [ { "file": "drivers/staging/generic_serial/Kconfig", "type": 2, "prompt": "Commodore A2232 serial support (EXPERIMENTAL)", "def_val": "" } ],
-      "after": []
+      "name": "ACPI_APEI_GHES",
+      "change": "changed",
+      "before": [ { "file": "drivers/acpi/apei/Kconfig", "line": 13, "type": 1, "prompt": "APEI Generic Hardware Error Source", "def_val": "", "facts": { "kind": "config", "type": "bool", "...": "..." } } ],
+      "after": [ { "file": "drivers/acpi/apei/Kconfig", "line": 13, "type": 1, "prompt": "APEI Generic Hardware Error Source", "def_val": "", "facts": { "...": "..." } } ],
+      "changes": [ { "field": "selects", "added": ["IRQ_WORK"], "removed": [], "before": ["..."], "after": ["..."] } ]
     }
   ],
   "files": [ { "file": "drivers/staging/tty/Kconfig", "change": "removed" } ],
-  "unindexed_files": ["arch/arm/Kconfig"]
+  "unindexed_files": []
 }
 ```
 

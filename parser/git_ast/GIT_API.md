@@ -23,7 +23,7 @@ Streaming Delimiter-Delimited Git Log Execution:
   │
   ▼ [GitCommitParser.parse_commit_stream() (git_commit_parser.py)]
 Commit Processing & Trailer Extraction:
-  ├── Committer & Author: Ingests into m_maintainer_person (Table 20)
+  ├── Committer & Author: Ingests into m_maintainer_person (Table 16)
   ├── Structured Trailers (TRAILER_PATTERN regex):
   │     └── Co-developed-by, Signed-off-by, Reviewed-by, Acked-by, Tested-by, Reported-by, Suggested-by
   ├── Merge Metadata (PULL_FROM_RE, BRANCH_MERGE_RE):
@@ -33,10 +33,10 @@ Commit Processing & Trailer Extraction:
   │
   ▼ [GitCommitParser.stage_commits() -> TableEngine Staging]
 Relational Database Mapping:
-  ├── Commit Registry: m_commit (Table 26)
-  ├── Contributor Roles: m_bridge_commit_person (Table 27)
-  ├── Modified Files: m_bridge_commit_file (Table 28)
-  └── Code Occurrence Tag Bridge: m_bridge_commit_tag (Table 29)
+  ├── Commit Registry: m_commit (Table 22)
+  ├── Contributor Roles: m_bridge_commit_person (Table 23)
+  ├── Modified Files: m_bridge_commit_file (Table 24)
+  └── Code Occurrence Tag Bridge: m_bridge_commit_tag (Table 25)
         └── _map_hunk_to_tags: Bisect interval search over m_bridge_tag coordinates
 ==================================================================================================
 ```
@@ -116,7 +116,7 @@ Kernel commits frequently feature contributions from multiple developers beyond 
 | `CommitRole.RequestedBy` | 11 | Pull request requester (`requested-by` / `Pull from:`) |
 | `CommitRole.Other` | 12 | Unclassified trailer tag |
 
-Contributors are sanitized and stored in `m_maintainer_person` (Table 20), linking maintainer identities with git author and trailer histories across releases.
+Contributors are sanitized and stored in `m_maintainer_person` (Table 16), linking maintainer identities with git author and trailer histories across releases.
 
 ---
 

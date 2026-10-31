@@ -465,12 +465,26 @@ export class DiffView {
           </div>`).join("")
       : `<div class="compare-sym-none">not defined</div>`;
 
+    // Property-level changes (one definition on each side): what actually differs, e.g. a new `depends on`
+    const show = (v) => (typeof v === "string" ? v : JSON.stringify(v));
+    const changesHtml = (sym.changes || []).map((c) => {
+      if (Array.isArray(c.added) || Array.isArray(c.removed)) {
+        const items = [...(c.removed || []).map((x) => `<code class="diff-del">− ${escapeHtml(show(x))}</code>`),
+          ...(c.added || []).map((x) => `<code class="diff-add">+ ${escapeHtml(show(x))}</code>`)];
+        return `<div class="compare-sym-change"><span class="compare-sym-field">${escapeHtml(c.field)}</span> ${items.join(" ") || "reordered"}</div>`;
+      }
+      if (c.field === "help") return `<div class="compare-sym-change"><span class="compare-sym-field">help</span> text changed</div>`;
+      return `<div class="compare-sym-change"><span class="compare-sym-field">${escapeHtml(c.field)}</span> `
+        + `<code class="diff-del">− ${escapeHtml(show(c.before ?? ""))}</code> <code class="diff-add">+ ${escapeHtml(show(c.after ?? ""))}</code></div>`;
+    }).join("");
+
     const box = document.createElement("div");
     box.className = "compare-sym-detail";
     box.innerHTML = (sym.before || sym.after)
       ? `
         <div class="compare-sym-side"><div class="compare-sym-side-title">${escapeHtml(shortRef(this.versionA))}</div>${defsHtml(sym.before)}</div>
-        <div class="compare-sym-side"><div class="compare-sym-side-title">${escapeHtml(shortRef(this.versionB))}</div>${defsHtml(sym.after)}</div>`
+        <div class="compare-sym-side"><div class="compare-sym-side-title">${escapeHtml(shortRef(this.versionB))}</div>${defsHtml(sym.after)}</div>
+        ${changesHtml ? `<div class="compare-sym-changes">${changesHtml}</div>` : ""}`
       : `<div class="compare-sym-none">No definition details available.</div>`;
     rowEl.appendChild(box);
 

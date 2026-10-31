@@ -132,7 +132,7 @@ CS.store(m_bridge_map.set(tag_ref, tag_ref))
 ```
 
 ### 2.4. Cross-Language Definition Indexing (`m_symbol_def` view)
-Rust definition symbols (`Rust_Fn`, `Rust_Struct`, `Rust_Enum`, `Rust_Trait`) are staged per blob into `m_blob_symbol_def` (Table 31, read through the `m_symbol_def` view) across both top-level and nested constructs (such as methods in `impl` blocks or functions in `mod` blocks):
+Rust definition symbols (`Rust_Fn`, `Rust_Struct`, `Rust_Enum`, `Rust_Trait`) are staged per blob into `m_blob_symbol_def` (Table 27, read through the `m_symbol_def` view) across both top-level and nested constructs (such as methods in `impl` blocks or functions in `mod` blocks):
 ```python
 with CS(REF_POS):
     CS.store(m_blob_symbol_def.set(

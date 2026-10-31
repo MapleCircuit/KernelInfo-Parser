@@ -36,6 +36,7 @@ const FIELD_LABEL = {
   implies: "imply",
   ranges: "range",
   options: "option",
+  transitional: "transitional",
 };
 const PLAY_INTERVAL_MS = 1400;
 
@@ -419,5 +420,6 @@ function renderFacts(f) {
     if (f[key] && f[key].length) rows.push([FIELD_LABEL[key], f[key].join("  ·  ")]);
   }
   if (f.choice) rows.push(["choice", f.choice]);
+  if (f.transitional) rows.push(["transitional", "yes: read from an old .config, never written"]);
   return rows.length ? `<table class="symhist-fields">${rows.map(([k, v]) => `<tr><td>${escapeHtml(k)}</td><td>${escapeHtml(v)}</td></tr>`).join("")}</table>` : "";
 }

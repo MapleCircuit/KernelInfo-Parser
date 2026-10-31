@@ -145,10 +145,6 @@ from core.DBLayout import (
     m_map_ast,
     m_bridge_map,
     m_ast_hash,
-    m_kconfig_symbol,
-    m_kconfig_relation,
-    m_kconfig_tree,
-    m_kconfig_kbuild,
     m_maintainer_person,
     m_maintainer_section,
     m_maintainer_member,
@@ -231,6 +227,65 @@ def drop_legacy_symbol_tables(db: Any) -> None:
             cur.execute("SET FOREIGN_KEY_CHECKS = 1;")
         db.cnx.commit()
         logger.info(f"Dropped tables of the per-blob symbol layout: {', '.join(legacy)}")
+
+
+# Kconfig tables of the earlier layout (table ids 16-19), dropped from the schema
+OBSOLETE_KCONFIG_TABLES = ("m_kconfig_kbuild", "m_kconfig_tree", "m_kconfig_relation", "m_kconfig_symbol")
+# Table ids of the earlier layout -> current ids (core/DBLayout.py). m_ast_attribute keeps id 35: view
+# hashes (m_ast_hash) include the ids of the joined tables, so its id must never change.
+_OLD_TABLE_IDS = {
+    **{old: old - 4 for old in range(20, 35)},  # m_maintainer_person .. m_db_instance
+    35: 35,                                       # m_ast_attribute
+    **{old: old - 5 for old in range(36, 40)},  # m_git_network, m_repository, m_git_ref, m_commit_parent
+    **{old: old - 4 for old in range(40, 49)},  # m_ingest_state .. m_commit_email
+}
+# m_kconfig_tree (old id 18) was a watermarked table; id 18 now is m_maintainer_member, which is not
+_OBSOLETE_MARKER_ID = 18
+
+
+def drop_obsolete_kconfig_tables(db: Any) -> None:
+    """Drop the Kconfig tables the schema no longer has and renumber the watermarks of interrupted runs.
+
+    The tables after them moved to other ids (`_OLD_TABLE_IDS`). `m_ingest_watermark` stores table ids,
+    so the marks of a version left `INGEST_PARSING` before the upgrade are renumbered first, in one
+    transaction per commit: a commit's marks are in the old numbering exactly when they include id 18
+    (`m_kconfig_tree`, marked, whereas id 18 now names the unmarked `m_maintainer_member`), which keeps
+    a re-run harmless.
+    """
+    if not (hasattr(db, "cnx") and db.cnx):
+        return
+    names = OBSOLETE_KCONFIG_TABLES + ("m_ingest_watermark",)
+    with contextlib.closing(db.cnx.cursor()) as cur:
+        cur.execute(
+            "SELECT table_name FROM information_schema.tables WHERE table_schema = DATABASE() "
+            f"AND table_type = 'BASE TABLE' AND table_name IN ({','.join(['%s'] * len(names))})",
+            names,
+        )
+        present = {r[0].decode() if isinstance(r[0], (bytes, bytearray)) else r[0] for r in cur.fetchall()}
+        if "m_ingest_watermark" in present:
+            cur.execute("SELECT DISTINCT commit_id FROM m_ingest_watermark WHERE marked_table_id = %s", (_OBSOLETE_MARKER_ID,))
+            old_style = [int(r[0]) for r in cur.fetchall()]
+            for commit_id in old_style:
+                cur.execute("SELECT marked_table_id, max_id FROM m_ingest_watermark WHERE commit_id = %s", (commit_id,))
+                marks = [(int(t), int(m)) for t, m in cur.fetchall()]
+                cur.execute("DELETE FROM m_ingest_watermark WHERE commit_id = %s", (commit_id,))
+                for table_id, max_id in marks:
+                    new_id = table_id if table_id < 16 else _OLD_TABLE_IDS.get(table_id)
+                    if new_id is not None:  # the dropped tables' marks (16-19) go away
+                        cur.execute(
+                            "INSERT INTO m_ingest_watermark (commit_id, marked_table_id, max_id) VALUES (%s, %s, %s)",
+                            (commit_id, new_id, max_id),
+                        )
+                db.cnx.commit()
+            if old_style:
+                logger.info(f"Renumbered the ingestion watermarks of {len(old_style)} interrupted version(s) to the current table ids.")
+        obsolete = [n for n in OBSOLETE_KCONFIG_TABLES if n in present]
+        if obsolete:
+            cur.execute("SET FOREIGN_KEY_CHECKS = 0;")
+            cur.execute(f"DROP TABLE IF EXISTS {', '.join(f'`{n}`' for n in obsolete)};")
+            cur.execute("SET FOREIGN_KEY_CHECKS = 1;")
+            db.cnx.commit()
+            logger.info(f"Dropped Kconfig tables the schema no longer uses: {', '.join(obsolete)}")
 
 
 def ensure_db_views(db: Any) -> None:
@@ -2465,6 +2520,7 @@ def main() -> None:
             logger.info("Resetting and recreating all database tables...")
             db.drop_table(gp.Table_Array)
             drop_legacy_symbol_tables(db)
+            drop_obsolete_kconfig_tables(db)
             db.create_table(gp.Table_Array)
             try:
                 db.create_index("v_main_index", m_v_main, (m_v_main.vname,))
@@ -2475,6 +2531,7 @@ def main() -> None:
             if hasattr(G.TE, "start_new_db") and getattr(G.TE, "tables", None):
                 G.TE.start_new_db(G.DB, is_worker=False)
         else:
+            drop_obsolete_kconfig_tables(db)
             missing = db.test_tables(gp.Table_Array)
             if missing:
                 logger.info(f"Missing tables detected ({missing}), creating tables...")
@@ -5138,10 +5195,11 @@ def processing_kbuild(
     valid_fnids: set[int] | None = None,
     new_blob_ids: set[int] | None = None,
 ) -> None:
-    """Parse Makefile and Kbuild files for active version, map Kconfig symbols, and stage build references.
+    """Parse the version's Makefile and Kbuild files and stage their build references (m_file_reference).
 
-    `new_blob_ids` limits m_file_reference staging to Makefile blobs whose references were cleared for
-    recomputation (None: every blob); m_kconfig_kbuild rows are staged for every Makefile.
+    Rows are keyed by the Makefile blob, so only blobs in `new_blob_ids` (None: every blob) are parsed;
+    a carried-over Makefile keeps the rows computed when it first appeared. Which Kconfig symbols
+    govern a file is answered from Git by the webapp (kbuild_usage, build conditions), not stored.
     """
     if gp.VID == 0:
         return
@@ -5159,48 +5217,17 @@ def processing_kbuild(
         return
 
     all_files = file_list_raw.splitlines() if file_list_raw else []
-    makefile_paths = [
-        f for f in all_files
-        if f.endswith("Makefile") or f.endswith("Kbuild") or f.endswith("/Makefile") or f.endswith("/Kbuild")
-    ]
+    makefile_paths = [f for f in all_files if f.endswith("Makefile") or f.endswith("Kbuild")]
     if not makefile_paths:
         return
 
-    has_new_kconfig = bool(getattr(G.TE, "_staged", {}).get(m_kconfig_symbol.table_id)) if getattr(G, "TE", None) else False
     target_makefiles = [
         f for f in makefile_paths
-        if has_new_kconfig or new_blob_ids is None or get_fid_for_path(f) in new_blob_ids
+        if (fid := get_fid_for_path(f)) and (new_blob_ids is None or fid in new_blob_ids)
+        and (valid_blob_ids is None or fid in valid_blob_ids)
     ]
     logger.info(f"Processing {len(target_makefiles)} Makefile/Kbuild files for version '{version}' (of {len(makefile_paths)} total)...")
 
-    kcid_cache: dict[str, int] = {}
-    if getattr(G, "TE", None) is not None:
-        cached_kc = getattr(G.TE, "_cached_rows", {}).get(m_kconfig_symbol.table_id)
-        if cached_kc:
-            for row in cached_kc:
-                if len(row) > 1 and row[0] is not None and row[1]:
-                    kcid_cache[row[1]] = row[0]
-        staged_kc = getattr(G.TE, "_staged", {}).get(m_kconfig_symbol.table_id)
-        if staged_kc:
-            for row in (staged_kc.values() if isinstance(staged_kc, dict) else staged_kc):
-                if len(row) > 1 and row[0] is not None and row[1]:
-                    kcid_cache[row[1]] = row[0]
-
-    def get_kcid_for_sym(sym: str) -> int:
-        if not sym or sym in ("y", "m"):
-            return 0
-        clean_sym = sym[7:] if sym.startswith("CONFIG_") else sym
-        if clean_sym in kcid_cache:
-            return kcid_cache[clean_sym]
-        sym_row = m_kconfig_symbol.get(None, clean_sym, None, None, None, None, None)
-        if sym_row and len(sym_row) >= 3 and sym_row[2]:
-            kcid = sym_row[2][0]
-            kcid_cache[clean_sym] = kcid
-            return kcid
-        kcid_cache[clean_sym] = 0
-        return 0
-
-    count = 0
     ref_count = 0
     for mk_path in target_makefiles:
         if G.is_deadline_exceeded():
@@ -5208,69 +5235,31 @@ def processing_kbuild(
             break
         try:
             mk_fid = get_fid_for_path(mk_path)
-            if not has_new_kconfig and new_blob_ids is not None and mk_fid not in new_blob_ids:
-                continue
             content = MF.get_file(mk_path, gp.Version_Name)
             if not content:
                 continue
-            dir_path = os.path.dirname(mk_path)
-            bindings = kbuild_parser.parse_makefile_content(content, dir_path=dir_path)
+            bindings = kbuild_parser.parse_makefile_content(content, dir_path=os.path.dirname(mk_path))
             for b in bindings:
                 target_fnid = get_fnid_for_path(b.source_file_rel)
-                fid = get_fid_for_path(b.source_file_rel)
-                if fid is None and b.source_file_rel.endswith(".c"):
-                    alt_asm = b.source_file_rel[:-2] + ".S"
-                    fid = get_fid_for_path(alt_asm)
-                    if target_fnid is None:
-                        target_fnid = get_fnid_for_path(alt_asm)
-
-                # Validate foreign keys before staging
-                if valid_fnids is not None and target_fnid is not None and target_fnid not in valid_fnids:
-                    target_fnid = None
-                mk_blob_id = mk_fid if (mk_fid and (valid_blob_ids is None or mk_fid in valid_blob_ids)) else 0
-
-                # 1. Populate m_kconfig_kbuild for compiled source files
-                if getattr(b, "ref_type", 3) == 3 and target_fnid is not None:
-                    kcid = get_kcid_for_sym(b.symbol_name)
-                    G.TE.set(
-                        m_kconfig_kbuild.table_id,
-                        (
-                            kcid,
-                            mk_blob_id,
-                            target_fnid,
-                            int(b.compile_mode),
-                            b.target_obj[:64],
-                        ),
-                    )
-                    count += 1
-
-                # 2. Populate m_file_reference for Kbuild compilations and Makefile includes/recursions
-                if mk_fid and target_fnid is not None:
-                    if valid_blob_ids is not None and mk_fid not in valid_blob_ids:
-                        continue
-                    if new_blob_ids is not None and mk_fid not in new_blob_ids:
-                        continue
-                    ref_t = int(getattr(b, "ref_type", 3))
-                    source_line = int(getattr(b, "source_line", 1))
-                    ref_key = (mk_fid, target_fnid, ref_t, source_line)
-                    if ref_key not in staged_file_refs:
-                        staged_file_refs.add(ref_key)
-                        G.TE.set(
-                            m_file_reference.table_id,
-                            (
-                                None,
-                                mk_fid,
-                                target_fnid,
-                                ref_t,
-                                source_line,
-                                getattr(b, "details", "")[:255],
-                            ),
-                        )
-                        ref_count += 1
+                if target_fnid is None and b.source_file_rel.endswith(".c"):
+                    target_fnid = get_fnid_for_path(b.source_file_rel[:-2] + ".S")
+                if target_fnid is None or (valid_fnids is not None and target_fnid not in valid_fnids):
+                    continue
+                ref_t = int(getattr(b, "ref_type", 3))
+                source_line = int(getattr(b, "source_line", 1))
+                ref_key = (mk_fid, target_fnid, ref_t, source_line)
+                if ref_key in staged_file_refs:
+                    continue
+                staged_file_refs.add(ref_key)
+                G.TE.set(
+                    m_file_reference.table_id,
+                    (None, mk_fid, target_fnid, ref_t, source_line, getattr(b, "details", "")[:255]),
+                )
+                ref_count += 1
         except Exception as e:
             logger.debug(f"Error parsing kbuild file '{mk_path}': {e}")
 
-    logger.info(f"Staged {count} Kbuild symbol-to-source mappings and {ref_count} build references for version '{version}'.")
+    logger.info(f"Staged {ref_count} build references for version '{version}'.")
 
 
 def processing_doc_references(
@@ -5368,7 +5357,7 @@ def processing_include_references(version: str) -> None:
             sync_query = f"""
                 INSERT IGNORE INTO m_file_reference (source_blob_id, target_fnid, ref_type, line_no, details)
                 SELECT STRAIGHT_JOIN DISTINCT bt.blob_id, inc.fnid,
-                       CASE WHEN a.type_id IN ({ASTT.Kconfig_Source.value}, {ASTT.Kconfig_Rsource.value}) THEN {int(FileRefType.Kconfig)} ELSE {int(FileRefType.Include)} END AS ref_type,
+                       CASE WHEN a.type_id IN ({ASTT.Kconfig_Source.value}, {ASTT.Kconfig_Rsource.value}, {ASTT.Kconfig_Osource.value}) THEN {int(FileRefType.Kconfig)} ELSE {int(FileRefType.Include)} END AS ref_type,
                        bt.line_s,
                        LEFT(a.name, 255)
                 FROM m_bridge_checkpoint bf

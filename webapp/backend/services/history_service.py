@@ -186,25 +186,25 @@ def _config_facts(cfg: KconfigConfig, inherited: list[str], choice: str | None) 
         "ranges": [_cond(f"{_expr(lo)} {_expr(hi)}", c) for lo, hi, c in cfg.ranges],
         "choice": choice or "",
         "options": list(cfg.options),
+        "transitional": cfg.transitional,
         "help": cfg.help_text or "",
     }
 
 
-def _kconfig_file_facts(text: str, sym: str) -> tuple[dict[str, Any], ...]:
-    """Every definition of `sym` in one Kconfig file with its properties and the dependencies it
-    inherits from enclosing if/menu/choice blocks."""
+def kconfig_definitions(text: str) -> dict[str, list[dict[str, Any]]]:
+    """Every config/menuconfig definition of one Kconfig file, by symbol, with its properties and the
+    dependencies it inherits from enclosing if/menu/choice blocks (one parse for all symbols)."""
     try:
         items = KconfigParser(KconfigLexer(text).tokenize(), text).parse()
     except Exception as e:  # malformed historical Kconfig: report the snippet without properties
-        logger.debug("Kconfig parse failed for %s: %s", sym, e)
-        return ()
-    found: list[dict[str, Any]] = []
+        logger.debug("Kconfig parse failed: %s", e)
+        return {}
+    found: dict[str, list[dict[str, Any]]] = {}
 
     def walk(nodes: list[Any], inherited: list[str], choice: str | None) -> None:
         for node in nodes:
             if isinstance(node, KconfigConfig):
-                if node.name == sym:
-                    found.append(_config_facts(node, inherited, choice))
+                found.setdefault(node.name, []).append(_config_facts(node, inherited, choice))
             elif isinstance(node, KconfigIf):
                 walk(node.children, inherited + [_expr(node.cond)], choice)
             elif isinstance(node, KconfigMenu):
@@ -213,7 +213,12 @@ def _kconfig_file_facts(text: str, sym: str) -> tuple[dict[str, Any], ...]:
                 walk(node.children, inherited + [_expr(d) for d in node.depends_on], node.prompt or node.name or "choice")
 
     walk(items, [], None)
-    return tuple(found)
+    return found
+
+
+def _kconfig_file_facts(text: str, sym: str) -> tuple[dict[str, Any], ...]:
+    """Every definition of `sym` in one Kconfig file (see kconfig_definitions)."""
+    return tuple(kconfig_definitions(text).get(sym, ()))
 
 
 def kconfig_field_changes(old: dict[str, Any] | None, new: dict[str, Any] | None) -> list[dict[str, Any]]:
@@ -221,7 +226,7 @@ def kconfig_field_changes(old: dict[str, Any] | None, new: dict[str, Any] | None
     if not old or not new:
         return []
     changes: list[dict[str, Any]] = []
-    for key in ("kind", "type", "prompt", "choice", "help"):
+    for key in ("kind", "type", "prompt", "choice", "transitional", "help"):
         if old.get(key) != new.get(key):
             changes.append({"field": key, "before": old.get(key), "after": new.get(key)})
     for key in ("defaults", "depends_on", "inherited_depends", "selects", "implies", "ranges", "options"):

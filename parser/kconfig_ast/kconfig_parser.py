@@ -77,6 +77,32 @@ class KconfigExpr:
         return syms
 
 
+def _span(op: ExprOp, left: KconfigExpr | None, right: KconfigExpr | None = None, value: str | None = None,
+          ref: KconfigExpr | None = None) -> KconfigExpr:
+    src = ref or left
+    return KconfigExpr(op=op, left=left, right=right, value=value,
+                       line_s=src.line_s if src else 0, char_s=src.char_s if src else 0,
+                       line_e=src.line_e if src else 0, char_e=src.char_e if src else 0)
+
+
+def trans_compare_no(expr: KconfigExpr, equal: bool) -> KconfigExpr:
+    """expr_trans_compare(e, E_EQUAL (equal=True) / E_UNEQUAL, &symbol_no) of scripts/kconfig/expr.c."""
+    op = expr.op
+    if op in (ExprOp.AND, ExprOp.OR):
+        left = trans_compare_no(expr.left, True)
+        right = trans_compare_no(expr.right, True)
+        # sym == &symbol_no: AND becomes OR and OR becomes AND
+        out = _span(ExprOp.OR if op == ExprOp.AND else ExprOp.AND, left, right, ref=expr)
+        return out if equal else _span(ExprOp.NOT, out, ref=expr)
+    if op == ExprOp.NOT:
+        return trans_compare_no(expr.left, not equal)
+    if op in RELATIONAL_TEXT:
+        return _span(ExprOp.NOT, expr, ref=expr) if equal else expr
+    # A symbol or constant: E_SYMBOL compared with n
+    no = _span(ExprOp.SYMBOL_REF, None, value="n", ref=expr)
+    return _span(ExprOp.EQUAL if equal else ExprOp.UNEQUAL, expr, no, ref=expr)
+
+
 # Symbol Type Constants (mapped to DBLayout schema: 1: bool, 2: tristate, 3: string, 4: hex, 5: int)
 TYPE_UNKNOWN = 0
 TYPE_BOOL = 1
@@ -105,6 +131,7 @@ class KconfigConfig:
     is_modules: bool = False  # option modules / modules
     is_defconfig_list: bool = False  # option defconfig_list
     allnoconfig_y: bool = False  # option allnoconfig_y
+    transitional: bool = False  # Linux 6.18+: value read from .config and used, never shown nor written
     line_s: int = 0
     char_s: int = 0
     line_e: int = 0
@@ -125,6 +152,10 @@ class KconfigMenu:
     line_e: int = 0
     char_e: int = 0
     raw_code: str = ""
+    # The `menu` line and its own properties (without children or `endmenu`)
+    header_line_e: int = 0
+    header_char_e: int = 0
+    header_code: str = ""
 
 
 @dataclass
@@ -143,6 +174,10 @@ class KconfigChoice:
     line_e: int = 0
     char_e: int = 0
     raw_code: str = ""
+    # The `choice` line and its own properties (without members or `endchoice`)
+    header_line_e: int = 0
+    header_char_e: int = 0
+    header_code: str = ""
 
 
 @dataclass
@@ -154,6 +189,10 @@ class KconfigIf:
     line_e: int = 0
     char_e: int = 0
     raw_code: str = ""
+    # The `if <expr>` line alone
+    header_line_e: int = 0
+    header_char_e: int = 0
+    header_code: str = ""
 
 
 @dataclass
@@ -230,6 +269,8 @@ class KconfigParser:
         self.raw_text = raw_text
         self.raw_lines = raw_text.splitlines(keepends=True) if raw_text else []
         self.on_source = on_source
+        # "<line>: <message>" for statements kconfig would reject (skipped here, never silently)
+        self.warnings: list[str] = []
 
     def _current(self) -> Token:
         return self.tokens.get(self.pos)
@@ -255,6 +296,19 @@ class KconfigParser:
             return self._advance()
         # Non-fatal advance
         return self._advance()
+
+    def _last_significant(self, fallback: Token) -> Token:
+        """The last token consumed that is not a line end (blank and comment lines end no entry)."""
+        idx = self.pos - 1
+        while idx >= 0:
+            tok = self.tokens.get(idx)
+            if tok.type != TokenType.NEWLINE:
+                return tok
+            idx -= 1
+        return fallback
+
+    def _warn_line(self, tok: Token, what: str) -> None:
+        self.warnings.append(f"{tok.line}: {what} '{tok.value}' ignored")
 
     def _skip_newlines(self) -> None:
         while self._current().type == TokenType.NEWLINE:
@@ -312,6 +366,8 @@ class KconfigParser:
             return None
         else:
             # Skip unhandled token on line
+            if tok.type not in (TokenType.NEWLINE, TokenType.EOF):
+                self._warn_line(tok, "unknown statement")
             self._advance()
             while self._current().type not in (TokenType.NEWLINE, TokenType.EOF):
                 self._advance()
@@ -373,8 +429,13 @@ class KconfigParser:
             prop_tok = self._current()
             if prop_tok.type in (TokenType.BOOL, TokenType.TRISTATE, TokenType.STRING, TokenType.HEX, TokenType.INT):
                 self._parse_type_definition(cfg)
-            elif prop_tok.type in (TokenType.DEF_BOOL, TokenType.DEF_TRISTATE):
+            elif prop_tok.type in (TokenType.DEF_BOOL, TokenType.DEF_TRISTATE, TokenType.DEF_STRING,
+                                   TokenType.DEF_INT, TokenType.DEF_HEX):
                 self._parse_def_type_definition(cfg)
+            elif prop_tok.type == TokenType.TRANSITIONAL:
+                cfg.transitional = True
+                self._advance()
+                self._skip_line()
             elif prop_tok.type == TokenType.PROMPT:
                 self._parse_prompt(cfg)
             elif prop_tok.type == TokenType.DEFAULT:
@@ -396,14 +457,13 @@ class KconfigParser:
                 self._parse_help(cfg)
             else:
                 # Unknown property: drop the whole line so a trailing 'if' is not mistaken for a block
+                self._warn_line(prop_tok, f"unknown property of {sym_name}:")
                 self._skip_line()
-
-            last_line = self._previous().end_line if self.pos > 0 else last_line
-            last_col = self._previous().end_col if self.pos > 0 else last_col
             self._skip_newlines()
 
-        cfg.line_e = last_line
-        cfg.char_e = last_col
+        last = self._last_significant(name_tok)
+        cfg.line_e = max(last.end_line, last_line)
+        cfg.char_e = last.end_col if last.end_line >= last_line else last_col
         cfg.raw_code = self._extract_raw(cfg.line_s, cfg.line_e)
         return cfg
 
@@ -428,7 +488,13 @@ class KconfigParser:
 
     def _parse_def_type_definition(self, cfg: KconfigConfig) -> None:
         type_tok = self._advance()
-        cfg.sym_type = TYPE_BOOL if type_tok.type == TokenType.DEF_BOOL else TYPE_TRISTATE
+        cfg.sym_type = {
+            TokenType.DEF_BOOL: TYPE_BOOL,
+            TokenType.DEF_TRISTATE: TYPE_TRISTATE,
+            TokenType.DEF_STRING: TYPE_STRING,
+            TokenType.DEF_INT: TYPE_INT,
+            TokenType.DEF_HEX: TYPE_HEX,
+        }[type_tok.type]
         def_expr = self._parse_expr()
         cond_expr = None
         if self._current().type == TokenType.IF:
@@ -463,6 +529,13 @@ class KconfigParser:
         if self._current().type == TokenType.ON:
             self._advance()  # 'on'
         expr = self._parse_expr()
+        if self._current().type == TokenType.IF:
+            # Linux 7.0+ "depends on X if Y" is menu_add_dep(X, Y): X || (Y = n), trans-compared
+            self._advance()
+            cond = self._parse_expr()
+            if expr and cond:
+                expr = _span(ExprOp.OR, expr, trans_compare_no(cond, True), ref=expr)
+                expr.line_e, expr.char_e = cond.line_e, cond.char_e
         if expr:
             target_list.append(expr)
         self._skip_newlines()
@@ -517,11 +590,18 @@ class KconfigParser:
             target.help_text = self._advance().value
         self._skip_newlines()
 
+    def _set_header(self, node: Any, header_tok: Token) -> None:
+        node.header_line_e = header_tok.end_line
+        node.header_char_e = header_tok.end_col
+        node.header_code = self._extract_raw(node.line_s, node.header_line_e)
+
     def _parse_menu(self) -> KconfigMenu:
         start_tok = self._advance()  # 'menu'
         title = ""
+        header_tok = start_tok
         if self._current().type in (TokenType.CONST_STRING, TokenType.SYMBOL):
-            title = self._advance().value
+            header_tok = self._advance()
+            title = header_tok.value
         self._skip_newlines()
 
         menu = KconfigMenu(
@@ -529,6 +609,7 @@ class KconfigParser:
             line_s=start_tok.line,
             char_s=start_tok.col,
         )
+        in_header = True
 
         # Parse properties and sub-blocks until endmenu or EOF
         while self._current().type not in (TokenType.ENDMENU, TokenType.EOF):
@@ -551,9 +632,12 @@ class KconfigParser:
             elif cur.type == TokenType.HELP:
                 self._parse_help(menu)
             else:
+                in_header = False
                 item = self._parse_top_level_item()
                 if item:
                     menu.children.append(item)
+            if in_header:
+                header_tok = self._last_significant(header_tok)
             self._skip_newlines()
 
         end_tok = self._current()
@@ -564,13 +648,16 @@ class KconfigParser:
         menu.line_e = end_tok.end_line
         menu.char_e = end_tok.end_col
         menu.raw_code = self._extract_raw(menu.line_s, menu.line_e)
+        self._set_header(menu, header_tok)
         return menu
 
     def _parse_choice(self) -> KconfigChoice:
         start_tok = self._advance()  # 'choice'
         name = None
+        header_tok = start_tok
         if self._current().type == TokenType.SYMBOL:
-            name = self._advance().value
+            header_tok = self._advance()
+            name = header_tok.value
         self._skip_newlines()
 
         choice = KconfigChoice(
@@ -578,6 +665,7 @@ class KconfigParser:
             line_s=start_tok.line,
             char_s=start_tok.col,
         )
+        in_header = True
 
         while self._current().type not in (TokenType.ENDCHOICE, TokenType.EOF):
             cur = self._current()
@@ -617,9 +705,12 @@ class KconfigParser:
             elif cur.type == TokenType.HELP:
                 self._parse_help(choice)
             else:
+                in_header = False
                 item = self._parse_top_level_item()
                 if item:
                     choice.children.append(item)
+            if in_header:
+                header_tok = self._last_significant(header_tok)
             self._skip_newlines()
 
         end_tok = self._current()
@@ -630,11 +721,13 @@ class KconfigParser:
         choice.line_e = end_tok.end_line
         choice.char_e = end_tok.end_col
         choice.raw_code = self._extract_raw(choice.line_s, choice.line_e)
+        self._set_header(choice, header_tok)
         return choice
 
     def _parse_if(self) -> KconfigIf:
         start_tok = self._advance()  # 'if'
         cond_expr = self._parse_expr() or KconfigExpr(op=ExprOp.SYMBOL_REF, value="y")
+        header_tok = self._last_significant(start_tok)
         self._skip_newlines()
 
         if_node = KconfigIf(
@@ -657,6 +750,7 @@ class KconfigParser:
         if_node.line_e = end_tok.end_line
         if_node.char_e = end_tok.end_col
         if_node.raw_code = self._extract_raw(if_node.line_s, if_node.line_e)
+        self._set_header(if_node, header_tok)
         return if_node
 
     def _parse_comment(self) -> KconfigComment:
@@ -676,7 +770,7 @@ class KconfigParser:
             self._parse_depends_on(comment.depends_on)
             self._skip_newlines()
 
-        last_tok = self._previous() if self.pos > 0 else start_tok
+        last_tok = self._last_significant(start_tok)
         comment.line_e = last_tok.end_line
         comment.char_e = last_tok.end_col
         comment.raw_code = self._extract_raw(comment.line_s, comment.line_e)
@@ -685,17 +779,19 @@ class KconfigParser:
     def _parse_source(self, is_rsource: bool, is_osource: bool = False) -> KconfigSource:
         start_tok = self._advance()  # 'source', 'rsource', or 'osource'
         path_str = ""
+        end_tok = start_tok
         if self._current().type in (TokenType.CONST_STRING, TokenType.SYMBOL):
-            path_str = self._advance().value
+            end_tok = self._advance()
+            path_str = end_tok.value
         src = KconfigSource(
             path=path_str,
             is_rsource=is_rsource,
             is_osource=is_osource,
             line_s=start_tok.line,
             char_s=start_tok.col,
-            line_e=start_tok.end_line,
-            char_e=start_tok.end_col,
-            raw_code=self._extract_raw(start_tok.line, start_tok.end_line),
+            line_e=end_tok.end_line,
+            char_e=end_tok.end_col,
+            raw_code=self._extract_raw(start_tok.line, end_tok.end_line),
         )
         if self.on_source is not None:
             # Before the next line is lexed (it may use variables the sourced file defines)

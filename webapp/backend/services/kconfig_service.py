@@ -12,6 +12,7 @@ different files (and with different dependencies) per architecture, e.g. 64BIT.
 """
 from __future__ import annotations
 
+import gzip
 import hashlib
 import json
 import logging
@@ -19,6 +20,7 @@ import os
 import re
 import subprocess
 import threading
+from pathlib import Path
 from typing import Any
 
 from fastapi import HTTPException
@@ -29,6 +31,8 @@ from parser.kconfig_ast.kconfig_eval import KconfigEvaluator, escape_string, sol
 from parser.kconfig_ast.kconfig_preprocess import KconfigPreprocessor
 from parser.kconfig_ast.kconfig_toolchain import ToolchainProfile, ToolchainShell
 from parser.kconfig_ast.kconfig_model import (
+    MODEL_FORMAT,
+    ExprTable,
     KconfigEnv,
     KconfigModelBuilder,
     arch_aliases,
@@ -37,7 +41,7 @@ from parser.kconfig_ast.kconfig_model import (
     resolve_kbuild_defconfig,
 )
 from webapp.backend.config import RepoScopedCache, get_active_repo_name, get_repo_dir
-from webapp.backend.database.helpers import get_version_info, safe_decode
+from webapp.backend.database.helpers import get_version_info
 from webapp.backend.database.pool import get_db_cursor
 from webapp.backend.security.git import safe_rev
 from webapp.backend.security.sql import is_valid_identifier
@@ -63,18 +67,21 @@ _USAGE_REF_LIMIT = 20000
 class _ModelEntry:
     """A built model plus server-side extras (help texts, reverse indexes, expression printer)."""
 
-    def __init__(self, builder: KconfigModelBuilder, model: dict[str, Any], arch: dict[str, Any]) -> None:
-        self.builder = builder
+    def __init__(self, model: dict[str, Any], arch: dict[str, Any], extras: dict[str, Any]) -> None:
         self.model = model
         self.arch = arch
         self.compact = compact_model(model)
-        self.help = builder.help_texts()
-        self.menu_help = builder.menu_help()
+        self.help: dict[str, str] = extras["help"]
+        self.menu_help: dict[int, str] = {int(k): v for k, v in extras["menu_help"].items()}
+        # Direct references made by entries' own properties (KconfigModelBuilder.references)
+        self.references: dict[str, list[dict[str, Any]]] = extras["references"]
+        self.exprs = ExprTable()
+        self.exprs.nodes = [tuple(node) for node in model["exprs"]]
         self.selected_by: dict[str, list[tuple[str, int]]] = {}
         self.implied_by: dict[str, list[tuple[str, int]]] = {}
         # Symbols named by each entry's own `depends on` lines (not inherited from menus/ifs)
         self.own_depends: dict[str, list[str]] = {}
-        for target, refs in builder.references.items():
+        for target, refs in self.references.items():
             for by in {r["by"] for r in refs if r["kind"] == "depends_on"}:
                 self.own_depends.setdefault(by, []).append(target)
         for deps in self.own_depends.values():
@@ -86,10 +93,58 @@ class _ModelEntry:
                 self.implied_by.setdefault(target, []).append((name, vis))
 
     def expr(self, eid: int) -> str:
-        return self.builder.exprs.to_string(None if eid < 0 else eid)
+        return self.exprs.to_string(None if eid < 0 else eid)
 
     def evaluator(self) -> KconfigEvaluator:
         return KconfigEvaluator(self.model)
+
+
+# Built models persist across restarts as gzipped JSON, keyed by commit SHA, ARCH, toolchain and the
+# model code (a cold build of a modern tree costs ~2 s); KERNELINFO_CACHE_DIR overrides the location
+_MODEL_DISK_DIR = Path(os.environ.get("KERNELINFO_CACHE_DIR") or "~/.cache/kernelinfo").expanduser() / "kconfig-models"
+_MODEL_DISK_LIMIT = 32
+_MODEL_CODE_FILES = ("kconfig_lexer.py", "kconfig_parser.py", "kconfig_model.py", "kconfig_preprocess.py", "kconfig_toolchain.py")
+_model_code_fingerprint: str | None = None
+
+
+def _code_fingerprint() -> str:
+    """Hash of the model-building code: a cached model is only reused by the code that built it."""
+    global _model_code_fingerprint
+    if _model_code_fingerprint is None:
+        h = hashlib.sha1(str(MODEL_FORMAT).encode())
+        base = Path(__file__).resolve().parents[3] / "parser" / "kconfig_ast"
+        for name in _MODEL_CODE_FILES:
+            try:
+                h.update((base / name).read_bytes())
+            except OSError:
+                h.update(name.encode())
+        _model_code_fingerprint = h.hexdigest()
+    return _model_code_fingerprint
+
+
+def _disk_load(key: str) -> dict[str, Any] | None:
+    path = _MODEL_DISK_DIR / f"{key}.json.gz"
+    try:
+        with gzip.open(path, "rt", encoding="utf-8") as fh:
+            data = json.load(fh)
+        os.utime(path)  # least recently used eviction by mtime
+        return data
+    except (OSError, ValueError, EOFError):
+        return None
+
+
+def _disk_store(key: str, data: dict[str, Any]) -> None:
+    try:
+        _MODEL_DISK_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = _MODEL_DISK_DIR / f".{key}.{os.getpid()}.tmp"
+        with gzip.open(tmp, "wt", encoding="utf-8", compresslevel=5) as fh:
+            json.dump(data, fh, separators=(",", ":"))
+        os.replace(tmp, _MODEL_DISK_DIR / f"{key}.json.gz")
+        entries = sorted(_MODEL_DISK_DIR.glob("*.json.gz"), key=lambda p: p.stat().st_mtime)
+        for old in entries[:-_MODEL_DISK_LIMIT]:
+            old.unlink(missing_ok=True)
+    except OSError as exc:
+        logger.debug("Kconfig model not cached on disk: %s", exc)
 
 
 _MODELS: "RepoScopedCache" = RepoScopedCache()
@@ -283,7 +338,27 @@ class KconfigService:
 
     def _build_model(self, rev: str, info: dict[str, Any], profile: ToolchainProfile,
                      version_name: str) -> _ModelEntry:
-        """Parse and finalize one revision's Kconfig model. Runs without the model cache lock held."""
+        """Parse and finalize one revision's Kconfig model (or load it from the disk cache).
+
+        Runs without the model cache lock held.
+        """
+        commit = self._git(["rev-parse", "--verify", "--quiet", f"{rev}^{{commit}}"], timeout=10).strip()
+        key = None
+        if re.fullmatch(r"[0-9a-f]{40,64}", commit):
+            spec = json.dumps([get_active_repo_name(), commit, info["arch"], profile.to_dict(), _code_fingerprint()], sort_keys=True)
+            key = hashlib.sha1(spec.encode()).hexdigest()
+            cached = _disk_load(key)
+            if cached is not None:
+                cached["model"]["version"] = version_name
+                return _ModelEntry(cached["model"], info, cached)
+        model, extras = self._parse_model(rev, info, profile)
+        if key is not None:
+            _disk_store(key, {"model": model, **extras})
+        model["version"] = version_name
+        return _ModelEntry(model, info, extras)
+
+    def _parse_model(self, rev: str, info: dict[str, Any], profile: ToolchainProfile) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Build one revision's model from Git: (model, {help, menu_help, references})."""
         read = lambda p: self._read(rev, p)  # noqa: E731
         env_vars = profile.environment(info["arch"], info["srcarch"], info["kernelversion"])
         env_vars.setdefault("KBUILD_DEFCONFIG", self._default_defconfig(rev, info["arch"], info["srcarch"]) or "")
@@ -298,11 +373,10 @@ class KconfigService:
             shell.pp = pp
         builder = KconfigModelBuilder(read, env, pp)
         model = builder.build(self._root_kconfig(rev, info["srcarch"]))
-        model["version"] = version_name
         model["arch"] = info["arch"]
         model["srcarch"] = info["srcarch"]
         model["toolchain"] = self._toolchain_report(model, profile, env_vars, macros, pp, shell)
-        return _ModelEntry(builder, model, info)
+        return model, {"help": builder.help_texts(), "menu_help": builder.menu_help(), "references": builder.references}
 
     @staticmethod
     def _toolchain_report(model: dict[str, Any], profile: ToolchainProfile, env_vars: dict[str, str], macros: bool,
@@ -482,7 +556,7 @@ class KconfigService:
         if include_relations:
             relations: dict[str, dict[str, list[str]]] = {}
             reverse: dict[str, dict[str, list[dict[str, Any]]]] = {}
-            for ref_target, refs in entry.builder.references.items():
+            for ref_target, refs in entry.references.items():
                 for ref in refs:
                     kind = {"depends_on": "depends_on", "select": "selects", "imply": "implies"}.get(ref["kind"])
                     if kind:
@@ -621,7 +695,7 @@ class KconfigService:
             "choice": sym.get("choice"),
             "choice_members": entry.model["symbols"][sym["choice"]]["members"] if sym.get("choice") else [],
             "env": sym.get("env"),
-            "kconfig_refs": entry.builder.references.get(clean, [])[:_USAGE_LIMIT],
+            "kconfig_refs": entry.references.get(clean, [])[:_USAGE_LIMIT],
             "kbuild": kbuild,
             "compiled_files": self._compiled_files(kbuild, clean, version_name),
             # Lifecycle fields kept for API compatibility (the model is per revision)
@@ -680,7 +754,9 @@ class KconfigService:
         trees = self._arch_trees(rev, info["arch"])
         return [dict(r, other_arch=is_other_arch_path(r["path"], srcarch, trees)) for r in rules]
 
-    def _compiled_files(self, kbuild: list[dict[str, Any]], name: str, version_name: str) -> list[dict[str, Any]]:
+    @staticmethod
+    def _compiled_files(kbuild: list[dict[str, Any]], name: str, version_name: str) -> list[dict[str, Any]]:
+        """Existing source files the symbol's Kbuild rules build at this revision (from the Git scan)."""
         files: dict[str, dict[str, Any]] = {}
         for rule in kbuild:
             if rule["kind"] == "directory" or not rule["exists"]:
@@ -689,25 +765,6 @@ class KconfigService:
                 "file_path": rule["path"], "target_obj": rule["target_obj"], "compile_mode": rule["compile_mode"],
                 "makefile": rule["makefile"], "line": rule["line"], "other_arch": rule["other_arch"],
             })
-        # Rows indexed by the parsing pipeline (m_kconfig_kbuild) complement the Git scan
-        try:
-            with get_db_cursor() as cursor:
-                cursor.execute(
-                    """
-                    SELECT DISTINCT fn.fname, kb.target_obj
-                    FROM m_kconfig_kbuild kb
-                    JOIN m_kconfig_symbol s ON s.kcid = kb.kcid
-                    JOIN m_file_name fn ON kb.target_fnid = fn.fnid
-                    WHERE s.name = %s
-                    LIMIT 500;
-                    """,
-                    (name,),
-                )
-                for row in cursor.fetchall():
-                    path = safe_decode(row["fname"])
-                    files.setdefault(path, {"file_path": path, "target_obj": safe_decode(row["target_obj"]), "compile_mode": "conditional"})
-        except Exception as exc:
-            logger.debug("m_kconfig_kbuild lookup skipped: %s", exc)
         return sorted(files.values(), key=lambda f: f["file_path"])
 
     # ------------------------------------------------------------------ build conditions (git)
@@ -791,7 +848,7 @@ class KconfigService:
             "source_ref_count": len(sources),
             "source_refs_truncated": len(refs) >= _USAGE_REF_LIMIT,
             "source_file_count": len({r["file_path"] for r in sources}),
-            "kconfig_refs": entry.builder.references.get(clean, [])[:limit],
+            "kconfig_refs": entry.references.get(clean, [])[:limit],
         }
 
     def get_graph(self, version_name: str, symbol_or_arch: str = "x86", depth: int = 2, arch: str = DEFAULT_ARCH, toolchain: Any = None) -> dict[str, Any]:

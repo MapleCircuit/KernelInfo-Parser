@@ -26,9 +26,7 @@ from core.DBLayout import (
     m_bridge_tag,
     m_map_ast,
     m_bridge_map,
-    m_kconfig_symbol,
-    m_kconfig_relation,
-    m_kconfig_tree,
+    m_tag_code,
 )
 from db_engine import MockDB
 from table_engine import TECachedDB
@@ -224,31 +222,64 @@ class TestKconfigAstIntegration(unittest.TestCase):
         executed = cs.execute()
         self.assertTrue(executed)
 
-        # Validate that symbols were created and resolvable via public TableEngine API
-        modules_sym = m_kconfig_symbol.get(None, "MODULES", None, None, None, None, None)
-        netdev_sym = m_kconfig_symbol.get(None, "NETDEVICES", None, None, None, None, None)
-        hostname_sym = m_kconfig_symbol.get(None, "DEFAULT_HOSTNAME", None, None, None, None, None)
+        # Every entry is an m_ast node named after it, placed in the blob by a tag
+        def ast_id(name: str, ast_type: ASTT) -> int | None:
+            res = m_ast.view_get(((m_ast.ast_id,),), None, name, int(ast_type))
+            return res[2][0] if res else None
 
-        self.assertIsNotNone(modules_sym)
-        self.assertIsNotNone(netdev_sym)
-        self.assertIsNotNone(hostname_sym)
+        for name in ("MODULES", "LOCALVERSION", "DEFAULT_HOSTNAME", "ZLIB_COMPRESSION", "LZO_COMPRESSION"):
+            self.assertIsNotNone(ast_id(name, ASTT.Kconfig_Config), name)
+        self.assertIsNotNone(ast_id("NETDEVICES", ASTT.Kconfig_Menuconfig))
+        self.assertIsNotNone(ast_id("General setup", ASTT.Kconfig_Menu))
+        self.assertIsNotNone(ast_id("Choose compression algorithm", ASTT.Kconfig_Choice))
+        self.assertIsNotNone(ast_id("if MODULES", ASTT.Kconfig_If))
 
-        # Check symbol definitions
-        for sym_op, sym_name in ((modules_sym, "MODULES"), (netdev_sym, "NETDEVICES"), (hostname_sym, "DEFAULT_HOSTNAME")):
-            row = sym_op[2]
-            self.assertEqual(row[1], sym_name)
-
-        # Validate relations
-        rel_rows = G.TE.queued_set.get(m_kconfig_relation.table_id, {})
-        self.assertGreater(len(rel_rows), 0)
-
-        # Validate menu tree
-        tree_rows = G.TE.queued_set.get(m_kconfig_tree.table_id, {})
-        self.assertGreater(len(tree_rows), 0)
-        # Check version/blob binding on tree records
         expected_blob_id = cs.cs_result[1][0]
-        for _, trow in tree_rows.items():
-            self.assertEqual(trow[1], expected_blob_id)  # blob_id
+        bridges = {row[1]: row for row in G.TE.queued_set.get(m_bridge_tag.table_id, {}).values()}
+        tags = {row[0]: row for row in G.TE.queued_set.get(m_tag.table_id, {}).values()}
+        codes = {row[0]: row[1] for row in G.TE.queued_set.get(m_tag_code.table_id, {}).values()}
+        self.assertTrue(bridges)
+        lines = SAMPLE_KCONFIG.splitlines()
+        by_ast = {}
+        for tag_id, b in bridges.items():
+            self.assertEqual(b[0], expected_blob_id)
+            by_ast[tags[tag_id][2]] = (b[2], b[3], codes.get(tags[tag_id][1], ""))
+        # Container tags cover their header lines only, never their children
+        menu_s, menu_e, menu_code = by_ast[ast_id("General setup", ASTT.Kconfig_Menu)]
+        self.assertEqual((lines[menu_s - 1], menu_s), ('menu "General setup"', menu_e))
+        if_s, if_e, if_code = by_ast[ast_id("if MODULES", ASTT.Kconfig_If)]
+        self.assertEqual((if_code, if_s), ("if MODULES\n", if_e))
+        choice_s, choice_e, choice_code = by_ast[ast_id("Choose compression algorithm", ASTT.Kconfig_Choice)]
+        self.assertNotIn("ZLIB\"", choice_code)
+        self.assertEqual(lines[choice_e - 1].strip(), "default ZLIB_COMPRESSION")
+        # A config ends at its last property: the blank line and the next entry are not part of it
+        mod_s, mod_e, mod_code = by_ast[ast_id("MODULES", ASTT.Kconfig_Config)]
+        self.assertTrue(mod_code.rstrip("\n").endswith("monolithic kernel."))
+        self.assertEqual(lines[mod_e - 1].strip(), "Say Y unless you are building a monolithic kernel.")
+        # A literal `source` path links the sourced file
+        fn = m_file_name.get(None, "drivers/net/Kconfig")
+        self.assertIsNotNone(fn)
+        includes = [row for row in G.TE.queued_set.get(m_ast_include.table_id, {}).values()]
+        self.assertIn(fn[2][0], {row[1] for row in includes})
+
+    def test_environment_dependent_source_is_not_a_file_name(self) -> None:
+        """`source "arch/$SRCARCH/Kconfig"` names one file per ARCH: no bogus m_file_name row."""
+        cs = ChangeSet("A\tKconfig")
+        cs.gp = self.gp
+        cs.mf = None
+        cs.raw_content = 'source "arch/$SRCARCH/Kconfig"\nsource "arch/$(SRCARCH)/Kconfig.debug"\n'
+        cs.store(m_file_name.set(None, "Kconfig"))
+        cs.store(m_file.set(None, b"\x03" * 20, 2))
+        cs.store(m_bridge_file.set(1, ((m_file_name.table_id, 0), 3, (REF_ROOT,)), ((m_file.table_id, 0), 3, (REF_ROOT,))))
+        kconfig_ast_parse(cs)
+        self.assertTrue(cs.execute())
+        # m_file_name is no_duplicate: staged rows are keyed by (fname,)
+        staged = [key[0] for key in G.TE.queued_set.get(m_file_name.table_id, {})]
+        self.assertIn("Kconfig", staged)
+        self.assertFalse(any("$" in name for name in staged), staged)
+        self.assertFalse(G.TE.queued_set.get(m_ast_include.table_id))
+        res = m_ast.view_get(((m_ast.ast_id,),), None, "arch/$SRCARCH/Kconfig", int(ASTT.Kconfig_Source))
+        self.assertIsNotNone(res)
 
     def test_kconfig_multi_file_symbol_relations_dedup(self) -> None:
         """Verify that multiple Kconfig files defining the same symbol with overlapping relations stage cleanly."""
@@ -511,3 +542,91 @@ if __name__ == "__main__":
     unittest.main()
 
 
+
+
+class TestObsoleteKconfigTables(unittest.TestCase):
+    """Startup migration dropping m_kconfig_* (table ids 16-19) and renumbering interrupted runs' watermarks."""
+
+    class FakeCursor:
+        def __init__(self, store: dict) -> None:
+            self.store = store
+            self._result: list = []
+
+        def execute(self, sql: str, params: tuple = ()) -> None:
+            s = " ".join(sql.split())
+            marks = self.store["marks"]
+            if s.startswith("SELECT table_name FROM information_schema.tables"):
+                self._result = [(n,) for n in params if n in self.store["tables"]]
+            elif s.startswith("SELECT DISTINCT commit_id FROM m_ingest_watermark WHERE marked_table_id"):
+                self._result = sorted({(c,) for c, t, _ in marks if t == params[0]})
+            elif s.startswith("SELECT marked_table_id, max_id FROM m_ingest_watermark"):
+                self._result = [(t, v) for c, t, v in marks if c == params[0]]
+            elif s.startswith("DELETE FROM m_ingest_watermark"):
+                self.store["marks"] = [m for m in marks if m[0] != params[0]]
+            elif s.startswith("INSERT INTO m_ingest_watermark"):
+                assert not any(c == params[0] and t == params[1] for c, t, _ in marks), "primary key collision"
+                self.store["marks"].append(tuple(params))
+            elif s.startswith("DROP TABLE"):
+                for name in list(self.store["tables"]):
+                    if f"`{name}`" in s:
+                        self.store["tables"].discard(name)
+            self.store["log"].append(s)
+
+        def fetchall(self) -> list:
+            return self._result
+
+        def close(self) -> None:
+            pass
+
+    class FakeCnx:
+        def __init__(self, store: dict) -> None:
+            self.store = store
+
+        def cursor(self):
+            return TestObsoleteKconfigTables.FakeCursor(self.store)
+
+        def commit(self) -> None:
+            pass
+
+    class FakeDB:
+        def __init__(self, store: dict) -> None:
+            self.cnx = TestObsoleteKconfigTables.FakeCnx(store)
+
+    def test_drop_and_renumber_is_idempotent(self) -> None:
+        import main
+        from core import ingest_state
+        from core.DBLayout import TABLES, m_maintainer_member, m_maintainer_person
+        # Old numbering: m_kconfig_symbol/relation/tree (16-18) were watermarked, later tables were 20+
+        old_marks = [(7, 3, 9), (7, 16, 100), (7, 17, 200), (7, 18, 300), (7, 20, 40), (7, 26, 50), (7, 35, 6), (7, 38, 7), (7, 45, 1)]
+        new_marks = [(9, 16, 11), (9, 22, 12)]  # a run already recorded with the current ids
+        store = {"tables": set(main.OBSOLETE_KCONFIG_TABLES) | {"m_ingest_watermark"}, "marks": old_marks + new_marks, "log": []}
+        db = self.FakeDB(store)
+        main.drop_obsolete_kconfig_tables(db)
+        self.assertEqual(store["tables"], {"m_ingest_watermark"})
+        # m_maintainer_person (old 20 -> 16), m_commit (26 -> 22), m_ast_attribute (35 stays),
+        # m_git_ref (38 -> 33), m_ingest_watermark (45 -> 41)
+        self.assertEqual(sorted(store["marks"]), sorted([(7, 3, 9), (7, 16, 40), (7, 22, 50), (7, 35, 6), (7, 33, 7), (7, 41, 1)] + new_marks))
+        names = {t.table_id: t.table_name for t in TABLES}
+        self.assertEqual((names[16], names[22], names[33], names[35], names[41]),
+                         ("m_maintainer_person", "m_commit", "m_git_ref", "m_ast_attribute", "m_ingest_watermark"))
+        # The marker id is unmarked in the new numbering, so a second run changes nothing
+        marked = {t.table_id for t, _ in ingest_state.marked_tables(TABLES)}
+        self.assertNotIn(m_maintainer_member.table_id, marked)
+        self.assertIn(m_maintainer_person.table_id, marked)
+        before = list(store["marks"])
+        main.drop_obsolete_kconfig_tables(db)
+        self.assertEqual(store["marks"], before)
+
+
+class TestKconfigDiffDefinitions(unittest.TestCase):
+    def test_definitions_and_line_insensitive_comparison(self) -> None:
+        from webapp.backend.services.history_service import kconfig_definitions
+        from webapp.backend.services.diff_service import DiffService
+        old = 'if NET\nconfig A\n\tbool "a"\n\tdepends on X\nendif\n'
+        moved = '# moved down\n\nif NET\nconfig A\n\tbool "a"\n\tdepends on X\nendif\n'
+        changed = 'if NET\nconfig A\n\tbool "a"\n\tdepends on X && Y\nendif\n'
+        defs = {k: kconfig_definitions(v)["A"][0] for k, v in (("old", old), ("moved", moved), ("changed", changed))}
+        self.assertEqual(defs["old"]["inherited_depends"], ["NET"])
+        cmp = {k: DiffService._comparable({"file": "Kconfig", "facts": v}) for k, v in defs.items()}
+        self.assertEqual(cmp["old"], cmp["moved"])
+        self.assertNotEqual(cmp["old"], cmp["changed"])

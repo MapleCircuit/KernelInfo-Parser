@@ -28,7 +28,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
-from parser.kconfig_ast.kconfig_lexer import KconfigLexer
+from parser.kconfig_ast.kconfig_lexer import KEYWORDS, KconfigLexer
 from parser.kconfig_ast.kconfig_parser import (
     ExprOp,
     KconfigChoice,
@@ -51,7 +51,7 @@ MODEL_FORMAT = 2
 
 TYPE_NAMES = {TYPE_BOOL: "bool", TYPE_TRISTATE: "tristate", TYPE_STRING: "string", TYPE_HEX: "hex", TYPE_INT: "int"}
 
-# Legacy node_type codes (m_kconfig_tree): 1=menu, 2=choice, 3=config, 4=menuconfig, 5=comment
+# Menu entry kinds of model nodes (node_type): 1=menu, 2=choice, 3=config, 4=menuconfig, 5=comment, 6=if
 NODE_TYPES = {"menu": 1, "choice": 2, "config": 3, "menuconfig": 4, "comment": 5, "if": 6, "root": 0}
 
 _REL_OPS = {
@@ -139,6 +139,23 @@ class ExprTable:
                     return True
         return False
 
+    def contains_symbol_negated(self, eid: int | None, name: str) -> bool:
+        """expr_contains_symbol_negated (Linux 7.3+): `name` is referenced so it can be disabled (!FOO, FOO=n, FOO!=y/m)."""
+        if eid is None:
+            return False
+        node = self.nodes[eid]
+        op = node[0]
+        if op in ("&", "|"):
+            return self.contains_symbol_negated(node[1], name) or self.contains_symbol_negated(node[2], name)
+        if op == "!":
+            return self.nodes[node[1]] == ("s", name)
+        if op in ("=", "!="):
+            left, right = self.nodes[node[1]], self.nodes[node[2]]
+            if left != ("s", name):
+                return False
+            return right == ("s", "n") if op == "=" else right in (("s", "y"), ("s", "m"))
+        return False
+
     def conjuncts(self, eid: int | None) -> set[int]:
         if eid is None:
             return set()
@@ -195,6 +212,7 @@ class _Sym:
     menus: list["_Menu"] = field(default_factory=list)
     help: str = ""
     allnoconfig_y: bool = False
+    transitional: bool = False  # SYMBOL_TRANS (Linux 6.18+)
 
 
 @dataclass(eq=False)
@@ -247,6 +265,9 @@ class KconfigModelBuilder:
         # Direct references made by each entry's own properties: name -> [{kind, by, file, line}]
         self.references: dict[str, list[dict[str, Any]]] = {}
         self._anon_choices = 0
+        # menu_finalize rules of the revision (set from conf_semantics() by build())
+        self._negated_submenu_rule = False
+        self._sem: dict[str, bool] = {}
         self._parse_cache: dict[str, list[Any]] = {}
         self._mod_rewrites: list[tuple[str, int]] = []
 
@@ -336,7 +357,10 @@ class KconfigModelBuilder:
             return items
 
         lexer = KconfigLexer(content, self.pp, path)
-        items = KconfigParser(lexer.iter_tokens(), content, on_source=on_source).parse()
+        parser = KconfigParser(lexer.iter_tokens(), content, on_source=on_source)
+        items = parser.parse()
+        # Statements kconfig would reject are dropped by the parser: never silently
+        self.warnings.extend(f"{path}:{w}" for w in parser.warnings)
         if self.pp is None:
             self._parse_cache[path] = items
         return items
@@ -454,8 +478,12 @@ class KconfigModelBuilder:
             self.modules_name = cfg.name
         if cfg.is_defconfig_list and self.defconfig_list is None:
             self.defconfig_list = cfg.name
+        if cfg.is_defconfig_list and self._sem.get("defconfig_list_auto"):
+            sym.auto = True  # SYMBOL_AUTO / SYMBOL_NO_WRITE since 4.16: never written to .config
         if cfg.allnoconfig_y:
             sym.allnoconfig_y = True
+        if cfg.transitional:
+            sym.transitional = True
         if cfg.help_text:
             menu.help = cfg.help_text
             if not sym.help:
@@ -516,9 +544,10 @@ class KconfigModelBuilder:
             return [p for p in menu.sym.props if p.menu is menu]
         return [menu.prompt] if menu.prompt is not None else []
 
-    def _finalize(self, parent: _Menu) -> None:
+    def _finalize(self, parent: _Menu, inside_choice: bool = False) -> None:
         sym = parent.sym
         ex = self.exprs
+        sem = self._sem
         if parent.children:
             if sym is not None and sym.is_choice:
                 if sym.type == "unknown":
@@ -529,7 +558,8 @@ class KconfigModelBuilder:
                 for menu in parent.children:
                     if menu.sym is not None and menu.sym.type == "unknown":
                         menu.sym.type = sym.type
-                parentdep = ex.sym(sym.name)
+                # 6.11+: choice members inherit the choice's dependency, no longer the choice symbol
+                parentdep = parent.dep if sem.get("choice_member_parentdep") else ex.sym(sym.name)
             elif parent.prompt is not None:
                 parentdep = parent.prompt.visible
             else:
@@ -540,7 +570,7 @@ class KconfigModelBuilder:
                 menu.dep = basedep
                 for prop in self._menu_props(menu):
                     dep = ex.and_(basedep, prop.visible)
-                    if menu.sym is not None and menu.sym.type != "tristate":
+                    if menu.sym is not None and menu.sym.type != "tristate" and not sem.get("no_finalize_trans_bool"):
                         dep = self._trans_bool(dep)
                     prop.visible = dep
                     if prop.kind in ("select", "imply") and menu.sym is not None:
@@ -552,10 +582,12 @@ class KconfigModelBuilder:
                             target.implied = ex.or_(target.implied, term)
             # Children may adopt their following siblings (implicit submenus): walk by index
             idx = 0
+            child_in_choice = bool(sym is not None and sym.is_choice and sem.get("no_submenu_in_choice"))
             while idx < len(parent.children):
-                self._finalize(parent.children[idx])
+                self._finalize(parent.children[idx], child_in_choice)
                 idx += 1
-        elif sym is not None:
+        elif sym is not None and not inside_choice:
+            # 6.9+: a choice member gets neither submenus nor dir_dep (choice values never use it)
             self._implicit_submenu(parent, sym)
             sym.dir_dep = ex.or_(sym.dir_dep, parent.dep) if sym.dir_dep is not None else parent.dep
 
@@ -568,7 +600,7 @@ class KconfigModelBuilder:
                 member.choice = sym.name
                 if not menu.prompt:
                     self.warnings.append(f"{menu.file}:{menu.line}: choice value must have a prompt")
-                if sym.type == "tristate" and member.type != "tristate":
+                if sym.type == "tristate" and member.type != "tristate" and not sem.get("no_tristate_choices"):
                     # Non-tristate values of tristate choices depend on the choice being y
                     basedep = ex.rel("=", ex.sym(sym.name), ex.sym("y"))
                     menu.dep = ex.and_(basedep, menu.dep)
@@ -583,7 +615,7 @@ class KconfigModelBuilder:
                 menu.children = []
             idx += 1
 
-        if sym is not None and not sym.optional and parent.prompt is not None:
+        if sym is not None and not sym.optional and parent.prompt is not None and not sem.get("no_tristate_choices"):
             sym.rev_dep = ex.or_(sym.rev_dep, ex.and_(parent.prompt.visible, ex.sym("m")))
 
     def _implicit_submenu(self, parent: _Menu, sym: _Sym) -> None:
@@ -607,6 +639,8 @@ class KconfigModelBuilder:
             if not ex.contains_symbol(dep, sym.name):
                 break
             if not ex.depends_symbol(dep, sym.name):
+                if self._negated_submenu_rule and ex.contains_symbol_negated(dep, sym.name):
+                    break  # Negative dependency (Linux 7.3+): not a child of `sym`
                 # Approximates expr_eliminate_eq: every conjunct of the parent's visibility must recur
                 if not base_terms <= ex.conjuncts(dep):
                     break
@@ -622,6 +656,10 @@ class KconfigModelBuilder:
 
     # ------------------------------------------------------------------ output
     def build(self, root_file: str) -> dict[str, Any]:
+        semantics = self.conf_semantics()
+        self._sem = semantics
+        self._negated_submenu_rule = semantics["submenu_negated_dep"]
+        self._check_keywords()
         self.load(root_file)
         modules = self.modules_name or "MODULES"
         self._patch_modules(modules)
@@ -691,11 +729,13 @@ class KconfigModelBuilder:
                 entry["env"] = sym.env
             if sym.allnoconfig_y:
                 entry["allnoconfig_y"] = True
+            if sym.transitional:
+                entry["transitional"] = True
             symbols_out[sym.name] = entry
 
         return {
             "format": MODEL_FORMAT,
-            "semantics": self.conf_semantics(),
+            "semantics": semantics,
             "config_header": self.config_header(),
             "env": self.env,
             "root_kconfig": root_file,
@@ -710,9 +750,16 @@ class KconfigModelBuilder:
         }
 
     def conf_semantics(self) -> dict[str, bool]:
-        """conf behaviours that changed over time, detected from the revision's scripts/kconfig."""
+        """conf behaviours that changed over time, detected from the revision's scripts/kconfig.
+
+        A behaviour detected by the absence of code only applies when that source file was read: a
+        tree without scripts/kconfig (synthetic models) keeps the long-standing behaviour.
+        """
         symbol_c = self.read_file("scripts/kconfig/symbol.c") or ""
         confdata_c = self.read_file("scripts/kconfig/confdata.c") or ""
+        expr_c = self.read_file("scripts/kconfig/expr.c") or ""
+        menu_c = self.read_file("scripts/kconfig/menu.c") or ""
+        parser_y = (self.read_file("scripts/kconfig/parser.y") or "") + (self.read_file("scripts/kconfig/zconf.y") or "")
         return {
             # Only defaults evaluating to y/m mark a symbol as written (later 4.x+)
             "write_on_nonzero_default": re.search(r"if \(newval\.tri != no\)\s*sym->flags \|= SYMBOL_WRITE", symbol_c) is not None,
@@ -722,7 +769,70 @@ class KconfigModelBuilder:
             "int_hex_zero_default": 'newval.val = "0x0"' in symbol_c,
             # m-visible tristate values of a y choice are hidden
             "tristate_choice_mod_hidden": "choice_sym->curr.tri == yes" in symbol_c,
+            # =, !=, <, ... parse both sides by symbol type and compare numerically (4.2+)
+            "typed_comparisons": "expr_parse_string" in expr_c,
+            # ... falling back to strcmp when a side does not parse, also for <, <=, >, >= (5.0+)
+            "compare_fallback_strcmp": "expr_parse_string" in expr_c and "k_invalid" not in expr_c,
+            # the constant symbols y/m/n are typed tristate, so they compare as n<m<y (6.10+)
+            "const_tristate_type": re.search(r"symbol_yes\s*=\s*\{[^}]*\.type\s*=\s*S_TRISTATE", symbol_c) is not None,
+            # 5.18+: an empty menu also gets its "# end of" line
+            "end_comment_empty_menus": "end_check:" in confdata_c,
+            # 4.10-5.6: implied is only computed for symbols whose direct dependency is not n
+            "implied_needs_dir_dep": "sym->implied.expr && sym->dir_dep.tri != no" in symbol_c,
+            # 4.10-5.6: a tristate implied by a y symbol cannot be m
+            "implied_y_forces_y": "sym->implied.tri == yes" in symbol_c,
+            # 5.7+: an implied value is limited by the direct dependency (no imply before 4.10)
+            "imply_obeys_dir_dep": not symbol_c or re.search(r"EXPR_AND\(newval\.tri,\s*sym->dir_dep\.tri\)", symbol_c) is not None,
+            # 4.16+: the `option defconfig_list` symbol is SYMBOL_AUTO (never written)
+            "defconfig_list_auto": "sym_defconfig_list->flags" in menu_c + parser_y,
+            # 6.9+: entries inside a choice never become implicit submenus
+            "no_submenu_in_choice": "inside_choice" in menu_c,
+            # 6.10+: menu_finalize no longer rewrites FOO!=n to FOO for non-tristate owners
+            "no_finalize_trans_bool": bool(menu_c) and "expr_trans_bool(dep)" not in menu_c,
+            # 6.11+: tristate choices are gone (no choice=y condition on bool values, no `prompt && m` rev_dep)
+            "no_tristate_choices": bool(menu_c) and "expr_alloc_comp(E_EQUAL, sym, &symbol_yes)" not in menu_c,
+            # 6.11+: choice members inherit the choice's dependency instead of the choice symbol
+            "choice_member_parentdep": bool(menu_c) and "parentdep = expr_alloc_symbol(sym)" not in menu_c,
+            # 6.11+: choice selection by member priority (sym_calc_choice over choice_members)
+            "choice_priority": "choice_members" in symbol_c,
+            # 6.11-rc1..6.12-rc5: a hidden menuconfig no longer shows because of visible children
+            "menu_visible_no_children": bool(menu_c) and "menu_is_visible(child)" not in menu_c,
+            # 6.11+: conf_read keeps user values of invisible symbols (conf_unsaved is gone)
+            "conf_read_keeps_invisible": bool(confdata_c) and "conf_unsaved" not in confdata_c,
+            # 6.10+: conf_read keeps out-of-range int/hex user values (they are clamped when used)
+            "conf_read_keeps_out_of_range": bool(confdata_c) and "sym_string_within_range" not in confdata_c,
+            # A following entry with a negated dependency on a symbol is no implicit child of it (7.3+)
+            "submenu_negated_dep": "expr_contains_symbol_negated" in expr_c,
+            # sym_get_string_default clamps a default to the active range (savedefconfig, 7.4+)
+            "default_range_clamp": "sym_get_near_range_bound" in symbol_c,
+            # hex ranges compare as unsigned 64-bit integers (7.4+)
+            "hex_range_unsigned": "union range_value" in symbol_c,
+            # an out-of-range value becomes the bound's own value text, not its reformatted number (6.7+)
+            "range_bound_text": "range_sym->curr.val" in symbol_c,
+            # int/hex values outside the 64-bit bounds are rejected (7.4+)
+            "numeric_bounds_check": "sym_string_check_bounds" in symbol_c,
         }
+
+    # Option names handled inside `option ...` lines (TF_OPTION in zconf.gperf / kconf_id.c)
+    _OPTION_WORDS = frozenset({"allnoconfig_y", "defconfig_list", "env"})
+
+    def _check_keywords(self) -> None:
+        """Warn about keywords of this revision's own kconfig lexer that this parser does not know.
+
+        kconfig's keyword table is read from scripts/kconfig/lexer.l (4.18+), kconf_id.c (4.x) or
+        zconf.gperf (older); a keyword missing from KEYWORDS would otherwise be dropped silently.
+        """
+        found: set[str] = set()
+        lexer_l = self.read_file("scripts/kconfig/lexer.l")
+        if lexer_l:
+            found.update(re.findall(r'^"([A-Za-z_-]+)"\s+return\s+T_', lexer_l, re.M))
+        for path, pattern in (("scripts/kconfig/kconf_id.c", r'\{\s*"([A-Za-z_-]+)",\s*T_\w+,\s*(TF_[\w|]+)'),
+                              ("scripts/kconfig/zconf.gperf", r'^([A-Za-z_-]+),\s*T_\w+,\s*(TF_[\w|]+)')):
+            text = self.read_file(path)
+            if text:
+                found.update(word for word, flags in re.findall(pattern, text, re.M) if "TF_OPTION" not in flags)
+        for word in sorted(found - set(KEYWORDS) - self._OPTION_WORDS):
+            self.warnings.append(f"kconfig keyword '{word}' of this revision is not supported by the parser")
 
     def config_header(self) -> str:
         confdata_c = self.read_file("scripts/kconfig/confdata.c") or ""
@@ -870,7 +980,7 @@ _SYM_KEYS = (
     ("selects", "s", []), ("implies", "i", []), ("rev_dep", "rd", -1), ("implied", "im", -1),
     ("dir_dep", "dd", -1), ("menus", "m", []), ("choice", "ch", None), ("is_choice", "ic", False),
     ("optional", "op", False), ("members", "mb", []), ("auto", "au", False), ("env", "env", None),
-    ("allnoconfig_y", "any", False),
+    ("allnoconfig_y", "any", False), ("transitional", "tr", False),
 )
 MENU_FIELDS = ("parent", "kind", "sym", "prompt", "pvis", "vis_if", "dep", "file", "line_s", "line_e", "has_help")
 

@@ -93,6 +93,188 @@ class TestKconfigSyntax(unittest.TestCase):
         self.assertEqual(choice["members"], ["X", "Y"])
 
 
+class TestNewerKconfigSyntax(unittest.TestCase):
+    """Keywords and grammar added after v6.17, and the extents tags are built from."""
+
+    def parse(self, src: str):
+        parser = KconfigParser(KconfigLexer(src).tokenize(), src)
+        return parser.parse(), parser.warnings
+
+    def test_def_string_int_hex(self) -> None:
+        items, warnings = self.parse('config S\n\tdef_string "a b"\nconfig I\n\tdef_int 3 if X\nconfig H\n\tdef_hex 0x10\n')
+        self.assertEqual([(i.name, i.sym_type, i.defaults[0][0].value) for i in items], [("S", 3, "a b"), ("I", 5, "3"), ("H", 4, "0x10")])
+        self.assertEqual(items[1].defaults[0][1].value, "X")
+        self.assertEqual(warnings, [])
+
+    def test_transitional(self) -> None:
+        items, warnings = self.parse("config OLD\n\tbool\n\ttransitional\n\thelp\n\t  gone\n")
+        self.assertTrue(items[0].transitional)
+        self.assertEqual(items[0].help_text, "gone")
+        self.assertEqual(warnings, [])
+
+    def test_conditional_depends_on(self) -> None:
+        """`depends on X if Y` is menu_add_dep(X, Y): X || expr_trans_compare(Y, =, n)."""
+        items, _ = self.parse("config A\n\tbool \"a\"\n\tdepends on X if Y && !Z\nconfig B\n\tbool \"b\"\n")
+        self.assertEqual([i.name for i in items], ["A", "B"])  # the `if` never opens a block
+        self.assertEqual(items[0].depends_on[0].to_string(), "(X || (Y = n || Z != n))")
+
+    def test_unknown_statements_are_reported(self) -> None:
+        items, warnings = self.parse("whatever\nconfig A\n\tbool \"a\"\n\tfrobnicate if B\nconfig C\n\tbool\n")
+        self.assertEqual([i.name for i in items], ["A", "C"])
+        self.assertEqual(warnings, ["1: unknown statement 'whatever' ignored", "4: unknown property of A: 'frobnicate' ignored"])
+        model = build({"Kconfig": BASE + "config A\n\tbool \"a\"\n\tfrobnicate\n"})
+        self.assertTrue(any("unknown property of A" in w for w in model["warnings"]))
+
+    def test_entry_extents_stop_at_the_last_property(self) -> None:
+        src = ('config A\n\tbool "a"\n\thelp\n\t  text\n\n# about B\n\nconfig B\n\tbool "b"\n'
+               'menu "M"\n\tdepends on Q\n\nconfig C\n\tbool\nendmenu\nif X && \\\n   Y\nconfig D\n\tbool\nendif\n')
+        items, _ = self.parse(src)
+        self.assertEqual((items[0].line_s, items[0].line_e), (1, 4))
+        self.assertEqual((items[2].line_s, items[2].line_e, items[2].header_line_e), (10, 15, 11))
+        self.assertEqual(items[2].header_code, 'menu "M"\n\tdepends on Q\n')
+        self.assertEqual((items[3].header_line_e, items[3].header_code), (17, "if X && \\\n   Y\n"))
+
+    def test_keyword_guard_reports_unknown_kernel_keywords(self) -> None:
+        lexer_l = '"bool"\t\treturn T_BOOL;\n"transitional"\t\treturn T_TRANSITIONAL;\n"frobnicate"\t\treturn T_FROB;\n'
+        model = build({"Kconfig": BASE, "scripts/kconfig/lexer.l": lexer_l})
+        self.assertIn("kconfig keyword 'frobnicate' of this revision is not supported by the parser", model["warnings"])
+        self.assertFalse(any("'transitional'" in w for w in model["warnings"]))
+
+
+# Markers of scripts/kconfig sources: conf_semantics() detects a revision's behaviour from them
+SYMBOL_C_7_4 = ('newval.val = "0x0"; if (newval.tri != no)\n\t\t\t\t\t\tsym->flags |= SYMBOL_WRITE;\n'
+                "range_sym->curr.val union range_value sym_get_near_range_bound sym_string_check_bounds choice_members "
+                "symbol_yes = { .name = \"y\", .type = S_TRISTATE, }\n"
+                "newval.tri = EXPR_AND(newval.tri, sym->dir_dep.tri);\n")
+EXPR_C_7_4 = "expr_parse_string expr_contains_symbol_negated"
+MENU_C_7_4 = "inside_choice menu_is_visible(child)"
+CONFDATA_C_7_4 = "# end of %s"
+
+
+def modern(files: dict[str, str]) -> dict[str, str]:
+    return {**files, "scripts/kconfig/symbol.c": SYMBOL_C_7_4, "scripts/kconfig/expr.c": EXPR_C_7_4,
+            "scripts/kconfig/menu.c": MENU_C_7_4, "scripts/kconfig/confdata.c": CONFDATA_C_7_4}
+
+
+class TestNewerKconfigSemantics(unittest.TestCase):
+    """conf behaviours of 6.7-7.4 and of the 4.x-5.x eras, gated by conf_semantics()."""
+
+    def test_semantics_are_detected_from_the_sources(self) -> None:
+        sem = build(modern({"Kconfig": BASE}))["semantics"]
+        for key in ("choice_priority", "choice_member_parentdep", "no_tristate_choices", "typed_comparisons",
+                    "compare_fallback_strcmp", "const_tristate_type", "default_range_clamp", "hex_range_unsigned",
+                    "numeric_bounds_check", "range_bound_text", "submenu_negated_dep", "no_submenu_in_choice",
+                    "conf_read_keeps_invisible", "conf_read_keeps_out_of_range", "imply_obeys_dir_dep"):
+            self.assertTrue(sem[key], key)
+        self.assertFalse(sem["menu_visible_no_children"])
+        # Without scripts/kconfig sources, the long-standing behaviour applies
+        old = build({"Kconfig": BASE})["semantics"]
+        self.assertFalse(old["choice_priority"] or old["choice_member_parentdep"] or old["conf_read_keeps_invisible"])
+
+    def test_transitional_value_migrates_and_is_never_written(self) -> None:
+        files = modern({"Kconfig": BASE + 'config NEW\n\tbool "new"\n\tdefault OLD\nconfig OLD\n\tbool\n\ttransitional\n'})
+        ev = KconfigEvaluator(build(files))
+        ev.load_config("CONFIG_OLD=y\n")
+        ev.set_all_new_symbols("default")
+        self.assertEqual((ev.value("OLD"), ev.value("NEW")), ("y", "y"))
+        self.assertTrue(ev.has_user("NEW"))  # 6.18: inherits the transitional value as its own
+        out = ev.write_config()
+        self.assertIn("CONFIG_NEW=y", out)
+        self.assertNotIn("OLD", out)
+        self.assertNotIn("OLD", ev.write_defconfig())
+        fresh = KconfigEvaluator(build(files))
+        fresh.set_all_new_symbols("mod")
+        self.assertEqual(fresh.value("OLD"), "n")  # all*config never assigns a prompt-less symbol
+
+    def test_relational_comparisons_follow_symbol_types(self) -> None:
+        files = modern({"Kconfig": BASE + (
+            'config A\n\ttristate "a"\n\tdefault m\nconfig B\n\ttristate "b"\n\tdefault y\n'
+            'config LE\n\tdef_bool A <= B\nconfig GT\n\tdef_bool A > B\nconfig H\n\thex "h"\n\tdefault 0xffffffffffffffff\n'
+            'config HBIG\n\tdef_bool H > 0x10\nconfig YS\n\tdef_bool A < y\n')})
+        ev = evaluator(files)
+        self.assertEqual([ev.value(n) for n in ("LE", "GT", "HBIG", "YS")], ["y", "n", "y", "y"])
+
+    def test_default_clamped_to_range_in_savedefconfig(self) -> None:
+        files = modern({"Kconfig": BASE + 'config N\n\tint "n"\n\trange 2 8\n\tdefault 20\n'})
+        ev = evaluator(files)
+        self.assertEqual(ev.value("N"), "8")
+        self.assertEqual(ev.string_default("N"), "8")
+        self.assertNotIn("CONFIG_N", ev.write_defconfig())  # 7.4: the clamped default equals the value
+
+    def test_numeric_bounds_reject_overflow(self) -> None:
+        ev = evaluator(modern({"Kconfig": BASE + 'config N\n\tint "n"\nconfig H\n\thex "h"\n'}))
+        self.assertFalse(ev.set_value("N", "9223372036854775808"))
+        self.assertTrue(ev.set_value("N", "9223372036854775807"))
+        self.assertTrue(ev.set_value("H", "0xffffffffffffffff"))
+        self.assertFalse(ev.set_value("H", "0x10000000000000000"))
+
+    def test_choice_priority_and_member_dependencies(self) -> None:
+        """6.11+: members inherit the choice's dependency; the last assigned member wins."""
+        files = modern({"Kconfig": BASE + (
+            'config DRV\n\ttristate "drv"\nif DRV\nchoice\n\tprompt "mode"\nconfig MODE_A\n\tbool "a"\n'
+            'config MODE_B\n\tbool "b"\n\tselect LIB\nendchoice\nendif\nconfig LIB\n\ttristate\n')})
+        ev = KconfigEvaluator(build(files))
+        ev.load_config("CONFIG_DRV=m\nCONFIG_MODE_B=y\nCONFIG_MODE_A=y\n")
+        ev.set_all_new_symbols("default")
+        self.assertEqual((ev.value("MODE_A"), ev.value("MODE_B")), ("y", "n"))
+        ev.load_config("CONFIG_DRV=m\nCONFIG_MODE_B=y\n")
+        ev.set_all_new_symbols("default")
+        self.assertEqual(ev.value("MODE_B"), "y")
+        self.assertEqual(ev.value("LIB"), "m")  # the select carries the choice's dependency (DRV=m)
+        self.assertEqual(ev.toggle("MODE_A"), 2)
+        self.assertEqual(ev.value("MODE_B"), "n")
+
+    def test_allnoconfig_y_and_pre_5_7_imply(self) -> None:
+        files = {"Kconfig": BASE + (
+            'config EXPERT\n\tbool "expert"\n\toption allnoconfig_y\n'
+            'config DRV\n\tbool "drv"\n\tdefault y\n\timply LIB\nconfig LIB\n\ttristate "lib"\n'),
+            "scripts/kconfig/symbol.c": "if (sym->implied.expr && sym->dir_dep.tri != no) sym->implied.tri == yes"}
+        ev = KconfigEvaluator(build(files))
+        ev.set_all_new_symbols("no")
+        self.assertEqual(ev.value("EXPERT"), "y")
+        ev = KconfigEvaluator(build(files))
+        ev.set_all_new_symbols("mod")
+        self.assertEqual(ev.value("LIB"), "y")  # 4.10-5.6: implied by y, so not m
+        self.assertFalse(ev.set_value("LIB", "m"))
+
+    def test_javascript_engine_matches_python_on_new_semantics(self) -> None:
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("node is not installed")
+        files = modern({"Kconfig": BASE + (
+            'config NEW\n\tbool "new"\n\tdefault OLD\nconfig OLD\n\tbool\n\ttransitional\n'
+            'config A\n\ttristate "a"\n\tdefault m\nconfig B\n\ttristate "b"\n\tdefault y\nconfig LE\n\tdef_bool A <= B\n'
+            'config N\n\tint "n"\n\trange 2 8\n\tdefault 20\n'
+            'config DRV\n\ttristate "drv"\nif DRV\nchoice\n\tprompt "mode"\nconfig MODE_A\n\tbool "a"\n'
+            'config MODE_B\n\tbool "b"\n\tselect LIB\nendchoice\nendif\nconfig LIB\n\ttristate\n')})
+        model = build(files)
+        config = "CONFIG_OLD=y\nCONFIG_DRV=m\nCONFIG_MODE_B=y\n"
+        ev = KconfigEvaluator(model)
+        ev.load_config(config)
+        ev.set_all_new_symbols("default")
+        tmp = tempfile.mkdtemp(prefix="kconfig-js-")
+        try:
+            paths = {k: os.path.join(tmp, k) for k in ("model.json", "in.config", "run.mjs")}
+            with open(paths["model.json"], "w") as fh:
+                json.dump(compact_model(model), fh)
+            with open(paths["in.config"], "w") as fh:
+                fh.write(config)
+            with open(paths["run.mjs"], "w") as fh:
+                fh.write(
+                    "import fs from 'fs';\n"
+                    f"const {{ KconfigEngine }} = await import({json.dumps(ENGINE_JS)});\n"
+                    "const e = new KconfigEngine(JSON.parse(fs.readFileSync(process.argv[2], 'utf8')));\n"
+                    "e.loadConfig(fs.readFileSync(process.argv[3], 'utf8')); e.setAllNewSymbols('default');\n"
+                    "console.log(JSON.stringify({config: e.writeConfig(), defconfig: e.writeDefconfig()}));\n"
+                )
+            out = json.loads(subprocess.run([node, paths["run.mjs"], paths["model.json"], paths["in.config"]],
+                                            check=True, capture_output=True, text=True, timeout=60).stdout)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+        self.assertEqual(out["config"], ev.write_config())
+        self.assertEqual(out["defconfig"], ev.write_defconfig())
+
+
 class TestKconfigModelSemantics(unittest.TestCase):
     """menu_finalize rules and value computation on small trees."""
 

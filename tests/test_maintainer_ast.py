@@ -26,8 +26,7 @@ from core.DBLayout import (
     m_bridge_tag,
     m_map_ast,
     m_bridge_map,
-    m_kconfig_symbol,
-    m_kconfig_kbuild,
+    m_file_reference,
     m_maintainer_person,
     m_maintainer_section,
     m_maintainer_member,
@@ -490,9 +489,6 @@ class TestMaintainerAndCreditsIntegration(unittest.TestCase):
             sec_ipv6 = G.TE.set(m_maintainer_section.table_id, (None, 1, "IPV6 NETWORKING", "Maintained", "", "", "netdev@vger.kernel.org", 2))
             sec_ipv6_id = sec_ipv6[0]
 
-            sym_ext4 = G.TE.set(m_kconfig_symbol.table_id, (None, "EXT4_FS", 1, "Ext4", "", "", 1))
-            sym_ext4_id = sym_ext4[0]
-
             # Seed files
             fn_ids = {}
             for fid, path in [
@@ -530,18 +526,11 @@ class TestMaintainerAndCreditsIntegration(unittest.TestCase):
             # 2. Run processing_kbuild
             processing_kbuild("v3.0")
 
-            # Verify m_kconfig_kbuild staging:
-            sym_ext4_row = m_kconfig_symbol.get(None, "EXT4_FS", None, None, None, None, None)
-            self.assertIsNotNone(sym_ext4_row)
-            sym_ext4_id = sym_ext4_row[2][0]
-
-            # balloc.c -> (kcid=sym_ext4_id, makefile_blob_id=9, target_fnid=fn_ids['balloc.c'], compile_mode=3, target_obj='ext4.o')
-            # inode.c -> (kcid=sym_ext4_id, makefile_blob_id=9, target_fnid=fn_ids['inode.c'], compile_mode=3, target_obj='ext4.o')
-            # core.c -> (kcid=0, makefile_blob_id=9, target_fnid=fn_ids['core.c'], compile_mode=1, target_obj='core.o')
-            kbuild_rows = G.TE.queued_set.get(m_kconfig_kbuild.table_id, {})
-            self.assertIn((sym_ext4_id, 9, fn_ids["fs/ext4/balloc.c"], 3), kbuild_rows)
-            self.assertIn((sym_ext4_id, 9, fn_ids["fs/ext4/inode.c"], 3), kbuild_rows)
-            self.assertIn((0, 9, fn_ids["fs/ext4/core.c"], 1), kbuild_rows)
+            # Verify the Makefile's build references (m_file_reference, ref_type 3 = Kbuild):
+            # ext4.o's members balloc.c / inode.c and core.o, all keyed by the Makefile blob (9)
+            refs = {(row[1], row[2], row[3]) for row in G.TE.queued_set.get(m_file_reference.table_id, {}).values()}
+            for name in ("fs/ext4/balloc.c", "fs/ext4/inode.c", "fs/ext4/core.c"):
+                self.assertIn((9, fn_ids[name], 3), refs)
         finally:
             if orig_mf is not None:
                 main.MF = orig_mf

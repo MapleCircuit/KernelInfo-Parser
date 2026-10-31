@@ -52,6 +52,21 @@ def get_db_pool() -> pooling.MySQLConnectionPool:
     global _POOL
     if _POOL is None:
         cfg = get_backend_db_config()
+
+        # Automatically start SSH tunnel if enabled in configuration
+        ssh_tunnel_cfg = cfg.get("ssh_tunnel") or {}
+        ssh_tunnel_active = bool(ssh_tunnel_cfg.get("enabled", False))
+        if ssh_tunnel_active:
+            from core.ssh_tunnel import is_ssh_tunnel_active, start_ssh_tunnel
+            if not is_ssh_tunnel_active("database"):
+                logger.info("Starting database SSH tunnel for web application...")
+                try:
+                    start_ssh_tunnel(ssh_tunnel_cfg, feature="database")
+                    cfg = get_backend_db_config()
+                except Exception as exc:
+                    logger.error("Failed to start database SSH tunnel: %s", exc)
+                    raise
+
         pool_kwargs: dict[str, Any] = {
             "pool_name": "kernelinfo_webapp_pool",
             "pool_size": 32,
@@ -68,7 +83,6 @@ def get_db_pool() -> pooling.MySQLConnectionPool:
             pool_kwargs["ssl_disabled"] = True
 
         # Attempt Unix domain socket connection for local non-tunneled configurations
-        ssh_tunnel_active = (cfg.get("ssh_tunnel") or {}).get("enabled", False)
         socket_path = cfg.get("resolved_unix_socket") or os.getenv("DB_SOCKET") or os.getenv("MYSQL_UNIX_PORT")
         if not ssh_tunnel_active and socket_path and os.path.exists(socket_path):
             pool_kwargs["unix_socket"] = socket_path
@@ -93,19 +107,40 @@ def get_db_pool() -> pooling.MySQLConnectionPool:
     return _POOL
 
 
+def close_db_pool() -> None:
+    """Reset and release the active database connection pool."""
+    global _POOL
+    _POOL = None
+
+
 def get_pooled_connection(max_retries: int = 3) -> Any:
-    """Acquire a connection from pool with exponential backoff on saturation."""
+    """Acquire a connection from pool with exponential backoff on saturation or connection drops."""
+    global _POOL
     pool = get_db_pool()
     backoff = 0.05
     for attempt in range(max_retries):
         try:
-            return pool.get_connection()
-        except mysql.connector.errors.PoolError as e:
+            cnx = pool.get_connection()
+            if hasattr(cnx, "ping"):
+                try:
+                    cnx.ping(reconnect=True, attempts=1, delay=0)
+                except Exception:
+                    pass
+            return cnx
+        except (
+            mysql.connector.errors.PoolError,
+            mysql.connector.errors.InterfaceError,
+            mysql.connector.errors.OperationalError,
+        ) as e:
             if attempt == max_retries - 1:
-                logger.error("Database connection pool exhausted after %d retries: %s", max_retries, e)
+                logger.error("Database connection acquisition failed after %d retries: %s", max_retries, e)
                 raise
+            if isinstance(e, (mysql.connector.errors.InterfaceError, mysql.connector.errors.OperationalError)):
+                logger.warning("Database connection error (%s); resetting pool...", e)
+                _POOL = None
             time.sleep(backoff)
             backoff *= 2
+            pool = get_db_pool()
 
 
 @contextmanager
@@ -128,6 +163,7 @@ class DatabaseManager:
     """Manages database connection parameters according to core.config (Rule 26)."""
 
     def __init__(self) -> None:
+        self._init_pool()
         cfg = get_backend_db_config()
         self.host = cfg.get("host", "127.0.0.1")
         self.port = int(cfg.get("port", 3306))
@@ -135,7 +171,6 @@ class DatabaseManager:
         self.password = cfg.get("password", "Passe123")
         self.database = cfg.get("database", "test")
         self.timeout = int(cfg.get("timeout", 10))
-        self._init_pool()
 
     def _init_pool(self) -> None:
         try:

@@ -1,5 +1,7 @@
 """webapp/backend/app.py - FastAPI Application Factory."""
 from __future__ import annotations
+from contextlib import asynccontextmanager
+import logging
 from pathlib import Path
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -36,12 +38,39 @@ def render_index(build: str) -> str:
     return html.replace("__KIP_BUILD__", build).replace('"/static/', f'"/b/{build}/')
 
 
+logger = logging.getLogger(__name__)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """FastAPI application lifespan manager for startup pre-warming and graceful shutdown."""
+    # Pre-warm DB pool and establish SSH tunnel if configured
+    try:
+        from webapp.backend.database.pool import get_db_pool
+        get_db_pool()
+    except Exception as exc:
+        logger.debug("Database pool startup pre-warm deferred: %s", exc)
+    yield
+    # Graceful shutdown: close connection pool and stop SSH tunnel
+    try:
+        from webapp.backend.database.pool import close_db_pool
+        close_db_pool()
+    except Exception:
+        pass
+    try:
+        from core.ssh_tunnel import stop_ssh_tunnel
+        stop_ssh_tunnel("database")
+    except Exception:
+        pass
+
+
 def create_app() -> FastAPI:
     """Create and configure the FastAPI web application instance."""
     app = FastAPI(
         title="KernelInfo-Parser Developer Platform",
         version="2.0.0",
         description="High-performance, zero-trust introspection and analysis platform for Linux kernel ASTs.",
+        lifespan=lifespan,
     )
 
     # 1. Performance & Security Middleware

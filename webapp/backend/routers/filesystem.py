@@ -13,7 +13,12 @@ git_service = GitService()
 
 @router.get("/tree")
 @router.get("/fs/tree/{version_name}")
-def get_tree(version: str = Query("v3.0"), path: str = Query(""), version_name: str | None = None) -> dict[str, Any]:
+def get_tree(
+    version: str = Query("v3.0"),
+    path: str = Query(""),
+    depth: int = Query(2),
+    version_name: str | None = None,
+) -> dict[str, Any]:
     """Retrieve directory hierarchy for given version and path."""
     v = version_name or version
     return fs_service.get_tree(v, path)

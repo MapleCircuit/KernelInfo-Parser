@@ -33,6 +33,10 @@ class TokenType(Enum):
     INT = auto()
     DEF_BOOL = auto()
     DEF_TRISTATE = auto()
+    DEF_STRING = auto()
+    DEF_INT = auto()
+    DEF_HEX = auto()
+    TRANSITIONAL = auto()
     PROMPT = auto()
     DEFAULT = auto()
     DEPENDS = auto()
@@ -104,6 +108,12 @@ KEYWORDS = {
     "def_bool": TokenType.DEF_BOOL,
     "def_boolean": TokenType.DEF_BOOL,
     "def_tristate": TokenType.DEF_TRISTATE,
+    # Linux 7.4+ (master since 2026-09-18): type definition plus default for the other types
+    "def_string": TokenType.DEF_STRING,
+    "def_int": TokenType.DEF_INT,
+    "def_hex": TokenType.DEF_HEX,
+    # Linux 6.18+: read from an old .config and used by defaults, never shown nor written
+    "transitional": TokenType.TRANSITIONAL,
     "prompt": TokenType.PROMPT,
     "default": TokenType.DEFAULT,
     "depends": TokenType.DEPENDS,
@@ -386,8 +396,9 @@ class KconfigLexer:
             line = self.lines[cur]
             stripped = line.strip()
             if not stripped:
+                # Blank lines belong to the help text only when more text follows: the token's extent
+                # ends at the last text line, so a trailing blank line never lengthens the entry
                 help_lines.append("")
-                block_end_line = cur + 1
                 cur += 1
                 continue
 

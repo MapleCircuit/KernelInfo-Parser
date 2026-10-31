@@ -3,156 +3,80 @@
 Authoritative architectural specification and relational staging reference for `parser/kconfig_ast/` ([kconfig_ast.py](parser/kconfig_ast/kconfig_ast.py), [kconfig_lexer.py](parser/kconfig_ast/kconfig_lexer.py), [kconfig_parser.py](parser/kconfig_ast/kconfig_parser.py), [kconfig_model.py](parser/kconfig_ast/kconfig_model.py), [kconfig_eval.py](parser/kconfig_ast/kconfig_eval.py)) and the associated build system parsers [kbuild_parser.py](parser/kbuild_parser.py), [kbuild_conditions.py](parser/kbuild_conditions.py), [make_eval.py](parser/make_eval.py), [arch_layout.py](parser/arch_layout.py) and [include_graph.py](parser/include_graph.py). Designed as an exhaustive reference for AI agents extending, maintaining, or querying the Linux kernel configuration and build dependency graph.
 
 Two consumers share the lexer/parser:
-- **Database pipeline** (`kconfig_ast.py`): per-file AST, tags and relational rows (sections 1-4).
+- **Database pipeline** (`kconfig_ast.py`): Kconfig entries become code tags (sections 1-5). There are no Kconfig-specific tables.
 - **Semantic model + evaluator** (`kconfig_model.py`, `kconfig_eval.py`, section 8): a port of `scripts/kconfig` used by the web application's configuration engine. It reproduces the kernel's own `conf` output byte for byte.
 
 ---
 
 ## 1. High-Level Architecture & Pipeline Flow
 
-The Kconfig subsystem extracts configuration symbol definitions, dependency expressions (`depends on`), reverse dependencies (`select`, `imply`), menu tree hierarchies, and compiled object bindings into relational database tables.
+The database stores where each Kconfig entry is and what its text is, for every version; what the entries *mean* (menus, dependencies inherited across `source`, defaults, values for an ARCH and toolchain) is computed by the semantic model from Git when the webapp needs it.
 
 ```
 ==================================================================================================
-KCONFIG & KBUILD PARSING PIPELINE
+KCONFIG PARSING PIPELINE (database)
 --------------------------------------------------------------------------------------------------
 Kconfig Source File (Kconfig*)
   │
   ├─ Git Operation: "R100" (Exact Rename) ──► No-op (Preserves old blob and tags)
+  ├─ Git Operation: "D" (Deleted) ──► get_prior_tags(CS) / close_prior_tags(CS) (no-op under the Git DAG)
+  └─ Git Operation: "A" / "M" / "R*" ──► get_prior_tags(CS) (M, R*) ──► KconfigManager
+       ├── KconfigLexer (kconfig_lexer.py) ──► KconfigParser (kconfig_parser.py)
+       └── per entry: m_ast.view(name, type) + tag (m_tag, m_tag_code, m_bridge_tag, m_map_ast, m_bridge_map,
+           m_moved_tag on transitions); `source "<literal path>"` also m_file_name + m_ast_include
   │
-  ├─ Git Operation: "D" (Deleted)
-  │  ├─ get_prior_tags(CS) ──► Queries old_vid tags via 3-way join (m_bridge_tag -> m_tag -> m_ast)
-  │  └─ close_prior_tags(CS) ─► No-op under immutable Git DAG architecture
-  │
-  └─ Git Operation: "A" / "M" / "R*" (Added / Modified / Content Rename)
-     ├─ get_prior_tags(CS) (if M or R*)
-     │
-     ▼ [KconfigManager (kconfig_ast.py)]
-Lexical Scanning & Recursive Descent Grammar:
-  ├── KconfigLexer (kconfig_lexer.py): Slices source into tokens (keywords, symbols, strings, prompts, help blocks)
-  └── KconfigParser (kconfig_parser.py): Builds typed node tree
-        ├── Symbols: KconfigConfig (config, menuconfig)
-        ├── Menus & Choices: KconfigMenu, KconfigChoice
-        ├── Conditionals: KconfigIf
-        ├── Sources: KconfigSource (source "path")
-        ├── Comments: KconfigComment
-        └── Boolean Logic: KconfigExpr (AND, OR, NOT, EQUAL, UNEQUAL)
-  │
-  ▼ [KconfigManager.extract_item() -> Relational ChangeSet Staging]
-Relational Database Mapping:
-  ├── AST Symbol Staging: m_ast.view [Rule 23]
-  ├── Core Code Tag Staging: m_tag.set (5-col, Rule 12 order), m_tag_code, m_bridge_tag (6-col), m_map_ast, m_bridge_map
-  ├── Symbol Registry: m_kconfig_symbol (Table 16, 7-col content deduplicated)
-  ├── Dependency & Reverse-Dependency Graph: m_kconfig_relation (Table 17, 6-col)
-  └── Menuconfig UI Hierarchy: m_kconfig_tree (Table 18, 9-col blob-scoped)
-  │
-  ▼ [Post-Processing: processing_kbuild(version) (main.py + kbuild_parser.py)]
-Kbuild / Makefile Integration:
-  ├── KbuildParser: Scans all Makefiles & Kbuild files in the kernel tree
-  ├── Extracts bindings: obj-$(CONFIG_XYZ) += target.o, composite targets (target-objs := a.o b.o)
-  └── Staging: m_kconfig_kbuild (Table 19) links kcid -> (makefile_blob_id, target_fnid, compile_mode, target_obj)
+  ▼ [Post-Processing: processing_kbuild(version) (main.py + kbuild_parser.py), Step 6.6]
+Kbuild references: new Makefile/Kbuild blobs ──► m_file_reference (ref_type 3 = Kbuild)
 ==================================================================================================
 ```
 
 ---
 
-## 2. Relational Schema Mapping & ChangeSet Operations
+## 2. Relational Mapping
 
-`kconfig_ast` coordinates between general AST tracking tables (0–15) and Kconfig-specific domain tables (16–19):
+Every entry is staged by `KconfigManager._stage_entry()`: an `m_ast.view(((m_ast.ast_id,),), None, name[:255], type)` node, deduplicated by name and type (Rule 23), and the entry's tag (`_tag_and_map()`, Rule 12 order: `m_tag.set` first, then `m_tag_code.get_set`, `m_moved_tag` when `match_prior_tag_transition()` pairs it with a prior tag; then `m_bridge_tag`, `m_map_ast`, `m_bridge_map`). A tag whose text is unchanged since the previous version of the file is recycled (only its `m_bridge_tag` placement is written).
 
-### 2.1. Core AST and Tag Staging
+| Entry | `m_ast.name` | `ASTT` | Tag text and extent |
+| :--- | :--- | :--- | :--- |
+| `config` / `menuconfig` | symbol name | `Kconfig_Config` (88) / `Kconfig_Menuconfig` | from the keyword to the entry's last property (help text included); trailing blank and comment lines belong to no entry |
+| `menu` | title | `Kconfig_Menu` | header only: the `menu` line and its own `depends on` / `visible if` / `help` lines |
+| `choice` | prompt (else name, else `Choice`) | `Kconfig_Choice` | header only: the `choice` line and its own properties up to the first member |
+| `if <expr>` | `if <expr>` | `Kconfig_If` | header only: the `if` line (with continuations) |
+| `comment` | title | `Kconfig_Comment` | the `comment` line and its `depends on` lines |
+| `source` / `rsource` / `osource` | the path as written | `Kconfig_Source` / `Kconfig_Rsource` / `Kconfig_Osource` | the statement; a literal path (`rsource` resolved against the file's directory) is registered in `m_file_name` and linked by `m_ast_include` (Step 6.6 turns it into an `m_file_reference` of type `Kconfig`); a path naming a variable (`arch/$(SRCARCH)/Kconfig`) names one file per ARCH and is not linked |
+| `mainmenu` | title | `Kconfig_Mainmenu` | the statement |
 
-1. **AST Node Definition (`m_ast.view` per Rule 23)**:
-   ```python
-   with CS(REF_POS):
-       CS.store(m_ast.view(
-           ((m_ast.ast_id,),),
-           None,
-           symbol_name[:255],
-           int(ast_type),
-       ))
-       ast_ref = ((m_ast.table_id, 0), OP_REF, (REF_POS, CS.route[-1]))
-   ```
+Container tags (`menu`, `choice`, `if`) cover their header only: a tag spanning the whole block was re-stored whenever any child changed (93% of the new Kconfig tag text of the v6.17 → v6.18 cycle was such copies) and, since commits are attributed to tags by line overlap, was linked to every commit touching anything inside the block. The block's full extent is in the semantic model (`nodes[].line_s/line_e`).
 
-2. **Occurrence Tagging & Deduplication (Rule 12 Order)**:
-   `m_tag.set` **must be the first operation** inside `with CS(REF_POS):` using the zero-VID 5-column schema:
-   ```python
-   with CS(REF_POS):
-       CS.store(m_tag.set(
-           None,            # tag_id (AUTO_INCREMENT)
-           code_hash,       # 32-byte binary SHA-256 digest
-           ast_ref,         # reference to m_ast node
-           0,               # hl_s
-           0,               # hl_l
-       ))
-       tag_ref = ((m_tag.table_id, 0), OP_REF, (REF_POS, CS.route[-1]))
-       CS.store(m_tag_code.get_set(code_hash, extent.code))
-       if s_tag_id is not None:
-           CS.store(m_moved_tag.set(s_tag_id, tag_ref))
-   ```
-
-3. **Spatial Mapping & Blob Bridging**:
-   ```python
-   with CS(REF_POS):
-       CS.store(m_bridge_tag.set(
-           ((m_file.table_id, 0), OP_REF, (REF_ROOT,)),
-           tag_ref,
-           extent.line_pos[0],
-           extent.line_pos[1],
-           extent.char_pos[0],
-           extent.char_pos[1],
-       ))
-   CS.store(m_map_ast.set(tag_ref, 1, 1, rel_line_e, rel_char_e, ast_ref))
-   CS.store(m_bridge_map.set(tag_ref, tag_ref))
-   ```
-
-### 2.2. Domain Tables (Tables 16, 17, 18, 19)
-
-| Table ID | Table Name | Columns | Primary Key | `no_duplicate` | Description |
-| :---: | :--- | :--- | :--- | :---: | :--- |
-| **16** | `m_kconfig_symbol` | `(kcid, name, type, prompt, def_val, help, ast_id)` | `("kcid",)` | `True` | Content-deduplicated Kconfig symbol definitions. Type codes: 1=bool, 2=tristate, 3=string, 4=hex, 5=int, 0=unknown. |
-| **17** | `m_kconfig_relation` | `(rel_id, kcid, target_name, rel_type, cond_ast_id, priority)` | `("rel_id",)` | `True` | Direct dependencies & reverse dependencies. Relation types: `1=depends_on`, `2=select`, `3=imply`, `4=choice_member` (`target_name` = the enclosing choice's name, or its prompt for anonymous choices; also emitted for members nested in `if` blocks). |
-| **18** | `m_kconfig_tree` | `(tree_id, blob_id, parent_id, node_type, title, kcid, priority, dep_ast_id, ast_id)` | `("tree_id",)` | `False` | Hierarchical Menuconfig tree scoped to `blob_id`. Node types: `1=menu`, `2=choice`, `3=config`, `4=menuconfig`, `5=comment`. `dep_ast_id` is the entry's whole effective dependency within the file: the AND of inherited (`menu`/`if`/`choice`) and own `depends on` expressions. |
-| **19** | `m_kconfig_kbuild` | `(kcid, makefile_blob_id, target_fnid, compile_mode, target_obj)` | `("kcid", "makefile_blob_id", "target_fnid", "compile_mode", "target_obj")` | `False` | Compiled file & object mappings scoped to Makefile blobs. Compile modes: `1=built-in` (`y`), `2=module` (`m`), `3=conditional` (`y/m`). |
-
-#### Example: Staging `m_kconfig_relation`
-```python
-with CS(REF_POS):
-    CS.store(m_kconfig_relation.set(
-        None,             # rel_id (AUTO_INCREMENT, PK)
-        kcid_ref,         # source symbol kcid reference
-        target_sym_name,  # target symbol identifier (e.g. "BLOCK", "NET")
-        1,                # rel_type: 1 = depends_on
-        cond_ast_ref,     # conditional AST expression reference or 0
-        rel_priority,     # sequence priority
-    ))
-```
+Consumers: symbol history (`HistoryService.get_kconfig_history`: name + `Kconfig_Config`/`Kconfig_Menuconfig` → tags → blobs, then the defining files are parsed from Git), the Kconfig diff without Git trees (`DiffService._fetch_kconfig_symbols`: the tag hashes of each symbol), commit/tag history and the AST overlay.
 
 ---
 
 ## 3. AST Node Classification & Grammar
 
-The parser implements a robust grammar for Linux Kconfig constructs:
+The parser implements kconfig's grammar (all revisions since 2.6.12):
 
-| Grammar Node | `ASTT` Category | Numeric ID | Responsibilities |
-| :--- | :--- | :---: | :--- |
-| **`KconfigConfig`** | `ASTT.Kconfig_Config` | 88 | `config <NAME>` or `menuconfig <NAME>`. Captures symbol type (`bool`, `tristate`, `int`, `hex`, `string`), prompt string, default values, `depends on` clauses, `select` clauses, `imply` clauses, and multi-line `help` documentation. |
-| **`KconfigMenu`** | `ASTT.Kconfig_Menu` | 89 | `menu "<TITLE>" ... endmenu`. Hierarchical menu container grouping configuration symbols. |
-| **`KconfigChoice`** | `ASTT.Kconfig_Choice` | 90 | `choice ... endchoice`. Mutual-exclusion selection block among child symbols. |
-| **`KconfigIf`** | `ASTT.Kconfig_If` | 91 | `if <EXPR> ... endif`. Scoped conditional block propagating parent dependencies to nested constructs. |
-| **`KconfigSource`** | `ASTT.Kconfig_Source`, `ASTT.Kconfig_Rsource`, `ASTT.Kconfig_Osource` | 92, 93, 188 | Dynamic include directives (`source "<PATH>"`, relative `rsource`, optional `osource`) linking child Kconfig files. |
-| **`KconfigComment`** | `ASTT.Kconfig_Comment` | 93 | `comment "<TITLE>"`. Non-configurable section heading displayed in menuconfig. |
-| **`KconfigMainmenu`** | `ASTT.Kconfig_Mainmenu` | 94 | `mainmenu "<TITLE>"`. Root title declaration for kernel configuration. |
-| **`KconfigExpr`** | Multiple | 95–99 | Boolean logic tree: `ASTT.Kconfig_Op_And` (95), `ASTT.Kconfig_Op_Or` (96), `ASTT.Kconfig_Op_Not` (97), `ASTT.Kconfig_Op_Equal` (98), `ASTT.Kconfig_Op_Unequal` (99). Relational operators `<`, `<=`, `>`, `>=` (Linux 4.x+) are staged as `ASTT.Undefined` nodes named by the operator text. |
+| Grammar Node | `ASTT` Category | Responsibilities |
+| :--- | :--- | :--- |
+| **`KconfigConfig`** | `ASTT.Kconfig_Config` (88) / `Kconfig_Menuconfig` | `config <NAME>` or `menuconfig <NAME>`: type (`bool`, `tristate`, `int`, `hex`, `string`, `def_bool`, `def_tristate`, `def_string`, `def_int`, `def_hex`), prompt, defaults, `depends on`, `select`, `imply`, `range`, `option`s, `modules`, `transitional`, help. |
+| **`KconfigMenu`** | `ASTT.Kconfig_Menu` (89) | `menu "<TITLE>" ... endmenu`. |
+| **`KconfigChoice`** | `ASTT.Kconfig_Choice` (90) | `choice ... endchoice`. |
+| **`KconfigIf`** | `ASTT.Kconfig_If` (91) | `if <EXPR> ... endif`. |
+| **`KconfigSource`** | `ASTT.Kconfig_Source`, `Kconfig_Rsource`, `Kconfig_Osource` | `source "<PATH>"` and the relative/optional variants. |
+| **`KconfigComment`** | `ASTT.Kconfig_Comment` | `comment "<TITLE>"`. |
+| **`KconfigMainmenu`** | `ASTT.Kconfig_Mainmenu` | `mainmenu "<TITLE>"`. |
+| **`KconfigExpr`** | (not stored) | Boolean logic tree (`AND`, `OR`, `NOT`, `EQUAL`, `UNEQUAL`, `<`, `<=`, `>`, `>=`), consumed by the semantic model. |
 
 ### 3.1. Lexer and Grammar Details
 
-- **Keywords are case-sensitive** (as in `zconf.gperf`): `Bool` or `HELP` are symbol names, not keywords.
+- **Keywords are case-sensitive** (as in `zconf.gperf` / `lexer.l`): `Bool` or `HELP` are symbol names, not keywords. Keywords of every era are accepted: `---help---`, `boolean`, `def_boolean`, `option`, `optional` (older), `transitional` (6.18+), `def_string` / `def_int` / `def_hex` (7.4+, master since 2026-09-18).
 - **Operators**: `&&`, `||`, `!`, `=`, `!=`, `<`, `<=`, `>`, `>=`, parentheses. Precedence: `||` < `&&` < `!` < comparison < primary.
+- **`depends on X if Y`** (7.0+) is parsed as kconfig's `menu_add_dep(X, Y)` does: `X || <expr_trans_compare(Y, =, n)>` (`trans_compare_no()`), e.g. `depends on X if Y && !Z` is `X || (Y=n || Z!=n)`.
 - **Macro language** (Linux 4.18+): with a `KconfigPreprocessor` (section 8.6), `KconfigLexer` executes `name := value` / `name = value` / `name += value` lines and expands `$(...)` while lexing, exactly where kconfig does: a token containing `$` becomes one `SYMBOL` token (empty results vanish), quoted strings are expanded in place, help texts are not. `iter_tokens()` lexes lazily so a sourced file is read before the rest of its parent (`KconfigParser(on_source=...)` fills `KconfigSource.items`/`resolved_path`). Without a preprocessor (older trees, DB pipeline) a `$(...)` reference is one `MACRO` token parsed as a `CONSTANT` holding the raw text.
 - **Constants vs symbols**: quoted words are `ExprOp.CONSTANT`. Bare words (`y`, `0x1000`, `-1`, `FOO`) are `ExprOp.SYMBOL_REF`; kconfig treats an undefined word as a constant whose value is its own name.
-- **`KconfigConfig` properties**: `sym_type`, `prompt`/`prompt_cond`, `defaults` (value, condition) in source order, `depends_on`, `selects`, `implies`, `ranges` (min/max as expressions, so bounds may name other int/hex symbols), `help_text`, raw `options` plus structured `env` (`option env="X"`), `is_modules` (`option modules` or `modules`), `is_defconfig_list`, `allnoconfig_y`.
-- **Unknown property lines** are skipped whole, so a trailing `if` is never taken for an `if` block.
+- **`KconfigConfig` properties**: `sym_type`, `prompt`/`prompt_cond`, `defaults` (value, condition) in source order, `depends_on`, `selects`, `implies`, `ranges` (min/max as expressions, so bounds may name other int/hex symbols), `help_text`, raw `options` plus structured `env` (`option env="X"`), `is_modules` (`option modules` or `modules`), `is_defconfig_list`, `allnoconfig_y`, `transitional`.
+- **Extents**: an entry ends at its last significant token (`_last_significant()`); blank lines, comment lines and the blank lines closing a help text (the `HELP_TEXT` token ends at its last text line) do not lengthen it. `KconfigMenu`/`KconfigChoice`/`KconfigIf` also record `header_line_e`, `header_char_e` and `header_code` (the header alone).
+- **Unknown statements and properties** are skipped whole (so a trailing `if` is never taken for an `if` block) and recorded in `KconfigParser.warnings` (`"<line>: unknown property of FOO: 'frob' ignored"`); the semantic model reports them in `model["warnings"]` instead of dropping them silently. kconfig itself rejects them.
 - **`KconfigChoice.sym_type`** stays `TYPE_UNKNOWN` when the choice declares no type; kconfig then uses the first typed member's type.
 - **`KconfigMenu.visible_if`**: successive `visible if` lines are ANDed.
 
@@ -160,27 +84,16 @@ The parser implements a robust grammar for Linux Kconfig constructs:
 
 ## 4. Tag Lifecycle & Content Addressable Deduplication
 
-Kconfig files track tag continuity across kernel releases using `c_ast` tag tracking utilities ([tag_tracker.py](parser/c_ast/tag_tracker.py)):
-
-1. **Tag Hash Deduplication**:
-   Exact binary SHA-256 matches recycle existing `tag_id`s, preserving database space and preventing duplicate rows in `m_tag`.
-2. **Prior Tag Evolution (`match_prior_tag_transition`)**:
-   When a Kconfig symbol's help text, prompt, or default values change between kernel versions, the transition engine detects the modified symbol and stages `m_moved_tag(s_tag_id, tag_ref)`.
-3. **Symbol Lifecycle (`m_kconfig_symbol`)**:
-   Symbols are content-deduplicated globally (`no_duplicate=True`) without version columns. Blob-specific hierarchy binds each menu node to its containing file via `m_kconfig_tree.blob_id`.
-4. **Immutable Tag Closing**:
-   Under the Git DAG architecture, prior tags are immutable; `close_prior_tags(CS)` operates as a safe no-op.
+1. **Tag Hash Deduplication**: exact SHA-256 matches with a prior tag of the same file recycle its `tag_id`.
+2. **Prior Tag Evolution (`match_prior_tag_transition`)**: a modified entry is paired with its prior tag (name and type first) and `m_moved_tag(s_tag_id, tag_ref)` is staged.
+3. **Immutable Tag Closing**: under the Git DAG architecture prior tags are immutable; `close_prior_tags(CS)` is a safe no-op.
 
 ---
 
 ## 5. Cross-File Reference Handling
 
-1. **`source` Directive Resolution**:
-   - `KconfigSource` extracts the target path (e.g. `source "drivers/net/Kconfig"`).
-   - Stages `m_file_name.get_set(None, norm_path)` and links the dependency via `m_ast.view` joined with `m_ast_include`.
-2. **Symbol Cross-Referencing**:
-   - Symbols referenced in `depends on`, `select`, or `imply` statements are stored by name in `m_kconfig_relation.target_name`.
-   - TableEngine queries can join `m_kconfig_relation.target_name` against `m_kconfig_symbol.name` to traverse the full directed acyclic dependency graph.
+- **`source`**: see section 2. Step 6.6 (`processing_include_references`) turns `m_ast_include` rows of `Kconfig_Source`/`Kconfig_Rsource`/`Kconfig_Osource` nodes into `m_file_reference` rows of type `FileRefType.Kconfig`.
+- **Symbol references** (`depends on`, `select`, `imply`, `default`, prompt and select/imply conditions) are answered by the semantic model per revision and ARCH (`builder.references`, section 8.2), including the dependencies an entry inherits from the files that source it.
 
 ---
 
@@ -190,17 +103,9 @@ The Kbuild parser maps Kconfig configuration symbols to concrete C, ASM, and obj
 
 ### 6.1. Architecture & Execution
 - **Location**: [parser/kbuild_parser.py](parser/kbuild_parser.py)
-- **Invoked by**: `main.py:processing_kbuild(version)` at Step 6.6 of the update pipeline.
-- **Workflow**:
-  1. Traverses the kernel source tree for all `Makefile` and `Kbuild` files.
-  2. Joins backslash line continuations (`\`) into logical lines.
-  3. Evaluates regexes:
-     - `OBJ_ASSIGN_RE`: Matches `obj-$(CONFIG_XYZ) += target.o`, `obj-y += ...`, `obj-m += ...`.
-     - `COMPOSITE_RE`: Matches composite object rules `target-y := a.o b.o`, `target-objs := ...`.
-  4. Resolves `.o` object goals to underlying `.c` and `.S` source files.
-  5. Maps relative file paths to `target_fnid` in `m_file_name`.
-  6. Queries `m_kconfig_symbol` for `kcid` by symbol name.
-  7. Stages batches into `m_kconfig_kbuild.set(kcid, makefile_blob_id, target_fnid, compile_mode, target_obj)`.
+- **Database**: `main.py:processing_kbuild(version)` (Step 6.6) parses the Makefile/Kbuild blobs that are new in the version and stages one `m_file_reference` row (ref_type 3 = Kbuild) per built file (`source_blob_id` = the Makefile blob). Rows are keyed by the Makefile blob, so a carried-over Makefile keeps its rows.
+- **Webapp**: `KconfigService.kbuild_usage()` greps the revision for `CONFIG_<name>` in Makefiles and parses the matches with `KbuildParser` (rules, lines, kind, `via` rule/condition, `other_arch`); `compiled_files` is the existing files among them.
+- **Workflow**: joins backslash continuations, evaluates `OBJ_ASSIGN_RE` (`obj-$(CONFIG_XYZ) += target.o`, `obj-y`, `obj-m`) and `COMPOSITE_RE` (`target-y := a.o b.o`, `target-objs := ...`), resolves `.o` goals to `.c`/`.S` sources.
 
 ### 6.2. Compile Modes
 - `compile_mode = 1`: Built-in compilation (`y` / `obj-y`).
@@ -255,14 +160,9 @@ Which directories are "the architecture's own" is read from each revision's Make
 
 ## 7. Performance Invariants & Architectural Rules
 
-1. **Rule 12 Staging Order**:
-   In `KconfigManager._stage_tag()`, `m_tag.set` MUST be the first operation inside `with CS(REF_POS):` so `tag_ref` references `m_tag`. Auxiliary tables (`m_tag_code.get_set`, `m_moved_tag.set`) follow immediately within the block.
-2. **Rule 23 View Deduplication**:
-   All AST node creation (`_extract_expr_ast`, `_stage_ast_node`) uses `m_ast.view(((m_ast.ast_id,),), None, name, type_id)`.
-3. **Expression Tree Flattening**:
-   Deep boolean expressions (e.g. chained `A && B && C && D`) are evaluated iteratively to prevent Python `RecursionError` exceptions on complex platform dependencies.
-4. **Zero-Duplication Kbuild Ingestion**:
-   `m_kconfig_kbuild` uses primary key `("kcid", "makefile_blob_id", "target_fnid", "compile_mode")` with direct TableEngine caching to prevent redundant insertions across multi-directory Makefiles.
+1. **Rule 12 Staging Order**: in `KconfigManager._tag_and_map()`, `m_tag.set` MUST be the first operation inside `with CS(REF_POS):` so `tag_ref` references `m_tag`; `m_tag_code.get_set` and `m_moved_tag.set` follow within the block.
+2. **Rule 23 View Deduplication**: AST nodes are created with `m_ast.view(...)` (`((m_ast.ast_id,),)`, or `((m_ast.ast_id, m_ast_include.ast_id, 1),)` for a linked `source`).
+3. **Nothing per expression**: dependency expressions are not stored (the semantic model evaluates them), so a Kconfig file costs one AST node and one tag per entry.
 
 ---
 
@@ -279,13 +179,14 @@ model = builder.build("Kconfig")  # root: top-level Kconfig (arch/$SRCARCH/Kconf
 `read_file(path) -> str | None` returns a file of the revision being modelled (the web app reads Git objects). The builder:
 1. **Sources** files recursively, expanding `$VAR` from the environment (`source "arch/$SRCARCH/Kconfig"`); `rsource` is relative to the current file, `osource` may be missing. A file may be sourced more than once (each inclusion creates entries); only recursive inclusion is refused.
 2. **Applies parse actions**: one menu entry per `config`/`menuconfig`/`menu`/`choice`/`comment`/`if`; properties are attached to the entry where they are written; `depends on` accumulates in the entry's dependency; `visible if` of every enclosing menu is ANDed into config prompts; every dependency and property condition has `m` rewritten to `m && <modules symbol>` (the symbol with `option modules`, else `MODULES`); `option env="X"` makes the symbol automatic (never written) with the environment value as default.
-3. **Finalizes** (`menu_finalize`): parent dependencies flow into each entry and each of its properties; `select`/`imply` build reverse dependencies (`target.rev_dep |= owner && condition`); `FOO!=n` is rewritten to `FOO` for tristate `FOO` in properties of non-tristate symbols (`expr_trans_bool`); choices take the first typed member's type and collect their members; values of tristate choices that are bool depend on `choice=y`; entries depending on the preceding symbol become its children (implicit submenus); prompt-less entries (`if` blocks) hand their children to their parent; non-optional choices get `rev_dep = prompt && m`.
+3. **Finalizes** (`menu_finalize`): parent dependencies flow into each entry and each of its properties; `select`/`imply` build reverse dependencies (`target.rev_dep |= owner && condition`); `FOO!=n` is rewritten to `FOO` for tristate `FOO` in properties of non-tristate symbols (`expr_trans_bool`, until 6.10); choices take the first typed member's type and collect their members; choice members depend on the choice symbol (until 6.10) or inherit the choice's dependency (6.11+); values of tristate choices that are bool depend on `choice=y` and non-optional choices get `rev_dep = prompt && m` (until 6.10, tristate choices were removed in 6.11); entries depending on the preceding symbol become its children (implicit submenus; never inside a choice since 6.9, and not when the dependency is negated since 7.3); prompt-less entries (`if` blocks) hand their children to their parent.
+4. **Reports** what it could not model: parser warnings (unknown statements and properties), keywords of the revision's own kconfig lexer the parser does not know (`_check_keywords()`), unreadable sourced files.
 
 ### 8.2. Model Format
 Expressions are hash-consed into `model["exprs"]` (shared parent dependency chains stay small). Ids index the table, `-1` means "no expression" (always y):
 `["s", name]` (word: y/m/n, defined or undefined symbol), `["c", text]` (quoted constant), `["&", a, b]`, `["|", a, b]`, `["!", a]`, `["=", a, b]`, `["!=", a, b]`, `["<"|"<="|">"|">=", a, b]`.
 
-- `model["symbols"][name]`: `type`, `prompts` (visibility expression of each prompt), `defaults` (`[value, condition]` in kconfig order across all definitions), `ranges`, `selects`/`implies` (`[target, condition]`), `rev_dep`, `implied`, `dir_dep`, `menus` (definition entries), plus `choice` (for choice values), `is_choice`/`optional`/`members` (choices, keyed `<choice-N>` or `<choice:NAME>`), `auto`, `env`.
+- `model["symbols"][name]`: `type`, `prompts` (visibility expression of each prompt), `defaults` (`[value, condition]` in kconfig order across all definitions), `ranges`, `selects`/`implies` (`[target, condition]`), `rev_dep`, `implied`, `dir_dep`, `menus` (definition entries), plus `choice` (for choice values), `is_choice`/`optional`/`members` (choices, keyed `<choice-N>` or `<choice:NAME>`), `auto` (never written: env symbols, choices, the `defconfig_list` symbol since 4.16), `env`, `allnoconfig_y`, `transitional`.
 - `model["nodes"]`: entries in menu order (pre-order, root first): `tree_id`, `parent_id`, `kind` (`root`/`menu`/`choice`/`config`/`menuconfig`/`comment`/`if`), `node_type`, `symbol_name`, `prompt`, `pvis` (prompt visibility), `vis_if`, `dep`, `file_path`, `line_s`, `line_e`, `has_help`, `children`.
 - `env`, `mainmenu` (expanded), `modules_sym`, `defconfig_list`, `files` (every Kconfig file read), `warnings`.
 - `builder.references[name]`: the direct references made by entries' own properties (`depends_on`, `select`, `imply`, `default`, `prompt_condition`, ...) with file and line. `builder.help_texts()` and `builder.menu_help()` hold the help texts kept out of the model.
@@ -306,11 +207,22 @@ solve(ev, "KVM_INTEL")                     # legal changes reaching the target (
 ```
 Values are computed lazily and memoized until the next change (kconfig's `SYMBOL_VALID`); a symbol read while it is being computed yields its provisional value, as in kconfig. Only legal changes are accepted by the setters: tristate values must lie between the reverse dependency and the prompt visibility, `m` needs modules, choice values are changed by selecting another member, and int/hex values must be valid and inside the active `range`.
 
+Revision-dependent rules both engines follow (all gated by `model["semantics"]`):
+- **Transitional symbols** (6.18+): always visible (their `.config` value is used), never written, never assigned by all*config; a symbol whose default is a transitional symbol with a `.config` value takes that value as its own user value (`_inherit_transitional`).
+- **Choices** (6.11+, `choice_priority`): `sym_calc_choice` over members in priority order — the last `.config` assignment to a member, or the member selected with `choice_set_value()` (`toggle()`/`set_value(..., "y")`), has the highest priority; then the choice default, then the first visible member without a value; all*config leave choices alone. Earlier revisions keep the choice-symbol algorithm.
+- **Comparisons** (`_compare`): before 4.2 `=`/`!=` compare strings; since 4.2 both sides parse by type (bool/tristate n<m<y, int signed, hex unsigned, others `strtoll` base 0) and compare numerically; an unparsable side makes `<`... false (4.x) or falls back to `strcmp` (5.0+); `y`/`m`/`n` are tristate-typed since 6.10.
+- **imply**: 4.10-5.6 compute `implied` only when the direct dependency is met, force a tristate implied by `y` to `y` and refuse `m` for it; 5.7+ clamp the implied value by the direct dependency instead. `sym_get_string_default` includes `implied` (savedefconfig).
+- **Ranges**: an out-of-range value becomes the bound's own text (6.7+) or its reformatted number; hex ranges compare unsigned and int/hex values outside the 64-bit bounds are refused (7.4+); savedefconfig clamps defaults to the range before comparing (7.4+).
+- **conf_read**: until 6.10/6.11 it drops user values of invisible symbols (when nothing is unsaved) and out-of-range numbers; later revisions keep them. `option allnoconfig_y` (3.15-5.x) makes allnoconfig set the symbol to `y`.
+- **Output**: `# end of <menu>` lines (5.x+) also for empty menus since 5.18; 6.11-rc1..6.12-rc5 do not show a hidden menuconfig because of visible children.
+
 `webapp/frontend/js/views/kconfig/kconfig_engine.js` is the client-side twin (same algorithm, same model); keep both in sync.
 
 ### 8.4. Fidelity and Limits
-- Verified byte for byte against the real `conf` of Linux v3.0 (x86_64, i386, arm, sparc, mips, powerpc defconfigs, allno/allyes/allmodconfig, savedefconfig), v4.15 (x86_64, arm64, allmodconfig) and v6.8 (x86_64_defconfig with the macro language, once with gcc 13.3.0 + binutils 2.42 and once with clang 18.1.3, reproduced from toolchain profiles). Fixtures and tests: `tests/test_kconfig_engine.py`, `tests/fixtures/kconfig/`. Configurations produced by random sequences of legal edits are fixed points of `conf --oldnoconfig`.
-- `conf` behaviours that changed over time are detected from the revision's own `scripts/kconfig` sources (`model["semantics"]`): `write_on_nonzero_default` (a default evaluating to n no longer writes "is not set"), `menu_end_comments` (`# end of <menu>` lines), `int_hex_zero_default` (int/hex without value are `0`/`0x0`), `tristate_choice_mod_hidden` (m-visible tristate values of a y choice are hidden). `model["config_header"]` holds the header wording of that revision.
+- Verified byte for byte, Python and JavaScript engines, against the real `conf` built from each revision (`make ARCH=<arch> <target>`, toolchain probes executed on the host): x86_64 defconfig, allnoconfig, allmodconfig, allyesconfig and savedefconfig, arm64 defconfig, allmodconfig and savedefconfig, riscv defconfig and savedefconfig (4.15+) at v3.10, v4.4, v4.15, v4.19, v5.4, v5.10, v5.15, v6.1, v6.6, v6.8, v6.11, v6.12, v6.13, v6.18, v7.0, v7.1, v7.3 and master (2026-10-29); plus the v3.0 fixtures (x86_64, i386, arm, sparc, mips defconfigs, allno/allmodconfig, savedefconfig) and v6.8 x86_64_defconfig with gcc 13.3.0 and clang 18.1.3 toolchain profiles. Fixtures and tests: `tests/test_kconfig_engine.py`, `tests/fixtures/kconfig/`. Configurations produced by random sequences of legal edits are fixed points of `conf --oldnoconfig`.
+- `conf` behaviours that changed over time are detected from the revision's own `scripts/kconfig` sources (`model["semantics"]`, `KconfigModelBuilder.conf_semantics()`; a behaviour detected by the absence of code only applies when that file was read): `write_on_nonzero_default`, `menu_end_comments`, `end_comment_empty_menus`, `int_hex_zero_default`, `tristate_choice_mod_hidden`, `typed_comparisons`, `compare_fallback_strcmp`, `const_tristate_type`, `implied_needs_dir_dep`, `implied_y_forces_y`, `imply_obeys_dir_dep`, `defconfig_list_auto`, `no_submenu_in_choice`, `no_finalize_trans_bool`, `no_tristate_choices`, `choice_member_parentdep`, `choice_priority`, `menu_visible_no_children`, `conf_read_keeps_invisible`, `conf_read_keeps_out_of_range`, `submenu_negated_dep`, `default_range_clamp`, `hex_range_unsigned`, `range_bound_text`, `numeric_bounds_check` (see the rules above). `model["config_header"]` holds the header wording of that revision.
+- Also verified at v6.6 and master for i386 (defconfig, allnoconfig, savedefconfig), arm, s390 and loongarch (defconfig, savedefconfig) and mips/powerpc symbol semantics. Known differences: arm `multi_v7_defconfig` at master leaves `REGULATOR_AB8500` (and the four entries depending on it) unset where conf sets them — a long `select` chain re-enters `REGULATOR` while it is being computed, and the provisional value it reads differs from conf's evaluation order; and the default defconfigs powerpc (`ppc64le_defconfig`) and mips (`32r2el_defconfig`) generate with `merge_into_defconfig` make rules are not files, so they are not listed or loadable (their base defconfigs are).
+- Interactive choice edits on 6.11+ follow `choice_set_value()`; sequences of `n` assignments to members typed into a `.config` by hand follow the same priority list, but were only verified through the generated configurations above.
 - Toolchain answers come from a profile (section 8.6), not a real compiler: identity-derived answers (versions, `CC_IS_*`, `LD_IS_*`, minimum versions) are exact; feature checks use a table of known first gcc/clang versions, and anything else is assumed to succeed. Every answer is reported with its source so it can be overridden.
 - `dir_dep` uses the modern OR-of-definitions rule (v3.0 kept the last definition's); it only affects `imply` (absent in v3.0) and unmet-dependency warnings.
 - Range bounds are evaluated as 64-bit integers (Linux 4.x+ `strtoll`); v3.0 used 32-bit `int`, which only differs for out-of-range values beyond 2^31.
@@ -332,6 +244,7 @@ pp = KconfigPreprocessor(env, shell); shell.pp = pp       # pp records env_used,
 model = KconfigModelBuilder(read_file, KconfigEnv("x86_64", "x86", "6.8.0", extra=env), pp).build("Kconfig")
 ```
 - **`KconfigPreprocessor`** (port of `preprocess.c`): simple (`:=`), recursive (`=`) and append (`+=`) variables, `$(1)`... arguments, built-ins `shell`, `info`, `warning-if`, `error-if`, `filename`, `lineno`, then environment variables. `error-if`/`warning-if`/`info` are recorded in `messages` (the real kconfig exits on `error-if`; here parsing continues so the problem can be shown). `env_used` lists every environment variable read.
+- **Environment**: `ToolchainProfile.environment()` also exports what the top Makefile passes to Kconfig: `RUSTC_VERSION_TEXT` (6.12+, `rustc <version>` or empty) and `PAHOLE_VERSION` (7.0+, the 3-digit `scripts/pahole-version.sh` form, `0` without pahole).
 - **`ToolchainProfile`**: `cc` (gcc|clang), `cc_version`, `ld` (bfd|lld), `ld_version`, `assembler` (gnu|llvm), `binutils_version`, `cross_compile`, `llvm_utils`, `pahole_version` (`"none"` = not installed), `rustc_version`, `gcc_plugins`, `host_release` (`uname -r`), `env` (overrides of any environment variable) and `probes` (overrides of probe answers). Missing versions default to a toolchain contemporary with the kernel release.
   `from_dict()` validates a caller-supplied mapping: unknown keys are ignored, each value is coerced to its field's type (booleans also accept `1`/`0` and `"yes"`/`"no"`, `pahole_version: null` means the era default and `""` means not installed), and `env`/`probes` must be objects of at most 128 string entries with values of at most 512 characters. A wrong shape raises `ValueError`, which the webapp reports as `HTTP 400` (`webapp/API.md` §4.5) instead of letting it fail inside the model build. The bounds matter because the profile is part of the model cache key.
 - **`ToolchainShell`** interprets the shell subset Kconfig uses (`{ }`, `&&`, `||`, `;`, pipes, redirections, `test`, `echo`, `printf`, `set --`, `grep`, `head`, `sed`, `cut`, `command -v`, `env`, `uname`) and classifies external commands into probes keyed for overrides: `cc-option:<flags>`, `ld-option:<flags>`, `as-instr:<instruction>`, `cc-snippet:<code>`, `script:<name> [args]`, `file:<path>`, `cc-print:<file>`, `cmd:<command>`. Version scripts (`cc-version.sh`, `gcc-version.sh`, `clang-version.sh`, `ld-version.sh`, `lld-version.sh`, `as-version.sh`, `pahole-version.sh`, `rustc-version.sh`) print the format of the revision's own script and honour `scripts/min-tool-version.sh`. `probes` maps each key to `{key, kind, label, command, result, source: toolchain|knowledge|assumed|override, note, locations}`.
