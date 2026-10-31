@@ -187,6 +187,7 @@ REPOSITORY_KEYS = (
     "enabled",
     "branch_filter",
     "branches",
+    "tag_views",
 )
 
 _ACTIVE_CONFIG: dict[str, dict[str, Any]] | None = None
@@ -619,6 +620,16 @@ DEFAULT_BRANCH_FILTER: dict[str, list[str]] = {
     "exclude": ["*rc*"],
 }
 
+DEFAULT_TAG_VIEWS: list[dict[str, Any]] = [
+    {
+        "name": "— any branch —",
+        "regex_rules": [
+            r"^(v2\.6\.\d+)((?:-(?:rc|pre|alpha|beta)\d*|\.\d+(?:-(?:rc|pre|alpha|beta)\d*)?).*)$",
+            r"^(v(?!2\.6\.)\d+\.\d+)((?:-(?:rc|pre|alpha|beta)\d*|\.\d+(?:-(?:rc|pre|alpha|beta)\d*)?).*)$",
+        ],
+    }
+]
+
 
 def matches_branch_filter(branch: str, branch_filter: dict[str, Any] | None = None) -> bool:
     """True if branch matches include patterns and does not match exclude patterns."""
@@ -736,6 +747,7 @@ def detect_repository(path: Path) -> dict[str, Any]:
         "enabled": True,
         "branch_filter": branch_filter,
         "branches": branches,
+        "tag_views": copy.deepcopy(DEFAULT_TAG_VIEWS),
     }
     _DETECTED_REPO_CACHE[str(path)] = entry
     return dict(entry)

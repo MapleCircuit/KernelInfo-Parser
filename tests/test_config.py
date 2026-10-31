@@ -11,6 +11,7 @@ from pathlib import Path
 from core.config import (
     DEFAULT_BRANCH_FILTER,
     DEFAULT_CONFIG,
+    DEFAULT_TAG_VIEWS,
     find_config_path,
     find_repository_branches,
     get_config,
@@ -421,6 +422,40 @@ class TestRepositoryDetection(unittest.TestCase):
         saved = json.loads(self.config_path.read_text())
         self.assertEqual(saved["repositories"][0]["branches"], branches)
         self.assertEqual(saved["repositories"][0]["branch_filter"], DEFAULT_BRANCH_FILTER)
+
+    def test_tag_views_config_and_regex_rules(self) -> None:
+        """Verify DEFAULT_TAG_VIEWS regex rules partition Linux 2.6.x and 3.x+ tags correctly."""
+        import re
+
+        self.assertGreaterEqual(len(DEFAULT_TAG_VIEWS), 1)
+        linux_view = DEFAULT_TAG_VIEWS[0]
+        self.assertEqual(linux_view["name"], "— any branch —")
+        rules = [re.compile(r) for r in linux_view["regex_rules"]]
+
+        def parse(tag: str) -> tuple[str, str, bool]:
+            for r in rules:
+                m = r.match(tag)
+                if m and m.group(1):
+                    suffix = m.group(2) if len(m.groups()) >= 2 and m.group(2) else ""
+                    if suffix:
+                        return m.group(1), suffix, True
+            return tag, "", False
+
+        # Linux 2.6.x family: base is v2.6.<sublevel>
+        self.assertEqual(parse("v2.6.12"), ("v2.6.12", "", False))
+        self.assertEqual(parse("v2.6.12.1"), ("v2.6.12", ".1", True))
+        self.assertEqual(parse("v2.6.16.62"), ("v2.6.16", ".62", True))
+        self.assertEqual(parse("v2.6.12-rc2"), ("v2.6.12", "-rc2", True))
+        self.assertEqual(parse("v2.6.16.28-rc1"), ("v2.6.16", ".28-rc1", True))
+
+        # Linux 3.x+ family: base is v<major>.<minor>
+        self.assertEqual(parse("v3.0"), ("v3.0", "", False))
+        self.assertEqual(parse("v3.0-rc7"), ("v3.0", "-rc7", True))
+        self.assertEqual(parse("v3.0.1"), ("v3.0", ".1", True))
+        self.assertEqual(parse("v3.0.101"), ("v3.0", ".101", True))
+        self.assertEqual(parse("v6.6"), ("v6.6", "", False))
+        self.assertEqual(parse("v6.6.1"), ("v6.6", ".1", True))
+        self.assertEqual(parse("v6.6-rc1"), ("v6.6", "-rc1", True))
 
 
 if __name__ == "__main__":

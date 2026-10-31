@@ -1,6 +1,7 @@
 """webapp/backend/routers/versions.py - Release Versions, Projects, Branches & Catalog."""
 from __future__ import annotations
 
+import copy
 import logging
 import subprocess
 from collections import OrderedDict
@@ -8,7 +9,7 @@ from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query
 
-from core.config import matches_branch_filter
+from core.config import DEFAULT_TAG_VIEWS, matches_branch_filter
 from webapp.backend.config import (
     get_active_repo_name,
     get_active_repository,
@@ -104,6 +105,7 @@ def get_projects() -> dict[str, Any]:
             "indexed": db_row is not None,
             "available": resolve_repo_path(repo).exists(),
             "active": name == active,
+            "tag_views": repo.get("tag_views") or copy.deepcopy(DEFAULT_TAG_VIEWS),
         })
     return {"total": len(projects), "active": active, "projects": projects}
 
@@ -206,7 +208,8 @@ def get_branches() -> dict[str, Any]:
         return (2, b["name"])
 
     branches.sort(key=branch_sort_key)
-    return {"total": len(branches), "branches": branches}
+    tag_views = repo.get("tag_views") or copy.deepcopy(DEFAULT_TAG_VIEWS)
+    return {"total": len(branches), "branches": branches, "tag_views": tag_views}
 
 
 @router.get("/branch/tags")

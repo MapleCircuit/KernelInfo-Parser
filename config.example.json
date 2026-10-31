@@ -83,6 +83,15 @@
       "branches": [
         "master",
         "stable/linux-6.6.y"
+      ],
+      "tag_views": [
+        {
+          "name": "— any branch —",
+          "regex_rules": [
+            "^(v2\\.6\\.\\d+)((?:-(?:rc|pre|alpha|beta)\\d*|\\.\\d+(?:-(?:rc|pre|alpha|beta)\\d*)?).*)$",
+            "^(v(?!2\\.6\\.)\\d+\\.\\d+)((?:-(?:rc|pre|alpha|beta)\\d*|\\.\\d+(?:-(?:rc|pre|alpha|beta)\\d*)?).*)$"
+          ]
+        }
       ]
     }
   ]

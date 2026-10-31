@@ -640,7 +640,9 @@ export class KernelIdeApp {
       try {
         const bRes = await api.getBranches();
         this.branches = bRes.branches || [{ name: "master" }];
-        if (state.selectedBranch && !this.branches.some((b) => b.name === state.selectedBranch)) {
+        this.tagViews = bRes.tag_views || (this.projects || []).find((p) => p.repo === state.currentRepo)?.tag_views || [];
+        const isTagView = (scope) => !scope || scope.startsWith("view:") || (this.tagViews || []).some((v) => v.name === scope);
+        if (state.selectedBranch && !isTagView(state.selectedBranch) && !this.branches.some((b) => b.name === state.selectedBranch)) {
           state.setSelectedBranch(""); // the stored scope is not a branch of this repository
         }
         this.renderBranchSelector();
@@ -655,7 +657,8 @@ export class KernelIdeApp {
     try {
       // Every tag including release candidates; releases fill the Tag selector, -rc# the RC selector
       const res = await api.getVersions(true);
-      this.buildVersionCatalog(res.versions || ["v3.0"]);
+      this.rawVersions = res.versions || ["v3.0"];
+      this.buildVersionCatalog(this.rawVersions);
       const branchNames = (this.branches || []).map((b) => b.name);
       // The branch scope only narrows what the dropdowns offer, so it is read in the background:
       // the lists render complete and narrow once the walk of that branch's history comes back
@@ -676,7 +679,11 @@ export class KernelIdeApp {
       select.onchange = (e) => {
         const base = e.target.value;
         if (!base || base.includes("object")) return;
-        const target = this.versionByName.has(base) ? base : (this.rcsByBase.get(base) || []).slice(-1)[0]?.vname;
+        let target = this.versionByName.has(base) ? base : null;
+        if (!target) {
+          const subs = this.rcsByBase.get(base) || [];
+          target = subs[0]?.vname || base;
+        }
         if (target) state.setSelectedVersion(target);
       };
 
@@ -732,48 +739,100 @@ export class KernelIdeApp {
     this.updateVersionSelectorDisplay();
   }
 
-  /** Branch dropdown: "any branch" (no scope) plus the repository's branches, the scope selected. */
+  /** Active tag_view if current branch selection matches one, otherwise null for real Git branches. */
+  getActiveTagView() {
+    const views = (this.tagViews && this.tagViews.length) ? this.tagViews : [
+      {
+        name: "\u2014 any branch \u2014",
+        regex_rules: [
+          "^(v2\\.6\\.\\d+)((?:-(?:rc|pre|alpha|beta)\\d*|\\.\\d+(?:-(?:rc|pre|alpha|beta)\\d*)?).*)$",
+          "^(v(?!2\\.6\\.)\\d+\\.\\d+)((?:-(?:rc|pre|alpha|beta)\\d*|\\.\\d+(?:-(?:rc|pre|alpha|beta)\\d*)?).*)$"
+        ]
+      }
+    ];
+    const branch = state.selectedBranch;
+    if (branch === "" || branch === "view:0") return views[0];
+    if (branch.startsWith("view:")) {
+      const idx = parseInt(branch.slice(5), 10);
+      return (!isNaN(idx) && views[idx]) ? views[idx] : null;
+    }
+    const namedView = views.find((v) => v.name === branch);
+    if (namedView) return namedView;
+    return null;
+  }
+
+  /** Natural version comparison helper (e.g. 3.0.101 > 3.0.2, -rc7 > -rc1, .28 > .28-rc1). */
+  static naturalVersionCompare(a, b) {
+    if (a === b) return 0;
+    const ax = [], bx = [];
+    (a || "").replace(/(\d+)|(\D+)/g, (_, $1, $2) => { ax.push([$1 ? 0 : 1, $1 ? parseInt($1, 10) : $2]); });
+    (b || "").replace(/(\d+)|(\D+)/g, (_, $1, $2) => { bx.push([$1 ? 0 : 1, $1 ? parseInt($1, 10) : $2]); });
+    for (let i = 0; i < Math.max(ax.length, bx.length); i++) {
+      const ai = ax[i], bi = bx[i];
+      if (ai === undefined) {
+        if (bi && typeof bi[1] === "string" && bi[1].startsWith("-")) return 1;
+        return -1;
+      }
+      if (bi === undefined) {
+        if (ai && typeof ai[1] === "string" && ai[1].startsWith("-")) return -1;
+        return 1;
+      }
+      if (ai[0] !== bi[0]) return ai[0] - bi[0];
+      if (ai[1] !== bi[1]) return ai[1] < bi[1] ? -1 : 1;
+    }
+    return 0;
+  }
+
+  /** Branch dropdown: tag_views (e.g. "any branch") plus the repository's branches, the scope selected. */
   renderBranchSelector() {
     const branchSelect = document.getElementById("branch-select");
     if (!branchSelect) return;
     const scope = state.selectedBranch;
+    const views = (this.tagViews && this.tagViews.length) ? this.tagViews : [
+      {
+        name: "\u2014 any branch \u2014",
+        regex_rules: [
+          "^(v2\\.6\\.\\d+)((?:-(?:rc|pre|alpha|beta)\\d*|\\.\\d+(?:-(?:rc|pre|alpha|beta)\\d*)?).*)$",
+          "^(v(?!2\\.6\\.)\\d+\\.\\d+)((?:-(?:rc|pre|alpha|beta)\\d*|\\.\\d+(?:-(?:rc|pre|alpha|beta)\\d*)?).*)$"
+        ]
+      }
+    ];
     const options = [
-      { value: "", label: "\u2014 any branch \u2014" },
+      ...views.map((v, i) => ({ value: i === 0 ? "" : `view:${i}`, label: v.name })),
       ...(this.branches || []).map((b) => ({ value: b.name, label: b.is_default ? `${b.name} (default)` : b.name })),
     ];
     branchSelect.innerHTML = options.map((o) =>
       `<option value="${escapeAttr(o.value)}" ${o.value === scope ? "selected" : ""}>${escapeAttr(o.label)}</option>`
     ).join("");
-    branchSelect.title = scope
-      ? `Tag and RC lists hold the releases of ${scope} only`
-      : "Every tag of the repository; pick a branch to list only the releases on it";
+    const activeView = this.getActiveTagView();
+    branchSelect.title = activeView
+      ? `Tag layout: ${activeView.name} (regex grouped)`
+      : (scope ? `Tag and Release lists hold the releases of ${scope} only` : "Every tag of the repository; pick a branch to list only the releases on it");
   }
 
   /**
-   * Pick the branch the Tag and RC lists are scoped to: only the tags reachable from it are offered
-   * (a stable branch's point releases are on it, master's are not). The branch head also becomes the
-   * selected revision, so **Apply** / **New Tab** act on it; no open tab is touched either way.
+   * Pick the branch or custom tag_view: custom tag_views lay out tags via regex rules, while real
+   * Git branches scope to tags reachable from them and preserve standard Git pre-release grouping.
    */
   async selectBranch(name) {
     const branch = typeof name === "string" ? name.trim() : "";
     state.setSelectedBranch(branch);
-    if (branch) state.setSelectedVersion(branch);
+    if (branch && !branch.startsWith("view:")) {
+      state.setSelectedVersion(branch);
+    }
     this.renderBranchSelector();
     await this.loadBranchScope(branch);
+    this.buildVersionCatalog(this.rawVersions);
     this.updateVersionSelectorDisplay();
   }
 
   /**
-   * Read the tags reachable from `branch` into `state.branchTags`, the one scope every control that
-   * offers tags goes through (the Tag and RC lists here, the Commit picker's tag search in
-   * `ref_picker.js`). No branch — or a request that failed — leaves it null and every tag offered: a
-   * scope narrows the catalog, it never hides it. The server walks that branch's history, which takes
-   * seconds on a large one, so the Tag dropdown says so while it runs and a selection made in the
-   * meantime wins (the answer of an abandoned branch is dropped by `state.setBranchTags`).
+   * Read tags reachable from `branch` into `state.branchTags`. If a custom tag_view is selected,
+   * no reachability filtering is applied (branchTags = null).
    */
   async loadBranchScope(branch) {
     const b = typeof branch === "string" ? branch.trim() : "";
-    if (!b) {
+    if (!b || b.startsWith("view:")) {
       state.setBranchTags("", null);
       return;
     }
@@ -800,12 +859,55 @@ export class KernelIdeApp {
   }
 
   /**
-   * Split the version catalog into releases (Tag selector) and pre-releases grouped under the release
-   * they lead to (RC selector): v3.1-rc1..rc10 belong to v3.1. A release that only has candidates so
-   * far (e.g. v7.3-rc1 before v7.3 is tagged) gets an "rc only" entry in the Tag selector.
+   * Parse a tag into base release and sub-version/RC suffix according to active tag_view regex rules,
+   * or standard Git pre-release pattern if on a real Git branch.
+   */
+  parseTagVersion(vname) {
+    const activeView = this.getActiveTagView();
+    if (activeView && Array.isArray(activeView.regex_rules) && activeView.regex_rules.length > 0) {
+      if (!this._regexCache) this._regexCache = new Map();
+      for (const rule of activeView.regex_rules) {
+        try {
+          let re = this._regexCache.get(rule);
+          if (!re) {
+            re = new RegExp(rule);
+            this._regexCache.set(rule, re);
+          }
+          const m = re.exec(vname || "");
+          if (m && m[1]) {
+            const base = m[1];
+            const suffix = m[2] || "";
+            if (suffix) {
+              return { base, suffix, isSub: true };
+            }
+          }
+        } catch (e) {
+          console.warn(`Invalid tag_view regex rule '${rule}':`, e);
+        }
+      }
+      return { base: vname, suffix: "", isSub: false };
+    }
+    // Real Git branch: standard Git pre-release grouping (only -rc/-pre/etc are sub-versions)
+    const m = /^(.*?)(-(?:rc|pre|alpha|beta)\d*)$/.exec(vname || "");
+    if (m && m[1] && m[2]) {
+      return { base: m[1], suffix: m[2], isSub: true };
+    }
+    return { base: vname, suffix: "", isSub: false };
+  }
+
+  /** Release a tag belongs to: "v3.1-rc4" → "v3.1", "v3.0.1" → "v3.0" (in tag_view), etc. */
+  releaseOf(vname) {
+    return this.parseTagVersion(vname).base;
+  }
+
+  /**
+   * Split the version catalog into releases (Tag selector) and sub-versions/pre-releases grouped
+   * under the release they belong to (Release selector).
    */
   buildVersionCatalog(rawVersions) {
-    const entries = rawVersions
+    if (rawVersions) this.rawVersions = rawVersions;
+    const versions = this.rawVersions || rawVersions || ["v3.0"];
+    const entries = versions
       .map((v) => (typeof v === "string"
         ? { vname: v, commit_hash: "", indexed: true, ref_type: 1, is_prerelease: /-(rc|pre|alpha|beta)\d*$/.test(v) }
         : { vname: v.vname || v.name, commit_hash: v.commit_hash || "", indexed: v.indexed !== false, ref_type: v.ref_type ?? 1, is_prerelease: Boolean(v.is_prerelease) }))
@@ -816,10 +918,11 @@ export class KernelIdeApp {
     const seenBases = new Set();
     for (const v of entries) {
       if (v.ref_type === 2 || v.ref_type === 3) continue; // branches and bare commits are not releases
-      const base = this.releaseOf(v.vname);
-      if (base !== v.vname) {
+      const parsed = this.parseTagVersion(v.vname);
+      const base = parsed.base;
+      if (parsed.isSub) {
         if (!this.rcsByBase.has(base)) this.rcsByBase.set(base, []);
-        this.rcsByBase.get(base).push(v);
+        this.rcsByBase.get(base).push({ ...v, suffix: parsed.suffix });
         if (!this.versionByName.has(base) && !seenBases.has(base)) {
           seenBases.add(base);
           releases.push({ vname: base, commit_hash: "", indexed: v.indexed, rcOnly: true });
@@ -829,6 +932,17 @@ export class KernelIdeApp {
         releases.push(v);
       }
     }
+    // Sort sub-versions: stable point releases descending first, then RCs descending
+    const isRc = (s) => /^-(rc|pre|alpha|beta)/.test(s || "");
+    for (const subs of this.rcsByBase.values()) {
+      subs.sort((a, b) => {
+        const aIsRc = isRc(a.suffix);
+        const bIsRc = isRc(b.suffix);
+        if (!aIsRc && bIsRc) return -1;
+        if (aIsRc && !bIsRc) return 1;
+        return KernelIdeApp.naturalVersionCompare(b.vname, a.vname);
+      });
+    }
     // A release counts as parsed when its final tag, or any of its candidates, was parsed
     for (const r of releases) {
       if (r.rcOnly) r.indexed = (this.rcsByBase.get(r.vname) || []).some((rc) => rc.indexed);
@@ -836,13 +950,7 @@ export class KernelIdeApp {
     this.tagVersions = releases;
   }
 
-  /** Release a tag belongs to: "v3.1-rc4" → "v3.1"; releases map to themselves. */
-  releaseOf(vname) {
-    const m = /^(.*?)-(rc|pre|alpha|beta)\d*$/.exec(vname || "");
-    return m ? m[1] : vname;
-  }
-
-  /** Reflect the selected revision and branch scope in the Tag, RC and Branch controls. */
+  /** Reflect the selected revision and branch scope in the Tag, Release and Branch controls. */
   updateVersionSelectorDisplay() {
     const cur = state.selectedVersion;
     const scope = state.branchTags; // tags of the selected branch, null while no branch scopes them
@@ -885,12 +993,15 @@ export class KernelIdeApp {
         });
         if (parent !== select) select.appendChild(parent);
       });
-      select.title = branch && scope
-        ? `${tags.length} release${tags.length === 1 ? "" : "s"} on ${branch}`
-        : "Every release of the repository";
+      const activeView = this.getActiveTagView();
+      select.title = activeView
+        ? `${tags.length} base release${tags.length === 1 ? "" : "s"} (${activeView.name})`
+        : (branch && scope
+          ? `${tags.length} release${tags.length === 1 ? "" : "s"} on ${branch}`
+          : "Every release of the repository");
     }
 
-    // RC selector: the selected release's candidates, plus its final tag when it exists
+    // Release selector: sub-versions (stable point releases first descending, final, then RCs descending)
     const rcSelect = document.getElementById("rc-select");
     const rcLabel = document.getElementById("rc-select-label");
     const rcs = base
@@ -899,15 +1010,32 @@ export class KernelIdeApp {
     if (rcSelect) {
       const show = rcs.length > 0;
       rcSelect.hidden = !show;
-      if (rcLabel) rcLabel.hidden = !show;
+      if (rcLabel) {
+        rcLabel.hidden = !show;
+        rcLabel.textContent = "Release:";
+      }
       rcSelect.innerHTML = "";
       if (show) {
         const finalTag = this.versionByName.get(base);
         const finalListed = finalTag && (!scope || scope.has(base) || base === cur);
+
+        const isRc = (s) => /^-(rc|pre|alpha|beta)/.test(s || "");
+        const stables = rcs.filter((r) => !isRc(r.suffix));
+        const prereleases = rcs.filter((r) => isRc(r.suffix));
+        const formatSuffix = (suffix) => {
+          if (!suffix) return "";
+          if (suffix.startsWith("-rc") || suffix.startsWith("-pre")) {
+            return suffix.slice(1);
+          }
+          return suffix;
+        };
+
         const options = [
+          ...stables.map((s) => ({ value: s.vname, text: formatSuffix(s.suffix), indexed: s.indexed })),
           ...(finalListed ? [{ value: base, text: "final", indexed: finalTag.indexed }] : []),
-          ...rcs.slice().reverse().map((rc) => ({ value: rc.vname, text: rc.vname.slice(base.length + 1), indexed: rc.indexed })),
+          ...prereleases.map((rc) => ({ value: rc.vname, text: formatSuffix(rc.suffix), indexed: rc.indexed })),
         ];
+
         for (const o of options) {
           const opt = document.createElement("option");
           opt.value = o.value;
@@ -915,7 +1043,7 @@ export class KernelIdeApp {
           if (o.value === cur) opt.selected = true;
           rcSelect.appendChild(opt);
         }
-        rcSelect.title = `${rcs.length} release candidate${rcs.length === 1 ? "" : "s"} of ${base}`;
+        rcSelect.title = `${rcs.length} release/candidate${rcs.length === 1 ? "" : "s"} of ${base}`;
       }
     }
 

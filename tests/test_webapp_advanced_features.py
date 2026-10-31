@@ -494,11 +494,15 @@ int get_foo(void) {
         self.assertIn("projects", projs)
         self.assertGreaterEqual(len(projs["projects"]), 1)
         self.assertIn(projs["projects"][0]["name"], ("linux", "Linux Kernel"))
+        self.assertIn("tag_views", projs["projects"][0])
+        self.assertGreaterEqual(len(projs["projects"][0]["tag_views"]), 1)
 
         # 2. Branches
         branches = get_branches()
         self.assertIn("branches", branches)
         self.assertGreaterEqual(len(branches["branches"]), 1)
+        self.assertIn("tag_views", branches)
+        self.assertGreaterEqual(len(branches["tag_views"]), 1)
         branch_names = [b["name"] for b in branches["branches"]]
         self.assertIn("master", branch_names)
 
