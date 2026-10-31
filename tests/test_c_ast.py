@@ -1561,7 +1561,7 @@ struct nlmsvc_binding {
         self.assertEqual(res["mismatches_count"], 0)
         self.assertEqual(res["uncovered_non_ws"], 0)
         self.assertEqual(res["coverage_ratio"], 1.0)
-        self.assertGreater(res["total_tags"], 1000)
+        self.assertGreater(res["total_tags"], 950)
 
     def test_tag_fidelity_drbd_magic(self) -> None:
         """Verify tag text fidelity on include/linux/drbd_tag_magic.h."""

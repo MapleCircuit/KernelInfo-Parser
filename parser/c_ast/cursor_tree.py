@@ -2753,6 +2753,7 @@ class C_Type(Ast):
                 ))
                 ast_id_route = CS.get_route_parse()
                 self.ast_ref = CS.ref(m_ast.ast_id, *ast_id_route)
+                self.type_id = int(ASTT.C_functionproto)
 
             with CS(REF_NO_REF):
                 tag_ref = self.tag(
@@ -2819,6 +2820,7 @@ class C_Type(Ast):
                 ))
                 ast_id_route = CS.get_route_parse()
                 self.ast_ref = CS.ref(m_ast.ast_id, *ast_id_route)
+                self.type_id = int(ASTT.C_functionproto)
 
             with CS(REF_NO_REF):
                 tag_ref = self.tag(
@@ -2886,6 +2888,7 @@ class C_Type(Ast):
                 ))
                 ast_id_route = CS.get_route_parse()
                 self.ast_ref = CS.ref(m_ast.ast_id, *ast_id_route)
+                self.type_id = int(ASTT.C_functionproto)
 
             with CS(REF_NO_REF):
                 tag_ref = self.tag(
@@ -2954,6 +2957,7 @@ class C_Type(Ast):
                 ))
                 ast_id_route = CS.get_route_parse()
                 self.ast_ref = CS.ref(m_ast.ast_id, *ast_id_route)
+                self.type_id = int(ASTT.C_functionproto)
 
             with CS(REF_NO_REF):
                 tag_ref = self.tag(
@@ -2980,7 +2984,6 @@ class C_Type(Ast):
                 if hasattr(CS, "symbol_dict"):
                     pos_idx = ast_id_route[-1]
                     CS.symbol_dict[(str(p_init)[:255], int(entry_type))] = pos_idx
-                    CS.symbol_dict[(str(p_init)[:255], int(ASTT.C_DeclRefExpr))] = pos_idx
             return
 
         # Export symbol macro extraction (EXPORT_SYMBOL, EXPORT_SYMBOL_GPL, etc.)
@@ -3021,6 +3024,7 @@ class C_Type(Ast):
                 ))
                 ast_id_route = CS.get_route_parse()
                 self.ast_ref = CS.ref(m_ast.ast_id, *ast_id_route)
+                self.type_id = int(ASTT.C_functionproto)
 
             with CS(REF_NO_REF):
                 tag_ref = self.tag(
@@ -3047,7 +3051,6 @@ class C_Type(Ast):
                 if hasattr(CS, "symbol_dict"):
                     pos_idx = ast_id_route[-1]
                     CS.symbol_dict[(str(p_sym)[:255], int(entry_type))] = pos_idx
-                    CS.symbol_dict[(str(p_sym)[:255], int(ASTT.C_DeclRefExpr))] = pos_idx
             return
 
         # Device table macro extraction (MODULE_DEVICE_TABLE)
@@ -3082,6 +3085,7 @@ class C_Type(Ast):
                 ))
                 ast_id_route = CS.get_route_parse()
                 self.ast_ref = CS.ref(m_ast.ast_id, *ast_id_route)
+                self.type_id = int(ASTT.C_functionproto)
 
             with CS(REF_NO_REF):
                 tag_ref = self.tag(
@@ -3108,7 +3112,6 @@ class C_Type(Ast):
                 if hasattr(CS, "symbol_dict"):
                     pos_idx = ast_id_route[-1]
                     CS.symbol_dict[(str(p_sym)[:255], int(entry_type))] = pos_idx
-                    CS.symbol_dict[(str(p_sym)[:255], int(ASTT.C_DeclRefExpr))] = pos_idx
             return
 
         # Sysfs attribute macro extraction (DEVICE_ATTR_RO, DEVICE_ATTR_RW, SYSFS_ATTR_RO, etc.)
@@ -3144,6 +3147,7 @@ class C_Type(Ast):
                 ))
                 ast_id_route = CS.get_route_parse()
                 self.ast_ref = CS.ref(m_ast.ast_id, *ast_id_route)
+                self.type_id = int(ASTT.C_functionproto)
 
             with CS(REF_NO_REF):
                 tag_ref = self.tag(
@@ -3170,7 +3174,6 @@ class C_Type(Ast):
                 if hasattr(CS, "symbol_dict"):
                     pos_idx = ast_id_route[-1]
                     CS.symbol_dict[(str(p_sym)[:255], int(entry_type))] = pos_idx
-                    CS.symbol_dict[(str(p_sym)[:255], int(ASTT.C_DeclRefExpr))] = pos_idx
             return
 
         # 1. Process Child Zones by Category
@@ -3493,6 +3496,7 @@ class C_Type(Ast):
                                     self.ast_ref = CS.ref(m_ast.ast_id, *ast_id_route)
                                     typesegment.ref_type = TSRef.Route_Ref
                                     typesegment.ref = ast_id_route
+                        self.type_id = ast_staging_type
 
                         has_var = any(
                             token.type == 0 for ts in final_type for token in ts.content
@@ -3875,6 +3879,8 @@ class C_Type(Ast):
                     main_t_id = ASTT.C_Compound
             else:
                 main_t_id = ASTT.C_enumequal if getattr(self.cursor, "kind", None) == cc.CursorKind.ENUM_CONSTANT_DECL else ASTT.C_Compound
+
+            self.type_id = main_t_id
 
             if type_segments:
                 # Invariant E: Simple primitive struct members generate NO m_ast_container records (never for typedefs)
@@ -4614,7 +4620,10 @@ class Zone:
                 item.extract(CS, create_tag=create_tags)
             elif isinstance(item, CPPro):
                 with CS(REF_NO_REF):
-                    item.extract(CS)
+                    try:
+                        item.extract(CS, create_tag=create_tags)
+                    except TypeError:
+                        item.extract(CS)
             else:
                 with CS(REF_NO_REF):
                     try:
@@ -4638,6 +4647,10 @@ class Zone:
             for child in self.children:
                 c_ref = getattr(child, "ast_ref", None)
                 c_type = getattr(child, "type_id", getattr(child, "ast_type", ASTT.C_CompoundStmt))
+                if c_type == 0 or c_type == ASTT.Undefined:
+                    c_type = getattr(child, "ast_type", ASTT.C_CompoundStmt)
+                    if c_type == 0 or c_type == ASTT.Undefined:
+                        c_type = ASTT.C_CompoundStmt
                 if c_ref is not None:
                     container_items.append((stmt_priority, int(c_type), c_ref))
                     stmt_priority += 1

@@ -112,6 +112,9 @@ Kernel commits frequently feature contributions from multiple developers beyond 
 | `CommitRole.TestedBy` | 7 | `Tested-by: Name <email>` |
 | `CommitRole.ReportedBy` | 8 | `Reported-by: Name <email>` |
 | `CommitRole.SuggestedBy` | 9 | `Suggested-by: Name <email>` |
+| `CommitRole.MergedBy` | 10 | Pull request merger (`merged-by` / `merger`) |
+| `CommitRole.RequestedBy` | 11 | Pull request requester (`requested-by` / `Pull from:`) |
+| `CommitRole.Other` | 12 | Unclassified trailer tag |
 
 Contributors are sanitized and stored in `m_maintainer_person` (Table 20), linking maintainer identities with git author and trailer histories across releases.
 

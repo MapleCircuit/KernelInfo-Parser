@@ -163,20 +163,53 @@ class MaintainerParser:
                 # Look for separator after this
                 for j in range(i + 1, min(i + 20, len(self.lines))):
                     if re.match(r"^-{3,}$", self.lines[j].strip()):
-                        return j + 1
+                        idx = j + 1
+                        while idx < len(self.lines) and not self.lines[idx].strip():
+                            idx += 1
+                        return idx
+                # If no separator after "Maintainers List" (e.g. early kernels v2.6.12-v2.6.30),
+                # scan past the instruction and description header block
+                for j in range(i + 1, min(i + 120, len(self.lines))):
+                    raw_l = self.lines[j]
+                    l_str = raw_l.strip()
+                    if not l_str:
+                        continue
+                    # Section titles start at column 0 without indentation
+                    if raw_l[0] in (" ", "\t"):
+                        continue
+                    if l_str.startswith("Note:") or "hard of thinking" in l_str or "Descriptions of" in l_str:
+                        continue
+                    if TAG_LINE_RE.match(l_str):
+                        continue
+                    # Check if this line is an uppercase section title followed by real tags
+                    has_tag = False
+                    for k in range(j + 1, min(j + 6, len(self.lines))):
+                        tm = TAG_LINE_RE.match(self.lines[k].strip())
+                        if tm:
+                            val = tm.group(2)
+                            if "@" in val or any(s in val for s in ("Maintained", "Supported", "Orphan", "Odd Fixes")):
+                                has_tag = True
+                                break
+                    if has_tag:
+                        return j
                 return i + 1
 
         # Fallback: scan for first sequence of Title followed immediately by tag lines
         for i in range(len(self.lines) - 2):
-            if self.lines[i].strip() and not TAG_LINE_RE.match(self.lines[i].strip()):
+            raw_l = self.lines[i]
+            if raw_l.strip() and raw_l[0] not in (" ", "\t") and not TAG_LINE_RE.match(raw_l.strip()):
+                l_str = raw_l.strip()
+                if l_str.startswith("Note:") or "hard of thinking" in l_str or "Descriptions of" in l_str:
+                    continue
                 # Check if next non-empty line has a tag (M:, F:, etc.)
                 for k in range(i + 1, min(i + 5, len(self.lines))):
                     nxt = self.lines[k].strip()
                     if not nxt:
                         continue
-                    if TAG_LINE_RE.match(nxt):
-                        # Ensure this isn't the descriptions section (e.g. "P: Person (obsolete)")
-                        if "Descriptions of section entries" not in self.lines[i]:
+                    tm = TAG_LINE_RE.match(nxt)
+                    if tm:
+                        val = tm.group(2)
+                        if "@" in val or any(s in val for s in ("Maintained", "Supported", "Orphan", "Odd Fixes")):
                             return i
                     break
 
@@ -196,6 +229,12 @@ class MaintainerParser:
 
         # Clean section title (remove extra spaces)
         name = re.sub(r"\s+", " ", name).strip()
+        if (
+            name.startswith("Note:")
+            or "hard of thinking" in name
+            or "Descriptions of section entries" in name
+        ):
+            return None
 
         status = "Maintained"
         scm_tree = ""
@@ -226,7 +265,22 @@ class MaintainerParser:
                 else:
                     mailing_list += f", {ml}"
             elif tag_char == "S":
-                status = tag_val
+                s_clean = tag_val.strip()
+                if s_clean.startswith("Status, one of the following"):
+                    return None
+                s_lower = s_clean.lower()
+                if s_lower in ("odd fixes", "odd fix"):
+                    status = "Odd Fixes"
+                elif s_lower in ("orphan", "orphaned"):
+                    status = "Orphan"
+                elif s_lower == "maintained":
+                    status = "Maintained"
+                elif s_lower == "supported":
+                    status = "Supported"
+                elif s_lower == "obsolete":
+                    status = "Obsolete"
+                else:
+                    status = s_clean
             elif tag_char == "W":
                 if not web_page:
                     web_page = tag_val

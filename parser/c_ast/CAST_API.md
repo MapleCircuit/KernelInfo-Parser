@@ -645,10 +645,12 @@ class Zone_Type(IntEnum):
   - Preprocessor operators and directives `#embed` (`ASTT.CPPro_embed` = 165) and `defined` (`ASTT.CPPro_defined` = 166) are fully mapped.
 
 - **Kernel Semantic Initialization, Export, Device Table & Sysfs Extraction**:
-  - Initcall macros (`_INITCALL_MACROS`: `module_init`, `module_exit`, `*initcall`) are extracted into `m_symbol_def` as `ASTT.C_InitcallDef` (163) and dual-indexed in `CS.symbol_dict`.
-  - Symbol export macros (`_EXPORT_MACROS`: `EXPORT_SYMBOL*`) are extracted into `m_symbol_def` as `ASTT.C_ExportSymbolDef` (164) and dual-indexed in `CS.symbol_dict`.
-  - Driver device match tables (`_DEVICE_TABLE_MACROS`: `MODULE_DEVICE_TABLE`) are extracted into `m_symbol_def` as `ASTT.C_DeviceTableDef` (175) and dual-indexed in `CS.symbol_dict`.
+  - Initcall macros (`_INITCALL_MACROS`: `module_init`, `module_exit`, `*initcall`) are extracted into `m_symbol_def` as `ASTT.C_InitcallDef` (163) and indexed in `CS.symbol_dict[(p_init, ASTT.C_InitcallDef)]` without overriding `ASTT.C_DeclRefExpr`.
+  - Symbol export macros (`_EXPORT_MACROS`: `EXPORT_SYMBOL*`) are extracted into `m_symbol_def` as `ASTT.C_ExportSymbolDef` (164) and indexed in `CS.symbol_dict[(p_sym, ASTT.C_ExportSymbolDef)]` without overriding `ASTT.C_DeclRefExpr`, ensuring variable and function reference linking resolves to primary declarations.
+  - Driver device match tables (`_DEVICE_TABLE_MACROS`: `MODULE_DEVICE_TABLE`) are extracted into `m_symbol_def` as `ASTT.C_DeviceTableDef` (175) and indexed in `CS.symbol_dict[(p_sym, ASTT.C_DeviceTableDef)]`.
   - Sysfs attribute definitions (`_SYSFS_ATTR_MACROS`: `DEVICE_ATTR_*`, `SYSFS_ATTR_*`, `CLASS_ATTR_*`, `BUS_ATTR_*`, `DRIVER_ATTR_*`, `__ATTR*`) are extracted into `m_symbol_def` as `ASTT.C_SysfsAttrDef` (176) and dual-indexed in `CS.symbol_dict`.
+  - Inside compound statements (`Zone_Type.Compound_Stmt`), inner preprocessor directives inherit `create_tags=False`, ensuring clean single-tag extents for enclosing function definitions without inner tag overlaps.
+  - Local declarations and type definitions assign `self.type_id` so that `m_ast_container` preserves non-zero child construct types (`ASTT`).
 
 - **Variable & Parameter Reference Linking (`SymbolRole.DeclRef = 5`)**:
   - `resolve_cursor_type_ast` resolves `VAR_DECL` and `PARM_DECL` against `CS.symbol_dict[(safe_name, ASTT.C_DeclRefExpr)]` and foreign files (`REF_FILE`), activating `SymbolRole.DeclRef = 5` in `m_symbol_ref` for variable usages within function bodies.

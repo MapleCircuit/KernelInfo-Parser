@@ -81,9 +81,9 @@ Dense architectural contract and state interaction reference across `globalstuff
   - `T_KCONFIG = 2`: Kconfig menu definitions (`Kconfig*`).
   - `T_RUST = 3`: Rust source file (`.rs`).
   - `T_ASM = 4`: Architecture assembly source (`.S`, `.s`).
-  - `T_RAW = 5`: Fallback raw/unparsed text file (Documentation, README, licenses, build scripts).
-  - `T_MAINTAINERS = 6`: Kernel subsystem maintainer directory (`MAINTAINERS`).
-  - `T_CREDITS = 7`: Kernel contributor biographies (`CREDITS`).
+  - `T_MAINTAINERS = 5`: Kernel subsystem maintainer directory (`MAINTAINERS`).
+  - `T_CREDITS = 6`: Kernel contributor biographies (`CREDITS`).
+  - `T_RAW = 7`: Fallback raw/unparsed text file (Documentation, README, licenses, build scripts).
 - **Helper Classes**:
   - `PointerGetter(joins)`: Iterator extracting `(repeat_count, pointer)` sequentially from `JoinsType`.
     - `get_first_pointer() -> PointerType`: Root table pointer.

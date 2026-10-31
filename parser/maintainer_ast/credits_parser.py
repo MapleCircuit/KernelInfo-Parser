@@ -117,7 +117,25 @@ class CreditsParser:
         if not name:
             return None
 
-        email = ", ".join(fields.get("E", [])).strip()
+        email_parts = []
+        for e in fields.get("E", []):
+            e_str = e.strip()
+            # Extract email if inside angle brackets <...>
+            m = re.search(r"<([^>]+)>", e_str)
+            if m:
+                email_parts.append(m.group(1).strip())
+            elif "@" in e_str:
+                # Bare email or multiple space-separated words; extract email token
+                tokens = e_str.split()
+                at_tokens = [tok.strip("<>\"',;") for tok in tokens if "@" in tok]
+                if at_tokens:
+                    email_parts.append(at_tokens[0])
+                else:
+                    email_parts.append(e_str.strip("<>\"',;"))
+            elif e_str:
+                email_parts.append(e_str.strip("<>\"',;"))
+
+        email = ", ".join(email_parts).strip()
         web_page = ", ".join(fields.get("W", [])).strip()
         pgp_key = ", ".join(fields.get("P", [])).strip()
         description = " ".join(fields.get("D", [])).strip()
