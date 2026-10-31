@@ -447,6 +447,11 @@ class Test_TableSchemaAndOperations(BaseTableHandlingTestCase):
             op_ref_view = t_file.ref_view(joins, *cols)
             self.assertEqual(op_ref_view[1], OP_REF_VIEW)
 
+        with test_step("PointerGetter with integer table ID does not raise AttributeError on iteration"):
+            pg = PointerGetter(t_file.table_id)
+            self.assertEqual(pg.get_first_table_id(), t_file.table_id)
+            self.assertEqual(list(pg), [])
+
     @test_feature("table_cached_columns_validation")
     def test_07_table_cached_columns_validation(self) -> None:
         """Verify Table initialization validates te_cached configuration and column names."""

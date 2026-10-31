@@ -10,6 +10,26 @@ from core.globalstuff import G, is_safe_git_rev, is_safe_git_spec
 _VERSION_TAG_RE = re.compile(r"^v?\d+(?:\.\d+)*(?:-(?:rc|alpha|beta|pre)\d*)?$")
 
 
+def _ensure_asm_symlinks(base_dir: str | Path) -> None:
+    """Ensure include/asm and include/uapi/asm symlinks point to asm-generic."""
+    base = Path(base_dir)
+    asm_path = base / "include" / "asm"
+    if not asm_path.exists() and not asm_path.is_symlink():
+        try:
+            os.symlink("asm-generic", asm_path)
+        except OSError:
+            sp.run(["ln", "-s", "asm-generic", str(asm_path)], check=False)
+
+    uapi_asm_parent = base / "include" / "uapi"
+    if uapi_asm_parent.exists():
+        uapi_asm_path = uapi_asm_parent / "asm"
+        if not uapi_asm_path.exists() and not uapi_asm_path.is_symlink():
+            try:
+                os.symlink("asm-generic", uapi_asm_path)
+            except OSError:
+                sp.run(["ln", "-s", "asm-generic", str(uapi_asm_path)], check=False)
+
+
 class MasterFile:
     """Handle filesystem temporary working directories and Git repository interactions."""
 
@@ -193,21 +213,7 @@ class MasterFile:
                         f.write(blob_bytes)
 
         # Ensure asm symlinks remain intact
-        asm_path = Path(f"{self.workspace_dir}/include/asm")
-        if not asm_path.exists() and not asm_path.is_symlink():
-            try:
-                os.symlink("asm-generic", asm_path)
-            except OSError:
-                sp.run(["ln", "-s", "asm-generic", str(asm_path)], check=False)
-
-        uapi_asm_parent = Path(f"{self.workspace_dir}/include/uapi")
-        if uapi_asm_parent.exists():
-            uapi_asm_path = Path(f"{self.workspace_dir}/include/uapi/asm")
-            if not uapi_asm_path.exists() and not uapi_asm_path.is_symlink():
-                try:
-                    os.symlink("asm-generic", uapi_asm_path)
-                except OSError:
-                    sp.run(["ln", "-s", "asm-generic", str(uapi_asm_path)], check=False)
+        _ensure_asm_symlinks(self.workspace_dir)
 
         return self.workspace_dir
 
@@ -267,25 +273,14 @@ class MasterFile:
             ["git", f"--git-dir={git_dir}", "archive", self._checked_rev(version)],
             stdout=sp.PIPE,
         )
-        sp.run(["tar", "-x", "-C", f"{temp_path}"], stdin=p_arch.stdout, check=True)  # noqa: S603, PLW1510
+        try:
+            sp.run(["tar", "-x", "-C", f"{temp_path}"], stdin=p_arch.stdout, check=True)  # noqa: S603, PLW1510
+        finally:
+            if p_arch.stdout:
+                p_arch.stdout.close()
         p_arch.wait()
 
-        # Symlinks for asm
-        asm_path = Path(f"{temp_path}/include/asm")
-        if not asm_path.exists():
-            try:
-                os.symlink("asm-generic", asm_path)
-            except OSError:
-                sp.run(["ln", "-s", "asm-generic", str(asm_path)], check=False)
-
-        uapi_asm_parent = Path(f"{temp_path}/include/uapi")
-        if uapi_asm_parent.exists():
-            uapi_asm_path = Path(f"{temp_path}/include/uapi/asm")
-            if not uapi_asm_path.exists():
-                try:
-                    os.symlink("asm-generic", uapi_asm_path)
-                except OSError:
-                    sp.run(["ln", "-s", "asm-generic", str(uapi_asm_path)], check=False)
+        _ensure_asm_symlinks(temp_path)
         return temp_path
 
     def get_file(self, file_path: str, version: str) -> str:

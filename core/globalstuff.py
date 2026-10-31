@@ -8,7 +8,7 @@ from pathlib import Path
 import contextlib
 import types
 import time
-from typing import Self
+from typing import Any, Self
 from functools import wraps
 import hashlib
 from enum import IntEnum, auto, Flag
@@ -32,7 +32,9 @@ SafeDataType = int | str | bytes | None
 UnSafeDataType = SafeDataType | RefType
 
 
-import re
+def is_test_environment() -> bool:
+    """Return True if running in a unit test or pytest harness."""
+    return any(arg in sys.argv for arg in ("-u", "--unit-test")) or "unittest" in sys.modules or "pytest" in sys.modules
 
 
 def compute_code_hash(code: str) -> bytes:
@@ -170,7 +172,7 @@ class GlobalStuff:
         # Profiling Facility
         self.PROFILING_ENABLED = False
         self.EXECUTION_DEADLINE: float | None = None
-        self.STAGE_PROFILER: any = None
+        self.STAGE_PROFILER: Any | None = None
 
         # Memory Profile Management: "normal" | "low" | "very_low"
         self.MEMORY_MODE: str = "normal"
@@ -244,8 +246,7 @@ class GlobalStuff:
             for directory in gp_obj.PURGE_LIST:
                 with contextlib.suppress(Exception):
                     shutil.rmtree(directory)
-        is_unit_test = any(arg in sys.argv for arg in ("-u", "--unit-test")) or "unittest" in sys.modules or "pytest" in sys.modules
-        if not is_unit_test:
+        if not is_test_environment():
             with contextlib.suppress(Exception):
                 from core.ssh_tunnel import stop_ssh_tunnel
                 stop_ssh_tunnel()
@@ -381,6 +382,9 @@ class PointerGetter:
             self.end = len(joins)
             if len(joins) == 1 and len(joins[0]) == 1:
                 self.end = 0
+        else:
+            self.current = 0
+            self.end = 0
 
     def __iter__(self) -> Self:  # noqa: D105
         return self
@@ -890,8 +894,7 @@ def setup_memory_limit(limit_gb: float = 60.0) -> None:
         logger.debug(f"[Memory Guard] cgroups inspection check skipped: {e}")
 
     # 2. If unconstrained and systemd-run is available, re-exec inside a dedicated cgroup scope (except in unit tests)
-    is_unit_test = any(arg in sys.argv for arg in ("-u", "--unit-test")) or "unittest" in sys.modules or "pytest" in sys.modules
-    if not is_unit_test and os.environ.get("KERNELINFO_CGROUP_ACTIVE") != "1" and shutil.which("systemd-run"):
+    if not is_test_environment() and os.environ.get("KERNELINFO_CGROUP_ACTIVE") != "1" and shutil.which("systemd-run"):
         try:
             os.environ["KERNELINFO_CGROUP_ACTIVE"] = "1"
             logger.info(COLOR.cyan(f"[Memory Guard] Activating cgroups v2 scope via systemd-run: max={limit_gb:.1f} GB, high={limit_gb*0.9:.1f} GB..."))

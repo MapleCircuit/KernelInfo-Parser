@@ -27,7 +27,9 @@ change lists, and cross-process IPC communication during multicore parsing.
 import itertools
 import logging
 import multiprocessing
+import os
 import pickle
+import shutil
 import zlib
 from collections import OrderedDict
 from collections.abc import Iterable
@@ -324,6 +326,22 @@ class CompressedChangeSetDict(dict):
             return args[0]
         raise KeyError(key)
 
+    def setdefault(self, key: str, default: Any = None) -> Any:
+        if key in self:
+            return self[key]
+        self[key] = default
+        return default
+
+    def copy(self) -> "CompressedChangeSetDict":
+        self.flush_dirty()
+        new_dict = CompressedChangeSetDict(lru_cache_size=self._lru_size)
+        new_dict._all_keys = set(self._all_keys)
+        new_dict._evacuated_store = dict(self._evacuated_store)
+        new_dict._compressed_store = dict(self._compressed_store)
+        new_dict._raw_crcs = dict(self._raw_crcs)
+        new_dict._lru_cache = OrderedDict(self._lru_cache)
+        return new_dict
+
     def __bool__(self) -> bool:
         return bool(self._all_keys)
 
@@ -415,7 +433,6 @@ class GreatProcessor:
                 mf = getattr(self, "mf", None) or getattr(G, "MF", None)
                 v_name = getattr(self, "Version_Name", "v3.0")
                 if mf and hasattr(mf, "version_dict") and v_name in mf.version_dict:
-                    import os
                     mfdir = mf.version_dict[v_name]
                     target_file = os.path.join(mfdir, path)
                     if not os.path.exists(target_file):
@@ -434,7 +451,7 @@ class GreatProcessor:
         """Query DB for symbol mappings (name, type_id) -> ast_id for a file not in active ChangeSet_Dict."""
         if not rel_file:
             return None
-        if hasattr(self, "unchanged_symbol_cache") and rel_file in self.unchanged_symbol_cache:
+        if rel_file in self.unchanged_symbol_cache:
             return self.unchanged_symbol_cache[rel_file]
 
         from core.DBLayout import m_file_name, m_bridge_file, m_bridge_tag, m_tag, m_ast
@@ -448,8 +465,6 @@ class GreatProcessor:
 
         fn_row = m_file_name.get(None, rel_file)
         if not fn_row or len(fn_row) < 3 or not fn_row[2]:
-            if not hasattr(self, "unchanged_symbol_cache"):
-                self.unchanged_symbol_cache = {}
             self.unchanged_symbol_cache[rel_file] = {}
             return self.unchanged_symbol_cache[rel_file]
         fnid = fn_row[2][0]
@@ -465,8 +480,6 @@ class GreatProcessor:
             if old_vid > 0:
                 bf_row = m_bridge_file.get(old_vid, fnid, None)
         if not bf_row or len(bf_row) < 3 or not bf_row[2]:
-            if not hasattr(self, "unchanged_symbol_cache"):
-                self.unchanged_symbol_cache = {}
             self.unchanged_symbol_cache[rel_file] = {}
             return self.unchanged_symbol_cache[rel_file]
         fid = bf_row[2][2]
@@ -478,8 +491,6 @@ class GreatProcessor:
                 known = self._blob_symbols_fetched.get(fid)
             if known is not None:
                 self._note_blob_symbols_used(fid)
-                if not hasattr(self, "unchanged_symbol_cache"):
-                    self.unchanged_symbol_cache = {}
                 self.unchanged_symbol_cache[rel_file] = known
                 return known
 
@@ -493,8 +504,6 @@ class GreatProcessor:
         if not rows:
             if complete_blob:
                 self._store_blob_symbols(fid, {})
-            if not hasattr(self, "unchanged_symbol_cache"):
-                self.unchanged_symbol_cache = {}
             self.unchanged_symbol_cache[rel_file] = {}
             return self.unchanged_symbol_cache[rel_file]
 
@@ -532,23 +541,27 @@ class GreatProcessor:
         # Include definitions stored once per tag (m_tag_def + m_blob_symbol)
         if tag_ids and m_tag_def.table_id in te.tables and m_blob_symbol.table_id in te.tables:
             t_defs = te.get_in(m_tag_def.table_id, m_tag_def.tag_id[1], tag_ids) or ()
+            bs_cache: dict[int, int | None] = {}
             for r in t_defs:
                 if len(r) > m_tag_def.type_id[1]:
                     key = r[m_tag_def.sym_key[1]]
                     d_name = r[m_tag_def.name[1]]
                     d_type = r[m_tag_def.type_id[1]]
-                    bs_row = te.get(m_blob_symbol.table_id, (fid, key, None, None))
-                    if bs_row and len(bs_row) >= 3 and bs_row[2]:
-                        d_ast_id = bs_row[2][m_blob_symbol.target_ast_id[1]] if isinstance(bs_row[2], (list, tuple)) else bs_row[2]
+                    if key not in bs_cache:
+                        bs_row = te.get(m_blob_symbol.table_id, (fid, key, None, None))
+                        if bs_row and len(bs_row) >= 3 and bs_row[2]:
+                            bs_cache[key] = bs_row[2][m_blob_symbol.target_ast_id[1]] if isinstance(bs_row[2], (list, tuple)) else bs_row[2]
+                        else:
+                            bs_cache[key] = None
+                    d_ast_id = bs_cache[key]
+                    if d_ast_id is not None:
                         if isinstance(d_name, (bytes, bytearray)):
                             d_name = d_name.decode("utf-8", "replace")
-                        if d_name and d_ast_id:
+                        if d_name:
                             sym_map[(d_name, d_type)] = d_ast_id
 
         if complete_blob:
             self._store_blob_symbols(fid, sym_map)
-        if not hasattr(self, "unchanged_symbol_cache"):
-            self.unchanged_symbol_cache = {}
         self.unchanged_symbol_cache[rel_file] = sym_map
         return sym_map
 
@@ -637,7 +650,6 @@ class GreatProcessor:
         result_dir = getattr(self, "_commit_result_dir", None)
         self._commit_result_dir = None
         if result_dir:
-            import shutil
             shutil.rmtree(result_dir, ignore_errors=True)
             if result_dir in self.PURGE_LIST:
                 self.PURGE_LIST.remove(result_dir)

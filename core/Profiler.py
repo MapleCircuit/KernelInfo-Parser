@@ -85,7 +85,7 @@ def _format_ms(val_s: float) -> str:
 def _format_pct(val_s: float, total_s: float, width: int = 0) -> str:
     """Format percentage of total, right-aligned to `width` visible characters, with threshold-based ANSI colour."""
     pct = (val_s / total_s) * 100.0 if total_s > 0.0 else 0.0
-    formatted = f"{f'{pct:5.1f}%':>{width}}"
+    formatted = f"{pct:5.1f}%".rjust(width)
     if pct >= 50.0:
         return COLOR.red(formatted)
     elif pct >= 25.0:

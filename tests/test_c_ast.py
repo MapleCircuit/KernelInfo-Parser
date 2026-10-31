@@ -595,6 +595,17 @@ class TestCASTParser(unittest.TestCase):
         self.assertEqual(c_dict.pop("a")["count"], 99)
         self.assertNotIn("a", c_dict)
 
+        # Test setdefault and copy completeness
+        val_default = c_dict.setdefault("new_key", {"count": 100})
+        self.assertEqual(val_default["count"], 100)
+        self.assertEqual(c_dict["new_key"]["count"], 100)
+        val_existing = c_dict.setdefault("new_key", {"count": 999})
+        self.assertEqual(val_existing["count"], 100)
+
+        copied = c_dict.copy()
+        self.assertEqual(copied["new_key"]["count"], 100)
+        self.assertEqual(len(copied), len(c_dict))
+
     def test_stage2_epoch_partitioning_and_regeneration(self) -> None:
         """Verify Stage 2 project-agnostic dynamic complexity batching, epoch partitioning, and reader lifecycle."""
         import tempfile
