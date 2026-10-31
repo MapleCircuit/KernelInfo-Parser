@@ -830,11 +830,19 @@ class SharedSymbolBuilder:
     def __init__(self, mode: str = "auto") -> None:
         self.mode = "off" if mode == "4k" else mode
 
-    def build_file_scoped(self, file_symbols: dict[str, dict[tuple[str, int], int]]) -> SharedSymbolReader | None:
+    def build_file_scoped(
+        self,
+        file_symbols: dict[str, dict[tuple[str, int], int]],
+        extra_symbols: dict[tuple[str, int], int] | None = None,
+        extra_names: dict[str, int] | None = None,
+    ) -> SharedSymbolReader | None:
         """Build a table keyed by defining file, queried with `get_file_symbol()` / `get_file_name()`.
+        Also indexes unscoped (sym_name, sym_type) and sym_name for O(1) in-memory fallback.
 
         Args:
             file_symbols: Per-file symbol maps `rel_file -> {(sym_name, sym_type): ast_id}`.
+            extra_symbols: Optional extra (sym_name, sym_type) -> ast_id mappings to index unscoped.
+            extra_names: Optional extra sym_name -> ast_id mappings to index unscoped.
 
         Returns:
             Reader over the packed table, or None when no file publishes a symbol.
@@ -850,6 +858,16 @@ class SharedSymbolBuilder:
                 key = file_scoped_key(rel_file, sym_name)
                 symbols_map[(key, sym_type)] = ast_id
                 names_map[key] = ast_id
+
+        if extra_symbols:
+            for (sym_name, sym_type), ast_id in extra_symbols.items():
+                if sym_name and ast_id is not None and (sym_name, sym_type) not in symbols_map:
+                    symbols_map[(sym_name, sym_type)] = ast_id
+        if extra_names:
+            for sym_name, ast_id in extra_names.items():
+                if sym_name and ast_id is not None and sym_name not in names_map:
+                    names_map[sym_name] = ast_id
+
         return self.build(symbols_map, names_map)
 
     def build(
@@ -980,6 +998,20 @@ class SharedSymbolChain:
     def get_file_name(self, rel_file: str, sym_name: str) -> int | None:
         for segment in reversed(self.segments):
             val = segment.get_file_name(rel_file, sym_name)
+            if val is not None:
+                return val
+        return None
+
+    def get_symbol(self, sym_name: str, sym_type: int) -> int | None:
+        for segment in reversed(self.segments):
+            val = segment.get_symbol(sym_name, sym_type)
+            if val is not None:
+                return val
+        return None
+
+    def get_name(self, sym_name: str) -> int | None:
+        for segment in reversed(self.segments):
+            val = segment.get_name(sym_name)
             if val is not None:
                 return val
         return None

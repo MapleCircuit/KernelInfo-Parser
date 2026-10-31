@@ -322,7 +322,7 @@ class Ast:
         if not hasattr(CS, "register_bridge_map") or CS.register_bridge_map(tag_target, tag_target):
             CS.store(m_bridge_map.set(tag_target, tag_target))
 
-    def extract(self, CS: Any) -> None:
+    def extract(self, CS: Any, create_tag: bool = True) -> None:
         """Default fallback extraction."""
         with CS(REF_POS):
             CS.store(m_ast.view(
@@ -332,8 +332,9 @@ class Ast:
                 0,
             ))
             ast_id_route = CS.get_route_parse()
-        with CS(REF_NO_REF):
-            self.tag(CS, ast_id_route, self.extent)
+        if create_tag:
+            with CS(REF_NO_REF):
+                self.tag(CS, ast_id_route, self.extent)
 
 
 # --- Comments ---
@@ -385,12 +386,12 @@ class Ast_ASM_Directive(Ast):
         self.type_id = ASTT.ASM_Directive
         self.payload = payload
 
-    def extract(self, CS: Any) -> None:
+    def extract(self, CS: Any, create_tag: bool = True) -> None:
         parser_obj = CS.parsers.get("C_AM") or CS.parsers.get("ASM_AM")
         if parser_obj and hasattr(parser_obj, "rawfile"):
             self.extent.cc(parser_obj.rawfile)
         name = self.payload or self.extent.code
-        self.extract_1arg(CS, ASTT.ASM_Directive, name[:255], self.extent)
+        self.extract_1arg(CS, ASTT.ASM_Directive, name[:255], self.extent, create_tag=create_tag)
 
 
 class Ast_ASM_Macro(Ast):
@@ -401,11 +402,11 @@ class Ast_ASM_Macro(Ast):
         self.type_id = ASTT.ASM_Macro
         self.name = name
 
-    def extract(self, CS: Any) -> None:
+    def extract(self, CS: Any, create_tag: bool = True) -> None:
         parser_obj = CS.parsers.get("C_AM") or CS.parsers.get("ASM_AM")
         if parser_obj and hasattr(parser_obj, "rawfile"):
             self.extent.cc(parser_obj.rawfile)
-        self.extract_1arg(CS, ASTT.ASM_Macro, self.name[:255], self.extent)
+        self.extract_1arg(CS, ASTT.ASM_Macro, self.name[:255], self.extent, create_tag=create_tag)
 
 
 class Ast_ASM_Instruction(Ast):
@@ -416,12 +417,12 @@ class Ast_ASM_Instruction(Ast):
         self.type_id = ASTT.ASM_Instruction
         self.mnemonic = mnemonic
 
-    def extract(self, CS: Any) -> None:
+    def extract(self, CS: Any, create_tag: bool = True) -> None:
         parser_obj = CS.parsers.get("C_AM") or CS.parsers.get("ASM_AM")
         if parser_obj and hasattr(parser_obj, "rawfile"):
             self.extent.cc(parser_obj.rawfile)
         name = self.mnemonic or self.extent.code
-        self.extract_1arg(CS, ASTT.ASM_Instruction, name[:255], self.extent)
+        self.extract_1arg(CS, ASTT.ASM_Instruction, name[:255], self.extent, create_tag=create_tag)
 
 
 class Ast_ASM_Label(Ast):
@@ -432,8 +433,8 @@ class Ast_ASM_Label(Ast):
         self.type_id = ASTT.ASM_Label
         self.label = label
 
-    def extract(self, CS: Any) -> None:
-        self.extract_1arg(CS, ASTT.ASM_Label, self.label[:255], self.extent)
+    def extract(self, CS: Any, create_tag: bool = True) -> None:
+        self.extract_1arg(CS, ASTT.ASM_Label, self.label[:255], self.extent, create_tag=create_tag)
 
 
 # --- C Preprocessor Subsystem (CPPro) ---
@@ -562,7 +563,7 @@ class CPPro(Ast):
     def exec_literal(self, token: Any, cursor: Any) -> None:
         pass
 
-    def extract(self, CS: Any) -> None:
+    def extract(self, CS: Any, create_tag: bool = True) -> None:
         pass
 
 
@@ -590,8 +591,8 @@ class CPPro_if(CPPro):
     def exec_literal(self, token: Any, cursor: Any) -> None:
         self.expression += token.spelling_str
 
-    def extract(self, CS: Any) -> None:
-        self.extract_1arg(CS, ASTT.CPPro_if, self.expression[:255], self.extent)
+    def extract(self, CS: Any, create_tag: bool = True) -> None:
+        self.extract_1arg(CS, ASTT.CPPro_if, self.expression[:255], self.extent, create_tag=create_tag)
 
 
 class CPPro_elif(CPPro):
@@ -618,8 +619,8 @@ class CPPro_elif(CPPro):
     def exec_literal(self, token: Any, cursor: Any) -> None:
         self.expression += token.spelling_str
 
-    def extract(self, CS: Any) -> None:
-        self.extract_1arg(CS, ASTT.CPPro_elif, self.expression[:255], self.extent)
+    def extract(self, CS: Any, create_tag: bool = True) -> None:
+        self.extract_1arg(CS, ASTT.CPPro_elif, self.expression[:255], self.extent, create_tag=create_tag)
 
 
 class CPPro_else(CPPro):
@@ -632,8 +633,8 @@ class CPPro_else(CPPro):
     def init_subclass(self) -> None:
         self.type_id = ASTT.CPPro_else
 
-    def extract(self, CS: Any) -> None:
-        self.extract_1arg(CS, ASTT.CPPro_else, "", self.extent)
+    def extract(self, CS: Any, create_tag: bool = True) -> None:
+        self.extract_1arg(CS, ASTT.CPPro_else, "", self.extent, create_tag=create_tag)
 
 
 class CPPro_endif(CPPro):
@@ -646,8 +647,8 @@ class CPPro_endif(CPPro):
     def init_subclass(self) -> None:
         self.type_id = ASTT.CPPro_endif
 
-    def extract(self, CS: Any) -> None:
-        self.extract_1arg(CS, ASTT.CPPro_endif, "", self.extent)
+    def extract(self, CS: Any, create_tag: bool = True) -> None:
+        self.extract_1arg(CS, ASTT.CPPro_endif, "", self.extent, create_tag=create_tag)
 
 
 class CPPro_ifdef(CPPro):
@@ -670,8 +671,8 @@ class CPPro_ifdef(CPPro):
         if not self.identifier:
             self.identifier = token.spelling_str
 
-    def extract(self, CS: Any) -> None:
-        self.extract_1arg(CS, ASTT.CPPro_ifdef, self.identifier[:255], self.extent)
+    def extract(self, CS: Any, create_tag: bool = True) -> None:
+        self.extract_1arg(CS, ASTT.CPPro_ifdef, self.identifier[:255], self.extent, create_tag=create_tag)
 
 
 class CPPro_ifndef(CPPro):
@@ -694,8 +695,8 @@ class CPPro_ifndef(CPPro):
         if not self.identifier:
             self.identifier = token.spelling_str
 
-    def extract(self, CS: Any) -> None:
-        self.extract_1arg(CS, ASTT.CPPro_ifndef, self.identifier[:255], self.extent)
+    def extract(self, CS: Any, create_tag: bool = True) -> None:
+        self.extract_1arg(CS, ASTT.CPPro_ifndef, self.identifier[:255], self.extent, create_tag=create_tag)
 
 
 class CPPro_elifdef(CPPro):
@@ -714,8 +715,8 @@ class CPPro_elifdef(CPPro):
         if not self.identifier:
             self.identifier = token.spelling_str
 
-    def extract(self, CS: Any) -> None:
-        self.extract_1arg(CS, ASTT.CPPro_elifdef, self.identifier[:255], self.extent)
+    def extract(self, CS: Any, create_tag: bool = True) -> None:
+        self.extract_1arg(CS, ASTT.CPPro_elifdef, self.identifier[:255], self.extent, create_tag=create_tag)
 
 
 class CPPro_elifndef(CPPro):
@@ -734,8 +735,8 @@ class CPPro_elifndef(CPPro):
         if not self.identifier:
             self.identifier = token.spelling_str
 
-    def extract(self, CS: Any) -> None:
-        self.extract_1arg(CS, ASTT.CPPro_elifndef, self.identifier[:255], self.extent)
+    def extract(self, CS: Any, create_tag: bool = True) -> None:
+        self.extract_1arg(CS, ASTT.CPPro_elifndef, self.identifier[:255], self.extent, create_tag=create_tag)
 
 
 class CPPro_define(CPPro):
@@ -814,7 +815,7 @@ class CPPro_define(CPPro):
         else:
             self.replacement += " " + token.spelling_str
 
-    def extract(self, CS: Any) -> None:
+    def extract(self, CS: Any, create_tag: bool = True) -> None:
         # Macro continuation backslash expansion (Invariant C)
         parser_obj = CS.parsers.get("C_AM") or CS.parsers.get("ASM_AM")
         if parser_obj and hasattr(parser_obj, "rawfile"):
@@ -859,27 +860,33 @@ class CPPro_define(CPPro):
                 ast_id_route = CS.get_route_parse()
 
         self.ast_ref = CS.ref(m_ast.ast_id, *ast_id_route)
-        with CS(REF_NO_REF):
-            if G.OVERRIDE_FORCE_AST_DEBUG:
-                self.ast_debug(CS, ast_id_route)
-            tag_ref = self.tag(CS, ast_id_route, self.extent, ast_name=safe_name, ast_type=type_const)
-            if safe_name:
-                if hasattr(CS, "symbol_dict"):
-                    CS.symbol_dict[(safe_name, type_const)] = ast_id_route[1]
-                    CS.symbol_dict[(safe_name, ASTT.CPPro_define)] = ast_id_route[1]
-                    CS.symbol_dict[(safe_name, ASTT.CPPro_define_macro)] = ast_id_route[1]
-                ext = self.extent
-                with CS(REF_POS):
-                    record_symbol_def(
-                        CS,
-                        tag_ref or getattr(self, "tag_ref", 0),
-                        self.ast_ref,
-                        safe_name,
-                        type_const,
-                        int(SymbolLinkage.MacroOrKernelDef),
-                        ext.line_pos[0],
-                        ext.line_pos[1],
-                    )
+        if create_tag:
+            with CS(REF_NO_REF):
+                if G.OVERRIDE_FORCE_AST_DEBUG:
+                    self.ast_debug(CS, ast_id_route)
+                tag_ref = self.tag(CS, ast_id_route, self.extent, ast_name=safe_name, ast_type=type_const)
+                if safe_name:
+                    if hasattr(CS, "symbol_dict"):
+                        CS.symbol_dict[(safe_name, type_const)] = ast_id_route[1]
+                        CS.symbol_dict[(safe_name, ASTT.CPPro_define)] = ast_id_route[1]
+                        CS.symbol_dict[(safe_name, ASTT.CPPro_define_macro)] = ast_id_route[1]
+                    ext = self.extent
+                    with CS(REF_POS):
+                        record_symbol_def(
+                            CS,
+                            tag_ref or getattr(self, "tag_ref", 0),
+                            self.ast_ref,
+                            safe_name,
+                            type_const,
+                            int(SymbolLinkage.MacroOrKernelDef),
+                            ext.line_pos[0],
+                            ext.line_pos[1],
+                        )
+        else:
+            if safe_name and hasattr(CS, "symbol_dict"):
+                CS.symbol_dict[(safe_name, type_const)] = ast_id_route[1]
+                CS.symbol_dict[(safe_name, ASTT.CPPro_define)] = ast_id_route[1]
+                CS.symbol_dict[(safe_name, ASTT.CPPro_define_macro)] = ast_id_route[1]
 
 
 class CPPro_undef(CPPro):
@@ -898,8 +905,8 @@ class CPPro_undef(CPPro):
         if not self.identifier:
             self.identifier = token.spelling_str
 
-    def extract(self, CS: Any) -> None:
-        self.extract_1arg(CS, ASTT.CPPro_undef, self.identifier[:255], self.extent)
+    def extract(self, CS: Any, create_tag: bool = True) -> None:
+        self.extract_1arg(CS, ASTT.CPPro_undef, self.identifier[:255], self.extent, create_tag=create_tag)
 
 
 class CPPro_include(CPPro):
@@ -1066,8 +1073,8 @@ class CPPro_ident(CPPro):
     def exec_punctuation(self, token: Any, cursor: Any) -> None:
         self.ident_str += token.spelling_str
 
-    def extract(self, CS: Any) -> None:
-        self.extract_1arg(CS, ASTT.CPPro_ident, self.ident_str[:255], self.extent)
+    def extract(self, CS: Any, create_tag: bool = True) -> None:
+        self.extract_1arg(CS, ASTT.CPPro_ident, self.ident_str[:255], self.extent, create_tag=create_tag)
 
 
 class CPPro_line(CPPro):
@@ -1093,9 +1100,9 @@ class CPPro_line(CPPro):
         else:
             self.filename = token.spelling_str
 
-    def extract(self, CS: Any) -> None:
+    def extract(self, CS: Any, create_tag: bool = True) -> None:
         val = f"{self.lineno} {self.filename or ''}".strip()
-        self.extract_1arg(CS, ASTT.CPPro_line, val[:255], self.extent)
+        self.extract_1arg(CS, ASTT.CPPro_line, val[:255], self.extent, create_tag=create_tag)
 
 
 class CPPro_error(CPPro):
@@ -1119,8 +1126,8 @@ class CPPro_error(CPPro):
     def exec_punctuation(self, token: Any, cursor: Any) -> None:
         self.message = (self.message + token.spelling_str).strip()
 
-    def extract(self, CS: Any) -> None:
-        self.extract_1arg(CS, ASTT.CPPro_error, self.message[:255], self.extent)
+    def extract(self, CS: Any, create_tag: bool = True) -> None:
+        self.extract_1arg(CS, ASTT.CPPro_error, self.message[:255], self.extent, create_tag=create_tag)
 
 
 class CPPro_warning(CPPro):
@@ -1144,8 +1151,8 @@ class CPPro_warning(CPPro):
     def exec_punctuation(self, token: Any, cursor: Any) -> None:
         self.message = (self.message + token.spelling_str).strip()
 
-    def extract(self, CS: Any) -> None:
-        self.extract_1arg(CS, ASTT.CPPro_warning, self.message[:255], self.extent)
+    def extract(self, CS: Any, create_tag: bool = True) -> None:
+        self.extract_1arg(CS, ASTT.CPPro_warning, self.message[:255], self.extent, create_tag=create_tag)
 
 
 class CPPro_pragma(CPPro):
@@ -1169,8 +1176,8 @@ class CPPro_pragma(CPPro):
     def exec_punctuation(self, token: Any, cursor: Any) -> None:
         self.payload = (self.payload + token.spelling_str).strip()
 
-    def extract(self, CS: Any) -> None:
-        self.extract_1arg(CS, ASTT.CPPro_pragma, self.payload[:255], self.extent)
+    def extract(self, CS: Any, create_tag: bool = True) -> None:
+        self.extract_1arg(CS, ASTT.CPPro_pragma, self.payload[:255], self.extent, create_tag=create_tag)
 
 
 class CPPro_embed(CPPro):
@@ -1179,8 +1186,8 @@ class CPPro_embed(CPPro):
     def init_subclass(self) -> None:
         self.type_id = ASTT.CPPro_embed
 
-    def extract(self, CS: Any) -> None:
-        self.extract_1arg(CS, ASTT.CPPro_embed, "", self.extent)
+    def extract(self, CS: Any, create_tag: bool = True) -> None:
+        self.extract_1arg(CS, ASTT.CPPro_embed, "", self.extent, create_tag=create_tag)
 
 
 class CPPro_defined(CPPro):
@@ -1189,8 +1196,8 @@ class CPPro_defined(CPPro):
     def init_subclass(self) -> None:
         self.type_id = ASTT.CPPro_defined
 
-    def extract(self, CS: Any) -> None:
-        self.extract_1arg(CS, ASTT.CPPro_defined, "", self.extent)
+    def extract(self, CS: Any, create_tag: bool = True) -> None:
+        self.extract_1arg(CS, ASTT.CPPro_defined, "", self.extent, create_tag=create_tag)
 
 
 # --- Statements ---

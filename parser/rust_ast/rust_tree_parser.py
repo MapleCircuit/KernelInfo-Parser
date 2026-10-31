@@ -403,6 +403,19 @@ def convert_item_node(item: dict[str, Any], raw_lines: tuple[str, ...]) -> Ast_R
         return None
 
     ident = clean_ident(item.get("ident"))
+    kind_obj = item.get("kind", {})
+    kind_type = kind_obj.get("_type") if isinstance(kind_obj, dict) else kind_obj
+
+    if not ident and isinstance(kind_obj, dict):
+        kind_items = kind_obj.get("_items", []) if isinstance(kind_obj.get("_items"), list) else []
+        for kit in kind_items:
+            if isinstance(kit, str) and "#" in kit:
+                ident = clean_ident(kit)
+                break
+            elif isinstance(kit, dict) and kit.get("ident"):
+                ident = clean_ident(kit["ident"])
+                break
+
     extent = make_line_extent(item.get("span"), raw_lines)
     vis = extract_visibility(item.get("vis"))
 
@@ -420,17 +433,27 @@ def convert_item_node(item: dict[str, Any], raw_lines: tuple[str, ...]) -> Ast_R
         else:
             attributes.append(str(kind))
 
-    kind_obj = item.get("kind", {})
-    kind_type = kind_obj.get("_type") if isinstance(kind_obj, dict) else kind_obj
-
     if kind_type == "Struct":
         fields = []
-        variant_data = kind_obj.get("_items", [{}])[0] if isinstance(kind_obj.get("_items"), list) else kind_obj
+        items_list = kind_obj.get("_items", []) if isinstance(kind_obj.get("_items"), list) else []
+        struct_name = ident
+        if not struct_name and items_list and isinstance(items_list[0], str):
+            struct_name = clean_ident(items_list[0])
+
+        variant_data = None
+        for it in items_list:
+            if isinstance(it, dict) and it.get("_type") in ("Struct", "Tuple", "Unit"):
+                variant_data = it
+                break
+        if variant_data is None:
+            variant_data = items_list[0] if items_list and isinstance(items_list[0], dict) else kind_obj
+
         field_list = []
         if isinstance(variant_data, dict):
-            v_type = variant_data.get("_type", "")
-            if "Struct" in v_type or "Tuple" in v_type:
-                field_list = variant_data.get("_items", [[]])[0] if isinstance(variant_data.get("_items"), list) and variant_data["_items"] else []
+            if "fields" in variant_data and isinstance(variant_data["fields"], list):
+                field_list = variant_data["fields"]
+            elif variant_data.get("_type") == "Tuple" and isinstance(variant_data.get("_items"), list) and variant_data["_items"]:
+                field_list = variant_data["_items"][0] if isinstance(variant_data["_items"][0], list) else []
 
         for idx, f in enumerate(field_list):
             if not isinstance(f, dict):
@@ -442,7 +465,7 @@ def convert_item_node(item: dict[str, Any], raw_lines: tuple[str, ...]) -> Ast_R
             fields.append(Ast_Rust_Field(f_ident, f_ty, f_extent, vis=f_vis, priority=idx))
 
         return Ast_Rust_Struct(
-            name=ident,
+            name=struct_name,
             extent=extent,
             vis=vis,
             fields=fields,
@@ -452,7 +475,19 @@ def convert_item_node(item: dict[str, Any], raw_lines: tuple[str, ...]) -> Ast_R
 
     elif kind_type == "Enum":
         variants = []
-        enum_def = kind_obj.get("_items", [{}])[0] if isinstance(kind_obj.get("_items"), list) else kind_obj
+        items_list = kind_obj.get("_items", []) if isinstance(kind_obj.get("_items"), list) else []
+        enum_name = ident
+        if not enum_name and items_list and isinstance(items_list[0], str):
+            enum_name = clean_ident(items_list[0])
+
+        enum_def = None
+        for it in items_list:
+            if isinstance(it, dict) and it.get("_type") == "EnumDef":
+                enum_def = it
+                break
+        if enum_def is None:
+            enum_def = items_list[0] if items_list and isinstance(items_list[0], dict) else kind_obj
+
         variant_list = enum_def.get("variants", []) if isinstance(enum_def, dict) else []
 
         for v in variant_list:
@@ -478,7 +513,7 @@ def convert_item_node(item: dict[str, Any], raw_lines: tuple[str, ...]) -> Ast_R
             ))
 
         return Ast_Rust_Enum(
-            name=ident,
+            name=enum_name,
             extent=extent,
             vis=vis,
             variants=variants,
@@ -488,8 +523,17 @@ def convert_item_node(item: dict[str, Any], raw_lines: tuple[str, ...]) -> Ast_R
 
     elif kind_type == "Union":
         fields = []
-        variant_data = kind_obj.get("_items", [{}])[0] if isinstance(kind_obj.get("_items"), list) else kind_obj
-        field_list = variant_data.get("_items", [[]])[0] if isinstance(variant_data, dict) and isinstance(variant_data.get("_items"), list) and variant_data["_items"] else []
+        items_list = kind_obj.get("_items", []) if isinstance(kind_obj.get("_items"), list) else []
+        union_name = ident
+        if not union_name and items_list and isinstance(items_list[0], str):
+            union_name = clean_ident(items_list[0])
+
+        field_list = []
+        for it in items_list:
+            if isinstance(it, dict) and "fields" in it:
+                field_list = it["fields"]
+                break
+
         for idx, f in enumerate(field_list):
             if isinstance(f, dict):
                 f_ident = clean_ident(f.get("ident"))
@@ -498,7 +542,7 @@ def convert_item_node(item: dict[str, Any], raw_lines: tuple[str, ...]) -> Ast_R
                 fields.append(Ast_Rust_Field(f_ident, f_ty, f_extent, priority=idx))
 
         return Ast_Rust_Union(
-            name=ident,
+            name=union_name,
             extent=extent,
             vis=vis,
             fields=fields,
@@ -736,6 +780,16 @@ def convert_assoc_item(assoc: dict[str, Any], raw_lines: tuple[str, ...]) -> Ast
 
     kind_obj = assoc.get("kind", {})
     kind_type = kind_obj.get("_type") if isinstance(kind_obj, dict) else kind_obj
+
+    if not ident and isinstance(kind_obj, dict):
+        kind_items = kind_obj.get("_items", []) if isinstance(kind_obj.get("_items"), list) else []
+        for kit in kind_items:
+            if isinstance(kit, str) and "#" in kit:
+                ident = clean_ident(kit)
+                break
+            elif isinstance(kit, dict) and kit.get("ident"):
+                ident = clean_ident(kit["ident"])
+                break
 
     if kind_type == "Fn":
         fn_data = kind_obj.get("_items", [{}])[0] if isinstance(kind_obj.get("_items"), list) else kind_obj

@@ -4613,6 +4613,9 @@ class Zone:
         for item in self.children:
             if isinstance(item, (C_Type, AST_Initializer)):
                 item.extract(CS, create_tag=create_tags)
+            elif isinstance(item, CPPro):
+                with CS(REF_NO_REF):
+                    item.extract(CS)
             else:
                 with CS(REF_NO_REF):
                     try:

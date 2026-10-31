@@ -1718,10 +1718,11 @@ Retrieve full email details including RFC-822 headers, body text, raw payload, a
 
 #### `GET /api/mail/thread/{tid}`
 #### `GET /api/mail/thread`
-Retrieve all messages in a discussion thread ordered chronologically by sequential number or date.
+Retrieve a discussion thread's messages ordered chronologically by sequential number or date.
 - **Parameters**:
   - `tid` (path or query): Thread integer identifier.
   - `mid` (query): Optional Message-ID hint used to resolve `tid` automatically if `tid` is omitted or 0.
+- **Bounded page**: a thread is unbounded in principle (the reference archive's largest holds 12,342 messages, each carrying a compressed overview blob), so the archive store caps the messages unpacked per request at `MAX_THREAD_MESSAGES` (1000) and accepts `limit` / `offset`. `total` is the thread's real message count from an indexed count, and `truncated` states whether messages beyond the returned page remain — so a client must read `total` as the thread size and `messages` as a page of it, not as the whole thread.
 - **In-Memory LRU Cache**: 128 entries cached in `MailingListService._thread_cache`.
 - **Response**:
 ```json
@@ -1730,6 +1731,9 @@ Retrieve all messages in a discussion thread ordered chronologically by sequenti
   "tid": 87654,
   "subject": "[PATCH v2 0/3] fs/ext4: extent tree cleanup & fix",
   "total": 4,
+  "limit": 1000,
+  "offset": 0,
+  "truncated": false,
   "participants": [
     "Developer Name <dev@kernel.org>",
     "Theodore Ts'o <tytso@mit.edu>"
@@ -1826,7 +1830,8 @@ Full-text search across public-inbox mail archive with Boolean and term prefixes
   - `limit` (query): Items per page (1-100, default 50).
   - `filter` / `filter_type` (query): Filtering preset: `"all"`, `"patch"`, `"cover"`, `"pull"`.
 - **Future-Dated Messages**: an empty `q` is the chronological browse listing (`ORDER BY ds DESC`), where a message carrying a `Date:` header in the future — a skewed sender clock or a forged header — would sort ahead of every real email. Those rows are therefore excluded from the empty-query listing by the archive store (`PublicInboxLocalStore.search_emails`, `ds <= now + FUTURE_DATE_SKEW_SECONDS`, a one-hour tolerance), and `MailingListService._drop_future_dated` re-applies the same horizon to the returned page so the invariant also holds against a micro-daemon predating it (lowering `total` by what the page dropped). **A non-empty `q` is never filtered**: a search that matches a future-dated message still returns it, and the filter presets apply unchanged in both cases.
-- **Reported `total`**: the archive searches a bounded candidate pool (at least 200 rows, growing with `page × limit`) and reports the size of the filtered pool, so `total` is a lower bound on a large archive rather than an exact match count; the frontend roster treats a page that adds no new message as the end of the results (§5.22). Where the Xapian bindings are unavailable the subject-substring fallback (`search_over_subjects`) scans the newest rows up to `scan_limit`, which likewise grows with the requested page, so later pages stay reachable.
+- **Reported `total`**: where the Xapian bindings are available, `total` is Xapian's estimated match count (`get_matches_estimated()`) for the whole archive. Otherwise it is a lower bound — the offset plus the returned page, plus one when more remain — and the response always carries `has_more`; the frontend roster also treats a page that adds no new message as the end of the results (§5.22).
+- **Paging cost is flat**: `limit` and `offset` are clamped by the archive store (`MAX_SEARCH_LIMIT` 200, `MAX_SEARCH_OFFSET` 5,000,000) and the offset is applied by Xapian or by SQL `LIMIT ? OFFSET ?` rather than by slicing a fetched list, so a deep page costs what the first one does. Materializing `limit + offset` records previously cost 3.1GB and 43s at offset 2,000,000 on a 22M-message archive — enough to have the archive daemon OOM-killed — against 33MB and 0.16s now. Without Xapian, the subject-substring fallback streams a bounded scan (`MAX_SEARCH_SCAN` 20,000 rows) and keeps only the requested page.
 - **In-Memory LRU Cache**: 64 entries cached in `MailingListService._search_cache`.
 - **Response**:
 ```json
@@ -1836,7 +1841,9 @@ Full-text search across public-inbox mail archive with Boolean and term prefixes
   "filter_type": "patch",
   "page": 1,
   "limit": 50,
+  "offset": 0,
   "total": 142,
+  "has_more": true,
   "results": [
     {
       "num": 421890,

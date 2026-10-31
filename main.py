@@ -531,6 +531,7 @@ def _reuse_parsed_blobs(file_blob_hashes: dict[str, bytes]) -> list[str]:
         G.TE.set(m_commit_file.table_id, (gp.VID, fnid, b_id, 0, 0, op[:1]))
         gp.file_blob_ids[fpath] = b_id
         file_fid_cache[fpath] = b_id
+        file_fnid_cache[fpath] = fnid
         gp.deduped_paths.add(fpath)
         reused.add(item)
 
@@ -715,13 +716,9 @@ def update(version: str, repo_path: str | None = None) -> None:
     with G.measure_stage("Step 6.1: Symbolic Links Resolution"):
         processing_symlinks()
 
-    # Disable TableEngine in-memory secondary indexing for write-only batch staging phases
-    if hasattr(G.TE, "update_in_mem_indexes"):
-        G.TE.update_in_mem_indexes = False
-
     if G.is_deadline_exceeded():
         logger.warning(COLOR.yellow(f"[Duration Limit] Execution deadline reached before Git commits. Finalizing '{version}'..."))
-        G.TE.commit_all(update_in_mem_indexes=False)
+        G.TE.commit_all()
         G.TE.close()
         return
 
@@ -732,11 +729,11 @@ def update(version: str, repo_path: str | None = None) -> None:
         processing_git_commits(version)
 
     # Commit git commits, checkpoint files, and git tags staged during git processing
-    G.TE.commit_all(update_in_mem_indexes=False)
+    G.TE.commit_all()
 
     if G.is_deadline_exceeded():
         logger.warning(COLOR.yellow(f"[Duration Limit] Execution deadline reached before File References. Finalizing '{version}'..."))
-        G.TE.commit_all(update_in_mem_indexes=False)
+        G.TE.commit_all()
         G.TE.close()
         return
 
@@ -1115,9 +1112,11 @@ class DependencyScheduler:
 
     def _maybe_chunk_commit(self) -> None:
         if self.executed_count % self.chunk_commit_interval == 0:
+            # If an async background commit is still writing and memory is healthy, defer to allow async overlap
+            if getattr(G.TE, "async_commits", False) and getattr(G.TE, "pending_commit_rows", 0) > 0 and not G.LOW_MEMORY_MODE:
+                if self.executed_count % (2 * self.chunk_commit_interval) != 0:
+                    return
             _commit_all_with_retry("Chunk")
-            if hasattr(self.gp, "_ast_negative_cache"):
-                self.gp._ast_negative_cache.clear()
             reclaim_system_memory()
 
     def _execute(self, path: str, cs_obj: ChangeSet, defer: bool) -> bool:
@@ -1465,7 +1464,7 @@ _STAGE_END = object()
 # Batches sent to a worker ahead of the one it parses
 _TASKS_AHEAD = 2
 # Serialized batches the reader thread may hold for the ingest thread; more only adds parent memory
-_PREFETCH_DEPTH = 2
+_PREFETCH_DEPTH = 8
 
 
 def _recv_task(conn: Any) -> tuple[int, list[str]] | None:
@@ -1498,11 +1497,15 @@ def _encode_batch_result(
     batch_cs_dict: dict[str, Any],
     errors: list[tuple[str, str, str]],
     compress: bool,
+    blob_symbols: dict[int, dict[tuple[str, int], int]] | None = None,
 ) -> bytes | memoryview:
-    """Serialize a parsed batch and its per-file errors into one result frame."""
+    """Serialize a parsed batch, per-file errors, and streamed blob symbols into one result frame."""
     buf = io.BytesIO()
     buf.write(_RESULT_HEADER.pack(_FRAME_RESULT, batch_id, 0))
-    pickle.dump((batch_cs_dict, errors), buf, protocol=pickle.HIGHEST_PROTOCOL)
+    if blob_symbols:
+        pickle.dump((batch_cs_dict, errors, blob_symbols), buf, protocol=pickle.HIGHEST_PROTOCOL)
+    else:
+        pickle.dump((batch_cs_dict, errors), buf, protocol=pickle.HIGHEST_PROTOCOL)
     if not compress:
         return buf.getbuffer()
     body = zlib.compress(buf.getbuffer()[_RESULT_HEADER.size :], level=1)
@@ -1720,10 +1723,14 @@ def _publish_file_symbols() -> None:
     Forked workers query the segments (`gp._shared_symbols`) per target file without copying them,
     so the parent's heap copies are dropped once packed.
     """
-    if gp.file_symbols:
+    if gp.file_symbols or gp._ast_staged_symbols or gp._ast_staged_names:
         t_build = time.perf_counter()
         builder = SharedSymbolBuilder(mode=getattr(G.TE, "hugepages", "auto"))
-        segment = builder.build_file_scoped(gp.file_symbols)
+        segment = builder.build_file_scoped(
+            gp.file_symbols,
+            extra_symbols=gp._ast_staged_symbols,
+            extra_names=gp._ast_staged_names,
+        )
         if segment is not None:
             if gp._shared_symbols is None:
                 gp._shared_symbols = SharedSymbolChain()
@@ -1926,7 +1933,13 @@ def _run_worker_stage(
             received.add(b_id)
             t_decode = time.perf_counter()
             try:
-                batch_dict, batch_errors = pickle.loads(body)
+                decoded_payload = pickle.loads(body)
+                if isinstance(decoded_payload, tuple) and len(decoded_payload) == 3:
+                    batch_dict, batch_errors, batch_blob_symbols = decoded_payload
+                    if batch_blob_symbols and hasattr(gp, "blob_symbol_cache"):
+                        gp.blob_symbol_cache.update(batch_blob_symbols)
+                else:
+                    batch_dict, batch_errors = decoded_payload
             except Exception as e:
                 error_list.extend(
                     (f, f"Batch {b_id} result could not be deserialized: {e}", traceback.format_exc())
@@ -2191,10 +2204,10 @@ def trigger_multicore(batch_size: int | None = None, scheduler: DependencySchedu
         heavy_batch_size=min(header_batch, profile["heavy_batch"]),
         max_batch_bytes=profile["max_batch_bytes"],
         target_epoch_files=len(header_files),
-        largest_first=False,
+        largest_first=True,
         num_workers=num_workers,
     )
-    header_batches = header_epochs[0] if header_epochs else []
+    header_batches = [b for ep in header_epochs for b in ep]
     logger.info(
         f"Distributing {len(regular_files)} changed files ({len(header_files)} headers in {len(header_batches)} batches, "
         f"{len(source_files)} sources) (memory mode: {G.MEMORY_MODE}) across {num_workers} parallel workers"
@@ -2977,6 +2990,9 @@ def arg_handling() -> argparse.Namespace:
                 )
             sys.exit(0)
 
+    # Enforce memory limit early so re-exec (systemd-run) occurs before opening SSH tunnels or DB connections
+    setup_memory_limit(float(args.mem_max))
+
     parser_cfg = get_parser_config()
     db_cfg = get_db_config()
     ssh_cfg = get_ssh_tunnel_config()
@@ -3168,6 +3184,9 @@ def arg_handling() -> argparse.Namespace:
     return args
 
 
+_network_repo_cache: dict[tuple[str, str, str, str], tuple[int, int]] = {}
+
+
 def resolve_git_network_and_repo(
     repo_dir: str | None = None,
     repo_name: str | None = None,
@@ -3176,6 +3195,13 @@ def resolve_git_network_and_repo(
 ) -> tuple[int, int]:
     """Discover or register m_project, m_git_network, and m_repository for the given git tree."""
     repo_dir = repo_dir or getattr(MF, "repo_dir", None) or "linux"
+    cache_key = (os.path.abspath(repo_dir), repo_name or "", project_name, project_slug)
+    if cache_key in _network_repo_cache:
+        net_id, r_id = _network_repo_cache[cache_key]
+        gp.network_id = net_id
+        gp.repo_id = r_id
+        return net_id, r_id
+
     git_dir = os.path.join(repo_dir, ".git") if os.path.isdir(os.path.join(repo_dir, ".git")) else repo_dir
 
     roots = []
@@ -3252,6 +3278,7 @@ def resolve_git_network_and_repo(
 
     gp.network_id = network_id
     gp.repo_id = repo_id
+    _network_repo_cache[cache_key] = (network_id, repo_id)
     return network_id, repo_id
 
 
@@ -3755,19 +3782,140 @@ def _attach_blob_hash(CS: ChangeSet, blob_hashes: dict[str, bytes] | None) -> bo
 _GIT_COMMIT_RESULT = "commits.pkl"
 
 
-def _git_commit_worker(old_ver: str | int, ver: str, result_path: str, repo_dir: str | None = None, limit: int | None = None) -> None:
+def _git_commit_worker(
+    old_ver: str | int,
+    ver: str,
+    result_path: str,
+    repo_dir: str | None = None,
+    limit: int | None = None,
+    known_count: int | None = None,
+) -> None:
     """Worker process that parses git commits and diff hunks in parallel with file AST parsing.
 
-    The result is pickled to `result_path` instead of a queue so the process exits as soon as parsing
-    ends, and stops sharing the parent's fork-time memory long before the parent reads the result.
+    Also executes patch-id calculation, diff-tree blob extraction, and lore mailing-list resolution
+    in the background, overlapping Step 6.5 completely with multicore file parsing.
     """
     try:
         from parser.git_ast import GitCommitParser
         git_parser = GitCommitParser(repo_dir=repo_dir)
-        commits, file_hunks_map = git_parser.parse_version_commits_with_hunks(old_ver, ver, limit=limit)
+        try:
+            commits, file_hunks_map = git_parser.parse_version_commits_with_hunks(
+                old_ver, ver, limit=limit, known_commit_count=known_count
+            )
+        except TypeError:
+            commits, file_hunks_map = git_parser.parse_version_commits_with_hunks(
+                old_ver, ver, limit=limit
+            )
+
+        ml_results = None
+        commit_patch_ids: dict[str, str] = {}
+        commit_file_blobs: dict[str, list[tuple[str, str, str]]] = {}
+        if commits:
+            try:
+                from parser.mailing_list.ml_client import MailingListClient
+                from parser.mailing_list.ml_types import CommitFeatures
+
+                non_merge_hashes = [
+                    c.commit_hash for c in commits
+                    if not getattr(c, "parents", None) or len(c.parents) < 2
+                ]
+                all_hashes = [c.commit_hash for c in commits]
+
+                if non_merge_hashes and repo_dir:
+                    try:
+                        p_log = sp.Popen(
+                            ["git", "-C", repo_dir, "show", "--format=%H", "--patch", "--no-color", "--stdin"],
+                            stdin=sp.PIPE,
+                            stdout=sp.PIPE,
+                            stderr=sp.DEVNULL,
+                        )
+                        p_patch = sp.Popen(
+                            ["git", "patch-id", "--stable"],
+                            stdin=p_log.stdout,
+                            stdout=sp.PIPE,
+                            stderr=sp.DEVNULL,
+                            text=True,
+                        )
+                        if p_log.stdin:
+                            p_log.stdin.write("\n".join(non_merge_hashes).encode("ascii") + b"\n")
+                            p_log.stdin.close()
+                        p_patch_out, _ = p_patch.communicate(timeout=180)
+                        p_log.wait(timeout=10)
+                        for line in p_patch_out.splitlines():
+                            parts = line.strip().split()
+                            if len(parts) >= 2:
+                                commit_patch_ids[parts[1]] = parts[0]
+                    except Exception as e:
+                        logger.debug(f"Worker patch-id extraction failed: {e}")
+
+                if all_hashes and repo_dir:
+                    try:
+                        p_dt = sp.run(
+                            ["git", "-C", repo_dir, "diff-tree", "--stdin", "-r"],
+                            input="\n".join(all_hashes),
+                            capture_output=True,
+                            text=True,
+                            check=False,
+                            timeout=180,
+                        )
+                        if p_dt.returncode == 0:
+                            cur_h = None
+                            for line in p_dt.stdout.splitlines():
+                                line_s = line.strip()
+                                if not line_s:
+                                    continue
+                                if not line_s.startswith(":"):
+                                    cur_h = line_s
+                                elif cur_h:
+                                    parts = line_s.split("\t", 1)
+                                    if len(parts) >= 2:
+                                        meta = parts[0].split()
+                                        fpath = parts[1]
+                                        if len(meta) >= 5:
+                                            old_b = meta[2]
+                                            new_b = meta[3]
+                                            pre_sha = old_b if len(old_b) == 40 and old_b != "0" * 40 else ""
+                                            post_sha = new_b if len(new_b) == 40 and new_b != "0" * 40 else ""
+                                            if pre_sha or post_sha:
+                                                b_list = commit_file_blobs.setdefault(cur_h, [])
+                                                if len(b_list) < 10:
+                                                    b_list.append((pre_sha, post_sha, fpath))
+                    except Exception as e:
+                        logger.debug(f"Worker diff-tree extraction failed: {e}")
+
+                features_list = []
+                for c in commits:
+                    c_hash = c.commit_hash
+                    parents = getattr(c, "parents", None) or []
+                    patch_id = commit_patch_ids.get(c_hash)
+                    file_blobs = commit_file_blobs.get(c_hash, [])
+                    features = CommitFeatures(
+                        commit_id=0,
+                        commit_hash=c_hash,
+                        subject=getattr(c, "subject", "") or "",
+                        author_name=getattr(c, "author_name", "") or "",
+                        author_email=getattr(c, "author_email", "") or "",
+                        author_date=int(getattr(c, "author_date", 0) or 0),
+                        commit_ts=int(getattr(c, "committer_date", 0) or getattr(c, "author_date", 0) or 0),
+                        commit_message=getattr(c, "message", "") or "",
+                        patch_id=patch_id,
+                        file_blobs=file_blobs[:10],
+                        is_merge=len(parents) >= 2,
+                    )
+                    features_list.append(features)
+
+                if features_list:
+                    client = MailingListClient(git_dir=repo_dir)
+                    try:
+                        ml_results = client.resolve_commits(features_list)
+                    finally:
+                        client.close()
+            except Exception as e:
+                logger.debug(f"Worker mailing list resolution skipped/failed: {e}")
+
         tmp_path = f"{result_path}.tmp"
         with open(tmp_path, "wb") as f:
-            pickle.dump((commits, file_hunks_map), f, protocol=pickle.HIGHEST_PROTOCOL)
+            pickle.dump((commits, file_hunks_map, ml_results, commit_patch_ids, commit_file_blobs), f, protocol=pickle.HIGHEST_PROTOCOL)
         os.replace(tmp_path, result_path)
     except Exception as e:
         logger.error(f"Git commit worker error: {e}", exc_info=True)
@@ -3781,6 +3929,7 @@ def _start_git_commit_worker() -> None:
     result_dir = tempfile.mkdtemp(prefix="kip-commits-", dir=base_dir)
     gp.PURGE_LIST.append(result_dir)
     gp._commit_result_dir = result_dir
+    known_count = len(gp.commit_ids_by_hash) if getattr(gp, "commit_ids_by_hash", None) else None
     proc = _MP.Process(
         target=_git_commit_worker,
         args=(
@@ -3789,6 +3938,7 @@ def _start_git_commit_worker() -> None:
             os.path.join(result_dir, _GIT_COMMIT_RESULT),
             MF.get_repo_dir(),
             getattr(gp, "commit_limit", None),
+            known_count,
         ),
         name="git-commit-parser",
         daemon=True,
@@ -3817,7 +3967,16 @@ def _collect_git_commit_result() -> tuple[Any, Any] | None:
             logger.warning(f"Git commit worker exited with code {proc.exitcode}; parsing commits in-process.")
             return None
         with open(os.path.join(result_dir, _GIT_COMMIT_RESULT), "rb") as f:
-            return pickle.load(f)  # noqa: S301
+            res = pickle.load(f)  # noqa: S301
+            if isinstance(res, tuple):
+                if len(res) == 5:
+                    commits, file_hunks_map, ml_results, commit_patch_ids, commit_file_blobs = res
+                    if ml_results is not None:
+                        gp._precomputed_ml_results = (ml_results, commit_patch_ids, commit_file_blobs)
+                    return (commits, file_hunks_map)
+                elif len(res) >= 2:
+                    return (res[0], res[1])
+            return res
     except Exception as e:
         logger.warning(f"Failed to load precomputed commits from background worker: {e}")
         return None
@@ -3891,11 +4050,15 @@ def file_processing_worker(
             item = worker_serialize_queue.get()
             if item is None:
                 break
-            b_id, b_files, b_dict, b_errors = item
+            if len(item) == 5:
+                b_id, b_files, b_dict, b_errors, b_blob_symbols = item
+            else:
+                b_id, b_files, b_dict, b_errors = item
+                b_blob_symbols = None
             del item
             t_encode = time.perf_counter()
             try:
-                frame = _encode_batch_result(b_id, b_dict, b_errors, compress)
+                frame = _encode_batch_result(b_id, b_dict, b_errors, compress, b_blob_symbols)
             except Exception as e:
                 logger.error(COLOR.red(f"Worker {worker_id} failed to serialize batch {b_id}: {e}"))
                 tb_str = traceback.format_exc()
@@ -3913,6 +4076,8 @@ def file_processing_worker(
     serializer_thread = threading.Thread(target=_serializer_loop, daemon=True)
     serializer_thread.start()
 
+    last_sent_blobs: set[int] = set()
+
     try:
         while True:
             t_wait = time.perf_counter()
@@ -3927,6 +4092,54 @@ def file_processing_worker(
             batch_cs_dict = {}
             batch_errors: list[tuple[str, str, str]] = []
 
+            # Batch pre-fetch prior tags & items for modified files in this batch
+            batch_prior_tags: dict[int, list[tuple[Any, ...]]] = {}
+            batch_prior_items: dict[int, tuple[Counter, Counter]] = {}
+            old_vid = getattr(gp_ref, "Old_VID", 0) if gp_ref is not None else 0
+            if old_vid > 0:
+                try:
+                    old_fids: dict[str, int] = {}
+                    for cf in changed_files:
+                        p = cf.split("\t")
+                        if not p[0].startswith("D") and not p[0].startswith("A"):
+                            lp = p[1] if (p[0].startswith("R") and len(p) >= 3) else p[-1]
+                            fn_row = m_file_name.get(None, lp)
+                            if fn_row and len(fn_row) >= 3 and fn_row[2]:
+                                fnid = fn_row[2][0]
+                                bf_row = m_bridge_file.get(old_vid, fnid, None)
+                                if bf_row and len(bf_row) >= 3 and bf_row[2]:
+                                    old_fids[lp] = bf_row[2][2]
+                    if old_fids:
+                        joins = (
+                            (m_bridge_tag.tag_id, m_tag.tag_id, 1),
+                            (m_tag.ast_id, m_ast.ast_id, 1),
+                        )
+                        all_tag_ids: set[int] = set()
+                        for fid in set(old_fids.values()):
+                            cols = (fid,) + (None,) * 13
+                            p_tags = m_bridge_tag.view_get_multiple(joins, *cols)
+                            if p_tags:
+                                batch_prior_tags[fid] = p_tags
+                                for t in p_tags:
+                                    tid = t[1] if len(t) > 1 else t[0]
+                                    if tid:
+                                        all_tag_ids.add(tid)
+                        if all_tag_ids:
+                            tag_id_list = sorted(all_tag_ids)
+                            ref_rows = G.TE.get_in(m_tag_ref.table_id, 0, tag_id_list) or ()
+                            def_rows = G.TE.get_in(m_tag_def.table_id, 0, tag_id_list) or ()
+                            refs_map: dict[int, Counter] = {t: Counter() for t in all_tag_ids}
+                            defs_map: dict[int, Counter] = {t: Counter() for t in all_tag_ids}
+                            for tag_id, _idx, key, role, rel_line, char_s in ref_rows:
+                                refs_map.setdefault(tag_id, Counter())[(key, role, rel_line, char_s)] += 1
+                            for tag_id, _idx, key, name, type_id, linkage, rel_s, rel_e in def_rows:
+                                decoded_name = name.decode("utf-8", "replace") if isinstance(name, (bytes, bytearray)) else name
+                                defs_map.setdefault(tag_id, Counter())[(key, decoded_name, type_id, linkage, rel_s, rel_e)] += 1
+                            for tid in all_tag_ids:
+                                batch_prior_items[tid] = (refs_map[tid], defs_map[tid])
+                except Exception as e:
+                    logger.debug(f"Worker {worker_id} batch prefetch prior tags failed: {e}")
+
             for f_idx, changed_file in enumerate(changed_files):
                 try:
                     CS = ChangeSet(changed_file)
@@ -3934,6 +4147,8 @@ def file_processing_worker(
                     CS.gp = gp_ref
                     CS.mf = mf_ref
                     CS.batch_cs_dict = batch_cs_dict
+                    CS._batch_prior_tags = batch_prior_tags
+                    CS._batch_prior_items = batch_prior_items
                     if not _attach_blob_hash(CS, getattr(gp_ref, "file_blob_hashes", None)):
                         batch_errors.append((
                             changed_file, "No git blob hash in this version (not a regular file?); skipped.", ""
@@ -3978,8 +4193,15 @@ def file_processing_worker(
 
             t_put = time.perf_counter()
             split["busy_s"] += t_put - t_task
+            new_blob_symbols = None
+            if gp_ref is not None and hasattr(gp_ref, "_blob_symbols_fetched"):
+                new_blob_symbols = {
+                    fid: sm for fid, sm in gp_ref._blob_symbols_fetched.items()
+                    if fid not in last_sent_blobs
+                }
+                last_sent_blobs.update(new_blob_symbols.keys())
             # Blocks while two finished batches wait for the parent to read them
-            worker_serialize_queue.put((batch_id, changed_files, batch_cs_dict, batch_errors))
+            worker_serialize_queue.put((batch_id, changed_files, batch_cs_dict, batch_errors, new_blob_symbols))
             t_queued = time.perf_counter()
             split["send_wait_s"] += t_queued - t_put
             del batch_cs_dict
@@ -4114,6 +4336,7 @@ def processing_unchanges() -> list[str]:
             missing_unchanged.append(unchanged)
             continue
         fnid = un_m_file_name[2][0]
+        file_fnid_cache[unchanged] = fnid
 
         # Guard against duplicate primary key insertion if already checkpointed
         if m_bridge_file.get(vid, fnid, None) is not None:
@@ -4182,7 +4405,7 @@ def processing_dirs() -> dict[str, ChangeSet]:  # noqa: C901
         for single_dir in unchanged_dirs:
             # Get m_file_name
             un_m_file_name = m_file_name.get(None, single_dir)
-            if un_m_file_name is None:
+            if un_m_file_name is None or not un_m_file_name[2]:
                 new_dir_list.add(single_dir)
                 logger.warning(f"Unchanged dir missing m_file_name: '{single_dir}', self-healing as new addition...")
                 continue
@@ -4191,7 +4414,7 @@ def processing_dirs() -> dict[str, ChangeSet]:  # noqa: C901
                 continue
             # Get old_m_bridge_file
             old_m_bridge_file = m_bridge_file.get(gp.Old_VID, dir_fnid, None)
-            if old_m_bridge_file is None:
+            if old_m_bridge_file is None or not old_m_bridge_file[2]:
                 new_dir_list.add(single_dir)
                 logger.warning(
                     f"Unchanged dir '{single_dir}' missing prior m_bridge_file (Old_VID {gp.Old_VID}). "
@@ -4287,6 +4510,7 @@ def processing_symlinks(override_symlinks: list[str] | None = None) -> None:
             sym_fnid = sym_fn_res[0]
             te_set(t_id, (vid, sym_fnid, target_fid))
             file_fid_cache[symlink_path] = target_fid
+            file_fnid_cache[symlink_path] = sym_fnid
             if hasattr(gp, "file_blob_ids") and isinstance(gp.file_blob_ids, dict):
                 gp.file_blob_ids[symlink_path] = target_fid
             logger.info(f"Symlink aliased: '{symlink_path}' -> '{norm_target}' (fid {target_fid})")
@@ -4348,6 +4572,7 @@ def _reuse_parsed_symlink_blobs(fallback_files: list[str]) -> list[str]:
         if m_bridge_file.get(gp.VID, fnid, None) is None:
             G.TE.set(m_bridge_file.table_id, (gp.VID, fnid, b_id))
         file_fid_cache[fpath] = b_id
+        file_fnid_cache[fpath] = fnid
         gp.file_blob_ids[fpath] = b_id
         logger.info(f"Symlink '{fpath}' reuses its already parsed blob (fid {b_id})")
     return remaining
@@ -4394,8 +4619,9 @@ def processing_git_commits(version: str) -> None:
         commits, file_hunks_map = precomputed
 
     if commits is None:
+        known_count = len(gp.commit_ids_by_hash) if getattr(gp, "commit_ids_by_hash", None) else None
         commits, file_hunks_map = git_parser.parse_version_commits_with_hunks(
-            gp.Old_Version_Name, gp.Version_Name, limit=getattr(gp, "commit_limit", None)
+            gp.Old_Version_Name, gp.Version_Name, limit=getattr(gp, "commit_limit", None), known_commit_count=known_count
         )
     if not commits:
         # An empty diff stream (git timed out or the range is empty) leaves the version without
@@ -4682,65 +4908,114 @@ def resolve_version_mailing_list_commits(
         c_id = commit_hash_to_id.get(c_hash)
         if not c_id:
             continue
-
         parents = getattr(c, "parents", None) or []
         if len(parents) >= 2:
             merge_commits.append((c_id, c_hash, parents))
 
-        patch_id = None
-        try:
-            p_show = sp.run(
-                ["git", "-C", repo_dir, "show", "--format=", c_hash],
-                capture_output=True,
-                check=False,
-            )
-            if p_show.returncode == 0 and p_show.stdout:
-                p_patchid = sp.run(
-                    ["git", "patch-id", "--stable"],
-                    input=p_show.stdout,
-                    capture_output=True,
-                    check=False,
+    results = None
+    precomputed_ml = getattr(gp, "_precomputed_ml_results", None)
+    if precomputed_ml:
+        results, commit_patch_ids, commit_file_blobs = precomputed_ml
+        gp._precomputed_ml_results = None
+
+    if results is None:
+        commit_patch_ids: dict[str, str] = {}
+        commit_file_blobs: dict[str, list[tuple[str, str, str]]] = {}
+        non_merge_hashes = [
+            c.commit_hash for c in commits
+            if commit_hash_to_id.get(c.commit_hash) and (not getattr(c, "parents", None) or len(c.parents) < 2)
+        ]
+        all_known_hashes = [
+            c.commit_hash for c in commits
+            if commit_hash_to_id.get(c.commit_hash)
+        ]
+
+        if non_merge_hashes:
+            try:
+                p_log = sp.Popen(
+                    ["git", "-C", repo_dir, "show", "--format=%H", "--patch", "--no-color", "--stdin"],
+                    stdin=sp.PIPE,
+                    stdout=sp.PIPE,
+                    stderr=sp.DEVNULL,
                 )
-                if p_patchid.returncode == 0 and p_patchid.stdout:
-                    parts = p_patchid.stdout.decode("ascii", errors="replace").split()
-                    if parts:
-                        patch_id = parts[0]
-        except Exception:
-            pass
+                p_patch = sp.Popen(
+                    ["git", "patch-id", "--stable"],
+                    stdin=p_log.stdout,
+                    stdout=sp.PIPE,
+                    stderr=sp.DEVNULL,
+                    text=True,
+                )
+                if p_log.stdin:
+                    p_log.stdin.write("\n".join(non_merge_hashes).encode("ascii") + b"\n")
+                    p_log.stdin.close()
+                p_patch_out, _ = p_patch.communicate(timeout=120)
+                p_log.wait(timeout=10)
+                for line in p_patch_out.splitlines():
+                    parts = line.strip().split()
+                    if len(parts) >= 2:
+                        commit_patch_ids[parts[1]] = parts[0]
+            except Exception as e:
+                logger.debug(f"Batch patch-id extraction failed: {e}")
 
-        blob_hashes: list[str] = []
-        try:
-            diff_res = sp.run(
-                ["git", "-C", repo_dir, "diff-tree", "-r", "--no-commit-id", c_hash],
-                capture_output=True,
-                text=True,
-                check=False,
+        if all_known_hashes:
+            try:
+                p_dt = sp.run(
+                    ["git", "-C", repo_dir, "diff-tree", "--stdin", "-r"],
+                    input="\n".join(all_known_hashes),
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=120,
+                )
+                if p_dt.returncode == 0:
+                    cur_h = None
+                    for line in p_dt.stdout.splitlines():
+                        line_s = line.strip()
+                        if not line_s:
+                            continue
+                        if not line_s.startswith(":"):
+                            cur_h = line_s
+                        elif cur_h:
+                            parts = line_s.split("\t", 1)
+                            if len(parts) >= 2:
+                                meta = parts[0].split()
+                                fpath = parts[1]
+                                if len(meta) >= 5:
+                                    old_b = meta[2]
+                                    new_b = meta[3]
+                                    pre_sha = old_b if len(old_b) == 40 and old_b != "0" * 40 else ""
+                                    post_sha = new_b if len(new_b) == 40 and new_b != "0" * 40 else ""
+                                    if pre_sha or post_sha:
+                                        b_list = commit_file_blobs.setdefault(cur_h, [])
+                                        if len(b_list) < 10:
+                                            b_list.append((pre_sha, post_sha, fpath))
+            except Exception as e:
+                logger.debug(f"Batch diff-tree extraction failed: {e}")
+
+        for c in commits:
+            c_hash = c.commit_hash
+            c_id = commit_hash_to_id.get(c_hash)
+            if not c_id:
+                continue
+
+            parents = getattr(c, "parents", None) or []
+            patch_id = commit_patch_ids.get(c_hash)
+            file_blobs = commit_file_blobs.get(c_hash, [])
+
+            features = CommitFeatures(
+                commit_id=c_id,
+                commit_hash=c_hash,
+                subject=getattr(c, "subject", "") or "",
+                author_name=getattr(c, "author_name", "") or "",
+                author_email=getattr(c, "author_email", "") or "",
+                author_date=int(getattr(c, "author_date", 0) or 0),
+                commit_ts=int(getattr(c, "committer_date", 0) or getattr(c, "author_date", 0) or 0),
+                commit_message=getattr(c, "message", "") or "",
+                patch_id=patch_id,
+                file_blobs=file_blobs[:10],
+                is_merge=len(parents) >= 2,
             )
-            if diff_res.returncode == 0:
-                for line in diff_res.stdout.splitlines():
-                    parts = line.split()
-                    if len(parts) >= 5:
-                        post_sha = parts[3]
-                        if len(post_sha) == 40 and post_sha != "0" * 40:
-                            blob_hashes.append(post_sha)
-        except Exception:
-            pass
-
-        features = CommitFeatures(
-            commit_id=c_id,
-            commit_hash=c_hash,
-            subject=getattr(c, "subject", "") or "",
-            author_name=getattr(c, "author_name", "") or "",
-            author_email=getattr(c, "author_email", "") or "",
-            author_date=int(getattr(c, "author_date", 0) or 0),
-            commit_message=getattr(c, "message", "") or "",
-            patch_id=patch_id,
-            blob_hashes=blob_hashes[:10],
-        )
-        features_list.append(features)
-
-    if not features_list:
-        return 0
+            features_list.append(features)
 
     client_kwargs = {}
     if storage_dir:
@@ -4749,7 +5024,10 @@ def resolve_version_mailing_list_commits(
 
     total_staged = 0
     try:
-        results = client.resolve_commits(features_list)
+        if results is None:
+            if not features_list:
+                return 0
+            results = client.resolve_commits(features_list)
         for c_hash, ctx in results.items():
             c_id = commit_hash_to_id.get(c_hash)
             if c_id is not None:
@@ -4875,9 +5153,25 @@ def processing_kbuild(
     if not makefile_paths:
         return
 
-    logger.info(f"Processing {len(makefile_paths)} Makefile/Kbuild files for version '{version}'...")
+    has_new_kconfig = bool(getattr(G.TE, "_staged", {}).get(m_kconfig_symbol.table_id)) if getattr(G, "TE", None) else False
+    target_makefiles = [
+        f for f in makefile_paths
+        if has_new_kconfig or new_blob_ids is None or get_fid_for_path(f) in new_blob_ids
+    ]
+    logger.info(f"Processing {len(target_makefiles)} Makefile/Kbuild files for version '{version}' (of {len(makefile_paths)} total)...")
 
     kcid_cache: dict[str, int] = {}
+    if getattr(G, "TE", None) is not None:
+        cached_kc = getattr(G.TE, "_cached_rows", {}).get(m_kconfig_symbol.table_id)
+        if cached_kc:
+            for row in cached_kc:
+                if len(row) > 1 and row[0] is not None and row[1]:
+                    kcid_cache[row[1]] = row[0]
+        staged_kc = getattr(G.TE, "_staged", {}).get(m_kconfig_symbol.table_id)
+        if staged_kc:
+            for row in (staged_kc.values() if isinstance(staged_kc, dict) else staged_kc):
+                if len(row) > 1 and row[0] is not None and row[1]:
+                    kcid_cache[row[1]] = row[0]
 
     def get_kcid_for_sym(sym: str) -> int:
         if not sym or sym in ("y", "m"):
@@ -4895,15 +5189,17 @@ def processing_kbuild(
 
     count = 0
     ref_count = 0
-    for mk_path in makefile_paths:
+    for mk_path in target_makefiles:
         if G.is_deadline_exceeded():
             logger.warning(COLOR.yellow("[Duration Limit] Execution deadline reached during Kbuild processing. Stopping early..."))
             break
         try:
+            mk_fid = get_fid_for_path(mk_path)
+            if not has_new_kconfig and new_blob_ids is not None and mk_fid not in new_blob_ids:
+                continue
             content = MF.get_file(mk_path, gp.Version_Name)
             if not content:
                 continue
-            mk_fid = get_fid_for_path(mk_path)
             dir_path = os.path.dirname(mk_path)
             bindings = kbuild_parser.parse_makefile_content(content, dir_path=dir_path)
             for b in bindings:
@@ -5111,7 +5407,7 @@ def processing_file_references(version: str) -> None:
         return
 
     # Ensure all parent tables (m_file_blob, m_file_name, m_bridge_checkpoint) are committed before referencing
-    G.TE.commit_all(update_in_mem_indexes=False)
+    G.TE.commit_all()
 
     scope = _new_version_blob_ids()
     valid_blob_ids, new_blob_ids = scope if scope is not None else (None, None)
@@ -5188,13 +5484,21 @@ def processing_maintainer_files(version: str) -> None:
         return
 
     matcher = MaintainerMatcher(sections)
+    if not matcher.exact_index and not matcher.dir_prefix_map and not matcher.general_rules:
+        logger.info(f"No file patterns (F:) found in MAINTAINERS for version '{version}', skipping file matching.")
+        return
 
+    maintainers_blob_id = gp.file_blob_ids.get("MAINTAINERS")
     sec_id_cache: dict[str, int | None] = {}
 
     def get_sec_id_for_name(name: str) -> int | None:
         if name in sec_id_cache:
             return sec_id_cache[name]
-        sec_row = m_maintainer_section.get(None, None, name, None, None, None, None, None)
+        sec_row = None
+        if maintainers_blob_id is not None:
+            sec_row = m_maintainer_section.get(None, maintainers_blob_id, name, None, None, None, None, None)
+        if not sec_row:
+            sec_row = m_maintainer_section.get(None, None, name, None, None, None, None, None)
         if sec_row and len(sec_row) >= 3 and sec_row[2]:
             sec_id = sec_row[2][0]
             sec_id_cache[name] = sec_id

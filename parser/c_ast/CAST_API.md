@@ -50,7 +50,7 @@ STAGE 2: RELATIONAL CHANGESET EXTRACTION & 5-TIER TAG EVOLUTION
 CSExtractor.extract_zone(CS, main_zone) -> main_zone.extract(CS) (cs_extractor.py, cursor_tree.py)
   │
   ├── Tag Lifecycle Initialization: get_prior_tags(CS) (tag_tracker.py)
-  │     └── Queries m_bridge_tag + m_tag -> Inverted hash, name, pos, anchor, & symbol indices
+  │     └── Resolves prior tags & symbol items via worker batch pre-fetch cache (`CS._batch_prior_tags`, `CS._batch_prior_items`) or queries m_bridge_tag + m_tag -> Inverted hash, name, pos, anchor, & symbol indices
   │
   ├── AST Definition & Child Container Staging:
   │     ├── C_Type:
@@ -514,8 +514,8 @@ class Zone_Type(IntEnum):
   - `resolve_cppro_scopes()`: Links preprocessor conditional branches to terminating `#endif`.
 - **Extraction Protocol (`Zone.extract(CS)`)**:
   - Suppresses dummy parameter container creation for explicit empty parameter lists `(void)` when parameter type is `C_void` and has no identifier name.
-  - For `C_Type` child nodes, executes `item.extract(CS)` directly (allowing `C_Type` to stage internal `REF_POS`/`REF_NO_REF`/`REF_MULTI` routes).
-  - For all other child nodes (`Ast_Statement`, `CPPro`, comments, assembly), wraps execution in `with CS(REF_NO_REF): item.extract(CS)`.
+  - For `C_Type` child nodes, executes `item.extract(CS, create_tag=create_tags)` directly (allowing `C_Type` to stage internal `REF_POS`/`REF_NO_REF`/`REF_MULTI` routes).
+  - For all other child nodes (`Ast_Statement`, `CPPro`, comments, assembly), wraps execution in `with CS(REF_NO_REF): item.extract(CS, create_tag=create_tags)`. All AST node subclasses accept `create_tag: bool = True` and pass it down to `extract_1arg` and `tag()`, preventing 1-line tag creation inside nested function and struct zones when `create_tags=False`.
 - **Hot-Loop Token Dispatch & Scope Optimization**:
   - `check_exec` and `within_range` avoid temporary list allocations (`[z for z in self.zones if not z.completed]`) by checking the tail zone (`self.zones[-1]`) first and short-circuiting generator expressions `any(not z.completed for z in self.zones)`.
   - Child attributes (`need_processing`, `paren_depth`, `zones`) are accessed directly rather than through `getattr()`.

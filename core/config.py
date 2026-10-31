@@ -135,7 +135,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "mailing_list": {
         "storage_dir": "/srv/lore",
         "port": 8192,
-        "batch_size": 200,
+        "batch_size": 50,
+        "request_timeout": 180,
+        "daemon_max_rss_mb": 1024,
+        "daemon_max_concurrent": 4,
         "auto_start_daemon": True,
         "ssh_tunnel": {
             "enabled": False,
@@ -478,7 +481,10 @@ def load_config(config_path: str | Path | None = None) -> dict[str, dict[str, An
     ml_sec = merged["mailing_list"]
     ml_sec.setdefault("storage_dir", "/srv/lore")
     ml_sec.setdefault("port", 8192)
-    ml_sec.setdefault("batch_size", 200)
+    ml_sec.setdefault("batch_size", 50)
+    ml_sec.setdefault("request_timeout", 180)
+    ml_sec.setdefault("daemon_max_rss_mb", 1024)
+    ml_sec.setdefault("daemon_max_concurrent", 4)
     ml_sec.setdefault("auto_start_daemon", True)
     if "ssh_tunnel" not in ml_sec or not isinstance(ml_sec["ssh_tunnel"], dict):
         ml_sec["ssh_tunnel"] = copy.deepcopy(DEFAULT_CONFIG["mailing_list"]["ssh_tunnel"])

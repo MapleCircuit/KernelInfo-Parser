@@ -72,13 +72,18 @@ def get_prior_tags(CS: Any) -> None:
         return
     old_fid = bf_row[2][2]
 
-    # 3-way join: m_bridge_tag (6 cols) -> m_tag (5 cols) -> m_ast (3 cols) = 14 cols
-    joins = (
-        (m_bridge_tag.tag_id, m_tag.tag_id, 1),
-        (m_tag.ast_id, m_ast.ast_id, 1),
-    )
-    cols = (old_fid,) + (None,) * 13
-    CS.prior_tags = m_bridge_tag.view_get_multiple(joins, *cols)
+    # Check batch cache first before executing individual DB query
+    batch_tags = getattr(CS, "_batch_prior_tags", None)
+    if batch_tags is not None and old_fid in batch_tags:
+        CS.prior_tags = batch_tags[old_fid]
+    else:
+        # 3-way join: m_bridge_tag (6 cols) -> m_tag (5 cols) -> m_ast (3 cols) = 14 cols
+        joins = (
+            (m_bridge_tag.tag_id, m_tag.tag_id, 1),
+            (m_tag.ast_id, m_ast.ast_id, 1),
+        )
+        cols = (old_fid,) + (None,) * 13
+        CS.prior_tags = m_bridge_tag.view_get_multiple(joins, *cols)
 
     if not CS.prior_tags:
         return

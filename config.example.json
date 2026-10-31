@@ -39,7 +39,10 @@
   "mailing_list": {
     "storage_dir": "/srv/lore",
     "port": 8192,
-    "batch_size": 200,
+    "batch_size": 50,
+    "request_timeout": 180,
+    "daemon_max_rss_mb": 1024,
+    "daemon_max_concurrent": 4,
     "auto_start_daemon": true,
     "ssh_tunnel": {
       "enabled": false,

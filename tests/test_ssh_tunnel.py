@@ -37,10 +37,18 @@ class TestSSHTunnelConfig(unittest.TestCase):
     """Test configuration loading and precedence rules for SSH tunnel."""
 
     def setUp(self) -> None:
+        import copy
+        import core.config
+        self._orig_cfg = copy.deepcopy(core.config._ACTIVE_CONFIG)
+        self._orig_cfg_path = core.config._LOADED_CONFIG_PATH
         reset_config()
 
     def tearDown(self) -> None:
+        import copy
+        import core.config
         reset_config()
+        core.config._ACTIVE_CONFIG = copy.deepcopy(self._orig_cfg)
+        core.config._LOADED_CONFIG_PATH = self._orig_cfg_path
 
     def test_default_config_disabled(self) -> None:
         """SSH tunnel must be disabled by default in built-in configuration."""
@@ -130,12 +138,31 @@ class TestSSHTunnelManager(unittest.TestCase):
     """Test SSH command generation and lifecycle execution."""
 
     def setUp(self) -> None:
+        import copy
+        import core.config
+        import core.ssh_tunnel
+        self._orig_env = dict(os.environ)
+        self._orig_cfg = copy.deepcopy(core.config._ACTIVE_CONFIG)
+        self._orig_cfg_path = core.config._LOADED_CONFIG_PATH
+        self._orig_tunnels = dict(core.ssh_tunnel._TUNNELS)
+        self._orig_global = core.ssh_tunnel._GLOBAL_TUNNEL
+        core.ssh_tunnel._TUNNELS = {}
+        core.ssh_tunnel._GLOBAL_TUNNEL = None
         reset_config()
-        stop_ssh_tunnel()
 
     def tearDown(self) -> None:
+        import copy
+        import core.config
+        import core.ssh_tunnel
         stop_ssh_tunnel()
+        core.ssh_tunnel._TUNNELS.clear()
+        core.ssh_tunnel._TUNNELS.update(self._orig_tunnels)
+        core.ssh_tunnel._GLOBAL_TUNNEL = self._orig_global
         reset_config()
+        os.environ.clear()
+        os.environ.update(self.original_env if hasattr(self, "original_env") else self._orig_env)
+        core.config._ACTIVE_CONFIG = copy.deepcopy(self._orig_cfg)
+        core.config._LOADED_CONFIG_PATH = self._orig_cfg_path
 
     def test_find_free_port(self) -> None:
         """_find_free_port should return a valid unbound ephemeral port."""

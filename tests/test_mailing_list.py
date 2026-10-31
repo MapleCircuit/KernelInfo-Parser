@@ -9,7 +9,7 @@ import time
 import unittest
 import urllib.request
 import zlib
-from http.server import HTTPServer
+from http.server import HTTPServer, ThreadingHTTPServer
 from pathlib import Path
 
 from parser.mailing_list.ml_types import (
@@ -311,8 +311,8 @@ class MockStore:
     def lookup_by_blob(self, blob_sha: str) -> list[SmsgRecord]:
         return self.blob_map.get(blob_sha, [])
 
-    def lookup_thread(self, tid: int) -> list[SmsgRecord]:
-        return self.threads.get(tid, [])
+    def lookup_thread(self, tid: int, limit: int = 1000, offset: int = 0) -> list[SmsgRecord]:
+        return self.threads.get(tid, [])[offset : offset + limit]
 
     get_thread_by_tid = lookup_thread
 
@@ -369,12 +369,17 @@ class MockStore:
             "raw": f"From: {rec.author}\nSubject: {rec.subject}\n\nMock body content\n",
         }
 
-    def get_thread_messages(self, tid):
+    def get_thread_messages(self, tid, limit=1000, offset=0):
         thread = self.threads.get(tid, [])
+        total = len(thread)
+        thread = thread[offset : offset + limit]
         return {
             "tid": tid,
             "subject": thread[0].subject if thread else "",
-            "total": len(thread),
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+            "truncated": (offset + len(thread)) < total,
             "participants": list({r.author for r in thread}),
             "messages": [
                 {
@@ -731,6 +736,574 @@ class TestServerClientHTTPRoundTrip(unittest.TestCase):
             data = json.loads(resp.read().decode("utf-8"))
             self.assertGreaterEqual(data.get("total", 0), 1)
             self.assertEqual(data.get("results")[0]["message_id"], "http.test@example.org")
+
+
+class TestMemoryBounds(unittest.TestCase):
+    """Query results must stay proportional to the page, not to the archive.
+
+    The archive this runs against holds 22M messages in a 19GB overview database, where
+    one unbounded fetch exhausted the host's RAM and got the daemon OOM-killed.
+    """
+
+    def setUp(self):
+        self.test_dir = tempfile.TemporaryDirectory()
+        self.storage_dir = Path(self.test_dir.name)
+        conn = sqlite3.connect(str(self.storage_dir / "over.sqlite3"))
+        conn.execute(
+            "CREATE TABLE over (num INTEGER PRIMARY KEY, tid INTEGER, sid INTEGER, "
+            "ts INTEGER, ds INTEGER, ddd BLOB)"
+        )
+        conn.execute("CREATE TABLE id2num (id TEXT PRIMARY KEY, num INTEGER)")
+        # One thread of 40 messages, newest last.
+        for i in range(40):
+            subj = f"[PATCH {i}/40] subsystem: change number {i}"
+            ddd = zlib.compress(
+                f"{subj}\nDev <dev@example.org>\n\nTo\nCc\n{'a' * 40}\nmid{i}@example.org\n100\n5\n".encode()
+            )
+            conn.execute(
+                "INSERT INTO over (num, tid, sid, ts, ds, ddd) VALUES (?, ?, ?, ?, ?, ?)",
+                (i + 1, 7, 1, 1600000000 + i, 1600000000 + i, ddd),
+            )
+            conn.execute("INSERT INTO id2num (id, num) VALUES (?, ?)", (f"mid{i}@example.org", i + 1))
+        conn.commit()
+        conn.close()
+        self.store = PublicInboxLocalStore(self.storage_dir)
+
+    def tearDown(self):
+        self.store.close()
+        self.test_dir.cleanup()
+
+    def test_thread_fetch_is_bounded_and_reports_real_total(self):
+        self.assertEqual(self.store.count_thread_messages(7), 40)
+        page = self.store.get_thread_by_tid(7, limit=10)
+        self.assertEqual(len(page), 10)
+        data = self.store.get_thread_messages(7, limit=10)
+        self.assertEqual(len(data["messages"]), 10)
+        self.assertEqual(data["total"], 40, "total must be the real thread size")
+        self.assertTrue(data["truncated"])
+
+    def test_thread_fetch_cap_cannot_be_exceeded_by_a_caller(self):
+        from parser.mailing_list.ml_store import MAX_THREAD_MESSAGES
+
+        page = self.store.get_thread_by_tid(7, limit=MAX_THREAD_MESSAGES * 100)
+        self.assertLessEqual(len(page), MAX_THREAD_MESSAGES)
+
+    def test_thread_offset_pages_without_overlap(self):
+        first = self.store.get_thread_by_tid(7, limit=10, offset=0)
+        second = self.store.get_thread_by_tid(7, limit=10, offset=10)
+        self.assertEqual(len(second), 10)
+        self.assertFalse({r.num for r in first} & {r.num for r in second})
+
+    def test_search_page_size_is_independent_of_offset(self):
+        """A deep page must not materialize everything skipped before it."""
+        shallow = self.store.search_emails(query="", limit=5, offset=0)
+        deep = self.store.search_emails(query="", limit=5, offset=30)
+        self.assertEqual(len(shallow["results"]), 5)
+        self.assertEqual(len(deep["results"]), 5)
+        self.assertFalse(
+            {r["num"] for r in shallow["results"]} & {r["num"] for r in deep["results"]},
+            "offset must be applied by the query, not by slicing a fetched list",
+        )
+
+    def test_search_clamps_hostile_limit_and_offset(self):
+        from parser.mailing_list.ml_store import MAX_SEARCH_LIMIT, MAX_SEARCH_OFFSET
+
+        out = self.store.search_emails(query="", limit=10_000_000, offset=10 ** 12)
+        self.assertEqual(out["limit"], MAX_SEARCH_LIMIT)
+        self.assertEqual(out["offset"], MAX_SEARCH_OFFSET)
+        self.assertLessEqual(len(out["results"]), MAX_SEARCH_LIMIT)
+
+    def test_search_reports_has_more(self):
+        page = self.store.search_emails(query="", limit=5, offset=0)
+        self.assertTrue(page["has_more"])
+        tail = self.store.search_emails(query="", limit=5, offset=38)
+        self.assertFalse(tail["has_more"])
+
+    def test_cat_file_payload_rejects_implausible_size(self):
+        """A desynchronized cat-file stream must not be handed a huge read()."""
+        from parser.mailing_list.ml_store import MAX_RAW_EMAIL_BYTES
+
+        class _Proc:
+            class stdout:
+                @staticmethod
+                def read(n):
+                    raise AssertionError("read() must not be called for a bogus size")
+
+        with self.assertRaises(ValueError):
+            PublicInboxLocalStore._read_cat_payload(_Proc(), MAX_RAW_EMAIL_BYTES + 1, keep=1024)
+        with self.assertRaises(ValueError):
+            PublicInboxLocalStore._read_cat_payload(_Proc(), -5, keep=1024)
+
+    def test_cat_file_payload_drains_oversized_body_without_keeping_it(self):
+        """The tail beyond `keep` is consumed to resync, not retained."""
+        body = b"x" * 4096
+
+        class _Proc:
+            def __init__(self):
+                self.buf = body + b"\n"
+
+            class _Out:
+                def __init__(self, outer):
+                    self.outer = outer
+
+                def read(self, n):
+                    chunk = self.outer.buf[:n]
+                    self.outer.buf = self.outer.buf[n:]
+                    return chunk
+
+            @property
+            def stdout(self):
+                if not hasattr(self, "_out"):
+                    self._out = self._Out(self)
+                return self._out
+
+        proc = _Proc()
+        kept = PublicInboxLocalStore._read_cat_payload(proc, len(body), keep=100)
+        self.assertEqual(len(kept), 100)
+        self.assertEqual(proc.buf, b"", "payload tail and trailing LF must be consumed")
+
+
+class TestXapianSerialization(unittest.TestCase):
+    """A xapian.Database is not thread-safe: searching must hold the store lock.
+
+    Concurrent searches on the shared handle abort the daemon process inside
+    libxapian, so `execute_xapian` and `parse_query` must serialize on `_qp_lock`.
+    """
+
+    class _FakeMSet(list):
+        """Stands in for a xapian.MSet, which is a sequence plus match estimates."""
+
+        def get_matches_estimated(self) -> int:
+            return len(self)
+
+    @staticmethod
+    def _bare_store() -> PublicInboxLocalStore:
+        """A store with only the Xapian attributes set, bypassing on-disk discovery."""
+        store = object.__new__(PublicInboxLocalStore)
+        store._qp_lock = threading.Lock()
+        store.xap_db = object()
+        store.qp = None
+        store.get_by_mid = lambda mid: None
+        return store
+
+    def test_execute_xapian_holds_lock_while_searching(self):
+        import parser.mailing_list.ml_store as ml_store
+
+        held: list[bool] = []
+        store = self._bare_store()
+
+        class _FakeEnquire:
+            def __init__(self, db):
+                held.append(store._qp_lock.locked())
+
+            def set_query(self, q):
+                pass
+
+            def set_weighting_scheme(self, w):
+                pass
+
+            def set_sort_by_value(self, slot, reverse):
+                pass
+
+            def get_mset(self, start, limit):
+                held.append(store._qp_lock.locked())
+                return TestXapianSerialization._FakeMSet()
+
+        class _FakeXapian:
+            Enquire = _FakeEnquire
+            DatabaseModifiedError = RuntimeError
+
+            @staticmethod
+            def BoolWeight():
+                return None
+
+        orig_xapian, orig_has = ml_store.xapian, ml_store.HAS_XAPIAN
+        ml_store.xapian, ml_store.HAS_XAPIAN = _FakeXapian, True
+        try:
+            self.assertEqual(store.execute_xapian(object(), limit=5), [])
+        finally:
+            ml_store.xapian, ml_store.HAS_XAPIAN = orig_xapian, orig_has
+
+        self.assertEqual(held, [True, True], "Xapian search ran without holding _qp_lock")
+        self.assertFalse(store._qp_lock.locked(), "lock was not released")
+
+    def test_parse_query_holds_lock(self):
+        import parser.mailing_list.ml_store as ml_store
+
+        seen: list[bool] = []
+
+        class _FakeQP:
+            def parse_query(self, q, flags=None):
+                seen.append(store._qp_lock.locked())
+                return "query"
+
+        store = self._bare_store()
+        store.qp = _FakeQP()
+
+        orig_has = ml_store.HAS_XAPIAN
+        orig_xapian = ml_store.xapian
+        ml_store.HAS_XAPIAN, ml_store.xapian = True, object()
+        try:
+            self.assertEqual(store.parse_query("s:test"), "query")
+            self.assertEqual(store.parse_query("s:test", 3), "query")
+        finally:
+            ml_store.HAS_XAPIAN, ml_store.xapian = orig_has, orig_xapian
+
+        self.assertEqual(seen, [True, True], "parse_query ran without holding _qp_lock")
+        self.assertFalse(store._qp_lock.locked())
+
+
+class TestBlobQueryConstruction(unittest.TestCase):
+    """A blob term must never reach Xapian as a bare prefix.
+
+    A deleted file has no post-image, and the extractor represents it as an empty
+    string. `"".startswith("0000000")` is False, so the old guard let the term become
+    the bare prefix `XDFPOST`, whose wildcard expands to every blob term in the
+    archive: over a gigabyte per commit, which grew the daemon until the kernel killed
+    it, and a candidate list so broad it could produce false BlobHash matches.
+    """
+
+    class _FakeQuery:
+        OP_OR = "OR"
+        OP_WILDCARD = "WILDCARD"
+        WILDCARD_LIMIT_FIRST = "FIRST"
+        built: list[tuple] = []
+
+        def __init__(self, op, arg, *rest):
+            type(self).built.append((op, arg, rest))
+            self.op, self.arg, self.rest = op, arg, rest
+
+    def setUp(self):
+        import parser.mailing_list.ml_resolver as mr
+
+        self.mr = mr
+        self._orig = mr.xapian
+        self._FakeQuery.built = []
+
+        class _FakeXapian:
+            Query = self._FakeQuery
+
+        mr.xapian = _FakeXapian
+
+    def tearDown(self):
+        self.mr.xapian = self._orig
+
+    def test_empty_and_placeholder_blobs_are_rejected(self):
+        norm = KernelCommitEmailResolver._normalize_blob
+        self.assertEqual(norm(""), "")
+        self.assertEqual(norm(None), "")
+        self.assertEqual(norm("0" * 40), "")
+        self.assertEqual(norm("0000000"), "")
+        self.assertEqual(norm("abc"), "", "too short to be selective")
+        self.assertEqual(norm("zzzznothex1234"), "")
+        self.assertEqual(norm("DEADBEEF12345678"), "deadbeef12345678")
+
+    def test_deletion_falls_back_to_the_pre_image(self):
+        """A deletion has no post-image, so its pre-image term is used instead."""
+        pre = "a" * 40
+        queries = KernelCommitEmailResolver.blob_queries_for([(pre, "", "fs/removed.c")])
+        self.assertEqual(len(queries), 1)
+        patterns = [arg for op, arg, _ in self._FakeQuery.built if op == "WILDCARD"]
+        self.assertEqual(patterns, ["XDFPRE" + pre[:10]])
+
+    def test_no_query_is_built_when_both_sides_are_missing(self):
+        self.assertEqual(KernelCommitEmailResolver.blob_queries_for([("", "", "x.c")]), [])
+        self.assertEqual(KernelCommitEmailResolver.blob_queries_for([("0" * 40, "", "x.c")]), [])
+        self.assertEqual(self._FakeQuery.built, [])
+
+    def test_bare_prefix_wildcard_is_never_constructed(self):
+        blobs = [
+            ("b" * 40, "", "deleted.c"),          # deletion
+            ("", "c" * 40, "added.c"),            # addition
+            ("d" * 40, "e" * 40, "modified.c"),   # modification
+            ("", "", "nothing.c"),                # neither side
+            ("0" * 40, "0" * 40, "zeroes.c"),     # placeholders
+        ]
+        KernelCommitEmailResolver.blob_queries_for(blobs)
+        patterns = [arg for op, arg, _ in self._FakeQuery.built if op == "WILDCARD"]
+        for pattern in patterns:
+            self.assertNotIn(pattern, ("XDFPOST", "XDFPRE"), "bare prefix wildcard built")
+            self.assertGreater(
+                len(pattern.replace("XDFPOST", "").replace("XDFPRE", "")),
+                KernelCommitEmailResolver.MIN_BLOB_PREFIX - 1,
+            )
+
+    def test_probe_count_is_capped(self):
+        blobs = [("", f"{i:040x}", f"f{i}.c") for i in range(1, 40)]
+        queries = KernelCommitEmailResolver.blob_queries_for(blobs)
+        self.assertEqual(len(queries), KernelCommitEmailResolver.MAX_BLOB_PROBES)
+
+    def test_wildcard_expansion_is_bounded(self):
+        """Every wildcard carries an expansion limit, whatever the pattern looks like."""
+        KernelCommitEmailResolver.blob_queries_for([("", "f" * 40, "x.c")])
+        wildcards = [(arg, rest) for op, arg, rest in self._FakeQuery.built if op == "WILDCARD"]
+        self.assertEqual(len(wildcards), 1)
+        _arg, rest = wildcards[0]
+        self.assertEqual(rest[0], KernelCommitEmailResolver.MAX_WILDCARD_EXPANSION)
+        self.assertEqual(rest[1], "FIRST")
+
+
+class TestDaemonMemoryGuard(unittest.TestCase):
+    """The daemon must refuse work rather than become the host's OOM victim."""
+
+    def test_soft_limit_refuses_heavy_requests(self):
+        from parser.mailing_list.ml_server import MemoryGuard
+        import parser.mailing_list.ml_server as ml_server
+
+        guard = MemoryGuard(max_rss_mb=100)
+        orig = ml_server.current_rss_mb
+        try:
+            ml_server.current_rss_mb = lambda: 10.0
+            self.assertIsNone(guard.check("/resolve_batch"), "well under the limit must pass")
+            ml_server.current_rss_mb = lambda: 80.0
+            self.assertEqual(guard.check("/resolve_batch"), 80.0, "above 75% must be reported")
+        finally:
+            ml_server.current_rss_mb = orig
+
+    def test_peak_is_tracked_for_health(self):
+        from parser.mailing_list.ml_server import MemoryGuard
+        import parser.mailing_list.ml_server as ml_server
+
+        guard = MemoryGuard(max_rss_mb=1000)
+        orig = ml_server.current_rss_mb
+        try:
+            ml_server.current_rss_mb = lambda: 42.0
+            guard.observe()
+            ml_server.current_rss_mb = lambda: 17.0
+            guard.observe()
+        finally:
+            ml_server.current_rss_mb = orig
+        self.assertEqual(guard.peak_mb, 42.0)
+
+    def test_heap_limit_is_applied(self):
+        """RLIMIT_DATA turns a runaway allocation into a MemoryError, mid-request."""
+        import resource as res
+        from parser.mailing_list.ml_server import MemoryGuard
+
+        original = res.getrlimit(res.RLIMIT_DATA)
+        try:
+            MemoryGuard(max_rss_mb=512).apply_heap_limit()
+            soft, _hard = res.getrlimit(res.RLIMIT_DATA)
+            self.assertNotEqual(soft, res.RLIM_INFINITY, "heap must be bounded")
+            self.assertLessEqual(soft, int((512 + 256) * 1024 * 1024))
+        finally:
+            res.setrlimit(res.RLIMIT_DATA, original)
+
+    def test_resolve_batch_defers_under_memory_pressure(self):
+        """A stop predicate must defer the rest of the batch, like the time budget."""
+        store = MockStore()
+        resolver = KernelCommitEmailResolver(store)
+        feats = [
+            CommitFeatures(commit_hash=f"cc{i:038d}", subject=f"net: pressure {i}", author_name="Ida")
+            for i in range(6)
+        ]
+        results, pending = resolver.resolve_batch_until(feats, deadline=None, should_stop=lambda: True)
+        self.assertEqual(len(pending), 5)
+        self.assertEqual(pending, [c.sha for c in feats[1:]])
+
+
+class TestResolveBatchTimeBudget(unittest.TestCase):
+    """Time-budget deferral in the resolver and adaptive chunk retry in the client."""
+
+    @staticmethod
+    def _features(count: int, prefix: str = "ab") -> list:
+        return [
+            CommitFeatures(
+                commit_hash=f"{prefix}{i:038d}",
+                subject=f"net: budget test {i}",
+                author_name="Grace",
+                author_email="grace@example.org",
+                author_date=1600000000,
+            )
+            for i in range(count)
+        ]
+
+    def test_resolver_defers_commits_past_deadline(self):
+        """An exhausted budget returns partial results plus the deferred SHAs."""
+        store = MockStore()
+        resolver = KernelCommitEmailResolver(store)
+        feats = self._features(5)
+
+        # Deadline already elapsed: first commit still runs, the rest are deferred.
+        results, pending = resolver.resolve_batch_until(feats, deadline=time.monotonic() - 1.0)
+        self.assertEqual(len(pending), 4)
+        self.assertEqual(pending, [c.sha for c in feats[1:]])
+        self.assertNotIn(feats[1].sha, results)
+
+    def test_resolver_no_deadline_processes_everything(self):
+        store = MockStore()
+        resolver = KernelCommitEmailResolver(store)
+        feats = self._features(3)
+        _results, pending = resolver.resolve_batch_until(feats, deadline=None)
+        self.assertEqual(pending, [])
+
+    def _make_client(self, port: int, batch_size: int, timeout: float) -> MailingListClient:
+        """Build a tunnel-mode client bound to a local stub daemon, bypassing _init_backend."""
+        client = object.__new__(MailingListClient)
+        client.cfg = {}
+        client.git_dir = ""
+        client.storage_dir = "/srv/lore"
+        client.port = port
+        client.batch_size = batch_size
+        client.request_timeout = timeout
+        client.auto_start = False
+        client.tunnel_cfg = {}
+        client.use_tunnel = True
+        client._in_process_resolver = None
+        client._effective_port = port
+        return client
+
+    def test_client_splits_chunk_on_timeout(self):
+        """A chunk that times out is halved and retried instead of aborting the run."""
+        slow_threshold = 4
+        seen_sizes: list[int] = []
+
+        class _StubHandler(MLServerRequestHandler):
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length", 0))
+                req = json.loads(self.rfile.read(length).decode("utf-8"))
+                commits = req.get("commits", [])
+                seen_sizes.append(len(commits))
+                if len(commits) >= slow_threshold:
+                    # Simulate a daemon too slow to answer within the client timeout.
+                    time.sleep(2.0)
+                try:
+                    self._send_json(200, {"count": 0, "results": {}, "pending": []})
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+
+            def log_message(self, fmt, *args):
+                pass
+
+        # Threaded, so the abandoned slow request does not block the retries behind it.
+        server = ThreadingHTTPServer(("127.0.0.1", 0), _StubHandler)
+        server.daemon_threads = True
+        server.resolver = None
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            client = self._make_client(server.server_port, batch_size=4, timeout=1.0)
+            client.resolve_commits(self._features(4, prefix="cd"))
+        finally:
+            server.shutdown()
+            server.server_close()
+
+        self.assertEqual(seen_sizes[0], 4)
+        self.assertTrue(seen_sizes[1:], "timed-out chunk was never retried")
+        self.assertTrue(all(n < slow_threshold for n in seen_sizes[1:]))
+        self.assertEqual(sum(seen_sizes[1:]), 4)
+
+    def test_client_requeues_pending_shas(self):
+        """SHAs the daemon defers are re-sent in smaller chunks and still resolved."""
+        requests: list[int] = []
+
+        class _StubHandler(MLServerRequestHandler):
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length", 0))
+                req = json.loads(self.rfile.read(length).decode("utf-8"))
+                commits = req.get("commits", [])
+                requests.append(len(commits))
+                # First call resolves one commit and defers the rest; later calls resolve all.
+                if len(requests) == 1:
+                    head, tail = commits[:1], commits[1:]
+                else:
+                    head, tail = commits, []
+                results = {
+                    c["sha"]: ResolvedCommitContext(
+                        commit_sha=c["sha"],
+                        matched_tier=int(MLMatchTier.Trailer),
+                        patch_email=SmsgRecord(num=1, tid=5, subject="[PATCH] x", mids=["m@e.org"]),
+                    ).to_dict()
+                    for c in head
+                }
+                self._send_json(200, {
+                    "count": len(results),
+                    "results": results,
+                    "pending": [c["sha"] for c in tail],
+                })
+
+            def log_message(self, fmt, *args):
+                pass
+
+        server = HTTPServer(("127.0.0.1", 0), _StubHandler)
+        server.resolver = None
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            client = self._make_client(server.server_port, batch_size=4, timeout=10.0)
+            feats = self._features(4, prefix="ef")
+            results = client.resolve_commits(feats)
+        finally:
+            server.shutdown()
+            server.server_close()
+
+        self.assertEqual(len(results), 4)
+        self.assertGreater(len(requests), 1)
+
+    def test_client_shrinks_chunk_on_503_backpressure(self):
+        """A daemon refusing work for memory reasons must shrink the request, not fail."""
+        sizes: list[int] = []
+
+        class _StubHandler(MLServerRequestHandler):
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length", 0))
+                req = json.loads(self.rfile.read(length).decode("utf-8"))
+                commits = req.get("commits", [])
+                sizes.append(len(commits))
+                if len(commits) > 1:
+                    self._send_json(503, {"error": "above memory soft limit"})
+                else:
+                    self._send_json(200, {"count": 0, "results": {}, "pending": []})
+
+            def log_message(self, fmt, *args):
+                pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), _StubHandler)
+        server.daemon_threads = True
+        server.resolver = None
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            client = self._make_client(server.server_port, batch_size=4, timeout=10.0)
+            client.BACKPRESSURE_SLEEP = 0.0
+            results = client.resolve_commits(self._features(4, prefix="bp"))
+        finally:
+            server.shutdown()
+            server.server_close()
+
+        self.assertEqual(results, {})
+        self.assertEqual(sizes[0], 4)
+        self.assertEqual(sizes[-1], 1, "chunks must shrink to single commits under backpressure")
+        self.assertEqual(sizes.count(1), 4, "every commit must still be attempted")
+
+    def test_client_sends_budget_below_timeout(self):
+        """The daemon budget must be strictly below the client socket timeout."""
+        captured: list[float] = []
+
+        class _StubHandler(MLServerRequestHandler):
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length", 0))
+                req = json.loads(self.rfile.read(length).decode("utf-8"))
+                captured.append(float(req.get("budget_s", 0)))
+                self._send_json(200, {"count": 0, "results": {}, "pending": []})
+
+            def log_message(self, fmt, *args):
+                pass
+
+        server = HTTPServer(("127.0.0.1", 0), _StubHandler)
+        server.resolver = None
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            client = self._make_client(server.server_port, batch_size=10, timeout=100.0)
+            client.resolve_commits(self._features(2, prefix="01"))
+        finally:
+            server.shutdown()
+            server.server_close()
+
+        self.assertEqual(len(captured), 1)
+        self.assertGreater(captured[0], 0.0)
+        self.assertLess(captured[0], 100.0)
 
 
 if __name__ == "__main__":

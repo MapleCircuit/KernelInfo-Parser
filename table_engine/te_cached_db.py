@@ -159,6 +159,8 @@ class TECachedDB(TEDirectDB):
         for table in self.tables.values():
             if not getattr(table, "te_cached", False):
                 continue
+            if table.table_name in self.CARRIED_TABLES:
+                continue
             min_vid = min_active_vid if (self._is_version_scoped(table) and min_active_vid > 0) else None
             try:
                 size = self.db.table_size(table, getattr(table, "cached_columns", None), min_vid)
@@ -803,7 +805,8 @@ class TECachedDB(TEDirectDB):
                     lookup_val = bytes(val) if isinstance(val, (bytearray, memoryview)) else val
                     candidates = col_dict.get(lookup_val)
                     if candidates is None:
-                        return None
+                        best_candidates = None
+                        break
                     if best_candidates is None or len(candidates) < len(best_candidates):
                         best_candidates = candidates
 
@@ -811,39 +814,61 @@ class TECachedDB(TEDirectDB):
                 for row in best_candidates:
                     if self._match_columns(table, row, columns):
                         return row
-                if self._is_version_scoped(table) and self.db is not None:
-                    return self._db_read((table_id,), self.db.select, table, columns)
-                return None
+
+            # If not matched in staged index, check shared buffer if table is preloaded
+            if self._shared_buffer is not None and self._shared_buffer.contains_table(table_id):
+                shared_row = self._shared_buffer.scan_matching(table_id, columns)
+                if shared_row is not None:
+                    return shared_row
+
+            if self._is_version_scoped(table) and self.db is not None:
+                return self._db_read((table_id,), self.db.select, table, columns)
+            return None
 
         # 4. In-Memory Linear Scan Fallback with Hoisted Filters
-        non_none_filters = [
-            (i, bytes(val) if isinstance(val, (bytearray, memoryview)) else val)
-            for i, val in enumerate(columns)
-            if val is not None
-        ]
-        if not non_none_filters:
-            if self._cached_rows[table_id]:
-                return self._cached_rows[table_id][0]
-        else:
-            cached_cols = getattr(table, "cached_columns", None)
-            is_full_cached = cached_cols is None or len(cached_cols) == table.length
-            for row in self._cached_rows[table_id]:
-                if is_full_cached:
-                    match = True
-                    for i, match_val in non_none_filters:
-                        if row[i] != match_val:
-                            match = False
-                            break
-                    if match:
-                        return row
-                else:
+        has_shared = self._shared_buffer is not None and self._shared_buffer.contains_table(table_id)
+        is_shared_view = isinstance(self._cached_rows.get(table_id), SharedTableRowSequenceView)
+
+        if is_shared_view:
+            # Cached rows is a view over shared buffer: first scan appended rows, then shared buffer
+            view = self._cached_rows[table_id]
+            if getattr(view, "_appended", None):
+                for row in view._appended:
                     if self._match_columns(table, row, columns):
                         return row
+            if has_shared:
+                shared_row = self._shared_buffer.scan_matching(table_id, columns)
+                if shared_row is not None:
+                    return shared_row
+        else:
+            non_none_filters = [
+                (i, bytes(val) if isinstance(val, (bytearray, memoryview)) else val)
+                for i, val in enumerate(columns)
+                if val is not None
+            ]
+            if not non_none_filters:
+                if self._cached_rows[table_id]:
+                    return self._cached_rows[table_id][0]
+            else:
+                cached_cols = getattr(table, "cached_columns", None)
+                is_full_cached = cached_cols is None or len(cached_cols) == table.length
+                for row in self._cached_rows[table_id]:
+                    if is_full_cached:
+                        match = True
+                        for i, match_val in non_none_filters:
+                            if row[i] != match_val:
+                                match = False
+                                break
+                        if match:
+                            return row
+                    else:
+                        if self._match_columns(table, row, columns):
+                            return row
 
-        if self._shared_buffer is not None:
-            shared_row = self._shared_buffer.scan_matching(table_id, columns)
-            if shared_row is not None:
-                return shared_row
+            if has_shared:
+                shared_row = self._shared_buffer.scan_matching(table_id, columns)
+                if shared_row is not None:
+                    return shared_row
 
         if self._is_version_scoped(table) and self.db is not None:
             return self._db_read((table_id,), self.db.select, table, columns)
@@ -860,16 +885,18 @@ class TECachedDB(TEDirectDB):
         """
         key = self._sanitize_key(columns[1:])
         assigned_id = self._nodup_index.get(table_id, {}).get(key)
-        if assigned_id is None:
-            assigned_id = self._committed_nodup_keys.get(table_id, {}).get(key)
         if assigned_id is not None:
             return assigned_id
+        keys_map = self._committed_nodup_keys.get(table_id)
+        if keys_map is not None and key in keys_map:
+            return keys_map[key]
         if table_id in self._nodup_complete or self.db is None:
             return None
         table = self.tables[table_id]
         filter_cols = (None, *columns[1:]) + (None,) * (table.length - len(columns))
         row = self._db_read((table_id,), self.db.select, table, filter_cols)
         if not row:
+            self._committed_nodup_keys.setdefault(table_id, {})[key] = None
             return None
         self._committed_nodup_keys.setdefault(table_id, {})[key] = row[0]
         return row[0]

@@ -533,6 +533,7 @@ class GreatProcessor:
         ast_type_idx = m_bridge_tag.length + m_tag.length + m_ast.type_id[1]
 
         sym_map: dict[tuple[str, int], int] = {}
+        tag_ids: list[int] = []
         for row in rows:
             if len(row) >= total_cols:
                 ast_id = row[ast_id_idx]
@@ -540,6 +541,39 @@ class GreatProcessor:
                 ast_type = row[ast_type_idx]
                 if ast_name and ast_id:
                     sym_map[(ast_name, ast_type)] = ast_id
+                tid = row[m_bridge_tag.tag_id[1]]
+                if tid:
+                    tag_ids.append(tid)
+
+        # Include definitions stored per blob (m_blob_symbol_def)
+        from core.DBLayout import m_blob_symbol_def, m_tag_def, m_blob_symbol
+        if m_blob_symbol_def.table_id in te.tables:
+            b_defs = te.get_in(m_blob_symbol_def.table_id, m_blob_symbol_def.blob_id[1], (fid,)) or ()
+            for r in b_defs:
+                if len(r) > m_blob_symbol_def.type_id[1]:
+                    d_ast_id = r[m_blob_symbol_def.ast_id[1]]
+                    d_name = r[m_blob_symbol_def.name[1]]
+                    d_type = r[m_blob_symbol_def.type_id[1]]
+                    if isinstance(d_name, (bytes, bytearray)):
+                        d_name = d_name.decode("utf-8", "replace")
+                    if d_name and d_ast_id:
+                        sym_map[(d_name, d_type)] = d_ast_id
+
+        # Include definitions stored once per tag (m_tag_def + m_blob_symbol)
+        if tag_ids and m_tag_def.table_id in te.tables and m_blob_symbol.table_id in te.tables:
+            t_defs = te.get_in(m_tag_def.table_id, m_tag_def.tag_id[1], tag_ids) or ()
+            for r in t_defs:
+                if len(r) > m_tag_def.type_id[1]:
+                    key = r[m_tag_def.sym_key[1]]
+                    d_name = r[m_tag_def.name[1]]
+                    d_type = r[m_tag_def.type_id[1]]
+                    bs_row = te.get(m_blob_symbol.table_id, (fid, key, None, None))
+                    if bs_row and len(bs_row) >= 3 and bs_row[2]:
+                        d_ast_id = bs_row[2][m_blob_symbol.target_ast_id[1]] if isinstance(bs_row[2], (list, tuple)) else bs_row[2]
+                        if isinstance(d_name, (bytes, bytearray)):
+                            d_name = d_name.decode("utf-8", "replace")
+                        if d_name and d_ast_id:
+                            sym_map[(d_name, d_type)] = d_ast_id
 
         if complete_blob:
             self._store_blob_symbols(fid, sym_map)

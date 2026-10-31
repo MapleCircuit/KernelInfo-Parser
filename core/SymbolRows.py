@@ -194,16 +194,29 @@ def record_def(CS: Any, tag_ref: Any, ast_ref: Any, name: str, type_id: int, lin
 def load_prior_items(CS: Any, tag_ids: Iterable[int]) -> None:
     """Load the stored items of the previous version's tags (compared with a recycled tag's current items)."""
     ids = sorted({int(t) for t in tag_ids if isinstance(t, int)})
-    if not ids or getattr(G, "TE", None) is None or not hasattr(G.TE, "get_in"):
+    if not ids:
         return
     col = collector(CS)
-    refs: dict[int, Counter] = {t: Counter() for t in ids}
-    defs: dict[int, Counter] = {t: Counter() for t in ids}
-    for tag_id, _idx, key, role, rel_line, char_s in G.TE.get_in(m_tag_ref.table_id, 0, ids):
+    batch_cache = getattr(CS, "_batch_prior_items", None)
+    missing_ids = []
+    if batch_cache is not None:
+        for tag_id in ids:
+            if tag_id in batch_cache:
+                col.prior_items[tag_id] = batch_cache[tag_id]
+            else:
+                missing_ids.append(tag_id)
+    else:
+        missing_ids = ids
+
+    if not missing_ids or getattr(G, "TE", None) is None or not hasattr(G.TE, "get_in"):
+        return
+    refs: dict[int, Counter] = {t: Counter() for t in missing_ids}
+    defs: dict[int, Counter] = {t: Counter() for t in missing_ids}
+    for tag_id, _idx, key, role, rel_line, char_s in G.TE.get_in(m_tag_ref.table_id, 0, missing_ids):
         refs.setdefault(tag_id, Counter())[(key, role, rel_line, char_s)] += 1
-    for tag_id, _idx, key, name, type_id, linkage, rel_s, rel_e in G.TE.get_in(m_tag_def.table_id, 0, ids):
+    for tag_id, _idx, key, name, type_id, linkage, rel_s, rel_e in G.TE.get_in(m_tag_def.table_id, 0, missing_ids):
         defs.setdefault(tag_id, Counter())[(key, _decode(name), type_id, linkage, rel_s, rel_e)] += 1
-    for tag_id in ids:
+    for tag_id in missing_ids:
         col.prior_items[tag_id] = (refs[tag_id], defs[tag_id])
 
 
@@ -378,12 +391,18 @@ def finish(CS: Any) -> None:
         plans.append((p, refs, defs))
 
     def _targets() -> dict[int, set[Any]]:
-        found: dict[int, set[Any]] = {}
+        raw: dict[int, set[tuple[Any, Any]]] = {}
         for _p, refs, defs in plans:
             for key, item in refs:
-                found.setdefault(key, set()).add((ctx.fingerprint(item[0]), ctx.fingerprint(item[1])))
+                raw.setdefault(key, set()).add((item[0], item[1]))
             for key, item in defs:
-                found.setdefault(key, set()).add((ctx.fingerprint(item[0]), ctx.fingerprint(0)))
+                raw.setdefault(key, set()).add((item[0], 0))
+        found: dict[int, set[Any]] = {}
+        for key, targets in raw.items():
+            if len(targets) <= 1:
+                found[key] = {0}
+            else:
+                found[key] = {(ctx.fingerprint(t0), ctx.fingerprint(t1)) for t0, t1 in targets}
         return found
 
     # A key meaning two different targets in this blob (e.g. a shadowed local) cannot be resolved by one

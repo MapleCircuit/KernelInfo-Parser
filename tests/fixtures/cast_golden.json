@@ -369,8 +369,8 @@
   },
   "include/linux/drbd_tag_magic.h": {
     "full": {
-      "ops_count": 428,
-      "ops_hash": "0bdb9ac67e6ba5c4a9876a8adda6f9e9fcc514cb323ab03ec2055a154e89f299",
+      "ops_count": 438,
+      "ops_hash": "619fd3968c2cf8b68312d0f9efa0a07a25fb4d938f0a6062493c661a399e12d3",
       "store_hashes": {
         "m_ast": "63ed68c4c3136c7b",
         "m_ast_attribute": "e6aa9f1419c4c926",
@@ -378,20 +378,20 @@
         "m_ast_hash": "b48cfe2fb7dcf8fc",
         "m_ast_include": "107e56826ce9d3d2",
         "m_bridge_checkpoint": "028ab3525e29917f",
-        "m_bridge_map": "15e83172cc8ac62a",
-        "m_bridge_tag": "d9f1cebfcdeaa715",
+        "m_bridge_map": "fff469225647fe67",
+        "m_bridge_tag": "e8bcf15351dd4723",
         "m_file_blob": "6360ee821b923e75",
         "m_file_name": "f36789109d30e66d",
-        "m_map_ast": "40ade7dfae8b2bf4",
-        "m_symbol_def": "935dadca977b10c5",
-        "m_symbol_ref": "ca1f4c9677468ed1",
-        "m_tag": "0b1e867a1cdf0786",
-        "m_tag_code": "4c1616634a593480"
+        "m_map_ast": "5f10f43cf4054c6e",
+        "m_symbol_def": "5811f1f6e891b0da",
+        "m_symbol_ref": "1bc08cb593258920",
+        "m_tag": "ea4ec18daf8d21f2",
+        "m_tag_code": "83c900745d976780"
       }
     },
     "isolated": {
-      "ops_count": 429,
-      "ops_hash": "7c749cad31ae4d6011a5606807d8dfc6569bc49ab453a9f4c2b933237fadeb7a",
+      "ops_count": 439,
+      "ops_hash": "23ddda785536c504ff78efb03908d254c352b4facbc18a1a5a6d229d2c1d9d19",
       "store_hashes": {
         "m_ast": "c63effb880b7af0c",
         "m_ast_attribute": "9f1ad2cde21424d4",
@@ -399,15 +399,15 @@
         "m_ast_hash": "bd0e27e9e3f51922",
         "m_ast_include": "bb85cd96fa5c2eb1",
         "m_bridge_checkpoint": "028ab3525e29917f",
-        "m_bridge_map": "15e83172cc8ac62a",
-        "m_bridge_tag": "d9f1cebfcdeaa715",
+        "m_bridge_map": "fff469225647fe67",
+        "m_bridge_tag": "e8bcf15351dd4723",
         "m_file_blob": "6360ee821b923e75",
         "m_file_name": "2f9b938d588910ca",
-        "m_map_ast": "9ae79387f5670cfc",
-        "m_symbol_def": "4590ef88b12342ca",
-        "m_symbol_ref": "9d215fd5cd922d04",
-        "m_tag": "a71c6926b0752615",
-        "m_tag_code": "4c1616634a593480"
+        "m_map_ast": "fea87cd9d915a481",
+        "m_symbol_def": "853fb10fd85b8c63",
+        "m_symbol_ref": "2a9e79425cbfa41b",
+        "m_tag": "8866cd51e166018d",
+        "m_tag_code": "83c900745d976780"
       }
     }
   },
@@ -545,8 +545,8 @@
   },
   "kernel/sched.c": {
     "full": {
-      "ops_count": 32910,
-      "ops_hash": "9cd0be03ae3cec39906de9773d87c0d3deed02f8b734d0adc44e82930ffca625",
+      "ops_count": 32915,
+      "ops_hash": "eb8ab8be2b5d526cc52670910899bf11cdd9f1d54fd6d23ad187f88edb697716",
       "store_hashes": {
         "m_ast": "a17700c1ea568932",
         "m_ast_attribute": "ef8539dc8f4371fb",
@@ -554,20 +554,20 @@
         "m_ast_hash": "c34b2b1d4195816b",
         "m_ast_include": "748286b02726f5ce",
         "m_bridge_checkpoint": "028ab3525e29917f",
-        "m_bridge_map": "afaabe75202e273b",
-        "m_bridge_tag": "a1d2a4085e18665b",
+        "m_bridge_map": "7e82046186590faa",
+        "m_bridge_tag": "378bf5a911c9dec4",
         "m_file_blob": "6360ee821b923e75",
         "m_file_name": "9392c6cbb1fa3a37",
-        "m_map_ast": "db68b4cba65ccf5c",
-        "m_symbol_def": "227466943c9e4fdd",
-        "m_symbol_ref": "3a1bad160f435496",
-        "m_tag": "131a5a5877993fe7",
-        "m_tag_code": "80f4ae887f954642"
+        "m_map_ast": "01d87897f6ee7434",
+        "m_symbol_def": "d350fb0dfe171b79",
+        "m_symbol_ref": "17a1774b8f4195dc",
+        "m_tag": "453d81eac778b4ab",
+        "m_tag_code": "4bea9af3ff90e79c"
       }
     },
     "isolated": {
-      "ops_count": 25891,
-      "ops_hash": "589ac8ffd80b87eec85bcddd1cd96c8f34cc8e3dfeb0a99da1b02fa366967fd2",
+      "ops_count": 25896,
+      "ops_hash": "4937af106da05da038e51fb3f02ff5f3b0ddb77f4dd4cbf4d851c84e711ba699",
       "store_hashes": {
         "m_ast": "99a473f7f5bb5767",
         "m_ast_attribute": "9ba1adcdb66a8365",
@@ -575,15 +575,15 @@
         "m_ast_hash": "5ae20feb8e610a33",
         "m_ast_include": "dde5a60e898b48e4",
         "m_bridge_checkpoint": "028ab3525e29917f",
-        "m_bridge_map": "2e2b4280347d5411",
-        "m_bridge_tag": "c633a780e3140e33",
+        "m_bridge_map": "20ff68576b8cae22",
+        "m_bridge_tag": "72e408abece4e7e1",
         "m_file_blob": "6360ee821b923e75",
-        "m_file_name": "1ead9cdf5e98f535",
-        "m_map_ast": "1e16077a0ef27362",
-        "m_symbol_def": "cad1c93294e1b472",
-        "m_symbol_ref": "c088caebba064c15",
-        "m_tag": "8abf54f26190ce6a",
-        "m_tag_code": "569a954c079cc080"
+        "m_file_name": "af6fb15fb28912a9",
+        "m_map_ast": "fd6e6c2a4bcc8365",
+        "m_symbol_def": "373da7287b769512",
+        "m_symbol_ref": "42a3076c03fb3b31",
+        "m_tag": "7f2e0d14179b8cea",
+        "m_tag_code": "44a347822d037337"
       }
     }
   },

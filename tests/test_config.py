@@ -31,13 +31,21 @@ from webapp.main import DatabaseManager
 
 class TestConfigManagement(unittest.TestCase):
     def setUp(self) -> None:
+        import copy
+        import core.config
+        self._orig_cfg = copy.deepcopy(core.config._ACTIVE_CONFIG)
+        self._orig_cfg_path = core.config._LOADED_CONFIG_PATH
         reset_config()
         self.original_env = dict(os.environ)
 
     def tearDown(self) -> None:
+        import copy
+        import core.config
         reset_config()
         os.environ.clear()
         os.environ.update(self.original_env)
+        core.config._ACTIVE_CONFIG = copy.deepcopy(self._orig_cfg)
+        core.config._LOADED_CONFIG_PATH = self._orig_cfg_path
 
     def test_default_config_fallback(self) -> None:
         """When no config file or env vars exist, defaults are used."""
@@ -271,11 +279,13 @@ class TestConfigManagement(unittest.TestCase):
         mf = MasterFile()
         # Test with mock git command output
         # git tag --sort=v:refname with versionsort.suffix=-rc orders candidates before their release
-        mock_output = "v3.0-rc1\nv3.0-rc2\nv3.0\nv3.1-rc1\nv3.1\nv3.2\nv3.3\n"
+        mock_output = "assoc-array-fixes\nv2.6.11-tree\nv3.0-rc1\nv3.0-rc2\nv3.0\nv3.1-rc1\nv3.1\nv3.2\nv3.3\n"
         with mock.patch("subprocess.run") as mock_run:
             mock_run.return_value = mock.MagicMock(returncode=0, stdout=mock_output)
-            # Default: release candidates are included in version order
+            # Default: release candidates are included in version order, non-release tags are filtered out
             tags = mf.get_version_tags(start_ref="v3.0")
+            self.assertNotIn("assoc-array-fixes", tags)
+            self.assertNotIn("v2.6.11-tree", tags)
             self.assertIn("v3.1-rc1", tags)
             self.assertLess(tags.index("v3.1-rc1"), tags.index("v3.1"))
 

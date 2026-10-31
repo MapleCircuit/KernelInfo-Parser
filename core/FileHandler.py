@@ -1,10 +1,13 @@
 """FileHandler.py - Interacts with the FS and GIT."""
 import os
+import re
 import shutil
 import tempfile
 import subprocess as sp
 from pathlib import Path
 from core.globalstuff import G, is_safe_git_rev, is_safe_git_spec
+
+_VERSION_TAG_RE = re.compile(r"^v?\d+(?:\.\d+)*(?:-(?:rc|alpha|beta|pre)\d*)?$")
 
 
 class MasterFile:
@@ -410,8 +413,9 @@ class MasterFile:
         if include_pre_releases is None:
             include_pre_releases = True
 
-        # "-tree" tags (e.g. v2.6.11-tree) point at trees, not commits
-        raw_tags = [t for t in raw_tags if not t.endswith("-tree")]
+        # Filter for canonical version release tags (e.g. v2.6.12, v3.0, v6.12.1, v2.6.12-rc2).
+        # Excludes non-release topic tags (e.g. assoc-array-fixes) and tree tags (v2.6.11-tree).
+        raw_tags = [t for t in raw_tags if not t.endswith("-tree") and _VERSION_TAG_RE.match(t)]
         if not include_pre_releases:
             tags = [t for t in raw_tags if not any(pre in t for pre in ("-rc", "-alpha", "-beta", "-pre"))]
             if not tags:
@@ -448,7 +452,7 @@ class MasterFile:
         points_at = set(self._git_lines("tag", "--points-at", start))
         descendants = set(self._git_lines("tag", "--contains", start)) - points_at
         # Name the snapshot after a tag on that exact commit even when pre-release tags are filtered out
-        exact = sorted(t for t in points_at if not t.endswith("-tree"))
+        exact = sorted(t for t in points_at if not t.endswith("-tree") and _VERSION_TAG_RE.match(t))
         first = exact[0] if exact else start
         return [first] + [t for t in tags if t in descendants]
 

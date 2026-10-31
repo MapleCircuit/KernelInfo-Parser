@@ -534,12 +534,27 @@ class ChangeSet:
                             if name_id is not None:
                                 return to_safe_data(name_id)
 
+                    # Fast-path check via shared memory symbol buffer
+                    if scoped_syms is not None:
+                        exact_id = scoped_syms.get_symbol(safe_sym_name, safe_sym_type) if hasattr(scoped_syms, "get_symbol") else None
+                        if exact_id is not None:
+                            return to_safe_data(exact_id)
+                        notbind_id = scoped_syms.get_symbol(safe_sym_name, safe_notbind_type) if hasattr(scoped_syms, "get_symbol") else None
+                        if notbind_id is not None:
+                            return to_safe_data(notbind_id)
+                        name_id = scoped_syms.get_name(safe_sym_name) if hasattr(scoped_syms, "get_name") else None
+                        if name_id is not None:
+                            return to_safe_data(name_id)
+
                     # Exact match check via TE with negative query caching
                     gp_neg_cache = getattr(self.gp, "_ast_negative_cache", None) if self.gp else None
                     neg_key = (safe_sym_name, safe_sym_type) if safe_sym_name is not None else None
                     is_neg_cached = bool(gp_neg_cache is not None and neg_key in gp_neg_cache)
 
-                    if not is_neg_cached:
+                    is_worker = bool(self.gp and getattr(self.gp, "_is_worker", False))
+                    skip_db_lookup = is_neg_cached or is_worker
+
+                    if not skip_db_lookup:
                         res = G.TE.get(m_ast.table_id, (None, safe_sym_name, safe_sym_type))
                         if res is not None and len(res) > query[1] and res[query[1]] is not None:
                             found_id = res[query[1]]
@@ -565,6 +580,8 @@ class ChangeSet:
                             found_id = res[query[1]]
                             if gp_staged_names is not None:
                                 gp_staged_names[safe_sym_name] = found_id
+                            if gp_staged_syms is not None and safe_sym_type is not None:
+                                gp_staged_syms[(safe_sym_name, safe_sym_type)] = found_id
                             return to_safe_data(found_id)
 
                         # Record miss in negative cache

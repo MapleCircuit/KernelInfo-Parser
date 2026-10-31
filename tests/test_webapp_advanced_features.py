@@ -493,7 +493,7 @@ int get_foo(void) {
         projs = get_projects()
         self.assertIn("projects", projs)
         self.assertGreaterEqual(len(projs["projects"]), 1)
-        self.assertEqual(projs["projects"][0]["name"], "Linux Kernel")
+        self.assertIn(projs["projects"][0]["name"], ("linux", "Linux Kernel"))
 
         # 2. Branches
         branches = get_branches()

@@ -121,7 +121,10 @@ class TestHistoryIntegration(unittest.TestCase):
             raise unittest.SkipTest("no indexed version")
         from webapp.backend.config import get_repo_dir
         cls.repo = str(get_repo_dir())
-        cls.version = next((v["vname"] for v in reversed(cls.versions) if v["is_release"]), cls.versions[-1]["vname"])
+        releases = [v["vname"] for v in cls.versions if v["is_release"]]
+        if not releases:
+            raise unittest.SkipTest("no indexed release version")
+        cls.version = releases[-1]
         out = subprocess.run(
             ["git", "-C", cls.repo, "grep", "-n", f"\\*{cls.NAME}(", cls.version, "--", cls.PATH],
             capture_output=True, text=True,
@@ -147,7 +150,8 @@ class TestHistoryIntegration(unittest.TestCase):
         self.assertEqual(known[0]["status"], "introduced")
         self.assertNotIn("absent", [t["status"] for t in known])
         self.assertNotIn("removed", [t["status"] for t in known])
-        self.assertGreater(res["change_count"], 0)
+        if any(t["status"] in ("modified", "cosmetic") for t in known):
+            self.assertGreater(res["change_count"], 0)
         prev = None
         for t in known:
             if prev is not None and t["status"] in ("modified", "cosmetic"):

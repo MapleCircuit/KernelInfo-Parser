@@ -447,6 +447,7 @@ m_kconfig_symbol = Table(
     initial_insert=((0, "", 0, "", "", "", 0),),
     no_duplicate=True,
     te_cached=True,
+    indexes=(("kc_sym_name_idx", ("name",)),),
     hashing_table=False,
 )
 

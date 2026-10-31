@@ -33,6 +33,17 @@ logger = logging.getLogger(__name__)
 # is never filtered, so those messages stay findable.
 FUTURE_DATE_SKEW_SECONDS = 3600
 
+# Memory ceilings. The archive holds tens of millions of messages, so any query whose
+# result set is proportional to the archive (or to how deep a client pages) must be
+# bounded: one unbounded fetch is enough to exhaust a shared host's RAM.
+MAX_THREAD_MESSAGES = 1000      # messages unpacked for a single thread
+COVER_LETTER_SCAN = 200         # head of a thread examined when hunting a cover letter
+MAX_SEARCH_LIMIT = 200          # page size accepted from a caller
+MAX_SEARCH_OFFSET = 5_000_000   # how deep paging may go before it is clamped
+MAX_SEARCH_SCAN = 20_000        # rows scanned by the non-Xapian substring fallback
+MAX_RAW_EMAIL_BYTES = 32 << 20  # single blob read from `git cat-file --batch`
+SQLITE_CACHE_KIB = 8_000        # page cache per connection (thread-local handles)
+
 
 class PublicInboxLocalStore:
     """Direct read-only interface to public-inbox SQLite, Xapian shards, and all.git."""
@@ -188,6 +199,11 @@ class PublicInboxLocalStore:
         try:
             conn.execute("PRAGMA busy_timeout = 60000;")
             conn.execute("PRAGMA query_only = ON;")
+            # Bound per-connection memory: handles are thread-local, so an unbounded
+            # page cache would multiply by the number of daemon request threads.
+            conn.execute(f"PRAGMA cache_size = -{SQLITE_CACHE_KIB};")
+            # Spill ORDER BY sorters to disk instead of growing the heap.
+            conn.execute("PRAGMA temp_store = FILE;")
         except Exception:
             pass
         return conn
@@ -251,6 +267,22 @@ class PublicInboxLocalStore:
                 else:
                     raise
         return db.execute(sql, params)
+
+    def close_thread_handles(self) -> None:
+        """Close this thread's SQLite handles.
+
+        Handles are thread-local and the daemon serves each request on a new thread, so
+        without this every request would leave two open connections (and their page
+        caches) behind for the life of the process.
+        """
+        for attr in ("over_db", "msgmap_db"):
+            db = getattr(self._local, attr, None)
+            if db is not None:
+                try:
+                    db.close()
+                except Exception as exc:
+                    logger.debug("Error closing thread-local %s: %s", attr, exc)
+                setattr(self._local, attr, None)
 
     def close(self) -> None:
         """Safely close open databases and processes."""
@@ -388,10 +420,35 @@ class PublicInboxLocalStore:
             pass
         return None
 
-    def get_thread_by_tid(self, tid: int) -> list[SmsgRecord]:
-        """Fetch all non-ghost messages in a thread ordered chronologically."""
+    def count_thread_messages(self, tid: int) -> int:
+        """Number of non-ghost messages in a thread (indexed count, no row unpacking)."""
+        if tid <= 0:
+            return 0
+        try:
+            cursor = self._execute_query(
+                self.over_db,
+                "SELECT count(*) FROM over WHERE tid = ? AND num > 0",
+                (tid,),
+            )
+            row = cursor.fetchone()
+            return int(row[0]) if row else 0
+        except Exception as exc:
+            logger.debug("Thread count failed for tid %d: %s", tid, exc)
+            return 0
+
+    def get_thread_by_tid(
+        self, tid: int, limit: int = MAX_THREAD_MESSAGES, offset: int = 0
+    ) -> list[SmsgRecord]:
+        """Fetch non-ghost messages in a thread, chronologically and bounded.
+
+        A thread is unbounded in principle (this archive's largest holds over 12,000
+        messages), and every row carries a compressed overview blob, so the fetch is
+        capped. Series reconstruction only needs the cover letter and the patch's
+        siblings, which sit at the start of the thread.
+        """
         if tid <= 0:
             return []
+        capped = max(1, min(int(limit), MAX_THREAD_MESSAGES))
         cursor = self._execute_query(
             self.over_db,
             """
@@ -399,17 +456,24 @@ class PublicInboxLocalStore:
             FROM over
             WHERE tid = ? AND num > 0
             ORDER BY ds ASC, num ASC
+            LIMIT ? OFFSET ?
             """,
-            (tid,),
+            (tid, capped, max(0, int(offset))),
         )
         rows = cursor.fetchall()
+        if len(rows) >= capped:
+            logger.debug("Thread %d truncated at %d messages", tid, capped)
         return [self._unpack_row(r) for r in rows]
 
-    def search_over_subjects(self, pattern: str, limit: int = 20, scan_limit: int = 500) -> list[SmsgRecord]:
+    def search_over_subjects(
+        self, pattern: str, limit: int = 20, scan_limit: int = 500, offset: int = 0
+    ) -> list[SmsgRecord]:
         """Query over table by subject substring pattern (fallback when Xapian unavailable).
 
         `scan_limit` bounds how many of the newest rows are decompressed and tested, so
         a deep page of results can still be reached without scanning the whole archive.
+        Rows are consumed one at a time and only matches inside the requested page are
+        retained, so memory stays proportional to `limit` rather than to the scan.
         """
         cursor = self._execute_query(
             self.over_db,
@@ -420,47 +484,118 @@ class PublicInboxLocalStore:
             ORDER BY ds DESC
             LIMIT ?
             """,
-            (max(500, scan_limit),),
+            (max(500, min(int(scan_limit), MAX_SEARCH_SCAN)),),
         )
         matches: list[SmsgRecord] = []
         pattern_lower = pattern.lower()
-        for r in cursor.fetchall():
+        skip = max(0, int(offset))
+        seen = 0
+        for r in cursor:
             rec = self._unpack_row(r)
-            if pattern_lower in rec.subject.lower():
-                matches.append(rec)
-                if len(matches) >= limit:
-                    break
+            if pattern_lower not in rec.subject.lower():
+                continue
+            seen += 1
+            if seen <= skip:
+                continue
+            matches.append(rec)
+            if len(matches) >= limit:
+                break
         return matches
 
-    def execute_xapian(self, query: Any, limit: int = 50) -> list[SmsgRecord]:
-        """Execute a Xapian query with automatic reopen() on concurrent writer updates."""
-        if self.xap_db is None or not HAS_XAPIAN or xapian is None:
-            return []
+    def parse_query(self, query_string: str, flags: int | None = None) -> Any:
+        """Parse a query string into a Xapian query under the Xapian lock.
 
+        `xapian.QueryParser` holds a reference to the shared `Database`, which is not
+        thread-safe, so parsing must be serialized along with searching.
+        """
+        if self.qp is None or not HAS_XAPIAN or xapian is None:
+            return None
+        with self._qp_lock:
+            if flags is None:
+                return self.qp.parse_query(query_string)
+            return self.qp.parse_query(query_string, flags)
+
+    def execute_xapian(self, query: Any, limit: int = 50) -> list[SmsgRecord]:
+        """Execute a Xapian query with automatic reopen() on concurrent writer updates.
+
+        A `xapian.Database` is not thread-safe: concurrent searches on the shared handle
+        abort the process inside libxapian. All searching is therefore serialized on
+        `_qp_lock`, and only the matched message IDs are collected while it is held, so
+        the overview lookups that resolve them run outside the critical section.
+        """
+        return self.search_xapian_page(query, limit=limit)[0]
+
+    def search_xapian_page(
+        self, query: Any, limit: int = 50, offset: int = 0
+    ) -> tuple[list[SmsgRecord], int]:
+        """Fetch one page of Xapian matches plus the estimated total match count.
+
+        The offset is applied by Xapian, so a deep page costs what the first one does
+        instead of materializing every record skipped along the way.
+        """
+        if self.xap_db is None or not HAS_XAPIAN or xapian is None or query is None:
+            return [], 0
+
+        mids: list[str] = []
+        estimated = 0
         for attempt in range(2):
             try:
-                enquire = xapian.Enquire(self.xap_db)
-                enquire.set_query(query)
-                enquire.set_weighting_scheme(xapian.BoolWeight())
-                enquire.set_sort_by_value(0, True)
-                mset = enquire.get_mset(0, limit)
+                with self._qp_lock:
+                    enquire = xapian.Enquire(self.xap_db)
+                    enquire.set_query(query)
+                    enquire.set_weighting_scheme(xapian.BoolWeight())
+                    enquire.set_sort_by_value(0, True)
+                    # Xapian applies the offset itself, so a deep page costs the same
+                    # as the first one instead of materializing everything skipped.
+                    mset = enquire.get_mset(max(0, offset), max(1, limit))
+                    estimated = mset.get_matches_estimated()
 
-                results: list[SmsgRecord] = []
-                for match in mset:
-                    for term_item in match.document.termlist():
-                        t = term_item.term.decode("utf-8", errors="replace")
-                        if t.startswith("Q"):
-                            rec = self.get_by_mid(t[1:])
-                            if rec:
-                                results.append(rec)
+                    for match in mset:
+                        for term_item in match.document.termlist():
+                            t = term_item.term.decode("utf-8", errors="replace")
+                            if t.startswith("Q"):
+                                mids.append(t[1:])
                                 break
-                return results
+                break
             except getattr(xapian, "DatabaseModifiedError", Exception):
+                mids.clear()
                 if attempt == 0:
-                    self.xap_db.reopen()
+                    with self._qp_lock:
+                        self.xap_db.reopen()
                 else:
                     raise
-        return []
+
+        results: list[SmsgRecord] = []
+        for mid in mids:
+            rec = self.get_by_mid(mid)
+            if rec:
+                results.append(rec)
+        return results, estimated
+
+    @staticmethod
+    def _read_cat_payload(proc: Any, size: int, keep: int) -> bytes:
+        """Read one `git cat-file --batch` payload, keeping at most `keep` bytes.
+
+        The declared size is validated before allocating: a desynchronized stream makes
+        the header line garbage, and a bogus size would otherwise be handed straight to
+        `read()` as a multi-gigabyte allocation. The remainder of a payload larger than
+        `keep` is drained in chunks so the stream stays in sync without being held in
+        memory, and the trailing newline is consumed.
+        """
+        if size < 0 or size > MAX_RAW_EMAIL_BYTES:
+            raise ValueError(f"implausible blob size {size} from git cat-file")
+
+        kept = bytearray()
+        remaining = size
+        while remaining > 0:
+            chunk = proc.stdout.read(min(remaining, 1 << 20))
+            if not chunk:
+                raise OSError("git cat-file stream ended mid-payload")
+            remaining -= len(chunk)
+            if len(kept) < keep:
+                kept += chunk[: keep - len(kept)]
+        proc.stdout.read(1)  # trailing LF
+        return bytes(kept)
 
     def get_raw_email_headers(self, blob_oid: str) -> dict[str, str]:
         """Read RFC822 email headers from all.git blob OID."""
@@ -477,9 +612,7 @@ class PublicInboxLocalStore:
                 parts = header.split()
                 if len(parts) < 3:
                     return {}
-                size = int(parts[2])
-                payload = proc.stdout.read(size)
-                proc.stdout.read(1)  # trailing LF
+                payload = self._read_cat_payload(proc, int(parts[2]), keep=64 << 10)
 
                 headers: dict[str, str] = {}
                 for line in payload.decode("utf-8", errors="replace").splitlines():
@@ -526,12 +659,19 @@ class PublicInboxLocalStore:
             except Exception as exc:
                 logger.debug("xref3 lookup error for blob %s: %s", clean_sha, exc)
 
+        # The indexed `xref3` lookup above is authoritative wherever the archive is
+        # indexed. This recency scan can only ever match the newest messages, and it
+        # decompresses an overview blob per row (hundreds of random reads per commit on
+        # a multi-gigabyte archive), so it runs only without a Xapian index.
+        if HAS_XAPIAN and self.xap_db is not None:
+            return []
+
         cursor = self._execute_query(
             self.over_db,
             "SELECT num, tid, sid, ts, ds, ddd FROM over WHERE num > 0 ORDER BY ds DESC LIMIT 1000",
         )
         matches: list[SmsgRecord] = []
-        for r in cursor.fetchall():
+        for r in cursor:
             rec = self._unpack_row(r)
             if rec.git_blob and clean_sha in rec.git_blob.lower():
                 matches.append(rec)
@@ -555,9 +695,7 @@ class PublicInboxLocalStore:
                 parts = header.split()
                 if len(parts) < 3:
                     return ""
-                size = int(parts[2])
-                payload = proc.stdout.read(size)
-                proc.stdout.read(1)  # trailing LF
+                payload = self._read_cat_payload(proc, int(parts[2]), keep=MAX_RAW_EMAIL_BYTES)
                 return payload.decode("utf-8", errors="replace")
             except Exception as exc:
                 logger.debug("Failed to read raw email blob %s: %s", clean_oid, exc)
@@ -670,11 +808,21 @@ class PublicInboxLocalStore:
             "patch_total": patch_total,
         }
 
-    def get_thread_messages(self, tid: int) -> dict[str, Any]:
-        """Fetch all messages in a thread with summary metadata and reply structure."""
-        records = self.get_thread_by_tid(tid)
+    def get_thread_messages(
+        self, tid: int, limit: int = MAX_THREAD_MESSAGES, offset: int = 0
+    ) -> dict[str, Any]:
+        """Fetch one page of a thread's messages with summary metadata.
+
+        `total` is the thread's real message count (an indexed count), while `messages`
+        is bounded, so a 12,000-message thread cannot be unpacked into the response.
+        """
+        records = self.get_thread_by_tid(tid, limit=limit, offset=offset)
         if not records:
-            return {"tid": tid, "subject": "", "total": 0, "participants": [], "messages": []}
+            return {
+                "tid": tid, "subject": "", "total": 0, "participants": [],
+                "messages": [], "limit": limit, "offset": offset, "truncated": False,
+            }
+        total = self.count_thread_messages(tid) or len(records)
 
         from datetime import datetime, timezone
         from parser.mailing_list.ml_resolver import extract_patch_metadata
@@ -724,9 +872,12 @@ class PublicInboxLocalStore:
         return {
             "tid": tid,
             "subject": root_subject,
-            "total": len(messages),
+            "total": total,
             "participants": sorted(list(participants)),
             "messages": messages,
+            "limit": limit,
+            "offset": offset,
+            "truncated": (offset + len(messages)) < total,
         }
 
     def search_emails(
@@ -741,21 +892,33 @@ class PublicInboxLocalStore:
         from parser.mailing_list.ml_resolver import extract_patch_metadata
 
         clean_q = (query or "").strip()
+        # The offset is pushed down into Xapian / SQLite instead of being applied to a
+        # materialized list: fetching `limit + offset` records cost ~3GB at offset 2M on
+        # a 22M-message archive, which is what exhausted the host's RAM.
+        limit = max(1, min(int(limit), MAX_SEARCH_LIMIT))
+        offset = max(0, min(int(offset), MAX_SEARCH_OFFSET))
+        # `filter_type` is applied after fetching, so over-fetch a little to keep a
+        # filtered page full, bounded so the over-fetch cannot itself grow unbounded.
+        fetch = limit if filter_type == "all" else min(limit * 4, MAX_SEARCH_LIMIT * 4)
         matched_records: list[SmsgRecord] = []
+        estimated_total = 0
 
         # 1. Try Xapian search if available and query is present
         if clean_q and self.xap_db is not None and HAS_XAPIAN and self.qp is not None and xapian is not None:
             try:
-                x_query = self.qp.parse_query(clean_q)
-                matched_records = self.execute_xapian(x_query, limit=max(200, limit + offset))
+                x_query = self.parse_query(clean_q)
+                matched_records, estimated_total = self.search_xapian_page(
+                    x_query, limit=fetch, offset=offset
+                )
             except Exception as exc:
                 logger.debug("Xapian query error: %s, falling back to SQLite search", exc)
 
         # 2. Fallback to over.sqlite3 substring search
         if not matched_records:
             if clean_q:
-                pool = max(200, limit + offset)
-                matched_records = self.search_over_subjects(clean_q, limit=pool, scan_limit=pool * 4)
+                matched_records = self.search_over_subjects(
+                    clean_q, limit=fetch, scan_limit=MAX_SEARCH_SCAN, offset=offset
+                )
             else:
                 # Empty query: recent messages ordered chronologically, future dates excluded
                 try:
@@ -766,11 +929,11 @@ class PublicInboxLocalStore:
                         FROM over
                         WHERE num > 0 AND (ds IS NULL OR ds <= ?)
                         ORDER BY ds DESC
-                        LIMIT ?
+                        LIMIT ? OFFSET ?
                         """,
-                        (int(time.time()) + FUTURE_DATE_SKEW_SECONDS, max(200, limit + offset)),
+                        (int(time.time()) + FUTURE_DATE_SKEW_SECONDS, fetch, offset),
                     )
-                    matched_records = [self._unpack_row(r) for r in cursor.fetchall()]
+                    matched_records = [self._unpack_row(r) for r in cursor]
                 except Exception as exc:
                     logger.warning("Empty search query failed: %s", exc)
                     matched_records = []
@@ -790,8 +953,12 @@ class PublicInboxLocalStore:
                     continue
             filtered.append(r)
 
-        total = len(filtered)
-        page = filtered[offset : offset + limit]
+        # The fetch above already starts at `offset`, so the page is just the head of
+        # what came back. `total` is Xapian's estimate when available, and otherwise a
+        # lower bound that lets a caller know whether another page exists.
+        page = filtered[:limit]
+        has_more = len(filtered) > limit or len(matched_records) >= fetch
+        total = estimated_total or (offset + len(page) + (1 if has_more else 0))
 
         results: list[dict[str, Any]] = []
         for r in page:
@@ -831,12 +998,16 @@ class PublicInboxLocalStore:
             "total": total,
             "limit": limit,
             "offset": offset,
+            "has_more": has_more,
             "results": results,
         }
 
     def get_cover_letter(self, tid: int) -> SmsgRecord | None:
-        """Find the series cover letter [0/N] in a thread."""
-        thread = self.get_thread_by_tid(tid)
+        """Find the series cover letter [0/N] in a thread.
+
+        A cover letter is the thread root, so only the chronological head is examined.
+        """
+        thread = self.get_thread_by_tid(tid, limit=COVER_LETTER_SCAN)
         for rec in thread:
             if re.search(r"\[[^\]]*\b0+/\d+[^\]]*\]", rec.subject):
                 return rec

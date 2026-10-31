@@ -267,6 +267,7 @@ class GitCommitParser:
         old_rev: str | None,
         new_rev: str,
         limit: int | None = None,
+        known_commit_count: int | None = None,
     ) -> tuple[list[GitCommit], dict[str, list[tuple[int, int, str]]]]:
         """Extract all commits and diff hunks in a single unified git log stream.
 
@@ -274,6 +275,7 @@ class GitCommitParser:
             old_rev: Prior version git ref or tag (if None or empty tree, inspects up to new_rev).
             new_rev: Target version git ref or tag (e.g. 'v3.0').
             limit: Maximum commits to parse.
+            known_commit_count: Optional known commit count for range to avoid duplicate `rev-list --count`.
 
         Returns:
             Tuple of:
@@ -291,7 +293,10 @@ class GitCommitParser:
             if effective_limit is None:
                 # Sizing the range first (seconds even over 1.5M commits) keeps a branch tip far from the
                 # prior release from starving the whole stream on the subprocess timeout
-                range_count = self.count_commits(revision_arg)
+                if known_commit_count is not None and known_commit_count >= 0:
+                    range_count = known_commit_count
+                else:
+                    range_count = self.count_commits(revision_arg)
                 if range_count < 0 or range_count > RANGE_HUNK_COMMIT_CAP:
                     effective_limit = RANGE_HUNK_COMMIT_CAP
                     logger.warning(

@@ -262,9 +262,11 @@ class GlobalStuff:
             for directory in gp_obj.PURGE_LIST:
                 with contextlib.suppress(Exception):
                     shutil.rmtree(directory)
-        with contextlib.suppress(Exception):
-            from core.ssh_tunnel import stop_ssh_tunnel
-            stop_ssh_tunnel()
+        is_unit_test = any(arg in sys.argv for arg in ("-u", "--unit-test")) or "unittest" in sys.modules or "pytest" in sys.modules
+        if not is_unit_test:
+            with contextlib.suppress(Exception):
+                from core.ssh_tunnel import stop_ssh_tunnel
+                stop_ssh_tunnel()
         sys.exit(number_error)
         return
 

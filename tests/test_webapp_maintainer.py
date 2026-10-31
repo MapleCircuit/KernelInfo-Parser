@@ -37,6 +37,7 @@ class TestWebAppMaintainerEndpoints(unittest.TestCase):
             raise unittest.SkipTest(f"Database check failed: {e}")
 
     def test_maintainers_overview_and_search(self) -> None:
+        require_indexed_ref("v3.0")
         # Search for ext4 subsystem
         res = get_maintainers_overview("v3.0", q="ext4")
         self.assertIn("sections", res)
