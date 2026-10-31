@@ -5,7 +5,6 @@ import shutil
 import logging
 import re
 from pathlib import Path
-from core.StringWrangler import wrap_lines, render_ansi_box, render_with_indent
 import contextlib
 import types
 import time
@@ -150,34 +149,17 @@ class GlobalStuff:
         self.CPUS = 8
         # Placeholder until main() / webapp config select the configured repository (core.config.get_repository)
         self.linux_directory = Path(__file__).resolve().parent.parent / "repos" / "linux"
-        self.CLEAN_PRINT = True
-
-        self.BP_ON_SHUTDOWN = False
-        self.BP_ON_REF_FAIL = False
-
         # Active file context for logging
         self.CURRENT_PARSING_FILE: str | None = None
         self.CURRENT_PARSING_DIR: str | None = None
 
-        # FAIL CHECK
-        self.OVERRIDE_FC_MAX_LOOP_EXEC_MULT = 2
-        # FUNCTIONS
-        self.OVERRIDE_CPPRO_CINDEX_INPUT = True
-        # PRINTS
-        # SQL
-        self.OVERRIDE_TABLE_CREATION_PRINT = False
-        # AST
-        self.OVERRIDE_GLOBAL_C_AST = False
-        self.OVERRIDE_C_AST_LINE_PRINT = True
-        self.OVERRIDE_CPPRO_PRINT = True
-        self.OVERRIDE_CINDEX_ERROR_PRINT = True
-        self.OVERRIDE_CINDEX_SKIPPED_PRINT = True
+        self.BP_ON_SHUTDOWN = False
+        self.BP_ON_REF_FAIL = False
 
+        self.OVERRIDE_CPPRO_CINDEX_INPUT = True
+        self.OVERRIDE_TABLE_CREATION_PRINT = False
         self.OVERRIDE_FORCE_AST_DEBUG = False
-        # GIT
         self.OVERRIDE_FORGOTTEN_PRINT = False
-        # General Print
-        self.OVERRIDE_MAX_PRINT_SIZE = 60
 
         # TypeCheck
         self.DEBUG_TYPECHECK = False
@@ -275,25 +257,6 @@ class GlobalStuff:
         """Breakpoint with instructions."""
         sys.breakpointhook()  # noqa: T100
         return
-
-    def string_shortner(self, text: str, mode: str = "boxed+indent") -> str:
-        """Beautify string."""
-        formated_text = ""
-        wrapped_text = wrap_lines(
-            [text],
-            self.OVERRIDE_MAX_PRINT_SIZE + (self.OVERRIDE_MAX_PRINT_SIZE / 2),
-        )
-
-        if mode == "boxed":
-            formated_list = render_ansi_box(wrapped_text)
-        elif mode == "indent":
-            formated_list = render_with_indent(wrapped_text, "    > ")
-        elif mode == "boxed+indent":
-            formated_list = render_ansi_box(render_with_indent(wrapped_text, "    > "))
-
-        for line in formated_list[0]:
-            formated_text = f"{formated_text}\n{line}"
-        return formated_text
 
     def is_PointerType(self, variable: PointerType) -> bool:
         if isinstance(variable, tuple) and len(variable) == 2:  # noqa: PLR2004, SIM102

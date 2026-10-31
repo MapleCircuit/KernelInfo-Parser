@@ -219,13 +219,9 @@ class TestPublicInboxLocalStore(unittest.TestCase):
         self.assertEqual(len(recs), 1)
         self.assertEqual(recs[0].num, 10)
 
-    def test_lookup_thread_and_cover_letter(self):
+    def test_lookup_thread(self):
         thread = self.store.lookup_thread(10)
         self.assertEqual(len(thread), 2)
-        cover = self.store.get_cover_letter(10)
-        self.assertIsNotNone(cover)
-        self.assertEqual(cover.num, 9)
-        self.assertIn("0/2", cover.subj)
 
     def _insert_future_dated_message(self):
         """Add a message whose Date: header is a year ahead of now; returns its Message-ID."""
@@ -315,12 +311,6 @@ class MockStore:
         return self.threads.get(tid, [])[offset : offset + limit]
 
     get_thread_by_tid = lookup_thread
-
-    def get_cover_letter(self, tid: int) -> SmsgRecord | None:
-        for r in self.threads.get(tid, []):
-            if "[patch 0/" in r.subj.lower() or ("[patch v" in r.subj.lower() and " 0/" in r.subj):
-                return r
-        return None
 
     def search_over_subjects(self, pattern: str, limit: int = 20, scan_limit: int = 500) -> list[SmsgRecord]:
         matches = []

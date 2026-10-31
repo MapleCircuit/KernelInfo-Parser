@@ -36,9 +36,8 @@ import logging
 import time
 from operator import itemgetter
 from typing import TYPE_CHECKING, Any, Callable, Sequence
-from types import TracebackType
 
-from core.globalstuff import JoinsType, PointerGetter, SafeDataType
+from core.globalstuff import JoinsType, SafeDataType
 from table_engine.shared_buffer import (
     estimate_packed_bytes,
     SharedTableBuilder,

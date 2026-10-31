@@ -6,7 +6,6 @@ normalized symbols, dependency relations, and menu tree structures into ChangeSe
 from __future__ import annotations
 import logging
 from typing import Any
-from pathlib import Path
 
 from core.globalstuff import (
     G,

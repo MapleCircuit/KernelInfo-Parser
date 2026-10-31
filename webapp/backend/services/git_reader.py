@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import atexit
 import logging
-import os
 from pathlib import Path
 import subprocess
 import threading

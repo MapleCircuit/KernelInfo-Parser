@@ -8,7 +8,6 @@ from __future__ import annotations
 import json
 from enum import Flag, IntEnum
 from typing import Any
-from pathlib import Path
 
 from core.globalstuff import G, ASTT, OP_REF, REF_ROOT, REF_POS, REF_NO_REF, REF_FILE, SymbolRole, SymbolLinkage, compute_code_hash, normalize_repo_path
 from core.DBLayout import (
@@ -30,7 +29,7 @@ from core.SymbolRows import (
     record_def as record_symbol_def,
     register_tag as register_symbol_tag,
 )
-from parser.c_ast.tokenizer import AST_KIND, Line, get_cursor_line
+from parser.c_ast.tokenizer import AST_KIND, Line
 from parser.c_ast.tag_tracker import match_prior_tag_transition
 import clang.cindex as cc
 
@@ -369,11 +368,6 @@ class Ast_ASM_Comment(Ast):
         if parser_obj and hasattr(parser_obj, "rawfile"):
             self.extent.cc(parser_obj.rawfile)
         self.extract_1arg(CS, ASTT.ASM_Comment, self.extent.code[:255], self.extent, create_tag=create_tag)
-
-
-class Ast_Keyword(Ast):
-    """Preserved statement keyword placeholder."""
-    pass
 
 
 # --- Assembly Directives and Instructions ---

@@ -37,7 +37,6 @@ FUTURE_DATE_SKEW_SECONDS = 3600
 # result set is proportional to the archive (or to how deep a client pages) must be
 # bounded: one unbounded fetch is enough to exhaust a shared host's RAM.
 MAX_THREAD_MESSAGES = 1000      # messages unpacked for a single thread
-COVER_LETTER_SCAN = 200         # head of a thread examined when hunting a cover letter
 MAX_SEARCH_LIMIT = 200          # page size accepted from a caller
 MAX_SEARCH_OFFSET = 5_000_000   # how deep paging may go before it is clamped
 MAX_SEARCH_SCAN = 20_000        # rows scanned by the non-Xapian substring fallback
@@ -597,40 +596,6 @@ class PublicInboxLocalStore:
         proc.stdout.read(1)  # trailing LF
         return bytes(kept)
 
-    def get_raw_email_headers(self, blob_oid: str) -> dict[str, str]:
-        """Read RFC822 email headers from all.git blob OID."""
-        with self._cat_lock:
-            proc = self._ensure_cat_proc()
-            if not proc or not proc.stdin or not proc.stdout:
-                return {}
-            try:
-                proc.stdin.write(f"{blob_oid}\n".encode("ascii"))
-                proc.stdin.flush()
-                header = proc.stdout.readline().decode("ascii").strip()
-                if header.endswith("missing"):
-                    return {}
-                parts = header.split()
-                if len(parts) < 3:
-                    return {}
-                payload = self._read_cat_payload(proc, int(parts[2]), keep=64 << 10)
-
-                headers: dict[str, str] = {}
-                for line in payload.decode("utf-8", errors="replace").splitlines():
-                    if not line.strip():
-                        break
-                    if ":" in line and not line.startswith((" ", "\t")):
-                        k, v = line.split(":", 1)
-                        headers[k.strip().lower()] = v.strip()
-                return headers
-            except Exception as exc:
-                logger.debug("Failed to read raw email blob %s: %s", blob_oid, exc)
-                try:
-                    proc.terminate()
-                except Exception:
-                    pass
-                self._cat_proc = None
-                return {}
-
     # Aliases and helper lookups
     lookup_by_mid = get_by_mid
     lookup_thread = get_thread_by_tid
@@ -1001,16 +966,5 @@ class PublicInboxLocalStore:
             "has_more": has_more,
             "results": results,
         }
-
-    def get_cover_letter(self, tid: int) -> SmsgRecord | None:
-        """Find the series cover letter [0/N] in a thread.
-
-        A cover letter is the thread root, so only the chronological head is examined.
-        """
-        thread = self.get_thread_by_tid(tid, limit=COVER_LETTER_SCAN)
-        for rec in thread:
-            if re.search(r"\[[^\]]*\b0+/\d+[^\]]*\]", rec.subject):
-                return rec
-        return None
 
 

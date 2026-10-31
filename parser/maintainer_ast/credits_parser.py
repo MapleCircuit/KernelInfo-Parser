@@ -6,7 +6,6 @@ from the kernel CREDITS file.
 from __future__ import annotations
 import re
 import logging
-from typing import Sequence
 
 from parser.maintainer_ast.maintainer_types import CreditsEntry
 

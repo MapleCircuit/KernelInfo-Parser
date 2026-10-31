@@ -270,15 +270,12 @@ Slot-optimized spatial coordinate carrier (`__slots__ = ("line_pos", "char_pos",
 ### 4.2 Coordinate Fast-Path: `get_cursor_line(cursor: cc.Cursor) -> Line`
 Bypasses Python object allocation when cursor is already annotated; retrieves coordinates via `_CLANG_GET_FILE_LOC` (`clang_getFileLocation`) in 2 C-calls passing `None` for file and offset pointers. Using physical file locations rather than macro expansion spelling locations prevents cross-file coordinate extent drift across macros, while clamping character columns when lines wrap, and caches directly on `cursor._cached_line`.
 
-### 4.3 Extent Token Retrieval: `get_tokens_in_extent(tokens: list[Any], extent: Line) -> list[Any]`
-Performs binary search over contiguous token list using `(s_l, s_c)` coordinates to locate the starting token index in $O(\log N)$ time, followed by a linear sweep bounded by `(e_l, e_c)` to return all tokens overlapping the given spatial extent.
-
-### 4.4 Fast Delimiter Encapsulation: `encapsulate_trailing_delimiter`
+### 4.3 Fast Delimiter Encapsulation: `encapsulate_trailing_delimiter`
 Expands the target `Line` extent to encapsulate trailing punctuation delimiters (`;`, `,`) on the current line or column <= 2 of the immediate next line.
 - **$O(\log N)$ Binary Search Optimization**: Uses `bisect.bisect_left(tokens, e_l, key=_get_tok_start_line)` to directly jump to the first token starting at or after the extent end line `e_l`.
 - Inspects at most 1 to 3 trailing tokens on line `e_l` or `e_l + 1`, eliminating $O(N)$ linear scans from index 0 across thousands of translation unit tokens.
 
-### 4.5 `TokenStream` Architecture
+### 4.4 `TokenStream` Architecture
 - **Initialization Sequence**:
   1. Computes source file range `cc.SourceRange(1:1, filesize_offset)`.
   2. Foreign call `clang_tokenize` fills contiguous C array `tokens_memory`.
@@ -393,7 +390,6 @@ Base class in `cursor_tree.py` for expression and sub-construct containers (`AST
 | `Ast_ASM_Macro` | `ASTT.ASM_Macro` | 83 | `name[:255]` | Assembly macro definition (`.macro ... .endm`). |
 | `Ast_ASM_Instruction`| `ASTT.ASM_Instruction`| 85 | `mnemonic[:255]` | Assembly instruction mnemonic and operands. |
 | `Ast_ASM_Label` | `ASTT.ASM_Label` | 86 | `label[:255]` | Assembly jump or symbol label. |
-| `Ast_Keyword` | `ASTT.C_Keyword` | 3 | None | Statement keyword placeholder. |
 | `Ast_MACRO_INSTANTIATION`| &mdash; | &mdash; | Extent bounds | Macro instantiation carrier node. |
 
 ### 5.6 C Preprocessor Subsystem (`CPPro`) (`ast_nodes.py`)

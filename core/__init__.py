@@ -2,7 +2,6 @@
 
 Exports:
     - Global state, types, and constants (`globalstuff`)
-    - String manipulation and terminal formatting (`StringWrangler`)
     - Git and filesystem working directory manager (`FileHandler`)
     - Multiprocessing IPC and runtime state container (`GreatProcessor`)
     - Relational schema tables and layout (`DBLayout`)
@@ -57,17 +56,6 @@ from core.globalstuff import (
     reclaim_system_memory,
     freeze_system_memory,
     unfreeze_system_memory,
-)
-
-from core.StringWrangler import (
-    wrap_lines,
-    render_ansi_box,
-    render_with_indent,
-    align_columns,
-    tag_lines,
-    group_lines,
-    normalize,
-    listify,
 )
 
 from core.FileHandler import MasterFile
@@ -167,15 +155,6 @@ __all__ = [
     "UnSafeDataType",
     "setup_memory_limit",
     "normalize_repo_path",
-    # StringWrangler
-    "wrap_lines",
-    "render_ansi_box",
-    "render_with_indent",
-    "align_columns",
-    "tag_lines",
-    "group_lines",
-    "normalize",
-    "listify",
     # FileHandler
     "MasterFile",
     # GreatProcessor

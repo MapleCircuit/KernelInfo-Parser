@@ -776,19 +776,3 @@ class Ast_Rust_DocComment(Ast_Rust):
         )
         self.comment_text = comment_text
         self.is_inner = is_inner
-
-
-class Ast_Rust_Comment(Ast_Rust):
-    """Rust general line or block comment."""
-
-    def __init__(
-        self,
-        comment_text: str,
-        extent: Line,
-    ) -> None:
-        super().__init__(
-            name=comment_text.strip(),
-            extent=extent,
-            ast_type=ASTT.Rust_Comment,
-        )
-        self.comment_text = comment_text

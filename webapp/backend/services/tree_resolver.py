@@ -245,53 +245,6 @@ class TreeResolverService:
         if len(self._tree_cache) > self._max_cache_size:
             self._tree_cache.popitem(last=False)
 
-    def resolve_path_to_blob(self, commit_id: int, file_path: str, cursor: Any = None) -> int | None:
-        """Resolve repository path to blob_id at commit_id."""
-        if not file_path:
-            return None
-
-        def _lookup_fnid(cur: Any) -> int | None:
-            cur.execute("SELECT fnid FROM m_file_name WHERE fname = %s LIMIT 1;", (file_path,))
-            r = cur.fetchone()
-            if r:
-                return r["fnid"] if isinstance(r, dict) else r[0]
-            return None
-
-        if cursor is not None:
-            fnid = _lookup_fnid(cursor)
-            return self.resolve_file_blob(commit_id, fnid, cursor) if fnid else None
-
-        with get_db_cursor() as cur:
-            fnid = _lookup_fnid(cur)
-            return self.resolve_file_blob(commit_id, fnid, cur) if fnid else None
-
-    def resolve_tree_paths(self, commit_id: int, cursor: Any = None) -> dict[str, int]:
-        """Resolve full tree as a mapping of relative file path string to blob_id."""
-        fnid_to_blob = self.resolve_tree(commit_id, cursor)
-        if not fnid_to_blob:
-            return {}
-
-        def _map_fnids(cur: Any) -> dict[str, int]:
-            fnids = list(fnid_to_blob.keys())
-            chunk_size = 5000
-            path_map: dict[str, int] = {}
-            for i in range(0, len(fnids), chunk_size):
-                chunk = fnids[i : i + chunk_size]
-                fmt = ",".join(["%s"] * len(chunk))
-                cur.execute(f"SELECT fnid, fname FROM m_file_name WHERE fnid IN ({fmt});", chunk)
-                for r in cur.fetchall():
-                    fid = r["fnid"] if isinstance(r, dict) else r[0]
-                    fname = safe_decode(r["fname"] if isinstance(r, dict) else r[1])
-                    if fid in fnid_to_blob:
-                        path_map[fname] = fnid_to_blob[fid]
-            return path_map
-
-        if cursor is not None:
-            return _map_fnids(cursor)
-
-        with get_db_cursor() as cur:
-            return _map_fnids(cur)
-
 
 BLOB_PATHS_TTL = 120.0
 

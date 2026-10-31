@@ -4284,9 +4284,6 @@ def file_processing(start: int, end: int | None, override_list: list[str] | None
         finally:
             G.CURRENT_PARSING_FILE = None
 
-    if override_list is None:
-        gp.push_set_to_main()
-
     return
 
 

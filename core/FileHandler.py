@@ -374,14 +374,6 @@ class MasterFile:
         ]
         return sp.run(command, capture_output=True, text=True).stdout.splitlines()  # noqa: PLW1510, S603
 
-    def resolve_path(self, file_path: str) -> str:
-        """Convert an absolute working directory path back into a relative repository file path."""
-        for version, working_dir in self.version_dict.items():
-            if file_path.startswith(working_dir):
-                return file_path[len(working_dir)+1:]
-
-        return file_path
-
     def get_version_tags(
         self,
         start_ref: str | None = None,

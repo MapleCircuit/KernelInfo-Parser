@@ -761,11 +761,6 @@ def find_repository_dirs(repos_dir: Path | None = None) -> list[Path]:
     return [child for child in sorted(base.iterdir()) if child.is_dir() and is_git_repository(child)]
 
 
-def detect_repositories(repos_dir: Path | None = None) -> list[dict[str, Any]]:
-    """Detect and describe every Git repository directly under repos_dir."""
-    return [detect_repository(p) for p in find_repository_dirs(repos_dir)]
-
-
 def _missing_repo_keys(entry: dict[str, Any]) -> list[str]:
     return [k for k in REPOSITORY_KEYS if k not in entry]
 

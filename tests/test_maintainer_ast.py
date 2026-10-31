@@ -187,13 +187,14 @@ class TestMaintainerParser(unittest.TestCase):
         self.assertEqual(len(sec1.get_maintainers()), 2)
         self.assertEqual(len(sec1.get_reviewers()), 1)
         self.assertEqual(sec1.get_reviewers()[0].name, "Jan Kara")
-        self.assertEqual(len(sec1.get_file_patterns()), 2)
+        self.assertEqual(len([p for p in sec1.patterns if p.pat_type == PatternType.FILE]), 2)
 
         sec2 = sections[2]
         self.assertEqual(sec2.name, "NETWORKING [GENERAL]")
-        self.assertEqual(len(sec2.get_file_patterns()), 1)
-        self.assertEqual(len(sec2.get_exclude_patterns()), 2)
-        self.assertIn("net/ipv6/", sec2.get_exclude_patterns())
+        self.assertEqual(len([p for p in sec2.patterns if p.pat_type == PatternType.FILE]), 1)
+        sec2_excludes = [p.pattern for p in sec2.patterns if p.pat_type == PatternType.EXCLUDE]
+        self.assertEqual(len(sec2_excludes), 2)
+        self.assertIn("net/ipv6/", sec2_excludes)
 
 
 class TestCreditsParser(unittest.TestCase):

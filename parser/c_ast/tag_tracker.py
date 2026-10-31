@@ -13,7 +13,7 @@ Provides:
 from __future__ import annotations
 from typing import Any
 import logging
-from core.globalstuff import G, ASTT, compute_code_hash, REF_POS, REF_OLD
+from core.globalstuff import ASTT
 from core.DBLayout import m_file_name, m_bridge_file, m_bridge_tag, m_tag, m_ast
 from core.SymbolRows import load_prior_items as load_prior_symbol_items
 

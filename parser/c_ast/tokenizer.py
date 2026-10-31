@@ -267,40 +267,6 @@ def get_cursor_line(cursor: cc.Cursor) -> Line:
     return cl
 
 
-def get_tokens_in_extent(tokens: list[Any], extent: Line) -> list[Any]:
-    """Retrieve all tokens from tokens_array whose extent falls within or overlaps extent."""
-    s_l, e_l = extent.line_pos
-    s_c, e_c = extent.char_pos
-    if not tokens:
-        return []
-
-    # Binary search for start index
-    low = 0
-    high = len(tokens)
-    target = (s_l, s_c)
-    while low < high:
-        mid = (low + high) // 2
-        tok_line = tokens[mid].line
-        mid_pos = (tok_line.line_pos[0], tok_line.char_pos[0])
-        if mid_pos < target:
-            low = mid + 1
-        else:
-            high = mid
-
-    start_idx = max(0, low - 1)
-    res = []
-    for idx in range(start_idx, len(tokens)):
-        tok = tokens[idx]
-        tl = tok.line
-        t_sl, t_el = tl.line_pos
-        t_sc, t_ec = tl.char_pos
-        if t_sl > e_l or (t_sl == e_l and t_sc >= e_c):
-            break
-        if (t_sl > s_l or (t_sl == s_l and t_sc >= s_c)) and (t_el < e_l or (t_el == e_l and t_ec <= e_c)):
-            res.append(tok)
-    return res
-
-
 def _get_tok_start_line(t: Any) -> int:
     return t.line.line_pos[0]
 

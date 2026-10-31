@@ -279,7 +279,6 @@ class ChangeSet:
         self._cached_route: tuple[LinkType, ...] | None = (REF_ROOT,)
         self.prior_tags: Any | None = None
         self.parsers: dict[str, Any] = {}
-        self.debug: list[Any] = []
         self._bridge_maps: set[tuple[Any, Any]] = set()
         self.symbol_dict: dict[tuple[str, int], int] = {}
         self.pending_symbol_refs: list[tuple[Any, int, int, int]] = []
@@ -1443,7 +1442,6 @@ class ChangeSet:
         self.gp = None
         self.mf = None
         self.file = None
-        self.debug = []
         self.parsers = {}
         self.prior_tags = None
         self.prior_tags_map = None
@@ -1583,19 +1581,9 @@ class Table:
         self.hashing_table = hashing_table
         self.has_auto_increment = any(any("AUTO_INCREMENT" in str(elem) for elem in col) for col in self.init_columns)
 
-        # Step 1: Bind column attribute pointers directly onto instance (self.column_name = (table_id, col_idx))
+        # Bind column attribute pointers directly onto instance (self.column_name = (table_id, col_idx))
         for x, column in enumerate(self.init_columns):
             setattr(self, column[0], (self.table_id, x))
-
-        # Step 2: Inject Table object reference into c_ast module scopes for AST parsing
-        if mod_c := sys.modules.get("parser.c_ast.c_ast"):
-            setattr(mod_c, self.table_name, self)
-        if mod_root := sys.modules.get("parser.c_ast"):
-            setattr(mod_root, self.table_name, self)
-
-    def start_te(self) -> None:
-        """Register table schema with active Table Engine (`G.TE`)."""
-        G.TE.start(self, G.DB)
 
     @G.type_check(Self, {UnSafeDataType})
     def set(self, *columns: UnSafeDataType) -> OperationType:

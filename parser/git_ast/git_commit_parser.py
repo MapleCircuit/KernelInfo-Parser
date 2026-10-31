@@ -5,14 +5,13 @@ Extracts commit histories, author/committer information, trailer contributors
 and correlates code occurrence tags (m_tag) to commit revisions.
 """
 import re
-import os
 import bisect
 import subprocess
 import logging
 from pathlib import Path
 from typing import Any, Sequence
 
-from core.globalstuff import G, SafeDataType
+from core.globalstuff import G
 from parser.git_ast.git_types import (
     CommitRole,
     GitContributor,

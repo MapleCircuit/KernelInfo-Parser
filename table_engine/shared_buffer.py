@@ -12,7 +12,6 @@ import ctypes
 import hashlib
 import logging
 import mmap
-import os
 import struct
 import sys
 from typing import Any, Sequence

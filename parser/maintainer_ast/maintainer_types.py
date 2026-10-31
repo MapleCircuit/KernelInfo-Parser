@@ -93,14 +93,6 @@ class MaintainerSection:
         """Return members designated as reviewers."""
         return [m for m in self.members if m.role == MaintainerRole.REVIEWER]
 
-    def get_file_patterns(self) -> list[str]:
-        """Return list of 'F:' file inclusion pattern strings."""
-        return [p.pattern for p in self.patterns if p.pat_type == PatternType.FILE]
-
-    def get_exclude_patterns(self) -> list[str]:
-        """Return list of 'X:' file exclusion pattern strings."""
-        return [p.pattern for p in self.patterns if p.pat_type == PatternType.EXCLUDE]
-
 
 @dataclass(slots=True)
 class CreditsEntry:

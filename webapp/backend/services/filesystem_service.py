@@ -12,7 +12,7 @@ from webapp.backend.database.helpers import (
     format_stat_label,
     get_version_info,
 )
-from webapp.backend.security.jail import resolve_and_verify_repo_path, is_safe_rel_path
+from webapp.backend.security.jail import is_safe_rel_path
 from webapp.backend.security.sql import escape_like
 from webapp.backend.services.git_reader import git_reader
 from webapp.backend.services.tree_resolver import tree_resolver, git_tree_resolver

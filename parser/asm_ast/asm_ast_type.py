@@ -1,7 +1,6 @@
 """parser/asm_ast/asm_ast_type.py - Assembly AST Type Definitions and Node Classes."""
 from __future__ import annotations
 
-from core.globalstuff import ASTT
 from typing import Any
 ChangeSetType = Any
 from parser.c_ast import (

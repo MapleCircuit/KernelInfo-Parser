@@ -195,11 +195,3 @@ class MaintainerMatcher:
 
         self._cache[file_path] = matching_sections
         return matching_sections
-
-    def match_all_files(self, file_paths: Sequence[str]) -> dict[str, list[MaintainerSection]]:
-        """Batch match a collection of file paths against all sections."""
-        results: dict[str, list[MaintainerSection]] = {}
-        for path in file_paths:
-            cleaned = path.strip().lstrip("/")
-            results[cleaned] = self.match_file(cleaned)
-        return results

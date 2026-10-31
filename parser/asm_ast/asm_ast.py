@@ -5,9 +5,7 @@ Provides fast, accurate AST extraction for .S and .s assembly source files.
 from __future__ import annotations
 
 import time
-import ctypes
 from pathlib import Path
-from typing import TYPE_CHECKING
 import clang.cindex as cc
 
 from core.SymbolRows import finish as finish_symbol_rows

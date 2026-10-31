@@ -91,9 +91,6 @@ class KconfigEvaluator:
         self._clear()
 
     # ------------------------------------------------------------------ expressions
-    def _leaf_is_defined(self, node: list[Any]) -> bool:
-        return node[0] == "s" and node[1] in self.syms and self.syms[node[1]]["type"] != "unknown"
-
     def leaf_str(self, eid: int) -> str:
         """sym_get_string_value of a leaf (constants and undefined symbols evaluate to their name)."""
         node = self.exprs[eid]

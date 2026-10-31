@@ -234,9 +234,6 @@ class KconfigParser:
     def _current(self) -> Token:
         return self.tokens.get(self.pos)
 
-    def _peek(self, offset: int = 1) -> Token:
-        return self.tokens.get(self.pos + offset)
-
     def _advance(self) -> Token:
         tok = self._current()
         if self.tokens.has(self.pos):
