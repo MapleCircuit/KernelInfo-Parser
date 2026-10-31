@@ -2502,6 +2502,19 @@ def main() -> None:
     if getattr(args, "clean_temp", False):
         ingest_state.cleanup_ramdisk_artifacts(getattr(G, "RAMDISK", None))
 
+    # One mailing list tunnel for the whole run: the per-version forked commit workers and the
+    # per-version Step 6.5 client inherit this forward (core/API.md 7.2) instead of each opening
+    # - and, in a forked worker, orphaning - an SSH connection of their own.
+    ml_tunnel_cfg = get_ssh_tunnel_config("mailing_list")
+    if get_mailing_list_config().get("enabled", True) and ml_tunnel_cfg.get("enabled"):
+        try:
+            ml_tunnel = start_ssh_tunnel(ml_tunnel_cfg, feature="mailing_list")
+            logger.info(f"[Mailing List] Shared SSH tunnel established on 127.0.0.1:{ml_tunnel.local_port} for the whole run.")
+        except Exception as exc:
+            logger.warning(COLOR.yellow(
+                f"[Mailing List] Could not establish the shared SSH tunnel ({exc}); each worker will tunnel on its own."
+            ))
+
     if getattr(args, "resolve_ml", False):
         commit_range = getattr(args, "ml_range", None) or (args.ref[0] if getattr(args, "ref", None) else "HEAD~100..HEAD")
         standalone_resolve_mailing_list(repo_path, commit_range, getattr(args, "ml_storage_dir", None))
@@ -3909,7 +3922,10 @@ def _git_commit_worker(
                     try:
                         ml_results = client.resolve_commits(features_list)
                     finally:
-                        client.close()
+                        # stop_tunnel is a no-op for the tunnel inherited from the parent
+                        # (SSHTunnelManager.stop() never signals another process' ssh), and
+                        # reaps a tunnel this worker had to open itself instead of orphaning it.
+                        client.close(stop_tunnel=True)
             except Exception as e:
                 logger.debug(f"Worker mailing list resolution skipped/failed: {e}")
 

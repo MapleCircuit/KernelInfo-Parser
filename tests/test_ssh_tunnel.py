@@ -343,5 +343,94 @@ class TestSSHTunnelManager(unittest.TestCase):
         self.assertFalse(is_ssh_tunnel_active("database"))
 
 
+class TestInheritedTunnelAcrossFork(unittest.TestCase):
+    """A tunnel started once is reused, not reopened, by forked per-version workers."""
+
+    def setUp(self) -> None:
+        import copy
+        import core.config
+        import core.ssh_tunnel
+        self._orig_cfg = copy.deepcopy(core.config._ACTIVE_CONFIG)
+        self._orig_cfg_path = core.config._LOADED_CONFIG_PATH
+        # Isolate the registry: the process-wide tunnels started at launch must survive
+        self._orig_tunnels = dict(core.ssh_tunnel._TUNNELS)
+        self._orig_global = core.ssh_tunnel._GLOBAL_TUNNEL
+        core.ssh_tunnel._TUNNELS = {}
+        core.ssh_tunnel._GLOBAL_TUNNEL = None
+
+    def tearDown(self) -> None:
+        import copy
+        import core.config
+        import core.ssh_tunnel
+        core.ssh_tunnel._TUNNELS.clear()
+        core.ssh_tunnel._TUNNELS.update(self._orig_tunnels)
+        core.ssh_tunnel._GLOBAL_TUNNEL = self._orig_global
+        core.config._ACTIVE_CONFIG = copy.deepcopy(self._orig_cfg)
+        core.config._LOADED_CONFIG_PATH = self._orig_cfg_path
+
+    @patch("subprocess.Popen")
+    @patch("core.ssh_tunnel._is_port_in_use")
+    def _make_started_manager(self, mock_port_in_use: MagicMock, mock_popen: MagicMock) -> tuple[SSHTunnelManager, MagicMock]:
+        mock_proc = MagicMock()
+        mock_proc.poll.return_value = None
+        mock_proc.pid = os.getpid()  # a PID that is guaranteed alive
+        mock_popen.return_value = mock_proc
+        mock_port_in_use.side_effect = [False, True]
+
+        manager = SSHTunnelManager(
+            host="mail.server.org",
+            local_port=40011,
+            remote_port=8192,
+            connect_timeout=2,
+            feature="mailing_list",
+        )
+        manager.start()
+        return manager, mock_proc
+
+    def test_inherited_tunnel_is_active_without_polling_foreign_process(self) -> None:
+        """In a non-owner process the live forward is detected by PID + port, not Popen.poll()."""
+        manager, mock_proc = self._make_started_manager()
+        self.assertTrue(manager.is_owner())
+
+        # Simulate being a forked worker that inherited the manager
+        manager._owner_pid = os.getpid() + 1
+        self.assertFalse(manager.is_owner())
+        mock_proc.poll.reset_mock()
+        # poll() in a forked child reports a bogus clean exit; it must not be consulted
+        mock_proc.poll.return_value = 0
+
+        with patch("core.ssh_tunnel._is_port_in_use", return_value=True):
+            self.assertTrue(manager.is_active())
+        mock_proc.poll.assert_not_called()
+
+        # A forward that no longer accepts connections is correctly reported as inactive
+        with patch("core.ssh_tunnel._is_port_in_use", return_value=False):
+            self.assertFalse(manager.is_active())
+
+    def test_inherited_tunnel_stop_does_not_kill_owner_process(self) -> None:
+        """A worker closing its client must not tear down the parent's shared tunnel."""
+        manager, mock_proc = self._make_started_manager()
+        manager._owner_pid = os.getpid() + 1
+
+        manager.stop()
+        mock_proc.terminate.assert_not_called()
+        mock_proc.kill.assert_not_called()
+        self.assertIsNone(manager.proc)
+
+    def test_start_ssh_tunnel_reuses_inherited_forward(self) -> None:
+        """start_ssh_tunnel() in a worker returns the inherited manager without spawning ssh."""
+        manager, _ = self._make_started_manager()
+        import core.ssh_tunnel as ssh_mod
+        ssh_mod._TUNNELS["mailing_list"] = manager
+        manager._owner_pid = os.getpid() + 1
+
+        with patch("core.ssh_tunnel._is_port_in_use", return_value=True), \
+                patch("subprocess.Popen") as mock_popen:
+            reused = start_ssh_tunnel({"host": "mail.server.org"}, feature="mailing_list")
+            mock_popen.assert_not_called()
+        self.assertIs(reused, manager)
+        self.assertEqual(reused.local_port, 40011)
+
+
 if __name__ == "__main__":
     unittest.main()

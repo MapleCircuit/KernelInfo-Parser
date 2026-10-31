@@ -4,6 +4,12 @@ Manages background OpenSSH subprocess tunnels to securely forward remote MariaDB
 ports to local interfaces. Automatically updates active configuration and os.environ
 so that TableEngine, MariaDB drivers, and multicore worker processes route queries
 transparently through the encrypted tunnel.
+
+A tunnel is owned by the process that spawned its `ssh` child. Forked workers inherit
+the manager object and can use the forward (it is a plain TCP listener on 127.0.0.1),
+but must neither probe nor signal the `ssh` process, which is not their child: see
+`SSHTunnelManager.is_active()` and `.stop()`. This keeps one tunnel alive for a whole
+multi-version parse instead of one per forked per-version worker.
 """
 from __future__ import annotations
 
@@ -31,6 +37,21 @@ def _find_free_port() -> int:
         s.bind(("127.0.0.1", 0))
         s.listen(1)
         return int(s.getsockname()[1])
+
+
+def _pid_alive(pid: int) -> bool:
+    """Check if a PID still exists, without reaping or signalling it."""
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
 
 
 def _is_port_in_use(port: int, host: str = "127.0.0.1") -> bool:
@@ -75,11 +96,26 @@ class SSHTunnelManager:
         self.proc: subprocess.Popen[str] | None = None
         self._askpass_path: Path | None = None
         self._is_active = False
+        # PID of the process that owns (spawned) the ssh child; set again in start().
+        self._owner_pid = os.getpid()
+
+    def is_owner(self) -> bool:
+        """Return True if this process spawned the ssh child (False in a forked worker)."""
+        return os.getpid() == self._owner_pid
 
     def is_active(self) -> bool:
-        """Return True if the SSH tunnel subprocess is currently alive and active."""
+        """Return True if the SSH tunnel is currently alive and usable from this process.
+
+        In a forked worker the inherited `ssh` process is not our child, so `Popen.poll()`
+        cannot report its status (waitpid yields ECHILD, which CPython reports as a clean
+        exit). The inherited forward is instead validated by checking that the owner's ssh
+        PID still exists and the forwarded local port still accepts connections, so workers
+        reuse the parent's tunnel rather than opening their own.
+        """
         if not self._is_active or self.proc is None:
             return False
+        if not self.is_owner():
+            return _pid_alive(self.proc.pid) and _is_port_in_use(self.local_port)
         return self.proc.poll() is None
 
     def _setup_askpass(self, env: dict[str, str]) -> None:
@@ -207,6 +243,7 @@ class SSHTunnelManager:
         )
 
         try:
+            self._owner_pid = os.getpid()
             self.proc = subprocess.Popen(
                 cmd,
                 stdout=subprocess.PIPE,
@@ -274,7 +311,18 @@ class SSHTunnelManager:
         return self.local_port
 
     def stop(self) -> None:
-        """Safely terminate the SSH tunnel process and clean up resources."""
+        """Safely terminate the SSH tunnel process and clean up resources.
+
+        A non-owner process (a forked worker holding an inherited manager) only drops its
+        own handle: signalling the ssh PID there would tear down the parent's tunnel, and
+        the askpass script belongs to the owner.
+        """
+        if not self.is_owner():
+            self.proc = None
+            self._askpass_path = None
+            self._is_active = False
+            return
+
         self._cleanup_askpass()
         if self.proc is not None:
             if self.proc.poll() is None:
