@@ -12,6 +12,7 @@ import { state } from "../../state.js";
 import { contextMenu } from "../../components/context_menu.js";
 import { shortRef } from "../../components/ref_picker.js";
 import { escapeHtml } from "../../components/modal.js";
+import { clearScrollPositions } from "../../components/scroll_memory.js";
 
 // Extension -> icon of the entry list (directories and plain files have their own)
 const FILE_ICONS = [
@@ -95,11 +96,6 @@ export class ExplorerView {
       });
     };
 
-    const listing = containerEl.querySelector("#explorer-listing");
-    listing.addEventListener("scroll", () => {
-      this.tabData.scrollTop = listing.scrollTop;
-    });
-
     this.renderBreadcrumbs();
     await this.load();
   }
@@ -109,7 +105,8 @@ export class ExplorerView {
     this.path = (path || "").replace(/^\/+|\/+$/g, "");
     this.tabData.path = this.path;
     this.tabData.title = this.path ? this.path.split("/").pop() : `Explorer ${shortRef(this.version)}`;
-    this.tabData.scrollTop = 0;
+    // The listing's position belonged to the directory being left (§5.28)
+    clearScrollPositions(this.tabData);
     state.saveState();
     // Re-renders the tab strip (new directory name) and this view, which lists the new directory
     state.emit("tabs:changed", { paneId: state.activePaneId, activeTabId: this.tabData.id });
@@ -190,7 +187,6 @@ export class ExplorerView {
           });
         });
       });
-      listing.scrollTop = this.tabData.scrollTop || 0;
     }
 
     if (status) {

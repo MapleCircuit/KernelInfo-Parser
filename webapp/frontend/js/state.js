@@ -231,8 +231,9 @@ class GlobalState {
     // Update the tab's version so it reloads in the newly selected version
     if (tab && tab.version !== vStr) {
       tab.version = vStr;
-      // A code tab re-opens at the top of the file: its saved position belongs to the old revision
+      // The tab re-opens at the top: its saved positions belong to the old revision (§5.21, §5.28)
       delete tab.scrollTop;
+      delete tab.scrollPositions;
     }
 
     if (isActive) this.emit("version:changed", vStr);
@@ -742,6 +743,13 @@ class GlobalState {
 
     if (existing) {
       pane.activeTabId = existing.id;
+      // Reopened onto something else (another symbol, message, commit, search...): the positions
+      // it was left at belong to what it showed before (§5.28)
+      const NAV_KEYS = ["cursorLine", "symbol", "threadId", "messageId", "query", "listMode", "filter", "commitId",
+        "versionA", "versionB", "mode", "statuses", "kconfigQuery", "renameSearches"];
+      if (NAV_KEYS.some((k) => tabData[k] !== undefined && JSON.stringify(tabData[k]) !== JSON.stringify(existing[k]))) {
+        delete existing.scrollPositions;
+      }
       if (tabData.cursorLine) {
         existing.cursorLine = tabData.cursorLine;
         // Navigating to a line overrides the position this tab was left at

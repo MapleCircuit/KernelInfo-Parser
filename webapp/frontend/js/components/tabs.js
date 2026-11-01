@@ -11,6 +11,7 @@ import { escapeHtml } from "./modal.js";
 import { contextMenu } from "./context_menu.js";
 import { toast } from "./toast.js";
 import { requestVersionSwitch } from "./version_switch.js";
+import { attachScrollMemory } from "./scroll_memory.js";
 
 // Dragged tab in the drag event's data transfer; the text form is what survives browsers that
 // hand a custom type only to the window the drag started in.
@@ -196,6 +197,8 @@ export class TabsComponent {
       const activeTab = pane.tabs.find((t) => t.id === pane.activeTabId);
       if (activeTab) {
         this.renderTabContent(contentEl, activeTab);
+        // Every scrollable part of the tab comes back where it was left (§5.28)
+        attachScrollMemory(contentEl, activeTab);
       } else {
         contentEl.innerHTML = `
           <div style="display:flex;height:100%;align-items:center;justify-content:center;flex-direction:column;color:var(--text-muted);gap:12px;">

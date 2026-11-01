@@ -18,6 +18,7 @@ import { isDocumentationPath } from "../docs/rst_renderer.js";
 import { DirectiveEvaluator, PREPROCESSED_RE, archMacros } from "../kconfig/directive_evaluator.js";
 import { configLookup, evalBuild, explainBuild } from "../kconfig/build_condition.js";
 import { escapeHtml } from "../../components/modal.js";
+import { scheduleScrollSave } from "../../components/scroll_memory.js";
 
 // Files the build banner reports on (sources Kbuild compiles and the headers/DTs they use)
 const BUILD_TRACKED_RE = /\.(c|h|S|rs|lds|dts|dtsi|inc)$/i;
@@ -213,8 +214,6 @@ export class VirtualEditor {
     this.unsubscribers = [];
     this.resizeObserver?.disconnect();
     this.resizeObserver = null;
-    clearTimeout(this._saveScrollTimer);
-    this._saveScrollTimer = null;
     this.containerEl = null;
     this.linesContainer = null;
     this.rawLines = [];
@@ -376,7 +375,7 @@ export class VirtualEditor {
         </div>
         <div class="code-build-banner" id="code-build-banner" hidden></div>
         <div class="editor-body">
-          <div class="virtual-scroll-viewport" id="editor-viewport">
+          <div class="virtual-scroll-viewport" id="editor-viewport" data-scroll-restore="off">
             <div class="virtual-scroll-spacer" id="editor-spacer"></div>
             <div class="virtual-lines-container" id="editor-lines"></div>
           </div>
@@ -852,12 +851,8 @@ export class VirtualEditor {
     const top = Math.round(this.viewportEl.scrollTop);
     if (this.tabData.scrollTop === top) return;
     this.tabData.scrollTop = top;
-    // The position is written on every scroll, so persisting is throttled to one write per idle frame
-    if (this._saveScrollTimer) return;
-    this._saveScrollTimer = setTimeout(() => {
-      this._saveScrollTimer = null;
-      state.saveState();
-    }, 400);
+    // The position is written on every scroll, so persisting is debounced (shared with §5.28)
+    scheduleScrollSave();
   }
 
   /** Document height the minimap maps, and the height it is drawn at (never taller than its track). */
