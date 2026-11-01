@@ -218,7 +218,9 @@
   display: flex;
   flex-direction: column;
   gap: 8px;
-  z-index: 999;
+  /* Topmost layer: notifications must stay above every modal, popover and
+     backdrop (highest of those is 99999), so pin to the max 32-bit z-index. */
+  z-index: 2147483647;
 }
 
 .toast {

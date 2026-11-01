@@ -5,12 +5,14 @@ import asyncio
 import json
 import os
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from webapp.backend import app as app_module
+from webapp.backend.routers import versions as versions_router
 from webapp.backend.routers.versions import _stamp
 from webapp.backend.services import sync_service as ss
 
@@ -146,6 +148,77 @@ class TestVersionStamps(unittest.TestCase):
         self.assertEqual(_stamp(sha, 0), "17d857be649a.0")  # parsed before ingestion states existed
         self.assertNotEqual(_stamp(sha, 1761400000), _stamp(sha, 1761500000))  # parsed again
         self.assertNotEqual(_stamp(sha, None), _stamp("02f8c6aee8df" + "0" * 28, None))  # branch moved
+
+
+class TestBranchTagsWarmup(unittest.TestCase):
+    """Startup warm-up of the branch-tags walk (webapp/API.md section 2.12)."""
+
+    def setUp(self) -> None:
+        versions_router._BRANCH_TAGS_CACHE.clear()
+        versions_router._BRANCH_TAGS_INFLIGHT.clear()
+
+    tearDown = setUp
+
+    def test_concurrent_callers_share_one_walk(self) -> None:
+        calls = []
+        release = threading.Event()
+
+        def slow_walk(head):
+            calls.append(head)
+            release.wait(5)
+            return ["v3.0", "v3.1"]
+
+        results = []
+        with patch.object(versions_router, "_merged_tags", side_effect=slow_walk):
+            threads = [threading.Thread(target=lambda: results.append(versions_router.branch_tags("abc"))) for _ in range(3)]
+            for t in threads:
+                t.start()
+            time.sleep(0.2)
+            release.set()
+            for t in threads:
+                t.join(5)
+            self.assertEqual(versions_router.branch_tags("abc"), ["v3.0", "v3.1"])  # served from the cache
+        self.assertEqual(calls, ["abc"])
+        self.assertEqual(results, [["v3.0", "v3.1"]] * 3)
+        self.assertEqual(versions_router._BRANCH_TAGS_INFLIGHT, {})
+
+    def test_failed_walk_is_not_cached_and_answers_503(self) -> None:
+        with patch.object(versions_router, "_merged_tags", return_value=None) as walk, \
+                patch.object(versions_router, "_branch_head", return_value="abc"):
+            with self.assertRaises(versions_router.HTTPException) as ctx:
+                versions_router.get_branch_tags("master")
+            self.assertEqual(ctx.exception.status_code, 503)
+            self.assertIsNone(versions_router.branch_tags("abc"))
+        self.assertEqual(walk.call_count, 2)  # retried, not served from the cache
+        self.assertEqual(len(versions_router._BRANCH_TAGS_CACHE), 0)
+
+    def test_prewarm_walks_the_default_branch_of_available_repositories(self) -> None:
+        repos = [{"name": "linux", "path": "/x"}, {"name": "gone", "path": "/missing"}]
+        branches = {"branches": [{"name": "stable", "is_default": False}, {"name": "master", "is_default": True}]}
+        with patch.object(versions_router, "list_repositories", return_value=repos), \
+                patch.object(versions_router, "resolve_repo_path", side_effect=lambda r: MagicMock(exists=lambda: r["name"] == "linux")), \
+                patch.object(versions_router, "set_active_repository", return_value=object()) as select, \
+                patch.object(versions_router, "reset_active_repository") as reset, \
+                patch.object(versions_router, "get_versions") as get_versions, \
+                patch.object(versions_router, "get_branches", return_value=branches), \
+                patch.object(versions_router, "_branch_head", return_value="abc") as head, \
+                patch.object(versions_router, "branch_tags", return_value=["v3.0"]) as tags:
+            versions_router.prewarm_catalog()
+        select.assert_called_once_with("linux")
+        reset.assert_called_once()
+        get_versions.assert_called_once_with(True)
+        head.assert_called_once_with("master")
+        tags.assert_called_once_with("abc")
+
+    def test_prewarm_errors_do_not_escape(self) -> None:
+        with patch.object(versions_router, "list_repositories", return_value=[{"name": "linux", "path": "/x"}]), \
+                patch.object(versions_router, "resolve_repo_path", return_value=MagicMock(exists=lambda: True)), \
+                patch.object(versions_router, "set_active_repository", return_value=object()), \
+                patch.object(versions_router, "reset_active_repository") as reset, \
+                patch.object(versions_router, "get_versions", side_effect=RuntimeError("db down")):
+            with self.assertLogs(versions_router.logger, "WARNING"):
+                versions_router.prewarm_catalog()
+        reset.assert_called_once()
 
 
 if __name__ == "__main__":

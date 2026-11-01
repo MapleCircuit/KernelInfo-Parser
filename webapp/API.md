@@ -223,6 +223,13 @@ Clients must follow server changes without the user knowing to reload. The serve
 - **Service worker** (`sw.js`): `kip-shell` holds `/` (every shell path and query share one entry) and `/boot.js`, cache-first; `kip-assets` holds `/b/<build>/…`, cache-first (the page posts `{type: "prune", build}` on start to drop other builds); `kip-api` holds API responses, network-first with cache fallback (`/api/sync` is never cached, so it always reaches the server). A reply the worker serves from `kip-api` after the request failed, and its synthesized `503`, carry `X-KIP-Offline: 1`, so the page does not mistake a cached reply for a live one (§5.1 *Server reachability*). Caches not named `kip-*` (e.g. the former `kernel-ide-v10`) are deleted on activation; there is no hand-maintained pre-cache list.
 - **New build announcement** (`syncManager.announceUpdate()`): a bottom banner *"KernelInfo was updated (build …). Reloading in 5 s…"* with **Reload now** and **Later**; the countdown waits while a dialog (`.ki-modal-backdrop`) is open. Reloading drops the cached shell first, so the next page is the new build; tabs and KConfig profiles survive (saved in `localStorage`). **Later** dismisses it until the next hourly check.
 
+### 2.12. Startup Catalog Warm-Up (`webapp/backend/app.py:lifespan`, `webapp/backend/routers/versions.py`)
+A restarted server has empty in-memory caches, and a client after **Full Local Reset** (§5.5) has an empty IndexedDB, so the first page load would otherwise pay for every catalog itself — above all the branch-tags walk (`GET /api/branch/tags`, ~18 s for `master` of Linux).
+- **What runs**: after the database pool is pre-warmed, `lifespan` starts `start_prewarm()`, a daemon thread (`kip-prewarm`) that does not delay startup. For every configured repository whose work tree exists it selects that repository (`set_active_repository`), reads `get_versions(include_rc=True)` and `get_branches()` (warming the database pool, Git packs and the OS page cache) and walks the tags of the branch marked `is_default`, filling `_BRANCH_TAGS_CACHE`. It logs `Pre-warmed <repo> in <s> s (default branch <name>: <n> tags)` at INFO; a failure is logged as a warning and never stops the server.
+- **Shared walks**: `branch_tags(head)` keeps one in-flight walk per `(repository, head)` (`_BRANCH_TAGS_INFLIGHT`), so a request arriving while the warm-up still walks `master` waits for that walk instead of starting a second `git for-each-ref --merged` (it is answered when the warm-up finishes, not 18 s after it arrived). The walk uses the resolved head, so a branch moving during it cannot mix two positions. A failed or timed-out walk (180 s) is not cached.
+- **Shutdown**: `cancel_branch_walks()` terminates walks still running, so a `--reload` restart does not leave Git processes behind.
+- Only the default branch is warmed; another branch is walked on its first request and then cached as before.
+
 ## 3. Database Schema & Underlying Tables
 
 | Domain Area | Key Database Tables | Primary Role |
@@ -328,8 +335,8 @@ Retrieve the active repository's Git branches: finished indexed refs (`m_git_ref
 
 #### `GET /api/branch/tags`
 Tag names reachable from one branch: the releases that belong to its history (`git for-each-ref --merged=<branch> refs/tags`). This is what scopes the header's Tag and RC lists (§5.13) — `v2.6.16.62` was tagged on `stable/linux-2.6.16.y` and is not reachable from `master`, so it is offered for that branch only.
-- **Query Parameters**: `branch` (string, required): a branch name (any revision resolves). Validated like every revision (§2.1); `400` when it is not a plain ref, `404` when it does not resolve.
-- **Cost**: Git walks the whole history of the branch, so the first answer costs ~0.3 s for a stable branch and ~18 s for `master` of Linux (1.5 M commits; ~6 s with a Git commit-graph written in the repository). The answer is cached per `(repository, branch head)` in the server (32 entries, never stale: a branch that moved has another head) and in the client under the branch's stamp (§2.11), so it is computed once per branch position. The frontend requests it with a long timeout and off the critical path: the dropdowns render complete and narrow when it arrives.
+- **Query Parameters**: `branch` (string, required): a branch name (any revision resolves). Validated like every revision (§2.1); `400` when it is not a plain ref, `404` when it does not resolve, `503` when the Git walk failed or timed out (not cached; the client then keeps every tag listed).
+- **Cost**: Git walks the whole history of the branch, so the first answer costs ~0.3 s for a stable branch and ~18 s for `master` of Linux (1.5 M commits; ~6 s with a Git commit-graph written in the repository). The answer is cached per `(repository, branch head)` in the server (32 entries, never stale: a branch that moved has another head) and in the client under the branch's stamp (§2.11), so it is computed once per branch position. The default branch of each repository is walked when the server starts (§2.12), and concurrent requests for one head share a single walk. The frontend requests it with a long timeout and off the critical path: the dropdowns render complete and narrow when it arrives.
 - **Response**:
 ```json
 {
@@ -1949,7 +1956,7 @@ webapp/frontend/js/
 │   ├── ref_picker.js      # Git reference picker popover (release tags + searchable commits)
 │   ├── version_switch.js  # Apply / New Tab: guarded revision switch of the active tab
 │   ├── scroll_memory.js   # Per-tab scroll positions of every scrollable element, kept in the session
-│   └── toast.js           # Ephemeral status toasts (success / error / info / warning)
+│   └── toast.js           # Ephemeral status toasts (success / error / info / warning); #toast-container is always the topmost layer (z-index 2147483647), above every modal/backdrop
 ├── utils/
 │   ├── clipboard.js       # Universal fallback clipboard copier (navigator + execCommand)
 │   ├── debounce.js        # Function debouncer

@@ -4,6 +4,8 @@ from __future__ import annotations
 import copy
 import logging
 import subprocess
+import threading
+import time
 from collections import OrderedDict
 from typing import Any
 
@@ -15,7 +17,9 @@ from webapp.backend.config import (
     get_active_repository,
     get_repo_dir,
     list_repositories,
+    reset_active_repository,
     resolve_repo_path,
+    set_active_repository,
 )
 from webapp.backend.database.helpers import finished_ref_sql, get_active_repo_id, hash_hex, safe_decode
 from webapp.backend.database.pool import get_db_cursor
@@ -35,6 +39,14 @@ PRERELEASE_MARKERS = ("-rc", "-pre", "-alpha", "-beta")
 # the branch moves.
 _BRANCH_TAGS_CACHE: OrderedDict[tuple[str, str], list[str]] = OrderedDict()
 _BRANCH_TAGS_CACHE_MAX = 32
+# Guards the cache and the in-flight table. A walk being computed is entered in _BRANCH_TAGS_INFLIGHT,
+# so a request arriving meanwhile (e.g. while the startup warm-up walks master) waits for that walk
+# instead of starting a second one.
+_BRANCH_TAGS_LOCK = threading.Lock()
+_BRANCH_TAGS_INFLIGHT: dict[tuple[str, str], threading.Lock] = {}
+# `git for-each-ref --merged` processes still running, terminated on shutdown (cancel_branch_walks)
+_RUNNING_WALKS: set[subprocess.Popen] = set()
+_BRANCH_WALK_TIMEOUT_S = 180
 
 
 def _stamp(commit_hash: str, parsed_at: Any) -> str:
@@ -212,6 +224,78 @@ def get_branches() -> dict[str, Any]:
     return {"total": len(branches), "branches": branches, "tag_views": tag_views}
 
 
+def _merged_tags(head: str) -> list[str] | None:
+    """Tags reachable from `head` (one walk of its history); None when Git failed, timed out or was cancelled."""
+    try:
+        proc = subprocess.Popen(
+            ["git", "for-each-ref", f"--merged={head}", "--format=%(refname:short)", "refs/tags"],
+            cwd=str(get_repo_dir()),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+    except OSError:
+        return None
+    with _BRANCH_TAGS_LOCK:
+        _RUNNING_WALKS.add(proc)
+    try:
+        out, _ = proc.communicate(timeout=_BRANCH_WALK_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.communicate()
+        return None
+    finally:
+        with _BRANCH_TAGS_LOCK:
+            _RUNNING_WALKS.discard(proc)
+    if proc.returncode != 0:
+        return None
+    return [line.strip() for line in out.splitlines() if line.strip()]
+
+
+def branch_tags(head: str) -> list[str] | None:
+    """Tags reachable from commit `head` of the active repository, cached per (repository, head).
+
+    Concurrent callers for the same head share one walk. A failed walk is not cached (None)."""
+    key = (str(get_repo_dir()), head)
+    with _BRANCH_TAGS_LOCK:
+        tags = _BRANCH_TAGS_CACHE.get(key)
+        if tags is not None:
+            _BRANCH_TAGS_CACHE.move_to_end(key)
+            return tags
+        walk = _BRANCH_TAGS_INFLIGHT.setdefault(key, threading.Lock())
+    with walk:
+        with _BRANCH_TAGS_LOCK:
+            tags = _BRANCH_TAGS_CACHE.get(key)
+        if tags is not None:
+            return tags  # computed by the walk this caller waited for
+        try:
+            tags = _merged_tags(head)
+        finally:
+            with _BRANCH_TAGS_LOCK:
+                if tags is not None:
+                    _BRANCH_TAGS_CACHE[key] = tags
+                    while len(_BRANCH_TAGS_CACHE) > _BRANCH_TAGS_CACHE_MAX:
+                        _BRANCH_TAGS_CACHE.popitem(last=False)
+                _BRANCH_TAGS_INFLIGHT.pop(key, None)
+    return tags
+
+
+def cancel_branch_walks() -> None:
+    """Terminate running branch walks (server shutdown: a --reload restart must not leave them behind)."""
+    with _BRANCH_TAGS_LOCK:
+        procs = list(_RUNNING_WALKS)
+    for proc in procs:
+        try:
+            proc.terminate()
+        except OSError:
+            pass
+
+
+def _branch_head(branch: str) -> str | None:
+    head_lines = _git_lines(["rev-parse", "--verify", f"{branch}^{{commit}}"], timeout=5)
+    return head_lines[0] if head_lines else None
+
+
 @router.get("/branch/tags")
 def get_branch_tags(branch: str = Query(..., min_length=1)) -> dict[str, Any]:
     """Tag names reachable from `branch`: the releases that belong to that branch's history.
@@ -222,25 +306,48 @@ def get_branch_tags(branch: str = Query(..., min_length=1)) -> dict[str, Any]:
     also the cache generation of the answer (a branch that moved returns a new head).
     """
     safe_rev(branch, "branch")
-    head_lines = _git_lines(["rev-parse", "--verify", f"{branch}^{{commit}}"], timeout=5)
-    if not head_lines:
+    head = _branch_head(branch)
+    if not head:
         raise HTTPException(status_code=404, detail=f"Unknown branch: {branch}")
-    head = head_lines[0]
-
-    key = (str(get_repo_dir()), head)
-    tags = _BRANCH_TAGS_CACHE.get(key)
+    tags = branch_tags(head)
     if tags is None:
-        # One reachability walk of the branch; the timeout covers the largest histories
-        tags = _git_lines(
-            ["for-each-ref", f"--merged={branch}", "--format=%(refname:short)", "refs/tags"],
-            timeout=180,
-        )
-        _BRANCH_TAGS_CACHE[key] = tags
-        while len(_BRANCH_TAGS_CACHE) > _BRANCH_TAGS_CACHE_MAX:
-            _BRANCH_TAGS_CACHE.popitem(last=False)
-    _BRANCH_TAGS_CACHE.move_to_end(key)
-
+        raise HTTPException(status_code=503, detail=f"Could not list the tags of {branch}")
     return {"branch": branch, "head": head, "total": len(tags), "tags": tags}
+
+
+def prewarm_catalog() -> None:
+    """Startup warm-up (webapp/API.md section 2.12): for every available repository, read the version and
+    branch catalogs and walk the default branch's tags, so the first page load after a restart does not
+    pay for them. Runs in a background thread; errors are logged and never stop the server."""
+    for repo in list_repositories():
+        name = repo.get("name")
+        if not name or not resolve_repo_path(repo).exists():
+            continue
+        token = set_active_repository(name)
+        if token is None:
+            continue
+        started = time.monotonic()
+        try:
+            get_versions(True)
+            default = next((b for b in get_branches()["branches"] if b.get("is_default")), None)
+            head = _branch_head(default["name"]) if default else None
+            tags = branch_tags(head) if head else None
+            logger.info(
+                "Pre-warmed %s in %.1f s (default branch %s: %s tags)",
+                name, time.monotonic() - started,
+                default["name"] if default else "-", len(tags) if tags is not None else "no",
+            )
+        except Exception as exc:  # noqa: BLE001 - warm-up is best effort
+            logger.warning("Pre-warm of %s failed: %s", name, exc)
+        finally:
+            reset_active_repository(token)
+
+
+def start_prewarm() -> threading.Thread:
+    """Run prewarm_catalog() in a daemon thread (does not delay startup)."""
+    thread = threading.Thread(target=prewarm_catalog, name="kip-prewarm", daemon=True)
+    thread.start()
+    return thread
 
 
 @router.get("/versions")

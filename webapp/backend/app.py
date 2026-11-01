@@ -50,7 +50,18 @@ async def lifespan(app: FastAPI):
         get_db_pool()
     except Exception as exc:
         logger.debug("Database pool startup pre-warm deferred: %s", exc)
+    # Version/branch catalogs and the default branch's tag walk, in the background (API.md section 2.12)
+    try:
+        from webapp.backend.routers.versions import start_prewarm
+        start_prewarm()
+    except Exception as exc:
+        logger.warning("Catalog pre-warm not started: %s", exc)
     yield
+    try:
+        from webapp.backend.routers.versions import cancel_branch_walks
+        cancel_branch_walks()
+    except Exception:
+        pass
     # Graceful shutdown: close connection pool and stop SSH tunnel
     try:
         from webapp.backend.database.pool import close_db_pool
