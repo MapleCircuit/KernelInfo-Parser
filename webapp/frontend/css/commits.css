@@ -17,6 +17,50 @@
   overflow: hidden;
 }
 
+/* Folded list column: a narrow rail on the left unfolds it */
+.commits-list-rail {
+  display: none;
+}
+
+.list-collapsed .commits-list-col {
+  display: none;
+}
+
+.list-collapsed .commits-list-rail {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  flex: 0 0 28px;
+  padding: 8px 0;
+  border: none;
+  border-right: 1px solid var(--border-color);
+  background: var(--bg-secondary);
+  color: var(--text-muted);
+  font: inherit;
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.list-collapsed .commits-list-rail:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+.commits-list-rail .collapse-btn {
+  color: inherit;
+  background: transparent;
+}
+
+.commits-search-bar .collapse-btn {
+  align-self: center;
+}
+
+.commits-rail-label {
+  writing-mode: vertical-rl;
+  letter-spacing: 0.05em;
+}
+
 .commits-search-bar {
   padding: 8px 12px;
   border-bottom: 1px solid var(--border-color);

@@ -277,7 +277,7 @@ function openHistory({ title, subtitle, version, load }) {
       el.onclick = () => {
         modal.close();
         stopPlay();
-        state.openTab({ type: "commits", title: "Commits", version: entry.vname, commitId: el.dataset.hash, forceNew: true });
+        state.openTab({ type: "commits", title: "Commits", version: entry.vname, commitId: el.dataset.hash, listCollapsed: true, forceNew: true });
       };
     });
   }

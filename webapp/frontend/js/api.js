@@ -631,7 +631,8 @@ class ApiClient {
 
   async getCommitDetail(version, commitIdOrHash) {
     const ver = this._sanitizeVer(version);
-    return this.request(`/api/commits/${encodeURIComponent(ver)}/detail/${encodeURIComponent(commitIdOrHash)}`, {}, "commits", `commit_${this._vk(ver)}_${commitIdOrHash}`);
+    // High fetch priority: the commit on screen goes ahead of the list/search requested beside it
+    return this.request(`/api/commits/${encodeURIComponent(ver)}/detail/${encodeURIComponent(commitIdOrHash)}`, { priority: "high" }, "commits", `commit_${this._vk(ver)}_${commitIdOrHash}`);
   }
 
   async getCommitDiff(version, commitHash, context = 3) {

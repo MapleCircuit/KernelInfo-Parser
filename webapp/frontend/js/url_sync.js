@@ -159,6 +159,7 @@ class UrlSynchronizer {
           type: "commits",
           title: "Commits",
           commitId: params.get("cid") || "",
+          listCollapsed: params.get("lc") === "1",
           query,
           version: v || state.currentVersion
         });
@@ -210,6 +211,7 @@ class UrlSynchronizer {
     } else if (activeTab.type === "commits") {
       if (activeTab.commitId) params.set("cid", activeTab.commitId);
       if (activeTab.query) params.set("q", activeTab.query);
+      if (activeTab.listCollapsed) params.set("lc", "1");
     }
 
     const newHash = "#" + params.toString();

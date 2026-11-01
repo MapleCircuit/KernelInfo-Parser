@@ -347,14 +347,14 @@
   white-space: nowrap;
 }
 
-.sidebar-collapse-btn {
+/* Default collapse control (js/utils/icons.js COLLAPSE_ICON): the sidebar's, the commits list's... */
+.collapse-btn {
   flex: 0 0 auto;
   display: flex;
   align-items: center;
   justify-content: center;
   width: 20px;
   height: 20px;
-  margin: -2px -4px -2px 4px;
   padding: 0;
   border: none;
   border-radius: 3px;
@@ -364,20 +364,29 @@
   transition: background var(--transition-fast), color var(--transition-fast);
 }
 
-.sidebar-collapse-btn:hover {
+.collapse-btn:hover {
   background: var(--bg-hover);
   color: var(--text-primary);
 }
 
-.sidebar-collapse-btn:focus-visible {
+.collapse-btn:focus-visible {
   outline: 1px solid var(--accent-blue);
   outline-offset: 1px;
 }
 
-.sidebar-collapse-btn svg {
+.collapse-btn svg {
   width: 14px;
   height: 14px;
   fill: currentColor;
+}
+
+/* The control that unfolds the panel: the same icon, pointing the other way */
+.collapse-btn.expand svg {
+  transform: scaleX(-1);
+}
+
+#sidebar-collapse {
+  margin: -2px -4px -2px 4px;
 }
 
 .sidebar-content {

@@ -8,6 +8,7 @@ import { showPersonModal } from "../../components/person_modal.js";
 import { toast } from "../../components/toast.js";
 import { copyToClipboard } from "../../utils/clipboard.js";
 import { contextMenu } from "../../components/context_menu.js";
+import { COLLAPSE_ICON } from "../../utils/icons.js";
 
 const STATUS_COLORS = { A: "var(--accent-green)", D: "var(--accent-red)", R: "#d2a8ff", M: "var(--accent-yellow)" };
 // Files whose diff is longer than this start collapsed in the inline commit diff
@@ -109,25 +110,34 @@ export class CommitsView {
     this.nextFutureCursor = null;
     this.isLoadingTop = false;
     this.isLoadingBottom = false;
+    this.listCollapsed = false;
+    this.listLoaded = false;
   }
 
   async render(containerEl, tabData) {
     this.containerEl = containerEl;
     this.tabId = tabData.id || null;
     this.currentVersion = tabData.version || state.currentVersion;
-    if (tabData.commitId) {
-      this.selectedCommitId = tabData.commitId;
-    }
-    if (tabData.query) {
-      this.currentQuery = tabData.query;
-    }
+    // The tab is the whole truth: a tab without a search or a selection shows none, whatever
+    // this view showed before
+    this.selectedCommitId = tabData.commitId || null;
+    this.currentQuery = tabData.query || "";
+    this.listCollapsed = Boolean(tabData.listCollapsed);
+    this.listLoaded = false;
 
     containerEl.innerHTML = `
-      <div class="commits-view-container">
+      <div class="commits-view-container${this.listCollapsed ? " list-collapsed" : ""}">
+        <!-- Folded list: a rail on the left that unfolds it -->
+        <button type="button" class="commits-list-rail" id="btn-commits-expand" title="Show the commit list and search" aria-label="Show the commit list and search">
+          <span class="collapse-btn expand">${COLLAPSE_ICON}</span>
+          <span class="commits-rail-label">Commits</span>
+        </button>
+
         <!-- Commits List Column -->
         <div class="commits-list-col">
           <div class="commits-search-bar" style="display:flex;gap:6px;">
             <input type="text" id="commit-search-input" placeholder="Search commit subject, author, hash..." style="flex:1;" />
+            <button type="button" class="collapse-btn" id="btn-commits-collapse" title="Collapse the commit list" aria-label="Collapse the commit list">${COLLAPSE_ICON}</button>
           </div>
           <div class="commits-list" id="commit-list-container">
             <div style="padding:16px;color:var(--text-muted);">Loading commits...</div>
@@ -154,6 +164,9 @@ export class CommitsView {
       });
     });
 
+    containerEl.querySelector("#btn-commits-expand").onclick = () => this.setListCollapsed(false);
+    containerEl.querySelector("#btn-commits-collapse").onclick = () => this.setListCollapsed(true);
+
     const searchInput = containerEl.querySelector("#commit-search-input");
     if (this.currentQuery && searchInput) {
       searchInput.value = this.currentQuery;
@@ -167,10 +180,24 @@ export class CommitsView {
       debouncedSearch(searchInput.value.trim());
     };
 
+    // The selected commit is what the reader came for: its detail is requested first (and at high
+    // fetch priority) and the list or search loads beside it, so neither waits for the other. A
+    // folded list is not loaded at all until it is unfolded.
+    const detail = this.selectedCommitId ? this.inspectCommit(this.selectedCommitId) : null;
+    const list = this.listCollapsed ? null : this.loadCommits(this.currentQuery, true);
+    await Promise.all([list, detail]);
+  }
+
+  /** Fold the list column to a rail on the left, or unfold it (loading it the first time). */
+  async setListCollapsed(collapsed) {
+    this.listCollapsed = collapsed;
+    this.containerEl.querySelector(".commits-view-container")?.classList.toggle("list-collapsed", collapsed);
+    this.persistTabState({ listCollapsed: collapsed || undefined });
+    if (collapsed) return;
+    this.containerEl.querySelector("#commit-search-input")?.focus();
+    if (this.listLoaded) return;
     await this.loadCommits(this.currentQuery, true);
-    if (this.selectedCommitId) {
-      this.inspectCommit(this.selectedCommitId);
-    }
+    this.containerEl.querySelector(".commit-card.active")?.scrollIntoView({ block: "nearest" });
   }
 
   /**
@@ -184,6 +211,9 @@ export class CommitsView {
 
   async loadCommits(query = "", reset = true) {
     const listContainer = this.containerEl.querySelector("#commit-list-container");
+    // Only the latest load renders: an older search answering late must not replace a newer one
+    const token = this._listToken = (this._listToken || 0) + 1;
+    this.listLoaded = true;
     if (reset) {
       this.currentPage = 1;
       this.commits = [];
@@ -199,11 +229,13 @@ export class CommitsView {
     try {
       if (this.currentQuery) {
         const res = await api.getCommits(this.currentVersion, this.currentPage, 50, this.currentQuery);
+        if (token !== this._listToken) return;
         const newCommits = res.commits || [];
         this.commits = newCommits;
         this.hasMore = newCommits.length === 50;
       } else {
         const res = await api.getCommitTimeline(this.currentVersion, 50, "past", null);
+        if (token !== this._listToken) return;
         this.anchorCommit = res.anchor_commit || null;
         this.commits = res.timeline || [];
         this.hasPast = Boolean(res.has_past);
@@ -213,7 +245,7 @@ export class CommitsView {
       }
       this.renderCommitList();
     } catch (e) {
-      if (reset) {
+      if (reset && token === this._listToken) {
         listContainer.innerHTML = `<div style="color:var(--accent-red);padding:16px;">Failed: ${escapeHtml(e.message)}</div>`;
       }
     }
@@ -366,6 +398,7 @@ export class CommitsView {
             type: "commits",
             title: `Commit ${hashShort}`,
             commitId: c.commit_hash || c.commit_id,
+            listCollapsed: true,
             version: this.currentVersion,
             forceNew: true
           });
@@ -530,9 +563,12 @@ export class CommitsView {
   async inspectCommit(commitIdOrHash) {
     const detailEl = this.containerEl.querySelector("#commit-detail-container");
     detailEl.innerHTML = `<div style="color:var(--text-muted);">Loading commit details...</div>`;
+    // Only the latest selection renders: a commit clicked while another is loading wins
+    const token = this._detailToken = (this._detailToken || 0) + 1;
 
     try {
       const c = await api.getCommitDetail(this.currentVersion, commitIdOrHash);
+      if (token !== this._detailToken) return;
       // The commit on screen is recorded on the tab by its hash, never by the integer
       // commit_id: a shared link has to survive a database rebuild (§5.26)
       this.persistTabState({ commitId: c.commit_hash || String(commitIdOrHash) });
@@ -699,6 +735,7 @@ export class CommitsView {
         });
       });
     } catch (e) {
+      if (token !== this._detailToken) return;
       detailEl.innerHTML = `<div style="color:var(--accent-red);padding:16px;">Failed: ${escapeHtml(e.message)}</div>`;
     }
   }

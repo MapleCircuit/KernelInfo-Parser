@@ -61,6 +61,7 @@ export class BlameView {
           type: "commits",
           title: `Commit ${cell.dataset.commit.substring(0, 7)}`,
           commitId: cell.dataset.commit,
+          listCollapsed: true,
           version: this.version || state.activeVersion()
         });
       }

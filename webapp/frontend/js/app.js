@@ -38,15 +38,16 @@ export class KernelIdeApp {
   constructor() {
     this.tabsComponent = null;
     this.viewRenderers = {
-      // One view per tab (code, kconfig, explorer, mail, diff): each keeps its own file, dimming, engine
-      // selection, browsed directory, mail search/thread or comparison (chips, filters, rename searches)
+      // One view per tab (code, kconfig, explorer, mail, diff, commits): each keeps its own file, dimming,
+      // engine selection, browsed directory, mail search/thread, comparison (chips, filters, rename
+      // searches) or commit search and selection
       code: () => new VirtualEditor(),
       kconfig: () => new KconfigView(),
       explorer: () => new ExplorerView(),
       mail: () => new MailView(),
       nodemap: new NodeMapController(),
       maintainers: new MaintainersView(),
-      commits: new CommitsView(),
+      commits: () => new CommitsView(),
       pahole: new PaholeView(),
       callgraph: new CallgraphView(),
       diff: () => new DiffView(),

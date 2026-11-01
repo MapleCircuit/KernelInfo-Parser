@@ -779,6 +779,7 @@ class ContextMenu {
               type: "commits",
               title: `Commit ${full.slice(0, 7)}`,
               commitId: full,
+              listCollapsed: true,
               version: v,
               forceNew: true
             });
@@ -1174,6 +1175,7 @@ class ContextMenu {
         type: "commits",
         title: `Commit ${shortHash}`,
         commitId: commitHash,
+        listCollapsed: true,
         version: v
       });
       backdrop.remove();
@@ -1186,6 +1188,7 @@ class ContextMenu {
           type: "commits",
           title: `Commit ${shortHash}`,
           commitId: commitHash,
+          listCollapsed: true,
           version: v,
           forceNew: true
         });

@@ -766,6 +766,11 @@ class GlobalState {
       if (tabData.listMode !== undefined) existing.listMode = tabData.listMode;
       if (tabData.filter !== undefined) existing.filter = tabData.filter;
       if (tabData.commitId !== undefined) existing.commitId = tabData.commitId;
+      // A commits tab reopened for one commit (blame, a hash menu, a deep link) shows it with the list folded
+      if (tabData.listCollapsed !== undefined) {
+        if (tabData.listCollapsed) existing.listCollapsed = true;
+        else delete existing.listCollapsed;
+      }
       if (tabData.type === "diff") {
         // A Compare deep link: the revisions (when given), mode, chips, filters and rename searches
         for (const key of ["versionA", "versionB", "mode", "statuses", "kconfigQuery", "renameSearches"]) {

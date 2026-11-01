@@ -196,6 +196,7 @@ export async function showFileHistoryModal(version, filePath) {
             title: "Commits",
             version: version,
             commitId: hash,
+            listCollapsed: true,
             forceNew: true,
           });
         }
