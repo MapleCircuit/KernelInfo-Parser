@@ -50,8 +50,7 @@ Relational Extraction inside with CS(REF_NO_REF):
   │     ├── Rule 12 Staging Order inside with CS(REF_POS):
   │     │     ├── 1. m_tag.set(None, code_hash, ast_ref, 0, 0)          [MUST BE FIRST, 5 columns: tag_id, hash, ast_id, hl_s, hl_l]
   │     │     │      tag_ref = ((m_tag.table_id, 0), OP_REF, (REF_POS, CS.route[-1]))
-  │     │     ├── 2. m_tag_code.get_set(code_hash, code_str)             [Auxiliary hash table]
-  │     │     └── 3. m_moved_tag.set(s_tag_id, tag_ref)                  [If evolved tag match]
+  │     │     └── 2. m_moved_tag.set(s_tag_id, tag_ref)                  [If evolved tag match]
   │     │
   │     ├── File-to-Tag Bridge: m_bridge_tag.set(blob_id, tag_ref, line_s, line_e, char_s, char_e)
   │     ├── Spatial AST Map: m_map_ast.set(tag_ref, 1, 1, rel_line_e, rel_char_e, ast_ref)
@@ -112,7 +111,6 @@ with CS(REF_POS):
         0,               # hl_l
     ))
     tag_ref = ((m_tag.table_id, 0), OP_REF, (REF_POS, CS.route[-1]))
-    CS.store(m_tag_code.get_set(code_hash, self.extent.code))
     if s_tag_id is not None:
         CS.store(m_moved_tag.set(s_tag_id, tag_ref))
 ```
@@ -198,7 +196,7 @@ The Rust AST parser defines dedicated `Ast_Rust` classes for every major languag
 ## 6. Performance Invariants & Architectural Rules
 
 1. **Rule 12 Staging Order**:
-   `m_tag.set` MUST be the first operation inside `with CS(REF_POS):` so `tag_ref` references `m_tag`. Auxiliary tables (`m_tag_code.get_set`, `m_moved_tag.set`) follow immediately within the block.
+   `m_tag.set` MUST be the first operation inside `with CS(REF_POS):` so `tag_ref` references `m_tag`. Auxiliary tables (such as `m_moved_tag.set`) follow immediately within the block.
 2. **Rule 21 Flat Scalar Container Payload**:
    In `m_ast.view` joined with `m_ast_container`, container arguments MUST be passed as flat positional scalars (`*container_payload`), never as nested tuples inside lists.
 3. **Rule 23 View Deduplication**:

@@ -27,7 +27,6 @@ from core.DBLayout import (
     m_tag,
     m_moved_tag,
     m_bridge_tag,
-    m_tag_code,
     m_map_ast,
     m_bridge_map,
 )
@@ -150,7 +149,6 @@ class Test_CParserLifecycle(BaseCParserTestCase):
             tables = snapshot["tables"]
             self.assertIn("m_ast", tables)
             self.assertIn("m_tag", tables)
-            self.assertIn("m_tag_code", tables)
             self.assertIn("m_bridge_tag", tables)
             self.assertIn("m_map_ast", tables)
             self.assertIn("m_bridge_map", tables)

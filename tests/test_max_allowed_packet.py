@@ -11,8 +11,8 @@ class TestMaxAllowedPacketAdaptiveBisection(unittest.TestCase):
 
     def setUp(self) -> None:
         self.t_code = Table(
-            table_id=10,
-            table_name="m_tag_code",
+            table_id=99,
+            table_name="test_large_payload",
             columns=(
                 ("hash", "BINARY(32)", "NOT NULL"),
                 ("code", "LONGTEXT", "NOT NULL"),

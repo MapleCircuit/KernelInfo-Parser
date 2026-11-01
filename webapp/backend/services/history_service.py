@@ -103,23 +103,112 @@ def indexed_versions(cursor: Any, include_rc: bool = False) -> list[dict[str, An
     return versions
 
 
+# (tag_id) -> snippet code text; tags are immutable and content-addressed
+_TAG_CODE_CACHE: OrderedDict[int, str] = OrderedDict()
+_TAG_CODE_LOCK = threading.Lock()
+_TAG_CODE_CACHE_LIMIT = 16384
+
+
+def _slice_extent(lines: list[str], s_l: int, e_l: int, s_c: int, e_c: int) -> str:
+    """Extract exact raw source string from line array using 1-based coordinates matching Extent.cc()."""
+    if s_l <= 0 or e_l <= 0 or s_l > len(lines):
+        return ""
+    if s_l == e_l:
+        line_str = lines[s_l - 1]
+        line_len = len(line_str)
+        s_idx = max(0, s_c - 1)
+        e_idx = min(line_len, e_c - 1) if e_c > 0 else line_len
+        return line_str[s_idx:e_idx]
+
+    slices = []
+    raw_len = len(lines)
+    for l_num in range(s_l, min(e_l + 1, raw_len + 1)):
+        line_str = lines[l_num - 1]
+        line_len = len(line_str)
+        if l_num == s_l:
+            s_idx = max(0, s_c - 1)
+            slices.append(line_str[s_idx:])
+        elif l_num == e_l:
+            e_idx = min(line_len, e_c - 1) if e_c > 0 else line_len
+            slices.append(line_str[:e_idx])
+        else:
+            slices.append(line_str)
+
+    return "\n".join(slices)
+
+
 def tag_codes(cursor: Any, tag_ids: set[int]) -> dict[int, str]:
-    """Code snippet of each tag (m_tag_code, content addressed)."""
+    """Code snippet of each tag reconstructed on-demand from Git blobs via m_bridge_tag coordinates."""
     codes: dict[int, str] = {}
-    ids = sorted(t for t in tag_ids if t)
-    for i in range(0, len(ids), 1000):
-        chunk = ids[i:i + 1000]
+    missing_ids: list[int] = []
+
+    with _TAG_CODE_LOCK:
+        for tid in tag_ids:
+            if not tid:
+                continue
+            if tid in _TAG_CODE_CACHE:
+                _TAG_CODE_CACHE.move_to_end(tid)
+                codes[tid] = _TAG_CODE_CACHE[tid]
+            else:
+                missing_ids.append(tid)
+
+    if not missing_ids:
+        return codes
+
+    missing_ids.sort()
+    # tag_id -> (blob_hex, line_s, line_e, char_s, char_e)
+    tag_spans: dict[int, tuple[str, int, int, int, int]] = {}
+    for i in range(0, len(missing_ids), 1000):
+        chunk = missing_ids[i:i + 1000]
+        fmt = ",".join(["%s"] * len(chunk))
         cursor.execute(
             f"""
-            SELECT t.tag_id, c.code
-            FROM m_tag t
-            JOIN m_tag_code c ON c.hash = t.hash
-            WHERE t.tag_id IN ({",".join(["%s"] * len(chunk))});
+            SELECT bt.tag_id, fb.blob_hash, bt.line_s, bt.line_e, bt.char_s, bt.char_e
+            FROM m_bridge_tag bt
+            JOIN m_file_blob fb ON fb.blob_id = bt.blob_id
+            WHERE bt.tag_id IN ({fmt});
             """,
             chunk,
         )
         for r in cursor.fetchall():
-            codes[r["tag_id"]] = safe_decode(r["code"]) or ""
+            tid = r["tag_id"]
+            if tid not in tag_spans:
+                tag_spans[tid] = (
+                    hash_hex(r["blob_hash"]),
+                    r["line_s"],
+                    r["line_e"],
+                    r["char_s"],
+                    r["char_e"],
+                )
+
+    # Group tags by blob_hex to read each Git blob at most once
+    blobs_to_tags: dict[str, list[tuple[int, int, int, int, int]]] = {}
+    for tid, span in tag_spans.items():
+        blobs_to_tags.setdefault(span[0], []).append((tid, span[1], span[2], span[3], span[4]))
+
+    resolved: dict[int, str] = {}
+    for blob_hex, spans in blobs_to_tags.items():
+        if not blob_hex:
+            continue
+        obj_type, raw_bytes, _ = git_reader.read_object(blob_hex, "")
+        if obj_type != "blob" or raw_bytes is None:
+            continue
+        # Split lines preserving exact structure
+        lines = raw_bytes.decode("utf-8", errors="replace").splitlines()
+        for tid, s_l, e_l, s_c, e_c in spans:
+            resolved[tid] = _slice_extent(lines, s_l, e_l, s_c, e_c)
+
+    # Populate missing entries with empty string if unresolvable
+    for tid in missing_ids:
+        c = resolved.get(tid, "")
+        codes[tid] = c
+
+    with _TAG_CODE_LOCK:
+        for tid, c in resolved.items():
+            _TAG_CODE_CACHE[tid] = c
+            if len(_TAG_CODE_CACHE) > _TAG_CODE_CACHE_LIMIT:
+                _TAG_CODE_CACHE.popitem(last=False)
+
     return codes
 
 

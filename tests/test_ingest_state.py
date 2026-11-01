@@ -70,7 +70,6 @@ def seeded() -> MemoryDB:
     db.add("m_bridge_checkpoint", 10, 1, 1)
     db.add("m_bridge_checkpoint", 10, 11, 11)
     db.add("m_commit_file", 5, 2, 3, 0, 0, "A")  # the old commit that introduced blob 3 keeps its row
-    db.add("m_tag_code", b"c1", "code")
     db.add("m_ast", 1, "schedule", 1)
     db.add("m_ast", 11, "new_fn", 1)
     db.add("m_ast_container", 1, 0, 1, 1)
@@ -101,7 +100,7 @@ class TestRollbackPlan(unittest.TestCase):
         names = {t.table_name for t, _ in I.marked_tables(TABLES)}
         self.assertTrue({"m_file_blob", "m_file_name", "m_ast", "m_tag", "m_commit", "m_blob_symbol_def"} <= names)
         # Static registries, hash/composite keys and foreign-key primary keys are not watermarked
-        self.assertFalse(names & {"m_type_descriptor", "m_git_ref", "m_repository", "m_tag_code", "m_bridge_tag",
+        self.assertFalse(names & {"m_type_descriptor", "m_git_ref", "m_repository", "m_bridge_tag",
                                   "m_ast_include", "m_ingest_state", "m_ingest_watermark", "m_ingest_blob"})
 
     def test_children_are_deleted_before_their_parents(self) -> None:

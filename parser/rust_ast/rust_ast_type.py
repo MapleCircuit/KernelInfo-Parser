@@ -33,7 +33,6 @@ from core.DBLayout import (
     m_map_ast,
     m_bridge_map,
     m_ast_hash,
-    m_tag_code,
     m_moved_tag,
     m_blob_symbol_def,
 )
@@ -231,7 +230,6 @@ class Ast_Rust:
         with CS(REF_POS):
             CS.store(m_tag.set(*current_tag))
             tag_ref = ((m_tag.table_id, 0), OP_REF, (REF_POS, CS.route[-1]))
-            CS.store(m_tag_code.get_set(code_hash, self.extent.code))
             if s_tag_id is not None:
                 CS.store(m_moved_tag.set(s_tag_id, tag_ref))
 

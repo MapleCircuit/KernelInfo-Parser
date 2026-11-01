@@ -30,7 +30,7 @@ Kernel Root Documentation (MAINTAINERS / CREDITS)
      │     │     └── Patterns: F (Files), X (Excludes), N (Regex), K (Keywords)
      │     └── Relational Staging:
      │           ├── AST Nodes: m_ast.view [Rule 23]
-     │           ├── Code Occurrence Tags: m_tag.set (5-col, Rule 12 order), m_tag_code, m_bridge_tag (6-col)
+     │           ├── Code Occurrence Tags: m_tag.set (5-col, Rule 12 order), m_bridge_tag (6-col)
      │           ├── Identities: m_maintainer_person (Table 16)
      │           ├── Subsystems: m_maintainer_section (Table 17, 8-col with blob_ref)
      │           ├── Personnel Roles: m_maintainer_member (Table 18)
@@ -84,7 +84,6 @@ Subsystem File Ownership Resolution:
            0,               # hl_l
        ))
        tag_ref = ((m_tag.table_id, 0), OP_REF, (REF_POS, CS.route[-1]))
-       CS.store(m_tag_code.get_set(code_hash, extent.code))
        if s_tag_id is not None:
            CS.store(m_moved_tag.set(s_tag_id, tag_ref))
    ```
@@ -174,7 +173,7 @@ To resolve file ownership across the entire kernel repository:
 ## 6. Performance Invariants & Architectural Rules
 
 1. **Rule 12 Staging Order**:
-   In `MaintainerManager._stage_tag()` and `CreditsManager._stage_tag()`, `m_tag.set` MUST be the first operation inside `with CS(REF_POS):` so `tag_ref` references `m_tag`. Auxiliary tables (`m_tag_code.get_set`, `m_moved_tag.set`) follow immediately within the block.
+   In `MaintainerManager._stage_tag()` and `CreditsManager._stage_tag()`, `m_tag.set` MUST be the first operation inside `with CS(REF_POS):` so `tag_ref` references `m_tag`. Auxiliary tables (such as `m_moved_tag.set`) follow immediately within the block.
 2. **Rule 23 View Deduplication**:
    All AST nodes (`_stage_ast_node`) use `m_ast.view(((m_ast.ast_id,),), None, name, type_id)`.
 3. **Person Identity Normalization** (`maintainer_types.clean_identity_text`):

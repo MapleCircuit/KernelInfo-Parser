@@ -160,7 +160,7 @@ class TestDBLayoutAndWebappReferenceAPI(unittest.TestCase):
     """Test suite verifying m_file_reference schema and webapp helpers."""
 
     def test_m_file_reference_schema(self) -> None:
-        self.assertEqual(m_file_reference.table_id, 29)
+        self.assertEqual(m_file_reference.table_id, 28)
         self.assertEqual(m_file_reference.table_name, "m_file_reference")
         self.assertEqual(m_file_reference.init_primary, ("ref_id",))
         self.assertEqual(m_file_reference.primary, (0,))

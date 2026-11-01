@@ -1050,12 +1050,11 @@ class TestTECachedDBIntegrity(unittest.TestCase):
         self.assertNotIn(1, self.te._pk_index.get(fake_tbl_cached.table_id, {}))
 
     def test_schema_table_ordering_and_backward_foreign_keys(self) -> None:
-        """Verify m_tag_code is table_id=10 and all foreign keys point strictly backward."""
-        from core.DBLayout import TABLES, m_tag_code, m_tag
+        """Verify m_tag is table_id=10 and all foreign keys point strictly backward."""
+        from core.DBLayout import TABLES, m_tag
 
-        self.assertEqual(m_tag_code.table_id, 10)
-        self.assertEqual(m_tag_code.te_cached, (0,))
-        self.assertEqual(m_tag.table_id, 11)
+        self.assertEqual(len(TABLES), 44)
+        self.assertEqual(m_tag.table_id, 10)
 
         # Verify TABLES order matches table_id
         for idx, tbl in enumerate(TABLES):

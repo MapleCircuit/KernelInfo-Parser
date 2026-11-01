@@ -160,7 +160,6 @@ from core.DBLayout import (
     m_bridge_commit_person,
     m_bridge_commit_file,
     m_bridge_commit_tag,
-    m_tag_code,
     m_moved_tag,
     m_file_reference,
     m_db_instance,
@@ -234,10 +233,10 @@ OBSOLETE_KCONFIG_TABLES = ("m_kconfig_kbuild", "m_kconfig_tree", "m_kconfig_rela
 # Table ids of the earlier layout -> current ids (core/DBLayout.py). m_ast_attribute keeps id 35: view
 # hashes (m_ast_hash) include the ids of the joined tables, so its id must never change.
 _OLD_TABLE_IDS = {
-    **{old: old - 4 for old in range(20, 35)},  # m_maintainer_person .. m_db_instance
-    35: 35,                                       # m_ast_attribute
-    **{old: old - 5 for old in range(36, 40)},  # m_git_network, m_repository, m_git_ref, m_commit_parent
-    **{old: old - 4 for old in range(40, 49)},  # m_ingest_state .. m_commit_email
+    **{old: old - 5 for old in range(20, 35)},  # m_maintainer_person .. m_db_instance
+    35: 34,                                       # m_ast_attribute
+    **{old: old - 6 for old in range(36, 40)},  # m_git_network, m_repository, m_git_ref, m_commit_parent
+    **{old: old - 5 for old in range(40, 49)},  # m_ingest_state .. m_commit_email
 }
 # m_kconfig_tree (old id 18) was a watermarked table; id 18 now is m_maintainer_member, which is not
 _OBSOLETE_MARKER_ID = 18

@@ -18,7 +18,6 @@ from core.DBLayout import (
     m_file,
     m_file_name,
     m_tag,
-    m_tag_code,
     m_bridge_tag,
     m_map_ast,
     m_bridge_map,
@@ -254,7 +253,6 @@ class Ast:
         with CS(REF_POS):
             CS.store(m_tag.set(None, code_hash, ast_ref, 0, 0))
             tag_ref = ((m_tag.table_id, 0), OP_REF, (REF_POS, CS.route[-1]))
-            CS.store(m_tag_code.get_set(code_hash, ext.code))
             if s_tag_id is not None:
                 CS.store(m_moved_tag.set(s_tag_id, tag_ref))
 

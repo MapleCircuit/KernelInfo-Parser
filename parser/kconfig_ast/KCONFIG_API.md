@@ -22,7 +22,7 @@ Kconfig Source File (Kconfig*)
   ├─ Git Operation: "D" (Deleted) ──► get_prior_tags(CS) / close_prior_tags(CS) (no-op under the Git DAG)
   └─ Git Operation: "A" / "M" / "R*" ──► get_prior_tags(CS) (M, R*) ──► KconfigManager
        ├── KconfigLexer (kconfig_lexer.py) ──► KconfigParser (kconfig_parser.py)
-       └── per entry: m_ast.view(name, type) + tag (m_tag, m_tag_code, m_bridge_tag, m_map_ast, m_bridge_map,
+       └── per entry: m_ast.view(name, type) + tag (m_tag, m_bridge_tag, m_map_ast, m_bridge_map,
            m_moved_tag on transitions); `source "<literal path>"` also m_file_name + m_ast_include
   │
   ▼ [Post-Processing: processing_kbuild(version) (main.py + kbuild_parser.py), Step 6.6]
@@ -34,7 +34,7 @@ Kbuild references: new Makefile/Kbuild blobs ──► m_file_reference (ref_typ
 
 ## 2. Relational Mapping
 
-Every entry is staged by `KconfigManager._stage_entry()`: an `m_ast.view(((m_ast.ast_id,),), None, name[:255], type)` node, deduplicated by name and type (Rule 23), and the entry's tag (`_tag_and_map()`, Rule 12 order: `m_tag.set` first, then `m_tag_code.get_set`, `m_moved_tag` when `match_prior_tag_transition()` pairs it with a prior tag; then `m_bridge_tag`, `m_map_ast`, `m_bridge_map`). A tag whose text is unchanged since the previous version of the file is recycled (only its `m_bridge_tag` placement is written).
+Every entry is staged by `KconfigManager._stage_entry()`: an `m_ast.view(((m_ast.ast_id,),), None, name[:255], type)` node, deduplicated by name and type (Rule 23), and the entry's tag (`_tag_and_map()`, Rule 12 order: `m_tag.set` first, then `m_moved_tag` when `match_prior_tag_transition()` pairs it with a prior tag; then `m_bridge_tag`, `m_map_ast`, `m_bridge_map`). A tag whose text is unchanged since the previous version of the file is recycled (only its `m_bridge_tag` placement is written).
 
 | Entry | `m_ast.name` | `ASTT` | Tag text and extent |
 | :--- | :--- | :--- | :--- |
@@ -160,7 +160,7 @@ Which directories are "the architecture's own" is read from each revision's Make
 
 ## 7. Performance Invariants & Architectural Rules
 
-1. **Rule 12 Staging Order**: in `KconfigManager._tag_and_map()`, `m_tag.set` MUST be the first operation inside `with CS(REF_POS):` so `tag_ref` references `m_tag`; `m_tag_code.get_set` and `m_moved_tag.set` follow within the block.
+1. **Rule 12 Staging Order**: in `KconfigManager._tag_and_map()`, `m_tag.set` MUST be the first operation inside `with CS(REF_POS):` so `tag_ref` references `m_tag`; `m_moved_tag.set` follows within the block when an evolved transition exists.
 2. **Rule 23 View Deduplication**: AST nodes are created with `m_ast.view(...)` (`((m_ast.ast_id,),)`, or `((m_ast.ast_id, m_ast_include.ast_id, 1),)` for a linked `source`).
 3. **Nothing per expression**: dependency expressions are not stored (the semantic model evaluates them), so a Kconfig file costs one AST node and one tag per entry.
 

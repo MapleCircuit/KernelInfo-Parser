@@ -1,7 +1,7 @@
 """parser/c_ast/cs_extractor.py - ChangeSet Relational Stager for c_ast.
 
 Encapsulates relational ChangeSet generation with strict enforcement of:
-- Rule 12 (m_tag.set staged FIRST within `with CS(REF_POS):`, followed by m_tag_code and m_moved_tag)
+- Rule 12 (m_tag.set staged FIRST within `with CS(REF_POS):`, followed by m_moved_tag)
 - Rule 14 (32-byte binary SHA-256 via compute_code_hash)
 - Invariant A: m_bridge_tag coordinates (1-based, inclusive start, exclusive end)
 - Invariant I: VARCHAR(255) bounds on m_ast.name
@@ -21,7 +21,6 @@ from core.globalstuff import (
 from core.DBLayout import (
     m_file,
     m_tag,
-    m_tag_code,
     m_moved_tag,
     m_bridge_tag,
     m_ast,
@@ -95,8 +94,6 @@ class CSExtractor:
         with CS(REF_POS):
             CS.store(m_tag.set(None, code_hash, ast_ref, 0, 0))
             tag_ref = ((m_tag.table_id, 0), OP_REF, (REF_POS, CS.route[-1]))
-            # Auxiliary deduplication table MUST be staged after m_tag.set
-            CS.store(m_tag_code.get_set(code_hash, code_str))
             if s_tag_id is not None:
                 CS.store(m_moved_tag.set(s_tag_id, tag_ref))
 

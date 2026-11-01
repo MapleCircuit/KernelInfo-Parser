@@ -7,7 +7,7 @@
     "versions": [
       "v3.0"
     ],
-    "description": "Verify added raw file stages m_v_main, file prelude, AST tags, coordinates, and code content"
+    "description": "Verify added raw file stages m_v_main, file prelude, AST tags, and coordinates"
   },
   "tables": {
     "m_file_name": [
@@ -35,12 +35,6 @@
         "ast_id": "$ast_0",
         "name": "6aad220acdedc2dc37ff426751ef51af8ee9fd3a41ef2ac2ff14516ad80fef02",
         "type_id": "144 (Raw_Content)"
-      }
-    ],
-    "m_tag_code": [
-      {
-        "hash": "hex:6aad220acdedc2dc37ff426751ef51af8ee9fd3a41ef2ac2ff14516ad80fef02",
-        "code": "What:\t\t/sys/kernel/fscaps\nDate:\t\tFebruary 2011\nKernelVersion:\t2.6.38\nContact:\tLudwig Nussel <ludwig.nussel@suse.de>\nDescription\n\t\tShows whether file system capabilities are honored\n\t\twhen executing a binary\n\n"
       }
     ],
     "m_tag": [

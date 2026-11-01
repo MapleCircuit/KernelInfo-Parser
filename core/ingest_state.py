@@ -446,7 +446,7 @@ def purge_version_differential_rows(cnx: Any, commit_id: int, pred_commit_id: in
       - m_arch_root for commit_id
       - Resets m_ingest_state to INGEST_PARSING
 
-    Leaves universal content-addressable tables (m_file_blob, m_ast, m_tag, m_tag_code) intact.
+    Leaves universal content-addressable tables (m_file_blob, m_ast, m_tag) intact.
     Returns total count of deleted rows.
     """
     total = 0

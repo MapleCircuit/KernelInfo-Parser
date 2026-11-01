@@ -23,7 +23,6 @@ from core.DBLayout import (
     m_file,
     m_bridge_file,
     m_ast,
-    m_tag_code,
     m_tag,
     m_moved_tag,
     m_bridge_tag,
@@ -181,7 +180,6 @@ class RawManager:
                 0,
             ))
             tag_ref = ((m_tag.table_id, 0), OP_REF, (REF_POS, CS.route[-1]))
-            CS.store(m_tag_code.get_set(content_hash, content))
             if s_tag_id is not None:
                 CS.store(m_moved_tag.set(s_tag_id, tag_ref))
 

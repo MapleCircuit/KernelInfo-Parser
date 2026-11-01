@@ -539,7 +539,7 @@ class GenericTableEngineTestCase:
     @test_feature("cryptographic_hash_presorting", depends_on=["duplicate_primary_key_rejection"])
     def test_11_cryptographic_hash_presorting(self) -> None:
         """Verify batch insert payloads on tables with hash primary keys are pre-sorted in ascending order."""
-        t_code = self.test_tables.t_tag_code
+        t_hash = self.test_tables.t_ast_hash
 
         with test_step("Staging rows with pseudo-random unsorted binary hashes"):
             hashes = [
@@ -549,13 +549,13 @@ class GenericTableEngineTestCase:
                 b"\x05" * 32,
             ]
             for h in hashes:
-                self.te.set(t_code.table_id, (h, f"code_{h.hex()[:4]}"))
+                self.te.set(t_hash.table_id, (h, 1))
 
         with test_step(
             "Calling commit() and verifying payload rows are sorted by primary key",
             diagnostic="TableEngine must pre-sort cryptographic hash batch payloads to optimize B+Tree leaf insertion.",
         ):
-            self.te.commit(t_code.table_id)
+            self.te.commit(t_hash.table_id)
             self.assertEqual(len(self.driver.inserts), 1)
             _, payload = self.driver.inserts[0]
             pks = [row[0] for row in payload]
@@ -572,12 +572,12 @@ class GenericTableEngineTestCase:
             raise unittest.SkipTest(f"SKIPPED: Extended in-memory caching is not applicable to '{self.engine_name}'.")
 
         t_fn = self.test_tables.t_file_name
-        t_code = self.test_tables.t_tag_code
+        t_hash = self.test_tables.t_ast_hash
 
         with test_step("Configuring mock preloaded rows in RecordingDriver"):
             fresh_driver = RecordingDriver()
             fresh_driver.preload_returns[t_fn.table_name] = [(1, "fs/ext4/super.c"), (2, "fs/ext4/inode.c")]
-            fresh_driver.preload_returns[t_code.table_name] = [(b"\x12" * 32,)]
+            fresh_driver.preload_returns[t_hash.table_name] = [(b"\x12" * 32, 1)]
 
         with test_step("Starting TECachedDB and asserting select_preload calls"):
             fresh_te = self.te_class()
@@ -586,7 +586,7 @@ class GenericTableEngineTestCase:
             # Assert select_preload was called for cached tables
             preload_tables = [item[0] for item in fresh_driver.preload_calls]
             self.assertIn(t_fn.table_name, preload_tables)
-            self.assertIn(t_code.table_name, preload_tables)
+            self.assertIn(t_hash.table_name, preload_tables)
 
         with test_step("Verifying preloaded rows were populated in in-memory cache and indices"):
             cached_row = fresh_te.get(t_fn.table_id, (1, None))
@@ -678,14 +678,14 @@ class GenericTableEngineTestCase:
             raise unittest.SkipTest(f"SKIPPED: Extended in-memory caching is not applicable to '{self.engine_name}'.")
 
         t_fn = self.test_tables.t_file_name
-        t_code = self.test_tables.t_tag_code
+        t_hash = self.test_tables.t_ast_hash
 
         with test_step("Reporting one cached table above and one below the 1MB ceiling"):
             fresh_driver = RecordingDriver()
             fresh_driver.table_sizes[t_fn.table_name] = 4 * 1024 * 1024
-            fresh_driver.table_sizes[t_code.table_name] = 64 * 1024
+            fresh_driver.table_sizes[t_hash.table_name] = 64 * 1024
             fresh_driver.preload_returns[t_fn.table_name] = [(1, "fs/ext4/super.c")]
-            fresh_driver.preload_returns[t_code.table_name] = [(b"\x12" * 32,)]
+            fresh_driver.preload_returns[t_hash.table_name] = [(b"\x12" * 32, 1)]
             fresh_te = self.te_class(cache_max_table_mb=1)
             fresh_te.start(self.test_tables.tables_list, lambda: fresh_driver)
 
@@ -703,13 +703,13 @@ class GenericTableEngineTestCase:
             diagnostic="The ceiling must be compared against the cached column projection, not the whole row.",
         ):
             measured = {name: cols for name, cols, _vid in fresh_driver.size_calls}
-            self.assertEqual(measured.get(t_code.table_name), t_code.cached_columns)
+            self.assertEqual(measured.get(t_hash.table_name), t_hash.cached_columns)
             self.assertEqual(measured.get(t_fn.table_name), t_fn.cached_columns)
 
         with test_step("Asserting the table below the ceiling is still preloaded and cached"):
-            self.assertNotIn(t_code.table_id, fresh_te._oversized)
-            self.assertTrue(fresh_te._is_cached(t_code))
-            self.assertIn(t_code.table_name, [item[0] for item in fresh_driver.preload_calls])
+            self.assertNotIn(t_hash.table_id, fresh_te._oversized)
+            self.assertTrue(fresh_te._is_cached(t_hash))
+            self.assertIn(t_hash.table_name, [item[0] for item in fresh_driver.preload_calls])
 
         with test_step(
             "Asserting a read of the excluded table reaches the database",

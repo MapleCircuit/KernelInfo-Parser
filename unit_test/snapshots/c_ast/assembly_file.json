@@ -42,16 +42,6 @@
         "type_id": "84 (ASM_Directive)"
       }
     ],
-    "m_tag_code": [
-      {
-        "hash": "hex:984ca77b50d76b96672bb45c1f5571e98fe1e7edec41a71acf580f1fd96f719b",
-        "code": "/*\n * arch/alpha/lib/clear_page.S\n *\n * Zero an entire page.\n */"
-      },
-      {
-        "hash": "hex:a721a32737fc46115edcb63c32e9ec3de58866b62f971a3a37317acca553b5c9",
-        "code": ".text\n\t.align 4\n\t.global clear_page\n\t.ent clear_page\nclear_page:\n\t.prologue 0\n\n\tlda\t$0,128\n\tnop\n\tunop\n\tnop\n\n1:\tstq\t$31,0($16)\n\tstq\t$31,8($16)\n\tstq\t$31,16($16)\n\tstq\t$31,24($16)\n\n\tstq\t$31,32($16)\n\tstq\t$31,40($16)\n\tstq\t$31,48($16)\n\tsubq\t$0,1,$0\n\n\tstq\t$31,56($16)\n\taddq\t$16,64,$16\n\tunop\n\tbne\t$0,1b\n\n\tret\n\tnop\n\tunop\n\tnop\n\n\t.end clear_page"
-      }
-    ],
     "m_tag": [
       {
         "tag_id": "$tag_0",

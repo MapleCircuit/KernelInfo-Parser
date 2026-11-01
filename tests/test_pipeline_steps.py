@@ -328,7 +328,7 @@ class _CountingDB(MockDB):
 
 
 class TestCarriedHashTables(unittest.TestCase):
-    """m_ast_hash / m_tag_code survive TableEngine restarts instead of being reloaded every version."""
+    """m_ast_hash survives TableEngine restarts instead of being reloaded every version."""
 
     def setUp(self) -> None:
         self.saved = (G.DB, G.TE, main.gp.Old_VID)
@@ -379,7 +379,6 @@ class TestCarriedHashTables(unittest.TestCase):
 
         self._start()                                    # version 3: reuses it
         self.assertNotIn("m_ast_hash", _CountingDB.preloaded)
-        self.assertNotIn("m_tag_code", _CountingDB.preloaded)
         self.assertIn("m_file_name", _CountingDB.preloaded)
         self.assertEqual(self._ast_id(old[0]), 1001)
         self.assertEqual(self._ast_id(committed), 1010)

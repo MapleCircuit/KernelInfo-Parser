@@ -28,7 +28,6 @@ SCHEMA ENTITY-RELATIONSHIP GRAPH:
 3. Universal Content-Addressable Stores:
    m_file_name (fnid, fname)
    m_file_blob (blob_id, blob_hash, ftype)
-   m_tag_code (hash, code)
    m_ast (ast_id, name, type_id)
    m_ast_hash (hash, ast_id)
    m_type_descriptor (type_id, name)
@@ -294,29 +293,10 @@ m_ast_debug = Table(
 )
 
 # -----------------------------------------------------------------------------
-# 10. m_tag_code (table_id=10): Content-Addressable Source Code Snippets
-# -----------------------------------------------------------------------------
-m_tag_code = Table(
-    table_id=10,
-    table_name="m_tag_code",
-    columns=(
-        ("hash", "BINARY(32)", "NOT NULL"),
-        ("code", "MEDIUMTEXT", "NOT NULL"),
-    ),
-    primary=("hash",),
-    foreign=None,
-    initial_insert=((b"\x00" * 32, ""),),
-    no_duplicate=False,
-    te_cached=("hash",),
-    idempotent_pk=True,
-    hashing_table=False,
-)
-
-# -----------------------------------------------------------------------------
-# 11. m_tag (table_id=11): Immutable & Recyclable AST Code Tag Entity
+# 10. m_tag (table_id=10): Immutable & Recyclable AST Code Tag Entity
 # -----------------------------------------------------------------------------
 m_tag = Table(
-    table_id=11,
+    table_id=10,
     table_name="m_tag",
     columns=(
         ("tag_id", "INT", "NOT NULL", "AUTO_INCREMENT"),
@@ -327,7 +307,6 @@ m_tag = Table(
     ),
     primary=("tag_id",),
     foreign=(
-        ("hash", "m_tag_code", "hash"),
         ("ast_id", "m_ast", "ast_id"),
     ),
     initial_insert=((0, b"\x00" * 32, 0, 0, 0),),
@@ -338,10 +317,10 @@ m_tag = Table(
 )
 
 # -----------------------------------------------------------------------------
-# 12. m_bridge_tag (table_id=12): Tag Occurrence Coordinates within Content Blob
+# 11. m_bridge_tag (table_id=11): Tag Occurrence Coordinates within Content Blob
 # -----------------------------------------------------------------------------
 m_bridge_tag = Table(
-    table_id=12,
+    table_id=11,
     table_name="m_bridge_tag",
     columns=(
         ("blob_id", "INT", "NOT NULL"),
@@ -366,10 +345,10 @@ m_bridge_tag = Table(
 setattr(m_bridge_tag, "fid", m_bridge_tag.blob_id)
 
 # -----------------------------------------------------------------------------
-# 13. m_map_ast (table_id=13): Tag-Relative AST Overlay Spans
+# 12. m_map_ast (table_id=12): Tag-Relative AST Overlay Spans
 # -----------------------------------------------------------------------------
 m_map_ast = Table(
-    table_id=13,
+    table_id=12,
     table_name="m_map_ast",
     columns=(
         ("map_id", "INT", "NOT NULL"),
@@ -389,10 +368,10 @@ m_map_ast = Table(
 )
 
 # -----------------------------------------------------------------------------
-# 14. m_bridge_map (table_id=14): Tag to AST Map Linkage
+# 13. m_bridge_map (table_id=13): Tag to AST Map Linkage
 # -----------------------------------------------------------------------------
 m_bridge_map = Table(
-    table_id=14,
+    table_id=13,
     table_name="m_bridge_map",
     columns=(
         ("tag_id", "INT", "NOT NULL"),
@@ -408,10 +387,10 @@ m_bridge_map = Table(
 )
 
 # -----------------------------------------------------------------------------
-# 15. m_ast_hash (table_id=15): Cryptographic AST Content Hash Index
+# 14. m_ast_hash (table_id=14): Cryptographic AST Content Hash Index
 # -----------------------------------------------------------------------------
 m_ast_hash = Table(
-    table_id=15,
+    table_id=14,
     table_name="m_ast_hash",
     columns=(
         ("hash", "BINARY(32)", "NOT NULL"),
@@ -427,10 +406,10 @@ m_ast_hash = Table(
 )
 
 # -----------------------------------------------------------------------------
-# 16. m_maintainer_person (table_id=16): Contributor Identity Registry
+# 15. m_maintainer_person (table_id=15): Contributor Identity Registry
 # -----------------------------------------------------------------------------
 m_maintainer_person = Table(
-    table_id=16,
+    table_id=15,
     table_name="m_maintainer_person",
     columns=(
         ("person_id", "INT", "NOT NULL", "AUTO_INCREMENT"),
@@ -446,10 +425,10 @@ m_maintainer_person = Table(
 )
 
 # -----------------------------------------------------------------------------
-# 17. m_maintainer_section (table_id=17): Blob-Scoped Subsystem Definitions
+# 16. m_maintainer_section (table_id=16): Blob-Scoped Subsystem Definitions
 # -----------------------------------------------------------------------------
 m_maintainer_section = Table(
-    table_id=17,
+    table_id=16,
     table_name="m_maintainer_section",
     columns=(
         ("sec_id", "INT", "NOT NULL", "AUTO_INCREMENT"),
@@ -474,10 +453,10 @@ m_maintainer_section = Table(
 )
 
 # -----------------------------------------------------------------------------
-# 18. m_maintainer_member (table_id=18): Section Maintainer Members
+# 17. m_maintainer_member (table_id=17): Section Maintainer Members
 # -----------------------------------------------------------------------------
 m_maintainer_member = Table(
-    table_id=18,
+    table_id=17,
     table_name="m_maintainer_member",
     columns=(
         ("sec_id", "INT", "NOT NULL"),
@@ -498,10 +477,10 @@ m_maintainer_member = Table(
 )
 
 # -----------------------------------------------------------------------------
-# 19. m_maintainer_pattern (table_id=19): Section File Matching Patterns
+# 18. m_maintainer_pattern (table_id=18): Section File Matching Patterns
 # -----------------------------------------------------------------------------
 m_maintainer_pattern = Table(
-    table_id=19,
+    table_id=18,
     table_name="m_maintainer_pattern",
     columns=(
         ("sec_id", "INT", "NOT NULL"),
@@ -519,10 +498,10 @@ m_maintainer_pattern = Table(
 )
 
 # -----------------------------------------------------------------------------
-# 20. m_maintainer_file (table_id=20): Path to Maintainer Section Resolution
+# 19. m_maintainer_file (table_id=19): Path to Maintainer Section Resolution
 # -----------------------------------------------------------------------------
 m_maintainer_file = Table(
-    table_id=20,
+    table_id=19,
     table_name="m_maintainer_file",
     columns=(
         ("maintainers_blob_id", "INT", "NOT NULL"),
@@ -544,10 +523,10 @@ m_maintainer_file = Table(
 )
 
 # -----------------------------------------------------------------------------
-# 21. m_credits_entry (table_id=21): Linux CREDITS Contributor Biographies
+# 20. m_credits_entry (table_id=20): Linux CREDITS Contributor Biographies
 # -----------------------------------------------------------------------------
 m_credits_entry = Table(
-    table_id=21,
+    table_id=20,
     table_name="m_credits_entry",
     columns=(
         ("credit_id", "INT", "NOT NULL", "AUTO_INCREMENT"),
@@ -573,10 +552,10 @@ m_credits_entry = Table(
 )
 
 # -----------------------------------------------------------------------------
-# 22. m_commit (table_id=22): Git Commit Metadata & Topology Node
+# 21. m_commit (table_id=21): Git Commit Metadata & Topology Node
 # -----------------------------------------------------------------------------
 m_commit = Table(
-    table_id=22,
+    table_id=21,
     table_name="m_commit",
     columns=(
         ("commit_id", "INT", "NOT NULL", "AUTO_INCREMENT"),
@@ -603,10 +582,10 @@ m_commit = Table(
 )
 
 # -----------------------------------------------------------------------------
-# 23. m_bridge_commit_person (table_id=23): Git Commit Contributor Attribution
+# 22. m_bridge_commit_person (table_id=22): Git Commit Contributor Attribution
 # -----------------------------------------------------------------------------
 m_bridge_commit_person = Table(
-    table_id=23,
+    table_id=22,
     table_name="m_bridge_commit_person",
     columns=(
         ("commit_id", "INT", "NOT NULL"),
@@ -630,10 +609,10 @@ m_bridge_commit_person = Table(
 )
 
 # -----------------------------------------------------------------------------
-# 24. m_commit_file (table_id=24): First-Parent Commit Tree Delta
+# 23. m_commit_file (table_id=23): First-Parent Commit Tree Delta
 # -----------------------------------------------------------------------------
 m_commit_file = Table(
-    table_id=24,
+    table_id=23,
     table_name="m_commit_file",
     columns=(
         ("commit_id", "INT", "NOT NULL"),
@@ -659,10 +638,10 @@ m_commit_file = Table(
 m_bridge_commit_file = m_commit_file
 
 # -----------------------------------------------------------------------------
-# 25. m_bridge_commit_tag (table_id=25): Tag Lifecycle Introduced in Commit
+# 24. m_bridge_commit_tag (table_id=24): Tag Lifecycle Introduced in Commit
 # -----------------------------------------------------------------------------
 m_bridge_commit_tag = Table(
-    table_id=25,
+    table_id=24,
     table_name="m_bridge_commit_tag",
     columns=(
         ("commit_id", "INT", "NOT NULL"),
@@ -684,10 +663,10 @@ m_bridge_commit_tag = Table(
 )
 
 # -----------------------------------------------------------------------------
-# 26. m_moved_tag (table_id=26): Content Tag Evolution (M:N Cross-Branch DAG)
+# 25. m_moved_tag (table_id=25): Content Tag Evolution (M:N Cross-Branch DAG)
 # -----------------------------------------------------------------------------
 m_moved_tag = Table(
-    table_id=26,
+    table_id=25,
     table_name="m_moved_tag",
     columns=(
         ("s_tag_id", "INT", "NOT NULL"),
@@ -707,12 +686,12 @@ m_moved_tag = Table(
 )
 
 # -----------------------------------------------------------------------------
-# 27. m_blob_symbol_def (table_id=27): Per-Blob Symbol Definitions
+# 26. m_blob_symbol_def (table_id=26): Per-Blob Symbol Definitions
 #     Definitions that cannot be stored once per tag (outside their tag's lines, tagless, ambiguous key, or a
 #     reused tag whose definitions changed); the m_symbol_def view adds the m_tag_def rows (core/SymbolRows.py)
 # -----------------------------------------------------------------------------
 m_blob_symbol_def = Table(
-    table_id=27,
+    table_id=26,
     table_name="m_blob_symbol_def",
     columns=(
         ("def_id", "INT", "NOT NULL", "AUTO_INCREMENT"),
@@ -746,12 +725,12 @@ m_blob_symbol_def = Table(
 )
 
 # -----------------------------------------------------------------------------
-# 28. m_blob_symbol_ref (table_id=28): Per-Blob Symbol Occurrences & Usages
+# 27. m_blob_symbol_ref (table_id=27): Per-Blob Symbol Occurrences & Usages
 #     References that cannot be stored once per tag (same cases as m_blob_symbol_def); the m_symbol_ref view
 #     adds the m_tag_ref rows resolved through m_blob_symbol
 # -----------------------------------------------------------------------------
 m_blob_symbol_ref = Table(
-    table_id=28,
+    table_id=27,
     table_name="m_blob_symbol_ref",
     columns=(
         ("ref_id", "INT", "NOT NULL", "AUTO_INCREMENT"),
@@ -782,10 +761,10 @@ m_blob_symbol_ref = Table(
 )
 
 # -----------------------------------------------------------------------------
-# 29. m_file_reference (table_id=29): Unified Blob-Scoped Cross-File Provenance
+# 28. m_file_reference (table_id=28): Unified Blob-Scoped Cross-File Provenance
 # -----------------------------------------------------------------------------
 m_file_reference = Table(
-    table_id=29,
+    table_id=28,
     table_name="m_file_reference",
     columns=(
         ("ref_id", "INT", "NOT NULL", "AUTO_INCREMENT"),
@@ -814,10 +793,10 @@ m_file_reference = Table(
 setattr(m_file_reference, "source_fid", m_file_reference.source_blob_id)
 
 # -----------------------------------------------------------------------------
-# 30. m_db_instance (table_id=30): Database Instance Fingerprint
+# 29. m_db_instance (table_id=29): Database Instance Fingerprint
 # -----------------------------------------------------------------------------
 m_db_instance = Table(
-    table_id=30,
+    table_id=29,
     table_name="m_db_instance",
     columns=(
         ("instance_hash", "VARCHAR(64)", "NOT NULL", "COLLATE utf8mb4_bin"),
@@ -833,31 +812,10 @@ m_db_instance = Table(
 )
 
 # -----------------------------------------------------------------------------
-# 35. m_ast_attribute (table_id=35): AST Compiler & Kernel Attributes
-# -----------------------------------------------------------------------------
-m_ast_attribute = Table(
-    table_id=35,
-    table_name="m_ast_attribute",
-    columns=(
-        ("ast_id", "INT", "NOT NULL"),
-        ("priority", "SMALLINT", "UNSIGNED", "NOT NULL"),
-        ("name", "VARCHAR(64)", "NOT NULL", "COLLATE utf8mb4_bin"),
-        ("val", "VARCHAR(255)", "DEFAULT ''", "COLLATE utf8mb4_bin"),
-    ),
-    primary=("ast_id", "priority"),
-    foreign=(("ast_id", "m_ast", "ast_id"),),
-    initial_insert=None,
-    no_duplicate=False,
-    te_cached=False,
-    idempotent_pk=True,
-    hashing_table=False,
-)
-
-# -----------------------------------------------------------------------------
-# 31. m_git_network (table_id=31): Git Object Pool & Root Commit Scope
+# 30. m_git_network (table_id=30): Git Object Pool & Root Commit Scope
 # -----------------------------------------------------------------------------
 m_git_network = Table(
-    table_id=31,
+    table_id=30,
     table_name="m_git_network",
     columns=(
         ("network_id", "INT", "NOT NULL", "AUTO_INCREMENT"),
@@ -875,10 +833,10 @@ m_git_network = Table(
 )
 
 # -----------------------------------------------------------------------------
-# 32. m_repository (table_id=32): Repository Remote / Clone Descriptor
+# 31. m_repository (table_id=31): Repository Remote / Clone Descriptor
 # -----------------------------------------------------------------------------
 m_repository = Table(
-    table_id=32,
+    table_id=31,
     table_name="m_repository",
     columns=(
         ("repo_id", "INT", "NOT NULL", "AUTO_INCREMENT"),
@@ -897,10 +855,10 @@ m_repository = Table(
 )
 
 # -----------------------------------------------------------------------------
-# 33. m_git_ref (table_id=33): Named Git Reference (Branch, Tag, Release)
+# 32. m_git_ref (table_id=32): Named Git Reference (Branch, Tag, Release)
 # -----------------------------------------------------------------------------
 m_git_ref = Table(
-    table_id=33,
+    table_id=32,
     table_name="m_git_ref",
     columns=(
         ("ref_id", "INT", "NOT NULL", "AUTO_INCREMENT"),
@@ -929,10 +887,10 @@ setattr(m_git_ref, "vid", m_git_ref.commit_id)
 setattr(m_git_ref, "vname", m_git_ref.ref_name)
 
 # -----------------------------------------------------------------------------
-# 34. m_commit_parent (table_id=34): Full Git Commit Topology (First & Merge Parents)
+# 33. m_commit_parent (table_id=33): Full Git Commit Topology (First & Merge Parents)
 # -----------------------------------------------------------------------------
 m_commit_parent = Table(
-    table_id=34,
+    table_id=33,
     table_name="m_commit_parent",
     columns=(
         ("commit_id", "INT", "NOT NULL"),
@@ -955,10 +913,31 @@ m_commit_parent = Table(
 )
 
 # -----------------------------------------------------------------------------
-# 36. m_ingest_state (table_id=36): Atomic Ingestion Progress & Crash Recovery
+# 34. m_ast_attribute (table_id=34): AST Compiler & Kernel Attributes
+# -----------------------------------------------------------------------------
+m_ast_attribute = Table(
+    table_id=34,
+    table_name="m_ast_attribute",
+    columns=(
+        ("ast_id", "INT", "NOT NULL"),
+        ("priority", "SMALLINT", "UNSIGNED", "NOT NULL"),
+        ("name", "VARCHAR(64)", "NOT NULL", "COLLATE utf8mb4_bin"),
+        ("val", "VARCHAR(255)", "DEFAULT ''", "COLLATE utf8mb4_bin"),
+    ),
+    primary=("ast_id", "priority"),
+    foreign=(("ast_id", "m_ast", "ast_id"),),
+    initial_insert=None,
+    no_duplicate=False,
+    te_cached=False,
+    idempotent_pk=True,
+    hashing_table=False,
+)
+
+# -----------------------------------------------------------------------------
+# 35. m_ingest_state (table_id=35): Atomic Ingestion Progress & Crash Recovery
 # -----------------------------------------------------------------------------
 m_ingest_state = Table(
-    table_id=36,
+    table_id=35,
     table_name="m_ingest_state",
     columns=(
         ("network_id", "INT", "NOT NULL"),
@@ -979,12 +958,12 @@ m_ingest_state = Table(
 )
 
 # -----------------------------------------------------------------------------
-# 37. m_tag_def (table_id=37): Symbol Definitions of a Tag, Relative to the Tag's First Line
+# 36. m_tag_def (table_id=36): Symbol Definitions of a Tag, Relative to the Tag's First Line
 #     Written once, when the tag is new; every blob placing the tag (m_bridge_tag) shares them. ast_id is not
 #     stored: it is resolved per blob through m_blob_symbol (sym_key), like a reference's target.
 # -----------------------------------------------------------------------------
 m_tag_def = Table(
-    table_id=37,
+    table_id=36,
     table_name="m_tag_def",
     columns=(
         ("tag_id", "INT", "NOT NULL"),
@@ -1006,12 +985,12 @@ m_tag_def = Table(
 )
 
 # -----------------------------------------------------------------------------
-# 38. m_tag_ref (table_id=38): Symbol References of a Tag, Relative to the Tag's First Line
+# 37. m_tag_ref (table_id=37): Symbol References of a Tag, Relative to the Tag's First Line
 #     Written once, when the tag is new. sym_key identifies the target without resolving it (core/SymbolRows.py);
 #     m_blob_symbol resolves it per blob, since a target's AST id changes whenever its definition does.
 # -----------------------------------------------------------------------------
 m_tag_ref = Table(
-    table_id=38,
+    table_id=37,
     table_name="m_tag_ref",
     columns=(
         ("tag_id", "INT", "NOT NULL"),
@@ -1031,11 +1010,11 @@ m_tag_ref = Table(
 )
 
 # -----------------------------------------------------------------------------
-# 39. m_blob_symbol (table_id=39): Per-Blob Resolution of Symbol Keys
+# 38. m_blob_symbol (table_id=38): Per-Blob Resolution of Symbol Keys
 #     One row per distinct sym_key the blob's shared tag rows use: the AST id (and file) it resolves to here.
 # -----------------------------------------------------------------------------
 m_blob_symbol = Table(
-    table_id=39,
+    table_id=38,
     table_name="m_blob_symbol",
     columns=(
         ("blob_id", "INT", "NOT NULL"),
@@ -1058,12 +1037,12 @@ m_blob_symbol = Table(
 )
 
 # -----------------------------------------------------------------------------
-# 40. m_symbol_own (table_id=40): Tag Placements Whose Symbols Are Stored Per Blob
+# 39. m_symbol_own (table_id=39): Tag Placements Whose Symbols Are Stored Per Blob
 #     kind 1 = references, 2 = definitions: the views skip that tag's shared rows in that blob and the
 #     m_blob_symbol_ref / m_blob_symbol_def rows stand in for them.
 # -----------------------------------------------------------------------------
 m_symbol_own = Table(
-    table_id=40,
+    table_id=39,
     table_name="m_symbol_own",
     columns=(
         ("blob_id", "INT", "NOT NULL"),
@@ -1083,13 +1062,13 @@ m_symbol_own = Table(
 )
 
 # -----------------------------------------------------------------------------
-# 41. m_ingest_watermark (table_id=41): Highest Id of Each Id-Allocating Table When a Version Run Started
+# 40. m_ingest_watermark (table_id=40): Highest Id of Each Id-Allocating Table When a Version Run Started
 #     Rows above these marks were created by that run; core/ingest_state.py rolls them back when the
 #     run was interrupted (m_ingest_state still INGEST_PARSING). Removed once the version is done.
 #     No foreign keys: the bookkeeping must survive the rollback it drives.
 # -----------------------------------------------------------------------------
 m_ingest_watermark = Table(
-    table_id=41,
+    table_id=40,
     table_name="m_ingest_watermark",
     columns=(
         ("commit_id", "INT", "NOT NULL"),
@@ -1107,12 +1086,12 @@ m_ingest_watermark = Table(
 )
 
 # -----------------------------------------------------------------------------
-# 42. m_ingest_blob (table_id=42): Pre-Existing Blobs a Version Run Parses
+# 41. m_ingest_blob (table_id=41): Pre-Existing Blobs a Version Run Parses
 #     Blobs created by earlier runs without being parsed (intermediate commits): their derived rows
 #     are cleared too when the run is rolled back. Removed once the version is done.
 # -----------------------------------------------------------------------------
 m_ingest_blob = Table(
-    table_id=42,
+    table_id=41,
     table_name="m_ingest_blob",
     columns=(
         ("commit_id", "INT", "NOT NULL"),
@@ -1128,14 +1107,14 @@ m_ingest_blob = Table(
 )
 
 # -----------------------------------------------------------------------------
-# 43. m_arch_root (table_id=43): Build Layout of Each ARCH at a Version
+# 42. m_arch_root (table_id=42): Build Layout of Each ARCH at a Version
 #     What `make ARCH=<arch>` uses at the version's head commit, evaluated from its Makefiles by
 #     parser/arch_layout.py: role 1 source directory, 2 include directory (priority = -I order),
 #     3 symlink the build creates (path -> target), 4 generated asm-generic wrapper (path -> the
 #     header it includes), 5 forced -include file. Directories end with "/".
 # -----------------------------------------------------------------------------
 m_arch_root = Table(
-    table_id=43,
+    table_id=42,
     table_name="m_arch_root",
     columns=(
         ("commit_id", "INT", "NOT NULL"),
@@ -1155,10 +1134,10 @@ m_arch_root = Table(
 )
 
 # -----------------------------------------------------------------------------
-# 44. m_commit_email (table_id=44): Git Commit to Mailing List Message Linkage
+# 43. m_commit_email (table_id=43): Git Commit to Mailing List Message Linkage
 # -----------------------------------------------------------------------------
 m_commit_email = Table(
-    table_id=44,
+    table_id=43,
     table_name="m_commit_email",
     columns=(
         ("commit_id", "INT", "NOT NULL"),
@@ -1193,54 +1172,53 @@ TABLES: tuple[Table, ...] = (
     m_ast_container,       # 7
     m_ast_include,         # 8
     m_ast_debug,           # 9
-    m_tag_code,            # 10
-    m_tag,                 # 11
-    m_bridge_tag,          # 12
-    m_map_ast,             # 13
-    m_bridge_map,          # 14
-    m_ast_hash,            # 15
-    m_maintainer_person,   # 16
-    m_maintainer_section,  # 17
-    m_maintainer_member,   # 18
-    m_maintainer_pattern,  # 19
-    m_maintainer_file,     # 20
-    m_credits_entry,       # 21
-    m_commit,              # 22
-    m_bridge_commit_person,# 23
-    m_commit_file,         # 24
-    m_bridge_commit_tag,   # 25
-    m_moved_tag,           # 26
-    m_blob_symbol_def,     # 27
-    m_blob_symbol_ref,     # 28
-    m_file_reference,      # 29
-    m_db_instance,         # 30
-    m_git_network,         # 31
-    m_repository,          # 32
-    m_git_ref,             # 33
-    m_commit_parent,       # 34
-    m_ast_attribute,       # 35
-    m_ingest_state,        # 36
-    m_tag_def,             # 37
-    m_tag_ref,             # 38
-    m_blob_symbol,         # 39
-    m_symbol_own,          # 40
-    m_ingest_watermark,    # 41
-    m_ingest_blob,         # 42
-    m_arch_root,           # 43
-    m_commit_email,        # 44
+    m_tag,                 # 10
+    m_bridge_tag,          # 11
+    m_map_ast,             # 12
+    m_bridge_map,          # 13
+    m_ast_hash,            # 14
+    m_maintainer_person,   # 15
+    m_maintainer_section,  # 16
+    m_maintainer_member,   # 17
+    m_maintainer_pattern,  # 18
+    m_maintainer_file,     # 19
+    m_credits_entry,       # 20
+    m_commit,              # 21
+    m_bridge_commit_person,# 22
+    m_commit_file,         # 23
+    m_bridge_commit_tag,   # 24
+    m_moved_tag,           # 25
+    m_blob_symbol_def,     # 26
+    m_blob_symbol_ref,     # 27
+    m_file_reference,      # 28
+    m_db_instance,         # 29
+    m_git_network,         # 30
+    m_repository,          # 31
+    m_git_ref,             # 32
+    m_commit_parent,       # 33
+    m_ast_attribute,       # 34
+    m_ingest_state,        # 35
+    m_tag_def,             # 36
+    m_tag_ref,             # 37
+    m_blob_symbol,         # 38
+    m_symbol_own,          # 39
+    m_ingest_watermark,    # 40
+    m_ingest_blob,         # 41
+    m_arch_root,           # 42
+    m_commit_email,        # 43
 )
 
 Table_Array = TABLES
 
 
 def init_db_layout(gp=None) -> tuple[Table, ...]:
-    """Initialize and populate gp.Table_Array with all 45 schema tables.
+    """Initialize and populate gp.Table_Array with all 44 schema tables.
 
     Args:
         gp: Optional GreatProcessor instance to attach Table_Array to.
 
     Returns:
-        Immutable tuple of all 45 Table schema objects.
+        Immutable tuple of all 44 Table schema objects.
     """
     if gp is not None:
         gp.Table_Array = list(TABLES)

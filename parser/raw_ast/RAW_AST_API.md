@@ -11,7 +11,7 @@ The Fallback Raw AST parser (`raw_ast.py`) serves as the universal parser for fi
 ### Core Responsibilities
 1. **Full-Extent Tagging**: Wraps the entire content of the raw file in a single cohesive occurrence tag (`m_tag`) spanning from line 1, char 1 to `line_count`, `last_char_count`.
 2. **Cryptographic Identity**: Computes deterministic SHA-256 hashes (`BINARY(32)` digest for `m_tag.hash` and hexadecimal string for `m_ast.name` with `ASTT.Raw_Content`).
-3. **Cross-Version Tag Recycling**: Detects identical content across kernel releases and recycles existing `tag_id`s into new `m_bridge_file` / `m_bridge_tag` links with zero duplicate `m_tag`, `m_ast`, or `m_tag_code` database entries.
+3. **Cross-Version Tag Recycling**: Detects identical content across kernel releases and recycles existing `tag_id`s into new `m_bridge_file` / `m_bridge_tag` links with zero duplicate `m_tag` or `m_ast` database entries.
 4. **History & Evolution Tracking**: When content changes across versions, records transitional links via `m_moved_tag(s_tag_id, tag_ref)`. Under the immutable Git DAG architecture, prior tags are permanent content records; tag closure is a no-op.
 
 ```
@@ -44,7 +44,6 @@ Raw / Fallback File (T_RAW, T_MAINTAINERS, T_CREDITS, etc.)
      │     ├─ m_ast.view(((m_ast.ast_id,),), None, content_hex, ASTT.Raw_Content) [Rule 23]
      │     ├─ with CS(REF_POS):
      │     │  ├─ m_tag.set(None, content_hash, ast_ref, 0, 0) [5-col, Rule 12]
-     │     │  ├─ m_tag_code.get_set(content_hash, content)
      │     │  └─ m_moved_tag.set(s_tag_id, tag_ref) (if modifying prior tag)
      │     ├─ m_bridge_tag.set(blob_id, tag_ref, 1, line_count, 1, last_char_count)
      │     ├─ m_map_ast.set(tag_ref, 1, 1, line_count, last_char_count, ast_ref)
@@ -138,7 +137,6 @@ with CS(REF_POS):
         0,
     ))
     tag_ref = ((m_tag.table_id, 0), OP_REF, (REF_POS, CS.route[-1]))
-    CS.store(m_tag_code.get_set(content_hash, content))
     if s_tag_id is not None:
         CS.store(m_moved_tag.set(s_tag_id, tag_ref))
 
@@ -177,8 +175,8 @@ if not hasattr(CS, "register_bridge_map") or CS.register_bridge_map(tag_ref, tag
 
 ## 3. Critical Invariants & Rules
 
-1. **Tag Reference Invariant (Rule 12)**: Inside `with CS(REF_POS):`, `m_tag.set` must be the first stored operation so `tag_ref` points directly to `m_tag`. Auxiliary deduplication tables (`m_tag_code.get_set`) must be stored immediately after.
-2. **Binary Digest Invariant (Rule 14)**: `m_tag.hash` and `m_tag_code.hash` require raw 32-byte binary SHA-256 digests (`hashlib.sha256(content_bytes).digest()`). The AST symbol name (`m_ast.name`) uses the 64-character hexadecimal digest string (`hexdigest()`).
+1. **Tag Reference Invariant (Rule 12)**: Inside `with CS(REF_POS):`, `m_tag.set` must be the first stored operation so `tag_ref` points directly to `m_tag`. Auxiliary deduplication tables (`m_moved_tag.set`) must be stored immediately after if evolving a prior tag.
+2. **Binary Digest Invariant (Rule 14)**: `m_tag.hash` requires raw 32-byte binary SHA-256 digests (`hashlib.sha256(content_bytes).digest()`). The AST symbol name (`m_ast.name`) uses the 64-character hexadecimal digest string (`hexdigest()`).
 3. **Zero-Duplication Exact Renames**: `"R100"` operations are strict no-ops in `raw_ast_parse()` to avoid duplicate AST tags.
 4. **Latin-1 Safety**: Content must always be decoded/encoded using `latin-1` to prevent UTF-8 decode errors on binary or non-UTF8 source tree files.
 5. **Public Engine Queries (Rule 15)**: Tag lookups must strictly query public TableEngine APIs (`m_bridge_tag.view_get_multiple()`, `m_bridge_file.get()`, `m_file_name.get()`) without assuming in-memory table structures.
@@ -194,7 +192,7 @@ The fallback raw AST parser is verified through the reusable snapshot testing ha
   - `extract_changeset_snapshot(CS | [CS, ...], test_conf=...)`: Extracts all executed operations from single or multi-version ChangeSets (`[cs_v1, cs_v2]`). Rows within each table preserve strict operational insertion order. Surrogate monotonic IDs (`tag_id`, `ast_id`, `fid`, `fnid`, `map_id`) are canonicalized into symbolic identifiers (`$tag_0`, `$ast_0`, `$fid_0`) sequentially based on first-appearance order, rendering snapshots deterministic while preserving concrete `vid` sequences. Updates on primary keys (`OP_UPDATE`) update existing rows in place. Table rows preserve exact database column definitions (`table.init_columns`), `type_id` values are formatted as `<id> (<name>)` (e.g., `"144 (Raw_Content)"`), and `ftype` values are formatted as `<id> (<name>)` (e.g., `"7 (T_RAW)"`).
   - `assert_snapshot_matches(test_case, parser_name, test_name, snapshot)`: Verifies extracted ChangeSet tables and `test_conf` metadata against verified JSON baselines. Set `UPDATE_SNAPSHOTS=1` in the environment to re-generate baselines after human verification.
 - **Test Suite**: `unit_test/test_raw_parser.py`
-  - `test_01_added_raw_file`: Added (`A`) file parsing, verifying creation of `m_v_main`, file prelude, `m_ast`, `m_tag`, `m_tag_code`, `m_bridge_tag`, `m_map_ast`, and `m_bridge_map`.
-  - `test_02_modified_changed_raw_file`: Modified (`M`) file parsing across `v2.6.39` -> `v3.0`, validating evolutionary links via `m_moved_tag`, retention of both `m_tag_code` records, and tag continuity.
+  - `test_01_added_raw_file`: Added (`A`) file parsing, verifying creation of `m_v_main`, file prelude, `m_ast`, `m_tag`, `m_bridge_tag`, `m_map_ast`, and `m_bridge_map`.
+  - `test_02_modified_changed_raw_file`: Modified (`M`) file parsing across `v2.6.39` -> `v3.0`, validating evolutionary links via `m_moved_tag` and tag continuity.
   - `test_03_exact_rename_raw_file`: Exact rename (`R100`) file parsing across `v2.6.39` -> `v3.0`, verifying `m_v_main` progression, old `fid` reuse, dual `m_bridge_file` links, and zero duplicate AST tags.
 - **Snapshot Storage**: `unit_test/snapshots/raw_ast/*.json` containing `test_conf` metadata and `tables` mapping.

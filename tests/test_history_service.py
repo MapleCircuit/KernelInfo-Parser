@@ -18,6 +18,7 @@ from webapp.backend.services.history_service import (
     RC_RE,
     HistoryService,
     _kconfig_file_facts,
+    _slice_extent,
     history_service,
     kconfig_field_changes,
     normalize_code,
@@ -55,6 +56,25 @@ class TestHistoryHelpers(unittest.TestCase):
         self.assertTrue(RC_RE.search("v2.6.15-rc3"))
         self.assertFalse(RC_RE.search("v2.6.15"))
         self.assertFalse(RC_RE.search("v3.0"))
+
+    def test_slice_extent_coordinates(self) -> None:
+        raw_lines = [
+            "/* header */",
+            "int calculate(int x, int y) {",
+            "    int res = x + y;",
+            "    return res;",
+            "}",
+        ]
+        # Single line slice
+        self.assertEqual(_slice_extent(raw_lines, 2, 2, 1, 30), "int calculate(int x, int y) {")
+        self.assertEqual(_slice_extent(raw_lines, 2, 2, 5, 14), "calculate")
+        # Multi-line slice
+        func_slice = _slice_extent(raw_lines, 2, 5, 1, 2)
+        expected = "int calculate(int x, int y) {\n    int res = x + y;\n    return res;\n}"
+        self.assertEqual(func_slice, expected)
+        # Out of bounds / invalid coordinates
+        self.assertEqual(_slice_extent(raw_lines, 0, 0, 0, 0), "")
+        self.assertEqual(_slice_extent(raw_lines, 10, 15, 1, 1), "")
 
     def test_kconfig_facts_include_inherited_dependencies(self) -> None:
         facts = _kconfig_file_facts(KCONFIG_TEXT, "SMP")

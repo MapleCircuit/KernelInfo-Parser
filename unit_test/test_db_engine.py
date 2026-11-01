@@ -507,7 +507,10 @@ class GenericDBEngineTestCase:
         if not self.has_packet_bisection:
             raise unittest.SkipTest(f"SKIPPED: Packet size bisection is not applicable to backend '{self.engine_name}'.")
 
-        t_code = self.test_tables.t_tag_code
+        t_ast = self.test_tables.t_ast
+        t_debug = self.test_tables.t_ast_debug
+        self.db.insert(t_ast, tuple((10 + i, f"node_{i}", 1) for i in range(6)))
+
         original_executemany = self.db.cursor.executemany
         call_count = 0
 
@@ -527,14 +530,14 @@ class GenericDBEngineTestCase:
                 diagnostic="Driver must recursively bisect chunk into halves (3 + 3) and complete both chunks.",
             ):
                 sample_data = tuple(
-                    (bytes([10 + i] * 32), f"int sample_code_{i}() {{ return {i}; }}")
+                    (10 + i, f"int sample_code_{i}() {{ return {i}; }}")
                     for i in range(6)
                 )
-                self.db.insert(t_code, sample_data)
+                self.db.insert(t_debug, sample_data)
                 self.assertGreater(call_count, 1, "Expected bisection to execute multiple smaller batches")
 
             with test_step("Verifying rows were persisted after bisection recovery"):
-                row = self.db.select(t_code, (bytes([10] * 32), None))
+                row = self.db.select(t_debug, (10, None))
                 self.assertIsNotNone(row)
         finally:
             self.db.cursor.executemany = original_executemany
@@ -545,7 +548,7 @@ class GenericDBEngineTestCase:
         if not self.has_packet_bisection:
             raise unittest.SkipTest(f"SKIPPED: Packet size bisection is not applicable to backend '{self.engine_name}'.")
 
-        t_code = self.test_tables.t_tag_code
+        t_debug = self.test_tables.t_ast_debug
 
         with test_step(
             "Attempting insert of single atomic row exceeding max_allowed_packet",
@@ -563,9 +566,9 @@ class GenericDBEngineTestCase:
                 errno=1153, msg="Got a packet bigger than 'max_allowed_packet' bytes"
             )
 
-            single_oversized = ((bytes([99] * 32), "UNHANDLED_OVERSIZED_PAYLOAD"),)
+            single_oversized = ((99, "UNHANDLED_OVERSIZED_PAYLOAD"),)
             with self.assertRaises(mysql.connector.Error) as ctx:
-                mock_driver.insert(t_code, single_oversized)
+                mock_driver.insert(t_debug, single_oversized)
             self.assertIn("1153", str(ctx.exception))
             self.assertEqual(mock_driver.cursor.executemany.call_count, 3, "Expected 3 retry attempts before raising")
 
@@ -575,7 +578,9 @@ class GenericDBEngineTestCase:
         if not self.has_packet_bisection:
             raise unittest.SkipTest(f"SKIPPED: Byte-bounded live chunking test not configured for backend '{self.engine_name}'.")
 
-        t_code = self.test_tables.t_tag_code
+        t_ast = self.test_tables.t_ast
+        t_debug = self.test_tables.t_ast_debug
+        self.db.insert(t_ast, tuple((200 + i, f"node_{i}", 1) for i in range(6)))
 
         with test_step(
             "Inserting 6 rows (~2.4MB total payload) into LONGTEXT table",
@@ -583,13 +588,13 @@ class GenericDBEngineTestCase:
         ):
             large_code_block = "/* payload chunk test */\n" + ("x" * 400_000)
             large_rows = tuple(
-                (bytes([200 + i] * 32), f"{large_code_block}_{i}")
+                (200 + i, f"{large_code_block}_{i}")
                 for i in range(6)
             )
-            self.db.insert(t_code, large_rows)
+            self.db.insert(t_debug, large_rows)
 
         with test_step("Querying inserted large payload record to verify data integrity"):
-            row = self.db.select(t_code, (bytes([200] * 32), None))
+            row = self.db.select(t_debug, (200, None))
             self.assertIsNotNone(row)
             self.assertEqual(len(row[1]), len(large_code_block) + 2)
 

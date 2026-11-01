@@ -70,8 +70,7 @@ CSExtractor.extract_zone(CS, main_zone) -> main_zone.extract(CS) (cs_extractor.p
   │     ├── Rule 12 Staging Order inside with CS(REF_POS):
   │     │     ├── 1. m_tag.set(None, code_hash, ast_ref, 0, 0)          [MUST BE FIRST, 5 columns: tag_id, hash, ast_id, hl_s, hl_l]
   │     │     │      tag_ref = ((m_tag.table_id, 0), OP_REF, (REF_POS, CS.route[-1]))
-  │     │     ├── 2. m_tag_code.get_set(code_hash, code_str)             [Auxiliary hash table]
-  │     │     └── 3. m_moved_tag.set(s_tag_id, tag_ref)                  [If evolved tag match]
+  │     │     └── 2. m_moved_tag.set(s_tag_id, tag_ref)                  [If evolved tag match]
   │     │
   │     ├── File-to-Tag Bridge: m_bridge_tag.set(blob_id, tag_ref, line_s, line_e, char_s, char_e)
   │     ├── Spatial AST Map: m_map_ast.set(tag_ref, 1, 1, rel_line_e, rel_char_e, ast_ref)
@@ -308,7 +307,7 @@ Expands the target `Line` extent to encapsulate trailing punctuation delimiters 
   - `within_range(token, ast_kind) -> bool`: Evaluates boundary enclosure against `end_mode`.
   - `exec_filter(token, cursor, kind)`: Dispatches token to appropriate handler.
   - `extract_1arg(CS, type_id: int, name: int | str, extent: Line | None = None) -> None`: Emits `m_ast.view(((m_ast.ast_id,),), None, str(name)[:255], type_id)` inside `with CS(REF_POS):` and dispatches `self.tag`.
-  - `tag(CS, ast_id_route, extent=None, ast_name=None, ast_type=None) -> None`: Primary tag stager. Evaluates Tier 1 exact hash match, Tier 2-5 evolution transitions, emits `m_tag.set` (Rule 12 first in `REF_POS`), `m_tag_code.get_set`, `m_moved_tag.set`, `m_bridge_tag.set`, and invokes `self.map_ast`.
+  - `tag(CS, ast_id_route, extent=None, ast_name=None, ast_type=None) -> None`: Primary tag stager. Evaluates Tier 1 exact hash match, Tier 2-5 evolution transitions, emits `m_tag.set` (Rule 12 first in `REF_POS`), `m_moved_tag.set`, `m_bridge_tag.set`, and invokes `self.map_ast`.
   - `map_ast(CS, ast_id_route, tag_route, extent=None) -> None`: Computes relative coordinates (using `self.endif` for preprocessor conditional branches) and stages `m_map_ast.set` and deduplicated `m_bridge_map.set`.
 
 #### `Ast_Statement(Ast)` (Statement Interface)
@@ -742,8 +741,6 @@ ast_ref = (
 with CS(REF_POS):
     CS.store(m_tag.set(None, code_hash, ast_ref, 0, 0))
     tag_ref = ((m_tag.table_id, 0), OP_REF, (REF_POS, CS.route[-1]))
-    # Auxiliary tables staged after m_tag.set
-    CS.store(m_tag_code.get_set(code_hash, code_str))
     if s_tag_id is not None:
         CS.store(m_moved_tag.set(s_tag_id, tag_ref))
 
@@ -825,17 +822,16 @@ Defined in `core/globalstuff.py`, `STANDARD_C_KEYWORDS: dict[str, ASTT]` provide
 | m_ast_container     |    7     | (ast_id, priority, type_id, ref_ast_id)                            |
 | m_ast_include       |    8     | (ast_id, fnid)                                                     |
 | m_ast_debug         |    9     | (ast_id, ast_raw)                                                  |
-| m_tag_code          |   10     | (hash, code)                                                       |
-| m_tag               |   11     | (tag_id, hash, ast_id, hl_s, hl_l)                                 |
-| m_bridge_tag        |   12     | (blob_id, tag_id, line_s, line_e, char_s, char_e)                  |
-| m_map_ast           |   13     | (map_id, line_s, char_s, line_e, char_e, ast_id)                   |
-| m_bridge_map        |   14     | (tag_id, map_id)                                                   |
-| m_ast_hash          |   15     | (hash, ast_id)                                                     |
-| m_moved_tag         |   30     | (s_tag_id, e_tag_id)                                               |
-| m_symbol_def        |   31     | (def_id, blob_id, tag_id, ast_id, name, type_id, linkage, line_s, line_e) |
-| m_symbol_ref        |   32     | (ref_id, blob_id, tag_id, ast_id, target_fnid, role, line, char_s)  |
-| m_file_reference    |   33     | (ref_id, source_blob_id, target_fnid, ref_type, line_no, details)  |
-| m_ast_attribute     |   35     | (ast_id, priority, name, val)                                      |
+| m_tag               |   10     | (tag_id, hash, ast_id, hl_s, hl_l)                                 |
+| m_bridge_tag        |   11     | (blob_id, tag_id, line_s, line_e, char_s, char_e)                  |
+| m_map_ast           |   12     | (map_id, line_s, char_s, line_e, char_e, ast_id)                   |
+| m_bridge_map        |   13     | (tag_id, map_id)                                                   |
+| m_ast_hash          |   14     | (hash, ast_id)                                                     |
+| m_moved_tag         |   25     | (s_tag_id, e_tag_id)                                               |
+| m_symbol_def        |   26     | (def_id, blob_id, tag_id, ast_id, name, type_id, linkage, line_s, line_e) |
+| m_symbol_ref        |   27     | (ref_id, blob_id, tag_id, ast_id, target_fnid, role, line, char_s)  |
+| m_file_reference    |   28     | (ref_id, source_blob_id, target_fnid, ref_type, line_no, details)  |
+| m_ast_attribute     |   34     | (ast_id, priority, name, val)                                      |
 +----------------------------------------------------------------------------------------------------+
 ```
 
@@ -844,7 +840,7 @@ Defined in `core/globalstuff.py`, `STANDARD_C_KEYWORDS: dict[str, ASTT]` provide
 ## 11. Critical Engine Invariants & AI Development Guidelines
 
 1. **Relative File Paths**: All file links and documentation references must use relative paths from git root (e.g. `parser/c_ast/cursor_tree.py`). Never use absolute machine file URIs.
-2. **Tag Reference Order Invariant**: Inside `with CS(REF_POS):`, `m_tag.set(None, code_hash, ast_ref, 0, 0)` (5 columns: `tag_id, hash, ast_id, hl_s, hl_l`) MUST be the first staged operation so `tag_ref = ((m_tag.table_id, 0), OP_REF, (REF_POS, CS.route[-1]))` points directly to `m_tag`. Auxiliary tables (`m_tag_code.get_set`, `m_moved_tag.set`) must follow `m_tag.set`.
+2. **Tag Reference Order Invariant**: Inside `with CS(REF_POS):`, `m_tag.set(None, code_hash, ast_ref, 0, 0)` (5 columns: `tag_id, hash, ast_id, hl_s, hl_l`) MUST be the first staged operation so `tag_ref = ((m_tag.table_id, 0), OP_REF, (REF_POS, CS.route[-1]))` points directly to `m_tag`. Auxiliary tables (such as `m_moved_tag.set`) must follow `m_tag.set`.
 3. **Cryptographic Hashing Standard**: Code snippets must be hashed using `compute_code_hash(code)` from `core.globalstuff`, returning a 32-byte binary SHA-256 digest (`BINARY(32)`).
 4. **TableEngine Agnosticism**: Tests and workflows must never access private engine internals (e.g. `_cached_rows`, `_pk_index`). Queries must use public TableEngine APIs (`Table.get()`, `G.TE.get()`) or assert against database state (`MockDB._global_store`).
 5. **Form Feed & Line Splitting**: Never use `splitlines()` on source text. Use `raw_content.replace("\r\n", "\n").split("\n")` to preserve 1:1 line index parity with Libclang across files containing form-feed characters (`\x0c`).
@@ -969,7 +965,7 @@ The C & Preprocessor AST parser is verified through the reusable snapshot testin
   - `assert_snapshot_matches(test_case, parser_name, test_name, snapshot)`: Verifies extracted ChangeSet tables and `test_conf` metadata against verified JSON baselines. Set `UPDATE_SNAPSHOTS=1` in the environment to re-generate baselines after human verification.
 - **Test Suites**: `unit_test/test_c_parser.py`
   - **Lifecycle Suite (`Test_CParserLifecycle`)**:
-    - `test_01_added_c_file`: Added (`A`) file parsing of `include/linux/lockd/bind.h` on `v3.0`, verifying creation of `m_v_main`, file prelude, `m_ast`, `m_tag`, `m_tag_code`, `m_bridge_tag`, `m_map_ast`, `m_bridge_map`, `m_symbol_def`, and `m_symbol_ref`.
+    - `test_01_added_c_file`: Added (`A`) file parsing of `include/linux/lockd/bind.h` on `v3.0`, verifying creation of `m_v_main`, file prelude, `m_ast`, `m_tag`, `m_bridge_tag`, `m_map_ast`, `m_bridge_map`, `m_symbol_def`, and `m_symbol_ref`.
     - `test_02_modified_changed_c_file`: Modified (`M`) file parsing across `v2.6.28` -> `v2.6.29` (kernel commit `0cb2659b` adding `noresvport` to `struct nlmclnt_initdata`), validating evolutionary links via `m_moved_tag: 1`, recycling of unchanged tags, retention of both struct tag codes, and prior struct tag closure (`vid_e = 1`).
     - `test_03_exact_rename_c_file`: Exact rename (`R100`) file parsing across `v2.6.39` -> `v3.0`, verifying `m_v_main` progression, old `fid` reuse, dual `m_bridge_file` links, and zero duplicate AST tags.
   - **Corner Cases Suite (`Test_CParserCornerCases`)**:

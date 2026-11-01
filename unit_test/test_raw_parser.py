@@ -26,7 +26,6 @@ from core.DBLayout import (
     m_tag,
     m_moved_tag,
     m_bridge_tag,
-    m_tag_code,
 )
 from db_engine import MockDB
 from table_engine import TECachedDB
@@ -79,7 +78,7 @@ class Test_RawParserLifecycle(BaseRawParserTestCase):
 
     @test_feature("raw_ast_added_file")
     def test_01_added_raw_file(self) -> None:
-        """Verify adding a raw file stages m_v_main, m_file, m_ast, m_tag, m_tag_code, m_bridge_tag, and matches snapshot."""
+        """Verify adding a raw file stages m_v_main, m_file, m_ast, m_tag, m_bridge_tag, and matches snapshot."""
         file_path = "Documentation/ABI/testing/sysfs-kernel-fscaps"
         self.gp.Version_Name = "v3.0"
         self.gp.VID = 1
@@ -98,7 +97,7 @@ class Test_RawParserLifecycle(BaseRawParserTestCase):
 
         with test_step("Execute raw_ast_parse and ChangeSet resolution"):
             raw_ast_parse(cs)
-            self.assertGreaterEqual(len(cs.cs), 7, "raw_ast_parse should stage AST, tag, maps, code")
+            self.assertGreaterEqual(len(cs.cs), 6, "raw_ast_parse should stage AST, tag, maps")
             success = cs.execute()
             self.assertTrue(success, "ChangeSet execution should succeed without deferrals")
 
@@ -109,14 +108,13 @@ class Test_RawParserLifecycle(BaseRawParserTestCase):
                 "file_operation": "A",
                 "file_path": file_path,
                 "versions": ["v3.0"],
-                "description": "Verify added raw file stages m_v_main, file prelude, AST tags, coordinates, and code content",
+                "description": "Verify added raw file stages m_v_main, file prelude, AST tags, and coordinates",
             }
             snapshot = extract_changeset_snapshot(cs, test_conf=test_conf)
             tables = snapshot["tables"]
             self.assertIn("m_v_main", tables)
             self.assertIn("m_ast", tables)
             self.assertIn("m_tag", tables)
-            self.assertIn("m_tag_code", tables)
             self.assertIn("m_bridge_file", tables)
             self.assertIn("m_bridge_tag", tables)
             self.assertIn("m_map_ast", tables)
@@ -127,22 +125,19 @@ class Test_RawParserLifecycle(BaseRawParserTestCase):
         with test_step("Verify semantic relationships and cryptographic hash"):
             ast_rows = tables["m_ast"]
             tag_rows = tables["m_tag"]
-            code_rows = tables["m_tag_code"]
             v_rows = tables["m_v_main"]
             self.assertEqual(len(v_rows), 1)
             self.assertEqual(v_rows[0]["vname"], "v3.0")
             self.assertEqual(len(ast_rows), 1)
             self.assertEqual(len(tag_rows), 1)
-            self.assertEqual(len(code_rows), 1)
 
             # m_tag.ast_id must point to m_ast.ast_id
             self.assertEqual(tag_rows[0]["ast_id"], ast_rows[0]["ast_id"])
-            # m_tag.hash must match m_tag_code.hash
-            self.assertEqual(tag_rows[0]["hash"], code_rows[0]["hash"])
+            self.assertTrue(tag_rows[0]["hash"].startswith("hex:"))
 
     @test_feature("raw_ast_modified_changed_file", depends_on=["raw_ast_added_file"])
     def test_02_modified_changed_raw_file(self) -> None:
-        """Verify modifying a raw file tracks tag evolution via m_moved_tag, retains both tag codes, and closes prior tag."""
+        """Verify modifying a raw file tracks tag evolution via m_moved_tag and closes prior tag."""
         file_path = "Documentation/00-INDEX"
 
         with test_step("Stage Version 1 (v2.6.39) baseline"):
@@ -193,18 +188,15 @@ class Test_RawParserLifecycle(BaseRawParserTestCase):
             self.assertIn("m_v_main", tables)
             self.assertIn("m_moved_tag", tables, "Modified changed file must record m_moved_tag")
             self.assertIn("m_tag", tables)
-            self.assertIn("m_tag_code", tables)
 
             assert_snapshot_matches(self, "raw_ast", "modified_changed_file", snapshot)
 
-        with test_step("Verify tag evolution, prior tag closure, and dual tag codes"):
+        with test_step("Verify tag evolution and prior tag closure"):
             moved_rows = tables["m_moved_tag"]
             tag_rows = tables["m_tag"]
-            code_rows = tables["m_tag_code"]
             v_rows = tables["m_v_main"]
 
             self.assertEqual(len(v_rows), 2, "Expected 2 versions in m_v_main (v2.6.39 and v3.0)")
-            self.assertEqual(len(code_rows), 2, "Expected 2 m_tag_code entries across modified versions")
             self.assertEqual(len(moved_rows), 1)
             self.assertEqual(len(tag_rows), 2, "Expected new tag and prior tag")
 
@@ -274,7 +266,6 @@ class Test_RawParserLifecycle(BaseRawParserTestCase):
             self.assertIn("m_file", tables)
             self.assertIn("m_bridge_file", tables)
             self.assertIn("m_tag", tables)
-            self.assertIn("m_tag_code", tables)
             self.assertIn("m_ast", tables)
 
             assert_snapshot_matches(self, "raw_ast", "exact_rename_file", snapshot)

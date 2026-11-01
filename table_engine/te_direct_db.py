@@ -67,7 +67,7 @@ def _is_hash_keyed(table: Table) -> bool:
     return bool(
         getattr(table, "idempotent_pk", False)
         or getattr(table, "init_primary", ()) == ("hash",)
-        or table.table_name in ("m_tag_code", "m_ast_hash")
+        or table.table_name == "m_ast_hash"
     )
 
 
@@ -628,7 +628,7 @@ class TEDirectDB:
 
         pk_fn = self._pk_getters.get(table_id)
         pk = self._sanitize_key(pk_fn(columns) if pk_fn is not None else itemgetter(*table.primary)(columns))
-        if getattr(table, "idempotent_pk", False) or getattr(table, "init_primary", ()) == ("hash",) or table.table_name in ("m_tag_code", "m_ast_hash"):
+        if getattr(table, "idempotent_pk", False) or getattr(table, "init_primary", ()) == ("hash",) or table.table_name == "m_ast_hash":
             if pk in self.queued_set[table_id]:
                 return self.queued_set[table_id][pk]
             if pk in self._committed_pks.get(table_id, set()):

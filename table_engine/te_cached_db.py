@@ -59,7 +59,7 @@ class TECachedDB(TEDirectDB):
     # Hash-keyed deduplication tables, written only through this TableEngine and needed in full. Their snapshot
     # outlives close()/start() (single writer): the next start reuses it plus the rows committed since, instead
     # of fetching, indexing and repacking millions of hashes for every version.
-    CARRIED_TABLES = frozenset({"m_ast_hash", "m_tag_code"})
+    CARRIED_TABLES = frozenset({"m_ast_hash"})
     # Reload carried tables from the database once rows committed since the snapshot exceed this share of it
     CARRY_RELOAD_RATIO = 0.5
     # Default budget (MB) of preloaded rows held on the heap before they are packed into a shared-memory
@@ -72,7 +72,7 @@ class TECachedDB(TEDirectDB):
     CACHE_MAX_TABLE_MB = 0
     # Tables whose committed rows leave the heap at each commit (their keys stay in _committed_pks)
     WRITE_HEAVY_TABLES = frozenset({
-        "m_ast_hash", "m_tag_code", "m_blob_symbol_def", "m_ast_container", "m_bridge_tag", "m_bridge_checkpoint", "m_blob_transition",
+        "m_ast_hash", "m_blob_symbol_def", "m_ast_container", "m_bridge_tag", "m_bridge_checkpoint", "m_blob_transition",
     })
 
     def __init__(
@@ -499,7 +499,7 @@ class TECachedDB(TEDirectDB):
                 self._ensure_table(table_id)
                 if table.no_duplicate:
                     self._committed_nodup_keys[table_id] = {}
-                if getattr(table, "init_primary", ()) == ("hash",) or table.table_name in ("m_tag_code", "m_ast_hash"):
+                if getattr(table, "init_primary", ()) == ("hash",) or table.table_name == "m_ast_hash":
                     self._committed_pks[table_id] = set()
                 if self.db is not None:
                     try:
@@ -601,7 +601,7 @@ class TECachedDB(TEDirectDB):
                 continue
             if table.no_duplicate:
                 self._committed_nodup_keys[t_id] = dict(self._nodup_index.get(t_id, {}))
-            if getattr(table, "init_primary", ()) == ("hash",) or table.table_name in ("m_tag_code", "m_ast_hash"):
+            if getattr(table, "init_primary", ()) == ("hash",) or table.table_name == "m_ast_hash":
                 self._committed_pks[t_id] = set(self._pk_index.get(t_id, {}).keys())
 
         if segments:
@@ -1013,7 +1013,7 @@ class TECachedDB(TEDirectDB):
         pk_fn = self._pk_getters.get(table_id)
         pk = self._sanitize_key(pk_fn(columns) if pk_fn is not None else itemgetter(*table.primary)(columns))
 
-        if getattr(table, "idempotent_pk", False) or getattr(table, "init_primary", ()) == ("hash",) or table.table_name in ("m_tag_code", "m_ast_hash"):
+        if getattr(table, "idempotent_pk", False) or getattr(table, "init_primary", ()) == ("hash",) or table.table_name == "m_ast_hash":
             if pk in self.queued_set[table_id]:
                 return self.queued_set[table_id][pk]
             existing_row = self._pk_index[table_id].get(pk)

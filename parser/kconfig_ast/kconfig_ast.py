@@ -22,12 +22,12 @@ from core.globalstuff import (
     ASTT,
     OP_REF,
 )
-m_file_name = m_file = m_ast = m_ast_include = m_tag_code = m_tag = m_bridge_tag = m_map_ast = m_bridge_map = m_moved_tag = None
+m_file_name = m_file = m_ast = m_ast_include = m_tag = m_bridge_tag = m_map_ast = m_bridge_map = m_moved_tag = None
 from core.globalstuff import compute_code_hash
 
 
 def _init_tables() -> None:
-    global m_file_name, m_file, m_ast, m_ast_include, m_tag_code, m_tag, m_bridge_tag, m_map_ast, m_bridge_map, m_moved_tag
+    global m_file_name, m_file, m_ast, m_ast_include, m_tag, m_bridge_tag, m_map_ast, m_bridge_map, m_moved_tag
     if m_file_name is not None:
         return
     import core.DBLayout as db_layout
@@ -35,7 +35,6 @@ def _init_tables() -> None:
     m_file = db_layout.m_file
     m_ast = db_layout.m_ast
     m_ast_include = db_layout.m_ast_include
-    m_tag_code = db_layout.m_tag_code
     m_tag = db_layout.m_tag
     m_bridge_tag = db_layout.m_bridge_tag
     m_map_ast = db_layout.m_map_ast
@@ -198,7 +197,6 @@ class KconfigManager:
         with CS(REF_POS):
             CS.store(m_tag.set(*current_tag))
             tag_ref = ((m_tag.table_id, 0), OP_REF, (REF_POS, CS.route[-1]))
-            CS.store(m_tag_code.get_set(code_hash, code))
             if s_tag_id is not None:
                 CS.store(m_moved_tag.set(s_tag_id, tag_ref))
 

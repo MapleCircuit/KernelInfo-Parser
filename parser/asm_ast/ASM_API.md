@@ -58,8 +58,7 @@ Relational Extraction inside with CS(REF_NO_REF):
   │     ├── Rule 12 Staging Order inside with CS(REF_POS):
   │     │     ├── 1. m_tag.set(None, code_hash, ast_ref, 0, 0)          [MUST BE FIRST, 5 columns]
   │     │     │      tag_ref = ((m_tag.table_id, 0), OP_REF, (REF_POS, CS.route[-1]))
-  │     │     ├── 2. m_tag_code.get_set(code_hash, code_str)             [Auxiliary hash table]
-  │     │     └── 3. m_moved_tag.set(s_tag_id, tag_ref)                  [If evolved tag match]
+  │     │     └── 2. m_moved_tag.set(s_tag_id, tag_ref)                  [If evolved tag match]
   │     │
   │     ├── File-to-Tag Bridge: m_bridge_tag.set(blob_id, tag_ref, line_s, line_e, char_s, char_e)
   │     ├── Spatial AST Map: m_map_ast.set(tag_ref, 1, 1, rel_line_e, rel_char_e, ast_ref)
@@ -101,7 +100,6 @@ Relational Extraction inside with CS(REF_NO_REF):
            0,               # hl_l
        ))
        tag_ref = ((m_tag.table_id, 0), OP_REF, (REF_POS, CS.route[-1]))
-       CS.store(m_tag_code.get_set(code_hash, extent.code))
        if s_tag_id is not None:
            CS.store(m_moved_tag.set(s_tag_id, tag_ref))
    ```
@@ -161,7 +159,7 @@ Assembly files contain a mixture of assembler directives, hardware instructions,
    - Queries `m_bridge_tag.view_get_multiple` for `old_fid` in `Old_VID`.
    - Indexes prior tags into `prior_tags_map[code_hash]` and `prior_tags_name_map[name]`.
 2. **5-Tier Evolution Matching**:
-   - **Tier 1 (Exact Hash)**: If `compute_code_hash(extent.code)` matches an unconsumed prior tag, the existing `tag_id` is recycled without creating new rows in `m_tag`, `m_ast`, or `m_tag_code`.
+   - **Tier 1 (Exact Hash)**: If `compute_code_hash(extent.code)` matches an unconsumed prior tag, the existing `tag_id` is recycled without creating new rows in `m_tag` or `m_ast`.
    - **Tier 2 (Name & AST Type)**: Evolved matching via `match_prior_tag_transition` when labels or macros are modified in-place.
    - **Tier 3 (Bulk Renames)**: Refactoring prefix/suffix changes.
    - **Tier 4 (Positional Anchors)**: Relative position between unchanged sibling labels.
@@ -187,7 +185,7 @@ Assembly files frequently use preprocessor conditionals (`#ifdef __ASSEMBLY__`, 
 2. **Ctypes Fast Tokenization**:
    - Uses `TokenList` from [tokenizer.py](parser/c_ast/tokenizer.py) for direct ctypes array memory access (`_CLANG_GET_SPELLING_LOC`, `_CLANG_GET_TOKEN_KIND`), bypassing Python object allocations.
 3. **Rule 12 Staging Order**:
-   - `m_tag.set` MUST be the first operation inside `with CS(REF_POS):` so that `tag_ref` references `m_tag`. Auxiliary tables (`m_tag_code.get_set`, `m_moved_tag.set`) must follow.
+   - `m_tag.set` MUST be the first operation inside `with CS(REF_POS):` so that `tag_ref` references `m_tag`. Auxiliary tables (such as `m_moved_tag.set`) must follow.
 4. **Rule 23 View Deduplication**:
    - AST node creation must use `m_ast.view(((m_ast.ast_id,),), None, name, type_id)`, never `m_ast.set` or `m_ast.get_set`.
 5. **Memory Teardown**:

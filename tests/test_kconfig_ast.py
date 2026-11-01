@@ -26,7 +26,6 @@ from core.DBLayout import (
     m_bridge_tag,
     m_map_ast,
     m_bridge_map,
-    m_tag_code,
 )
 from db_engine import MockDB
 from table_engine import TECachedDB
@@ -237,24 +236,21 @@ class TestKconfigAstIntegration(unittest.TestCase):
         expected_blob_id = cs.cs_result[1][0]
         bridges = {row[1]: row for row in G.TE.queued_set.get(m_bridge_tag.table_id, {}).values()}
         tags = {row[0]: row for row in G.TE.queued_set.get(m_tag.table_id, {}).values()}
-        codes = {row[0]: row[1] for row in G.TE.queued_set.get(m_tag_code.table_id, {}).values()}
         self.assertTrue(bridges)
         lines = SAMPLE_KCONFIG.splitlines()
         by_ast = {}
         for tag_id, b in bridges.items():
             self.assertEqual(b[0], expected_blob_id)
-            by_ast[tags[tag_id][2]] = (b[2], b[3], codes.get(tags[tag_id][1], ""))
+            by_ast[tags[tag_id][2]] = (b[2], b[3])
         # Container tags cover their header lines only, never their children
-        menu_s, menu_e, menu_code = by_ast[ast_id("General setup", ASTT.Kconfig_Menu)]
+        menu_s, menu_e = by_ast[ast_id("General setup", ASTT.Kconfig_Menu)]
         self.assertEqual((lines[menu_s - 1], menu_s), ('menu "General setup"', menu_e))
-        if_s, if_e, if_code = by_ast[ast_id("if MODULES", ASTT.Kconfig_If)]
-        self.assertEqual((if_code, if_s), ("if MODULES\n", if_e))
-        choice_s, choice_e, choice_code = by_ast[ast_id("Choose compression algorithm", ASTT.Kconfig_Choice)]
-        self.assertNotIn("ZLIB\"", choice_code)
+        if_s, if_e = by_ast[ast_id("if MODULES", ASTT.Kconfig_If)]
+        self.assertEqual((lines[if_s - 1].strip(), if_s), ("if MODULES", if_e))
+        choice_s, choice_e = by_ast[ast_id("Choose compression algorithm", ASTT.Kconfig_Choice)]
         self.assertEqual(lines[choice_e - 1].strip(), "default ZLIB_COMPRESSION")
         # A config ends at its last property: the blank line and the next entry are not part of it
-        mod_s, mod_e, mod_code = by_ast[ast_id("MODULES", ASTT.Kconfig_Config)]
-        self.assertTrue(mod_code.rstrip("\n").endswith("monolithic kernel."))
+        mod_s, mod_e = by_ast[ast_id("MODULES", ASTT.Kconfig_Config)]
         self.assertEqual(lines[mod_e - 1].strip(), "Say Y unless you are building a monolithic kernel.")
         # A literal `source` path links the sourced file
         fn = m_file_name.get(None, "drivers/net/Kconfig")
@@ -598,16 +594,16 @@ class TestObsoleteKconfigTables(unittest.TestCase):
         from core.DBLayout import TABLES, m_maintainer_member, m_maintainer_person
         # Old numbering: m_kconfig_symbol/relation/tree (16-18) were watermarked, later tables were 20+
         old_marks = [(7, 3, 9), (7, 16, 100), (7, 17, 200), (7, 18, 300), (7, 20, 40), (7, 26, 50), (7, 35, 6), (7, 38, 7), (7, 45, 1)]
-        new_marks = [(9, 16, 11), (9, 22, 12)]  # a run already recorded with the current ids
+        new_marks = [(9, 15, 11), (9, 21, 12)]  # a run already recorded with the current ids
         store = {"tables": set(main.OBSOLETE_KCONFIG_TABLES) | {"m_ingest_watermark"}, "marks": old_marks + new_marks, "log": []}
         db = self.FakeDB(store)
         main.drop_obsolete_kconfig_tables(db)
         self.assertEqual(store["tables"], {"m_ingest_watermark"})
-        # m_maintainer_person (old 20 -> 16), m_commit (26 -> 22), m_ast_attribute (35 stays),
-        # m_git_ref (38 -> 33), m_ingest_watermark (45 -> 41)
-        self.assertEqual(sorted(store["marks"]), sorted([(7, 3, 9), (7, 16, 40), (7, 22, 50), (7, 35, 6), (7, 33, 7), (7, 41, 1)] + new_marks))
+        # m_maintainer_person (old 20 -> 15), m_commit (26 -> 21), m_ast_attribute (35 -> 34),
+        # m_git_ref (38 -> 32), m_ingest_watermark (45 -> 40)
+        self.assertEqual(sorted(store["marks"]), sorted([(7, 3, 9), (7, 15, 40), (7, 21, 50), (7, 34, 6), (7, 32, 7), (7, 40, 1)] + new_marks))
         names = {t.table_id: t.table_name for t in TABLES}
-        self.assertEqual((names[16], names[22], names[33], names[35], names[41]),
+        self.assertEqual((names[15], names[21], names[32], names[34], names[40]),
                          ("m_maintainer_person", "m_commit", "m_git_ref", "m_ast_attribute", "m_ingest_watermark"))
         # The marker id is unmarked in the new numbering, so a second run changes nothing
         marked = {t.table_id for t, _ in ingest_state.marked_tables(TABLES)}

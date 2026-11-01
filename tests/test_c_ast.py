@@ -16,11 +16,12 @@ import shutil
 import unittest
 import subprocess
 import multiprocessing
+import hashlib
 from typing import Any
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from core.globalstuff import G, COLOR, REF_OLD, REF_ROOT, ASTT
+from core.globalstuff import G, COLOR, REF_OLD, REF_ROOT, ASTT, compute_code_hash
 from core.GreatProcessor import GreatProcessor, CompressedChangeSetDict
 from core.FileHandler import MasterFile
 from core.TableHandling import ChangeSet
@@ -30,7 +31,6 @@ from core.DBLayout import (
     m_file_name,
     m_file,
     m_bridge_file,
-    m_tag_code,
     m_tag,
     m_moved_tag,
     m_bridge_tag,
@@ -128,6 +128,30 @@ def _symbol_store(view: str) -> dict[int, tuple]:
     return dict(enumerate(symbol_view_rows(MockDB._global_store, view)))
 
 
+def _slice_source(raw_lines: list[str], s_l: int, e_l: int, s_c: int, e_c: int) -> str:
+    """Extract exact raw source string from line list using 1-based coordinates."""
+    if not raw_lines or s_l <= 0 or e_l <= 0 or s_l > len(raw_lines):
+        return ""
+    if s_l == e_l:
+        line_str = raw_lines[s_l - 1]
+        line_len = len(line_str)
+        s_idx = max(0, s_c - 1)
+        e_idx = min(line_len, e_c - 1) if e_c > 0 else line_len
+        return line_str[s_idx:e_idx]
+    slices = []
+    for l in range(s_l, e_l + 1):
+        if 1 <= l <= len(raw_lines):
+            line_str = raw_lines[l - 1]
+            if l == s_l:
+                slices.append(line_str[max(0, s_c - 1):])
+            elif l == e_l:
+                e_idx = min(len(line_str), e_c - 1) if e_c > 0 else len(line_str)
+                slices.append(line_str[:e_idx])
+            else:
+                slices.append(line_str)
+    return "\n".join(slices)
+
+
 def run_single_file_worker(item: dict[str, Any]) -> dict[str, Any]:
     """Execute isolated C-AST parsing and ChangeSet.execute() in a worker process.
     
@@ -189,10 +213,8 @@ def run_single_file_worker(item: dict[str, Any]) -> dict[str, Any]:
         raw_lines = file_content.decode("latin-1").replace("\r\n", "\n").split("\n")
 
         mock_tags = MockDB._global_store.get("m_tag", {})
-        mock_tag_codes = MockDB._global_store.get("m_tag_code", {})
         mock_bridge = MockDB._global_store.get("m_bridge_tag", {})
         tag_map = {row[0]: row for row in mock_tags.values()}
-        code_map = {row[0]: row[1] for row in mock_tag_codes.values()}
 
         mismatches_count = 0
         zero_extent_tags = 0
@@ -204,7 +226,6 @@ def run_single_file_worker(item: dict[str, Any]) -> dict[str, Any]:
             if not tag_row:
                 continue
             tag_hash = tag_row[1] if len(tag_row) == 5 else tag_row[3]
-            tag_code = code_map.get(tag_hash, "")
 
             if line_s == 0 and line_e == 0:
                 zero_extent_tags += 1
@@ -242,11 +263,14 @@ def run_single_file_worker(item: dict[str, Any]) -> dict[str, Any]:
                                 covered_char_mask[l - 1][c] = True
                 raw_slice = "\n".join(slices)
 
-            # Compare tag code vs raw source slice
-            match_exact = (tag_code == raw_slice)
-            match_trimmed = (tag_code.rstrip(",; \t\r\n") == raw_slice.rstrip(",; \t\r\n"))
-            if not (match_exact or match_trimmed):
-                mismatches_count += 1
+            # Compare raw source slice hash against tag_hash
+            slice_hash = compute_code_hash(raw_slice)
+            match_exact = (slice_hash == tag_hash)
+            if not match_exact:
+                slice_trimmed = raw_slice.rstrip(",; \t\r\n")
+                match_trimmed = (compute_code_hash(slice_trimmed) == tag_hash)
+                if not match_trimmed:
+                    mismatches_count += 1
 
         total_non_ws = sum(len([c for c in line if not c.isspace()]) for line in raw_lines)
         uncovered_non_ws = 0
@@ -285,7 +309,6 @@ def run_single_file_worker(item: dict[str, Any]) -> dict[str, Any]:
             res_dict["result_ops"] = list(cs.cs_result)
             res_dict["store"] = {
                 "m_tag": dict(mock_tags),
-                "m_tag_code": dict(mock_tag_codes),
                 "m_bridge_tag": dict(mock_bridge),
                 "m_ast": dict(MockDB._global_store.get("m_ast", {})),
                 "m_ast_container": dict(MockDB._global_store.get("m_ast_container", {})),
@@ -1013,11 +1036,13 @@ int compute_metrics(int base) {
 
             from core.globalstuff import ASTT
             types_in_ast = set()
-            tag_codes = []
+            raw_lines = snippet.split("\n")
+            tag_codes = [
+                _slice_source(raw_lines, op[2][2], op[2][3], op[2][4], op[2][5])
+                for op in cs.cs if op[0] == m_bridge_tag.table_id
+            ]
             for op in cs.cs:
-                if op[0] == m_tag_code.table_id:
-                    tag_codes.append(op[2][1])
-                elif isinstance(op[0], tuple) and len(op) >= 3 and isinstance(op[2], tuple):
+                if isinstance(op[0], tuple) and len(op) >= 3 and isinstance(op[2], tuple):
                     for val in op[2]:
                         if isinstance(val, (int, ASTT)) and not isinstance(val, bool):
                             try:
@@ -1082,7 +1107,11 @@ int add_three(int a, int b, int c) {
             self.assertTrue(cs.execute())
             self.assertEqual(len(cs.cs), len(cs.cs_result))
 
-            tag_codes = [op[2][1] for op in cs.cs if op[0] == m_tag_code.table_id]
+            raw_lines = snippet.split("\n")
+            tag_codes = [
+                _slice_source(raw_lines, op[2][2], op[2][3], op[2][4], op[2][5])
+                for op in cs.cs if op[0] == m_bridge_tag.table_id
+            ]
             # Function tag encloses the entire definition, parameters are not tagged as separate sub-tags
             func_tags = [t for t in tag_codes if "add_three" in t]
             self.assertEqual(len(func_tags), 1)
@@ -1273,12 +1302,13 @@ struct task_struct {
 
             from core.globalstuff import ASTT
             ast_names = []
-            tag_codes = []
+            raw_lines = snippet.split("\n")
+            tag_codes = [
+                _slice_source(raw_lines, op[2][2], op[2][3], op[2][4], op[2][5])
+                for op in cs.cs if op[0] == m_bridge_tag.table_id
+            ]
             for op in cs.cs:
-                if op[0] == m_tag_code.table_id:
-                    if len(op[2]) > 1 and op[2][1] is not None:
-                        tag_codes.append(op[2][1])
-                elif isinstance(op[0], tuple) and len(op) >= 3 and isinstance(op[2], tuple):
+                if isinstance(op[0], tuple) and len(op) >= 3 and isinstance(op[2], tuple):
                     name = op[2][1] if len(op[2]) > 1 else None
                     if name:
                         ast_names.append(name)
@@ -1892,13 +1922,13 @@ struct nlmsvc_binding {
             G.TE.commit_all()
 
             db_tag = MockDB._global_store.get(m_tag.table_name, {})
-            db_tag_code = MockDB._global_store.get(m_tag_code.table_name, {})
             db_bridge_tag = MockDB._global_store.get(m_bridge_tag.table_name, {})
 
             # Should have exactly 1 tag: the full typedef tag (argument is linked in m_ast_container, no phantom *nlm_host_match_fn_t tag)
             self.assertEqual(len(db_tag), 1)
             self.assertEqual(len(db_bridge_tag), 1)
-            tags_code = [db_tag_code[t[1]][1] for t in db_tag.values()]
+            raw_lines = code.split("\n")
+            tags_code = [_slice_source(raw_lines, b[2], b[3], b[4], b[5]) for b in db_bridge_tag.values()]
             self.assertIn("typedef void (*nlm_host_match_fn_t)(struct nlm_host *host);", tags_code)
             self.assertNotIn("*nlm_host_match_fn_t", tags_code)
             self.assertNotIn("struct nlm_host *host", tags_code)
@@ -2214,7 +2244,7 @@ struct anon_container {
             self.assertTrue(cs.execute())
             G.TE.commit_all()
 
-            # Verify that none of the m_ast or m_tag entries contain '/dev/shm'
+            # Verify that none of the m_ast entries contain '/dev/shm'
             ast_store = MockDB._global_store.get("m_ast", {})
             for ast_id, row in ast_store.items():
                 ast_name = row[1]
@@ -2222,12 +2252,6 @@ struct anon_container {
                     self.assertNotIn("/dev/shm", ast_name, f"m_ast.name '{ast_name}' must not contain /dev/shm")
                     if "(unnamed at " in ast_name:
                         self.assertIn("drivers/net/test_anon_enum.c", ast_name, f"m_ast.name '{ast_name}' should contain relative path")
-
-            tag_code_store = MockDB._global_store.get("m_tag_code", {})
-            for hash_val, row in tag_code_store.items():
-                tag_code = row[1]
-                if tag_code:
-                    self.assertNotIn("/dev/shm", tag_code, f"m_tag_code.code '{tag_code}' must not contain /dev/shm")
         finally:
             if mf:
                 mf.clear_all_version()
@@ -2744,14 +2768,16 @@ const struct xattr_handler btrfs_xattr_acl_access_handler = {
             G.TE.commit_all()
 
             db_tag = MockDB._global_store.get(m_tag.table_name, {})
-            db_tag_code = MockDB._global_store.get(m_tag_code.table_name, {})
+            db_bridge_tag = MockDB._global_store.get(m_bridge_tag.table_name, {})
             db_ast = MockDB._global_store.get(m_ast.table_name, {})
             db_cont = MockDB._global_store.get(m_ast_container.table_name, {})
 
             # Exactly 1 tag produced for the complete struct declaration
             self.assertEqual(len(db_tag), 1, f"Expected 1 tag for struct declaration, got {len(db_tag)}")
             trow = next(iter(db_tag.values()))
-            tag_code = db_tag_code[trow[1]][1]
+            brow = next(iter(db_bridge_tag.values()))
+            raw_lines = snippet.split("\n")
+            tag_code = _slice_source(raw_lines, brow[2], brow[3], brow[4], brow[5])
             self.assertTrue(tag_code.startswith("const struct xattr_handler v9fs_xattr_acl_access_handler"))
             self.assertTrue(tag_code.rstrip().endswith("};"))
 
@@ -3140,10 +3166,8 @@ def assert_file_tag_fidelity(
             raise AssertionError(f"CS.execute() failed for {file_path}")
 
         mock_tags = MockDB._global_store.get("m_tag", {})
-        mock_tag_codes = MockDB._global_store.get("m_tag_code", {})
         mock_bridge = MockDB._global_store.get("m_bridge_tag", {})
         tag_map = {row[0]: row for row in mock_tags.values()}
-        code_map = {row[0]: row[1] for row in mock_tag_codes.values()}
 
         mismatches: list[dict[str, Any]] = []
         zero_extent_tags = 0
@@ -3155,7 +3179,6 @@ def assert_file_tag_fidelity(
             if not tag_row:
                 continue
             tag_hash = tag_row[1] if len(tag_row) == 5 else tag_row[3]
-            tag_code = code_map.get(tag_hash, "")
 
             if line_s == 0 and line_e == 0:
                 zero_extent_tags += 1
@@ -3193,16 +3216,18 @@ def assert_file_tag_fidelity(
                                 covered_char_mask[l - 1][c] = True
                 raw_slice = "\n".join(slices)
 
-            # Compare tag code vs raw source slice
-            match_exact = (tag_code == raw_slice)
-            match_trimmed = (tag_code.rstrip(",; \t\r\n") == raw_slice.rstrip(",; \t\r\n"))
-            if not (match_exact or match_trimmed):
-                mismatches.append({
-                    "tag_id": tag_id,
-                    "coords": (line_s, line_e, char_s, char_e),
-                    "tag_code": tag_code,
-                    "raw_slice": raw_slice,
-                })
+            # Compare raw source slice hash against tag_hash
+            slice_hash = compute_code_hash(raw_slice)
+            match_exact = (slice_hash == tag_hash)
+            if not match_exact:
+                slice_trimmed = raw_slice.rstrip(",; \t\r\n")
+                match_trimmed = (compute_code_hash(slice_trimmed) == tag_hash)
+                if not match_trimmed:
+                    mismatches.append({
+                        "tag_id": tag_id,
+                        "coords": (line_s, line_e, char_s, char_e),
+                        "raw_slice": raw_slice,
+                    })
 
         total_non_ws = sum(len([c for c in line if not c.isspace()]) for line in raw_lines)
         uncovered_non_ws = 0
@@ -3373,7 +3398,7 @@ def format_operations_table(staged_ops: list[Any], result_ops: list[Any]) -> str
 
 
 def format_bridge_tag_map(store: dict[str, dict]) -> str:
-    """Format Tag-to-Coordinate Bridge Map (m_bridge_tag, m_tag, m_tag_code, m_ast)."""
+    """Format Tag-to-Coordinate Bridge Map (m_bridge_tag, m_tag, m_ast)."""
     mock_bridge = store.get("m_bridge_tag", {})
     mock_tags = store.get("m_tag", {})
     mock_codes = store.get("m_tag_code", {})
@@ -3385,7 +3410,7 @@ def format_bridge_tag_map(store: dict[str, dict]) -> str:
 
     lines = [
         COLOR.cyan("\n" + "=" * 115),
-        COLOR.cyan("                    TAG-TO-COORDINATE BRIDGE MAP (m_bridge_tag & m_tag & m_tag_code)"),
+        COLOR.cyan("                    TAG-TO-COORDINATE BRIDGE MAP (m_bridge_tag & m_tag)"),
         COLOR.cyan("=" * 115),
         f"{'Tag ID':<7} | {'Line Range':<12} | {'Char Range':<12} | {'AST Node Ref':<26} | {'Hash (SHA-256)':<14} | {'Code Snippet Preview'}",
         COLOR.cyan("-" * 115),
