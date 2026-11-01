@@ -5,7 +5,7 @@ Verifies:
 2. Table Class Schema Introspection & Operation Builders (`Table`, `set`, `update`, `get`, `get_set`, `view`, `view_get`, `view_get_multiple`, `ref_view`)
 3. ChangeSet Context Routing & Staging Protocol (`ChangeSet`, `route_parse`, `store`, `ref`, context managers)
 4. ChangeSet Reference Resolution (`resolve_ref`, `_resolve_ref_from_tuple`, foreign symbols, dependency blocking, circular stub generation)
-5. ChangeSet Pipeline Execution & Lifecycle (`execute`, multi-pass dependency loop, `preprocess_ref_views`, `get_file_type`, `clear_bloat`, `register_bridge_map`)
+5. ChangeSet Pipeline Execution & Lifecycle (`execute`, multi-pass dependency loop, `preprocess_ref_views`, `get_file_type`, `clear_bloat`)
 
 Uses RecordingTableEngine stand-in for pure unit isolation and TestTableCollection with 't_' prefixes.
 """
@@ -761,6 +761,10 @@ class Test_ChangeSetReferenceResolution(BaseTableHandlingTestCase):
             def __init__(self) -> None:
                 self.file_symbols = {}
                 self.file_names = {}
+                self.completed_paths = set()
+                self._ast_staged_symbols = {}
+                self._ast_staged_names = {}
+                self._ast_negative_cache = set()
                 self._changed_paths_set = {"include/linux/pci.h"}
                 self.ChangeSet_Dict = MockChangeSetDict()
 
@@ -986,23 +990,6 @@ class Test_ChangeSetExecutionAndLifecycle(BaseTableHandlingTestCase):
             self.assertEqual(deserialized.current_path, "kernel/futex.c")
             self.assertEqual(len(deserialized.cs), 1)
 
-    @test_feature("register_bridge_map")
-    def test_06_register_bridge_map(self) -> None:
-        """Verify register_bridge_map deduplicates tag-to-map registrations."""
-        cs = ChangeSet("M\tsecurity/selinux/hooks.c")
-
-        with test_step("First registration returns True"):
-            is_new = cs.register_bridge_map(tag_ref=100, map_ref=200)
-            self.assertTrue(is_new)
-
-        with test_step("Duplicate registration returns False"):
-            is_dup = cs.register_bridge_map(tag_ref=100, map_ref=200)
-            self.assertFalse(is_dup)
-
-        with test_step("Distinct registration returns True"):
-            is_distinct = cs.register_bridge_map(tag_ref=100, map_ref=201)
-            self.assertTrue(is_distinct)
-
     @test_feature("preprocess_ref_views")
     def test_07_preprocess_ref_views(self) -> None:
         """Verify preprocess_ref_views unpacks intra-file OP_REF_VIEW operations into OP_VIEW_SET."""
@@ -1078,8 +1065,10 @@ class Test_ChangeSetExecutionAndLifecycle(BaseTableHandlingTestCase):
             def __init__(self) -> None:
                 self.file_symbols = {}
                 self.file_names = {}
-                self.staged_symbols = {}
-                self.staged_names = {}
+                self.completed_paths = set()
+                self._ast_staged_symbols = {}
+                self._ast_staged_names = {}
+                self._ast_negative_cache = set()
                 self._changed_paths_set = {"fs/xfs/xfs_mount.h"}
                 self.ChangeSet_Dict = {}
 

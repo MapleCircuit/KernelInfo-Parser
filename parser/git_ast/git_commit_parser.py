@@ -105,6 +105,71 @@ class _HunkIndex:
         return found
 
 
+_HUNK_HEADER_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
+_DIFF_GIT_RE = re.compile(r"^diff --git a/(.*) b/(.*)$")
+
+
+def _map_line(hunks: list[tuple[int, int, int, int]], line: int) -> int:
+    """Line of a commit's pre-image mapped into its post-image through its hunks `(old_s, old_c, new_s, new_c)`.
+
+    Lines after a hunk shift by its size change; a line the commit replaced maps into the replacement (the
+    line before it when the commit only deleted).
+    """
+    delta = 0
+    for old_s, old_c, new_s, new_c in hunks:
+        if old_c == 0:  # pure insertion after line old_s
+            if line > old_s:
+                delta += new_c
+                continue
+            break
+        if line < old_s:
+            break
+        if line < old_s + old_c:
+            return new_s + min(line - old_s, new_c - 1) if new_c else max(new_s, 1)
+        delta += new_c - old_c
+    return line + delta
+
+
+class _HeadLineMapper:
+    """Moves hunk line ranges of a commit range's commits into the newest commit's coordinates.
+
+    `git log -p` gives each commit's hunks in that commit's own version of the file, while tags carry the
+    lines of the version at the end of the range. Commits are fed newest first (git log order): a commit's
+    ranges are mapped through the hunks of every newer commit that touched the file, and its own hunks are
+    then kept for the older ones. Renames carry the chain to the old name; a file (re)created by a newer
+    commit ends it, since older commits edited another file of that name.
+    """
+
+    def __init__(self) -> None:
+        # Path as older commits name it -> hunks of the newer commits touching it (oldest last), None: ended
+        self._chains: dict[str, list[list[tuple[int, int, int, int]]] | None] = {}
+        self._head: dict[str, str] = {}
+
+    def add(
+        self, path: str, old_path: str, change: str, hunks: list[tuple[int, int, int, int]]
+    ) -> tuple[str, list[tuple[int, int]]]:
+        """Record one commit's hunks of `path`; returns the file's head path and the hunks' head line ranges."""
+        chain = self._chains.get(path, [])
+        head = self._head.get(path, path)
+        mapped: list[tuple[int, int]] = []
+        if chain is not None:
+            for _old_s, _old_c, new_s, new_c in hunks:
+                start, end = new_s, new_s + max(1, new_c) - 1
+                for newer in reversed(chain):
+                    start, end = _map_line(newer, start), _map_line(newer, end)
+                mapped.append((start, max(start, end)))
+            chain.append(sorted(hunks))
+        if change == "A":
+            self._chains[path] = None
+        elif old_path and old_path != path:
+            self._chains[old_path] = chain
+            self._head[old_path] = head
+            self._chains[path] = None
+        else:
+            self._chains[path] = chain
+        return head, mapped
+
+
 def _describe_git_cmd(cmd: Sequence[str]) -> str:
     """Render git arguments for a log line, eliding the control-character `--format=` spec."""
     return " ".join("--format=<spec>" if a.startswith("--format=") else a for a in cmd)
@@ -317,6 +382,7 @@ class GitCommitParser:
             "log",
             "-p",
             "-U0",
+            "--full-index",
             f"--format={fmt_spec}",
         ] + max_flag + [revision_arg, "--"]
 
@@ -596,14 +662,17 @@ class GitCommitParser:
 
         Returns:
             Tuple of (commits_list, file_hunks_map) where file_hunks_map is:
-            {file_path: [(new_start, new_end, commit_hash), ...]}
+            {file_path: [(start, end, commit_hash), ...]}, lines (and paths) of the newest version in the
+            range (`_HeadLineMapper`).
         """
         if not raw_output:
             return [], {}
 
         commits: list[GitCommit] = []
         file_hunks_map: dict[str, list[tuple[int, int, str]]] = {}
-        hunk_header_re = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
+        hunk_header_re = _HUNK_HEADER_RE
+        # Hunk lines are moved into the coordinates of the range's newest version, where the tags are
+        head_mapper = _HeadLineMapper()
 
         if RECORD_SEP in raw_output:
             raw_chunks = raw_output.split(RECORD_SEP)
@@ -824,63 +893,63 @@ class GitCommitParser:
                     seen_contributors.add(t_key)
                     priority_idx += 1
 
-            # Parse patch_part for modified files and diff hunks
+            # Parse patch_part for modified files, their blobs and diff hunks (header lines are only read
+            # between `diff --git` and the first hunk, so patch content can never be taken for them)
             modified_files: list[tuple[str, str]] = []
+            file_blobs: dict[str, tuple[str, str, str]] = {}
+            entries: list[dict[str, Any]] = []
             seen_files: set[str] = set()
-            current_file = None
-            current_change = "M"
+            cur: dict[str, Any] | None = None
+            in_header = False
 
             for line in patch_part.splitlines():
-                line_str = line.strip()
-                if not line_str:
+                if line.startswith("diff --git "):
+                    m_paths = _DIFF_GIT_RE.match(line)
+                    a_path, b_path = m_paths.groups() if m_paths else ("", line.split(" ")[-1].removeprefix("b/"))
+                    cur = {"path": b_path, "old_path": a_path, "change": "M", "hunks": [], "old_sha": "", "new_sha": ""}
+                    entries.append(cur)
+                    in_header = True
                     continue
-
-                if line_str.startswith("diff --git "):
-                    if current_file and current_file not in seen_files:
-                        seen_files.add(current_file)
-                        modified_files.append((current_change, current_file))
-                    parts = line_str.split(" ")
-                    if len(parts) >= 4:
-                        b_path = parts[3]
-                        current_file = b_path[2:] if b_path.startswith("b/") else b_path
-                        current_change = "M"
-                elif line_str.startswith("new file mode"):
-                    current_change = "A"
-                elif line_str.startswith("deleted file mode"):
-                    current_change = "D"
-                elif line_str.startswith("similarity index"):
-                    current_change = "R"
-                elif line_str.startswith("--- ") and "/dev/null" in line_str:
-                    current_change = "A"
-                elif line_str.startswith("+++ "):
-                    if "/dev/null" in line_str:
-                        current_change = "D"
-                    elif current_file and current_file not in seen_files:
-                        seen_files.add(current_file)
-                        modified_files.append((current_change, current_file))
-                elif line_str.startswith("@@ ") and current_file:
-                    h_match = hunk_header_re.match(line_str)
+                if cur is not None and in_header and not line.startswith("@@ "):
+                    if line.startswith("new file mode"):
+                        cur["change"] = "A"
+                    elif line.startswith("deleted file mode"):
+                        cur["change"] = "D"
+                    elif line.startswith(("similarity index", "rename from ", "copy from ")):
+                        cur["change"] = "C" if line.startswith("copy") else "R"
+                        if line.startswith(("rename from ", "copy from ")):
+                            cur["old_path"] = line.split(" from ", 1)[1]
+                    elif line.startswith(("rename to ", "copy to ")):
+                        cur["path"] = line.split(" to ", 1)[1]
+                    elif line.startswith("index "):
+                        shas = line[6:].split(" ", 1)[0].split("..")
+                        if len(shas) == 2:
+                            cur["old_sha"], cur["new_sha"] = (sha if sha.strip("0") else "" for sha in shas)
+                    continue
+                if line.startswith("@@ ") and cur is not None:
+                    in_header = False
+                    h_match = hunk_header_re.match(line)
                     if h_match:
-                        if current_file not in seen_files:
-                            seen_files.add(current_file)
-                            modified_files.append((current_change, current_file))
-                        ns = int(h_match.group(1))
-                        nc = int(h_match.group(2)) if h_match.group(2) is not None else 1
-                        ne = ns + max(1, nc) - 1
-                        if current_file not in file_hunks_map:
-                            file_hunks_map[current_file] = []
-                        file_hunks_map[current_file].append((ns, ne, commit_hash))
-                elif line_str.startswith(("M\t", "A\t", "D\t", "R\t")):
-                    parts = line_str.split("\t")
-                    if len(parts) >= 2:
-                        c_type = parts[0][0].upper()
-                        f_path = parts[-1].strip()
-                        if f_path not in seen_files:
-                            seen_files.add(f_path)
-                            modified_files.append((c_type, f_path))
+                        os_, oc, ns, nc = h_match.groups()
+                        cur["hunks"].append((int(os_), 1 if oc is None else int(oc), int(ns), 1 if nc is None else int(nc)))
+                elif line.startswith(("M\t", "A\t", "D\t", "R")) and "\t" in line and cur is None:
+                    # Name-status records (logs without patches)
+                    parts = line.strip().split("\t")
+                    f_path = parts[-1].strip()
+                    if f_path not in seen_files:
+                        seen_files.add(f_path)
+                        modified_files.append((parts[0][0].upper(), f_path))
 
-            if current_file and current_file not in seen_files:
-                modified_files.append((current_change, current_file))
+            for entry in entries:
+                path = entry["path"]
+                if path not in seen_files:
+                    seen_files.add(path)
+                    modified_files.append((entry["change"], path))
+                if entry["old_sha"] or entry["new_sha"]:
+                    file_blobs[path] = (entry["old_path"], entry["old_sha"], entry["new_sha"])
+                head, ranges = head_mapper.add(path, entry["old_path"], entry["change"], entry["hunks"])
+                if ranges:
+                    file_hunks_map.setdefault(head, []).extend((s_, e_, commit_hash) for s_, e_ in ranges)
 
             commits.append(
                 GitCommit(
@@ -895,6 +964,7 @@ class GitCommitParser:
                     message=message,
                     contributors=contributors,
                     files=modified_files,
+                    file_blobs=file_blobs,
                     is_merge=is_merge,
                     parents=parents,
                     merge_requester_name=req_name,
@@ -937,7 +1007,7 @@ class GitCommitParser:
         new_rev: str,
         file_path: str,
     ) -> list[CommitDiffHunk]:
-        """Extract diff hunk line intervals for a file across commits."""
+        """Extract diff hunk line intervals for a file across commits, in the newest version's lines."""
         EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
         if not old_rev or old_rev == EMPTY_TREE or str(old_rev) == "0":
             rev_spec = [new_rev]
@@ -950,6 +1020,7 @@ class GitCommitParser:
             "-U0",
             "--format=%x1e%H",
         ] + rev_spec + ["--", file_path]
+        mapper = _HeadLineMapper()
 
         raw_output = self._run_git(git_args)
         if not raw_output:
@@ -969,9 +1040,38 @@ class GitCommitParser:
                 continue
             commit_hash = lines[0].strip()
             parsed_hunks = self.extract_diff_hunks_from_patch(chunk, file_path, commit_hash=commit_hash)
+            # Newest commit first: move each commit's hunks into the newest version's lines
+            _head, ranges = mapper.add(
+                file_path, file_path, "M", [(h.old_start, h.old_count, h.new_start, h.new_count) for h in parsed_hunks]
+            )
+            for h, (start, end) in zip(parsed_hunks, ranges):
+                h.new_start, h.new_count = start, end - start + 1
             hunks.extend(parsed_hunks)
 
         return hunks
+
+    @staticmethod
+    def _tag_fields(tag: Any) -> tuple[int, int, int, int] | None:
+        """`(tag_id, fid, line_s, line_e)` of a tag given as a tuple/list or a dict."""
+        if isinstance(tag, dict):
+            line_s = tag.get("line_s", 1)
+            return tag.get("tag_id", 0), tag.get("fid", 0), line_s, tag.get("line_e", line_s)
+        if isinstance(tag, (tuple, list)):
+            line_s = tag[2] if len(tag) > 2 else 1
+            return (
+                tag[0] if len(tag) > 0 else 0,
+                tag[1] if len(tag) > 1 else 0,
+                line_s,
+                tag[3] if len(tag) > 3 else line_s,
+            )
+        return None
+
+    @staticmethod
+    def _hunk_matcher(resolved_hunks: list[tuple[int, int, int]]) -> Any:
+        """Function `(line_s, line_e) -> commit ids of the hunks overlapping it` (a scan for a few hunks)."""
+        if len(resolved_hunks) <= 8:
+            return lambda ls, le: [cid for hs, he, cid in resolved_hunks if not (le < hs or ls > he)]
+        return _HunkIndex(resolved_hunks).overlapping
 
     def map_tags_to_commits(
         self,
@@ -983,216 +1083,59 @@ class GitCommitParser:
         hunks_by_commit: dict[int, list[CommitDiffHunk]] | None = None,
         file_hunks_map: dict[str, list[tuple[int, int, str]]] | None = None,
     ) -> Any:
-        """Match each tag to all intersecting commits that modified the tag's line range.
+        """Match each tag to the commits whose hunks intersect the tag's line range.
+
+        A tag no hunk touches (unchanged code of a changed file) is linked to no commit. Hunk lines must be in
+        the coordinates of the version the tags belong to (`parse_commit_log_with_hunks()` and
+        `extract_file_hunks()` map them there).
 
         Returns:
-            List of tuples `[(cid, fid, tag_id), ...]` or mapping dict `{tag_id: [cid, ...]}`.
+            List of tuples `[(cid, fid, tag_id), ...]` or, with `hunks_by_commit`, a mapping
+            `{tag_id: [cid, ...]}`.
         """
         if not tags:
             return [] if hunks_by_commit is None else {}
+        commit_hash_to_id = commit_hash_to_id or {}
 
-        # Mode A: Direct hunk-to-commit mapping dictionary passed (e.g. in unit tests)
         if hunks_by_commit is not None:
+            # Mode A: hunks already grouped by commit id (e.g. unit tests)
+            resolved = [
+                (h.new_start, h.new_start + max(1, h.new_count) - 1, cid)
+                for cid, hunk_list in hunks_by_commit.items()
+                for h in hunk_list
+            ]
+            match = self._hunk_matcher(resolved)
             tag_to_cids: dict[int, list[int]] = {}
-            resolved_hunks: list[tuple[int, int, int]] = []
-            for cid, hunk_list in hunks_by_commit.items():
-                for h in hunk_list:
-                    hs = h.new_start
-                    he = h.new_start + max(1, h.new_count) - 1
-                    resolved_hunks.append((hs, he, cid))
-
-            if len(resolved_hunks) <= 8:
-                for t in tags:
-                    tid = t["tag_id"] if isinstance(t, dict) else (t[0] if len(t) > 0 else 0)
-                    ls = t["line_s"] if isinstance(t, dict) else (t[2] if len(t) > 2 else 1)
-                    le = t["line_e"] if isinstance(t, dict) else (t[3] if len(t) > 3 else ls)
-                    matched_cids: list[int] = []
-                    for hs, he, cid in resolved_hunks:
-                        if not (le < hs or ls > he):
-                            if cid not in matched_cids:
-                                matched_cids.append(cid)
-                    tag_to_cids[tid] = matched_cids
-                return tag_to_cids
-
-            hunk_index = _HunkIndex(resolved_hunks)
-
             for t in tags:
-                tid = t["tag_id"] if isinstance(t, dict) else (t[0] if len(t) > 0 else 0)
-                ls = t["line_s"] if isinstance(t, dict) else (t[2] if len(t) > 2 else 1)
-                le = t["line_e"] if isinstance(t, dict) else (t[3] if len(t) > 3 else ls)
-                tag_to_cids[tid] = list(dict.fromkeys(hunk_index.overlapping(ls, le)))
+                fields = self._tag_fields(t)
+                if fields is not None:
+                    tag_id, _fid, line_s, line_e = fields
+                    tag_to_cids[tag_id] = list(dict.fromkeys(match(line_s, line_e)))
             return tag_to_cids
 
-        # Mode B: Pre-indexed single-pass in-memory file hunks map
         if file_hunks_map is not None:
-            if commit_hash_to_id is None:
-                commit_hash_to_id = {}
-
-            raw_hunks = file_hunks_map.get(file_path, [])
-            if not raw_hunks:
-                return []
-
-            first_cid: int | None = None
-            resolved_hunks = []
-            for hunk_s, hunk_e, c_hash in raw_hunks:
-                cid = commit_hash_to_id.get(c_hash)
-                if cid is not None:
-                    if first_cid is None:
-                        first_cid = cid
-                    resolved_hunks.append((hunk_s, hunk_e, cid))
-
-            if not resolved_hunks:
-                return []
-
-            tag_commit_bridges: list[tuple[int, int, int]] = []
-            seen_bridges: set[tuple[int, int]] = set()
-
-            if len(resolved_hunks) <= 8:
-                for t in tags:
-                    if isinstance(t, dict):
-                        tag_id = t.get("tag_id", 0)
-                        fid = t.get("fid", 0)
-                        line_s = t.get("line_s", 1)
-                        line_e = t.get("line_e", line_s)
-                    elif isinstance(t, (tuple, list)):
-                        tag_id = t[0] if len(t) > 0 else 0
-                        fid = t[1] if len(t) > 1 else 0
-                        line_s = t[2] if len(t) > 2 else 1
-                        line_e = t[3] if len(t) > 3 else line_s
-                    else:
-                        continue
-
-                    matched_commit_ids: set[int] = set()
-                    for hunk_s, hunk_e, cid in resolved_hunks:
-                        if not (line_e < hunk_s or line_s > hunk_e):
-                            matched_commit_ids.add(cid)
-
-                    if not matched_commit_ids and first_cid is not None:
-                        matched_commit_ids.add(first_cid)
-
-                    for cid in matched_commit_ids:
-                        bridge_key = (cid, tag_id)
-                        if bridge_key not in seen_bridges:
-                            seen_bridges.add(bridge_key)
-                            tag_commit_bridges.append((cid, fid, tag_id))
-
-                return tag_commit_bridges
-
-            hunk_index = _HunkIndex(resolved_hunks)
-
-            for t in tags:
-                if isinstance(t, dict):
-                    tag_id = t.get("tag_id", 0)
-                    fid = t.get("fid", 0)
-                    line_s = t.get("line_s", 1)
-                    line_e = t.get("line_e", line_s)
-                elif isinstance(t, (tuple, list)):
-                    tag_id = t[0] if len(t) > 0 else 0
-                    fid = t[1] if len(t) > 1 else 0
-                    line_s = t[2] if len(t) > 2 else 1
-                    line_e = t[3] if len(t) > 3 else line_s
-                else:
-                    continue
-
-                matched_commit_ids = set(hunk_index.overlapping(line_s, line_e))
-
-                if not matched_commit_ids and first_cid is not None:
-                    matched_commit_ids.add(first_cid)
-
-                for cid in matched_commit_ids:
-                    bridge_key = (cid, tag_id)
-                    if bridge_key not in seen_bridges:
-                        seen_bridges.add(bridge_key)
-                        tag_commit_bridges.append((cid, fid, tag_id))
-
-            return tag_commit_bridges
-
-        # Mode C: Fallback to individual file hunk extraction
-        if commit_hash_to_id is None:
-            commit_hash_to_id = {}
-
-        hunks_list = self.extract_file_hunks(old_rev, new_rev, file_path)
-        if not hunks_list:
+            # Mode B: the in-memory hunk map of one diff stream
+            raw = [(hs, he, commit_hash_to_id.get(c_hash)) for hs, he, c_hash in file_hunks_map.get(file_path, ())]
+        else:
+            # Mode C: one `git log -p` for this file
+            raw = [
+                (h.new_start, h.new_start + max(1, h.new_count) - 1, commit_hash_to_id.get(h.commit_hash))
+                for h in self.extract_file_hunks(old_rev, new_rev, file_path)
+            ]
+        resolved = [(hs, he, cid) for hs, he, cid in raw if cid is not None]
+        if not resolved:
             return []
 
-        first_cid = None
-        resolved_hunks = []
-        for h in hunks_list:
-            cid = commit_hash_to_id.get(h.commit_hash)
-            if cid is not None:
-                if first_cid is None:
-                    first_cid = cid
-                hunk_s = h.new_start
-                hunk_e = h.new_start + max(1, h.new_count) - 1
-                resolved_hunks.append((hunk_s, hunk_e, cid))
-
-        if not resolved_hunks:
-            return []
-
-        tag_commit_bridges = []
-        seen_bridges = set()
-
-        if len(resolved_hunks) <= 8:
-            for t in tags:
-                if isinstance(t, dict):
-                    tag_id = t.get("tag_id", 0)
-                    fid = t.get("fid", 0)
-                    line_s = t.get("line_s", 1)
-                    line_e = t.get("line_e", line_s)
-                elif isinstance(t, (tuple, list)):
-                    tag_id = t[0] if len(t) > 0 else 0
-                    fid = t[1] if len(t) > 1 else 0
-                    line_s = t[2] if len(t) > 2 else 1
-                    line_e = t[3] if len(t) > 3 else line_s
-                else:
-                    continue
-
-                matched_commit_ids = set()
-                for hunk_s, hunk_e, cid in resolved_hunks:
-                    if not (line_e < hunk_s or line_s > hunk_e):
-                        matched_commit_ids.add(cid)
-
-                if not matched_commit_ids and first_cid is not None:
-                    matched_commit_ids.add(first_cid)
-
-                for cid in matched_commit_ids:
-                    bridge_key = (cid, tag_id)
-                    if bridge_key not in seen_bridges:
-                        seen_bridges.add(bridge_key)
-                        tag_commit_bridges.append((cid, fid, tag_id))
-            return tag_commit_bridges
-
-        resolved_hunks.sort(key=lambda x: x[0])
-        hunk_starts = [h[0] for h in resolved_hunks]
-
+        match = self._hunk_matcher(resolved)
+        bridges: list[tuple[int, int, int]] = []
+        seen: set[tuple[int, int]] = set()
         for t in tags:
-            if isinstance(t, dict):
-                tag_id = t.get("tag_id", 0)
-                fid = t.get("fid", 0)
-                line_s = t.get("line_s", 1)
-                line_e = t.get("line_e", line_s)
-            elif isinstance(t, (tuple, list)):
-                tag_id = t[0] if len(t) > 0 else 0
-                fid = t[1] if len(t) > 1 else 0
-                line_s = t[2] if len(t) > 2 else 1
-                line_e = t[3] if len(t) > 3 else line_s
-            else:
+            fields = self._tag_fields(t)
+            if fields is None:
                 continue
-
-            matched_commit_ids = set()
-            idx_end = bisect.bisect_right(hunk_starts, line_e)
-            for i in range(idx_end):
-                hunk_s, hunk_e, cid = resolved_hunks[i]
-                if hunk_e >= line_s:
-                    matched_commit_ids.add(cid)
-
-            if not matched_commit_ids and first_cid is not None:
-                matched_commit_ids.add(first_cid)
-
-            for cid in matched_commit_ids:
-                bridge_key = (cid, tag_id)
-                if bridge_key not in seen_bridges:
-                    seen_bridges.add(bridge_key)
-                    tag_commit_bridges.append((cid, fid, tag_id))
-
-        return tag_commit_bridges
+            tag_id, fid, line_s, line_e = fields
+            for cid in dict.fromkeys(match(line_s, line_e)):
+                if (cid, tag_id) not in seen:
+                    seen.add((cid, tag_id))
+                    bridges.append((cid, fid, tag_id))
+        return bridges

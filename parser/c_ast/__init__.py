@@ -141,9 +141,11 @@ from parser.c_ast.cursor_tree import (
 
 from parser.c_ast.tag_tracker import (
     get_prior_tags,
-    close_prior_tags,
     match_prior_tag_transition,
     check_exact_match,
+    stage_bridge_tag,
+    stage_new_tag,
+    stage_tag_map,
 )
 
 from parser.c_ast.cs_extractor import (
@@ -155,7 +157,6 @@ from parser.c_ast.c_ast import (
     process_c_ast,
     TokenList,
     Ast_Manager,
-    comment_remover,
 )
 
 __all__ = [
@@ -168,7 +169,9 @@ __all__ = [
     "Line",
     "get_cursor_line",
     "get_prior_tags",
-    "close_prior_tags",
+    "stage_bridge_tag",
+    "stage_new_tag",
+    "stage_tag_map",
     "match_prior_tag_transition",
     "check_exact_match",
     "Ast",
@@ -189,7 +192,6 @@ __all__ = [
     "AST_KIND",
     "safe_spelling",
     "safe_cursor_spelling",
-    "comment_remover",
     "Ast_Comment",
     "Ast_ASM_Directive",
     "Ast_ASM_Macro",

@@ -3,7 +3,9 @@
 Implements Linux kernel scripts/get_maintainer.pl pattern matching rules:
 - Trailing slash (e.g. 'drivers/net/'): recursive match for directory and all descendants.
 - Direct wildcard (e.g. 'drivers/net/*'): match files directly under directory.
-- Generic glob (e.g. '*/net/*', 'drivers/net/3c505*'): wildcard path matching.
+- Generic glob (e.g. '*/net/*', 'drivers/net/3c505*'): wildcard path matching. As in get_maintainer.pl, a
+  wildcard pattern without a trailing slash only matches paths with as many '/' as the pattern ('*' never
+  reaches into a subdirectory).
 - Exact path (e.g. 'include/linux/sched.h'): exact file matching.
 - Exclusions ('X:'): overrides 'F:' matches for specific paths/subdirectories.
 """
@@ -57,13 +59,14 @@ class CompiledSectionRules:
         self.section = section
         self.exact_includes: set[str] = set()
         self.prefix_includes: list[str] = []
-        self.regex_includes: list[re.Pattern] = []
+        # (compiled pattern, number of '/' a matching path has)
+        self.regex_includes: list[tuple[re.Pattern, int]] = []
         # Directory prefixes every regex include requires ('' when one can match anywhere)
         self.regex_include_dirs: set[str] = set()
 
         self.exact_excludes: set[str] = set()
         self.prefix_excludes: list[str] = []
-        self.regex_excludes: list[re.Pattern] = []
+        self.regex_excludes: list[tuple[re.Pattern, int]] = []
 
         for p in section.patterns:
             pat = p.pattern.strip()
@@ -74,7 +77,7 @@ class CompiledSectionRules:
                 if pat.endswith("/"):
                     self.prefix_includes.append(pat)
                 elif "*" in pat or "?" in pat or "[" in pat:
-                    self.regex_includes.append(_pattern_to_regex(pat))
+                    self.regex_includes.append((_pattern_to_regex(pat), pat.count("/")))
                     self.regex_include_dirs.add(_literal_dir_prefix(pat))
                 else:
                     self.exact_includes.add(pat)
@@ -84,7 +87,7 @@ class CompiledSectionRules:
                 if pat.endswith("/"):
                     self.prefix_excludes.append(pat)
                 elif "*" in pat or "?" in pat or "[" in pat:
-                    self.regex_excludes.append(_pattern_to_regex(pat))
+                    self.regex_excludes.append((_pattern_to_regex(pat), pat.count("/")))
                 else:
                     self.exact_excludes.add(pat)
                     self.prefix_excludes.append(f"{pat}/")
@@ -103,11 +106,14 @@ class CompiledSectionRules:
             if file_path.startswith(pfx):
                 return True
 
-        for regex in self.regex_includes:
-            if regex.match(file_path):
-                return True
+        return self._wildcard_match(self.regex_includes, file_path)
 
-        return False
+    @staticmethod
+    def _wildcard_match(patterns: list[tuple[re.Pattern, int]], file_path: str) -> bool:
+        if not patterns:
+            return False
+        slashes = file_path.count("/")
+        return any(slashes == n and regex.match(file_path) for regex, n in patterns)
 
     def _is_excluded(self, file_path: str) -> bool:
         if file_path in self.exact_excludes:
@@ -117,11 +123,7 @@ class CompiledSectionRules:
             if file_path.startswith(pfx):
                 return True
 
-        for regex in self.regex_excludes:
-            if regex.match(file_path):
-                return True
-
-        return False
+        return self._wildcard_match(self.regex_excludes, file_path)
 
 
 class MaintainerMatcher:

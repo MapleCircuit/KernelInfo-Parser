@@ -313,7 +313,6 @@ def run_single_file_worker(item: dict[str, Any]) -> dict[str, Any]:
                 "m_ast": dict(MockDB._global_store.get("m_ast", {})),
                 "m_ast_container": dict(MockDB._global_store.get("m_ast_container", {})),
                 "m_map_ast": dict(MockDB._global_store.get("m_map_ast", {})),
-                "m_bridge_map": dict(MockDB._global_store.get("m_bridge_map", {})),
                 "m_file_name": dict(MockDB._global_store.get("m_file_name", {})),
                 "m_file": dict(MockDB._global_store.get("m_file", {})),
                 "m_bridge_file": dict(MockDB._global_store.get("m_bridge_file", {})),
@@ -3456,21 +3455,15 @@ def format_bridge_tag_map(store: dict[str, dict]) -> str:
 
 
 def format_spatial_ast_map(store: dict[str, dict]) -> str:
-    """Format Spatial AST Region Map (m_map_ast & m_bridge_map)."""
+    """Format Spatial AST Region Map (m_map_ast, keyed by the tag: map_id = tag_id)."""
     mock_map_ast = store.get("m_map_ast", {})
-    mock_bridge_map = store.get("m_bridge_map", {})
     mock_ast = store.get("m_ast", {})
 
     ast_map = {row[0]: row for row in mock_ast.values()} if mock_ast else {}
 
-    map_to_tags: dict[int, list[int]] = {}
-    for b_row in mock_bridge_map.values():
-        t_id, m_id = b_row[0], b_row[1]
-        map_to_tags.setdefault(m_id, []).append(t_id)
-
     lines = [
         COLOR.cyan("\n" + "=" * 115),
-        COLOR.cyan("                            SPATIAL AST REGION MAP (m_map_ast & m_bridge_map)"),
+        COLOR.cyan("                            SPATIAL AST REGION MAP (m_map_ast)"),
         COLOR.cyan("=" * 115),
         f"{'Map ID':<7} | {'Tag ID(s)':<10} | {'AST ID':<7} | {'Relative Extent':<20} | {'AST Symbol Name':<28} | {'AST Construct Type'}",
         COLOR.cyan("-" * 115),
@@ -3480,10 +3473,7 @@ def format_spatial_ast_map(store: dict[str, dict]) -> str:
 
     for m_row in sorted_maps:
         map_id, line_s, char_s, line_e, char_e, ast_id = m_row
-        tags = map_to_tags.get(map_id, [])
-        tags_str = ", ".join(f"#{t}" for t in tags) if tags else "-"
-        if len(tags_str) > 10:
-            tags_str = tags_str[:8] + ".."
+        tags_str = f"#{map_id}"
 
         rel_extent = f"L{line_s}:C{char_s} -> L{line_e}:C{char_e}"
 

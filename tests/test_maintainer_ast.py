@@ -253,6 +253,18 @@ class TestMaintainerMatcher(unittest.TestCase):
         matches_other = self.matcher.match_file("drivers/net/e1000.c")
         self.assertEqual(len(matches_other), 0)
 
+    def test_wildcard_does_not_reach_into_subdirectories(self) -> None:
+        """`F: dir/*` covers the files of dir only, `*/net/*` one level under any top directory (get_maintainer.pl)."""
+        section = MaintainerSection(
+            name="NET DIR FILES",
+            patterns=[PatternRule(PatternType.FILE, "drivers/net/*"), PatternRule(PatternType.FILE, "*/fw/*")],
+        )
+        matcher = MaintainerMatcher([section])
+        self.assertEqual([s.name for s in matcher.match_file("drivers/net/loopback.c")], ["NET DIR FILES"])
+        self.assertEqual(matcher.match_file("drivers/net/ethernet/intel/e1000.c"), [])
+        self.assertEqual([s.name for s in matcher.match_file("lib/fw/x.c")], ["NET DIR FILES"])
+        self.assertEqual(matcher.match_file("lib/sub/fw/x.c"), [])
+
     def test_directory_recursive_matching(self) -> None:
         matches = self.matcher.match_file("fs/ext4/super.c")
         self.assertEqual(len(matches), 1)
@@ -503,6 +515,9 @@ class TestMaintainerAndCreditsIntegration(unittest.TestCase):
                 fn_ids[path] = fnid
                 G.TE.set(m_file.table_id, (fid, b"\x00" * 20, 1))
                 G.TE.set(m_bridge_file.table_id, (1, fnid, fid))
+            # The version's MAINTAINERS file is blob 1, the blob the seeded sections belong to
+            maintainers_fnid = G.TE.set(m_file_name.table_id, (None, "MAINTAINERS"))[0]
+            G.TE.set(m_bridge_file.table_id, (1, maintainers_fnid, 1))
 
             # 1. Run processing_maintainer_files
             processing_maintainer_files("v3.0")
@@ -527,10 +542,10 @@ class TestMaintainerAndCreditsIntegration(unittest.TestCase):
             processing_kbuild("v3.0")
 
             # Verify the Makefile's build references (m_file_reference, ref_type 3 = Kbuild):
-            # ext4.o's members balloc.c / inode.c and core.o, all keyed by the Makefile blob (9)
-            refs = {(row[1], row[2], row[3]) for row in G.TE.queued_set.get(m_file_reference.table_id, {}).values()}
+            # ext4.o's members balloc.c / inode.c and core.o, all keyed by the Makefile's (blob 9, path)
+            refs = {(row[1], row[2], row[3], row[4]) for row in G.TE.queued_set.get(m_file_reference.table_id, {}).values()}
             for name in ("fs/ext4/balloc.c", "fs/ext4/inode.c", "fs/ext4/core.c"):
-                self.assertIn((9, fn_ids[name], 3), refs)
+                self.assertIn((9, fn_ids["fs/ext4/Makefile"], fn_ids[name], 3), refs)
         finally:
             if orig_mf is not None:
                 main.MF = orig_mf

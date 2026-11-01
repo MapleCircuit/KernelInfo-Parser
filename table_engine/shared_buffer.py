@@ -262,54 +262,40 @@ class SharedTableReader:
             if step > cap:
                 return None
 
+    def _unpack_cell(self, str_base: int, cur: int) -> Any:
+        """Decode the 9-byte slotted cell at `cur` (1-byte tag, then an int64 or a string/bytes reference)."""
+        tag = self.mv[cur]
+        if tag == TAG_INT:
+            return struct.unpack_from("<q", self.mv, cur + 1)[0]
+        if tag == TAG_STR or tag == TAG_BYTES:
+            s_off, s_len = struct.unpack_from("<II", self.mv, cur + 1)
+            raw = bytes(self.mv[str_base + s_off : str_base + s_off + s_len])
+            return raw.decode("utf-8", errors="replace") if tag == TAG_STR else raw
+        return None
+
     def _unpack_row(self, t_meta: dict[str, Any], rec_off: int) -> tuple:
         """Reconstruct tuple of SafeDataType from slotted record in shared memory."""
-        col_count = t_meta["col_count"]
         str_base = t_meta["str_offset"]
-        cells = []
-        cur = rec_off
-        for _ in range(col_count):
-            tag = self.mv[cur]
-            cur += 1
-            if tag == TAG_NONE:
-                cells.append(None)
-                cur += 8
-            elif tag == TAG_INT:
-                val = struct.unpack_from("<q", self.mv, cur)[0]
-                cells.append(val)
-                cur += 8
-            elif tag == TAG_STR:
-                s_off, s_len = struct.unpack_from("<II", self.mv, cur)
-                cur += 8
-                s_bytes = bytes(self.mv[str_base + s_off : str_base + s_off + s_len])
-                cells.append(s_bytes.decode("utf-8", errors="replace"))
-            elif tag == TAG_BYTES:
-                s_off, s_len = struct.unpack_from("<II", self.mv, cur)
-                cur += 8
-                cells.append(bytes(self.mv[str_base + s_off : str_base + s_off + s_len]))
-            else:
-                cells.append(None)
-                cur += 8
-        return tuple(cells)
+        return tuple(self._unpack_cell(str_base, rec_off + 9 * c) for c in range(t_meta["col_count"]))
 
     def scan_matching(self, table_id: int, filter_cols: tuple) -> tuple | None:
-        """Linear scan of shared table rows matching filter criteria."""
+        """Linear scan of shared table rows matching filter criteria.
+
+        Only the filtered cells of each record are decoded; a row is unpacked once all of them match.
+        """
         t_meta = self.tables.get(table_id)
         if not t_meta or t_meta["row_count"] == 0:
             return None
         col_count = t_meta["col_count"]
+        filters = [(c * 9, v) for c, v in enumerate(filter_cols[:col_count]) if v is not None]
         rec_size = col_count * 9
         data_base = t_meta["data_offset"]
+        str_base = t_meta["str_offset"]
+        cell = self._unpack_cell
         for i in range(t_meta["row_count"]):
             rec_off = data_base + i * rec_size
-            row = self._unpack_row(t_meta, rec_off)
-            match = True
-            for f_val, r_val in zip(filter_cols, row):
-                if f_val is not None and f_val != r_val:
-                    match = False
-                    break
-            if match:
-                return row
+            if all(cell(str_base, rec_off + off) == val for off, val in filters):
+                return self._unpack_row(t_meta, rec_off)
         return None
 
 

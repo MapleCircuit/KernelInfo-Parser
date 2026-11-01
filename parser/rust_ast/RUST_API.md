@@ -16,9 +16,7 @@ Rust Source Code (.rs)
   │
   ├─ Git Operation: "R100" (Exact Rename) ──► No-op (Reuses old fid automatically)
   │
-  ├─ Git Operation: "D" (Deleted)
-  │  ├─ get_prior_tags(CS) ──► Queries old tags via m_bridge_tag.view_get_multiple
-  │  └─ close_prior_tags(CS) ─► No-op under immutable Git DAG architecture
+  ├─ Git Operation: "D" (Deleted) ──► No-op (tags are immutable content records; no prior tags are loaded)
   │
   └─ Git Operation: "A" / "M" / "R*" (Added / Modified / Content Rename)
      ├─ get_prior_tags(CS) (if M or R*)
@@ -53,10 +51,8 @@ Relational Extraction inside with CS(REF_NO_REF):
   │     │     └── 2. m_moved_tag.set(s_tag_id, tag_ref)                  [If evolved tag match]
   │     │
   │     ├── File-to-Tag Bridge: m_bridge_tag.set(blob_id, tag_ref, line_s, line_e, char_s, char_e)
-  │     ├── Spatial AST Map: m_map_ast.set(tag_ref, 1, 1, rel_line_e, rel_char_e, ast_ref)
-  │     └── Bridge Map Link: m_bridge_map.set(tag_ref, tag_ref)
-  │
-  └─ close_prior_tags(CS): In zero-VID DAG, tags are immutable content records; tag closure is a no-op
+  │     └── Spatial AST Map: m_map_ast.set(tag_ref, 1, 1, rel_line_e, rel_char_e, ast_ref)  (map_id = tag_id;
+  │         m_bridge_map is no longer written)
 ==================================================================================================
 ```
 
@@ -125,8 +121,7 @@ CS.store(m_bridge_tag.set(
     self.extent.char_pos[0],
     self.extent.char_pos[1],
 ))
-CS.store(m_map_ast.set(tag_ref, 1, 1, rel_line_e, rel_char_e, ast_ref))
-CS.store(m_bridge_map.set(tag_ref, tag_ref))
+CS.store(m_map_ast.set(tag_ref, 1, 1, rel_line_e, rel_char_e, ast_ref))  # tag_tracker.stage_tag_map(); map_id = tag_id
 ```
 
 ### 2.4. Cross-Language Definition Indexing (`m_symbol_def` view)
@@ -173,13 +168,12 @@ The Rust AST parser defines dedicated `Ast_Rust` classes for every major languag
 `rust_ast` tracks construct continuity across Git versions using `get_prior_tags` and `match_prior_tag_transition`:
 
 1. **Prior Tag Indexing (`get_prior_tags`)**:
-   Queries active tags for `old_fid` in `Old_VID` from `m_bridge_tag` joined with `m_tag`. Builds in-memory lookup map `CS.prior_tags_map[code_hash]`.
+   `tag_tracker.get_prior_tags(CS, with_indexes=True, with_symbols=False)`: the shared 14-column `m_bridge_tag` -> `m_tag` -> `m_ast` join for `old_fid` in `Old_VID` (from the parsing worker's batch prefetch when present). Builds `CS.prior_tags_map[code_hash]` and the name/position indices `match_prior_tag_transition` uses.
 2. **Exact Tag Recycling (Tier 1)**:
    If `compute_code_hash(self.extent.code)` matches an unconsumed prior tag, the existing `tag_id` is recycled directly into `m_bridge_tag`, producing zero duplicate entries in `m_tag` or `m_ast`.
 3. **Modified Tag Evolution (Tier 2)**:
    If code has changed, `match_prior_tag_transition` matches by symbol name and AST type constant, linking the old tag to the new tag via `m_moved_tag(s_tag_id, tag_ref)`.
-4. **Immutable Tag Closing (`close_prior_tags`)**:
-   Under the immutable Git DAG architecture, prior tags are permanent content records; `close_prior_tags` operates as a clean no-op.
+4. **Immutable Tags**: under the Git DAG architecture prior tags are permanent content records; nothing closes them.
 
 ---
 

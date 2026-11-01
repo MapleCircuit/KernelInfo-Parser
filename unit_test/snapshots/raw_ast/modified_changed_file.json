@@ -100,16 +100,6 @@
         "ast_id": "$ast_1"
       }
     ],
-    "m_bridge_map": [
-      {
-        "tag_id": "$prior_tag_0",
-        "map_id": "$prior_tag_0"
-      },
-      {
-        "tag_id": "$tag_1",
-        "map_id": "$tag_1"
-      }
-    ],
     "m_moved_tag": [
       {
         "s_tag_id": "$prior_tag_0",

@@ -16,9 +16,7 @@ Assembly Source (.S / .s / .h)
   │
   ├─ Git Operation: "R100" (Exact Rename) ──► No-op (Reuses old fid automatically)
   │
-  ├─ Git Operation: "D" (Deleted)
-  │  ├─ get_prior_tags(CS) ──► Queries old tags via m_bridge_tag.view_get_multiple
-  │  └─ close_prior_tags(CS) ─► No-op under immutable Git DAG architecture
+  ├─ Git Operation: "D" (Deleted) ──► No-op (tags are immutable content records; no prior tags are loaded)
   │
   └─ Git Operation: "A" / "M" / "R*" (Added / Modified / Content Rename)
      ├─ get_prior_tags(CS) (if M or R*)
@@ -62,9 +60,7 @@ Relational Extraction inside with CS(REF_NO_REF):
   │     │
   │     ├── File-to-Tag Bridge: m_bridge_tag.set(blob_id, tag_ref, line_s, line_e, char_s, char_e)
   │     ├── Spatial AST Map: m_map_ast.set(tag_ref, 1, 1, rel_line_e, rel_char_e, ast_ref)
-  │     └── Bridge Map Link: m_bridge_map.set(tag_ref, tag_ref)
-  │
-  └─ close_prior_tags(CS): In zero-VID DAG, tags are immutable content records; tag closure is a no-op
+  │     └── (m_map_ast is keyed by the tag (map_id = tag_id); m_bridge_map is no longer written)
 ==================================================================================================
 ```
 
@@ -114,8 +110,7 @@ Relational Extraction inside with CS(REF_NO_REF):
        extent.char_pos[0],
        extent.char_pos[1],
    ))
-   CS.store(m_map_ast.set(tag_ref, 1, 1, rel_line_e, rel_char_e, ast_ref))
-   CS.store(m_bridge_map.set(tag_ref, tag_ref))
+   CS.store(m_map_ast.set(tag_ref, 1, 1, rel_line_e, rel_char_e, ast_ref))  # map_id = tag_id
    ```
 
 4. **Preprocessor Includes (`CPPro_include`)**:
@@ -156,7 +151,7 @@ Assembly files contain a mixture of assembler directives, hardware instructions,
 `asm_ast` shares the 5-tier tag evolution engine with `c_ast` via [tag_tracker.py](parser/c_ast/tag_tracker.py):
 
 1. **Prior Tag Querying (`get_prior_tags(CS)`)**:
-   - Queries `m_bridge_tag.view_get_multiple` for `old_fid` in `Old_VID`.
+   - `tag_tracker.get_prior_tags()`: the 14-column `m_bridge_tag` -> `m_tag` -> `m_ast` join for `old_fid` in `Old_VID` (`query_prior_tags()`), served from the parsing worker's batch prefetch when present.
    - Indexes prior tags into `prior_tags_map[code_hash]` and `prior_tags_name_map[name]`.
 2. **5-Tier Evolution Matching**:
    - **Tier 1 (Exact Hash)**: If `compute_code_hash(extent.code)` matches an unconsumed prior tag, the existing `tag_id` is recycled without creating new rows in `m_tag` or `m_ast`.
@@ -164,8 +159,7 @@ Assembly files contain a mixture of assembler directives, hardware instructions,
    - **Tier 3 (Bulk Renames)**: Refactoring prefix/suffix changes.
    - **Tier 4 (Positional Anchors)**: Relative position between unchanged sibling labels.
    - **Tier 5 (Line Proximity)**: Fallback line overlap (drift $\le 2$ lines).
-3. **Immutable Tag Closing (`close_prior_tags(CS)`)**:
-   - In the zero-VID DAG architecture, tags are immutable content records; `close_prior_tags(CS)` operates as a safe no-op.
+3. **Immutable Tags**: in the zero-VID DAG architecture tags are immutable content records; nothing closes them.
 
 ---
 

@@ -221,15 +221,20 @@ class TestIngestStateDatabase(unittest.TestCase):
             ("v1.0", 101, I.INGEST_DONE),
             ("v1.1", 102, I.INGEST_PARSING),
             ("v1.2", 103, None),
+            ("v1.3", 104, None),
         ]
         cnx = FakeCnx({
             "SELECT r.ref_name": fake_rows,
-            "SELECT COUNT(*) FROM m_bridge_checkpoint": [(50,)],
+            "SELECT DISTINCT commit_id FROM m_bridge_checkpoint": [(103,)],
         })
         states = I.fetch_repo_version_states(cnx, repo_id=1, network_id=1)
         self.assertEqual(states["v1.0"], (101, "done"))
         self.assertEqual(states["v1.1"], (102, "interrupted"))
-        self.assertEqual(states["v1.2"], (103, "done"))
+        # Checkpoint rows without a state row: completeness is decided by main._previous_ingest() (90% rule)
+        self.assertEqual(states["v1.2"], (103, "legacy"))
+        self.assertEqual(states["v1.3"], (104, "new"))
+        # One batched existence query for all legacy candidates, not one COUNT(*) per ref
+        self.assertEqual(sum(1 for sql, _ in cnx.log if "m_bridge_checkpoint" in sql), 1)
 
     def test_purge_version_differential_rows_cleans_version_records(self) -> None:
         cnx = FakeCnx({
@@ -243,6 +248,29 @@ class TestIngestStateDatabase(unittest.TestCase):
         self.assertTrue(any("DELETE FROM m_moved_tag" in s for s in sqls))
         self.assertTrue(any("UPDATE m_ingest_state SET status" in s for s in sqls))
         self.assertGreater(cnx.commits, 0)
+        # Only tags absent from the predecessor's tree lose their inbound transitions
+        tag_query = next(p for sql, p in cnx.log if "SELECT DISTINCT bt.tag_id" in sql)
+        self.assertEqual(tag_query, (40, 50, 40))
+
+    def test_purge_without_predecessor_keeps_moved_tags(self) -> None:
+        cnx = FakeCnx({"SELECT DISTINCT bt.tag_id": [(10,)]})
+        I.purge_version_differential_rows(cnx, commit_id=50)
+        self.assertFalse(any("m_moved_tag" in sql for sql, _ in cnx.log))
+
+    def test_cleanup_keeps_directories_of_running_instances(self) -> None:
+        import tempfile
+        import os
+        from core.FileHandler import mark_owner
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            live = tempfile.mkdtemp(prefix="code-parser.live-", dir=tmp_dir)
+            mark_owner(live)
+            dead = tempfile.mkdtemp(prefix="kip-commits-", dir=tmp_dir)
+            with open(os.path.join(dead, ".kip-owner"), "w") as f:
+                f.write("999999999")
+            removed = I.cleanup_ramdisk_artifacts(ramdisk_dir=tmp_dir, search_system_temps=False)
+            self.assertEqual(removed, 1)
+            self.assertTrue(os.path.isdir(live))
+            self.assertFalse(os.path.isdir(dead))
 
     def test_cleanup_ramdisk_artifacts(self) -> None:
         import tempfile

@@ -16,8 +16,8 @@ C / ASM Source Code (.c / .h / .S)
   │
   ▼ [Ast_Manager (c_ast.py)]
 Clang TranslationUnit (cc.Index -> cc.TranslationUnit)
-  │ (with -D__KERNEL__, kernel include paths, PARSE_DETAILED_PROCESSING_RECORD + 32768)
-  │ (optional comment_remover() pre-filter if G.OVERRIDE_CPPRO_CINDEX_INPUT is active)
+  │ (with -D__KERNEL__, kernel include paths, _CLANG_PARSE_OPTIONS = PARSE_DETAILED_PROCESSING_RECORD
+  │  | IgnoreNonErrorsFromIncludedFiles (0x4000) | RetainExcludedConditionalBlocks (0x8000))
   ▼ [TokenStream / TokenList (tokenizer.py)]
 Low-Level Foreign Ctypes Tokenization & Bulk Annotation:
   ├── clang_tokenize() -> tokens_memory (Contiguous C array of cc.Token)
@@ -75,11 +75,10 @@ CSExtractor.extract_zone(CS, main_zone) -> main_zone.extract(CS) (cs_extractor.p
   │     ├── File-to-Tag Bridge: m_bridge_tag.set(blob_id, tag_ref, line_s, line_e, char_s, char_e)
   │     ├── Spatial AST Map: m_map_ast.set(tag_ref, 1, 1, rel_line_e, rel_char_e, ast_ref)
   │     │     └── (rel_line_e and rel_char_e computed against self.endif for preprocessor branches)
-  │     ├── Bridge Map Link: m_bridge_map.set(tag_ref, tag_ref) (deduped via register_bridge_map)
+  │     │     (map_id is the tag: m_bridge_map, whose rows were all (tag_id, tag_id), is no longer written)
   │     └── Debug serialization: m_ast_debug.set (when G.OVERRIDE_FORCE_AST_DEBUG is True)
   │
-  └── Tag Lifecycle Finalization: close_prior_tags(CS) (tag_tracker.py)
-        └── Immutable zero-VID DAG: tags remain permanent content records; tag retirement/closure is a no-op
+  └── Immutable zero-VID DAG: tags remain permanent content records (nothing closes them)
 ==================================================================================================
 ```
 
@@ -91,11 +90,12 @@ CSExtractor.extract_zone(CS, main_zone) -> main_zone.extract(CS) (cs_extractor.p
 Dispatches parsing workflow inside `with CS(REF_C_AST):` according to Git diff status `CS.file_operation`:
 - **`"R100"`** (Exact rename): Immediate return. File lifecycle and AST tags are preserved automatically.
 - **`"A"`** (Added file): Calls `process_c_ast(CS)`.
-- **`"M"` / `"R*"`** (Modified / Partial Rename): Executes `get_prior_tags(CS)` &rarr; `process_c_ast(CS)` &rarr; `close_prior_tags(CS)`.
-- **`"D"`** (Deleted file): Executes `get_prior_tags(CS)` &rarr; `close_prior_tags(CS)`.
+- **`"M"` / `"R*"`** (Modified / Partial Rename): Executes `get_prior_tags(CS)` &rarr; `process_c_ast(CS)`.
+- **`"D"`** (Deleted file): stages nothing (tags are immutable content records; no prior tags are loaded).
+- Ends with `finish_symbol_rows(CS)` (core/SymbolRows.py); `ChangeSet.parse()` does not repeat it.
 
-### 2.2 `comment_remover(text: str) -> str`
-Strips C line/block comments from source text while preserving exact line numbering by substituting comment spans with equivalent counts of newline characters (`\n`). Used during pre-filtering when `G.OVERRIDE_CPPRO_CINDEX_INPUT` is enabled.
+### 2.2 Clang arguments
+`Ast_Manager.Init_Parse()` passes `_CLANG_KERNEL_MACRO_DEFINES` and the include paths only. (The former `G.OVERRIDE_CPPRO_CINDEX_INPUT` option passed every `#ifdef` name as a bare argument without `-D`, which clang ignores; it was removed together with `comment_remover()`.)
 
 ### 2.3 `process_c_ast(CS: ChangeSet) -> None`
 Instantiates `Ast_Manager(CS)` to drive translation unit parsing and extraction.
@@ -308,7 +308,7 @@ Expands the target `Line` extent to encapsulate trailing punctuation delimiters 
   - `exec_filter(token, cursor, kind)`: Dispatches token to appropriate handler.
   - `extract_1arg(CS, type_id: int, name: int | str, extent: Line | None = None) -> None`: Emits `m_ast.view(((m_ast.ast_id,),), None, str(name)[:255], type_id)` inside `with CS(REF_POS):` and dispatches `self.tag`.
   - `tag(CS, ast_id_route, extent=None, ast_name=None, ast_type=None) -> None`: Primary tag stager. Evaluates Tier 1 exact hash match, Tier 2-5 evolution transitions, emits `m_tag.set` (Rule 12 first in `REF_POS`), `m_moved_tag.set`, `m_bridge_tag.set`, and invokes `self.map_ast`.
-  - `map_ast(CS, ast_id_route, tag_route, extent=None) -> None`: Computes relative coordinates (using `self.endif` for preprocessor conditional branches) and stages `m_map_ast.set` and deduplicated `m_bridge_map.set`.
+  - `map_ast(CS, ast_id_route, tag_route, extent=None) -> None`: Computes relative coordinates (using `self.endif` for preprocessor conditional branches) and stages the tag-keyed `m_map_ast` row (`tag_tracker.stage_tag_map()`).
 
 #### `Ast_Statement(Ast)` (Statement Interface)
 Base class in `cursor_tree.py` for executable statements (`Ast_CompoundStmt`, `Ast_IfStmt`, `Ast_SwitchStmt`, etc.):
@@ -493,7 +493,7 @@ class Zone_Type(IntEnum):
   - Child AST nodes created under `Zone_Type.Full_File` (or inside structs) receive `end_mode = End_Mode.Extent` bounded strictly by their Clang cursor extents. This prevents inline functions (which terminate with `}`) from swallowing subsequent top-level declarations.
   - Trailing punctuation delimiters in `_PUNCT_IGNORED` (`{",", ";"}`) trigger delimiter growth on the active child node (`self.children[-1].extent.grow(tline)`), absorbing semicolons while maintaining 100.00% character code coverage.
 - **Factory `_create_child_node(cursor, extent) -> Ast`**:
-  Maps Clang cursor kinds to specific Statement, Expression, or `C_Type` instances:
+  Maps Clang cursor kinds to specific Statement, Expression, or `C_Type` instances through one dict lookup (`_child_node_factories()`, built once from the kinds the installed cindex has; any `*ASM_STMT` kind maps to `Ast_AsmStmt`; other kinds get `self.ast_type`):
   - `DECL_STMT`, `VAR_DECL`, `FIELD_DECL`, `PARM_DECL` &rarr; `C_Type`
   - `IF_STMT` &rarr; `Ast_IfStmt`, `SWITCH_STMT` &rarr; `Ast_SwitchStmt`, `CASE_STMT` &rarr; `Ast_CaseStmt`, `DEFAULT_STMT` &rarr; `Ast_DefaultStmt`
   - `WHILE_STMT` &rarr; `Ast_WhileStmt`, `DO_STMT` &rarr; `Ast_DoStmt`, `FOR_STMT` &rarr; `Ast_ForStmt`
@@ -701,8 +701,10 @@ Incoming Modified AST Node Extent & Metadata
       └── Matches modified anonymous blocks based on line overlap or <= 2 line distance -> Emits m_moved_tag
 ```
 
-### 8.3 Prior Tag Lifecycle (`close_prior_tags`)
-Under the immutable Git DAG architecture, `m_tag` records are permanent, content-addressable entities; `close_prior_tags(CS)` operates as a clean no-op without mutating existing tag entries.
+### 8.3 Prior Tag Loading & Shared Staging Helpers (`tag_tracker.py`)
+- `get_prior_tags(CS, with_indexes=True, with_symbols=True)`: loads the previous version's tags (`query_prior_tags(old_fid)`, 14 columns: `m_bridge_tag` + `m_tag` + `m_ast`; served from the worker's batch prefetch `_batch_prior_tags` when present). It always builds the code-hash index; `with_indexes` adds the name/position indices of the transition tiers, `with_symbols` loads the stored symbol items (C/ASM only). Raw files use neither, Rust only the indices.
+- Every parser stages tags through `check_exact_match()` (Tier 1), `stage_new_tag()` (Rule 12), `stage_bridge_tag()` and `stage_tag_map()`; Kconfig, MAINTAINERS and CREDITS entries use `stage_entry_tag()`, which combines them with every row staged positionally.
+- Under the immutable Git DAG architecture `m_tag` records are permanent: nothing closes prior tags, and a deleted file loads none.
 
 ---
 
@@ -737,28 +739,14 @@ ast_ref = (
     else ast_id_route
 )
 
-# 4. Rule 12 Staging Invariant: m_tag.set MUST BE FIRST inside with CS(REF_POS):
-with CS(REF_POS):
-    CS.store(m_tag.set(None, code_hash, ast_ref, 0, 0))
-    tag_ref = ((m_tag.table_id, 0), OP_REF, (REF_POS, CS.route[-1]))
-    if s_tag_id is not None:
-        CS.store(m_moved_tag.set(s_tag_id, tag_ref))
+# 4. Rule 12 Staging Invariant: m_tag.set MUST BE FIRST inside with CS(REF_POS) (tag_tracker.stage_new_tag)
+tag_ref = stage_new_tag(CS, code_hash, ast_ref, s_tag_id)
 
 # 5. File-to-tag bridge (source coordinates: 1-based, inclusive start, exclusive end)
-CS.store(m_bridge_tag.set(
-    ((m_file.table_id, 0), OP_REF, (REF_ROOT,)),
-    tag_ref,
-    extent.line_pos[0], extent.line_pos[1],
-    extent.char_pos[0], extent.char_pos[1],
-))
+stage_bridge_tag(CS, tag_ref, extent.line_pos, extent.char_pos)
 
-# 6. Intra-tag spatial map & bridge map (deduplicated via CS.register_bridge_map)
-rel_line_e = max(1, extent.line_pos[1] - extent.line_pos[0] + 1)
-rel_char_e = extent.char_pos[1]
-CS.store(m_map_ast.set(tag_ref, 1, 1, rel_line_e, rel_char_e, ast_ref))
-
-if not hasattr(CS, "register_bridge_map") or CS.register_bridge_map(tag_ref, tag_ref):
-    CS.store(m_bridge_map.set(tag_ref, tag_ref))
+# 6. Intra-tag spatial map, keyed by the tag (map_id = tag_id)
+stage_tag_map(CS, tag_ref, ast_ref, max(1, extent.line_pos[1] - extent.line_pos[0] + 1), extent.char_pos[1])
 
 return tag_ref
 ```
@@ -767,7 +755,7 @@ return tag_ref
 
 ### 9.3 Symbol Definitions & References (`core/SymbolRows.py`)
 - Parsers no longer store `m_symbol_def` / `m_symbol_ref` rows while extracting. Every former staging site records the item instead: `record_symbol_def(CS, tag_ref, ast_ref, name, type_id, linkage, line_s, line_e)` and `record_symbol_ref(CS, tag_ref, target, target_fnid, role, line, char_s)` (the surrounding `with CS(REF_POS):` stays, since some arguments are positional references). Pending references go through `flush_pending_symbol_refs(CS, tag_ref)` (same per-flush deduplication as before), and `Ast.tag()` / `CSExtractor.stage_tag()` register every placed tag with its lines, start column and text (`register_symbol_tag(CS, tag_ref, line_s, line_e, char_s, code)`, both the tier-1 recycled and the new branch).
-- `c_ast_parse()`, `asm_ast_parse()` and `ChangeSet.parse()` end with `finish_symbol_rows(CS)` (idempotent), which emits all symbol operations at the end of the file:
+- `c_ast_parse()` and `asm_ast_parse()` end with `finish_symbol_rows(CS)` (idempotent), which emits all symbol operations at the end of the file:
   - Items recorded against a tag that does not contain their lines (pending references are flushed to the next tag created) move to the innermost tag that does; items no tag contains stay per blob.
   - Each item inside its tag gets a `sym_key` from the tag's text only: a digest of the tag's code with the identifier at the reference and its role, or with the definition's name and type. It never depends on the target's form (an unresolved route in the first parse, an AST id once `CS.ref()` can resolve it against the database), so a recycled tag compares equal in every version. A key that means two different targets in this file (shadowed locals; targets compared by Merkle fingerprint) is refined by the item's position in the tag; a key that still means two targets (the same tag placed twice and resolved differently) keeps those placements per blob.
   - New tag: `m_tag_def` / `m_tag_ref` rows with lines relative to the tag. Recycled tag whose current items equal the stored ones: nothing. Otherwise (changed items, or no stored items): `m_symbol_own` marker plus per-blob `m_blob_symbol_def` / `m_blob_symbol_ref` rows.
@@ -825,12 +813,12 @@ Defined in `core/globalstuff.py`, `STANDARD_C_KEYWORDS: dict[str, ASTT]` provide
 | m_tag               |   10     | (tag_id, hash, ast_id, hl_s, hl_l)                                 |
 | m_bridge_tag        |   11     | (blob_id, tag_id, line_s, line_e, char_s, char_e)                  |
 | m_map_ast           |   12     | (map_id, line_s, char_s, line_e, char_e, ast_id)                   |
-| m_bridge_map        |   13     | (tag_id, map_id)                                                   |
+| m_bridge_map        |   13     | (tag_id, map_id) — no longer written                               |
 | m_ast_hash          |   14     | (hash, ast_id)                                                     |
 | m_moved_tag         |   25     | (s_tag_id, e_tag_id)                                               |
 | m_symbol_def        |   26     | (def_id, blob_id, tag_id, ast_id, name, type_id, linkage, line_s, line_e) |
 | m_symbol_ref        |   27     | (ref_id, blob_id, tag_id, ast_id, target_fnid, role, line, char_s)  |
-| m_file_reference    |   28     | (ref_id, source_blob_id, target_fnid, ref_type, line_no, details)  |
+| m_file_reference    |   28     | (ref_id, source_blob_id, source_fnid, target_fnid, ref_type, line_no, details) |
 | m_ast_attribute     |   34     | (ast_id, priority, name, val)                                      |
 +----------------------------------------------------------------------------------------------------+
 ```
@@ -845,7 +833,7 @@ Defined in `core/globalstuff.py`, `STANDARD_C_KEYWORDS: dict[str, ASTT]` provide
 4. **TableEngine Agnosticism**: Tests and workflows must never access private engine internals (e.g. `_cached_rows`, `_pk_index`). Queries must use public TableEngine APIs (`Table.get()`, `G.TE.get()`) or assert against database state (`MockDB._global_store`).
 5. **Form Feed & Line Splitting**: Never use `splitlines()` on source text. Use `raw_content.replace("\r\n", "\n").split("\n")` to preserve 1:1 line index parity with Libclang across files containing form-feed characters (`\x0c`).
 6. **Delimiter Encapsulation & 100.00% Coverage**: Semicolons (`;`), closing braces (`}`), and macro continuation backslashes (`\`) must be encapsulated within AST node extents to ensure 100.00% character coverage and zero orphan characters.
-7. **Bridge Map Deduplication**: Always register tag bridge map links via `CS.register_bridge_map(tag_ref, tag_ref)` before emitting `m_bridge_map.set` to prevent duplicate primary key crashes in MariaDB.
+7. **Tag-Keyed Spatial Maps**: `m_map_ast.map_id` is the tag id (`stage_tag_map()`); `m_bridge_map` is no longer written (it only ever held `(tag_id, tag_id)`), readers join `m_map_ast.map_id = m_bridge_tag.tag_id`.
 8. **Schema String Bounds**: Every string written to `m_ast.name` must be bounded to 255 characters (`safe_name = str(name)[:255]`) to satisfy database column constraints.
 9. **Import Order Guard**: Always ensure `core` modules (`core.globalstuff`, `core.DBLayout`) are imported before `parser.c_ast` components to prevent circular import deadlocks.
 10. **Exact Rename Optimization**: When `CS.file_operation == "R100"`, `c_ast_parse` must return immediately without emitting records.
@@ -965,7 +953,7 @@ The C & Preprocessor AST parser is verified through the reusable snapshot testin
   - `assert_snapshot_matches(test_case, parser_name, test_name, snapshot)`: Verifies extracted ChangeSet tables and `test_conf` metadata against verified JSON baselines. Set `UPDATE_SNAPSHOTS=1` in the environment to re-generate baselines after human verification.
 - **Test Suites**: `unit_test/test_c_parser.py`
   - **Lifecycle Suite (`Test_CParserLifecycle`)**:
-    - `test_01_added_c_file`: Added (`A`) file parsing of `include/linux/lockd/bind.h` on `v3.0`, verifying creation of `m_v_main`, file prelude, `m_ast`, `m_tag`, `m_bridge_tag`, `m_map_ast`, `m_bridge_map`, `m_symbol_def`, and `m_symbol_ref`.
+    - `test_01_added_c_file`: Added (`A`) file parsing of `include/linux/lockd/bind.h` on `v3.0`, verifying creation of `m_v_main`, file prelude, `m_ast`, `m_tag`, `m_bridge_tag`, `m_map_ast` (no `m_bridge_map`), `m_symbol_def`, and `m_symbol_ref`.
     - `test_02_modified_changed_c_file`: Modified (`M`) file parsing across `v2.6.28` -> `v2.6.29` (kernel commit `0cb2659b` adding `noresvport` to `struct nlmclnt_initdata`), validating evolutionary links via `m_moved_tag: 1`, recycling of unchanged tags, retention of both struct tag codes, and prior struct tag closure (`vid_e = 1`).
     - `test_03_exact_rename_c_file`: Exact rename (`R100`) file parsing across `v2.6.39` -> `v3.0`, verifying `m_v_main` progression, old `fid` reuse, dual `m_bridge_file` links, and zero duplicate AST tags.
   - **Corner Cases Suite (`Test_CParserCornerCases`)**:

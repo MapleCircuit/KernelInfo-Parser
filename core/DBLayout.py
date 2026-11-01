@@ -48,7 +48,7 @@ SCHEMA ENTITY-RELATIONSHIP GRAPH:
    m_blob_symbol_def (def_id, blob_id, tag_id, ast_id, name, type_id, linkage, line_s, line_e)
    m_blob_symbol_ref (ref_id, blob_id, tag_id, ast_id, target_fnid, role, line, char_s)
    Views m_symbol_def / m_symbol_ref (main.ensure_db_views) return both layouts in the per-blob shape.
-   m_file_reference (ref_id, source_blob_id, target_fnid, ref_type, line_no, details)
+   m_file_reference (ref_id, source_blob_id, source_fnid, target_fnid, ref_type, line_no, details)
 
 6. Kconfig: no dedicated tables. Kconfig entries are tags like any other code (m_ast name + type
    Kconfig_Config/Kconfig_Menuconfig/... -> m_tag -> m_bridge_tag); everything else (menus,
@@ -368,7 +368,10 @@ m_map_ast = Table(
 )
 
 # -----------------------------------------------------------------------------
-# 13. m_bridge_map (table_id=13): Tag to AST Map Linkage
+# 13. m_bridge_map (table_id=13): Tag to AST Map Linkage (no longer written)
+# Every row it ever held was (tag_id, tag_id): m_map_ast.map_id is the tag id, so readers join
+# m_map_ast.map_id = m_bridge_tag.tag_id directly. The table stays registered so table ids never shift
+# (m_ast_hash hashes join graphs, table ids included).
 # -----------------------------------------------------------------------------
 m_bridge_map = Table(
     table_id=13,
@@ -769,6 +772,7 @@ m_file_reference = Table(
     columns=(
         ("ref_id", "INT", "NOT NULL", "AUTO_INCREMENT"),
         ("source_blob_id", "INT", "NOT NULL"),
+        ("source_fnid", "INT", "NOT NULL"),
         ("target_fnid", "INT", "NOT NULL"),
         ("ref_type", "TINYINT", "UNSIGNED", "NOT NULL"),
         ("line_no", "INT", "NOT NULL"),
@@ -777,6 +781,7 @@ m_file_reference = Table(
     primary=("ref_id",),
     foreign=(
         ("source_blob_id", "m_file_blob", "blob_id"),
+        ("source_fnid", "m_file_name", "fnid"),
         ("target_fnid", "m_file_name", "fnid"),
     ),
     initial_insert=None,
@@ -784,10 +789,12 @@ m_file_reference = Table(
     te_cached=False,
     blob_scoped=True,
     indexes=(
-        ("fref_src_idx", ("source_blob_id", "ref_type")),
         ("fref_tgt_idx", ("target_fnid", "ref_type")),
     ),
-    unique_keys=(("source_blob_id", "target_fnid", "ref_type", "line_no"),),
+    # One row set per (path, blob) pair: Kbuild and documentation references resolve relative to the
+    # source file's path, so identical copies of a Makefile in two directories reference different files.
+    # The unique key's (source_blob_id, source_fnid, ...) prefix serves lookups from the source side.
+    unique_keys=(("source_blob_id", "source_fnid", "target_fnid", "ref_type", "line_no"),),
     hashing_table=False,
 )
 setattr(m_file_reference, "source_fid", m_file_reference.source_blob_id)

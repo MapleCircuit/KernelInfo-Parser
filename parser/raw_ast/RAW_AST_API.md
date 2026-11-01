@@ -22,9 +22,7 @@ Raw / Fallback File (T_RAW, T_MAINTAINERS, T_CREDITS, etc.)
   │
   ├─ Git Operation: "R100" (Exact Rename) ──► No-op (Reuses old blob automatically)
   │
-  ├─ Git Operation: "D" (Deleted)
-  │  ├─ get_prior_tags(CS) ──► Queries old_vid tags via 2-way join (m_bridge_tag -> m_tag)
-  │  └─ close_prior_tags(CS) ─► No-op under immutable Git DAG architecture
+  ├─ Git Operation: "D" (Deleted) ──► No-op (tags are immutable content records; no prior tags are loaded)
   │
   └─ Git Operation: "A" / "M" / "R*" (Added / Modified / Content Rename)
      ├─ get_prior_tags(CS) (if M or R*)
@@ -46,10 +44,8 @@ Raw / Fallback File (T_RAW, T_MAINTAINERS, T_CREDITS, etc.)
      │     │  ├─ m_tag.set(None, content_hash, ast_ref, 0, 0) [5-col, Rule 12]
      │     │  └─ m_moved_tag.set(s_tag_id, tag_ref) (if modifying prior tag)
      │     ├─ m_bridge_tag.set(blob_id, tag_ref, 1, line_count, 1, last_char_count)
-     │     ├─ m_map_ast.set(tag_ref, 1, 1, line_count, last_char_count, ast_ref)
-     │     └─ m_bridge_map.set(tag_ref, tag_ref)
+     │     └─ m_map_ast.set(tag_ref, 1, 1, line_count, last_char_count, ast_ref)
      │
-     └─ close_prior_tags(CS) (if M or R*, no-op)
 ==================================================================================================
 ```
 
@@ -68,10 +64,7 @@ Primary entry point dispatched by `main.py` when processing files typed as `T_RA
   - `CS.file_operation == "M"` or partial rename (`"R*"`):
     1. `get_prior_tags(CS)`: Queries and indexes tags from `Old_VID`.
     2. `RawManager(CS)`: Reconciles content hash; recycles existing tag or creates replacement tag with `m_moved_tag` link.
-    3. `close_prior_tags(CS)`: No-op under immutable Git DAG architecture.
-  - `CS.file_operation == "D"`:
-    1. `get_prior_tags(CS)`: Retrieves active tags from `Old_VID`.
-    2. `close_prior_tags(CS)`: No-op under immutable Git DAG architecture.
+  - `CS.file_operation == "D"` (or `"U"`): stages nothing; tags are immutable content records.
 
 ---
 
@@ -82,29 +75,8 @@ Queries TableEngine for existing active tags registered for the file in the prec
   1. Resolves filename: uses `CS.old_path` for renames (`R*`), otherwise `CS.current_path`.
   2. Resolves `fnid`: `m_file_name.get(None, lookup_path)`.
   3. Resolves `old_fid`: `m_bridge_file.get(old_vid, fnid, None)`.
-  4. Queries prior tags via 11-column 2-way join (`m_bridge_tag` -> `m_tag`):
-     ```python
-     CS.prior_tags = m_bridge_tag.view_get_multiple(
-         ((m_bridge_tag.tag_id, m_tag.tag_id, 1),),
-         old_fid,
-         None,  # 1: m_bridge_tag.tag_id
-         None,  # 2: m_bridge_tag.line_s
-         None,  # 3: m_bridge_tag.line_e
-         None,  # 4: m_bridge_tag.char_s
-         None,  # 5: m_bridge_tag.char_e
-         None,  # 6: m_tag.tag_id
-         None,  # 7: m_tag.hash
-         None,  # 8: m_tag.ast_id
-         None,  # 9: m_tag.hl_s
-         None,  # 10: m_tag.hl_l
-     )
-     ```
+  4. Loads prior tags through `tag_tracker.get_prior_tags(CS, with_indexes=False, with_symbols=False)`: the shared 14-column `m_bridge_tag` -> `m_tag` -> `m_ast` join (`query_prior_tags()`), served from the parsing worker's batch prefetch when present (no second query).
   5. Populates `CS.prior_tags_map = {code_hash: [(idx, tag_id), ...]}` where `code_hash = tag[7]`.
-
----
-
-### 2.3. `close_prior_tags(CS: ChangeSet) -> None`
-Under the Git DAG architecture, prior tags are immutable and preserved content-addressably across history. `close_prior_tags(CS)` operates as a clean no-op.
 
 ---
 
@@ -127,48 +99,14 @@ with CS(REF_POS):
     ))
     ast_ref = ((m_ast.table_id, 0), OP_REF, (REF_POS, CS.route[-1]))
 
-# 2. Tag registration and code snippet deduplication (Rule 12 order)
-with CS(REF_POS):
-    CS.store(m_tag.set(
-        None,
-        content_hash,
-        ast_ref,
-        0,
-        0,
-    ))
-    tag_ref = ((m_tag.table_id, 0), OP_REF, (REF_POS, CS.route[-1]))
-    if s_tag_id is not None:
-        CS.store(m_moved_tag.set(s_tag_id, tag_ref))
+# 2. Tier 1 recycling (check_exact_match) or a new tag (Rule 12 order, tag_tracker.stage_new_tag)
+tag_ref = stage_new_tag(CS, content_hash, ast_ref, s_tag_id)
 
 # 3. Spatial file coordinates
-with CS(REF_POS):
-    CS.store(m_bridge_tag.set(
-        ((m_file.table_id, 0), OP_REF, (REF_ROOT,)),
-        tag_ref,
-        1,
-        line_count,
-        1,
-        last_char_count,
-    ))
+stage_bridge_tag(CS, tag_ref, (1, line_count), (1, last_char_count), positional=True)
 
-# 4. Spatial AST map
-with CS(REF_POS):
-    CS.store(m_map_ast.set(
-        tag_ref,
-        1,
-        1,
-        line_count,
-        last_char_count,
-        ast_ref,
-    ))
-
-# 5. Bridge map
-if not hasattr(CS, "register_bridge_map") or CS.register_bridge_map(tag_ref, tag_ref):
-    with CS(REF_POS):
-        CS.store(m_bridge_map.set(
-            tag_ref,
-            tag_ref,
-        ))
+# 4. Spatial AST map, keyed by the tag (map_id = tag_id; m_bridge_map is no longer written)
+stage_tag_map(CS, tag_ref, ast_ref, line_count, last_char_count, positional=True)
 ```
 
 ---
@@ -192,7 +130,7 @@ The fallback raw AST parser is verified through the reusable snapshot testing ha
   - `extract_changeset_snapshot(CS | [CS, ...], test_conf=...)`: Extracts all executed operations from single or multi-version ChangeSets (`[cs_v1, cs_v2]`). Rows within each table preserve strict operational insertion order. Surrogate monotonic IDs (`tag_id`, `ast_id`, `fid`, `fnid`, `map_id`) are canonicalized into symbolic identifiers (`$tag_0`, `$ast_0`, `$fid_0`) sequentially based on first-appearance order, rendering snapshots deterministic while preserving concrete `vid` sequences. Updates on primary keys (`OP_UPDATE`) update existing rows in place. Table rows preserve exact database column definitions (`table.init_columns`), `type_id` values are formatted as `<id> (<name>)` (e.g., `"144 (Raw_Content)"`), and `ftype` values are formatted as `<id> (<name>)` (e.g., `"7 (T_RAW)"`).
   - `assert_snapshot_matches(test_case, parser_name, test_name, snapshot)`: Verifies extracted ChangeSet tables and `test_conf` metadata against verified JSON baselines. Set `UPDATE_SNAPSHOTS=1` in the environment to re-generate baselines after human verification.
 - **Test Suite**: `unit_test/test_raw_parser.py`
-  - `test_01_added_raw_file`: Added (`A`) file parsing, verifying creation of `m_v_main`, file prelude, `m_ast`, `m_tag`, `m_bridge_tag`, `m_map_ast`, and `m_bridge_map`.
+  - `test_01_added_raw_file`: Added (`A`) file parsing, verifying creation of `m_v_main`, file prelude, `m_ast`, `m_tag`, `m_bridge_tag`, and `m_map_ast` (no `m_bridge_map`).
   - `test_02_modified_changed_raw_file`: Modified (`M`) file parsing across `v2.6.39` -> `v3.0`, validating evolutionary links via `m_moved_tag` and tag continuity.
   - `test_03_exact_rename_raw_file`: Exact rename (`R100`) file parsing across `v2.6.39` -> `v3.0`, verifying `m_v_main` progression, old `fid` reuse, dual `m_bridge_file` links, and zero duplicate AST tags.
 - **Snapshot Storage**: `unit_test/snapshots/raw_ast/*.json` containing `test_conf` metadata and `tables` mapping.

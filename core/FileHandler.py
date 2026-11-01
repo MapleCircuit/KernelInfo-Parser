@@ -1,4 +1,6 @@
 """FileHandler.py - Interacts with the FS and GIT."""
+import contextlib
+import logging
 import os
 import re
 import shutil
@@ -8,6 +10,36 @@ from pathlib import Path
 from core.globalstuff import G, is_safe_git_rev, is_safe_git_spec
 
 _VERSION_TAG_RE = re.compile(r"^v?\d+(?:\.\d+)*(?:-(?:rc|alpha|beta|pre)\d*)?$")
+logger = logging.getLogger(__name__)
+
+# Scratch directories carry the PID of the process that created them, so `--clean-temp` can leave the
+# directories of a parser instance that is still running alone (core/ingest_state.cleanup_ramdisk_artifacts)
+OWNER_FILE = ".kip-owner"
+
+
+def mark_owner(path: str | Path) -> None:
+    """Record the current process as the owner of a scratch directory."""
+    with contextlib.suppress(OSError):
+        Path(path, OWNER_FILE).write_text(str(os.getpid()))
+
+
+def owner_alive(path: str | Path) -> bool:
+    """True when the process recorded by `mark_owner()` for `path` is still running."""
+    try:
+        pid = int(Path(path, OWNER_FILE).read_text().strip())
+    except (OSError, ValueError):
+        return False
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
 
 
 def _ensure_asm_symlinks(base_dir: str | Path) -> None:
@@ -38,7 +70,10 @@ class MasterFile:
         self.version_dict = {}
         self.file_dict = {}
         self.workspace_dir: str | None = None
+        # Revision the workspace currently holds (None while it is being changed)
+        self.workspace_rev: str | None = None
         self._cat_file_proc: sp.Popen | None = None
+        self._cat_file_owner: int = os.getpid()
         self.repo_dir: Path = Path(G.linux_directory).resolve()
         # (repo_dir, version) -> `git ls-tree -r --name-only` output: one version is listed by several steps
         self._file_list_cache: dict[tuple[Path, str], str] = {}
@@ -66,7 +101,14 @@ class MasterFile:
         return str(repo)
 
     def _ensure_cat_file_proc(self) -> sp.Popen:
-        """Ensure persistent git cat-file --batch subprocess is alive."""
+        """Ensure this process's persistent git cat-file --batch subprocess is alive.
+
+        A forked worker inherits the parent's handle but must not share its pipes (requests and answers of
+        two processes would interleave) nor signal it: it starts its own.
+        """
+        if self._cat_file_owner != os.getpid():
+            self._cat_file_proc = None
+            self._cat_file_owner = os.getpid()
         if self._cat_file_proc is not None and self._cat_file_proc.poll() is None:
             return self._cat_file_proc
 
@@ -76,30 +118,25 @@ class MasterFile:
             ["git", f"--git-dir={git_dir}", "cat-file", "--batch"],
             stdin=sp.PIPE,
             stdout=sp.PIPE,
-            stderr=sp.PIPE,
+            stderr=sp.DEVNULL,
             bufsize=0,
         )
         return self._cat_file_proc
 
     def _close_cat_file_proc(self) -> None:
-        """Safely terminate persistent git cat-file --batch subprocess."""
-        if self._cat_file_proc is not None:
-            try:
-                if self._cat_file_proc.stdin:
-                    self._cat_file_proc.stdin.close()
-                if self._cat_file_proc.stdout:
-                    self._cat_file_proc.stdout.close()
-                if self._cat_file_proc.stderr:
-                    self._cat_file_proc.stderr.close()
-                self._cat_file_proc.terminate()
-                self._cat_file_proc.wait(timeout=1.0)
-            except Exception:
-                try:
-                    self._cat_file_proc.kill()
-                except Exception:
-                    pass
-            finally:
-                self._cat_file_proc = None
+        """Terminate this process's git cat-file --batch subprocess (never one inherited from a parent)."""
+        proc, self._cat_file_proc = self._cat_file_proc, None
+        if proc is None or self._cat_file_owner != os.getpid():
+            return
+        try:
+            for pipe in (proc.stdin, proc.stdout):
+                if pipe:
+                    pipe.close()
+            proc.terminate()
+            proc.wait(timeout=1.0)
+        except Exception:
+            with contextlib.suppress(Exception):
+                proc.kill()
 
     @staticmethod
     def _checked_rev(rev: str) -> str:
@@ -161,65 +198,90 @@ class MasterFile:
                     raise
         return None
 
-    def sync_workspace(self, target_rev: str, change_list: list[str]) -> str:
-        """Incrementally synchronize persistent RAMDISK workspace with target_rev using git cat-file."""
-        if not self.workspace_dir or not os.path.exists(self.workspace_dir):
-            self.workspace_dir = self.git_clone(target_rev)
-            self.version_dict[target_rev] = self.workspace_dir
-            self.file_dict.clear()
-            self.file_dict[target_rev] = {}
-            return self.workspace_dir
+    def checkout_version(self, version: str, base_rev: str | None, purge_list: list) -> str:
+        """Make the persistent RAMDISK workspace hold `version` and register it in `version_dict`.
 
-        self.version_dict[target_rev] = self.workspace_dir
-        self.file_dict.clear()
-        self.file_dict[target_rev] = {}
+        When the workspace holds `base_rev`, only the files that differ are rewritten (`_apply_tree_diff()`);
+        otherwise (first version, a skipped base, an earlier failure) the tree is extracted in full. Other
+        versions mapped to the workspace are dropped from `version_dict`, so a read of the previous version
+        goes to git instead of returning the new content from disk.
+        """
+        ws = self.workspace_dir
+        updated = False
+        if ws and os.path.isdir(ws) and base_rev and self.workspace_rev == str(base_rev):
+            self.workspace_rev = None
+            try:
+                self._apply_tree_diff(ws, str(base_rev), version)
+                updated = True
+            except Exception as e:
+                logger.warning(f"Incremental checkout {base_rev}..{version} failed ({e}); extracting the full tree.")
+        if not updated:
+            if ws:
+                shutil.rmtree(ws, ignore_errors=True)
+            ws = self.git_clone(version)
+            if ws not in purge_list:
+                purge_list.append(ws)
+        for stale in [v for v, d in self.version_dict.items() if d == ws]:
+            del self.version_dict[stale]
+            self.file_dict.pop(stale, None)
+        self.workspace_dir = ws
+        self.workspace_rev = version
+        self.version_dict[version] = ws
+        self.file_dict[version] = {}
+        return ws
 
-        for item in change_list:
-            if not item or not item.strip():
-                continue
-            tokens = item.strip().split("\t")
-            status = tokens[0].split()[-1] if " " in tokens[0] else tokens[0]
-
+    def _apply_tree_diff(self, ws: str, base_rev: str, target_rev: str) -> None:
+        """Rewrite the files of `ws` that differ between two revisions (symlinks and modes included)."""
+        git_dir = self._get_git_dir()
+        out = sp.run(
+            ["git", f"--git-dir={git_dir}", "diff-tree", "-r", "-z", "--no-renames",
+             self._checked_rev(base_rev), self._checked_rev(target_rev)],
+            capture_output=True,
+            check=True,
+        ).stdout
+        fields = out.split(b"\0")
+        for i in range(0, len(fields) - 1, 2):
+            meta, path = fields[i].decode("ascii"), fields[i + 1].decode("utf-8", "surrogateescape")
+            _old_mode, new_mode, _old_sha, new_sha, status = meta.lstrip(":").split()
+            target = os.path.join(ws, path)
+            if os.path.islink(target) or os.path.isfile(target):
+                # Unlink first: writing through an existing symlink would overwrite the file it points at
+                os.unlink(target)
             if status.startswith("D"):
-                path = tokens[1]
-                target_file = os.path.join(self.workspace_dir, path)
-                if os.path.exists(target_file) or os.path.islink(target_file):
-                    try:
-                        os.unlink(target_file)
-                    except OSError:
-                        pass
-            elif status.startswith("R"):
-                old_path = tokens[1]
-                new_path = tokens[2]
-                old_target = os.path.join(self.workspace_dir, old_path)
-                if os.path.exists(old_target) or os.path.islink(old_target):
-                    try:
-                        os.unlink(old_target)
-                    except OSError:
-                        pass
-                blob_bytes = self._read_blob(f"{target_rev}:{new_path}")
-                if blob_bytes is not None:
-                    new_target = os.path.join(self.workspace_dir, new_path)
-                    os.makedirs(os.path.dirname(new_target), exist_ok=True)
-                    with open(new_target, "wb") as f:
-                        f.write(blob_bytes)
-            elif status.startswith("A") or status.startswith("M") or status.startswith("C"):
-                path = tokens[1]
-                blob_bytes = self._read_blob(f"{target_rev}:{path}")
-                if blob_bytes is not None:
-                    target_file = os.path.join(self.workspace_dir, path)
-                    os.makedirs(os.path.dirname(target_file), exist_ok=True)
-                    with open(target_file, "wb") as f:
-                        f.write(blob_bytes)
+                self._prune_empty_dirs(ws, os.path.dirname(target))
+                continue
+            if new_mode == "160000":
+                continue  # submodule commit: no content in this repository
+            data = self._read_blob(new_sha)
+            if data is None:
+                raise RuntimeError(f"blob {new_sha} of '{path}' is missing")
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            if new_mode == "120000":
+                os.symlink(os.fsdecode(data), target)
+                continue
+            with open(target, "wb") as f:
+                f.write(data)
+            if new_mode == "100755":
+                os.chmod(target, 0o755)
+        _ensure_asm_symlinks(ws)
 
-        # Ensure asm symlinks remain intact
-        _ensure_asm_symlinks(self.workspace_dir)
-
-        return self.workspace_dir
+    @staticmethod
+    def _prune_empty_dirs(root: str, directory: str) -> None:
+        """Remove `directory` and its parents below `root` while they are empty (as a fresh extraction has them)."""
+        root = os.path.normpath(root)
+        directory = os.path.normpath(directory)
+        while directory != root and directory.startswith(root + os.sep):
+            try:
+                os.rmdir(directory)
+            except OSError:
+                return
+            directory = os.path.dirname(directory)
 
     def create_temp_dir(self) -> str:
         """Create a new temporary directory in RAMDISK for cloning repository versions."""
-        return tempfile.mkdtemp(prefix="code-parser.", dir=G.RAMDISK)
+        path = tempfile.mkdtemp(prefix="code-parser.", dir=G.RAMDISK)
+        mark_owner(path)
+        return path
 
     def add_version(self, version_name: str, purge_list: list) -> None:
         """Clone a new repository version, register its directory, and track it in purge_list."""
@@ -242,24 +304,23 @@ class MasterFile:
             oldest_v = next(iter(self.version_dict))
             oldest_dir = self.version_dict.pop(oldest_v)
             self.file_dict.pop(oldest_v, None)
-            if os.path.exists(oldest_dir):
+            if oldest_dir not in self.version_dict.values():
                 shutil.rmtree(oldest_dir, ignore_errors=True)
+                if oldest_dir == self.workspace_dir:
+                    self.workspace_dir = self.workspace_rev = None
             trimmed += 1
         return trimmed
 
     def clear_all_version(self) -> None:
         """Remove all cloned repository version directories from disk and clear state."""
         self._close_cat_file_proc()
-        for item in self.version_dict:
-            if os.path.exists(self.version_dict[item]):
-                shutil.rmtree(self.version_dict[item], ignore_errors=True)
-        if self.workspace_dir and os.path.exists(self.workspace_dir):
-            shutil.rmtree(self.workspace_dir, ignore_errors=True)
+        for directory in {*self.version_dict.values(), self.workspace_dir} - {None}:
+            shutil.rmtree(directory, ignore_errors=True)
         self.workspace_dir = None
+        self.workspace_rev = None
         self.version_dict.clear()
         self.file_dict.clear()
         self._file_list_cache.clear()
-        return
 
     def __del__(self) -> None:
         """Safely clean up persistent subprocess on destruction."""
@@ -286,10 +347,9 @@ class MasterFile:
     def get_file(self, file_path: str, version: str) -> str:
         """Retrieve content of a file at a specific version (from disk cache or git show)."""
         if version not in self.version_dict:
-            git_dir = self._get_git_dir()
-            command = ["git", f"--git-dir={git_dir}", "show", f"{self._checked_rev(version)}:{file_path}"]
-            raw_file = sp.run(command, capture_output=True, text=True, encoding="latin-1")  # noqa: PLW1510
-            return raw_file.stdout
+            # One request on the persistent cat-file stream instead of a `git show` process per file
+            data = self._read_blob(f"{self._checked_rev(version)}:{file_path}")
+            return data.decode("latin-1") if data is not None else ""
 
         if version not in self.file_dict:
             self.file_dict[version] = {}

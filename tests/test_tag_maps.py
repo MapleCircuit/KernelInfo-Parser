@@ -1,9 +1,10 @@
-"""tests/test_bridge_map_dedup.py - Unit & Integration Test Suite for Bridge Map Deduplication.
+"""tests/test_tag_maps.py - Tag spatial map staging.
 
 Validates that:
-1. ChangeSet.register_bridge_map prevents duplicate bridge map emissions.
-2. C-AST, Kconfig-AST, and Maintainer-AST emit exactly one m_bridge_map entry per tag.
-3. Database batch insertion is idempotent and handles bridge tables safely.
+1. C-AST, Kconfig-AST, and Maintainer-AST emit exactly one m_map_ast row per new tag, keyed by the tag
+   (map_id = tag_id), and no m_bridge_map rows (the table only ever held identity rows).
+2. A recycled tag only emits its m_bridge_tag placement.
+3. Database batch insertion is strict.
 """
 from __future__ import annotations
 import os
@@ -32,8 +33,8 @@ from core.config import get_default_repo_path
 LINUX_REPO = str(get_default_repo_path())
 
 
-class TestBridgeMapDeduplication(unittest.TestCase):
-    """Test ChangeSet-level and parser-level bridge map deduplication."""
+class TestTagMaps(unittest.TestCase):
+    """Test that parsers stage one tag-keyed spatial map per new tag."""
 
     def setUp(self) -> None:
         self.gp = GreatProcessor()
@@ -42,28 +43,18 @@ class TestBridgeMapDeduplication(unittest.TestCase):
         G.TE = TECachedDB()
         G.TE.start(self.gp.Table_Array, G.DB)
 
-    def test_changeset_register_bridge_map(self) -> None:
-        """Verify ChangeSet.register_bridge_map returns True on first registration and False on duplicate."""
-        cs = ChangeSet("A", "test.c")
-        tag_1 = ((m_tag.table_id, 0), OP_REF, (REF_POS, 1))
-        tag_2 = ((m_tag.table_id, 0), OP_REF, (REF_POS, 2))
+    def assert_one_map_per_tag(self, cs: ChangeSet) -> None:
+        tag_ops = [op for op in cs.cs if op[0] == m_tag.table_id]
+        map_ast_ops = [op for op in cs.cs if op[0] == m_map_ast.table_id]
+        self.assertEqual([op for op in cs.cs if op[0] == m_bridge_map.table_id], [])
+        self.assertEqual(len(tag_ops), len(map_ast_ops), "One m_map_ast row per new tag")
+        for op in map_ast_ops:
+            # map_id is the tag: a positional reference to the tag's m_tag operation
+            map_id = op[2][0]
+            self.assertEqual(map_id[0], (m_tag.table_id, 0))
 
-        # First registration of tag_1
-        self.assertTrue(cs.register_bridge_map(tag_1, tag_1))
-        # Second registration of tag_1 should be False
-        self.assertFalse(cs.register_bridge_map(tag_1, tag_1))
-
-        # First registration of tag_2
-        self.assertTrue(cs.register_bridge_map(tag_2, tag_2))
-        # Subsequent registration of tag_2
-        self.assertFalse(cs.register_bridge_map(tag_2, tag_2))
-
-        # After clear_bloat(), tracking is reset
-        cs.clear_bloat()
-        self.assertTrue(cs.register_bridge_map(tag_1, tag_1))
-
-    def test_c_ast_single_bridge_map_per_tag(self) -> None:
-        """Verify C-AST parsing emits exactly one m_bridge_map per tag."""
+    def test_c_ast_single_map_per_tag(self) -> None:
+        """Verify C-AST parsing emits exactly one m_map_ast per tag and no m_bridge_map."""
         from parser.c_ast.c_ast import c_ast_parse
         from tests.test_c_ast import default_processing
         import subprocess
@@ -94,20 +85,11 @@ class TestBridgeMapDeduplication(unittest.TestCase):
         default_processing(cs, self.gp)
         cs.parse()
 
-        # Count m_tag, m_bridge_tag, m_map_ast, m_bridge_map operations in CS.cs
-        tag_ops = [op for op in cs.cs if op[0] == m_tag.table_id]
-        bridge_tag_ops = [op for op in cs.cs if op[0] == m_bridge_tag.table_id]
-        map_ast_ops = [op for op in cs.cs if op[0] == m_map_ast.table_id]
-        bridge_map_ops = [op for op in cs.cs if op[0] == m_bridge_map.table_id]
+        self.assertGreater(len([op for op in cs.cs if op[0] == m_tag.table_id]), 0)
+        self.assert_one_map_per_tag(cs)
 
-        # Number of bridge_maps should not exceed number of tags
-        self.assertGreater(len(tag_ops), 0)
-        self.assertGreater(len(map_ast_ops), 0)
-        self.assertGreater(len(bridge_map_ops), 0)
-        self.assertEqual(len(tag_ops), len(bridge_map_ops), "Bridge maps must be 1-to-1 with tags")
-
-    def test_kconfig_single_bridge_map_per_tag(self) -> None:
-        """Verify Kconfig parser emits exactly one m_bridge_map per tag."""
+    def test_kconfig_single_map_per_tag(self) -> None:
+        """Verify Kconfig parser emits exactly one m_map_ast per tag."""
         from parser.kconfig_ast.kconfig_ast import kconfig_ast_parse
 
         cs = ChangeSet("A", "fs/ext4/Kconfig")
@@ -118,13 +100,10 @@ class TestBridgeMapDeduplication(unittest.TestCase):
         except Exception:
             pass
 
-        tag_ops = [op for op in cs.cs if op[0] == m_tag.table_id]
-        bridge_map_ops = [op for op in cs.cs if op[0] == m_bridge_map.table_id]
-        if tag_ops:
-            self.assertEqual(len(tag_ops), len(bridge_map_ops), "Kconfig tags must match bridge maps count")
+        self.assert_one_map_per_tag(cs)
 
-    def test_maintainer_single_bridge_map_per_tag(self) -> None:
-        """Verify Maintainer and Credits parsers emit exactly one m_bridge_map per tag."""
+    def test_maintainer_single_map_per_tag(self) -> None:
+        """Verify Maintainer and Credits parsers emit exactly one m_map_ast per tag."""
         from parser.maintainer_ast.maintainer_ast import maintainer_ast_parse
 
         cs = ChangeSet("A", "MAINTAINERS")
@@ -135,13 +114,10 @@ class TestBridgeMapDeduplication(unittest.TestCase):
         except Exception:
             pass
 
-        tag_ops = [op for op in cs.cs if op[0] == m_tag.table_id]
-        bridge_map_ops = [op for op in cs.cs if op[0] == m_bridge_map.table_id]
-        if tag_ops:
-            self.assertEqual(len(tag_ops), len(bridge_map_ops), "Maintainer tags must match bridge maps count")
+        self.assert_one_map_per_tag(cs)
 
     def test_recycled_tag_skips_map_reemission(self) -> None:
-        """Verify that when a tag is recycled from prior_tags, m_map_ast and m_bridge_map are not re-emitted."""
+        """Verify that when a tag is recycled from prior_tags, m_map_ast is not re-emitted."""
         from parser.kconfig_ast.kconfig_ast import KconfigManager
 
         cs = ChangeSet("A", "fs/ext4/Kconfig")

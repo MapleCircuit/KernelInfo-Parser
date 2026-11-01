@@ -67,6 +67,8 @@ class GitCommit:
     message: str
     contributors: list[GitContributor] = field(default_factory=list)
     files: list[tuple[str, str]] = field(default_factory=list)  # (change_type, file_path)
+    # file_path -> (old_path, old_blob_sha, new_blob_sha) from the patch's `index` / `rename from` lines
+    file_blobs: dict[str, tuple[str, str, str]] = field(default_factory=dict)
     commit_id: int | None = None
     author_person_id: int | None = None
     committer_person_id: int | None = None

@@ -88,7 +88,7 @@ def _parse_two_versions(path: str, versions: tuple[str, str], layout: str, eager
             G.CURRENT_PARSING_FILE = path
             # The file's m_file_name operation first, as in main.default_processing() (target_fnid routes point at it)
             stage_file_prelude(cs, gp)
-            cs.store(m_v_main.set(vid, version))
+            cs.store(m_v_main.set(None, 0, 4, version, vid, None, None, None))
             before = {t: len(MockDB._global_store.get(t, {})) for t in SYMBOL_TABLES}
             if eager_second and op == "M":
                 orig_ref = ChangeSet.ref

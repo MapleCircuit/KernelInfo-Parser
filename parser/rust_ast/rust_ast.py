@@ -14,22 +14,10 @@ from typing import Any
 
 from core.globalstuff import (
     G,
-    COLOR,
-    REF_ROOT,
-    REF_OLD,
     REF_NO_REF,
-    REF_POS,
     FILE_ERROR,
-    ASTT,
 )
-from core.DBLayout import (
-    m_file_name,
-    m_file,
-    m_bridge_file,
-    m_tag,
-    m_bridge_tag,
-    m_ast,
-)
+from parser.c_ast.tag_tracker import get_prior_tags as _load_prior_tags
 from parser.rust_ast.rust_ast_type import ChangeSetType
 from parser.rust_ast.rust_tree_parser import parse_rust_ast_tree
 
@@ -45,71 +33,16 @@ def rust_ast_parse(CS: ChangeSetType) -> None:
     elif CS.file_operation == "M" or (CS.file_operation and CS.file_operation.startswith("R")):
         get_prior_tags(CS)
         Rust_Manager(CS)
-        close_prior_tags(CS)
     elif CS.file_operation == "D":
-        get_prior_tags(CS)
-        close_prior_tags(CS)
+        pass  # Tags are immutable content records: a deleted file stages nothing
 
 
 def get_prior_tags(CS: ChangeSetType) -> None:
-    """Query TableEngine for existing active AST tags registered in the previous version."""
-    CS.active_tag_list = set()
-    CS.prior_tags = None
-    CS.prior_tags_map = {}
+    """Previous version's tags of the file with the name/position indices transition matching uses.
 
-    old_vid = getattr(CS.gp, "Old_VID", 0)
-    if old_vid <= 0:
-        return
-
-    lookup_path = CS.old_path if (CS.file_operation and CS.file_operation.startswith("R") and CS.old_path) else CS.current_path
-    fn_row = m_file_name.get(None, lookup_path)
-    if not fn_row or len(fn_row) < 3 or not fn_row[2]:
-        return
-    fnid = fn_row[2][0]
-
-    bf_row = m_bridge_file.get(old_vid, fnid, None)
-    if not bf_row or len(bf_row) < 3 or not bf_row[2]:
-        return
-    old_fid = bf_row[2][2]
-
-    # 14-column 3-way join: m_bridge_tag (6 cols) -> m_tag (5 cols) -> m_ast (3 cols)
-    CS.prior_tags = m_bridge_tag.view_get_multiple(
-        (
-            (m_bridge_tag.tag_id, m_tag.tag_id, 1),
-            (m_tag.ast_id, m_ast.ast_id, 1),
-        ),
-        old_fid,
-        None,  # 1: m_bridge_tag.tag_id
-        None,  # 2: m_bridge_tag.line_s
-        None,  # 3: m_bridge_tag.line_e
-        None,  # 4: m_bridge_tag.char_s
-        None,  # 5: m_bridge_tag.char_e
-        None,  # 6: m_tag.tag_id
-        None,  # 7: m_tag.hash
-        None,  # 8: m_tag.ast_id
-        None,  # 9: m_tag.hl_s
-        None,  # 10: m_tag.hl_l
-        None,  # 11: m_ast.ast_id
-        None,  # 12: m_ast.name
-        None,  # 13: m_ast.type_id
-    )
-    if CS.prior_tags:
-        CS.prior_tags_map = {}
-        for x, tag in enumerate(CS.prior_tags):
-            if len(tag) > 7:
-                tag_hash = tag[7]
-                if tag_hash is not None:
-                    if tag_hash not in CS.prior_tags_map:
-                        CS.prior_tags_map[tag_hash] = []
-                    tag_id = tag[1] if len(tag) > 1 else tag[0]
-                    CS.prior_tags_map[tag_hash].append((x, tag_id))
-
-
-def close_prior_tags(CS: ChangeSetType) -> None:
-    """In zero-VID Git-native DAG architecture, tags are immutable content records.
-    Tag retirement/closure is obsolete; unrecycled tags are preserved for lineage.
+    The worker's batch prefetch answers it; Rust records no symbol items, so none are loaded.
     """
-    pass
+    _load_prior_tags(CS, with_indexes=True, with_symbols=False)
 
 
 class Rust_Manager:

@@ -16,17 +16,17 @@ The database stores where each Kconfig entry is and what its text is, for every 
 ==================================================================================================
 KCONFIG PARSING PIPELINE (database)
 --------------------------------------------------------------------------------------------------
-Kconfig Source File (Kconfig*)
+Kconfig Source File (`Kconfig` and `Kconfig.*` fragments such as lib/Kconfig.debug: core.globalstuff.type_check)
   │
   ├─ Git Operation: "R100" (Exact Rename) ──► No-op (Preserves old blob and tags)
-  ├─ Git Operation: "D" (Deleted) ──► get_prior_tags(CS) / close_prior_tags(CS) (no-op under the Git DAG)
+  ├─ Git Operation: "D" (Deleted) ──► No-op (tags are immutable content records; no prior tags are loaded)
   └─ Git Operation: "A" / "M" / "R*" ──► get_prior_tags(CS) (M, R*) ──► KconfigManager
        ├── KconfigLexer (kconfig_lexer.py) ──► KconfigParser (kconfig_parser.py)
-       └── per entry: m_ast.view(name, type) + tag (m_tag, m_bridge_tag, m_map_ast, m_bridge_map,
-           m_moved_tag on transitions); `source "<literal path>"` also m_file_name + m_ast_include
+       └── per entry: m_ast.view(name, type) + tag (tag_tracker.stage_entry_tag(): m_tag, m_bridge_tag,
+           m_map_ast keyed by the tag, m_moved_tag on transitions); `source "<literal path>"` also m_file_name + m_ast_include
   │
   ▼ [Post-Processing: processing_kbuild(version) (main.py + kbuild_parser.py), Step 6.6]
-Kbuild references: new Makefile/Kbuild blobs ──► m_file_reference (ref_type 3 = Kbuild)
+Kbuild references: new Makefile/Kbuild (path, blob) pairs ──► m_file_reference (ref_type 3 = Kbuild)
 ==================================================================================================
 ```
 
@@ -34,7 +34,7 @@ Kbuild references: new Makefile/Kbuild blobs ──► m_file_reference (ref_typ
 
 ## 2. Relational Mapping
 
-Every entry is staged by `KconfigManager._stage_entry()`: an `m_ast.view(((m_ast.ast_id,),), None, name[:255], type)` node, deduplicated by name and type (Rule 23), and the entry's tag (`_tag_and_map()`, Rule 12 order: `m_tag.set` first, then `m_moved_tag` when `match_prior_tag_transition()` pairs it with a prior tag; then `m_bridge_tag`, `m_map_ast`, `m_bridge_map`). A tag whose text is unchanged since the previous version of the file is recycled (only its `m_bridge_tag` placement is written).
+Every entry is staged by `KconfigManager._stage_entry()`: an `m_ast.view(((m_ast.ast_id,),), None, name[:255], type)` node, deduplicated by name and type (Rule 23), and the entry's tag (`_tag_and_map()`, Rule 12 order: `m_tag.set` first, then `m_moved_tag` when `match_prior_tag_transition()` pairs it with a prior tag; then `m_bridge_tag` and `m_map_ast`, whose `map_id` is the tag; all through `tag_tracker.stage_entry_tag()`). A tag whose text is unchanged since the previous version of the file is recycled (only its `m_bridge_tag` placement is written).
 
 | Entry | `m_ast.name` | `ASTT` | Tag text and extent |
 | :--- | :--- | :--- | :--- |
@@ -86,7 +86,7 @@ The parser implements kconfig's grammar (all revisions since 2.6.12):
 
 1. **Tag Hash Deduplication**: exact SHA-256 matches with a prior tag of the same file recycle its `tag_id`.
 2. **Prior Tag Evolution (`match_prior_tag_transition`)**: a modified entry is paired with its prior tag (name and type first) and `m_moved_tag(s_tag_id, tag_ref)` is staged.
-3. **Immutable Tag Closing**: under the Git DAG architecture prior tags are immutable; `close_prior_tags(CS)` is a safe no-op.
+3. **Immutable Tags**: under the Git DAG architecture prior tags are immutable; nothing closes them.
 
 ---
 
@@ -103,7 +103,7 @@ The Kbuild parser maps Kconfig configuration symbols to concrete C, ASM, and obj
 
 ### 6.1. Architecture & Execution
 - **Location**: [parser/kbuild_parser.py](parser/kbuild_parser.py)
-- **Database**: `main.py:processing_kbuild(version)` (Step 6.6) parses the Makefile/Kbuild blobs that are new in the version and stages one `m_file_reference` row (ref_type 3 = Kbuild) per built file (`source_blob_id` = the Makefile blob). Rows are keyed by the Makefile blob, so a carried-over Makefile keeps its rows.
+- **Database**: `main.py:processing_kbuild(version)` (Step 6.6) parses the Makefile/Kbuild files whose (path, blob) pair is new in the version and stages one `m_file_reference` row (ref_type 3 = Kbuild) per built file (`source_blob_id`, `source_fnid` = the Makefile's blob and path). Targets resolve against the Makefile's directory, so identical Makefiles in two directories have rows of their own, and a Makefile carried over at the same path keeps its rows.
 - **Webapp**: `KconfigService.kbuild_usage()` greps the revision for `CONFIG_<name>` in Makefiles and parses the matches with `KbuildParser` (rules, lines, kind, `via` rule/condition, `other_arch`); `compiled_files` is the existing files among them.
 - **Workflow**: joins backslash continuations, evaluates `OBJ_ASSIGN_RE` (`obj-$(CONFIG_XYZ) += target.o`, `obj-y`, `obj-m`) and `COMPOSITE_RE` (`target-y := a.o b.o`, `target-objs := ...`), resolves `.o` goals to `.c`/`.S` sources.
 
@@ -160,7 +160,7 @@ Which directories are "the architecture's own" is read from each revision's Make
 
 ## 7. Performance Invariants & Architectural Rules
 
-1. **Rule 12 Staging Order**: in `KconfigManager._tag_and_map()`, `m_tag.set` MUST be the first operation inside `with CS(REF_POS):` so `tag_ref` references `m_tag`; `m_moved_tag.set` follows within the block when an evolved transition exists.
+1. **Rule 12 Staging Order**: in `KconfigManager._tag_and_map()` (`tag_tracker.stage_entry_tag()` / `stage_new_tag()`), `m_tag.set` MUST be the first operation inside `with CS(REF_POS):` so `tag_ref` references `m_tag`; `m_moved_tag.set` follows within the block when an evolved transition exists.
 2. **Rule 23 View Deduplication**: AST nodes are created with `m_ast.view(...)` (`((m_ast.ast_id,),)`, or `((m_ast.ast_id, m_ast_include.ast_id, 1),)` for a linked `source`).
 3. **Nothing per expression**: dependency expressions are not stored (the semantic model evaluates them), so a Kconfig file costs one AST node and one tag per entry.
 

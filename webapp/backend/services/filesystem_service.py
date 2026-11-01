@@ -365,8 +365,7 @@ class FilesystemService:
                            m.line_s AS m_line_s, m.char_s AS m_char_s, m.line_e AS m_line_e, m.char_e AS m_char_e,
                            m.ast_id, a.type_id
                     FROM m_bridge_tag bt
-                    JOIN m_bridge_map bm ON bt.tag_id = bm.tag_id
-                    JOIN m_map_ast m ON bm.map_id = m.map_id
+                    JOIN m_map_ast m ON m.map_id = bt.tag_id
                     JOIN m_ast a ON m.ast_id = a.ast_id
                     WHERE bt.blob_id = %s
                     ORDER BY bt.line_s ASC, bt.char_s ASC;
@@ -564,8 +563,9 @@ class FilesystemService:
                 """
                 SELECT r.ref_type, r.line_no, r.details, fn.fname, r.source_blob_id AS source_fid
                 FROM m_file_reference r
-                LEFT JOIN m_bridge_checkpoint bc ON r.source_blob_id = bc.blob_id AND bc.commit_id = %s
-                LEFT JOIN m_file_name fn ON bc.fnid = fn.fnid
+                JOIN m_bridge_checkpoint bc
+                  ON bc.commit_id = %s AND bc.fnid = r.source_fnid AND bc.blob_id = r.source_blob_id
+                JOIN m_file_name fn ON fn.fnid = r.source_fnid
                 WHERE r.target_fnid = %s
                 ORDER BY r.ref_type ASC, fn.fname ASC, r.line_no ASC;
                 """,
@@ -852,7 +852,7 @@ class FilesystemService:
                     SELECT fn_target.fname
                     FROM m_bridge_checkpoint bc_src
                     JOIN m_file_name fn_src ON bc_src.fnid = fn_src.fnid
-                    JOIN m_file_reference fr ON bc_src.blob_id = fr.source_blob_id
+                    JOIN m_file_reference fr ON fr.source_blob_id = bc_src.blob_id AND fr.source_fnid = bc_src.fnid
                     JOIN m_file_name fn_target ON fr.target_fnid = fn_target.fnid
                     WHERE bc_src.commit_id = %s AND fn_src.fname = %s AND fr.ref_type = 1
                       AND (fn_target.fname = %s OR fn_target.fname LIKE %s)

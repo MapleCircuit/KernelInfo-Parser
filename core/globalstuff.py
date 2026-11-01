@@ -72,6 +72,9 @@ def is_safe_git_spec(spec: object) -> bool:
     )
 
 
+_RAMDISK_PATH_RE = re.compile(r"^(?:/dev/shm|/tmp)/(?:code-parser\.[^/]+(?:/linux)?/|[^/]+/linux/|[^/]+/)?(.*)$")
+
+
 def normalize_repo_path(path: str, base_dir: str | None = None) -> str:
     """Normalize absolute host/RAMDISK file paths into relative git repository paths."""
     if not path:
@@ -90,7 +93,7 @@ def normalize_repo_path(path: str, base_dir: str | None = None) -> str:
             return ""
 
     # Check for temporary clone directories in RAMDISK (/dev/shm or /tmp)
-    m = re.match(r"^(?:/dev/shm|/tmp)/(?:code-parser\.[^/]+(?:/linux)?/|[^/]+/linux/|[^/]+/)?(.*)$", norm)
+    m = _RAMDISK_PATH_RE.match(norm)
     if m and m.group(1):
         return m.group(1)
 
@@ -116,10 +119,9 @@ def clean_unnamed_spelling(spelling: str) -> str:
         parts = full_loc.rsplit(":", 2)
         if len(parts) == 3 and parts[1].isdigit() and parts[2].isdigit():
             path_part, loc = parts[0], f":{parts[1]}:{parts[2]}"
-        elif len(parts) >= 2 and parts[-1].isdigit():
-            path_part, loc = full_loc.rsplit(":", 1)[0], f":{full_loc.rsplit(':', 1)[1]}"
         else:
-            path_part, loc = full_loc, ""
+            head, sep, tail = full_loc.rpartition(":")
+            path_part, loc = (head, f":{tail}") if sep and tail.isdigit() else (full_loc, "")
 
         current_file = getattr(G, "CURRENT_PARSING_FILE", None)
         if current_file and path_part.endswith(current_file):
@@ -158,7 +160,6 @@ class GlobalStuff:
         self.BP_ON_SHUTDOWN = False
         self.BP_ON_REF_FAIL = False
 
-        self.OVERRIDE_CPPRO_CINDEX_INPUT = True
         self.OVERRIDE_TABLE_CREATION_PRINT = False
         self.OVERRIDE_FORCE_AST_DEBUG = False
         self.OVERRIDE_FORGOTTEN_PRINT = False
@@ -251,7 +252,6 @@ class GlobalStuff:
                 from core.ssh_tunnel import stop_ssh_tunnel
                 stop_ssh_tunnel()
         sys.exit(number_error)
-        return
 
     @classmethod
     def BP(cls) -> None:  # noqa: N802
@@ -434,6 +434,9 @@ _RE_C_DECLARATION = re.compile(
     r"^\s*(#\s*include|typedef|struct\s+\w+\s*\{|union\s+\w+\s*\{|enum\s+\w+\s*\{|extern|static|inline|__inline__|void|int|char|long)\b",
     re.MULTILINE,
 )
+# C initializers (`... = {`, designated `.field =` / `[IDX] =`): tables built from #define-d types have no keyword
+_RE_C_INITIALIZER = re.compile(r"=\s*\{|^\s*(?:\.\w+|\[\w+\])\s*=", re.MULTILINE)
+_RE_C_COMMENT = re.compile(r"/\*.*?\*/|//[^\n]*", re.DOTALL)
 _RE_ASM_PIPE_COMMENT = re.compile(r"^\s*\|(\s+[a-zA-Z0-9_-]|\s*$)", re.MULTILINE)
 _RE_ASM_DIRECTIVE = re.compile(
     r"^\s*\.(set|globl|global|macro|endm|section|equ|equiv|ascii|asciz|byte|short|long|quad|word|space|align|balign|fill|text|data|bss)\s+[a-zA-Z0-9_.]+",
@@ -447,7 +450,12 @@ def is_pure_asm_content(content: str) -> bool:
         return False
     if _RE_C_DECLARATION.search(content):
         return False
-    return bool(_RE_ASM_PIPE_COMMENT.search(content) or _RE_ASM_DIRECTIVE.search(content))
+    # ASCII tables in comments ("| Company ID |") and `| FLAG` continuation lines of multi-line #defines and
+    # initializers are not assembly evidence
+    code = _RE_C_COMMENT.sub("", content).replace("\\\n", " ")
+    if _RE_C_INITIALIZER.search(code):
+        return False
+    return bool(_RE_ASM_PIPE_COMMENT.search(code) or _RE_ASM_DIRECTIVE.search(code))
 
 
 def type_check(name: str, content: str | None = None) -> int:
@@ -462,7 +470,8 @@ def type_check(name: str, content: str | None = None) -> int:
         return T_CREDITS
     if name.endswith((".S", ".s")):
         return T_ASM
-    if name.endswith("Kconfig"):
+    base = name.rsplit("/", 1)[-1]
+    if base == "Kconfig" or base.startswith("Kconfig."):
         return T_KCONFIG
     if name.endswith(".rs"):
         return T_RUST

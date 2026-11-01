@@ -50,7 +50,6 @@ from parser.c_ast import (
     get_cursor_line,
     TokenList,
     get_prior_tags,
-    close_prior_tags,
     resolve_cppro_scopes,
     _CLANG_GET_EXTENT,
     _CLANG_GET_RANGE_START,
@@ -82,10 +81,8 @@ def asm_ast_parse(CS: ChangeSetType) -> None:
         elif CS.file_operation == "M" or (CS.file_operation and CS.file_operation.startswith("R")):
             get_prior_tags(CS)
             Asm_Manager(CS)
-            close_prior_tags(CS)
         elif CS.file_operation == "D":
-            get_prior_tags(CS)
-            close_prior_tags(CS)
+            pass  # Tags are immutable content records: a deleted file stages nothing
     # Emit the symbol definitions/references recorded while parsing (core/SymbolRows.py)
     finish_symbol_rows(CS)
 

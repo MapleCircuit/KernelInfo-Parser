@@ -264,7 +264,7 @@ COMMIT_DELIM_END
         tags = [
             (1, 101, 105, 110),  # Intersects hash_aaa
             (2, 101, 210, 220),  # Intersects hash_bbb
-            (3, 101, 300, 310),  # Outside ranges -> fallback to first
+            (3, 101, 300, 310),  # Outside every hunk: unchanged code, linked to no commit
         ]
         parser = GitCommitParser()
         bridges = parser.map_tags_to_commits(
@@ -273,10 +273,22 @@ COMMIT_DELIM_END
             commit_hash_to_id=commit_hash_to_id,
             file_hunks_map=file_hunks_map,
         )
-        self.assertEqual(len(bridges), 3)
-        self.assertEqual(bridges[0], (10, 101, 1))
-        self.assertEqual(bridges[1], (20, 101, 2))
-        self.assertEqual(bridges[2], (10, 101, 3))
+        self.assertEqual(bridges, [(10, 101, 1), (20, 101, 2)])
+
+    def test_hunks_of_older_commits_move_to_newest_lines(self) -> None:
+        """An older commit's hunk lines are shifted by the newer commits' insertions (git log lists newest first)."""
+        sep_r, sep_f, sep_b = "\x1e", "\x1f", "\x1d"
+        def record(c_hash: str, patch: str) -> str:
+            fields = [c_hash, "", "A", "a@x", "1", "A", "a@x", "1", f"subject {c_hash}", "body"]
+            return sep_r + sep_f.join(fields) + sep_b + patch
+        newest = (
+            "diff --git a/f.c b/f.c\nindex 1111111111111111111111111111111111111111..2222222222222222222222222222222222222222 100644\n"
+            "--- a/f.c\n+++ b/f.c\n@@ -2,0 +3,5 @@\n+a\n+b\n+c\n+d\n+e\n"
+        )
+        older = "diff --git a/f.c b/f.c\nindex 0000001..1111111 100644\n--- a/f.c\n+++ b/f.c\n@@ -10,3 +10,3 @@\n-x\n+y\n"
+        commits, hunks = GitCommitParser.parse_commit_log_with_hunks(record("n" * 40, newest) + record("o" * 40, older))
+        self.assertEqual(hunks["f.c"], [(3, 7, "n" * 40), (15, 17, "o" * 40)])
+        self.assertEqual(commits[0].file_blobs["f.c"], ("f.c", "1" * 40, "2" * 40))
 
 
 class TestWebAppGitEndpoints(unittest.TestCase):

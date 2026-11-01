@@ -187,20 +187,78 @@ class TestDBLayoutAndWebappReferenceAPI(unittest.TestCase):
         te._register_table(m_file_reference)
         te.next_id[m_file_reference.table_id] = 1
 
-        # First insert
-        row1 = te.set(m_file_reference.table_id, (None, 18278, 18291, 3, 9, "details 1"))
+        # First insert: (ref_id, source_blob_id, source_fnid, target_fnid, ref_type, line_no, details)
+        row1 = te.set(m_file_reference.table_id, (None, 18278, 500, 18291, 3, 9, "details 1"))
         self.assertEqual(row1[0], 1)
-        self.assertEqual(row1[1], 18278)
-        self.assertEqual(row1[2], 18291)
-        self.assertEqual(row1[3], 3)
-        self.assertEqual(row1[4], 9)
+        self.assertEqual(tuple(row1[1:6]), (18278, 500, 18291, 3, 9))
 
-        # Duplicate insert with identical (source_blob_id, target_fnid, ref_type, line_no)
-        row2 = te.set(m_file_reference.table_id, (None, 18278, 18291, 3, 9, "details 2"))
+        # Duplicate insert with identical (source_blob_id, source_fnid, target_fnid, ref_type, line_no)
+        row2 = te.set(m_file_reference.table_id, (None, 18278, 500, 18291, 3, 9, "details 2"))
         # Must return the existing staged row without allocating a new ID
         self.assertEqual(row2[0], 1)
         self.assertEqual(len(te.queued_set[m_file_reference.table_id]), 1)
 
+        # The same blob at another path is another source: its own row
+        row3 = te.set(m_file_reference.table_id, (None, 18278, 501, 18291, 3, 9, "details 1"))
+        self.assertEqual(row3[0], 2)
+        self.assertEqual(len(te.queued_set[m_file_reference.table_id]), 2)
+
+
+class TestPathScopedReferences(unittest.TestCase):
+    """Kbuild/documentation rows are keyed by the source file's (blob, path) pair (source_fnid)."""
+
+    MAKEFILE = "obj-y += x.o\n"
+    DOC = "See fs/a/x.c and fs/b/x.c.\n"
+    FNIDS = {
+        "fs/a/Makefile": 1, "fs/b/Makefile": 2, "fs/a/x.c": 11, "fs/b/x.c": 12,
+        "Documentation/a.txt": 21, "Documentation/copy.txt": 22,
+    }
+    BLOBS = {"fs/a/Makefile": 9, "fs/b/Makefile": 9, "fs/a/x.c": 31, "fs/b/x.c": 32,
+             "Documentation/a.txt": 40, "Documentation/copy.txt": 40}
+
+    def _run(self, func, new_pairs):
+        from unittest import mock
+        import main
+
+        staged: list[tuple] = []
+
+        class FakeTE:
+            def set(self, table_id, row):
+                staged.append(row)
+                return row
+
+        class FakeMF:
+            def get_file(_self, path, version):
+                return self.MAKEFILE if path.endswith("Makefile") else self.DOC
+
+            def git_file_list(_self, version):
+                return "\n".join(self.FNIDS) + "\n"
+
+        with mock.patch.object(main, "MF", FakeMF()), mock.patch.object(main.G, "TE", FakeTE()), \
+                mock.patch.object(main, "get_fnid_for_path", self.FNIDS.get), \
+                mock.patch.object(main, "get_fid_for_path", self.BLOBS.get), \
+                mock.patch.object(main.gp, "VID", 2, create=True), \
+                mock.patch.object(main.gp, "Version_Name", "v3.1", create=True):
+            func("v3.1", new_pairs=new_pairs)
+        return staged
+
+    def test_identical_makefiles_reference_their_own_directory(self) -> None:
+        from main import processing_kbuild
+        kbuild = int(FileRefType.Kbuild)
+        rows = {tuple(r[1:6]) for r in self._run(processing_kbuild, None)}
+        self.assertEqual(rows, {(9, 1, 11, kbuild, 1), (9, 2, 12, kbuild, 1)})
+
+    def test_only_new_pairs_are_recomputed(self) -> None:
+        from main import processing_kbuild
+        # Blob 9 was already at fs/a/Makefile in the previous version: only its new path is parsed
+        rows = {tuple(r[1:6]) for r in self._run(processing_kbuild, {(2, 9)})}
+        self.assertEqual(rows, {(9, 2, 12, int(FileRefType.Kbuild), 1)})
+
+    def test_documentation_rows_per_path(self) -> None:
+        from main import processing_doc_references
+        doc = int(FileRefType.Documentation)
+        rows = {tuple(r[1:5]) for r in self._run(processing_doc_references, {(22, 40)})}
+        self.assertEqual(rows, {(40, 22, 11, doc), (40, 22, 12, doc)})
 
 if __name__ == "__main__":
     unittest.main()

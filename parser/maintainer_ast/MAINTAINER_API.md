@@ -21,7 +21,7 @@ Kernel Root Documentation (MAINTAINERS / CREDITS)
   ├─ Git Operation: "D" (Deleted) ──► No-op under immutable Git DAG architecture
   │
   └─ Git Operation: "A" / "M" / "R*" (Added / Modified / Content Rename)
-     ├─ get_prior_tags(CS) (if M or R*: queries prior tags via 11-col 2-way join m_bridge_tag -> m_tag)
+     ├─ get_prior_tags(CS) (if M or R*: the shared 14-col m_bridge_tag -> m_tag -> m_ast join, tag_tracker.py)
      │
      ├── If MAINTAINERS -> MaintainerManager(CS):
      │     ├── MaintainerParser: Parses 3-line header blocks, section titles, and tags
@@ -30,7 +30,7 @@ Kernel Root Documentation (MAINTAINERS / CREDITS)
      │     │     └── Patterns: F (Files), X (Excludes), N (Regex), K (Keywords)
      │     └── Relational Staging:
      │           ├── AST Nodes: m_ast.view [Rule 23]
-     │           ├── Code Occurrence Tags: m_tag.set (5-col, Rule 12 order), m_bridge_tag (6-col)
+     │           ├── Code Occurrence Tags: tag_tracker.stage_entry_tag() -> m_tag (5-col, Rule 12 order), m_bridge_tag (6-col), m_map_ast (map_id = tag_id)
      │           ├── Identities: m_maintainer_person (Table 16)
      │           ├── Subsystems: m_maintainer_section (Table 17, 8-col with blob_ref)
      │           ├── Personnel Roles: m_maintainer_member (Table 18)
@@ -41,8 +41,6 @@ Kernel Root Documentation (MAINTAINERS / CREDITS)
      │     └── Relational Staging:
      │           ├── Person Registry: m_maintainer_person (Table 16)
      │           └── Contributor Biographies: m_credits_entry (Table 21, 8-col with blob_ref)
-     │
-     └─ close_prior_tags(CS) ──► No-op under immutable Git DAG architecture
   │
   ▼ [Post-Processing: processing_maintainer_files(version) (main.py + maintainer_matcher.py)]
 Subsystem File Ownership Resolution:
@@ -98,8 +96,7 @@ Subsystem File Ownership Resolution:
        extent.char_pos[0],
        extent.char_pos[1],
    ))
-   CS.store(m_map_ast.set(tag_ref, 1, 1, rel_line_e, rel_char_e, ast_ref))
-   CS.store(m_bridge_map.set(tag_ref, tag_ref))
+   CS.store(m_map_ast.set(tag_ref, 1, 1, rel_line_e, rel_char_e, ast_ref))  # map_id = tag_id (no m_bridge_map row)
    ```
 
 ### 2.2. Domain Tables (Tables 20–25)
@@ -145,9 +142,9 @@ Parsed by `CreditsParser` into structured contributor blocks:
 
 Under the immutable Git DAG content-addressable model:
 1. **Immutable Tags**:
-   All `m_tag` records are immutable and content-addressable. `close_prior_tags` is a no-op; tags are never closed with `vid_e` updates.
+   All `m_tag` records are immutable and content-addressable; tags are never closed with `vid_e` updates.
 2. **Prior Tag Transition (`match_prior_tag_transition`)**:
-   When modifying a file, `get_prior_tags` queries prior tags using an 11-column 2-way join (`m_bridge_tag` -> `m_tag`), and `match_prior_tag_transition` emits `m_moved_tag(s_tag_id, tag_ref)` if tags evolve.
+   When modifying a file, `get_prior_tags` loads prior tags through the shared 14-column join (`m_bridge_tag` -> `m_tag` -> `m_ast`), and `match_prior_tag_transition` emits `m_moved_tag(s_tag_id, tag_ref)` if tags evolve.
 3. **Person Deduplication**:
    `m_maintainer_person` uses `no_duplicate=True` on `(person_id,)` with in-memory caching to guarantee that contributors maintaining multiple subsystems share a single canonical `person_id`.
 
@@ -161,8 +158,9 @@ To resolve file ownership across the entire kernel repository:
    - Compiles `F:` file patterns and `X:` exclude patterns into normalized globs.
    - Evaluates each active file path in the tree against all sections in priority order.
    - Specific directory patterns (e.g. `fs/ext4/`) take precedence over broad generic patterns (e.g. `fs/`).
+   - Wildcard semantics follow `get_maintainer.pl`: a pattern without a trailing slash only matches paths with as many `/` as the pattern, so `drivers/net/*` covers the files of `drivers/net` but not `drivers/net/ethernet/...` (a trailing-slash pattern matches recursively).
    - Indexed lookup: exact paths and directory prefixes are dictionary lookups; sections with wildcard patterns are filed under the directory part of each wildcard's literal prefix (`drivers/net/3c505*` -> `drivers/net/`), so a file only tests the wildcard sections filed under its ancestor directories plus those whose wildcards can match anywhere (e.g. `*/net/*`), still in section order. Sections without any `F:` pattern are skipped (they cannot match). On v3.0 (36,783 files, 925 sections) matching takes 0.5 s instead of 6.6 s with identical results.
-   - `processing_maintainer_files()` skips files already mapped for the same MAINTAINERS blob in an earlier version.
+   - `processing_maintainer_files()` skips files already mapped for the same MAINTAINERS blob in an earlier version. Section ids come from the sections of the version's own MAINTAINERS blob (`get_fid_for_path("MAINTAINERS")`, also when the file did not change), read in one query (`main._maintainer_section_ids()`); without a blob row the step is skipped.
 3. **Bridge Population**:
    - Inserts resolved `(maintainers_blob_id, fnid, sec_id)` triplets into `m_maintainer_file`.
    - Deduplicates `(fnid, sec_id)` pairs in-memory using a tracking set to prevent duplicate primary key violations when multiple repository paths resolve to the same file.

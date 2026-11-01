@@ -8,13 +8,15 @@ Provides:
     2. Exact symbol name & category match (functions, structs, unions, enums, macros)
     3. Bulk prefix/suffix rename refactoring detection
     4. Spatial proximity / line overlap fallback
-- close_prior_tags(CS): Marks obsolete prior tags as closed (vid_e = Old_VID).
+- stage_bridge_tag(CS, tag, line_pos, char_pos), stage_new_tag(CS, code_hash, ast_ref, s_tag_id),
+  stage_tag_map(CS, tag, ast_ref, line_e, char_e): the tag rows every parser stages (Rule 12).
+Prior tags are immutable content records under the Git DAG: nothing closes them.
 """
 from __future__ import annotations
 from typing import Any
 import logging
-from core.globalstuff import ASTT
-from core.DBLayout import m_file_name, m_bridge_file, m_bridge_tag, m_tag, m_ast
+from core.globalstuff import ASTT, OP_REF, REF_POS, REF_ROOT, compute_code_hash
+from core.DBLayout import m_file_name, m_file_blob, m_bridge_file, m_bridge_tag, m_tag, m_ast, m_map_ast, m_moved_tag
 from core.SymbolRows import load_prior_items as load_prior_symbol_items
 
 logger = logging.getLogger(__name__)
@@ -43,8 +45,28 @@ NAMED_CONSTRUCT_TYPES = {
 }
 
 
-def get_prior_tags(CS: Any) -> None:
-    """Query Table Engine for active AST tags registered in the previous version and build inverted indices."""
+# The blob of the file being parsed (m_bridge_tag.blob_id), resolved from the ChangeSet's own m_file_blob row
+FILE_BLOB_REF = ((m_file_blob.table_id, 0), OP_REF, (REF_ROOT,))
+# m_bridge_tag (6 cols) -> m_tag (5 cols) -> m_ast (3 cols): 14 columns, tag hash at 7, m_tag.tag_id at 6
+_PRIOR_TAG_JOINS = (
+    (m_bridge_tag.tag_id, m_tag.tag_id, 1),
+    (m_tag.ast_id, m_ast.ast_id, 1),
+)
+PRIOR_TAG_COLUMNS = m_bridge_tag.length + m_tag.length + m_ast.length
+
+
+def query_prior_tags(old_fid: int) -> list[tuple[Any, ...]] | None:
+    """Tags of a previous-version blob joined with their m_tag and m_ast rows (`PRIOR_TAG_COLUMNS` columns)."""
+    return m_bridge_tag.view_get_multiple(_PRIOR_TAG_JOINS, old_fid, *(None,) * (PRIOR_TAG_COLUMNS - 1))
+
+
+def get_prior_tags(CS: Any, with_indexes: bool = True, with_symbols: bool = True) -> None:
+    """Load the previous version's tags of the file and build their lookup indices.
+
+    Always builds the code-hash index (`prior_tags_map`, Tier 1 recycling). `with_indexes` adds the name and
+    position indices `match_prior_tag_transition()` uses; `with_symbols` loads the stored symbol items the
+    recycled tags are compared with (core/SymbolRows.py), needed only by parsers that record symbols.
+    """
     CS.active_tag_list = set()
     CS.transitioned_tag_list = set()
     CS.prior_tags = None
@@ -72,23 +94,23 @@ def get_prior_tags(CS: Any) -> None:
         return
     old_fid = bf_row[2][2]
 
-    # Check batch cache first before executing individual DB query
+    # The parsing worker prefetches the prior tags of a whole batch in one pass
     batch_tags = getattr(CS, "_batch_prior_tags", None)
     if batch_tags is not None and old_fid in batch_tags:
         CS.prior_tags = batch_tags[old_fid]
     else:
-        # 3-way join: m_bridge_tag (6 cols) -> m_tag (5 cols) -> m_ast (3 cols) = 14 cols
-        joins = (
-            (m_bridge_tag.tag_id, m_tag.tag_id, 1),
-            (m_tag.ast_id, m_ast.ast_id, 1),
-        )
-        cols = (old_fid,) + (None,) * 13
-        CS.prior_tags = m_bridge_tag.view_get_multiple(joins, *cols)
+        CS.prior_tags = query_prior_tags(old_fid)
 
     if not CS.prior_tags:
         return
-    # Their stored symbol items, compared with those of the tags recycled below (core/SymbolRows.py)
-    load_prior_symbol_items(CS, (tag[1] for tag in CS.prior_tags))
+    if not with_indexes:
+        for x, tag in enumerate(CS.prior_tags):
+            if len(tag) > 7 and tag[7] is not None:
+                CS.prior_tags_map.setdefault(tag[7], []).append((x, tag[1]))
+        return
+    if with_symbols:
+        # Their stored symbol items, compared with those of the tags recycled below (core/SymbolRows.py)
+        load_prior_symbol_items(CS, (tag[1] for tag in CS.prior_tags))
 
     # In-memory ast cache for fallback if caller provides shorter tuples
     ast_cache: dict[int, tuple[str, int | None]] = {}
@@ -137,23 +159,17 @@ def get_prior_tags(CS: Any) -> None:
 
 
 def check_exact_match(CS: Any, code_hash: bytes) -> int | None:
-    """Check Tier 1 exact snippet code hash match against prior version tags."""
-    if not getattr(CS, "prior_tags", None) or not code_hash:
+    """Tier 1: a prior tag with the same code hash not placed yet in this version (marked placed), else None."""
+    lookup = getattr(CS, "prior_tags_map", None) if getattr(CS, "prior_tags", None) else None
+    if not lookup or not code_hash:
         return None
-    lookup = getattr(CS, "prior_tags_map", None)
-    if not lookup:
-        return None
-    tag_list = lookup.get(code_hash)
-    if not tag_list:
-        return None
-    active_set = CS.active_tag_list if isinstance(CS.active_tag_list, set) else set(CS.active_tag_list)
-    for item in tag_list:
-        if item[0] not in active_set:
-            x, tag_id = item
-            if isinstance(CS.active_tag_list, set):
-                CS.active_tag_list.add(x)
+    active = CS.active_tag_list
+    for x, tag_id in lookup.get(code_hash, ()):
+        if x not in active:
+            if isinstance(active, set):
+                active.add(x)
             else:
-                CS.active_tag_list.append(x)
+                active.append(x)
             return tag_id
     return None
 
@@ -344,6 +360,69 @@ def match_prior_tag_transition(
     return None
 
 
-def close_prior_tags(CS: Any) -> None:
-    """Under the immutable Git DAG architecture, prior tags are permanent content records; close_prior_tags is a no-op."""
-    return
+def stage_bridge_tag(CS: Any, tag: Any, line_pos: tuple[int, int], char_pos: tuple[int, int], positional: bool = False) -> None:
+    """Place a tag (new tag route or recycled tag id) in the file's blob at the given coordinates."""
+    op = m_bridge_tag.set(FILE_BLOB_REF, tag, line_pos[0], line_pos[1], char_pos[0], char_pos[1])
+    if positional:
+        with CS(REF_POS):
+            CS.store(op)
+    else:
+        CS.store(op)
+
+
+def stage_new_tag(CS: Any, code_hash: bytes, ast_ref: Any, s_tag_id: int | None = None, hl: tuple[int, int] = (0, 0)) -> Any:
+    """Stage a new m_tag row (Rule 12: first operation of its REF_POS scope) and its transition from `s_tag_id`.
+
+    `hl` is the tag's (hl_s, hl_l) highlight. Returns the tag's reference.
+    """
+    with CS(REF_POS):
+        CS.store(m_tag.set(None, code_hash, ast_ref, hl[0], hl[1]))
+        tag_ref = ((m_tag.table_id, 0), OP_REF, (REF_POS, CS.route[-1]))
+        if s_tag_id is not None:
+            CS.store(m_moved_tag.set(s_tag_id, tag_ref))
+    return tag_ref
+
+
+def stage_tag_map(CS: Any, tag: Any, ast_ref: Any, line_e: int, char_e: int, positional: bool = False) -> None:
+    """Stage the tag's spatial map (m_map_ast keyed by the tag: map_id = tag_id), relative to the tag's start."""
+    op = m_map_ast.set(tag, 1, 1, line_e, char_e, ast_ref)
+    if positional:
+        with CS(REF_POS):
+            CS.store(op)
+    else:
+        CS.store(op)
+
+
+def stage_entry_tag(
+    CS: Any,
+    ast_ref: Any,
+    line_s: int,
+    line_e: int,
+    char_s: int,
+    char_e: int,
+    code: str,
+    ast_name: str | None = None,
+    ast_type: Any = None,
+) -> Any:
+    """Recycle (Tier 1) or create the tag of a whole entry (Kconfig, MAINTAINERS, CREDITS) with its map.
+
+    Every row is staged positionally. Returns the recycled tag id or the new tag's reference.
+    """
+    from parser.c_ast.tokenizer import Line
+
+    extent = Line(line_s, line_e)
+    extent.line_pos = (line_s, line_e)
+    extent.char_pos = (char_s, char_e)
+    extent.code = code
+    code_hash = compute_code_hash(code)
+    if code:
+        tag_id = check_exact_match(CS, code_hash)
+        if tag_id is not None:
+            stage_bridge_tag(CS, tag_id, extent.line_pos, extent.char_pos, positional=True)
+            return tag_id
+
+    s_tag_id = match_prior_tag_transition(CS, extent, ast_name, ast_type)
+    tag_ref = stage_new_tag(CS, code_hash, ast_ref, s_tag_id)
+    stage_bridge_tag(CS, tag_ref, extent.line_pos, extent.char_pos, positional=True)
+    stage_tag_map(CS, tag_ref, ast_ref, max(1, line_e - line_s + 1), char_e, positional=True)
+    return tag_ref

@@ -229,7 +229,7 @@ Clients must follow server changes without the user knowing to reload. The serve
 | :--- | :--- | :--- |
 | **Versions / Git Refs** | `m_git_ref`, `m_commit` | Version and reference identifiers (`ref_id`, `commit_id`, `ref_name`), chronological author dates, commit SHAs |
 | **Filesystem & Blobs** | `m_file_blob`, `m_file_name`, `m_bridge_checkpoint`, `m_file_reference` | File instances, content blobs, paths, file types (0=Dir, 1=C, 2=Kconfig, 3=Rust, 4=Asm, 5=Maintainers, 6=Credits, 7=Raw), and compiler-verified `#include` / Kbuild provenance |
-| **AST & Spatial Maps** | `m_ast`, `m_ast_container`, `m_ast_include`, `m_bridge_tag`, `m_bridge_map`, `m_map_ast`, `m_tag` | Relational AST nodes, preprocessor `#include` links, container hierarchies, and coordinate regions (`line_s`, `char_s`, `line_e`, `char_e`) |
+| **AST & Spatial Maps** | `m_ast`, `m_ast_container`, `m_ast_include`, `m_bridge_tag`, `m_map_ast`, `m_tag` | Relational AST nodes, preprocessor `#include` links, container hierarchies, and coordinate regions (`line_s`, `char_s`, `line_e`, `char_e`); `m_map_ast.map_id` is the tag id, so the file token maps join `m_map_ast.map_id = m_bridge_tag.tag_id` (`m_bridge_map` is no longer written) |
 | **Symbols & XRefs** | `m_symbol_def`, `m_symbol_ref` (views over `m_tag_def`, `m_tag_ref`, `m_blob_symbol`, `m_symbol_own`, `m_blob_symbol_def`, `m_blob_symbol_ref`; see `core/API.md`) | Definitions and usage cross-references (calls, field access, type usages, macro expansions). `def_id` of a definition stored once per tag is computed (not indexable) and `ref_id` may be NULL, so services select every needed column in the query that finds the rows instead of re-fetching by id. Rows of given target AST ids come from `rows_of_targets_sql()` (`core/SymbolRows.py`) instead of `WHERE ast_id IN (...)` on the views, which takes seconds per target |
 | **Kconfig** | `m_ast` (types `Kconfig_*`), `m_tag`, `m_bridge_tag` | Kconfig entries as tags (where each definition is, per blob and version). Menus, dependencies and values come from the semantic model built from Git per revision and ARCH (§4.4); there are no Kconfig tables |
 | **Maintainers** | `m_maintainer_section`, `m_maintainer_member`, `m_maintainer_person`, `m_maintainer_pattern`, `m_maintainer_file`, `m_credits_entry` | Subsystem sections, pattern rules, maintainers, reviewers, and historical `CREDITS` biographies |
@@ -449,6 +449,8 @@ Retrieve version-specific source file contents, metadata, spatial AST coordinate
 }
 ```
 
+- **`used_by`**: incoming `m_file_reference` rows whose source (`source_blob_id`, `source_fnid`) is in the revision's tree, one per source path (`source_fname` is that path; an identical Makefile in two directories is listed under each directory it builds from).
+
 - **Directory Path Response** (when target `path` is a directory):
 ```json
 {
@@ -482,7 +484,7 @@ Resolve a preprocessor `#include <...>` or `#include "..."` directive to an auth
 - **Jailing**: `header` and `current_file` become candidate repository paths, one of which is probed on disk in step 5, so both are rejected with `HTTP 400 Bad Request` unless `is_safe_rel_path()` accepts them, and each candidate is re-checked against the repository root after `resolve()` (a traversing header such as `../../../../etc/passwd` would otherwise be reported as `resolved`, revealing whether an arbitrary host path exists).
 - **Resolution Strategy**:
   0. The compiler's search for the ARCH's build layout (`arch_layout_service.resolve_include`, §2.7 item 4): `"name"` in `current_file`'s directory first, then the `-I` directories, through build-time symlinks and generated wrappers (`<asm/atomic.h>` → `include/asm-x86_64/atomic.h` at v2.6.12 for x86_64, `arch/x86/include/asm/atomic.h` at v3.0); method `build_layout`, with `arch`. Steps 1-5 only run when it finds nothing (e.g. generated headers, `tools/`).
-  1. If `current_file` is supplied, queries compiler-verified provenance from `m_file_reference` (`ref_type=1`).
+  1. If `current_file` is supplied, queries compiler-verified provenance from `m_file_reference` (`ref_type=1`, the rows of `current_file`'s blob at that path: `source_blob_id`/`source_fnid` joined to the revision's `m_bridge_checkpoint`).
   2. If `ast_id` is supplied, queries `m_ast_include` join `m_file_name`.
   3. Generates prioritized candidate search paths: relative to `current_file` directory, `header`, `include/{header}`, `include/uapi/{header}`, and `arch/{arch}/include/{header}`.
   4. Matches candidates against active non-directory indexed files (`ftype != 0`) in `m_bridge_checkpoint` / `m_file_blob` / `m_file_name`.

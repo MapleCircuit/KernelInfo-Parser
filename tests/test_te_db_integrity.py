@@ -771,6 +771,19 @@ class TestTECachedDBIntegrity(unittest.TestCase):
         except Exception:
             pass
 
+    def test_new_key_missed_after_cache_purge_is_still_committed(self) -> None:
+        """A database miss memoized for a no-duplicate key must not make commit skip the row staged for it."""
+        self.db.insert(fake_tbl_cached_nodup, ((1, "old"),))
+        self.te.start(ALL_FAKE_TABLES, lambda: self.db)
+        t_id = fake_tbl_cached_nodup.table_id
+        self.te.clear_cache()
+        self.assertIsNone(self.te.get(t_id, (None, "new")))
+        row = self.te.set(t_id, (None, "new"))
+        self.te.commit_all()
+        self.assertEqual(self.db.select(fake_tbl_cached_nodup, (None, "new")), row)
+        # The committed key now resolves to the same id instead of a second one
+        self.assertEqual(self.te.set(t_id, (None, "new")), row)
+
     def test_preload_existing_records_on_start(self) -> None:
         """Verify start() preloads all existing rows for tables with te_cached=True."""
         self.db.insert(fake_tbl_cached, (

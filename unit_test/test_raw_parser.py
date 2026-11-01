@@ -92,7 +92,7 @@ class Test_RawParserLifecycle(BaseRawParserTestCase):
             G.CURRENT_PARSING_FILE = file_path
 
             # Version and file prelude registration
-            cs.store(m_v_main.set(1, self.gp.Version_Name))
+            cs.store(m_v_main.set(None, 0, 4, self.gp.Version_Name, 1, None, None, None))
             stage_file_prelude(cs, self.gp)
 
         with test_step("Execute raw_ast_parse and ChangeSet resolution"):
@@ -118,7 +118,7 @@ class Test_RawParserLifecycle(BaseRawParserTestCase):
             self.assertIn("m_bridge_file", tables)
             self.assertIn("m_bridge_tag", tables)
             self.assertIn("m_map_ast", tables)
-            self.assertIn("m_bridge_map", tables)
+            self.assertNotIn("m_bridge_map", tables)
 
             assert_snapshot_matches(self, "raw_ast", "added_file", snapshot)
 
@@ -151,7 +151,7 @@ class Test_RawParserLifecycle(BaseRawParserTestCase):
             cs_v1.current_vid = 1
             G.CURRENT_PARSING_FILE = file_path
 
-            cs_v1.store(m_v_main.set(1, self.gp.Version_Name))
+            cs_v1.store(m_v_main.set(None, 0, 4, self.gp.Version_Name, 1, None, None, None))
             stage_file_prelude(cs_v1, self.gp)
             raw_ast_parse(cs_v1)
             self.assertTrue(cs_v1.execute())
@@ -169,7 +169,7 @@ class Test_RawParserLifecycle(BaseRawParserTestCase):
             cs_v2.current_vid = 2
             G.CURRENT_PARSING_FILE = file_path
 
-            cs_v2.store(m_v_main.set(2, self.gp.Version_Name))
+            cs_v2.store(m_v_main.set(None, 0, 4, self.gp.Version_Name, 2, None, None, None))
             stage_file_prelude(cs_v2, self.gp)
             raw_ast_parse(cs_v2)
             self.assertTrue(cs_v2.execute())
@@ -226,7 +226,7 @@ class Test_RawParserLifecycle(BaseRawParserTestCase):
             cs_v1.current_vid = 1
             G.CURRENT_PARSING_FILE = old_path
 
-            cs_v1.store(m_v_main.set(1, self.gp.Version_Name))
+            cs_v1.store(m_v_main.set(None, 0, 4, self.gp.Version_Name, 1, None, None, None))
             stage_file_prelude(cs_v1, self.gp)
             raw_ast_parse(cs_v1)
             self.assertTrue(cs_v1.execute())
@@ -244,7 +244,7 @@ class Test_RawParserLifecycle(BaseRawParserTestCase):
             cs_v2.current_vid = 2
             G.CURRENT_PARSING_FILE = new_path
 
-            cs_v2.store(m_v_main.set(2, self.gp.Version_Name))
+            cs_v2.store(m_v_main.set(None, 0, 4, self.gp.Version_Name, 2, None, None, None))
             stage_file_prelude(cs_v2, self.gp)
             raw_ast_parse(cs_v2)  # Contractual no-op for R100
             self.assertTrue(cs_v2.execute())

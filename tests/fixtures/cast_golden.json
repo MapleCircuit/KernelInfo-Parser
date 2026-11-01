@@ -1,13 +1,12 @@
 {
   "arch/alpha/lib/clear_page.S": {
     "full": {
-      "ops_count": 13,
-      "ops_hash": "601775c0eaf220f9e8ec368a6bd7f5f5f1435e5fe6fd170d87312ca6a896192e",
+      "ops_count": 11,
+      "ops_hash": "253774cce1604597f03607c1dace342e6fcd49fd6cca7e2b06c9326532a8fae5",
       "store_hashes": {
         "m_ast": "f739d4ef89ece128",
         "m_ast_hash": "b5e20b9420cd527c",
         "m_bridge_checkpoint": "028ab3525e29917f",
-        "m_bridge_map": "13ead635d0466c54",
         "m_bridge_tag": "457f73288c7cd7ca",
         "m_file_blob": "6360ee821b923e75",
         "m_file_name": "fd99039b182da285",
@@ -16,13 +15,12 @@
       }
     },
     "isolated": {
-      "ops_count": 13,
-      "ops_hash": "601775c0eaf220f9e8ec368a6bd7f5f5f1435e5fe6fd170d87312ca6a896192e",
+      "ops_count": 11,
+      "ops_hash": "253774cce1604597f03607c1dace342e6fcd49fd6cca7e2b06c9326532a8fae5",
       "store_hashes": {
         "m_ast": "f739d4ef89ece128",
         "m_ast_hash": "b5e20b9420cd527c",
         "m_bridge_checkpoint": "028ab3525e29917f",
-        "m_bridge_map": "13ead635d0466c54",
         "m_bridge_tag": "457f73288c7cd7ca",
         "m_file_blob": "6360ee821b923e75",
         "m_file_name": "fd99039b182da285",
@@ -33,13 +31,12 @@
   },
   "arch/mips/include/asm/mach-cavium-octeon/kernel-entry-init.h": {
     "full": {
-      "ops_count": 106,
-      "ops_hash": "aefe90f885a4ca2fe2a6d8eba3a1580ee2a39028b5e84c337133d68b150230d8",
+      "ops_count": 89,
+      "ops_hash": "aafa4acc44b1db9c97fa4507cb35da2569e9e5bec4a19fa834e91e8fca2ecc04",
       "store_hashes": {
         "m_ast": "8013549c9aff671d",
         "m_ast_hash": "a6f4cd8753bc32f2",
         "m_bridge_checkpoint": "028ab3525e29917f",
-        "m_bridge_map": "e367883833ec26fd",
         "m_bridge_tag": "9a459c337100d5bd",
         "m_file_blob": "6360ee821b923e75",
         "m_file_name": "4f4366ad6e975a03",
@@ -49,13 +46,12 @@
       }
     },
     "isolated": {
-      "ops_count": 106,
-      "ops_hash": "aefe90f885a4ca2fe2a6d8eba3a1580ee2a39028b5e84c337133d68b150230d8",
+      "ops_count": 89,
+      "ops_hash": "aafa4acc44b1db9c97fa4507cb35da2569e9e5bec4a19fa834e91e8fca2ecc04",
       "store_hashes": {
         "m_ast": "8013549c9aff671d",
         "m_ast_hash": "a6f4cd8753bc32f2",
         "m_bridge_checkpoint": "028ab3525e29917f",
-        "m_bridge_map": "e367883833ec26fd",
         "m_bridge_tag": "9a459c337100d5bd",
         "m_file_blob": "6360ee821b923e75",
         "m_file_name": "4f4366ad6e975a03",
@@ -67,15 +63,14 @@
   },
   "arch/powerpc/xmon/ppc-opc.c": {
     "full": {
-      "ops_count": 20048,
-      "ops_hash": "295d5abf130e6d8409716dc8efd79f934430baacd74f09cb6453b4055621656a",
+      "ops_count": 19600,
+      "ops_hash": "abee8e9a8428def52105f0da6c2ef42a809a54df9d348fabd94f92c8d7b90978",
       "store_hashes": {
         "m_ast": "6ec2f7602c59b449",
         "m_ast_container": "e6bf011544bc763b",
         "m_ast_hash": "5b37a59765e5da26",
         "m_ast_include": "a4e8ac3264406ef5",
         "m_bridge_checkpoint": "028ab3525e29917f",
-        "m_bridge_map": "451f2df5f7cddf02",
         "m_bridge_tag": "4dd38a8b84ac9be4",
         "m_file_blob": "6360ee821b923e75",
         "m_file_name": "691d73ad36b3409f",
@@ -86,15 +81,14 @@
       }
     },
     "isolated": {
-      "ops_count": 19531,
-      "ops_hash": "5935864c271bdfc4a568ddc22aca2a888f4a2ecc6d77c9b348325c9da1ccef0d",
+      "ops_count": 19080,
+      "ops_hash": "7a1e56905e1969726b26b9ab355bc6cf1f51b684d48c0942c791d1344d1c2c06",
       "store_hashes": {
         "m_ast": "db1bea13b8c4b5d2",
         "m_ast_container": "f27902e8399d1f3f",
         "m_ast_hash": "94e672bf2cdf04ff",
         "m_ast_include": "6c4a94164ee7a2aa",
         "m_bridge_checkpoint": "028ab3525e29917f",
-        "m_bridge_map": "918a5fd15c1bc7b0",
         "m_bridge_tag": "8467992473ccb736",
         "m_file_blob": "6360ee821b923e75",
         "m_file_name": "20362673d500e560",
@@ -107,14 +101,13 @@
   },
   "arch/x86/kernel/entry_64.S": {
     "full": {
-      "ops_count": 1878,
-      "ops_hash": "88af901e8c30687701cb9cf57e575e5ecb864a1e3cce8b920d1b1b7bbe7bff59",
+      "ops_count": 1514,
+      "ops_hash": "22cd27bac01e50c5f2f1803e99e12ee9c728b1c21450fb5c1ef389002805d369",
       "store_hashes": {
         "m_ast": "eefddd22c3e9f17b",
         "m_ast_hash": "d056bab04e173eba",
         "m_ast_include": "0e12637f6cf5696b",
         "m_bridge_checkpoint": "028ab3525e29917f",
-        "m_bridge_map": "c3ca598c47fda360",
         "m_bridge_tag": "41d32e0b01b47f20",
         "m_file_blob": "6360ee821b923e75",
         "m_file_name": "02f98fdd8e919202",
@@ -124,14 +117,13 @@
       }
     },
     "isolated": {
-      "ops_count": 1878,
-      "ops_hash": "90e2310c6a8dde59a471c59541b6f10095f60b55b37d1ed4da4256b2494d05ee",
+      "ops_count": 1514,
+      "ops_hash": "c0ca448ccf27b5347d919f5f7b4ad7d96eafb1267ae4681c5067f6dc069de24b",
       "store_hashes": {
         "m_ast": "eefddd22c3e9f17b",
         "m_ast_hash": "d056bab04e173eba",
         "m_ast_include": "0e12637f6cf5696b",
         "m_bridge_checkpoint": "028ab3525e29917f",
-        "m_bridge_map": "c3ca598c47fda360",
         "m_bridge_tag": "41d32e0b01b47f20",
         "m_file_blob": "6360ee821b923e75",
         "m_file_name": "a57eaca992aaea5e",
@@ -143,8 +135,8 @@
   },
   "drivers/input/keyboard/hilkbd.c": {
     "full": {
-      "ops_count": 1568,
-      "ops_hash": "6a64d04061d0abee6fd354184f8b5572720cd12501bd508589e322f98c97d1e3",
+      "ops_count": 1468,
+      "ops_hash": "789e686d1fc25e6ec2d97dadd9434718f63c1fb128ea55335a035edce146572b",
       "store_hashes": {
         "m_ast": "971223720d1b2cef",
         "m_ast_attribute": "fbcdbce1ce9f1244",
@@ -152,7 +144,6 @@
         "m_ast_hash": "67cbe375c56c3a01",
         "m_ast_include": "7fe7eee67dd81e82",
         "m_bridge_checkpoint": "028ab3525e29917f",
-        "m_bridge_map": "2f1657702b1afdd3",
         "m_bridge_tag": "d0351cac3c5bfd52",
         "m_file_blob": "6360ee821b923e75",
         "m_file_name": "d6d2c9d3cf4cefae",
@@ -163,8 +154,8 @@
       }
     },
     "isolated": {
-      "ops_count": 1357,
-      "ops_hash": "47ad3018498ed586bba5ce10389fc648b4c7a10f479c611d7737558cac4cda9f",
+      "ops_count": 1255,
+      "ops_hash": "10de4a6858c56e020a3447f10aef8cbfea8a26b99bf3d76385afb63b16db1e36",
       "store_hashes": {
         "m_ast": "cc565c47ec6be2b2",
         "m_ast_attribute": "94ebec5a2c6d648e",
@@ -172,7 +163,6 @@
         "m_ast_hash": "f5d8e071af1c0133",
         "m_ast_include": "cf97441ce1fd202a",
         "m_bridge_checkpoint": "028ab3525e29917f",
-        "m_bridge_map": "d82a2f83f716df4d",
         "m_bridge_tag": "9d67b877fd653f5c",
         "m_file_blob": "6360ee821b923e75",
         "m_file_name": "9cf85ffb0af1cec0",
@@ -185,8 +175,8 @@
   },
   "drivers/net/wan/wanxl.c": {
     "full": {
-      "ops_count": 3707,
-      "ops_hash": "0e264e540d5f6c4ed882f6c3abeda81baaee6b60bc3ca5fdb4593fedc7450bb1",
+      "ops_count": 3632,
+      "ops_hash": "493d807bf8d930afe2e97f8f029f33ca1e14c62dd40c6903044823368ebddc5c",
       "store_hashes": {
         "m_ast": "58c6596933378fe3",
         "m_ast_attribute": "8d89cf6e0fe9721d",
@@ -194,7 +184,6 @@
         "m_ast_hash": "3a860a89da535517",
         "m_ast_include": "397ffe09fcbbe4d2",
         "m_bridge_checkpoint": "028ab3525e29917f",
-        "m_bridge_map": "db9f412dfdb9eca4",
         "m_bridge_tag": "cfbcb9bcd5346fe9",
         "m_file_blob": "6360ee821b923e75",
         "m_file_name": "ad5c1c170092e82f",
@@ -205,8 +194,8 @@
       }
     },
     "isolated": {
-      "ops_count": 2445,
-      "ops_hash": "83eaf888e7b919e519f4579c3cba2dd9a0a8d91661889cdccacad99171a030e3",
+      "ops_count": 2370,
+      "ops_hash": "6bdfa9f9237749dfec430123b3ad788e9fdabf014dde59f2db447c6bdfb3d9cd",
       "store_hashes": {
         "m_ast": "32cbba9c476c6ef0",
         "m_ast_attribute": "68e6f3305c4671da",
@@ -214,7 +203,6 @@
         "m_ast_hash": "e79551fcf6420f5e",
         "m_ast_include": "ec65b264773ec4e9",
         "m_bridge_checkpoint": "028ab3525e29917f",
-        "m_bridge_map": "db9f412dfdb9eca4",
         "m_bridge_tag": "cfbcb9bcd5346fe9",
         "m_file_blob": "6360ee821b923e75",
         "m_file_name": "1bc4dccce79ea2f8",
@@ -227,8 +215,8 @@
   },
   "drivers/usb/storage/isd200.c": {
     "full": {
-      "ops_count": 5321,
-      "ops_hash": "dd3b8632dc42f3c549336f48d0d185cdd3536310de91a01ae8f87f18391a10d4",
+      "ops_count": 5129,
+      "ops_hash": "412a2617d6422ff4cc3126d5a6338e4a9f69669149a440cec923b111d09192a0",
       "store_hashes": {
         "m_ast": "b14626f810333756",
         "m_ast_attribute": "0a2473750ce86ad6",
@@ -236,7 +224,6 @@
         "m_ast_hash": "67cd19d665f44c3d",
         "m_ast_include": "a92dc602e9b248d1",
         "m_bridge_checkpoint": "028ab3525e29917f",
-        "m_bridge_map": "f6881f591c3bc4a0",
         "m_bridge_tag": "27e6142ca0afbb47",
         "m_file_blob": "6360ee821b923e75",
         "m_file_name": "629954be128f76b9",
@@ -247,8 +234,8 @@
       }
     },
     "isolated": {
-      "ops_count": 4616,
-      "ops_hash": "cee13e20191e5112f0552704ce448f6af72ec6de832032b6e44329301c379320",
+      "ops_count": 4424,
+      "ops_hash": "2e1cacbd07a7687f4ff53661dc2ccd8bee99e9b1c6958118a7d3a39ffa9f8141",
       "store_hashes": {
         "m_ast": "67d9b710be2ddff7",
         "m_ast_attribute": "a991744b05a0b684",
@@ -256,7 +243,6 @@
         "m_ast_hash": "e3dbb21c5ffb8bd7",
         "m_ast_include": "aa3940dcf7c13445",
         "m_bridge_checkpoint": "028ab3525e29917f",
-        "m_bridge_map": "f6881f591c3bc4a0",
         "m_bridge_tag": "27e6142ca0afbb47",
         "m_file_blob": "6360ee821b923e75",
         "m_file_name": "5b0f102e08c708f3",
@@ -269,8 +255,8 @@
   },
   "drivers/watchdog/w83627hf_wdt.c": {
     "full": {
-      "ops_count": 1294,
-      "ops_hash": "8e24a0d61b6ad5a01eb879731212e8b90763bd11bd656de73685e35327ae38bd",
+      "ops_count": 1225,
+      "ops_hash": "33c169a5bee976f426061dddc916912e60cdc1e2c13e55c0f0b5ffdd1e2f7a99",
       "store_hashes": {
         "m_ast": "deeefe79067da821",
         "m_ast_attribute": "200c93e10937a872",
@@ -278,7 +264,6 @@
         "m_ast_hash": "d164ec75a38929f7",
         "m_ast_include": "5bb8cfc05d4affd8",
         "m_bridge_checkpoint": "028ab3525e29917f",
-        "m_bridge_map": "42c9bf82ac03c170",
         "m_bridge_tag": "f9c068227b3275df",
         "m_file_blob": "6360ee821b923e75",
         "m_file_name": "035e8dc1deb7b637",
@@ -289,8 +274,8 @@
       }
     },
     "isolated": {
-      "ops_count": 1045,
-      "ops_hash": "cf9c68653b1fc1e695a94fbf968c34a0278dc749c57cdeac083f61fba6446b9f",
+      "ops_count": 978,
+      "ops_hash": "c1bf5117d962f68f7f180ad91260d0b116dba3b1fa83f931a4188f96b3e5762d",
       "store_hashes": {
         "m_ast": "320f4be0234cf1cc",
         "m_ast_attribute": "b0d3b1d05ff08952",
@@ -298,7 +283,6 @@
         "m_ast_hash": "798dead58b507ad9",
         "m_ast_include": "8e7c46bc2a2f71aa",
         "m_bridge_checkpoint": "028ab3525e29917f",
-        "m_bridge_map": "b6360eab79fbcc93",
         "m_bridge_tag": "9396f38fe43d0881",
         "m_file_blob": "6360ee821b923e75",
         "m_file_name": "07e4680633116236",
@@ -311,15 +295,14 @@
   },
   "fs/nls/nls_cp936.c": {
     "full": {
-      "ops_count": 3753,
-      "ops_hash": "aac5b496ad05dc1edb6d635cee4307b20efe24219a744ae6c7958225252de1bf",
+      "ops_count": 3505,
+      "ops_hash": "0b128be2a1d7df382b965abe65a5856cf5f6a62531e199764b338a13868fc26c",
       "store_hashes": {
         "m_ast": "abca7535d851b6c2",
         "m_ast_container": "784eef69976635f9",
         "m_ast_hash": "870f5fc45be0242c",
         "m_ast_include": "13157c5a288fe3b3",
         "m_bridge_checkpoint": "028ab3525e29917f",
-        "m_bridge_map": "04cc462dd94a0527",
         "m_bridge_tag": "4827ab2f8ca12105",
         "m_file_blob": "6360ee821b923e75",
         "m_file_name": "be6b89a3143f3d9e",
@@ -330,15 +313,14 @@
       }
     },
     "isolated": {
-      "ops_count": 3133,
-      "ops_hash": "de69e34538b2c2b562c9a2a601a3c34a510779fed8fcb855ac579430fb7d7c3c",
+      "ops_count": 2885,
+      "ops_hash": "824890c6d7b8d2bb3b5cf207dd7c9c99d09a6af20942abaaa6116117f15fca9d",
       "store_hashes": {
         "m_ast": "f561990c63513adf",
         "m_ast_container": "14ac51f4c614c735",
         "m_ast_hash": "89fa36b245be8904",
         "m_ast_include": "58dfd4e1587116b6",
         "m_bridge_checkpoint": "028ab3525e29917f",
-        "m_bridge_map": "04cc462dd94a0527",
         "m_bridge_tag": "4827ab2f8ca12105",
         "m_file_blob": "6360ee821b923e75",
         "m_file_name": "039952ee5ed2ef42",
@@ -351,8 +333,8 @@
   },
   "include/linux/drbd_tag_magic.h": {
     "full": {
-      "ops_count": 322,
-      "ops_hash": "70ed59bc7ba27a0a2897affc7931a0c0d4a54e138d1c385bff84dd7facb9f4d9",
+      "ops_count": 286,
+      "ops_hash": "74e867b834242867b088a403030a1397576c769c53bec05344ad8f4c6d52f284",
       "store_hashes": {
         "m_ast": "63ed68c4c3136c7b",
         "m_ast_attribute": "e6aa9f1419c4c926",
@@ -360,7 +342,6 @@
         "m_ast_hash": "7d45fe8388ac5e3f",
         "m_ast_include": "107e56826ce9d3d2",
         "m_bridge_checkpoint": "028ab3525e29917f",
-        "m_bridge_map": "c8c0533bddc4586d",
         "m_bridge_tag": "8da7e899dad08d3f",
         "m_file_blob": "6360ee821b923e75",
         "m_file_name": "f36789109d30e66d",
@@ -371,8 +352,8 @@
       }
     },
     "isolated": {
-      "ops_count": 323,
-      "ops_hash": "eb87a5d6f3a45ad136005c0475d560e01686706e946cc7a96262057aec224cea",
+      "ops_count": 287,
+      "ops_hash": "fea7e3a9978360671d9990bdf6b0ae160718d629214c5cc7e0653e623d3a2855",
       "store_hashes": {
         "m_ast": "c63effb880b7af0c",
         "m_ast_attribute": "9f1ad2cde21424d4",
@@ -380,7 +361,6 @@
         "m_ast_hash": "04023f3de7933b66",
         "m_ast_include": "bb85cd96fa5c2eb1",
         "m_bridge_checkpoint": "028ab3525e29917f",
-        "m_bridge_map": "c8c0533bddc4586d",
         "m_bridge_tag": "8da7e899dad08d3f",
         "m_file_blob": "6360ee821b923e75",
         "m_file_name": "2f9b938d588910ca",
@@ -393,8 +373,8 @@
   },
   "include/linux/lockd/bind.h": {
     "full": {
-      "ops_count": 208,
-      "ops_hash": "4b22a83723c31b45432787641f756e02068ddff72b182fe1613e92b708245957",
+      "ops_count": 184,
+      "ops_hash": "bd8bd6ab5375918e30ed2003ae37f91fc813ea73313e62afd6cf0093269efbde",
       "store_hashes": {
         "m_ast": "960f7fc301dedc81",
         "m_ast_attribute": "8ad3cf12709d434f",
@@ -402,7 +382,6 @@
         "m_ast_hash": "b86a9519845528a9",
         "m_ast_include": "49a706ac3c3270f6",
         "m_bridge_checkpoint": "028ab3525e29917f",
-        "m_bridge_map": "a9549d69f36f2b91",
         "m_bridge_tag": "d83617404fc726c7",
         "m_file_blob": "6360ee821b923e75",
         "m_file_name": "440ee763e92fc7a7",
@@ -413,8 +392,8 @@
       }
     },
     "isolated": {
-      "ops_count": 209,
-      "ops_hash": "3c40e64aec34d8e8abc33809572e39167e414642e37054ff83298c0c0ed3301a",
+      "ops_count": 185,
+      "ops_hash": "d74887042e954fcce3f8455bb28ff0a720e1a10fd892322831c037c52ea5e635",
       "store_hashes": {
         "m_ast": "590a2fd545126909",
         "m_ast_attribute": "6baa4152ebad55ef",
@@ -422,7 +401,6 @@
         "m_ast_hash": "78e3d68ea8d146b3",
         "m_ast_include": "761b8e43be2c106e",
         "m_bridge_checkpoint": "028ab3525e29917f",
-        "m_bridge_map": "a9549d69f36f2b91",
         "m_bridge_tag": "d83617404fc726c7",
         "m_file_blob": "6360ee821b923e75",
         "m_file_name": "d25d63a1b15b6ba0",
@@ -435,8 +413,8 @@
   },
   "include/linux/netfilter_bridge/ebtables.h": {
     "full": {
-      "ops_count": 1032,
-      "ops_hash": "85093c2877cf850d8f5834b7ed58bed654e90f064c5553339164d28ce06f7ed9",
+      "ops_count": 945,
+      "ops_hash": "39a43f1685f903916ea56374b271458f072420cee8a712540d4cfdbc6b97fcd9",
       "store_hashes": {
         "m_ast": "9eb44e5151b0a0fc",
         "m_ast_attribute": "996b0d8925a63af1",
@@ -444,7 +422,6 @@
         "m_ast_hash": "94c0f895c0907381",
         "m_ast_include": "ff19ac31dffc105f",
         "m_bridge_checkpoint": "028ab3525e29917f",
-        "m_bridge_map": "c3eb7f11fb674a73",
         "m_bridge_tag": "242341017254f24e",
         "m_file_blob": "6360ee821b923e75",
         "m_file_name": "53d30ddb8ca99722",
@@ -455,8 +432,8 @@
       }
     },
     "isolated": {
-      "ops_count": 1057,
-      "ops_hash": "16388445022a9d447bfbf6ce329f2d137e8b4106ecdd4cd2d139c4ed33c826f8",
+      "ops_count": 970,
+      "ops_hash": "30251871bb7884aad3a605444f9ef9b2b26639a6e228da19ac3fe0d5ce8a6d20",
       "store_hashes": {
         "m_ast": "5c77890b48afda70",
         "m_ast_attribute": "f650b58057977f0e",
@@ -464,7 +441,6 @@
         "m_ast_hash": "626a15d8cdb0c43d",
         "m_ast_include": "fb2c2d792644e3d2",
         "m_bridge_checkpoint": "028ab3525e29917f",
-        "m_bridge_map": "c3eb7f11fb674a73",
         "m_bridge_tag": "242341017254f24e",
         "m_file_blob": "6360ee821b923e75",
         "m_file_name": "be1a9f83fadd79e9",
@@ -477,8 +453,8 @@
   },
   "include/linux/sched.h": {
     "full": {
-      "ops_count": 10359,
-      "ops_hash": "c3063538509e1a6aa9797760accf824a80a00c4782c95a2263755e28da4ce314",
+      "ops_count": 9385,
+      "ops_hash": "973dae3e9d38956c3a48d8e69dfa54f306c5e83c10ea88648432bfa4d1206194",
       "store_hashes": {
         "m_ast": "131104a1a443cc1c",
         "m_ast_attribute": "ff440b91898bcbd9",
@@ -486,7 +462,6 @@
         "m_ast_hash": "214b879e1033994f",
         "m_ast_include": "fb086ed0b026ccbe",
         "m_bridge_checkpoint": "028ab3525e29917f",
-        "m_bridge_map": "2b7c699d282e04de",
         "m_bridge_tag": "7c943b9390aca704",
         "m_file_blob": "6360ee821b923e75",
         "m_file_name": "9038e128e8ddb748",
@@ -497,8 +472,8 @@
       }
     },
     "isolated": {
-      "ops_count": 9993,
-      "ops_hash": "0c34af5a3c2505b3007d338fb6e6d49129fc0cb6c346ee45c8faa7db4b0c3fc9",
+      "ops_count": 9019,
+      "ops_hash": "e8b32519d817e3add8240dbc22fff98c874f9cee97c3aa5a5a51c650fe48a18e",
       "store_hashes": {
         "m_ast": "bf734af2e2468189",
         "m_ast_attribute": "52776f36068c2d7c",
@@ -506,7 +481,6 @@
         "m_ast_hash": "a9fcc82e5b103dd6",
         "m_ast_include": "0609ef0d6e94d59f",
         "m_bridge_checkpoint": "028ab3525e29917f",
-        "m_bridge_map": "2b7c699d282e04de",
         "m_bridge_tag": "7c943b9390aca704",
         "m_file_blob": "6360ee821b923e75",
         "m_file_name": "9ecfd1d5c84bbfba",
@@ -519,8 +493,8 @@
   },
   "kernel/sched.c": {
     "full": {
-      "ops_count": 30748,
-      "ops_hash": "e74b1add116c780b7318ce42e0735899eaa7559efe68518dac85e24b23a90c58",
+      "ops_count": 29595,
+      "ops_hash": "0434b93389fbfae406690926d8aa9d085e22106f7832da55119b7b08f3bc751a",
       "store_hashes": {
         "m_ast": "a17700c1ea568932",
         "m_ast_attribute": "ef8539dc8f4371fb",
@@ -528,7 +502,6 @@
         "m_ast_hash": "8e7b0674fd7471a6",
         "m_ast_include": "748286b02726f5ce",
         "m_bridge_checkpoint": "028ab3525e29917f",
-        "m_bridge_map": "e06ecb97a2bdafee",
         "m_bridge_tag": "379981b349f68f4b",
         "m_file_blob": "6360ee821b923e75",
         "m_file_name": "9392c6cbb1fa3a37",
@@ -539,8 +512,8 @@
       }
     },
     "isolated": {
-      "ops_count": 23731,
-      "ops_hash": "e7b51aa8c14948a1d2729b43eb2e2ad9340d7df3eae2b207ab1dbf4c89d819e0",
+      "ops_count": 22610,
+      "ops_hash": "ff4ca782f713ce0ff5b74f5f89b6474e60ac86d5f2be06de3533ec10415dd5e6",
       "store_hashes": {
         "m_ast": "99a473f7f5bb5767",
         "m_ast_attribute": "9ba1adcdb66a8365",
@@ -548,7 +521,6 @@
         "m_ast_hash": "302bb4597907943e",
         "m_ast_include": "dde5a60e898b48e4",
         "m_bridge_checkpoint": "028ab3525e29917f",
-        "m_bridge_map": "c239d59f6a95d090",
         "m_bridge_tag": "99dba2b85e18a304",
         "m_file_blob": "6360ee821b923e75",
         "m_file_name": "af6fb15fb28912a9",
@@ -561,8 +533,8 @@
   },
   "virt/kvm/iodev.h": {
     "full": {
-      "ops_count": 271,
-      "ops_hash": "dd24f47ae0dce8c190e2eee56fb5926d4a478e63c3da2b924e766d203b3461d8",
+      "ops_count": 256,
+      "ops_hash": "8072b729f3ff285db145bf9a3c29d0b64c92e829354397b9f89aaa03ae003368",
       "store_hashes": {
         "m_ast": "353eb4094b48d367",
         "m_ast_attribute": "460661b0b0a5ecf8",
@@ -570,7 +542,6 @@
         "m_ast_hash": "12bce5b31246bd3d",
         "m_ast_include": "9cad964b29d32dc6",
         "m_bridge_checkpoint": "028ab3525e29917f",
-        "m_bridge_map": "a763f070344c314b",
         "m_bridge_tag": "31ab7db05dde3cba",
         "m_file_blob": "6360ee821b923e75",
         "m_file_name": "1717bfdd630e88fb",
@@ -581,8 +552,8 @@
       }
     },
     "isolated": {
-      "ops_count": 264,
-      "ops_hash": "8b77bab33992dcb7cd41c45b185a8e0de6db8e87aa8384d4127028791f9b4ba7",
+      "ops_count": 249,
+      "ops_hash": "d375a21a7c620148d4d48c9847ac61b47d4df9b2a265c54205354b559f170b1e",
       "store_hashes": {
         "m_ast": "07fae9359545c014",
         "m_ast_attribute": "460661b0b0a5ecf8",
@@ -590,7 +561,6 @@
         "m_ast_hash": "d8f393e39dfda836",
         "m_ast_include": "38ab785114894ffd",
         "m_bridge_checkpoint": "028ab3525e29917f",
-        "m_bridge_map": "a763f070344c314b",
         "m_bridge_tag": "31ab7db05dde3cba",
         "m_file_blob": "6360ee821b923e75",
         "m_file_name": "11c1828b5000fd4f",

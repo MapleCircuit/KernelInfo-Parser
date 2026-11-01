@@ -5,33 +5,24 @@ Encapsulates relational ChangeSet generation with strict enforcement of:
 - Rule 14 (32-byte binary SHA-256 via compute_code_hash)
 - Invariant A: m_bridge_tag coordinates (1-based, inclusive start, exclusive end)
 - Invariant I: VARCHAR(255) bounds on m_ast.name
-- Invariant J: CS.register_bridge_map in-memory deduplication
+- m_map_ast is keyed by the tag (map_id = tag_id); m_bridge_map is no longer written
 """
 from __future__ import annotations
 import time
 from typing import Any
-from core.globalstuff import (
-    G,
-    REF_POS,
-    REF_ROOT,
-    REF_NO_REF,
-    OP_REF,
-    compute_code_hash,
-)
-from core.DBLayout import (
-    m_file,
-    m_tag,
-    m_moved_tag,
-    m_bridge_tag,
-    m_ast,
-    m_map_ast,
-    m_bridge_map,
-)
+from core.globalstuff import OP_REF, compute_code_hash
+from core.DBLayout import m_ast
 from core.SymbolRows import (
     flush_pending_refs as flush_pending_symbol_refs,
     register_tag as register_symbol_tag,
 )
-from parser.c_ast.tag_tracker import check_exact_match, match_prior_tag_transition
+from parser.c_ast.tag_tracker import (
+    check_exact_match,
+    match_prior_tag_transition,
+    stage_bridge_tag,
+    stage_new_tag,
+    stage_tag_map,
+)
 
 
 class CSExtractor:
@@ -69,15 +60,10 @@ class CSExtractor:
         code_hash = compute_code_hash(code_str)
 
         # Tier 1: Check exact code hash match against prior version tags
-        if getattr(CS, "prior_tags", None) and code_str != "":
+        if code_str:
             recycled_tag_id = check_exact_match(CS, code_hash)
             if recycled_tag_id is not None:
-                CS.store(m_bridge_tag.set(
-                    ((m_file.table_id, 0), OP_REF, (REF_ROOT,)),
-                    recycled_tag_id,
-                    extent.line_pos[0], extent.line_pos[1],
-                    extent.char_pos[0], extent.char_pos[1],
-                ))
+                stage_bridge_tag(CS, recycled_tag_id, extent.line_pos, extent.char_pos)
                 register_symbol_tag(CS, recycled_tag_id, extent.line_pos[0], extent.line_pos[1], extent.char_pos[0], code_str)
                 return recycled_tag_id
 
@@ -90,33 +76,9 @@ class CSExtractor:
             else ast_id_route
         )
 
-        # Rule 12 Invariant: m_tag.set MUST be first inside with CS(REF_POS)
-        with CS(REF_POS):
-            CS.store(m_tag.set(None, code_hash, ast_ref, 0, 0))
-            tag_ref = ((m_tag.table_id, 0), OP_REF, (REF_POS, CS.route[-1]))
-            if s_tag_id is not None:
-                CS.store(m_moved_tag.set(s_tag_id, tag_ref))
-
-        # Stage File-to-Tag Bridge (coordinates: 1-based, inclusive start, exclusive end)
-        CS.store(m_bridge_tag.set(
-            ((m_file.table_id, 0), OP_REF, (REF_ROOT,)),
-            tag_ref,
-            extent.line_pos[0], extent.line_pos[1],
-            extent.char_pos[0], extent.char_pos[1],
-        ))
+        tag_ref = stage_new_tag(CS, code_hash, ast_ref, s_tag_id)
+        # File-to-Tag Bridge (coordinates: 1-based, inclusive start, exclusive end)
+        stage_bridge_tag(CS, tag_ref, extent.line_pos, extent.char_pos)
         register_symbol_tag(CS, tag_ref, extent.line_pos[0], extent.line_pos[1], extent.char_pos[0], code_str)
-
-        # Stage Intra-Tag Spatial Mapping & Bridge Map (with deduplication)
-        rel_line_e = max(1, extent.line_pos[1] - extent.line_pos[0] + 1)
-        rel_char_e = extent.char_pos[1]
-        CS.store(m_map_ast.set(
-            tag_ref,
-            1, 1,
-            rel_line_e, rel_char_e,
-            ast_ref,
-        ))
-
-        if not hasattr(CS, "register_bridge_map") or CS.register_bridge_map(tag_ref, tag_ref):
-            CS.store(m_bridge_map.set(tag_ref, tag_ref))
-
+        stage_tag_map(CS, tag_ref, ast_ref, max(1, extent.line_pos[1] - extent.line_pos[0] + 1), extent.char_pos[1])
         return tag_ref

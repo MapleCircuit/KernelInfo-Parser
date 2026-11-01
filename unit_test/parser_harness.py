@@ -386,10 +386,8 @@ def normalize_snapshot_ids(
                 ptag_id = ptag[6] if len(ptag) > 6 and ptag[6] is not None else (ptag[1] if len(ptag) > 1 else ptag[0])
                 if ptag_id is not None and ptag_id not in prior_tag_map:
                     prior_tag_map[ptag_id] = f"$prior_tag_{len(prior_tag_map)}"
-                past_id = (
-                    ptag[8] if len(ptag) == 11 and ptag[8] is not None
-                    else (ptag[10] if len(ptag) > 10 and ptag[10] is not None else None)
-                )
+                # m_bridge_tag (6 cols) + m_tag (tag_id, hash, ast_id, ...): m_tag.ast_id is column 8
+                past_id = ptag[8] if len(ptag) > 8 and ptag[8] is not None else None
                 if past_id is not None and past_id not in prior_ast_map:
                     prior_ast_map[past_id] = f"$prior_ast_{len(prior_ast_map)}"
 

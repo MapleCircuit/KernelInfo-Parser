@@ -244,7 +244,6 @@ class MaintainerParser:
         members: list[MaintainerPerson] = []
         patterns: list[PatternRule] = []
 
-        member_priority = 0
         pattern_priority = 0
 
         for tag_char, tag_val, _line_num in tags:

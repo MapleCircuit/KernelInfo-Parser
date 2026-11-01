@@ -9,19 +9,14 @@ import json
 from enum import Flag, IntEnum
 from typing import Any
 
-from core.globalstuff import G, ASTT, OP_REF, REF_ROOT, REF_POS, REF_NO_REF, REF_FILE, SymbolRole, SymbolLinkage, compute_code_hash, normalize_repo_path
+from core.globalstuff import G, ASTT, OP_REF, REF_POS, REF_NO_REF, REF_FILE, SymbolRole, SymbolLinkage, compute_code_hash, normalize_repo_path
 from core.DBLayout import (
     m_ast,
     m_ast_container,
     m_ast_include,
     m_ast_debug,
-    m_file,
     m_file_name,
     m_tag,
-    m_bridge_tag,
-    m_map_ast,
-    m_bridge_map,
-    m_moved_tag,
 )
 from core.SymbolRows import (
     flush_pending_refs as flush_pending_symbol_refs,
@@ -29,7 +24,13 @@ from core.SymbolRows import (
     register_tag as register_symbol_tag,
 )
 from parser.c_ast.tokenizer import AST_KIND, Line
-from parser.c_ast.tag_tracker import match_prior_tag_transition
+from parser.c_ast.tag_tracker import (
+    check_exact_match,
+    match_prior_tag_transition,
+    stage_bridge_tag,
+    stage_new_tag,
+    stage_tag_map,
+)
 import clang.cindex as cc
 
 
@@ -213,34 +214,15 @@ class Ast:
         code_hash = compute_code_hash(ext.code)
 
         # 1. Tier 1: Check exact code hash match against prior version tags
-        if getattr(CS, "prior_tags", None) and ext.code != "":
-            lookup = getattr(CS, "prior_tags_map", None)
-            if lookup is not None:
-                tag_list = lookup.get(code_hash)
-                if tag_list is not None:
-                    tag_match = None
-                    for item in tag_list:
-                        if item[0] not in CS.active_tag_list:
-                            tag_match = item
-                            break
-                    if tag_match is not None:
-                        x, tag_id = tag_match
-                        if isinstance(CS.active_tag_list, set):
-                            CS.active_tag_list.add(x)
-                        else:
-                            CS.active_tag_list.append(x)
-                        CS.store(m_bridge_tag.set(
-                            ((m_file.table_id, 0), OP_REF, (REF_ROOT,)),
-                            tag_id,
-                            ext.line_pos[0], ext.line_pos[1],
-                            ext.char_pos[0], ext.char_pos[1],
-                        ))
-                        self.tag_ref = tag_id
-                        if hasattr(CS, "last_tag_ref"):
-                            CS.last_tag_ref = tag_id
-                        register_symbol_tag(CS, tag_id, ext.line_pos[0], ext.line_pos[1], ext.char_pos[0], ext.code)
-                        self._flush_pending_symbol_refs(CS, tag_id)
-                        return tag_id
+        if ext.code:
+            tag_id = check_exact_match(CS, code_hash)
+            if tag_id is not None:
+                stage_bridge_tag(CS, tag_id, ext.line_pos, ext.char_pos)
+                self.tag_ref = tag_id
+                CS.last_tag_ref = tag_id
+                register_symbol_tag(CS, tag_id, ext.line_pos[0], ext.line_pos[1], ext.char_pos[0], ext.code)
+                self._flush_pending_symbol_refs(CS, tag_id)
+                return tag_id
 
         # 2. Check evolved prior tag match via tag_tracker
         cur_ast_name = ast_name or getattr(self, "name", None)
@@ -250,25 +232,15 @@ class Ast:
         ast_ref = CS.ref(m_ast.ast_id, *ast_id_route) if not (isinstance(ast_id_route, tuple) and len(ast_id_route) == 3 and ast_id_route[1] == OP_REF) else ast_id_route
 
         # 3. Rule 12 Invariant: m_tag.set MUST be first inside with CS(REF_POS)
-        with CS(REF_POS):
-            CS.store(m_tag.set(None, code_hash, ast_ref, 0, 0))
-            tag_ref = ((m_tag.table_id, 0), OP_REF, (REF_POS, CS.route[-1]))
-            if s_tag_id is not None:
-                CS.store(m_moved_tag.set(s_tag_id, tag_ref))
+        tag_ref = stage_new_tag(CS, code_hash, ast_ref, s_tag_id)
 
         # 4. Stage File-to-Tag Bridge (source coordinates: 1-based, inclusive start, exclusive end)
-        CS.store(m_bridge_tag.set(
-            ((m_file.table_id, 0), OP_REF, (REF_ROOT,)),
-            tag_ref,
-            ext.line_pos[0], ext.line_pos[1],
-            ext.char_pos[0], ext.char_pos[1],
-        ))
+        stage_bridge_tag(CS, tag_ref, ext.line_pos, ext.char_pos)
 
-        # 5. Stage Intra-Tag Spatial Mapping & Bridge Map (with deduplication)
+        # 5. Stage Intra-Tag Spatial Mapping
         self.map_ast(CS, ast_ref, tag_ref, ext)
         self.tag_ref = tag_ref
-        if hasattr(CS, "last_tag_ref"):
-            CS.last_tag_ref = tag_ref
+        CS.last_tag_ref = tag_ref
         register_symbol_tag(CS, tag_ref, ext.line_pos[0], ext.line_pos[1], ext.char_pos[0], ext.code)
         self._flush_pending_symbol_refs(CS, tag_ref)
         return tag_ref
@@ -284,11 +256,8 @@ class Ast:
         tag_route: Any,
         extent: Line | None = None,
     ) -> None:
-        """Stage intra-tag spatial coordinate map and bridge map."""
+        """Stage the tag's intra-tag spatial coordinate map (m_map_ast, keyed by the tag)."""
         ext = extent if extent is not None else self.extent
-        line_s = 1
-        char_s = 1
-
         if self.endif and self.endif.line_pos[0] > 0:
             end_line = self.endif.line_pos[1]
             line_e = max(1, end_line - ext.line_pos[0] + 1)
@@ -308,16 +277,7 @@ class Ast:
             else CS.ref(m_tag.tag_id, *tag_route)
         )
 
-        CS.store(m_map_ast.set(
-            tag_target,
-            line_s, char_s,
-            line_e, char_e,
-            ast_target,
-        ))
-
-        # Invariant J: Deduplicate bridge map entries via CS.register_bridge_map
-        if not hasattr(CS, "register_bridge_map") or CS.register_bridge_map(tag_target, tag_target):
-            CS.store(m_bridge_map.set(tag_target, tag_target))
+        stage_tag_map(CS, tag_target, ast_target, line_e, char_e)
 
     def extract(self, CS: Any, create_tag: bool = True) -> None:
         """Default fallback extraction."""

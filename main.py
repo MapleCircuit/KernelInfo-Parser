@@ -13,7 +13,7 @@ lifecycles, coordinates multiprocessing parsing workers, and resolves queued
   `gp.Table_Array` registers 15 core relational tables defining the schema:
     - Version & File tracking: `m_v_main`, `m_file_name`, `m_file`, `m_bridge_file`, `m_moved_file`
     - AST Schema: `m_type_descriptor`, `m_ast`, `m_ast_container`, `m_ast_include`, `m_ast_debug`, `m_ast_hash`
-    - Version Tags & Spatial Coordinates: `m_tag`, `m_bridge_tag`, `m_map_ast`, `m_bridge_map`
+    - Version Tags & Spatial Coordinates: `m_tag`, `m_bridge_tag`, `m_map_ast` (keyed by the tag)
 
 2. VERSION PROCESSING PIPELINE (`update(version)`):
 -------------------------------------------------------------------------------
@@ -53,6 +53,7 @@ from core.globalstuff import (
     REF_NOT_RESOLVABLE,
     CONTINUE_EXCEPTION,
     T_DIR,
+    T_ASM,
     T_RAW,
     T_MAINTAINERS,
     T_CREDITS,
@@ -114,10 +115,11 @@ import traceback
 import gc
 import ctypes
 from parser.c_ast import c_ast_parse, Line
+from parser.c_ast.tag_tracker import query_prior_tags
 from parser.maintainer_ast.maintainer_types import clean_identity_text
 from parser.arch_layout import compute_layouts
 from parser.make_eval import Tree
-from core.FileHandler import MasterFile
+from core.FileHandler import MasterFile, mark_owner
 from core.GreatProcessor import GreatProcessor
 from core.TableHandling import Table, ChangeSet, is_data_unsafe
 from table_engine.shared_buffer import SharedSymbolBuilder, SharedSymbolChain
@@ -141,9 +143,10 @@ from core.DBLayout import (
     m_ast_include,
     m_ast_debug,
     m_tag,
+    m_tag_def,
+    m_tag_ref,
     m_bridge_tag,
     m_map_ast,
-    m_bridge_map,
     m_ast_hash,
     m_maintainer_person,
     m_maintainer_section,
@@ -366,107 +369,80 @@ def get_fid_for_path(path: str) -> int | None:
 
 def extract_tags_and_evacuate_cs(cs_obj: ChangeSet) -> None:
     """Extract bridge tags, preserve resolved symbols, and purge internal AST buffers from an executed ChangeSet."""
-    c_path = getattr(cs_obj, "current_path", None)
+    c_path = cs_obj.current_path
     if not c_path:
         return
     fid = get_fid_for_path(c_path)
     # ChangeSets executed straight from a worker batch (execute_and_purge) arrive with gp cleared
-    gp_ref = getattr(cs_obj, "gp", None) or gp
-    if hasattr(gp_ref, "completed_paths"):
-        gp_ref.completed_paths.add(c_path)
+    gp_ref = cs_obj.gp or gp
+    gp_ref.completed_paths.add(c_path)
 
-    # 1. Preserve resolved symbol map before internal buffers are cleared
-    if hasattr(cs_obj, "symbol_dict") and cs_obj.symbol_dict:
+    # 1. Preserve the resolved symbol map before internal buffers are cleared
+    if cs_obj.symbol_dict:
         resolved_symbols = {}
-        cs_res = getattr(cs_obj, "cs_result", None)
-        cs_ops = getattr(cs_obj, "cs", None)
-        for (sym_name, sym_type), op_pos in cs_obj.symbol_dict.items():
+        cs_res, cs_ops = cs_obj.cs_result, cs_obj.cs
+        for sym_key, op_pos in cs_obj.symbol_dict.items():
             ast_id = None
-            if cs_res and op_pos < len(cs_res) and cs_res[op_pos] is not None:
+            if op_pos < len(cs_res) and cs_res[op_pos] is not None:
                 res_row = cs_res[op_pos]
-                if len(res_row) > 0 and isinstance(res_row[0], int):
+                if res_row and isinstance(res_row[0], int):
                     ast_id = res_row[0]
-            elif cs_ops and op_pos < len(cs_ops) and cs_ops[op_pos] is not None:
+            elif op_pos < len(cs_ops) and cs_ops[op_pos] is not None:
                 op = cs_ops[op_pos]
-                if len(op) >= 3 and len(op[2]) > 0 and isinstance(op[2][0], int):
+                if len(op) >= 3 and op[2] and isinstance(op[2][0], int):
                     ast_id = op[2][0]
             if ast_id is not None:
-                resolved_symbols[(sym_name, sym_type)] = ast_id
+                resolved_symbols[sym_key] = ast_id
         cs_obj.resolved_symbols = resolved_symbols
 
-        # Register resolved symbols into GreatProcessor per-file symbol tables for O(1) lookups
-        if gp_ref is not None:
-            if hasattr(gp_ref, "file_symbols") and isinstance(gp_ref.file_symbols, dict):
-                gp_ref.file_symbols[c_path] = resolved_symbols
-            if hasattr(gp_ref, "file_names") and isinstance(gp_ref.file_names, dict):
-                gp_ref.file_names[c_path] = {s_name: a_id for (s_name, _), a_id in resolved_symbols.items()}
-            if hasattr(gp_ref, "_ast_staged_symbols") and isinstance(gp_ref._ast_staged_symbols, dict):
-                gp_ref._ast_staged_symbols.update(resolved_symbols)
-            if hasattr(gp_ref, "_ast_staged_names") and isinstance(gp_ref._ast_staged_names, dict):
-                for (s_name, _s_type), a_id in resolved_symbols.items():
-                    if s_name not in gp_ref._ast_staged_names:
-                        gp_ref._ast_staged_names[s_name] = a_id
-            if hasattr(gp_ref, "_ast_negative_cache") and gp_ref._ast_negative_cache:
-                for sym_key in resolved_symbols:
-                    gp_ref._ast_negative_cache.discard(sym_key)
+        # Per-file symbol tables for O(1) lookups by the files referencing this one
+        gp_ref.file_symbols[c_path] = resolved_symbols
+        gp_ref.file_names[c_path] = {s_name: a_id for (s_name, _), a_id in resolved_symbols.items()}
+        gp_ref._ast_staged_symbols.update(resolved_symbols)
+        staged_names = gp_ref._ast_staged_names
+        for (s_name, _s_type), a_id in resolved_symbols.items():
+            staged_names.setdefault(s_name, a_id)
+        if gp_ref._ast_negative_cache:
+            gp_ref._ast_negative_cache.difference_update(resolved_symbols)
 
     # 2. Extract bridge tags with resolved tag_id from cs_result
     if fid is not None and not hasattr(cs_obj, "pre_extracted_tags"):
         file_tags = []
-        cs_ops = getattr(cs_obj, "cs", [])
-        cs_res = getattr(cs_obj, "cs_result", [])
-        for i, op in enumerate(cs_ops):
-            if op and len(op) >= 3 and op[0] == m_bridge_tag.table_id:
+        cs_res = cs_obj.cs_result
+        for i, op in enumerate(cs_obj.cs):
+            if op and len(op) >= 3 and op[0] == m_bridge_tag.table_id and len(op[2]) >= 4:
                 cols = op[2]
-                if len(cols) >= 4:
-                    tag_id = None
-                    if i < len(cs_res) and cs_res[i] is not None and len(cs_res[i]) >= 2:
-                        res_val = cs_res[i][1]
-                        if isinstance(res_val, int):
-                            tag_id = res_val
-                    if tag_id is None and not isinstance(cols[1], tuple):
-                        tag_id = cols[1]
-
+                tag_id = None
+                if i < len(cs_res) and cs_res[i] is not None and len(cs_res[i]) >= 2 and isinstance(cs_res[i][1], int):
+                    tag_id = cs_res[i][1]
+                if tag_id is None and not isinstance(cols[1], tuple):
+                    tag_id = cols[1]
+                if tag_id is not None:
                     line_s = cols[2] if isinstance(cols[2], int) else 1
                     line_e = cols[3] if isinstance(cols[3], int) else line_s
-                    if tag_id is not None:
-                        file_tags.append((tag_id, fid, line_s, line_e))
+                    file_tags.append((tag_id, fid, line_s, line_e))
         cs_obj.pre_extracted_tags = file_tags
 
     blob_id = getattr(cs_obj, "blob_id", 0) or fid or 0
     if blob_id:
         cs_obj.blob_id = blob_id
-        if gp_ref is not None and hasattr(gp_ref, "file_blob_ids") and isinstance(gp_ref.file_blob_ids, dict):
-            gp_ref.file_blob_ids[c_path] = blob_id
+        gp_ref.file_blob_ids[c_path] = blob_id
 
-    if hasattr(cs_obj, "pre_extracted_tags") and cs_obj.pre_extracted_tags:
-        if gp_ref is not None and hasattr(gp_ref, "file_pre_extracted_tags") and isinstance(gp_ref.file_pre_extracted_tags, dict):
-            gp_ref.file_pre_extracted_tags[c_path] = cs_obj.pre_extracted_tags
+    if getattr(cs_obj, "pre_extracted_tags", None):
+        gp_ref.file_pre_extracted_tags[c_path] = cs_obj.pre_extracted_tags
 
     # 3. Evacuate internal AST buffers and bloat
-    if hasattr(cs_obj, "cs") and isinstance(cs_obj.cs, list):
-        cs_obj.cs.clear()
-    if hasattr(cs_obj, "store_dict") and isinstance(cs_obj.store_dict, dict):
-        cs_obj.store_dict.clear()
-    if hasattr(cs_obj, "cs_result") and isinstance(cs_obj.cs_result, list):
-        cs_obj.cs_result.clear()
-    if hasattr(cs_obj, "symbol_dict") and isinstance(cs_obj.symbol_dict, dict):
-        cs_obj.symbol_dict.clear()
-    if hasattr(cs_obj, "foreign_deps") and isinstance(cs_obj.foreign_deps, set):
-        cs_obj.foreign_deps.clear()
-    if hasattr(cs_obj, "unresolved_indices") and cs_obj.unresolved_indices:
+    cs_obj.cs.clear()
+    cs_obj.store_dict.clear()
+    cs_obj.cs_result.clear()
+    cs_obj.symbol_dict.clear()
+    cs_obj.foreign_deps.clear()
+    if cs_obj.unresolved_indices:
         cs_obj.unresolved_indices.clear()
-    if hasattr(cs_obj, "clear_bloat"):
-        cs_obj.clear_bloat()
-    else:
-        cs_obj.gp = None
-        cs_obj.mf = None
-        cs_obj.parsers = {}
-        cs_obj.batch_cs_dict = None
-        cs_obj.file = None
+    cs_obj.clear_bloat()
 
     # Record worker micro-profiler into central StageProfiler if active
-    if getattr(G, "STAGE_PROFILER", None) is not None and getattr(cs_obj, "profiler", None) is not None:
+    if G.STAGE_PROFILER is not None and cs_obj.profiler is not None:
         G.STAGE_PROFILER.record_worker_profiler(cs_obj.profiler)
         cs_obj.profiler = None
 
@@ -531,6 +507,19 @@ def _tagged_blob_ids(blob_ids: Iterable[int]) -> set[int]:
     return tagged
 
 
+def _known_blob_id(fpath: str, b_hash: bytes) -> int | None:
+    """Id of an existing m_file_blob row for a path's blob, else None.
+
+    A parsed `.c`/`.h` blob is stored under the content-aware type (`ChangeSet.get_file_type()`: T_ASM for a
+    header written in assembly), so that type is tried when the name-based one misses.
+    """
+    for ftype in (type_check(fpath), T_ASM) if fpath.endswith((".c", ".h")) else (type_check(fpath),):
+        row = G.TE.get(m_file_blob.table_id, (None, b_hash, ftype))
+        if row is not None:
+            return row[0]
+    return None
+
+
 def _reuse_parsed_blobs(file_blob_hashes: dict[str, bytes]) -> list[str]:
     """Step 4.5: link changed files whose exact blob was already parsed instead of parsing them again.
 
@@ -553,9 +542,9 @@ def _reuse_parsed_blobs(file_blob_hashes: dict[str, bytes]) -> list[str]:
         b_hash = file_blob_hashes.get(fpath)
         if not b_hash:
             continue
-        blob_row = G.TE.get(m_file_blob.table_id, (None, b_hash, type_check(fpath)))
-        if blob_row is not None:
-            candidates[item] = (op, fpath, blob_row[0])
+        blob_id = _known_blob_id(fpath, b_hash)
+        if blob_id is not None:
+            candidates[item] = (op, fpath, blob_id)
 
     tagged = _tagged_blob_ids(b_id for _op, _path, b_id in candidates.values())
     # Checkpoint rows of this version from an interrupted earlier run (one query instead of one per file)
@@ -606,9 +595,9 @@ def _record_reparsed_blobs(file_blob_hashes: dict[str, bytes]) -> None:
             continue
         b_hash = file_blob_hashes.get(parts[-1])
         if b_hash:
-            row = G.TE.get(m_file_blob.table_id, (None, b_hash, type_check(parts[-1])))
-            if row is not None:
-                blob_ids.add(row[0])
+            blob_id = _known_blob_id(parts[-1], b_hash)
+            if blob_id is not None:
+                blob_ids.add(blob_id)
     if blob_ids:
         with G.DB() as db:
             if getattr(db, "cnx", None) is not None:
@@ -621,7 +610,7 @@ def update(version: str, repo_path: str | None = None) -> None:
     Workflow Steps:
     1. Register/synchronize version in `m_git_ref` via `create_new_vid()`.
     2. Build temporary performance B-tree indexes (`ast_index`, `file_name_index`).
-    3. Clone repository branch into RAMDISK via `MF.add_version()`.
+    3. Bring the RAMDISK workspace to the version via `MF.checkout_version()` (incremental from the previous version).
     4. Generate git diff change list (`MF.generate_change_list()`) & extract Git blob hashes.
     4.4 Start the TableEngine (preload cached tables).
     4.5 Deduplicate files against `m_file_blob` across trees sharing root commit (TableEngine caches).
@@ -659,7 +648,6 @@ def update(version: str, repo_path: str | None = None) -> None:
         ("file_name_index", m_file_name, (m_file_name.fname,)),
         ("bridge_tag_fid_idx", m_bridge_tag, (m_bridge_tag.blob_id, m_bridge_tag.tag_id)),
         ("file_ref_target_idx", m_file_reference, (m_file_reference.target_fnid, m_file_reference.ref_type)),
-        ("file_ref_source_idx", m_file_reference, (m_file_reference.source_blob_id, m_file_reference.ref_type)),
     )
     with G.measure_stage("Step 2: Performance Index Setup", count=len(performance_indexes), units="indexes"):
         with G.DB() as db:
@@ -673,7 +661,8 @@ def update(version: str, repo_path: str | None = None) -> None:
     # STEP 3: Clone repository branch version to RAMDISK workspace
     # -------------------------------------------------------------------------
     with G.measure_stage("Step 3: Branch Checkout"):
-        MF.add_version(version, gp.PURGE_LIST)
+        # Rewrites only the files that differ from the previous version when the workspace holds it
+        MF.checkout_version(version, gp.Old_Version_Name, gp.PURGE_LIST)
 
     if G.is_deadline_exceeded():
         logger.warning(COLOR.yellow(f"[Duration Limit] Execution deadline reached after Step 3. Halting '{version}' early."))
@@ -2231,8 +2220,6 @@ def trigger_multicore(batch_size: int | None = None, scheduler: DependencySchedu
         else:
             regular_files.append(item)
 
-    if not hasattr(gp, "Symlink_List") or gp.Symlink_List is None:
-        gp.Symlink_List = []
     gp.Symlink_List.extend(symlink_files)
 
     # Order regular files: header DAG first
@@ -2632,6 +2619,8 @@ def main() -> None:
 
     if repair_mode or backfill_target:
         canonical_tags = MF.get_version_tags(start_ref=target_refs[0] if target_refs else None, include_pre_releases=True)
+        for ref in [r for r, (_cid, st) in version_states.items() if st == "legacy"]:
+            _resolve_legacy_state(ref, version_states, network_id)
         orchestrate_repair_pipeline(
             canonical_tags,
             version_states,
@@ -2659,6 +2648,8 @@ def main() -> None:
         resume_idx = 0
         for idx, ref in enumerate(target_refs):
             st = version_states.get(ref, (0, "new"))[1]
+            if st == "legacy":
+                st = _resolve_legacy_state(ref, version_states, network_id)
             if st == "done":
                 resume_idx = idx + 1
             else:
@@ -3196,12 +3187,13 @@ def arg_handling() -> argparse.Namespace:
             "unit_test.test_c_parser",
             "tests.test_maintainer_ast",
             "tests.test_credits_lifecycle",
-            "tests.test_bridge_map_dedup",
+            "tests.test_tag_maps",
             "tests.test_git_commit_parser",
             "tests.test_tree_resolver",
             "tests.test_te_db_integrity",
             "tests.test_multicore_pipeline",
             "tests.test_pipeline_steps",
+            "tests.test_workspace_checkout",
             "tests.test_commit_pipeline",
             "tests.test_symbol_rows",
             "tests.test_kconfig_ast",
@@ -3648,6 +3640,18 @@ def _previous_ingest(db: Any, network_id: int, commit_id: int, version_or_ref: s
     return "legacy_partial"
 
 
+def _resolve_legacy_state(ref: str, version_states: dict[str, tuple[int, str]], network_id: int) -> str:
+    """Decide a "legacy" ref (checkpoint rows, no m_ingest_state row) with `_previous_ingest()`'s 90% rule.
+
+    Updates `version_states` with "done" (the state row is then backfilled) or "legacy_partial".
+    """
+    cid = version_states[ref][0]
+    with G.DB() as db:
+        state = _previous_ingest(db, network_id, cid, ref)
+    version_states[ref] = (cid, state)
+    return state
+
+
 def _purge_partial_version(db: Any, commit_id: int) -> None:
     """Remove the version-scoped rows of an interrupted run that left no watermarks."""
     cnx = getattr(db, "cnx", None)
@@ -3765,7 +3769,7 @@ def default_processing(CS: ChangeSet) -> None:
                 CS.store(m_file.set(
                     None,
                     getattr(CS, "blob_hash", b"\x00" * 20),
-                    CS.get_file_type() if hasattr(CS, "get_file_type") else type_check(CS.current_path),
+                    CS.get_file_type(),
                 ))
 
                 # Create BRIDGE FILE
@@ -3794,7 +3798,7 @@ def default_processing(CS: ChangeSet) -> None:
             CS.store(m_file.set(
                 None,
                 getattr(CS, "blob_hash", b"\x00" * 20),
-                CS.get_file_type() if hasattr(CS, "get_file_type") else type_check(CS.current_path),
+                CS.get_file_type(),
             ))
 
             # 2 Create BRIDGE FILE
@@ -3820,7 +3824,7 @@ def default_processing(CS: ChangeSet) -> None:
         CS.store(m_file.set(
             None,
             getattr(CS, "blob_hash", b"\x00" * 20),
-            CS.get_file_type() if hasattr(CS, "get_file_type") else type_check(CS.current_path),
+            CS.get_file_type(),
         ))
 
         # 2 Create BRIDGE FILE
@@ -3999,6 +4003,7 @@ def _start_git_commit_worker() -> None:
     gp.stop_commit_worker()
     base_dir = G.RAMDISK if os.path.isdir(G.RAMDISK) else None
     result_dir = tempfile.mkdtemp(prefix="kip-commits-", dir=base_dir)
+    mark_owner(result_dir)
     gp.PURGE_LIST.append(result_dir)
     gp._commit_result_dir = result_dir
     known_count = len(gp.commit_ids_by_hash) if getattr(gp, "commit_ids_by_hash", None) else None
@@ -4182,14 +4187,9 @@ def file_processing_worker(
                                 if bf_row and len(bf_row) >= 3 and bf_row[2]:
                                     old_fids[lp] = bf_row[2][2]
                     if old_fids:
-                        joins = (
-                            (m_bridge_tag.tag_id, m_tag.tag_id, 1),
-                            (m_tag.ast_id, m_ast.ast_id, 1),
-                        )
                         all_tag_ids: set[int] = set()
                         for fid in set(old_fids.values()):
-                            cols = (fid,) + (None,) * 13
-                            p_tags = m_bridge_tag.view_get_multiple(joins, *cols)
+                            p_tags = query_prior_tags(fid)
                             if p_tags:
                                 batch_prior_tags[fid] = p_tags
                                 for t in p_tags:
@@ -4299,7 +4299,11 @@ def file_processing_worker(
         split["db_read_s"] = getattr(G.TE, "db_read_s", 0.0) - reads_base[1]
         split["symbol_stats"] = dict(SYMBOL_STATS - symbols_base)
         if gp_ref is not None:
-            split["blob_symbols"] = getattr(gp_ref, "_blob_symbols_fetched", None) or {}
+            # Maps already streamed with a batch frame are not sent again
+            split["blob_symbols"] = {
+                fid: sm for fid, sm in (getattr(gp_ref, "_blob_symbols_fetched", None) or {}).items()
+                if fid not in last_sent_blobs
+            }
             split["blob_symbols_used"] = list(getattr(gp_ref, "_blob_symbols_used", ()))
         try:
             _send(_FRAME_DONE + pickle.dumps(split, protocol=pickle.HIGHEST_PROTOCOL))
@@ -4419,8 +4423,6 @@ def processing_unchanges() -> list[str]:
 
         # If unchanged is a symlink, defer resolution to processing_symlinks so target fid stays in sync
         if working_dir and os.path.islink(os.path.join(working_dir, unchanged)):
-            if not hasattr(gp, "Symlink_List") or gp.Symlink_List is None:
-                gp.Symlink_List = []
             gp.Symlink_List.append(f"U\t{unchanged}")
             continue
 
@@ -4451,8 +4453,6 @@ def processing_unchanges() -> list[str]:
             to_parse.extend(sorted(missing_regs))
 
         if missing_syms:
-            if not hasattr(gp, "Symlink_List") or gp.Symlink_List is None:
-                gp.Symlink_List = []
             gp.Symlink_List.extend(missing_syms)
 
     return to_parse
@@ -4468,7 +4468,6 @@ def processing_dirs() -> dict[str, ChangeSet]:  # noqa: C901
         old_dir_list = set(MF.get_dir_list(gp.Old_Version_Name))
         new_dir_list = dir_list - old_dir_list
         unchanged_dirs = dir_list & old_dir_list
-        deleted_dirs = old_dir_list - dir_list
 
         # Unchanged dirs
         for single_dir in unchanged_dirs:
@@ -4605,7 +4604,7 @@ def processing_symlinks(override_symlinks: list[str] | None = None) -> None:
                     cs_obj.execute(force_stubs=True)
                 extract_tags_and_evacuate_cs(cs_obj)
 
-    if override_symlinks is None and hasattr(gp, "Symlink_List") and gp.Symlink_List:
+    if override_symlinks is None:
         gp.Symlink_List.clear()
 
 
@@ -4625,9 +4624,9 @@ def _reuse_parsed_symlink_blobs(fallback_files: list[str]) -> list[str]:
         b_hash = blob_hashes.get(fpath)
         if item.startswith("D") or not b_hash:
             continue
-        blob_row = G.TE.get(m_file_blob.table_id, (None, b_hash, type_check(fpath)))
-        if blob_row is not None:
-            parsed[fpath] = blob_row[0]
+        blob_id = _known_blob_id(fpath, b_hash)
+        if blob_id is not None:
+            parsed[fpath] = blob_id
 
     tagged = _tagged_blob_ids(parsed.values())
     remaining = []
@@ -4672,6 +4671,17 @@ def _load_blob_tags(blob_ids: Iterable[int]) -> dict[int, list[tuple[int, int, i
         finally:
             cur.close()
     return tags
+
+
+def _commit_blob_id(path: str, sha: str) -> int:
+    """m_file_blob id of a blob a commit read or wrote (0 for none): the version's own blob when it is the one,
+    else the blob's row, staged when new."""
+    if not sha:
+        return 0
+    head_hash = gp.file_blob_hashes.get(path) if getattr(gp, "file_blob_hashes", None) else None
+    if head_hash is not None and head_hash.hex() == sha and path in gp.file_blob_ids:
+        return gp.file_blob_ids[path]
+    return G.TE.set(m_file_blob.table_id, (None, bytes.fromhex(sha), type_check(path)))[0]
 
 
 def processing_git_commits(version: str) -> None:
@@ -4774,27 +4784,26 @@ def processing_git_commits(version: str) -> None:
                     ),
                 )
 
-        # Insert modified file bridges into m_commit_file
+        # Files the commit touched, with the blobs it read and wrote (blobs of intermediate commits get their
+        # m_file_blob row here; they are parsed if a later version contains them)
         for change_type, file_path in commit.files:
+            old_path, old_sha, new_sha = commit.file_blobs.get(file_path, (file_path, "", ""))
             fnid = get_fnid_for_path(file_path)
-            if fnid is not None:
-                blob_id = 0
-                if hasattr(gp, "file_blob_ids") and file_path in gp.file_blob_ids:
-                    blob_id = gp.file_blob_ids[file_path]
-                elif getattr(gp, "ChangeSet_Dict", None):
-                    cs_obj = gp.ChangeSet_Dict.get(file_path)
-                    blob_id = getattr(cs_obj, "blob_id", 0) if cs_obj else 0
-                G.TE.set(
-                    m_commit_file.table_id,
-                    (
-                        commit_id,
-                        fnid,
-                        blob_id,
-                        0,
-                        0,
-                        change_type[:1],
-                    ),
-                )
+            if fnid is None:
+                fnid = G.TE.set(m_file_name.table_id, (None, file_path[:255]))[0]
+                file_fnid_cache[file_path] = fnid
+            old_fnid = fnid if not old_path or old_path == file_path else (get_fnid_for_path(old_path) or 0)
+            G.TE.set(
+                m_commit_file.table_id,
+                (
+                    commit_id,
+                    fnid,
+                    _commit_blob_id(file_path, new_sha),
+                    old_fnid if old_sha else 0,
+                    _commit_blob_id(old_path or file_path, old_sha),
+                    change_type[:1],
+                ),
+            )
 
     # Link parents now that every commit of the range has an id; parents outside the range were looked up above
     for commit_id, parent_hashes in pending_parents:
@@ -5187,74 +5196,101 @@ def standalone_resolve_mailing_list(
         G.emergency_shutdown(1)
 
 
+def _reference_sources(
+    all_files: list[str],
+    wanted: Callable[[str], bool],
+    new_pairs: set[tuple[int, int]] | None,
+) -> list[tuple[str, int, int]]:
+    """(path, fnid, blob_id) of the version's files selected by `wanted` whose references are recomputed.
+
+    `new_pairs` holds the (fnid, blob_id) pairs new in this version (`_new_version_file_pairs()`); None
+    (no SQL access) selects every file.
+    """
+    sources = []
+    for path in all_files:
+        if not wanted(path):
+            continue
+        fnid, blob_id = get_fnid_for_path(path), get_fid_for_path(path)
+        if fnid is None or blob_id is None or (new_pairs is not None and (fnid, blob_id) not in new_pairs):
+            continue
+        sources.append((path, fnid, blob_id))
+    return sources
+
+
+def _stage_file_reference(
+    staged_file_refs: set[tuple[int, int, int, int, int]],
+    blob_id: int,
+    fnid: int,
+    target_fnid: int,
+    ref_type: int,
+    line_no: int,
+    details: str,
+) -> bool:
+    """Stage one m_file_reference row of the source file (fnid, blob_id) unless already staged; True if staged."""
+    key = (blob_id, fnid, target_fnid, ref_type, line_no)
+    if key in staged_file_refs:
+        return False
+    staged_file_refs.add(key)
+    G.TE.set(m_file_reference.table_id, (None, blob_id, fnid, target_fnid, ref_type, line_no, details[:255]))
+    return True
+
+
+def _version_file_list(version: str, purpose: str) -> list[str]:
+    """Paths of the version's tree (empty when Git cannot list it)."""
+    try:
+        file_list_raw = MF.git_file_list(gp.Version_Name)
+    except Exception as e:
+        logger.debug(f"Failed to get git_file_list for {purpose} in {version}: {e}")
+        return []
+    return file_list_raw.splitlines() if file_list_raw else []
+
+
 def processing_kbuild(
     version: str,
-    staged_file_refs: set[tuple[int, int, int, int]] | None = None,
-    valid_blob_ids: set[int] | None = None,
-    valid_fnids: set[int] | None = None,
-    new_blob_ids: set[int] | None = None,
+    staged_file_refs: set[tuple[int, int, int, int, int]] | None = None,
+    new_pairs: set[tuple[int, int]] | None = None,
 ) -> None:
     """Parse the version's Makefile and Kbuild files and stage their build references (m_file_reference).
 
-    Rows are keyed by the Makefile blob, so only blobs in `new_blob_ids` (None: every blob) are parsed;
-    a carried-over Makefile keeps the rows computed when it first appeared. Which Kconfig symbols
-    govern a file is answered from Git by the webapp (kbuild_usage, build conditions), not stored.
+    Rows are keyed by the Makefile's (blob, path), since the targets resolve against its directory: only
+    the (fnid, blob_id) pairs in `new_pairs` (None: every file) are parsed, and a Makefile carried over
+    at the same path keeps the rows computed when it first appeared there. Which Kconfig symbols govern a
+    file is answered from Git by the webapp (kbuild_usage, build conditions), not stored.
     """
     if gp.VID == 0:
         return
-
     if staged_file_refs is None:
         staged_file_refs = set()
 
     from parser.kbuild_parser import KbuildParser
     kbuild_parser = KbuildParser()
 
-    try:
-        file_list_raw = MF.git_file_list(gp.Version_Name)
-    except Exception as e:
-        logger.debug(f"Failed to get git_file_list for kbuild parsing in {version}: {e}")
+    all_files = _version_file_list(version, "kbuild parsing")
+    is_makefile = lambda f: f.endswith("Makefile") or f.endswith("Kbuild")  # noqa: E731
+    targets = _reference_sources(all_files, is_makefile, new_pairs)
+    if not targets:
         return
-
-    all_files = file_list_raw.splitlines() if file_list_raw else []
-    makefile_paths = [f for f in all_files if f.endswith("Makefile") or f.endswith("Kbuild")]
-    if not makefile_paths:
-        return
-
-    target_makefiles = [
-        f for f in makefile_paths
-        if (fid := get_fid_for_path(f)) and (new_blob_ids is None or fid in new_blob_ids)
-        and (valid_blob_ids is None or fid in valid_blob_ids)
-    ]
-    logger.info(f"Processing {len(target_makefiles)} Makefile/Kbuild files for version '{version}' (of {len(makefile_paths)} total)...")
+    logger.info(f"Processing {len(targets)} Makefile/Kbuild files for version '{version}' (of {sum(map(is_makefile, all_files))} total)...")
 
     ref_count = 0
-    for mk_path in target_makefiles:
+    for mk_path, mk_fnid, mk_blob in targets:
         if G.is_deadline_exceeded():
             logger.warning(COLOR.yellow("[Duration Limit] Execution deadline reached during Kbuild processing. Stopping early..."))
             break
         try:
-            mk_fid = get_fid_for_path(mk_path)
             content = MF.get_file(mk_path, gp.Version_Name)
             if not content:
                 continue
-            bindings = kbuild_parser.parse_makefile_content(content, dir_path=os.path.dirname(mk_path))
-            for b in bindings:
+            for b in kbuild_parser.parse_makefile_content(content, dir_path=os.path.dirname(mk_path)):
                 target_fnid = get_fnid_for_path(b.source_file_rel)
                 if target_fnid is None and b.source_file_rel.endswith(".c"):
                     target_fnid = get_fnid_for_path(b.source_file_rel[:-2] + ".S")
-                if target_fnid is None or (valid_fnids is not None and target_fnid not in valid_fnids):
+                if target_fnid is None:
                     continue
-                ref_t = int(getattr(b, "ref_type", 3))
-                source_line = int(getattr(b, "source_line", 1))
-                ref_key = (mk_fid, target_fnid, ref_t, source_line)
-                if ref_key in staged_file_refs:
-                    continue
-                staged_file_refs.add(ref_key)
-                G.TE.set(
-                    m_file_reference.table_id,
-                    (None, mk_fid, target_fnid, ref_t, source_line, getattr(b, "details", "")[:255]),
+                ref_count += _stage_file_reference(
+                    staged_file_refs, mk_blob, mk_fnid, target_fnid,
+                    int(getattr(b, "ref_type", 3)), int(getattr(b, "source_line", 1)), getattr(b, "details", ""),
                 )
-                ref_count += 1
         except Exception as e:
             logger.debug(f"Error parsing kbuild file '{mk_path}': {e}")
 
@@ -5263,38 +5299,29 @@ def processing_kbuild(
 
 def processing_doc_references(
     version: str,
-    staged_file_refs: set[tuple[int, int, int, int]] | None = None,
-    valid_blob_ids: set[int] | None = None,
-    valid_fnids: set[int] | None = None,
-    new_blob_ids: set[int] | None = None,
+    staged_file_refs: set[tuple[int, int, int, int, int]] | None = None,
+    new_pairs: set[tuple[int, int]] | None = None,
 ) -> None:
     """Scan documentation and text files for active version and map cross-file references into m_file_reference.
 
-    `new_blob_ids` limits the scan to documents whose references were cleared for recomputation (None: all).
+    Rows are keyed by the document's (blob, path) like every m_file_reference row (the scan also skips
+    references to the document's own path); `new_pairs` limits the scan to the (fnid, blob_id) pairs new
+    in this version (None: all).
     """
     if gp.VID == 0:
         return
-
     if staged_file_refs is None:
         staged_file_refs = set()
 
     from parser.doc_parser import DocReferenceScanner
     scanner = DocReferenceScanner()
 
-    try:
-        file_list_raw = MF.git_file_list(gp.Version_Name)
-    except Exception as e:
-        logger.debug(f"Failed to get git_file_list for doc reference parsing in {version}: {e}")
+    all_files = _version_file_list(version, "doc reference parsing")
+    docs = _reference_sources(all_files, scanner.is_doc_candidate, new_pairs)
+    if not docs:
         return
 
-    all_files = file_list_raw.splitlines() if file_list_raw else []
-    doc_paths = [f for f in all_files if scanner.is_doc_candidate(f)]
-    if new_blob_ids is not None:
-        doc_paths = [f for f in doc_paths if get_fid_for_path(f) in new_blob_ids]
-    if not doc_paths:
-        return
-
-    logger.info(f"Processing {len(doc_paths)} documentation/text files for version '{version}'...")
+    logger.info(f"Processing {len(docs)} documentation/text files for version '{version}'...")
 
     fnid_by_path: dict[str, int] = {}
     for p in all_files:
@@ -5303,36 +5330,17 @@ def processing_doc_references(
             fnid_by_path[p] = fnid
 
     count = 0
-    for doc_p in doc_paths:
+    doc_type = int(FileRefType.Documentation)
+    for doc_p, doc_fnid, doc_blob in docs:
         if G.is_deadline_exceeded():
             logger.warning(COLOR.yellow("[Duration Limit] Execution deadline reached during doc references processing. Stopping early..."))
             break
         try:
-            doc_fid = get_fid_for_path(doc_p)
-            if doc_fid is None or (valid_blob_ids is not None and doc_fid not in valid_blob_ids):
-                continue
             content = MF.get_file(doc_p, gp.Version_Name)
             if not content:
                 continue
-            refs = scanner.scan_file_content(content, doc_fid, fnid_by_path, source_path=doc_p)
-            for r in refs:
-                if valid_fnids is not None and r.target_fnid not in valid_fnids:
-                    continue
-                ref_key = (r.source_fid, r.target_fnid, int(FileRefType.Documentation), int(r.line_no))
-                if ref_key not in staged_file_refs:
-                    staged_file_refs.add(ref_key)
-                    G.TE.set(
-                        m_file_reference.table_id,
-                        (
-                            None,
-                            r.source_fid,
-                            r.target_fnid,
-                            int(FileRefType.Documentation),
-                            int(r.line_no),
-                            r.details[:255],
-                        ),
-                    )
-                    count += 1
+            for r in scanner.scan_file_content(content, doc_blob, fnid_by_path, source_path=doc_p):
+                count += _stage_file_reference(staged_file_refs, doc_blob, doc_fnid, r.target_fnid, doc_type, int(r.line_no), r.details)
         except Exception as e:
             logger.debug(f"Error parsing documentation references in '{doc_p}': {e}")
 
@@ -5342,8 +5350,9 @@ def processing_doc_references(
 def processing_include_references(version: str) -> None:
     """Batch populate C/ASM and Kconfig include references into m_file_reference using set-based query.
 
-    Only blobs that are new in this version (absent from gp.Old_VID's checkpoint) are processed: their
-    previous rows were cleared by processing_file_references(), and carried-over blobs keep theirs.
+    Only the (path, blob) pairs new in this version (absent from gp.Old_VID's checkpoint) are processed:
+    their previous rows were cleared by processing_file_references(), and carried-over pairs keep theirs.
+    Every path holding the blob gets its own rows (source_fnid), with the targets of the blob's AST.
     """
     if gp.VID == 0:
         return
@@ -5354,13 +5363,14 @@ def processing_include_references(version: str) -> None:
                 return
 
             sync_query = f"""
-                INSERT IGNORE INTO m_file_reference (source_blob_id, target_fnid, ref_type, line_no, details)
-                SELECT STRAIGHT_JOIN DISTINCT bt.blob_id, inc.fnid,
+                INSERT IGNORE INTO m_file_reference (source_blob_id, source_fnid, target_fnid, ref_type, line_no, details)
+                SELECT STRAIGHT_JOIN DISTINCT bt.blob_id, bf.fnid, inc.fnid,
                        CASE WHEN a.type_id IN ({ASTT.Kconfig_Source.value}, {ASTT.Kconfig_Rsource.value}, {ASTT.Kconfig_Osource.value}) THEN {int(FileRefType.Kconfig)} ELSE {int(FileRefType.Include)} END AS ref_type,
                        bt.line_s,
                        LEFT(a.name, 255)
                 FROM m_bridge_checkpoint bf
-                LEFT JOIN m_bridge_checkpoint old_v ON old_v.blob_id = bf.blob_id AND old_v.commit_id = %s
+                LEFT JOIN m_bridge_checkpoint old_v
+                       ON old_v.commit_id = %s AND old_v.fnid = bf.fnid AND old_v.blob_id = bf.blob_id
                 JOIN m_bridge_tag bt ON bf.blob_id = bt.blob_id
                 JOIN m_tag t ON bt.tag_id = t.tag_id
                 JOIN m_ast_include inc ON t.ast_id = inc.ast_id
@@ -5376,33 +5386,38 @@ def processing_include_references(version: str) -> None:
         logger.warning(f"Error in processing_include_references for {version}: {e}", exc_info=True)
 
 
-def _new_version_blob_ids() -> tuple[set[int], set[int]] | None:
-    """Blob ids of this version's tree, and the subset absent from gp.Old_VID's tree (new in this version).
+def _new_version_file_pairs() -> set[tuple[int, int]] | None:
+    """(fnid, blob_id) pairs of this version's tree that gp.Old_VID's tree did not hold.
 
-    Returns None when the driver has no SQL access (MockDB).
+    m_file_reference rows are keyed by the source file's (blob, path), so these are the sources whose
+    references are (re)computed: new blobs, and existing blobs at a path they did not have before (an
+    identical Makefile copied to another directory). Returns None when the driver has no SQL access (MockDB).
     """
     with G.DB() as db:
         cur = _raw_cursor(db)
         if cur is None:
             return None
         try:
-            cur.execute("SELECT DISTINCT blob_id FROM m_bridge_checkpoint WHERE commit_id = %s", (gp.VID,))
-            current = {int(r[0]) for r in cur.fetchall()}
-            previous: set[int] = set()
-            if gp.Old_VID:
-                cur.execute("SELECT DISTINCT blob_id FROM m_bridge_checkpoint WHERE commit_id = %s", (gp.Old_VID,))
-                previous = {int(r[0]) for r in cur.fetchall()}
+            cur.execute(
+                """
+                SELECT cur_v.fnid, cur_v.blob_id FROM m_bridge_checkpoint cur_v
+                LEFT JOIN m_bridge_checkpoint old_v
+                       ON old_v.commit_id = %s AND old_v.fnid = cur_v.fnid AND old_v.blob_id = cur_v.blob_id
+                WHERE cur_v.commit_id = %s AND old_v.blob_id IS NULL
+                """,
+                (gp.Old_VID or 0, gp.VID),
+            )
+            return {(int(f), int(b)) for f, b in cur.fetchall()}
         finally:
             cur.close()
-    return current, current - previous
 
 
 def processing_file_references(version: str) -> None:
     """Extract and consolidate all cross-file references (Kbuild, Makefiles, Documentation, Includes, Kconfig).
 
-    m_file_reference rows are keyed by source blob, so only blobs that are new in this version (absent
-    from gp.Old_VID's tree) are cleared and recomputed; blobs carried over keep the rows computed when they
-    first appeared.
+    m_file_reference rows are keyed by the source file's (blob, path) pair (`source_blob_id`, `source_fnid`),
+    so only the pairs new in this version are cleared and recomputed (`_new_version_file_pairs()`); pairs
+    carried over keep their rows.
     """
     if gp.VID == 0:
         return
@@ -5410,24 +5425,24 @@ def processing_file_references(version: str) -> None:
     # Ensure all parent tables (m_file_blob, m_file_name, m_bridge_checkpoint) are committed before referencing
     G.TE.commit_all()
 
-    scope = _new_version_blob_ids()
-    valid_blob_ids, new_blob_ids = scope if scope is not None else (None, None)
-    if new_blob_ids is not None:
-        logger.info(f"Recomputing file references for {len(new_blob_ids)} of {len(valid_blob_ids)} blobs new in version '{version}'.")
+    new_pairs = _new_version_file_pairs()
+    if new_pairs is not None:
+        logger.info(f"Recomputing file references for {len(new_pairs)} (path, blob) pairs new in version '{version}'.")
 
-    # 1. Clear the rows of the blobs about to be recomputed (idempotent across pipeline re-runs)
+    # 1. Clear the rows of the pairs about to be recomputed (idempotent across pipeline re-runs)
     try:
         with G.DB() as db:
             cur = _raw_cursor(db)
             if cur:
                 cur.execute(
                     """
-                    DELETE r FROM m_file_reference r
-                    JOIN m_bridge_checkpoint cur_v ON cur_v.blob_id = r.source_blob_id AND cur_v.commit_id = %s
-                    LEFT JOIN m_bridge_checkpoint old_v ON old_v.blob_id = cur_v.blob_id AND old_v.commit_id = %s
-                    WHERE old_v.blob_id IS NULL;
+                    DELETE r FROM m_bridge_checkpoint cur_v
+                    LEFT JOIN m_bridge_checkpoint old_v
+                           ON old_v.commit_id = %s AND old_v.fnid = cur_v.fnid AND old_v.blob_id = cur_v.blob_id
+                    JOIN m_file_reference r ON r.source_blob_id = cur_v.blob_id AND r.source_fnid = cur_v.fnid
+                    WHERE cur_v.commit_id = %s AND old_v.blob_id IS NULL;
                     """,
-                    (gp.VID, gp.Old_VID or 0),
+                    (gp.Old_VID or 0, gp.VID),
                 )
                 db.cnx.commit()
                 cur.close()
@@ -5441,12 +5456,12 @@ def processing_file_references(version: str) -> None:
         except Exception:
             pass
 
-    # Rows staged for one source blob in this run (rows of other blobs were cleared or are not recomputed)
-    staged_file_refs: set[tuple[int, int, int, int]] = set()
+    # Rows staged in this run (rows of other pairs were cleared or are not recomputed)
+    staged_file_refs: set[tuple[int, int, int, int, int]] = set()
 
     # 3. Parse Kbuild and Documentation files and stage into TableEngine (fnids come from the committed TE cache)
-    processing_kbuild(version, staged_file_refs=staged_file_refs, valid_blob_ids=valid_blob_ids, new_blob_ids=new_blob_ids)
-    processing_doc_references(version, staged_file_refs=staged_file_refs, valid_blob_ids=valid_blob_ids, new_blob_ids=new_blob_ids)
+    processing_kbuild(version, staged_file_refs=staged_file_refs, new_pairs=new_pairs)
+    processing_doc_references(version, staged_file_refs=staged_file_refs, new_pairs=new_pairs)
 
     # 4. Commit TableEngine queued rows immediately so they claim sequence IDs 1..N and empty the queue
     if m_file_reference.table_id in G.TE.queued_set and G.TE.queued_set[m_file_reference.table_id]:
@@ -5461,6 +5476,29 @@ def processing_file_references(version: str) -> None:
             G.TE.next_id[m_file_reference.table_id] = G.TE.db.get_next_id(m_file_reference)
         except Exception:
             pass
+
+
+def _maintainer_section_ids(blob_id: int, sections: Iterable[Any]) -> dict[str, int]:
+    """Section name -> sec_id of one MAINTAINERS blob (the first section of a repeated name), in one query."""
+    found: dict[str, int] = {}
+    with G.DB() as db:
+        cur = _raw_cursor(db)
+        if cur is not None:
+            try:
+                cur.execute("SELECT name, sec_id FROM m_maintainer_section WHERE blob_id = %s ORDER BY sec_id", (blob_id,))
+                for name, sec_id in cur.fetchall():
+                    if isinstance(name, (bytes, bytearray)):
+                        name = name.decode("utf-8", "replace")
+                    found.setdefault(name, int(sec_id))
+            finally:
+                cur.close()
+            return found
+    for sec in sections:
+        if sec.name and sec.name not in found:
+            row = m_maintainer_section.get(None, blob_id, sec.name, None, None, None, None, None)
+            if row and len(row) >= 3 and row[2]:
+                found[sec.name] = row[2][0]
+    return found
 
 
 def processing_maintainer_files(version: str) -> None:
@@ -5489,27 +5527,12 @@ def processing_maintainer_files(version: str) -> None:
         logger.info(f"No file patterns (F:) found in MAINTAINERS for version '{version}', skipping file matching.")
         return
 
-    maintainers_blob_id = gp.file_blob_ids.get("MAINTAINERS")
-    sec_id_cache: dict[str, int | None] = {}
-
-    def get_sec_id_for_name(name: str) -> int | None:
-        if name in sec_id_cache:
-            return sec_id_cache[name]
-        sec_row = None
-        if maintainers_blob_id is not None:
-            sec_row = m_maintainer_section.get(None, maintainers_blob_id, name, None, None, None, None, None)
-        if not sec_row:
-            sec_row = m_maintainer_section.get(None, None, name, None, None, None, None, None)
-        if sec_row and len(sec_row) >= 3 and sec_row[2]:
-            sec_id = sec_row[2][0]
-            sec_id_cache[name] = sec_id
-            return sec_id
-        sec_id_cache[name] = None
-        return None
-
-    for sec in sections:
-        if sec.name and sec.name not in sec_id_cache:
-            get_sec_id_for_name(sec.name)
+    # Sections are rows of this version's MAINTAINERS blob (also when the file did not change)
+    maintainers_blob_id = get_fid_for_path("MAINTAINERS")
+    if maintainers_blob_id is None:
+        logger.warning(f"MAINTAINERS of version '{version}' has no blob row; skipping maintainer file matching.")
+        return
+    sec_ids = _maintainer_section_ids(maintainers_blob_id, sections)
 
     try:
         file_list_raw = MF.git_file_list(gp.Version_Name)
@@ -5523,7 +5546,6 @@ def processing_maintainer_files(version: str) -> None:
 
     logger.info(f"Matching {len(all_files)} files against {len(sections)} maintainer sections for version '{version}'...")
 
-    maintainers_blob_id = get_fid_for_path("MAINTAINERS") or 1
     # Rows are keyed by the MAINTAINERS blob: files mapped for it in an earlier version need no matching
     already_mapped: set[int] = set()
     with G.DB() as db:
@@ -5550,7 +5572,7 @@ def processing_maintainer_files(version: str) -> None:
         if not matched_sections:
             continue
         for sec in matched_sections:
-            sec_id = get_sec_id_for_name(sec.name)
+            sec_id = sec_ids.get(sec.name)
             if sec_id is not None:
                 pair = (fnid, sec_id)
                 if pair in seen_pairs:

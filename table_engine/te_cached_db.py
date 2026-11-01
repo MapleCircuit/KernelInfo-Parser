@@ -45,7 +45,7 @@ from table_engine.shared_buffer import (
     SharedTableRowSequenceView,
     SharedTableSegments,
 )
-from table_engine.te_direct_db import CommitBatch, TEDirectDB
+from table_engine.te_direct_db import CommitBatch, TEDirectDB, _is_hash_keyed
 
 if TYPE_CHECKING:
     from core.TableHandling import Table
@@ -292,8 +292,7 @@ class TECachedDB(TEDirectDB):
 
         # 1. Primary Key Index
         if all(row[i] is not None for i in table.primary):
-            pk_fn = self._pk_getters.get(table_id)
-            pk = self._sanitize_key(pk_fn(row) if pk_fn is not None else itemgetter(*table.primary)(row))
+            pk = self._pk_of(table_id, row)
             self._pk_index[table_id][pk] = row
 
         # 2. Deduplication Index (for no_duplicate=True tables)
@@ -328,8 +327,7 @@ class TECachedDB(TEDirectDB):
 
         # 1. Primary Key Index
         if all(row[i] is not None for i in table.primary):
-            pk_fn = self._pk_getters.get(table_id)
-            pk = self._sanitize_key(pk_fn(row) if pk_fn is not None else itemgetter(*table.primary)(row))
+            pk = self._pk_of(table_id, row)
             self._pk_index[table_id].pop(pk, None)
 
         # 2. Deduplication Index
@@ -728,8 +726,7 @@ class TECachedDB(TEDirectDB):
         pos = len(self._cached_rows[table_id])
         self._cached_rows[table_id].append(proj_row)
         if table.primary and all(proj_row[i] is not None for i in table.primary):
-            pk_fn = self._pk_getters.get(table_id)
-            pk = self._sanitize_key(pk_fn(proj_row) if pk_fn is not None else itemgetter(*table.primary)(proj_row))
+            pk = self._pk_of(table_id, proj_row)
             self._cached_rows_pos[table_id][pk] = pos
         self._index_row(table, proj_row)
 
@@ -768,8 +765,7 @@ class TECachedDB(TEDirectDB):
         # 1. Primary Key Fast-Path
         pk_specified = all(columns[i] is not None for i in table.primary)
         if pk_specified:
-            pk_fn = self._pk_getters.get(table_id)
-            pk = self._sanitize_key(pk_fn(columns) if pk_fn is not None else itemgetter(*table.primary)(columns))
+            pk = self._pk_of(table_id, columns)
             row = self._pk_index[table_id].get(pk)
             if row is not None and self._match_columns(table, row, columns):
                 return row
@@ -944,8 +940,7 @@ class TECachedDB(TEDirectDB):
                 if existing_id is not None:
                     return (existing_id, *columns[1:])
             if table.primary and not table.no_duplicate and columns[0] is not None:
-                pk_fn = self._pk_getters.get(table_id)
-                pk = self._sanitize_key(pk_fn(columns) if pk_fn is not None else itemgetter(*table.primary)(columns))
+                pk = self._pk_of(table_id, columns)
                 existing_row = self._pk_index.get(table_id, {}).get(pk)
                 if existing_row is not None:
                     proj_row = self._project_row(table, columns)
@@ -987,8 +982,7 @@ class TECachedDB(TEDirectDB):
             pos = len(self._cached_rows[table_id])
             self._cached_rows[table_id].append(proj_row)
             if table.primary:
-                pk_fn = self._pk_getters.get(table_id)
-                pk = self._sanitize_key(pk_fn(proj_row) if pk_fn is not None else itemgetter(*table.primary)(proj_row))
+                pk = self._pk_of(table_id, proj_row)
                 self._cached_rows_pos[table_id][pk] = pos
             self._index_row(table, proj_row)
             self._index_staged_row(table_id, row)
@@ -1003,17 +997,15 @@ class TECachedDB(TEDirectDB):
             pos = len(self._cached_rows[table_id])
             self._cached_rows[table_id].append(proj_row)
             if table.primary:
-                pk_fn = self._pk_getters.get(table_id)
-                pk = self._sanitize_key(pk_fn(proj_row) if pk_fn is not None else itemgetter(*table.primary)(proj_row))
+                pk = self._pk_of(table_id, proj_row)
                 self._cached_rows_pos[table_id][pk] = pos
             self._index_row(table, proj_row)
             self._index_staged_row(table_id, row)
             return row
 
-        pk_fn = self._pk_getters.get(table_id)
-        pk = self._sanitize_key(pk_fn(columns) if pk_fn is not None else itemgetter(*table.primary)(columns))
+        pk = self._pk_of(table_id, columns)
 
-        if getattr(table, "idempotent_pk", False) or getattr(table, "init_primary", ()) == ("hash",) or table.table_name == "m_ast_hash":
+        if _is_hash_keyed(table):
             if pk in self.queued_set[table_id]:
                 return self.queued_set[table_id][pk]
             existing_row = self._pk_index[table_id].get(pk)
@@ -1057,8 +1049,7 @@ class TECachedDB(TEDirectDB):
 
         if self._is_cached(table) and self.update_in_mem_indexes:
             self._ensure_table(table_id)
-            pk_fn = self._pk_getters.get(table_id)
-            pk = self._sanitize_key(pk_fn(columns) if pk_fn is not None else itemgetter(*table.primary)(columns))
+            pk = self._pk_of(table_id, columns)
             existing_row = self._pk_index[table_id].get(pk)
             proj_row = self._project_row(table, columns)
             if existing_row is not None:
@@ -1220,11 +1211,10 @@ class TECachedDB(TEDirectDB):
             ):
                 continue
             self._ensure_table(t_id)
-            pk_fn = self._pk_getters.get(t_id)
             for row in ins_payload:
                 proj_row = self._project_row(table, row)
                 if table.primary and all(proj_row[i] is not None for i in table.primary):
-                    pk = self._sanitize_key(pk_fn(proj_row) if pk_fn is not None else itemgetter(*table.primary)(proj_row))
+                    pk = self._pk_of(t_id, proj_row)
                     if self._pk_index[t_id].get(pk) is not None:
                         continue
                     self._committed_pks.get(t_id, set()).discard(pk)

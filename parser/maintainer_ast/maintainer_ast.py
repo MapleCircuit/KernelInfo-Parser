@@ -18,15 +18,12 @@ from core.globalstuff import (
 )
 
 m_file_name = m_file = m_bridge_file = m_type_descriptor = m_ast = m_ast_container = None
-m_tag = m_bridge_tag = m_map_ast = m_bridge_map = m_moved_tag = None
 m_maintainer_person = m_maintainer_section = m_maintainer_member = None
 m_maintainer_pattern = m_maintainer_file = m_credits_entry = None
-from core.globalstuff import compute_code_hash
 
 
 def _init_tables() -> None:
     global m_file_name, m_file, m_bridge_file, m_type_descriptor, m_ast, m_ast_container
-    global m_tag, m_bridge_tag, m_map_ast, m_bridge_map, m_moved_tag
     global m_maintainer_person, m_maintainer_section, m_maintainer_member
     global m_maintainer_pattern, m_maintainer_file, m_credits_entry
     if m_file_name is not None:
@@ -38,11 +35,6 @@ def _init_tables() -> None:
     m_type_descriptor = db_layout.m_type_descriptor
     m_ast = db_layout.m_ast
     m_ast_container = db_layout.m_ast_container
-    m_tag = db_layout.m_tag
-    m_bridge_tag = db_layout.m_bridge_tag
-    m_map_ast = db_layout.m_map_ast
-    m_bridge_map = db_layout.m_bridge_map
-    m_moved_tag = db_layout.m_moved_tag
     m_maintainer_person = db_layout.m_maintainer_person
     m_maintainer_section = db_layout.m_maintainer_section
     m_maintainer_member = db_layout.m_maintainer_member
@@ -51,7 +43,8 @@ def _init_tables() -> None:
     m_credits_entry = db_layout.m_credits_entry
 
 
-from parser.c_ast import Line, get_prior_tags, close_prior_tags
+from parser.c_ast import get_prior_tags
+from parser.c_ast.tag_tracker import stage_entry_tag
 from parser.maintainer_ast.maintainer_types import (
     MaintainerRole,
     PatternType,
@@ -78,10 +71,8 @@ def maintainer_ast_parse(CS: Any) -> None:
         elif CS.file_operation == "M" or (CS.file_operation and CS.file_operation.startswith("R")):
             get_prior_tags(CS)
             MaintainerManager(CS)
-            close_prior_tags(CS)
         elif CS.file_operation == "D":
-            get_prior_tags(CS)
-            close_prior_tags(CS)
+            pass  # Tags are immutable content records: a deleted file stages nothing
         else:
             logger.warning("Unhandled file operation '%s' for %s", CS.file_operation, CS.current_path)
 
@@ -97,10 +88,8 @@ def credits_ast_parse(CS: Any) -> None:
         elif CS.file_operation == "M" or (CS.file_operation and CS.file_operation.startswith("R")):
             get_prior_tags(CS)
             CreditsManager(CS)
-            close_prior_tags(CS)
         elif CS.file_operation == "D":
-            get_prior_tags(CS)
-            close_prior_tags(CS)
+            pass  # Tags are immutable content records: a deleted file stages nothing
         else:
             logger.warning("Unhandled file operation '%s' for %s", CS.file_operation, CS.current_path)
 
@@ -250,106 +239,8 @@ class MaintainerManager:
         ast_name: str | None = None,
         ast_type: Any = None,
     ) -> Any:
-        """Create or recycle m_tag, m_bridge_tag, m_map_ast, and m_bridge_map entries."""
-        CS = self.CS
-        extent = Line(line_s, line_e)
-        extent.line_pos = (line_s, line_e)
-        extent.char_pos = (char_s, char_e)
-        extent.code = code
-
-        code_hash = compute_code_hash(code)
-        current_tag = (
-            None,
-            code_hash,
-            ast_ref,
-            0,
-            0,
-        )
-
-        if CS.prior_tags and (extent.code != ""):
-            lookup = getattr(CS, "prior_tags_map", None)
-            if lookup is not None:
-                tag_list = lookup.get(code_hash)
-                if tag_list is not None:
-                    tag_match = None
-                    for item in tag_list:
-                        if item[0] not in CS.active_tag_list:
-                            tag_match = item
-                            break
-                    if tag_match is not None:
-                        x, tag_id = tag_match
-                        if isinstance(CS.active_tag_list, set):
-                            CS.active_tag_list.add(x)
-                        else:
-                            CS.active_tag_list.append(x)
-                        with CS(REF_POS):
-                            CS.store(m_bridge_tag.set(
-                                ((m_file.table_id, 0), OP_REF, (REF_ROOT,)),
-                                tag_id,
-                                extent.line_pos[0],
-                                extent.line_pos[1],
-                                extent.char_pos[0],
-                                extent.char_pos[1],
-                            ))
-                        return tag_id
-
-        from parser.c_ast import match_prior_tag_transition
-        s_tag_id = match_prior_tag_transition(CS, extent, ast_name, ast_type)
-
-        with CS(REF_POS):
-            CS.store(m_tag.set(*current_tag))
-            tag_ref = ((m_tag.table_id, 0), OP_REF, (REF_POS, CS.route[-1]))
-            if s_tag_id is not None:
-                CS.store(m_moved_tag.set(s_tag_id, tag_ref))
-
-        with CS(REF_POS):
-            CS.store(m_bridge_tag.set(
-                ((m_file.table_id, 0), OP_REF, (REF_ROOT,)),
-                tag_ref,
-                extent.line_pos[0],
-                extent.line_pos[1],
-                extent.char_pos[0],
-                extent.char_pos[1],
-            ))
-        self._map_spatial(ast_ref, tag_ref, extent)
-        return tag_ref
-
-    def _map_spatial(self, ast_ref: Any, tag_ref: Any, extent: Line) -> None:
-        CS = self.CS
-        line_s = 1
-        char_s = 1
-        line_e = max(1, extent.line_pos[1] - extent.line_pos[0] + 1)
-        char_e = extent.char_pos[1]
-
-        ast_target = (
-            ast_ref
-            if (isinstance(ast_ref, tuple) and len(ast_ref) == 3 and ast_ref[1] == OP_REF)
-            or isinstance(ast_ref, int)
-            else CS.ref(m_ast.ast_id, *ast_ref)
-        )
-        tag_target = (
-            tag_ref
-            if (isinstance(tag_ref, tuple) and len(tag_ref) == 3 and tag_ref[1] == OP_REF)
-            or isinstance(tag_ref, int)
-            else CS.ref(m_tag.tag_id, *tag_ref)
-        )
-
-        with CS(REF_POS):
-            CS.store(m_map_ast.set(
-                tag_target,
-                line_s,
-                char_s,
-                line_e,
-                char_e,
-                ast_target,
-            ))
-        if not hasattr(CS, "register_bridge_map") or CS.register_bridge_map(tag_target, tag_target):
-            with CS(REF_POS):
-                CS.store(m_bridge_map.set(
-                    tag_target,
-                    tag_target,
-                ))
-
+        """Create or recycle the entry's m_tag, m_bridge_tag and m_map_ast rows."""
+        return stage_entry_tag(self.CS, ast_ref, line_s, line_e, char_s, char_e, code, ast_name=ast_name, ast_type=ast_type)
 
 class CreditsManager:
     """Orchestrates parsing of the CREDITS file and emits ChangeSet operations."""
@@ -465,106 +356,8 @@ class CreditsManager:
         ast_name: str | None = None,
         ast_type: Any = None,
     ) -> Any:
-        """Create or recycle m_tag, m_bridge_tag, m_map_ast, and m_bridge_map entries."""
-        CS = self.CS
-        extent = Line(line_s, line_e)
-        extent.line_pos = (line_s, line_e)
-        extent.char_pos = (char_s, char_e)
-        extent.code = code
-
-        code_hash = compute_code_hash(code)
-        current_tag = (
-            None,
-            code_hash,
-            ast_ref,
-            0,
-            0,
-        )
-
-        if CS.prior_tags and (extent.code != ""):
-            lookup = getattr(CS, "prior_tags_map", None)
-            if lookup is not None:
-                tag_list = lookup.get(code_hash)
-                if tag_list is not None:
-                    tag_match = None
-                    for item in tag_list:
-                        if item[0] not in CS.active_tag_list:
-                            tag_match = item
-                            break
-                    if tag_match is not None:
-                        x, tag_id = tag_match
-                        if isinstance(CS.active_tag_list, set):
-                            CS.active_tag_list.add(x)
-                        else:
-                            CS.active_tag_list.append(x)
-                        with CS(REF_POS):
-                            CS.store(m_bridge_tag.set(
-                                ((m_file.table_id, 0), OP_REF, (REF_ROOT,)),
-                                tag_id,
-                                extent.line_pos[0],
-                                extent.line_pos[1],
-                                extent.char_pos[0],
-                                extent.char_pos[1],
-                            ))
-                        return tag_id
-
-        from parser.c_ast import match_prior_tag_transition
-        s_tag_id = match_prior_tag_transition(CS, extent, ast_name, ast_type)
-
-        with CS(REF_POS):
-            CS.store(m_tag.set(*current_tag))
-            tag_ref = ((m_tag.table_id, 0), OP_REF, (REF_POS, CS.route[-1]))
-            if s_tag_id is not None:
-                CS.store(m_moved_tag.set(s_tag_id, tag_ref))
-
-        with CS(REF_POS):
-            CS.store(m_bridge_tag.set(
-                ((m_file.table_id, 0), OP_REF, (REF_ROOT,)),
-                tag_ref,
-                extent.line_pos[0],
-                extent.line_pos[1],
-                extent.char_pos[0],
-                extent.char_pos[1],
-            ))
-        self._map_spatial(ast_ref, tag_ref, extent)
-        return tag_ref
-
-    def _map_spatial(self, ast_ref: Any, tag_ref: Any, extent: Line) -> None:
-        CS = self.CS
-        line_s = 1
-        char_s = 1
-        line_e = max(1, extent.line_pos[1] - extent.line_pos[0] + 1)
-        char_e = extent.char_pos[1]
-
-        ast_target = (
-            ast_ref
-            if (isinstance(ast_ref, tuple) and len(ast_ref) == 3 and ast_ref[1] == OP_REF)
-            or isinstance(ast_ref, int)
-            else CS.ref(m_ast.ast_id, *ast_ref)
-        )
-        tag_target = (
-            tag_ref
-            if (isinstance(tag_ref, tuple) and len(tag_ref) == 3 and tag_ref[1] == OP_REF)
-            or isinstance(tag_ref, int)
-            else CS.ref(m_tag.tag_id, *tag_ref)
-        )
-
-        with CS(REF_POS):
-            CS.store(m_map_ast.set(
-                tag_target,
-                line_s,
-                char_s,
-                line_e,
-                char_e,
-                ast_target,
-            ))
-        if not hasattr(CS, "register_bridge_map") or CS.register_bridge_map(tag_target, tag_target):
-            with CS(REF_POS):
-                CS.store(m_bridge_map.set(
-                    tag_target,
-                    tag_target,
-                ))
-
+        """Create or recycle the entry's m_tag, m_bridge_tag and m_map_ast rows."""
+        return stage_entry_tag(self.CS, ast_ref, line_s, line_e, char_s, char_e, code, ast_name=ast_name, ast_type=ast_type)
 
 # -----------------------------------------------------------------------------
 # High-Level Query Helpers

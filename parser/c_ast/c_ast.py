@@ -5,10 +5,9 @@ Provides:
 - process_c_ast(CS): Parse and stage C-AST constructs into ChangeSet.
 - Ast_Manager: Translation unit manager coordinating Libclang parsing and tokenization.
 - TokenList: High-speed ctypes token stream with in-place Latin-1 line slicing.
-- get_prior_tags(CS), close_prior_tags(CS): Prior tag version lifecycle hooks.
+- get_prior_tags(CS): Prior version tags (recycling and transition matching).
 """
 from __future__ import annotations
-import re
 import time
 import ctypes
 import logging
@@ -25,7 +24,6 @@ from core.globalstuff import (
     REF_NO_REF,
     REF_POS,
     FILE_ERROR,
-    configure_logging,
     ASTT,
     STANDARD_C_KEYWORDS,
 )
@@ -109,34 +107,23 @@ from parser.c_ast.cursor_tree import (
 )
 from parser.c_ast.tag_tracker import (
     get_prior_tags,
-    close_prior_tags,
     match_prior_tag_transition,
     check_exact_match,
 )
 from parser.c_ast.cs_extractor import CSExtractor
 
-configure_logging(level=logging.INFO, fmt="%(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
 _WORKER_CLANG_INDEX: cc.Index | None = None
 
-_COMMENT_PATTERN = re.compile(
-    r'//.*?$|/\*.*?\*/|\'(?:\\.|[^\\\'])*\'|"(?:\\.|[^\\"])*"',
-    re.DOTALL | re.MULTILINE,
+# CXTranslationUnit flags (clang-c/Index.h) without a cindex constant
+_CXTU_IGNORE_NON_ERRORS_FROM_INCLUDED_FILES = 0x4000
+_CXTU_RETAIN_EXCLUDED_CONDITIONAL_BLOCKS = 0x8000
+_CLANG_PARSE_OPTIONS = (
+    cc.TranslationUnit.PARSE_DETAILED_PROCESSING_RECORD
+    | _CXTU_IGNORE_NON_ERRORS_FROM_INCLUDED_FILES
+    | _CXTU_RETAIN_EXCLUDED_CONDITIONAL_BLOCKS
 )
-
-
-def _comment_replacer(match: Any) -> str:
-    s = match.group(0)
-    if s.startswith("/"):
-        return "\n" * s.count("\n")
-    return s
-
-
-def comment_remover(text: str) -> str:
-    """Remove comments from C source text preserving line numbers."""
-    return _COMMENT_PATTERN.sub(_comment_replacer, text)
-
 
 def c_ast_parse(CS: Any) -> None:
     """Entry point dispatching C file parsing into ChangeSet operations."""
@@ -151,10 +138,8 @@ def c_ast_parse(CS: Any) -> None:
             elif CS.file_operation == "M" or (CS.file_operation and CS.file_operation.startswith("R")):
                 get_prior_tags(CS)
                 process_c_ast(CS)
-                close_prior_tags(CS)
             elif CS.file_operation == "D":
-                get_prior_tags(CS)
-                close_prior_tags(CS)
+                pass  # Tags are immutable content records: a deleted file stages nothing
             else:
                 logger.error(f"Unsupported file operation '{CS.file_operation}' in c_ast_parse")
         # Emit the symbol definitions/references recorded while parsing (core/SymbolRows.py)
@@ -490,14 +475,6 @@ class Ast_Manager:
         G.CURRENT_RAWFILE = self.rawfile
         file_byte_size = len(unsplit_rawfile)
 
-        cppro_cindex_input = []
-        if getattr(G, "OVERRIDE_CPPRO_CINDEX_INPUT", False):
-            cppro_cindex_input = [
-                line[6:].lstrip()
-                for line in comment_remover(unsplit_rawfile).splitlines()
-                if line.startswith("#ifdef")
-            ]
-
         global _WORKER_CLANG_INDEX
         if _WORKER_CLANG_INDEX is None:
             _WORKER_CLANG_INDEX = cc.Index.create()
@@ -514,14 +491,13 @@ class Ast_Manager:
                 "-ferror-limit=0",
                 "-w",
                 *_CLANG_KERNEL_MACRO_DEFINES,
-                *cppro_cindex_input,
                 f"-I{self.mfdir}/{inc_dir}",
                 f"-I{self.mfdir}/include",
                 f"-I{self.mfdir}/include/uapi",
                 f"-I{self.mfdir}/arch/x86/include",
                 f"-I{self.mfdir}/arch/x86/include/uapi",
             ],
-            options=(cc.TranslationUnit.PARSE_DETAILED_PROCESSING_RECORD + 32768 + 16384),
+            options=_CLANG_PARSE_OPTIONS,
         )
         t_includes_0 = time.perf_counter() if prof is not None else 0.0
 

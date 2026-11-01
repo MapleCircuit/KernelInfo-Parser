@@ -46,7 +46,7 @@ from core.DBLayout import (
 )
 from db_engine import MockDB
 from table_engine import TECachedDB
-from parser.raw_ast.raw_ast import raw_ast_parse, get_prior_tags, close_prior_tags
+from parser.raw_ast.raw_ast import raw_ast_parse
 from core.config import get_default_repo_path
 
 LINUX_REPO = str(get_default_repo_path())
@@ -89,12 +89,26 @@ class TestRawAstParser(unittest.TestCase):
         if hasattr(self, "mf") and self.mf:
             self.mf.clear_all_version()
 
+    def test_c_files_with_pipes_are_not_assembly(self) -> None:
+        """`|` in comments, multi-line #define continuations or initializers is not m68k comment syntax."""
+        ascii_table = "#ifndef _ASM_CPU_H\n#define _ASM_CPU_H\n/*\n  | Company Options| Company ID |\n */\n#define PRID_X 0x1\n#endif\n"
+        continuation = "#define FLAGS (A \\\n\t| B)\n"
+        initializer = "T table[2] = {\n\t[0] = {\n\t .flags = A\n\t | B,\n\t},\n};\n"
+        for content in (ascii_table, continuation, initializer):
+            self.assertEqual(type_check("arch/x/include/asm/foo.h", content), T_C, content)
+        m68k = "|\tfpsp.h 3.1 12/10/90\n|\n| Copyright (C) Motorola, Inc. 1990\n\t.set\tLV,-LOCAL_SIZE\n"
+        self.assertEqual(type_check("arch/m68k/fpsp040/fpsp.h", m68k), T_ASM)
+
     def test_type_check_fallback(self) -> None:
         """Verify type_check returns T_RAW for unparsed files and correct types for known files."""
         self.assertEqual(type_check("kernel/sched.c"), T_C)
         self.assertEqual(type_check("include/linux/types.h"), T_C)
         self.assertEqual(type_check("arch/x86/kernel/entry_64.S"), T_ASM)
         self.assertEqual(type_check("arch/x86/Kconfig"), T_KCONFIG)
+        # Kconfig fragments sourced by other Kconfig files (lib/Kconfig.debug, arch/x86/Kconfig.cpu...)
+        self.assertEqual(type_check("lib/Kconfig.debug"), T_KCONFIG)
+        self.assertEqual(type_check("arch/x86/Kconfig.cpu"), T_KCONFIG)
+        self.assertEqual(type_check("Documentation/kbuild/kconfig-language.txt"), T_RAW)
         self.assertEqual(type_check("rust/kernel/lib.rs"), T_RUST)
         self.assertEqual(type_check("MAINTAINERS"), T_MAINTAINERS)
         self.assertEqual(type_check("CREDITS"), T_CREDITS)
@@ -126,7 +140,7 @@ class TestRawAstParser(unittest.TestCase):
         cs.store(m_bridge_file.set(self.gp.VID, cs.ref(m_file_name.fnid), cs.ref(m_file.fid)))
 
         cs.parse()
-        # Should have staged m_ast, m_tag, m_bridge_tag, m_map_ast, m_bridge_map
+        # Should have staged m_ast, m_tag, m_bridge_tag, m_map_ast
         self.assertGreaterEqual(len(cs.cs), 7)
 
         success = cs.execute()

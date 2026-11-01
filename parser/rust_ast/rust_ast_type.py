@@ -29,14 +29,17 @@ from core.DBLayout import (
     m_ast_include,
     m_ast_debug,
     m_tag,
-    m_bridge_tag,
-    m_map_ast,
-    m_bridge_map,
     m_ast_hash,
-    m_moved_tag,
     m_blob_symbol_def,
 )
 from core.globalstuff import compute_code_hash
+from parser.c_ast.tag_tracker import (
+    check_exact_match,
+    match_prior_tag_transition,
+    stage_bridge_tag,
+    stage_new_tag,
+    stage_tag_map,
+)
 
 ChangeSetType = Any
 
@@ -168,82 +171,20 @@ class Ast_Rust:
 
         code_hash = compute_code_hash(self.extent.code)
 
-        current_tag = (
-            None,
-            code_hash,
-            ast_ref,
-            self.extent.char_pos[0],
-            max(0, self.extent.char_pos[1] - self.extent.char_pos[0]),
-        )
-
         # Prior tag recycling check
-        if CS.prior_tags:
-            lookup = getattr(CS, "prior_tags_map", None)
-            if lookup is not None and code_hash in lookup:
-                available = [
-                    (idx, tid) for idx, tid in lookup[code_hash]
-                    if idx not in CS.active_tag_list
-                ]
-                if available:
-                    chosen_idx, prior_tag_id = available[0]
-                    if isinstance(CS.active_tag_list, set):
-                        CS.active_tag_list.add(chosen_idx)
-                    else:
-                        CS.active_tag_list.append(chosen_idx)
+        prior_tag_id = check_exact_match(CS, code_hash)
+        if prior_tag_id is not None:
+            stage_bridge_tag(CS, prior_tag_id, self.extent.line_pos, self.extent.char_pos)
+            self.map_ast(CS, ast_ref, prior_tag_id, self.extent)
+            self.stage_symbol_defs(CS, prior_tag_id)
+            return
 
-                    CS.store(m_bridge_tag.set(
-                        ((m_file.table_id, 0), OP_REF, (REF_ROOT,)),
-                        prior_tag_id,
-                        self.extent.line_pos[0],
-                        self.extent.line_pos[1],
-                        self.extent.char_pos[0],
-                        self.extent.char_pos[1],
-                    ))
-                    self.map_ast(CS, ast_ref, prior_tag_id, self.extent)
-                    self.stage_symbol_defs(CS, prior_tag_id)
-                    return
-            else:
-                for x, tag in enumerate(CS.prior_tags):
-                    if x in CS.active_tag_list:
-                        continue
-                    if len(tag) > 7 and tag[7] == code_hash:
-                        if isinstance(CS.active_tag_list, set):
-                            CS.active_tag_list.add(x)
-                        else:
-                            CS.active_tag_list.append(x)
-                        CS.store(m_bridge_tag.set(
-                            ((m_file.table_id, 0), OP_REF, (REF_ROOT,)),
-                            tag[1],
-                            self.extent.line_pos[0],
-                            self.extent.line_pos[1],
-                            self.extent.char_pos[0],
-                            self.extent.char_pos[1],
-                        ))
-                        self.map_ast(CS, ast_ref, tag[1], self.extent)
-                        self.stage_symbol_defs(CS, tag[1])
-                        return
-
-        from parser.c_ast import match_prior_tag_transition
         s_tag_id = match_prior_tag_transition(CS, self.extent, getattr(self, "name", None), getattr(self, "type", None))
+        hl = (self.extent.char_pos[0], max(0, self.extent.char_pos[1] - self.extent.char_pos[0]))
+        tag_ref = stage_new_tag(CS, code_hash, ast_ref, s_tag_id, hl=hl)
+        stage_bridge_tag(CS, tag_ref, self.extent.line_pos, self.extent.char_pos)
 
-        # New Tag Creation
-        with CS(REF_POS):
-            CS.store(m_tag.set(*current_tag))
-            tag_ref = ((m_tag.table_id, 0), OP_REF, (REF_POS, CS.route[-1]))
-            if s_tag_id is not None:
-                CS.store(m_moved_tag.set(s_tag_id, tag_ref))
-
-        # Stage Bridge Tag
-        CS.store(m_bridge_tag.set(
-            ((m_file.table_id, 0), OP_REF, (REF_ROOT,)),
-            tag_ref,
-            self.extent.line_pos[0],
-            self.extent.line_pos[1],
-            self.extent.char_pos[0],
-            self.extent.char_pos[1],
-        ))
-
-        # Stage Spatial Map and Bridge Map
+        # Stage Spatial Map
         self.map_ast(CS, ast_ref, tag_ref, self.extent)
         self.stage_symbol_defs(CS, tag_ref)
 
@@ -254,13 +195,11 @@ class Ast_Rust:
         tag_route: RouteType | Any,
         extent: Line | None = None,
     ) -> None:
-        """Create m_map_ast and m_bridge_map spatial coordinate entries for this AST node."""
+        """Create the m_map_ast spatial coordinate entry (keyed by the tag) for this AST node."""
         ext = extent if extent is not None else getattr(self, "extent", None)
         if ext is None:
             return
 
-        line_s = 1
-        char_s = 1
         line_e = max(1, ext.line_pos[1] - ext.line_pos[0] + 1)
         char_e = ext.char_pos[1]
 
@@ -275,19 +214,7 @@ class Ast_Rust:
             else CS.ref(m_tag.tag_id, *tag_route)
         )
 
-        CS.store(m_map_ast.set(
-            tag_target,
-            line_s,
-            char_s,
-            line_e,
-            char_e,
-            ast_target,
-        ))
-        if not hasattr(CS, "register_bridge_map") or CS.register_bridge_map(tag_target, tag_target):
-            CS.store(m_bridge_map.set(
-                tag_target,
-                tag_target,
-            ))
+        stage_tag_map(CS, tag_target, ast_target, line_e, char_e)
 
 
 class Ast_Rust_Struct(Ast_Rust):

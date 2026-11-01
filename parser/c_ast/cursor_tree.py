@@ -11,7 +11,9 @@ from __future__ import annotations
 import logging
 from collections import deque
 from pathlib import Path
-from typing import Any
+import ctypes
+import os
+from typing import Any, Callable
 import clang.cindex as cc
 
 from core.globalstuff import (
@@ -4191,128 +4193,9 @@ class Zone:
             if sp:
                 node.name = sp
             return node
-        k = getattr(cursor, "kind", None) if cursor is not None else None
-        if k in (cc.CursorKind.DECL_STMT, cc.CursorKind.VAR_DECL, cc.CursorKind.FIELD_DECL, cc.CursorKind.PARM_DECL):
-            return C_Type(extent, End_Mode.Extent, cursor=cursor)
-        elif k == cc.CursorKind.IF_STMT:
-            return Ast_IfStmt(extent, end_mode=End_Mode.Extent, cursor=cursor)
-        elif k == cc.CursorKind.SWITCH_STMT:
-            return Ast_SwitchStmt(extent, end_mode=End_Mode.Extent, cursor=cursor)
-        elif k == cc.CursorKind.CASE_STMT:
-            return Ast_CaseStmt(extent, end_mode=End_Mode.Extent, cursor=cursor)
-        elif k == cc.CursorKind.DEFAULT_STMT:
-            return Ast_DefaultStmt(extent, end_mode=End_Mode.Extent, cursor=cursor)
-        elif k == cc.CursorKind.WHILE_STMT:
-            return Ast_WhileStmt(extent, end_mode=End_Mode.Extent, cursor=cursor)
-        elif k == cc.CursorKind.DO_STMT:
-            return Ast_DoStmt(extent, end_mode=End_Mode.Extent, cursor=cursor)
-        elif k == cc.CursorKind.FOR_STMT:
-            return Ast_ForStmt(extent, end_mode=End_Mode.Extent, cursor=cursor)
-        elif k == cc.CursorKind.RETURN_STMT:
-            return Ast_ReturnStmt(extent, end_mode=End_Mode.Extent, cursor=cursor)
-        elif k == cc.CursorKind.BREAK_STMT:
-            return Ast_BreakStmt(extent, end_mode=End_Mode.Extent, cursor=cursor)
-        elif k == cc.CursorKind.CONTINUE_STMT:
-            return Ast_ContinueStmt(extent, end_mode=End_Mode.Extent, cursor=cursor)
-        elif k == cc.CursorKind.GOTO_STMT:
-            return Ast_GotoStmt(extent, end_mode=End_Mode.Extent, cursor=cursor)
-        elif k == cc.CursorKind.LABEL_STMT:
-            return Ast_LabelStmt(extent, end_mode=End_Mode.Extent, cursor=cursor)
-        elif (
-            k in (getattr(cc.CursorKind, "ASM_STMT", None), getattr(cc.CursorKind, "MS_ASM_STMT", None))
-            or (k and getattr(k, "name", "").endswith("ASM_STMT"))
-        ):
-            return Ast_AsmStmt(extent, end_mode=End_Mode.Extent, cursor=cursor)
-        elif k == cc.CursorKind.CALL_EXPR:
-            return Ast_CallExpr(extent, end_mode=End_Mode.Extent, cursor=cursor)
-        elif k == cc.CursorKind.MEMBER_REF_EXPR:
-            return Ast_MemberRefExpr(extent, end_mode=End_Mode.Extent, cursor=cursor)
-        elif k == cc.CursorKind.DECL_REF_EXPR:
-            return Ast_DeclRefExpr(extent, end_mode=End_Mode.Extent, cursor=cursor)
-        elif k == cc.CursorKind.MACRO_INSTANTIATION:
-            return Ast_MacroRefExpr(extent, sp, end_mode=End_Mode.Extent, cursor=cursor)
-        elif k == cc.CursorKind.BINARY_OPERATOR:
-            return Ast_BinaryOperator(extent, end_mode=End_Mode.Extent, cursor=cursor)
-        elif k == cc.CursorKind.UNARY_OPERATOR:
-            return Ast_UnaryOperator(extent, end_mode=End_Mode.Extent, cursor=cursor)
-        elif k == cc.CursorKind.COMPOUND_STMT:
-            return Ast_CompoundStmt(extent, end_mode=End_Mode.Extent, cursor=cursor)
-        elif k == cc.CursorKind.CSTYLE_CAST_EXPR:
-            return Ast_CastExpr(extent, end_mode=End_Mode.Extent, cursor=cursor)
-        elif k == cc.CursorKind.CONDITIONAL_OPERATOR:
-            return Ast_ConditionalOperator(extent, end_mode=End_Mode.Extent, cursor=cursor)
-        elif k == cc.CursorKind.ARRAY_SUBSCRIPT_EXPR:
-            return Ast_ArraySubscriptExpr(extent, end_mode=End_Mode.Extent, cursor=cursor)
-        elif k == getattr(cc.CursorKind, "DESIGNATED_INIT_EXPR", None):
-            return Ast_DesignatedInitExpr(extent, end_mode=End_Mode.Extent, cursor=cursor)
-        elif k == getattr(cc.CursorKind, "COMPOUND_ASSIGNMENT_OPERATOR", None):
-            return Ast_CompoundAssignOperator(extent, end_mode=End_Mode.Extent, cursor=cursor)
-        elif k == getattr(cc.CursorKind, "COMPOUND_LITERAL_EXPR", None):
-            return Ast_CompoundLiteralExpr(extent, end_mode=End_Mode.Extent, cursor=cursor)
-        elif k == getattr(cc.CursorKind, "INDIRECT_GOTO_STMT", None):
-            return Ast_IndirectGotoStmt(extent, end_mode=End_Mode.Extent, cursor=cursor)
-        elif k == getattr(cc.CursorKind, "ADDR_LABEL_EXPR", None):
-            return Ast_AddrLabelExpr(extent, end_mode=End_Mode.Extent, cursor=cursor)
-        elif k == getattr(cc.CursorKind, "NULL_STMT", None):
-            return Ast_NullStmt(extent, end_mode=End_Mode.Extent, cursor=cursor)
-        elif k == getattr(cc.CursorKind, "PAREN_EXPR", None):
-            return Ast_ParenExpr(extent, end_mode=End_Mode.Extent, cursor=cursor)
-        elif k in (getattr(cc.CursorKind, "CXX_UNARY_EXPR", None), getattr(cc.CursorKind, "UNARY_EXPR", None)):
-            if cursor is not None:
-                sp_lower = (safe_cursor_spelling(cursor) or "").lower()
-                if "alignof" in sp_lower:
-                    return Ast_AlignofExpr(extent, end_mode=End_Mode.Extent, cursor=cursor)
-                if hasattr(cursor, "get_tokens"):
-                    for t in cursor.get_tokens():
-                        tsp = (getattr(t, "spelling", "") or "").lower()
-                        if "alignof" in tsp:
-                            return Ast_AlignofExpr(extent, end_mode=End_Mode.Extent, cursor=cursor)
-                        break
-            return Ast_SizeofExpr(extent, end_mode=End_Mode.Extent, cursor=cursor)
-        elif k == getattr(cc.CursorKind, "ATOMIC_EXPR", None):
-            return Ast_AtomicExpr(extent, end_mode=End_Mode.Extent, cursor=cursor)
-        elif k in (getattr(cc.CursorKind, "StmtExpr", None), getattr(cc.CursorKind, "STMT_EXPR", None)):
-            return Ast_StmtExpr(extent, end_mode=End_Mode.Extent, cursor=cursor)
-        elif k == getattr(cc.CursorKind, "GENERIC_SELECTION_EXPR", None):
-            return Ast_GenericSelectionExpr(extent, end_mode=End_Mode.Extent, cursor=cursor)
-        elif k == getattr(cc.CursorKind, "VA_ARG_EXPR", None):
-            return Ast_VaArgExpr(extent, end_mode=End_Mode.Extent, cursor=cursor)
-        elif k == getattr(cc.CursorKind, "STATIC_ASSERT", None):
-            return Ast_StaticAssert(extent, end_mode=End_Mode.Extent, cursor=cursor)
-        elif k == getattr(cc.CursorKind, "LABEL_REF", None):
-            return Ast_LabelRef(extent, end_mode=End_Mode.Extent, cursor=cursor)
-        elif k == getattr(cc.CursorKind, "INTEGER_LITERAL", None):
-            node = Ast_IntegerLiteral(extent, end_mode=End_Mode.Extent, cursor=cursor)
-            if not sp and cursor is not None:
-                for t in cursor.get_tokens():
-                    sp = t.spelling
-                    break
-            if sp:
-                node.name = sp
-            return node
-        elif k == getattr(cc.CursorKind, "FLOATING_LITERAL", None):
-            node = Ast_FloatingLiteral(extent, end_mode=End_Mode.Extent, cursor=cursor)
-            if not sp and cursor is not None:
-                for t in cursor.get_tokens():
-                    sp = t.spelling
-                    break
-            if sp:
-                node.name = sp
-            return node
-        elif k == getattr(cc.CursorKind, "STRING_LITERAL", None):
-            node = Ast_StringLiteral(extent, end_mode=End_Mode.Extent, cursor=cursor)
-            if sp:
-                node.name = sp
-            return node
-        elif k == getattr(cc.CursorKind, "CHARACTER_LITERAL", None):
-            node = Ast_CharacterLiteral(extent, end_mode=End_Mode.Extent, cursor=cursor)
-            if not sp and cursor is not None:
-                for t in cursor.get_tokens():
-                    sp = t.spelling
-                    break
-            if sp:
-                node.name = sp
-            return node
+        factory = _child_node_factories().get(getattr(cursor, "kind", None) if cursor is not None else None)
+        if factory is not None:
+            return factory(extent, cursor, sp)
         node = self.ast_type(extent, End_Mode.Extent, cursor=cursor)
         if sp:
             node.name = sp
@@ -4714,3 +4597,103 @@ class SemanticPartitioner:
         self.main_zone.gen_lined_dict()
         self.main_zone.resolve_cppro_scopes()
         return self.main_zone
+
+
+def _first_token_spelling(cursor: Any) -> str:
+    for t in cursor.get_tokens():
+        return t.spelling
+    return ""
+
+
+def _named_node(cls: type) -> Callable[[Line, Any, str], Ast]:
+    """Factory of a literal node named after its spelling (or its first token)."""
+    def make(extent: Line, cursor: Any, sp: str) -> Ast:
+        node = cls(extent, end_mode=End_Mode.Extent, cursor=cursor)
+        name = sp or (_first_token_spelling(cursor) if cls is not Ast_StringLiteral and cursor is not None else "")
+        if name:
+            node.name = name
+        return node
+    return make
+
+
+def _unary_expr_node(extent: Line, cursor: Any, sp: str) -> Ast:
+    """sizeof / alignof (`UNARY_EXPR`): alignof when the spelling or the first token says so."""
+    if cursor is not None:
+        if "alignof" in (safe_cursor_spelling(cursor) or "").lower():
+            return Ast_AlignofExpr(extent, end_mode=End_Mode.Extent, cursor=cursor)
+        if "alignof" in _first_token_spelling(cursor).lower():
+            return Ast_AlignofExpr(extent, end_mode=End_Mode.Extent, cursor=cursor)
+    return Ast_SizeofExpr(extent, end_mode=End_Mode.Extent, cursor=cursor)
+
+
+_CHILD_NODE_FACTORIES: dict[Any, Callable[[Line, Any, str], Ast]] | None = None
+
+
+def _child_node_factories() -> dict[Any, Callable[[Line, Any, str], Ast]]:
+    """CursorKind -> child node factory for `Zone._create_child_node()` (built once; kinds the installed
+    cindex lacks are skipped)."""
+    global _CHILD_NODE_FACTORIES
+    if _CHILD_NODE_FACTORIES is not None:
+        return _CHILD_NODE_FACTORIES
+
+    def plain(cls: type) -> Callable[[Line, Any, str], Ast]:
+        return lambda extent, cursor, sp: cls(extent, end_mode=End_Mode.Extent, cursor=cursor)
+
+    by_name: dict[str, Callable[[Line, Any, str], Ast]] = {
+        "IF_STMT": plain(Ast_IfStmt),
+        "SWITCH_STMT": plain(Ast_SwitchStmt),
+        "CASE_STMT": plain(Ast_CaseStmt),
+        "DEFAULT_STMT": plain(Ast_DefaultStmt),
+        "WHILE_STMT": plain(Ast_WhileStmt),
+        "DO_STMT": plain(Ast_DoStmt),
+        "FOR_STMT": plain(Ast_ForStmt),
+        "RETURN_STMT": plain(Ast_ReturnStmt),
+        "BREAK_STMT": plain(Ast_BreakStmt),
+        "CONTINUE_STMT": plain(Ast_ContinueStmt),
+        "GOTO_STMT": plain(Ast_GotoStmt),
+        "LABEL_STMT": plain(Ast_LabelStmt),
+        "CALL_EXPR": plain(Ast_CallExpr),
+        "MEMBER_REF_EXPR": plain(Ast_MemberRefExpr),
+        "DECL_REF_EXPR": plain(Ast_DeclRefExpr),
+        "MACRO_INSTANTIATION": lambda extent, cursor, sp: Ast_MacroRefExpr(extent, sp, end_mode=End_Mode.Extent, cursor=cursor),
+        "BINARY_OPERATOR": plain(Ast_BinaryOperator),
+        "UNARY_OPERATOR": plain(Ast_UnaryOperator),
+        "COMPOUND_STMT": plain(Ast_CompoundStmt),
+        "CSTYLE_CAST_EXPR": plain(Ast_CastExpr),
+        "CONDITIONAL_OPERATOR": plain(Ast_ConditionalOperator),
+        "ARRAY_SUBSCRIPT_EXPR": plain(Ast_ArraySubscriptExpr),
+        "DESIGNATED_INIT_EXPR": plain(Ast_DesignatedInitExpr),
+        "COMPOUND_ASSIGNMENT_OPERATOR": plain(Ast_CompoundAssignOperator),
+        "COMPOUND_LITERAL_EXPR": plain(Ast_CompoundLiteralExpr),
+        "INDIRECT_GOTO_STMT": plain(Ast_IndirectGotoStmt),
+        "ADDR_LABEL_EXPR": plain(Ast_AddrLabelExpr),
+        "NULL_STMT": plain(Ast_NullStmt),
+        "PAREN_EXPR": plain(Ast_ParenExpr),
+        "CXX_UNARY_EXPR": _unary_expr_node,
+        "UNARY_EXPR": _unary_expr_node,
+        "ATOMIC_EXPR": plain(Ast_AtomicExpr),
+        "StmtExpr": plain(Ast_StmtExpr),
+        "STMT_EXPR": plain(Ast_StmtExpr),
+        "GENERIC_SELECTION_EXPR": plain(Ast_GenericSelectionExpr),
+        "VA_ARG_EXPR": plain(Ast_VaArgExpr),
+        "STATIC_ASSERT": plain(Ast_StaticAssert),
+        "LABEL_REF": plain(Ast_LabelRef),
+        "INTEGER_LITERAL": _named_node(Ast_IntegerLiteral),
+        "FLOATING_LITERAL": _named_node(Ast_FloatingLiteral),
+        "STRING_LITERAL": _named_node(Ast_StringLiteral),
+        "CHARACTER_LITERAL": _named_node(Ast_CharacterLiteral),
+    }
+    table: dict[Any, Callable[[Line, Any, str], Ast]] = {
+        kind: (lambda extent, cursor, sp: C_Type(extent, End_Mode.Extent, cursor=cursor))
+        for kind in (cc.CursorKind.DECL_STMT, cc.CursorKind.VAR_DECL, cc.CursorKind.FIELD_DECL, cc.CursorKind.PARM_DECL)
+    }
+    for name, factory in by_name.items():
+        kind = getattr(cc.CursorKind, name, None)
+        if kind is not None:
+            table.setdefault(kind, factory)
+    # Every inline assembly statement kind (ASM_STMT, MS_ASM_STMT, ...)
+    for kind in cc.CursorKind:
+        if kind.name.endswith("ASM_STMT"):
+            table.setdefault(kind, plain(Ast_AsmStmt))
+    _CHILD_NODE_FACTORIES = table
+    return table

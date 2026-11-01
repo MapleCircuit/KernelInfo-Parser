@@ -813,7 +813,7 @@ class KconfigParser:
     def _parse_or_expr(self) -> KconfigExpr | None:
         left = self._parse_and_expr()
         while self._current().type == TokenType.PIPE_PIPE:
-            op_tok = self._advance()
+            self._advance()
             right = self._parse_and_expr()
             if left and right:
                 left = KconfigExpr(
@@ -830,7 +830,7 @@ class KconfigParser:
     def _parse_and_expr(self) -> KconfigExpr | None:
         left = self._parse_not_expr()
         while self._current().type == TokenType.AMP_AMP:
-            op_tok = self._advance()
+            self._advance()
             right = self._parse_not_expr()
             if left and right:
                 left = KconfigExpr(

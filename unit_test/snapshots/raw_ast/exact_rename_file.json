@@ -77,12 +77,6 @@
         "ast_id": "$ast_0"
       }
     ],
-    "m_bridge_map": [
-      {
-        "tag_id": "$tag_0",
-        "map_id": "$tag_0"
-      }
-    ],
     "m_git_ref": [
       {
         "ref_id": 1,

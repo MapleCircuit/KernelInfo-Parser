@@ -280,9 +280,7 @@ class TEDirectDB:
                         k = self._sanitize_key(row[1:])
                         self._committed_nodup_keys[table_id][k] = row[0]
                     if table.primary:
-                        pk_fn = self._pk_getters.get(table_id)
-                        pk = self._sanitize_key(pk_fn(row) if pk_fn is not None else itemgetter(*table.primary)(row))
-                        self._committed_pks[table_id].add(pk)
+                        self._committed_pks[table_id].add(self._pk_of(table_id, row))
             if self.db is not None:
                 try:
                     self.next_id[table_id] = self.db.get_next_id(table)
@@ -355,6 +353,50 @@ class TEDirectDB:
                             else:
                                 bucket.append(row)
 
+    def _pk_of(self, table_id: int, row: tuple[SafeDataType, ...]) -> Any:
+        """Hashable primary key of `row` in `table_id`."""
+        pk_fn = self._pk_getters.get(table_id)
+        return self._sanitize_key(pk_fn(row) if pk_fn is not None else itemgetter(*self.tables[table_id].primary)(row))
+
+    @staticmethod
+    def _row_matches(row: tuple[SafeDataType, ...], columns: tuple[SafeDataType, ...]) -> bool:
+        """Whether `row` has every non-None value of `columns` at its position."""
+        for i, val in enumerate(columns):
+            if val is not None and (i >= len(row) or row[i] != val):
+                return False
+        return True
+
+    def _find_staged(
+        self,
+        table_id: int,
+        columns: tuple[SafeDataType, ...],
+        staged_rows: Callable[[], Iterable[tuple[SafeDataType, ...]]],
+    ) -> tuple[SafeDataType, ...] | None:
+        """First staged row matching a partial filter: through a secondary index, else the most selective
+        single-column index, else a scan of `staged_rows()`. An index answers definitively (no scan after it)."""
+        matches = self._row_matches
+        sec_dict = self._queued_sec_indexes.get(table_id, {})
+        for col_positions in self._table_sec_indexes.get(table_id, ()):
+            if all(c < len(columns) and columns[c] is not None for c in col_positions):
+                key = tuple(self._sanitize_key(columns[c]) for c in col_positions)
+                return next((r for r in sec_dict.get(col_positions, {}).get(key, ()) if matches(r, columns)), None)
+
+        single_dict = self._queued_single_col_indexes.get(table_id, {})
+        matching_cols = [
+            c for c in self._table_single_col_indexes.get(table_id, ()) if c < len(columns) and columns[c] is not None
+        ]
+        if matching_cols:
+            best: list[tuple[SafeDataType, ...]] | None = None
+            for c in matching_cols:
+                candidates = single_dict.get(c, {}).get(self._sanitize_key(columns[c]))
+                if candidates is None:
+                    return None
+                if best is None or len(candidates) < len(best):
+                    best = candidates
+            return next((r for r in best if matches(r, columns)), None)
+
+        return next((r for r in staged_rows() if matches(r, columns)), None)
+
     def get(
         self,
         table_id: int,
@@ -368,10 +410,10 @@ class TEDirectDB:
 
         Process:
             1. Staging check in `queued_set`:
-               - If `no_duplicate=True`: checks staged dictionary using `columns[1:]`.
+               - If `no_duplicate=True` with a full key: checks the staged and committed key maps.
                - If explicit PK provided: checks staged dictionary via PK key.
                - Otherwise: consults secondary and single-column queue indexes in O(1)
-                 before falling back to scanning staged dictionary entries.
+                 before falling back to scanning staged dictionary entries (`_find_staged()`).
             2. Emptiness guard: If table has `has_auto_increment=True`, `initial_insert=None`,
                and `next_id <= 1`, returns `None` immediately without issuing SQL queries.
             3. Fallback: Executes direct database select via `self.db.select(table, columns)`.
@@ -382,160 +424,30 @@ class TEDirectDB:
         table = self.tables[table_id]
 
         # 1. Staging check in queued_set
-        if table_id in self.queued_set:
-            if table.no_duplicate:
-                if len(columns) > 1 and all(c is not None for c in columns[1:]):
-                    key = self._sanitize_key(columns[1:])
-                    cached_id = self.queued_set[table_id].get(key)
-                    if cached_id is not None:
-                        row = (cached_id, *columns[1:])
-                        if columns[0] is None or row[0] == columns[0]:
-                            return row
-                    committed_id = self._committed_nodup_keys.get(table_id, {}).get(key)
-                    if committed_id is not None:
-                        row = (committed_id, *columns[1:])
-                        if columns[0] is None or row[0] == columns[0]:
-                            return row
-                else:
-                    found_sec_index = False
-                    sec_indexes = self._table_sec_indexes.get(table_id)
-                    if sec_indexes and table_id in self._queued_sec_indexes:
-                        sec_dict = self._queued_sec_indexes[table_id]
-                        for col_positions in sec_indexes:
-                            if all(c < len(columns) and columns[c] is not None for c in col_positions):
-                                found_sec_index = True
-                                key = tuple(self._sanitize_key(columns[c]) for c in col_positions)
-                                candidates = sec_dict.get(col_positions, {}).get(key)
-                                if candidates:
-                                    for staged_row in candidates:
-                                        match = True
-                                        for i, val in enumerate(columns):
-                                            if val is not None and (i >= len(staged_row) or staged_row[i] != val):
-                                                match = False
-                                                break
-                                        if match:
-                                            return staged_row
-                                break
-
-                    if not found_sec_index:
-                        single_indexes = self._table_single_col_indexes.get(table_id)
-                        if single_indexes and table_id in self._queued_single_col_indexes:
-                            single_dict = self._queued_single_col_indexes[table_id]
-                            matching_cols = [
-                                c for c in single_indexes
-                                if c < len(columns) and columns[c] is not None
-                            ]
-                            if matching_cols:
-                                best_candidates: list[tuple[SafeDataType, ...]] | None = None
-                                for c in matching_cols:
-                                    val_key = self._sanitize_key(columns[c])
-                                    c_candidates = single_dict.get(c, {}).get(val_key)
-                                    if c_candidates is None:
-                                        best_candidates = None
-                                        found_sec_index = True
-                                        break
-                                    if best_candidates is None or len(c_candidates) < len(best_candidates):
-                                        best_candidates = c_candidates
-                                        found_sec_index = True
-
-                                if best_candidates is not None:
-                                    for staged_row in best_candidates:
-                                        match = True
-                                        for i, val in enumerate(columns):
-                                            if val is not None and (i >= len(staged_row) or staged_row[i] != val):
-                                                match = False
-                                                break
-                                        if match:
-                                            return staged_row
-
-                    if not found_sec_index:
-                        for k, v in self.queued_set[table_id].items():
-                            staged_row = (v, *k) if isinstance(k, tuple) else (v, k)
-                            match = True
-                            for i, val in enumerate(columns):
-                                if val is not None and (i >= len(staged_row) or staged_row[i] != val):
-                                    match = False
-                                    break
-                            if match:
-                                return staged_row
+        staged = self.queued_set.get(table_id)
+        if staged is not None:
+            if table.no_duplicate and len(columns) > 1 and all(c is not None for c in columns[1:]):
+                key = self._sanitize_key(columns[1:])
+                for known_id in (staged.get(key), self._committed_nodup_keys.get(table_id, {}).get(key)):
+                    if known_id is not None and (columns[0] is None or known_id == columns[0]):
+                        return (known_id, *columns[1:])
+            elif table.no_duplicate:
+                row = self._find_staged(
+                    table_id, columns, lambda: ((v, *k) if isinstance(k, tuple) else (v, k) for k, v in staged.items())
+                )
+                if row is not None:
+                    return row
+            elif all(columns[i] is not None for i in table.primary):
+                row = staged.get(self._pk_of(table_id, columns))
+                if row is not None and self._row_matches(row, columns):
+                    return row
             else:
-                pk_specified = all(columns[i] is not None for i in table.primary)
-                if pk_specified:
-                    pk_fn = self._pk_getters.get(table_id)
-                    pk = self._sanitize_key(pk_fn(columns) if pk_fn is not None else itemgetter(*table.primary)(columns))
-                    staged_row = self.queued_set[table_id].get(pk)
-                    if staged_row is not None:
-                        match = True
-                        for i, val in enumerate(columns):
-                            if val is not None and (i >= len(staged_row) or staged_row[i] != val):
-                                match = False
-                                break
-                        if match:
-                            return staged_row
-                else:
-                    found_sec_index = False
-                    sec_indexes = self._table_sec_indexes.get(table_id)
-                    if sec_indexes and table_id in self._queued_sec_indexes:
-                        sec_dict = self._queued_sec_indexes[table_id]
-                        for col_positions in sec_indexes:
-                            if all(c < len(columns) and columns[c] is not None for c in col_positions):
-                                found_sec_index = True
-                                key = tuple(self._sanitize_key(columns[c]) for c in col_positions)
-                                candidates = sec_dict.get(col_positions, {}).get(key)
-                                if candidates:
-                                    for staged_row in candidates:
-                                        match = True
-                                        for i, val in enumerate(columns):
-                                            if val is not None and (i >= len(staged_row) or staged_row[i] != val):
-                                                match = False
-                                                break
-                                        if match:
-                                            return staged_row
-                                break
-
-                    if not found_sec_index:
-                        single_indexes = self._table_single_col_indexes.get(table_id)
-                        if single_indexes and table_id in self._queued_single_col_indexes:
-                            single_dict = self._queued_single_col_indexes[table_id]
-                            matching_cols = [
-                                c for c in single_indexes
-                                if c < len(columns) and columns[c] is not None
-                            ]
-                            if matching_cols:
-                                best_candidates: list[tuple[SafeDataType, ...]] | None = None
-                                for c in matching_cols:
-                                    val_key = self._sanitize_key(columns[c])
-                                    c_candidates = single_dict.get(c, {}).get(val_key)
-                                    if c_candidates is None:
-                                        best_candidates = None
-                                        found_sec_index = True
-                                        break
-                                    if best_candidates is None or len(c_candidates) < len(best_candidates):
-                                        best_candidates = c_candidates
-                                        found_sec_index = True
-
-                                if best_candidates is not None:
-                                    for staged_row in best_candidates:
-                                        match = True
-                                        for i, val in enumerate(columns):
-                                            if val is not None and (i >= len(staged_row) or staged_row[i] != val):
-                                                match = False
-                                                break
-                                        if match:
-                                            return staged_row
-
-                    if not found_sec_index:
-                        for staged_row in self.queued_set[table_id].values():
-                            match = True
-                            for i, val in enumerate(columns):
-                                if val is not None and (i >= len(staged_row) or staged_row[i] != val):
-                                    match = False
-                                    break
-                            if match:
-                                return staged_row
+                row = self._find_staged(table_id, columns, staged.values)
+                if row is not None:
+                    return row
 
         # 2. Emptiness guard: Table has never received data and has no seed insert
-        if getattr(table, "has_auto_increment", True) and table.initial_insert is None and self.next_id.get(table_id, 0) <= 1 and (table_id not in self.queued_set or not self.queued_set[table_id]):
+        if getattr(table, "has_auto_increment", True) and table.initial_insert is None and self.next_id.get(table_id, 0) <= 1 and not staged:
             return None
 
         if self.db is None:
@@ -616,8 +528,12 @@ class TEDirectDB:
                             if existing_rows:
                                 return existing_rows[0]
                         committed_u = self._committed_unique_keys.get(table_id, {}).get(col_positions)
-                        if committed_u and u_key in committed_u:
-                            return (None, *columns[1:])
+                        if committed_u and u_key in committed_u and self.db is not None:
+                            # Written by an earlier commit: return the stored row (its id), not a row without one
+                            filter_cols = tuple(columns[c] if c in col_positions else None for c in range(len(columns)))
+                            existing = self._db_read((table_id,), self.db.select, table, filter_cols)
+                            if existing:
+                                return tuple(existing)
 
             assigned_id = self.next_id[table_id]
             row = (assigned_id, *columns[1:])
@@ -626,9 +542,8 @@ class TEDirectDB:
             self._index_staged_row(table_id, row)
             return row
 
-        pk_fn = self._pk_getters.get(table_id)
-        pk = self._sanitize_key(pk_fn(columns) if pk_fn is not None else itemgetter(*table.primary)(columns))
-        if getattr(table, "idempotent_pk", False) or getattr(table, "init_primary", ()) == ("hash",) or table.table_name == "m_ast_hash":
+        pk = self._pk_of(table_id, columns)
+        if _is_hash_keyed(table):
             if pk in self.queued_set[table_id]:
                 return self.queued_set[table_id][pk]
             if pk in self._committed_pks.get(table_id, set()):
@@ -955,7 +870,8 @@ class TEDirectDB:
                     added: list[Any] = []
                     rows = []
                     for k, v in staged_set.items():
-                        if k in committed_map:
+                        # A key memoized as absent (None, TECachedDB._committed_nodup_id) is not written yet
+                        if committed_map.get(k) is not None:
                             continue
                         row = v if isinstance(v, (tuple, list)) else ((v, *k) if isinstance(k, tuple) else (v, k))
                         rows.append(row)

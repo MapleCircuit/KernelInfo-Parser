@@ -40,25 +40,21 @@ from core.TableHandling import ChangeSet
 logger = logging.getLogger("core.GreatProcessor")
 
 
+_MISSING = object()
+
+
 class CompressedChangeSetDict(dict):
     """Memory-optimized dictionary that compresses ChangeSet objects in RAM.
 
-    Maintains a small LRU cache in decompressed memory, while keeping all other
-    queued ChangeSets as compact zlib byte buffers.
+    Executed (evacuated) ChangeSets are kept as they are; the others stay uncompressed in a small LRU cache
+    and are pickled and zlib-compressed when they leave it. An entry handed out by `[]`/`get()` may be
+    mutated by the caller, so an evicted entry is always compressed again.
     """
 
     @staticmethod
     def _is_evacuated(val: Any) -> bool:
-        """Return True if val is an evacuated ChangeSet whose internal AST buffers are empty."""
-        if val is None:
-            return False
-        if getattr(val, "cs_processed", False):
-            cs_ops = getattr(val, "cs", None)
-            if not cs_ops or len(cs_ops) == 0:
-                s_dict = getattr(val, "store_dict", None)
-                if not s_dict or len(s_dict) == 0:
-                    return True
-        return False
+        """Return True if val is an executed ChangeSet whose internal AST buffers are empty."""
+        return bool(val is not None and getattr(val, "cs_processed", False) and not getattr(val, "cs", None) and not getattr(val, "store_dict", None))
 
     def __init__(self, lru_cache_size: int = 500, *args: Any, **kwargs: Any) -> None:
         super().__init__()
@@ -67,163 +63,107 @@ class CompressedChangeSetDict(dict):
         self._compressed_store: dict[str, bytes | None] = {}
         self._lru_cache: OrderedDict[str, Any] = OrderedDict()
         self._lru_size = lru_cache_size
-        self._dirty_keys: set[str] = set()
-        self._raw_crcs: dict[str, int] = {}
         if args or kwargs:
             self.update(*args, **kwargs)
 
-    def flush_dirty(self) -> None:
-        """Compress any dirty items currently in LRU cache to update the compressed store."""
-        for k in list(self._dirty_keys):
-            v = self._lru_cache.get(k)
-            if v is not None:
-                if self._is_evacuated(v):
-                    self._compressed_store.pop(k, None)
-                    self._raw_crcs.pop(k, None)
-                    self._evacuated_store[k] = v
-                    self._dirty_keys.discard(k)
-                    continue
+    def _compress(self, key: str, value: Any) -> bool:
+        """Pickle and compress `value` into the compressed store (without its process-local references)."""
+        saved = {attr: getattr(value, attr, None) for attr in ("gp", "mf", "batch_cs_dict")}
+        try:
+            for attr, val in saved.items():
+                if val is not None:
+                    setattr(value, attr, None)
+            self._compressed_store[key] = zlib.compress(pickle.dumps(value, protocol=pickle.HIGHEST_PROTOCOL), level=1)
+            return True
+        except Exception as e:
+            logger.warning(f"[CompressedChangeSetDict] Failed to compress '{key}': {e}")
+            return False
+        finally:
+            for attr, val in saved.items():
+                if val is not None:
+                    setattr(value, attr, val)
 
-                orig_gp = getattr(v, "gp", None)
-                orig_mf = getattr(v, "mf", None)
-                orig_batch = getattr(v, "batch_cs_dict", None)
-                try:
-                    if orig_gp is not None:
-                        v.gp = None
-                    if orig_mf is not None:
-                        v.mf = None
-                    if orig_batch is not None:
-                        v.batch_cs_dict = None
-                    raw_bytes = pickle.dumps(v, protocol=pickle.HIGHEST_PROTOCOL)
-                    self._compressed_store[k] = zlib.compress(raw_bytes, level=1)
-                    self._raw_crcs[k] = zlib.crc32(raw_bytes)
-                except Exception as e:
-                    logger.warning(f"[CompressedChangeSetDict] Failed to flush/recompress '{k}': {e}")
-                finally:
-                    if orig_gp is not None:
-                        v.gp = orig_gp
-                    if orig_mf is not None:
-                        v.mf = orig_mf
-                    if orig_batch is not None:
-                        v.batch_cs_dict = orig_batch
-            self._dirty_keys.discard(k)
-
-    def __reduce__(self) -> tuple[Any, ...]:
-        self.flush_dirty()
-        return (CompressedChangeSetDict, (getattr(self, "_lru_size", 500),), {
-            "_all_keys": getattr(self, "_all_keys", set()),
-            "_evacuated_store": getattr(self, "_evacuated_store", {}),
-            "_compressed_store": getattr(self, "_compressed_store", {}),
-            "_lru_cache": getattr(self, "_lru_cache", OrderedDict()),
-            "_lru_size": getattr(self, "_lru_size", 500),
-            "_dirty_keys": getattr(self, "_dirty_keys", set()),
-            "_raw_crcs": getattr(self, "_raw_crcs", {}),
-        })
-
-    def _evict_lru(self) -> None:
-        """Evict oldest entries from LRU cache and re-compress only mutated, dirty, or uncompressed items."""
-        while len(self._lru_cache) > self._lru_size:
-            k, v = self._lru_cache.popitem(last=False)
-            is_dirty = k in self._dirty_keys
-            self._dirty_keys.discard(k)
-            if v is not None:
-                if self._is_evacuated(v):
-                    self._compressed_store.pop(k, None)
-                    self._raw_crcs.pop(k, None)
-                    self._evacuated_store[k] = v
-                    continue
-
-                orig_gp = getattr(v, "gp", None)
-                orig_mf = getattr(v, "mf", None)
-                orig_batch = getattr(v, "batch_cs_dict", None)
-                try:
-                    if orig_gp is not None:
-                        v.gp = None
-                    if orig_mf is not None:
-                        v.mf = None
-                    if orig_batch is not None:
-                        v.batch_cs_dict = None
-                    raw_bytes = pickle.dumps(v, protocol=pickle.HIGHEST_PROTOCOL)
-                    new_crc = zlib.crc32(raw_bytes)
-                    prev_crc = self._raw_crcs.get(k)
-                    if is_dirty or prev_crc is None or new_crc != prev_crc or k not in self._compressed_store or self._compressed_store.get(k) is None:
-                        self._compressed_store[k] = zlib.compress(raw_bytes, level=1)
-                        self._raw_crcs[k] = new_crc
-                except Exception as e:
-                    logger.warning(f"[CompressedChangeSetDict] Failed to evict/recompress '{k}': {e}")
-                    self._lru_cache[k] = v
-                    self._lru_cache.move_to_end(k)
-                finally:
-                    if orig_gp is not None:
-                        v.gp = orig_gp
-                    if orig_mf is not None:
-                        v.mf = orig_mf
-                    if orig_batch is not None:
-                        v.batch_cs_dict = orig_batch
-
-    def __setitem__(self, key: str, value: Any) -> None:
+    def _place(self, key: str, value: Any) -> None:
+        """Store `value` under `key` (evacuated store, or the LRU cache), without evicting."""
         self._all_keys.add(key)
-        self._dirty_keys.discard(key)
+        self._lru_cache.pop(key, None)
         if value is None:
             self._evacuated_store.pop(key, None)
             self._compressed_store[key] = None
-            self._raw_crcs.pop(key, None)
-            self._lru_cache.pop(key, None)
-            return
-
-        # Fast path for evacuated ChangeSets: store uncompressed with zero serialization overhead
-        if self._is_evacuated(value):
+        elif self._is_evacuated(value):
             self._compressed_store.pop(key, None)
-            self._raw_crcs.pop(key, None)
-            self._lru_cache.pop(key, None)
             self._evacuated_store[key] = value
-            return
+        else:
+            self._evacuated_store.pop(key, None)
+            self._lru_cache[key] = value
 
-        # Active ChangeSet: keep in LRU cache uncompressed until evicted
-        self._evacuated_store.pop(key, None)
-        self._lru_cache[key] = value
-        self._lru_cache.move_to_end(key)
-        self._dirty_keys.add(key)
-        self._evict_lru()
+    def _evict_lru(self) -> None:
+        """Compress the oldest LRU entries until the cache fits (evacuated ones move to their own store)."""
+        while len(self._lru_cache) > self._lru_size:
+            k, v = self._lru_cache.popitem(last=False)
+            if self._is_evacuated(v):
+                self._compressed_store.pop(k, None)
+                self._evacuated_store[k] = v
+            elif not self._compress(k, v):
+                # Kept uncompressed; stop here rather than retry the same entries forever
+                self._lru_cache[k] = v
+                break
 
-    def __getitem__(self, key: str) -> Any:
+    def flush(self) -> None:
+        """Compress every LRU entry into the compressed store (entries stay cached), e.g. before pickling."""
+        for k, v in self._lru_cache.items():
+            self._compress(k, v)
+
+    def __reduce__(self) -> tuple[Any, ...]:
+        self.flush()
+        return (CompressedChangeSetDict, (self._lru_size,), {
+            "_all_keys": self._all_keys,
+            "_evacuated_store": self._evacuated_store,
+            "_compressed_store": self._compressed_store,
+            "_lru_cache": OrderedDict(),
+            "_lru_size": self._lru_size,
+        })
+
+    def _load(self, key: str, default: Any = _MISSING) -> Any:
         if key in self._evacuated_store:
             return self._evacuated_store[key]
-
         if key in self._lru_cache:
             self._lru_cache.move_to_end(key)
             return self._lru_cache[key]
-
         if key not in self._compressed_store:
-            raise KeyError(key)
-
+            if default is _MISSING:
+                raise KeyError(key)
+            return default
         compressed = self._compressed_store[key]
         if compressed is None:
             return None
-
-        # Decompress on-demand (clean, not dirty)
-        raw_bytes = zlib.decompress(compressed)
-        self._raw_crcs[key] = zlib.crc32(raw_bytes)
-        obj = pickle.loads(raw_bytes)  # noqa: S301
-
+        obj = pickle.loads(zlib.decompress(compressed))  # noqa: S301
         if self._is_evacuated(obj):
             self._compressed_store.pop(key, None)
-            self._raw_crcs.pop(key, None)
             self._evacuated_store[key] = obj
             return obj
-
         self._lru_cache[key] = obj
-        self._lru_cache.move_to_end(key)
         self._evict_lru()
         return obj
+
+    def __setitem__(self, key: str, value: Any) -> None:
+        self._place(key, value)
+        self._evict_lru()
+
+    def __getitem__(self, key: str) -> Any:
+        return self._load(key)
+
+    def get(self, key: str, default: Any = None) -> Any:
+        try:
+            return self._load(key, default)
+        except Exception:
+            return default
 
     def __delitem__(self, key: str) -> None:
         self._all_keys.discard(key)
         self._evacuated_store.pop(key, None)
         self._compressed_store.pop(key, None)
         self._lru_cache.pop(key, None)
-        self._dirty_keys.discard(key)
-        self._raw_crcs.pop(key, None)
 
     def __contains__(self, key: object) -> bool:
         return key in self._all_keys
@@ -234,87 +174,31 @@ class CompressedChangeSetDict(dict):
     def __iter__(self):
         return iter(list(self._all_keys))
 
+    def __bool__(self) -> bool:
+        return bool(self._all_keys)
+
     def clear(self) -> None:
         self._all_keys.clear()
         self._evacuated_store.clear()
         self._compressed_store.clear()
         self._lru_cache.clear()
-        self._dirty_keys.clear()
-        self._raw_crcs.clear()
-
-    def get(self, key: str, default: Any = None) -> Any:
-        if key in self._evacuated_store:
-            return self._evacuated_store[key]
-
-        if key in self._lru_cache:
-            self._lru_cache.move_to_end(key)
-            return self._lru_cache[key]
-
-        if key not in self._compressed_store:
-            return default
-
-        compressed = self._compressed_store[key]
-        if compressed is None:
-            return None
-
-        try:
-            raw_bytes = zlib.decompress(compressed)
-            self._raw_crcs[key] = zlib.crc32(raw_bytes)
-            obj = pickle.loads(raw_bytes)  # noqa: S301
-            if self._is_evacuated(obj):
-                self._compressed_store.pop(key, None)
-                self._raw_crcs.pop(key, None)
-                self._evacuated_store[key] = obj
-                return obj
-
-            self._lru_cache[key] = obj
-            self._lru_cache.move_to_end(key)
-            self._evict_lru()
-            return obj
-        except Exception:
-            return default
 
     def keys(self):
         return self._all_keys
 
     def values(self):
-        for k in self.keys():
+        for k in list(self._all_keys):
             yield self[k]
 
     def items(self):
-        for k in self.keys():
+        for k in list(self._all_keys):
             yield (k, self[k])
 
     def update(self, *args: Any, **kwargs: Any) -> None:
-        items_to_add = []
-        if args:
-            other = args[0]
-            if isinstance(other, dict):
-                items_to_add.extend(other.items())
-            else:
-                items_to_add.extend(other)
-        if kwargs:
-            items_to_add.extend(kwargs.items())
-
-        for k, v in items_to_add:
-            self._all_keys.add(k)
-            self._dirty_keys.discard(k)
-            if v is None:
-                self._evacuated_store.pop(k, None)
-                self._compressed_store[k] = None
-                self._raw_crcs.pop(k, None)
-                self._lru_cache.pop(k, None)
-            elif self._is_evacuated(v):
-                self._compressed_store.pop(k, None)
-                self._raw_crcs.pop(k, None)
-                self._lru_cache.pop(k, None)
-                self._evacuated_store[k] = v
-            else:
-                self._evacuated_store.pop(k, None)
-                self._lru_cache[k] = v
-                self._lru_cache.move_to_end(k)
-                self._dirty_keys.add(k)
-
+        items = list(args[0].items() if args and isinstance(args[0], dict) else (args[0] if args else ()))
+        items.extend(kwargs.items())
+        for k, v in items:
+            self._place(k, v)
         self._evict_lru()
 
     def pop(self, key: str, *args: Any) -> Any:
@@ -333,17 +217,12 @@ class CompressedChangeSetDict(dict):
         return default
 
     def copy(self) -> "CompressedChangeSetDict":
-        self.flush_dirty()
         new_dict = CompressedChangeSetDict(lru_cache_size=self._lru_size)
         new_dict._all_keys = set(self._all_keys)
         new_dict._evacuated_store = dict(self._evacuated_store)
         new_dict._compressed_store = dict(self._compressed_store)
-        new_dict._raw_crcs = dict(self._raw_crcs)
         new_dict._lru_cache = OrderedDict(self._lru_cache)
         return new_dict
-
-    def __bool__(self) -> bool:
-        return bool(self._all_keys)
 
 
 
@@ -398,10 +277,15 @@ class GreatProcessor:
         self._commit_proc = None
         self._commit_result_dir: str | None = None
 
-    def init_cs_dict(self) -> None:
-        """Initialize or reset ChangeSet_Dict according to active G.MEMORY_MODE."""
-        from core.globalstuff import G
-        self.close_shared_symbols()
+    @staticmethod
+    def _cs_lru_size() -> int:
+        """Decompressed ChangeSets kept per store for the active G.MEMORY_MODE."""
+        if G.VERY_LOW_MEMORY_MODE:
+            return 25
+        return 50 if G.LOW_MEMORY_MODE else 500
+
+    def _clear_version_symbols(self) -> None:
+        """Forget the per-version symbol tables, dependency graph and completion state."""
         self._ast_staged_symbols = {}
         self._ast_staged_names = {}
         self.file_deps = {}
@@ -412,19 +296,22 @@ class GreatProcessor:
         self.file_pre_extracted_tags = {}
         self.file_blob_ids = {}
         self._ast_negative_cache = set()
-        if G.VERY_LOW_MEMORY_MODE:
-            self.ChangeSet_Dict = CompressedChangeSetDict(lru_cache_size=25)
-            self.Alt_ChangeSet_Dict = CompressedChangeSetDict(lru_cache_size=25)
-        elif G.LOW_MEMORY_MODE:
-            self.ChangeSet_Dict = CompressedChangeSetDict(lru_cache_size=50)
-            self.Alt_ChangeSet_Dict = CompressedChangeSetDict(lru_cache_size=50)
-        else:
-            self.ChangeSet_Dict = CompressedChangeSetDict(lru_cache_size=500)
-            self.Alt_ChangeSet_Dict = CompressedChangeSetDict(lru_cache_size=500)
 
-    # this is not optimized as reset_cs destroys our progress... might be too much to ask to keep 2 CS_list
+    def init_cs_dict(self) -> None:
+        """Initialize or reset ChangeSet_Dict according to active G.MEMORY_MODE."""
+        self.close_shared_symbols()
+        self._clear_version_symbols()
+        lru_size = self._cs_lru_size()
+        self.ChangeSet_Dict = CompressedChangeSetDict(lru_cache_size=lru_size)
+        self.Alt_ChangeSet_Dict = CompressedChangeSetDict(lru_cache_size=lru_size)
+
     def safe_get_cs(self, path: str):
-        if not path or path.startswith(("/usr/", "usr/", "/etc/", "etc/", "/lib/", "lib/", "/opt/", "opt/")):
+        """ChangeSet of a repository path: the update's own, else one parsed on demand (Alt_ChangeSet_Dict).
+
+        Absolute system paths (headers outside the repository) have none; relative `lib/` and `usr/` are
+        kernel directories.
+        """
+        if not path or path.startswith(("/usr/", "/etc/", "/lib/", "/opt/")):
             return None
         CS = self.ChangeSet_Dict.get(path)
         if CS is None:
@@ -538,27 +425,27 @@ class GreatProcessor:
                     if d_name and d_ast_id:
                         sym_map[(d_name, d_type)] = d_ast_id
 
-        # Include definitions stored once per tag (m_tag_def + m_blob_symbol)
+        # Include definitions stored once per tag (m_tag_def + m_blob_symbol): the blob's key resolutions in
+        # one read, plus a staged lookup per key still missing for a blob written in this update
         if tag_ids and m_tag_def.table_id in te.tables and m_blob_symbol.table_id in te.tables:
             t_defs = te.get_in(m_tag_def.table_id, m_tag_def.tag_id[1], tag_ids) or ()
-            bs_cache: dict[int, int | None] = {}
-            for r in t_defs:
-                if len(r) > m_tag_def.type_id[1]:
+            if t_defs:
+                key_col, target_col = m_blob_symbol.sym_key[1], m_blob_symbol.target_ast_id[1]
+                targets: dict[int, int | None] = {
+                    r[key_col]: r[target_col]
+                    for r in te.get_in(m_blob_symbol.table_id, m_blob_symbol.blob_id[1], (fid,)) or ()
+                }
+                for r in t_defs:
                     key = r[m_tag_def.sym_key[1]]
+                    if key not in targets:
+                        bs_row = None if complete_blob else te.get(m_blob_symbol.table_id, (fid, key, None, None))
+                        targets[key] = bs_row[target_col] if bs_row else None
+                    d_ast_id = targets[key]
                     d_name = r[m_tag_def.name[1]]
-                    d_type = r[m_tag_def.type_id[1]]
-                    if key not in bs_cache:
-                        bs_row = te.get(m_blob_symbol.table_id, (fid, key, None, None))
-                        if bs_row and len(bs_row) >= 3 and bs_row[2]:
-                            bs_cache[key] = bs_row[2][m_blob_symbol.target_ast_id[1]] if isinstance(bs_row[2], (list, tuple)) else bs_row[2]
-                        else:
-                            bs_cache[key] = None
-                    d_ast_id = bs_cache[key]
-                    if d_ast_id is not None:
-                        if isinstance(d_name, (bytes, bytearray)):
-                            d_name = d_name.decode("utf-8", "replace")
-                        if d_name:
-                            sym_map[(d_name, d_type)] = d_ast_id
+                    if isinstance(d_name, (bytes, bytearray)):
+                        d_name = d_name.decode("utf-8", "replace")
+                    if d_ast_id and d_name:
+                        sym_map[(d_name, r[m_tag_def.type_id[1]])] = d_ast_id
 
         if complete_blob:
             self._store_blob_symbols(fid, sym_map)
@@ -603,28 +490,19 @@ class GreatProcessor:
         return len(stale)
 
     def reset_cs(self) -> None:
-        """Reset Change_List and ChangeSet_Dict upon completion of a version parsing pass."""
+        """Reset Change_List, ChangeSet stores and per-version symbol state once a version is parsed."""
         self.Alt_ChangeSet_Dict.clear()
-        if hasattr(self, "unchanged_symbol_cache"):
-            self.unchanged_symbol_cache.clear()
-        if hasattr(self, "blob_symbol_cache"):
-            self.prune_blob_symbol_cache()
-        if hasattr(self, "file_pre_extracted_tags"):
-            self.file_pre_extracted_tags.clear()
-        if hasattr(self, "file_blob_ids"):
-            self.file_blob_ids.clear()
-        if hasattr(self, "_ast_negative_cache"):
-            self._ast_negative_cache.clear()
+        self.unchanged_symbol_cache.clear()
+        self.prune_blob_symbol_cache()
+        self._clear_version_symbols()
         self.Change_List = None
         self.worker_change_list = None
         self.commit_ids_by_hash = {}
         self.deduped_paths = set()
-        if hasattr(self, "Symlink_List") and self.Symlink_List:
-            self.Symlink_List.clear()
+        self.Symlink_List.clear()
         self.stop_commit_worker()
         self.close_shared_symbols()
         self.ChangeSet_Dict.clear()
-        return
 
     def close_shared_symbols(self) -> None:
         """Unmap the shared memory symbol segments so they never leak into the next version."""

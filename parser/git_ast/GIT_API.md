@@ -37,7 +37,7 @@ Relational Database Mapping:
   ├── Contributor Roles: m_bridge_commit_person (Table 23)
   ├── Modified Files: m_bridge_commit_file (Table 24)
   └── Code Occurrence Tag Bridge: m_bridge_commit_tag (Table 25)
-        └── _map_hunk_to_tags: Bisect interval search over m_bridge_tag coordinates
+        └── map_tags_to_commits: tags overlapping each commit's hunks (moved to the version's lines)
 ==================================================================================================
 ```
 
@@ -51,7 +51,7 @@ Relational Database Mapping:
 | :---: | :--- | :--- | :--- | :---: | :--- |
 | **26** | `m_commit` | `(commit_id, network_id, commit_hash, author_id, author_date, committer_id, committer_date, subject, message)` | `("commit_id",)` | `False` | Git commit registry. `commit_hash` is `BINARY(20)` SHA-1. Primary key `commit_id` is AUTO_INCREMENT. |
 | **27** | `m_bridge_commit_person` | `(commit_id, person_id, role_type, priority)` | `("commit_id", "person_id", "role_type")` | `False` | Contributor associations: author, committer, and trailers. |
-| **28** | `m_commit_file` | `(commit_id, fnid, blob_id, old_fnid, old_blob_id, change_type)` | `("commit_id", "fnid")` | `False` | First-parent commit tree deltas (aliased as `m_bridge_commit_file`). |
+| **28** | `m_commit_file` | `(commit_id, fnid, blob_id, old_fnid, old_blob_id, change_type)` | `("commit_id", "fnid")` | `False` | Files a commit touched (aliased as `m_bridge_commit_file`): `blob_id` / `old_blob_id` are the blobs that commit wrote and read (from the patch's `index <old>..<new>` lines, `--full-index`; 0 for none), `old_fnid` the path before a rename. A blob that is not the version's own gets its `m_file_blob` row (`main._commit_blob_id()`). |
 | **29** | `m_bridge_commit_tag` | `(commit_id, blob_id, tag_id)` | `("commit_id", "tag_id")` | `False` | Code tags modified per commit revision. |
 | **36** | `m_git_network` | `(network_id, project_id, name, root_commit_hash)` | `("network_id",)` | `False` | Multi-remote repository network sharing the same initial root commit. |
 | **37** | `m_repository` | `(repo_id, network_id, name, git_url, default_branch)` | `("repo_id",)` | `False` | Tracked Git repository clone/remote instance. |
@@ -125,17 +125,13 @@ Contributors are sanitized and stored in `m_maintainer_person` (Table 16), linki
 `git_ast` bridges commits to AST code occurrence tags (`m_tag`) using diff coordinate spatial indexing:
 
 ### 4.1. Hunk Interval Representation (`CommitDiffHunk`)
-- For modified files, executes `git diff-tree -p -U0 <commit>` to extract line modification intervals:
-  - `old_start, old_count`: Modified range in previous version.
-  - `new_start, new_count`: Modified range in active version.
+- `git log -p -U0` gives each hunk as `@@ -old_start,old_count +new_start,new_count @@`, in that commit's own version of the file.
+- Tags carry the lines of the range's newest version, so `parse_commit_log_with_hunks()` (and `extract_file_hunks()`) move every hunk there with `_HeadLineMapper`: commits arrive newest first, and a commit's range is mapped through the hunks of every newer commit that touched the file (`_map_line()`: lines after a hunk shift by its size change, a replaced line maps into the replacement). Renames carry the chain to the old name; a file (re)created by a newer commit ends it. `file_hunks_map` is keyed by the newest path.
+- Patch headers are only read between `diff --git` and the first hunk (patch content can never be taken for `--- /dev/null` etc.); `index`, `rename from/to` and `new/deleted file mode` lines give each file's change type, old path and blobs (`GitCommit.file_blobs`).
 
-### 4.2. Binary Search Tag Correlation (`_map_hunk_to_tags`)
-- Collects active tags for the modified file from `m_bridge_tag` sorted by start line:
-  ```python
-  tag_intervals = [(line_s, line_e, tag_id), ...]
-  ```
-- Uses `bisect` over `tag_intervals` to locate code tags overlapping the diff hunk range `[new_start, new_start + new_count]`.
-- Correlated tags are staged into `m_bridge_commit_tag(commit_id, blob_id, tag_id)`.
+### 4.2. Tag Correlation (`map_tags_to_commits`)
+- For each tag `(tag_id, fid, line_s, line_e)` of a changed file, the commits whose hunks overlap its lines (`_HunkIndex` beyond 8 hunks, a scan below) are staged into `m_bridge_commit_tag(commit_id, blob_id, tag_id)`.
+- A tag no hunk touches (unchanged code of a changed file, recycled tags) is linked to no commit.
 - This enables web applications and static analysis tools to query all commits that modified a specific function, struct, or macro across kernel versions in $O(1)$ time.
 
 ---

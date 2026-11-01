@@ -16,32 +16,25 @@ from typing import Any
 
 from core.globalstuff import (
     G,
-    REF_ROOT,
     REF_POS,
     REF_C_AST,
     ASTT,
     OP_REF,
 )
-m_file_name = m_file = m_ast = m_ast_include = m_tag = m_bridge_tag = m_map_ast = m_bridge_map = m_moved_tag = None
-from core.globalstuff import compute_code_hash
+m_file_name = m_ast = m_ast_include = None
 
 
 def _init_tables() -> None:
-    global m_file_name, m_file, m_ast, m_ast_include, m_tag, m_bridge_tag, m_map_ast, m_bridge_map, m_moved_tag
+    global m_file_name, m_ast, m_ast_include
     if m_file_name is not None:
         return
     import core.DBLayout as db_layout
     m_file_name = db_layout.m_file_name
-    m_file = db_layout.m_file
     m_ast = db_layout.m_ast
     m_ast_include = db_layout.m_ast_include
-    m_tag = db_layout.m_tag
-    m_bridge_tag = db_layout.m_bridge_tag
-    m_map_ast = db_layout.m_map_ast
-    m_bridge_map = db_layout.m_bridge_map
-    m_moved_tag = db_layout.m_moved_tag
 
-from parser.c_ast import Line, get_prior_tags, close_prior_tags
+from parser.c_ast import get_prior_tags
+from parser.c_ast.tag_tracker import stage_entry_tag
 from parser.kconfig_ast.kconfig_lexer import KconfigLexer
 from parser.kconfig_ast.kconfig_parser import (
     KconfigParser,
@@ -71,10 +64,8 @@ def kconfig_ast_parse(CS: Any) -> None:
         elif CS.file_operation == "M" or (CS.file_operation and CS.file_operation.startswith("R")):
             get_prior_tags(CS)
             KconfigManager(CS)
-            close_prior_tags(CS)
         elif CS.file_operation == "D":
-            get_prior_tags(CS)
-            close_prior_tags(CS)
+            pass  # Tags are immutable content records: a deleted file stages nothing
         else:
             logger.warning("Unhandled file operation '%s' for %s", CS.file_operation, CS.current_path)
 
@@ -147,96 +138,8 @@ class KconfigManager:
         ast_name: str | None = None,
         ast_type: Any = None,
     ) -> Any:
-        """Create or recycle m_tag, m_bridge_tag, m_map_ast, and m_bridge_map entries."""
-        CS = self.CS
-        extent = Line(line_s, line_e)
-        extent.line_pos = (line_s, line_e)
-        extent.char_pos = (char_s, char_e)
-        extent.code = code
-
-        code_hash = compute_code_hash(code)
-        current_tag = (
-            None,
-            code_hash,
-            ast_ref,
-            0,
-            0,
-        )
-
-        # Attempt to recycle prior version tag if code matches
-        if CS.prior_tags and (extent.code != ""):
-            lookup = getattr(CS, "prior_tags_map", None)
-            if lookup is not None:
-                tag_list = lookup.get(code_hash)
-                if tag_list is not None:
-                    tag_match = None
-                    for item in tag_list:
-                        if item[0] not in CS.active_tag_list:
-                            tag_match = item
-                            break
-                    if tag_match is not None:
-                        x, tag_id = tag_match
-                        if isinstance(CS.active_tag_list, set):
-                            CS.active_tag_list.add(x)
-                        else:
-                            CS.active_tag_list.append(x)
-                        with CS(REF_POS):
-                            CS.store(m_bridge_tag.set(
-                                ((m_file.table_id, 0), OP_REF, (REF_ROOT,)),
-                                tag_id,
-                                extent.line_pos[0],
-                                extent.line_pos[1],
-                                extent.char_pos[0],
-                                extent.char_pos[1],
-                            ))
-                        return tag_id
-
-        from parser.c_ast import match_prior_tag_transition
-        s_tag_id = match_prior_tag_transition(CS, extent, ast_name, ast_type)
-
-        with CS(REF_POS):
-            CS.store(m_tag.set(*current_tag))
-            tag_ref = ((m_tag.table_id, 0), OP_REF, (REF_POS, CS.route[-1]))
-            if s_tag_id is not None:
-                CS.store(m_moved_tag.set(s_tag_id, tag_ref))
-
-        with CS(REF_POS):
-            CS.store(m_bridge_tag.set(
-                ((m_file.table_id, 0), OP_REF, (REF_ROOT,)),
-                tag_ref,
-                extent.line_pos[0],
-                extent.line_pos[1],
-                extent.char_pos[0],
-                extent.char_pos[1],
-            ))
-        self._map_spatial(ast_ref, tag_ref, extent)
-        return tag_ref
-
-    def _map_spatial(self, ast_ref: Any, tag_ref: Any, extent: Line) -> None:
-        CS = self.CS
-        line_s = 1
-        char_s = 1
-        line_e = max(1, extent.line_pos[1] - extent.line_pos[0] + 1)
-        char_e = extent.char_pos[1]
-
-        ast_target = ast_ref if (isinstance(ast_ref, tuple) and len(ast_ref) == 3 and ast_ref[1] == OP_REF) or isinstance(ast_ref, int) else CS.ref(m_ast.ast_id, *ast_ref)
-        tag_target = tag_ref if (isinstance(tag_ref, tuple) and len(tag_ref) == 3 and tag_ref[1] == OP_REF) or isinstance(tag_ref, int) else CS.ref(m_tag.tag_id, *tag_ref)
-
-        with CS(REF_POS):
-            CS.store(m_map_ast.set(
-                tag_target,
-                line_s,
-                char_s,
-                line_e,
-                char_e,
-                ast_target,
-            ))
-        if not hasattr(CS, "register_bridge_map") or CS.register_bridge_map(tag_target, tag_target):
-            with CS(REF_POS):
-                CS.store(m_bridge_map.set(
-                    tag_target,
-                    tag_target,
-                ))
+        """Create or recycle the entry's m_tag, m_bridge_tag and m_map_ast rows."""
+        return stage_entry_tag(self.CS, ast_ref, line_s, line_e, char_s, char_e, code, ast_name=ast_name, ast_type=ast_type)
 
     def _source_target(self, src: KconfigSource) -> str | None:
         """Repository path a `source` names, or None when it depends on the environment ($SRCARCH...)."""

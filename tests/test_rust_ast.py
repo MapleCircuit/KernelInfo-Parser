@@ -55,7 +55,7 @@ from parser.rust_ast.rust_ast_type import (
     Ast_Rust_DocComment,
 )
 from parser.rust_ast.rust_tree_parser import parse_rust_ast_tree, parse_span_coords
-from parser.rust_ast.rust_ast import rust_ast_parse, get_prior_tags, close_prior_tags
+from parser.rust_ast.rust_ast import rust_ast_parse
 from core.config import get_default_repo_path
 
 LINUX_REPO = str(get_default_repo_path())

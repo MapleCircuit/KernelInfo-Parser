@@ -359,9 +359,13 @@ def rollback_version(cnx: Any, network_id: int, commit_id: int, tables: Sequence
 def cleanup_ramdisk_artifacts(ramdisk_dir: str | None = None, search_system_temps: bool = True) -> int:
     """Purge orphaned scratch directories left in RAMDISK or temp directories from previous crashed parser runs.
 
-    Searches for directories matching 'code-parser.*', 'kip-commits-*', 'kip-*'.
+    Searches for directories matching 'code-parser.*' and 'kip-*' (which includes 'kip-commits-*'). A directory
+    whose owner (`core.FileHandler.mark_owner()`) is a process still running belongs to a live parser
+    instance and is kept.
     Returns number of directories removed.
     """
+    from core.FileHandler import owner_alive
+
     removed = 0
     search_dirs: list[str] = []
     if ramdisk_dir and os.path.isdir(ramdisk_dir):
@@ -375,15 +379,16 @@ def cleanup_ramdisk_artifacts(ramdisk_dir: str | None = None, search_system_temp
             search_dirs.append(tmp)
 
     for base in search_dirs:
-        for pattern in ("code-parser.*", "kip-commits-*", "kip-*"):
+        for pattern in ("code-parser.*", "kip-*"):
             for path in glob.glob(os.path.join(base, pattern)):
-                if os.path.isdir(path) and not os.path.islink(path):
-                    try:
-                        shutil.rmtree(path, ignore_errors=True)
-                        removed += 1
-                        logger.debug(f"Removed stale scratch directory: {path}")
-                    except Exception as e:
-                        logger.warning(f"Could not remove scratch directory {path}: {e}")
+                if not os.path.isdir(path) or os.path.islink(path):
+                    continue
+                if owner_alive(path):
+                    logger.debug(f"Keeping scratch directory of a running parser: {path}")
+                    continue
+                shutil.rmtree(path, ignore_errors=True)
+                removed += 1
+                logger.debug(f"Removed stale scratch directory: {path}")
 
     logger.info(f"[Cleanup] Removed {removed} orphaned scratch directory/directories from RAMDISK/temp storage.")
     return removed
@@ -393,8 +398,10 @@ def fetch_repo_version_states(cnx: Any, repo_id: int, network_id: int) -> dict[s
     """Return map of ref_name -> (commit_id, state) for all registered refs of the repository.
 
     States:
-        "done": fully ingested version (INGEST_DONE or legacy checkpoint with rows)
+        "done": fully ingested version (INGEST_DONE)
         "interrupted": crashed or halted run with INGEST_PARSING
+        "legacy": no state row but checkpoint rows (ingested before m_ingest_state existed); whether it is
+            complete is decided by `main._previous_ingest()` (at least 90% of the tree checkpointed)
         "new": registered ref that has not been ingested yet
     """
     states: dict[str, tuple[int, str]] = {}
@@ -424,15 +431,18 @@ def fetch_repo_version_states(cnx: Any, repo_id: int, network_id: int) -> dict[s
             else:
                 legacy_candidates.append((ref_name, commit_id))
 
-        if legacy_candidates:
-            for rname, cid in legacy_candidates:
-                cur.execute("SELECT COUNT(*) FROM m_bridge_checkpoint WHERE commit_id = %s", (cid,))
-                row_chk = cur.fetchone()
-                cnt = int(row_chk[0]) if row_chk and row_chk[0] else 0
-                if cnt > 0:
-                    states[rname] = (cid, "done")
-                else:
-                    states[rname] = (cid, "new")
+        # One query per 1000 refs (the primary key's commit_id prefix answers it) instead of a COUNT(*) per ref
+        checkpointed: set[int] = set()
+        cids = sorted({cid for _name, cid in legacy_candidates})
+        for i in range(0, len(cids), _IN_CHUNK):
+            chunk = tuple(cids[i:i + _IN_CHUNK])
+            cur.execute(
+                f"SELECT DISTINCT commit_id FROM m_bridge_checkpoint WHERE commit_id IN ({','.join(['%s'] * len(chunk))})",
+                chunk,
+            )
+            checkpointed.update(int(r[0]) for r in cur.fetchall())
+        for rname, cid in legacy_candidates:
+            states[rname] = (cid, "legacy" if cid in checkpointed else "new")
     return states
 
 
@@ -440,7 +450,10 @@ def purge_version_differential_rows(cnx: Any, commit_id: int, pred_commit_id: in
     """Purge version-scoped differential rows of a version to prepare clean re-alignment with a new Old_VID base.
 
     Cleans:
-      - Inbound m_moved_tag transitions targeting tags in commit_id's tree
+      - Inbound m_moved_tag transitions whose target tag only appears in blobs new in commit_id's tree
+        relative to pred_commit_id (tags are content-addressed and shared across versions: a tag also placed
+        in the predecessor's tree keeps the transitions earlier versions recorded for it). Without
+        pred_commit_id no transition is removed.
       - m_bridge_checkpoint for commit_id
       - m_commit_file, m_bridge_commit_tag, m_bridge_commit_person, m_commit_email for commit_id
       - m_arch_root for commit_id
@@ -453,25 +466,32 @@ def purge_version_differential_rows(cnx: Any, commit_id: int, pred_commit_id: in
     if cnx is None:
         return 0
     with contextlib.closing(cnx.cursor()) as cur:
-        # 1. Fetch tags placed in commit_id's checkpoint to delete inbound m_moved_tag
-        try:
-            cur.execute(
-                """
-                SELECT DISTINCT bt.tag_id
-                FROM m_bridge_tag bt
-                JOIN m_bridge_checkpoint bcp ON bcp.blob_id = bt.blob_id
-                WHERE bcp.commit_id = %s
-                """,
-                (commit_id,),
-            )
-            target_tag_ids = [int(r[0]) for r in cur.fetchall()]
-            for i in range(0, len(target_tag_ids), _IN_CHUNK):
-                chunk = tuple(target_tag_ids[i:i + _IN_CHUNK])
-                in_fmt = ",".join(["%s"] * len(chunk))
-                cur.execute(f"DELETE FROM m_moved_tag WHERE e_tag_id IN ({in_fmt})", chunk)
-                total += cur.rowcount or 0
-        except Exception as e:
-            logger.debug(f"Inbound m_moved_tag purge error for commit_id {commit_id}: {e}")
+        # 1. Transitions into tags this version introduced (placed in its new blobs, absent from the predecessor)
+        if pred_commit_id:
+            try:
+                cur.execute(
+                    """
+                    SELECT DISTINCT bt.tag_id
+                    FROM m_bridge_checkpoint bcp
+                    LEFT JOIN m_bridge_checkpoint pred ON pred.commit_id = %s AND pred.blob_id = bcp.blob_id
+                    JOIN m_bridge_tag bt ON bt.blob_id = bcp.blob_id
+                    WHERE bcp.commit_id = %s AND pred.blob_id IS NULL
+                      AND NOT EXISTS (
+                          SELECT 1 FROM m_bridge_tag pbt
+                          JOIN m_bridge_checkpoint pcp ON pcp.blob_id = pbt.blob_id AND pcp.commit_id = %s
+                          WHERE pbt.tag_id = bt.tag_id
+                      )
+                    """,
+                    (pred_commit_id, commit_id, pred_commit_id),
+                )
+                target_tag_ids = [int(r[0]) for r in cur.fetchall()]
+                for i in range(0, len(target_tag_ids), _IN_CHUNK):
+                    chunk = tuple(target_tag_ids[i:i + _IN_CHUNK])
+                    in_fmt = ",".join(["%s"] * len(chunk))
+                    cur.execute(f"DELETE FROM m_moved_tag WHERE e_tag_id IN ({in_fmt})", chunk)
+                    total += cur.rowcount or 0
+            except Exception as e:
+                logger.debug(f"Inbound m_moved_tag purge error for commit_id {commit_id}: {e}")
 
         # 2. Delete version-scoped records
         for table in (
@@ -502,4 +522,3 @@ def purge_version_differential_rows(cnx: Any, commit_id: int, pred_commit_id: in
         f"Purged {total} version-scoped differential rows for commit_id {commit_id} to prepare clean re-alignment."
     )
     return total
-

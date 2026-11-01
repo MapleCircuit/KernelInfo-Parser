@@ -125,7 +125,7 @@ class Test_CParserLifecycle(BaseCParserTestCase):
             G.CURRENT_PARSING_FILE = file_path
 
             # Version and file prelude registration
-            cs.store(m_v_main.set(1, self.gp.Version_Name))
+            cs.store(m_v_main.set(None, 0, 4, self.gp.Version_Name, 1, None, None, None))
             stage_file_prelude(cs, self.gp)
 
         with test_step("Execute c_ast_parse and ChangeSet resolution"):
@@ -151,7 +151,7 @@ class Test_CParserLifecycle(BaseCParserTestCase):
             self.assertIn("m_tag", tables)
             self.assertIn("m_bridge_tag", tables)
             self.assertIn("m_map_ast", tables)
-            self.assertIn("m_bridge_map", tables)
+            self.assertNotIn("m_bridge_map", tables)
             self.assertIn("m_symbol_def", tables)
             self.assertIn("m_symbol_ref", tables)
 
@@ -176,7 +176,7 @@ class Test_CParserLifecycle(BaseCParserTestCase):
             cs1.mf = self.mf
             cs1.current_vid = 1
             G.CURRENT_PARSING_FILE = file_path
-            cs1.store(m_v_main.set(1, self.gp.Version_Name))
+            cs1.store(m_v_main.set(None, 0, 4, self.gp.Version_Name, 1, None, None, None))
             stage_file_prelude(cs1, self.gp)
             c_ast_parse(cs1)
             ok1 = cs1.execute()
@@ -198,7 +198,7 @@ class Test_CParserLifecycle(BaseCParserTestCase):
             cs2.mf = self.mf
             cs2.current_vid = 2
             G.CURRENT_PARSING_FILE = file_path
-            cs2.store(m_v_main.set(2, self.gp.Version_Name))
+            cs2.store(m_v_main.set(None, 0, 4, self.gp.Version_Name, 2, None, None, None))
             stage_file_prelude(cs2, self.gp)
             c_ast_parse(cs2)
             ok2 = cs2.execute()
@@ -247,7 +247,7 @@ class Test_CParserLifecycle(BaseCParserTestCase):
             cs1.mf = self.mf
             cs1.current_vid = 1
             G.CURRENT_PARSING_FILE = old_path
-            cs1.store(m_v_main.set(1, self.gp.Version_Name))
+            cs1.store(m_v_main.set(None, 0, 4, self.gp.Version_Name, 1, None, None, None))
             stage_file_prelude(cs1, self.gp)
             c_ast_parse(cs1)
             ok1 = cs1.execute()
@@ -265,7 +265,7 @@ class Test_CParserLifecycle(BaseCParserTestCase):
             cs2.mf = self.mf
             cs2.current_vid = 2
             G.CURRENT_PARSING_FILE = new_path
-            cs2.store(m_v_main.set(2, self.gp.Version_Name))
+            cs2.store(m_v_main.set(None, 0, 4, self.gp.Version_Name, 2, None, None, None))
             stage_file_prelude(cs2, self.gp)
             c_ast_parse(cs2)
             ok2 = cs2.execute()
@@ -320,7 +320,7 @@ class Test_CParserCornerCases(BaseCParserTestCase):
             cs.mf = self.mf
             cs.current_vid = 1
             G.CURRENT_PARSING_FILE = file_path
-            cs.store(m_v_main.set(1, self.gp.Version_Name))
+            cs.store(m_v_main.set(None, 0, 4, self.gp.Version_Name, 1, None, None, None))
             stage_file_prelude(cs, self.gp)
             c_ast_parse(cs)
             exec_ok = cs.execute()
@@ -357,7 +357,7 @@ class Test_CParserCornerCases(BaseCParserTestCase):
             cs.mf = self.mf
             cs.current_vid = 1
             G.CURRENT_PARSING_FILE = file_path
-            cs.store(m_v_main.set(1, self.gp.Version_Name))
+            cs.store(m_v_main.set(None, 0, 4, self.gp.Version_Name, 1, None, None, None))
             stage_file_prelude(cs, self.gp)
             c_ast_parse(cs)
             exec_ok = cs.execute()
@@ -394,7 +394,7 @@ class Test_CParserCornerCases(BaseCParserTestCase):
             cs.mf = self.mf
             cs.current_vid = 1
             G.CURRENT_PARSING_FILE = file_path
-            cs.store(m_v_main.set(1, self.gp.Version_Name))
+            cs.store(m_v_main.set(None, 0, 4, self.gp.Version_Name, 1, None, None, None))
             stage_file_prelude(cs, self.gp)
             c_ast_parse(cs)
             exec_ok = cs.execute()
@@ -431,7 +431,7 @@ class Test_CParserCornerCases(BaseCParserTestCase):
             cs.mf = self.mf
             cs.current_vid = 1
             G.CURRENT_PARSING_FILE = file_path
-            cs.store(m_v_main.set(1, self.gp.Version_Name))
+            cs.store(m_v_main.set(None, 0, 4, self.gp.Version_Name, 1, None, None, None))
             stage_file_prelude(cs, self.gp)
             c_ast_parse(cs)
             exec_ok = cs.execute()
