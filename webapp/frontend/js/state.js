@@ -216,22 +216,27 @@ class GlobalState {
     return this.branchTags.has(typeof vname === "string" ? vname : (vname?.vname || ""));
   }
 
-  /** Move the active tab (and the explored revision) to `version`; see `requestVersionSwitch`. */
-  setVersion(version) {
+  /**
+   * Move a tab (the active one by default) to `version`; see `requestVersionSwitch`. The explored
+   * revision follows only when that tab is the active one: a background tab is moved on its own and
+   * reloads in that revision when it is next shown.
+   */
+  setVersion(version, tab = this.getActiveTab()) {
     const vStr = GlobalState.refOf(version);
     if (!vStr) return;
-    this.currentVersion = vStr;
+    const isActive = !tab || tab === this.getActiveTab();
+    if (isActive) this.currentVersion = vStr;
     this.selectedVersion = vStr;
 
-    // Update active tab's version so it reloads in the newly selected version
-    const activeTab = this.getActiveTab();
-    if (activeTab && activeTab.version !== vStr) {
-      activeTab.version = vStr;
+    // Update the tab's version so it reloads in the newly selected version
+    if (tab && tab.version !== vStr) {
+      tab.version = vStr;
       // A code tab re-opens at the top of the file: its saved position belongs to the old revision
-      delete activeTab.scrollTop;
+      delete tab.scrollTop;
     }
 
-    this.emit("version:changed", vStr);
+    if (isActive) this.emit("version:changed", vStr);
+    else this.emit("tabs:changed", { paneId: this.activePaneId, activeTabId: this.getActivePane()?.activeTabId || null });
     this.saveState();
   }
 
@@ -753,6 +758,12 @@ class GlobalState {
       if (tabData.listMode !== undefined) existing.listMode = tabData.listMode;
       if (tabData.filter !== undefined) existing.filter = tabData.filter;
       if (tabData.commitId !== undefined) existing.commitId = tabData.commitId;
+      if (tabData.type === "diff") {
+        // A Compare deep link: the revisions (when given), mode, chips, filters and rename searches
+        for (const key of ["versionA", "versionB", "mode", "statuses", "kconfigQuery", "renameSearches"]) {
+          if (tabData[key] !== undefined) existing[key] = tabData[key];
+        }
+      }
     } else {
       const id = "tab-" + Math.random().toString(36).substring(2, 9);
       // A tab opened from another one inherits that tab's revision, never the header selection

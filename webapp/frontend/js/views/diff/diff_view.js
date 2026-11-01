@@ -4,10 +4,17 @@
 import { api } from "../../api.js";
 import { state } from "../../state.js";
 import { refPicker, shortRef } from "../../components/ref_picker.js";
+import { downloadText } from "../../components/modal.js";
 
 const PAGE_SIZE = 500;
 const KCONFIG_TYPES = { 1: "bool", 2: "tristate", 3: "string", 4: "hex", 5: "int" };
-const STATUS_LABELS = { added: "A", modified: "M", deleted: "D", renamed: "R", removed: "D", changed: "M" };
+const STATUS_LABELS = { added: "A", modified: "M", deleted: "D", renamed: "R", unchanged: "U", removed: "D", changed: "M" };
+const FILE_STATUSES = ["added", "modified", "deleted", "renamed", "unchanged"];
+const DOWNLOAD_FORMATS = [
+  { key: "txt", label: "Paths (.txt)", title: "One path per line (the target path; the base path for deleted files)" },
+  { key: "tsv", label: "Table (.tsv)", title: "Status, similarity, path and old path per file" },
+  { key: "json", label: "JSON (.json)", title: "Revisions, filters and every file with its details" },
+];
 
 function escapeHtml(str) {
   return String(str ?? "")
@@ -30,6 +37,19 @@ export class DiffView {
     this.visibleCount = PAGE_SIZE;
     this.kconfigResult = null;
     this.loadSeq = 0;
+    // Rename search (shown while the renamed chip is active): the quick pass of the diff, the last search
+    this.renameInfo = null;
+    this.renameSimilarity = 50;
+    this.renameScope = "";
+    this.renameSearch = null; // { busy, seq, message, error }
+    // Rename searches applied to this comparison, in order ([{ sim, dir }]); kept on the tab and in
+    // the URL (§5.26) and re-applied whenever the diff is loaded again
+    this.renameSearches = [];
+    this.kconfigFilter = "";
+    // Unchanged files, fetched when the unchanged chip is first selected
+    this.unchangedFiles = null;
+    this.unchangedLoading = null;
+    this.unchangedError = "";
   }
 
   async render(containerEl, tabData) {
@@ -37,7 +57,19 @@ export class DiffView {
     this.containerEl = containerEl;
     this.versionB = tabData.versionB || state.currentVersion;
     this.versionA = tabData.versionA || await this.defaultBaseFor(this.versionB);
-    this.currentMode = tabData.mode || "files";
+    this.currentMode = tabData.mode === "kconfig" ? "kconfig" : "files";
+    // View state recorded on the tab (and so in the URL, §5.26): chips, filters, rename searches
+    this.statusFilter = new Set(String(tabData.statuses || "").split(",").filter((k) => FILE_STATUSES.includes(k)));
+    this.fileFilter = tabData.query || "";
+    this.kconfigFilter = tabData.kconfigQuery || "";
+    this.renameSearches = Array.isArray(tabData.renameSearches)
+      ? tabData.renameSearches.filter((r) => r && Number.isFinite(r.sim)).map((r) => ({ sim: r.sim, dir: r.dir || "" }))
+      : [];
+    const lastSearch = this.renameSearches[this.renameSearches.length - 1];
+    if (lastSearch) {
+      this.renameSimilarity = lastSearch.sim;
+      this.renameScope = lastSearch.dir;
+    }
 
     containerEl.innerHTML = `
       <div class="tools-view-container compare-view">
@@ -66,7 +98,7 @@ export class DiffView {
       </div>
     `;
 
-    this.persist();
+    this.persist({ rendering: true });
     this.updateRefButtons();
     this.updateModeButtons();
 
@@ -78,6 +110,7 @@ export class DiffView {
         onSelect: (ref) => {
           if (which === "a") this.versionA = ref;
           else this.versionB = ref;
+          this.renameSearches = []; // they paired files of the previous revisions
           this.persist();
           this.updateRefButtons();
           this.loadDiff();
@@ -88,6 +121,7 @@ export class DiffView {
     containerEl.querySelector("#cmp-ref-b").onclick = pick("b");
     containerEl.querySelector("#cmp-swap").onclick = () => {
       [this.versionA, this.versionB] = [this.versionB, this.versionA];
+      this.renameSearches = [];
       this.persist();
       this.updateRefButtons();
       this.loadDiff();
@@ -122,15 +156,31 @@ export class DiffView {
     }
   }
 
-  persist() {
+  /**
+   * Record on this tab (and so in its URL, §5.26) what this view is showing. A view whose element
+   * was replaced by a re-render is stale: its state is nobody's address any more.
+   */
+  persistTabState(patch, { rendering = false } = {}) {
+    // render() runs before the pane attaches its element, so the render itself is never stale
+    if (!this.tab || !this.containerEl || (!rendering && !this.containerEl.isConnected)) return;
+    state.updateTabState(this.tab.id, patch);
+  }
+
+  persist(options = {}) {
     if (!this.tab) return;
-    this.tab.versionA = this.versionA;
-    this.tab.versionB = this.versionB;
-    this.tab.mode = this.currentMode;
-    this.tab.title = `Compare ${shortRef(this.versionA)}…${shortRef(this.versionB)}`;
+    const title = `Compare ${shortRef(this.versionA)}…${shortRef(this.versionB)}`;
+    this.persistTabState({
+      versionA: this.versionA,
+      versionB: this.versionB,
+      mode: this.currentMode === "kconfig" ? "kconfig" : "",
+      statuses: FILE_STATUSES.filter((k) => this.statusFilter.has(k)).join(","),
+      query: this.fileFilter,
+      kconfigQuery: this.kconfigFilter,
+      renameSearches: this.renameSearches.length ? this.renameSearches : null,
+      title,
+    }, options);
     const titleEl = document.querySelector(`.tab[data-tab-id="${this.tab.id}"] .tab-title`);
-    if (titleEl) titleEl.textContent = this.tab.title;
-    state.saveState();
+    if (titleEl) titleEl.textContent = title;
   }
 
   updateRefButtons() {
@@ -168,8 +218,14 @@ export class DiffView {
         if (seq !== this.loadSeq) return;
         this.fileChanges = res.changes || [];
         this.fileSummary = res.summary || {};
+        this.renameInfo = res.renames || null;
+        this.renameSearch = null;
+        this.unchangedFiles = null;
+        this.unchangedLoading = null;
+        this.unchangedError = "";
         this.visibleCount = PAGE_SIZE;
         this.renderFileDiff(resContainer);
+        await this.reapplyRenameSearches(seq);
       }
     } catch (e) {
       if (seq !== this.loadSeq) return;
@@ -198,10 +254,19 @@ export class DiffView {
           ${chip("modified", "modified", s.modified_count)}
           ${chip("deleted", "deleted", s.removed_count)}
           ${chip("renamed", "renamed", s.renamed_count)}
-          <span class="compare-chip-static">${s.unchanged_count ?? 0} unchanged</span>
+          ${chip("unchanged", "unchanged", s.unchanged_count)}
         </div>
-        <input type="text" class="compare-filter" id="cmp-file-filter" placeholder="Filter by path…" value="${escapeHtml(this.fileFilter)}" spellcheck="false" />
+        <div class="compare-toolbar-right">
+          <input type="text" class="compare-filter" id="cmp-file-filter" placeholder="Filter by path…" value="${escapeHtml(this.fileFilter)}" spellcheck="false" />
+          <div class="compare-download">
+            <button class="code-btn" id="cmp-download" type="button" title="Download every file matching the current filters (all pages)">⬇ Download <span id="cmp-download-count"></span></button>
+            <div class="compare-download-menu" id="cmp-download-menu" hidden>
+              ${DOWNLOAD_FORMATS.map((f) => `<button type="button" data-format="${f.key}" title="${escapeHtml(f.title)}">${escapeHtml(f.label)}</button>`).join("")}
+            </div>
+          </div>
+        </div>
       </div>
+      <div id="cmp-rename-search"></div>
       <div class="compare-list" id="cmp-file-list"></div>
     `;
 
@@ -212,6 +277,9 @@ export class DiffView {
         else this.statusFilter.add(key);
         btn.classList.toggle("active", this.statusFilter.has(key));
         this.visibleCount = PAGE_SIZE;
+        if (key === "renamed") this.renderRenameSearch();
+        if (key === "unchanged") this.unchangedError = ""; // a reselected chip retries a failed fetch
+        this.persist();
         this.renderFileRows();
       };
     });
@@ -221,14 +289,229 @@ export class DiffView {
       this.fileFilter = filterInput.value;
       this.visibleCount = PAGE_SIZE;
       this.renderFileRows();
+      this.persist();
     };
 
+    const menu = resContainer.querySelector("#cmp-download-menu");
+    const closeMenu = (e) => {
+      if (e && menu.parentElement.contains(e.target)) return;
+      menu.hidden = true;
+      document.removeEventListener("mousedown", closeMenu, true);
+    };
+    resContainer.querySelector("#cmp-download").onclick = () => {
+      if (!menu.hidden) return closeMenu();
+      menu.hidden = false;
+      document.addEventListener("mousedown", closeMenu, true);
+    };
+    menu.querySelectorAll("[data-format]").forEach((btn) => {
+      btn.onclick = () => {
+        closeMenu();
+        this.downloadFileRows(btn.dataset.format);
+      };
+    });
+
+    this.renderRenameSearch();
     this.renderFileRows();
   }
 
+  // ---------------------------------------------------------------------------
+  // Rename search: pairs Git's quick pass left as added + deleted
+  // ---------------------------------------------------------------------------
+
+  renderRenameSearch() {
+    const box = this.containerEl.querySelector("#cmp-rename-search");
+    if (!box) return;
+    if (!this.statusFilter.has("renamed")) {
+      box.innerHTML = "";
+      return;
+    }
+    const info = this.renameInfo;
+    const search = this.renameSearch;
+    let note;
+    if (!info || info.source !== "git") {
+      note = "Only renames with identical content are detected for these revisions (no Git trees).";
+    } else if (info.exhaustive) {
+      note = `Renames are files at least ${info.similarity}% alike; every deleted/added pair was compared.`;
+    } else {
+      note = `Renames are files at least ${info.similarity}% alike, but there were too many added and deleted files to compare every pair: `
+        + "only identical files and files that kept their name were paired. Search to compare every pair (narrow it to a directory for large ranges).";
+    }
+    // Directories holding unpaired added or deleted files, for the scope suggestions
+    const dirs = new Map();
+    for (const ch of this.fileChanges) {
+      if (ch.type !== "added" && ch.type !== "deleted") continue;
+      const parts = (ch.file_path || "").split("/");
+      for (let depth = 1; depth <= Math.min(3, parts.length - 1); depth++) {
+        const d = parts.slice(0, depth).join("/");
+        dirs.set(d, (dirs.get(d) || 0) + 1);
+      }
+    }
+    const dirOptions = [...dirs.entries()].sort((a, b) => b[1] - a[1]).slice(0, 200)
+      .map(([d, n]) => `<option value="${escapeHtml(d)}">${n} unpaired</option>`).join("");
+    const canSearch = info?.source === "git";
+
+    box.innerHTML = `
+      <div class="compare-rename-search">
+        <div class="compare-rename-note">${escapeHtml(note)}</div>
+        ${canSearch ? `
+        <form class="compare-rename-form" id="cmp-rename-form">
+          <label>Similarity ≥ <input type="number" id="cmp-rename-sim" min="1" max="100" step="1" value="${this.renameSimilarity}" />%</label>
+          <label>in <input type="text" id="cmp-rename-scope" list="cmp-rename-dirs" placeholder="whole tree" value="${escapeHtml(this.renameScope)}" spellcheck="false" /></label>
+          <datalist id="cmp-rename-dirs">${dirOptions}</datalist>
+          <button class="code-btn" type="submit" ${search?.busy ? "disabled" : ""}>${search?.busy ? "Searching…" : "Search renames"}</button>
+        </form>` : ""}
+        ${search?.message ? `<div class="compare-rename-status ${search.error ? "error" : ""}">${escapeHtml(search.message)}</div>` : ""}
+      </div>`;
+
+    const form = box.querySelector("#cmp-rename-form");
+    if (form) {
+      form.onsubmit = (e) => {
+        e.preventDefault();
+        const sim = parseInt(box.querySelector("#cmp-rename-sim").value, 10);
+        this.renameSimilarity = Number.isFinite(sim) ? Math.max(1, Math.min(100, sim)) : 50;
+        this.renameScope = box.querySelector("#cmp-rename-scope").value.trim().replace(/^\/+|\/+$/g, "");
+        this.runRenameSearch();
+      };
+    }
+  }
+
+  /** Re-apply the rename searches recorded on the tab (from the URL or before a reload); cached, so fast. */
+  async reapplyRenameSearches(seq) {
+    const searches = this.renameSearches.slice();
+    for (const r of searches) {
+      if (seq !== this.loadSeq) return;
+      this.renameSimilarity = r.sim;
+      this.renameScope = r.dir;
+      await this.runRenameSearch({ record: false });
+    }
+  }
+
+  /** Record an applied search; a search re-pairs its whole directory, so it supersedes those inside it. */
+  recordRenameSearch(sim, dir) {
+    const inside = (d) => !dir || d === dir || d.startsWith(`${dir}/`);
+    this.renameSearches = [...this.renameSearches.filter((r) => !inside(r.dir)), { sim, dir }];
+    this.persist();
+  }
+
+  async runRenameSearch({ record = true } = {}) {
+    const seq = this.loadSeq;
+    const scope = this.renameScope;
+    const similarity = this.renameSimilarity;
+    const where = scope ? `under ${scope}/` : "in the whole tree";
+    this.renameSearch = { busy: true, message: `Comparing every deleted with every added file ${where}…` };
+    this.renderRenameSearch();
+    const started = performance.now();
+    try {
+      const res = await api.searchRenames(this.versionA, this.versionB, scope, similarity);
+      if (seq !== this.loadSeq) return;
+      const c = res.candidates || {};
+      if (res.reason === "too_many") {
+        const pairs = (c.pairs || 0).toLocaleString();
+        this.renameSearch = {
+          error: true,
+          message: `${(c.deleted || 0).toLocaleString()} deleted × ${(c.added || 0).toLocaleString()} added files ${where} = ${pairs} pairs, `
+            + `above the limit of ${(res.max_pairs || 0).toLocaleString()}. Pick a directory to narrow the search.`
+        };
+      } else if (res.reason === "failed") {
+        this.renameSearch = { error: true, message: "The rename search failed (Git did not answer in time)." };
+      } else {
+        const { found, added } = this.applyRenameSearch(res);
+        if (record) this.recordRenameSearch(res.similarity, res.path || "");
+        const secs = ((performance.now() - started) / 1000).toFixed(1);
+        this.renameSearch = {
+          message: `${found} rename${found === 1 ? "" : "s"} at ≥${res.similarity}% ${where} `
+            + `(${added >= 0 ? "+" : ""}${added} vs. before; ${(c.pairs || 0).toLocaleString()} pairs compared, ${secs}s).`
+        };
+        this.renderFileDiff(this.containerEl.querySelector("#diff-results-container"));
+        return;
+      }
+    } catch (e) {
+      if (seq !== this.loadSeq) return;
+      this.renameSearch = { error: true, message: `Rename search failed: ${e.message}` };
+    }
+    this.renderRenameSearch();
+  }
+
+  /**
+   * Replace the pairing of the search's scope with the search result. Renames with both ends in scope
+   * go back to added + deleted and the search pairs them again (a higher threshold drops pairs, a lower
+   * one adds them); renames crossing the scope boundary are kept, since the search did not see them.
+   */
+  applyRenameSearch(res) {
+    const scope = res.path || "";
+    const inScope = (p) => !scope || p === scope || (p || "").startsWith(`${scope}/`);
+    const rows = [];
+    const added = new Map();
+    const deleted = new Map();
+    let before = 0;
+    const row = (type, path, fid) => ({ type, file: path, file_path: path, name: path, fid: fid || 0 });
+    for (const ch of this.fileChanges) {
+      if (ch.type === "renamed" && inScope(ch.file_path) && inScope(ch.old_file)) {
+        before++;
+        added.set(ch.file_path, row("added", ch.file_path, ch.fid));
+        deleted.set(ch.old_file, row("deleted", ch.old_file, 0));
+      } else if (ch.type === "added" && inScope(ch.file_path)) {
+        added.set(ch.file_path, ch);
+      } else if (ch.type === "deleted" && inScope(ch.file_path)) {
+        deleted.set(ch.file_path, ch);
+      } else {
+        rows.push(ch);
+      }
+    }
+    let found = 0;
+    for (const r of res.renames || []) {
+      if (!added.has(r.file) || !deleted.has(r.old_file)) continue;
+      added.delete(r.file);
+      deleted.delete(r.old_file);
+      rows.push({ ...row("renamed", r.file, r.fid), old_file: r.old_file, similarity: r.similarity });
+      found++;
+    }
+    rows.push(...added.values(), ...deleted.values());
+    rows.sort((a, b) => (a.file_path < b.file_path ? -1 : a.file_path > b.file_path ? 1 : 0));
+    this.fileChanges = rows;
+    const count = (t) => rows.filter((ch) => ch.type === t).length;
+    this.fileSummary = {
+      ...this.fileSummary,
+      added_count: count("added"),
+      removed_count: count("deleted"),
+      renamed_count: count("renamed"),
+    };
+    this.visibleCount = PAGE_SIZE;
+    return { found, added: found - before };
+  }
+
+  /** Fetch the unchanged files once per comparison (the unchanged chip); re-renders the rows when done. */
+  ensureUnchangedFiles() {
+    if (this.unchangedFiles || this.unchangedLoading) return this.unchangedLoading || Promise.resolve();
+    const seq = this.loadSeq;
+    this.unchangedError = "";
+    this.unchangedLoading = api.getUnchangedFiles(this.versionA, this.versionB).then((res) => {
+      if (seq !== this.loadSeq) return;
+      this.unchangedFiles = (res.files || []).map((p) => ({ type: "unchanged", file: p, file_path: p, name: p }));
+    }).catch((e) => {
+      if (seq !== this.loadSeq) return;
+      this.unchangedError = e.message || String(e);
+    }).finally(() => {
+      if (seq !== this.loadSeq) return;
+      this.unchangedLoading = null;
+      this.renderFileRows();
+    });
+    return this.unchangedLoading;
+  }
+
+  /**
+   * Rows matching the chips and the path filter. No chip = every change (unchanged files only appear
+   * when their chip is selected); unchanged rows are merged in path order.
+   */
   filteredFileChanges() {
     const q = this.fileFilter.trim().toLowerCase();
-    return this.fileChanges.filter((ch) => {
+    let source = this.fileChanges;
+    if (this.statusFilter.has("unchanged") && this.unchangedFiles) {
+      source = this.statusFilter.size === 1
+        ? this.unchangedFiles
+        : [...this.fileChanges, ...this.unchangedFiles].sort((a, b) => (a.file_path < b.file_path ? -1 : a.file_path > b.file_path ? 1 : 0));
+    }
+    return source.filter((ch) => {
       if (this.statusFilter.size > 0 && !this.statusFilter.has(ch.type)) return false;
       if (q && !(ch.file_path || "").toLowerCase().includes(q) && !(ch.old_file || "").toLowerCase().includes(q)) return false;
       return true;
@@ -238,15 +521,27 @@ export class DiffView {
   renderFileRows() {
     const listEl = this.containerEl.querySelector("#cmp-file-list");
     if (!listEl) return;
+    const wantsUnchanged = this.statusFilter.has("unchanged");
+    if (wantsUnchanged && !this.unchangedFiles && !this.unchangedError) this.ensureUnchangedFiles();
     const rows = this.filteredFileChanges();
+    const pending = wantsUnchanged && !this.unchangedFiles;
+    const countEl = this.containerEl.querySelector("#cmp-download-count");
+    if (countEl) countEl.textContent = pending ? "" : `(${rows.length.toLocaleString()})`;
+    const dlBtn = this.containerEl.querySelector("#cmp-download");
+    if (dlBtn) dlBtn.disabled = pending || rows.length === 0;
+    const note = pending
+      ? `<div class="compare-empty ${this.unchangedError ? "error" : ""}">${this.unchangedError
+        ? `Failed to load the unchanged files: ${escapeHtml(this.unchangedError)}`
+        : "Loading unchanged files…"}</div>`
+      : "";
 
     if (rows.length === 0) {
-      listEl.innerHTML = `<div class="compare-empty">${this.fileChanges.length === 0 ? "No file differences between these revisions." : "No files match the current filter."}</div>`;
+      listEl.innerHTML = note || `<div class="compare-empty">${this.fileChanges.length === 0 && !wantsUnchanged ? "No file differences between these revisions." : "No files match the current filter."}</div>`;
       return;
     }
 
     const shown = rows.slice(0, this.visibleCount);
-    listEl.innerHTML = shown.map((ch, idx) => this.fileRowHtml(ch, idx)).join("") + (
+    listEl.innerHTML = note + shown.map((ch, idx) => this.fileRowHtml(ch, idx)).join("") + (
       rows.length > shown.length
         ? `<button class="compare-more" id="cmp-more" type="button">Show ${Math.min(PAGE_SIZE, rows.length - shown.length)} more (${rows.length - shown.length} remaining)</button>`
         : ""
@@ -254,7 +549,10 @@ export class DiffView {
 
     listEl.querySelectorAll(".compare-row").forEach((rowEl) => {
       const ch = shown[parseInt(rowEl.dataset.idx, 10)];
-      rowEl.querySelector(".compare-row-main").onclick = () => this.toggleFileDiff(rowEl, ch.file_path, ch.old_file);
+      // An unchanged file has no diff: a click opens it at the target revision
+      rowEl.querySelector(".compare-row-main").onclick = ch.type === "unchanged"
+        ? () => this.openFile(this.versionB, ch.file_path)
+        : () => this.toggleFileDiff(rowEl, ch.file_path, ch.old_file, ch.similarity);
       rowEl.querySelector(".compare-row-main").addEventListener("auxclick", (e) => {
         if (e.button === 1) {
           e.preventDefault();
@@ -283,6 +581,9 @@ export class DiffView {
     const type = ch.type || "modified";
     const path = escapeHtml(ch.file_path);
     const renameFrom = type === "renamed" ? `<span class="compare-row-old">${escapeHtml(ch.old_file)} →</span>` : "";
+    const similarity = type === "renamed" && ch.similarity != null && ch.similarity < 100
+      ? `<span class="compare-row-sim" title="Content similarity of the renamed file">${Number(ch.similarity)}%</span>`
+      : "";
     const symDelta = (ch.symbols_added || ch.symbols_removed)
       ? `<span class="compare-row-syms" title="Symbol definitions added / removed">+${ch.symbols_added || 0} / −${ch.symbols_removed || 0} sym</span>`
       : "";
@@ -290,9 +591,10 @@ export class DiffView {
     const canOpenTarget = type !== "deleted";
     return `
       <div class="compare-row" data-idx="${idx}">
-        <div class="compare-row-main" title="Click to show the diff · middle-click to open">
+        <div class="compare-row-main" title="${type === "unchanged" ? "Identical at both revisions · click to open" : "Click to show the diff · middle-click to open"}">
           <span class="compare-status ${type}">${STATUS_LABELS[type] || "?"}</span>
           <span class="compare-row-path">${renameFrom}${path}</span>
+          ${similarity}
           ${symDelta}
           <span class="compare-row-actions">
             ${canOpenBase ? `<button class="code-btn" data-open="a" type="button" title="Open at ${escapeHtml(this.versionA)}">${escapeHtml(shortRef(this.versionA))}</button>` : ""}
@@ -302,7 +604,59 @@ export class DiffView {
       </div>`;
   }
 
-  async toggleFileDiff(rowEl, path, oldPath = "") {
+  /** Download every row matching the chips and the path filter (all pages, not only the rendered ones). */
+  async downloadFileRows(format) {
+    if (this.statusFilter.has("unchanged")) await this.ensureUnchangedFiles();
+    const rows = this.filteredFileChanges();
+    if (rows.length === 0) return;
+    const statuses = [...this.statusFilter].sort();
+    const filter = this.fileFilter.trim();
+    const safe = (v) => String(v).replace(/[^A-Za-z0-9._-]+/g, "_").replace(/^_+|_+$/g, "");
+    const name = ["compare", `${safe(shortRef(this.versionA))}..${safe(shortRef(this.versionB))}`,
+      statuses.length ? statuses.join("-") : "", filter ? safe(filter).slice(0, 40) : ""].filter(Boolean).join("_");
+    // A deleted file only exists at the base; every other row is named by its target path
+    const pathOf = (ch) => ch.file_path;
+
+    if (format === "txt") {
+      downloadText(`${name}.txt`, rows.map(pathOf).join("\n") + "\n");
+      return;
+    }
+    if (format === "tsv") {
+      const cell = (v) => String(v ?? "").replace(/[\t\r\n]/g, " ");
+      const lines = [["status", "similarity", "path", "old_path"].join("\t")];
+      for (const ch of rows) {
+        lines.push([
+          STATUS_LABELS[ch.type] || "?",
+          ch.type === "renamed" ? (ch.similarity ?? "") : "",
+          pathOf(ch),
+          ch.type === "renamed" ? ch.old_file : "",
+        ].map(cell).join("\t"));
+      }
+      downloadText(`${name}.tsv`, lines.join("\n") + "\n", "text/tab-separated-values");
+      return;
+    }
+    const data = {
+      base: this.versionA,
+      target: this.versionB,
+      generated: new Date().toISOString(),
+      filters: {
+        statuses: statuses.length ? statuses : ["added", "modified", "deleted", "renamed"],
+        path_contains: filter,
+        rename_search: this.renameSearch && !this.renameSearch.error && !this.renameSearch.busy
+          ? { similarity: this.renameSimilarity, directory: this.renameScope } : null,
+      },
+      renames: this.renameInfo,
+      count: rows.length,
+      files: rows.map((ch) => {
+        const out = { status: ch.type, path: pathOf(ch) };
+        if (ch.type === "renamed") Object.assign(out, { old_path: ch.old_file, similarity: ch.similarity ?? null });
+        return out;
+      }),
+    };
+    downloadText(`${name}.json`, JSON.stringify(data, null, 2) + "\n", "application/json");
+  }
+
+  async toggleFileDiff(rowEl, path, oldPath = "", similarity = 50) {
     const existing = rowEl.querySelector(".compare-row-diff");
     if (existing) {
       existing.remove();
@@ -316,7 +670,7 @@ export class DiffView {
     rowEl.appendChild(box);
 
     try {
-      const res = await api.getFileDiff(this.versionA, this.versionB, path, oldPath || "");
+      const res = await api.getFileDiff(this.versionA, this.versionB, path, oldPath || "", similarity ?? 50);
       if (!rowEl.contains(box)) return;
       if (res.is_binary) {
         box.innerHTML = `<div class="diff-content">Binary file changed.</div>`;
@@ -381,7 +735,7 @@ export class DiffView {
           <span class="compare-chip-sep"></span>
           <span class="compare-chip-static">Kconfig files: ${s.files_added ?? 0} added · ${s.files_removed ?? 0} removed · ${s.files_modified ?? 0} modified</span>
         </div>
-        <input type="text" class="compare-filter" id="cmp-kc-filter" placeholder="Filter options or files…" spellcheck="false" />
+        <input type="text" class="compare-filter" id="cmp-kc-filter" placeholder="Filter options or files…" value="${escapeHtml(this.kconfigFilter)}" spellcheck="false" />
       </div>
       ${unindexed.length > 0 ? `
         <div class="compare-warning" title="${escapeHtml(unindexed.slice(0, 40).join("\n"))}${unindexed.length > 40 ? "\n…" : ""}">
@@ -409,7 +763,11 @@ export class DiffView {
       this.renderKconfigSymbols(resContainer.querySelector("#cmp-kc-symbols"), symRows);
       this.renderKconfigFiles(resContainer.querySelector("#cmp-kc-files"), fileRows);
     };
-    filterInput.oninput = renderLists;
+    filterInput.oninput = () => {
+      this.kconfigFilter = filterInput.value;
+      renderLists();
+      this.persist();
+    };
     renderLists();
   }
 

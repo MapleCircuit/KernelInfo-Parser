@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import logging
 import posixpath
+import re
 import subprocess
 import threading
 from collections import OrderedDict
@@ -32,6 +33,16 @@ logger = logging.getLogger(__name__)
 KCONFIG_FTYPE = 2
 MAX_SYMBOL_DIFF_FILES = 50
 MAX_FILE_DIFF_BYTES = 512 * 1024
+# Rename detection (git diff-tree -M): a deleted and an added path pair up when their contents are
+# at least RENAME_SIMILARITY % alike. The quick pass of every comparison compares contents only while
+# deleted x added candidates stay within RENAME_LIMIT^2 (beyond that Git pairs exact copies and files
+# that kept their basename); search_renames() compares every candidate pair up to MAX_RENAME_SEARCH_PAIRS.
+RENAME_SIMILARITY = 50
+RENAME_LIMIT = 1000
+RENAME_TIMEOUT = 30.0
+MAX_RENAME_SEARCH_PAIRS = 60_000_000
+RENAME_SEARCH_TIMEOUT = 110.0
+_RENAME_LIMIT_RE = re.compile(rb"at least (\d+)")
 
 
 KCONFIG_TYPE_CODES = {name: code for code, name in KCONFIG_TYPE_NAMES.items()}
@@ -143,39 +154,47 @@ class DiffService:
         db_tree = self._fetch_commit_files(cursor, vid, prefix, norm_path)
         return {p: str(b) for p, b in db_tree.items()}, False
 
+    def _fetch_trees(
+        self, cursor: Any, v1: str, v2: str, prefix: str, norm_path: str,
+    ) -> tuple[str, str, dict[str, str], dict[str, str], bool]:
+        """Level 1 inputs: (vname1, vname2, {path: content_key} of each side, both from Git)."""
+        vid1, vname1, vid2, vname2 = self._resolve_pair(cursor, v1, v2)
+        files_v1, git1 = self._fetch_tree(cursor, vid1, vname1, prefix, norm_path)
+        files_v2, git2 = self._fetch_tree(cursor, vid2, vname2, prefix, norm_path)
+        use_git = git1 and git2
+        if not use_git and (git1 or git2):
+            # Mixed sources cannot be compared by key; fall back to DB on both sides
+            files_v1 = {p: str(b) for p, b in self._fetch_commit_files(cursor, vid1, prefix, norm_path).items()}
+            files_v2 = {p: str(b) for p, b in self._fetch_commit_files(cursor, vid2, prefix, norm_path).items()}
+        return vname1, vname2, files_v1, files_v2, use_git
+
+    def get_unchanged_files(self, v1: str, v2: str, path: str = "") -> dict[str, Any]:
+        """Paths present at both revisions with the same content (the `unchanged_count` of the diff)."""
+        norm_path = path.strip().strip("/")
+        prefix = f"{norm_path}/" if norm_path else ""
+        with get_db_cursor() as cursor:
+            vname1, vname2, files_v1, files_v2, use_git = self._fetch_trees(cursor, v1, v2, prefix, norm_path)
+        files = sorted(p for p, key in files_v2.items() if files_v1.get(p) == key)
+        return {"v1": vname1, "v2": vname2, "path": norm_path, "source": "git" if use_git else "db", "count": len(files), "files": files}
+
     def get_versions_diff(self, v1: str, v2: str, path: str = "") -> dict[str, Any]:
         """Compare file hierarchies between two revisions using 3-level blob-skip diffing."""
         norm_path = path.strip().strip("/")
         prefix = f"{norm_path}/" if norm_path else ""
 
         with get_db_cursor() as cursor:
-            vid1, vname1, vid2, vname2 = self._resolve_pair(cursor, v1, v2)
-
-            # Level 1: content-key comparison ({path: blob_sha} from Git, or {path: blob_id} from DB)
-            files_v1, git1 = self._fetch_tree(cursor, vid1, vname1, prefix, norm_path)
-            files_v2, git2 = self._fetch_tree(cursor, vid2, vname2, prefix, norm_path)
-            use_git = git1 and git2
-            if not use_git and (git1 or git2):
-                # Mixed sources cannot be compared by key; fall back to DB on both sides
-                files_v1 = {p: str(b) for p, b in self._fetch_commit_files(cursor, vid1, prefix, norm_path).items()}
-                files_v2 = {p: str(b) for p, b in self._fetch_commit_files(cursor, vid2, prefix, norm_path).items()}
+            vname1, vname2, files_v1, files_v2, use_git = self._fetch_trees(cursor, v1, v2, prefix, norm_path)
 
             added_paths = [p for p in files_v2 if p not in files_v1]
             deleted_paths = [p for p in files_v1 if p not in files_v2]
             modified_paths = [p for p in files_v2 if p in files_v1 and files_v1[p] != files_v2[p]]
             unchanged_count = len(files_v2) - len(added_paths) - len(modified_paths)
 
-            # Exact renames: a deleted path whose content reappears under a single added path
-            renamed_pairs: list[tuple[str, str]] = []
-            added_by_key: dict[str, list[str]] = {}
-            for p in added_paths:
-                added_by_key.setdefault(files_v2[p], []).append(p)
-            for old_p in sorted(deleted_paths):
-                candidates = added_by_key.get(files_v1[old_p])
-                if candidates:
-                    renamed_pairs.append((old_p, candidates.pop(0)))
-            renamed_old = {o for o, _ in renamed_pairs}
-            renamed_new = {n for _, n in renamed_pairs}
+            renamed_pairs, rename_info = self._pair_renames(
+                vname1, vname2, files_v1, files_v2, added_paths, deleted_paths, norm_path, use_git,
+            )
+            renamed_old = {o for o, _, _ in renamed_pairs}
+            renamed_new = {n for _, n, _ in renamed_pairs}
             added_paths = sorted(p for p in added_paths if p not in renamed_new)
             deleted_paths = sorted(p for p in deleted_paths if p not in renamed_old)
             modified_paths.sort()
@@ -183,7 +202,7 @@ class DiffService:
             # Map content keys to indexed blob_ids (0 when the blob was never parsed)
             if use_git:
                 needed = [files_v2[p] for p in added_paths + modified_paths] + [files_v1[p] for p in deleted_paths + modified_paths]
-                needed += [files_v2[n] for _, n in renamed_pairs]
+                needed += [files_v2[n] for _, n, _ in renamed_pairs]
                 blob_meta = git_tree_resolver.map_blob_hashes(cursor, needed)
 
                 def blob_id_of(key: str) -> int:
@@ -194,7 +213,10 @@ class DiffService:
 
             added = [{"file": p, "fid": blob_id_of(files_v2[p])} for p in added_paths]
             deleted = [{"file": p, "fid": blob_id_of(files_v1[p])} for p in deleted_paths]
-            renamed = [{"file": n, "old_file": o, "fid": blob_id_of(files_v2[n])} for o, n in renamed_pairs]
+            renamed = [
+                {"file": n, "old_file": o, "similarity": sim, "fid": blob_id_of(files_v2[n])}
+                for o, n, sim in renamed_pairs
+            ]
             modified = [
                 {"file": p, "fid_old": blob_id_of(files_v1[p]), "fid_new": blob_id_of(files_v2[p])}
                 for p in modified_paths
@@ -229,6 +251,7 @@ class DiffService:
                     "file": r["file"],
                     "file_path": r["file"],
                     "old_file": r["old_file"],
+                    "similarity": r["similarity"],
                     "name": r["file"],
                     "fid": r.get("fid"),
                 })
@@ -266,8 +289,145 @@ class DiffService:
                 "deleted": deleted,
                 "modified": modified,
                 "renamed": renamed,
+                "renames": rename_info,
                 "changes": changes,
             }
+
+    def _pair_renames(
+        self,
+        vname1: str,
+        vname2: str,
+        files_v1: dict[str, str],
+        files_v2: dict[str, str],
+        added_paths: list[str],
+        deleted_paths: list[str],
+        scope: str,
+        use_git: bool,
+    ) -> tuple[list[tuple[str, str, int]], dict[str, Any]]:
+        """Pair deleted with added paths: Git's similarity detection, then exact content for the rest."""
+        info: dict[str, Any] = {"similarity": RENAME_SIMILARITY, "exhaustive": False, "limit_needed": 0, "source": "exact"}
+        added_set, deleted_set = set(added_paths), set(deleted_paths)
+        pairs: list[tuple[str, str, int]] = []
+        if use_git and added_set and deleted_set:
+            found = self._git_renames(vname1, vname2, RENAME_SIMILARITY, RENAME_LIMIT, scope, RENAME_TIMEOUT)
+            if found is not None:
+                git_pairs, limit_needed = found
+                info.update(source="git", exhaustive=limit_needed == 0, limit_needed=limit_needed)
+                for old_p, new_p, sim in git_pairs:
+                    if old_p in deleted_set and new_p in added_set:
+                        pairs.append((old_p, new_p, sim))
+                        deleted_set.discard(old_p)
+                        added_set.discard(new_p)
+        # Exact renames Git did not report (no Git, or the detection failed): same content key
+        added_by_key: dict[str, list[str]] = {}
+        for p in sorted(added_set):
+            added_by_key.setdefault(files_v2[p], []).append(p)
+        for old_p in sorted(deleted_set):
+            candidates = added_by_key.get(files_v1[old_p])
+            if candidates:
+                pairs.append((old_p, candidates.pop(0), 100))
+        return pairs, info
+
+    @staticmethod
+    def _git_renames(
+        rev1: str, rev2: str, similarity: int, limit: int, scope: str, timeout: float,
+    ) -> tuple[list[tuple[str, str, int]], int] | None:
+        """(renames [(old, new, similarity %)], limit_needed) from git diff-tree -M; None on failure.
+
+        limit_needed is 0 when every candidate pair was compared, else the rename limit Git asked for
+        (it then only paired exact copies and files that kept their basename).
+        """
+        sha1 = git_tree_resolver.resolve_commit_sha(rev1)
+        sha2 = git_tree_resolver.resolve_commit_sha(rev2)
+        if sha1 is None or sha2 is None:
+            return None
+        cmd = ["git", "-C", str(get_repo_dir()), "diff-tree", "-r", "-z", "--name-status", "--diff-filter=R",
+               f"-M{similarity}%", f"-l{limit}", sha1, sha2]
+        if scope:
+            cmd += ["--", f":(literal){scope}"]
+        try:
+            out = subprocess.run(cmd, capture_output=True, timeout=timeout, check=False)
+        except (OSError, subprocess.SubprocessError) as e:
+            logger.warning("git diff-tree -M %s..%s failed: %s", sha1, sha2, e)
+            return None
+        if out.returncode != 0:
+            logger.warning("git diff-tree -M %s..%s failed: %s", sha1, sha2,
+                           out.stderr.decode("utf-8", errors="replace").strip())
+            return None
+        fields = out.stdout.split(b"\0")
+        pairs: list[tuple[str, str, int]] = []
+        i = 0
+        while i + 2 < len(fields):
+            status = fields[i]
+            if status.startswith(b"R"):
+                score = int(status[1:] or b"100")
+                pairs.append((safe_decode(fields[i + 1]), safe_decode(fields[i + 2]), score))
+                i += 3
+            else:
+                i += 2 if status else 1
+        limit_needed = 0
+        m = _RENAME_LIMIT_RE.search(out.stderr)
+        if m or b"rename detection was skipped" in out.stderr:
+            limit_needed = int(m.group(1)) if m else limit + 1
+        return pairs, limit_needed
+
+    def search_renames(self, v1: str, v2: str, path: str = "", similarity: int = RENAME_SIMILARITY) -> dict[str, Any]:
+        """Exhaustive rename search: compare every deleted with every added path under `path`."""
+        norm_path = path.strip().strip("/")
+        if norm_path and not is_safe_rel_path(norm_path):
+            raise HTTPException(status_code=400, detail="Invalid directory.")
+        similarity = max(1, min(100, int(similarity)))
+        prefix = f"{norm_path}/" if norm_path else ""
+        files_v1 = git_tree_resolver.list_tree(v1)
+        files_v2 = git_tree_resolver.list_tree(v2)
+        if files_v1 is None or files_v2 is None:
+            missing = v1 if files_v1 is None else v2
+            raise HTTPException(status_code=404, detail=f"Version or commit '{missing}' not found in Git.")
+
+        def in_scope(p: str) -> bool:
+            return not prefix or p.startswith(prefix) or p == norm_path
+
+        added = [p for p in files_v2 if p not in files_v1 and in_scope(p)]
+        deleted = [p for p in files_v1 if p not in files_v2 and in_scope(p)]
+        # Exact copies are paired by Git before any content comparison; they cost nothing
+        deleted_keys = {files_v1[p] for p in deleted}
+        exact = sum(1 for p in added if files_v2[p] in deleted_keys)
+        candidate_pairs = max(0, len(added) - exact) * max(0, len(deleted) - exact)
+        result: dict[str, Any] = {
+            "v1": v1,
+            "v2": v2,
+            "path": norm_path,
+            "similarity": similarity,
+            "candidates": {"added": len(added), "deleted": len(deleted), "pairs": candidate_pairs},
+            "max_pairs": MAX_RENAME_SEARCH_PAIRS,
+            "complete": False,
+            "reason": "",
+            "renames": [],
+        }
+        if not added or not deleted:
+            result["complete"] = True
+            return result
+        if candidate_pairs > MAX_RENAME_SEARCH_PAIRS:
+            result["reason"] = "too_many"
+            return result
+        # Git compares contents only while each side, and their product, stay within the limit
+        limit = max(RENAME_LIMIT, len(added), len(deleted)) + 1
+        found = self._git_renames(v1, v2, similarity, limit, norm_path, RENAME_SEARCH_TIMEOUT)
+        if found is None:
+            result["reason"] = "failed"
+            return result
+        pairs, limit_needed = found
+        added_set, deleted_set = set(added), set(deleted)
+        with get_db_cursor() as cursor:
+            meta = git_tree_resolver.map_blob_hashes(cursor, [files_v2[n] for _, n, _ in pairs if n in files_v2])
+        result["renames"] = [
+            {"old_file": o, "file": n, "similarity": sim, "fid": meta.get(files_v2[n], (0, 0))[0]}
+            for o, n, sim in pairs if o in deleted_set and n in added_set
+        ]
+        result["complete"] = limit_needed == 0
+        if limit_needed:
+            result["reason"] = "too_many"
+        return result
 
     def get_kconfig_diff(self, v1: str, v2: str) -> dict[str, Any]:
         """Compare Kconfig files and symbol definitions between two revisions (Level 3).
@@ -435,7 +595,7 @@ class DiffService:
         })
         return result
 
-    def get_file_diff(self, v1: str, v2: str, path: str, old_path: str = "") -> dict[str, Any]:
+    def get_file_diff(self, v1: str, v2: str, path: str, old_path: str = "", similarity: int = RENAME_SIMILARITY) -> dict[str, Any]:
         """Unified Git diff of one file between two revisions (old_path for renames)."""
         norm_path = path.strip().strip("/")
         norm_old = (old_path or norm_path).strip().strip("/")
@@ -451,7 +611,8 @@ class DiffService:
         pathspecs = [norm_old] if norm_old == norm_path else [norm_old, norm_path]
         try:
             out = subprocess.run(
-                ["git", "-C", str(get_repo_dir()), "diff", "--no-color", "-M", sha1, sha2, "--", *pathspecs],
+                ["git", "-C", str(get_repo_dir()), "diff", "--no-color", f"-M{max(1, min(100, int(similarity)))}%",
+                 sha1, sha2, "--", *(f":(literal){p}" for p in pathspecs)],
                 capture_output=True,
                 timeout=20,
                 check=False,

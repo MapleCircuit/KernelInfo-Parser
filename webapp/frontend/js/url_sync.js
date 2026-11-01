@@ -4,7 +4,8 @@
  * The hash is the address of what the active tab is showing: its kind and revision, and the
  * state inside it a reader would otherwise have to reproduce by hand — the file and line of a
  * code tab, the ARCH, filter and inspected symbol of a KConfig tab, the query, thread and
- * message of a mailing list tab, the query and commit of a commits tab. Copying the URL
+ * message of a mailing list tab, the query and commit of a commits tab, the revisions, chips,
+ * filter and rename searches of a Compare tab. Copying the URL
  * therefore reopens that same search and that same target (§5.26).
  *
  * Tab and revision changes are announced as `tabs:changed` / `version:changed`; a navigation
@@ -12,6 +13,18 @@
  * pane would discard the view that reported it.
  */
 import { state } from "./state.js";
+
+/** Compare rename searches from `rn=<similarity>:<directory>` entries (applied in order; empty dir = whole tree). */
+function parseRenameSearches(values) {
+  const out = [];
+  for (const value of values) {
+    const sep = value.indexOf(":");
+    const sim = parseInt(sep === -1 ? value : value.slice(0, sep), 10);
+    if (!Number.isFinite(sim) || sim < 1 || sim > 100) continue;
+    out.push({ sim, dir: sep === -1 ? "" : value.slice(sep + 1).replace(/^\/+|\/+$/g, "") });
+  }
+  return out.length ? out : null;
+}
 
 class UrlSynchronizer {
   constructor() {
@@ -126,6 +139,21 @@ class UrlSynchronizer {
           listMode: params.get("mode") === "tree" ? "tree" : "search",
           version: v || state.currentVersion
         });
+      } else if (tabType === "diff") {
+        const kconfigMode = params.get("mode") === "kconfig";
+        state.openTab({
+          type: "diff",
+          title: "Compare",
+          // Without a/b the tab keeps its revisions (or picks its defaults)
+          versionA: params.get("a") || undefined,
+          versionB: params.get("b") || undefined,
+          mode: kconfigMode ? "kconfig" : "files",
+          statuses: kconfigMode ? undefined : (params.get("st") || ""),
+          query: kconfigMode ? undefined : query,
+          kconfigQuery: kconfigMode ? query : undefined,
+          renameSearches: kconfigMode ? undefined : parseRenameSearches(params.getAll("rn")),
+          version: v || state.currentVersion
+        });
       } else if (tabType === "commits") {
         state.openTab({
           type: "commits",
@@ -168,6 +196,17 @@ class UrlSynchronizer {
       if (activeTab.query) params.set("q", activeTab.query);
       if (activeTab.filter && activeTab.filter !== "all") params.set("f", activeTab.filter);
       if (activeTab.listMode === "tree") params.set("mode", "tree");
+    } else if (activeTab.type === "diff") {
+      if (activeTab.versionA) params.set("a", activeTab.versionA);
+      if (activeTab.versionB) params.set("b", activeTab.versionB);
+      if (activeTab.mode === "kconfig") {
+        params.set("mode", "kconfig");
+        if (activeTab.kconfigQuery) params.set("q", activeTab.kconfigQuery);
+      } else {
+        if (activeTab.statuses) params.set("st", activeTab.statuses);
+        if (activeTab.query) params.set("q", activeTab.query);
+        for (const r of activeTab.renameSearches || []) params.append("rn", `${r.sim}:${r.dir || ""}`);
+      }
     } else if (activeTab.type === "commits") {
       if (activeTab.commitId) params.set("cid", activeTab.commitId);
       if (activeTab.query) params.set("q", activeTab.query);

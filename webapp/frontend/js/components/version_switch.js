@@ -2,8 +2,9 @@
  * version_switch.js - Guarded revision switch ("Apply" in the header).
  *
  * The header's Tag, RC, Branch and Commit controls only *select* a revision (`state.selectedVersion`).
- * **Apply** moves the active tab to that revision through `requestVersionSwitch`, and **New Tab**
- * opens a repository explorer on it (`openVersionInNewTab`) — a tab's revision never changes on its
+ * **Apply** moves the active tab to that revision through `requestVersionSwitch` (the tab menu's
+ * **Apply Current Tag** does the same for the right-clicked tab), and **New Tab** opens a repository
+ * explorer on it (`openVersionInNewTab`) — a tab's revision never changes on its
  * own, and links opened from a tab follow that tab's revision.
  *
  * Applying it to a KConfig tab also carries that tab's configuration over to the target revision and
@@ -14,19 +15,21 @@
 import { state, kconfigProfileKey } from "../state.js";
 import { openModal, escapeHtml } from "./modal.js";
 
-/** Apply a revision to the active tab; true when it happened. */
-export async function requestVersionSwitch(target) {
+/**
+ * Apply a revision to a tab — the active one by default, or the one right-clicked in the tab menu
+ * ("Apply Current Tag"); true when it happened.
+ */
+export async function requestVersionSwitch(target, tab = state.getActiveTab()) {
   const ref = typeof target === "string" ? target.trim() : "";
   if (!ref) return false;
   state.setSelectedVersion(ref);
-  const tab = state.getActiveTab();
   if (!tab || tab.version === ref) return false;
   if (tab.type === "kconfig") {
     const plan = kconfigCarryPlan(tab, ref);
     if (!(await confirmKconfigVersionSwitch(tab, ref, plan))) return false;
     applyKconfigCarryPlan(tab, plan);
   }
-  state.setVersion(ref);
+  state.setVersion(ref, tab);
   return true;
 }
 

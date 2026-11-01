@@ -4,7 +4,7 @@ from typing import Any
 from fastapi import APIRouter, Query
 from webapp.backend.services.pahole_service import PaholeService
 from webapp.backend.services.callgraph_service import CallgraphService
-from webapp.backend.services.diff_service import DiffService
+from webapp.backend.services.diff_service import DiffService, RENAME_SIMILARITY
 
 router = APIRouter(prefix="/api", tags=["tools"])
 pahole_service = PaholeService()
@@ -51,6 +51,16 @@ def get_version_diff(
     return diff_service.get_versions_diff(va, vb, path)
 
 
+@router.get("/tools/diff/unchanged")
+def get_unchanged_files(
+    version_a: str = Query(...),
+    version_b: str = Query(...),
+    path: str = Query(""),
+) -> dict[str, Any]:
+    """Files identical at both revisions (same path, same content)."""
+    return diff_service.get_unchanged_files(version_a, version_b, path)
+
+
 @router.get("/tools/diff/file")
 @router.get("/diff/file")
 def get_file_diff(
@@ -58,9 +68,21 @@ def get_file_diff(
     version_b: str = Query(...),
     path: str = Query(...),
     old_path: str = Query(""),
+    similarity: int = Query(RENAME_SIMILARITY, ge=1, le=100),
 ) -> dict[str, Any]:
     """Unified diff of a single file between two releases or commits."""
-    return diff_service.get_file_diff(version_a, version_b, path, old_path)
+    return diff_service.get_file_diff(version_a, version_b, path, old_path, similarity)
+
+
+@router.get("/tools/diff/renames")
+def search_renames(
+    version_a: str = Query(...),
+    version_b: str = Query(...),
+    path: str = Query(""),
+    similarity: int = Query(RENAME_SIMILARITY, ge=1, le=100),
+) -> dict[str, Any]:
+    """Exhaustive rename search between two revisions, optionally under one directory."""
+    return diff_service.search_renames(version_a, version_b, path, similarity)
 
 
 @router.get("/version/diff/kconfig")

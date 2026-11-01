@@ -10,6 +10,7 @@ import { shortRef } from "./ref_picker.js";
 import { escapeHtml } from "./modal.js";
 import { contextMenu } from "./context_menu.js";
 import { toast } from "./toast.js";
+import { requestVersionSwitch } from "./version_switch.js";
 
 // Dragged tab in the drag event's data transfer; the text form is what survives browsers that
 // hand a custom type only to the window the drag started in.
@@ -530,9 +531,33 @@ export class TabsComponent {
       contextMenu.showTabMenu(e.clientX, e.clientY, {
         tab,
         onOpenInNewWindow: () => this.elevateTabToNewWindow({ ...tab }, paneId),
-        onPushToSession: (session) => this.pushTabToSession(tab, paneId, session)
+        onPushToSession: (session) => this.pushTabToSession(tab, paneId, session),
+        onApplyCurrentTag: () => this.applyCurrentTagToTab(tab),
+        onGetTabTag: () => this.getTabTag(tab)
       });
     });
+  }
+
+  /**
+   * Move this tab to the revision selected in the header (§5.24.5) — the header's **Apply**, aimed
+   * at the right-clicked tab instead of the active one, with the same KConfig confirmation.
+   */
+  async applyCurrentTagToTab(tab) {
+    const target = state.selectedVersion;
+    const live = state.findTab(tab?.id);
+    if (!target || !live) return;
+    if (live.version === target) {
+      toast.info(`${live.title} is already on ${shortRef(target)}`);
+      return;
+    }
+    if (await requestVersionSwitch(target, live)) toast.success(`${live.title} switched to ${shortRef(target)}`);
+  }
+
+  /** Select this tab's revision in the header (§5.24.5); no tab is switched. */
+  getTabTag(tab) {
+    const live = state.findTab(tab?.id);
+    const ref = live?.version || state.currentVersion;
+    if (state.setSelectedVersion(ref)) toast.info(`Header revision set to ${shortRef(ref)}`);
   }
 
   /**

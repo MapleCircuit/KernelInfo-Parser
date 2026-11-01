@@ -14,6 +14,9 @@ const HEARTBEAT_TIMEOUT_MS = 5000;
 // (branch reachability walks the whole history of a branch).
 const REQUEST_TIMEOUT_MS = 10000;
 const BRANCH_TAGS_TIMEOUT_MS = 180000;
+// Compare: the revision diff runs Git's rename detection, the rename search compares every candidate pair
+const VERSIONS_DIFF_TIMEOUT_MS = 45000;
+const RENAME_SEARCH_TIMEOUT_MS = 120000;
 
 class ApiClient {
   constructor() {
@@ -678,15 +681,35 @@ class ApiClient {
     const va = this._sanitizeVer(versionA);
     const vb = this._sanitizeVer(versionB);
     const q = new URLSearchParams({ version_a: va, version_b: vb }).toString();
-    return this.request(`/api/tools/diff/versions?${q}`, {}, "tools", `diff2_${this._vk(va)}_${this._vk(vb)}`);
+    return this.request(`/api/tools/diff/versions?${q}`, { timeoutMs: VERSIONS_DIFF_TIMEOUT_MS }, "tools", `diff3_${this._vk(va)}_${this._vk(vb)}`);
   }
 
-  async getFileDiff(versionA, versionB, path, oldPath = "") {
+  async getFileDiff(versionA, versionB, path, oldPath = "", similarity = 50) {
     const va = this._sanitizeVer(versionA);
     const vb = this._sanitizeVer(versionB);
     const params = new URLSearchParams({ version_a: va, version_b: vb, path });
     if (oldPath && oldPath !== path) params.set("old_path", oldPath);
-    return this.request(`/api/tools/diff/file?${params.toString()}`, {}, "tools", `fdiff_${this._vk(va)}_${this._vk(vb)}_${oldPath || ""}_${path}`);
+    // A rename below Git's default 50% only shows as one diff when git diff -M uses its score
+    const sim = Math.max(1, Math.min(50, Math.round(similarity) || 50));
+    if (sim !== 50) params.set("similarity", String(sim));
+    return this.request(`/api/tools/diff/file?${params.toString()}`, {}, "tools", `fdiff_${this._vk(va)}_${this._vk(vb)}_${sim}_${oldPath || ""}_${path}`);
+  }
+
+  /** Paths with the same content at both revisions (the diff's unchanged count; ~29k at v3.0…v3.1). */
+  async getUnchangedFiles(versionA, versionB) {
+    const va = this._sanitizeVer(versionA);
+    const vb = this._sanitizeVer(versionB);
+    const q = new URLSearchParams({ version_a: va, version_b: vb }).toString();
+    return this.request(`/api/tools/diff/unchanged?${q}`, { timeoutMs: VERSIONS_DIFF_TIMEOUT_MS }, "tools", `unchanged_${this._vk(va)}_${this._vk(vb)}`);
+  }
+
+  /** Exhaustive rename search (every deleted x added pair under `path`); can take tens of seconds. */
+  async searchRenames(versionA, versionB, path = "", similarity = 50) {
+    const va = this._sanitizeVer(versionA);
+    const vb = this._sanitizeVer(versionB);
+    const params = new URLSearchParams({ version_a: va, version_b: vb, path, similarity: String(similarity) });
+    return this.request(`/api/tools/diff/renames?${params.toString()}`, { timeoutMs: RENAME_SEARCH_TIMEOUT_MS }, "tools",
+      `renames_${this._vk(va)}_${this._vk(vb)}_${similarity}_${path}`);
   }
 
   async getKconfigDiff(versionA, versionB) {

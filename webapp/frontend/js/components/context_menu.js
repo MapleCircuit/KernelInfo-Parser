@@ -7,6 +7,7 @@ import { api } from "../api.js";
 import { state } from "../state.js";
 import { sessionManager } from "../session_manager.js";
 import { toast } from "./toast.js";
+import { shortRef } from "./ref_picker.js";
 import { copyToClipboard } from "../utils/clipboard.js";
 import { showPersonModal } from "./person_modal.js";
 import { includeSymbolsPopover } from "./include_symbols_popover.js";
@@ -803,12 +804,32 @@ class ContextMenu {
    * Right-click menu of a tab in the tabstrip (§5.24.5). The actions themselves are handed in by
    * `TabsComponent`, which owns tab transfers; this only lays out the menu and the session list.
    */
-  showTabMenu(x, y, { tab, onOpenInNewWindow, onPushToSession }) {
+  showTabMenu(x, y, { tab, onOpenInNewWindow, onPushToSession, onApplyCurrentTag, onGetTabTag }) {
     const sessions = sessionManager
       .getSessionsIndex()
       .filter((s) => s.id !== sessionManager.activeSessionId);
 
+    // Header selection vs. this tab's own revision (§5.24.5): either side can be copied to the other
+    const selected = state.selectedVersion || "";
+    const tabRef = tab.version || state.currentVersion || "";
+    const same = !selected || !tabRef || selected === tabRef;
+
     const items = [
+      {
+        label: `Apply Current Tag${selected ? ` (${shortRef(selected)})` : ""}`,
+        icon: "⤓",
+        shortcut: same ? "already on it" : "",
+        disabled: same,
+        onClick: () => onApplyCurrentTag && onApplyCurrentTag()
+      },
+      {
+        label: `Get Tab Tag${tabRef ? ` (${shortRef(tabRef)})` : ""}`,
+        icon: "⤒",
+        shortcut: same ? "already selected" : "",
+        disabled: same,
+        onClick: () => onGetTabTag && onGetTabTag()
+      },
+      { separator: true },
       {
         label: "Open on New Browser Tab",
         icon: "🗗",
