@@ -80,9 +80,10 @@ def get_kconfig_symbol_history(
     version_name: str,
     symbol_name: str,
     include_rc: bool = Query(False, description="Also list release candidates"),
+    branch: str | None = Query(None, description="Branch the timeline follows (default: chosen for version_name)"),
 ) -> dict[str, Any]:
     """Release-by-release history of every definition of CONFIG_<symbol>, with property-level changes."""
-    return history_service.get_kconfig_history(symbol_name, version_name, include_rc)
+    return history_service.get_kconfig_history(symbol_name, version_name, include_rc, branch=branch or None)
 
 
 @router.get("/version/{version_name}/kconfig/defconfigs")

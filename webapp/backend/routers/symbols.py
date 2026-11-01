@@ -88,16 +88,17 @@ def get_symbol_history(
     name: str | None = Query(None, description="Symbol under the cursor: anchors on its definition"),
     include_rc: bool = Query(False, description="Also list release candidates"),
     arch: ArchParam = DEFAULT_DEFINITION_ARCH,
+    branch: str | None = Query(None, description="Branch the timeline follows (default: chosen for version_name)"),
 ) -> dict[str, Any]:
     """Release-by-release history of the definition at path:line (a Kconfig entry returns its Kconfig history)."""
     return history_service.get_symbol_history(version_name, path, ast_id=ast_id, line=line, name=name,
-                                              include_rc=include_rc, arch=arch)
+                                              include_rc=include_rc, arch=arch, branch=branch or None)
 
 
 @router.get("/tag/{tag_id}/timeline")
-def get_tag_timeline(tag_id: int, include_rc: bool = Query(False)) -> dict[str, Any]:
-    """Release-by-release history of the definition a tag belongs to."""
-    return history_service.get_tag_history(tag_id, include_rc=include_rc)
+def get_tag_timeline(tag_id: int, include_rc: bool = Query(False), branch: str | None = Query(None)) -> dict[str, Any]:
+    """Release-by-release history of the definition a tag belongs to (default branch unless `branch`)."""
+    return history_service.get_tag_history(tag_id, include_rc=include_rc, branch=branch or None)
 
 
 @router.get("/history/commits")

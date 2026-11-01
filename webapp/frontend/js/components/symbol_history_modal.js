@@ -1,9 +1,12 @@
 /**
  * symbol_history_modal.js - Release slider over the history of one definition or Kconfig symbol.
  *
+ * The timeline follows one branch at a time (the Branch selector; by default the header's branch
+ * when the version is on it, else the branch the server picks for the version), so releases of
+ * other branches (stable point releases on master, say) never interleave.
  * Stops are the releases where the definition changed (plus the latest one); runs of releases
  * without change collapse into "…" gaps that expand on click. Release candidates are hidden
- * unless "Include RCs" is ticked. Each stop shows the code (or diff to the previous stop), the
+ * unless "Include RCs" is ticked (disabled when the branch has none). Each stop shows the code (or diff to the previous stop), the
  * Kconfig properties that changed, and on demand the commits behind the change (`git log -L`).
  */
 import { api } from "../api.js";
@@ -46,7 +49,7 @@ export function showSymbolHistoryModal(version, filePath, line, astId = null, na
     title: name || `${filePath.split("/").pop()}:${line}`,
     subtitle: `${filePath}:${line} @ ${shortRef(version)}`,
     version,
-    load: (includeRc) => api.getSymbolHistory(version, filePath, line, astId, { name, includeRc }),
+    load: ({ includeRc, branch }) => api.getSymbolHistory(version, filePath, line, astId, { name, includeRc, branch }),
   });
 }
 
@@ -57,13 +60,17 @@ export function showKconfigHistoryModal(version, name) {
     title: `CONFIG_${sym}`,
     subtitle: `Kconfig symbol @ ${shortRef(version)}`,
     version,
-    load: (includeRc) => api.getKconfigHistory(version, sym, { includeRc }),
+    load: ({ includeRc, branch }) => api.getKconfigHistory(version, sym, { includeRc, branch }),
   });
 }
 
 function openHistory({ title, subtitle, version, load }) {
   const modal = openModal({ title: `🕰 History: ${title}`, subtitle, width: "960px" });
-  const ui = { includeRc: false, expandAll: false, expanded: new Set(), pos: 0, view: "diff", showAllDefs: false, timer: null, res: null };
+  const ui = {
+    includeRc: false, expandAll: false, expanded: new Set(), pos: 0, view: "diff", showAllDefs: false, timer: null, res: null,
+    branch: null, // branch the timeline follows ("" = chosen by the server for `version`), set on first load
+    branches: [], // the repository's branches (GET /api/branches)
+  };
 
   const alive = () => document.body.contains(modal.el);
   const stopPlay = () => {
@@ -86,19 +93,27 @@ function openHistory({ title, subtitle, version, load }) {
 
   async function fetchAndRender(keepVersion = null) {
     stopPlay();
-    modal.body.innerHTML = `<div class="ki-modal-empty">Tracing the definition across indexed releases…</div>`;
+    if (ui.branch === null) {
+      modal.body.innerHTML = `<div class="ki-modal-empty">Reading the branches…</div>`;
+      ui.branches = await api.getBranches().then((r) => r.branches || []).catch(() => []);
+      if (!alive()) return;
+      ui.branch = initialBranch(version, ui.branches);
+    }
+    modal.body.innerHTML = `<div class="ki-modal-empty">Tracing the definition across the releases of ${escapeHtml(ui.branch || "its branch")}…</div>`;
     try {
-      ui.res = await load(ui.includeRc);
+      ui.res = await load({ includeRc: ui.includeRc, branch: ui.branch });
     } catch (err) {
       if (alive()) modal.body.innerHTML = `<div class="ki-modal-error">${escapeHtml(err.message)}</div>`;
       return;
     }
     if (!alive()) return;
     const res = ui.res;
+    if (res.branch) ui.branch = res.branch;
     modal.el.querySelector(".ki-modal-title").textContent = `🕰 History: ${res.ast_name || title}`;
-    // Select the last stop at or before the version the history was opened from
+    // Select the last stop at or before the version kept (else the one the history was opened from)
     const stops = computeStops(res.timeline || [], ui).filter((s) => s.type === "stop");
-    const wantIdx = res.timeline.findIndex((t) => t.vname === (keepVersion || version));
+    const indexOf = (vname) => (vname ? res.timeline.findIndex((t) => t.vname === vname) : -1);
+    const wantIdx = indexOf(keepVersion) >= 0 ? indexOf(keepVersion) : indexOf(version);
     const atOrBefore = wantIdx < 0 ? -1 : stops.reduce((best, s, n) => (s.idx <= wantIdx ? n : best), -1);
     ui.pos = atOrBefore >= 0 ? atOrBefore : Math.max(0, stops.length - 1);
     render();
@@ -126,13 +141,21 @@ function openHistory({ title, subtitle, version, load }) {
     const current = stops.length ? timeline[stops[ui.pos].idx] : null;
     const isKconfig = res.kind === "kconfig";
     const releases = timeline.length;
+    const rcCount = typeof res.rc_count === "number" ? res.rc_count : null;
+    const noRc = rcCount === 0 && !ui.includeRc;
+    const branchNames = ui.branches.map((b) => b.name);
+    if (res.branch && !branchNames.includes(res.branch)) branchNames.unshift(res.branch);
+    const branchOptions = branchNames.map((b) => {
+      const isDefault = ui.branches.some((x) => x.name === b && x.is_default);
+      return `<option value="${escapeHtml(b)}" ${b === res.branch ? "selected" : ""}>${escapeHtml(isDefault ? `${b} (default)` : b)}</option>`;
+    }).join("");
 
     modal.body.innerHTML = `
       <div class="symhist-meta">
         ${isKconfig
           ? `<span>Defined in <strong>${(res.paths || []).length}</strong> Kconfig file${(res.paths || []).length === 1 ? "" : "s"}</span>`
           : `<span>File <code>${escapeHtml(res.path)}</code></span>${res.type_name ? `<span>${escapeHtml(res.type_name)}</span>` : ""}`}
-        <span>Present in <strong>${res.total_versions}</strong> of ${releases} ${ui.includeRc ? "indexed tags" : "releases"}</span>
+        <span>Present in <strong>${res.total_versions}</strong> of ${releases} ${ui.includeRc ? "indexed tags" : "releases"}${res.branch ? ` of <code>${escapeHtml(res.branch)}</code>` : ""}</span>
         <span><strong>${res.change_count}</strong> change${res.change_count === 1 ? "" : "s"}</span>
       </div>
       <div class="symhist-controls">
@@ -141,7 +164,8 @@ function openHistory({ title, subtitle, version, load }) {
         <button class="code-btn" data-act="next" type="button" title="Next change (→)">▶</button>
         <input type="range" min="0" max="${Math.max(0, stops.length - 1)}" value="${ui.pos}" step="1" ${stops.length < 2 ? "disabled" : ""} aria-label="Change">
         <label title="Show every release instead of collapsing unchanged ones"><input type="checkbox" data-act="expand" ${ui.expandAll ? "checked" : ""}> All releases</label>
-        <label title="Also list release candidates (more detail)"><input type="checkbox" data-act="rc" ${ui.includeRc ? "checked" : ""}> Include RCs</label>
+        <label title="${noRc ? `No release candidate is indexed on ${escapeHtml(res.branch || "this branch")}` : "Also list release candidates (more detail)"}"><input type="checkbox" data-act="rc" ${ui.includeRc ? "checked" : ""} ${noRc ? "disabled" : ""}> Include RCs${rcCount ? ` (${rcCount})` : ""}</label>
+        ${branchOptions ? `<label title="Branch the timeline follows: only the releases reachable from it are listed"><select class="symhist-branch" data-act="branch">${branchOptions}</select></label>` : ""}
       </div>
       <div class="symhist-track">
         ${items.length === 0 ? `<span class="ki-modal-empty">No indexed release in this repository yet.</span>` : items.map((s) => {
@@ -192,6 +216,14 @@ function openHistory({ title, subtitle, version, load }) {
       ui.expanded.clear();
       fetchAndRender(current?.vname);
     };
+    const branchSelect = body.querySelector('[data-act="branch"]');
+    if (branchSelect) {
+      branchSelect.onchange = (e) => {
+        ui.branch = e.target.value;
+        ui.expanded.clear();
+        fetchAndRender(current?.vname);
+      };
+    }
     body.querySelectorAll("[data-stop]").forEach((btn) => {
       btn.onclick = () => {
         ui.pos = parseInt(btn.dataset.stop, 10);
@@ -283,6 +315,18 @@ function openHistory({ title, subtitle, version, load }) {
   }
 
   fetchAndRender();
+}
+
+/**
+ * Branch a history opens on: the header's branch (a real one, not a tag layout view) when `version`
+ * is one of its tags or the tags are not read yet; otherwise "" lets the server pick the branch
+ * that holds `version` (the default branch, or the stable branch of a point release).
+ */
+function initialBranch(version, branches) {
+  const header = state.selectedBranch;
+  if (!header || !branches.some((b) => b.name === header)) return "";
+  if (version === header || state.tagOnSelectedBranch(version)) return header;
+  return "";
 }
 
 /**

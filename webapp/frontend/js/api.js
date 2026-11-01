@@ -336,20 +336,26 @@ class ApiClient {
   }
 
   /** Release-by-release history of the definition at path:line (`name`: symbol under the cursor). */
-  async getSymbolHistory(version, path, line, astId = null, { name = "", includeRc = false } = {}) {
+  async getSymbolHistory(version, path, line, astId = null, { name = "", includeRc = false, branch = "" } = {}) {
     const ver = this._sanitizeVer(version);
     const params = new URLSearchParams({ path, line, arch: state.definitionContext().arch });
     if (astId) params.set("ast_id", astId);
     if (name) params.set("name", name);
     if (includeRc) params.set("include_rc", "true");
-    return this.request(`/api/symbols/${encodeURIComponent(ver)}/history?${params.toString()}`);
+    if (branch) params.set("branch", branch);
+    // The first history of a branch walks its tags (~18 s for master when not pre-warmed)
+    return this.request(`/api/symbols/${encodeURIComponent(ver)}/history?${params.toString()}`, { timeoutMs: BRANCH_TAGS_TIMEOUT_MS });
   }
 
   /** Release-by-release history of every definition of CONFIG_<name>, with property-level changes. */
-  async getKconfigHistory(version, name, { includeRc = false } = {}) {
+  async getKconfigHistory(version, name, { includeRc = false, branch = "" } = {}) {
     const ver = this._sanitizeVer(version);
-    const q = includeRc ? "?include_rc=true" : "";
-    return this.request(`/api/kconfig/${encodeURIComponent(ver)}/symbol/${encodeURIComponent(name)}/history${q}`);
+    const params = new URLSearchParams();
+    if (includeRc) params.set("include_rc", "true");
+    if (branch) params.set("branch", branch);
+    const q = params.toString() ? `?${params.toString()}` : "";
+    return this.request(`/api/kconfig/${encodeURIComponent(ver)}/symbol/${encodeURIComponent(name)}/history${q}`,
+      { timeoutMs: BRANCH_TAGS_TIMEOUT_MS });
   }
 
   /** Commits of from..to that touched lines lineS..lineE (at `to`) of path. */
@@ -486,8 +492,12 @@ class ApiClient {
     return this.request(`/api/symbols/${encodeURIComponent(ver)}/lookup?${q}`);
   }
 
-  async getTagTimeline(tagId, { includeRc = false } = {}) {
-    return this.request(`/api/tag/${encodeURIComponent(tagId)}/timeline${includeRc ? "?include_rc=true" : ""}`);
+  async getTagTimeline(tagId, { includeRc = false, branch = "" } = {}) {
+    const params = new URLSearchParams();
+    if (includeRc) params.set("include_rc", "true");
+    if (branch) params.set("branch", branch);
+    const q = params.toString() ? `?${params.toString()}` : "";
+    return this.request(`/api/tag/${encodeURIComponent(tagId)}/timeline${q}`, { timeoutMs: BRANCH_TAGS_TIMEOUT_MS });
   }
 
   // --- KConfig ---

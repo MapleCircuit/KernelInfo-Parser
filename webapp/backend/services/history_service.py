@@ -28,7 +28,10 @@ from webapp.backend.services.tree_resolver import DEFAULT_DEFINITION_ARCH, defin
 
 logger = logging.getLogger(__name__)
 
-RC_RE = re.compile(r"-rc\d+$")
+# Pre-release tags (v3.1-rc2, v2.6.16.30-pre1, ...), the markers of PRERELEASE_MARKERS in routers/versions.py:
+# hidden from a timeline unless include_rc
+RC_RE = re.compile(r"-(?:rc|pre|alpha|beta)\d*$")
+REF_TAG, REF_BRANCH = 1, 2
 KCONFIG_TYPES = (int(ASTT.Kconfig_Config), int(ASTT.Kconfig_Menuconfig))
 KCONFIG_TYPE_NAMES = {1: "bool", 2: "tristate", 3: "string", 4: "hex", 5: "int"}
 # Statuses that end a run of unchanged versions (the stops of the UI slider)
@@ -82,8 +85,13 @@ def normalize_code(code: str, strip_c_comments: bool = True) -> str:
     return " ".join(code.split())
 
 
-def indexed_versions(cursor: Any, include_rc: bool = False) -> list[dict[str, Any]]:
-    """Indexed refs of the active repository, oldest first; release candidates only with include_rc."""
+def indexed_versions(cursor: Any, include_rc: bool = False, scope: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+    """Indexed refs of the active repository, oldest first; release candidates only with include_rc.
+
+    `scope` (history_scope()) keeps one branch: the tags reachable from it and the branch's own ref,
+    so a timeline never interleaves releases of other branches (v2.6.16.62 is on stable/linux-2.6.16.y,
+    not on master). Without it every indexed ref is listed.
+    """
     cursor.execute(
         f"""
         SELECT r.ref_name, r.commit_id, r.ref_type
@@ -94,13 +102,89 @@ def indexed_versions(cursor: Any, include_rc: bool = False) -> list[dict[str, An
         """,
         (get_active_repo_id(cursor),),
     )
+    tags = scope["tags"] if scope else None
     versions = []
+    seen: set[str] = set()
+    rc_count = 0
     for r in cursor.fetchall():
         name = safe_decode(r["ref_name"])
+        if name in seen:
+            continue
+        if tags is not None:
+            on_branch = name in tags if r["ref_type"] == REF_TAG else (r["ref_type"] == REF_BRANCH and name == scope["branch"])
+            if not on_branch:
+                continue
+        seen.add(name)
         is_release = not RC_RE.search(name)
+        rc_count += not is_release
         if is_release or include_rc:
             versions.append({"vname": name, "vid": r["commit_id"], "is_release": is_release})
+    if scope is not None:
+        scope["rc_count"] = rc_count
     return versions
+
+
+def _version_numbers(name: str) -> list[str]:
+    """Leading dotted numbers of a version name: v2.6.32.71 -> ['2', '6', '32', '71']."""
+    m = re.search(r"\d+(?:\.\d+)*", name or "")
+    return m.group(0).split(".") if m else []
+
+
+def history_scope(version_name: str | None, branch: str | None = None) -> dict[str, Any]:
+    """The branch a timeline follows, with the tags reachable from it: {branch, tags, auto, candidates}.
+
+    `branch` given: that branch (400 when not a plain ref, 404 unknown, 503 when Git could not walk it).
+    Otherwise it is chosen for `version_name`: the version itself when it names a branch, the default
+    branch when the version is one of its tags (or is not a tag at all, e.g. a commit), else the
+    branches whose name carries the version's release number (stable/linux-2.6.32.y for v2.6.32.71),
+    the first one reaching it; the default branch when none does. Branch tags are walked once per
+    branch head and cached (routers/versions.py branch_tags()).
+    """
+    # The branch-tag walk and its cache live with GET /api/branch/tags (imported lazily: routers import services)
+    from webapp.backend.routers.versions import _branch_head, branch_tags, get_branches
+
+    def walk(name: str) -> set[str] | None:
+        head = _branch_head(name)
+        if not head:
+            return None
+        tags = branch_tags(head)
+        return set(tags) if tags is not None else None
+
+    if branch:
+        if not is_safe_git_rev(branch):
+            raise HTTPException(status_code=400, detail=f"Invalid branch: {branch}")
+        if not _branch_head(branch):
+            raise HTTPException(status_code=404, detail=f"Unknown branch: {branch}")
+        tags = walk(branch)
+        if tags is None:
+            raise HTTPException(status_code=503, detail=f"Could not list the tags of {branch}")
+        return {"branch": branch, "tags": tags, "auto": False}
+
+    branches = get_branches()["branches"]
+    names = [b["name"] for b in branches]
+    default = next((b["name"] for b in branches if b.get("is_default")), names[0] if names else "")
+    vname = (version_name or "").strip()
+    if vname in names:
+        tags = walk(vname)
+        if tags is not None:
+            return {"branch": vname, "tags": tags, "auto": True}
+    default_tags = walk(default) if default else None
+    if default_tags is None:
+        raise HTTPException(status_code=503, detail=f"Could not list the tags of {default or 'the default branch'}")
+    is_tag = is_safe_git_rev(vname) and bool(_git(["rev-parse", "--verify", "--quiet", f"refs/tags/{vname}"]))
+    if not is_tag or vname in default_tags:
+        return {"branch": default, "tags": default_tags, "auto": True}
+    nums = _version_numbers(vname)
+    for k in range(len(nums) - 1, 1, -1):
+        token = re.compile(rf"(?<![\d.]){re.escape('.'.join(nums[:k]))}(?!\d)")
+        candidates = [n for n in names if n != default and token.search(n)]
+        if not candidates or len(candidates) > 3:
+            continue  # nothing, or too broad a number (2.6 names every 2.6.x branch) to walk them all
+        for name in candidates:
+            tags = walk(name)
+            if tags is not None and vname in tags:
+                return {"branch": name, "tags": tags, "auto": True}
+    return {"branch": default, "tags": default_tags, "auto": True}
 
 
 # (tag_id) -> snippet code text; tags are immutable and content-addressed
@@ -372,21 +456,24 @@ class HistoryService:
         name: str | None = None,
         include_rc: bool = False,
         arch: str = DEFAULT_DEFINITION_ARCH,
+        branch: str | None = None,
     ) -> dict[str, Any]:
-        """Trace the definition anchored at path:line (or tag_id) across the indexed releases.
+        """Trace the definition anchored at path:line (or tag_id) across the indexed releases of one branch.
 
         The anchor is the narrowest definition covering `line` (preferring one named `name`, then
         `ast_id`); when `name` is not defined there (e.g. the cursor is on a call), the definition is
         located through the symbol index first, ranked for `arch`. A Kconfig anchor returns the Kconfig
-        history instead.
+        history instead. `branch` picks the branch the timeline follows (history_scope(): chosen for
+        `version_name` when omitted).
         """
         norm_path = (path or "").strip().strip("/")
+        scope = history_scope(version_name, branch)
         with get_db_cursor() as cursor:
             anchor = self._resolve_anchor(cursor, version_name, norm_path, line, ast_id, tag_id, name, arch)
             if anchor["type_id"] in KCONFIG_TYPES:
-                return self.get_kconfig_history(anchor["name"], version_name, include_rc)
+                return self.get_kconfig_history(anchor["name"], version_name, include_rc, scope=scope)
             norm_path = anchor["path"]
-            versions = indexed_versions(cursor, include_rc)
+            versions = indexed_versions(cursor, include_rc, scope)
             shas = batch_blob_shas([f"{v['vname']}:{norm_path}" for v in versions])
             blob_meta = git_tree_resolver.map_blob_hashes(cursor, [s for s in shas if s])
             blob_ids = sorted({blob_meta[s][0] for s in shas if s and s in blob_meta})
@@ -463,6 +550,8 @@ class HistoryService:
             "type_name": safe_decode(type_row["name"]) if type_row else "",
             "path": norm_path,
             "include_rc": include_rc,
+            "branch": scope["branch"],
+            "rc_count": scope["rc_count"],
             "moved_to": forward[0] if forward else None,
             "moved_from": backward[0] if backward else None,
             "lineage_tag_ids": [anchor["tag_id"]] + [t for t in sorted(lineage) if t != anchor["tag_id"]][:LINEAGE_LIMIT],
@@ -472,7 +561,7 @@ class HistoryService:
             "timeline": timeline,
         }
 
-    def get_tag_history(self, tag_id: int, include_rc: bool = False) -> dict[str, Any]:
+    def get_tag_history(self, tag_id: int, include_rc: bool = False, branch: str | None = None) -> dict[str, Any]:
         """History of the definition a tag belongs to, located through any blob that holds it."""
         with get_db_cursor() as cursor:
             row = None
@@ -496,7 +585,7 @@ class HistoryService:
                     break
         if not row:
             raise HTTPException(status_code=404, detail=f"Tag {tag_id} not found.")
-        return self.get_symbol_history(None, safe_decode(row["fname"]), tag_id=tag_id, include_rc=include_rc)
+        return self.get_symbol_history(None, safe_decode(row["fname"]), tag_id=tag_id, include_rc=include_rc, branch=branch)
 
     @staticmethod
     def _anchor_row(cursor: Any, tag_id: int, path: str, line_s: int | None = None) -> dict[str, Any]:
@@ -684,13 +773,23 @@ class HistoryService:
 
     # --- Kconfig symbols ------------------------------------------------------------------------------------
 
-    def get_kconfig_history(self, name: str, version_name: str | None = None, include_rc: bool = False) -> dict[str, Any]:
-        """Every definition of CONFIG_<name> across the indexed releases, with property-level changes."""
+    def get_kconfig_history(
+        self,
+        name: str,
+        version_name: str | None = None,
+        include_rc: bool = False,
+        branch: str | None = None,
+        scope: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Every definition of CONFIG_<name> across the indexed releases of one branch, with property-level
+        changes (`branch` / `scope` as in get_symbol_history)."""
         sym = (name or "").strip()
         if sym.startswith("CONFIG_"):
             sym = sym[7:]
         if not sym:
             raise HTTPException(status_code=400, detail="Kconfig symbol name is required.")
+        if scope is None:
+            scope = history_scope(version_name, branch)
         with get_db_cursor() as cursor:
             cursor.execute(
                 f"""
@@ -724,7 +823,7 @@ class HistoryService:
                 blob_ids + blob_ids,
             )
             paths = sorted({safe_decode(r["fname"]) for r in cursor.fetchall()})
-            versions = indexed_versions(cursor, include_rc)
+            versions = indexed_versions(cursor, include_rc, scope)
             specs = [f"{v['vname']}:{p}" for v in versions for p in paths]
             shas = batch_blob_shas(specs)
             indexed = git_tree_resolver.map_blob_hashes(cursor, [s for s in shas if s and s not in sha_to_blob])
@@ -818,6 +917,8 @@ class HistoryService:
             "path": (current["defs"][0]["path"] if current and current["defs"] else (paths[0] if paths else "")),
             "paths": sorted(all_paths),
             "include_rc": include_rc,
+            "branch": scope["branch"],
+            "rc_count": scope["rc_count"],
             "total_versions": present,
             "change_count": changes,
             "snippets": {str(t): c for t, c in codes.items()},

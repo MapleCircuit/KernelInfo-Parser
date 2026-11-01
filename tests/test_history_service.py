@@ -56,6 +56,9 @@ class TestHistoryHelpers(unittest.TestCase):
         self.assertTrue(RC_RE.search("v2.6.15-rc3"))
         self.assertFalse(RC_RE.search("v2.6.15"))
         self.assertFalse(RC_RE.search("v3.0"))
+        self.assertTrue(RC_RE.search("v2.6.16.30-pre1"))
+        self.assertTrue(RC_RE.search("v2.6.16.28-rc1"))
+        self.assertFalse(RC_RE.search("v2.6.16.28"))
 
     def test_slice_extent_coordinates(self) -> None:
         raw_lines = [
@@ -187,6 +190,18 @@ class TestHistoryIntegration(unittest.TestCase):
         everything = self.history(include_rc=True)["timeline"]
         self.assertGreaterEqual(len(everything), len(releases))
         self.assertEqual([t["vname"] for t in everything if t["is_release"]], [t["vname"] for t in releases])
+
+    def test_timeline_follows_one_branch(self) -> None:
+        """Releases of other branches never interleave: each listed tag is reachable from the branch."""
+        res = self.history()
+        branch = res["branch"]
+        self.assertTrue(branch)
+        reachable = set(subprocess.run(
+            ["git", "-C", self.repo, "for-each-ref", f"--merged={branch}", "--format=%(refname:short)", "refs/tags"],
+            capture_output=True, text=True,
+        ).stdout.split())
+        self.assertTrue(all(t["vname"] in reachable or t["vname"] == branch for t in res["timeline"]))
+        self.assertGreaterEqual(res["rc_count"], 0)
 
     def test_anchor_from_a_call_site(self) -> None:
         res = history_service.get_symbol_history(self.version, "kernel/sched.c", line=1, name=self.NAME)

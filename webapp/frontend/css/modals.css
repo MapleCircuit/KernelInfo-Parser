@@ -919,6 +919,21 @@
   cursor: pointer;
 }
 
+.symhist-controls label:has(input:disabled) {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.symhist-branch {
+  max-width: 220px;
+  background: var(--bg-secondary);
+  color: var(--text-primary);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-sm);
+  padding: 2px 4px;
+  font-size: 12px;
+}
+
 .symhist-track {
   display: flex;
   flex-wrap: wrap;
