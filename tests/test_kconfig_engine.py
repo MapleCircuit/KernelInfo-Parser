@@ -617,17 +617,23 @@ class TestKconfigKernelFidelity(unittest.TestCase):
     def test_presets_follow_the_top_makefile(self) -> None:
         presets = {p["id"]: p for p in self.svc.get_env_presets("v3.0")["targets"]}
         self.assertEqual(presets["x86_64"]["env"]["SRCARCH"], "x86")
-        self.assertEqual(presets["x86_64"]["canonical_defconfig"], "x86_64_defconfig")
-        self.assertEqual(presets["x86"]["canonical_defconfig"], "i386_defconfig")
         self.assertEqual(presets["sparc64"]["env"]["SRCARCH"], "sparc")
-        self.assertEqual(presets["arm"]["canonical_defconfig"], "versatile_defconfig")
 
-    def test_resolved_export_and_validation(self) -> None:
-        exported = self.svc.export_file("v3.0", {"arch": "x86_64", "symbols": {"IKCONFIG_PROC": "y", "SMP": "n"}})
-        self.assertIn("# CONFIG_SMP is not set", exported["content"])
-        self.assertNotIn("CONFIG_IKCONFIG_PROC=y", exported["content"])
-        report = self.svc.validate_assignments("v3.0", {"arch": "x86_64", "symbols": {"IKCONFIG_PROC": "y"}})
-        self.assertEqual(report["adjusted_symbols"].get("IKCONFIG_PROC"), "n")
+        def default(arch: str) -> list[str]:
+            return [d["name"] for d in self.svc.get_defconfigs("v3.0", arch)["defconfigs"] if d["is_canonical"]]
+
+        # KBUILD_DEFCONFIG of the ARCH's Makefile (arch/x86/Makefile picks per ARCH value)
+        self.assertEqual(default("x86_64"), ["x86_64_defconfig"])
+        self.assertEqual(default("x86"), ["i386_defconfig"])
+        self.assertEqual(default("arm"), ["versatile_defconfig"])
+
+    def test_assignments_load_with_conf_read_semantics(self) -> None:
+        # The auto-solver's starting configuration: values kconfig would not keep are resolved away
+        _, ev, _ = self.svc._load("v3.0", "x86_64", {"symbols": {"IKCONFIG_PROC": "y", "SMP": "n"}})
+        content = ev.write_config()
+        self.assertIn("# CONFIG_SMP is not set", content)
+        self.assertNotIn("CONFIG_IKCONFIG_PROC=y", content)
+        self.assertEqual(ev.value("IKCONFIG_PROC"), "n")
 
     def test_javascript_engine_matches_conf(self) -> None:
         node = shutil.which("node")

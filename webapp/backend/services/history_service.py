@@ -34,8 +34,6 @@ RC_RE = re.compile(r"-(?:rc|pre|alpha|beta)\d*$")
 REF_TAG, REF_BRANCH = 1, 2
 KCONFIG_TYPES = (int(ASTT.Kconfig_Config), int(ASTT.Kconfig_Menuconfig))
 KCONFIG_TYPE_NAMES = {1: "bool", 2: "tristate", 3: "string", 4: "hex", 5: "int"}
-# Statuses that end a run of unchanged versions (the stops of the UI slider)
-CHANGE_STATUSES = ("introduced", "added", "modified", "cosmetic", "removed")
 LINEAGE_LIMIT = 500
 COMMIT_FORMAT = "--format=%H%x00%an%x00%ae%x00%at%x00%s"
 _C_COMMENT_RE = re.compile(r"/\*.*?\*/|//[^\n]*", re.S)
@@ -448,17 +446,16 @@ class HistoryService:
 
     def get_symbol_history(
         self,
-        version_name: str | None,
+        version_name: str,
         path: str,
         ast_id: int | None = None,
         line: int | None = None,
-        tag_id: int | None = None,
         name: str | None = None,
         include_rc: bool = False,
         arch: str = DEFAULT_DEFINITION_ARCH,
         branch: str | None = None,
     ) -> dict[str, Any]:
-        """Trace the definition anchored at path:line (or tag_id) across the indexed releases of one branch.
+        """Trace the definition anchored at path:line across the indexed releases of one branch.
 
         The anchor is the narrowest definition covering `line` (preferring one named `name`, then
         `ast_id`); when `name` is not defined there (e.g. the cursor is on a call), the definition is
@@ -469,7 +466,7 @@ class HistoryService:
         norm_path = (path or "").strip().strip("/")
         scope = history_scope(version_name, branch)
         with get_db_cursor() as cursor:
-            anchor = self._resolve_anchor(cursor, version_name, norm_path, line, ast_id, tag_id, name, arch)
+            anchor = self._resolve_anchor(cursor, version_name, norm_path, line, ast_id, name, arch)
             if anchor["type_id"] in KCONFIG_TYPES:
                 return self.get_kconfig_history(anchor["name"], version_name, include_rc, scope=scope)
             norm_path = anchor["path"]
@@ -482,10 +479,6 @@ class HistoryService:
             codes = tag_codes(cursor, {c["tag_id"] for rows in cands.values() for c in rows} | {anchor["tag_id"]})
             cursor.execute("SELECT name FROM m_type_descriptor WHERE type_id = %s;", (anchor["type_id"],))
             type_row = cursor.fetchone()
-            cursor.execute("SELECT e_tag_id FROM m_moved_tag WHERE s_tag_id = %s;", (anchor["tag_id"],))
-            forward = [r["e_tag_id"] for r in cursor.fetchall()]
-            cursor.execute("SELECT s_tag_id FROM m_moved_tag WHERE e_tag_id = %s;", (anchor["tag_id"],))
-            backward = [r["s_tag_id"] for r in cursor.fetchall()]
 
         strip_comments = not norm_path.split("/")[-1].startswith("Kconfig")
         timeline: list[dict[str, Any]] = []
@@ -552,40 +545,11 @@ class HistoryService:
             "include_rc": include_rc,
             "branch": scope["branch"],
             "rc_count": scope["rc_count"],
-            "moved_to": forward[0] if forward else None,
-            "moved_from": backward[0] if backward else None,
-            "lineage_tag_ids": [anchor["tag_id"]] + [t for t in sorted(lineage) if t != anchor["tag_id"]][:LINEAGE_LIMIT],
             "total_versions": present,
             "change_count": changes,
             "snippets": {str(t): codes.get(t, "") for t in seen_tags},
             "timeline": timeline,
         }
-
-    def get_tag_history(self, tag_id: int, include_rc: bool = False, branch: str | None = None) -> dict[str, Any]:
-        """History of the definition a tag belongs to, located through any blob that holds it."""
-        with get_db_cursor() as cursor:
-            row = None
-            for sql in (
-                """
-                SELECT fn.fname FROM m_bridge_tag bt
-                JOIN m_bridge_checkpoint bc ON bc.blob_id = bt.blob_id
-                JOIN m_file_name fn ON fn.fnid = bc.fnid
-                WHERE bt.tag_id = %s LIMIT 1;
-                """,
-                """
-                SELECT fn.fname FROM m_bridge_tag bt
-                JOIN m_commit_file cf ON cf.blob_id = bt.blob_id
-                JOIN m_file_name fn ON fn.fnid = cf.fnid
-                WHERE bt.tag_id = %s LIMIT 1;
-                """,
-            ):
-                cursor.execute(sql, (tag_id,))
-                row = cursor.fetchone()
-                if row:
-                    break
-        if not row:
-            raise HTTPException(status_code=404, detail=f"Tag {tag_id} not found.")
-        return self.get_symbol_history(None, safe_decode(row["fname"]), tag_id=tag_id, include_rc=include_rc, branch=branch)
 
     @staticmethod
     def _anchor_row(cursor: Any, tag_id: int, path: str, line_s: int | None = None) -> dict[str, Any]:
@@ -612,18 +576,13 @@ class HistoryService:
     def _resolve_anchor(
         self,
         cursor: Any,
-        version_name: str | None,
+        version_name: str,
         path: str,
         line: int | None,
         ast_id: int | None,
-        tag_id: int | None,
         name: str | None,
         arch: str = DEFAULT_DEFINITION_ARCH,
     ) -> dict[str, Any]:
-        if tag_id is not None:
-            return self._anchor_row(cursor, tag_id, path)
-        if not version_name:
-            raise HTTPException(status_code=400, detail="version_name is required without tag_id.")
         vid, vname = get_version_info(cursor, version_name)
         rev = vname if vid is not None else version_name
         sha = batch_blob_shas([f"{rev}:{path}"])[0]

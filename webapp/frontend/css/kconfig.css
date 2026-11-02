@@ -326,16 +326,6 @@
   color: var(--text-muted);
 }
 
-.kconfig-choice-box {
-  background: var(--bg-secondary);
-  border: 1px solid var(--border-color);
-  border-radius: var(--radius-sm);
-  padding: 8px 12px;
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-}
-
 /* Compare-with-defconfig table */
 .kconfig-cmp-table {
   width: 100%;

@@ -10,13 +10,15 @@ export class CallgraphView {
     this.currentVersion = "v3.0";
     this.functionName = "schedule";
     this.containerEl = null;
+    this.tabId = null;
   }
 
   async render(containerEl, tabData) {
     this.containerEl = containerEl;
+    this.tabId = tabData.id;
     this.currentVersion = tabData.version || state.currentVersion;
     if (tabData.functionName) {
-      this.functionName = tabData.functionName;
+      this.functionName = tabData.functionName.replace(/\(\)$/, "").trim();
     }
 
     containerEl.innerHTML = `
@@ -24,14 +26,14 @@ export class CallgraphView {
         <div style="display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid var(--border-color);padding-bottom:12px;">
           <div>
             <div style="font-size:18px;font-weight:600;color:var(--accent-purple);">
-              Callgraph: <span style="font-family:var(--font-mono);">${this.functionName}()</span>
+              Callgraph: <span class="callgraph-header-name" style="font-family:var(--font-mono);">${escapeHtml(this.functionName)}()</span>
             </div>
             <div style="font-size:12px;color:var(--text-muted);margin-top:4px;">
               Bidirectional caller/callee cross-reference explorer.
             </div>
           </div>
           <div style="display:flex;gap:8px;">
-            <input type="text" id="callgraph-input" value="${this.functionName}" placeholder="Function name..." />
+            <input type="text" id="callgraph-input" value="${escapeHtml(this.functionName)}" placeholder="Function name..." />
             <button class="code-btn active" id="callgraph-btn">Explore</button>
             <button class="code-btn" id="callgraph-btn-nodemap" title="Open interactive DAG in NodeMap">🗺️ Open in NodeMap</button>
           </div>
@@ -46,15 +48,39 @@ export class CallgraphView {
     const btn = containerEl.querySelector("#callgraph-btn");
     const input = containerEl.querySelector("#callgraph-input");
 
-    btn.onclick = () => {
+    const triggerSearch = () => {
       this.functionName = input.value.trim() || "schedule";
       this.loadCallgraph();
     };
+
+    btn.onclick = triggerSearch;
+    input.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") {
+        triggerSearch();
+      }
+    });
 
     await this.loadCallgraph();
   }
 
   async loadCallgraph() {
+    const headerNameEl = this.containerEl.querySelector(".callgraph-header-name");
+    if (headerNameEl) {
+      headerNameEl.textContent = `${this.functionName}()`;
+    }
+    const inputEl = this.containerEl.querySelector("#callgraph-input");
+    if (inputEl) {
+      inputEl.value = this.functionName;
+    }
+
+    const tab = (this.tabId ? state.findTab(this.tabId) : null) || state.getActiveTab();
+    if (tab && tab.type === "callgraph") {
+      state.updateTabState(tab.id, {
+        functionName: this.functionName,
+        title: `Callgraph: ${this.functionName}`
+      });
+    }
+
     const resContainer = this.containerEl.querySelector("#callgraph-results");
     try {
       const res = await api.getCallgraph(this.currentVersion, this.functionName);
@@ -133,14 +159,16 @@ export class CallgraphView {
                 ? callers.map((c) => {
                     const funcName = c.name || c.caller_name || c.caller || "";
                     const filePath = c.file_path || c.file_name || c.file || "";
+                    const safeFunc = escapeHtml(funcName);
+                    const safeFile = escapeHtml(filePath);
                     return `
                     <div class="callgraph-node-item" style="display:flex;justify-content:space-between;align-items:center;">
-                      <div class="callgraph-jump" data-func="${funcName}" style="cursor:pointer;flex:1;">
-                        <span style="font-weight:500;">${funcName}()</span>
+                      <div class="callgraph-jump" data-func="${safeFunc}" style="cursor:pointer;flex:1;">
+                        <span style="font-weight:500;">${safeFunc}()</span>
                         ${(c.call_count && c.call_count > 1) ? `<span style="font-size:10px;padding:1px 5px;border-radius:10px;background:var(--bg-tertiary);color:var(--accent-orange);margin-left:6px;font-weight:600;" title="${c.call_count} calls">×${c.call_count}</span>` : ""}
-                        <span class="callgraph-node-file">${filePath}</span>
+                        <span class="callgraph-node-file">${safeFile}</span>
                       </div>
-                      ${filePath ? `<span class="callgraph-src-link" data-path="${filePath}" data-line="${c.line_no || c.line_s || 1}" style="color:var(--accent-blue);font-size:10px;cursor:pointer;" title="Open in Code View">[📄 src]</span>` : ""}
+                      ${filePath ? `<span class="callgraph-src-link" data-path="${safeFile}" data-line="${c.line_no || c.line_s || 1}" style="color:var(--accent-blue);font-size:10px;cursor:pointer;" title="Open in Code View">[📄 src]</span>` : ""}
                     </div>
                   `;
                   }).join("")
@@ -160,14 +188,16 @@ export class CallgraphView {
                 ? callees.map((c) => {
                     const funcName = c.name || c.callee_name || c.callee || "";
                     const filePath = c.file_path || c.file_name || c.file || "";
+                    const safeFunc = escapeHtml(funcName);
+                    const safeFile = escapeHtml(filePath);
                     return `
                     <div class="callgraph-node-item" style="display:flex;justify-content:space-between;align-items:center;">
-                      <div class="callgraph-jump" data-func="${funcName}" style="cursor:pointer;flex:1;">
-                        <span style="font-weight:500;">${funcName}()</span>
+                      <div class="callgraph-jump" data-func="${safeFunc}" style="cursor:pointer;flex:1;">
+                        <span style="font-weight:500;">${safeFunc}()</span>
                         ${(c.call_count && c.call_count > 1) ? `<span style="font-size:10px;padding:1px 5px;border-radius:10px;background:var(--bg-tertiary);color:var(--accent-blue);margin-left:6px;font-weight:600;" title="${c.call_count} calls">×${c.call_count}</span>` : ""}
-                        <span class="callgraph-node-file">${filePath}</span>
+                        <span class="callgraph-node-file">${safeFile}</span>
                       </div>
-                      ${filePath ? `<span class="callgraph-src-link" data-path="${filePath}" data-line="${c.line_no || c.line || 1}" style="color:var(--accent-blue);font-size:10px;cursor:pointer;" title="Open in Code View">[📄 src]</span>` : ""}
+                      ${filePath ? `<span class="callgraph-src-link" data-path="${safeFile}" data-line="${c.line_no || c.line || 1}" style="color:var(--accent-blue);font-size:10px;cursor:pointer;" title="Open in Code View">[📄 src]</span>` : ""}
                     </div>
                   `;
                   }).join("")

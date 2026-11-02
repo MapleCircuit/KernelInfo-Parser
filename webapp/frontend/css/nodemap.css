@@ -123,8 +123,6 @@
 
 .node-badge.struct { background: rgba(57, 197, 187, 0.2); color: var(--accent-cyan); }
 .node-badge.func { background: rgba(188, 140, 255, 0.2); color: var(--accent-purple); }
-.node-badge.file { background: rgba(88, 166, 255, 0.2); color: var(--accent-blue); }
-.node-badge.kconfig { background: rgba(63, 185, 80, 0.2); color: var(--accent-green); }
 
 .node-body {
   padding: 8px 10px;

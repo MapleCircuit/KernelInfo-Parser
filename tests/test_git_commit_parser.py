@@ -14,13 +14,14 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from fastapi import HTTPException
 from parser.git_ast.git_types import CommitRole, GitContributor, GitCommit, CommitDiffHunk
 from parser.git_ast.git_commit_parser import GitCommitParser
-from webapp.main import (
-    get_person_profile,
-    get_version_commits,
-    get_commit_detail,
-    get_file_blame,
-    get_commit_timeline,
-)
+from webapp.backend.services.git_service import GitService
+from webapp.backend.services.maintainer_service import MaintainerService
+
+_git = GitService()
+get_person_profile = MaintainerService().get_person_profile
+get_version_commits = _git.get_commits
+get_commit_detail = _git.get_commit_detail
+get_commit_timeline = _git.get_commit_timeline
 
 
 SAMPLE_GIT_LOG = """COMMIT_DELIM_START_7f9a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a
@@ -295,12 +296,12 @@ class TestWebAppGitEndpoints(unittest.TestCase):
     """Test suite for FastAPI Git Blame, Timeline, Commit, and Contributor Endpoints."""
 
     def test_commits_list_and_search(self) -> None:
-        res = get_version_commits("v3.0", limit=10, offset=0)
+        res = get_version_commits("v3.0", page=1, limit=10)
         self.assertIn("commits", res)
-        self.assertIn("total_count", res)
-        if not res.get("commits") or res.get("total_count", 0) == 0:
+        self.assertEqual(res["offset"], 0)
+        if not res.get("commits"):
             raise unittest.SkipTest("m_commit table has 0 commits for v3.0 in active database.")
-        self.assertGreaterEqual(res["total_count"], 1)
+        self.assertEqual(res["total"], len(res["commits"]))
         self.assertLessEqual(len(res["commits"]), 10)
 
         # Verify commit structure
@@ -317,10 +318,9 @@ class TestWebAppGitEndpoints(unittest.TestCase):
         self.assertGreaterEqual(len(commits_res["commits"]), 1)
         target_hash = commits_res["commits"][0]["commit_hash"]
 
-        detail = get_commit_detail("v3.0", target_hash)
+        detail = get_commit_detail(target_hash)
         self.assertEqual(detail["commit_hash"], target_hash)
         self.assertIn("author", detail)
-        self.assertIn("committer", detail)
         self.assertIn("message", detail)
         self.assertIn("contributors", detail)
         self.assertIn("files", detail)
@@ -334,41 +334,33 @@ class TestWebAppGitEndpoints(unittest.TestCase):
                 raise unittest.SkipTest("Person profile not populated in active database.")
             raise
         self.assertIn("person", res)
-        self.assertIn("latest_patch", res)
         self.assertIn("contribution_stats", res)
         self.assertIn("recent_commits", res)
-
-        # Check latest patch
-        lp = res["latest_patch"]
-        if lp:
-            self.assertIn("commit_hash", lp)
-            self.assertIn("subject", lp)
-            self.assertIn("author_date_iso", lp)
+        for c in res["recent_commits"]:
+            self.assertIn("commit_hash", c)
+            self.assertIn("subject", c)
 
         # Check contribution stats
         stats = res["contribution_stats"]
-        self.assertIn("authored_commits", stats)
-        self.assertIn("co_developed_commits", stats)
-        self.assertIn("signed_off_commits", stats)
+        # The counts the profile shows
+        self.assertEqual(set(stats), {"authored_commits", "signed_off_commits", "reviewed_commits"})
 
-    def test_commit_timeline_and_top_contributors(self) -> None:
+    def test_commit_timeline_paging(self) -> None:
         res = get_commit_timeline("v3.0", limit=20)
         self.assertIn("timeline", res)
-        self.assertIn("total_commits", res)
-        self.assertIn("top_contributors", res)
         self.assertGreaterEqual(len(res["timeline"]), 1)
-        self.assertGreaterEqual(len(res["top_contributors"]), 1)
+        self.assertLessEqual(len(res["timeline"]), 20)
+        for key in ("has_past", "has_future", "next_past_cursor", "next_future_cursor"):
+            self.assertIn(key, res)
+        self.assertIn("author_name", res["timeline"][0])
 
-        top_contrib = res["top_contributors"][0]
-        self.assertIn("name", top_contrib)
-        self.assertIn("commits_count", top_contrib)
-
-    def test_file_blame_endpoint(self) -> None:
-        # Test blame for a known file in v3.0 (e.g. fid 1 or 2)
-        res = get_file_blame("v3.0", 1)
-        self.assertIn("fid", res)
-        self.assertIn("tags", res)
-        self.assertIn("total_tags", res)
+    def test_commit_short_prefix_resolution(self) -> None:
+        # A 7-digit abbreviation (git's default) resolves on every digit, never to a neighbour
+        detail = get_commit_detail("02f8c6a")
+        self.assertEqual(detail["commit_hash"], "02f8c6aee8df3cdc935e9bdd4f2d020306035dbe")
+        with self.assertRaises(HTTPException) as ctx:
+            get_commit_detail("ffffff0")
+        self.assertEqual(ctx.exception.status_code, 404)
 
     def test_m_bridge_commit_person_table_engine_deduplication(self) -> None:
         """Verify TableEngine deduplicates duplicate contributor roles in memory and avoids duplicate commits."""

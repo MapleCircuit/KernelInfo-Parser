@@ -1,66 +1,97 @@
-"""webapp/backend/security/middleware.py - Security Headers & Rate Limiting Middleware."""
+"""webapp/backend/security/middleware.py - Security Headers & Rate Limiting Middleware.
+
+Both are pure ASGI middleware: BaseHTTPMiddleware runs every request through an extra task and
+memory stream, which every API call paid twice.
+"""
 from __future__ import annotations
 import time
-from collections import defaultdict
-from starlette.middleware.base import BaseHTTPMiddleware
-from starlette.requests import Request
-from starlette.responses import Response, JSONResponse
+from collections import deque
+from starlette.responses import JSONResponse
+
+_CSP = (
+    "default-src 'self'; "
+    # No frontend module evaluates code from a string (no eval, no new Function), so
+    # 'unsafe-eval' would only widen what an injected string could do.
+    "script-src 'self'; "
+    "style-src 'self' 'unsafe-inline'; "
+    "img-src 'self' data: blob:; "
+    "connect-src 'self'; "
+    "frame-ancestors 'none';"
+).encode()
+_FIXED_HEADERS = (
+    (b"x-content-type-options", b"nosniff"),
+    (b"x-frame-options", b"DENY"),
+    (b"referrer-policy", b"strict-origin-when-cross-origin"),
+)
+_FIXED_NAMES = {name for name, _ in _FIXED_HEADERS}
 
 
-class SecurityHeadersMiddleware(BaseHTTPMiddleware):
+class SecurityHeadersMiddleware:
     """Injects defensive HTTP security headers onto every response."""
 
-    async def dispatch(self, request: Request, call_next):
-        response: Response = await call_next(request)
-        response.headers["X-Content-Type-Options"] = "nosniff"
-        response.headers["X-Frame-Options"] = "DENY"
-        response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
-        # Routes may set a stricter policy (e.g. sandboxed raw SVG); only fill in the default
-        response.headers.setdefault("Content-Security-Policy", (
-            "default-src 'self'; "
-            # No frontend module evaluates code from a string (no eval, no new Function), so
-            # 'unsafe-eval' would only widen what an injected string could do.
-            "script-src 'self'; "
-            "style-src 'self' 'unsafe-inline'; "
-            "img-src 'self' data: blob:; "
-            "connect-src 'self'; "
-            "frame-ancestors 'none';"
-        ))
-        return response
+    def __init__(self, app) -> None:
+        self.app = app
+
+    async def __call__(self, scope, receive, send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        async def send_with_headers(message) -> None:
+            if message["type"] == "http.response.start":
+                headers = [(k, v) for k, v in message.get("headers", []) if k.lower() not in _FIXED_NAMES]
+                headers.extend(_FIXED_HEADERS)
+                # Routes may set a stricter policy (e.g. sandboxed raw SVG); only fill in the default
+                if not any(k.lower() == b"content-security-policy" for k, _ in headers):
+                    headers.append((b"content-security-policy", _CSP))
+                message["headers"] = headers
+            await send(message)
+
+        await self.app(scope, receive, send_with_headers)
 
 
-class SlidingWindowRateLimiter(BaseHTTPMiddleware):
-    """Sliding-window in-memory rate limiter per client IP address."""
+class SlidingWindowRateLimiter:
+    """Sliding-window in-memory rate limiter per client IP address, on /api/ requests.
 
-    def __init__(self, app, max_requests: int = 600, window_seconds: int = 60):
-        super().__init__(app)
+    The shell, its loader and the build's assets are not limited (they are static and cached by the
+    browser); a path ending in ".js" or ".json" under /api/ is an API request like any other.
+    """
+
+    def __init__(self, app, max_requests: int = 600, window_seconds: int = 60) -> None:
+        self.app = app
         self.max_requests = max_requests
         self.window_seconds = window_seconds
-        self.hits: dict[str, list[float]] = defaultdict(list)
+        self.hits: dict[str, deque[float]] = {}
 
-    async def dispatch(self, request: Request, call_next):
-        # Allow static files and asset requests to bypass rate limiter
-        path = request.url.path
-        if path.startswith("/static") or path.endswith((".js", ".css", ".png", ".svg", ".json")):
-            return await call_next(request)
+    async def __call__(self, scope, receive, send) -> None:
+        if scope["type"] != "http" or not scope.get("path", "").startswith("/api/"):
+            await self.app(scope, receive, send)
+            return
 
-        client_ip = request.client.host if request.client else "unknown"
-        now = time.time()
+        client = scope.get("client")
+        client_ip = client[0] if client else "unknown"
+        now = time.monotonic()
         cutoff = now - self.window_seconds
 
-        # Clean old timestamps
-        timestamps = [ts for ts in self.hits[client_ip] if ts > cutoff]
+        timestamps = self.hits.setdefault(client_ip, deque())
+        while timestamps and timestamps[0] <= cutoff:
+            timestamps.popleft()
         if len(timestamps) >= self.max_requests:
             retry_after = int(timestamps[0] + self.window_seconds - now) + 1
-            return JSONResponse(
+            response = JSONResponse(
                 status_code=429,
                 content={"detail": "Too many requests. Please slow down."},
                 headers={"Retry-After": str(max(1, retry_after))},
             )
-
+            await response(scope, receive, send)
+            return
         timestamps.append(now)
-        self.hits[client_ip] = timestamps
-        return await call_next(request)
+
+        # Periodic cleanup of expired IP keys to prevent unbounded memory growth
+        if len(self.hits) > 2000:
+            for ip in [ip for ip, tss in self.hits.items() if not tss or tss[-1] <= cutoff]:
+                self.hits.pop(ip, None)
+        await self.app(scope, receive, send)
 
 
 class RepoContextMiddleware:

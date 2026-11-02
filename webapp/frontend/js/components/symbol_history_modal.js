@@ -65,18 +65,22 @@ export function showKconfigHistoryModal(version, name) {
 }
 
 function openHistory({ title, subtitle, version, load }) {
-  const modal = openModal({ title: `🕰 History: ${title}`, subtitle, width: "960px" });
   const ui = {
     includeRc: false, expandAll: false, expanded: new Set(), pos: 0, view: "diff", showAllDefs: false, timer: null, res: null,
     branch: null, // branch the timeline follows ("" = chosen by the server for `version`), set on first load
     branches: [], // the repository's branches (GET /api/branches)
   };
 
-  const alive = () => document.body.contains(modal.el);
   const stopPlay = () => {
-    clearInterval(ui.timer);
-    ui.timer = null;
+    if (ui.timer) {
+      clearInterval(ui.timer);
+      ui.timer = null;
+    }
   };
+
+  let modal = null;
+  const alive = () => modal && document.body.contains(modal.el);
+
   const onKey = (e) => {
     if (!alive()) {
       document.removeEventListener("keydown", onKey);
@@ -90,6 +94,16 @@ function openHistory({ title, subtitle, version, load }) {
     e.preventDefault();
   };
   document.addEventListener("keydown", onKey);
+
+  modal = openModal({
+    title: `🕰 History: ${title}`,
+    subtitle,
+    width: "960px",
+    onClose: () => {
+      document.removeEventListener("keydown", onKey);
+      stopPlay();
+    }
+  });
 
   async function fetchAndRender(keepVersion = null) {
     stopPlay();

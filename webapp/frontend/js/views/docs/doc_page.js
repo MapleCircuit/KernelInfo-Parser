@@ -353,7 +353,7 @@ export class DocPage {
     const dir = path.slice(0, path.lastIndexOf("/"));
     const links = [];
     try {
-      const listing = await api.getDirectoryTree(this.opts.version, dir, 1);
+      const listing = await api.getDirectoryTree(this.opts.version, dir);
       const names = new Set((listing.entries || []).map((e) => e.name));
       const base = path.split("/").pop();
       for (const idx of ["index.rst", "00-INDEX"]) {

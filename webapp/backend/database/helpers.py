@@ -25,8 +25,22 @@ def finished_ref_sql(alias: str = "r") -> str:
     return f"NOT EXISTS (SELECT 1 FROM m_ingest_state s WHERE s.commit_id = {alias}.commit_id AND s.status = {INGEST_PARSING})"
 
 
-_NAME_TO_VID_CACHE: dict[str, int] = RepoScopedCache()
-_VID_TO_NAME_CACHE: dict[int, str] = RepoScopedCache()
+# Bounded: besides the repository's refs (preloaded), any commit SHA or prefix a caller names adds entries
+_NAME_TO_VID_CACHE: dict[str, int] = RepoScopedCache(maxsize=50_000)
+_VID_TO_NAME_CACHE: dict[int, str] = RepoScopedCache(maxsize=50_000)
+# Whether the repository's refs were preloaded into the two caches above
+_PRELOADED: dict[str, bool] = RepoScopedCache()
+
+
+def commit_prefix_range(prefix_hex: str) -> tuple[bytes, bytes | None]:
+    """[low, high) BINARY(20) bounds of the commit hashes starting with a hex prefix of any length
+    (an odd length bounds its last digit too); high is None when no upper bound is needed."""
+    prefix_hex = prefix_hex.lower()
+    lo_hex = prefix_hex + ("0" if len(prefix_hex) % 2 else "")
+    hi_hex = prefix_hex + ("f" if len(prefix_hex) % 2 else "")
+    nxt = int(hi_hex, 16) + 1
+    hi = nxt.to_bytes(len(hi_hex) // 2, "big") if nxt < 16 ** len(hi_hex) else None
+    return bytes.fromhex(lo_hex), hi
 
 
 def safe_decode(val: Any) -> Any:
@@ -57,10 +71,10 @@ def hash_hex(val: Any) -> str:
     return str(val)
 
 
-def format_stat_label(stat: str | None, is_end: bool = False) -> str:
-    """Return friendly label for start or end status code."""
+def format_stat_label(stat: str | None) -> str:
+    """Return the friendly label of a start status code."""
     if not stat or stat == "0":
-        return "Active" if is_end else "Added"
+        return "Added"
     return STAT_LABEL_MAP.get(stat, str(stat))
 
 
@@ -88,9 +102,30 @@ def get_active_repo_id(cursor: Any) -> int:
     return repo_id
 
 
+def get_active_network_id(cursor: Any) -> int | None:
+    """m_git_network.network_id of the request's repository: the commits m_commit holds for it (and for
+    the other clones of its history). None when the repository was never parsed."""
+    cached = _REPO_ID_CACHE.get("network_id")
+    if cached is not None:
+        return cached if cached >= 0 else None
+    repo_id = get_active_repo_id(cursor)
+    network_id = -1
+    if repo_id > 0:
+        try:
+            cursor.execute("SELECT network_id FROM m_repository WHERE repo_id = %s LIMIT 1;", (repo_id,))
+            row = cursor.fetchone()
+            if row:
+                network_id = int(row["network_id"] if isinstance(row, dict) else row[0])
+        except Exception as e:
+            logger.debug("Could not resolve network_id of repo %s: %s", repo_id, e)
+            return None
+    _REPO_ID_CACHE["network_id"] = network_id
+    return network_id if network_id >= 0 else None
+
+
 def preload_version_cache(cursor: Any) -> None:
     """Preload the active repository's refs into in-memory caches from native m_git_ref."""
-    _VID_TO_NAME_CACHE["__loaded__"] = True
+    _PRELOADED["loaded"] = True
     try:
         cursor.execute(
             f"SELECT r.commit_id, r.ref_name FROM m_git_ref r WHERE r.commit_id > 0 AND r.repo_id = %s AND {finished_ref_sql()} "
@@ -115,23 +150,22 @@ def preload_version_cache(cursor: Any) -> None:
 
 def get_version_info(cursor: Any, version_name_or_id: str | int) -> tuple[int | None, str]:
     """Resolve both vid (commit_id) and vname with thread-safe in-memory caching and Git commit SHA lookup."""
-    if "__loaded__" not in _VID_TO_NAME_CACHE:
+    if not _PRELOADED.get("loaded"):
         preload_version_cache(cursor)
 
-    if isinstance(version_name_or_id, int):
-        if version_name_or_id in _VID_TO_NAME_CACHE:
-            return version_name_or_id, _VID_TO_NAME_CACHE[version_name_or_id]
-    elif str(version_name_or_id).isdigit():
+    # .get() into locals: both caches evict, so contains-then-get could race a miss
+    if isinstance(version_name_or_id, int) or str(version_name_or_id).isdigit():
         vid_int = int(version_name_or_id)
-        if vid_int in _VID_TO_NAME_CACHE:
-            return vid_int, _VID_TO_NAME_CACHE[vid_int]
+        cached_name = _VID_TO_NAME_CACHE.get(vid_int)
+        if cached_name is not None:
+            return vid_int, cached_name
 
     ver_str = str(version_name_or_id).strip()
-    if ver_str in _NAME_TO_VID_CACHE:
-        vid = _NAME_TO_VID_CACHE[ver_str]
+    cached_vid = _NAME_TO_VID_CACHE.get(ver_str)
+    if cached_vid is not None:
         if not ver_str.isdigit():
-            return vid, ver_str
-        return vid, _VID_TO_NAME_CACHE.get(vid, ver_str)
+            return cached_vid, ver_str
+        return cached_vid, _VID_TO_NAME_CACHE.get(cached_vid, ver_str)
 
     # Database query: try m_git_ref (for tags/branches), then m_commit (for arbitrary Git commit SHAs)
     try:
@@ -181,16 +215,22 @@ def get_version_info(cursor: Any, version_name_or_id: str | int) -> tuple[int | 
             if len(ver_str) == 40:
                 c_bytes = bytes.fromhex(ver_str)
                 cursor.execute(
-                    "SELECT commit_id, commit_hash FROM m_commit WHERE commit_hash = %s LIMIT 1;",
+                    f"SELECT c.commit_id, c.commit_hash FROM m_commit c WHERE c.commit_hash = %s AND {finished_ref_sql('c')} LIMIT 1;",
                     (c_bytes,),
                 )
+                c_rows = cursor.fetchall()
             else:
-                prefix_hex = ver_str.lower()
+                # Every digit counts (git abbreviates to 7), and a prefix two commits share names neither
+                lo, hi = commit_prefix_range(ver_str)
                 cursor.execute(
-                    "SELECT commit_id, commit_hash FROM m_commit WHERE HEX(commit_hash) LIKE %s LIMIT 1;",
-                    (f"{prefix_hex.upper()}%",),
+                    f"SELECT c.commit_id, c.commit_hash FROM m_commit c WHERE c.commit_hash >= %s"
+                    f"{' AND c.commit_hash < %s' if hi else ''} AND {finished_ref_sql('c')} LIMIT 2;",
+                    (lo, hi) if hi else (lo,),
                 )
-            c_row = cursor.fetchone()
+                c_rows = cursor.fetchall()
+                if len(c_rows) > 1:
+                    return None, ver_str
+            c_row = c_rows[0] if c_rows else None
             if c_row:
                 cid = c_row["commit_id"] if isinstance(c_row, dict) else c_row[0]
                 c_h = c_row["commit_hash"] if isinstance(c_row, dict) else c_row[1]
@@ -219,13 +259,17 @@ def get_version_info(cursor: Any, version_name_or_id: str | int) -> tuple[int | 
                 git_sha = out.stdout.strip()
                 if len(git_sha) == 40:
                     c_bytes = bytes.fromhex(git_sha)
-                    cursor.execute("SELECT commit_id FROM m_commit WHERE commit_hash = %s LIMIT 1;", (c_bytes,))
+                    cursor.execute(
+                        f"SELECT c.commit_id FROM m_commit c WHERE c.commit_hash = %s AND {finished_ref_sql('c')} LIMIT 1;",
+                        (c_bytes,),
+                    )
                     c_row = cursor.fetchone()
                     if c_row:
                         cid = c_row["commit_id"] if isinstance(c_row, dict) else c_row[0]
                         _NAME_TO_VID_CACHE[ver_str] = cid
                         _NAME_TO_VID_CACHE[git_sha] = cid
-                        _VID_TO_NAME_CACHE[cid] = ver_str
+                        if cid not in _VID_TO_NAME_CACHE:
+                            _VID_TO_NAME_CACHE[cid] = ver_str
                         return cid, ver_str
                     # Valid git revision not indexed into m_commit; assign pseudo vid 0
                     _NAME_TO_VID_CACHE[ver_str] = 0

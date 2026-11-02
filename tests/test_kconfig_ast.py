@@ -316,8 +316,9 @@ class TestKconfigAstIntegration(unittest.TestCase):
         # Commit chunk 2 - must not raise Duplicate entry '800-1-HAVE_KVM-0'
         G.TE.commit_all()
 
-    def test_kconfig_export_import_roundtrip(self) -> None:
-        from webapp.main import export_kconfig_file, import_kconfig_file
+    def test_kconfig_config_text_roundtrip(self) -> None:
+        """.config rendering (the auto-solver's input) and parsing (defconfig values) are inverse."""
+        from webapp.backend.services.kconfig_service import KconfigService
         test_symbols = {
             "MODULES": "y",
             "NETDEVICES": "m",
@@ -325,15 +326,14 @@ class TestKconfigAstIntegration(unittest.TestCase):
             "DEFAULT_HOSTNAME": "(none)",
             "NR_CPUS": "64",
         }
-        export_res = export_kconfig_file("v3.0", {"symbols": test_symbols})
-        self.assertIn("CONFIG_MODULES=y", export_res["content"])
-        self.assertIn("CONFIG_NETDEVICES=m", export_res["content"])
-        self.assertIn("# CONFIG_WATCHDOG is not set", export_res["content"])
-        self.assertIn('CONFIG_DEFAULT_HOSTNAME="(none)"', export_res["content"])
-        self.assertIn("CONFIG_NR_CPUS=64", export_res["content"])
+        content = KconfigService._assignments_to_config(test_symbols)
+        self.assertIn("CONFIG_MODULES=y", content)
+        self.assertIn("CONFIG_NETDEVICES=m", content)
+        self.assertIn("# CONFIG_WATCHDOG is not set", content)
+        self.assertIn('CONFIG_DEFAULT_HOSTNAME="(none)"', content)
+        self.assertIn("CONFIG_NR_CPUS=64", content)
 
-        import_res = import_kconfig_file("v3.0", {"content": export_res["content"]})
-        imported_symbols = import_res["symbols"]
+        imported_symbols = KconfigService._config_assignments(content)
         self.assertEqual(imported_symbols.get("MODULES"), "y")
         self.assertEqual(imported_symbols.get("NETDEVICES"), "m")
         self.assertEqual(imported_symbols.get("WATCHDOG"), "n")
@@ -341,12 +341,12 @@ class TestKconfigAstIntegration(unittest.TestCase):
         self.assertEqual(imported_symbols.get("NR_CPUS"), "64")
 
     def test_kconfig_env_presets(self) -> None:
-        from webapp.main import get_kconfig_env_presets
-        presets = get_kconfig_env_presets("v3.0")
-        self.assertIn("architectures", presets)
-        self.assertIn("compilers", presets)
+        from webapp.backend.services.kconfig_service import KconfigService
+        svc = KconfigService()
+        presets = svc.get_env_presets("v3.0")
+        self.assertIn("targets", presets)
 
-        arch_ids = [a["id"] for a in presets["architectures"]]
+        arch_ids = [a["id"] for a in presets["targets"]]
         if not arch_ids:
             raise unittest.SkipTest("Linux v3.0 architecture Kconfig tree not indexed in database.")
         # Verify dynamically discovered architectures in Linux v3.0
@@ -361,16 +361,14 @@ class TestKconfigAstIntegration(unittest.TestCase):
         self.assertIn("xtensa", arch_ids)
         self.assertGreaterEqual(len(arch_ids), 20)
 
-        compiler_ids = [c["id"] for c in presets["compilers"]]
-        self.assertIn("gcc", compiler_ids)
-        self.assertIn("clang", compiler_ids)
-
         # Presets are the kconfig environment (ARCH/SRCARCH), not hand-picked symbol values:
         # 64BIT/X86_64 follow from ARCH=x86_64 through arch/x86/Kconfig itself
-        x86_64_preset = next(a for a in presets["architectures"] if a["id"] == "x86_64")
+        x86_64_preset = next(a for a in presets["targets"] if a["id"] == "x86_64")
         self.assertEqual(x86_64_preset["env"]["ARCH"], "x86_64")
         self.assertEqual(x86_64_preset["env"]["SRCARCH"], "x86")
-        self.assertEqual(x86_64_preset["canonical_defconfig"], "x86_64_defconfig")
+        # Its default defconfig is what the defconfig list flags
+        canonical = [d["name"] for d in svc.get_defconfigs("v3.0", "x86_64")["defconfigs"] if d["is_canonical"]]
+        self.assertEqual(canonical, ["x86_64_defconfig"])
 
     def test_kbuild_parser_composite_and_direct(self) -> None:
         from parser.kbuild_parser import KbuildParser
@@ -411,15 +409,17 @@ obj-y += core.o
         self.assertEqual(drbd_syms[0].source_file_rel, "fs/ext4/drbd.c")
 
     def test_kconfig_tree_scoped_hierarchy(self) -> None:
-        from webapp.main import get_kconfig_tree
-        tree_res = get_kconfig_tree("v3.0", arch="x86", include_nodes=True)
-        self.assertIn("nodes", tree_res)
+        from webapp.backend.services.kconfig_service import KconfigService
+        tree_res = KconfigService().get_tree("v3.0", arch="x86")
+        self.assertIn("menus", tree_res)
         self.assertEqual(tree_res["arch"], "x86")
 
-        nodes = tree_res["nodes"]
-        # Root nodes (parent_id == 0) should be cleanly organized top-level categories
-        root_nodes = [n for n in nodes if n["parent_id"] == 0]
-        visible_root_nodes = [n for n in root_nodes if (n["node_type"] in (1, 2) or n["prompt"])]
+        fields = tree_res["menu_fields"]
+        parent, kind, prompt = fields.index("parent"), fields.index("kind"), fields.index("prompt")
+        # Children of the root menu (index 0) should be cleanly organized top-level categories
+        root_nodes = [m for m in tree_res["menus"] if m[parent] == 0]
+        # kind 1 menu, 2 choice
+        visible_root_nodes = [m for m in root_nodes if m[kind] in (1, 2) or m[prompt]]
         
         # Verify that visible root nodes contain authentic high-level categories (~15-20)
         self.assertLessEqual(len(visible_root_nodes), 25)
@@ -428,9 +428,9 @@ obj-y += core.o
 
 
     def test_kconfig_symbol_detail_compiled_files(self) -> None:
-        from webapp.main import get_kconfig_symbol_detail
+        from webapp.backend.services.kconfig_service import KconfigService
         try:
-            detail = get_kconfig_symbol_detail("v3.0", "EXT4_FS")
+            detail = KconfigService().get_symbol_detail("v3.0", "EXT4_FS")
         except Exception:
             raise unittest.SkipTest("EXT4_FS symbol not indexed in database.")
         self.assertIn("compiled_files", detail)
@@ -441,7 +441,8 @@ obj-y += core.o
 
 
     def test_kconfig_search_with_and_without_config_prefix(self) -> None:
-        from webapp.main import search_kconfig_symbols
+        from webapp.backend.services.kconfig_service import KconfigService
+        search_kconfig_symbols = KconfigService().search_symbols
         # Search without prefix
         try:
             res_bare = search_kconfig_symbols("v3.0", q="USER_STACKTRACE_SUPPORT")
@@ -464,39 +465,41 @@ obj-y += core.o
 
 
     def test_kconfig_defconfig_discovery(self) -> None:
-        from webapp.main import get_kconfig_defconfigs
+        from webapp.backend.services.kconfig_service import KconfigService
+        get_kconfig_defconfigs = KconfigService().get_defconfigs
         # Test x86 defconfigs (ARCH=x86_64: `make defconfig` loads x86_64_defconfig)
         x86_res = get_kconfig_defconfigs("v3.0", arch="x86_64")
         self.assertIn("defconfigs", x86_res)
-        self.assertGreaterEqual(x86_res["total_count"], 2)
+        self.assertGreaterEqual(len(x86_res["defconfigs"]), 2)
         names = [d["name"] for d in x86_res["defconfigs"]]
         self.assertIn("x86_64_defconfig", names)
         self.assertIn("i386_defconfig", names)
-        self.assertIsNotNone(x86_res["canonical_default"])
-        self.assertEqual(x86_res["canonical_default"]["name"], "x86_64_defconfig")
+        self.assertEqual([d["name"] for d in x86_res["defconfigs"] if d["is_canonical"]], ["x86_64_defconfig"])
 
         # Test ARM multi-defconfig discovery (100+ board configs)
         arm_res = get_kconfig_defconfigs("v3.0", arch="arm")
         self.assertIn("defconfigs", arm_res)
-        self.assertGreaterEqual(arm_res["total_count"], 50)
-        self.assertIsNotNone(arm_res["canonical_default"])
+        self.assertGreaterEqual(len(arm_res["defconfigs"]), 50)
+        self.assertEqual(sum(1 for d in arm_res["defconfigs"] if d["is_canonical"]), 1)
 
     def test_kconfig_defconfig_content_parsing(self) -> None:
-        from webapp.main import get_kconfig_defconfig_content
+        from webapp.backend.services.kconfig_service import KconfigService
+        get_kconfig_defconfig_content = KconfigService().get_defconfig_content
         # Test x86_64_defconfig content
-        x86_64_cfg = get_kconfig_defconfig_content("v3.0", file_path="arch/x86/configs/x86_64_defconfig")
+        x86_64_cfg = get_kconfig_defconfig_content("v3.0", "arch/x86/configs/x86_64_defconfig")
         self.assertIn("values", x86_64_cfg)
-        self.assertGreaterEqual(x86_64_cfg["symbol_count"], 10)
+        self.assertGreaterEqual(len(x86_64_cfg["values"]), 10)
         self.assertEqual(x86_64_cfg["values"].get("64BIT"), "y")
 
         # Test i386_defconfig content
-        i386_cfg = get_kconfig_defconfig_content("v3.0", file_path="arch/x86/configs/i386_defconfig")
+        i386_cfg = get_kconfig_defconfig_content("v3.0", "arch/x86/configs/i386_defconfig")
         self.assertIn("values", i386_cfg)
-        self.assertGreaterEqual(i386_cfg["symbol_count"], 10)
+        self.assertGreaterEqual(len(i386_cfg["values"]), 10)
         self.assertEqual(i386_cfg["values"].get("64BIT", "n"), "n")
 
     def test_kconfig_symbol_detail_resolution(self) -> None:
-        from webapp.main import get_kconfig_symbol_detail
+        from webapp.backend.services.kconfig_service import KconfigService
+        get_kconfig_symbol_detail = KconfigService().get_symbol_detail
         try:
             detail_prefix = get_kconfig_symbol_detail("v3.0", "CONFIG_EXT4_FS")
         except Exception:
@@ -511,27 +514,14 @@ obj-y += core.o
         self.assertEqual(detail_bare["type_name"], "tristate")
 
     def test_kconfig_tree_relations(self) -> None:
-        from webapp.main import get_kconfig_tree
-        tree_res = get_kconfig_tree("v3.0", arch="x86", include_relations=True, include_nodes=True)
-        self.assertIn("nodes", tree_res)
-        if "relations" in tree_res:
-            self.assertIn("reverse_relations", tree_res)
-            if tree_res.get("relations"):
-                self.assertGreater(len(tree_res["relations"]), 10)
-
-        # Check nodes have relation fields
-        for node in tree_res["nodes"]:
-            self.assertIn("depends_on", node)
-            self.assertIn("selects", node)
-            self.assertIn("selected_by", node)
-
-    def test_kconfig_validate_constraints(self) -> None:
-        from webapp.main import validate_kconfig_assignments
-        # Test forced select cascade
-        payload = {"symbols": {"EXT4_FS": "y", "NET": "y"}}
-        val_res = validate_kconfig_assignments("v3.0", payload)
-        self.assertIn("forced_symbols", val_res)
-        self.assertIn("adjusted_symbols", val_res)
+        """The model carries the relations the engine evaluates: selects, direct and reverse dependencies."""
+        from webapp.backend.services.kconfig_service import KconfigService
+        tree_res = KconfigService().get_tree("v3.0", arch="x86")
+        symbols = tree_res["symbols"]
+        self.assertGreater(sum(1 for sym in symbols.values() if sym.get("s")), 10)
+        self.assertGreater(sum(1 for sym in symbols.values() if sym.get("rd") not in (None, -1)), 10)
+        # EXT4_FS selects JBD2 (and CRC16)
+        self.assertIn("JBD2", [target for target, _ in symbols["EXT4_FS"]["s"]])
 
 
 if __name__ == "__main__":

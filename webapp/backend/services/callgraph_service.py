@@ -1,161 +1,143 @@
 """webapp/backend/services/callgraph_service.py - Bidirectional Caller / Callee Flow Graph."""
 from __future__ import annotations
 from typing import Any
-from fastapi import HTTPException
+from core.globalstuff import SymbolLinkage
 from core.SymbolRows import rows_of_targets_sql
 from webapp.backend.database.pool import get_db_cursor
-from webapp.backend.database.helpers import (
-    safe_decode,
-    get_version_info,
-)
+from webapp.backend.database.helpers import safe_decode
+from webapp.backend.services.symbol_service import SymbolService
+from webapp.backend.services.tree_resolver import best_path, definition_arch, definition_rank
+
+# m_type_descriptor C_functionproto / C_functionprotodecl: function definitions and prototypes
+FUNCTION_TYPES = (20, 21)
+# Reference targets per callgraph: calls bind to the declaration visible at the call site (a header
+# prototype), so every in-tree declaration of the function is one
+MAX_TARGETS = 8
+# Call sites kept per direction; a function like printk has tens of thousands
+MAX_CALL_SITES = 2000
+
+
+def _group_calls(rows: list[tuple[str, str | None, int]]) -> tuple[list[dict[str, Any]], bool]:
+    """(name, file, line) call sites grouped per (function, file), at most MAX_CALL_SITES sites."""
+    groups: dict[tuple[str, str | None], dict[str, Any]] = {}
+    truncated = len(rows) > MAX_CALL_SITES
+    for name, path, line in sorted(rows, key=lambda r: (r[0] or "", r[1] or "", r[2] or 0))[:MAX_CALL_SITES]:
+        entry = groups.get((name, path))
+        if entry is None:
+            entry = groups[(name, path)] = {"name": name, "file_path": path, "line_no": line, "call_count": 0, "lines": {}}
+        entry["call_count"] += 1
+        entry["lines"][line] = None
+    for entry in groups.values():
+        entry["lines"] = list(entry["lines"])
+    return list(groups.values()), truncated
 
 
 class CallgraphService:
     """Provides bidirectional caller and callee query trees for C functions."""
 
     def get_function_callgraph(self, version_name: str, function_name: str) -> dict[str, Any]:
-        """Retrieve incoming callers and outgoing callees for a function."""
+        """Incoming callers and outgoing callees of a function, within the revision's tree."""
         with get_db_cursor() as cursor:
-            vid, vname = get_version_info(cursor, version_name)
-            if vid is None:
-                raise HTTPException(status_code=404, detail=f"Version '{version_name}' not found.")
+            _, vname, blob_paths = SymbolService._scope(cursor, version_name)
+            _, scope, bits = definition_arch(vname, None)
+            empty = {
+                "function": function_name,
+                "version": vname,
+                "file_path": "",
+                "line_s": 0,
+                "line_e": 0,
+                "callers": [],
+                "callees": [],
+                "truncated": False,
+            }
 
             cursor.execute(
                 """
-                SELECT s.def_id, s.ast_id, s.blob_id AS fid, fn.fname, s.line_s, s.line_e
+                SELECT s.ast_id, s.blob_id, s.line_s, s.line_e, s.type_id, s.linkage, a.name AS ast_name
                 FROM m_symbol_def s
-                LEFT JOIN m_bridge_checkpoint bc ON s.blob_id = bc.blob_id AND bc.commit_id = %s
-                LEFT JOIN m_file_name fn ON bc.fnid = fn.fnid
-                WHERE s.name = %s
-                ORDER BY (s.type_id IN (1, 2)) DESC
-                LIMIT 1;
+                LEFT JOIN m_ast a ON a.ast_id = s.ast_id
+                WHERE s.name = %s;
                 """,
-                (vid, function_name),
+                (function_name,),
             )
-            fn_def = cursor.fetchone()
-            if not fn_def:
-                return {
-                    "function": function_name,
-                    "function_name": function_name,
-                    "version": vname,
-                    "file": "",
-                    "file_path": "",
-                    "line_s": 0,
-                    "line_e": 0,
-                    "caller_count": 0,
-                    "callee_count": 0,
-                    "callers": [],
-                    "callees": [],
-                }
+            defs = [
+                r for r in cursor.fetchall()
+                if r["blob_id"] in blob_paths and r["ast_id"] and r["type_id"] in FUNCTION_TYPES
+                and int(r["linkage"] or 0) != SymbolLinkage.MacroOrKernelDef
+            ]
+            if not defs:
+                return empty
+            for r in defs:
+                r["fname"] = best_path(blob_paths[r["blob_id"]], scope, bits)
+            # The definition with a body: never a prototype, a real definition before a header inline stub
+            fn_def = min(defs, key=lambda r: (
+                int(r["linkage"] or 0) == SymbolLinkage.PrototypeDecl,
+                int(r["linkage"] or 0) == SymbolLinkage.InlineHeaderDef,
+                definition_rank(r["fname"], r.get("linkage"), r["line_s"], scope, bits),
+            ))
+            # Reference targets: the declarations that are the function itself (a marker macro's
+            # shared AST would bring the references of every function it marks)
+            targets = [fn_def["ast_id"]] + [
+                r["ast_id"] for r in sorted(defs, key=lambda r: definition_rank(r["fname"], r.get("linkage"), r["line_s"], scope, bits))
+                if safe_decode(r["ast_name"]) == function_name
+            ]
+            targets = list(dict.fromkeys(targets))[:MAX_TARGETS]
 
-            target_ast_id = fn_def["ast_id"]
-            target_fid = fn_def["fid"]
-            file_path = safe_decode(fn_def["fname"])
-
-            # 1. Callers (incoming): calls in this version's blobs, named by the AST of the tag they are in. The
+            # 1. Callers: calls in this revision's blobs, named by the AST of the tag they are in. The
             # references come key first (rows_of_targets_sql); filtering the m_symbol_ref view by ast_id is slow.
-            refs_sql, repeat = rows_of_targets_sql("m_symbol_ref", 1)
+            refs_sql, repeat = rows_of_targets_sql("m_symbol_ref", len(targets))
             cursor.execute(
                 f"""
-                SELECT a.name AS caller_name, fn.fname AS file_name, r.line AS line_no
+                SELECT a.name AS caller_name, r.blob_id, r.line AS line_no
                 FROM ({refs_sql}) r
                 JOIN m_tag t ON r.tag_id = t.tag_id
                 JOIN m_ast a ON a.ast_id = t.ast_id
-                JOIN m_bridge_checkpoint bc ON bc.blob_id = r.blob_id AND bc.commit_id = %s
-                LEFT JOIN m_file_name fn ON bc.fnid = fn.fnid
-                WHERE r.role = 3
-                ORDER BY a.name ASC, r.line ASC;
+                WHERE r.role = 3;
                 """,
-                (target_ast_id,) * repeat + (vid,),
+                tuple(targets) * repeat,
             )
-            raw_callers = cursor.fetchall()
-            callers_map: dict[tuple[str, str], dict[str, Any]] = {}
-            for r in raw_callers:
-                c_name = safe_decode(r["caller_name"])
-                f_path = safe_decode(r["file_name"])
-                key = (c_name, f_path)
-                if key not in callers_map:
-                    callers_map[key] = {
-                        "name": c_name,
-                        "caller_name": c_name,
-                        "file_path": f_path,
-                        "file_name": f_path,
-                        "line_no": r["line_no"],
-                        "line_s": r["line_no"],
-                        "call_count": 0,
-                        "lines": [],
-                    }
-                callers_map[key]["call_count"] += 1
-                if r["line_no"] not in callers_map[key]["lines"]:
-                    callers_map[key]["lines"].append(r["line_no"])
+            caller_sites = [
+                (safe_decode(r["caller_name"]), best_path(blob_paths[r["blob_id"]], scope, bits), r["line_no"])
+                for r in cursor.fetchall() if r["blob_id"] in blob_paths
+            ]
+            callers, callers_truncated = _group_calls(caller_sites)
 
-            callers = list(callers_map.values())
-
-            # 2. Callees (outgoing): calls inside the function's lines, with the files defining each callee in
-            # this version (joining the m_symbol_def view by ast_id would materialize it)
+            # 2. Callees: calls inside the function's lines, with the files defining each callee in this
+            # revision (joining the m_symbol_def view by ast_id would materialize it)
             cursor.execute(
                 """
                 SELECT r.ast_id, a.name AS callee_name, r.line AS line_no
                 FROM m_symbol_ref r
                 JOIN m_ast a ON a.ast_id = r.ast_id
-                WHERE r.blob_id = %s AND r.line BETWEEN %s AND %s AND r.role = 3
-                ORDER BY a.name ASC, r.line ASC;
+                WHERE r.blob_id = %s AND r.line BETWEEN %s AND %s AND r.role = 3;
                 """,
-                (target_fid, fn_def["line_s"], fn_def["line_e"]),
+                (fn_def["blob_id"], fn_def["line_s"], fn_def["line_e"]),
             )
             call_rows = cursor.fetchall()
             callee_ids = sorted({r["ast_id"] for r in call_rows})
-            callee_files: dict[int, list[Any]] = {}
+            callee_files: dict[int, list[str]] = {}
             if callee_ids:
                 defs_sql, repeat = rows_of_targets_sql("m_symbol_def", len(callee_ids))
-                cursor.execute(
-                    f"""
-                    SELECT DISTINCT d.ast_id, fn.fname
-                    FROM ({defs_sql}) d
-                    JOIN m_bridge_checkpoint bc ON bc.blob_id = d.blob_id AND bc.commit_id = %s
-                    JOIN m_file_name fn ON bc.fnid = fn.fnid;
-                    """,
-                    tuple(callee_ids) * repeat + (vid,),
-                )
+                cursor.execute(f"SELECT DISTINCT d.ast_id, d.blob_id FROM ({defs_sql}) d;", tuple(callee_ids) * repeat)
                 for d_row in cursor.fetchall():
-                    callee_files.setdefault(d_row["ast_id"], []).append(d_row["fname"])
-            raw_callees = [
-                {"callee_name": r["callee_name"], "file_name": f_name, "line_no": r["line_no"]}
+                    if d_row["blob_id"] in blob_paths:
+                        path = best_path(blob_paths[d_row["blob_id"]], scope, bits)
+                        files = callee_files.setdefault(d_row["ast_id"], [])
+                        if path not in files:
+                            files.append(path)
+            callee_sites = [
+                (safe_decode(r["callee_name"]), path, r["line_no"])
                 for r in call_rows
-                for f_name in (callee_files.get(r["ast_id"]) or [None])
+                for path in (callee_files.get(r["ast_id"]) or [None])
             ]
-            callees_map: dict[tuple[str, str], dict[str, Any]] = {}
-            for r in raw_callees:
-                c_name = safe_decode(r["callee_name"])
-                f_path = safe_decode(r["file_name"])
-                key = (c_name, f_path)
-                if key not in callees_map:
-                    callees_map[key] = {
-                        "name": c_name,
-                        "callee_name": c_name,
-                        "file_path": f_path,
-                        "file_name": f_path,
-                        "line_no": r["line_no"],
-                        "line": r["line_no"],
-                        "call_count": 0,
-                        "lines": [],
-                    }
-                callees_map[key]["call_count"] += 1
-                if r["line_no"] not in callees_map[key]["lines"]:
-                    callees_map[key]["lines"].append(r["line_no"])
-
-            callees = list(callees_map.values())
+            callees, callees_truncated = _group_calls(callee_sites)
 
             return {
-                "function": function_name,
-                "function_name": function_name,
-                "version": vname,
-                "file": file_path,
-                "file_path": file_path,
+                **empty,
+                "file_path": fn_def["fname"],
                 "line_s": fn_def["line_s"],
                 "line_e": fn_def["line_e"],
-                "caller_count": len(callers),
-                "callee_count": len(callees),
                 "callers": callers,
                 "callees": callees,
+                "truncated": callers_truncated or callees_truncated,
             }

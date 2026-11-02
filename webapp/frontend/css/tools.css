@@ -79,12 +79,6 @@
 }
 
 /* 2. Callgraph Explorer */
-.callgraph-container {
-  display: flex;
-  gap: 20px;
-  height: 100%;
-}
-
 .callgraph-col {
   flex: 1;
   background: var(--bg-secondary);
@@ -296,20 +290,10 @@
   font-family: var(--font-mono);
 }
 
-.compare-chip-static {
+.compare-chip-sub {
   color: var(--text-muted);
-  padding: 2px 4px;
+  font-size: 11px;
 }
-
-.compare-chip-sep {
-  width: 1px;
-  height: 14px;
-  background: var(--border-color);
-}
-
-.kc-added { color: var(--accent-green); }
-.kc-removed { color: var(--accent-red); }
-.kc-changed { color: var(--accent-yellow); }
 
 .compare-filter {
   width: 260px;

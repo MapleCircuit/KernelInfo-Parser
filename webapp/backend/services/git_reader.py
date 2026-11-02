@@ -1,16 +1,18 @@
 """webapp/backend/services/git_reader.py - Persistent Git Object Reader via git cat-file.
 
 Provides a thread-safe, high-performance reader for version-specific file contents
-and directory checks in the Linux Git repository, using persistent 'git cat-file --batch'.
+and directory checks in the Linux Git repository, using a small pool of persistent
+'git cat-file --batch' processes per repository.
 """
 from __future__ import annotations
 
 import atexit
+from collections.abc import Iterator
+from contextlib import contextmanager
 import logging
 from pathlib import Path
 import subprocess
 import threading
-from typing import Any
 
 from core.globalstuff import is_safe_git_spec
 from webapp.backend.config import LINUX_REPO_DIR, get_repo_dir
@@ -43,7 +45,7 @@ class GitReader:
                 cmd,
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
                 bufsize=0,  # Unbuffered binary streams for precise byte reading
             )
             logger.info("Spawned persistent git cat-file --batch process (PID: %d) in %s", self._proc.pid, self.repo_dir)
@@ -175,37 +177,75 @@ class GitReader:
         return (None, False, None)
 
 
-class GitReaderPool:
-    """Dispatches reads to one persistent GitReader per repository (the request's active repository)."""
+# Concurrent readers per repository. One `git cat-file --batch` stream answers one request at a
+# time, so a single reader made file views wait behind history timelines (hundreds of blobs),
+# Kconfig model builds and include walks. Readers are spawned only when every existing one is busy.
+READERS_PER_REPO = 4
 
-    def __init__(self) -> None:
-        self._readers: dict[str, GitReader] = {}
+
+class _RepoReaders:
+    """Up to `size` GitReaders of one repository; a read checks out an idle one (most recently used first)."""
+
+    def __init__(self, repo_dir: str, size: int) -> None:
+        self.repo_dir = repo_dir
+        self.size = max(1, size)
+        self.readers: list[GitReader] = []
+        self._idle: list[GitReader] = []
+        self._cond = threading.Condition()
+
+    @contextmanager
+    def checkout(self) -> Iterator[GitReader]:
+        with self._cond:
+            while not self._idle and len(self.readers) >= self.size:
+                self._cond.wait()
+            if self._idle:
+                reader = self._idle.pop()
+            else:
+                reader = GitReader(self.repo_dir)
+                self.readers.append(reader)
+        try:
+            yield reader
+        finally:
+            with self._cond:
+                self._idle.append(reader)
+                self._cond.notify()
+
+    def close(self) -> None:
+        with self._cond:
+            for reader in self.readers:
+                reader.close()
+
+
+class GitReaderPool:
+    """Dispatches reads to a small pool of persistent GitReaders per repository (the request's active one)."""
+
+    def __init__(self, size: int = READERS_PER_REPO) -> None:
+        self._size = size
+        self._groups: dict[str, _RepoReaders] = {}
         self._lock = threading.Lock()
 
-    def _reader(self) -> GitReader:
+    def _group(self) -> _RepoReaders:
         key = str(get_repo_dir())
         with self._lock:
-            reader = self._readers.get(key)
-            if reader is None:
-                reader = GitReader(key)
-                self._readers[key] = reader
-            return reader
+            group = self._groups.get(key)
+            if group is None:
+                group = _RepoReaders(key, self._size)
+                self._groups[key] = group
+            return group
 
     def read_object(self, rev: str, path: str) -> tuple[str, bytes | None, str | None]:
-        return self._reader().read_object(rev, path)
+        with self._group().checkout() as reader:
+            return reader.read_object(rev, path)
 
     def read_file(self, rev: str, path: str) -> tuple[bytes | None, bool, str | None]:
-        return self._reader().read_file(rev, path)
+        with self._group().checkout() as reader:
+            return reader.read_file(rev, path)
 
     def close(self) -> None:
         with self._lock:
-            for reader in self._readers.values():
-                reader.close()
-            self._readers.clear()
-
-    def __getattr__(self, name: str) -> Any:
-        # Remaining GitReader attributes (repo_dir, _proc, ...) refer to the active repository's reader
-        return getattr(self._reader(), name)
+            for group in self._groups.values():
+                group.close()
+            self._groups.clear()
 
 
 # Default module-level instance (routes reads to the active repository)

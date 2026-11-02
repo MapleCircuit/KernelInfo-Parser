@@ -70,7 +70,6 @@ class TestMailingListService(unittest.TestCase):
             status = self.service.get_status()
             self.assertTrue(status["enabled"])
             self.assertTrue(status["available"])
-            self.assertTrue(status["use_tunnel"])
             self.assertEqual(status["port"], 8089)
             self.assertIsNone(status["reason"])
 
@@ -437,15 +436,15 @@ class TestCommitMailIntegration(unittest.TestCase):
             mock_cursor.fetchone.side_effect = [
                 commit_row,                                                    # commit detail
                 {"name": b"Dev", "email": b"dev@btrfs.org", "person_id": 1},   # author
-                {"name": b"Maint", "email": b"maint@btrfs.org", "person_id": 2}, # committer
             ]
             mock_cursor.fetchall.side_effect = [
+                [],                  # parents (m_commit_parent)
                 [],                  # trailers
                 [],                  # files
                 [mock_email_row],    # m_commit_email
             ]
 
-            detail = git_svc.get_commit_detail("v3.0", "5001")
+            detail = git_svc.get_commit_detail("5001")
             self.assertEqual(detail["commit_id"], 5001)
             self.assertIn("linked_emails", detail)
             self.assertEqual(len(detail["linked_emails"]), 1)
@@ -505,7 +504,7 @@ class TestCommitMailIntegration(unittest.TestCase):
             mock_client_inst.resolve_commits.return_value = {c_hash: mock_resolved_ctx}
             mock_client_cls.return_value = mock_client_inst
 
-            result = git_svc.resolve_commit_mail("v3.0", "5002")
+            result = git_svc.resolve_commit_mail("5002")
             self.assertTrue(result["resolved"])
             self.assertEqual(len(result["linked_emails"]), 1)
             match = result["linked_emails"][0]
@@ -566,7 +565,9 @@ class TestFrontendMailAssets(unittest.TestCase):
             content = f.read()
 
         self.assertIn('"mail"', content)
-        self.assertIn("DB_VERSION = 4", content)
+        # v4 added the mail store, v5 the updated_at index every data store is pruned by
+        self.assertIn("DB_VERSION = 5", content)
+        self.assertIn('createIndex("updated_at", "updated_at")', content)
 
     def test_api_js_includes_mail_methods(self) -> None:
         api_path = os.path.join(REPO_ROOT, "webapp", "frontend", "js", "api.js")

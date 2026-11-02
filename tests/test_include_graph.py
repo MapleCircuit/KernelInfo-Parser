@@ -76,11 +76,10 @@ class TestDefinitionFromUseSite(unittest.TestCase):
         reached = {"include/linux/sched.h": None, "include/asm-x86_64/atomic.h": "include/linux/sched.h",
                    "include/linux/proto.h": "include/linux/sched.h"}
         with patch.object(ss.arch_layout_service, "reachable", return_value=reached):
-            chain = ss.SymbolService._prefer_reachable(rows, blob_paths, "v2.6.12", "i386", "include/linux/sched.h", "i386", 32)
+            ss.SymbolService._prefer_reachable(rows, blob_paths, "v2.6.12", "i386", "include/linux/sched.h", "i386", 32)
         # The reached x86_64 header beats i386's own (path rank alone would pick asm-i386); prototypes stay last
         self.assertEqual([r["fname"] for r in rows],
                          ["include/asm-x86_64/atomic.h", "include/asm-i386/atomic.h", "net/rxrpc/internal.h", "include/linux/proto.h"])
-        self.assertEqual(chain, ["include/linux/sched.h", "include/asm-x86_64/atomic.h"])
         self.assertEqual([r["visible"] for r in rows], [True, False, False, True])
 
     def test_no_layout_keeps_the_ranking(self) -> None:
@@ -88,7 +87,7 @@ class TestDefinitionFromUseSite(unittest.TestCase):
 
         rows = [{"fid": 1, "fname": "a.h", "line_s": 1, "linkage": 0}]
         with patch.object(ss.arch_layout_service, "reachable", return_value={}):
-            self.assertEqual(ss.SymbolService._prefer_reachable(rows, {1: ["a.h"]}, "v", "x86_64", "b.c", "x86", 64), [])
+            ss.SymbolService._prefer_reachable(rows, {1: ["a.h"]}, "v", "x86_64", "b.c", "x86", 64)
         self.assertNotIn("visible", rows[0])
 
 

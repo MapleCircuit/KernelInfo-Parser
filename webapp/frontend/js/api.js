@@ -17,6 +17,8 @@ const BRANCH_TAGS_TIMEOUT_MS = 180000;
 // Compare: the revision diff runs Git's rename detection, the rename search compares every candidate pair
 const VERSIONS_DIFF_TIMEOUT_MS = 45000;
 const RENAME_SEARCH_TIMEOUT_MS = 120000;
+// Callgraph: the callers of a widely used function are looked up across every indexed blob (~25 s for schedule)
+const CALLGRAPH_TIMEOUT_MS = 60000;
 
 class ApiClient {
   constructor() {
@@ -36,13 +38,11 @@ class ApiClient {
 
     window.addEventListener("online", () => {
       this.isOnline = true;
-      document.dispatchEvent(new CustomEvent("app:online"));
       this.pingServer();
     });
     window.addEventListener("offline", () => {
       this.isOnline = false;
       this._setServerUp(false);
-      document.dispatchEvent(new CustomEvent("app:offline"));
     });
     document.addEventListener("visibilitychange", () => {
       if (!document.hidden) this.pingServer();
@@ -142,7 +142,6 @@ class ApiClient {
         el.classList.remove("active");
       }
     }
-    document.dispatchEvent(new CustomEvent("app:loading", { detail: { loading: active } }));
   }
 
   /** Repository selected in the header; sent with every request and namespacing offline cache keys. */
@@ -160,14 +159,7 @@ class ApiClient {
     options = fetchOptions;
     if (!networkFirst && cacheStore && cacheKey && (!options.method || options.method === "GET")) {
       const cached = await localDB.get(cacheStore, cacheKey);
-      if (cached !== null && cached !== undefined) {
-        // If cached mail item is failed or missing body/raw, bypass stale cache to fetch fresh
-        if (cacheStore === "mail" && cached && (cached.available === false || cached.error || (!cached.raw && !cached.body && !cached.messages && !cached.results && !cached.versions))) {
-          // Stale or incomplete mail entry, bypass cache
-        } else {
-          return cached;
-        }
-      }
+      if (cached !== null && cached !== undefined) return cached;
     }
 
     // 2. Fetch with the request timeout (10 s unless the endpoint asked for more)
@@ -210,8 +202,8 @@ class ApiClient {
 
       const data = await response.json();
 
-      // 3. Cache successful response in IndexedDB
-      if (cacheStore && cacheKey) {
+      // 3. Cache successful response in IndexedDB (skip if served from Service Worker offline cache)
+      if (cacheStore && cacheKey && !response.headers.get("X-KIP-Offline")) {
         // Do not cache failed or empty mail items in IndexedDB
         if (cacheStore !== "mail" || (data && data.available !== false && !data.error && (data.raw || data.body || data.messages || data.results || data.versions))) {
           localDB.set(cacheStore, cacheKey, data).catch((e) => console.warn("Cache write failed:", e));
@@ -263,7 +255,8 @@ class ApiClient {
   }
 
   _sanitizeVer(v) {
-    if (!v || typeof v !== "string" || v.includes("object")) {
+    // A version object stringified by mistake ("[object Object]"); a branch may well contain "object"
+    if (!v || typeof v !== "string" || v.startsWith("[object ")) {
       return "v3.0";
     }
     return v;
@@ -375,29 +368,11 @@ class ApiClient {
     return this.request(`/api/kconfig/${encodeURIComponent(ver)}/search?${q}`);
   }
 
-  async importKconfig(version, content, arch = null) {
-    const ver = this._sanitizeVer(version);
-    return this.request(`/api/kconfig/${encodeURIComponent(ver)}/import`, { method: "POST", body: JSON.stringify({ content, ...(arch ? { arch } : {}) }) });
-  }
-
-  async validateKconfig(version, symbols, arch = null) {
-    const ver = this._sanitizeVer(version);
-    return this.request(`/api/kconfig/${encodeURIComponent(ver)}/validate`, { method: "POST", body: JSON.stringify({ symbols, ...(arch ? { arch } : {}) }) });
-  }
-
-  async diffKconfigConfigs(version, activeConfig, customConfig) {
-    const ver = this._sanitizeVer(version);
-    return this.request(`/api/kconfig/${encodeURIComponent(ver)}/diff-config`, {
-      method: "POST",
-      body: JSON.stringify({ active_config: activeConfig, custom_config: customConfig })
-    });
-  }
-
   // --- Filesystem ---
-  async getDirectoryTree(version, path = "", depth = 2) {
+  async getDirectoryTree(version, path = "") {
     const ver = this._sanitizeVer(version);
-    const q = new URLSearchParams({ path, depth }).toString();
-    return this.request(`/api/fs/tree/${encodeURIComponent(ver)}?${q}`, {}, "files", `tree2_${this._vk(ver)}_${path}_${depth}`);
+    const q = new URLSearchParams({ path }).toString();
+    return this.request(`/api/fs/tree/${encodeURIComponent(ver)}?${q}`, {}, "files", `tree3_${this._vk(ver)}_${path}`);
   }
 
   async getFileContent(version, path) {
@@ -444,12 +419,6 @@ class ApiClient {
     return this.request(`/api/version/${encodeURIComponent(ver)}/treemap?${q}`, {}, "files", `treemap_${this._vk(ver)}_${path}_${maxDepth}`);
   }
 
-  async getCompileCommands(version, arch = "x86") {
-    const ver = this._sanitizeVer(version);
-    const q = new URLSearchParams({ arch }).toString();
-    return this.request(`/api/version/${encodeURIComponent(ver)}/compile_commands?${q}`);
-  }
-
   // --- Symbols ---
   async searchSymbols(version, query, limit = 50) {
     const ver = this._sanitizeVer(version);
@@ -484,20 +453,6 @@ class ApiClient {
   async getAstTree(version, astId) {
     const ver = this._sanitizeVer(version);
     return this.request(`/api/symbols/${encodeURIComponent(ver)}/ast/${astId}`, {}, "symbols", `ast_${this._vk(ver)}_${astId}`);
-  }
-
-  async lookupSymbols(version, query, limit = 20) {
-    const ver = this._sanitizeVer(version);
-    const q = new URLSearchParams({ q: query, limit }).toString();
-    return this.request(`/api/symbols/${encodeURIComponent(ver)}/lookup?${q}`);
-  }
-
-  async getTagTimeline(tagId, { includeRc = false, branch = "" } = {}) {
-    const params = new URLSearchParams();
-    if (includeRc) params.set("include_rc", "true");
-    if (branch) params.set("branch", branch);
-    const q = params.toString() ? `?${params.toString()}` : "";
-    return this.request(`/api/tag/${encodeURIComponent(tagId)}/timeline${q}`, { timeoutMs: BRANCH_TAGS_TIMEOUT_MS });
   }
 
   // --- KConfig ---
@@ -567,12 +522,12 @@ class ApiClient {
     return this.request(`/api/kconfig/${encodeURIComponent(ver)}/presets`, {}, "kconfigs", `presets2_${this._vk(ver)}`);
   }
 
-  async getKconfigGraph(version, arch = "x86_64", symbol = null, depth = 2, toolchain = null) {
+  async getKconfigGraph(version, arch = "x86_64", symbol = null, toolchain = null) {
     const ver = this._sanitizeVer(version);
-    const params = new URLSearchParams({ arch, depth });
+    const params = new URLSearchParams({ arch });
     if (symbol) params.set("symbol", symbol);
     const suffix = this._toolchainParams(params, toolchain);
-    return this.request(`/api/kconfig/${encodeURIComponent(ver)}/graph?${params.toString()}`, {}, "kconfigs", `kgraph3_${this._vk(ver)}_${arch}_${symbol || 'all'}_${depth}${suffix}`);
+    return this.request(`/api/kconfig/${encodeURIComponent(ver)}/graph?${params.toString()}`, {}, "kconfigs", `kgraph4_${this._vk(ver)}_${arch}_${symbol || 'all'}${suffix}`);
   }
 
   // --- Maintainers ---
@@ -685,7 +640,7 @@ class ApiClient {
 
   async getCallgraph(version, functionName) {
     const ver = this._sanitizeVer(version);
-    return this.request(`/api/tools/${encodeURIComponent(ver)}/callgraph/${encodeURIComponent(functionName)}`, {}, "tools", `callgraph_${this._vk(ver)}_${functionName}`);
+    return this.request(`/api/tools/${encodeURIComponent(ver)}/callgraph/${encodeURIComponent(functionName)}`, { timeoutMs: CALLGRAPH_TIMEOUT_MS }, "tools", `callgraph_${this._vk(ver)}_${functionName}`);
   }
 
   async getVersionsDiff(versionA, versionB) {
@@ -777,7 +732,11 @@ class ApiClient {
     );
   }
 
-  async searchMailingList(query = "", { page = 1, limit = 50, filterType = "all", networkFirst = false } = {}) {
+  /**
+   * Mailing list search. The archive grows while it is fetched, so the server is always asked first;
+   * only the browse listing (no query) is kept for offline use, not every query typed in the palette.
+   */
+  async searchMailingList(query = "", { page = 1, limit = 50, filterType = "all" } = {}) {
     const params = new URLSearchParams({
       q: query,
       page,
@@ -786,9 +745,9 @@ class ApiClient {
     });
     return this.request(
       `/api/mail/search?${params.toString()}`,
-      { networkFirst },
-      "mail",
-      `search_${query}_${page}_${limit}_${filterType}`
+      { networkFirst: true },
+      query ? null : "mail",
+      query ? null : `search__${page}_${limit}_${filterType}`
     );
   }
 

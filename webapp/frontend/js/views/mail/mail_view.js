@@ -79,10 +79,12 @@ export class MailView {
     this.versionsData = null;
     this.selectedVersion = 0;
     this.isLoadingVersions = false;
+    this._versionsToken = 0;
     this.treeOpen = new Map(); // normalized mid -> explicit user expand/collapse
 
     this.isLoadingSearch = false;
     this.isLoadingThread = false;
+    this._threadToken = 0;
     this.daemonStatus = null;
     this._checkingDaemon = false;
   }
@@ -237,27 +239,31 @@ export class MailView {
 
   /** Load the revision list (v1, v2, ...) of the series the active thread belongs to. */
   async loadThreadVersions() {
-    if (this.isLoadingVersions) return;
     if (!this.activeThreadId && !this.activeMessageId) return;
     if (this.versionsData && this.versionsData.tid === this.activeThreadId) {
       this.renderVersionSelector();
       return;
     }
 
+    const token = ++this._versionsToken;
     this.isLoadingVersions = true;
     this.renderVersionSelector();
     try {
       const data = await api.getMailThreadVersions(this.activeThreadId, this.activeMessageId);
+      if (token !== this._versionsToken) return;
       this.versionsData = data;
       if (data?.available && data.current_version) {
         this.selectedVersion = data.current_version;
       }
     } catch (e) {
+      if (token !== this._versionsToken) return;
       this.versionsData = { available: false, error: e.message, versions: [] };
     } finally {
-      this.isLoadingVersions = false;
-      this.renderVersionSelector();
-      this.renderTree();
+      if (token === this._versionsToken) {
+        this.isLoadingVersions = false;
+        this.renderVersionSelector();
+        this.renderTree();
+      }
     }
   }
 
@@ -464,7 +470,10 @@ export class MailView {
     let badge = "";
     if (msg.is_pull) badge = `<span class="mail-badge pull">PULL</span>`;
     else if (msg.is_cover) badge = `<span class="mail-badge cover">0/${msg.patch_total || 'N'}</span>`;
-    else if (msg.is_patch) badge = `<span class="mail-badge patch">${msg.patch_idx || 1}/${msg.patch_total || 1}</span>`;
+    else if (msg.is_patch) {
+      const tot = msg.patch_total && msg.patch_total >= (msg.patch_idx || 1) ? msg.patch_total : (msg.patch_idx || 1);
+      badge = `<span class="mail-badge patch">${msg.patch_idx || 1}/${tot}</span>`;
+    }
     else if (isReply) badge = `<span class="mail-badge reply">RE</span>`;
 
     row.innerHTML = `
@@ -690,7 +699,8 @@ export class MailView {
         badgesHtml += `<span class="mail-badge cover">Cover [0/${item.patch_total || 'N'}]</span>`;
       } else if (item.is_patch) {
         const vStr = item.patch_version > 1 ? ` v${item.patch_version}` : "";
-        const idxStr = item.patch_idx ? ` ${item.patch_idx}/${item.patch_total || '1'}` : "";
+        const tot = item.patch_total && item.patch_total >= item.patch_idx ? item.patch_total : item.patch_idx;
+        const idxStr = item.patch_idx ? ` ${item.patch_idx}/${tot}` : "";
         badgesHtml += `<span class="mail-badge patch">PATCH${vStr}${idxStr}</span>`;
       }
 
@@ -748,7 +758,7 @@ export class MailView {
   }
 
   async inspectThread(tid, targetMid = "") {
-    if (this.isLoadingThread) return;
+    const token = ++this._threadToken;
     this.isLoadingThread = true;
     this.activeThreadId = tid || 0;
     this.activeMessageId = targetMid || "";
@@ -762,6 +772,7 @@ export class MailView {
 
     try {
       const threadData = await api.getMailThread(tid, targetMid);
+      if (token !== this._threadToken) return;
       this.activeThreadData = threadData;
       this.activeThreadId = threadData.tid || tid;
 
@@ -785,13 +796,16 @@ export class MailView {
         this.loadThreadVersions();
       }
     } catch (e) {
+      if (token !== this._threadToken) return;
       detailEl.innerHTML = `
         <div style="padding:32px;color:var(--accent-red);text-align:center;">
           Failed to load thread: ${escapeHtml(e.message)}
         </div>
       `;
     } finally {
-      this.isLoadingThread = false;
+      if (token === this._threadToken) {
+        this.isLoadingThread = false;
+      }
     }
   }
 
@@ -824,7 +838,7 @@ export class MailView {
             <span>·</span>
             <span><strong>${participants.length}</strong> contributor${participants.length === 1 ? '' : 's'}</span>
             <span>·</span>
-            <a href="${threadData.lore_url || (LORE_BASE_URL + 't/' + (threadData.tid || 0))}" target="_blank" class="lore-link">lore.kernelinfo.org ↗</a>
+            <a href="${escapeHtml(threadData.lore_url || (LORE_BASE_URL + 't/' + (threadData.tid || 0)))}" target="_blank" rel="noopener noreferrer" class="lore-link">lore.kernelinfo.org ↗</a>
           </div>
         </div>
 
@@ -868,7 +882,8 @@ export class MailView {
       badgeHtml = `<span class="mail-badge cover">Cover Letter [0/${msgSummary.patch_total || 'N'}]</span>`;
     } else if (msgSummary.is_patch) {
       const vStr = msgSummary.patch_version > 1 ? ` v${msgSummary.patch_version}` : "";
-      const idxStr = msgSummary.patch_idx ? ` ${msgSummary.patch_idx}/${msgSummary.patch_total || '1'}` : "";
+      const tot = msgSummary.patch_total && msgSummary.patch_total >= msgSummary.patch_idx ? msgSummary.patch_total : msgSummary.patch_idx;
+      const idxStr = msgSummary.patch_idx ? ` ${msgSummary.patch_idx}/${tot}` : "";
       badgeHtml = `<span class="mail-badge patch">PATCH${vStr}${idxStr}</span>`;
     }
 
@@ -1032,7 +1047,7 @@ export class MailView {
             ${escapeHtml(detail?.error || "The message content could not be located in the local public-inbox mirror.")}
           </div>
           <div style="display:flex;gap:10px;align-items:center;">
-            ${detail?.lore_url ? `<a href="${detail.lore_url}" target="_blank" class="lore-link" style="font-size:12px;">View on lore.kernelinfo.org ↗</a>` : ""}
+            ${detail?.lore_url ? `<a href="${escapeHtml(detail.lore_url)}" target="_blank" rel="noopener noreferrer" class="lore-link" style="font-size:12px;">View on lore.kernelinfo.org ↗</a>` : ""}
             <button class="code-btn mail-retry-msg-btn" style="font-size:11px;padding:3px 10px;">Retry</button>
           </div>
         </div>

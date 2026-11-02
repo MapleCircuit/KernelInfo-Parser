@@ -301,10 +301,10 @@ export class VirtualEditor {
           + (more ? `, or one of ${more} other rule${more === 1 ? "" : "s"}` : "");
       }
       banner.className = "code-build-banner not-built";
-      banner.innerHTML = `<span class="code-build-icon">⛔</span><span><strong>Not compiled</strong> for ARCH=${escapeHtml(arch)} with the current KConfig configuration. ${why}</span>${ruleHtml}`;
+      banner.innerHTML = `<span class="code-build-icon">⛔</span><span><strong>Not compiled</strong> for ARCH=${arch} with the current KConfig configuration. ${why}</span>${ruleHtml}`;
     } else if (result === "m") {
       banner.className = "code-build-banner module";
-      banner.innerHTML = `<span class="code-build-icon">📦</span><span>Built as a <strong>module</strong> for ARCH=${escapeHtml(arch)} with the current KConfig configuration.</span>${ruleHtml}`;
+      banner.innerHTML = `<span class="code-build-icon">📦</span><span>Built as a <strong>module</strong> for ARCH=${arch} with the current KConfig configuration.</span>${ruleHtml}`;
     } else {
       banner.hidden = true;
       return;
@@ -560,13 +560,23 @@ export class VirtualEditor {
 
       const row = e.target.closest(".code-row");
       const lineNo = row ? parseInt(row.dataset.lineNo, 10) : 1;
+      const lineText = (this.rawLines && this.rawLines[lineNo - 1]) || "";
+      const selection = window.getSelection() ? window.getSelection().toString().trim() : "";
 
       let tokenData = null;
-      const tokenSpan = e.target.closest(".ast-token");
+      let tokenSpan = e.target.closest(".ast-token");
+      // If user right-clicked on 'struct' or 'union' keyword, look ahead to the struct name token
+      if (!tokenSpan && e.target.classList.contains("tok-keyword")) {
+        const kw = e.target.textContent.trim();
+        if ((kw === "struct" || kw === "union") && e.target.nextElementSibling) {
+          tokenSpan = e.target.nextElementSibling.closest(".ast-token") || e.target.nextElementSibling;
+        }
+      }
+
       if (tokenSpan && !tokenSpan.classList.contains("tok-comment") && tokenSpan.dataset.typeId !== "2") {
         const astId = parseInt(tokenSpan.dataset.astId || "0", 10);
         const typeId = parseInt(tokenSpan.dataset.typeId || "0", 10);
-        const name = tokenSpan.dataset.name || tokenSpan.textContent;
+        const name = (tokenSpan.dataset.name || tokenSpan.textContent || "").trim();
         const header = tokenSpan.dataset.header || "";
         const isInclude = tokenSpan.classList.contains("ast-include") || typeId === 78 || name.includes(".h");
         tokenData = {
@@ -575,6 +585,7 @@ export class VirtualEditor {
           isInclude,
           ast_id: astId,
           type_id: typeId,
+          typeClass: tokenSpan.className || "",
           version: this.currentVersion,
           filePath: this.currentFilePath,
           ftype: this.currentFtype,
@@ -582,11 +593,28 @@ export class VirtualEditor {
         };
       }
 
-      const selection = window.getSelection() ? window.getSelection().toString().trim() : "";
+      // If no AST token span was clicked, but user has an active text selection of a symbol
+      if (!tokenData && selection && /^(struct\s+|union\s+)?[a-zA-Z_]\w*$/.test(selection)) {
+        const cleanName = selection.replace(/^(struct|union)\s+/, "").trim();
+        tokenData = {
+          name: cleanName,
+          header: "",
+          isInclude: false,
+          ast_id: 0,
+          type_id: selection.startsWith("struct ") ? 28 : (selection.startsWith("union ") ? 34 : 0),
+          typeClass: selection.startsWith("struct ") ? "ast-struct tok-type" : (selection.startsWith("union ") ? "ast-struct tok-type" : "tok-identifier"),
+          version: this.currentVersion,
+          filePath: this.currentFilePath,
+          ftype: this.currentFtype,
+          line: lineNo
+        };
+      }
+
       const blame = this.blameView?.blameByLine?.get(lineNo) || null;
 
       contextMenu.showEditorMenu(e.clientX, e.clientY, {
         token: tokenData,
+        lineText,
         filePath: this.currentFilePath,
         ftype: this.currentFtype,
         line: lineNo,
@@ -640,12 +668,12 @@ export class VirtualEditor {
         const dirListHtml = entries.map((item) => {
           const isItemDir = item.type === "dir";
           const icon = isItemDir ? "📁" : "📄";
-          const statBadge = item.s_stat_label ? `<span class="badge" style="font-size:10px;padding:1px 6px;border-radius:3px;background:var(--bg-tertiary);">${item.s_stat_label}</span>` : "";
+          const statBadge = item.s_stat_label ? `<span class="badge" style="font-size:10px;padding:1px 6px;border-radius:3px;background:var(--bg-tertiary);">${escapeHtml(item.s_stat_label)}</span>` : "";
           return `
-            <div class="dir-entry-row" data-path="${item.path}" data-type="${item.type}" style="display:flex;align-items:center;justify-content:space-between;padding:8px 12px;border-bottom:1px solid var(--border-color);cursor:pointer;transition:background 0.15s;" onmouseover="this.style.background='var(--bg-hover)'" onmouseout="this.style.background='transparent'">
+            <div class="dir-entry-row" data-path="${escapeHtml(item.path)}" data-type="${escapeHtml(item.type)}" style="display:flex;align-items:center;justify-content:space-between;padding:8px 12px;border-bottom:1px solid var(--border-color);cursor:pointer;transition:background 0.15s;" onmouseover="this.style.background='var(--bg-hover)'" onmouseout="this.style.background='transparent'">
               <div style="display:flex;align-items:center;gap:10px;">
                 <span style="font-size:16px;">${icon}</span>
-                <span style="font-weight:${isItemDir ? '600' : '400'};color:${isItemDir ? 'var(--accent-blue)' : 'var(--text-primary)'};">${item.name}</span>
+                <span style="font-weight:${isItemDir ? '600' : '400'};color:${isItemDir ? 'var(--accent-blue)' : 'var(--text-primary)'};">${escapeHtml(item.name)}</span>
               </div>
               <div style="display:flex;align-items:center;gap:12px;font-size:11px;color:var(--text-muted);">
                 ${statBadge}
@@ -659,7 +687,7 @@ export class VirtualEditor {
           <div class="directory-browser-container" style="max-width:860px;margin:0 auto;padding:24px 16px;">
             <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;border-bottom:1px solid var(--border-color);padding-bottom:12px;">
               <div>
-                <h3 style="margin:0;font-size:18px;display:flex;align-items:center;gap:8px;">📁 ${this.currentFilePath || "Kernel Root"}</h3>
+                <h3 style="margin:0;font-size:18px;display:flex;align-items:center;gap:8px;">📁 ${escapeHtml(this.currentFilePath || "Kernel Root")}</h3>
                 <span style="font-size:12px;color:var(--text-muted);">${entries.length} items in this directory</span>
               </div>
             </div>
@@ -681,6 +709,13 @@ export class VirtualEditor {
             });
           };
         });
+        return;
+      }
+
+      // Binary and oversized (> 10 MB) files come without content: say why instead of an empty editor
+      if (res.is_binary || res.is_oversized) {
+        this.rawLines = [];
+        this.linesContainer.innerHTML = `<div style="padding:20px;color:var(--text-muted);">${escapeHtml(res.message || "This file cannot be displayed.")}</div>`;
         return;
       }
 
@@ -733,7 +768,7 @@ export class VirtualEditor {
     } catch (err) {
       this.linesContainer.innerHTML = `
         <div style="padding:20px;color:var(--accent-red);">
-          Failed to load file: ${err.message}
+          Failed to load file: ${escapeHtml(err.message)}
         </div>
       `;
     }

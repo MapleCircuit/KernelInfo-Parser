@@ -608,11 +608,6 @@
   font-weight: 600;
 }
 
-.include-pill-count {
-  font-size: 10px;
-  opacity: 0.8;
-}
-
 .include-symbols-list {
   flex: 1;
   overflow-y: auto;
@@ -634,14 +629,6 @@
   background: var(--bg-hover);
 }
 
-.include-symbol-info {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  min-width: 0;
-  flex: 1;
-}
-
 .include-symbol-name {
   font-family: var(--font-mono);
   font-size: 12px;
@@ -660,13 +647,6 @@
   border-radius: 2px;
 }
 
-.include-symbol-details {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  flex-shrink: 0;
-}
-
 .include-badge {
   font-size: 10px;
   font-weight: 600;
@@ -676,13 +656,14 @@
   letter-spacing: 0.3px;
 }
 
-.include-badge-func {
+.include-badge-function {
   background: rgba(88, 166, 255, 0.15);
   color: var(--accent-blue);
   border: 1px solid rgba(88, 166, 255, 0.3);
 }
 
-.include-badge-struct {
+.include-badge-struct,
+.include-badge-union {
   background: rgba(188, 140, 255, 0.15);
   color: var(--accent-purple);
   border: 1px solid rgba(188, 140, 255, 0.3);
@@ -700,19 +681,20 @@
   border: 1px solid rgba(57, 197, 187, 0.3);
 }
 
-.include-badge-enum {
+.include-badge-enum,
+.include-badge-enumconstant {
   background: rgba(210, 153, 34, 0.15);
   color: var(--accent-yellow);
   border: 1px solid rgba(210, 153, 34, 0.3);
 }
 
-.include-badge-var {
+.include-badge-variable {
   background: rgba(63, 185, 80, 0.15);
   color: var(--accent-green);
   border: 1px solid rgba(63, 185, 80, 0.3);
 }
 
-.include-badge-other {
+.include-badge-symbol {
   background: var(--bg-tertiary);
   color: var(--text-muted);
   border: 1px solid var(--border-color);
@@ -726,24 +708,6 @@
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-}
-
-.include-symbol-jump {
-  color: var(--text-muted);
-  font-size: 12px;
-  transition: transform var(--transition-fast), color var(--transition-fast);
-}
-
-.include-symbol-row:hover .include-symbol-jump {
-  color: var(--accent-blue);
-  transform: translateX(2px);
-}
-
-.include-symbols-empty {
-  padding: 24px 16px;
-  text-align: center;
-  color: var(--text-muted);
-  font-size: 12px;
 }
 
 .include-popover-footer {

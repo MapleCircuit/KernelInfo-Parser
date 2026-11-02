@@ -3,18 +3,36 @@
  */
 import { api } from "../../api.js";
 import { state } from "../../state.js";
-import { toast } from "../../components/toast.js";
 import { debounce } from "../../utils/debounce.js";
 import { escapeHtml } from "../../components/modal.js";
 
+/** Sections of the view's sidebar; the first is the default, left out of the URL (§5.26). */
+const SECTIONS = ["subsystems", "developers", "credits", "patch"];
+const SEARCH_PLACEHOLDERS = {
+  subsystems: "Search subsystems, names, emails...",
+  developers: "Search developers, names, emails...",
+  credits: "Search CREDITS entries...",
+  patch: "Search...",
+};
+const EMPTY_DETAIL = `
+  <div style="color:var(--text-muted);padding-top:40px;text-align:center;">
+    Select a subsystem or developer to inspect maintainers and biographical records.
+  </div>`;
+
+/** Key a person is addressed by: the email when known (stable across database rebuilds), else the id or name. */
+function personKey(p) {
+  return String(p.email || p.person_id || p.name || "");
+}
+
 export class MaintainersView {
   constructor() {
+    this.tabId = null;
     this.currentVersion = "v3.0";
     this.activeTab = "subsystems"; // 'subsystems' | 'developers' | 'credits' | 'patch'
     this.subsystems = [];
     this.developers = [];
     this.selectedSecId = null;
-    this.selectedPersonId = null;
+    this.selectedPerson = null; // personKey() of the inspected developer
     this.currentDevRole = "all";
     this.currentDevSort = "activity";
     this.containerEl = null;
@@ -22,7 +40,15 @@ export class MaintainersView {
 
   async render(containerEl, tabData) {
     this.containerEl = containerEl;
+    this.tabId = tabData.id || null;
     this.currentVersion = tabData.version || state.currentVersion;
+    // The tab is the whole truth (§5.26): its section, search, developer filters and selection
+    this.activeTab = SECTIONS.includes(tabData.section) ? tabData.section : "subsystems";
+    this.currentDevRole = ["maintainer", "reviewer", "credits"].includes(tabData.role) ? tabData.role : "all";
+    this.currentDevSort = tabData.sort === "alpha" ? "alpha" : "activity";
+    this.selectedSecId = tabData.secId ? parseInt(tabData.secId, 10) || null : null;
+    this.selectedPerson = this.selectedSecId ? null : (tabData.person ? String(tabData.person) : null);
+    const initialQuery = tabData.query || "";
 
     containerEl.innerHTML = `
       <div class="maintainers-view-container">
@@ -35,7 +61,7 @@ export class MaintainersView {
             <div class="m-nav-tab ${this.activeTab === "patch" ? "active" : ""}" data-tab="patch">Patch Reviewer</div>
           </div>
           <div style="padding:8px 12px;border-bottom:1px solid var(--border-color);">
-            <input type="text" id="m-search-input" placeholder="Search subsystems, names, emails..." style="width:100%;" />
+            <input type="text" id="m-search-input" placeholder="${SEARCH_PLACEHOLDERS[this.activeTab]}" value="${escapeHtml(initialQuery)}" style="width:100%;" />
           </div>
           <!-- Developers Filter & Sort Toolbar -->
           <div id="m-filter-toolbar" class="m-filter-toolbar" style="${this.activeTab === "developers" ? "display:flex;" : "display:none;"}">
@@ -55,38 +81,23 @@ export class MaintainersView {
         </div>
 
         <!-- Detail Column -->
-        <div class="maintainers-detail" id="m-detail-container">
-          <div style="color:var(--text-muted);padding-top:40px;text-align:center;">
-            Select a subsystem or developer to inspect maintainers and biographical records.
-          </div>
-        </div>
+        <div class="maintainers-detail" id="m-detail-container">${EMPTY_DETAIL}</div>
       </div>
     `;
 
     // Tab switching
     containerEl.querySelectorAll(".m-nav-tab").forEach((tab) => {
       tab.onclick = () => {
-        this.activeTab = tab.dataset.tab;
-        containerEl.querySelectorAll(".m-nav-tab").forEach((t) => t.classList.remove("active"));
-        tab.classList.add("active");
-
-        const filterToolbar = containerEl.querySelector("#m-filter-toolbar");
-        if (filterToolbar) {
-          filterToolbar.style.display = this.activeTab === "developers" ? "flex" : "none";
+        if (tab.dataset.tab === this.activeTab) return;
+        const leavingPatch = this.activeTab === "patch";
+        this.setSection(tab.dataset.tab);
+        if (this.activeTab === "patch") {
+          // The reviewer replaces the detail column: nothing is inspected any more
+          this.setSelection(null, null);
+        } else if (leavingPatch) {
+          containerEl.querySelector("#m-detail-container").innerHTML = EMPTY_DETAIL;
         }
-
-        const searchInput = containerEl.querySelector("#m-search-input");
-        if (this.activeTab === "developers") {
-          searchInput.placeholder = "Search developers, names, emails...";
-        } else if (this.activeTab === "subsystems") {
-          searchInput.placeholder = "Search subsystems, names, emails...";
-        } else if (this.activeTab === "credits") {
-          searchInput.placeholder = "Search CREDITS entries...";
-        } else {
-          searchInput.placeholder = "Search...";
-        }
-
-        this.loadList(searchInput.value.trim());
+        this.loadList(containerEl.querySelector("#m-search-input").value.trim());
       };
     });
 
@@ -96,6 +107,7 @@ export class MaintainersView {
         this.currentDevRole = pill.dataset.role;
         containerEl.querySelectorAll(".m-role-pill").forEach((p) => p.classList.remove("active"));
         pill.classList.add("active");
+        this.persistTabState({ role: this.currentDevRole === "all" ? undefined : this.currentDevRole });
         const searchInput = containerEl.querySelector("#m-search-input");
         this.loadList(searchInput.value.trim());
       };
@@ -107,6 +119,7 @@ export class MaintainersView {
       sortBtn.onclick = () => {
         this.currentDevSort = this.currentDevSort === "activity" ? "alpha" : "activity";
         sortBtn.textContent = this.currentDevSort === "alpha" ? "🔤 A-Z" : "⚡ Activity";
+        this.persistTabState({ sort: this.currentDevSort === "alpha" ? "alpha" : undefined });
         const searchInput = containerEl.querySelector("#m-search-input");
         this.loadList(searchInput.value.trim());
       };
@@ -115,16 +128,46 @@ export class MaintainersView {
     // Search filter
     const searchInput = containerEl.querySelector("#m-search-input");
     const debouncedSearch = debounce((q) => {
+      this.persistTabState({ query: q });
       this.loadList(q);
     }, 250);
     searchInput.oninput = () => {
       debouncedSearch(searchInput.value.trim());
     };
 
-    await this.loadList();
-    if (tabData.person) {
-      await this.inspectPerson(tabData.person);
-    }
+    // The selection is requested beside the list, so neither waits for the other
+    const detail = this.activeTab === "patch" ? null
+      : this.selectedSecId ? this.inspectSection(this.selectedSecId)
+      : this.selectedPerson ? this.inspectPerson(this.selectedPerson)
+      : null;
+    await Promise.all([this.loadList(initialQuery), detail]);
+  }
+
+  /**
+   * Record on this tab (and so in its URL, §5.26) what this view is showing. A view whose
+   * element was replaced by a re-render is stale: its state is nobody's address any more.
+   */
+  persistTabState(patch) {
+    if (!this.containerEl || !this.containerEl.isConnected) return null;
+    return state.updateTabState(this.tabId, patch);
+  }
+
+  /** Switch the sidebar section (nav tab, filter toolbar, search placeholder) and record it. */
+  setSection(section) {
+    this.activeTab = section;
+    this.containerEl.querySelectorAll(".m-nav-tab").forEach((t) => t.classList.toggle("active", t.dataset.tab === section));
+    const filterToolbar = this.containerEl.querySelector("#m-filter-toolbar");
+    if (filterToolbar) filterToolbar.style.display = section === "developers" ? "flex" : "none";
+    const searchInput = this.containerEl.querySelector("#m-search-input");
+    if (searchInput) searchInput.placeholder = SEARCH_PLACEHOLDERS[section];
+    this.persistTabState({ section: section === "subsystems" ? undefined : section });
+  }
+
+  /** The inspected subsystem or developer (one at a time), recorded on the tab. */
+  setSelection(secId, person) {
+    this.selectedSecId = secId ? parseInt(secId, 10) : null;
+    this.selectedPerson = this.selectedSecId ? null : (person ? String(person) : null);
+    this.persistTabState({ secId: this.selectedSecId || undefined, person: this.selectedPerson || undefined });
   }
 
   async loadList(query = "") {
@@ -136,6 +179,11 @@ export class MaintainersView {
         const res = await api.getMaintainersOverview(this.currentVersion, query);
         this.subsystems = res.sections || [];
         this.renderSubsystemsList();
+        if (!this.subsystems.length) {
+          listContainer.innerHTML = `<div style="padding:16px;color:var(--text-muted);">${
+            res.indexed === false ? "The MAINTAINERS file of this revision has not been parsed." : "No matching subsystem."
+          }</div>`;
+        }
       } catch (e) {
         listContainer.innerHTML = `<div style="padding:16px;color:var(--accent-red);">Failed: ${escapeHtml(e.message)}</div>`;
       }
@@ -174,7 +222,7 @@ export class MaintainersView {
 
     developers.forEach((d) => {
       const card = document.createElement("div");
-      card.className = `subsystem-card dev-card ${d.person_id === this.selectedPersonId ? "active" : ""}`;
+      card.className = `subsystem-card dev-card ${personKey(d) === this.selectedPerson ? "active" : ""}`;
 
       const roleBadges = [];
       if (d.is_maintainer) {
@@ -189,20 +237,19 @@ export class MaintainersView {
 
       card.innerHTML = `
         <div class="subsystem-name">
-          <span style="font-weight:600;">${this.escapeHtml(d.name || d.email || "Unknown")}</span>
+          <span style="font-weight:600;">${escapeHtml(d.name || d.email || "Unknown")}</span>
           ${d.subsystems_count > 0 ? `<span class="dev-subsystems-count">${d.subsystems_count} ${d.subsystems_count === 1 ? "subsystem" : "subsystems"}</span>` : ""}
         </div>
         <div class="subsystem-lead" style="display:flex;align-items:center;justify-content:space-between;gap:6px;margin-top:4px;">
-          <span class="dev-email-text" title="${this.escapeHtml(d.email || "")}">${this.escapeHtml(d.email || "")}</span>
+          <span class="dev-email-text" title="${escapeHtml(d.email || "")}">${escapeHtml(d.email || "")}</span>
           <div class="dev-badges-group">${roleBadges.join("")}</div>
         </div>
       `;
 
       card.onclick = () => {
-        this.selectedPersonId = d.person_id;
         this.containerEl.querySelectorAll(".subsystem-card").forEach((c) => c.classList.remove("active"));
         card.classList.add("active");
-        this.inspectPerson(d.person_id || d.email || d.name);
+        this.inspectPerson(personKey(d));
       };
 
       card.addEventListener("auxclick", (e) => {
@@ -213,7 +260,7 @@ export class MaintainersView {
             type: "maintainers",
             title: `Person: ${d.name || d.email}`,
             version: this.currentVersion,
-            person: d.person_id || d.email,
+            person: personKey(d),
             forceNew: true
           });
         }
@@ -232,16 +279,15 @@ export class MaintainersView {
       card.className = `subsystem-card ${sec.sec_id === this.selectedSecId ? "active" : ""}`;
       card.innerHTML = `
         <div class="subsystem-name">
-          <span>${sec.name}</span>
-          ${sec.status ? `<span class="subsystem-status">${sec.status}</span>` : ""}
+          <span>${escapeHtml(sec.name)}</span>
+          ${sec.status ? `<span class="subsystem-status">${escapeHtml(sec.status)}</span>` : ""}
         </div>
         <div class="subsystem-lead">
-          ${sec.maintainers_count ? `${sec.maintainers_count} Maintainers` : ""}
+          ${sec.maintainers_count ? `${escapeHtml(sec.maintainers_count)} Maintainers` : ""}
         </div>
       `;
 
       card.onclick = () => {
-        this.selectedSecId = sec.sec_id;
         this.containerEl.querySelectorAll(".subsystem-card").forEach((c) => c.classList.remove("active"));
         card.classList.add("active");
         this.inspectSection(sec.sec_id);
@@ -255,6 +301,7 @@ export class MaintainersView {
             type: "maintainers",
             title: `Subsystem: ${sec.name}`,
             version: this.currentVersion,
+            secId: sec.sec_id,
             forceNew: true
           });
         }
@@ -265,6 +312,7 @@ export class MaintainersView {
   }
 
   async inspectSection(secId) {
+    this.setSelection(secId, null);
     const detailEl = this.containerEl.querySelector("#m-detail-container");
     detailEl.innerHTML = `<div style="color:var(--text-muted);">Loading subsystem details...</div>`;
 
@@ -274,8 +322,8 @@ export class MaintainersView {
 
       detailEl.innerHTML = `
         <div class="m-section-header">
-          <div class="m-section-title">${sec.name}</div>
-          <div style="font-size:12px;color:var(--accent-cyan);margin-top:4px;">Status: ${sec.status || "Maintained"}</div>
+          <div class="m-section-title">${escapeHtml(sec.name)}</div>
+          <div style="font-size:12px;color:var(--accent-cyan);margin-top:4px;">Status: ${escapeHtml(sec.status || "Maintained")}</div>
         </div>
 
         <div class="m-grid-2col">
@@ -286,14 +334,14 @@ export class MaintainersView {
               ${
                 Array.isArray(sec.members) && sec.members.length > 0
                   ? sec.members.map((m) => `
-                      <div class="person-item" data-id="${m.person_id || ''}" data-email="${m.email || ''}" data-name="${m.name || ''}" style="cursor:pointer;">
+                      <div class="person-item" data-id="${escapeHtml(m.person_id || '')}" data-email="${escapeHtml(m.email || '')}" data-name="${escapeHtml(m.name || '')}" style="cursor:pointer;">
                         <div class="person-info">
-                          <span class="person-name">${m.name}</span>
-                          <span class="person-email">${m.email || ''}</span>
+                          <span class="person-name">${escapeHtml(m.name)}</span>
+                          <span class="person-email">${escapeHtml(m.email || '')}</span>
                         </div>
 
                         <span style="font-size:10px;padding:1px 5px;background:var(--bg-tertiary);border-radius:3px;">
-                          ${m.role_name || (m.role_type === 1 ? "Maintainer" : "Reviewer")}
+                          ${escapeHtml(m.role_name || (m.role_type === 1 ? "Maintainer" : "Reviewer"))}
                         </span>
                       </div>
                     `).join("")
@@ -306,9 +354,9 @@ export class MaintainersView {
           <div class="m-card">
             <div class="m-card-title">Subsystem Metadata</div>
             <div style="display:flex;flex-direction:column;gap:8px;font-size:12px;">
-              <div><strong style="color:var(--text-muted);">Mailing List:</strong> ${sec.mailing_list || "None"}</div>
-              <div><strong style="color:var(--text-muted);">Web Page:</strong> ${sec.web_page ? `<a href="${sec.web_page}" target="_blank" style="color:var(--accent-blue);">${sec.web_page}</a>` : "None"}</div>
-              <div><strong style="color:var(--text-muted);">SCM Tree:</strong> ${sec.scm_tree || "None"}</div>
+              <div><strong style="color:var(--text-muted);">Mailing List:</strong> ${escapeHtml(sec.mailing_list || "None")}</div>
+              <div><strong style="color:var(--text-muted);">Web Page:</strong> ${sec.web_page ? `<a href="${escapeHtml(sec.web_page)}" target="_blank" style="color:var(--accent-blue);">${escapeHtml(sec.web_page)}</a>` : "None"}</div>
+              <div><strong style="color:var(--text-muted);">SCM Tree:</strong> ${escapeHtml(sec.scm_tree || "None")}</div>
             </div>
           </div>
         </div>
@@ -321,8 +369,8 @@ export class MaintainersView {
               Array.isArray(sec.patterns) && sec.patterns.length > 0
                 ? sec.patterns.map((p) => `
                     <div style="display:flex;gap:8px;">
-                      <span style="color:var(--accent-orange);font-weight:bold;">${p.pattern_type}:</span>
-                      <span>${p.pattern}</span>
+                      <span style="color:var(--accent-orange);font-weight:bold;">${escapeHtml(p.pattern_type || "")}:</span>
+                      <span>${escapeHtml(p.pattern)}</span>
                     </div>
                   `).join("")
                 : `<span style="color:var(--text-muted);">No explicit file rules</span>`
@@ -337,8 +385,8 @@ export class MaintainersView {
             ${
               Array.isArray(sec.files) && sec.files.length > 0
                 ? sec.files.map((f) => `
-                    <div class="m-file-link" data-path="${f.fname || f}" style="color:var(--accent-blue);cursor:pointer;padding:2px 0;">
-                      📄 ${f.fname || f}
+                    <div class="m-file-link" data-path="${escapeHtml(f.fname || f)}" style="color:var(--accent-blue);cursor:pointer;padding:2px 0;">
+                      📄 ${escapeHtml(f.fname || f)}
                     </div>
                   `).join("")
                 : `<span style="color:var(--text-muted);">No directly matched indexed files recorded</span>`
@@ -349,7 +397,7 @@ export class MaintainersView {
 
       // Developer click -> Person Profile
       detailEl.querySelectorAll(".person-item").forEach((el) => {
-        el.onclick = () => this.inspectPerson(el.dataset.id || el.dataset.email || el.dataset.name);
+        el.onclick = () => this.inspectPerson(el.dataset.email || el.dataset.id || el.dataset.name);
         el.addEventListener("auxclick", (e) => {
           if (e.button === 1) {
             e.preventDefault();
@@ -358,6 +406,7 @@ export class MaintainersView {
               type: "maintainers",
               title: `Person: ${el.dataset.name || el.dataset.email || "Profile"}`,
               version: this.currentVersion,
+              person: el.dataset.email || el.dataset.id || el.dataset.name,
               forceNew: true
             });
           }
@@ -400,18 +449,18 @@ export class MaintainersView {
 
     credits.forEach((c) => {
       const card = document.createElement("div");
-      card.className = "subsystem-card";
+      card.className = `subsystem-card ${personKey(c) === this.selectedPerson ? "active" : ""}`;
       card.innerHTML = `
         <div class="subsystem-name">
-          <span>${c.name}</span>
+          <span>${escapeHtml(c.name)}</span>
         </div>
-        <div class="subsystem-lead">${c.description || c.email || ""}</div>
+        <div class="subsystem-lead">${escapeHtml(c.description || c.email || "")}</div>
       `;
 
       card.onclick = () => {
         this.containerEl.querySelectorAll(".subsystem-card").forEach((x) => x.classList.remove("active"));
         card.classList.add("active");
-        this.inspectPerson(c.person_id || c.email || c.name);
+        this.inspectPerson(personKey(c));
       };
 
       listContainer.appendChild(card);
@@ -419,6 +468,7 @@ export class MaintainersView {
   }
 
   async inspectPerson(emailOrName) {
+    this.setSelection(null, emailOrName);
     const detailEl = this.containerEl.querySelector("#m-detail-container");
     detailEl.innerHTML = `<div style="color:var(--text-muted);">Loading developer profile...</div>`;
 
@@ -429,8 +479,8 @@ export class MaintainersView {
 
       detailEl.innerHTML = `
         <div class="m-section-header">
-          <div class="m-section-title">${p.name}</div>
-          <div style="font-size:12px;color:var(--text-muted);">${p.email || ""}</div>
+          <div class="m-section-title">${escapeHtml(p.name)}</div>
+          <div style="font-size:12px;color:var(--text-muted);">${escapeHtml(p.email || "")}</div>
         </div>
 
         <div class="m-grid-2col">
@@ -438,10 +488,10 @@ export class MaintainersView {
           <div class="m-card">
             <div class="m-card-title">CREDITS Record</div>
             <div style="display:flex;flex-direction:column;gap:8px;font-size:12px;">
-              <div><strong style="color:var(--text-muted);">Description:</strong> ${p.credits?.description || "Not in CREDITS"}</div>
-              ${p.credits?.web_page ? `<div><strong style="color:var(--text-muted);">Web Page:</strong> <a href="${p.credits.web_page}" target="_blank" style="color:var(--accent-blue);">${p.credits.web_page}</a></div>` : ""}
-              ${p.credits?.pgp_key ? `<div><strong style="color:var(--text-muted);">PGP Key:</strong> <code style="font-size:11px;color:var(--accent-orange);">${p.credits.pgp_key}</code></div>` : ""}
-              <div><strong style="color:var(--text-muted);">Snail Mail:</strong> ${p.credits?.snail_mail ? `<pre style="font-family:inherit;margin-top:2px;white-space:pre-wrap;">${p.credits.snail_mail}</pre>` : "None"}</div>
+              <div><strong style="color:var(--text-muted);">Description:</strong> ${escapeHtml(p.credits?.description || "Not in CREDITS")}</div>
+              ${p.credits?.web_page ? `<div><strong style="color:var(--text-muted);">Web Page:</strong> <a href="${escapeHtml(p.credits.web_page)}" target="_blank" style="color:var(--accent-blue);">${escapeHtml(p.credits.web_page)}</a></div>` : ""}
+              ${p.credits?.pgp_key ? `<div><strong style="color:var(--text-muted);">PGP Key:</strong> <code style="font-size:11px;color:var(--accent-orange);">${escapeHtml(p.credits.pgp_key)}</code></div>` : ""}
+              <div><strong style="color:var(--text-muted);">Snail Mail:</strong> ${p.credits?.snail_mail ? `<pre style="font-family:inherit;margin-top:2px;white-space:pre-wrap;">${escapeHtml(p.credits.snail_mail)}</pre>` : "None"}</div>
             </div>
           </div>
 
@@ -464,8 +514,8 @@ export class MaintainersView {
               sections.length > 0
                 ? sections.map((s) => `
                     <div class="sec-ref-item" data-id="${s.sec_id}" style="cursor:pointer;padding:4px 8px;border-radius:3px;background:var(--bg-tertiary);display:flex;justify-content:space-between;">
-                      <span style="font-weight:500;color:var(--accent-blue);">${s.name}</span>
-                      <span style="color:var(--text-muted);">${s.role_name || "Maintainer"}</span>
+                      <span style="font-weight:500;color:var(--accent-blue);">${escapeHtml(s.name)}</span>
+                      <span style="color:var(--text-muted);">${escapeHtml(s.role_name || "Maintainer")}</span>
                     </div>
                   `).join("")
                 : `<span style="color:var(--text-muted);">No indexed subsystems</span>`
@@ -475,7 +525,7 @@ export class MaintainersView {
 
         <div style="margin-top:16px;display:flex;gap:8px;">
           <button id="btn-view-person-commits" class="code-btn active" style="font-size:12px;padding:6px 12px;cursor:pointer;">
-            View Commits by ${this.escapeHtml(p.name || p.email)}
+            View Commits by ${escapeHtml(p.name || p.email)}
           </button>
         </div>
       `;
@@ -483,13 +533,14 @@ export class MaintainersView {
       // Clicking a maintained subsystem opens it
       detailEl.querySelectorAll(".sec-ref-item").forEach((el) => {
         el.onclick = async () => {
-          this.activeTab = "subsystems";
-          this.containerEl.querySelectorAll(".m-nav-tab").forEach((t) => t.classList.toggle("active", t.dataset.tab === "subsystems"));
-          const filterToolbar = this.containerEl.querySelector("#m-filter-toolbar");
-          if (filterToolbar) filterToolbar.style.display = "none";
+          this.setSection("subsystems");
           this.selectedSecId = parseInt(el.dataset.id, 10);
-          await this.loadList();
+          // The subsystems list is shown whole, so the search box no longer applies
+          const searchInput = this.containerEl.querySelector("#m-search-input");
+          if (searchInput) searchInput.value = "";
+          this.persistTabState({ query: undefined });
           this.inspectSection(el.dataset.id);
+          await this.loadList();
         };
         el.addEventListener("auxclick", (e) => {
           if (e.button === 1) {
@@ -499,6 +550,7 @@ export class MaintainersView {
               type: "maintainers",
               title: `Subsystem: ${el.querySelector("span")?.textContent || "Detail"}`,
               version: this.currentVersion,
+              secId: parseInt(el.dataset.id, 10),
               forceNew: true
             });
           }
@@ -519,16 +571,6 @@ export class MaintainersView {
     } catch (e) {
       detailEl.innerHTML = `<div style="color:var(--accent-red);padding:16px;">Failed to load person profile: ${escapeHtml(e.message)}</div>`;
     }
-  }
-
-  escapeHtml(str) {
-    if (!str) return "";
-    return String(str)
-      .replace(/&/g, "&amp;")
-      .replace(/</g, "&lt;")
-      .replace(/>/g, "&gt;")
-      .replace(/"/g, "&quot;")
-      .replace(/'/g, "&#039;");
   }
 
   renderPatchReviewer() {
@@ -552,12 +594,22 @@ export class MaintainersView {
 
       try {
         const matchRes = await api.matchMaintainers(this.currentVersion, text);
+        const toList = (matchRes.suggested_to || []).map((p) => {
+          const str = typeof p === "string" ? p : `${p.name || p.email} <${p.email || ""}> (${p.role || "Maintainer"})`;
+          return `<div>• ${escapeHtml(str)}</div>`;
+        }).join("");
+        const ccList = (matchRes.suggested_cc || []).map((p) => {
+          const str = typeof p === "string" ? p : `${p.name || p.email} <${p.email || ""}>`;
+          return `<div>• ${escapeHtml(str)}</div>`;
+        }).join("");
+
         resContainer.innerHTML = `
           <div style="display:flex;flex-direction:column;gap:10px;">
             <div><strong>Suggested To:</strong></div>
-            ${(matchRes.suggested_to || []).map((p) => `<div>• ${p.name} &lt;${p.email}&gt; (${p.role || "Maintainer"})</div>`).join("")}
+            ${toList || "<div style='color:var(--text-muted);'>None</div>"}
             <div style="margin-top:8px;"><strong>Suggested Cc:</strong></div>
-            ${(matchRes.suggested_cc || []).map((p) => `<div>• ${p.name || p.email} &lt;${p.email}&gt;</div>`).join("")}
+            ${ccList || "<div style='color:var(--text-muted);'>None</div>"}
+            ${matchRes.skipped_files_count ? `<div style="margin-top:8px;color:var(--accent-yellow);">${escapeHtml(matchRes.skipped_files_count)} more file(s) of the patch were not matched (per-patch file limit).</div>` : ""}
           </div>
         `;
       } catch (e) {

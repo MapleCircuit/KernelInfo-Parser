@@ -2,7 +2,6 @@
 
 Implements:
 1. TreeResolverService:
-   - Path A: Single-file lookup (<0.2ms) walking parent_idx=0 back to checkpoint.
    - Path B: Full-tree resolution (<15ms, LRU cached) applying m_commit_file deltas to checkpoint baseline.
 2. GitTreeResolver:
    - Path C: Git-native full-tree listing (`git ls-tree -r`, LRU cached per commit SHA) for any revision,
@@ -33,25 +32,27 @@ from parser.arch_layout import ArchLayout, path_arch
 from parser.kbuild_conditions import own_arch_dirs
 from webapp.backend.config import get_repo_dir
 from webapp.backend.database.pool import get_db_cursor
-from webapp.backend.database.helpers import hash_hex, safe_decode
+from webapp.backend.database.helpers import finished_ref_sql, hash_hex, safe_decode
 
 logger = logging.getLogger(__name__)
 
 
 class TreeResolverService:
-    """Dual-path Git tree resolver mapping commit_id and fnid to content-addressable blob_ids."""
+    """Database tree resolver (Path B) mapping commit_id and fnid to content-addressable blob_ids."""
 
     def __init__(self, max_cache_size: int = 128) -> None:
         self._tree_cache: OrderedDict[int, dict[int, int]] = OrderedDict()
         self._checkpoint_cache: dict[int, int] = {}
         self._parent_cache: dict[int, int] = {}
         self._max_cache_size = max_cache_size
+        self._lock = threading.Lock()
 
     def clear_cache(self) -> None:
         """Clear all in-memory tree and checkpoint caches."""
-        self._tree_cache.clear()
-        self._checkpoint_cache.clear()
-        self._parent_cache.clear()
+        with self._lock:
+            self._tree_cache.clear()
+            self._checkpoint_cache.clear()
+            self._parent_cache.clear()
 
     def _get_first_parent(self, commit_id: int, cursor: Any) -> int | None:
         """Resolve the primary (first-parent, parent_idx=0) commit_id."""
@@ -113,67 +114,6 @@ class TreeResolverService:
         if chk_id is not None:
             self._checkpoint_cache[commit_id] = chk_id
         return chk_id, list(reversed(path_rev))
-
-    def resolve_file_blob(self, commit_id: int, fnid: int, cursor: Any = None) -> int | None:
-        """Path A: Single-file lookup (<0.2ms) walking parent_idx=0 back to checkpoint."""
-        if commit_id <= 0 or fnid <= 0:
-            return None
-
-        # Check full-tree LRU cache first
-        if commit_id in self._tree_cache:
-            return self._tree_cache[commit_id].get(fnid)
-
-        if cursor is not None:
-            return self._resolve_file_blob_with_cursor(commit_id, fnid, cursor)
-
-        with get_db_cursor() as cur:
-            return self._resolve_file_blob_with_cursor(commit_id, fnid, cur)
-
-    def _resolve_file_blob_with_cursor(self, commit_id: int, fnid: int, cursor: Any) -> int | None:
-        chk_id, forward_path = self._find_nearest_checkpoint_and_path(commit_id, cursor)
-
-        # Check deltas along forward path (from newest commit_id backwards to oldest)
-        if forward_path:
-            format_strings = ",".join(["%s"] * len(forward_path))
-            sql = f"""
-                SELECT commit_id, blob_id, change_type
-                FROM m_commit_file
-                WHERE fnid = %s AND commit_id IN ({format_strings});
-            """
-            cursor.execute(sql, [fnid, *forward_path])
-            rows = cursor.fetchall()
-            if rows:
-                commit_to_delta = {
-                    (r["commit_id"] if isinstance(r, dict) else r[0]): (
-                        r["blob_id"] if isinstance(r, dict) else r[1],
-                        safe_decode(r["change_type"] if isinstance(r, dict) else r[2]),
-                    )
-                    for r in rows
-                }
-                for cid in reversed(forward_path):
-                    if cid in commit_to_delta:
-                        blob_id, change_type = commit_to_delta[cid]
-                        if change_type == "D" or blob_id == 0:
-                            return None
-                        return blob_id
-
-        # If no delta was applied along the path, check baseline checkpoint
-        if chk_id is not None:
-            cursor.execute(
-                """
-                SELECT blob_id
-                FROM m_bridge_checkpoint
-                WHERE commit_id = %s AND fnid = %s
-                LIMIT 1;
-                """,
-                (chk_id, fnid),
-            )
-            row = cursor.fetchone()
-            if row:
-                blob_id = row["blob_id"] if isinstance(row, dict) else row[0]
-                return blob_id if blob_id != 0 else None
-
-        return None
 
     def resolve_tree(self, commit_id: int, cursor: Any = None) -> dict[int, int]:
         """Path B: Full-tree resolution (<15ms, LRU cached) applying m_commit_file deltas to checkpoint."""
@@ -247,12 +187,19 @@ class TreeResolverService:
 
 
 BLOB_PATHS_TTL = 120.0
+# Revision name -> commit SHA answers are reused this long (a branch moves; the `git` sync token also
+# clears them, see clear_revision_caches). A full SHA that resolved is a commit forever.
+REV_SHA_TTL = 15.0
+REV_SHA_CACHE_SIZE = 4096
+# Directory and search indexes are a few MB per commit, so fewer are kept than tree listings
+DERIVED_CACHE_SIZE = 4
+_FULL_SHA_RE = re.compile(r"[0-9a-f]{40}")
 
 
 class GitTreeResolver:
     """Path C: Git-native full-tree resolver for any revision (tag, branch, or arbitrary commit).
 
-    The relational commit DAG only covers ingested commits, so Path A/B cannot reconstruct the
+    The relational commit DAG only covers ingested commits, so Path B cannot reconstruct the
     tree of a commit whose first-parent chain leaves the indexed set. The Git object store is
     always complete, so this resolver lists the tree directly and joins m_file_blob through the
     content-addressed blob_hash (blob_hash == Git blob SHA-1).
@@ -263,7 +210,14 @@ class GitTreeResolver:
         self._lock = threading.Lock()
         self._tree_cache: OrderedDict[str, dict[str, str]] = OrderedDict()
         self._size_cache: OrderedDict[str, dict[str, int]] = OrderedDict()
-        self._blob_path_cache: OrderedDict[str, tuple[float, dict[int, list[str]]]] = OrderedDict()
+        # sha -> (computed at, or None for a finished version whose blobs no longer change; {blob_id: paths})
+        self._blob_path_cache: OrderedDict[str, tuple[float | None, dict[int, list[str]]]] = OrderedDict()
+        # (repository, revision) -> (resolved at, or None when permanent; commit SHA or None)
+        self._sha_cache: OrderedDict[tuple[str, str], tuple[float | None, str | None]] = OrderedDict()
+        # sha -> {directory: (subdirectory names, {path: blob_sha} of its direct files)}, built in one pass
+        self._dir_cache: OrderedDict[str, dict[str, tuple[set[str], dict[str, str]]]] = OrderedDict()
+        # sha -> [(lowercased path, lowercased basename, path)], scanned by the file palette
+        self._search_cache: OrderedDict[str, list[tuple[str, str, str]]] = OrderedDict()
         self._max_cache_size = max_cache_size
 
     @property
@@ -271,11 +225,12 @@ class GitTreeResolver:
         """Pinned repository, else the repository selected for the current request."""
         return self._pinned_repo_dir or get_repo_dir()
 
-    def clear_cache(self) -> None:
+    def clear_revision_caches(self) -> None:
+        """Drop what depends on refs or on what was parsed (revision names, indexed blob maps). Tree
+        listings are keyed by commit SHA and never change, so they are kept."""
         with self._lock:
-            self._tree_cache.clear()
-            self._size_cache.clear()
             self._blob_path_cache.clear()
+            self._sha_cache.clear()
 
     def _run_git(self, args: list[str], timeout: float = 30.0) -> bytes | None:
         if not self.repo_dir.exists():
@@ -293,13 +248,32 @@ class GitTreeResolver:
         return out.stdout if out.returncode == 0 else None
 
     def resolve_commit_sha(self, rev: str) -> str | None:
-        """Resolve any revision (tag, branch, short/full SHA) to its full 40-char commit SHA."""
+        """Resolve any revision (tag, branch, short/full SHA) to its full 40-char commit SHA.
+
+        Answers are cached (every tree, blob and layout lookup resolves its revision first, and each
+        resolution used to spawn `git rev-parse`): a full SHA that names a commit permanently, any other
+        name for REV_SHA_TTL seconds.
+        """
         # Only a plain ref name or SHA may reach the command line: git reads "-..." as an option
         if not is_safe_git_rev(rev):
             return None
+        key = (str(self.repo_dir), rev)
+        now = time.monotonic()
+        with self._lock:
+            hit = self._sha_cache.get(key)
+            if hit is not None and (hit[0] is None or now - hit[0] < REV_SHA_TTL):
+                self._sha_cache.move_to_end(key)
+                return hit[1]
         out = self._run_git(["rev-parse", "--verify", "--quiet", f"{rev}^{{commit}}"], timeout=5.0)
         sha = out.decode("ascii", errors="replace").strip() if out else ""
-        return sha if len(sha) == 40 else None
+        sha = sha if len(sha) == 40 else None
+        permanent = sha is not None and _FULL_SHA_RE.fullmatch(rev) is not None
+        with self._lock:
+            self._sha_cache[key] = (None if permanent else now, sha)
+            self._sha_cache.move_to_end(key)
+            while len(self._sha_cache) > REV_SHA_CACHE_SIZE:
+                self._sha_cache.popitem(last=False)
+        return sha
 
     def list_tree(self, rev: str) -> dict[str, str] | None:
         """Return {path: blob_sha_hex} for every blob in the tree of rev, or None if unresolvable."""
@@ -332,6 +306,67 @@ class GitTreeResolver:
             if len(self._tree_cache) > self._max_cache_size:
                 self._tree_cache.popitem(last=False)
         return tree
+
+    def _derived(self, cache: OrderedDict[str, Any], rev: str, build: Any) -> Any:
+        """Per-commit structure built once from list_tree(rev) by `build(tree)` (LRU, DERIVED_CACHE_SIZE)."""
+        sha = self.resolve_commit_sha(rev)
+        if sha is None:
+            return None
+        with self._lock:
+            hit = cache.get(sha)
+            if hit is not None:
+                cache.move_to_end(sha)
+                return hit
+        tree = self.list_tree(sha)
+        if tree is None:
+            return None
+        value = build(tree)
+        with self._lock:
+            cache[sha] = value
+            cache.move_to_end(sha)
+            while len(cache) > DERIVED_CACHE_SIZE:
+                cache.popitem(last=False)
+        return value
+
+    @staticmethod
+    def _build_dir_index(tree: dict[str, str]) -> dict[str, tuple[set[str], dict[str, str]]]:
+        index: dict[str, tuple[set[str], dict[str, str]]] = {}
+        for path, blob_sha in tree.items():
+            parent = path.rpartition("/")[0]
+            entry = index.get(parent)
+            if entry is None:
+                entry = index[parent] = (set(), {})
+            entry[1][path] = blob_sha
+            # Register each ancestor in its parent; stop at the first one already known
+            while parent:
+                grand, _, name = parent.rpartition("/")
+                up = index.get(grand)
+                if up is None:
+                    up = index[grand] = (set(), {})
+                if name in up[0]:
+                    break
+                up[0].add(name)
+                parent = grand
+        return index
+
+    def list_dir(self, rev: str, directory: str) -> tuple[set[str], dict[str, str]] | None:
+        """(subdirectory names, {path: blob_sha} of direct files) of `directory` ("" is the root) at rev,
+        from a per-commit index, so expanding a directory no longer scans the whole tree. None if rev is
+        unresolvable; an absent directory is empty."""
+        index = self._derived(self._dir_cache, rev, self._build_dir_index)
+        if index is None:
+            return None
+        return index.get(directory.strip("/"), (set(), {}))
+
+    def search_index(self, rev: str) -> list[tuple[str, str, str]] | None:
+        """[(lowercased path, lowercased basename, path)] of every blob at rev, built once per commit."""
+        def build(tree: dict[str, str]) -> list[tuple[str, str, str]]:
+            out = []
+            for path in tree:
+                low = path.lower()
+                out.append((low, low.rpartition("/")[2], path))
+            return out
+        return self._derived(self._search_cache, rev, build)
 
     def list_tree_sizes(self, rev: str) -> dict[str, int] | None:
         """Return {path: blob size in bytes} for every blob in the tree of rev (LRU cached per commit SHA)."""
@@ -377,7 +412,7 @@ class GitTreeResolver:
         now = time.monotonic()
         with self._lock:
             hit = self._blob_path_cache.get(sha)
-            if hit is not None and now - hit[0] < BLOB_PATHS_TTL:
+            if hit is not None and (hit[0] is None or now - hit[0] < BLOB_PATHS_TTL):
                 self._blob_path_cache.move_to_end(sha)
                 return hit[1]
 
@@ -393,12 +428,31 @@ class GitTreeResolver:
         for v in paths.values():
             v.sort()
 
+        # A finished version's blobs are all indexed: its map only changes when the parse state does,
+        # which clears this cache (clear_revision_caches). Other revisions gain blobs as parses run.
+        stamp = None if self._is_finished_version(cursor, sha) else now
         with self._lock:
-            self._blob_path_cache[sha] = (now, paths)
+            self._blob_path_cache[sha] = (stamp, paths)
             self._blob_path_cache.move_to_end(sha)
             if len(self._blob_path_cache) > 8:
                 self._blob_path_cache.popitem(last=False)
         return paths
+
+    @staticmethod
+    def _is_finished_version(cursor: Any, sha: str) -> bool:
+        """Whether the commit is the head of a ref whose ingestion finished."""
+        try:
+            cursor.execute(
+                f"""
+                SELECT 1 FROM m_commit c JOIN m_git_ref r ON r.commit_id = c.commit_id
+                WHERE c.commit_hash = %s AND {finished_ref_sql('r')} LIMIT 1;
+                """,
+                (bytes.fromhex(sha),),
+            )
+            return cursor.fetchone() is not None
+        except Exception as exc:  # noqa: BLE001 - unknown: keep the TTL
+            logger.debug("finished-version check for %s failed: %s", sha, exc)
+            return False
 
     @staticmethod
     def map_blob_hashes(cursor: Any, blob_shas: Iterable[str]) -> dict[str, tuple[int, int]]:

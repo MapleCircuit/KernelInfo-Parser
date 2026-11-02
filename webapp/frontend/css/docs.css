@@ -602,11 +602,6 @@
   color: var(--text-secondary);
 }
 
-.kdoc-figure-alt {
-  margin-top: 4px;
-  color: var(--text-muted);
-}
-
 /* Quick search hits and anchor target flash */
 .kdoc-body mark.kdoc-hl {
   background: rgba(210, 153, 34, 0.35);

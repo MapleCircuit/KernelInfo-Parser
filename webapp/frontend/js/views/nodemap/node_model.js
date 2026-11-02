@@ -2,14 +2,6 @@
  * node_model.js - Data Structures for NodeMap Schematic Canvas.
  */
 
-export class NodePort {
-  constructor(id, label, direction = "in") {
-    this.id = id;
-    this.label = label;
-    this.direction = direction; // 'in' (left) | 'out' (right)
-  }
-}
-
 export class NodeModel {
   constructor(options = {}) {
     this.id = options.id || "node-" + Math.random().toString(36).substring(2, 9);
@@ -24,8 +16,8 @@ export class NodeModel {
     this.astId = options.astId || null;
     this.constituents = options.constituents || [];
     this.ports = {
-      in: options.ports?.in || [new NodePort("in-1", "Input", "in")],
-      out: options.ports?.out || [new NodePort("out-1", "Output", "out")]
+      in: options.ports?.in || [{ id: "in-1", label: "Input", direction: "in" }],
+      out: options.ports?.out || [{ id: "out-1", label: "Output", direction: "out" }]
     };
   }
 

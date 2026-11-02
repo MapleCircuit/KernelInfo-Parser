@@ -3,7 +3,6 @@
  */
 import { api } from "../api.js";
 import { state } from "../state.js";
-import { toast } from "./toast.js";
 
 export async function showPersonModal(version, personIdentifier) {
   if (!personIdentifier) return;

@@ -18,7 +18,6 @@ export class MenuconfigTui {
     this.view = view;
     this.engine = view.engine;
     this.stack = [{ nodeId: 0, title: this.engine.model.mainmenu || "Linux Kernel Configuration", selectedIndex: 0 }];
-    this.searchResults = null;
     this.modalEl = null;
     this.keyHandler = null;
     this.helpOpen = false;

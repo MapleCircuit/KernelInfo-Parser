@@ -232,7 +232,6 @@
 .tok-preproc { color: #d2a8ff; font-weight: 500; }
 .tok-macro { color: #d2a8ff; font-weight: 500; }
 .tok-include { color: #a5d6ff; }
-.tok-operator { color: #ff7b72; }
 .tok-punct { color: #8b949e; }
 .tok-function { color: #d2a8ff; font-weight: 500; }
 .tok-identifier { color: #c9d1d9; }
@@ -249,11 +248,6 @@
   background: rgba(88, 166, 255, 0.2);
   text-decoration: underline;
   text-underline-offset: 3px;
-}
-
-.ast-decl {
-  color: #ffa657;
-  font-weight: 600;
 }
 
 .ast-ref {

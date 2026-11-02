@@ -2,7 +2,7 @@
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from fastapi import HTTPException
-from webapp.backend.services.git_reader import GitReader, git_reader
+from webapp.backend.services.git_reader import READERS_PER_REPO, GitReader, git_reader
 from webapp.backend.services.filesystem_service import FilesystemService
 
 
@@ -48,13 +48,15 @@ class TestGitReader(unittest.TestCase):
 
     def test_process_restart_resilience(self) -> None:
         """Verify GitReader seamlessly recovers when underlying process is terminated."""
-        # Ensure process exists
+        # Ensure process exists (the pool's reader of the active repository)
         _ = self.reader.read_file("v3.0", "include/linux/lockd/bind.h")
-        self.assertIsNotNone(self.reader._proc)
-        # Force-kill subprocess
-        if self.reader._proc:
-            self.reader._proc.kill()
-            self.reader._proc.wait()
+        readers = self.reader._group().readers
+        self.assertTrue(any(r._proc is not None for r in readers))
+        # Force-kill every subprocess of the pool
+        for inner in readers:
+            if inner._proc:
+                inner._proc.kill()
+                inner._proc.wait()
 
         # Subsequent read should restart process and succeed
         data, is_dir, sha1 = self.reader.read_file("v3.0", "include/linux/lockd/bind.h")
@@ -83,6 +85,8 @@ class TestGitReader(unittest.TestCase):
         self.assertEqual(len(results), len(targets))
         for raw, is_dir in results:
             self.assertTrue(is_dir or (raw is not None and len(raw) > 0))
+        # Concurrent demand grows the pool, never past its bound
+        self.assertLessEqual(len(self.reader._group().readers), READERS_PER_REPO)
 
 
 class TestFilesystemServiceGetFile(unittest.TestCase):
@@ -136,31 +140,23 @@ class TestGitBlameService(unittest.TestCase):
         self.svc = GitService()
 
     def test_get_blame_success_and_schema(self) -> None:
-        """Verify git blame produces normalized and legacy keys expected by webapp frontends."""
+        """Verify git blame produces the keys the webapp frontend reads, on every line."""
         res = self.svc.get_blame("v3.0", "include/linux/lockd/bind.h")
         self.assertIn("lines", res)
-        self.assertIn("blame", res)
         self.assertGreater(len(res["lines"]), 0)
-        self.assertEqual(len(res["lines"]), len(res["blame"]))
+        self.assertEqual([e["line"] for e in res["lines"]], list(range(1, len(res["lines"]) + 1)))
 
-        first = res["lines"][0]
-        # Frontend expectations
-        self.assertIn("line", first)
-        self.assertIn("commit_hash", first)
-        self.assertIn("author_name", first)
-        self.assertIn("author_email", first)
-        self.assertIn("date", first)
-        self.assertIn("subject", first)
-        # Backward compatibility expectations
-        self.assertIn("author", first)
-        self.assertIn("summary", first)
-        self.assertIn("final_line", first)
-        self.assertEqual(first["line"], 1)
+        for entry in res["lines"]:
+            self.assertEqual(set(entry), {"line", "commit_hash", "author_name", "author_email", "date", "subject"})
+            # --porcelain names a commit's author once; every later line of it still carries it
+            self.assertNotEqual(entry["author_name"], "Unknown")
+            self.assertGreater(entry["date"], 0)
+        self.assertEqual([e["line"] for e in res["lines"]], list(range(1, len(res["lines"]) + 1)))
 
     def test_get_blame_router_scoped(self) -> None:
-        """Verify commits router get_blame_scoped properly proxies blame retrieval."""
-        from webapp.backend.routers.commits import get_blame_scoped
-        res = get_blame_scoped("v3.0", "include/linux/lockd/bind.h")
+        """Verify the commits router's blame route proxies blame retrieval."""
+        from webapp.backend.routers.commits import get_blame
+        res = get_blame("v3.0", "include/linux/lockd/bind.h")
         self.assertIn("lines", res)
         self.assertGreater(len(res["lines"]), 0)
 

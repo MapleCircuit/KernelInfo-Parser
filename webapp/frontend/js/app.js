@@ -34,7 +34,7 @@ import { MailView } from "./views/mail/mail_view.js";
 /** Per-browser UI preference: whether the left explorer sidebar is collapsed. */
 const SIDEBAR_COLLAPSED_KEY = "kernel_ide_sidebar_collapsed";
 
-export class KernelIdeApp {
+class KernelIdeApp {
   constructor() {
     this.tabsComponent = null;
     this.viewRenderers = {
@@ -45,13 +45,13 @@ export class KernelIdeApp {
       kconfig: () => new KconfigView(),
       explorer: () => new ExplorerView(),
       mail: () => new MailView(),
-      nodemap: new NodeMapController(),
-      maintainers: new MaintainersView(),
+      nodemap: () => new NodeMapController(),
+      maintainers: () => new MaintainersView(),
       commits: () => new CommitsView(),
-      pahole: new PaholeView(),
-      callgraph: new CallgraphView(),
+      pahole: () => new PaholeView(),
+      callgraph: () => new CallgraphView(),
       diff: () => new DiffView(),
-      treemap: new TreemapView()
+      treemap: () => new TreemapView()
     };
   }
 
@@ -179,8 +179,10 @@ export class KernelIdeApp {
         toast.info("Offline mode active: viewing cached repository data");
       }
       // Keep an open settings popover in step with the state it reports
-      if (document.getElementById("settings-popover-menu")) {
-        this.toggleSettingsPopover(badge);
+      const openPopover = document.getElementById("settings-popover-menu");
+      if (openPopover) {
+        if (openPopover._closePopover) openPopover._closePopover();
+        else openPopover.remove();
         this.toggleSettingsPopover(badge);
       }
     };
@@ -212,8 +214,15 @@ export class KernelIdeApp {
     };
     updateLabel();
 
-    state.subscribe("session:adopted", () => {
+    state.subscribe("session:adopted", async () => {
       updateLabel();
+      api.setRepository(state.currentRepo);
+      if (typeof this.loadBranchScope === "function") {
+        await this.loadBranchScope(state.selectedBranch);
+      }
+      if (typeof this.loadSidebarFileTree === "function") {
+        await this.loadSidebarFileTree();
+      }
       this.tabsComponent?.render();
       this.updateVersionSelectorDisplay();
     });
@@ -347,7 +356,8 @@ export class KernelIdeApp {
   async toggleSettingsPopover(anchorEl) {
     const existing = document.getElementById("settings-popover-menu");
     if (existing) {
-      existing.remove();
+      if (typeof existing._closePopover === "function") existing._closePopover();
+      else existing.remove();
       return;
     }
 
@@ -374,8 +384,8 @@ export class KernelIdeApp {
       ? state.openTabs.length
       : (state.panes?.reduce((sum, p) => sum + (p.tabs?.length || 0), 0) || 0);
     // Same three states as the header badge: link down, backend not answering, or connected.
-    const isOnline = navigator.onLine && api.serverUp;
-    const linkDown = !navigator.onLine;
+    const isOnline = api.isConnected;
+    const linkDown = !api.isOnline;
     const connLabel = isOnline ? "Online (Connected)" : linkDown ? "Offline (Cached)" : "Server Unreachable";
     const connDetail = isOnline ? "REST API Active" : linkDown ? "Fallback DB" : "No response from backend";
     const connColor = isOnline ? "var(--accent-green)" : linkDown ? "var(--accent-yellow)" : "var(--accent-red)";
@@ -493,18 +503,20 @@ export class KernelIdeApp {
 
     document.body.appendChild(popover);
 
+    const closePopover = () => {
+      popover.remove();
+      document.removeEventListener("click", outsideClickHandler);
+    };
+    popover._closePopover = closePopover;
+
     const outsideClickHandler = (e) => {
       if (!popover.contains(e.target) && e.target !== anchorEl) {
-        popover.remove();
-        document.removeEventListener("click", outsideClickHandler);
+        closePopover();
       }
     };
     setTimeout(() => document.addEventListener("click", outsideClickHandler), 10);
 
-    popover.querySelector("#close-settings-btn").onclick = () => {
-      popover.remove();
-      document.removeEventListener("click", outsideClickHandler);
-    };
+    popover.querySelector("#close-settings-btn").onclick = closePopover;
 
     popover.querySelector("#btn-check-updates").onclick = (e) => this.checkForUpdates(e.currentTarget);
 
@@ -514,7 +526,7 @@ export class KernelIdeApp {
         try {
           await localDB.clearStore(storeName);
           toast.success(`Cleared ${storeName} offline cache`);
-          popover.remove();
+          closePopover();
         } catch (err) {
           toast.error(`Failed to clear ${storeName}: ${err.message}`);
         }
@@ -524,8 +536,11 @@ export class KernelIdeApp {
     popover.querySelector("#btn-clear-cache").onclick = async () => {
       try {
         await localDB.clearDataStores();
-        toast.success("Cleared all offline IndexedDB cache stores");
-        popover.remove();
+        if ("caches" in window) {
+          await caches.delete("kip-api");
+        }
+        toast.success("Cleared all offline IndexedDB and Service Worker API caches");
+        closePopover();
       } catch (err) {
         toast.error("Failed to clear offline cache: " + err.message);
       }
@@ -536,9 +551,11 @@ export class KernelIdeApp {
         localStorage.removeItem("kernel_ide_open_tabs");
         localStorage.removeItem("kernel_ide_active_tab_id");
         localStorage.removeItem("kernel_ide_state");
+        state.cancelPendingSave();
         await localDB.delete("tabs_state", "current_session").catch(() => {});
         state.openTabs = [];
         state.tabs = [];
+        state.kconfigEngines = {};
         state.activeTabId = null;
         state.panes = [
           {
@@ -554,7 +571,7 @@ export class KernelIdeApp {
         state.saveState?.();
         this.tabsComponent?.render();
         toast.success("Reset open tabs and workspace session");
-        popover.remove();
+        closePopover();
       } catch (err) {
         toast.error("Failed to reset tabs: " + err.message);
       }
@@ -562,11 +579,13 @@ export class KernelIdeApp {
 
     popover.querySelector("#btn-full-reset").onclick = async () => {
       const confirmed = confirm(
-        "Are you sure you want to reset all local data?\\n\\nThis will wipe offline IndexedDB caches, clear tabs and local storage settings, and reload the application."
+        "Are you sure you want to reset all local data?\n\nThis will wipe offline IndexedDB caches, clear tabs and local storage settings, and reload the application."
       );
       if (!confirmed) return;
 
       try {
+        // Nothing may be written back after the wipe (a pending save would be flushed on reload)
+        state.suspendPersistence();
         await localDB.clearAllStores();
         localStorage.clear();
         if (window.caches) {
@@ -1159,7 +1178,7 @@ export class KernelIdeApp {
           toast.info("Generating compile_commands.json…");
         }
       },
-      { title: "Open KConfig engine", hint: "Menuconfig, defconfigs, dependencies", keywords: "config", run: () => state.openTab({ type: "kconfig", title: "KConfig (x86_64)", arch: "x86_64" }) },
+      { title: "Open KConfig engine", hint: "Menuconfig, defconfigs, dependencies", keywords: "config", run: () => { const a = state.kconfigArch(); state.openTab({ type: "kconfig", title: `KConfig (${a})`, arch: a }); } },
       {
         title: "Enable KConfig engine in a tab (#ifdef dimming)", hint: "Dims compiled-out preprocessor branches", keywords: "ifdef dim preprocessor config engine",
         run: () => {
@@ -1188,6 +1207,8 @@ export class KernelIdeApp {
       { title: "Open Mailing List & LKML search", hint: "Search patches and threads", keywords: "mail lkml lore patch thread", run: () => state.openTab({ type: "mail", title: "Mailing List" }) },
       { title: "Open subsystems & maintainers", hint: "MAINTAINERS, CREDITS", keywords: "people", run: () => state.openTab({ type: "maintainers", title: "Maintainers" }) },
       { title: "Open NodeMap canvas", hint: "Schematic view", keywords: "graph", run: () => state.openTab({ type: "nodemap", title: "NodeMap Canvas" }) },
+      { title: "Open Pahole struct layout inspector", hint: "Memory layout, cachelines & padding holes", keywords: "pahole struct layout memory cacheline hole padding", run: () => state.openTab({ type: "pahole", title: "struct task_struct", structName: "task_struct" }) },
+      { title: "Open Callgraph function explorer", hint: "Bidirectional callers and callees", keywords: "callgraph callers callees function graph", run: () => state.openTab({ type: "callgraph", title: "Callgraph: schedule", functionName: "schedule" }) },
       { title: "Open kernel documentation", hint: "Documentation/index.rst", keywords: "docs rst", run: () => state.openTab({ type: "code", title: "index.rst", path: "Documentation/index.rst", version: v() }) },
       { title: "Toggle file explorer", hint: "Sidebar", keywords: "sidebar tree collapse", run: () => this.toggleSidebar() },
     ];
@@ -1261,7 +1282,8 @@ export class KernelIdeApp {
         if (action === "explorer") {
           this.toggleSidebar();
         } else if (action === "kconfig") {
-          state.openTab({ type: "kconfig", title: "KConfig (x86_64)", arch: "x86_64" });
+          const a = state.kconfigArch();
+          state.openTab({ type: "kconfig", title: `KConfig (${a})`, arch: a });
         } else if (action === "nodemap") {
           state.openTab({ type: "nodemap", title: "NodeMap Canvas" });
         } else if (action === "maintainers") {
@@ -1275,6 +1297,17 @@ export class KernelIdeApp {
         }
       });
     });
+  }
+
+  async expandTreeItem(path) {
+    const treeContainer = document.getElementById("sidebar-tree-root");
+    if (!treeContainer || !path) return null;
+    const selector = `.tree-item[data-path="${CSS.escape(path)}"]`;
+    const targetRow = treeContainer.querySelector(selector);
+    if (targetRow && !targetRow.classList.contains("expanded") && typeof targetRow._expandDir === "function") {
+      await targetRow._expandDir();
+    }
+    return targetRow;
   }
 
   async loadSidebarFileTree() {
@@ -1291,10 +1324,7 @@ export class KernelIdeApp {
         let curPrefix = "";
         for (const part of parts) {
           curPrefix += (curPrefix ? "/" : "") + part;
-          const targetRow = document.querySelector(`.tree-item[data-path="${curPrefix}"]`);
-          if (targetRow && !targetRow.classList.contains("expanded")) {
-            targetRow.click();
-          }
+          await this.expandTreeItem(curPrefix);
         }
       });
     }
@@ -1305,7 +1335,7 @@ export class KernelIdeApp {
     treeContainer.innerHTML = `<div style="padding:12px;color:var(--text-muted);">Loading files...</div>`;
 
     try {
-      const res = await api.getDirectoryTree(state.currentVersion, "", 2);
+      const res = await api.getDirectoryTree(state.currentVersion, "");
       const items = res.entries || res.tree || [];
       treeContainer.innerHTML = "";
 
@@ -1355,25 +1385,31 @@ export class KernelIdeApp {
       container.appendChild(childContainer);
 
       let expanded = false;
-      row.onclick = async () => {
+      const doExpand = async () => {
+        if (row.dataset.loading === "true") return;
         expanded = !expanded;
         row.classList.toggle("expanded", expanded);
         childContainer.style.display = expanded ? "block" : "none";
 
         if (expanded && childContainer.children.length === 0) {
-          if (Array.isArray(item.children) && item.children.length > 0) {
-            item.children.forEach((c) => this.renderFileTreeNode(childContainer, c, depth + 1));
-          } else {
-            try {
-              const res = await api.getDirectoryTree(state.currentVersion, item.path, 1);
+          row.dataset.loading = "true";
+          try {
+            if (Array.isArray(item.children) && item.children.length > 0) {
+              item.children.forEach((c) => this.renderFileTreeNode(childContainer, c, depth + 1));
+            } else {
+              const res = await api.getDirectoryTree(state.currentVersion, item.path);
               const children = res.entries || res.tree || [];
               children.forEach((c) => this.renderFileTreeNode(childContainer, c, depth + 1));
-            } catch (err) {
-              console.warn("Failed to expand dir:", err);
             }
+          } catch (err) {
+            console.warn("Failed to expand dir:", err);
+          } finally {
+            row.dataset.loading = "false";
           }
         }
       };
+      row._expandDir = doExpand;
+      row.onclick = doExpand;
     } else {
       row.onclick = () => {
         state.openTab({

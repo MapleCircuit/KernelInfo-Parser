@@ -1,12 +1,12 @@
 """webapp/backend/services/maintainer_service.py - Subsystems Catalog, Maintainers Roster & CREDITS."""
 from __future__ import annotations
 from webapp.backend.config import RepoScopedCache
-from datetime import datetime, timezone
 from typing import Any
 from fastapi import HTTPException
 from webapp.backend.database.pool import get_db_cursor
 from webapp.backend.database.helpers import (
     safe_decode,
+    hash_hex,
     get_version_info,
 )
 from webapp.backend.security.sql import sanitize_like_query
@@ -19,31 +19,231 @@ from parser.maintainer_ast.maintainer_types import (
 )
 from parser.maintainer_ast.maintainer_matcher import MaintainerMatcher
 
-_MAINTAINER_CACHE: dict[str, tuple[list[MaintainerSection], MaintainerMatcher]] = RepoScopedCache()
+# Bounded: keyed by the requested version, and any revision a caller names (a commit SHA) adds a whole
+# MAINTAINERS model
+_MAINTAINER_CACHE: dict[str, tuple[list[MaintainerSection], MaintainerMatcher]] = RepoScopedCache(maxsize=16)
 # Bounded: the key carries the requested file path, so each distinct path a caller sends adds an entry
 _FILE_SUBSYSTEMS_CACHE: dict[tuple[str, str], list[dict[str, Any]]] = RepoScopedCache(maxsize=4096)
+# Sections of one MAINTAINERS blob / entries of one CREDITS blob (content addressed, keyed by blob_id)
+_BLOB_SECTIONS_CACHE: dict[int, list[int]] = RepoScopedCache(maxsize=64)
+_BLOB_CREDITS_CACHE: dict[int, list[int]] = RepoScopedCache(maxsize=64)
+# (emails, names) of the version's CREDITS entries, for the in_credits flags of resolve_subsystems_for_file
+_CREDITS_KEYS_CACHE: dict[str, tuple[set[str], set[str]]] = RepoScopedCache(maxsize=16)
+# Persona identity index (see MaintainerService._identity_index), keyed by registry signature
+_IDENTITY_CACHE: dict[str, Any] = RepoScopedCache(maxsize=4)
 # Files of one patch that match_maintainers() resolves; the rest are reported as skipped
 MAX_PATCH_FILES = 200
+
+
+def _clean_name(name: str | None) -> str:
+    """Display form of a persona name: trims whitespace, surrounding quotes and a leaked 'From:' header prefix."""
+    clean = " ".join((name or "").split())
+    if clean[:5].casefold() == "from:":
+        clean = clean[5:].strip()
+    while len(clean) >= 2 and clean[0] == clean[-1] and clean[0] in "\"'":
+        clean = clean[1:-1].strip()
+    return clean
+
+
+def _identity_key(name: str | None, email: str | None) -> str:
+    """Normalized identity of a persona: m_maintainer_person holds one row per (name, email) alias,
+    so the same developer appears under several person_ids. Group by case/whitespace-folded name,
+    falling back to the email when the name is empty."""
+    norm_name = _clean_name(name).casefold()
+    if norm_name:
+        return f"n:{norm_name}"
+    return f"e:{(email or '').strip().casefold()}"
+
+
+def _merge_emails(emails: list[str | None]) -> list[str]:
+    """Split comma-joined email fields and return the distinct addresses, first-seen order."""
+    out: list[str] = []
+    seen: set[str] = set()
+    for field in emails:
+        for addr in (field or "").split(","):
+            addr = addr.strip()
+            if addr and addr.casefold() not in seen:
+                seen.add(addr.casefold())
+                out.append(addr)
+    return out
+
+
+def _in_ids(column: str, ids: list[int] | None) -> tuple[str, list[int]]:
+    """SQL condition `column IN (ids)` and its parameters; never true for an empty or missing list."""
+    if not ids:
+        return "1 = 0", []
+    return f"{column} IN ({','.join(['%s'] * len(ids))})", list(ids)
+
+
+def _build_identity_index(personas: Any) -> dict[int, str]:
+    """Map each (person_id, name, email) persona to its identity key.
+
+    Personas group by normalized name. A name-less persona joins the named identity that owns its
+    address; when several named identities use it (typo'd name, nickname), the one using it on the
+    most personas, then the largest, wins. Named identities are never merged with each other by
+    email: shared or mistyped addresses would chain distinct people together."""
+    pid_to_key: dict[int, str] = {}
+    pid_emails: dict[int, list[str]] = {}
+    sizes: dict[str, int] = {}
+    email_owners: dict[str, dict[str, int]] = {}
+    for pid, name, email in personas:
+        key = _identity_key(name, email)
+        pid_to_key[pid] = key
+        pid_emails[pid] = [a.casefold() for a in _merge_emails([email])]
+        sizes[key] = sizes.get(key, 0) + 1
+        if key.startswith("n:"):
+            for addr in pid_emails[pid]:
+                owners = email_owners.setdefault(addr, {})
+                owners[key] = owners.get(key, 0) + 1
+    for pid, key in pid_to_key.items():
+        if not key.startswith("e:"):
+            continue
+        candidates: dict[str, int] = {}
+        for addr in pid_emails[pid]:
+            for owner, cnt in email_owners.get(addr, {}).items():
+                candidates[owner] = candidates.get(owner, 0) + cnt
+        if candidates:
+            pid_to_key[pid] = max(candidates, key=lambda k: (candidates[k], sizes[k], k))
+    return pid_to_key
 
 
 class MaintainerService:
     """Service for exploring subsystems, maintainer roles, CREDITS entries, and matching patches."""
 
-    def get_overview(self, version_name: str, query: str = "", q: str = "") -> dict[str, Any]:
+    @staticmethod
+    def _get_version_blobs(cursor: Any, vid: int | None, vname: str) -> tuple[int | None, int | None]:
+        m_blob_id = None
+        c_blob_id = None
+        if vid and vid > 0:
+            cursor.execute(
+                """
+                SELECT fn.fname, bc.blob_id
+                FROM m_bridge_checkpoint bc
+                JOIN m_file_name fn ON bc.fnid = fn.fnid
+                WHERE bc.commit_id = %s AND fn.fname IN ('MAINTAINERS', 'CREDITS');
+                """,
+                (vid,),
+            )
+            for row in cursor.fetchall():
+                fname = safe_decode(row["fname"])
+                if fname == "MAINTAINERS":
+                    m_blob_id = row["blob_id"]
+                elif fname == "CREDITS":
+                    c_blob_id = row["blob_id"]
+        if m_blob_id is None or c_blob_id is None:
+            try:
+                from webapp.backend.services.tree_resolver import git_tree_resolver
+                bp = git_tree_resolver.blob_paths(cursor, vname)
+                if bp:
+                    for b_id, paths in bp.items():
+                        if "MAINTAINERS" in paths and m_blob_id is None:
+                            m_blob_id = b_id
+                        if "CREDITS" in paths and c_blob_id is None:
+                            c_blob_id = b_id
+            except Exception:
+                pass
+        return m_blob_id, c_blob_id
+
+    @staticmethod
+    def _blob_section_ids(cursor: Any, blob_id: int) -> list[int]:
+        """sec_ids of the sections one MAINTAINERS blob holds.
+
+        Sections are content addressed: one unchanged since an earlier MAINTAINERS keeps the row stored
+        with that earlier blob (`m_maintainer_section.blob_id`), so a blob's sections are the rows whose
+        AST is one of the blob's tags. One row per section name, the newest when several share it.
+        """
+        cached = _BLOB_SECTIONS_CACHE.get(blob_id)
+        if cached is not None:
+            return cached
+        cursor.execute(
+            """
+            SELECT MAX(s.sec_id) AS sec_id, s.name
+            FROM m_bridge_tag bt
+            JOIN m_tag t ON t.tag_id = bt.tag_id
+            JOIN m_maintainer_section s ON s.ast_id = t.ast_id
+            WHERE bt.blob_id = %s AND s.sec_id > 0
+            GROUP BY s.ast_id, s.name;
+            """,
+            (blob_id,),
+        )
+        newest: dict[str, int] = {}
+        for r in cursor.fetchall():
+            key = (safe_decode(r["name"]) or "").strip().lower()
+            newest[key] = max(newest.get(key, 0), int(r["sec_id"]))
+        ids = sorted(newest.values())
+        _BLOB_SECTIONS_CACHE[blob_id] = ids
+        return ids
+
+    @staticmethod
+    def _blob_credit_ids(cursor: Any, blob_id: int) -> list[int]:
+        """credit_ids of the entries one CREDITS blob holds (found through its tags, as sections are)."""
+        cached = _BLOB_CREDITS_CACHE.get(blob_id)
+        if cached is not None:
+            return cached
+        cursor.execute(
+            """
+            SELECT DISTINCT ce.credit_id
+            FROM m_bridge_tag bt
+            JOIN m_tag t ON t.tag_id = bt.tag_id
+            JOIN m_credits_entry ce ON ce.ast_id = t.ast_id
+            WHERE bt.blob_id = %s AND ce.credit_id > 0;
+            """,
+            (blob_id,),
+        )
+        ids = sorted(int(r["credit_id"]) for r in cursor.fetchall())
+        _BLOB_CREDITS_CACHE[blob_id] = ids
+        return ids
+
+    @staticmethod
+    def _version_scope(cursor: Any, vid: int | None, vname: str) -> tuple[list[int] | None, list[int] | None]:
+        """(sec_ids, credit_ids) of the version's MAINTAINERS and CREDITS files; None for a file whose
+        blob was never indexed (nothing of it is listed rather than every section ever parsed)."""
+        m_blob_id, c_blob_id = MaintainerService._get_version_blobs(cursor, vid, vname)
+        sec_ids = MaintainerService._blob_section_ids(cursor, m_blob_id) if m_blob_id else None
+        credit_ids = MaintainerService._blob_credit_ids(cursor, c_blob_id) if c_blob_id else None
+        return sec_ids, credit_ids
+
+    @staticmethod
+    def _identity_index(cursor: Any) -> tuple[dict[int, str], dict[str, list[int]]]:
+        """(person_id -> identity key, identity key -> person_ids) over m_maintainer_person.
+
+        Shared by the Developers directory and the profile modal so both resolve the same aliases.
+        Cached per repository until the persona registry grows."""
+        cursor.execute("SELECT COUNT(*) AS cnt, MAX(person_id) AS max_id FROM m_maintainer_person;")
+        sig_row = cursor.fetchone() or {}
+        sig = (int(sig_row.get("cnt") or 0), int(sig_row.get("max_id") or 0))
+        cached = _IDENTITY_CACHE.get("index")
+        if cached is not None and cached[0] == sig:
+            return cached[1], cached[2]
+        cursor.execute("SELECT person_id, name, email FROM m_maintainer_person WHERE person_id > 0;")
+        pid_to_key = _build_identity_index(
+            (int(r["person_id"]), safe_decode(r["name"]), safe_decode(r["email"])) for r in cursor.fetchall()
+        )
+        members: dict[str, list[int]] = {}
+        for pid, key in pid_to_key.items():
+            members.setdefault(key, []).append(pid)
+        for pids in members.values():
+            pids.sort()
+        _IDENTITY_CACHE["index"] = (sig, pid_to_key, members)
+        return pid_to_key, members
+
+    def get_overview(self, version_name: str, query: str = "") -> dict[str, Any]:
         """List subsystem sections and maintainers with optional query filtering."""
-        target_q = query or q
+        target_q = query
         clean_q = sanitize_like_query(target_q)
         with get_db_cursor() as cursor:
             vid, vname = get_version_info(cursor, version_name)
             if vid is None:
                 raise HTTPException(status_code=404, detail=f"Version '{version_name}' not found.")
 
-            sql = """
+            sec_ids, _ = self._version_scope(cursor, vid, vname)
+            in_secs, params = _in_ids("s.sec_id", sec_ids)
+
+            sql = f"""
                 SELECT s.sec_id, s.name, s.status, s.scm_tree, s.web_page, s.mailing_list
                 FROM m_maintainer_section s
-                WHERE s.sec_id > 0
+                WHERE {in_secs}
             """
-            params: list[Any] = []
             if clean_q:
                 sql += """
                     AND (
@@ -57,10 +257,21 @@ class MaintainerService:
                 """
                 like_str = f"%{clean_q}%"
                 params.extend([like_str, like_str, like_str])
-            sql += " ORDER BY s.name ASC;"
+            sql += " ORDER BY s.sec_id DESC;"
 
             cursor.execute(sql, tuple(params))
-            sections_raw = cursor.fetchall()
+            all_raw = cursor.fetchall()
+            seen_names: set[str] = set()
+            sections_raw: list[dict[str, Any]] = []
+            for r in all_raw:
+                s_name = safe_decode(r["name"]) or ""
+                norm_name = s_name.strip().lower()
+                if norm_name in seen_names:
+                    continue
+                seen_names.add(norm_name)
+                sections_raw.append(r)
+
+            sections_raw.sort(key=lambda s: (safe_decode(s["name"]) or "").lower())
 
             sec_ids = [s["sec_id"] for s in sections_raw]
             members_by_sec: dict[int, list[dict[str, Any]]] = {}
@@ -101,19 +312,17 @@ class MaintainerService:
                     "maintainers": members_by_sec.get(sec_id, []),
                 })
 
-            return {"version": vname, "total_count": len(sections), "sections": sections}
+            return {"version": vname, "indexed": sec_ids is not None, "sections": sections}
 
     def get_developers(
         self,
         version_name: str,
         query: str = "",
-        q: str = "",
         role: str = "all",
         sort: str = "activity",
     ) -> dict[str, Any]:
         """List all developers, maintainers, reviewers, and contributors recorded in the kernel persona registry."""
-        target_q = query or q
-        clean_q = sanitize_like_query(target_q)
+        target_q = query
         clean_role = (role or "all").strip().lower()
         clean_sort = (sort or "activity").strip().lower()
 
@@ -122,85 +331,121 @@ class MaintainerService:
             if vid is None:
                 raise HTTPException(status_code=404, detail=f"Version '{version_name}' not found.")
 
-            sql = """
-                SELECT 
+            sec_ids, credit_ids = self._version_scope(cursor, vid, vname)
+            in_credits_sql, credit_params = _in_ids("c.credit_id", credit_ids)
+            in_secs_sql, sec_params = _in_ids("s.sec_id", sec_ids)
+
+            sql = f"""
+                SELECT
                     p.person_id,
                     p.name,
                     p.email,
-                    COUNT(DISTINCT s.sec_id) AS subsystems_count,
-                    MAX(CASE WHEN m.role_type = 1 THEN 1 ELSE 0 END) AS is_maintainer,
-                    MAX(CASE WHEN m.role_type = 2 THEN 1 ELSE 0 END) AS is_reviewer,
-                    EXISTS(SELECT 1 FROM m_credits_entry c WHERE c.person_id = p.person_id) AS in_credits,
+                    COUNT(DISTINCT s.name) AS subsystems_count,
+                    MAX(CASE WHEN s.sec_id IS NOT NULL AND m.role_type = 1 THEN 1 ELSE 0 END) AS is_maintainer,
+                    MAX(CASE WHEN s.sec_id IS NOT NULL AND m.role_type = 2 THEN 1 ELSE 0 END) AS is_reviewer,
+                    EXISTS(SELECT 1 FROM m_credits_entry c WHERE c.person_id = p.person_id AND {in_credits_sql}) AS in_credits,
                     EXISTS(SELECT 1 FROM m_commit com WHERE com.author_id = p.person_id) AS has_commits
                 FROM m_maintainer_person p
                 LEFT JOIN m_maintainer_member m ON p.person_id = m.person_id
-                LEFT JOIN m_maintainer_section s ON m.sec_id = s.sec_id AND s.sec_id > 0
+                LEFT JOIN m_maintainer_section s ON m.sec_id = s.sec_id AND {in_secs_sql}
             """
-            params: list[Any] = []
-
-            where_clauses = ["p.person_id > 0"]
-            if clean_q:
-                where_clauses.append("(LOWER(p.name) LIKE LOWER(%s) OR LOWER(p.email) LIKE LOWER(%s))")
-                like_str = f"%{clean_q}%"
-                params.extend([like_str, like_str])
-
-            if clean_role == "maintainer":
-                where_clauses.append("EXISTS (SELECT 1 FROM m_maintainer_member mem JOIN m_maintainer_section sec ON mem.sec_id = sec.sec_id WHERE mem.person_id = p.person_id AND mem.role_type = 1 AND sec.sec_id > 0)")
-            elif clean_role == "reviewer":
-                where_clauses.append("EXISTS (SELECT 1 FROM m_maintainer_member mem JOIN m_maintainer_section sec ON mem.sec_id = sec.sec_id WHERE mem.person_id = p.person_id AND mem.role_type = 2 AND sec.sec_id > 0)")
-            elif clean_role == "credits":
-                where_clauses.append("EXISTS (SELECT 1 FROM m_credits_entry c WHERE c.person_id = p.person_id)")
-
-            if where_clauses:
-                sql += " WHERE " + " AND ".join(where_clauses)
-
-            sql += " GROUP BY p.person_id, p.name, p.email"
-
-            if clean_sort == "alpha":
-                sql += " ORDER BY p.name ASC, subsystems_count DESC;"
-            else:
-                sql += " ORDER BY subsystems_count DESC, p.name ASC;"
+            params: list[Any] = [*credit_params, *sec_params]
+            sql += " WHERE p.person_id > 0 GROUP BY p.person_id, p.name, p.email;"
 
             cursor.execute(sql, tuple(params))
             rows = cursor.fetchall()
 
-            developers = []
+            # Merge alias personas (same developer under several person_ids) into one entry.
+            pid_to_key, _ = self._identity_index(cursor)
+            groups: dict[str, list[dict[str, Any]]] = {}
             for r in rows:
-                p_name = safe_decode(r["name"])
-                p_email = safe_decode(r["email"])
-                sub_count = int(r["subsystems_count"] or 0)
-                is_m = bool(r["is_maintainer"])
-                is_r = bool(r["is_reviewer"])
-                in_cred = bool(r["in_credits"])
-                has_c = bool(r["has_commits"])
+                pid = int(r["person_id"])
+                groups.setdefault(pid_to_key.get(pid, f"p:{pid}"), []).append(r)
 
-                if is_m:
-                    primary_role = "Maintainer"
-                elif is_r:
-                    primary_role = "Reviewer"
-                elif in_cred:
-                    primary_role = "Credits"
-                elif has_c:
-                    primary_role = "Author"
+            # Search matches any alias's name or address, and keeps the whole merged identity
+            needle = (target_q or "").strip()[:100].casefold()
+            if needle:
+                groups = {
+                    k: g for k, g in groups.items()
+                    if any(needle in (safe_decode(r["name"]) or "").casefold() or needle in (safe_decode(r["email"]) or "").casefold() for r in g)
+                }
+
+            # Distinct subsystem names per alias, needed only where several aliases carry subsystems
+            multi_pids = [
+                r["person_id"]
+                for g in groups.values() if sum(1 for r in g if r["subsystems_count"]) > 1
+                for r in g if r["subsystems_count"]
+            ]
+            sec_names_by_pid: dict[int, set[str]] = {}
+            if multi_pids:
+                fmt = ",".join(["%s"] * len(multi_pids))
+                cursor.execute(
+                    f"""
+                    SELECT DISTINCT m.person_id, s.name
+                    FROM m_maintainer_member m
+                    JOIN m_maintainer_section s ON m.sec_id = s.sec_id
+                    WHERE m.person_id IN ({fmt}) AND {in_secs_sql};
+                    """,
+                    (*multi_pids, *sec_params),
+                )
+                for sr in cursor.fetchall():
+                    sec_names_by_pid.setdefault(sr["person_id"], set()).add(safe_decode(sr["name"]) or "")
+
+            developers = []
+            for g in groups.values():
+                # Representative alias: one with a name and email, most subsystems, CREDITS/commit presence
+                rep = max(
+                    g,
+                    key=lambda r: (
+                        bool(_clean_name(safe_decode(r["name"]))),
+                        bool((safe_decode(r["email"]) or "").strip()),
+                        int(r["subsystems_count"] or 0),
+                        bool(r["in_credits"]),
+                        bool(r["has_commits"]),
+                        -int(r["person_id"]),
+                    ),
+                )
+                p_name = _clean_name(safe_decode(rep["name"]))
+                p_email = safe_decode(rep["email"])
+                if len(g) > 1 and any(sec_names_by_pid.get(r["person_id"]) for r in g):
+                    sub_names: set[str] = set()
+                    for r in g:
+                        sub_names |= sec_names_by_pid.get(r["person_id"], set())
+                    sub_count = len(sub_names)
                 else:
-                    primary_role = "Developer"
+                    sub_count = max(int(r["subsystems_count"] or 0) for r in g)
+                is_m = any(bool(r["is_maintainer"]) for r in g)
+                is_r = any(bool(r["is_reviewer"]) for r in g)
+                in_cred = any(bool(r["in_credits"]) for r in g)
+                has_c = any(bool(r["has_commits"]) for r in g)
+
+                if clean_role == "maintainer" and not is_m:
+                    continue
+                if clean_role == "reviewer" and not is_r:
+                    continue
+                if clean_role == "credits" and not in_cred:
+                    continue
 
                 developers.append({
-                    "person_id": r["person_id"],
+                    "person_id": rep["person_id"],
                     "name": p_name,
                     "email": p_email,
+                    "emails": _merge_emails([p_email] + [safe_decode(r["email"]) for r in g]),
+                    "alias_person_ids": sorted(int(r["person_id"]) for r in g),
                     "subsystems_count": sub_count,
                     "is_maintainer": is_m,
                     "is_reviewer": is_r,
                     "in_credits": in_cred,
                     "has_commits": has_c,
-                    "primary_role": primary_role,
                 })
+
+            if clean_sort == "alpha":
+                developers.sort(key=lambda d: ((d["name"] or d["email"] or "").casefold(), -d["subsystems_count"]))
+            else:
+                developers.sort(key=lambda d: (-d["subsystems_count"], (d["name"] or d["email"] or "").casefold()))
 
             return {
                 "version": vname,
-                "total_count": len(developers),
-                "role_filter": clean_role,
                 "sort": clean_sort,
                 "developers": developers,
             }
@@ -212,6 +457,9 @@ class MaintainerService:
             if vid is None:
                 raise HTTPException(status_code=404, detail=f"Version '{version_name}' not found.")
 
+            sec_ids, _ = self._version_scope(cursor, vid, vname)
+            in_secs_sql, sec_params = _in_ids("s.sec_id", sec_ids)
+
             sec_param = str(section_name).strip()
             if sec_param.isdigit():
                 cursor.execute(
@@ -219,19 +467,21 @@ class MaintainerService:
                     SELECT s.sec_id, s.name, s.status, s.scm_tree, s.web_page, s.mailing_list
                     FROM m_maintainer_section s
                     WHERE s.sec_id > 0 AND (s.sec_id = %s OR s.name = %s)
+                    ORDER BY s.sec_id DESC
                     LIMIT 1;
                     """,
                     (int(sec_param), sec_param),
                 )
             else:
                 cursor.execute(
-                    """
+                    f"""
                     SELECT s.sec_id, s.name, s.status, s.scm_tree, s.web_page, s.mailing_list
                     FROM m_maintainer_section s
-                    WHERE s.sec_id > 0 AND s.name = %s
+                    WHERE s.name = %s AND {in_secs_sql}
+                    ORDER BY s.sec_id DESC
                     LIMIT 1;
                     """,
-                    (sec_param,),
+                    (sec_param, *sec_params),
                 )
             sec_row = cursor.fetchone()
             if not sec_row:
@@ -331,7 +581,7 @@ class MaintainerService:
                 )
             else:
                 cursor.execute(
-                    "SELECT person_id, name, email FROM m_maintainer_person WHERE LOWER(email) = LOWER(%s) OR LOWER(name) = LOWER(%s) OR LOWER(email) = LOWER(%s) LIMIT 1;",
+                    "SELECT person_id, name, email FROM m_maintainer_person WHERE LOWER(email) = LOWER(%s) OR LOWER(name) = LOWER(%s) OR LOWER(email) = LOWER(%s) ORDER BY (name = '') ASC, person_id ASC LIMIT 1;",
                     (clean_id, clean_id, stripped_id),
                 )
             person = cursor.fetchone()
@@ -339,38 +589,55 @@ class MaintainerService:
                 raise HTTPException(status_code=404, detail=f"Person '{person_id_or_email}' not found.")
 
             person_id = person["person_id"]
+            pid_to_key, key_members = self._identity_index(cursor)
+            alias_ids = key_members.get(pid_to_key.get(int(person_id), ""), [int(person_id)])
+            id_fmt = ",".join(["%s"] * len(alias_ids))
+            cursor.execute(f"SELECT email FROM m_maintainer_person WHERE person_id IN ({id_fmt}) ORDER BY person_id;", tuple(alias_ids))
+            alias_emails = [safe_decode(r["email"]) for r in cursor.fetchall()]
+
+            vid, vname = get_version_info(cursor, version_name)
+            sec_ids, credit_ids = self._version_scope(cursor, vid, vname)
+            in_secs_sql, sec_params = _in_ids("s.sec_id", sec_ids)
+            in_credits_sql, credit_params = _in_ids("credit_id", credit_ids)
 
             # Maintained sections
             cursor.execute(
-                """
+                f"""
                 SELECT s.sec_id, s.name, s.status, m.role_type
                 FROM m_maintainer_member m
                 JOIN m_maintainer_section s ON m.sec_id = s.sec_id
-                WHERE m.person_id = %s
-                ORDER BY s.name ASC;
+                WHERE m.person_id IN ({id_fmt}) AND {in_secs_sql}
+                ORDER BY s.sec_id DESC, m.role_type ASC;
                 """,
-                (person_id,),
+                (*alias_ids, *sec_params),
             )
-            sections = [
-                {
+            seen_sec_names = set()
+            sections = []
+            for r in cursor.fetchall():
+                s_name = safe_decode(r["name"]) or ""
+                norm = s_name.strip().lower()
+                if norm in seen_sec_names:
+                    continue
+                seen_sec_names.add(norm)
+                sections.append({
                     "sec_id": r["sec_id"],
-                    "name": safe_decode(r["name"]),
+                    "name": s_name,
                     "status": safe_decode(r["status"]),
                     "role_type": r["role_type"],
                     "role_name": "Maintainer" if r["role_type"] == 1 else "Reviewer",
-                }
-                for r in cursor.fetchall()
-            ]
+                })
+            sections.sort(key=lambda s: s["name"].lower())
 
-            # CREDITS entry
+            # CREDITS entry (newest revision across aliases)
             cursor.execute(
-                """
+                f"""
                 SELECT web_page, pgp_key, description, snail_mail
                 FROM m_credits_entry
-                WHERE person_id = %s
+                WHERE person_id IN ({id_fmt}) AND {in_credits_sql}
+                ORDER BY credit_id DESC
                 LIMIT 1;
                 """,
-                (person_id,),
+                (*alias_ids, *credit_params),
             )
             credit = cursor.fetchone()
 
@@ -378,76 +645,57 @@ class MaintainerService:
                 "person_id": person_id,
                 "name": safe_decode(person["name"]),
                 "email": safe_decode(person["email"]),
+                "emails": _merge_emails([safe_decode(person["email"])] + alias_emails),
+                "alias_person_ids": alias_ids,
             }
 
             in_credits = bool(credit is not None)
 
             # Recent commits & latest patch
             cursor.execute(
-                """
+                f"""
                 SELECT commit_id, commit_hash, author_date, subject
                 FROM m_commit
-                WHERE author_id = %s
+                WHERE author_id IN ({id_fmt})
                 ORDER BY author_date DESC
                 LIMIT 10;
                 """,
-                (person_id,),
+                tuple(alias_ids),
             )
             c_rows = cursor.fetchall()
             recent_commits = [
                 {
                     "commit_id": r["commit_id"],
-                    "commit_hash": safe_decode(r["commit_hash"]),
+                    "commit_hash": hash_hex(r["commit_hash"]),
                     "author_date": r["author_date"],
                     "subject": safe_decode(r["subject"]),
                 }
                 for r in c_rows
             ]
 
-            latest_patch = None
-            if c_rows:
-                lp_row = c_rows[0]
-                adate = lp_row["author_date"]
-                dt_iso = datetime.fromtimestamp(adate, tz=timezone.utc).isoformat() if adate else ""
-                latest_patch = {
-                    "commit_id": lp_row["commit_id"],
-                    "commit_hash": safe_decode(lp_row["commit_hash"]),
-                    "subject": safe_decode(lp_row["subject"]),
-                    "author_date": adate,
-                    "author_date_iso": dt_iso,
-                }
-
             # Contribution stats across roles in m_bridge_commit_person
             cursor.execute(
-                """
+                f"""
                 SELECT
-                    SUM(CASE WHEN role_type = 1 THEN 1 ELSE 0 END) AS authored,
-                    SUM(CASE WHEN role_type = 3 THEN 1 ELSE 0 END) AS co_developed,
-                    SUM(CASE WHEN role_type = 4 THEN 1 ELSE 0 END) AS signed_off,
-                    SUM(CASE WHEN role_type = 5 THEN 1 ELSE 0 END) AS reviewed,
-                    SUM(CASE WHEN role_type = 6 THEN 1 ELSE 0 END) AS acked,
-                    SUM(CASE WHEN role_type = 7 THEN 1 ELSE 0 END) AS tested,
-                    SUM(CASE WHEN role_type = 8 THEN 1 ELSE 0 END) AS reported
+                    COUNT(DISTINCT CASE WHEN role_type = 1 THEN commit_id END) AS authored,
+                    COUNT(DISTINCT CASE WHEN role_type = 4 THEN commit_id END) AS signed_off,
+                    COUNT(DISTINCT CASE WHEN role_type = 5 THEN commit_id END) AS reviewed
                 FROM m_bridge_commit_person
-                WHERE person_id = %s;
+                WHERE person_id IN ({id_fmt});
                 """,
-                (person_id,),
+                tuple(alias_ids),
             )
             b_stats = cursor.fetchone() or {}
             authored_cnt = int(b_stats.get("authored") or 0)
             if not authored_cnt and recent_commits:
-                cursor.execute("SELECT COUNT(*) AS cnt FROM m_commit WHERE author_id = %s;", (person_id,))
+                cursor.execute(f"SELECT COUNT(*) AS cnt FROM m_commit WHERE author_id IN ({id_fmt});", tuple(alias_ids))
                 cnt_row = cursor.fetchone()
                 authored_cnt = int(cnt_row["cnt"]) if cnt_row else 0
 
             contribution_stats = {
                 "authored_commits": authored_cnt,
-                "co_developed_commits": int(b_stats.get("co_developed") or 0),
                 "signed_off_commits": int(b_stats.get("signed_off") or 0),
                 "reviewed_commits": int(b_stats.get("reviewed") or 0),
-                "acked_commits": int(b_stats.get("acked") or 0),
-                "tested_commits": int(b_stats.get("tested") or 0),
-                "reported_commits": int(b_stats.get("reported") or 0),
             }
 
             return {
@@ -455,6 +703,8 @@ class MaintainerService:
                 "person_id": person_id,
                 "name": p_dict["name"],
                 "email": p_dict["email"],
+                "emails": p_dict["emails"],
+                "alias_person_ids": alias_ids,
                 "in_credits": in_credits,
                 "sections": sections,
                 "subsystems": sections,
@@ -465,63 +715,96 @@ class MaintainerService:
                     "description": safe_decode(credit["description"]) if credit else None,
                     "snail_mail": safe_decode(credit["snail_mail"]) if credit else None,
                 } if credit else None,
-                "latest_patch": latest_patch,
                 "contribution_stats": contribution_stats,
                 "recent_commits": recent_commits,
             }
 
-    def get_credits(self, version_name: str, query: str = "", q: str = "") -> dict[str, Any]:
+    def get_credits(self, version_name: str, query: str = "") -> dict[str, Any]:
         """List historical CREDITS entries."""
-        target_q = query or q
+        target_q = query
         clean_q = sanitize_like_query(target_q)
         with get_db_cursor() as cursor:
             vid, vname = get_version_info(cursor, version_name)
-            sql = """
+            if vid is None:
+                raise HTTPException(status_code=404, detail=f"Version '{version_name}' not found.")
+
+            _, credit_ids = self._version_scope(cursor, vid, vname)
+            in_credits_sql, params = _in_ids("c.credit_id", credit_ids)
+
+            sql = f"""
                 SELECT c.credit_id, p.person_id, p.name, p.email, c.web_page, c.pgp_key, c.description, c.snail_mail
                 FROM m_credits_entry c
                 JOIN m_maintainer_person p ON c.person_id = p.person_id
+                WHERE {in_credits_sql}
             """
-            params: list[Any] = []
             if clean_q:
-                sql += " WHERE LOWER(p.name) LIKE LOWER(%s) OR LOWER(p.email) LIKE LOWER(%s) OR LOWER(c.description) LIKE LOWER(%s)"
+                sql += " AND (LOWER(p.name) LIKE LOWER(%s) OR LOWER(p.email) LIKE LOWER(%s) OR LOWER(c.description) LIKE LOWER(%s))"
                 params.extend([f"%{clean_q}%", f"%{clean_q}%", f"%{clean_q}%"])
-            sql += " ORDER BY p.name ASC LIMIT 500;"
+            sql += " ORDER BY c.credit_id DESC;"
 
             cursor.execute(sql, tuple(params))
-            entries = [
-                {
+            # Rows are newest-first: older revisions of an entry (superseded CREDITS blobs) and the
+            # same developer under other alias personas collapse into the newest entry.
+            by_identity: dict[str, dict[str, Any]] = {}
+            for r in cursor.fetchall():
+                pid = r["person_id"]
+                key = _identity_key(safe_decode(r["name"]), safe_decode(r["email"]))
+                existing = by_identity.get(key)
+                if existing is not None:
+                    existing["emails"] = _merge_emails(existing["emails"] + [safe_decode(r["email"])])
+                    if pid not in existing["alias_person_ids"]:
+                        existing["alias_person_ids"].append(pid)
+                    for fld in ("web_page", "pgp_key", "description", "snail_mail"):
+                        if not existing[fld]:
+                            existing[fld] = safe_decode(r[fld])
+                    continue
+                by_identity[key] = {
                     "credit_id": r["credit_id"],
-                    "person_id": r["person_id"],
-                    "name": safe_decode(r["name"]),
+                    "person_id": pid,
+                    "name": _clean_name(safe_decode(r["name"])),
                     "email": safe_decode(r["email"]),
                     "web_page": safe_decode(r["web_page"]),
                     "pgp_key": safe_decode(r["pgp_key"]),
                     "description": safe_decode(r["description"]),
                     "snail_mail": safe_decode(r["snail_mail"]),
+                    "emails": _merge_emails([safe_decode(r["email"])]),
+                    "alias_person_ids": [pid],
                 }
-                for r in cursor.fetchall()
-            ]
+
+            entries = list(by_identity.values())
+            for e in entries:
+                # Newest CREDITS revision may have lost the address; fall back to the merged list
+                if not (e["email"] or "").strip() and e["emails"]:
+                    e["email"] = ", ".join(e["emails"])
+                e["alias_person_ids"].sort()
+            entries.sort(key=lambda e: (e["name"] or "").lower())
             return {
                 "version": vname,
                 "total": len(entries),
-                "total_count": len(entries),
                 "entries": entries,
                 "credits": entries,
             }
 
     def get_maintainer_data(self, version_name: str) -> tuple[list[MaintainerSection], MaintainerMatcher]:
         """Retrieve or parse MaintainerSection items and MaintainerMatcher for a version."""
-        if version_name in _MAINTAINER_CACHE:
-            return _MAINTAINER_CACHE[version_name]
+        # .get() into a local: the cache evicts, so contains-then-get could race a miss
+        cached = _MAINTAINER_CACHE.get(version_name)
+        if cached is not None:
+            return cached
 
         with get_db_cursor() as cursor:
+            vid, vname = get_version_info(cursor, version_name)
+            sec_ids, _ = self._version_scope(cursor, vid, vname)
+            in_secs_sql, sec_params = _in_ids("s.sec_id", sec_ids)
+
             cursor.execute(
-                """
+                f"""
                 SELECT s.sec_id, s.name, s.status, s.scm_tree, s.web_page, s.mailing_list
                 FROM m_maintainer_section s
-                WHERE s.sec_id > 0
-                ORDER BY s.sec_id ASC;
-                """
+                WHERE {in_secs_sql}
+                ORDER BY s.sec_id DESC;
+                """,
+                tuple(sec_params),
             )
             sec_rows = cursor.fetchall()
             sec_map: dict[int, MaintainerSection] = {}
@@ -593,6 +876,18 @@ class MaintainerService:
         _MAINTAINER_CACHE[version_name] = (sections, matcher)
         return sections, matcher
 
+    def _credits_keys(self, version_name: str) -> tuple[set[str], set[str]]:
+        """Lower-cased emails and names of the version's CREDITS entries, read once per version."""
+        keys = _CREDITS_KEYS_CACHE.get(version_name)
+        if keys is None:
+            entries = self.get_credits(version_name).get("entries", [])
+            keys = (
+                {e["email"].lower() for e in entries if e["email"]},
+                {e["name"].lower() for e in entries if e["name"]},
+            )
+            _CREDITS_KEYS_CACHE[version_name] = keys
+        return keys
+
     def resolve_subsystems_for_file(self, version_name: str, file_path: str) -> list[dict[str, Any]]:
         """Resolve all subsystems, maintainers, and reviewers governing a file path."""
         if not file_path:
@@ -605,10 +900,7 @@ class MaintainerService:
         sections, matcher = self.get_maintainer_data(version_name)
         matched_secs = matcher.match_file(file_path)
 
-        credits_res = self.get_credits(version_name)
-        credits_entries = credits_res.get("entries", [])
-        credits_emails = {e["email"].lower() for e in credits_entries if e["email"]}
-        credits_names = {e["name"].lower() for e in credits_entries if e["name"]}
+        credits_emails, credits_names = self._credits_keys(version_name)
 
         results = []
         for sec in matched_secs:
@@ -646,39 +938,19 @@ class MaintainerService:
                 "mailing_list": sec.mailing_list,
                 "maintainers": maintainers,
                 "reviewers": reviewers,
-                "all_members": maintainers + reviewers,
             })
 
         _FILE_SUBSYSTEMS_CACHE[cache_key] = results
         return results
 
-    def match_maintainers(
-        self,
-        target: str | list[str],
-        req_or_patch: Any = None,
-        version_name: str = "v3.0",
-    ) -> dict[str, Any]:
-        """Analyze unified diff patch text or paths and generate exact get_maintainer.pl recipient rosters."""
-        if isinstance(target, str) and not (target.endswith(".c") or target.endswith(".h") or "/" in target):
-            vname = target
-            patch_input = req_or_patch
-        elif isinstance(target, list):
-            vname = version_name
-            patch_input = req_or_patch
-        else:
-            vname = version_name
-            patch_input = target
-
-        patch_text = ""
-        if hasattr(patch_input, "patch_text"):
-            patch_text = patch_input.patch_text or ""
-        elif isinstance(patch_input, dict):
-            patch_text = patch_input.get("patch_text") or patch_input.get("patch", "")
-        elif isinstance(patch_input, str):
-            patch_text = patch_input
+    def match_maintainers(self, version_name: str, patch_text: str = "", paths: list[str] | None = None) -> dict[str, Any]:
+        """get_maintainer.pl recipients of a unified diff and/or explicit file paths at a version."""
+        vname = version_name
+        candidate_paths: list[str] = list(paths or [])
+        patch_text = patch_text or ""
 
         lines = patch_text.splitlines() if patch_text else []
-        touched_files: dict[str, int] = {}
+        touched_files: dict[str, None] = {}  # insertion-ordered set of the files the patch changes
         curr_file = None
         for line in lines:
             if line.startswith("diff --git a/"):
@@ -691,17 +963,17 @@ class MaintainerService:
                 curr_file = line[6:].strip()
             elif line.startswith("+") and not line.startswith("+++"):
                 if curr_file:
-                    touched_files[curr_file] = touched_files.get(curr_file, 0) + 1
+                    touched_files[curr_file] = None
             elif line.startswith("-") and not line.startswith("---"):
                 if curr_file:
-                    touched_files[curr_file] = touched_files.get(curr_file, 0) + 1
+                    touched_files[curr_file] = None
 
         if not touched_files and curr_file:
-            touched_files[curr_file] = 1
+            touched_files[curr_file] = None
 
-        if not touched_files and isinstance(target, list):
-            for p in target:
-                touched_files[p] = 1
+        for p in candidate_paths:
+            if p and p not in touched_files:
+                touched_files[p] = None
 
         # Every file is matched against every MAINTAINERS pattern, so the work is linear in the
         # number of files the patch names and is paid even when nothing matches (2,000 files took
@@ -716,11 +988,10 @@ class MaintainerService:
         all_subsystems: set[str] = set()
 
         file_breakdown = []
-        for fpath, mod_lines in touched_files.items():
+        for fpath in touched_files:
             subs = self.resolve_subsystems_for_file(vname, fpath)
             file_breakdown.append({
                 "file_path": fpath,
-                "modified_lines": mod_lines,
                 "subsystems": subs,
             })
             for s in subs:
@@ -748,7 +1019,6 @@ class MaintainerService:
 
         return {
             "version": vname,
-            "touched_files_count": len(touched_files),
             "skipped_files_count": skipped_files,
             "files": file_breakdown,
             "subsystems": sorted(all_subsystems),
@@ -756,9 +1026,4 @@ class MaintainerService:
             "suggested_cc": cc_list,
             "maintainers": [{**m, "roles": list(m["roles"]), "subsystems": list(m["subsystems"])} for m in all_maintainers.values()],
             "reviewers": [{**r, "roles": list(r["roles"]), "subsystems": list(r["subsystems"])} for r in all_reviewers.values()],
-            "mailing_lists": sorted(all_lists),
         }
-
-
-maintainer_service = MaintainerService()
-

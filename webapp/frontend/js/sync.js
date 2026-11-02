@@ -19,8 +19,12 @@ import { state } from "./state.js";
 const FRONTEND_CHECK_MS = 60 * 60 * 1000;
 const RELOAD_DELAY_S = 5;
 const LAST_FRONTEND_CHECK_KEY = "kip-last-frontend-check";
-// Bumped when cache keys change shape: entries of the previous layout are dropped once
-const CACHE_LAYOUT = 2;
+// Cached API data older than this is dropped (checked at most daily, when the page opens)
+const CACHE_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
+const LAST_PRUNE_KEY = "kip-last-cache-prune";
+// Bumped when cache keys or cached responses change shape: entries of the previous layout are dropped once
+// (3: symbol detail, file, callgraph, Pahole, blame, version diff and maintainers responses changed)
+const CACHE_LAYOUT = 3;
 
 class SyncManager {
   constructor() {
@@ -38,9 +42,13 @@ class SyncManager {
   async start() {
     if ((await localDB.get("meta", "cache_layout")) !== CACHE_LAYOUT) {
       await localDB.clearDataStores();
+      if ("caches" in window) {
+        await caches.delete("kip-api");
+      }
       await localDB.set("meta", "cache_layout", CACHE_LAYOUT);
       await localDB.set("meta", "version_stamps", {});
     }
+    this.pruneOldEntries();
     api.versionStamps = (await localDB.get("meta", "version_stamps")) || {};
     this.tokens = (await localDB.get("meta", "sync_tokens")) || {};
     api.onSyncHeader = (value) => this.onHeader(value);
@@ -80,8 +88,10 @@ class SyncManager {
       if (prev.db) {
         console.info(`[Sync] Database changed (${prev.db} -> ${sync.db}); clearing cached data.`);
         await localDB.clearDataStores();
+        if ("caches" in window) {
+          await caches.delete("kip-api");
+        }
         api.versionStamps = {};
-        document.dispatchEvent(new CustomEvent("app:cache-reset", { detail: { instance_hash: sync.db } }));
       }
       await localDB.set("meta", "db_instance_hash", sync.db);
       next.db = sync.db;
@@ -209,6 +219,21 @@ class SyncManager {
     else location.reload();
   }
 
+  /** At most daily: drop cached API data older than CACHE_MAX_AGE_MS (runs in the background). */
+  pruneOldEntries() {
+    let last = 0;
+    try {
+      last = Number(localStorage.getItem(LAST_PRUNE_KEY) || 0);
+    } catch { /* storage unavailable */ }
+    if (Date.now() - last < 24 * 60 * 60 * 1000) return;
+    try {
+      localStorage.setItem(LAST_PRUNE_KEY, String(Date.now()));
+    } catch { /* storage unavailable */ }
+    localDB.pruneOlderThan(CACHE_MAX_AGE_MS)
+      .then((n) => { if (n) console.info(`[Sync] ${n} cached entries older than 30 days dropped.`); })
+      .catch(() => {});
+  }
+
   /** Let the service worker drop cached files of other builds. */
   pruneOtherBuilds() {
     const build = this.build;
@@ -218,7 +243,7 @@ class SyncManager {
 }
 
 /** Whether a cache key holds data of version `v` under a stamp other than `stamp` (see api._vk). */
-export function isStaleKey(key, v, stamp) {
+function isStaleKey(key, v, stamp) {
   let i = key.indexOf(`${v}@`);
   while (i >= 0) {
     const before = i === 0 ? "" : key[i - 1];

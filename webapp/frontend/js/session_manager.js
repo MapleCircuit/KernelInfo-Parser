@@ -12,19 +12,21 @@ const SESSION_STORAGE_WIN_KEY = "kip_window_id";
 const SHARED_PROFILES_KEY = "kip_shared_kconfig_profiles";
 const SHARED_TOOLCHAINS_KEY = "kip_shared_kconfig_toolchains";
 const BROADCAST_CHANNEL_NAME = "kip_multi_tab";
-// Presence refresh, well inside the 30s window `getActiveWindowsList` prunes with
+// Presence refresh, well inside the 30s window `isSessionActiveInOtherWindow` reads presence with
 const HEARTBEAT_INTERVAL_MS = 10000;
 
-export class SessionManager {
+class SessionManager {
   constructor() {
     this.channel = typeof window !== "undefined" && "BroadcastChannel" in window
       ? new BroadcastChannel(BROADCAST_CHANNEL_NAME)
       : null;
 
     this.windowId = null;
-    this.heartbeatTimer = null;
     this.activeSessionId = null;
     this.activeSessionName = "Default Session";
+    // Set by state.js: write (or drop) the pending save of the session this window leaves or copies
+    this.beforeSessionChange = null;
+    this.discardPendingSave = null;
     // Remote engines running in other windows: tabId -> { sessionId, sessionName, tabId, version, arch, configName, assignments }
     this.remoteEngines = new Map();
     // Active windows in other browser tabs: winId -> { winId, sessionId, sessionName, lastSeen }
@@ -75,10 +77,10 @@ export class SessionManager {
       this.requestActiveWindows();
     }, 100);
 
-    // Presence is read with a 30s cut-off (`getActiveWindowsList`), so it has to be refreshed:
+    // Presence is read with a 30s cut-off (`isSessionActiveInOtherWindow`), so it has to be refreshed:
     // without this a window that has been open for half a minute looks gone to the others and the
     // Session Picker stops reporting which sessions are in use elsewhere.
-    this.heartbeatTimer = setInterval(() => this.broadcastWindowHeartbeat(), HEARTBEAT_INTERVAL_MS);
+    setInterval(() => this.broadcastWindowHeartbeat(), HEARTBEAT_INTERVAL_MS);
   }
 
   subscribe(event, callback) {
@@ -168,11 +170,6 @@ export class SessionManager {
           break;
         }
 
-        case "session:index:updated": {
-          this.emit("session:index:updated", msg);
-          break;
-        }
-
         case "session:renamed": {
           if (msg.id === this.activeSessionId) {
             this.activeSessionName = msg.name;
@@ -187,7 +184,7 @@ export class SessionManager {
             // Another window just took this session: sign out of it before anything else is
             // written to it, so the two windows can never save over each other.
             const sid = this.activeSessionId;
-            this.unpinSessionFromWindow();
+            this.unpinSessionFromWindow({ flush: false });
             this.emit("session:taken_over", { sessionId: sid, byWinId: msg.winId });
           }
           break;
@@ -208,7 +205,6 @@ export class SessionManager {
           // when the browser hides the drag payload from `dragover` (§5.24.4).
           if (msg.winId === this.getWindowId()) break;
           this.incomingTabDrag = { ...(msg.payload || {}), at: Date.now() };
-          this.emit("tab:drag:started", this.incomingTabDrag);
           break;
         }
 
@@ -217,7 +213,6 @@ export class SessionManager {
           if (this.incomingTabDrag && this.incomingTabDrag.tabId === msg.tabId) {
             this.incomingTabDrag = null;
           }
-          this.emit("tab:drag:ended", msg);
           break;
         }
 
@@ -247,7 +242,6 @@ export class SessionManager {
               sessionName: msg.sessionName,
               lastSeen: Date.now()
             });
-            this.emit("window:active_changed", this.getActiveWindowsList());
           }
           break;
         }
@@ -262,7 +256,6 @@ export class SessionManager {
         case "window:unloading": {
           if (this.activeWindows.has(msg.winId)) {
             this.activeWindows.delete(msg.winId);
-            this.emit("window:active_changed", this.getActiveWindowsList());
           }
           // The engines that window was running are gone with it: a code tab following one of them
           // must fall back instead of dimming against a configuration nobody resolves any more.
@@ -293,28 +286,19 @@ export class SessionManager {
     });
   }
 
-  getActiveWindowsList() {
-    const now = Date.now();
-    const list = [];
-    for (const [wId, w] of this.activeWindows.entries()) {
-      if (now - w.lastSeen < 30000) {
-        list.push(w);
-      } else {
-        this.activeWindows.delete(wId);
-      }
-    }
-    return list;
-  }
-
   isSessionActiveInOtherWindow(sessionId) {
     if (!sessionId) return false;
     const now = Date.now();
+    let active = false;
     for (const [wId, w] of this.activeWindows.entries()) {
-      if (w.sessionId === sessionId && w.winId !== this.getWindowId()) {
-        if (now - w.lastSeen < 30000) return true;
+      // A window silent for 30s is gone (its heartbeat runs every 10s): forget it
+      if (now - w.lastSeen >= 30000) {
+        this.activeWindows.delete(wId);
+      } else if (w.sessionId === sessionId && w.winId !== this.getWindowId()) {
+        active = true;
       }
     }
-    return false;
+    return active;
   }
 
   // ------------------------------------------------------------------ Session Identification
@@ -363,6 +347,7 @@ export class SessionManager {
   }
 
   pinSessionToWindow(sessionId, sessionName = null) {
+    if (sessionId !== this.activeSessionId) this.beforeSessionChange?.();
     this.activeSessionId = sessionId;
     if (sessionName) {
       this.activeSessionName = sessionName;
@@ -394,7 +379,13 @@ export class SessionManager {
     });
   }
 
-  unpinSessionFromWindow() {
+  /**
+   * Release the session this window holds. Its pending save is written first (`flush`), except when
+   * the session is no longer this window's to write: taken over by another window, or deleted.
+   */
+  unpinSessionFromWindow({ flush = true } = {}) {
+    if (flush) this.beforeSessionChange?.();
+    else this.discardPendingSave?.();
     const oldSid = this.activeSessionId;
     this.activeSessionId = null;
     try {
@@ -440,7 +431,6 @@ export class SessionManager {
   saveSessionsIndex(index) {
     try {
       localStorage.setItem(SESSIONS_INDEX_KEY, JSON.stringify(index));
-      this.channel?.postMessage({ type: "session:index:updated" });
     } catch (e) {
       console.warn("[SessionManager] Failed to save sessions index:", e);
     }
@@ -486,13 +476,16 @@ export class SessionManager {
     name = "",
     repo = "",
     version = "v3.0",
+    selectedBranch = "",
     splitMode = "single",
     panes = null,
     pin = false,
     // A session created around tabs that already exist (drag-out, duplication) keeps the engines
     // those tabs were running: a KConfig tab arrives resolving its configuration, not switched off.
     kconfigEngineTabIds = [],
-    kconfigEngineProfiles = {}
+    kconfigEngineProfiles = {},
+    kconfigProfiles = {},
+    kconfigToolchains = {}
   } = {}) {
     const timestampPart = Date.now().toString(36);
     const randomPart = Math.random().toString(36).substring(2, 8);
@@ -525,12 +518,16 @@ export class SessionManager {
       repo,
       version,
       selectedVersion: version,
+      selectedBranch,
       splitMode,
       activePaneId: "pane-1",
       panes: defaultPanes,
       kconfigEngineTabIds: [...kconfigEngineTabIds],
       kconfigEngineProfiles: { ...kconfigEngineProfiles }
     };
+    // Configurations travel through the shared store, never inside a session record
+    for (const [key, values] of Object.entries(kconfigProfiles)) this.updateSharedKconfigProfile(key, values);
+    for (const [key, toolchain] of Object.entries(kconfigToolchains)) this.updateSharedKconfigToolchain(key, toolchain);
 
     // Save record
     localStorage.setItem(`kip_session_${id}`, JSON.stringify(sessionState));
@@ -586,6 +583,7 @@ export class SessionManager {
   }
 
   duplicateSession(sessionId, newName = null) {
+    if (sessionId === this.activeSessionId) this.beforeSessionChange?.();
     // Read, never `loadSession`: that pins the original to this window and would take it over
     const orig = this.readSession(sessionId);
     if (!orig) return null;
@@ -640,23 +638,6 @@ export class SessionManager {
     return null;
   }
 
-  async loadSessionFromDB(sessionId) {
-    const memoryLoaded = this.loadSession(sessionId);
-    if (memoryLoaded) return memoryLoaded;
-
-    try {
-      const dbLoaded = await localDB.get("tabs_state", `session_${sessionId}`);
-      if (dbLoaded) {
-        this.pinSessionToWindow(sessionId, dbLoaded.name || "Session");
-        localStorage.setItem(`kip_session_${sessionId}`, JSON.stringify(dbLoaded));
-        return dbLoaded;
-      }
-    } catch (e) {
-      console.warn(`[SessionManager] Failed to load session ${sessionId} from IndexedDB:`, e);
-    }
-    return null;
-  }
-
   saveActiveSession(stateObj) {
     if (!this.activeSessionId) return;
     const id = this.activeSessionId;
@@ -668,6 +649,7 @@ export class SessionManager {
       repo: stateObj.repo || "",
       version: stateObj.version || "v3.0",
       selectedVersion: stateObj.selectedVersion || stateObj.version || "v3.0",
+      selectedBranch: stateObj.selectedBranch || "",
       splitMode: stateObj.splitMode || "single",
       activePaneId: stateObj.activePaneId || "pane-1",
       panes: stateObj.panes || [],
@@ -750,11 +732,11 @@ export class SessionManager {
       this.saveSessionsIndex(index);
 
       if (sessionId === this.activeSessionId) {
-        this.unpinSessionFromWindow();
+        // Deleted: a pending save would write the record back
+        this.unpinSessionFromWindow({ flush: false });
       }
 
       this.channel?.postMessage({ type: "session:closed", sessionId });
-      this.emit("session:deleted", sessionId);
       return true;
     } catch (e) {
       console.warn(`[SessionManager] Failed to delete session ${sessionId}:`, e);
@@ -771,10 +753,13 @@ export class SessionManager {
     return {};
   }
 
-  saveSharedKconfigProfiles(profiles) {
-    try {
-      localStorage.setItem(SHARED_PROFILES_KEY, JSON.stringify(profiles || {}));
-    } catch (e) {}
+  /**
+   * Store (or, with `null`, drop) one configuration in the map shared by every session and window.
+   * The map is read again first: writing this window's whole copy would erase the configurations
+   * other windows saved since it was loaded. Returns the stored value.
+   */
+  updateSharedKconfigProfile(profileKey, values) {
+    return this._updateSharedEntry(SHARED_PROFILES_KEY, profileKey, values);
   }
 
   getSharedKconfigToolchains() {
@@ -785,10 +770,25 @@ export class SessionManager {
     return {};
   }
 
-  saveSharedKconfigToolchains(toolchains) {
+  /** Store (or, with `null`, drop) one toolchain profile in the shared map (see updateSharedKconfigProfile). */
+  updateSharedKconfigToolchain(profileKey, toolchain) {
+    return this._updateSharedEntry(SHARED_TOOLCHAINS_KEY, profileKey, toolchain);
+  }
+
+  _updateSharedEntry(storageKey, entryKey, value) {
+    if (!entryKey) return null;
+    let map = {};
     try {
-      localStorage.setItem(SHARED_TOOLCHAINS_KEY, JSON.stringify(toolchains || {}));
-    } catch (e) {}
+      map = JSON.parse(localStorage.getItem(storageKey) || "{}") || {};
+    } catch (e) { /* unreadable: start over */ }
+    if (value === null || value === undefined) delete map[entryKey];
+    else map[entryKey] = value;
+    try {
+      localStorage.setItem(storageKey, JSON.stringify(map));
+    } catch (e) {
+      console.warn(`[SessionManager] Could not save ${storageKey} (storage full?):`, e);
+    }
+    return value ?? null;
   }
 
   // ------------------------------------------------------------------ Remote Engine Registry

@@ -35,12 +35,13 @@ export function scheduleScrollSave() {
   }, SAVE_DELAY_MS);
 }
 
-/** Write a pending save now (the window is going away). */
+/** Write a pending save now (the window is going away): saveState() only schedules, flushState() writes. */
 function flushScrollSave() {
   if (!saveTimer) return;
   clearTimeout(saveTimer);
   saveTimer = null;
   state.saveState();
+  state.flushState();
 }
 
 if (typeof window !== "undefined") {

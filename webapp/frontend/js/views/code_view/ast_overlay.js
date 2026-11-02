@@ -261,11 +261,6 @@ export class AstOverlay {
     return html;
   }
 
-  isClickableType(typeId) {
-    if (!typeId || typeId === 2 || typeId === 69 || typeId === 70) return false;
-    return true;
-  }
-
   renderLexical(lineText, isDimmed) {
     const trimmed = lineText.trim();
 

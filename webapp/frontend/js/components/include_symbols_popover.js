@@ -4,7 +4,7 @@
 import { state } from "../state.js";
 import { toast } from "./toast.js";
 
-export class IncludeSymbolsPopover {
+class IncludeSymbolsPopover {
   constructor() {
     this.container = null;
     this.currentData = null;
@@ -188,8 +188,17 @@ export class IncludeSymbolsPopover {
 
       const nameSpan = document.createElement("span");
       nameSpan.className = "include-symbol-name";
-      nameSpan.innerText = sym.name || "";
       nameSpan.title = sym.name || "";
+      if (this.currentQuery && (sym.name || "").toLowerCase().includes(this.currentQuery)) {
+        const rawName = sym.name || "";
+        const idx = rawName.toLowerCase().indexOf(this.currentQuery);
+        const before = rawName.slice(0, idx);
+        const matched = rawName.slice(idx, idx + this.currentQuery.length);
+        const after = rawName.slice(idx + this.currentQuery.length);
+        nameSpan.innerHTML = `${this.escapeHtml(before)}<mark style="background:rgba(255,200,0,0.3);color:inherit;padding:0 1px;border-radius:2px;">${this.escapeHtml(matched)}</mark>${this.escapeHtml(after)}`;
+      } else {
+        nameSpan.innerText = sym.name || "";
+      }
 
       const leftGroup = document.createElement("div");
       leftGroup.className = "include-row-left";
@@ -203,8 +212,16 @@ export class IncludeSymbolsPopover {
         const locBadge = document.createElement("span");
         locBadge.className = "include-loc-badge";
         const shortFile = sym.def_file.split("/").slice(-2).join("/");
-        locBadge.innerText = `${shortFile}:${sym.def_line_s}`;
         locBadge.title = `${sym.def_file}:${sym.def_line_s}`;
+        if (this.currentQuery && shortFile.toLowerCase().includes(this.currentQuery)) {
+          const idx = shortFile.toLowerCase().indexOf(this.currentQuery);
+          const before = shortFile.slice(0, idx);
+          const matched = shortFile.slice(idx, idx + this.currentQuery.length);
+          const after = shortFile.slice(idx + this.currentQuery.length);
+          locBadge.innerHTML = `${this.escapeHtml(before)}<mark style="background:rgba(255,200,0,0.3);color:inherit;padding:0 1px;border-radius:2px;">${this.escapeHtml(matched)}</mark>${this.escapeHtml(after)}:${sym.def_line_s}`;
+        } else {
+          locBadge.innerText = `${shortFile}:${sym.def_line_s}`;
+        }
         rightGroup.appendChild(locBadge);
       }
 

@@ -2,9 +2,9 @@
 
 Tests:
 1. Cross-Version File & Kconfig Diff
-2. Global Symbol XRef & Autocomplete Lookup
+2. Global Symbol XRef & Search
 3. Interactive Canvas DAG Graph Payload
-4. Kconfig Auto-Solver & Config Diff
+4. Kconfig Auto-Solver
 5. Patch Reviewer & Maintainers Matcher
 6. AST Semantic Query Sandbox
 7. Clang compile_commands.json Exporter
@@ -25,30 +25,33 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from tests import require_indexed_ref
-from webapp.main import (
-    AutoSolveRequest,
-    DiffConfigRequest,
-    FormatPatchRequest,
-    PatchReviewRequest,
-    _compute_structured_diff,
-    autosolve_kconfig,
-    diff_kconfig_configurations,
-    export_compile_commands,
-    generate_formatted_patch,
-    get_codebase_treemap,
-    get_function_callgraph,
-    get_kconfig_diff,
-    get_kconfig_graph,
-    get_struct_layout,
-    get_symbol_xref,
-    get_symbol_detail,
-    get_tag_timeline,
-    get_include_symbols,
-    get_versions_diff,
-    lookup_symbols,
-    search_symbols,
-    match_patch_maintainers,
-)
+from fastapi import HTTPException
+from webapp.backend.database.pool import get_db_cursor
+from webapp.backend.models import FormatPatchRequest
+from webapp.backend.services.callgraph_service import CallgraphService
+from webapp.backend.services.diff_service import DiffService
+from webapp.backend.services.filesystem_service import FilesystemService
+from webapp.backend.services.git_service import GitService, _compute_structured_diff
+from webapp.backend.services.kconfig_service import KconfigService
+from webapp.backend.services.maintainer_service import MaintainerService
+from webapp.backend.services.pahole_service import PaholeService
+from webapp.backend.services.symbol_service import SymbolService
+
+_diff, _fs, _kconfig, _symbols = DiffService(), FilesystemService(), KconfigService(), SymbolService()
+get_versions_diff = _diff.get_versions_diff
+get_kconfig_diff = _diff.get_kconfig_diff
+export_compile_commands = _fs.export_compile_commands
+get_codebase_treemap = _fs.get_codebase_treemap
+get_kconfig_graph = _kconfig.get_graph
+autosolve_kconfig = _kconfig.autosolve
+get_symbol_xref = _symbols.get_symbol_xref
+get_symbol_detail = _symbols.get_symbol_detail
+get_include_symbols = _symbols.get_include_symbols
+search_symbols = _symbols.search_symbols
+get_function_callgraph = CallgraphService().get_function_callgraph
+get_struct_layout = PaholeService().get_struct_layout
+match_patch_maintainers = MaintainerService().match_maintainers
+generate_formatted_patch = GitService().format_patch
 
 
 class TestWebappAdvancedFeatures(unittest.TestCase):
@@ -68,13 +71,9 @@ class TestWebappAdvancedFeatures(unittest.TestCase):
         self.assertEqual(k_res["summary"]["added"], 0)
         self.assertEqual(k_res["summary"]["removed"], 0)
 
-    def test_symbol_xref_and_lookup(self) -> None:
-        # Lookup autocomplete
-        lookup = lookup_symbols("v3.0", q="ext4", limit=10)
-        self.assertIsInstance(lookup, list)
-
+    def test_symbol_xref_and_search(self) -> None:
         # Rich symbol search from m_symbol_def
-        search_res = search_symbols("v3.0", q="ext4", limit=10)
+        search_res = search_symbols("v3.0", "ext4", limit=10)
         self.assertIsInstance(search_res, list)
         if len(search_res) > 0:
             sym = search_res[0]
@@ -90,40 +89,26 @@ class TestWebappAdvancedFeatures(unittest.TestCase):
         self.assertEqual(xref["symbol"], "kmalloc")
         self.assertIn("definitions", xref)
         self.assertIn("references", xref)
-        self.assertIn("calls", xref)
-        self.assertIn("member_refs", xref)
-        self.assertIn("type_usages", xref)
-        self.assertIn("declarations", xref)
-        self.assertIn("macro_expansions", xref)
-        self.assertIn("macro_expansions_count", xref)
-        self.assertIn("references_count", xref)
+        # Every reference carries its role badge (the categories are not repeated as separate lists)
+        badges = {"Decl", "TypeUsage", "Call", "MemberRef", "DeclRef", "MacroExp", "Ref"}
+        self.assertTrue(all(r["type"] in badges for r in xref["references"]))
+        for key in ("calls", "member_refs", "type_usages", "macro_expansions", "usages", "references_count"):
+            self.assertNotIn(key, xref)
 
     def test_kconfig_dag_graph(self) -> None:
         # Graph for EXT4_FS
-        graph = get_kconfig_graph("v3.0", "EXT4_FS", depth=2)
-        self.assertIn("nodes", graph)
+        graph = get_kconfig_graph("v3.0", "EXT4_FS")
+        self.assertEqual(graph["symbol"], "EXT4_FS")
         self.assertIn("edges", graph)
-        self.assertGreaterEqual(len(graph["nodes"]), 1)
+        self.assertNotIn("nodes", graph)
+        # EXT4_FS selects JBD2 at v3.0
+        self.assertIn({"from": "EXT4_FS", "to": "JBD2", "type": "selects"}, graph["edges"])
 
-        root = next((n for n in graph["nodes"] if n["id"] == "EXT4_FS"), None)
-        self.assertIsNotNone(root)
-        self.assertTrue(root["is_root"])
-
-    def test_kconfig_autosolve_and_config_diff(self) -> None:
-        # Autosolve for EXT4_FS
-        req = AutoSolveRequest(target_symbol="EXT4_FS", current_values={})
-        res = autosolve_kconfig("v3.0", req)
+    def test_kconfig_autosolve(self) -> None:
+        # Autosolve for EXT4_FS (the body of POST /api/kconfig/{v}/autosolve)
+        res = autosolve_kconfig("v3.0", {"target_symbol": "EXT4_FS", "current_values": {}})
         self.assertTrue(res["solution_found"])
         self.assertIn("toggles_needed", res)
-
-        # Config Diff
-        diff_req = DiffConfigRequest(
-            active_config={"EXT4_FS": "y", "BTRFS_FS": "n"},
-            custom_config={"EXT4_FS": "y", "BTRFS_FS": "y"},
-        )
-        diff_res = diff_kconfig_configurations("v3.0", diff_req)
-        self.assertEqual(diff_res["matching_symbols"], 1)
-        self.assertEqual(diff_res["mismatched_symbols"], 1)
 
     def test_patch_reviewer_maintainers_matcher(self) -> None:
         sample_patch = """diff --git a/fs/ext4/super.c b/fs/ext4/super.c
@@ -133,16 +118,15 @@ class TestWebappAdvancedFeatures(unittest.TestCase):
 +/* Added sample comment for patch reviewer test */
 +int test_func(void) { return 0; }
 """
-        req = PatchReviewRequest(patch_text=sample_patch)
-        res = match_patch_maintainers("v3.0", req)
-        self.assertEqual(res["touched_files_count"], 1)
-        self.assertGreater(len(res["files"]), 0)
+        res = match_patch_maintainers("v3.0", patch_text=sample_patch)
+        self.assertEqual(len(res["files"]), 1)
+        self.assertEqual(res["skipped_files_count"], 0)
         self.assertEqual(res["files"][0]["file_path"], "fs/ext4/super.c")
         self.assertIn("suggested_to", res)
         self.assertIn("suggested_cc", res)
 
-    def test_tag_version_timeline_and_diff(self) -> None:
-        """Verify GET /api/tag/{tag_id}/timeline and diff generation."""
+    def test_history_diff_and_release_slider(self) -> None:
+        """Verify the structured diff of history timelines and the release slider assets."""
         # 1. Test diff computation helper
         code_v1 = "int foo(void) {\n    return 1;\n}\n"
         code_v2 = "int foo(int x) {\n    return x + 1;\n}\n"
@@ -152,12 +136,7 @@ class TestWebappAdvancedFeatures(unittest.TestCase):
         self.assertIn("del", types)
         self.assertIn("add", types)
 
-        # 2. Test 404 on non-existent tag
-        from fastapi import HTTPException
-        with self.assertRaises(HTTPException):
-            get_tag_timeline(99999999)
-
-        # 3. The release slider lives in the modular frontend (the legacy webapp.html page is gone)
+        # 2. The release slider lives in the modular frontend (the legacy webapp.html page is gone)
         base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         self.assertFalse(os.path.exists(os.path.join(base_dir, "webapp", "webapp.html")))
         modal_js = os.path.join(base_dir, "webapp", "frontend", "js", "components", "symbol_history_modal.js")
@@ -187,6 +166,27 @@ class TestWebappAdvancedFeatures(unittest.TestCase):
         self.assertIn("cache_lines_used", res)
         self.assertIn("optimization", res)
         self.assertGreater(res["total_size"], 0)
+        self.assertEqual(res["file_path"], "include/linux/sched.h")
+        # Members typed by AST category only (typedefs, embedded structs) are estimated
+        self.assertTrue(res["is_estimate"])
+        self.assertEqual(res["estimated_members"], sum(1 for m in res["members"] if m["estimated"]))
+
+        # The struct definition, not a macro of the same name: struct list_head is two pointers
+        lh = get_struct_layout("v3.0", "list_head")
+        self.assertEqual(lh["file_path"], "include/linux/types.h")
+        self.assertEqual([m["name"] for m in lh["members"]], ["next", "prev"])
+        self.assertEqual(lh["total_size"], 16)
+
+        # Compiler-extracted array sizes (e.g. unsigned char id[16] in struct adb_ids)
+        adb = get_struct_layout("v3.0", "adb_ids")
+        self.assertEqual(adb["file_path"], "include/linux/adb.h")
+        self.assertEqual([m["name"] for m in adb["members"]], ["nids", "id"])
+        self.assertEqual(adb["members"][0]["size"], 4)
+        self.assertEqual(adb["members"][1]["size"], 16)
+        self.assertEqual(adb["members"][1]["offset"], 4)
+        self.assertEqual(adb["members"][1]["type"], "unsigned char [16]")
+        self.assertEqual(adb["total_size"], 20)
+        self.assertFalse(adb["is_estimate"])
 
 
 
@@ -198,11 +198,10 @@ class TestWebappAdvancedFeatures(unittest.TestCase):
 
     def test_function_callgraph(self) -> None:
         res = get_function_callgraph("v3.0", "ext4_fill_super")
-        self.assertEqual(res["function_name"], "ext4_fill_super")
+        self.assertEqual(res["function"], "ext4_fill_super")
+        self.assertEqual(res["file_path"], "fs/ext4/super.c")
         self.assertIn("callers", res)
         self.assertIn("callees", res)
-        self.assertIn("caller_count", res)
-        self.assertIn("callee_count", res)
         if len(res["callees"]) > 0:
             callee = res["callees"][0]
             self.assertIn("name", callee)
@@ -223,8 +222,7 @@ class TestWebappAdvancedFeatures(unittest.TestCase):
 
     def test_edge_cases_empty_and_fallback(self) -> None:
         # 1. Empty Patch Review
-        empty_patch = match_patch_maintainers("v3.0", PatchReviewRequest(patch_text=""))
-        self.assertEqual(empty_patch["touched_files_count"], 0)
+        empty_patch = match_patch_maintainers("v3.0", patch_text="")
         self.assertEqual(len(empty_patch["files"]), 0)
 
         # 3. Patch Format with Unchanged Code
@@ -237,11 +235,10 @@ class TestWebappAdvancedFeatures(unittest.TestCase):
         self.assertEqual(no_change_patch["diff"], "")
         self.assertIn("[PATCH] ext4: no-op commit", no_change_patch["formatted_patch"])
 
-        # 4. Unknown Struct Fallback
-        struct_res = get_struct_layout("v3.0", "unknown_custom_struct")
-        self.assertIn("total_size", struct_res)
-        self.assertGreater(struct_res["total_size"], 0)
-        self.assertIn("members", struct_res)
+        # 4. Unknown struct: 404, never an invented layout
+        with self.assertRaises(HTTPException) as ctx:
+            get_struct_layout("v3.0", "unknown_custom_struct")
+        self.assertEqual(ctx.exception.status_code, 404)
 
         # 5. Alternate Architectures for Clang Database
         arm_cmds = export_compile_commands("v3.0", arch="arm")
@@ -250,8 +247,8 @@ class TestWebappAdvancedFeatures(unittest.TestCase):
 
         # 7. Non-existent Function Callgraph
         empty_callgraph = get_function_callgraph("v3.0", "non_existent_fn_xyz")
-        self.assertEqual(empty_callgraph["caller_count"], 0)
-        self.assertEqual(empty_callgraph["callee_count"], 0)
+        self.assertEqual(empty_callgraph["callers"], [])
+        self.assertEqual(empty_callgraph["callees"], [])
 
         # 8. Treemap Depth Variations
         shallow_tree = get_codebase_treemap("v3.0", max_depth=1)
@@ -267,59 +264,50 @@ class TestWebappAdvancedFeatures(unittest.TestCase):
         self.assertGreater(arch_node.get("file_count", 0), 1000)
 
         # 11. Multi-symbol DAG Graph
-        g1 = get_kconfig_graph("v3.0", "EXT4_FS", depth=2)
-        g2 = get_kconfig_graph("v3.0", "BTRFS_FS", depth=2)
-        self.assertGreater(len(g1["nodes"]), 0)
-        self.assertGreater(len(g2["nodes"]), 0)
+        g1 = get_kconfig_graph("v3.0", "EXT4_FS")
+        g2 = get_kconfig_graph("v3.0", "BTRFS_FS")
+        self.assertGreater(len(g1["edges"]), 0)
+        self.assertGreater(len(g2["edges"]), 0)
 
     def test_symbol_endpoints(self) -> None:
-        from fastapi import HTTPException
         try:
             detail = get_symbol_detail("v3.0", "task_struct")
             self.assertIn("symbol_name", detail)
             self.assertEqual(detail["symbol_name"], "task_struct")
-            self.assertIn("declarations", detail)
-            self.assertIn("usages", detail)
+            self.assertIn("definition", detail)
+            self.assertIn("definitions", detail)
+            # References are xref's: symbol detail (Go to Definition) does not compute them
+            self.assertNotIn("usages", detail)
         except HTTPException as e:
             self.assertEqual(e.status_code, 404)
 
-        results = search_symbols("v3.0", q="task", limit=10)
+        results = search_symbols("v3.0", "task", limit=10)
         self.assertIsInstance(results, list)
 
     def test_include_symbols_endpoint_and_dom(self) -> None:
         """Verify get_include_symbols endpoint and includeSymbolsPopover UI structure."""
-        from fastapi import HTTPException
         # 1. 404 on non-existent AST ID
         with self.assertRaises(HTTPException) as ctx:
             get_include_symbols("v3.0", 999999999)
         self.assertEqual(ctx.exception.status_code, 404)
 
         # 2. Existing AST ID query if any include exists in DB
-        from webapp.main import db
-        cnx = db.get_connection()
-        if cnx:
-            cursor = cnx.cursor()
+        with get_db_cursor() as cursor:
             cursor.execute("SELECT ast_id FROM m_ast_include LIMIT 1;")
             row = cursor.fetchone()
-            cursor.close()
-            cnx.close()
-            if row:
-                res = get_include_symbols("v3.0", row[0])
-                self.assertIn("ast_id", res)
-                self.assertIn("include_text", res)
-                self.assertIn("header_file", res)
-                self.assertIn("header_exists", res)
-                self.assertIn("total_symbols", res)
-                self.assertIn("symbols", res)
-                self.assertIsInstance(res["symbols"], list)
+        if row:
+            res = get_include_symbols("v3.0", row["ast_id"])
+            self.assertIn("ast_id", res)
+            self.assertIn("include_text", res)
+            self.assertIn("header_file", res)
+            self.assertIn("symbols", res)
+            self.assertIsInstance(res["symbols"], list)
 
         # 3. Fallback resolution when AST ID is 0 or missing
         fb_res = get_include_symbols("v3.0", 0, header="linux/const.h", file_path="include/linux/const.h")
         self.assertIn("ast_id", fb_res)
         self.assertIn("header_file", fb_res)
         self.assertEqual(fb_res["header_file"], "include/linux/const.h")
-        self.assertTrue(fb_res["header_exists"])
-        self.assertEqual(fb_res["total_symbols"], 0)
         self.assertEqual(fb_res["symbols"], [])
 
         # 4. Verify modular frontend popover component and stylesheet
@@ -338,8 +326,9 @@ class TestWebappAdvancedFeatures(unittest.TestCase):
             c_content = f.read()
         self.assertIn(".include-symbols-popover", c_content)
         self.assertIn(".include-category-pills", c_content)
-        self.assertIn(".include-badge-func", c_content)
-        self.assertIn(".include-badge-struct", c_content)
+        # One rule per backend category (include-badge-<category lowercased>)
+        for cat in ("function", "struct", "union", "enum", "enumconstant", "typedef", "macro", "variable", "symbol"):
+            self.assertIn(f".include-badge-{cat}", c_content)
 
         context_menu_js = os.path.join(base_dir, "webapp", "frontend", "js", "components", "context_menu.js")
         with open(context_menu_js, "r", encoding="utf-8") as f:
@@ -458,7 +447,8 @@ int get_foo(void) {
         self.assertIn("_onRequestEnd", api_js)
         self.assertIn("_setSpinnerActive", api_js)
         self.assertIn("global-loading-spinner", api_js)
-        self.assertIn("app:loading", api_js)
+        # Nothing listens for a loading event: the spinner element is the only consumer
+        self.assertNotIn("app:loading", api_js)
 
     def test_kconfig_declaration_coordinates(self) -> None:
         """Verify Kconfig symbol detail retrieves declaration file_path and line range with fallback."""
@@ -524,10 +514,10 @@ int get_foo(void) {
         past_res = git_svc.get_commit_timeline("v3.0", limit=15, direction="past")
         self.assertEqual(past_res["version"], "v3.0")
         self.assertEqual(past_res["direction"], "past")
-        self.assertIsNotNone(past_res["anchor_commit"])
-        self.assertEqual(past_res["anchor_commit"]["commit_id"], v30)
-        self.assertEqual(past_res["anchor_commit"]["subject"], "Linux 3.0")
         self.assertGreater(len(past_res["timeline"]), 0)
+        # The past timeline starts at the anchor: the version's own commit
+        self.assertEqual(past_res["timeline"][0]["commit_id"], v30)
+        self.assertEqual(past_res["timeline"][0]["subject"], "Linux 3.0")
         # All commits in past timeline must be <= anchor commit_id
         for c in past_res["timeline"]:
             self.assertLessEqual(c["commit_id"], v30)
@@ -536,8 +526,6 @@ int get_foo(void) {
         future_res = git_svc.get_commit_timeline("v3.0", limit=15, direction="future")
         self.assertEqual(future_res["version"], "v3.0")
         self.assertEqual(future_res["direction"], "future")
-        self.assertIsNotNone(future_res["anchor_commit"])
-        self.assertEqual(future_res["anchor_commit"]["commit_id"], v30)
         self.assertGreater(len(future_res["timeline"]), 0)
         # All commits in future timeline must be >= anchor commit_id
         for c in future_res["timeline"]:
@@ -578,7 +566,7 @@ int get_foo(void) {
         history = git_svc.get_file_history("v3.0", "init/main.c", limit=10)
         self.assertEqual(history["version"], "v3.0")
         self.assertEqual(history["path"], "init/main.c")
-        self.assertGreater(history["total_commits"], 0)
+        self.assertGreater(len(history["commits"]), 0)
         self.assertIsNotNone(history["last_changed"])
         self.assertIn("commit_hash", history["last_changed"])
         self.assertIn("author_name", history["last_changed"])
@@ -597,6 +585,64 @@ int get_foo(void) {
         self.assertIn("last_changed", file_res["file_info"])
         self.assertIsNotNone(file_res["file_info"]["last_changed"])
         self.assertEqual(file_res["file_info"]["last_changed"]["commit_hash"], history["last_changed"]["commit_hash"])
+
+
+class _LadderCursor:
+    """Cursor over an in-memory AST where node k holds node k + 1 twice (content-addressed sharing):
+    expanded to depth d it serializes to 2^(d+1) - 1 positions from only d + 1 distinct nodes."""
+
+    def __init__(self, levels: int) -> None:
+        self.levels = levels
+        self.queries = 0
+        self._rows: list[dict] = []
+
+    def execute(self, sql: str, args: tuple | list = ()) -> None:
+        self.queries += 1
+        ids = [int(a) for a in args]
+        if "m_ast_container" in sql:
+            self._rows = [{"ast_id": i, "ref_ast_id": i + 1, "priority": p}
+                          for i in ids if i < self.levels for p in (0, 1)]
+        else:
+            self._rows = [{"ast_id": i, "name": f"n{i}", "type_id": 1, "type_name": "Block", "tag_id": None}
+                          for i in ids if i <= self.levels]
+
+    def fetchall(self) -> list[dict]:
+        return self._rows
+
+
+class TestAstTreeBudget(unittest.TestCase):
+    """GET /api/symbols/{v}/ast/{id}: the answer never serializes more than MAX_AST_TREE_NODES nodes."""
+
+    def _tree(self, depth: int, levels: int = 12) -> tuple[dict, _LadderCursor]:
+        from unittest.mock import MagicMock, patch
+        cursor = _LadderCursor(levels)
+        ctx = MagicMock()
+        ctx.__enter__.return_value = cursor
+        with patch("webapp.backend.services.symbol_service.get_db_cursor", return_value=ctx):
+            return SymbolService().get_ast_tree(0, depth), cursor
+
+    @staticmethod
+    def _positions(node: dict) -> int:
+        return 1 + sum(TestAstTreeBudget._positions(c) for c in node["children"])
+
+    @staticmethod
+    def _truncated(node: dict) -> bool:
+        return bool(node.get("truncated")) or any(TestAstTreeBudget._truncated(c) for c in node["children"])
+
+    def test_shared_subtrees_serialize_in_full_within_budget(self) -> None:
+        tree, cursor = self._tree(depth=10)
+        self.assertEqual(self._positions(tree), 2 ** 11 - 1)
+        self.assertFalse(self._truncated(tree))
+        self.assertNotIn("containers", tree)
+        # One container query and one node query per level, not one per node
+        self.assertLessEqual(cursor.queries, 2 * 10 + 1)
+
+    def test_budget_bounds_positions_at_any_depth(self) -> None:
+        from unittest.mock import patch
+        with patch("webapp.backend.services.symbol_service.MAX_AST_TREE_NODES", 1000):
+            tree, _ = self._tree(depth=12)
+        self.assertLessEqual(self._positions(tree), 1000)
+        self.assertTrue(self._truncated(tree))
 
 
 if __name__ == "__main__":

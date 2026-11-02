@@ -1,4 +1,4 @@
-"""tests/test_webapp_system.py - Unit tests for read-only database instance endpoint and Rule 35 compliance."""
+"""tests/test_webapp_system.py - Read-only database instance token (sync service) and Rule 35 compliance."""
 from __future__ import annotations
 
 import os
@@ -10,62 +10,40 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from main import ensure_db_instance
 from core.DBLayout import m_db_instance
-from webapp.backend.routers.system import get_db_instance, _FALLBACK_INSTANCE_HASH, _FALLBACK_CREATED_AT
 from webapp.backend.database.pool import get_db_cursor
+from webapp.backend.services.sync_service import SyncService
 
 
 class TestWebappSystem(unittest.TestCase):
-    """Test suite for system endpoints and database read-only invariants."""
+    """Test suite for the database instance token and database read-only invariants."""
 
-    def test_get_db_instance_populated(self) -> None:
-        """Test get_db_instance with populated database row."""
+    def _db_token(self, cursor: MagicMock) -> str:
+        with patch("webapp.backend.services.sync_service.get_db_cursor") as mock_get_cursor:
+            mock_get_cursor.return_value.__enter__.return_value = cursor
+            return SyncService().db_token(fresh=True)
+
+    def test_db_token_populated(self) -> None:
+        """The `db` sync token is the instance hash, read with a read-only SELECT."""
         mock_cursor = MagicMock()
-        mock_cursor.fetchone.return_value = {
-            "instance_hash": "a" * 64,
-            "created_at": 1727000000,
-        }
-
-        with patch("webapp.backend.routers.system.get_db_cursor") as mock_get_cursor:
-            mock_get_cursor.return_value.__enter__.return_value = mock_cursor
-            res = get_db_instance()
-
-        self.assertEqual(res["instance_hash"], "a" * 64)
-        self.assertEqual(res["created_at"], 1727000000)
-        # Verify query executed was read-only SELECT
+        mock_cursor.fetchone.return_value = {"instance_hash": "a" * 64}
+        self.assertEqual(self._db_token(mock_cursor), "a" * 12)
         mock_cursor.execute.assert_called_once()
         query = mock_cursor.execute.call_args[0][0]
         self.assertIn("SELECT", query.upper())
         self.assertNotIn("INSERT INTO", query.upper())
         self.assertNotIn("CREATE TABLE", query.upper())
 
-    def test_get_db_instance_fallback_when_empty(self) -> None:
-        """Test get_db_instance returns fallback when table has 0 rows without modifying DB."""
-        mock_cursor = MagicMock()
-        mock_cursor.fetchone.return_value = None
+    def test_db_token_empty_or_unavailable(self) -> None:
+        """An empty or missing m_db_instance gives an empty token, without writing anything."""
+        empty = MagicMock()
+        empty.fetchone.return_value = None
+        self.assertEqual(self._db_token(empty), "")
+        for call_args in empty.execute.call_args_list:
+            self.assertNotIn("INSERT INTO", call_args[0][0].upper())
 
-        with patch("webapp.backend.routers.system.get_db_cursor") as mock_get_cursor:
-            mock_get_cursor.return_value.__enter__.return_value = mock_cursor
-            res = get_db_instance()
-
-        self.assertEqual(res["instance_hash"], _FALLBACK_INSTANCE_HASH)
-        self.assertEqual(res["created_at"], _FALLBACK_CREATED_AT)
-        # Must not perform any write
-        for call_args in mock_cursor.execute.call_args_list:
-            query = call_args[0][0]
-            self.assertNotIn("INSERT INTO", query.upper())
-            self.assertNotIn("CREATE TABLE", query.upper())
-
-    def test_get_db_instance_fallback_on_db_error(self) -> None:
-        """Test get_db_instance catches database errors (e.g. table missing) gracefully."""
-        mock_cursor = MagicMock()
-        mock_cursor.execute.side_effect = Exception("Table 'test.m_db_instance' doesn't exist")
-
-        with patch("webapp.backend.routers.system.get_db_cursor") as mock_get_cursor:
-            mock_get_cursor.return_value.__enter__.return_value = mock_cursor
-            res = get_db_instance()
-
-        self.assertEqual(res["instance_hash"], _FALLBACK_INSTANCE_HASH)
-        self.assertEqual(res["created_at"], _FALLBACK_CREATED_AT)
+        broken = MagicMock()
+        broken.execute.side_effect = Exception("Table 'test.m_db_instance' doesn't exist")
+        self.assertEqual(self._db_token(broken), "")
 
     def test_get_db_cursor_rejects_commit_argument(self) -> None:
         """Rule 35: get_db_cursor must not accept commit argument."""

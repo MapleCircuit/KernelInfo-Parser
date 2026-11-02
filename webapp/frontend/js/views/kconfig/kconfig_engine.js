@@ -81,7 +81,7 @@ function numericInBounds(type, text) {
   return true;
 }
 
-export function stringValid(type, text) {
+function stringValid(type, text) {
   const s = text ?? "";
   if (type === "string") return true;
   if (type === "int") return /^-?(0|[1-9][0-9]*)$/.test(s);
@@ -95,7 +95,7 @@ export function escapeConfigString(value) {
 }
 
 /** Expand the compact transport form (short keys, menus as arrays) into engine objects. */
-export function decodeModel(raw) {
+function decodeModel(raw) {
   if (!raw || !Array.isArray(raw.menus)) throw new Error("Unsupported Kconfig model format");
   const files = raw.files || [];
   const nodes = raw.menus.map((row, id) => ({
@@ -158,7 +158,6 @@ export class KconfigEngine {
     this.choices = Object.keys(m.syms).filter((n) => m.syms[n].is_choice);
     // 6.11+: choice members in priority order (menu::choice_members), declaration order at first
     this.modernChoice = Boolean(this.sem.choice_priority);
-    this._selectors = null;
     this.user.clear();
     this.choiceUser.clear();
     this.choiceDefTri.clear();
@@ -176,6 +175,29 @@ export class KconfigEngine {
     const order = this.choiceOrder.get(choice).filter((m) => m !== member);
     order.unshift(member);
     this.choiceOrder.set(choice, order);
+  }
+
+  /**
+   * Copy of everything a configuration is made of (user values, choice values and defaults, choice
+   * member priority). Restoring it gives back exactly the same configuration, not a re-resolution.
+   */
+  captureState() {
+    return {
+      user: new Map(this.user),
+      choiceUser: new Map(this.choiceUser),
+      choiceDefTri: new Map(this.choiceDefTri),
+      choiceOrder: new Map([...this.choiceOrder].map(([c, order]) => [c, [...order]])),
+    };
+  }
+
+  /** Put back a state taken by `captureState()` (the copy is not kept, so it can be reused). */
+  restoreState(snap) {
+    for (const key of ["user", "choiceUser", "choiceDefTri"]) {
+      this[key].clear();
+      for (const [k, v] of snap[key]) this[key].set(k, v);
+    }
+    this.choiceOrder = new Map([...snap.choiceOrder].map(([c, order]) => [c, [...order]]));
+    this.invalidate();
   }
 
   get loaded() {
@@ -309,18 +331,6 @@ export class KconfigEngine {
     const node = this.exprs[id];
     if (node[0] === "|") return [...this.orTerms(node[1]), ...this.orTerms(node[2])];
     return [id];
-  }
-
-  /** Symbols referenced by an expression. */
-  exprSymbols(id, out = new Set()) {
-    if (id === null || id === undefined || id < 0) return out;
-    const node = this.exprs[id];
-    if (node[0] === "s") {
-      if (!(node[1] in TRI_OF) && !node[1].startsWith("<choice")) out.add(node[1]);
-    } else if (node[0] !== "c") {
-      for (const child of node.slice(1)) this.exprSymbols(child, out);
-    }
-    return out;
   }
 
   // ------------------------------------------------------------------ symbol values
@@ -710,7 +720,7 @@ export class KconfigEngine {
     return true;
   }
 
-  /** The value `toggle()` would set: the next of n -> m -> y -> n that is in range (the current one if none). */
+  /** sym_toggle_tristate_value's target: the next of n -> m -> y -> n that is in range (the current one if none). */
   toggleTarget(name) {
     const old = this.symTri(name);
     for (let step = 1; step < 3; step++) {
@@ -718,19 +728,6 @@ export class KconfigEngine {
       if (this.tristateWithinRange(name, next)) return next;
     }
     return old;
-  }
-
-  /** sym_toggle_tristate_value: n -> m -> y -> n, skipping values out of range. */
-  toggle(name) {
-    const choice = this.syms[name].choice;
-    if (choice && this.modernChoice) {
-      // sym_toggle_tristate_value: a choice member is selected (6.11+)
-      this.choiceSetValue(choice, name);
-      return this.symTri(name);
-    }
-    const next = this.toggleTarget(name);
-    if (next !== this.symTri(name)) this.setTristate(name, next);
-    return this.symTri(name);
   }
 
   /**
@@ -751,8 +748,7 @@ export class KconfigEngine {
       (n) => n !== name && this.isDefined(n) && !this.syms[n].is_choice && !(target.choice && this.syms[n].choice === target.choice)
     );
     const before = new Map(names.map((n) => [n, snapshot(n)]));
-    const saved = [new Map(this.user), new Map(this.choiceUser), new Map(this.choiceDefTri)];
-    const savedOrder = new Map([...this.choiceOrder].map(([c, order]) => [c, [...order]]));
+    const saved = this.captureState();
     const lowered = [];
     try {
       if (!this.setValue(name, text)) return null;
@@ -775,12 +771,7 @@ export class KconfigEngine {
         });
       }
     } finally {
-      for (const [map, copy] of [[this.user, saved[0]], [this.choiceUser, saved[1]], [this.choiceDefTri, saved[2]]]) {
-        map.clear();
-        for (const [k, v] of copy) map.set(k, v);
-      }
-      this.choiceOrder = savedOrder;
-      this.invalidate();
+      this.restoreState(saved);
     }
     return lowered.sort((a, b) => a.name.localeCompare(b.name));
   }
@@ -1092,20 +1083,6 @@ export class KconfigEngine {
       if (this.writes(name)) values[name] = this.symStr(name);
     }
     return values;
-  }
-
-  /** Symbols whose `select` names `name`. */
-  selectors(name) {
-    if (!this._selectors) {
-      this._selectors = new Map();
-      for (const [n, s] of Object.entries(this.syms)) {
-        for (const [target] of s.selects) {
-          if (!this._selectors.has(target)) this._selectors.set(target, []);
-          this._selectors.get(target).push(n);
-        }
-      }
-    }
-    return this._selectors.get(name) || [];
   }
 
   /** Enclosing menu prompts of a menu node (menuconfig "Location:"). */

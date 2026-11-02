@@ -139,7 +139,7 @@ export class ExplorerView {
     const token = ++this.loadToken;
     listing.innerHTML = `<div class="explorer-empty">Loading ${escapeHtml(this.path || "repository root")}…</div>`;
     try {
-      const res = await api.getDirectoryTree(this.version, this.path, 1);
+      const res = await api.getDirectoryTree(this.version, this.path);
       if (token !== this.loadToken) return;
       this.entries = res.entries || res.tree || [];
       this.renderListing();

@@ -1,13 +1,13 @@
 """webapp/backend/services/filesystem_service.py - Directory & Source File Inspection."""
 from __future__ import annotations
+from collections.abc import Iterator
+import heapq
 import os
 from webapp.backend.config import RepoScopedCache, get_repo_dir
-from pathlib import Path
 from typing import Any
 from fastapi import HTTPException
 from webapp.backend.database.pool import get_db_cursor
 from webapp.backend.database.helpers import (
-    hash_hex,
     safe_decode,
     format_stat_label,
     get_version_info,
@@ -16,11 +16,10 @@ from webapp.backend.security.jail import is_safe_rel_path
 from webapp.backend.security.sql import escape_like
 from webapp.backend.services.git_reader import git_reader
 from webapp.backend.services.tree_resolver import tree_resolver, git_tree_resolver
-from core.globalstuff import format_ref_type_label, FileRefType
 # Bounded: every key below carries a request parameter (a header, a path), so an unbounded cache
 # would grow with each distinct value a caller sends. Treemaps are whole subtrees, so fewer are kept.
 _INCLUDE_CACHE: dict[tuple[str, str, str | None], dict[str, Any]] = RepoScopedCache(maxsize=4096)
-_FILE_TOKENS_CACHE: dict[tuple[str, str], list[list[int]]] = RepoScopedCache(maxsize=512)
+_FILE_TOKENS_CACHE: dict[int, list[list[int]]] = RepoScopedCache(maxsize=512)
 _TREEMAP_CACHE: dict[tuple[str, int, str], dict[str, Any]] = RepoScopedCache(maxsize=64)
 # Only image types are served raw (documentation figures); everything else goes through get_file()
 RAW_MEDIA_TYPES = {"svg": "image/svg+xml", "png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg", "gif": "image/gif"}
@@ -29,149 +28,141 @@ RAW_MEDIA_TYPES = {"svg": "image/svg+xml", "png": "image/png", "jpg": "image/jpe
 class FilesystemService:
     """Service handling directory tree traversal, file content extraction, and AST coordinate mapping."""
 
-    def get_tree(self, version_name: str, path: str = "") -> dict[str, Any]:
-        """Retrieve directory hierarchy and file entries for the given version."""
+    def get_tree(self, version_name: str, path: str = "", cursor: Any = None) -> dict[str, Any]:
+        """Retrieve directory hierarchy and file entries for the given version (on `cursor` when given)."""
+        if cursor is None:
+            with get_db_cursor() as cur:
+                return self._get_tree(cur, version_name, path)
+        return self._get_tree(cursor, version_name, path)
+
+    def _get_tree(self, cursor: Any, version_name: str, path: str) -> dict[str, Any]:
         norm_path = path.strip().strip("/")
-        with get_db_cursor() as cursor:
-            vid, vname = get_version_info(cursor, version_name)
-            if vid is None:
-                raise HTTPException(status_code=404, detail=f"Version '{version_name}' not found.")
+        vid, vname = get_version_info(cursor, version_name)
+        if vid is None:
+            raise HTTPException(status_code=404, detail=f"Version '{version_name}' not found.")
 
-            prefix = f"{norm_path}/" if norm_path else ""
-            # Wildcards in the requested path are escaped: only the trailing % is a wildcard
-            like_pattern = f"{escape_like(prefix)}%" if prefix else "%"
+        prefix = f"{norm_path}/" if norm_path else ""
+        # Wildcards in the requested path are escaped: only the trailing % is a wildcard
+        like_pattern = f"{escape_like(prefix)}%" if prefix else "%"
 
-            # Path C: the Git tree is authoritative for every revision (tags, branches, arbitrary commits)
-            git_tree = git_tree_resolver.list_tree(vname)
-            is_checkpoint = False
-            if git_tree is None:
-                # Git unavailable: fall back to milestone checkpoint in m_bridge_checkpoint
-                cursor.execute("SELECT 1 FROM m_bridge_checkpoint WHERE commit_id = %s LIMIT 1;", (vid,))
-                is_checkpoint = cursor.fetchone() is not None
+        # Path C: the Git tree is authoritative for every revision (tags, branches, arbitrary commits)
+        git_dir = git_tree_resolver.list_dir(vname, norm_path)
+        is_checkpoint = False
+        if git_dir is None:
+            # Git unavailable: fall back to milestone checkpoint in m_bridge_checkpoint
+            cursor.execute("SELECT 1 FROM m_bridge_checkpoint WHERE commit_id = %s LIMIT 1;", (vid,))
+            is_checkpoint = cursor.fetchone() is not None
 
-            if git_tree is not None:
-                rows = self._git_tree_rows(cursor, git_tree, prefix)
-            elif is_checkpoint:
-                sql = """
-                    SELECT fn.fname, bc.blob_id AS fid, fb.ftype, '0' AS s_stat, '0' AS e_stat
-                    FROM m_bridge_checkpoint bc
-                    JOIN m_file_blob fb ON bc.blob_id = fb.blob_id
-                    JOIN m_file_name fn ON bc.fnid = fn.fnid
-                    WHERE bc.commit_id = %s AND (fn.fname LIKE %s OR %s = '')
-                    ORDER BY fn.fname ASC;
-                """
-                cursor.execute(sql, (vid, like_pattern, prefix))
-                rows = cursor.fetchall()
+        if git_dir is not None:
+            rows = self._git_tree_rows(cursor, git_dir, prefix)
+        elif is_checkpoint:
+            sql = """
+                SELECT fn.fname, bc.blob_id AS fid, fb.ftype, '0' AS s_stat, '0' AS e_stat
+                FROM m_bridge_checkpoint bc
+                JOIN m_file_blob fb ON bc.blob_id = fb.blob_id
+                JOIN m_file_name fn ON bc.fnid = fn.fnid
+                WHERE bc.commit_id = %s AND (fn.fname LIKE %s OR %s = '')
+                ORDER BY fn.fname ASC;
+            """
+            cursor.execute(sql, (vid, like_pattern, prefix))
+            rows = cursor.fetchall()
+        else:
+            tree_map = tree_resolver.resolve_tree(vid, cursor)
+            if not tree_map:
+                rows = []
             else:
-                tree_map = tree_resolver.resolve_tree(vid, cursor)
-                if not tree_map:
-                    rows = []
-                else:
-                    fnids = list(tree_map.keys())
-                    rows = []
-                    chunk_size = 5000
-                    for i in range(0, len(fnids), chunk_size):
-                        chunk = fnids[i:i + chunk_size]
-                        fmt = ",".join(["%s"] * len(chunk))
-                        if prefix:
-                            cursor.execute(
-                                f"SELECT fnid, fname FROM m_file_name WHERE fnid IN ({fmt}) AND fname LIKE %s ORDER BY fname ASC;",
-                                [*chunk, like_pattern],
-                            )
-                        else:
-                            cursor.execute(
-                                f"SELECT fnid, fname FROM m_file_name WHERE fnid IN ({fmt}) ORDER BY fname ASC;",
-                                chunk,
-                            )
-                        c_rows = cursor.fetchall()
-                        blob_ids = list({tree_map[r["fnid"]] for r in c_rows})
-                        b_types: dict[int, int] = {}
-                        if blob_ids:
-                            b_fmt = ",".join(["%s"] * len(blob_ids))
-                            cursor.execute(f"SELECT blob_id, ftype FROM m_file_blob WHERE blob_id IN ({b_fmt});", blob_ids)
-                            b_types = {br["blob_id"]: br["ftype"] for br in cursor.fetchall()}
-                        for r in c_rows:
-                            b_id = tree_map[r["fnid"]]
-                            rows.append({
-                                "fname": r["fname"],
-                                "fid": b_id,
-                                "ftype": b_types.get(b_id, 1),
-                                "s_stat": "0",
-                                "e_stat": "0",
-                            })
-
-
-            entries = []
-            seen_dirs = set()
-            prefix_len = len(prefix)
-
-            for r in rows:
-                fname = safe_decode(r["fname"])
-                rel = fname[prefix_len:]
-                if not rel:
-                    continue
-                ftype = r["ftype"]
-                if "/" in rel:
-                    # Directory entry
-                    dirname = rel.split("/", 1)[0]
-                    if dirname not in seen_dirs:
-                        seen_dirs.add(dirname)
-                        entries.append({
-                            "name": dirname,
-                            "type": "dir",
-                            "path": f"{prefix}{dirname}" if prefix else dirname,
+                fnids = list(tree_map.keys())
+                rows = []
+                chunk_size = 5000
+                for i in range(0, len(fnids), chunk_size):
+                    chunk = fnids[i:i + chunk_size]
+                    fmt = ",".join(["%s"] * len(chunk))
+                    if prefix:
+                        cursor.execute(
+                            f"SELECT fnid, fname FROM m_file_name WHERE fnid IN ({fmt}) AND fname LIKE %s ORDER BY fname ASC;",
+                            [*chunk, like_pattern],
+                        )
+                    else:
+                        cursor.execute(
+                            f"SELECT fnid, fname FROM m_file_name WHERE fnid IN ({fmt}) ORDER BY fname ASC;",
+                            chunk,
+                        )
+                    c_rows = cursor.fetchall()
+                    blob_ids = list({tree_map[r["fnid"]] for r in c_rows})
+                    b_types: dict[int, int] = {}
+                    if blob_ids:
+                        b_fmt = ",".join(["%s"] * len(blob_ids))
+                        cursor.execute(f"SELECT blob_id, ftype FROM m_file_blob WHERE blob_id IN ({b_fmt});", blob_ids)
+                        b_types = {br["blob_id"]: br["ftype"] for br in cursor.fetchall()}
+                    for r in c_rows:
+                        b_id = tree_map[r["fnid"]]
+                        rows.append({
+                            "fname": r["fname"],
+                            "fid": b_id,
+                            "ftype": b_types.get(b_id, 1),
+                            "s_stat": "0",
+                            "e_stat": "0",
                         })
-                elif ftype == 0 or str(ftype) == "0":
-                    # Explicit directory record (ftype=0)
-                    dirname = rel
-                    if dirname not in seen_dirs:
-                        seen_dirs.add(dirname)
-                        entries.append({
-                            "name": dirname,
-                            "type": "dir",
-                            "path": f"{prefix}{dirname}" if prefix else dirname,
-                        })
-                else:
-                    # File entry (ftype != 0)
-                    if rel in seen_dirs:
-                        continue
+
+
+        entries = []
+        seen_dirs = set()
+        prefix_len = len(prefix)
+
+        for r in rows:
+            fname = safe_decode(r["fname"])
+            rel = fname[prefix_len:]
+            if not rel:
+                continue
+            ftype = r["ftype"]
+            if "/" in rel:
+                # Directory entry
+                dirname = rel.split("/", 1)[0]
+                if dirname not in seen_dirs:
+                    seen_dirs.add(dirname)
                     entries.append({
-                        "name": rel,
-                        "type": "file",
-                        "fid": r["fid"],
-                        "ftype": safe_decode(r["ftype"]),
-                        "path": fname,
-                        "s_stat": safe_decode(r["s_stat"]),
-                        "e_stat": safe_decode(r["e_stat"]),
-                        "s_stat_label": format_stat_label(safe_decode(r["s_stat"]), is_end=False),
-                        "e_stat_label": format_stat_label(safe_decode(r["e_stat"]), is_end=True),
+                        "name": dirname,
+                        "type": "dir",
+                        "path": f"{prefix}{dirname}" if prefix else dirname,
                     })
+            elif ftype == 0 or str(ftype) == "0":
+                # Explicit directory record (ftype=0)
+                dirname = rel
+                if dirname not in seen_dirs:
+                    seen_dirs.add(dirname)
+                    entries.append({
+                        "name": dirname,
+                        "type": "dir",
+                        "path": f"{prefix}{dirname}" if prefix else dirname,
+                    })
+            else:
+                # File entry (ftype != 0)
+                if rel in seen_dirs:
+                    continue
+                entries.append({
+                    "name": rel,
+                    "type": "file",
+                    "fid": r["fid"],
+                    "ftype": safe_decode(r["ftype"]),
+                    "path": fname,
+                    "s_stat": safe_decode(r["s_stat"]),
+                    "e_stat": safe_decode(r["e_stat"]),
+                    "s_stat_label": format_stat_label(safe_decode(r["s_stat"])),
+                })
 
-            entries.sort(key=lambda x: (0 if x["type"] == "dir" else 1, x["name"].lower()))
-            return {
-                "version": vname,
-                "vid": vid,
-                "path": norm_path,
-                "entries": entries,
-                "tree": entries,
-                "total_count": len(entries),
-            }
+        entries.sort(key=lambda x: (0 if x["type"] == "dir" else 1, x["name"].lower()))
+        return {
+            "version": vname,
+            "vid": vid,
+            "path": norm_path,
+            "entries": entries,
+            "tree": entries,
+        }
 
     @staticmethod
-    def _git_tree_rows(cursor: Any, git_tree: dict[str, str], prefix: str) -> list[dict[str, Any]]:
-        """Build direct-child rows of prefix from a Git tree, annotating files via m_file_blob blob_hash."""
-        prefix_len = len(prefix)
-        subdirs: set[str] = set()
-        direct_files: dict[str, str] = {}
-        for fname, blob_sha in git_tree.items():
-            if prefix and not fname.startswith(prefix):
-                continue
-            rel = fname[prefix_len:]
-            if "/" in rel:
-                subdirs.add(rel.split("/", 1)[0])
-            elif rel:
-                direct_files[fname] = blob_sha
-
+    def _git_tree_rows(cursor: Any, git_dir: tuple[set[str], dict[str, str]], prefix: str) -> list[dict[str, Any]]:
+        """Direct-child rows of prefix from a Git directory listing (list_dir), annotating files via m_file_blob blob_hash."""
+        subdirs, direct_files = git_dir
         blob_meta = git_tree_resolver.map_blob_hashes(cursor, direct_files.values())
         rows: list[dict[str, Any]] = [
             {"fname": f"{prefix}{d}", "fid": None, "ftype": 0, "s_stat": "0", "e_stat": "0"}
@@ -190,7 +181,12 @@ class FilesystemService:
         return rows
 
     def get_file(self, version_name: str, path: str) -> dict[str, Any]:
-        """Fetch raw file content, metadata, AST spatial coordinate maps, and incoming references."""
+        """Content of a file at a revision, with the AST token map of its indexed blob.
+
+        The blob is found by content (the Git blob SHA is `m_file_blob.blob_hash`), so the tokens always
+        belong to the text served, whatever the revision: a tag, a branch that moved since it was
+        parsed, or a commit never ingested. A directory path answers with its listing.
+        """
         norm_path = path.strip().strip("/")
         if not norm_path:
             raise HTTPException(status_code=400, detail="File path must be specified.")
@@ -202,437 +198,113 @@ class FilesystemService:
             if vid is None:
                 raise HTTPException(status_code=404, detail=f"Version '{version_name}' not found.")
 
-            # 1. Query file metadata from m_bridge_checkpoint and m_file_blob (if indexed)
-            cursor.execute(
-                """
-                SELECT bc.blob_id AS fid, NULL AS vid_s, NULL AS vid_e, fb.ftype, '0' AS s_stat, '0' AS e_stat, fn.fnid, fn.fname
-                FROM m_file_name fn
-                JOIN m_bridge_checkpoint bc ON fn.fnid = bc.fnid
-                JOIN m_file_blob fb ON bc.blob_id = fb.blob_id
-                WHERE bc.commit_id = %s AND fn.fname = %s
-                LIMIT 1;
-                """,
-                (vid, norm_path),
-            )
-            f_row = cursor.fetchone()
-
-            # 2. Read version-specific source content from Git
             raw_bytes, is_dir, sha1 = git_reader.read_file(vname, norm_path)
-
-            # Non-checkpoint commit: resolve the indexed blob through its content-addressed Git SHA-1
-            if not f_row and sha1 and not is_dir:
-                blob_meta = git_tree_resolver.map_blob_hashes(cursor, [sha1]).get(sha1)
-                if blob_meta:
-                    cursor.execute("SELECT fnid FROM m_file_name WHERE fname = %s LIMIT 1;", (norm_path,))
-                    fn_match = cursor.fetchone()
-                    if fn_match:
-                        f_row = {
-                            "fid": blob_meta[0],
-                            "vid_s": vid,
-                            "vid_e": None,
-                            "ftype": blob_meta[1],
-                            "s_stat": "0",
-                            "e_stat": "0",
-                            "fnid": fn_match["fnid"],
-                            "fname": norm_path,
-                        }
-
-            # Check if directory either in git tree or database ftype == 0
-            is_directory = is_dir or (f_row is not None and (f_row["ftype"] == 0 or str(f_row["ftype"]) == "0"))
-            if is_directory:
-                tree_data = self.get_tree(version_name, norm_path)
+            if is_dir:
+                tree_data = self.get_tree(version_name, norm_path, cursor=cursor)
                 return {
                     "type": "dir",
                     "is_directory": True,
                     "version": vname,
                     "vid": vid,
                     "path": norm_path,
-                    "file_info": {
-                        "fid": f_row["fid"] if f_row else None,
-                        "fnid": f_row["fnid"] if f_row else None,
-                        "fname": norm_path,
-                        "ftype": "dir",
-                    },
+                    "ftype": 0,
+                    "file_info": {"fid": None, "fname": norm_path, "ftype": "dir"},
                     "tree": tree_data.get("tree", []),
                     "entries": tree_data.get("entries", []),
                     "content": f"[Directory: {norm_path}]",
                     "tokens": [],
-                    "token_count": 0,
-                    "subsystems": [],
-                    "used_by": {"total": 0, "counts": {}, "references": []},
                 }
-
             if raw_bytes is None:
                 raise HTTPException(status_code=404, detail=f"File '{norm_path}' not found in version '{vname}'.")
 
+            blob_meta = git_tree_resolver.map_blob_hashes(cursor, [sha1]).get(sha1) if sha1 else None
+            fid, ftype = (blob_meta[0], blob_meta[1]) if blob_meta else (None, None)
             file_size = len(raw_bytes)
 
-            # Safeguard: detect binary files or oversized blobs
+            # Safeguard: binary files and oversized blobs are not displayed
             if b"\0" in raw_bytes[:1024]:
                 return {
                     "is_binary": True,
-                    "file_size": file_size,
                     "path": norm_path,
                     "version": vname,
-                    "fid": f_row["fid"] if f_row else None,
+                    "fid": fid,
+                    "ftype": ftype,
                     "message": "Binary file cannot be displayed.",
                 }
-
             if file_size > 10 * 1024 * 1024:
                 return {
                     "is_binary": False,
                     "is_oversized": True,
-                    "file_size": file_size,
                     "path": norm_path,
                     "version": vname,
-                    "fid": f_row["fid"] if f_row else None,
+                    "fid": fid,
+                    "ftype": ftype,
                     "message": f"File size ({file_size / (1024*1024):.2f} MB) exceeds maximum viewer display limit of 10 MB.",
                 }
 
-            raw_content = raw_bytes.decode("utf-8", errors="replace")
-
-            # Graceful unindexed fallback: if file exists in Git but has no DB record in checkpoint
-            if not f_row:
-                from webapp.backend.services.maintainer_service import MaintainerService
-                maintainer_srv = MaintainerService()
-                subsystems = maintainer_srv.resolve_subsystems_for_file(vname, norm_path)
-
-                cursor.execute("SELECT fnid FROM m_file_name WHERE fname = %s LIMIT 1;", (norm_path,))
-                fn_match = cursor.fetchone()
-                fallback_fid = fn_match["fnid"] if fn_match else None
-
-                last_changed = None
-                try:
-                    from webapp.backend.services.git_service import GitService
-                    last_changed = GitService().get_file_last_changed(vname, norm_path)
-                except Exception:
-                    pass
-
-                return {
-                    "type": "file",
-                    "is_binary": False,
-                    "version": vname,
-                    "vid": vid,
-                    "path": norm_path,
-                    "file_info": {
-                        "fid": fallback_fid,
-                        "fnid": fallback_fid,
-                        "fname": norm_path,
-                        "ftype": 1,
-                        "vid_s": vid,
-                        "vid_e": 0,
-                        "vname_s": vname,
-                        "vname_e": "Active",
-                        "added_version": vname,
-                        "s_stat": "A",
-                        "e_stat": "0",
-                        "s_stat_label": "Added",
-                        "e_stat_label": "Active",
-                        "file_size": file_size,
-                        "last_changed": last_changed,
-                        "history": [
-                            {
-                                "fid": fallback_fid,
-                                "vid_s": vid,
-                                "vid_e": 0,
-                                "vname_s": vname,
-                                "vname_e": "Active",
-                                "s_stat": "A",
-                                "e_stat": "0",
-                                "s_stat_label": "Added",
-                                "e_stat_label": "Active",
-                            }
-                        ],
-                    },
-                    "content": raw_content,
-                    "tokens": [],
-                    "token_count": 0,
-                    "subsystems": subsystems,
-                    "used_by": {"total": 0, "counts": {}, "references": []},
-                }
-
-            fid = f_row["fid"]
-            fnid = f_row["fnid"]
-
-            # 3. Compact AST token maps: [line_s, char_s, line_e, char_e, ast_id, type_id]
-            token_cache_key = (vname, norm_path)
-            # .get() into a local: the cache evicts, so contains-then-get could race a miss
-            compact_tokens = _FILE_TOKENS_CACHE.get(token_cache_key)
-            if compact_tokens is None:
-                cursor.execute(
-                    """
-                    SELECT bt.line_s, bt.char_s, bt.line_e, bt.char_e,
-                           m.line_s AS m_line_s, m.char_s AS m_char_s, m.line_e AS m_line_e, m.char_e AS m_char_e,
-                           m.ast_id, a.type_id
-                    FROM m_bridge_tag bt
-                    JOIN m_map_ast m ON m.map_id = bt.tag_id
-                    JOIN m_ast a ON m.ast_id = a.ast_id
-                    WHERE bt.blob_id = %s
-                    ORDER BY bt.line_s ASC, bt.char_s ASC;
-                    """,
-                    (fid,),
-                )
-                map_rows = cursor.fetchall()
-                compact_tokens = []
-                for r in map_rows:
-                    # Calculate absolute line and 0-indexed column coordinates from 1-indexed snippet-relative map
-                    abs_ls = r["line_s"] + r["m_line_s"] - 1
-                    abs_le = r["line_s"] + r["m_line_e"] - 1
-                    raw_cs = (r["char_s"] + r["m_char_s"] - 1) if r["m_line_s"] == 1 else r["m_char_s"]
-                    raw_ce = (r["char_s"] + r["m_char_e"] - 1) if r["m_line_e"] == 1 else r["m_char_e"]
-                    abs_cs = max(0, raw_cs - 1)
-                    abs_ce = max(abs_cs, raw_ce)
-                    compact_tokens.append([abs_ls, abs_cs, abs_le, abs_ce, r["ast_id"], r["type_id"]])
-                _FILE_TOKENS_CACHE[token_cache_key] = compact_tokens
-
-
-            # 4. History across versions and commits
-            cursor.execute(
-                """
-                SELECT
-                    bc.blob_id AS fid,
-                    bc.commit_id AS vid_s,
-                    '0' AS s_stat,
-                    c.commit_hash,
-                    c.author_date,
-                    c.subject,
-                    r.ref_name
-                FROM m_file_name fn
-                JOIN m_bridge_checkpoint bc ON fn.fnid = bc.fnid
-                JOIN m_commit c ON bc.commit_id = c.commit_id
-                LEFT JOIN m_git_ref r ON bc.commit_id = r.commit_id
-                WHERE fn.fname = %s
-                ORDER BY c.author_date ASC, bc.commit_id ASC;
-                """,
-                (norm_path,),
-            )
-            hist_rows = cursor.fetchall()
-            if not hist_rows:
-                cursor.execute(
-                    """
-                    SELECT
-                        cf.blob_id AS fid,
-                        cf.commit_id AS vid_s,
-                        cf.change_type AS s_stat,
-                        c.commit_hash,
-                        c.author_date,
-                        c.subject,
-                        r.ref_name
-                    FROM m_file_name fn
-                    JOIN m_commit_file cf ON fn.fnid = cf.fnid
-                    JOIN m_commit c ON cf.commit_id = c.commit_id
-                    LEFT JOIN m_git_ref r ON c.commit_id = r.commit_id
-                    WHERE fn.fname = %s
-                    ORDER BY c.author_date ASC, cf.commit_id ASC;
-                    """,
-                    (norm_path,),
-                )
-                hist_rows = cursor.fetchall()
-
-
-            history = []
-            for hr in hist_rows:
-                h_vid_s = hr["vid_s"] or vid
-                ref_name = safe_decode(hr.get("ref_name"))
-                if ref_name:
-                    h_vname_s = ref_name
+            # Compact AST token maps: [line_s, char_s, line_e, char_e, ast_id, type_id], per blob (content
+            # addressed, so shared by every revision holding the same file content)
+            compact_tokens: list[list[int]] = []
+            if fid is not None:
+                # .get() into a local: the cache evicts, so contains-then-get could race a miss
+                cached_tokens = _FILE_TOKENS_CACHE.get(fid)
+                if cached_tokens is not None:
+                    compact_tokens = cached_tokens
                 else:
-                    _, h_vname_s = get_version_info(cursor, h_vid_s)
-                if not h_vname_s or h_vname_s == "default" or h_vid_s == 0:
-                    c_h = hr.get("commit_hash")
-                    if c_h:
-                        h_vname_s = hash_hex(c_h)[:8]
-                    else:
-                        h_vname_s = vname
-                c_hash_hex = ""
-                if hr.get("commit_hash"):
-                    c_h = hr["commit_hash"]
-                    c_hash_hex = hash_hex(c_h)
-                s_stat_val = safe_decode(hr.get("s_stat")) or "0"
-                history.append({
-                    "fid": hr["fid"],
-                    "vid_s": h_vid_s,
-                    "vid_e": None,
-                    "vname_s": h_vname_s,
-                    "vname_e": "Active",
-                    "commit_hash": c_hash_hex,
-                    "subject": safe_decode(hr.get("subject")) or "",
-                    "author_date": hr.get("author_date"),
-                    "s_stat": s_stat_val,
-                    "e_stat": "0",
-                    "s_stat_label": format_stat_label(s_stat_val),
-                    "e_stat_label": "Active",
-                })
+                    compact_tokens = self._blob_tokens(cursor, fid)
+                    _FILE_TOKENS_CACHE[fid] = compact_tokens
 
+        last_changed = None
+        try:
+            from webapp.backend.services.git_service import GitService
+            last_changed = GitService().get_file_last_changed(vname, norm_path)
+        except Exception:  # noqa: BLE001 - the header line is optional
+            pass
 
-            vid_s = f_row["vid_s"] or vid
-            vid_e = f_row["vid_e"]
-            _, vname_s = get_version_info(cursor, vid_s)
-            if vname_s == "default" or vid_s == 0:
-                vname_s = vname
-                vid_s = vid
-            _, vname_e = get_version_info(cursor, vid_e) if vid_e else (None, "Active")
-
-            # 5. Incoming references ("Used By")
-            used_by = self.get_file_references(vname, fid)
-
-            # 6. Subsystems governing this file
-            from webapp.backend.services.maintainer_service import MaintainerService
-            maintainer_srv = MaintainerService()
-            subsystems = maintainer_srv.resolve_subsystems_for_file(vname, norm_path)
-
-            # 7. Last changed commit metadata
-            last_changed = None
-            try:
-                from webapp.backend.services.git_service import GitService
-                last_changed = GitService().get_file_last_changed(vname, norm_path)
-            except Exception:
-                pass
-
-            return {
-                "type": "file",
-                "is_binary": False,
-                "version": vname,
-                "vid": vid,
-                "path": norm_path,
-                "file_info": {
-                    "fid": fid,
-                    "fnid": fnid,
-                    "fname": norm_path,
-                    "ftype": safe_decode(f_row["ftype"]),
-                    "vid_s": vid_s,
-                    "vid_e": vid_e,
-                    "vname_s": vname_s,
-                    "vname_e": vname_e,
-                    "added_version": vname_s,
-                    "s_stat": safe_decode(f_row["s_stat"]),
-                    "e_stat": safe_decode(f_row["e_stat"]),
-                    "s_stat_label": format_stat_label(safe_decode(f_row["s_stat"])),
-                    "e_stat_label": format_stat_label(safe_decode(f_row["e_stat"]), is_end=True),
-                    "file_size": file_size,
-                    "last_changed": last_changed,
-                    "history": history,
-                },
-                "content": raw_content,
-                "tokens": compact_tokens,
-                "token_count": len(compact_tokens),
-                "subsystems": subsystems,
-                "used_by": used_by,
-            }
-
-    def browse_path(self, version_name: str, path: str = "") -> dict[str, Any]:
-        """Unified endpoint: introspects path to determine if it is directory tree or file."""
-        norm_path = path.strip().strip("/")
-        if not norm_path:
-            return self.get_tree(version_name, "")
-        if not is_safe_rel_path(norm_path):
-            raise HTTPException(status_code=400, detail="Path traversal attempt detected.")
-
-        obj_type, _, _ = git_reader.read_object(version_name, norm_path)
-        if obj_type == "tree":
-            return self.get_tree(version_name, norm_path)
-        return self.get_file(version_name, norm_path)
-
-    def get_file_references(self, version_name: str, fid: int | None, ref_type: str | None = None) -> dict[str, Any]:
-        """Query incoming cross-file references from m_file_reference."""
-        empty_counts = {
-            "include": 0,
-            "kbuild": 0,
-            "kconfig": 0,
-            "makefile": 0,
-            "documentation": 0,
+        return {
+            "type": "file",
+            "is_binary": False,
+            "version": vname,
+            "vid": vid,
+            "path": norm_path,
+            "ftype": ftype,
+            "file_info": {
+                "fid": fid,
+                "fname": norm_path,
+                "ftype": ftype,
+                "last_changed": last_changed,
+            },
+            "content": raw_bytes.decode("utf-8", errors="replace"),
+            "tokens": compact_tokens,
         }
-        if fid is None:
-            return {"total": 0, "counts": empty_counts, "references": []}
-        with get_db_cursor() as cursor:
-            vid, vname = get_version_info(cursor, version_name)
-            if vid is None:
-                return {"total": 0, "counts": empty_counts, "references": []}
 
-            # Map fid or fnid to target_fnid
-            cursor.execute(
-                """
-                SELECT bc.fnid FROM m_bridge_checkpoint bc WHERE (bc.blob_id = %s OR bc.fnid = %s) AND bc.commit_id = %s LIMIT 1;
-                """,
-                (fid, fid, vid),
-            )
-            row = cursor.fetchone()
-            target_fnid = row["fnid"] if row else fid
-
-            cursor.execute(
-                """
-                SELECT r.ref_type, r.line_no, r.details, fn.fname, r.source_blob_id AS source_fid
-                FROM m_file_reference r
-                JOIN m_bridge_checkpoint bc
-                  ON bc.commit_id = %s AND bc.fnid = r.source_fnid AND bc.blob_id = r.source_blob_id
-                JOIN m_file_name fn ON fn.fnid = r.source_fnid
-                WHERE r.target_fnid = %s
-                ORDER BY r.ref_type ASC, fn.fname ASC, r.line_no ASC;
-                """,
-                (vid, target_fnid),
-            )
-            rows = cursor.fetchall()
-
-            counts = {
-                "include": 0,
-                "kbuild": 0,
-                "kconfig": 0,
-                "makefile": 0,
-                "documentation": 0,
-            }
-            references = []
-            for r in rows:
-                rtype_code = r["ref_type"]
-                try:
-                    cat_name = format_ref_type_label(FileRefType(rtype_code)).lower()
-                except Exception:
-                    cat_name = "include"
-
-                counts[cat_name] = counts.get(cat_name, 0) + 1
-                if ref_type and ref_type.lower() != cat_name:
-                    continue
-
-                references.append({
-                    "ref_type": rtype_code,
-                    "ref_type_name": cat_name,
-                    "line_no": r["line_no"],
-                    "details": safe_decode(r["details"]),
-                    "source_fname": safe_decode(r["fname"]),
-                    "source_fid": r["source_fid"],
-                })
-
-            return {
-                "total": len(rows),
-                "filtered_total": len(references),
-                "counts": counts,
-                "references": references,
-            }
-
-    def get_file_by_id(self, fid: int, version_name: str | None = None) -> dict[str, Any]:
-        """Fetch file metadata by primary key fid."""
-        with get_db_cursor() as cursor:
-            cursor.execute(
-                """
-                SELECT bc.blob_id AS fid, fn.fname, bc.commit_id AS vid
-                FROM m_bridge_checkpoint bc
-                JOIN m_file_name fn ON bc.fnid = fn.fnid
-                WHERE bc.blob_id = %s
-                LIMIT 1;
-                """,
-                (fid,),
-            )
-            r = cursor.fetchone()
-            if not r:
-                # Fallback: check if fid corresponds to an fnid in m_file_name
-                cursor.execute("SELECT fname FROM m_file_name WHERE fnid = %s LIMIT 1;", (fid,))
-                fn_r = cursor.fetchone()
-                if fn_r:
-                    v_target = version_name or "v3.0"
-                    return self.get_file(str(v_target), safe_decode(fn_r["fname"]))
-                raise HTTPException(status_code=404, detail=f"File with FID {fid} not found.")
-
-            v_target = version_name or r["vid"]
-            return self.get_file(str(v_target), safe_decode(r["fname"]))
+    @staticmethod
+    def _blob_tokens(cursor: Any, blob_id: int) -> list[list[int]]:
+        """Absolute [line_s, char_s, line_e, char_e, ast_id, type_id] of every AST map of one blob."""
+        cursor.execute(
+            """
+            SELECT bt.line_s, bt.char_s, bt.line_e, bt.char_e,
+                   m.line_s AS m_line_s, m.char_s AS m_char_s, m.line_e AS m_line_e, m.char_e AS m_char_e,
+                   m.ast_id, a.type_id
+            FROM m_bridge_tag bt
+            JOIN m_map_ast m ON m.map_id = bt.tag_id
+            JOIN m_ast a ON m.ast_id = a.ast_id
+            WHERE bt.blob_id = %s
+            ORDER BY bt.line_s ASC, bt.char_s ASC;
+            """,
+            (blob_id,),
+        )
+        tokens = []
+        for r in cursor.fetchall():
+            # Absolute line and 0-indexed column coordinates from the 1-indexed snippet-relative map
+            abs_ls = r["line_s"] + r["m_line_s"] - 1
+            abs_le = r["line_s"] + r["m_line_e"] - 1
+            raw_cs = (r["char_s"] + r["m_char_s"] - 1) if r["m_line_s"] == 1 else r["m_char_s"]
+            raw_ce = (r["char_s"] + r["m_char_e"] - 1) if r["m_line_e"] == 1 else r["m_char_e"]
+            abs_cs = max(0, raw_cs - 1)
+            abs_ce = max(abs_cs, raw_ce)
+            tokens.append([abs_ls, abs_cs, abs_le, abs_ce, r["ast_id"], r["type_id"]])
+        return tokens
 
     def export_compile_commands(self, version_name: str, arch: str = "x86") -> list[dict[str, str]]:
         """Export a clang compile_commands.json database for every C source of the revision.
@@ -720,20 +392,25 @@ class FilesystemService:
         return result
 
     def search_files(self, version_name: str, query: str, limit: int = 50) -> dict[str, Any]:
-        """Fuzzy path search over the revision's Git tree (basename matches rank first)."""
+        """Fuzzy path search over the revision's Git tree (basename matches rank first).
+
+        Scans a per-commit index of lowercased paths (search_index) and keeps only the best `limit`
+        matches (heapq), instead of lowercasing and sorting every match on each keystroke.
+        """
         q = (query or "").strip().lower()
         with get_db_cursor() as cursor:
             vid, vname = get_version_info(cursor, version_name)
             if vid is None:
                 raise HTTPException(status_code=404, detail=f"Version '{version_name}' not found.")
-        tree = git_tree_resolver.list_tree(vname) or {}
         if not q:
             return {"version": vname, "query": query, "total": 0, "files": []}
+        index = git_tree_resolver.search_index(vname) or []
+        fuzzy = len(q) >= 2
 
-        def subsequence_gaps(needle: str, hay: str) -> int | None:
+        def subsequence_gaps(hay: str) -> int | None:
             pos = -1
             gaps = 0
-            for ch in needle:
+            for ch in q:
                 nxt = hay.find(ch, pos + 1)
                 if nxt == -1:
                     return None
@@ -741,27 +418,32 @@ class FilesystemService:
                 pos = nxt
             return gaps
 
-        scored: list[tuple[float, str]] = []
-        for p in tree:
-            lp = p.lower()
-            base = lp.rsplit("/", 1)[-1]
-            if base == q:
-                score = 0.0
-            elif base.startswith(q):
-                score = 1.0 + len(base) / 1000
-            elif q in base:
-                score = 2.0 + base.index(q) / 100
-            elif q in lp:
-                score = 3.0 + len(lp) / 1000
-            else:
-                gaps = subsequence_gaps(q, lp) if len(q) >= 2 else None
-                if gaps is None:
-                    continue
-                score = 4.0 + gaps / 100
-            scored.append((score, p))
-        scored.sort()
-        files = [{"path": p, "name": p.rsplit("/", 1)[-1], "score": round(sc, 3)} for sc, p in scored[: max(1, min(limit, 200))]]
-        return {"version": vname, "query": query, "total": len(scored), "files": files}
+        def scored() -> Iterator[tuple[float, str]]:
+            for lp, base, p in index:
+                if base == q:
+                    yield (0.0, p)
+                elif base.startswith(q):
+                    yield (1.0 + len(base) / 1000, p)
+                elif q in base:
+                    yield (2.0 + base.index(q) / 100, p)
+                elif q in lp:
+                    yield (3.0 + len(lp) / 1000, p)
+                elif fuzzy:
+                    gaps = subsequence_gaps(lp)
+                    if gaps is not None:
+                        yield (4.0 + gaps / 100, p)
+
+        total = 0
+
+        def counted() -> Iterator[tuple[float, str]]:
+            nonlocal total
+            for item in scored():
+                total += 1
+                yield item
+
+        best = heapq.nsmallest(max(1, min(limit, 200)), counted())
+        files = [{"path": p, "name": p.rsplit("/", 1)[-1], "score": round(sc, 3)} for sc, p in best]
+        return {"version": vname, "query": query, "total": total, "files": files}
 
     def read_raw(self, version_name: str, path: str) -> tuple[bytes, str]:
         """Raw image bytes for documentation figures; `name.*` picks the first existing svg/png/jpg/gif."""
@@ -784,10 +466,6 @@ class FilesystemService:
                     raise HTTPException(status_code=413, detail="File too large to serve.")
                 return data, media_type
         raise HTTPException(status_code=404, detail=f"No image found for '{norm_path}' at '{vname}'.")
-
-    def get_include_symbols(self, version_name: str, path: str) -> dict[str, Any]:
-        """Retrieve symbols defined in headers included by the file."""
-        return {"file": path, "symbols": []}
 
     def resolve_include(
         self,
@@ -966,19 +644,15 @@ class FilesystemService:
                 _INCLUDE_CACHE[cache_key] = res
                 return res
 
-            # Check physical file if unindexed (must be file, never directory, never outside the jail:
-            # candidates are built from the header, and a symlink in the tree can still point out)
-            repo_root = get_repo_dir().resolve()
+            # Unindexed revision or file: a candidate that exists in the revision's Git tree
+            tree = git_tree_resolver.list_tree(vname) or {}
             for cand in candidates:
-                cand_path = (repo_root / cand).resolve()
-                if not cand_path.is_relative_to(repo_root):
-                    continue
-                if cand_path.is_file():
+                if cand in tree:
                     res = {
                         "header": clean_header,
                         "path": cand,
                         "resolved": True,
-                        "method": "disk",
+                        "method": "git_tree",
                     }
                     _INCLUDE_CACHE[cache_key] = res
                     return res

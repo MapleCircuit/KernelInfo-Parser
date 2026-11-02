@@ -42,7 +42,7 @@ export function isDocumentationPath(path) {
 }
 
 /** Resolve a :doc:/toctree target relative to the current document (Sphinx semantics). */
-export function resolveDocPath(target, currentPath) {
+function resolveDocPath(target, currentPath) {
   let t = String(target || "").trim();
   if (!t) return "";
   t = t.replace(/#.*$/, "");

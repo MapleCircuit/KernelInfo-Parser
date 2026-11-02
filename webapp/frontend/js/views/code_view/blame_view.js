@@ -5,6 +5,7 @@
 import { api } from "../../api.js";
 import { state } from "../../state.js";
 import { showPersonModal } from "../../components/person_modal.js";
+import { escapeHtml } from "../../components/modal.js";
 
 export class BlameView {
   constructor() {
@@ -36,12 +37,15 @@ export class BlameView {
     const hashShort = (b.commit_hash || "0000000").substring(0, 7);
     const author = b.author_name || "Unknown";
     const dateStr = b.date ? new Date(b.date * 1000).toISOString().split("T")[0] : "";
+    const cleanSubject = escapeHtml(b.subject || "");
+    const cleanAuthor = escapeHtml(author);
+    const cleanCommit = escapeHtml(b.commit_hash || "");
 
     return `
-      <div class="gutter-blame" title="${b.subject || ''} (${b.author_name})" data-commit="${b.commit_hash}">
-        <span style="color:var(--accent-blue);font-family:var(--font-mono);">${hashShort}</span>
-        <span class="blame-author-link" style="cursor:pointer;" data-author="${author}" title="Click to view developer profile: ${author}">${author}</span>
-        <span style="font-size:9px;color:var(--text-muted);">${dateStr}</span>
+      <div class="gutter-blame" title="${cleanSubject} (${cleanAuthor})" data-commit="${cleanCommit}">
+        <span style="color:var(--accent-blue);font-family:var(--font-mono);">${escapeHtml(hashShort)}</span>
+        <span class="blame-author-link" style="cursor:pointer;" data-author="${cleanAuthor}" title="Click to view developer profile: ${cleanAuthor}">${cleanAuthor}</span>
+        <span style="font-size:9px;color:var(--text-muted);">${escapeHtml(dateStr)}</span>
       </div>
     `;
   }

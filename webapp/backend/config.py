@@ -7,6 +7,7 @@ through core.config with strict precedence:
 from __future__ import annotations
 from contextvars import ContextVar
 from pathlib import Path
+import threading
 from typing import Any
 from core.config import (
     get_db_config,
@@ -14,8 +15,6 @@ from core.config import (
     get_repositories_config,
     get_repository,
     get_webapp_config,
-    get_parser_config,
-    init_config,
     resolve_repo_path,
 )
 
@@ -75,6 +74,7 @@ class RepoScopedCache(dict):
     def __init__(self, maxsize: int | None = None) -> None:
         super().__init__()
         self.maxsize = maxsize
+        self._lock = threading.RLock()
 
     def _k(self, key: Any) -> tuple[str, Any]:
         return (get_active_repo_name(), key)
@@ -90,35 +90,42 @@ class RepoScopedCache(dict):
 
     def __getitem__(self, key: Any) -> Any:
         scoped = self._k(key)
-        value = super().__getitem__(scoped)
-        self._touch(scoped)
-        return value
+        with self._lock:
+            value = super().__getitem__(scoped)
+            self._touch(scoped)
+            return value
 
     def __setitem__(self, key: Any, value: Any) -> None:
-        super().__setitem__(self._k(key), value)
-        self._evict()
+        with self._lock:
+            super().__setitem__(self._k(key), value)
+            self._evict()
 
     def __contains__(self, key: object) -> bool:
-        return super().__contains__(self._k(key))
+        with self._lock:
+            return super().__contains__(self._k(key))
 
     def __delitem__(self, key: Any) -> None:
-        super().__delitem__(self._k(key))
+        with self._lock:
+            super().__delitem__(self._k(key))
 
     def get(self, key: Any, default: Any = None) -> Any:
         scoped = self._k(key)
-        if not super().__contains__(scoped):
-            return default
-        value = super().__getitem__(scoped)
-        self._touch(scoped)
-        return value
+        with self._lock:
+            if not super().__contains__(scoped):
+                return default
+            value = super().__getitem__(scoped)
+            self._touch(scoped)
+            return value
 
     def pop(self, key: Any, *default: Any) -> Any:
-        return super().pop(self._k(key), *default)
+        with self._lock:
+            return super().pop(self._k(key), *default)
 
     def setdefault(self, key: Any, default: Any = None) -> Any:
-        value = super().setdefault(self._k(key), default)
-        self._evict()
-        return value
+        with self._lock:
+            value = super().setdefault(self._k(key), default)
+            self._evict()
+            return value
 
 
 def get_backend_db_config() -> dict[str, Any]:

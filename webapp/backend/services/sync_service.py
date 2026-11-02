@@ -46,23 +46,41 @@ def _digest(parts: list[str]) -> str:
 
 
 class _Ttl:
-    """value_fn() cached for `ttl` seconds per key (`fresh` recomputes it)."""
+    """value_fn() cached for `ttl` seconds per key (`fresh` recomputes it).
+
+    One computation per key at a time: requests arriving while a token is recomputed wait for that
+    answer instead of each running the same `git for-each-ref` or database query.
+    """
 
     def __init__(self, ttl: float) -> None:
         self.ttl = ttl
         self._values: dict[Any, tuple[float, str]] = {}
         self._lock = threading.Lock()
+        self._computing: dict[Any, threading.Lock] = {}
+
+    def peek(self, key: Any) -> str | None:
+        """The cached value while it is fresh, else None (never computes)."""
+        hit = self._values.get(key)
+        return hit[1] if hit and time.monotonic() - hit[0] < self.ttl else None
 
     def get(self, key: Any, value_fn: Callable[[], str], fresh: bool = False) -> str:
-        now = time.monotonic()
+        started = time.monotonic()
         with self._lock:
             hit = self._values.get(key)
-            if hit and not fresh and now - hit[0] < self.ttl:
+            if hit and not fresh and started - hit[0] < self.ttl:
                 return hit[1]
-        value = value_fn()
-        with self._lock:
-            self._values[key] = (now, value)
-        return value
+            gate = self._computing.setdefault(key, threading.Lock())
+        with gate:
+            with self._lock:
+                hit = self._values.get(key)
+            # Computed by the caller this one waited for
+            if hit and hit[0] >= started:
+                return hit[1]
+            now = time.monotonic()
+            value = value_fn()
+            with self._lock:
+                self._values[key] = (now, value)
+            return value
 
 
 class SyncService:
@@ -76,6 +94,7 @@ class SyncService:
         self._parsed = _Ttl(_REPO_TTL)
         self._git = _Ttl(_REPO_TTL)
         self._last_parsed: dict[str, str] = {}
+        self._last_git: dict[str, str] = {}
 
     # ------------------------------------------------------------------ frontend
     def _frontend_files(self) -> list[tuple[str, int, int, int, int]]:
@@ -178,7 +197,14 @@ class SyncService:
             except Exception as exc:
                 logger.debug("git token unavailable: %s", exc)
                 return ""
-            return _digest(out.splitlines())
+            token = _digest(out.splitlines())
+            # Tags fetched or a branch moved: caches keyed by a revision name (a branch's files, Kconfig
+            # model, maintainers, name -> commit) would keep answering for the old commit
+            if self._last_git.get(repo_dir) not in (None, token):
+                clear_parse_dependent_caches()
+                logger.info("Git refs of %s changed; revision caches cleared.", repo_dir)
+            self._last_git[repo_dir] = token
+            return token
         return self._git.get(repo_dir, compute, fresh)
 
     # ------------------------------------------------------------------ API
@@ -196,21 +222,60 @@ class SyncService:
         """`db.parsed.git` for the X-KIP-Sync response header (the frontend build is only checked on page open)."""
         return f"{self.db_token()}.{self.parsed_token()}.{self.git_token()}"
 
+    def cached_header_value(self) -> str | None:
+        """header_value() when all three tokens are cached and fresh (no database or Git work), else None."""
+        db = self._db.peek("db")
+        parsed = self._parsed.peek(get_active_repo_name())
+        git = self._git.peek(str(get_repo_dir()))
+        if db is None or parsed is None or git is None:
+            return None
+        return f"{db}.{parsed}.{git}"
+
 
 def clear_parse_dependent_caches() -> None:
     """Drop server caches holding per-version data derived from what was parsed (a version finished or was
     rolled back, so its name now resolves to other rows)."""
     from webapp.backend.database import helpers
-    from webapp.backend.services import filesystem_service, history_service, maintainer_service
-    from webapp.backend.services.tree_resolver import git_tree_resolver
+    from webapp.backend.services import (
+        filesystem_service,
+        history_service,
+        maintainer_service,
+        kconfig_service,
+    )
+    from webapp.backend.services.arch_layout_service import arch_layout_service
+    from webapp.backend.services.tree_resolver import tree_resolver, git_tree_resolver
 
     for cache in (
-        helpers._NAME_TO_VID_CACHE, helpers._VID_TO_NAME_CACHE, helpers._REPO_ID_CACHE,
+        helpers._NAME_TO_VID_CACHE, helpers._VID_TO_NAME_CACHE, helpers._REPO_ID_CACHE, helpers._PRELOADED,
         filesystem_service._FILE_TOKENS_CACHE, filesystem_service._INCLUDE_CACHE,
+        filesystem_service._TREEMAP_CACHE,
         maintainer_service._MAINTAINER_CACHE, maintainer_service._FILE_SUBSYSTEMS_CACHE,
-        history_service._FACTS_CACHE, git_tree_resolver._blob_path_cache,
+        maintainer_service._BLOB_SECTIONS_CACHE, maintainer_service._BLOB_CREDITS_CACHE,
+        maintainer_service._CREDITS_KEYS_CACHE,
+        history_service._FACTS_CACHE, history_service._TAG_CODE_CACHE,
+        kconfig_service._MODELS, kconfig_service._BUILD_RESOLVERS,
+        kconfig_service._LISTING_CACHE, kconfig_service._PATHS_CACHE, kconfig_service._USAGE_CACHE,
+        kconfig_service._ARCH_INFO_CACHE,
     ):
-        cache.clear()
+        try:
+            cache.clear()
+        except Exception:
+            pass
+
+    try:
+        arch_layout_service.clear_cache()
+    except Exception:
+        pass
+
+    try:
+        tree_resolver.clear_cache()
+    except Exception:
+        pass
+
+    try:
+        git_tree_resolver.clear_revision_caches()
+    except Exception:
+        pass
 
 
 sync_service = SyncService()
@@ -238,7 +303,8 @@ class SyncHeaderMiddleware:
         async def send_with_header(message) -> None:
             if message["type"] == "http.response.start":
                 try:
-                    value = await run_in_threadpool(ctx.run, sync_service.header_value)
+                    # Cached tokens are read in place; only a refresh goes to the threadpool
+                    value = ctx.run(sync_service.cached_header_value) or await run_in_threadpool(ctx.run, sync_service.header_value)
                     message.setdefault("headers", [])
                     message["headers"] = [*message["headers"], (SYNC_HEADER.lower().encode(), value.encode())]
                 except Exception as exc:

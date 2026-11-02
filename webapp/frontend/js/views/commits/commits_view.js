@@ -102,7 +102,6 @@ export class CommitsView {
     this.containerEl = null;
     this.currentPage = 1;
     this.currentQuery = "";
-    this.anchorCommit = null;
     this.hasPast = false;
     this.hasFuture = false;
     this.hasMore = false;
@@ -236,7 +235,6 @@ export class CommitsView {
       } else {
         const res = await api.getCommitTimeline(this.currentVersion, 50, "past", null);
         if (token !== this._listToken) return;
-        this.anchorCommit = res.anchor_commit || null;
         this.commits = res.timeline || [];
         this.hasPast = Boolean(res.has_past);
         this.hasFuture = Boolean(res.has_future);
@@ -363,11 +361,11 @@ export class CommitsView {
       const authorIdentifier = c.author?.email || c.author_email || authorName;
 
       card.innerHTML = `
-        <div class="commit-subject">${c.subject || "No subject"}</div>
+        <div class="commit-subject">${escapeHtml(c.subject || "No subject")}</div>
         <div class="commit-meta">
-          <span class="commit-author-link" style="color:var(--text-secondary);cursor:pointer;transition:color 0.15s;" title="View developer profile: ${authorName}">${authorName}</span>
+          <span class="commit-author-link" style="color:var(--text-secondary);cursor:pointer;transition:color 0.15s;" title="View developer profile: ${escapeHtml(authorName)}">${escapeHtml(authorName)}</span>
           <div style="display:flex;gap:6px;align-items:center;">
-            <span>${dateStr}</span>
+            <span>${escapeHtml(dateStr)}</span>
             ${hashHtml(c.commit_hash, { short: true })}
           </div>
         </div>
@@ -576,15 +574,15 @@ export class CommitsView {
 
       detailEl.innerHTML = `
         <div class="commit-header">
-          <div class="commit-detail-title">${c.subject || "Commit"}</div>
+          <div class="commit-detail-title">${escapeHtml(c.subject || "Commit")}</div>
           <div class="commit-detail-meta">
-            <div><strong>Author:</strong> <span class="commit-detail-author-link" style="color:var(--accent-blue);cursor:pointer;text-decoration:underline;" title="Click to view developer profile">${c.author?.name || c.author_name} &lt;${c.author?.email || c.author_email}&gt;</span></div>
-            <div><strong>Date:</strong> ${dateStr}</div>
+            <div><strong>Author:</strong> <span class="commit-detail-author-link" style="color:var(--accent-blue);cursor:pointer;text-decoration:underline;" title="Click to view developer profile">${escapeHtml(c.author?.name || c.author_name)} &lt;${escapeHtml(c.author?.email || c.author_email)}&gt;</span></div>
+            <div><strong>Date:</strong> ${escapeHtml(dateStr)}</div>
             <div><strong>Hash:</strong> ${hashHtml(c.commit_hash)}</div>
-            ${c.lore_url ? `<div><a href="${c.lore_url}" target="_blank" class="lore-link">lore.kernelinfo.org LKML Thread ↗</a></div>` : ""}
+            ${c.lore_url ? `<div><a href="${escapeHtml(c.lore_url)}" target="_blank" class="lore-link">lore.kernelinfo.org LKML Thread ↗</a></div>` : ""}
             <div style="margin-top:8px;">
               <button class="code-btn active" id="btn-explore-commit" style="font-size:11px;padding:4px 10px;">
-                🔍 Explore Files at this Commit (${c.commit_hash.slice(0, 8)})
+                🔍 Explore Files at this Commit (${escapeHtml(c.commit_hash.slice(0, 8))})
               </button>
             </div>
           </div>
@@ -618,13 +616,13 @@ export class CommitsView {
                     if (role.toLowerCase().includes("signed-off")) color = "var(--accent-green)";
                     else if (role.toLowerCase().includes("reported") || role.toLowerCase().includes("suggested")) color = "var(--accent-orange)";
                     else if (role.toLowerCase().includes("co-developed")) color = "#d2a8ff";
-                    return `<span style="color:${color};font-weight:bold;font-size:10px;background:rgba(255,255,255,0.05);padding:2px 6px;border-radius:3px;border:1px solid rgba(255,255,255,0.1);">${role}</span>`;
+                    return `<span style="color:${color};font-weight:bold;font-size:10px;background:rgba(255,255,255,0.05);padding:2px 6px;border-radius:3px;border:1px solid rgba(255,255,255,0.1);">${escapeHtml(role)}</span>`;
                   }).join(" ");
 
                   const contribId = contrib.email || contrib.name;
                   return `
-                    <div class="commit-contributor-item" data-person="${contribId}" style="display:flex;justify-content:space-between;align-items:center;padding:6px 10px;background:var(--bg-tertiary);border-radius:4px;cursor:pointer;transition:background 0.15s;" title="Click to view developer profile">
-                      <span><strong style="color:var(--accent-blue);">${contrib.name}</strong> &lt;${contrib.email || ""}&gt;</span>
+                    <div class="commit-contributor-item" data-person="${escapeHtml(contribId)}" style="display:flex;justify-content:space-between;align-items:center;padding:6px 10px;background:var(--bg-tertiary);border-radius:4px;cursor:pointer;transition:background 0.15s;" title="Click to view developer profile">
+                      <span><strong style="color:var(--accent-blue);">${escapeHtml(contrib.name)}</strong> &lt;${escapeHtml(contrib.email || "")}&gt;</span>
                       <div style="display:flex;gap:4px;align-items:center;">${badgesHtml}</div>
                     </div>
                   `;
@@ -637,7 +635,7 @@ export class CommitsView {
         <!-- Full Commit Message -->
         <div class="m-card">
           <div class="m-card-title">Commit Message</div>
-          <pre style="font-family:var(--font-mono);font-size:12px;white-space:pre-wrap;color:var(--text-primary);line-height:1.4;">${c.message || c.subject}</pre>
+          <pre style="font-family:var(--font-mono);font-size:12px;white-space:pre-wrap;color:var(--text-primary);line-height:1.4;">${escapeHtml(c.message || c.subject)}</pre>
         </div>
 
         <!-- Modified Files -->
@@ -712,12 +710,13 @@ export class CommitsView {
 
       // Jump to file
       detailEl.querySelectorAll(".commit-file-link").forEach((link) => {
+        const fileVer = link.dataset.status === "D" ? `${c.commit_hash}~1` : (c.commit_hash || this.currentVersion);
         link.onclick = () => {
           state.openTab({
             type: "code",
             title: link.dataset.path.split("/").pop(),
             path: link.dataset.path,
-            version: this.currentVersion
+            version: fileVer
           });
         };
         link.addEventListener("auxclick", (e) => {
@@ -728,7 +727,7 @@ export class CommitsView {
               type: "code",
               title: link.dataset.path.split("/").pop(),
               path: link.dataset.path,
-              version: this.currentVersion,
+              version: fileVer,
               forceNew: true
             });
           }
@@ -764,7 +763,7 @@ export class CommitsView {
         badgeText = "Pull Request";
       } else if (item.patch_version || item.patch_idx) {
         const v = item.patch_version > 1 ? ` v${item.patch_version}` : "";
-        const idx = item.patch_idx ? ` ${item.patch_idx}/${item.patch_total || '1'}` : "";
+        const idx = item.patch_idx ? (item.patch_total && item.patch_total >= item.patch_idx ? ` ${item.patch_idx}/${item.patch_total}` : ` ${item.patch_idx}`) : "";
         badgeText = `Patch${v}${idx}`;
       }
 

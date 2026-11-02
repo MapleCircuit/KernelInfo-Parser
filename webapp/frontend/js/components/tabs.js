@@ -62,6 +62,12 @@ export class TabsComponent {
       this.render();
     });
     state.subscribe("pane:activated", () => this.highlightActivePane());
+    state.subscribe("tab:state", ({ tabId, patch }) => {
+      if (patch && patch.title) {
+        const titleEl = this.container.querySelector(`.tab[data-tab-id="${tabId}"] .tab-title`);
+        if (titleEl) titleEl.textContent = patch.title;
+      }
+    });
   }
 
   render() {
@@ -577,8 +583,10 @@ export class TabsComponent {
     if (!payload) return;
 
     // A KConfig tab's values travel through the shared configuration store rather than in the
-    // payload (§5.8), so what this window holds has to be written before the tab leaves it.
+    // payload (§5.8); that store is written whenever they change. The session is written now too,
+    // instead of after the save delay, since another window acts on the transfer at once.
     state.saveState();
+    state.flushState();
 
     const sessionName = session.name || session.id;
     this.pendingPushes.set(tab.id, { sessionId: session.id, sessionName });

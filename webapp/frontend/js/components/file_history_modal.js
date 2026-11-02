@@ -48,12 +48,12 @@ export async function showFileHistoryModal(version, filePath) {
     <div style="padding: 14px 18px; border-bottom: 1px solid var(--border-color, #333); display: flex; justify-content: space-between; align-items: center; background: var(--bg-tertiary, #252526);">
       <h3 style="margin: 0; font-size: 14px; font-weight: 600; color: var(--text-primary, #fff); display: flex; align-items: center; gap: 8px;">
         <span>📜 File Commit History:</span>
-        <code style="color: var(--accent-blue, #61afef); font-size: 13px;">${cleanPath}</code>
+        <code style="color: var(--accent-blue, #61afef); font-size: 13px;">${escapeHtml(cleanPath)}</code>
       </h3>
       <button class="file-history-modal-close" style="background: none; border: none; color: var(--text-muted, #888); font-size: 20px; cursor: pointer; padding: 0 4px; line-height: 1;">&times;</button>
     </div>
     <div class="file-history-modal-body" style="padding: 16px 20px; overflow-y: auto; flex: 1;">
-      <div style="padding: 30px; text-align: center; color: var(--text-muted);">⏳ Loading Git commit history for ${cleanPath}...</div>
+      <div style="padding: 30px; text-align: center; color: var(--text-muted);">⏳ Loading Git commit history for ${escapeHtml(cleanPath)}...</div>
     </div>
     <div style="padding: 10px 18px; border-top: 1px solid var(--border-color, #333); display: flex; justify-content: flex-end; background: var(--bg-tertiary, #252526);">
       <button class="code-btn file-history-close-btn" style="padding: 4px 14px; font-size: 12px;">Close</button>
@@ -188,24 +188,20 @@ export async function showFileHistoryModal(version, filePath) {
       btn.onclick = () => {
         const hash = btn.dataset.hash;
         close();
-        if (typeof window !== "undefined" && typeof window.openCommitModal === "function") {
-          window.openCommitModal(hash);
-        } else {
-          state.openTab({
-            type: "commits",
-            title: "Commits",
-            version: version,
-            commitId: hash,
-            listCollapsed: true,
-            forceNew: true,
-          });
-        }
+        state.openTab({
+          type: "commits",
+          title: "Commits",
+          version: version,
+          commitId: hash,
+          listCollapsed: true,
+          forceNew: true,
+        });
       };
     });
   } catch (err) {
     bodyEl.innerHTML = `
       <div style="padding: 20px; color: var(--accent-red, #ff5555); text-align: center;">
-        Failed to load commit history: ${err.message}
+        Failed to load commit history: ${escapeHtml(err.message)}
       </div>
     `;
   }

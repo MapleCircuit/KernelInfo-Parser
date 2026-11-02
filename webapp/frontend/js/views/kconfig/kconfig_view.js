@@ -23,12 +23,20 @@ import { toast } from "../../components/toast.js";
 import { KconfigEngine } from "./kconfig_engine.js";
 import { KconfigParser } from "./kconfig_parser.js";
 import { MenuconfigTui } from "./menuconfig_tui.js";
+import { KconfigHistory } from "./kconfig_history.js";
 import { openModal, escapeHtml, downloadText } from "../../components/modal.js";
 import { showKconfigHistoryModal } from "../../components/symbol_history_modal.js";
 
 const DEFAULT_ARCH = "x86_64";
 const TRI_CHAR = ["n", "m", "y"];
 const SEARCH_LIMIT = 150;
+
+/** Whether two assignment sets hold the same values (compared as text). */
+function sameValues(a, b) {
+  const ka = Object.keys(a || {});
+  if (ka.length !== Object.keys(b || {}).length) return false;
+  return ka.every((k) => Object.prototype.hasOwnProperty.call(b, k) && String(a[k]) === String(b[k]));
+}
 
 export class KconfigView {
   constructor() {
@@ -54,6 +62,12 @@ export class KconfigView {
     this.selfEngineChange = false;
     // "version|ARCH|name" this tab's values were last loaded against (a switch reports what moved)
     this.resolvedProfileKey = "";
+    // Undo/redo of this tab's configuration (Ctrl+Z, Ctrl+Shift+Z / Ctrl+Y): the differences between
+    // consecutive states, in memory only. Commits made while loading a model are not changes.
+    this.history = new KconfigHistory();
+    this.historyPaused = 0;
+    this.onUndoKey = (e) => this.handleUndoKey(e);
+    document.addEventListener("keydown", this.onUndoKey);
 
     // This tab's engine can be switched off elsewhere (the command palette's *Disable every KConfig
     // engine*, a tab being closed): follow it so the toolbar and the tree never claim an engine this
@@ -80,6 +94,8 @@ export class KconfigView {
   dispose() {
     if (this.unsubscribeEngine) this.unsubscribeEngine();
     if (this.unsubscribeEngineRequest) this.unsubscribeEngineRequest();
+    document.removeEventListener("keydown", this.onUndoKey);
+    this.history.clear("");
     this.unsubscribeEngine = null;
     this.unsubscribeEngineRequest = null;
     this.containerEl = null;
@@ -186,7 +202,7 @@ export class KconfigView {
 
     try {
       const presetsRes = await api.getKconfigPresets(this.currentVersion);
-      this.archPresets = (presetsRes && (presetsRes.targets || presetsRes.architectures)) || [];
+      this.archPresets = (presetsRes && presetsRes.targets) || [];
       if (!this.archPresets.some((p) => p.id === this.currentArch)) {
         const fallback = presetsRes?.default_arch || this.archPresets[0]?.id || DEFAULT_ARCH;
         if (this.archPresets.length) toast.info(`ARCH=${this.currentArch} does not exist in ${this.currentVersion}; using ${fallback}`);
@@ -290,7 +306,34 @@ export class KconfigView {
     }
 
     const saved = state.getKconfigProfile(this.profileKey);
-    if (saved && Object.keys(saved).length) {
+    // A re-render of the same configuration puts back the exact state the history ends on, so undo
+    // keeps working across tab switches; anything else (another ARCH, revision or toolchain, values
+    // changed from elsewhere) is another configuration and starts a new history
+    const historyKey = this.historyKey();
+    const base = this.history.base;
+    const resume = this.history.key === historyKey && Boolean(base?.engine)
+      && base.engineOn === this.engineActive && sameValues(base.raw, saved || {});
+    this.historyPaused++;
+    try {
+      await this.loadProfileValues(saved, resume ? base : null);
+    } finally {
+      this.historyPaused--;
+    }
+    if (resume) this.history.base = this.snapshot();
+    else this.history.clear(historyKey, this.snapshot());
+
+    this.resolvedProfileKey = this.profileKey;
+    this.renderTree();
+    if (this.selectedSymbol) this.inspectSymbol(this.selectedSymbol);
+  }
+
+  /** Load the saved values of this tab's profile into the freshly loaded model (or its defconfig). */
+  async loadProfileValues(saved, resumeFrom) {
+    if (resumeFrom) {
+      this.engine.restoreState(resumeFrom.engine);
+      this.rawValues = { ...saved };
+      this.commit();
+    } else if (saved && Object.keys(saved).length) {
       // Values carried over from another revision or ARCH (see `requestVersionSwitch`) are loaded
       // against this model; with the engine on, kconfig resolves them and drops what it does not know
       if (this.engineActive) {
@@ -309,10 +352,6 @@ export class KconfigView {
     } else {
       await this.loadDefconfig("", { quiet: true });
     }
-
-    this.resolvedProfileKey = this.profileKey;
-    this.renderTree();
-    if (this.selectedSymbol) this.inspectSymbol(this.selectedSymbol);
   }
 
   /**
@@ -409,6 +448,93 @@ export class KconfigView {
       configName: this.configName,
     });
     this.updateStatus();
+    this.recordHistory();
+  }
+
+  // ------------------------------------------------------------------ undo / redo
+  /** The model a history belongs to: its entries only make sense against the same one. */
+  historyKey() {
+    return `${this.currentVersion}|${this.currentArch}|${JSON.stringify(this.toolchain || {})}`;
+  }
+
+  /** The whole configuration state of this tab (values, engine state, engine on/off). */
+  snapshot() {
+    return {
+      raw: { ...(this.rawValues || {}) },
+      engine: this.engine.loaded ? this.engine.captureState() : null,
+      engineOn: this.engineActive,
+    };
+  }
+
+  /** Keep the difference from the previous state as an undo entry (nothing when nothing changed). */
+  recordHistory() {
+    if (this.historyPaused || !this.engine.loaded || !this.history.base) return;
+    this.history.record(this.snapshot());
+  }
+
+  /** Ctrl+Z / Cmd+Z undoes, Ctrl+Shift+Z / Ctrl+Y redoes, while this tab is the one shown. */
+  handleUndoKey(e) {
+    if (!(e.ctrlKey || e.metaKey) || e.altKey) return;
+    const key = e.key.toLowerCase();
+    const redo = (key === "z" && e.shiftKey) || (key === "y" && !e.shiftKey);
+    if (key !== "z" && !redo) return;
+    if (!this.containerEl || !this.containerEl.isConnected || !this.engine.loaded) return;
+    if (state.getActiveTab()?.id !== this.tabId) return;
+    // Text fields keep their own undo; a dialog (or the TUI) owns the keyboard while it is open
+    const t = e.target;
+    if (t && (t.isContentEditable || ["INPUT", "TEXTAREA", "SELECT"].includes(t.tagName))) return;
+    if (document.querySelector(".ki-modal-backdrop")) return;
+    e.preventDefault();
+    if (redo) this.redo();
+    else this.undo();
+  }
+
+  undo() {
+    const step = this.history.undo();
+    if (!step) {
+      toast.info("Nothing to undo in this configuration");
+      return;
+    }
+    this.restoreSnapshot(step.snap);
+    toast.info(`Undone: back to ${KconfigHistory.describe(step.entry, 1)}`);
+  }
+
+  redo() {
+    const step = this.history.redo();
+    if (!step) {
+      toast.info("Nothing to redo in this configuration");
+      return;
+    }
+    this.restoreSnapshot(step.snap);
+    toast.info(`Redone: ${KconfigHistory.describe(step.entry, 2)}`);
+  }
+
+  /**
+   * Put back a state of the history exactly as it was: the engine's own state is restored, not
+   * re-resolved, and the engine is switched on or off as it was then. This is the change the user
+   * asked for (the reverse of the last one), so it is applied without a confirmation (§5.0).
+   */
+  restoreSnapshot(snap) {
+    this.historyPaused++;
+    try {
+      if (snap.engine) this.engine.restoreState(snap.engine);
+      if (snap.engineOn !== this.engineActive) {
+        this.selfEngineChange = true;
+        try {
+          state.setKconfigEngineEnabled(this.tabId, snap.engineOn);
+        } finally {
+          this.selfEngineChange = false;
+        }
+      }
+      this.rawValues = { ...snap.raw };
+      this.commit();
+    } finally {
+      this.historyPaused--;
+    }
+    this.history.base = this.snapshot();
+    this.updateEngineButton();
+    this.renderTree();
+    if (this.selectedSymbol) this.inspectSymbol(this.selectedSymbol, this.selectedNodeId, { keepScroll: true });
   }
 
   /** Refresh tree and inspector after a change. */
@@ -439,11 +565,7 @@ export class KconfigView {
    * resolves this tab's values through kconfig; turning it off keeps them as they are (raw editing).
    */
   applyEngineState({ announce = true } = {}) {
-    const btn = this.containerEl?.querySelector("#btn-toggle-engine");
-    if (btn) {
-      btn.classList.toggle("active", this.engineActive);
-      btn.textContent = this.engineActive ? "✓ Engine Active" : "⚡ Enable Engine";
-    }
+    this.updateEngineButton();
     if (this.engineActive && this.engine.loaded) {
       const before = { ...(this.rawValues || {}) };
       const report = this.engine.loadAssignments(before);
@@ -460,9 +582,17 @@ export class KconfigView {
     } else {
       if (announce) toast.info("Engine off: values are edited without constraints (export will be unvalidated)");
       this.updateStatus();
+      this.recordHistory(); // no value changes, but undo switches the engine back on
       if (this.engine.loaded) this.renderTree();
     }
     if (this.selectedSymbol) this.inspectSymbol(this.selectedSymbol, this.selectedNodeId, { keepScroll: true });
+  }
+
+  updateEngineButton() {
+    const btn = this.containerEl?.querySelector("#btn-toggle-engine");
+    if (!btn) return;
+    btn.classList.toggle("active", this.engineActive);
+    btn.textContent = this.engineActive ? "✓ Engine Active" : "⚡ Enable Engine";
   }
 
   /**
@@ -1242,7 +1372,7 @@ export class KconfigView {
     const kconfigRefs = usage.kconfig_refs || [];
     const kbuild = (usage.kbuild || []).filter((r) => r.via === "condition" || r.kind === "directory");
     container.innerHTML = `
-      <div class="kconfig-muted">${usage.source_ref_count} reference(s) in ${usage.source_file_count} source file(s)${usage.source_ref_count > (usage.source_refs || []).length ? ` (first ${(usage.source_refs || []).length} shown)` : ""}</div>
+      <div class="kconfig-muted">${usage.source_ref_count}${usage.source_refs_truncated ? "+" : ""} reference(s) in ${usage.source_file_count} source file(s)${usage.source_ref_count > (usage.source_refs || []).length ? ` (first ${(usage.source_refs || []).length} shown)` : ""}</div>
       ${[...byFile.entries()].map(([file, refs]) => `
         <details class="kconfig-usage-file ${refs[0].other_arch ? "kconfig-other-arch" : ""}">
           <summary>${escapeHtml(file)} <span class="kconfig-muted">(${refs.length})</span></summary>
@@ -1279,7 +1409,7 @@ export class KconfigView {
     container.innerHTML = `<div class="kconfig-muted">Loading graph…</div>`;
     let graph;
     try {
-      graph = await api.getKconfigGraph(this.currentVersion, this.currentArch, symbolName, 1, this.toolchain);
+      graph = await api.getKconfigGraph(this.currentVersion, this.currentArch, symbolName, this.toolchain);
     } catch (err) {
       container.innerHTML = `<div class="kconfig-error">${escapeHtml(err.message)}</div>`;
       return;
@@ -1562,9 +1692,16 @@ export class KconfigView {
         .map((n) => ({ name: n, want: String(before[n] ?? ""), got: String(after[n] ?? "") }));
     }
     if (changes.length && !(await this.confirmModelChanges(changes))) return null;
-    this.engine.setModel(raw);
-    if (this.engineActive) this.engine.loadAssignments(before);
-    this.commit();
+    this.historyPaused++;
+    try {
+      this.engine.setModel(raw);
+      if (this.engineActive) this.engine.loadAssignments(before);
+      this.commit();
+    } finally {
+      this.historyPaused--;
+    }
+    // Entries of the previous model do not apply to this one
+    this.history.clear(this.historyKey(), this.snapshot());
     this.renderTree();
     if (this.selectedSymbol) this.inspectSymbol(this.selectedSymbol);
     return changes.length;

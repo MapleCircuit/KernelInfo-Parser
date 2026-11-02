@@ -5,7 +5,10 @@
 const DB_NAME = "KernelInfoIDE_v2";
 // Stores of cached API data (meta, tabs_state and nodemap_projects hold user state)
 const DATA_STORES = ["files", "symbols", "kconfigs", "maintainers", "commits", "tools", "mail"];
-const DB_VERSION = 4;
+// 5: data stores get an `updated_at` index, so entries can be pruned by age (pruneOlderThan)
+const DB_VERSION = 5;
+// How long an open blocked by another window's older connection may wait before the app runs uncached
+const BLOCKED_OPEN_TIMEOUT_MS = 3000;
 
 const REQUIRED_STORES = [
   { name: "meta", keyPath: "key" },
@@ -34,24 +37,54 @@ class LocalDatabase {
 
     return new Promise((resolve) => {
       const req = indexedDB.open(DB_NAME, DB_VERSION);
+      let settled = false;
+      const settle = (db) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(blockedTimer);
+        resolve(db);
+      };
+      let blockedTimer = null;
 
       req.onupgradeneeded = (e) => {
         const db = e.target.result;
+        const tx = e.target.transaction;
         REQUIRED_STORES.forEach((s) => {
-          if (!db.objectStoreNames.contains(s.name)) {
-            db.createObjectStore(s.name, { keyPath: s.keyPath });
+          const store = db.objectStoreNames.contains(s.name)
+            ? tx.objectStore(s.name)
+            : db.createObjectStore(s.name, { keyPath: s.keyPath });
+          if (DATA_STORES.includes(s.name) && !store.indexNames.contains("updated_at")) {
+            store.createIndex("updated_at", "updated_at");
           }
         });
       };
 
       req.onsuccess = (e) => {
-        this.db = e.target.result;
-        resolve(this.db);
+        const db = e.target.result;
+        // A newer page (new DB_VERSION) wants to upgrade: let go at once, or its open blocks until
+        // every window holding this connection is closed
+        db.onversionchange = () => {
+          db.close();
+          if (this.db === db) this.db = null;
+        };
+        if (settled) {
+          // Opened after the blocked fallback below: from now on the cache is usable
+          this.db = db;
+          return;
+        }
+        this.db = db;
+        settle(db);
+      };
+
+      // Another window still holds an older version open: run without cache rather than wait for it
+      req.onblocked = () => {
+        console.warn("[LocalDB] Upgrade blocked by another open window; continuing without the offline cache for now.");
+        blockedTimer = setTimeout(() => settle(null), BLOCKED_OPEN_TIMEOUT_MS);
       };
 
       req.onerror = (e) => {
         console.warn("[LocalDB] IndexedDB open failed, falling back to memory/local storage:", e);
-        resolve(null);
+        settle(null);
       };
     });
   }
@@ -172,6 +205,40 @@ class LocalDatabase {
         tx.oncomplete = tx.onerror = tx.onabort = () => resolve();
       } catch (e) {
         console.warn(`[LocalDB] Key scan failed for ${s}:`, e);
+        resolve();
+      }
+    })));
+    return count;
+  }
+
+  /**
+   * Delete the cached API entries written more than `maxAgeMs` ago (a key-only scan of each data
+   * store's `updated_at` index). Nothing else bounds the offline cache. Returns the count.
+   */
+  async pruneOlderThan(maxAgeMs) {
+    await this.ready;
+    if (!this.db) return 0;
+    const cutoff = Date.now() - maxAgeMs;
+    let count = 0;
+    await Promise.all(DATA_STORES.filter((s) => this.db.objectStoreNames.contains(s)).map((s) => new Promise((resolve) => {
+      try {
+        const tx = this.db.transaction(s, "readwrite");
+        const store = tx.objectStore(s);
+        if (!store.indexNames.contains("updated_at")) {
+          resolve();
+          return;
+        }
+        const req = store.index("updated_at").openKeyCursor(IDBKeyRange.upperBound(cutoff));
+        req.onsuccess = () => {
+          const cursor = req.result;
+          if (!cursor) return;
+          store.delete(cursor.primaryKey);
+          count++;
+          cursor.continue();
+        };
+        tx.oncomplete = tx.onerror = tx.onabort = () => resolve();
+      } catch (e) {
+        console.warn(`[LocalDB] Prune failed for ${s}:`, e);
         resolve();
       }
     })));

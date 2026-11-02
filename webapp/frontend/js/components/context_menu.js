@@ -13,12 +13,12 @@ import { showPersonModal } from "./person_modal.js";
 import { includeSymbolsPopover } from "./include_symbols_popover.js";
 import { showSymbolHistoryModal, showKconfigHistoryModal } from "./symbol_history_modal.js";
 import { showPatchModal } from "./patch_modal.js";
+import { showFileHistoryModal } from "./file_history_modal.js";
 import { openDefinition } from "../utils/definition_picker.js";
 
 class ContextMenu {
   constructor() {
     this.menuEl = null;
-    this.activeToken = null;
 
     document.addEventListener("click", () => this.hide());
     document.addEventListener("keydown", (e) => {
@@ -231,7 +231,6 @@ class ContextMenu {
    * Left-click token quick menu (backward compatible with existing virtual_editor clicks).
    */
   show(x, y, tokenData) {
-    this.activeToken = tokenData;
     const tokenName = tokenData.name || "";
     const isInclude = Boolean(
       tokenData.isInclude ||
@@ -501,36 +500,55 @@ class ContextMenu {
 
       // 2. Deep Analysis Tools (Context-adaptive: only show struct for structs, callgraph for functions)
       const typeId = token.type_id;
-      const isStruct = typeId === 6 || typeId === 7 || typeId === 8 || token.name?.startsWith("struct ") || token.name?.startsWith("union ") || (token.typeClass && token.typeClass.includes("ast-struct"));
-      if (isStruct) {
+      const cleanName = token.name ? token.name.replace(/^(struct|union)\s+/, "").trim() : "";
+      const lineText = context.lineText || "";
+      const isCFile = (ftype === 1) || Boolean(filePath && /\.(c|h|i)$/i.test(filePath));
+
+      const isStruct =
+        typeId === 27 || typeId === 28 || typeId === 29 || // C_struct, C_structdecl, C_structnotbind
+        typeId === 33 || typeId === 34 || typeId === 35 || // C_union, C_uniondecl, C_unionnotbind
+        token.name?.startsWith("struct ") ||
+        token.name?.startsWith("union ") ||
+        (token.typeClass && token.typeClass.includes("ast-struct")) ||
+        (cleanName && (cleanName.endsWith("_struct") || cleanName.endsWith("_union") || cleanName.endsWith("_s") || cleanName === "task_struct")) ||
+        (cleanName && lineText && new RegExp(`\\b(struct|union)\\s+${cleanName}\\b`).test(lineText));
+
+      const isFunction =
+        typeId === 20 || typeId === 21 || typeId === 22 || typeId === 63 || typeId === 147 || // C_functionproto, C_functionprotodecl, C_functionprotnotbind, C_CallExpr, C_SyscallDef
+        token.name?.endsWith("()") ||
+        (token.typeClass && (token.typeClass.includes("ast-func") || token.typeClass.includes("tok-function"))) ||
+        (cleanName && lineText && new RegExp(`\\b${cleanName}\\s*\\(`).test(lineText));
+
+      const showStructAction = isStruct || (isCFile && cleanName && /^[a-zA-Z_]\w*$/.test(cleanName) && !isFunction && !token.isInclude);
+
+      if (showStructAction && cleanName) {
         items.push({
-          label: `Show Struct Layout: ${token.name}`,
+          label: `Show Struct Layout: struct ${cleanName}`,
           icon: "📐",
           onClick: () => {
             state.openTab({
               type: "pahole",
-              title: `struct ${token.name}`,
-              structName: token.name,
+              title: `struct ${cleanName}`,
+              structName: cleanName,
               version: v
             });
-            toast.success(`Opened struct layout for ${token.name}`);
+            toast.success(`Opened struct layout for struct ${cleanName}`);
           }
         });
       }
 
-      const isFunction = typeId === 5 || typeId === 21 || typeId === 10 || typeId === 74 || (token.typeClass && (token.typeClass.includes("ast-function") || token.typeClass.includes("tok-function")));
-      if (isFunction) {
+      if (isFunction && cleanName) {
         items.push({
-          label: `Show Callgraph: ${token.name}()`,
+          label: `Show Callgraph: ${cleanName}()`,
           icon: "📊",
           onClick: () => {
             state.openTab({
               type: "callgraph",
-              title: `Callgraph: ${token.name}`,
-              functionName: token.name,
+              title: `Callgraph: ${cleanName}`,
+              functionName: cleanName,
               version: v
             });
-            toast.success(`Opened callgraph for ${token.name}`);
+            toast.success(`Opened callgraph for ${cleanName}`);
           }
         });
       }
@@ -725,12 +743,7 @@ class ContextMenu {
       items.push({
         label: "View File Git History",
         icon: "🕒",
-        onClick: () => state.openTab({
-          type: "commits",
-          title: `History: ${item.name}`,
-          filePath: path,
-          version: v
-        })
+        onClick: () => showFileHistoryModal(v, path)
       });
     }
 
@@ -955,21 +968,22 @@ class ContextMenu {
       });
 
       // Filter Struct Layout / Callgraph per Issue 4
-      const isStruct = node.type === "struct" || nodeName.startsWith("struct ");
+      const isStruct = node.type === "struct" || nodeName.startsWith("struct ") || nodeName.endsWith("_struct");
       const isFunction = node.type === "func" || node.type === "function" || nodeName.endsWith("()");
 
       if (isStruct || isFunction) {
         items.push({ separator: true });
       }
       if (isStruct) {
+        const cleanStruct = nodeName.replace(/^(struct|union)\s+/, "").trim();
         items.push({
-          label: `Show Struct Layout: ${nodeName}`,
+          label: `Show Struct Layout: struct ${cleanStruct}`,
           icon: "📐",
           onClick: () => {
             state.openTab({
               type: "pahole",
-              title: `struct ${nodeName.replace(/^struct\s+/, "")}`,
-              structName: nodeName.replace(/^struct\s+/, ""),
+              title: `struct ${cleanStruct}`,
+              structName: cleanStruct,
               version: v
             });
           }
@@ -1098,7 +1112,7 @@ class ContextMenu {
         commit_hash: commitHash,
         subject: blame?.subject || `Commit ${commitHash.substring(0, 7)}`,
         author_name: blame?.author_name || "Unknown",
-        date: blame?.date || ""
+        date: blame?.author_date || blame?.date || ""
       };
     }
 
@@ -1112,9 +1126,9 @@ class ContextMenu {
 
     const shortHash = commitHash.substring(0, 8);
     const author = commitDetail.author_name || blame?.author_name || "Unknown";
-    const dateStr = commitDetail.date || (blame?.date ? new Date(blame.date * 1000).toLocaleString() : "Unknown");
+    const dateStr = commitDetail.author_date_iso || commitDetail.author_date || commitDetail.date || (blame?.author_date || blame?.date ? new Date((blame.author_date || blame.date) * 1000).toLocaleString() : "Unknown");
     const subject = commitDetail.subject || blame?.subject || "No commit message";
-    const body = commitDetail.body || "";
+    const body = commitDetail.message || commitDetail.body || "";
     const files = commitDetail.touched_files || commitDetail.files || [];
 
     box.innerHTML = `
@@ -1144,7 +1158,7 @@ class ContextMenu {
 
       <div style="padding:12px 16px;display:flex;justify-content:space-between;align-items:center;background:var(--bg-secondary);">
         <div style="font-size:11px;color:var(--text-muted);">
-          ${files.length > 0 ? `${files.length} touched files` : `${filePath || ''}`}
+          ${files.length > 0 ? `${files.length} touched files` : `${this.escapeHtml(filePath || '')}`}
         </div>
         <div style="display:flex;gap:8px;">
           <button id="copy-hash-btn" class="code-btn" style="padding:4px 10px;font-size:11px;">Copy Hash</button>
@@ -1313,7 +1327,7 @@ class ContextMenu {
 
     modal.innerHTML = `
       <div class="ast-modal-header">
-        <span>AST Structure: ${name}</span>
+        <span>AST Structure: ${this.escapeHtml(name)}</span>
         <button id="close-ast-btn" style="color:var(--text-muted);font-size:16px;">&times;</button>
       </div>
       <div class="ast-tree-content" id="ast-tree-root"></div>
@@ -1367,16 +1381,6 @@ class ContextMenu {
       chevron.onclick = toggle;
       label.onclick = toggle;
     }
-  }
-
-  showIncludeSymbolsModal(name, incData, x, y, includeInfo) {
-    const info = includeInfo || { header: name, name: name, version: state.activeVersion() };
-    includeSymbolsPopover.show(
-      x || Math.max(16, window.innerWidth / 2 - 225),
-      y || Math.max(16, window.innerHeight / 4),
-      info,
-      incData
-    );
   }
 
   escapeHtml(str) {

@@ -6,10 +6,12 @@ import { localDB } from "./db.js";
 import { sessionManager } from "./session_manager.js";
 
 // A resolved configuration (defconfig loaded in the KConfig view) has far more than the default seeds
-export const MIN_CONFIG_SYMBOLS = 50;
+const MIN_CONFIG_SYMBOLS = 50;
 // ARCH (and what is known of its configuration) when no KConfig engine provides one
-export const DEFAULT_DEFINITION_ARCH = "x86_64";
+const DEFAULT_DEFINITION_ARCH = "x86_64";
 const DEFAULT_ARCH_BASELINE = { X86: "y", X86_64: "y", "64BIT": "y", X86_32: "n" };
+// Session saves are coalesced over this delay (see saveState)
+const SAVE_STATE_DELAY_MS = 300;
 
 /** Key a KConfig configuration is saved under: "version|ARCH", plus "|name" for a named copy. */
 export function kconfigProfileKey(version, arch, configName = "") {
@@ -120,6 +122,7 @@ class GlobalState {
     // Session Picker. The workspace on screen is left alone until a session is chosen.
     sessionManager.subscribe("session:taken_over", ({ sessionId }) => {
       if (sessionId !== this.currentSessionId) return;
+      this.cancelPendingSave();
       this.currentSessionId = null;
       this.currentSessionName = "";
       this.emit("session:taken_over", sessionId);
@@ -130,6 +133,17 @@ class GlobalState {
         this.emit("session:closed", sid);
       }
     });
+
+    // A pending save is written before the window goes away and before this window leaves its session
+    this._saveTimer = null;
+    sessionManager.beforeSessionChange = () => this.flushState();
+    sessionManager.discardPendingSave = () => this.cancelPendingSave();
+    if (typeof window !== "undefined") {
+      window.addEventListener("pagehide", () => this.flushState());
+      document.addEventListener("visibilitychange", () => {
+        if (document.visibilityState === "hidden") this.flushState();
+      });
+    }
 
     // Load persisted state if available
     this.loadState();
@@ -187,7 +201,6 @@ class GlobalState {
     this.selectedBranch = bStr;
     // The tags in hand are the previous branch's: nothing is scoped until the new ones are read
     if (this.branchTagsFor !== bStr) this.setBranchTags("", null);
-    this.emit("branch:selected", bStr);
     this.saveState();
     return true;
   }
@@ -257,7 +270,6 @@ class GlobalState {
     this.kconfigEngines = {};
     this.saveState();
     if (hadEngines) this.emit("kconfig:engine:changed", { tabId: "", active: false, engineTabIds: [] });
-    this.emit("repo:changed", name);
     this.emit("layout:changed", { splitMode: this.splitMode, panes: this.panes });
     this.emit("version:changed", this.currentVersion);
   }
@@ -306,10 +318,14 @@ class GlobalState {
     if (this.kconfigProfiles[fromKey]) {
       this.kconfigProfiles[toKey] = this.kconfigProfiles[fromKey];
       delete this.kconfigProfiles[fromKey];
+      sessionManager.updateSharedKconfigProfile(toKey, this.kconfigProfiles[toKey]);
+      sessionManager.updateSharedKconfigProfile(fromKey, null);
     }
     if (this.kconfigToolchains[fromKey]) {
       this.kconfigToolchains[toKey] = this.kconfigToolchains[fromKey];
       delete this.kconfigToolchains[fromKey];
+      sessionManager.updateSharedKconfigToolchain(toKey, this.kconfigToolchains[toKey]);
+      sessionManager.updateSharedKconfigToolchain(fromKey, null);
     }
     for (const engine of Object.values(this.kconfigEngines)) {
       if (engine.profileKey === fromKey) engine.profileKey = toKey;
@@ -486,7 +502,7 @@ class GlobalState {
   saveKconfigProfileValues(profileKey, values) {
     if (!profileKey) return;
     this.kconfigProfiles[profileKey] = bareAssignments(values);
-    sessionManager.saveSharedKconfigProfiles(this.kconfigProfiles);
+    sessionManager.updateSharedKconfigProfile(profileKey, this.kconfigProfiles[profileKey]);
     this.saveState();
   }
 
@@ -497,7 +513,7 @@ class GlobalState {
   setKconfigAssignments(tabId, profileKey, values, { version = "", arch = "", configName = "" } = {}) {
     if (profileKey) {
       this.kconfigProfiles[profileKey] = bareAssignments(values);
-      sessionManager.saveSharedKconfigProfiles(this.kconfigProfiles);
+      sessionManager.updateSharedKconfigProfile(profileKey, this.kconfigProfiles[profileKey]);
     }
     if (tabId && this.isKconfigEngineOwner(tabId)) {
       const assignments = normalizeAssignments(values);
@@ -528,13 +544,13 @@ class GlobalState {
   setKconfigToolchain(profileKey, toolchain) {
     if (toolchain && Object.keys(toolchain).length) this.kconfigToolchains[profileKey] = toolchain;
     else delete this.kconfigToolchains[profileKey];
-    sessionManager.saveSharedKconfigToolchains(this.kconfigToolchains);
+    sessionManager.updateSharedKconfigToolchain(profileKey, this.kconfigToolchains[profileKey] || null);
     this.saveState();
   }
 
   dropKconfigProfile(profileKey) {
     delete this.kconfigProfiles[profileKey];
-    sessionManager.saveSharedKconfigProfiles(this.kconfigProfiles);
+    sessionManager.updateSharedKconfigProfile(profileKey, null);
     this.saveState();
   }
 
@@ -697,7 +713,7 @@ class GlobalState {
    * `tab:state`, which `url_sync` reflects in the hash. It is not `tabs:changed`: that one
    * redraws the pane, which would throw away the very view that reported the change.
    */
-  updateTabState(tabId, patch = {}) {
+  updateTabState(tabId, patch = {}, options = {}) {
     const tab = this.findTab(tabId) || this.getActiveTab();
     if (!tab) return null;
     let changed = false;
@@ -714,7 +730,7 @@ class GlobalState {
     }
     if (!changed) return tab;
     this.saveState();
-    this.emit("tab:state", { tabId: tab.id, patch });
+    this.emit("tab:state", { tabId: tab.id, patch, replace: Boolean(options && options.replace) });
     return tab;
   }
 
@@ -738,6 +754,8 @@ class GlobalState {
             return t.title === tabData.title;
           }
           if (t.type === "diff") return true;
+          if (t.type === "pahole") return (t.structName || "") === (tabData.structName || "") && t.version === tabData.version;
+          if (t.type === "callgraph") return (t.functionName || "") === (tabData.functionName || "") && t.version === tabData.version;
           return t.title === tabData.title;
         });
 
@@ -746,8 +764,11 @@ class GlobalState {
       // Reopened onto something else (another symbol, message, commit, search...): the positions
       // it was left at belong to what it showed before (§5.28)
       const NAV_KEYS = ["cursorLine", "symbol", "threadId", "messageId", "query", "listMode", "filter", "commitId",
-        "versionA", "versionB", "mode", "statuses", "kconfigQuery", "renameSearches"];
-      if (NAV_KEYS.some((k) => tabData[k] !== undefined && JSON.stringify(tabData[k]) !== JSON.stringify(existing[k]))) {
+        "versionA", "versionB", "mode", "statuses", "kconfigQuery", "kconfigStatuses", "renameSearches",
+        "section", "secId", "person", "role", "sort", "structName", "functionName"];
+      // An empty value ("", 0, null) addresses the same thing as an absent one
+      const navValue = (x) => JSON.stringify(x === "" || x === 0 || x === null ? undefined : x);
+      if (NAV_KEYS.some((k) => tabData[k] !== undefined && navValue(tabData[k]) !== navValue(existing[k]))) {
         delete existing.scrollPositions;
       }
       if (tabData.cursorLine) {
@@ -758,6 +779,8 @@ class GlobalState {
       if ("diffMarks" in tabData) existing.diffMarks = tabData.diffMarks;
       if (tabData.symbol !== undefined) existing.symbol = tabData.symbol;
       if (tabData.title) existing.title = tabData.title;
+      if (tabData.structName !== undefined) existing.structName = tabData.structName;
+      if (tabData.functionName !== undefined) existing.functionName = tabData.functionName;
       if (tabData.threadId !== undefined) existing.threadId = tabData.threadId;
       if (tabData.messageId !== undefined) existing.messageId = tabData.messageId;
       if (tabData.query !== undefined) existing.query = tabData.query;
@@ -771,9 +794,17 @@ class GlobalState {
         if (tabData.listCollapsed) existing.listCollapsed = true;
         else delete existing.listCollapsed;
       }
+      if (tabData.type === "maintainers") {
+        // A Maintainers deep link: its section, selection and developer filters (empty = cleared)
+        for (const key of ["section", "secId", "person", "role", "sort"]) {
+          if (tabData[key] === undefined) continue;
+          if (tabData[key] === "" || tabData[key] === 0 || tabData[key] === null) delete existing[key];
+          else existing[key] = tabData[key];
+        }
+      }
       if (tabData.type === "diff") {
         // A Compare deep link: the revisions (when given), mode, chips, filters and rename searches
-        for (const key of ["versionA", "versionB", "mode", "statuses", "kconfigQuery", "renameSearches"]) {
+        for (const key of ["versionA", "versionB", "mode", "statuses", "kconfigQuery", "kconfigStatuses", "renameSearches"]) {
           if (tabData[key] !== undefined) existing[key] = tabData[key];
         }
       }
@@ -835,7 +866,7 @@ class GlobalState {
    * Everything that has to travel with a tab dragged out of this window (§5.24.4): the tab itself,
    * where it came from, and — for a KConfig tab — the engine it is running. The configuration's
    * values are not carried: they are shared across sessions under `profileKey`
-   * (`sessionManager.saveSharedKconfigProfiles`), so the window taking the tab reads them from there.
+   * (`sessionManager.updateSharedKconfigProfile`), so the window taking the tab reads them from there.
    */
   tabTransferPayload(tab, sourcePaneId) {
     if (!tab) return null;
@@ -928,6 +959,8 @@ class GlobalState {
 
   adoptSession(sessionData) {
     if (!sessionData) return;
+    // Whatever the session being left still has pending is written under its own id first
+    this.flushState();
     // The engines of the session this window is leaving stop running here, so the other windows
     // must forget them: a code tab following one of them would otherwise dim against a
     // configuration nobody resolves any more (§5.23.5).
@@ -976,11 +1009,19 @@ class GlobalState {
       ];
     }
 
-    // Shared profiles
+    // Configurations and toolchain profiles are shared by every session (one copy, see
+    // sessionManager.updateSharedKconfigProfile). Records saved before carried a copy of their own:
+    // keys the shared store lacks are moved into it.
     const sharedProfiles = sessionManager.getSharedKconfigProfiles();
-    this.kconfigProfiles = { ...sharedProfiles, ...(sessionData.kconfigProfiles || {}) };
     const sharedToolchains = sessionManager.getSharedKconfigToolchains();
-    this.kconfigToolchains = { ...sharedToolchains, ...(sessionData.kconfigToolchains || {}) };
+    for (const [key, values] of Object.entries(sessionData.kconfigProfiles || {})) {
+      if (!(key in sharedProfiles)) sharedProfiles[key] = sessionManager.updateSharedKconfigProfile(key, values) || values;
+    }
+    for (const [key, toolchain] of Object.entries(sessionData.kconfigToolchains || {})) {
+      if (!(key in sharedToolchains)) sharedToolchains[key] = sessionManager.updateSharedKconfigToolchain(key, toolchain) || toolchain;
+    }
+    this.kconfigProfiles = sharedProfiles;
+    this.kconfigToolchains = sharedToolchains;
 
     // Rehydrate engines for live Kconfig tabs
     const engineIds = Array.isArray(sessionData.kconfigEngineTabIds) ? sessionData.kconfigEngineTabIds : [];
@@ -1010,8 +1051,24 @@ class GlobalState {
     this.emit("version:changed", this.currentVersion);
   }
 
+  /**
+   * Persist the session. Calls are coalesced: every tab switch, tab-state update and scroll pause asks
+   * for a save, and one write per burst is enough. Pending writes are flushed before the window goes
+   * away (pagehide, hidden) and before another session is adopted (`flushState`).
+   */
   saveState() {
+    if (this._saveTimer) return;
+    this._saveTimer = setTimeout(() => this.flushState(), SAVE_STATE_DELAY_MS);
+  }
+
+  /** Write a pending save now (no-op when none is pending, or once persistence is suspended). */
+  flushState() {
+    if (!this._saveTimer || this._persistenceSuspended) return;
+    clearTimeout(this._saveTimer);
+    this._saveTimer = null;
     try {
+      // KConfig configurations and toolchains are not part of it: they are shared by every session
+      // and saved, one key at a time, when they change (sessionManager.updateSharedKconfigProfile)
       const stateObj = {
         name: this.currentSessionName,
         version: this.currentVersion,
@@ -1027,22 +1084,27 @@ class GlobalState {
         splitMode: this.splitMode,
         activePaneId: this.activePaneId,
         panes: this.panes,
-        kconfigProfiles: this.kconfigProfiles,
-        kconfigToolchains: this.kconfigToolchains
       };
 
       if (this.currentSessionId) {
         sessionManager.saveActiveSession(stateObj);
       }
-      sessionManager.saveSharedKconfigProfiles(this.kconfigProfiles);
-      sessionManager.saveSharedKconfigToolchains(this.kconfigToolchains);
-
-      // Keep legacy item as backup for non-session consumers
-      localStorage.setItem("kernel_ide_state", JSON.stringify(stateObj));
       localDB.set("tabs_state", "current_session", stateObj).catch(() => {});
     } catch (e) {
       console.warn("Failed to persist state:", e);
     }
+  }
+
+  /** Drop a pending save: the session now belongs to another window, which must not be overwritten. */
+  cancelPendingSave() {
+    clearTimeout(this._saveTimer);
+    this._saveTimer = null;
+  }
+
+  /** Stop writing state for the rest of this page's life (Full Local Reset wipes storage, then reloads). */
+  suspendPersistence() {
+    this.cancelPendingSave();
+    this._persistenceSuspended = true;
   }
 
   loadState() {

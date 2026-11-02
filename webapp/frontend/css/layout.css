@@ -157,67 +157,10 @@
   margin: 4px 0;
 }
 
-.header-center {
-  flex: 1;
-  max-width: 540px;
-}
-
-.global-search-bar {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  background: var(--bg-tertiary);
-  border: 1px solid var(--border-color);
-  border-radius: var(--radius-md);
-  padding: 4px 10px;
-  color: var(--text-muted);
-  cursor: pointer;
-  transition: var(--transition-fast);
-}
-
-.global-search-bar:hover {
-  border-color: var(--border-focus);
-  color: var(--text-primary);
-}
-
-.global-search-bar input {
-  flex: 1;
-  background: transparent;
-  border: none;
-  padding: 0;
-  color: var(--text-primary);
-  font-size: 12px;
-}
-
-.search-shortcut {
-  font-size: 10px;
-  background: var(--bg-secondary);
-  border: 1px solid var(--border-color);
-  padding: 1px 5px;
-  border-radius: 3px;
-  color: var(--text-muted);
-}
-
 .header-right {
   display: flex;
   align-items: center;
   gap: 8px;
-}
-
-.header-btn {
-  padding: 5px 9px;
-  border-radius: var(--radius-sm);
-  color: var(--text-secondary);
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  font-size: 12px;
-  transition: var(--transition-fast);
-}
-
-.header-btn:hover {
-  background: var(--bg-hover);
-  color: var(--text-primary);
 }
 
 .offline-badge {
@@ -341,7 +284,7 @@
   justify-content: space-between;
 }
 
-.sidebar-header > span {
+.sidebar-header>span {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -424,7 +367,7 @@
   color: var(--text-muted);
 }
 
-.tree-item.expanded > .chevron {
+.tree-item.expanded>.chevron {
   transform: rotate(90deg);
 }
 
@@ -486,12 +429,12 @@
   flex-shrink: 0;
 }
 
-.split-horizontal > .pane-divider {
+.split-horizontal>.pane-divider {
   width: 5px;
   cursor: col-resize;
 }
 
-.split-vertical > .pane-divider {
+.split-vertical>.pane-divider {
   height: 5px;
   cursor: row-resize;
 }
@@ -529,6 +472,7 @@
   from {
     transform: rotate(0deg);
   }
+
   to {
     transform: rotate(360deg);
   }
@@ -875,7 +819,7 @@
   left: 50%;
   bottom: 20px;
   transform: translateX(-50%);
-  z-index: 10000;
+  z-index: 20000;
   display: flex;
   align-items: center;
   gap: 10px;

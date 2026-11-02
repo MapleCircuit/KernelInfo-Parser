@@ -1,15 +1,17 @@
-"""webapp/backend/services/git_service.py - Throttled Git Blame, Commits & Format-Patch."""
+"""webapp/backend/services/git_service.py - Git Blame, Commits, Timelines & Format-Patch."""
 from __future__ import annotations
-import asyncio
 import logging
 import re
 import subprocess
+import urllib.parse
 from webapp.backend.config import get_repo_dir
 from functools import lru_cache
 from typing import Any
 from fastapi import HTTPException
 from webapp.backend.database.pool import get_db_cursor
 from webapp.backend.database.helpers import (
+    commit_prefix_range,
+    get_active_network_id,
     hash_hex,
     safe_decode,
     get_version_info,
@@ -20,9 +22,6 @@ from webapp.backend.security.jail import resolve_and_verify_repo_path
 from webapp.backend.services.mailing_list_service import LORE_BASE_URL
 
 logger = logging.getLogger(__name__)
-
-_GIT_SEMAPHORE = asyncio.Semaphore(8)
-
 
 _HEX_REF = re.compile(r"[0-9a-f]{4,40}")
 _EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
@@ -196,7 +195,7 @@ class GitService:
         return proc.stdout, proc.stderr, proc.returncode
 
     def get_blame(self, version_name: str, file_path: str) -> dict[str, Any]:
-        """Retrieve line-by-line git blame annotations with LRU caching."""
+        """Line-by-line `git blame` of a file at a revision: the commit, author, date and subject of each line."""
         import urllib.parse
         clean_file_path = urllib.parse.unquote(str(file_path).strip()).strip("/")
         target_path = resolve_and_verify_repo_path(clean_file_path)
@@ -208,62 +207,51 @@ class GitService:
         rev = safe_rev(vname or str(version_name).strip(), "version")
 
         try:
-            stdout, stderr, code = self.run_git(["blame", "--line-porcelain", rev, "--", rel_path])
-            if code != 0:
-                raise HTTPException(status_code=404, detail=f"Git blame failed: {stderr.strip() or 'Unknown error'}")
-
-            lines = stdout.splitlines()
-            entries: list[dict[str, Any]] = []
-            curr: dict[str, Any] = {}
-            for line in lines:
-                if line.startswith("\t"):
-                    curr["line_content"] = line[1:]
-                    final_l = curr.get("final_line", 1)
-                    orig_l = curr.get("orig_line", 1)
-                    author = curr.get("author", "Unknown")
-                    author_mail = curr.get("author_mail", "")
-                    author_time = curr.get("author_time", 0)
-                    summary = curr.get("summary", "")
-
-                    curr["line"] = final_l
-                    curr["final_line"] = final_l
-                    curr["orig_line"] = orig_l
-                    curr["author_name"] = author
-                    curr["author"] = author
-                    curr["author_email"] = author_mail
-                    curr["author_mail"] = author_mail
-                    curr["date"] = author_time
-                    curr["author_time"] = author_time
-                    curr["subject"] = summary
-                    curr["summary"] = summary
-
-                    entries.append(curr)
-                    curr = {}
-                elif not curr:
-                    parts = line.split(" ", 3)
-                    curr["commit_hash"] = parts[0]
-                    curr["orig_line"] = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 1
-                    curr["final_line"] = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 1
-                elif line.startswith("author "):
-                    curr["author"] = line[7:]
-                elif line.startswith("author-mail "):
-                    curr["author_mail"] = line[12:].strip("<>")
-                elif line.startswith("author-time "):
-                    curr["author_time"] = int(line[12:])
-                elif line.startswith("summary "):
-                    curr["summary"] = line[8:]
-
-            return {
-                "version": vname or version_name,
-                "vid": vid,
-                "path": rel_path,
-                "file_path": rel_path,
-                "total_lines": len(entries),
-                "lines": entries,
-                "blame": entries,
-            }
+            # --porcelain names each commit's author and summary once, on its first line only
+            stdout, stderr, code = self.run_git(["blame", "--porcelain", rev, "--", rel_path])
         except subprocess.TimeoutExpired:
-            raise HTTPException(status_code=504, detail="Git blame operation timed out.")
+            raise HTTPException(status_code=504, detail="Git blame operation timed out.") from None
+        if code != 0:
+            raise HTTPException(status_code=404, detail=f"Git blame failed: {stderr.strip() or 'Unknown error'}")
+
+        commits: dict[str, dict[str, Any]] = {}
+        entries: list[dict[str, Any]] = []
+        info: dict[str, Any] | None = None
+        sha = ""
+        final_line = 1
+        for line in stdout.splitlines():
+            if line.startswith("\t"):
+                entries.append({
+                    "line": final_line,
+                    "commit_hash": sha,
+                    "author_name": info.get("author", "Unknown") if info else "Unknown",
+                    "author_email": info.get("author_mail", "") if info else "",
+                    "date": info.get("author_time", 0) if info else 0,
+                    "subject": info.get("summary", "") if info else "",
+                })
+                info = None
+                continue
+            if info is None:
+                # Line header: "<sha> <orig_line> <final_line> [<lines in group>]"
+                parts = line.split(" ")
+                sha = parts[0]
+                final_line = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 1
+                info = commits.setdefault(sha, {})
+            elif line.startswith("author "):
+                info["author"] = line[7:]
+            elif line.startswith("author-mail "):
+                info["author_mail"] = line[12:].strip("<>")
+            elif line.startswith("author-time "):
+                info["author_time"] = int(line[12:]) if line[12:].isdigit() else 0
+            elif line.startswith("summary "):
+                info["summary"] = line[8:]
+
+        return {
+            "version": vname or version_name,
+            "vid": vid,
+            "path": rel_path,
+            "lines": entries,
+        }
 
     def get_file_last_changed(self, version_name: str, file_path: str) -> dict[str, Any] | None:
         """Retrieve the most recent git commit modifying file_path up to version_name."""
@@ -297,7 +285,6 @@ class GitService:
         return {
             "version": str(version_name).strip(),
             "path": rel_path,
-            "total_commits": len(commits),
             "last_changed": last_changed,
             "commits": commits,
         }
@@ -368,17 +355,18 @@ class GitService:
             "formatted_patch": formatted,
         }
 
-    def get_commits(self, version_name: str, page: int = 1, limit: int = 50, query: str = "", offset: int | None = None) -> dict[str, Any]:
-        """Retrieve paginated commit history from m_commit."""
-        # Bound here too: this method is also exported as a programmatic delegate (webapp/main.py),
-        # and limit/offset are bound straight into SQL LIMIT/OFFSET
+    def get_commits(self, version_name: str, page: int = 1, limit: int = 50, query: str = "") -> dict[str, Any]:
+        """Search the indexed commits of the request's repository (its Git network), newest first."""
+        # limit and the page's offset are bound straight into SQL LIMIT/OFFSET
         limit = max(1, min(int(limit), MAX_COMMIT_PAGE))
-        off = offset if offset is not None else (max(1, page) - 1) * limit
-        off = max(0, min(int(off), MAX_COMMIT_OFFSET))
+        off = max(0, min((max(1, int(page)) - 1) * limit, MAX_COMMIT_OFFSET))
         with get_db_cursor() as cursor:
             vid, vname = get_version_info(cursor, version_name)
             if vid is None:
                 raise HTTPException(status_code=404, detail=f"Version '{version_name}' not found.")
+            network_id = get_active_network_id(cursor)
+            if network_id is None:
+                return {"version": vname, "page": page, "limit": limit, "offset": off, "total": 0, "commits": []}
 
             sql = """
                 SELECT c.commit_id, c.commit_hash, c.author_date, c.subject,
@@ -386,9 +374,9 @@ class GitService:
                        (SELECT COUNT(*) FROM m_commit_file cf WHERE cf.commit_id = c.commit_id) AS files_count
                 FROM m_commit c
                 JOIN m_maintainer_person p ON c.author_id = p.person_id
-                WHERE c.commit_id > 0
+                WHERE c.commit_id > 0 AND c.network_id = %s
             """
-            params: list[Any] = []
+            params: list[Any] = [network_id]
             if query:
                 # commit_hash is BINARY(20): match hex prefixes against its HEX() rendering.
                 # Wildcards are escaped: an unescaped "%" makes all three LIKEs match every row.
@@ -423,15 +411,15 @@ class GitService:
                 "limit": limit,
                 "offset": off,
                 "total": len(commits),
-                "total_count": len(commits),
                 "commits": commits,
             }
 
-    def get_commit_detail(self, version_name: str, commit_id: int | str) -> dict[str, Any]:
+    def get_commit_detail(self, commit_id: int | str) -> dict[str, Any]:
         """Retrieve full commit metadata, modified files, and trailers."""
         with get_db_cursor() as cursor:
             if str(commit_id).isdigit():
-                cursor.execute("SELECT * FROM m_commit WHERE commit_id = %s LIMIT 1;", (int(commit_id),))
+                cursor.execute("SELECT * FROM m_commit WHERE commit_id = %s AND commit_id > 0 LIMIT 1;", (int(commit_id),))
+                c_row = cursor.fetchone()
             else:
                 # commit_hash is BINARY(20); anything that is not hex cannot name a commit, and
                 # encoding it to latin-1 would raise on a non-latin-1 character
@@ -439,17 +427,37 @@ class GitService:
                 if not _HEX_REF.fullmatch(cid_str.lower()):
                     raise HTTPException(status_code=400, detail="A commit id or hash (4-40 hex digits) must be specified.")
                 if len(cid_str) == 40:
-                    c_bytes = bytes.fromhex(cid_str)
-                    cursor.execute("SELECT * FROM m_commit WHERE commit_hash = %s LIMIT 1;", (c_bytes,))
+                    cursor.execute("SELECT * FROM m_commit WHERE commit_hash = %s LIMIT 1;", (bytes.fromhex(cid_str),))
+                    c_row = cursor.fetchone()
                 else:
-                    # Short prefix: match against the hex rendering
-                    cursor.execute("SELECT * FROM m_commit WHERE HEX(commit_hash) LIKE %s LIMIT 1;",
-                                   (f"{cid_str.upper()}%",))
-            c_row = cursor.fetchone()
+                    # Short prefix: a range over the binary hash (every digit counts); two matches are ambiguous
+                    lo, hi = commit_prefix_range(cid_str)
+                    cursor.execute(
+                        f"SELECT * FROM m_commit WHERE commit_hash >= %s{' AND commit_hash < %s' if hi else ''} LIMIT 2;",
+                        (lo, hi) if hi else (lo,),
+                    )
+                    rows = cursor.fetchall()
+                    if len(rows) > 1:
+                        raise HTTPException(status_code=400, detail=f"Commit prefix '{cid_str}' is ambiguous; give more digits.")
+                    c_row = rows[0] if rows else None
             if not c_row:
                 raise HTTPException(status_code=404, detail=f"Commit '{commit_id}' not found.")
 
             cid = c_row["commit_id"]
+
+            # Parents from the ingested DAG (a merge has several; a commit without rows is a root, or
+            # its parents were not ingested: _fill_missing_commit_files then asks Git if it must)
+            cursor.execute(
+                """
+                SELECT c.commit_hash
+                FROM m_commit_parent p
+                JOIN m_commit c ON c.commit_id = p.parent_commit_id
+                WHERE p.commit_id = %s
+                ORDER BY p.parent_idx ASC;
+                """,
+                (cid,),
+            )
+            parents = [format_commit_hash(r["commit_hash"]) for r in cursor.fetchall()]
 
             # Author info
             cursor.execute(
@@ -467,26 +475,6 @@ class GitService:
                 "name": safe_decode(p_row["name"]) if p_row else "Unknown",
                 "email": safe_decode(p_row["email"]) if p_row else "",
             }
-
-            # Committer info
-            committer_dict = author_dict
-            if c_row.get("committer_id"):
-                cursor.execute(
-                    """
-                    SELECT p.person_id, p.name, p.email
-                    FROM m_maintainer_person p
-                    WHERE p.person_id = %s
-                    LIMIT 1;
-                    """,
-                    (c_row["committer_id"],),
-                )
-                cm_row = cursor.fetchone()
-                if cm_row:
-                    committer_dict = {
-                        "person_id": c_row["committer_id"],
-                        "name": safe_decode(cm_row["name"]),
-                        "email": safe_decode(cm_row["email"]),
-                    }
 
             # Modified files
             cursor.execute(
@@ -555,12 +543,6 @@ class GitService:
             contributors = list(contributors_map.values())
 
             # Linked mailing list emails from m_commit_email
-            relation_names = {
-                1: "Patch",
-                2: "Cover Letter",
-                3: "Sibling Patch",
-                4: "Pull Request",
-            }
             tier_names = {
                 1: "Authoritative Link / Message-ID",
                 2: "Exact Patch-ID",
@@ -589,7 +571,6 @@ class GitService:
                         "message_id": mid,
                         "thread_id": erow["thread_id"],
                         "relation_type": rel_type,
-                        "relation_name": relation_names.get(rel_type, "Email"),
                         "match_tier": tier,
                         "match_tier_name": tier_names.get(tier, "Matched"),
                         "patch_version": erow["patch_version"],
@@ -602,7 +583,7 @@ class GitService:
 
             # LKML thread URL on the self-hosted public-inbox mirror
             subj = safe_decode(c_row["subject"])
-            lore_url = linked_emails[0]["lore_url"] if linked_emails else f"{LORE_BASE_URL}?q={subj}"
+            lore_url = linked_emails[0]["lore_url"] if linked_emails else f"{LORE_BASE_URL}?q={urllib.parse.quote_plus(subj or '')}"
 
             detail = {
                 "commit_id": cid,
@@ -612,15 +593,11 @@ class GitService:
                 "author": author_dict,
                 "author_name": author_dict["name"],
                 "author_email": author_dict["email"],
-                "committer": committer_dict,
-                "committer_name": committer_dict["name"],
-                "committer_email": committer_dict["email"],
                 "author_date": c_row["author_date"],
-                "committer_date": c_row["committer_date"],
                 "files": files,
                 "files_source": "db" if files else "none",
                 "files_truncated": False,
-                "is_merge": False,
+                "is_merge": len(parents) > 1,
                 "trailers": trailers,
                 "contributors": contributors,
                 "lore_url": lore_url,
@@ -630,22 +607,24 @@ class GitService:
         # `git log -p` suppresses merge diffs, so the parser stages no m_commit_file rows for a
         # merge: its first-parent delta is resolved from Git on demand, which keeps "Modified
         # Files" in agreement with the "Show changes" panel (which diffs against the first parent).
-        self._fill_missing_commit_files(detail)
+        self._fill_missing_commit_files(detail, parents)
         return detail
 
-    def _fill_missing_commit_files(self, detail: dict[str, Any]) -> None:
-        """Resolve a commit's first-parent file list from Git when no rows were staged for it."""
+    def _fill_missing_commit_files(self, detail: dict[str, Any], parents: list[str]) -> None:
+        """Resolve a commit's first-parent file list from Git when no rows were staged for it.
+        `parents` are the commit's parents from m_commit_parent (Git is asked only when there are none)."""
+        if detail["files"]:
+            return
         sha = detail.get("commit_hash") or ""
         if not _HEX_REF.fullmatch(sha.lower()):
             return
         try:
-            out, _, rc = self.run_git(["rev-list", "--parents", "-n1", sha], timeout=10)
-            if rc != 0:
-                return
-            parents = out.split()[1:]
-            detail["is_merge"] = len(parents) > 1
-            if detail["files"]:
-                return
+            if not parents:
+                out, _, rc = self.run_git(["rev-list", "--parents", "-n1", sha], timeout=10)
+                if rc != 0:
+                    return
+                parents = out.split()[1:]
+                detail["is_merge"] = len(parents) > 1
             base = parents[0] if parents else _EMPTY_TREE
             out, _, rc = self.run_git(
                 ["-c", "core.quotePath=false", "diff", "--no-color", "--no-ext-diff",
@@ -672,9 +651,9 @@ class GitService:
             detail["files"] = files
             detail["files_source"] = "git"
 
-    def resolve_commit_mail(self, version_name: str, commit_id_or_hash: str) -> dict[str, Any]:
+    def resolve_commit_mail(self, commit_id_or_hash: str) -> dict[str, Any]:
         """On-demand resolution of a commit against the mailing list archive."""
-        detail = self.get_commit_detail(version_name, commit_id_or_hash)
+        detail = self.get_commit_detail(commit_id_or_hash)
         if detail.get("linked_emails"):
             return {"resolved": True, "linked_emails": detail["linked_emails"], "cached": True}
 
@@ -687,19 +666,28 @@ class GitService:
 
         patch_id = None
         try:
-            p_show = subprocess.run(["git", "-C", repo_dir, "show", "--format=", c_hash], capture_output=True, check=False)
-            if p_show.returncode == 0 and p_show.stdout:
-                p_patchid = subprocess.run(["git", "patch-id", "--stable"], input=p_show.stdout, capture_output=True, check=False)
+            # Bounded like get_commit_diff(): a tree-import commit diffs to hundreds of MB. A truncated
+            # patch would give another patch id, so none is computed for it.
+            with subprocess.Popen(["git", "-C", repo_dir, "show", "--format=", c_hash],
+                                  stdout=subprocess.PIPE, stderr=subprocess.DEVNULL) as show:
+                patch = show.stdout.read(MAX_COMMIT_DIFF_BYTES + 1)
+                if len(patch) > MAX_COMMIT_DIFF_BYTES:
+                    show.kill()
+                    patch = b""
+                show_rc = show.wait(timeout=30)
+            if show_rc == 0 and patch:
+                p_patchid = subprocess.run(["git", "patch-id", "--stable"], input=patch, capture_output=True, check=False, timeout=30)
                 if p_patchid.returncode == 0 and p_patchid.stdout:
                     parts = p_patchid.stdout.decode("ascii", errors="replace").split()
                     if parts:
                         patch_id = parts[0]
-        except Exception:
-            pass
+        except (OSError, subprocess.SubprocessError) as exc:
+            logger.debug("patch-id of %s not computed: %s", c_hash, exc)
 
         blob_hashes: list[str] = []
         try:
-            diff_res = subprocess.run(["git", "-C", repo_dir, "diff-tree", "-r", "--no-commit-id", c_hash], capture_output=True, text=True, check=False)
+            diff_res = subprocess.run(["git", "-C", repo_dir, "diff-tree", "-r", "--no-commit-id", c_hash],
+                                      capture_output=True, text=True, check=False, timeout=30)
             if diff_res.returncode == 0:
                 for line in diff_res.stdout.splitlines():
                     parts = line.split()
@@ -736,7 +724,6 @@ class GitService:
                     "message_id": mid,
                     "thread_id": ctx.patch_email.tid,
                     "relation_type": int(MLRelationType.Patch),
-                    "relation_name": "Patch",
                     "match_tier": int(ctx.matched_tier),
                     "match_tier_name": "Live Resolved",
                     "patch_version": int(ctx.patch_version),
@@ -750,7 +737,6 @@ class GitService:
                     "message_id": c_mid,
                     "thread_id": ctx.cover_letter.tid,
                     "relation_type": int(MLRelationType.CoverLetter),
-                    "relation_name": "Cover Letter",
                     "match_tier": int(ctx.matched_tier),
                     "match_tier_name": "Live Resolved",
                     "patch_version": int(ctx.patch_version),
@@ -764,7 +750,6 @@ class GitService:
                     "message_id": pr_mid,
                     "thread_id": ctx.pull_request.tid,
                     "relation_type": int(MLRelationType.PullRequest),
-                    "relation_name": "Pull Request",
                     "match_tier": int(MLMatchTier.PullRequest),
                     "match_tier_name": "Pull Request",
                     "patch_version": 1,
@@ -824,106 +809,6 @@ class GitService:
             "truncated": truncated or any(f["truncated"] for f in files),
         }
 
-    def get_file_blame(self, version_name: str, fid_or_path: int | str) -> dict[str, Any]:
-        """Retrieve tag-by-tag commit provenance and git blame annotations."""
-        with get_db_cursor() as cursor:
-            vid, vname = get_version_info(cursor, version_name)
-            blob_id = 0
-            file_path = ""
-            target_id = 0
-            if isinstance(fid_or_path, int) or str(fid_or_path).isdigit():
-                target_id = int(fid_or_path)
-                cursor.execute(
-                    """
-                    SELECT fn.fname, bcp.blob_id
-                    FROM m_bridge_checkpoint bcp
-                    JOIN m_file_name fn ON bcp.fnid = fn.fnid
-                    WHERE bcp.blob_id = %s
-                    LIMIT 1;
-                    """,
-                    (target_id,),
-                )
-                r = cursor.fetchone()
-                if r:
-                    file_path = safe_decode(r["fname"])
-                    blob_id = r["blob_id"]
-                else:
-                    cursor.execute(
-                        """
-                        SELECT fname FROM m_file_name WHERE fnid = %s LIMIT 1;
-                        """,
-                        (target_id,),
-                    )
-                    r = cursor.fetchone()
-                    if r:
-                        file_path = safe_decode(r["fname"])
-                        blob_id = target_id
-                    else:
-                        blob_id = target_id
-            else:
-                file_path = str(fid_or_path)
-                cursor.execute(
-                    """
-                    SELECT bcp.blob_id
-                    FROM m_file_name fn
-                    JOIN m_bridge_checkpoint bcp ON fn.fnid = bcp.fnid
-                    WHERE fn.fname = %s
-                    LIMIT 1;
-                    """,
-                    (file_path,),
-                )
-                r = cursor.fetchone()
-                blob_id = r["blob_id"] if r else 0
-
-            # Tags blame
-            cursor.execute(
-                """
-                SELECT bt.tag_id, bt.line_s, bt.line_e, bt.char_s, bt.char_e
-                FROM m_bridge_tag bt
-                WHERE bt.blob_id = %s
-                ORDER BY bt.line_s ASC
-                LIMIT 200;
-                """,
-                (blob_id,),
-            )
-            tags = [
-                {
-                    "tag_id": r["tag_id"],
-                    "line_s": r["line_s"],
-                    "line_e": r["line_e"],
-                    "char_s": r["char_s"],
-                    "char_e": r["char_e"],
-                    "code": "",
-                    "commits_count": 0,
-                    "commits": [],
-                }
-                for r in cursor.fetchall()
-            ]
-
-        result: dict[str, Any] = {
-            "fid": target_id if (isinstance(fid_or_path, int) or str(fid_or_path).isdigit()) else blob_id,
-            "blob_id": blob_id,
-            "version": vname,
-            "path": file_path,
-            "total_tags": len(tags),
-            "tags": tags,
-            "total_lines": 0,
-            "lines": [],
-            "blame": [],
-        }
-
-        if file_path:
-            try:
-                b_res = self.get_blame(vname or version_name, file_path)
-                result["total_lines"] = b_res.get("total_lines", 0)
-                result["lines"] = b_res.get("lines", [])
-                result["blame"] = b_res.get("blame", [])
-            except Exception as e:
-                logger.debug("Could not attach git blame to get_file_blame: %s", e)
-
-        return result
-
-
     def get_commit_timeline(
         self,
         version_name: str,
@@ -933,6 +818,8 @@ class GitService:
     ) -> dict[str, Any]:
         """Retrieve structured commit timeline starting from the version tag anchor, supporting past and future exploration."""
         import datetime
+
+        limit = max(1, min(int(limit or 100), 250))
 
         def _format_date(ts: int) -> str:
             try:
@@ -944,19 +831,22 @@ class GitService:
             vid, vname = get_version_info(cursor, version_name)
             if vid is None:
                 vid, vname = get_version_info(cursor, "v3.0")
+            # Commit ids are global: every query below stays inside the repository's Git network
+            network_id = get_active_network_id(cursor)
+            if network_id is None:
+                network_id = -1
 
             anchor_row = None
             if vid and vid > 0:
                 cursor.execute(
                     """
-                    SELECT c.commit_id, c.commit_hash, c.author_date, c.subject,
-                           p.person_id AS author_id, p.name AS author_name, p.email AS author_email
+                    SELECT c.commit_id
                     FROM m_commit c
                     JOIN m_maintainer_person p ON c.author_id = p.person_id
-                    WHERE c.commit_id = %s
+                    WHERE c.commit_id = %s AND c.network_id = %s
                     LIMIT 1;
                     """,
-                    (vid,),
+                    (vid, network_id),
                 )
                 anchor_row = cursor.fetchone()
 
@@ -964,14 +854,14 @@ class GitService:
                 # Find closest commit or latest tag commit
                 cursor.execute(
                     """
-                    SELECT c.commit_id, c.commit_hash, c.author_date, c.subject,
-                           p.person_id AS author_id, p.name AS author_name, p.email AS author_email
+                    SELECT c.commit_id
                     FROM m_commit c
                     JOIN m_maintainer_person p ON c.author_id = p.person_id
-                    WHERE c.commit_id > 0
+                    WHERE c.commit_id > 0 AND c.network_id = %s
                     ORDER BY c.commit_id DESC
                     LIMIT 1;
-                    """
+                    """,
+                    (network_id,),
                 )
                 anchor_row = cursor.fetchone()
 
@@ -979,17 +869,10 @@ class GitService:
                 return {
                     "version": version_name,
                     "direction": direction,
-                    "anchor_commit": {},
-                    "total_commits": 0,
-                    "displayed_commits": 0,
-                    "top_contributors": [],
                     "timeline": [],
                 }
 
             anchor_id = anchor_row["commit_id"]
-            anchor_hash = format_commit_hash(anchor_row["commit_hash"])
-            anchor_subject = safe_decode(anchor_row["subject"])
-            anchor_author = safe_decode(anchor_row["author_name"])
 
             raw_rows: list[dict[str, Any]] = []
             dir_mode = (direction or "past").lower().strip()
@@ -1003,16 +886,16 @@ class GitService:
                            (SELECT COUNT(*) FROM m_commit_file cf WHERE cf.commit_id = c.commit_id) AS files_count
                     FROM m_commit c
                     JOIN m_maintainer_person p ON c.author_id = p.person_id
-                    WHERE c.commit_id >= %s
+                    WHERE c.commit_id >= %s AND c.network_id = %s
                     ORDER BY c.commit_id ASC
                     LIMIT %s;
                     """,
-                    (start_id, max(1, min(limit, 250))),
+                    (start_id, network_id, limit),
                 )
                 raw_rows = cursor.fetchall()
             elif dir_mode == "around":
                 future_limit = max(5, limit // 4)
-                past_limit = limit - future_limit
+                past_limit = max(1, limit - future_limit)
                 cursor.execute(
                     """
                     SELECT c.commit_id, c.commit_hash, c.author_date, c.subject,
@@ -1020,11 +903,11 @@ class GitService:
                            (SELECT COUNT(*) FROM m_commit_file cf WHERE cf.commit_id = c.commit_id) AS files_count
                     FROM m_commit c
                     JOIN m_maintainer_person p ON c.author_id = p.person_id
-                    WHERE c.commit_id > %s
+                    WHERE c.commit_id > %s AND c.network_id = %s
                     ORDER BY c.commit_id ASC
                     LIMIT %s;
                     """,
-                    (anchor_id, future_limit),
+                    (anchor_id, network_id, future_limit),
                 )
                 future_rows = list(reversed(cursor.fetchall()))
                 cursor.execute(
@@ -1034,11 +917,11 @@ class GitService:
                            (SELECT COUNT(*) FROM m_commit_file cf WHERE cf.commit_id = c.commit_id) AS files_count
                     FROM m_commit c
                     JOIN m_maintainer_person p ON c.author_id = p.person_id
-                    WHERE c.commit_id <= %s
+                    WHERE c.commit_id <= %s AND c.network_id = %s
                     ORDER BY c.commit_id DESC
                     LIMIT %s;
                     """,
-                    (anchor_id, past_limit),
+                    (anchor_id, network_id, past_limit),
                 )
                 past_rows = cursor.fetchall()
                 raw_rows = future_rows + past_rows
@@ -1051,27 +934,20 @@ class GitService:
                            (SELECT COUNT(*) FROM m_commit_file cf WHERE cf.commit_id = c.commit_id) AS files_count
                     FROM m_commit c
                     JOIN m_maintainer_person p ON c.author_id = p.person_id
-                    WHERE c.commit_id <= %s
+                    WHERE c.commit_id <= %s AND c.network_id = %s
                     ORDER BY c.commit_id DESC
                     LIMIT %s;
                     """,
-                    (start_id, max(1, min(limit, 250))),
+                    (start_id, network_id, limit),
                 )
                 raw_rows = cursor.fetchall()
 
             commits = []
-            author_counts: dict[str, dict[str, Any]] = {}
             for r in raw_rows:
-                cid = r["commit_id"]
                 name = safe_decode(r["author_name"]) or "Unknown"
                 email = safe_decode(r["author_email"]) or ""
-                key = email or name
-                if key not in author_counts:
-                    author_counts[key] = {"name": name, "email": email, "commits_count": 0}
-                author_counts[key]["commits_count"] += 1
-
                 commits.append({
-                    "commit_id": cid,
+                    "commit_id": r["commit_id"],
                     "commit_hash": format_commit_hash(r["commit_hash"]),
                     "author_date": r["author_date"],
                     "author_date_iso": _format_date(r["author_date"]),
@@ -1084,37 +960,23 @@ class GitService:
                     "author_name": name,
                     "author_email": email,
                     "files_count": int(r.get("files_count", 0)),
-                    "is_anchor": (cid == anchor_id),
                 })
-
-            top_contrib = sorted(author_counts.values(), key=lambda x: x["commits_count"], reverse=True)[:10]
 
             min_id = min((c["commit_id"] for c in commits), default=anchor_id)
             max_id = max((c["commit_id"] for c in commits), default=anchor_id)
 
-            cursor.execute("SELECT 1 FROM m_commit WHERE commit_id < %s AND commit_id > 0 LIMIT 1;", (min_id,))
+            cursor.execute("SELECT 1 FROM m_commit WHERE commit_id < %s AND commit_id > 0 AND network_id = %s LIMIT 1;", (min_id, network_id))
             has_past = cursor.fetchone() is not None
-            cursor.execute("SELECT 1 FROM m_commit WHERE commit_id > %s LIMIT 1;", (max_id,))
+            cursor.execute("SELECT 1 FROM m_commit WHERE commit_id > %s AND network_id = %s LIMIT 1;", (max_id, network_id))
             has_future = cursor.fetchone() is not None
 
             return {
                 "version": vname,
                 "direction": dir_mode,
-                "anchor_commit": {
-                    "commit_id": anchor_id,
-                    "commit_hash": anchor_hash,
-                    "subject": anchor_subject,
-                    "author_name": anchor_author,
-                    "author_date": anchor_row["author_date"],
-                    "author_date_iso": _format_date(anchor_row["author_date"]),
-                },
-                "total_commits": len(commits),
-                "displayed_commits": len(commits),
                 "has_past": has_past,
                 "has_future": has_future,
                 "next_past_cursor": max(1, min_id - 1),
                 "next_future_cursor": max_id + 1,
-                "top_contributors": top_contrib,
                 "timeline": commits,
             }
 

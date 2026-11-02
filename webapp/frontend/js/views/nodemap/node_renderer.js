@@ -1,5 +1,5 @@
 /**
- * node_renderer.js - DOM & Two.js Node Renderer.
+ * node_renderer.js - DOM Node Renderer.
  * Mounts interactive schematic nodes with drag handles, port anchors, and expand buttons.
  */
 
@@ -228,14 +228,6 @@ export class NodeRenderer {
     if (nodeEl) {
       const header = nodeEl.querySelector(".node-header");
       if (header) header.style.borderTop = `3px solid ${color}`;
-    }
-  }
-
-  updateNodePosition(nodeId, x, y) {
-    const nodeEl = this.container.querySelector(`.schematic-node[data-node-id="${nodeId}"]`);
-    if (nodeEl) {
-      nodeEl.style.left = `${x}px`;
-      nodeEl.style.top = `${y}px`;
     }
   }
 }

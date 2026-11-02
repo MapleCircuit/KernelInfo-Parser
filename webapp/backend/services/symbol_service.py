@@ -8,8 +8,7 @@ from webapp.backend.database.helpers import (
     safe_decode,
     get_version_info,
 )
-from webapp.backend.security.sql import sanitize_like_query
-from parser.include_graph import include_chain
+from webapp.backend.security.sql import escape_like, sanitize_like_query
 from webapp.backend.services.arch_layout_service import arch_layout_service
 from webapp.backend.services.tree_resolver import (
     DEFAULT_DEFINITION_ARCH,
@@ -20,15 +19,26 @@ from webapp.backend.services.tree_resolver import (
     path_rank,
 )
 
-# Name-ordered candidates scanned before scoping to the revision's tree (symbols of every indexed
-# version share m_symbol_def, so a prefix can match many blobs that are not in the requested tree)
+# Symbol search (search_symbols) ranks distinct names first, then fetches their definitions in small
+# batches: ordering the m_symbol_def view itself by length sorted every prefix match of every indexed
+# version (minutes for a one-letter prefix). Names come from the name indexes, NAME_PAGE at a time.
+NAME_PAGE = 400
+# Names of the first definition batch; each later batch doubles, up to MAX_NAME_BATCH
+FIRST_NAME_BATCH = 8
+MAX_NAME_BATCH = 128
+# Most definition rows one batch reads (symbols of every indexed version share m_symbol_def, so a batch
+# can match many blobs that are not in the requested tree)
 SEARCH_CANDIDATES = 30000
+# Name pages scanned before giving up on filling the answer (names absent from the requested tree)
+MAX_NAME_PAGES = 8
 # Deepest m_ast_container expansion one request may ask for (see get_ast_tree)
 MAX_AST_TREE_DEPTH = 12
-# Tree positions one answer may carry. Shared subtrees are built once but still serialize at every
-# position they occupy, so the response grows multiplicatively with depth even when few nodes are
-# distinct: the depth cap alone does not bound the body, this does.
+# Tree positions (serialized nodes) one answer may carry. Shared subtrees are built once but still
+# serialize at every position they occupy, so the response grows multiplicatively with depth even
+# when few nodes are distinct: the depth cap alone does not bound the body, this does.
 MAX_AST_TREE_NODES = 20000
+# AST ids per IN list while get_ast_tree fetches a level of the tree
+AST_TREE_CHUNK = 1000
 # Most references one xref answer returns when the caller names no limit
 MAX_XREF_REFS = 5000
 # Most target ASTs one xref answer looks references up for. Only reached at a revision without an in-tree
@@ -87,37 +97,37 @@ class SymbolService:
                 blob_paths.setdefault(r["blob_id"], []).append(safe_decode(r["fname"]))
         return vid, rev, blob_paths
 
-    def search_symbols(self, version_name: str, query: str = "", q: str = "", limit: int = 50) -> list[dict[str, Any]]:
-        """Search symbol definitions by prefix or substring, returning a list of symbol records."""
-        target_q = query or q
-        clean_q = sanitize_like_query(target_q)
+    def search_symbols(self, version_name: str, query: str = "", limit: int = 50) -> list[dict[str, Any]]:
+        """Symbol definitions of the revision whose name starts with `query`: the exact name first, then
+        shorter names, then by name."""
+        clean_q = sanitize_like_query(query)
         if not clean_q:
             return []
 
         with get_db_cursor() as cursor:
             _, _, blob_paths = self._scope(cursor, version_name)
             cap = max(1, min(limit, 200))
-            # One query: m_symbol_def is a view whose shared rows have computed def_ids, so a second lookup by
-            # def_id could not use an index
-            cursor.execute(
-                """
-                SELECT s.def_id, s.name, s.type_id, t.name AS type_name, s.blob_id AS fid, s.line_s, s.line_e, s.ast_id
-                FROM m_symbol_def s
-                JOIN m_type_descriptor t ON s.type_id = t.type_id
-                WHERE (s.name LIKE %s OR s.name = %s)
-                ORDER BY (s.name = %s) DESC, LENGTH(s.name) ASC, s.name ASC
-                LIMIT %s;
-                """,
-                (f"{clean_q}%", target_q, target_q, SEARCH_CANDIDATES),
-            )
-            picked = [r for r in cursor.fetchall() if r["fid"] in blob_paths][:cap]
+            picked: list[dict[str, Any]] = []
+            batch_size = FIRST_NAME_BATCH
+            after: tuple[int, str] | None = None
+            for _ in range(MAX_NAME_PAGES):
+                names = self._name_page(cursor, f"{clean_q}%", after)
+                for i in range(0, len(names), batch_size):
+                    picked.extend(self._definitions_in_tree(cursor, names[i:i + batch_size], blob_paths))
+                    batch_size = min(batch_size * 2, MAX_NAME_BATCH)
+                    if len(picked) >= cap:
+                        break
+                if len(picked) >= cap or len(names) < NAME_PAGE:
+                    break
+                after = (len(names[-1].encode()), names[-1])
+
             results = []
-            for r in picked:
-                path = blob_paths[r["fid"]][0]
+            for r in picked[:cap]:
+                path = r["file_path"]
                 results.append({
                     "def_id": r["def_id"],
-                    "name": safe_decode(r["name"]),
-                    "symbol_name": safe_decode(r["name"]),
+                    "name": r["name"],
+                    "symbol_name": r["name"],
                     "type_id": r["type_id"],
                     "type_name": format_symbol_type(safe_decode(r["type_name"])),
                     "fid": r["fid"],
@@ -127,53 +137,65 @@ class SymbolService:
                     "line_e": r["line_e"],
                     "ast_id": r["ast_id"],
                 })
-
             return results
 
-    def lookup_symbols(self, version_name: str, prefix: str = "", q: str = "", limit: int = 20) -> list[str]:
-        """Fast typeahead prefix suggestions returning symbol names."""
-        target_p = prefix or q
-        clean_p = sanitize_like_query(target_p)
-        if not clean_p:
-            return []
+    @staticmethod
+    def _name_page(cursor: Any, like: str, after: tuple[int, str] | None) -> list[str]:
+        """Next NAME_PAGE distinct definition names matching `like`, by (byte length, name), after `after`.
 
-        with get_db_cursor() as cursor:
-            try:
-                _, _, blob_paths = self._scope(cursor, version_name)
-            except HTTPException:
-                return []
-
+        Each table holding definition names (shared per tag, or per blob) is read through its name index
+        and only its distinct names are sorted; the two lists merge in Python. Being ordered by the same
+        key, the union's first NAME_PAGE names are among the first NAME_PAGE of each table.
+        """
+        cond, args = "", [like]
+        if after is not None:
+            cond = " AND (LENGTH(name) > %s OR (LENGTH(name) = %s AND name > %s))"
+            args += [after[0], after[0], after[1]]
+        names: set[str] = set()
+        for table in ("m_tag_def", "m_blob_symbol_def"):
             cursor.execute(
-                """
-                SELECT s.name, s.blob_id
-                FROM m_symbol_def s
-                WHERE s.name LIKE %s
-                ORDER BY s.name ASC
-                LIMIT %s;
-                """,
-                (f"{clean_p}%", SEARCH_CANDIDATES),
+                f"SELECT name FROM {table} WHERE name LIKE %s{cond} GROUP BY name ORDER BY LENGTH(name), name LIMIT %s;",
+                (*args, NAME_PAGE),
             )
-            cap = max(1, min(limit, 100))
-            names: list[str] = []
-            for r in cursor.fetchall():
-                if r["blob_id"] not in blob_paths:
-                    continue
-                name = safe_decode(r["name"])
-                if not names or names[-1] != name:
-                    names.append(name)
-                    if len(names) >= cap:
-                        break
-            return names
+            names.update(safe_decode(r["name"]) for r in cursor.fetchall())
+        return sorted(names, key=lambda n: (len(n.encode()), n))[:NAME_PAGE]
+
+    @staticmethod
+    def _definitions_in_tree(cursor: Any, names: list[str], blob_paths: dict[int, list[str]]) -> list[dict[str, Any]]:
+        """Definitions of `names` whose blob is in the revision's tree, in the order of `names`, then by path and line."""
+        if not names:
+            return []
+        rank = {n: i for i, n in enumerate(names)}
+        cursor.execute(
+            f"""
+            SELECT s.def_id, s.name, s.type_id, t.name AS type_name, s.blob_id AS fid, s.line_s, s.line_e, s.ast_id
+            FROM m_symbol_def s
+            JOIN m_type_descriptor t ON s.type_id = t.type_id
+            WHERE s.name IN ({", ".join(["%s"] * len(names))})
+            LIMIT %s;
+            """,
+            (*names, SEARCH_CANDIDATES),
+        )
+        rows = []
+        for r in cursor.fetchall():
+            paths = blob_paths.get(r["fid"])
+            if not paths:
+                continue
+            r["name"] = safe_decode(r["name"])
+            r["file_path"] = paths[0]
+            rows.append(r)
+        rows.sort(key=lambda r: (rank.get(r["name"], len(rank)), r["file_path"], r["line_s"] or 0))
+        return rows
 
     @staticmethod
     def _prefer_reachable(rows: list[dict[str, Any]], blob_paths: dict[int, list[str]], rev: str, arch_id: str,
-                          from_file: str, scope: Any, bits: int | None) -> list[str]:
+                          from_file: str, scope: Any, bits: int | None) -> None:
         """Put first the definitions the compilation of `from_file` reaches through its #include chain for
         ARCH=<arch_id> (arch_layout_service.reachable); prototypes stay last and weak definitions after
-        strong ones. Marks rows `visible` and returns the include chain of the first row ([] if unreached)."""
+        strong ones. Marks rows `visible` (rows are left untouched when nothing is reached)."""
         reached = arch_layout_service.reachable(rev, arch_id, from_file)
         if not reached:
-            return []
+            return
         for r in rows:
             hit = next((p for p in blob_paths.get(r["fid"]) or () if p in reached), None)
             r["visible"] = hit is not None
@@ -185,63 +207,66 @@ class SymbolService:
             return (proto, 1 if link_rank == 1 else 0, 0 if r["visible"] else 1, group, bits_penalty, link_rank, path, line)
 
         rows.sort(key=key)
-        return include_chain(reached, rows[0]["fname"]) if rows and rows[0]["visible"] else []
+
+    @staticmethod
+    def _kconfig_detail(vname: str, name: str, arch_id: str) -> dict[str, Any] | None:
+        """Symbol detail of a Kconfig symbol (CONFIG_ prefix optional) in the ARCH's model, else None."""
+        clean_name = name[7:] if name.startswith("CONFIG_") else name
+        try:
+            from webapp.backend.services.kconfig_service import KconfigService
+            k_detail = KconfigService().get_symbol_detail(vname, clean_name, arch_id)
+        except Exception:  # noqa: BLE001 - not a Kconfig symbol of this revision and ARCH
+            return None
+        if not k_detail or not k_detail.get("file_path"):
+            return None
+        return {
+            "version": vname,
+            "name": name,
+            "symbol_name": name,
+            "symbol": name,
+            "type_name": "kconfig",
+            "file_path": k_detail["file_path"],
+            "line": k_detail["line_s"],
+            "line_s": k_detail["line_s"],
+            "line_e": k_detail["line_e"],
+            "definition": {
+                "def_id": 0,
+                "ast_id": 0,
+                "tag_id": 0,
+                "type_id": 88,
+                "type_name": "kconfig",
+                "fid": None,
+                "file": k_detail["file_path"],
+                "file_path": k_detail["file_path"],
+                "line_s": k_detail["line_s"],
+                "line_e": k_detail["line_e"],
+            },
+            "is_kconfig": True,
+            "kconfig": k_detail,
+            "arch": arch_id,
+        }
 
     def get_symbol_detail(self, version_name: str, name: str, arch: str = DEFAULT_DEFINITION_ARCH,
                           from_file: str | None = None) -> dict[str, Any]:
-        """Retrieve full definition, declarations, and usages of a symbol.
+        """The definition of a symbol in the revision's tree.
 
         Among several definitions the one for `arch` wins (see `definition_rank`); with `from_file` (the
         file the symbol is used in), the definitions its #include chain reaches for that ARCH come first
         (`_prefer_reachable`). Kconfig symbols are looked up in that ARCH's model. `definitions` lists
-        every in-tree definition in rank order.
+        every in-tree definition in rank order. References are not part of the answer: get_symbol_xref()
+        computes them, only for the views that show them.
         """
         with get_db_cursor() as cursor:
             _, vname, blob_paths = self._scope(cursor, version_name)
             arch_id, srcarch, bits = definition_arch(vname, arch)
 
-            # Check if this is a Kconfig configuration symbol (e.g. CONFIG_NET or CONFIG_SMP)
+            # A Kconfig configuration symbol (CONFIG_NET, CONFIG_SMP)
             if name.startswith("CONFIG_"):
-                clean_name = name[7:]
-                try:
-                    from webapp.backend.services.kconfig_service import KconfigService
-                    k_svc = KconfigService()
-                    k_detail = k_svc.get_symbol_detail(vname, clean_name, arch_id)
-                    if k_detail and k_detail.get("file_path"):
-                        return {
-                            "version": vname,
-                            "name": name,
-                            "symbol_name": name,
-                            "symbol": name,
-                            "type_name": "kconfig",
-                            "file_path": k_detail["file_path"],
-                            "line": k_detail["line_s"],
-                            "line_s": k_detail["line_s"],
-                            "line_e": k_detail["line_e"],
-                            "definition": {
-                                "def_id": 0,
-                                "ast_id": 0,
-                                "tag_id": 0,
-                                "type_id": 88,
-                                "type_name": "kconfig",
-                                "fid": None,
-                                "file": k_detail["file_path"],
-                                "file_path": k_detail["file_path"],
-                                "line_s": k_detail["line_s"],
-                                "line_e": k_detail["line_e"],
-                            },
-                            "declarations": k_detail.get("declarations", []),
-                            "usages": {},
-                            "xrefs": {},
-                            "total_usages": 0,
-                            "is_kconfig": True,
-                            "kconfig": k_detail,
-                            "arch": arch_id,
-                        }
-                except Exception:
-                    pass
+                k_res = self._kconfig_detail(vname, name, arch_id)
+                if k_res is not None:
+                    return k_res
 
-            # 1. Authoritative definition: one whose blob is in this revision's tree, ranked for the ARCH
+            # Authoritative definition: one whose blob is in this revision's tree, ranked for the ARCH
             cursor.execute(
                 """
                 SELECT s.def_id, s.ast_id, s.name, s.type_id, t.name AS type_name, s.blob_id AS fid, s.line_s, s.line_e, s.tag_id, s.linkage
@@ -257,54 +282,17 @@ class SymbolService:
             for r in in_tree:
                 r["fname"] = best_path(blob_paths[r["fid"]], srcarch, bits)
             in_tree.sort(key=lambda r: definition_rank(r["fname"], r.get("linkage"), r["line_s"], srcarch, bits))
-            chain = self._prefer_reachable(in_tree, blob_paths, vname, arch_id, from_file, srcarch, bits) if from_file and in_tree else []
+            if from_file and in_tree:
+                self._prefer_reachable(in_tree, blob_paths, vname, arch_id, from_file, srcarch, bits)
             s_row = in_tree[0] if in_tree else (def_rows[0] if def_rows else None)
             if s_row is not None and not in_tree:
                 s_row["fname"] = None
             if not s_row:
-                # Check if this is a Kconfig configuration symbol (e.g. CONFIG_NET or NET)
-                clean_name = name[7:] if name.startswith("CONFIG_") else name
-                try:
-                    from webapp.backend.services.kconfig_service import KconfigService
-                    k_svc = KconfigService()
-                    k_detail = k_svc.get_symbol_detail(vname, clean_name, arch_id)
-                    if k_detail and k_detail.get("file_path"):
-                        return {
-                            "version": vname,
-                            "name": name,
-                            "symbol_name": name,
-                            "symbol": name,
-                            "type_name": "kconfig",
-                            "file_path": k_detail["file_path"],
-                            "line": k_detail["line_s"],
-                            "line_s": k_detail["line_s"],
-                            "line_e": k_detail["line_e"],
-                            "definition": {
-                                "def_id": 0,
-                                "ast_id": 0,
-                                "tag_id": 0,
-                                "type_id": 88,
-                                "type_name": "kconfig",
-                                "fid": None,
-                                "file": k_detail["file_path"],
-                                "file_path": k_detail["file_path"],
-                                "line_s": k_detail["line_s"],
-                                "line_e": k_detail["line_e"],
-                            },
-                            "declarations": k_detail.get("declarations", []),
-                            "usages": {},
-                            "xrefs": {},
-                            "total_usages": 0,
-                            "is_kconfig": True,
-                            "kconfig": k_detail,
-                            "arch": arch_id,
-                        }
-                except Exception:
-                    pass
+                # A Kconfig symbol named without its CONFIG_ prefix (NET)
+                k_res = self._kconfig_detail(vname, name, arch_id)
+                if k_res is not None:
+                    return k_res
                 raise HTTPException(status_code=404, detail=f"Symbol '{name}' not found in version '{version_name}'.")
-
-            # 2. XRefs (Usages)
-            xref_data = self.get_symbol_xref(vname, name, arch=arch_id)
 
             return {
                 "version": vname,
@@ -340,16 +328,11 @@ class SymbolService:
                 ],
                 "arch": arch_id,
                 "from_file": from_file,
-                "include_chain": chain,
-                "declarations": xref_data.get("declarations", []),
-                "usages": xref_data.get("usages", {}),
-                "xrefs": xref_data.get("usages", {}),
-                "total_usages": xref_data.get("total_usages", 0),
             }
 
     def get_symbol_xref(self, version_name: str, symbol_name: str, limit: int | None = None,
                         arch: str = DEFAULT_DEFINITION_ARCH) -> dict[str, Any]:
-        """Categorize references: calls, member_refs, type_usages, declarations, macro_expansions.
+        """Definitions and references of a symbol; each reference carries its role badge (`type`).
 
         `definitions` are the definitions in this revision's tree, ranked for `arch` (see `definition_rank`);
         `definition` is the first one. References are looked up for every AST that *is* the symbol, in the
@@ -451,39 +434,21 @@ class SymbolService:
                 cap = min(limit, MAX_XREF_REFS) if limit and limit > 0 else MAX_XREF_REFS
                 ref_rows = ref_rows[:cap]
 
-            role_map = {
-                1: ("declarations", "Decl"),
-                2: ("type_usages", "TypeUsage"),
-                3: ("calls", "Call"),
-                4: ("member_refs", "MemberRef"),
-                5: ("decl_refs", "DeclRef"),
-                6: ("macro_expansions", "MacroExp"),
-            }
-            usages: dict[str, list[dict[str, Any]]] = {
-                "declarations": [],
-                "type_usages": [],
-                "calls": [],
-                "member_refs": [],
-                "decl_refs": [],
-                "macro_expansions": [],
-            }
-
-            for r in ref_rows:
-                category, role_type = role_map.get(r["role"], ("decl_refs", "Ref"))
-                item = {
+            # Reference badges by SymbolRole (Decl, TypeUsage, Call, MemberRef, DeclRef, MacroExpansion)
+            role_badges = {1: "Decl", 2: "TypeUsage", 3: "Call", 4: "MemberRef", 5: "DeclRef", 6: "MacroExp"}
+            references = [
+                {
                     "file": r["fname"],
                     "caller": safe_decode(r["caller"]) if r["caller"] else None,
                     "fid": r["fid"],
                     "line": r["line"],
                     "char_s": r["char_s"],
                     "tag_id": r["tag_id"],
-                    "type": role_type,
+                    "type": role_badges.get(r["role"], "Ref"),
                 }
-                usages[category].append(item)
-
-            all_refs = []
-            for k, v in usages.items():
-                all_refs.extend(v)
+                # Grouped by role (unknown roles with DeclRef), file/line order within a role
+                for r in sorted(ref_rows, key=lambda r: r["role"] if r["role"] in role_badges else 5)
+            ]
 
             return {
                 "version": vname,
@@ -493,24 +458,13 @@ class SymbolService:
                 "ast_id": primary_ast_id,
                 "definitions": defs,
                 "definition": defs[0] if defs else None,
-                "total_definitions": len(defs),
                 # The index knows this symbol, but no definition of it sits in this revision's tree: the
                 # revision's copy of the defining file was never parsed (its references still resolve)
                 "definition_unindexed": bool(def_rows) and not defs,
-                "references": all_refs,
-                "references_count": len(all_refs),
-                "total_references": len(all_refs),
-                "calls": usages["calls"],
-                "member_refs": usages["member_refs"],
-                "type_usages": usages["type_usages"],
-                "declarations": usages["declarations"],
-                "macro_expansions": usages["macro_expansions"],
-                "macro_expansions_count": len(usages["macro_expansions"]),
-                "usages": usages,
-                "total_usages": len(all_refs),
+                "references": references,
             }
 
-    def get_ast_tree(self, ast_id: int, depth: int = 3, version_name: str = "v3.0") -> dict[str, Any]:
+    def get_ast_tree(self, ast_id: int, depth: int = 3) -> dict[str, Any]:
         """Recursive m_ast_container hierarchy inspection with tag_id annotations and batched queries."""
         # AST nodes are content-addressed, so one subtree is referenced by many parents. Without a
         # bound and without memoizing subtrees, a deep request re-expands every shared subtree once
@@ -518,17 +472,17 @@ class SymbolService:
         depth = max(0, min(int(depth), MAX_AST_TREE_DEPTH))
         with get_db_cursor() as cursor:
             node_cache: dict[int, dict[str, Any]] = {}
+            # ast_id -> [(child ast_id, priority)] of every node expanded so far
+            children_of: dict[int, list[tuple[int, int]]] = {}
             # (ast_id, remaining depth) -> (subtree, positions it serializes to)
             subtree_cache: dict[tuple[int, int], tuple[dict[str, Any], int]] = {}
+            # Positions left: the answer never serializes more than MAX_AST_TREE_NODES nodes
             budget = [MAX_AST_TREE_NODES]
 
             def fetch_batch_nodes(ast_ids: list[int]) -> None:
-                missing = [aid for aid in ast_ids if aid not in node_cache]
-                if not missing:
-                    return
-                # Chunk in batches of 100 to avoid excessive parameter lists
-                for i in range(0, len(missing), 100):
-                    chunk = missing[i:i + 100]
+                missing = list(dict.fromkeys(aid for aid in ast_ids if aid not in node_cache))
+                for i in range(0, len(missing), AST_TREE_CHUNK):
+                    chunk = missing[i:i + AST_TREE_CHUNK]
                     placeholders = ",".join(["%s"] * len(chunk))
                     cursor.execute(
                         f"""
@@ -543,31 +497,49 @@ class SymbolService:
                     for r in cursor.fetchall():
                         node_cache[r["ast_id"]] = r
 
+            def expand(roots: list[int], levels: int) -> None:
+                """Fetch the containers of `roots` and of their descendants `levels` levels down: one query
+                per level (and per AST_TREE_CHUNK nodes) instead of one per node. Each node is expanded once,
+                at the shallowest level it appears, where it has the most depth left. Stops early once
+                MAX_AST_TREE_NODES nodes are known (the budget truncates the answer before using more);
+                build_tree expands what it still needs on demand."""
+                frontier = [aid for aid in dict.fromkeys(roots) if aid not in children_of]
+                for _ in range(levels):
+                    if not frontier:
+                        return
+                    for i in range(0, len(frontier), AST_TREE_CHUNK):
+                        chunk = frontier[i:i + AST_TREE_CHUNK]
+                        cursor.execute(
+                            f"""
+                            SELECT c.ast_id, c.ref_ast_id, c.priority
+                            FROM m_ast_container c
+                            WHERE c.ast_id IN ({",".join(["%s"] * len(chunk))})
+                            ORDER BY c.ast_id, c.priority ASC;
+                            """,
+                            chunk,
+                        )
+                        for r in cursor.fetchall():
+                            children_of.setdefault(r["ast_id"], []).append((r["ref_ast_id"], r["priority"]))
+                    for aid in frontier:
+                        children_of.setdefault(aid, [])
+                    found = [child for aid in frontier for child, _ in children_of[aid]]
+                    fetch_batch_nodes(found)
+                    if len(node_cache) >= MAX_AST_TREE_NODES:
+                        return
+                    frontier = [aid for aid in dict.fromkeys(found) if aid not in children_of]
+
+            fetch_batch_nodes([ast_id])
+            expand([ast_id], depth)
+
             def build_tree(curr_ast_id: int, curr_depth: int) -> tuple[dict[str, Any], int]:
-                """The subtree under curr_ast_id, and the number of positions it serializes to."""
-                memo = subtree_cache.get((curr_ast_id, curr_depth))
-                if memo is not None:
-                    return memo
+                """The subtree under curr_ast_id, built fresh, and the number of positions it serializes to.
+                Every node built charges one position to the budget; a memoized subtree reused under
+                another parent serializes again, so its caller charges its whole size."""
+                budget[0] -= 1
                 node = node_cache.get(curr_ast_id)
                 if not node:
-                    cursor.execute(
-                        """
-                        SELECT a.ast_id, a.name, a.type_id, t.name AS type_name,
-                               (SELECT tag_id FROM m_tag WHERE ast_id = a.ast_id LIMIT 1) AS tag_id
-                        FROM m_ast a
-                        JOIN m_type_descriptor t ON a.type_id = t.type_id
-                        WHERE a.ast_id = %s
-                        LIMIT 1;
-                        """,
-                        (curr_ast_id,),
-                    )
-                    node = cursor.fetchone()
-                    if node:
-                        node_cache[curr_ast_id] = node
-
-                if not node:
                     return ({"ast_id": curr_ast_id, "tag_id": None, "name": "unknown", "type_id": 0,
-                             "containers": [], "children": []}, 1)
+                             "children": []}, 1)
 
                 tid = node["tag_id"]
                 node_dict: dict[str, Any] = {
@@ -576,73 +548,51 @@ class SymbolService:
                     "name": safe_decode(node["name"]),
                     "type_id": node["type_id"],
                     "type_name": safe_decode(node["type_name"]),
-                    "containers": [],
                     "children": [],
                 }
                 if curr_depth <= 0:
                     subtree_cache[(curr_ast_id, curr_depth)] = (node_dict, 1)
                     return (node_dict, 1)
 
-                cursor.execute(
-                    """
-                    SELECT c.ref_ast_id, c.priority
-                    FROM m_ast_container c
-                    WHERE c.ast_id = %s
-                    ORDER BY c.priority ASC;
-                    """,
-                    (curr_ast_id,),
-                )
-                children = cursor.fetchall()
-                if children:
-                    fetch_batch_nodes([ch["ref_ast_id"] for ch in children])
+                if curr_ast_id not in children_of:
+                    expand([curr_ast_id], curr_depth)
 
-                # Each child is serialized twice (once under "containers", once under "children"),
-                # so a subtree's real cost doubles at every level: the budget counts it that way.
                 size = 1
-                for ch in children:
-                    if budget[0] <= 0:
-                        node_dict["truncated"] = True
-                        break
-                    child_ast_id = ch["ref_ast_id"]
-                    child_tree, child_size = build_tree(child_ast_id, curr_depth - 1)
-                    budget[0] -= 2 * child_size
-                    size += 2 * child_size
+                # Children in m_ast_container priority order; the first one that does not fit in the
+                # budget cuts the rest
+                for child_ast_id, _priority in children_of[curr_ast_id]:
+                    memo = subtree_cache.get((child_ast_id, curr_depth - 1))
+                    if memo is not None:
+                        child_tree, child_size = memo
+                        if child_size > budget[0]:
+                            node_dict["truncated"] = True
+                            break
+                        budget[0] -= child_size
+                    else:
+                        if budget[0] < 1:
+                            node_dict["truncated"] = True
+                            break
+                        child_tree, child_size = build_tree(child_ast_id, curr_depth - 1)
+                    size += child_size
                     # Suppress tag_id on untagged sub-expressions if inner statement/expression.
                     # A memoized subtree may also be the root or another parent's child, so the
                     # suppression goes on a shallow copy instead of mutating the shared node.
                     if child_tree["type_id"] > 20 and child_tree["tag_id"] is not None:
                         child_tree = {**child_tree, "tag_id": None}
-                    node_dict["containers"].append({
-                        "priority": ch["priority"],
-                        "child_node": child_tree,
-                    })
                     node_dict["children"].append(child_tree)
                 subtree_cache[(curr_ast_id, curr_depth)] = (node_dict, size)
                 return (node_dict, size)
 
             return build_tree(ast_id, depth)[0]
 
-    def get_tag_timeline(self, tag_id: int, include_rc: bool = False) -> dict[str, Any]:
-        """Cross-version history of the symbol a tag belongs to (see HistoryService)."""
-        from webapp.backend.services.history_service import history_service
-        return history_service.get_tag_history(tag_id, include_rc=include_rc)
-
-    def get_symbol_history(
-        self,
-        version_name: str | None,
-        path: str,
-        ast_id: int | None = None,
-        line: int | None = None,
-        tag_id: int | None = None,
-        name: str | None = None,
-        include_rc: bool = False,
-        arch: str = DEFAULT_DEFINITION_ARCH,
-    ) -> dict[str, Any]:
-        """Release-by-release history of the definition at path:line (see HistoryService)."""
-        from webapp.backend.services.history_service import history_service
-        return history_service.get_symbol_history(
-            version_name, path, ast_id=ast_id, line=line, tag_id=tag_id, name=name, include_rc=include_rc, arch=arch,
-        )
+    @staticmethod
+    def _blob_of(cursor: Any, rev: str, path: str | None) -> int | None:
+        """Indexed blob_id of `path` in the tree of `rev` (None when absent or never parsed)."""
+        clean = (path or "").strip().strip("/")
+        tree = git_tree_resolver.list_tree(rev) if clean else None
+        sha = tree.get(clean) if tree else None
+        meta = git_tree_resolver.map_blob_hashes(cursor, [sha]).get(sha) if sha else None
+        return meta[0] if meta else None
 
     def get_include_symbols(
         self,
@@ -658,53 +608,45 @@ class SymbolService:
         from core.globalstuff import normalize_repo_path
 
         with get_db_cursor() as cursor:
-            vid, version_name = get_version_info(cursor, version_name)
-            if vid is None:
-                raise HTTPException(status_code=404, detail=f"Version '{version_name}' not found.")
+            _, version_name, blob_paths = self._scope(cursor, version_name)
 
-            target_ast_id = ast_id
-            if (target_ast_id <= 0 or target_ast_id is None) and tag_id:
+            target_ast_id = ast_id or 0
+            if target_ast_id <= 0 and tag_id:
                 cursor.execute("SELECT ast_id FROM m_tag WHERE tag_id = %s LIMIT 1;", (tag_id,))
                 t_row = cursor.fetchone()
                 if t_row and t_row["ast_id"]:
                     target_ast_id = t_row["ast_id"]
 
-            if (target_ast_id <= 0 or target_ast_id is None) and file_path and line:
-                clean_file = file_path.strip().lstrip("/")
+            # The include directive of the referring file, looked up in that file's blob at this revision
+            file_blob = self._blob_of(cursor, version_name, file_path) if target_ast_id <= 0 and file_path else None
+            if target_ast_id <= 0 and file_blob and line:
                 cursor.execute(
                     """
                     SELECT a.ast_id
-                    FROM m_bridge_checkpoint bc
-                    JOIN m_file_name fn ON bc.fnid = fn.fnid
-                    JOIN m_bridge_tag bt ON bc.blob_id = bt.blob_id
+                    FROM m_bridge_tag bt
                     JOIN m_tag t ON bt.tag_id = t.tag_id
                     JOIN m_ast a ON t.ast_id = a.ast_id
-                    WHERE bc.commit_id = %s AND fn.fname = %s AND a.type_id = 78
-                      AND bt.line_s <= %s AND bt.line_e >= %s
+                    WHERE bt.blob_id = %s AND a.type_id = 78 AND bt.line_s <= %s AND bt.line_e >= %s
                     LIMIT 1;
                     """,
-                    (vid, clean_file, line, line),
+                    (file_blob, line, line),
                 )
                 f_row = cursor.fetchone()
                 if f_row and f_row["ast_id"]:
                     target_ast_id = f_row["ast_id"]
 
-            if (target_ast_id <= 0 or target_ast_id is None) and file_path and header:
-                clean_file = file_path.strip().lstrip("/")
-                clean_hdr = header.strip().strip("<>\"' ;")
+            if target_ast_id <= 0 and file_blob and header:
+                clean_hdr = escape_like(header.strip().strip("<>\"' ;"))
                 cursor.execute(
                     """
                     SELECT a.ast_id
-                    FROM m_bridge_checkpoint bc
-                    JOIN m_file_name fn ON bc.fnid = fn.fnid
-                    JOIN m_bridge_tag bt ON bc.blob_id = bt.blob_id
+                    FROM m_bridge_tag bt
                     JOIN m_tag t ON bt.tag_id = t.tag_id
                     JOIN m_ast a ON t.ast_id = a.ast_id
-                    WHERE bc.commit_id = %s AND fn.fname = %s AND a.type_id = 78
-                      AND a.name LIKE %s
+                    WHERE bt.blob_id = %s AND a.type_id = 78 AND a.name LIKE %s
                     LIMIT 1;
                     """,
-                    (vid, clean_file, f"%{clean_hdr}%"),
+                    (file_blob, f"%{clean_hdr}%"),
                 )
                 h_row = cursor.fetchone()
                 if h_row and h_row["ast_id"]:
@@ -742,8 +684,6 @@ class SymbolService:
                     "ast_id": target_ast_id or 0,
                     "include_text": header or "#include",
                     "header_file": hdr_file,
-                    "header_exists": bool(hdr_file),
-                    "total_symbols": 0,
                     "symbols": [],
                 }
 
@@ -762,7 +702,6 @@ class SymbolService:
             inc_row = cursor.fetchone()
             raw_header = safe_decode(inc_row["fname"]) if inc_row else ""
             header_file = normalize_repo_path(raw_header)
-            header_exists = bool(header_file)
 
             cursor.execute(
                 """
@@ -779,35 +718,33 @@ class SymbolService:
 
             symbol_names = [safe_decode(r["sym_name"]) for r in cont_rows if r["sym_name"]]
 
+            # Each symbol's definition in this revision's tree: in the header itself, then in its directory
             def_map = {}
             if symbol_names:
                 format_strings = ",".join(["%s"] * len(symbol_names))
-                header_dir = (os.path.dirname(header_file) + "/%") if header_file else "%"
+                header_dir = (os.path.dirname(header_file) + "/") if header_file else ""
                 cursor.execute(
                     f"""
-                    SELECT d.name, d.type_id, d.blob_id AS fid, d.line_s, d.line_e, fn.fname
+                    SELECT d.name, d.blob_id AS fid, d.line_s
                     FROM m_symbol_def d
-                    LEFT JOIN m_bridge_checkpoint bc ON d.blob_id = bc.blob_id AND bc.commit_id = %s
-                    LEFT JOIN m_file_name fn ON bc.fnid = fn.fnid
-                    WHERE d.name IN ({format_strings})
-                    ORDER BY
-                        CASE
-                            WHEN fn.fname = %s THEN 0
-                            WHEN fn.fname LIKE %s THEN 1
-                            ELSE 2
-                        END,
-                        d.line_s ASC;
+                    WHERE d.name IN ({format_strings});
                     """,
-                    (vid, *symbol_names, header_file, header_dir),
+                    tuple(symbol_names),
                 )
+                ranked: dict[str, tuple] = {}
                 for d_row in cursor.fetchall():
+                    paths = blob_paths.get(d_row["fid"])
+                    if not paths:
+                        continue
                     d_name = safe_decode(d_row["name"])
-                    if d_name not in def_map:
+                    path = header_file if header_file in paths else paths[0]
+                    rank = (0 if path == header_file else 1 if header_dir and path.startswith(header_dir) else 2, d_row["line_s"] or 0)
+                    if d_name not in ranked or rank < ranked[d_name]:
+                        ranked[d_name] = rank
                         def_map[d_name] = {
                             "fid": d_row["fid"],
                             "line_s": d_row["line_s"],
-                            "line_e": d_row["line_e"],
-                            "def_file": safe_decode(d_row["fname"]),
+                            "def_file": path,
                         }
 
             def _get_category(t_name: str) -> str:
@@ -850,15 +787,12 @@ class SymbolService:
                     "category": _get_category(t_name),
                     "def_file": def_info["def_file"] if def_info else None,
                     "def_line_s": def_info["line_s"] if def_info else None,
-                    "def_line_e": def_info["line_e"] if def_info else None,
                 })
 
             return {
                 "ast_id": target_ast_id,
                 "include_text": raw_include_text,
                 "header_file": header_file,
-                "header_exists": header_exists,
-                "total_symbols": len(symbols_list),
                 "symbols": symbols_list,
             }
 

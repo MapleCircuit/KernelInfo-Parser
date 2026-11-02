@@ -157,7 +157,7 @@ class TestDocReferenceScanner(unittest.TestCase):
 
 
 class TestDBLayoutAndWebappReferenceAPI(unittest.TestCase):
-    """Test suite verifying m_file_reference schema and webapp helpers."""
+    """Test suite verifying the m_file_reference schema and its table-engine deduplication."""
 
     def test_m_file_reference_schema(self) -> None:
         self.assertEqual(m_file_reference.table_id, 28)
@@ -172,13 +172,6 @@ class TestDBLayoutAndWebappReferenceAPI(unittest.TestCase):
         self.assertEqual(format_ref_type_label(FileRefType.Kconfig), "Kconfig")
         self.assertEqual(format_ref_type_label(FileRefType.Makefile), "Makefile")
         self.assertEqual(format_ref_type_label(FileRefType.Documentation), "Documentation")
-
-    def test_webapp_get_file_references_empty(self) -> None:
-        from webapp.main import get_file_references_internal
-        res = get_file_references_internal(None, 1, 100)
-        self.assertEqual(res["total"], 0)
-        self.assertIn("counts", res)
-        self.assertIn("include", res["counts"])
 
     def test_m_file_reference_unique_key_and_table_engine_deduplication(self) -> None:
         """Verify TableEngine deduplicates duplicate unique key entries for m_file_reference."""

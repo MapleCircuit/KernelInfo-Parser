@@ -10,6 +10,16 @@ const PAGE_SIZE = 500;
 const KCONFIG_TYPES = { 1: "bool", 2: "tristate", 3: "string", 4: "hex", 5: "int" };
 const STATUS_LABELS = { added: "A", modified: "M", deleted: "D", renamed: "R", unchanged: "U", removed: "D", changed: "M" };
 const FILE_STATUSES = ["added", "modified", "deleted", "renamed", "unchanged"];
+// Kconfig mode chips: option changes (added/changed/removed) and Kconfig file changes
+// (added/modified/removed) both map onto these
+const KCONFIG_STATUSES = ["added", "modified", "deleted"];
+const KCONFIG_STATUS_OF = { added: "added", changed: "modified", modified: "modified", removed: "deleted", deleted: "deleted" };
+const KCONFIG_DOWNLOAD_FORMATS = [
+  { key: "options", label: "Options (.txt)", title: "One CONFIG_ option per line" },
+  { key: "files", label: "Kconfig files (.txt)", title: "One Kconfig file path per line" },
+  { key: "tsv", label: "Table (.tsv)", title: "Kind, status, name, defining files and changed fields per option and file" },
+  { key: "json", label: "JSON (.json)", title: "Revisions, filters, every option with its definitions and every Kconfig file" },
+];
 const DOWNLOAD_FORMATS = [
   { key: "txt", label: "Paths (.txt)", title: "One path per line (the target path; the base path for deleted files)" },
   { key: "tsv", label: "Table (.tsv)", title: "Status, similarity, path and old path per file" },
@@ -46,6 +56,7 @@ export class DiffView {
     // the URL (§5.26) and re-applied whenever the diff is loaded again
     this.renameSearches = [];
     this.kconfigFilter = "";
+    this.kconfigStatusFilter = new Set();
     // Unchanged files, fetched when the unchanged chip is first selected
     this.unchangedFiles = null;
     this.unchangedLoading = null;
@@ -62,6 +73,7 @@ export class DiffView {
     this.statusFilter = new Set(String(tabData.statuses || "").split(",").filter((k) => FILE_STATUSES.includes(k)));
     this.fileFilter = tabData.query || "";
     this.kconfigFilter = tabData.kconfigQuery || "";
+    this.kconfigStatusFilter = new Set(String(tabData.kconfigStatuses || "").split(",").filter((k) => KCONFIG_STATUSES.includes(k)));
     this.renameSearches = Array.isArray(tabData.renameSearches)
       ? tabData.renameSearches.filter((r) => r && Number.isFinite(r.sim)).map((r) => ({ sim: r.sim, dir: r.dir || "" }))
       : [];
@@ -163,7 +175,7 @@ export class DiffView {
   persistTabState(patch, { rendering = false } = {}) {
     // render() runs before the pane attaches its element, so the render itself is never stale
     if (!this.tab || !this.containerEl || (!rendering && !this.containerEl.isConnected)) return;
-    state.updateTabState(this.tab.id, patch);
+    state.updateTabState(this.tab.id, patch, { replace: Boolean(rendering) });
   }
 
   persist(options = {}) {
@@ -176,6 +188,7 @@ export class DiffView {
       statuses: FILE_STATUSES.filter((k) => this.statusFilter.has(k)).join(","),
       query: this.fileFilter,
       kconfigQuery: this.kconfigFilter,
+      kconfigStatuses: KCONFIG_STATUSES.filter((k) => this.kconfigStatusFilter.has(k)).join(","),
       renameSearches: this.renameSearches.length ? this.renameSearches : null,
       title,
     }, options);
@@ -258,12 +271,7 @@ export class DiffView {
         </div>
         <div class="compare-toolbar-right">
           <input type="text" class="compare-filter" id="cmp-file-filter" placeholder="Filter by path…" value="${escapeHtml(this.fileFilter)}" spellcheck="false" />
-          <div class="compare-download">
-            <button class="code-btn" id="cmp-download" type="button" title="Download every file matching the current filters (all pages)">⬇ Download <span id="cmp-download-count"></span></button>
-            <div class="compare-download-menu" id="cmp-download-menu" hidden>
-              ${DOWNLOAD_FORMATS.map((f) => `<button type="button" data-format="${f.key}" title="${escapeHtml(f.title)}">${escapeHtml(f.label)}</button>`).join("")}
-            </div>
-          </div>
+          ${this.downloadMenuHtml(DOWNLOAD_FORMATS, "Download every file matching the current filters (all pages)")}
         </div>
       </div>
       <div id="cmp-rename-search"></div>
@@ -292,6 +300,24 @@ export class DiffView {
       this.persist();
     };
 
+    this.wireDownloadMenu(resContainer, (format) => this.downloadFileRows(format));
+
+    this.renderRenameSearch();
+    this.renderFileRows();
+  }
+
+  /** The ⬇ Download button and its format menu (both modes). */
+  downloadMenuHtml(formats, title) {
+    return `
+      <div class="compare-download">
+        <button class="code-btn" id="cmp-download" type="button" title="${escapeHtml(title)}">⬇ Download <span id="cmp-download-count"></span></button>
+        <div class="compare-download-menu" id="cmp-download-menu" hidden>
+          ${formats.map((f) => `<button type="button" data-format="${f.key}" title="${escapeHtml(f.title)}">${escapeHtml(f.label)}</button>`).join("")}
+        </div>
+      </div>`;
+  }
+
+  wireDownloadMenu(resContainer, onPick) {
     const menu = resContainer.querySelector("#cmp-download-menu");
     const closeMenu = (e) => {
       if (e && menu.parentElement.contains(e.target)) return;
@@ -306,12 +332,16 @@ export class DiffView {
     menu.querySelectorAll("[data-format]").forEach((btn) => {
       btn.onclick = () => {
         closeMenu();
-        this.downloadFileRows(btn.dataset.format);
+        onPick(btn.dataset.format);
       };
     });
+  }
 
-    this.renderRenameSearch();
-    this.renderFileRows();
+  /** File name stem shared by both download kinds: `<prefix>_<base>..<target>[_<statuses>][_<filter>]`. */
+  downloadName(prefix, statuses, filter) {
+    const safe = (v) => String(v).replace(/[^A-Za-z0-9._-]+/g, "_").replace(/^_+|_+$/g, "");
+    return [prefix, `${safe(shortRef(this.versionA))}..${safe(shortRef(this.versionB))}`,
+      statuses.length ? statuses.join("-") : "", filter ? safe(filter).slice(0, 40) : ""].filter(Boolean).join("_");
   }
 
   // ---------------------------------------------------------------------------
@@ -334,7 +364,9 @@ export class DiffView {
       note = `Renames are files at least ${info.similarity}% alike; every deleted/added pair was compared.`;
     } else {
       note = `Renames are files at least ${info.similarity}% alike, but there were too many added and deleted files to compare every pair: `
-        + "only identical files and files that kept their name were paired. Search to compare every pair (narrow it to a directory for large ranges).";
+        + "only identical files and files that kept their name were paired"
+        + (info.limit_needed ? ` (Git would need a rename limit of ${Number(info.limit_needed).toLocaleString()})` : "")
+        + ". Search to compare every pair (narrow it to a directory for large ranges).";
     }
     // Directories holding unpaired added or deleted files, for the scope suggestions
     const dirs = new Map();
@@ -611,9 +643,7 @@ export class DiffView {
     if (rows.length === 0) return;
     const statuses = [...this.statusFilter].sort();
     const filter = this.fileFilter.trim();
-    const safe = (v) => String(v).replace(/[^A-Za-z0-9._-]+/g, "_").replace(/^_+|_+$/g, "");
-    const name = ["compare", `${safe(shortRef(this.versionA))}..${safe(shortRef(this.versionB))}`,
-      statuses.length ? statuses.join("-") : "", filter ? safe(filter).slice(0, 40) : ""].filter(Boolean).join("_");
+    const name = this.downloadName("compare", statuses, filter);
     // A deleted file only exists at the base; every other row is named by its target path
     const pathOf = (ch) => ch.file_path;
 
@@ -712,30 +742,58 @@ export class DiffView {
   // Kconfig mode
   // ---------------------------------------------------------------------------
 
-  renderKconfigDiff(resContainer) {
+  /** Every option and Kconfig file of the Kconfig diff, each with its chip status (added/modified/deleted). */
+  kconfigEntries() {
     const res = this.kconfigResult || {};
-    const s = res.summary || {};
-    const files = res.files || [];
-    const symbols = res.symbols || (
+    const symbols = (res.symbols || (
       [...(res.added || []).map((n) => ({ name: n, change: "added" })),
        ...(res.removed || []).map((n) => ({ name: n, change: "removed" })),
        ...(res.changed || []).map((n) => ({ name: n, change: "changed" }))]
-    );
+    )).map((sym) => ({ ...sym, status: KCONFIG_STATUS_OF[sym.change] || "modified" }));
+    const files = (res.files || []).map((f) => ({ ...f, status: KCONFIG_STATUS_OF[f.change] || "modified" }));
+    return { symbols, files };
+  }
+
+  /** Options and Kconfig files matching the chips (none selected = all) and the text filter. */
+  filteredKconfigEntries() {
+    const { symbols, files } = this.kconfigEntries();
+    const q = this.kconfigFilter.trim().toLowerCase();
+    const chips = this.kconfigStatusFilter;
+    const byChip = (e) => chips.size === 0 || chips.has(e.status);
+    return {
+      symbols: symbols.filter((sym) => byChip(sym)
+        && (!q || sym.name.toLowerCase().includes(q) || `config_${sym.name.toLowerCase()}`.includes(q))),
+      files: files.filter((f) => byChip(f) && (!q || f.file.toLowerCase().includes(q))),
+    };
+  }
+
+  renderKconfigDiff(resContainer) {
+    const res = this.kconfigResult || {};
+    const s = res.summary || {};
+    const { symbols, files } = this.kconfigEntries();
     const unindexed = res.unindexed_files || [];
 
     const countEl = this.containerEl.querySelector("#cmp-count-kconfig");
     if (countEl) countEl.textContent = symbols.length + files.length;
 
+    const fileCount = { added: s.files_added ?? 0, modified: s.files_modified ?? 0, deleted: s.files_removed ?? 0 };
+    const optionCount = { added: s.added ?? 0, modified: s.changed ?? 0, deleted: s.removed ?? 0 };
+    const chip = (key) => `
+      <button class="compare-chip ${key} ${this.kconfigStatusFilter.has(key) ? "active" : ""}" data-kc-status="${key}" type="button"
+              title="${optionCount[key]} option${optionCount[key] === 1 ? "" : "s"} and ${fileCount[key]} Kconfig file${fileCount[key] === 1 ? "" : "s"} ${key}">
+        <span class="compare-chip-count">${optionCount[key]}</span> ${key}
+        <span class="compare-chip-sub">· ${fileCount[key]} file${fileCount[key] === 1 ? "" : "s"}</span>
+      </button>`;
+
     resContainer.innerHTML = `
       <div class="compare-toolbar">
         <div class="compare-chips">
-          <span class="compare-chip-static"><strong class="kc-added">${s.added ?? 0}</strong> options added</span>
-          <span class="compare-chip-static"><strong class="kc-removed">${s.removed ?? 0}</strong> removed</span>
-          <span class="compare-chip-static"><strong class="kc-changed">${s.changed ?? 0}</strong> changed</span>
-          <span class="compare-chip-sep"></span>
-          <span class="compare-chip-static">Kconfig files: ${s.files_added ?? 0} added · ${s.files_removed ?? 0} removed · ${s.files_modified ?? 0} modified</span>
+          ${KCONFIG_STATUSES.map(chip).join("")}
         </div>
-        <input type="text" class="compare-filter" id="cmp-kc-filter" placeholder="Filter options or files…" value="${escapeHtml(this.kconfigFilter)}" spellcheck="false" />
+        <div class="compare-toolbar-right">
+          <input type="text" class="compare-filter" id="cmp-kc-filter" placeholder="Filter options or files…" value="${escapeHtml(this.kconfigFilter)}" spellcheck="false" />
+          ${this.downloadMenuHtml(KCONFIG_DOWNLOAD_FORMATS, "Download every option and Kconfig file matching the current filters")}
+        </div>
       </div>
       ${unindexed.length > 0 ? `
         <div class="compare-warning" title="${escapeHtml(unindexed.slice(0, 40).join("\n"))}${unindexed.length > 40 ? "\n…" : ""}">
@@ -753,22 +811,85 @@ export class DiffView {
       </div>
     `;
 
-    const filterInput = resContainer.querySelector("#cmp-kc-filter");
     const renderLists = () => {
-      const q = filterInput.value.trim().toLowerCase();
-      const symRows = symbols.filter((sym) => !q || sym.name.toLowerCase().includes(q) || `config_${sym.name.toLowerCase()}`.includes(q));
-      const fileRows = files.filter((f) => !q || f.file.toLowerCase().includes(q));
+      const { symbols: symRows, files: fileRows } = this.filteredKconfigEntries();
       resContainer.querySelector("#cmp-kc-sym-count").textContent = symRows.length;
       resContainer.querySelector("#cmp-kc-file-count").textContent = fileRows.length;
+      const total = symRows.length + fileRows.length;
+      resContainer.querySelector("#cmp-download-count").textContent = `(${total.toLocaleString()})`;
+      resContainer.querySelector("#cmp-download").disabled = total === 0;
       this.renderKconfigSymbols(resContainer.querySelector("#cmp-kc-symbols"), symRows);
       this.renderKconfigFiles(resContainer.querySelector("#cmp-kc-files"), fileRows);
     };
+
+    resContainer.querySelectorAll(".compare-chip[data-kc-status]").forEach((btn) => {
+      btn.onclick = () => {
+        const key = btn.dataset.kcStatus;
+        if (this.kconfigStatusFilter.has(key)) this.kconfigStatusFilter.delete(key);
+        else this.kconfigStatusFilter.add(key);
+        btn.classList.toggle("active", this.kconfigStatusFilter.has(key));
+        renderLists();
+        this.persist();
+      };
+    });
+
+    const filterInput = resContainer.querySelector("#cmp-kc-filter");
     filterInput.oninput = () => {
       this.kconfigFilter = filterInput.value;
       renderLists();
       this.persist();
     };
+
+    this.wireDownloadMenu(resContainer, (format) => this.downloadKconfigRows(format));
     renderLists();
+  }
+
+  /** Download every option and Kconfig file matching the chips and the filter (not only the 2000 rendered). */
+  downloadKconfigRows(format) {
+    const { symbols, files } = this.filteredKconfigEntries();
+    if (symbols.length + files.length === 0) return;
+    const statuses = KCONFIG_STATUSES.filter((k) => this.kconfigStatusFilter.has(k));
+    const filter = this.kconfigFilter.trim();
+    const name = this.downloadName("compare-kconfig", statuses, filter);
+    // Files defining an option, on either side
+    const defFiles = (sym) => [...new Set([...(sym.before || []), ...(sym.after || [])].map((d) => d.file).filter(Boolean))];
+
+    if (format === "options") {
+      downloadText(`${name}_options.txt`, symbols.map((sym) => `CONFIG_${sym.name}`).join("\n") + "\n");
+      return;
+    }
+    if (format === "files") {
+      downloadText(`${name}_files.txt`, files.map((f) => f.file).join("\n") + "\n");
+      return;
+    }
+    if (format === "tsv") {
+      const cell = (v) => String(v ?? "").replace(/[\t\r\n]/g, " ");
+      const lines = [["kind", "status", "name", "files", "changed_fields"].join("\t")];
+      for (const sym of symbols) {
+        lines.push(["option", STATUS_LABELS[sym.status], `CONFIG_${sym.name}`, defFiles(sym).join(","),
+          (sym.changes || []).map((c) => c.field).join(",")].map(cell).join("\t"));
+      }
+      for (const f of files) lines.push(["file", STATUS_LABELS[f.status], f.file, "", ""].map(cell).join("\t"));
+      downloadText(`${name}.tsv`, lines.join("\n") + "\n", "text/tab-separated-values");
+      return;
+    }
+    const data = {
+      base: this.versionA,
+      target: this.versionB,
+      generated: new Date().toISOString(),
+      filters: { statuses: statuses.length ? statuses : KCONFIG_STATUSES.slice(), contains: filter },
+      summary: this.kconfigResult?.summary || {},
+      count: { options: symbols.length, files: files.length },
+      options: symbols.map((sym) => {
+        const out = { name: sym.name, status: sym.status, files: defFiles(sym) };
+        if (sym.before) out.before = sym.before;
+        if (sym.after) out.after = sym.after;
+        if (sym.changes) out.changes = sym.changes;
+        return out;
+      }),
+      files: files.map((f) => ({ status: f.status, path: f.file })),
+    };
+    downloadText(`${name}.json`, JSON.stringify(data, null, 2) + "\n", "application/json");
   }
 
   renderKconfigSymbols(listEl, symbols) {

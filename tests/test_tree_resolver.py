@@ -17,75 +17,11 @@ from webapp.backend.services.tree_resolver import (
 
 
 class TestTreeResolverService(unittest.TestCase):
-    """Test suite for TreeResolverService (Path A single-file and Path B full-tree resolution)."""
+    """Test suite for TreeResolverService (Path B full-tree resolution)."""
 
     def setUp(self) -> None:
         self.resolver = TreeResolverService(max_cache_size=4)
         self.mock_cursor = MagicMock()
-
-    def test_path_a_direct_checkpoint_lookup(self) -> None:
-        """Verify Path A returns baseline blob from checkpoint when no deltas intervened."""
-        # Commit 100 is a checkpoint with fnid=5 -> blob_id=42
-        def execute_side_effect(sql: str, params: tuple | list) -> None:
-            if "FROM m_bridge_checkpoint WHERE commit_id = %s LIMIT 1" in sql:
-                self.mock_cursor.fetchone.return_value = {"1": 1}
-            elif "FROM m_bridge_checkpoint" in sql and "fnid = %s" in sql:
-                self.mock_cursor.fetchone.return_value = {"blob_id": 42}
-            else:
-                self.mock_cursor.fetchone.return_value = None
-
-        self.mock_cursor.execute.side_effect = execute_side_effect
-
-        blob_id = self.resolver.resolve_file_blob(commit_id=100, fnid=5, cursor=self.mock_cursor)
-        self.assertEqual(blob_id, 42)
-
-    def test_path_a_delta_override(self) -> None:
-        """Verify Path A correctly returns updated blob_id from m_commit_file deltas."""
-        # Commit 102 has parent 101, parent of 101 is checkpoint 100
-        # In commit 102, fnid 5 was modified to blob 99
-        parents = {102: 101, 101: 100}
-
-        def execute_side_effect(sql: str, params: tuple | list) -> None:
-            if "FROM m_bridge_checkpoint WHERE commit_id = %s LIMIT 1" in sql:
-                cid = params[0]
-                self.mock_cursor.fetchone.return_value = {"1": 1} if cid == 100 else None
-            elif "FROM m_commit_parent" in sql:
-                cid = params[0]
-                p = parents.get(cid)
-                self.mock_cursor.fetchone.return_value = {"parent_commit_id": p} if p else None
-            elif "FROM m_commit_file" in sql:
-                self.mock_cursor.fetchall.return_value = [
-                    {"commit_id": 102, "blob_id": 99, "change_type": "M"}
-                ]
-            else:
-                self.mock_cursor.fetchone.return_value = None
-
-        self.mock_cursor.execute.side_effect = execute_side_effect
-
-        blob_id = self.resolver.resolve_file_blob(commit_id=102, fnid=5, cursor=self.mock_cursor)
-        self.assertEqual(blob_id, 99)
-
-    def test_path_a_file_deletion_returns_none(self) -> None:
-        """Verify Path A returns None when file was deleted in intermediate commit."""
-        parents = {101: 100}
-
-        def execute_side_effect(sql: str, params: tuple | list) -> None:
-            if "FROM m_bridge_checkpoint WHERE commit_id = %s LIMIT 1" in sql:
-                cid = params[0]
-                self.mock_cursor.fetchone.return_value = {"1": 1} if cid == 100 else None
-            elif "FROM m_commit_parent" in sql:
-                self.mock_cursor.fetchone.return_value = {"parent_commit_id": 100}
-            elif "FROM m_commit_file" in sql:
-                self.mock_cursor.fetchall.return_value = [
-                    {"commit_id": 101, "blob_id": 0, "change_type": "D"}
-                ]
-            else:
-                self.mock_cursor.fetchone.return_value = None
-
-        self.mock_cursor.execute.side_effect = execute_side_effect
-
-        blob_id = self.resolver.resolve_file_blob(commit_id=101, fnid=5, cursor=self.mock_cursor)
-        self.assertIsNone(blob_id)
 
     def test_path_b_full_tree_assembly_and_lru_caching(self) -> None:
         """Verify Path B constructs full tree by applying deltas to checkpoint and caches result."""
@@ -179,7 +115,7 @@ class TestGitTreeBlobPaths(unittest.TestCase):
         with patch.object(ss, "get_db_cursor", return_value=ctx), \
              patch.object(ss, "get_version_info", return_value=(None, "")), \
              patch.object(ss.git_tree_resolver, "blob_paths", return_value={10: ["init/main.c"], 20: ["mm/slab.c"]}):
-            results = ss.SymbolService().search_symbols("0123abcd", q="start_kernel", limit=10)
+            results = ss.SymbolService().search_symbols("0123abcd", "start_kernel", limit=10)
         self.assertEqual([(r["def_id"], r["file_path"]) for r in results], [(2, "init/main.c"), (3, "mm/slab.c")])
 
 

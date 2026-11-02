@@ -16,7 +16,7 @@ import { configLookup, evalBuild } from "../views/kconfig/build_condition.js";
 const MAX_CANDIDATE_FILES = 6;
 
 /** First of `defs` (backend rank order) the configuration compiles, or null when none is known to be. */
-export async function pickConfiguredDefinition(version, defs, ctx = state.definitionContext()) {
+async function pickConfiguredDefinition(version, defs, ctx = state.definitionContext()) {
   const files = [...new Set(defs.map((d) => d.file).filter(Boolean))].slice(0, MAX_CANDIDATE_FILES);
   const candidates = defs.filter((d) => files.includes(d.file));
   if (candidates.length < 2) return null;
@@ -56,7 +56,7 @@ export async function pickConfiguredDefinition(version, defs, ctx = state.defini
 }
 
 /** getSymbolDetail() whose definition is the one the active configuration compiles. */
-export async function resolveDefinition(version, name, fromFile = null) {
+async function resolveDefinition(version, name, fromFile = null) {
   const ctx = state.definitionContext();
   const detail = await api.getSymbolDetail(version, name, ctx.arch, fromFile);
   if (!detail || detail.is_kconfig || !Array.isArray(detail.definitions) || detail.definitions.length < 2) return detail;

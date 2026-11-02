@@ -6,31 +6,31 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from webapp.main import (
-    get_kconfig_defconfigs,
-    get_kconfig_defconfig_content,
-    get_kconfig_tree,
-    get_kconfig_symbol_detail,
-)
+from webapp.backend.services.kconfig_service import KconfigService
+
+_kconfig = KconfigService()
+get_kconfig_defconfigs = _kconfig.get_defconfigs
+get_kconfig_defconfig_content = _kconfig.get_defconfig_content
+get_kconfig_tree = _kconfig.get_tree
+get_kconfig_symbol_detail = _kconfig.get_symbol_detail
 
 
 class TestWebappDefconfig(unittest.TestCase):
-    """Test defconfig listing, content retrieval, architecture-scoped dependencies, and symbol lifecycle."""
+    """Test defconfig listing, content retrieval, architecture-scoped dependencies, and symbol detail."""
 
     def test_get_kconfig_defconfigs_x86(self) -> None:
         """Test retrieving x86 architecture defconfigs (default = what `make ARCH=<arch> defconfig` loads)."""
         res = get_kconfig_defconfigs("v3.0", "x86_64")
         self.assertIn("defconfigs", res)
-        self.assertIn("canonical_default", res)
-        self.assertGreaterEqual(res["total_count"], 1)
+        self.assertGreaterEqual(len(res["defconfigs"]), 1)
 
-        canonical = res["canonical_default"]
-        self.assertIsNotNone(canonical)
-        self.assertEqual(canonical["name"], "x86_64_defconfig")
-        self.assertTrue(canonical["is_canonical"])
+        def canonical(items: list[dict]) -> list[str]:
+            return [d["name"] for d in items if d["is_canonical"]]
 
+        # Exactly one default
+        self.assertEqual(canonical(res["defconfigs"]), ["x86_64_defconfig"])
         # arch/x86/Makefile: ARCH=x86 selects i386_defconfig
-        self.assertEqual(get_kconfig_defconfigs("v3.0", "x86")["canonical_default"]["name"], "i386_defconfig")
+        self.assertEqual(canonical(get_kconfig_defconfigs("v3.0", "x86")["defconfigs"]), ["i386_defconfig"])
 
     def test_get_kconfig_defconfig_content_full_path(self) -> None:
         """Test parsing defconfig using full relative file path."""
@@ -38,7 +38,7 @@ class TestWebappDefconfig(unittest.TestCase):
         self.assertEqual(res["name"], "x86_64_defconfig")
         self.assertEqual(res["file_path"], "arch/x86/configs/x86_64_defconfig")
         self.assertEqual(res["bits"], 64)
-        self.assertGreater(res["symbol_count"], 50)
+        self.assertGreater(len(res["values"]), 50)
         self.assertIn("values", res)
         self.assertIn("content", res)
         self.assertGreater(len(res["content"]), 0)
@@ -51,7 +51,7 @@ class TestWebappDefconfig(unittest.TestCase):
         self.assertEqual(res["name"], "x86_64_defconfig")
         self.assertEqual(res["file_path"], "arch/x86/configs/x86_64_defconfig")
         self.assertEqual(res["bits"], 64)
-        self.assertGreater(res["symbol_count"], 50)
+        self.assertGreater(len(res["values"]), 50)
         self.assertIn("values", res)
         self.assertIn("content", res)
         self.assertGreater(len(res["content"]), 0)
@@ -63,42 +63,39 @@ class TestWebappDefconfig(unittest.TestCase):
         self.assertEqual(res["name"], "i386_defconfig")
         self.assertEqual(res["file_path"], "arch/x86/configs/i386_defconfig")
         self.assertEqual(res["bits"], 32)
-        self.assertGreater(res["symbol_count"], 50)
+        self.assertGreater(len(res["values"]), 50)
         self.assertIn("values", res)
 
     def test_get_kconfig_defconfigs_arm(self) -> None:
         """Test retrieving ARM architecture defconfigs."""
         res = get_kconfig_defconfigs("v3.0", "arm")
         self.assertIn("defconfigs", res)
-        self.assertGreaterEqual(res["total_count"], 1)
+        self.assertGreaterEqual(len(res["defconfigs"]), 1)
 
     def test_x86_tree_scoped_arch_dependencies(self) -> None:
-        """Verify that x86 menu tree only retains x86 architecture dependencies."""
-        tree = get_kconfig_tree("v3.0", "x86", include_nodes=True)
-        self.assertIn("nodes", tree)
+        """Verify that the x86 model only holds the x86 architecture's symbols."""
+        tree = get_kconfig_tree("v3.0", "x86")
+        self.assertIn("symbols", tree)
+        self.assertIn("64BIT", tree["symbols"])
+        # Symbols of other architectures' Kconfig files never enter the x86 model
+        self.assertNotIn("PA8X00", tree["symbols"])
+        self.assertNotIn("TILEGX", tree["symbols"])
 
-        sym_64bit_node = None
-        for n in tree["nodes"]:
-            if n.get("symbol_name") == "64BIT":
-                sym_64bit_node = n
-                break
-
-        if sym_64bit_node:
-            deps = sym_64bit_node.get("depends_on", [])
-            self.assertNotIn("PA8X00", deps)
-            self.assertNotIn("TILEGX", deps)
-
-    def test_kconfig_symbol_lifecycle_metadata(self) -> None:
-        """Verify Kconfig symbol lifecycle tracking fields (vid_s, vid_e, added_version, lifecycle_status)."""
+    def test_kconfig_symbol_detail(self) -> None:
+        """Verify the Kconfig symbol detail the KConfig view reads (definition sites, help, Kbuild rules)."""
         try:
             sym = get_kconfig_symbol_detail("v3.0", "EXT4_FS")
         except Exception:
             raise unittest.SkipTest("EXT4_FS symbol not indexed in database.")
         self.assertEqual(sym["name"], "EXT4_FS")
-        self.assertEqual(sym["vname_s"], "v3.0")
-        self.assertEqual(sym["added_version"], "v3.0")
-        self.assertTrue(sym["is_active"])
-        self.assertEqual(sym["lifecycle_status"], "Active")
+        self.assertTrue(sym["defined_for_arch"])
+        self.assertEqual(sym["declarations"][0]["file_path"], "fs/ext4/Kconfig")
+        self.assertIn("help", sym)
+        self.assertIn("kbuild", sym)
+        self.assertIn("compiled_files", sym)
+        # The per-revision model has no lifecycle: those compatibility fields are gone
+        for key in ("vname_s", "added_version", "is_active", "lifecycle_status", "menu_path"):
+            self.assertNotIn(key, sym)
 
 
 if __name__ == "__main__":

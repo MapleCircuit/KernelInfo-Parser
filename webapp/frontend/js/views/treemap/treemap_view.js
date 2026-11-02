@@ -229,4 +229,11 @@ export class TreemapView {
       }
     };
   }
+
+  dispose() {
+    if (this._resizeObserver) {
+      this._resizeObserver.disconnect();
+      this._resizeObserver = null;
+    }
+  }
 }

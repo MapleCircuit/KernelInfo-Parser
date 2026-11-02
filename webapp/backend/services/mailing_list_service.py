@@ -29,6 +29,13 @@ _BRACKET_TAG_RE = re.compile(r"^\s*\[[^\]]*\]\s*")
 
 # Safety bound on how many sibling threads a version lookup will expand.
 MAX_VERSION_THREADS = 8
+# Threads, series and searches grow while the archive is fetched; a cached answer is reused this long.
+# Messages never change and stay cached until evicted.
+LIVE_CACHE_TTL = 60.0
+
+
+def _lore_search_url(query: str) -> str:
+    return f"{LORE_BASE_URL}?q={urllib.parse.quote_plus(query)}" if query else LORE_BASE_URL
 
 
 def normalize_series_subject(subject: str) -> str:
@@ -90,7 +97,6 @@ class MailingListService:
         max_search_cache: int = 64,
     ) -> None:
         self._client: MailingListClient | None = None
-        self._client_init_failed = False
         self._client_init_error = ""
         self._lock = threading.Lock()
 
@@ -99,9 +105,10 @@ class MailingListService:
         self._max_search_cache = max_search_cache
 
         self._email_cache: OrderedDict[str, dict[str, Any]] = OrderedDict()
-        self._thread_cache: OrderedDict[int, dict[str, Any]] = OrderedDict()
-        self._search_cache: OrderedDict[str, dict[str, Any]] = OrderedDict()
-        self._version_cache: OrderedDict[str, dict[str, Any]] = OrderedDict()
+        # (stored at, answer): see LIVE_CACHE_TTL
+        self._thread_cache: OrderedDict[int, tuple[float, dict[str, Any]]] = OrderedDict()
+        self._search_cache: OrderedDict[str, tuple[float, dict[str, Any]]] = OrderedDict()
+        self._version_cache: OrderedDict[str, tuple[float, dict[str, Any]]] = OrderedDict()
 
     def _get_client(self) -> MailingListClient | None:
         """Lazily initialize client connection to in-process store or daemon."""
@@ -116,11 +123,9 @@ class MailingListService:
 
             try:
                 self._client = MailingListClient()
-                self._client_init_failed = False
                 self._client_init_error = ""
                 return self._client
             except Exception as exc:
-                self._client_init_failed = True
                 self._client_init_error = str(exc)
                 logger.warning("Could not initialize MailingListClient: %s", exc)
                 return None
@@ -158,7 +163,6 @@ class MailingListService:
         return {
             "enabled": True,
             "available": is_healthy,
-            "use_tunnel": client.use_tunnel,
             "port": client._effective_port,
             "lore_url": LORE_BASE_URL,
             "reason": None if is_healthy else "Mailing list daemon not responding on port",
@@ -227,6 +231,23 @@ class MailingListService:
                 "lore_url": f"{LORE_BASE_URL}{key}/",
             }
 
+    def _live_get(self, cache: OrderedDict, key: Any) -> dict[str, Any] | None:
+        """A cached thread/series/search answer younger than LIVE_CACHE_TTL (caller holds the lock)."""
+        hit = cache.get(key)
+        if hit is None:
+            return None
+        if time.monotonic() - hit[0] >= LIVE_CACHE_TTL:
+            del cache[key]
+            return None
+        cache.move_to_end(key)
+        return hit[1]
+
+    def _live_put(self, cache: OrderedDict, key: Any, value: dict[str, Any], limit: int) -> None:
+        cache[key] = (time.monotonic(), value)
+        cache.move_to_end(key)
+        while len(cache) > limit:
+            cache.popitem(last=False)
+
     def _resolve_tid(self, tid: int, clean_mid: str) -> tuple[int, str]:
         """Resolve a thread ID from an explicit tid or, failing that, a Message-ID hint."""
         if tid > 0 or not clean_mid:
@@ -255,46 +276,44 @@ class MailingListService:
                 "messages": [],
             }
 
+        cached_res = None
         with self._lock:
-            if tid in self._thread_cache:
-                self._thread_cache.move_to_end(tid)
-                return self._thread_cache[tid]
+            cached_res = self._live_get(self._thread_cache, tid)
 
-        client = self._get_client()
-        if client is None:
-            return {
-                "available": False,
-                "tid": tid,
-                "error": self._client_init_error or "Mailing list archive unavailable",
-                "lore_url": f"{LORE_BASE_URL}{clean_mid}/" if clean_mid else LORE_BASE_URL,
-                "total": 0,
-                "messages": [],
-            }
+        if cached_res is None:
+            client = self._get_client()
+            if client is None:
+                return {
+                    "available": False,
+                    "tid": tid,
+                    "error": self._client_init_error or "Mailing list archive unavailable",
+                    "lore_url": f"{LORE_BASE_URL}{clean_mid}/" if clean_mid else LORE_BASE_URL,
+                    "total": 0,
+                    "messages": [],
+                }
 
-        try:
-            thread_data = client.get_thread(tid)
-            result: dict[str, Any] = {
-                "available": True,
-                "lore_url": f"{LORE_BASE_URL}t/{tid}" if tid else LORE_BASE_URL,
-                **thread_data,
-            }
+            try:
+                thread_data = client.get_thread(tid)
+                cached_res = {
+                    "available": True,
+                    "lore_url": f"{LORE_BASE_URL}t/{tid}" if tid else LORE_BASE_URL,
+                    **thread_data,
+                }
 
-            with self._lock:
-                self._thread_cache[tid] = result
-                if len(self._thread_cache) > self._max_thread_cache:
-                    self._thread_cache.popitem(last=False)
+                with self._lock:
+                    self._live_put(self._thread_cache, tid, cached_res, self._max_thread_cache)
+            except Exception as exc:
+                logger.debug("Error retrieving thread %d: %s", tid, exc)
+                return {
+                    "available": False,
+                    "tid": tid,
+                    "error": str(exc),
+                    "lore_url": LORE_BASE_URL,
+                    "total": 0,
+                    "messages": [],
+                }
 
-            return result
-        except Exception as exc:
-            logger.debug("Error retrieving thread %d: %s", tid, exc)
-            return {
-                "available": False,
-                "tid": tid,
-                "error": str(exc),
-                "lore_url": LORE_BASE_URL,
-                "total": 0,
-                "messages": [],
-            }
+        return {**cached_res, "total": len(cached_res.get("messages", []))}
 
     @staticmethod
     def _absorb_version_thread(
@@ -368,9 +387,9 @@ class MailingListService:
 
         cache_key = f"{tid}:{clean_mid}"
         with self._lock:
-            if cache_key in self._version_cache:
-                self._version_cache.move_to_end(cache_key)
-                return self._version_cache[cache_key]
+            cached = self._live_get(self._version_cache, cache_key)
+            if cached is not None:
+                return cached
 
         thread = self.get_thread(tid)
         if not thread.get("available"):
@@ -446,9 +465,7 @@ class MailingListService:
         }
 
         with self._lock:
-            self._version_cache[cache_key] = result
-            if len(self._version_cache) > self._max_thread_cache:
-                self._version_cache.popitem(last=False)
+            self._live_put(self._version_cache, cache_key, result, self._max_thread_cache)
 
         return result
 
@@ -467,22 +484,21 @@ class MailingListService:
         cache_key = f"{clean_q}:{p}:{lim}:{filter_type}"
 
         with self._lock:
-            if cache_key in self._search_cache:
-                self._search_cache.move_to_end(cache_key)
-                return self._search_cache[cache_key]
+            cached = self._live_get(self._search_cache, cache_key)
+            if cached is not None:
+                return cached
 
         client = self._get_client()
         if client is None:
             return {
                 "available": False,
                 "query": clean_q,
-                "filter_type": filter_type,
                 "page": p,
                 "limit": lim,
                 "total": 0,
                 "results": [],
                 "error": self._client_init_error or "Mailing list archive unavailable",
-                "lore_url": f"{LORE_BASE_URL}?q={clean_q}" if clean_q else LORE_BASE_URL,
+                "lore_url": _lore_search_url(clean_q),
             }
 
         try:
@@ -497,14 +513,12 @@ class MailingListService:
             result: dict[str, Any] = {
                 "available": True,
                 "page": p,
-                "lore_url": f"{LORE_BASE_URL}?q={clean_q}" if clean_q else LORE_BASE_URL,
+                "lore_url": _lore_search_url(clean_q),
                 **search_data,
             }
 
             with self._lock:
-                self._search_cache[cache_key] = result
-                if len(self._search_cache) > self._max_search_cache:
-                    self._search_cache.popitem(last=False)
+                self._live_put(self._search_cache, cache_key, result, self._max_search_cache)
 
             return result
         except Exception as exc:
@@ -512,13 +526,12 @@ class MailingListService:
             return {
                 "available": False,
                 "query": clean_q,
-                "filter_type": filter_type,
                 "page": p,
                 "limit": lim,
                 "total": 0,
                 "results": [],
                 "error": str(exc),
-                "lore_url": f"{LORE_BASE_URL}?q={clean_q}" if clean_q else LORE_BASE_URL,
+                "lore_url": _lore_search_url(clean_q),
             }
 
 

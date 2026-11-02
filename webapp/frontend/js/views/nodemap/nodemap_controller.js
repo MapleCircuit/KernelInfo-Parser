@@ -1,5 +1,5 @@
 /**
- * nodemap_controller.js - Main Two.js Schematic Canvas Controller.
+ * nodemap_controller.js - Schematic Canvas Controller (DOM nodes, SVG wires).
  * Manages pan/zoom canvas, interactive nodes, bezier edge routing,
  * lossless SVG/PNG/JSON export, and hierarchical constituent expansion.
  */
@@ -7,6 +7,7 @@ import { api } from "../../api.js";
 import { state } from "../../state.js";
 import { toast } from "../../components/toast.js";
 import { contextMenu } from "../../components/context_menu.js";
+import { escapeHtml } from "../../components/modal.js";
 import { NodeModel, EdgeModel } from "./node_model.js";
 import { EdgeRouter } from "./edge_router.js";
 import { NodeRenderer } from "./node_renderer.js";
@@ -22,7 +23,6 @@ export class NodeMapController {
     this.panY = 0;
     this.zoom = 1.0;
 
-    this.two = null;
     this.containerEl = null;
     this.canvasWrapperEl = null;
     this.overlayLayerEl = null;
@@ -77,15 +77,6 @@ export class NodeMapController {
     this.overlayLayerEl = containerEl.querySelector("#nm-overlay-layer");
     this.wireLayerSvg = containerEl.querySelector("#nm-wire-layer");
 
-    // Initialize Two.js backend if loaded
-    if (window.Two) {
-      this.two = new window.Two({
-        type: window.Two.Types.svg,
-        fullscreen: false,
-        autostart: true
-      }).appendTo(this.canvasWrapperEl);
-    }
-
     // Node Renderer
     this.renderer = new NodeRenderer(this.overlayLayerEl, {
       getZoom: () => this.zoom,
@@ -133,8 +124,11 @@ export class NodeMapController {
     // If initial nodes or diagram requested (e.g. from Callgraph, Pahole, or Context Menu)
     if (tabData.initialNodes && Array.isArray(tabData.initialNodes)) {
       this.importDiagram(tabData.initialNodes, tabData.initialEdges || []);
+      delete tabData.initialNodes;
+      delete tabData.initialEdges;
     } else if (tabData.initialNode) {
       this.addSymbolNode(tabData.initialNode);
+      delete tabData.initialNode;
     } else if (this.nodes.length === 0) {
       // Default sample nodes
       this.loadSampleDiagram();
@@ -152,17 +146,23 @@ export class NodeMapController {
       }
     });
 
-    window.addEventListener("mousemove", (e) => {
-      if (this.isPanning) {
-        this.panX = e.clientX - this.panStartX;
-        this.panY = e.clientY - this.panStartY;
-        this.applyTransform();
-      }
-    });
+    if (!this._onMouseMove) {
+      this._onMouseMove = (e) => {
+        if (this.isPanning) {
+          this.panX = e.clientX - this.panStartX;
+          this.panY = e.clientY - this.panStartY;
+          this.applyTransform();
+        }
+      };
+      window.addEventListener("mousemove", this._onMouseMove);
+    }
 
-    window.addEventListener("mouseup", () => {
-      this.isPanning = false;
-    });
+    if (!this._onMouseUp) {
+      this._onMouseUp = () => {
+        this.isPanning = false;
+      };
+      window.addEventListener("mouseup", this._onMouseUp);
+    }
 
     this.canvasWrapperEl.addEventListener("wheel", (e) => {
       e.preventDefault();
@@ -417,11 +417,11 @@ export class NodeMapController {
       inspectorEl.innerHTML = `
         <div class="inspector-field">
           <span class="inspector-label">Title</span>
-          <span class="inspector-val">${node.title}</span>
+          <span class="inspector-val">${escapeHtml(node.title)}</span>
         </div>
         <div class="inspector-field">
           <span class="inspector-label">Type</span>
-          <span class="inspector-val">${node.type}</span>
+          <span class="inspector-val">${escapeHtml(node.type)}</span>
         </div>
         <div class="inspector-field">
           <span class="inspector-label">Coordinates</span>
@@ -433,7 +433,7 @@ export class NodeMapController {
             ${
               (node.constituents || []).map((c) => `
                 <div style="font-family:var(--font-mono);font-size:11px;color:var(--accent-blue);">
-                  • ${c.name || c.type}
+                  • ${escapeHtml(c.name || c.type || "")}
                 </div>
               `).join("") || `<span style="color:var(--text-muted);">None loaded</span>`
             }
@@ -457,15 +457,20 @@ export class NodeMapController {
         } else if (node.title) {
           const cleanName = node.title.replace(/^struct\s+/, "").replace(/\(\)$/, "").trim();
           if (node.type === "struct" || node.title.startsWith("struct")) {
-            const res = await api.getPaholeLayout(this.currentVersion, cleanName);
+            // 404 when the revision defines no such struct: fall through to the definition's AST
+            const res = await api.getPaholeLayout(this.currentVersion, cleanName).catch(() => null);
             if (res && Array.isArray(res.members) && res.members.length > 0) {
               node.constituents = res.members.map((m) => ({ name: `${m.type} ${m.name}` }));
             }
           }
           if (!node.constituents || node.constituents.length === 0) {
+            // The children of the definition's AST (symbol detail itself lists no members)
             const detail = await api.getSymbolDetail(this.currentVersion, cleanName);
-            if (detail && Array.isArray(detail.members) && detail.members.length > 0) {
-              node.constituents = detail.members.map((m) => ({ name: m.name || m.spelling }));
+            const astId = detail?.definition?.ast_id;
+            if (astId) {
+              const res = await api.getAstTree(this.currentVersion, astId);
+              const children = res.node?.children || res.children || [];
+              node.constituents = children.map((c) => ({ name: c.spelling || c.name || c.type_name }));
             }
           }
         }
@@ -682,8 +687,8 @@ export class NodeMapController {
       svgContent += `
         <g transform="translate(${node.x}, ${node.y})">
           <rect width="${node.width}" height="100" rx="6" fill="#161b22" stroke="${node.color}" stroke-width="2"/>
-          <text x="12" y="24" fill="#ffffff" font-family="sans-serif" font-weight="bold" font-size="12">${node.title}</text>
-          <text x="12" y="44" fill="#8b949e" font-family="monospace" font-size="10">${node.type}</text>
+          <text x="12" y="24" fill="#ffffff" font-family="sans-serif" font-weight="bold" font-size="12">${escapeHtml(node.title)}</text>
+          <text x="12" y="44" fill="#8b949e" font-family="monospace" font-size="10">${escapeHtml(node.type)}</text>
         </g>
       `;
     });
@@ -707,6 +712,25 @@ export class NodeMapController {
     ctx.fillStyle = "#0a0d12";
     ctx.fillRect(0, 0, canvas.width, canvas.height);
 
+    // Draw edges first so they sit beneath nodes
+    ctx.strokeStyle = "#58a6ff";
+    ctx.lineWidth = 2;
+    this.edges.forEach((edge) => {
+      const fromNode = this.nodes.find((n) => n.id === edge.fromNodeId);
+      const toNode = this.nodes.find((n) => n.id === edge.toNodeId);
+      if (fromNode && toNode) {
+        const p = EdgeRouter.computeBezierPath(fromNode.x + fromNode.width, fromNode.y + 40, toNode.x, toNode.y + 40);
+        ctx.beginPath();
+        ctx.moveTo(p.points[0].x, p.points[0].y);
+        ctx.bezierCurveTo(
+          p.points[1].x, p.points[1].y,
+          p.points[2].x, p.points[2].y,
+          p.points[3].x, p.points[3].y
+        );
+        ctx.stroke();
+      }
+    });
+
     // Draw nodes
     this.nodes.forEach((node) => {
       ctx.fillStyle = "#161b22";
@@ -729,6 +753,17 @@ export class NodeMapController {
     a.download = "nodemap_schematic.png";
     a.click();
     toast.success("Exported lossless PNG image");
+  }
+
+  dispose() {
+    if (this._onMouseMove) {
+      window.removeEventListener("mousemove", this._onMouseMove);
+      this._onMouseMove = null;
+    }
+    if (this._onMouseUp) {
+      window.removeEventListener("mouseup", this._onMouseUp);
+      this._onMouseUp = null;
+    }
   }
 
   exportJSON() {

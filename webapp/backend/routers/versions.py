@@ -11,7 +11,7 @@ from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query
 
-from core.config import DEFAULT_TAG_VIEWS, matches_branch_filter
+from core.config import DEFAULT_TAG_VIEWS, detect_default_branch, matches_branch_filter
 from webapp.backend.config import (
     get_active_repo_name,
     get_active_repository,
@@ -24,11 +24,9 @@ from webapp.backend.config import (
 from webapp.backend.database.helpers import finished_ref_sql, get_active_repo_id, hash_hex, safe_decode
 from webapp.backend.database.pool import get_db_cursor
 from webapp.backend.security.git import safe_rev
-from webapp.backend.services.git_service import GitService
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api", tags=["versions"])
-git_service = GitService()
 
 PRERELEASE_MARKERS = ("-rc", "-pre", "-alpha", "-beta")
 
@@ -57,6 +55,19 @@ def _stamp(commit_hash: str, parsed_at: Any) -> str:
 
 def _hex(val: Any) -> str:
     return hash_hex(val) if val else ""
+
+
+def default_branch_of(repo: dict[str, Any]) -> str:
+    """The repository's default branch: configured, else what its clone has checked out (as core.config
+    detects it for auto-detected repositories), else "master"."""
+    configured = (repo.get("default_branch") or "").strip()
+    if configured:
+        return configured
+    try:
+        detected = detect_default_branch(resolve_repo_path(repo))
+    except Exception:  # noqa: BLE001 - a missing clone still lists its configured branches
+        detected = ""
+    return detected if detected and detected != "HEAD" else "master"
 
 
 def _git_lines(args: list[str], timeout: float = 10.0) -> list[str]:
@@ -112,7 +123,7 @@ def get_projects() -> dict[str, Any]:
             "repo": name,
             "slug": repo.get("project") or name,
             "path": repo.get("path", ""),
-            "default_branch": repo.get("default_branch") or "master",
+            "default_branch": default_branch_of(repo),
             "git_url": repo.get("git_url", ""),
             "indexed": db_row is not None,
             "available": resolve_repo_path(repo).exists(),
@@ -130,7 +141,7 @@ def get_branches() -> dict[str, Any]:
 
     repo = get_active_repository()
     branch_filter = repo.get("branch_filter")
-    default_branch = repo.get("default_branch") or "main"
+    default_branch = default_branch_of(repo)
 
     local_branches: set[str] = set()
     ref_entries: list[tuple[str, str, str]] = []  # (refname, short_name, obj)
@@ -186,12 +197,11 @@ def get_branches() -> dict[str, Any]:
             if bname and bname not in seen and matches_branch_filter(bname, branch_filter):
                 seen.add(bname)
                 commit_hash = _hex(row.get("commit_hash"))
-                is_default = bname == default_branch or (not default_branch and bname in ("main", "master"))
                 branches.append({
                     "name": bname,
                     "commit_id": row["commit_id"],
                     "commit_hash": commit_hash,
-                    "is_default": is_default,
+                    "is_default": bname == default_branch,
                     # The branch may have moved in Git since it was parsed
                     "stamp": _stamp(git_heads.get(bname) or commit_hash, row.get("parsed_at") or 0),
                 })
@@ -199,18 +209,16 @@ def get_branches() -> dict[str, Any]:
     for bname, head in git_heads.items():
         if bname not in seen:
             seen.add(bname)
-            is_default = bname == default_branch or (not default_branch and bname in ("main", "master"))
             branches.append({
                 "name": bname,
                 "commit_id": 0,
                 "commit_hash": head,
-                "is_default": is_default,
+                "is_default": bname == default_branch,
                 "stamp": _stamp(head, None),
             })
 
     if not branches:
-        fallback_name = default_branch or "main"
-        branches.append({"name": fallback_name, "commit_id": 0, "commit_hash": "", "is_default": True})
+        branches.append({"name": default_branch, "commit_id": 0, "commit_hash": "", "is_default": True, "stamp": ""})
 
     def branch_sort_key(b: dict[str, Any]) -> tuple[int, str]:
         if b.get("is_default"):
@@ -424,14 +432,3 @@ def get_versions(include_rc: bool = Query(True)) -> dict[str, Any]:
     order = {line.split()[0]: i for i, line in enumerate(tag_lines)}
     versions.sort(key=lambda v: order.get(v["vname"], len(order)))
     return {"total": len(versions), "versions": versions}
-
-
-@router.get("/version/{version_name}/timeline")
-def get_version_timeline(
-    version_name: str,
-    limit: int = Query(100),
-    direction: str = Query("past"),
-    cursor_id: int | None = Query(None),
-) -> dict[str, Any]:
-    """Retrieve structured commit timeline starting from version anchor commit."""
-    return git_service.get_commit_timeline(version_name, limit=limit, direction=direction, cursor_id=cursor_id)

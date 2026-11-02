@@ -18,7 +18,6 @@ from webapp.backend.routers import (
     maintainers_router,
     commits_router,
     tools_router,
-    system_router,
     sync_router,
     docs_router,
     mail_router,
@@ -32,10 +31,21 @@ SHELL_CACHE_CONTROL = "private, max-age=3600"
 BUILD_CACHE_CONTROL = "public, max-age=31536000, immutable"
 
 
+_INDEX_CACHE: dict[str, str] = {}
+
+
 def render_index(build: str) -> str:
-    """index.html with its assets under /b/<build>/ (relative module imports inherit the prefix)."""
-    html = (FRONTEND_DIR / "index.html").read_text(encoding="utf-8")
-    return html.replace("__KIP_BUILD__", build).replace('"/static/', f'"/b/{build}/')
+    """index.html with its assets under /b/<build>/ (relative module imports inherit the prefix).
+
+    The build is a digest of every frontend file, index.html included, so one rendering per build is
+    all that is ever needed."""
+    html = _INDEX_CACHE.get(build)
+    if html is None:
+        html = (FRONTEND_DIR / "index.html").read_text(encoding="utf-8")
+        html = html.replace("__KIP_BUILD__", build).replace('"/static/', f'"/b/{build}/')
+        _INDEX_CACHE.clear()
+        _INDEX_CACHE[build] = html
+    return html
 
 
 logger = logging.getLogger(__name__)
@@ -111,18 +121,13 @@ def create_app() -> FastAPI:
     app.include_router(maintainers_router)
     app.include_router(commits_router)
     app.include_router(tools_router)
-    app.include_router(system_router)
     app.include_router(sync_router)
     app.include_router(docs_router)
     app.include_router(mail_router)
 
-    # 3. Mount Frontend Static Assets
+    # 3. Frontend files outside a build (the manifest's icon); the shell loads /b/<build>/...
     if FRONTEND_DIR.is_dir():
         app.mount("/static", StaticFiles(directory=str(FRONTEND_DIR)), name="static")
-        for subdir in ["css", "js", "assets", "vendor"]:
-            subpath = FRONTEND_DIR / subdir
-            if subpath.is_dir():
-                app.mount(f"/{subdir}", StaticFiles(directory=str(subpath)), name=subdir)
 
     @app.get("/")
     @app.get("/app")

@@ -13,17 +13,17 @@ webapp/
 ├── backend/
 │   ├── app.py                      # FastAPI application factory & middleware setup
 │   ├── config.py                   # Centralized configuration resolver (via core.config)
-│   ├── models.py                   # Pydantic request & response data schemas
+│   ├── models.py                   # Pydantic request schema of the patch formatter
 │   ├── database/
-│   │   ├── pool.py                 # Thread-safe MySQL connection pool with backoff
+│   │   ├── pool.py                 # Thread-safe database connection pool (no per-cursor reset) with backoff
 │   │   └── helpers.py              # Encoding safeguards, version metadata lookup
 │   ├── security/
 │   │   ├── jail.py                 # Canonical filesystem sandboxing & jail validation
 │   │   ├── git.py                  # Git revision & object-spec validation (argument injection)
 │   │   ├── sql.py                  # SQL LIKE wildcard sanitizer & identifier validation
-│   │   └── middleware.py           # Security headers (CSP) & sliding-window rate limiter
+│   │   └── middleware.py           # Security headers (CSP), sliding-window rate limiter, repository selection (pure ASGI)
 │   ├── services/
-│   │   ├── git_reader.py           # Persistent Git object readers (git cat-file --batch), one per repository
+│   │   ├── git_reader.py           # Persistent Git object readers (git cat-file --batch), up to 4 per repository
 │   │   ├── docs_service.py         # Documentation label index & kernel-doc comment extraction
 │   │   ├── tree_resolver.py        # Tri-Path Git tree resolver & arch-aware definition ranking
 │   │   ├── arch_layout_service.py  # Build layout of an ARCH at a revision (m_arch_root, else Git)
@@ -53,7 +53,6 @@ webapp/
 │   ├── boot.js                     # Loader of the build's modules, recovers from a stale cached shell
 │   ├── manifest.json               # Progressive Web App (PWA) manifest
 │   ├── sw.js                       # Service Worker: cached shell, per-build assets, API offline fallback
-│   ├── vendor/two.min.js           # Vendored vector schematic engine
 │   ├── css/                        # Modular Design System tokens & layout
 │   └── js/
 │       ├── api.js                  # Frontend HTTP client with offline IndexedDB fallback
@@ -64,7 +63,7 @@ webapp/
 │       ├── components/             # Reusable UI controls (tabs, context menu, toast)
 │       ├── utils/                  # Universal clipboard copy and helpers
 │       └── views/                  # Domain-specific view controllers
-├── main.py                         # Application CLI entrypoint & programmatic delegate exports
+├── main.py                         # Server entrypoint (`app`, CLI: -c, --host, --port, --reload)
 ├── API.md                          # Authoritative API documentation (this document)
 └── README.md                       # Quick-start and development instructions
 ```
@@ -92,11 +91,11 @@ before it can reach a command line:
   and every character git gives a meaning in a revision expression (`^`, `~`, `:`, `{`, `}`).
 - `is_safe_rev(rev) -> bool`: the non-raising form, for services that fall back instead of failing
   (`TreeResolverService.resolve_commit_sha()` returns `None`, so callers answer 404 as before).
-- `safe_blob_spec(spec) -> str`: a `<rev>:<path>` spec for `git cat-file --batch`, which reads one
-  request per line. A newline or NUL inside a spec injects further requests and desynchronizes every
-  later answer on that long-lived stream, so such specs are never written to it: `GitReader`
-  (`git_reader.py`) answers `missing`, and `history_service.batch_blob_shas()` — which matches
-  answers to specs by position — leaves the offending spec out and reports `None` for it.
+- `<rev>:<path>` specs for `git cat-file --batch` are checked with `core.globalstuff.is_safe_git_spec()`.
+  The stream reads one request per line: a newline or NUL inside a spec injects further requests and
+  desynchronizes every later answer on that long-lived stream, so such specs are never written to it:
+  `GitReader` (`git_reader.py`) answers `missing`, and `history_service.batch_blob_shas()` — which
+  matches answers to specs by position — leaves the offending spec out and reports `None` for it.
 
 Validation points (every revision a service passes to git goes through one of them):
 `GitService.get_blame()` / `get_file_history()` (`safe_rev`), `_cached_git_file_history()`
@@ -117,17 +116,17 @@ rejects anything `is_valid_identifier()` does not accept (`^[A-Za-z0-9_.~+-]+$`)
 from an accepted name are still escaped (`re.escape`, as `_other_arch_definitions()` does), the
 literal searches pass `-F` so git reads the name as text rather than a basic regex, and a symbol
 with more than `_USAGE_REF_LIMIT` (20,000) references is reported `source_refs_truncated: true`
-instead of being cached whole. `git grep -E` itself uses a DFA, so a pattern cannot make it
+(the KConfig view shows its count as `20000+`) instead of being cached whole. `git grep -E` itself uses a DFA, so a pattern cannot make it
 backtrack; the control here is over how much it can match and retain.
 
 ### 2.2. SQL Wildcard Sanitization (`webapp/backend/security/sql.py`)
-- `escape_like(value: str) -> str`: Escapes the SQL `LIKE` wildcards (`%`, `_`) and the escape character itself, leaving length untouched. For values that must keep their full length, such as a path prefix (`filesystem_service.get_tree()`, `diff_service._fetch_commit_files()`), where an unescaped `%` turns an anchored prefix match into a full scan.
+- `escape_like(value: str) -> str`: Escapes the SQL `LIKE` wildcards (`%`, `_`) and the escape character itself, leaving length untouched. For values that must keep their full length, such as a path prefix (`filesystem_service.get_tree()`), where an unescaped `%` turns an anchored prefix match into a full scan.
 - `sanitize_like_query(query: str) -> str`: Truncates a search query to 100 characters, then escapes it with `escape_like()`. Used by the symbol, maintainer and commit searches. Commit search matters most: `q=%` previously made all three of its `LIKE` clauses match every row of `m_commit` (95,949 rows of the reference database, against 70 for the escaped, literal `%`).
 - `is_valid_identifier(name: str) -> bool`: `^[A-Za-z0-9_.~+-]+$`, the gate described in §2.1.2.
 
 ### 2.3. HTTP Security Headers (`webapp/backend/security/middleware.py`)
 Every response includes hardened security headers:
-- `Content-Security-Policy`: `default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self'; frame-ancestors 'none'`. Scripts and workers are restricted to `'self'`, with `'unsafe-inline'` only for style attributes. `script-src` carries **no** `'unsafe-eval'`: no frontend module evaluates code from a string (no `eval`, no `new Function`, and the vendored `two.min.js` uses neither), so allowing it would only widen what an injected string could do. A route may set a stricter policy of its own (`GET /api/fs/raw/...` sandboxes raw SVG); the middleware only fills in the default.
+- `Content-Security-Policy`: `default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self'; frame-ancestors 'none'`. Scripts and workers are restricted to `'self'`, with `'unsafe-inline'` only for style attributes. `script-src` carries **no** `'unsafe-eval'`: no frontend module evaluates code from a string (no `eval`, no `new Function`), so allowing it would only widen what an injected string could do. A route may set a stricter policy of its own (`GET /api/fs/raw/...` sandboxes raw SVG); the middleware only fills in the default.
 - `X-Frame-Options`: `DENY` (prevents clickjacking attacks).
 - `X-Content-Type-Options`: `nosniff`.
 - `Referrer-Policy`: `strict-origin-when-cross-origin`.
@@ -141,34 +140,36 @@ API as that visitor; with credentials off, the literal `*` is returned instead. 
 is served from the same origin, it still reads `X-KIP-Sync` and every other response header.
 
 ### 2.4. Sliding-Window Rate Limiting
-- `SlidingWindowRateLimiter`: Enforces an in-memory sliding window cap (default 600 requests / 60 seconds per client IP). Exceeding requests receive `HTTP 429 Too Many Requests` with a `Retry-After` header.
+- `SlidingWindowRateLimiter`: Enforces an in-memory sliding window cap (default 600 requests / 60 seconds per client IP) on `/api/` requests; the shell, `/boot.js` and the build's assets are not limited, whatever their extension, while an API path ending in `.js` or `.json` is. Exceeding requests receive `HTTP 429 Too Many Requests` with a `Retry-After` header. Behind a reverse proxy every client shares the proxy's address.
+- The security headers, the rate limiter, `RepoContextMiddleware` and `SyncHeaderMiddleware` are pure ASGI middleware (`BaseHTTPMiddleware` would run each request through an extra task and memory stream).
 
 ### 2.5. Strict Read-Only Database Invariant
 The `webapp/` backend operates exclusively as a read-only presentation and query tier. Under no circumstances may any router, service, middleware, or background task in `webapp/` execute database schema definitions (DDL: `CREATE`, `ALTER`, `DROP`, `TRUNCATE`) or data modification commands (DML: `INSERT`, `UPDATE`, `DELETE`, `REPLACE`).
 - All table creations, schema migrations, and initial seed rows (including `m_db_instance`) are the strict and exclusive responsibility of the parser engine (`core/DBLayout.py`, `main.py`).
 - Database cursors acquired via `get_db_cursor()` in `webapp/backend/database/pool.py` do not support or execute transaction commits.
 - Connection Pool: When `ssh_tunnel` is inactive and a local MariaDB instance is configured, `get_db_pool()` connects via Unix domain socket (`/run/mysqld/mysqld.sock`), automatically falling back to TCP (`127.0.0.1:3306`) if the socket is inaccessible. When `ssh_tunnel` is enabled in configuration (`database.ssh_tunnel.enabled: true`), `get_db_pool()` and FastAPI application startup (`webapp/backend/app.py:lifespan`) automatically initialize and verify the SSH tunnel forward (`core/ssh_tunnel.py`), reroute pool connection parameters to the forwarded port (`127.0.0.1:<local_port>`), and gracefully tear down the tunnel and connection pool on server shutdown.
-- Resilient Connection Management: `get_pooled_connection()` employs exponential backoff and session ping validation on connection acquisition; if transient network or tunnel drops occur, the pool resets and automatically re-verifies the SSH tunnel.
+- Resilient Connection Management: `get_db_pool()` creates the pool (and the SSH tunnel before it) once, under a lock, whatever the threads asking, and checks it with one connection. The pool (`ConnectionPool`, up to `POOL_SIZE` = 32 connections, opened on demand) replaces mysql-connector's `MySQLConnectionPool`, which pinged every connection it lent (under a process-wide lock) and reset its session when given back, on top of the ping `cursor()` itself makes: three round trips per cursor (3–6 ms over the SSH tunnel, now ~0.7 ms). The webapp never changes session state (read only, autocommit, no session variables, temporary tables or locks), so a connection goes back as it is. `get_pooled_connection()` waits up to `POOL_WAIT_S` (10 s) for a connection of a saturated pool, since connections come back as other requests finish (the threadpool has 40 workers). `get_db_cursor()` reconnects a connection that `cursor()` finds dropped while idle (server restart, tunnel drop), and closes instead of reusing one that failed during the request or kept a result it could not drain. If connecting fails, the pool resets (at most 3 times) and automatically re-verifies the SSH tunnel.
 - If expected metadata tables or rows are absent, webapp endpoints must return appropriate HTTP error statuses or graceful process-level fallbacks without modifying the underlying database.
 
 ### 2.6. Frontend & Service Architectural Invariants
 1. **Directory Path Filtering & Polymorphic Navigation**: In database queries on `m_file_blob`, directory records have `ftype == 0` while regular files have `ftype != 0`. All file search, path lookup, and `#include` header resolution queries explicitly filter `ftype != 0` so directories sharing names or paths with header files are never returned as file matches. File viewer endpoints (`get_file`) and frontend code views (`virtual_editor.js`) support polymorphic path navigation: opening directory paths returns child hierarchies (`entries`, `tree`) and renders interactive navigation tables/grids rather than returning 404 errors.
 2. **Lexical Comment Prioritization & Directive Matching**: In dual-layer syntax and AST overlays (`webapp/frontend/js/views/code_view/ast_overlay.js`), lexical tokenizers prioritize matching block comments (`/* ... */`) and line comments (`// ...`) *before* general identifier regexes, rendering them as non-clickable `<span class="tok-comment">` elements to prevent comment tokens from leaking into `.ast-token` or triggering symbol context menus. Preprocessor directive matching on snippet-relative coordinate slices allows optional leading hashes (e.g. `^(\s*#?\s*define\s+)`) so directive keywords are styled as preprocessors (`tok-macro`) and never tagged as clickable symbol identifiers.
 3. **Flat Coordinate Projection & Defensive Navigation**: Symbol detail backend endpoints (`webapp/backend/services/symbol_service.py:get_symbol_detail`) expose definition coordinate fields as flat scalars (`line: row["line_s"]`, `line_s: row["line_s"]`) at the root of the response payload alongside the nested `definition` record. Frontend jump-to-definition callers (`webapp/frontend/js/views/code_view/context_menu.js`) resolve coordinates defensively across `detail.definition?.line_s || detail.line_s || detail.line || 1` to ensure virtual editors navigate to and highlight the exact symbol definition line.
-4. **Maintainer Query Sanitization & Parameter Preference**: Developer identity and maintainer endpoints (`webapp/backend/routers/maintainers.py`, `webapp/backend/services/maintainer_service.py`) support query parameter lookups (`/api/maintainers/person?email=...&version=...`) alongside URL path parameters. Frontend API clients sanitize patch trailers and email strings (stripping `<>`, quotes, and whitespace) and prefer query parameters when identifiers contain special characters (`@`, `<`, `>`, `/`) to prevent URL decoding and route matching failures.
+4. **Maintainer Query Sanitization & Parameter Preference**: Developer identity and maintainer endpoints (`webapp/backend/routers/maintainers.py`, `webapp/backend/services/maintainer_service.py`) support query parameter lookups (`/api/maintainers/{version}/person?email=...`) alongside URL path parameters. Frontend API clients sanitize patch trailers and email strings (stripping `<>`, quotes, and whitespace) and prefer query parameters when identifiers contain special characters (`@`, `<`, `>`, `/`) to prevent URL decoding and route matching failures.
 5. **Context Menu Interaction Preservation**: Right-click context menus (`contextmenu`) across webapp workspaces (virtual code editor, file explorer sidebar, nodemap canvas) intercept default browser menus and offer context-adaptive actions (definitions, references, git blame popovers, command palette search, coordinate copying), while strictly preserving primary left-click interactions (inline AST token inspector popups, file navigation, node selection) without collision, event race conditions, or lingering ghost menus.
-6. **Structured Cross-Reference Classification**: Symbol cross-reference backend services (`get_symbol_xref`) and frontend inspectors (`showXrefModal`) return and render both primary and multi-declaration definition locations (`definitions: [...]` with file path, line bounds, and AST declaration type) alongside categorized usage references (`references: [...]` with caller function, file, line, and typed badges `Call`, `MemberRef`, `TypeUsage`, `DeclRef`, `MacroExpansion`), providing direct 1-click jump navigation for both definitions and usages. Every location is a location of the requested revision: definitions come only from blobs of its Git tree, and the ASTs whose references are looked up are only those the symbol's own name identifies, never the shared AST of a marker macro such as `EXPORT_SYMBOL` (see §4.3).
+6. **Structured Cross-Reference Classification**: Symbol cross-reference backend services (`get_symbol_xref`) and frontend inspectors (`showXrefModal`) return and render both primary and multi-declaration definition locations (`definitions: [...]` with file path, line bounds, and AST declaration type) alongside usage references (`references: [...]` with caller function, file, line, and typed badges `Decl`, `TypeUsage`, `Call`, `MemberRef`, `DeclRef`, `MacroExp`; one list, grouped by role), providing direct 1-click jump navigation for both definitions and usages. Every location is a location of the requested revision: definitions come only from blobs of its Git tree, and the ASTs whose references are looked up are only those the symbol's own name identifies, never the shared AST of a marker macro such as `EXPORT_SYMBOL` (see §4.3).
 7. **Escaping of Interpolated HTML**: every value interpolated into an `innerHTML` / `insertAdjacentHTML` template passes through `escapeHtml()` (exported by `webapp/frontend/js/components/modal.js`), including error text (`e.message`), repository data (git author names, file paths) and state values (the KConfig `arch`). Only values that are *already* rendered HTML are interpolated raw, and those are built from escaped parts (`doc_page.js` navigation links, the `virtual_editor.js` build-condition `why` / `ruleHtml` fragments). The CSP (§2.3) forbids inline scripts, so this is the layer that keeps repository content from entering the DOM as markup.
 
 ### 2.7. Tri-Path Tree Resolution & Arch-Aware Definition Ranking (`webapp/backend/services/tree_resolver.py`)
 1. **Database Tree Resolution (`TreeResolverService`, module singleton `tree_resolver`)**:
-   - **Path A (Single-File Lookup, `<0.2ms`)**: Resolves the exact `blob_id` of a specific `fnid` at any `commit_id` by walking `parent_idx = 0` backwards to the nearest `m_bridge_checkpoint`. If an `m_commit_file` delta intervened along that chain, returns the delta's `blob_id` (or `None` if deleted with `change_type == 'D'`). If untouched, returns the checkpoint's baseline `blob_id`.
    - **Path B (Full-Tree Resolution, `<15ms`, LRU Cached)**: Assembles the entire active `{fnid: blob_id}` repository tree at any `commit_id` by loading baseline snapshot records from `m_bridge_checkpoint` and chronologically applying forward `m_commit_file` deltas along the first-parent DAG. Results are cached in an in-memory `OrderedDict` LRU cache.
-   - **Limitation**: Paths A/B only reach a checkpoint when every first-parent ancestor is ingested in `m_commit`/`m_commit_parent`. The parser ingests a bounded commit window, so many intermediate commits have broken chains; Paths A/B are therefore used only as a fallback when the Git repository is unavailable.
+   - **Limitation**: Path B only reaches a checkpoint when every first-parent ancestor is ingested in `m_commit`/`m_commit_parent`. The parser ingests a bounded commit window, so many intermediate commits have broken chains; Path B is therefore used only as a fallback when the Git repository is unavailable.
 2. **Git-Native Tree Resolution (`GitTreeResolver`, module singleton `git_tree_resolver`)**:
    - **Path C (Full-Tree Listing, `~50ms` cold, LRU Cached per commit SHA)**: `list_tree(rev)` resolves any revision (tag, branch, full/short SHA, even commits never ingested into `m_commit`) via `git rev-parse --verify <rev>^{commit}` and returns `{path: blob_sha}` from `git ls-tree -r -z --full-tree`. Submodule entries are skipped. This is the authoritative file list for every revision.
+   - `list_dir(rev, directory)` returns `(subdirectory names, {path: blob_sha} of the direct files)` from a per-commit directory index built in one pass over `list_tree` (`DERIVED_CACHE_SIZE` = 4 commits), so expanding a directory no longer scans the whole tree. `search_index(rev)` is the per-commit list of `(lowercased path, lowercased basename, path)` that the file palette scans (`GET /api/fs/search`).
+   - `resolve_commit_sha(rev)` answers are cached (4096 entries per repository): a full SHA that names a commit permanently, any other name for `REV_SHA_TTL` (15 s), and all names are dropped when the `git` sync token changes (`clear_revision_caches`). Every tree, blob-map and build-layout lookup resolves its revision first, so without the cache one include resolution spawned three `git rev-parse` processes.
    - `map_blob_hashes(cursor, blob_shas)` joins the Git blob SHAs to `m_file_blob.blob_hash` (`blob_hash` == Git blob SHA-1) and returns `{blob_sha: (blob_id, ftype)}`, preferring typed (`ftype != 0`) rows. Blobs absent from the map were never parsed (unindexed).
-   - `blob_paths(cursor, rev)` returns `{blob_id: [paths]}` for the indexed blobs of the revision's tree (sorted paths; one blob may sit at several paths). It is cached per commit SHA (8 entries) for `BLOB_PATHS_TTL` = 120 s, so blobs indexed by a running parse appear without a restart. Symbol services use it to scope `m_symbol_def` (content-addressed by `blob_id`) to any revision; see §4 *Revision scoping of symbol queries*.
+   - `blob_paths(cursor, rev)` returns `{blob_id: [paths]}` for the indexed blobs of the revision's tree (sorted paths; one blob may sit at several paths). It is cached per commit SHA (8 entries): for `BLOB_PATHS_TTL` = 120 s, so blobs indexed by a running parse appear without a restart, except for the head commit of a ref whose ingestion finished, whose blobs are all indexed and whose map is kept until the parse state changes (`clear_revision_caches`). Symbol services use it to scope `m_symbol_def` (content-addressed by `blob_id`) to any revision; see §4 *Revision scoping of symbol queries*.
 3. **Arch-Aware Definition Ranking (`definition_rank`, `best_path`, `definition_arch`)**:
    A symbol defined once per architecture (`struct pt_regs`, `setup_arch`, `thread_struct`...) resolves to the definition of one ARCH value: the `arch` parameter of the symbol endpoints, which the frontend sets to the KConfig engine's ARCH while the engine is on with a resolved configuration, and to `x86_64` otherwise (§5.19). `definition_arch(version, arch)` resolves the ARCH value through `KconfigService.resolve_arch` (unknown values fall back to `x86_64`) and returns it with its `ArchScope` and word size (`arch_bits`: `x86_64` → 64, `i386` → 32, generic `x86` → none). The scope is the ARCH's build layout at the revision (`webapp/backend/services/arch_layout_service.py`): the `m_arch_root` rows the parser stored for the version's head commit, or, for revisions without rows (branches, commits never ingested), the same evaluation of the revision's Makefiles from Git (`parser/arch_layout.py`, `parser/kconfig_ast/KCONFIG_API.md` §6.5), cached per (commit, ARCH); without a layout, the SRCARCH's `own_arch_dirs` are assumed. Definitions are ordered by:
    - prototypes (`SymbolLinkage.PrototypeDecl`) after every definition with a body;
@@ -176,12 +177,12 @@ The `webapp/` backend operates exclusively as a read-only presentation and query
    - word size: files of the other word size (`process_32.c` on x86_64, `page_64.h` on i386) after the others;
    - weak/alias definitions (`WeakOrAliasDef`) after strong ones, then path and line.
    A blob present at several paths is reported at its best-ranked path (`best_path`). Choosing between `#ifdef` branches of one file and between files Kbuild does not compile is done by the frontend against the actual configuration (§5.19).
-4. **Definitions Reached From the Use Site (`from_file`)**: when the request names the file the symbol is used in, `SymbolService._prefer_reachable()` puts first the definitions the compilation of that file reads for the ARCH, i.e. what the compiler sees. `arch_layout_service.reachable(rev, arch, file)` walks the file's `#include` chain with the ARCH's build layout (`parser/include_graph.py`, `parser/kconfig_ast/KCONFIG_API.md` §6.6): forced `-include` files first, quoted names in the including file's directory, then the `-I` directories in order, through the build's symlinks and generated asm-generic wrappers. `#include` lines count whatever `#if` block holds them (the frontend still drops definitions its configuration compiles out), and directives are read from Git once per blob (cached by blob SHA, 50,000 entries; each walk cached per (commit, ARCH, file), 32 entries; a cold walk of `include/linux/sched.h` at v2.6.12 takes ~0.3 s). Reached definitions go before the path groups of item 3, prototypes stay last and weak definitions after strong ones; definitions are marked `visible`, and `include_chain` lists the files from the use site to the first one. `atomic_t` used in `include/linux/sched.h` at v2.6.12 thus resolves through `include/asm-x86_64/semaphore.h` to `include/asm-x86_64/atomic.h` for x86_64 (through `include/linux/sem.h` → `include/asm-um/atomic.h` → `include/asm-um/arch/atomic.h` = `include/asm-x86_64/atomic.h` for ARCH=um), and never to the unrelated `net/rxrpc/internal.h`. The walk reads the files themselves rather than `m_ast_include`/`m_file_reference`: those rows come from the parser's own clang run, which links `include/asm` to `asm-generic` and skips the includes of inactive `#if` branches, so they describe no particular ARCH.
+4. **Definitions Reached From the Use Site (`from_file`)**: when the request names the file the symbol is used in, `SymbolService._prefer_reachable()` puts first the definitions the compilation of that file reads for the ARCH, i.e. what the compiler sees. `arch_layout_service.reachable(rev, arch, file)` walks the file's `#include` chain with the ARCH's build layout (`parser/include_graph.py`, `parser/kconfig_ast/KCONFIG_API.md` §6.6): forced `-include` files first, quoted names in the including file's directory, then the `-I` directories in order, through the build's symlinks and generated asm-generic wrappers. `#include` lines count whatever `#if` block holds them (the frontend still drops definitions its configuration compiles out), and directives are read from Git once per blob (cached by blob SHA, 50,000 entries; each walk cached per (commit, ARCH, file), 32 entries; a cold walk of `include/linux/sched.h` at v2.6.12 takes ~0.3 s). Reached definitions go before the path groups of item 3, prototypes stay last and weak definitions after strong ones; definitions are marked `visible`. `atomic_t` used in `include/linux/sched.h` at v2.6.12 thus resolves through `include/asm-x86_64/semaphore.h` to `include/asm-x86_64/atomic.h` for x86_64 (through `include/linux/sem.h` → `include/asm-um/atomic.h` → `include/asm-um/arch/atomic.h` = `include/asm-x86_64/atomic.h` for ARCH=um), and never to the unrelated `net/rxrpc/internal.h`. The walk reads the files themselves rather than `m_ast_include`/`m_file_reference`: those rows come from the parser's own clang run, which links `include/asm` to `asm-generic` and skips the includes of inactive `#if` branches, so they describe no particular ARCH.
 
 ### 2.8. 3-Level Semantic Cross-Version Diff Engine (`webapp/backend/services/diff_service.py`)
 Either side of a comparison may be a release tag, a branch, or an arbitrary commit SHA. Comparison is evaluated in three progressive tiers to optimize latency:
-1. **Level 1 (O(1) Content Blob Filter)**: Resolves `{path: blob_sha}` for both revisions via `GitTreeResolver` (Path C), falling back to `{path: blob_id}` from `m_bridge_checkpoint` / `TreeResolverService` only when Git is unavailable on both sides. Unchanged files (equal content keys) are short-circuited in $O(1)$. **Renames** pair a deleted with an added path (`DiffService._pair_renames`): with Git trees, `git diff-tree -r -z --name-status --diff-filter=R -M50% -l1000` (scoped to `path` with a `:(literal)` pathspec) reports each pair with its content similarity (`R087` → 87); then a deleted path whose exact content reappears under a still unpaired added path is paired at 100 (this is the only rule without Git). Git compares contents only while `added` and `deleted` (after exact and same-basename pairs) each stay within the limit and their product within its square; beyond that it pairs only identical files and files that kept their basename and asks for a higher limit, which the response reports as `renames.exhaustive: false` / `renames.limit_needed` (v3.0→v3.1: every pair compared, 391 renames of which 161 identical, ~0.5 s; v3.0→v4.0: 2,967 renames without the exhaustive pass, `limit_needed` 19,771). The exhaustive pass for such ranges is the separate rename search (`GET /api/tools/diff/renames`), run on request and scoped to a directory.
-2. **Level 2 (AST & Symbol Structural Diff)**: For the first 50 modified files whose blobs are indexed on both sides, compares symbol definition records in `m_symbol_def` by `(name, type_id)` to surface added and removed definitions.
+1. **Level 1 (O(1) Content Blob Filter)**: Resolves `{path: blob_sha}` for both revisions via `GitTreeResolver` (Path C), falling back to `{path: blob_id}` from `m_bridge_checkpoint` / `TreeResolverService` only when Git is unavailable on both sides. Unchanged files (equal content keys) are short-circuited in $O(1)$. **Renames** pair a deleted with an added path (`DiffService._pair_renames`): with Git trees, `git diff-tree -r -z --name-status --diff-filter=R -M50% -l1000` reports each pair with its content similarity (`R087` → 87); then a deleted path whose exact content reappears under a still unpaired added path is paired at 100 (this is the only rule without Git). Git compares contents only while `added` and `deleted` (after exact and same-basename pairs) each stay within the limit and their product within its square; beyond that it pairs only identical files and files that kept their basename and asks for a higher limit, which the response reports as `renames.exhaustive: false` / `renames.limit_needed`, shown in the Compare view's rename note (v3.0→v3.1: every pair compared, 391 renames of which 161 identical, ~0.5 s; v3.0→v4.0: 2,967 renames without the exhaustive pass, `limit_needed` 19,771). The exhaustive pass for such ranges is the separate rename search (`GET /api/tools/diff/renames`), run on request and scoped to a directory.
+2. **Level 2 (AST & Symbol Structural Diff)**: For the first 50 modified source files (`.c`, `.h`, `.S`, `.rs`; paths sort documentation and dotfiles first) whose blobs are indexed on both sides, compares symbol definition records in `m_symbol_def` by `(name, type_id)` (one query for all of them) to surface added and removed definitions.
 3. **Level 3 (Kconfig Scoped Diff)**: Lists added/removed/modified Kconfig source files (`Kconfig`, `Kconfig.*`) from the Git trees, then parses only the files whose blob differs (from Git, cached per blob SHA) and compares each symbol's definitions there: properties (type, prompt, defaults, `depends on` including the dependencies inherited from enclosing `if`/`menu`/`choice` blocks, selects, implies, ranges, choice, options, `transitional`, help) per defining file. A definition that only moved lines is unchanged. A symbol is added/removed only when no Kconfig file of the other revision defines it (files with the same blob on both sides are checked with one `git grep`). Without Git trees (revisions Git cannot resolve), the indexed versions' Kconfig tags are compared instead (name -> set of definition text hashes, `DiffService._fetch_kconfig_symbols`).
 
 ### 2.9. Git-Native Database Architecture & Commit Hash Formatting
@@ -200,10 +201,10 @@ Either side of a comparison may be a release tag, a branch, or an arbitrary comm
 
 ### 2.10. Multi-Repository Request Scoping (`webapp/backend/config.py`, `webapp/backend/security/middleware.py`)
 1. **Repository selection**: `RepoContextMiddleware` (pure ASGI, outermost) reads the `X-KI-Repo` header or `?repo=` query parameter and stores the matching configured repository (core config `"repositories"`, see `core/API.md` §7.1.1) in a `ContextVar`. Unknown or missing names fall back to the default repository. Because it is pure ASGI, sync endpoints running in the threadpool inherit the value.
-2. **Git access**: Every service resolves the work tree through `get_repo_dir()`; `git_reader` is a `GitReaderPool` with one persistent `git cat-file --batch` process per repository, and `GitTreeResolver.repo_dir` follows the request unless pinned.
+2. **Git access**: Every service resolves the work tree through `get_repo_dir()`; `git_reader` is a `GitReaderPool` with up to 4 persistent `git cat-file --batch` processes per repository, and `GitTreeResolver.repo_dir` follows the request unless pinned.
 3. **Database scoping**: `get_active_repo_id(cursor)` maps the repository to `m_repository.repo_id` (by name, then `git_url`; `-1` when never parsed). Version resolution (`get_version_info`) and the version/branch catalogs only consider that repository's `m_git_ref` rows. Commit ids, blobs and tags are global and need no scoping.
-4. **Caches**: Module caches keyed by version names (`_FILE_TOKENS_CACHE`, `_INCLUDE_CACHE`, `_TREEMAP_CACHE`, `_DEFCONFIG_CACHE`, `_TREE_CACHE`, `_MAINTAINER_CACHE`, `_FILE_SUBSYSTEMS_CACHE`, version name/id caches) are `RepoScopedCache` instances that transparently prefix keys with the repository name; the git file-history LRU cache takes the repository path as an argument.
-   A `RepoScopedCache` takes an optional `maxsize` and then evicts the least recently used entry. Every cache whose key carries a request parameter is bounded, because otherwise each distinct value a caller sends adds an entry that is never released: `_INCLUDE_CACHE` (4096; keyed by header and referring file), `_FILE_TOKENS_CACHE` (512), `_TREEMAP_CACHE` (64; each entry is a whole subtree), `_FILE_SUBSYSTEMS_CACHE` (4096; keyed by file path), `_USAGE_CACHE` (256; keyed by Kconfig symbol), `_LISTING_CACHE` (64; keyed by revision) and `_PATHS_CACHE` (4, separate because one entry is a revision's whole file list: 36,783 paths / ~4.5 MiB at v3.0, more in later releases). Caches keyed only by what the repository itself defines stay unbounded, and the callers that evict by their own policy (`_MODELS`, `_BUILD_RESOLVERS`) reach through `dict.pop` and are unaffected. Because a bounded cache can evict between a membership test and a read, its callers read once into a local (`.get()`) rather than testing and then indexing.
+4. **Caches**: Module caches keyed by version names (`_INCLUDE_CACHE`, `_TREEMAP_CACHE`, `_MAINTAINER_CACHE`, `_FILE_SUBSYSTEMS_CACHE`, `_CREDITS_KEYS_CACHE`, the Kconfig `_MODELS` / `_LISTING_CACHE` / `_PATHS_CACHE` / `_USAGE_CACHE` / `_BUILD_RESOLVERS`, version name/id caches) or by content (`_FILE_TOKENS_CACHE` per blob, `_BLOB_SECTIONS_CACHE` / `_BLOB_CREDITS_CACHE` per MAINTAINERS / CREDITS blob, `_ARCH_INFO_CACHE` per commit and ARCH) are `RepoScopedCache` instances that transparently prefix keys with the repository name; the git file-history LRU cache takes the repository path as an argument. A cache keyed by a version name would keep answering for the commit a branch pointed at, so all of them are cleared when the `parsed` **or** the `git` sync token changes (§2.11).
+   A `RepoScopedCache` takes an optional `maxsize` and then evicts the least recently used entry. Every cache whose key carries a request parameter is bounded, because otherwise each distinct value a caller sends adds an entry that is never released: `_INCLUDE_CACHE` (4096; keyed by header and referring file), `_FILE_TOKENS_CACHE` (512), `_TREEMAP_CACHE` (64; each entry is a whole subtree), `_FILE_SUBSYSTEMS_CACHE` (4096; keyed by file path), `_MAINTAINER_CACHE` (16; one MAINTAINERS model per version, and any commit SHA is a version), `_CREDITS_KEYS_CACHE` (16), the version name/id maps (`_NAME_TO_VID_CACHE`, `_VID_TO_NAME_CACHE`, 50,000 each; a separate `_PRELOADED` flag records that the repository's refs were loaded), `_USAGE_CACHE` (256; keyed by Kconfig symbol), `_LISTING_CACHE` (64; keyed by revision), `_ARCH_INFO_CACHE` (256) and `_PATHS_CACHE` (4, separate because one entry is a revision's whole file list: 36,783 paths / ~4.5 MiB at v3.0, more in later releases). A failed or timed-out `git` call of the Kconfig service is never cached as an empty answer. Caches keyed only by what the repository itself defines stay unbounded, and the callers that evict by their own policy (`_MODELS`, `_BUILD_RESOLVERS`) reach through `dict.pop` and are unaffected. Because a bounded cache can evict between a membership test and a read, its callers read once into a local (`.get()`) rather than testing and then indexing.
 5. **Unparsed repositories** remain browsable: tags absent from `m_git_ref` resolve through `git rev-parse` to `vid = 0`, and trees, files, searches, diffs and treemaps read Git directly.
 
 ### 2.11. Client Synchronization & Build-Bound Assets (`webapp/backend/services/sync_service.py`, `webapp/frontend/js/sync.js`)
@@ -213,14 +214,14 @@ Clients must follow server changes without the user knowing to reload. The serve
 | `db` | Database rebuilt | `m_db_instance` (30 s) | Every cached API response is dropped |
 | `frontend` | Webapp code changed | SHA-256 of the files under `webapp/frontend/` (path + content), recomputed only when a file's size, mtime, ctime or inode changed (checked every 5 s); identical files give the same build across restarts | The page reloads into the new build (see below) |
 | `parsed` | Versions of the active repository finished, re-parsed or rolled back | `m_git_ref` + `m_ingest_state` of the repository, unfinished versions excluded (15 s) | Version/branch lists are refetched; cached data of versions whose stamp changed is dropped. On the server, a change also clears the per-version caches (`clear_parse_dependent_caches()`: version-name maps, file tokens, include resolution, maintainers, history facts, blob-path maps) |
-| `git` | Tags fetched, branches moved | `git for-each-ref` of the repository (15 s) | Same as `parsed` |
-- **Delivery**: `GET /api/sync` returns all four. `SyncHeaderMiddleware` (inside `RepoContextMiddleware`, so tokens are those of the request's repository) adds `X-KIP-Sync: <db>.<parsed>.<git>` to every `/api/` response, so any request reveals a change without polling.
+| `git` | Tags fetched, branches moved | `git for-each-ref` of the repository (15 s) | Same as `parsed`, server side included: caches keyed by a revision name (a branch's file tokens, Kconfig model, maintainers, name → commit) are cleared, and the revision → SHA and blob-map caches of `GitTreeResolver` (`clear_revision_caches`; tree listings are content-addressed and kept) |
+- **Delivery**: `GET /api/sync` returns all four. `SyncHeaderMiddleware` (inside `RepoContextMiddleware`, so tokens are those of the request's repository) adds `X-KIP-Sync: <db>.<parsed>.<git>` to every `/api/` response, so any request reveals a change without polling. While the three tokens are cached the header is read in place (`cached_header_value`); only a refresh goes to the threadpool, and one refresh per token runs at a time (`_Ttl`: requests arriving meanwhile wait for its answer instead of each running `git for-each-ref` or the database query).
 - **When clients check**: `syncManager.start()` runs once when the page opens (replacing the former `api.checkDbSync()`): it compares `db`, `parsed` and `git` with the tokens seen last (`meta/sync_tokens`), then follows the `X-KIP-Sync` headers. The `frontend` token is only compared when the page opens **and** the last frontend check (`localStorage["kip-last-frontend-check"]`) is more than an hour old; there is no polling.
 - **Manual check** (`syncManager.checkNow()`, Settings popover **🔄 Check for Updates**, §5.5): requests `GET /api/sync?fresh=true`, so the server recomputes all four tokens instead of serving its cached ones, applies them like a header change, always refetches the version/branch stamps (`apply(…, {force: true})`), and compares the frontend build regardless of the hourly delay (a newer build shows the reload banner). Resolves to `{db, parsed, git, frontend, changed, removed, added, newBuild}`; the popover reports *Up to date* or what changed in a toast. It compares against the server's local Git repository; it does not `git fetch` from a remote.
 - **Version stamps**: `/api/versions` and `/api/branches` give each version a `stamp` (`<commit sha[:12]>.<parse completion time>`, `.0` for versions parsed before `m_ingest_state`, `.git` when not parsed; a branch uses its current Git head). `api._vk(version)` puts `"<name>@<stamp>~"` into every version-scoped cache key, so a re-parsed version or a moved branch never serves older cached data; `syncManager.refreshVersions()` deletes the entries of versions whose stamp changed (`localDB.deleteDataWhere`, `isStaleKey`) and emits `versions:updated` (`{changed, removed, added, newlyIndexed}`); `app.js` then rebuilds the selectors, toasts newly indexed versions and re-renders open views of changed versions. A change of cache-key layout (`CACHE_LAYOUT`) clears the data stores once.
 - **Build-bound assets**: `GET /` renders `index.html` with `__KIP_BUILD__` replaced by the current build (`<meta name="kip-build">`) and every `"/static/` URL rewritten to `"/b/<build>/` (`render_index()`); relative ES-module imports inherit the prefix. `GET /b/{build}/{path}` serves the current build's files with `Cache-Control: public, max-age=31536000, immutable` and answers **409** for any other build, so a page never mixes modules of two builds. The shell and `/boot.js` are sent with `Cache-Control: private, max-age=3600`, `sw.js` with `no-cache`. Legacy `/static/`, `/js/`, `/css/` mounts stay for direct access.
 - **`boot.js`** (classic external script, the CSP forbids inline ones): sets `window.KIP_BUILD` and imports the build's `app.js` (`data-entry`). If the import fails (409: the cached shell is older than the server's build and its modules are not cached), it deletes the `kip-shell`/`kip-assets` caches and reloads once (`sessionStorage["kip-stale-build-reload"]` prevents a loop; a second failure shows an error box). `window.KIP_RELOAD_TO_LATEST()` does the same on request. `app.js` starts on `DOMContentLoaded`, or immediately when the import resolves after it.
-- **Service worker** (`sw.js`): `kip-shell` holds `/` (every shell path and query share one entry) and `/boot.js`, cache-first; `kip-assets` holds `/b/<build>/…`, cache-first (the page posts `{type: "prune", build}` on start to drop other builds); `kip-api` holds API responses, network-first with cache fallback (`/api/sync` is never cached, so it always reaches the server). A reply the worker serves from `kip-api` after the request failed, and its synthesized `503`, carry `X-KIP-Offline: 1`, so the page does not mistake a cached reply for a live one (§5.1 *Server reachability*). Caches not named `kip-*` (e.g. the former `kernel-ide-v10`) are deleted on activation; there is no hand-maintained pre-cache list.
+- **Service worker** (`sw.js`): `kip-shell` holds `/` (every shell path and query share one entry) and `/boot.js`, cache-first; `kip-assets` holds `/b/<build>/…`, cache-first (the page posts `{type: "prune", build}` on start to drop other builds); `kip-api` holds API responses, network-first with cache fallback (`/api/sync` is never cached, so it always reaches the server), bounded to `API_CACHE_LIMIT` (300) entries, oldest dropped first. A reply the worker serves from `kip-api` after the request failed, and its synthesized `503`, carry `X-KIP-Offline: 1`, so the page does not mistake a cached reply for a live one (§5.1 *Server reachability*). Caches not named `kip-*` (e.g. the former `kernel-ide-v10`) are deleted on activation; there is no hand-maintained pre-cache list.
 - **New build announcement** (`syncManager.announceUpdate()`): a bottom banner *"KernelInfo was updated (build …). Reloading in 5 s…"* with **Reload now** and **Later**; the countdown waits while a dialog (`.ki-modal-backdrop`) is open. Reloading drops the cached shell first, so the next page is the new build; tabs and KConfig profiles survive (saved in `localStorage`). **Later** dismisses it until the next hourly check.
 
 ### 2.12. Startup Catalog Warm-Up (`webapp/backend/app.py:lifespan`, `webapp/backend/routers/versions.py`)
@@ -355,32 +356,17 @@ Change tokens of the server (§2.11): `{"db", "frontend", "parsed", "git", "repo
 ```
 Every `/api/` response also carries `X-KIP-Sync: <db>.<parsed>.<git>`.
 
-#### `GET /api/db/instance`
-Retrieve the unique database instance hash and initialization timestamp, allowing frontend clients to verify whether the active database has been rebuilt.
-- **Query Parameters**: None
-- **Behavior**:
-  - Executes a strictly read-only `SELECT instance_hash, created_at FROM m_db_instance LIMIT 1;`.
-  - In compliance with the strict read-only database invariant, never attempts to `CREATE TABLE` or `INSERT` instance records. If `m_db_instance` does not exist or contains no rows, the endpoint logs a warning and returns a stable process-level fallback hash and startup timestamp.
-- **Response**:
-```json
-{
-  "instance_hash": "a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90",
-  "created_at": 1727021400
-}
-```
-
 ---
 
 ### 4.2. Filesystem & Code View API
 
 #### `GET /api/fs/tree/{version_name}`
-#### `GET /api/tree`
-Retrieve the directory hierarchy and file entries for a given path in the kernel repository.
+Retrieve the directory entries of a path in the kernel repository.
 - **Parameters**:
-  - `version_name` (path) / `version` (query): Kernel version string (default `"v3.0"`).
+  - `version_name` (path): Revision: a release tag, a branch, or any full/short commit SHA.
   - `path` (query): Directory path relative to repository root (e.g. `"kernel"`, `""` for root).
 - **Behavior**:
-  - `version_name` may be a release tag, a branch, or any full/short commit SHA. The listing comes from the Git tree of that revision (complete for every commit); file entries are annotated with `fid` (`blob_id`) and `ftype` from `m_file_blob` by blob hash. Files whose blobs were never parsed have `fid: null` and `ftype: 7` (Raw).
+  - The listing comes from the Git tree of that revision (complete for every commit); file entries are annotated with `fid` (`blob_id`) and `ftype` from `m_file_blob` by blob hash. Files whose blobs were never parsed have `fid: null` and `ftype: 7` (Raw).
   - Automatically identifies subdirectories and filters out directory records (`ftype == 0`) from the file entries list to prevent duplication.
   - Returns sorted entries: directories first, followed by files alphabetically.
 - **Response**:
@@ -398,65 +384,46 @@ Retrieve the directory hierarchy and file entries for a given path in the kernel
       "fid": 17858,
       "ftype": 7,
       "path": "Makefile",
-      "s_stat": "A",
-      "e_stat": "M",
-      "s_stat_label": "Added",
-      "e_stat_label": "Modified"
+      "s_stat": "0",
+      "e_stat": "0",
+      "s_stat_label": "Added"
     }
-  ],
-  "total_count": 3
+  ]
 }
 ```
 
 #### `GET /api/fs/file/{version_name}`
-#### `GET /api/file`
-Retrieve version-specific source file contents, metadata, spatial AST coordinate tokens, version lifecycle history, and incoming cross-file references.
-- **Source Retrieval Engine**: Uses a persistent, thread-safe `git cat-file --batch` worker (`GitReader`) to stream exact blob contents directly from Git for the requested revision/tag in sub-millisecond time (~0.1ms small / ~0.2ms big files). Preserves 100% byte fidelity without relying on local working tree checkouts.
-- **Graceful Unindexed Fallback**: If a requested file exists in the Git repository but has no indexing row in `m_bridge_checkpoint` (or is a non-C file), the endpoint serves the raw file content with `tokens: []`, empty AST maps, and inferred lifecycle metadata rather than throwing a 404.
-- **Directory Detection**: If the path resolves to a Git `tree` or directory record (`ftype == 0`), the endpoint transparently returns the directory hierarchy structure.
+Content of a file at a revision, with the AST token map of its indexed blob and the commit that last changed it.
+- **Source Retrieval Engine**: Uses persistent `git cat-file --batch` workers (`GitReader`) to stream exact blob contents directly from Git for the requested revision in sub-millisecond time (~0.1ms small / ~0.2ms big files). Preserves 100% byte fidelity without relying on local working tree checkouts. One stream answers one read at a time, so `git_reader` (`GitReaderPool`) keeps up to `READERS_PER_REPO` (4) of them per repository, spawned only when every existing one is busy: a file view no longer waits behind a history timeline (hundreds of blobs), a Kconfig model build or an include walk.
+- **Indexed blob**: found by content: the Git blob SHA of the file is `m_file_blob.blob_hash`, so the tokens always belong to the text served, at a tag, at a branch that moved since it was parsed, or at a commit never ingested. Tokens are cached per `blob_id` (`_FILE_TOKENS_CACHE`), so revisions sharing a file content share them. A file whose blob was never parsed is served with `fid: null`, `ftype: null` and `tokens: []`.
+- **Directory Detection**: If the path resolves to a Git `tree`, the endpoint returns the directory listing.
+- **Binary / oversized files**: a NUL in the first KiB answers `is_binary: true`, more than 10 MiB `is_oversized: true`, both without `content` and with a `message` the code view shows in place of the file.
 - **Parameters**:
-  - `version_name` (path) / `version` (query): Kernel version string (default `"v3.0"`).
+  - `version_name` (path): Revision.
   - `path` (query): Target file path (e.g. `"init/main.c"`). Required.
 - **Response**:
 ```json
 {
+  "type": "file",
+  "is_binary": false,
   "version": "v3.0",
   "vid": 1,
-  "fid": 684,
   "path": "init/main.c",
-  "content": "/* ... raw source code ... */",
-  "total_lines": 890,
-  "file_size": 25412,
   "ftype": 1,
+  "file_info": {
+    "fid": 684,
+    "fname": "init/main.c",
+    "ftype": 1,
+    "last_changed": { "commit_hash": "…", "author_name": "…", "author_date": 1310000000, "subject": "…" }
+  },
+  "content": "/* ... raw source code ... */",
   "tokens": [
     [15, 0, 15, 24, 365653, 78],
     [21, 0, 21, 28, 42, 5]
-  ],
-  "tokens_format": "[line_s, char_s, line_e, char_e, ast_id, type_id]",
-  "history": [
-    {
-      "fid": 684,
-      "vid_s": 1,
-      "vid_e": 0,
-      "vname_s": "v3.0",
-      "vname_e": "Active",
-      "s_stat": "A",
-      "e_stat": "0",
-      "s_stat_label": "Added",
-      "e_stat_label": "Active"
-    }
-  ],
-  "used_by": {
-    "total": 4,
-    "breakdown": { "include": 4, "kconfig": 0, "kbuild": 0, "makefile": 0, "documentation": 0 },
-    "references": [
-      { "fid": 912, "source_file": "kernel/sched.c", "ref_type": "include", "ref_label": "Included By" }
-    ]
-  }
+  ]
 }
 ```
-
-- **`used_by`**: incoming `m_file_reference` rows whose source (`source_blob_id`, `source_fnid`) is in the revision's tree, one per source path (`source_fname` is that path; an identical Makefile in two directories is listed under each directory it builds from).
+`tokens` rows are `[line_s, char_s, line_e, char_e, ast_id, type_id]`. `ftype` at the root is what the code view's syntax scoping reads (`AstOverlay.setFileInfo`, §5.2).
 
 - **Directory Path Response** (when target `path` is a directory):
 ```json
@@ -466,21 +433,18 @@ Retrieve version-specific source file contents, metadata, spatial AST coordinate
   "version": "v3.0",
   "vid": 1,
   "path": "init",
-  "file_info": { "fid": 684, "fnid": 684, "fname": "init", "ftype": "dir" },
+  "ftype": 0,
+  "file_info": { "fid": null, "fname": "init", "ftype": "dir" },
   "entries": [
     { "name": "main.c", "type": "file", "fid": 36568, "ftype": 1, "path": "init/main.c", "s_stat_label": "Added" }
   ],
   "tree": [ ... ],
   "content": "[Directory: init]",
-  "tokens": [],
-  "token_count": 0,
-  "subsystems": [],
-  "used_by": { "total": 0, "counts": {}, "references": [] }
+  "tokens": []
 }
 ```
 
 #### `GET /api/fs/resolve_include`
-#### `GET /api/resolve_include`
 Resolve a preprocessor `#include <...>` or `#include "..."` directive to an authoritative git repository file path. Guarantees directory exclusion (`ftype != 0`) to prevent directory false-positives.
 - **Parameters**:
   - `version` (query): Kernel version string (default `"v3.0"`).
@@ -488,14 +452,14 @@ Resolve a preprocessor `#include <...>` or `#include "..."` directive to an auth
   - `ast_id` (query): Optional AST Node ID of the include directive to check direct `m_ast_include` links.
   - `current_file` (query): Optional referring source file path (e.g. `"arch/x86/kernel/setup.c"`) to prioritize architecture-specific or relative header matches.
   - `arch` (query, optional): ARCH whose build layout resolves the include (`definition_arch`: unknown values fall back to `x86_64`).
-- **Jailing**: `header` and `current_file` become candidate repository paths, one of which is probed on disk in step 5, so both are rejected with `HTTP 400 Bad Request` unless `is_safe_rel_path()` accepts them, and each candidate is re-checked against the repository root after `resolve()` (a traversing header such as `../../../../etc/passwd` would otherwise be reported as `resolved`, revealing whether an arbitrary host path exists).
+- **Jailing**: `header` and `current_file` become candidate repository paths, so both are rejected with `HTTP 400 Bad Request` unless `is_safe_rel_path()` accepts them (a traversing header such as `../../../../etc/passwd` is never resolved).
 - **Resolution Strategy**:
   0. The compiler's search for the ARCH's build layout (`arch_layout_service.resolve_include`, §2.7 item 4): `"name"` in `current_file`'s directory first, then the `-I` directories, through build-time symlinks and generated wrappers (`<asm/atomic.h>` → `include/asm-x86_64/atomic.h` at v2.6.12 for x86_64, `arch/x86/include/asm/atomic.h` at v3.0); method `build_layout`, with `arch`. Steps 1-5 only run when it finds nothing (e.g. generated headers, `tools/`).
   1. If `current_file` is supplied, queries compiler-verified provenance from `m_file_reference` (`ref_type=1`, the rows of `current_file`'s blob at that path: `source_blob_id`/`source_fnid` joined to the revision's `m_bridge_checkpoint`).
   2. If `ast_id` is supplied, queries `m_ast_include` join `m_file_name`.
   3. Generates prioritized candidate search paths: relative to `current_file` directory, `header`, `include/{header}`, `include/uapi/{header}`, and `arch/{arch}/include/{header}`.
   4. Matches candidates against active non-directory indexed files (`ftype != 0`) in `m_bridge_checkpoint` / `m_file_blob` / `m_file_name`.
-  5. Falls back to physical repo jail disk verification.
+  5. Falls back to the candidates present in the revision's Git tree (method `git_tree`); the work tree on disk is never consulted, since it may hold another revision.
 - **Response**:
 ```json
 {
@@ -506,44 +470,6 @@ Resolve a preprocessor `#include <...>` or `#include "..."` directive to an auth
 }
 ```
 
-#### `GET /api/blame`
-#### `GET /api/commits/{version_name}/blame/{path:path}`
-#### `GET /api/commits/{version_name}/blame?path={path}`
-#### `GET /api/version/{version_name}/file/{fid}/blame`
-Retrieve line-by-line git blame provenance annotations and commit attributions.
-- **Parameters**:
-  - `version` (query) / `version_name` (path): Kernel version string (e.g. `"v3.0"`).
-  - `path` (query or path): File path in repository (e.g. `"init/main.c"`).
-  - `fid` (path): Integer file ID (when querying by file ID).
-- **Response**:
-```json
-{
-  "path": "init/main.c",
-  "total_lines": 890,
-  "lines": [
-    {
-      "line": 1,
-      "commit_hash": "1da177e4c3f41524e886b7f1b8a0c1fc7321cac2",
-      "author_name": "Linus Torvalds",
-      "author_email": "torvalds@ppc970.osdl.org",
-      "date": 1113690036,
-      "subject": "Linux-2.6.12-rc2",
-      "author": "Linus Torvalds",
-      "summary": "Linux-2.6.12-rc2",
-      "final_line": 1
-    }
-  ],
-  "blame": [ ... ]
-}
-```
-
-#### `GET /api/version/{version_name}/browse/{path:path}`
-Polymorphic unified browse endpoint that automatically detects whether the target path is a directory (returning tree hierarchy) or a source file (returning content, tokens, metadata, and lifecycle history).
-- **Parameters**:
-  - `version_name` (path): Kernel version string.
-  - `path` (path): Repository path (empty string for repository root).
-- **Response**: Returns either directory entries or file content payload based on path classification.
-#### `GET /api/fs/treemap/{version_name}`
 #### `GET /api/version/{version_name}/treemap`
 Directory hierarchy of the revision weighted by bytes and file counts, built from `git ls-tree -r -l` (`GitTreeResolver.list_tree_sizes`, LRU cached). Children are sorted by size, descending.
 - **Parameters**:
@@ -569,73 +495,39 @@ Directory hierarchy of the revision weighted by bytes and file counts, built fro
 #### `GET /api/fs/search/{version_name}`
 Fuzzy file-path search over the revision's Git tree (used by the Ctrl+K palette).
 - **Parameters**: `q` (query), `limit` (query, default 50, max 200).
-- **Ranking**: exact basename → basename prefix → basename substring → path substring → subsequence (fewest gaps first).
+- **Ranking**: exact basename → basename prefix → basename substring → path substring → subsequence (fewest gaps first, queries of 2+ characters). Each keystroke scans the revision's search index (`GitTreeResolver.search_index`, lowercased once per commit) and keeps only the best `limit` matches (`heapq.nsmallest`); `total` counts every match.
 - **Response**: `{ "version", "query", "total", "files": [{ "path", "name", "score" }] }`
 
 #### `GET /api/fs/raw/{version_name}`
 Serve an image blob of the revision (documentation figures). Only `svg`, `png`, `jpg`/`jpeg`, `gif` are served (else 404); a `name.*` path picks the first existing of `.svg/.png/.jpg/.jpeg/.gif` (Sphinx convention). Responses carry `Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; sandbox` so scripts embedded in SVG never run; files over 10 MiB return 413.
 - **Parameters**: `path` (query, jailed relative path), `repo` (query, optional repository for `<img>` requests that cannot send headers).
 
-#### `GET /api/fs/compile_commands/{version_name}`
-#### `GET /api/version/{version_name}/compile_commands`
-Export a Clang JSON Compilation Database (`compile_commands.json`) with one entry per `.c` file of the revision's Git tree, excluding other architectures' `arch/<name>/` subtrees. Commands include the arch/generic include paths, `include/linux/kconfig.h`, `-D__KERNEL__` and `-nostdinc`.
+#### `GET /api/fs/compile_commands/{version_name}/export`
+Download a Clang JSON Compilation Database (`compile_commands.json`) with one entry per `.c` file of the revision's Git tree, excluding other architectures' `arch/<name>/` subtrees, as an attachment (`Content-Disposition: attachment; filename="compile_commands-<version>-<arch>.json"`, both names reduced to file-name characters). Commands include the arch/generic include paths, `include/linux/kconfig.h`, `-D__KERNEL__` and `-nostdinc`.
 - **Parameters**:
-  - `version_name` (path): Kernel version string.
+  - `version_name` (path): Revision.
   - `arch` (query): Target architecture (e.g. `"x86"`, `"arm"`, default `"x86"`).
-- **Response**:
+- **Body**:
 ```json
 [
   {
     "directory": "/kernel",
     "file": "init/main.c",
-    "command": "gcc -nostdinc -isystem ... -Iarch/x86/include -Iinclude -c init/main.c -o init/main.o"
+    "command": "clang -Iarch/x86/include ... -D__KERNEL__ -nostdinc -c init/main.c -o init/main.o"
   }
 ]
-```
-
-#### `GET /api/fs/compile_commands/{version_name}/export`
-#### `GET /api/version/{version_name}/export/compile_commands.json`
-Same database as an attachment download (`Content-Disposition: attachment; filename="compile_commands-<version>-<arch>.json"`).
-
-#### `GET /api/version/{version_name}/export/compile_commands`
-#### `GET /api/fs/compile_commands/{version_name}/export`
-Export compilation commands wrapped in an envelope object (`{"compile_commands": [...], "commands": [...]}`) for client-side download consumers expecting wrapped payloads.
-- **Parameters**:
-  - `version_name` (path): Kernel version string.
-  - `arch` (query): Target architecture (default `"x86"`).
-- **Response**:
-```json
-{
-  "version": "v3.0",
-  "arch": "x86",
-  "total": 1,
-  "compile_commands": [
-    {
-      "directory": "/kernel",
-      "file": "init/main.c",
-      "command": "gcc -nostdinc -isystem ... -Iarch/x86/include -Iinclude -c init/main.c -o init/main.o"
-    }
-  ],
-  "commands": [
-    {
-      "directory": "/kernel",
-      "file": "init/main.c",
-      "command": "gcc -nostdinc -isystem ... -Iarch/x86/include -Iinclude -c init/main.c -o init/main.o"
-    }
-  ]
-}
 ```
 
 ---
 
 ### 4.3. Symbols, Cross-References & AST Inspection API
 
-#### `GET /api/symbols/search`
 #### `GET /api/symbols/{version_name}/search`
-Search symbol definitions by prefix or substring across functions, variables, structs, enums, enumerator constants (`EnumConstant`), typedefs, and macros.
-- **Revision scoping of symbol queries** (also `lookup`, `symbol/{name}`, `xref/{name}`): `version_name` may be a tag, branch, or any commit SHA, including commits that were never ingested into `m_commit`. `SymbolService._scope` builds `{blob_id: [paths]}` from the revision's Git tree (`GitTreeResolver.blob_paths`) and falls back to `m_bridge_checkpoint` only when Git is unavailable. Only definitions whose blob is in that tree are returned, with `file_path` taken from the tree. A symbol is therefore found at a commit whenever its file's exact content was parsed in any version; files whose content was never parsed contribute no symbols. Search scans up to `SEARCH_CANDIDATES` (30000) name-ordered candidates before scoping, then fetches details for the kept `def_id`s. The first query per commit costs ~0.3 s to build the blob map; later queries are cached.
+Search symbol definitions by name prefix across functions, variables, structs, enums, enumerator constants (`EnumConstant`), typedefs, and macros.
+- **Revision scoping of symbol queries** (also `detail/{name}`, `xref/{name}`, `include/{ast_id}`, the callgraph and Pahole, §4.7): `version_name` may be a tag, branch, or any commit SHA, including commits that were never ingested into `m_commit`. `SymbolService._scope` builds `{blob_id: [paths]}` from the revision's Git tree (`GitTreeResolver.blob_paths`) and falls back to `m_bridge_checkpoint` only when Git is unavailable. Only definitions whose blob is in that tree are returned, with `file_path` taken from the tree. A symbol is therefore found at a commit whenever its file's exact content was parsed in any version; files whose content was never parsed contribute no symbols. The first query per commit costs ~0.3 s to build the blob map; later queries are cached.
+- **Ranking and cost**: the exact name first, then shorter names, then by name; definitions of one name by path and line. Ordering the `m_symbol_def` view itself sorted every prefix match of every indexed version (328 s for `s`, 4.7 s for `sched`), so the search ranks distinct names first: `_name_page` reads `NAME_PAGE` (400) names at a time from the name indexes of `m_tag_def` and `m_blob_symbol_def` (`GROUP BY name ORDER BY LENGTH(name), name`, continuing after the last key) and merges them. Their definitions are then read in batches of names (`FIRST_NAME_BATCH` = 8, doubling up to 128, at most `SEARCH_CANDIDATES` rows each) and scoped to the revision until `limit` are kept or `MAX_NAME_PAGES` (8) pages were read. Warm, `s` answers in ~0.7 s and `sched` in ~1.1 s.
 - **Parameters**:
-  - `version` / `version_name` (query): Kernel version string (default `"v3.0"`).
+  - `version_name` (path): Revision.
   - `q` (query): Search prefix or substring.
   - `limit` (query): Maximum results to return (default 50).
 - **Response**:
@@ -659,55 +551,40 @@ Search symbol definitions by prefix or substring across functions, variables, st
 > All symbol endpoints (`search`, `detail`, `xref`) map raw AST type names (e.g. `C_enumequal` &rarr; `EnumConstant`, `C_functionproto` &rarr; `FunctionDecl`, `C_struct` &rarr; `StructDecl`, `C_SCtypedef` &rarr; `Typedef`) to readable presentation labels.
 
 
-#### `GET /api/symbols/lookup`
-#### `GET /api/symbols/{version_name}/lookup`
-#### `GET /api/version/{version_name}/symbol_lookup`
-#### `GET /api/version/{version_name}/lookup`
-Fast typeahead symbol name suggestion endpoint.
-- **Parameters**:
-  - `version` / `version_name` (query or path): Kernel version string (default `"v3.0"`).
-  - `q` / `query` (query): Symbol prefix.
-  - `limit` (query): Maximum results (default 20).
-- **Response**:
-```json
-["start_kernel", "start_secondary", "start_arm"]
-```
-
 #### `GET /api/symbols/{version_name}/detail/{symbol_name}`
-#### `GET /api/version/{version_name}/symbol/{symbol_name}`
-Retrieve authoritative definition information, source location, and cross-reference overview for a symbol.
+The definition of a symbol in the revision's tree (what Go to Definition opens). References are not part of it: `xref/{name}` computes them, only for the views that list them.
 - **Parameters**:
   - `version_name` (path): Kernel version string.
   - `symbol_name` (path): Symbol identifier.
   - `arch` (query, default `x86_64`): ARCH value whose definition wins when the symbol is defined per architecture (§2.7); also the ARCH whose Kconfig model answers `CONFIG_*` / Kconfig symbols.
   - `from_file` (query, optional): file the symbol is used in; the definitions its `#include` chain reaches for `arch` win (§2.7 item 4).
-- **Response** also carries `arch`, `from_file`, `include_chain` (files from `from_file` to the chosen definition when it is reached, else `[]`) and `definitions` (every in-tree definition in rank order, at most 50: `[{file, line_s, line_e, type_name, ast_id, linkage, visible}]`, `visible` = reached from `from_file`, `null` without it); `file_path`/`definition` are the first one.
+- **Response** also carries `arch`, `from_file` and `definitions` (every in-tree definition in rank order, at most 50: `[{file, line_s, line_e, type_name, ast_id, linkage, visible}]`, `visible` = reached from `from_file`, `null` without it); `file_path`/`definition` are the first one.
+- **Kconfig symbols** (`CONFIG_*`, or a name no C definition has): answered from the ARCH's Kconfig model with `is_kconfig: true`, `type_name: "kconfig"` and the model's detail under `kconfig`.
 - **Response**:
 ```json
 {
+  "version": "v3.0",
   "name": "start_kernel",
-  "found": true,
-  "type_id": 5,
   "type_name": "FunctionDecl",
-  "fid": 684,
   "file_path": "init/main.c",
   "line": 490,
   "line_s": 490,
-  "line_e": 680,
-  "total_references": 12
+  "definition": { "def_id": 1, "ast_id": 42, "tag_id": 7, "type_id": 21, "type_name": "FunctionDecl", "fid": 684, "file": "init/main.c", "line_s": 490, "line_e": 680 },
+  "definitions": [{ "file": "init/main.c", "line_s": 490, "line_e": 680, "type_name": "FunctionDecl", "ast_id": 42, "linkage": 0, "visible": null }],
+  "arch": "x86_64",
+  "from_file": null
 }
 ```
 
 #### `GET /api/symbols/{version_name}/xref/{symbol_name}`
-#### `GET /api/version/{version_name}/xref/{symbol_name}`
-Retrieve both definition location(s) and categorized usage references (call sites, member references, type usages, macro expansions) across the kernel codebase.
+Retrieve both definition location(s) and usage references (declarations, type usages, call sites, member references, declaration references, macro expansions, told apart by each reference's `type` badge) across the kernel codebase.
 - **Parameters**:
   - `version_name` (path): Kernel version string.
   - `symbol_name` (path): Symbol identifier.
   - `limit` (query, optional int, 1-5000): Maximum number of reference records to return (useful for symbols with thousands of references like `kmalloc`). Always capped at `MAX_XREF_REFS` (5000), including when no limit is given.
   - `arch` (query, default `x86_64`): orders `definitions` for that ARCH (§2.7); `definition` is the first.
-- **Definitions**: only definitions whose blob is in the revision's tree, so every `file` is a path of this revision. When the index knows the symbol but holds no definition of it in this tree — the revision's copy of the defining file was never parsed, which is common at a commit between two ingested releases — `definitions` is `[]`, `definition` is `null` and `definition_unindexed` is `true` (the references still resolve, see below). `total_definitions` counts the returned ones.
-- **References**: only references in blobs of the revision's tree are returned, ordered by file and line. `file` is the path of the referencing blob in that tree (best-ranked for `arch` when the blob sits at several paths; not `target_fnid`, which is the target's file), `caller` is the name of the AST of the tag the reference sits in (e.g. the enclosing function), `fid` the referencing blob, and `limit` applies after scoping. `references_count` and `total_references` both count them.
+- **Definitions**: only definitions whose blob is in the revision's tree, so every `file` is a path of this revision. When the index knows the symbol but holds no definition of it in this tree — the revision's copy of the defining file was never parsed, which is common at a commit between two ingested releases — `definitions` is `[]`, `definition` is `null` and `definition_unindexed` is `true` (the references still resolve, see below).
+- **References**: only references in blobs of the revision's tree are returned, grouped by role (`Decl`, `TypeUsage`, `Call`, `MemberRef`, `DeclRef` — which also takes unknown roles as `Ref` —, `MacroExp`) and ordered by file and line within a role. `file` is the path of the referencing blob in that tree (best-ranked for `arch` when the blob sits at several paths; not `target_fnid`, which is the target's file), `caller` is the name of the AST of the tag the reference sits in (e.g. the enclosing function), `fid` the referencing blob, and `limit` applies after scoping.
 - **Reference targets**: a reference resolves to the AST of the definition its blob was parsed against, so the targets are the ASTs of the in-tree definitions, or — without any — every indexed AST of the symbol (at most `MAX_XREF_TARGETS` (64); one per content of the defining file), which is what keeps the usages of a revision with no in-tree definition. An AST is a target only when `m_ast.name` is the symbol's name: a marker definition (`EXPORT_SYMBOL(sym)`, an initcall) records the symbol's name against the AST of the *macro*, which is content-addressed and therefore one shared node for every symbol marked that way (180k `C_ExportSymbolDef` rows share 4 ASTs in a 2.6.x index), so using it would return the references of all of them. Such a definition is still listed in `definitions` (it is a real source location).
 - **Response**:
 ```json
@@ -729,9 +606,7 @@ Retrieve both definition location(s) and categorized usage references (call site
     "type_name": "FunctionDecl",
     "ast_id": 42
   },
-  "total_definitions": 1,
   "definition_unindexed": false,
-  "total_references": 2,
   "references": [
     {
       "caller": "x86_64_start_kernel",
@@ -756,70 +631,68 @@ Retrieve both definition location(s) and categorized usage references (call site
 ```
 
 #### `GET /api/symbols/{version_name}/ast/{ast_id}`
-#### `GET /api/ast/{ast_id}/tree`
 Recursively inspect relational AST node container hierarchies.
 - **Parameters**:
-  - `version_name` (path) / `version` (query): Kernel version string.
+  - `version_name` (path): Revision (AST nodes are content addressed, so it does not change the answer and the service ignores it).
   - `ast_id` (path): Root AST Node ID to expand.
-  - `depth` (query): Traversal depth limit (0-12, default 3). AST nodes are content-addressed, so one subtree is referenced by many parents: subtrees are built once per (node, remaining depth) and reused, but each child still serializes twice (under `containers` and under `children`), so the body doubles at every level. `MAX_AST_TREE_NODES` (20,000 serialized positions, counted with that doubling) bounds it regardless of shape, and a node whose children were cut carries `truncated: true`.
-- **Response**:
+  - `depth` (query): Traversal depth limit (0-12, default 3).
+- **Size bound**: AST nodes are content-addressed, so one subtree is referenced by many parents: subtrees are built once per (node, remaining depth) and reused, but a reused subtree still serializes at every position it occupies, so the body grows multiplicatively with depth. `MAX_AST_TREE_NODES` (20,000 serialized nodes) bounds it at any depth: each node built counts one, each reuse of a built subtree counts its whole size, and the first child that does not fit cuts the remaining children of its parent, which then carries `truncated: true`. Each node lists its children once, in `m_ast_container` priority order. A former `containers` list repeated every child next to its priority, read by no client; it doubled the body at every level and its positions were counted only after each subtree was finished, so the bound did not hold (397,000 positions, 55 MB at depth 12 under `copy_process`; now 4,155 positions, 0.45 MB).
+- **Cost**: the tree is fetched level by level (`m_ast_container` and `m_ast` rows of a whole level per query, `AST_TREE_CHUNK` = 1000 ids), not with one query per node: depth 3 below `copy_process` takes ~40 ms instead of ~250 ms (105 queries).
+- **Response**: the root node itself. Children with `type_id` > 20 (inner statements and expressions) carry `tag_id: null`.
 ```json
 {
   "ast_id": 42,
-  "node": {
-    "ast_id": 42,
-    "name": "start_kernel",
-    "type_id": 5,
-    "type_name": "FunctionDecl",
-    "children": [
-      {
-        "ast_id": 43,
-        "name": "setup_arch",
-        "type_id": 21,
-        "type_name": "CallExpr",
-        "children": []
-      }
-    ]
-  }
+  "tag_id": 1234,
+  "name": "start_kernel",
+  "type_id": 5,
+  "type_name": "FunctionDecl",
+  "children": [
+    {
+      "ast_id": 43,
+      "tag_id": null,
+      "name": "setup_arch",
+      "type_id": 21,
+      "type_name": "CallExpr",
+      "children": []
+    }
+  ]
 }
 ```
 
 #### `GET /api/symbols/{version_name}/include/{ast_id}`
-#### `GET /api/include/{ast_id}`
-#### `GET /api/version/{version_name}/include/{ast_id}/symbols`
-#### `GET /api/version/{version_name}/include/{ast_id}`
 Retrieve imported symbols and target header file path for a preprocessor `CPPro_include` AST node.
 - **Parameters**:
-  - `version_name` (path) / `version` (query): Kernel version string.
-  - `ast_id` (path): AST Node ID of the include directive. If `ast_id <= 0`, falls back to database lookup using `file_path`, `line`, or `header`.
+  - `version_name` (path): Revision.
+  - `ast_id` (path): AST Node ID of the include directive. If `ast_id <= 0`, it is found from `tag_id`, else in the blob `file_path` has at this revision (the include tag covering `line`, else the one naming `header`).
   - `tag_id` (query): Optional tag ID of the include node.
   - `file_path` (query): Path of the source file containing the include.
   - `line` (query): 1-indexed line number of the include in the source file.
   - `header` (query): Include header target (e.g. `<linux/init.h>` or `linux/init.h`).
+- **Definitions**: each symbol's definition is taken from the revision's tree (`SymbolService._scope`): in the header itself first, then in its directory.
 - **Response**:
 ```json
 {
   "ast_id": 365653,
   "include_text": "<linux/const.h>",
   "header_file": "include/linux/const.h",
-  "header_exists": true,
-  "total_symbols": 2,
-  "imported_symbols": [
+  "symbols": [
     {
+      "priority": 1,
+      "ast_id": 5512,
       "name": "_AC",
       "type_id": 76,
-      "type_name": "MacroDef",
+      "type_name": "CPPro_define_macro",
+      "category": "Macro",
       "def_file": "include/linux/const.h",
-      "line_s": 14
+      "def_line_s": 14
     }
   ]
 }
 ```
 
 #### `GET /api/symbols/{version_name}/history`
-#### `GET /api/tag/{tag_id}/timeline`
 Release-by-release history of one definition (function, struct, union, enum, typedef, macro, global, ASM label, Rust item...) in the active repository (`HistoryService.get_symbol_history`, `webapp/backend/services/history_service.py`).
-- **Parameters**: `path` and `line` (query) plus optional `name` (the symbol under the cursor) and `ast_id` select the anchor: the narrowest tag of the file at `version_name` covering `line` that is named `name` (else has `ast_id`, else is a definition in `m_symbol_def`). When `name` is not defined at `path:line` (the cursor is on a use), the definition is located through `m_symbol_def` (the requested file first, then the `arch` query parameter's ranking (§2.7, default `x86_64`), then definitions with a body, then `.c` files). An anchor that is a Kconfig `config`/`menuconfig` entry returns the Kconfig history below. `include_rc` (bool, default `false`): also list pre-release tags (`-rc`, `-pre`, `-alpha`, `-beta`, `RC_RE`); by default only final releases are listed. `branch` (optional): the branch the timeline follows, see **Branch scope**. The tag route takes `tag_id` (plus `include_rc` and `branch`) and locates its file through `m_bridge_checkpoint`/`m_commit_file`.
+- **Parameters**: `path` and `line` (query) plus optional `name` (the symbol under the cursor) and `ast_id` select the anchor: the narrowest tag of the file at `version_name` covering `line` that is named `name` (else has `ast_id`, else is a definition in `m_symbol_def`). When `name` is not defined at `path:line` (the cursor is on a use), the definition is located through `m_symbol_def` (the requested file first, then the `arch` query parameter's ranking (§2.7, default `x86_64`), then definitions with a body, then `.c` files). An anchor that is a Kconfig `config`/`menuconfig` entry returns the Kconfig history below. `include_rc` (bool, default `false`): also list pre-release tags (`-rc`, `-pre`, `-alpha`, `-beta`, `RC_RE`); by default only final releases are listed. `branch` (optional): the branch the timeline follows, see **Branch scope**.
 - **Branch scope** (`history_scope()`): a timeline follows **one branch**: the indexed tags reachable from it (the `GET /api/branch/tags` walk, cached per branch head) and the branch's own ref when it is indexed; tags of other branches and bare-commit refs are left out, so stable point releases (`v2.6.32.71`) never interleave with mainline releases on `master`, and a stable branch lists the mainline releases up to its fork followed by its own point releases. Without `branch` it is chosen for `version_name`: the version itself when it names a branch, the default branch when the version is one of its tags (or is not a tag, e.g. a commit), else the branches whose name carries the version's release number (`stable/linux-2.6.32.y` for `v2.6.32.71`; at most 3 walked), the first one reaching it; the default branch when none does. `400` for a branch that is not a plain ref, `404` unknown, `503` when Git could not walk it. The response carries `branch` (the branch followed) and `rc_count` (pre-release tags of that branch, listed or not).
 - **Identity**: versions are matched by the anchor's identity, `m_ast.name` + `type_id`, never by `ast_id` (a function's `ast_id` hashes signature + body, so it changes with every code change). When a blob holds several matches, a member of the anchor's `m_moved_tag` lineage (transitive, both directions, bounded to 500 tags) wins, then the one closest to the previous version's line; a renamed lineage member is used only when no tag of the same name remains.
 - **Algorithm**: the file's blob at every listed ref comes from one `git cat-file --batch-check` (content hash → `m_file_blob`). Per ref: same `tag_id` as the previous ref → `unchanged`; another tag → `modified`, or `cosmetic` when the code is identical once comments and whitespace are removed; first appearance → `introduced` (`added` when it reappears); no match → `removed`/`absent`; blob never parsed → `unindexed`; blob parsed without the definition although a non-indented line of the file still names the symbol → `unparsed` (an indexing gap, the previous state is kept). Code comes from on-demand Git blob slicing via `m_bridge_tag` coordinates (cached in memory); diffs (with context lines) compare against the last present version.
@@ -836,9 +709,6 @@ Release-by-release history of one definition (function, struct, union, enum, typ
   "include_rc": false,
   "branch": "master",
   "rc_count": 203,
-  "moved_to": 1404325,
-  "moved_from": 1350084,
-  "lineage_tag_ids": [1352034, 1267003, 1338314, 1350084, 1404325],
   "total_versions": 5,
   "change_count": 4,
   "snippets": { "982012": "static task_t *copy_process(...", "1142713": "..." },
@@ -850,7 +720,6 @@ Release-by-release history of one definition (function, struct, union, enum, typ
 ```
 
 #### `GET /api/kconfig/{version_name}/symbol/{symbol_name}/history`
-#### `GET /api/version/{version_name}/kconfig/symbol/{symbol_name}/history`
 Release-by-release history of every definition of `CONFIG_<symbol>` (`CONFIG_` prefix optional) across all Kconfig files (`HistoryService.get_kconfig_history`).
 - **Parameters**: `include_rc` (bool, default `false`) and `branch` as above (the branch scope applies the same way); `version_name` picks the reported `path` and, without `branch`, the branch followed.
 - **Algorithm**: the Kconfig tags of the symbol (`m_ast` name + `Kconfig_Config`/`Kconfig_Menuconfig` → `m_tag` → `m_bridge_tag`) give the blobs defining it and, through `m_bridge_checkpoint`/`m_commit_file`, the candidate paths; one `git cat-file --batch-check` resolves every (ref, path). Each defining file is parsed with `KconfigParser` (cached per blob SHA) to extract the definition's properties, including the dependencies inherited from enclosing `if`/`menu`/`choice` blocks. Definitions are paired per path (in line order) between consecutive refs: `added`, `removed`, `unchanged` (same tag), `modified` (a property changed) or `cosmetic` (text changed, properties identical). The entry status aggregates them (`introduced`, `added`, `modified`, `cosmetic`, `removed`, `unchanged`, `absent`, `unindexed`).
@@ -875,17 +744,15 @@ kernel-doc comments of a source file, filtered like the `.. kernel-doc::` direct
 
 ### 4.4. Kconfig & Architecture Defconfigs API
 
-All Kconfig endpoints read the Git objects of the requested revision (never the work tree), accept an optional **toolchain profile** (`toolchain` query parameter holding JSON on GET endpoints, `toolchain` body field on POST endpoints; see `GET /toolchain` below) and are scoped by an **ARCH value** (`arch` parameter, default `x86_64`): the value `make ARCH=<arch>` would receive. The top Makefile maps some values onto another source directory (`i386`/`x86_64` -> `x86`, `sparc32`/`sparc64` -> `sparc`, `sh64` -> `sh`, ...); `x86`, `sparc` and `sh` themselves are the generic forms whose bitness is chosen in menuconfig. The model is built by `parser/kconfig_ast/kconfig_model.py` and evaluated by `parser/kconfig_ast/kconfig_eval.py` (server) and `kconfig_engine.js` (browser); both reproduce the kernel's `conf` output byte for byte (see `parser/kconfig_ast/KCONFIG_API.md` section 8). Models are cached per (repository, revision, ARCH, toolchain) in a 6-entry LRU, and persist across restarts as gzipped JSON under `~/.cache/kernelinfo/kconfig-models/` (`KERNELINFO_CACHE_DIR` overrides the base directory; 32 files, least recently used evicted, ~4 MB each for a modern tree), keyed by commit SHA, ARCH, toolchain profile and a hash of the model-building code, so a code change or a moved branch never reuses a stale model (a cold build of a modern tree takes ~2-3 s, a cached one ~0.3 s). A build costs about a second of CPU and tens of MB, and the toolchain profile is part of the key, so builds are bounded: each key has its own lock (concurrent requests for one model wait for that single build instead of duplicating it, and never block requests for other models), at most two models are built at once across all keys, and the cache lock is never held while a model is built.
+All Kconfig endpoints read the Git objects of the requested revision (never the work tree), accept an optional **toolchain profile** (`toolchain` query parameter holding JSON on GET endpoints, `toolchain` body field of the auto-solve POST; see `GET /toolchain` below) and are scoped by an **ARCH value** (`arch` parameter, default `x86_64`): the value `make ARCH=<arch>` would receive. The top Makefile maps some values onto another source directory (`i386`/`x86_64` -> `x86`, `sparc32`/`sparc64` -> `sparc`, `sh64` -> `sh`, ...); `x86`, `sparc` and `sh` themselves are the generic forms whose bitness is chosen in menuconfig. The model is built by `parser/kconfig_ast/kconfig_model.py` and evaluated by `parser/kconfig_ast/kconfig_eval.py` (server) and `kconfig_engine.js` (browser); both reproduce the kernel's `conf` output byte for byte (see `parser/kconfig_ast/KCONFIG_API.md` section 8). Models are cached per (repository, revision, ARCH, toolchain) in a 6-entry LRU, and persist across restarts as gzipped JSON under `~/.cache/kernelinfo/kconfig-models/` (`KERNELINFO_CACHE_DIR` overrides the base directory; 32 files, least recently used evicted, ~4 MB each for a modern tree), keyed by commit SHA, ARCH, toolchain profile and a hash of the model-building code, so a code change or a moved branch never reuses a stale model (a cold build of a modern tree takes ~2-3 s, a cached one ~0.3 s). A build costs about a second of CPU and tens of MB, and the toolchain profile is part of the key, so builds are bounded: each key has its own lock (concurrent requests for one model wait for that single build instead of duplicating it, and never block requests for other models), at most two models are built at once across all keys, and the cache lock is never held while a model is built.
 
 #### `GET /api/kconfig/{version_name}/toolchain`
-#### `GET /api/version/{version_name}/kconfig/toolchain`
 Default toolchain profiles of a revision. Linux 4.18+ Kconfig runs `$(shell,...)` checks against the compiler, linker and assembler while it is parsed; the server answers them from a profile (`parser/kconfig_ast/kconfig_toolchain.py`). Response: `{ "version", "arch", "kernelversion", "macros": true, "gcc": {profile}, "clang": {profile} }` where a profile is `{ "cc", "cc_version", "ld", "ld_version", "assembler", "binutils_version", "cross_compile", "llvm_utils", "pahole_version", "rustc_version", "gcc_plugins", "host_release", "env", "probes" }`. `macros: false` means the revision predates the macro language: only environment variables (`option env=`) matter.
 - **Toolchain parameter**: validated before use — unknown keys are ignored, each value is coerced to its field's type, `env`/`probes` must be objects of at most 128 string entries (each value at most 512 characters), and a wrong shape (`{"env": "text"}`) answers `HTTP 400 Bad Request` rather than failing inside the model build. It is any subset of the profile, e.g. `{"cc": "clang", "cc_version": "18.1.3", "env": {"CC_VERSION_TEXT": "Ubuntu clang version 18.1.3"}, "probes": {"cc-option:-fsanitize=kcfi": "n"}}`. Missing fields take the defaults of that kernel release. `env` overrides any environment variable Kconfig reads; `probes` forces a check (`"y"`/`"n"`) or a command output (text), keyed as reported in the model's `toolchain.probes`.
 
 #### `GET /api/kconfig/{version_name}/tree`
-#### `GET /api/kconfig/tree`
 The finalized configuration model of one ARCH, in compact transport form, for the client-side engine (`decodeModel()` in `kconfig_engine.js`).
-- **Parameters**: `version_name` (path) / `version` (query); `arch` (query, default `x86_64`); `include_nodes` / `include_tree` (bool: also return readable per-entry `nodes` with `tree_id`, `parent_id`, `node_type`, `title`, `prompt`, `symbol_name`, `file_path`, `line_s`, `depends_on_expr`, `depends_on`, `defaults`, `selects`, `selected_by`, `implies`, `implied_by`, `choice`); `include_relations` (bool: `relations` / `reverse_relations` maps).
+- **Parameters**: `version_name` (path); `arch` (query, default `x86_64`); `toolchain` (query, JSON).
 - **Response** (abridged):
 ```json
 {
@@ -893,7 +760,7 @@ The finalized configuration model of one ARCH, in compact transport form, for th
   "env": {"ARCH": "x86_64", "SRCARCH": "x86", "KERNELVERSION": "3.0.0"},
   "mainmenu": "Linux/x86_64 3.0.0 Kernel Configuration",
   "config_header": "Automatically generated make config: don't edit",
-  "modules_sym": "MODULES", "root_kconfig": "Kconfig", "total_nodes": 8255,
+  "modules_sym": "MODULES", "root_kconfig": "Kconfig",
   "exprs": [["s", "64BIT"], ["c", "x86_64"], ["=", 3, 1], ["&", 0, 2]],
   "menu_fields": ["parent", "kind", "sym", "prompt", "pvis", "vis_if", "dep", "file", "line_s", "line_e", "has_help"],
   "menus": [[-1, 0, null, "Linux/x86_64 3.0.0 Kernel Configuration", -1, -1, -1, 0, 6, 0, 0], [0, 3, "64BIT", "64-bit kernel", 12, -1, -1, 1, 2, 9, 1]],
@@ -903,7 +770,7 @@ The finalized configuration model of one ARCH, in compact transport form, for th
   "semantics": {"write_on_nonzero_default": false, "menu_end_comments": false, "int_hex_zero_default": false, "tristate_choice_mod_hidden": false},
   "toolchain": {
     "macros": false, "summary": "gcc 5.4.0 · GNU ld 2.25", "profile": {...}, "env": {"CC": "gcc", "...": "..."},
-    "env_used": [{"name": "ARCH", "value": "x86_64", "overridden": false}],
+    "env_used": [{"name": "ARCH", "value": "x86_64"}],
     "probes": [{"key": "cc-option:-fsanitize=kcfi", "kind": "cc-option", "label": "Compiler accepts -fsanitize=kcfi", "command": "...", "result": "n", "source": "knowledge", "note": "gcc >= never, clang >= 16.0", "locations": [{"file": "arch/Kconfig", "line": 790, "symbol": "CFI_CLANG"}]}],
     "messages": [{"level": "error", "text": "Sorry, this C compiler is not supported.", "file": "scripts/Kconfig.include", "line": 44}]
   }
@@ -913,18 +780,15 @@ The finalized configuration model of one ARCH, in compact transport form, for th
   Expression nodes: `["s", name]`, `["c", text]`, `["&"|"|", a, b]`, `["!", a]`, `["="|"!="|"<"|"<="|">"|">=", a, b]`; `-1` = no expression. Menu `kind` codes: 0 root, 1 menu, 2 choice, 3 config, 4 menuconfig, 5 comment, 6 if. Symbol keys: `t` type, `p` prompt visibilities, `d` defaults `[value, condition]`, `r` ranges, `s` selects, `i` implies, `rd` reverse dependency, `im` implied-by, `dd` direct dependency, `m` defining menu entries, `ch` choice of a choice value, `ic`/`op`/`mb` choice flags and members, `au` automatic (env/choice), `env`.
 
 #### `GET /api/kconfig/{version_name}/symbol/{symbol_name}`
-#### `GET /api/version/{version_name}/kconfig/symbol/{symbol_name}`
-#### `GET /api/kconfig/symbol` / `GET /api/version/{version_name}/kconfig/symbol` (`name` query)
 Arch-scoped details of a symbol (with or without `CONFIG_`). The same name can be declared in different files per architecture (e.g. `64BIT`: `arch/x86/Kconfig` for x86_64, `arch/sparc/Kconfig` for sparc64).
 - **Parameters**: `arch` (query, default `x86_64`).
-- **Response**: `name`, `arch`, `srcarch`, `defined_for_arch`, `type` (1 bool, 2 tristate, 3 string, 4 hex, 5 int) / `type_name`, `prompt`, `prompts`, `help`, primary `file_path` / `line_s` / `line_e` / `definition`, `declarations` and `definitions` (every definition for this ARCH: `file_path`, `line_s`, `line_e`, `prompt`, `kind`, `depends_on_expr`, `visible_expr`, `help`, `menu_path`), `dir_dep_expr`, `rev_dep_expr`, `implied_expr`, `depends_on` (symbols named by its own `depends on` lines), `selects`, `select_conditions`, `implies`, `selected_by`, `implied_by`, `defaults` (`[{value, cond}]`), `def_val`, `ranges`, `choice`, `choice_members`, `env`, `kconfig_refs` (entries referring to it), `kbuild` (Makefile rules, see usage), `compiled_files` (`[{file_path, target_obj, compile_mode, makefile, line, other_arch}]`: the existing files among the `kbuild` rules of this revision), plus compatibility fields `vid_s`, `vid_e`, `vname_s`, `vname_e`, `added_version`, `is_active`, `lifecycle_status`.
+- **Response**: `name`, `arch`, `srcarch`, `defined_for_arch`, `type` (1 bool, 2 tristate, 3 string, 4 hex, 5 int) / `type_name`, `prompt`, `prompts`, `help`, primary `file_path` / `line_s` / `line_e` / `definition`, `declarations` and `definitions` (every definition for this ARCH: `file_path`, `line_s`, `line_e`, `prompt`, `kind`, `help`), `depends_on` (symbols named by its own `depends on` lines), `selects`, `implies`, `defaults` (`[{value, cond}]`), `def_val`, `ranges`, `choice`, `env`, `kconfig_refs` (entries referring to it), `kbuild` (Makefile rules, see usage), `compiled_files` (`[{file_path, target_obj, compile_mode, makefile, line, other_arch}]`: the existing files among the `kbuild` rules of this revision). Reverse dependencies and evaluated expressions are not part of it: the KConfig view reads them from its own engine (§5.8).
 - When the symbol is not declared for this ARCH: `defined_for_arch: false` and `declarations` lists its declarations in other architectures' Kconfig files (404 if declared nowhere).
 
 #### `GET /api/kconfig/{version_name}/symbol/{symbol_name}/usage`
-#### `GET /api/version/{version_name}/kconfig/symbol/{symbol_name}/usage`
-Where `CONFIG_<symbol>` is used (Git grep of the revision, cached).
+Where `CONFIG_<symbol>` is used (Git grep of the revision, cached; a `git grep` that fails or times out answers 503 and is not cached).
 - **Parameters**: `arch` (default `x86_64`), `limit` (1-2000, default 400). `symbol_name` must be an identifier (§2.1.2) or the request is rejected with 400.
-- **Response**: `kbuild` (`[{makefile, line, rule, target_obj, path, exists, kind: object|composite|directory, via: rule|condition, compile_mode, other_arch}]`: objects and directories built when the option is enabled, including rules inside `ifeq ($(CONFIG_X),y)` blocks), `source_refs` (`[{file_path, line, text, other_arch}]` in `.c .h .S .lds .dts .dtsi`, `CONFIG_X` and `CONFIG_X_MODULE`), `source_ref_count`, `source_refs_truncated` (the symbol has more than 20,000 references, so the list was cut before being cached), `source_file_count`, `kconfig_refs` (`[{kind: depends_on|select|imply|default|prompt_condition|select_condition|imply_condition, by, file, line}]`). `other_arch` marks paths in an architecture tree (`arch/<a>/`, or `include/asm-<a>/` in 2.6.x) the ARCH's build layout does not use (§2.7).
+- **Response**: `kbuild` (`[{makefile, line, rule, target_obj, path, exists, kind: object|composite|directory, via: rule|condition, compile_mode, other_arch}]`: objects and directories built when the option is enabled, including rules inside `ifeq ($(CONFIG_X),y)` blocks), `source_refs` (`[{file_path, line, text, other_arch}]` in `.c .h .S .lds .dts .dtsi`, `CONFIG_X` and `CONFIG_X_MODULE`), `source_ref_count`, `source_refs_truncated` (the symbol has more than 20,000 references, so the list was cut before being cached; the view shows the count with a `+`), `source_file_count`, `kconfig_refs` (`[{kind: depends_on|select|imply|default|prompt_condition|select_condition|imply_condition, by, file, line}]`). `other_arch` marks paths in an architecture tree (`arch/<a>/`, or `include/asm-<a>/` in 2.6.x) the ARCH's build layout does not use (§2.7).
 
 #### `GET /api/kconfig/{version_name}/build`
 Kbuild build condition of source files: under which configuration `make ARCH=<arch>` compiles each one (`KconfigService.build_conditions`, `parser/kbuild_conditions.py`, see `parser/kconfig_ast/KCONFIG_API.md` §6.4). The condition is an expression over `CONFIG_*` symbols that the client evaluates against its own configuration (`build_condition.js`), so one response serves every configuration of the ARCH. Resolvers are cached per (revision, ARCH) (4 entries); the first request of a revision reads its Makefiles and greps it once for `#include "*.c"` sources (~1 s).
@@ -949,64 +813,48 @@ Kbuild build condition of source files: under which configuration `make ARCH=<ar
 }
 ```
 
-#### `GET /api/version/{version_name}/kconfig/defconfigs`
-#### `GET /api/kconfig/{version_name}/defconfigs` / `GET /api/kconfig/defconfigs`
-Defconfigs of the ARCH's source directory: `arch/<srcarch>/defconfig` and every file under `arch/<srcarch>/configs/` (nested ones such as powerpc `40x/acadia_defconfig` included). `canonical_default` is what `make ARCH=<arch> defconfig` loads: `KBUILD_DEFCONFIG` from `arch/<srcarch>/Makefile` evaluated with ARCH/SRCARCH known, `CONFIG_*` undefined and `CROSS_COMPILE` set (e.g. `x86` -> `i386_defconfig`, `x86_64` -> `x86_64_defconfig`, `powerpc` -> `ppc64_defconfig`), else `arch/<srcarch>/defconfig`.
-- **Response**: `{ "version", "arch", "arch_dir", "total_count", "canonical_default", "defconfigs": [{ "name", "file_path", "fid", "is_canonical" }] }`.
+#### `GET /api/kconfig/{version_name}/defconfigs`
+Defconfigs of the ARCH's source directory: `arch/<srcarch>/defconfig` and every file under `arch/<srcarch>/configs/` (nested ones such as powerpc `40x/acadia_defconfig` included). The one flagged `is_canonical` is what `make ARCH=<arch> defconfig` loads: `KBUILD_DEFCONFIG` from `arch/<srcarch>/Makefile` evaluated with ARCH/SRCARCH known, `CONFIG_*` undefined and `CROSS_COMPILE` set (e.g. `x86` -> `i386_defconfig`, `x86_64` -> `x86_64_defconfig`, `powerpc` -> `ppc64_defconfig`), else `arch/<srcarch>/defconfig`.
+- **Response**: `{ "version", "arch", "defconfigs": [{ "name", "file_path", "fid", "is_canonical" }] }`.
 
-#### `GET /api/version/{version_name}/kconfig/defconfig/content`
-#### `GET /api/kconfig/{version_name}/defconfig` / `GET /api/kconfig/defconfig/content`
+#### `GET /api/kconfig/{version_name}/defconfig`
 Raw defconfig text and its literal assignments. Nothing is injected: everything a defconfig leaves out is derived by kconfig when it is loaded.
-- **Parameters**: `defconfig` / `file_path` (name or path; empty = the ARCH's default defconfig), `arch`.
-- **Response**: `{ "version", "name", "file_path", "arch", "srcarch", "bits", "symbol_count", "values", "content" }`; `bits` is `64BIT` after resolving the defconfig with kconfig (null for architectures without that symbol).
+- **Parameters**: `file_path` (name or path; empty = the ARCH's default defconfig), `arch`, `toolchain`.
+- **Response**: `{ "version", "name", "file_path", "arch", "srcarch", "bits", "values", "content" }`; `bits` is `64BIT` after resolving the defconfig with kconfig (null for architectures without that symbol).
 
 #### `GET /api/kconfig/{version_name}/presets`
-#### `GET /api/version/{version_name}/kconfig/presets` / `.../kconfig/env-presets`
 Every ARCH value of the revision: one per `arch/*` directory plus the top Makefile's aliases.
-- **Response**: `{ "version", "default_arch", "targets": [{ "id", "label", "arch", "srcarch", "kconfig_path", "canonical_defconfig", "bits", "env": {"ARCH", "SRCARCH", "KERNELVERSION"} }], "architectures": (same list), "compilers": [...] }`. `compilers` only matters from Linux 4.18 (`CC_IS_GCC`/`CC_IS_CLANG`), whose `$(shell,...)` macros the model does not evaluate.
+- **Response**: `{ "version", "default_arch", "targets": [{ "id", "label", "arch", "srcarch", "bits", "env": {"ARCH", "SRCARCH", "KERNELVERSION"} }] }`. The default defconfig of each ARCH is the one `GET /defconfigs` flags.
 
 #### `GET /api/kconfig/{version_name}/search`
-#### `GET /api/version/{version_name}/kconfig/search`
-Search symbol names and prompts of the ARCH model (`CONFIG_` prefix optional). Parameters: `q`, `limit` (default 25), `arch`. Response: `{ "version", "arch", "query", "count", "total", "symbols": [{ "name", "type", "type_name", "prompt", "help", "file_path", "line_s" }] }`.
+Search symbol names and prompts of the ARCH model (`CONFIG_` prefix optional). Parameters: `q`, `limit` (1-500, default 25), `arch`. Response: `{ "version", "arch", "query", "count", "total", "symbols": [{ "name", "type", "type_name", "prompt", "help", "file_path", "line_s" }] }`.
 
-#### `GET /api/kconfig/graph` / `GET /api/kconfig/{version_name}/graph`
-#### `GET /api/version/{version_name}/kconfig/graph` / `.../kconfig/graph/{symbol_name}`
-Direct relations of one symbol in the ARCH model: its own `depends on` symbols (`depends_on` edges), `selects` / `implies` targets, and selectors (`selects` edges into it). Parameters: `symbol` / `symbol_name`, `arch`, `depth` (kept for compatibility). Response: `{ "version", "arch", "symbol", "nodes": [{ "id", "label", "is_root", "type" }], "edges": [{ "from", "to", "type" }] }`.
+#### `GET /api/kconfig/{version_name}/graph`
+Direct relations of one symbol in the ARCH model: its own `depends on` symbols (`depends_on` edges), `selects` / `implies` targets, and selectors (`selects` edges into it). Parameters: `symbol`, `arch`, `toolchain`. Response: `{ "version", "arch", "symbol", "edges": [{ "from", "to", "type" }] }`.
 
-#### `POST /api/kconfig/{version_name}/autosolve` / `POST /api/version/{version_name}/kconfig/autosolve`
-#### `GET /api/kconfig/{version_name}/autosolve/{symbol}` / `GET /api/version/{version_name}/kconfig/autosolve/{symbol}`
+#### `POST /api/kconfig/{version_name}/autosolve`
 Legal changes (the ones menuconfig would accept, applied in order) that make `target_symbol` reach `value` from `current_values`. The solver satisfies prompt visibility recursively (AND: both sides, OR: cheapest side, `!X`: lowers X), selects prompt-less symbols through a selector, and refuses symbols forced by select, fixed by the architecture or without prompt.
-- **Body**: `{ "target_symbol": "KVM_INTEL", "value": "y", "arch": "x86_64", "toolchain": {...}, "current_values": {"KVM": "n"} }` (GET: empty configuration, `arch` query).
+- **Body**: `{ "target_symbol": "KVM_INTEL", "value": "y", "arch": "x86_64", "toolchain": {...}, "current_values": {"KVM": "n"} }`.
 - **Response**: `{ "solution_found": true, "toggles_needed": [{ "symbol": "KVM", "from": "n", "set_to": "y", "to": "y" }, { "symbol": "KVM_INTEL", "from": "n", "set_to": "y", "to": "y" }], "total_toggles": 2, "blocked_by": [], "final_value": "y", "target": "KVM_INTEL", "arch": "x86_64" }`.
 
-#### `POST /api/kconfig/{version_name}/validate` / `POST /api/version/{version_name}/kconfig/validate`
-Loads `{"symbols": {...}, "arch": ...}` like `conf_read` and reports every value kconfig would not keep. Response: `{ "version", "arch", "forced_symbols": {name: value}, "adjusted_symbols": {name: value}, "details": [{ "symbol", "requested", "value", "reason", "depends_on" }], "conflicts": [{ "symbol", "message", "selected_by", "depends_on" }], "unknown_symbols", "invalid_values" }`. `conflicts` are kconfig's "selects X which has unmet direct dependencies" warnings.
-
-#### `POST /api/kconfig/{version_name}/diff-config` / `POST /api/version/{version_name}/kconfig/diff-config`
-Compare `{"active_config": {...}, "custom_config": {...}}`. Response: `{ "version", "matching_symbols", "mismatched_symbols", "differences": [{ "symbol", "val1", "val2" }] }`.
-
-#### `POST /api/kconfig/{version_name}/import` / `POST /api/version/{version_name}/kconfig/import`
-Parse `.config` text (`{"content": "...", "arch": optional}`) into `{ "version", "symbol_count", "symbols" }` (strings unescaped). With `arch`, also `unknown_symbols`, `invalid_values` and `warnings` as kconfig reports them.
-
-#### `POST /api/kconfig/{version_name}/export` / `POST /api/version/{version_name}/kconfig/export`
-Body `{"symbols": {...}, "arch": optional, "format": "config"|"defconfig"}`. With `arch`, the assignments are resolved by kconfig and the result is exactly what `conf` writes (`format: "defconfig"`: `make savedefconfig` output); response `{ "version", "arch", "content", "symbol_count", "resolved": true, "unknown_symbols", "invalid_values" }`. Without `arch`, the assignments are only formatted (`resolved: false`).
+Validation, import, export and configuration comparison run in the browser on the same model (`kconfig_engine.js`, §5.8); the server only builds the model and answers the auto-solver.
 
 ---
 
 ### 4.5. Maintainers & CREDITS API
 
+**Version scoping** (`MaintainerService._version_scope`): sections and CREDITS entries are content addressed. A section unchanged since an earlier MAINTAINERS keeps the row stored with that earlier blob (`m_maintainer_section.blob_id`), so the sections of a version are the rows whose `ast_id` is one of its MAINTAINERS blob's tags (`m_bridge_tag` → `m_tag.ast_id`), one per section name (the newest row when several share it); CREDITS entries likewise through `m_credits_entry.ast_id`. v3.0 lists 925 sections and 507 CREDITS entries, exactly its files' contents. A version whose MAINTAINERS (or CREDITS) blob was never parsed lists none of them (`indexed: false` in the overview) rather than every section ever parsed. The id lists are cached per blob (`_BLOB_SECTIONS_CACHE`, `_BLOB_CREDITS_CACHE`, 64 entries each); the subsystem matcher per version (`_MAINTAINER_CACHE`, 16 entries).
+
 #### `GET /api/maintainers/{version_name}/overview`
-#### `GET /api/maintainers`
-#### `GET /api/version/{version_name}/maintainers`
-Search and list kernel subsystems from the authoritative `MAINTAINERS` file database.
+Search and list the subsystems of the version's `MAINTAINERS` file.
 - **Parameters**:
-  - `version_name` (path) / `version` (query): Kernel version string.
+  - `version_name` (path): Revision.
   - `q` (query): Search filter across subsystem names, maintainer names, and emails.
 - **Response**:
 ```json
 {
   "version": "v3.0",
-  "total": 1,
+  "indexed": true,
   "sections": [
     {
       "sec_id": 1,
@@ -1030,12 +878,10 @@ Search and list kernel subsystems from the authoritative `MAINTAINERS` file data
 ```
 
 #### `GET /api/maintainers/{version_name}/section/{sec_id}`
-#### `GET /api/maintainers/section`
-#### `GET /api/version/{version_name}/maintainer/section/{sec_id}`
 Retrieve comprehensive details for a subsystem section, including member rosters, file matching rules (`F:`, `X:`), and touched files.
 - **Parameters**:
-  - `version_name` (path) / `version` (query): Kernel version string.
-  - `sec_id` (path) / `sec_name` (query): Numeric section ID (`sec_id`) or literal subsystem name.
+  - `version_name` (path): Revision.
+  - `sec_id` (path): Numeric section ID, or a subsystem name (looked up among the version's sections).
 - **Response**:
 ```json
 {
@@ -1069,23 +915,21 @@ Retrieve comprehensive details for a subsystem section, including member rosters
 ```
 
 #### `GET /api/maintainers/{version_name}/person/{person_id_or_email}`
-#### `GET /api/maintainers/{version_name}/person`
-#### `GET /api/maintainers/person`
-#### `GET /api/version/{version_name}/person/{person_id_or_email}`
-#### `GET /api/version/{version_name}/person`
-Retrieve developer profile, CREDITS biographical data, maintained subsystems, and git contribution statistics. Supports both URI path parameters and query parameters to safely handle email addresses containing special characters.
+#### `GET /api/maintainers/{version_name}/person?email=...`
+Retrieve developer profile, CREDITS biographical data, maintained subsystems, and git contribution statistics. An email address goes in the `email` query parameter (its `@`, `<`, `/` do not survive a path segment); a numeric id or a name in the path.
+Subsystems, the CREDITS entry, recent commits and contribution stats are aggregated over every alias persona of the developer (same identity rule as the Developers directory, see **Persona identity merging** below), so a profile always matches its directory card. Contribution stats count distinct commits per role. An email/name lookup prefers a named persona over a name-less one.
 - **Parameters**:
-  - `version_name` (path) / `version` (query): Kernel version string.
+  - `version_name` (path): Revision (its MAINTAINERS and CREDITS files scope `subsystems` and `credits`).
   - `person_id_or_email` (path): Developer numeric person ID, email address, or name.
   - `email` (query): Developer email address (e.g. `"torvalds@linux-foundation.org"`).
-  - `person_id` / `id` (query): Numeric developer person ID (e.g. `47`).
-  - `name` (query): Developer name query.
 - **Response**:
 ```json
 {
   "person_id": 47,
   "name": "Philip Blundell",
   "email": "philb@gnu.org",
+  "emails": ["philb@gnu.org"],
+  "alias_person_ids": [47],
   "in_credits": true,
   "subsystems": [
     {
@@ -1110,18 +954,15 @@ Retrieve developer profile, CREDITS biographical data, maintained subsystems, an
 ```
 
 #### `POST /api/maintainers/{version_name}/match`
-#### `POST /api/maintainers/match`
-#### `POST /api/version/{version_name}/patch/maintainers`
-#### `POST /api/patch/maintainers`
-Emulate `scripts/get_maintainer.pl` by evaluating touched paths or raw patch content against subsystem pattern rules.
-Every file is matched against every MAINTAINERS pattern, so at most `MAX_PATCH_FILES` (200) files of one patch are resolved; the rest are counted in `skipped_files_count` and not matched (2,000 files took ~14 s before this cap, and the cost was paid even when nothing matched).
+Emulate `scripts/get_maintainer.pl` by evaluating touched paths or raw patch content against the subsystem pattern rules of the version's MAINTAINERS. The `in_credits` flags come from the version's CREDITS, read once per version (`_CREDITS_KEYS_CACHE`).
+Every file is matched against every MAINTAINERS pattern, so at most `MAX_PATCH_FILES` (200) files of one patch are resolved; the rest are counted in `skipped_files_count` (the patch reviewer says how many were left out) and not matched (2,000 files took ~14 s before this cap, and the cost was paid even when nothing matched).
 - **Parameters**:
   - `version_name` (path): Kernel version string.
   - **Body** (`application/json`):
     ```json
     {
-      "paths": ["drivers/net/3c505.c"],
-      "patch": null
+      "touched_files": ["drivers/net/3c505.c"],
+      "patch": "diff --git a/... (optional unified diff)"
     }
     ```
 - **Response**:
@@ -1145,11 +986,10 @@ Every file is matched against every MAINTAINERS pattern, so at most `MAX_PATCH_F
 ```
 
 #### `GET /api/maintainers/{version_name}/credits`
-#### `GET /api/credits`
-#### `GET /api/version/{version_name}/credits`
-Search historical `CREDITS` file entries and biographical details.
+Search the entries of the version's `CREDITS` file and their biographical details.
+Returns one entry per developer: several rows of one entry and the same person under other alias personas collapse into the newest entry. Its addresses are unioned into `emails`, empty bio fields are filled from older revisions, and `email` falls back to the merged list when the newest revision lost it. Names are cleaned (see **Persona identity merging**).
 - **Parameters**:
-  - `version_name` (path) / `version` (query): Kernel version string.
+  - `version_name` (path): Revision.
   - `q` (query): Search query string.
 - **Response**:
 ```json
@@ -1161,6 +1001,8 @@ Search historical `CREDITS` file entries and biographical details.
       "person_id": 47,
       "name": "Philip Blundell",
       "email": "philb@gnu.org",
+      "emails": ["philb@gnu.org"],
+      "alias_person_ids": [47],
       "description": "Linux/ARM hacker Device driver hacker",
       "snail_mail": "Cambridge CB5 8EG\nUnited Kingdom"
     }
@@ -1169,32 +1011,35 @@ Search historical `CREDITS` file entries and biographical details.
 ```
 
 #### `GET /api/maintainers/{version_name}/developers`
-#### `GET /api/developers/{version_name}`
-#### `GET /api/developers`
 Search and list all kernel developers, maintainers, reviewers, and contributors recorded in the kernel persona registry (`m_maintainer_person`).
+
+**Persona identity merging**: the registry holds one row per (name, email) alias, so one developer appears under many `person_id`s. Rows are merged into one entry per identity (`MaintainerService._identity_index`, cached per repository until the registry grows):
+- Identity = name folded for case/whitespace, with surrounding quotes and a leaked `From:` prefix stripped (`_clean_name`, also the displayed name).
+- A name-less persona joins the named identity that owns its address; when several do (typo'd name, nickname), the one using it on the most personas, then the largest, wins.
+- Named identities are never merged with each other by email: transitive email links chain distinct people together (shared/mistyped addresses), so `"Greg KH"` stays separate from `"Greg Kroah-Hartman"`.
+- The merged entry uses the alias with a name and email, most subsystems, CREDITS, commits as `person_id`/`email`; flags are OR-ed over aliases, `subsystems_count` is the distinct subsystem names across aliases. The search and `role` filter apply to the merged identity (a match on any alias returns the whole identity); sorting happens after merging.
 - **Parameters**:
-  - `version_name` (path) / `version` (query): Kernel version string.
-  - `q` / `query` (query): Case-insensitive search on developer name or email.
+  - `version_name` (path): Revision (`subsystems_count`, `is_maintainer`, `is_reviewer` and `in_credits` count only its MAINTAINERS and CREDITS).
+  - `q` (query): Case-insensitive search on developer name or email.
   - `role` (query): Role filter (`"all"`, `"maintainer"`, `"reviewer"`, `"credits"`). Default `"all"`.
   - `sort` (query): Sort order (`"activity"` for subsystems count descending, or `"alpha"` for alphabetical A-Z). Default `"activity"`.
 - **Response**:
 ```json
 {
   "version": "v3.0",
-  "total_count": 1171,
-  "role_filter": "all",
   "sort": "activity",
   "developers": [
     {
       "person_id": 72,
       "name": "Lennert Buytenhek",
       "email": "kernel@wantstofly.org",
-      "subsystems_count": 20,
+      "emails": ["kernel@wantstofly.org", "buytenh@wantstofly.org", "buytenh@marvell.com"],
+      "alias_person_ids": [67, 1135, 5334, 5338, 7184],
+      "subsystems_count": 24,
       "is_maintainer": true,
       "is_reviewer": false,
       "in_credits": true,
-      "has_commits": false,
-      "primary_role": "Maintainer"
+      "has_commits": false
     }
   ]
 }
@@ -1205,12 +1050,12 @@ Search and list all kernel developers, maintainers, reviewers, and contributors 
 ### 4.6. Git Commits & Patch Management API
 
 #### `GET /api/commits/{version_name}/list`
-#### `GET /api/commits`
-Retrieve paginated commit history and contributor summaries.
+Search the indexed commits of the request's repository, newest first (the Commits view's search; its unfiltered list is the timeline below).
+- **Repository scoping**: commit ids are global, so the query is restricted to the repository's Git network (`m_commit.network_id` = `m_repository.network_id`, `helpers.get_active_network_id`): other repositories of the database never appear. A repository that was never parsed answers an empty list.
 - **Parameters**:
-  - `version_name` (path) / `version` (query): Kernel version string.
+  - `version_name` (path): Revision (must resolve, else 404).
   - `page` (query): Page number (1 or more, default 1).
-  - `limit` (query): Commits per page (1-500, default 50). Bound again in the service, which also clamps the derived `OFFSET` (`MAX_COMMIT_PAGE`, `MAX_COMMIT_OFFSET`), since both are bound straight into SQL and the method is also an exported delegate.
+  - `limit` (query): Commits per page (1-500, default 50). Bound again in the service, which also clamps the derived `OFFSET` (`MAX_COMMIT_PAGE`, `MAX_COMMIT_OFFSET`), since both are bound straight into SQL.
   - `q` (query): Filter by commit subject, hash prefix (matched case-insensitively against `HEX(commit_hash)`), or author name. Wildcards are escaped (§2.2), so `%` and `_` match literally.
 - **Response**:
 ```json
@@ -1233,13 +1078,11 @@ Retrieve paginated commit history and contributor summaries.
 ```
 
 #### `GET /api/commits/{version_name}/detail/{commit_id_or_hash}`
-#### `GET /api/commit`
-#### `GET /api/version/{version_name}/commit/{commit_id_or_hash}`
 Retrieve detailed metadata for a commit, including multi-contributor trailers and modified files.
-- **Modified files**: `files` comes from `m_commit_file` (`files_source: "db"`). `git log -p` emits no diff for a merge, so the parser stages **no file rows for merge commits** (`parser/git_ast/GIT_API.md` §2); for any commit whose staged list is empty the service resolves it live with `git diff -M --name-status <first parent> <commit>` and reports `files_source: "git"` — the same comparison `.../diff/{hash}` renders, so the *Modified Files* count can no longer disagree with **± Show changes**. A commit that genuinely changes nothing keeps an empty list and `files_source: "none"`. `is_merge` is set from the commit's parent count, and a list longer than 5000 entries is cut with `files_truncated: true`.
+- **Modified files**: `files` comes from `m_commit_file` (`files_source: "db"`). `git log -p` emits no diff for a merge, so the parser stages **no file rows for merge commits** (`parser/git_ast/GIT_API.md` §2); for any commit whose staged list is empty the service resolves it live with `git diff -M --name-status <first parent> <commit>` and reports `files_source: "git"` — the same comparison `.../diff/{hash}` renders, so the *Modified Files* count can no longer disagree with **± Show changes**. A commit that genuinely changes nothing keeps an empty list and `files_source: "none"`. `is_merge` is set from the commit's parent count in `m_commit_parent`, which also gives the first parent of that diff (Git is asked, `rev-list --parents`, only for a commit without parent rows: a root, or one whose parents were not ingested), and a list longer than 5000 entries is cut with `files_truncated: true`.
 - **Parameters**:
-  - `version_name` (path) / `version` (query): Kernel version string.
-  - `commit_id_or_hash` (path) / `commit_id` (query): Commit integer ID, 40-character SHA-1 hash, or a short hex prefix (4-40 digits, matched case-insensitively against `HEX(commit_hash)`). Anything else answers `HTTP 400 Bad Request`.
+  - `version_name` (path): Revision (not used: commit ids and hashes are global).
+  - `commit_id_or_hash` (path): Commit integer ID, 40-character SHA-1 hash, or a short hex prefix (4-39 digits). A prefix is a range over the binary hash in which every digit counts (`helpers.commit_prefix_range`: an odd length bounds its last digit, so the 7-digit abbreviations Git prints resolve exactly); a prefix two commits share answers `HTTP 400` (ambiguous), as does anything that is not hex. The same range rule resolves short SHAs used as a version name (`get_version_info`, where an ambiguous prefix resolves to nothing).
 - **Response**:
 ```json
 {
@@ -1264,7 +1107,6 @@ Retrieve detailed metadata for a commit, including multi-contributor trailers an
       "message_id": "20210515120000.1234-1-dev@kernel.org",
       "thread_id": 98765,
       "relation_type": 1,
-      "relation_name": "Patch",
       "match_tier": 1,
       "match_tier_name": "Trailer",
       "patch_version": 1,
@@ -1278,12 +1120,12 @@ Retrieve detailed metadata for a commit, including multi-contributor trailers an
 ```
 
 #### `POST /api/commits/{version_name}/resolve_mail/{commit_id_or_hash}`
-#### `POST /api/commits/resolve_mail`
 Execute on-demand live resolution of a Git commit against the Public-Inbox / LKML archive without pre-indexed database writes.
 - **Parameters**:
-  - `version_name` (path) / `version` (query): Kernel version string.
-  - `commit_id_or_hash` (path) / `commit_id` (query): Commit integer ID or hex hash.
+  - `version_name` (path): Revision (not used: commit ids and hashes are global).
+  - `commit_id_or_hash` (path): Commit integer ID or hex hash.
 - **Read-Only Safety**: Strictly adheres to the zero-write backend invariant; queries the commit features, extracts `git patch-id` and blob hashes, invokes `MailingListClient.resolve_commits()`, and synthesizes linked email records dynamically in memory without executing any `INSERT` or `UPDATE` SQL queries.
+- **Limits**: the commit's patch is read with the 8 MiB cap of `.../diff/{hash}` (a larger one gets no patch id, since a truncated patch would hash differently), and every Git step has a 30 s timeout.
 - **Response**:
 ```json
 {
@@ -1295,7 +1137,6 @@ Execute on-demand live resolution of a Git commit against the Public-Inbox / LKM
       "message_id": "20210515120000.1234-1-dev@kernel.org",
       "thread_id": 98765,
       "relation_type": 1,
-      "relation_name": "Patch",
       "match_tier": 2,
       "match_tier_name": "Live Resolved",
       "patch_version": 1,
@@ -1307,13 +1148,11 @@ Execute on-demand live resolution of a Git commit against the Public-Inbox / LKM
 }
 ```
 
-#### `GET /api/commits/timeline`
 #### `GET /api/commits/{version_name}/timeline`
-#### `GET /api/version/{version_name}/timeline`
-Retrieve an anchored, bi-directional chronological commit timeline relative to a release tag or version commit. Resolves the version's anchor commit (e.g. `v3.0` -> commit 854 "Linux 3.0") and navigates forward into newer commits (`direction="future"`), backward into older commits (`direction="past"`), or centered around the anchor (`direction="around"`). Uses primary key indexed ordering on `commit_id` for instantaneous (<0.002s) execution.
+Retrieve an anchored, bi-directional chronological commit timeline relative to a release tag or version commit. Resolves the version's anchor commit (e.g. `v3.0` -> commit 854 "Linux 3.0") and navigates forward into newer commits (`direction="future"`), backward into older commits (`direction="past"`), or centered around the anchor (`direction="around"`). Uses primary key indexed ordering on `commit_id` for instantaneous (<0.002s) execution. Every query stays inside the repository's Git network (see the list above), so two repositories of one database never interleave.
 - **Parameters**:
   - `version_name` (path): Kernel version string, branch, or commit SHA.
-  - `limit` (query): Maximum commits to retrieve (default 50).
+  - `limit` (query): Maximum commits to retrieve (1-250, default 100; the same bound in every direction).
   - `direction` (query): Seek direction: `"past"` (commits leading up to or before anchor, default), `"future"` (commits after anchor), or `"around"` (centered around anchor commit).
   - `cursor_id` (query): Optional integer commit ID pagination cursor.
 - **Response**:
@@ -1321,15 +1160,6 @@ Retrieve an anchored, bi-directional chronological commit timeline relative to a
 {
   "version": "v3.0",
   "direction": "past",
-  "anchor_commit": {
-    "commit_id": 854,
-    "commit_hash": "02f8c6aee8df311261e6da8ba96bd41704aa9623",
-    "subject": "Linux 3.0",
-    "author": { "name": "Linus Torvalds", "email": "torvalds@linux-foundation.org" },
-    "author_date": 1311299908,
-    "author_date_iso": "2011-07-21 18:58:28"
-  },
-  "total_commits": 50,
   "has_past": true,
   "has_future": true,
   "next_past_cursor": 804,
@@ -1342,18 +1172,13 @@ Retrieve an anchored, bi-directional chronological commit timeline relative to a
       "author_date": 1311299908,
       "author_date_iso": "2011-07-21 18:58:28",
       "subject": "Linux 3.0",
-      "files_count": 1,
-      "contributors": []
+      "files_count": 1
     }
-  ],
-  "top_contributors": [
-    { "name": "Linus Torvalds", "email": "torvalds@linux-foundation.org", "commits_count": 18 }
   ]
 }
 ```
 
 #### `GET /api/commits/{version_name}/search`
-#### `GET /api/commits/search`
 Fast full-text search across commit subjects, messages, author names, and hashes.
 - **Parameters**:
   - `version_name` (path): Kernel version string.
@@ -1410,22 +1235,43 @@ Structured unified diff of one commit against its **first parent** (root commits
 ```
 `status` is `A`, `M`, `D` or `R` (for renames `old_path` differs from `path`).
 
+#### `GET /api/commits/{version_name}/blame/{path:path}`
+Line-by-line `git blame` of a file at a revision (`git blame --porcelain`: each commit's author and summary are sent by Git once, on its first line, and attached to every line of it).
+- **Parameters**:
+  - `version_name` (path): Revision (validated by `safe_rev`, §2.1.1).
+  - `path` (path): Jailed repository path (e.g. `"init/main.c"`); traversal answers 400, a failed blame 404, a blame running over 12 s 504.
+- **Response**:
+```json
+{
+  "version": "v3.0",
+  "vid": 1,
+  "path": "init/main.c",
+  "lines": [
+    {
+      "line": 1,
+      "commit_hash": "1da177e4c3f41524e886b7f1b8a0c1fc7321cac2",
+      "author_name": "Linus Torvalds",
+      "author_email": "torvalds@ppc970.osdl.org",
+      "date": 1113690036,
+      "subject": "Linux-2.6.12-rc2"
+    }
+  ]
+}
+```
+
 #### `GET /api/commits/{version_name}/history/{path:path}`
-#### `GET /api/commits/{version_name}/history?path={path}`
-#### `GET /api/version/{version_name}/file/{path:path}/history`
 Retrieve chronological Git commit history touching a specific file up to a given version/tag/commit, along with immediate `last_changed` metadata.
 - **In-Memory LRU Caching**: Leverages a 1024-entry thread-safe LRU cache (`_cached_git_file_history`) on `(rev, rel_path, limit)`, providing instantaneous (<0.05ms) sub-millisecond responses on repeated queries without spawning subprocesses.
 - **Resilience Guard**: Wrapped with an 8-second execution timeout guard returning `HTTP 504 Gateway Timeout` on prolonged Git operations. Caller services (`FilesystemService`) safely fallback to `None` if unindexed or missing, preventing file viewer crashes.
 - **Parameters**:
-  - `version_name` (path) / `version` (query): Kernel version string, tag, branch, or commit SHA.
-  - `path` (path or query): Relative file path within the repository (e.g. `"init/main.c"`).
-  - `limit` (query): Maximum commits to retrieve (default 50, maximum 200).
+  - `version_name` (path): Kernel version string, tag, branch, or commit SHA.
+  - `path` (path): Relative file path within the repository (e.g. `"init/main.c"`).
+  - `limit` (query): Maximum commits to retrieve (default 50, 1-200).
 - **Response**:
 ```json
 {
   "version": "v3.0",
   "path": "init/main.c",
-  "total_commits": 50,
   "last_changed": {
     "commit_hash": "2f40b79cf44e311f42d2a02b378170c8a3014a40",
     "commit_hash_short": "2f40b79cf4",
@@ -1449,10 +1295,7 @@ Retrieve chronological Git commit history touching a specific file up to a given
 }
 ```
 
-#### `POST /api/commits/{version_name}/format_patch`
-#### `POST /api/commits/format_patch`
 #### `POST /api/version/{version_name}/patch/format`
-#### `POST /api/patch/format`
 Generate an authentic RFC-2822 standard email formatted patch file (`git format-patch`) from in-browser virtual editor modifications.
 - **Parameters**:
   - `version_name` (path): Kernel version string.
@@ -1482,101 +1325,86 @@ Generate an authentic RFC-2822 standard email formatted patch file (`git format-
 ### 4.7. Visual Modeling & Analysis Tools API
 
 #### `GET /api/tools/{version_name}/pahole/{struct_name}`
-#### `GET /api/struct/layout`
-#### `GET /api/version/{version_name}/struct/layout/{struct_name}`
-#### `GET /api/version/{version_name}/pahole/{struct_name}`
-Pahole-style memory alignment, member offset calculation, and 64-byte cacheline analysis for C struct and union definitions. Prioritizes struct definitions with AST member containers over forward declarations.
+Pahole-style member offsets, alignment holes and 64-byte cachelines of a C struct or union, verified via compiler AST attributes and source extraction. `404` when the revision defines no struct or union of that name.
+- **Definition**: the `C_structdecl` / `C_uniondecl` definitions of the name in the revision's tree (`SymbolService._scope`), ranked: definitions with members before forward declarations, then kernel headers before trees that carry their own copy for host programs (`tools/`, `scripts/`, `samples/`, `Documentation/`), then `.h` files, then `definition_rank` (§2.7). `struct list_head` at v3.0 is `include/linux/types.h:222`, 16 bytes.
+- **Sizes & Offsets**: member sizes and bit offsets are read from compiler AST attributes (`m_ast_attribute`: `size_bytes`, `offset_bits`, `bitfield_width`), which are extracted directly by Libclang during AST parsing. For members where compiler attributes are absent, size falls back to the AST category (`_EXACT_SIZES` and `_GUESSED_SIZES`). Member declarator types and array subscripts (e.g. `unsigned char [16]` for `id[16]`) are extracted directly from the struct definition in Git source. `is_estimate` is true only when any member lacks compiler attributes and uses category estimation (`struct adb_ids` is exact 20 bytes; `is_estimate: false`).
 - **Parameters**:
-  - `version_name` (path) / `version` (query): Kernel version string.
-  - `struct_name` (path or query): C struct identifier (e.g. `"task_struct"`).
+  - `version_name` (path): Revision.
+  - `struct_name` (path): C struct identifier (e.g. `"task_struct"`; a `struct ` / `union ` prefix is stripped).
 - **Response**:
 ```json
 {
   "version": "v3.0",
-  "struct_name": "struct task_struct",
-  "file_path": "include/linux/sched.h",
-  "line_s": 1220,
-  "line_e": 1573,
-  "total_size": 1304,
+  "struct_name": "struct list_head",
+  "file_path": "include/linux/types.h",
+  "line_s": 222,
+  "line_e": 224,
+  "is_estimate": true,
+  "estimated_members": 2,
+  "total_size": 16,
   "alignment": 8,
-  "padding_bytes": 78,
-  "cache_lines_used": 21,
+  "padding_bytes": 0,
+  "holes_count": 0,
+  "cache_lines_used": 1,
   "members": [
     {
-      "name": "state",
-      "type": "long",
+      "name": "next",
+      "type": "struct",
       "size": 8,
       "alignment": 8,
+      "estimated": true,
       "offset": 0,
       "padding_before": 0,
       "cacheline_idx": 0,
       "cacheline_offset": 0,
       "crosses_cacheline": false
-    },
-    {
-      "name": "stack",
-      "type": "void *",
-      "size": 8,
-      "alignment": 8,
-      "offset": 8,
-      "padding_before": 0,
-      "cacheline_idx": 0,
-      "cacheline_offset": 8,
-      "crosses_cacheline": false
     }
   ],
   "optimization": {
-    "current_size": 1304,
-    "optimized_size": 1226,
-    "bytes_saved": 78,
-    "suggested_order": ["state", "stack", "flags", "..."]
+    "current_size": 16,
+    "optimized_size": 16,
+    "bytes_saved": 0,
+    "suggested_order": ["next", "prev"]
   }
 }
 ```
 
 #### `GET /api/tools/{version_name}/callgraph/{function_name}`
-#### `GET /api/version/{version_name}/callgraph/{function_name}`
 Retrieve bidirectional caller and callee execution flow. Consolidates multiple call sites of the same function with call frequencies and coordinate tracking.
-- **Callers** are the calls to the function's AST found in this version's blobs, named after the AST of the tag containing the call. **Callees** are the calls inside the function's lines, each with the files defining the callee in this version (`file_path` is null when none does).
+- **Function**: the in-tree definitions of the name that are functions (`C_functionproto`/`C_functionprotodecl`, not macros), scoped to the revision's tree like the symbol endpoints; the one shown (`file_path`, lines, callees) has a body (not a prototype, and an `ExternalDef` before a header inline stub), ranked by `definition_rank` (§2.7).
+- **Callers** are the calls to any in-tree declaration that is the function itself (a call binds to the declaration visible where it is made, usually a header prototype; at most 8 ASTs, `m_ast.name` must be the function's name), found in this revision's blobs and named after the AST of the tag containing the call. **Callees** are the calls inside the function's lines, each with the files defining the callee in this revision (`file_path` is null when none does). At most `MAX_CALL_SITES` (2000) call sites are kept per direction (`truncated: true` beyond). Reference lookup goes through every indexed blob holding the targets (`rows_of_targets_sql`), so a widely used function takes seconds (`schedule` at v3.0: 542 callers, ~25 s); the frontend allows 60 s.
 - **Parameters**:
-  - `version_name` (path): Kernel version string.
+  - `version_name` (path): Revision.
   - `function_name` (path): C function identifier.
 - **Response**:
 ```json
 {
-  "function": "ext4_fill_super",
-  "function_name": "ext4_fill_super",
+  "function": "copy_process",
   "version": "v3.0",
-  "file": "fs/ext4/super.c",
-  "file_path": "fs/ext4/super.c",
-  "line_s": 3480,
-  "line_e": 3890,
-  "caller_count": 1,
-  "callee_count": 64,
+  "file_path": "kernel/fork.c",
+  "line_s": 1049,
+  "line_e": 1447,
+  "truncated": false,
   "callers": [
-    { "name": "ext4_mount", "caller_name": "ext4_mount", "file_path": "fs/ext4/super.c", "line_no": 4830, "call_count": 1, "lines": [4830] }
+    { "name": "do_fork", "file_path": "kernel/fork.c", "line_no": 1499, "call_count": 1, "lines": [1499] }
   ],
   "callees": [
-    { "name": "EXT4_SB", "callee_name": "EXT4_SB", "file_path": "fs/ext4/ext4.h", "line_no": 3528, "call_count": 4, "lines": [3528, 3594, 3596, 3706] }
+    { "name": "security_task_create", "file_path": "security/security.c", "line_no": 1063, "call_count": 1, "lines": [1063] }
   ]
 }
 ```
 
 #### `GET /api/tools/diff/versions`
-#### `GET /api/version/diff`
-#### `GET /api/diff/versions/{v1}/{v2}`
 Compare file changes between two revisions (release tags, branches, or commit SHAs).
 - **Parameters**:
-  - `v1` / `version_a` (query or path): Base revision (e.g. `"v3.0"` or `"1052cff317e7"`).
-  - `v2` / `version_b` (query or path): Target revision (e.g. `"v3.1"`).
-  - `path` (query): Optional directory prefix filter.
-- **Behavior**: See §2.8. `source` is `"git"` when both trees came from Git (Path C) and `"db"` for the database fallback. `fid`, `fid_old`, `fid_new` are indexed `blob_id`s, or `0` when the blob was never parsed. `changes` is sorted by path. Renamed entries carry `similarity` (percent, 100 = identical content). `renames` describes the rename pairing: `similarity` (the threshold, 50), `source` (`"git"` for Git's detection, `"exact"` when only identical content was paired), `exhaustive` (every deleted/added pair was compared) and `limit_needed` (the rename limit Git asked for when it was not, else 0).
+  - `version_a` (query, required): Base revision (e.g. `"v3.0"` or `"1052cff317e7"`).
+  - `version_b` (query, required): Target revision (e.g. `"v3.1"`).
+- **Behavior**: See §2.8. The whole trees are compared; scoping to a directory is what the rename search below offers. `source` is `"git"` when both trees came from Git (Path C) and `"db"` for the database fallback. `fid`, `fid_old`, `fid_new` are indexed `blob_id`s, or `0` when the blob was never parsed. `changes` holds one row per change, sorted by path (8,790 rows at v3.0→v3.1, ~1.2 MiB of JSON); `symbols_added` / `symbols_removed` are set for the first 50 modified source files (§2.8 Level 2). Renamed entries carry `similarity` (percent, 100 = identical content). `renames` describes the rename pairing: `similarity` (the threshold, 50), `source` (`"git"` for Git's detection, `"exact"` when only identical content was paired), `exhaustive` (every deleted/added pair was compared) and `limit_needed` (the rename limit Git asked for when it was not, else 0).
 - **Response**:
 ```json
 {
   "v1": "v3.0",
   "v2": "v3.1",
-  "path": "",
   "source": "git",
   "summary": {
     "added_count": 1065,
@@ -1586,25 +1414,21 @@ Compare file changes between two revisions (release tags, branches, or commit SH
     "unchanged_count": 28828
   },
   "changes": [
-    { "type": "added", "file": "Documentation/ABI/stable/firewire-cdev", "file_path": "Documentation/ABI/stable/firewire-cdev", "fid": 0 },
-    { "type": "renamed", "file": "Documentation/DocBook/media/dvb/dvbstb.pdf", "file_path": "Documentation/DocBook/media/dvb/dvbstb.pdf", "old_file": "Documentation/DocBook/dvb/dvbstb.pdf", "similarity": 100, "fid": 13635 },
-    { "type": "modified", "file": "Makefile", "file_path": "Makefile", "fid_old": 15495, "fid_new": 0, "symbols_added": 0, "symbols_removed": 0 }
+    { "type": "added", "file_path": "Documentation/ABI/stable/firewire-cdev", "fid": 0 },
+    { "type": "renamed", "file_path": "Documentation/DocBook/media/dvb/dvbstb.pdf", "old_file": "Documentation/DocBook/dvb/dvbstb.pdf", "similarity": 100, "fid": 13635 },
+    { "type": "modified", "file_path": "arch/alpha/include/asm/atomic.h", "fid_old": 15495, "fid_new": 663012, "symbols_added": 1, "symbols_removed": 2 }
   ],
-  "added": [ { "file": "Documentation/ABI/stable/firewire-cdev", "fid": 0 } ],
-  "modified": [ { "file": "Makefile", "fid_old": 15495, "fid_new": 0 } ],
-  "renamed": [ { "file": "Documentation/DocBook/media/dvb/dvbstb.pdf", "old_file": "Documentation/DocBook/dvb/dvbstb.pdf", "similarity": 100, "fid": 13635 } ],
-  "deleted": [],
   "renames": { "similarity": 50, "exhaustive": true, "limit_needed": 0, "source": "git" }
 }
 ```
 
 #### `GET /api/tools/diff/unchanged`
 Paths present at both revisions with the same content: the files behind `summary.unchanged_count` of the revision diff, which does not list them (28,828 paths, ~1 MiB of JSON at v3.0→v3.1).
-- **Parameters**: `version_a`, `version_b` (query, required); `path` (query): optional directory prefix filter.
+- **Parameters**: `version_a`, `version_b` (query, required).
 - **Behavior**: `DiffService.get_unchanged_files()` reads both trees exactly like the revision diff (`_fetch_trees`: Git trees, or the database for both sides) and returns the sorted paths whose content key is equal on both sides (~0.7 s cold at v3.0→v3.1, then served from the tree LRU cache).
 - **Response**:
 ```json
-{ "v1": "v3.0", "v2": "v3.1", "path": "", "source": "git", "count": 28828, "files": ["COPYING", "Documentation/.gitignore"] }
+{ "v1": "v3.0", "v2": "v3.1", "source": "git", "count": 28828, "files": ["COPYING", "Documentation/.gitignore"] }
 ```
 
 #### `GET /api/tools/diff/renames`
@@ -1633,7 +1457,6 @@ Exhaustive rename search: compares every deleted with every added file between t
 ```
 
 #### `GET /api/tools/diff/file`
-#### `GET /api/diff/file`
 Unified Git diff of a single file between two revisions.
 - **Parameters**:
   - `version_a` (query, required): Base revision.
@@ -1657,14 +1480,11 @@ Unified Git diff of a single file between two revisions.
 }
 ```
 
-#### `GET /api/tools/{version_name}/diff/kconfig`
-#### `GET /api/version/diff/kconfig`
 #### `GET /api/diff/kconfig/{v1}/{v2}`
 Compare Kconfig source files and option definitions between two revisions (release tags, branches, or commit SHAs).
 - **Parameters**:
-  - `version_name` (path): Context kernel version string.
-  - `v1` (query): Base revision (e.g. `"v3.0"`).
-  - `v2` (query): Target revision (e.g. `"v3.1"`).
+  - `v1` (path): Base revision (e.g. `"v3.0"`).
+  - `v2` (path): Target revision (e.g. `"v3.1"`).
 - **Behavior**: See §2.8 Level 3. Both `files` and `symbols` come from Git and are complete; `unindexed_files` is always empty (kept for compatibility). Each definition in `before`/`after` carries `file`, `line`, `type` (1 bool, 2 tristate, 3 string, 4 hex, 5 int), `prompt` (text without its condition), `def_val` (first default) and `facts` (the property record of the symbol history, `GET /api/kconfig/{version_name}/symbol/{symbol_name}/history`); a symbol with one definition on each side also gets `changes` (`[{field, before, after}]` / `[{field, added, removed, before, after}]`). Measured: v3.0 -> v3.1 takes ~2 s (174 modified files), v6.17 -> v6.18 ~3 s.
 - **Response**:
 ```json
@@ -1709,7 +1529,6 @@ Check daemon status, reachability, active port, and the base URL of the self-hos
 {
   "enabled": true,
   "available": true,
-  "use_tunnel": true,
   "port": 8192,
   "lore_url": "https://lore.kernelinfo.org/all/",
   "reason": null
@@ -1720,7 +1539,7 @@ Check daemon status, reachability, active port, and the base URL of the self-hos
 Retrieve full email details including RFC-822 headers, body text, raw payload, and pre-parsed interactive patch diffs.
 - **Parameters**:
   - `mid` (query): RFC-822 Message-ID (e.g. `"<20210515120000.1234-1-dev@kernel.org>"` or `"20210515120000.1234-1-dev@kernel.org"`). Automatically supports URL decoding, angle-bracket removal, space-to-plus recovery (`+` converted to space in query strings), and direct `xref3` binary OID fallback.
-  - `num` (query): Optional sequential article number in the Public-Inbox archive.
+  The service also accepts a sequential article number in `mid`.
 - **In-Memory LRU Cache**: 512 entries cached in-memory in `MailingListService._email_cache`. Stale or error entries are automatically bypassed.
 - **Client Cache**: `api.getMailMessage` operates `networkFirst: true`. IndexedDB never caches failed or empty email responses.
 - **Response**:
@@ -1784,14 +1603,13 @@ Retrieve full email details including RFC-822 headers, body text, raw payload, a
 }
 ```
 
-#### `GET /api/mail/thread/{tid}`
 #### `GET /api/mail/thread`
 Retrieve a discussion thread's messages ordered chronologically by sequential number or date.
 - **Parameters**:
-  - `tid` (path or query): Thread integer identifier.
+  - `tid` (query): Thread integer identifier.
   - `mid` (query): Optional Message-ID hint used to resolve `tid` automatically if `tid` is omitted or 0.
-- **Bounded page**: a thread is unbounded in principle (the reference archive's largest holds 12,342 messages, each carrying a compressed overview blob), so the archive store caps the messages unpacked per request at `MAX_THREAD_MESSAGES` (1000) and accepts `limit` / `offset`. `total` is the thread's real message count from an indexed count, and `truncated` states whether messages beyond the returned page remain — so a client must read `total` as the thread size and `messages` as a page of it, not as the whole thread.
-- **In-Memory LRU Cache**: 128 entries cached in `MailingListService._thread_cache`.
+- **Bounded page**: a thread is unbounded in principle (the reference archive's largest holds 12,342 messages, each carrying a compressed overview blob), so the archive store caps the messages unpacked per request at `MAX_THREAD_MESSAGES` (1000); the endpoint answers that first page. `total` is the thread's real message count from an indexed count, and `truncated` states whether messages beyond the returned page remain — so a client must read `total` as the thread size and `messages` as a page of it, not as the whole thread.
+- **In-Memory LRU Cache**: 128 entries cached in `MailingListService._thread_cache`, each reused for `LIVE_CACHE_TTL` (60 s) only: the archive is fetched continuously and a thread gains replies.
 - **Response**:
 ```json
 {
@@ -1842,14 +1660,13 @@ Retrieve a discussion thread's messages ordered chronologically by sequential nu
 }
 ```
 
-#### `GET /api/mail/versions/{tid}`
 #### `GET /api/mail/versions`
 List every revision (`v1`, `v2`, ...) of the patch series a thread belongs to. Revisions are normally posted as separate threads sharing one base subject, so the series is reconstructed by normalizing the requested thread's subject (`normalize_series_subject`: reply prefixes and leading `[PATCH v3 2/5]` tags removed) and matching that base subject against the archive search index. At most `MAX_VERSION_THREADS` (8) sibling threads are expanded.
 - **Parameters**:
-  - `tid` (path or query): Thread integer identifier.
+  - `tid` (query): Thread integer identifier.
   - `mid` (query): Optional Message-ID, used both to resolve `tid` and to pin `current_version` when a single thread carries messages of more than one revision.
 - **Grouping**: every message of each thread is folded into the entry of its own revision (`patch_version`); a reply carrying no patch tag inherits the revision of the earliest series message in its thread. `total` counts all messages of the revision, `patches` only the patches, cover letters and pull requests.
-- **In-Memory LRU Cache**: keyed by `tid:mid`, bounded by the thread cache size (128 entries) in `MailingListService._version_cache`.
+- **In-Memory LRU Cache**: keyed by `tid:mid`, bounded by the thread cache size (128 entries) in `MailingListService._version_cache`, reused for `LIVE_CACHE_TTL` (60 s): a new revision of the series is a new thread.
 - **Response**:
 ```json
 {
@@ -1896,11 +1713,12 @@ Full-text search across public-inbox mail archive with Boolean and term prefixes
   - `q` (query): Search terms or prefixes (e.g. `s:ext4`, `f:torvalds`, `m:20210515`).
   - `page` (query): 1-indexed page number (default 1).
   - `limit` (query): Items per page (1-100, default 50).
-  - `filter` / `filter_type` (query): Filtering preset: `"all"`, `"patch"`, `"cover"`, `"pull"`.
+  - `filter` (query): Filtering preset: `"all"`, `"patch"`, `"cover"`, `"pull"`.
 - **Future-Dated Messages**: an empty `q` is the chronological browse listing (`ORDER BY ds DESC`), where a message carrying a `Date:` header in the future — a skewed sender clock or a forged header — would sort ahead of every real email. Those rows are therefore excluded from the empty-query listing by the archive store (`PublicInboxLocalStore.search_emails`, `ds <= now + FUTURE_DATE_SKEW_SECONDS`, a one-hour tolerance), and `MailingListService._drop_future_dated` re-applies the same horizon to the returned page so the invariant also holds against a micro-daemon predating it (lowering `total` by what the page dropped). **A non-empty `q` is never filtered**: a search that matches a future-dated message still returns it, and the filter presets apply unchanged in both cases.
 - **Reported `total`**: where the Xapian bindings are available, `total` is Xapian's estimated match count (`get_matches_estimated()`) for the whole archive. Otherwise it is a lower bound — the offset plus the returned page, plus one when more remain — and the response always carries `has_more`; the frontend roster also treats a page that adds no new message as the end of the results (§5.22).
 - **Paging cost is flat**: `limit` and `offset` are clamped by the archive store (`MAX_SEARCH_LIMIT` 200, `MAX_SEARCH_OFFSET` 5,000,000) and the offset is applied by Xapian or by SQL `LIMIT ? OFFSET ?` rather than by slicing a fetched list, so a deep page costs what the first one does. Materializing `limit + offset` records previously cost 3.1GB and 43s at offset 2,000,000 on a 22M-message archive — enough to have the archive daemon OOM-killed — against 33MB and 0.16s now. Without Xapian, the subject-substring fallback streams a bounded scan (`MAX_SEARCH_SCAN` 20,000 rows) and keeps only the requested page.
-- **In-Memory LRU Cache**: 64 entries cached in `MailingListService._search_cache`.
+- **In-Memory LRU Cache**: 64 entries cached in `MailingListService._search_cache`, reused for `LIVE_CACHE_TTL` (60 s), so the browse listing shows new mail within a minute. The client asks network-first and keeps only the browse listing (no query) in IndexedDB for offline use (§5.1).
+- **Lore links**: `lore_url` of a search carries the query URL-encoded (`quote_plus`), as does a commit's fallback link built from its subject.
 - **Response**:
 ```json
 {
@@ -1939,7 +1757,7 @@ Full-text search across public-inbox mail archive with Boolean and term prefixes
 The frontend is a vanilla ES-Module single-page application requiring zero node/npm build steps.
 
 ### 5.0. Interaction Invariant: No Unrequested Change Without Confirmation
-**Any action that would change more than what the user directly asked for must be reported and confirmed before it is applied.** This holds for every view, and for the configuration state in particular (`state.kconfigProfiles`, `state.kconfigEngines`, the KConfig engines): the user's click is a mandate for the change they made, never for its side effects. A new interaction that can alter values, options or state the user did not name is implemented as *compute the full consequence first (on a throwaway engine or a dry run), show it (what changes, from which value to which, and why), apply it only on explicit confirmation, and leave everything untouched on Close/Escape*. Confirmation is skipped only when the consequence is empty — nothing else changes — and the dialog must then not appear at all. Existing instances of the pattern: lowering a value that other options need (§5.8, `previewLowered`), enabling the constraint engine over edited values (§5.8, `resolutionDiff`), applying a toolchain profile that resolves values differently (§5.8, `reloadModel`), applying a revision to a KConfig tab (§5.13, `requestVersionSwitch`: its values are carried to the target revision, resolved against that model, and the configuration saved for the revision it leaves is dropped), *Apply kconfig resolution* in **Validate** (§5.8, the change the user asked for, itemized before it is applied). Auto-solve is the documented exception: its changes *are* the requested action and are listed afterwards. Toasts report what happened; they never replace a confirmation.
+**Any action that would change more than what the user directly asked for must be reported and confirmed before it is applied.** This holds for every view, and for the configuration state in particular (`state.kconfigProfiles`, `state.kconfigEngines`, the KConfig engines): the user's click is a mandate for the change they made, never for its side effects. A new interaction that can alter values, options or state the user did not name is implemented as *compute the full consequence first (on a throwaway engine or a dry run), show it (what changes, from which value to which, and why), apply it only on explicit confirmation, and leave everything untouched on Close/Escape*. Confirmation is skipped only when the consequence is empty — nothing else changes — and the dialog must then not appear at all. Existing instances of the pattern: lowering a value that other options need (§5.8, `previewLowered`), enabling the constraint engine over edited values (§5.8, `resolutionDiff`), applying a toolchain profile that resolves values differently (§5.8, `reloadModel`), applying a revision to a KConfig tab (§5.13, `requestVersionSwitch`: its values are carried to the target revision, resolved against that model, and the configuration saved for the revision it leaves is dropped), *Apply kconfig resolution* in **Validate** (§5.8, the change the user asked for, itemized before it is applied). Auto-solve is the documented exception: its changes *are* the requested action and are listed afterwards. Undo/redo in a KConfig tab (§5.8, `Ctrl+Z`) is not an instance either: it puts back exactly the state the tab had before (or after) the change being undone, which is the requested action itself. Toasts report what happened; they never replace a confirmation.
 
 ```
 webapp/frontend/js/
@@ -1972,7 +1790,7 @@ webapp/frontend/js/
     │   ├── fidelity_clipboard.js # 100% copy fidelity raw line buffer extractor
     │   └── blame_view.js         # Interactive git blame annotations
     ├── nodemap/
-    │   ├── nodemap_controller.js # Two.js canvas controller, zoom/pan, export
+    │   ├── nodemap_controller.js # Schematic canvas controller (DOM nodes, SVG wires), zoom/pan, export
     │   ├── node_renderer.js      # Real-time dragging DOM renderer
     │   ├── edge_router.js        # Cubic bezier spline router
     │   └── node_model.js         # Node and wire data structures
@@ -1981,6 +1799,7 @@ webapp/frontend/js/
     │   ├── kconfig_engine.js     # scripts/kconfig port: values, legal edits, .config/defconfig I/O
     │   ├── kconfig_parser.js     # .config reader & raw (engine-off) writer
     │   ├── menuconfig_tui.js     # mconf-style terminal menuconfig
+    │   ├── kconfig_history.js    # Undo/redo of a KConfig tab's configuration (diffs between states)
     │   ├── directive_evaluator.js# #ifdef conditional code dimming (+ ARCH compiler macros)
     │   └── build_condition.js    # Kbuild build-condition evaluation & explanation
     ├── explorer/explorer_view.js  # Full-tab repository explorer (tab type `explorer`)
@@ -1999,29 +1818,32 @@ Handles unified HTTP communication, response caching, offline fallback, and netw
   - Replaces legacy static status bar with a sleek, floating circular loading spinner in the bottom-right viewport (`#global-loading-spinner`).
   - Automatically tracks in-flight `fetch` requests via `this.activeRequests`.
   - Employs a 150ms anti-flicker debounce timer so sub-150ms and IndexedDB cache hits never flash the UI.
-  - When network fetch duration exceeds 150ms, fades in the glowing spinning indicator and dispatches `app:loading` event; smoothly fades out when all requests finish.
-- **Server reachability (`isOnline`, `serverUp`, `isConnected`)**: `navigator.onLine` only reports the browser's link state and stays `true` while the backend is down, so the client tracks the backend separately. `serverUp` is set from every exchange: any HTTP status proves the server answered (a `500` still counts), while a transport failure, the request timeout (10 s, raised per request with `timeoutMs` for the few endpoints that compute — `getBranchTags()` asks for 180 s), or a reply carrying `X-KIP-Offline` (served from the Service Worker cache, §2.11) means it did not. `getSync()` marks the same way. A change dispatches `app:server-status` (`{up}`) on `document`; `isConnected` is `isOnline && serverUp`.
+  - When network fetch duration exceeds 150ms, fades in the glowing spinning indicator; smoothly fades out when all requests finish.
+- **Server reachability (`isOnline`, `serverUp`, `isConnected`)**: `navigator.onLine` only reports the browser's link state and stays `true` while the backend is down, so the client tracks the backend separately. `serverUp` is set from every exchange: any HTTP status proves the server answered (a `500` still counts), while a transport failure, the request timeout (10 s, raised per request with `timeoutMs` for the few endpoints that compute — `getBranchTags()` asks for 180 s), or a reply carrying `X-KIP-Offline` (served from the Service Worker cache, §2.11) means it did not. `getSync()` marks the same way. A change dispatches `app:server-status` (`{up}`) on `document`; `isConnected` is `isOnline && serverUp` (`isOnline` follows the browser's `online`/`offline` events); the settings panel's connection status reads `isConnected` and `isOnline`.
 - **Heartbeat (`startHeartbeat()`, `stopHeartbeat()`, `pingServer()`)**: `pingServer()` requests `GET /api/sync` (cheap, server-cached, never intercepted by the worker) with a 5 s timeout and records reachability without throwing or touching the loading spinner. The heartbeat polls every **30 s** while the server answers and every **5 s** while it does not, skips hidden tabs, and re-paces itself on each state change. A probe also runs when the tab becomes visible and on the browser's `online` event. `app.js` starts it from `setupNetworkStatus()`.
 - `getVersions()`: Fetches release list.
 - `getSync({fresh})`: Server change tokens (`GET /api/sync`, never cached; `fresh` adds `?fresh=true`); `onSyncHeader` receives the `X-KIP-Sync` header of every response; `versionStamps` / `_vk(version)` stamp version-scoped cache keys (§2.11).
-- `getDirectoryTree(version, path, depth)`: Fetches directory tree.
+- `getDirectoryTree(version, path)`: Direct children of a directory.
 - `getFileContent(version, path)`: Retrieves raw text and AST tokens.
 - `getTreemap(version, maxDepth, path)`: Retrieves hierarchical squarified codebase treemap.
-- `getCompileCommands(version, arch)`: Retrieves Clang compilation commands database.
+- `getCompileCommandsDownloadUrl(version, arch)`: URL of the `compile_commands.json` download (`GET /api/fs/compile_commands/{v}/export`).
 - `resolveInclude(version, header, astId, currentFile, arch)`: Resolves `#include` directive targets for `arch` (default `state.definitionContext().arch`, part of the cache key).
 - `getIncludeSymbols(version, astId, options)`: Fetches imported symbols for an include, supporting fallback lookup options (`filePath`, `line`, `header`, `tagId`).
 - `getSymbolDetail(version, name, arch, fromFile)` / `getSymbolXref(version, name, limit, arch)`: Symbol inspection; `arch` defaults to `state.definitionContext().arch` and is part of the cache key, as is `fromFile` (the file the symbol is used in, §2.7 item 4).
 - `getBuildConditions(version, paths, arch)`: Kbuild build conditions of files (`GET /api/kconfig/{v}/build`).
-- `lookupSymbols(version, query, limit)`: Fast typeahead symbol name suggestion list.
-- `getSymbolHistory(version, path, line, astId, { name, includeRc, branch })` / `getTagTimeline(tagId, { includeRc, branch })`: Release-by-release history of a definition on one branch (sends the definition ARCH; long timeout, since the first history of a branch walks its tags).
+- `searchSymbols(version, query, limit)`: Symbol definitions by prefix (Ctrl+K palette).
+- `getSymbolHistory(version, path, line, astId, { name, includeRc, branch })`: Release-by-release history of a definition on one branch (sends the definition ARCH; long timeout, since the first history of a branch walks its tags).
 - `getKconfigHistory(version, name, { includeRc, branch })`: Release-by-release history of a Kconfig symbol on one branch, with property-level changes.
 - `getHistoryCommits({ path, to, from, lineS, lineE })`: Commits behind one history change (`git log -L`).
-- `getKconfigGraph(version, arch, symbol, depth)`: Full architecture dependency DAG graph.
+- `getKconfigGraph(version, arch, symbol, toolchain)`: Direct relations (edges) of one Kconfig symbol.
 - `getKconfigDiff(versionA, versionB)`: Cross-release KConfig symbol definition and default differences.
 - `formatPatch(version, payload)`: Generates RFC-2822 standard git format patch from content edits.
 - `getMaintainersOverview(version, query)` / `getMaintainerSection(version, secId)`: Subsystems.
 - `getDevelopers(version, options)`: Full kernel persona directory with role filtering and activity/alpha sorting.
 - `getPersonProfile(version, idOrEmail)`: Developer profiles.
+- `getCallgraph(version, functionName)`: Callers and callees (60 s timeout: the callers of a widely used function take seconds, §4.7).
+- `searchMailingList(query, { page, limit, filterType })`: Mailing list search, always network-first (the archive grows while it is fetched); only the browse listing (empty query) is kept in IndexedDB for offline use, never the queries typed in the palette.
+- `_sanitizeVer(v)`: falls back to `v3.0` for an empty value or a stringified object (`"[object …"`) only; any other name, a branch containing "object" included, is sent as is.
 
 ### 5.2. `AstOverlay` (`webapp/frontend/js/views/code_view/ast_overlay.js`)
 Implements two-layer hybrid highlighting with map prioritization and client-side fallback:
@@ -2043,7 +1865,7 @@ Implements two-layer hybrid highlighting with map prioritization and client-side
    - Slicing coordinate correction: `abs_ce = max(abs_cs, raw_ce)` in `filesystem_service.py` preserves 1-indexed column intervals with closing quotes and angle brackets intact.
 
 ### 5.3. `NodeRenderer` & Drag Controller (`webapp/frontend/js/views/nodemap/`)
-- Canvas pan and zoom via matrix transformations (`Two.Group`).
+- Canvas pan and zoom via CSS transforms of the node layer; wires are SVG paths (`edge_router.js`).
 - `attachDrag()`: Updates `nodeEl.style.left` and `nodeEl.style.top` in real time during `mousemove` scaled by canvas zoom:
    ```javascript
    const zoom = this.callbacks.getZoom() || 1.0;
@@ -2059,7 +1881,8 @@ Implements two-layer hybrid highlighting with map prioritization and client-side
 - Slices lines from the clean raw source code array (`rawLines`), ensuring 100% copy fidelity without line numbers, gutter metadata, or HTML formatting artifacts.
 
 ### 5.5. `LocalDatabase` & Storage Settings (`webapp/frontend/js/db.js`, `webapp/frontend/js/app.js`)
-- **Offline Cache Stores**: Persistent IndexedDB (`KernelInfoIDE_v2`, v3) caching `meta`, `files`, `symbols`, `kconfigs`, `maintainers`, `commits`, `tools`, `tabs_state`, and `nodemap_projects`.
+- **Offline Cache Stores**: Persistent IndexedDB (`KernelInfoIDE_v2`, v5) caching `meta`, `files`, `symbols`, `kconfigs`, `maintainers`, `commits`, `tools`, `mail`, `tabs_state`, and `nodemap_projects`. Each data store has an `updated_at` index (v5): once a day, when the page opens, `syncManager.pruneOldEntries()` drops the entries written more than 30 days ago (`localDB.pruneOlderThan`, a key-only index scan), which is what bounds the offline cache. A change of `CACHE_LAYOUT` (`sync.js`, now 3: several response shapes changed) clears the data stores once.
+- **Upgrades with other windows open**: an open connection closes itself on `versionchange`, so a newer page's upgrade is not blocked by an older window; a page whose open is still blocked after 3 s (`BLOCKED_OPEN_TIMEOUT_MS`) runs uncached instead of waiting (every cached `api.request()` would otherwise wait on `localDB.ready` forever).
 - **Server Synchronization (`syncManager`, `js/sync.js`, §2.11)**: on bootstrap and on every `X-KIP-Sync` header, a changed `db` token purges all data caches (`files`, `symbols`, `kconfigs`, `maintainers`, `commits`, `tools`) and stores the token in `meta/db_instance_hash`; changed `parsed`/`git` tokens refresh the version stamps (`meta/version_stamps`) and drop the cached entries of changed versions.
 - **Cache-First Client Policy**:
   - All static analysis and versioned data requests query IndexedDB first.
@@ -2120,11 +1943,11 @@ Implements two-layer hybrid highlighting with map prioritization and client-side
   - Top-bar **"📄 Open Header"** action button quickly opens the included header file.
 
 ### 5.8. `KconfigView` (`webapp/frontend/js/views/kconfig/kconfig_view.js`) & `KconfigEngine` (`webapp/frontend/js/views/kconfig/kconfig_engine.js`)
-- **Engine**: `KconfigEngine` decodes the model of `GET /api/kconfig/{v}/tree` (`decodeModel`) and evaluates it with kconfig's algorithms (twin of `parser/kconfig_ast/kconfig_eval.py`): `value`, `visibility`, `revDep`, `getType` (tristate degrades to bool without `MODULES`), `choiceSelection`, `isChangeable`, `menuVisible` (`menu_is_visible`); legal setters `setTristate` / `setValue` / `toggle` (refuse what kconfig refuses; `refusalReason` explains why), `toggleTarget` (the value `toggle` would set), `previewLowered(name, text)` (what other options lose if the value is set: bool/tristate options whose value drops and other options no longer written, each with the reason (`depends on …`, `no longer selected: …`, `prompt hidden: …`), members of the same choice excluded, the configuration restored afterwards; `null` when kconfig refuses the value; about 150 ms on a v3.0 x86_64 model); `loadConfig` (conf_read report: unknown, invalid, warnings), `loadAssignments`, `setAllNewSymbols`, `writeConfig` (full `.config`, byte-identical to `conf`), `writeDefconfig` (`make savedefconfig`), `configValues`, `exprStr(id, withValues)`, `orTerms`, `menuPath`.
+- **Engine**: `KconfigEngine` decodes the model of `GET /api/kconfig/{v}/tree` (`decodeModel`) and evaluates it with kconfig's algorithms (twin of `parser/kconfig_ast/kconfig_eval.py`): `value`, `visibility`, `revDep`, `getType` (tristate degrades to bool without `MODULES`), `choiceSelection`, `isChangeable`, `menuVisible` (`menu_is_visible`); legal setters `setTristate` / `setValue` (refuse what kconfig refuses; `refusalReason` explains why), `toggleTarget` (the value `sym_toggle_tristate_value` would set: n -> m -> y -> n within range), `previewLowered(name, text)` (what other options lose if the value is set: bool/tristate options whose value drops and other options no longer written, each with the reason (`depends on …`, `no longer selected: …`, `prompt hidden: …`), members of the same choice excluded, the configuration restored afterwards; `null` when kconfig refuses the value; about 150 ms on a v3.0 x86_64 model); `loadConfig` (conf_read report: unknown, invalid, warnings), `loadAssignments`, `setAllNewSymbols`, `writeConfig` (full `.config`, byte-identical to `conf`), `writeDefconfig` (`make savedefconfig`), `configValues`, `exprStr(id, withValues)`, `orTerms`, `menuPath`.
 - **Engine on/off** (also gates `#ifdef` dimming): on, every edit goes through the engine so only valid configurations exist, and the published values are the resolved `.config` values. Off, values are edited raw (no constraints, export marked unvalidated); turning it back on resolves the raw values through kconfig and reports how many were adjusted. Switching it off keeps every value: the tab's configuration stays in its `version|ARCH` profile and only stops being constrained.
 - **Enabling it over edited values** (`resolutionDiff()`): the engine only holds configurations kconfig accepts, so enabling it loads the tab's values through `conf_read` semantics, which can change values the user never touched (raw edits kconfig refuses, an imported or hand-edited `.config`, symbols a `select` forces or whose prompt is invisible). The resolution is therefore computed first on a throwaway `KconfigEngine` built from the same model (the live engine and the values stay untouched) and shown before anything is applied: a dialog lists every option with its current value, the value kconfig resolves it to and why (*forced by select: …*, *prompt not visible: …*, *limited by dependencies or range*) plus the symbols unknown for the ARCH that would be dropped, and the engine is enabled only with **Enable engine and apply these changes** (Close or Escape leaves the engine off and the values exactly as they are, §5.0). When the resolution changes nothing, no dialog appears and the engine turns on directly. The same diff backs **Validate** and its *Apply kconfig resolution*.
 - **One engine per tab, several at once** (`state.kconfigEngineTabIds` + `state.kconfigEngines`, persisted): the engine is **off by default** (a new KConfig tab opens on **⚡ Enable Engine**) and belongs to the tab that enables it. Each KConfig tab has its own view instance, model and values (`TabsComponent` builds one `KconfigView` per tab and `dispose()`s it when the tab closes), and **any number of tabs may run their engine at the same time**: each one resolves its own configuration and publishes it under its own tab id (`state.kconfigEngines[tabId] = {version, arch, configName, profileKey, assignments}`), so two ARCHes or two revisions can be resolved side by side. Enabling an engine therefore asks nothing of the other tabs — only the resolution of *this* tab's values is confirmed (above, §5.0). `state.setKconfigEngineEnabled(tabId, enabled)` switches one on or off and emits `kconfig:engine:changed` `{tabId, active, engineTabIds}`; `state.disableAllKconfigEngines()` (palette *Disable every KConfig engine*) switches all of them off. A `KconfigView` follows that event only for its own tab. `state.requestKconfigEngine(tabId)` / `takeKconfigEngineRequest(tabId)` (event `kconfig:engine:requested`, not persisted) let the command palette ask a tab — including one in the background, which claims the request when it renders — to enable its engine through that same confirmation instead of switching it on behind the view's back. Closing a tab, switching project or restoring a session whose tab is gone switches that engine off; no configuration is lost in any of these cases (`state.kconfigProfiles` keeps one per `version|ARCH`). `state.kconfigEngineActive` is derived (any engine running **in this window**), `state.isKconfigEngineOwner(tabId)` asks about one tab of this window, `state.hasEngine(tabId)` asks whether that engine runs anywhere (this window or another session, §5.23) and is what decides whether a code tab may follow it (§5.16), and `state.kconfigEngineList()` describes the running engines (tab id, title, revision, ARCH, name, symbol count, whether the configuration is resolved) for the code view's engine selector (§5.16). Only the engine descriptors are persisted: each engine's values are rehydrated from `kconfigProfiles[profileKey]` on load.
-- **Cross-Session Kconfig Engine Broadcasting** (`SessionManager`, `BroadcastChannel("kip_multi_tab")`): running engines are usable across multiple browser tabs and windows. When an engine runs or updates in Session A, it announces its presence (`kconfig:engine:announced`) and broadcasts live assignments (`kconfig:assignments:broadcast`). Windows running Session B or Session C discover remote engines via `kconfig:request_engines`, automatically merging them into `state.kconfigEngineList()`. Code tabs in Session B can follow an engine running in Session A for `#ifdef` dimming, build condition evaluation, and definition ranking without needing to duplicate the Kconfig tab: such an engine is picked and kept exactly like a local one (`state.hasEngine`, §5.16), every edit in Session A's KConfig tab re-dims the code tabs following it in Session B, and it is dropped again when Session A's window or session goes away (§5.23). Saved configuration profiles and toolchain profiles are synchronized globally across sessions via `sessionManager.saveSharedKconfigProfiles` and `sessionManager.saveSharedKconfigToolchains`.
+- **Cross-Session Kconfig Engine Broadcasting** (`SessionManager`, `BroadcastChannel("kip_multi_tab")`): running engines are usable across multiple browser tabs and windows. When an engine runs or updates in Session A, it announces its presence (`kconfig:engine:announced`) and broadcasts live assignments (`kconfig:assignments:broadcast`). Windows running Session B or Session C discover remote engines via `kconfig:request_engines`, automatically merging them into `state.kconfigEngineList()`. Code tabs in Session B can follow an engine running in Session A for `#ifdef` dimming, build condition evaluation, and definition ranking without needing to duplicate the Kconfig tab: such an engine is picked and kept exactly like a local one (`state.hasEngine`, §5.16), every edit in Session A's KConfig tab re-dims the code tabs following it in Session B, and it is dropped again when Session A's window or session goes away (§5.23). Saved configuration profiles and toolchain profiles are shared by every session and window: they live once, in `localStorage["kip_shared_kconfig_profiles"]` / `["kip_shared_kconfig_toolchains"]`, and each change writes only its own key (`sessionManager.updateSharedKconfigProfile` / `updateSharedKconfigToolchain` re-read the map first), so a window never erases configurations another window saved since it loaded. Session records do not carry them; a record saved before carries a copy, which `adoptSession()` moves into the shared store for the keys it lacks.
 
 - **Deep links**: the tab's ARCH, configuration name, tree filter and inspected symbol are kept in the URL hash (`#tab=kconfig&arch=…&cfg=…&q=…&sym=…`, §5.26), so a copied link reopens the same search and the same symbol; switching ARCH drops the symbol, which belonged to the ARCH being left.
 - **Architectures**: the dropdown lists `GET /presets` grouped by source directory (ARCH values such as `x86_64`, `i386`, `x86`, `sparc64`). Each `version|ARCH` keeps its own configuration in `state.kconfigProfiles`; switching restores it, or loads the ARCH's default defconfig (`canonical_defconfig`) the first time.
@@ -2133,6 +1956,7 @@ Implements two-layer hybrid highlighting with map prioritization and client-side
 - **Inspector**: value with its origin (explicit, default, forced by select, choice), n/m/y buttons enabled only for legal values (or an input for int/hex/string), evaluated prompt visibility, direct dependencies and "Selected by"/"Implied by" terms with `[=value]` annotations, every definition for the ARCH (file:line buttons opening the code view, prompt, menu location, visibility), defaults with the active one highlighted, ranges, selects/implies, choice group, help text, files built when enabled (other architectures collapsed), directories descended into, **Find usages** (source references grouped by file, Makefile conditions, Kconfig entries referring to it), **Auto-solve** (server solver, changes applied through the engine), and the dependency graph. Symbols not declared for the ARCH list their declarations elsewhere.
 - **Toolchain** (Linux 4.18+; button **Toolchain…** or the toolchain summary in the status line): compiler (GCC/Clang) and version, linker (GNU ld/LLD) and version, assembler, binutils version, `CROSS_COMPILE`, LLVM utilities, pahole/rustc versions, GCC plugin headers, build host `uname -r`; a table of every environment variable Kconfig read with an override field (plus *add any variable*); a filterable table of every toolchain check with its result, source and the options using it, each overridable (auto / force y / force n, or text for command outputs); and `$(error-if)` messages (e.g. compiler below the minimum version). *Apply* stores the profile per `version|ARCH` (`state.kconfigToolchains`) and rebuilds the model with it; *Reset to defaults* clears it. Because another model resolves dependencies, defaults and ranges differently, `reloadModel()` resolves the current values on a throwaway engine first and, when any would change, lists them (option, now, after) and keeps the new model only once confirmed (§5.0) — declining, like a failed rebuild, restores the previous profile and leaves the model and every value untouched. With the engine off no value changes, so only the model is rebuilt. For older revisions the dialog explains that only environment variables matter.
 - **Configurations**: **Load Defconfig** (filterable list, default one tagged), **Import .config** (conf_read in the engine; unknown/invalid entries reported), **Export .config** (`<arch>-<version>.config`, the resolved `.config` to place in the kernel tree), **Validate** (values kconfig would not keep with reasons, unknown symbols, select-with-unmet-dependency warnings, *Apply kconfig resolution*), **Compare…** (beside **⚡ Enable Engine** in the toolbar; `showCompareModal()`: one window with a **Compare with** selector — a defconfig of this ARCH, resolved on a throwaway engine, or any other open KConfig tab — including a named copy of the same ARCH and revision — whose configuration is taken from `state.kconfigProfiles` (`state.kconfigProfileKeyOf(tab)`) exactly as that tab holds it, resolved while its engine is on and raw while it is off. The table lists only the options whose values differ (`Option | Current | <side>`, `—` for an option one side does not write) with the matching/different counts (the first 2000 rows; comparing two architectures differs in thousands of options), and clicking a row inspects that option. A tab on another ARCH or revision is compared all the same, with a note naming the difference; a tab that has never loaded a configuration says so).
+- **Undo / redo** (`kconfig_history.js`, `KconfigHistory`): `Ctrl+Z` / `Cmd+Z` reverts the last change applied to the tab's configuration and `Ctrl+Shift+Z` / `Ctrl+Y` re-applies it, while the tab is the active one, no dialog (or the TUI) is open and the focus is not in a text field (those keep their own text undo). A change is whatever reaches `commit()` — a value set from the tree, the inspector or the TUI (including the options a confirmed lowering drops with it), Load Defconfig, Import .config, Auto-solve, *Apply kconfig resolution*, enabling the engine over edited values — plus switching the engine off. A state is the tab's values, the engine's own state (`KconfigEngine.captureState()`: user values, choice values and defaults, choice member priority) and whether the tab runs its engine; only the **differences** between consecutive states are kept in memory (`[key, before, after]` per changed entry, 200 entries per tab, nothing persisted), plus the current state. Undo restores that state exactly (`restoreState()`, no re-resolution through kconfig, and the engine is switched back on or off as it was), so the restored configuration is the one the tab had, byte for byte. A new change after an undo drops the redo entries. The history survives re-renders of the tab (a tab switch, a layout change: the view puts back the state the history ends on when the saved values are unchanged) and starts over on another model: an ARCH or revision switch, a toolchain profile applied (`reloadModel`), or values changed from elsewhere while the tab was hidden. A toast names what was undone or redone.
 - **TUI** (`menuconfig_tui.js`): mconf-style modal over the same engine: `menu`/`menuconfig`/`choice` open submenus, other children are listed indented; keys Up/Down/PgUp/PgDn/Home/End, Enter, Space, Y/M/N, Esc/Left, `/` search, `?`/H help (help text plus Symbol/Type/Prompt/Defined at/Depends on/Location/Selects/Selected by), Z show all, S save `.config`, D save defconfig (`writeDefconfig`, the only place a minimal defconfig is downloaded from).
 
 ### 5.9. Universal Middle-Click Tab & Navigation Capture
@@ -2155,6 +1979,7 @@ The frontend implements systematic middle-click capture (`auxclick` with `e.butt
      - **Maintainers Viewer**: Subsystem cards, person profile cards, and referenced file links.
      - **Commits Viewer**: Commit history cards and touched file links.
      - **Callgraph Viewer**: Caller and callee function jump links and source file links.
+     - **Pahole Struct Layout**: Nested struct/union drilldown links (`.struct-drilldown`), definition source file links (`#pahole-open-src`), Analyze button (`#pahole-search-btn`), and NodeMap elevation (`#pahole-btn-nodemap`).
      - **Version Diff Viewer**: Modified and added file rows.
 5. **Modal Non-Dismissing Multi-Tab Queuing**:
    - In the **Cross-References (XRef)** and **Included Symbols** modals, middle-clicking definitions or usage links opens the target code tabs with `forceNew: true` while preserving the modal backdrop, allowing users to queue multiple references into separate tabs without re-opening search modals.
@@ -2164,9 +1989,10 @@ The frontend implements systematic middle-click capture (`auxclick` with `e.butt
    - Clicking developer names across the workspace (Commit author headers, Contributors & Signoffs lists, Commit cards, Blame gutters, and Blame context popovers) activates the universal Developer Profile modal (`webapp/frontend/js/components/person_modal.js`).
    - Displays avatar initials, author email, CREDITS biographical data (description, project URL, PGP keys, snail mail), Git stats (authored commits count), and maintained subsystems.
    - **Maintainers "Developers" Directory**:
-     - The Maintainers view incorporates a dedicated **"Developers"** directory (`Subsystems` | `Developers` | `CREDITS` | `Patch Reviewer`) listing all 1,170+ personas from `m_maintainer_person`.
+     - The Maintainers view incorporates a dedicated **"Developers"** directory (`Subsystems` | `Developers` | `CREDITS` | `Patch Reviewer`) listing every developer from `m_maintainer_person`, one card per merged identity (alias personas collapsed, §4.5 `/developers`).
      - Supports live name/email search, category filter pills (`All`, `Maintainers`, `Reviewers`, `CREDITS`), and an Activity (subsystems count) vs. A-Z alphabetical sort toggle.
      - Selecting any developer renders their complete profile card in the detail pane with maintained subsystems (clickable to jump into the Subsystems tab) and a direct "View All Commits" action button.
+     - **Deep links**: the sidebar section, the search, the developer role pill and sort, and the inspected subsystem or developer are recorded on the tab (`section`, `query`, `role`, `sort`, `secId` / `person`, via `persistTabState`) and written to the URL hash (`#tab=maintainers&view=<developers|credits|patch>&sec=<sec_id>&person=<email>&q=…&role=…&sort=alpha`, §5.26). One selection is held at a time: inspecting a subsystem drops `person` and vice versa, and the Patch Reviewer clears both. A developer is addressed by email when known (stable across database rebuilds), else by `person_id` or name. `MaintainersView.render` rebuilds everything from the tab, requesting the selection beside the list.
    - Provides 1-click elevation actions:
      - **Open in Maintainers Tab**: Focuses or launches `state.openTab({ type: "maintainers", person: ... })`, inspecting the developer's complete subsystem roster and contribution graph.
      - **View Commits**: Focuses or launches `state.openTab({ type: "commits", query: ... })`, filtering the commit history by author name or email.
@@ -2180,8 +2006,9 @@ The frontend implements systematic middle-click capture (`auxclick` with `e.butt
 3. **Files Mode** (`api.getVersionsDiff`, 45 s timeout): Status chips (added / modified / deleted / renamed / unchanged) act as toggle filters alongside a path filter (which matches the path and, for renames, the old path). With no chip selected every change is listed; unchanged files are listed only while their chip is selected. They are fetched the first time it is (`api.getUnchangedFiles`, `GET /api/tools/diff/unchanged`, once per comparison; *Loading unchanged files…* meanwhile, and reselecting the chip retries a failed fetch), merged in path order with the other selected statuses, and shown with a `U` badge; clicking an unchanged row opens the file at the target revision instead of expanding a diff. Rows render in pages of 500. A rename row shows `old → new` and, below 100%, its similarity. Clicking a row expands an inline unified diff from `api.getFileDiff` (renames pass their similarity, capped at 50); per-row buttons open the file at the base or target revision, and middle-click opens it in a new tab.
    - **⬇ Download (N)** (`downloadFileRows`): saves every row matching the chips and the path filter, all pages (N is that count; the button is disabled while unchanged files load or when nothing matches), as *Paths (.txt)* (one path per line: the target path, the base path for deleted files), *Table (.tsv)* (`status` A/M/D/R/U, `similarity` for renames, `path`, `old_path`) or *JSON (.json)* (`base`, `target`, `generated`, `filters` with the statuses, path filter and last successful rename search, `renames` of the response, `count`, `files` with `status`, `path` and, for renames, `old_path` and `similarity`). No format carries the symbol counts of modified files. Rows include the pairing of a rename search already applied. The file is named `compare_<base>..<target>[_<statuses>][_<filter>].<ext>` and written with `downloadText` (`components/modal.js`).
    - **Rename search** (shown while the **renamed** chip is active, `renderRenameSearch`): a note says how renames were paired (`renames` of the response: every pair compared, or only identical / same-basename files because there were too many candidates, or identical content only without Git trees), and a form takes a similarity threshold (default 50%) and a directory (suggestions: the directories holding the most unpaired added/deleted files). **Search renames** calls `api.searchRenames` (`GET /api/tools/diff/renames`, 120 s timeout, cached per revision pair, threshold and directory). A refused search (`too_many`) states the deleted × added counts and asks for a directory. A completed search replaces the pairing inside the directory (`applyRenameSearch`): renames with both ends there go back to added + deleted and the search result pairs them again (so a higher threshold drops pairs and a lower one adds them), renames crossing the directory boundary are kept, and the chip counts are recomputed; the status line reports the number of renames, the change against before, the pairs compared and the time. Each successful search is recorded on the tab (`renameSearches`, `[{sim, dir}]`, and so in the URL as `rn`, §5.26) and re-applied in order whenever the diff loads again (a mode switch, a re-render, a reopened link; the searches are cached, so this is fast). A search supersedes the recorded ones in its directory or below it, since it re-pairs that whole directory; changing or swapping a revision clears them.
-   - **Deep links and per-tab state**: each Compare tab has its own `DiffView` (`app.viewRenderers.diff` is a factory), and the revisions, mode, chips, path filter, Kconfig filter and rename searches are recorded on the tab with `state.updateTabState` (`persistTabState`, skipped for a view whose element was replaced; the render itself records before the pane attaches it) and written to the URL hash (§5.26). A deep link into an existing Compare tab merges those fields into it (`state.openTab`).
-4. **Kconfig Mode** (`api.getKconfigDiff`): Shows option counts and Kconfig file counts, a warning listing unindexed Kconfig files when option coverage is partial, an **Options** list (expand for per-file `type` / `prompt` / `default` before and after, or **Inspect** to open the KConfig view on that symbol), and a **Kconfig Files** list with the same inline diff and open actions as Files mode.
+   - **Deep links and per-tab state**: each Compare tab has its own `DiffView` (`app.viewRenderers.diff` is a factory), and the revisions, mode, chips (Files and Kconfig), path filter, Kconfig filter and rename searches are recorded on the tab with `state.updateTabState` (`persistTabState`, skipped for a view whose element was replaced; the render itself records before the pane attaches it) and written to the URL hash (§5.26). A deep link into an existing Compare tab merges those fields into it (`state.openTab`).
+4. **Kconfig Mode** (`api.getKconfigDiff`): Status chips **added / modified / deleted** (each shows the option count and the Kconfig file count) act as toggle filters on both lists, like the Files chips: an option `added`/`changed`/`removed` and a Kconfig file `added`/`modified`/`removed` map onto them (`KCONFIG_STATUS_OF`); with no chip selected everything is listed. A text filter matches option names (with or without `CONFIG_`) and file paths. Below: a warning listing unindexed Kconfig files when option coverage is partial, an **Options** list (the first 2000 matches; expand for per-file `type` / `prompt` / `default` before and after, or **Inspect** to open the KConfig view on that symbol), and a **Kconfig Files** list with the same inline diff and open actions as Files mode.
+   - **⬇ Download (N)** (`downloadKconfigRows`): saves every option and Kconfig file matching the chips and the filter (N is their sum; not capped at 2000; disabled when nothing matches), as *Options (.txt)* (one `CONFIG_<name>` per line), *Kconfig files (.txt)* (one path per line), *Table (.tsv)* (`kind` option/file, `status` A/M/D, `name` — `CONFIG_<name>` or the path —, `files` defining the option on either side, `changed_fields` of a single-definition change) or *JSON (.json)* (`base`, `target`, `generated`, `filters` with the statuses and the filter text, `summary` of the response, `count` `{options, files}`, `options` with `name`, `status`, `files` and the response's `before`, `after`, `changes`, and `files` with `status` and `path`). The file is named `compare-kconfig_<base>..<target>[_<statuses>][_<filter>]` (`_options.txt` / `_files.txt` / `.tsv` / `.json`).
 
 ### 5.12. Git Commits Timeline & Bi-Directional Pagination (`webapp/frontend/js/views/commits/commits_view.js`)
 - **Clean Full-Width Search Header**: Replaced legacy direction toggle buttons (`◀ Future`, `⊙ Anchor`, `Past ▶`, and `🏷️ v3.0`) with a clean, focused typeahead search bar (`#commit-search-input`).
@@ -2265,7 +2092,7 @@ The frontend implements systematic middle-click capture (`auxclick` with `e.butt
 ### 5.20. Repository Explorer Tab (`webapp/frontend/js/views/explorer/explorer_view.js`, `webapp/frontend/css/explorer.css`)
 - **Opening**: clicking any segment of the path in a code view's breadcrumbs (`.breadcrumb-dir`, including the leading revision, which opens the root) opens the directory in a full tab instead of revealing it in the sidebar; middle-click opens it in a second explorer tab. The header's **New Tab** button (§5.13) opens the root of the selected revision, the palette has *Open repository explorer tab*, and a commit chosen in the palette, in the commits view (*Explore Files at this Commit*) or in the file history modal opens its tree here.
 - **Tab data** (`type: "explorer"`): `path` (the directory, `""` = root), `version` and `filter`; the listing's position is kept by §5.28 (`scrollPositions`), and moving to another directory clears it (`clearScrollPositions`). Two explorer tabs of the same directory and revision are the same tab (`state.openTab` matching), and the tab title is the directory's name. The URL hash carries it as `tab=explorer&dir=<path>&v=<ref>`.
-- **Listing** (`GET /api/fs/tree/{v}?path=…&depth=1`): directories first, then files (server-side order), each row with an extension icon, its name and either *directory* or the file's start-state label (`s_stat_label`). A filter box narrows the directory, **↑ Up** goes to the parent, **Reveal** reveals the directory in the sidebar explorer (`explorer:reveal`), **Treemap** opens its treemap (§5.17), and the status bar states how many entries are listed, how many are directories, and the path and revision they come from.
+- **Listing** (`GET /api/fs/tree/{v}?path=…`): directories first, then files (server-side order), each row with an extension icon, its name and either *directory* or the file's start-state label (`s_stat_label`). A filter box narrows the directory, **↑ Up** goes to the parent, **Reveal** reveals the directory in the sidebar explorer (`explorer:reveal`), **Treemap** opens its treemap (§5.17), and the status bar states how many entries are listed, how many are directories, and the path and revision they come from.
 - **Navigation stays in the revision**: a directory opens in the same tab (middle-click: a new explorer tab) and a file opens in a code tab **at the explorer's revision** (middle-click: a new one), so browsing a second revision never repoints the tabs of the first. Right-clicking a row opens the shared explorer context menu (`contextMenu.showFileTreeMenu`) with that revision.
 
 ### 5.21. Code View Toolbar, Saved Position & Minimap (`webapp/frontend/js/views/code_view/virtual_editor.js`)
@@ -2315,7 +2142,7 @@ The frontend implements systematic middle-click capture (`auxclick` with `e.butt
 
 ### 5.23. Multi-Window Workspace Sessions & Cross-Tab Coordination (`webapp/frontend/js/session_manager.js`, `webapp/frontend/js/components/session_modal.js`)
 1. **Window-to-Session Isolation & Cloned-Storage Protection**:
-   - `sessionStorage` pins each individual browser window/tab to an active workspace session (`sessionStorage["kip_active_session_id"]`), while full session documents are stored under `localStorage["kip_session_<id>"]` and indexed in `localStorage["kip_sessions_index"]`.
+   - `sessionStorage` pins each individual browser window/tab to an active workspace session (`sessionStorage["kip_active_session_id"]`), while full session documents are stored under `localStorage["kip_session_<id>"]` and indexed in `localStorage["kip_sessions_index"]`. A session document holds the panes, tabs and engine descriptors only (KConfig configurations are shared, §5.8). `state.saveState()` coalesces the saves of a burst (`SAVE_STATE_DELAY_MS`, 300 ms: every tab switch, tab-state update and scroll pause asks for one) and `state.flushState()` writes a pending one now: on `pagehide`, when the page is hidden, before another session is adopted or the current one duplicated, and before a tab is transferred. Full Local Reset suspends persistence (`state.suspendPersistence()`) so nothing is written back after the wipe.
    - **Cloned-Storage Protection**: Modern browsers duplicate `sessionStorage` when a tab is duplicated, opened via `target="_blank"`, or created with `window.open`. To prevent new tabs from silently inheriting and overlapping with the parent tab's session, `SessionManager` assigns a unique Window ID (`window.name = "kip_win_<id>"` matched against `sessionStorage["kip_window_id"]`). If a mismatch is detected on startup, the cloned session pin is cleared and the Session Picker modal is presented.
    - **Refresh (F5) Seamlessness**: When a window reloads, its `window.name` matches its `sessionStorage["kip_window_id"]`, seamlessly rehydrating its pinned session without prompting.
 2. **Distinct Session IDs & Duplication**:
@@ -2340,8 +2167,8 @@ The frontend implements systematic middle-click capture (`auxclick` with `e.butt
      - **🗑 Close Session**: Prompts confirmation, deletes the session from `localStorage`, unpins the window, broadcasts closure remotely, and re-opens the Session Picker modal.
 5. **Cross-Tab Real-Time Coordination (`BroadcastChannel("kip_multi_tab")`)**:
    - Synchronizes running Kconfig engines, live constraint assignments, active window presence, and session lifecycle events across windows without polling.
-   - Messages: `kconfig:request_engines`, `kconfig:engine:announced`, `kconfig:engine:revoked`, `kconfig:assignments:broadcast`, `session:index:updated`, `session:renamed`, `session:closed`, `session:takeover`, `window:heartbeat`, `window:request_active`, `window:unloading`, the tab-transfer trio `tab:drag:start`, `tab:drag:end`, `tab:transfer:accepted` (§5.24.4), and the directed `tab:push` (§5.24.5).
-   - **Exclusive session ownership** (`session:takeover`): `sessionManager.pinSessionToWindow()` always ends in `claimSessionExclusively(sessionId)`, so *every* way of entering a session (picker **Open**, `?session=<id>`, a new or duplicated session, F5 rehydration) claims it. The claim is unconditional rather than conditional on presence, so it holds even when the other window's heartbeat has not been seen. A window receiving a claim for the session it holds calls `unpinSessionFromWindow()` (which also posts `window:unloading`, retiring its presence and the engines it was announcing) and emits `session:taken_over`; `GlobalState` clears `currentSessionId`/`currentSessionName` — stopping every further write to a session this window no longer owns, since `saveState()` only calls `saveActiveSession()` while a session is pinned — and re-emits `session:taken_over`, on which `KernelIdeApp` re-labels the header and opens the Session Picker with `allowClose: false`. A window ignores its own claim (`winId`).
+   - Messages: `kconfig:request_engines`, `kconfig:engine:announced`, `kconfig:engine:revoked`, `kconfig:assignments:broadcast`, `session:renamed`, `session:closed`, `session:takeover`, `window:heartbeat`, `window:request_active`, `window:unloading`, the tab-transfer trio `tab:drag:start`, `tab:drag:end`, `tab:transfer:accepted` (§5.24.4), and the directed `tab:push` (§5.24.5).
+   - **Exclusive session ownership** (`session:takeover`): `sessionManager.pinSessionToWindow()` always ends in `claimSessionExclusively(sessionId)`, so *every* way of entering a session (picker **Open**, `?session=<id>`, a new or duplicated session, F5 rehydration) claims it. The claim is unconditional rather than conditional on presence, so it holds even when the other window's heartbeat has not been seen. A window receiving a claim for the session it holds calls `unpinSessionFromWindow()` (which also posts `window:unloading`, retiring its presence and the engines it was announcing) and emits `session:taken_over`; `GlobalState` clears `currentSessionId`/`currentSessionName` — stopping every further write to a session this window no longer owns, since a save only calls `saveActiveSession()` while a session is pinned and the pending (coalesced) save is dropped rather than written (`unpinSessionFromWindow({flush: false})`, as for a deleted session) — and re-emits `session:taken_over`, on which `KernelIdeApp` re-labels the header and opens the Session Picker with `allowClose: false`. A window ignores its own claim (`winId`).
    - **Presence heartbeat**: `broadcastWindowHeartbeat()` runs on startup, on every pin **and every 10s** (`HEARTBEAT_INTERVAL_MS`), because `getActiveWindowsList()` prunes entries older than 30s; without the interval a window open for half a minute looked gone to the others and the picker stopped reporting which sessions are in use elsewhere.
    - **Remote engine registry** (`sessionManager.remoteEngines`, keyed by the engine's tab id): `kconfig:engine:announced` carries the announcing window's `winId` alongside its session, so an engine is dropped again when its window goes away (`window:unloading` → `dropRemoteEnginesOf`, matched on `winId`) or when its session is closed elsewhere (`session:closed`). **Only the window that announced an engine may retire it**: `kconfig:engine:revoked` carries the revoking `winId` and a registry entry is dropped only when it matches, because a tab transferred to another window (§5.24.4) runs its engine there under the same tab id — the window it left revokes that id just after the new one announced it, and an unscoped revoke would drop an engine that is still running. **Switching session also retires that window's engines** (`adoptSession` revokes every engine of the session being left before adopting the next one), so no code tab keeps dimming against a configuration nobody resolves any more. Dropping one emits `kconfig:remote_engines:updated`, which `GlobalState` re-emits as `kconfig:engine:changed` with `remote: true` (below) so every code tab following that engine falls back instead of dimming against a configuration nobody resolves any more.
    - **Live assignments**: `kconfig:assignments:broadcast` carries the engine's full descriptor (`title`, `version`, `arch`, `configName`, `profileKey`) with the values, not just the values, because the KConfig tab may have moved to another ARCH, revision or configuration name since it announced itself; the receiving window updates its registry entry from it, so a code tab in another session re-dims against the right ARCH on every edit. A broadcast for an engine this window never heard announced (its window was opened later, or the engine was enabled before this window had a session) answers with `kconfig:request_engines` instead of being dropped, so the engine registers and the next edit arrives as an update.
@@ -2378,7 +2205,7 @@ The frontend implements systematic middle-click capture (`auxclick` with `e.butt
      - **↪ Push to Another Session…**: a second menu lists every other saved session, each marked `🟢 open` when a window is holding it (`isSessionActiveInOtherWindow`) or `💤 saved` when none is; the entry is disabled when no other session exists. Choosing one moves the tab there. The current session is never listed.
    - **Live push**: `sessionManager.broadcastTabPush(payload, targetSessionId)` posts `tab:push` carrying exactly the drag payload (`state.tabTransferPayload`). The window whose `activeSessionId` matches emits `tab:push:received`, and `acceptPushedTab` takes the tab with `state.acceptTransferredTab` into its active pane and answers `tab:transfer:accepted` — so the push lands exactly as a cross-window drop (§5.24.4) does, down to the KConfig engine arriving still running and the source window closing its copy on the acknowledgement. A window with no session pinned takes nothing (§5.23.5).
    - **Offline push**: no window answers within `PUSH_ACK_GRACE_MS` (400ms) — because no window holds that session, or its presence entry was stale — so `sessionManager.pushTabToStoredSession(sessionId, payload)` appends the tab to the stored record's active pane as its active tab (fresh id if that record already holds the id), carries the KConfig engine descriptor into `kconfigEngineTabIds`/`kconfigEngineProfiles`, refreshes the session index (`tabCount`, `previewTabs`) and only then is the tab closed here. The session shows it the next time it is opened. Presence is therefore never trusted to decide where a tab goes: the live path is tried first and the stored write is the fallback, so a tab is closed here only once something has taken it.
-   - `state.saveState()` runs before the payload leaves, because a KConfig tab's values travel through the shared configuration store under `profileKey` (§5.8) rather than in the payload itself.
+   - The session is written (`state.flushState()`) before the payload leaves; a KConfig tab's values travel through the shared configuration store under `profileKey` (§5.8), written whenever they change, rather than in the payload itself.
 
 ### 5.25. Multi-Pane Split Editor Layout & Resizable Dividers (`webapp/frontend/css/layout.css`, `webapp/frontend/js/components/tabs.js`)
 1. **Split Button Specificity & Layout Fix**:
@@ -2405,15 +2232,24 @@ The hash is not merely "which kind of tab is open": it carries the state inside 
 | `kconfig` | `#v=<rev>&tab=kconfig&arch=<ARCH>&cfg=<name>&sym=<SYMBOL>&q=<filter>` |
 | `mail` | `#v=<rev>&tab=mail&tid=<threadId>&mid=<Message-ID>&q=<query>&f=<patch\|cover\|pull>&mode=tree` |
 | `commits` | `#v=<rev>&tab=commits&cid=<40-hex hash>&q=<query>&lc=1` (`lc`: commit list folded, §5.12) |
-| `diff` (Compare) | `#v=<rev>&tab=diff&a=<base>&b=<target>&st=<chips>&q=<filter>&rn=<similarity>:<dir>…` (Files) or `…&mode=kconfig&q=<filter>` (Kconfig) |
+| `diff` (Compare) | `#v=<rev>&tab=diff&a=<base>&b=<target>&st=<chips>&q=<filter>&rn=<similarity>:<dir>…` (Files) or `…&mode=kconfig&st=<chips>&q=<filter>` (Kconfig) |
+| `maintainers` | `#v=<rev>&tab=maintainers&view=<developers\|credits\|patch>&sec=<sec_id>&person=<email\|id\|name>&q=<query>&role=<maintainer\|reviewer\|credits>&sort=alpha` (`sec` and `person` are exclusive; §5.10) |
 | `nodemap` | `#v=<rev>&tab=nodemap` |
+| `pahole` | `#v=<rev>&tab=pahole&struct=<struct_name>` (Pahole struct layout, cachelines & padding holes) |
+| `callgraph` | `#v=<rev>&tab=callgraph&fn=<func_name>` (Bidirectional caller/callee callgraph) |
 
-   Empty, default and absent values are left out (`f=all`, `mode=search`, `line=1`, an unnamed configuration, no selection), so the hash stays as short as what it actually addresses. `sym` is the bare symbol name (no `CONFIG_` prefix), `cid` is always the **commit hash**, never the integer `commit_id`, so a shared link survives a database rebuild, `st` lists the selected Compare chips (`added,modified,deleted,renamed,unchanged`, in that order), `rn` is repeated once per applied rename search in the order they were applied (empty directory = whole tree), and `mid` is the message's `Message-ID` (percent-encoded, compared normalized — unbracketed and case-insensitive).
+   Empty, default and absent values are left out (`f=all`, `mode=search`, `line=1`, `view=subsystems`, `role=all`, the Activity sort, an unnamed configuration, no selection), so the hash stays as short as what it actually addresses. `sym` is the bare symbol name (no `CONFIG_` prefix), `cid` is always the **commit hash**, never the integer `commit_id`, so a shared link survives a database rebuild, `st` lists the selected Compare chips (`added,modified,deleted,renamed,unchanged` in Files mode, `added,modified,deleted` in Kconfig mode, in that order), `rn` is repeated once per applied rename search in the order they were applied (empty directory = whole tree), and `mid` is the message's `Message-ID` (percent-encoded, compared normalized — unbracketed and case-insensitive).
 
-2. **Reading a hash** (`applyHash`, from `init` on load and from `handleHashChange` on every `hashchange`): the revision is selected in the header and the tab is opened with those fields. An already open tab of the same identity is reused rather than duplicated (`state.openTab`: a KConfig tab is identified by revision + ARCH + configuration name, a mailing list tab by its thread and message, a commits tab by its title) and the deep link's view state — `query`, `symbol`, `commitId`, `listCollapsed`, `listMode`, `filter`, `threadId`, `messageId` — is merged into it, so the tab comes back on that search, that selection and that mode and not merely on the right kind of tab. Views restore it from their `tabData`: `MailView` re-runs the query with the filter chip and opens the thread focused on `mid`; `KconfigView` refills the filter box, applies the flat match list and inspects `sym` — a link carrying both keeps the filter instead of clearing it to reveal the symbol in the tree; `CommitsView` refills the search box, inspects `cid` and folds the list when `lc=1`; `DiffView` restores the revisions (a link without `a`/`b` keeps the tab's own), mode, chips and the filter of that mode, and re-runs the `rn` rename searches in order once the diff has loaded (each is cached, §5.11).
+2. **Reading a hash** (`applyHash`, from `init` on load and from `handleHashChange` on every `hashchange`): the revision is selected in the header and the tab is opened with those fields. An already open tab of the same identity is reused rather than duplicated (`state.openTab`: a KConfig tab is identified by revision + ARCH + configuration name, a mailing list tab by its thread and message, a commits tab by its title) and the deep link's view state — `query`, `symbol`, `commitId`, `listCollapsed`, `listMode`, `filter`, `threadId`, `messageId` — is merged into it, so the tab comes back on that search, that selection and that mode and not merely on the right kind of tab. Views restore it from their `tabData`: `MailView` re-runs the query with the filter chip and opens the thread focused on `mid`; `KconfigView` refills the filter box, applies the flat match list and inspects `sym` — a link carrying both keeps the filter instead of clearing it to reveal the symbol in the tree; `CommitsView` refills the search box, inspects `cid` and folds the list when `lc=1`; `DiffView` restores the revisions (a link without `a`/`b` keeps the tab's own), mode, chips and the filter of that mode, and re-runs the `rn` rename searches in order once the diff has loaded (each is cached, §5.11); `MaintainersView` restores the section, search, role pill and sort and inspects `sec` or `person` (a Maintainers link always carries all of `section`, `secId`, `person`, `role`, `sort`, empty when absent, so a reused tab drops a selection or filter the link does not have). Reopening a tab clears its saved scroll positions only when a navigation field actually changes; an empty value (`""`, `0`) counts as the same as an absent one, so re-applying the hash on reload keeps them (§5.28).
 
-3. **Writing it** (`updateHashFromState`, `history.replaceState`, never a new history entry): the hash follows the **active** tab. Tab and revision changes announce themselves as `tabs:changed` / `version:changed`; a navigation *inside* a tab is announced as **`tab:state`** by `state.updateTabState(tabId, patch)`, which merges the patch into the tab, persists the session and emits — it is deliberately **not** `tabs:changed`, since that redraws the pane and would discard the very view that reported the change. A patch entry that is empty (`""`, `0`, `null`, `undefined`) deletes that key, and a patch that changes nothing emits nothing.
-   Views record their own state through `persistTabState(patch)`, which ignores the call when the view's element is no longer in the document: a view replaced by a re-render is stale and its state is nobody's address any more. The recorded moments are: the KConfig filter box, the inspected symbol (tree row, flat match, badge, graph node), the ARCH switch (which also drops `sym`, a symbol of the ARCH being left) and the configuration name; the mailing list query, filter chip, left-column mode, opened thread and focused message; and the commits query, inspected commit and folded list; the Compare revisions, mode, chips, both filters and each successful rename search (the tab keeps `versionA`, `versionB`, `mode`, `statuses`, `query`, `kconfigQuery`, `renameSearches`).
+3. **Writing it & Browser History Navigation** (`updateHashFromState`, `history.pushState` / `history.replaceState`, `handlePopState`): the hash follows the **active** tab. Tab and revision changes announce themselves as `tabs:changed` / `version:changed`; a navigation *inside* a tab is announced as **`tab:state`** by `state.updateTabState(tabId, patch)`, which merges the patch into the tab, persists the session and emits — it is deliberately **not** `tabs:changed`, since that redraws the pane and would discard the very view that reported the change. A patch entry that is empty (`""`, `0`, `null`, `undefined`) deletes that key, and a patch that changes nothing emits nothing.
+   - **Selective History Stack**: `url_sync.js` distinguishes discrete navigation hops from ephemeral in-tab filtering. Discrete events — switching active tabs, opening new tabs, or changing primary navigation keys (such as Pahole struct drilldowns `structName`, Callgraph function jumps `functionName`, Explorer directory hops `path`, commit selections `commitId`, mailing list thread/message selections `threadId`/`messageId`, or Kconfig symbol selections `symbol`) — capture a workspace snapshot and push a new browser history entry (`history.pushState(snapshot, "", newHash)`). Ephemeral in-tab micro-adjustments (typing into search/filter inputs, editor cursor line movements, scroll positions) and initial tab hydration (such as Compare resolving default base/target revisions upon initial render, marked via `{ replace: true }`) update the URL and snapshot in place via `history.replaceState()`, preventing redundant intermediate history states.
+   - **Back / Forward Rewinding & Redaction** (`popstate`): Clicking the browser's Back or Forward arrow emits `popstate`, delivering the target history entry's workspace snapshot. `restoreSnapshot(targetSnapshot)` reconciles current state against the snapshot:
+     1. *Tab Redaction*: Any tab open in the live workspace that was created after the target snapshot was captured is closed (`state.closeTab`), redacting newly opened tabs when navigating backwards.
+     2. *Tab Reopening*: Any tab present in the target snapshot that was subsequently closed is reopened in its recorded pane.
+     3. *In-Tab Rewinding*: Tabs whose navigation targets changed (e.g. drilling down into nested struct definitions in Pahole or navigating folders in Explorer) have their parameters rewound to the target snapshot's values and re-render.
+     4. *Active Tab & Pane Focus*: Active pane and tab selection are restored, and `tabs:changed` renders the restored workspace state.
+   Views record their own state through `persistTabState(patch)`, which ignores the call when the view's element is no longer in the document: a view replaced by a re-render is stale and its state is nobody's address any more. The recorded moments are: the KConfig filter box, the inspected symbol (tree row, flat match, badge, graph node), the ARCH switch (which also drops `sym`, a symbol of the ARCH being left) and the configuration name; the mailing list query, filter chip, left-column mode, opened thread and focused message; and the commits query, inspected commit and folded list; the Compare revisions, mode, chips, both filters and each successful rename search (the tab keeps `versionA`, `versionB`, `mode`, `statuses`, `query`, `kconfigStatuses`, `kconfigQuery`, `renameSearches`); and the Maintainers section, search, role pill, sort and inspected subsystem or developer.
 4. **A link opened while no session is pinned** (`urlSync.defer()` / `urlSync.init()`): a link opened in a new browser tab arrives with its address in the hash, but that window has no session yet, so the startup Session Picker (§5.23) comes up first. Adopting a session **replaces the panes** with that session's saved tabs and then rewrites the hash from the active one, so applying the address before that choice would open the tab into panes that are about to be discarded — the browser tab would appear never to open at all. `app.init` therefore **holds** the address (`defer()`) instead of calling `urlSync.init()` at boot: while held, `hashchange` only updates what is pending and `updateHashFromState` writes nothing, so neither the picker nor the adoption can clobber it. The hold is released as soon as a session is adopted — on `session:adopted`, whichever path adopted it, and from the picker's `onSelect` — and the held address is then applied **on top of** the adopted session's tabs, so the tab the link asked for opens inside that session. When a session is already pinned to the window no picker appears and `urlSync.init()` runs normally at boot.
 5. **What is deliberately not addressed**: scroll positions (kept per tab in the session instead, §5.28), expanded tree nodes, open/collapsed email cards, the engine state of a KConfig tab and the pagination page reached — a deep link addresses *what* is shown, not how far the reader had scrolled through it. Only the active tab is in the hash; the whole workspace (every pane, tab and configuration) is restored from the session instead (§5.23).
 
@@ -2436,74 +2272,16 @@ Every tab comes back where it was scrolled — after selecting another tab, afte
 6. **Opt-out**: a subtree marked `data-scroll-restore="off"` keeps its own position and is ignored here — the code view's virtualized line viewport (`tab.scrollTop`, §5.21), whose saved position must yield to a requested line.
 7. **Not addressed**: canvas pan/zoom (Node Map, treemap) is not scrolling and is not kept; deep links still carry no scroll position (§5.26).
 
-## 6. Programmatic Python Service Delegates (`webapp/main.py`)
+## 6. Using the Services from Python
 
-For automated testing, scripting, and offline analysis, all core domain service functions are exported directly from [`webapp/main.py`](webapp/main.py):
+`webapp/main.py` is only the server's entrypoint (it exports `app`). Scripts and tests use the service classes directly, one module per area under `webapp/backend/services/` (`FilesystemService`, `SymbolService`, `KconfigService`, `MaintainerService`, `GitService`, `PaholeService`, `CallgraphService`, `DiffService`, `history_service`, `mailing_list_service`), or the router functions under `webapp/backend/routers/`, whose parameters carry plain defaults (`Annotated[..., Query()]`) so they can be called without FastAPI:
 
 ```python
-from webapp.main import (
-    # Filesystem & Source Code
-    get_tree,
-    get_file,
-    browse_path,
-    get_file_by_id,
-    export_compile_commands,
-    get_codebase_treemap,
-    
-    # Symbols, AST & Tags
-    search_symbols,
-    lookup_symbols,
-    get_symbol_detail,
-    get_symbol_xref,
-    get_ast_container_tree,
-    get_tag_by_id,
-    get_tag_timeline,
-    get_include_symbols,
-    
-    # Kconfig & Defconfigs
-    get_kconfig_defconfigs,
-    get_kconfig_defconfig_content,
-    get_kconfig_tree,
-    get_kconfig_symbol_detail,
-    get_kconfig_graph,
-    get_kconfig_env_presets,
-    export_kconfig_file,
-    import_kconfig_file,
-    search_kconfig_symbols,
-    validate_kconfig_assignments,
-    autosolve_kconfig,
-    diff_kconfig_configurations,
-    
-    # Maintainers & CREDITS
-    get_maintainers_overview,
-    get_maintainer_section_detail,
-    get_person_profile,
-    get_credits_overview,
-    get_developers,
-    match_patch_maintainers,
-    
-    # Git & Blame
-    get_blame,
-    get_file_blame,
-    get_commits,
-    get_version_commits,
-    get_commit_detail,
-    get_commit_timeline,
-    generate_formatted_patch,
-    
-    # Visual Modeling & Diffs
-    get_struct_layout,
-    get_function_callgraph,
-    get_versions_diff,
-    get_kconfig_diff,
-    
-    # Mailing List & LKML Discussions
-    get_mail_status,
-    get_mail_message,
-    get_mail_thread,
-    search_mail,
-    resolve_commit_mail,
-)
+from webapp.backend.services.symbol_service import SymbolService
+from webapp.backend.services.kconfig_service import KconfigService
+
+detail = SymbolService().get_symbol_detail("v3.0", "copy_process")
+model = KconfigService().get_tree("v3.0", "x86_64")
 ```
 
 ---
@@ -2530,12 +2308,14 @@ The Git repository served by the webapp (`webapp/backend/config.py:LINUX_REPO_DI
 Start the application from the repository root:
 
 ```bash
-# Using webapp entrypoint (with CLI overrides)
-python3 webapp/main.py --host 0.0.0.0 --port 8000
+# Using webapp entrypoint (with CLI overrides; -c selects another config.json)
+python3 webapp/main.py -c config.json --host 0.0.0.0 --port 8000 --no-reload
 
-# Or via uvicorn directly
+# Or via uvicorn directly (CONFIG_FILE selects another config.json)
 uvicorn webapp.main:app --host 0.0.0.0 --port 8000 --reload
 ```
+
+`-c` is passed on as the `CONFIG_FILE` environment variable before anything reads the configuration, so it also applies to the process uvicorn's reloader starts. Options left unset fall back to the `webapp` section of the configuration (`host`, `port`, `reload`).
 
 Open `http://localhost:8000` in any modern browser.
 

@@ -27,7 +27,7 @@ from core.config import (
     sync_repositories,
     update_repository_branches,
 )
-from webapp.main import DatabaseManager
+from webapp.backend.config import get_backend_db_config
 
 
 class TestConfigManagement(unittest.TestCase):
@@ -159,8 +159,8 @@ class TestConfigManagement(unittest.TestCase):
         finally:
             os.unlink(temp_path)
 
-    def test_database_manager_reads_config(self) -> None:
-        """DatabaseManager correctly initializes using get_db_config()."""
+    def test_webapp_db_config_reads_config(self) -> None:
+        """The webapp's connection pool settings come from get_db_config() (get_backend_db_config)."""
         custom_data = {
             "database": {
                 "host": "10.0.0.42",
@@ -177,14 +177,13 @@ class TestConfigManagement(unittest.TestCase):
 
         try:
             init_config(temp_path)
-            with unittest.mock.patch.object(DatabaseManager, "_init_pool"):
-                mgr = DatabaseManager()
-                self.assertEqual(mgr.host, "10.0.0.42")
-                self.assertEqual(mgr.port, 3308)
-                self.assertEqual(mgr.user, "dbmgr_user")
-                self.assertEqual(mgr.password, "mgr_pass")
-                self.assertEqual(mgr.database, "dbmgr_test")
-                self.assertEqual(mgr.timeout, 5)
+            cfg = get_backend_db_config()
+            self.assertEqual(cfg["host"], "10.0.0.42")
+            self.assertEqual(int(cfg["port"]), 3308)
+            self.assertEqual(cfg["user"], "dbmgr_user")
+            self.assertEqual(cfg["password"], "mgr_pass")
+            self.assertEqual(cfg["database"], "dbmgr_test")
+            self.assertEqual(int(cfg["timeout"]), 5)
         finally:
             os.unlink(temp_path)
 
@@ -216,20 +215,21 @@ class TestConfigManagement(unittest.TestCase):
             os.unlink(temp_path)
 
     def test_webapp_cli_arguments(self) -> None:
-        """webapp/main.py parses CLI overrides on top of config."""
-        import argparse
-        parser = argparse.ArgumentParser(description="KernelInfo-Parser Web Application Server")
-        parser.add_argument("-c", "--config", dest="config_path", default=None)
-        parser.add_argument("--host", dest="host", default=None)
-        parser.add_argument("--port", dest="port", type=int, default=None)
-        parser.add_argument("--reload", dest="reload", action="store_true", default=None)
-        parser.add_argument("--no-reload", dest="reload", action="store_false")
+        """webapp/main.py parses CLI overrides, and -c becomes the configuration of the server process."""
+        from webapp import main as webapp_main
 
-        args = parser.parse_args(["-c", "custom.json", "--host", "127.0.0.1", "--port", "9099", "--no-reload"])
-        self.assertEqual(args.config_path, "custom.json")
+        args = webapp_main.parse_args(["-c", "custom.json", "--host", "127.0.0.1", "--port", "9099", "--no-reload"])
+        self.assertEqual(args.config, "custom.json")
         self.assertEqual(args.host, "127.0.0.1")
         self.assertEqual(args.port, 9099)
         self.assertFalse(args.reload)
+        self.assertIsNone(webapp_main.parse_args([]).reload)
+
+        # -c reaches core.config (and uvicorn's reloader process) as CONFIG_FILE
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("CONFIG_FILE", None)
+            webapp_main.apply_config_path(args)
+            self.assertEqual(os.environ["CONFIG_FILE"], str(Path("custom.json").resolve()))
 
     def test_default_continuous_parsing_arguments(self) -> None:
         """Verify main.arg_handling defaults single_version to False for continuous parsing."""

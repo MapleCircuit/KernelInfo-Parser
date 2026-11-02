@@ -23,15 +23,15 @@ from webapp.backend.database.helpers import (
     get_version_info,
 )
 from webapp.backend.security.jail import is_safe_rel_path
-from webapp.backend.security.sql import escape_like
 from webapp.backend.services.tree_resolver import tree_resolver, git_tree_resolver
 from webapp.backend.services.history_service import KCONFIG_TYPE_NAMES, kconfig_definitions, kconfig_field_changes
 from core.globalstuff import ASTT, is_safe_git_rev
 
 logger = logging.getLogger(__name__)
 
-KCONFIG_FTYPE = 2
 MAX_SYMBOL_DIFF_FILES = 50
+# Files whose definitions Level 2 compares (paths sort documentation and dotfiles first)
+SYMBOL_DIFF_SUFFIXES = (".c", ".h", ".S", ".rs")
 MAX_FILE_DIFF_BYTES = 512 * 1024
 # Rename detection (git diff-tree -M): a deleted and an added path pair up when their contents are
 # at least RENAME_SIMILARITY % alike. The quick pass of every comparison compares contents only while
@@ -144,46 +144,39 @@ class DiffService:
             raise HTTPException(status_code=404, detail=f"Version or commit '{missing}' not found.")
         return vid1, vname1, vid2, vname2
 
-    def _fetch_tree(self, cursor: Any, vid: int, vname: str, prefix: str, norm_path: str) -> tuple[dict[str, str], bool]:
+    def _fetch_tree(self, cursor: Any, vid: int, vname: str) -> tuple[dict[str, str], bool]:
         """Return ({path: content_key}, is_git). Content keys are Git blob SHAs (Path C) or DB blob_ids."""
         git_tree = git_tree_resolver.list_tree(vname)
         if git_tree is not None:
-            if prefix:
-                git_tree = {p: s for p, s in git_tree.items() if p.startswith(prefix) or p == norm_path}
             return git_tree, True
-        db_tree = self._fetch_commit_files(cursor, vid, prefix, norm_path)
+        db_tree = self._fetch_commit_files(cursor, vid)
         return {p: str(b) for p, b in db_tree.items()}, False
 
     def _fetch_trees(
-        self, cursor: Any, v1: str, v2: str, prefix: str, norm_path: str,
+        self, cursor: Any, v1: str, v2: str,
     ) -> tuple[str, str, dict[str, str], dict[str, str], bool]:
         """Level 1 inputs: (vname1, vname2, {path: content_key} of each side, both from Git)."""
         vid1, vname1, vid2, vname2 = self._resolve_pair(cursor, v1, v2)
-        files_v1, git1 = self._fetch_tree(cursor, vid1, vname1, prefix, norm_path)
-        files_v2, git2 = self._fetch_tree(cursor, vid2, vname2, prefix, norm_path)
+        files_v1, git1 = self._fetch_tree(cursor, vid1, vname1)
+        files_v2, git2 = self._fetch_tree(cursor, vid2, vname2)
         use_git = git1 and git2
         if not use_git and (git1 or git2):
             # Mixed sources cannot be compared by key; fall back to DB on both sides
-            files_v1 = {p: str(b) for p, b in self._fetch_commit_files(cursor, vid1, prefix, norm_path).items()}
-            files_v2 = {p: str(b) for p, b in self._fetch_commit_files(cursor, vid2, prefix, norm_path).items()}
+            files_v1 = {p: str(b) for p, b in self._fetch_commit_files(cursor, vid1).items()}
+            files_v2 = {p: str(b) for p, b in self._fetch_commit_files(cursor, vid2).items()}
         return vname1, vname2, files_v1, files_v2, use_git
 
-    def get_unchanged_files(self, v1: str, v2: str, path: str = "") -> dict[str, Any]:
+    def get_unchanged_files(self, v1: str, v2: str) -> dict[str, Any]:
         """Paths present at both revisions with the same content (the `unchanged_count` of the diff)."""
-        norm_path = path.strip().strip("/")
-        prefix = f"{norm_path}/" if norm_path else ""
         with get_db_cursor() as cursor:
-            vname1, vname2, files_v1, files_v2, use_git = self._fetch_trees(cursor, v1, v2, prefix, norm_path)
+            vname1, vname2, files_v1, files_v2, use_git = self._fetch_trees(cursor, v1, v2)
         files = sorted(p for p, key in files_v2.items() if files_v1.get(p) == key)
-        return {"v1": vname1, "v2": vname2, "path": norm_path, "source": "git" if use_git else "db", "count": len(files), "files": files}
+        return {"v1": vname1, "v2": vname2, "source": "git" if use_git else "db", "count": len(files), "files": files}
 
-    def get_versions_diff(self, v1: str, v2: str, path: str = "") -> dict[str, Any]:
+    def get_versions_diff(self, v1: str, v2: str) -> dict[str, Any]:
         """Compare file hierarchies between two revisions using 3-level blob-skip diffing."""
-        norm_path = path.strip().strip("/")
-        prefix = f"{norm_path}/" if norm_path else ""
-
         with get_db_cursor() as cursor:
-            vname1, vname2, files_v1, files_v2, use_git = self._fetch_trees(cursor, v1, v2, prefix, norm_path)
+            vname1, vname2, files_v1, files_v2, use_git = self._fetch_trees(cursor, v1, v2)
 
             added_paths = [p for p in files_v2 if p not in files_v1]
             deleted_paths = [p for p in files_v1 if p not in files_v2]
@@ -191,7 +184,7 @@ class DiffService:
             unchanged_count = len(files_v2) - len(added_paths) - len(modified_paths)
 
             renamed_pairs, rename_info = self._pair_renames(
-                vname1, vname2, files_v1, files_v2, added_paths, deleted_paths, norm_path, use_git,
+                vname1, vname2, files_v1, files_v2, added_paths, deleted_paths, use_git,
             )
             renamed_old = {o for o, _, _ in renamed_pairs}
             renamed_new = {n for _, n, _ in renamed_pairs}
@@ -222,56 +215,52 @@ class DiffService:
                 for p in modified_paths
             ]
 
-            # Level 2 AST & symbol semantic diff on changed files
-            for m in modified[:MAX_SYMBOL_DIFF_FILES]:
-                old_blob = m.get("fid_old", 0)
-                new_blob = m.get("fid_new", 0)
-                if old_blob > 0 and new_blob > 0 and old_blob != new_blob:
-                    cursor.execute(
-                        "SELECT name, type_id FROM m_symbol_def WHERE blob_id = %s;",
-                        (old_blob,),
-                    )
-                    old_syms = {(safe_decode(r["name"]), r["type_id"]) for r in cursor.fetchall()}
-                    cursor.execute(
-                        "SELECT name, type_id FROM m_symbol_def WHERE blob_id = %s;",
-                        (new_blob,),
-                    )
-                    new_syms = {(safe_decode(r["name"]), r["type_id"]) for r in cursor.fetchall()}
-                    m["symbols_added"] = len(new_syms - old_syms)
-                    m["symbols_removed"] = len(old_syms - new_syms)
+            # Level 2 AST & symbol semantic diff on changed files (one query for all of them)
+            sym_files = [m for m in modified
+                         if m["file"].endswith(SYMBOL_DIFF_SUFFIXES)
+                         and m["fid_old"] > 0 and m["fid_new"] > 0 and m["fid_old"] != m["fid_new"]][:MAX_SYMBOL_DIFF_FILES]
+            blob_ids = sorted({b for m in sym_files for b in (m["fid_old"], m["fid_new"])})
+            syms_by_blob: dict[int, set[tuple[str, int]]] = {b: set() for b in blob_ids}
+            if blob_ids:
+                cursor.execute(
+                    f"SELECT blob_id, name, type_id FROM m_symbol_def WHERE blob_id IN ({','.join(['%s'] * len(blob_ids))});",
+                    blob_ids,
+                )
+                for r in cursor.fetchall():
+                    syms_by_blob[r["blob_id"]].add((safe_decode(r["name"]), r["type_id"]))
+            for m in sym_files:
+                old_syms, new_syms = syms_by_blob[m["fid_old"]], syms_by_blob[m["fid_new"]]
+                m["symbols_added"] = len(new_syms - old_syms)
+                m["symbols_removed"] = len(old_syms - new_syms)
 
+            # One row per change (diff_view.js filters and pages them client-side)
             changes = []
             for a in added:
-                changes.append({"type": "added", "file": a["file"], "file_path": a["file"], "name": a["file"], "fid": a.get("fid")})
+                changes.append({"type": "added", "file_path": a["file"], "fid": a.get("fid")})
             for d in deleted:
-                changes.append({"type": "deleted", "file": d["file"], "file_path": d["file"], "name": d["file"], "fid": d.get("fid")})
+                changes.append({"type": "deleted", "file_path": d["file"], "fid": d.get("fid")})
             for r in renamed:
                 changes.append({
                     "type": "renamed",
-                    "file": r["file"],
                     "file_path": r["file"],
                     "old_file": r["old_file"],
                     "similarity": r["similarity"],
-                    "name": r["file"],
                     "fid": r.get("fid"),
                 })
             for m in modified:
                 changes.append({
                     "type": "modified",
-                    "file": m["file"],
                     "file_path": m["file"],
-                    "name": m["file"],
                     "fid_old": m.get("fid_old"),
                     "fid_new": m.get("fid_new"),
                     "symbols_added": m.get("symbols_added", 0),
                     "symbols_removed": m.get("symbols_removed", 0),
                 })
-            changes.sort(key=lambda c: c["file"])
+            changes.sort(key=lambda c: c["file_path"])
 
             return {
                 "v1": vname1,
                 "v2": vname2,
-                "path": norm_path,
                 "source": "git" if use_git else "db",
                 "summary": {
                     "added_count": len(added),
@@ -279,16 +268,7 @@ class DiffService:
                     "modified_count": len(modified),
                     "renamed_count": len(renamed),
                     "unchanged_count": unchanged_count,
-                    "added": len(added),
-                    "deleted": len(deleted),
-                    "modified": len(modified),
-                    "renamed": len(renamed),
-                    "unchanged": unchanged_count,
                 },
-                "added": added,
-                "deleted": deleted,
-                "modified": modified,
-                "renamed": renamed,
                 "renames": rename_info,
                 "changes": changes,
             }
@@ -301,7 +281,6 @@ class DiffService:
         files_v2: dict[str, str],
         added_paths: list[str],
         deleted_paths: list[str],
-        scope: str,
         use_git: bool,
     ) -> tuple[list[tuple[str, str, int]], dict[str, Any]]:
         """Pair deleted with added paths: Git's similarity detection, then exact content for the rest."""
@@ -309,7 +288,7 @@ class DiffService:
         added_set, deleted_set = set(added_paths), set(deleted_paths)
         pairs: list[tuple[str, str, int]] = []
         if use_git and added_set and deleted_set:
-            found = self._git_renames(vname1, vname2, RENAME_SIMILARITY, RENAME_LIMIT, scope, RENAME_TIMEOUT)
+            found = self._git_renames(vname1, vname2, RENAME_SIMILARITY, RENAME_LIMIT, "", RENAME_TIMEOUT)
             if found is not None:
                 git_pairs, limit_needed = found
                 info.update(source="git", exhaustive=limit_needed == 0, limit_needed=limit_needed)
@@ -648,23 +627,16 @@ class DiffService:
         }
 
     @staticmethod
-    def _fetch_commit_files(cursor: Any, commit_id: int, prefix: str = "", norm_path: str = "") -> dict[str, int]:
-        if prefix:
-            sql = """
-                SELECT COALESCE(NULLIF(fn.fname, ''), CONCAT('file_', bc.fnid)) AS fname, bc.blob_id
-                FROM m_bridge_checkpoint bc
-                LEFT JOIN m_file_name fn ON bc.fnid = fn.fnid AND fn.fnid > 0
-                WHERE bc.commit_id = %s AND (fn.fname LIKE %s OR fn.fname = %s);
+    def _fetch_commit_files(cursor: Any, commit_id: int) -> dict[str, int]:
+        cursor.execute(
             """
-            cursor.execute(sql, (commit_id, f"{escape_like(prefix)}%", norm_path))
-        else:
-            sql = """
-                SELECT COALESCE(NULLIF(fn.fname, ''), CONCAT('file_', bc.fnid)) AS fname, bc.blob_id
-                FROM m_bridge_checkpoint bc
-                LEFT JOIN m_file_name fn ON bc.fnid = fn.fnid AND fn.fnid > 0
-                WHERE bc.commit_id = %s;
-            """
-            cursor.execute(sql, (commit_id,))
+            SELECT COALESCE(NULLIF(fn.fname, ''), CONCAT('file_', bc.fnid)) AS fname, bc.blob_id
+            FROM m_bridge_checkpoint bc
+            LEFT JOIN m_file_name fn ON bc.fnid = fn.fnid AND fn.fnid > 0
+            WHERE bc.commit_id = %s;
+            """,
+            (commit_id,),
+        )
         rows = cursor.fetchall()
         if rows:
             return {safe_decode(r["fname"]): r["blob_id"] for r in rows}
@@ -679,16 +651,7 @@ class DiffService:
         for i in range(0, len(fnids), chunk_size):
             chunk = fnids[i:i + chunk_size]
             fmt = ",".join(["%s"] * len(chunk))
-            if prefix:
-                cursor.execute(
-                    f"SELECT fnid, fname FROM m_file_name WHERE fnid IN ({fmt}) AND (fname LIKE %s OR fname = %s);",
-                    [*chunk, f"{escape_like(prefix)}%", norm_path],
-                )
-            else:
-                cursor.execute(
-                    f"SELECT fnid, fname FROM m_file_name WHERE fnid IN ({fmt});",
-                    chunk,
-                )
+            cursor.execute(f"SELECT fnid, fname FROM m_file_name WHERE fnid IN ({fmt});", chunk)
             for r in cursor.fetchall():
                 fn = safe_decode(r["fname"]) or f"file_{r['fnid']}"
                 res[fn] = fnid_map[r["fnid"]]
