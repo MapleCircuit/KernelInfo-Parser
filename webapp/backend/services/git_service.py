@@ -219,7 +219,10 @@ class GitService:
         info: dict[str, Any] | None = None
         sha = ""
         final_line = 1
-        for line in stdout.splitlines():
+        for raw_line in stdout.split("\n"):
+            line = raw_line.rstrip("\r")
+            if not line:
+                continue
             if line.startswith("\t"):
                 entries.append({
                     "line": final_line,
@@ -234,9 +237,10 @@ class GitService:
             if info is None:
                 # Line header: "<sha> <orig_line> <final_line> [<lines in group>]"
                 parts = line.split(" ")
-                sha = parts[0]
-                final_line = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 1
-                info = commits.setdefault(sha, {})
+                if len(parts) >= 3 and parts[2].isdigit():
+                    sha = parts[0]
+                    final_line = int(parts[2])
+                    info = commits.setdefault(sha, {})
             elif line.startswith("author "):
                 info["author"] = line[7:]
             elif line.startswith("author-mail "):

@@ -145,6 +145,11 @@
   background: var(--bg-hover);
 }
 
+.blame-author-link:hover {
+  text-decoration: underline;
+  color: var(--text-primary);
+}
+
 .gutter-line-no {
   width: 48px;
   flex-shrink: 0;

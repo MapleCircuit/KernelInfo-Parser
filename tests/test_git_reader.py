@@ -166,6 +166,18 @@ class TestGitBlameService(unittest.TestCase):
             self.svc.get_blame("v3.0", "../../../etc/passwd")
         self.assertEqual(ctx.exception.status_code, 400)
 
+    def test_get_blame_file_with_form_feeds(self) -> None:
+        """Verify files with form feed characters (e.g. COPYING:75) blame every line without missing entries."""
+        res = self.svc.get_blame("v3.10", "COPYING")
+        self.assertIn("lines", res)
+        self.assertEqual(len(res["lines"]), 356)
+        self.assertEqual([e["line"] for e in res["lines"]], list(range(1, 357)))
+        line75 = next((e for e in res["lines"] if e["line"] == 75), None)
+        self.assertIsNotNone(line75)
+        self.assertEqual(line75["line"], 75)
+        self.assertNotEqual(line75["commit_hash"], "")
+        self.assertNotEqual(line75["author_name"], "Unknown")
+
 
 if __name__ == "__main__":
     unittest.main()
