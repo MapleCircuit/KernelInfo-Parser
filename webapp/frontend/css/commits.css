@@ -15,6 +15,7 @@
   display: flex;
   flex-direction: column;
   overflow: hidden;
+  user-select: none;
 }
 
 /* Folded list column: a narrow rail on the left unfolds it */
@@ -202,9 +203,20 @@
   overflow-x: auto;
 }
 
-.diff-add { color: #7ee787; background: rgba(46, 160, 67, 0.15); }
-.diff-del { color: #ff7b72; background: rgba(248, 81, 73, 0.15); }
-.diff-hunk { color: #d2a8ff; background: rgba(188, 140, 255, 0.1); }
+.diff-add {
+  color: #7ee787;
+  background: rgba(46, 160, 67, 0.15);
+}
+
+.diff-del {
+  color: #ff7b72;
+  background: rgba(248, 81, 73, 0.15);
+}
+
+.diff-hunk {
+  color: #d2a8ff;
+  background: rgba(188, 140, 255, 0.1);
+}
 
 /* Inline commit diff */
 .commit-diff-section {
@@ -214,7 +226,7 @@
   padding-bottom: 24px;
 }
 
-.commit-diff-section > #btn-commit-diff {
+.commit-diff-section>#btn-commit-diff {
   align-self: flex-start;
 }
 
@@ -244,9 +256,21 @@
   font-size: 11px;
 }
 
-.cdiff-add { color: var(--accent-green); font-family: var(--font-mono); font-size: 11px; }
-.cdiff-del { color: var(--accent-red); font-family: var(--font-mono); font-size: 11px; }
-.cdiff-muted { color: var(--text-muted); }
+.cdiff-add {
+  color: var(--accent-green);
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+
+.cdiff-del {
+  color: var(--accent-red);
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+
+.cdiff-muted {
+  color: var(--text-muted);
+}
 
 .cdiff-status {
   padding: 8px 12px;
@@ -261,7 +285,7 @@
   overflow: hidden;
 }
 
-.cdiff-file > summary {
+.cdiff-file>summary {
   display: flex;
   align-items: center;
   gap: 8px;
@@ -273,7 +297,7 @@
   user-select: none;
 }
 
-.cdiff-file[open] > summary {
+.cdiff-file[open]>summary {
   border-bottom: 1px solid var(--border-color);
 }
 
@@ -327,8 +351,13 @@
   outline-offset: -1px;
 }
 
-.cdiff-row.add { background: rgba(63, 185, 80, 0.12); }
-.cdiff-row.del { background: rgba(248, 81, 73, 0.12); }
+.cdiff-row.add {
+  background: rgba(63, 185, 80, 0.12);
+}
+
+.cdiff-row.del {
+  background: rgba(248, 81, 73, 0.12);
+}
 
 .cdiff-ln {
   width: 44px;
@@ -346,8 +375,13 @@
   user-select: none;
 }
 
-.cdiff-row.add .cdiff-sign { color: var(--accent-green); }
-.cdiff-row.del .cdiff-sign { color: var(--accent-red); }
+.cdiff-row.add .cdiff-sign {
+  color: var(--accent-green);
+}
+
+.cdiff-row.del .cdiff-sign {
+  color: var(--accent-red);
+}
 
 .cdiff-text {
   white-space: pre;

@@ -7,6 +7,7 @@
   background: #0a0d12;
   position: relative;
   overflow: hidden;
+  user-select: none;
 }
 
 .nodemap-canvas-wrapper {
@@ -121,8 +122,15 @@
   text-transform: uppercase;
 }
 
-.node-badge.struct { background: rgba(57, 197, 187, 0.2); color: var(--accent-cyan); }
-.node-badge.func { background: rgba(188, 140, 255, 0.2); color: var(--accent-purple); }
+.node-badge.struct {
+  background: rgba(57, 197, 187, 0.2);
+  color: var(--accent-cyan);
+}
+
+.node-badge.func {
+  background: rgba(188, 140, 255, 0.2);
+  color: var(--accent-purple);
+}
 
 .node-body {
   padding: 8px 10px;
@@ -223,6 +231,7 @@
   display: flex;
   flex-direction: column;
   gap: 4px;
+  user-select: text;
 }
 
 .inspector-label {

@@ -21,6 +21,7 @@
   overflow: hidden;
   min-height: 0;
   height: 100%;
+  user-select: none;
 }
 
 .mail-list-switcher {
