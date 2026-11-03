@@ -1,8 +1,8 @@
 /**
  * command_palette.js - Global Ctrl+K search & command palette.
  *
- * Prefixes select the mode: (none) files, symbols and Kconfig options together; ">" commands;
- * "@" symbols; "#" commits; "?" Kconfig options; ":" go to line in the active code tab.
+ * Prefixes select the mode: (none) files, symbols and Kconfig options together; "/" commands;
+ * "$" symbols; "#" commits; "?" Kconfig options; ":" go to line in the active code tab; "@" mailing list.
  */
 import { api } from "../api.js";
 import { state } from "../state.js";
@@ -40,12 +40,12 @@ function highlight(text, query) {
 }
 
 const MODES = {
-  ">": { label: "Commands", placeholder: "Run a command…" },
-  "@": { label: "Symbols", placeholder: "Search symbol definitions…" },
+  "/": { label: "Commands", placeholder: "Run a command…" },
+  "$": { label: "Symbols", placeholder: "Search symbol definitions…" },
   "#": { label: "Commits", placeholder: "Search commits by subject, author or hash…" },
   "?": { label: "Kconfig", placeholder: "Search Kconfig options…" },
   ":": { label: "Go to line", placeholder: "Line number in the active file…" },
-  "m": { label: "Mailing List", placeholder: "Search LKML emails, patches, and threads…" },
+  "@": { label: "Mailing List", placeholder: "Search LKML emails, patches, and threads…" },
 };
 
 class CommandPalette {
@@ -54,6 +54,9 @@ class CommandPalette {
     this.items = [];
     this.highlightIdx = 0;
     this.seq = 0;
+    // Input text the rendered results were computed for, and an Enter pressed before they caught up.
+    this.resultsFor = null;
+    this.pendingEnter = null;
     this.commandProvider = () => [];
     this.debouncedSearch = debounce(() => this.search(), 160);
   }
@@ -71,7 +74,7 @@ class CommandPalette {
         this.open("");
       } else if ((e.ctrlKey || e.metaKey) && e.shiftKey && key === "p") {
         e.preventDefault();
-        this.open(">");
+        this.open("/");
       } else if (key === "escape" && this.el) {
         this.close();
       }
@@ -97,7 +100,7 @@ class CommandPalette {
         <div class="cmdp-results" role="listbox"></div>
         <div class="cmdp-footer">
           <span><kbd>↑↓</kbd> navigate</span><span><kbd>Enter</kbd> open</span><span><kbd>Ctrl+Enter</kbd> new tab</span>
-          <span class="cmdp-prefixes"><code>&gt;</code> commands <code>@</code> symbols <code>#</code> commits <code>?</code> kconfig <code>:</code> line <code>m</code> mail</span>
+          <span class="cmdp-prefixes"><code>/</code> commands <code>$</code> symbols <code>#</code> commits <code>?</code> kconfig <code>:</code> line <code>@</code> mail</span>
         </div>
       </div>`;
     document.body.appendChild(backdrop);
@@ -109,9 +112,10 @@ class CommandPalette {
     const input = backdrop.querySelector(".cmdp-input");
     input.value = initial;
     input.addEventListener("input", () => {
+      this.pendingEnter = null;
       this.updateMode();
       const { mode } = this.parse();
-      if (mode === ">" || mode === ":") this.search();
+      if (mode === "/" || mode === ":") this.search();
       else this.debouncedSearch();
     });
     input.addEventListener("keydown", (e) => this.onKey(e));
@@ -124,6 +128,8 @@ class CommandPalette {
     this.el?.remove();
     this.el = null;
     this.items = [];
+    this.resultsFor = null;
+    this.pendingEnter = null;
     this.seq++;
   }
 
@@ -144,11 +150,12 @@ class CommandPalette {
   async search() {
     if (!this.el) return;
     const seq = ++this.seq;
+    const raw = this.el.querySelector(".cmdp-input").value;
     const { mode, query } = this.parse();
     const version = state.getActiveTab()?.version || state.currentVersion;
     let items = [];
 
-    if (mode === ">") {
+    if (mode === "/") {
       const q = query.toLowerCase();
       items = this.commandProvider()
         .filter((c) => !q || c.title.toLowerCase().includes(q) || (c.keywords || "").toLowerCase().includes(q))
@@ -165,16 +172,16 @@ class CommandPalette {
       items = this.commandProvider().slice(0, 8).map((c) => ({ section: "Suggested commands", icon: "›", title: c.title, detail: c.hint || "", run: c.run }));
     } else {
       const wantFiles = mode === "";
-      const wantSymbols = mode === "" || mode === "@";
+      const wantSymbols = mode === "" || mode === "$";
       const wantKconfig = mode === "" || mode === "?";
       const wantCommits = mode === "#";
-      const wantMail = mode === "m" || (mode === "" && query.length >= 3);
+      const wantMail = mode === "@" || (mode === "" && query.length >= 3);
       const [files, symbols, kconfig, commits, mail] = await Promise.allSettled([
         wantFiles ? api.searchFiles(version, query, 25) : null,
-        wantSymbols && query.length >= 2 ? api.searchSymbols(version, query, mode === "@" ? 50 : 15) : null,
+        wantSymbols && query.length >= 2 ? api.searchSymbols(version, query, mode === "$" ? 50 : 15) : null,
         wantKconfig && query.length >= 2 ? api.searchKconfig(version, query.replace(/^CONFIG_/i, ""), mode === "?" ? 40 : 8) : null,
         wantCommits ? api.searchCommits(version, query, 40) : null,
-        wantMail ? api.searchMailingList(query, { limit: mode === "m" ? 30 : 6 }) : null,
+        wantMail ? api.searchMailingList(query, { limit: mode === "@" ? 30 : 6 }) : null,
       ]);
       if (seq !== this.seq || !this.el) return;
 
@@ -228,8 +235,14 @@ class CommandPalette {
     }
 
     this.items = items;
+    this.resultsFor = raw;
     this.highlightIdx = items.findIndex((it) => it.run);
     this.render();
+    if (this.pendingEnter) {
+      const { newTab } = this.pendingEnter;
+      this.pendingEnter = null;
+      this.execute(this.highlightIdx, newTab);
+    }
   }
 
   render() {
@@ -267,7 +280,15 @@ class CommandPalette {
       this.render();
     } else if (e.key === "Enter") {
       e.preventDefault();
-      this.execute(this.highlightIdx, e.ctrlKey || e.metaKey);
+      const newTab = e.ctrlKey || e.metaKey;
+      // Results still belong to an earlier input (debounced search pending or in flight):
+      // search the current text now and open its top result instead of a stale row.
+      if (e.target.value !== this.resultsFor) {
+        this.pendingEnter = { newTab };
+        this.search();
+        return;
+      }
+      this.execute(this.highlightIdx, newTab);
     } else if (e.key === "Escape") {
       e.preventDefault();
       this.close();

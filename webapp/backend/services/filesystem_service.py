@@ -231,7 +231,7 @@ class FilesystemService:
                     "ftype": ftype,
                     "message": "Binary file cannot be displayed.",
                 }
-            if file_size > 10 * 1024 * 1024:
+            if file_size > 50 * 1024 * 1024:
                 return {
                     "is_binary": False,
                     "is_oversized": True,
@@ -239,7 +239,7 @@ class FilesystemService:
                     "version": vname,
                     "fid": fid,
                     "ftype": ftype,
-                    "message": f"File size ({file_size / (1024*1024):.2f} MB) exceeds maximum viewer display limit of 10 MB.",
+                    "message": f"File size ({file_size / (1024*1024):.2f} MB) exceeds maximum viewer display limit of 50 MB.",
                 }
 
             # Compact AST token maps: [line_s, char_s, line_e, char_e, ast_id, type_id], per blob (content
@@ -462,7 +462,7 @@ class FilesystemService:
                 continue
             data, is_dir, _ = git_reader.read_file(vname, cand)
             if data is not None and not is_dir:
-                if len(data) > 10 * 1024 * 1024:
+                if len(data) > 50 * 1024 * 1024:
                     raise HTTPException(status_code=413, detail="File too large to serve.")
                 return data, media_type
         raise HTTPException(status_code=404, detail=f"No image found for '{norm_path}' at '{vname}'.")

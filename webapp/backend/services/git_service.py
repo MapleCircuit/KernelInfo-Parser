@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import re
 import subprocess
+import time
 import urllib.parse
 from webapp.backend.config import get_repo_dir
 from functools import lru_cache
@@ -364,6 +365,7 @@ class GitService:
         # limit and the page's offset are bound straight into SQL LIMIT/OFFSET
         limit = max(1, min(int(limit), MAX_COMMIT_PAGE))
         off = max(0, min((max(1, int(page)) - 1) * limit, MAX_COMMIT_OFFSET))
+        now_ts = int(time.time())
         with get_db_cursor() as cursor:
             vid, vname = get_version_info(cursor, version_name)
             if vid is None:
@@ -372,42 +374,140 @@ class GitService:
             if network_id is None:
                 return {"version": vname, "page": page, "limit": limit, "offset": off, "total": 0, "commits": []}
 
-            sql = """
-                SELECT c.commit_id, c.commit_hash, c.author_date, c.subject,
-                       p.person_id AS author_id, p.name AS author_name, p.email AS author_email,
-                       (SELECT COUNT(*) FROM m_commit_file cf WHERE cf.commit_id = c.commit_id) AS files_count
-                FROM m_commit c
-                JOIN m_maintainer_person p ON c.author_id = p.person_id
-                WHERE c.commit_id > 0 AND c.network_id = %s
-            """
-            params: list[Any] = [network_id]
-            if query:
-                # commit_hash is BINARY(20): match hex prefixes against its HEX() rendering.
-                # Wildcards are escaped: an unescaped "%" makes all three LIKEs match every row.
-                clean_q = sanitize_like_query(query)
-                sql += " AND (c.subject LIKE %s OR HEX(c.commit_hash) LIKE %s OR p.name LIKE %s)"
-                params.extend([f"%{clean_q}%", f"{clean_q.upper()}%", f"%{clean_q}%"])
-            sql += " ORDER BY c.author_date DESC LIMIT %s OFFSET %s;"
-            params.extend([limit, off])
+            commits: list[dict[str, Any]] = []
+            q_clean = query.strip()
 
-            cursor.execute(sql, tuple(params))
-            commits = [
-                {
-                    "commit_id": r["commit_id"],
-                    "commit_hash": format_commit_hash(r["commit_hash"]),
-                    "author_date": r["author_date"],
-                    "subject": safe_decode(r["subject"]),
-                    "author": {
-                        "person_id": r["author_id"],
-                        "name": safe_decode(r["author_name"]),
-                        "email": safe_decode(r["author_email"]),
-                    },
-                    "author_name": safe_decode(r["author_name"]),
-                    "author_email": safe_decode(r["author_email"]),
-                    "files_count": int(r.get("files_count", 0)),
-                }
-                for r in cursor.fetchall()
-            ]
+            # Case 1: Query is a commit hash or prefix (4-40 hex characters) -> indexed binary lookup
+            if q_clean and _HEX_REF.fullmatch(q_clean.lower()):
+                lo, hi = commit_prefix_range(q_clean)
+                if hi:
+                    sql = """
+                        SELECT c.commit_id, c.commit_hash, c.author_date, c.subject,
+                               p.person_id AS author_id, p.name AS author_name, p.email AS author_email,
+                               (SELECT COUNT(*) FROM m_commit_file cf WHERE cf.commit_id = c.commit_id) AS files_count
+                        FROM m_commit c
+                        JOIN m_maintainer_person p ON c.author_id = p.person_id
+                        WHERE c.commit_id > 0 AND c.network_id = %s
+                          AND c.commit_hash >= %s AND c.commit_hash < %s
+                        ORDER BY c.commit_id DESC LIMIT %s OFFSET %s;
+                    """
+                    cursor.execute(sql, (network_id, lo, hi, limit, off))
+                else:
+                    sql = """
+                        SELECT c.commit_id, c.commit_hash, c.author_date, c.subject,
+                               p.person_id AS author_id, p.name AS author_name, p.email AS author_email,
+                               (SELECT COUNT(*) FROM m_commit_file cf WHERE cf.commit_id = c.commit_id) AS files_count
+                        FROM m_commit c
+                        JOIN m_maintainer_person p ON c.author_id = p.person_id
+                        WHERE c.commit_id > 0 AND c.network_id = %s AND c.commit_hash = %s
+                        ORDER BY c.commit_id DESC LIMIT %s OFFSET %s;
+                    """
+                    cursor.execute(sql, (network_id, lo, limit, off))
+
+                commits = [
+                    {
+                        "commit_id": r["commit_id"],
+                        "commit_hash": format_commit_hash(r["commit_hash"]),
+                        "author_date": r["author_date"],
+                        "subject": safe_decode(r["subject"]),
+                        "author": {
+                            "person_id": r["author_id"],
+                            "name": safe_decode(r["author_name"]),
+                            "email": safe_decode(r["author_email"]),
+                        },
+                        "author_name": safe_decode(r["author_name"]),
+                        "author_email": safe_decode(r["author_email"]),
+                        "files_count": int(r.get("files_count", 0)),
+                    }
+                    for r in cursor.fetchall()
+                ]
+
+                # If query is specified and we haven't reached the limit, search Git CLI for unparsed commits
+                if len(commits) < limit:
+                    known_hashes = {c["commit_hash"] for c in commits}
+                    try:
+                        out, _, rc = self.run_git(["rev-parse", "--verify", "--quiet", f"{q_clean}^{{commit}}"], timeout=5)
+                        if rc == 0 and out.strip():
+                            full_sha = out.strip()
+                            if full_sha not in known_hashes:
+                                g_out, _, g_rc = self.run_git(["log", "-1", "--format=%H%x00%an%x00%ae%x00%at%x00%s", full_sha], timeout=5)
+                                if g_rc == 0 and g_out.strip():
+                                    parts = g_out.strip().split("\x00")
+                                    if len(parts) >= 5:
+                                        adate = int(parts[3]) if parts[3].isdigit() else 0
+                                        commits.append({
+                                            "commit_id": parts[0],
+                                            "commit_hash": parts[0],
+                                            "author_date": adate,
+                                            "subject": parts[4],
+                                            "author": {"person_id": 0, "name": parts[1], "email": parts[2]},
+                                            "author_name": parts[1],
+                                            "author_email": parts[2],
+                                            "files_count": 0,
+                                        })
+                    except Exception as exc:
+                        logger.debug("Git search fallback for hash %s failed: %s", q_clean, exc)
+
+            elif q_clean:
+                # Case 2: Text search by commit subject or author name
+                clean_q = sanitize_like_query(q_clean)
+                sql = """
+                    SELECT c.commit_id, c.commit_hash, c.author_date, c.subject,
+                           p.person_id AS author_id, p.name AS author_name, p.email AS author_email,
+                           (SELECT COUNT(*) FROM m_commit_file cf WHERE cf.commit_id = c.commit_id) AS files_count
+                    FROM m_commit c
+                    JOIN m_maintainer_person p ON c.author_id = p.person_id
+                    WHERE c.commit_id > 0 AND c.network_id = %s
+                      AND (c.subject LIKE %s OR p.name LIKE %s)
+                    ORDER BY c.commit_id DESC LIMIT %s OFFSET %s;
+                """
+                cursor.execute(sql, (network_id, f"%{clean_q}%", f"%{clean_q}%", limit, off))
+                commits = [
+                    {
+                        "commit_id": r["commit_id"],
+                        "commit_hash": format_commit_hash(r["commit_hash"]),
+                        "author_date": r["author_date"],
+                        "subject": safe_decode(r["subject"]),
+                        "author": {
+                            "person_id": r["author_id"],
+                            "name": safe_decode(r["author_name"]),
+                            "email": safe_decode(r["author_email"]),
+                        },
+                        "author_name": safe_decode(r["author_name"]),
+                        "author_email": safe_decode(r["author_email"]),
+                        "files_count": int(r.get("files_count", 0)),
+                    }
+                    for r in cursor.fetchall()
+                ]
+            else:
+                # Case 3: Empty query -> latest indexed commits (primary key walk, excluding future commits)
+                sql = """
+                    SELECT c.commit_id, c.commit_hash, c.author_date, c.subject,
+                           p.person_id AS author_id, p.name AS author_name, p.email AS author_email,
+                           (SELECT COUNT(*) FROM m_commit_file cf WHERE cf.commit_id = c.commit_id) AS files_count
+                    FROM m_commit c
+                    JOIN m_maintainer_person p ON c.author_id = p.person_id
+                    WHERE c.commit_id > 0 AND c.network_id = %s AND c.author_date <= %s
+                    ORDER BY c.commit_id DESC LIMIT %s OFFSET %s;
+                """
+                cursor.execute(sql, (network_id, now_ts, limit, off))
+                commits = [
+                    {
+                        "commit_id": r["commit_id"],
+                        "commit_hash": format_commit_hash(r["commit_hash"]),
+                        "author_date": r["author_date"],
+                        "subject": safe_decode(r["subject"]),
+                        "author": {
+                            "person_id": r["author_id"],
+                            "name": safe_decode(r["author_name"]),
+                            "email": safe_decode(r["author_email"]),
+                        },
+                        "author_name": safe_decode(r["author_name"]),
+                        "author_email": safe_decode(r["author_email"]),
+                        "files_count": int(r.get("files_count", 0)),
+                    }
+                    for r in cursor.fetchall()
+                ]
 
             return {
                 "version": vname,
@@ -445,6 +545,8 @@ class GitService:
                         raise HTTPException(status_code=400, detail=f"Commit prefix '{cid_str}' is ambiguous; give more digits.")
                     c_row = rows[0] if rows else None
             if not c_row:
+                if not str(commit_id).isdigit():
+                    return self._get_git_commit_detail(str(commit_id).strip())
                 raise HTTPException(status_code=404, detail=f"Commit '{commit_id}' not found.")
 
             cid = c_row["commit_id"]
@@ -611,6 +713,92 @@ class GitService:
         # `git log -p` suppresses merge diffs, so the parser stages no m_commit_file rows for a
         # merge: its first-parent delta is resolved from Git on demand, which keeps "Modified
         # Files" in agreement with the "Show changes" panel (which diffs against the first parent).
+        self._fill_missing_commit_files(detail, parents)
+        return detail
+
+    def _get_git_commit_detail(self, commit_ref: str) -> dict[str, Any]:
+        """Fallback to inspect an unparsed commit directly from Git repository."""
+        ref = commit_ref.strip()
+        if not is_safe_rev(ref) and not _HEX_REF.fullmatch(ref.lower()):
+            raise HTTPException(status_code=400, detail="Invalid commit reference.")
+        try:
+            out, _, rc = self.run_git(["rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}"], timeout=10)
+            if rc != 0 or not out.strip():
+                raise HTTPException(status_code=404, detail=f"Commit '{commit_ref}' not found.")
+            sha = out.strip()
+            out, _, _ = self.run_git(["rev-list", "--parents", "-n1", sha], timeout=10)
+            parents = out.split()[1:]
+
+            # %an (author name) \x00 %ae (author email) \x00 %at (author timestamp) \x00 %s (subject) \x00 %B (body)
+            out, _, rc = self.run_git(["log", "-1", "--format=%an%x00%ae%x00%at%x00%s%x00%B", sha], timeout=10)
+            if rc != 0:
+                raise HTTPException(status_code=404, detail=f"Commit '{commit_ref}' not found.")
+            parts = out.split("\x00", 4)
+            if len(parts) < 5:
+                raise HTTPException(status_code=500, detail="Failed to parse commit details from Git.")
+            author_name, author_email, author_date_str, subj, message = parts
+            author_date = int(author_date_str) if author_date_str.strip().isdigit() else 0
+        except HTTPException:
+            raise
+        except Exception as exc:
+            logger.warning("Git inspection for commit %s failed: %s", ref, exc)
+            raise HTTPException(status_code=500, detail="Failed to inspect commit in Git.") from exc
+
+        # Parse contributor trailers from commit message
+        trailers = []
+        contributors = []
+        seen_contribs = set()
+        TRAILER_ROLES = {
+            "signed-off-by": (4, "Signed-off-by"),
+            "reviewed-by": (5, "Reviewed-by"),
+            "acked-by": (6, "Acked-by"),
+            "tested-by": (7, "Tested-by"),
+            "reported-by": (8, "Reported-by"),
+            "suggested-by": (9, "Suggested-by"),
+            "co-developed-by": (3, "Co-developed-by"),
+        }
+        for line in message.splitlines():
+            line = line.strip()
+            if ":" not in line:
+                continue
+            key, val = line.split(":", 1)
+            key_clean = key.strip().lower()
+            val_clean = val.strip()
+            if key_clean in TRAILER_ROLES and "<" in val_clean and ">" in val_clean:
+                role_type, role_name = TRAILER_ROLES[key_clean]
+                trailers.append({"role_type": role_type, "role_name": role_name, "raw_val": val_clean})
+                c_name = val_clean.split("<")[0].strip()
+                c_email = val_clean.split("<")[1].split(">")[0].strip()
+                c_key = (c_name.lower(), c_email.lower())
+                if c_key not in seen_contribs:
+                    seen_contribs.add(c_key)
+                    contributors.append({
+                        "person_id": 0,
+                        "name": c_name,
+                        "email": c_email,
+                        "role_type": role_type,
+                        "role_name": role_name,
+                        "roles": [role_name],
+                    })
+
+        detail = {
+            "commit_id": sha,
+            "commit_hash": sha,
+            "subject": subj,
+            "message": message,
+            "author": {"person_id": 0, "name": author_name, "email": author_email},
+            "author_name": author_name,
+            "author_email": author_email,
+            "author_date": author_date,
+            "files": [],
+            "files_source": "none",
+            "files_truncated": False,
+            "is_merge": len(parents) > 1,
+            "trailers": trailers,
+            "contributors": contributors,
+            "lore_url": f"{LORE_BASE_URL}?q={urllib.parse.quote_plus(subj or '')}",
+            "linked_emails": [],
+        }
         self._fill_missing_commit_files(detail, parents)
         return detail
 
@@ -831,6 +1019,8 @@ class GitService:
             except Exception:
                 return ""
 
+        now_ts = int(time.time())
+
         with get_db_cursor() as cursor:
             vid, vname = get_version_info(cursor, version_name)
             if vid is None:
@@ -846,26 +1036,68 @@ class GitService:
                     """
                     SELECT c.commit_id
                     FROM m_commit c
-                    JOIN m_maintainer_person p ON c.author_id = p.person_id
-                    WHERE c.commit_id = %s AND c.network_id = %s
+                    WHERE c.commit_id = %s AND c.network_id = %s AND c.author_date <= %s
                     LIMIT 1;
                     """,
-                    (vid, network_id),
+                    (vid, network_id, now_ts),
                 )
                 anchor_row = cursor.fetchone()
 
             if not anchor_row:
-                # Find closest commit or latest tag commit
+                # Check if version_name resolves directly in Git as an unparsed commit or branch
+                if is_safe_rev(version_name) or _HEX_REF.fullmatch(version_name.lower()):
+                    try:
+                        out, _, rc = self.run_git(["rev-parse", "--verify", "--quiet", f"{version_name}^{{commit}}"], timeout=5)
+                        if rc == 0 and out.strip():
+                            git_sha = out.strip()
+                            g_out, _, g_rc = self.run_git(
+                                ["log", f"-n{limit}", "--format=%H%x00%an%x00%ae%x00%at%x00%s", git_sha],
+                                timeout=10,
+                            )
+                            if g_rc == 0 and g_out.strip():
+                                git_commits = []
+                                for line in g_out.strip().splitlines():
+                                    parts = line.split("\x00")
+                                    if len(parts) >= 5:
+                                        adate = int(parts[3]) if parts[3].isdigit() else 0
+                                        if adate > now_ts:
+                                            continue
+                                        name = parts[1] or "Unknown"
+                                        email = parts[2] or ""
+                                        git_commits.append({
+                                            "commit_id": parts[0],
+                                            "commit_hash": parts[0],
+                                            "author_date": adate,
+                                            "author_date_iso": _format_date(adate),
+                                            "subject": parts[4],
+                                            "author": {"person_id": 0, "name": name, "email": email},
+                                            "author_name": name,
+                                            "author_email": email,
+                                            "files_count": 0,
+                                        })
+                                if git_commits:
+                                    return {
+                                        "version": version_name,
+                                        "direction": (direction or "past").lower().strip(),
+                                        "has_past": len(git_commits) >= limit,
+                                        "has_future": False,
+                                        "next_past_cursor": None,
+                                        "next_future_cursor": None,
+                                        "timeline": git_commits,
+                                    }
+                    except Exception as e:
+                        logger.debug("Failed to resolve unparsed git timeline for %s: %s", version_name, e)
+
+                # Find closest commit or latest tag commit (strictly not beyond current date)
                 cursor.execute(
                     """
                     SELECT c.commit_id
                     FROM m_commit c
-                    JOIN m_maintainer_person p ON c.author_id = p.person_id
-                    WHERE c.commit_id > 0 AND c.network_id = %s
+                    WHERE c.commit_id > 0 AND c.network_id = %s AND c.author_date <= %s
                     ORDER BY c.commit_id DESC
                     LIMIT 1;
                     """,
-                    (network_id,),
+                    (network_id, now_ts),
                 )
                 anchor_row = cursor.fetchone()
 
@@ -890,11 +1122,11 @@ class GitService:
                            (SELECT COUNT(*) FROM m_commit_file cf WHERE cf.commit_id = c.commit_id) AS files_count
                     FROM m_commit c
                     JOIN m_maintainer_person p ON c.author_id = p.person_id
-                    WHERE c.commit_id >= %s AND c.network_id = %s
+                    WHERE c.commit_id >= %s AND c.network_id = %s AND c.author_date <= %s
                     ORDER BY c.commit_id ASC
                     LIMIT %s;
                     """,
-                    (start_id, network_id, limit),
+                    (start_id, network_id, now_ts, limit),
                 )
                 raw_rows = cursor.fetchall()
             elif dir_mode == "around":
@@ -907,11 +1139,11 @@ class GitService:
                            (SELECT COUNT(*) FROM m_commit_file cf WHERE cf.commit_id = c.commit_id) AS files_count
                     FROM m_commit c
                     JOIN m_maintainer_person p ON c.author_id = p.person_id
-                    WHERE c.commit_id > %s AND c.network_id = %s
+                    WHERE c.commit_id > %s AND c.network_id = %s AND c.author_date <= %s
                     ORDER BY c.commit_id ASC
                     LIMIT %s;
                     """,
-                    (anchor_id, network_id, future_limit),
+                    (anchor_id, network_id, now_ts, future_limit),
                 )
                 future_rows = list(reversed(cursor.fetchall()))
                 cursor.execute(
@@ -921,11 +1153,11 @@ class GitService:
                            (SELECT COUNT(*) FROM m_commit_file cf WHERE cf.commit_id = c.commit_id) AS files_count
                     FROM m_commit c
                     JOIN m_maintainer_person p ON c.author_id = p.person_id
-                    WHERE c.commit_id <= %s AND c.network_id = %s
+                    WHERE c.commit_id <= %s AND c.network_id = %s AND c.author_date <= %s
                     ORDER BY c.commit_id DESC
                     LIMIT %s;
                     """,
-                    (anchor_id, network_id, past_limit),
+                    (anchor_id, network_id, now_ts, past_limit),
                 )
                 past_rows = cursor.fetchall()
                 raw_rows = future_rows + past_rows
@@ -938,11 +1170,11 @@ class GitService:
                            (SELECT COUNT(*) FROM m_commit_file cf WHERE cf.commit_id = c.commit_id) AS files_count
                     FROM m_commit c
                     JOIN m_maintainer_person p ON c.author_id = p.person_id
-                    WHERE c.commit_id <= %s AND c.network_id = %s
+                    WHERE c.commit_id <= %s AND c.network_id = %s AND c.author_date <= %s
                     ORDER BY c.commit_id DESC
                     LIMIT %s;
                     """,
-                    (start_id, network_id, limit),
+                    (start_id, network_id, now_ts, limit),
                 )
                 raw_rows = cursor.fetchall()
 
@@ -971,7 +1203,7 @@ class GitService:
 
             cursor.execute("SELECT 1 FROM m_commit WHERE commit_id < %s AND commit_id > 0 AND network_id = %s LIMIT 1;", (min_id, network_id))
             has_past = cursor.fetchone() is not None
-            cursor.execute("SELECT 1 FROM m_commit WHERE commit_id > %s AND network_id = %s LIMIT 1;", (max_id, network_id))
+            cursor.execute("SELECT 1 FROM m_commit WHERE commit_id > %s AND network_id = %s AND author_date <= %s LIMIT 1;", (max_id, network_id, now_ts))
             has_future = cursor.fetchone() is not None
 
             return {

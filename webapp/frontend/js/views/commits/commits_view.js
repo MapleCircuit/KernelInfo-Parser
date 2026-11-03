@@ -523,19 +523,22 @@ export class CommitsView {
   /** "+"/context lines open the file at the commit; "-" lines open it at the parent with the removed lines marked. */
   openChange(diff, file, side, line, forceNew) {
     const removedSide = side === "-" || file.status === "D";
-    const version = removedSide ? diff.parent_hash : diff.commit_hash;
+    const commitTarget = diff?.commit_hash || this.selectedCommitId || this.currentVersion;
+    const version = removedSide ? (diff?.parent_hash || `${commitTarget}~1`) : commitTarget;
     if (!version) {
       toast.info("This line has no previous version (root commit).");
       return;
     }
-    const path = removedSide ? file.old_path : file.path;
+    const path = removedSide ? (file.old_path || file.path) : file.path;
+    state.syncVersionFromTab(version);
+    state.setSelectedVersion(version);
     state.openTab({
       type: "code",
       title: path.split("/").pop(),
       path,
       version,
       cursorLine: Math.max(1, line || 1),
-      diffMarks: { kind: removedSide ? "del" : "add", commit: diff.commit_hash, ranges: changedRanges(file, removedSide ? "-" : "+") },
+      diffMarks: { kind: removedSide ? "del" : "add", commit: commitTarget, ranges: changedRanges(file, removedSide ? "-" : "+") },
       forceNew: Boolean(forceNew),
     });
   }
@@ -685,6 +688,7 @@ export class CommitsView {
         exploreCommitBtn.onclick = () => {
           // The commit becomes the header selection (Apply / New Tab act on it) and opens in a
           // repository explorer of its own; no other tab's revision changes
+          state.syncVersionFromTab(c.commit_hash);
           state.setSelectedVersion(c.commit_hash);
           state.openTab({
             type: "explorer",
@@ -712,6 +716,8 @@ export class CommitsView {
       detailEl.querySelectorAll(".commit-file-link").forEach((link) => {
         const fileVer = link.dataset.status === "D" ? `${c.commit_hash}~1` : (c.commit_hash || this.currentVersion);
         link.onclick = () => {
+          state.syncVersionFromTab(fileVer);
+          state.setSelectedVersion(fileVer);
           state.openTab({
             type: "code",
             title: link.dataset.path.split("/").pop(),
@@ -723,6 +729,8 @@ export class CommitsView {
           if (e.button === 1) {
             e.preventDefault();
             e.stopPropagation();
+            state.syncVersionFromTab(fileVer);
+            state.setSelectedVersion(fileVer);
             state.openTab({
               type: "code",
               title: link.dataset.path.split("/").pop(),

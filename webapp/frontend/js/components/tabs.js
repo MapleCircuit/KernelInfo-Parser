@@ -71,6 +71,19 @@ export class TabsComponent {
   }
 
   render() {
+    const paneScrolls = new Map();
+    this.container.querySelectorAll(".pane").forEach((pEl) => {
+      const pid = pEl.dataset.paneId;
+      const ts = pEl.querySelector(".tabstrip");
+      const tl = pEl.querySelector(".tab-list");
+      if (pid) {
+        paneScrolls.set(pid, {
+          tabstrip: ts ? ts.scrollLeft : 0,
+          tabList: tl ? tl.scrollLeft : 0
+        });
+      }
+    });
+
     this.container.innerHTML = "";
     this.container.className = `split-container split-${state.splitMode}`;
 
@@ -144,6 +157,11 @@ export class TabsComponent {
         tabEl.appendChild(closeBtn);
 
         tabEl.addEventListener("click", () => {
+          this.paneScrolls = this.paneScrolls || new Map();
+          this.paneScrolls.set(pane.id, {
+            tabstrip: tabstrip.scrollLeft,
+            tabList: tabList.scrollLeft
+          });
           pane.activeTabId = tab.id;
           state.setActivePane(pane.id);
           if (tab.version && tab.version !== state.currentVersion) {
@@ -191,6 +209,28 @@ export class TabsComponent {
       actions.appendChild(splitHBtn);
       actions.appendChild(splitVBtn);
       tabstrip.appendChild(actions);
+
+      // Restore horizontal scroll position on the tabstrip
+      const savedScroll = paneScrolls.get(pane.id) || this.paneScrolls?.get(pane.id);
+      if (savedScroll) {
+        if (savedScroll.tabstrip) tabstrip.scrollLeft = savedScroll.tabstrip;
+        if (savedScroll.tabList) tabList.scrollLeft = savedScroll.tabList;
+        requestAnimationFrame(() => {
+          if (savedScroll.tabstrip) tabstrip.scrollLeft = savedScroll.tabstrip;
+          if (savedScroll.tabList) tabList.scrollLeft = savedScroll.tabList;
+        });
+      }
+      this.paneScrolls = this.paneScrolls || new Map();
+      tabstrip.addEventListener("scroll", () => {
+        const cur = this.paneScrolls.get(pane.id) || {};
+        cur.tabstrip = tabstrip.scrollLeft;
+        this.paneScrolls.set(pane.id, cur);
+      }, { passive: true });
+      tabList.addEventListener("scroll", () => {
+        const cur = this.paneScrolls.get(pane.id) || {};
+        cur.tabList = tabList.scrollLeft;
+        this.paneScrolls.set(pane.id, cur);
+      }, { passive: true });
 
       paneEl.appendChild(tabstrip);
 

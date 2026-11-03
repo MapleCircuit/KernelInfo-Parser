@@ -28,7 +28,7 @@
 }
 
 .pahole-title {
-  font-size: 18px;
+  font-size: var(--fs-18, 18px);
   font-weight: 600;
   color: var(--accent-cyan);
   font-family: var(--font-mono);
@@ -38,7 +38,7 @@
   width: 100%;
   border-collapse: collapse;
   font-family: var(--font-mono);
-  font-size: 12px;
+  font-size: var(--fs-12, 12px);
   background: var(--bg-secondary);
   border: 1px solid var(--border-color);
   border-radius: var(--radius-md);
@@ -54,7 +54,7 @@
 .pahole-table th {
   background: var(--bg-tertiary);
   color: var(--text-muted);
-  font-size: 11px;
+  font-size: var(--fs-11, 11px);
   font-weight: 600;
   text-transform: uppercase;
 }
@@ -70,7 +70,7 @@
 }
 
 .padding-hole-badge {
-  font-size: 10px;
+  font-size: var(--fs-10, 10px);
   padding: 2px 6px;
   border-radius: 3px;
   background: rgba(248, 81, 73, 0.2);
@@ -94,7 +94,7 @@
   background: var(--bg-tertiary);
   border-bottom: 1px solid var(--border-color);
   font-weight: 600;
-  font-size: 12px;
+  font-size: var(--fs-12, 12px);
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -114,7 +114,7 @@
   border-radius: var(--radius-sm);
   cursor: pointer;
   font-family: var(--font-mono);
-  font-size: 12px;
+  font-size: var(--fs-12, 12px);
   transition: background var(--transition-fast);
 }
 
@@ -124,7 +124,7 @@
 }
 
 .callgraph-node-file {
-  font-size: 10px;
+  font-size: var(--fs-10, 10px);
   color: var(--text-muted);
 }
 
@@ -144,13 +144,13 @@
 }
 
 .compare-title {
-  font-size: 18px;
+  font-size: var(--fs-18, 18px);
   font-weight: 600;
   color: var(--accent-orange);
 }
 
 .compare-subtitle {
-  font-size: 12px;
+  font-size: var(--fs-12, 12px);
   color: var(--text-muted);
   margin-top: 4px;
 }
@@ -178,7 +178,7 @@
 }
 
 .compare-ref-role {
-  font-size: 10px;
+  font-size: var(--fs-10, 10px);
   font-weight: 600;
   text-transform: uppercase;
   color: var(--text-muted);
@@ -186,7 +186,7 @@
 
 .compare-ref-value {
   font-family: var(--font-mono);
-  font-size: 12px;
+  font-size: var(--fs-12, 12px);
   font-weight: 600;
   color: var(--accent-blue);
 }
@@ -215,7 +215,7 @@
   align-items: center;
   flex-wrap: wrap;
   gap: 6px;
-  font-size: 12px;
+  font-size: var(--fs-12, 12px);
 }
 
 .compare-chip {
@@ -275,7 +275,7 @@
   padding: 5px 10px;
   border-radius: var(--radius-sm);
   text-align: left;
-  font-size: 12px;
+  font-size: var(--fs-12, 12px);
   color: var(--text-secondary);
   background: transparent;
 }
@@ -292,7 +292,7 @@
 
 .compare-chip-sub {
   color: var(--text-muted);
-  font-size: 11px;
+  font-size: var(--fs-11, 11px);
 }
 
 .compare-filter {
@@ -301,7 +301,7 @@
   padding: 4px 8px;
   border: 1px solid var(--border-color);
   border-radius: var(--radius-sm);
-  font-size: 12px;
+  font-size: var(--fs-12, 12px);
   outline: none;
 }
 
@@ -316,7 +316,7 @@
   border-radius: var(--radius-md);
   background: rgba(210, 153, 34, 0.08);
   color: var(--accent-yellow);
-  font-size: 12px;
+  font-size: var(--fs-12, 12px);
 }
 
 .compare-rename-search {
@@ -329,7 +329,7 @@
   border-left: 3px solid var(--accent-purple);
   border-radius: var(--radius-md);
   background: var(--bg-secondary);
-  font-size: 12px;
+  font-size: var(--fs-12, 12px);
 }
 
 .compare-rename-note {
@@ -354,7 +354,7 @@
   padding: 3px 6px;
   border: 1px solid var(--border-color);
   border-radius: var(--radius-sm);
-  font-size: 12px;
+  font-size: var(--fs-12, 12px);
   font-family: var(--font-mono);
   outline: none;
 }
@@ -401,7 +401,7 @@
   display: flex;
   flex-direction: column;
   font-family: var(--font-mono);
-  font-size: 12px;
+  font-size: var(--fs-12, 12px);
 }
 
 .compare-row {
@@ -453,14 +453,14 @@
 
 .compare-row-sim {
   flex-shrink: 0;
-  font-size: 11px;
+  font-size: var(--fs-11, 11px);
   font-family: var(--font-mono);
   color: var(--accent-purple);
 }
 
 .compare-row-syms {
   flex-shrink: 0;
-  font-size: 11px;
+  font-size: var(--fs-11, 11px);
   color: var(--text-muted);
 }
 
@@ -501,7 +501,7 @@
   border: 1px solid var(--border-color);
   border-radius: var(--radius-sm);
   color: var(--text-secondary);
-  font-size: 12px;
+  font-size: var(--fs-12, 12px);
 }
 
 .compare-more:hover {
@@ -513,7 +513,7 @@
   padding: 16px;
   color: var(--text-muted);
   font-family: var(--font-sans);
-  font-size: 12px;
+  font-size: var(--fs-12, 12px);
 }
 
 .compare-empty.error {
@@ -529,7 +529,7 @@
   background: var(--bg-primary);
   border: 1px solid var(--border-color);
   border-radius: var(--radius-sm);
-  font-size: 11px;
+  font-size: var(--fs-11, 11px);
 }
 
 .compare-sym-side-title {
@@ -581,7 +581,7 @@
   padding: 6px 12px;
   background: var(--bg-secondary);
   border-bottom: 1px solid var(--border-color);
-  font-size: 12px;
+  font-size: var(--fs-12, 12px);
 }
 
 .treemap-crumbs a {
@@ -640,7 +640,7 @@
 
 .treemap-label {
   padding: 2px 5px;
-  font-size: 11px;
+  font-size: var(--fs-11, 11px);
   font-weight: 600;
   color: var(--text-primary);
   white-space: nowrap;
@@ -654,7 +654,7 @@
   box-sizing: border-box;
   border: 1px solid rgba(13, 17, 23, 0.55);
   background: rgba(255, 255, 255, 0.04);
-  font-size: 10px;
+  font-size: var(--fs-10, 10px);
   color: var(--text-secondary);
   overflow: hidden;
 }
@@ -681,7 +681,7 @@
   border: 1px solid var(--border-color);
   border-radius: var(--radius-md);
   box-shadow: var(--shadow-md);
-  font-size: 11px;
+  font-size: var(--fs-11, 11px);
   pointer-events: none;
 }
 

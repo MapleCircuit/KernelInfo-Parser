@@ -14,6 +14,8 @@ const HEARTBEAT_TIMEOUT_MS = 5000;
 // (branch reachability walks the whole history of a branch).
 const REQUEST_TIMEOUT_MS = 10000;
 const BRANCH_TAGS_TIMEOUT_MS = 180000;
+// Commits: timeline seek, multi-page searches, and Git diff/fallback on large repositories
+const COMMITS_TIMEOUT_MS = 45000;
 // Compare: the revision diff runs Git's rename detection, the rename search compares every candidate pair
 const VERSIONS_DIFF_TIMEOUT_MS = 45000;
 const RENAME_SEARCH_TIMEOUT_MS = 120000;
@@ -359,7 +361,7 @@ class ApiClient {
       params.set("line_s", lineS);
       params.set("line_e", lineE);
     }
-    return this.request(`/api/history/commits?${params.toString()}`, {}, "files", `histcommits_${params.toString()}`);
+    return this.request(`/api/history/commits?${params.toString()}`, { timeoutMs: COMMITS_TIMEOUT_MS }, "files", `histcommits_${params.toString()}`);
   }
 
   async searchKconfig(version, query, limit = 25, arch = "x86_64") {
@@ -591,37 +593,37 @@ class ApiClient {
     const q = new URLSearchParams({ page, limit, q: query }).toString();
     const cacheStore = (!query && page === 1) ? "commits" : null;
     const cacheKey = (!query && page === 1) ? `commits_${this._vk(ver)}_p1` : null;
-    return this.request(`/api/commits/${encodeURIComponent(ver)}/list?${q}`, {}, cacheStore, cacheKey);
+    return this.request(`/api/commits/${encodeURIComponent(ver)}/list?${q}`, { timeoutMs: COMMITS_TIMEOUT_MS }, cacheStore, cacheKey);
   }
 
   async getCommitDetail(version, commitIdOrHash) {
     const ver = this._sanitizeVer(version);
     // High fetch priority: the commit on screen goes ahead of the list/search requested beside it
-    return this.request(`/api/commits/${encodeURIComponent(ver)}/detail/${encodeURIComponent(commitIdOrHash)}`, { priority: "high" }, "commits", `commit_${this._vk(ver)}_${commitIdOrHash}`);
+    return this.request(`/api/commits/${encodeURIComponent(ver)}/detail/${encodeURIComponent(commitIdOrHash)}`, { priority: "high", timeoutMs: COMMITS_TIMEOUT_MS }, "commits", `commit_${this._vk(ver)}_${commitIdOrHash}`);
   }
 
   async getCommitDiff(version, commitHash, context = 3) {
     const ver = this._sanitizeVer(version);
-    return this.request(`/api/commits/${encodeURIComponent(ver)}/diff/${encodeURIComponent(commitHash)}?context=${context}`, {}, "commits", `cdiff_${commitHash}_${context}`);
+    return this.request(`/api/commits/${encodeURIComponent(ver)}/diff/${encodeURIComponent(commitHash)}?context=${context}`, { timeoutMs: COMMITS_TIMEOUT_MS }, "commits", `cdiff_${commitHash}_${context}`);
   }
 
   async getCommitTimeline(version, limit = 100, direction = "past", cursorId = null) {
     const ver = this._sanitizeVer(version);
     const params = new URLSearchParams({ limit, direction });
     if (cursorId !== null && cursorId !== undefined) params.set("cursor_id", cursorId);
-    return this.request(`/api/commits/${encodeURIComponent(ver)}/timeline?${params.toString()}`);
+    return this.request(`/api/commits/${encodeURIComponent(ver)}/timeline?${params.toString()}`, { timeoutMs: COMMITS_TIMEOUT_MS });
   }
 
   async searchCommits(version, query, limit = 25) {
     const ver = this._sanitizeVer(version);
     const q = new URLSearchParams({ q: query, limit }).toString();
-    return this.request(`/api/commits/${encodeURIComponent(ver)}/search?${q}`);
+    return this.request(`/api/commits/${encodeURIComponent(ver)}/search?${q}`, { timeoutMs: COMMITS_TIMEOUT_MS });
   }
 
   async getFileHistory(version, filePath, limit = 50) {
     const ver = this._sanitizeVer(version);
     const cleanPath = filePath.replace(/^\/+/, "");
-    return this.request(`/api/commits/${encodeURIComponent(ver)}/history/${encodeURIComponent(cleanPath)}?limit=${limit}`);
+    return this.request(`/api/commits/${encodeURIComponent(ver)}/history/${encodeURIComponent(cleanPath)}?limit=${limit}`, { timeoutMs: COMMITS_TIMEOUT_MS });
   }
 
   async formatPatch(version, payload) {
@@ -756,6 +758,7 @@ class ApiClient {
     const cid = encodeURIComponent(String(commitIdOrHash).trim());
     return this.request(`/api/commits/${encodeURIComponent(ver)}/resolve_mail/${cid}`, {
       method: "POST",
+      timeoutMs: COMMITS_TIMEOUT_MS,
     });
   }
 }

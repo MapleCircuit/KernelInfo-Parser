@@ -58,6 +58,9 @@ class KernelIdeApp {
   async init() {
     console.info("Initializing KernelInfo Developer IDE...");
 
+    // 0. Apply persistent font scaling and typography preferences
+    applyTypographySettings();
+
     // 1. Register Service Worker for offline PWA
     this.registerServiceWorker();
 
@@ -381,8 +384,8 @@ class KernelIdeApp {
     const tabsCount = Array.isArray(state.tabs)
       ? state.tabs.length
       : Array.isArray(state.openTabs)
-      ? state.openTabs.length
-      : (state.panes?.reduce((sum, p) => sum + (p.tabs?.length || 0), 0) || 0);
+        ? state.openTabs.length
+        : (state.panes?.reduce((sum, p) => sum + (p.tabs?.length || 0), 0) || 0);
     // Same three states as the header badge: link down, backend not answering, or connected.
     const isOnline = api.isConnected;
     const linkDown = !api.isOnline;
@@ -395,6 +398,9 @@ class KernelIdeApp {
     const shortHash = cachedHash.length > 12 ? cachedHash.substring(0, 12) : cachedHash;
     const storageEst = await localDB.getStorageEstimate();
     const usedMB = storageEst?.usage ? (storageEst.usage / (1024 * 1024)).toFixed(1) : null;
+
+    const curCodeFontSize = parseInt(localStorage.getItem("kip-code-font-size") || "12", 10);
+    const curUiFontScale = parseInt(localStorage.getItem("kip-ui-font-scale") || "100", 10);
 
     popover.innerHTML = `
       <div class="settings-popover-header">
@@ -433,7 +439,43 @@ class KernelIdeApp {
           </div>
         </div>
 
-        <!-- 2. Local Storage Breakdown -->
+        <!-- 2. Typography & Font Sizes -->
+        <div>
+          <div class="settings-section-title">Typography &amp; Font Sizes</div>
+          <div style="display:flex;flex-direction:column;gap:10px;background:var(--bg-primary);padding:10px 12px;border-radius:var(--radius-md);border:1px solid var(--border-color);">
+            <!-- Code View Font Size -->
+            <div>
+              <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;">
+                <label for="setting-code-font-slider" style="font-size:11px;font-weight:600;color:var(--text-secondary);">Code View Font Size</label>
+                <span id="setting-code-font-val" style="font-size:11px;font-family:var(--font-mono);color:var(--accent-blue);font-weight:600;">${curCodeFontSize}px</span>
+              </div>
+              <input type="range" id="setting-code-font-slider" min="10" max="26" step="1" value="${curCodeFontSize}" style="width:100%;cursor:pointer;" />
+              <div style="display:flex;justify-content:space-between;font-size:9px;color:var(--text-muted);margin-top:2px;">
+                <span>10px</span>
+                <span>Default: 12px</span>
+                <span>26px</span>
+              </div>
+            </div>
+
+            <!-- UI Text Relative Scale -->
+            <div>
+              <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;">
+                <label for="setting-ui-font-slider" style="font-size:11px;font-weight:600;color:var(--text-secondary);">UI Text Scale</label>
+                <span id="setting-ui-font-val" style="font-size:11px;font-family:var(--font-mono);color:var(--accent-blue);font-weight:600;">${curUiFontScale}%</span>
+              </div>
+              <input type="range" id="setting-ui-font-slider" min="80" max="160" step="5" value="${curUiFontScale}" style="width:100%;cursor:pointer;" />
+              <div style="display:flex;justify-content:space-between;font-size:9px;color:var(--text-muted);margin-top:2px;">
+                <span>80%</span>
+                <span>Default: 100%</span>
+                <span>160%</span>
+              </div>
+            </div>
+
+            <button class="settings-reset-font-btn" id="btn-reset-fonts" style="align-self:flex-start;padding:3px 8px;font-size:10px;cursor:pointer;border:1px solid var(--border-color);background:var(--bg-tertiary);color:var(--text-secondary);border-radius:var(--radius-sm);transition:var(--transition-fast);">Reset to Defaults</button>
+          </div>
+        </div>
+
+        <!-- 3. Local Storage Breakdown -->
         <div>
           <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;">
             <span class="settings-section-title" style="margin-bottom:0;">Cached Data Stores</span>
@@ -520,9 +562,44 @@ class KernelIdeApp {
 
     popover.querySelector("#btn-check-updates").onclick = (e) => this.checkForUpdates(e.currentTarget);
 
-    popover.querySelectorAll(".settings-chip-btn").forEach((chip) => {
+    const codeSlider = popover.querySelector("#setting-code-font-slider");
+    const codeVal = popover.querySelector("#setting-code-font-val");
+    if (codeSlider) {
+      codeSlider.oninput = (e) => {
+        const val = parseInt(e.target.value, 10);
+        if (codeVal) codeVal.textContent = `${val}px`;
+        applyTypographySettings(val, null);
+      };
+    }
+
+    const uiSlider = popover.querySelector("#setting-ui-font-slider");
+    const uiVal = popover.querySelector("#setting-ui-font-val");
+    if (uiSlider) {
+      uiSlider.oninput = (e) => {
+        const val = parseInt(e.target.value, 10);
+        if (uiVal) uiVal.textContent = `${val}%`;
+        applyTypographySettings(null, val);
+      };
+    }
+
+    const resetFontsBtn = popover.querySelector("#btn-reset-fonts");
+    if (resetFontsBtn) {
+      resetFontsBtn.onclick = (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        if (codeSlider) codeSlider.value = "12";
+        if (codeVal) codeVal.textContent = "12px";
+        if (uiSlider) uiSlider.value = "100";
+        if (uiVal) uiVal.textContent = "100%";
+        applyTypographySettings(12, 100);
+        toast.info("Font sizes reset to defaults");
+      };
+    }
+
+    popover.querySelectorAll(".settings-store-chips .settings-chip-btn").forEach((chip) => {
       chip.onclick = async () => {
         const storeName = chip.dataset.store;
+        if (!storeName) return;
         try {
           await localDB.clearStore(storeName);
           toast.success(`Cleared ${storeName} offline cache`);
@@ -552,7 +629,7 @@ class KernelIdeApp {
         localStorage.removeItem("kernel_ide_active_tab_id");
         localStorage.removeItem("kernel_ide_state");
         state.cancelPendingSave();
-        await localDB.delete("tabs_state", "current_session").catch(() => {});
+        await localDB.delete("tabs_state", "current_session").catch(() => { });
         state.openTabs = [];
         state.tabs = [];
         state.kconfigEngines = {};
@@ -1357,11 +1434,10 @@ class KernelIdeApp {
     row.innerHTML = `
       <span class="chevron">${isDir ? "▶" : ""}</span>
       <svg width="14" height="14" viewBox="0 0 16 16" fill="${isDir ? 'var(--accent-blue)' : 'var(--text-muted)'}">
-        ${
-          isDir
-            ? '<path d="M1.75 1A1.75 1.75 0 0 0 0 2.75v10.5C0 14.216.784 15 1.75 15h12.5A1.75 1.75 0 0 0 16 13.25v-8.5A1.75 1.75 0 0 0 14.25 3H7.5a.25.25 0 0 1-.2-.1l-.9-1.2C6.07 1.26 5.55 1 5 1H1.75z"/>'
-            : '<path d="M3.75 1.5a.25.25 0 0 0-.25.25v12.5c0 .138.112.25.25.25h8.5a.25.25 0 0 0 .25-.25V6H9.75A1.75 1.75 0 0 1 8 4.25V1.5H3.75zm5.75.56v2.19c0 .138.112.25.25.25h2.19L9.5 2.06zM2 1.75C2 .784 2.784 0 3.75 0h5.586c.464 0 .909.184 1.237.513l3.414 3.414c.329.328.513.773.513 1.237v9.086A1.75 1.75 0 0 1 12.75 16h-8.5A1.75 1.75 0 0 1 2 14.25V1.75z"/>'
-        }
+        ${isDir
+        ? '<path d="M1.75 1A1.75 1.75 0 0 0 0 2.75v10.5C0 14.216.784 15 1.75 15h12.5A1.75 1.75 0 0 0 16 13.25v-8.5A1.75 1.75 0 0 0 14.25 3H7.5a.25.25 0 0 1-.2-.1l-.9-1.2C6.07 1.26 5.55 1 5 1H1.75z"/>'
+        : '<path d="M3.75 1.5a.25.25 0 0 0-.25.25v12.5c0 .138.112.25.25.25h8.5a.25.25 0 0 0 .25-.25V6H9.75A1.75 1.75 0 0 1 8 4.25V1.5H3.75zm5.75.56v2.19c0 .138.112.25.25.25h2.19L9.5 2.06zM2 1.75C2 .784 2.784 0 3.75 0h5.586c.464 0 .909.184 1.237.513l3.414 3.414c.329.328.513.773.513 1.237v9.086A1.75 1.75 0 0 1 12.75 16h-8.5A1.75 1.75 0 0 1 2 14.25V1.75z"/>'
+      }
       </svg>
       <span style="overflow:hidden;text-overflow:ellipsis;">${item.name}</span>
     `;
@@ -1434,6 +1510,32 @@ class KernelIdeApp {
       });
     }
   }
+}
+
+export function applyTypographySettings(codeFontSize = null, uiFontScale = null) {
+  let cfs = codeFontSize;
+  if (cfs === null) {
+    const raw = localStorage.getItem("kip-code-font-size");
+    cfs = raw ? parseInt(raw, 10) : 12;
+  }
+  cfs = Math.max(10, Math.min(26, Number.isFinite(cfs) ? cfs : 12));
+
+  let ufs = uiFontScale;
+  if (ufs === null) {
+    const raw = localStorage.getItem("kip-ui-font-scale");
+    ufs = raw ? parseInt(raw, 10) : 100;
+  }
+  ufs = Math.max(80, Math.min(160, Number.isFinite(ufs) ? ufs : 100));
+
+  localStorage.setItem("kip-code-font-size", String(cfs));
+  localStorage.setItem("kip-ui-font-scale", String(ufs));
+
+  const rowHeight = Math.max(16, Math.round(cfs * 1.667));
+  document.documentElement.style.setProperty("--code-font-size", `${cfs}px`);
+  document.documentElement.style.setProperty("--code-row-height", `${rowHeight}px`);
+  document.documentElement.style.setProperty("--ui-font-scale", (ufs / 100).toString());
+
+  state.emit("codeview:font-changed", { fontSize: cfs, rowHeight });
 }
 
 function escapeAttr(str) {

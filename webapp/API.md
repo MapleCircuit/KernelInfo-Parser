@@ -397,7 +397,7 @@ Content of a file at a revision, with the AST token map of its indexed blob and 
 - **Source Retrieval Engine**: Uses persistent `git cat-file --batch` workers (`GitReader`) to stream exact blob contents directly from Git for the requested revision in sub-millisecond time (~0.1ms small / ~0.2ms big files). Preserves 100% byte fidelity without relying on local working tree checkouts. One stream answers one read at a time, so `git_reader` (`GitReaderPool`) keeps up to `READERS_PER_REPO` (4) of them per repository, spawned only when every existing one is busy: a file view no longer waits behind a history timeline (hundreds of blobs), a Kconfig model build or an include walk.
 - **Indexed blob**: found by content: the Git blob SHA of the file is `m_file_blob.blob_hash`, so the tokens always belong to the text served, at a tag, at a branch that moved since it was parsed, or at a commit never ingested. Tokens are cached per `blob_id` (`_FILE_TOKENS_CACHE`), so revisions sharing a file content share them. A file whose blob was never parsed is served with `fid: null`, `ftype: null` and `tokens: []`.
 - **Directory Detection**: If the path resolves to a Git `tree`, the endpoint returns the directory listing.
-- **Binary / oversized files**: a NUL in the first KiB answers `is_binary: true`, more than 10 MiB `is_oversized: true`, both without `content` and with a `message` the code view shows in place of the file.
+- **Binary / oversized files**: a NUL in the first KiB answers `is_binary: true`, more than 50 MiB `is_oversized: true`, both without `content` and with a `message` the code view shows in place of the file.
 - **Parameters**:
   - `version_name` (path): Revision.
   - `path` (query): Target file path (e.g. `"init/main.c"`). Required.
@@ -499,7 +499,7 @@ Fuzzy file-path search over the revision's Git tree (used by the Ctrl+K palette)
 - **Response**: `{ "version", "query", "total", "files": [{ "path", "name", "score" }] }`
 
 #### `GET /api/fs/raw/{version_name}`
-Serve an image blob of the revision (documentation figures). Only `svg`, `png`, `jpg`/`jpeg`, `gif` are served (else 404); a `name.*` path picks the first existing of `.svg/.png/.jpg/.jpeg/.gif` (Sphinx convention). Responses carry `Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; sandbox` so scripts embedded in SVG never run; files over 10 MiB return 413.
+Serve an image blob of the revision (documentation figures). Only `svg`, `png`, `jpg`/`jpeg`, `gif` are served (else 404); a `name.*` path picks the first existing of `.svg/.png/.jpg/.jpeg/.gif` (Sphinx convention). Responses carry `Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; sandbox` so scripts embedded in SVG never run; files over 50 MiB return 413.
 - **Parameters**: `path` (query, jailed relative path), `repo` (query, optional repository for `<img>` requests that cannot send headers).
 
 #### `GET /api/fs/compile_commands/{version_name}/export`
@@ -1052,11 +1052,12 @@ Search and list all kernel developers, maintainers, reviewers, and contributors 
 #### `GET /api/commits/{version_name}/list`
 Search the indexed commits of the request's repository, newest first (the Commits view's search; its unfiltered list is the timeline below).
 - **Repository scoping**: commit ids are global, so the query is restricted to the repository's Git network (`m_commit.network_id` = `m_repository.network_id`, `helpers.get_active_network_id`): other repositories of the database never appear. A repository that was never parsed answers an empty list.
+- **Current-date filtering & Git fallback**: By default, commits with future dates (`author_date > now`) are excluded to hide erroneous timestamps. When `q` is provided, future-dated commits can be matched if searched for. If `q` names an unparsed commit hash or prefix not in `m_commit`, results fall back to querying the Git CLI directly.
 - **Parameters**:
   - `version_name` (path): Revision (must resolve, else 404).
   - `page` (query): Page number (1 or more, default 1).
   - `limit` (query): Commits per page (1-500, default 50). Bound again in the service, which also clamps the derived `OFFSET` (`MAX_COMMIT_PAGE`, `MAX_COMMIT_OFFSET`), since both are bound straight into SQL.
-  - `q` (query): Filter by commit subject, hash prefix (matched case-insensitively against `HEX(commit_hash)`), or author name. Wildcards are escaped (§2.2), so `%` and `_` match literally.
+  - `q` (query): Filter by commit subject, hash prefix (matched via indexed binary hash range `helpers.commit_prefix_range`), or author name. Wildcards are escaped (§2.2), so `%` and `_` match literally. Commits are traversed using primary key order (`c.commit_id DESC`), preventing full-table filesort timeouts.
 - **Response**:
 ```json
 {
@@ -1079,6 +1080,7 @@ Search the indexed commits of the request's repository, newest first (the Commit
 
 #### `GET /api/commits/{version_name}/detail/{commit_id_or_hash}`
 Retrieve detailed metadata for a commit, including multi-contributor trailers and modified files.
+- **Unparsed commits & Git fallback**: When a commit hash or reference is not found in `m_commit`, the service falls back to inspecting the Git repository directly (`git log`, `git show`, `git diff-tree`), parsing commit headers, trailers, and modified files in memory without database writes.
 - **Modified files**: `files` comes from `m_commit_file` (`files_source: "db"`). `git log -p` emits no diff for a merge, so the parser stages **no file rows for merge commits** (`parser/git_ast/GIT_API.md` §2); for any commit whose staged list is empty the service resolves it live with `git diff -M --name-status <first parent> <commit>` and reports `files_source: "git"` — the same comparison `.../diff/{hash}` renders, so the *Modified Files* count can no longer disagree with **± Show changes**. A commit that genuinely changes nothing keeps an empty list and `files_source: "none"`. `is_merge` is set from the commit's parent count in `m_commit_parent`, which also gives the first parent of that diff (Git is asked, `rev-list --parents`, only for a commit without parent rows: a root, or one whose parents were not ingested), and a list longer than 5000 entries is cut with `files_truncated: true`.
 - **Parameters**:
   - `version_name` (path): Revision (not used: commit ids and hashes are global).
@@ -1149,7 +1151,7 @@ Execute on-demand live resolution of a Git commit against the Public-Inbox / LKM
 ```
 
 #### `GET /api/commits/{version_name}/timeline`
-Retrieve an anchored, bi-directional chronological commit timeline relative to a release tag or version commit. Resolves the version's anchor commit (e.g. `v3.0` -> commit 854 "Linux 3.0") and navigates forward into newer commits (`direction="future"`), backward into older commits (`direction="past"`), or centered around the anchor (`direction="around"`). Uses primary key indexed ordering on `commit_id` for instantaneous (<0.002s) execution. Every query stays inside the repository's Git network (see the list above), so two repositories of one database never interleave.
+Retrieve an anchored, bi-directional chronological commit timeline relative to a release tag or version commit. Resolves the version's anchor commit (e.g. `v3.0` -> commit 854 "Linux 3.0") and navigates forward into newer commits (`direction="future"`), backward into older commits (`direction="past"`), or centered around the anchor (`direction="around"`). Uses primary key indexed ordering on `commit_id` for instantaneous (<0.002s) execution. Every query stays inside the repository's Git network (see the list above), so two repositories of one database never interleave. Future-dated commits (`author_date > now`) are excluded from default timelines to omit corrupt timestamps. If `version_name` names an unparsed revision or branch outside `m_commit`, the timeline reads commits directly from Git (skipping any with timestamps beyond the current date).
 - **Parameters**:
   - `version_name` (path): Kernel version string, branch, or commit SHA.
   - `limit` (query): Maximum commits to retrieve (1-250, default 100; the same bound in every direction).
@@ -1819,7 +1821,7 @@ Handles unified HTTP communication, response caching, offline fallback, and netw
   - Automatically tracks in-flight `fetch` requests via `this.activeRequests`.
   - Employs a 150ms anti-flicker debounce timer so sub-150ms and IndexedDB cache hits never flash the UI.
   - When network fetch duration exceeds 150ms, fades in the glowing spinning indicator; smoothly fades out when all requests finish.
-- **Server reachability (`isOnline`, `serverUp`, `isConnected`)**: `navigator.onLine` only reports the browser's link state and stays `true` while the backend is down, so the client tracks the backend separately. `serverUp` is set from every exchange: any HTTP status proves the server answered (a `500` still counts), while a transport failure, the request timeout (10 s, raised per request with `timeoutMs` for the few endpoints that compute — `getBranchTags()` asks for 180 s), or a reply carrying `X-KIP-Offline` (served from the Service Worker cache, §2.11) means it did not. `getSync()` marks the same way. A change dispatches `app:server-status` (`{up}`) on `document`; `isConnected` is `isOnline && serverUp` (`isOnline` follows the browser's `online`/`offline` events); the settings panel's connection status reads `isConnected` and `isOnline`.
+- **Server reachability (`isOnline`, `serverUp`, `isConnected`)**: `navigator.onLine` only reports the browser's link state and stays `true` while the backend is down, so the client tracks the backend separately. `serverUp` is set from every exchange: any HTTP status proves the server answered (a `500` still counts), while a transport failure, the request timeout (10 s, raised per request with `timeoutMs` for the few endpoints that compute — `getBranchTags()` asks for 180 s, commit endpoints ask for 45 s), or a reply carrying `X-KIP-Offline` (served from the Service Worker cache, §2.11) means it did not. `getSync()` marks the same way. A change dispatches `app:server-status` (`{up}`) on `document`; `isConnected` is `isOnline && serverUp` (`isOnline` follows the browser's `online`/`offline` events); the settings panel's connection status reads `isConnected` and `isOnline`.
 - **Heartbeat (`startHeartbeat()`, `stopHeartbeat()`, `pingServer()`)**: `pingServer()` requests `GET /api/sync` (cheap, server-cached, never intercepted by the worker) with a 5 s timeout and records reachability without throwing or touching the loading spinner. The heartbeat polls every **30 s** while the server answers and every **5 s** while it does not, skips hidden tabs, and re-paces itself on each state change. A probe also runs when the tab becomes visible and on the browser's `online` event. `app.js` starts it from `setupNetworkStatus()`.
 - `getVersions()`: Fetches release list.
 - `getSync({fresh})`: Server change tokens (`GET /api/sync`, never cached; `fresh` adds `?fresh=true`); `onSyncHeader` receives the `X-KIP-Sync` header of every response; `versionStamps` / `_vk(version)` stamp version-scoped cache keys (§2.11).
@@ -1906,6 +1908,11 @@ Implements two-layer hybrid highlighting with map prioritization and client-side
   - Clicking the top-right connection badge opens an anchored settings popover dropdown.
   - **Database & Network**: Real-time connection status (the badge's three states: *Online (Connected)* / *Server Unreachable* / *Offline (Cached)*) alongside the verified DB Instance Hash badge with synchronization indicator (`● Synced`).
   - **🔄 Check for Updates** (`app.checkForUpdates()`, disabled unless connected — the button reads *Offline* or *Unreachable*): runs `syncManager.checkNow()` (§2.11) and shows *Checking… / Up to date / Updated / Failed* on the button, with a toast listing what changed (new frontend build, database rebuilt, versions re-parsed or moved, new or removed versions/branches).
+  - **Typography & Font Sizes**:
+    - **Code View Font Size**: Slider in pixels (10px to 26px, default 12px) dynamically setting `--code-font-size` and computing proportional row height `--code-row-height = Math.max(16, Math.round(fontSize * 1.667))` in `virtual_editor.js`, diffs, and code views.
+    - **UI Text Scale**: Relative percentage slider (80% to 160%, default 100%) adjusting `--ui-font-scale` so discrete font sizes (`8px` through `24px`) across tabs, mailing lists, commits, maintainers, kconfig, sidebars, tree rows, badges, and modals scale proportionately without breaking layouts.
+    - **Reset to Defaults**: Restores 12px code view and 100% UI text scale reliably across multiple uses.
+    - **Persistence**: Saved in `localStorage` (`kip-code-font-size`, `kip-ui-font-scale`) and restored automatically on application initialization.
   - **Cached Data Stores Breakdown**: 6-card metric grid showing counts for Files, Symbols, Kconfig, Maintainers, Commits, and Tools, plus total entries and disk footprint in MB.
   - **Granular Per-Store Clear Chips**: Fast one-click buttons to flush individual stores (`Clear Kconfig`, `Clear Files`, `Clear Symbols`, etc.).
   - **Storage Actions**:
@@ -2028,6 +2035,7 @@ The frontend implements systematic middle-click capture (`auxclick` with `e.butt
 
 - **Inline Commit Diff (`#btn-commit-diff`)**: The bottom of a selected commit's detail has a **± Show changes** button. It loads `GET /api/commits/{v}/diff/{hash}` once per commit (IndexedDB `commits` store, key `cdiff_<hash>_<context>`) and renders a compact per-file diff (status badge, `+/−` counts, old/new line-number gutters). Files with more than 120 rows, or after the 25th file, start collapsed; each file body scrolls at 420px.
   - **Jump to the edited lines**: Clicking an added or context row opens the file **at the commit** on that line; clicking a removed row opens the file **at the parent commit** on the old line (deleted files always open at the parent). Hunk headers and the per-file **Open ↗** button jump to the first change. Ctrl/Cmd+click or middle-click opens a new tab. Selecting text in the diff does not navigate.
+  - **Automatic Header Version Synchronization**: Clicking **Open ↗**, an edited line, or *Explore Files at this Commit* switches the workspace to the target commit revision, synchronizing both `state.currentVersion` and `state.selectedVersion` (emitting `version:synced`) so the top navigation bar immediately tracks and reflects the commit version without requiring the user to navigate out and back into the tab.
   - **Change markers in the code view**: The opened tab carries `diffMarks: { kind: "add" | "del", commit, ranges: [[start, end], ...] }`. `VirtualEditor` tints those lines green (added) or red (removed), adds a gutter bar and minimap ticks, and shows a `± <hash>: N lines changed` chip with **↑/↓** (previous/next change block) and **✕** (clear markers). Re-opening an already open file tab replaces its markers.
 
 ### 5.13. Header Version Selector, Apply & New Tab (`webapp/frontend/js/app.js`, `webapp/frontend/js/components/ref_picker.js`, `webapp/frontend/js/components/version_switch.js`)
@@ -2061,7 +2069,7 @@ The frontend implements systematic middle-click capture (`auxclick` with `e.butt
 
 ### 5.15. Command Palette (`webapp/frontend/js/components/command_palette.js`)
 - **Opening**: `Ctrl/Cmd+K` or `Ctrl/Cmd+P` (search), `Ctrl/Cmd+Shift+P` (commands), or the header **🔍 Search…** button.
-- **Modes by prefix**: none — files (`/api/fs/search`), symbols (`api.searchSymbols`) and Kconfig options (`api.searchKconfig`) together; `>` commands; `@` symbols; `#` commits (`api.searchCommits`, selecting one selects it in the header and opens its tree in a repository explorer tab); `?` Kconfig options; `:` go to line in the active code tab. Results are grouped by section with match highlighting; ↑/↓ navigate, Enter opens, Ctrl+Enter opens in a new tab.
+- **Modes by prefix**: none — files (`/api/fs/search`), symbols (`api.searchSymbols`) and Kconfig options (`api.searchKconfig`) together; `>` commands; `@` symbols; `#` commits (`api.searchCommits`, selecting one selects it in the header and opens its tree in a repository explorer tab); `?` Kconfig options; `:` go to line in the active code tab. Results are grouped by section with match highlighting; ↑/↓ navigate, Enter opens, Ctrl+Enter opens in a new tab. Enter always acts on the text currently typed: if the rendered results were computed for an earlier input (the 160 ms debounced search is pending or still in flight), it searches the current text immediately and opens that search's top result, so a quick Enter never runs a stale row such as the *Suggested commands* shown for an empty query (`resultsFor` / `pendingEnter`).
 - **Commands** (`KernelIdeApp.paletteCommands()`): compare, select commit, source treemap, export `compile_commands.json` (download via `api.getCompileCommandsDownloadUrl`), KConfig view, *Enable KConfig engine in a tab* (asks the active KConfig tab, else the first one not already running its engine, to enable it — `state.requestKconfigEngine(tabId)` shows that tab and its view confirms the resolution as usual (§5.0), so the palette never changes values on its own; with no such tab it says so), *Disable every KConfig engine* (`state.disableAllKconfigEngines()`, configurations kept), *Open repository explorer tab* (§5.20), commits, maintainers, NodeMap, documentation, explorer toggle, plus *Create patch* / *Symbol history* for the active code tab and *Switch project* entries.
 
 ### 5.16. `#ifdef` Dimming (`webapp/frontend/js/views/kconfig/directive_evaluator.js`)
@@ -2126,6 +2134,7 @@ The frontend implements systematic middle-click capture (`auxclick` with `e.butt
    - Segmented toggle (`Beautified` / `Raw`) on every message card:
      - **Beautified Mode**: Formatted in monospace (`font-family: var(--font-mono)`) with `white-space: pre-wrap; word-break: break-word` to preserve indentation of kernel code snippets, ASCII diagrams, and stack traces; indented and tinted quote blocks (`> ...`), highlighted trailer lines (`Signed-off-by:`, `Acked-by:`, `Reviewed-by:`), collapsible RFC-822 header drawer, and structured interactive diff viewer.
      - **Raw Mode**: Monospace view of the unparsed RFC-822 / git-am formatted message with horizontal scrolling for long lines.
+     - **Instant Cached Re-rendering**: Cached message details in `loadedMessageDetails` are immediately rendered whenever an email card opens or mode toggles, avoiding infinite loading spinners when switching modes or expanding cards.
    - Action controls: `📋 Copy` RFC-822 text to clipboard, `⬇ Download` `.eml` / `.patch` file, and direct `Lore ↗` permalink.
    - **Archive host**: every outbound permalink points at the self-hosted public-inbox mirror `https://lore.kernelinfo.org/all/` (a clone of `lore.kernel.org`), defined once per side as `LORE_BASE_URL` in `webapp/backend/services/mailing_list_service.py` (reused by `webapp/backend/services/git_service.py` for commit linkage) and in `webapp/frontend/js/views/mail/mail_view.js`. `Link:` trailers inside upstream commit messages are untouched: they are historical kernel data pointing at `lore.kernel.org`.
 4. **Interactive Patch Viewer**:
@@ -2175,10 +2184,11 @@ The frontend implements systematic middle-click capture (`auxclick` with `e.butt
    - **`remote: true` on `kconfig:engine:changed`**: an engine of *another* session appearing or going away changes what the code tabs here can follow, but no KConfig tab of this window gained or lost its own engine, so `KconfigView` ignores those events (it would otherwise re-run its engine-resolution confirmation, §5.0, on every announce from another window) while `VirtualEditor` acts on them like any other engine change.
 
 ### 5.24. Universal Tab Drag-and-Drop, Pane & Cross-Session Transfers, Drag-Out Elevation & Tab Menu (`webapp/frontend/js/components/tabs.js`, `webapp/frontend/css/tabs.css`)
-1. **Intra-Pane Tab Reordering**:
+1. **Intra-Pane Tab Reordering & Scroll Preservation**:
    - Tabs carry `draggable="true"` and register `dragstart`, `dragend`, `dragover`, and `dragleave` event handlers.
    - While dragging over a tab strip, mouse coordinate tracking calculates the midpoint of each tab to position an animated visual drop indicator line (`.tab-drop-indicator`).
    - Dropping within the same pane reorders `pane.tabs` in `state.panes` and emits `tabs:changed`.
+   - **Tabstrip Horizontal Scroll Preservation**: Switching or clicking tabs maintains the `.tabstrip` and `.tab-list` horizontal scroll position (`scrollLeft`) across DOM renders per pane, restored both synchronously and via `requestAnimationFrame` to prevent the tabstrip from resetting its horizontal scroll offset to 0.
 2. **Inter-Pane Tab Transfers**:
    - Tabs can be dragged and dropped between different split panes (e.g. from `pane-1` to `pane-2` or vice-versa).
    - Dropping onto the target pane's tab strip inserts the tab at the hovered index; dropping onto the pane's content container appends it to the target pane.

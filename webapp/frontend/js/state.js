@@ -622,7 +622,9 @@ class GlobalState {
 
   syncVersionFromTab(version) {
     const vStr = GlobalState.refOf(version);
-    if (!vStr || this.currentVersion === vStr) return;
+    if (!vStr) return;
+    const changed = this.currentVersion !== vStr || this.selectedVersion !== vStr;
+    if (!changed) return;
     this.currentVersion = vStr;
     this.selectedVersion = vStr;
     this.emit("version:synced", vStr);
@@ -819,6 +821,11 @@ class GlobalState {
       };
       pane.tabs.push(newTab);
       pane.activeTabId = id;
+    }
+
+    const activeTab = existing || pane.tabs.find((t) => t.id === pane.activeTabId);
+    if (activeTab && activeTab.version) {
+      this.syncVersionFromTab(activeTab.version);
     }
 
     this.emit("tabs:changed", { paneId: pane.id, activeTabId: pane.activeTabId });

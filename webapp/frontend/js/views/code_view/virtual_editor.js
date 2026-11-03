@@ -23,7 +23,13 @@ import { scheduleScrollSave } from "../../components/scroll_memory.js";
 // Files the build banner reports on (sources Kbuild compiles and the headers/DTs they use)
 const BUILD_TRACKED_RE = /\.(c|h|S|rs|lds|dts|dtsi|inc)$/i;
 
-const ROW_HEIGHT = 20; // 20px per line
+export function getCodeRowHeight() {
+  const custom = parseInt(document.documentElement.style.getPropertyValue("--code-row-height"), 10);
+  if (custom && Number.isFinite(custom) && custom >= 16) return custom;
+  const fontSize = parseInt(document.documentElement.style.getPropertyValue("--code-font-size"), 10) || 12;
+  return Math.max(16, Math.round(fontSize * 1.667));
+}
+
 const BUFFER_LINES = 15; // lines buffered above and below viewport
 
 // Compiled-out lines shown undimmed: one choice shared by every code tab (not persisted)
@@ -42,6 +48,15 @@ export class VirtualEditor {
     // Lines changed by a commit (opened from the commit diff): Set of line numbers + ordered blocks
     this.diffMarks = null;
     this.diffMarkedLines = new Set();
+
+    state.subscribe("codeview:font-changed", () => {
+      if (this.viewportEl && this.rawLines.length) {
+        const rowH = getCodeRowHeight();
+        if (this.spacerEl) this.spacerEl.style.height = `${this.rawLines.length * rowH}px`;
+        this.updateVisibleLines();
+        this.renderMinimap();
+      }
+    });
 
     this.viewportEl = null;
     this.spacerEl = null;
@@ -712,7 +727,7 @@ export class VirtualEditor {
         return;
       }
 
-      // Binary and oversized (> 10 MB) files come without content: say why instead of an empty editor
+      // Binary and oversized (> 50 MB) files come without content: say why instead of an empty editor
       if (res.is_binary || res.is_oversized) {
         this.rawLines = [];
         this.linesContainer.innerHTML = `<div style="padding:20px;color:var(--text-muted);">${escapeHtml(res.message || "This file cannot be displayed.")}</div>`;
@@ -750,7 +765,8 @@ export class VirtualEditor {
       }
 
       // Update spacer height for virtual scrolling
-      const totalHeight = this.rawLines.length * ROW_HEIGHT;
+      const rowH = getCodeRowHeight();
+      const totalHeight = this.rawLines.length * rowH;
       this.spacerEl.style.height = `${totalHeight}px`;
 
       // Come back where the tab was left, unless a specific line was requested (navigation drops
@@ -759,7 +775,7 @@ export class VirtualEditor {
       if (Number.isFinite(savedTop) && savedTop > 0) {
         this.viewportEl.scrollTop = Math.min(savedTop, Math.max(0, totalHeight - this.viewportEl.clientHeight));
       } else if (this.targetCursorLine > 1) {
-        this.viewportEl.scrollTop = Math.max(0, (this.targetCursorLine - 5) * ROW_HEIGHT);
+        this.viewportEl.scrollTop = Math.max(0, (this.targetCursorLine - 5) * rowH);
       }
 
       this.updateVisibleLines();
@@ -841,7 +857,8 @@ export class VirtualEditor {
     if (!target) target = dir > 0 ? blocks[0] : blocks[blocks.length - 1];
     this.targetCursorLine = target[0];
     this.tabData.cursorLine = target[0];
-    this.viewportEl.scrollTop = Math.max(0, (target[0] - 5) * ROW_HEIGHT);
+    const rowH = getCodeRowHeight();
+    this.viewportEl.scrollTop = Math.max(0, (target[0] - 5) * rowH);
     this.updateVisibleLines();
     this.rememberScrollPosition();
   }
@@ -849,13 +866,14 @@ export class VirtualEditor {
   updateVisibleLines() {
     if (!this.viewportEl || this.rawLines.length === 0) return;
 
+    const rowH = getCodeRowHeight();
     const scrollTop = this.viewportEl.scrollTop;
     const viewportHeight = this.viewportEl.clientHeight || 600;
 
-    const startIdx = Math.max(0, Math.floor(scrollTop / ROW_HEIGHT) - BUFFER_LINES);
-    const endIdx = Math.min(this.rawLines.length - 1, Math.ceil((scrollTop + viewportHeight) / ROW_HEIGHT) + BUFFER_LINES);
+    const startIdx = Math.max(0, Math.floor(scrollTop / rowH) - BUFFER_LINES);
+    const endIdx = Math.min(this.rawLines.length - 1, Math.ceil((scrollTop + viewportHeight) / rowH) + BUFFER_LINES);
 
-    this.linesContainer.style.transform = `translateY(${startIdx * ROW_HEIGHT}px)`;
+    this.linesContainer.style.transform = `translateY(${startIdx * rowH}px)`;
 
     let html = "";
     for (let i = startIdx; i <= endIdx; i++) {
@@ -902,7 +920,7 @@ export class VirtualEditor {
       trackH,
       lineScale,
       mapH: Math.min(trackH, totalLines * lineScale),
-      docH: totalLines * ROW_HEIGHT,
+      docH: totalLines * getCodeRowHeight(),
       viewportH: this.viewportEl?.clientHeight || 0,
     };
   }

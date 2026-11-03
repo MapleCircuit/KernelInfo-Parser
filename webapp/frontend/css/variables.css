@@ -27,6 +27,27 @@
   --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", Helvetica, Arial, sans-serif;
   --font-mono: "JetBrains Mono", "Fira Code", Consolas, Menlo, Monaco, "Courier New", monospace;
 
+  /* Typography scale tokens */
+  --ui-font-scale: 1;
+  --fs-8: calc(8px * var(--ui-font-scale, 1));
+  --fs-9: calc(9px * var(--ui-font-scale, 1));
+  --fs-10: calc(10px * var(--ui-font-scale, 1));
+  --fs-11: calc(11px * var(--ui-font-scale, 1));
+  --fs-11-5: calc(11.5px * var(--ui-font-scale, 1));
+  --fs-12: calc(12px * var(--ui-font-scale, 1));
+  --fs-13: calc(13px * var(--ui-font-scale, 1));
+  --fs-13-5: calc(13.5px * var(--ui-font-scale, 1));
+  --fs-14: calc(14px * var(--ui-font-scale, 1));
+  --fs-15: calc(15px * var(--ui-font-scale, 1));
+  --fs-16: calc(16px * var(--ui-font-scale, 1));
+  --fs-16-5: calc(16.5px * var(--ui-font-scale, 1));
+  --fs-18: calc(18px * var(--ui-font-scale, 1));
+  --fs-20: calc(20px * var(--ui-font-scale, 1));
+  --fs-24: calc(24px * var(--ui-font-scale, 1));
+
+  --code-font-size: 12px;
+  --code-row-height: 20px;
+
   --sidebar-width: 280px;
   --header-height: 48px;
   --tab-height: 36px;
@@ -55,12 +76,36 @@ body {
   font-family: var(--font-sans);
   background-color: var(--bg-primary);
   color: var(--text-primary);
-  font-size: 13px;
+  font-size: var(--fs-13, 13px);
   line-height: 1.5;
   overflow: hidden;
   height: 100vh;
   width: 100vw;
   -webkit-font-smoothing: antialiased;
+}
+
+/* Relative proportional font scaling on elements with inline sizes outside code viewer */
+[style*="font-size: 8px"], [style*="font-size:8px"] { font-size: var(--fs-8, 8px) !important; }
+[style*="font-size: 9px"], [style*="font-size:9px"] { font-size: var(--fs-9, 9px) !important; }
+[style*="font-size: 10px"], [style*="font-size:10px"] { font-size: var(--fs-10, 10px) !important; }
+[style*="font-size: 11px"], [style*="font-size:11px"] { font-size: var(--fs-11, 11px) !important; }
+[style*="font-size: 11.5px"], [style*="font-size:11.5px"] { font-size: var(--fs-11-5, 11.5px) !important; }
+[style*="font-size: 12px"], [style*="font-size:12px"] { font-size: var(--fs-12, 12px) !important; }
+[style*="font-size: 13px"], [style*="font-size:13px"] { font-size: var(--fs-13, 13px) !important; }
+[style*="font-size: 13.5px"], [style*="font-size:13.5px"] { font-size: var(--fs-13-5, 13.5px) !important; }
+[style*="font-size: 14px"], [style*="font-size:14px"] { font-size: var(--fs-14, 14px) !important; }
+[style*="font-size: 15px"], [style*="font-size:15px"] { font-size: var(--fs-15, 15px) !important; }
+[style*="font-size: 16px"], [style*="font-size:16px"] { font-size: var(--fs-16, 16px) !important; }
+[style*="font-size: 16.5px"], [style*="font-size:16.5px"] { font-size: var(--fs-16-5, 16.5px) !important; }
+[style*="font-size: 18px"], [style*="font-size:18px"] { font-size: var(--fs-18, 18px) !important; }
+[style*="font-size: 20px"], [style*="font-size:20px"] { font-size: var(--fs-20, 20px) !important; }
+[style*="font-size: 24px"], [style*="font-size:24px"] { font-size: var(--fs-24, 24px) !important; }
+
+/* Keep code viewer tokens respected */
+.code-viewer-container .code-row,
+.virtual-editor-viewport .code-row,
+.cdiff-body .cdiff-line {
+  font-size: var(--code-font-size, 12px) !important;
 }
 
 button {

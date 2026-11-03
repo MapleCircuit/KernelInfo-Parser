@@ -941,6 +941,10 @@ export class MailView {
         const mid = msgSummary.message_id || msgSummary.num;
         if (!this.loadedMessageDetails.has(mid)) {
           this.fetchAndRenderMessageDetail(mid, card);
+        } else {
+          const detail = this.loadedMessageDetails.get(mid);
+          const isRaw = this.rawModeMap.get(mid) || false;
+          this.renderCardContent(bodyEl, detail, isRaw);
         }
       }
     };
@@ -1011,6 +1015,13 @@ export class MailView {
         a.click();
         URL.revokeObjectURL(url);
       };
+    }
+
+    const mid = msgSummary.message_id || msgSummary.num;
+    if (this.loadedMessageDetails.has(mid)) {
+      const detail = this.loadedMessageDetails.get(mid);
+      const isRaw = this.rawModeMap.get(mid) || false;
+      this.renderCardContent(bodyEl, detail, isRaw);
     }
 
     return card;
