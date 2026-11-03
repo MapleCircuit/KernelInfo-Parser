@@ -193,7 +193,10 @@ class CommitFeatures:
         self.merge_branch = merge_branch
         self.pull_from_name = pull_from_name
         self.pull_from_email = pull_from_email
-        self.commit_id = commit_id
+        try:
+            self.commit_id = int(commit_id or 0)
+        except (ValueError, TypeError):
+            self.commit_id = 0
 
         # Auto-extract trailers if not provided
         if not self.trailer_mids and self.message:
@@ -260,6 +263,11 @@ class CommitFeatures:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> CommitFeatures:
+        raw_cid = data.get("commit_id", 0)
+        try:
+            cid = int(raw_cid)
+        except (ValueError, TypeError):
+            cid = 0
         return cls(
             sha=str(data.get("sha", "")),
             author_name=str(data.get("author_name", "")),
@@ -275,7 +283,7 @@ class CommitFeatures:
             merge_branch=str(data.get("merge_branch", "")),
             pull_from_name=str(data.get("pull_from_name", "")),
             pull_from_email=str(data.get("pull_from_email", "")),
-            commit_id=int(data.get("commit_id", 0)),
+            commit_id=cid,
         )
 
 
@@ -342,6 +350,11 @@ class ResolvedCommitContext:
         cover_letter = SmsgRecord.from_dict(data["cover_letter"]) if data.get("cover_letter") else None
         pull_request = SmsgRecord.from_dict(data["pull_request"]) if data.get("pull_request") else None
         sibling_patches = [SmsgRecord.from_dict(s) for s in data.get("sibling_patches", [])]
+        raw_cid = data.get("commit_id", 0)
+        try:
+            cid = int(raw_cid)
+        except (ValueError, TypeError):
+            cid = 0
         return cls(
             commit_sha=str(data.get("commit_sha", "")),
             matched_tier=int(data.get("matched_tier", 0)),
@@ -352,5 +365,5 @@ class ResolvedCommitContext:
             patch_version=int(data.get("patch_version", 1)),
             patch_idx=int(data.get("patch_idx", 0)),
             patch_total=int(data.get("patch_total", 0)),
-            commit_id=int(data.get("commit_id", 0)),
+            commit_id=cid,
         )

@@ -854,7 +854,11 @@ class GitService:
 
         repo_dir = str(get_repo_dir())
         c_hash = detail["commit_hash"]
-        cid = detail["commit_id"]
+        raw_cid = detail.get("commit_id", 0)
+        try:
+            cid = int(raw_cid)
+        except (ValueError, TypeError):
+            cid = 0
 
         patch_id = None
         try:

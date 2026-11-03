@@ -1126,7 +1126,7 @@ Execute on-demand live resolution of a Git commit against the Public-Inbox / LKM
 - **Parameters**:
   - `version_name` (path): Revision (not used: commit ids and hashes are global).
   - `commit_id_or_hash` (path): Commit integer ID or hex hash.
-- **Read-Only Safety**: Strictly adheres to the zero-write backend invariant; queries the commit features, extracts `git patch-id` and blob hashes, invokes `MailingListClient.resolve_commits()`, and synthesizes linked email records dynamically in memory without executing any `INSERT` or `UPDATE` SQL queries.
+- **Read-Only Safety**: Strictly adheres to the zero-write backend invariant; queries the commit features, extracts `git patch-id` and blob hashes, invokes `MailingListClient.resolve_commits()`, and synthesizes linked email records dynamically in memory without executing any `INSERT` or `UPDATE` SQL queries. For unparsed Git-only commits, non-numeric `commit_id` references are safely sanitized to integer `0` in `CommitFeatures` before querying the mailing list daemon.
 - **Limits**: the commit's patch is read with the 8 MiB cap of `.../diff/{hash}` (a larger one gets no patch id, since a truncated patch would hash differently), and every Git step has a 30 s timeout.
 - **Response**:
 ```json

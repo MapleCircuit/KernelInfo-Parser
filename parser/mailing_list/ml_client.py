@@ -207,7 +207,7 @@ class MailingListClient:
         )
         lock_file = f"/tmp/ml_server.{remote_port}.lock"
         listen_pids = (
-            f"ss -ltnpH 'sport = :{remote_port}' 2>/dev/null "
+            f"ss -ltnpH sport = :{remote_port} 2>/dev/null "
             f"| grep -o 'pid=[0-9]*' | cut -d= -f2 | sort -u"
         )
         remote_script = (
@@ -393,6 +393,33 @@ class MailingListClient:
                             "Skipping commit %s: daemon stayed at its limits across %d attempts",
                             chunk[0].sha[:12],
                             attempt,
+                        )
+                    continue
+
+                if isinstance(exc, urllib.error.HTTPError):
+                    # HTTP errors from the daemon (e.g. 500 Internal Server Error, 400 Bad Request).
+                    # Extract error body from the response so the real failure reason is logged.
+                    try:
+                        err_body = exc.read().decode("utf-8", errors="replace")
+                    except Exception:
+                        err_body = str(exc)
+                    if len(chunk) > 1:
+                        mid = len(chunk) // 2
+                        queue[:0] = [(chunk[:mid], attempt), (chunk[mid:], attempt)]
+                        logger.warning(
+                            "Mailing list daemon returned HTTP %d for chunk of %d commits; retrying in halves of %d: %s",
+                            exc.code,
+                            len(chunk),
+                            mid,
+                            err_body,
+                        )
+                    else:
+                        dropped.append(chunk[0].sha)
+                        logger.warning(
+                            "Skipping commit %s: daemon returned HTTP %d: %s",
+                            chunk[0].sha[:12],
+                            exc.code,
+                            err_body,
                         )
                     continue
 

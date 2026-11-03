@@ -84,6 +84,16 @@ class TestTypeSerialization(unittest.TestCase):
         self.assertEqual(restored.patch_id, "deadbeefcafebabe11223344556677889900aabb")
         self.assertEqual(len(restored.blob_hashes), 1)
 
+    def test_commit_features_non_numeric_commit_id_resilience(self):
+        # Unparsed Git commits have SHA as commit_id in GitService; must safely normalize to 0
+        feat = CommitFeatures(commit_id="06a9a4408697aaf0b4bd88936a3075a9a0b30124", commit_hash="06a9a4408697aaf0b4bd88936a3075a9a0b30124")
+        self.assertEqual(feat.commit_id, 0)
+        d = {"commit_id": "06a9a4408697aaf0b4bd88936a3075a9a0b30124", "sha": "06a9a4408697aaf0b4bd88936a3075a9a0b30124"}
+        restored = CommitFeatures.from_dict(d)
+        self.assertEqual(restored.commit_id, 0)
+        restored_ctx = ResolvedCommitContext.from_dict(d)
+        self.assertEqual(restored_ctx.commit_id, 0)
+
     def test_resolved_context_round_trip(self):
         patch = SmsgRecord(
             num=101,
