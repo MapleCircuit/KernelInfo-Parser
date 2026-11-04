@@ -54,6 +54,17 @@ def get_file_diff(
     return diff_service.get_file_diff(version_a, version_b, path, old_path, similarity)
 
 
+@router.get("/tools/diff/blobs")
+def get_blob_diff(
+    version_a: str = Query(...),
+    path_a: str = Query(...),
+    version_b: str = Query(...),
+    path_b: str = Query(...),
+) -> dict[str, Any]:
+    """Changed lines between any two files at any two revisions (code view "Diff with…")."""
+    return diff_service.get_blob_diff(version_a, path_a, version_b, path_b)
+
+
 @router.get("/tools/diff/renames")
 def search_renames(
     version_a: str = Query(...),

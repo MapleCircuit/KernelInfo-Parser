@@ -292,7 +292,22 @@ class ApiClient {
 
   async getVersions(includeRc = true) {
     const q = `?include_rc=${includeRc ? "true" : "false"}`;
-    return this.request(`/api/versions${q}`, { networkFirst: true }, "files", `app_versions_${includeRc ? "rc" : "rel"}`);
+    const res = await this.request(`/api/versions${q}`, { networkFirst: true }, "files", `app_versions_${includeRc ? "rc" : "rel"}`);
+    if (res) {
+      this._versionsMemo = this._versionsMemo || new Map();
+      this._versionsMemo.set(`${this.repo || ""}|${includeRc}`, res);
+    }
+    return res;
+  }
+
+  /**
+   * The version catalog as last fetched in this page (startup and every sync refresh go through
+   * getVersions), fetched only when nothing was yet. For lookups that must not wait on the
+   * network: ⇄ Diff's default revision, the ref picker's tag list, the Compare view's default base.
+   */
+  async getVersionsCached(includeRc = true) {
+    const hit = this._versionsMemo?.get(`${this.repo || ""}|${includeRc}`);
+    return hit || this.getVersions(includeRc);
   }
 
   /** URL with ?repo= for requests that cannot carry headers (img src, downloads). */
@@ -661,6 +676,14 @@ class ApiClient {
     const sim = Math.max(1, Math.min(50, Math.round(similarity) || 50));
     if (sim !== 50) params.set("similarity", String(sim));
     return this.request(`/api/tools/diff/file?${params.toString()}`, {}, "tools", `fdiff_${this._vk(va)}_${this._vk(vb)}_${sim}_${oldPath || ""}_${path}`);
+  }
+
+  /** Changed lines (-U0 hunks) between any two files at any two revisions (code view "⇄ Diff"). */
+  async getBlobDiff(versionA, pathA, versionB, pathB) {
+    const va = this._sanitizeVer(versionA);
+    const vb = this._sanitizeVer(versionB);
+    const params = new URLSearchParams({ version_a: va, path_a: pathA, version_b: vb, path_b: pathB });
+    return this.request(`/api/tools/diff/blobs?${params.toString()}`, { timeoutMs: 45000 }, "tools", `bdiff_${this._vk(va)}_${this._vk(vb)}_${pathA}_${pathB}`);
   }
 
   /** Paths with the same content at both revisions (the diff's unchanged count; ~29k at v3.0…v3.1). */

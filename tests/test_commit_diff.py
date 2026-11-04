@@ -1,4 +1,5 @@
-"""tests/test_commit_diff.py - Structured commit diff parsing and the git-backed commit diff service."""
+"""tests/test_commit_diff.py - Structured commit diff parsing, the git-backed commit diff service and
+the any-file blob diff of the code view ("⇄ Diff")."""
 from __future__ import annotations
 
 import subprocess
@@ -8,6 +9,7 @@ from fastapi import HTTPException
 
 from core.config import get_default_repo_path
 from webapp.backend.services.git_service import GitService, parse_unified_diff
+from webapp.backend.services.diff_service import DiffService
 
 LINUX_REPO = str(get_default_repo_path())
 
@@ -70,6 +72,11 @@ class TestParseUnifiedDiff(unittest.TestCase):
         self.assertEqual(sum(len(h["lines"]) for f in files for h in f["hunks"]), 3)
         self.assertEqual((files[0]["additions"], files[2]["deletions"]), (2, 2))
 
+    def test_line_clipping(self):
+        long = "diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1 +1 @@\n-" + "a" * 500 + "\n+b\n"
+        self.assertEqual(len(parse_unified_diff(long)[0]["hunks"][0]["lines"][0][3]), 400)
+        self.assertEqual(len(parse_unified_diff(long, max_chars=None)[0]["hunks"][0]["lines"][0][3]), 500)
+
 
 class TestCommitDiffService(unittest.TestCase):
     @classmethod
@@ -96,6 +103,45 @@ class TestCommitDiffService(unittest.TestCase):
         with self.assertRaises(HTTPException) as missing:
             GitService().get_commit_diff("deadbeefdeadbeef")
         self.assertEqual(missing.exception.status_code, 404)
+
+
+class TestBlobDiffService(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        out = subprocess.run(["git", "-C", LINUX_REPO, "rev-parse", "v3.1^{commit}"], capture_output=True, text=True)
+        if out.returncode != 0:
+            raise unittest.SkipTest("Linux repository with tag v3.1 not available")
+
+    def test_same_file_two_revisions(self):
+        diff = DiffService().get_blob_diff("v3.1-rc10", "Makefile", "v3.1", "Makefile")
+        self.assertFalse(diff["identical"] or diff["binary"] or diff["truncated"])
+        self.assertEqual((diff["additions"], diff["deletions"]), (1, 1))
+        self.assertEqual(diff["hunks"][0]["lines"], [
+            ["-", 4, None, "EXTRAVERSION = -rc10"],
+            ["+", None, 4, "EXTRAVERSION ="],
+        ])
+
+    def test_two_different_files_and_identical(self):
+        diff = DiffService().get_blob_diff("v3.0", "kernel/sched.c", "v3.0", "kernel/sched_fair.c")
+        self.assertNotEqual(diff["blob_a"], diff["blob_b"])
+        self.assertGreater(len(diff["hunks"]), 0)
+        # -U0: hunks carry changed lines only
+        self.assertTrue(all(r[0] in "+-" for h in diff["hunks"] for r in h["lines"]))
+        same = DiffService().get_blob_diff("v3.0", "Makefile", "v3.0", "Makefile")
+        self.assertTrue(same["identical"])
+        self.assertEqual(same["hunks"], [])
+
+    def test_invalid_paths_and_refs(self):
+        cases = [
+            (("v3.0", "../etc/passwd", "v3.0", "Makefile"), 400),
+            (("v3.0", "kernel", "v3.0", "Makefile"), 400),
+            (("v3.0", "no/such/file.c", "v3.0", "Makefile"), 404),
+            (("--output=x", "Makefile", "v3.0", "Makefile"), 404),
+        ]
+        for args, status in cases:
+            with self.assertRaises(HTTPException) as err:
+                DiffService().get_blob_diff(*args)
+            self.assertEqual(err.exception.status_code, status, args)
 
 
 if __name__ == "__main__":

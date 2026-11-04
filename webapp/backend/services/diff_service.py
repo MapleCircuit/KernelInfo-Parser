@@ -25,6 +25,7 @@ from webapp.backend.database.helpers import (
 from webapp.backend.security.jail import is_safe_rel_path
 from webapp.backend.services.tree_resolver import tree_resolver, git_tree_resolver
 from webapp.backend.services.history_service import KCONFIG_TYPE_NAMES, kconfig_definitions, kconfig_field_changes
+from webapp.backend.services.git_service import parse_unified_diff
 from core.globalstuff import ASTT, is_safe_git_rev
 
 logger = logging.getLogger(__name__)
@@ -33,6 +34,11 @@ MAX_SYMBOL_DIFF_FILES = 50
 # Files whose definitions Level 2 compares (paths sort documentation and dotfiles first)
 SYMBOL_DIFF_SUFFIXES = (".c", ".h", ".S", ".rs")
 MAX_FILE_DIFF_BYTES = 512 * 1024
+# Any two files at any two revisions (code view "Diff with…"): only the changed lines travel (-U0),
+# the client rebuilds the full file from the side it already shows.
+MAX_BLOB_DIFF_BYTES = 8 * 1024 * 1024
+MAX_BLOB_DIFF_ROWS = 200_000
+BLOB_DIFF_TIMEOUT = 30.0
 # Rename detection (git diff-tree -M): a deleted and an added path pair up when their contents are
 # at least RENAME_SIMILARITY % alike. The quick pass of every comparison compares contents only while
 # deleted x added candidates stay within RENAME_LIMIT^2 (beyond that Git pairs exact copies and files
@@ -625,6 +631,90 @@ class DiffService:
             "is_binary": b"\nBinary files " in raw or raw.startswith(b"Binary files "),
             "truncated": truncated,
         }
+
+    @staticmethod
+    def _blob_at(sha: str, path: str) -> tuple[str, str] | None:
+        """(object type, object SHA) of `path` in commit `sha`, or None when the path is absent."""
+        try:
+            out = subprocess.run(
+                ["git", "-C", str(get_repo_dir()), "ls-tree", "-z", sha, "--", f":(literal){path}"],
+                capture_output=True,
+                timeout=10,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError) as e:
+            logger.warning("git ls-tree %s failed: %s", sha, e)
+            raise HTTPException(status_code=500, detail="git ls-tree failed") from e
+        if out.returncode != 0:
+            raise HTTPException(status_code=500, detail="git ls-tree failed")
+        for entry in out.stdout.split(b"\0"):
+            meta, _, name = entry.partition(b"\t")
+            parts = meta.split()
+            if len(parts) == 3 and name.decode("utf-8", errors="replace") == path:
+                return parts[1].decode("ascii", errors="replace"), parts[2].decode("ascii", errors="replace")
+        return None
+
+    def get_blob_diff(self, v1: str, path1: str, v2: str, path2: str) -> dict[str, Any]:
+        """Changed lines (-U0 hunks) between `path1` at `v1` and `path2` at `v2`: any two files, any two revisions."""
+        norm1 = (path1 or "").strip().strip("/")
+        norm2 = (path2 or "").strip().strip("/")
+        if not norm1 or not norm2 or not is_safe_rel_path(norm1) or not is_safe_rel_path(norm2):
+            raise HTTPException(status_code=400, detail="A valid relative file path must be specified for both sides.")
+
+        blobs = []
+        for rev, path in ((v1, norm1), (v2, norm2)):
+            sha = git_tree_resolver.resolve_commit_sha(rev)
+            if sha is None:
+                raise HTTPException(status_code=404, detail=f"Version or commit '{rev}' not found in Git.")
+            obj = self._blob_at(sha, path)
+            if obj is None:
+                raise HTTPException(status_code=404, detail=f"'{path}' does not exist at {rev}.")
+            if obj[0] != "blob":
+                raise HTTPException(status_code=400, detail=f"'{path}' is not a file at {rev}.")
+            blobs.append(obj[1])
+
+        result: dict[str, Any] = {
+            "v1": v1, "v2": v2, "path_a": norm1, "path_b": norm2, "blob_a": blobs[0], "blob_b": blobs[1],
+            "identical": blobs[0] == blobs[1], "binary": False, "additions": 0, "deletions": 0,
+            "truncated": False, "hunks": [],
+        }
+        if result["identical"]:
+            return result
+        try:
+            # Two object SHAs: nothing user-supplied reaches the command line. Stdout is streamed and
+            # cut at the byte cap (two unrelated large files can differ on every line).
+            with subprocess.Popen(
+                ["git", "-C", str(get_repo_dir()), "diff", "--no-color", "--no-ext-diff", "-U0", blobs[0], blobs[1]],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+            ) as proc:
+                raw = proc.stdout.read(MAX_BLOB_DIFF_BYTES + 1)
+                truncated = len(raw) > MAX_BLOB_DIFF_BYTES
+                if truncated:
+                    proc.kill()
+                    raw = raw[: raw.rfind(b"\n", 0, MAX_BLOB_DIFF_BYTES) + 1]
+                rc = proc.wait(timeout=BLOB_DIFF_TIMEOUT)
+        except subprocess.TimeoutExpired as e:
+            raise HTTPException(status_code=504, detail="git diff timed out.") from e
+        except OSError as e:
+            logger.warning("git diff %s %s failed: %s", blobs[0], blobs[1], e)
+            raise HTTPException(status_code=500, detail="git diff failed") from e
+        if rc != 0 and not truncated:
+            raise HTTPException(status_code=500, detail="git diff failed")
+
+        files = parse_unified_diff(raw.decode("utf-8", errors="replace"), MAX_BLOB_DIFF_ROWS, max_chars=None)
+        if files:
+            f = files[0]
+            result.update({
+                "binary": f["binary"],
+                "additions": f["additions"],
+                "deletions": f["deletions"],
+                "truncated": truncated or f["truncated"],
+                "hunks": [{k: h[k] for k in ("old_start", "old_count", "new_start", "new_count", "lines")} for h in f["hunks"]],
+            })
+        else:
+            result["truncated"] = truncated
+        return result
 
     @staticmethod
     def _fetch_commit_files(cursor: Any, commit_id: int) -> dict[str, int]:

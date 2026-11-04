@@ -43,11 +43,13 @@ def _strip_diff_prefix(path: str, prefix: str) -> str:
     return path[len(prefix):] if path.startswith(prefix) else path
 
 
-def parse_unified_diff(text: str, max_lines: int = MAX_COMMIT_DIFF_LINES) -> list[dict[str, Any]]:
+def parse_unified_diff(text: str, max_lines: int = MAX_COMMIT_DIFF_LINES,
+                       max_chars: int | None = MAX_DIFF_LINE_CHARS) -> list[dict[str, Any]]:
     """Parse `git diff` output into files -> hunks -> [kind, old_no, new_no, text] rows.
 
     kind is "+", "-" or " ". Once `max_lines` rows have been stored, later rows are only counted
-    (additions/deletions stay exact) and the affected files are flagged `truncated`.
+    (additions/deletions stay exact) and the affected files are flagged `truncated`. Row text is
+    clipped to `max_chars` characters (None keeps whole lines).
     """
     files: list[dict[str, Any]] = []
     cur: dict[str, Any] | None = None
@@ -91,7 +93,7 @@ def parse_unified_diff(text: str, max_lines: int = MAX_COMMIT_DIFF_LINES) -> lis
         if hunk is None or not line or line[0] not in "+- ":
             continue
         kind = line[0]
-        row = [kind, old_no if kind != "+" else None, new_no if kind != "-" else None, line[1:1 + MAX_DIFF_LINE_CHARS]]
+        row = [kind, old_no if kind != "+" else None, new_no if kind != "-" else None, line[1:] if max_chars is None else line[1:1 + max_chars]]
         if kind == "+":
             cur["additions"] += 1
             new_no += 1

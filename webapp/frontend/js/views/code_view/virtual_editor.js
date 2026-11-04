@@ -19,6 +19,7 @@ import { DirectiveEvaluator, PREPROCESSED_RE, archMacros } from "../kconfig/dire
 import { configLookup, evalBuild, explainBuild } from "../kconfig/build_condition.js";
 import { escapeHtml } from "../../components/modal.js";
 import { scheduleScrollSave } from "../../components/scroll_memory.js";
+import { buildDiffRows, pairDiffRows, showDiffPicker, diffSideLabel } from "./file_diff.js";
 
 // Files the build banner reports on (sources Kbuild compiles and the headers/DTs they use)
 const BUILD_TRACKED_RE = /\.(c|h|S|rs|lds|dts|dtsi|inc)$/i;
@@ -48,11 +49,14 @@ export class VirtualEditor {
     // Lines changed by a commit (opened from the commit diff): Set of line numbers + ordered blocks
     this.diffMarks = null;
     this.diffMarkedLines = new Set();
+    // Full-file diff against another file/revision (toolbar "⇄ Diff"; null = the plain file)
+    this.fileDiff = null;
+    this.fileDiffToken = 0;
 
     state.subscribe("codeview:font-changed", () => {
       if (this.viewportEl && this.rawLines.length) {
         const rowH = getCodeRowHeight();
-        if (this.spacerEl) this.spacerEl.style.height = `${this.rawLines.length * rowH}px`;
+        if (this.spacerEl) this.spacerEl.style.height = `${this.rowCount() * rowH}px`;
         this.updateVisibleLines();
         this.renderMinimap();
       }
@@ -341,6 +345,9 @@ export class VirtualEditor {
     this.currentVersion = tabData.version || state.currentVersion;
     this.targetCursorLine = tabData.cursorLine || 1;
     this.diffMarks = tabData.diffMarks?.ranges?.length ? tabData.diffMarks : null;
+    // A re-render starts from the plain file; loadFileContent() re-enters the diff the tab records
+    this.fileDiff = null;
+    this.fileDiffToken++;
     this.diffMarkedLines = new Set();
     for (const [a, b] of this.diffMarks?.ranges || []) {
       for (let n = a; n <= b; n++) this.diffMarkedLines.add(n);
@@ -380,8 +387,10 @@ export class VirtualEditor {
               ± ${(this.diffMarks.commit || "").slice(0, 8)}: ${this.diffMarkedLines.size} line${this.diffMarkedLines.size === 1 ? "" : "s"} ${this.diffMarks.kind === "del" ? "removed" : "changed"}
               <button data-diffnav="-1" title="Previous change">↑</button><button data-diffnav="1" title="Next change">↓</button><button data-diffnav="0" title="Clear change markers">✕</button>
             </span>` : ""}
+            <span id="code-filediff-chip" class="code-filediff-chip" hidden></span>
             <span id="file-last-changed" class="code-last-changed" style="display:none;font-size:11px;color:var(--text-muted);margin-right:8px;padding:3px 8px;background:var(--bg-tertiary);border-radius:4px;border:1px solid var(--border-color);align-items:center;gap:4px;cursor:pointer;" title="Click to view full commit history"></span>
             <button class="code-btn" id="btn-kconfig-engine" title="KConfig engine this file follows"></button>
+            <button class="code-btn" id="btn-file-diff" title="Diff this file with another revision or another file">⇄ Diff</button>
             <button class="code-btn" id="btn-file-history" title="View commit history for this file">📜 History</button>
             <button class="code-btn" id="btn-toggle-blame" title="Annotate every line with the commit that last changed it">Blame</button>
             <button class="code-btn" id="btn-copy-raw">Copy File</button>
@@ -427,7 +436,8 @@ export class VirtualEditor {
     this.minimapCanvas = containerEl.querySelector("#minimap-canvas");
 
     // Attach 100% copy fidelity handler
-    const clipboard = new FidelityClipboard(() => this.rawLines);
+    // A diff mixes both files' lines: its selections are copied as the browser shows them
+    const clipboard = new FidelityClipboard(() => (this.fileDiff ? [] : this.rawLines));
     clipboard.attach(this.linesContainer);
 
     // Toolbar actions
@@ -462,8 +472,25 @@ export class VirtualEditor {
       };
     });
 
+    const fileDiffBtn = containerEl.querySelector("#btn-file-diff");
+    fileDiffBtn.onclick = (e) => {
+      e.stopPropagation();
+      if (!this.rawLines.length) {
+        toast.info("This file has no text lines to diff");
+        return;
+      }
+      showDiffPicker(fileDiffBtn, {
+        tabId: this.tabId,
+        version: this.currentVersion,
+        path: this.currentFilePath,
+        current: this.fileDiff?.target || this.tabData.diffWith || null,
+        onPick: (target) => this.enterFileDiff(target),
+      });
+    };
+
     const blameBtn = containerEl.querySelector("#btn-toggle-blame");
     blameBtn.onclick = async () => {
+      if (this.fileDiff) return;
       if (this.docMode === "rendered") this.setDocMode("source");
       this.showBlame = !this.showBlame;
       blameBtn.classList.toggle("active", this.showBlame);
@@ -513,7 +540,7 @@ export class VirtualEditor {
 
         e.stopPropagation();
         const row = tokenSpan.closest(".code-row");
-        const lineNo = row ? parseInt(row.dataset.lineNo, 10) : 1;
+        const lineNo = row ? (parseInt(row.dataset.lineNo, 10) || 1) : 1;
         const astId = parseInt(tokenSpan.dataset.astId || "0", 10);
         const typeId = parseInt(tokenSpan.dataset.typeId || "0", 10);
         const name = tokenSpan.dataset.name || tokenSpan.textContent;
@@ -547,7 +574,7 @@ export class VirtualEditor {
         e.preventDefault();
         e.stopPropagation();
         const row = tokenSpan.closest(".code-row");
-        const lineNo = row ? parseInt(row.dataset.lineNo, 10) : 1;
+        const lineNo = row ? (parseInt(row.dataset.lineNo, 10) || 1) : 1;
         const astId = parseInt(tokenSpan.dataset.astId || "0", 10);
         const typeId = parseInt(tokenSpan.dataset.typeId || "0", 10);
         const name = tokenSpan.dataset.name || tokenSpan.textContent;
@@ -574,7 +601,7 @@ export class VirtualEditor {
       e.stopPropagation();
 
       const row = e.target.closest(".code-row");
-      const lineNo = row ? parseInt(row.dataset.lineNo, 10) : 1;
+      const lineNo = row ? (parseInt(row.dataset.lineNo, 10) || 1) : 1;
       const lineText = (this.rawLines && this.rawLines[lineNo - 1]) || "";
       const selection = window.getSelection() ? window.getSelection().toString().trim() : "";
 
@@ -781,6 +808,11 @@ export class VirtualEditor {
       this.updateVisibleLines();
       this.renderMinimap();
       this.updateMinimapSlider();
+
+      // The tab was left showing a diff (or a deep link asks for one): show it again
+      if (this.tabData.diffWith?.version && this.tabData.diffWith?.path) {
+        await this.enterFileDiff(this.tabData.diffWith, { restoring: true });
+      }
     } catch (err) {
       this.linesContainer.innerHTML = `
         <div style="padding:20px;color:var(--accent-red);">
@@ -863,8 +895,314 @@ export class VirtualEditor {
     this.rememberScrollPosition();
   }
 
+  /** Rows the viewport scrolls through: the file's lines, or the rows of the diff it shows. */
+  rowCount() {
+    const fd = this.fileDiff;
+    if (!fd) return this.rawLines.length;
+    return fd.layout === "split" ? fd.pairs.length : fd.rows.length;
+  }
+
+  /** Line of the tab's own file at diff row `i` (0 when that row only exists in the other file). */
+  diffShownLineAt(i) {
+    const fd = this.fileDiff;
+    if (fd.layout !== "split") return fd.rows[i]?.s || 0;
+    const p = fd.pairs[i];
+    return (p?.r?.s || p?.l?.s) || 0;
+  }
+
+  /** First line of the own file shown at or below the top of the viewport. */
+  topShownLine() {
+    const rowH = getCodeRowHeight();
+    const top = Math.floor((this.viewportEl?.scrollTop || 0) / rowH);
+    if (!this.fileDiff) return top + 1;
+    const total = this.rowCount();
+    for (let i = top; i < total; i++) {
+      const s = this.diffShownLineAt(i);
+      if (s) return s;
+    }
+    return Math.max(1, this.rawLines.length);
+  }
+
+  /** Diff row showing own-file line `line` (or the first one after it). */
+  diffRowOfLine(line) {
+    const total = this.rowCount();
+    for (let i = 0; i < total; i++) {
+      if (this.diffShownLineAt(i) >= line) return i;
+    }
+    return Math.max(0, total - 1);
+  }
+
+  /**
+   * Show this file diffed with `target` ({ version, path, swap }): by default the target is the base
+   * and this tab's file the new side; `swap` reverses them. Only the changed lines are fetched, the
+   * rest is this tab's own text (`buildDiffRows`). Records the choice on the tab (and so in its URL).
+   */
+  async enterFileDiff(target, { restoring = false } = {}) {
+    if (!this.rawLines.length || !this.isLive()) return;
+    const token = ++this.fileDiffToken;
+    const swap = Boolean(target.swap);
+    const pick = { version: target.version, path: String(target.path || "").replace(/^\/+|\/+$/g, ""), swap };
+    const chip = this.containerEl.querySelector("#code-filediff-chip");
+    chip.hidden = false;
+    chip.className = "code-filediff-chip loading";
+    chip.textContent = `⇄ Loading diff with ${diffSideLabel(pick.version, pick.path, this.currentFilePath)}…`;
+    const [va, pa, vb, pb] = swap
+      ? [this.currentVersion, this.currentFilePath, pick.version, pick.path]
+      : [pick.version, pick.path, this.currentVersion, this.currentFilePath];
+    let res;
+    try {
+      res = await api.getBlobDiff(va, pa, vb, pb);
+    } catch (err) {
+      if (token !== this.fileDiffToken || !this.isLive()) return;
+      toast.error(`Diff with ${diffSideLabel(pick.version, pick.path, this.currentFilePath)} failed: ${err.message}`);
+      // A diff that cannot be shown is not kept on the tab; the one already on screen stays
+      if (this.fileDiff) this.updateFileDiffChip();
+      else this.exitFileDiff();
+      return;
+    }
+    if (token !== this.fileDiffToken || !this.isLive()) return;
+    if (!res || res.binary) {
+      toast.warning("Binary files differ: there is no line diff to show");
+      if (this.fileDiff) this.updateFileDiffChip();
+      else this.exitFileDiff();
+      return;
+    }
+
+    if (this.docMode === "rendered") this.setDocMode("source");
+    const topLine = this.topShownLine();
+    const { rows, blocks } = buildDiffRows(res.hunks, this.rawLines, !swap, res.truncated);
+    const { pairs, blocks: pairBlocks } = pairDiffRows(rows);
+    this.fileDiff = { target: pick, res, rows, blocks, pairs, pairBlocks, layout: this.tabData.diffLayout === "split" ? "split" : "unified", lastJump: null };
+    if (JSON.stringify(this.tabData.diffWith || null) !== JSON.stringify(pick)) {
+      state.updateTabState(this.tabId, { diffWith: pick }, { replace: true });
+      this.tabData.diffWith = pick;
+    }
+
+    // Blame and commit change markers annotate the plain file: hidden while the diff is shown
+    if (this.showBlame) {
+      this.showBlame = false;
+      this.containerEl.querySelector("#btn-toggle-blame")?.classList.remove("active");
+    }
+    this.setPlainOnlyControls(false);
+
+    const rowH = getCodeRowHeight();
+    this.spacerEl.style.height = `${this.rowCount() * rowH}px`;
+    const savedTop = Number(this.tabData?.scrollTop);
+    if (restoring && Number.isFinite(savedTop) && savedTop > 0) {
+      this.viewportEl.scrollTop = savedTop;
+    } else {
+      this.viewportEl.scrollTop = Math.max(0, this.diffRowOfLine(topLine) * rowH);
+    }
+    this.updateFileDiffChip();
+    this.updateVisibleLines();
+    this.renderMinimap();
+    this.updateMinimapSlider();
+    this.rememberScrollPosition();
+    if (!restoring) {
+      if (res.identical) toast.info("The two files are identical");
+      else if (!blocks.length) toast.info("No line differs between the two files");
+    }
+    if (res.truncated) toast.warning("The diff is too large: it stops after the last change that could be loaded");
+  }
+
+  /** Back to the plain file, at the line the diff was showing. */
+  exitFileDiff() {
+    this.fileDiffToken++;
+    const topLine = this.fileDiff ? this.topShownLine() : null;
+    this.fileDiff = null;
+    state.updateTabState(this.tabId, { diffWith: null }, { replace: true });
+    delete this.tabData.diffWith;
+    this.setPlainOnlyControls(true);
+    const chip = this.containerEl?.querySelector("#code-filediff-chip");
+    if (chip) chip.hidden = true;
+    if (!this.viewportEl || !this.rawLines.length) return;
+    const rowH = getCodeRowHeight();
+    this.spacerEl.style.height = `${this.rawLines.length * rowH}px`;
+    if (topLine) this.viewportEl.scrollTop = (topLine - 1) * rowH;
+    this.updateVisibleLines();
+    this.renderMinimap();
+    this.updateMinimapSlider();
+    this.rememberScrollPosition();
+  }
+
+  /** Blame and the commit change-marker chip belong to the plain file view. */
+  setPlainOnlyControls(enabled) {
+    const blameBtn = this.containerEl?.querySelector("#btn-toggle-blame");
+    if (blameBtn) {
+      blameBtn.disabled = !enabled;
+      blameBtn.title = enabled ? "Annotate every line with the commit that last changed it" : "Blame annotates the plain file: close the diff (✕) to use it";
+    }
+    const markChip = this.containerEl?.querySelector(".code-diffmark-chip");
+    if (markChip) markChip.style.display = enabled ? "" : "none";
+    this.containerEl?.querySelector("#btn-file-diff")?.classList.toggle("active", !enabled);
+  }
+
+  /** Unified rows (old/new gutters) or side-by-side pairs; toggled from the diff chip. */
+  setDiffLayout(layout) {
+    const fd = this.fileDiff;
+    if (!fd || fd.layout === layout) return;
+    const topLine = this.topShownLine();
+    fd.layout = layout;
+    fd.lastJump = null;
+    state.updateTabState(this.tabId, { diffLayout: layout === "split" ? "split" : "" }, { replace: true });
+    if (layout === "split") this.tabData.diffLayout = "split";
+    else delete this.tabData.diffLayout;
+    const rowH = getCodeRowHeight();
+    this.spacerEl.style.height = `${this.rowCount() * rowH}px`;
+    this.viewportEl.scrollTop = Math.max(0, this.diffRowOfLine(topLine) * rowH);
+    this.updateFileDiffChip();
+    this.updateVisibleLines();
+    this.renderMinimap();
+    this.updateMinimapSlider();
+    this.rememberScrollPosition();
+  }
+
+  /** Scroll to the previous/next change block of the diff. */
+  jumpToDiffHunk(dir) {
+    const fd = this.fileDiff;
+    const blocks = fd?.layout === "split" ? fd.pairBlocks : fd?.blocks;
+    if (!blocks?.length) return;
+    const rowH = getCodeRowHeight();
+    const top = this.viewportEl.scrollTop;
+    let idx;
+    if (fd.lastJump && Math.abs(fd.lastJump.top - top) < 1) {
+      idx = fd.lastJump.idx + dir;
+    } else {
+      const cur = Math.floor(top / rowH) + 5;
+      idx = dir > 0 ? blocks.findIndex(([a]) => a > cur) : blocks.findLastIndex(([a]) => a < cur);
+    }
+    if (idx < 0 || idx >= blocks.length) idx = dir > 0 ? 0 : blocks.length - 1;
+    this.viewportEl.scrollTop = Math.max(0, (blocks[idx][0] - 5) * rowH);
+    fd.lastJump = { idx, top: this.viewportEl.scrollTop };
+    this.updateFileDiffChip();
+    this.updateVisibleLines();
+  }
+
+  /** `⇄ base → target  +A −D` with the layout toggle, ↑/↓, swap and close. */
+  updateFileDiffChip() {
+    const chip = this.containerEl?.querySelector("#code-filediff-chip");
+    const fd = this.fileDiff;
+    if (!chip) return;
+    if (!fd) {
+      chip.hidden = true;
+      return;
+    }
+    const own = diffSideLabel(this.currentVersion, this.currentFilePath, this.currentFilePath);
+    const other = diffSideLabel(fd.target.version, fd.target.path, this.currentFilePath);
+    const [base, tgt] = fd.target.swap ? [own, other] : [other, own];
+    const r = fd.res;
+    const blocks = fd.layout === "split" ? fd.pairBlocks : fd.blocks;
+    // "–/N" before the first jump: the same width as "n/N", so the chip never shifts while navigating
+    const at = fd.lastJump ? `${fd.lastJump.idx + 1}/${blocks.length}` : `–/${blocks.length}`;
+    const split = fd.layout === "split";
+    chip.hidden = false;
+    chip.className = "code-filediff-chip";
+    chip.title = `Base: ${fd.target.swap ? `${this.currentFilePath} @ ${this.currentVersion}` : `${fd.target.path} @ ${fd.target.version}`}\n`
+      + `Target: ${fd.target.swap ? `${fd.target.path} @ ${fd.target.version}` : `${this.currentFilePath} @ ${this.currentVersion}`}\n`
+      + "Click ⇄ Diff to pick another file or revision";
+    chip.innerHTML = `
+      <span class="code-filediff-label">⇄ ${escapeHtml(base)} → ${escapeHtml(tgt)}</span>
+      ${r.identical ? `<span class="code-filediff-muted">identical</span>` : `<span class="code-filediff-add">+${r.additions}</span><span class="code-filediff-del">−${r.deletions}</span>`}
+      ${r.truncated ? `<span class="code-filediff-warn" title="The diff was cut at the server's size limit">⚠ truncated</span>` : ""}
+      ${blocks.length ? `<span class="code-filediff-muted code-filediff-pos" style="width:${String(blocks.length).length * 2 + 1}ch" title="Change blocks">${at}</span>` : ""}
+      <button data-fd="layout" title="${split ? "Unified view (one column, old and new line numbers)" : "Side-by-side view (base left, target right)"}">${split ? "☰" : "◫"}</button>
+      <button data-fd="-1" title="Previous change" ${blocks.length ? "" : "disabled"}>↑</button><button data-fd="1" title="Next change" ${blocks.length ? "" : "disabled"}>↓</button>
+      <button data-fd="swap" title="Swap base and target">⇆</button><button data-fd="close" title="Close the diff">✕</button>`;
+    chip.querySelectorAll("[data-fd]").forEach((btn) => {
+      btn.onclick = (e) => {
+        e.stopPropagation();
+        const act = btn.dataset.fd;
+        if (act === "layout") this.setDiffLayout(split ? "unified" : "split");
+        else if (act === "swap") this.enterFileDiff({ ...fd.target, swap: !fd.target.swap });
+        else if (act === "close") this.exitFileDiff();
+        else this.jumpToDiffHunk(parseInt(act, 10));
+      };
+    });
+  }
+
+  /** Text of one diff row: syntax-highlighted when it is a line of this tab's file, plain otherwise. */
+  diffRowHtml(row, asShown) {
+    if (asShown && row.s) {
+      const isDimmed = !this.dimSuspended && this.dimmedLines.has(row.s);
+      return this.astOverlay.renderLineHtml(row.s, this.rawLines[row.s - 1] ?? row.t, isDimmed);
+    }
+    return escapeHtml(row.t);
+  }
+
+  renderDiffLines() {
+    const fd = this.fileDiff;
+    const rowH = getCodeRowHeight();
+    const scrollTop = this.viewportEl.scrollTop;
+    const viewportHeight = this.viewportEl.clientHeight || 600;
+    const total = this.rowCount();
+    const startIdx = Math.max(0, Math.floor(scrollTop / rowH) - BUFFER_LINES);
+    const endIdx = Math.min(total - 1, Math.ceil((scrollTop + viewportHeight) / rowH) + BUFFER_LINES);
+    this.linesContainer.style.transform = `translateY(${startIdx * rowH}px)`;
+    const KIND = { " ": "diff-ctx", "+": "diff-add", "-": "diff-del" };
+    const SIGN = { " ": " ", "+": "+", "-": "−" };
+    let html = "";
+    if (fd.layout === "split") {
+      // The tab's own file is the target (right) unless swapped; context rows are the same row on both sides
+      const shownSide = fd.target.swap ? "l" : "r";
+      const half = (row, side) => {
+        if (!row) return `<div class="diff-half diff-filler"><div class="gutter-line-no diff-ln"></div><div class="diff-sign"></div><div class="code-text"></div></div>`;
+        const ln = side === "l" ? row.o : row.n;
+        return `<div class="diff-half ${KIND[row.k]}"><div class="gutter-line-no diff-ln">${ln ?? ""}</div><div class="diff-sign">${SIGN[row.k]}</div><div class="code-text">${this.diffRowHtml(row, row.k !== " " || side === shownSide)}</div></div>`;
+      };
+      for (let i = startIdx; i <= endIdx; i++) {
+        const p = fd.pairs[i];
+        const s = this.diffShownLineAt(i);
+        const hl = s && s === this.targetCursorLine ? " highlighted-line" : "";
+        html += `<div class="code-row diff-split-row${hl}" data-line-no="${s || ""}">${half(p.l, "l")}${half(p.r, "r")}</div>`;
+      }
+    } else {
+      for (let i = startIdx; i <= endIdx; i++) {
+        const r = fd.rows[i];
+        const hl = r.s && r.s === this.targetCursorLine ? " highlighted-line" : "";
+        html += `<div class="code-row diff-row ${KIND[r.k]}${hl}" data-line-no="${r.s || ""}">`
+          + `<div class="gutter-line-no diff-ln">${r.o ?? ""}</div><div class="gutter-line-no diff-ln">${r.n ?? ""}</div>`
+          + `<div class="diff-sign">${SIGN[r.k]}</div><div class="code-text">${this.diffRowHtml(r, true)}</div></div>`;
+      }
+    }
+    this.linesContainer.innerHTML = html;
+  }
+
+  /** Minimap of the diff rows: text lengths, and a red/green (amber: changed pair) bar per change. */
+  renderDiffMinimap(ctx, m, w) {
+    const fd = this.fileDiff;
+    const split = fd.layout === "split";
+    const h = Math.max(1, m.lineScale);
+    for (let i = 0; i < m.totalLines; i++) {
+      const p = split ? fd.pairs[i] : null;
+      const text = split ? (p.r || p.l).t : fd.rows[i].t;
+      const len = Math.min(w - 10, (text || "").length * 0.8);
+      if (len > 0) ctx.fillRect(6, i * m.lineScale, len, h);
+    }
+    const colors = { add: "rgba(63, 185, 80, 0.9)", del: "rgba(248, 81, 73, 0.9)", mod: "rgba(210, 153, 34, 0.9)" };
+    for (let i = 0; i < m.totalLines; i++) {
+      let kind = "";
+      if (split) {
+        const p = fd.pairs[i];
+        const del = p.l?.k === "-";
+        const add = p.r?.k === "+";
+        kind = del && add ? "mod" : del ? "del" : add ? "add" : "";
+      } else {
+        const k = fd.rows[i].k;
+        kind = k === "+" ? "add" : k === "-" ? "del" : "";
+      }
+      if (!kind) continue;
+      ctx.fillStyle = colors[kind];
+      ctx.fillRect(0, i * m.lineScale, 4, Math.max(2, m.lineScale));
+    }
+    ctx.fillStyle = "rgba(139, 148, 158, 0.4)";
+  }
+
   updateVisibleLines() {
     if (!this.viewportEl || this.rawLines.length === 0) return;
+    if (this.fileDiff) {
+      this.renderDiffLines();
+      return;
+    }
 
     const rowH = getCodeRowHeight();
     const scrollTop = this.viewportEl.scrollTop;
@@ -910,7 +1248,7 @@ export class VirtualEditor {
 
   /** Document height the minimap maps, and the height it is drawn at (never taller than its track). */
   minimapMetrics() {
-    const totalLines = this.rawLines.length;
+    const totalLines = this.rowCount();
     const trackH = (this.minimapCanvas?.parentElement?.clientHeight) || 0;
     if (!totalLines || !trackH) return null;
     // One pixel per line at most: the drawing is exactly as deep as the file is long
@@ -940,14 +1278,18 @@ export class VirtualEditor {
     if (!m) return;
     ctx.fillStyle = "rgba(139, 148, 158, 0.4)";
 
-    for (let i = 0; i < m.totalLines; i++) {
-      const len = Math.min(w - 10, (this.rawLines[i] || "").length * 0.8);
-      if (len > 0) {
-        ctx.fillRect(4, i * m.lineScale, len, Math.max(1, m.lineScale));
+    if (this.fileDiff) {
+      this.renderDiffMinimap(ctx, m, w);
+    } else {
+      for (let i = 0; i < m.totalLines; i++) {
+        const len = Math.min(w - 10, (this.rawLines[i] || "").length * 0.8);
+        if (len > 0) {
+          ctx.fillRect(4, i * m.lineScale, len, Math.max(1, m.lineScale));
+        }
       }
     }
 
-    if (this.diffMarks) {
+    if (this.diffMarks && !this.fileDiff) {
       ctx.fillStyle = this.diffMarks.kind === "del" ? "rgba(248, 81, 73, 0.9)" : "rgba(63, 185, 80, 0.9)";
       for (const [a, b] of this.diffMarks.ranges) {
         ctx.fillRect(0, (a - 1) * m.lineScale, 4, Math.max(2, (b - a + 1) * m.lineScale));

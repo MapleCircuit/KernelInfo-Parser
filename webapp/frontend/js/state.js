@@ -779,6 +779,18 @@ class GlobalState {
         delete existing.scrollTop;
       }
       if ("diffMarks" in tabData) existing.diffMarks = tabData.diffMarks;
+      // "⇄ Diff" (§5.21): a deep link sets or clears the file the tab is diffed with; another diff
+      // has other rows, so the position the tab was left at no longer applies
+      if ("diffWith" in tabData) {
+        const next = tabData.diffWith?.version ? tabData.diffWith : null;
+        if (JSON.stringify(next) !== JSON.stringify(existing.diffWith || null)) delete existing.scrollTop;
+        if (next) existing.diffWith = next;
+        else delete existing.diffWith;
+      }
+      if ("diffLayout" in tabData) {
+        if (tabData.diffLayout) existing.diffLayout = tabData.diffLayout;
+        else delete existing.diffLayout;
+      }
       if (tabData.symbol !== undefined) existing.symbol = tabData.symbol;
       if (tabData.title) existing.title = tabData.title;
       if (tabData.structName !== undefined) existing.structName = tabData.structName;

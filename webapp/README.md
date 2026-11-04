@@ -23,7 +23,7 @@ The web application is built on a decoupled, zero-trust layered architecture:
   - **Modular Routers**: Version-scoped REST controllers (`webapp/backend/routers/`).
 - **Frontend (`webapp/frontend/`)**:
   - **Zero-Build Vanilla ES-Modules**: Native browser ES6 modules requiring no Webpack, Vite, or npm build steps.
-  - **Code View & AST Overlay**: Virtualized editor (`virtual_editor.js`) with narrowest-interval disjoint token mapping, interactive in-editor folder browsing, internal snippet lexical coloring (`ast_overlay.js`), and 100% copy fidelity buffer extraction (`fidelity_clipboard.js`).
+  - **Code View & AST Overlay**: Virtualized editor (`virtual_editor.js`) with narrowest-interval disjoint token mapping, interactive in-editor folder browsing, internal snippet lexical coloring (`ast_overlay.js`), 100% copy fidelity buffer extraction (`fidelity_clipboard.js`), and a full-file **⇄ Diff** against any file at any revision, unified or side-by-side (`file_diff.js`).
   - **Interactive NodeMap**: Schematic view of DOM nodes and SVG wires, cubic bezier edge routing, topological DAG auto-layout, and real-time zoom-aware node dragging.
   - **Universal Right-Click Context Menus**: Context-adaptive right-click menu system across Code Editor (Pahole layout, Callgraphs, Line Blame popover with commit diff jump, Command Palette search, coordinate copying), File Explorer (file and folder actions), and NodeMap (AST inspect, center, remove, clear canvas).
   - **Kconfig Menuconfig & Solver**: 20-pass constraint propagation engine, terminal TUI emulation, defconfig modal picker, and 1-click prerequisite auto-solver.

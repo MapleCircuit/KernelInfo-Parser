@@ -5,6 +5,7 @@ import { api } from "../../api.js";
 import { state } from "../../state.js";
 import { refPicker, shortRef } from "../../components/ref_picker.js";
 import { downloadText } from "../../components/modal.js";
+import { previousTag } from "../code_view/file_diff.js";
 
 const PAGE_SIZE = 500;
 const KCONFIG_TYPES = { 1: "bool", 2: "tristate", 3: "string", 4: "hex", 5: "int" };
@@ -153,19 +154,7 @@ export class DiffView {
 
   /** Default base: the release tag preceding target (or the latest tag when target is a commit). */
   async defaultBaseFor(target) {
-    try {
-      const res = await api.getVersions(true);
-      // Compare a release with the previous release, a release candidate with the previous tag
-      const all = (res.versions || []).filter((v) => typeof v === "string" || v.ref_type !== 3);
-      const isPre = (name) => /-(rc|pre|alpha|beta)\d*$/.test(name);
-      const tags = all.map((v) => (typeof v === "string" ? v : v.vname)).filter((n) => n && (isPre(target) || !isPre(n) || n === target));
-      const idx = tags.indexOf(target);
-      if (idx > 0) return tags[idx - 1];
-      if (idx === -1 && tags.length > 0) return tags[tags.length - 1];
-      return tags.find((t) => t !== target) || "v3.0";
-    } catch {
-      return "v3.0";
-    }
+    return previousTag(target);
   }
 
   /**

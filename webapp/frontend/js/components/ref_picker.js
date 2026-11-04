@@ -114,7 +114,7 @@ class RefPicker {
     const q = query.toLowerCase();
 
     const [versionsRes, commitsRes] = await Promise.allSettled([
-      api.getVersions(true),
+      api.getVersionsCached(true),
       api.getCommits(this.current || "v3.0", 1, 50, query)
     ]);
     if (seq !== this.searchSeq || !this.popover) return;

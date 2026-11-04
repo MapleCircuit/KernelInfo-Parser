@@ -330,12 +330,18 @@ class UrlSynchronizer {
       if (v) state.setSelectedVersion(v);
 
       if (tabType === "code" && file) {
+        // "⇄ Diff" of the file (§5.21): dv/dp = the other file, ds=1 swapped sides, dm=split layout.
+        // A link without dv addresses the plain file, so a reused tab drops its diff.
+        const dv = params.get("dv") || "";
+        const diffWith = dv ? { version: dv, path: params.get("dp") || file, swap: params.get("ds") === "1" } : null;
         state.openTab({
           type: "code",
           title: file.split("/").pop(),
           path: file,
           cursorLine: line,
-          version: v || state.currentVersion
+          version: v || state.currentVersion,
+          diffWith,
+          diffLayout: dv && params.get("dm") === "split" ? "split" : "",
         });
       } else if (tabType === "kconfig") {
         state.openTab({
@@ -453,6 +459,12 @@ class UrlSynchronizer {
       params.set("file", activeTab.path);
       if (activeTab.cursorLine && activeTab.cursorLine > 1) {
         params.set("line", activeTab.cursorLine);
+      }
+      if (activeTab.diffWith?.version) {
+        params.set("dv", activeTab.diffWith.version);
+        if (activeTab.diffWith.path && activeTab.diffWith.path !== activeTab.path) params.set("dp", activeTab.diffWith.path);
+        if (activeTab.diffWith.swap) params.set("ds", "1");
+        if (activeTab.diffLayout === "split") params.set("dm", "split");
       }
     } else if (activeTab.type === "explorer") {
       if (activeTab.path) params.set("dir", activeTab.path);
