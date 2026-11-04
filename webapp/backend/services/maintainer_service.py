@@ -68,6 +68,36 @@ def _merge_emails(emails: list[str | None]) -> list[str]:
     return out
 
 
+def _domain_query(query: str | None) -> str | None:
+    """Domain of an `@domain` search (`"@Intel.com"` -> `"intel.com"`), or None when the query is not one.
+
+    A bare `@`, or a query with a second `@` or whitespace, stays an ordinary substring search."""
+    q = (query or "").strip()[:100]
+    if not q.startswith("@"):
+        return None
+    domain = q[1:].strip(".").casefold()
+    if not domain or "@" in domain or any(ch.isspace() for ch in domain):
+        return None
+    return domain
+
+
+def _address_in_domain(addr: str, domain: str) -> bool:
+    """True when addr's host is domain or one of its subdomains (`x@linux.intel.com` for `intel.com`).
+
+    Surrounding `<>`, `[]`, `()` and quotes are ignored; `intel.com.au` and `lintel.com` do not match."""
+    clean = addr.strip().strip("<>[]()\"'").casefold()
+    local, sep, host = clean.rpartition("@")
+    if not sep or not local:
+        return False
+    host = host.rstrip(".")
+    return host == domain or host.endswith("." + domain)
+
+
+def _emails_in_domain(field: str | None, domain: str) -> list[str]:
+    """Addresses of a (possibly comma-joined) email field that belong to domain."""
+    return [a for a in _merge_emails([field]) if _address_in_domain(a, domain)]
+
+
 def _in_ids(column: str, ids: list[int] | None) -> tuple[str, list[int]]:
     """SQL condition `column IN (ids)` and its parameters; never true for an empty or missing list."""
     if not ids:
@@ -227,9 +257,24 @@ class MaintainerService:
         _IDENTITY_CACHE["index"] = (sig, pid_to_key, members)
         return pid_to_key, members
 
+    @staticmethod
+    def _domain_person_ids(cursor: Any, domain: str) -> list[int]:
+        """person_ids of the personas with an address in domain or one of its subdomains.
+
+        LIKE narrows the scan; the exact host test runs per address, since an email field can hold
+        several comma-joined addresses."""
+        cursor.execute(
+            "SELECT person_id, email FROM m_maintainer_person WHERE person_id > 0 AND LOWER(email) LIKE %s;",
+            (f"%{sanitize_like_query(domain)}%",),
+        )
+        return [int(r["person_id"]) for r in cursor.fetchall() if _emails_in_domain(safe_decode(r["email"]), domain)]
+
     def get_overview(self, version_name: str, query: str = "") -> dict[str, Any]:
-        """List subsystem sections and maintainers with optional query filtering."""
+        """List subsystem sections and maintainers with optional query filtering.
+
+        An `@domain` query keeps the sections with a member whose address is in that domain."""
         target_q = query
+        domain = _domain_query(target_q)
         clean_q = sanitize_like_query(target_q)
         with get_db_cursor() as cursor:
             vid, vname = get_version_info(cursor, version_name)
@@ -244,7 +289,11 @@ class MaintainerService:
                 FROM m_maintainer_section s
                 WHERE {in_secs}
             """
-            if clean_q:
+            if domain:
+                in_pids, pid_params = _in_ids("mem.person_id", self._domain_person_ids(cursor, domain))
+                sql += f" AND EXISTS (SELECT 1 FROM m_maintainer_member mem WHERE mem.sec_id = s.sec_id AND {in_pids})"
+                params.extend(pid_params)
+            elif clean_q:
                 sql += """
                     AND (
                         LOWER(s.name) LIKE LOWER(%s)
@@ -362,9 +411,18 @@ class MaintainerService:
                 pid = int(r["person_id"])
                 groups.setdefault(pid_to_key.get(pid, f"p:{pid}"), []).append(r)
 
-            # Search matches any alias's name or address, and keeps the whole merged identity
+            # Search matches any alias's name or address, and keeps the whole merged identity.
+            # An `@domain` search matches the aliases' addresses in that domain or its subdomains.
+            domain = _domain_query(target_q)
             needle = (target_q or "").strip()[:100].casefold()
-            if needle:
+            matched_by_key: dict[str, list[str]] = {}
+            if domain:
+                for k, g in groups.items():
+                    hits = _merge_emails([a for r in g for a in _emails_in_domain(safe_decode(r["email"]), domain)])
+                    if hits:
+                        matched_by_key[k] = hits
+                groups = {k: g for k, g in groups.items() if k in matched_by_key}
+            elif needle:
                 groups = {
                     k: g for k, g in groups.items()
                     if any(needle in (safe_decode(r["name"]) or "").casefold() or needle in (safe_decode(r["email"]) or "").casefold() for r in g)
@@ -392,7 +450,7 @@ class MaintainerService:
                     sec_names_by_pid.setdefault(sr["person_id"], set()).add(safe_decode(sr["name"]) or "")
 
             developers = []
-            for g in groups.values():
+            for key, g in groups.items():
                 # Representative alias: one with a name and email, most subsystems, CREDITS/commit presence
                 rep = max(
                     g,
@@ -426,7 +484,7 @@ class MaintainerService:
                 if clean_role == "credits" and not in_cred:
                     continue
 
-                developers.append({
+                dev = {
                     "person_id": rep["person_id"],
                     "name": p_name,
                     "email": p_email,
@@ -437,7 +495,13 @@ class MaintainerService:
                     "is_reviewer": is_r,
                     "in_credits": in_cred,
                     "has_commits": has_c,
-                })
+                }
+                if domain:
+                    # Representative's own address first when it is one of the matches
+                    hits = matched_by_key[key]
+                    rep_hits = _emails_in_domain(p_email, domain)
+                    dev["matched_emails"] = _merge_emails(rep_hits + hits)
+                developers.append(dev)
 
             if clean_sort == "alpha":
                 developers.sort(key=lambda d: ((d["name"] or d["email"] or "").casefold(), -d["subsystems_count"]))
@@ -732,8 +796,9 @@ class MaintainerService:
             }
 
     def get_credits(self, version_name: str, query: str = "") -> dict[str, Any]:
-        """List historical CREDITS entries."""
+        """List historical CREDITS entries. An `@domain` query matches the entries' addresses only."""
         target_q = query
+        domain = _domain_query(target_q)
         clean_q = sanitize_like_query(target_q)
         with get_db_cursor() as cursor:
             vid, vname = get_version_info(cursor, version_name)
@@ -749,7 +814,11 @@ class MaintainerService:
                 JOIN m_maintainer_person p ON c.person_id = p.person_id
                 WHERE {in_credits_sql}
             """
-            if clean_q:
+            if domain:
+                in_pids, pid_params = _in_ids("p.person_id", self._domain_person_ids(cursor, domain))
+                sql += f" AND {in_pids}"
+                params.extend(pid_params)
+            elif clean_q:
                 sql += " AND (LOWER(p.name) LIKE LOWER(%s) OR LOWER(p.email) LIKE LOWER(%s) OR LOWER(c.description) LIKE LOWER(%s))"
                 params.extend([f"%{clean_q}%", f"%{clean_q}%", f"%{clean_q}%"])
             sql += " ORDER BY c.credit_id DESC;"

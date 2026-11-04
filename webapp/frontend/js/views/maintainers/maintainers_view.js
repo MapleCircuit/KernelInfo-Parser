@@ -8,10 +8,11 @@ import { escapeHtml } from "../../components/modal.js";
 
 /** Sections of the view's sidebar; the first is the default, left out of the URL (§5.26). */
 const SECTIONS = ["subsystems", "developers", "credits", "patch"];
+// A query starting with "@" (e.g. "@intel.com") filters by email domain, subdomains included (§4.5)
 const SEARCH_PLACEHOLDERS = {
-  subsystems: "Search subsystems, names, emails...",
-  developers: "Search developers, names, emails...",
-  credits: "Search CREDITS entries...",
+  subsystems: "Search subsystems, names, emails, @domain...",
+  developers: "Search developers, names, emails, @domain...",
+  credits: "Search CREDITS entries, @domain...",
   patch: "Search...",
 };
 const EMPTY_DETAIL = `
@@ -235,13 +236,19 @@ export class MaintainersView {
         roleBadges.push(`<span class="m-role-badge m-role-badge-c">CREDITS</span>`);
       }
 
+      // Under an @domain search, show the address that matched instead of the primary one
+      const matched = d.matched_emails || [];
+      const shownEmail = matched[0] || d.email || "";
+      const emailTitle = matched.length ? matched.join(", ") : shownEmail;
+      const moreMatched = matched.length > 1 ? ` +${matched.length - 1}` : "";
+
       card.innerHTML = `
         <div class="subsystem-name">
           <span style="font-weight:600;">${escapeHtml(d.name || d.email || "Unknown")}</span>
           ${d.subsystems_count > 0 ? `<span class="dev-subsystems-count">${d.subsystems_count} ${d.subsystems_count === 1 ? "subsystem" : "subsystems"}</span>` : ""}
         </div>
         <div class="subsystem-lead" style="display:flex;align-items:center;justify-content:space-between;gap:6px;margin-top:4px;">
-          <span class="dev-email-text" title="${escapeHtml(d.email || "")}">${escapeHtml(d.email || "")}</span>
+          <span class="dev-email-text" title="${escapeHtml(emailTitle)}">${escapeHtml(shownEmail)}${moreMatched}</span>
           <div class="dev-badges-group">${roleBadges.join("")}</div>
         </div>
       `;

@@ -13,8 +13,11 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from tests import require_indexed_ref
 from webapp.backend.database.pool import get_db_cursor
 from webapp.backend.services.maintainer_service import (
+    _address_in_domain,
     _build_identity_index,
     _clean_name,
+    _domain_query,
+    _emails_in_domain,
     _identity_key,
     MaintainerService,
 )
@@ -109,6 +112,60 @@ class TestWebAppMaintainerEndpoints(unittest.TestCase):
         self.assertEqual(idx[4], idx[1])  # dominant owner (larger identity) wins the name-less alias
         self.assertNotEqual(idx[3], idx[1])  # named identities never merge by email
         self.assertNotEqual(idx[5], idx[6])
+
+    def test_domain_query_rules(self) -> None:
+        self.assertEqual(_domain_query("@Intel.com"), "intel.com")
+        self.assertEqual(_domain_query("  @intel.com. "), "intel.com")
+        self.assertIsNone(_domain_query("intel.com"))
+        self.assertIsNone(_domain_query("@"))
+        self.assertIsNone(_domain_query("@a@intel.com"))
+        self.assertIsNone(_domain_query("jdoe@intel.com"))
+
+        self.assertTrue(_address_in_domain("jdoe@intel.com", "intel.com"))
+        self.assertTrue(_address_in_domain("JDoe@Linux.Intel.COM", "intel.com"))
+        self.assertTrue(_address_in_domain("[fenghua.yu@intel.com]", "intel.com"))
+        self.assertTrue(_address_in_domain("<x@sc.intel.com>", "intel.com"))
+        self.assertFalse(_address_in_domain("tony.luck@lintel.com", "intel.com"))
+        self.assertFalse(_address_in_domain("x@intel.com.au", "intel.com"))
+        self.assertFalse(_address_in_domain("x@intel.community", "intel.com"))
+        self.assertFalse(_address_in_domain("x at intel.com", "intel.com"))
+        self.assertFalse(_address_in_domain("@intel.com", "intel.com"))
+        self.assertFalse(_address_in_domain("x@intel.com", "linux.intel.com"))
+
+        self.assertEqual(
+            _emails_in_domain("a@intel.com, b@yahoo.com, c@linux.intel.com", "intel.com"),
+            ["a@intel.com", "c@linux.intel.com"],
+        )
+
+    def test_domain_search_across_sections(self) -> None:
+        require_indexed_ref("v3.0")
+        devs = maintainer_service.get_developers("v3.0", query="@intel.com")["developers"]
+        self.assertGreater(len(devs), 0)
+        for d in devs:
+            self.assertTrue(d["matched_emails"], d)
+            self.assertTrue(all(_address_in_domain(e, "intel.com") for e in d["matched_emails"]), d)
+        # Subdomains are included; a subdomain filter is a subset of its parent domain
+        sub = maintainer_service.get_developers("v3.0", query="@linux.intel.com")["developers"]
+        self.assertGreater(len(sub), 0)
+        self.assertTrue({d["person_id"] for d in sub} <= {d["person_id"] for d in devs})
+        self.assertTrue(any(e.casefold().endswith("@linux.intel.com") for d in devs for e in d["matched_emails"]))
+        # A plain search carries no matched_emails and is unchanged
+        self.assertNotIn("matched_emails", maintainer_service.get_developers("v3.0", query="intel")["developers"][0])
+
+        secs = get_maintainers_overview("v3.0", "@intel.com")["sections"]
+        self.assertGreater(len(secs), 0)
+        for sec in secs[:10]:
+            detail = maintainer_service.get_section_detail("v3.0", str(sec["sec_id"]))
+            self.assertTrue(
+                any(_emails_in_domain(m["email"], "intel.com") for m in detail["members"]),
+                sec["name"],
+            )
+
+        for c in get_credits_overview("v3.0", "@intel.com")["credits"]:
+            self.assertTrue(any(_address_in_domain(e, "intel.com") for e in c["emails"]), c)
+
+        self.assertEqual(maintainer_service.get_developers("v3.0", query="@no-such-domain.invalid")["developers"], [])
+        self.assertEqual(get_maintainers_overview("v3.0", "@no-such-domain.invalid")["sections"], [])
 
     def test_developers_and_credits_have_no_duplicates(self) -> None:
         devs = maintainer_service.get_developers("v3.0")["developers"]

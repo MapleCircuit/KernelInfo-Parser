@@ -843,13 +843,15 @@ Validation, import, export and configuration comparison run in the browser on th
 
 ### 4.5. Maintainers & CREDITS API
 
+**`@domain` search** (`_domain_query`, `_address_in_domain`): a `q` that starts with `@` (e.g. `@intel.com`) filters by email domain instead of substring. An address matches when its host is the domain or one of its subdomains, case-insensitively (`@intel.com` matches `x@intel.com` and `x@linux.intel.com`, not `x@lintel.com` or `x@intel.com.au`; `@linux.intel.com` narrows to that subdomain). Each address of a comma-joined email field is tested on its own, with surrounding `<>`, `[]`, `()` and quotes ignored; disguised addresses (`x at intel.com`, `x#intel.com`) do not match. Names, subsystem names and CREDITS descriptions are not searched. A bare `@`, or a query with a second `@` or whitespace (`jdoe@intel`), is an ordinary substring search. `/overview` and `/credits` resolve the matching `person_id`s first (`MaintainerService._domain_person_ids`: a `LIKE` prefilter, then the host test per address).
+
 **Version scoping** (`MaintainerService._version_scope`): sections and CREDITS entries are content addressed. A section unchanged since an earlier MAINTAINERS keeps the row stored with that earlier blob (`m_maintainer_section.blob_id`), so the sections of a version are the rows whose `ast_id` is one of its MAINTAINERS blob's tags (`m_bridge_tag` → `m_tag.ast_id`), one per section name (the newest row when several share it); CREDITS entries likewise through `m_credits_entry.ast_id`. v3.0 lists 925 sections and 507 CREDITS entries, exactly its files' contents. A version whose MAINTAINERS (or CREDITS) blob was never parsed lists none of them (`indexed: false` in the overview) rather than every section ever parsed. The id lists are cached per blob (`_BLOB_SECTIONS_CACHE`, `_BLOB_CREDITS_CACHE`, 64 entries each); the subsystem matcher per version (`_MAINTAINER_CACHE`, 16 entries).
 
 #### `GET /api/maintainers/{version_name}/overview`
 Search and list the subsystems of the version's `MAINTAINERS` file.
 - **Parameters**:
   - `version_name` (path): Revision.
-  - `q` (query): Search filter across subsystem names, maintainer names, and emails.
+  - `q` (query): Search filter across subsystem names, maintainer names, and emails. `@domain` keeps the sections with a member whose address is in that domain (see **`@domain` search**).
 - **Response**:
 ```json
 {
@@ -990,7 +992,7 @@ Search the entries of the version's `CREDITS` file and their biographical detail
 Returns one entry per developer: several rows of one entry and the same person under other alias personas collapse into the newest entry. Its addresses are unioned into `emails`, empty bio fields are filled from older revisions, and `email` falls back to the merged list when the newest revision lost it. Names are cleaned (see **Persona identity merging**).
 - **Parameters**:
   - `version_name` (path): Revision.
-  - `q` (query): Search query string.
+  - `q` (query): Search on name, email and description; `@domain` matches the entry's addresses only (see **`@domain` search**).
 - **Response**:
 ```json
 {
@@ -1020,7 +1022,7 @@ Search and list all kernel developers, maintainers, reviewers, and contributors 
 - The merged entry uses the alias with a name and email, most subsystems, CREDITS, commits as `person_id`/`email`; flags are OR-ed over aliases, `subsystems_count` is the distinct subsystem names across aliases. The search and `role` filter apply to the merged identity (a match on any alias returns the whole identity); sorting happens after merging.
 - **Parameters**:
   - `version_name` (path): Revision (`subsystems_count`, `is_maintainer`, `is_reviewer` and `in_credits` count only its MAINTAINERS and CREDITS).
-  - `q` (query): Case-insensitive search on developer name or email.
+  - `q` (query): Case-insensitive search on developer name or email. `@domain` keeps the identities with an alias address in that domain, and each entry then carries `matched_emails`: those addresses, the representative's own first (the Developers card shows the first).
   - `role` (query): Role filter (`"all"`, `"maintainer"`, `"reviewer"`, `"credits"`). Default `"all"`.
   - `sort` (query): Sort order (`"activity"` for subsystems count descending, or `"alpha"` for alphabetical A-Z). Default `"activity"`.
 - **Response**:
@@ -2034,7 +2036,7 @@ The frontend implements systematic middle-click capture (`auxclick` with `e.butt
    - Displays avatar initials, author email, CREDITS biographical data (description, project URL, PGP keys, snail mail), Git stats (authored commits count), and maintained subsystems.
    - **Maintainers "Developers" Directory**:
      - The Maintainers view incorporates a dedicated **"Developers"** directory (`Subsystems` | `Developers` | `CREDITS` | `Patch Reviewer`) listing every developer from `m_maintainer_person`, one card per merged identity (alias personas collapsed, §4.5 `/developers`).
-     - Supports live name/email search, category filter pills (`All`, `Maintainers`, `Reviewers`, `CREDITS`), and an Activity (subsystems count) vs. A-Z alphabetical sort toggle.
+     - Supports live name/email search (`@intel.com` filters by email domain, subdomains included, in the Subsystems, Developers and CREDITS lists, §4.5; a developer card then shows the matching address, `+N` when several aliases match, all of them in its tooltip), category filter pills (`All`, `Maintainers`, `Reviewers`, `CREDITS`), and an Activity (subsystems count) vs. A-Z alphabetical sort toggle.
      - Selecting any developer renders their complete profile card in the detail pane with maintained subsystems (clickable to jump into the Subsystems tab) and a direct "View All Commits" action button.
      - **Deep links**: the sidebar section, the search, the developer role pill and sort, and the inspected subsystem or developer are recorded on the tab (`section`, `query`, `role`, `sort`, `secId` / `person`, via `persistTabState`) and written to the URL hash (`#tab=maintainers&view=<developers|credits|patch>&sec=<sec_id>&person=<email>&q=…&role=…&sort=alpha`, §5.26). One selection is held at a time: inspecting a subsystem drops `person` and vice versa, and the Patch Reviewer clears both. A developer is addressed by email when known (stable across database rebuilds), else by `person_id` or name. `MaintainersView.render` rebuilds everything from the tab, requesting the selection beside the list.
    - Provides 1-click elevation actions:
