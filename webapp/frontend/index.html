@@ -35,9 +35,9 @@
       <div class="header-left">
         <div class="app-brand">
           <img src="/static/assets/icon.svg" alt="KernelIDE Icon" class="brand-icon" />
-          <span>KernelInfo IDE</span>
+          <span class="brand-title">KernelInfo IDE</span>
         </div>
-        <div class="version-selector-container" style="display: flex; align-items: center; gap: 8px;">
+        <div class="version-selector-container">
           <label for="project-select">Project:</label>
           <select id="project-select" style="max-width: 130px; font-size: 12px;">
             <option value="1">Linux Kernel</option>
@@ -70,9 +70,14 @@
       </div>
       <div class="header-right">
         <button id="global-search-btn" class="global-search-btn" type="button" title="Search files, symbols, commits and Kconfig options (Ctrl+K) · commands (Ctrl+Shift+P)">
-          <span>🔍 Search…</span><kbd>Ctrl K</kbd>
+          <span class="search-icon">🔍</span>
+          <span class="search-label">Search…</span>
+          <kbd>Ctrl K</kbd>
         </button>
-        <div id="offline-badge" class="offline-badge">● Online</div>
+        <div id="offline-badge" class="offline-badge">
+          <span class="badge-dot">●</span>
+          <span class="badge-text">Online</span>
+        </div>
       </div>
     </header>
 

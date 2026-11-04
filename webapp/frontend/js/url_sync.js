@@ -351,6 +351,7 @@ class UrlSynchronizer {
           configName: cfg,
           query,
           symbol: params.get("sym") || "",
+          listCollapsed: params.get("lc") === "1",
           version: v || state.currentVersion
         });
       } else if (tabType === "explorer") {
@@ -375,6 +376,7 @@ class UrlSynchronizer {
           query,
           filter: params.get("f") || "all",
           listMode: params.get("mode") === "tree" ? "tree" : "search",
+          listCollapsed: params.get("lc") === "1",
           version: v || state.currentVersion
         });
       } else if (tabType === "diff") {
@@ -414,6 +416,7 @@ class UrlSynchronizer {
           role: params.get("role") || "",
           sort: params.get("sort") === "alpha" ? "alpha" : "",
           query,
+          listCollapsed: params.get("lc") === "1",
           version: v || state.currentVersion
         });
       } else if (tabType === "pahole") {
@@ -473,12 +476,14 @@ class UrlSynchronizer {
       if (activeTab.configName) params.set("cfg", activeTab.configName);
       if (activeTab.symbol) params.set("sym", activeTab.symbol);
       if (activeTab.query) params.set("q", activeTab.query);
+      if (activeTab.listCollapsed) params.set("lc", "1");
     } else if (activeTab.type === "mail") {
       if (activeTab.threadId) params.set("tid", activeTab.threadId);
       if (activeTab.messageId) params.set("mid", activeTab.messageId);
       if (activeTab.query) params.set("q", activeTab.query);
       if (activeTab.filter && activeTab.filter !== "all") params.set("f", activeTab.filter);
       if (activeTab.listMode === "tree") params.set("mode", "tree");
+      if (activeTab.listCollapsed) params.set("lc", "1");
     } else if (activeTab.type === "diff") {
       if (activeTab.versionA) params.set("a", activeTab.versionA);
       if (activeTab.versionB) params.set("b", activeTab.versionB);
@@ -502,6 +507,7 @@ class UrlSynchronizer {
       if (activeTab.query) params.set("q", activeTab.query);
       if (activeTab.role && activeTab.role !== "all") params.set("role", activeTab.role);
       if (activeTab.sort === "alpha") params.set("sort", "alpha");
+      if (activeTab.listCollapsed) params.set("lc", "1");
     } else if (activeTab.type === "pahole") {
       if (activeTab.structName) params.set("struct", activeTab.structName);
     } else if (activeTab.type === "callgraph") {

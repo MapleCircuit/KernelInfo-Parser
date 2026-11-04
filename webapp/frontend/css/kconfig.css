@@ -19,6 +19,51 @@
   user-select: none;
 }
 
+/* Folded tree column: a narrow rail on the left unfolds it */
+.kconfig-list-rail {
+  display: none;
+}
+
+.list-collapsed .kconfig-explorer-col {
+  display: none;
+}
+
+.list-collapsed .kconfig-list-rail {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  flex: 0 0 28px;
+  padding: 8px 0;
+  border: none;
+  border-right: 1px solid var(--border-color);
+  background: var(--bg-secondary);
+  color: var(--text-muted);
+  font: inherit;
+  font-size: var(--fs-11, 11px);
+  cursor: pointer;
+}
+
+.list-collapsed .kconfig-list-rail:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+.kconfig-list-rail .collapse-btn {
+  color: inherit;
+  background: transparent;
+}
+
+.kconfig-arch-presets .collapse-btn {
+  align-self: center;
+  flex: 0 0 auto;
+}
+
+.kconfig-rail-label {
+  writing-mode: vertical-rl;
+  letter-spacing: 0.05em;
+}
+
 .kconfig-filter-bar {
   padding: 8px 12px;
   border-bottom: 1px solid var(--border-color);
@@ -47,7 +92,18 @@
 .kconfig-arch-presets {
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: 8px;
+  min-width: 0;
+}
+
+.kconfig-arch-presets select,
+#kconfig-arch-select {
+  flex: 1 1 0;
+  min-width: 0;
+  width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .kconfig-tree-scroll {

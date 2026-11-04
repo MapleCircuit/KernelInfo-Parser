@@ -5,6 +5,7 @@ import { api } from "../../api.js";
 import { state } from "../../state.js";
 import { debounce } from "../../utils/debounce.js";
 import { escapeHtml } from "../../components/modal.js";
+import { COLLAPSE_ICON } from "../../utils/icons.js";
 
 /** Sections of the view's sidebar; the first is the default, left out of the URL (§5.26). */
 const SECTIONS = ["subsystems", "developers", "credits", "patch"];
@@ -36,6 +37,8 @@ export class MaintainersView {
     this.selectedPerson = null; // personKey() of the inspected developer
     this.currentDevRole = "all";
     this.currentDevSort = "activity";
+    this.listCollapsed = false;
+    this.listLoaded = false;
     this.containerEl = null;
   }
 
@@ -49,10 +52,18 @@ export class MaintainersView {
     this.currentDevSort = tabData.sort === "alpha" ? "alpha" : "activity";
     this.selectedSecId = tabData.secId ? parseInt(tabData.secId, 10) || null : null;
     this.selectedPerson = this.selectedSecId ? null : (tabData.person ? String(tabData.person) : null);
+    this.listCollapsed = Boolean(tabData.listCollapsed);
+    this.listLoaded = false;
     const initialQuery = tabData.query || "";
 
     containerEl.innerHTML = `
-      <div class="maintainers-view-container">
+      <div class="maintainers-view-container${this.listCollapsed ? " list-collapsed" : ""}">
+        <!-- Folded sidebar: a rail on the left that unfolds it -->
+        <button type="button" class="maintainers-list-rail" id="btn-maintainers-expand" title="Show maintainers" aria-label="Show maintainers">
+          <span class="collapse-btn expand">${COLLAPSE_ICON}</span>
+          <span class="maintainers-rail-label">Maintainers</span>
+        </button>
+
         <!-- Sidebar Navigation -->
         <div class="maintainers-sidebar">
           <div class="maintainers-nav-tabs">
@@ -61,8 +72,9 @@ export class MaintainersView {
             <div class="m-nav-tab ${this.activeTab === "credits" ? "active" : ""}" data-tab="credits">CREDITS</div>
             <div class="m-nav-tab ${this.activeTab === "patch" ? "active" : ""}" data-tab="patch">Patch Reviewer</div>
           </div>
-          <div style="padding:8px 12px;border-bottom:1px solid var(--border-color);">
-            <input type="text" id="m-search-input" placeholder="${SEARCH_PLACEHOLDERS[this.activeTab]}" value="${escapeHtml(initialQuery)}" style="width:100%;" />
+          <div class="maintainers-search-bar" style="display:flex;gap:6px;align-items:center;padding:8px 12px;border-bottom:1px solid var(--border-color);">
+            <input type="text" id="m-search-input" placeholder="${SEARCH_PLACEHOLDERS[this.activeTab]}" value="${escapeHtml(initialQuery)}" style="flex:1;" />
+            <button type="button" class="collapse-btn" id="btn-maintainers-collapse" title="Collapse maintainers" aria-label="Collapse maintainers">${COLLAPSE_ICON}</button>
           </div>
           <!-- Developers Filter & Sort Toolbar -->
           <div id="m-filter-toolbar" class="m-filter-toolbar" style="${this.activeTab === "developers" ? "display:flex;" : "display:none;"}">
@@ -136,12 +148,28 @@ export class MaintainersView {
       debouncedSearch(searchInput.value.trim());
     };
 
+    containerEl.querySelector("#btn-maintainers-expand").onclick = () => this.setListCollapsed(false);
+    containerEl.querySelector("#btn-maintainers-collapse").onclick = () => this.setListCollapsed(true);
+
     // The selection is requested beside the list, so neither waits for the other
     const detail = this.activeTab === "patch" ? null
       : this.selectedSecId ? this.inspectSection(this.selectedSecId)
       : this.selectedPerson ? this.inspectPerson(this.selectedPerson)
       : null;
-    await Promise.all([this.loadList(initialQuery), detail]);
+    const list = this.listCollapsed ? null : this.loadList(initialQuery);
+    await Promise.all([list, detail]);
+  }
+
+  /** Fold the sidebar to a rail on the left, or unfold it (loading it the first time). */
+  async setListCollapsed(collapsed) {
+    this.listCollapsed = collapsed;
+    this.containerEl.querySelector(".maintainers-view-container")?.classList.toggle("list-collapsed", collapsed);
+    this.persistTabState({ listCollapsed: collapsed || undefined });
+    if (collapsed) return;
+    this.containerEl.querySelector("#m-search-input")?.focus();
+    if (this.listLoaded) return;
+    await this.loadList(this.containerEl.querySelector("#m-search-input")?.value?.trim() || "");
+    this.containerEl.querySelector(".subsystem-card.active")?.scrollIntoView({ block: "nearest" });
   }
 
   /**
@@ -172,6 +200,7 @@ export class MaintainersView {
   }
 
   async loadList(query = "") {
+    this.listLoaded = true;
     const listContainer = this.containerEl.querySelector("#m-list-container");
     listContainer.innerHTML = `<div style="padding:16px;color:var(--text-muted);">Searching...</div>`;
 

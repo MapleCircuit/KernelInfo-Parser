@@ -18,6 +18,50 @@
   user-select: none;
 }
 
+/* Folded sidebar: a narrow rail on the left unfolds it */
+.maintainers-list-rail {
+  display: none;
+}
+
+.list-collapsed .maintainers-sidebar {
+  display: none;
+}
+
+.list-collapsed .maintainers-list-rail {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  flex: 0 0 28px;
+  padding: 8px 0;
+  border: none;
+  border-right: 1px solid var(--border-color);
+  background: var(--bg-secondary);
+  color: var(--text-muted);
+  font: inherit;
+  font-size: var(--fs-11, 11px);
+  cursor: pointer;
+}
+
+.list-collapsed .maintainers-list-rail:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+.maintainers-list-rail .collapse-btn {
+  color: inherit;
+  background: transparent;
+}
+
+.maintainers-search-bar .collapse-btn {
+  align-self: center;
+}
+
+.maintainers-rail-label {
+  writing-mode: vertical-rl;
+  letter-spacing: 0.05em;
+}
+
 .maintainers-nav-tabs {
   display: flex;
   border-bottom: 1px solid var(--border-color);

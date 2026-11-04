@@ -1144,11 +1144,16 @@ class GlobalState {
       // Check if any session exists in index
       const index = sessionManager.getSessionsIndex();
       if (index.length === 1) {
-        // Only one session exists; enter it automatically without prompting
-        const sessionData = sessionManager.loadSession(index[0].id);
-        if (sessionData) {
-          this.adoptSession(sessionData);
-          return true;
+        // Only one session exists; if not active in another tab, enter it automatically without prompting
+        if (!sessionManager.isSessionActiveInOtherWindow(index[0].id)) {
+          const sessionData = sessionManager.loadSession(index[0].id);
+          if (sessionData) {
+            this.adoptSession(sessionData);
+            return true;
+          }
+        } else {
+          // Already active in another window/tab: don't auto-takeover, allow Session Picker to be shown
+          return false;
         }
       }
       if (index.length > 1) {

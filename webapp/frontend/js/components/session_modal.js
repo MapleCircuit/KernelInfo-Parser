@@ -25,16 +25,6 @@ export function showSessionPickerModal({ allowClose = false, onSelect = null } =
   const existing = document.getElementById("session-picker-modal");
   if (existing) return;
 
-  const initialSessions = sessionManager.getSessionsIndex();
-  if (!allowClose && initialSessions.length === 1) {
-    const singleSession = sessionManager.loadSession(initialSessions[0].id);
-    if (singleSession) {
-      state.adoptSession(singleSession);
-      if (onSelect) onSelect(singleSession.id);
-      return;
-    }
-  }
-
   const backdrop = document.createElement("div");
   backdrop.id = "session-picker-modal";
   backdrop.className = "ki-modal-backdrop session-modal-backdrop";
@@ -206,7 +196,7 @@ export function showSessionPickerModal({ allowClose = false, onSelect = null } =
         if (confirm(`Are you sure you want to delete session '${name}'? This cannot be undone.`)) {
           sessionManager.deleteSession(sid);
           const remaining = sessionManager.getSessionsIndex();
-          if (!allowClose && remaining.length === 1) {
+          if (!allowClose && remaining.length === 1 && !sessionManager.isSessionActiveInOtherWindow(remaining[0].id)) {
             openSession(remaining[0].id);
             return;
           }

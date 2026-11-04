@@ -168,17 +168,30 @@ class KernelIdeApp {
       if (status === shown) return;
       const first = shown === null;
       shown = status;
+      const setBadgeContent = (text) => {
+        let textSpan = badge.querySelector(".badge-text");
+        let dotSpan = badge.querySelector(".badge-dot");
+        if (!textSpan || !dotSpan) {
+          badge.innerHTML = `<span class="badge-dot">●</span><span class="badge-text">${escapeHtml(text)}</span>`;
+        } else {
+          textSpan.textContent = text;
+        }
+      };
+
       if (status === "online") {
-        badge.textContent = "● Online";
+        setBadgeContent("Online");
         badge.className = "offline-badge";
+        badge.title = "Online: Connected to backend server. Click to open Network & Local Storage Settings";
         if (!first) toast.success("Server reachable again");
       } else if (status === "unreachable") {
-        badge.textContent = "● Server Unreachable";
+        setBadgeContent("Server Unreachable");
         badge.className = "offline-badge unreachable";
+        badge.title = "Server Unreachable: Viewing cached data. Click to open Network & Local Storage Settings";
         toast.warning("Server not responding: viewing cached repository data");
       } else {
-        badge.textContent = "● Offline (Cached)";
+        setBadgeContent("Offline (Cached)");
         badge.className = "offline-badge offline";
+        badge.title = "Offline: Viewing cached data. Click to open Network & Local Storage Settings";
         toast.info("Offline mode active: viewing cached repository data");
       }
       // Keep an open settings popover in step with the state it reports
@@ -247,7 +260,7 @@ class KernelIdeApp {
       if (closedSid === state.currentSessionId || !state.currentSessionId) {
         updateLabel();
         const index = sessionManager.getSessionsIndex();
-        if (index.length === 1) {
+        if (index.length === 1 && !sessionManager.isSessionActiveInOtherWindow(index[0].id)) {
           const remaining = sessionManager.loadSession(index[0].id);
           if (remaining) {
             state.adoptSession(remaining);
@@ -265,7 +278,8 @@ class KernelIdeApp {
       e.stopPropagation();
       const existingMenu = container.querySelector(".session-dropdown-menu");
       if (existingMenu) {
-        existingMenu.remove();
+        if (typeof existingMenu._closeMenu === "function") existingMenu._closeMenu();
+        else existingMenu.remove();
         return;
       }
 
@@ -301,21 +315,26 @@ class KernelIdeApp {
 
       container.appendChild(menu);
 
+      const closeMenu = () => {
+        menu.remove();
+        document.removeEventListener("click", outsideClick);
+      };
+      menu._closeMenu = closeMenu;
+
       const outsideClick = (ev) => {
         if (!menu.contains(ev.target) && ev.target !== btn) {
-          menu.remove();
-          document.removeEventListener("click", outsideClick);
+          closeMenu();
         }
       };
       setTimeout(() => document.addEventListener("click", outsideClick), 10);
 
       menu.querySelector("#session-action-switch")?.addEventListener("click", () => {
-        menu.remove();
+        closeMenu();
         showSessionPickerModal({ allowClose: true });
       });
 
       menu.querySelector("#session-action-new")?.addEventListener("click", () => {
-        menu.remove();
+        closeMenu();
         const count = sessionManager.getSessionsIndex().length;
         const name = prompt("Enter a name for the new session:", "Session " + (count + 1));
         if (name === null) return;
@@ -330,7 +349,7 @@ class KernelIdeApp {
       });
 
       menu.querySelector("#session-action-duplicate")?.addEventListener("click", () => {
-        menu.remove();
+        closeMenu();
         if (!state.currentSessionId) return;
         const dup = sessionManager.duplicateSession(state.currentSessionId);
         if (dup) {
@@ -340,7 +359,7 @@ class KernelIdeApp {
       });
 
       menu.querySelector("#session-action-rename")?.addEventListener("click", () => {
-        menu.remove();
+        closeMenu();
         const currentName = state.currentSessionName || "Session";
         const newName = prompt("Rename session:", currentName);
         if (!newName || newName.trim() === currentName) return;
@@ -351,7 +370,7 @@ class KernelIdeApp {
       });
 
       menu.querySelector("#session-action-close")?.addEventListener("click", () => {
-        menu.remove();
+        closeMenu();
         const name = state.currentSessionName || "this session";
         if (confirm("Are you sure you want to close '" + name + "'? The session will be deleted from your saved workspaces.")) {
           const sid = state.currentSessionId;
@@ -360,7 +379,7 @@ class KernelIdeApp {
           state.currentSessionName = "";
           updateLabel();
           const index = sessionManager.getSessionsIndex();
-          if (index.length === 1) {
+          if (index.length === 1 && !sessionManager.isSessionActiveInOtherWindow(index[0].id)) {
             const remaining = sessionManager.loadSession(index[0].id);
             if (remaining) {
               state.adoptSession(remaining);

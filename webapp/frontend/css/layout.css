@@ -21,12 +21,14 @@
   gap: 12px;
   z-index: 100;
   user-select: none;
+  min-width: 0;
 }
 
 .header-left {
   display: flex;
   align-items: center;
   gap: 12px;
+  min-width: 0;
 }
 
 .app-brand {
@@ -37,21 +39,30 @@
   font-size: var(--fs-14, 14px);
   color: var(--accent-blue);
   letter-spacing: 0.3px;
+  flex-shrink: 0;
 }
 
 .brand-icon {
   width: 24px;
   height: 24px;
+  flex-shrink: 0;
+}
+
+.brand-title {
+  white-space: nowrap;
 }
 
 .version-selector-container {
-  display: flex;
+  display: inline-flex;
   align-items: center;
   gap: 6px;
+  height: 28px;
+  box-sizing: border-box;
   background: var(--bg-tertiary);
-  padding: 2px 8px;
+  padding: 0 8px;
   border-radius: var(--radius-md);
   border: 1px solid var(--border-color);
+  flex-shrink: 0;
 }
 
 .version-selector-container label {
@@ -59,26 +70,33 @@
   font-size: var(--fs-11, 11px);
   text-transform: uppercase;
   font-weight: 600;
+  white-space: nowrap;
 }
 
-#version-select,
-#rc-select {
+.version-selector-container select {
   background: transparent;
   border: none;
   font-weight: 600;
   color: var(--accent-blue);
   cursor: pointer;
+  height: 24px;
+  box-sizing: border-box;
+  line-height: 24px;
+  padding: 0 2px;
 }
 
 .session-selector-container {
-  display: flex;
+  display: inline-flex;
   align-items: center;
   gap: 6px;
+  height: 28px;
+  box-sizing: border-box;
   background: var(--bg-tertiary);
-  padding: 2px 8px;
+  padding: 0 6px;
   border-radius: var(--radius-md);
   border: 1px solid var(--border-color);
   position: relative;
+  flex-shrink: 0;
 }
 
 .session-picker-btn {
@@ -91,8 +109,12 @@
   display: inline-flex;
   align-items: center;
   gap: 4px;
-  padding: 2px 4px;
+  height: 24px;
+  box-sizing: border-box;
+  line-height: 1;
+  padding: 0 4px;
   border-radius: var(--radius-sm);
+  white-space: nowrap;
   transition: var(--transition-fast);
 }
 
@@ -162,18 +184,42 @@
   display: flex;
   align-items: center;
   gap: 8px;
+  flex-shrink: 0;
 }
 
 .offline-badge {
   font-size: var(--fs-11, 11px);
-  padding: 2px 6px;
-  border-radius: 10px;
+  height: 28px;
+  box-sizing: border-box;
+  line-height: 1;
+  padding: 0 10px;
+  border-radius: 14px;
   background: rgba(63, 185, 80, 0.15);
   color: var(--accent-green);
   border: 1px solid rgba(63, 185, 80, 0.3);
-  display: flex;
+  display: inline-flex;
   align-items: center;
-  gap: 4px;
+  justify-content: center;
+  gap: 6px;
+  cursor: pointer;
+  user-select: none;
+  flex-shrink: 0;
+  transition: var(--transition-fast);
+}
+
+.offline-badge .badge-dot {
+  order: 1;
+  font-size: 10px;
+  line-height: 1;
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.offline-badge .badge-text {
+  order: 2;
+  white-space: nowrap;
 }
 
 .offline-badge.offline {
@@ -485,14 +531,20 @@
 .commit-picker-btn {
   display: inline-flex;
   align-items: center;
+  justify-content: center;
   gap: 4px;
+  height: 24px;
+  box-sizing: border-box;
+  line-height: 1;
   max-width: 150px;
-  padding: 1px 6px;
+  padding: 0 6px;
   border-radius: var(--radius-sm);
   font-family: var(--font-mono);
   font-size: var(--fs-12, 12px);
   color: var(--text-secondary);
   border: 1px solid transparent;
+  background: transparent;
+  cursor: pointer;
 }
 
 .commit-picker-btn:hover {
@@ -519,13 +571,20 @@
 /* Apply / New Tab: the header selection only takes effect through these (see webapp/API.md 5.13) */
 .version-apply-btn,
 .version-newtab-btn {
-  padding: 2px 8px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  height: 24px;
+  box-sizing: border-box;
+  line-height: 1;
+  padding: 0 8px;
   border-radius: var(--radius-sm);
   border: 1px solid var(--border-color);
   background: var(--bg-primary);
   color: var(--text-secondary);
   font-size: var(--fs-11, 11px);
   font-weight: 600;
+  cursor: pointer;
   transition: var(--transition-fast);
 }
 
@@ -648,13 +707,20 @@
 .global-search-btn {
   display: inline-flex;
   align-items: center;
-  gap: 10px;
-  padding: 3px 6px 3px 10px;
+  justify-content: center;
+  gap: 8px;
+  height: 28px;
+  box-sizing: border-box;
+  line-height: 1;
+  padding: 0 10px;
   border: 1px solid var(--border-color);
   border-radius: var(--radius-md);
   background: var(--bg-tertiary);
   color: var(--text-muted);
   font-size: var(--fs-12, 12px);
+  cursor: pointer;
+  flex-shrink: 0;
+  transition: var(--transition-fast);
 }
 
 .global-search-btn:hover {
@@ -664,11 +730,16 @@
 
 .global-search-btn kbd {
   padding: 0 5px;
+  height: 18px;
+  line-height: 16px;
+  box-sizing: border-box;
   border: 1px solid var(--border-color);
   border-radius: 3px;
   font-family: var(--font-mono);
   font-size: var(--fs-10, 10px);
   color: var(--text-secondary);
+  display: inline-flex;
+  align-items: center;
 }
 
 /* Command palette (components/command_palette.js) */
@@ -849,4 +920,105 @@
 .kip-update-banner .kip-update-now {
   border-color: var(--accent-blue);
   color: var(--accent-blue);
+}
+
+/* 4. Responsive Header Collapsing */
+@media (max-width: 1440px) {
+
+  /* Offline badge: flip dot position to after label ("Online ●") */
+  .offline-badge .badge-dot {
+    order: 2;
+  }
+
+  .offline-badge .badge-text {
+    order: 1;
+  }
+
+  /* Global search button: hide keyboard shortcut */
+  .global-search-btn kbd {
+    display: none;
+  }
+
+  /* Session selector: revert to icon-only */
+  #session-picker-label {
+    display: none;
+  }
+
+  /* Version selector: hide text labels to preserve space for dropdowns */
+  .version-selector-container label {
+    display: none;
+  }
+}
+
+@media (max-width: 1300px) {
+
+  /* Spacing optimization under size pressure */
+  #app-header {
+    gap: 8px;
+    padding: 0 8px;
+  }
+
+  .header-left {
+    gap: 8px;
+  }
+
+  .version-selector-container {
+    gap: 4px;
+    padding: 0 6px;
+  }
+
+  /* Offline badge: collapse to dot-only icon */
+  .offline-badge {
+    width: 28px;
+    min-width: 28px;
+    padding: 0;
+    justify-content: center;
+    border-radius: var(--radius-md);
+  }
+
+  .offline-badge .badge-text {
+    display: none;
+  }
+
+  .offline-badge .badge-dot {
+    font-size: 20px;
+    line-height: 1;
+  }
+
+  /* Global search button: collapse to icon-only */
+  .global-search-btn {
+    width: 28px;
+    min-width: 28px;
+    padding: 0;
+    justify-content: center;
+  }
+
+  .global-search-btn .search-label {
+    display: none;
+  }
+
+  .global-search-btn .search-icon {
+    font-size: 14px;
+    line-height: 1;
+  }
+}
+
+@media (max-width: 1050px) {
+
+  /* Brand title: collapse to brand icon only */
+  .brand-title {
+    display: none;
+  }
+}
+
+@media (max-width: 850px) {
+
+  /* Compact dropdown and commit buttons for ultra-narrow viewports */
+  .version-selector-container select {
+    max-width: 90px !important;
+  }
+
+  .commit-picker-btn {
+    max-width: 90px;
+  }
 }

@@ -9,6 +9,7 @@ import { localDB } from "./db.js";
 const SESSIONS_INDEX_KEY = "kip_sessions_index";
 const SESSION_STORAGE_PIN_KEY = "kip_active_session_id";
 const SESSION_STORAGE_WIN_KEY = "kip_window_id";
+const ACTIVE_WINDOWS_KEY = "kip_active_windows";
 const SHARED_PROFILES_KEY = "kip_shared_kconfig_profiles";
 const SHARED_TOOLCHAINS_KEY = "kip_shared_kconfig_toolchains";
 const BROADCAST_CHANNEL_NAME = "kip_multi_tab";
@@ -61,7 +62,8 @@ class SessionManager {
   initWindowLifecycle() {
     if (typeof window === "undefined") return;
 
-    window.addEventListener("beforeunload", () => {
+    const cleanup = () => {
+      this.unregisterActiveWindow();
       if (this.channel && this.activeSessionId) {
         this.channel.postMessage({
           type: "window:unloading",
@@ -69,7 +71,10 @@ class SessionManager {
           sessionId: this.activeSessionId
         });
       }
-    });
+    };
+
+    window.addEventListener("beforeunload", cleanup);
+    window.addEventListener("pagehide", cleanup);
 
     // Announce this window and ask for active peers
     setTimeout(() => {
@@ -242,6 +247,16 @@ class SessionManager {
               sessionName: msg.sessionName,
               lastSeen: Date.now()
             });
+            try {
+              const reg = this.getActiveWindowsRegistry();
+              reg[msg.winId] = {
+                winId: msg.winId,
+                sessionId: msg.sessionId,
+                sessionName: msg.sessionName,
+                lastSeen: Date.now()
+              };
+              this.saveActiveWindowsRegistry(reg);
+            } catch (e) {}
           }
           break;
         }
@@ -257,6 +272,13 @@ class SessionManager {
           if (this.activeWindows.has(msg.winId)) {
             this.activeWindows.delete(msg.winId);
           }
+          try {
+            const reg = this.getActiveWindowsRegistry();
+            if (reg[msg.winId]) {
+              delete reg[msg.winId];
+              this.saveActiveWindowsRegistry(reg);
+            }
+          } catch (e) {}
           // The engines that window was running are gone with it: a code tab following one of them
           // must fall back instead of dimming against a configuration nobody resolves any more.
           if (this.dropRemoteEnginesOf((eng) => (eng.winId ? eng.winId === msg.winId : eng.sessionId === msg.sessionId))) {
@@ -268,8 +290,56 @@ class SessionManager {
     };
   }
 
+  getActiveWindowsRegistry() {
+    try {
+      const raw = localStorage.getItem(ACTIVE_WINDOWS_KEY);
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        if (parsed && typeof parsed === "object") return parsed;
+      }
+    } catch (e) {}
+    return {};
+  }
+
+  saveActiveWindowsRegistry(reg) {
+    try {
+      localStorage.setItem(ACTIVE_WINDOWS_KEY, JSON.stringify(reg));
+    } catch (e) {}
+  }
+
+  registerActiveWindow(sessionId, sessionName) {
+    if (!sessionId) return;
+    try {
+      const reg = this.getActiveWindowsRegistry();
+      const now = Date.now();
+      for (const [wId, w] of Object.entries(reg)) {
+        if (!w || now - (w.lastSeen || 0) >= 30000) delete reg[wId];
+      }
+      reg[this.getWindowId()] = {
+        winId: this.getWindowId(),
+        sessionId,
+        sessionName: sessionName || this.activeSessionName || "Session",
+        lastSeen: now
+      };
+      this.saveActiveWindowsRegistry(reg);
+    } catch (e) {}
+  }
+
+  unregisterActiveWindow() {
+    try {
+      const reg = this.getActiveWindowsRegistry();
+      const myId = this.getWindowId();
+      if (reg[myId]) {
+        delete reg[myId];
+        this.saveActiveWindowsRegistry(reg);
+      }
+    } catch (e) {}
+  }
+
   broadcastWindowHeartbeat() {
-    if (!this.channel || !this.activeSessionId) return;
+    if (!this.activeSessionId) return;
+    this.registerActiveWindow(this.activeSessionId, this.activeSessionName);
+    if (!this.channel) return;
     this.channel.postMessage({
       type: "window:heartbeat",
       winId: this.getWindowId(),
@@ -289,15 +359,46 @@ class SessionManager {
   isSessionActiveInOtherWindow(sessionId) {
     if (!sessionId) return false;
     const now = Date.now();
+    const myWinId = this.getWindowId();
     let active = false;
-    for (const [wId, w] of this.activeWindows.entries()) {
-      // A window silent for 30s is gone (its heartbeat runs every 10s): forget it
-      if (now - w.lastSeen >= 30000) {
-        this.activeWindows.delete(wId);
-      } else if (w.sessionId === sessionId && w.winId !== this.getWindowId()) {
-        active = true;
+
+    // Read localStorage registry synchronously (authoritative shared state across tabs)
+    try {
+      const reg = this.getActiveWindowsRegistry();
+      let changed = false;
+
+      // Prune entries from in-memory map that are no longer in localStorage or expired
+      for (const [wId, w] of this.activeWindows.entries()) {
+        if (!reg[wId] || now - (w.lastSeen || 0) >= 30000) {
+          this.activeWindows.delete(wId);
+        }
+      }
+
+      // Process registry entries
+      for (const [wId, w] of Object.entries(reg)) {
+        if (!w || now - (w.lastSeen || 0) >= 30000) {
+          delete reg[wId];
+          this.activeWindows.delete(wId);
+          changed = true;
+        } else if (w.winId !== myWinId) {
+          this.activeWindows.set(w.winId, w);
+          if (w.sessionId === sessionId) {
+            active = true;
+          }
+        }
+      }
+      if (changed) this.saveActiveWindowsRegistry(reg);
+    } catch (e) {
+      // Fallback to in-memory map if localStorage is inaccessible
+      for (const [wId, w] of this.activeWindows.entries()) {
+        if (now - w.lastSeen >= 30000) {
+          this.activeWindows.delete(wId);
+        } else if (w.sessionId === sessionId && w.winId !== myWinId) {
+          active = true;
+        }
       }
     }
+
     return active;
   }
 
@@ -391,6 +492,7 @@ class SessionManager {
     try {
       sessionStorage.removeItem(SESSION_STORAGE_PIN_KEY);
     } catch (e) {}
+    this.unregisterActiveWindow();
     if (this.channel && oldSid) {
       this.channel.postMessage({
         type: "window:unloading",

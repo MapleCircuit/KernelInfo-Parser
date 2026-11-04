@@ -26,6 +26,7 @@ import { MenuconfigTui } from "./menuconfig_tui.js";
 import { KconfigHistory } from "./kconfig_history.js";
 import { openModal, escapeHtml, downloadText } from "../../components/modal.js";
 import { showKconfigHistoryModal } from "../../components/symbol_history_modal.js";
+import { COLLAPSE_ICON } from "../../utils/icons.js";
 
 const DEFAULT_ARCH = "x86_64";
 const TRI_CHAR = ["n", "m", "y"];
@@ -60,6 +61,7 @@ export class KconfigView {
     // Name telling this configuration apart from other copies of the same revision and ARCH
     this.configName = "";
     this.selfEngineChange = false;
+    this.listCollapsed = false;
     // "version|ARCH|name" this tab's values were last loaded against (a switch reports what moved)
     this.resolvedProfileKey = "";
     // Undo/redo of this tab's configuration (Ctrl+Z, Ctrl+Shift+Z / Ctrl+Y): the differences between
@@ -142,6 +144,7 @@ export class KconfigView {
     this.currentArch = tabData.arch || DEFAULT_ARCH;
     this.configName = tabData.configName || "";
     this.searchQuery = tabData.query || "";
+    this.listCollapsed = Boolean(tabData.listCollapsed);
     // A revision or ARCH switch can land on another tab's configuration: take a free name instead
     const ownTab = state.findTab(this.tabId);
     if (ownTab) {
@@ -153,13 +156,20 @@ export class KconfigView {
     }
 
     containerEl.innerHTML = `
-      <div class="kconfig-view-container">
+      <div class="kconfig-view-container${this.listCollapsed ? " list-collapsed" : ""}">
+        <!-- Folded tree column: a rail on the left that unfolds it -->
+        <button type="button" class="kconfig-list-rail" id="btn-kconfig-expand" title="Show KConfig explorer" aria-label="Show KConfig explorer">
+          <span class="collapse-btn expand">${COLLAPSE_ICON}</span>
+          <span class="kconfig-rail-label">KConfig</span>
+        </button>
+
         <div class="kconfig-explorer-col">
           <div class="kconfig-filter-bar">
             <div class="kconfig-arch-presets">
-              <select id="kconfig-arch-select" style="flex:1;" title="ARCH value passed to kconfig (decides which Kconfig files and definitions apply)">
+              <select id="kconfig-arch-select" style="flex:1;min-width:0;" title="ARCH value passed to kconfig (decides which Kconfig files and definitions apply)">
                 <option value="${escapeHtml(this.currentArch)}">${escapeHtml(this.currentArch)}</option>
               </select>
+              <button type="button" class="collapse-btn" id="btn-kconfig-collapse" title="Collapse KConfig explorer" aria-label="Collapse KConfig explorer">${COLLAPSE_ICON}</button>
             </div>
             <div class="kconfig-btn-row">
               <button class="code-btn" id="btn-toolchain" title="Compiler, linker, environment variables and toolchain checks Kconfig depends on">Toolchain…</button>
@@ -256,6 +266,19 @@ export class KconfigView {
       this.filterTree(this.searchQuery);
       this.persistTabState({ query: this.searchQuery });
     };
+
+    c.querySelector("#btn-kconfig-expand").onclick = () => this.setListCollapsed(false);
+    c.querySelector("#btn-kconfig-collapse").onclick = () => this.setListCollapsed(true);
+  }
+
+  /** Fold the tree column to a rail on the left, or unfold it. */
+  setListCollapsed(collapsed) {
+    this.listCollapsed = collapsed;
+    this.containerEl.querySelector(".kconfig-view-container")?.classList.toggle("list-collapsed", collapsed);
+    this.persistTabState({ listCollapsed: collapsed || undefined });
+    if (collapsed) return;
+    this.containerEl.querySelector("#kconfig-search-input")?.focus();
+    this.containerEl.querySelector(".kconfig-node-row.active")?.scrollIntoView({ block: "nearest" });
   }
 
   fillArchSelect() {

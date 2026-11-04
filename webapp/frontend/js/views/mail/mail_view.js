@@ -13,6 +13,7 @@ import { debounce } from "../../utils/debounce.js";
 import { escapeHtml } from "../../components/modal.js";
 import { toast } from "../../components/toast.js";
 import { copyToClipboard } from "../../utils/clipboard.js";
+import { COLLAPSE_ICON } from "../../utils/icons.js";
 
 const STATUS_COLORS = {
   A: "var(--accent-green)",
@@ -87,6 +88,8 @@ export class MailView {
     this._threadToken = 0;
     this.daemonStatus = null;
     this._checkingDaemon = false;
+    this.listCollapsed = false;
+    this.listLoaded = false;
   }
 
   async render(containerEl, tabData = {}) {
@@ -97,16 +100,25 @@ export class MailView {
     if (tabData.threadId) this.activeThreadId = parseInt(tabData.threadId, 10);
     if (tabData.messageId) this.activeMessageId = String(tabData.messageId).trim();
     if (tabData.listMode === "tree" || tabData.listMode === "search") this.listMode = tabData.listMode;
+    this.listCollapsed = Boolean(tabData.listCollapsed);
+    this.listLoaded = false;
 
     const treeActive = this.listMode === "tree";
 
     containerEl.innerHTML = `
-      <div class="mail-view-container">
+      <div class="mail-view-container${this.listCollapsed ? " list-collapsed" : ""}">
+        <!-- Folded list: a rail on the left that unfolds it -->
+        <button type="button" class="mail-list-rail" id="btn-mail-expand" title="Show mailing list" aria-label="Show mailing list">
+          <span class="collapse-btn expand">${COLLAPSE_ICON}</span>
+          <span class="mail-rail-label">Mailing List</span>
+        </button>
+
         <!-- Left Column: Search / Thread Tree -->
         <div class="mail-list-col">
           <div class="mail-list-switcher">
             <button class="mail-list-mode-btn ${treeActive ? '' : 'active'}" data-list-mode="search" title="Search the mailing list archive">🔍 Search</button>
             <button class="mail-list-mode-btn ${treeActive ? 'active' : ''}" data-list-mode="tree" title="Browse the reply tree of the open thread">🌲 Thread Tree</button>
+            <button type="button" class="collapse-btn" id="btn-mail-collapse" title="Collapse mailing list" aria-label="Collapse mailing list">${COLLAPSE_ICON}</button>
           </div>
 
           <div id="mail-status-banner" class="mail-status-banner" style="display:none;"></div>
@@ -194,6 +206,9 @@ export class MailView {
       btn.onclick = () => this.setListMode(btn.dataset.listMode);
     });
 
+    containerEl.querySelector("#btn-mail-expand").onclick = () => this.setListCollapsed(false);
+    containerEl.querySelector("#btn-mail-collapse").onclick = () => this.setListCollapsed(true);
+
     // 3. Initial checks & search in parallel
     this.checkDaemonStatus();
 
@@ -203,7 +218,24 @@ export class MailView {
     } else if (treeActive) {
       this.renderTree();
     }
-    this.loadSearch(true);
+    if (!this.listCollapsed) {
+      this.loadSearch(true);
+    }
+  }
+
+  /** Fold the left column to a rail on the left, or unfold it (loading search the first time). */
+  async setListCollapsed(collapsed) {
+    this.listCollapsed = collapsed;
+    this.containerEl.querySelector(".mail-view-container")?.classList.toggle("list-collapsed", collapsed);
+    this.persistTabState({ listCollapsed: collapsed || undefined });
+    if (collapsed) return;
+    if (this.listMode === "search") {
+      this.containerEl.querySelector("#mail-search-input")?.focus();
+      if (!this.listLoaded) await this.loadSearch(true);
+    } else if (this.listMode === "tree") {
+      this.renderTree();
+      this.loadThreadVersions();
+    }
   }
 
   /**
@@ -234,6 +266,8 @@ export class MailView {
     if (next === "tree") {
       this.renderTree();
       this.loadThreadVersions();
+    } else if (next === "search" && !this.listLoaded) {
+      this.loadSearch(true);
     }
   }
 
@@ -618,6 +652,7 @@ export class MailView {
     const listContainer = this.containerEl.querySelector("#mail-results-container");
     if (!listContainer) return;
 
+    this.listLoaded = true;
     if (reset) {
       this.currentPage = 1;
       this.results = [];
@@ -889,22 +924,20 @@ export class MailView {
 
     card.innerHTML = `
       <div class="mail-card-header">
-        <div class="mail-card-header-left">
+        <div class="mail-card-header-line mail-card-header-top">
           <button class="mail-card-toggle" title="Toggle message body">
             ${startExpanded ? '▼' : '▶'}
           </button>
-          <div style="display:flex;flex-direction:column;gap:2px;">
-            <div style="display:flex;gap:8px;align-items:center;">
-              <strong class="mail-author-name">${escapeHtml(authorShort)}</strong>
-              ${authorEmail ? `<span class="mail-author-email">&lt;${escapeHtml(authorEmail)}&gt;</span>` : ''}
-              ${badgeHtml}
-            </div>
-            <div class="mail-card-subject">${escapeHtml(msgSummary.subject || '')}</div>
+          <div class="mail-card-author-group">
+            <strong class="mail-author-name" title="${escapeHtml(authorShort)}">${escapeHtml(authorShort)}</strong>
+            ${authorEmail ? `<span class="mail-author-email" title="&lt;${escapeHtml(authorEmail)}&gt;">&lt;${escapeHtml(authorEmail)}&gt;</span>` : ''}
+            ${badgeHtml}
           </div>
+          <span class="mail-card-date" title="${escapeHtml(dateStr)}">${escapeHtml(dateStr)}</span>
         </div>
 
-        <div class="mail-card-header-right">
-          <span class="mail-card-date">${dateStr}</span>
+        <div class="mail-card-header-line mail-card-header-bottom">
+          <div class="mail-card-subject" title="${escapeHtml(msgSummary.subject || '')}">${escapeHtml(msgSummary.subject || '')}</div>
           <div class="mail-card-actions">
             <!-- View Mode Toggle -->
             <div class="mail-view-mode-toggle" title="Toggle Beautified / Raw RFC-822 view">
