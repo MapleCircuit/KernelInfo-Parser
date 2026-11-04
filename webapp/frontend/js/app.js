@@ -246,6 +246,15 @@ class KernelIdeApp {
     state.subscribe("session:closed", (closedSid) => {
       if (closedSid === state.currentSessionId || !state.currentSessionId) {
         updateLabel();
+        const index = sessionManager.getSessionsIndex();
+        if (index.length === 1) {
+          const remaining = sessionManager.loadSession(index[0].id);
+          if (remaining) {
+            state.adoptSession(remaining);
+            toast.info(`Switched to "${remaining.name || "Session"}"`);
+            return;
+          }
+        }
         showSessionPickerModal({ allowClose: false });
       }
     });
@@ -350,6 +359,15 @@ class KernelIdeApp {
           state.currentSessionId = null;
           state.currentSessionName = "";
           updateLabel();
+          const index = sessionManager.getSessionsIndex();
+          if (index.length === 1) {
+            const remaining = sessionManager.loadSession(index[0].id);
+            if (remaining) {
+              state.adoptSession(remaining);
+              toast.info(`Switched to "${remaining.name || "Session"}"`);
+              return;
+            }
+          }
           showSessionPickerModal({ allowClose: false });
         }
       });
