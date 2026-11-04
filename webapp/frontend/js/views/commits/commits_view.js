@@ -653,7 +653,7 @@ export class CommitsView {
                 ? c.files.map((f) => `
                     <div style="display:flex;gap:8px;align-items:center;">
                       <span style="font-weight:bold;color:${STATUS_COLORS[f.change_type] || "var(--accent-green)"};">[${escapeHtml(f.change_type)}]</span>
-                      <span class="commit-file-link" data-path="${escapeHtml(f.file)}" style="color:var(--accent-blue);cursor:pointer;">${escapeHtml(f.file)}</span>
+                      <span class="commit-file-link" data-path="${escapeHtml(f.file)}" data-status="${escapeHtml(f.change_type)}" style="color:var(--accent-blue);cursor:pointer;">${escapeHtml(f.file)}</span>
                     </div>
                   `).join("")
                 : `<span style="color:var(--text-muted);">This commit changes no files against its parent</span>`

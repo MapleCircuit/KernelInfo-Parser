@@ -567,11 +567,15 @@ class MaintainerService:
 
     def get_person_profile(self, version_name: str, person_id_or_email: int | str) -> dict[str, Any]:
         """Fetch developer profile, maintained sections, and CREDITS biographical data."""
+        import email.utils
         import urllib.parse
         clean_id = urllib.parse.unquote(str(person_id_or_email)).strip()
         if "%" in clean_id:
             clean_id = urllib.parse.unquote(clean_id).strip()
         stripped_id = clean_id.strip("<>'\" \t\r\n")
+        parsed_name, parsed_email = email.utils.parseaddr(clean_id)
+        parsed_name = parsed_name.strip("<>'\" \t\r\n")
+        parsed_email = parsed_email.strip("<>'\" \t\r\n")
 
         with get_db_cursor() as cursor:
             if stripped_id.isdigit():
@@ -581,8 +585,16 @@ class MaintainerService:
                 )
             else:
                 cursor.execute(
-                    "SELECT person_id, name, email FROM m_maintainer_person WHERE LOWER(email) = LOWER(%s) OR LOWER(name) = LOWER(%s) OR LOWER(email) = LOWER(%s) ORDER BY (name = '') ASC, person_id ASC LIMIT 1;",
-                    (clean_id, clean_id, stripped_id),
+                    """
+                    SELECT person_id, name, email FROM m_maintainer_person
+                    WHERE LOWER(email) = LOWER(%s)
+                       OR LOWER(name) = LOWER(%s)
+                       OR LOWER(email) = LOWER(%s)
+                       OR (LENGTH(%s) > 0 AND LOWER(email) = LOWER(%s))
+                       OR (LENGTH(%s) > 0 AND LOWER(name) = LOWER(%s))
+                    ORDER BY (name = '') ASC, person_id ASC LIMIT 1;
+                    """,
+                    (clean_id, clean_id, stripped_id, parsed_email, parsed_email, parsed_name, parsed_name),
                 )
             person = cursor.fetchone()
             if not person:

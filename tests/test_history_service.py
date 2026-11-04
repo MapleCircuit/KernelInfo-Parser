@@ -182,7 +182,7 @@ class TestHistoryIntegration(unittest.TestCase):
                 self.assertTrue(any(d["type"] in ("add", "del") for d in t["diff"]))
                 self.assertIn(str(t["tag_id"]), res["snippets"])
             if t["status"] == "unchanged":
-                self.assertEqual(t["tag_id"], prev["tag_id"])
+                self.assertTrue(t["tag_id"] == prev["tag_id"] or res["snippets"].get(str(t["tag_id"])) == res["snippets"].get(str(prev["tag_id"])))
             prev = t
 
     def test_release_candidates_on_demand(self) -> None:

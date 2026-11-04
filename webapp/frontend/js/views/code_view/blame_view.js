@@ -107,5 +107,23 @@ export class BlameView {
         });
       }
     });
+
+    containerEl.addEventListener("auxclick", (e) => {
+      if (e.button === 1) {
+        const cell = e.target.closest(".gutter-blame");
+        if (cell && cell.dataset.commit) {
+          e.preventDefault();
+          e.stopPropagation();
+          state.openTab({
+            type: "commits",
+            title: `Commit ${cell.dataset.commit.substring(0, 7)}`,
+            commitId: cell.dataset.commit,
+            listCollapsed: true,
+            version: this.version || state.activeVersion(),
+            forceNew: true,
+          });
+        }
+      }
+    });
   }
 }

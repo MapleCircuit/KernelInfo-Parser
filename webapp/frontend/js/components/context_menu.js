@@ -1087,7 +1087,8 @@ class ContextMenu {
         toast.info(`Fetching blame for ${filePath}:${line || 1}...`);
         const fileBlame = await api.getFileBlame(v, filePath);
         if (Array.isArray(fileBlame?.lines)) {
-          const lineBlame = fileBlame.lines.find((b) => b.line === line);
+          const targetLine = parseInt(line, 10) || 1;
+          const lineBlame = fileBlame.lines.find((b) => b.line === targetLine);
           if (lineBlame) {
             commitHash = lineBlame.commit_hash;
             blame = lineBlame;

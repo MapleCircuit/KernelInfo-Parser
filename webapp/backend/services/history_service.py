@@ -323,6 +323,8 @@ def diff_stats(old: str, new: str) -> dict[str, Any]:
 
 
 def _cosmetic_or_modified(old: str, new: str, strip_c_comments: bool = True) -> str:
+    if old == new:
+        return "unchanged"
     return "cosmetic" if normalize_code(old, strip_c_comments) == normalize_code(new, strip_c_comments) else "modified"
 
 
@@ -519,7 +521,7 @@ class HistoryService:
                 entry["status"] = "added"
                 if code != last_code:
                     entry.update(diff_stats(last_code, code))
-            elif match["tag_id"] == prev["tag_id"]:
+            elif match["tag_id"] == prev["tag_id"] or code == last_code:
                 entry["status"] = "unchanged"
             else:
                 entry["status"] = _cosmetic_or_modified(last_code, code, strip_comments)
@@ -830,12 +832,12 @@ class HistoryService:
                         d = {**n, "changes": []}
                         if o is None:
                             d["status"] = "added"
-                        elif o["tag_id"] == n["tag_id"]:
+                        elif o["tag_id"] == n["tag_id"] or codes.get(o["tag_id"], "") == codes.get(n["tag_id"], ""):
                             d["status"] = "unchanged"
                         else:
                             d["changes"] = kconfig_field_changes(o["facts"], n["facts"])
                             d["status"] = "modified" if d["changes"] else _cosmetic_or_modified(codes.get(o["tag_id"], ""), codes.get(n["tag_id"], ""), False)
-                        if base is not None and base["tag_id"] != n["tag_id"]:
+                        if base is not None and base["tag_id"] != n["tag_id"] and codes.get(base["tag_id"], "") != codes.get(n["tag_id"], ""):
                             d.update(diff_stats(codes.get(base["tag_id"], ""), codes.get(n["tag_id"], "")))
                             if o is None:
                                 d["changes"] = kconfig_field_changes(base["facts"], n["facts"])
