@@ -507,6 +507,7 @@ class ContextMenu {
       const isStruct =
         typeId === 27 || typeId === 28 || typeId === 29 || // C_struct, C_structdecl, C_structnotbind
         typeId === 33 || typeId === 34 || typeId === 35 || // C_union, C_uniondecl, C_unionnotbind
+        typeId === 123 || typeId === 125 || typeId === 127 || // Rust_Struct, Rust_Enum, Rust_Union
         token.name?.startsWith("struct ") ||
         token.name?.startsWith("union ") ||
         (token.typeClass && token.typeClass.includes("ast-struct")) ||
@@ -515,6 +516,7 @@ class ContextMenu {
 
       const isFunction =
         typeId === 20 || typeId === 21 || typeId === 22 || typeId === 63 || typeId === 147 || // C_functionproto, C_functionprotodecl, C_functionprotnotbind, C_CallExpr, C_SyscallDef
+        typeId === 128 || // Rust_Fn
         token.name?.endsWith("()") ||
         (token.typeClass && (token.typeClass.includes("ast-func") || token.typeClass.includes("tok-function"))) ||
         (cleanName && lineText && new RegExp(`\\b${cleanName}\\s*\\(`).test(lineText));

@@ -1809,6 +1809,9 @@ webapp/frontend/js/
     ├── code_view/
     │   ├── virtual_editor.js     # Virtualized line scroller with minimap (one per code tab)
     │   ├── ast_overlay.js        # Disjoint narrowest-interval AST token mapping & syntax colors
+    │   ├── syntax/               # Modular language syntax grammars & detection registry
+    │   │   ├── registry.js       # Grammar detector (ftype, extension, filename, shebang)
+    │   │   └── languages/        # Declarative language lexers (c, rust, python, shell, perl, asm, etc.)
     │   ├── fidelity_clipboard.js # 100% copy fidelity raw line buffer extractor
     │   ├── file_diff.js          # "⇄ Diff": full-file diff rows, side-by-side pairing, file/revision picker
     │   └── blame_view.js         # Interactive git blame annotations
@@ -1870,23 +1873,34 @@ Handles unified HTTP communication, response caching, offline fallback, and netw
 - `_sanitizeVer(v)`: falls back to `v3.0` for an empty value or a stringified object (`"[object …"`) only; any other name, a branch containing "object" included, is sent as is.
 
 ### 5.2. `AstOverlay` (`webapp/frontend/js/views/code_view/ast_overlay.js`)
-Implements two-layer hybrid highlighting with map prioritization and client-side fallback:
-1. **File-Type Scoped Syntax Parsing (`setFileInfo`)**:
-   - Explicitly scopes C keywords (`C_KEYWORDS`), C standard/kernel types (`C_TYPES`), and C preprocessor directives (`#include`, `#define`, `#ifdef`) strictly to C-type files (`ftype === 1` or `.c`/`.h`/`.i` paths).
-   - In raw files (Makefiles, documentation, text files) and Kconfig files, prevents C keywords (e.g. `if`, `else`, `return`, `default`) and `#` preprocessors from false-positive C styling, correctly preserving hash comments and plain text tokenization.
-2. **Map Prioritization & Narrowest-Interval Disjoint Token Mapping**:
+Implements two-layer hybrid highlighting with map prioritization, multi-language grammar dispatch, and client-side fallback:
+1. **Multi-Language Detection & Grammar Dispatch (`setFileInfo`, `syntax/registry.js`)**:
+   - Dispatches language grammars from `webapp/frontend/js/views/code_view/syntax/registry.js` using a 4-tier detection cascade:
+     1. Database `ftype` identifiers (`ftype === 1` for C, `2` for Kconfig, `3` for Rust, `4` for Assembly).
+     2. Exact filename matching (e.g. `Makefile`, `Kbuild`, `Kconfig`).
+     3. Canonical file extension mapping (`.rs`, `.py`, `.sh`/`.bash`, `.pl`/`.pm`, `.S`/`.s`, `.mk`, `.dts`/`.dtsi`, `.yaml`/`.yml`, `.c`/`.h`/`.i`).
+     4. First-line shebang inspection (`#!/bin/sh`, `#!/usr/bin/env python`, `#!/usr/bin/perl`) for extensionless kernel scripts.
+   - Modular grammar definitions (`webapp/frontend/js/views/code_view/syntax/languages/`) encapsulate keywords, standard/kernel types, comments, string delimiters, and directive rules for each language.
+2. **Dedicated Token Classes & Visual Fidelity (`codeview.css`)**:
+   - Reuses core styling tokens (`.tok-keyword`, `.tok-type`, `.tok-string`, `.tok-number`, `.tok-comment`, `.tok-preproc`, `.tok-macro`, `.tok-include`, `.tok-punct`, `.tok-function`, `.tok-identifier`).
+   - Introduces dedicated language styling classes:
+     - `.tok-variable` (`#ffa657`): Shell and Perl variables (`$VAR`, `${VAR}`, `$@`, `%hash`, `@arr`), Makefile expansions (`$(CC)`, `$<`), and Assembly registers (`%rax`).
+     - `.tok-attribute` (`#7ee787`): Rust outer/inner attributes (`#[inline]`, `#![no_std]`) and Python decorators (`@classmethod`).
+     - `.tok-lifetime` (`#ffa657` italic): Rust lifetime parameters (`'a`, `'static`).
+3. **Map Prioritization & Narrowest-Interval Disjoint Token Mapping**:
    - Sorts spatial map tokens by width descending (`(char_e - char_s)`).
    - Assigns character intervals to an array `charToken[i]`, ensuring narrow inner tokens (declarators, symbol references, variables) overwrite and take precedence over enclosing multi-line scopes without shadowing.
    - When specific AST tokens exist for a line, prioritizes map information (`renderWithAstTokens`).
-3. **Client-Side Lexical & Semantic Fallback (`renderLexical`)**:
-   - On lines without AST tokens or lines only covered by broad multi-line container envelopes (`type_id` in 1, 21, 69, 70, 71, 72), automatically reverts to the client-side parser.
-   - Accurately tokenizes C/C++ keywords (`.tok-keyword`), types (`.tok-type`), strings (`.tok-string`), numbers (`.tok-number`), operators/punctuation (`.tok-punct`), and comments (`.tok-comment`) when viewing C-type files.
-   - Ensures non-symbol tokens (keywords, literals, comments) are strictly non-clickable (no `.ast-token`), while function calls and identifiers receive interactive `.ast-token` badges for context inspection.
-4. **Include Directive Tokenization (`renderIncludeLine`)**:
-   - Reliably isolates `#include ` directives across all C source and header files (e.g. `init/do_mounts.c`).
+   - Maps Rust AST node types (ASTT values 123–143) to corresponding CSS classes (`Rust_Struct`, `Rust_Enum`, `Rust_Union`, `Rust_Trait` -> `tok-type ast-struct`; `Rust_Fn` -> `tok-function ast-func`; `Rust_MacroDef`, `Rust_MacroCall` -> `tok-macro ast-macro`; `Rust_Attribute` -> `tok-attribute ast-attribute`; comments -> `tok-comment`).
+   - Filters broad multi-line container envelopes across C and Rust (C containers 1, 21, 69–72; Rust `Rust_Impl` 132, `Rust_Mod` 136, `Rust_ForeignMod` 140) to prevent enclosing blocks from suppressing line-level tokenization.
+4. **Client-Side Lexical Fallback & Multi-Line Interval Scanning (`indexMultiLineSpans`, `renderLexical`)**:
+   - On lines without server AST tokens or unparsed files, falls back to the client-side language lexer.
+   - Lightweight $O(N)$ single-pass scan (`indexMultiLineSpans`) on file load indexes multi-line block comments (`/* ... */`) and Python triple-quoted docstrings (`"""..."""` / `'''...'''`), ensuring correct styling across virtual scrolling jumps without line-prefix heuristics.
+   - Identifiers, types, and function calls across all supported languages receive interactive `.ast-token` badges with `data-name="..."`, enabling full right-click context menu capabilities (Go to Definition, Find References, Symbol Palette search).
+5. **Include Directive Tokenization (`renderIncludeLine`)**:
+   - Reliably isolates `#include ` directives across C, Assembly, and DeviceTree source files.
    - Renders `#include ` as non-clickable `<span class="tok-preproc">` and the header target (`<linux/...>` or `"header.h"`) as `<span class="tok-include ast-token ast-include">`.
    - Binds server AST ID and type (`data-type-id="78"`) when mapped, while preserving interactive click resolution for all unmapped includes.
-   - Slicing coordinate correction: `abs_ce = max(abs_cs, raw_ce)` in `filesystem_service.py` preserves 1-indexed column intervals with closing quotes and angle brackets intact.
 
 ### 5.3. `NodeRenderer` & Drag Controller (`webapp/frontend/js/views/nodemap/`)
 - Canvas pan and zoom via CSS transforms of the node layer; wires are SVG paths (`edge_router.js`).

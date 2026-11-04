@@ -534,7 +534,7 @@ export class VirtualEditor {
       const tokenSpan = e.target.closest(".ast-token");
       if (tokenSpan) {
         // Prevent clicks on comments or structural directives
-        if (tokenSpan.classList.contains("tok-comment") || tokenSpan.dataset.typeId === "2") {
+        if (tokenSpan.classList.contains("tok-comment") || tokenSpan.dataset.typeId === "2" || tokenSpan.dataset.typeId === "142" || tokenSpan.dataset.typeId === "143") {
           return;
         }
 
@@ -567,7 +567,7 @@ export class VirtualEditor {
       const tokenSpan = e.target.closest(".ast-token");
       if (tokenSpan) {
         // Prevent clicks on comments or structural directives
-        if (tokenSpan.classList.contains("tok-comment") || tokenSpan.dataset.typeId === "2") {
+        if (tokenSpan.classList.contains("tok-comment") || tokenSpan.dataset.typeId === "2" || tokenSpan.dataset.typeId === "142" || tokenSpan.dataset.typeId === "143") {
           return;
         }
 
@@ -615,7 +615,7 @@ export class VirtualEditor {
         }
       }
 
-      if (tokenSpan && !tokenSpan.classList.contains("tok-comment") && tokenSpan.dataset.typeId !== "2") {
+      if (tokenSpan && !tokenSpan.classList.contains("tok-comment") && tokenSpan.dataset.typeId !== "2" && tokenSpan.dataset.typeId !== "142" && tokenSpan.dataset.typeId !== "143") {
         const astId = parseInt(tokenSpan.dataset.astId || "0", 10);
         const typeId = parseInt(tokenSpan.dataset.typeId || "0", 10);
         const name = (tokenSpan.dataset.name || tokenSpan.textContent || "").trim();
@@ -764,7 +764,8 @@ export class VirtualEditor {
       const content = res.content || "";
       this.rawLines = content.split(/\r?\n/);
       this.currentFtype = res.ftype;
-      this.astOverlay.setFileInfo(res.ftype, this.currentFilePath);
+      this.astOverlay.setFileInfo(res.ftype, this.currentFilePath, this.rawLines[0] || "");
+      this.astOverlay.indexMultiLineSpans(this.rawLines);
 
       // Update last changed metadata chip in toolbar if available
       if (res.file_info && res.file_info.last_changed) {

@@ -1,89 +1,308 @@
 /**
  * ast_overlay.js - Dual-Layer Syntax Highlighting & AST Disjoint Interval Overlay.
- * Combines client-side lexical parsing with database spatial map tokens and #ifdef dimming.
+ * Combines client-side multi-language lexical parsing with database spatial map tokens and #ifdef dimming.
  */
 
-const C_KEYWORDS = new Set([
-  "auto", "break", "case", "char", "const", "continue", "default", "do",
-  "double", "else", "enum", "extern", "float", "for", "goto", "if",
-  "inline", "int", "long", "register", "restrict", "return", "short",
-  "signed", "sizeof", "static", "struct", "switch", "typedef", "union",
-  "unsigned", "void", "volatile", "while", "_Bool", "_Complex", "_Imaginary",
-  "__init", "__exit", "__user", "__kernel", "__iomem", "__percpu", "__rcu",
-  "asmlinkage", "FASTCALL", "__attribute__", "__inline__", "__inline",
-  "__asm__", "__volatile__", "likely", "unlikely", "NULL"
-]);
+import { detectGrammar, DEFAULT_FALLBACK_GRAMMAR } from "./syntax/registry.js";
+import { C_KEYWORDS, C_TYPES } from "./syntax/languages/c.js";
 
-const C_TYPES = new Set([
-  "size_t", "ssize_t", "uint8_t", "uint16_t", "uint32_t", "uint64_t",
-  "int8_t", "int16_t", "int32_t", "int64_t", "u8", "u16", "u32", "u64",
-  "s8", "s16", "s32", "s64", "__u8", "__u16", "__u32", "__u64",
-  "__s8", "__s16", "__s32", "__s64", "__be16", "__be32", "__be64",
-  "__le16", "__le32", "__le64", "gfp_t", "phys_addr_t", "resource_size_t",
-  "dma_addr_t", "loff_t", "atomic_t", "atomic64_t", "spinlock_t",
-  "mutex", "rwsem", "list_head", "hlist_node", "bool"
-]);
+const REGEX_CACHE = new Map();
+const PUNCT_REGEX = "[^\\s\\w\"'`$@%#;/]+|[^\\s\\w]";
+
+/**
+ * Build a language-specific token regular expression with tailored token boundaries.
+ * Prevents cross-language collisions (e.g. semicolons as comments in C/Rust, or slashes as comments in Python/Shell).
+ *
+ * @param {string} grammarId
+ * @returns {RegExp}
+ */
+function getGrammarRegex(grammarId) {
+  const cached = REGEX_CACHE.get(grammarId);
+  if (cached) {
+    return new RegExp(cached.source, "g");
+  }
+
+  const parts = [];
+
+  switch (grammarId) {
+    case "rust":
+      parts.push(
+        "/\\*[\\s\\S]*?\\*/",                                                // 1. Block comments
+        "//[^\n]*",                                                          // 2. Line / doc comments
+        "#!?\\[[^\\]\n]*\\]",                                                // 3. Attributes: #[inline], #![no_std]
+        "r###\"[\\s\\S]*?\"###|r##\"[\\s\\S]*?\"##|r#\"[\\s\\S]*?\"#",       // 4. Raw strings: r#"..."#
+        "b\"[^\"\\\\]*(?:\\\\.[^\"\\\\]*)*\"",                               // 5. Byte strings: b"..."
+        "\"[^\"\\\\]*(?:\\\\.[^\"\\\\]*)*\"",                                // 6. Double-quoted strings
+        "'(?:[^'\\\\]|\\\\.)'",                                              // 7. Character literals: 'c', '\n'
+        "'[a-zA-Z_]\\w*\\b",                                                 // 8. Lifetimes: 'a, 'static
+        "[a-zA-Z_]\\w*!",                                                    // 9. Macro calls: pr_info!, vec!
+        "\\b0x[0-9a-fA-F_]+[uUlLiIfF\\d]*\\b",                              // 10. Hex numbers
+        "\\b0b[01_]+[uUlLiIfF\\d]*\\b",                                      // 11. Binary numbers
+        "\\b0o[0-7_]+[uUlLiIfF\\d]*\\b",                                     // 12. Octal numbers
+        "\\b\\d[\\d_]*(?:\\.[\\d_]*)?(?:[eE][+-]?\\d+)?(?:[a-zA-Z_]\\w*)?\\b",// 13. Decimals / floats
+        "[a-zA-Z_]\\w*",                                                     // 14. Identifiers
+        PUNCT_REGEX                                                          // 15. Punctuation
+      );
+      break;
+
+    case "c":
+      parts.push(
+        "/\\*[\\s\\S]*?\\*/",                                                // Block comments
+        "//[^\n]*",                                                          // Line comments
+        "#[a-zA-Z_]\\w*",                                                    // Preprocessor directives
+        "\"[^\"\\\\]*(?:\\\\.[^\"\\\\]*)*\"",                                // Double-quoted strings
+        "'[^'\\\\]*(?:\\\\.[^'\\\\]*)*'",                                    // Char literals
+        "\\b0x[0-9a-fA-F]+[uUlL]*\\b",                                       // Hex
+        "\\b\\d+[uUlL]*\\b",                                                 // Decimal
+        "[a-zA-Z_]\\w*",                                                     // Identifiers
+        PUNCT_REGEX                                                          // Punctuation
+      );
+      break;
+
+    case "python":
+      parts.push(
+        "#[^\n]*",                                                           // Hash comments
+        "\"\"\"[\\s\\S]*?\"\"\"|'''[\\s\\S]*?'''",                           // Triple-quoted docstrings
+        "@[a-zA-Z_]\\w*(?:\\.[a-zA-Z_]\\w*)*",                               // Decorators
+        "[frbFRB]{0,2}\"[^\"\\\\]*(?:\\\\.[^\"\\\\]*)*\"",                   // Double-quoted strings
+        "[frbFRB]{0,2}'[^'\\\\]*(?:\\\\.[^'\\\\]*)*'",                       // Single-quoted strings
+        "\\b0x[0-9a-fA-F_]+\\b|\\b0b[01_]+\\b|\\b0o[0-7_]+\\b",             // Hex / bin / oct
+        "\\b\\d[\\d_]*(?:\\.[\\d_]*)?(?:[eE][+-]?\\d+)?\\b",                 // Numbers
+        "[a-zA-Z_]\\w*",                                                     // Identifiers
+        PUNCT_REGEX                                                          // Punctuation
+      );
+      break;
+
+    case "shell":
+      parts.push(
+        "#[^\n]*",                                                           // Comments
+        "\\$\\{[^}]+\\}|\\$\\([a-zA-Z0-9_.-]+\\)|\\$[a-zA-Z_]\\w*|\\$[@*#?$!0-9-]", // Variables
+        "\"[^\"\\\\]*(?:\\\\.[^\"\\\\]*)*\"",                                // Double quotes
+        "'[^']*'",                                                           // Single quotes
+        "\\b0x[0-9a-fA-F]+\\b|\\b\\d+\\b",                                   // Numbers
+        "[a-zA-Z_][\\w-]*",                                                  // Identifiers / words
+        PUNCT_REGEX                                                          // Punctuation
+      );
+      break;
+
+    case "perl":
+      parts.push(
+        "#[^\n]*",                                                           // Comments
+        "[\\$@%][a-zA-Z_]\\w*|\\$#[a-zA-Z_]\\w*|\\$[@*#?$!0-9-]",           // Variables
+        "\"[^\"\\\\]*(?:\\\\.[^\"\\\\]*)*\"",                                // Double quotes
+        "'[^']*'",                                                           // Single quotes
+        "\\b0x[0-9a-fA-F]+\\b|\\b\\d+\\b",                                   // Numbers
+        "[a-zA-Z_]\\w*",                                                     // Identifiers
+        PUNCT_REGEX                                                          // Punctuation
+      );
+      break;
+
+    case "assembly":
+      parts.push(
+        "/\\*[\\s\\S]*?\\*/",                                                // Block comments
+        "//[^\n]*",                                                          // C++ comments
+        ";[^\n]*",                                                           // Semicolon comments
+        "@[^\n]*",                                                           // ARM @ comments
+        "#[^\n]*",                                                           // Hash comments
+        "\\.[a-zA-Z_]\\w*",                                                  // Directives (.global, etc.)
+        "%[a-zA-Z0-9]+",                                                     // Registers (%rax, etc.)
+        "\"[^\"\\\\]*(?:\\\\.[^\"\\\\]*)*\"",                                // Strings
+        "'[^'\\\\]*(?:\\\\.[^'\\\\]*)*'",                                    // Chars
+        "\\b0x[0-9a-fA-F]+\\b|\\b\\d+\\b",                                   // Numbers
+        "[a-zA-Z_]\\w*",                                                     // Labels / identifiers
+        PUNCT_REGEX                                                          // Punctuation
+      );
+      break;
+
+    case "makefile":
+      parts.push(
+        "#[^\n]*",                                                           // Comments
+        ":=|\\+=|\\?=|!=",                                                   // Assignment operators
+        "\\$\\([a-zA-Z0-9_.-]+\\)|\\$\\{[^}]+\\}|\\$[@<*^?%+]",              // Variables
+        "\"[^\"\\\\]*(?:\\\\.[^\"\\\\]*)*\"",                                // Strings
+        "'[^']*'",                                                           // Chars
+        "\\b\\d+\\b",                                                        // Numbers
+        "[a-zA-Z_][\\w-]*",                                                  // Targets / variables
+        PUNCT_REGEX                                                          // Punctuation
+      );
+      break;
+
+    case "kconfig":
+      parts.push(
+        "#[^\n]*",                                                           // Comments
+        "\"[^\"\\\\]*(?:\\\\.[^\"\\\\]*)*\"",                                // Strings
+        "'[^']*'",                                                           // Chars
+        "\\b0x[0-9a-fA-F]+\\b|\\b\\d+\\b",                                   // Numbers
+        "[a-zA-Z0-9_]+",                                                     // Identifiers
+        PUNCT_REGEX                                                          // Punctuation
+      );
+      break;
+
+    case "dts":
+      parts.push(
+        "/\\*[\\s\\S]*?\\*/",                                                // Block comments
+        "//[^\n]*",                                                          // Comments
+        "/[a-zA-Z0-9_-]+/[a-zA-Z0-9_-]*",                                    // Directives: /dts-v1/, etc.
+        "#[a-zA-Z_]\\w*",                                                    // Preproc
+        "\"[^\"\\\\]*(?:\\\\.[^\"\\\\]*)*\"",                                // Strings
+        "\\b0x[0-9a-fA-F]+\\b|\\b\\d+\\b",                                   // Numbers
+        "[a-zA-Z_][\\w-]*",                                                  // Node names / properties
+        PUNCT_REGEX                                                          // Punctuation
+      );
+      break;
+
+    case "yaml":
+      parts.push(
+        "#[^\n]*",                                                           // Comments
+        "\"[^\"\\\\]*(?:\\\\.[^\"\\\\]*)*\"",                                // Strings
+        "'[^']*'",                                                           // Chars
+        "\\b0x[0-9a-fA-F]+\\b|\\b\\d+(?:\\.\\d+)?\\b",                       // Numbers
+        "[a-zA-Z0-9_-]+",                                                    // Keys / values
+        PUNCT_REGEX                                                          // Punctuation
+      );
+      break;
+
+    default:
+      // Generic fallback
+      parts.push(
+        "/\\*[\\s\\S]*?\\*/",
+        "//[^\n]*",
+        "#[^\n]*",
+        "\"[^\"\\\\]*(?:\\\\.[^\"\\\\]*)*\"",
+        "'[^'\\\\]*(?:\\\\.[^'\\\\]*)*'",
+        "\\b0x[0-9a-fA-F]+\\b|\\b\\d+\\b",
+        "[a-zA-Z_]\\w*",
+        PUNCT_REGEX
+      );
+      break;
+  }
+
+  const compiled = new RegExp(parts.join("|"), "g");
+  REGEX_CACHE.set(grammarId, compiled);
+  return new RegExp(compiled.source, "g");
+}
 
 export class AstOverlay {
   constructor() {
     this.tokensByLine = new Map(); // lineNo -> list of AST tokens
+    this.multiLineCommentLines = new Set(); // lineNo -> is inside multi-line block comment
+    this.multiLineDocstringLines = new Set(); // lineNo -> is inside multi-line docstring
     this.ftype = null;
     this.filePath = "";
+    this.grammar = DEFAULT_FALLBACK_GRAMMAR;
     this.isCFile = true; // Default true until setFileInfo is called
   }
 
-  setFileInfo(ftype, filePath = "") {
+  setFileInfo(ftype, filePath = "", firstLine = "") {
     this.ftype = ftype;
     this.filePath = filePath || "";
-    this.isCFile = (ftype === 1) || Boolean(filePath && /\.(c|h|i)$/i.test(filePath));
+    this.grammar = detectGrammar(ftype, filePath, firstLine);
+    this.isCFile = this.grammar.id === "c";
+  }
+
+  /**
+   * Pre-scan line intervals on file content load to accurately track multi-line
+   * block comments (/* ... *\/) and Python docstrings (""" / ''') across virtual scrolling jumps.
+   *
+   * @param {string[]} rawLines
+   */
+  indexMultiLineSpans(rawLines) {
+    this.multiLineCommentLines.clear();
+    this.multiLineDocstringLines.clear();
+    if (!Array.isArray(rawLines) || rawLines.length === 0) return;
+
+    let inBlockComment = false;
+    let inTripleQuote = null; // '"""' or "'''"
+
+    for (let i = 0; i < rawLines.length; i++) {
+      const lineNo = i + 1;
+      const line = rawLines[i];
+
+      // 1. Continuation of block comment
+      if (inBlockComment) {
+        this.multiLineCommentLines.add(lineNo);
+        if (line.includes("*/")) {
+          inBlockComment = false;
+        }
+        continue;
+      }
+
+      // 2. Continuation of Python triple-quote docstring
+      if (inTripleQuote) {
+        this.multiLineDocstringLines.add(lineNo);
+        if (line.includes(inTripleQuote)) {
+          inTripleQuote = null;
+        }
+        continue;
+      }
+
+      // 3. Check for start of block comment (C, Rust, Assembly, DTS)
+      if (this.grammar.id === "c" || this.grammar.id === "rust" || this.grammar.id === "assembly" || this.grammar.id === "dts") {
+        const openIdx = line.indexOf("/*");
+        if (openIdx !== -1) {
+          const closeIdx = line.indexOf("*/", openIdx + 2);
+          if (closeIdx === -1) {
+            inBlockComment = true;
+            this.multiLineCommentLines.add(lineNo);
+            continue;
+          }
+        }
+      }
+
+      // 4. Check for start of Python triple-quote docstring
+      if (this.grammar.id === "python") {
+        for (const quote of ['"""', "'''"]) {
+          const openIdx = line.indexOf(quote);
+          if (openIdx !== -1) {
+            const closeIdx = line.indexOf(quote, openIdx + 3);
+            if (closeIdx === -1) {
+              inTripleQuote = quote;
+              this.multiLineDocstringLines.add(lineNo);
+              break;
+            }
+          }
+        }
+      }
+    }
   }
 
   loadServerTokens(serverTokens) {
     this.tokensByLine.clear();
     if (!Array.isArray(serverTokens)) return;
 
+    const processTok = (line_s, char_s, line_e, char_e, ast_id, type_id) => {
+      // Skip pure comments from clickable AST tokens map (C_Comment=2, Rust_DocComment=142, Rust_Comment=143)
+      if (type_id === 2 || type_id === 142 || type_id === 143) return;
+
+      for (let l = line_s; l <= line_e; l++) {
+        if (!this.tokensByLine.has(l)) {
+          this.tokensByLine.set(l, []);
+        }
+        this.tokensByLine.get(l).push({
+          char_s: l === line_s ? char_s : 0,
+          char_e: l === line_e ? char_e : 9999,
+          ast_id,
+          type_id,
+          isMultiLine: line_e > line_s
+        });
+      }
+    };
+
     // Support both nested arrays [[l_s, c_s, l_e, c_e, ast_id, type_id], ...] and flat array
     if (serverTokens.length > 0 && Array.isArray(serverTokens[0])) {
       for (const tok of serverTokens) {
-        const [line_s, char_s, line_e, char_e, ast_id, type_id] = tok;
-        // Skip pure comments from clickable AST tokens map
-        if (type_id === 2) continue;
-
-        for (let l = line_s; l <= line_e; l++) {
-          if (!this.tokensByLine.has(l)) {
-            this.tokensByLine.set(l, []);
-          }
-          this.tokensByLine.get(l).push({
-            char_s: l === line_s ? char_s : 0,
-            char_e: l === line_e ? char_e : 9999,
-            ast_id,
-            type_id,
-            isMultiLine: line_e > line_s
-          });
-        }
+        processTok(tok[0], tok[1], tok[2], tok[3], tok[4], tok[5]);
       }
     } else {
       for (let i = 0; i < serverTokens.length; i += 6) {
-        const line_s = serverTokens[i];
-        const char_s = serverTokens[i + 1];
-        const line_e = serverTokens[i + 2];
-        const char_e = serverTokens[i + 3];
-        const ast_id = serverTokens[i + 4];
-        const type_id = serverTokens[i + 5];
-        if (type_id === 2) continue;
-
-        for (let l = line_s; l <= line_e; l++) {
-          if (!this.tokensByLine.has(l)) {
-            this.tokensByLine.set(l, []);
-          }
-          this.tokensByLine.get(l).push({
-            char_s: l === line_s ? char_s : 0,
-            char_e: l === line_e ? char_e : 9999,
-            ast_id,
-            type_id,
-            isMultiLine: line_e > line_s
-          });
-        }
+        processTok(
+          serverTokens[i],
+          serverTokens[i + 1],
+          serverTokens[i + 2],
+          serverTokens[i + 3],
+          serverTokens[i + 4],
+          serverTokens[i + 5]
+        );
       }
     }
   }
@@ -93,20 +312,30 @@ export class AstOverlay {
       return isDimmed ? `<span class="ast-dimmed">&nbsp;</span>` : "&nbsp;";
     }
 
-    // 1. Direct Include Line Handling:
-    // If in a C file and line is an #include directive, ALWAYS format the include line accurately:
-    // '#include ' as non-clickable preproc, and the header as clickable .ast-include.
-    // If the map has a token for this line (type_id 78), attach the server's ast_id.
-    if (this.isCFile && /^\s*#\s*include\b/.test(rawLineText)) {
+    // 1. Direct Include Line Handling for languages with preprocessor includes (C, Assembly, DTS)
+    if ((this.grammar.supportsInclude || this.isCFile) && /^\s*#\s*include\b/.test(rawLineText)) {
       return this.renderIncludeLine(lineNo, rawLineText, isDimmed);
+    }
+
+    // 2. Pre-scanned Multi-Line Block Comments & Docstrings
+    if (lineNo && this.multiLineCommentLines.has(lineNo)) {
+      const h = `<span class="tok-comment">${this.escapeHtml(rawLineText)}</span>`;
+      return isDimmed ? `<span class="ast-dimmed">${h}</span>` : h;
+    }
+    if (lineNo && this.multiLineDocstringLines.has(lineNo)) {
+      const h = `<span class="tok-string">${this.escapeHtml(rawLineText)}</span>`;
+      return isDimmed ? `<span class="ast-dimmed">${h}</span>` : h;
     }
 
     const astTokens = this.tokensByLine.get(lineNo) || [];
 
-    // Filter out broad multi-line container envelopes (functions, compound statements, preprocessor blocks)
+    // Filter out broad multi-line container envelopes (functions, compound statements, preprocessor blocks, Rust impls/mods)
     // that span across multiple lines without providing token-level detail for this specific line.
     const specificTokens = astTokens.filter((t) => {
-      const isBroadContainer = t.isMultiLine && (t.type_id === 1 || t.type_id === 21 || t.type_id === 69 || t.type_id === 70 || t.type_id === 71 || t.type_id === 72);
+      const isBroadContainer = t.isMultiLine && (
+        t.type_id === 1 || t.type_id === 21 || t.type_id === 69 || t.type_id === 70 || t.type_id === 71 || t.type_id === 72 ||
+        t.type_id === 132 || t.type_id === 136 || t.type_id === 140
+      );
       return !isBroadContainer;
     });
 
@@ -116,7 +345,7 @@ export class AstOverlay {
     }
 
     // Otherwise, revert to client-side lexical/semantic parser
-    return this.renderLexical(rawLineText, isDimmed);
+    return this.renderLexical(rawLineText, isDimmed, lineNo);
   }
 
   renderIncludeLine(lineNo, rawLineText, isDimmed) {
@@ -139,7 +368,7 @@ export class AstOverlay {
       const h = `${prefixHtml}${headerHtml}${remHtml}`;
       return isDimmed ? `<span class="ast-dimmed">${h}</span>` : h;
     }
-    return this.renderLexical(rawLineText, isDimmed);
+    return this.renderLexical(rawLineText, isDimmed, lineNo);
   }
 
   renderWithAstTokens(lineText, astTokens, isDimmed) {
@@ -198,16 +427,17 @@ export class AstOverlay {
 
   tokenizeSnippet(snippet, tok) {
     // 1. Comments: never clickable
-    if (tok.type_id === 2 || snippet.trim().startsWith("//") || snippet.trim().startsWith("/*")) {
+    if (tok.type_id === 2 || tok.type_id === 142 || tok.type_id === 143 ||
+        snippet.trim().startsWith("//") || snippet.trim().startsWith("/*")) {
       return `<span class="tok-comment">${this.escapeHtml(snippet)}</span>`;
     }
 
-    // 2. Preprocessor include: Only the <header> or "header" is clickable, NEVER the #include keyword!
+    // 2. Preprocessor include
     if (tok.type_id === 78) {
       return this.renderIncludeLine(null, snippet, false);
     }
 
-    // 3. Preprocessor defines & macros
+    // 3. Preprocessor defines & macros (C macros: 75, 76; Rust macros: 138, 139)
     if (tok.type_id === 75 || tok.type_id === 76) {
       const defMatch = snippet.match(/^(\s*#?\s*define\s+)([a-zA-Z_]\w*)(.*)$/);
       if (defMatch) {
@@ -218,87 +448,51 @@ export class AstOverlay {
       }
     }
 
+    if (tok.type_id === 138 || tok.type_id === 139) {
+      const macroMatch = snippet.match(/^([a-zA-Z_]\w*!?)(.*)$/);
+      if (macroMatch) {
+        const macroName = macroMatch[1];
+        const cleanName = macroName.replace(/!$/, "");
+        const remainder = this.tokenizeExpression(macroMatch[2]);
+        return `<span class="tok-macro ast-token ast-macro" data-name="${this.escapeHtml(cleanName)}" data-ast-id="${tok.ast_id}" data-type-id="${tok.type_id}">${this.escapeHtml(macroName)}</span>${remainder}`;
+      }
+    }
+
     // 4. Internal tokenization for code within the map extent
     const typeClass = this.mapTypeToClass(tok.type_id);
-    const tokenRegex = /(\/\/[^\n]*|\/\*[\s\S]*?\*\/|".*?"|'.*?'|[a-zA-Z_]\w*|\b0x[0-9a-fA-F]+[uUlL]*\b|\b\d+[uUlL]*\b|[^\s\w]+)/g;
-    let html = "";
-    let match;
-    let lastIdx = 0;
-
-    while ((match = tokenRegex.exec(snippet)) !== null) {
-      const idx = match.index;
-      const val = match[0];
-
-      if (idx > lastIdx) {
-        html += this.escapeHtml(snippet.substring(lastIdx, idx));
-      }
-
-      if (val.startsWith("//") || val.startsWith("/*") || (!this.isCFile && val.startsWith("#"))) {
-        html += `<span class="tok-comment">${this.escapeHtml(val)}</span>`;
-      } else if (val.startsWith('"') || val.startsWith("'")) {
-        html += `<span class="tok-string">${this.escapeHtml(val)}</span>`;
-      } else if (/^(0x[0-9a-fA-F]+|\d+)[uUlL]*$/.test(val)) {
-        html += `<span class="tok-number">${this.escapeHtml(val)}</span>`;
-      } else if (this.isCFile && C_KEYWORDS.has(val)) {
-        html += `<span class="tok-keyword">${this.escapeHtml(val)}</span>`;
-      } else if (this.isCFile && (C_TYPES.has(val) || val.endsWith("_t"))) {
-        html += `<span class="tok-type ast-token" data-name="${this.escapeHtml(val)}" data-ast-id="${tok.ast_id}" data-type-id="${tok.type_id}">${this.escapeHtml(val)}</span>`;
-      } else if (/^[a-zA-Z_]\w*$/.test(val)) {
-        const isFnCall = snippet.slice(tokenRegex.lastIndex).trimStart().startsWith("(");
-        const cls = isFnCall ? "tok-function" : "tok-identifier";
-        html += `<span class="${cls} ast-token ${typeClass}" data-name="${this.escapeHtml(val)}" data-ast-id="${tok.ast_id}" data-type-id="${tok.type_id}">${this.escapeHtml(val)}</span>`;
-      } else {
-        html += `<span class="tok-punct">${this.escapeHtml(val)}</span>`;
-      }
-
-      lastIdx = tokenRegex.lastIndex;
-    }
-
-    if (lastIdx < snippet.length) {
-      html += this.escapeHtml(snippet.substring(lastIdx));
-    }
-
-    return html;
+    return this.tokenizeExpression(snippet, tok, typeClass);
   }
 
-  renderLexical(lineText, isDimmed) {
+  renderLexical(lineText, isDimmed, lineNo = null) {
     const trimmed = lineText.trim();
 
-    if (this.isCFile) {
-      // 1. Comments: C++ style, C block starts, or multi-line comment continuations (lines starting with '*')
-      if (trimmed.startsWith("//") || trimmed.startsWith("/*") || (trimmed.startsWith("*") && !trimmed.startsWith("*="))) {
-        const h = `<span class="tok-comment">${this.escapeHtml(lineText)}</span>`;
+    // 1. Check if entire line is a comment according to the active grammar
+    if (this.grammar.isCommentLine(trimmed)) {
+      const h = `<span class="tok-comment">${this.escapeHtml(lineText)}</span>`;
+      return isDimmed ? `<span class="ast-dimmed">${h}</span>` : h;
+    }
+
+    // 2. Preprocessor Directives for languages that support cpp (C, Assembly, DTS)
+    if (this.grammar.hasPreprocessor && trimmed.startsWith("#")) {
+      // #define <MACRO>
+      const defMatch = lineText.match(/^(\s*#\s*define\s+)([a-zA-Z_]\w*)(.*)$/);
+      if (defMatch) {
+        const prefix = `<span class="tok-preproc">${this.escapeHtml(defMatch[1])}</span>`;
+        const macroName = defMatch[2];
+        const remainder = this.tokenizeExpression(defMatch[3]);
+        const h = `${prefix}<span class="tok-macro ast-token" data-name="${this.escapeHtml(macroName)}">${this.escapeHtml(macroName)}</span>${remainder}`;
         return isDimmed ? `<span class="ast-dimmed">${h}</span>` : h;
       }
 
-      // 2. Preprocessor Directives
-      if (trimmed.startsWith("#")) {
-        // Handle #define <MACRO>
-        const defMatch = lineText.match(/^(\s*#\s*define\s+)([a-zA-Z_]\w*)(.*)$/);
-        if (defMatch) {
-          const prefix = `<span class="tok-preproc">${this.escapeHtml(defMatch[1])}</span>`;
-          const macroName = defMatch[2];
-          const remainder = this.tokenizeExpression(defMatch[3]);
-          const h = `${prefix}<span class="tok-macro ast-token" data-name="${this.escapeHtml(macroName)}">${this.escapeHtml(macroName)}</span>${remainder}`;
-          return isDimmed ? `<span class="ast-dimmed">${h}</span>` : h;
-        }
-
-        // Handle #include <header.h> or "header.h"
-        if (/^\s*#\s*include\b/.test(lineText)) {
-          return this.renderIncludeLine(null, lineText, isDimmed);
-        }
-
-        // Other preprocessor directives (#if, #ifdef, #ifndef, #else, #endif, #pragma, #undef)
-        const preMatch = lineText.match(/^(\s*#\s*[a-zA-Z_]\w*)(.*)$/);
-        if (preMatch) {
-          const h = `<span class="tok-preproc">${this.escapeHtml(preMatch[1])}</span>${this.tokenizeExpression(preMatch[2])}`;
-          return isDimmed ? `<span class="ast-dimmed">${h}</span>` : h;
-        }
+      // #include <header.h>
+      if (/^\s*#\s*include\b/.test(lineText)) {
+        return this.renderIncludeLine(lineNo, lineText, isDimmed);
       }
-    } else {
-      // Non-C files: '#' is standard comment syntax (Makefiles, Kconfig, shell, etc.)
-      if (trimmed.startsWith("#") || trimmed.startsWith("//") || trimmed.startsWith("/*")) {
-        const h = `<span class="tok-comment">${this.escapeHtml(lineText)}</span>`;
+
+      // Other preprocessor directives (#if, #ifdef, #ifndef, #else, #elif, #endif, #pragma, #undef)
+      const preMatch = lineText.match(/^(\s*#\s*[a-zA-Z_]\w*)(.*)$/);
+      if (preMatch) {
+        const h = `<span class="tok-preproc">${this.escapeHtml(preMatch[1])}</span>${this.tokenizeExpression(preMatch[2])}`;
         return isDimmed ? `<span class="ast-dimmed">${h}</span>` : h;
       }
     }
@@ -308,11 +502,23 @@ export class AstOverlay {
     return isDimmed ? `<span class="ast-dimmed">${h}</span>` : h;
   }
 
-  tokenizeExpression(text) {
-    const tokenRegex = /(\/\/[^\n]*|\/\*[\s\S]*?\*\/|".*?"|'.*?'|[a-zA-Z_]\w*|\b0x[0-9a-fA-F]+[uUlL]*\b|\b\d+[uUlL]*\b|[^\s\w]+)/g;
+  /**
+   * Tokenize expression text with full multi-language lexical awareness.
+   *
+   * @param {string} text - Code snippet to tokenize
+   * @param {object|null} [tok=null] - Enclosing server AST token if within map extent
+   * @param {string} [enclosingTypeClass=""] - CSS class for enclosing AST extent
+   * @returns {string} Escaped HTML with token styling and .ast-token interactive attributes
+   */
+  tokenizeExpression(text, tok = null, enclosingTypeClass = "") {
+    const tokenRegex = getGrammarRegex(this.grammar.id);
     let html = "";
     let match;
     let lastIdx = 0;
+    let lastKeyword = null;
+
+    const astIdAttr = tok && tok.ast_id ? ` data-ast-id="${tok.ast_id}"` : "";
+    const typeIdAttr = tok && tok.type_id ? ` data-type-id="${tok.type_id}"` : "";
 
     while ((match = tokenRegex.exec(text)) !== null) {
       const idx = match.index;
@@ -322,22 +528,89 @@ export class AstOverlay {
         html += this.escapeHtml(text.substring(lastIdx, idx));
       }
 
-      if (val.startsWith("//") || val.startsWith("/*") || (!this.isCFile && val.startsWith("#"))) {
+      // 1. Comments
+      if (val.startsWith("/*") || val.startsWith("//") ||
+          (val.startsWith(";") && this.grammar.id === "assembly") ||
+          (val.startsWith("@") && this.grammar.id === "assembly")) {
         html += `<span class="tok-comment">${this.escapeHtml(val)}</span>`;
-      } else if (val.startsWith('"') || val.startsWith("'")) {
+        lastKeyword = null;
+      } else if (val.startsWith("#")) {
+        // Rust attributes start with #[ or #!
+        if (this.grammar.id === "rust" && (val.startsWith("#[") || val.startsWith("#!["))) {
+          html += `<span class="tok-attribute">${this.escapeHtml(val)}</span>`;
+        } else if (this.grammar.hasPreprocessor && /^\s*#\s*(include|define|undef|if|ifdef|ifndef|else|elif|endif|pragma)\b/.test(val)) {
+          html += `<span class="tok-preproc">${this.escapeHtml(val)}</span>`;
+        } else if (this.grammar.id !== "rust") {
+          // Standard hash comment in Shell, Python, Perl, Makefile, Kconfig, YAML, etc.
+          html += `<span class="tok-comment">${this.escapeHtml(val)}</span>`;
+        } else {
+          html += `<span class="tok-punct">${this.escapeHtml(val)}</span>`;
+        }
+        lastKeyword = null;
+      } else if (val.startsWith("#[") || val.startsWith("#![")) {
+        html += `<span class="tok-attribute">${this.escapeHtml(val)}</span>`;
+        lastKeyword = null;
+      } else if (val.startsWith("@") && this.grammar.id === "python") {
+        html += `<span class="tok-attribute">${this.escapeHtml(val)}</span>`;
+        lastKeyword = null;
+      } else if (
+        ((val.startsWith("$") || val.startsWith("@") || val.startsWith("%")) && (this.grammar.id === "shell" || this.grammar.id === "perl" || this.grammar.id === "makefile")) ||
+        (val.startsWith("%") && this.grammar.id === "assembly")
+      ) {
+        html += `<span class="tok-variable">${this.escapeHtml(val)}</span>`;
+        lastKeyword = null;
+      } else if (val.startsWith('"""') || val.startsWith("'''")) {
         html += `<span class="tok-string">${this.escapeHtml(val)}</span>`;
-      } else if (/^(0x[0-9a-fA-F]+|\d+)[uUlL]*$/.test(val)) {
+        lastKeyword = null;
+      } else if (val.startsWith("'") && this.grammar.id === "rust" && /^'[a-zA-Z_]\w*$/.test(val)) {
+        html += `<span class="tok-lifetime">${this.escapeHtml(val)}</span>`;
+        lastKeyword = null;
+      } else if (val.startsWith('"') || val.startsWith("'") || val.startsWith('r"') || val.startsWith('r#') || val.startsWith('b"')) {
+        html += `<span class="tok-string">${this.escapeHtml(val)}</span>`;
+        lastKeyword = null;
+      } else if (val.endsWith("!") && this.grammar.id === "rust" && /^[a-zA-Z_]\w*!$/.test(val)) {
+        const macroName = val.slice(0, -1);
+        html += `<span class="tok-macro ast-token ast-macro" data-name="${this.escapeHtml(macroName)}"${astIdAttr}${typeIdAttr}>${this.escapeHtml(val)}</span>`;
+        lastKeyword = null;
+      } else if (val === ":=" || val === "+=" || val === "?=" || val === "!=") {
+        html += `<span class="tok-punct">${this.escapeHtml(val)}</span>`;
+        lastKeyword = null;
+      } else if (/^(0x[0-9a-fA-F_]+|0b[01_]+|0o[0-7_]+|\d)[\w.]*$/.test(val) && !/^[a-zA-Z_]/.test(val)) {
         html += `<span class="tok-number">${this.escapeHtml(val)}</span>`;
-      } else if (this.isCFile && C_KEYWORDS.has(val)) {
+        lastKeyword = null;
+      } else if (this.grammar.keywords && this.grammar.keywords.has(val)) {
         html += `<span class="tok-keyword">${this.escapeHtml(val)}</span>`;
-      } else if (this.isCFile && (C_TYPES.has(val) || val.endsWith("_t") || val.endsWith("_type"))) {
-        html += `<span class="tok-type ast-token" data-name="${this.escapeHtml(val)}">${this.escapeHtml(val)}</span>`;
+        lastKeyword = val;
+      } else if (this.grammar.isType(val) || (this.grammar.types && this.grammar.types.has(val))) {
+        html += `<span class="tok-type ast-token" data-name="${this.escapeHtml(val)}"${astIdAttr}${typeIdAttr}>${this.escapeHtml(val)}</span>`;
+        lastKeyword = null;
+      } else if (/^\.[a-zA-Z_]\w*$/.test(val) && this.grammar.id === "assembly") {
+        html += `<span class="tok-preproc">${this.escapeHtml(val)}</span>`;
+        lastKeyword = null;
       } else if (/^[a-zA-Z_]\w*$/.test(val)) {
         const isFnCall = text.slice(tokenRegex.lastIndex).trimStart().startsWith("(");
-        const cls = isFnCall ? "tok-function" : "tok-identifier";
-        html += `<span class="${cls} ast-token" data-name="${this.escapeHtml(val)}">${this.escapeHtml(val)}</span>`;
+        const isFnDef = lastKeyword === "fn" || lastKeyword === "def" || lastKeyword === "sub" || lastKeyword === "function";
+        const isTypeDef = lastKeyword === "struct" || lastKeyword === "enum" || lastKeyword === "union" || lastKeyword === "trait" || lastKeyword === "class";
+
+        let cls = "tok-identifier";
+        if (isTypeDef) {
+          cls = "tok-type";
+        } else if (isFnCall || isFnDef) {
+          cls = "tok-function";
+        }
+
+        const extraCls = enclosingTypeClass ? ` ${enclosingTypeClass}` : "";
+        html += `<span class="${cls} ast-token${extraCls}" data-name="${this.escapeHtml(val)}"${astIdAttr}${typeIdAttr}>${this.escapeHtml(val)}</span>`;
+        lastKeyword = null;
       } else {
         html += `<span class="tok-punct">${this.escapeHtml(val)}</span>`;
+        // Do not reset lastKeyword on whitespace / punctuation if it could lead to definition
+        if (val !== " " && val !== "\t") {
+          // Keep keyword if it's colon or namespace separator
+          if (val !== ":" && val !== "&" && val !== "*") {
+            lastKeyword = null;
+          }
+        }
       }
 
       lastIdx = tokenRegex.lastIndex;
@@ -361,6 +634,27 @@ export class AstOverlay {
       case 10: case 7: case 8: case 36: case 37: case 41: case 42: return "tok-type ast-type"; // types & typedefs
       case 9: return "ast-field"; // struct field
       case 1: return "ast-compound"; // compound
+
+      // Rust AST types (ASTT.Rust_*: 123 - 143)
+      case 123: case 125: case 127: case 130: case 131:
+        return "tok-type ast-struct"; // Rust_Struct, Rust_Enum, Rust_Union, Rust_Trait, Rust_TraitAlias
+      case 133:
+        return "tok-type ast-type"; // Rust_Type
+      case 128:
+        return "tok-function ast-func"; // Rust_Fn
+      case 124: case 129:
+        return "ast-field"; // Rust_Field, Rust_Param
+      case 134: case 135:
+        return "tok-variable ast-ref"; // Rust_Const, Rust_Static
+      case 138: case 139:
+        return "tok-macro ast-macro"; // Rust_MacroDef, Rust_MacroCall
+      case 141:
+        return "tok-attribute ast-attribute"; // Rust_Attribute
+      case 142: case 143:
+        return "tok-comment"; // Rust_DocComment, Rust_Comment
+      case 132: case 136: case 137: case 140:
+        return "ast-compound"; // Rust_Impl, Rust_Mod, Rust_Use, Rust_ForeignMod
+
       default: return "ast-ref";
     }
   }

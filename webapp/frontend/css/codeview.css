@@ -244,6 +244,9 @@
 .tok-punct { color: #8b949e; }
 .tok-function { color: #d2a8ff; font-weight: 500; }
 .tok-identifier { color: #c9d1d9; }
+.tok-variable { color: #ffa657; }
+.tok-attribute { color: #7ee787; }
+.tok-lifetime { color: #ffa657; font-style: italic; }
 
 
 /* Semantic AST Overlay Tokens */
