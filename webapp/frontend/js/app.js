@@ -494,10 +494,10 @@ class KernelIdeApp {
               </div>
             </div>
 
-            <!-- UI Text Relative Scale -->
+            <!-- UI Relative Scale -->
             <div>
               <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;">
-                <label for="setting-ui-font-slider" style="font-size:11px;font-weight:600;color:var(--text-secondary);">UI Text Scale</label>
+                <label for="setting-ui-font-slider" style="font-size:11px;font-weight:600;color:var(--text-secondary);">UI Scale</label>
                 <span id="setting-ui-font-val" style="font-size:11px;font-family:var(--font-mono);color:var(--accent-blue);font-weight:600;">${curUiFontScale}%</span>
               </div>
               <input type="range" id="setting-ui-font-slider" min="80" max="160" step="5" value="${curUiFontScale}" style="width:100%;cursor:pointer;" />
@@ -1568,9 +1568,12 @@ export function applyTypographySettings(codeFontSize = null, uiFontScale = null)
   localStorage.setItem("kip-ui-font-scale", String(ufs));
 
   const rowHeight = Math.max(16, Math.round(cfs * 1.667));
+  const fontScale = ufs / 100;
+  const layoutScale = 1 + (fontScale - 1) * 0.5;
   document.documentElement.style.setProperty("--code-font-size", `${cfs}px`);
   document.documentElement.style.setProperty("--code-row-height", `${rowHeight}px`);
-  document.documentElement.style.setProperty("--ui-font-scale", (ufs / 100).toString());
+  document.documentElement.style.setProperty("--ui-font-scale", fontScale.toString());
+  document.documentElement.style.setProperty("--ui-layout-scale", layoutScale.toString());
 
   state.emit("codeview:font-changed", { fontSize: cfs, rowHeight });
 }

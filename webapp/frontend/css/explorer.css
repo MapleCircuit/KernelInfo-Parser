@@ -9,7 +9,7 @@
 }
 
 .explorer-toolbar {
-  min-height: 32px;
+  min-height: calc(32px * var(--ui-layout-scale, 1));
   background: var(--bg-secondary);
   border-bottom: 1px solid var(--border-color);
   display: flex;
@@ -75,10 +75,10 @@
 
 .explorer-row {
   display: grid;
-  grid-template-columns: 24px 1fr 180px;
+  grid-template-columns: calc(24px * var(--ui-layout-scale, 1)) 1fr calc(180px * var(--ui-layout-scale, 1));
   align-items: center;
   gap: 8px;
-  padding: 5px 16px;
+  padding: calc(5px * var(--ui-layout-scale, 1)) 16px;
   border-bottom: 1px solid var(--border-color);
   cursor: pointer;
   font-size: var(--fs-12, 12px);

@@ -12,8 +12,8 @@
 
 /* Left Column: Search & Thread List */
 .mail-list-col {
-  width: 420px;
-  min-width: 320px;
+  width: calc(420px * var(--ui-layout-scale, 1));
+  min-width: calc(320px * var(--ui-layout-scale, 1));
   border-right: 1px solid var(--border-color);
   background: var(--bg-secondary);
   display: flex;
@@ -38,7 +38,7 @@
   flex-direction: column;
   align-items: center;
   gap: 8px;
-  flex: 0 0 28px;
+  flex: 0 0 calc(28px * var(--ui-layout-scale, 1));
   padding: 8px 0;
   border: none;
   border-right: 1px solid var(--border-color);
@@ -78,7 +78,7 @@
 
 .mail-list-mode-btn {
   flex: 1;
-  padding: 4px 8px;
+  padding: calc(4px * var(--ui-layout-scale, 1)) calc(8px * var(--ui-layout-scale, 1));
   font-size: var(--fs-11, 11px);
   font-weight: 500;
   border-radius: var(--radius-sm);

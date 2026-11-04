@@ -9,7 +9,7 @@
 }
 
 .maintainers-sidebar {
-  width: 380px;
+  width: calc(380px * var(--ui-layout-scale, 1));
   border-right: 1px solid var(--border-color);
   background: var(--bg-secondary);
   display: flex;
@@ -32,7 +32,7 @@
   flex-direction: column;
   align-items: center;
   gap: 8px;
-  flex: 0 0 28px;
+  flex: 0 0 calc(28px * var(--ui-layout-scale, 1));
   padding: 8px 0;
   border: none;
   border-right: 1px solid var(--border-color);

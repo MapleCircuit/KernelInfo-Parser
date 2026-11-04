@@ -10,7 +10,7 @@
 
 /* 1. Kconfig Tree & Search Column */
 .kconfig-explorer-col {
-  width: 360px;
+  width: calc(360px * var(--ui-layout-scale, 1));
   border-right: 1px solid var(--border-color);
   background: var(--bg-secondary);
   display: flex;
@@ -33,7 +33,7 @@
   flex-direction: column;
   align-items: center;
   gap: 8px;
-  flex: 0 0 28px;
+  flex: 0 0 calc(28px * var(--ui-layout-scale, 1));
   padding: 8px 0;
   border: none;
   border-right: 1px solid var(--border-color);
@@ -116,7 +116,7 @@
   display: flex;
   align-items: center;
   gap: 6px;
-  padding: 4px 10px;
+  padding: calc(4px * var(--ui-layout-scale, 1)) calc(10px * var(--ui-layout-scale, 1));
   font-size: var(--fs-12, 12px);
   cursor: pointer;
   color: var(--text-secondary);
@@ -136,12 +136,12 @@
   font-family: var(--font-mono);
   font-size: var(--fs-11, 11px);
   color: var(--accent-blue);
-  width: 26px;
+  min-width: calc(26px * var(--ui-layout-scale, 1));
   text-align: center;
   cursor: pointer;
   user-select: none;
   border-radius: var(--radius-sm);
-  padding: 1px 2px;
+  padding: 1px calc(4px * var(--ui-layout-scale, 1));
   transition: all 0.15s ease;
 }
 
