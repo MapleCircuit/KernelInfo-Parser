@@ -23,6 +23,9 @@
   padding: 0 12px;
   font-family: var(--font-sans);
   font-size: var(--fs-11, 11px);
+  min-width: 0;
+  gap: 8px;
+  overflow: hidden;
 }
 
 .code-breadcrumbs {
@@ -33,6 +36,8 @@
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  min-width: 0;
+  flex: 0 1 auto;
 }
 
 .breadcrumb-item {
@@ -52,20 +57,29 @@
 .code-actions {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 6px;
+  flex-shrink: 0;
+  margin-left: auto;
 }
 
 .code-btn {
-  display: flex;
+  display: inline-flex;
   align-items: center;
+  justify-content: center;
   gap: 4px;
-  padding: 2px 8px;
+  height: 22px;
+  box-sizing: border-box;
+  line-height: 1;
+  padding: 0 8px;
   border-radius: var(--radius-sm);
   background: var(--bg-tertiary);
   border: 1px solid var(--border-color);
   color: var(--text-secondary);
   font-size: var(--fs-11, 11px);
+  white-space: nowrap;
   transition: var(--transition-fast);
+  cursor: pointer;
+  user-select: none;
 }
 
 .code-btn:hover {
@@ -78,6 +92,38 @@
   background: rgba(88, 166, 255, 0.15);
   color: var(--accent-blue);
   border-color: var(--accent-blue);
+}
+
+.code-overflow-btn {
+  padding: 0 6px;
+  font-size: var(--fs-11, 11px);
+  font-weight: 600;
+  min-width: 22px;
+}
+
+.code-last-changed {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  height: 22px;
+  box-sizing: border-box;
+  line-height: 1;
+  font-size: var(--fs-11, 11px);
+  color: var(--text-muted);
+  padding: 0 8px;
+  background: var(--bg-tertiary);
+  border-radius: 4px;
+  border: 1px solid var(--border-color);
+  cursor: pointer;
+  white-space: nowrap;
+  flex-shrink: 0;
+  transition: var(--transition-fast);
+}
+
+.code-last-changed:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+  border-color: var(--border-focus);
 }
 
 /* 2. Editor Body & Virtual Scroller */
@@ -187,14 +233,19 @@
   display: inline-flex;
   align-items: center;
   gap: 4px;
+  height: 22px;
+  box-sizing: border-box;
+  line-height: 1;
   font-size: var(--fs-11, 11px);
   font-family: var(--font-mono);
-  padding: 2px 4px 2px 8px;
-  margin-right: 6px;
+  padding: 0 4px 0 8px;
+  margin-right: 2px;
   border-radius: 4px;
   border: 1px solid rgba(63, 185, 80, 0.5);
   color: var(--accent-green);
   background: rgba(63, 185, 80, 0.08);
+  white-space: nowrap;
+  flex-shrink: 0;
 }
 
 .code-diffmark-chip.del {
@@ -208,9 +259,14 @@
   border: none;
   color: inherit;
   cursor: pointer;
-  padding: 0 4px;
+  padding: 0 3px;
+  height: 18px;
+  line-height: 18px;
   font-size: var(--fs-11, 11px);
   border-radius: 3px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
 }
 
 .code-diffmark-chip button:hover {
@@ -374,10 +430,15 @@
 
 /* #ifdef dimming status chip (KConfig engine active) */
 .code-dim-chip {
+  display: inline-flex;
   align-items: center;
+  justify-content: center;
   gap: 4px;
-  margin-right: 8px;
-  padding: 2px 8px;
+  height: 22px;
+  box-sizing: border-box;
+  line-height: 1;
+  padding: 0 8px;
+  margin-right: 2px;
   border-radius: 4px;
   border: 1px solid rgba(210, 153, 34, 0.4);
   background: rgba(210, 153, 34, 0.08);
@@ -385,6 +446,8 @@
   font-size: var(--fs-11, 11px);
   font-family: var(--font-sans);
   cursor: pointer;
+  white-space: nowrap;
+  flex-shrink: 0;
 }
 
 .code-dim-chip:hover {
@@ -467,15 +530,19 @@
   display: inline-flex;
   align-items: center;
   gap: 6px;
+  height: 22px;
+  box-sizing: border-box;
+  line-height: 1;
   max-width: 46vw;
   font-size: var(--fs-11, 11px);
   font-family: var(--font-mono);
-  padding: 2px 4px 2px 8px;
+  padding: 0 4px 0 8px;
   border-radius: 4px;
   border: 1px solid rgba(88, 166, 255, 0.5);
   color: var(--accent-blue);
   background: rgba(88, 166, 255, 0.08);
   white-space: nowrap;
+  flex-shrink: 0;
 }
 
 .code-filediff-chip[hidden] {
@@ -503,8 +570,13 @@
   color: inherit;
   cursor: pointer;
   padding: 0 4px;
+  height: 18px;
+  line-height: 18px;
   font-size: var(--fs-11, 11px);
   border-radius: 3px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
 }
 
 .code-filediff-chip button:hover:not(:disabled) {

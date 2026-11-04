@@ -165,6 +165,8 @@ export class VirtualEditor {
     btn.title = engine
       ? `This file follows ${engine.title} (ARCH=${engine.arch} @ ${engine.version}, ${engine.symbols} symbols${engine.resolved ? "" : " — not a resolved configuration yet"}).\nClick to follow another KConfig engine.`
       : `${engines.length ? `${engines.length} KConfig engine(s) running` : "No KConfig engine is running"}: this file is shown without #ifdef dimming or build banner.\nClick to pick one.`;
+    btn._kipNaturalWidth = 0;
+    this.updateToolbarOverflow();
   }
 
   /** Popover listing the running KConfig engines (plus "No engine") for this file. */
@@ -213,6 +215,155 @@ export class VirtualEditor {
     });
   }
 
+  /**
+   * Adjusts code-toolbar items dynamically according to available width:
+   * 1. Hides informational #file-last-changed when width < 640px or space is constrained.
+   * 2. Moves action buttons into the "▾" overflow dropdown in right-to-left priority order.
+   * 3. Pinned interactive chips (dimming, commit diffmarks, file diff) always remain on the bar.
+   */
+  updateToolbarOverflow() {
+    const toolbarEl = this.containerEl?.querySelector(".code-toolbar");
+    const actionsEl = this.containerEl?.querySelector(".code-actions");
+    const breadcrumbsEl = this.containerEl?.querySelector(".code-breadcrumbs");
+    const overflowBtn = this.containerEl?.querySelector("#btn-code-overflow");
+    if (!toolbarEl || !actionsEl || !breadcrumbsEl || !overflowBtn) return;
+
+    const toolbarWidth = toolbarEl.clientWidth;
+    if (toolbarWidth <= 0) return;
+
+    // Auto-hide the informational "last-changed" chip on narrow viewports
+    const lastChangedEl = actionsEl.querySelector("#file-last-changed");
+    if (lastChangedEl) {
+      if (this.hasLastChanged && toolbarWidth >= 640) {
+        lastChangedEl.style.display = "inline-flex";
+      } else {
+        lastChangedEl.style.display = "none";
+      }
+    }
+
+    // Action buttons in priority order: first item is first to hide/overflow (right-to-left)
+    const priorityButtons = [
+      { id: "btn-create-patch", label: "Create Patch", icon: "✎" },
+      { id: "btn-copy-raw", label: "Copy File", icon: "📋" },
+      { id: "btn-file-history", label: "File History", icon: "📜" },
+      {
+        id: "btn-toggle-blame",
+        label: () => (this.showBlame ? "Hide Blame Annotations" : "Show Git Blame"),
+        icon: () => (this.showBlame ? "✓" : "👁"),
+      },
+      { id: "btn-file-diff", label: "Diff File...", icon: "⇄" },
+      {
+        id: "btn-kconfig-engine",
+        label: () => {
+          const e = state.kconfigEngineList().find((x) => x.tabId === this.engineTabId);
+          return e ? `KConfig Engine (${e.arch})` : "KConfig Engine...";
+        },
+        icon: "⚙",
+      },
+    ];
+
+    // Measure natural widths when visible
+    for (const item of priorityButtons) {
+      const el = actionsEl.querySelector(`#${item.id}`);
+      if (el) {
+        if (el.style.display !== "none" && el.offsetWidth > 0) {
+          el._kipNaturalWidth = el.offsetWidth;
+        } else if (!el._kipNaturalWidth) {
+          el._kipNaturalWidth = 72;
+        }
+      }
+    }
+
+    // Measure pinned chips
+    const gap = 6;
+    let pinnedWidth = 0;
+    actionsEl.querySelectorAll(".code-dim-chip, .code-diffmark-chip, .code-filediff-chip, .code-last-changed, #btn-doc-toggle").forEach((chip) => {
+      if (chip.style.display !== "none" && !chip.hidden && chip.offsetWidth > 0) {
+        pinnedWidth += chip.offsetWidth + gap;
+      }
+    });
+
+    const toolbarPadding = 24; // 12px padding left + right
+    const breadcrumbsScrollWidth = breadcrumbsEl.scrollWidth || 120;
+    // Keep breadcrumbs comfortably readable (up to 35% of toolbar or full length, min 120px)
+    const desiredBreadcrumbs = Math.max(120, Math.min(breadcrumbsScrollWidth, toolbarWidth * 0.35));
+    const availableForActions = toolbarWidth - toolbarPadding - desiredBreadcrumbs - pinnedWidth - gap;
+
+    let totalPriorityWidth = 0;
+    for (const item of priorityButtons) {
+      const el = actionsEl.querySelector(`#${item.id}`);
+      if (el) {
+        totalPriorityWidth += (el._kipNaturalWidth || 72) + gap;
+      }
+    }
+
+    const overflowBtnWidth = 26 + gap;
+    const hiddenItems = [];
+
+    if (totalPriorityWidth > availableForActions) {
+      let currentWidth = totalPriorityWidth + overflowBtnWidth;
+      for (const item of priorityButtons) {
+        const el = actionsEl.querySelector(`#${item.id}`);
+        if (!el) continue;
+        if (currentWidth > availableForActions) {
+          el.style.display = "none";
+          hiddenItems.push(item);
+          currentWidth -= ((el._kipNaturalWidth || 72) + gap);
+        } else {
+          el.style.display = "";
+        }
+      }
+      overflowBtn.style.display = "inline-flex";
+    } else {
+      for (const item of priorityButtons) {
+        const el = actionsEl.querySelector(`#${item.id}`);
+        if (el) el.style.display = "";
+      }
+      overflowBtn.style.display = "none";
+    }
+
+    this._hiddenActionItems = hiddenItems;
+    if (hiddenItems.length === 0) {
+      overflowBtn.style.display = "none";
+    }
+  }
+
+  /**
+   * Opens the dropdown context menu listing actions currently hidden by overflow.
+   * @param {HTMLElement} anchorEl The "▾" overflow button
+   */
+  showOverflowMenu(anchorEl) {
+    if (contextMenu.menuEl && contextMenu.menuEl.dataset.origin === "code-overflow") {
+      contextMenu.hide();
+      return;
+    }
+    const hidden = this._hiddenActionItems || [];
+    if (!hidden.length) return;
+
+    const items = hidden.map((item) => {
+      const btn = this.containerEl?.querySelector(`#${item.id}`);
+      const icon = typeof item.icon === "function" ? item.icon() : item.icon;
+      const label = typeof item.label === "function" ? item.label() : item.label;
+      return {
+        label,
+        icon,
+        disabled: btn?.disabled,
+        onClick: () => {
+          btn?.click();
+        },
+      };
+    });
+
+    const rect = anchorEl.getBoundingClientRect();
+    contextMenu.renderMenu(rect.right - 180, rect.bottom + 4, {
+      header: { title: "More Actions" },
+      items,
+    });
+    if (contextMenu.menuEl) {
+      contextMenu.menuEl.dataset.origin = "code-overflow";
+    }
+  }
+
   /** Compiled-out lines shown undimmed; the choice is shared by every code tab. */
   get dimSuspended() {
     return dimSuspendedAll;
@@ -248,6 +399,7 @@ export class VirtualEditor {
     if (!this.dimmingAvailable()) {
       this.dimmedLines = new Set();
       if (chip) chip.style.display = "none";
+      this.updateToolbarOverflow();
       return;
     }
     const ctx = state.definitionContext(this.engineTabId);
@@ -266,6 +418,7 @@ export class VirtualEditor {
     chip.title = this.dimSuspended
       ? "Compiled-out lines are shown normally. Click to dim them again."
       : "Lines inside #if/#ifdef branches disabled by the KConfig engine's current configuration.\nClick to stop dimming them for now (toggle the engine in the KConfig view to turn dimming off).";
+    this.updateToolbarOverflow();
   }
 
   /** Temporarily show compiled-out lines undimmed (or dim them again); not persisted. */
@@ -388,13 +541,14 @@ export class VirtualEditor {
               <button data-diffnav="-1" title="Previous change">↑</button><button data-diffnav="1" title="Next change">↓</button><button data-diffnav="0" title="Clear change markers">✕</button>
             </span>` : ""}
             <span id="code-filediff-chip" class="code-filediff-chip" hidden></span>
-            <span id="file-last-changed" class="code-last-changed" style="display:none;font-size:11px;color:var(--text-muted);margin-right:8px;padding:3px 8px;background:var(--bg-tertiary);border-radius:4px;border:1px solid var(--border-color);align-items:center;gap:4px;cursor:pointer;" title="Click to view full commit history"></span>
+            <span id="file-last-changed" class="code-last-changed" style="display:none;" title="Click to view full commit history"></span>
             <button class="code-btn" id="btn-kconfig-engine" title="KConfig engine this file follows"></button>
             <button class="code-btn" id="btn-file-diff" title="Diff this file with another revision or another file">⇄ Diff</button>
             <button class="code-btn" id="btn-file-history" title="View commit history for this file">📜 History</button>
             <button class="code-btn" id="btn-toggle-blame" title="Annotate every line with the commit that last changed it">Blame</button>
             <button class="code-btn" id="btn-copy-raw">Copy File</button>
             <button class="code-btn" id="btn-create-patch" title="Edit this file and generate a git format-patch">✎ Patch</button>
+            <button type="button" class="code-btn code-overflow-btn" id="btn-code-overflow" title="More actions" style="display:none;" aria-haspopup="true" aria-expanded="false">▾</button>
           </div>
         </div>
         <div class="code-build-banner" id="code-build-banner" hidden></div>
@@ -524,6 +678,13 @@ export class VirtualEditor {
     if (lastChangedEl) {
       lastChangedEl.onclick = () => {
         showFileHistoryModal(this.currentVersion, this.currentFilePath);
+      };
+    }
+    const overflowBtn = containerEl.querySelector("#btn-code-overflow");
+    if (overflowBtn) {
+      overflowBtn.onclick = (e) => {
+        e.stopPropagation();
+        this.showOverflowMenu(overflowBtn);
       };
     }
 
@@ -681,19 +842,27 @@ export class VirtualEditor {
     this.resizeObserver?.disconnect();
     if (typeof ResizeObserver === "function") {
       this.resizeObserver = new ResizeObserver(() => {
-        if (!this.isLive() || !this.rawLines.length) return;
+        if (!this.isLive()) return;
+        this.updateToolbarOverflow();
+        if (!this.rawLines.length) return;
         this.renderMinimap();
         this.updateMinimapSlider();
         this.updateVisibleLines();
       });
-      this.resizeObserver.observe(containerEl.querySelector(".editor-body"));
+      const editorBody = containerEl.querySelector(".editor-body");
+      if (editorBody) this.resizeObserver.observe(editorBody);
+      const toolbar = containerEl.querySelector(".code-toolbar");
+      if (toolbar) this.resizeObserver.observe(toolbar);
     }
+
+    this.updateToolbarOverflow();
 
     // Load file content from API
     await this.loadFileContent();
   }
 
   async loadFileContent() {
+    this.hasLastChanged = false;
     const lastChangedEl = this.viewportEl?.closest(".code-viewer-container")?.querySelector("#file-last-changed");
     if (lastChangedEl) {
       lastChangedEl.style.display = "none";
@@ -774,9 +943,10 @@ export class VirtualEditor {
         if (lastChangedEl) {
           const dateStr = lc.author_date_iso ? lc.author_date_iso.split(" ")[0] : "";
           const authorStr = lc.author_name || "";
-          lastChangedEl.style.display = "inline-flex";
+          this.hasLastChanged = true;
           lastChangedEl.innerHTML = `🕒 Last Changed: <strong style="color:var(--text-primary);margin-left:3px;">${escapeHtml(dateStr)}</strong><span style="opacity:0.75;margin-left:4px;">by ${escapeHtml(authorStr)}</span>`;
           lastChangedEl.title = `Last changed: ${lc.author_date_iso} by ${authorStr}\nCommit: ${lc.commit_hash_short}\nSubject: ${lc.subject}\nClick to view full history`;
+          this.updateToolbarOverflow();
         }
       }
 
@@ -1016,6 +1186,7 @@ export class VirtualEditor {
     this.setPlainOnlyControls(true);
     const chip = this.containerEl?.querySelector("#code-filediff-chip");
     if (chip) chip.hidden = true;
+    this.updateToolbarOverflow();
     if (!this.viewportEl || !this.rawLines.length) return;
     const rowH = getCodeRowHeight();
     this.spacerEl.style.height = `${this.rawLines.length * rowH}px`;
@@ -1119,6 +1290,7 @@ export class VirtualEditor {
         else this.jumpToDiffHunk(parseInt(act, 10));
       };
     });
+    this.updateToolbarOverflow();
   }
 
   /** Text of one diff row: syntax-highlighted when it is a line of this tab's file, plain otherwise. */
