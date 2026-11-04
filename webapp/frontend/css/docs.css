@@ -277,6 +277,31 @@
   margin: 0 0 14px 28px;
 }
 
+/* GFM Task Lists */
+.kdoc-body ul.task-list {
+  list-style: none;
+  padding-left: 4px;
+}
+
+.kdoc-body li.task-list-item {
+  list-style: none;
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  margin: 4px 0;
+}
+
+.kdoc-body li.task-list-item input[type="checkbox"] {
+  margin: 0;
+  cursor: default;
+  accent-color: var(--accent-blue, #58a6ff);
+}
+
+.kdoc-body del {
+  text-decoration: line-through;
+  opacity: 0.7;
+}
+
 /* Inline literals and code blocks */
 .kdoc-body code {
   font-family: var(--font-mono);
@@ -668,6 +693,17 @@
   border-radius: 4px;
   /* Most kernel figures are drawn for white pages */
   background: #f6f8fa;
+}
+
+/* Inline badges & linked images (crates.io, shields.io, build badges) */
+.kdoc-body a img.kdoc-img,
+.kdoc-body img.kdoc-badge {
+  display: inline-block;
+  vertical-align: middle;
+  background: transparent;
+  padding: 0;
+  margin: 2px 4px 2px 0;
+  border-radius: 3px;
 }
 
 .kdoc-body .kdoc-align-center img.kdoc-img { margin: 0 auto; }

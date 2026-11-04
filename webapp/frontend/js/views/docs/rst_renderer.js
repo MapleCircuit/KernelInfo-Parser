@@ -7,6 +7,8 @@
  * All source text is HTML-escaped; links are emitted as data attributes resolved by the caller.
  */
 
+import { renderMarkdownDocument, isMarkdownPath, extractMarkdownTitle } from "./md_renderer.js";
+
 const ADORNMENT_CHARS = "=-`:.'\"~^_*+#<>!$%&,;?@[]\\/|{}()";
 const ADMONITIONS = new Set([
   "note", "warning", "attention", "caution", "danger", "error", "hint", "important", "tip", "seealso", "todo"
@@ -31,8 +33,8 @@ export function escapeHtml(str) {
 export function isDocumentationPath(path) {
   if (!path) return false;
   const base = path.split("/").pop();
-  if (/\.rst$/i.test(base)) return true;
-  if (/^README(\.(txt|md|rst))?$/i.test(base)) return true;
+  if (/\.(rst|md|markdown)$/i.test(base)) return true;
+  if (/^README(\.(txt|md|rst|markdown))?$/i.test(base)) return true;
   if (path.startsWith("Documentation/")) {
     if (/\.txt$/i.test(base)) return true;
     // Legacy extension-less docs (e.g. Documentation/CodingStyle, 00-INDEX), but not build files
@@ -993,10 +995,13 @@ class RstRenderer {
 }
 
 /**
- * Render a documentation file.
+ * Render a documentation file (reStructuredText, Markdown, or plain-text).
  * @returns {{ html: string, toc: Array<{level:number,id:string,title:string}>, title: string }}
  */
 export function renderDocument(source, path) {
+  if (isMarkdownPath(path) || (!/\.rst$/i.test(path) && looksLikeMarkdown(source))) {
+    return renderMarkdownDocument(source, path);
+  }
   const plainText = !/\.rst$/i.test(path) && !looksLikeRst(source);
   return new RstRenderer(source, { path, plainText }).render();
 }
@@ -1007,10 +1012,14 @@ export function renderRstFragment(source, path) {
 }
 
 /** Export the slug function so cross-document anchors match generated heading ids. */
-export { slugify };
+export { slugify, isMarkdownPath, renderMarkdownDocument };
 
 /** First section title of a document (cheap scan used for toctree link labels). */
-export function extractTitle(source) {
+export function extractTitle(source, path = "") {
+  if (isMarkdownPath(path) || /^\s*#\s+/.test(source || "")) {
+    const mdTitle = extractMarkdownTitle(source);
+    if (mdTitle) return mdTitle;
+  }
   const lines = String(source || "").split(/\r?\n/, 400).map(expandTabs);
   for (let i = 0; i + 1 < lines.length; i++) {
     const cur = lines[i];
@@ -1020,6 +1029,12 @@ export function extractTitle(source) {
       && next.trim().length >= Math.max(3, cur.trim().length - 2)) return cur.trim();
   }
   return "";
+}
+
+/** Detect if source looks like Markdown when file extension is absent or ambiguous. */
+function looksLikeMarkdown(source) {
+  const sample = String(source || "").slice(0, 10000);
+  return /^\s*#{1,6}\s+\S/m.test(sample) || /```[\w+-]*\r?\n/.test(sample) || /^[-*]\s+\[[ xX]\]/m.test(sample);
 }
 
 /** Legacy .txt documents that were already written in reStructuredText. */
