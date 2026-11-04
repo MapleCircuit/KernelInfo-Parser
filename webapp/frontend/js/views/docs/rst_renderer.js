@@ -8,6 +8,7 @@
  */
 
 import { renderMarkdownDocument, isMarkdownPath, extractMarkdownTitle } from "./md_renderer.js";
+import { renderTmplDocument, isTmplPath, looksLikeTmpl, extractTmplTitle } from "./tmpl_renderer.js";
 
 const ADORNMENT_CHARS = "=-`:.'\"~^_*+#<>!$%&,;?@[]\\/|{}()";
 const ADMONITIONS = new Set([
@@ -33,10 +34,10 @@ export function escapeHtml(str) {
 export function isDocumentationPath(path) {
   if (!path) return false;
   const base = path.split("/").pop();
-  if (/\.(rst|md|markdown)$/i.test(base)) return true;
-  if (/^README(\.(txt|md|rst|markdown))?$/i.test(base)) return true;
+  if (/\.(rst|md|markdown|tmpl)$/i.test(base)) return true;
+  if (/^README(\.(txt|md|rst|markdown|tmpl))?$/i.test(base)) return true;
   if (path.startsWith("Documentation/")) {
-    if (/\.txt$/i.test(base)) return true;
+    if (/\.(txt|tmpl)$/i.test(base)) return true;
     // Legacy extension-less docs (e.g. Documentation/CodingStyle, 00-INDEX), but not build files
     if (!base.includes(".") && !/^(Makefile|Kconfig|Kbuild)/.test(base)) return true;
   }
@@ -995,10 +996,13 @@ class RstRenderer {
 }
 
 /**
- * Render a documentation file (reStructuredText, Markdown, or plain-text).
+ * Render a documentation file (reStructuredText, Markdown, DocBook XML template, or plain-text).
  * @returns {{ html: string, toc: Array<{level:number,id:string,title:string}>, title: string }}
  */
 export function renderDocument(source, path) {
+  if (isTmplPath(path) || (!/\.rst$/i.test(path) && looksLikeTmpl(source))) {
+    return renderTmplDocument(source, path);
+  }
   if (isMarkdownPath(path) || (!/\.rst$/i.test(path) && looksLikeMarkdown(source))) {
     return renderMarkdownDocument(source, path);
   }
@@ -1012,10 +1016,14 @@ export function renderRstFragment(source, path) {
 }
 
 /** Export the slug function so cross-document anchors match generated heading ids. */
-export { slugify, isMarkdownPath, renderMarkdownDocument };
+export { slugify, isMarkdownPath, renderMarkdownDocument, isTmplPath, renderTmplDocument };
 
 /** First section title of a document (cheap scan used for toctree link labels). */
 export function extractTitle(source, path = "") {
+  if (isTmplPath(path) || looksLikeTmpl(source)) {
+    const tmplTitle = extractTmplTitle(source);
+    if (tmplTitle) return tmplTitle;
+  }
   if (isMarkdownPath(path) || /^\s*#\s+/.test(source || "")) {
     const mdTitle = extractMarkdownTitle(source);
     if (mdTitle) return mdTitle;
