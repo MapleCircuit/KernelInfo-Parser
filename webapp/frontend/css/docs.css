@@ -706,6 +706,9 @@
   border-radius: 3px;
 }
 
+.kdoc-body .kdoc-align-center {
+  text-align: center;
+}
 .kdoc-body .kdoc-align-center img.kdoc-img { margin: 0 auto; }
 .kdoc-body .kdoc-align-right img.kdoc-img { margin-left: auto; }
 
