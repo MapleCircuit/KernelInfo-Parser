@@ -840,6 +840,7 @@ class GlobalState {
       this.syncVersionFromTab(activeTab.version);
     }
 
+    this.emit("tab:opened", { tab: activeTab, paneId: pane.id, isNew: !existing });
     this.emit("tabs:changed", { paneId: pane.id, activeTabId: pane.activeTabId });
     this.saveState();
   }
@@ -1065,6 +1066,7 @@ class GlobalState {
     sessionManager.requestRemoteEngines();
     this.broadcastAllActiveEngines();
     this.emit("session:adopted", sessionData);
+    this.emit("session:restored", sessionData);
     this.emit("layout:changed", { splitMode: this.splitMode, panes: this.panes });
     this.emit("tabs:changed", { paneId: this.activePaneId, activeTabId: this.getActiveTab()?.id });
     this.emit("version:changed", this.currentVersion);

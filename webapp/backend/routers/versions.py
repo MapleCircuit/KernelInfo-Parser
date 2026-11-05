@@ -2,14 +2,17 @@
 from __future__ import annotations
 
 import copy
+import difflib
+import json
 import logging
 import subprocess
 import threading
 import time
 from collections import OrderedDict
+from functools import cached_property
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Request, Response
 
 from core.config import DEFAULT_TAG_VIEWS, detect_default_branch, matches_branch_filter
 from webapp.backend.config import (
@@ -24,11 +27,21 @@ from webapp.backend.config import (
 from webapp.backend.database.helpers import finished_ref_sql, get_active_repo_id, hash_hex, safe_decode
 from webapp.backend.database.pool import get_db_cursor
 from webapp.backend.security.git import safe_rev
+from webapp.backend.services.catalog_cache import JsonBody, TokenCache, client_etags, digest, dumps, respond
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api", tags=["versions"])
 
 PRERELEASE_MARKERS = ("-rc", "-pre", "-alpha", "-beta")
+
+# Compact version catalog (GET /api/versions?compact=1, webapp/API.md section 4.1). The layout version
+# is part of its ETag, so a client never applies a delta to a base of another layout.
+COMPACT_FORMAT = "c1"
+# Commit of a ref without a known commit in the fixed-width hash column (Git's null object id)
+NULL_SHA12 = "0" * 12
+# Generations of the compact catalog a delta can start from, per repository and include_rc: about two
+# hours while the parser finishes a version every ~2 minutes; an older base gets the full catalog
+_HISTORY_MAX = 64
 
 # Tags reachable from a branch, keyed by (repository, branch head): what the header's Branch selector
 # scopes the Tag/RC lists with (webapp/API.md section 5.13). Git computes it by walking the branch's
@@ -89,12 +102,19 @@ def _git_lines(args: list[str], timeout: float = 10.0) -> list[str]:
 
 @router.get("/projects")
 def get_projects() -> dict[str, Any]:
-    """List the configured repositories (config "repositories", auto-detected under workspace.repos_dir).
+    """List the configured repositories, the request's repository marked `active`."""
+    active = get_active_repo_name()
+    projects = [{**p, "active": p["repo"] == active} for p in projects_catalog()]
+    return {"total": len(projects), "active": active, "projects": projects}
+
+
+def projects_catalog() -> list[dict[str, Any]]:
+    """The configured repositories (config "repositories", auto-detected under workspace.repos_dir), the same for
+    every request (`active` False): what GET /api/projects lists and the `projects` sync token digests.
 
     `indexed` tells whether the parser has ingested the repository into the database; unindexed
     repositories are still browsable through their Git object store.
     """
-    active = get_active_repo_name()
     indexed: dict[str, dict[str, Any]] = {}
     try:
         with get_db_cursor() as cursor:
@@ -127,14 +147,32 @@ def get_projects() -> dict[str, Any]:
             "git_url": repo.get("git_url", ""),
             "indexed": db_row is not None,
             "available": resolve_repo_path(repo).exists(),
-            "active": name == active,
+            "active": False,
             "tag_views": repo.get("tag_views") or copy.deepcopy(DEFAULT_TAG_VIEWS),
         })
-    return {"total": len(projects), "active": active, "projects": projects}
+    return projects
+
+
+_BRANCHES: TokenCache[JsonBody] = TokenCache()
+
+
+def _branches_body() -> JsonBody:
+    """The branch catalog of the active repository, built once per repository state (section 2.13)."""
+    return _BRANCHES.get(get_active_repo_name(), lambda _previous: JsonBody(_build_branches()))
+
+
+def get_branches() -> dict[str, Any]:
+    """Branch catalog of the active repository (a copy of the cached one)."""
+    return json.loads(_branches_body().raw)
 
 
 @router.get("/branches")
-def get_branches() -> dict[str, Any]:
+def branches_endpoint(request: Request) -> Response:
+    """List git branches of the active repository (indexed refs first, then Git branches); ETag / 304."""
+    return respond(request, _branches_body())
+
+
+def _build_branches() -> dict[str, Any]:
     """List git branches of the active repository (indexed refs first, then Git branches)."""
     branches = []
     seen = set()
@@ -358,16 +396,20 @@ def start_prewarm() -> threading.Thread:
     return thread
 
 
-@router.get("/versions")
-def get_versions(include_rc: bool = Query(True)) -> dict[str, Any]:
-    """List versions of the active repository: indexed refs from m_git_ref plus the repository's Git tags.
+def _is_prerelease(name: str) -> bool:
+    return any(m in name for m in PRERELEASE_MARKERS)
 
-    Tags that were never parsed are returned with `"indexed": false` (vid 0); they remain browsable
-    because file trees, files and diffs are resolved from Git. Pre-release tags are included only
-    when `include_rc` is true; indexed refs are always included.
+
+def _version_rows(include_rc: bool) -> list[tuple[int, str, str, int, int | None]]:
+    """Versions of the active repository as (vid, vname, commit_hash, ref_type, parsed), in catalog order.
+
+    Indexed refs from m_git_ref (`parsed`: when their ingestion finished, 0 when it predates
+    m_ingest_state) plus every Git tag that was not ingested (vid 0, `parsed` None); those remain
+    browsable because file trees, files and diffs are resolved from Git. Pre-release tags only Git has
+    are included only when `include_rc`; indexed refs are always included.
     """
-    versions = []
-    seen_vnames = set()
+    rows: list[tuple[int, str, str, int, int | None]] = []
+    seen_vnames: set[str] = set()
 
     with get_db_cursor() as cursor:
         cursor.execute(
@@ -391,16 +433,7 @@ def get_versions(include_rc: bool = Query(True)) -> dict[str, Any]:
             vname = safe_decode(r["vname"]) or ""
             if vname and vname not in seen_vnames:
                 seen_vnames.add(vname)
-                commit_hash = _hex(r.get("commit_hash"))
-                versions.append({
-                    "vid": r["vid"],
-                    "vname": vname,
-                    "commit_hash": commit_hash,
-                    "is_prerelease": any(m in vname for m in PRERELEASE_MARKERS),
-                    "ref_type": r.get("ref_type"),
-                    "indexed": True,
-                    "stamp": _stamp(commit_hash, r.get("parsed_at") or 0),
-                })
+                rows.append((r["vid"], vname, _hex(r.get("commit_hash")), r.get("ref_type"), r.get("parsed_at") or 0))
 
     # Git tags of the active repository that were not ingested, in version order
     tag_lines = _git_lines([
@@ -413,22 +446,189 @@ def get_versions(include_rc: bool = Query(True)) -> dict[str, Any]:
         # The first type is the peeled one for annotated tags; only commit-pointing tags are versions
         if tname in seen_vnames or len(parts) < 3 or not parts[1].startswith("commit"):
             continue
-        is_pre = any(m in tname for m in PRERELEASE_MARKERS)
-        if is_pre and not include_rc:
+        if not include_rc and _is_prerelease(tname):
             continue
         seen_vnames.add(tname)
-        versions.append({
-            "vid": 0,
-            "vname": tname,
-            # Annotated tags list the peeled commit (%(*objectname)) first; lightweight tags only have %(objectname)
-            "commit_hash": parts[2],
-            "is_prerelease": is_pre,
-            "ref_type": 1,
-            "indexed": False,
-            "stamp": _stamp(parts[2], None),
-        })
+        # Annotated tags list the peeled commit (%(*objectname)) first; lightweight tags only have %(objectname)
+        rows.append((0, tname, parts[2], 1, None))
 
     # Version order (git versionsort) for tags; other indexed refs (branches, commits) keep DB order at the end
     order = {line.split()[0]: i for i, line in enumerate(tag_lines)}
-    versions.sort(key=lambda v: order.get(v["vname"], len(order)))
-    return {"total": len(versions), "versions": versions}
+    rows.sort(key=lambda row: order.get(row[1], len(order)))
+    return rows
+
+
+# Compact rows of recent catalog generations per (repository, include_rc): the bases deltas start from
+_HISTORY: dict[tuple[str, bool], OrderedDict[str, list[tuple]]] = {}
+_HISTORY_LOCK = threading.Lock()
+
+
+def _remember_generation(key: tuple[str, bool], gen: str, compact: list[tuple]) -> None:
+    with _HISTORY_LOCK:
+        generations = _HISTORY.setdefault(key, OrderedDict())
+        generations[gen] = compact
+        generations.move_to_end(gen)
+        while len(generations) > _HISTORY_MAX:
+            generations.popitem(last=False)
+
+
+def _generation(key: tuple[str, bool], gen: str) -> list[tuple] | None:
+    with _HISTORY_LOCK:
+        generations = _HISTORY.get(key)
+        return generations.get(gen) if generations else None
+
+
+def _wire_row(row: tuple[str, str, int | None, int]) -> list[Any]:
+    """A compact row as sent: [vname, sha12, parsed, ref_type] without trailing defaults (parsed None, ref_type 1)."""
+    vname, sha, parsed, ref_type = row
+    if ref_type != 1:
+        return [vname, sha, parsed, ref_type]
+    if parsed is not None:
+        return [vname, sha, parsed]
+    return [vname, sha]
+
+
+def _delta_ops(base: list[tuple], cur: list[tuple]) -> list[list[Any]]:
+    """Operations rebuilding `cur` from `base`, in order: [start, count] copies `count` rows of `base` from
+    `start`; any other entry (a list starting with a name) is a row of `cur`.
+
+    Names are matched first (tags are added or removed rarely), then the rows of matching names compared:
+    a version that finished parsing is one row between two copies."""
+    ops: list[list[Any]] = []
+
+    def copy(start: int, count: int) -> None:
+        last = ops[-1] if ops else None
+        if last is not None and isinstance(last[0], int) and last[0] + last[1] == start:
+            last[1] += count
+        else:
+            ops.append([start, count])
+
+    matcher = difflib.SequenceMatcher(None, [row[0] for row in base], [row[0] for row in cur], autojunk=False)
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag != "equal":
+            ops.extend(_wire_row(row) for row in cur[j1:j2])
+            continue
+        run = i1  # first row of the current run of unchanged rows
+        for k in range(i2 - i1):
+            if base[i1 + k] != cur[j1 + k]:
+                if run < i1 + k:
+                    copy(run, i1 + k - run)
+                ops.append(_wire_row(cur[j1 + k]))
+                run = i1 + k + 1
+        if run < i2:
+            copy(run, i2 - run)
+    return ops
+
+
+def _wire_size(body: JsonBody) -> int:
+    return len(body.gz) if body.gz is not None else len(body.raw)
+
+
+class VersionCatalog:
+    """The version list of one repository state and its encodings (webapp/API.md sections 2.13 and 4.1).
+
+    `rows` are (vid, vname, commit_hash, ref_type, parsed) in catalog order; `compact` the positional rows
+    (vname, sha12, parsed, ref_type) the frontend reads, deriving `indexed` (parsed is not None),
+    `is_prerelease` (from the name) and the stamp from them. `gen` is a digest of the whole content.
+    """
+
+    def __init__(self, key: tuple[str, bool], rows: list[tuple], gen: str, previous: VersionCatalog | None = None) -> None:
+        self.key = key
+        self.rows = rows
+        self.gen = gen
+        compact = [(vname, sha[:12] if len(sha) >= 12 else "", parsed, ref_type or 1) for _vid, vname, sha, ref_type, parsed in rows]
+        if previous is not None:
+            # Rows unchanged since the previous generation share its tuples: the history holds one copy of them
+            same = {row: row for row in previous.compact}
+            compact = [same.get(row, row) for row in compact]
+        self.compact = compact
+        self._deltas: dict[str, JsonBody | None] = {}
+
+    @classmethod
+    def build(cls, key: tuple[str, bool], previous: VersionCatalog | None = None) -> VersionCatalog:
+        rows = _version_rows(key[1])
+        gen = digest(dumps(rows))
+        if previous is not None and previous.gen == gen:
+            return previous  # same content (e.g. only a remote branch moved): keep its encodings
+        catalog = cls(key, rows, gen, previous)
+        _remember_generation(key, gen, catalog.compact)
+        return catalog
+
+    def legacy(self) -> dict[str, Any]:
+        """The documented layout: {total, versions: [{vid, vname, commit_hash, is_prerelease, ref_type, indexed, stamp}]}."""
+        versions = [
+            {
+                "vid": vid,
+                "vname": vname,
+                "commit_hash": sha,
+                "is_prerelease": _is_prerelease(vname),
+                "ref_type": ref_type,
+                "indexed": parsed is not None,
+                "stamp": _stamp(sha, parsed),
+            }
+            for vid, vname, sha, ref_type, parsed in self.rows
+        ]
+        return {"total": len(versions), "versions": versions}
+
+    @cached_property
+    def legacy_body(self) -> JsonBody:
+        return JsonBody(self.legacy())
+
+    @cached_property
+    def compact_body(self) -> JsonBody:
+        """Columns: names, commits as one string of 12-hex chunks, parse times (null: Git only) and the
+        ref types other than 1 as [index, type] pairs."""
+        return JsonBody({
+            "g": self.gen,
+            "n": [row[0] for row in self.compact],
+            "h": "".join(row[1] or NULL_SHA12 for row in self.compact),
+            "p": [row[2] for row in self.compact],
+            "t": [[i, row[3]] for i, row in enumerate(self.compact) if row[3] != 1],
+        }, etag=f"{COMPACT_FORMAT}-{self.gen}")
+
+    def delta_from(self, base_gen: str) -> JsonBody | None:
+        """The rows changed since generation `base_gen`; None when this process does not know that
+        generation or the delta would not be smaller than the full catalog."""
+        if base_gen in self._deltas:
+            return self._deltas[base_gen]
+        base = _generation(self.key, base_gen)
+        if base is None:
+            return None
+        body: JsonBody | None = JsonBody({"g": self.gen, "b": base_gen, "d": _delta_ops(base, self.compact)})
+        if _wire_size(body) >= _wire_size(self.compact_body):
+            body = None
+        self._deltas[base_gen] = body  # bounded: only generations of the history get here
+        return body
+
+
+_CATALOGS: TokenCache[VersionCatalog] = TokenCache()
+
+
+def version_catalog(include_rc: bool = True) -> VersionCatalog:
+    """The version catalog of the active repository, built once per repository state (section 2.13)."""
+    key = (get_active_repo_name(), bool(include_rc))
+    return _CATALOGS.get(key, lambda previous: VersionCatalog.build(key, previous))
+
+
+def get_versions(include_rc: bool = True) -> dict[str, Any]:
+    """Versions of the active repository in the documented entry layout (a fresh copy)."""
+    return version_catalog(include_rc).legacy()
+
+
+@router.get("/versions")
+def versions_endpoint(request: Request, include_rc: bool = Query(True), compact: bool = Query(False)) -> Response:
+    """List versions of the active repository: indexed refs from m_git_ref plus the repository's Git tags.
+
+    `compact` selects the positional form the frontend reads. Its ETag names the catalog generation: a
+    client sending the generation it has (If-None-Match) gets 304, or only the rows changed since then.
+    """
+    catalog = version_catalog(include_rc)
+    if not compact:
+        return respond(request, catalog.legacy_body)
+    prefix = f"{COMPACT_FORMAT}-"
+    for tag in client_etags(request):
+        if tag.startswith(prefix) and tag[len(prefix):] != catalog.gen:
+            delta = catalog.delta_from(tag[len(prefix):])
+            if delta is not None:
+                return respond(request, delta, cache_control="no-store", etag=False)
+    return respond(request, catalog.compact_body)

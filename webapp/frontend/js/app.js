@@ -115,6 +115,9 @@ class KernelIdeApp {
       this.tabsComponent.render();
     });
 
+    // A repository was added, removed, parsed for the first time or went missing (sync `projects` token)
+    state.subscribe("projects:updated", () => this.initVersionSelector());
+
     // A version finished parsing (or was rolled back), a branch moved or tags were fetched
     state.subscribe("versions:updated", async ({ changed, removed, newlyIndexed }) => {
       await this.initVersionSelector();
@@ -145,10 +148,16 @@ class KernelIdeApp {
 
   registerServiceWorker() {
     if ("serviceWorker" in navigator) {
-      navigator.serviceWorker.register("/sw.js").then((reg) => {
-        console.info("PWA ServiceWorker registered with scope:", reg.scope);
+      navigator.serviceWorker.getRegistration().then((reg) => {
+        if (!reg || reg.updateViaCache !== "all") {
+          navigator.serviceWorker.register("/sw.js", { updateViaCache: "all" }).then((r) => {
+            console.info("PWA ServiceWorker registered with scope:", r.scope);
+          }).catch((err) => {
+            console.warn("ServiceWorker registration failed:", err);
+          });
+        }
       }).catch((err) => {
-        console.warn("ServiceWorker registration failed:", err);
+        console.warn("ServiceWorker registration check failed:", err);
       });
     }
   }
@@ -714,7 +723,7 @@ class KernelIdeApp {
     };
   }
 
-  /** Settings "Check for Updates": manual sync of the frontend build, database, parsed versions and Git refs. */
+  /** Settings "Check for Updates": manual sync of the frontend build, database, parsed versions, Git refs and repositories. */
   async checkForUpdates(btn) {
     const status = btn.querySelector("#check-updates-status");
     btn.disabled = true;
@@ -727,13 +736,14 @@ class KernelIdeApp {
       if (r.changed.length) parts.push(`${r.changed.length} version(s) re-parsed or moved`);
       if (r.added.length && !r.db) parts.push(`${r.added.length} new version(s)/branch(es)`);
       if (r.removed.length) parts.push(`${r.removed.length} removed`);
+      if (r.projects && !r.db) parts.push("repository list updated");
       if (!parts.length && (r.parsed || r.git)) parts.push("version lists refreshed");
       if (parts.length) {
         status.textContent = "Updated";
         toast.success(`Updates found: ${parts.join(", ")}`);
       } else {
         status.textContent = "Up to date";
-        toast.info("Everything is up to date (frontend, database, parsed versions, Git)");
+        toast.info("Everything is up to date (frontend, database, parsed versions, Git, repositories)");
       }
     } catch (err) {
       status.textContent = "Failed";

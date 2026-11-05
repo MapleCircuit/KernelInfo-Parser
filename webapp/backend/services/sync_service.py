@@ -1,19 +1,22 @@
 """webapp/backend/services/sync_service.py - Tokens telling clients what changed on the server.
 
-Four tokens (short hex digests), each with its own client reaction (webapp/frontend/js/sync.js):
+Five tokens (short hex digests), each with its own client reaction (webapp/frontend/js/sync.js):
 - `db`: the database instance (m_db_instance); a rebuilt database invalidates every client cache.
 - `frontend`: the webapp code under webapp/frontend; the page reloads into the new build.
 - `parsed`: the active repository's ingested versions (m_git_ref + m_ingest_state); version lists
   are refetched and cached data of the versions that changed is dropped.
 - `git`: the active repository's refs (git for-each-ref); tag/branch lists are refetched.
+- `projects`: the repository list (GET /api/projects: configured repositories, which are parsed and
+  present); clients refetch it only when this changes, not with every parsed version.
 
-They are cached (frontend 5 s, db 30 s, parsed/git 15 s) so `/api/sync` and the `X-KIP-Sync`
+They are cached (frontend 5 s, db/projects 30 s, parsed/git 15 s) so `/api/sync` and the `X-KIP-Sync`
 header of every API response cost no database or Git work on most requests; `/api/sync?fresh=true`
 (the "Check for Updates" button) recomputes them all.
 """
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import os
 import subprocess
@@ -35,6 +38,7 @@ INGEST_PARSING = 1
 _FRONTEND_TTL = 5.0
 _DB_TTL = 30.0
 _REPO_TTL = 15.0
+_PROJECTS_TTL = 30.0
 
 
 def _digest(parts: list[str]) -> str:
@@ -93,6 +97,7 @@ class SyncService:
         self._db = _Ttl(_DB_TTL)
         self._parsed = _Ttl(_REPO_TTL)
         self._git = _Ttl(_REPO_TTL)
+        self._projects = _Ttl(_PROJECTS_TTL)
         self._last_parsed: dict[str, str] = {}
         self._last_git: dict[str, str] = {}
 
@@ -207,14 +212,27 @@ class SyncService:
             return token
         return self._git.get(repo_dir, compute, fresh)
 
+    def projects_token(self, fresh: bool = False) -> str:
+        """Digest of the repository list (the same for every repository: no `active` flag in it)."""
+        def compute() -> str:
+            try:
+                # Imported here: the versions router imports this module (through catalog_cache)
+                from webapp.backend.routers.versions import projects_catalog
+                return _digest([json.dumps(projects_catalog(), sort_keys=True, default=str)])
+            except Exception as exc:
+                logger.debug("projects token unavailable: %s", exc)
+                return ""
+        return self._projects.get("projects", compute, fresh)
+
     # ------------------------------------------------------------------ API
     def snapshot(self, fresh: bool = False) -> dict[str, str]:
-        """All four tokens; `fresh` recomputes them instead of using the cached values."""
+        """All five tokens; `fresh` recomputes them instead of using the cached values."""
         return {
             "db": self.db_token(fresh),
             "frontend": self.frontend_build(fresh),
             "parsed": self.parsed_token(fresh),
             "git": self.git_token(fresh),
+            "projects": self.projects_token(fresh),
             "repo": get_active_repo_name(),
         }
 

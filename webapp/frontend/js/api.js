@@ -4,10 +4,11 @@
  */
 import { localDB } from "./db.js";
 import { state } from "./state.js";
+import { VERSION_CATALOG_FORMAT, catalogFromBody, isCatalog, versionsFromCatalog } from "./utils/version_catalog.js";
 
 // Heartbeat probing GET /api/sync (cheap, server-cached): slow while the backend answers, fast while it
 // does not, so the badge recovers quickly once the server is back.
-const HEARTBEAT_UP_MS = 30000;
+const HEARTBEAT_UP_MS = 60000;
 const HEARTBEAT_DOWN_MS = 5000;
 const HEARTBEAT_TIMEOUT_MS = 5000;
 // Request timeout; `timeoutMs` in a request's options raises it for the few endpoints that compute
@@ -35,6 +36,8 @@ class ApiClient {
     this.versionStamps = {};
     // Called with the X-KIP-Sync header of every API response (js/sync.js)
     this.onSyncHeader = null;
+    // Called with the parsed JSON body of GET /api/sync (js/sync.js)
+    this.onSyncData = null;
     this._showTimer = null;
     this._heartbeatTimer = null;
 
@@ -78,14 +81,29 @@ class ApiClient {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), HEARTBEAT_TIMEOUT_MS);
     try {
-      await fetch(`${this.baseUrl}/api/sync`, {
+      const res = await fetch(`${this.baseUrl}/api/sync`, {
         method: "GET",
         signal: controller.signal,
         headers: { Accept: "application/json", ...(this.repo ? { "X-KI-Repo": this.repo } : {}) },
         cache: "no-store",
       });
-      this._setServerUp(true);
-      return true;
+      const ok = res.ok;
+      this._setServerUp(ok);
+      if (ok) {
+        try {
+          const syncData = await res.json();
+          if (this.onSyncData) {
+            this.onSyncData(syncData);
+          }
+        } catch {
+          // Ignore JSON parse failure
+        }
+        const syncHeader = res.headers.get("X-KIP-Sync");
+        if (syncHeader && this.onSyncHeader && !this.onSyncData) {
+          this.onSyncHeader(syncHeader);
+        }
+      }
+      return ok;
     } catch {
       this._setServerUp(false);
       return false;
@@ -151,20 +169,13 @@ class ApiClient {
     this.repo = name || "";
   }
 
-  async request(endpoint, options = {}, cacheStore = null, cacheKey = null) {
-    const url = `${this.baseUrl}${endpoint}`;
-    if (cacheKey && this.repo) cacheKey = `${this.repo}::${cacheKey}`;
-
-    // 1. Cache-First: If cache info provided and not a mutating method, return cached immediately
-    //    (catalog endpoints pass networkFirst so newly parsed versions/repositories show up)
-    const { networkFirst, timeoutMs, ...fetchOptions } = options;
-    options = fetchOptions;
-    if (!networkFirst && cacheStore && cacheKey && (!options.method || options.method === "GET")) {
-      const cached = await localDB.get(cacheStore, cacheKey);
-      if (cached !== null && cached !== undefined) return cached;
-    }
-
-    // 2. Fetch with the request timeout (10 s unless the endpoint asked for more)
+  /**
+   * One request: the timeout (10 s unless `timeoutMs`), the loading indicator, the repository header and the
+   * reachability / X-KIP-Sync bookkeeping. Resolves to {response, data}: data is the JSON body, null for a
+   * 304 (only requests that send If-None-Match themselves get one). Rejects on a transport failure, the
+   * timeout, or an HTTP error status (with the server's detail).
+   */
+  async _fetchJson(url, options = {}, timeoutMs = 0) {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs || REQUEST_TIMEOUT_MS);
     this._onRequestStart();
@@ -189,6 +200,7 @@ class ApiClient {
       const syncHeader = response.headers.get("X-KIP-Sync");
       if (syncHeader && this.onSyncHeader) this.onSyncHeader(syncHeader);
 
+      if (response.status === 304) return { response, data: null };
       if (!response.ok) {
         const errText = await response.text();
         let errMsg = `Request failed: ${response.status}`;
@@ -201,8 +213,34 @@ class ApiClient {
         console.error(`API Error [${response.status}] for ${url}: ${errMsg}`);
         throw new Error(errMsg);
       }
+      return { response, data: await response.json() };
+    } catch (err) {
+      clearTimeout(timer);
+      // Only a transport failure or the timeout means the server is unreachable; an HTTP error status
+      // threw above but already proved it answered.
+      if (!answered) this._setServerUp(false);
+      throw err;
+    } finally {
+      this._onRequestEnd();
+    }
+  }
 
-      const data = await response.json();
+  async request(endpoint, options = {}, cacheStore = null, cacheKey = null) {
+    const url = `${this.baseUrl}${endpoint}`;
+    if (cacheKey && this.repo) cacheKey = `${this.repo}::${cacheKey}`;
+
+    // 1. Cache-First: If cache info provided and not a mutating method, return cached immediately
+    //    (catalog endpoints pass networkFirst so newly parsed versions/repositories show up)
+    const { networkFirst, timeoutMs, ...fetchOptions } = options;
+    options = fetchOptions;
+    if (!networkFirst && cacheStore && cacheKey && (!options.method || options.method === "GET")) {
+      const cached = await localDB.get(cacheStore, cacheKey);
+      if (cached !== null && cached !== undefined) return cached;
+    }
+
+    try {
+      // 2. Fetch with the request timeout (10 s unless the endpoint asked for more)
+      const { response, data } = await this._fetchJson(url, options, timeoutMs);
 
       // 3. Cache successful response in IndexedDB (skip if served from Service Worker offline cache)
       if (cacheStore && cacheKey && !response.headers.get("X-KIP-Offline")) {
@@ -214,11 +252,6 @@ class ApiClient {
 
       return data;
     } catch (err) {
-      clearTimeout(timer);
-      // Only a transport failure or the timeout means the server is unreachable; an HTTP error status
-      // threw above but already proved it answered.
-      if (!answered) this._setServerUp(false);
-
       // 4. On network failure, fallback to cache if available
       if (cacheStore && cacheKey) {
         const cached = await localDB.get(cacheStore, cacheKey);
@@ -228,8 +261,6 @@ class ApiClient {
         }
       }
       throw err;
-    } finally {
-      this._onRequestEnd();
     }
   }
 
@@ -265,12 +296,12 @@ class ApiClient {
   }
 
   // --- Versions & Projects ---
-  async getProjects() {
-    return this.request("/api/projects", { networkFirst: true }, "files", "app_projects2");
+  async getProjects(options = {}) {
+    return this.request("/api/projects", options, "files", "app_projects2");
   }
 
-  async getBranches() {
-    return this.request("/api/branches", { networkFirst: true }, "files", "app_branches");
+  async getBranches(options = {}) {
+    return this.request("/api/branches", options, "files", "app_branches");
   }
 
   /**
@@ -290,13 +321,62 @@ class ApiClient {
     );
   }
 
-  async getVersions(includeRc = true) {
-    const q = `?include_rc=${includeRc ? "true" : "false"}`;
-    const res = await this.request(`/api/versions${q}`, { networkFirst: true }, "files", `app_versions_${includeRc ? "rc" : "rel"}`);
-    if (res) {
-      this._versionsMemo = this._versionsMemo || new Map();
-      this._versionsMemo.set(`${this.repo || ""}|${includeRc}`, res);
+  /**
+   * Version catalog of the repository (webapp/API.md §4.1) as {total, versions, g}, entries {vname,
+   * commit_hash (12 hex), is_prerelease, ref_type, indexed, stamp}. Read from IndexedDB unless
+   * `networkFirst` (sync refresh, §2.11). The network request asks for the compact form and names the
+   * generation this client has (If-None-Match): the server answers 304, the rows that changed since, or
+   * the whole catalog. Concurrent calls of the same kind share one request.
+   */
+  getVersions(includeRc = true, { networkFirst = false } = {}) {
+    const key = `${this.repo || ""}|${includeRc}|${networkFirst ? "net" : "cache"}`;
+    this._versionsInFlight = this._versionsInFlight || new Map();
+    let pending = this._versionsInFlight.get(key);
+    if (!pending) {
+      pending = this._loadVersions(includeRc, networkFirst).finally(() => this._versionsInFlight.delete(key));
+      this._versionsInFlight.set(key, pending);
     }
+    return pending;
+  }
+
+  async _loadVersions(includeRc, networkFirst) {
+    const memoKey = `${this.repo || ""}|${includeRc}`;
+    const cacheKey = `${this.repo ? `${this.repo}::` : ""}app_versions_${VERSION_CATALOG_FORMAT}_${includeRc ? "rc" : "rel"}`;
+    let base = await localDB.get("files", cacheKey);
+    if (!isCatalog(base)) base = null;
+    if (base && !networkFirst) return this._rememberVersions(memoKey, base);
+
+    const url = `${this.baseUrl}/api/versions?include_rc=${includeRc ? "true" : "false"}&compact=1`;
+    let catalog = null;
+    try {
+      const headers = base ? { "If-None-Match": `W/"${VERSION_CATALOG_FORMAT}-${base.g}"` } : {};
+      const { response, data } = await this._fetchJson(url, { headers });
+      if (response.status === 304) {
+        catalog = base;
+      } else if (response.headers.get("X-KIP-Offline")) {
+        catalog = base || catalogFromBody(data, null); // the Service Worker's copy is never newer than ours
+      } else {
+        catalog = catalogFromBody(data, base);
+        // A delta from a generation this client does not have: ask for the whole catalog
+        if (!catalog && base) catalog = catalogFromBody((await this._fetchJson(url)).data, null);
+      }
+    } catch (err) {
+      if (!base) throw err;
+      catalog = base; // offline or failing: the catalog this client has
+    }
+    if (!catalog) throw new Error("Unexpected version catalog response");
+    if (catalog !== base) localDB.set("files", cacheKey, catalog).catch((e) => console.warn("Cache write failed:", e));
+    return this._rememberVersions(memoKey, catalog);
+  }
+
+  /** The decoded catalog, kept per repository (getVersionsCached) and decoded once per generation. */
+  _rememberVersions(memoKey, catalog) {
+    this._versionsMemo = this._versionsMemo || new Map();
+    const memo = this._versionsMemo.get(memoKey);
+    if (memo && memo.g === catalog.g) return memo;
+    const versions = versionsFromCatalog(catalog);
+    const res = { total: versions.length, versions, g: catalog.g };
+    this._versionsMemo.set(memoKey, res);
     return res;
   }
 

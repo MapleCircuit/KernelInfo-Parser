@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import gzip
 import json
 import os
 import tempfile
@@ -14,7 +15,9 @@ from unittest.mock import MagicMock, patch
 from webapp.backend import app as app_module
 from webapp.backend.routers import versions as versions_router
 from webapp.backend.routers.versions import _stamp
+from webapp.backend.services import catalog_cache as cc
 from webapp.backend.services import sync_service as ss
+from starlette.requests import Request
 
 
 def _route(app, path: str):
@@ -135,10 +138,40 @@ class TestTokens(unittest.TestCase):
             with patch.object(ss, "get_db_cursor", side_effect=lambda: (_ for _ in ()).throw(RuntimeError("no db"))), \
                  patch.object(ss, "get_active_repo_name", return_value="linux"), \
                  patch.object(ss, "get_repo_dir", return_value=tmp), \
-                 patch.object(ss.subprocess, "run", side_effect=lambda *a, **k: MagicMock(stdout=f"{next(counter)} refs/tags/v3.0")):
+                 patch.object(ss.subprocess, "run", side_effect=lambda *a, **k: MagicMock(stdout=f"{next(counter)} refs/tags/v3.0")), \
+                 patch.object(svc, "projects_token", return_value="r"):
                 first = svc.snapshot()["git"]
                 self.assertEqual(svc.snapshot()["git"], first)  # cached for 15 s
                 self.assertNotEqual(svc.snapshot(fresh=True)["git"], first)  # manual check recomputes
+
+    def test_projects_token_follows_the_repository_list(self) -> None:
+        svc = ss.SyncService(Path(tempfile.gettempdir()))
+        catalogs = [[{"repo": "linux", "indexed": False}], [{"repo": "linux", "indexed": True}]]
+        with patch.object(versions_router, "projects_catalog", side_effect=lambda: catalogs[0]):
+            first = svc.projects_token()
+            self.assertEqual(len(first), 12)
+            catalogs.pop(0)  # the repository got parsed
+            self.assertEqual(svc.projects_token(), first)  # cached for 30 s
+            self.assertNotEqual(svc.projects_token(fresh=True), first)
+        with patch.object(versions_router, "projects_catalog", side_effect=RuntimeError("config unreadable")):
+            self.assertEqual(svc.projects_token(fresh=True), "")
+
+    def test_snapshot_lists_the_five_tokens(self) -> None:
+        svc = ss.SyncService(Path(tempfile.gettempdir()))
+        with patch.object(svc, "db_token", return_value="d"), patch.object(svc, "frontend_build", return_value="f"), \
+                patch.object(svc, "parsed_token", return_value="p"), patch.object(svc, "git_token", return_value="g"), \
+                patch.object(svc, "projects_token", return_value="r"), patch.object(ss, "get_active_repo_name", return_value="linux"):
+            self.assertEqual(svc.snapshot(), {"db": "d", "frontend": "f", "parsed": "p", "git": "g", "projects": "r", "repo": "linux"})
+
+    def test_projects_mark_the_request_repository_active(self) -> None:
+        catalog = [{"repo": "linux", "active": False, "tag_views": []}, {"repo": "stable", "active": False, "tag_views": []}]
+        with patch.object(versions_router, "projects_catalog", return_value=catalog), \
+                patch.object(versions_router, "get_active_repo_name", return_value="stable"):
+            res = versions_router.get_projects()
+        self.assertEqual((res["total"], res["active"]), (2, "stable"))
+        self.assertEqual([p["active"] for p in res["projects"]], [False, True])
+        self.assertEqual(list(res["projects"][1]), ["repo", "active", "tag_views"])  # field order kept
+        self.assertFalse(catalog[1]["active"])  # the shared catalog is not modified
 
 
 class TestVersionStamps(unittest.TestCase):
@@ -219,6 +252,211 @@ class TestBranchTagsWarmup(unittest.TestCase):
             with self.assertLogs(versions_router.logger, "WARNING"):
                 versions_router.prewarm_catalog()
         reset.assert_called_once()
+
+
+def _request(headers: dict[str, str] | None = None) -> Request:
+    raw = [(k.lower().encode(), v.encode()) for k, v in (headers or {}).items()]
+    return Request({"type": "http", "method": "GET", "path": "/api/versions", "query_string": b"", "headers": raw})
+
+
+def _catalog_rows(n: int = 300) -> list[tuple]:
+    """(vid, vname, commit_hash, ref_type, parsed): every third tag only in Git."""
+    return [(i + 1 if i % 3 else 0, f"v4.{i}", f"{i:040x}", 1, None if i % 3 == 0 else 1761400000 + i) for i in range(n)]
+
+
+def _apply_ops(base: list[tuple], ops: list) -> list[tuple]:
+    """What the frontend does with a delta (webapp/frontend/js/utils/version_catalog.js)."""
+    rows: list[tuple] = []
+    for op in ops:
+        if isinstance(op[0], int):
+            rows.extend(base[op[0]:op[0] + op[1]])
+        else:
+            rows.append(tuple(list(op) + [None, 1][len(op) - 2:]))
+    return rows
+
+
+class TestCatalogCache(unittest.TestCase):
+    def test_built_once_per_repository_state(self) -> None:
+        cache = cc.TokenCache()
+        tokens = {"parsed": "p1", "git": "g1"}
+        seen_previous = []
+
+        def build(previous):
+            seen_previous.append(previous)
+            return f"v{len(seen_previous)}"
+
+        with patch.object(cc.sync_service, "parsed_token", side_effect=lambda: tokens["parsed"]), \
+                patch.object(cc.sync_service, "git_token", side_effect=lambda: tokens["git"]):
+            self.assertEqual(cache.get("k", build), "v1")
+            self.assertEqual(cache.get("k", build), "v1")  # same state: served from the cache
+            tokens["git"] = "g2"  # a ref moved
+            self.assertEqual(cache.get("k", build), "v2")
+            self.assertEqual(seen_previous, [None, "v1"])  # the build is handed the previous value
+            tokens["parsed"] = ""  # token unavailable: the value is only trusted briefly
+            self.assertEqual(cache.get("k", build), "v3")
+            self.assertEqual(cache.get("k", build), "v3")
+            with patch.object(cc, "_UNVERIFIED_TTL_S", 0.0):
+                self.assertEqual(cache.get("k", build), "v4")
+
+    def test_concurrent_requests_share_one_build(self) -> None:
+        cache = cc.TokenCache()
+        started, release = threading.Event(), threading.Event()
+        calls, results = [], []
+
+        def build(_previous):
+            calls.append(1)
+            started.set()
+            release.wait(5)
+            return "value"
+
+        with patch.object(cc.sync_service, "parsed_token", return_value="p"), \
+                patch.object(cc.sync_service, "git_token", return_value="g"):
+            threads = [threading.Thread(target=lambda: results.append(cache.get("k", build))) for _ in range(4)]
+            for t in threads:
+                t.start()
+            started.wait(5)
+            time.sleep(0.05)
+            release.set()
+            for t in threads:
+                t.join(5)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(results, ["value"] * 4)
+
+    def test_respond_answers_304_for_its_etag_and_gzip_when_accepted(self) -> None:
+        body = cc.JsonBody({"x": "y" * 2000})
+        r = cc.respond(_request({"Accept-Encoding": "gzip, br"}), body)
+        self.assertEqual((r.status_code, r.headers["content-encoding"]), (200, "gzip"))
+        self.assertEqual(gzip.decompress(r.body), body.raw)
+        self.assertEqual(r.headers["etag"], f'W/"{body.etag}"')
+        self.assertEqual(r.headers["cache-control"], "no-cache")
+        self.assertIn("X-KI-Repo", r.headers["vary"])
+        plain = cc.respond(_request(), body)
+        self.assertNotIn("content-encoding", plain.headers)
+        self.assertEqual(plain.body, body.raw)
+        for inm in (f'W/"{body.etag}"', f'"{body.etag}"', f'"other", W/"{body.etag}"', "*"):
+            r = cc.respond(_request({"If-None-Match": inm}), body)
+            self.assertEqual((r.status_code, r.body), (304, b""), inm)
+        self.assertEqual(cc.respond(_request({"If-None-Match": '"other"'}), body).status_code, 200)
+        small = cc.JsonBody({"a": 1})
+        self.assertIsNone(small.gz)  # below the gzip threshold
+        self.assertNotIn("content-encoding", cc.respond(_request({"Accept-Encoding": "gzip"}), small).headers)
+        unvalidated = cc.respond(_request({"If-None-Match": f'W/"{small.etag}"'}), small, cache_control="no-store", etag=False)
+        self.assertEqual(unvalidated.status_code, 200)
+        self.assertNotIn("etag", unvalidated.headers)
+
+
+class TestVersionCatalog(unittest.TestCase):
+    KEY = ("linux", True)
+
+    def setUp(self) -> None:
+        versions_router._HISTORY.clear()
+
+    def tearDown(self) -> None:
+        versions_router._HISTORY.clear()
+
+    def _catalog(self, rows: list[tuple], previous=None):
+        cat = versions_router.VersionCatalog(self.KEY, rows, versions_router.digest(versions_router.dumps(rows)), previous)
+        versions_router._remember_generation(self.KEY, cat.gen, cat.compact)
+        return cat
+
+    def test_legacy_layout_and_compact_columns(self) -> None:
+        sha = "17d857be649a" + "0" * 28
+        rows = [
+            (11, "v3.0-rc1", "aa" * 20, 1, 1761400000),
+            (0, "v3.0-rc2", "bb" * 20, 1, None),
+            (12, "v3.0", sha, 1, 0),
+            (13, "master", "", 2, 1761500000),
+        ]
+        cat = self._catalog(rows)
+        legacy = cat.legacy()
+        self.assertEqual(legacy["total"], 4)
+        self.assertEqual(legacy["versions"][0], {
+            "vid": 11, "vname": "v3.0-rc1", "commit_hash": "aa" * 20, "is_prerelease": True,
+            "ref_type": 1, "indexed": True, "stamp": "aaaaaaaaaaaa.1761400000",
+        })
+        self.assertEqual([v["stamp"] for v in legacy["versions"][1:]], ["bbbbbbbbbbbb.git", "17d857be649a.0", ".1761500000"])
+
+        body = json.loads(cat.compact_body.raw)
+        self.assertEqual(cat.compact_body.etag, f"c1-{cat.gen}")
+        self.assertEqual(body, {
+            "g": cat.gen,
+            "n": ["v3.0-rc1", "v3.0-rc2", "v3.0", "master"],
+            "h": "aaaaaaaaaaaa" "bbbbbbbbbbbb" "17d857be649a" "000000000000",
+            "p": [1761400000, None, 0, 1761500000],
+            "t": [[3, 2]],
+        })
+        # The frontend derives each stamp from the columns, identical to the legacy one
+        for i, v in enumerate(legacy["versions"]):
+            chunk = body["h"][i * 12:(i + 1) * 12]
+            parsed = body["p"][i]
+            self.assertEqual(f"{'' if chunk == '0' * 12 else chunk}.{'git' if parsed is None else parsed}", v["stamp"])
+
+    def test_delta_rebuilds_the_current_rows(self) -> None:
+        rows = _catalog_rows()
+        base = self._catalog(rows)
+        cur_rows = list(rows)
+        cur_rows[30] = (99, "v4.30", rows[30][2], 1, 1761999999)  # finished parsing
+        cur_rows.insert(200, (0, "v4.199-rc1", "e" * 40, 1, None))  # a tag was fetched
+        del cur_rows[5:7]  # tags were deleted
+        cur_rows.append((50, "master", "", 2, 1761500000))  # a branch was parsed
+        cur = self._catalog(cur_rows, base)
+        body = cur.delta_from(base.gen)
+        delta = json.loads(body.raw)
+        self.assertEqual((delta["g"], delta["b"]), (cur.gen, base.gen))
+        self.assertEqual(_apply_ops(base.compact, delta["d"]), cur.compact)
+        self.assertLess(len(body.raw), 200)
+        self.assertIs(cur.delta_from(base.gen), body)  # computed once per base
+
+    def test_one_finished_version_is_one_row_between_two_copies(self) -> None:
+        rows = _catalog_rows()
+        base = self._catalog(rows)
+        cur_rows = list(rows)
+        cur_rows[30] = (99, "v4.30", rows[30][2], 1, 1761999999)
+        cur = self._catalog(cur_rows, base)
+        self.assertEqual(json.loads(cur.delta_from(base.gen).raw)["d"],
+                         [[0, 30], ["v4.30", rows[30][2][:12], 1761999999], [31, 269]])
+        self.assertIs(cur.compact[0], base.compact[0])  # unchanged rows are shared with the previous generation
+
+    def test_unknown_base_or_large_delta_gets_the_full_catalog(self) -> None:
+        rows = _catalog_rows()
+        base = self._catalog(rows)
+        self.assertIsNone(base.delta_from("0123456789abcdef"))
+        rewritten = [(vid, name, "f" * 40, rt, parsed) for vid, name, _sha, rt, parsed in rows]  # every commit moved
+        self.assertIsNone(self._catalog(rewritten, base).delta_from(base.gen))
+
+    def test_history_is_bounded(self) -> None:
+        for i in range(versions_router._HISTORY_MAX + 5):
+            versions_router._remember_generation(self.KEY, f"g{i}", [])
+        self.assertEqual(len(versions_router._HISTORY[self.KEY]), versions_router._HISTORY_MAX)
+        self.assertIsNone(versions_router._generation(self.KEY, "g0"))
+        self.assertEqual(versions_router._generation(self.KEY, f"g{versions_router._HISTORY_MAX + 4}"), [])
+
+    def test_unchanged_content_keeps_the_previous_catalog(self) -> None:
+        rows = _catalog_rows()
+        with patch.object(versions_router, "_version_rows", return_value=rows):
+            first = versions_router.VersionCatalog.build(self.KEY)
+            self.assertIs(versions_router.VersionCatalog.build(self.KEY, first), first)
+        with patch.object(versions_router, "_version_rows", return_value=rows[:-1]):
+            self.assertIsNot(versions_router.VersionCatalog.build(self.KEY, first), first)
+
+    def test_endpoint_answers_304_delta_or_full(self) -> None:
+        rows = _catalog_rows()
+        base = self._catalog(rows)
+        cur_rows = list(rows)
+        cur_rows[30] = (99, "v4.30", rows[30][2], 1, 1761999999)
+        cur = self._catalog(cur_rows, base)
+        endpoint = versions_router.versions_endpoint
+        with patch.object(versions_router, "version_catalog", return_value=cur):
+            self.assertEqual(endpoint(_request({"If-None-Match": f'W/"c1-{cur.gen}"'}), True, True).status_code, 304)
+            delta = endpoint(_request({"If-None-Match": f'W/"c1-{base.gen}"'}), True, True)
+            self.assertEqual((delta.status_code, delta.headers["cache-control"]), (200, "no-store"))
+            self.assertEqual(json.loads(delta.body)["b"], base.gen)
+            full = endpoint(_request({"If-None-Match": 'W/"c1-0123456789abcdef"'}), True, True)
+            self.assertEqual(json.loads(full.body)["g"], cur.gen)
+            # A compact generation never validates the legacy layout
+            legacy = endpoint(_request({"If-None-Match": f'W/"c1-{cur.gen}"'}), True, False)
+            self.assertEqual(legacy.status_code, 200)
+            self.assertEqual(json.loads(legacy.body)["total"], 300)
 
 
 if __name__ == "__main__":

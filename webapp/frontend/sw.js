@@ -8,6 +8,7 @@
  *   pruned when the page tells the worker its build ({type: "prune", build}).
  * - kip-api: API responses, network-first with cache fallback for offline use. Bounded: past
  *   API_CACHE_LIMIT entries the oldest are dropped (the page keeps its own IndexedDB cache too).
+ *   Replies marked `Cache-Control: no-store` (version catalog deltas) are passed through, not kept.
  */
 const SHELL_CACHE = "kip-shell";
 const ASSET_CACHE = "kip-assets";
@@ -78,7 +79,8 @@ function networkFirst(request, cacheName) {
   const cacheKey = apiCacheKey(request);
   return fetch(request)
     .then((response) => {
-      if (response && response.status === 200) {
+      // `no-store` replies (e.g. a version catalog delta, valid only against the client's own copy) are not kept
+      if (response && response.status === 200 && !/no-store/i.test(response.headers.get("Cache-Control") || "")) {
         const copy = response.clone();
         caches.open(cacheName).then((cache) => cache.put(cacheKey, copy).then(() => {
           if (++apiWrites % API_TRIM_EVERY === 0) return trimApiCache(cache);

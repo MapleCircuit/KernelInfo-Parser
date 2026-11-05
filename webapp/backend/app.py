@@ -168,7 +168,7 @@ def create_app() -> FastAPI:
     def serve_sw():
         sw_path = FRONTEND_DIR / "sw.js"
         if sw_path.is_file():
-            return FileResponse(str(sw_path), media_type="application/javascript", headers={"Cache-Control": "no-cache"})
+            return FileResponse(str(sw_path), media_type="application/javascript", headers={"Cache-Control": BUILD_CACHE_CONTROL})
         return Response(status_code=404)
 
     return app

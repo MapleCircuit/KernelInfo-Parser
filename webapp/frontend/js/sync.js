@@ -5,18 +5,18 @@
  * - db: a rebuilt database clears every cached API response.
  * - parsed / git: version and branch lists are refetched; each version carries a stamp (commit + parse
  *   completion) that is part of its cache keys (api._vk), and entries of versions whose stamp changed
- *   are deleted. Checked when the page opens and whenever an API response's X-KIP-Sync header differs.
- * - frontend: when the page opens and the last check is more than an hour old, a newer build than the
- *   one this page runs (window.KIP_BUILD, see boot.js) is announced and the page reloads into it after
- *   5 seconds ("Later" postpones it to the next check).
- * - checkNow() (Settings "Check for Updates"): all four tokens recomputed by the server, version stamps
- *   refetched and the frontend build compared regardless of the hourly delay.
+ *   are deleted.
+ * - projects: the repository list is refetched (and the selectors re-rendered) only when it changed.
+ * - frontend: compared on every sync (page open, opening a new tab, restoring a session, and periodic
+ *   60s sync). When a newer build than the running page (window.KIP_BUILD, see boot.js) is detected,
+ *   it is announced and the page reloads after 5 seconds ("Later" postpones it for the session).
+ * - checkNow() (Settings "Check for Updates"): all five tokens recomputed by the server (?fresh=true),
+ *   version stamps and the repository list refetched and frontend build compared immediately.
  */
 import { api } from "./api.js";
 import { localDB } from "./db.js";
 import { state } from "./state.js";
 
-const FRONTEND_CHECK_MS = 60 * 60 * 1000;
 const RELOAD_DELAY_S = 5;
 const LAST_FRONTEND_CHECK_KEY = "kip-last-frontend-check";
 // Cached API data older than this is dropped (checked at most daily, when the page opens)
@@ -31,6 +31,14 @@ class SyncManager {
     this.tokens = {};
     this.queue = Promise.resolve();
     this.reloadTimer = null;
+    this.postponedBuild = null;
+    this._lastSyncTime = 0;
+    this._inFlightSync = null;
+
+    // Synchronize on opening a new tab and restoring a session
+    state.subscribe("tab:opened", () => this.sync({ notify: true }));
+    state.subscribe("session:adopted", () => this.sync({ notify: true }));
+    state.subscribe("session:restored", () => this.sync({ notify: true }));
   }
 
   /** Frontend build of the running page. */
@@ -52,17 +60,37 @@ class SyncManager {
     api.versionStamps = (await localDB.get("meta", "version_stamps")) || {};
     this.tokens = (await localDB.get("meta", "sync_tokens")) || {};
     api.onSyncHeader = (value) => this.onHeader(value);
+    api.onSyncData = (data) => this.onSyncData(data);
     this.pruneOtherBuilds();
 
-    let sync;
-    try {
-      sync = await api.getSync();
-    } catch (err) {
-      console.info("[Sync] Server unreachable; using cached data.", err);
-      return;
+    await this.sync({ notify: false });
+  }
+
+  /**
+   * Sync with the server (`GET /api/sync`): checks db, parsed, git, and frontend tokens.
+   * In-flight calls share the promise; rapid calls within 1 s are coalesced.
+   */
+  async sync({ notify = true, fresh = false, force = false } = {}) {
+    const now = Date.now();
+    if (!force && !fresh && this._lastSyncTime && (now - this._lastSyncTime < 1000)) {
+      return this.queue;
     }
-    await this.enqueue(sync, { notify: false });
-    this.checkFrontend(sync.frontend);
+    if (this._inFlightSync) {
+      return this._inFlightSync;
+    }
+    this._inFlightSync = (async () => {
+      try {
+        const sync = await api.getSync({ fresh });
+        this._lastSyncTime = Date.now();
+        return await this.enqueue(sync, { notify, force });
+      } catch (err) {
+        console.info("[Sync] Server unreachable; using cached data.", err);
+        return null;
+      } finally {
+        this._inFlightSync = null;
+      }
+    })();
+    return this._inFlightSync;
   }
 
   onHeader(value) {
@@ -73,6 +101,11 @@ class SyncManager {
     }
   }
 
+  onSyncData(sync) {
+    if (!sync) return;
+    this.enqueue(sync, { notify: true });
+  }
+
   enqueue(sync, opts) {
     this.queue = this.queue.then(() => this.apply(sync, opts)).catch((err) => console.warn("[Sync] Update failed:", err));
     return this.queue;
@@ -80,9 +113,18 @@ class SyncManager {
 
   /** Returns the version changes of refreshVersions() when the versions were refetched, else null. */
   async apply(sync, { notify, force = false }) {
+    if (!sync) return null;
     const prev = this.tokens;
     const next = { ...prev };
     let refresh = force || !Object.keys(api.versionStamps).length;
+    // The repository list has its own token: refetched when it changed, not with every parsed version
+    let refreshProjects = force;
+
+    // Check for frontend updates on every sync
+    if (sync.frontend) {
+      next.frontend = sync.frontend;
+      this.checkFrontend(sync.frontend);
+    }
 
     if (sync.db && sync.db !== prev.db) {
       if (prev.db) {
@@ -103,18 +145,27 @@ class SyncManager {
         refresh = refresh || Boolean(prev[key]);
       }
     }
+    if (sync.projects && sync.projects !== prev.projects) {
+      next.projects = sync.projects;
+      refreshProjects = refreshProjects || Boolean(prev.projects);
+    }
+    if (sync.repo) {
+      next.repo = sync.repo;
+    }
     this.tokens = next;
     await localDB.set("meta", "sync_tokens", next);
+    if (refreshProjects) await this.refreshProjects({ notify });
     return refresh ? this.refreshVersions({ notify }) : null;
   }
 
   /**
-   * Manual check: server tokens recomputed (`?fresh=true`), version stamps always refetched, frontend build
-   * compared without the hourly delay. Resolves to {db, parsed, git, frontend, changed, removed, added,
-   * newBuild}: the first four tell which token changed, newBuild is the server build when it differs from
+   * Manual check: server tokens recomputed (`?fresh=true`), version stamps and the repository list always
+   * refetched, frontend build compared without delay. Resolves to {db, parsed, git, projects, frontend,
+   * changed, removed, added, newBuild}: the first five tell which token changed, newBuild is the server build when it differs from
    * the running page's (the reload banner is then shown). Rejects when the server is unreachable.
    */
   async checkNow() {
+    this.postponedBuild = null;
     const sync = await api.getSync({ fresh: true });
     const prev = { ...this.tokens };
     const run = this.queue.then(() => this.apply(sync, { notify: true, force: true }));
@@ -124,21 +175,41 @@ class SyncManager {
       localStorage.setItem(LAST_FRONTEND_CHECK_KEY, String(Date.now()));
     } catch { /* storage unavailable */ }
     const newBuild = sync.frontend && this.build && !this.build.startsWith("__") && sync.frontend !== this.build ? sync.frontend : null;
-    if (newBuild) this.announceUpdate(newBuild);
+    if (newBuild) {
+      this.updateServiceWorker();
+      this.announceUpdate(newBuild);
+    }
     const changedToken = (k) => Boolean(sync[k] && prev[k] && sync[k] !== prev[k]);
     return {
       db: changedToken("db"),
       parsed: changedToken("parsed"),
       git: changedToken("git"),
+      projects: changedToken("projects"),
       frontend: Boolean(newBuild),
       ...versions,
       newBuild,
     };
   }
 
+  /**
+   * Refetch the repository list (GET /api/projects) after its `projects` token changed or on a manual check;
+   * app.js re-renders the selectors on `projects:updated`. A failure keeps the cached list.
+   */
+  async refreshProjects({ notify }) {
+    try {
+      const res = await api.getProjects({ networkFirst: true });
+      if (notify) state.emit("projects:updated", res);
+    } catch (err) {
+      console.warn("[Sync] Could not refresh the repository list:", err);
+    }
+  }
+
   /** Refetch version and branch stamps; drop cached data of versions whose stamp changed. */
   async refreshVersions({ notify }) {
-    const [vRes, bRes] = await Promise.all([api.getVersions(true), api.getBranches()]);
+    const [vRes, bRes] = await Promise.all([
+      api.getVersions(true, { networkFirst: true }),
+      api.getBranches({ networkFirst: true }),
+    ]);
     const nextStamps = {};
     for (const v of vRes?.versions || []) if (v.vname && v.stamp) nextStamps[v.vname] = v.stamp;
     for (const b of bRes?.branches || []) if (b.name && b.stamp) nextStamps[b.name] = b.stamp;
@@ -164,17 +235,14 @@ class SyncManager {
 
   // ------------------------------------------------------------------ frontend build
   checkFrontend(serverBuild) {
-    let last = 0;
-    try {
-      last = Number(localStorage.getItem(LAST_FRONTEND_CHECK_KEY) || 0);
-    } catch { /* storage unavailable */ }
-    if (Date.now() - last < FRONTEND_CHECK_MS) return;
+    if (!serverBuild || !this.build || this.build.startsWith("__")) return;
+    if (serverBuild === this.build) return;
+    this.updateServiceWorker();
+    if (this.postponedBuild === serverBuild) return;
     try {
       localStorage.setItem(LAST_FRONTEND_CHECK_KEY, String(Date.now()));
     } catch { /* storage unavailable */ }
-    if (serverBuild && this.build && serverBuild !== this.build && !this.build.startsWith("__")) {
-      this.announceUpdate(serverBuild);
-    }
+    this.announceUpdate(serverBuild);
   }
 
   /** Banner "KernelInfo was updated", reloading after RELOAD_DELAY_S (waits while a dialog is open). */
@@ -208,13 +276,31 @@ class SyncManager {
     bar.querySelector(".kip-update-now").onclick = () => this.reloadToLatest();
     bar.querySelector(".kip-update-later").onclick = () => {
       clearTimeout(this.reloadTimer);
+      this.postponedBuild = serverBuild;
       bar.remove();
     };
     tick();
   }
 
+  /**
+   * Refetch and update the Service Worker only when sync confirms a frontend build change.
+   * Uses cache: 'reload' to bypass the HTTP cache and update it with the new /sw.js.
+   */
+  async updateServiceWorker() {
+    if (!("serviceWorker" in navigator)) return;
+    try {
+      const reg = await navigator.serviceWorker.getRegistration();
+      if (!reg) return;
+      await fetch("/sw.js", { cache: "reload" });
+      await reg.update();
+    } catch (e) {
+      console.warn("[Sync] ServiceWorker update failed:", e);
+    }
+  }
+
   reloadToLatest() {
     clearTimeout(this.reloadTimer);
+    this.updateServiceWorker();
     if (window.KIP_RELOAD_TO_LATEST) window.KIP_RELOAD_TO_LATEST();
     else location.reload();
   }
