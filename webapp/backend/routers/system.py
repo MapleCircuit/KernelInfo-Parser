@@ -16,6 +16,6 @@ def get_sync(fresh: bool = False) -> dict[str, Any]:
 
     Clients compare them with the ones they saw last (webapp/frontend/js/sync.js); see
     webapp/backend/services/sync_service.py for what each one covers. `fresh=true` recomputes the
-    tokens instead of serving the cached ones (manual "Check for Updates").
+    tokens instead of serving the cached ones (not sent by the frontend).
     """
     return sync_service.snapshot(fresh=fresh)

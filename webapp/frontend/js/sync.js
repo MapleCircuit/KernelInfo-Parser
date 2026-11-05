@@ -10,8 +10,9 @@
  * - frontend: compared on every sync (page open, opening a new tab, restoring a session, and periodic
  *   60s sync). When a newer build than the running page (window.KIP_BUILD, see boot.js) is detected,
  *   it is announced and the page reloads after 5 seconds ("Later" postpones it for the session).
- * - checkNow() (Settings "Check for Updates"): all five tokens recomputed by the server (?fresh=true),
- *   version stamps and the repository list refetched and frontend build compared immediately.
+ * - checkNow() (Settings "Check for Updates"): that same sync, run at once; when it finds an update (a newer
+ *   frontend build, a changed token or changed versions) the page restarts right away (restart()) instead of
+ *   re-rendering in place or announcing the build.
  */
 import { api } from "./api.js";
 import { localDB } from "./db.js";
@@ -19,6 +20,8 @@ import { state } from "./state.js";
 
 const RELOAD_DELAY_S = 5;
 const LAST_FRONTEND_CHECK_KEY = "kip-last-frontend-check";
+// What a manual check found, left by restart() for the page it reloads (sessionStorage: this browser tab only)
+const RESTART_NOTE_KEY = "kip-restart-note";
 // Cached API data older than this is dropped (checked at most daily, when the page opens)
 const CACHE_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
 const LAST_PRUNE_KEY = "kip-last-cache-prune";
@@ -111,8 +114,11 @@ class SyncManager {
     return this.queue;
   }
 
-  /** Returns the version changes of refreshVersions() when the versions were refetched, else null. */
-  async apply(sync, { notify, force = false }) {
+  /**
+   * Returns the version changes of refreshVersions() when the versions were refetched, else null. `announce`
+   * false leaves a newer frontend build to the caller (checkNow(): the page restarts instead of showing the banner).
+   */
+  async apply(sync, { notify, force = false, announce = true }) {
     if (!sync) return null;
     const prev = this.tokens;
     const next = { ...prev };
@@ -123,7 +129,7 @@ class SyncManager {
     // Check for frontend updates on every sync
     if (sync.frontend) {
       next.frontend = sync.frontend;
-      this.checkFrontend(sync.frontend);
+      if (announce) this.checkFrontend(sync.frontend);
     }
 
     if (sync.db && sync.db !== prev.db) {
@@ -159,36 +165,55 @@ class SyncManager {
   }
 
   /**
-   * Manual check: server tokens recomputed (`?fresh=true`), version stamps and the repository list always
-   * refetched, frontend build compared without delay. Resolves to {db, parsed, git, projects, frontend,
-   * changed, removed, added, newBuild}: the first five tell which token changed, newBuild is the server build when it differs from
-   * the running page's (the reload banner is then shown). Rejects when the server is unreachable.
+   * Settings "Check for Updates": the sync of the 60 s heartbeat (`GET /api/sync` with the server's cached
+   * tokens, applied by apply(): a purged cache, refetched catalogs and repository list), run at once. Nothing is
+   * re-rendered and a newer build is not announced: when `updated`, the caller restarts the page (restart()).
+   * Resolves to {db, parsed, git, projects, frontend, newBuild, changed, removed, added, updated}: the first four
+   * tell which token changed since the last sync, frontend / newBuild whether (and to what) the server's build
+   * differs from the running page's, changed / removed / added the versions whose stamp changed, updated whether
+   * any of them did. Rejects when the server is unreachable or the update could not be applied.
    */
   async checkNow() {
-    this.postponedBuild = null;
-    const sync = await api.getSync({ fresh: true });
     const prev = { ...this.tokens };
-    const run = this.queue.then(() => this.apply(sync, { notify: true, force: true }));
+    const sync = await api.getSync();
+    const run = this.queue.then(() => this.apply(sync, { notify: false, announce: false }));
     this.queue = run.catch((err) => console.warn("[Sync] Update failed:", err));
     const versions = (await run) || { changed: [], removed: [], added: [] };
-    try {
-      localStorage.setItem(LAST_FRONTEND_CHECK_KEY, String(Date.now()));
-    } catch { /* storage unavailable */ }
     const newBuild = sync.frontend && this.build && !this.build.startsWith("__") && sync.frontend !== this.build ? sync.frontend : null;
-    if (newBuild) {
-      this.updateServiceWorker();
-      this.announceUpdate(newBuild);
-    }
     const changedToken = (k) => Boolean(sync[k] && prev[k] && sync[k] !== prev[k]);
-    return {
+    const found = {
       db: changedToken("db"),
       parsed: changedToken("parsed"),
       git: changedToken("git"),
       projects: changedToken("projects"),
       frontend: Boolean(newBuild),
-      ...versions,
-      newBuild,
     };
+    const versionsChanged = versions.changed.length + versions.removed.length + versions.added.length > 0;
+    return { ...found, newBuild, ...versions, updated: versionsChanged || Object.values(found).some(Boolean) };
+  }
+
+  /**
+   * Restart the page after checkNow() found updates: into the new frontend build when there is one
+   * (reloadToLatest(): cached shell dropped), else a plain reload, the shell and modules still served by the
+   * Service Worker. `note` (what was found) is for the restarted page (takeRestartNote()).
+   */
+  restart(newBuild, note = "") {
+    try {
+      sessionStorage.setItem(RESTART_NOTE_KEY, note);
+    } catch { /* storage unavailable */ }
+    if (newBuild) this.reloadToLatest();
+    else location.reload();
+  }
+
+  /** The note restart() left for this page, once; null when the page was not restarted by an update check. */
+  takeRestartNote() {
+    try {
+      const note = sessionStorage.getItem(RESTART_NOTE_KEY);
+      if (note !== null) sessionStorage.removeItem(RESTART_NOTE_KEY);
+      return note;
+    } catch {
+      return null;
+    }
   }
 
   /**

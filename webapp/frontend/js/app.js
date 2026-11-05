@@ -76,6 +76,9 @@ class KernelIdeApp {
     } catch (e) {
       console.warn("Server sync check error:", e);
     }
+    // Restarted by Settings "Check for Updates": say what it found (syncManager.restart())
+    const restartNote = syncManager.takeRestartNote();
+    if (restartNote !== null) toast.success(restartNote ? `Updates applied: ${restartNote}` : "Updates applied");
 
     // 3. Initialize Version Selector
     await this.initVersionSelector();
@@ -478,7 +481,7 @@ class KernelIdeApp {
               <span style="font-size:10px;color:var(--accent-green);font-weight:500;">● Synced</span>
             </div>
 
-            <button class="settings-btn" id="btn-check-updates" ${isOnline ? "" : "disabled"} title="Check the frontend build, database, parsed versions and Git refs against the server">
+            <button class="settings-btn" id="btn-check-updates" ${isOnline ? "" : "disabled"} title="Sync with the server now (frontend build, database, parsed versions, Git refs, repositories) and restart the page when an update is found">
               <span>🔄 Check for Updates</span>
               <span id="check-updates-status" style="font-size:10px;color:var(--text-muted);">${isOnline ? "&rarr;" : linkDown ? "Offline" : "Unreachable"}</span>
             </button>
@@ -723,33 +726,30 @@ class KernelIdeApp {
     };
   }
 
-  /** Settings "Check for Updates": manual sync of the frontend build, database, parsed versions, Git refs and repositories. */
+  /**
+   * Settings "Check for Updates": the 60 s sync run now (syncManager.checkNow()). When it found an update the page
+   * restarts at once (into the new build when there is one) and the restarted page toasts what was found.
+   */
   async checkForUpdates(btn) {
     const status = btn.querySelector("#check-updates-status");
     btn.disabled = true;
     status.textContent = "Checking…";
+    let restarting = false;
     try {
       const r = await syncManager.checkNow();
-      const parts = [];
-      if (r.frontend) parts.push(`new frontend build ${r.newBuild}`);
-      if (r.db) parts.push("database rebuilt (cache cleared)");
-      if (r.changed.length) parts.push(`${r.changed.length} version(s) re-parsed or moved`);
-      if (r.added.length && !r.db) parts.push(`${r.added.length} new version(s)/branch(es)`);
-      if (r.removed.length) parts.push(`${r.removed.length} removed`);
-      if (r.projects && !r.db) parts.push("repository list updated");
-      if (!parts.length && (r.parsed || r.git)) parts.push("version lists refreshed");
-      if (parts.length) {
-        status.textContent = "Updated";
-        toast.success(`Updates found: ${parts.join(", ")}`);
-      } else {
-        status.textContent = "Up to date";
-        toast.info("Everything is up to date (frontend, database, parsed versions, Git, repositories)");
+      if (r.updated) {
+        restarting = true;
+        status.textContent = "Restarting…";
+        syncManager.restart(r.newBuild, describeUpdates(r));
+        return;
       }
+      status.textContent = "Up to date";
+      toast.info("Everything is up to date (frontend, database, parsed versions, Git, repositories)");
     } catch (err) {
       status.textContent = "Failed";
       toast.error("Update check failed: " + err.message);
     } finally {
-      btn.disabled = false;
+      if (!restarting) btn.disabled = false;
     }
   }
 
@@ -1590,6 +1590,19 @@ export function applyTypographySettings(codeFontSize = null, uiFontScale = null)
 
 function escapeAttr(str) {
   return String(str ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
+
+/** What "Check for Updates" found (syncManager.checkNow()), as the restarted page toasts it. */
+function describeUpdates(r) {
+  const parts = [];
+  if (r.frontend) parts.push(`new frontend build ${r.newBuild}`);
+  if (r.db) parts.push("database rebuilt (cache cleared)");
+  if (r.changed.length) parts.push(`${r.changed.length} version(s) re-parsed or moved`);
+  if (r.added.length && !r.db) parts.push(`${r.added.length} new version(s)/branch(es)`);
+  if (r.removed.length) parts.push(`${r.removed.length} removed`);
+  if (r.projects && !r.db) parts.push("repository list updated");
+  if (!parts.length) parts.push("version lists refreshed");
+  return parts.join(", ");
 }
 
 // Bootstrap on DOM ready (boot.js imports this module, possibly after DOMContentLoaded fired)

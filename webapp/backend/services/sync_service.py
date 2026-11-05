@@ -11,7 +11,7 @@ Five tokens (short hex digests), each with its own client reaction (webapp/front
 
 They are cached (frontend 5 s, db/projects 30 s, parsed/git 15 s) so `/api/sync` and the `X-KIP-Sync`
 header of every API response cost no database or Git work on most requests; `/api/sync?fresh=true`
-(the "Check for Updates" button) recomputes them all.
+recomputes them all (the frontend never asks for it: its "Check for Updates" reads the cached tokens too).
 """
 from __future__ import annotations
 
