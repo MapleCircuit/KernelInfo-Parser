@@ -7,6 +7,16 @@ import re
 from typing import Any
 
 
+PULL_FROM_RE = re.compile(
+    r"Pull\s+(?:.*?\s+)?from\s+([^:\n<]+?)\s*(?:<([^>\n\r]+)>)?\s*:",
+    re.IGNORECASE,
+)
+BRANCH_MERGE_RE = re.compile(
+    r"Merge (?:branch|tag)\s+'([^']+)'\s+of\s+(\S+)",
+    re.IGNORECASE,
+)
+
+
 class MLRelationType(IntEnum):
     """Relation of the mailing list email to the target git commit."""
     Patch = 1
@@ -221,6 +231,18 @@ class CommitFeatures:
             m_bm = re.search(r"Merge (?:branch|tag)\s+'([^']+)'", self.subject, re.IGNORECASE)
             if m_bm:
                 self.merge_branch = m_bm.group(1)
+
+        if self.is_merge and self.message:
+            if not self.pull_from_name:
+                m_pull = PULL_FROM_RE.search(self.message)
+                if m_pull:
+                    self.pull_from_name = m_pull.group(1).strip()
+                    if m_pull.group(2):
+                        self.pull_from_email = m_pull.group(2).strip()
+            if not self.merge_branch:
+                m_bm = BRANCH_MERGE_RE.search(self.message)
+                if m_bm:
+                    self.merge_branch = m_bm.group(1).strip()
 
     @property
     def commit_hash(self) -> str:

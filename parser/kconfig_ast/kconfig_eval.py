@@ -1000,13 +1000,16 @@ def solve(ev: KconfigEvaluator, target: str, want: int = 2, max_steps: int = 60)
             raise _Blocked(f"{name} has no prompt and nothing selects it (value derived from: {defaults or 'no defaults'})")
         raise _Blocked(errors[0] if errors else f"{name} cannot be enabled")
 
-    def lower_sym(name: str, level: int, plan: list[tuple[str, str]]) -> None:
+    def lower_sym(name: str, level: int, plan: list[tuple[str, str]], seen: set[str]) -> None:
         if name in ("y", "m", "n") or not ev.is_defined(name):
             if (TRI_OF.get(name, 0)) > level:
                 raise _Blocked(f"constant {name} cannot be lowered")
             return
         if ev.sym_tri(name) <= level:
             return
+        if name in seen:
+            raise _Blocked(f"dependency loop through {name}")
+        seen = seen | {name}
         if ev.rev_dep(name) > level:
             raise _Blocked(f"{name} is forced to {ev.value(name)} by select ({', '.join(_selectors(ev, name)[:3])})")
         if ev.visibility(name) == 0:
@@ -1042,7 +1045,7 @@ def solve(ev: KconfigEvaluator, target: str, want: int = 2, max_steps: int = 60)
                 raise _Blocked(error or "no alternative can be satisfied")
             plan.extend(best)
         elif op == "!":
-            lower_expr(node[1], 2 - level, plan)
+            lower_expr(node[1], 2 - level, plan, seen)
         elif op in ("=", "!="):
             left, right = ev.exprs[node[1]], ev.exprs[node[2]]
             sym_node, const = (left, right) if left[0] == "s" and ev.is_defined(left[1]) else (right, left)
@@ -1055,7 +1058,7 @@ def solve(ev: KconfigEvaluator, target: str, want: int = 2, max_steps: int = 60)
                         if TRI_OF[text] > ev.sym_tri(name):
                             need_sym(name, TRI_OF[text], plan, seen)
                         else:
-                            lower_sym(name, TRI_OF[text], plan)
+                            lower_sym(name, TRI_OF[text], plan, seen)
                         return
                     raise _Blocked(f"{name} can never equal {text}")
                 if ev.visibility(name) == 0:
@@ -1066,13 +1069,13 @@ def solve(ev: KconfigEvaluator, target: str, want: int = 2, max_steps: int = 60)
                     if text == "n":
                         need_sym(name, 1, plan, seen)
                     else:
-                        lower_sym(name, 0, plan)
+                        lower_sym(name, 0, plan, seen)
                     return
                 raise _Blocked(f"{name} != {text} cannot be arranged automatically")
         else:
             raise _Blocked(f"comparison {op} cannot be arranged automatically")
 
-    def lower_expr(eid: int, level: int, plan: list[tuple[str, str]]) -> None:
+    def lower_expr(eid: int, level: int, plan: list[tuple[str, str]], seen: set[str]) -> None:
         if eid < 0:
             raise _Blocked("an unconditional dependency cannot be lowered")
         if ev.expr_tri(eid) <= level:
@@ -1080,25 +1083,25 @@ def solve(ev: KconfigEvaluator, target: str, want: int = 2, max_steps: int = 60)
         node = ev.exprs[eid]
         op = node[0]
         if op == "s":
-            lower_sym(node[1], level, plan)
+            lower_sym(node[1], level, plan, seen)
         elif op == "c":
             raise _Blocked(f'constant "{node[1]}" is true')
         elif op == "|":
-            lower_expr(node[1], level, plan)
-            lower_expr(node[2], level, plan)
+            lower_expr(node[1], level, plan, seen)
+            lower_expr(node[2], level, plan, seen)
         elif op == "&":
             error = None
             for side in (node[1], node[2]):
                 attempt: list[tuple[str, str]] = []
                 try:
-                    lower_expr(side, level, attempt)
+                    lower_expr(side, level, attempt, seen)
                     plan.extend(attempt)
                     return
                 except _Blocked as exc:
                     error = error or str(exc)
             raise _Blocked(error or "cannot be lowered")
         elif op == "!":
-            need_expr(node[1], 2 - level, plan, set())
+            need_expr(node[1], 2 - level, plan, seen)
         else:
             raise _Blocked(f"{ev.leaf_str(node[1])} {op} {ev.leaf_str(node[2])} cannot be changed automatically")
 
@@ -1116,7 +1119,22 @@ def solve(ev: KconfigEvaluator, target: str, want: int = 2, max_steps: int = 60)
             if is_tri:
                 need_sym(target, want, plan, set())
             else:
-                need_expr(max(ev.syms[target]["prompts"], default=-1), 2, plan, set())
+                prompts = ev.syms[target].get("prompts", [])
+                if not prompts:
+                    raise _Blocked(f"{target} has no visible prompt")
+                errors: list[str] = []
+                satisfied = False
+                for pvis in prompts:
+                    attempt: list[tuple[str, str]] = []
+                    try:
+                        need_expr(pvis, 2, attempt, set())
+                        plan.extend(attempt)
+                        satisfied = True
+                        break
+                    except _Blocked as exc:
+                        errors.append(str(exc))
+                if not satisfied:
+                    raise _Blocked(errors[0] if errors else f"{target} has no satisfiable prompt")
         except _Blocked as exc:
             blocked.append(str(exc))
             break

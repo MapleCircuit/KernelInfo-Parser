@@ -1,0 +1,2395 @@
+# WebApp Frontend Client Architecture & Module Specifications (`webapp/API_FRONTEND.md`)
+
+Authoritative specification for Section 5 (`§5.0`–`§5.37`) of the WebApp subsystem. For core architecture, security, caching, sync, and configuration (`§1`–`§3`, `§6`–`§8`), see `webapp/API.md`. For REST API endpoints (`§4.1`–`§4.12`), see `webapp/API_ENDPOINTS.md`.
+
+---
+
+## Table of Contents
+- 5. Frontend Client Architecture & Module Specifications
+  - 5.0. Interaction Invariant: No Unrequested Change Without Confirmation [L54-L143]
+  - 5.1. `ApiClient` (`webapp/frontend/js/api.js`) [L144-L225]
+  - 5.2. `AstOverlay` (`webapp/frontend/js/views/code_view/ast_overlay.js`) [L226-L279]
+  - 5.3. `NodeRenderer` & Drag Controller (`webapp/frontend/js/views/nodemap/`) [L280-L292]
+  - 5.4. `FidelityClipboard` (`webapp/frontend/js/views/code_view/fidelity_clipboard.js`) [L293-L297]
+  - 5.5. `LocalDatabase` & Storage Settings (`webapp/frontend/js/db.js`, `webapp/frontend/js/app.js`) [L298-L406]
+  - 5.6. Context Menu & Cross-References Modal (`webapp/frontend/js/components/context_menu.js`) [L407-L479]
+  - 5.7. `IncludeSymbolsPopover` (`webapp/frontend/js/components/include_symbols_popover.js`) [L480-L494]
+  - 5.8. `KconfigView` & `KconfigEngine` (`webapp/frontend/js/views/kconfig/`) [L495-L692]
+  - 5.9. Universal Middle-Click Tab & Navigation Capture [L693-L733]
+  - 5.10. Developer Profiles & Kconfig Compiled Source Navigation [L734-L776]
+  - 5.11. Compare View: Files & Kconfig Between Any Two Revisions (`diff_view.js`) [L777-L850]
+  - 5.12. Git Commits Timeline & Bi-Directional Pagination (`commits_view.js`) [L851-L949]
+  - 5.13. Header Navigation, Version Selector, Apply & Responsive Controls [L950-L1071]
+  - 5.14. Documentation Viewer (`webapp/frontend/js/views/docs/`) [L1072-L1184]
+  - 5.15. Command Palette (`webapp/frontend/js/components/command_palette.js`) [L1185-L1213]
+  - 5.16. `#ifdef` Dimming (`directive_evaluator.js`) [L1214-L1280]
+  - 5.17. Treemap, Symbol History & Patch Staging [L1281-L1334]
+  - 5.18. Projects (Multiple Repositories) [L1335-L1350]
+  - 5.19. Definition Context & Picker (`definition_picker.js`) [L1351-L1374]
+  - 5.20. Repository Explorer Tab (`explorer_view.js`) [L1375-L1396]
+  - 5.21. Code View Toolbar, Saved Position & Minimap (`virtual_editor.js`) [L1397-L1553]
+  - 5.22. Mailing List & LKML Discussions Tab (`mail_view.js`) [L1554-L1678]
+  - 5.23. Multi-Window Workspace Sessions & Coordination (`session_manager.js`) [L1679-L1814]
+  - 5.24. Universal Tab Drag-and-Drop, Pane Transfers & Tab Menu (`tabs.js`) [L1815-L1917]
+  - 5.25. Multi-Pane Split Editor Layout & Resizable Dividers (`tabs.js`) [L1918-L1938]
+  - 5.26. Deep Links: URL Hash as Tab Address (`url_sync.js`) [L1939-L2049]
+  - 5.27. Explorer Sidebar Collapse (`app.js`, `layout.css`) [L2050-L2072]
+  - 5.28. Tab Scroll Memory (`scroll_memory.js`) [L2073-L2108]
+  - 5.29. Kernel API Tab (`kernel_api_view.js`) & Sectioned Tabs (`sections/`) [L2109-L2161]
+  - 5.30. Insights Tab (`webapp/frontend/js/views/insights/`) [L2162-L2203]
+  - 5.31. Keyboard Shortcuts (`shortcuts.js`) [L2204-L2256]
+  - 5.32. Change Preview Component (`change_preview.js`, `kconfig_dry_run.js`) [L2257-L2283]
+  - 5.33. Patch Series Tab (`patch_series_view.js`, `series_model.js`) [L2284-L2303]
+  - 5.34. Search Tab: Full-Text Code Search (`search_view.js`) [L2304-L2326]
+  - 5.35. Bookmarks, Notes & Code Tours (`webapp/frontend/js/views/bookmarks/`) [L2327-L2356]
+  - 5.36. Watch List (`webapp/frontend/js/views/watch/`) [L2357-L2379]
+  - 5.37. Parser Status Tab (`status_view.js`, `status_model.js`) [L2380-L2395]
+
+---
+
+## 5. Frontend Client Architecture & Module Specifications
+
+The frontend is a vanilla ES-Module single-page application requiring zero node/npm build steps.
+
+### 5.0. Interaction Invariant: No Unrequested Change Without Confirmation
+**Any action that would change more than what the user directly asked for must be reported and confirmed
+before it is applied.** This holds for every view, and for the configuration state in particular
+(`state.kconfigProfiles`, `state.kconfigEngines`, the KConfig engines): the user's click is a mandate for the
+change they made, never for its side effects. A new interaction that can alter values, options or state the
+user did not name is implemented as *compute the full consequence first (on a throwaway engine or a dry run),
+show it (what changes, from which value to which, and why), apply it only on explicit confirmation, and leave
+everything untouched on Close/Escape*. Confirmation is skipped only when the consequence is empty — nothing
+else changes — and the dialog must then not appear at all. Existing instances of the pattern: lowering a value
+that other options need (§5.8, `previewLowered`), enabling the constraint engine over edited values (§5.8,
+`resolutionDiff`), applying a toolchain profile that resolves values differently (§5.8, `reloadModel`),
+applying a revision to a KConfig tab (§5.13, `requestVersionSwitch`: its values are carried to the target
+revision, resolved against that model, and the configuration saved for the revision it leaves is dropped),
+*Apply kconfig resolution* in **Validate** (§5.8, the change the user asked for, itemized before it is
+applied), importing a session whose configurations differ from yours (§5.23, G07: *Keep mine* by default),
+**Fragments…**, **Hardware…** and **New options** (§5.8: merged fragments, trimmed or added modules, each new
+option answered — every one through the shared change preview, §5.32). New actions use `kconfigDryRun` and
+`showChangePreview` / `previewOrApply` (§5.32) instead of their own dialog. Auto-solve is the documented
+exception: its changes *are* the requested action and are listed afterwards. Undo/redo in a KConfig tab (§5.8,
+`Ctrl+Z`) is not an instance either: it puts back exactly the state the tab had before (or after) the change
+being undone, which is the requested action itself. Toasts report what happened; they never replace a
+confirmation.
+
+```
+webapp/frontend/js/
+├── api.js                 # ApiClient: centralized REST fetch client with offline fallbacks
+├── sync.js                # SyncManager: server change tokens, version stamps, new-build reload
+├── db.js                  # LocalDatabase: IndexedDB offline cache manager
+├── state.js               # StateStore: tabs, selected vs. explored revision, KConfig engines, persistence
+├── url_sync.js            # UrlSync: bi-directional hash router
+├── app.js                 # Application bootstrap orchestrator
+├── components/
+│   ├── tabs.js            # Multi-pane split manager (single, horizontal, vertical); per-tab view instances
+│   ├── context_menu.js    # Context-adaptive menus (CodeView, Explorer, NodeMap, Commits)
+│   ├── command_palette.js # Ctrl+K search (files, symbols, Kconfig, commits) & Ctrl+Shift+P commands
+│   ├── modal.js           # Shared modal dialog (`onClose` callback, e.g. to resolve a confirmation) + download helper
+│   ├── change_preview.js  # The reusable §5.0 confirmation: sections of changes, notes, filter, inspect (§5.32)
+│   ├── patch_modal.js     # In-browser patch staging (edit → git format-patch)
+│   ├── symbol_history_modal.js # Release slider over the history of a definition or Kconfig symbol
+│   ├── symbol_history_render.js # Its pure, escaped fragments (renamed-from note)
+│   ├── file_references.js       # "Referenced by" menu groups of a file (GET /api/fs/references)
+│   ├── ref_picker.js      # Git reference picker popover (release tags + searchable commits)
+│   ├── version_switch.js  # Apply / New Tab: guarded revision switch of the active tab
+│   ├── scroll_memory.js   # Per-tab scroll positions of every scrollable element, kept in the session
+│   └── toast.js           # Ephemeral status toasts (success / error / info / warning); #toast-container is always the topmost layer (z-index 2147483647), above every modal/backdrop
+├── utils/
+│   ├── clipboard.js       # Universal fallback clipboard copier (navigator + execCommand)
+│   ├── debounce.js        # Function debouncer
+│   ├── definition_picker.js # Go to Definition: the definition the active ARCH/configuration compiles
+│   └── icons.js           # Shared inline SVG icons (COLLAPSE_ICON: default icon of every collapse control)
+└── views/
+    ├── code_view/
+    │   ├── virtual_editor.js     # Virtualized line scroller with minimap (one per code tab)
+    │   ├── ast_overlay.js        # Disjoint narrowest-interval AST token mapping & syntax colors
+    │   ├── syntax/               # Modular language syntax grammars & detection registry
+    │   │   ├── registry.js       # Grammar detector (ftype, extension, filename, shebang)
+    │   │   └── languages/        # Declarative language lexers (c, rust, python, shell, perl, asm, etc.)
+    │   ├── fidelity_clipboard.js # 100% copy fidelity raw line buffer extractor
+    │   ├── file_diff.js          # "⇄ Diff": full-file diff rows, side-by-side pairing, file/revision picker
+    │   └── blame_view.js         # Interactive git blame annotations
+    ├── nodemap/
+    │   ├── nodemap_controller.js # Schematic canvas controller (DOM nodes, SVG wires), zoom/pan, export
+    │   ├── node_renderer.js      # Real-time dragging DOM renderer
+    │   ├── edge_router.js        # Cubic bezier spline router
+    │   └── node_model.js         # Node and wire data structures
+    ├── kconfig/
+    │   ├── kconfig_view.js       # Web menuconfig tree, symbol inspector, per-ARCH configurations
+    │   ├── kconfig_engine.js     # scripts/kconfig port: values, legal edits, .config/defconfig I/O
+    │   ├── kconfig_parser.js     # .config reader & raw (engine-off) writer
+    │   ├── menuconfig_tui.js     # mconf-style terminal menuconfig
+    │   ├── kconfig_history.js    # Undo/redo of a KConfig tab's configuration (diffs between states)
+    │   ├── kconfig_dry_run.js    # Throwaway-engine dry run of an action: changes, refused requests, unknown symbols (§5.32)
+    │   ├── kconfig_fragments.js  # merge_config.sh overlay of configuration fragments (K2)
+    │   ├── hw_input.js           # lsmod / lspci -k parsing; localmodconfig trim, ensure, localyesconfig (K1)
+    │   ├── kconfig_workflows.js  # Fragments…, Hardware… and New options dialogs/stepper of the KConfig tab
+    │   ├── directive_evaluator.js# #ifdef conditional code dimming (+ ARCH compiler macros)
+    │   └── build_condition.js    # Kbuild build-condition evaluation & explanation
+    ├── explorer/explorer_view.js  # Full-tab repository explorer (tab type `explorer`)
+    ├── maintainers/maintainers_view.js
+    ├── commits/commits_view.js
+    ├── diff/diff_view.js         # Compare view: files & Kconfig between any two tags/commits
+    ├── treemap/treemap_view.js   # Squarified source treemap (bytes / files)
+    └── docs/
+        ├── tmpl_renderer.js      # DocBook XML template (.tmpl) → escaped HTML renderer
+        ├── md_renderer.js        # GitHub Flavored Markdown (GFM) renderer (alerts, tables, task lists, code blocks)
+        ├── html_renderer.js      # HTML (.html, .htm, .xhtml, .shtml) → sanitized, beautified HTML renderer
+        ├── rst_renderer.js       # reStructuredText / legacy plain-text → escaped HTML renderer
+        └── doc_page.js           # kernel.org-style documentation page (sidebar, TOC, quick search)
+```
+
+### 5.1. `ApiClient` (`webapp/frontend/js/api.js`)
+Handles unified HTTP communication, response caching, offline fallback, and network activity tracking:
+- **Global Loading Indicator & Anti-Flicker Lifecycle**:
+  - Replaces legacy static status bar with a sleek, floating circular loading spinner in the bottom-right
+    viewport (`#global-loading-spinner`).
+  - Automatically tracks in-flight `fetch` requests via `this.activeRequests`.
+  - Employs a 150ms anti-flicker debounce timer so sub-150ms and IndexedDB cache hits never flash the UI.
+  - When network fetch duration exceeds 150ms, fades in the glowing spinning indicator; smoothly fades out
+    when all requests finish.
+- **Server reachability (`isOnline`, `serverUp`, `isConnected`)**: `navigator.onLine` only reports the
+  browser's link state and stays `true` while the backend is down, so the client tracks the backend
+  separately. `serverUp` is set from every exchange: any HTTP status proves the server answered (a `500` still
+  counts), while a transport failure, the request timeout (10 s, raised per request with `timeoutMs` for the
+  few endpoints that compute — `getBranchTags()` asks for 180 s, commit endpoints ask for 45 s), or a reply
+  carrying `X-KIP-Offline` (served from the Service Worker cache, §2.11) means it did not. `getSync()` marks
+  the same way. A change dispatches `app:server-status` (`{up}`) on `document`; `isConnected` is `isOnline &&
+  serverUp` (`isOnline` follows the browser's `online`/`offline` events); the settings panel's connection
+  status reads `isConnected` and `isOnline`.
+- **Heartbeat (`startHeartbeat()`, `stopHeartbeat()`, `pingServer()`)**: `pingServer()` requests `GET
+  /api/sync` (cheap, server-cached, never intercepted by the worker) with a 5 s timeout, records reachability
+  without throwing or touching the loading spinner, and dispatches the sync payload to
+  `syncManager.onSyncData` so that the periodic check updates everything (frontend build, database instance,
+  parsed versions, Git refs). The heartbeat polls every **60 s** while the server answers and every **5 s**
+  while it does not, skips hidden tabs, and re-paces itself on each state change. A probe also runs when the
+  tab becomes visible and on the browser's `online` event. `app.js` starts it from `setupNetworkStatus()`.
+- `getProjects(options)`, `getBranches(options)`: Read from IndexedDB cache first; fetched from network only
+  on cache miss or when sync confirms changes (`{ networkFirst: true }`: branches with the version catalog on
+  a `parsed`/`git` change, projects on a `projects` change or a manual check).
+- `getVersions(includeRc, options)`: The version catalog (`{total, versions, g}`, entries `{vname,
+  commit_hash` (12 hex)`, is_prerelease, ref_type, indexed, stamp}`), read from IndexedDB (`{g, r}` under
+  `app_versions_c1_<rc|rel>`) without a network request until `sync` confirms a change; `{ networkFirst: true
+  }` when refreshed by sync. The network request asks for the compact form (`/api/versions?compact=1`) with
+  `If-None-Match: W/"c1-<g>"` of the catalog it holds and applies the `304`, delta or full answer
+  (`utils/version_catalog.js`: `catalogFromBody`, `versionsFromCatalog`, §2.13); a delta of another base is
+  answered by refetching the full catalog, a failure or an offline reply keeps the catalog held. Concurrent
+  calls of the same kind share one request; the decoded answer is kept in memory per repository and
+  generation.
+- `_fetchJson(url, options, timeoutMs)`: The fetch shared by `request()` and `getVersions()`: timeout, loading
+  indicator, `X-KI-Repo`, reachability and `X-KIP-Sync` handling; resolves to `{response, data}` (`data` null
+  for a `304`), rejects on transport failure, timeout or an HTTP error status.
+- `getVersionsCached(includeRc)`: That in-memory catalog — refreshed by every `getVersions()` call (startup,
+  each sync refresh, §2.11) — fetched only when this page has none yet. Used where a lookup must not wait on
+  `/api/versions`: the **⇄ Diff** picker's default revision (`previousTag`), the ref picker's tag list (§5.13)
+  and the Compare view's default base.
+- `getSync({fresh})`: Server change tokens (`GET /api/sync`, never cached; `fresh` adds `?fresh=true`);
+  `onSyncHeader` receives the `X-KIP-Sync` header of every response; `onSyncData` receives the full JSON
+  snapshot; `versionStamps` / `_vk(version)` stamp version-scoped cache keys (§2.11).
+- `getDirectoryTree(version, path)`: Direct children of a directory.
+- `getFileContent(version, path)`: Retrieves raw text and AST tokens.
+- `getTreemap(version, maxDepth, path)`: Retrieves hierarchical squarified codebase treemap.
+- `getCompileCommandsDownloadUrl(version, arch)`: URL of the `compile_commands.json` download (`GET
+  /api/fs/compile_commands/{v}/export`).
+- `resolveInclude(version, header, astId, currentFile, arch)`: Resolves `#include` directive targets for
+  `arch` (default `state.definitionContext().arch`, part of the cache key).
+- `getIncludeSymbols(version, astId, options)`: Fetches imported symbols for an include, supporting fallback
+  lookup options (`filePath`, `line`, `header`, `tagId`).
+- `getSymbolDetail(version, name, arch, fromFile)` / `getSymbolXref(version, name, limit, arch)`: Symbol
+  inspection; `arch` defaults to `state.definitionContext().arch` and is part of the cache key, as is
+  `fromFile` (the file the symbol is used in, §2.7 item 4).
+- `getBuildConditions(version, paths, arch)`: Kbuild build conditions of files (`GET /api/kconfig/{v}/build`).
+- `searchSymbols(version, query, limit)`: Symbol definitions by prefix (Ctrl+K palette).
+- `getSymbolHistory(version, path, line, astId, { name, includeRc, branch })`: Release-by-release history of a
+  definition on one branch (sends the definition ARCH; long timeout, since the first history of a branch walks
+  its tags).
+- `getKconfigHistory(version, name, { includeRc, branch })`: Release-by-release history of a Kconfig symbol on
+  one branch, with property-level changes.
+- `getHistoryCommits({ path, to, from, lineS, lineE })`: Commits behind one history change (`git log -L`).
+- `getKconfigGraph(version, arch, symbol, toolchain)`: Direct relations (edges) of one Kconfig symbol.
+- `getKconfigDiff(versionA, versionB)`: Cross-release KConfig symbol definition and default differences.
+- `formatPatch(version, payload)`: Generates RFC-2822 standard git format patch from content edits.
+- `getMaintainersOverview(version, query)` / `getMaintainerSection(version, secId)`: Subsystems.
+- `getDevelopers(version, options)`: Full kernel persona directory with role filtering and activity/alpha
+  sorting.
+- `getPersonProfile(version, idOrEmail)`: Developer profiles.
+- `getCallgraph(version, functionName)`: Callers and callees (60 s timeout: the callers of a widely used
+  function take seconds, §4.7).
+- `searchMailingList(query, { page, limit, filterType })`: Mailing list search, always network-first (the
+  archive grows while it is fetched); only the browse listing (empty query) is kept in IndexedDB for offline
+  use, never the queries typed in the palette.
+- `_sanitizeVer(v)`: falls back to `v3.0` for an empty value or a stringified object (`"[object …"`) only; any
+  other name, a branch containing "object" included, is sent as is.
+
+### 5.2. `AstOverlay` (`webapp/frontend/js/views/code_view/ast_overlay.js`)
+- **Syntax colors** come from theme tokens (`--syn-keyword`, `--syn-type`, `--syn-string`, `--syn-comment`,
+  `--syn-preproc`, `--syn-function`, `--syn-variable`, `--syn-attribute`, `--syn-struct`, `--syn-macro`, …;
+  §5.5), never literals, so every theme recolors the code view, the documentation's highlighted code and the
+  AST overlay.
+Implements two-layer hybrid highlighting with map prioritization, multi-language grammar dispatch, and
+client-side fallback:
+1. **Multi-Language Detection & Grammar Dispatch (`setFileInfo`, `syntax/registry.js`)**:
+   - Dispatches language grammars from `webapp/frontend/js/views/code_view/syntax/registry.js` using a 4-tier
+     detection cascade:
+     1. Database `ftype` identifiers (`ftype === 1` for C, `2` for Kconfig, `3` for Rust, `4` for Assembly).
+     2. Exact filename matching (e.g. `Makefile`, `Kbuild`, `Kconfig`).
+     3. Canonical file extension mapping (`.rs`, `.py`, `.sh`/`.bash`, `.pl`/`.pm`, `.S`/`.s`, `.mk`,
+        `.dts`/`.dtsi`, `.yaml`/`.yml`, `.c`/`.h`/`.i`).
+     4. First-line shebang inspection (`#!/bin/sh`, `#!/usr/bin/env python`, `#!/usr/bin/perl`) for
+        extensionless kernel scripts.
+   - Modular grammar definitions (`webapp/frontend/js/views/code_view/syntax/languages/`) encapsulate
+     keywords, standard/kernel types, comments, string delimiters, and directive rules for each language.
+2. **Dedicated Token Classes & Visual Fidelity (`codeview.css`)**:
+   - Reuses core styling tokens (`.tok-keyword`, `.tok-type`, `.tok-string`, `.tok-number`, `.tok-comment`,
+     `.tok-preproc`, `.tok-macro`, `.tok-include`, `.tok-punct`, `.tok-function`, `.tok-identifier`).
+   - Introduces dedicated language styling classes:
+     - `.tok-variable` (`#ffa657`): Shell and Perl variables (`$VAR`, `${VAR}`, `$@`, `%hash`, `@arr`),
+       Makefile expansions (`$(CC)`, `$<`), and Assembly registers (`%rax`).
+     - `.tok-attribute` (`#7ee787`): Rust outer/inner attributes (`#[inline]`, `#![no_std]`) and Python
+       decorators (`@classmethod`).
+     - `.tok-lifetime` (`#ffa657` italic): Rust lifetime parameters (`'a`, `'static`).
+3. **Map Prioritization & Narrowest-Interval Disjoint Token Mapping**:
+   - Sorts spatial map tokens by width descending (`(char_e - char_s)`).
+   - Assigns character intervals to an array `charToken[i]`, ensuring narrow inner tokens (declarators, symbol
+     references, variables) overwrite and take precedence over enclosing multi-line scopes without shadowing.
+   - When specific AST tokens exist for a line, prioritizes map information (`renderWithAstTokens`).
+   - Maps Rust AST node types (ASTT values 123–143) to corresponding CSS classes (`Rust_Struct`, `Rust_Enum`,
+     `Rust_Union`, `Rust_Trait` -> `tok-type ast-struct`; `Rust_Fn` -> `tok-function ast-func`;
+     `Rust_MacroDef`, `Rust_MacroCall` -> `tok-macro ast-macro`; `Rust_Attribute` -> `tok-attribute
+     ast-attribute`; comments -> `tok-comment`).
+   - Filters broad multi-line container envelopes across C and Rust (C containers 1, 21, 69–72; Rust
+     `Rust_Impl` 132, `Rust_Mod` 136, `Rust_ForeignMod` 140) to prevent enclosing blocks from suppressing
+     line-level tokenization.
+4. **Client-Side Lexical Fallback & Multi-Line Interval Scanning (`indexMultiLineSpans`, `renderLexical`)**:
+   - On lines without server AST tokens or unparsed files, falls back to the client-side language lexer.
+   - Lightweight $O(N)$ single-pass scan (`indexMultiLineSpans`) on file load indexes multi-line block
+     comments (`/* ... */`) and Python triple-quoted docstrings (`"""..."""` / `'''...'''`), ensuring correct
+     styling across virtual scrolling jumps without line-prefix heuristics.
+   - Identifiers, types, and function calls across all supported languages receive interactive `.ast-token`
+     badges with `data-name="..."`, enabling full right-click context menu capabilities (Go to Definition,
+     Find References, Symbol Palette search).
+5. **Include Directive Tokenization (`renderIncludeLine`)**:
+   - Reliably isolates `#include ` directives across C, Assembly, and DeviceTree source files.
+   - Renders `#include ` as non-clickable `<span class="tok-preproc">` and the header target (`<linux/...>` or
+     `"header.h"`) as `<span class="tok-include ast-token ast-include">`.
+   - Binds server AST ID and type (`data-type-id="78"`) when mapped, while preserving interactive click
+     resolution for all unmapped includes.
+
+### 5.3. `NodeRenderer` & Drag Controller (`webapp/frontend/js/views/nodemap/`)
+- Canvas pan and zoom via CSS transforms of the node layer; wires are SVG paths (`edge_router.js`).
+- `attachDrag()`: Updates `nodeEl.style.left` and `nodeEl.style.top` in real time during `mousemove` scaled by
+  canvas zoom:
+   ```javascript
+   const zoom = this.callbacks.getZoom() || 1.0;
+   node.x = initialNodeX + (moveEvent.clientX - startX) / zoom;
+   node.y = initialNodeY + (moveEvent.clientY - startY) / zoom;
+   nodeEl.style.left = `${node.x}px`;
+   nodeEl.style.top = `${node.y}px`;
+   ```
+- Rerenders cubic bezier SVG wires smoothly without lag.
+
+### 5.4. `FidelityClipboard` (`webapp/frontend/js/views/code_view/fidelity_clipboard.js`)
+- Intercepts clipboard copy (`Ctrl+C` / `Cmd+C` / right-click copy).
+- Slices lines from the clean raw source code array (`rawLines`), ensuring 100% copy fidelity without line
+  numbers, gutter metadata, or HTML formatting artifacts.
+
+### 5.5. `LocalDatabase` & Storage Settings (`webapp/frontend/js/db.js`, `webapp/frontend/js/app.js`)
+- **Theme** (settings popover, G08, `utils/theme.js`): *Auto (follow the system)*, *Dark* (default), *Light*,
+  *High-contrast dark*, *High-contrast light*, stored in `localStorage` `kip-theme` and applied at once
+  without a reload (`applyTheme` sets `data-theme` on `<html>`; `kip:theme-changed` notifies canvas and export
+  code). `css/variables.css` holds every color as a token — surfaces, text, borders, accents, syntax
+  (`--syn-*`), diffs (`--diff-*-fg`), charts (`--chart-1`…`16`, the blame author and treemap palettes) — and
+  one block per theme redefines them (`:root[data-theme="light"|"hc-dark"|"hc-light"]`, `auto` through
+  `prefers-color-scheme`). No other stylesheet or script holds a literal color: JavaScript uses `var(--…)` in
+  markup and `token()` / `resolveColor()` for canvas drawing and exported SVG files. Exceptions: the
+  menuconfig TUI keeps mconf's blue/grey look (a `theme-fixed` region of `kconfig.css`) and figures keep a
+  light backing (`--figure-bg`). `tests/test_webapp_theme_contrast.py` checks WCAG contrast on the code
+  background in every theme — text and every syntax and diff color ≥ 4.5:1 (≥ 7:1 in the high-contrast
+  themes), muted text ≥ 3:1 (4.5:1) — and that no literal color is left.
+- **Hover cards** (settings popover, G04): on/off (`localStorage` `kip-hover-cards`) and the delay, 300–1,000
+  ms (`kip-hover-delay`, default 450); both apply at the next pointer move (§5.6).
+- **User data** (S06, IndexedDB v6 store `user`, `utils/user_records.js`): what the user makes — bookmarks,
+  notes, tours, watches (`kind` `bookmark` | `note` | `tour` | `watch` | `watch-state`), records `{key:
+  "<repo>::<kind>::<id>", kind, repo, id, created_at, updated_at, data}` indexed by `kind`, `repo` and
+  `updated_at`. It is not a data store: age pruning, sync-token purges, **Clear All Offline Cache** and the
+  per-store chips never touch it. API: `localDB.userPut`, `userGet`, `userList(kind, repo)`, `userDelete`,
+  `userClear`; every write announces `user:changed {kind, key}` to this window (`kip:user-changed` DOM event)
+  and the others (`BroadcastChannel("kip_multi_tab")`), and `localDB.onUserChanged(cb)` listens to both, so
+  panels follow edits made in another window without a reload. The settings popover shows a *User data* count,
+  **Clear User Data** (asks first), **⬇ Export User Data** (`{format: "kip-user", version: 1, exported_at,
+  records}`) and **⬆ Import User Data…** (records already present are kept; `mergeImport` also supports
+  `overwrite` and `copy` with new ids). **Full Local Reset** names how many user records it deletes and
+  suggests exporting first.
+- **Offline Cache Stores**: Persistent IndexedDB (`KernelInfoIDE_v2`, v6) caching `meta`, `files`, `symbols`,
+  `kconfigs`, `maintainers`, `commits`, `tools`, `mail`, `tabs_state`, and `nodemap_projects`. Each data store
+  has an `updated_at` index (v5): once a day, when the page opens, `syncManager.pruneOldEntries()` drops the
+  entries written more than 30 days ago (`localDB.pruneOlderThan`, a key-only index scan), which is what
+  bounds the offline cache. A change of `CACHE_LAYOUT` (`sync.js`, now 3: several response shapes changed)
+  clears the data stores once.
+- **Settings popover entries** beyond storage: **⛏ Parser** — one line of ingestion status filled from `GET
+  /api/system/ingest` when the server answers (`312 parsed · 1 parsing (v3.2-rc4, 2 min ago) · DB 41.3 GB`,
+  `statusLine()`), opening the status tab (§5.37); **⌨ Keyboard Shortcuts** (the overlay, §5.31.1); **🔄 Check
+  for Updates** (§2.11); and, under Typography, *Sticky scroll* (§5.21).
+- **Upgrades with other windows open**: an open connection closes itself on `versionchange`, so a newer page's
+  upgrade is not blocked by an older window; a page whose open is still blocked after 3 s
+  (`BLOCKED_OPEN_TIMEOUT_MS`) runs uncached instead of waiting (every cached `api.request()` would otherwise
+  wait on `localDB.ready` forever).
+- **Server Synchronization (`syncManager`, `js/sync.js`, §2.11)**: on bootstrap, tab open, session restore,
+  periodic 60 s heartbeat, and on every `X-KIP-Sync` header, the server state is synchronized: a changed `db`
+  token purges all data caches (`files`, `symbols`, `kconfigs`, `maintainers`, `commits`, `tools`) and stores
+  the token in `meta/db_instance_hash`; changed `parsed`/`git` tokens refresh the version stamps
+  (`meta/version_stamps`) and drop cached entries of changed versions; a changed `projects` token refetches
+  the repository list and re-renders the selectors; a changed `frontend` token announces the new build
+  immediately.
+- **Keys of the `files` store** include `fref_<version stamp>_<path>` (`api.getFileReferences`, §4.2), next to
+  `outline_…`, `doclabels_…` and `tree3_…`.
+- **Cache-First Client Policy**:
+  - All static analysis and versioned data requests query IndexedDB first.
+  - If a cached record exists, it is served immediately without making network calls, ensuring instantaneous
+    loading for heavy structures (such as Kconfig hierarchy trees and source file buffers).
+  - Dynamic keyword searches bypass the cache and query the REST API directly.
+- **Storage Management API**:
+  - `localDB.clearStore(storeName)`: Clears records for a single object store.
+  - `localDB.clearDataStores()`: Clears all domain data stores while preserving workspace session tabs and
+    nodemap diagrams.
+  - `localDB.deleteDataWhere(predicate)`: Deletes the data-store entries whose key matches (one key-cursor
+    scan per store); returns the count.
+  - `localDB.clearAllStores()`: Concurrently clears all configured object stores.
+  - `localDB.getStorageEstimate()`: Queries `navigator.storage.estimate()` returning `{ usage, quota }`.
+  - `localDB.getStoreCounts()`: Returns a dictionary `{ [storeName]: count }` of stored record counts.
+- **Connection Badge (`#offline-badge`, `app.setupNetworkStatus()`)**: three states, driven by the browser
+  link state **and** by whether the backend actually answers (`api.serverUp`, §5.1), refreshed on
+  `online`/`offline` and on `app:server-status`:
+  | State | Badge | Class | Meaning |
+  |---|---|---|---|
+  | Connected | `● Online` | `.offline-badge` | Link up and the server answered |
+  | Backend down | `● Server Unreachable` | `.offline-badge.unreachable` (amber) | Link up, but requests and the heartbeat get no reply; cached data is shown |
+  | Link down | `● Offline (Cached)` | `.offline-badge.offline` (red) | `navigator.onLine` is false |
+  Each transition toasts once (a warning when the server drops, a success when it comes back); re-renders of
+  the same state are silent, and an open settings popover is rebuilt so it reports the same state.
+- **Revamped Settings Popover (`#offline-badge`)**:
+  - Clicking the top-right connection badge opens an anchored settings popover dropdown.
+  - **Database & Network**: Real-time connection status (the badge's three states: *Online (Connected)* /
+    *Server Unreachable* / *Offline (Cached)*) alongside the verified DB Instance Hash badge with
+    synchronization indicator (`● Synced`).
+  - **🔄 Check for Updates** (`app.checkForUpdates()`, disabled unless connected — the button reads *Offline*
+    or *Unreachable*): runs `syncManager.checkNow()` (§2.11), the 60 s sync run at once, and shows *Checking…
+    / Up to date / Restarting… / Failed* on the button. When an update was found the page restarts right away
+    (`syncManager.restart()`, into the new build when there is one) and the restarted page toasts what it was
+    (*Updates applied:* new frontend build, database rebuilt, versions re-parsed or moved, new or removed
+    versions/branches, repository list updated); otherwise a toast says everything is up to date.
+  - **Typography & Font Sizes**:
+    - **Code View Font Size**: Slider in pixels (10px to 26px, default 12px) dynamically setting
+      `--code-font-size` and computing proportional row height `--code-row-height = Math.max(16,
+      Math.round(fontSize * 1.667))` in `virtual_editor.js`, diffs, and code views.
+    - **UI Scale**: Relative percentage slider (80% to 160%, default 100%) dynamically adjusting typography
+      scale `--ui-font-scale` alongside a 50% damped layout scale `--ui-layout-scale = 1 + (fontScale - 1) *
+      0.5`. This smoothly scales font sizes (`8px` through `24px`) while expanding layout geometry (headers,
+      tabstrip, activity bar, control heights, column widths, row heights, and badges) proportionally so
+      elements fit naturally without clipping or overflowing.
+    - **Reset to Defaults**: Restores 12px code view and 100% UI scale reliably across multiple uses.
+    - **Persistence**: Saved in `localStorage` (`kip-code-font-size`, `kip-ui-font-scale`) and restored
+      automatically on application initialization.
+  - **Cached Data Stores Breakdown**: 6-card metric grid showing counts for Files, Symbols, Kconfig,
+    Maintainers, Commits, and Tools, plus total entries and disk footprint in MB.
+  - **Granular Per-Store Clear Chips**: Fast one-click buttons to flush individual stores (`Clear Kconfig`,
+    `Clear Files`, `Clear Symbols`, etc.).
+  - **Storage Actions**:
+    1. **Clear All Offline Cache**: Flushes all domain data stores (`files`, `symbols`, `kconfigs`,
+       `maintainers`, `commits`, `tools`).
+    2. **Reset Tabs & Workspace State**: Clears saved tab state from `localStorage` and `tabs_state`,
+       resetting the active workspace session.
+    3. **Full Local Reset & Reload**: Prompts confirmation, wipes IndexedDB, purges `localStorage`, clears
+       Service Worker/browser caches (`window.caches`), and reloads the application.
+
+### 5.6. Context Menu & Cross-References Modal (`webapp/frontend/js/components/context_menu.js`)
+- **Dual Mouse Navigation**: Left-click on AST tokens triggers quick inspector popup; right-click opens the
+  contextual action menu (Go to Definition, Find References, Copy Symbol, Expand AST, NodeMap).
+- **Explorer file menu**: *Open File*, *Copy Relative Path*, *Copy Filename*, *Create Patch…*, *View File Git
+  History*, **Referenced by…** (the code toolbar's ⇇ Refs menu, §5.21, at the explorer's revision).
+- **Bookmarks** (G05, §5.35): *Bookmark this line*, *Bookmark symbol X*, *Add this line to a tour…*;
+  **watches** (G10, §5.36): *Watch this file*, *Watch symbol X*.
+- **Ops implementations** (N1, `views/code_view/ops_modal.js`): every identifier's menu has *Ops
+  implementations / tables using this* (*Ops implementations of struct X* on `*_operations` / `*_ops` names).
+  The dialog takes a struct (guessed from the enclosing `struct S name = {` initializer, else
+  `file_operations`; common ops structs suggested) and a field, or a function: a struct name lists its fields
+  with counts, a `.field =` token its implementations, any other token the ops tables that use it (`GET
+  /api/tools/{v}/implementations`, §4.7). Results are grouped by file; each row opens the implementation's
+  definition, the entry line or the table; middle-click or Ctrl+click opens a new tab and keeps the dialog
+  (§5.9). The Callgraph tab has **🧩 Indirect callers (ops tables)**, the same dialog on its function, and **⇢
+  Find path to…** (N2): a target function (symbol suggestions), depth, functions to skip and *through ops
+  tables* (indirect edges); the shortest chains (`GET /api/tools/{v}/callpath`, §4.7) show as rows of hops,
+  each hop opening its call graph and its call site (`file:line`) opening the code; a static function or macro
+  shows its file, and a hop through an ops table a dashed arrow with its `struct.field`. The first search of a
+  revision shows the source index being assembled (§2.19); the target is kept in the URL (`to`), so a link
+  re-runs the search.
+- **Hover cards** (G04, `views/code_view/hover_card.js`, timing in `hover_model.js`): resting the pointer on a
+  symbol token (not comments, includes or preprocessor structure) for the configured delay (450 ms by default;
+  moving restarts it) shows a card — kind, signature, kernel-doc summary and parameters, the definition's
+  location and how many others exist — from `GET /symbols/{v}/hover/{name}` with the followed engine's ARCH
+  and this file; a `CONFIG_` token shows the prompt, type, the followed engine's value (or the baseline's),
+  what it depends on and selects, and the help's first paragraph. Actions: *Go to definition*
+  (`openDefinition`), *References* (the XRef modal), *History*. The card hides when the pointer leaves (150 ms
+  grace to move into it), on Escape, scroll, click or right-click, and never shows while a menu, the
+  inspector, a dialog or a text selection is open, or while a mouse button is held, so click and right-click
+  behave as before. One request at a time (aborted when the pointer leaves; at most one every 300 ms), cached
+  in memory; nothing is fetched while the server is unreachable.
+- **Go to Definition** (menu items, middle-click default action, documentation `func()` links) goes through
+  `openDefinition()` (`utils/definition_picker.js`, §5.19), so per-architecture symbols open the definition of
+  the active ARCH/configuration. *Open in Kconfig Viewer* (and the Kconfig links of the docs and compare
+  views) open the KConfig tab on the active profile's ARCH (`state.kconfigArch()`, `x86_64` by default).
+- **Context-Adaptive Kconfig Navigation**:
+  - Automatically identifies Kconfig tokens across both C files and Kconfig files (via spatial AST types
+    `88..118` from `m_map_ast`, `CONFIG_*` prefix matching, or Kconfig file category `ftype === 2`).
+  - Replaces "Go to Definition" and "Find References / XRef" with **"Open in Kconfig Viewer"** (`⚙️`),
+    preventing meaningless symbol lookups on configuration symbols.
+  - Clicking "Open in Kconfig Viewer" strips any `CONFIG_` prefix, opens/focuses the Kconfig explorer tab,
+    highlights the matching symbol row, and immediately loads dependency constraints and auto-solve options in
+    the inspector.
+- **Clean Cross-References (XRef) Modal**:
+  - Distinct top **"Definition"** card displaying primary definition file path, line numbers, and readable AST
+    type badge (`FunctionDecl`, `StructDecl`, `EnumConstant`, `CPPro_define_macro`), with direct 1-click
+    jump-to-code navigation.
+  - Categorized **"References & Usages"** list showing caller context (enclosing function), file paths in the
+    current revision, line numbers, and readable reference type badges (`Call`, `MemberRef`, `TypeUsage`,
+    `DeclRef`, `MacroExp`).
+  - Purely displays indexed cross-references without non-functional search fallback buttons.
+  - Only definition cards with a path of the current revision are rendered (a definition outside its tree can
+    be neither shown nor jumped to), and `definition_unindexed` replaces the empty-state line with *"Defined
+    in other indexed revisions, but this revision's copy of the file was never parsed — the usages below still
+    apply"* (common on a commit between two ingested releases).
+- **Commit Hash Menu** (`showCommitHashMenu`): right-clicking any commit hash (`.copy-hash`, §5.12) opens
+  **Copy Hash** (the full 40-character SHA, the same action as left-click), **View Commit** and **Set as Work
+  Commit**. *View Commit* calls the `onView(hash)` callback first — a view that already lists commits inspects
+  it in place — and opens a `Commit <short>` tab when that returns false (a parent commit outside the loaded
+  range). *Set as Work Commit* only moves the header selection (`state.setSelectedVersion`, §5.13), so no tab
+  changes revision until **Apply** or **New Tab** is pressed; the item is disabled and reads *Already the Work
+  Commit* when the hash is the current selection.
+- **Tabstrip Tab Menu** (`showTabMenu`, `showTabPushMenu`): right-clicking a tab offers **Open on New Browser
+  Tab** and **Push to Another Session…**, the second opening a list of every other saved session marked `🟢
+  open` (held by another window) or `💤 saved`. The menu only lays the actions out — `TabsComponent` performs
+  them, since it owns tab transfers (§5.24.5).
+- **Include Symbols Inspection**:
+  - Clicking or right-clicking `#include` directives provides an **"Inspect Included Symbols"** (`🔍`) action.
+  - Queries `api.getIncludeSymbols` with client-provided AST ID, file path, line coordinate, and header query
+    fallback.
+  - Displays the floating `IncludeSymbolsPopover` adjacent to the clicked token.
+
+### 5.7. `IncludeSymbolsPopover` (`webapp/frontend/js/components/include_symbols_popover.js`)
+- **Anchored Floating Popover**: Clamped dynamically within viewport bounds adjacent to clicked `#include`
+  lines.
+- **Live Search Filtering**: Client-side interactive search input (`#include-symbols-search`) with real-time
+  text matching, substring highlighting (`<mark>`), and instant symbol filtering.
+- **Category Filter Pills**: Interactive pills with live counts (`All`, `Functions`, `Structs`, `Macros`,
+  `Typedefs`, `Enums`, `Variables`) enabling one-click category filtering.
+- **Category Badges & Definition Coordinates**: Color-coded badges for symbol categories (`Func`, `Struct`,
+  `Macro`, `Typedef`, `Enum`, `Var`), definition file paths, and line numbers (`def_file:line_s`).
+- **Navigation & Queuing**:
+  - Left-click on any symbol row immediately navigates to its definition (`state.openTab`).
+  - Middle-click opens the definition in a new tab without dismissing the popover, allowing rapid multi-tab
+    queuing.
+  - Top-bar **"📄 Open Header"** action button quickly opens the included header file.
+
+### 5.8. `KconfigView` (`webapp/frontend/js/views/kconfig/kconfig_view.js`) & `KconfigEngine` (`webapp/frontend/js/views/kconfig/kconfig_engine.js`)
+- **Engine**: `KconfigEngine` decodes the model of `GET /api/kconfig/{v}/tree` (`decodeModel`) and evaluates
+  it with kconfig's algorithms (twin of `parser/kconfig_ast/kconfig_eval.py`): `value`, `visibility`,
+  `revDep`, `getType` (tristate degrades to bool without `MODULES`), `choiceSelection`, `isChangeable`,
+  `menuVisible` (`menu_is_visible`); legal setters `setTristate` / `setValue` (refuse what kconfig refuses;
+  `refusalReason` explains why), `toggleTarget` (the value `sym_toggle_tristate_value` would set: n -> m -> y
+  -> n within range), `previewLowered(name, text)` (what other options lose if the value is set: bool/tristate
+  options whose value drops and other options no longer written, each with the reason (`depends on …`, `no
+  longer selected: …`, `prompt hidden: …`), members of the same choice excluded, the configuration restored
+  afterwards; `null` when kconfig refuses the value; about 150 ms on a v3.0 x86_64 model); `loadConfig`
+  (conf_read report: unknown, invalid, warnings), `loadAssignments`, `setAllNewSymbols`, `writeConfig` (full
+  `.config`, byte-identical to `conf`), `writeDefconfig` (`make savedefconfig`), `configValues`, `exprStr(id,
+  withValues)`, `orTerms`, `menuPath`.
+- **Engine on/off** (also gates `#ifdef` dimming): on, every edit goes through the engine so only valid
+  configurations exist, and the published values are the resolved `.config` values. Off, values are edited raw
+  (no constraints, export marked unvalidated); turning it back on resolves the raw values through kconfig and
+  reports how many were adjusted. Switching it off keeps every value: the tab's configuration stays in its
+  `version|ARCH` profile and only stops being constrained.
+- **Enabling it over edited values** (`resolutionDiff()`): the engine only holds configurations kconfig
+  accepts, so enabling it loads the tab's values through `conf_read` semantics, which can change values the
+  user never touched (raw edits kconfig refuses, an imported or hand-edited `.config`, symbols a `select`
+  forces or whose prompt is invisible). The resolution is therefore computed first on a throwaway
+  `KconfigEngine` built from the same model (the live engine and the values stay untouched) and shown before
+  anything is applied: a dialog lists every option with its current value, the value kconfig resolves it to
+  and why (*forced by select: …*, *prompt not visible: …*, *limited by dependencies or range*) plus the
+  symbols unknown for the ARCH that would be dropped, and the engine is enabled only with **Enable engine and
+  apply these changes** (Close or Escape leaves the engine off and the values exactly as they are, §5.0). When
+  the resolution changes nothing, no dialog appears and the engine turns on directly. The same diff backs
+  **Validate** and its *Apply kconfig resolution*.
+- **One engine per tab, several at once** (`state.kconfigEngineTabIds` + `state.kconfigEngines`, persisted):
+  the engine is **off by default** (a new KConfig tab opens on **⚡ Enable Engine**) and belongs to the tab
+  that enables it. Each KConfig tab has its own view instance, model and values (`TabsComponent` builds one
+  `KconfigView` per tab and `dispose()`s it when the tab closes), and **any number of tabs may run their
+  engine at the same time**: each one resolves its own configuration and publishes it under its own tab id
+  (`state.kconfigEngines[tabId] = {version, arch, configName, profileKey, assignments}`), so two ARCHes or two
+  revisions can be resolved side by side. Enabling an engine therefore asks nothing of the other tabs — only
+  the resolution of *this* tab's values is confirmed (above, §5.0). `state.setKconfigEngineEnabled(tabId,
+  enabled)` switches one on or off and emits `kconfig:engine:changed` `{tabId, active, engineTabIds}`;
+  `state.disableAllKconfigEngines()` (palette *Disable every KConfig engine*) switches all of them off. A
+  `KconfigView` follows that event only for its own tab. `state.requestKconfigEngine(tabId)` /
+  `takeKconfigEngineRequest(tabId)` (event `kconfig:engine:requested`, not persisted) let the command palette
+  ask a tab — including one in the background, which claims the request when it renders — to enable its engine
+  through that same confirmation instead of switching it on behind the view's back. Closing a tab, switching
+  project or restoring a session whose tab is gone switches that engine off; no configuration is lost in any
+  of these cases (`state.kconfigProfiles` keeps one per `version|ARCH`). `state.kconfigEngineActive` is
+  derived (any engine running **in this window**), `state.isKconfigEngineOwner(tabId)` asks about one tab of
+  this window, `state.hasEngine(tabId)` asks whether that engine runs anywhere (this window or another
+  session, §5.23) and is what decides whether a code tab may follow it (§5.16), and
+  `state.kconfigEngineList()` describes the running engines (tab id, title, revision, ARCH, name, symbol
+  count, whether the configuration is resolved) for the code view's engine selector (§5.16). Only the engine
+  descriptors are persisted: each engine's values are rehydrated from `kconfigProfiles[profileKey]` on load.
+- **Cross-Session Kconfig Engine Broadcasting** (`SessionManager`, `BroadcastChannel("kip_multi_tab")`):
+  running engines are usable across multiple browser tabs and windows. When an engine runs or updates in
+  Session A, it announces its presence (`kconfig:engine:announced`) and broadcasts live assignments
+  (`kconfig:assignments:broadcast`). Windows running Session B or Session C discover remote engines via
+  `kconfig:request_engines`, automatically merging them into `state.kconfigEngineList()`. Code tabs in Session
+  B can follow an engine running in Session A for `#ifdef` dimming, build condition evaluation, and definition
+  ranking without needing to duplicate the Kconfig tab: such an engine is picked and kept exactly like a local
+  one (`state.hasEngine`, §5.16), every edit in Session A's KConfig tab re-dims the code tabs following it in
+  Session B, and it is dropped again when Session A's window or session goes away (§5.23). Saved configuration
+  profiles and toolchain profiles are shared by every session and window: they live once, in
+  `localStorage["kip_shared_kconfig_profiles"]` / `["kip_shared_kconfig_toolchains"]`, and each change writes
+  only its own key (`sessionManager.updateSharedKconfigProfile` / `updateSharedKconfigToolchain` re-read the
+  map first), so a window never erases configurations another window saved since it loaded. Session records do
+  not carry them; a record saved before carries a copy, which `adoptSession()` moves into the shared store for
+  the keys it lacks.
+
+- **Collapsible tree column**: the collapse button beside the ARCH dropdown (`#btn-kconfig-collapse`, the
+  default collapse icon `COLLAPSE_ICON` of the sidebar, §5.27) folds the tree and search column into a 28 px
+  rail on the left (`.kconfig-view-container.list-collapsed`); clicking the rail (`#btn-kconfig-expand`, the
+  mirrored icon and *KConfig*) unfolds it and focuses the search box. The state is kept on the tab
+  (`listCollapsed`) and in the URL (`lc=1`, §5.26).
+- **Deep links**: the tab's ARCH, configuration name, tree filter, inspected symbol and collapsed state are
+  kept in the URL hash (`#tab=kconfig&arch=…&cfg=…&q=…&sym=…&lc=1`, §5.26), so a copied link reopens the same
+  search, the same symbol and layout; switching ARCH drops the symbol, which belonged to the ARCH being left.
+- **Architectures**: the dropdown lists `GET /presets` grouped by source directory (ARCH values such as
+  `x86_64`, `i386`, `x86`, `sparc64`). Each `version|ARCH` keeps its own configuration in
+  `state.kconfigProfiles`; switching restores it, or loads the ARCH's default defconfig
+  (`canonical_defconfig`) the first time.
+- **Several configurations of one ARCH and revision** (`state.kconfigProfiles` keys built by
+  `kconfigProfileKey(version, arch, configName)`): a tab's configuration is saved under `version|ARCH` while
+  it is the only one, and under `version|ARCH|name` once it is named, so copies are independent and can be
+  compared against each other. **⧉ Duplicate** copies the current values (and the toolchain profile) into the
+  first free name — `v2`, `v3`, … (`state.nextKconfigConfigName`, the unnamed one counting as v1) — and opens
+  them in a new tab, unconstrained whoever holds the engine. **✎ `<name>`** renames the configuration (empty =
+  unnamed, `|` is not allowed, a name another tab of the same `version|ARCH` uses is refused): the saved
+  values and toolchain profile move to the new key (`state.moveKconfigProfile`) and the tab strip, status line
+  and URL hash (`cfg=`) follow. A revision or ARCH switch that would land a tab on another tab's configuration
+  gives it the next free name instead (`state.ensureUniqueKconfigConfigName`), so two tabs never share one
+  configuration. The tab title is `KConfig (<arch>)`, plus ` · <name>`. A tab running its engine publishes its
+  configuration under its own tab id (`state.setKconfigAssignments(tabId, profileKey, values, {version, arch,
+  configName})`, bare and `CONFIG_` keys), and the code tabs following that engine dim with it; a tab whose
+  engine is off only saves its values in its profile (`state.saveKconfigProfileValues`), so it never speaks
+  for another tab's engine.
+- **Tree (web menuconfig)**: entries from the finalized model in menuconfig order, with implicit submenus.
+  Only entries menuconfig shows are listed (`menuVisible`); invisible prompted entries are added (dimmed,
+  tooltip with the failing prompt condition) by the TUI's **Z** key, and automatically when an inspected
+  symbol would otherwise be unreachable (`view.showUnmet`; the tab has no *Show All* button). Markers follow
+  mconf: `[*]`/`[ ]` bool, `<*>`/`<M>`/`< >` tristate, `-*-`/`-M-` forced by select, `(X)`/`( )` choice
+  values, `(value)` int/hex/string, `--->` submenus, `*** comment ***`; choices show their selected member.
+  Clicking the marker changes the value (toggle, choice selection, or a prompt for int/hex/string); refused
+  changes show the reason. With the engine on, lowering a value (y → m/n, m → n, from the tree, the
+  inspector's n/m/y buttons or the TUI's Space/Y/M/N) that other options need asks first: a dialog lists each
+  option that would drop with its current and new value and why, and the change is applied only with **Set to
+  … anyway** (Close, Escape or clicking a listed option, which inspects it, cancels). Auto-solve applies its
+  changes without asking. Search filters symbol names and prompts and shows each match's menu location.
+- **Inspector**: value with its origin (explicit, default, forced by select, choice), n/m/y buttons enabled
+  only for legal values (or an input for int/hex/string), evaluated prompt visibility, direct dependencies and
+  "Selected by"/"Implied by" terms with `[=value]` annotations, every definition for the ARCH (file:line
+  buttons opening the code view, prompt, menu location, visibility), defaults with the active one highlighted,
+  ranges, selects/implies, choice group, help text, files built when enabled (other architectures collapsed),
+  directories descended into, **Find usages** (source references grouped by file, Makefile conditions, Kconfig
+  entries referring to it), **Auto-solve** (server solver, changes applied through the engine), and the
+  dependency graph. Symbols not declared for the ARCH list their declarations elsewhere.
+- **Toolchain** (Linux 4.18+; button **Toolchain…** or the toolchain summary in the status line): compiler
+  (GCC/Clang) and version, linker (GNU ld/LLD) and version, assembler, binutils version, `CROSS_COMPILE`, LLVM
+  utilities, pahole/rustc versions, GCC plugin headers, build host `uname -r`; a table of every environment
+  variable Kconfig read with an override field (plus *add any variable*); a filterable table of every
+  toolchain check with its result, source and the options using it, each overridable (auto / force y / force
+  n, or text for command outputs); and `$(error-if)` messages (e.g. compiler below the minimum version).
+  *Apply* stores the profile per `version|ARCH` (`state.kconfigToolchains`) and rebuilds the model with it;
+  *Reset to defaults* clears it. Because another model resolves dependencies, defaults and ranges differently,
+  `reloadModel()` resolves the current values on a throwaway engine first and, when any would change, lists
+  them (option, now, after) and keeps the new model only once confirmed (§5.0) — declining, like a failed
+  rebuild, restores the previous profile and leaves the model and every value untouched. With the engine off
+  no value changes, so only the model is rebuilt. For older revisions the dialog explains that only
+  environment variables matter.
+- **Configurations**: **Load Defconfig** (filterable list, default one tagged), **Import .config** (conf_read
+  in the engine; unknown/invalid entries reported), **Export .config** (`<arch>-<version>.config`, the
+  resolved `.config` to place in the kernel tree), **Validate** (values kconfig would not keep with reasons,
+  unknown symbols, select-with-unmet-dependency warnings, *Apply kconfig resolution*), **Compare…** (beside
+  **⚡ Enable Engine** in the toolbar; `showCompareModal()`: one window with a **Compare with** selector — a
+  defconfig of this ARCH, resolved on a throwaway engine, or any other open KConfig tab — including a named
+  copy of the same ARCH and revision — whose configuration is taken from `state.kconfigProfiles`
+  (`state.kconfigProfileKeyOf(tab)`) exactly as that tab holds it, resolved while its engine is on and raw
+  while it is off. The table lists only the options whose values differ (`Option | Current | <side>`, `—` for
+  an option one side does not write) with the matching/different counts (the first 2000 rows; comparing two
+  architectures differs in thousands of options), and clicking a row inspects that option. A tab on another
+  ARCH or revision is compared all the same, with a note naming the difference; a tab that has never loaded a
+  configuration says so).
+- **Fragments…** (K2, `kconfig_fragments.js`): merges configuration fragments the way `merge_config.sh` does —
+  the revision's in-tree fragments (`GET /fragments`, ticked in order) then a pasted or uploaded one, later
+  ones winning — and resolves the result (olddefconfig: `loadAssignments` + `setAllNewSymbols("default")`) on
+  a throwaway engine. When only the requested values change, they are applied directly (a toast says how
+  many); otherwise the change preview (§5.32) lists *Requested by the fragments* (with the fragment that set
+  each), *Other options that change*, *Not honoured* (requested value, final value and `refusalReason` —
+  merge_config.sh's "Value requested for CONFIG_X not in final .config") and notes for unknown symbols and
+  values a later fragment redefines; with nothing to apply it is a report with Close only. A fragment
+  restating current values shows no dialog. Engine off: the fragments' values are written raw (nothing else
+  changes, no dialog).
+- **Hardware…** (K1, `hw_input.js`; needs the engine — the dialog offers **⚡ Enable Engine**, through its own
+  confirmation): paste `lsmod`, `lspci -k` (`Kernel driver in use` / `Kernel modules`) or module names (`-` =
+  `_`); `POST /kbuild/modules` (§4.4) maps them to their objects and required symbols, names without an object
+  are listed as *Not matched*. **Trim** (`make localmodconfig`): tristate options at `m` that gate a
+  module-capable object and that no listed module requires go to `n`, repeated to a fixed point; an option
+  whose removal would lower a required one, or that a kept option selects, is *Kept* with the reason.
+  **Ensure**: for the listed modules whose condition is `n`, auto-solve (`POST /autosolve`, `value` m, or y
+  for bool) raises each required option, its toggles applied in order; options it cannot reach are *Blocked*
+  (at most 200 modules). **Built-in** (`localyesconfig`): the required tristate options at `m` go to `y`, to a
+  fixed point. Every operation runs on a throwaway engine and is shown in the change preview (*Disabled* /
+  *Enabled* / *Built in*, *Other options that change as a consequence*, *Kept*, *Blocked*); **Apply** commits
+  it as one undo step, Close changes nothing, and a configuration that already matches only gets a toast. v3.0
+  x86_64 defconfig + `kvm_intel` → *Ensure*: `KVM`, `KVM_INTEL` → m plus 8 selected options.
+- **New options** (K3, `KconfigEngine.newSymbols()`: `conf --listnewconfig` — inside visible menus, changeable
+  options without a user value, one entry per unanswered choice): after a revision is applied to a tab running
+  its engine (§5.13), a banner above the tree says *N new options since vX, set to their defaults* with
+  **Review** and **Accept defaults** (the values already are the defaults, so nothing changes — the result
+  equals the plain carry byte for byte). **Review** opens a stepper in place of the banner: menu path, prompt,
+  `CONFIG_` name, type, dependencies, the legal values only (choice members, n/m/y within range, or an input),
+  **Keep <value> →**, **← Back**, **Accept defaults for the rest**, **Hide**; the inspector follows the option
+  (help, origin). Each answer is a direct request set through `applyValue` (so lowering what others need still
+  asks first, §5.0) and is one undo step. The review (`newReview`: names, position, profile key) is saved on
+  the tab, so it survives re-renders and reloads; another ARCH or configuration drops it. The **New options**
+  button starts the same review for the current configuration (e.g. after **Import .config**); with nothing to
+  ask, a toast says so.
+- **Undo / redo** (`kconfig_history.js`, `KconfigHistory`; shortcut registry entries `kconfig.undo` /
+  `kconfig.redo`, §5.31): `Ctrl+Z` / `Cmd+Z` reverts the last change applied to the tab's configuration and
+  `Ctrl+Shift+Z` / `Ctrl+Y` re-applies it, while the tab is the active one, no dialog (or the TUI) is open and
+  the focus is not in a text field (those keep their own text undo). A change is whatever reaches `commit()` —
+  a value set from the tree, the inspector or the TUI (including the options a confirmed lowering drops with
+  it), Load Defconfig, Import .config, Auto-solve, *Apply kconfig resolution*, a merged fragment, a hardware
+  operation, enabling the engine over edited values — plus switching the engine off. A state is the tab's
+  values, the engine's own state (`KconfigEngine.captureState()`: user values, choice values and defaults,
+  choice member priority) and whether the tab runs its engine; only the **differences** between consecutive
+  states are kept in memory (`[key, before, after]` per changed entry, 200 entries per tab, nothing
+  persisted), plus the current state. Undo restores that state exactly (`restoreState()`, no re-resolution
+  through kconfig, and the engine is switched back on or off as it was), so the restored configuration is the
+  one the tab had, byte for byte. A new change after an undo drops the redo entries. The history survives
+  re-renders of the tab (a tab switch, a layout change: the view puts back the state the history ends on when
+  the saved values are unchanged) and starts over on another model: an ARCH or revision switch, a toolchain
+  profile applied (`reloadModel`), or values changed from elsewhere while the tab was hidden. A toast names
+  what was undone or redone.
+- **TUI** (`menuconfig_tui.js`): mconf-style modal over the same engine: `menu`/`menuconfig`/`choice` open
+  submenus, other children are listed indented; keys Up/Down/PgUp/PgDn/Home/End, Enter, Space, Y/M/N,
+  Esc/Left, `/` search, `?`/H help (help text plus Symbol/Type/Prompt/Defined at/Depends
+  on/Location/Selects/Selected by), Z show all, S save `.config`, D save defconfig (`writeDefconfig`, the only
+  place a minimal defconfig is downloaded from).
+
+### 5.9. Universal Middle-Click Tab & Navigation Capture
+The frontend implements systematic middle-click capture (`auxclick` with `e.button === 1`) across all
+interactive UI surfaces:
+1. **Force New Tab (`forceNew: true`)**:
+   - `state.openTab(tabData, targetPaneId)` accepts `tabData.forceNew`.
+   - When set, bypasses duplicate tab matching and always generates a new unique tab instance in the
+     foreground.
+2. **CodeView AST Tokens**:
+   - Middle-clicking any `.ast-token` in `virtual_editor.js` bypasses the context menu and directly executes
+     the primary contextual action (`contextMenu.executeDefaultAction`) in a new foreground tab:
+     - **C/Rust AST Symbols**: Queries symbol definition and jumps to the definition line in a new code tab.
+     - **Kconfig Symbols**: Opens the symbol in a new Kconfig tab.
+     - **Include Directives**: Resolves the target header and opens it in a new code tab.
+3. **Tab Header Close**:
+   - Middle-clicking any tab header in the top tab strip immediately closes the tab (`state.closeTab`),
+     conforming to standard IDE and browser tab strip mechanics.
+4. **In-Place Navigation Elevation**:
+   - Where left-click navigates in-place within the current view, middle-click opens the target in a new tab:
+     - **Kconfig Viewer**: Dependency badges (`.kconfig-badge-link`), tree rows (`.kconfig-node-row`),
+       compiled file links (`.compiled-file-link`), and architecture defconfigs (`.def-item`).
+     - **File Explorer**: Files in the sidebar tree open in a new code tab with `forceNew: true`; in the
+       full-tab explorer (§5.20) a file opens in a new code tab and a directory in a second explorer tab, both
+       at that explorer's revision.
+     - **Code View Breadcrumbs**: a path segment opens the repository explorer of that directory in a new tab.
+     - **Maintainers Viewer**: Subsystem cards, person profile cards, and referenced file links.
+     - **Commits Viewer**: Commit history cards and touched file links.
+     - **Callgraph Viewer**: Caller and callee function jump links and source file links.
+     - **Pahole Struct Layout**: Nested struct/union drilldown links (`.struct-drilldown`), definition source
+       file links (`#pahole-open-src`), Analyze button (`#pahole-search-btn`), and NodeMap elevation
+       (`#pahole-btn-nodemap`). **⇄ Compare with…** (`#pahole-btn-compare`, the revision picker) shows both
+       layouts side by side aligned by member, colored by status, with a delta summary (*−24 bytes, −3
+       holes*); **📈 History** (`#pahole-btn-history`) draws `total_size` at each release where the definition
+       changed (`views/pahole/pahole_compare.js`: holes as bars, estimates hollow, unindexed releases in red;
+       clicking a point opens that version's layout in a new tab) — both from §4.7 (N3) and kept in the URL
+       (`cmp`, `hist`).
+     - **Version Diff Viewer**: Modified and added file rows.
+5. **Modal Non-Dismissing Multi-Tab Queuing**:
+   - In the **Cross-References (XRef)** and **Included Symbols** modals, middle-clicking definitions or usage
+     links opens the target code tabs with `forceNew: true` while preserving the modal backdrop, allowing
+     users to queue multiple references into separate tabs without re-opening search modals.
+
+### 5.10. Developer Profiles & Kconfig Compiled Source Navigation
+1. **Interactive Developer Profile Modal (`showPersonModal`) & Maintainers Sub-Tab**:
+   - Clicking developer names across the workspace (Commit author headers, Contributors & Signoffs lists,
+     Commit cards, Blame gutters, and Blame context popovers) activates the universal Developer Profile modal
+     (`webapp/frontend/js/components/person_modal.js`).
+   - Displays avatar initials, author email, CREDITS biographical data (description, project URL, PGP keys,
+     snail mail), Git stats (authored commits count), and maintained subsystems.
+   - **Maintainers "Developers" Directory**:
+     - The Maintainers view incorporates a dedicated **"Developers"** directory (`Subsystems` | `Developers` |
+       `CREDITS` | `Patch Reviewer`) listing every developer from `m_maintainer_person`, one card per merged
+       identity (alias personas collapsed, §4.5 `/developers`).
+     - Supports live name/email search (`@intel.com` filters by email domain, subdomains included, in the
+       Subsystems, Developers and CREDITS lists, §4.5; a developer card then shows the matching address, `+N`
+       when several aliases match, all of them in its tooltip), category filter pills (`All`, `Maintainers`,
+       `Reviewers`, `CREDITS`), and an Activity (subsystems count) vs. A-Z alphabetical sort toggle.
+     - Selecting any developer renders their complete profile card in the detail pane with maintained
+       subsystems (clickable to jump into the Subsystems tab) and a direct "View All Commits" action button.
+     - **Collapsible sidebar**: the collapse button at the end of the search bar (`#btn-maintainers-collapse`,
+       the default collapse icon `COLLAPSE_ICON` of the sidebar, §5.27) folds the sidebar into a 28 px rail on
+       the left (`.maintainers-view-container.list-collapsed`); clicking the rail (`#btn-maintainers-expand`,
+       the mirrored icon and *Maintainers*) unfolds it and focuses the search. The state is kept on the tab
+       (`listCollapsed`) and in the URL (`lc=1`, §5.26). A folded list is not loaded until unfolded
+       (`listLoaded`), then the selected card is scrolled into view.
+     - **Deep links**: the sidebar section, the search, the developer role pill and sort, and the inspected
+       subsystem or developer are recorded on the tab (`section`, `query`, `role`, `sort`, `secId` / `person`,
+       `listCollapsed`, via `persistTabState`) and written to the URL hash
+       (`#tab=maintainers&view=<developers|credits|patch>&sec=<sec_id>&person=<email>&q=…&role=…&sort=alpha&lc=1`,
+       §5.26). One selection is held at a time: inspecting a subsystem drops `person` and vice versa, and the
+       Patch Reviewer clears both. A developer is addressed by email when known (stable across database
+       rebuilds), else by `person_id` or name. `MaintainersView.render` rebuilds everything from the tab,
+       requesting the selection beside the list.
+   - Provides 1-click elevation actions:
+     - **Open in Maintainers Tab**: Focuses or launches `state.openTab({ type: "maintainers", person: ... })`,
+       inspecting the developer's complete subsystem roster and contribution graph.
+     - **View Commits**: Focuses or launches `state.openTab({ type: "commits", query: ... })`, filtering the
+       commit history by author name or email.
+2. **Kconfig Compiled Source Files**:
+   - `sym.compiled_files` records (`{"file_path": "..."}`) are normalized and displayed with source file icons
+     (`📄 kernel/smp.c`) and associated target object badges (`smp.o`).
+   - Clicking any compiled file item (`.compiled-file-link`) immediately opens the target source file in the
+     virtual code editor (`state.openTab({ type: "code", path: filePath })`), supporting both left-click
+     in-place navigation and middle-click multi-tab queuing.
+
+### 5.11. Compare View: Files & Kconfig Between Any Two Revisions (`webapp/frontend/js/views/diff/diff_view.js`)
+1. **Activity Bar Entry**: The **Compare** activity-bar button (`data-action="compare"`) opens a single `diff`
+   tab (re-clicking focuses it). The tab persists `versionA`, `versionB`, and `mode` in its tab data, and its
+   title reflects the pair (`Compare v3.0…v3.1`).
+2. **Revision Selection**: Base and Target buttons open the shared `refPicker` (§5.13), so either side can be
+   a release tag or any commit. When no base is stored, it defaults to the tag preceding the target (or the
+   latest tag when the target is a commit). A ⇄ button swaps the sides.
+3. **Files Mode** (`api.getVersionsDiff`, 45 s timeout): Status chips (added / modified / deleted / renamed /
+   unchanged) act as toggle filters alongside a path filter (which matches the path and, for renames, the old
+   path). With no chip selected every change is listed; unchanged files are listed only while their chip is
+   selected. They are fetched the first time it is (`api.getUnchangedFiles`, `GET /api/tools/diff/unchanged`,
+   once per comparison; *Loading unchanged files…* meanwhile, and reselecting the chip retries a failed
+   fetch), merged in path order with the other selected statuses, and shown with a `U` badge; clicking an
+   unchanged row opens the file at the target revision instead of expanding a diff. Rows render in pages of
+   500. A rename row shows `old → new` and, below 100%, its similarity. Clicking a row expands an inline
+   unified diff from `api.getFileDiff` (renames pass their similarity, capped at 50); per-row buttons open the
+   file at the base or target revision, and middle-click opens it in a new tab.
+   - **⬇ Download (N)** (`downloadFileRows`): saves every row matching the chips and the path filter, all
+     pages (N is that count; the button is disabled while unchanged files load or when nothing matches), as
+     *Paths (.txt)* (one path per line: the target path, the base path for deleted files), *Table (.tsv)*
+     (`status` A/M/D/R/U, `similarity` for renames, `path`, `old_path`) or *JSON (.json)* (`base`, `target`,
+     `generated`, `filters` with the statuses, path filter and last successful rename search, `renames` of the
+     response, `count`, `files` with `status`, `path` and, for renames, `old_path` and `similarity`). No
+     format carries the symbol counts of modified files. Rows include the pairing of a rename search already
+     applied. The file is named `compare_<base>..<target>[_<statuses>][_<filter>].<ext>` and written with
+     `downloadText` (`components/modal.js`).
+   - **Rename search** (shown while the **renamed** chip is active, `renderRenameSearch`): a note says how
+     renames were paired (`renames` of the response: every pair compared, or only identical / same-basename
+     files because there were too many candidates, or identical content only without Git trees), and a form
+     takes a similarity threshold (default 50%) and a directory (suggestions: the directories holding the most
+     unpaired added/deleted files). **Search renames** calls `api.searchRenames` (`GET
+     /api/tools/diff/renames`, 120 s timeout, cached per revision pair, threshold and directory). A refused
+     search (`too_many`) states the deleted × added counts and asks for a directory. A completed search
+     replaces the pairing inside the directory (`applyRenameSearch`): renames with both ends there go back to
+     added + deleted and the search result pairs them again (so a higher threshold drops pairs and a lower one
+     adds them), renames crossing the directory boundary are kept, and the chip counts are recomputed; the
+     status line reports the number of renames, the change against before, the pairs compared and the time.
+     Each successful search is recorded on the tab (`renameSearches`, `[{sim, dir}]`, and so in the URL as
+     `rn`, §5.26) and re-applied in order whenever the diff loads again (a mode switch, a re-render, a
+     reopened link; the searches are cached, so this is fast). A search supersedes the recorded ones in its
+     directory or below it, since it re-pairs that whole directory; changing or swapping a revision clears
+     them.
+   - **Deep links and per-tab state**: each Compare tab has its own `DiffView` (`app.viewRenderers.diff` is a
+     factory), and the revisions, mode, chips (Files and Kconfig), path filter, Kconfig filter and rename
+     searches are recorded on the tab with `state.updateTabState` (`persistTabState`, skipped for a view whose
+     element was replaced; the render itself records before the pane attaches it) and written to the URL hash
+     (§5.26). A deep link into an existing Compare tab merges those fields into it (`state.openTab`).
+4. **Kconfig Mode** (`api.getKconfigDiff`): Status chips **added / modified / deleted** (each shows the option
+   count and the Kconfig file count) act as toggle filters on both lists, like the Files chips: an option
+   `added`/`changed`/`removed` and a Kconfig file `added`/`modified`/`removed` map onto them
+   (`KCONFIG_STATUS_OF`); with no chip selected everything is listed. A text filter matches option names (with
+   or without `CONFIG_`) and file paths. Below: a warning listing unindexed Kconfig files when option coverage
+   is partial, an **Options** list (the first 2000 matches; expand for per-file `type` / `prompt` / `default`
+   before and after, or **Inspect** to open the KConfig view on that symbol), and a **Kconfig Files** list
+   with the same inline diff and open actions as Files mode.
+   - **⬇ Download (N)** (`downloadKconfigRows`): saves every option and Kconfig file matching the chips and
+     the filter (N is their sum; not capped at 2000; disabled when nothing matches), as *Options (.txt)* (one
+     `CONFIG_<name>` per line), *Kconfig files (.txt)* (one path per line), *Table (.tsv)* (`kind`
+     option/file, `status` A/M/D, `name` — `CONFIG_<name>` or the path —, `files` defining the option on
+     either side, `changed_fields` of a single-definition change) or *JSON (.json)* (`base`, `target`,
+     `generated`, `filters` with the statuses and the filter text, `summary` of the response, `count`
+     `{options, files}`, `options` with `name`, `status`, `files` and the response's `before`, `after`,
+     `changes`, and `files` with `status` and `path`). The file is named
+     `compare-kconfig_<base>..<target>[_<statuses>][_<filter>]` (`_options.txt` / `_files.txt` / `.tsv` /
+     `.json`).
+
+- **API mode** (A6, `views/diff/api_diff.js`): the Kernel API changelog of `GET /api/kapi/diff` (§4.9) — an
+  ARCH selector, kind chips with counts (Syscalls, Exports, Parameters, Tracepoints, Modules), status chips
+  (*added*, *removed*, *changed*), a filter, and one row per change (`+` / `−` / `~`, kind, name, detail). A
+  row opens the Kernel API section filtered on that name, at the target revision (the base for a removed
+  item); middle-click or Ctrl/Cmd+click opens a new tab. **⬇ Download (N)**: *Summary (.md)* for release
+  notes, *Table (.tsv)*, *JSON*. While the catalogs of either side build, the mode shows their progress. The
+  palette command *Compare kernel APIs* opens it.
+
+### 5.12. Git Commits Timeline & Bi-Directional Pagination (`webapp/frontend/js/views/commits/commits_view.js`)
+- **Clean Full-Width Search Header**: Replaced legacy direction toggle buttons (`◀ Future`, `⊙ Anchor`, `Past
+  ▶`, and `🏷️ v3.0`) with a clean, focused typeahead search bar (`#commit-search-input`).
+- **Bi-Directional "Load 50 More Commits" Pagination**:
+  - **Top Pagination Button (`#btn-load-more-top`)**: Automatically renders at the top of the commit timeline
+    when commits exist above the current viewport (`has_future`). Seamlessly fetches 50 commits using
+    `direction="future"` and `next_future_cursor`, prepends them in continuous chronological descending order,
+    and preserves exact vertical scroll position (`scrollTop`) without layout jumping.
+  - **Bottom Pagination Button (`#btn-load-more-bottom`)**: Automatically renders at the bottom of the
+    timeline when older commits exist (`has_past`). Fetches 50 commits using `direction="past"` and
+    `next_past_cursor` and appends them to the bottom of the list.
+  - **Repeated loads**: each button is rebuilt by `renderCommitList()` from `isLoadingTop` /
+    `isLoadingBottom`, so those flags are cleared **before** re-rendering — a button rendered while they still
+    said "loading" stayed disabled and kept reading *Loading…*, which capped the timeline at one extra page
+    per direction. Commits already in the list are filtered out by `commit_id`/`commit_hash` when a page is
+    merged, so a cursor that overlaps the previous page cannot duplicate rows.
+  - **Search Pagination**: In commit search mode, the bottom button paginates sequentially through matching
+    commits across pages.
+- **Deep links**: the search and the inspected commit are kept in the URL hash (`#tab=commits&q=…&cid=<hash>`,
+  §5.26, always the commit hash so the link survives a database rebuild).
+- **One view per tab**: each commits tab has its own `CommitsView` (`app.viewRenderers.commits` is a factory),
+  and `render()` takes the search, the selected commit and the folded list from the tab alone (`tab.query`,
+  `tab.commitId`, `tab.listCollapsed`; absent means none).
+- **Collapsible list**: the collapse button at the end of the search bar (`#btn-commits-collapse`, the default
+  collapse icon `COLLAPSE_ICON` of the sidebar, §5.27) folds the list column into a 28 px rail on the left
+  (`.commits-view-container.list-collapsed`); clicking the rail (`#btn-commits-expand`, the mirrored icon and
+  *Commits*) unfolds it and focuses the search. The state is kept on the tab (`listCollapsed`) and in the URL
+  (`lc=1`, §5.26). **A folded list is never requested**: the timeline or search is loaded the first time the
+  list is unfolded (`listLoaded`), then the selected card is scrolled into view. Tabs opened for one commit
+  from elsewhere open folded (`listCollapsed: true`): a blame gutter, *View Commit* of the hash menu (§5.6)
+  when it opens a tab, the commit popover's *Open commit tab*, the file and symbol history modals, and a
+  commit card middle-clicked into a tab of its own. Reopening an existing tab with `listCollapsed` given
+  (`state.openTab`) applies it; searches by author (person modal, Subsystems view) still open unfolded.
+- **Selected commit first**: when the tab opens with a commit selected (deep link, restored tab, *View
+  Commit*), `render()` requests its detail **before** the timeline or search and runs both in parallel
+  (`Promise.all`), so the detail pane never waits for the list. `api.getCommitDetail` is sent with fetch
+  `priority: "high"` (ignored by browsers without the Fetch Priority API). Each pane renders only its latest
+  request (`_detailToken`, `_listToken`): a commit clicked, or a search typed, while an earlier one is still
+  loading is never overwritten by the late answer.
+- **Commit Inspection & File Jumping**: Selecting any commit card displays subject, author, UTC date, Git SHA,
+  Lore LKML thread link, structured trailers/signoffs badges, full commit message, and touched file list with
+  middle-click multi-tab queuing.
+- **Modified Files agrees with the diff**: the card renders the detail endpoint's `files`; when that list was
+  resolved from Git rather than staged (merge commits, see the detail endpoint above) the title carries a
+  muted *resolved from Git (merge, vs first parent)* note, and `files_truncated` appends *… list truncated*.
+  The badge color of every status (`A`/`D`/`R`/`M`) comes from `STATUS_COLORS`, and paths are HTML-escaped.
+- **Copy a hash with one click** (`hashHtml` / `attachHashCopy`): every `.commit-hash` in the view — the short
+  hash on a commit card, the full hash in the detail header, and the parent hash in the diff summary — is a
+  `.copy-hash` button (`role="button"`, keyboard `Enter`/`Space`) that copies the **full 40-character SHA**
+  through `utils/clipboard.js` and flashes green on success. One delegated listener per view container, bound
+  in the **capture** phase so copying a card's hash does not also select or re-open that commit.
+- **Right-click a hash**: the same delegated listener opens `contextMenu.showCommitHashMenu` (§5.6) with
+  **Copy Hash**, **View Commit** and **Set as Work Commit**. *View Commit* goes through
+  `selectLoadedCommit(hash)`, which selects and inspects the card already in the timeline (matched by
+  `data-hash`, scrolled into view) and returns false for a hash outside the loaded range so the menu opens a
+  tab of its own for it.
+
+- **Inline Commit Diff (`#btn-commit-diff`)**: The bottom of a selected commit's detail has a **± Show
+  changes** button. It loads `GET /api/commits/{v}/diff/{hash}` once per commit (IndexedDB `commits` store,
+  key `cdiff_<hash>_<context>`) and renders a compact per-file diff (status badge, `+/−` counts, old/new
+  line-number gutters). Files with more than 120 rows, or after the 25th file, start collapsed; each file body
+  scrolls at 420px.
+  - **Jump to the edited lines**: Clicking an added or context row opens the file **at the commit** on that
+    line; clicking a removed row opens the file **at the parent commit** on the old line (deleted files always
+    open at the parent). Hunk headers and the per-file **Open ↗** button jump to the first change.
+    Ctrl/Cmd+click or middle-click opens a new tab. Selecting text in the diff does not navigate.
+  - **Automatic Header Version Synchronization**: Clicking **Open ↗**, an edited line, or *Explore Files at
+    this Commit* switches the workspace to the target commit revision, synchronizing both
+    `state.currentVersion` and `state.selectedVersion` (emitting `version:synced`) so the top navigation bar
+    immediately tracks and reflects the commit version without requiring the user to navigate out and back
+    into the tab.
+  - **Change markers in the code view**: The opened tab carries `diffMarks: { kind: "add" | "del", commit,
+    ranges: [[start, end], ...] }`. `VirtualEditor` tints those lines green (added) or red (removed), adds a
+    gutter bar and minimap ticks, and shows a `± <hash>: N lines changed` chip with **↑/↓** (previous/next
+    change block) and **✕** (clear markers). Re-opening an already open file tab replaces its markers.
+
+- **First release badge** (H3): the detail header shows *First released in v3.1-rc6 → v3.1* (plus the first
+  stable tag when there is one) or *Not released yet* (with the branches containing it in the tooltip), from
+  `api.getCommitRelease` (`GET …/released/{hash}`; released answers kept in the `commits` store as
+  `rel_<hash>`, never-released ones asked again). Clicking the badge selects that release in the header; like
+  every header pick it switches no tab (§5.13). While the release index is first built the badge shows its
+  progress.
+- **Relations card** (H1, H2; `relations_render.js`, above *Commit Message*): *Fixes*, *Fixed by*, *Reverts*,
+  *Reverted by*, *Backport of*, *Backported as* — each related commit with its copyable hash (§5.12 hash
+  menu), subject, author and first release — plus *Cc: stable* with its annotation and the `Link:` message-ids
+  (opening the thread in a mail tab). Clicking a subject inspects that commit in place; middle-click or
+  Ctrl/Cmd+click opens a commits tab. An unresolved `Fixes:` prefix is shown with its quoted subject. While
+  the relation index is first built the card shows its progress (`api.getCommitRelations`, polling the 202
+  answers).
+- **Timeline chips** (H1): after each render of the list, one batched `POST …/relations` fetches counts for
+  the cards shown and adds *fixed later ×N*, *reverted*, *fix*, *backported ×N* or *stable* chips.
+- **Structured queries** (H8, `commit_query.js`): the search box understands `path:`, `author:`, `committer:`,
+  `reviewer:`, `acked:`, `tested:`, `reported:`, `suggested:`, `signed:`, `codev:`, `cc:`, `fixes:`, `link:`,
+  `since:`, `until:`, `in:<release>`, `range:A..B`, `merges:only|none` and `section:` (values may be quoted:
+  `reviewer:"Jan Kara"`). Recognized keys show as removable chips under the box (removing one refines the list
+  at once; the query stays in the URL as `q=`); unknown keys stay free text. A query with at least one key
+  goes to `GET …/query` and pages downward only; plain text keeps the indexed search. The **?** button lists
+  the keys (a click inserts one), and typing a key's prefix suggests it.
+
+### 5.13. Header Navigation, Version Selector, Apply & Responsive Controls (`webapp/frontend/index.html`, `webapp/frontend/css/layout.css`, `webapp/frontend/js/app.js`, `webapp/frontend/js/components/ref_picker.js`, `webapp/frontend/js/components/version_switch.js`)
+- **Standardized Header Heights & Vertical Alignment**: All top-level header controls
+  (`.version-selector-container`, `.session-selector-container`, `#global-search-btn`, and `#offline-badge`)
+  share a standardized `28px` outer height (`box-sizing: border-box; line-height: 1; align-items: center;
+  justify-content: center;`), vertically centered with 10px margins inside the 48px header (`--header-height:
+  48px`). Inner form elements and action triggers (`<select>`, `#commit-picker-btn`, `#version-apply-btn`,
+  `#version-newtab-btn`, `#session-picker-btn`) are normalized to `24px` height with crisp single-line text
+  and icon alignment.
+- **Responsive Size-Pressure Collapsing**: To avoid header clipping and control overlap across all window
+  sizes, split viewports, and displays, the header automatically collapses in progressive stages:
+  - **Intermediate Pressure (`<= 1440px`)**:
+    - `#offline-badge`: Flips dot position to trailing after status text (e.g. `Online ●`, `order: 2` on
+      `.badge-dot`, `order: 1` on `.badge-text`), keeping the status visible while signaling size contraction.
+    - `#global-search-btn`: Hides the `<kbd>Ctrl K</kbd>` keybinding badge, showing only the search icon and
+      `Search…` text.
+    - `#session-picker-btn`: Reverts to icon-only mode (`🗂 ▾`), hiding `#session-picker-label`.
+    - `.version-selector-container`: Hides descriptive text labels (`Project:`, `Branch:`, `Tag:`, `Commit:`)
+      to preserve vital space for the dropdowns and buttons.
+  - **High Pressure (`<= 1300px`)**:
+    - `#offline-badge`: Collapses to a standalone dot icon button (`●`, 28x28px, hiding `.badge-text`, with
+      `font-size: 20px; border-radius: var(--radius-md);` expanding the dot to properly fill the button) with
+      a hover tooltip (`badge.title`) detailing full connection status and local storage settings.
+    - `#global-search-btn`: Collapses to an icon-only square button (`🔍`, 28x28px, hiding `.search-label`).
+    - Spacing optimization: `#app-header`, `.header-left`, and `.version-selector-container` gaps and paddings
+      tighten.
+  - **Compact Brand (`<= 1050px`)**:
+    - `.app-brand`: Hides `.brand-title` ("KernelInfo IDE"), displaying only the 24px `.brand-icon`.
+  - **Narrow Viewport (`<= 850px`)**:
+    - `.version-selector-container select` and `#commit-picker-btn`: Constrained to max-width 90px with
+      ellipsis truncation.
+- **Header Overflow & Dropdown Menu Visibility**: Neither `#app-header` nor `.header-left` enforces `overflow:
+  hidden`, ensuring that absolutely positioned dropdown menus (such as `.session-dropdown-menu`) and custom
+  popovers remain fully visible when opened. Layout clipping and horizontal scroll prevention are handled
+  exclusively at the root `#app-container` level and via responsive media query collapsing.
+- **Two revisions, not one**: `state.selectedVersion` is what the header's controls point at,
+  `state.currentVersion` is the revision of the active tab (what links opened from it follow,
+  `state.activeVersion()`). Both are persisted, with the branch the lists are scoped to
+  (`state.selectedBranch`, event `branch:selected`). **Selecting a revision changes nothing**: the Tag,
+  Release, Branch and Commit controls only move the selection (`state.setSelectedVersion`, event
+  `version:selected`), and nothing reloads until **Apply** or **New Tab** is pressed.
+- **Selectors**: `.version-selector-container` holds Project, Branch (`#branch-select`, the scope or custom
+  tag view of the lists beside it), Tag (`#version-select`, releases), Release (`#rc-select`, sub-versions and
+  candidates of the selected release; see §5.18), Commit (`#commit-picker-btn`), **Apply**
+  (`#version-apply-btn`) and **New Tab** (`#version-newtab-btn`). A selection may be a tag, a branch name or a
+  commit SHA; startup sanitization only resets values that are none of these (for both the explored and the
+  selected revision), and it goes by the **whole** catalog, so a revision the branch scope excludes is never
+  reset.
+- **Branch Selector & Tag Layout Views** (`tag_views` in repository config; `getActiveTagView()`,
+  `parseTagVersion()`, `renderBranchSelector()`, `selectBranch()`, `loadBranchScope()`,
+  `state.setBranchTags()`, `state.tagOnSelectedBranch()`, `releaseOnBranch()`):
+  - **Custom Tag Views (Top of Dropdown)**: Populated from `tag_views` in repository config (defaulting to `—
+    any branch —`). When active, ordered regex rules partition tags into base releases (Tag selector) and
+    sub-versions (Release selector):
+    1. For Linux 2.6.x, `^(v2\.6\.\d+)((?:-(?:rc|pre|alpha|beta)\d*|\.\d+(?:-(?:rc|pre|alpha|beta)\d*)?).*)$`
+       maps `v2.6.<sublevel>` (e.g. `v2.6.16`) as the base release, while stable point releases (`.1`..`.62`)
+       and candidates (`-rc1`..`-rc6`, `.28-rc1`) go to the Release dropdown.
+    2. For Linux 3.x+,
+       `^(v(?!2\.6\.)\d+\.\d+)((?:-(?:rc|pre|alpha|beta)\d*|\.\d+(?:-(?:rc|pre|alpha|beta)\d*)?).*)$` maps
+       `v<major>.<minor>` (e.g. `v3.0`) as the base release, with point releases (`.1`..`.101`) and candidates
+       (`-rc1`..`-rc7`) in the Release dropdown.
+    3. Other projects can configure custom `tag_views` with arbitrary regex patterns.
+  - **Real Git Branches (True to Git)**: Selecting a real Git branch scopes offered tags to those reachable
+    from it (`GET /api/branch/tags`, e.g. `stable/linux-2.6.16.y`), preserving standard Git pre-release
+    grouping where stable point releases remain standalone tags and only `-rc`/`-pre` pre-releases move to the
+    Release dropdown. Selecting a branch also sets its head as the selected revision.
+  - **Sub-version / Release Dropdown Sorting & Default**: Items in the Release dropdown are sorted descending
+    by version (latest stable point releases first, e.g. `.101`, `.2`, `.1`, then `final`, followed by release
+    candidates newest to oldest, `-rc7`, `-rc1`). When a base release is selected in the Tag dropdown, it
+    defaults to the `final` tag if present, or to the latest candidate if rc-only.
+- **Apply** (`requestVersionSwitch(target)`): moves **the active tab** to the selected revision
+  (`state.setVersion`, which also updates `state.currentVersion` and drops the tab's saved scroll position)
+  and nothing else — every other tab stays where it is. The tab menu's **Apply Current Tag** does the same for
+  the right-clicked tab, and **Get Tab Tag** copies a tab's revision back into the header (§5.24.5). Pressing
+  it when the tab already shows that revision, or with no tab open at all, says so (the latter opens an
+  explorer instead). The button is highlighted (`.pending`) while the selection differs from the active tab's
+  revision, and its tooltip names both revisions.
+- **New Tab** (`openVersionInNewTab(version)`): opens a full-tab **repository explorer** (§5.20) on the
+  selected revision, which is how a second revision is explored side by side without touching the tabs already
+  open.
+- **Links follow their tab**: `state.openTab()` defaults a new tab's revision to the active tab's
+  (`state.activeVersion()`), never to the header selection, and every view passes its own revision explicitly
+  (code view, explorer, blame gutters, include popover, XRef modal, NodeMap). A commit chosen in the palette's
+  `#` mode, *Explore Files at this Commit* in the commits view and *Explore at commit* in the file history
+  modal therefore no longer repoint an open tab: they move the header selection and open that commit in a tab
+  of its own.
+- **Guarded switch for KConfig tabs** (§5.0): applying a revision to a KConfig tab also **carries that tab's
+  configuration to the target revision and drops the configuration saved for the revision it leaves**
+  (`kconfigCarryPlan` / `applyKconfigCarryPlan`: the values move to `version|ARCH[|name]` of the target, the
+  toolchain profile moves with them, and the tab takes the next free name when the target already has a
+  configuration under its own). A dialog states how many values move, that nothing is kept for the revision
+  being left, that options the target revision does not define are dropped when the model loads them, and —
+  when the tab runs its engine — that the carried values are resolved against the target's model and the code
+  tabs following that engine follow the result; options new in the target take their defaults and can be
+  reviewed one by one afterwards (§5.8 *New options*). **Close** leaves the tab, its configuration and the
+  explored revision untouched. After the switch the view reports what the resolution dropped (`activateArch`)
+  and, with the engine on, shows the new-options banner. Restoring a revision from the URL hash only moves the
+  selection and never prompts.
+- **Commit Picker**: `#commit-picker-btn` opens `refPicker` with `scoped: true`, a popover with a search box
+  that lists matching release tags (`api.getVersionsCached`, the catalog already loaded in this page,
+  **narrowed to the selected branch** — its section reads *Release Tags on `<branch>`* and its placeholder
+  names the branch) and commits (`api.getCommits`, matching subject, author, or hash prefix). The Compare view
+  opens the same picker **unscoped** (`scoped` defaults to false), since comparing two branches means reaching
+  the tags of both; a tag outside the scope is also still selectable in the header by pasting its name (the
+  *Revision* entry). Arrow keys navigate, Enter selects, and any pasted SHA or ref name not in the lists is
+  offered as a raw revision (resolved server-side via `git rev-parse`). Selecting one sets the header
+  selection.
+- **Display Sync** (`updateVersionSelectorDisplay`, on `version:changed` / `version:synced` /
+  `version:selected` / `tabs:changed`): On a tag, the Tag dropdown selects it and the Commit button shows the
+  tag's short SHA. On a commit, the Tag dropdown shows `— none —` and the Commit button shows the short SHA
+  highlighted as detached. The Branch dropdown shows the **scope** or active tag view
+  (`state.selectedBranch`), not the explored revision, so picking a tag from a scoped list leaves the branch
+  where it is. The sidebar explorer header and the tab version badges show the active tab's revision in the
+  same short form (`shortRef`, 12 hex chars).
+- **Cache Keys**: Directory trees are cached under `tree2_*` and diffs under `diff3_*` / `kdiff2_*` /
+  `fdiff_*` / `bdiff_*` / `renames_*` / `unchanged_*` so responses cached before Git-native tree resolution
+  (and, for `diff3_`, before similarity-based rename detection) are not reused; every version-scoped key
+  embeds the version's stamp (`api._vk`, §2.11), the branch scope included (`branch_tags_<branch>@<stamp>~`,
+  so a branch that moved is walked again and an unchanged one is read from IndexedDB). Service Worker caches
+  are described in §2.11.
+
+---
+
+### 5.14. Documentation Viewer (`webapp/frontend/js/views/docs/`, `webapp/frontend/css/docs.css`)
+- **Activation**: `isDocumentationPath(path)` selects `*.rst`, `*.md`, `*.markdown`, `*.tmpl` (including
+  `Documentation/DocBook/*.tmpl`), `*.html`, `*.htm`, `*.xhtml`, `*.shtml`, `README*` (including root or
+  directory `README.md`), and `Documentation/` files that are `.txt` or extension-less (excluding
+  `Makefile`/`Kconfig`/`Kbuild`). Such code tabs open in **Rendered** mode (`tabData.docMode = "rendered"`)
+  unless a specific `cursorLine` was requested; the toolbar's **📖 Rendered / </> Source** button toggles back
+  to the virtual editor, and enabling **Blame** switches to source.
+- **Layout**: Mirrors https://www.kernel.org/doc/html/latest/ (Sphinx/Alabaster): a left sidebar with *The
+  Linux Kernel* title and the tab's version, **Quick search** (in-page highlight; Enter cycles matches),
+  **Contents** (nested local TOC with scroll-spy), **Navigation** (directory `index.rst`/`00-INDEX` and
+  `Documentation/index.rst`), and **This Page → Show Source**, beside a serif body and a footer. Colors come
+  from the IDE dark tokens.
+- **Unified Renderer Dispatch** (`renderDocument(source, path)`): Inspects the target file path and source
+  contents. If `isTmplPath(path)` (or DocBook template markup via `looksLikeTmpl`), delegates to
+  `renderTmplDocument(source, path)` (`webapp/frontend/js/views/docs/tmpl_renderer.js`). If `isHtmlPath(path)`
+  (or HTML markup via `looksLikeHtml`), delegates to `renderHtmlDocument(source, path)`
+  (`webapp/frontend/js/views/docs/html_renderer.js`). If `isMarkdownPath(path)` (or markdown
+  headings/fences/task-lists via `looksLikeMarkdown`), delegates to `renderMarkdownDocument(source, path)`
+  (`webapp/frontend/js/views/docs/md_renderer.js`). Otherwise, renders via `RstRenderer` (`rst_renderer.js`).
+- **HTML Renderer (`webapp/frontend/js/views/docs/html_renderer.js`)**:
+  - **Security Hardening**: Strips `<script>`, `<noscript>`, `<style>`, unauthenticated metadata/links
+    (`<link>`, `<meta>`, `<base>`), embedded objects/frames (`<object>`, `<embed>`, `<applet>`, `<iframe>`,
+    `<frame>`, `<frameset>`), inline event handlers (`onload=`, `onclick=`, etc.), and `javascript:` /
+    dangerous `data:` URIs, strictly complying with the platform Content Security Policy (CSP).
+  - **Headings, Permalinks & Local TOC**: Parses `<h1>` through `<h6>`, assigning slugified IDs, clickable `¶`
+    permalinks (`.headerlink`), and building a nested local Table of Contents (`toc`) for sidebar navigation
+    and scroll-spy. Detects and normalizes legacy pseudo-headings that contain only `<hr>` divider tags (e.g.
+    `<H1><HR WIDTH="100%"></H1>` in early kernel docs) into `<hr class="docutils" />` without polluting the
+    TOC.
+  - **Legacy HTML Normalization**: Adapts legacy presentational markup for modern dark-theme presentation:
+    wraps `<center>` in `<div class="kdoc-align-center">`, maps `<tt>` to `<code class="docutils literal
+    notranslate">`, normalizes unclosed `<pre>` blocks, and ensures legacy anchor targets (`<a name="...">`)
+    carry matching `id="..."` attributes for smooth scrolling (`scrollToId`).
+  - **Syntax Highlighting**: Transforms `<pre>` and `<pre><code>` blocks with multi-language syntax
+    highlighting via `AstOverlay` and `highlightCode`, auto-detecting C, Shell, Python, Rust, or text where
+    explicit language classes are omitted.
+  - **Dark-Themed Tables**: Automatically injects `.docutils` classes into `<table>` elements so all kernel
+    tables inherit dark-theme borders, alternating row tones, and typography.
+  - **Links & Images**: Resolves relative document links (`.rst`, `.md`, `.tmpl`, `.html`, etc.) into
+    `data-doc` attributes for in-app tab transitions, maps relative source links to `data-src`, directs
+    external URLs to new tabs (`target="_blank" rel="noopener noreferrer"`), hydrates images via `data-raw`
+    from the Git tree (`/api/fs/raw`), and styles inline status badges (`.kdoc-badge`).
+  - **Kernel Automarkup**: Automatically scans prose text nodes outside code blocks and links, converting
+    `CONFIG_*` macros to interactive Kconfig links and function calls `func()` to code symbols.
+- **DocBook XML Template Renderer (`webapp/frontend/js/views/docs/tmpl_renderer.js`)**:
+  - **Structural Hierarchy & Permalinks**: Parses DocBook `<book>`, `<chapter>`, `<preface>`, `<appendix>`,
+    `<sect1>`–`<sect4>`, and `<section>`, mapping to semantic headings (`h1`–`h6`) with clean anchor IDs
+    (`slugify`), clickable `¶` permalinks (`.headerlink`), and local TOC hierarchy for `DocPage` sidebar
+    navigation and scroll-spy.
+  - **Kernel-Doc Directive Hydration**: Translates DocBook `!<type><path>` directives (`!E` export, `!I`
+    internal, `!F` function list, `!P` DOC section, `!C` all comments) into `<div class="kdoc-kerneldoc">`
+    blocks containing fallback directive cards with 1-click source links, automatically hydrated into live
+    extracted API documentation via `DocPage.hydrateKernelDoc()`.
+  - **Book Metadata**: Renders `<bookinfo>` headers, `<title>`, `<subtitle>`, `<authorgroup>`/`<author>` (with
+    mailto links), `<copyright>`, `<legalnotice>` (as styled admonition note), and `<abstract>` callouts.
+  - **Code Listings**: Formats `<programlisting>` and `<screen>` (with CDATA unwrapping) using multi-language
+    syntax highlighting (`highlightCode(code, "c")`).
+  - **Lists & Tables**: Renders `<itemizedlist>` (`ul`), `<orderedlist>` (`ol`), `<variablelist>`
+    (`dl.docutils` with `<term>` and `<listitem>`), and DocBook `<table>`/`<informaltable>`/`<tgroup>` with
+    `<thead>` and `<tbody>`.
+  - **Inline Semantics & Kernel Automarkup**: Renders `<function>` (symbol link), `<structname>` (struct
+    symbol link), `<constant>`, `<varname>`, `<parameter>`, `<structfield>`, `<type>`, `<filename>` (source
+    jump link), `<emphasis>`/`<quote>`, `<ulink>` (external link), `<link>` (internal anchor), alongside
+    `CONFIG_*` macros, `func()` symbol jumps, and `struct foo` links.
+- **Markdown Renderer (`webapp/frontend/js/views/docs/md_renderer.js`)**:
+  - **GFM Headings & Permalinks**: Parses ATX (`#`–`######`) and Setext (`===` / `---`) headings, generating
+    clean slugs (`slugify`), anchor IDs, and clickable `¶` permalinks (`.headerlink`). Extracts local TOC
+    hierarchy (`h1`–`h4`) for `DocPage` sidebar navigation and scroll-spy.
+  - **Fenced Code Blocks & Multi-Language Highlighting**: Code fences (```` ``` ```` or `~~~`) with language
+    specifiers are highlighted via `highlightCode(code, lang)` using `AstOverlay` and language grammars
+    (`syntax/languages/`), supporting Rust, C, Python, Shell, Perl, Assembly, Makefile, Kconfig, DTS, YAML,
+    JSON, and fallback text.
+  - **GitHub Alert Callouts**: Blockquotes starting with `> [!NOTE]`, `> [!TIP]`, `> [!IMPORTANT]`, `>
+    [!WARNING]`, or `> [!CAUTION]` render as styled `.admonition` callout boxes with categorical title badges
+    and SVG icons matching Sphinx documentation themes.
+  - **GFM Tables**: Pipe tables with cell alignments (`:---`, `:---:`, `---:`), headers, and responsive
+    borders styled under `.docutils`.
+  - **Task Lists**: List items with `[ ]` or `[x]` / `[X]` checkboxes render as `.task-list` and
+    `.task-list-item` with non-editable styled checkboxes (`docs.css`).
+  - **Inline Formatting & Kernel Automarkup**: Strikethrough (`~~text~~` → `<del>`), bold (`**` / `__`),
+    italic (`*` / `_`), inline code, links with relative document path resolution (`resolveRelativePath`),
+    images, bare URLs, keyboard shortcuts (`<kbd>`), and kernel automarkup (`func()` → symbol link, `struct
+    foo` → struct link, `CONFIG_*` → Kconfig view link). Supports nested linked images and badges
+    (`[![alt](img)](url)`) with transparent inline styling (`.kdoc-badge`), reference-style link definitions
+    (`[label]: url "title"`), full/collapsed reference links (`[text][ref]`), shortcut reference links
+    (`[ref]`), and clean omission of HTML comments (`<!-- ... -->`).
+- **reStructuredText Renderer (`webapp/frontend/js/views/docs/rst_renderer.js`)**: `.rst` (or `.txt` that uses
+  rST markup) is parsed as reStructuredText: over/underlined sections (levels by first appearance, `¶`
+  permalinks), transitions, bullet/enumerated/field/definition/line lists, `::` and quoted literal blocks,
+  block quotes, grid and simple tables, footnotes, substitutions, hyperlink targets and labels, and directives
+  (`code-block`/`highlight` with C and shell highlighting, admonitions, `toctree`, `contents`,
+  `list-table`/`flat-table`/`csv-table`, `kernel-doc`/`include`/`literalinclude`/`kernel-*` as source-link
+  cards, figures as placeholders, `c:function`-style domain entries, `versionadded`/`deprecated`, `only`,
+  `rubric`, `topic`). Inline markup covers literals, emphasis, roles (`:doc:`, `:ref:`,
+  `:c:func:`/`:c:type:`…, `:manpage:`, `:kbd:`, `:abbr:`, `:menuselection:`…), embedded and named links, bare
+  URLs, `Documentation/…` paths, and kernel automarkup (`func()`, `struct foo`, `CONFIG_FOO`). Legacy
+  plain-text docs keep aligned/indented text as preformatted blocks and promote tab-centered lines to
+  headings. All source text is HTML-escaped.
+- **Figures**: `image`/`figure`/`kernel-figure` render inline from `/api/fs/raw` (on a light backing for
+  legibility); unrenderable formats (e.g. `.dot`) fall back to a source link.
+- **kernel-doc**: `.. kernel-doc::` blocks are replaced by the extracted API documentation
+  (`/api/docs/{v}/kernel-doc` with the directive's options): Sphinx C-domain entries with highlighted
+  signatures, Parameters/Members, Definition (types), Description/Return/Context sections rendered as
+  reStructuredText after translating kernel-doc markup (`@param` → bold, `%CONST` → literal, `&struct foo` →
+  type link), and a *[source]* link to the comment's line.
+- **Cross-document `:ref:`**: unresolved labels are looked up in `/api/docs/{v}/labels` and become links to
+  `<doc>#<label>` showing the target section's title.
+- **Links**: `:doc:`/toctree/`Documentation/` links navigate in place (`tabData.docHistory` backs the sidebar
+  **← Back**; Ctrl/middle-click opens a new tab), toctree labels are filled from each target's first title,
+  `func()`/`struct` links jump to the symbol definition via `api.getSymbolDetail`, `CONFIG_*` opens the
+  KConfig view, directive cards open the referenced source, and in-page anchors scroll without touching
+  `location.hash`.
+
+### 5.15. Command Palette (`webapp/frontend/js/components/command_palette.js`)
+- **Opening**: `Ctrl/Cmd+K` or `Ctrl/Cmd+P` (search), `Ctrl/Cmd+Shift+P` (commands), or the header **🔍
+  Search…** button. The keys are entries `palette.open` / `palette.commands` of the shortcut registry (§5.31)
+  and can be rebound; the palette footer shows the current bindings.
+- **Modes by prefix** (`MODES` in `command_palette.js`): none — files (`/api/fs/search`), symbols
+  (`api.searchSymbols`) and Kconfig options (`api.searchKconfig`) together; `/` commands; `$` symbols; `@`
+  mailing-list discussions (§5.22); `%` text in every file of the revision (`api.grepCode`, `GET
+  /api/fs/grep`, 400 ms debounce, at least 2 characters: the first 30 matches grouped by file with their exact
+  match ranges highlighted, Enter opens the file at the line, plus *Open all results in the Search tab*,
+  §5.34); `#` commits (`api.searchCommits`, selecting one selects it in the header and opens its tree in a
+  repository explorer tab); `?` Kconfig options; `:` go to line in the active code tab — or, followed by a
+  name instead of a number, go to that definition of the active file (its outline, §5.21: exact, then prefix,
+  then substring matches, shortest names first; Enter scrolls the tab there, Ctrl+Enter opens the file at that
+  line in a new tab). Results are grouped by section with match highlighting; ↑/↓ navigate, Enter opens,
+  Ctrl+Enter opens in a new tab. Enter always acts on the text currently typed: if the rendered results were
+  computed for an earlier input (the 160 ms debounced search is pending or still in flight), it searches the
+  current text immediately and opens that search's top result, so a quick Enter never runs a stale row such as
+  the *Suggested commands* shown for an empty query (`resultsFor` / `pendingEnter`).
+- **Commands** (`KernelIdeApp.paletteCommands()`): *Open Kernel API* / *Open Insights* and one per section
+  (§5.29), *Show parser status* (§5.37), compare, *Keyboard shortcuts* (§5.31.1), *Search text in files…*
+  (§5.34), select commit, source treemap, export `compile_commands.json` (download via
+  `api.getCompileCommandsDownloadUrl`), KConfig view, *Enable KConfig engine in a tab* (asks the active
+  KConfig tab, else the first one not already running its engine, to enable it —
+  `state.requestKconfigEngine(tabId)` shows that tab and its view confirms the resolution as usual (§5.0), so
+  the palette never changes values on its own; with no such tab it says so), *Disable every KConfig engine*
+  (`state.disableAllKconfigEngines()`, configurations kept), *Open repository explorer tab* (§5.20), commits,
+  maintainers, NodeMap, documentation, explorer toggle, plus *Create patch* / *Symbol history* for the active
+  code tab and *Switch project* entries.
+
+### 5.16. `#ifdef` Dimming (`webapp/frontend/js/views/kconfig/directive_evaluator.js`)
+- **Which engine a file follows** (`tab.kconfigEngineTabId`, persisted): several KConfig tabs may run an
+  engine (§5.8), so each code tab follows exactly one of them, chosen with the toolbar's **⚙ `<arch>` ▾**
+  button (`#btn-kconfig-engine`). The popover lists *No engine* plus every running engine with its ARCH,
+  revision, symbol count and whether its configuration is resolved; a revision other than the tab's is marked
+  as such. A tab nobody set an engine on follows the **first engine whose revision is the tab's own**, and
+  **no engine** when none of them is on that revision — dimming and the build banner are then simply off until
+  one is picked (`resolveEngineSelection`, `state.defaultEngineTabIdFor`). A choice made by hand
+  (`kconfigEngineUserPicked`) outlives new engines appearing and is only re-defaulted when the engine it names
+  stops running.
+- **An engine of another session is picked like a local one**: the popover lists the engines running in other
+  browser windows as well (§5.23), and **every** check of "can this tab follow it?" goes through
+  `state.hasEngine(engineTabId)`, which is true for an engine of this window (`isKconfigEngineOwner`) *and*
+  for one in `sessionManager.remoteEngines`. Both the choice (`setEngineSelection`) and its re-resolution on
+  every engine change (`resolveEngineSelection`) use it, so picking a remote engine sticks: it survives
+  switching away from the tab, re-rendering it, *No engine* being chosen in between, and the announcements of
+  other engines — it is only re-defaulted when that engine actually stops running (its tab closed, its engine
+  switched off, or its window closed, §5.23).
+- **Gate**: Only while the engine this tab follows is running (§5.8) **and** has a resolved configuration (≥
+  50 symbols, i.e. a defconfig; `state.kconfigConfigActive(engineTabId)`), for preprocessed sources
+  (`PREPROCESSED_RE`: `.c .h .S .lds .dts .dtsi .inc`). A toolbar chip shows the number of compiled-out lines;
+  clicking it (`VirtualEditor.toggleDimSuspended()`) temporarily shows those lines undimmed (chip marked *not
+  dimmed*, dashed) and clicking again restores the dimming. The choice applies to every code tab until toggled
+  back or the page is reloaded (not persisted); the count, the build banner and Go to Definition are
+  unaffected.
+- **Semantics**: Three-valued evaluation of `#if/#ifdef/#ifndef/#elif/#else/#endif` (with `\` continuations).
+  Only `CONFIG_*` macros are known, following `autoconf.h`: `CONFIG_FOO` is defined for `y` and every
+  string/int/hex value (even empty), `CONFIG_FOO_MODULE` for `m`, symbols that are `n` or absent are
+  undefined; `IS_BUILTIN` is true for `y` (or an int equal to 1), `IS_ENABLED`/`IS_REACHABLE` for `y`/`m`;
+  `IS_ENABLED/IS_BUILTIN/IS_MODULE/IS_REACHABLE`, `defined()`, `!`, `&&`, `||`, parentheses and numeric
+  comparisons are supported. The compiler-predefined macros of the configuration's ARCH are known as well
+  (`archMacros(arch, assignments)`): `__KERNEL__` is defined; the own architecture's macros are defined
+  (`__x86_64__`/`__amd64__` or `__i386__` by word size, from `CONFIG_64BIT` when set, else from the ARCH
+  value; `__arm__`, `__aarch64__`, `__powerpc__`/`__powerpc64__`, `__sparc__`/`__arch64__`,
+  `__s390__`/`__s390x__`, `__mips__`, ...), every other architecture's macros, the other word size's macros,
+  `__CHECKER__` and `__GENKSYMS__` are undefined, `__LP64__` follows the word size; in `#if` expressions known
+  macros are 1 or 0. Any other macro (header guards, `__ASSEMBLY__`, `MODULE`) is unknown and a branch with an
+  unknown condition is never dimmed, nor are its alternatives. With `partial: true` (used for the x86_64
+  baseline of §5.19), `CONFIG_*` symbols absent from the assignments are unknown instead of `n`. Directive
+  lines are dimmed only when their enclosing region is compiled out.
+- **Live updates**: every code tab has its own `VirtualEditor` (`TabsComponent` builds one per tab and
+  `dispose()`s it — unsubscribing it — when the tab closes), and each one recomputes its dimmed lines, its
+  `#ifdef` chip count and its build banner on `kconfig:engine:changed` and on `kconfig:assignments:updated`
+  **for the engine it follows** (both events carry the `tabId` of the engine, so an edit in a KConfig tab no
+  code tab follows costs nothing): enabling or disabling an engine, loading or importing a configuration, a
+  single value edit and a toolchain rebuild reach the editors following it. `kconfig:engine:changed` also
+  re-resolves each editor's engine selection, so a code tab whose engine was switched off falls back to the
+  default and one on a revision that just got its first engine picks it up. Both events reach a code tab
+  following an engine of **another session** exactly the same way: an edit in that window's KConfig tab
+  arrives as `kconfig:assignments:broadcast`, updates the remote engine's entry (values *and* descriptor) and
+  is re-emitted locally as `kconfig:assignments:updated` under the same engine tab id, so the dimming, the
+  chip count and the build banner of every code tab following it refresh on each edit without that tab being
+  touched (§5.23). A tab only does that work while it is on screen (`isLive()`: its lines are still in the
+  document); showing a tab again re-renders it, which reloads the file and recomputes both from the
+  configuration in force at that moment, so a tab edited behind the scenes is never stale when it comes back.
+  The *not dimmed* choice is shared by every code tab (`code:dim-suspended`), so toggling the chip in one
+  updates the others on screen.
+- **Build banner**: with the same gate, `VirtualEditor.refreshBuildBanner()` fetches the open file's Kbuild
+  condition (`api.getBuildConditions`, once per version/ARCH/path) and evaluates it against the configuration
+  (`build_condition.js`, absent symbols are `n`). When it is `n`, a red banner above the code says the file is
+  **not compiled** for the ARCH with the current configuration and why: the failing symbols with their values
+  (e.g. *Needs `CONFIG_E1000E` (currently E1000E=n)*, plus how many alternative rules also fail), or the
+  reason for `other_arch`/`no_rule` (*arch/arm/ is not built for ARCH=x86_64*, *drivers/net/Makefile does not
+  build skeleton.o*). When it is `m`, a blue banner says the file is built as a module. The banner shows the
+  object's Kbuild rule (`makefile:line text`), which opens the Makefile at that line. Unknown conditions (`?`,
+  e.g. headers) show nothing. It is re-evaluated without refetching on every configuration change.
+
+### 5.17. Treemap, Symbol History & Patch Staging
+- **Treemap** (`views/treemap/treemap_view.js`, tab type `treemap`): squarified layout of
+  `/api/version/{v}/treemap` two levels deep, Bytes/Files metric toggle, breadcrumb zoom, click a directory to
+  zoom in or a file to open (middle-click: new tab). Opened from the explorer's folder context menu (*Show
+  Treemap of Folder*) or the palette.
+- **Symbol & Kconfig history** (`components/symbol_history_modal.js`): `showSymbolHistoryModal(version, path,
+  line, astId, name)` (editor context menu *Symbol History Across Releases* on a symbol, *Symbol History at
+  This Line*, palette *Symbol history at cursor line*) and `showKconfigHistoryModal(version, name)` (context
+  menu *Kconfig History Across Releases* on a `CONFIG_*`/Kconfig token or selection, KConfig view **🕰
+  History** card).
+  - **Branch**: the timeline follows one branch (*Branch scope* of `GET /api/symbols/{version_name}/history`).
+    The modal opens on the header's branch (`state.selectedBranch`, a real branch rather than a tag layout
+    view) when the version is one of its tags (`state.tagOnSelectedBranch`) or is that branch; otherwise the
+    server picks the branch holding the version (the default branch, or e.g. `stable/linux-2.6.32.y` for
+    `v2.6.32.71`). The **Branch** selector of the controls (`GET /api/branches`) refetches the timeline on
+    another branch, keeping the selected release when it is on it; it changes nothing outside the modal (the
+    header's scope stays as it is).
+  - **Slider**: one stop per release where the definition changed (introduced, modified, formatting-only,
+    removed, re-added) plus the first and the newest indexed version; each run of releases without change
+    collapses into a `…` gap (click expands it). ◀/▶ buttons, ←/→ keys and **Play** step through the stops.
+    **All releases** disables collapsing; **Include RCs** refetches with `include_rc=true` and shows how many
+    pre-release tags the branch has (`rc_count`); it is disabled when the branch has none. Without it no
+    pre-release tag (`-rc`, `-pre`, ...) is listed. The stop at or before the version the history was opened
+    from is selected first.
+  - **Detail**: status, `prev → version` range and line counts, *renamed from `<old path>`* on the release
+    where the file was renamed (`renamed_from`, `components/symbol_history_render.js`, escaped); **Diff**
+    (unchanged runs longer than 3 lines folded) or **Code** of each definition. Kconfig stops list only the
+    files whose definition changed (**Show all N definitions** toggles) with a table of the changed properties
+    (`depends on`, `inherited depends`, `select`, `default`, `type`, `prompt`, `help`...). **Commits** loads
+    `api.getHistoryCommits` for that definition (click a hash to open the commit); **Open @ version** opens
+    the file at the definition.
+- **Patch staging** (`components/patch_modal.js`): code toolbar **✎ Patch**, editor/explorer context menu, or
+  palette. Edit the file in a textarea (Tab inserts a tab), set subject, description and identity (remembered
+  in `localStorage`), then *Generate patch* → `api.formatPatch`; copy or download `0001-<subject>.patch`.
+  **Run checkpatch** (P4, `components/checkpatch_panel.js`) checks the generated patch on the server (§2.18,
+  §4.7): a summary per level, the results grouped by level (each links to its line in the preview, which
+  scrolls to it and is outlined), the reported lines marked in the preview's gutter; while the operator has
+  not enabled it, a note names `webapp.tools.checkpatch.enabled` and why it is off. The Patch series dialog
+  (§5.33) has the same **checkpatch** per patch. **Add to series** (P3) stages the edit in the session's patch
+  series instead — with the blob SHA of the text it started from — and opens the Patch series tab (§5.33); a
+  file staged again keeps its patch, and a file at another revision than the series' base is refused.
+- **KConfig additions**: **Import .config**, **Validate** and **Compare…** run in the browser engine (see
+  5.8); the per-symbol **Dependency Graph** uses `api.getKconfigGraph` (own depends-on left, selects/implies
+  right, colored by current value, nodes clickable).
+
+- **Build overlay** (K4): **Build: off / `<engine>` ▾** in the treemap toolbar lists the running KConfig
+  engines (like the code view's picker, §5.16; one without a resolved configuration is disabled). With one
+  picked, the treemap comes from `POST /api/version/{v}/treemap/build` (§4.2) with that engine's assignments:
+  cells are colored by the bucket holding most of their bytes (built in, module, not built, unknown — design
+  tokens), the legend gives *compiled: X of Y (Z %) · N of M .c/.S files*, and the tooltip the four buckets of
+  a cell. **Compiled bytes** sizes cells by the bytes built in or as modules. The treemap refetches (500 ms
+  debounce) on `kconfig:assignments:updated` of its engine, and drops the overlay when the engine stops. The
+  engine is kept on the tab (`buildEngineTabId`), not in the URL (engine ids are session-local, §5.26).
+
+### 5.18. Projects (Multiple Repositories)
+- The header **Project** selector lists `/api/projects` (parsed repositories plus *git only* ones).
+  `api.setRepository(name)` adds `X-KI-Repo` to every request, prefixes IndexedDB cache keys with the
+  repository, and `withRepo()` appends `?repo=` to URLs used directly (images, downloads). Switching asks for
+  confirmation, closes the workspace tabs (`state.setRepository`), and selects the repository's latest parsed
+  version (else its default branch).
+- The **Tag** dropdown lists base releases (in custom tag views, or on real Git branches without a branch
+  scope) grouped into *Parsed* and *Git only (not parsed)*; a release that so far only has candidates appears
+  as `vX.Y (rc only)` and selects its latest candidate. The **Release** dropdown (shown when the selected
+  release has sub-versions or candidates) lists stable point releases descending (newest first), `final` (base
+  release), plus release candidates (`-rc#`), newest first, with `(git only)` marking unparsed ones;
+  `KernelIdeApp.buildVersionCatalog()` groups tags by active `tag_views` regex rules (e.g. `releaseOf()` for
+  `v3.0.1` → `v3.0`, `v2.6.16.62` → `v2.6.16`) from `/api/versions?include_rc=true&compact=1` (§2.13). Catalog
+  requests (`projects`, `branches`, `versions`) are read from IndexedDB and refetched when a sync token
+  reports a change (§2.11), so newly parsed versions appear without clearing the cache.
+
+### 5.19. Definition Context & Picker (`state.definitionContext()`, `webapp/frontend/js/utils/definition_picker.js`)
+- **Context**: `state.definitionContext(engineTabId?)` returns `{arch, assignments, strict, engineTabId}`: for
+  a running engine with a resolved configuration (`state.kconfigConfigActive(engineTabId)`), that engine's
+  ARCH and resolved values (`strict`: absent symbols are `n`); otherwise `x86_64` with a baseline (`X86`,
+  `X86_64`, `64BIT` = `y`, `X86_32` = `n`; `strict: false`, every other symbol unknown). Called without an
+  argument it uses the engine the **active tab** follows (`state.activeEngineTabId()`: a KConfig tab's own
+  engine, or a code tab's selected one, §5.16), which is what the context menu, the definition picker and
+  `api.getSymbolDetail`/`getSymbolXref`/`getSymbolHistory` go by (they send its `arch`, §2.7); `VirtualEditor`
+  passes its own tab's engine explicitly, so a file dims and reports its build condition against the engine it
+  follows even while another tab is active. `state.kconfigArch(engineTabId?)` is the same resolution for the
+  ARCH alone, except that a tab which cannot follow an engine (Compare, documentation, NodeMap) falls back to
+  any running engine (`state.fallbackEngineTabId()`), so opening a Kconfig symbol from there lands on the ARCH
+  being configured.
+- **Picker**: `resolveDefinition(version, name, fromFile)` takes the backend's ranked `definitions` (with
+  `fromFile`, those the file's `#include` chain reaches come first, §2.7 item 4) and, among those in the first
+  6 candidate files, returns the first one the context compiles: files whose Kbuild condition evaluates to `n`
+  (`api.getBuildConditions`) are skipped, then definitions on lines `DirectiveEvaluator` compiles out with the
+  context's assignments and `archMacros` (partial when not strict). On x86_64, `struct pt_regs` therefore
+  opens the `__x86_64__` branch of `arch/x86/include/asm/ptrace.h` rather than its `__i386__` one, and
+  `arch/x86/kernel/process_64.c` wins over `process_32.c`. When no candidate is known to be compiled, the
+  backend's first choice is kept. `openDefinition(version, name, {forceNew, fromFile})` opens the result in a
+  code tab (used by the context menu and middle-click, which pass the code view's file as `fromFile`, and by
+  documentation links).
+
+### 5.20. Repository Explorer Tab (`webapp/frontend/js/views/explorer/explorer_view.js`, `webapp/frontend/css/explorer.css`)
+- **Opening**: clicking any segment of the path in a code view's breadcrumbs (`.breadcrumb-dir`, including the
+  leading revision, which opens the root) opens the directory in a full tab instead of revealing it in the
+  sidebar; middle-click opens it in a second explorer tab. The header's **New Tab** button (§5.13) opens the
+  root of the selected revision, the palette has *Open repository explorer tab*, and a commit chosen in the
+  palette, in the commits view (*Explore Files at this Commit*) or in the file history modal opens its tree
+  here.
+- **Tab data** (`type: "explorer"`): `path` (the directory, `""` = root), `version` and `filter`; the
+  listing's position is kept by §5.28 (`scrollPositions`), and moving to another directory clears it
+  (`clearScrollPositions`). Two explorer tabs of the same directory and revision are the same tab
+  (`state.openTab` matching), and the tab title is the directory's name. The URL hash carries it as
+  `tab=explorer&dir=<path>&v=<ref>`.
+- **Listing** (`GET /api/fs/tree/{v}?path=…`): directories first, then files (server-side order), each row
+  with an extension icon, its name and either *directory* or the file's start-state label (`s_stat_label`). A
+  filter box narrows the directory, **↑ Up** goes to the parent, **Reveal** reveals the directory in the
+  sidebar explorer (`explorer:reveal`), **Treemap** opens its treemap (§5.17), and the status bar states how
+  many entries are listed, how many are directories, and the path and revision they come from.
+- **Navigation stays in the revision**: a directory opens in the same tab (middle-click: a new explorer tab)
+  and a file opens in a code tab **at the explorer's revision** (middle-click: a new one), so browsing a
+  second revision never repoints the tabs of the first. Right-clicking a row opens the shared explorer context
+  menu (`contextMenu.showFileTreeMenu`) with that revision.
+
+### 5.21. Code View Toolbar, Saved Position & Minimap (`webapp/frontend/js/views/code_view/virtual_editor.js`)
+- **Toolbar Layout & Standardized Heights**: all buttons and chips (`.code-btn`, `.code-dim-chip`,
+  `.code-diffmark-chip`, `.code-filediff-chip`, `.code-last-changed`, and `#btn-code-overflow`) share a
+  standardized `22px` height (`box-sizing: border-box; line-height: 1; display: inline-flex; align-items:
+  center; justify-content: center;`) with normalized vertical centering for emojis (`📜`, `✎`, `⚙`, `📖`) and
+  plain text.
+- **Dynamic Priority Overflow & Down-Arrow Dropdown (`#btn-code-overflow`)**:
+  - The toolbar watches width changes via `ResizeObserver`. Breadcrumbs (`.code-breadcrumbs`) allow graceful
+    truncation with ellipsis (`flex: 0 1 auto; min-width: 0;`).
+  - Interactive chips (KConfig `#ifdef` dimming status chip §5.16, commit diff-marks chip §5.12, file diff
+    navigation chip) remain pinned on the toolbar for persistent access.
+  - The informational last-changed chip (`#file-last-changed`) auto-hides under tight space or widths `<
+    640px`.
+  - When toolbar space is constrained, action buttons dynamically overflow in reverse-priority order
+    (right-to-left: `✎ Patch` → `Copy File` → `📜 History` → `Blame` → `⇄ Diff` → `⚙ Engine`) into an
+    ultra-compact `▾` down-arrow button placed at the right of `.code-actions`.
+  - Clicking `▾` triggers a context menu listing hidden actions with their respective icons, active toggle
+    state (e.g. active `Blame`), and direct click handlers, automatically closing upon action selection,
+    outside click, or Escape.
+- **Toolbar Actions**: breadcrumbs (every segment opens the repository explorer, §5.20) then the `#ifdef` chip
+  (§5.16), the diff-marks chip (§5.12), the last-changed chip, **⚙ `<engine>` ▾** (which KConfig engine this
+  file follows, §5.16), **📜 History** (`showFileHistoryModal`), **⇄ Diff** (below), **Blame** (`BlameView`,
+  whose author links and commit jumps use the revision the blame was loaded for, and whose commit hashes and
+  gutter indicator borders are color-differentiated by author to make change transitions immediately evident),
+  **Copy File**, **☰ Outline**, **⇇ Refs** ("Referenced by": the menu of
+  `contextMenu.showFileReferencesMenu()`, grouped *Included by / Sourced by / Built by / Documented in* with
+  each group's total, every entry opening the file at its line, middle-click or Ctrl+click a new tab; the
+  button then shows the count; `components/file_references.js`, labels escaped by the context menu), **🔗
+  Link**, **✎ Patch**, and **▾** overflow.
+- **⇄ Diff: the file against any file at any revision** (`webapp/frontend/js/views/code_view/file_diff.js`,
+  `VirtualEditor.enterFileDiff`):
+  - **Picker** (`showDiffPicker`): a **Revision** button opening the shared `refPicker` (§5.13, unscoped;
+    default: the tag preceding the tab's revision, `previousTag`, the rule the Compare view uses for its base,
+    read from `api.getVersionsCached()` so opening the picker sends no `/api/versions` request), a **File**
+    box (default: the same path; suggestions from `api.searchFiles` *at the picked revision*), **Quick picks**
+    (*This file @ previous tag*, and every other open code tab's file at its revision) and *Picked file is the
+    target* (swap). **Show diff** / Enter applies; Cancel, Escape or a click outside changes nothing.
+  - **Direction**: by default the picked file is the **base** and the tab's own file the **target**; swapped,
+    the tab is the base.
+  - **Full diff in place**: `api.getBlobDiff` (`GET /api/tools/diff/blobs`, cached as `bdiff_*`) returns only
+    the changed lines; `buildDiffRows` rebuilds every line of both files from those hunks and the text the tab
+    already shows (rows `{k, o, n, t, s}`, `s` = the tab's own line), so a 10k-line file costs only its
+    changes on the wire. The viewport stays virtualized over the diff rows, and the minimap draws them with a
+    green / red bar per added / removed row.
+  - **Layouts**: **unified** (one column: old and new line numbers, `+`/`−` sign) or **side-by-side**
+    (`pairDiffRows`: base left, target right, the removed and added lines of a block paired row by row, filler
+    rows hatched); toggled with ☰/◫ in the chip and kept on the tab (`diffLayout`). The minimap marks a
+    changed pair amber.
+  - **Chip** `⇄ <base> → <target> +A −D n/N ☰|◫ ↑ ↓ ⇆ ✕`: sides read `v2.6.39` for the same path or
+    `v3.0:kernel/sched_fair.c` for another file; ↑/↓ jump between change blocks (`jumpToDiffHunk`; the counter
+    reads `–/N` until the first jump, then `n/N`, in a fixed width of `2·digits(N)+1` characters so the chip
+    never shifts while navigating), ⇆ swaps base and target, ✕ returns to the plain file at the line the diff
+    was showing. Identical files show *identical*, a diff past the server's limits *⚠ truncated* (its rows
+    stop after the last loaded change); binary files and errors (missing path, directory, unknown revision)
+    are reported by a toast and leave the tab as it was.
+  - **What still works**: rows that are lines of the tab's own file keep syntax highlighting, AST tokens,
+    `#ifdef` dimming, the context menu and middle-click, with their real line number (`data-line-no`); the
+    other file's lines are plain text. Blame is disabled and the commit diff-marks chip hidden while a diff is
+    shown (both annotate the plain file). Copying a multi-line selection copies what is shown instead of the
+    raw buffer (`FidelityClipboard` gets no lines in diff mode).
+  - **State**: the tab records `diffWith: {version, path, swap}` and `diffLayout` (`state.updateTabState`,
+    replace-only: the URL changes without a new history entry), so the diff survives tab switches, re-renders
+    and reloads, and the hash carries it (`dv`, `dp` when the path differs, `ds=1`, `dm=split`; §5.26).
+    **Patch source** (P1): `diffWith: {kind: "patch", mids, revision, applyId}` diffs the tab's file (the
+    base, left) against what those mailing-list patches make of it (`GET /api/mail/apply/{id}/file`,
+    re-applied when the id is unknown or evicted); the chip reads *v7.3 → patched (3 messages)* and has no
+    swap; the hash carries `dk=patch&dmid=<message ids>` instead of `dv`. A code deep link without `dv` (or
+    `dk`) addresses the plain file, so a reused tab drops its diff (`state.openTab`); a link that changes the
+    diff drops the tab's saved scroll position. Entering, swapping or leaving a diff keeps the reader at the
+    same line of the own file. No other state changes, so §5.0 needs no confirmation.
+- **Saved position**: the viewport's `scrollTop` is kept on the tab (`tab.scrollTop`, written on scroll and
+  persisted debounced), so selecting the tab again — which reloads and re-renders the file — comes back
+  exactly where it was left. Opening an already open file *at a line* (`cursorLine`, e.g. from a definition,
+  an XRef or a commit diff) drops that saved position (`state.openTab`), so navigation still wins over it;
+  applying another revision to the tab drops it too. The viewport is marked `data-scroll-restore="off"`, so
+  the generic tab scroll memory (§5.28) leaves it to this logic, and its saves go through the same debounced
+  `scheduleScrollSave()`; every other scrollable part of a code tab (the rendered documentation viewport and
+  its sidebar) is kept by §5.28.
+- **Minimap to scale**: `minimapMetrics()` maps the document (`lines × 20px`) onto at most one pixel per line,
+  so the drawing is exactly as deep as the file is long and the track below the last line is shaded rather
+  than pretending to be content. The slider's height is the share of the document the viewport shows and its
+  travel is `mapHeight − sliderHeight`, so at the bottom of the file its lower edge meets the last line
+  instead of running past it (it is also looked up inside the tab's own container, so split panes no longer
+  share one slider). Clicking or dragging the minimap scrolls to that position, and a `ResizeObserver` on the
+  editor body redraws it when the pane, the window or the sidebar changes its size.
+
+- **Outline, sticky scroll and the current definition** (`outline_panel.js`, `outline_model.js`, G03): after
+  the file loads, its definitions come from `GET /api/fs/outline` (§4.2; cached in the `files` store under the
+  revision's stamp) — or, for a `Kconfig*` file, from its own text (`kconfigOutline`: `config` / `menuconfig`
+  entries nested in `menu` … `endmenu`, `choice` … `endchoice` and `if` … `endif`).
+  - **☰ Outline** (toolbar, part of the overflow order; disabled with *Outline needs an indexed file* when
+    there is none) opens a side panel between the code and the minimap: a filter box (Enter jumps to the first
+    match, Escape clears it), the definitions grouped by kind (Functions, Types, Macros, Variables, Kernel
+    API, Kconfig, Constants, Declarations; a group header folds it) with nested members, each with its line. A
+    click scrolls to the definition and selects its first line. The definition containing the top visible line
+    is highlighted and kept in view. The panel's open state is kept on the tab (`outlineOpen`), not in the
+    URL.
+  - **Sticky scroll**: while the top of the viewport is inside a function, a type or a Kconfig menu spanning
+    several lines, the first line of that definition is pinned over the top of the viewport (rendered like a
+    normal row), two nested levels at most (`stickyLines`: a pinned row hides the line under it, so
+    containment is tested below the pinned rows). Clicking a pinned row goes to the definition. In a diff it
+    follows the tab's own lines and hides over rows of the other file. The settings popover's *Sticky scroll*
+    checkbox turns it off (`localStorage["kip-sticky-scroll"] = "off"`).
+  - **Breadcrumb**: `› <name>` of the definition the viewport is in is appended to the path; clicking it goes
+    to that definition.
+- **Line ranges and links** (`permalink.js`, G06): clicking a line number selects that line, Shift+click
+  extends the selection from the selected line, dragging in the gutter selects a range; the selected lines are
+  highlighted (`highlighted-line`) and recorded on the tab as `cursorLine` and `lineEnd`
+  (`state.updateTabState`, replacing the history entry), so the URL carries `line=<a>-<b>` (§5.26). Opening
+  such a link centres the range. In a diff the selection covers the tab's own lines (rows carry their own-file
+  line number).
+  - **Copy actions** — in the line's context menu (the selection when the line is in it, else that line) and
+    behind the toolbar's **🔗 Link** button (it overflows first on narrow toolbars): *Copy Permalink* — the
+    link with `v=<sha12>` instead of a tag or branch, so it never drifts when a branch moves (the tab's
+    revision when it is already a SHA, else the SHA of its catalog stamp `<sha12>.<…>`, §2.11; the diff keys
+    `dv`/`dp`/`ds`/`dm` of a shown diff are kept); *Copy Link (follows the revision)* — the same link with the
+    revision name; *Copy as Markdown* — ``[`path:a-b` @ v3.0 (sha12)](<permalink>)`` followed by the lines in
+    a fenced block whose language comes from the grammar registry (`fenceLanguage`: `c`, `rust`, `asm`,
+    `make`, `kconfig`, `dts`, …; the fence is longer than any backtick run of the code); *Copy External Link*
+    — the same lines on the repository's own web viewer, built from the project's `git_url` (`GET
+    /api/projects`): kernel.org cgit (`…/tree/<path>?id=<sha>#n<a>`), GitHub (`…/blob/<sha>/<path>#L<a>-L<b>`)
+    or GitLab; hidden for other hosts.
+- **Blame** (`blame_view.js`, `blame_options.js`): **Blame** annotates every line with the commit that last
+  changed it; the choice is kept on the tab (`tab.blame`, `bl=1` in its URL, §5.26), so a re-rendered or
+  reopened tab shows it again once the file is loaded. While blame is on, **⚙** (`#btn-blame-opts`) opens its
+  options — *Follow lines moved within the file* (`-M`), *Follow lines copied from other files* (`-C`, marked
+  slow; a blame that took more than 10 s says so in a toast) and *Ignore whitespace changes* (`-w`) — kept on
+  the tab as `blameOpts` (`bo=mcw`). A line whose blamed source is another file (`source_path`, after
+  `-M`/`-C`) is marked **↪** in the gutter, with *moved from `<path>`* in its tooltip.
+  - **Blame Before This Change** (editor context menu, next to *View Line Blame & Commit Details*): opens the
+    file as it was in the parent of the commit that last touched the line (`previous_sha`, under its name
+    there, `previous_path`), with blame on, at the line's number in the blamed commit (`orig_line`: the
+    parent's line is approximate, so the item reads *≈ line N*). Middle-click or Ctrl/Cmd+click opens a new
+    tab. For a root commit the item is disabled (*root commit*).
+- **Find in file** (`find_bar.js`, matching in the pure `find_model.js`): the view is virtualized, so the
+  browser's own find only sees the rows on screen. `Mod+F` (shortcut `code.find`, §5.31; in rendered
+  documentation mode it focuses the page's *Quick search* instead, §5.14) opens a bar at the top right of the
+  editor body, prefilled with a single-line selection: the query, **Aa** (match case), **ab|** (whole word: no
+  letter, digit or `_` on either side) and **.\*** (JavaScript regular expression; an invalid one shows its
+  error under the box), the count `n/N`, ↑/↓ and ✕.
+  - **Whole file**: the search runs over the raw line buffer (`rawLines`, what `FidelityClipboard` slices) —
+    or, while a diff is shown, over every diff row (unified rows; both halves of side-by-side pairs) — never
+    over the DOM. At most 10,000 matches are kept (`n/10000+`); buffers of more than 50,000 rows are searched
+    in chunks between idle callbacks, with a running count. Zero-width regex matches are skipped, never looped
+    on.
+  - **Walking matches**: `Enter` / `F3` next, `Shift+Enter` / `Shift+F3` previous (wrapping); a new search
+    starts at the first match at or below the top of the viewport. The current match is scrolled to the
+    vertical centre.
+  - **Highlights**: after each render of the visible rows (`updateVisibleLines()` / `renderDiffLines()`, rows
+    carry `data-row`), the matches of a row are wrapped in `<mark class="find-match">` (`current` for the
+    current one) by splitting the row's text nodes at the match offsets (`rangesToNodePieces`), so any token
+    structure keeps working: AST token clicks, the context menu and copy are unaffected. The minimap draws one
+    tick per matching row on its right edge.
+  - **State**: `tab.find = {query, caseSensitive, wholeWord, regex, open}` is kept on the tab, so the bar
+    survives re-renders and tab switches; it is not part of the URL. `Escape` in the box closes it. The count
+    is announced (`aria-live="polite"`).
+
+### 5.22. Mailing List & LKML Discussions Tab (`webapp/frontend/js/views/mail/mail_view.js`, `webapp/frontend/css/mail.css`)
+1. **Activity Bar & Navigation**:
+   - The Activity Bar features a dedicated **Mailing List** envelope icon (`data-action="mail"`) opening or
+     focusing a singleton `mail` tab (`[L]` badge in tab strip).
+   - Bi-directional URL synchronization via
+     `#tab=mail&tid=<threadId>&mid=<messageId>&q=<query>&f=<filter>&mode=<search|tree>`: the query, the filter
+     chip, the left-column mode, the open thread and the focused message are all in the hash, so copying the
+     URL reopens that same search with that same email open (§5.26).
+   - Command palette mode `@` (`@<search query>`, §5.15) searches LKML discussions directly from any tab.
+2. **Integrated Two-Column Architecture**:
+   - **Left Column (two modes, `.mail-list-switcher`)**: a segmented switcher (`🔍 Search` / `🌲 Thread Tree`)
+     swaps the two panes (`#mail-search-pane`, `#mail-tree-pane`; the inactive one carries `hidden`). The mode
+     is kept on the tab (`tab.listMode`) and in the URL (`&mode=tree`), so a reopened or reloaded tab comes
+     back in the mode it was left in. The offline banner stays above both panes.
+     - **Collapsible Left Column**: a collapse button in the switcher bar (`#btn-mail-collapse`, the default
+       collapse icon `COLLAPSE_ICON` of the sidebar, §5.27) folds the left column into a 28 px rail on the
+       left (`.mail-view-container.list-collapsed`); clicking the rail (`#btn-mail-expand`, the mirrored icon
+       and *Mailing List*) unfolds it. The state is kept on the tab (`listCollapsed`) and in the URL (`lc=1`,
+       §5.26). When folded, search results are not loaded until unfolded (`listLoaded`).
+     - **Search mode** (`#mail-search-pane`):
+       - Real-time debounced typeahead search input (`s:`, `f:`, `m:` prefix support).
+       - Filter chips (`All`, `Patches`, `Cover Letters`, `Pull Requests`) with categorical badge highlights.
+       - Scrollable results roster with pagination (`Load More (N of Total)`): each click raises `currentPage`
+         and merges the next page into `results` (deduplicated by `message_id`/`num`). The control is enabled
+         whenever no request is in flight — `isLoadingSearch` is cleared *before* `renderResultsList` draws
+         it, so the button never renders permanently stuck on `Loading...` — a click while loading is ignored,
+         and a page that adds no new message retires the control (`totalResults` clamped to the rows actually
+         held, `currentPage` rolled back), since the archive's `total` is a lower bound (§4.8).
+       - With no query typed, the roster is the chronological browse listing and **excludes messages dated in
+         the future** (§4.8); typing a query that matches them brings them back.
+       - Middle-click multi-tab opening: middle-clicking any search result opens the thread in a new
+         standalone tab.
+     - **Thread Tree mode** (`#mail-tree-pane`, replaces the former mini timeline outline):
+       - **Revision picker** (`.mail-version-chips`): one chip per revision of the series (`v1`, `v2`, ...
+         each with its message count), from `GET /api/mail/versions` (§4.8). The chip of the revision on
+         screen is active; choosing another loads that revision's thread (`inspectThread` on its `tid`,
+         focused on its cover letter) and redraws the tree, so a multi-version patch series is navigated
+         without going back to search. A single-revision series states so instead of showing one chip; nothing
+         is shown when no thread is open.
+       - **Reply tree** (`buildThreadTree`): the hierarchy is derived from each message's `References` chain —
+         the closest reference that is present in the thread and is not already a descendant becomes the
+         parent (cycle-safe), and a patch with no resolvable parent attaches to the series cover letter. Roots
+         are ordered chronologically, as are the replies under each node.
+       - **Expandable nodes**: a node with replies carries a twisty (`▸`/`▾`) and a `↳ N` count of the
+         messages below it; collapsed replies are revealed by expanding it. Root rows and the branch holding
+         the focused message open by default, and an explicit expand or collapse is remembered for that thread
+         (`treeOpen`). Each row shows its patch badge (`0/N`, `i/N`, `PULL`, `RE`), the subject with its reply
+         prefixes and bracket tag stripped, the author, the date and the bracket tag itself.
+       - **Selection**: clicking a row expands and scrolls to that email card in the conversation column
+         (`focusMessageCard`) and records it as the tab's `mid`; middle-clicking opens that message in a new
+         standalone mail tab. When one thread carries several revisions, the tree shows only the branches of
+         the selected revision.
+   - **Right Column (Conversation & Patch Viewer)**:
+     - Top thread summary card showing root subject, message count, participant count, and external
+       `lore.kernelinfo.org ↗` link.
+     - **Thread & Card Scroll Containment**: Enforces strict flexbox containment (`min-height: 0; min-width:
+       0; flex: 1 1 0%`) on `.tab-content-container`, `.mail-detail-col`, `.mail-thread-wrapper`, and
+       `.mail-messages-container` with `flex-shrink: 0` on individual email cards (`.mail-card`). This
+       guarantees that multi-thousand-line emails, large patch series, and raw RFC-822 payloads scroll
+       vertically in their entirety without clipping.
+     - **Collapsible Message Cards & Responsive Header Layout**: Accordion-style email cards with author
+       avatar/name, email, timestamp, and status badges. Employs a balanced two-row responsive container
+       layout (`container-type: inline-size; container-name: mailcard`): Line 1 groups toggle chevron, author
+       name, email, and patch badge on the left with the date pushed to the right; Line 2 places the message
+       subject on the left with action buttons (`Beautified/Raw`, `Copy`, `Download`, `Lore ↗`) on the right.
+       Under narrow widths or split-pane pressure (`@container mailcard (max-width: 520px)`), author email
+       collapses into tooltip hover to preserve critical author/patch badges, the subject spans the full card
+       width with ellipsis, and action buttons cleanly wrap to Line 3 right-aligned without clipping or
+       horizontal overflow.
+3. **Beautified & Raw Dual-Mode Viewing**:
+   - Segmented toggle (`Beautified` / `Raw`) on every message card:
+     - **Beautified Mode**: Formatted in monospace (`font-family: var(--font-mono)`) with `white-space:
+       pre-wrap; word-break: break-word` to preserve indentation of kernel code snippets, ASCII diagrams, and
+       stack traces; indented and tinted quote blocks (`> ...`), highlighted trailer lines (`Signed-off-by:`,
+       `Acked-by:`, `Reviewed-by:`), collapsible RFC-822 header drawer, and structured interactive diff
+       viewer.
+     - **Raw Mode**: Monospace view of the unparsed RFC-822 / git-am formatted message with horizontal
+       scrolling for long lines.
+     - **Instant Cached Re-rendering**: Cached message details in `loadedMessageDetails` are immediately
+       rendered whenever an email card opens or mode toggles, avoiding infinite loading spinners when
+       switching modes or expanding cards.
+   - Action controls: `📋 Copy` RFC-822 text to clipboard, `⬇ Download` `.eml` / `.patch` file, and direct
+     `Lore ↗` permalink.
+   - **Archive host**: every outbound permalink points at the self-hosted public-inbox mirror
+     `https://lore.kernelinfo.org/all/` (a clone of `lore.kernel.org`), defined once per side as
+     `LORE_BASE_URL` in `webapp/backend/services/mailing_list_service.py` (reused by
+     `webapp/backend/services/git_service.py` for commit linkage) and in
+     `webapp/frontend/js/views/mail/mail_view.js`. `Link:` trailers inside upstream commit messages are
+     untouched: they are historical kernel data pointing at `lore.kernel.org`.
+4. **Interactive Patch Viewer**:
+   - Unified diff hunks are parsed into structured file cards showing path, old/new line numbers, additions
+     (`+N`), and deletions (`−N`).
+   - File cards feature a 1-click **Open ↗** button that opens the modified file directly in the Virtual Code
+     Editor at the modified line.
+   - Clicking individual hunk diff rows navigates to the exact line in the code view.
+5. **Caching & Offline Resilience**:
+   - IndexedDB store (`localDB.mail` under DB version 4) acts as both an active read-through cache (preventing
+     repetitive network and SSH tunnel requests for immutable emails) and an offline fallback when network
+     connectivity is lost. Search results, threads and revision lists (`versions`) are cached; failed or empty
+     mail payloads never are.
+   - Automatically displays an inline warning banner with a **Retry** button when the daemon or SSH tunnel is
+     offline, smoothly rendering cached conversations.
+6. **Commit View Integration**:
+   - Commit detail cards display linked mailing list discussions (`Patch`, `Cover Letter`, `Pull Request`)
+     with tier tags (`Trailer`, `Patch-ID`, `BlobHash`, `MetadataFallback`).
+   - Clicking any linked email opens the Mailing List tab focused on that specific thread and message.
+   - Incorporates an on-demand **Auto-resolve from LKML** action for unlinked commits, resolving against the
+     micro-daemon over SSH tunnel dynamically without modifying MySQL tables.
+
+- **Try a patch on a revision** (P1, `patch_try.js`): patch cards have **Try on revision…** and the thread
+  header **Try the series…** (the newest version of the series in `[PATCH i/N]` order, cover letter included
+  for its `base-commit:`); both open the revision picker and apply in memory (`POST /api/mail/apply`). The
+  results dialog lists each patch with its status, then each file (applied, offset, created, deleted, renamed,
+  failed with the reason, unsupported) and its hunks; a failed hunk shows its expected line, the pre-image and
+  the nearest region (*k/n lines match*, a link opening the code there). **Open patched file** opens the file
+  at that revision in **⇄ Diff** mode against the patched text (diff source kind `patch`, §5.21); **View new
+  file** shows a created one; **Try on base-commit …** re-runs on the series' own base when the repository has
+  it.
+- **Merged state of a thread** (P2, `merged_render.js`): the thread header shows *Merged k/N · v3.1* (*Merged
+  · not released yet*, *Not merged*, or *Merged: unknown* when the lookup failed), from `api.getMergedCommits`
+  (`GET /api/mail/merged`; cached in the `tools` store under the `parsed` token, since the parser may link
+  more commits later). Clicking it lists the commits (`[i/N]` subject, first release); a click opens one in
+  the Commits tab, middle-click or Ctrl/Cmd+click in a new one. Message cards of patches that landed get a
+  *Merged as `<sha12>`* link.
+
+### 5.23. Multi-Window Workspace Sessions & Cross-Tab Coordination (`webapp/frontend/js/session_manager.js`, `webapp/frontend/js/components/session_modal.js`)
+1. **Window-to-Session Isolation & Cloned-Storage Protection**:
+   - `sessionStorage` pins each individual browser window/tab to an active workspace session
+     (`sessionStorage["kip_active_session_id"]`), while full session documents are stored under
+     `localStorage["kip_session_<id>"]` and indexed in `localStorage["kip_sessions_index"]`. A session
+     document holds the panes, tabs and engine descriptors only (KConfig configurations are shared, §5.8).
+     `state.saveState()` coalesces the saves of a burst (`SAVE_STATE_DELAY_MS`, 300 ms: every tab switch,
+     tab-state update and scroll pause asks for one) and `state.flushState()` writes a pending one now: on
+     `pagehide`, when the page is hidden, before another session is adopted or the current one duplicated, and
+     before a tab is transferred. Full Local Reset suspends persistence (`state.suspendPersistence()`) so
+     nothing is written back after the wipe.
+   - **Cloned-Storage Protection**: Modern browsers duplicate `sessionStorage` when a tab is duplicated,
+     opened via `target="_blank"`, or created with `window.open`. To prevent new tabs from silently inheriting
+     and overlapping with the parent tab's session, `SessionManager` assigns a unique Window ID (`window.name
+     = "kip_win_<id>"` matched against `sessionStorage["kip_window_id"]`). If a mismatch is detected on
+     startup, the cloned session pin is cleared and the Session Picker modal is presented.
+   - **Refresh (F5) Seamlessness**: When a window reloads, its `window.name` matches its
+     `sessionStorage["kip_window_id"]`, seamlessly rehydrating its pinned session without prompting.
+2. **Distinct Session IDs & Duplication**:
+   - Every session receives a distinct, human-readable base-36 timestamped identifier (`sess_<time36>_<rand>`,
+     e.g. `sess_m2k8x3w_9a2f1c`).
+   - Sessions can be cloned via `sessionManager.duplicateSession(sessionId)`, allowing users to branch off an
+     existing workspace's open tabs and split panes into a new independent session without state overlap. The
+     copy is read with `sessionManager.readSession(sessionId)` (not `loadSession`, which pins — and therefore
+     claims — the original), and its tabs get **fresh ids** (`SessionManager.remapPaneTabIds`): tab ids
+     identify engines across windows (§5.23.5), so a copy keeping them would announce its engine under the
+     original's id and its code tabs would follow the original's engine. `pane.activeTabId` and every
+     `tab.kconfigEngineTabId` pointing at a copied tab are remapped with them, while one following an engine
+     of another session is left alone.
+   - **The engines come with the copy**: `kconfigEngineTabIds` and `kconfigEngineProfiles` are carried over
+     under the remapped ids, so duplicating a session whose KConfig tab resolves a configuration gives a copy
+     that resolves it too, instead of one whose engine is off. `createSession({kconfigEngineTabIds,
+     kconfigEngineProfiles})` takes them for every session built around tabs that already exist (duplication,
+     drag-out elevation, §5.24.3); the values themselves are not copied — they are shared under `profileKey`
+     (§5.8) and rehydrated by `adoptSession`.
+3. **Session Picker Modal (`showSessionPickerModal`)**:
+   - When an unassigned window is opened (e.g. opening a new browser tab or opening a tab after closing a
+     previous session): if only one saved session exists in the registry and is not currently active in
+     another window/tab, it is entered automatically (`state.loadState()` adopts it without prompting). If
+     multiple saved sessions exist, or the single session is already active in another window/tab, the Session
+     Picker modal is presented (`allowClose: false` on startup, `allowClose: true` on manual switch),
+     preventing automatic takeover loops across concurrent tabs. If no saved sessions exist, a default session
+     is created.
+   - Displays session cards with active window badges, timestamps, revisions, repository badges, explicit
+     session IDs, and tab preview chips (`type` + `title`).
+   - Real-time cross-tab presence tracking tags sessions currently open in other tabs with an `"Open in
+     another tab · Open takes it over"` warning badge (its tooltip points at **Duplicate** for working on a
+     copy instead).
+   - **Exclusive ownership — taking a session over**: a session is open in **one window at a time**, so
+     **Open** on a session already in use elsewhere simply takes it: no confirmation is asked and nothing
+     overlaps. Pinning the session broadcasts the claim (`session:takeover`, below), the window that held it
+     is signed out of it on the spot — it stops writing to that session, the picker opens there with
+     `allowClose: false` and a toast says the session continues in another window — and this window gets a
+     toast naming the session it took over. Nothing is lost: the session is the same record either way, and
+     **Duplicate** branches it into an independent session instead (§5.23.2).
+   - Actions to **Open**, **Duplicate**, **Delete** (with confirmation), or create a **➕ New Session**.
+4. **Header Session Controls**:
+   - The top header navigation features a dedicated `.session-selector-container` with `#session-picker-btn`.
+   - Displays the current session's human-readable name with a caret dropdown and tooltip with session name
+     and ID.
+   - Dropdown menu header displays full session ID (`ID: sess_...`) with click-to-select styling.
+   - Dropdown menu actions:
+     - **🗂 Switch Session…**: Opens the Session Picker modal.
+     - **➕ New Session…**: Prompts for a session name, provisions a clean session with distinct ID, and
+       switches to it.
+     - **⧉ Duplicate Session…**: Clones the current session and tabs into a new session instance.
+     - **✏️ Rename Session…**: Updates the session's name locally and broadcasts the change across tabs.
+     - **🗑 Close Session**: Prompts confirmation, deletes the session from `localStorage`, unpins the window,
+       broadcasts closure remotely; if exactly one session remains in the registry and is not active in
+       another tab, switches to it automatically, otherwise re-opens the Session Picker modal.
+5. **Cross-Tab Real-Time Coordination (`BroadcastChannel("kip_multi_tab")`)**:
+   - Synchronizes running Kconfig engines, live constraint assignments, active window presence, and session
+     lifecycle events across windows without polling.
+   - Messages: `kconfig:request_engines`, `kconfig:engine:announced`, `kconfig:engine:revoked`,
+     `kconfig:assignments:broadcast`, `session:renamed`, `session:closed`, `session:takeover`,
+     `window:heartbeat`, `window:request_active`, `window:unloading`, the tab-transfer trio `tab:drag:start`,
+     `tab:drag:end`, `tab:transfer:accepted` (§5.24.4), and the directed `tab:push` (§5.24.5).
+   - **Exclusive session ownership** (`session:takeover`): `sessionManager.pinSessionToWindow()` always ends
+     in `claimSessionExclusively(sessionId)`, so *every* way of entering a session (picker **Open**,
+     `?session=<id>`, a new or duplicated session, F5 rehydration) claims it. The claim is unconditional
+     rather than conditional on presence, so it holds even when the other window's heartbeat has not been
+     seen. A window receiving a claim for the session it holds calls `unpinSessionFromWindow()` (which also
+     posts `window:unloading`, retiring its presence and the engines it was announcing) and emits
+     `session:taken_over`; `GlobalState` clears `currentSessionId`/`currentSessionName` — stopping every
+     further write to a session this window no longer owns, since a save only calls `saveActiveSession()`
+     while a session is pinned and the pending (coalesced) save is dropped rather than written
+     (`unpinSessionFromWindow({flush: false})`, as for a deleted session) — and re-emits `session:taken_over`,
+     on which `KernelIdeApp` re-labels the header and opens the Session Picker with `allowClose: false`. A
+     window ignores its own claim (`winId`).
+   - **Presence heartbeat**: `broadcastWindowHeartbeat()` runs on startup, on every pin **and every 10s**
+     (`HEARTBEAT_INTERVAL_MS`), backed by a synchronous `localStorage` active windows registry
+     (`kip_active_windows`) alongside `BroadcastChannel` messages. Because `isSessionActiveInOtherWindow()`
+     checks the registry immediately on startup, a newly opened tab can reliably detect concurrent active tabs
+     synchronously, preventing accidental takeovers and ping-pong loops. Entries older than 30s are pruned
+     automatically.
+   - **Remote engine registry** (`sessionManager.remoteEngines`, keyed by the engine's tab id):
+     `kconfig:engine:announced` carries the announcing window's `winId` alongside its session, so an engine is
+     dropped again when its window goes away (`window:unloading` → `dropRemoteEnginesOf`, matched on `winId`)
+     or when its session is closed elsewhere (`session:closed`). **Only the window that announced an engine
+     may retire it**: `kconfig:engine:revoked` carries the revoking `winId` and a registry entry is dropped
+     only when it matches, because a tab transferred to another window (§5.24.4) runs its engine there under
+     the same tab id — the window it left revokes that id just after the new one announced it, and an unscoped
+     revoke would drop an engine that is still running. **Switching session also retires that window's
+     engines** (`adoptSession` revokes every engine of the session being left before adopting the next one),
+     so no code tab keeps dimming against a configuration nobody resolves any more. Dropping one emits
+     `kconfig:remote_engines:updated`, which `GlobalState` re-emits as `kconfig:engine:changed` with `remote:
+     true` (below) so every code tab following that engine falls back instead of dimming against a
+     configuration nobody resolves any more.
+   - **Live assignments**: `kconfig:assignments:broadcast` carries the engine's full descriptor (`title`,
+     `version`, `arch`, `configName`, `profileKey`) with the values, not just the values, because the KConfig
+     tab may have moved to another ARCH, revision or configuration name since it announced itself; the
+     receiving window updates its registry entry from it, so a code tab in another session re-dims against the
+     right ARCH on every edit. A broadcast for an engine this window never heard announced (its window was
+     opened later, or the engine was enabled before this window had a session) answers with
+     `kconfig:request_engines` instead of being dropped, so the engine registers and the next edit arrives as
+     an update.
+   - **`remote: true` on `kconfig:engine:changed`**: an engine of *another* session appearing or going away
+     changes what the code tabs here can follow, but no KConfig tab of this window gained or lost its own
+     engine, so `KconfigView` ignores those events (it would otherwise re-run its engine-resolution
+     confirmation, §5.0, on every announce from another window) while `VirtualEditor` acts on them like any
+     other engine change.
+
+- **Export / import** (G07, `components/session_transfer_ui.js`, `utils/session_transfer.js`): each card of
+  the Session picker has **⤓ Export** — a `kip-session` v1 JSON file `{format, version, exported_at, build,
+  repository, session: {name, version, selectedBranch, splitMode, activePaneId, panes, kconfigEngineTabIds,
+  kconfigEngineProfiles}, kconfig: {profiles, toolchains}, user?: {records}}` holding the configurations and
+  toolchain profiles its KConfig tabs and engines use (or every saved one, a checkbox) and optionally the user
+  data (bookmarks, notes, tours, §5.5). **⤒ Import…** in the picker header reads such a file, which is
+  untrusted: at most 5 MB, known tab types only, repository paths without `..`, strings capped, unknown fields
+  dropped, configuration values checked (`validateSessionFile`). A repository the server does not have is
+  offered to be mapped to the active one. The import always creates a **new** session (*name (imported)*,
+  fresh tab ids remapped as in duplication, engines carried); configurations absent here are added, identical
+  ones skipped, and when one differs from the local one a dialog asks per key — *Keep mine* (default), *Use
+  imported* (replaces yours) or *Import as a copy* (a new configuration name, the imported tabs and engines
+  re-pointed to it); Close imports nothing (§5.0). With nothing to decide there is no dialog, a toast says
+  what was imported. User records are added without overwriting (`skip-existing`).
+### 5.24. Universal Tab Drag-and-Drop, Pane & Cross-Session Transfers, Drag-Out Elevation & Tab Menu (`webapp/frontend/js/components/tabs.js`, `webapp/frontend/css/tabs.css`)
+1. **Intra-Pane Tab Reordering & Scroll Preservation**:
+   - Tabs carry `draggable="true"` and register `dragstart`, `dragend`, `dragover`, and `dragleave` event
+     handlers.
+   - While dragging over a tab strip, mouse coordinate tracking calculates the midpoint of each tab to
+     position an animated visual drop indicator line (`.tab-drop-indicator`).
+   - Dropping within the same pane reorders `pane.tabs` in `state.panes` and emits `tabs:changed`.
+   - **Tabstrip Horizontal Scroll Preservation**: Switching or clicking tabs maintains the `.tabstrip` and
+     `.tab-list` horizontal scroll position (`scrollLeft`) across DOM renders per pane, restored both
+     synchronously and via `requestAnimationFrame` to prevent the tabstrip from resetting its horizontal
+     scroll offset to 0.
+2. **Inter-Pane Tab Transfers**:
+   - Tabs can be dragged and dropped between different split panes (e.g. from `pane-1` to `pane-2` or
+     vice-versa).
+   - Dropping onto the target pane's tab strip inserts the tab at the hovered index; dropping onto the pane's
+     content container appends it to the target pane.
+   - Transfer preserves tab metadata, cursor line, scroll position, and view state. If the tab was running a
+     Kconfig engine, engine ownership transfers with it.
+3. **Drag-Out Elevation to New Browser Window**:
+   - Dragging a tab outside the browser window boundaries (detected on `dragend` from
+     `clientX`/`clientY`/`screenX` leaving the window) elevates the tab into a new browser window.
+   - Creates a new workspace session pre-populated with the dragged tab, closes the tab in the source window,
+     and launches the new browser window via `window.open("/?session=<newSessionId>", "_blank")`. Both the
+     drag-out and the **Open on New Browser Tab** menu entry (§5.24.5) go through the same
+     `elevateTabToNewWindow(tab, sourcePaneId)`.
+   - **The engine travels with the tab**: a KConfig tab holding an engine is elevated *still holding it* — the
+     new session is created with `kconfigEngineTabIds: [tab.id]` and that engine's descriptor (`version`,
+     `arch`, `configName`, `profileKey`), and the new window's `adoptSession` rehydrates its values from the
+     shared configuration under `profileKey` (§5.8). A configuration being resolved is therefore never
+     switched off on the way into its own window.
+   - **Elevation waits for a possible transfer** (`TRANSFER_GRACE_MS`, 250ms): another window of the same
+     browser is "outside" this one too, so a drop that landed in another session (below) would otherwise
+     *also* spawn a window. `dragend` defers elevation, and the `tab:transfer:accepted` message — which may
+     arrive just after it — cancels it; a tab that is gone from `state` by then is not elevated either.
+
+4. **Cross-Session Transfers Between Windows** (`state.tabTransferPayload`, `state.acceptTransferredTab`):
+   - A tab is dragged **from the window of one session straight into the window of another** and dropped on
+     its tab strip (at the hovered index) or on a pane's content area. Since a session is open in one window
+     at a time (§5.23.3), two windows are what it takes to see both sides; the tab **moves**, it is not
+     copied.
+   - `dragstart` puts `state.tabTransferPayload(tab, paneId)` — the tab,
+     `sourceWinId`/`sourcePaneId`/`sourceSessionId`/`sourceSessionName`, and for a KConfig tab `{engineActive,
+     profileKey, version, arch, configName}` — into the drag as `application/kip-tab` **and** as `text/plain`
+     prefixed `kip-tab:`, and announces it with `tab:drag:start`. `dragend` posts `tab:drag:end`. The
+     announcement is the fallback for browsers that hand a custom data type only to the window the drag
+     started in; `dragPayloadFrom` prefers the drag's own data, ignores drops carrying `Files`, and expires an
+     announcement after 120s (`sessionManager.getIncomingTabDrag`).
+   - A window with **no session pinned** (its Session Picker is up) refuses the drop with a toast instead of
+     taking the tab: it writes nothing while unpinned (§5.23.5), so the tab would be lost. The source window
+     closes its copy only once another window has said it took it.
+   - The receiving window recognizes a foreign drag by `sourceWinId` (its own goes through `moveTabToPane`),
+     inserts the tab with `state.acceptTransferredTab(payload, paneId, index)` and posts
+     `tab:transfer:accepted`; the source window closes its copy of that tab on that message and both windows
+     toast the move. The tab keeps its contents, cursor line and scroll position, gets a fresh id only if that
+     id is already open here (a duplicate of the source session), and its revision becomes the window's
+     through `syncVersionFromTab`.
+   - **A KConfig tab arrives still running its engine**: `acceptTransferredTab` registers it in
+     `kconfigEngineTabIds`/`kconfigEngines` under the descriptor it came with, re-reads that `profileKey` from
+     the shared configuration and toolchain stores (this window may hold an older copy in memory), announces
+     it to the other windows and emits `kconfig:engine:changed`, so the code tabs of the receiving session can
+     follow it at once (§5.16). The values themselves never travel in the drag: they are shared across
+     sessions under `profileKey` (§5.8).
+
+5. **Tab Right-Click Menu: Revision Exchange, Elevate & Push to Another Session** (`attachTabContextMenu`,
+   `applyCurrentTagToTab`, `getTabTag`, `pushTabToSession`, `acceptPushedTab`, `contextMenu.showTabMenu`):
+   - Right-clicking a tab opens the universal context menu (§5.6) on that tab — whichever pane it sits in, and
+     whether or not it is the active tab (only the pane is activated) — with these actions:
+     - **⤓ Apply Current Tag (`<ref>`)**: moves *this* tab to the revision selected in the header
+       (`state.selectedVersion`) — the header's **Apply**, aimed at the right-clicked tab rather than the
+       active one. It goes through `requestVersionSwitch(target, tab)`, so a KConfig tab gets the same
+       carry-over confirmation (§5.0) and nothing changes when it is dismissed. `state.setVersion(version,
+       tab)` moves the explored revision (`currentVersion`, `version:changed`) only when that tab is the
+       active one; a background tab is moved on its own (`tabs:changed`) and loads in the new revision when it
+       is next shown.
+     - **⤒ Get Tab Tag (`<ref>`)**: selects this tab's revision in the header (`state.setSelectedVersion`,
+       `version:selected`). Like every header pick it only moves the selection: no tab is switched.
+     - Both entries are disabled (`already on it` / `already selected`) when the tab's revision already equals
+       the header selection.
+     - **🗗 Open on New Browser Tab** (`moves it`): the same elevation as dragging the tab out of the window
+       (§5.24.3) — a new session is created holding the tab, with the engine it was running, this window
+       closes it, and the new browser tab opens pinned to that session.
+     - **↪ Push to Another Session…**: a second menu lists every other saved session, each marked `🟢 open`
+       when a window is holding it (`isSessionActiveInOtherWindow`) or `💤 saved` when none is; the entry is
+       disabled when no other session exists. Choosing one moves the tab there. The current session is never
+       listed.
+   - **Live push**: `sessionManager.broadcastTabPush(payload, targetSessionId)` posts `tab:push` carrying
+     exactly the drag payload (`state.tabTransferPayload`). The window whose `activeSessionId` matches emits
+     `tab:push:received`, and `acceptPushedTab` takes the tab with `state.acceptTransferredTab` into its
+     active pane and answers `tab:transfer:accepted` — so the push lands exactly as a cross-window drop
+     (§5.24.4) does, down to the KConfig engine arriving still running and the source window closing its copy
+     on the acknowledgement. A window with no session pinned takes nothing (§5.23.5).
+   - **Offline push**: no window answers within `PUSH_ACK_GRACE_MS` (400ms) — because no window holds that
+     session, or its presence entry was stale — so `sessionManager.pushTabToStoredSession(sessionId, payload)`
+     appends the tab to the stored record's active pane as its active tab (fresh id if that record already
+     holds the id), carries the KConfig engine descriptor into `kconfigEngineTabIds`/`kconfigEngineProfiles`,
+     refreshes the session index (`tabCount`, `previewTabs`) and only then is the tab closed here. The session
+     shows it the next time it is opened. Presence is therefore never trusted to decide where a tab goes: the
+     live path is tried first and the stored write is the fallback, so a tab is closed here only once
+     something has taken it.
+   - The session is written (`state.flushState()`) before the payload leaves; a KConfig tab's values travel
+     through the shared configuration store under `profileKey` (§5.8), written whenever they change, rather
+     than in the payload itself.
+
+### 5.25. Multi-Pane Split Editor Layout & Resizable Dividers (`webapp/frontend/css/layout.css`, `webapp/frontend/js/components/tabs.js`)
+1. **Split Button Specificity & Layout Fix**:
+   - Fixed CSS specificity issue where `#workspace { flex-direction: column; }` (ID specificity 0,1,0,0)
+     overrode `.split-horizontal` (class specificity 0,0,2,0), which caused "Split Editor Down" to render in a
+     horizontal row.
+   - Scoped rules `#workspace.split-horizontal { flex-direction: row; }` and `#workspace.split-vertical {
+     flex-direction: column; }` enforce proper orientation for "Split Editor Right" (side-by-side columns) and
+     "Split Editor Down" (stacked rows).
+2. **Cloned Tab Initialization & Focus**:
+   - Transitioning from `single` to split mode (`split-horizontal` or `split-vertical`) clones the currently
+     active tab into `pane-2` and immediately activates `pane-2` with focus, matching professional IDE
+     mechanics.
+   - Returning to `single` mode merges any open tabs from `pane-2` back into `pane-1` without closing them.
+3. **Active Pane Indication**:
+   - The active pane is styled with `.active-pane`, providing a subtle top accent bar and active tabstrip
+     background.
+4. **Draggable Divider Resizing**:
+   - Split panes are separated by `.pane-divider` with dedicated horizontal (`row-resize`) or vertical
+     (`col-resize`) handles.
+   - Dragging the divider computes flex-basis proportions dynamically for smooth, real-time pane resizing.
+
+### 5.26. Deep Links: the URL Hash as the Address of What a Tab Shows (`webapp/frontend/js/url_sync.js`, `state.updateTabState`)
+The hash is not merely "which kind of tab is open": it carries the state inside the active tab that a reader
+would otherwise have to reproduce by hand, so **copying the URL reopens the same search and the same target**.
+
+1. **Parameters per tab type** (`v` = revision and `tab` = type are always written; `q` is the search typed in
+   that tab's own filter box):
+
+| Tab | Hash |
+| --- | --- |
+| `code` | `#v=<rev>&tab=code&file=<path>&line=<n>\|<a>-<b>&dv=<rev>&dp=<path>&ds=1&dm=split&bl=1&bo=<m\|c\|w>` (`line=<a>-<b>`: a selected range, a reversed one is normalized; a *permalink* writes `v=<sha12>` so it never drifts; `dv`…`dm`: the **⇄ Diff** shown, or `dk=patch&dmid=<message ids>` for a patched-file diff (P1); `bl`: blame on, `bo`: its options — moves, copies, whitespace; §5.21) |
+| `explorer` | `#v=<rev>&tab=explorer&dir=<path>` |
+| `kconfig` | `#v=<rev>&tab=kconfig&arch=<ARCH>&cfg=<name>&sym=<SYMBOL>&q=<filter>&lc=1` (`lc`: tree column folded, §5.8) |
+| `mail` | `#v=<rev>&tab=mail&tid=<threadId>&mid=<Message-ID>&q=<query>&f=<patch\|cover\|pull>&mode=tree&lc=1` (`lc`: left column folded, §5.22) |
+| `commits` | `#v=<rev>&tab=commits&cid=<40-hex hash>&q=<query>&lc=1` (`lc`: commit list folded, §5.12) |
+| `diff` (Compare) | `#v=<rev>&tab=diff&a=<base>&b=<target>&st=<chips>&q=<filter>&rn=<similarity>:<dir>…` (Files), `…&mode=kconfig&st=<chips>&q=<filter>` (Kconfig) or `…&mode=api&k=<kinds>&st=<added,removed,changed>&q=<filter>&arch=<ARCH>` (API, A6) |
+| `maintainers` | `#v=<rev>&tab=maintainers&view=<developers\|credits\|patch>&sec=<sec_id>&person=<email\|id\|name>&q=<query>&role=<maintainer\|reviewer\|credits>&sort=alpha&lc=1` (`sec` and `person` are exclusive, `lc`: sidebar folded; §5.10) |
+| `nodemap` | `#v=<rev>&tab=nodemap` |
+| `pahole` | `#v=<rev>&tab=pahole&struct=<struct_name>&cmp=<rev>&hist=1` (Pahole struct layout, cachelines & padding holes; `cmp`: **⇄ Compare with…** another revision, `hist=1`: **📈 History**, N3) |
+| `callgraph` | `#v=<rev>&tab=callgraph&fn=<func_name>&to=<func_name>` (Bidirectional caller/callee callgraph; `to`: the **⇢ Find path to…** search shown, N2 — navigation, like `fn`) |
+| `status` | `#v=<rev>&tab=status` (parser status, §5.37) |
+| `patch` | `#v=<base>&tab=patch` (patch series, §5.33; the draft itself is session state) |
+| `watch` | `#tab=watch` (watch list, §5.36) |
+| `bookmarks` | `#tab=bookmarks&t=<tour>` (bookmarks & tours, §5.35; `t`: a shared tour, imported once as a new tour and removed from the address) |
+| `api` | `#v=<rev>&tab=api&view=<section>&arch=<ARCH>&q=<filter>&f=<chips>&sel=<key>&lc=1` (Kernel API, §5.29) |
+| `insights` | `#v=<rev>&tab=insights&view=<section>&r=<release>&w=<window>&q=<filter>&f=<chips>&sel=<key>&lc=1` (Insights, §5.30; `w`: releases of the Subsystem health window) |
+| `search` | `#v=<rev>&tab=search&q=<text>&re=1&cs=1&w=1&p=<path filter>…&n=<500\|10000>` (full-text search, §5.34; the query and its options are navigation: a new search is a history entry) |
+
+   Empty, default and absent values are left out (`f=all`, `mode=search`, `line=1`, `view=subsystems`,
+   `role=all`, the Activity sort, an unnamed configuration, no selection), so the hash stays as short as what
+   it actually addresses. `sym` is the bare symbol name (no `CONFIG_` prefix), `cid` is always the **commit
+   hash**, never the integer `commit_id`, so a shared link survives a database rebuild, `st` lists the
+   selected Compare chips (`added,modified,deleted,renamed,unchanged` in Files mode, `added,modified,deleted`
+   in Kconfig mode, in that order), `rn` is repeated once per applied rename search in the order they were
+   applied (empty directory = whole tree), and `mid` is the message's `Message-ID` (percent-encoded, compared
+   normalized — unbracketed and case-insensitive).
+
+2. **Reading a hash** (`applyHash`, from `init` on load and from `handleHashChange` on every `hashchange`):
+   the revision is selected in the header and the tab is opened with those fields. An already open tab of the
+   same identity is reused rather than duplicated (`state.openTab`: a KConfig tab is identified by revision +
+   ARCH + configuration name, a mailing list tab by its thread and message, a commits tab by its title) and
+   the deep link's view state — `query`, `symbol`, `commitId`, `listCollapsed`, `listMode`, `filter`,
+   `threadId`, `messageId` — is merged into it, so the tab comes back on that search, that selection and that
+   mode and not merely on the right kind of tab. Views restore it from their `tabData`: `MailView` re-runs the
+   query with the filter chip and opens the thread focused on `mid`; `KconfigView` refills the filter box,
+   applies the flat match list and inspects `sym` — a link carrying both keeps the filter instead of clearing
+   it to reveal the symbol in the tree; `CommitsView` refills the search box, inspects `cid` and folds the
+   list when `lc=1` (as do `KconfigView`, `MailView` and `MaintainersView`); `DiffView` restores the revisions
+   (a link without `a`/`b` keeps the tab's own), mode, chips and the filter of that mode, and re-runs the `rn`
+   rename searches in order once the diff has loaded (each is cached, §5.11); `MaintainersView` restores the
+   section, search, role pill and sort and inspects `sec` or `person` (a Maintainers link always carries all
+   of `section`, `secId`, `person`, `role`, `sort`, empty when absent, so a reused tab drops a selection or
+   filter the link does not have). Reopening a tab clears its saved scroll positions only when a navigation
+   field actually changes; an empty value (`""`, `0`) counts as the same as an absent one, so re-applying the
+   hash on reload keeps them (§5.28).
+
+3. **Writing it & Browser History Navigation** (`updateHashFromState`, `history.pushState` /
+   `history.replaceState`, `handlePopState`): the hash follows the **active** tab. Tab and revision changes
+   announce themselves as `tabs:changed` / `version:changed`; a navigation *inside* a tab is announced as
+   **`tab:state`** by `state.updateTabState(tabId, patch)`, which merges the patch into the tab, persists the
+   session and emits — it is deliberately **not** `tabs:changed`, since that redraws the pane and would
+   discard the very view that reported the change. A patch entry that is empty (`""`, `0`, `null`,
+   `undefined`) deletes that key, and a patch that changes nothing emits nothing.
+   - **Selective History Stack**: `url_sync.js` distinguishes discrete navigation hops from ephemeral in-tab
+     filtering. Discrete events — switching active tabs, opening new tabs, or changing primary navigation keys
+     (such as Pahole struct drilldowns `structName`, Callgraph function jumps `functionName`, Explorer
+     directory hops `path`, commit selections `commitId`, mailing list thread/message selections
+     `threadId`/`messageId`, or Kconfig symbol selections `symbol`) — capture a workspace snapshot and push a
+     new browser history entry (`history.pushState(snapshot, "", newHash)`). Ephemeral in-tab
+     micro-adjustments (typing into search/filter inputs, editor cursor line movements, scroll positions) and
+     initial tab hydration (such as Compare resolving default base/target revisions upon initial render,
+     marked via `{ replace: true }`) update the URL and snapshot in place via `history.replaceState()`,
+     preventing redundant intermediate history states.
+   - **Back / Forward Rewinding & Redaction** (`popstate`): Clicking the browser's Back or Forward arrow emits
+     `popstate`, delivering the target history entry's workspace snapshot. `restoreSnapshot(targetSnapshot)`
+     reconciles current state against the snapshot:
+     1. *Tab Redaction*: Any tab open in the live workspace that was created after the target snapshot was
+        captured is closed (`state.closeTab`), redacting newly opened tabs when navigating backwards.
+     2. *Tab Reopening*: Any tab present in the target snapshot that was subsequently closed is reopened in
+        its recorded pane.
+     3. *In-Tab Rewinding*: Tabs whose navigation targets changed (e.g. drilling down into nested struct
+        definitions in Pahole or navigating folders in Explorer) have their parameters rewound to the target
+        snapshot's values and re-render.
+     4. *Active Tab & Pane Focus*: Active pane and tab selection are restored, and `tabs:changed` renders the
+        restored workspace state.
+   Views record their own state through `persistTabState(patch)`, which ignores the call when the view's
+   element is no longer in the document: a view replaced by a re-render is stale and its state is nobody's
+   address any more. The recorded moments are: the KConfig filter box, the inspected symbol (tree row, flat
+   match, badge, graph node), the ARCH switch (which also drops `sym`, a symbol of the ARCH being left) and
+   the configuration name; the mailing list query, filter chip, left-column mode, opened thread and focused
+   message; and the commits query, inspected commit and folded list; the Compare revisions, mode, chips, both
+   filters and each successful rename search (the tab keeps `versionA`, `versionB`, `mode`, `statuses`,
+   `query`, `kconfigStatuses`, `kconfigQuery`, `renameSearches`); and the Maintainers section, search, role
+   pill, sort and inspected subsystem or developer.
+4. **A link opened while no session is pinned** (`urlSync.defer()` / `urlSync.init()`): a link opened in a new
+   browser tab arrives with its address in the hash, but that window has no session yet, so the startup
+   Session Picker (§5.23) comes up first. Adopting a session **replaces the panes** with that session's saved
+   tabs and then rewrites the hash from the active one, so applying the address before that choice would open
+   the tab into panes that are about to be discarded — the browser tab would appear never to open at all.
+   `app.init` therefore **holds** the address (`defer()`) instead of calling `urlSync.init()` at boot: while
+   held, `hashchange` only updates what is pending and `updateHashFromState` writes nothing, so neither the
+   picker nor the adoption can clobber it. The hold is released as soon as a session is adopted — on
+   `session:adopted`, whichever path adopted it, and from the picker's `onSelect` — and the held address is
+   then applied **on top of** the adopted session's tabs, so the tab the link asked for opens inside that
+   session. When a session is already pinned to the window no picker appears and `urlSync.init()` runs
+   normally at boot.
+5. **What is deliberately not addressed**: scroll positions (kept per tab in the session instead, §5.28),
+   expanded tree nodes, open/collapsed email cards, the engine state of a KConfig tab and the pagination page
+   reached — a deep link addresses *what* is shown, not how far the reader had scrolled through it. Only the
+   active tab is in the hash; the whole workspace (every pane, tab and configuration) is restored from the
+   session instead (§5.23).
+
+### 5.27. Explorer Sidebar Collapse (`webapp/frontend/index.html`, `webapp/frontend/css/layout.css`, `webapp/frontend/js/app.js`)
+The left **Repository Explorer** sidebar collapses to zero width so the workspace can take the whole window.
+
+1. **Controls**: a chevron button at the top right of the sidebar header (`#sidebar-collapse`, inside
+   `.sidebar-header`) collapses it. Its icon (chevron against a bar) is the **default icon of every collapse
+   control** in the frontend: `COLLAPSE_ICON` in `webapp/frontend/js/utils/icons.js`, inside a `.collapse-btn`
+   (`webapp/frontend/css/layout.css`), mirrored by `.collapse-btn.expand` for the control that unfolds the
+   panel again (the commits, kconfig, maintainers, and mailing list tabs use both, §5.8, §5.10, §5.12, §5.22);
+   the Activity Bar's Explorer button (`data-action="explorer"`) and the palette command *Toggle file
+   explorer* toggle it, and are the way back once the sidebar — and with it its own button — is hidden.
+2. **Single owner of the state** (`app.setSidebarCollapsed(collapsed)` / `app.toggleSidebar()`): every control
+   routes through these, so the `#sidebar.collapsed` class, the Explorer button's `active` state, the collapse
+   button's `aria-expanded` and the stored preference never disagree. `explorer:reveal` (§5.20) expands
+   through the same call before revealing a directory.
+3. **Animation**: `#sidebar` transitions `width` (`--transition-norm`) between `--sidebar-width` and `0`;
+   collapsed, it also drops `min-width` and its border, and its header and content are `visibility: hidden` so
+   nothing inside can stretch it back open mid-transition. The code view's `ResizeObserver` (§5.21) redraws
+   the minimap at the new pane width.
+4. **Persistence**: the collapsed state is a per-browser UI preference in
+   `localStorage["kernel_ide_sidebar_collapsed"]`, applied on boot (`setupSidebarCollapse`), deliberately
+   **not** part of a workspace session (§5.23) — it describes the chrome, not what the session is showing.
+   Blocked or unavailable storage is caught: the sidebar still toggles, it is just not remembered.
+
+### 5.28. Tab Scroll Memory (`webapp/frontend/js/components/scroll_memory.js`)
+Every tab comes back where it was scrolled — after selecting another tab, after any re-render of the panes,
+and after closing the browser and reopening the session.
+
+1. **Universal, no opt-in**: `TabsComponent.render()` calls `attachScrollMemory(contentEl, tab)` on each
+   pane's content container right after the active tab's view is rendered into it. A capture-phase `scroll`
+   listener records the position of **any** scrolled element inside it (lists, detail columns, inspectors,
+   timelines, the container itself), so a view added later is covered without code of its own.
+2. **Storage**: `tab.scrollPositions` maps an element key to `[scrollTop, scrollLeft]`. It lives on the tab,
+   so it is persisted with the session's panes (`state.saveState`, §5.23) and travels with a tab dragged or
+   pushed to another session (§5.24). Writes are debounced (`scheduleScrollSave()`, 400 ms) and a pending
+   write is flushed on `pagehide` and when the page becomes hidden, so closing the window does not lose the
+   last scroll. A position of `0,0` removes its key; at most 24 keys are kept per tab (least recently scrolled
+   dropped first).
+3. **Element keys**: the nearest ancestor `id` (inside the container) followed by `tag.firstClass:n` steps
+   down to the element, `n` counting siblings with the same tag and first class (`""` alone is the container).
+   Keys therefore find the same element in a fresh render of the same view.
+4. **Restoration**: views fill their content asynchronously, so each saved position is applied as soon as its
+   element exists **and** is tall/wide enough to take it, re-checked on DOM mutations and every 250 ms.
+   Restoration also re-applies a position when the view replaces the element right after (cached data first,
+   then the server's answer) and ends when every position is applied and the DOM has settled for 1.5 s, after
+   15 s (any position not yet reachable is then applied clamped), or **as soon as the reader interacts** with
+   the tab (`wheel`, `pointerdown`, `keydown`, `touchstart`). While it runs, scroll events on the saved
+   elements are not recorded: they come from the view loading (an emptied container clamped to 0) or from the
+   restoration itself.
+5. **When positions are dropped**: applying another revision to the tab (`state.setVersion`); reopening an
+   existing tab onto something else through `state.openTab` (a different `cursorLine`, `symbol`, `threadId`,
+   `messageId`, `query`, `listMode`, `filter`, `commitId` or Compare parameters); an explorer tab navigating
+   to another directory (`clearScrollPositions`). In-tab selections (`state.updateTabState`) keep them: the
+   reader is scrolling that very view.
+6. **Opt-out**: a subtree marked `data-scroll-restore="off"` keeps its own position and is ignored here — the
+   code view's virtualized line viewport (`tab.scrollTop`, §5.21), whose saved position must yield to a
+   requested line.
+7. **Not addressed**: canvas pan/zoom (Node Map, treemap) is not scrolling and is not kept; deep links still
+   carry no scroll position (§5.26).
+
+### 5.29. Kernel API Tab (`webapp/frontend/js/views/kernel_api/kernel_api_view.js`) and the Sectioned Tabs (`webapp/frontend/js/views/sections/`, `webapp/frontend/js/components/virtual_list.js`, `webapp/frontend/css/sections.css`)
+Two list-and-detail tabs host the catalogs and reports — **Kernel API** (type `api`, badge `[A]`; activity bar
+`</>`) and **Insights** (type `insights`, badge `[N]`; activity bar chart, §5.30) — on one base,
+`SectionedView`. Each feature only registers a section (`registerApiSection`, `registerInsightsSection`;
+`views/sections/all_sections.js` imports them all).
+- **Layout**: section pills; a release picker (release-scoped sections: the final releases of the catalog, or
+  the section's own `releaseOptions`) and an ARCH picker (ARCH-scoped sections: `GET
+  /api/kconfig/{v}/presets`, default `state.kconfigArch()`); a search box (every word must match, `rowText`);
+  filter chips with counts (client-side `test(row)`); the status line (rows shown of total, the section's
+  note, a progress bar while a background job builds the list, §2.15); an optional summary block; the list;
+  the detail pane. **⬇** offers the section's downloads of the filtered rows (TSV, JSON…). The list folds into
+  the rail of the other list views (`lc=1`); a folded list is not fetched — only the selection's detail is
+  shown.
+- **VirtualList**: a fixed-row-height windowed list (`visibleRange`), so lists of 10⁵ rows scroll smoothly;
+  ↑/↓/PageUp/PageDown/Home/End move the selection, Enter activates it, the active row is announced
+  (`aria-activedescendant`); its viewport opts out of tab scroll memory (§5.28).
+- **Detail links** shared by every section: `data-open-file` (+ `data-line`, `data-version`) opens a code tab,
+  `data-commit` a commits tab, `data-symbol` a Search tab for the name; middle-click or Ctrl/Cmd+click opens a
+  new tab. Middle-click on a row opens that entry in a new tab of the same kind.
+- **Address** (§5.26):
+  `#tab=api|insights&view=<section>&r=<release>&arch=<ARCH>&q=<filter>&f=<chips>&sel=<key>&lc=1` — the
+  section, selection, release and ARCH are navigation (history entries), the search and chips replace the
+  entry.
+- **Opening**: the activity bar, palette commands *Open Kernel API* / *Open Insights* and one per section
+  (*Kernel API: <section>*, *Insights: <section>*).
+
+- **Sections** (`views/kernel_api/api_sections.js`; every detail links files, definitions (`openDefinition`),
+  Kconfig options (the KConfig view on the option: no value changes, so no §5.0 dialog), callgraphs and
+  history):
+  - **Syscalls** (ARCH-scoped): `nr`, name, argument count, ABI and status; chips *defined*, *sys_ni_syscall*,
+    *no definition*, *unnumbered* (a `SYSCALL_DEFINE` with no number on this ARCH); the detail gives the entry
+    point, the signature rebuilt from `SYSCALL_DEFINEn`, *Go to definition*, *History* (§5.17), *Callers*
+    (callgraph) and the `man 2` page. The status line names the table the numbers come from. Download: TSV.
+  - **Exports**: symbol, variant and namespace badges; one chip per variant with counts; the detail lists
+    every export site with the object that contains it (*module X* or built in, its condition, and *built:
+    y/m/n* when a KConfig engine runs for the revision), *Go to definition* and *Search uses*. Downloads:
+    symbols (TXT), TSV.
+  - **Parameters** (ARCH-scoped): kind, name (`<module>.<param>` for module parameters), type; chips *boot*,
+    *early*, *core*, *module*, *undocumented*, *stale docs*; the detail shows the invocation, handler,
+    description and the kernel-parameters.txt entry (with a link to its line).
+  - **Tracepoints**: grouped by system (sorted); chips *events*, *classes*, *raw*; the detail shows prototype,
+    fields, format, the tracefs path and the call sites.
+  - **Modules** (ARCH-scoped, engine-aware): name, description, license and *built* (y/m/n under the KConfig
+    engine running for this revision and ARCH, `builtUnderEngine`); chips by license, *firmware*, *device
+    table*, *built as module*, *not built*; the detail gives the `.ko` object and its condition, options,
+    license, authors, init function (callgraph), firmware, aliases, sources, device tables (opening the
+    Devices section), parameters, exports and maintainers.
+  - **Devices** (N4, `views/kernel_api/devices_section.js`; ARCH-scoped): every device-table entry — bus, id,
+    table and file; one chip per bus. The summary block is the **paste box**: paste `lspci -nn`, `lsusb`,
+    `/sys/…/modalias` lines, `vendor:device` pairs, OF compatibles or ACPI ids and **Find drivers** lists, per
+    input line, the matching tables with the module, its Kconfig options (opening the KConfig view on them, no
+    value change) and the source line; unmatched lines are listed apart. Download: TSV.
+
+### 5.30. Insights Tab (`webapp/frontend/js/views/insights/`)
+Sections (each documented with its feature below): **Release stats** (H6), **Merge window** (H5), **Subsystem
+health** (H7), **Stable** (H2), **Security** (H4). Charts are hand-built SVG with the design tokens
+(`webapp/frontend/js/utils/svg_charts.js`: bars with markers, sparklines, horizontal bars, KPI tiles).
+- **Release stats** (`release_sections.js`): the status line names the source (*from the parser's release
+  statistics* / *computed from Git*, §4.10) and notes that first-timers apply to mainline releases only on a
+  stable update; KPI tiles (commits and merges, authors, first-timers, days since the previous release, lines,
+  release candidates), employers as horizontal bars, a sparkline of commits over the preceding releases
+  already computed; the list holds the people of every role (chips *Authors*, *Reviewed-by*, *Tested-by*,
+  *Reported-by*, *Acked-by*, *Signed-off-by*, *First-timers*); a person's detail links to the developer
+  profile (§5.10) and to *their commits in the release* (a Commits tab query `author:` / `reviewer:` …
+  `in:<release>`, §5.12). Download: TSV.
+- **Merge window**: KPI tiles and a bar chart of commits pulled per day with the `-rc1` marker; the list of
+  pulls (day, sender or ref, subsystem, commits) with chips *before rc1*, *after rc1*, *≥ 100 commits*; the
+  detail gives the merge (Commits tab), source tree and ref, sender, *list them* (a Commits tab query
+  `range:<p1>..<p2>`), the subsystem (Maintainers tab), the [GIT PULL] thread (Mailing List tab), top
+  directories and the tag message. Download: TSV.
+- **Subsystem health**: a window selector (1–12 releases, `w=` in the URL, default 4); flag chips; per section
+  its commits, review coverage and flags; the detail shows a per-release sparkline, bus factor, the
+  maintainers' and reviewers' last activity (*none* marked), top authors, *Open in Maintainers* and *Commits
+  touching this section* (`section:<id> in:<release>`, §5.12). Download: TSV.
+- **Stable** (`stable_section.js`): the release picker lists the series with stable tags (`GET
+  …/stable/series`); the list is `GET …/stable/missing` (§4.10) — commits with their mainline release and *cc*
+  / *fixes* tags, chips *Cc: stable* and *Fixes*; the detail gives the commit (link to the Commits tab), its
+  date, why it is a candidate (with the `# annotation`) and the commits of the series it fixes. Download: TSV.
+  The commit detail's Relations card (§5.12) shows the other direction: *Backport of* / *Backported as* with
+  each backport's first stable tag.
+
+- **Security** (`security_section.js`, H4): the release picker lists releases and stable updates; the list
+  holds the Linux kernel CVEs affecting the release, possibly affecting it, or fixed in it (§4.11), each row
+  with its state (tooltip: what decided it), CVSS score and *KEV* when CISA lists it as exploited; chips
+  *affected*, *possibly*, *fixed*, *fixed here* (first fixed in this release), *CVSS ≥ 7*, *exploited* (chips
+  combine: *affected* + *CVSS ≥ 7*). The detail gives the record's kind, the state at the tab's release, CVSS
+  (vector, source), KEV / SSVC exploitation, the description, the files (opening the code at the tab's
+  release), the commits (introduced by / fixed by, each with its first release, links to the Commits tab; for
+  other CNAs' records the introduction inferred from the fix's `Fixes:` tags, or *unknown*), the version
+  entries per affected product (with their default), references and the record at cve.org. Without a clone the
+  section explains how to set one up (cvelistV5 in the project root is found by default); with a clone the
+  parser has not ingested yet, it says to run `python3 main.py --cve`; either way it shows nothing else. The
+  commit detail's Relations card (§5.12) shows *Fixes CVE-…* / *Backports the fix of CVE-…* / *Introduced the
+  bug of CVE-…* linking here.
+
+### 5.31. Keyboard Shortcuts (`webapp/frontend/js/utils/shortcuts.js`)
+One registry knows every keyboard shortcut: what it does, where it applies and what it is bound to. The
+overlay lists it (§5.31.1), menus take their labels from it, and users can rebind entries.
+- **Registration**: `shortcuts.register({id, keys, scope, description, when, handler, allowInInputs, docOnly,
+  rebindable, shareKeys})` (or `registerAll([...])`), next to the code that handles the keys. Chords are
+  written `Mod+Shift+P`, `?`, `F3`, `Shift+F12`; `Mod` is Ctrl on Linux/Windows and Cmd (⌘) on macOS.
+  `parseChord` / `normalizeChord` / `chordFromEvent` / `formatChord` are pure
+  (`webapp/frontend/tests/shortcuts.test.mjs`); Shift is dropped from printable symbols that already carry it
+  (`Shift+/` is `?`).
+- **Dispatch**: one capture-phase `keydown` listener on the document (`shortcuts.install()`, from `app.js`).
+  The context (`setContextProvider`) is `{tab, tabType, view, modal}`: `view` is the active tab's own view
+  instance, `modal` is true while a `.ki-modal-backdrop` dialog is open. Scopes are tried narrowest first:
+  `modal`, then the active tab's type (`code`, `kconfig`, `diff`, …), then `global`; an open dialog hides the
+  tab scope. Text fields (input, textarea, select, contenteditable) are skipped unless `allowInInputs`. An
+  entry's `when(ctx)` can decline; a handler returning `false` lets the event through.
+- **Documentation-only entries** (`docOnly: true`): keys handled locally (palette navigation, the KConfig TUI,
+  the revision picker, `Escape` in dialogs) are listed without moving their handlers.
+- **Overrides**: `localStorage["kip-shortcuts"]` holds `{id: [keys]}`. `setOverride(id, keys)` refuses a
+  binding that another dispatched entry of the same scope already uses and returns the conflicts;
+  `resetOverride(id)`, `resetAll()`. A change emits `shortcuts:changed` on the document. `label(id)` gives the
+  platform label of an entry's first binding (context menus show it).
+
+| Entry | Keys | Scope | Action |
+|---|---|---|---|
+| `palette.open` | `Mod+K`, `Mod+P` | global (also in text fields) | Search files, symbols and Kconfig options (§5.15) |
+| `palette.commands` | `Mod+Shift+P` | global (also in text fields) | Command mode of the palette |
+| `code.goToDefinition` | `F12` | code | Go to the definition of the selected identifier, else the token under the pointer (same action as a click, §5.6) |
+| `code.findReferences` | `Shift+F12` | code | Cross-references modal of that token |
+| `code.find` | `Mod+F` | code | Find in file (§5.21); the rendered documentation's quick search in rendered mode |
+| `code.findNext` / `code.findPrevious` | `F3` / `Shift+F3` | code (also in the find box) | Next / previous match while the find bar is open |
+| `help.shortcuts` | `?` | global | This overlay (§5.31.1) |
+| `kconfig.undo` / `kconfig.redo` | `Mod+Z` / `Mod+Shift+Z`, `Mod+Y` | kconfig | Undo / redo of the tab's configuration (§5.8) |
+| `palette.*` (doc) | `↑` `↓`, `Enter`, `Mod+Enter`, `Escape` | palette | Navigate, open, open in a new tab, close |
+| `tui.*` (doc) | arrows, `PageUp`/`PageDown`/`Home`/`End`, `Enter`, `Space`, `Y`/`M`/`N`, `/`, `?`/`H`, `Z`, `S`, `D`, `Escape` | kconfig-tui | Menuconfig TUI keys (§5.8) |
+| `find.*` (doc) | `Enter` / `Shift+Enter`, `Escape` | code-find | In the find box: next / previous match, close |
+| `refpicker.*` (doc) | `↑` `↓`, `Enter`, `Escape` | picker | Revision picker (§5.13) |
+| `modal.close` (doc) | `Escape` | modal | Close a dialog; nothing is applied (§5.0) |
+
+#### 5.31.1. Shortcut Overlay & Rebinding (`webapp/frontend/js/components/shortcuts_overlay.js`)
+- **Opening**: `?` (entry `help.shortcuts`, not while typing in a text field), the palette command *Keyboard
+  shortcuts*, or **⌨ Keyboard Shortcuts** in the settings popover (§5.5).
+- **Listing**: every registry entry grouped by scope (Global, Code view, Find bar, KConfig, KConfig TUI,
+  Command palette, Revision picker, Dialogs, …; `groupShortcuts`), each with its description and its keys as
+  platform labels (`Mod` is Ctrl, or ⌘ on macOS); a search box filters by description, id or key (`ctrl+k`,
+  `F3`). Documentation-only entries are listed like the others and marked *(fixed)*.
+- **Rebinding**: **Edit** captures the next key combination (`captureStep`: a lone modifier keeps waiting,
+  Escape cancels); the registry dispatches nothing while a chord is captured (`shortcuts.suspend()`), so the
+  pressed keys never trigger their current action. A chord another dispatched entry of the same scope already
+  uses is refused, and the row names the entry that uses it. **Reset** restores one entry (its default is in
+  the button's tooltip), **Reset all** every one. Changes are stored as overrides
+  (`localStorage["kip-shortcuts"]`), apply at once, and update the palette footer and the context menus
+  through `shortcuts:changed` / `shortcuts.label()`.
+
+### 5.32. Change Preview Component (`webapp/frontend/js/components/change_preview.js`, `webapp/frontend/js/views/kconfig/kconfig_dry_run.js`)
+The shared implementation of §5.0 for actions whose consequence reaches beyond the request.
+- **Dry run** (`kconfigDryRun(model, startState, mutate)`): a throwaway `KconfigEngine` built from the tab's
+  decoded model, started from `captureState()` of the live one; `mutate(probe, ctx)` runs the action
+  (`ctx.want(name, value)` sets a value and records the request, `ctx.expect(name, value)` only records it,
+  for actions that load assignments). Every option's value is compared before and after (`valueMap`: n/m/y, or
+  the text, `(not set)` when not written): `{changes: [{name, from, to, why}], refused: [{name, wanted, got,
+  reason}], unknown, requested, state}`. `why` is kconfig's: *requested*, *selected by …*, *depends on …*, *no
+  longer selected: …*, *choice: X selected*, *prompt hidden: …*, *default*. `sideEffects(run)` are the changes
+  nobody asked for. The live engine is never touched; `applyDryRun(live, run)` puts the probe's state into it,
+  so what is applied is exactly what was shown, and the caller's `changed()` commits it as one undo step.
+- **Dialog** (`showChangePreview({title, summary, intro, sections: [{label, rows, prefix, fields, columns}],
+  notes, confirmLabel, onInspect})` → `Promise<boolean>`): one table per non-empty section (option, then the
+  row's `fields`, default now / after / why), a filter box over 30 rows, notes (unknown symbols, unmatched
+  input), at most 500 rows per section. Clicking an option inspects it and cancels; Close, Escape and the
+  backdrop resolve false; a null `confirmLabel` makes a report with Close only. Every value is escaped.
+- **`previewOrApply({…, apply})`**: no dialog and an immediate `apply()` when every section is empty,
+  otherwise `apply()` only on confirmation.
+- **Users**: **Fragments…**, **Hardware…** and the new-options review (§5.8). The older dialogs (lowering,
+  engine resolution, toolchain, revision carry) keep their own markup with the same contract.
+- **Tests** (`webapp/frontend/tests/kconfig_workflows.test.mjs`, fixture model
+  `tests/fixtures/kconfig_tiny.json` generated with `compact_model()`): reasons for select/depends/choice,
+  refused and unknown requests, the empty preview applying with no dialog, Close applying nothing,
+  byte-identical `writeConfig()` after a dry run, fragment overlay order and provenance, not-honoured
+  detection, `newSymbols()`, the lsmod / lspci -k parsers, the trim fixed point, built-in and ensure with a
+  mocked auto-solve.
+
+### 5.33. Patch Series Tab (`webapp/frontend/js/views/patch/patch_series_view.js`, `series_model.js`, `webapp/frontend/css/patch.css`)
+Tab type `patch` (badge `[W]`; palette *Open patch series*; opened by **Add to series**). The draft is session
+state (`state.patchDrafts`, saved with the session §5.23 and shared by its tabs; not in the URL): `{base,
+author, edits: {path: {originalBlob, modified}}, series: [{id, subject, body, files}], cover, to, cc,
+version}`, changed only through `series_model.js` (each file in exactly one patch).
+- **Staged files**: path, the patch it belongs to (a select), *Open* (the file at the base), *Edit* (the patch
+  modal on the staged text), *✕* (unstage).
+- **Patches**: `[PATCH i/N]` with subject and description, ↑/↓ to reorder, ✕ (its files go to the previous
+  patch; the last one stays), **+ Patch**.
+- **Author & recipients**: name, email, version (`vK`), the cover letter (two patches or more), To/Cc (one
+  address per line or comma separated); **Suggest recipients** adds the maintainers (`suggested_to`) and
+  lists/reviewers (`suggested_cc`) of every touched file (`POST /api/maintainers/{v}/match`), keeping what is
+  there. Missing fields are listed and keep **Generate series** disabled.
+- **Generate series** (`POST /api/version/{base}/patch/series`, §4.6): a dialog with *Applies cleanly to
+  <base>* (or not, per patch), the diffstat, each message (copy, download) and **Download mbox**. Generating
+  changes nothing; **Discard draft** asks first (Close keeps it).
+- **Tests**: `webapp/frontend/tests/patch_series.test.mjs` (blob SHA = `git hash-object`, staging, assignment,
+  reorder, removal, payload, session round trip); `tests/test_webapp_patch_series.py` (format, numbering,
+  cover letter, base-commit, stale blob 409, path jail, duplicate files, `git am` on a scratch repository).
+
+### 5.34. Search Tab: Full-Text Code Search (`webapp/frontend/js/views/search/search_view.js`, `webapp/frontend/css/search.css`)
+A tab (type `search`, badge `[F]`) searching the text of every file of its revision through `GET /api/fs/grep`
+(§4.2, §2.1.3).
+- **Opening**: palette command *Search text in files…*, *Open all results in the Search tab* at the end of the
+  palette's `%` results (§5.15), the code view's context menu *Search “…” in tree* (the selection, else the
+  token — then as a whole word, §5.6), or a deep link.
+- **Toolbar**: the query; **Aa** (match case), **ab|** (whole words), **.\*** (POSIX ERE, `git grep -E`); path
+  filters (`drivers/net/, *.c, !*.h`, comma or space separated, at most 8); the most matches returned (500,
+  2,000 default, 10,000; 200 per file); **Search** (Enter); **⬇ .txt** downloads the results as
+  `path:line:text` lines.
+- **Results**: a summary (`N matches in M files`, elapsed time; *truncated: narrow the search with a path
+  filter*, or *timed out (partial)*), then one collapsible group per file (sticky header with the path and its
+  count), each line with its number and the exact match ranges highlighted (`highlightRanges` escapes every
+  segment of the raw text separately; long lines arrive clipped around the match, marked `…`). Click opens the
+  file at the line in the tab's revision; middle-click or Ctrl/Cmd+click opens a new tab (§5.9).
+- **Address**: the query and its options are recorded on the tab (`state.updateTabState`) and in its URL
+  (§5.26), so a link reopens the same search. Answers are kept in the `tools` store under the revision's stamp
+  (`grep_<v@stamp>_<params>`): a commit's content never changes; a timed-out answer is never stored.
+- **Route registry**: the `search` route (and those of later tab types) is declared in
+  `webapp/frontend/js/routes.js` through `registerTabRoute()` (`tab_routes.js`): its hash keys, which fields
+  are navigation, and tab reuse (`state.openTab`) — url_sync.js, state.js and the tab strip consult it instead
+  of a case of their own.
+
+### 5.35. Bookmarks, Notes & Code Tours (`webapp/frontend/js/views/bookmarks/`, G05)
+User-made navigation aids, stored in the `user` store (S06, §5.5) per repository and shared live between
+windows.
+- **Bookmarks** (`bookmark_model.js`, `bookmark_store.js`): targets `{type: "line", path, rev, sha, line,
+  snippet}` (the commit is pinned; `snippet` is the line's text), `{type: "symbol", name, rev}`, `{type:
+  "commit", hash}`, `{type: "mail", tid, mid}`, `{type: "kconfig", name, arch, rev}`, with a label, a group
+  and an order. Bookmarking toggles: the same place again removes it. Ways in: **Ctrl+Alt+B** in a code tab
+  (`code.bookmark`, §5.31) on the current line; *Bookmark this line*, *Bookmark symbol X* and *Add this line
+  to a tour…* in a token's menu (§5.6); the palette's *Bookmark this tab* for commit, mail and KConfig tabs
+  and *Show bookmarks & tours*.
+- **Gutter**: bookmarked lines of the open file are marked in the line-number gutter (purple with a note; the
+  tooltip shows the label and the note). A bookmark made at another revision of the file is shown dimmed
+  (*moved?*) where its snippet is found again within ±200 lines (`relocate`), else not at all.
+- **Bookmarks tab** (type `bookmarks`, badge `[B]`): bookmarks grouped and searchable (labels, targets, groups
+  and notes), each with label and group fields, ↑/↓ order, a Markdown **note** (edited in place, rendered with
+  the documentation renderer, which escapes and sanitizes), *+ to tour…* and delete (its note goes with it).
+  Clicking opens the target in its tab type (a line at its pinned commit); middle-click or Ctrl+click opens a
+  new tab.
+- **Code tours**: `{title, description, steps: [{target, title, markdown}]}` — created in the tab or from *Add
+  this line to a tour…*; edited in the tab (title, description, per-step title and text, ↑/↓, remove, *Save
+  tour*); **▶ Play** opens a floating player (`tour_player.js`: step *k/N*, title, target link, rendered text,
+  Prev/Next) that opens each step's target. Shared as a **.kiptour.json** file (*Export*, *Import…*) or a
+  **link** `#tab=bookmarks&t=<base64url(deflate-raw(JSON))>` (`CompressionStream`; links over 8 KB are refused
+  in favour of the file). A link imports its tour as a new one — never overwriting — and starts playing it;
+  the `t` parameter is then dropped from the address. Imported tours are untrusted: validated (`validateTour`:
+  titles, at most 500 steps, every target checked — repository paths without `..`, identifiers, hex hashes,
+  revision names — and at most 1 MB), and their Markdown goes through the sanitizing renderer.
+- **Tests**: `webapp/frontend/tests/bookmarks.test.mjs` (target validation, labels, toggling identity, snippet
+  relocation, ordering, tour validation and the link round trip), `user_records.test.mjs` (S06).
+
+### 5.36. Watch List (`webapp/frontend/js/views/watch/`, G10)
+Files, directories, symbols, Kconfig options and MAINTAINERS sections the user follows on a branch. Records in
+the `user` store (S06): `watch` `{target, branch, base_sha}` and `watch-state` `{watch_key, last_sha,
+last_checked, status, summary, changed_since, unread, result}`.
+- **Adding**: *Watch this file* and *Watch symbol X* in a token's menu (§5.6); the palette's *Watch this tab*
+  (a code tab's file, an explorer's directory, a KConfig tab's option, a Maintainers tab's section). Again on
+  the same target stops watching it. A watch follows the header's branch scope, else the mainline branch
+  (`master`/`main`; a tag never moves), starting from that branch's current commit.
+- **Checking** (`watch_runtime.js`): when `versions:updated` (§2.11) reports that a watched branch moved or
+  appeared, the watches following it are checked from their last checked commit to the branch (`POST
+  /api/watch/changes`, §4.12, one request per (from, to) group); **Check now** in the Watch tab checks all. A
+  change marks the item unread until it is read, with what changed and since which commit; unchanged and
+  cosmetic results stay silent. A toast names the changed count; an optional browser notification (enabled in
+  the Watch tab, which asks the browser's permission) fires only while the page is hidden.
+- **Bell**: **🔔** in the header with the unread count (updated live, also from other windows); it opens the
+  Watch tab.
+- **Watch tab** (type `watch`, badge `[Y]`): each item with its type, branch, status badge, last checked
+  commit, *new* marker, the change (directory paths listed) and links — *Compare* (files and directories: the
+  Compare view between the two commits, filtered to the path), *Commits* (the commit query `path:` or
+  `section:`, H8), *History* (symbol or Kconfig history) — *Stop watching*, *Mark read* and *Mark all read*.
+- **Tests**: `tests/test_webapp_watch.py` (each type with fake readers, cosmetic vs modified, invalid inputs),
+  `webapp/frontend/tests/watch.test.mjs` (which updates concern which watches, grouping, unread bookkeeping).
+
+### 5.37. Parser Status Tab (`webapp/frontend/js/views/status/status_view.js`, `status_model.js`, `webapp/frontend/css/status.css`)
+A tab (type `status`, badge `[I]`) showing what the parser has done for the active repository, from `GET
+/api/system/ingest` (§4.1); useful while the parser runs next to the webapp.
+- **Opening**: the palette command *Show parser status*, the **⛏ Parser** line of the settings popover (§5.5),
+  or `#tab=status`.
+- **Content**: counters (tags in Git, parsed, parsing now, git only, database size); *Parsing now* — each
+  version with its commit and last update, marked **stale** (with an explanation) when not updated for 30
+  minutes; *Recent completions* (clicking a version selects it in the header); *Database tables* — every table
+  with its estimated rows, data, index and total size, sortable by any column; the sync tokens (§2.11); and
+  the server (uptime, catalog warm-up, background jobs with their progress, in-memory caches with their
+  bounds, disk cache namespaces and cap).
+- **Refresh**: every 15 s while the page is visible and the tab is shown (paused otherwise, like the
+  heartbeat, §5.1), and on **⟳ Refresh**. The last answer is kept in the `tools` store, so the tab still shows
+  it offline.
+- **Not covered**: live progress inside a version (current step, files done) would need the parser to publish
+  it; it does not today.

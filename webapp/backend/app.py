@@ -21,6 +21,10 @@ from webapp.backend.routers import (
     sync_router,
     docs_router,
     mail_router,
+    insights_router,
+    cve_router,
+    kapi_router,
+    watch_router,
 )
 from webapp.backend.services.sync_service import SyncHeaderMiddleware, sync_service
 
@@ -70,6 +74,12 @@ async def lifespan(app: FastAPI):
     try:
         from webapp.backend.routers.versions import cancel_branch_walks
         cancel_branch_walks()
+    except Exception:
+        pass
+    # Background jobs (API.md section 2.15): cancel queued and running ones, stop the workers
+    try:
+        from webapp.backend.services.jobs import jobs
+        jobs.cancel_all()
     except Exception:
         pass
     # Graceful shutdown: close connection pool and stop SSH tunnel
@@ -124,6 +134,10 @@ def create_app() -> FastAPI:
     app.include_router(sync_router)
     app.include_router(docs_router)
     app.include_router(mail_router)
+    app.include_router(insights_router)
+    app.include_router(cve_router)
+    app.include_router(kapi_router)
+    app.include_router(watch_router)
 
     # 3. Frontend files outside a build (the manifest's icon); the shell loads /b/<build>/...
     if FRONTEND_DIR.is_dir():
@@ -153,7 +167,8 @@ def create_app() -> FastAPI:
             return JSONResponse({"detail": "stale frontend build", "build": current}, status_code=409,
                                 headers={"Cache-Control": "no-store"})
         target = (FRONTEND_DIR / asset_path).resolve()
-        if not target.is_relative_to(FRONTEND_DIR) or not target.is_file():
+        # The JS unit tests (webapp/frontend/tests) are not part of a build
+        if asset_path.startswith("tests/") or not target.is_relative_to(FRONTEND_DIR) or not target.is_file():
             return Response(status_code=404)
         return FileResponse(str(target), headers={"Cache-Control": BUILD_CACHE_CONTROL})
 

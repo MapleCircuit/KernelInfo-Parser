@@ -21,17 +21,19 @@ from core.globalstuff import (
     ASTT,
     OP_REF,
 )
-m_file_name = m_ast = m_ast_include = None
+from core.SymbolRows import record_def, record_ref
+m_file_name = m_ast = m_ast_include = m_ast_container = None
 
 
 def _init_tables() -> None:
-    global m_file_name, m_ast, m_ast_include
+    global m_file_name, m_ast, m_ast_include, m_ast_container
     if m_file_name is not None:
         return
     import core.DBLayout as db_layout
     m_file_name = db_layout.m_file_name
     m_ast = db_layout.m_ast
     m_ast_include = db_layout.m_ast_include
+    m_ast_container = db_layout.m_ast_container
 
 from parser.c_ast import get_prior_tags
 from parser.c_ast.tag_tracker import stage_entry_tag
@@ -125,7 +127,57 @@ class KconfigManager:
         with CS(REF_POS):
             CS.store(m_ast.view(((m_ast.ast_id,),), None, name, ast_type.value))
             ast_ref = ((m_ast.table_id, 0), OP_REF, (REF_POS, CS.route[-1]))
-        self._tag_and_map(ast_ref, item.line_s, line_e, item.char_s, char_e, code, ast_name=name, ast_type=ast_type)
+        tag_ref = self._tag_and_map(ast_ref, item.line_s, line_e, item.char_s, char_e, code, ast_name=name, ast_type=ast_type)
+
+        ref_syms: set[str] = set()
+        if isinstance(item, KconfigConfig):
+            record_def(CS, tag_ref, ast_ref, item.name, ast_type.value, 0, item.line_s, line_e)
+
+            # Record referenced symbols (selects, implies, depends_on, defaults)
+            for sel, cond in item.selects:
+                ref_syms.add(sel)
+                if cond:
+                    ref_syms.update(cond.collect_symbols())
+            for imp, cond in item.implies:
+                ref_syms.add(imp)
+                if cond:
+                    ref_syms.update(cond.collect_symbols())
+            for dep in item.depends_on:
+                ref_syms.update(dep.collect_symbols())
+            for def_val, cond in item.defaults:
+                ref_syms.update(def_val.collect_symbols())
+                if cond:
+                    ref_syms.update(cond.collect_symbols())
+        elif isinstance(item, KconfigIf):
+            if item.cond:
+                ref_syms.update(item.cond.collect_symbols())
+        elif isinstance(item, KconfigMenu):
+            for dep in item.depends_on:
+                ref_syms.update(dep.collect_symbols())
+            if item.visible_if:
+                ref_syms.update(item.visible_if.collect_symbols())
+            if item.prompt_cond:
+                ref_syms.update(item.prompt_cond.collect_symbols())
+        elif isinstance(item, KconfigChoice):
+            for dep in item.depends_on:
+                ref_syms.update(dep.collect_symbols())
+            if item.prompt_cond:
+                ref_syms.update(item.prompt_cond.collect_symbols())
+            for def_sym, cond in item.defaults:
+                if def_sym:
+                    ref_syms.add(def_sym)
+                if cond:
+                    ref_syms.update(cond.collect_symbols())
+        elif isinstance(item, KconfigComment):
+            for dep in item.depends_on:
+                ref_syms.update(dep.collect_symbols())
+
+        for ref_name in ref_syms:
+            if ref_name and ref_name != "y" and ref_name != "m" and ref_name != "n":
+                with CS(REF_POS):
+                    CS.store(m_ast.view(((m_ast.ast_id,),), None, ref_name[:_NAME_MAX], ASTT.Kconfig_Config.value))
+                    ref_ast_ref = ((m_ast.table_id, 0), OP_REF, (REF_POS, CS.route[-1]))
+                record_ref(CS, tag_ref, ref_ast_ref, 0, OP_REF, item.line_s, item.char_s)
 
     def _tag_and_map(
         self,
@@ -159,8 +211,34 @@ class KconfigManager:
         else:
             ast_type = ASTT.Kconfig_Source
         name = src.path[:_NAME_MAX]
+
+        if "*" in src.path:
+            targets = []
+            if hasattr(self.CS, "gp") and getattr(self.CS.gp, "File_Array", None):
+                import fnmatch
+                pattern = self._source_target(src) or src.path
+                targets = [f for f in self.CS.gp.File_Array if fnmatch.fnmatch(f, pattern)]
+            if targets:
+                for target in targets:
+                    with CS(REF_POS):
+                        CS.store(m_file_name.set(None, target))
+                        fnid_ref = ((m_file_name.table_id, 0), OP_REF, (REF_POS, CS.route[-1]))
+                    with CS(REF_POS):
+                        CS.store(m_ast.view(((m_ast.ast_id, m_ast_include.ast_id, 1),), None, target[:_NAME_MAX], ast_type.value, None, fnid_ref))
+                        ast_ref = ((m_ast.table_id, 0), OP_REF, (REF_POS, CS.route[-1]))
+                    target_code = f"{src.raw_code.rstrip()} # {target}\n"
+                    self._tag_and_map(ast_ref, src.line_s, src.line_e, src.char_s, src.char_e, target_code, ast_name=target[:_NAME_MAX], ast_type=ast_type)
+                return
+            else:
+                # Empty glob matches: stage ast without recording invalid '*' in m_file_name
+                with CS(REF_POS):
+                    CS.store(m_ast.view(((m_ast.ast_id,),), None, name, ast_type.value))
+                    ast_ref = ((m_ast.table_id, 0), OP_REF, (REF_POS, CS.route[-1]))
+                self._tag_and_map(ast_ref, src.line_s, src.line_e, src.char_s, src.char_e, src.raw_code, ast_name=name, ast_type=ast_type)
+                return
+
         target = self._source_target(src)
-        if target is None:
+        if target is None or "*" in target:
             # `source "arch/$(SRCARCH)/Kconfig"` names one file per ARCH: no single file to link
             with CS(REF_POS):
                 CS.store(m_ast.view(((m_ast.ast_id,),), None, name, ast_type.value))

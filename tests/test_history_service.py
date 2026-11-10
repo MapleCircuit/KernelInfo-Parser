@@ -7,11 +7,16 @@ repository and are skipped when either is unavailable.
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
+import tempfile
 import sys
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from pathlib import Path
+from unittest import mock
 
 from fastapi import HTTPException
 from webapp.backend.services.history_service import (
@@ -91,6 +96,29 @@ class TestHistoryHelpers(unittest.TestCase):
         self.assertEqual(f["defaults"], ["y if FOO_BOARD"])
         self.assertIn("Say Y here.", f["help"])
         self.assertEqual(_kconfig_file_facts(KCONFIG_TEXT, "NOT_THERE"), ())
+
+    def test_kconfig_blob_is_parsed_once_for_all_its_symbols(self) -> None:
+        """B7: history (per symbol) and Compare share one parse per Kconfig blob SHA."""
+        from unittest import mock
+        from webapp.backend.services import diff_service, kconfig_facts
+        text = KCONFIG_TEXT + "\nconfig NR_CPUS\n\tint \"Maximum CPUs\"\n\tdefault 8\n"
+        sha = "f" * 40
+        kconfig_facts._DEFS_CACHE.pop(sha, None)
+        before = kconfig_facts.STATS["parsed"]
+        with mock.patch("webapp.backend.services.history_service.git_reader.read_file",
+                        return_value=(text.encode(), None, None)) as read:
+            smp = HistoryService._file_facts("v3.0", "arch/x86/Kconfig", sha, "SMP")
+            cpus = HistoryService._file_facts("v3.0", "arch/x86/Kconfig", sha, "NR_CPUS")
+        self.assertEqual(read.call_count, 1)
+        self.assertEqual(kconfig_facts.STATS["parsed"] - before, 1)
+        self.assertEqual(smp, _kconfig_file_facts(text, "SMP"))
+        self.assertEqual(cpus[0]["type"], "int")
+        self.assertNotIn("prompt_text", smp[0])  # history's shape is unchanged
+        # Compare reads the same entry, with its raw prompt and first default
+        defs = diff_service._blob_definitions(sha, None)
+        self.assertEqual(kconfig_facts.STATS["parsed"] - before, 1)
+        self.assertEqual(defs["NR_CPUS"][0]["prompt_text"], "Maximum CPUs")
+        self.assertEqual(defs["NR_CPUS"][0]["first_default"], "8")
 
     def test_kconfig_field_changes(self) -> None:
         old = _kconfig_file_facts(KCONFIG_TEXT, "SMP")[0]
@@ -182,7 +210,9 @@ class TestHistoryIntegration(unittest.TestCase):
                 self.assertTrue(any(d["type"] in ("add", "del") for d in t["diff"]))
                 self.assertIn(str(t["tag_id"]), res["snippets"])
             if t["status"] == "unchanged":
-                self.assertTrue(t["tag_id"] == prev["tag_id"] or res["snippets"].get(str(t["tag_id"])) == res["snippets"].get(str(prev["tag_id"])))
+                # The same tag, or a new tag with identical code (B14)
+                self.assertTrue(t["tag_id"] == prev["tag_id"]
+                                or res["snippets"].get(str(t["tag_id"])) == res["snippets"].get(str(prev["tag_id"])))
             prev = t
 
     def test_release_candidates_on_demand(self) -> None:
@@ -254,6 +284,170 @@ class TestHistoryIntegration(unittest.TestCase):
         res = history_service.get_symbol_history(self.version, path, line=int(line))
         self.assertEqual(res["kind"], "kconfig")
         self.assertEqual(res["name"], "SMP")
+
+
+F_V1 = "int f(int x)\n{\n\treturn x;\n}\n\nint g(int y)\n{\n\treturn y;\n}\n"
+
+
+@unittest.skipUnless(shutil.which("git"), "git is not installed")
+class TestChangeCommitsFromDatabase(unittest.TestCase):
+    """GET /api/history/commits from m_bridge_commit_tag / m_commit_file (D05), against `git log` on a
+    temporary repository: v1.0 -> (f changed, g changed, f changed) -> v1.1 -> a.c renamed to b.c -> v1.2."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        from tests.test_commit_relations import ENV, Store, git
+        cls.dir = Path(tempfile.mkdtemp(prefix="histdb-"))
+        cls.git = staticmethod(lambda *a: git(cls.dir, *a))
+        cls.git("init", "-q", "-b", "master")
+        cls.write("a.c", F_V1, "base")
+        cls.git("tag", "v1.0")
+        cls.f1 = cls.write("a.c", F_V1.replace("return x;", "return x + 1;"), "f: add one")
+        cls.g1 = cls.write("a.c", F_V1.replace("return x;", "return x + 1;").replace("return y;", "return y * 2;"), "g: double")
+        text_v2 = F_V1.replace("return x;", "if (x)\n\t\treturn 0;\n\treturn x + 1;").replace("return y;", "return y * 2;")
+        cls.f2 = cls.write("a.c", text_v2, "f: zero")
+        cls.git("tag", "v1.1")
+        cls.git("mv", "a.c", "b.c")
+        cls.git("commit", "-q", "-m", "rename a.c")
+        cls.rename = cls.git("rev-parse", "HEAD").strip()
+        cls.git("tag", "v1.2")
+        cls.text_v2 = text_v2
+        cls.store = Store(cls.dir, with_relations=False)
+        cls.build_rows()
+
+    @classmethod
+    def write(cls, path: str, text: str, msg: str) -> str:
+        (cls.dir / path).write_text(text)
+        cls.git("add", "-A")
+        cls.git("commit", "-q", "-m", msg)
+        return cls.git("rev-parse", "HEAD").strip()
+
+    @classmethod
+    def build_rows(cls) -> None:
+        """What the parser stores: ingest states (v1.1 on v1.0, v1.2 on v1.1), the v1.1 blob's tags (f lines 1-6, g
+        lines 8-11), their commit bridges (GitCommitParser.map_tags_to_commits), the commit files."""
+        from parser.git_ast import GitCommitParser
+        db = cls.store.db
+        db.executescript("""
+            DROP TABLE m_ingest_state;
+            CREATE TABLE m_ingest_state (network_id INT, commit_id INT, status INT, base_commit_id INT);
+            CREATE TABLE m_bridge_tag (blob_id INT, tag_id INT, line_s INT, line_e INT);
+            CREATE TABLE m_bridge_commit_tag (commit_id INT, blob_id INT, tag_id INT);
+            CREATE TABLE m_file_name (fnid INTEGER PRIMARY KEY, fname TEXT);
+            CREATE TABLE m_commit_file (commit_id INT, fnid INT, blob_id INT, old_fnid INT, old_blob_id INT, change_type TEXT);
+            INSERT INTO m_maintainer_person VALUES (1, 'Ann', 'ann@x.org');
+            INSERT INTO m_file_name VALUES (1, 'a.c'), (2, 'b.c');
+        """)
+        ids = {bytes(h).hex(): cid for cid, h in db.execute("SELECT commit_id, commit_hash FROM m_commit WHERE commit_id > 0")}
+        cls.ids = ids
+        tag = lambda t: cls.git("rev-parse", f"{t}^{{commit}}").strip()  # noqa: E731
+        db.executemany("INSERT INTO m_ingest_state VALUES (1, ?, 2, ?)",
+                       [(ids[tag("v1.0")], 0), (ids[tag("v1.1")], ids[tag("v1.0")]), (ids[tag("v1.2")], ids[tag("v1.1")])])
+        cls.blob = 500
+        db.executemany("INSERT INTO m_bridge_tag VALUES (?, ?, ?, ?)", [(cls.blob, 1, 1, 6), (cls.blob, 2, 8, 11)])
+        gp = GitCommitParser(repo_dir=str(cls.dir))
+        _commits, hunks = gp.parse_version_commits_with_hunks("v1.0", "v1.1")
+        bridges = gp.map_tags_to_commits([(1, cls.blob, 1, 6), (2, cls.blob, 8, 11)], "a.c", commit_hash_to_id=ids,
+                                         file_hunks_map=hunks)
+        db.executemany("INSERT INTO m_bridge_commit_tag VALUES (?, ?, ?)", bridges)
+        for sha, cid in ids.items():
+            out = cls.git("diff-tree", "-r", "-M", "--no-commit-id", "--name-status", "--root", sha)
+            for line in out.splitlines():
+                parts = line.split("\t")
+                fn = {"a.c": 1, "b.c": 2}
+                if parts[0].startswith("R"):
+                    db.execute("INSERT INTO m_commit_file VALUES (?, ?, 0, ?, 0, 'R')", (cid, fn[parts[2]], fn[parts[1]]))
+                else:
+                    db.execute("INSERT INTO m_commit_file VALUES (?, ?, 0, ?, 0, ?)", (cid, fn[parts[1]], fn[parts[1]], parts[0]))
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        shutil.rmtree(cls.dir, ignore_errors=True)
+
+    def setUp(self) -> None:
+        from webapp.backend.services import history_service as hs
+        from webapp.backend.services import release_service as rs
+        self.hs, self.rs = hs, rs
+        sha_v2 = self.git("rev-parse", "v1.1:a.c").strip()
+        self.patches = [
+            *self.store.patches(),
+            mock.patch.object(hs, "get_db_cursor", return_value=self.store.dict_cursor()),
+            mock.patch.object(hs, "get_active_network_id", return_value=1),
+            mock.patch.object(hs, "get_active_repo_id", return_value=1),
+            mock.patch.object(hs, "get_repo_dir", lambda: self.dir),
+            mock.patch.object(rs, "get_repo_dir", lambda: self.dir),
+            mock.patch.object(hs.git_tree_resolver, "map_blob_hashes",
+                              side_effect=lambda cur, shas: {s: (self.blob, 1) for s in shas if s == sha_v2}),
+        ]
+        for p in self.patches:
+            p.start()
+        rs._TAGS_CACHE.clear()
+        hs._cached_change_commits.cache_clear()
+        self.store.statements.clear()
+
+    def tearDown(self) -> None:
+        for p in self.patches:
+            p.stop()
+        self.rs._TAGS_CACHE.clear()
+
+    def git_answer(self, path: str, frm: str, to: str, s: int = 0, e: int = 0) -> list[str]:
+        return [c["commit_hash"] for c in self.hs._cached_change_commits(str(self.dir), path, frm, to, s, e, 100)]
+
+    def test_lines_equal_git_log_L(self) -> None:
+        for s, e, want in ((1, 6, [self.f2, self.f1]), (8, 11, [self.g1])):
+            res = self.hs.history_service.get_change_commits("a.c", "v1.1", "v1.0", s, e)
+            self.assertEqual(res["source"], "db")
+            self.assertEqual([c["commit_hash"] for c in res["commits"]], self.git_answer("a.c", "v1.0", "v1.1", s, e))
+            self.assertEqual({c["commit_hash"] for c in res["commits"]}, set(want))
+        self.assertEqual(res["commits"][0]["author_name"], "Ann")
+        self.assertTrue(all(st.lstrip().upper().startswith("SELECT") for st in self.store.statements))
+
+    def test_without_lines_lists_the_file_commits(self) -> None:
+        res = self.hs.history_service.get_change_commits("a.c", "v1.2", "v1.1")
+        self.assertEqual(res["source"], "db")
+        self.assertEqual([c["commit_hash"] for c in res["commits"]], [self.rename])     # renamed away (old_fnid)
+        res = self.hs.history_service.get_change_commits("a.c", "v1.1", "v1.0")
+        self.assertEqual([c["commit_hash"] for c in res["commits"]], self.git_answer("a.c", "v1.0", "v1.1"))
+
+    def test_branch_and_unjoined_ranges_use_git(self) -> None:
+        self.assertEqual(self.hs.history_service.get_change_commits("a.c", "master", "v1.0", 1, 6)["source"], "git")
+        # v1.0 -> v1.2 spans two ingestions: the line range cannot be mapped from the stored bridges
+        self.assertEqual(self.hs.history_service.get_change_commits("b.c", "v1.2", "v1.0", 1, 6)["source"], "git")
+
+    def test_reappeared_blob_does_not_leak_older_commits(self) -> None:
+        db = self.store.db
+        older = self.ids[self.git("rev-parse", "v1.0").strip()]
+        db.execute("INSERT INTO m_bridge_commit_tag VALUES (?, ?, 1)", (older, self.blob))
+        try:
+            res = self.hs.history_service.get_change_commits("a.c", "v1.1", "v1.0", 1, 6)
+            self.assertNotIn(self.git("rev-parse", "v1.0").strip(), [c["commit_hash"] for c in res["commits"]])
+        finally:
+            db.execute("DELETE FROM m_bridge_commit_tag WHERE commit_id = ?", (older,))
+
+    def test_rename_is_followed(self) -> None:
+        tag = lambda t: self.git("rev-parse", f"{t}^{{commit}}").strip()  # noqa: E731
+        versions = [{"vname": v, "vid": self.ids[tag(v)]} for v in ("v1.0", "v1.1", "v1.2")]
+        shas = self.hs.batch_blob_shas([f"{v['vname']}:a.c" for v in versions])
+        self.assertIsNone(shas[2])
+        sha_v2 = shas[1]
+        new_sha = self.git("rev-parse", "v1.2:b.c").strip()
+        cur = mock.MagicMock()
+        answers = []
+
+        def execute(sql, params=()):
+            answers.append(sql)
+            cur.rows = [{"new_blob_id": 501}] if "m_blob_transition" in sql else [{"fname": "b.c"}]
+
+        cur.execute.side_effect = execute
+        cur.fetchall.side_effect = lambda: cur.rows
+        meta = {sha_v2: (self.blob, 1)}
+        with mock.patch.object(self.hs.git_tree_resolver, "map_blob_hashes", side_effect=lambda c, s: {x: (501, 1) for x in s}):
+            paths, renamed = self.hs.HistoryService._follow_renames(cur, versions, "a.c", shas, meta)
+        self.assertEqual(paths, ["a.c", "a.c", "b.c"])
+        self.assertEqual(renamed, {2: "a.c"})
+        self.assertEqual(shas[2], new_sha)          # the timeline continues on the new path
+        self.assertIn(new_sha, meta)                # a pure rename keeps the blob
+        self.assertIn("m_checkpoint_tree", answers[1])
 
 
 if __name__ == "__main__":

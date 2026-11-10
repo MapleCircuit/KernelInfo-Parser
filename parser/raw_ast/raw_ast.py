@@ -15,6 +15,7 @@ from core.globalstuff import (
     OP_REF,
     FILE_ERROR,
 )
+from core.encoding import safe_byte_coordinates
 from core.DBLayout import m_ast
 from parser.c_ast.tag_tracker import (
     check_exact_match,
@@ -68,9 +69,12 @@ class RawManager:
         content_hash = digest.digest()
         content_hex = digest.hexdigest()
 
-        lines = content.split("\n")
-        line_count = max(1, len(lines))
-        last_char_count = max(1, len(lines[-1])) if lines else 1
+        # Binary fast-path: if null bytes exist in the first 4KB, skip coordinate text parsing
+        if b"\0" in content_bytes[:4096]:
+            line_count = 1
+            last_char_count = max(1, len(content_bytes))
+        else:
+            line_count, last_char_count = safe_byte_coordinates(content_bytes)
         line_pos, char_pos = (1, line_count), (1, last_char_count)
 
         # Check if content hash matches prior tag (recycled)

@@ -105,9 +105,22 @@ class KconfigPreprocessor:
             return args[int(clause) - 1]
         parts: list[str] = []
         nest = 0
+        in_quote = None
+        escaped = False
         prev = 0
         for i, ch in enumerate(clause):
-            if nest == 0 and ch == ",":
+            if escaped:
+                escaped = False
+                continue
+            if ch == "\\":
+                escaped = True
+                continue
+            if in_quote:
+                if ch == in_quote:
+                    in_quote = None
+            elif ch in ('"', "'"):
+                in_quote = ch
+            elif nest == 0 and ch == ",":
                 parts.append(clause[prev:i])
                 prev = i + 1
             elif ch == "(":

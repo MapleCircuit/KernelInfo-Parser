@@ -155,6 +155,43 @@ class TestDocReferenceScanner(unittest.TestCase):
         matched_fnids = {r.target_fnid for r in refs}
         self.assertIn(102, matched_fnids)  # fs/ext4/super.c matched despite a/ and b/ prefix
 
+    def test_relative_paths_and_kernel_doc_directive(self) -> None:
+        text = """
+        See the filesystem documentation in ext4.txt for details.
+        .. kernel-doc:: include/linux/fs.h
+        """
+        refs = self.scanner.scan_file_content(
+            content=text,
+            source_fid=10,
+            fnid_by_path=self.mock_fnid_by_path,
+            source_path="Documentation/filesystems/overview.rst",
+        )
+        matched_fnids = {r.target_fnid for r in refs}
+        self.assertIn(103, matched_fnids)  # ext4.txt resolved relative to Documentation/filesystems/
+        self.assertIn(101, matched_fnids)  # .. kernel-doc:: include/linux/fs.h matched
+
+    def test_extensionless_doc_and_docbook_directives(self) -> None:
+        text = """
+        See :doc:`../filesystems/ext4` for filesystem architecture.
+        !Einclude/linux/fs.h
+        !Ffs/ext4/super.c ext4_sync_fs
+        .. kernel-doc:: include/linux/fs.h
+           :functions: file_operations generic_file_read_iter
+        """
+        refs = self.scanner.scan_file_content(
+            content=text,
+            source_fid=15,
+            fnid_by_path=self.mock_fnid_by_path,
+            source_path="Documentation/DocBook/vfs.tmpl",
+        )
+        fnid_map = {r.target_fnid: r for r in refs}
+        self.assertIn(103, fnid_map)  # ext4 resolved from :doc:`../filesystems/ext4` -> Documentation/filesystems/ext4.txt
+        self.assertIn(101, fnid_map)  # !Einclude/linux/fs.h
+        self.assertIn(102, fnid_map)  # !Ffs/ext4/super.c
+        kdoc_ref = [r for r in refs if r.target_fnid == 101 and "functions" in r.details]
+        self.assertTrue(len(kdoc_ref) > 0)
+        self.assertIn("file_operations", kdoc_ref[0].details)
+
 
 class TestDBLayoutAndWebappReferenceAPI(unittest.TestCase):
     """Test suite verifying the m_file_reference schema and its table-engine deduplication."""
@@ -235,17 +272,22 @@ class TestPathScopedReferences(unittest.TestCase):
             func("v3.1", new_pairs=new_pairs)
         return staged
 
+    # m_kbuild_symbol rows: (source_blob_id, source_fnid, idx, symbol, via, line_no, compile_mode, kind,
+    # target_obj, target_path, target_fnid, rule); (blob, path, target fnid, symbol, line) compared
+    @staticmethod
+    def _kbuild(rows):
+        return {(r[0], r[1], r[10], r[3], r[5]) for r in rows}
+
     def test_identical_makefiles_reference_their_own_directory(self) -> None:
         from main import processing_kbuild
-        kbuild = int(FileRefType.Kbuild)
-        rows = {tuple(r[1:6]) for r in self._run(processing_kbuild, None)}
-        self.assertEqual(rows, {(9, 1, 11, kbuild, 1), (9, 2, 12, kbuild, 1)})
+        rows = self._kbuild(self._run(processing_kbuild, None))
+        self.assertEqual(rows, {(9, 1, 11, "y", 1), (9, 2, 12, "y", 1)})
 
     def test_only_new_pairs_are_recomputed(self) -> None:
         from main import processing_kbuild
         # Blob 9 was already at fs/a/Makefile in the previous version: only its new path is parsed
-        rows = {tuple(r[1:6]) for r in self._run(processing_kbuild, {(2, 9)})}
-        self.assertEqual(rows, {(9, 2, 12, int(FileRefType.Kbuild), 1)})
+        rows = self._kbuild(self._run(processing_kbuild, {(2, 9)}))
+        self.assertEqual(rows, {(9, 2, 12, "y", 1)})
 
     def test_documentation_rows_per_path(self) -> None:
         from main import processing_doc_references
@@ -255,3 +297,87 @@ class TestPathScopedReferences(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestNewPairsOnce(unittest.TestCase):
+    """Step 6.6 computes the new (path, blob) pairs once, in a temporary table of one connection (D09)."""
+
+    def test_one_anti_join_for_clearing_and_includes(self) -> None:
+        from contextlib import contextmanager
+        from unittest import mock
+        import main
+
+        log: list[str] = []
+
+        class FakeDB:
+            rowcount = 3
+
+            def execute(self, sql, params=()):
+                log.append(" ".join(sql.split()))
+                return 3
+
+            def query(self, sql, params=(), dictionary=False):
+                return [(1, 9), (2, 9)]
+
+            def commit(self):
+                pass
+
+            def rollback(self):
+                pass
+
+        db = FakeDB()
+
+        @contextmanager
+        def fake_db():
+            yield db
+
+        with mock.patch.object(main.G, "DB", fake_db), mock.patch.object(main.G, "TE", mock.MagicMock()), \
+                mock.patch.object(main, "processing_kbuild") as kbuild, mock.patch.object(main, "processing_doc_references"), \
+                mock.patch.object(main.gp, "VID", 2, create=True), mock.patch.object(main.gp, "Old_VID", 1, create=True):
+            main.processing_file_references("v3.1")
+        anti_joins = [s for s in log if "LEFT JOIN m_bridge_checkpoint old_v" in s]
+        self.assertEqual(len(anti_joins), 1)
+        self.assertTrue(anti_joins[0].startswith("INSERT INTO tmp_new_pairs"))
+        self.assertIn("DELETE r FROM tmp_new_pairs p JOIN m_file_reference r ON r.source_blob_id = p.blob_id AND r.source_fnid = p.fnid", log)
+        self.assertIn("DELETE r FROM tmp_new_pairs p JOIN m_kbuild_symbol r ON r.source_blob_id = p.blob_id AND r.source_fnid = p.fnid", log)
+        self.assertTrue(any(s.startswith("INSERT IGNORE INTO m_file_reference") and "FROM tmp_new_pairs p" in s for s in log))
+        self.assertEqual(kbuild.call_args.kwargs["new_pairs"], {(1, 9), (2, 9)})
+        self.assertEqual(log[-1], "DROP TEMPORARY TABLE IF EXISTS tmp_new_pairs")
+
+    def test_processing_file_references_invalidates_te_id_cursor(self) -> None:
+        from unittest import mock
+        from contextlib import contextmanager
+        import main
+        from core.DBLayout import m_file_reference
+
+        te_mock = mock.MagicMock()
+        te_mock.db = None
+        te_mock._id_cursor = {m_file_reference.table_id: 1353}
+        te_mock._id_limit = {m_file_reference.table_id: 10000}
+        te_mock.next_id = {m_file_reference.table_id: 1353}
+        te_mock.queued_set = {}
+
+        class DummyDB:
+            def execute(self, *args, **kwargs):
+                return 0
+            def query(self, *args, **kwargs):
+                return []
+            def commit(self):
+                pass
+            def get_next_id(self, tbl):
+                return 96696
+
+        db = DummyDB()
+        @contextmanager
+        def fake_db():
+            yield db
+
+        with mock.patch.object(main.G, "DB", fake_db), mock.patch.object(main.G, "TE", te_mock), \
+                mock.patch.object(main, "processing_kbuild"), mock.patch.object(main, "processing_doc_references"), \
+                mock.patch.object(main, "processing_include_references"), \
+                mock.patch.object(main.gp, "VID", 2, create=True), mock.patch.object(main.gp, "Old_VID", 1, create=True):
+            main.processing_file_references("v3.1")
+
+        self.assertNotIn(m_file_reference.table_id, te_mock._id_cursor)
+        self.assertNotIn(m_file_reference.table_id, te_mock._id_limit)
+        self.assertEqual(te_mock.next_id[m_file_reference.table_id], 96696)

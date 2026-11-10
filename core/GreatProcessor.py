@@ -438,7 +438,7 @@ class GreatProcessor:
                 for r in t_defs:
                     key = r[m_tag_def.sym_key[1]]
                     if key not in targets:
-                        bs_row = None if complete_blob else te.get(m_blob_symbol.table_id, (fid, key, None, None))
+                        bs_row = None if complete_blob else te.get(m_blob_symbol.table_id, (fid, key, None))
                         targets[key] = bs_row[target_col] if bs_row else None
                     d_ast_id = targets[key]
                     d_name = r[m_tag_def.name[1]]

@@ -1,6 +1,7 @@
 /**
  * modal.js - Minimal shared modal dialog (backdrop, header, scrollable body, footer).
  */
+import { shortcuts } from "../utils/shortcuts.js";
 
 /**
  * @param {{ title: string, subtitle?: string, width?: string, footerHtml?: string, className?: string, onClose?: () => void }} opts
@@ -69,3 +70,5 @@ export function downloadText(filename, text, mime = "text/plain") {
   a.remove();
   setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
+
+shortcuts.register({ id: "modal.close", keys: ["Escape"], scope: "modal", docOnly: true, description: "Close the dialog (nothing is applied)" });

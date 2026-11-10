@@ -5,8 +5,10 @@ import { api } from "../../api.js";
 import { state } from "../../state.js";
 import { shortRef } from "../../components/ref_picker.js";
 import { escapeHtml } from "../../components/modal.js";
+import { contextMenu } from "../../components/context_menu.js";
+import { progressLabel } from "../../utils/job_poll.js";
 
-const PALETTE = ["#388bfd", "#3fb950", "#d29922", "#bc8cff", "#f0883e", "#39c5bb", "#f85149", "#79c0ff", "#56d364", "#e3b341", "#d2a8ff", "#ffa657"];
+const PALETTE = Array.from({ length: 12 }, (_, k) => `var(--chart-${k + 1})`); // theme tokens (G08)
 const MIN_LABEL_W = 46;
 const MIN_LABEL_H = 18;
 
@@ -15,6 +17,23 @@ function formatBytes(n) {
   if (n >= 1 << 20) return `${(n / (1 << 20)).toFixed(1)} MiB`;
   if (n >= 1 << 10) return `${(n / (1 << 10)).toFixed(1)} KiB`;
   return `${n} B`;
+}
+
+/** Cell size for a metric: bytes, files, or compiled bytes (built in + modules, K4). */
+function metricValue(node, metric) {
+  if (metric === "compiled") return node.built_y !== undefined ? (node.built_y + node.built_m) : (node.size || 0);
+  return node[metric] || 0;
+}
+
+/** Color of a cell under a build: the bucket holding most of its bytes (design tokens). */
+function buildColor(n) {
+  const buckets = [["var(--accent-green)", n.built_y], ["var(--accent-cyan)", n.built_m], ["var(--text-muted)", n.not_built], ["var(--accent-purple)", n.unknown]];
+  return buckets.sort((a, b) => b[1] - a[1])[0][0];
+}
+
+function buildLegend() {
+  return [["var(--accent-green)", "built in"], ["var(--accent-cyan)", "module"], ["var(--text-muted)", "not built"], ["var(--accent-purple)", "unknown (headers, non-Kbuild)"]]
+    .map(([c, l]) => `<span class="treemap-legend-item"><i style="background:${c}"></i>${l}</span>`).join("");
 }
 
 /** Squarified treemap layout (Bruls, Huizing & van Wijk). items: [{value, ...}] sorted descending. */
@@ -94,8 +113,11 @@ export class TreemapView {
             <span class="treemap-summary"></span>
             <button class="code-btn ${this.metric === "size" ? "active" : ""}" data-metric="size" type="button">Bytes</button>
             <button class="code-btn ${this.metric === "file_count" ? "active" : ""}" data-metric="file_count" type="button">Files</button>
+            <button class="code-btn ${this.metric === "compiled" ? "active" : ""}" data-metric="compiled" type="button" title="Size cells by the bytes the configuration compiles (needs a Build engine)">Compiled bytes</button>
+            <button class="code-btn treemap-build-btn" type="button" title="Color by what a KConfig engine's configuration compiles (K4)">Build: off ▾</button>
           </div>
         </div>
+        <div class="treemap-legend" hidden></div>
         <div class="treemap-canvas"><div class="treemap-loading">Loading treemap…</div></div>
         <div class="treemap-tooltip" hidden></div>
       </div>`;
@@ -110,16 +132,75 @@ export class TreemapView {
       };
     });
 
+    // Build overlay (K4): the engine this tab colors by (session-local, not in the URL)
+    this.engineTabId = tabData.buildEngineTabId && state.hasEngine(tabData.buildEngineTabId) ? tabData.buildEngineTabId : "";
+    containerEl.querySelector(".treemap-build-btn").onclick = (e) => this.showEnginePicker(e.currentTarget);
+    this.updateBuildButton();
+    this.offEngine?.();
+    let reloadTimer = null;
+    const offA = state.subscribe("kconfig:assignments:updated", ({ tabId } = {}) => {
+      if (!this.engineTabId || tabId !== this.engineTabId || !this.containerEl?.isConnected) return;
+      clearTimeout(reloadTimer);
+      reloadTimer = setTimeout(() => this.load(), 500);
+    });
+    const offB = state.subscribe("kconfig:engine:changed", () => {
+      if (this.engineTabId && !state.hasEngine(this.engineTabId)) this.setEngine("");
+    });
+    this.offEngine = () => { offA?.(); offB?.(); };
     this._resizeObserver?.disconnect();
     this._resizeObserver = new ResizeObserver(() => this.draw());
     this._resizeObserver.observe(containerEl.querySelector(".treemap-canvas"));
     await this.load();
   }
 
+  updateBuildButton() {
+    const btn = this.containerEl?.querySelector(".treemap-build-btn");
+    if (!btn) return;
+    const eng = this.engineTabId ? state.getEngine(this.engineTabId) : null;
+    btn.textContent = eng ? `Build: ${eng.arch}${eng.configName ? ` · ${eng.configName}` : ""} ▾` : "Build: off ▾";
+    btn.classList.toggle("active", Boolean(eng));
+  }
+
+  setEngine(tabId) {
+    this.engineTabId = tabId;
+    if (this.tab) {
+      if (tabId) this.tab.buildEngineTabId = tabId;
+      else delete this.tab.buildEngineTabId;
+      state.saveState();
+    }
+    this.updateBuildButton();
+    this.load();
+  }
+
+  showEnginePicker(anchor) {
+    const engines = state.kconfigEngineList();
+    const items = [{ label: "Off (plain sizes)", icon: this.engineTabId ? "" : "✓", onClick: () => this.setEngine("") }];
+    for (const e of engines) {
+      const ready = state.kconfigConfigActive(e.tabId);
+      items.push({
+        label: `${e.arch}${e.configName ? ` · ${e.configName}` : ""} · ${e.version}${ready ? "" : " (no resolved configuration)"}`,
+        icon: e.tabId === this.engineTabId ? "✓" : "⚙", disabled: !ready, onClick: () => this.setEngine(e.tabId),
+      });
+    }
+    if (!engines.length) items.push({ label: "No KConfig engine runs: enable one in a KConfig tab", icon: "ℹ", disabled: true });
+    const r = anchor.getBoundingClientRect();
+    contextMenu.renderMenu(r.left, r.bottom + 4, { header: { title: "Color by build", sub: "What the configuration compiles" }, items });
+  }
+
   async load() {
     const canvas = this.containerEl.querySelector(".treemap-canvas");
+    const eng = this.engineTabId ? state.getEngine(this.engineTabId) : null;
     try {
-      this.data = await api.getTreemap(this.version, 2, this.path);
+      if (eng && state.kconfigConfigActive(this.engineTabId)) {
+        // Unprefixed names only: the engine publishes both X and CONFIG_X
+        const assignments = Object.fromEntries(Object.entries(eng.assignments || {}).filter(([k]) => !k.startsWith("CONFIG_")));
+        this.data = await api.requestJob(`/api/version/${encodeURIComponent(this.version)}/treemap/build`, {
+          method: "POST", body: { arch: eng.arch, assignments, path: this.path, max_depth: 2 }, timeoutMs: 60000,
+          onProgress: (p) => { canvas.innerHTML = `<div class="treemap-loading">Indexing Kbuild objects… ${escapeHtml(progressLabel(p))}</div>`; },
+        });
+      } else {
+        this.data = await api.getTreemap(this.version, 2, this.path);
+      }
     } catch (err) {
       canvas.innerHTML = `<div class="treemap-loading error">Failed: ${escapeHtml(err.message)}</div>`;
       return;
@@ -156,6 +237,13 @@ export class TreemapView {
     });
     const d = this.data;
     this.containerEl.querySelector(".treemap-summary").textContent = `${formatBytes(d.size)} · ${d.file_count.toLocaleString()} files`;
+    const legend = this.containerEl.querySelector(".treemap-legend");
+    legend.hidden = d.built_y === undefined;
+    if (d.built_y !== undefined) {
+      const compiled = d.built_y + d.built_m;
+      const classified = d.files_y + d.files_m + d.files_n;
+      legend.innerHTML = `${buildLegend()} <span class="treemap-legend-total">compiled: ${formatBytes(compiled)} of ${formatBytes(d.size)} (${((100 * compiled) / Math.max(1, d.size)).toFixed(1)} %) · ${(d.files_y + d.files_m).toLocaleString()} of ${classified.toLocaleString()} .c/.S files</span>`;
+    }
   }
 
   draw() {
@@ -166,7 +254,7 @@ export class TreemapView {
     if (W < 20 || H < 20) return;
     const metric = this.metric;
     const items = (this.data.children || [])
-      .map((c, i) => ({ node: c, value: c[metric] || 0, color: PALETTE[i % PALETTE.length] }))
+      .map((c, i) => ({ node: c, value: metricValue(c, metric), color: PALETTE[i % PALETTE.length] }))
       .filter((it) => it.value > 0)
       .sort((a, b) => b.value - a.value);
 
@@ -175,12 +263,13 @@ export class TreemapView {
       const n = r.node;
       const isDir = n.type === "dir";
       const showLabel = r.w >= MIN_LABEL_W && r.h >= MIN_LABEL_H;
-      html += `<div class="treemap-cell ${isDir ? "dir" : "file"}" style="left:${r.x}px;top:${r.y}px;width:${r.w}px;height:${r.h}px;--tm-color:${r.color};" data-path="${escapeHtml(n.path)}" data-type="${n.type}">`;
+      const color = n.built_y !== undefined ? buildColor(n) : r.color;
+      html += `<div class="treemap-cell ${isDir ? "dir" : "file"}" style="left:${r.x}px;top:${r.y}px;width:${r.w}px;height:${r.h}px;--tm-color:${color};" data-path="${escapeHtml(n.path)}" data-type="${n.type}">`;
       if (showLabel) html += `<div class="treemap-label">${escapeHtml(n.name)}${isDir ? "/" : ""}</div>`;
       // Second level, inset under the label
       if (isDir && n.children?.length && r.w > 60 && r.h > 40) {
         const inner = n.children
-          .map((c) => ({ node: c, value: c[metric] || 0 }))
+          .map((c) => ({ node: c, value: metricValue(c, metric) }))
           .filter((it) => it.value > 0)
           .sort((a, b) => b.value - a.value);
         for (const c of squarify(inner, 2, 18, r.w - 4, r.h - 20)) {
@@ -208,7 +297,10 @@ export class TreemapView {
         return;
       }
       tooltip.hidden = false;
-      tooltip.innerHTML = `<strong>${escapeHtml(node.path)}</strong><br>${formatBytes(node.size)} · ${node.file_count.toLocaleString()} file${node.file_count === 1 ? "" : "s"}<br><span>${node.type === "dir" ? "Click to zoom in" : "Click to open"} · middle-click: new tab</span>`;
+      const build = node.built_y !== undefined
+        ? `<br>built in ${formatBytes(node.built_y)} (${node.files_y}) · module ${formatBytes(node.built_m)} (${node.files_m})<br>not built ${formatBytes(node.not_built)} (${node.files_n}) · unknown ${formatBytes(node.unknown)} (${node.files_unknown})`
+        : "";
+      tooltip.innerHTML = `<strong>${escapeHtml(node.path)}</strong><br>${formatBytes(node.size)} · ${node.file_count.toLocaleString()} file${node.file_count === 1 ? "" : "s"}${build}<br><span>${node.type === "dir" ? "Click to zoom in" : "Click to open"} · middle-click: new tab</span>`;
       const rect = this.containerEl.querySelector(".treemap-view").getBoundingClientRect();
       tooltip.style.left = `${Math.min(e.clientX - rect.left + 14, rect.width - 260)}px`;
       tooltip.style.top = `${e.clientY - rect.top + 14}px`;
@@ -231,6 +323,7 @@ export class TreemapView {
   }
 
   dispose() {
+    this.offEngine?.();
     if (this._resizeObserver) {
       this._resizeObserver.disconnect();
       this._resizeObserver = null;

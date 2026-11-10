@@ -96,13 +96,13 @@ export async function showPersonModal(version, personIdentifier) {
     bodyEl.innerHTML = `
       <!-- Profile Header -->
       <div style="display: flex; gap: 16px; align-items: center; margin-bottom: 20px;">
-        <div style="width: 52px; height: 52px; border-radius: 50%; background: linear-gradient(135deg, var(--accent-blue, #388bfd), #8957e5); color: #fff; display: flex; align-items: center; justify-content: center; font-weight: bold; font-size: 20px; flex-shrink: 0; box-shadow: 0 2px 8px rgba(0,0,0,0.3);">
+        <div style="width: 52px; height: 52px; border-radius: 50%; background: linear-gradient(135deg, var(--accent-blue), var(--accent-purple)); color: var(--text-on-accent); display: flex; align-items: center; justify-content: center; font-weight: bold; font-size: 20px; flex-shrink: 0; box-shadow: 0 2px 8px rgba(0,0,0,0.3);">
           ${initials}
         </div>
         <div style="flex: 1; min-width: 0;">
           <div style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap;">
             <span style="font-size: 18px; font-weight: 600; color: var(--text-primary, #eee);">${escapeHtml(name)}</span>
-            ${inCredits ? `<span style="background: rgba(227, 179, 65, 0.15); color: #e3b341; border: 1px solid rgba(227, 179, 65, 0.3); font-size: 10px; font-weight: 600; padding: 2px 6px; border-radius: 4px;">⭐ CREDITS</span>` : ""}
+            ${inCredits ? `<span style="background: rgba(227, 179, 65, 0.15); color: var(--syn-macro); border: 1px solid rgba(227, 179, 65, 0.3); font-size: 10px; font-weight: 600; padding: 2px 6px; border-radius: 4px;">⭐ CREDITS</span>` : ""}
           </div>
           ${email ? `<div style="font-size: 12px; color: var(--accent-blue, #58a6ff); font-family: var(--font-mono, monospace); margin-top: 2px;">${escapeHtml(email)}</div>` : ""}
         </div>
@@ -153,7 +153,7 @@ export async function showPersonModal(version, personIdentifier) {
         <button id="modal-filter-commits-btn" class="code-btn" style="padding: 6px 14px; font-size: 12px; cursor: pointer; border-radius: 4px; border: 1px solid var(--border-color, #444); background: var(--bg-tertiary, #2a2d2e); color: var(--text-primary, #eee); display: flex; align-items: center; gap: 6px;">
           <span>🔍 View Commits</span>
         </button>
-        <button id="modal-open-maintainers-btn" class="code-btn active" style="padding: 6px 14px; font-size: 12px; cursor: pointer; border-radius: 4px; border: 1px solid var(--accent-blue, #388bfd); background: var(--accent-blue, #388bfd); color: #fff; display: flex; align-items: center; gap: 6px;">
+        <button id="modal-open-maintainers-btn" class="code-btn active" style="padding: 6px 14px; font-size: 12px; cursor: pointer; border-radius: 4px; border: 1px solid var(--accent-blue, #388bfd); background: var(--accent-blue, #388bfd); color: var(--text-on-accent); display: flex; align-items: center; gap: 6px;">
           <span>📋 Open in Maintainers Tab &rarr;</span>
         </button>
       </div>
@@ -194,7 +194,7 @@ export async function showPersonModal(version, personIdentifier) {
         <div style="font-size: 12px; color: var(--text-muted, #888); margin-bottom: 16px;">
           Could not locate developer record for: <code>${escapeHtml(String(personIdentifier))}</code>
         </div>
-        <button id="modal-search-commits-fallback-btn" class="code-btn active" style="padding: 6px 14px; font-size: 12px; cursor: pointer; border-radius: 4px; border: 1px solid var(--accent-blue, #388bfd); background: var(--accent-blue, #388bfd); color: #fff;">
+        <button id="modal-search-commits-fallback-btn" class="code-btn active" style="padding: 6px 14px; font-size: 12px; cursor: pointer; border-radius: 4px; border: 1px solid var(--accent-blue, #388bfd); background: var(--accent-blue, #388bfd); color: var(--text-on-accent);">
           Search Commits for "${escapeHtml(String(personIdentifier))}"
         </button>
       </div>

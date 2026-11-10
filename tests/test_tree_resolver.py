@@ -22,6 +22,12 @@ class TestTreeResolverService(unittest.TestCase):
     def setUp(self) -> None:
         self.resolver = TreeResolverService(max_cache_size=4)
         self.mock_cursor = MagicMock()
+        # tree_source() remembers what a real database answered (an earlier test may have read one without the
+        # m_checkpoint_tree view): this test's cursor is a double, which tree_source() never remembers
+        from webapp.backend.database import helpers
+        saved = dict(helpers._TREE_SOURCE)
+        helpers._TREE_SOURCE.clear()
+        self.addCleanup(lambda: (helpers._TREE_SOURCE.clear(), helpers._TREE_SOURCE.update(saved)))
 
     def test_path_b_full_tree_assembly_and_lru_caching(self) -> None:
         """Verify Path B constructs full tree by applying deltas to checkpoint and caches result."""
@@ -30,12 +36,12 @@ class TestTreeResolverService(unittest.TestCase):
         parents = {11: 10}
 
         def execute_side_effect(sql: str, params: tuple | list) -> None:
-            if "FROM m_bridge_checkpoint WHERE commit_id = %s LIMIT 1" in sql:
+            if "FROM m_checkpoint_tree WHERE commit_id = %s LIMIT 1" in sql:
                 cid = params[0]
                 self.mock_cursor.fetchone.return_value = {"1": 1} if cid == 10 else None
             elif "FROM m_commit_parent" in sql:
                 self.mock_cursor.fetchone.return_value = {"parent_commit_id": 10}
-            elif "SELECT fnid, blob_id FROM m_bridge_checkpoint" in sql:
+            elif "SELECT fnid, blob_id FROM m_checkpoint_tree" in sql:
                 self.mock_cursor.fetchall.return_value = [
                     {"fnid": 1, "blob_id": 101},
                     {"fnid": 2, "blob_id": 102},

@@ -3,6 +3,7 @@
  * High-performance virtualized line renderer with 100% copy fidelity,
  * AST overlay tokens, context menu dispatch, and minimap.
  */
+import { shortcuts } from "../../utils/shortcuts.js";
 import { api } from "../../api.js";
 import { state } from "../../state.js";
 import { toast } from "../../components/toast.js";
@@ -19,7 +20,18 @@ import { DirectiveEvaluator, PREPROCESSED_RE, archMacros } from "../kconfig/dire
 import { configLookup, evalBuild, explainBuild } from "../kconfig/build_condition.js";
 import { escapeHtml } from "../../components/modal.js";
 import { scheduleScrollSave } from "../../components/scroll_memory.js";
+import { FindBar, selectionWithin } from "./find_bar.js";
+import { OutlinePanel } from "./outline_panel.js";
+import { registerView, unregisterView } from "../../utils/active_views.js";
+import { formatBlameOpts, parseBlameOpts } from "./blame_options.js";
+import { centeredScrollTop, codeHash, externalLink, fenceLanguage, formatLineSpec, markdownSnippet, pinnedSha } from "./permalink.js";
+import { isTextTarget } from "../../utils/shortcuts.js";
 import { buildDiffRows, pairDiffRows, showDiffPicker, diffSideLabel } from "./file_diff.js";
+import { patchedFileDiff } from "../mail/patch_try.js";
+import { HoverCard } from "./hover_card.js";
+import { localDB } from "../../db.js";
+import { relocate } from "../bookmarks/bookmark_model.js";
+import { referenceCount } from "../../components/file_references.js";
 
 // Files the build banner reports on (sources Kbuild compiles and the headers/DTs they use)
 const BUILD_TRACKED_RE = /\.(c|h|S|rs|lds|dts|dtsi|inc)$/i;
@@ -41,6 +53,10 @@ export class VirtualEditor {
     this.rawLines = [];
     this.astOverlay = new AstOverlay();
     this.blameView = new BlameView();
+    // Find in file (§5.21): searches the whole buffer, not just the rendered rows
+    this.findBar = new FindBar(this);
+    // Outline, sticky scroll and the breadcrumb's current definition (G03, §5.21)
+    this.outline = new OutlinePanel(this);
     this.showBlame = false;
     this.currentFilePath = "";
     this.currentVersion = "";
@@ -243,6 +259,9 @@ export class VirtualEditor {
 
     // Action buttons in priority order: first item is first to hide/overflow (right-to-left)
     const priorityButtons = [
+      { id: "btn-copy-link", label: "Copy Link to Lines…", icon: "🔗" },
+      { id: "btn-outline", label: () => (this.outline.open ? "Hide Outline" : "Show Outline"), icon: "☰" },
+      { id: "btn-file-refs", label: "Referenced by…", icon: "⇇" },
       { id: "btn-create-patch", label: "Create Patch", icon: "✎" },
       { id: "btn-copy-raw", label: "Copy File", icon: "📋" },
       { id: "btn-file-history", label: "File History", icon: "📜" },
@@ -277,7 +296,7 @@ export class VirtualEditor {
     // Measure pinned chips
     const gap = 6;
     let pinnedWidth = 0;
-    actionsEl.querySelectorAll(".code-dim-chip, .code-diffmark-chip, .code-filediff-chip, .code-last-changed, #btn-doc-toggle").forEach((chip) => {
+    actionsEl.querySelectorAll(".code-dim-chip, .code-diffmark-chip, .code-filediff-chip, .code-last-changed, #btn-doc-toggle, .code-blame-opts").forEach((chip) => {
       if (chip.style.display !== "none" && !chip.hidden && chip.offsetWidth > 0) {
         pinnedWidth += chip.offsetWidth + gap;
       }
@@ -379,7 +398,275 @@ export class VirtualEditor {
   }
 
   /** Called when this tab is closed (TabsComponent.pruneTabViews). */
+  rowHeight() {
+    return getCodeRowHeight();
+  }
+
+  /** Whether `line` is in the selected range (cursorLine..lineEnd). */
+  isLineSelected(line) {
+    const end = Math.max(this.targetCursorLine, this.targetLineEnd || 0);
+    return line >= this.targetCursorLine && line <= end;
+  }
+
+  /**
+   * Select lines a..b (in either order). `persist` records them on the tab (cursorLine, lineEnd) and so
+   * in its URL (line=a-b), replacing the history entry (G06, §5.26).
+   */
+  selectLines(a, b, { persist = true } = {}) {
+    const start = Math.max(1, Math.min(a, b));
+    const end = Math.max(a, b);
+    this.targetCursorLine = start;
+    this.targetLineEnd = end;
+    // Only the final selection is recorded (updateTabState writes the tab and announces the change, so the
+    // URL follows); a drag in progress only repaints
+    if (persist && this.tabId) {
+      state.updateTabState(this.tabId, { cursorLine: start, lineEnd: end > start ? end : null }, { replace: true });
+    }
+    this.updateVisibleLines();
+  }
+
+  /** Lines the link actions address: the selection when `line` is in it, else `line` alone. */
+  linkRange(line = null) {
+    if (line && !this.isLineSelected(line)) return { start: line, end: line };
+    return { start: this.targetCursorLine, end: Math.max(this.targetCursorLine, this.targetLineEnd || 0) };
+  }
+
+  /** SHA a permalink pins: the tab's revision when it is one, else the SHA of its catalog stamp. */
+  async pinnedRevision() {
+    let sha = pinnedSha(this.currentVersion, api.versionStamps[this.currentVersion]);
+    if (!sha) {
+      try {
+        await api.getBranches();
+        sha = pinnedSha(this.currentVersion, api.versionStamps[this.currentVersion]);
+      } catch {
+        sha = "";
+      }
+    }
+    return sha;
+  }
+
+  absoluteLink(hash) {
+    return `${window.location.origin}${window.location.pathname}${window.location.search}${hash}`;
+  }
+
+  /** Copy-link actions of the context menu and the toolbar's 🔗 button (G06, §5.21). */
+  linkMenuItems(line = null) {
+    const { start, end } = this.linkRange(line);
+    const spec = formatLineSpec(start, end);
+    const copy = async (text, what) => {
+      if (await copyToClipboard(text)) toast.success(`Copied ${what}`);
+      else toast.error(`Could not copy the ${what}`);
+    };
+    const hashFor = (rev) => codeHash({
+      rev, path: this.currentFilePath, start, end,
+      diffWith: this.fileDiff ? this.tabData?.diffWith : null, diffLayout: this.tabData?.diffLayout || "",
+    });
+    const items = [
+      {
+        label: `Copy Permalink (lines ${spec}, pinned to the commit)`, icon: "🔗",
+        onClick: async () => {
+          const sha = await this.pinnedRevision();
+          if (!sha) toast.warning("The commit of this revision is unknown: the link follows the revision name");
+          await copy(this.absoluteLink(hashFor(sha || this.currentVersion)), `permalink to ${this.currentFilePath}:${spec}`);
+        },
+      },
+      {
+        label: "Copy Link (follows the revision)", icon: "🔗",
+        onClick: () => copy(this.absoluteLink(hashFor(this.currentVersion)), `link to ${this.currentFilePath}:${spec}`),
+      },
+      {
+        label: "Copy as Markdown", icon: "Ⓜ",
+        onClick: async () => {
+          const sha = await this.pinnedRevision();
+          const text = markdownSnippet({
+            path: this.currentFilePath, start, end, revLabel: this.currentVersion, sha,
+            link: this.absoluteLink(hashFor(sha || this.currentVersion)),
+            lines: this.rawLines.slice(start - 1, end), lang: fenceLanguage(this.astOverlay?.grammar?.id),
+          });
+          await copy(text, `Markdown snippet of ${this.currentFilePath}:${spec}`);
+        },
+      },
+    ];
+    const gitUrl = this.repoGitUrl || "";
+    if (gitUrl && externalLink(gitUrl, this.currentFilePath, "0".repeat(40), start, end)) {
+      items.push({
+        label: `Copy External Link (${new URL(gitUrl.replace(/^git@([^:]+):/, "https://$1/")).hostname})`, icon: "↗",
+        onClick: async () => {
+          const sha = await this.pinnedRevision();
+          if (!sha) {
+            toast.error("The commit of this revision is unknown");
+            return;
+          }
+          // The web viewers need the full SHA; resolve the short one through the commit catalog when possible
+          const full = sha.length === 40 ? sha : (await resolveFullSha(this.currentVersion, sha));
+          await copy(externalLink(gitUrl, this.currentFilePath, full, start, end), "external link");
+        },
+      });
+    }
+    return items;
+  }
+
+  /**
+   * Blame annotations on or off (H9, §5.21). The choice is kept on the tab (`blame`, `bl=1` in its
+   * URL), with the options (`blameOpts`, `bo=mcw`), so a reopened tab or a link shows blame again.
+   */
+  async setBlame(on, { persist = true } = {}) {
+    this.showBlame = Boolean(on);
+    this.containerEl?.querySelector("#btn-toggle-blame")?.classList.toggle("active", this.showBlame);
+    const optsBtn = this.containerEl?.querySelector("#btn-blame-opts");
+    if (optsBtn) optsBtn.style.display = this.showBlame ? "" : "none";
+    if (persist && this.tabId) state.updateTabState(this.tabId, { blame: this.showBlame || null }, { replace: true });
+    if (this.showBlame) {
+      const opts = this.tabData?.blameOpts || "";
+      await this.blameView.loadBlame(this.currentVersion, this.currentFilePath, opts);
+      if (this.blameView.blameData?.slow) {
+        toast.info(`Blame took ${Math.round((this.blameView.blameData.elapsed_ms || 0) / 1000)} s (following copies compares every file of each commit)`);
+      }
+    }
+    if (!this.isLive()) return;
+    this.updateVisibleLines();
+    this.updateToolbarOverflow();
+  }
+
+  /** Popover of the blame options: follow moves (-M), follow copies (-C, slow), ignore whitespace (-w). */
+  showBlameOptions(anchorEl) {
+    document.querySelector(".blame-opts-popover")?.remove();
+    const current = parseBlameOpts(this.tabData?.blameOpts || "");
+    const pop = document.createElement("div");
+    pop.className = "blame-opts-popover";
+    pop.innerHTML = `
+      <div class="blame-opts-title">Blame options</div>
+      <label><input type="checkbox" data-opt="move" ${current.move ? "checked" : ""}/> Follow lines moved within the file <code>-M</code></label>
+      <label><input type="checkbox" data-opt="copy" ${current.copy ? "checked" : ""}/> Follow lines copied from other files <code>-C</code> <span class="blame-opts-slow">slow</span></label>
+      <label><input type="checkbox" data-opt="ws" ${current.ws ? "checked" : ""}/> Ignore whitespace changes <code>-w</code></label>`;
+    document.body.appendChild(pop);
+    const r = anchorEl.getBoundingClientRect();
+    pop.style.top = `${r.bottom + 4}px`;
+    pop.style.left = `${Math.max(8, Math.min(r.left, window.innerWidth - pop.offsetWidth - 8))}px`;
+    pop.addEventListener("change", async () => {
+      const next = {};
+      pop.querySelectorAll("input[data-opt]").forEach((cb) => { next[cb.dataset.opt] = cb.checked; });
+      const letters = formatBlameOpts(next);
+      state.updateTabState(this.tabId, { blameOpts: letters || null }, { replace: true });
+      if (this.tabData) {
+        if (letters) this.tabData.blameOpts = letters;
+        else delete this.tabData.blameOpts;
+      }
+      if (this.showBlame) await this.setBlame(true, { persist: false });
+    });
+    const close = (e) => {
+      if (e && pop.contains(e.target)) return;
+      pop.remove();
+      document.removeEventListener("mousedown", close, true);
+      document.removeEventListener("keydown", onKey, true);
+    };
+    const onKey = (e) => {
+      if (e.key === "Escape") close();
+    };
+    setTimeout(() => {
+      document.addEventListener("mousedown", close, true);
+      document.addEventListener("keydown", onKey, true);
+    }, 0);
+  }
+
+  /** Mod+F: the find bar over the source (prefilled with the selection), or the rendered page's quick search. */
+  openFind() {
+    if (this.docMode === "rendered") {
+      const input = this.containerEl?.querySelector(".kdoc-search-input");
+      if (input) {
+        input.focus();
+        input.select();
+      }
+      return;
+    }
+    this.findBar.open(selectionWithin(this.linesContainer));
+  }
+
+  /**
+   * Token the keyboard shortcuts act on (F12, Shift+F12): an identifier selected in this view, else
+   * the token under the pointer. Null when there is none, or it is a comment or a directive.
+   */
+  shortcutToken() {
+    if (!this.linesContainer || !this.linesContainer.isConnected) return null;
+    const sel = window.getSelection ? window.getSelection() : null;
+    const text = sel ? sel.toString().trim() : "";
+    if (text && sel.anchorNode && this.linesContainer.contains(sel.anchorNode) && /^(struct\s+|union\s+)?[a-zA-Z_]\w*$/.test(text)) {
+      const row = sel.anchorNode.parentElement?.closest(".code-row");
+      return {
+        name: text.replace(/^(struct|union)\s+/, "").trim(), header: "", isInclude: false, ast_id: 0,
+        type_id: text.startsWith("struct ") ? 28 : (text.startsWith("union ") ? 34 : 0),
+        version: this.currentVersion, filePath: this.currentFilePath, ftype: this.currentFtype,
+        line: row ? (parseInt(row.dataset.lineNo, 10) || 1) : 1,
+      };
+    }
+    const span = this.hoverTokenEl;
+    if (!span || !span.isConnected || !this.linesContainer.contains(span)) return null;
+    if (span.classList.contains("tok-comment") || ["2", "87", "142", "143"].includes(span.dataset.typeId)) return null;
+    const row = span.closest(".code-row");
+    const typeId = parseInt(span.dataset.typeId || "0", 10);
+    const name = (span.dataset.name || span.textContent || "").trim();
+    return {
+      name, header: span.dataset.header || "",
+      isInclude: span.classList.contains("ast-include") || typeId === 78 || name.includes(".h"),
+      ast_id: parseInt(span.dataset.astId || "0", 10), type_id: typeId, typeClass: span.className || "",
+      version: this.currentVersion, filePath: this.currentFilePath, ftype: this.currentFtype,
+      line: row ? (parseInt(row.dataset.lineNo, 10) || 1) : 1,
+    };
+  }
+
+  /** Record view state on the tab without a history entry. */
+  persistTab(patch) {
+    if (!this.tabId) return;
+    state.updateTabState(this.tabId, patch, { replace: true });
+  }
+
+  /** Scroll so `line` is near the top (5 rows of context) and optionally select it (outline, sticky rows). */
+  scrollToLine(line, { select = false } = {}) {
+    if (!this.viewportEl || !line) return;
+    const rowH = getCodeRowHeight();
+    const row = this.fileDiff ? this.diffRowOfLine(line) : line - 1;
+    this.viewportEl.scrollTop = Math.max(0, (row - 4) * rowH);
+    if (select) this.selectLines(line, line);
+    else this.updateVisibleLines();
+  }
+
+  /**
+   * Bookmarked lines of this file (G05): at this revision exactly, or found again by their snippet within
+   * ±200 lines when the bookmark was made at another revision (dimmed, *moved?*). Notes show as the tooltip.
+   */
+  async loadBookmarkMarks() {
+    const path = this.currentFilePath;
+    if (!path || !this.rawLines.length) return;
+    const [marks, notes] = await Promise.all([localDB.userList("bookmark", api.repo || ""), localDB.userList("note", api.repo || "")]);
+    const noteOf = new Map(notes.map((n) => [n.data.bookmark_key, n.data.markdown]));
+    const sha = pinnedSha(this.currentVersion, api.versionStamps[this.currentVersion]);
+    const out = new Map();
+    for (const m of marks) {
+      const t = m.data.target;
+      if (t?.type !== "line" || t.path !== path) continue;
+      const here = (t.sha && sha && t.sha.startsWith(sha.slice(0, 12))) || (!t.sha && t.rev === this.currentVersion) || t.rev === this.currentVersion;
+      const at = here ? { line: t.line, moved: false } : relocate(this.rawLines, t.line, t.snippet);
+      if (!at) continue;
+      const note = noteOf.get(m.key) || "";
+      out.set(at.line, { moved: !here, note: Boolean(note), title: `🔖 ${m.data.label}${here ? "" : ` (bookmarked at ${t.rev || t.sha}, moved?)`}${note ? `\n${note.slice(0, 300)}` : ""}` });
+    }
+    if (this.currentFilePath !== path) return;
+    this.bookmarkMarks = out;
+    this.updateVisibleLines?.();
+  }
+
+  /** The bookmark target of a line of this tab (pinned to the commit shown). */
+  lineTarget(line = this.targetCursorLine) {
+    const sha = pinnedSha(this.currentVersion, api.versionStamps[this.currentVersion]);
+    return { type: "line", path: this.currentFilePath, rev: this.currentVersion, ...(sha ? { sha } : {}), line, snippet: (this.rawLines[line - 1] || "").trim().slice(0, 300) };
+  }
+
   dispose() {
+    unregisterView(this.tabId, this);
+    this.hoverCard?.dispose();
+    this.hoverCard = null;
+    this.unsubBookmarks?.();
+    this.unsubBookmarks = null;
     (this.unsubscribers || []).forEach((off) => off());
     this.unsubscribers = [];
     this.resizeObserver?.disconnect();
@@ -464,6 +751,43 @@ export class VirtualEditor {
     const ruleHtml = rule
       ? `<button class="code-build-rule" data-mk="${escapeHtml(rule.makefile)}" data-line="${rule.line}" title="Open the Kbuild rule">${escapeHtml(rule.makefile)}:${rule.line} <code>${escapeHtml(rule.text)}</code></button>`
       : "";
+
+    // Extract module name, composite membership, and compiler flags from cond/rules
+    let moduleName = cond?.module || cond?.modname || "";
+    let compositeName = cond?.composite || "";
+    let compilerFlags = cond?.compiler_flags || cond?.cflags || cond?.flags || "";
+    const rules = cond?.rules || [];
+    const baseName = path.split("/").pop().replace(/\.[cCsS]$/, "");
+
+    for (const r of rules) {
+      const text = r.text || "";
+      const compMatch = text.match(/^([\w-]+)-(?:objs|y)\s*[:+]?=/);
+      if (compMatch && !compositeName) {
+        compositeName = `${compMatch[1]}.o`;
+        if (!moduleName) moduleName = `${compMatch[1]}.ko`;
+      }
+      const objMatch = text.match(/^obj-(?:\$\([A-Z0-9_]+\)|[ym])\s*[:+]?=\s*([\w-]+)\.o\b/);
+      if (objMatch && !moduleName) {
+        moduleName = `${objMatch[1]}.ko`;
+      }
+      const flagMatch = text.match(/(?:ccflags|asflags|CFLAGS_[\w-]+|EXTRA_CFLAGS)\s*[:+]?=\s*(.+)/);
+      if (flagMatch && !compilerFlags) {
+        compilerFlags = flagMatch[1].trim();
+      }
+    }
+    if (!moduleName && baseName) {
+      moduleName = `${baseName}.ko`;
+    }
+
+    const extraParts = [];
+    if (compositeName) {
+      extraParts.push(`<span>Part of composite <code>${escapeHtml(compositeName)}</code></span>`);
+    }
+    if (compilerFlags) {
+      extraParts.push(`<span>Flags: <code>${escapeHtml(compilerFlags)}</code></span>`);
+    }
+    const extraHtml = extraParts.length ? `<span class="code-build-details" style="opacity:0.85;margin-left:6px;">(${extraParts.join(" · ")})</span>` : "";
+
     if (result === "n") {
       let why = escapeHtml(cond.reason || "");
       if (cond.status === "rule") {
@@ -473,10 +797,14 @@ export class VirtualEditor {
           + (more ? `, or one of ${more} other rule${more === 1 ? "" : "s"}` : "");
       }
       banner.className = "code-build-banner not-built";
-      banner.innerHTML = `<span class="code-build-icon">⛔</span><span><strong>Not compiled</strong> for ARCH=${arch} with the current KConfig configuration. ${why}</span>${ruleHtml}`;
+      banner.innerHTML = `<span class="code-build-icon">⛔</span><span><strong>Not compiled</strong> for ARCH=${arch} with the current KConfig configuration. ${why}</span>${extraHtml}${ruleHtml}`;
     } else if (result === "m") {
       banner.className = "code-build-banner module";
-      banner.innerHTML = `<span class="code-build-icon">📦</span><span>Built as a <strong>module</strong> for ARCH=${arch} with the current KConfig configuration.</span>${ruleHtml}`;
+      const modLabel = moduleName ? ` as <code>${escapeHtml(moduleName)}</code>` : "";
+      banner.innerHTML = `<span class="code-build-icon">📦</span><span>Built as a <strong>module</strong>${modLabel} for ARCH=${arch} with the current KConfig configuration.</span>${extraHtml}${ruleHtml}`;
+    } else if (result === "y") {
+      banner.className = "code-build-banner builtin";
+      banner.innerHTML = `<span class="code-build-icon">✅</span><span>Built as <strong>built-in (y)</strong> for ARCH=${arch} with the current KConfig configuration.</span>${extraHtml}${ruleHtml}`;
     } else {
       banner.hidden = true;
       return;
@@ -492,11 +820,16 @@ export class VirtualEditor {
     this.tabData = tabData;
     this.tabId = tabData.id || null;
     this.containerEl = containerEl;
+    registerView(this.tabId, this);
     // Which KConfig engine this file follows (the first one of this revision by default, else none)
     this.resolveEngineSelection();
     this.currentFilePath = tabData.path;
     this.currentVersion = tabData.version || state.currentVersion;
     this.targetCursorLine = tabData.cursorLine || 1;
+    // Selected line range (G06): cursorLine..lineEnd, highlighted and addressed by line=a-b
+    this.targetLineEnd = Math.max(this.targetCursorLine, Number(tabData.lineEnd) || 0);
+    // Blame comes back from the tab once the file is loaded (tab.blame, H9)
+    this.showBlame = false;
     this.diffMarks = tabData.diffMarks?.ranges?.length ? tabData.diffMarks : null;
     // A re-render starts from the plain file; loadFileContent() re-enters the diff the tab records
     this.fileDiff = null;
@@ -541,12 +874,18 @@ export class VirtualEditor {
               <button data-diffnav="-1" title="Previous change">↑</button><button data-diffnav="1" title="Next change">↓</button><button data-diffnav="0" title="Clear change markers">✕</button>
             </span>` : ""}
             <span id="code-filediff-chip" class="code-filediff-chip" hidden></span>
+            <span id="file-security-badge" class="code-security-badge" style="display:none;" title="Security Insights"></span>
+            <span id="file-subsystem" class="code-subsystem-chip" style="display:none;" title="Subsystem"></span>
             <span id="file-last-changed" class="code-last-changed" style="display:none;" title="Click to view full commit history"></span>
             <button class="code-btn" id="btn-kconfig-engine" title="KConfig engine this file follows"></button>
             <button class="code-btn" id="btn-file-diff" title="Diff this file with another revision or another file">⇄ Diff</button>
             <button class="code-btn" id="btn-file-history" title="View commit history for this file">📜 History</button>
             <button class="code-btn" id="btn-toggle-blame" title="Annotate every line with the commit that last changed it">Blame</button>
+            <button type="button" class="code-btn code-blame-opts" id="btn-blame-opts" title="Blame options: follow moves and copies, ignore whitespace" style="display:none;" aria-haspopup="true">⚙</button>
             <button class="code-btn" id="btn-copy-raw">Copy File</button>
+            <button type="button" class="code-btn" id="btn-outline" title="Outline of this file's definitions">☰ Outline</button>
+            <button type="button" class="code-btn" id="btn-file-refs" title="Files including this one, Kconfig sources, Kbuild rules and documents naming it">⇇ Refs<span class="code-btn-badge" id="file-refs-count"></span></button>
+            <button type="button" class="code-btn" id="btn-copy-link" title="Copy a link to the selected lines (click line numbers to select; Shift+click extends)">🔗 Link</button>
             <button class="code-btn" id="btn-create-patch" title="Edit this file and generate a git format-patch">✎ Patch</button>
             <button type="button" class="code-btn code-overflow-btn" id="btn-code-overflow" title="More actions" style="display:none;" aria-haspopup="true" aria-expanded="false">▾</button>
           </div>
@@ -588,6 +927,8 @@ export class VirtualEditor {
     this.spacerEl = containerEl.querySelector("#editor-spacer");
     this.linesContainer = containerEl.querySelector("#editor-lines");
     this.minimapCanvas = containerEl.querySelector("#minimap-canvas");
+    this.findBar.mount();
+    this.outline.mount();
 
     // Attach 100% copy fidelity handler
     // A diff mixes both files' lines: its selections are copied as the browser shows them
@@ -646,12 +987,38 @@ export class VirtualEditor {
     blameBtn.onclick = async () => {
       if (this.fileDiff) return;
       if (this.docMode === "rendered") this.setDocMode("source");
-      this.showBlame = !this.showBlame;
-      blameBtn.classList.toggle("active", this.showBlame);
-      if (this.showBlame) {
-        await this.blameView.loadBlame(this.currentVersion, this.currentFilePath);
-      }
-      this.updateVisibleLines();
+      await this.setBlame(!this.showBlame);
+    };
+    containerEl.querySelector("#btn-outline").onclick = () => this.outline.toggle();
+    const refsBtn = containerEl.querySelector("#btn-file-refs");
+    refsBtn.onclick = async (e) => {
+      e.stopPropagation();
+      const r = (refsBtn.offsetWidth ? refsBtn : containerEl.querySelector("#btn-code-overflow") || refsBtn).getBoundingClientRect();
+      const res = await contextMenu.showFileReferencesMenu(Math.max(8, r.right - 360), r.bottom + 4, this.currentVersion, this.currentFilePath);
+      const badge = containerEl.querySelector("#file-refs-count");
+      if (badge && res) badge.textContent = ` ${referenceCount(res)}`;
+    };
+    const linkBtn = containerEl.querySelector("#btn-copy-link");
+    linkBtn.onclick = (e) => {
+      e.stopPropagation();
+      const r = (linkBtn.offsetWidth ? linkBtn : containerEl.querySelector("#btn-code-overflow") || linkBtn).getBoundingClientRect();
+      const { start, end } = this.linkRange();
+      contextMenu.renderMenu(Math.max(8, r.right - 300), r.bottom + 4, {
+        header: { title: `${this.currentFilePath}:${formatLineSpec(start, end)}`, sub: "Click line numbers to select; Shift+click extends" },
+        items: this.linkMenuItems(),
+      });
+    };
+    // The repository's web viewer (G06 "Copy External Link"), from the project catalog
+    this.repoGitUrl = "";
+    api.getProjects().then((res) => {
+      const projects = res?.projects || [];
+      const p = projects.find((x) => x.repo === state.currentRepo) || projects.find((x) => x.active) || projects[0];
+      this.repoGitUrl = p?.git_url || "";
+    }).catch(() => {});
+    const blameOptsBtn = containerEl.querySelector("#btn-blame-opts");
+    blameOptsBtn.onclick = (e) => {
+      e.stopPropagation();
+      this.showBlameOptions(blameOptsBtn);
     };
 
     const copyBtn = containerEl.querySelector("#btn-copy-raw");
@@ -695,7 +1062,7 @@ export class VirtualEditor {
       const tokenSpan = e.target.closest(".ast-token");
       if (tokenSpan) {
         // Prevent clicks on comments or structural directives
-        if (tokenSpan.classList.contains("tok-comment") || tokenSpan.dataset.typeId === "2" || tokenSpan.dataset.typeId === "142" || tokenSpan.dataset.typeId === "143") {
+        if (tokenSpan.classList.contains("tok-comment") || tokenSpan.dataset.typeId === "2" || tokenSpan.dataset.typeId === "87" || tokenSpan.dataset.typeId === "142" || tokenSpan.dataset.typeId === "143") {
           return;
         }
 
@@ -728,7 +1095,7 @@ export class VirtualEditor {
       const tokenSpan = e.target.closest(".ast-token");
       if (tokenSpan) {
         // Prevent clicks on comments or structural directives
-        if (tokenSpan.classList.contains("tok-comment") || tokenSpan.dataset.typeId === "2" || tokenSpan.dataset.typeId === "142" || tokenSpan.dataset.typeId === "143") {
+        if (tokenSpan.classList.contains("tok-comment") || tokenSpan.dataset.typeId === "2" || tokenSpan.dataset.typeId === "87" || tokenSpan.dataset.typeId === "142" || tokenSpan.dataset.typeId === "143") {
           return;
         }
 
@@ -756,6 +1123,51 @@ export class VirtualEditor {
       }
     });
 
+    // Line-number gutter: click selects a line, Shift+click extends, dragging selects a range (G06)
+    this.linesContainer.addEventListener("mousedown", (e) => {
+      if (e.button !== 0) return;
+      const gutter = e.target.closest(".gutter-line-no");
+      if (!gutter) return;
+      const row = gutter.closest(".code-row");
+      const line = parseInt(row?.dataset.lineNo || "", 10);
+      if (!line) return;
+      e.preventDefault();
+      const anchor = e.shiftKey ? this.targetCursorLine : line;
+      this.selectLines(anchor, line, { persist: false });
+      const onMove = (ev) => {
+        const r = document.elementFromPoint(ev.clientX, ev.clientY)?.closest?.(".code-row");
+        const l = parseInt(r?.dataset.lineNo || "", 10);
+        if (l && this.linesContainer.contains(r)) this.selectLines(anchor, l, { persist: false });
+      };
+      const onUp = () => {
+        document.removeEventListener("mousemove", onMove);
+        document.removeEventListener("mouseup", onUp);
+        this.selectLines(this.targetCursorLine, this.targetLineEnd, { persist: true, anchor });
+      };
+      document.addEventListener("mousemove", onMove);
+      document.addEventListener("mouseup", onUp);
+    });
+
+    // Bookmark gutter markers (G05) follow edits made anywhere, this window or another
+    this.unsubBookmarks?.();
+    this.unsubBookmarks = localDB.onUserChanged((d) => {
+      if (!d.kind || d.kind === "bookmark" || d.kind === "note" || d.kind === "*") this.loadBookmarkMarks();
+    });
+
+    // Hover cards (G04): signature, definition and kernel-doc of the token the pointer rests on
+    this.hoverCard?.dispose();
+    this.hoverCard = new HoverCard(this);
+    this.hoverCard.attach(this.linesContainer, this.viewportEl);
+
+    // Token under the pointer: what F12 / Shift+F12 act on when nothing is selected (§5.31)
+    this.linesContainer.addEventListener("mouseover", (e) => {
+      const span = e.target.closest?.(".ast-token");
+      if (span) this.hoverTokenEl = span;
+    });
+    this.linesContainer.addEventListener("mouseleave", () => {
+      this.hoverTokenEl = null;
+    });
+
     // Right-click context menu listener for editor lines, tokens, and selections
     this.linesContainer.addEventListener("contextmenu", (e) => {
       e.preventDefault();
@@ -776,7 +1188,7 @@ export class VirtualEditor {
         }
       }
 
-      if (tokenSpan && !tokenSpan.classList.contains("tok-comment") && tokenSpan.dataset.typeId !== "2" && tokenSpan.dataset.typeId !== "142" && tokenSpan.dataset.typeId !== "143") {
+      if (tokenSpan && !tokenSpan.classList.contains("tok-comment") && tokenSpan.dataset.typeId !== "2" && tokenSpan.dataset.typeId !== "87" && tokenSpan.dataset.typeId !== "142" && tokenSpan.dataset.typeId !== "143") {
         const astId = parseInt(tokenSpan.dataset.astId || "0", 10);
         const typeId = parseInt(tokenSpan.dataset.typeId || "0", 10);
         const name = (tokenSpan.dataset.name || tokenSpan.textContent || "").trim();
@@ -823,7 +1235,9 @@ export class VirtualEditor {
         line: lineNo,
         selection,
         version: this.currentVersion,
-        blame
+        blame,
+        // Links to the selected lines, or to this line when it is outside the selection (G06)
+        linkItems: row?.dataset.lineNo ? this.linkMenuItems(lineNo) : [],
       });
     });
 
@@ -832,6 +1246,7 @@ export class VirtualEditor {
       this.updateVisibleLines();
       this.updateMinimapSlider();
       this.rememberScrollPosition();
+      this.outline.update();
     });
 
     // The minimap is to scale with the document, so clicking or dragging it scrolls there
@@ -866,6 +1281,14 @@ export class VirtualEditor {
     const lastChangedEl = this.viewportEl?.closest(".code-viewer-container")?.querySelector("#file-last-changed");
     if (lastChangedEl) {
       lastChangedEl.style.display = "none";
+    }
+    const secBadgeEl = this.viewportEl?.closest(".code-viewer-container")?.querySelector("#file-security-badge");
+    if (secBadgeEl) {
+      secBadgeEl.style.display = "none";
+    }
+    const subChipEl = this.viewportEl?.closest(".code-viewer-container")?.querySelector("#file-subsystem");
+    if (subChipEl) {
+      subChipEl.style.display = "none";
     }
     this.linesContainer.innerHTML = `<div style="padding:20px;color:var(--text-muted);">Loading ${escapeHtml(this.currentFilePath)}...</div>`;
     try {
@@ -950,6 +1373,54 @@ export class VirtualEditor {
         }
       }
 
+      // Fetch CVE security badge for this file
+      api.getFileCves(this.currentVersion, this.currentFilePath).then((cveRes) => {
+        const badge = this.viewportEl?.closest(".code-viewer-container")?.querySelector("#file-security-badge");
+        if (!badge) return;
+        const total = cveRes?.total ?? (Array.isArray(cveRes?.cves) ? cveRes.cves.length : 0);
+        if (total > 0) {
+          badge.style.display = "inline-flex";
+          badge.innerHTML = `🛡️ ${total} CVE${total === 1 ? "" : "s"}`;
+          badge.title = `${total} CVE${total === 1 ? "" : "s"} associated with ${this.currentFilePath} (click to view Security Insights)`;
+          badge.onclick = () => {
+            state.openTab({
+              type: "insights",
+              title: "Insights · Security",
+              view: "security",
+              version: this.currentVersion,
+            });
+          };
+          this.updateToolbarOverflow();
+        } else {
+          badge.style.display = "none";
+        }
+      }).catch((err) => console.warn("CVE lookup failed:", err));
+
+      // Fetch Subsystem indicator for this file
+      api.matchMaintainers(this.currentVersion, "", [this.currentFilePath]).then((matchRes) => {
+        const subChip = this.viewportEl?.closest(".code-viewer-container")?.querySelector("#file-subsystem");
+        if (!subChip) return;
+        const subs = matchRes?.subsystems || [];
+        const subName = subs[0] || matchRes?.files?.[0]?.subsystems?.[0]?.name || "";
+        if (subName) {
+          subChip.style.display = "inline-flex";
+          subChip.innerHTML = `🏷️ ${escapeHtml(subName)}`;
+          subChip.title = `Subsystem: ${subName} (click to view Maintainers)`;
+          subChip.onclick = () => {
+            state.openTab({
+              type: "maintainers",
+              title: "Maintainers",
+              section: "subsystems",
+              query: subName,
+              version: this.currentVersion,
+            });
+          };
+          this.updateToolbarOverflow();
+        } else {
+          subChip.style.display = "none";
+        }
+      }).catch((err) => console.warn("Subsystem lookup failed:", err));
+
       // Load server tokens into AST overlay
       if (Array.isArray(res.tokens)) {
         this.astOverlay.loadServerTokens(res.tokens);
@@ -972,6 +1443,9 @@ export class VirtualEditor {
       const savedTop = Number(this.tabData?.scrollTop);
       if (Number.isFinite(savedTop) && savedTop > 0) {
         this.viewportEl.scrollTop = Math.min(savedTop, Math.max(0, totalHeight - this.viewportEl.clientHeight));
+      } else if (this.targetLineEnd > this.targetCursorLine) {
+        // A line range (permalink, G06): centered
+        this.viewportEl.scrollTop = centeredScrollTop(this.targetCursorLine, this.targetLineEnd, rowH, this.viewportEl.clientHeight || 600);
       } else if (this.targetCursorLine > 1) {
         this.viewportEl.scrollTop = Math.max(0, (this.targetCursorLine - 5) * rowH);
       }
@@ -979,9 +1453,16 @@ export class VirtualEditor {
       this.updateVisibleLines();
       this.renderMinimap();
       this.updateMinimapSlider();
+      this.findBar.refresh();
+      this.outline.load();
+      this.loadBookmarkMarks();
+      // The tab was left with blame on (or a link / "blame before this change" asks for it, H9)
+      if (this.tabData.blame && this.docMode === "source" && !this.showBlame) {
+        this.setBlame(true, { persist: false });
+      }
 
       // The tab was left showing a diff (or a deep link asks for one): show it again
-      if (this.tabData.diffWith?.version && this.tabData.diffWith?.path) {
+      if ((this.tabData.diffWith?.version && this.tabData.diffWith?.path) || this.tabData.diffWith?.kind === "patch") {
         await this.enterFileDiff(this.tabData.diffWith, { restoring: true });
       }
     } catch (err) {
@@ -1111,21 +1592,27 @@ export class VirtualEditor {
   async enterFileDiff(target, { restoring = false } = {}) {
     if (!this.rawLines.length || !this.isLive()) return;
     const token = ++this.fileDiffToken;
-    const swap = Boolean(target.swap);
-    const pick = { version: target.version, path: String(target.path || "").replace(/^\/+|\/+$/g, ""), swap };
+    // Diff source kind `patch` (P1): this tab's file against the text mailing-list patches make of it
+    const isPatch = target.kind === "patch";
+    // The tab's own file is the base of a patch diff: the layout of a swapped blob diff (own file on the left)
+    const swap = isPatch ? true : Boolean(target.swap);
+    const pick = isPatch
+      ? { kind: "patch", mids: [...(target.mids || [])], revision: target.revision || this.currentVersion, path: this.currentFilePath, applyId: target.applyId || "", swap: true }
+      : { version: target.version, path: String(target.path || "").replace(/^\/+|\/+$/g, ""), swap };
+    const label = isPatch ? `patched (${pick.mids.length} message${pick.mids.length === 1 ? "" : "s"})` : diffSideLabel(pick.version, pick.path, this.currentFilePath);
     const chip = this.containerEl.querySelector("#code-filediff-chip");
     chip.hidden = false;
     chip.className = "code-filediff-chip loading";
-    chip.textContent = `⇄ Loading diff with ${diffSideLabel(pick.version, pick.path, this.currentFilePath)}…`;
+    chip.textContent = `⇄ Loading diff with ${label}…`;
     const [va, pa, vb, pb] = swap
       ? [this.currentVersion, this.currentFilePath, pick.version, pick.path]
       : [pick.version, pick.path, this.currentVersion, this.currentFilePath];
     let res;
     try {
-      res = await api.getBlobDiff(va, pa, vb, pb);
+      res = isPatch ? await patchedFileDiff(pick) : await api.getBlobDiff(va, pa, vb, pb);
     } catch (err) {
       if (token !== this.fileDiffToken || !this.isLive()) return;
-      toast.error(`Diff with ${diffSideLabel(pick.version, pick.path, this.currentFilePath)} failed: ${err.message}`);
+      toast.error(`Diff with ${label} failed: ${err.message}`);
       // A diff that cannot be shown is not kept on the tab; the one already on screen stays
       if (this.fileDiff) this.updateFileDiffChip();
       else this.exitFileDiff();
@@ -1153,6 +1640,8 @@ export class VirtualEditor {
     if (this.showBlame) {
       this.showBlame = false;
       this.containerEl.querySelector("#btn-toggle-blame")?.classList.remove("active");
+      const optsBtn = this.containerEl.querySelector("#btn-blame-opts");
+      if (optsBtn) optsBtn.style.display = "none";
     }
     this.setPlainOnlyControls(false);
 
@@ -1174,6 +1663,7 @@ export class VirtualEditor {
       else if (!blocks.length) toast.info("No line differs between the two files");
     }
     if (res.truncated) toast.warning("The diff is too large: it stops after the last change that could be loaded");
+    this.findBar.refresh();
   }
 
   /** Back to the plain file, at the line the diff was showing. */
@@ -1195,6 +1685,7 @@ export class VirtualEditor {
     this.renderMinimap();
     this.updateMinimapSlider();
     this.rememberScrollPosition();
+    this.findBar.refresh();
   }
 
   /** Blame and the commit change-marker chip belong to the plain file view. */
@@ -1227,6 +1718,7 @@ export class VirtualEditor {
     this.renderMinimap();
     this.updateMinimapSlider();
     this.rememberScrollPosition();
+    this.findBar.refresh();
   }
 
   /** Scroll to the previous/next change block of the diff. */
@@ -1260,7 +1752,8 @@ export class VirtualEditor {
       return;
     }
     const own = diffSideLabel(this.currentVersion, this.currentFilePath, this.currentFilePath);
-    const other = diffSideLabel(fd.target.version, fd.target.path, this.currentFilePath);
+    const isPatch = fd.target.kind === "patch";
+    const other = isPatch ? `patched (${fd.target.mids.length} message${fd.target.mids.length === 1 ? "" : "s"})` : diffSideLabel(fd.target.version, fd.target.path, this.currentFilePath);
     const [base, tgt] = fd.target.swap ? [own, other] : [other, own];
     const r = fd.res;
     const blocks = fd.layout === "split" ? fd.pairBlocks : fd.blocks;
@@ -1269,7 +1762,9 @@ export class VirtualEditor {
     const split = fd.layout === "split";
     chip.hidden = false;
     chip.className = "code-filediff-chip";
-    chip.title = `Base: ${fd.target.swap ? `${this.currentFilePath} @ ${this.currentVersion}` : `${fd.target.path} @ ${fd.target.version}`}\n`
+    chip.title = isPatch
+      ? `Base: ${this.currentFilePath} @ ${this.currentVersion}\nTarget: the same file with the mailing-list patches applied (in memory)\nClick ⇄ Diff to pick another file or revision`
+      : `Base: ${fd.target.swap ? `${this.currentFilePath} @ ${this.currentVersion}` : `${fd.target.path} @ ${fd.target.version}`}\n`
       + `Target: ${fd.target.swap ? `${fd.target.path} @ ${fd.target.version}` : `${this.currentFilePath} @ ${this.currentVersion}`}\n`
       + "Click ⇄ Diff to pick another file or revision";
     chip.innerHTML = `
@@ -1279,7 +1774,7 @@ export class VirtualEditor {
       ${blocks.length ? `<span class="code-filediff-muted code-filediff-pos" style="width:${String(blocks.length).length * 2 + 1}ch" title="Change blocks">${at}</span>` : ""}
       <button data-fd="layout" title="${split ? "Unified view (one column, old and new line numbers)" : "Side-by-side view (base left, target right)"}">${split ? "☰" : "◫"}</button>
       <button data-fd="-1" title="Previous change" ${blocks.length ? "" : "disabled"}>↑</button><button data-fd="1" title="Next change" ${blocks.length ? "" : "disabled"}>↓</button>
-      <button data-fd="swap" title="Swap base and target">⇆</button><button data-fd="close" title="Close the diff">✕</button>`;
+      ${isPatch ? "" : `<button data-fd="swap" title="Swap base and target">⇆</button>`}<button data-fd="close" title="Close the diff">✕</button>`;
     chip.querySelectorAll("[data-fd]").forEach((btn) => {
       btn.onclick = (e) => {
         e.stopPropagation();
@@ -1325,19 +1820,20 @@ export class VirtualEditor {
       for (let i = startIdx; i <= endIdx; i++) {
         const p = fd.pairs[i];
         const s = this.diffShownLineAt(i);
-        const hl = s && s === this.targetCursorLine ? " highlighted-line" : "";
-        html += `<div class="code-row diff-split-row${hl}" data-line-no="${s || ""}">${half(p.l, "l")}${half(p.r, "r")}</div>`;
+        const hl = s && this.isLineSelected(s) ? " highlighted-line" : "";
+        html += `<div class="code-row diff-split-row${hl}" data-line-no="${s || ""}" data-row="${i}">${half(p.l, "l")}${half(p.r, "r")}</div>`;
       }
     } else {
       for (let i = startIdx; i <= endIdx; i++) {
         const r = fd.rows[i];
-        const hl = r.s && r.s === this.targetCursorLine ? " highlighted-line" : "";
-        html += `<div class="code-row diff-row ${KIND[r.k]}${hl}" data-line-no="${r.s || ""}">`
+        const hl = r.s && this.isLineSelected(r.s) ? " highlighted-line" : "";
+        html += `<div class="code-row diff-row ${KIND[r.k]}${hl}" data-line-no="${r.s || ""}" data-row="${i}">`
           + `<div class="gutter-line-no diff-ln">${r.o ?? ""}</div><div class="gutter-line-no diff-ln">${r.n ?? ""}</div>`
           + `<div class="diff-sign">${SIGN[r.k]}</div><div class="code-text">${this.diffRowHtml(r, true)}</div></div>`;
       }
     }
     this.linesContainer.innerHTML = html;
+    this.findBar.decorate(this.linesContainer);
   }
 
   /** Minimap of the diff rows: text lengths, and a red/green (amber: changed pair) bar per change. */
@@ -1390,23 +1886,27 @@ export class VirtualEditor {
     for (let i = startIdx; i <= endIdx; i++) {
       const lineNo = i + 1;
       const rawText = this.rawLines[i];
-      const isHighlighted = lineNo === this.targetCursorLine;
+      const isHighlighted = this.isLineSelected(lineNo);
       const isDimmed = !this.dimSuspended && this.dimmedLines.has(lineNo);
       const diffCls = this.diffMarkedLines.has(lineNo) ? (this.diffMarks.kind === "del" ? " diff-mark-del" : " diff-mark-add") : "";
 
       const blameHtml = this.showBlame ? this.blameView.renderGutterCell(lineNo) : "";
+      const mark = this.bookmarkMarks?.get(lineNo);
+      const markCls = mark ? ` bm-gutter${mark.moved ? " bm-gutter-moved" : ""}${mark.note ? " bm-gutter-note" : ""}` : "";
+      const markTitle = mark ? ` title="${escapeHtml(mark.title)}"` : "";
       const textHtml = this.astOverlay.renderLineHtml(lineNo, rawText, isDimmed);
 
       html += `
-        <div class="code-row ${isHighlighted ? "highlighted-line" : ""}${diffCls}" data-line-no="${lineNo}">
+        <div class="code-row ${isHighlighted ? "highlighted-line" : ""}${diffCls}" data-line-no="${lineNo}" data-row="${i}">
           ${blameHtml}
-          <div class="gutter-line-no">${lineNo}</div>
+          <div class="gutter-line-no${markCls}"${markTitle}>${lineNo}</div>
           <div class="code-text">${textHtml}</div>
         </div>
       `;
     }
 
     this.linesContainer.innerHTML = html;
+    this.findBar.decorate(this.linesContainer);
   }
 
   /** Remember where this tab is scrolled to, so selecting it again comes back to that position. */
@@ -1469,6 +1969,8 @@ export class VirtualEditor {
       }
     }
 
+    this.findBar.drawMinimap(ctx, m, w);
+
     // Below the last line the minimap shows nothing, so the track is marked as not part of the file
     if (m.mapH < h) {
       ctx.fillStyle = "rgba(0, 0, 0, 0.18)";
@@ -1520,3 +2022,53 @@ export class VirtualEditor {
     });
   }
 }
+
+/** Full 40-hex SHA of a revision for external viewers (the catalog only keeps 12 hex characters). */
+async function resolveFullSha(version, sha12) {
+  try {
+    const res = await api.searchCommits(version, sha12, 1);
+    const hit = (res?.commits || []).find((c) => String(c.commit_hash || "").startsWith(sha12));
+    if (hit?.commit_hash?.length === 40) return hit.commit_hash;
+  } catch {
+    // fall back to the short SHA, which cgit and GitHub accept for unambiguous prefixes
+  }
+  return sha12;
+}
+
+// Code view keys (webapp/API.md §5.31): act on the selected identifier or the token under the pointer
+const findAvailable = (ctx) => {
+  const v = ctx.view;
+  if (!v?.containerEl?.isConnected || typeof v.openFind !== "function") return false;
+  // A text field elsewhere (the palette, a picker) keeps the browser's own key
+  const active = document.activeElement;
+  return !isTextTarget(active) || Boolean(active.closest?.(".code-find-bar, .kdoc-search"));
+};
+const findOpen = (ctx) => Boolean(ctx.view?.findBar?.isOpen);
+shortcuts.registerAll([
+  { id: "code.bookmark", keys: ["Mod+Alt+B"], scope: "code", description: "Bookmark the current line (again: remove it)",
+    when: (ctx) => Boolean(ctx.view?.currentFilePath && ctx.view.rawLines?.length),
+    handler: async (e, ctx) => {
+      const { toggleBookmark } = await import("../bookmarks/bookmark_store.js");
+      const t = ctx.view.lineTarget();
+      try {
+        const r = await toggleBookmark(t, { label: `${t.path.split("/").pop()}:${t.line}` });
+        toast.success(r.added ? `Bookmarked ${t.path}:${t.line}` : `Bookmark on ${t.path}:${t.line} removed`);
+      } catch (err) {
+        toast.error(err.message);
+      }
+    } },
+  { id: "code.find", keys: ["Mod+F"], scope: "code", allowInInputs: true, description: "Find in file",
+    when: findAvailable, handler: (e, ctx) => { ctx.view.openFind(); } },
+  { id: "code.findNext", keys: ["F3"], scope: "code", allowInInputs: true, description: "Next match",
+    when: findOpen, handler: (e, ctx) => { ctx.view.findBar.step(1); } },
+  { id: "code.findPrevious", keys: ["Shift+F3"], scope: "code", allowInInputs: true, description: "Previous match",
+    when: findOpen, handler: (e, ctx) => { ctx.view.findBar.step(-1); } },
+  { id: "find.enter", keys: ["Enter", "Shift+Enter"], scope: "code-find", docOnly: true, description: "Next / previous match (in the find box)" },
+  { id: "find.close", keys: ["Escape"], scope: "code-find", docOnly: true, description: "Close the find bar" },
+  { id: "code.goToDefinition", keys: ["F12"], scope: "code", description: "Go to the definition of the token under the pointer",
+    when: (ctx) => Boolean(ctx.view?.shortcutToken?.()),
+    handler: (e, ctx) => { contextMenu.executeDefaultAction(ctx.view.shortcutToken(), { forceNew: false }); } },
+  { id: "code.findReferences", keys: ["Shift+F12"], scope: "code", description: "Find references of the token under the pointer",
+    when: (ctx) => Boolean(ctx.view?.shortcutToken?.()),
+    handler: (e, ctx) => { contextMenu.findReferences(ctx.view.shortcutToken()); } },
+]);

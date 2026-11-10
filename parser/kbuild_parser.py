@@ -12,6 +12,22 @@ from dataclasses import dataclass, field
 from typing import Any
 
 
+def _strip_comment(line: str) -> str:
+    out = []
+    i = 0
+    while i < len(line):
+        c = line[i]
+        if c == "\\" and i + 1 < len(line) and line[i + 1] == "#":
+            out.append("#")
+            i += 2
+            continue
+        if c == "#":
+            break
+        out.append(c)
+        i += 1
+    return "".join(out).rstrip()
+
+
 @dataclass
 class KbuildBinding:
     """Represents a compiled source file binding or Makefile dependency."""
@@ -31,27 +47,30 @@ class KbuildBinding:
 class KbuildParser:
     """Deterministic parser for Linux Makefile and Kbuild syntax."""
 
-    # Matches obj-$(CONFIG_XYZ) += ... or obj-y += ... or obj-m += ... (also obj-$(subst m,y,$(CONFIG_XYZ)))
+    # Matches obj-$(CONFIG_XYZ) += ... or obj-y += ... or obj-m += ... (also obj-$(subst m,y,$(CONFIG_XYZ)) and obj-$(CONFIG_XYZ:m=y))
     OBJ_ASSIGN_RE = re.compile(
-        r"^(?:obj-\$\(CONFIG_([A-Za-z0-9_]+)\)|obj-\$\(subst m,y,\$\(CONFIG_([A-Za-z0-9_]+)\)\)|obj-([ym]))"
+        r"^(?:obj-\$\(CONFIG_([A-Za-z0-9_]+)(?::m=y)?\)|obj-\$\(subst m,y,\$\(CONFIG_([A-Za-z0-9_]+)\)\)|obj-([ym]))"
         r"\s*([:+?]?=)\s*(.*)$",
         re.MULTILINE,
     )
 
     # lib-* (relative to the Makefile) and the top-level goal lists of arch Makefiles (relative to srctree)
     GOAL_ASSIGN_RE = re.compile(
-        r"^(lib|core|drivers|libs|net|init|head)-(?:\$\(CONFIG_([A-Za-z0-9_]+)\)|([ym]))\s*([:+?]?=)\s*(.*)$",
+        r"^(lib|core|drivers|libs|net|init|head|virt|extra|always|subdir)-(?:\$\(CONFIG_([A-Za-z0-9_]+)\)|([ym]))\s*([:+?]?=)\s*(.*)$",
     )
 
     # ifeq ($(CONFIG_X),y) / ifneq ($(CONFIG_X),) / ifdef CONFIG_X / ifndef CONFIG_X
     COND_RE = re.compile(r"^(ifeq|ifneq|ifdef|ifndef)\b(.*)$")
     CONFIG_REF_RE = re.compile(r"CONFIG_([A-Za-z0-9_]+)")
 
-    # Matches composite target-y := ... or target-objs := ...
+    # Matches composite target-y := ... or target-m := ... or target-objs := ...
     COMPOSITE_RE = re.compile(
-        r"^([A-Za-z0-9_\-]+)-(?:y|objs|\$\(CONFIG_([A-Za-z0-9_]+)\))\s*([:+?]?=)\s*(.*)$",
+        r"^([A-Za-z0-9_\-]+)-(?:[ym]|objs|\$\(CONFIG_([A-Za-z0-9_]+)\))\s*([:+?]?=)\s*(.*)$",
         re.MULTILINE,
     )
+
+    # Matches simple variable assignments: FOO := a.o b.o
+    VAR_ASSIGN_RE = re.compile(r"^([A-Za-z0-9_]+)\s*[:?]?=\s*(.*)$")
 
     # Matches -?include ...
     MAKEFILE_INCLUDE_RE = re.compile(
@@ -81,8 +100,9 @@ class KbuildParser:
         for idx, line in enumerate(content.splitlines(), start=1):
             if not current_line:
                 current_start_line = idx
-            stripped = line.rstrip()
-            if stripped.endswith("\\"):
+            no_comment = _strip_comment(line)
+            stripped = no_comment.rstrip(" \t")
+            if stripped.endswith("\\") and not stripped.endswith("\\\\"):
                 current_line.append(stripped[:-1].rstrip())
             else:
                 current_line.append(stripped)
@@ -91,20 +111,45 @@ class KbuildParser:
         if current_line:
             joined_lines.append((current_start_line, " ".join(current_line)))
 
-        # 2. Extract composite object mappings: target_name -> list of constituent (comp_obj, sub_sym, line_no)
+        # 2. Extract composite object mappings and variables
         composites: dict[str, list[tuple[str, str | None, int]]] = {}
+        variables: dict[str, list[str]] = {}
         for start_line, line_str in joined_lines:
             line_str = line_str.strip()
             if not line_str or line_str.startswith("#"):
                 continue
+
+            m_var = self.VAR_ASSIGN_RE.match(line_str)
+            if (
+                m_var
+                and not self.OBJ_ASSIGN_RE.match(line_str)
+                and not self.GOAL_ASSIGN_RE.match(line_str)
+                and not self.COMPOSITE_RE.match(line_str)
+            ):
+                v_name = m_var.group(1)
+                v_val = m_var.group(2).split()
+                variables[v_name] = v_val
+
             m = self.COMPOSITE_RE.match(line_str)
             if m:
                 target_base = m.group(1)
                 sub_cond = m.group(2)  # if composite had $(CONFIG_...)
                 vals = m.group(4).split()
+                expanded_vals: list[str] = []
+                for val in vals:
+                    clean_val = val.strip()
+                    if clean_val.startswith("$(") and clean_val.endswith(")"):
+                        var_key = clean_val[2:-1]
+                        if var_key in variables:
+                            expanded_vals.extend(variables[var_key])
+                        else:
+                            expanded_vals.append(clean_val)
+                    else:
+                        expanded_vals.append(clean_val)
+
                 if target_base not in composites:
                     composites[target_base] = []
-                for v in vals:
+                for v in expanded_vals:
                     clean_v = v.strip()
                     if clean_v.endswith(".o"):
                         composites[target_base].append((clean_v, sub_cond, start_line))
@@ -118,7 +163,7 @@ class KbuildParser:
             b_key = (b.source_file_rel, b.source_line, b.ref_type, b.symbol_name, b.target_obj)
             if b_key not in seen_bindings:
                 seen_bindings.add(b_key)
-                b.cond_symbols = [sym for frame in cond_stack for sym in frame]
+                b.cond_symbols = [sym for frame in cond_stack for sym in frame] + b.cond_symbols
                 bindings.append(b)
 
         for start_line, line_str in joined_lines:
@@ -136,6 +181,8 @@ class KbuildParser:
                 m_else = self.COND_RE.match(rest)
                 if m_else and cond_stack:
                     cond_stack[-1] = cond_stack[-1] + self.CONFIG_REF_RE.findall(m_else.group(2))
+                elif cond_stack:
+                    cond_stack[-1] = [s[1:] if s.startswith("!") else f"!{s}" for s in cond_stack[-1]]
                 continue
             if line_str.startswith("endif"):
                 if cond_stack:
@@ -151,13 +198,14 @@ class KbuildParser:
                     if "$" in item:
                         continue
                     # core-y/drivers-y/... in arch Makefiles name paths from the source root
-                    base = clean_dir if var == "lib" else ""
+                    base = clean_dir if var in ("lib", "extra", "always", "subdir", "virt") else ""
                     rel = os.path.normpath(f"{base}/{item}" if base else item).replace("\\", "/")
                     rule_desc = f"{var}-$(CONFIG_{sym_name}) += {item}" if mode == 3 else f"{var}-{sym_name} += {item}"
-                    if item.endswith("/"):
+                    if item.endswith("/") or var == "subdir":
                         add_binding(KbuildBinding(
                             symbol_name=sym_name, compile_mode=mode, target_obj="Makefile",
-                            source_file_rel=f"{rel}/Makefile", source_line=start_line, ref_type=4,
+                            source_file_rel=f"{rel}/Makefile" if not rel.endswith("Makefile") else rel,
+                            source_line=start_line, ref_type=4,
                             details=rule_desc, is_directory=True,
                         ))
                     elif item.endswith(".o"):
@@ -195,7 +243,18 @@ class KbuildParser:
             if m:
                 config_sym = m.group(1) or m.group(2)
                 direct_mode = m.group(3)  # 'y' or 'm'
-                items = m.group(5).split()
+                raw_items = m.group(5).split()
+                items: list[str] = []
+                for itm in raw_items:
+                    clean_itm = itm.strip()
+                    if clean_itm.startswith("$(") and clean_itm.endswith(")"):
+                        v_key = clean_itm[2:-1]
+                        if v_key in variables:
+                            items.extend(variables[v_key])
+                        else:
+                            items.append(clean_itm)
+                    else:
+                        items.append(clean_itm)
 
                 if config_sym:
                     sym_name = config_sym
@@ -238,6 +297,12 @@ class KbuildParser:
                                 src_base = comp_obj[:-2]
                                 src_c = f"{clean_dir}/{src_base}.c" if clean_dir else f"{src_base}.c"
                                 bound_sym = sub_sym if sub_sym else sym_name
+                                parent_cond = [sym_name] if (sub_sym and sym_name not in ("y", "m") and sym_name != sub_sym) else []
+                                rule_detail = (
+                                    f"{rule_desc} ({target_base}-$(CONFIG_{sub_sym}) += {comp_obj})"
+                                    if sub_sym
+                                    else f"{rule_desc} ({target_base}-objs += {comp_obj})"
+                                )
                                 add_binding(KbuildBinding(
                                     symbol_name=bound_sym,
                                     compile_mode=mode,
@@ -245,8 +310,9 @@ class KbuildParser:
                                     source_file_rel=src_c,
                                     source_line=comp_line or start_line,
                                     ref_type=3,  # FileRefType.Kbuild
-                                    details=f"{rule_desc} ({target_base}-objs += {comp_obj})",
+                                    details=rule_detail,
                                     is_composite=True,
+                                    cond_symbols=parent_cond,
                                 ))
                         else:
                             # Direct object -> .c file

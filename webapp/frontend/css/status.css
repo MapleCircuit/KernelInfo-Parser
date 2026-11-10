@@ -1,0 +1,30 @@
+/* Parser status tab (G11, webapp/API.md §5.37) */
+.status-view { height: 100%; overflow: auto; padding: 14px 18px 32px; box-sizing: border-box; }
+.status-head { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; margin-bottom: 12px; }
+.status-head h2 { margin: 0; font-size: 18px; }
+.status-repo { color: var(--text-secondary); }
+.status-updated { color: var(--text-muted); font-size: 12px; margin-left: auto; }
+.status-cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 10px; margin-bottom: 16px; }
+.status-card { background: var(--bg-secondary); border: 1px solid var(--border-color); border-radius: 6px; padding: 10px 12px; }
+.status-card.busy { border-color: var(--accent-blue); }
+.status-card.warn { border-color: var(--accent-yellow); }
+.status-val { font-size: 20px; font-weight: 600; color: var(--text-primary); font-variant-numeric: tabular-nums; }
+.status-lbl { font-size: 11px; color: var(--text-secondary); margin-top: 2px; }
+.status-section { margin: 14px 0; }
+.status-section h3 { font-size: 13px; margin: 0 0 6px; color: var(--text-secondary); text-transform: uppercase; letter-spacing: 0.04em; }
+.status-sub { font-size: 11px; color: var(--text-muted); text-transform: none; letter-spacing: 0; font-weight: 400; }
+.status-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 16px; }
+.status-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+.status-table th, .status-table td { text-align: left; padding: 4px 8px; border-bottom: 1px solid var(--border-color); }
+.status-table th { color: var(--text-secondary); font-weight: 600; background: var(--bg-secondary); position: sticky; top: 0; }
+.status-table.sortable th { cursor: pointer; user-select: none; }
+.status-table .num { text-align: right; font-variant-numeric: tabular-nums; }
+.status-table tr.stale td { background: rgba(210, 153, 34, 0.08); }
+.status-table a { color: var(--accent-blue); text-decoration: none; }
+.status-scroll { max-height: 420px; overflow: auto; border: 1px solid var(--border-color); border-radius: 4px; }
+.status-badge { font-size: 10px; padding: 1px 6px; border-radius: 9px; border: 1px solid currentColor; }
+.status-badge.busy { color: var(--accent-blue); }
+.status-badge.warn { color: var(--accent-yellow); }
+.status-warn { padding: 8px 10px; border: 1px solid var(--accent-red); color: var(--accent-red); border-radius: 4px; margin-bottom: 12px; }
+.status-empty { color: var(--text-muted); padding: 8px 0; font-size: 12px; }
+@media (max-width: 700px) { .status-view { padding: 10px; } }

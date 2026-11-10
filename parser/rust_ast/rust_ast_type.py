@@ -1,38 +1,24 @@
 """parser/rust_ast/rust_ast_type.py - Rust AST Node Types and Relational Extractors.
 
-Provides strongly-typed intermediate representations for Rust constructs (structs,
-enums, functions, traits, impls, modules, macros, types, constants, statics, doc comments)
-and maps them into relational database ChangeSet operations.
+Strongly-typed intermediate representations of Rust constructs (items, their members, doc comments,
+attributes and comments) and their mapping into ChangeSet operations (parser/rust_ast/RUST_API.md):
+
+- `extract_ast_node()`: the node and its children as content-addressed `m_ast` rows (`m_ast.view`, Rule 23),
+  children as flat `m_ast_container` scalars (Rule 21), `mod x;` declarations joined with `m_ast_include`.
+- `extract()`: a top-level construct's tag (tier-1 recycling or a new tag with its transition, Rule 12), its
+  `m_bridge_tag` placement and `m_map_ast` map, the symbol definitions it holds and its uses of C symbols
+  through bindgen (`bindings::foo`, references to a `Rust_BindingRef` AST named by the symbol; core/SymbolRows.py).
+
+A node's AST only holds what its tag's own text says, so a recycled tag (same code hash) always means the same
+AST: outer doc comments and attributes of a top-level item are tagged on their own, never stored in the item.
 """
 from __future__ import annotations
 
 from typing import Any
-from core.globalstuff import (
-    G,
-    ASTT,
-    OP_REF,
-    REF_ROOT,
-    REF_OLD,
-    REF_POS,
-    REF_NO_REF,
-    RouteType,
-)
-from core.DBLayout import (
-    m_v_main,
-    m_file_name,
-    m_file,
-    m_bridge_file,
-    m_moved_file,
-    m_type_descriptor,
-    m_ast,
-    m_ast_container,
-    m_ast_include,
-    m_ast_debug,
-    m_tag,
-    m_ast_hash,
-    m_blob_symbol_def,
-)
-from core.globalstuff import compute_code_hash
+
+from core.globalstuff import ASTT, OP_REF, REF_POS, SymbolLinkage, compute_code_hash
+from core.DBLayout import m_ast, m_ast_container, m_ast_include, m_file_name
+from core.SymbolRows import record_def, record_ref, register_tag
 from parser.c_ast.tag_tracker import (
     check_exact_match,
     match_prior_tag_transition,
@@ -43,9 +29,33 @@ from parser.c_ast.tag_tracker import (
 
 ChangeSetType = Any
 
+# m_ast.name is VARCHAR(255)
+NAME_MAX = 255
+
+# AST types recorded as symbol definitions (m_symbol_def; the webapp outline maps every one of them)
+DEF_TYPES = frozenset({
+    ASTT.Rust_Fn,
+    ASTT.Rust_Struct,
+    ASTT.Rust_Enum,
+    ASTT.Rust_Union,
+    ASTT.Rust_Trait,
+    ASTT.Rust_TraitAlias,
+    ASTT.Rust_Type,
+    ASTT.Rust_Const,
+    ASTT.Rust_Static,
+    ASTT.Rust_MacroDef,
+    ASTT.Rust_Mod,
+    ASTT.Rust_Impl,
+    ASTT.Rust_Variant,
+    ASTT.Rust_Field,
+    ASTT.Rust_ModuleAttr,
+})
+
 
 class Line:
-    """Coordinate tracking for source code extents and snippet content."""
+    """Coordinates of a source extent (1-based lines, 1-based byte columns, exclusive end) and its text."""
+
+    __slots__ = ("line_pos", "char_pos", "code")
 
     def __init__(
         self,
@@ -67,19 +77,21 @@ class Line:
 
     def grow(self, other: Line) -> None:
         """Expand extent to envelop another Line extent."""
-        self.line_pos[0] = min(self.line_pos[0], other.line_pos[0])
-        self.line_pos[1] = max(self.line_pos[1], other.line_pos[1])
-        if self.line_pos[0] == other.line_pos[0]:
-            self.char_pos[0] = min(self.char_pos[0], other.char_pos[0])
-        if self.line_pos[1] == other.line_pos[1]:
-            self.char_pos[1] = max(self.char_pos[1], other.char_pos[1])
+        if (other.line_pos[0], other.char_pos[0]) < (self.line_pos[0], self.char_pos[0]):
+            self.line_pos[0], self.char_pos[0] = other.line_pos[0], other.char_pos[0]
+        if (other.line_pos[1], other.char_pos[1]) > (self.line_pos[1], self.char_pos[1]):
+            self.line_pos[1], self.char_pos[1] = other.line_pos[1], other.char_pos[1]
 
     def __repr__(self) -> str:
         return f"Line(lines={self.line_pos}, chars={self.char_pos})"
 
 
 class Ast_Rust:
-    """Base class for all Rust AST nodes."""
+    """Base class for all Rust AST nodes.
+
+    `name` is the m_ast name (also the tier-2 transition key of a top-level node); `def_name` is the bare
+    identifier recorded as a symbol definition (None: not a definition); `linkage` its SymbolLinkage.
+    """
 
     def __init__(
         self,
@@ -90,6 +102,8 @@ class Ast_Rust:
         doc_comments: list[str] | None = None,
         attributes: list[str] | None = None,
         generics: str = "",
+        def_name: str | None = None,
+        linkage: int = SymbolLinkage.ExternalDef,
     ) -> None:
         self.name = name
         self.extent = extent or Line(1, 1, 1, 1)
@@ -98,7 +112,16 @@ class Ast_Rust:
         self.doc_comments = doc_comments or []
         self.attributes = attributes or []
         self.generics = generics
+        self.def_name = def_name
+        self.linkage = int(linkage)
         self.children: list[Ast_Rust] = []
+        # Repository path of the file a `mod x;` declaration loads (m_ast_include), when it exists
+        self.include_target: str | None = None
+        # Name the item is linked under for C (`#[no_mangle]`, `#[export]`, `#[export_name = "x"]`), else None
+        self.c_symbol: str | None = None
+        # Uses of C symbols in a top-level node's text: (name, SymbolRole, line, byte column) (RUST_API.md §7)
+        self.binding_refs: list[tuple[str, int, int, int]] = []
+        self.ast_ref: Any = None
 
     def get_symbol_name(self) -> str:
         """Return canonical name string stored in m_ast.name."""
@@ -106,115 +129,122 @@ class Ast_Rust:
 
     def extract_ast_node(self, CS: ChangeSetType) -> Any:
         """Extract this AST node and its children into m_ast / m_ast_container, returning its ast_ref."""
-        symbol_name = self.get_symbol_name()
+        symbol_name = str(self.get_symbol_name())[:NAME_MAX]
         type_id = int(self.ast_type)
 
         child_refs = [child.extract_ast_node(CS) for child in self.children]
+        container_payload: list[Any] = []
+        for priority, (child, child_ref) in enumerate(zip(self.children, child_refs)):
+            container_payload.extend([None, priority, int(child.ast_type), child_ref])
 
+        include_payload: list[Any] = []
+        joins: list[tuple[Any, ...]] = []
+        if self.include_target:
+            with CS(REF_POS):
+                CS.store(m_file_name.get_set(None, self.include_target[:NAME_MAX]))
+                fnid_route = CS.get_route_parse()
+            joins.append((m_ast.ast_id, m_ast_include.ast_id, 1))
+            include_payload = [None, CS.ref(m_file_name.fnid, *fnid_route)]
         if child_refs:
-            container_payload = []
-            for priority, (child, child_ref) in enumerate(zip(self.children, child_refs)):
-                container_payload.extend([None, priority, int(child.ast_type), child_ref])
+            joins.append((m_ast.ast_id, m_ast_container.ast_id, len(child_refs)))
+        if not joins:
+            joins.append((m_ast.ast_id,))
 
-            with CS(REF_POS):
-                CS.store(m_ast.view(
-                    ((m_ast.ast_id, m_ast_container.ast_id, len(child_refs)),),
-                    None,
-                    symbol_name,
-                    type_id,
-                    *container_payload,
-                ))
-                ast_ref = ((m_ast.table_id, 0), OP_REF, (REF_POS, CS.route[-1]))
-        else:
-            with CS(REF_POS):
-                CS.store(m_ast.view(
-                    ((m_ast.ast_id,),),
-                    None,
-                    symbol_name,
-                    type_id,
-                ))
-                ast_ref = ((m_ast.table_id, 0), OP_REF, (REF_POS, CS.route[-1]))
+        with CS(REF_POS):
+            CS.store(m_ast.view(
+                tuple(joins),
+                None,
+                symbol_name,
+                type_id,
+                *include_payload,
+                *container_payload,
+            ))
+            ast_ref = ((m_ast.table_id, 0), OP_REF, (REF_POS, CS.route[-1]))
 
         self.ast_ref = ast_ref
         return ast_ref
 
-    def stage_symbol_defs(self, CS: ChangeSetType, current_tag: Any) -> None:
-        """Stage definition symbols (Rust_Fn, Rust_Struct, Rust_Enum, Rust_Trait) into m_blob_symbol_def (per blob)."""
-        _RUST_DEF_TYPES = (
-            ASTT.Rust_Fn,
-            ASTT.Rust_Struct,
-            ASTT.Rust_Enum,
-            ASTT.Rust_Trait,
-        )
-        if self.ast_type in _RUST_DEF_TYPES and self.name and getattr(self, "ast_ref", None) is not None:
-            safe_name = str(self.name)[:255]
-            from core.globalstuff import SymbolLinkage
-            with CS(REF_POS):
-                CS.store(m_blob_symbol_def.set(
-                    None,
-                    ((m_file.table_id, 0), OP_REF, (REF_ROOT,)),
-                    current_tag,
-                    self.ast_ref,
-                    safe_name,
-                    int(self.ast_type),
-                    SymbolLinkage.ExternalDef,
-                    self.extent.line_pos[0],
-                    self.extent.line_pos[1],
-                ))
+    def record_defs(self, CS: ChangeSetType, tag: Any) -> None:
+        """Record the symbol definitions of this node and its members against the enclosing tag."""
+        if self.ast_type in DEF_TYPES and self.def_name and self.ast_ref is not None:
+            record_def(
+                CS,
+                tag,
+                self.ast_ref,
+                str(self.def_name)[:NAME_MAX],
+                int(self.ast_type),
+                self.linkage,
+                self.extent.line_pos[0],
+                self.extent.line_pos[1],
+            )
+            if self.c_symbol and self.c_symbol != self.def_name:
+                # `#[export_name = "x"]`: C knows the item as `x`
+                record_def(CS, tag, self.ast_ref, str(self.c_symbol)[:NAME_MAX], int(self.ast_type), self.linkage,
+                           self.extent.line_pos[0], self.extent.line_pos[1])
         for child in self.children:
-            if hasattr(child, "stage_symbol_defs"):
-                child.stage_symbol_defs(CS, current_tag)
+            child.record_defs(CS, tag)
 
-    def extract(self, CS: ChangeSetType) -> None:
-        """Extract this top-level AST construct (AST + tag + bridge_tag + map_ast)."""
+    def record_binding_refs(self, CS: ChangeSetType, tag: Any, cache: dict[str, Any]) -> None:
+        """Record this node's uses of C symbols, each a reference to the `Rust_BindingRef` AST of its name.
+
+        The AST is a leaf (name, type): the same row for every use of the symbol in every file and version, so
+        the webapp finds a symbol's Rust uses by name (`webapp/API.md` §4.3, xref) without resolving them.
+        """
+        for name, role, line, col in self.binding_refs:
+            target = cache.get(name)
+            if target is None:
+                with CS(REF_POS):
+                    CS.store(m_ast.view(((m_ast.ast_id,),), None, name[:NAME_MAX], int(ASTT.Rust_BindingRef)))
+                    target = cache[name] = ((m_ast.table_id, 0), OP_REF, (REF_POS, CS.route[-1]))
+            record_ref(CS, tag, target, 0, role, line, col)
+
+    def extract(self, CS: ChangeSetType, binding_cache: dict[str, Any] | None = None) -> Any:
+        """Extract this top-level construct: AST, tag (recycled or new), placement, map, definitions and
+        references (`binding_cache`: the file's `Rust_BindingRef` ASTs by name, staged once per file)."""
         ast_ref = self.extract_ast_node(CS)
+        ext = self.extent
+        code_hash = compute_code_hash(ext.code)
 
-        code_hash = compute_code_hash(self.extent.code)
+        tag = check_exact_match(CS, code_hash) if ext.code else None
+        if tag is not None:
+            # Tier 1: the prior tag already maps its AST; only its placement in this blob is new
+            stage_bridge_tag(CS, tag, ext.line_pos, ext.char_pos)
+        else:
+            s_tag_id = match_prior_tag_transition(CS, ext, self.get_symbol_name()[:NAME_MAX], self.ast_type)
+            tag = stage_new_tag(CS, code_hash, ast_ref, s_tag_id)
+            stage_bridge_tag(CS, tag, ext.line_pos, ext.char_pos)
+            stage_tag_map(CS, tag, ast_ref, max(1, ext.line_pos[1] - ext.line_pos[0] + 1), ext.char_pos[1])
 
-        # Prior tag recycling check
-        prior_tag_id = check_exact_match(CS, code_hash)
-        if prior_tag_id is not None:
-            stage_bridge_tag(CS, prior_tag_id, self.extent.line_pos, self.extent.char_pos)
-            self.map_ast(CS, ast_ref, prior_tag_id, self.extent)
-            self.stage_symbol_defs(CS, prior_tag_id)
-            return
+        register_tag(CS, tag, ext.line_pos[0], ext.line_pos[1], ext.char_pos[0], ext.code)
+        self.record_defs(CS, tag)
+        if self.binding_refs:
+            self.record_binding_refs(CS, tag, {} if binding_cache is None else binding_cache)
+        return tag
 
-        s_tag_id = match_prior_tag_transition(CS, self.extent, getattr(self, "name", None), getattr(self, "type", None))
-        hl = (self.extent.char_pos[0], max(0, self.extent.char_pos[1] - self.extent.char_pos[0]))
-        tag_ref = stage_new_tag(CS, code_hash, ast_ref, s_tag_id, hl=hl)
-        stage_bridge_tag(CS, tag_ref, self.extent.line_pos, self.extent.char_pos)
+    def walk(self):
+        """This node and every descendant, depth first."""
+        yield self
+        for child in self.children:
+            yield from child.walk()
 
-        # Stage Spatial Map
-        self.map_ast(CS, ast_ref, tag_ref, self.extent)
-        self.stage_symbol_defs(CS, tag_ref)
 
-    def map_ast(
-        self,
-        CS: ChangeSetType,
-        ast_id_route: RouteType | Any,
-        tag_route: RouteType | Any,
-        extent: Line | None = None,
-    ) -> None:
-        """Create the m_map_ast spatial coordinate entry (keyed by the tag) for this AST node."""
-        ext = extent if extent is not None else getattr(self, "extent", None)
-        if ext is None:
-            return
+class Ast_Rust_Signature(Ast_Rust):
+    """Header text of an item (`pub const unsafe fn f<T: Copy>(x: T) -> u32 where …`), whitespace-normalized."""
 
-        line_e = max(1, ext.line_pos[1] - ext.line_pos[0] + 1)
-        char_e = ext.char_pos[1]
+    def __init__(self, text: str, extent: Line | None = None) -> None:
+        super().__init__(name=text, extent=extent, ast_type=ASTT.Rust_Signature)
 
-        ast_target = (
-            ast_id_route
-            if (isinstance(ast_id_route, tuple) and len(ast_id_route) == 3 and ast_id_route[1] == OP_REF) or isinstance(ast_id_route, int)
-            else CS.ref(m_ast.ast_id, *ast_id_route)
-        )
-        tag_target = (
-            tag_route
-            if (isinstance(tag_route, tuple) and len(tag_route) == 3 and tag_route[1] == OP_REF) or isinstance(tag_route, int)
-            else CS.ref(m_tag.tag_id, *tag_route)
-        )
 
-        stage_tag_map(CS, tag_target, ast_target, line_e, char_e)
+class Ast_Rust_Attribute(Ast_Rust):
+    """Outer or inner attribute (`#[derive(Debug)]`, `#![no_std]`, `#[cfg(CONFIG_X86)]`), as written."""
+
+    def __init__(self, text: str, extent: Line | None = None, is_inner: bool = False) -> None:
+        super().__init__(name=text, extent=extent, ast_type=ASTT.Rust_Attribute)
+        self.is_inner = is_inner
+
+
+def _with_children(node: Ast_Rust, signature: str | None, attrs: list[Ast_Rust_Attribute] | None, members: list[Ast_Rust]) -> None:
+    node.children = ([Ast_Rust_Signature(signature)] if signature else []) + list(attrs or []) + list(members)
 
 
 class Ast_Rust_Struct(Ast_Rust):
@@ -229,6 +259,9 @@ class Ast_Rust_Struct(Ast_Rust):
         fields: list[Ast_Rust_Field] | None = None,
         doc_comments: list[str] | None = None,
         attributes: list[str] | None = None,
+        signature: str | None = None,
+        attr_nodes: list[Ast_Rust_Attribute] | None = None,
+        linkage: int = SymbolLinkage.ExternalDef,
     ) -> None:
         super().__init__(
             name=name,
@@ -238,13 +271,15 @@ class Ast_Rust_Struct(Ast_Rust):
             doc_comments=doc_comments,
             attributes=attributes,
             generics=generics,
+            def_name=name,
+            linkage=linkage,
         )
         self.fields = fields or []
-        self.children = list(self.fields)
+        _with_children(self, signature, attr_nodes, self.fields)
 
 
 class Ast_Rust_Field(Ast_Rust):
-    """Rust struct or tuple field."""
+    """Rust struct, union or variant field: `[vis ]name: Type` (tuple fields use their index)."""
 
     def __init__(
         self,
@@ -255,18 +290,22 @@ class Ast_Rust_Field(Ast_Rust):
         priority: int = 0,
         doc_comments: list[str] | None = None,
         attributes: list[str] | None = None,
+        attr_nodes: list[Ast_Rust_Attribute] | None = None,
     ) -> None:
+        label = name if name else str(priority)
         super().__init__(
-            name=f"{name}: {type_str}" if name else type_str,
+            name=f"{vis + ' ' if vis else ''}{label}: {type_str}",
             extent=extent,
             ast_type=ASTT.Rust_Field,
             vis=vis,
             doc_comments=doc_comments,
             attributes=attributes,
+            def_name=name or None,
         )
         self.field_name = name
         self.type_str = type_str
         self.priority = priority
+        self.children = list(attr_nodes or [])
 
 
 class Ast_Rust_Enum(Ast_Rust):
@@ -281,6 +320,9 @@ class Ast_Rust_Enum(Ast_Rust):
         variants: list[Ast_Rust_Variant] | None = None,
         doc_comments: list[str] | None = None,
         attributes: list[str] | None = None,
+        signature: str | None = None,
+        attr_nodes: list[Ast_Rust_Attribute] | None = None,
+        linkage: int = SymbolLinkage.ExternalDef,
     ) -> None:
         super().__init__(
             name=name,
@@ -290,13 +332,15 @@ class Ast_Rust_Enum(Ast_Rust):
             doc_comments=doc_comments,
             attributes=attributes,
             generics=generics,
+            def_name=name,
+            linkage=linkage,
         )
         self.variants = variants or []
-        self.children = list(self.variants)
+        _with_children(self, signature, attr_nodes, self.variants)
 
 
 class Ast_Rust_Variant(Ast_Rust):
-    """Rust enum variant."""
+    """Rust enum variant (`Name`, `Name = 5`), its fields as children."""
 
     def __init__(
         self,
@@ -306,17 +350,20 @@ class Ast_Rust_Variant(Ast_Rust):
         discriminant: str | None = None,
         doc_comments: list[str] | None = None,
         attributes: list[str] | None = None,
+        attr_nodes: list[Ast_Rust_Attribute] | None = None,
     ) -> None:
         super().__init__(
-            name=name,
+            name=f"{name} = {discriminant}" if discriminant else name,
             extent=extent,
             ast_type=ASTT.Rust_Variant,
             doc_comments=doc_comments,
             attributes=attributes,
+            def_name=name,
         )
+        self.variant_name = name
         self.fields = fields or []
         self.discriminant = discriminant
-        self.children = list(self.fields)
+        self.children = list(attr_nodes or []) + list(self.fields)
 
 
 class Ast_Rust_Union(Ast_Rust):
@@ -331,6 +378,9 @@ class Ast_Rust_Union(Ast_Rust):
         fields: list[Ast_Rust_Field] | None = None,
         doc_comments: list[str] | None = None,
         attributes: list[str] | None = None,
+        signature: str | None = None,
+        attr_nodes: list[Ast_Rust_Attribute] | None = None,
+        linkage: int = SymbolLinkage.ExternalDef,
     ) -> None:
         super().__init__(
             name=name,
@@ -340,13 +390,15 @@ class Ast_Rust_Union(Ast_Rust):
             doc_comments=doc_comments,
             attributes=attributes,
             generics=generics,
+            def_name=name,
+            linkage=linkage,
         )
         self.fields = fields or []
-        self.children = list(self.fields)
+        _with_children(self, signature, attr_nodes, self.fields)
 
 
 class Ast_Rust_Fn(Ast_Rust):
-    """Rust function or method declaration/definition."""
+    """Rust function or method; children: signature, attributes (nested items), parameters."""
 
     def __init__(
         self,
@@ -359,6 +411,10 @@ class Ast_Rust_Fn(Ast_Rust):
         qualifiers: list[str] | None = None,
         doc_comments: list[str] | None = None,
         attributes: list[str] | None = None,
+        signature: str | None = None,
+        attr_nodes: list[Ast_Rust_Attribute] | None = None,
+        has_body: bool = True,
+        linkage: int = SymbolLinkage.ExternalDef,
     ) -> None:
         super().__init__(
             name=name,
@@ -368,15 +424,19 @@ class Ast_Rust_Fn(Ast_Rust):
             doc_comments=doc_comments,
             attributes=attributes,
             generics=generics,
+            def_name=name,
+            linkage=SymbolLinkage.PrototypeDecl if not has_body else linkage,
         )
         self.params = params or []
         self.ret_type = ret_type
         self.qualifiers = qualifiers or []
-        self.children = list(self.params)
+        self.has_body = has_body
+        self.signature = signature or ""
+        _with_children(self, signature, attr_nodes, self.params)
 
 
 class Ast_Rust_Param(Ast_Rust):
-    """Rust function parameter."""
+    """Rust function parameter, as written (`x: u32`, `&mut self`, `(a, b): (u8, u8)`, `...`)."""
 
     def __init__(
         self,
@@ -385,12 +445,11 @@ class Ast_Rust_Param(Ast_Rust):
         extent: Line,
         is_self: bool = False,
         priority: int = 0,
+        text: str | None = None,
     ) -> None:
-        super().__init__(
-            name=f"{name}: {type_str}" if name and not is_self else (name or type_str),
-            extent=extent,
-            ast_type=ASTT.Rust_Param,
-        )
+        if text is None:
+            text = f"{name}: {type_str}" if name and type_str and not is_self else (name or type_str)
+        super().__init__(name=text, extent=extent, ast_type=ASTT.Rust_Param)
         self.param_name = name
         self.type_str = type_str
         self.is_self = is_self
@@ -410,6 +469,9 @@ class Ast_Rust_Trait(Ast_Rust):
         items: list[Ast_Rust] | None = None,
         doc_comments: list[str] | None = None,
         attributes: list[str] | None = None,
+        signature: str | None = None,
+        attr_nodes: list[Ast_Rust_Attribute] | None = None,
+        linkage: int = SymbolLinkage.ExternalDef,
     ) -> None:
         super().__init__(
             name=name,
@@ -419,10 +481,12 @@ class Ast_Rust_Trait(Ast_Rust):
             doc_comments=doc_comments,
             attributes=attributes,
             generics=generics,
+            def_name=name,
+            linkage=linkage,
         )
         self.bounds = bounds or []
         self.items = items or []
-        self.children = list(self.items)
+        _with_children(self, signature, attr_nodes, self.items)
 
 
 class Ast_Rust_TraitAlias(Ast_Rust):
@@ -437,6 +501,9 @@ class Ast_Rust_TraitAlias(Ast_Rust):
         bounds: list[str] | None = None,
         doc_comments: list[str] | None = None,
         attributes: list[str] | None = None,
+        signature: str | None = None,
+        attr_nodes: list[Ast_Rust_Attribute] | None = None,
+        linkage: int = SymbolLinkage.ExternalDef,
     ) -> None:
         super().__init__(
             name=name,
@@ -446,12 +513,15 @@ class Ast_Rust_TraitAlias(Ast_Rust):
             doc_comments=doc_comments,
             attributes=attributes,
             generics=generics,
+            def_name=name,
+            linkage=linkage,
         )
         self.bounds = bounds or []
+        _with_children(self, signature, attr_nodes, [])
 
 
 class Ast_Rust_Impl(Ast_Rust):
-    """Rust impl block (inherent or trait implementation)."""
+    """Rust impl block, named by its header (`unsafe impl<T: Send> Send for Arc<T>`, `impl Foo`)."""
 
     def __init__(
         self,
@@ -462,8 +532,10 @@ class Ast_Rust_Impl(Ast_Rust):
         items: list[Ast_Rust] | None = None,
         doc_comments: list[str] | None = None,
         attributes: list[str] | None = None,
+        header: str | None = None,
+        attr_nodes: list[Ast_Rust_Attribute] | None = None,
     ) -> None:
-        name = f"impl {of_trait} for {self_ty}" if of_trait else f"impl {self_ty}"
+        name = header or (f"impl {of_trait} for {self_ty}" if of_trait else f"impl {self_ty}")
         super().__init__(
             name=name,
             extent=extent or Line(1, 1, 1, 1),
@@ -471,15 +543,16 @@ class Ast_Rust_Impl(Ast_Rust):
             doc_comments=doc_comments,
             attributes=attributes,
             generics=generics,
+            def_name=name,
         )
         self.self_ty = self_ty
         self.of_trait = of_trait
         self.items = items or []
-        self.children = list(self.items)
+        self.children = list(attr_nodes or []) + list(self.items)
 
 
 class Ast_Rust_Type(Ast_Rust):
-    """Rust type alias (type Foo = Bar;) or abstract associated type (type Foo;)."""
+    """Rust type alias (`type Foo<T> = Bar<T>`) or associated type (`type Foo: Bound`, `type Foo`)."""
 
     def __init__(
         self,
@@ -490,8 +563,15 @@ class Ast_Rust_Type(Ast_Rust):
         generics: str = "",
         doc_comments: list[str] | None = None,
         attributes: list[str] | None = None,
+        bounds: str = "",
+        attr_nodes: list[Ast_Rust_Attribute] | None = None,
+        linkage: int = SymbolLinkage.ExternalDef,
     ) -> None:
-        display_name = f"type {name} = {target_ty}" if target_ty else f"type {name}"
+        display_name = f"type {name}{generics}"
+        if bounds:
+            display_name += f": {bounds}"
+        if target_ty:
+            display_name += f" = {target_ty}"
         super().__init__(
             name=display_name,
             extent=extent,
@@ -500,13 +580,16 @@ class Ast_Rust_Type(Ast_Rust):
             doc_comments=doc_comments,
             attributes=attributes,
             generics=generics,
+            def_name=name,
+            linkage=linkage,
         )
         self.type_name = name
         self.target_ty = target_ty
+        self.children = list(attr_nodes or [])
 
 
 class Ast_Rust_Const(Ast_Rust):
-    """Rust constant definition (const NAME: Ty = ...;)."""
+    """Rust constant definition (`const NAME: Ty = ...;`)."""
 
     def __init__(
         self,
@@ -517,6 +600,8 @@ class Ast_Rust_Const(Ast_Rust):
         val_expr: str | None = None,
         doc_comments: list[str] | None = None,
         attributes: list[str] | None = None,
+        attr_nodes: list[Ast_Rust_Attribute] | None = None,
+        linkage: int = SymbolLinkage.ExternalDef,
     ) -> None:
         super().__init__(
             name=f"const {name}: {type_str}",
@@ -525,14 +610,17 @@ class Ast_Rust_Const(Ast_Rust):
             vis=vis,
             doc_comments=doc_comments,
             attributes=attributes,
+            def_name=name if name != "_" else None,
+            linkage=linkage,
         )
         self.const_name = name
         self.type_str = type_str
         self.val_expr = val_expr
+        self.children = list(attr_nodes or [])
 
 
 class Ast_Rust_Static(Ast_Rust):
-    """Rust static definition (static [mut] NAME: Ty = ...;)."""
+    """Rust static definition (`static [mut] NAME: Ty = ...;`)."""
 
     def __init__(
         self,
@@ -544,6 +632,8 @@ class Ast_Rust_Static(Ast_Rust):
         val_expr: str | None = None,
         doc_comments: list[str] | None = None,
         attributes: list[str] | None = None,
+        attr_nodes: list[Ast_Rust_Attribute] | None = None,
+        linkage: int = SymbolLinkage.ExternalDef,
     ) -> None:
         mut_str = "mut " if is_mut else ""
         super().__init__(
@@ -553,15 +643,18 @@ class Ast_Rust_Static(Ast_Rust):
             vis=vis,
             doc_comments=doc_comments,
             attributes=attributes,
+            def_name=name,
+            linkage=linkage,
         )
         self.static_name = name
         self.type_str = type_str
         self.is_mut = is_mut
         self.val_expr = val_expr
+        self.children = list(attr_nodes or [])
 
 
 class Ast_Rust_Mod(Ast_Rust):
-    """Rust module declaration or inline module definition."""
+    """Rust inline module (`mod bar { ... }`) or module declaration (`mod bar;`, linked to its file)."""
 
     def __init__(
         self,
@@ -572,6 +665,9 @@ class Ast_Rust_Mod(Ast_Rust):
         is_inline: bool = True,
         doc_comments: list[str] | None = None,
         attributes: list[str] | None = None,
+        attr_nodes: list[Ast_Rust_Attribute] | None = None,
+        include_target: str | None = None,
+        linkage: int = SymbolLinkage.ExternalDef,
     ) -> None:
         super().__init__(
             name=name,
@@ -580,15 +676,18 @@ class Ast_Rust_Mod(Ast_Rust):
             vis=vis,
             doc_comments=doc_comments,
             attributes=attributes,
+            def_name=name,
+            linkage=linkage,
         )
         self.mod_name = name
         self.items = items or []
         self.is_inline = is_inline
-        self.children = list(self.items)
+        self.include_target = include_target
+        self.children = list(attr_nodes or []) + list(self.items)
 
 
 class Ast_Rust_Use(Ast_Rust):
-    """Rust use declaration / import."""
+    """Rust use declaration (`use kernel::{prelude::*, sync::Arc as A}`) or `extern crate`."""
 
     def __init__(
         self,
@@ -599,12 +698,17 @@ class Ast_Rust_Use(Ast_Rust):
         is_glob: bool = False,
         doc_comments: list[str] | None = None,
         attributes: list[str] | None = None,
+        tree: str | None = None,
+        attr_nodes: list[Ast_Rust_Attribute] | None = None,
     ) -> None:
-        name = f"use {path}"
-        if is_glob:
+        if tree is not None:
+            name = tree
+        elif is_glob:
             name = f"use {path}::*"
         elif alias:
             name = f"use {path} as {alias}"
+        else:
+            name = f"use {path}"
         super().__init__(
             name=name,
             extent=extent,
@@ -616,10 +720,11 @@ class Ast_Rust_Use(Ast_Rust):
         self.path = path
         self.alias = alias
         self.is_glob = is_glob
+        self.children = list(attr_nodes or [])
 
 
 class Ast_Rust_MacroDef(Ast_Rust):
-    """Rust macro definition (macro_rules! or macro)."""
+    """Rust macro definition (`macro_rules! name` or `macro name`)."""
 
     def __init__(
         self,
@@ -628,20 +733,25 @@ class Ast_Rust_MacroDef(Ast_Rust):
         body: str = "",
         doc_comments: list[str] | None = None,
         attributes: list[str] | None = None,
+        is_macro_rules: bool = True,
+        attr_nodes: list[Ast_Rust_Attribute] | None = None,
     ) -> None:
         super().__init__(
-            name=f"macro_rules! {name}",
+            name=f"macro_rules! {name}" if is_macro_rules else f"macro {name}",
             extent=extent,
             ast_type=ASTT.Rust_MacroDef,
             doc_comments=doc_comments,
             attributes=attributes,
+            def_name=name,
+            linkage=SymbolLinkage.MacroOrKernelDef,
         )
         self.macro_name = name
         self.body = body
+        self.children = list(attr_nodes or [])
 
 
 class Ast_Rust_MacroCall(Ast_Rust):
-    """Rust macro invocation (name!(...))."""
+    """Rust macro invocation at item level (`module! { ... }`, `kernel::module_platform_driver!`)."""
 
     def __init__(
         self,
@@ -650,6 +760,8 @@ class Ast_Rust_MacroCall(Ast_Rust):
         args_str: str = "",
         doc_comments: list[str] | None = None,
         attributes: list[str] | None = None,
+        attr_nodes: list[Ast_Rust_Attribute] | None = None,
+        module_attrs: list[Ast_Rust_ModuleAttr] | None = None,
     ) -> None:
         super().__init__(
             name=f"{name}!",
@@ -660,10 +772,40 @@ class Ast_Rust_MacroCall(Ast_Rust):
         )
         self.macro_name = name
         self.args_str = args_str
+        self.module_attrs = module_attrs or []
+        self.children = list(attr_nodes or []) + list(self.module_attrs)
+
+
+class Ast_Rust_ModuleAttr(Ast_Rust):
+    """One entry of a module macro (`module!`, `module_platform_driver!`, …): `license: "GPL"`, `type: M`.
+
+    A block entry (`params: { … }`) is named by its key, a typed block (`p: i64 { default: 1 }`, a module
+    parameter) by `key: type`; their entries are children. Definitions: the module's `name` (the string's value)
+    and each parameter (its name), as `MacroOrKernelDef`.
+    """
+
+    def __init__(
+        self,
+        key: str,
+        value: str,
+        extent: Line,
+        children: list[Ast_Rust_ModuleAttr] | None = None,
+        def_name: str | None = None,
+    ) -> None:
+        super().__init__(
+            name=f"{key}: {value}" if value else key,
+            extent=extent,
+            ast_type=ASTT.Rust_ModuleAttr,
+            def_name=def_name,
+            linkage=SymbolLinkage.MacroOrKernelDef,
+        )
+        self.key = key
+        self.value = value
+        self.children = list(children or [])
 
 
 class Ast_Rust_ForeignMod(Ast_Rust):
-    """Rust foreign module / extern ABI block (extern "C" { ... })."""
+    """Rust foreign module / extern ABI block (`extern "C" { ... }`)."""
 
     def __init__(
         self,
@@ -672,9 +814,11 @@ class Ast_Rust_ForeignMod(Ast_Rust):
         items: list[Ast_Rust] | None = None,
         doc_comments: list[str] | None = None,
         attributes: list[str] | None = None,
+        is_unsafe: bool = False,
+        attr_nodes: list[Ast_Rust_Attribute] | None = None,
     ) -> None:
         super().__init__(
-            name=f'extern "{abi}"',
+            name=f'{"unsafe " if is_unsafe else ""}extern "{abi}"',
             extent=extent,
             ast_type=ASTT.Rust_ForeignMod,
             doc_comments=doc_comments,
@@ -682,11 +826,11 @@ class Ast_Rust_ForeignMod(Ast_Rust):
         )
         self.abi = abi
         self.items = items or []
-        self.children = list(self.items)
+        self.children = list(attr_nodes or []) + list(self.items)
 
 
 class Ast_Rust_DocComment(Ast_Rust):
-    """Rust documentation comment (/// or //!)."""
+    """Block of consecutive documentation comments (`///`, `//!`, `/** */`), named by its text."""
 
     def __init__(
         self,
@@ -701,3 +845,11 @@ class Ast_Rust_DocComment(Ast_Rust):
         )
         self.comment_text = comment_text
         self.is_inner = is_inner
+
+
+class Ast_Rust_Comment(Ast_Rust):
+    """Plain comment outside items (consecutive `//` lines, or one `/* ... */`), named by its text."""
+
+    def __init__(self, comment_text: str, extent: Line) -> None:
+        super().__init__(name=comment_text.strip(), extent=extent, ast_type=ASTT.Rust_Comment)
+        self.comment_text = comment_text

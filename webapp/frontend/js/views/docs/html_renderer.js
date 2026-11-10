@@ -246,11 +246,19 @@ export class HtmlRenderer {
     html = html.replace(/<style\b[^<]*(?:(?!<\/style>)<[^<]*)*<\/style>/gi, "");
     html = html.replace(/<(?:link|meta|base)\b[^>]*>/gi, "");
     html = html.replace(/<(?:object|embed|applet|iframe|frame|frameset)\b[^>]*>([\s\S]*?<\/(?:object|embed|applet|iframe|frame|frameset)>)?/gi, "");
-    html = html.replace(/\son[a-z]+\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)/gi, "");
-    html = html.replace(/href\s*=\s*(["'])\s*(?:javascript|vbscript):[^"']*\1/gi, 'href="#"');
-    html = html.replace(/src\s*=\s*(["'])\s*(?:javascript|vbscript):[^"']*\1/gi, 'src=""');
-    html = html.replace(/href\s*=\s*(["'])\s*data:(?:text\/html|application\/javascript)[^"']*\1/gi, 'href="#"');
-    html = html.replace(/src\s*=\s*(["'])\s*data:(?:text\/html|application\/javascript)[^"']*\1/gi, 'src=""');
+
+    // Strip inline event handlers (onload, onclick, etc.), including slash-separated (<div/onclick=...) and unquoted
+    html = html.replace(/[\s/]on[a-z0-9_-]+\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)/gi, "");
+
+    // Sanitize javascript: and vbscript: URIs in href and src (quoted or unquoted, with optional slash separation)
+    html = html.replace(/([\s/]href\s*=\s*)(?:"\s*(?:javascript|vbscript):[^"]*"|'\s*(?:javascript|vbscript):[^']*'|(?:javascript|vbscript):[^\s>]*)/gi, '$1"#"');
+    html = html.replace(/([\s/]src\s*=\s*)(?:"\s*(?:javascript|vbscript):[^"]*"|'\s*(?:javascript|vbscript):[^']*'|(?:javascript|vbscript):[^\s>]*)/gi, '$1""');
+
+    // Sanitize data: URIs in href (all data: links neutralized to "#", handling parametric/unquoted/slash-separated)
+    html = html.replace(/([\s/]href\s*=\s*)(?:"\s*data:[^"]*"|'\s*data:[^']*'|data:[^\s>]*)/gi, '$1"#"');
+
+    // Sanitize dangerous/executable data: URIs in src (e.g. text/html, javascript, svg+xml, xhtml, with any parameters/charsets)
+    html = html.replace(/([\s/]src\s*=\s*)(?:"\s*data:\s*(?:text\/(?:html|xml)|application\/(?:javascript|x-javascript|xhtml\+xml|xml)|image\/svg\+xml)[^"]*"|'\s*data:\s*(?:text\/(?:html|xml)|application\/(?:javascript|x-javascript|xhtml\+xml|xml)|image\/svg\+xml)[^']*'|data:\s*(?:text\/(?:html|xml)|application\/(?:javascript|x-javascript|xhtml\+xml|xml)|image\/svg\+xml)[^\s>]*)/gi, '$1""');
 
     // 5. Transform legacy presentational elements into clean HTML5 / CSS
     html = html.replace(/<center\b[^>]*>([\s\S]*?)<\/center>/gi, '<div class="kdoc-align-center">$1</div>');
@@ -348,9 +356,10 @@ export class HtmlRenderer {
       return `<table class="docutils"${attrs}>`;
     });
 
-    // 10. Transform links
-    html = html.replace(/<a\b([^>]*)href\s*=\s*(["'])([^"']*)\2([^>]*)>([\s\S]*?)<\/a>/gi, (match, before, quote, rawHref, after, linkText) => {
-      const href = rawHref.trim();
+    // 10. Transform links (handling quoted, unquoted, and slash-separated href attributes)
+    html = html.replace(/<a\b([^>]*?)[\s/]href\s*=\s*(?:(["'])([\s\S]*?)\2|([^\s>]+))([^>]*)>([\s\S]*?)<\/a>/gi, (match, before, quote, quotedHref, unquotedHref, after, linkText) => {
+      const rawHref = quote ? quotedHref : unquotedHref;
+      const href = (rawHref || "").trim();
       const attrs = `${before} ${after}`.replace(/\s+/g, " ").trim();
 
       // Don't re-transform internal headerlinks
@@ -387,9 +396,10 @@ export class HtmlRenderer {
       return `<a ${fullAttrs} data-src="${escapeHtml(resolved)}" href="#">${linkText}</a>`;
     });
 
-    // 11. Transform images
-    html = html.replace(/<img\b([^>]*)src\s*=\s*(["'])([^"']*)\2([^>]*)>/gi, (match, before, quote, rawSrc, after) => {
-      const src = rawSrc.trim();
+    // 11. Transform images (handling quoted, unquoted, and slash-separated src attributes)
+    html = html.replace(/<img\b([^>]*?)[\s/]src\s*=\s*(?:(["'])([\s\S]*?)\2|([^\s>]+))([^>]*)>/gi, (match, before, quote, quotedSrc, unquotedSrc, after) => {
+      const rawSrc = quote ? quotedSrc : unquotedSrc;
+      const src = (rawSrc || "").trim();
       const attrs = `${before} ${after}`.replace(/\s+/g, " ").trim();
       const isBadge = /(badge|shields\.io|crates\.io\/crates\/[^\/]+\.svg|deps\.rs)/i.test(src);
       const badgeClass = isBadge ? " kdoc-badge" : "";

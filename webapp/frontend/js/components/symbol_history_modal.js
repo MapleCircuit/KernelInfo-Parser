@@ -12,6 +12,7 @@
 import { api } from "../api.js";
 import { state } from "../state.js";
 import { openModal, escapeHtml } from "./modal.js";
+import { renamedNoteHtml } from "./symbol_history_render.js";
 import { shortRef } from "./ref_picker.js";
 
 const STATUS_LABEL = {
@@ -294,7 +295,7 @@ function openHistory({ title, subtitle, version, load }) {
     const def = entry.defs[parseInt(btn.dataset.commits, 10)];
     const box = btn.closest(".symhist-def").querySelector(".symhist-commits");
     box.hidden = false;
-    box.innerHTML = `<div class="ki-modal-empty">Running git log over ${escapeHtml(entry.prev_vname || "history")} → ${escapeHtml(entry.vname)}…</div>`;
+    box.innerHTML = `<div class="ki-modal-empty">Looking up the commits of ${escapeHtml(entry.prev_vname || "history")} → ${escapeHtml(entry.vname)}…</div>`;
     const removed = def.status === "removed";
     let res;
     try {
@@ -402,6 +403,7 @@ function renderDetail(entry, res, ui) {
       <span class="ki-modal-subtitle">${range}</span>
       ${counts}
       ${note ? `<span class="symhist-status unchanged">${escapeHtml(note)}</span>` : ""}
+      ${renamedNoteHtml(entry)}
       <span class="symhist-spacer"></span>
       <button class="code-btn ${ui.view === "diff" ? "active" : ""}" data-view="diff" type="button">Diff</button>
       <button class="code-btn ${ui.view === "code" ? "active" : ""}" data-view="code" type="button">Code</button>

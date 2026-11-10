@@ -124,9 +124,13 @@ def logical_lines(content: str) -> list[_Line]:
     while i < len(raw):
         start = i
         line = raw[i]
-        while line.endswith("\\") and not line.endswith("\\\\") and i + 1 < len(raw):
-            i += 1
-            line = line[:-1].rstrip() + " " + raw[i].lstrip()
+        while i + 1 < len(raw):
+            stripped_end = line.rstrip(" \t")
+            if stripped_end.endswith("\\") and not stripped_end.endswith("\\\\"):
+                i += 1
+                line = stripped_end[:-1].rstrip() + " " + raw[i].lstrip()
+            else:
+                break
         i += 1
         recipe = line.startswith("\t")
         text = line[1:] if recipe else _strip_comment(line)

@@ -12,19 +12,19 @@ import logging
 import posixpath
 import re
 import subprocess
-import threading
-from collections import OrderedDict
 from webapp.backend.config import get_repo_dir
 from typing import Any
 from fastapi import HTTPException
 from webapp.backend.database.pool import get_db_cursor
 from webapp.backend.database.helpers import (
+    tree_source,
     safe_decode,
     get_version_info,
 )
 from webapp.backend.security.jail import is_safe_rel_path
 from webapp.backend.services.tree_resolver import tree_resolver, git_tree_resolver
-from webapp.backend.services.history_service import KCONFIG_TYPE_NAMES, kconfig_definitions, kconfig_field_changes
+from parser.kconfig_ast.kconfig_definitions import KCONFIG_TYPE_NAMES, RAW_FIELDS, kconfig_field_changes
+from webapp.backend.services import kconfig_facts
 from webapp.backend.services.git_service import parse_unified_diff
 from core.globalstuff import ASTT, is_safe_git_rev
 
@@ -52,85 +52,18 @@ _RENAME_LIMIT_RE = re.compile(rb"at least (\d+)")
 
 
 KCONFIG_TYPE_CODES = {name: code for code, name in KCONFIG_TYPE_NAMES.items()}
-# Kconfig blob SHA -> {symbol: [facts]}; content addressed, so valid for every revision and repository
-_DEFS_CACHE: OrderedDict[str, dict[str, list[dict[str, Any]]]] = OrderedDict()
-_DEFS_CACHE_SIZE = 4096
-_DEFS_LOCK = threading.Lock()
+# Kconfig definitions are parsed once per blob SHA and shared with Kconfig history (kconfig_facts.py)
+_DEFS_CACHE = kconfig_facts._DEFS_CACHE
 
 
 def _read_kconfig_blobs(shas: set[str]) -> dict[str, str]:
     """Text of the Git blobs not already parsed (one `git cat-file --batch` process)."""
-    with _DEFS_LOCK:
-        missing = sorted(s for s in shas if s not in _DEFS_CACHE)
-    if not missing:
-        return {}
-    try:
-        out = subprocess.run(
-            ["git", "-C", str(get_repo_dir()), "cat-file", "--batch"],
-            input="".join(f"{sha}\n" for sha in missing).encode(),
-            capture_output=True,
-            timeout=60,
-            check=False,
-        ).stdout
-    except (OSError, subprocess.SubprocessError) as e:
-        logger.warning("git cat-file for Kconfig blobs failed: %s", e)
-        return {}
-    texts: dict[str, str] = {}
-    pos = 0
-    for sha in missing:
-        nl = out.find(b"\n", pos)
-        if nl < 0:
-            break
-        header = out[pos:nl].split()
-        if len(header) < 3 or header[1] != b"blob":
-            pos = nl + 1
-            continue
-        size = int(header[2])
-        texts[sha] = out[nl + 1:nl + 1 + size].decode("utf-8", errors="replace")
-        pos = nl + 1 + size + 1
-    return texts
+    return kconfig_facts.read_blobs(shas)
 
 
 def _blob_definitions(sha: str, text: str | None) -> dict[str, list[dict[str, Any]]]:
-    """kconfig_definitions() of one blob (cached by SHA), each with its raw prompt and first default."""
-    with _DEFS_LOCK:
-        cached = _DEFS_CACHE.get(sha)
-        if cached is not None:
-            _DEFS_CACHE.move_to_end(sha)
-            return cached
-    if text is None:  # evicted since the batch read
-        text = _read_kconfig_blobs({sha}).get(sha, "")
-    from parser.kconfig_ast.kconfig_lexer import KconfigLexer
-    from parser.kconfig_ast.kconfig_parser import KconfigParser, KconfigConfig, KconfigIf, KconfigMenu, KconfigChoice
-
-    defs = kconfig_definitions(text)
-    # The compatibility fields (`prompt` without its condition, `def_val` = first default value)
-    raw: dict[str, list[tuple[str, str]]] = {}
-    try:
-        items = KconfigParser(KconfigLexer(text).tokenize(), text).parse()
-    except Exception:
-        items = []
-
-    def walk(nodes: list[Any]) -> None:
-        for node in nodes:
-            if isinstance(node, KconfigConfig):
-                raw.setdefault(node.name, []).append((node.prompt or "", node.defaults[0][0].to_string() if node.defaults else ""))
-            elif isinstance(node, (KconfigIf, KconfigMenu, KconfigChoice)):
-                walk(node.children)
-
-    walk(items)
-    for name, entries in defs.items():
-        for facts, (prompt, first) in zip(entries, raw.get(name, [])):
-            facts["prompt_text"] = prompt
-            facts["first_default"] = first
-        for facts in entries:
-            facts.setdefault("prompt_text", "")
-            facts.setdefault("first_default", "")
-    with _DEFS_LOCK:
-        _DEFS_CACHE[sha] = defs
-        while len(_DEFS_CACHE) > _DEFS_CACHE_SIZE:
-            _DEFS_CACHE.popitem(last=False)
-    return defs
+    """Definitions of one Kconfig blob, each with its raw prompt and first default (cached by SHA)."""
+    return kconfig_facts.definitions(sha, lambda: text if text is not None else kconfig_facts.read_blobs({sha}).get(sha, ""))
 
 
 def is_kconfig_path(path: str) -> bool:
@@ -526,7 +459,7 @@ class DiffService:
                         "type": KCONFIG_TYPE_CODES.get(facts["type"], 0),
                         "prompt": facts["prompt_text"],
                         "def_val": facts["first_default"],
-                        "facts": {k: v for k, v in facts.items() if k not in ("prompt_text", "first_default")},
+                        "facts": {k: v for k, v in facts.items() if k not in RAW_FIELDS},
                     })
         return defs
 
@@ -721,10 +654,10 @@ class DiffService:
         cursor.execute(
             """
             SELECT COALESCE(NULLIF(fn.fname, ''), CONCAT('file_', bc.fnid)) AS fname, bc.blob_id
-            FROM m_bridge_checkpoint bc
+            FROM m_checkpoint_tree bc
             LEFT JOIN m_file_name fn ON bc.fnid = fn.fnid AND fn.fnid > 0
             WHERE bc.commit_id = %s;
-            """,
+            """.replace("m_checkpoint_tree", tree_source(cursor)),
             (commit_id,),
         )
         rows = cursor.fetchall()
@@ -762,7 +695,7 @@ class DiffService:
             WHERE a.type_id IN (%s, %s)
         """
         cursor.execute(
-            "SELECT a.name, t.hash FROM m_bridge_checkpoint bc" + sql_tail.format(blob="bc.blob_id") + " AND bc.commit_id = %s;",
+            "SELECT a.name, t.hash FROM m_checkpoint_tree bc".replace("m_checkpoint_tree", tree_source(cursor)) + sql_tail.format(blob="bc.blob_id") + " AND bc.commit_id = %s;",
             (*types, commit_id),
         )
         rows = cursor.fetchall()

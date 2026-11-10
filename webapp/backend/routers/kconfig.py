@@ -73,6 +73,12 @@ def get_defconfigs(version_name: str, arch: str = Query(DEFAULT_ARCH)) -> dict[s
     return kconfig_service.get_defconfigs(version_name, arch)
 
 
+@router.get("/kconfig/{version_name}/fragments")
+def get_fragments(version_name: str, arch: str = Query(DEFAULT_ARCH)) -> dict[str, Any]:
+    """Configuration fragments of the revision (K2): kernel/configs/*.config and arch/$SRCARCH/configs/*.config."""
+    return kconfig_service.list_fragments(version_name, arch)
+
+
 @router.get("/kconfig/{version_name}/defconfig")
 def get_defconfig_content(
     version_name: str,
@@ -117,3 +123,66 @@ def search_kconfig_symbols(
 ) -> dict[str, Any]:
     """Search Kconfig symbols by name or prompt."""
     return kconfig_service.search_symbols(version_name, q=q, limit=limit, arch=arch, toolchain=toolchain)
+
+
+# ------------------------------------------------------------------ Kbuild object index (S04)
+def _kbuild_job(state: dict[str, Any]) -> Any:
+    from fastapi import HTTPException
+    from fastapi.responses import JSONResponse
+    from webapp.backend.services.jobs import retry_after_ms
+    if state.get("state") == "failed":
+        raise HTTPException(status_code=500, detail=f"Kbuild index failed: {state.get('error')}")
+    if state.get("state") != "done":
+        return JSONResponse({"state": "building", "progress": state.get("progress") or {}, "retry_after_ms": retry_after_ms(state)},
+                            status_code=202, headers={"Cache-Control": "no-store"})
+    return None
+
+
+@router.get("/kconfig/{version_name}/kbuild/index")
+def get_kbuild_index(version_name: str, arch: Annotated[str, Query()] = DEFAULT_ARCH) -> Any:
+    """Every object the Kbuild files name for one ARCH (S04): modname, kind, condition (interned), member
+    sources. 202 while the index builds; ETag = cache key."""
+    from fastapi.responses import JSONResponse
+    from webapp.backend.security.git import safe_rev
+    from webapp.backend.services.kbuild_index_service import compact, index_state
+    safe_rev(version_name)
+    st = index_state(version_name, arch, wait=2.0)
+    building = _kbuild_job(st)
+    if building is not None:
+        return building
+    return JSONResponse(compact(st["result"]), headers={"ETag": f'W/"{abs(hash(st["cache_key"])):x}"', "Cache-Control": "private, max-age=3600"})
+
+
+@router.post("/kconfig/{version_name}/kbuild/modules")
+def post_kbuild_modules(version_name: str, payload: dict[str, Any] = Body(...)) -> Any:
+    """Objects building the named modules (at most 2000; dashes and underscores are the same) with the
+    symbols each requires: {modules: {name: {objects, required_symbols}}, unmatched}; `"gates": true` adds
+    `module_gates`, every symbol gating a module-capable object (K1 trim candidates)."""
+    from fastapi import HTTPException
+    from webapp.backend.security.git import safe_rev
+    from webapp.backend.services.kbuild_index_service import index_state, module_gates, objects_for_module
+    safe_rev(version_name)
+    names = payload.get("names") if isinstance(payload, dict) else None
+    if not isinstance(names, list) or len(names) > 2000 or not all(isinstance(n, str) and 0 < len(n) <= 64 for n in names):
+        raise HTTPException(status_code=400, detail="names must be a list of at most 2000 module names")
+    st = index_state(version_name, str(payload.get("arch") or DEFAULT_ARCH), wait=2.0)
+    building = _kbuild_job(st)
+    if building is not None:
+        return building
+    out = {"version": version_name, "arch": st["result"]["arch"], **objects_for_module(st["result"], names)}
+    if payload.get("gates"):
+        out["module_gates"] = module_gates(st["result"])
+    return out
+
+
+@router.get("/kconfig/{version_name}/kbuild/file")
+def get_kbuild_file_objects(version_name: str, path: Annotated[str, Query()] = "", arch: Annotated[str, Query()] = DEFAULT_ARCH) -> Any:
+    """Objects one source file is part of, with their conditions and rules."""
+    from webapp.backend.security.git import safe_rev
+    from webapp.backend.services.kbuild_index_service import index_state, objects_for_file
+    safe_rev(version_name)
+    st = index_state(version_name, arch, wait=2.0)
+    building = _kbuild_job(st)
+    if building is not None:
+        return building
+    return {"version": version_name, "arch": st["result"]["arch"], "path": path, "objects": objects_for_file(st["result"], path)}

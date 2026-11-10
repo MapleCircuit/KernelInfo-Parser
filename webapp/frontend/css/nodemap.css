@@ -4,7 +4,7 @@
   display: flex;
   height: 100%;
   width: 100%;
-  background: #0a0d12;
+  background: var(--bg-canvas);
   position: relative;
   overflow: hidden;
   user-select: none;

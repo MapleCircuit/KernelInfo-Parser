@@ -8,6 +8,8 @@ import re
 from dataclasses import dataclass
 from enum import Enum, auto
 
+from core.encoding import safe_split_lines
+
 
 class TokenType(Enum):
     # Keywords
@@ -131,6 +133,8 @@ KEYWORDS = {
 
 
 _ASSIGN_RE = re.compile(r"^[ \t]*((?:[A-Za-z0-9_-]|\$\([^\n]*?\))+)[ \t]*(:=|\+=|=)(.*)$")
+_DOLLAR_TOKEN_RE = re.compile(r"[A-Za-z0-9_\-$]*\$")
+_IDENT_RE = re.compile(r"[A-Za-z0-9_\-\.\/]+")
 
 
 class KconfigLexer:
@@ -144,7 +148,7 @@ class KconfigLexer:
 
     def __init__(self, text: str, preprocessor=None, filename: str = "") -> None:
         self.text = text
-        self.lines = text.splitlines(keepends=True)
+        self.lines = safe_split_lines(text, keepends=True)
         self.num_lines = len(self.lines)
         self.pp = preprocessor
         self.filename = filename
@@ -302,7 +306,7 @@ class KconfigLexer:
                 idx += 1
                 continue
             # Linux 4.18+ token with references: expanded into one word (empty results vanish)
-            if self.pp is not None and re.match(r"[A-Za-z0-9_\-$]*\$", line_text[idx:]):
+            if self.pp is not None and _DOLLAR_TOKEN_RE.match(line_text, pos=idx):
                 start_col = idx + 1
                 value, consumed = self.pp.expand_one_token(line_text[idx:].rstrip("\r\n"))
                 idx += max(consumed, 1)
@@ -352,7 +356,7 @@ class KconfigLexer:
                 continue
 
             # Match symbol / keyword / number
-            m = re.match(r"[A-Za-z0-9_\-\.\/]+", line_text[idx:])
+            m = _IDENT_RE.match(line_text, pos=idx)
             if m:
                 val = m.group(0)
                 idx += len(val)

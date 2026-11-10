@@ -14,6 +14,7 @@ Test Architecture:
 from __future__ import annotations
 
 from collections import defaultdict
+from collections.abc import Iterator
 import os
 import sys
 from types import TracebackType
@@ -184,6 +185,42 @@ class RecordingDriver(BaseDBEngine):
 
     def verify_relational_integrity(self, tables: Sequence[Table]) -> dict[str, int]:
         return {}
+
+    def query(
+        self,
+        sql: str,
+        params: Sequence[Any] | None = None,
+        dictionary: bool = True,
+    ) -> list[dict[str, Any] | tuple[SafeDataType, ...]]:
+        self.calls.append(("query", (sql, params, dictionary), {}))
+        return []
+
+    def query_one(
+        self,
+        sql: str,
+        params: Sequence[Any] | None = None,
+        dictionary: bool = True,
+    ) -> dict[str, Any] | tuple[SafeDataType, ...] | None:
+        self.calls.append(("query_one", (sql, params, dictionary), {}))
+        return None
+
+    def query_iter(
+        self,
+        sql: str,
+        params: Sequence[Any] | None = None,
+        dictionary: bool = True,
+        chunk_size: int = 2000,
+    ) -> Iterator[dict[str, Any] | tuple[SafeDataType, ...]]:
+        self.calls.append(("query_iter", (sql, params, dictionary, chunk_size), {}))
+        return iter(())
+
+    def execute(self, sql: str, params: Sequence[Any] | None = None) -> int:
+        self.calls.append(("execute", (sql, params), {}))
+        return 0
+
+    def executemany(self, sql: str, params_seq: Sequence[Sequence[Any]]) -> int:
+        self.calls.append(("executemany", (sql, params_seq), {}))
+        return len(params_seq)
 
 
 class GenericTableEngineTestCase:

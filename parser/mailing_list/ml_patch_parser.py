@@ -13,6 +13,40 @@ DIFF_GIT_RE = re.compile(r"^diff --git\s+a/(.+?)\s+b/(.+)$")
 TRIPLE_MINUS_RE = re.compile(r"^---\s+(?:a/(.+)|\S+)")
 TRIPLE_PLUS_RE = re.compile(r"^\+\+\+\s+(?:b/(.+)|\S+)")
 
+_REVIEW_TRAILER_RE = re.compile(
+    r"^[ \t]*(Reviewed-by|Acked-by|Tested-by|Reported-by|Suggested-by|Signed-off-by):\s*(?:([^<\n\r]+?)\s*)??(?:<([^>\n\r]+)>|([^\s<>@]+@[^\s<>@]+))",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def extract_review_trailers(body: str) -> list[dict[str, str]]:
+    """Extract review trailers (Reviewed-by, Acked-by, Tested-by, etc.) from email body."""
+    mapping = {
+        "reviewed-by": "Reviewed-by",
+        "acked-by": "Acked-by",
+        "tested-by": "Tested-by",
+        "reported-by": "Reported-by",
+        "suggested-by": "Suggested-by",
+        "signed-off-by": "Signed-off-by",
+        "co-developed-by": "Co-developed-by",
+    }
+    out: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for m in _REVIEW_TRAILER_RE.finditer(body or ""):
+        tag, name, angle_email, bare_email = m.groups()
+        email = (angle_email or bare_email or "").strip()
+        clean_name = (name or "").strip() or email
+        canonical_tag = mapping.get(tag.lower(), tag.capitalize())
+        key = (canonical_tag, email.lower() or clean_name.lower())
+        if key not in seen:
+            seen.add(key)
+            out.append({
+                "type": canonical_tag,
+                "name": clean_name,
+                "email": email,
+            })
+    return out
+
 
 def parse_patch_from_body(body_text: str) -> dict[str, Any]:
     """Parse email body into text commentary and structured file diffs.
@@ -27,7 +61,7 @@ def parse_patch_from_body(body_text: str) -> dict[str, Any]:
                 deletions: total lines deleted
     """
     if not body_text:
-        return {"is_patch": False, "body": "", "diff": None}
+        return {"is_patch": False, "body": "", "diff": None, "review_trailers": []}
 
     lines = body_text.splitlines()
 
@@ -43,9 +77,48 @@ def parse_patch_from_body(body_text: str) -> dict[str, Any]:
             break
 
     if diff_start_idx == -1:
-        return {"is_patch": False, "body": body_text, "diff": None}
+        return {
+            "is_patch": False,
+            "body": body_text,
+            "commit_message": body_text,
+            "commentary": "",
+            "diffstat": "",
+            "base_commit": None,
+            "diff": None,
+            "review_trailers": extract_review_trailers(body_text),
+        }
 
-    intro_lines = lines[:diff_start_idx]
+    raw_intro_lines = lines[:diff_start_idx]
+
+    # Find the tearline '---' dividing commit message from below-tearline commentary/diffstat
+    tearline_idx = -1
+    for i, line in enumerate(raw_intro_lines):
+        if line.strip() == "---":
+            tearline_idx = i
+            break
+
+    if tearline_idx != -1:
+        commit_message = "\n".join(raw_intro_lines[:tearline_idx]).strip()
+        sub_lines = raw_intro_lines[tearline_idx + 1:]
+        commentary_lines = []
+        diffstat_lines = []
+        for l in sub_lines:
+            if re.search(r"\|\s*\d+\s*[+-]*$", l) or re.search(r"\d+\s+files?\s+changed", l):
+                diffstat_lines.append(l)
+            else:
+                commentary_lines.append(l)
+        commentary = "\n".join(commentary_lines).strip()
+        diffstat = "\n".join(diffstat_lines).strip()
+    else:
+        commit_message = "\n".join(raw_intro_lines).strip()
+        commentary = ""
+        diffstat = ""
+
+    # Base commit detection
+    m_base = re.search(r"^base-commit:\s*([0-9a-fA-F]{12,40})", body_text, re.MULTILINE)
+    base_commit = m_base.group(1).lower() if m_base else None
+
+    intro_lines = list(raw_intro_lines)
     # Strip any trailing '---' separator line before diff
     while intro_lines and (intro_lines[-1].strip() == "---" or not intro_lines[-1].strip()):
         intro_lines.pop()
@@ -156,40 +229,59 @@ def parse_patch_from_body(body_text: str) -> dict[str, Any]:
             }
             old_no = old_s
             new_no = new_s
+            old_left = old_c
+            new_left = new_c
             idx += 1
+            while idx < len(diff_lines) and (old_left > 0 or new_left > 0):
+                h_line = diff_lines[idx]
+                if h_line == "\\ No newline at end of file":
+                    idx += 1
+                    continue
+                if h_line.startswith("+"):
+                    if new_left > 0:
+                        current_file["additions"] += 1
+                        total_adds += 1
+                        current_hunk["lines"].append(["+", None, new_no, h_line[1:]])
+                        new_no += 1
+                        new_left -= 1
+                    else:
+                        break
+                elif h_line.startswith("-"):
+                    if old_left > 0:
+                        current_file["deletions"] += 1
+                        total_dels += 1
+                        current_hunk["lines"].append(["-", old_no, None, h_line[1:]])
+                        old_no += 1
+                        old_left -= 1
+                    else:
+                        break
+                elif h_line.startswith(" "):
+                    current_hunk["lines"].append([" ", old_no, new_no, h_line[1:]])
+                    old_no += 1
+                    new_no += 1
+                    if old_left > 0:
+                        old_left -= 1
+                    if new_left > 0:
+                        new_left -= 1
+                elif h_line == "":
+                    current_hunk["lines"].append([" ", old_no, new_no, ""])
+                    old_no += 1
+                    new_no += 1
+                    if old_left > 0:
+                        old_left -= 1
+                    if new_left > 0:
+                        new_left -= 1
+                else:
+                    break
+                idx += 1
+
+            current_file["hunks"].append(current_hunk)
+            current_hunk = None
             continue
 
-        # 3. Diff content lines
-        if current_hunk is not None and current_file is not None:
-            # End of diff: signature delimiter '-- '
-            if line == "-- " or line == "--":
-                break
-
-            if line.startswith("+"):
-                current_file["additions"] += 1
-                total_adds += 1
-                current_hunk["lines"].append(["+", None, new_no, line[1:]])
-                new_no += 1
-            elif line.startswith("-"):
-                current_file["deletions"] += 1
-                total_dels += 1
-                current_hunk["lines"].append(["-", old_no, None, line[1:]])
-                old_no += 1
-            elif line.startswith(" "):
-                current_hunk["lines"].append([" ", old_no, new_no, line[1:]])
-                old_no += 1
-                new_no += 1
-            elif line == "\\ No newline at end of file":
-                pass
-            else:
-                # If non-diff line occurs after hunks, might be post-patch commentary or sign-off
-                if line.startswith("diff --git"):
-                    # Will be caught on next loop
-                    continue
-                # Context line without leading space
-                current_hunk["lines"].append([" ", old_no, new_no, line])
-                old_no += 1
-                new_no += 1
+        # 3. Trailing non-hunk lines or signature
+        if line == "-- " or line == "--":
+            break
 
         idx += 1
 
@@ -199,11 +291,21 @@ def parse_patch_from_body(body_text: str) -> dict[str, Any]:
         files.append(current_file)
 
     if not files:
-        return {"is_patch": False, "body": body_text, "diff": None}
+        return {
+            "is_patch": False,
+            "body": body_text,
+            "diff": None,
+            "review_trailers": extract_review_trailers(body_text),
+        }
 
     return {
         "is_patch": True,
         "body": intro_body,
+        "commit_message": commit_message,
+        "commentary": commentary,
+        "diffstat": diffstat,
+        "base_commit": base_commit,
+        "review_trailers": extract_review_trailers(body_text),
         "diff": {
             "files": files,
             "additions": total_adds,

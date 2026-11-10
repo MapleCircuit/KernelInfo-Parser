@@ -52,6 +52,14 @@ class TestIncludeResolver(unittest.TestCase):
         self.assertIsNone(self.r.resolve("asm/offsets.h"))
         self.assertIsNone(self.r.resolve("../../etc/passwd"))
 
+    def test_prefetch_receives_each_level(self) -> None:
+        levels: list[list[str]] = []
+        with_hook = self.r.reachable("include/linux/sched.h", directives, prefetch=lambda paths: levels.append(list(paths)))
+        self.assertEqual(with_hook, self.r.reachable("include/linux/sched.h", directives))   # same walk, same order
+        self.assertEqual(list(with_hook), list(self.r.reachable("include/linux/sched.h", directives)))
+        self.assertEqual([p for level in levels for p in level], list(with_hook))           # every file, level by level
+        self.assertEqual(levels[0][-1], "include/linux/sched.h")
+
     def test_reachable_files_and_chain(self) -> None:
         reached = self.r.reachable("include/linux/sched.h", directives)
         self.assertEqual(list(reached)[:2], ["include/linux/kconfig.h", "include/linux/sched.h"])  # forced first

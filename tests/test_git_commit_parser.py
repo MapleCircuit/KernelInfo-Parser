@@ -154,6 +154,44 @@ COMMIT_DELIM_END
         req_contribs = [cb for cb in mc.contributors if cb.name == "Tejun Heo" and cb.role == CommitRole.REQUESTED_BY]
         self.assertEqual(len(req_contribs), 1)
 
+    def test_parse_expanded_trailers_and_fixes(self) -> None:
+        log = """COMMIT_DELIM_START_abc123
+HASH:abc123abc123abc123abc123abc123abc123abc1
+ANAME:Alice
+AEMAIL:alice@example.com
+ADATE:1311280000
+CNAME:Alice
+CEMAIL:alice@example.com
+CDATE:1311280000
+SUBJ:fix: memory leak in foo
+BODY_START
+Fix memory leak in foo driver.
+
+Fixes: 1a2b3c4d5e6f ("old commit")
+This reverts commit 7f9a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a.
+
+Co-authored-by: Bob <bob@example.com>
+Reported-and-tested-by: Charlie <charlie@test.org>
+Signed-off-by: Dave dave@example.org
+BODY_END
+M\tdrivers/foo.c
+COMMIT_DELIM_END
+"""
+        commits = GitCommitParser.parse_commit_log(log)
+        self.assertEqual(len(commits), 1)
+        c = commits[0]
+        self.assertIn("1a2b3c4d5e6f", c.fixes_commits)
+        self.assertIn("7f9a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a", c.reverted_commits)
+
+        roles = {contrib.role: contrib for contrib in c.contributors}
+        self.assertIn(CommitRole.CO_DEVELOPED_BY, roles)
+        self.assertEqual(roles[CommitRole.CO_DEVELOPED_BY].email, "bob@example.com")
+        self.assertIn(CommitRole.REPORTED_BY, roles)
+        self.assertEqual(roles[CommitRole.REPORTED_BY].email, "charlie@test.org")
+        dave = [contrib for contrib in c.contributors if contrib.email == "dave@example.org"]
+        self.assertEqual(len(dave), 1)
+        self.assertEqual(dave[0].role, CommitRole.SIGNED_OFF_BY)
+
     def test_parse_merge_commit_binary_delimited(self) -> None:
         raw_output = (
             "\x1eaabbcc112233\x1fparent1 parent2\x1fLinus Torvalds\x1ftorvalds@linux-foundation.org\x1f1311282000"
@@ -411,6 +449,96 @@ class TestWebAppGitEndpoints(unittest.TestCase):
         self.assertEqual(dr1, (10, 20, 1, 0))
         self.assertEqual(dr2, (10, 20, 1, 0))
         self.assertEqual(len(te_direct.queued_set[m_bridge_commit_person.table_id]), 1)
+
+    def test_trailer_synonyms_and_compound_roles(self) -> None:
+        """Test trailer synonyms and compound roles via CommitRole."""
+        self.assertEqual(CommitRole.from_trailer_prefix("co-authored-by"), CommitRole.CO_DEVELOPED_BY)
+        self.assertEqual(CommitRole.from_trailer_prefix("originally-by"), CommitRole.CO_DEVELOPED_BY)
+        self.assertEqual(CommitRole.from_trailer_prefix("reported-and-tested-by"), CommitRole.REPORTED_BY)
+        self.assertEqual(CommitRole.from_trailer_prefix("debugged-by"), CommitRole.TESTED_BY)
+        self.assertEqual(CommitRole.from_trailer_prefix("fix-suggested-by"), CommitRole.SUGGESTED_BY)
+        self.assertEqual(CommitRole.from_trailer_prefix("CO_DEVELOPED_BY"), CommitRole.CO_DEVELOPED_BY)
+        self.assertEqual(CommitRole.from_trailer_prefix("AUTHOR"), CommitRole.AUTHOR)
+        self.assertEqual(CommitRole.from_trailer_prefix(CommitRole.REVIEWED_BY), CommitRole.REVIEWED_BY)
+
+        self.assertEqual(
+            CommitRole.roles_from_trailer_prefix("reported-and-tested-by"),
+            (CommitRole.REPORTED_BY, CommitRole.TESTED_BY),
+        )
+        self.assertEqual(
+            CommitRole.roles_from_trailer_prefix("reviewed-and-tested-by"),
+            (CommitRole.REVIEWED_BY, CommitRole.TESTED_BY),
+        )
+        self.assertEqual(
+            CommitRole.roles_from_trailer_prefix("fix-suggested-by"),
+            (CommitRole.SUGGESTED_BY,),
+        )
+
+        msg = (
+            "Subject: test trailer parsing\n\n"
+            "Originally-by: Alice <alice@example.org>\n"
+            "Reported-and-tested-by: Bob <bob@example.org>\n"
+            "Fix-suggested-by: Charlie <charlie@example.org>\n"
+            "Debugged-by: Dave <dave@example.org>\n"
+        )
+        log_entry = (
+            f"\x1e{'1'*40}\x1f\x1fAuthor\x1fa@x.org\x1f100\x1fAuthor\x1fa@x.org\x1f100\x1f"
+            f"Test commit\x1f{msg}\x1dM\tfile.c\n"
+        )
+        commits = GitCommitParser().parse_commit_log(log_entry)
+        self.assertEqual(len(commits), 1)
+        contrib_roles = {(c.name, c.role) for c in commits[0].contributors}
+        self.assertIn(("Alice", CommitRole.CO_DEVELOPED_BY), contrib_roles)
+        self.assertIn(("Bob", CommitRole.REPORTED_BY), contrib_roles)
+        self.assertIn(("Bob", CommitRole.TESTED_BY), contrib_roles)
+        self.assertIn(("Charlie", CommitRole.SUGGESTED_BY), contrib_roles)
+        self.assertIn(("Dave", CommitRole.TESTED_BY), contrib_roles)
+
+    def test_rename_and_copy_parsing(self) -> None:
+        """Test rename and copy status parsing in name-status and raw diff modes."""
+        raw_log = (
+            f"\x1e{'2'*40}\x1f\x1fAuthor\x1fa@x.org\x1f100\x1fAuthor\x1fa@x.org\x1f100\x1f"
+            f"Rename commit\x1fSubject\x1d"
+            f"R100\told_path.c\tnew_path.c\n"
+            f"C100\tsrc_path.c\tcopy_path.c\n"
+        )
+        commits = GitCommitParser().parse_commit_log(raw_log)
+        self.assertEqual(len(commits), 1)
+        c = commits[0]
+        self.assertEqual(c.files, [("R", "new_path.c"), ("C", "copy_path.c")])
+        self.assertEqual(c.file_blobs["new_path.c"], ("old_path.c", "", ""))
+        self.assertEqual(c.file_blobs["copy_path.c"], ("src_path.c", "", ""))
+
+        # Test raw format with blob SHAs
+        old_sha = "a" * 40
+        new_sha = "b" * 40
+        raw_diff_log = (
+            f"\x1e{'3'*40}\x1f\x1fAuthor\x1fa@x.org\x1f100\x1fAuthor\x1fa@x.org\x1f100\x1f"
+            f"Raw commit\x1fSubject\x1d"
+            f":100644 100644 {old_sha} {new_sha} R100\told_name.c\tnew_name.c\n"
+        )
+        commits2 = GitCommitParser().parse_commit_log(raw_diff_log)
+        self.assertEqual(len(commits2), 1)
+        c2 = commits2[0]
+        self.assertEqual(c2.files, [("R", "new_name.c")])
+        self.assertEqual(c2.file_blobs["new_name.c"], ("old_name.c", old_sha, new_sha))
+
+        # Test diff with path containing " b/"
+        hunk_log = (
+            f"\x1e{'4'*40}\x1f\x1fAuthor\x1fa@x.org\x1f100\x1fAuthor\x1fa@x.org\x1f100\x1f"
+            f"Hunk commit\x1fSubject\x1d"
+            f"diff --git a/foo/a b/bar.c b/foo/a b/bar.c\n"
+            f"index {old_sha[:7]}..{new_sha[:7]} 100644\n"
+            f"--- a/foo/a b/bar.c\n"
+            f"+++ b/foo/a b/bar.c\n"
+            f"@@ -1,1 +1,1 @@\n"
+            f"-old\n"
+            f"+new\n"
+        )
+        commits3, hunks_map = GitCommitParser.parse_commit_log_with_hunks(hunk_log)
+        self.assertEqual(len(commits3), 1)
+        self.assertEqual(commits3[0].files, [("M", "foo/a b/bar.c")])
+        self.assertIn("foo/a b/bar.c", hunks_map)
 
 
 if __name__ == "__main__":

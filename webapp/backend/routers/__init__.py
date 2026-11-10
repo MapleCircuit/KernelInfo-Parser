@@ -9,6 +9,10 @@ from webapp.backend.routers.tools import router as tools_router
 from webapp.backend.routers.system import sync_router
 from webapp.backend.routers.docs import router as docs_router
 from webapp.backend.routers.mail import router as mail_router
+from webapp.backend.routers.insights import router as insights_router
+from webapp.backend.routers.cve import router as cve_router
+from webapp.backend.routers.kapi import router as kapi_router
+from webapp.backend.routers.watch import router as watch_router
 
 __all__ = [
     "versions_router",
@@ -21,5 +25,9 @@ __all__ = [
     "sync_router",
     "docs_router",
     "mail_router",
+    "insights_router",
+    "cve_router",
+    "kapi_router",
+    "watch_router",
 ]
 

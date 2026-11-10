@@ -152,3 +152,33 @@ class TestKbuildConditions(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestKbuildObjects(unittest.TestCase):
+    """KbuildConditionResolver.objects() (KCONFIG_API.md §6.4): every object with its members and condition."""
+
+    def test_objects_and_agreement_with_file_condition(self) -> None:
+        res = resolver()
+        objs = {o.target: o for o in res.objects()}
+        self.assertIn("drivers/net/e1000.o", objs)
+        e1000 = objs["drivers/net/e1000.o"]
+        self.assertTrue(e1000.composite)
+        self.assertEqual(e1000.modname, "e1000")
+        self.assertEqual(sorted(m for m, _ in e1000.members), ["drivers/net/e1000_main.c", "drivers/net/hw/e1000_hw.c"])
+        self.assertEqual(evaluate(e1000.condition, lambda s: X86_64.get(s, "n")), "m")
+        self.assertEqual(objs["arch/x86/kernel/head_64.o"].kind, "head")
+        self.assertEqual(objs["arch/x86/kernel/head_64.o"].modname, "head_64")
+        self.assertIn("drivers/net/bonding/bonding.o", objs)
+        bond = objs["drivers/net/bonding/bonding.o"]
+        self.assertIn("drivers/net/bonding/bond_procfs.c", [m for m, _ in bond.members])
+        # Other architectures are not walked
+        self.assertFalse(any(t.startswith("arch/arm/") for t in objs))
+        # Every member's own condition agrees with the object's: same value under a configuration
+        for obj in objs.values():
+            for member, mcond in obj.members:
+                fc = res.file_condition(member)
+                self.assertEqual(fc["status"], "rule", member)
+                for values in (X86_64, {**X86_64, "E1000": "y", "BONDING": "m", "PROC_FS": "n"}):
+                    val = lambda s, v=values: v.get(s, "n")  # noqa: E731
+                    from parser.kbuild_conditions import and_
+                    self.assertEqual(evaluate(fc["expr"], val), evaluate(and_(obj.condition, mcond), val), member)

@@ -11,7 +11,7 @@ export class NodeModel {
     this.y = options.y || 100;
     this.width = options.width || 200;
     this.height = options.height || 120;
-    this.color = options.color || "#58a6ff";
+    this.color = options.color || "var(--accent-blue)";
     this.expanded = options.expanded || false;
     this.astId = options.astId || null;
     this.constituents = options.constituents || [];

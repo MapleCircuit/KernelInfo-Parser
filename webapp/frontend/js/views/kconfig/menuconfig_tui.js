@@ -9,6 +9,7 @@
  * Y/M/N set a value, Esc or Left goes back, / searches, ? or H shows help, Z toggles "show all",
  * S saves .config, D saves a minimal defconfig.
  */
+import { shortcuts } from "../../utils/shortcuts.js";
 import { toast } from "../../components/toast.js";
 import { escapeHtml } from "../../components/modal.js";
 import { api } from "../../api.js";
@@ -292,3 +293,18 @@ export class MenuconfigTui {
     }
   }
 }
+
+// Keys the TUI handles itself while it is open (listed by the shortcut overlay, webapp/API.md §5.31)
+shortcuts.registerAll([
+  ["tui.move", ["ArrowUp", "ArrowDown"], "Move the selection"],
+  ["tui.page", ["PageUp", "PageDown", "Home", "End"], "Move by a page / to the first or last entry"],
+  ["tui.enter", ["Enter", "ArrowRight"], "Open a submenu (Enter also toggles an option)"],
+  ["tui.back", ["Escape", "ArrowLeft"], "Back to the parent menu"],
+  ["tui.toggle", ["Space"], "Toggle the selected option"],
+  ["tui.set", ["Y", "M", "N"], "Set the selected option to y, m or n"],
+  ["tui.search", ["/"], "Search options"],
+  ["tui.help", ["?", "H"], "Help for the selected option"],
+  ["tui.unmet", ["Z"], "Show or hide options whose dependencies are unmet"],
+  ["tui.save", ["S"], "Save the .config"],
+  ["tui.defconfig", ["D"], "Save a minimal defconfig"],
+].map(([id, keys, description]) => ({ id, keys, description, scope: "kconfig-tui", docOnly: true })));

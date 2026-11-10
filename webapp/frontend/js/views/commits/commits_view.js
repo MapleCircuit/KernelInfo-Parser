@@ -1,6 +1,9 @@
 /**
  * commits_view.js - Git Commit Timeline & Diff Viewer.
  */
+import { progressLabel } from "../../utils/job_poll.js";
+import { releaseBadgeHtml, relationChipsHtml, relationsCount, relationsHtml } from "./relations_render.js";
+import { KEY_HELP, completeKey, isStructured, parseCommitQuery, queryParams, removeToken } from "./commit_query.js";
 import { api } from "../../api.js";
 import { state } from "../../state.js";
 import { debounce } from "../../utils/debounce.js";
@@ -10,7 +13,7 @@ import { copyToClipboard } from "../../utils/clipboard.js";
 import { contextMenu } from "../../components/context_menu.js";
 import { COLLAPSE_ICON } from "../../utils/icons.js";
 
-const STATUS_COLORS = { A: "var(--accent-green)", D: "var(--accent-red)", R: "#d2a8ff", M: "var(--accent-yellow)" };
+const STATUS_COLORS = { A: "var(--accent-green)", D: "var(--accent-red)", R: "var(--diff-rename-fg)", M: "var(--accent-yellow)" };
 // Files whose diff is longer than this start collapsed in the inline commit diff
 const AUTO_EXPAND_ROWS = 120;
 
@@ -135,9 +138,12 @@ export class CommitsView {
         <!-- Commits List Column -->
         <div class="commits-list-col">
           <div class="commits-search-bar" style="display:flex;gap:6px;">
-            <input type="text" id="commit-search-input" placeholder="Search commit subject, author, hash..." style="flex:1;" />
+            <input type="text" id="commit-search-input" placeholder="Search subject, author, hash… or path:fs/ext4 in:v3.0 reviewer:name" style="flex:1;" list="commit-query-keys" />
+            <datalist id="commit-query-keys"></datalist>
+            <button type="button" class="code-btn commit-query-help" id="btn-commit-query-help" title="Query keys (path:, author:, reviewer:, since:, in:, merges:, section: …)">?</button>
             <button type="button" class="collapse-btn" id="btn-commits-collapse" title="Collapse the commit list" aria-label="Collapse the commit list">${COLLAPSE_ICON}</button>
           </div>
+          <div class="commit-query-chips" id="commit-query-chips" hidden></div>
           <div class="commits-list" id="commit-list-container">
             <div style="padding:16px;color:var(--text-muted);">Loading commits...</div>
           </div>
@@ -163,6 +169,13 @@ export class CommitsView {
       });
     });
 
+    // Release badge and Relations card links (H1-H3)
+    const detailContainer = containerEl.querySelector("#commit-detail-container");
+    detailContainer.addEventListener("click", (e) => this.onFactsClick(e));
+    detailContainer.addEventListener("auxclick", (e) => {
+      if (e.button === 1 && this.onFactsClick(e, true)) e.preventDefault();
+    });
+
     containerEl.querySelector("#btn-commits-expand").onclick = () => this.setListCollapsed(false);
     containerEl.querySelector("#btn-commits-collapse").onclick = () => this.setListCollapsed(true);
 
@@ -176,8 +189,22 @@ export class CommitsView {
       this.loadCommits(q, true);
     }, 250);
     searchInput.oninput = () => {
+      this.renderQueryChips(searchInput.value);
+      this.updateKeyCompletions(searchInput);
       debouncedSearch(searchInput.value.trim());
     };
+    this.renderQueryChips(searchInput.value);
+    containerEl.querySelector("#btn-commit-query-help").onclick = (e) => this.showQueryHelp(e.currentTarget);
+    containerEl.querySelector("#commit-query-chips").addEventListener("click", (e) => {
+      const x = e.target.closest("[data-token]");
+      if (!x) return;
+      // Removing a chip refines the list at once, and the URL reproduces the query (q=)
+      const next = removeToken(searchInput.value, parseInt(x.dataset.token, 10));
+      searchInput.value = next;
+      this.renderQueryChips(next);
+      this.persistTabState({ query: next.trim() });
+      this.loadCommits(next.trim(), true);
+    });
 
     // The selected commit is what the reader came for: its detail is requested first (and at high
     // fetch priority) and the list or search loads beside it, so neither waits for the other. A
@@ -226,7 +253,13 @@ export class CommitsView {
     }
 
     try {
-      if (this.currentQuery) {
+      if (this.currentQuery && isStructured(this.currentQuery)) {
+        // Structured query (H8): git log, downward pagination only
+        const res = await api.queryCommits(this.currentVersion, queryParams(parseCommitQuery(this.currentQuery), this.currentPage, 50));
+        if (token !== this._listToken) return;
+        this.commits = res.commits || [];
+        this.hasMore = Boolean(res.has_more);
+      } else if (this.currentQuery) {
         const res = await api.getCommits(this.currentVersion, this.currentPage, 50, this.currentQuery);
         if (token !== this._listToken) return;
         const newCommits = res.commits || [];
@@ -298,7 +331,12 @@ export class CommitsView {
 
     try {
       const known = new Set(this.commits.map((c) => c.commit_id ?? c.commit_hash));
-      if (this.currentQuery) {
+      if (this.currentQuery && isStructured(this.currentQuery)) {
+        this.currentPage += 1;
+        const res = await api.queryCommits(this.currentVersion, queryParams(parseCommitQuery(this.currentQuery), this.currentPage, 50));
+        this.commits.push(...(res.commits || []).filter((c) => !known.has(c.commit_id ?? c.commit_hash)));
+        this.hasMore = Boolean(res.has_more);
+      } else if (this.currentQuery) {
         this.currentPage += 1;
         const res = await api.getCommits(this.currentVersion, this.currentPage, 50, this.currentQuery);
         const newCommits = res.commits || [];
@@ -419,6 +457,9 @@ export class CommitsView {
       bottomBtn.onclick = () => this.loadMoreBottom();
       listContainer.appendChild(bottomBtn);
     }
+    // Relation chips (H1): one batched request for the cards just rendered
+    clearTimeout(this.chipTimer);
+    this.chipTimer = setTimeout(() => this.decorateCardsWithRelations(), 300);
   }
 
   async toggleCommitDiff(commitHash, btn, panel) {
@@ -561,6 +602,139 @@ export class CommitsView {
     return true;
   }
 
+  /** Chips of the recognized query keys under the search box (H8); each one removes its token. */
+  renderQueryChips(text) {
+    const box = this.containerEl?.querySelector("#commit-query-chips");
+    if (!box) return;
+    const q = parseCommitQuery(text);
+    box.hidden = !q.chips.length;
+    box.innerHTML = q.chips.map((c) => `<span class="cq-chip" title="${escapeHtml(KEY_HELP[c.key] || "")}"><b>${escapeHtml(c.key)}:</b>${escapeHtml(c.value)}<button type="button" data-token="${c.index}" title="Remove this filter" aria-label="Remove ${escapeHtml(c.key)} filter">×</button></span>`).join("")
+      + (q.text ? `<span class="cq-chip text" title="Subject or message text"><b>text:</b>${escapeHtml(q.text)}</span>` : "");
+  }
+
+  /** Key suggestions while the last word is a known key's prefix (the input's datalist). */
+  updateKeyCompletions(input) {
+    const list = this.containerEl?.querySelector("#commit-query-keys");
+    if (!list) return;
+    const words = input.value.split(/\s+/);
+    const last = words.pop() || "";
+    const head = words.length ? `${words.join(" ")} ` : "";
+    list.innerHTML = completeKey(last).map((k) => `<option value="${escapeHtml(head + k)}"></option>`).join("");
+  }
+
+  showQueryHelp(anchor) {
+    const items = Object.entries(KEY_HELP).map(([k, h]) => ({ label: `${k}: — ${h}`, icon: "⌕", onClick: () => {
+      const input = this.containerEl.querySelector("#commit-search-input");
+      input.value = `${input.value.trim()} ${k}:`.trim();
+      input.focus();
+    } }));
+    const r = anchor.getBoundingClientRect();
+    contextMenu.renderMenu(r.left, r.bottom + 4, { header: { title: "Query keys", sub: "Unknown keys stay free text; plain text searches subjects and messages" }, items });
+  }
+
+  /** Release badge (H3) and Relations card (H1/H2) of the inspected commit; `token` drops stale answers. */
+  loadCommitHistoryFacts(detailEl, hash, token) {
+    this.factsAbort?.abort();
+    const controller = new AbortController();
+    this.factsAbort = controller;
+    const live = () => token === this._detailToken && detailEl.isConnected;
+    const badgeEl = detailEl.querySelector("#commit-release-badge");
+    api.getCommitRelease(this.currentVersion, hash, {
+      signal: controller.signal,
+      onProgress: (p) => { if (live() && badgeEl) badgeEl.innerHTML = `<span class="release-badge pending">Indexing releases… ${escapeHtml(progressLabel(p))}</span>`; },
+    }).then((info) => {
+      if (!live() || !badgeEl) return;
+      badgeEl.innerHTML = releaseBadgeHtml(info);
+    }).catch((err) => {
+      if (err?.name === "AbortError" || !live() || !badgeEl) return;
+      badgeEl.innerHTML = `<span class="release-badge unknown" title="${escapeHtml(err.message)}">First release unknown</span>`;
+    });
+    const body = detailEl.querySelector("#commit-relations-body");
+    const countEl = detailEl.querySelector("#commit-relations-count");
+    api.getCommitRelations(this.currentVersion, hash, {
+      signal: controller.signal,
+      onProgress: (p) => { if (live() && body) body.innerHTML = `<span class="rel-loading">Indexing commit relations (first use)… ${escapeHtml(progressLabel(p))}</span>`; },
+    }).then((rel) => {
+      if (!live() || !body) return;
+      const html = relationsHtml(rel);
+      body.innerHTML = html || '<span class="rel-none">No Fixes:, revert or backport relation, and no Cc: stable.</span>';
+      if (countEl) countEl.textContent = relationsCount(rel) ? `(${relationsCount(rel)})` : "";
+    }).catch((err) => {
+      if (err?.name === "AbortError" || !live() || !body) return;
+      body.innerHTML = `<span class="rel-none">Relations unavailable: ${escapeHtml(err.message)}</span>`;
+    });
+  }
+
+  /** Clicks inside the Relations card and the release badge (delegated from the detail container). */
+  onFactsClick(e, forceNew = false) {
+    const badge = e.target.closest(".release-badge[data-tag]");
+    if (badge && !forceNew) {
+      // Like every header pick, selecting the release switches no tab (§5.13)
+      state.setSelectedVersion(badge.dataset.tag);
+      toast.info(`Selected ${badge.dataset.tag} in the header`);
+      return true;
+    }
+    const link = e.target.closest(".rel-subject[data-inspect]");
+    if (link) {
+      e.preventDefault();
+      const hash = link.dataset.inspect;
+      if (forceNew || e.ctrlKey || e.metaKey) {
+        state.openTab({ type: "commits", title: `Commit ${hash.slice(0, 7)}`, commitId: hash, listCollapsed: true, version: this.currentVersion, forceNew: true });
+      } else if (!this.selectLoadedCommit(hash)) {
+        this.selectedCommitId = hash;
+        this.inspectCommit(hash);
+      }
+      return true;
+    }
+    const cve = e.target.closest(".rel-cve[data-cve]");
+    if (cve) {
+      e.preventDefault();
+      state.openTab({ type: "insights", title: "Insights · Security", view: "security", sel: cve.dataset.cve, version: this.currentVersion, forceNew: forceNew || e.ctrlKey || e.metaKey });
+      return true;
+    }
+    const mail = e.target.closest(".rel-mail[data-mid]");
+    if (mail) {
+      e.preventDefault();
+      state.openTab({ type: "mail", title: "LKML thread", messageId: mail.dataset.mid, forceNew: forceNew || e.ctrlKey || e.metaKey });
+      return true;
+    }
+    return false;
+  }
+
+  /** Relation chips on the cards of the loaded timeline (H1), fetched in one batch per render. */
+  async decorateCardsWithRelations() {
+    const cards = [...(this.containerEl?.querySelectorAll(".commit-card") || [])];
+    this.relationCounts = this.relationCounts || new Map();
+    const missing = [];
+    for (const card of cards) {
+      const hash = card.querySelector(".copy-hash")?.dataset.hash;
+      if (hash && !this.relationCounts.has(hash)) missing.push(hash);
+    }
+    if (missing.length) {
+      try {
+        const res = await api.getRelationCounts(this.currentVersion, missing.slice(0, 200));
+        for (const h of missing) this.relationCounts.set(h, res?.results?.[h] || null);
+      } catch {
+        return;
+      }
+    }
+    for (const card of this.containerEl?.querySelectorAll(".commit-card") || []) {
+      const hash = card.querySelector(".copy-hash")?.dataset.hash;
+      const html = relationChipsHtml(this.relationCounts.get(hash));
+      let holder = card.querySelector(".rel-chips");
+      if (!html) {
+        holder?.remove();
+        continue;
+      }
+      if (!holder) {
+        holder = document.createElement("div");
+        holder.className = "rel-chips";
+        card.appendChild(holder);
+      }
+      holder.innerHTML = html;
+    }
+  }
+
   async inspectCommit(commitIdOrHash) {
     const detailEl = this.containerEl.querySelector("#commit-detail-container");
     detailEl.innerHTML = `<div style="color:var(--text-muted);">Loading commit details...</div>`;
@@ -582,6 +756,7 @@ export class CommitsView {
             <div><strong>Author:</strong> <span class="commit-detail-author-link" style="color:var(--accent-blue);cursor:pointer;text-decoration:underline;" title="Click to view developer profile">${escapeHtml(c.author?.name || c.author_name)} &lt;${escapeHtml(c.author?.email || c.author_email)}&gt;</span></div>
             <div><strong>Date:</strong> ${escapeHtml(dateStr)}</div>
             <div><strong>Hash:</strong> ${hashHtml(c.commit_hash)}</div>
+            <div class="commit-release" id="commit-release-badge"><span class="release-badge pending">First released in …</span></div>
             ${c.lore_url ? `<div><a href="${escapeHtml(c.lore_url)}" target="_blank" class="lore-link">lore.kernelinfo.org LKML Thread ↗</a></div>` : ""}
             <div style="margin-top:8px;">
               <button class="code-btn active" id="btn-explore-commit" style="font-size:11px;padding:4px 10px;">
@@ -618,7 +793,7 @@ export class CommitsView {
                     let color = "var(--accent-blue)";
                     if (role.toLowerCase().includes("signed-off")) color = "var(--accent-green)";
                     else if (role.toLowerCase().includes("reported") || role.toLowerCase().includes("suggested")) color = "var(--accent-orange)";
-                    else if (role.toLowerCase().includes("co-developed")) color = "#d2a8ff";
+                    else if (role.toLowerCase().includes("co-developed")) color = "var(--diff-rename-fg)";
                     return `<span style="color:${color};font-weight:bold;font-size:10px;background:rgba(255,255,255,0.05);padding:2px 6px;border-radius:3px;border:1px solid rgba(255,255,255,0.1);">${escapeHtml(role)}</span>`;
                   }).join(" ");
 
@@ -639,6 +814,12 @@ export class CommitsView {
         <div class="m-card">
           <div class="m-card-title">Commit Message</div>
           <pre style="font-family:var(--font-mono);font-size:12px;white-space:pre-wrap;color:var(--text-primary);line-height:1.4;">${escapeHtml(c.message || c.subject)}</pre>
+        </div>
+
+        <!-- Relations: Fixes / Fixed by / Reverts / backports (H1, H2) -->
+        <div class="m-card" id="commit-relations-card">
+          <div class="m-card-title">Relations <span class="rel-count" id="commit-relations-count"></span></div>
+          <div id="commit-relations-body" class="rel-body"><span class="rel-loading">Looking for related commits…</span></div>
         </div>
 
         <!-- Modified Files -->
@@ -682,6 +863,9 @@ export class CommitsView {
           showPersonModal(this.currentVersion, c.author?.email || c.author_email || c.author?.name || c.author_name);
         };
       }
+
+      // First release containing it (H3) and its relations (H1, H2), filled when they arrive
+      if (c.commit_hash) this.loadCommitHistoryFacts(detailEl, c.commit_hash, token);
 
       const exploreCommitBtn = detailEl.querySelector("#btn-explore-commit");
       if (exploreCommitBtn && c.commit_hash) {

@@ -95,8 +95,8 @@
 .tab-icon.maintainers { color: var(--accent-orange); }
 .tab-icon.commits { color: var(--accent-yellow); }
 .tab-icon.pahole { color: var(--accent-cyan); }
-.tab-icon.callgraph { color: #f778ba; }
-.tab-icon.diff { color: #e36209; }
+.tab-icon.callgraph { color: var(--accent-pink); }
+.tab-icon.diff { color: var(--accent-orange-strong); }
 .tab-icon.treemap { color: var(--accent-green); }
 .tab-icon.explorer { color: var(--accent-blue); }
 .tab-icon.mail { color: var(--accent-cyan); }

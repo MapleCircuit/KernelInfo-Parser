@@ -19,13 +19,13 @@ from core.globalstuff import (
 
 m_file_name = m_file = m_bridge_file = m_type_descriptor = m_ast = m_ast_container = None
 m_maintainer_person = m_maintainer_section = m_maintainer_member = None
-m_maintainer_pattern = m_maintainer_file = m_credits_entry = None
+m_maintainer_pattern = m_maintainer_file = m_credits_entry = m_ast_attribute = m_person_identity = None
 
 
 def _init_tables() -> None:
     global m_file_name, m_file, m_bridge_file, m_type_descriptor, m_ast, m_ast_container
     global m_maintainer_person, m_maintainer_section, m_maintainer_member
-    global m_maintainer_pattern, m_maintainer_file, m_credits_entry
+    global m_maintainer_pattern, m_maintainer_file, m_credits_entry, m_ast_attribute, m_person_identity
     if m_file_name is not None:
         return
     import core.DBLayout as db_layout
@@ -41,6 +41,8 @@ def _init_tables() -> None:
     m_maintainer_pattern = db_layout.m_maintainer_pattern
     m_maintainer_file = db_layout.m_maintainer_file
     m_credits_entry = db_layout.m_credits_entry
+    m_ast_attribute = db_layout.m_ast_attribute
+    m_person_identity = db_layout.m_person_identity
 
 
 from parser.c_ast import get_prior_tags
@@ -150,6 +152,9 @@ class MaintainerManager:
                     and old_sec.scm_tree.strip() == section.scm_tree.strip()
                     and old_sec.web_page.strip() == section.web_page.strip()
                     and old_sec.mailing_list.strip() == section.mailing_list.strip()
+                    and getattr(old_sec, "patchwork", "").strip() == section.patchwork.strip()
+                    and getattr(old_sec, "bug_url", "").strip() == section.bug_url.strip()
+                    and getattr(old_sec, "chat_channel", "").strip() == section.chat_channel.strip()
                     and len(old_sec.members) == len(section.members)
                     and all(
                         om.name == nm.name and om.email == nm.email and om.role == nm.role
@@ -197,6 +202,10 @@ class MaintainerManager:
                         section.web_page,
                         section.mailing_list,
                         ast_ref,
+                        section.patchwork or None,
+                        section.bug_url or None,
+                        section.chat_channel or None,
+                        section.profile_doc or None,
                     ))
                     sec_ref = ((m_maintainer_section.table_id, 0), OP_REF, (REF_POS, CS.route[-1]))
 
@@ -227,6 +236,36 @@ class MaintainerManager:
                             pattern.pattern,
                             pattern.priority,
                         ))
+
+                # 6. Store Extended Taxonomy Attributes ('Q:', 'B:', 'C:')
+                attr_priority = 0
+                if section.patchwork:
+                    with CS(REF_POS):
+                        CS.store(m_ast_attribute.set(
+                            ast_ref,
+                            attr_priority,
+                            "patchwork",
+                            section.patchwork[:255],
+                        ))
+                    attr_priority += 1
+                if section.bug_url:
+                    with CS(REF_POS):
+                        CS.store(m_ast_attribute.set(
+                            ast_ref,
+                            attr_priority,
+                            "bug_url",
+                            section.bug_url[:255],
+                        ))
+                    attr_priority += 1
+                if section.chat_channel:
+                    with CS(REF_POS):
+                        CS.store(m_ast_attribute.set(
+                            ast_ref,
+                            attr_priority,
+                            "chat_channel",
+                            section.chat_channel[:255],
+                        ))
+                    attr_priority += 1
 
     def _tag_and_map(
         self,
@@ -322,14 +361,36 @@ class CreditsManager:
                 ast_type=ASTT.Credits_Entry,
             )
 
-            # 3. Deduplicate / Store Contributor Person in m_maintainer_person
+            # 3. Deduplicate / Store Contributor Person in m_maintainer_person and secondary emails in m_person_identity
+            from parser.git_ast.identity import identity_key
+            emails = [e.strip() for e in entry.email.split(",") if e.strip()] if entry.email else []
+            primary_email = emails[0] if emails else ""
+            key = identity_key(entry.name, primary_email)
             with CS(REF_POS):
                 CS.store(m_maintainer_person.get_set(
                     None,
                     entry.name,
-                    entry.email,
+                    primary_email,
                 ))
                 person_ref = ((m_maintainer_person.table_id, 0), OP_REF, (REF_POS, CS.route[-1]))
+            with CS(REF_POS):
+                CS.store(m_person_identity.get_set(
+                    person_ref,
+                    key[:255],
+                ))
+            for sec_email in emails[1:]:
+                with CS(REF_POS):
+                    CS.store(m_maintainer_person.get_set(
+                        None,
+                        entry.name,
+                        sec_email,
+                    ))
+                    sec_person_ref = ((m_maintainer_person.table_id, 0), OP_REF, (REF_POS, CS.route[-1]))
+                with CS(REF_POS):
+                    CS.store(m_person_identity.get_set(
+                        sec_person_ref,
+                        key[:255],
+                    ))
 
             # 4. Store Credits Record in m_credits_entry ONLY if new or changed
             if not is_unchanged:
@@ -385,6 +446,9 @@ def query_maintainers_for_file(
             "scm_tree": sec.scm_tree,
             "web_page": sec.web_page,
             "mailing_list": sec.mailing_list,
+            "patchwork": sec.patchwork,
+            "bug_url": sec.bug_url,
+            "chat_channel": sec.chat_channel,
             "maintainers": [
                 {"name": m.name, "email": m.email, "role": "Maintainer"}
                 for m in sec.get_maintainers()

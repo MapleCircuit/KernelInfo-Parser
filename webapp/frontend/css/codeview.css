@@ -126,6 +126,56 @@
   border-color: var(--border-focus);
 }
 
+.code-security-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  height: 22px;
+  box-sizing: border-box;
+  line-height: 1;
+  font-size: var(--fs-11, 11px);
+  font-weight: 500;
+  color: var(--accent-red, #f85149);
+  padding: 0 8px;
+  background: rgba(248, 81, 73, 0.1);
+  border-radius: 4px;
+  border: 1px solid rgba(248, 81, 73, 0.3);
+  cursor: pointer;
+  white-space: nowrap;
+  flex-shrink: 0;
+  transition: var(--transition-fast);
+}
+
+.code-security-badge:hover {
+  background: rgba(248, 81, 73, 0.2);
+  border-color: rgba(248, 81, 73, 0.5);
+}
+
+.code-subsystem-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  height: 22px;
+  box-sizing: border-box;
+  line-height: 1;
+  font-size: var(--fs-11, 11px);
+  color: var(--text-secondary);
+  padding: 0 8px;
+  background: var(--bg-tertiary);
+  border-radius: 4px;
+  border: 1px solid var(--border-color);
+  cursor: pointer;
+  white-space: nowrap;
+  flex-shrink: 0;
+  transition: var(--transition-fast);
+}
+
+.code-subsystem-chip:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+  border-color: var(--border-focus);
+}
+
 /* 2. Editor Body & Virtual Scroller */
 .editor-body {
   display: flex;
@@ -289,20 +339,20 @@
 }
 
 /* Lexical highlighting tokens */
-.tok-keyword { color: #ff7b72; font-weight: 500; }
-.tok-type { color: #79c0ff; }
-.tok-string { color: #a5d6ff; }
-.tok-number { color: #79c0ff; }
-.tok-comment { color: #8b949e !important; font-style: italic; cursor: text !important; }
-.tok-preproc { color: #d2a8ff; font-weight: 500; }
-.tok-macro { color: #d2a8ff; font-weight: 500; }
-.tok-include { color: #a5d6ff; }
-.tok-punct { color: #8b949e; }
-.tok-function { color: #d2a8ff; font-weight: 500; }
-.tok-identifier { color: #c9d1d9; }
-.tok-variable { color: #ffa657; }
-.tok-attribute { color: #7ee787; }
-.tok-lifetime { color: #ffa657; font-style: italic; }
+.tok-keyword { color: var(--syn-keyword); font-weight: 500; }
+.tok-type { color: var(--syn-type); }
+.tok-string { color: var(--syn-string); }
+.tok-number { color: var(--syn-number); }
+.tok-comment { color: var(--syn-comment) !important; font-style: italic; cursor: text !important; }
+.tok-preproc { color: var(--syn-preproc); font-weight: 500; }
+.tok-macro { color: var(--syn-preproc); font-weight: 500; }
+.tok-include { color: var(--syn-string); }
+.tok-punct { color: var(--syn-punct); }
+.tok-function { color: var(--syn-function); font-weight: 500; }
+.tok-identifier { color: var(--syn-identifier); }
+.tok-variable { color: var(--syn-variable); }
+.tok-attribute { color: var(--syn-attribute); }
+.tok-lifetime { color: var(--syn-variable); font-style: italic; }
 
 
 /* Semantic AST Overlay Tokens */
@@ -319,35 +369,35 @@
 }
 
 .ast-ref {
-  color: #79c0ff;
+  color: var(--syn-type);
 }
 
 .ast-type {
-  color: #39c5bb;
+  color: var(--syn-struct);
   font-weight: 500;
 }
 
 .ast-struct {
-  color: #39c5bb;
+  color: var(--syn-struct);
   font-weight: 600;
 }
 
 .ast-func {
-  color: #d2a8ff;
+  color: var(--syn-function);
   font-weight: 500;
 }
 
 .ast-macro {
-  color: #e3b341;
+  color: var(--syn-macro);
   font-weight: 500;
 }
 
 .ast-include {
-  color: #a5d6ff;
+  color: var(--syn-string);
 }
 
 .ast-field {
-  color: #7ee787;
+  color: var(--syn-attribute);
 }
 
 /* Conditional compilation dimming */
@@ -402,6 +452,11 @@
 .code-build-banner.module {
   background: rgba(88, 166, 255, 0.08);
   border-bottom-color: rgba(88, 166, 255, 0.3);
+}
+
+.code-build-banner.builtin {
+  background: rgba(46, 160, 67, 0.08);
+  border-bottom-color: rgba(46, 160, 67, 0.3);
 }
 
 .code-build-banner code {
@@ -774,4 +829,155 @@
   flex-shrink: 0;
   text-align: right;
   font-variant-numeric: tabular-nums;
+}
+
+/* Find in file (webapp/API.md §5.21): overlaid at the top right of the editor body */
+.code-find-bar {
+  position: absolute;
+  top: 6px;
+  right: 104px;
+  z-index: 20;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px;
+  max-width: calc(100% - 120px);
+  padding: 5px 6px;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.35);
+  font-size: 12px;
+}
+.code-find-input {
+  width: 220px;
+  min-width: 120px;
+  flex: 1 1 160px;
+  padding: 4px 6px;
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+  font-family: var(--font-mono, monospace);
+  font-size: 12px;
+}
+.code-find-input:focus { outline: none; border-color: var(--accent-blue); }
+.code-find-bar.no-results .code-find-input,
+.code-find-bar.has-error .code-find-input { border-color: var(--accent-red); }
+.code-find-toggle,
+.code-find-nav,
+.code-find-close {
+  min-width: 24px;
+  height: 24px;
+  padding: 0 5px;
+  background: transparent;
+  color: var(--text-secondary);
+  border: 1px solid transparent;
+  border-radius: 4px;
+  cursor: pointer;
+  font-family: var(--font-mono, monospace);
+  font-size: 12px;
+}
+.code-find-toggle:hover,
+.code-find-nav:hover,
+.code-find-close:hover { background: var(--bg-hover); color: var(--text-primary); }
+.code-find-toggle.active { color: var(--accent-blue); border-color: var(--accent-blue); background: rgba(88, 166, 255, 0.12); }
+.code-find-count { min-width: 64px; text-align: center; color: var(--text-secondary); font-variant-numeric: tabular-nums; }
+.code-find-bar.no-results .code-find-count { color: var(--accent-red); }
+.code-find-error { flex-basis: 100%; color: var(--accent-red); font-size: 11px; padding: 2px 2px 0; }
+mark.find-match {
+  background: rgba(234, 179, 8, 0.32);
+  color: inherit;
+  border-radius: 2px;
+  box-shadow: 0 0 0 1px rgba(234, 179, 8, 0.45);
+}
+mark.find-match.current {
+  background: rgba(240, 136, 62, 0.65);
+  box-shadow: 0 0 0 1px rgba(240, 136, 62, 0.95);
+}
+@media (max-width: 700px) {
+  .code-find-bar { right: 8px; left: 8px; max-width: none; }
+  .code-find-input { width: auto; }
+}
+
+/* Blame options popover and moved-from marker (H9, webapp/API.md §5.21) */
+.blame-opts-popover {
+  position: fixed; z-index: 1000; min-width: 280px; padding: 8px 10px;
+  background: var(--bg-secondary); border: 1px solid var(--border-color); border-radius: 6px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4); font-size: 12px; color: var(--text-primary);
+}
+.blame-opts-popover label { display: flex; align-items: center; gap: 6px; padding: 4px 0; cursor: pointer; }
+.blame-opts-popover code { color: var(--text-muted); font-size: 11px; }
+.blame-opts-title { font-weight: 600; margin-bottom: 4px; color: var(--text-secondary); }
+.blame-opts-slow { font-size: 10px; color: var(--accent-yellow); border: 1px solid var(--accent-yellow); border-radius: 3px; padding: 0 3px; }
+.blame-moved-mark { color: var(--accent-orange); margin-right: 2px; font-weight: 700; }
+
+/* Outline panel, sticky scroll, breadcrumb symbol (G03, webapp/API.md §5.21) */
+.code-outline {
+  flex: 0 0 240px; display: flex; flex-direction: column; min-width: 0; max-width: 40%;
+  border-left: 1px solid var(--border-color); background: var(--bg-secondary); font-size: 12px;
+}
+.code-outline-head { display: flex; gap: 4px; padding: 6px; border-bottom: 1px solid var(--border-color); }
+.code-outline-filter {
+  flex: 1; min-width: 0; padding: 4px 6px; background: var(--bg-primary); color: var(--text-primary);
+  border: 1px solid var(--border-color); border-radius: 4px; font-size: 12px;
+}
+.code-outline-close { background: none; border: none; color: var(--text-secondary); cursor: pointer; }
+.code-outline-list { flex: 1; overflow: auto; padding: 4px 0 16px; }
+.code-outline-group-head {
+  padding: 4px 8px; color: var(--text-secondary); font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em; cursor: pointer;
+}
+.code-outline-group-head span { color: var(--text-muted); }
+.code-outline-group.collapsed .code-outline-item { display: none; }
+.code-outline-item {
+  display: flex; align-items: center; gap: 6px; padding: 2px 8px; cursor: pointer; white-space: nowrap;
+  color: var(--text-primary); font-family: var(--font-mono, monospace);
+}
+.code-outline-item:hover { background: var(--bg-hover); }
+.code-outline-item.current { background: rgba(88, 166, 255, 0.16); box-shadow: inset 2px 0 0 var(--accent-blue); }
+.code-outline-icon { width: 14px; text-align: center; color: var(--accent-purple); flex: none; }
+.code-outline-item.kind-type .code-outline-icon { color: var(--accent-cyan); }
+.code-outline-item.kind-macro .code-outline-icon { color: var(--accent-orange); }
+.code-outline-item.kind-api .code-outline-icon { color: var(--accent-green); }
+.code-outline-item.kind-prototype { opacity: 0.7; }
+.code-outline-name { overflow: hidden; text-overflow: ellipsis; }
+.code-outline-line { margin-left: auto; color: var(--text-muted); font-size: 10px; font-variant-numeric: tabular-nums; }
+.code-outline-empty { padding: 12px; color: var(--text-muted); }
+.code-sticky {
+  position: sticky; top: 0; z-index: 15; align-self: flex-start; flex: 0 0 auto; min-width: 100%; height: max-content;
+  background: var(--bg-primary); border-bottom: 1px solid var(--border-color); box-shadow: 0 3px 6px rgba(0, 0, 0, 0.35);
+}
+.code-sticky[hidden] { display: none; }
+.code-sticky-row { cursor: pointer; }
+.code-sticky-row:hover { background: var(--bg-hover); }
+.breadcrumb-symbol { margin-left: 6px; color: var(--accent-purple); cursor: pointer; font-family: var(--font-mono, monospace); white-space: nowrap; }
+@media (max-width: 700px) { .code-outline { flex-basis: 180px; } }
+
+/* Hover cards (G04, §5.6) */
+.hover-card { position: fixed; z-index: 9000; max-width: min(560px, calc(100vw - 16px)); padding: 8px 10px; background: var(--bg-secondary); color: var(--text-primary); border: 1px solid var(--border-color); border-radius: var(--radius-md); box-shadow: 0 6px 24px rgba(0, 0, 0, 0.35); font-size: var(--fs-12, 12px); display: flex; flex-direction: column; gap: 4px; }
+.hover-card .hc-head { display: flex; align-items: baseline; gap: 8px; }
+.hover-card .hc-kind { font-size: var(--fs-10, 10px); text-transform: uppercase; letter-spacing: 0.04em; color: var(--accent-purple); }
+.hover-card .hc-sig { margin: 0; padding: 4px 6px; background: var(--bg-tertiary); font-family: var(--font-mono); font-size: var(--fs-11, 11px); white-space: pre-wrap; overflow-wrap: anywhere; max-height: 9em; overflow: auto; }
+.hover-card .hc-doc { color: var(--text-secondary); max-height: 8em; overflow: auto; }
+.hover-card .hc-params { margin: 0; padding-left: 16px; color: var(--text-secondary); font-size: var(--fs-11, 11px); }
+.hover-card .hc-loc { font-family: var(--font-mono); font-size: var(--fs-10, 10px); color: var(--text-muted); overflow-wrap: anywhere; }
+.hover-card .hc-muted { color: var(--text-muted); }
+.hover-card .hc-actions { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 2px; }
+.hover-card .hc-actions button { background: var(--bg-tertiary); color: var(--text-primary); border: 1px solid var(--border-color); border-radius: var(--radius-sm); padding: 2px 8px; font-size: var(--fs-11, 11px); cursor: pointer; }
+.hover-card .hc-actions button:hover { background: var(--bg-hover); }
+
+/* Ops implementations (N1, §5.6) */
+.ops-modal .ops-form { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-bottom: 8px; }
+.ops-modal .ops-form label { display: flex; align-items: center; gap: 4px; font-size: var(--fs-11, 11px); color: var(--text-secondary); }
+.ops-modal .ops-form input { background: var(--bg-primary); color: var(--text-primary); border: 1px solid var(--border-color); border-radius: var(--radius-sm); padding: 3px 6px; font-family: var(--font-mono); min-width: 0; }
+.ops-modal .ops-status { margin: 4px 0 8px; font-size: var(--fs-11, 11px); }
+.ops-modal .ops-file { margin-bottom: 8px; }
+.ops-modal .ops-path { font-family: var(--font-mono); font-size: var(--fs-11, 11px); color: var(--text-secondary); overflow-wrap: anywhere; }
+.ops-modal .ops-row { padding-left: 14px; font-size: var(--fs-12, 12px); overflow-wrap: anywhere; }
+.ops-modal .ops-fields { display: flex; flex-wrap: wrap; gap: 6px 12px; font-family: var(--font-mono); font-size: var(--fs-12, 12px); }
+
+/* "Referenced by" count once loaded (code toolbar, webapp/API.md section 5.21) */
+.code-btn-badge {
+  font-size: 0.85em;
+  opacity: 0.8;
 }

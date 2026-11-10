@@ -3,6 +3,7 @@
  * Supports token clicks, right-click code editor actions, file explorer actions,
  * and NodeMap schematic canvas controls.
  */
+import { shortcuts } from "../utils/shortcuts.js";
 import { api } from "../api.js";
 import { state } from "../state.js";
 import { sessionManager } from "../session_manager.js";
@@ -15,6 +16,8 @@ import { showSymbolHistoryModal, showKconfigHistoryModal } from "./symbol_histor
 import { showPatchModal } from "./patch_modal.js";
 import { showFileHistoryModal } from "./file_history_modal.js";
 import { openDefinition } from "../utils/definition_picker.js";
+import { blameBeforeTarget } from "../views/code_view/blame_options.js";
+import { referenceMenuItems } from "./file_references.js";
 
 class ContextMenu {
   constructor() {
@@ -72,12 +75,24 @@ class ContextMenu {
         ${item.shortcut ? `<span class="context-menu-shortcut">${this.escapeHtml(item.shortcut)}</span>` : ""}
       `;
 
+      if (item.title) row.title = item.title;
       if (!item.disabled) {
         row.addEventListener("click", (e) => {
           e.stopPropagation();
           this.hide();
-          if (item.onClick) item.onClick();
+          // Ctrl/Cmd+click on an item that can open a new tab does so (§5.9)
+          if ((e.ctrlKey || e.metaKey) && item.onMiddleClick) item.onMiddleClick();
+          else if (item.onClick) item.onClick();
         });
+        if (item.onMiddleClick) {
+          row.addEventListener("auxclick", (e) => {
+            if (e.button !== 1) return;
+            e.preventDefault();
+            e.stopPropagation();
+            this.hide();
+            item.onMiddleClick();
+          });
+        }
       }
       this.menuEl.appendChild(row);
     });
@@ -104,6 +119,18 @@ class ContextMenu {
   /**
    * Determine whether a token represents a Kconfig symbol.
    */
+  /** Cross-references of a token in the modal (menu item and Shift+F12). */
+  async findReferences(tokenData) {
+    if (!tokenData?.name) return;
+    const v = tokenData.version || state.currentVersion;
+    try {
+      const xref = await api.getSymbolXref(v, tokenData.name, 250);
+      this.showXrefModal(tokenData.name, xref, v);
+    } catch (err) {
+      toast.error(`XRef lookup failed: ${err.message}`);
+    }
+  }
+
   isKconfigToken(token, filePath = "", ftype = null) {
     if (!token && !filePath) return false;
     const typeId = token?.type_id ?? token?.typeId ?? 0;
@@ -321,7 +348,7 @@ class ContextMenu {
       items.push({
         label: "Go to Definition",
         icon: "🎯",
-        shortcut: "F12",
+        shortcut: shortcuts.label("code.goToDefinition"),
         onClick: async () => {
           try {
             if (await openDefinition(v, tokenName, { fromFile: tokenData.filePath })) {
@@ -337,7 +364,7 @@ class ContextMenu {
       items.push({
         label: "Find References / XRef",
         icon: "🔗",
-        shortcut: "Shift+F12",
+        shortcut: shortcuts.label("code.findReferences"),
         onClick: async () => {
           try {
             const xref = await api.getSymbolXref(v, tokenName, 250);
@@ -347,6 +374,65 @@ class ContextMenu {
           }
         }
       });
+      if (/^[A-Za-z_]\w*$/.test(tokenName || "")) {
+        items.push({
+          label: /(_operations|_ops)$/.test(tokenName) ? `Ops implementations of struct ${tokenName}` : "Ops implementations / tables using this",
+          icon: "🧩",
+          onClick: async () => {
+            const { showOpsModal } = await import("../views/code_view/ops_modal.js");
+            showOpsModal({ version: v, name: tokenName, filePath: tokenData.filePath, line: tokenData.line });
+          }
+        });
+      }
+      // Bookmarks and tours (G05)
+      if (tokenData.filePath && tokenData.line) {
+        const bookmark = async (target, label) => {
+          const { toggleBookmark } = await import("../views/bookmarks/bookmark_store.js");
+          try {
+            const r = await toggleBookmark(target, { label });
+            toast.success(r.added ? `Bookmarked ${label}` : `Bookmark ${label} removed`);
+          } catch (err) {
+            toast.error(err.message);
+          }
+        };
+        const lineTarget = async () => {
+          const { viewOf } = await import("../utils/active_views.js");
+          return viewOf(state.getActiveTab()?.id)?.lineTarget?.(tokenData.line)
+            || { type: "line", path: tokenData.filePath, rev: v, line: tokenData.line };
+        };
+        items.push({
+          label: "Bookmark this line",
+          icon: "🔖",
+          shortcut: shortcuts.label("code.bookmark"),
+          onClick: async () => bookmark(await lineTarget(), `${tokenData.filePath.split("/").pop()}:${tokenData.line}`),
+        });
+        if (/^[A-Za-z_]\w*$/.test(tokenName || "")) {
+          items.push({
+            label: `Bookmark symbol ${tokenName}`,
+            icon: "🔖",
+            onClick: () => bookmark({ type: "symbol", name: tokenName, rev: v }, `${tokenName}()`),
+          });
+        }
+        const watch = async (target) => {
+          const { toggleWatch } = await import("../views/watch/watch_runtime.js");
+          try {
+            const r = await toggleWatch(target);
+            toast.success(r.added ? `Watching ${r.label}` : `Stopped watching ${r.label}`);
+          } catch (err) {
+            toast.error(err.message);
+          }
+        };
+        items.push({ label: "Watch this file", icon: "🔔", onClick: () => watch({ type: "file", path: tokenData.filePath }) });
+        if (/^[A-Za-z_]\w*$/.test(tokenName || "")) items.push({ label: `Watch symbol ${tokenName}`, icon: "🔔", onClick: () => watch({ type: "symbol", name: tokenName }) });
+        items.push({
+          label: "Add this line to a tour…",
+          icon: "🧭",
+          onClick: async () => {
+            const { addToTourDialog } = await import("../views/bookmarks/tour_dialog.js");
+            addToTourDialog(await lineTarget());
+          },
+        });
+      }
     }
 
     items.push({ separator: true });
@@ -468,7 +554,7 @@ class ContextMenu {
         items.push({
           label: "Go to Definition",
           icon: "🎯",
-          shortcut: "F12",
+          shortcut: shortcuts.label("code.goToDefinition"),
           onClick: async () => {
             try {
               if (await openDefinition(v, token.name, { fromFile: filePath })) {
@@ -484,7 +570,7 @@ class ContextMenu {
         items.push({
           label: "Find References / XRef",
           icon: "🔗",
-          shortcut: "Shift+F12",
+          shortcut: shortcuts.label("code.findReferences"),
           onClick: async () => {
             try {
               const xref = await api.getSymbolXref(v, token.name, 250);
@@ -620,6 +706,15 @@ class ContextMenu {
         onClick: () => showSymbolHistoryModal(v, filePath, line)
       });
     }
+    // Full-text search of the revision (§5.34) for the selection, else the token
+    const searchText = (selection && !selection.includes("\n") ? selection : token?.name || "").trim().slice(0, 256);
+    if (searchText) {
+      items.push({
+        label: `Search “${searchText.length > 32 ? `${searchText.slice(0, 32)}…` : searchText}” in tree`,
+        icon: "🔎",
+        onClick: () => state.openTab({ type: "search", title: `Search: ${searchText.slice(0, 24)}`, query: searchText, regex: false, word: Boolean(token && !selection), version: v })
+      });
+    }
     items.push({
       label: "Create Patch from This File…",
       icon: "✎",
@@ -630,10 +725,25 @@ class ContextMenu {
       icon: "🕒",
       onClick: () => this.showCommitDetailModal(blame, filePath, line, v)
     });
+    // H9: re-blame the line at the parent of the commit that last touched it (§5.21)
+    if (blame) {
+      const before = blameBeforeTarget(blame, filePath);
+      items.push(before ? {
+        label: `Blame Before This Change (${before.path === filePath ? "" : `${before.path}, `}≈ line ${before.line})`,
+        icon: "⏮",
+        title: `Open ${before.path} at ${before.version.slice(0, 12)}, the parent of ${String(blame.commit_hash || "").slice(0, 12)}, with blame on (middle-click: new tab)`,
+        onClick: () => openBlameBefore(before, false),
+        onMiddleClick: () => openBlameBefore(before, true),
+      } : { label: "Blame Before This Change (root commit)", icon: "⏮", disabled: true });
+    }
 
     items.push({ separator: true });
 
     // 4. Clipboard Actions
+    // Links to the selected lines: permalink pinned to the commit, moving link, Markdown, external (G06)
+    if (context.linkItems?.length) {
+      items.push(...context.linkItems);
+    }
     if (filePath && line) {
       items.push({
         label: `Copy Path (${fileName}:${line})`,
@@ -672,6 +782,28 @@ class ContextMenu {
       header: { title: headerTitle, sub: headerSub },
       items
     });
+  }
+
+  /**
+   * "Referenced by" of a file (GET /api/fs/references, §4.2): grouped entries, each opening the file at
+   * its line (middle-click or Ctrl+click: a new tab). Resolves with the response (null on error).
+   */
+  async showFileReferencesMenu(x, y, version, path) {
+    let res;
+    try {
+      res = await api.getFileReferences(version, path);
+    } catch (err) {
+      toast.error(`References of ${path}: ${err.message}`);
+      return null;
+    }
+    const open = (p, line, forceNew) => state.openTab({
+      type: "code", title: p.split("/").pop(), path: p, version, cursorLine: line, forceNew,
+    });
+    this.renderMenu(x, y, {
+      header: { title: `⇇ Referenced by`, sub: `${path} @ ${shortRef(version)}` },
+      items: referenceMenuItems(res, open),
+    });
+    return res;
   }
 
   /**
@@ -746,6 +878,12 @@ class ContextMenu {
         label: "View File Git History",
         icon: "🕒",
         onClick: () => showFileHistoryModal(v, path)
+      });
+      items.push({
+        label: "Referenced by…",
+        icon: "⇇",
+        title: "Files including this one, Kconfig sources, Kbuild rules and documents naming it",
+        onClick: () => this.showFileReferencesMenu(x, y, v, path)
       });
     }
 
@@ -1364,6 +1502,16 @@ class ContextMenu {
 
     row.appendChild(chevron);
     row.appendChild(label);
+
+    if (Array.isArray(node.attributes) && node.attributes.length > 0) {
+      const attrSpan = document.createElement("span");
+      attrSpan.style.color = "var(--text-muted)";
+      attrSpan.style.fontSize = "11px";
+      attrSpan.style.marginLeft = "6px";
+      attrSpan.textContent = "{" + node.attributes.map(a => `${a.name}: ${a.val}`).join(", ") + "}";
+      row.appendChild(attrSpan);
+    }
+
     container.appendChild(row);
 
     if (hasChildren) {
@@ -1398,3 +1546,16 @@ class ContextMenu {
 }
 
 export const contextMenu = new ContextMenu();
+
+/** Open the file as it was before a blamed change, with blame on (H9, §5.21). */
+function openBlameBefore(target, forceNew) {
+  state.openTab({
+    type: "code",
+    title: target.path.split("/").pop(),
+    path: target.path,
+    version: target.version,
+    cursorLine: target.line,
+    blame: true,
+    forceNew,
+  });
+}

@@ -8,6 +8,19 @@ Two consumers share the lexer/parser:
 
 ---
 
+## Table of Contents
+- **§1**: High-Level Architecture & Pipeline Flow [L23-L46]
+- **§2**: Relational Mapping [L47-L66]
+- **§3**: AST Node Classification & Grammar [L67-L96]
+- **§4**: Tag Lifecycle & Content Addressable Deduplication [L97-L104]
+- **§5**: Cross-File Reference Handling [L105-L111]
+- **§6**: Dedicated Kbuild Subsystem Section (`kbuild_parser.py`) [L112-L172]
+- **§7**: Performance Invariants & Architectural Rules [L173-L180]
+- **§8**: Semantic Model & Evaluator (`kconfig_model.py`, `kconfig_eval.py`) [L181-L264]
+- **§9**: Per-Blob Definition Facts (`kconfig_definitions.py` & `m_blob_facts` Family 4) [L265-L280]
+
+---
+
 ## 1. High-Level Architecture & Pipeline Flow
 
 The database stores where each Kconfig entry is and what its text is, for every version; what the entries *mean* (menus, dependencies inherited across `source`, defaults, values for an ARCH and toolchain) is computed by the semantic model from Git when the webapp needs it.
@@ -26,7 +39,7 @@ Kconfig Source File (`Kconfig` and `Kconfig.*` fragments such as lib/Kconfig.deb
            m_map_ast keyed by the tag, m_moved_tag on transitions); `source "<literal path>"` also m_file_name + m_ast_include
   │
   ▼ [Post-Processing: processing_kbuild(version) (main.py + kbuild_parser.py), Step 6.6]
-Kbuild references: new Makefile/Kbuild (path, blob) pairs ──► m_file_reference (ref_type 3 = Kbuild)
+Kbuild rules & references: new Makefile/Kbuild (path, blob) pairs ──► m_kbuild_symbol (Table 61) & m_file_reference (ref_type 3 = Kbuild)
 ==================================================================================================
 ```
 
@@ -103,7 +116,7 @@ The Kbuild parser maps Kconfig configuration symbols to concrete C, ASM, and obj
 
 ### 6.1. Architecture & Execution
 - **Location**: [parser/kbuild_parser.py](parser/kbuild_parser.py)
-- **Database**: `main.py:processing_kbuild(version)` (Step 6.6) parses the Makefile/Kbuild files whose (path, blob) pair is new in the version and stages one `m_file_reference` row (ref_type 3 = Kbuild) per built file (`source_blob_id`, `source_fnid` = the Makefile's blob and path). Targets resolve against the Makefile's directory, so identical Makefiles in two directories have rows of their own, and a Makefile carried over at the same path keeps its rows.
+- **Database**: `main.py:processing_kbuild(version)` (Step 6.6) parses the Makefile/Kbuild files whose (path, blob) pair is new in the version and stages their rules and governing symbols into Table 61 `m_kbuild_symbol` (`(source_blob_id, source_fnid, idx, symbol, via, line_no, compile_mode, kind, target_obj, target_path, target_fnid, rule)`) and `m_file_reference` (ref_type 3 = Kbuild) per built file (`source_blob_id`, `source_fnid` = the Makefile's blob and path). Targets resolve against the Makefile's directory, so identical Makefiles in two directories have rows of their own, and a Makefile carried over at the same path keeps its rows.
 - **Webapp**: `KconfigService.kbuild_usage()` greps the revision for `CONFIG_<name>` in Makefiles and parses the matches with `KbuildParser` (rules, lines, kind, `via` rule/condition, `other_arch`); `compiled_files` is the existing files among them.
 - **Workflow**: joins backslash continuations, evaluates `OBJ_ASSIGN_RE` (`obj-$(CONFIG_XYZ) += target.o`, `obj-y`, `obj-m`) and `COMPOSITE_RE` (`target-y := a.o b.o`, `target-objs := ...`), resolves `.o` goals to `.c`/`.S` sources.
 
@@ -248,3 +261,18 @@ model = KconfigModelBuilder(read_file, KconfigEnv("x86_64", "x86", "6.8.0", extr
 - **`ToolchainProfile`**: `cc` (gcc|clang), `cc_version`, `ld` (bfd|lld), `ld_version`, `assembler` (gnu|llvm), `binutils_version`, `cross_compile`, `llvm_utils`, `pahole_version` (`"none"` = not installed), `rustc_version`, `gcc_plugins`, `host_release` (`uname -r`), `env` (overrides of any environment variable) and `probes` (overrides of probe answers). Missing versions default to a toolchain contemporary with the kernel release.
   `from_dict()` validates a caller-supplied mapping: unknown keys are ignored, each value is coerced to its field's type (booleans also accept `1`/`0` and `"yes"`/`"no"`, `pahole_version: null` means the era default and `""` means not installed), and `env`/`probes` must be objects of at most 128 string entries with values of at most 512 characters. A wrong shape raises `ValueError`, which the webapp reports as `HTTP 400` (`webapp/API.md` §4.5) instead of letting it fail inside the model build. The bounds matter because the profile is part of the model cache key.
 - **`ToolchainShell`** interprets the shell subset Kconfig uses (`{ }`, `&&`, `||`, `;`, pipes, redirections, `test`, `echo`, `printf`, `set --`, `grep`, `head`, `sed`, `cut`, `command -v`, `env`, `uname`) and classifies external commands into probes keyed for overrides: `cc-option:<flags>`, `ld-option:<flags>`, `as-instr:<instruction>`, `cc-snippet:<code>`, `script:<name> [args]`, `file:<path>`, `cc-print:<file>`, `cmd:<command>`. Version scripts (`cc-version.sh`, `gcc-version.sh`, `clang-version.sh`, `ld-version.sh`, `lld-version.sh`, `as-version.sh`, `pahole-version.sh`, `rustc-version.sh`) print the format of the revision's own script and honour `scripts/min-tool-version.sh`. `probes` maps each key to `{key, kind, label, command, result, source: toolchain|knowledge|assumed|override, note, locations}`.
+
+---
+
+## 9. Per-Blob Definition Facts (`kconfig_definitions.py` & `m_blob_facts` Family 4)
+
+`parser/kconfig_ast/kconfig_definitions.py` extracts per-symbol definition facts directly from individual Kconfig blobs without requiring full semantic model builds:
+- **Extraction**: Parses each Kconfig blob into definitions indexed by symbol name (`extract(text) -> dict[str, Any]`), capturing properties and inherited dependencies from enclosing `if`, `menu`, and `choice` blocks.
+- **Fields Captured**:
+  - Scalar properties: `kind` (`config` vs `menuconfig`), `type` (`bool`, `tristate`, `string`, `hex`, `int`), `prompt`, `choice`, `transitional`, and `help`.
+  - Expression lists: `defaults`, `depends_on`, `inherited_depends`, `selects`, `implies`, `ranges`, and `options`.
+  - Coordinates & raw tokens: `line_s`, `line_e`, `prompt_text`, `first_default`.
+- **Blob Fact Storage (`m_blob_facts`)**:
+  - Ingested at Step 6.9 (`parser/facts_ingest.py`) and backfilled via `python3 main.py --backfill-facts --families 4`.
+  - Stored in Table 48 `m_blob_facts` under `family = 4` (`kconfig_definitions.FAMILY`), encoded as zlib-compressed JSON (`kconfig_definitions.FORMAT`).
+- **Consumers**: Webapp Kconfig symbol history and Compare view diffs (`webapp/backend/services/kconfig_facts.py`), enabling fast revision comparison without re-evaluating whole architecture trees.

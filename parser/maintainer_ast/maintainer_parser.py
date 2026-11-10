@@ -241,6 +241,9 @@ class MaintainerParser:
         web_page = ""
         mailing_list = ""
         patchwork = ""
+        bug_url = ""
+        chat_channel = ""
+        profile_doc = ""
         members: list[MaintainerPerson] = []
         patterns: list[PatternRule] = []
 
@@ -254,8 +257,18 @@ class MaintainerParser:
                 parsed_persons = parse_person_string(tag_val, role=MaintainerRole.REVIEWER)
                 members.extend(parsed_persons)
             elif tag_char == "P":
-                parsed_persons = parse_person_string(tag_val, role=MaintainerRole.PERSON)
-                members.extend(parsed_persons)
+                # In modern kernels, P: is Subsystem Profile document (P: Documentation/...), not Person
+                if tag_val.startswith("Documentation") or ("@" not in tag_val and "<" not in tag_val):
+                    if not profile_doc:
+                        profile_doc = tag_val
+                    else:
+                        profile_doc += f", {tag_val}"
+                else:
+                    parsed_persons = parse_person_string(tag_val, role=MaintainerRole.PERSON)
+                    members.extend(parsed_persons)
+            elif tag_char == "D":
+                patterns.append(PatternRule(pat_type=PatternType.FILE, pattern=tag_val, priority=pattern_priority))
+                pattern_priority += 1
             elif tag_char == "L":
                 # Clean mailing list comments like "(subscribers-only)" or "(open list)"
                 ml = tag_val
@@ -290,11 +303,21 @@ class MaintainerParser:
                     scm_tree = tag_val
                 else:
                     scm_tree += f", {tag_val}"
-            elif tag_char == "Q" or tag_char == "B" or tag_char == "C":
+            elif tag_char == "Q":
                 if not patchwork:
                     patchwork = tag_val
                 else:
                     patchwork += f", {tag_val}"
+            elif tag_char == "B":
+                if not bug_url:
+                    bug_url = tag_val
+                else:
+                    bug_url += f", {tag_val}"
+            elif tag_char == "C":
+                if not chat_channel:
+                    chat_channel = tag_val
+                else:
+                    chat_channel += f", {tag_val}"
             elif tag_char == "F":
                 patterns.append(PatternRule(pat_type=PatternType.FILE, pattern=tag_val, priority=pattern_priority))
                 pattern_priority += 1
@@ -320,6 +343,9 @@ class MaintainerParser:
             web_page=web_page,
             mailing_list=mailing_list,
             patchwork=patchwork,
+            bug_url=bug_url,
+            chat_channel=chat_channel,
+            profile_doc=profile_doc,
             members=members,
             patterns=patterns,
             line_s=line_s,

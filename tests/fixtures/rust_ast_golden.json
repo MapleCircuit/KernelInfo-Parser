@@ -1,0 +1,1436 @@
+{
+ "rustc": "rustc 1.93.1 (01f6ddf75 2026-02-11) (built from a source tarball)",
+ "nodes": [
+  {
+   "type": "Rust_Comment",
+   "name": "// SPDX-License-Identifier: GPL-2.0",
+   "lines": [
+    1,
+    1
+   ],
+   "cols": [
+    1,
+    36
+   ]
+  },
+  {
+   "type": "Rust_DocComment",
+   "name": "Crate documentation,\ntwo lines.",
+   "lines": [
+    3,
+    4
+   ],
+   "cols": [
+    1,
+    15
+   ]
+  },
+  {
+   "type": "Rust_Attribute",
+   "name": "#![allow(dead_code)]",
+   "lines": [
+    5,
+    5
+   ],
+   "cols": [
+    1,
+    21
+   ]
+  },
+  {
+   "type": "Rust_Comment",
+   "name": "/* Block comment /* nested */ still the comment */",
+   "lines": [
+    7,
+    7
+   ],
+   "cols": [
+    1,
+    51
+   ]
+  },
+  {
+   "type": "Rust_DocComment",
+   "name": "Struct doc\nsecond line",
+   "lines": [
+    9,
+    10
+   ],
+   "cols": [
+    1,
+    16
+   ]
+  },
+  {
+   "type": "Rust_Attribute",
+   "name": "#[derive(Debug)]",
+   "lines": [
+    11,
+    11
+   ],
+   "cols": [
+    1,
+    17
+   ]
+  },
+  {
+   "type": "Rust_Struct",
+   "name": "Foo",
+   "lines": [
+    12,
+    12
+   ],
+   "cols": [
+    1,
+    104
+   ],
+   "def": [
+    "Foo",
+    0
+   ],
+   "children": [
+    {
+     "type": "Rust_Signature",
+     "name": "pub(crate) struct Foo<'a, T: Clone> where T: Copy",
+     "lines": [
+      1,
+      1
+     ],
+     "cols": [
+      1,
+      1
+     ]
+    },
+    {
+     "type": "Rust_Field",
+     "name": "pub a: &'a mut T",
+     "lines": [
+      12,
+      12
+     ],
+     "cols": [
+      53,
+      69
+     ],
+     "def": [
+      "a",
+      0
+     ]
+    },
+    {
+     "type": "Rust_Field",
+     "name": "b: [u8; 4]",
+     "lines": [
+      12,
+      12
+     ],
+     "cols": [
+      71,
+      81
+     ],
+     "def": [
+      "b",
+      0
+     ]
+    },
+    {
+     "type": "Rust_Field",
+     "name": "c: Vec<Option<u32>>",
+     "lines": [
+      12,
+      12
+     ],
+     "cols": [
+      83,
+      102
+     ],
+     "def": [
+      "c",
+      0
+     ]
+    }
+   ]
+  },
+  {
+   "type": "Rust_Struct",
+   "name": "Tup",
+   "lines": [
+    14,
+    14
+   ],
+   "cols": [
+    1,
+    36
+   ],
+   "def": [
+    "Tup",
+    0
+   ],
+   "children": [
+    {
+     "type": "Rust_Signature",
+     "name": "pub struct Tup",
+     "lines": [
+      1,
+      1
+     ],
+     "cols": [
+      1,
+      1
+     ]
+    },
+    {
+     "type": "Rust_Field",
+     "name": "pub 0: u32",
+     "lines": [
+      14,
+      14
+     ],
+     "cols": [
+      16,
+      23
+     ]
+    },
+    {
+     "type": "Rust_Field",
+     "name": "1: *const u8",
+     "lines": [
+      14,
+      14
+     ],
+     "cols": [
+      25,
+      34
+     ]
+    }
+   ]
+  },
+  {
+   "type": "Rust_Struct",
+   "name": "Unit",
+   "lines": [
+    15,
+    15
+   ],
+   "cols": [
+    1,
+    17
+   ],
+   "def": [
+    "Unit",
+    0
+   ],
+   "children": [
+    {
+     "type": "Rust_Signature",
+     "name": "pub struct Unit",
+     "lines": [
+      1,
+      1
+     ],
+     "cols": [
+      1,
+      1
+     ]
+    }
+   ]
+  },
+  {
+   "type": "Rust_Enum",
+   "name": "E",
+   "lines": [
+    17,
+    17
+   ],
+   "cols": [
+    1,
+    43
+   ],
+   "def": [
+    "E",
+    0
+   ],
+   "children": [
+    {
+     "type": "Rust_Signature",
+     "name": "pub enum E",
+     "lines": [
+      1,
+      1
+     ],
+     "cols": [
+      1,
+      1
+     ]
+    },
+    {
+     "type": "Rust_Variant",
+     "name": "A",
+     "lines": [
+      17,
+      17
+     ],
+     "cols": [
+      14,
+      15
+     ],
+     "def": [
+      "A",
+      0
+     ]
+    },
+    {
+     "type": "Rust_Variant",
+     "name": "B",
+     "lines": [
+      17,
+      17
+     ],
+     "cols": [
+      17,
+      23
+     ],
+     "def": [
+      "B",
+      0
+     ],
+     "children": [
+      {
+       "type": "Rust_Field",
+       "name": "0: u64",
+       "lines": [
+        17,
+        17
+       ],
+       "cols": [
+        19,
+        22
+       ]
+      }
+     ]
+    },
+    {
+     "type": "Rust_Variant",
+     "name": "C = 5",
+     "lines": [
+      17,
+      17
+     ],
+     "cols": [
+      25,
+      41
+     ],
+     "def": [
+      "C",
+      0
+     ],
+     "children": [
+      {
+       "type": "Rust_Field",
+       "name": "x: i32",
+       "lines": [
+        17,
+        17
+       ],
+       "cols": [
+        29,
+        35
+       ],
+       "def": [
+        "x",
+        0
+       ]
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "type": "Rust_Comment",
+   "name": "/* cafÃ© */",
+   "lines": [
+    19,
+    19
+   ],
+   "cols": [
+    1,
+    12
+   ]
+  },
+  {
+   "type": "Rust_Fn",
+   "name": "after_utf8",
+   "lines": [
+    19,
+    19
+   ],
+   "cols": [
+    13,
+    35
+   ],
+   "def": [
+    "after_utf8",
+    0
+   ],
+   "children": [
+    {
+     "type": "Rust_Signature",
+     "name": "pub fn after_utf8()",
+     "lines": [
+      1,
+      1
+     ],
+     "cols": [
+      1,
+      1
+     ]
+    }
+   ]
+  },
+  {
+   "type": "Rust_Attribute",
+   "name": "#[no_mangle]",
+   "lines": [
+    21,
+    21
+   ],
+   "cols": [
+    1,
+    13
+   ]
+  },
+  {
+   "type": "Rust_Fn",
+   "name": "ffi",
+   "lines": [
+    22,
+    22
+   ],
+   "cols": [
+    1,
+    55
+   ],
+   "def": [
+    "ffi",
+    0
+   ],
+   "children": [
+    {
+     "type": "Rust_Signature",
+     "name": "pub unsafe extern \"C\" fn ffi(x: i32, ...) -> i32",
+     "lines": [
+      1,
+      1
+     ],
+     "cols": [
+      1,
+      1
+     ]
+    },
+    {
+     "type": "Rust_Param",
+     "name": "x: i32",
+     "lines": [
+      22,
+      22
+     ],
+     "cols": [
+      30,
+      36
+     ]
+    },
+    {
+     "type": "Rust_Param",
+     "name": "...",
+     "lines": [
+      22,
+      22
+     ],
+     "cols": [
+      38,
+      41
+     ]
+    }
+   ]
+  },
+  {
+   "type": "Rust_Fn",
+   "name": "cf",
+   "lines": [
+    24,
+    24
+   ],
+   "cols": [
+    1,
+    128
+   ],
+   "def": [
+    "cf",
+    0
+   ],
+   "children": [
+    {
+     "type": "Rust_Signature",
+     "name": "pub(super) const fn cf<T>(&self, mut y: impl Fn(u8) -> u8, (a, b): (u8, u8), r#type: u8) -> Result<(), Error> where T: Send",
+     "lines": [
+      1,
+      1
+     ],
+     "cols": [
+      1,
+      1
+     ]
+    },
+    {
+     "type": "Rust_Param",
+     "name": "&self",
+     "lines": [
+      24,
+      24
+     ],
+     "cols": [
+      27,
+      32
+     ]
+    },
+    {
+     "type": "Rust_Param",
+     "name": "mut y: impl Fn(u8) -> u8",
+     "lines": [
+      24,
+      24
+     ],
+     "cols": [
+      34,
+      58
+     ]
+    },
+    {
+     "type": "Rust_Param",
+     "name": "(a, b): (u8, u8)",
+     "lines": [
+      24,
+      24
+     ],
+     "cols": [
+      60,
+      76
+     ]
+    },
+    {
+     "type": "Rust_Param",
+     "name": "r#type: u8",
+     "lines": [
+      24,
+      24
+     ],
+     "cols": [
+      78,
+      88
+     ]
+    }
+   ]
+  },
+  {
+   "type": "Rust_Fn",
+   "name": "later",
+   "lines": [
+    26,
+    26
+   ],
+   "cols": [
+    1,
+    24
+   ],
+   "def": [
+    "later",
+    0
+   ],
+   "children": [
+    {
+     "type": "Rust_Signature",
+     "name": "pub async fn later()",
+     "lines": [
+      1,
+      1
+     ],
+     "cols": [
+      1,
+      1
+     ]
+    }
+   ]
+  },
+  {
+   "type": "Rust_Impl",
+   "name": "impl<T> Drop for Foo<'_, T>",
+   "lines": [
+    28,
+    28
+   ],
+   "cols": [
+    1,
+    54
+   ],
+   "def": [
+    "impl<T> Drop for Foo<'_, T>",
+    0
+   ],
+   "children": [
+    {
+     "type": "Rust_Fn",
+     "name": "drop",
+     "lines": [
+      28,
+      28
+     ],
+     "cols": [
+      31,
+      52
+     ],
+     "def": [
+      "drop",
+      0
+     ],
+     "children": [
+      {
+       "type": "Rust_Signature",
+       "name": "fn drop(&mut self)",
+       "lines": [
+        1,
+        1
+       ],
+       "cols": [
+        1,
+        1
+       ]
+      },
+      {
+       "type": "Rust_Param",
+       "name": "&mut self",
+       "lines": [
+        28,
+        28
+       ],
+       "cols": [
+        39,
+        48
+       ]
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "type": "Rust_Impl",
+   "name": "unsafe impl Send for Unit",
+   "lines": [
+    30,
+    30
+   ],
+   "cols": [
+    1,
+    29
+   ],
+   "def": [
+    "unsafe impl Send for Unit",
+    0
+   ]
+  },
+  {
+   "type": "Rust_Impl",
+   "name": "impl !Sync for Tup",
+   "lines": [
+    31,
+    31
+   ],
+   "cols": [
+    1,
+    22
+   ],
+   "def": [
+    "impl !Sync for Tup",
+    0
+   ]
+  },
+  {
+   "type": "Rust_Impl",
+   "name": "impl Foo<'static, u8>",
+   "lines": [
+    33,
+    38
+   ],
+   "cols": [
+    1,
+    2
+   ],
+   "def": [
+    "impl Foo<'static, u8>",
+    0
+   ],
+   "children": [
+    {
+     "type": "Rust_Fn",
+     "name": "new",
+     "lines": [
+      36,
+      36
+     ],
+     "cols": [
+      5,
+      37
+     ],
+     "def": [
+      "new",
+      0
+     ],
+     "children": [
+      {
+       "type": "Rust_Signature",
+       "name": "pub fn new() -> Self",
+       "lines": [
+        1,
+        1
+       ],
+       "cols": [
+        1,
+        1
+       ]
+      },
+      {
+       "type": "Rust_Attribute",
+       "name": "#[cfg(CONFIG_X86)]",
+       "lines": [
+        35,
+        35
+       ],
+       "cols": [
+        5,
+        23
+       ]
+      }
+     ]
+    },
+    {
+     "type": "Rust_Fn",
+     "name": "private",
+     "lines": [
+      37,
+      37
+     ],
+     "cols": [
+      5,
+      25
+     ],
+     "def": [
+      "private",
+      1
+     ],
+     "children": [
+      {
+       "type": "Rust_Signature",
+       "name": "fn private(&self)",
+       "lines": [
+        1,
+        1
+       ],
+       "cols": [
+        1,
+        1
+       ]
+      },
+      {
+       "type": "Rust_Param",
+       "name": "&self",
+       "lines": [
+        37,
+        37
+       ],
+       "cols": [
+        16,
+        21
+       ]
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "type": "Rust_Trait",
+   "name": "Tr",
+   "lines": [
+    40,
+    40
+   ],
+   "cols": [
+    1,
+    71
+   ],
+   "def": [
+    "Tr",
+    0
+   ],
+   "children": [
+    {
+     "type": "Rust_Signature",
+     "name": "pub trait Tr: Send + Sync",
+     "lines": [
+      1,
+      1
+     ],
+     "cols": [
+      1,
+      1
+     ]
+    },
+    {
+     "type": "Rust_Type",
+     "name": "type A",
+     "lines": [
+      40,
+      40
+     ],
+     "cols": [
+      29,
+      36
+     ],
+     "def": [
+      "A",
+      0
+     ]
+    },
+    {
+     "type": "Rust_Const",
+     "name": "const N: usize",
+     "lines": [
+      40,
+      40
+     ],
+     "cols": [
+      37,
+      56
+     ],
+     "def": [
+      "N",
+      0
+     ]
+    },
+    {
+     "type": "Rust_Fn",
+     "name": "m",
+     "lines": [
+      40,
+      40
+     ],
+     "cols": [
+      57,
+      69
+     ],
+     "def": [
+      "m",
+      2
+     ],
+     "children": [
+      {
+       "type": "Rust_Signature",
+       "name": "fn m(&self)",
+       "lines": [
+        1,
+        1
+       ],
+       "cols": [
+        1,
+        1
+       ]
+      },
+      {
+       "type": "Rust_Param",
+       "name": "&self",
+       "lines": [
+        40,
+        40
+       ],
+       "cols": [
+        62,
+        67
+       ]
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "type": "Rust_Mod",
+   "name": "inner",
+   "lines": [
+    42,
+    45
+   ],
+   "cols": [
+    1,
+    2
+   ],
+   "def": [
+    "inner",
+    0
+   ],
+   "children": [
+    {
+     "type": "Rust_Fn",
+     "name": "f",
+     "lines": [
+      43,
+      43
+     ],
+     "cols": [
+      5,
+      18
+     ],
+     "def": [
+      "f",
+      0
+     ],
+     "children": [
+      {
+       "type": "Rust_Signature",
+       "name": "pub fn f()",
+       "lines": [
+        1,
+        1
+       ],
+       "cols": [
+        1,
+        1
+       ]
+      }
+     ]
+    },
+    {
+     "type": "Rust_Mod",
+     "name": "deep",
+     "lines": [
+      44,
+      44
+     ],
+     "cols": [
+      5,
+      14
+     ],
+     "def": [
+      "deep",
+      1
+     ],
+     "include": "sample/inner/deep.rs"
+    }
+   ]
+  },
+  {
+   "type": "Rust_Mod",
+   "name": "sub",
+   "lines": [
+    46,
+    46
+   ],
+   "cols": [
+    1,
+    9
+   ],
+   "def": [
+    "sub",
+    1
+   ],
+   "include": "sample/sub.rs"
+  },
+  {
+   "type": "Rust_Attribute",
+   "name": "#[path = \"sample/sub/other.rs\"]",
+   "lines": [
+    47,
+    47
+   ],
+   "cols": [
+    1,
+    32
+   ]
+  },
+  {
+   "type": "Rust_Mod",
+   "name": "renamed",
+   "lines": [
+    48,
+    48
+   ],
+   "cols": [
+    1,
+    13
+   ],
+   "def": [
+    "renamed",
+    1
+   ],
+   "include": "sample/sub/other.rs"
+  },
+  {
+   "type": "Rust_Mod",
+   "name": "missing",
+   "lines": [
+    49,
+    49
+   ],
+   "cols": [
+    1,
+    13
+   ],
+   "def": [
+    "missing",
+    1
+   ]
+  },
+  {
+   "type": "Rust_Use",
+   "name": "use kernel::{prelude::*, sync::Arc as A}",
+   "lines": [
+    51,
+    51
+   ],
+   "cols": [
+    1,
+    42
+   ]
+  },
+  {
+   "type": "Rust_Use",
+   "name": "use core::mem",
+   "lines": [
+    52,
+    52
+   ],
+   "cols": [
+    1,
+    19
+   ]
+  },
+  {
+   "type": "Rust_Use",
+   "name": "extern crate alloc",
+   "lines": [
+    53,
+    53
+   ],
+   "cols": [
+    1,
+    20
+   ]
+  },
+  {
+   "type": "Rust_MacroDef",
+   "name": "macro_rules! mm",
+   "lines": [
+    55,
+    55
+   ],
+   "cols": [
+    1,
+    29
+   ],
+   "def": [
+    "mm",
+    5
+   ]
+  },
+  {
+   "type": "Rust_MacroCall",
+   "name": "module!",
+   "lines": [
+    56,
+    64
+   ],
+   "cols": [
+    1,
+    2
+   ],
+   "children": [
+    {
+     "type": "Rust_ModuleAttr",
+     "name": "type: X",
+     "lines": [
+      57,
+      57
+     ],
+     "cols": [
+      5,
+      12
+     ]
+    },
+    {
+     "type": "Rust_ModuleAttr",
+     "name": "name: \"x\"",
+     "lines": [
+      58,
+      58
+     ],
+     "cols": [
+      5,
+      14
+     ],
+     "def": [
+      "x",
+      5
+     ]
+    },
+    {
+     "type": "Rust_ModuleAttr",
+     "name": "authors: [\"A <a@b.c>\", \"B\"]",
+     "lines": [
+      59,
+      59
+     ],
+     "cols": [
+      5,
+      32
+     ]
+    },
+    {
+     "type": "Rust_ModuleAttr",
+     "name": "license: \"GPL\"",
+     "lines": [
+      60,
+      60
+     ],
+     "cols": [
+      5,
+      19
+     ]
+    },
+    {
+     "type": "Rust_ModuleAttr",
+     "name": "params",
+     "lines": [
+      61,
+      63
+     ],
+     "cols": [
+      5,
+      6
+     ],
+     "children": [
+      {
+       "type": "Rust_ModuleAttr",
+       "name": "p: i64",
+       "lines": [
+        62,
+        62
+       ],
+       "cols": [
+        9,
+        51
+       ],
+       "def": [
+        "p",
+        5
+       ],
+       "children": [
+        {
+         "type": "Rust_ModuleAttr",
+         "name": "default: 1",
+         "lines": [
+          62,
+          62
+         ],
+         "cols": [
+          18,
+          28
+         ]
+        },
+        {
+         "type": "Rust_ModuleAttr",
+         "name": "description: \"a, b\"",
+         "lines": [
+          62,
+          62
+         ],
+         "cols": [
+          30,
+          49
+         ]
+        }
+       ]
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "type": "Rust_ForeignMod",
+   "name": "extern \"C\"",
+   "lines": [
+    66,
+    66
+   ],
+   "cols": [
+    1,
+    56
+   ],
+   "children": [
+    {
+     "type": "Rust_Fn",
+     "name": "ext",
+     "lines": [
+      66,
+      66
+     ],
+     "cols": [
+      14,
+      36
+     ],
+     "def": [
+      "ext",
+      2
+     ],
+     "children": [
+      {
+       "type": "Rust_Signature",
+       "name": "fn ext(x: i32) -> i32",
+       "lines": [
+        1,
+        1
+       ],
+       "cols": [
+        1,
+        1
+       ]
+      },
+      {
+       "type": "Rust_Param",
+       "name": "x: i32",
+       "lines": [
+        66,
+        66
+       ],
+       "cols": [
+        21,
+        27
+       ]
+      }
+     ]
+    },
+    {
+     "type": "Rust_Static",
+     "name": "static EXTV: u32",
+     "lines": [
+      66,
+      66
+     ],
+     "cols": [
+      37,
+      54
+     ],
+     "def": [
+      "EXTV",
+      2
+     ]
+    }
+   ]
+  },
+  {
+   "type": "Rust_Static",
+   "name": "static mut S: u32",
+   "lines": [
+    68,
+    68
+   ],
+   "cols": [
+    1,
+    23
+   ],
+   "def": [
+    "S",
+    1
+   ]
+  },
+  {
+   "type": "Rust_Comment",
+   "name": "// trailing comment",
+   "lines": [
+    68,
+    68
+   ],
+   "cols": [
+    24,
+    43
+   ]
+  },
+  {
+   "type": "Rust_Type",
+   "name": "type R<T> = core::result::Result<T, Error>",
+   "lines": [
+    69,
+    69
+   ],
+   "cols": [
+    1,
+    44
+   ],
+   "def": [
+    "R",
+    1
+   ]
+  },
+  {
+   "type": "Rust_Union",
+   "name": "U",
+   "lines": [
+    70,
+    70
+   ],
+   "cols": [
+    1,
+    27
+   ],
+   "def": [
+    "U",
+    1
+   ],
+   "children": [
+    {
+     "type": "Rust_Signature",
+     "name": "union U",
+     "lines": [
+      1,
+      1
+     ],
+     "cols": [
+      1,
+      1
+     ]
+    },
+    {
+     "type": "Rust_Field",
+     "name": "a: u32",
+     "lines": [
+      70,
+      70
+     ],
+     "cols": [
+      11,
+      17
+     ],
+     "def": [
+      "a",
+      0
+     ]
+    },
+    {
+     "type": "Rust_Field",
+     "name": "b: f32",
+     "lines": [
+      70,
+      70
+     ],
+     "cols": [
+      19,
+      25
+     ],
+     "def": [
+      "b",
+      0
+     ]
+    }
+   ]
+  },
+  {
+   "type": "Rust_Const",
+   "name": "const _: ()",
+   "lines": [
+    71,
+    71
+   ],
+   "cols": [
+    1,
+    18
+   ]
+  },
+  {
+   "type": "Rust_Attribute",
+   "name": "#[export_name = \"c_name\"]",
+   "lines": [
+    73,
+    73
+   ],
+   "cols": [
+    1,
+    26
+   ]
+  },
+  {
+   "type": "Rust_Fn",
+   "name": "exported",
+   "lines": [
+    74,
+    81
+   ],
+   "cols": [
+    1,
+    2
+   ],
+   "def": [
+    "exported",
+    0
+   ],
+   "children": [
+    {
+     "type": "Rust_Signature",
+     "name": "fn exported(p: *mut bindings::page) -> bindings::gfp_t",
+     "lines": [
+      1,
+      1
+     ],
+     "cols": [
+      1,
+      1
+     ]
+    },
+    {
+     "type": "Rust_Param",
+     "name": "p: *mut bindings::page",
+     "lines": [
+      74,
+      74
+     ],
+     "cols": [
+      13,
+      35
+     ]
+    }
+   ]
+  },
+  {
+   "type": "Rust_Attribute",
+   "name": "#[unsafe(no_mangle)]",
+   "lines": [
+    82,
+    82
+   ],
+   "cols": [
+    1,
+    21
+   ]
+  },
+  {
+   "type": "Rust_Static",
+   "name": "static mut CVAR: u32",
+   "lines": [
+    83,
+    83
+   ],
+   "cols": [
+    1,
+    26
+   ],
+   "def": [
+    "CVAR",
+    0
+   ]
+  }
+ ]
+}

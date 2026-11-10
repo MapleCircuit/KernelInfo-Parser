@@ -885,13 +885,14 @@ class TECachedDB(TEDirectDB):
         keys_map = self._committed_nodup_keys.get(table_id)
         if keys_map is not None and key in keys_map:
             return keys_map[key]
-        if table_id in self._nodup_complete or self.db is None:
+        if (table_id in self._nodup_complete and not self.distributed) or self.db is None:
             return None
         table = self.tables[table_id]
         filter_cols = (None, *columns[1:]) + (None,) * (table.length - len(columns))
         row = self._db_read((table_id,), self.db.select, table, filter_cols)
         if not row:
-            self._committed_nodup_keys.setdefault(table_id, {})[key] = None
+            if not self.distributed:
+                self._committed_nodup_keys.setdefault(table_id, {})[key] = None
             return None
         self._committed_nodup_keys.setdefault(table_id, {})[key] = row[0]
         return row[0]
@@ -973,9 +974,10 @@ class TECachedDB(TEDirectDB):
                 assigned_id = columns[0]
                 if isinstance(assigned_id, int) and assigned_id >= self.next_id[table_id]:
                     self.next_id[table_id] = assigned_id + 1
+                    if table_id in self._id_cursor and assigned_id >= self._id_cursor[table_id]:
+                        self._id_cursor[table_id] = assigned_id + 1
             else:
-                assigned_id = self.next_id[table_id]
-                self.next_id[table_id] += 1
+                assigned_id = self._allocate_id(table_id)
             self.queued_set[table_id][key] = assigned_id
             row = (assigned_id, *columns[1:])
             proj_row = self._project_row(table, row)
@@ -989,10 +991,9 @@ class TECachedDB(TEDirectDB):
             return row
 
         if columns[0] is None:
-            assigned_id = self.next_id[table_id]
+            assigned_id = self._allocate_id(table_id)
             row = (assigned_id, *columns[1:])
             self.queued_set[table_id][assigned_id] = row
-            self.next_id[table_id] += 1
             proj_row = self._project_row(table, row)
             pos = len(self._cached_rows[table_id])
             self._cached_rows[table_id].append(proj_row)

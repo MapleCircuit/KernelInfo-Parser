@@ -66,7 +66,7 @@ from core.globalstuff import (
     unfreeze_system_memory,
 )
 from core.quit_listener import GracefulQuitListener
-from core import ingest_state
+from core import ingest_state, distributed
 from core.config import (
     init_config,
     get_config,
@@ -97,6 +97,8 @@ from typing import Any
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 import contextlib
+from unittest import mock
+from pathlib import Path
 import copy
 import io
 import math
@@ -116,9 +118,10 @@ import gc
 import ctypes
 from parser.c_ast import c_ast_parse, Line
 from parser.c_ast.tag_tracker import query_prior_tags
-from parser.maintainer_ast.maintainer_types import clean_identity_text
-from parser.arch_layout import compute_layouts
+from parser.arch_layout import compute_layout_rows, compute_layouts, layout_digest  # noqa: F401 - compute_layouts re-exported
 from parser.make_eval import Tree
+from parser import facts_ingest
+from core import checkpoints
 from core.FileHandler import MasterFile, mark_owner
 from core.GreatProcessor import GreatProcessor
 from core.TableHandling import Table, ChangeSet, is_data_unsafe
@@ -158,6 +161,8 @@ from core.DBLayout import (
     m_commit_file,
     m_commit_parent,
     m_commit_email,
+    m_commit_link,
+    m_commit_relation,
     m_bridge_checkpoint,
     m_git_ref,
     m_bridge_commit_person,
@@ -165,6 +170,7 @@ from core.DBLayout import (
     m_bridge_commit_tag,
     m_moved_tag,
     m_file_reference,
+    m_kbuild_symbol,
     m_db_instance,
     m_project,
     m_git_network,
@@ -205,29 +211,69 @@ def ensure_db_instance(db: Any) -> None:
         logger.warning(f"ensure_db_instance check encountered error: {e}")
 
 
+
+def _query_rows(db: Any, sql: str, params: tuple = ()) -> list[tuple]:
+    if hasattr(db, "query") and callable(db.query):
+        res = db.query(sql, params, dictionary=False)
+        if isinstance(res, list):
+            return res
+    if hasattr(db, "execute") and callable(db.execute):
+        res = db.execute(sql, params)
+        if isinstance(res, list):
+            return res
+    return []
+
+
+def _query_one_row(db: Any, sql: str, params: tuple = ()) -> tuple | None:
+    if hasattr(db, "query_one") and callable(db.query_one):
+        res = db.query_one(sql, params, dictionary=False)
+        if isinstance(res, (tuple, list)):
+            return tuple(res)
+        if res is None:
+            return None
+    if hasattr(db, "execute") and callable(db.execute):
+        res = db.execute(sql, params)
+        if isinstance(res, (tuple, list)):
+            return tuple(res)
+    return None
+
+
+def _execute_sql(db: Any, sql: str, params: tuple = ()) -> None:
+    if hasattr(db, "execute") and callable(db.execute):
+        db.execute(sql, params)
+        if hasattr(db, "commit") and callable(db.commit):
+            db.commit()
+
+
 def _legacy_symbol_tables(db: Any) -> list[str]:
     """Names of symbol views (core.SymbolRows.SYMBOL_VIEW_SQL) that still exist as tables of the per-blob layout."""
-    if not (hasattr(db, "cnx") and db.cnx):
+    if not (hasattr(db, "query") or hasattr(db, "execute") or hasattr(db, "cursor")):
         return []
     names = tuple(SYMBOL_VIEW_SQL)
-    with contextlib.closing(db.cnx.cursor()) as cur:
-        cur.execute(
-            "SELECT table_name FROM information_schema.tables WHERE table_schema = DATABASE() "
-            f"AND table_type = 'BASE TABLE' AND table_name IN ({','.join(['%s'] * len(names))})",
-            names,
-        )
-        return sorted(r[0].decode() if isinstance(r[0], (bytes, bytearray)) else r[0] for r in cur.fetchall())
+    sql = (
+        "SELECT table_name FROM information_schema.tables WHERE table_schema = DATABASE() "
+        f"AND table_type = 'BASE TABLE' AND table_name IN ({','.join(['%s'] * len(names))})"
+    )
+    rows = _query_rows(db, sql, names)
+    return sorted(r[0].decode() if isinstance(r[0], (bytes, bytearray)) else r[0] for r in rows)
+
+
+class _NamedTable:
+    def __init__(self, name: str) -> None:
+        self.table_name = name
+        self.table_id = -1
 
 
 def drop_legacy_symbol_tables(db: Any) -> None:
     """On --reset, drop the per-blob symbol tables of the earlier layout so their names can become views."""
     legacy = _legacy_symbol_tables(db)
     if legacy:
-        with contextlib.closing(db.cnx.cursor()) as cur:
-            cur.execute("SET FOREIGN_KEY_CHECKS = 0;")
-            cur.execute(f"DROP TABLE IF EXISTS {', '.join(f'`{n}`' for n in legacy)};")
-            cur.execute("SET FOREIGN_KEY_CHECKS = 1;")
-        db.cnx.commit()
+        if hasattr(db, "drop_table"):
+            db.drop_table([_NamedTable(n) for n in legacy])
+        else:
+            _execute_sql(db, "SET FOREIGN_KEY_CHECKS = 0;")
+            _execute_sql(db, f"DROP TABLE IF EXISTS {', '.join(f'`{n}`' for n in legacy)};")
+            _execute_sql(db, "SET FOREIGN_KEY_CHECKS = 1;")
         logger.info(f"Dropped tables of the per-blob symbol layout: {', '.join(legacy)}")
 
 
@@ -254,40 +300,161 @@ def drop_obsolete_kconfig_tables(db: Any) -> None:
     (`m_kconfig_tree`, marked, whereas id 18 now names the unmarked `m_maintainer_member`), which keeps
     a re-run harmless.
     """
-    if not (hasattr(db, "cnx") and db.cnx):
+    if not (hasattr(db, "query") or hasattr(db, "execute")):
         return
     names = OBSOLETE_KCONFIG_TABLES + ("m_ingest_watermark",)
-    with contextlib.closing(db.cnx.cursor()) as cur:
-        cur.execute(
-            "SELECT table_name FROM information_schema.tables WHERE table_schema = DATABASE() "
-            f"AND table_type = 'BASE TABLE' AND table_name IN ({','.join(['%s'] * len(names))})",
-            names,
+    sql_tables = (
+        "SELECT table_name FROM information_schema.tables WHERE table_schema = DATABASE() "
+        f"AND table_type = 'BASE TABLE' AND table_name IN ({','.join(['%s'] * len(names))})"
+    )
+    rows = _query_rows(db, sql_tables, names)
+    present = {r[0].decode() if isinstance(r[0], (bytes, bytearray)) else r[0] for r in rows}
+    if "m_ingest_watermark" in present:
+        sql_distinct = "SELECT DISTINCT commit_id FROM m_ingest_watermark WHERE marked_table_id = %s"
+        rows_distinct = _query_rows(db, sql_distinct, (_OBSOLETE_MARKER_ID,))
+        old_style = [int(r[0]) for r in rows_distinct]
+        for commit_id in old_style:
+            sql_marks = "SELECT marked_table_id, max_id FROM m_ingest_watermark WHERE commit_id = %s"
+            rows_marks = _query_rows(db, sql_marks, (commit_id,))
+            marks = [(int(t), int(m)) for t, m in rows_marks]
+            _execute_sql(db, "DELETE FROM m_ingest_watermark WHERE commit_id = %s", (commit_id,))
+            for table_id, max_id in marks:
+                new_id = table_id if table_id < 16 else _OLD_TABLE_IDS.get(table_id)
+                if new_id is not None:
+                    _execute_sql(
+                        db,
+                        "INSERT INTO m_ingest_watermark (commit_id, marked_table_id, max_id) VALUES (%s, %s, %s)",
+                        (commit_id, new_id, max_id),
+                    )
+        if old_style:
+            logger.info(f"Renumbered the ingestion watermarks of {len(old_style)} interrupted version(s) to the current table ids.")
+    obsolete = [n for n in OBSOLETE_KCONFIG_TABLES if n in present]
+    if obsolete:
+        if hasattr(db, "drop_table"):
+            db.drop_table([_NamedTable(n) for n in obsolete])
+        else:
+            _execute_sql(db, "SET FOREIGN_KEY_CHECKS = 0;")
+            _execute_sql(db, f"DROP TABLE IF EXISTS {', '.join(f'`{n}`' for n in obsolete)};")
+            _execute_sql(db, "SET FOREIGN_KEY_CHECKS = 1;")
+        logger.info(f"Dropped Kconfig tables the schema no longer uses: {', '.join(obsolete)}")
+
+
+# Columns of the current layout an older database lacks (or still has): such a database cannot be extended in place
+_LAYOUT_MARKERS = (
+    ("m_arch_root", "layout_id", True),          # build layouts shared between versions (m_arch_layout)
+    ("m_blob_symbol", "target_fnid", False),     # target files moved to m_blob_symbol_file
+)
+
+
+def outdated_layout(db: Any) -> list[str]:
+    """Why the database's tables predate the current layout (core/DBLayout.py); empty when they do not."""
+    if not (hasattr(db, "query_one") or hasattr(db, "execute")):
+        return []
+    reasons = []
+    for table, column, wanted in _LAYOUT_MARKERS:
+        row_c = _query_one_row(
+            db,
+            "SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = %s "
+            "AND COLUMN_NAME = %s",
+            (table, column),
         )
-        present = {r[0].decode() if isinstance(r[0], (bytes, bytearray)) else r[0] for r in cur.fetchall()}
-        if "m_ingest_watermark" in present:
-            cur.execute("SELECT DISTINCT commit_id FROM m_ingest_watermark WHERE marked_table_id = %s", (_OBSOLETE_MARKER_ID,))
-            old_style = [int(r[0]) for r in cur.fetchall()]
-            for commit_id in old_style:
-                cur.execute("SELECT marked_table_id, max_id FROM m_ingest_watermark WHERE commit_id = %s", (commit_id,))
-                marks = [(int(t), int(m)) for t, m in cur.fetchall()]
-                cur.execute("DELETE FROM m_ingest_watermark WHERE commit_id = %s", (commit_id,))
-                for table_id, max_id in marks:
-                    new_id = table_id if table_id < 16 else _OLD_TABLE_IDS.get(table_id)
-                    if new_id is not None:  # the dropped tables' marks (16-19) go away
-                        cur.execute(
-                            "INSERT INTO m_ingest_watermark (commit_id, marked_table_id, max_id) VALUES (%s, %s, %s)",
-                            (commit_id, new_id, max_id),
-                        )
-                db.cnx.commit()
-            if old_style:
-                logger.info(f"Renumbered the ingestion watermarks of {len(old_style)} interrupted version(s) to the current table ids.")
-        obsolete = [n for n in OBSOLETE_KCONFIG_TABLES if n in present]
-        if obsolete:
-            cur.execute("SET FOREIGN_KEY_CHECKS = 0;")
-            cur.execute(f"DROP TABLE IF EXISTS {', '.join(f'`{n}`' for n in obsolete)};")
-            cur.execute("SET FOREIGN_KEY_CHECKS = 1;")
-            db.cnx.commit()
-            logger.info(f"Dropped Kconfig tables the schema no longer uses: {', '.join(obsolete)}")
+        present = bool(row_c[0]) if row_c else False
+        row_t = _query_one_row(
+            db,
+            "SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = %s",
+            (table,),
+        )
+        if row_t and row_t[0] and present != wanted:
+            reasons.append(f"{table}.{column} {'missing' if wanted else 'still present'}")
+    row_h = _query_one_row(
+        db,
+        "SELECT CHARACTER_OCTET_LENGTH FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() "
+        "AND TABLE_NAME = 'm_ast_hash' AND COLUMN_NAME = 'hash'",
+    )
+    if row_h and row_h[0] is not None and int(row_h[0]) != 16:
+        reasons.append(f"m_ast_hash.hash is BINARY({int(row_h[0])}), not BINARY(16)")
+    return reasons
+
+
+def drop_familyless_blob_facts(db: Any) -> bool:
+    """Drop an `m_blob_facts` created before its `family` column (core/DBLayout.py); returns whether it was dropped.
+
+    Its rows are derived from the blobs alone (Step 6.9 writes them again for the versions ingested next, and the
+    webapp extracts what the database lacks), so the table is recreated empty rather than migrated."""
+    if not (hasattr(db, "query_one") or hasattr(db, "execute")):
+        return False
+    row_t = _query_one_row(
+        db,
+        "SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'm_blob_facts'",
+    )
+    if not (row_t and row_t[0]):
+        return False
+    row_c = _query_one_row(
+        db,
+        "SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() "
+        "AND TABLE_NAME = 'm_blob_facts' AND COLUMN_NAME = 'family'",
+    )
+    if row_c and row_c[0]:
+        return False
+    _execute_sql(db, "DROP TABLE m_blob_facts")
+    logger.info("Dropped m_blob_facts (created before its family column); it is recreated empty.")
+    return True
+
+
+# Tables that hold derived data only, and the column whose presence (True) or absence (False) marks the
+# layout before their current one. An outdated one is dropped at start and recreated empty by the
+# missing-table check; its backfill refills it (plans/database/README.md rule 2).
+_DERIVED_LAYOUT_MARKERS: tuple[tuple[str, str, bool, str], ...] = (
+    ("m_maintainer_file", "maintainers_blob_id", True, "keyed by MAINTAINERS blob; refill with --backfill-maintainer-files"),
+)
+
+
+def drop_outdated_derived_tables(db: Any) -> list[str]:
+    """Drop the derived tables of `_DERIVED_LAYOUT_MARKERS` that still have their old layout; returns their names."""
+    if not (hasattr(db, "query_one") or hasattr(db, "execute")):
+        return []
+    dropped = []
+    for table, column, old_when_present, note in _DERIVED_LAYOUT_MARKERS:
+        row_t = _query_one_row(
+            db,
+            "SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = %s",
+            (table,),
+        )
+        if not (row_t and row_t[0]):
+            continue
+        row_c = _query_one_row(
+            db,
+            "SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() "
+            "AND TABLE_NAME = %s AND COLUMN_NAME = %s",
+            (table, column),
+        )
+        if bool(row_c[0] if row_c else 0) != old_when_present:
+            continue
+        _execute_sql(db, f"DROP TABLE {table}")
+        dropped.append(table)
+        logger.info(f"Dropped {table} (older layout: {note}); it is recreated empty.")
+    return dropped
+
+
+# Tables whose declared secondary indexes are added to existing databases at start (indexes declared
+# after the table was created; create_table() only applies them to new tables)
+ENSURED_INDEX_TABLES = (m_commit_email, m_maintainer_member, m_maintainer_section, m_credits_entry, m_file_reference)
+
+
+def ensure_declared_indexes(db: Any, tables: Any = ENSURED_INDEX_TABLES) -> list[str]:
+    """Create the declared indexes of `tables` that an existing database lacks; returns their names."""
+    created = []
+    for table in tables:
+        for name, cols in (getattr(table, "indexes", None) or ()):
+            try:
+                if db.index_exists(name, table):
+                    continue
+                logger.info(f"Creating index {name} on {table.table_name} (declared after the table was created)...")
+                db.create_index(name, table, tuple(getattr(table, c) for c in cols))
+                created.append(name)
+            except Exception as exc:  # noqa: BLE001 - an index is an optimization, never a blocker
+                logger.warning(f"Could not create index {name} on {table.table_name}: {exc}")
+    return created
 
 
 def ensure_db_views(db: Any) -> None:
@@ -305,19 +472,21 @@ def ensure_db_views(db: Any) -> None:
         )
     views = (
         ("m_v_main", "CREATE OR REPLACE VIEW m_v_main AS SELECT commit_id AS vid, ref_name AS vname, repo_id, ref_type, tagger_id, tagger_date, tag_message FROM m_git_ref;"),
-        ("m_bridge_file", "CREATE OR REPLACE VIEW m_bridge_file AS SELECT commit_id AS vid, fnid, blob_id AS fid FROM m_bridge_checkpoint;"),
+        ("m_checkpoint_tree", checkpoints.TREE_VIEW_SQL),
+        ("m_bridge_file", "CREATE OR REPLACE VIEW m_bridge_file AS SELECT commit_id AS vid, fnid, blob_id AS fid FROM m_checkpoint_tree;"),
         ("m_file", "CREATE OR REPLACE VIEW m_file AS SELECT fb.blob_id AS fid, COALESCE((SELECT MIN(bc.commit_id) FROM m_bridge_checkpoint bc WHERE bc.blob_id = fb.blob_id), 0) AS vid_s, 0 AS vid_e, fb.ftype, '0' AS s_stat, '0' AS e_stat, fb.blob_hash FROM m_file_blob fb;"),
         ("m_bridge_commit_file", "CREATE OR REPLACE VIEW m_bridge_commit_file AS SELECT commit_id, fnid, blob_id, 0 AS old_fnid, 0 AS old_blob_id, change_type FROM m_commit_file;"),
         *SYMBOL_VIEW_SQL.items(),
     )
     for vname, ddl in views:
         try:
-            if hasattr(db, "cnx") and db.cnx:
-                with contextlib.closing(db.cnx.cursor()) as cur:
-                    cur.execute(ddl)
-                db.cnx.commit()
+            select_sql = ddl.split(" AS ", 1)[1].rstrip(";").strip() if " AS " in ddl else ddl
+            if hasattr(db, "create_view"):
+                db.create_view(vname, select_sql)
+            else:
+                _execute_sql(db, ddl)
         except Exception as e:
-            if vname in SYMBOL_VIEW_SQL:
+            if vname in SYMBOL_VIEW_SQL or vname == "m_checkpoint_tree":
                 logger.warning(COLOR.yellow(f"ensure_db_views could not create view {vname}: {e}"))
             else:
                 logger.debug(f"ensure_db_views skipping view {vname}: {e}")
@@ -452,20 +621,24 @@ _SQL_IN_CHUNK = 1000
 
 def _person_key(name: str | None, email: str | None) -> tuple[str, str]:
     """
-    Identity of an m_maintainer_person row: `(name, email)`, the TableEngine's no-duplicate key.
+    Identity of an m_maintainer_person row: `(name, email)`, the TableEngine's no-duplicate key
+    (`parser/git_ast/identity.py` `person_key`, shared with the release statistics step).
 
     Both halves are normalized (`clean_identity_text`): a commit trailer carrying a stray control
     byte — `Olof Johansson\\x01 <olof@lixom.net\\x01>` in `a929478f` — otherwise keys a second
     identity for a contributor who already has one.
     """
-    email = clean_identity_text(email)
-    return (clean_identity_text(name) or email or "Unknown", email)
+    from parser.git_ast.identity import person_key
+    return person_key(name, email)
 
 
-def _raw_cursor(db: Any) -> Any | None:
-    """A fresh cursor on a MariaDB connection, or None for drivers without SQL access (MockDB)."""
-    cnx = getattr(db, "cnx", None)
-    return cnx.cursor() if cnx else None
+def _parent_rss_mb() -> float:
+    """Resident set size of this process in MB (0 when /proc is unavailable)."""
+    try:
+        with open("/proc/self/statm") as f:
+            return int(f.read().split()[1]) * os.sysconf("SC_PAGE_SIZE") / (1024 * 1024)
+    except Exception:
+        return 0.0
 
 
 def _log_preload_summary(elapsed_s: float) -> None:
@@ -477,7 +650,7 @@ def _log_preload_summary(elapsed_s: float) -> None:
             sizes.append((len(rows), G.TE.tables[table_id].table_name))
         except Exception:
             continue
-    largest = ", ".join(f"{name} {count:,}" for count, name in sorted(sizes, reverse=True)[:5])
+    largest = ", ".join(f"{name} {count:,}" for count, name in sorted(sizes, reverse=True)[:5]) or "none"
     logger.info(f"[TableEngine] Preloaded cached tables in {elapsed_s:.1f}s (parent RSS {_parent_rss_mb():.0f}MB); largest: {largest}")
 
 
@@ -488,8 +661,7 @@ def _tagged_blob_ids(blob_ids: Iterable[int]) -> set[int]:
     if not wanted:
         return tagged
     with G.DB() as db:
-        cur = _raw_cursor(db)
-        if cur is None:
+        if not hasattr(db, "query") or isinstance(db, MockDB):
             for blob_id in wanted:
                 if m_bridge_tag.view_get_multiple(((m_bridge_tag.blob_id,),), blob_id, None, None, None, None, None):
                     tagged.add(blob_id)
@@ -497,13 +669,29 @@ def _tagged_blob_ids(blob_ids: Iterable[int]) -> set[int]:
         try:
             for i in range(0, len(wanted), _SQL_IN_CHUNK):
                 chunk = wanted[i : i + _SQL_IN_CHUNK]
-                cur.execute(
-                    f"SELECT DISTINCT blob_id FROM m_bridge_tag WHERE blob_id IN ({','.join(['%s'] * len(chunk))})",  # noqa: S608
+                fmt = ",".join(["%s"] * len(chunk))
+                rows = db.query(
+                    f"SELECT DISTINCT blob_id FROM m_bridge_tag WHERE blob_id IN ({fmt})",  # noqa: S608
                     tuple(chunk),
+                    dictionary=False,
                 )
-                tagged.update(int(r[0]) for r in cur.fetchall())
-        finally:
-            cur.close()
+                chunk_tagged = {int(r[0]) for r in rows}
+                if chunk_tagged:
+                    try:
+                        in_flight_rows = db.query(
+                            f"SELECT DISTINCT ib.blob_id FROM m_ingest_blob ib "
+                            f"JOIN m_ingest_state s ON s.commit_id = ib.commit_id "
+                            f"WHERE s.status = 1 AND ib.blob_id IN ({','.join(['%s'] * len(chunk_tagged))})",  # noqa: S608
+                            tuple(chunk_tagged),
+                            dictionary=False,
+                        )
+                        in_flight = {int(r[0]) for r in in_flight_rows}
+                        chunk_tagged.difference_update(in_flight)
+                    except Exception:
+                        pass
+                tagged.update(chunk_tagged)
+        except Exception as exc:
+            logger.debug(f"_tagged_blob_ids query failed: {exc}")
     return tagged
 
 
@@ -524,9 +712,11 @@ def _reuse_parsed_blobs(file_blob_hashes: dict[str, bytes]) -> list[str]:
     """Step 4.5: link changed files whose exact blob was already parsed instead of parsing them again.
 
     Blobs and file names are looked up in the TableEngine caches (preloaded by `G.TE.start()`), tagged
-    blobs are confirmed with one targeted query, and the reused files' m_file_name, m_bridge_checkpoint
-    and m_commit_file rows are staged through the TableEngine. Reused paths are recorded in
-    `gp.deduped_paths` so `processing_git_commits()` can still link their tags to this range's commits.
+    blobs are confirmed with one targeted query, and the reused files' m_file_name and m_bridge_checkpoint
+    rows are staged through the TableEngine. Reused paths are recorded in `gp.deduped_paths` so
+    `processing_git_commits()` can still link their tags to this range's commits. No m_commit_file row is
+    written for the version's head commit: those rows are the files each commit touched (Step 6.5), and a
+    version-diff row on the head commit made a tag commit list every reused file of its version.
 
     Returns:
         The change lines that still need parsing, in `gp.Change_List` order.
@@ -551,13 +741,12 @@ def _reuse_parsed_blobs(file_blob_hashes: dict[str, bytes]) -> list[str]:
     checkpointed: set[int] | None = None
     if tagged:
         with G.DB() as db:
-            cur = _raw_cursor(db)
-            if cur is not None:
+            if hasattr(db, "query") and not isinstance(db, MockDB):
                 try:
-                    cur.execute("SELECT fnid FROM m_bridge_checkpoint WHERE commit_id = %s", (gp.VID,))
-                    checkpointed = {int(r[0]) for r in cur.fetchall()}
-                finally:
-                    cur.close()
+                    rows = db.query("SELECT fnid FROM m_bridge_checkpoint WHERE commit_id = %s", (gp.VID,), dictionary=False)
+                    checkpointed = {int(r[0]) for r in rows}
+                except Exception:
+                    pass
     reused: set[str] = set()
     gp.deduped_paths = set()
     for item, (op, fpath, b_id) in candidates.items():
@@ -571,7 +760,6 @@ def _reuse_parsed_blobs(file_blob_hashes: dict[str, bytes]) -> list[str]:
             is_checkpointed = G.TE.get(m_bridge_checkpoint.table_id, (gp.VID, fnid, None)) is not None
         if not is_checkpointed:
             G.TE.set(m_bridge_checkpoint.table_id, (gp.VID, fnid, b_id))
-        G.TE.set(m_commit_file.table_id, (gp.VID, fnid, b_id, 0, 0, op[:1]))
         gp.file_blob_ids[fpath] = b_id
         file_fid_cache[fpath] = b_id
         file_fnid_cache[fpath] = fnid
@@ -600,8 +788,8 @@ def _record_reparsed_blobs(file_blob_hashes: dict[str, bytes]) -> None:
                 blob_ids.add(blob_id)
     if blob_ids:
         with G.DB() as db:
-            if getattr(db, "cnx", None) is not None:
-                ingest_state.record_blobs(db.cnx, gp.VID, blob_ids)
+            if db is not None:
+                ingest_state.record_blobs(db, gp.VID, blob_ids)
 
 
 def update(version: str, repo_path: str | None = None) -> None:
@@ -609,7 +797,8 @@ def update(version: str, repo_path: str | None = None) -> None:
     
     Workflow Steps:
     1. Register/synchronize version in `m_git_ref` via `create_new_vid()`.
-    2. Build temporary performance B-tree indexes (`ast_index`, `file_name_index`).
+    1.5 Expand the previous version's checkpoint if it is stored as a delta (core/checkpoints.py).
+    2. Ensure the declared lookup indexes the workers rely on (`ast_index`, `file_name_index`).
     3. Bring the RAMDISK workspace to the version via `MF.checkout_version()` (incremental from the previous version).
     4. Generate git diff change list (`MF.generate_change_list()`) & extract Git blob hashes.
     4.4 Start the TableEngine (preload cached tables).
@@ -636,6 +825,13 @@ def update(version: str, repo_path: str | None = None) -> None:
 
     logger.info(COLOR.green(f"=======================Working on {version} (commit_id {gp.VID})======================="))
 
+    # -------------------------------------------------------------------------
+    # STEP 1.5: The previous version's checkpoint is read as a full tree (TableEngine preload, unchanged files,
+    # new (path, blob) pairs): expand it when it is stored as a delta (a backfill or repair base)
+    # -------------------------------------------------------------------------
+    with G.measure_stage("Step 1.5: Previous Checkpoint"):
+        _ensure_full_checkpoint(gp.Old_VID)
+
     # Ensure TableEngine in-memory indexing is enabled for the new update cycle
     if hasattr(G.TE, "update_in_mem_indexes"):
         G.TE.update_in_mem_indexes = True
@@ -643,11 +839,12 @@ def update(version: str, repo_path: str | None = None) -> None:
     # -------------------------------------------------------------------------
     # STEP 2: Ensure performance B-tree indexes are active for worker queries (in parallel)
     # -------------------------------------------------------------------------
+    # Both are declared in core/DBLayout.py; this only recreates them on a database that lost them. A
+    # (blob_id, tag_id) index on m_bridge_tag or a (target_fnid, ref_type) one on m_file_reference would
+    # duplicate the primary key / fref_tgt_src_idx (1.8 GB and 0.2 GB on a full database)
     performance_indexes = (
         ("ast_index", m_ast, (m_ast.name, m_ast.type_id)),
         ("file_name_index", m_file_name, (m_file_name.fname,)),
-        ("bridge_tag_fid_idx", m_bridge_tag, (m_bridge_tag.blob_id, m_bridge_tag.tag_id)),
-        ("file_ref_target_idx", m_file_reference, (m_file_reference.target_fnid, m_file_reference.ref_type)),
     )
     with G.measure_stage("Step 2: Performance Index Setup", count=len(performance_indexes), units="indexes"):
         with G.DB() as db:
@@ -711,6 +908,10 @@ def update(version: str, repo_path: str | None = None) -> None:
     # -------------------------------------------------------------------------
     with G.measure_stage("Step 4.4: TableEngine Preload"):
         t_preload = time.perf_counter()
+        if hasattr(G.TE, "distributed"):
+            G.TE.distributed = getattr(G, "distributed", False)
+            G.TE.current_commit_id = getattr(gp, "VID", 0)
+            G.TE.defer_ast_hash = G.TE.distributed
         G.TE.start(gp.Table_Array, G.DB)
         _log_preload_summary(time.perf_counter() - t_preload)
 
@@ -725,6 +926,8 @@ def update(version: str, repo_path: str | None = None) -> None:
 
     if G.is_deadline_exceeded():
         logger.warning(COLOR.yellow(f"[Duration Limit] Execution deadline reached after Step 4.5. Finalizing '{version}' early."))
+        if getattr(G.TE, "defer_ast_hash", False):
+            G.TE.defer_ast_hash = False
         G.TE.commit_all(update_in_mem_indexes=False)
         G.TE.close()
         return
@@ -749,6 +952,8 @@ def update(version: str, repo_path: str | None = None) -> None:
 
     if G.is_deadline_exceeded():
         logger.warning(COLOR.yellow(f"[Duration Limit] Execution deadline reached after Multicore Parsing. Finalizing '{version}'..."))
+        if getattr(G.TE, "defer_ast_hash", False):
+            G.TE.defer_ast_hash = False
         G.TE.commit_all(update_in_mem_indexes=False)
         G.TE.close()
         return
@@ -788,6 +993,8 @@ def update(version: str, repo_path: str | None = None) -> None:
 
     if G.is_deadline_exceeded():
         logger.warning(COLOR.yellow(f"[Duration Limit] Execution deadline reached before Maintainers. Finalizing '{version}'..."))
+        if getattr(G.TE, "defer_ast_hash", False):
+            G.TE.defer_ast_hash = False
         G.TE.commit_all(update_in_mem_indexes=False)
         G.TE.close()
         return
@@ -806,6 +1013,14 @@ def update(version: str, repo_path: str | None = None) -> None:
         if layout_metric is not None:
             layout_metric.count = stored
 
+    # -------------------------------------------------------------------------
+    # STEP 6.9: Per-blob facts the database lacks (m_blob_facts: calls/ops tables, Kernel API macros)
+    # -------------------------------------------------------------------------
+    with G.measure_stage("Step 6.9: Source Facts", units="blobs") as facts_metric:
+        extracted = processing_source_facts(version)
+        if facts_metric is not None:
+            facts_metric.count = extracted
+
     if G.PROFILING_ENABLED and gp.ChangeSet_Dict:
         from core.Profiler import format_profiling_report
         profilers = [cs.profiler for cs in gp.ChangeSet_Dict.values() if getattr(cs, "profiler", None)]
@@ -820,12 +1035,14 @@ def update(version: str, repo_path: str | None = None) -> None:
     # streamed nearly every row of the version into them, so a drop/rebuild would only add work)
     # -------------------------------------------------------------------------
     with G.measure_stage("Step 7: Final DB Commit & Indexes"):
-        if getattr(G.TE, "db", None) is not None and hasattr(G.TE.db, "cnx") and G.TE.db.cnx is not None:
+        if getattr(G.TE, "db", None) is not None:
             try:
-                G.TE.db.cnx.commit()
+                G.TE.db.commit()
             except Exception:
                 pass
 
+        if getattr(G.TE, "defer_ast_hash", False):
+            G.TE.defer_ast_hash = False
         G.TE.commit_all(update_in_mem_indexes=False)
 
     file_fid_cache.clear()
@@ -1608,15 +1825,6 @@ def _close_parent_db() -> None:
             pass
 
 
-def _parent_rss_mb() -> float:
-    """Resident set size of this process in MB (0 when /proc is unavailable)."""
-    try:
-        with open("/proc/self/statm") as f:
-            return int(f.read().split()[1]) * os.sysconf("SC_PAGE_SIZE") / (1024 * 1024)
-    except Exception:
-        return 0.0
-
-
 def _register_file_names(items: list[str]) -> None:
     """Assign m_file_name ids to every path in `items` and commit them before workers fork.
 
@@ -2380,8 +2588,7 @@ def _apply_db_server_tuning(db: Any, mem_max_gb: float) -> None:
     if local and ram and isinstance(pool, int):
         # The pool the server actually runs with (a pool capped at its startup maximum is smaller)
         try:
-            db.cursor.execute("SELECT @@GLOBAL.innodb_buffer_pool_size")
-            row = db.cursor.fetchone()
+            row = db.query_one("SELECT @@GLOBAL.innodb_buffer_pool_size", dictionary=False) if hasattr(db, "query_one") else None
             pool = int(row[0]) if row and row[0] is not None else pool
         except Exception:
             pass
@@ -2466,8 +2673,8 @@ def orchestrate_repair_pipeline(
             cid_m, st_m = version_states.get(m_ver, (0, "new"))
             if st_m == "interrupted" and cid_m > 0:
                 with G.DB() as db:
-                    if getattr(db, "cnx", None):
-                        if not ingest_state.rollback_version(db.cnx, network_id, cid_m, TABLES):
+                    if db is not None:
+                        if not ingest_state.rollback_version(db, network_id, cid_m, TABLES):
                             _purge_partial_version(db, cid_m)
                 _forget_rolled_back_rows()
             update(m_ver, repo_path=repo_path)
@@ -2483,9 +2690,9 @@ def orchestrate_repair_pipeline(
                 f"[Repair Pipeline] Re-aligning downstream successor '{succ}' (commit_id {succ_cid}) with new base '{current_base}'..."
             ))
             with G.DB() as db:
-                if getattr(db, "cnx", None):
+                if db is not None:
                     pred_cid = version_states.get(current_base, (0,))[0] if current_base else None
-                    ingest_state.purge_version_differential_rows(db.cnx, succ_cid, pred_commit_id=pred_cid)
+                    ingest_state.purge_version_differential_rows(db, succ_cid, pred_commit_id=pred_cid)
             _forget_rolled_back_rows()
             if current_base and current_base in version_states:
                 gp.Old_VID = version_states[current_base][0]
@@ -2500,6 +2707,13 @@ def main() -> None:
     """Set the plan for what version to parse."""
     args = arg_handling()
     setup_memory_limit(float(args.mem_max))
+    role = getattr(args, "role", "standalone") or "standalone"
+    is_distributed = role in (distributed.ROLE_MASTER, distributed.ROLE_WORKER)
+    G.distributed = is_distributed
+    G.distributed_role = role
+    if hasattr(G.TE, "distributed"):
+        G.TE.distributed = is_distributed
+
     with G.DB() as db:
         _apply_db_server_tuning(db, float(args.mem_max))
         if getattr(args, "reset", False) or getattr(args, "Drop", False):
@@ -2517,7 +2731,16 @@ def main() -> None:
             if hasattr(G.TE, "start_new_db") and getattr(G.TE, "tables", None):
                 G.TE.start_new_db(G.DB, is_worker=False)
         else:
-            drop_obsolete_kconfig_tables(db)
+            if role != distributed.ROLE_WORKER:
+                drop_obsolete_kconfig_tables(db)
+                outdated = outdated_layout(db)
+                if outdated:
+                    raise RuntimeError(
+                        "The database was created with an older table layout (" + "; ".join(outdated) + "): "
+                        "rebuild it with --reset (core/API.md section 4)."
+                    )
+                drop_familyless_blob_facts(db)
+                drop_outdated_derived_tables(db)
             missing = db.test_tables(gp.Table_Array)
             if missing:
                 logger.info(f"Missing tables detected ({missing}), creating tables...")
@@ -2527,8 +2750,13 @@ def main() -> None:
                     db.create_index("v_main_index", m_v_main, (m_v_main.vname,))
                 except Exception:
                     pass
-            ensure_db_instance(db)
-            ensure_db_views(db)
+            if role != distributed.ROLE_WORKER:
+                ensure_db_instance(db)
+                ensure_db_views(db)
+                ensure_declared_indexes(db)
+                refresh_person_identities(db, "start", only_if_incomplete=True)
+        if is_distributed:
+            distributed.ensure_distributed_tables(db)
 
     # Repository: --repo may be a configured repository name or a path; default is the configured default
     repo_arg = getattr(args, "repo", None)
@@ -2541,6 +2769,17 @@ def main() -> None:
         repo_path = str(get_default_repo_path())
     MF.set_repo_dir(repo_path)
     logger.info(f"[Repository] Using '{(repo_entry or {}).get('name', repo_path)}' at {repo_path}")
+
+    # The CVE list (cve.repo_dir) is ingested when its HEAD moved, and its abbreviated commit hashes resolved
+    # in this repository; --cve does only this
+    if role != distributed.ROLE_WORKER and (getattr(args, "cve", False) or not getattr(args, "no_cve", False)):
+        _cve_net, cve_repo_id = resolve_git_network_and_repo(repo_path)
+        summary = processing_cve_list(force=bool(getattr(args, "cve_full", False)), kernel_repo=repo_path, repo_id=cve_repo_id)
+        if summary and summary.get("state") == "current":
+            logger.info(f"[CVE] The CVE list is current ({summary.get('records')} kernel records, HEAD {str(summary.get('head'))[:12]}).")
+    if getattr(args, "cve", False):
+        G.emergency_shutdown(0)
+        return
 
     if getattr(args, "clean_temp", False):
         ingest_state.cleanup_ramdisk_artifacts(getattr(G, "RAMDISK", None))
@@ -2611,7 +2850,140 @@ def main() -> None:
 
     network_id, repo_id = resolve_git_network_and_repo(repo_path)
     with G.DB() as db:
-        version_states = ingest_state.fetch_repo_version_states(getattr(db, "cnx", None), repo_id, network_id)
+        version_states = ingest_state.fetch_repo_version_states(db, repo_id, network_id)
+
+    node_id = None
+    heartbeat_daemon = None
+    if is_distributed:
+        node_id = distributed.get_default_node_id(role, getattr(args, "worker_id", None))
+        G.node_id = node_id
+        with G.DB() as db:
+            distributed.register_node(db, node_id, role, network_id)
+        heartbeat_daemon = distributed.NodeHeartbeatDaemon(G.DB, node_id, role=role, network_id=network_id)
+        heartbeat_daemon.start()
+        G.heartbeat_daemon = heartbeat_daemon
+    else:
+        G.node_id = None
+        G.heartbeat_daemon = None
+
+    if role == distributed.ROLE_WORKER:
+        current = {"ref": None}
+        quit_listener = GracefulQuitListener(
+            on_request=lambda: logger.warning(COLOR.yellow(
+                f"[Quit Requested] Finishing '{current['ref']}' before stopping. Press Ctrl+C to abort immediately."
+            ))
+        )
+        quit_listener.start()
+        logger.info(COLOR.cyan(f"[Worker] Starting secondary worker parser loop (node: '{node_id}')..."))
+        preferred_chain = None
+        gp._active_task_id = None
+        try:
+            while not G.is_deadline_exceeded() and not quit_listener.requested.is_set():
+                with G.DB() as db:
+                    distributed.reclaim_expired_leases(db, network_id)
+                    task = distributed.claim_next_task(db, network_id, node_id, preferred_chain=preferred_chain)
+
+                if task is not None:
+                    t_id = task["task_id"]
+                    ref_name = task["ref_name"]
+                    b_name = task["base_ref_name"]
+                    b_cid = task["base_commit_id"]
+                    cid = task["commit_id"]
+                    preferred_chain = task["chain_name"]
+                    gp._active_task_id = t_id
+                    heartbeat_daemon.set_active(cid, task_id=t_id)
+                    current["ref"] = ref_name
+                    gp.Old_VID = b_cid
+                    gp.Old_Version_Name = b_name
+                    logger.info(COLOR.green(
+                        f"[Worker] Processing assigned task {t_id} ('{ref_name}', chain: '{preferred_chain}', base: '{b_name}', commit_id: {cid})."
+                    ))
+                    try:
+                        update(ref_name, repo_path=repo_path)
+                        with G.DB() as db:
+                            success = distributed.mark_task_done(
+                                db, t_id, getattr(gp, "VID", cid), network_id, ref_name=ref_name, worker_id=node_id
+                            )
+                            if not success:
+                                logger.warning(COLOR.yellow(f"[Worker] Task {t_id} lease was lost/revoked before completion. Skipping rollback to avoid corrupting peer data."))
+                    except Exception as e:
+                        logger.error(f"[Worker] Failed parsing '{ref_name}': {e}", exc_info=True)
+                        with G.DB() as db:
+                            lease_held = distributed.check_lease_held(db, t_id, node_id)
+                            if lease_held:
+                                if getattr(gp, "VID", 0):
+                                    ingest_state.rollback_version(db, network_id, gp.VID, gp.Table_Array)
+                                distributed.mark_task_failed(db, t_id, str(e), worker_id=node_id)
+                            else:
+                                logger.warning(COLOR.yellow(f"[Worker] Lease for task {t_id} was lost/revoked; skipping rollback to avoid corrupting peer data."))
+                    finally:
+                        gp._active_task_id = None
+                        heartbeat_daemon.clear_active()
+                else:
+                    preferred_chain = None
+                    if getattr(args, "worker_once", False):
+                        logger.info("[Worker] No eligible tasks found and --worker-once is set. Exiting.")
+                        break
+                    with G.DB() as db:
+                        finished = distributed.is_parsing_finished(db, network_id)
+                    if finished:
+                        logger.info(COLOR.green("[Worker] All parsing completed across repository. Exiting cleanly."))
+                        break
+                    logger.info("[Worker] Queue is currently empty. Waiting for more versions from Master...")
+                    time.sleep(5.0)
+        finally:
+            quit_listener.stop()
+            heartbeat_daemon.stop()
+            with G.DB() as db:
+                if db is not None:
+                    refresh_person_identities(db, "worker shutdown", only_if_incomplete=True)
+            with G.DB() as db:
+                distributed.unregister_node(db, node_id)
+            G.heartbeat_daemon = None
+            G.node_id = None
+        logger.info("[Worker] Secondary worker shutdown complete.")
+        G.emergency_shutdown(0)
+        return
+
+    if role == distributed.ROLE_MASTER:
+        all_tags = MF.get_version_tags(include_pre_releases=True)
+        if target_refs and len(target_refs) > 0 and target_refs[0] in all_tags:
+            start_idx = all_tags.index(target_refs[0])
+            all_tags = all_tags[start_idx:]
+        with G.DB() as db:
+            distributed.publish_delegable_chains(
+                db,
+                network_id,
+                repo_id,
+                all_tags,
+                version_states,
+                delegate_stable=getattr(args, "delegate_stable", True),
+                delegate_branches=getattr(args, "delegate_branches", None),
+                repo_dir=repo_path,
+            )
+        if getattr(args, "delegate_stable", True):
+            from parser.git_ast import release_order
+            ranges = release_order.release_ranges(target_refs)
+            mainline_set = {r["tag"] for r in ranges if r["kind"] == "mainline"}
+            trunk_refs = {"history/master", "history/HEAD", "master", "main", "origin/master", "origin/main"}
+            orig_len = len(target_refs)
+            target_refs = [t for t in target_refs if t in mainline_set or t in trunk_refs]
+            logger.info(COLOR.cyan(
+                f"[Master] Mainline exclusive mode active. Delegated {orig_len - len(target_refs)} version(s) to secondary workers; parsing {len(target_refs)} mainline/trunk release(s)."
+            ))
+
+    # Release statistics of every release tag (core/API.md section 10); --release-stats does only this
+    if getattr(args, "release_stats", False) or not (getattr(args, "no_release_stats", False) or getattr(args, "dry_run", False)):
+        processing_release_stats(repo_path, repo_id)
+    if getattr(args, "release_stats", False):
+        G.emergency_shutdown(0)
+        return
+
+    if run_requested_backfills(args, network_id, repo_id):
+        G.emergency_shutdown(0)
+        return
+    if not getattr(args, "dry_run", False):
+        run_automatic_backfills(args)
 
     repair_mode = bool(getattr(args, "repair", False))
     backfill_target = getattr(args, "backfill", None)
@@ -2634,7 +3006,7 @@ def main() -> None:
             G.emergency_shutdown(0)
             return
         with G.DB() as db:
-            version_states = ingest_state.fetch_repo_version_states(getattr(db, "cnx", None), repo_id, network_id)
+            version_states = ingest_state.fetch_repo_version_states(db, repo_id, network_id)
 
     if is_branch_pipeline:
         unparsed_branches = [ref for ref in target_refs if version_states.get(ref, (0, "new"))[1] != "done"]
@@ -2675,8 +3047,8 @@ def main() -> None:
             r_cid, r_st = version_states.get(resume_ref, (0, "new"))
             if r_st == "interrupted" and r_cid > 0:
                 with G.DB() as db:
-                    if getattr(db, "cnx", None):
-                        if not ingest_state.rollback_version(db.cnx, network_id, r_cid, TABLES):
+                    if db is not None:
+                        if not ingest_state.rollback_version(db, network_id, r_cid, TABLES):
                             _purge_partial_version(db, r_cid)
                 _forget_rolled_back_rows()
                 logger.warning(COLOR.yellow(
@@ -2722,6 +3094,16 @@ def main() -> None:
             if is_branch_pipeline:
                 gp.Old_VID = 0
                 gp.Old_Version_Name = ""
+            # Bridge initial git commit (1da177 / v2.6.12-rc2) from history tip (v2.6.12-rc1)
+            if (ref.startswith("1da177") or ref in ("v2.6.12-rc2", "2.6.12-rc2")) and (gp.Old_VID == 0 or not gp.Old_Version_Name):
+                for hist_ref in ("v2.6.12-rc1", "history/master"):
+                    if hist_ref in version_states and version_states[hist_ref][1] == "done":
+                        gp.Old_VID = version_states[hist_ref][0]
+                        gp.Old_Version_Name = hist_ref
+                        logger.info(
+                            f"[Mainline Bridge] Linking initial git commit '{ref}' incrementally to completed history tip '{hist_ref}' (commit_id {gp.Old_VID})."
+                        )
+                        break
             current["ref"] = ref
             if total_targets > 1:
                 label = "branch" if is_branch_pipeline else "version"
@@ -2732,8 +3114,19 @@ def main() -> None:
         sys.exit(1)
     finally:
         quit_listener.stop()
+        if is_distributed and heartbeat_daemon is not None and node_id is not None:
+            heartbeat_daemon.stop()
+            with G.DB() as db:
+                distributed.unregister_node(db, node_id)
+            G.heartbeat_daemon = None
+            G.node_id = None
         if getattr(G, "STAGE_PROFILER", None) is not None:
             print(G.STAGE_PROFILER.format_stage_report())
+
+    # Again after the versions: a run that recovered an interrupted version skipped it at the start,
+    # and tags fetched while it ran are picked up (nothing is read when every tag is summarized)
+    if not getattr(args, "no_release_stats", False):
+        processing_release_stats(repo_path, repo_id)
 
     logger.info("We are done! Closing")
     G.emergency_shutdown(0)
@@ -3014,6 +3407,120 @@ def arg_handling() -> argparse.Namespace:
         help="SSH host key verification mode (default: accept-new)",
     )
     parser.add_argument(
+        "--cve",
+        dest="cve",
+        action="store_true",
+        help="Only ingest the CVE list (config cve.repo_dir) into m_cve / m_cve_commit, then exit",
+    )
+    parser.add_argument(
+        "--cve-full",
+        dest="cve_full",
+        action="store_true",
+        help="Ingest the whole CVE list again instead of the records changed since the last ingestion",
+    )
+    parser.add_argument(
+        "--no-cve",
+        dest="no_cve",
+        action="store_true",
+        help="Do not update the CVE list at the start of this run",
+    )
+    parser.add_argument(
+        "--release-stats",
+        dest="release_stats",
+        action="store_true",
+        help="Only summarize the release tags of the repository into m_release_segment / m_release_person / "
+             "m_person_first_release (core/API.md section 10), then exit",
+    )
+    parser.add_argument(
+        "--no-release-stats",
+        dest="no_release_stats",
+        action="store_true",
+        help="Do not update the release statistics in this run",
+    )
+    # One-off refills of derived tables for versions ingested before they existed (core/backfills.py)
+    parser.add_argument(
+        "--backfill-maintainer-files",
+        dest="backfill_maintainer_files",
+        action="store_true",
+        help="Refill m_maintainer_file (files of each MAINTAINERS section version) for the finished versions "
+             "of the repository, then exit (core/API.md section 4, row 19)",
+    )
+    parser.add_argument(
+        "--backfill-kbuild",
+        dest="backfill_kbuild",
+        action="store_true",
+        help="Fill m_kbuild_symbol (Kbuild rules with their CONFIG_ symbols) for every Makefile/Kbuild (path, blob) "
+             "pair of the database without rows, then exit (core/API.md section 12)",
+    )
+    parser.add_argument(
+        "--from",
+        dest="backfill_from",
+        default=None,
+        metavar="REF",
+        help="With --backfill-maintainer-files: resume at this finished version",
+    )
+    parser.add_argument(
+        "--backfill-facts",
+        dest="backfill_facts",
+        action="store_true",
+        help="Fill m_blob_facts (per-blob facts, families 1-5) for the blobs of every finished version that lack "
+             "them, then exit (core/API.md section 12)",
+    )
+    parser.add_argument(
+        "--families",
+        dest="facts_families",
+        type=lambda v: [int(x) for x in v.split(",") if x.strip()],
+        default=None,
+        metavar="1,2,3,4,5",
+        help="With --backfill-facts: only these fact families",
+    )
+    parser.add_argument(
+        "--backfill-commit-relations",
+        dest="backfill_commit_relations",
+        action="store_true",
+        help="Parse the stored message of every commit into m_commit_relation (Fixes:, reverts, backports, "
+             "Cc: stable) and m_commit_link (Link:, Message-Id:), then exit (core/API.md section 12)",
+    )
+    parser.add_argument(
+        "--from-commit-id",
+        dest="from_commit_id",
+        type=int,
+        default=None,
+        metavar="N",
+        help="With --backfill-commit-relations: start after this commit_id (default: resume where it stopped)",
+    )
+    parser.add_argument(
+        "--repair-head-commit-files",
+        dest="repair_head_commit_files",
+        action="store_true",
+        help="Delete the m_commit_file rows of version head commits naming files the commit did not touch "
+             "(written by Step 4.5 before 2026-11-07), then exit (core/API.md section 12)",
+    )
+    parser.add_argument(
+        "--backfill-doc-references",
+        dest="backfill_doc_references",
+        action="store_true",
+        help="Scan documentation files across finished versions and stage cross-file references into m_file_reference (core/API.md section 12)",
+    )
+    parser.add_argument(
+        "--backfill-cve-files",
+        dest="backfill_cve_files",
+        action="store_true",
+        help="Populate m_cve_file (affected source files per CVE) from parsed m_cve.data, then exit (core/API.md section 12)",
+    )
+    parser.add_argument(
+        "--backfill-mailing-list",
+        dest="backfill_mailing_list",
+        action="store_true",
+        help="Execute public-inbox mailing list resolution across commit range into m_commit_email, then exit (core/API.md section 12)",
+    )
+    parser.add_argument(
+        "--no-backfill",
+        dest="no_backfill",
+        action="store_true",
+        help="Skip the automatic one-off backfills run when their table has just been created",
+    )
+    parser.add_argument(
         "--resolve-ml",
         dest="resolve_ml",
         action="store_true",
@@ -3030,6 +3537,46 @@ def arg_handling() -> argparse.Namespace:
         dest="ml_storage_dir",
         default=None,
         help="Local or remote path to public-inbox storage directory (default: from config 'mailing_list.storage_dir')",
+    )
+    parser.add_argument(
+        "--role",
+        dest="role",
+        choices=["standalone", "master", "worker"],
+        default=None,
+        help="Opt-in distributed parsing role: 'standalone' (default, single computer), 'master' (mainline only, coordinates tasks), or 'worker' (parses delegated stable/past branches)",
+    )
+    parser.add_argument(
+        "--worker-id",
+        dest="worker_id",
+        default=None,
+        help="Unique identifier for this parser node (default: <role>:<hostname>:<pid>)",
+    )
+    parser.add_argument(
+        "--delegate-stable",
+        dest="delegate_stable",
+        action="store_true",
+        default=None,
+        help="In master role, automatically delegate stable release chains (vX.Y.1..vX.Y.Z) to secondary workers",
+    )
+    parser.add_argument(
+        "--no-delegate-stable",
+        dest="delegate_stable",
+        action="store_false",
+        help="In master role, do not delegate stable releases",
+    )
+    parser.add_argument(
+        "--delegate-branch",
+        dest="delegate_branches",
+        action="append",
+        default=None,
+        help="In master role, delegate specific branch(es) or past tag ranges to secondary workers",
+    )
+    parser.add_argument(
+        "--worker-once",
+        dest="worker_once",
+        action="store_true",
+        default=False,
+        help="In worker role, exit when queue is empty instead of waiting for more versions from master",
     )
     args = parser.parse_args()
 
@@ -3054,6 +3601,15 @@ def arg_handling() -> argparse.Namespace:
     setup_memory_limit(float(args.mem_max))
 
     parser_cfg = get_parser_config()
+    dist_cfg = parser_cfg.get("distributed", {}) if isinstance(parser_cfg, dict) else {}
+    if getattr(args, "role", None) is None:
+        args.role = dist_cfg.get("role", "standalone") if dist_cfg.get("enabled", False) else "standalone"
+    if getattr(args, "worker_id", None) is None:
+        args.worker_id = dist_cfg.get("worker_id")
+    if getattr(args, "delegate_stable", None) is None:
+        args.delegate_stable = dist_cfg.get("delegate_stable", True)
+    if getattr(args, "delegate_branches", None) is None:
+        args.delegate_branches = dist_cfg.get("delegate_branches", [])
     db_cfg = get_db_config()
     ssh_cfg = get_ssh_tunnel_config()
     ml_cfg = get_mailing_list_config()
@@ -3186,6 +3742,7 @@ def arg_handling() -> argparse.Namespace:
             "unit_test.test_raw_parser",
             "unit_test.test_c_parser",
             "tests.test_maintainer_ast",
+            "tests.test_maintainer_files",
             "tests.test_credits_lifecycle",
             "tests.test_tag_maps",
             "tests.test_git_commit_parser",
@@ -3204,6 +3761,12 @@ def arg_handling() -> argparse.Namespace:
             "tests.test_ingest_state",
             "tests.test_webapp_defconfig",
             "tests.test_webapp_maintainer",
+            "tests.test_webapp_existing_data",
+            "tests.test_person_identity",
+            "tests.test_webapp_kbuild_usage",
+            "tests.test_commit_relations",
+            "tests.test_blob_fact_readers",
+            "tests.test_webapp_file_references",
             "tests.test_raw_ast",
             "tests.test_rust_ast",
             "tests.test_config",
@@ -3220,6 +3783,36 @@ def arg_handling() -> argparse.Namespace:
             "tests.test_webapp_advanced_features",
             "tests.test_history_service",
             "tests.test_cast_golden",
+            "tests.test_webapp_disk_cache",
+            "tests.test_webapp_jobs",
+            "tests.test_webapp_grep",
+            "tests.test_webapp_blame",
+            "tests.test_webapp_outline",
+            "tests.test_webapp_rust_refs",
+            "tests.test_webapp_release_index",
+            "tests.test_webapp_commit_query",
+            "tests.test_webapp_stable",
+            "tests.test_webapp_insights",
+            "tests.test_webapp_cve",
+            "tests.test_cve_ingest",
+            "tests.test_release_stats",
+            "tests.test_webapp_kbuild_index",
+            "tests.test_webapp_kapi",
+            "tests.test_webapp_devices",
+            "tests.test_webapp_patch_apply",
+            "tests.test_webapp_patch_series",
+            "tests.test_webapp_checkpatch",
+            "tests.test_webapp_hover",
+            "tests.test_webapp_source_index",
+            "tests.test_facts_ingest",
+            "tests.test_kapi_facts",
+            "tests.test_checkpoints",
+            "tests.test_webapp_ops",
+            "tests.test_webapp_callpath",
+            "tests.test_webapp_pahole_compare",
+            "tests.test_webapp_watch",
+            "tests.test_webapp_theme_contrast",
+            "tests.test_webapp_frontend_js",
         ]
         suite = unittest.TestSuite()
         for mod_name in test_modules:
@@ -3349,8 +3942,7 @@ def _lookup_commit_ids(db: Any, network_id: int, hashes: Iterable[str]) -> dict[
     found: dict[str, int] = {}
     if not wanted:
         return found
-    cur = _raw_cursor(db)
-    if cur is None:
+    if not hasattr(db, "query") or isinstance(db, MockDB):
         for h in wanted:
             row = db.select(m_commit, (None, network_id, bytes.fromhex(h), None, None, None, None, None, None))
             if row:
@@ -3359,17 +3951,18 @@ def _lookup_commit_ids(db: Any, network_id: int, hashes: Iterable[str]) -> dict[
     try:
         for i in range(0, len(wanted), _SQL_IN_CHUNK):
             chunk = wanted[i : i + _SQL_IN_CHUNK]
-            cur.execute(
+            rows = db.query(
                 f"SELECT commit_hash, commit_id FROM m_commit WHERE network_id = %s "  # noqa: S608
                 f"AND commit_hash IN ({','.join(['%s'] * len(chunk))})",
                 (network_id, *(bytes.fromhex(h) for h in chunk)),
+                dictionary=False,
             )
-            for c_hash, c_id in cur.fetchall():
+            for c_hash, c_id in rows:
                 # mysql-connector may hand back a BINARY(20) whose bytes happen to be valid UTF-8 as str.
                 raw = c_hash.encode("utf-8") if isinstance(c_hash, str) else bytes(c_hash)
                 found[raw.hex()] = int(c_id)
-    finally:
-        cur.close()
+    except Exception as exc:
+        logger.debug(f"_lookup_commit_ids query failed: {exc}")
     return found
 
 
@@ -3389,24 +3982,46 @@ def _ingest_commit_range(db: Any, commits: list[Any], network_id: int) -> dict[s
     outside_parents = {p for c in ordered for p in (c.parents or ())} - set(in_range)
     commit_ids = _lookup_commit_ids(db, network_id, [*in_range, *outside_parents])
 
-    cur = _raw_cursor(db)
     person_ids: dict[tuple[str, str], int] = {}
-    if cur is not None:
+    if hasattr(db, "query") and not isinstance(db, MockDB):
         try:
-            cur.execute("SELECT person_id, name, email FROM m_maintainer_person")
-            rows = [(int(pid), name or "", email or "") for pid, name, email in cur.fetchall()]
+            raw_rows = db.query("SELECT person_id, name, email FROM m_maintainer_person", dictionary=False)
+            rows = [(int(pid), name or "", email or "") for pid, name, email in raw_rows]
             # Rows written before identities were normalized can carry stray control bytes, so two
             # of them may now share one key. The row already stored in its normalized form wins
             # (lowest id among equals), so commits map to the identity a merge would keep.
             rows.sort(key=lambda r: ((r[1], r[2]) != _person_key(r[1], r[2]), r[0]))
             for pid, name, email in rows:
                 person_ids.setdefault(_person_key(name, email), pid)
-        finally:
-            cur.close()
+        except Exception:
+            pass
     new_persons: list[tuple[int, str, str]] = []
     next_ids: dict[str, int] = {}
+    id_cursors: dict[str, int] = {}
+    id_limits: dict[str, int] = {}
+
+    target_cid = getattr(gp, "VID", 0) or 0
+    if target_cid:
+        if target_cid == getattr(gp, "Old_VID", None) or target_cid in commit_ids.values():
+            target_cid = 0
+        elif db is not None:
+            try:
+                if ingest_state.get_status(db, network_id, target_cid) == ingest_state.INGEST_DONE:
+                    target_cid = 0
+            except Exception:
+                pass
 
     def _next_id(table: Table) -> int:
+        if getattr(G, "distributed", False) and hasattr(db, "reserve_id_block"):
+            name = table.table_name
+            if name not in id_cursors or id_cursors[name] > id_limits[name]:
+                block_size = 1000 if name == "m_commit" else 256
+                start_id, end_id = db.reserve_id_block(table, block_size, commit_id=target_cid)
+                id_cursors[name] = start_id
+                id_limits[name] = end_id
+            assigned = id_cursors[name]
+            id_cursors[name] = assigned + 1
+            return assigned
         if table.table_name not in next_ids:
             next_ids[table.table_name] = db.get_next_id(table)
         assigned = next_ids[table.table_name]
@@ -3416,9 +4031,12 @@ def _ingest_commit_range(db: Any, commits: list[Any], network_id: int) -> dict[s
     def _person_id(name: str | None, email: str | None) -> int:
         key = _person_key(name, email)
         pid = person_ids.get(key)
-        if pid is None and cur is None:
+        if pid is None and hasattr(db, "select"):
             row = db.select(m_maintainer_person, (None, key[0], key[1]))
             pid = row[0] if row else None
+        elif pid is None and db is None:
+            row = m_maintainer_person.get(None, key[0], key[1])
+            pid = row[2][0] if row and len(row) >= 3 and row[2] else None
         if pid is None:
             pid = _next_id(m_maintainer_person)
             new_persons.append((pid, key[0], key[1]))
@@ -3461,11 +4079,17 @@ def _ingest_commit_range(db: Any, commits: list[Any], network_id: int) -> dict[s
             pid = _person_id(contrib.name, contrib.email)
             contributor_rows.setdefault((c_id, pid, int(contrib.role)), (c_id, pid, int(contrib.role), int(contrib.priority)))
 
+    # What the new commits' messages say about other commits and mail (core/API.md section 6, Step 1)
+    relation_rows, link_rows = commit_relation_rows(
+        [(row[0], row[2].hex(), row[8]) for row in new_commits], getattr(MF, "repo_dir", None))
+
     for table, rows in (
         (m_maintainer_person, new_persons),
         (m_commit, new_commits),
         (m_commit_parent, parent_rows),
         (m_bridge_commit_person, list(contributor_rows.values())),
+        (m_commit_relation, relation_rows),
+        (m_commit_link, link_rows),
     ):
         if rows:
             db.insert(table, tuple(rows))
@@ -3547,11 +4171,16 @@ def ingest_git_dag(
                 f"Ref '{version_or_ref}' points to commit_id {known_cid}, already ingested by another ref; "
                 f"registering it as an alias."
             )
+        elif state == "in_progress":
+            logger.info(
+                f"Ingestion of '{version_or_ref}' (commit_id {known_cid}) is actively in progress by a heartbeating peer node; "
+                f"preserving partial rows."
+            )
         elif state == "interrupted":
             logger.warning(
                 f"Ingestion of '{version_or_ref}' (commit_id {known_cid}) was interrupted; rolling back its partial rows."
             )
-            if not ingest_state.rollback_version(db.cnx, network_id, known_cid, TABLES):
+            if not ingest_state.rollback_version(db, network_id, known_cid, TABLES):
                 _purge_partial_version(db, known_cid)
             _forget_rolled_back_rows()
         elif state == "legacy_partial":
@@ -3582,7 +4211,10 @@ def ingest_git_dag(
             if commit_row:
                 head_commit_id = commit_row[0]
             else:
-                head_commit_id = db.get_next_id(m_commit)
+                if getattr(G, "distributed", False) and hasattr(db, "reserve_id_block"):
+                    head_commit_id = db.reserve_id_block(m_commit, 1)[0]
+                else:
+                    head_commit_id = db.get_next_id(m_commit)
                 db.insert(m_commit, (
                     head_commit_id,
                     network_id,
@@ -3600,42 +4232,84 @@ def ingest_git_dag(
             except Exception:
                 pass
         else:
-            ref_id = db.get_next_id(m_git_ref)
-            db.insert(m_git_ref, (ref_id, repo_id, ref_type, version_or_ref, head_commit_id, None, None, None))
-        if not already_ingested and getattr(db, "cnx", None) is not None:
+            if getattr(G, "distributed", False) and hasattr(db, "reserve_id_block"):
+                ref_id = db.reserve_id_block(m_git_ref, 1)[0]
+            else:
+                ref_id = db.get_next_id(m_git_ref)
+            try:
+                db.insert(m_git_ref, (ref_id, repo_id, ref_type, version_or_ref, head_commit_id, None, None, None))
+            except Exception as e_ins:
+                ref_row = db.select(m_git_ref, (None, repo_id, None, version_or_ref, None, None, None, None))
+                if ref_row:
+                    ref_id = ref_row[0]
+                    try:
+                        db.update(m_git_ref, (ref_id, repo_id, ref_type, version_or_ref, head_commit_id, None, None, None))
+                    except Exception:
+                        pass
+                else:
+                    raise e_ins
+        if not already_ingested and db is not None:
             # From here on every row the run writes lies above these watermarks (see core/ingest_state.py)
-            ingest_state.begin(db.cnx, network_id, head_commit_id, TABLES)
+            ingest_state.begin(
+                db,
+                network_id,
+                head_commit_id,
+                TABLES,
+                base_commit_id=getattr(gp, "Old_VID", 0) or 0,
+                worker_id=getattr(G, "node_id", "") or "",
+            )
+        if getattr(G, "distributed", False) and getattr(G, "node_id", None):
+            if heartbeat_daemon := getattr(G, "heartbeat_daemon", None):
+                heartbeat_daemon.set_active(head_commit_id)
+            if getattr(gp, "_active_task_id", None) and db is not None:
+                if hasattr(db, "execute"):
+                    db.execute("UPDATE m_parse_task SET commit_id = %s WHERE task_id = %s", (head_commit_id, gp._active_task_id))
+                    if hasattr(db, "commit"):
+                        db.commit()
 
-    gp.Old_VID = gp.VID
+    if getattr(G, "distributed_role", None) != distributed.ROLE_WORKER and not getattr(gp, "_repair_base_set", False):
+        gp.Old_VID = gp.VID
+        gp.Old_Version_Name = gp.Version_Name
     gp.VID = head_commit_id
-    gp.Old_Version_Name = gp.Version_Name
     gp.Version_Name = version_or_ref
     return head_commit_id, is_checkpoint, already_ingested
 
 
 def _previous_ingest(db: Any, network_id: int, commit_id: int, version_or_ref: str) -> str:
-    """State of an earlier ingestion of `commit_id`: "done", "interrupted", "legacy_partial" or "new".
+    """State of an earlier ingestion of `commit_id`: "done", "in_progress", "interrupted", "legacy_partial" or "new".
 
     `m_ingest_state` decides when present. Versions ingested before it existed have no row: they count
     as done when their checkpoint covers at least 90% of the tree (the row is then backfilled), else
     as a partial legacy run when they have checkpoint rows.
     """
-    cnx = getattr(db, "cnx", None)
-    if cnx is None:
+    if db is None:
         return "done" if db.select(m_bridge_checkpoint, (commit_id, None, None)) else "new"
-    with contextlib.closing(cnx.cursor()) as cur:
-        status = ingest_state.get_status(cur, network_id, commit_id)
-        if status == ingest_state.INGEST_DONE:
-            return "done"
-        if status == ingest_state.INGEST_PARSING:
-            return "interrupted"
-        cur.execute("SELECT COUNT(*) FROM m_bridge_checkpoint WHERE commit_id = %s", (commit_id,))
-        row_cnt = cur.fetchone()[0]
+    status = ingest_state.get_status(db, network_id, commit_id)
+    if status == ingest_state.INGEST_DONE:
+        return "done"
+    if status == ingest_state.INGEST_PARSING:
+        if getattr(G, "distributed", False) and hasattr(db, "query_one"):
+            now = int(time.time())
+            row = db.query_one(
+                "SELECT 1 FROM m_ingest_state s JOIN m_parse_node n ON s.worker_id = n.node_id "
+                "WHERE s.network_id = %s AND s.commit_id = %s AND s.worker_id != '' AND n.heartbeat_at >= %s",
+                (network_id, commit_id, now - 180),
+                dictionary=False,
+            )
+            if row:
+                return "in_progress"
+        return "interrupted"
+    row_cnt = 0
+    if hasattr(db, "query_one"):
+        row = db.query_one("SELECT COUNT(*) FROM m_bridge_checkpoint WHERE commit_id = %s", (commit_id,), dictionary=False)
+        row_cnt = int(row[0]) if row else 0
+    elif hasattr(db, "select"):
+        row_cnt = 1 if db.select(m_bridge_checkpoint, (commit_id, None, None)) else 0
     if not row_cnt:
         return "new"
     tree_files = len(MF.git_file_list(version_or_ref).splitlines())
     if tree_files > 0 and row_cnt >= max(1, int(tree_files * 0.9)):
-        ingest_state.set_status(cnx, network_id, commit_id, ingest_state.INGEST_DONE)
+        ingest_state.set_status(db, network_id, commit_id, ingest_state.INGEST_DONE)
         return "done"
     return "legacy_partial"
 
@@ -3654,13 +4328,15 @@ def _resolve_legacy_state(ref: str, version_states: dict[str, tuple[int, str]], 
 
 def _purge_partial_version(db: Any, commit_id: int) -> None:
     """Remove the version-scoped rows of an interrupted run that left no watermarks."""
-    cnx = getattr(db, "cnx", None)
-    if cnx is None:
+    if db is None:
         return
-    with contextlib.closing(cnx.cursor()) as cur:
-        for table in ("m_bridge_checkpoint", "m_commit_file", "m_bridge_commit_tag", "m_bridge_commit_person", "m_commit_email"):
-            cur.execute(f"DELETE FROM {table} WHERE commit_id = %s", (commit_id,))  # noqa: S608
-    cnx.commit()
+    checkpoints.expand_dependents(db, commit_id)
+    if hasattr(db, "execute"):
+        for table in ("m_checkpoint_base", "m_bridge_checkpoint", "m_arch_root", "m_commit_file", "m_bridge_commit_tag",
+                      "m_bridge_commit_person", "m_commit_email"):
+            db.execute(f"DELETE FROM {table} WHERE commit_id = %s", (commit_id,))  # noqa: S608
+        if hasattr(db, "commit"):
+            db.commit()
 
 
 def _forget_rolled_back_rows() -> None:
@@ -3674,12 +4350,94 @@ def _forget_rolled_back_rows() -> None:
 
 
 def finish_version_ingest(commit_id: int | None) -> None:
-    """Mark the version as completely ingested (the webapp lists it from now on)."""
+    """Mark the version as completely ingested (the webapp lists it from now on), then store the previous
+    version's checkpoint as a delta when it is close to an earlier full one (core/checkpoints.py): from now on
+    this version is the one the next run reads as a full tree."""
     if not commit_id:
         return
     with G.DB() as db:
-        if getattr(db, "cnx", None) is not None:
-            ingest_state.set_status(db.cnx, getattr(gp, "network_id", 1), commit_id, ingest_state.INGEST_DONE)
+        if db is not None:
+            if getattr(G, "distributed_role", None) == distributed.ROLE_WORKER and getattr(gp, "_active_task_id", None):
+                now = int(time.time())
+                row = db.query_one(
+                    "SELECT 1 FROM m_parse_task WHERE task_id = %s AND worker_id = %s AND status = %s AND lease_expires_at > %s",
+                    (gp._active_task_id, getattr(G, "node_id", ""), distributed.TASK_LEASED, now),
+                    dictionary=False,
+                ) if hasattr(db, "query_one") else (1,)
+                if not row:
+                    raise RuntimeError(f"Worker lease for task {gp._active_task_id} expired or was revoked; aborting completion.")
+            ingest_state.set_status(db, getattr(gp, "network_id", 1), commit_id, ingest_state.INGEST_DONE)
+            refresh_person_identities(db, "version ingested")
+            _compact_checkpoint(db, getattr(gp, "Old_VID", 0), commit_id)
+            if getattr(G, "distributed", False) and getattr(G, "distributed_role", None) != distributed.ROLE_WORKER:
+                from core.distributed import unlock_dependent_tasks
+                unlock_dependent_tasks(db, getattr(gp, "network_id", 1), commit_id, base_ref_name=getattr(gp, "Version_Name", None))
+
+
+def refresh_person_identities(db: Any, reason: str, only_if_incomplete: bool = False) -> int | None:
+    """Store the identity of every person alias (m_person_identity, parser/git_ast/identity.py). The master
+    (or a standalone run) does it; a worker's new persons are picked up at the master's next refresh.
+    With only_if_incomplete, nothing is done when every person already has a row. Never blocks parsing."""
+    if db is None or (getattr(G, "distributed_role", "standalone") == distributed.ROLE_WORKER and reason != "worker shutdown"):
+        return None
+    from parser.git_ast.identity import refresh_person_identities as refresh
+    try:
+        if only_if_incomplete:
+            row = _query_one_row(
+                db,
+                "SELECT (SELECT COUNT(*) FROM m_maintainer_person WHERE person_id > 0), (SELECT COUNT(*) FROM m_person_identity)",
+            )
+            persons, stored = (row or (0, 0)) if (row and len(row) >= 2) else (0, 0)
+            if int(persons or 0) == int(stored or 0):
+                return 0
+        started = time.perf_counter()
+        changed = refresh(db)
+        if changed:
+            logger.info(f"[Identities] {changed} person identity row(s) updated ({reason}) in {time.perf_counter() - started:.1f}s.")
+        return changed
+    except Exception as exc:  # noqa: BLE001 - identities are an optimization for the webapp
+        logger.warning(COLOR.yellow(f"[Identities] Refreshing m_person_identity failed ({reason}): {exc}"))
+        if hasattr(db, "rollback"):
+            with contextlib.suppress(Exception):
+                db.rollback()
+        return None
+
+
+def _compact_checkpoint(db: Any, prev_vid: int | None, current_vid: int) -> None:
+    """Best effort: a failed compaction leaves the full checkpoint in place."""
+    if not prev_vid or prev_vid == current_vid:
+        return
+    try:
+        started = time.perf_counter()
+        res = checkpoints.compact(
+            db,
+            getattr(gp, "network_id", 1),
+            prev_vid,
+            current=current_vid,
+            preferred_base=getattr(gp, "Old_VID", 0),
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(f"[Checkpoint] Keeping commit_id {prev_vid}'s checkpoint full: compaction failed: {exc}")
+        return
+    if res:
+        logger.info(
+            f"[Checkpoint] commit_id {prev_vid} stored as a delta of {res['base']}: {res['changed'] + res['removed']} "
+            f"of {res['total']} rows kept ({res['dropped']} dropped) in {time.perf_counter() - started:.1f}s."
+        )
+
+
+def _ensure_full_checkpoint(commit_id: int | None) -> None:
+    """Expand `commit_id`'s checkpoint when it is a delta (the TableEngine and Steps 4-6 read it in full)."""
+    if not commit_id:
+        return
+    with G.DB() as db:
+        if db is None:
+            return
+        restored = checkpoints.expand(db, commit_id)
+    if restored:
+        logger.info(f"[Checkpoint] Expanded the delta checkpoint of commit_id {commit_id} ({restored} rows restored).")
+    if restored:
+        logger.info(f"[Checkpoint] Expanded the delta checkpoint of commit_id {commit_id} ({restored} rows restored).")
 
 
 def create_new_vid(name: str) -> bool:
@@ -4653,8 +5411,7 @@ def _load_blob_tags(blob_ids: Iterable[int]) -> dict[int, list[tuple[int, int, i
     if not wanted:
         return tags
     with G.DB() as db:
-        cur = _raw_cursor(db)
-        if cur is None:
+        if not hasattr(db, "query") or isinstance(db, MockDB):
             for blob_id in wanted:
                 for row in m_bridge_tag.view_get_multiple(((m_bridge_tag.blob_id,),), blob_id, None, None, None, None, None) or ():
                     tags[blob_id].append((row[1], blob_id, row[2], row[3]))
@@ -4662,14 +5419,15 @@ def _load_blob_tags(blob_ids: Iterable[int]) -> dict[int, list[tuple[int, int, i
         try:
             for i in range(0, len(wanted), _SQL_IN_CHUNK):
                 chunk = wanted[i : i + _SQL_IN_CHUNK]
-                cur.execute(
+                rows = db.query(
                     f"SELECT blob_id, tag_id, line_s, line_e FROM m_bridge_tag WHERE blob_id IN ({','.join(['%s'] * len(chunk))})",  # noqa: S608
                     tuple(chunk),
+                    dictionary=False,
                 )
-                for blob_id, tag_id, line_s, line_e in cur.fetchall():
+                for blob_id, tag_id, line_s, line_e in rows:
                     tags[int(blob_id)].append((int(tag_id), int(blob_id), int(line_s), int(line_e)))
-        finally:
-            cur.close()
+        except Exception as exc:
+            logger.debug(f"_load_blob_tags query failed: {exc}")
     return tags
 
 
@@ -4682,6 +5440,42 @@ def _commit_blob_id(path: str, sha: str) -> int:
     if head_hash is not None and head_hash.hex() == sha and path in gp.file_blob_ids:
         return gp.file_blob_ids[path]
     return G.TE.set(m_file_blob.table_id, (None, bytes.fromhex(sha), type_check(path)))[0]
+
+
+def commit_relation_rows(new_messages: list[tuple[int, str, str]], repo_path: Any) -> tuple[list[tuple], list[tuple]]:
+    """m_commit_relation / m_commit_link rows of newly inserted commits ((commit_id, sha, message);
+    parser/git_ast/commit_relations.py). Abbreviated targets are resolved once for the batch, with one
+    `git cat-file`; a prefix naming no commit or several keeps a zero target_hash."""
+    from parser.git_ast import commit_relations as cr
+    parsed = [(cid, *cr.relation_rows(msg or "", sha)) for cid, sha, msg in new_messages]
+    prefixes = set().union(*(cr.prefixes_to_resolve(rels) for _cid, rels, _links in parsed)) if parsed else set()
+    resolved: dict[str, str] = {}
+    if prefixes and repo_path:
+        try:
+            resolved = cr.resolve_prefixes(repo_path, prefixes)
+        except (OSError, sp.SubprocessError) as exc:
+            logger.warning(f"Commit relation prefixes not resolved ({len(prefixes)}): {exc}")
+    rel_rows: list[tuple] = []
+    link_rows: list[tuple] = []
+    for cid, rels, links in parsed:
+        r, lk = cr.table_rows(cid, rels, links, resolved)
+        rel_rows.extend(r)
+        link_rows.extend(lk)
+    if parsed:
+        logger.info(f"Commit relations: {len(rel_rows)} relation(s), {len(link_rows)} mail link(s) for {len(parsed)} new "
+                    f"commit(s); {len(resolved)} of {len(prefixes)} abbreviated target(s) resolved.")
+    return rel_rows, link_rows
+
+
+def stage_commit_relations(new_messages: list[tuple[int, str, str]], repo_path: Any) -> tuple[int, int]:
+    """Stage through the TableEngine the relation rows of commits Step 6.5 inserted itself (commits Step 1
+    did not register; those get their rows in _ingest_commit_range)."""
+    rel_rows, link_rows = commit_relation_rows(new_messages, repo_path)
+    for row in rel_rows:
+        G.TE.set(m_commit_relation.table_id, row)
+    for row in link_rows:
+        G.TE.set(m_commit_link.table_id, row)
+    return len(rel_rows), len(link_rows)
 
 
 def processing_git_commits(version: str) -> None:
@@ -4722,6 +5516,7 @@ def processing_git_commits(version: str) -> None:
             known_ids.update(_lookup_commit_ids(db, network_id, unknown))
 
     pending_parents: list[tuple[int, list[str]]] = []
+    new_messages: list[tuple[int, str, str]] = []
     head_commit_id = None
     for commit in commits:
         if G.is_deadline_exceeded():
@@ -4760,6 +5555,7 @@ def processing_git_commits(version: str) -> None:
                 ),
             )
             commit_id = commit_res[0]
+            new_messages.append((commit_id, c_hash if isinstance(c_hash, str) else bytes(c_hash).hex(), commit.message))
         commit.commit_id = commit_id
         commit_hash_to_id[commit.commit_hash] = commit_id
         if head_commit_id is None:
@@ -4811,6 +5607,9 @@ def processing_git_commits(version: str) -> None:
             p_cid = commit_hash_to_id.get(p_hash) or known_ids.get(p_hash)
             if p_cid is not None:
                 G.TE.set(m_commit_parent.table_id, (commit_id, p_cid, p_idx))
+
+    # What the new commits' messages say about other commits and mail (m_commit_relation, m_commit_link)
+    stage_commit_relations(new_messages, repo_path)
 
     # Link tags to commits for all changed files and evacuate executed ChangeSet memory
     # Use gp.file_pre_extracted_tags and gp.file_blob_ids directly to avoid decompressing 70,000 ChangeSets!
@@ -4918,15 +5717,12 @@ def processing_git_commits(version: str) -> None:
             existing_fnids: set[int] = set()
             try:
                 with G.DB() as db:
-                    cur = db.cursor if hasattr(db, "cursor") else (db.cnx.cursor() if hasattr(db, "cnx") and db.cnx else None)
-                    if cur:
-                        cur.execute("SELECT COUNT(*) FROM m_bridge_checkpoint WHERE commit_id = %s", (checkpoint_cid,))
-                        row = cur.fetchone()
+                    if hasattr(db, "query_one"):
+                        row = db.query_one("SELECT COUNT(*) FROM m_bridge_checkpoint WHERE commit_id = %s", (checkpoint_cid,), dictionary=False)
                         existing_count = row[0] if (row and len(row) > 0) else 0
                         if 0 < existing_count < len(blob_items):
-                            cur.execute("SELECT fnid FROM m_bridge_checkpoint WHERE commit_id = %s", (checkpoint_cid,))
-                            existing_fnids = {r[0] for r in cur.fetchall()}
-                        cur.close()
+                            rows = db.query("SELECT fnid FROM m_bridge_checkpoint WHERE commit_id = %s", (checkpoint_cid,), dictionary=False)
+                            existing_fnids = {r[0] for r in rows}
             except Exception as e:
                 logger.debug(f"Note on checking m_bridge_checkpoint existing rows: {e}")
 
@@ -5250,51 +6046,49 @@ def processing_kbuild(
     staged_file_refs: set[tuple[int, int, int, int, int]] | None = None,
     new_pairs: set[tuple[int, int]] | None = None,
 ) -> None:
-    """Parse the version's Makefile and Kbuild files and stage their build references (m_file_reference).
+    """Parse the version's Makefile and Kbuild files and stage their rules with the CONFIG_ symbols that
+    govern them (m_kbuild_symbol, parser/kbuild_symbols.py).
 
     Rows are keyed by the Makefile's (blob, path), since the targets resolve against its directory: only
     the (fnid, blob_id) pairs in `new_pairs` (None: every file) are parsed, and a Makefile carried over
-    at the same path keeps the rows computed when it first appeared there. Which Kconfig symbols govern a
-    file is answered from Git by the webapp (kbuild_usage, build conditions), not stored.
+    at the same path keeps the rows computed when it first appeared there. Every binding is kept, also
+    when its target file does not exist. `staged_file_refs` is unused (kept for callers).
     """
     if gp.VID == 0:
         return
-    if staged_file_refs is None:
-        staged_file_refs = set()
-
     from parser.kbuild_parser import KbuildParser
+    from parser import kbuild_symbols
     kbuild_parser = KbuildParser()
 
     all_files = _version_file_list(version, "kbuild parsing")
-    is_makefile = lambda f: f.endswith("Makefile") or f.endswith("Kbuild")  # noqa: E731
-    targets = _reference_sources(all_files, is_makefile, new_pairs)
+    targets = _reference_sources(all_files, kbuild_symbols.is_kbuild_file, new_pairs)
     if not targets:
         return
-    logger.info(f"Processing {len(targets)} Makefile/Kbuild files for version '{version}' (of {sum(map(is_makefile, all_files))} total)...")
+    logger.info(
+        f"Processing {len(targets)} Makefile/Kbuild files for version '{version}' "
+        f"(of {sum(map(kbuild_symbols.is_kbuild_file, all_files))} total)..."
+    )
 
-    ref_count = 0
+    row_count = 0
     for mk_path, mk_fnid, mk_blob in targets:
         if G.is_deadline_exceeded():
             logger.warning(COLOR.yellow("[Duration Limit] Execution deadline reached during Kbuild processing. Stopping early..."))
             break
         try:
-            content = MF.get_file(mk_path, gp.Version_Name)
-            if not content:
-                continue
-            for b in kbuild_parser.parse_makefile_content(content, dir_path=os.path.dirname(mk_path)):
-                target_fnid = get_fnid_for_path(b.source_file_rel)
-                if target_fnid is None and b.source_file_rel.endswith(".c"):
-                    target_fnid = get_fnid_for_path(b.source_file_rel[:-2] + ".S")
-                if target_fnid is None:
-                    continue
-                ref_count += _stage_file_reference(
-                    staged_file_refs, mk_blob, mk_fnid, target_fnid,
-                    int(getattr(b, "ref_type", 3)), int(getattr(b, "source_line", 1)), getattr(b, "details", ""),
+            # An empty file still gets its marker row (kbuild_symbols.binding_rows), so the pair counts as processed
+            content = MF.get_file(mk_path, gp.Version_Name) or ""
+            bindings = kbuild_parser.parse_makefile_content(content, dir_path=os.path.dirname(mk_path)) if content else []
+            for row in kbuild_symbols.binding_rows(bindings, get_fnid_for_path):
+                idx, line, symbol, via, mode, kind, target_obj, target_path, target_fnid, rule = row
+                G.TE.set(
+                    m_kbuild_symbol.table_id,
+                    (mk_blob, mk_fnid, idx, symbol, via, line, mode, kind, target_obj, target_path, target_fnid, rule),
                 )
+                row_count += 1
         except Exception as e:
             logger.debug(f"Error parsing kbuild file '{mk_path}': {e}")
 
-    logger.info(f"Staged {ref_count} build references for version '{version}'.")
+    logger.info(f"Staged {row_count} Kbuild rule rows (m_kbuild_symbol) for version '{version}'.")
 
 
 def processing_doc_references(
@@ -5347,19 +6141,38 @@ def processing_doc_references(
     logger.info(f"Staged {count} documentation cross-file references into m_file_reference for version '{version}'.")
 
 
-def processing_include_references(version: str) -> None:
+def processing_include_references(version: str, pairs_db: Any = None) -> None:
     """Batch populate C/ASM and Kconfig include references into m_file_reference using set-based query.
 
     Only the (path, blob) pairs new in this version (absent from gp.Old_VID's checkpoint) are processed:
     their previous rows were cleared by processing_file_references(), and carried-over pairs keep theirs.
     Every path holding the blob gets its own rows (source_fnid), with the targets of the blob's AST.
+    `pairs_db`: connection holding `tmp_new_pairs` (processing_file_references), whose
+    pairs are joined instead of computing the anti-join of the two checkpoints again.
     """
     if gp.VID == 0:
         return
+    kconfig_types = f"{ASTT.Kconfig_Source.value}, {ASTT.Kconfig_Rsource.value}, {ASTT.Kconfig_Osource.value}"
+    if pairs_db is not None:
+        inserted = pairs_db.execute(
+            f"""
+            INSERT IGNORE INTO m_file_reference (source_blob_id, source_fnid, target_fnid, ref_type, line_no, details)
+            SELECT STRAIGHT_JOIN DISTINCT bt.blob_id, p.fnid, inc.fnid,
+                   CASE WHEN a.type_id IN ({kconfig_types}) THEN {int(FileRefType.Kconfig)} ELSE {int(FileRefType.Include)} END AS ref_type,
+                   bt.line_s,
+                   LEFT(a.name, 255)
+            FROM tmp_new_pairs p
+            JOIN m_bridge_tag bt ON p.blob_id = bt.blob_id
+            JOIN m_tag t ON bt.tag_id = t.tag_id
+            JOIN m_ast_include inc ON t.ast_id = inc.ast_id
+            JOIN m_ast a ON inc.ast_id = a.ast_id;
+            """
+        )
+        logger.info(f"Synchronized {inserted} include/Kconfig references into m_file_reference for version '{version}'.")
+        return
     try:
         with G.DB() as db:
-            cur = db.cnx.cursor() if hasattr(db, "cnx") and db.cnx else None
-            if cur is None:
+            if not hasattr(db, "execute") or isinstance(db, MockDB):
                 return
 
             sync_query = f"""
@@ -5377,10 +6190,9 @@ def processing_include_references(version: str) -> None:
                 JOIN m_ast a ON inc.ast_id = a.ast_id
                 WHERE bf.commit_id = %s AND old_v.blob_id IS NULL;
             """
-            cur.execute(sync_query, (gp.Old_VID or 0, gp.VID))
-            inserted = cur.rowcount
-            db.cnx.commit()
-            cur.close()
+            inserted = db.execute(sync_query, (gp.Old_VID or 0, gp.VID))
+            if hasattr(db, "commit"):
+                db.commit()
             logger.info(f"Synchronized {inserted} include/Kconfig references into m_file_reference for version '{version}'.")
     except Exception as e:
         logger.warning(f"Error in processing_include_references for {version}: {e}", exc_info=True)
@@ -5394,11 +6206,10 @@ def _new_version_file_pairs() -> set[tuple[int, int]] | None:
     identical Makefile copied to another directory). Returns None when the driver has no SQL access (MockDB).
     """
     with G.DB() as db:
-        cur = _raw_cursor(db)
-        if cur is None:
+        if not hasattr(db, "query") or isinstance(db, MockDB):
             return None
         try:
-            cur.execute(
+            rows = db.query(
                 """
                 SELECT cur_v.fnid, cur_v.blob_id FROM m_bridge_checkpoint cur_v
                 LEFT JOIN m_bridge_checkpoint old_v
@@ -5406,18 +6217,43 @@ def _new_version_file_pairs() -> set[tuple[int, int]] | None:
                 WHERE cur_v.commit_id = %s AND old_v.blob_id IS NULL
                 """,
                 (gp.Old_VID or 0, gp.VID),
+                dictionary=False,
             )
-            return {(int(f), int(b)) for f, b in cur.fetchall()}
-        finally:
-            cur.close()
+            return {(int(f), int(b)) for f, b in rows}
+        except Exception:
+            return None
+
+
+def _new_pairs_table(db: Any) -> set[tuple[int, int]]:
+    """Fill the connection's temporary table tmp_new_pairs with _new_version_file_pairs()'s anti-join (run
+    once per version: ~7 s on the reference database) and return its pairs."""
+    db.execute("DROP TEMPORARY TABLE IF EXISTS tmp_new_pairs")
+    db.execute("CREATE TEMPORARY TABLE tmp_new_pairs (fnid INT NOT NULL, blob_id INT NOT NULL, PRIMARY KEY (fnid, blob_id))")
+    db.execute(
+        """
+        INSERT INTO tmp_new_pairs (fnid, blob_id)
+        SELECT cur_v.fnid, cur_v.blob_id FROM m_bridge_checkpoint cur_v
+        LEFT JOIN m_bridge_checkpoint old_v
+               ON old_v.commit_id = %s AND old_v.fnid = cur_v.fnid AND old_v.blob_id = cur_v.blob_id
+        WHERE cur_v.commit_id = %s AND old_v.blob_id IS NULL
+        """,
+        (gp.Old_VID or 0, gp.VID),
+    )
+    rows = db.query("SELECT fnid, blob_id FROM tmp_new_pairs", dictionary=False)
+    return {(int(f), int(b)) for f, b in rows}
+
+
+_FILE_REFERENCE_TABLES = ("m_file_reference", "m_kbuild_symbol")
 
 
 def processing_file_references(version: str) -> None:
     """Extract and consolidate all cross-file references (Kbuild, Makefiles, Documentation, Includes, Kconfig).
 
-    m_file_reference rows are keyed by the source file's (blob, path) pair (`source_blob_id`, `source_fnid`),
-    so only the pairs new in this version are cleared and recomputed (`_new_version_file_pairs()`); pairs
-    carried over keep their rows.
+    m_file_reference / m_kbuild_symbol rows are keyed by the source file's (blob, path) pair
+    (`source_blob_id`, `source_fnid`), so only the pairs new in this version are cleared and recomputed;
+    pairs carried over keep their rows. The new pairs are computed once, into a temporary table of one
+    connection that the clearing deletes and the include INSERT ... SELECT join (_new_pairs_table); without
+    it (no SQL access, or the table cannot be created) each statement runs the anti-join itself.
     """
     if gp.VID == 0:
         return
@@ -5425,175 +6261,233 @@ def processing_file_references(version: str) -> None:
     # Ensure all parent tables (m_file_blob, m_file_name, m_bridge_checkpoint) are committed before referencing
     G.TE.commit_all()
 
-    new_pairs = _new_version_file_pairs()
-    if new_pairs is not None:
-        logger.info(f"Recomputing file references for {len(new_pairs)} (path, blob) pairs new in version '{version}'.")
+    with G.DB() as pairs_db:
+        new_pairs: set[tuple[int, int]] | None = None
+        has_tmp_pairs = False
+        if hasattr(pairs_db, "execute") and not isinstance(pairs_db, MockDB):
+            try:
+                started = time.perf_counter()
+                new_pairs = _new_pairs_table(pairs_db)
+                for table in _FILE_REFERENCE_TABLES:
+                    pairs_db.execute(
+                        f"DELETE r FROM tmp_new_pairs p JOIN {table} r ON r.source_blob_id = p.blob_id AND r.source_fnid = p.fnid"
+                    )
+                if hasattr(pairs_db, "commit"):
+                    pairs_db.commit()
+                has_tmp_pairs = True
+                logger.info(f"[Step 6.6] New (path, blob) pairs computed once and cleared in {time.perf_counter() - started:.1f}s.")
+            except Exception as e:
+                logger.debug(f"Temporary new-pairs table unavailable for {version} ({e}); using the per-statement anti-join.")
+                if hasattr(pairs_db, "rollback"):
+                    with contextlib.suppress(Exception):
+                        pairs_db.rollback()
+                new_pairs = None
+        if not has_tmp_pairs:
+            new_pairs = _new_version_file_pairs()
+            _clear_new_pair_rows(version)
+        if new_pairs is not None:
+            logger.info(f"Recomputing file references for {len(new_pairs)} (path, blob) pairs new in version '{version}'.")
 
-    # 1. Clear the rows of the pairs about to be recomputed (idempotent across pipeline re-runs)
-    try:
-        with G.DB() as db:
-            cur = _raw_cursor(db)
-            if cur:
-                cur.execute(
-                    """
-                    DELETE r FROM m_bridge_checkpoint cur_v
-                    LEFT JOIN m_bridge_checkpoint old_v
-                           ON old_v.commit_id = %s AND old_v.fnid = cur_v.fnid AND old_v.blob_id = cur_v.blob_id
-                    JOIN m_file_reference r ON r.source_blob_id = cur_v.blob_id AND r.source_fnid = cur_v.fnid
-                    WHERE cur_v.commit_id = %s AND old_v.blob_id IS NULL;
-                    """,
-                    (gp.Old_VID or 0, gp.VID),
-                )
-                db.cnx.commit()
-                cur.close()
-    except Exception as e:
-        logger.debug(f"Note on clearing m_file_reference for {version}: {e}")
-
-    # 2. Resynchronize TableEngine sequence next_id before staging fresh rows
-    if hasattr(G.TE, "db") and G.TE.db:
+        # 2. Resynchronize TableEngine sequence next_id before staging fresh rows
+        if hasattr(G.TE, "_id_cursor"):
+            G.TE._id_cursor.pop(m_file_reference.table_id, None)
+        if hasattr(G.TE, "_id_limit"):
+            G.TE._id_limit.pop(m_file_reference.table_id, None)
+        te_db = getattr(G.TE, "db", None)
         try:
-            G.TE.next_id[m_file_reference.table_id] = G.TE.db.get_next_id(m_file_reference)
+            if te_db is not None:
+                G.TE.next_id[m_file_reference.table_id] = te_db.get_next_id(m_file_reference)
+            else:
+                with G.DB() as db:
+                    if db is not None:
+                        G.TE.next_id[m_file_reference.table_id] = db.get_next_id(m_file_reference)
         except Exception:
             pass
 
-    # Rows staged in this run (rows of other pairs were cleared or are not recomputed)
-    staged_file_refs: set[tuple[int, int, int, int, int]] = set()
+        # Rows staged in this run (rows of other pairs were cleared or are not recomputed)
+        staged_file_refs: set[tuple[int, int, int, int, int]] = set()
 
-    # 3. Parse Kbuild and Documentation files and stage into TableEngine (fnids come from the committed TE cache)
-    processing_kbuild(version, staged_file_refs=staged_file_refs, new_pairs=new_pairs)
-    processing_doc_references(version, staged_file_refs=staged_file_refs, new_pairs=new_pairs)
+        # 3. Parse Kbuild and Documentation files and stage into TableEngine (fnids come from the committed TE cache)
+        processing_kbuild(version, staged_file_refs=staged_file_refs, new_pairs=new_pairs)
+        processing_doc_references(version, staged_file_refs=staged_file_refs, new_pairs=new_pairs)
 
-    # 4. Commit TableEngine queued rows immediately so they claim sequence IDs 1..N and empty the queue
-    if m_file_reference.table_id in G.TE.queued_set and G.TE.queued_set[m_file_reference.table_id]:
-        G.TE.commit(m_file_reference.table_id, update_in_mem_indexes=False)
+        # 4. Commit TableEngine queued rows immediately so they claim sequence IDs 1..N and empty the queue
+        if m_file_reference.table_id in G.TE.queued_set and G.TE.queued_set[m_file_reference.table_id]:
+            G.TE.commit(m_file_reference.table_id, update_in_mem_indexes=False)
 
-    # 5. Populate C/ASM and Kconfig include references using set-based SQL (claims N+1..M via server AUTO_INCREMENT)
-    processing_include_references(version)
+        # 5. Populate C/ASM and Kconfig include references using set-based SQL (claims N+1..M via server AUTO_INCREMENT)
+        if has_tmp_pairs:
+            try:
+                processing_include_references(version, pairs_db=pairs_db)
+                pairs_db.execute("DROP TEMPORARY TABLE IF EXISTS tmp_new_pairs")
+                if hasattr(pairs_db, "commit"):
+                    pairs_db.commit()
+            except Exception as e:
+                logger.warning(f"Error in processing_include_references for {version}: {e}", exc_info=True)
+        else:
+            processing_include_references(version)
 
     # 6. Resynchronize next_id so subsequent operations and commit_all have the accurate sequence boundary
-    if hasattr(G.TE, "db") and G.TE.db:
+    if hasattr(G.TE, "_id_cursor"):
+        G.TE._id_cursor.pop(m_file_reference.table_id, None)
+    if hasattr(G.TE, "_id_limit"):
+        G.TE._id_limit.pop(m_file_reference.table_id, None)
+    te_db = getattr(G.TE, "db", None)
+    try:
+        if te_db is not None:
+            G.TE.next_id[m_file_reference.table_id] = te_db.get_next_id(m_file_reference)
+        else:
+            with G.DB() as db:
+                if db is not None:
+                    G.TE.next_id[m_file_reference.table_id] = db.get_next_id(m_file_reference)
+    except Exception:
+        pass
+
+
+def _clear_new_pair_rows(version: str) -> None:
+    """Delete the m_file_reference / m_kbuild_symbol rows of the pairs new in this version, each with its own
+    anti-join (the path without the temporary table)."""
+    for table in _FILE_REFERENCE_TABLES:
         try:
-            G.TE.next_id[m_file_reference.table_id] = G.TE.db.get_next_id(m_file_reference)
-        except Exception:
-            pass
+            with G.DB() as db:
+                if hasattr(db, "execute") and not isinstance(db, MockDB):
+                    db.execute(
+                        f"""
+                        DELETE r FROM m_bridge_checkpoint cur_v
+                        LEFT JOIN m_bridge_checkpoint old_v
+                               ON old_v.commit_id = %s AND old_v.fnid = cur_v.fnid AND old_v.blob_id = cur_v.blob_id
+                        JOIN {table} r ON r.source_blob_id = cur_v.blob_id AND r.source_fnid = cur_v.fnid
+                        WHERE cur_v.commit_id = %s AND old_v.blob_id IS NULL;
+                        """,
+                        (gp.Old_VID or 0, gp.VID),
+                    )
+                    if hasattr(db, "commit"):
+                        db.commit()
+        except Exception as e:
+            logger.debug(f"Note on clearing {table} for {version}: {e}")
 
 
-def _maintainer_section_ids(blob_id: int, sections: Iterable[Any]) -> dict[str, int]:
-    """Section name -> sec_id of one MAINTAINERS blob (the first section of a repeated name), in one query."""
-    found: dict[str, int] = {}
+def _maintainer_scope(
+    blob_id: int | None, base_commit_id: int, sections: Iterable[Any]
+) -> tuple[dict[str, int], set[int], set[int], bool]:
+    """(section key -> sec_id of this version, sec_ids of the base version, base sec_ids with file rows,
+    whether SQL answered).
+
+    Read through parser/maintainer_ast/maintainer_store.py. Without SQL access (MockDB) the sections are
+    looked up by name in the TableEngine and the base is unknown."""
+    from parser.maintainer_ast import maintainer_store
     with G.DB() as db:
-        cur = _raw_cursor(db)
-        if cur is not None:
+        if hasattr(db, "query") and not isinstance(db, MockDB):
             try:
-                cur.execute("SELECT name, sec_id FROM m_maintainer_section WHERE blob_id = %s ORDER BY sec_id", (blob_id,))
-                for name, sec_id in cur.fetchall():
-                    if isinstance(name, (bytes, bytearray)):
-                        name = name.decode("utf-8", "replace")
-                    found.setdefault(name, int(sec_id))
-            finally:
-                cur.close()
-            return found
+                cur_ids = maintainer_store.blob_section_ids(db, blob_id) if blob_id else {}
+                prev_ids: set[int] = set()
+                if base_commit_id:
+                    prev_blob = maintainer_store.version_blob(db, base_commit_id, "MAINTAINERS")
+                    prev_ids = set(maintainer_store.blob_section_ids(db, prev_blob).values()) if prev_blob else set()
+                mapped = maintainer_store.sections_with_rows(db, prev_ids) if prev_ids else set()
+                return cur_ids, prev_ids, mapped, True
+            except Exception:
+                pass
+    found: dict[str, int] = {}
     for sec in sections:
-        if sec.name and sec.name not in found:
-            row = m_maintainer_section.get(None, blob_id, sec.name, None, None, None, None, None)
+        key = maintainer_store.section_key(sec.name)
+        if key and key not in found:
+            row = m_maintainer_section.get(None, None, sec.name, None, None, None, None, None)
             if row and len(row) >= 3 and row[2]:
-                found[sec.name] = row[2][0]
-    return found
+                found[key] = row[2][0]
+    return found, set(), set(), False
 
 
 def processing_maintainer_files(version: str) -> None:
-    """Batch match active files for version against MAINTAINERS patterns and populate m_maintainer_file."""
+    """Step 6.7: store which files each MAINTAINERS section version covers (m_maintainer_file).
+
+    A (sec_id, fnid) row holds for every MAINTAINERS blob containing that section version, so only the
+    sections new or changed since the base version are matched against every path, and the unchanged ones
+    against the paths new in this version. Nothing is parsed when neither exists. The matching is not cut
+    short by the duration limit: a section matched against part of the tree only would stay incomplete."""
     if gp.VID == 0:
         return
+    from parser.maintainer_ast import maintainer_store
+
+    maintainers_blob_id = get_fid_for_path("MAINTAINERS")
+    if maintainers_blob_id is None:
+        logger.info(f"Version '{version}' has no MAINTAINERS blob row; skipping maintainer file matching.")
+        return
+    try:
+        file_list_raw = MF.git_file_list(gp.Version_Name)
+    except Exception as e:
+        logger.debug(f"Failed to get git_file_list for maintainer matching in {version}: {e}")
+        return
+    all_files = file_list_raw.splitlines() if file_list_raw else []
+    if not all_files:
+        return
+
+    base_commit_id = int(getattr(gp, "Old_VID", 0) or 0)
+    base_name = getattr(gp, "Old_Version_Name", None)
+    cur_ids, prev_ids, mapped, has_sql = _maintainer_scope(maintainers_blob_id, base_commit_id, ())
+    if has_sql and not cur_ids:
+        logger.warning(f"No stored MAINTAINERS sections found for the blob of '{version}'; skipping maintainer file matching.")
+        return
+    if has_sql:
+        # A base whose sections have no row yet (first run after the migration, or a gap): match everything
+        changed: set[int] | None = (set(cur_ids.values()) - prev_ids) if mapped else None
+        new_paths: list[str] = []
+        if base_name and base_commit_id:
+            try:
+                old_files = set((MF.git_file_list(base_name) or "").splitlines())
+                new_paths = [p for p in all_files if p not in old_files]
+            except Exception as e:
+                logger.debug(f"Failed to list the base version '{base_name}' for maintainer matching: {e}")
+                changed = None
+        else:
+            changed = None
+        if changed is not None and not changed and not new_paths:
+            logger.info(f"[Step 6.7] MAINTAINERS sections and paths of '{version}' are unchanged since '{base_name}': nothing to match.")
+            return
 
     try:
         raw_maintainers = MF.get_file("MAINTAINERS", gp.Version_Name)
     except Exception as e:
         logger.debug(f"MAINTAINERS file not found for version '{version}': {e}")
         return
-
     if not raw_maintainers:
         return
 
     from parser.maintainer_ast.maintainer_parser import MaintainerParser
-    from parser.maintainer_ast.maintainer_matcher import MaintainerMatcher
-
     sections = MaintainerParser(raw_maintainers).parse()
     if not sections:
         return
+    if not has_sql:
+        cur_ids = _maintainer_scope(None, 0, sections)[0]
+        changed, new_paths = None, []
 
-    matcher = MaintainerMatcher(sections)
-    if not matcher.exact_index and not matcher.dir_prefix_map and not matcher.general_rules:
-        logger.info(f"No file patterns (F:) found in MAINTAINERS for version '{version}', skipping file matching.")
-        return
+    n_changed = len(cur_ids) if changed is None else len(changed)
+    logger.info(
+        f"Matching {n_changed} changed MAINTAINERS section(s) against {len(all_files)} files"
+        f" and {len(cur_ids)} against {len(new_paths)} new file(s) for version '{version}'..."
+    )
+    pairs = maintainer_store.map_files(sections, cur_ids, changed, all_files, new_paths)
 
-    # Sections are rows of this version's MAINTAINERS blob (also when the file did not change)
-    maintainers_blob_id = get_fid_for_path("MAINTAINERS")
-    if maintainers_blob_id is None:
-        logger.warning(f"MAINTAINERS of version '{version}' has no blob row; skipping maintainer file matching.")
-        return
-    sec_ids = _maintainer_section_ids(maintainers_blob_id, sections)
-
-    try:
-        file_list_raw = MF.git_file_list(gp.Version_Name)
-    except Exception as e:
-        logger.debug(f"Failed to get git_file_list for maintainer matching in {version}: {e}")
-        return
-
-    all_files = file_list_raw.splitlines() if file_list_raw else []
-    if not all_files:
-        return
-
-    logger.info(f"Matching {len(all_files)} files against {len(sections)} maintainer sections for version '{version}'...")
-
-    # Rows are keyed by the MAINTAINERS blob: files mapped for it in an earlier version need no matching
-    already_mapped: set[int] = set()
-    with G.DB() as db:
-        cur = _raw_cursor(db)
-        if cur is not None:
-            try:
-                cur.execute("SELECT DISTINCT fnid FROM m_maintainer_file WHERE maintainers_blob_id = %s", (maintainers_blob_id,))
-                already_mapped = {int(r[0]) for r in cur.fetchall()}
-            finally:
-                cur.close()
-    if already_mapped:
-        logger.info(f"{len(already_mapped)} files are already mapped for this MAINTAINERS blob; matching the others only.")
-
-    matched_count = 0
-    seen_pairs: set[tuple[int, int]] = set()
-    for file_path in all_files:
-        if G.is_deadline_exceeded():
-            logger.warning(COLOR.yellow("[Duration Limit] Execution deadline reached during maintainer matching. Stopping early..."))
-            break
-        fnid = get_fnid_for_path(file_path)
-        if fnid is None or fnid in already_mapped:
+    staged = 0
+    for sec_id, path in sorted(pairs):
+        fnid = get_fnid_for_path(path)
+        if fnid is None:
             continue
-        matched_sections = matcher.match_file(file_path)
-        if not matched_sections:
-            continue
-        for sec in matched_sections:
-            sec_id = sec_ids.get(sec.name)
-            if sec_id is not None:
-                pair = (fnid, sec_id)
-                if pair in seen_pairs:
-                    continue
-                seen_pairs.add(pair)
-                G.TE.set(
-                    m_maintainer_file.table_id,
-                    (
-                        maintainers_blob_id,
-                        fnid,
-                        sec_id,
-                    ),
-                )
-                matched_count += 1
+        G.TE.set(m_maintainer_file.table_id, (sec_id, fnid))
+        staged += 1
+    logger.info(f"Staged {staged} file-to-section mappings into m_maintainer_file for version '{version}'.")
 
-    logger.info(f"Staged {matched_count} file-to-section mappings into m_maintainer_file for version '{version}'.")
+
+# Input traces and rows of the previous version's ARCH layouts, for the run (Step 6.8)
+_ARCH_LAYOUT_MEMO: dict[str, Any] = {}
+
 
 def processing_arch_layouts(version: str) -> int:
     """Store what `make ARCH=<arch>` uses at this version for every ARCH value (parser/arch_layout.py):
     source and include directories, build-time symlinks, generated asm-generic wrappers and forced
-    includes, evaluated from the version's own Makefiles. Returns the number of rows stored."""
+    includes, evaluated from the version's own Makefiles. A layout is stored once (m_arch_layout, keyed by
+    `layout_digest()`, its rows in m_arch_layout_entry); the version's m_arch_root rows point at it.
+    Returns the number of layout rows written (0 when every layout already existed)."""
     if gp.VID == 0 or not getattr(gp, "file_blob_hashes", None):
         return 0
     tree = Tree(gp.file_blob_hashes)
@@ -5606,30 +6500,258 @@ def processing_arch_layouts(version: str) -> int:
             return None
 
     started = time.perf_counter()
-    layouts = compute_layouts(tree, read)
-    rows = [
-        (gp.VID, r.arch, r.role, r.priority, r.path[:255], r.target[:255])
-        for layout in layouts.values() for r in layout.rows()
-    ]
+    # ARCH values whose inputs (files read, tree queries) are unchanged since the previous version of this
+    # run reuse its rows (parser/arch_layout.py compute_layout_rows: replayed input traces)
+    blobs = gp.file_blob_hashes
+    by_arch, _ARCH_LAYOUT_MEMO["memo"], reused = compute_layout_rows(tree, read, blobs.get, _ARCH_LAYOUT_MEMO.get("memo"))
+    layouts = by_arch
+    written = new_layouts = 0
     with G.DB() as db:
-        cur = _raw_cursor(db)
-        if cur is None:
+        if not hasattr(db, "query") or isinstance(db, MockDB):
             return 0
         try:
-            cur.execute("DELETE FROM m_arch_root WHERE commit_id = %s", (gp.VID,))
-            for i in range(0, len(rows), 1000):
-                cur.executemany(
-                    "INSERT INTO m_arch_root (commit_id, arch, role, priority, path, target) VALUES (%s, %s, %s, %s, %s, %s) "
-                    "ON DUPLICATE KEY UPDATE priority = VALUES(priority), target = VALUES(target)",
-                    rows[i:i + 1000],
+            db.execute("DELETE FROM m_arch_root WHERE commit_id = %s", (gp.VID,))
+            for arch, rows in by_arch.items():
+                digest = layout_digest(rows)
+                found = db.query_one("SELECT layout_id FROM m_arch_layout WHERE layout_hash = %s", (digest,), dictionary=False)
+                if found:
+                    layout_id = int(found[0])
+                else:
+                    db.execute("INSERT INTO m_arch_layout (layout_hash) VALUES (%s)", (digest,))
+                    row_id = db.query_one("SELECT layout_id FROM m_arch_layout WHERE layout_hash = %s", (digest,), dictionary=False)
+                    layout_id = int(row_id[0]) if row_id else 0
+                    for i in range(0, len(rows), 1000):
+                        db.executemany(
+                            "INSERT INTO m_arch_layout_entry (layout_id, role, priority, path, target) VALUES (%s, %s, %s, %s, %s) "
+                            "ON DUPLICATE KEY UPDATE priority = VALUES(priority), target = VALUES(target)",
+                            [(layout_id, *r) for r in rows[i:i + 1000]],
+                        )
+                    written += len(rows)
+                    new_layouts += 1
+                db.execute(
+                    "INSERT INTO m_arch_root (commit_id, arch, layout_id) VALUES (%s, %s, %s) "
+                    "ON DUPLICATE KEY UPDATE layout_id = VALUES(layout_id)",
+                    (gp.VID, arch[:32], layout_id),
                 )
-            db.cnx.commit()
-        finally:
-            cur.close()
+            if hasattr(db, "commit"):
+                db.commit()
+        except Exception as exc:
+            logger.warning(f"Error updating arch layout for {version}: {exc}")
+            if hasattr(db, "rollback"):
+                with contextlib.suppress(Exception):
+                    db.rollback()
     logger.info(
-        f"[Arch Layout] '{version}': {len(layouts)} ARCH values, {len(rows)} rows in {time.perf_counter() - started:.1f}s."
+        f"[Arch Layout] '{version}': {len(layouts)} ARCH values (reused {reused} of {len(layouts)} ARCH layouts), "
+        f"{new_layouts} new layout(s) ({written} rows) in {time.perf_counter() - started:.1f}s."
     )
-    return len(rows)
+    return written
+
+
+def processing_source_facts(version: str) -> int:
+    """Step 6.9: extract the per-blob facts `m_blob_facts` lacks of this version's files (parser/facts_ingest.py):
+    functions, calls and ops tables of the `.c` / `.h` blobs (family 1), Kernel API macros of the `.c` / `.h` / `.S`
+    blobs (family 2), their `#include` directives (family 3), Kconfig definitions (family 4) and Documentation
+    labels (family 5), each blob read once; returns how many blobs were extracted."""
+    if gp.VID == 0 or not getattr(gp, "file_blob_hashes", None):
+        return 0
+    blobs = facts_ingest.fact_blobs(gp.file_blob_hashes)
+
+    def read_text(path: str) -> str | None:
+        try:
+            text = MF.get_file(path, gp.Version_Name)
+        except (OSError, UnicodeDecodeError) as exc:
+            logger.debug(f"[Source Facts] cannot read {path}: {exc}")
+            return None
+        # get_file() decodes latin-1 (one char per byte): back to the bytes, read as the webapp reads blobs
+        return text.encode("latin-1", "replace").decode("utf-8", "replace") if text is not None else None
+
+    try:
+        workers = max(1, min(int(get_parser_config().get("facts_workers", 4)), G.CPUS or 1))
+    except (TypeError, ValueError):
+        workers = 4
+    with G.DB() as db:
+        if db is None:
+            return 0
+        result = facts_ingest.ingest(db, blobs, read_text, workers)
+    if result["extracted"]:
+        logger.info(
+            f"[Source Facts] '{version}': {result['extracted']} of {result['blobs']} source blob(s) extracted "
+            f"({result['rows']} fact rows) in {result['seconds']}s."
+        )
+    return int(result["extracted"])
+
+
+def processing_cve_list(force: bool = False, kernel_repo: str | None = None, repo_id: int | None = None) -> dict[str, Any] | None:
+    """Bring m_cve / m_cve_commit to the HEAD of the CVE list clone (config cve.repo_dir, parser/cve/cve_ingest.py),
+    then resolve its abbreviated commit hashes in the kernel repository (m_cve_commit_hash) when one is given.
+    Nothing is read when the HEAD is the one already ingested. Returns the ingestion summary (None: no clone)."""
+    from parser.cve import cve_ingest
+    repo = cve_ingest.repo_dir()
+    if repo is None:
+        return None
+    try:
+        with G.DB() as db:
+            if db is None:
+                return None
+            summary = cve_ingest.ingest(db, repo, force=force)
+            if kernel_repo and repo_id and summary.get("state") != "missing":
+                summary["prefixes"] = cve_ingest.resolve_commit_prefixes(db, kernel_repo, repo_id)
+            return summary
+    except Exception as exc:  # noqa: BLE001 - the CVE list never blocks parsing
+        logger.warning(COLOR.yellow(f"[CVE] Ingesting {repo} failed: {exc}"))
+        return {"state": "error", "error": str(exc)}
+
+
+def run_requested_backfills(args: argparse.Namespace, network_id: int, repo_id: int) -> bool:
+    """Run the backfills named on the command line (core/backfills.py); returns whether any was requested
+    (the run then exits). Standalone and master roles only."""
+    from core import backfills
+    requested = False
+    with G.DB() as db:
+        if getattr(args, "backfill_maintainer_files", False):
+            requested = True
+            summary = backfills.backfill_maintainer_files(db, MF, network_id, repo_id, getattr(args, "backfill_from", None))
+            logger.info(f"[Backfill maintainer files] {summary}")
+        if getattr(args, "backfill_kbuild", False):
+            requested = True
+            if db is not None:
+                backfills.delete_old_kbuild_references(db)
+            summary = backfills.backfill_kbuild(db, MF)
+            logger.info(f"[Backfill Kbuild] {summary}")
+        if getattr(args, "backfill_facts", False):
+            requested = True
+            try:
+                workers = max(1, min(int(get_parser_config().get("facts_workers", 4)), G.CPUS or 1))
+            except (TypeError, ValueError):
+                workers = 4
+            summary = backfills.backfill_facts(db, MF, network_id, repo_id, getattr(args, "facts_families", None), workers)
+            logger.info(f"[Backfill facts] {summary}")
+        if getattr(args, "backfill_commit_relations", False):
+            requested = True
+            summary = backfills.backfill_commit_relations(db, str(MF.repo_dir), getattr(args, "from_commit_id", None))
+            logger.info(f"[Backfill commit relations] {summary}")
+        if getattr(args, "repair_head_commit_files", False):
+            requested = True
+            summary = backfills.repair_head_commit_files(db, str(MF.repo_dir), network_id)
+            logger.info(f"[Repair head commit files] {summary}")
+        if getattr(args, "backfill_doc_references", False):
+            requested = True
+            try:
+                workers = max(1, min(int(get_parser_config().get("facts_workers", 4)), G.CPUS or 1))
+            except (TypeError, ValueError):
+                workers = 4
+            summary = backfills.backfill_doc_references(db, MF, network_id, repo_id, workers)
+            logger.info(f"[Backfill doc references] {summary}")
+        if getattr(args, "backfill_cve_files", False):
+            requested = True
+            try:
+                workers = max(1, min(int(get_parser_config().get("facts_workers", 4)), G.CPUS or 1))
+            except (TypeError, ValueError):
+                workers = 4
+            summary = backfills.backfill_cve_files(db, MF, network_id, repo_id, workers)
+            logger.info(f"[Backfill CVE files] {summary}")
+        if getattr(args, "backfill_mailing_list", False):
+            requested = True
+            commit_range = getattr(args, "ml_range", None)
+            storage_dir = getattr(args, "ml_storage_dir", None)
+            summary = backfills.backfill_mailing_list(db, str(MF.repo_dir), commit_range, storage_dir)
+            logger.info(f"[Backfill mailing list] {summary}")
+    return requested
+
+
+def run_automatic_backfills(args: argparse.Namespace) -> None:
+    """One-off backfills of tables that are empty while the database holds finished versions (the table was
+    just added; core/API.md section 12), unless --no-backfill. Standalone and master roles only."""
+    from core import backfills
+    from parser.git_ast.commit_relations import BACKFILL_DONE
+    with G.DB() as db:
+        if db is None:
+            return
+        try:
+            relations_state = backfills.commit_relations_state(db)
+            sql_fin = "SELECT 1 FROM m_ingest_state WHERE status = %s LIMIT 1"
+            if hasattr(db, "query_one") and callable(db.query_one):
+                row_fin = db.query_one(sql_fin, (ingest_state.INGEST_DONE,), dictionary=False)
+            elif hasattr(db, "execute"):
+                db.execute(sql_fin, (ingest_state.INGEST_DONE,))
+                row_fin = db.fetchone() if hasattr(db, "fetchone") else None
+            else:
+                row_fin = None
+            finished = row_fin is not None
+            kbuild_empty = False
+            if finished:
+                sql_kb = "SELECT 1 FROM m_kbuild_symbol LIMIT 1"
+                if hasattr(db, "query_one") and callable(db.query_one):
+                    row_kb = db.query_one(sql_kb, dictionary=False)
+                elif hasattr(db, "execute"):
+                    db.execute(sql_kb)
+                    row_kb = db.fetchone() if hasattr(db, "fetchone") else None
+                else:
+                    row_kb = None
+                kbuild_empty = row_kb is None
+        except Exception as exc:  # noqa: BLE001 - never blocks parsing
+            logger.debug(f"Automatic backfill check failed: {exc}")
+            return
+        if not relations_state.startswith(BACKFILL_DONE):
+            # Until the state row says done, the webapp keeps reading its own relation index (webapp/API.md 2.16)
+            if getattr(args, "no_backfill", False):
+                logger.info("[Backfill commit relations] Stored commits are not covered yet; skipped (--no-backfill). "
+                            "Run --backfill-commit-relations to fill m_commit_relation / m_commit_link.")
+            else:
+                logger.info("[Backfill commit relations] Parsing the stored commit messages once into m_commit_relation / "
+                            "m_commit_link (--no-backfill skips this)" + (f", resuming after {relations_state}." if relations_state else "."))
+                backfills.backfill_commit_relations(db, str(MF.repo_dir))
+        if not finished:
+            return
+        if kbuild_empty:
+            if getattr(args, "no_backfill", False):
+                logger.info("[Backfill Kbuild] m_kbuild_symbol is empty; skipped (--no-backfill). Run --backfill-kbuild to fill it.")
+            else:
+                logger.info("[Backfill Kbuild] m_kbuild_symbol is empty: filling it once from the stored Makefiles (--no-backfill skips this).")
+                with contextlib.suppress(Exception):
+                    backfills.delete_old_kbuild_references(db)
+                backfills.backfill_kbuild(db, MF)
+
+
+def processing_release_stats(repo_path: str, repo_id: int) -> dict[str, Any] | None:
+    """Summarize the release tags of the repository not summarized yet (parser/git_ast/release_stats.py,
+    core/API.md section 10). Skipped while a version ingestion is interrupted: its rollback deletes the
+    persons created after its watermark, with every row naming them, so no row may name them before it ran.
+    Never blocks parsing: a failure is logged and the run goes on."""
+    from parser.git_ast import release_stats
+    try:
+        with G.DB() as db:
+            if db is None:
+                return None
+            sql_cnt = "SELECT COUNT(*) FROM m_ingest_state WHERE status = %s"
+            if hasattr(db, "query_one") and callable(db.query_one):
+                row_cnt = db.query_one(sql_cnt, (ingest_state.INGEST_PARSING,), dictionary=False)
+            elif hasattr(db, "execute"):
+                db.execute(sql_cnt, (ingest_state.INGEST_PARSING,))
+                row_cnt = db.fetchone() if hasattr(db, "fetchone") else (0,)
+            else:
+                row_cnt = (0,)
+            interrupted = int((row_cnt or (0,))[0] or 0)
+            if interrupted:
+                logger.info(COLOR.yellow(
+                    f"[Release stats] Skipped: {interrupted} version ingestion(s) interrupted; "
+                    "they are summarized once the version is recovered."
+                ))
+                return {"state": "deferred"}
+            summary = release_stats.ingest(db, Path(repo_path), repo_id)
+            if summary.get("persons_added"):
+                refresh_person_identities(db, "release statistics added persons")
+    except Exception as exc:  # noqa: BLE001 - release statistics never block parsing
+        logger.warning(COLOR.yellow(f"[Release stats] Summarizing the release tags of {repo_path} failed: {exc}"))
+        return {"state": "error", "error": str(exc)}
+    if summary["state"] == "current":
+        logger.info(f"[Release stats] Current ({summary['tags']} release tags).")
+    else:
+        logger.info(COLOR.green(
+            f"[Release stats] Summarized {summary['segments']} release tag(s) in {summary['seconds']}s "
+            f"({summary['persons_added']} new person(s))."
+        ))
+    return summary
 
 
 def execute_and_purge(cs_dict: dict) -> dict:

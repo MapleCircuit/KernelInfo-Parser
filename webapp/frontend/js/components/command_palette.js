@@ -2,12 +2,17 @@
  * command_palette.js - Global Ctrl+K search & command palette.
  *
  * Prefixes select the mode: (none) files, symbols and Kconfig options together; "/" commands;
- * "$" symbols; "#" commits; "?" Kconfig options; ":" go to line in the active code tab; "@" mailing list.
+ * "$" symbols; "#" commits; "?" Kconfig options; ":" go to line in the active code tab; "@" mailing list;
+ * "%" text in every file of the revision (git grep, §5.34).
  */
 import { api } from "../api.js";
 import { state } from "../state.js";
 import { debounce } from "../utils/debounce.js";
 import { shortRef } from "./ref_picker.js";
+import { shortcuts } from "../utils/shortcuts.js";
+import { groupByFile, grepSummary, highlightRanges } from "../utils/grep_format.js";
+import { viewOf } from "../utils/active_views.js";
+import { KIND_ICONS, matchSymbols } from "../views/code_view/outline_model.js";
 
 function escapeHtml(str) {
   return String(str ?? "")
@@ -44,9 +49,11 @@ const MODES = {
   "$": { label: "Symbols", placeholder: "Search symbol definitions…" },
   "#": { label: "Commits", placeholder: "Search commits by subject, author or hash…" },
   "?": { label: "Kconfig", placeholder: "Search Kconfig options…" },
-  ":": { label: "Go to line", placeholder: "Line number in the active file…" },
+  ":": { label: "Go to line", placeholder: "Line number, or a definition name, in the active file…" },
   "@": { label: "Mailing List", placeholder: "Search LKML emails, patches, and threads…" },
+  "%": { label: "Code", placeholder: "Search text in every file of this revision…" },
 };
+const GREP_PALETTE_LIMIT = 30;
 
 class CommandPalette {
   constructor() {
@@ -59,6 +66,8 @@ class CommandPalette {
     this.pendingEnter = null;
     this.commandProvider = () => [];
     this.debouncedSearch = debounce(() => this.search(), 160);
+    // Text search runs git grep on the server: wait for a pause in typing
+    this.debouncedGrep = debounce(() => this.search(), 400);
   }
 
   /** Register the function returning palette commands: [{ id, title, hint, run }]. */
@@ -67,18 +76,28 @@ class CommandPalette {
   }
 
   init() {
+    // Global keys go through the shortcut registry (webapp/API.md §5.31), so they can be rebound
+    shortcuts.registerAll([
+      { id: "palette.open", keys: ["Mod+K", "Mod+P"], scope: "global", allowInInputs: true,
+        description: "Search files, symbols and Kconfig options", handler: () => this.open("") },
+      { id: "palette.commands", keys: ["Mod+Shift+P"], scope: "global", allowInInputs: true,
+        description: "Run a command", handler: () => this.open("/") },
+      { id: "palette.navigate", keys: ["ArrowUp", "ArrowDown"], scope: "palette", docOnly: true, description: "Move through the results" },
+      { id: "palette.run", keys: ["Enter"], scope: "palette", docOnly: true, description: "Open the highlighted result" },
+      { id: "palette.runNewTab", keys: ["Mod+Enter"], scope: "palette", docOnly: true, description: "Open the highlighted result in a new tab" },
+      { id: "palette.close", keys: ["Escape"], scope: "palette", docOnly: true, description: "Close the palette" },
+    ]);
     document.addEventListener("keydown", (e) => {
-      const key = e.key.toLowerCase();
-      if ((e.ctrlKey || e.metaKey) && !e.altKey && (key === "k" || (key === "p" && !e.shiftKey))) {
-        e.preventDefault();
-        this.open("");
-      } else if ((e.ctrlKey || e.metaKey) && e.shiftKey && key === "p") {
-        e.preventDefault();
-        this.open("/");
-      } else if (key === "escape" && this.el) {
-        this.close();
-      }
+      if (e.key === "Escape" && this.el) this.close();
     });
+  }
+
+  /** Footer hint of the palette's own keys, following the user's bindings. */
+  keyHint() {
+    const open = shortcuts.label("palette.open");
+    const cmds = shortcuts.label("palette.commands");
+    return [open && `<span><kbd>${escapeHtml(open)}</kbd> search</span>`, cmds && `<span><kbd>${escapeHtml(cmds)}</kbd> commands</span>`]
+      .filter(Boolean).join("");
   }
 
   open(initial = "") {
@@ -99,8 +118,8 @@ class CommandPalette {
         </div>
         <div class="cmdp-results" role="listbox"></div>
         <div class="cmdp-footer">
-          <span><kbd>↑↓</kbd> navigate</span><span><kbd>Enter</kbd> open</span><span><kbd>Ctrl+Enter</kbd> new tab</span>
-          <span class="cmdp-prefixes"><code>/</code> commands <code>$</code> symbols <code>#</code> commits <code>?</code> kconfig <code>:</code> line <code>@</code> mail</span>
+          <span><kbd>↑↓</kbd> navigate</span><span><kbd>Enter</kbd> open</span><span><kbd>Ctrl+Enter</kbd> new tab</span>${this.keyHint()}
+          <span class="cmdp-prefixes"><code>/</code> commands <code>$</code> symbols <code>#</code> commits <code>?</code> kconfig <code>:</code> line <code>@</code> mail <code>%</code> code</span>
         </div>
       </div>`;
     document.body.appendChild(backdrop);
@@ -116,6 +135,7 @@ class CommandPalette {
       this.updateMode();
       const { mode } = this.parse();
       if (mode === "/" || mode === ":") this.search();
+      else if (mode === "%") this.debouncedGrep();
       else this.debouncedSearch();
     });
     input.addEventListener("keydown", (e) => this.onKey(e));
@@ -161,12 +181,61 @@ class CommandPalette {
         .filter((c) => !q || c.title.toLowerCase().includes(q) || (c.keywords || "").toLowerCase().includes(q))
         .map((c) => ({ section: "Commands", icon: "›", title: c.title, detail: c.hint || "", run: c.run, highlightQuery: query }));
     } else if (mode === ":") {
-      const line = parseInt(query, 10);
       const tab = state.getActiveTab();
-      if (tab?.type === "code" && line > 0) {
-        items = [{ section: "Go to line", icon: "↳", title: `Line ${line}`, detail: tab.path, run: () => this.openCode(tab.path, tab.version, line, false) }];
+      const view = tab?.type === "code" ? viewOf(tab.id) : null;
+      if (query && !/^\d+$/.test(query) && tab?.type === "code") {
+        // ":name" — definitions of the active file (its outline, G03)
+        const outline = view?.outline;
+        if (!outline?.loaded) {
+          items = [{ section: "Go to symbol", icon: "ℹ", title: "The outline of this file is still loading", detail: "", run: null }];
+        } else if (!outline.indexed || !outline.items.length) {
+          items = [{ section: "Go to symbol", icon: "ℹ", title: "Outline needs an indexed file", detail: tab.path, run: null }];
+        } else {
+          items = matchSymbols(outline.items, query).map((it) => ({
+            section: "Go to symbol", icon: KIND_ICONS[it.kind] || "•", title: it.name, highlightQuery: query,
+            detail: `${it.type_name} · line ${it.line_s}`,
+            run: (nt) => (nt ? this.openCode(tab.path, tab.version, it.line_s, true) : view.scrollToLine(it.line_s, { select: true })),
+          }));
+          if (!items.length) items = [{ section: "Go to symbol", icon: "ℹ", title: `No definition matches “${query}”`, detail: tab.path, run: null }];
+        }
       } else {
-        items = [{ section: "Go to line", icon: "ℹ", title: tab?.type === "code" ? "Type a line number" : "Open a code tab first", detail: "", run: null }];
+        const line = parseInt(query, 10);
+        if (tab?.type === "code" && line > 0) {
+          items = [{ section: "Go to line", icon: "↳", title: `Line ${line}`, detail: tab.path, run: () => this.openCode(tab.path, tab.version, line, false) }];
+        } else {
+          items = [{ section: "Go to line", icon: "ℹ", title: tab?.type === "code" ? "Type a line number, or a name to go to a definition" : "Open a code tab first", detail: "", run: null }];
+        }
+      }
+    } else if (mode === "%") {
+      // Full-text search (§5.34): the first matches, grouped by file; the Search tab has them all
+      if (query.length < 2) {
+        items = [{ section: "Code", icon: "ℹ", title: "Type at least 2 characters to search the files' text", detail: "", run: null }];
+      } else {
+        let res = null;
+        let error = null;
+        try {
+          res = await api.grepCode(version, { q: query, limit: GREP_PALETTE_LIMIT, perFile: 10 });
+        } catch (err) {
+          error = err;
+        }
+        if (seq !== this.seq || !this.el) return;
+        if (error) {
+          items = [{ section: "Code", icon: "⚠", title: `Search failed: ${error.message}`, detail: "", run: null }];
+        } else {
+          for (const g of groupByFile(res?.matches || [])) {
+            for (const m of g.matches) {
+              items.push({
+                section: g.path, icon: "≡", titleHtml: highlightRanges(m.text.trim() ? m.text : "(blank line)", m.text.trim() ? m.ranges : []),
+                detail: `:${m.line}`, run: (nt) => this.openCode(m.path, version, m.line, nt),
+              });
+            }
+          }
+          if (!items.length) items.push({ section: "Code", icon: "ℹ", title: `No file of ${shortRef(version)} contains “${query}”`, detail: "", run: null });
+          items.push({
+            section: "Search tab", icon: "🔎", title: `Open all results in the Search tab`, detail: res?.truncated ? "more than shown here" : grepSummary(res),
+            run: () => state.openTab({ type: "search", title: `Search: ${query.slice(0, 24)}`, query, version }),
+          });
+        }
       }
     } else if (!query) {
       items = this.commandProvider().slice(0, 8).map((c) => ({ section: "Suggested commands", icon: "›", title: c.title, detail: c.hint || "", run: c.run }));
@@ -254,7 +323,7 @@ class CommandPalette {
       lastSection = it.section;
       return `${header}<div class="cmdp-item ${idx === this.highlightIdx ? "active" : ""} ${it.run ? "" : "disabled"}" data-idx="${idx}" role="option">
         <span class="cmdp-icon">${escapeHtml(it.icon)}</span>
-        <span class="cmdp-title">${highlight(it.title, it.highlightQuery)}</span>
+        <span class="cmdp-title">${it.titleHtml ?? highlight(it.title, it.highlightQuery)}</span>
         <span class="cmdp-detail">${escapeHtml(it.detail)}</span>
       </div>`;
     }).join("");

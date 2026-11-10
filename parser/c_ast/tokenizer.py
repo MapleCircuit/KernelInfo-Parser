@@ -296,9 +296,13 @@ def encapsulate_trailing_delimiter(
 
 
 class ParsedToken:
-    """Slot-optimized token carrier eliminating ctypes dynamic dict allocations."""
+    """Slot-optimized token carrier eliminating ctypes dynamic dict allocations.
 
-    __slots__ = ("line", "spelling_str", "ast_kind", "_cursor")
+    `called`: an identifier whose next token (comments skipped) is `(`, i.e. the name of a call `f(...)`. A function
+    named without it (`.read = foo`, `&foo`, `register(foo)`) is a reference, not a call (`mark_calls()`).
+    """
+
+    __slots__ = ("line", "spelling_str", "ast_kind", "_cursor", "called")
 
     def __init__(
         self,
@@ -306,11 +310,13 @@ class ParsedToken:
         spelling_str: str,
         ast_kind: int,
         cursor: Any,
+        called: bool = False,
     ) -> None:
         self.line = line
         self.spelling_str = spelling_str
         self.ast_kind = ast_kind
         self._cursor = cursor
+        self.called = called
 
     @property
     def spelling(self) -> str:
@@ -319,6 +325,18 @@ class ParsedToken:
     @property
     def _tu(self) -> Any:
         return getattr(self._cursor, "_tu", None)
+
+
+def mark_calls(tokens: list[ParsedToken]) -> None:
+    """Set `called` on every identifier token followed by `(` (comment tokens in between are skipped)."""
+    nxt: ParsedToken | None = None
+    ident, comment = AST_KIND.identifier, AST_KIND.comment
+    for tok in reversed(tokens):
+        if tok.ast_kind == comment:
+            continue
+        if tok.ast_kind == ident:
+            tok.called = nxt is not None and nxt.spelling_str == "("
+        nxt = tok
 
 
 class TokenStream:
@@ -461,6 +479,7 @@ class TokenStream:
             ast_kind = token_kind_map[token.int_data[0]]
             tokens_append(ParsedToken(l, spelling_str, ast_kind, cursor))
 
+        mark_calls(tokens_array)
         self.tokens_array = tokens_array
         # Retain token memory pointer to prevent premature garbage collection
         self.token_group = cc.TokenGroup(parsed_tu, tokens_memory, tokens_count)

@@ -18,6 +18,7 @@ from core.globalstuff import (
     REF_NO_REF,
     FILE_ERROR,
     ASTT,
+    SymbolLinkage,
 )
 from typing import Any
 ChangeSetType = Any
@@ -114,6 +115,18 @@ class Asm_Manager:
         if prof is not None:
             t_parse_0 = time.perf_counter()
 
+        G.CURRENT_RAWFILE = self.rawfile
+        parts = self.filename.split("/")
+        arch_args = []
+        if len(parts) > 1 and parts[0] == "arch":
+            arch = parts[1]
+            arch_args.extend([
+                f"-I{self.mfdir}/arch/{arch}/include",
+                f"-I{self.mfdir}/arch/{arch}/include/uapi",
+                f"-I{self.mfdir}/arch/{arch}/include/generated",
+                f"-I{self.mfdir}/arch/{arch}/include/generated/uapi",
+            ])
+
         args = [
             "-w",
             "-x",
@@ -121,6 +134,7 @@ class Asm_Manager:
             "-D__KERNEL__",
             "-D__ASSEMBLY__",
             f"-I{self.mfdir}/{'/'.join(self.filename.split('/')[:-1])}",
+            *arch_args,
             f"-I{self.mfdir}/include",
             f"-I{self.mfdir}/include/uapi",
         ]
@@ -156,6 +170,27 @@ class Asm_Manager:
         """Process assembly and preprocessor tokens into AST nodes."""
         i = 0
         n = len(tokens_array)
+        G.CURRENT_RAWFILE = self.rawfile
+
+        LINKAGE_START_MACROS = frozenset({
+            "ENTRY", "GLOBAL", "KENTRY",
+            "SYM_FUNC_START", "SYM_FUNC_START_NOALIGN", "SYM_FUNC_START_LOCAL", "SYM_FUNC_START_LOCAL_NOALIGN", "SYM_FUNC_START_WEAK",
+            "SYM_FUNC_START_ALIAS", "SYM_FUNC_START_WEAK_ALIAS",
+            "SYM_CODE_START", "SYM_CODE_START_NOALIGN", "SYM_CODE_START_LOCAL", "SYM_CODE_START_LOCAL_NOALIGN", "SYM_CODE_START_WEAK",
+            "SYM_TYPED_FUNC_START", "SYM_DATA_START", "SYM_DATA_START_LOCAL", "SYM_DATA_START_WEAK", "WEAK",
+        })
+
+        LINKAGE_END_MACROS = frozenset({
+            "SYM_FUNC_END", "SYM_FUNC_END_ALIAS", "SYM_CODE_END", "SYM_DATA_END", "SYM_DATA_END_LABEL", "ENDPROC", "END",
+        })
+
+        CPP_DIRECTIVES = frozenset({
+            "include", "include_next", "define", "undef", "if", "ifdef", "ifndef",
+            "else", "elif", "elifdef", "elifndef", "endif", "pragma", "error", "warning", "line", "ident",
+        })
+
+        func_stack: list[Ast_ASM_Label] = []
+
         while i < n:
             token = tokens_array[i]
             cursor = cursors_array[i]
@@ -165,7 +200,7 @@ class Asm_Manager:
 
             # Comments
             if ast_kind == AST_KIND.comment:
-                self.children.append(Ast_Comment(tline, tspelling))
+                self.children.append(Ast_ASM_Comment(tline, tspelling))
                 i += 1
                 continue
 
@@ -177,25 +212,94 @@ class Asm_Manager:
 
             # Preprocessor directives & # comments
             if ast_kind == AST_KIND.punctuation and tspelling == "#":
-                kind = cursor.kind
-                if kind == cc.CursorKind.INCLUSION_DIRECTIVE:
-                    self.children.append(CPPro_include(get_cursor_line(cursor)))
+                next_tok = tokens_array[i + 1] if i + 1 < n else None
+                same_line = next_tok and next_tok.line.line_pos[0] == tline.line_pos[0]
+                if same_line and next_tok.spelling_str in CPP_DIRECTIVES:
+                    kind = cursor.kind
+                    if kind == cc.CursorKind.INCLUSION_DIRECTIVE:
+                        inc_node = CPPro_include(get_cursor_line(cursor))
+                        inc_node._check_inc_cursor(cursor)
+                        self.children.append(inc_node)
+                    else:
+                        self.children.append(CPPro(tline))
+                    i += 1
+                    continue
                 else:
-                    self.children.append(CPPro(tline))
-                i += 1
+                    # Assembly line comment starting with #
+                    # Consume all remaining tokens on this line into Ast_ASM_Comment
+                    comment_line = Line(tline)
+                    j = i + 1
+                    while j < n and tokens_array[j].line.line_pos[0] == tline.line_pos[0]:
+                        comment_line.grow(tokens_array[j].line)
+                        j += 1
+                    if hasattr(self, "rawfile") and self.rawfile:
+                        comment_line.cc(self.rawfile)
+                    self.children.append(Ast_ASM_Comment(comment_line, comment_line.code))
+                    i = j
+                    continue
+
+            # Macro definitions (.macro name ... .endm)
+            if ast_kind == AST_KIND.punctuation and tspelling == "." and i + 1 < n and tokens_array[i + 1].spelling_str == "macro":
+                macro_name = tokens_array[i + 2].spelling_str if i + 2 < n else "macro"
+                macro_line = Line(tline)
+                macro_line.grow(tokens_array[i + 1].line)
+                if i + 2 < n:
+                    macro_line.grow(tokens_array[i + 2].line)
+                self.children.append(Ast_ASM_Macro(macro_line, macro_name))
+                i += 3
                 continue
 
-            # Assembler directives starting with '.' (e.g. .macro, .set, .align, .global, .text)
+            # Assembler directives starting with '.' (e.g. .section, .align, .globl, .text)
             if ast_kind == AST_KIND.punctuation and tspelling == ".":
                 self.children.append(Ast_ASM_Directive(tline, "."))
                 i += 1
                 continue
 
+            # Linkage macros: ENTRY(name), GLOBAL(name), SYM_FUNC_START*(name), SYM_CODE_START*(name)
+            if tspelling in LINKAGE_START_MACROS and i + 2 < n and tokens_array[i + 1].spelling_str == "(":
+                sym_name = tokens_array[i + 2].spelling_str
+                close_idx = i + 3
+                while close_idx < n and tokens_array[close_idx].spelling_str != ")" and tokens_array[close_idx].line.line_pos[0] == tline.line_pos[0]:
+                    close_idx += 1
+                if close_idx < n and tokens_array[close_idx].spelling_str == ")":
+                    entry_ext = Line(tline)
+                    entry_ext.grow(tokens_array[close_idx].line)
+                    if "LOCAL" in tspelling:
+                        linkage = SymbolLinkage.InternalStaticDef
+                    elif "WEAK" in tspelling or tspelling == "WEAK":
+                        linkage = SymbolLinkage.WeakOrAliasDef
+                    else:
+                        linkage = SymbolLinkage.ExternalDef
+                    open_func = Ast_ASM_Label(entry_ext, sym_name, linkage=linkage)
+                    self.children.append(open_func)
+                    func_stack.append(open_func)
+                    i = close_idx + 1
+                    continue
+
+            # Linkage end macros: SYM_FUNC_END*(name), SYM_CODE_END*(name), ENDPROC(name), END(name)
+            if tspelling in LINKAGE_END_MACROS and i + 2 < n and tokens_array[i + 1].spelling_str == "(":
+                sym_name = tokens_array[i + 2].spelling_str
+                close_idx = i + 3
+                while close_idx < n and tokens_array[close_idx].spelling_str != ")" and tokens_array[close_idx].line.line_pos[0] == tline.line_pos[0]:
+                    close_idx += 1
+                if close_idx < n and tokens_array[close_idx].spelling_str == ")":
+                    end_ext = Line(tline)
+                    end_ext.grow(tokens_array[close_idx].line)
+                    for s_idx in range(len(func_stack) - 1, -1, -1):
+                        if func_stack[s_idx].label == sym_name:
+                            matched = func_stack.pop(s_idx)
+                            matched.extent.grow(tokens_array[close_idx].line)
+                            break
+                    self.children.append(Ast_ASM_Instruction(end_ext, tspelling))
+                    i = close_idx + 1
+                    continue
+
             # Labels (token followed by ':' on the same line)
             if i + 1 < n and tokens_array[i + 1].spelling_str == ":" and tokens_array[i + 1].line.line_pos[0] == tline.line_pos[0]:
                 label_ext = Line(tline)
                 label_ext.grow(tokens_array[i + 1].line)
-                self.children.append(Ast_ASM_Label(label_ext, tspelling))
+                is_num = tspelling.isdigit()
+                self.children.append(Ast_ASM_Label(label_ext, tspelling, is_numeric=is_num))
                 i += 2
                 continue
 

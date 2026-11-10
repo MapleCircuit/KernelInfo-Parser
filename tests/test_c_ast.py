@@ -3102,6 +3102,266 @@ int check_link(int up) {
             if mf:
                 mf.clear_all_version()
 
+    def test_assembly_symbols_and_linkage(self) -> None:
+        """Verify assembly parser extracts labels, linkage macros, and branch symbol references."""
+        mf = None
+        try:
+            from parser.asm_ast import asm_ast_parse
+            mf = MasterFile()
+            temp_dir = mf.create_temp_dir()
+            mf.version_dict["v3.0"] = temp_dir
+            G.MF = mf
+
+            gp = GreatProcessor()
+            gp.Version_Name = "v3.0"
+            gp.VID = 1
+            init_db_layout(gp)
+            G.TE = get_table_engine("cached")()
+            G.TE.start(gp.Table_Array, MockDB)
+
+            asm_snippet = """/* Native assembly entrypoint and call test */
+ENTRY(entry_SYSCALL_64)
+    pushq %rax
+    call do_syscall_64
+    sysretq
+END(entry_SYSCALL_64)
+
+my_local_handler:
+    nop
+    ret
+"""
+            target_path = "arch/x86/entry/test_entry.S"
+            full_path = os.path.join(temp_dir, target_path)
+            os.makedirs(os.path.dirname(full_path), exist_ok=True)
+            with open(full_path, "w") as f:
+                f.write(asm_snippet)
+
+            cs = ChangeSet(f"A\t{target_path}")
+            cs.current_vid = 1
+            cs.gp = gp
+            cs.mf = mf
+            G.CURRENT_PARSING_FILE = target_path
+            default_processing(cs, gp)
+            asm_ast_parse(cs)
+            self.assertTrue(cs.execute())
+
+            G.TE.commit_all()
+
+            sym_defs = _symbol_store("m_symbol_def")
+            defs_by_name = {row[4]: row for row in sym_defs.values()}
+            self.assertIn("entry_SYSCALL_64", defs_by_name)
+            self.assertIn("my_local_handler", defs_by_name)
+            self.assertEqual(defs_by_name["entry_SYSCALL_64"][6], 0)  # ExternalDef
+            self.assertEqual(defs_by_name["entry_SYSCALL_64"][7], 2)  # line_s
+            self.assertEqual(defs_by_name["entry_SYSCALL_64"][8], 6)  # line_e
+
+            sym_refs = _symbol_store("m_symbol_ref")
+            ast_rows = MockDB._global_store.get("m_ast", {})
+            ast_by_id = {row[0]: row[1] for row in ast_rows.values()}
+            ref_names = [ast_by_id.get(row[3], row[3]) for row in sym_refs.values()]
+            self.assertIn("do_syscall_64", ref_names)
+        finally:
+            if mf:
+                mf.clear_all_version()
+
+    def test_sysfs_attribute_macro_var_decl(self) -> None:
+        """Verify sysfs attribute macros (DEVICE_ATTR_RO, etc.) are recorded as variable definitions."""
+        mf = None
+        try:
+            from parser.c_ast import c_ast_parse
+            mf = MasterFile()
+            temp_dir = mf.create_temp_dir()
+            mf.version_dict["v3.0"] = temp_dir
+            G.MF = mf
+
+            gp = GreatProcessor()
+            gp.Version_Name = "v3.0"
+            gp.VID = 1
+            init_db_layout(gp)
+            G.TE = get_table_engine("cached")()
+            G.TE.start(gp.Table_Array, MockDB)
+
+            c_snippet = """#define DEVICE_ATTR_RO(_name) \\
+    struct device_attribute dev_attr_##_name = { .attr = { .name = #_name } }
+
+DEVICE_ATTR_RO(test_attr);
+"""
+            target_path = "drivers/base/test_attr.c"
+            full_path = os.path.join(temp_dir, target_path)
+            os.makedirs(os.path.dirname(full_path), exist_ok=True)
+            with open(full_path, "w") as f:
+                f.write(c_snippet)
+
+            cs = ChangeSet(f"A\t{target_path}")
+            cs.current_vid = 1
+            cs.gp = gp
+            cs.mf = mf
+            G.CURRENT_PARSING_FILE = target_path
+            default_processing(cs, gp)
+            c_ast_parse(cs)
+            self.assertTrue(cs.execute())
+            G.TE.commit_all()
+
+            sym_defs = _symbol_store("m_symbol_def")
+            defs_by_name = {row[4]: row for row in sym_defs.values()}
+            self.assertIn("test_attr", defs_by_name)
+        finally:
+            if mf:
+                mf.clear_all_version()
+
+    def test_struct_field_declarator_type_attribute(self) -> None:
+        """Verify struct field declarators record declared C type string in m_ast_attribute."""
+        mf = None
+        try:
+            from parser.c_ast import c_ast_parse
+            mf = MasterFile()
+            temp_dir = mf.create_temp_dir()
+            mf.version_dict["v3.0"] = temp_dir
+            G.MF = mf
+
+            gp = GreatProcessor()
+            gp.Version_Name = "v3.0"
+            gp.VID = 1
+            init_db_layout(gp)
+            G.TE = get_table_engine("cached")()
+            G.TE.start(gp.Table_Array, MockDB)
+
+            c_snippet = """struct test_struct {
+    int count;
+    char *name;
+};
+"""
+            target_path = "kernel/test_struct.c"
+            full_path = os.path.join(temp_dir, target_path)
+            os.makedirs(os.path.dirname(full_path), exist_ok=True)
+            with open(full_path, "w") as f:
+                f.write(c_snippet)
+
+            cs = ChangeSet(f"A\t{target_path}")
+            cs.current_vid = 1
+            cs.gp = gp
+            cs.mf = mf
+            G.CURRENT_PARSING_FILE = target_path
+            default_processing(cs, gp)
+            c_ast_parse(cs)
+            self.assertTrue(cs.execute())
+            G.TE.commit_all()
+
+            attrs = MockDB._global_store.get("m_ast_attribute", {})
+            type_attrs = [r for r in attrs.values() if r[2] == "type_str"]
+            self.assertEqual(len(type_attrs), 2)
+            self.assertEqual(type_attrs[0][3], "int")
+            self.assertEqual(type_attrs[1][3], "char *")
+        finally:
+            if mf:
+                mf.clear_all_version()
+
+    def test_pure_extractors(self) -> None:
+        """Verify pure C and ASM outline extractors extract functions, types, and macros."""
+        from parser.c_ast.c_pure_extractor import extract_c_outline
+        from parser.asm_ast.asm_pure_extractor import extract_asm_outline
+
+        c_bytes = b"""
+#define MAX_SIZE 1024
+#define DOUBLE(x) ((x) * 2)
+
+struct my_device {
+    int id;
+};
+
+static int init_device(struct my_device *d) {
+    return d->id;
+}
+"""
+        c_outline = extract_c_outline(c_bytes)
+        names = {item["name"]: item for item in c_outline}
+        self.assertIn("MAX_SIZE", names)
+        self.assertEqual(names["MAX_SIZE"]["kind"], "macro")
+        self.assertIn("DOUBLE", names)
+        self.assertEqual(names["DOUBLE"]["kind"], "macro")
+        self.assertIn("my_device", names)
+        self.assertEqual(names["my_device"]["kind"], "type")
+        self.assertIn("init_device", names)
+        self.assertEqual(names["init_device"]["kind"], "function")
+
+        asm_bytes = b"""# Comment in assembly
+.macro setup_stack
+    nop
+.endm
+
+SYM_FUNC_START(my_asm_fn)
+    pushq %rax
+    call helper
+    popq %rax
+    ret
+SYM_FUNC_END(my_asm_fn)
+"""
+        asm_outline = extract_asm_outline(asm_bytes)
+        asm_names = {item["name"]: item for item in asm_outline}
+        self.assertIn("setup_stack", asm_names)
+        self.assertEqual(asm_names["setup_stack"]["kind"], "macro")
+        self.assertIn("my_asm_fn", asm_names)
+        self.assertEqual(asm_names["my_asm_fn"]["kind"], "function")
+        self.assertEqual(asm_names["my_asm_fn"]["line_s"], 6)
+        self.assertEqual(asm_names["my_asm_fn"]["line_e"], 11)
+
+    def test_assembly_numeric_labels_suppressed_and_comments(self) -> None:
+        """Verify local numeric labels (1:, 2:) are not recorded as global symbol defs, and hash comments work."""
+        mf = None
+        try:
+            from parser.asm_ast import asm_ast_parse
+            mf = MasterFile()
+            temp_dir = mf.create_temp_dir()
+            mf.version_dict["v3.0"] = temp_dir
+            G.MF = mf
+
+            gp = GreatProcessor()
+            gp.Version_Name = "v3.0"
+            gp.VID = 1
+            init_db_layout(gp)
+            G.TE = get_table_engine("cached")()
+            G.TE.start(gp.Table_Array, MockDB)
+
+            asm_snippet = """# This is an assembly hash comment
+ENTRY(my_jump_func)
+1:
+    nop
+    jmp 1b
+2:
+    ret
+END(my_jump_func)
+"""
+            target_path = "arch/x86/entry/test_numeric.S"
+            full_path = os.path.join(temp_dir, target_path)
+            os.makedirs(os.path.dirname(full_path), exist_ok=True)
+            with open(full_path, "w") as f:
+                f.write(asm_snippet)
+
+            cs = ChangeSet(f"A\t{target_path}")
+            cs.current_vid = 1
+            cs.gp = gp
+            cs.mf = mf
+            G.CURRENT_PARSING_FILE = target_path
+            default_processing(cs, gp)
+            asm_ast_parse(cs)
+            self.assertTrue(cs.execute())
+            G.TE.commit_all()
+
+            sym_defs = _symbol_store("m_symbol_def")
+            defs_by_name = {row[4]: row for row in sym_defs.values()}
+            self.assertIn("my_jump_func", defs_by_name)
+            self.assertNotIn("1", defs_by_name)
+            self.assertNotIn("2", defs_by_name)
+
+            # Check that hash comment was staged as Ast_ASM_Comment (ASTT 87)
+            ast_rows = MockDB._global_store.get("m_ast", {})
+            comments = [r for r in ast_rows.values() if r[2] == int(ASTT.ASM_Comment)]
+            self.assertTrue(len(comments) >= 1)
+            self.assertIn("This is an assembly hash comment", comments[0][1])
+        finally:
+            if mf:
+                mf.clear_all_version()
+
 
 
 def assert_file_tag_fidelity(

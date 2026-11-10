@@ -6,7 +6,10 @@ const DB_NAME = "KernelInfoIDE_v2";
 // Stores of cached API data (meta, tabs_state and nodemap_projects hold user state)
 const DATA_STORES = ["files", "symbols", "kconfigs", "maintainers", "commits", "tools", "mail"];
 // 5: data stores get an `updated_at` index, so entries can be pruned by age (pruneOlderThan)
-const DB_VERSION = 5;
+// 6: the `user` store (S06): bookmarks, notes, tours and watches the user made; never pruned or cache-cleared
+const DB_VERSION = 6;
+const USER_STORE = "user";
+const USER_CHANNEL = "kip_multi_tab";
 // How long an open blocked by another window's older connection may wait before the app runs uncached
 const BLOCKED_OPEN_TIMEOUT_MS = 3000;
 
@@ -20,7 +23,8 @@ const REQUIRED_STORES = [
   { name: "tools", keyPath: "key" },
   { name: "mail", keyPath: "key" },
   { name: "tabs_state", keyPath: "key" },
-  { name: "nodemap_projects", keyPath: "id" }
+  { name: "nodemap_projects", keyPath: "id" },
+  { name: USER_STORE, keyPath: "key", indexes: ["kind", "repo", "updated_at"] }
 ];
 
 class LocalDatabase {
@@ -55,6 +59,9 @@ class LocalDatabase {
             : db.createObjectStore(s.name, { keyPath: s.keyPath });
           if (DATA_STORES.includes(s.name) && !store.indexNames.contains("updated_at")) {
             store.createIndex("updated_at", "updated_at");
+          }
+          for (const idx of s.indexes || []) {
+            if (!store.indexNames.contains(idx)) store.createIndex(idx, idx);
           }
         });
       };
@@ -258,6 +265,89 @@ class LocalDatabase {
       }
     }
     return null;
+  }
+
+  // ------------------------------------------------------------------ user data (S06)
+  /** Store `rec` ({key, kind, repo, id, created_at, updated_at, data}); other windows are told. */
+  async userPut(rec) {
+    const ok = await this._userTx("readwrite", (store) => store.put(rec));
+    if (ok !== null) this._userChanged(rec.kind, rec.key);
+    return ok !== null;
+  }
+
+  async userGet(key) {
+    return this._userTx("readonly", (store) => store.get(key));
+  }
+
+  /** Records of one kind (all when null), of one repository (all when null), newest first. */
+  async userList(kind = null, repo = null) {
+    const all = (await this._userTx("readonly", (store) => (kind ? store.index("kind").getAll(kind) : store.getAll()))) || [];
+    return all.filter((r) => repo === null || r.repo === repo).sort((a, b) => (b.updated_at || 0) - (a.updated_at || 0));
+  }
+
+  async userDelete(key) {
+    const rec = await this.userGet(key);
+    const ok = await this._userTx("readwrite", (store) => store.delete(key));
+    if (ok !== null) this._userChanged(rec?.kind || "", key);
+    return ok !== null;
+  }
+
+  async userClear() {
+    const ok = await this._userTx("readwrite", (store) => store.clear());
+    this._userChanged("*", "");
+    return ok !== null;
+  }
+
+  async _userTx(mode, op) {
+    await this.ready;
+    if (!this.db || !this.db.objectStoreNames.contains(USER_STORE)) return null;
+    return new Promise((resolve) => {
+      try {
+        const tx = this.db.transaction(USER_STORE, mode);
+        const req = op(tx.objectStore(USER_STORE));
+        // A write that returns nothing succeeded (true); a read of a missing key is null
+        req.onsuccess = () => resolve(req.result === undefined ? (mode === "readwrite" ? true : null) : req.result);
+        req.onerror = () => resolve(null);
+      } catch (e) {
+        console.warn("[LocalDB] user store operation failed:", e);
+        resolve(null);
+      }
+    });
+  }
+
+  /** `user:changed` to this window (a DOM event) and the others (BroadcastChannel). */
+  _userChanged(kind, key) {
+    const detail = { kind, key };
+    try {
+      window.dispatchEvent(new CustomEvent("kip:user-changed", { detail }));
+    } catch {
+      // no DOM events (tests)
+    }
+    try {
+      if (!this._userChannel && typeof BroadcastChannel !== "undefined") this._userChannel = new BroadcastChannel(USER_CHANNEL);
+      this._userChannel?.postMessage({ type: "user:changed", ...detail });
+    } catch {
+      // single window
+    }
+  }
+
+  /** Call `cb({kind, key})` when user data changes in this window or another one; returns an unsubscribe. */
+  onUserChanged(cb) {
+    const local = (e) => cb(e.detail || {});
+    window.addEventListener("kip:user-changed", local);
+    let ch = null;
+    try {
+      ch = new BroadcastChannel(USER_CHANNEL);
+      ch.onmessage = (e) => {
+        if (e.data?.type === "user:changed") cb({ kind: e.data.kind, key: e.data.key });
+      };
+    } catch {
+      ch = null;
+    }
+    return () => {
+      window.removeEventListener("kip:user-changed", local);
+      ch?.close();
+    };
   }
 
   async getStoreCounts() {

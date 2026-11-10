@@ -17,11 +17,26 @@ from functools import lru_cache
 from typing import Any
 from fastapi import HTTPException
 from core.globalstuff import ASTT, is_safe_git_rev, is_safe_git_spec
-from parser.kconfig_ast.kconfig_lexer import KconfigLexer
-from parser.kconfig_ast.kconfig_parser import KconfigChoice, KconfigConfig, KconfigIf, KconfigMenu, KconfigParser
+from parser.kconfig_ast.kconfig_definitions import (  # noqa: F401 - re-exported
+    KCONFIG_TYPE_NAMES,
+    _cond,
+    _config_facts,
+    _expr,
+    kconfig_definitions,
+    kconfig_field_changes,
+    without_raw_fields,
+)
+from webapp.backend.services import kconfig_facts
 from webapp.backend.config import get_repo_dir
 from webapp.backend.database.pool import get_db_cursor
-from webapp.backend.database.helpers import finished_ref_sql, get_active_repo_id, get_version_info, hash_hex, safe_decode
+from webapp.backend.database.helpers import (
+    finished_ref_sql,
+    get_active_network_id,
+    get_active_repo_id,
+    get_version_info,
+    hash_hex,
+    safe_decode,
+)
 from webapp.backend.services.git_reader import git_reader
 from webapp.backend.services.git_service import _compute_structured_diff
 from webapp.backend.services.tree_resolver import DEFAULT_DEFINITION_ARCH, definition_arch, definition_rank, git_tree_resolver
@@ -33,13 +48,12 @@ logger = logging.getLogger(__name__)
 RC_RE = re.compile(r"-(?:rc|pre|alpha|beta)\d*$")
 REF_TAG, REF_BRANCH = 1, 2
 KCONFIG_TYPES = (int(ASTT.Kconfig_Config), int(ASTT.Kconfig_Menuconfig))
-KCONFIG_TYPE_NAMES = {1: "bool", 2: "tristate", 3: "string", 4: "hex", 5: "int"}
 LINEAGE_LIMIT = 500
 COMMIT_FORMAT = "--format=%H%x00%an%x00%ae%x00%at%x00%s"
 _C_COMMENT_RE = re.compile(r"/\*.*?\*/|//[^\n]*", re.S)
-# (blob sha, symbol) -> Kconfig definition facts; content addressed, so shared by every repository
-_FACTS_CACHE: OrderedDict[tuple[str, str], tuple[dict[str, Any], ...]] = OrderedDict()
-_FACTS_LOCK = threading.Lock()
+# Kconfig definitions are cached per blob SHA in webapp/backend/services/kconfig_facts.py (shared with
+# Compare's Kconfig diff); kept as a name for sync_service's cache list
+_FACTS_CACHE = kconfig_facts._DEFS_CACHE
 
 
 def _git(args: list[str], stdin: bytes | None = None, timeout: float = 30.0) -> bytes | None:
@@ -323,8 +337,6 @@ def diff_stats(old: str, new: str) -> dict[str, Any]:
 
 
 def _cosmetic_or_modified(old: str, new: str, strip_c_comments: bool = True) -> str:
-    if old == new:
-        return "unchanged"
     return "cosmetic" if normalize_code(old, strip_c_comments) == normalize_code(new, strip_c_comments) else "modified"
 
 
@@ -334,85 +346,11 @@ def _summary(timeline: list[dict[str, Any]]) -> tuple[int, int]:
     return present, changes
 
 
-# --- Kconfig definition facts ------------------------------------------------------------------------------
-
-def _expr(e: Any) -> str:
-    return e.to_string() if e is not None else ""
-
-
-def _cond(text: str, cond: Any) -> str:
-    return f"{text} if {_expr(cond)}" if cond is not None else text
-
-
-def _config_facts(cfg: KconfigConfig, inherited: list[str], choice: str | None) -> dict[str, Any]:
-    return {
-        "line_s": cfg.line_s,
-        "line_e": cfg.line_e,
-        "kind": "menuconfig" if cfg.is_menuconfig else "config",
-        "type": KCONFIG_TYPE_NAMES.get(cfg.sym_type, ""),
-        "prompt": _cond(f'"{cfg.prompt}"', cfg.prompt_cond) if cfg.prompt else "",
-        "defaults": [_cond(_expr(v), c) for v, c in cfg.defaults],
-        "depends_on": [_expr(d) for d in cfg.depends_on],
-        "inherited_depends": inherited,
-        "selects": [_cond(t, c) for t, c in cfg.selects],
-        "implies": [_cond(t, c) for t, c in cfg.implies],
-        "ranges": [_cond(f"{_expr(lo)} {_expr(hi)}", c) for lo, hi, c in cfg.ranges],
-        "choice": choice or "",
-        "options": list(cfg.options),
-        "transitional": cfg.transitional,
-        "help": cfg.help_text or "",
-    }
-
-
-def kconfig_definitions(text: str) -> dict[str, list[dict[str, Any]]]:
-    """Every config/menuconfig definition of one Kconfig file, by symbol, with its properties and the
-    dependencies it inherits from enclosing if/menu/choice blocks (one parse for all symbols)."""
-    try:
-        items = KconfigParser(KconfigLexer(text).tokenize(), text).parse()
-    except Exception as e:  # malformed historical Kconfig: report the snippet without properties
-        logger.debug("Kconfig parse failed: %s", e)
-        return {}
-    found: dict[str, list[dict[str, Any]]] = {}
-
-    def walk(nodes: list[Any], inherited: list[str], choice: str | None) -> None:
-        for node in nodes:
-            if isinstance(node, KconfigConfig):
-                found.setdefault(node.name, []).append(_config_facts(node, inherited, choice))
-            elif isinstance(node, KconfigIf):
-                walk(node.children, inherited + [_expr(node.cond)], choice)
-            elif isinstance(node, KconfigMenu):
-                walk(node.children, inherited + [_expr(d) for d in node.depends_on], choice)
-            elif isinstance(node, KconfigChoice):
-                walk(node.children, inherited + [_expr(d) for d in node.depends_on], node.prompt or node.name or "choice")
-
-    walk(items, [], None)
-    return found
-
+# --- Kconfig definition facts (parser/kconfig_ast/kconfig_definitions.py; re-exported for importers) ------
 
 def _kconfig_file_facts(text: str, sym: str) -> tuple[dict[str, Any], ...]:
     """Every definition of `sym` in one Kconfig file (see kconfig_definitions)."""
     return tuple(kconfig_definitions(text).get(sym, ()))
-
-
-def kconfig_field_changes(old: dict[str, Any] | None, new: dict[str, Any] | None) -> list[dict[str, Any]]:
-    """Property-level differences between two definitions of one Kconfig symbol."""
-    if not old or not new:
-        return []
-    changes: list[dict[str, Any]] = []
-    for key in ("kind", "type", "prompt", "choice", "transitional", "help"):
-        if old.get(key) != new.get(key):
-            changes.append({"field": key, "before": old.get(key), "after": new.get(key)})
-    for key in ("defaults", "depends_on", "inherited_depends", "selects", "implies", "ranges", "options"):
-        before, after = old.get(key) or [], new.get(key) or []
-        if before != after:
-            changes.append({
-                "field": key,
-                "added": [x for x in after if x not in before],
-                "removed": [x for x in before if x not in after],
-                "before": before,
-                "after": after,
-            })
-    return changes
 
 
 # --- Per-change commits ------------------------------------------------------------------------------------
@@ -439,6 +377,137 @@ def _cached_change_commits(repo_dir: str, path: str, from_rev: str, to_rev: str,
             "subject": parts[4],
         })
     return tuple(commits)
+
+
+INGEST_DONE = 2  # core/ingest_state.INGEST_DONE
+MAX_RENAMES = 5
+INGEST_CHAIN_LIMIT = 200
+
+
+def _ingest_chain(cursor: Any, network_id: int, from_sha: str, to_sha: str) -> list[int] | None:
+    """commit_ids of the finished versions whose ingestion ranges lead from from_rev's commit to to_rev's
+    (m_ingest_state.base_commit_id), to_rev's first; None when the bases do not reach from_rev (a version
+    in between was never ingested, or an older database without base_commit_id)."""
+    cursor.execute(
+        "SELECT commit_id, commit_hash FROM m_commit WHERE network_id = %s AND commit_hash IN (%s, %s);",
+        (network_id, bytes.fromhex(from_sha), bytes.fromhex(to_sha)),
+    )
+    ids = {hash_hex(r["commit_hash"]): int(r["commit_id"]) for r in cursor.fetchall()}
+    if from_sha not in ids or to_sha not in ids:
+        return None
+    cursor.execute("SELECT commit_id, base_commit_id FROM m_ingest_state WHERE network_id = %s AND status = %s;",
+                   (network_id, INGEST_DONE))
+    base = {int(r["commit_id"]): int(r["base_commit_id"] or 0) for r in cursor.fetchall()}
+    chain, cid = [], ids[to_sha]
+    while cid != ids[from_sha]:
+        if cid not in base or len(chain) >= INGEST_CHAIN_LIMIT:
+            return None
+        chain.append(cid)
+        cid = base[cid]
+    return chain or None
+
+
+def _db_change_commits(cursor: Any, path: str, from_rev: str, to_rev: str, line_s: int, line_e: int,
+                       limit: int) -> list[dict[str, Any]] | None:
+    """The commits of from_rev..to_rev behind a change, from what the parser stored; None when the
+    database cannot answer (then `git log` does).
+
+    Both revisions must be release tags joined by release segments (m_commit_release, release_service.
+    walk_segments()) and by finished ingestions (_ingest_chain()). With a line range, to_rev must have
+    been ingested directly on from_rev (one range: m_bridge_commit_tag maps each commit's hunks to the
+    tags of to_rev's blob) and the commits are those bridged to the blob's tags overlapping the lines;
+    without one, the commits whose m_commit_file rows name the path (as old or new name). Merges have no
+    file rows (parser/git_ast/GIT_API.md section 2.0), so they are never listed."""
+    from webapp.backend.services import release_service as rs
+    tags = rs.tag_commits()
+    if from_rev not in tags or to_rev not in tags:
+        return None
+    segments = rs.walk_segments(from_rev, to_rev)
+    if not segments:
+        return None
+    network_id = get_active_network_id(cursor)
+    repo_id = get_active_repo_id(cursor)
+    if network_id is None:
+        return None
+    chain = _ingest_chain(cursor, network_id, tags[from_rev], tags[to_rev])
+    if chain is None:
+        return None
+    seg_sql = ",".join(["%s"] * len(segments))
+    if line_s > 0 and line_e >= line_s:
+        if len(chain) != 1:
+            return None
+        sha = batch_blob_shas([f"{to_rev}:{path}"])[0]
+        meta = git_tree_resolver.map_blob_hashes(cursor, [sha]) if sha else {}
+        if not sha or sha not in meta:
+            return None
+        blob_id = meta[sha][0]
+        cursor.execute("SELECT tag_id FROM m_bridge_tag WHERE blob_id = %s AND line_s <= %s AND line_e >= %s;",
+                       (blob_id, line_e, line_s))
+        tag_ids = sorted({int(r["tag_id"]) for r in cursor.fetchall()})
+        if not tag_ids:
+            return []
+        commit_ids: set[int] = set()
+        for i in range(0, len(tag_ids), 500):
+            part = tag_ids[i:i + 500]
+            cursor.execute(
+                f"SELECT DISTINCT commit_id FROM m_bridge_commit_tag WHERE blob_id = %s AND tag_id IN ({','.join(['%s'] * len(part))});",
+                (blob_id, *part),
+            )
+            commit_ids.update(int(r["commit_id"]) for r in cursor.fetchall())
+        if not commit_ids:
+            return []
+        ids = sorted(commit_ids)
+        rows: list[dict[str, Any]] = []
+        for i in range(0, len(ids), 1000):
+            part = ids[i:i + 1000]
+            cursor.execute(
+                f"""
+                SELECT c.commit_id, c.commit_hash, c.author_date, c.committer_date, c.subject, p.name, p.email
+                FROM m_commit c
+                JOIN m_commit_release cr ON cr.repo_id = %s AND cr.commit_hash = c.commit_hash AND cr.segment_id IN ({seg_sql})
+                LEFT JOIN m_maintainer_person p ON p.person_id = c.author_id
+                WHERE c.commit_id IN ({','.join(['%s'] * len(part))});
+                """,
+                (repo_id, *segments, *part),
+            )
+            rows.extend(cursor.fetchall())
+    else:
+        cursor.execute("SELECT fnid FROM m_file_name WHERE fname = %s LIMIT 1;", (path,))
+        row = cursor.fetchone()
+        if not row:
+            return []
+        fnid = int(row["fnid"])
+        cursor.execute(
+            f"""
+            SELECT DISTINCT c.commit_id, c.commit_hash, c.author_date, c.committer_date, c.subject, p.name, p.email
+            FROM m_commit_release cr
+            JOIN m_commit c ON c.network_id = %s AND c.commit_hash = cr.commit_hash
+            JOIN m_commit_file f ON f.commit_id = c.commit_id AND (f.fnid = %s OR f.old_fnid = %s)
+            LEFT JOIN m_maintainer_person p ON p.person_id = c.author_id
+            WHERE cr.repo_id = %s AND cr.segment_id IN ({seg_sql});
+            """,
+            (network_id, fnid, fnid, repo_id, *segments),
+        )
+        rows = cursor.fetchall()
+    seen: set[str] = set()
+    commits = []
+    # Newest first like git log; same-second commits by commit_id (the parser registers parents first)
+    for r in sorted(rows, key=lambda r: (int(r["committer_date"] or 0), int(r["commit_id"])), reverse=True):
+        h = hash_hex(r["commit_hash"])
+        if h in seen:
+            continue
+        seen.add(h)
+        commits.append({
+            "commit_hash": h,
+            "commit_hash_short": h[:12],
+            "author_name": safe_decode(r["name"]) or "",
+            "author_email": safe_decode(r["email"]) or "",
+            "author_date": int(r["author_date"] or 0),
+            "subject": safe_decode(r["subject"]) or "",
+        })
+        if len(commits) >= limit:
+            break
+    return commits
 
 
 class HistoryService:
@@ -475,6 +544,7 @@ class HistoryService:
             versions = indexed_versions(cursor, include_rc, scope)
             shas = batch_blob_shas([f"{v['vname']}:{norm_path}" for v in versions])
             blob_meta = git_tree_resolver.map_blob_hashes(cursor, [s for s in shas if s])
+            paths, renamed_from = self._follow_renames(cursor, versions, norm_path, shas, blob_meta)
             blob_ids = sorted({blob_meta[s][0] for s in shas if s and s in blob_meta})
             lineage = tag_lineage(cursor, anchor["tag_id"])
             cands = self._candidates(cursor, blob_ids, anchor, lineage)
@@ -488,11 +558,14 @@ class HistoryService:
         last_code: str | None = None
         ref_line = anchor["line_s"]
         prev_vname: str | None = None
-        for v, sha in zip(versions, shas):
+        for i, (v, sha) in enumerate(zip(versions, shas)):
+            v_path = paths[i]
             entry: dict[str, Any] = {
-                **v, "prev_vname": prev_vname, "path": norm_path, "tag_id": None, "line_s": None, "line_e": None,
+                **v, "prev_vname": prev_vname, "path": v_path, "tag_id": None, "line_s": None, "line_e": None,
                 "lines_added": 0, "lines_removed": 0, "diff": [], "defs": [],
             }
+            if i in renamed_from:
+                entry["renamed_from"] = renamed_from[i]
             prev_vname = v["vname"]
             blob = blob_meta.get(sha) if sha else None
             if sha is not None and blob is None:
@@ -500,7 +573,7 @@ class HistoryService:
                 timeline.append(entry)
                 continue
             match = self._pick(cands.get(blob[0], []) if blob else [], lineage, ref_line)
-            if match is None and prev is not None and blob and anchor["name"] and self._mentions(v["vname"], norm_path, anchor["name"]):
+            if match is None and prev is not None and blob and anchor["name"] and self._mentions(v["vname"], v_path, anchor["name"]):
                 # The file still names the symbol but its blob has no such tag: an indexing gap, not a removal
                 entry["status"] = "unparsed"
                 timeline.append(entry)
@@ -508,7 +581,7 @@ class HistoryService:
             if match is None:
                 entry["status"] = "removed" if prev is not None else "absent"
                 if prev is not None:
-                    entry["defs"] = [{"path": norm_path, "status": "removed", "tag_id": None,
+                    entry["defs"] = [{"path": v_path, "status": "removed", "tag_id": None,
                                       "line_s": prev["line_s"], "line_e": prev["line_e"]}]
                 prev = None
                 timeline.append(entry)
@@ -522,12 +595,14 @@ class HistoryService:
                 if code != last_code:
                     entry.update(diff_stats(last_code, code))
             elif match["tag_id"] == prev["tag_id"] or code == last_code:
+                # A new tag with byte-identical code (its hash covers more than the definition's text) is
+                # no change: "cosmetic" with an empty diff misled (B14)
                 entry["status"] = "unchanged"
             else:
                 entry["status"] = _cosmetic_or_modified(last_code, code, strip_comments)
                 entry.update(diff_stats(last_code, code))
             entry["defs"] = [{
-                "path": norm_path, "status": entry["status"], "tag_id": match["tag_id"],
+                "path": v_path, "status": entry["status"], "tag_id": match["tag_id"],
                 "line_s": match["line_s"], "line_e": match["line_e"], "diff": entry["diff"],
                 "lines_added": entry["lines_added"], "lines_removed": entry["lines_removed"],
             }]
@@ -552,6 +627,52 @@ class HistoryService:
             "snippets": {str(t): codes.get(t, "") for t in seen_tags},
             "timeline": timeline,
         }
+
+    @staticmethod
+    def _follow_renames(cursor: Any, versions: list[dict[str, Any]], path: str, shas: list[str | None],
+                        blob_meta: dict[str, Any]) -> tuple[list[str], dict[int, str]]:
+        """Paths of the timeline's versions, following renames: when the path has no blob at a version
+        but had an indexed one at the previous, m_blob_transition (old blob -> new blob, written by the
+        parser for each renamed file) and that version's checkpoint (m_checkpoint_tree) name the new path.
+        With exactly one candidate the remaining versions are resolved on it (shas and blob_meta are
+        updated in place); several or none leave the definition removed. -> (paths, {index: old path})."""
+        paths = [path] * len(versions)
+        renamed_from: dict[int, str] = {}
+        start = 1
+        for _ in range(MAX_RENAMES):
+            k = next((i for i in range(start, len(versions))
+                      if shas[i] is None and shas[i - 1] is not None and shas[i - 1] in blob_meta), None)
+            if k is None:
+                break
+            start = k + 1
+            old_blob = blob_meta[shas[k - 1]][0]
+            try:
+                cursor.execute("SELECT new_blob_id FROM m_blob_transition WHERE old_blob_id = %s;", (old_blob,))
+                new_blobs = sorted({int(r["new_blob_id"]) for r in cursor.fetchall()})
+                if not new_blobs:
+                    continue
+                cursor.execute(
+                    f"""
+                    SELECT DISTINCT f.fname FROM m_checkpoint_tree t JOIN m_file_name f ON f.fnid = t.fnid
+                    WHERE t.commit_id = %s AND t.blob_id IN ({",".join(["%s"] * len(new_blobs))});
+                    """,
+                    (versions[k]["vid"], *new_blobs),
+                )
+                found = sorted({safe_decode(r["fname"]) for r in cursor.fetchall()} - {paths[k - 1]})
+            except Exception as exc:  # noqa: BLE001 - the timeline stays on one path
+                logger.debug("rename lookup failed: %s", exc)
+                break
+            if len(found) != 1:
+                continue
+            new_path = found[0]
+            new_shas = batch_blob_shas([f"{v['vname']}:{new_path}" for v in versions[k:]])
+            if new_shas[0] is None:
+                continue
+            shas[k:] = new_shas
+            blob_meta.update(git_tree_resolver.map_blob_hashes(cursor, [s for s in new_shas if s and s not in blob_meta]))
+            renamed_from[k] = paths[k - 1]
+            paths[k:] = [new_path] * (len(versions) - k)
+        return paths, renamed_from
 
     @staticmethod
     def _anchor_row(cursor: Any, tag_id: int, path: str, line_s: int | None = None) -> dict[str, Any]:
@@ -789,6 +910,8 @@ class HistoryService:
             shas = batch_blob_shas(specs)
             indexed = git_tree_resolver.map_blob_hashes(cursor, [s for s in shas if s and s not in sha_to_blob])
             codes = tag_codes(cursor, {r["tag_id"] for r in tag_rows})
+        # The parser's stored definitions of every blob at once (m_blob_facts family 4); the rest parse from Git
+        kconfig_facts.load_stored(s for s in shas if s)
 
         timeline: list[dict[str, Any]] = []
         prev_defs: dict[str, list[dict[str, Any]]] = {}  # path -> definitions in the previous version
@@ -832,12 +955,12 @@ class HistoryService:
                         d = {**n, "changes": []}
                         if o is None:
                             d["status"] = "added"
-                        elif o["tag_id"] == n["tag_id"] or codes.get(o["tag_id"], "") == codes.get(n["tag_id"], ""):
+                        elif o["tag_id"] == n["tag_id"]:
                             d["status"] = "unchanged"
                         else:
                             d["changes"] = kconfig_field_changes(o["facts"], n["facts"])
                             d["status"] = "modified" if d["changes"] else _cosmetic_or_modified(codes.get(o["tag_id"], ""), codes.get(n["tag_id"], ""), False)
-                        if base is not None and base["tag_id"] != n["tag_id"] and codes.get(base["tag_id"], "") != codes.get(n["tag_id"], ""):
+                        if base is not None and base["tag_id"] != n["tag_id"]:
                             d.update(diff_stats(codes.get(base["tag_id"], ""), codes.get(n["tag_id"], "")))
                             if o is None:
                                 d["changes"] = kconfig_field_changes(base["facts"], n["facts"])
@@ -888,18 +1011,13 @@ class HistoryService:
 
     @staticmethod
     def _file_facts(vname: str, path: str, sha: str, sym: str) -> tuple[dict[str, Any], ...]:
-        key = (sha, sym)
-        with _FACTS_LOCK:
-            if key in _FACTS_CACHE:
-                _FACTS_CACHE.move_to_end(key)
-                return _FACTS_CACHE[key]
-        raw, _, _ = git_reader.read_file(vname, path)
-        facts = _kconfig_file_facts(raw.decode("utf-8", errors="replace") if raw is not None else "", sym)
-        with _FACTS_LOCK:
-            _FACTS_CACHE[key] = facts
-            if len(_FACTS_CACHE) > 2048:
-                _FACTS_CACHE.popitem(last=False)
-        return facts
+        """Definitions of `sym` in the Kconfig blob `sha` (`vname:path`): one parse per blob for all its
+        symbols, shared with Compare (kconfig_facts.definitions)."""
+        def load() -> str:
+            raw, _, _ = git_reader.read_file(vname, path)
+            return raw.decode("utf-8", errors="replace") if raw is not None else ""
+
+        return tuple(without_raw_fields(f) for f in kconfig_facts.definitions(sha, load).get(sym, ()))
 
     # --- Commits behind one change ----------------------------------------------------------------------------
 
@@ -914,8 +1032,9 @@ class HistoryService:
     ) -> dict[str, Any]:
         """Commits between two releases that touched lines line_s..line_e (at to_rev) of path.
 
-        `git log -L` follows the range back through every commit of from_rev..to_rev; without a line
-        range (a removed definition) the commits touching the file are listed.
+        From the database when it holds the answer (_db_change_commits(): `source: "db"`); otherwise
+        `git log -L` follows the range back through every commit of from_rev..to_rev, and without a line
+        range (a removed definition) the commits touching the file are listed (`source: "git"`).
         """
         norm_path = (path or "").strip().strip("/")
         for rev in (to_rev, from_rev):
@@ -924,13 +1043,26 @@ class HistoryService:
         if not norm_path or norm_path.startswith("-") or ".." in norm_path.split("/"):
             raise HTTPException(status_code=400, detail="Invalid path.")
         limit = max(1, min(limit, 500))
-        try:
-            commits = _cached_change_commits(
-                str(get_repo_dir()), norm_path, from_rev or "", to_rev, int(line_s or 0), int(line_e or 0), limit,
-            )
-        except subprocess.TimeoutExpired:
-            raise HTTPException(status_code=504, detail="Git history operation timed out.")
+        commits = None
+        source = "git"
+        if from_rev:
+            try:
+                with get_db_cursor() as cursor:
+                    commits = _db_change_commits(cursor, norm_path, from_rev, to_rev, int(line_s or 0), int(line_e or 0), limit)
+            except Exception as exc:  # noqa: BLE001 - git answers
+                logger.debug("change commits of %s from the database failed: %s", norm_path, exc)
+                commits = None
+            if commits is not None:
+                source = "db"
+        if commits is None:
+            try:
+                commits = _cached_change_commits(
+                    str(get_repo_dir()), norm_path, from_rev or "", to_rev, int(line_s or 0), int(line_e or 0), limit,
+                )
+            except subprocess.TimeoutExpired:
+                raise HTTPException(status_code=504, detail="Git history operation timed out.")
         return {
+            "source": source,
             "path": norm_path,
             "from": from_rev,
             "to": to_rev,

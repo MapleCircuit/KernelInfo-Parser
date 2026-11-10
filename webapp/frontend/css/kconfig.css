@@ -242,6 +242,7 @@
 }
 
 /* 3. Terminal Menuconfig TUI */
+/* theme-fixed-start: the menuconfig TUI keeps mconf's own blue/grey colors in every theme (§5.5) */
 .menuconfig-tui-modal {
   position: fixed;
   top: 0;
@@ -657,6 +658,7 @@
   display: flex;
   flex-direction: column;
 }
+/* theme-fixed-end */
 
 .tui-help-window pre {
   flex: 1;
@@ -728,3 +730,28 @@
   color: var(--accent-blue);
   text-decoration: none;
 }
+/* Change preview (§5.32) and configuration workflows: fragments, hardware, new options (§5.8) */
+.change-preview .cp-intro { margin-bottom: 10px; }
+.change-preview .cp-filter { width: 100%; margin-bottom: 8px; padding: 4px 8px; background: var(--bg-primary); color: var(--text-primary); border: 1px solid var(--border-color); border-radius: var(--radius-sm); }
+.change-preview .cp-section { margin-bottom: 14px; }
+.change-preview .cp-label { margin: 0 0 6px; font-size: var(--fs-12, 12px); color: var(--text-secondary); }
+.change-preview .cp-count { font-family: var(--font-mono); font-weight: normal; color: var(--text-muted); }
+.change-preview .cp-table tbody tr:not(.cp-link) { cursor: default; }
+.change-preview .cp-name { white-space: nowrap; }
+.change-preview .cp-notes { margin: 8px 0 0; padding-left: 18px; color: var(--text-secondary); font-size: var(--fs-11, 11px); overflow-wrap: anywhere; }
+.kfrag-list { display: flex; flex-direction: column; gap: 4px; max-height: 220px; overflow: auto; }
+.kfrag-item { display: flex; align-items: center; gap: 6px; cursor: pointer; }
+.kfrag-order { min-width: 1.6em; font-family: var(--font-mono); color: var(--accent-blue); }
+.kfrag-text { width: 100%; box-sizing: border-box; font-family: var(--font-mono); font-size: var(--fs-11, 11px); background: var(--bg-primary); color: var(--text-primary); border: 1px solid var(--border-color); border-radius: var(--radius-sm); padding: 6px; resize: vertical; }
+.khw-modes { display: flex; flex-wrap: wrap; gap: 14px; margin: 8px 0; }
+.khw-modes label { display: flex; align-items: center; gap: 4px; cursor: pointer; }
+.khw-status { min-height: 1.2em; }
+.kconfig-new-banner { padding: 6px 8px; border-bottom: 1px solid var(--border-color); background: var(--bg-secondary); font-size: var(--fs-11, 11px); }
+.knew-banner { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.knew-banner > span { flex: 1 1 140px; }
+.knew-step { display: flex; flex-direction: column; gap: 4px; }
+.knew-head { display: flex; justify-content: space-between; align-items: center; gap: 6px; }
+.knew-path, .knew-dep { font-size: var(--fs-10, 10px); overflow-wrap: anywhere; }
+.knew-prompt code { font-size: var(--fs-10, 10px); }
+.knew-values, .knew-nav { display: flex; flex-wrap: wrap; gap: 4px; }
+.knew-input { flex: 1; min-width: 80px; font-family: var(--font-mono); background: var(--bg-primary); color: var(--text-primary); border: 1px solid var(--border-color); border-radius: var(--radius-sm); padding: 2px 6px; }

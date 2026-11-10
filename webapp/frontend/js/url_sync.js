@@ -14,6 +14,7 @@
  * pane would discard the view that reported it.
  */
 import { state } from "./state.js";
+import { routeKeys, tabRoute } from "./tab_routes.js";
 
 /** Compare rename searches from `rn=<similarity>:<directory>` entries (applied in order; empty dir = whole tree). */
 function parseRenameSearches(values) {
@@ -150,11 +151,12 @@ class UrlSynchronizer {
 
     // 2. Reopen tabs that existed in this snapshot, or restore in-tab properties
     const NAV_PROPS = [
-      "title", "path", "cursorLine", "structName", "functionName",
+      "title", "path", "cursorLine", "lineEnd", "blame", "blameOpts", "structName", "functionName",
       "query", "filter", "symbol", "arch", "configName", "commitId",
       "listCollapsed", "threadId", "messageId", "listMode", "section",
       "secId", "person", "role", "sort", "versionA", "versionB", "mode",
-      "statuses", "kconfigQuery", "kconfigStatuses", "renameSearches"
+      "statuses", "kconfigQuery", "kconfigStatuses", "renameSearches", "apiKinds", "apiStatuses", "apiQuery", "apiArch",
+      ...routeKeys()
     ];
 
     for (const savedTab of (targetSnapshot.tabs || [])) {
@@ -219,13 +221,15 @@ class UrlSynchronizer {
   getNavKey(tab) {
     if (!tab) return "";
     const v = tab.version || state.currentVersion || "";
+    const route = tabRoute(tab.type);
+    if (route?.navKey) return `${v}:${tab.type}:${route.navKey(tab)}`;
     switch (tab.type) {
       case "code":
         return `${v}:${tab.type}:${tab.path || ""}`;
       case "pahole":
-        return `${v}:${tab.type}:${tab.structName || ""}`;
+        return `${v}:${tab.type}:${tab.structName || ""}:${tab.cmp || ""}:${tab.hist ? 1 : 0}`;
       case "callgraph":
-        return `${v}:${tab.type}:${tab.functionName || ""}`;
+        return `${v}:${tab.type}:${tab.functionName || ""}:${tab.pathTo || ""}`;
       case "explorer":
         return `${v}:${tab.type}:${tab.path || ""}`;
       case "commits":
@@ -271,6 +275,9 @@ class UrlSynchronizer {
           version: t.version,
           path: t.path,
           cursorLine: t.cursorLine,
+          lineEnd: t.lineEnd,
+          blame: t.blame,
+          blameOpts: t.blameOpts,
           structName: t.structName,
           functionName: t.functionName,
           query: t.query,
@@ -294,7 +301,13 @@ class UrlSynchronizer {
           statuses: t.statuses,
           kconfigQuery: t.kconfigQuery,
           kconfigStatuses: t.kconfigStatuses,
-          renameSearches: t.renameSearches ? JSON.parse(JSON.stringify(t.renameSearches)) : undefined
+          apiKinds: t.apiKinds,
+          apiStatuses: t.apiStatuses,
+          apiQuery: t.apiQuery,
+          apiArch: t.apiArch,
+          renameSearches: t.renameSearches ? JSON.parse(JSON.stringify(t.renameSearches)) : undefined,
+          ...Object.fromEntries((tabRoute(t.type)?.keys || []).filter((k) => t[k] !== undefined)
+            .map((k) => [k, typeof t[k] === "object" && t[k] !== null ? JSON.parse(JSON.stringify(t[k])) : t[k]]))
         });
       }
     }
@@ -320,7 +333,12 @@ class UrlSynchronizer {
       const v = params.get("v");
       const tabType = params.get("tab") || "code";
       const file = params.get("file");
-      const line = parseInt(params.get("line") || "1", 10);
+      // line=<a> or line=<a>-<b> (a selected range, G06); a reversed range is normalized
+      const lineSpec = /^(\d+)(?:-(\d+))?$/.exec(params.get("line") || "");
+      let line = lineSpec ? parseInt(lineSpec[1], 10) : 1;
+      let lineEnd = lineSpec && lineSpec[2] ? parseInt(lineSpec[2], 10) : 0;
+      if (lineEnd && lineEnd < line) [line, lineEnd] = [lineEnd, line];
+      if (lineEnd === line) lineEnd = 0;
       const arch = params.get("arch") || "x86_64";
       const dir = params.get("dir") || "";
       const cfg = params.get("cfg") || ""; // named copy of that ARCH's configuration, if any
@@ -329,19 +347,29 @@ class UrlSynchronizer {
       // Restoring a revision from the hash selects it in the header; the tab opened below carries it
       if (v) state.setSelectedVersion(v);
 
-      if (tabType === "code" && file) {
+      const route = tabRoute(tabType);
+      if (route?.fromHash) {
+        state.openTab({ type: tabType, ...route.fromHash(params, v || state.currentVersion), version: v || state.currentVersion });
+      } else if (tabType === "code" && file) {
         // "⇄ Diff" of the file (§5.21): dv/dp = the other file, ds=1 swapped sides, dm=split layout.
         // A link without dv addresses the plain file, so a reused tab drops its diff.
         const dv = params.get("dv") || "";
-        const diffWith = dv ? { version: dv, path: params.get("dp") || file, swap: params.get("ds") === "1" } : null;
+        // dk=patch&dmid=<message ids>: the file against what those archive patches make of it (P1)
+        const dmid = params.get("dk") === "patch" ? (params.get("dmid") || "").split(",").map((m) => m.trim()).filter(Boolean).slice(0, 50) : [];
+        const diffWith = dmid.length ? { kind: "patch", mids: dmid, revision: v || state.currentVersion, path: file, applyId: "" }
+          : dv ? { version: dv, path: params.get("dp") || file, swap: params.get("ds") === "1" } : null;
         state.openTab({
           type: "code",
           title: file.split("/").pop(),
           path: file,
           cursorLine: line,
+          lineEnd,
           version: v || state.currentVersion,
           diffWith,
-          diffLayout: dv && params.get("dm") === "split" ? "split" : "",
+          diffLayout: (dv || dmid.length) && params.get("dm") === "split" ? "split" : "",
+          // Blame shown, and its options (H9, §5.21): bl=1, bo=<m|c|w>
+          blame: params.get("bl") === "1",
+          blameOpts: params.get("bl") === "1" ? (params.get("bo") || "").replace(/[^mcw]/g, "").slice(0, 3) : "",
         });
       } else if (tabType === "kconfig") {
         state.openTab({
@@ -378,6 +406,14 @@ class UrlSynchronizer {
           listMode: params.get("mode") === "tree" ? "tree" : "search",
           listCollapsed: params.get("lc") === "1",
           version: v || state.currentVersion
+        });
+      } else if (tabType === "diff" && params.get("mode") === "api") {
+        // API mode (A6): k = kinds, st = statuses, q = filter, arch
+        state.openTab({
+          type: "diff", title: "Compare",
+          versionA: params.get("a") || undefined, versionB: params.get("b") || undefined, mode: "api",
+          apiKinds: params.get("k") || "", apiStatuses: params.get("st") || "", apiQuery: query, apiArch: params.get("arch") || "",
+          version: v || state.currentVersion,
         });
       } else if (tabType === "diff") {
         const kconfigMode = params.get("mode") === "kconfig";
@@ -425,6 +461,9 @@ class UrlSynchronizer {
           type: "pahole",
           title: `struct ${structName}`,
           structName,
+          // Layout over time (N3): cmp=<rev> compares with another revision, hist=1 shows the size history
+          cmp: params.get("cmp") || "",
+          hist: params.get("hist") === "1",
           version: v || state.currentVersion
         });
       } else if (tabType === "callgraph") {
@@ -433,6 +472,8 @@ class UrlSynchronizer {
           type: "callgraph",
           title: `Callgraph: ${funcName}`,
           functionName: funcName,
+          // Call path search target (N2): navigation, like the function
+          pathTo: params.get("to") || "",
           version: v || state.currentVersion
         });
       } else if (tabType === "treemap") {
@@ -460,14 +501,24 @@ class UrlSynchronizer {
 
     if (activeTab.type === "code" && activeTab.path) {
       params.set("file", activeTab.path);
-      if (activeTab.cursorLine && activeTab.cursorLine > 1) {
+      if (activeTab.lineEnd && activeTab.lineEnd > (activeTab.cursorLine || 1)) {
+        params.set("line", `${activeTab.cursorLine || 1}-${activeTab.lineEnd}`);
+      } else if (activeTab.cursorLine && activeTab.cursorLine > 1) {
         params.set("line", activeTab.cursorLine);
       }
-      if (activeTab.diffWith?.version) {
+      if (activeTab.diffWith?.kind === "patch") {
+        params.set("dk", "patch");
+        params.set("dmid", (activeTab.diffWith.mids || []).join(","));
+        if (activeTab.diffLayout === "split") params.set("dm", "split");
+      } else if (activeTab.diffWith?.version) {
         params.set("dv", activeTab.diffWith.version);
         if (activeTab.diffWith.path && activeTab.diffWith.path !== activeTab.path) params.set("dp", activeTab.diffWith.path);
         if (activeTab.diffWith.swap) params.set("ds", "1");
         if (activeTab.diffLayout === "split") params.set("dm", "split");
+      }
+      if (activeTab.blame) {
+        params.set("bl", "1");
+        if (activeTab.blameOpts) params.set("bo", activeTab.blameOpts);
       }
     } else if (activeTab.type === "explorer") {
       if (activeTab.path) params.set("dir", activeTab.path);
@@ -487,7 +538,13 @@ class UrlSynchronizer {
     } else if (activeTab.type === "diff") {
       if (activeTab.versionA) params.set("a", activeTab.versionA);
       if (activeTab.versionB) params.set("b", activeTab.versionB);
-      if (activeTab.mode === "kconfig") {
+      if (activeTab.mode === "api") {
+        params.set("mode", "api");
+        if (activeTab.apiKinds) params.set("k", activeTab.apiKinds);
+        if (activeTab.apiStatuses) params.set("st", activeTab.apiStatuses);
+        if (activeTab.apiQuery) params.set("q", activeTab.apiQuery);
+        if (activeTab.apiArch) params.set("arch", activeTab.apiArch);
+      } else if (activeTab.mode === "kconfig") {
         params.set("mode", "kconfig");
         if (activeTab.kconfigStatuses) params.set("st", activeTab.kconfigStatuses);
         if (activeTab.kconfigQuery) params.set("q", activeTab.kconfigQuery);
@@ -508,10 +565,15 @@ class UrlSynchronizer {
       if (activeTab.role && activeTab.role !== "all") params.set("role", activeTab.role);
       if (activeTab.sort === "alpha") params.set("sort", "alpha");
       if (activeTab.listCollapsed) params.set("lc", "1");
+    } else if (tabRoute(activeTab.type)?.toHash) {
+      tabRoute(activeTab.type).toHash(activeTab, params);
     } else if (activeTab.type === "pahole") {
       if (activeTab.structName) params.set("struct", activeTab.structName);
+      if (activeTab.cmp) params.set("cmp", activeTab.cmp);
+      if (activeTab.hist) params.set("hist", "1");
     } else if (activeTab.type === "callgraph") {
       if (activeTab.functionName) params.set("fn", activeTab.functionName);
+      if (activeTab.pathTo) params.set("to", activeTab.pathTo);
     }
 
     const newHash = "#" + params.toString();

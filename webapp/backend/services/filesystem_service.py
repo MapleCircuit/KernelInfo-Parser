@@ -2,12 +2,14 @@
 from __future__ import annotations
 from collections.abc import Iterator
 import heapq
+import logging
 import os
 from webapp.backend.config import RepoScopedCache, get_repo_dir
 from typing import Any
 from fastapi import HTTPException
 from webapp.backend.database.pool import get_db_cursor
 from webapp.backend.database.helpers import (
+    tree_source,
     safe_decode,
     format_stat_label,
     get_version_info,
@@ -16,6 +18,8 @@ from webapp.backend.security.jail import is_safe_rel_path
 from webapp.backend.security.sql import escape_like
 from webapp.backend.services.git_reader import git_reader
 from webapp.backend.services.tree_resolver import tree_resolver, git_tree_resolver
+logger = logging.getLogger(__name__)
+
 # Bounded: every key below carries a request parameter (a header, a path), so an unbounded cache
 # would grow with each distinct value a caller sends. Treemaps are whole subtrees, so fewer are kept.
 _INCLUDE_CACHE: dict[tuple[str, str, str | None], dict[str, Any]] = RepoScopedCache(maxsize=4096)
@@ -50,7 +54,7 @@ class FilesystemService:
         is_checkpoint = False
         if git_dir is None:
             # Git unavailable: fall back to milestone checkpoint in m_bridge_checkpoint
-            cursor.execute("SELECT 1 FROM m_bridge_checkpoint WHERE commit_id = %s LIMIT 1;", (vid,))
+            cursor.execute("SELECT 1 FROM m_checkpoint_tree WHERE commit_id = %s LIMIT 1;".replace("m_checkpoint_tree", tree_source(cursor)), (vid,))
             is_checkpoint = cursor.fetchone() is not None
 
         if git_dir is not None:
@@ -58,12 +62,12 @@ class FilesystemService:
         elif is_checkpoint:
             sql = """
                 SELECT fn.fname, bc.blob_id AS fid, fb.ftype, '0' AS s_stat, '0' AS e_stat
-                FROM m_bridge_checkpoint bc
+                FROM m_checkpoint_tree bc
                 JOIN m_file_blob fb ON bc.blob_id = fb.blob_id
                 JOIN m_file_name fn ON bc.fnid = fn.fnid
                 WHERE bc.commit_id = %s AND (fn.fname LIKE %s OR %s = '')
                 ORDER BY fn.fname ASC;
-            """
+            """.replace("m_checkpoint_tree", tree_source(cursor))
             cursor.execute(sql, (vid, like_pattern, prefix))
             rows = cursor.fetchall()
         else:
@@ -257,7 +261,7 @@ class FilesystemService:
         last_changed = None
         try:
             from webapp.backend.services.git_service import GitService
-            last_changed = GitService().get_file_last_changed(vname, norm_path)
+            last_changed = GitService().get_file_last_changed(vname, norm_path, blob_id=fid)
         except Exception:  # noqa: BLE001 - the header line is optional
             pass
 
@@ -312,7 +316,6 @@ class FilesystemService:
         Sources come from the Git tree (Path C) so every revision is complete; files under other
         architectures' arch/<name>/ subtrees are excluded.
         """
-        arch_dir = "x86" if arch in ("x86", "x86_64", "i386") else arch
         with get_db_cursor() as cursor:
             vid, vname = get_version_info(cursor, version_name)
             if vid is None:
@@ -321,16 +324,24 @@ class FilesystemService:
         if tree is None:
             raise HTTPException(status_code=404, detail=f"Revision '{vname}' is not available in Git.")
 
+        from webapp.backend.services.arch_layout_service import arch_layout_service
+        lay = arch_layout_service.layout(vname, arch)
+        srcarch = lay.srcarch if lay else ("x86" if arch in ("x86", "x86_64", "i386") else arch)
+        if lay and lay.includes:
+            inc_args = " ".join(f"-I{inc.rstrip('/')}" for inc in lay.includes)
+            includes = f"{inc_args} -Iarch/{srcarch}/include/uapi -Iinclude/uapi -include include/linux/kconfig.h"
+        else:
+            includes = (
+                f"-Iarch/{srcarch}/include -Iarch/{srcarch}/include/generated -Iinclude "
+                f"-Iarch/{srcarch}/include/uapi -Iinclude/uapi -include include/linux/kconfig.h"
+            )
+
         base_dir = str(get_repo_dir())
-        includes = (
-            f"-Iarch/{arch_dir}/include -Iarch/{arch_dir}/include/generated -Iinclude "
-            f"-Iarch/{arch_dir}/include/uapi -Iinclude/uapi -include include/linux/kconfig.h"
-        )
         commands = []
         for f in sorted(tree):
             if not f.endswith(".c"):
                 continue
-            if f.startswith("arch/") and not f.startswith(f"arch/{arch_dir}/"):
+            if f.startswith("arch/") and not f.startswith(f"arch/{srcarch}/"):
                 continue
             commands.append({
                 "directory": base_dir,
@@ -467,6 +478,112 @@ class FilesystemService:
                 return data, media_type
         raise HTTPException(status_code=404, detail=f"No image found for '{norm_path}' at '{vname}'.")
 
+    # ------------------------------------------------------------------ references to a file
+    REF_INCLUDE, REF_KCONFIG_SOURCE, REF_DOC = 1, 2, 5
+
+    def get_file_references(self, version_name: str, path: str, limit: int = 200) -> dict[str, Any]:
+        """What refers to a file at a revision (webapp/API.md section 4.2): the files including it, the Kconfig
+        files `source`-ing it and the documents naming it (m_file_reference, the parser's Step 6.6 rows), and
+        the Kbuild rules building it (m_kbuild_symbol). Rows are stored per (source path, blob); only those
+        whose source blob is the revision's blob of that path are kept. SELECT only."""
+        import time
+        started = time.perf_counter()
+        norm = (path or "").strip().strip("/")
+        if not norm or not is_safe_rel_path(norm):
+            raise HTTPException(status_code=400, detail="A valid relative file path must be specified.")
+        limit = max(1, min(int(limit or 200), 1000))
+        lists: dict[str, list[dict[str, Any]]] = {"included_by": [], "sourced_by": [], "documented_in": [], "built_by": []}
+        out: dict[str, Any] = {"version": version_name, "path": norm, "includes_source": "parser", "indexed": False}
+        with get_db_cursor() as cursor:
+            vid, vname = get_version_info(cursor, version_name)
+            rev = vname or version_name
+            blob_paths = git_tree_resolver.blob_paths(cursor, rev)
+            if blob_paths is None:
+                raise HTTPException(status_code=404, detail=f"Revision '{version_name}' is not available in Git.")
+            in_tree = {(bid, p) for bid, paths in blob_paths.items() for p in paths}
+            out["indexed"] = any(p == norm for _bid, p in in_tree)
+            cursor.execute("SELECT fnid FROM m_file_name WHERE fname = %s LIMIT 1;", (norm,))
+            row = cursor.fetchone()
+            if row:
+                fnid = int(row["fnid"])
+                kind_of = {self.REF_INCLUDE: "included_by", self.REF_KCONFIG_SOURCE: "sourced_by", self.REF_DOC: "documented_in"}
+                # Read from the covering index fref_tgt_src_idx alone (ref_id is its primary key part); the
+                # paths and the documents' details are fetched for the rows of the revision only
+                cursor.execute(
+                    """
+                    SELECT ref_id, ref_type, line_no, source_blob_id, source_fnid
+                    FROM m_file_reference
+                    WHERE target_fnid = %s AND ref_type IN (%s, %s, %s);
+                    """,
+                    (fnid, self.REF_INCLUDE, self.REF_KCONFIG_SOURCE, self.REF_DOC),
+                )
+                rows = [r for r in cursor.fetchall() if int(r["source_blob_id"]) in blob_paths]
+                names = self._fnames(cursor, {int(r["source_fnid"]) for r in rows})
+                kept = [(r, names.get(int(r["source_fnid"]), "")) for r in rows]
+                kept = [(r, src) for r, src in kept if (int(r["source_blob_id"]), src) in in_tree]
+                details: dict[int, str] = {}
+                doc_ids = sorted(int(r["ref_id"]) for r, _src in kept if int(r["ref_type"]) == self.REF_DOC)
+                for i in range(0, len(doc_ids), 1000):
+                    part = doc_ids[i:i + 1000]
+                    cursor.execute(f"SELECT ref_id, details FROM m_file_reference WHERE ref_id IN ({','.join(['%s'] * len(part))});", tuple(part))
+                    details.update({int(d["ref_id"]): safe_decode(d["details"]) or "" for d in cursor.fetchall()})
+                seen: set[tuple] = set()
+                for r, src in kept:
+                    kind = kind_of[int(r["ref_type"])]
+                    item = {"path": src, "line": int(r["line_no"] or 0)}
+                    if kind == "documented_in":
+                        item["details"] = details.get(int(r["ref_id"]), "")
+                    key = (kind, src, item["line"])
+                    if key not in seen:
+                        seen.add(key)
+                        lists[kind].append(item)
+                try:
+                    cursor.execute(
+                        """
+                        SELECT k.source_blob_id, k.line_no, k.symbol, k.rule, fn.fname
+                        FROM m_kbuild_symbol k
+                        JOIN m_file_name fn ON fn.fnid = k.source_fnid
+                        WHERE k.target_fnid = %s AND k.via IN (1, 2);
+                        """,
+                        (fnid,),
+                    )
+                    rules: dict[tuple[str, int], dict[str, Any]] = {}
+                    for r in cursor.fetchall():
+                        src = safe_decode(r["fname"])
+                        if (int(r["source_blob_id"]), src) not in in_tree:
+                            continue
+                        entry = rules.setdefault((src, int(r["line_no"] or 0)), {
+                            "path": src, "line": int(r["line_no"] or 0), "rule": safe_decode(r["rule"]) or "", "symbols": []})
+                        sym = safe_decode(r["symbol"]) or ""
+                        if sym and sym not in entry["symbols"]:
+                            entry["symbols"].append(sym)
+                    lists["built_by"] = list(rules.values())
+                except Exception as exc:  # noqa: BLE001 - an older database without m_kbuild_symbol
+                    logger.debug("m_kbuild_symbol unavailable: %s", exc)
+        totals = {}
+        truncated = False
+        for kind, items in lists.items():
+            items.sort(key=lambda it: (it["path"], it["line"]))
+            totals[kind] = len(items)
+            if len(items) > limit:
+                lists[kind] = items[:limit]
+                truncated = True
+        out.update(lists)
+        out["totals"] = totals
+        out["truncated"] = truncated
+        out["elapsed_ms"] = round((time.perf_counter() - started) * 1000)
+        return out
+
+    @staticmethod
+    def _fnames(cursor: Any, fnids: set[int]) -> dict[int, str]:
+        out: dict[int, str] = {}
+        ids = sorted(fnids)
+        for i in range(0, len(ids), 1000):
+            part = ids[i:i + 1000]
+            cursor.execute(f"SELECT fnid, fname FROM m_file_name WHERE fnid IN ({','.join(['%s'] * len(part))});", tuple(part))
+            out.update({int(r["fnid"]): safe_decode(r["fname"]) for r in cursor.fetchall()})
+        return out
+
     def resolve_include(
         self,
         version_name: str,
@@ -528,14 +645,14 @@ class FilesystemService:
                 cursor.execute(
                     """
                     SELECT fn_target.fname
-                    FROM m_bridge_checkpoint bc_src
+                    FROM m_checkpoint_tree bc_src
                     JOIN m_file_name fn_src ON bc_src.fnid = fn_src.fnid
                     JOIN m_file_reference fr ON fr.source_blob_id = bc_src.blob_id AND fr.source_fnid = bc_src.fnid
                     JOIN m_file_name fn_target ON fr.target_fnid = fn_target.fnid
                     WHERE bc_src.commit_id = %s AND fn_src.fname = %s AND fr.ref_type = 1
                       AND (fn_target.fname = %s OR fn_target.fname LIKE %s)
                     LIMIT 1;
-                    """,
+                    """.replace("m_checkpoint_tree", tree_source(cursor)),
                     (vid, current_file, clean_header, f"%/{clean_header}"),
                 )
                 fr_row = cursor.fetchone()
@@ -571,11 +688,11 @@ class FilesystemService:
                         """
                         SELECT fn.fname
                         FROM m_file_name fn
-                        JOIN m_bridge_checkpoint bc ON fn.fnid = bc.fnid
+                        JOIN m_checkpoint_tree bc ON fn.fnid = bc.fnid
                         JOIN m_file_blob fb ON bc.blob_id = fb.blob_id
                         WHERE bc.commit_id = %s AND fb.ftype != 0 AND (fn.fname = %s OR fn.fname = %s OR fn.fname LIKE %s)
                         LIMIT 1;
-                        """,
+                        """.replace("m_checkpoint_tree", tree_source(cursor)),
                         (vid, normalized, raw_path, f"%/{clean_header}"),
                     )
                     found = cursor.fetchone()
@@ -616,7 +733,7 @@ class FilesystemService:
                 f"""
                 SELECT fn.fname
                 FROM m_file_name fn
-                JOIN m_bridge_checkpoint bc ON fn.fnid = bc.fnid
+                JOIN m_checkpoint_tree bc ON fn.fnid = bc.fnid
                 JOIN m_file_blob fb ON bc.blob_id = fb.blob_id
                 WHERE bc.commit_id = %s AND fb.ftype != 0 AND (fn.fname IN ({placeholders}) OR fn.fname LIKE %s)
                 ORDER BY
@@ -629,7 +746,7 @@ class FilesystemService:
                     END,
                     LENGTH(fn.fname) ASC
                 LIMIT 1;
-                """,
+                """.replace("m_checkpoint_tree", tree_source(cursor)),
                 (vid, *candidates, f"%/{clean_header}", candidates[0], f"include/{clean_header}", f"include/uapi/{clean_header}", f"%/{clean_header}"),
             )
 

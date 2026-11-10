@@ -78,6 +78,9 @@ class MaintainerSection:
     web_page: str = ""
     mailing_list: str = ""
     patchwork: str = ""
+    bug_url: str = ""
+    chat_channel: str = ""
+    profile_doc: str = ""
     members: list[MaintainerPerson] = field(default_factory=list)
     patterns: list[PatternRule] = field(default_factory=list)
     line_s: int = 1

@@ -5,6 +5,7 @@
 
 import { detectGrammar, DEFAULT_FALLBACK_GRAMMAR } from "./syntax/registry.js";
 import { C_KEYWORDS, C_TYPES } from "./syntax/languages/c.js";
+import { buildByteToCharMap, byteColToCharIdx } from "../../utils/text_coordinates.js";
 
 const REGEX_CACHE = new Map();
 const PUNCT_REGEX = "[^\\s\\w\"'`$@%#;/]+|[^\\s\\w]";
@@ -271,8 +272,8 @@ export class AstOverlay {
     if (!Array.isArray(serverTokens)) return;
 
     const processTok = (line_s, char_s, line_e, char_e, ast_id, type_id) => {
-      // Skip pure comments from clickable AST tokens map (C_Comment=2, Rust_DocComment=142, Rust_Comment=143)
-      if (type_id === 2 || type_id === 142 || type_id === 143) return;
+      // Skip pure comments from clickable AST tokens map (C_Comment=2, ASM_Comment=87, Rust_DocComment=142, Rust_Comment=143)
+      if (type_id === 2 || type_id === 87 || type_id === 142 || type_id === 143) return;
 
       for (let l = line_s; l <= line_e; l++) {
         if (!this.tokensByLine.has(l)) {
@@ -312,9 +313,12 @@ export class AstOverlay {
       return isDimmed ? `<span class="ast-dimmed">&nbsp;</span>` : "&nbsp;";
     }
 
-    // 1. Direct Include Line Handling for languages with preprocessor includes (C, Assembly, DTS)
+    // 1. Direct Include Line Handling for languages with preprocessor includes (C, Assembly, DTS) or Rust mod declarations
     if ((this.grammar.supportsInclude || this.isCFile) && /^\s*#\s*include\b/.test(rawLineText)) {
       return this.renderIncludeLine(lineNo, rawLineText, isDimmed);
+    }
+    if (this.grammar.supportsInclude && this.grammar.id === "rust" && /^\s*(?:pub(?:\s*\([^)]*\))?\s+)?mod\s+[a-zA-Z_]\w*\s*;/.test(rawLineText)) {
+      return this.renderRustModLine(lineNo, rawLineText, isDimmed);
     }
 
     // 2. Pre-scanned Multi-Line Block Comments & Docstrings
@@ -371,9 +375,34 @@ export class AstOverlay {
     return this.renderLexical(rawLineText, isDimmed, lineNo);
   }
 
+  renderRustModLine(lineNo, rawLineText, isDimmed) {
+    const modMatch = rawLineText.match(/^(\s*(?:pub(?:\s*\([^)]*\))?\s+)?mod\s+)([a-zA-Z_]\w*)(\s*;.*)$/);
+    if (modMatch) {
+      const prefix = modMatch[1];
+      const modName = modMatch[2];
+      const remainder = modMatch[3];
+      const headerRaw = `${modName}.rs`;
+
+      const astTokens = lineNo ? (this.tokensByLine.get(lineNo) || []) : [];
+      const modTok = astTokens.find((t) => t.type_id === 136) || null;
+      const astIdAttr = modTok && modTok.ast_id ? ` data-ast-id="${modTok.ast_id}"` : "";
+
+      const prefixHtml = this.tokenizeExpression(prefix);
+      const modHtml = `<span class="tok-include ast-token ast-include" data-name="${this.escapeHtml(modName)}" data-header="${this.escapeHtml(headerRaw)}"${astIdAttr} data-type-id="136">${this.escapeHtml(modName)}</span>`;
+      const remHtml = this.tokenizeExpression(remainder);
+
+      const h = `${prefixHtml}${modHtml}${remHtml}`;
+      return isDimmed ? `<span class="ast-dimmed">${h}</span>` : h;
+    }
+    return this.renderLexical(rawLineText, isDimmed, lineNo);
+  }
+
   renderWithAstTokens(lineText, astTokens, isDimmed) {
     const len = lineText.length;
     if (len === 0) return "&nbsp;";
+
+    // Map 1-based database UTF-8 byte columns to 0-based JS character indices to eliminate alignment drift
+    const byteMap = buildByteToCharMap(lineText);
 
     // Map each character position to the most specific (narrowest) AST token
     const charToken = new Array(len).fill(null);
@@ -386,9 +415,11 @@ export class AstOverlay {
     });
 
     for (const tok of sorted) {
-      const s = Math.max(0, Math.min(tok.char_s || 0, len));
-      const e = Math.max(0, Math.min(tok.char_e || len, len));
-      for (let i = s; i < e; i++) {
+      const s = byteColToCharIdx(byteMap, tok.char_s || 1);
+      const e = tok.char_e != null && tok.char_e < 9999 ? byteColToCharIdx(byteMap, tok.char_e) : len;
+      const start = Math.max(0, Math.min(s, len));
+      const end = Math.max(start, Math.min(e, len));
+      for (let i = start; i < end; i++) {
         charToken[i] = tok;
       }
     }
@@ -426,8 +457,8 @@ export class AstOverlay {
   }
 
   tokenizeSnippet(snippet, tok) {
-    // 1. Comments: never clickable
-    if (tok.type_id === 2 || tok.type_id === 142 || tok.type_id === 143 ||
+    // 1. Comments: never clickable (C_Comment=2, ASM_Comment=87, Rust_DocComment=142, Rust_Comment=143)
+    if (tok.type_id === 2 || tok.type_id === 87 || tok.type_id === 142 || tok.type_id === 143 ||
         snippet.trim().startsWith("//") || snippet.trim().startsWith("/*")) {
       return `<span class="tok-comment">${this.escapeHtml(snippet)}</span>`;
     }
@@ -634,6 +665,13 @@ export class AstOverlay {
       case 10: case 7: case 8: case 36: case 37: case 41: case 42: return "tok-type ast-type"; // types & typedefs
       case 9: return "ast-field"; // struct field
       case 1: return "ast-compound"; // compound
+
+      // ASM AST types (ASTT.ASM_*: 83 - 87)
+      case 83: return "tok-macro ast-macro"; // ASM_Macro
+      case 84: return "tok-preproc ast-preproc"; // ASM_Directive
+      case 85: return "tok-keyword ast-ref"; // ASM_Instruction (mnemonics, registers)
+      case 86: return "tok-function ast-func"; // ASM_Label
+      case 87: return "tok-comment"; // ASM_Comment
 
       // Rust AST types (ASTT.Rust_*: 123 - 143)
       case 123: case 125: case 127: case 130: case 131:

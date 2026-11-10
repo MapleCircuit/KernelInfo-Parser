@@ -61,3 +61,13 @@ To run all repository tests and verify parser regressions (Rule 8):
 ```bash
 python3 main.py -u
 ```
+
+### Frontend (JavaScript) tests
+
+Frontend logic lives in DOM-free modules where possible, and its tests in `webapp/frontend/tests/*.test.mjs`. They use only Node's built-in runner (`node:test`, `node:assert`), so no npm install or build step is needed:
+
+```bash
+node --test webapp/frontend/tests/*.test.mjs
+```
+
+`python3 main.py -u` runs them through `tests/test_webapp_frontend_js.py`, and skips them when Node 18 or newer is not on `PATH`. The `tests/` directory is not part of a frontend build: it does not change the `frontend` sync token and is not served (`webapp/API.md` §2.11).

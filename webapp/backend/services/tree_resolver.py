@@ -32,7 +32,7 @@ from parser.arch_layout import ArchLayout, path_arch
 from parser.kbuild_conditions import own_arch_dirs
 from webapp.backend.config import get_repo_dir
 from webapp.backend.database.pool import get_db_cursor
-from webapp.backend.database.helpers import finished_ref_sql, hash_hex, safe_decode
+from webapp.backend.database.helpers import finished_ref_sql, hash_hex, safe_decode, tree_source
 
 logger = logging.getLogger(__name__)
 
@@ -102,7 +102,7 @@ class TreeResolverService:
         while curr is not None and curr > 0 and len(path_rev) <= max_depth:
             # Check if curr is a checkpoint commit
             cursor.execute(
-                "SELECT 1 FROM m_bridge_checkpoint WHERE commit_id = %s LIMIT 1;",
+                "SELECT 1 FROM m_checkpoint_tree WHERE commit_id = %s LIMIT 1;".replace("m_checkpoint_tree", tree_source(cursor)),
                 (curr,),
             )
             if cursor.fetchone():
@@ -138,7 +138,7 @@ class TreeResolverService:
             tree_map = dict(self._tree_cache[chk_id])
         elif chk_id is not None:
             cursor.execute(
-                "SELECT fnid, blob_id FROM m_bridge_checkpoint WHERE commit_id = %s;",
+                "SELECT fnid, blob_id FROM m_checkpoint_tree WHERE commit_id = %s;".replace("m_checkpoint_tree", tree_source(cursor)),
                 (chk_id,),
             )
             rows = cursor.fetchall()

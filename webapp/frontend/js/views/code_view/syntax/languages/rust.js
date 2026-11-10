@@ -30,7 +30,7 @@ export const rustGrammar = {
   keywords: RUST_KEYWORDS,
   types: RUST_TYPES,
   hasPreprocessor: false,
-  supportsInclude: false,
+  supportsInclude: true,
   isCommentLine(trimmed) {
     return trimmed.startsWith("//") || trimmed.startsWith("/*") || (trimmed.startsWith("*") && !trimmed.startsWith("*="));
   },

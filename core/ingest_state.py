@@ -36,6 +36,7 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
+
 INGEST_PARSING = 1
 INGEST_DONE = 2
 
@@ -44,7 +45,7 @@ _STATIC_TABLES = {"m_type_descriptor", "m_project", "m_git_network", "m_reposito
 # Tables referencing blobs from a commit's point of view (rows of other versions point at the blob too)
 _COMMIT_SCOPED = {"m_bridge_checkpoint", "m_commit_file", "m_bridge_commit_tag", "m_blob_transition"}
 # Rows describing the version's head commit itself (written by the run, whatever the commit's id)
-_VERSION_ROWS = ("m_bridge_checkpoint", "m_arch_root")
+_VERSION_ROWS = ("m_checkpoint_base", "m_bridge_checkpoint", "m_arch_root")
 _DELETE_CHUNK = 50_000
 _IN_CHUNK = 1000
 # A rollback deletes millions of rows; without this heartbeat a long step looks like a hang
@@ -201,13 +202,13 @@ def rollback_plan(tables: Sequence[Any], marks: dict[str, int], commit_id: int, 
 
 
 # ---------------------------------------------------------------------------------------------- database
-def _fetch_marks(cur: Any, commit_id: int, tables: Sequence[Any]) -> dict[str, int]:
+def _fetch_marks(db: Any, commit_id: int, tables: Sequence[Any]) -> dict[str, int]:
     names = {t.table_id: t.table_name for t in tables}
-    cur.execute("SELECT marked_table_id, max_id FROM m_ingest_watermark WHERE commit_id = %s", (commit_id,))
-    return {names[int(tid)]: int(mid) for tid, mid in cur.fetchall() if int(tid) in names}
+    rows = db.query("SELECT marked_table_id, max_id FROM m_ingest_watermark WHERE commit_id = %s", (commit_id,), dictionary=False)
+    return {names[int(tid)]: int(mid) for tid, mid in rows if int(tid) in names}
 
 
-def _completed_after(cur: Any, marks: dict[str, int]) -> int | None:
+def _completed_after(db: Any, marks: dict[str, int]) -> int | None:
     """Head commit of a version ingested to completion after `marks` were taken, else None.
 
     Watermarks only identify a run's rows while that run is the newest one: `begin()` records the
@@ -218,137 +219,273 @@ def _completed_after(cur: Any, marks: dict[str, int]) -> int | None:
     commit_mark = marks.get("m_commit")
     if commit_mark is None:
         return None
-    cur.execute(
+    row = db.query_one(
         "SELECT MIN(commit_id) FROM m_ingest_state WHERE status = %s AND commit_id > %s",
         (INGEST_DONE, commit_mark),
+        dictionary=False,
     )
-    row = cur.fetchone()
     return int(row[0]) if row and row[0] is not None else None
 
 
-def discard_marks(cnx: Any, commit_id: int) -> None:
-    """Forget a run's watermarks and parsed blobs (spent after a rollback, unusable when stale)."""
-    with contextlib.closing(cnx.cursor()) as cur:
-        cur.execute("DELETE FROM m_ingest_watermark WHERE commit_id = %s", (commit_id,))
-        cur.execute("DELETE FROM m_ingest_blob WHERE commit_id = %s", (commit_id,))
-    cnx.commit()
+def discard_marks(db: Any, commit_id: int) -> None:
+    """Forget a run's watermarks, id ranges, and parsed blobs (spent after a rollback, unusable when stale)."""
+    db.execute("DELETE FROM m_ingest_watermark WHERE commit_id = %s", (commit_id,))
+    db.execute("DELETE FROM m_ingest_blob WHERE commit_id = %s", (commit_id,))
+    try:
+        db.execute("DELETE FROM m_ingest_id_range WHERE commit_id = %s", (commit_id,))
+    except Exception:
+        pass
+    db.commit()
 
 
-def get_status(cur: Any, network_id: int, commit_id: int) -> int | None:
-    cur.execute("SELECT status FROM m_ingest_state WHERE network_id = %s AND commit_id = %s", (network_id, commit_id))
-    row = cur.fetchone()
+def get_status(db: Any, network_id: int, commit_id: int) -> int | None:
+    row = db.query_one("SELECT status FROM m_ingest_state WHERE network_id = %s AND commit_id = %s", (network_id, commit_id), dictionary=False)
     return int(row[0]) if row else None
 
 
-def set_status(cnx: Any, network_id: int, commit_id: int, status: int) -> None:
+def set_status(
+    db: Any,
+    network_id: int,
+    commit_id: int,
+    status: int,
+    base_commit_id: int = 0,
+    worker_id: str = "",
+) -> None:
     """Record a version's ingestion status (upsert) and commit."""
     if not commit_id:
         # commit_id 0 is the "unresolved ref" sentinel of m_git_ref, not a version being ingested
         logger.warning("Ignoring an ingestion status for commit_id 0 (the ref has no resolved head commit).")
         return
-    with contextlib.closing(cnx.cursor()) as cur:
-        cur.execute(
+    try:
+        db.execute(
+            "INSERT INTO m_ingest_state (network_id, commit_id, status, updated_at, base_commit_id, worker_id) "
+            "VALUES (%s, %s, %s, %s, %s, %s) "
+            "ON DUPLICATE KEY UPDATE status = VALUES(status), updated_at = VALUES(updated_at), "
+            "base_commit_id = VALUES(base_commit_id), worker_id = VALUES(worker_id)",
+            (network_id, commit_id, status, int(time.time()), base_commit_id, worker_id),
+        )
+    except Exception:
+        # Fallback for older schema without base_commit_id / worker_id
+        db.execute(
             "INSERT INTO m_ingest_state (network_id, commit_id, status, updated_at) VALUES (%s, %s, %s, %s) "
             "ON DUPLICATE KEY UPDATE status = VALUES(status), updated_at = VALUES(updated_at)",
             (network_id, commit_id, status, int(time.time())),
         )
-        if status == INGEST_DONE:
-            cur.execute("DELETE FROM m_ingest_watermark WHERE commit_id = %s", (commit_id,))
-            cur.execute("DELETE FROM m_ingest_blob WHERE commit_id = %s", (commit_id,))
-    cnx.commit()
+    if status == INGEST_DONE:
+        db.execute("DELETE FROM m_ingest_watermark WHERE commit_id = %s", (commit_id,))
+        db.execute("DELETE FROM m_ingest_blob WHERE commit_id = %s", (commit_id,))
+        try:
+            db.execute("DELETE FROM m_ingest_id_range WHERE commit_id = %s", (commit_id,))
+        except Exception:
+            pass
+    db.commit()
 
 
-def begin(cnx: Any, network_id: int, commit_id: int, tables: Sequence[Any]) -> dict[str, int]:
+def begin(
+    db: Any,
+    network_id: int,
+    commit_id: int,
+    tables: Sequence[Any],
+    base_commit_id: int = 0,
+    worker_id: str = "",
+) -> dict[str, int]:
     """Mark a version as being parsed and record the watermarks of its run. Returns the marks."""
     marks: dict[str, int] = {}
     if not commit_id:
         logger.warning("Not watermarking a run for commit_id 0 (the ref has no resolved head commit).")
         return marks
-    with contextlib.closing(cnx.cursor()) as cur:
-        cur.execute("DELETE FROM m_ingest_watermark WHERE commit_id = %s", (commit_id,))
-        cur.execute("DELETE FROM m_ingest_blob WHERE commit_id = %s", (commit_id,))
-        for t, col in marked_tables(tables):
-            cur.execute(f"SELECT COALESCE(MAX({col}), 0) FROM {t.table_name}")
-            marks[t.table_name] = int(cur.fetchone()[0])
-            cur.execute(
-                "INSERT INTO m_ingest_watermark (commit_id, marked_table_id, max_id) VALUES (%s, %s, %s)",
-                (commit_id, t.table_id, marks[t.table_name]),
-            )
-    set_status(cnx, network_id, commit_id, INGEST_PARSING)
+    db.execute("DELETE FROM m_ingest_watermark WHERE commit_id = %s", (commit_id,))
+    db.execute("DELETE FROM m_ingest_blob WHERE commit_id = %s", (commit_id,))
+    try:
+        db.execute("DELETE FROM m_ingest_id_range WHERE commit_id = %s", (commit_id,))
+    except Exception:
+        pass
+    for t, col in marked_tables(tables):
+        row = db.query_one(f"SELECT COALESCE(MAX({col}), 0) FROM {t.table_name}", dictionary=False)
+        marks[t.table_name] = int(row[0]) if row else 0
+        db.execute(
+            "INSERT INTO m_ingest_watermark (commit_id, marked_table_id, max_id) VALUES (%s, %s, %s)",
+            (commit_id, t.table_id, marks[t.table_name]),
+        )
+    set_status(db, network_id, commit_id, INGEST_PARSING, base_commit_id=base_commit_id, worker_id=worker_id)
     return marks
 
 
-def record_blobs(cnx: Any, commit_id: int, blob_ids: Iterable[int]) -> None:
+def fetch_id_ranges(db: Any, commit_id: int) -> list[tuple[int, int, int]]:
+    """Fetch leased (marked_table_id, start_id, end_id) ranges allocated to commit_id."""
+    try:
+        rows = db.query(
+            "SELECT marked_table_id, start_id, end_id FROM m_ingest_id_range WHERE commit_id = %s",
+            (commit_id,),
+            dictionary=False,
+        )
+        return [(int(r[0]), int(r[1]), int(r[2])) for r in rows]
+    except Exception:
+        return []
+
+
+def record_blobs(db: Any, commit_id: int, blob_ids: Iterable[int]) -> None:
     """Record pre-existing blobs the run is about to parse (before any of their rows are written)."""
     ids = sorted(set(blob_ids))
     if not ids or not commit_id:
         return
-    with contextlib.closing(cnx.cursor()) as cur:
-        for i in range(0, len(ids), _IN_CHUNK):
-            chunk = ids[i:i + _IN_CHUNK]
-            cur.executemany(
-                "INSERT INTO m_ingest_blob (commit_id, blob_id) VALUES (%s, %s) ON DUPLICATE KEY UPDATE blob_id = blob_id",
-                [(commit_id, b) for b in chunk],
-            )
-    cnx.commit()
+    for i in range(0, len(ids), _IN_CHUNK):
+        chunk = ids[i:i + _IN_CHUNK]
+        db.executemany(
+            "INSERT INTO m_ingest_blob (commit_id, blob_id) VALUES (%s, %s) ON DUPLICATE KEY UPDATE blob_id = blob_id",
+            [(commit_id, b) for b in chunk],
+        )
+    db.commit()
 
 
-def rollback_version(cnx: Any, network_id: int, commit_id: int, tables: Sequence[Any]) -> bool:
+def rollback_id_ranges(
+    db: Any,
+    commit_id: int,
+    tables: Sequence[Any],
+    id_ranges: list[tuple[int, int, int]],
+) -> int:
+    """Range-isolated rollback for an interrupted run that leased discrete ID blocks.
+
+    Preserves universal Git registry entries (m_file_name, m_file_blob, m_maintainer_person, m_commit)
+    and removes only the version-scoped and ID-range-allocated rows of this commit_id.
+    """
+    total = 0
+    by_id = {t.table_id: t for t in tables}
+    children = _children(tables)
+    started = time.perf_counter()
+
+    # 1. Version-scoped rows
+    for vtable in _VERSION_ROWS + (
+        "m_commit_file",
+        "m_bridge_commit_tag",
+        "m_bridge_commit_person",
+        "m_commit_email",
+    ):
+        try:
+            total += int(db.execute(f"DELETE FROM {vtable} WHERE commit_id = %s", (commit_id,)) or 0)
+        except Exception:
+            pass
+
+    # 2. Ingest blob derived rows
+    blob_rows = db.query("SELECT blob_id FROM m_ingest_blob WHERE commit_id = %s", (commit_id,), dictionary=False)
+    blob_ids = [int(r[0]) for r in blob_rows]
+    for i in range(0, len(blob_ids), _IN_CHUNK):
+        chunk = tuple(blob_ids[i : i + _IN_CHUNK])
+        in_list = ",".join(["%s"] * len(chunk))
+        for t, col in blob_derived_tables(tables):
+            pk = id_column(t)
+            if pk:
+                for child, child_col in children.get(t.table_name, ()):
+                    total += int(db.execute(
+                        f"DELETE FROM {child.table_name} WHERE {child_col} IN "
+                        f"(SELECT {pk} FROM {t.table_name} WHERE {col} IN ({in_list}))",
+                        chunk,
+                    ) or 0)
+            total += int(db.execute(f"DELETE FROM {t.table_name} WHERE {col} IN ({in_list})", chunk) or 0)
+
+    # 3. Leased ID range deletes
+    for tid, start_id, end_id in id_ranges:
+        tbl = by_id.get(tid)
+        if tbl is None or tbl.table_name in _STATIC_TABLES or tbl.table_name in (
+            "m_file_name",
+            "m_file_blob",
+            "m_maintainer_person",
+            "m_commit",
+        ):
+            continue
+        pk = id_column(tbl)
+        if not pk:
+            continue
+
+        # Special AST handling for children
+        if tbl.table_name == "m_ast":
+            for ast_child in ("m_ast_container", "m_ast_include", "m_ast_attribute"):
+                total += int(db.execute(f"DELETE FROM {ast_child} WHERE ast_id BETWEEN %s AND %s", (start_id, end_id)) or 0)
+            try:
+                total += int(db.execute("DELETE FROM m_ast_hash WHERE ast_id BETWEEN %s AND %s", (start_id, end_id)) or 0)
+            except Exception:
+                pass
+
+        for child, child_col in children.get(tbl.table_name, ()):
+            if child.table_name in by_id and id_column(child):
+                continue  # Child will have its own range if marked
+            try:
+                total += int(db.execute(
+                    f"DELETE FROM {child.table_name} WHERE {child_col} BETWEEN %s AND %s",
+                    (start_id, end_id),
+                ) or 0)
+            except Exception:
+                pass
+
+        total += int(db.execute(f"DELETE FROM {tbl.table_name} WHERE {pk} BETWEEN %s AND %s", (start_id, end_id)) or 0)
+
+    # 4. Clean up state and marks
+    db.execute("DELETE FROM m_ingest_state WHERE commit_id = %s", (commit_id,))
+    db.commit()
+
+    discard_marks(db, commit_id)
+    logger.info(
+        f"Rolled back interrupted run of commit_id {commit_id} using leased ID ranges: "
+        f"{total} rows removed in {time.perf_counter() - started:.1f}s."
+    )
+    return total
+
+
+def rollback_version(db: Any, network_id: int, commit_id: int, tables: Sequence[Any]) -> bool:
     """Undo the rows of an interrupted run of `commit_id`. Returns False when the run left no usable
     watermarks (it predates them, or a later version finished on top of them and the caller has to fall
     back to a version-scoped purge); raises RecoveryError when older rows reference rows of the run."""
-    with contextlib.closing(cnx.cursor()) as cur:
-        marks = _fetch_marks(cur, commit_id, tables)
-        if not marks:
-            return False
-        newer = _completed_after(cur, marks)
-        if newer is not None:
-            logger.warning(
-                f"Watermarks of the interrupted run of commit_id {commit_id} are stale: version commit_id "
-                f"{newer} was ingested to completion after them, so the ids above the marks no longer "
-                "belong to this run alone. Discarding them instead of deleting a finished version; only "
-                "the version-scoped rows of the interrupted run are purged."
+    id_ranges = fetch_id_ranges(db, commit_id)
+    if id_ranges:
+        rollback_id_ranges(db, commit_id, tables, id_ranges)
+        return True
+    marks = _fetch_marks(db, commit_id, tables)
+    if not marks:
+        return False
+    newer = _completed_after(db, marks)
+    if newer is not None:
+        logger.warning(
+            f"Watermarks of the interrupted run of commit_id {commit_id} are stale: version commit_id "
+            f"{newer} was ingested to completion after them, so the ids above the marks no longer "
+            "belong to this run alone. Discarding them instead of deleting a finished version; only "
+            "the version-scoped rows of the interrupted run are purged."
+        )
+        discard_marks(db, commit_id)
+        return False
+    for desc, sql, params in precheck_queries(tables, marks):
+        row = db.query_one(sql, params, dictionary=False)
+        if row:
+            raise RecoveryError(
+                f"Cannot roll back the interrupted run of commit_id {commit_id}: row {row[0]} of {desc} "
+                "predates the run but references a row it created."
             )
-            discard_marks(cnx, commit_id)
-            return False
-        for desc, sql, params in precheck_queries(tables, marks):
-            cur.execute(sql, params)
-            row = cur.fetchone()
-            if row:
-                raise RecoveryError(
-                    f"Cannot roll back the interrupted run of commit_id {commit_id}: row {row[0]} of {desc} "
-                    "predates the run but references a row it created."
-                )
-        cur.execute("SELECT blob_id FROM m_ingest_blob WHERE commit_id = %s", (commit_id,))
-        blob_ids = [int(r[0]) for r in cur.fetchall()]
+    blob_rows = db.query("SELECT blob_id FROM m_ingest_blob WHERE commit_id = %s", (commit_id,), dictionary=False)
+    blob_ids = [int(r[0]) for r in blob_rows]
     plan = rollback_plan(tables, marks, commit_id, blob_ids)
     started = time.perf_counter()
     total = 0
     logger.info(f"Rolling back the interrupted run of commit_id {commit_id}: {len(plan)} delete step(s) to run.")
-    with contextlib.closing(cnx.cursor()) as cur:
-        for step, d in enumerate(plan, 1):
-            # Most steps match nothing; probing first keeps them off the write path and out of the log
-            cur.execute(f"SELECT 1 FROM {d.table} WHERE {d.where} LIMIT 1", d.params)  # noqa: S608
-            if cur.fetchone() is None:
-                continue
-            step_started = last_logged = time.perf_counter()
-            removed = 0
-            while True:
-                cur.execute(f"{d.sql()} LIMIT {_DELETE_CHUNK}", d.params)
-                deleted = cur.rowcount or 0
-                cnx.commit()
-                removed += deleted
-                if deleted < _DELETE_CHUNK:
-                    break
-                if time.perf_counter() - last_logged >= _PROGRESS_EVERY:
-                    last_logged = time.perf_counter()
-                    logger.info(f"  [{step}/{len(plan)}] {d.table} ({d.where}): {removed} rows removed so far...")
-            total += removed
-            logger.info(
-                f"  [{step}/{len(plan)}] {d.table} ({d.where}): {removed} rows "
-                f"in {time.perf_counter() - step_started:.1f}s (total {total})"
-            )
-    discard_marks(cnx, commit_id)
+    for step, d in enumerate(plan, 1):
+        # Most steps match nothing; probing first keeps them off the write path and out of the log
+        if db.query_one(f"SELECT 1 FROM {d.table} WHERE {d.where} LIMIT 1", d.params, dictionary=False) is None:  # noqa: S608
+            continue
+        step_started = last_logged = time.perf_counter()
+        removed = 0
+        while True:
+            deleted = int(db.execute(f"{d.sql()} LIMIT {_DELETE_CHUNK}", d.params) or 0)
+            db.commit()
+            removed += deleted
+            if deleted < _DELETE_CHUNK:
+                break
+            if time.perf_counter() - last_logged >= _PROGRESS_EVERY:
+                last_logged = time.perf_counter()
+                logger.info(f"  [{step}/{len(plan)}] {d.table} ({d.where}): {removed} rows removed so far...")
+        total += removed
+        logger.info(
+            f"  [{step}/{len(plan)}] {d.table} ({d.where}): {removed} rows "
+            f"in {time.perf_counter() - step_started:.1f}s (total {total})"
+        )
+    discard_marks(db, commit_id)
     logger.info(
         f"Rolled back the interrupted run of commit_id {commit_id}: {total} rows removed "
         f"({len(blob_ids)} pre-existing blobs re-queued) in {time.perf_counter() - started:.1f}s."
@@ -394,7 +531,7 @@ def cleanup_ramdisk_artifacts(ramdisk_dir: str | None = None, search_system_temp
     return removed
 
 
-def fetch_repo_version_states(cnx: Any, repo_id: int, network_id: int) -> dict[str, tuple[int, str]]:
+def fetch_repo_version_states(db: Any, repo_id: int, network_id: int) -> dict[str, tuple[int, str]]:
     """Return map of ref_name -> (commit_id, state) for all registered refs of the repository.
 
     States:
@@ -405,48 +542,50 @@ def fetch_repo_version_states(cnx: Any, repo_id: int, network_id: int) -> dict[s
         "new": registered ref that has not been ingested yet
     """
     states: dict[str, tuple[int, str]] = {}
-    if cnx is None:
+    if db is None:
         return states
     legacy_candidates: list[tuple[str, int]] = []
-    with contextlib.closing(cnx.cursor()) as cur:
-        cur.execute(
-            """
-            SELECT r.ref_name, r.commit_id, s.status
-            FROM m_git_ref r
-            LEFT JOIN m_ingest_state s ON s.commit_id = r.commit_id AND s.network_id = %s
-            WHERE r.repo_id = %s AND r.commit_id > 0
-            """,
-            (network_id, repo_id),
-        )
-        for row in cur.fetchall():
-            ref_name = row[0]
-            if isinstance(ref_name, (bytes, bytearray)):
-                ref_name = ref_name.decode("utf-8", errors="replace")
-            commit_id = int(row[1])
-            status = row[2]
-            if status == INGEST_DONE:
-                states[ref_name] = (commit_id, "done")
-            elif status == INGEST_PARSING:
-                states[ref_name] = (commit_id, "interrupted")
-            else:
-                legacy_candidates.append((ref_name, commit_id))
+    rows = db.query(
+        """
+        SELECT r.ref_name, r.commit_id, s.status
+        FROM m_git_ref r
+        LEFT JOIN m_ingest_state s ON s.commit_id = r.commit_id AND s.network_id = %s
+        WHERE r.repo_id = %s AND r.commit_id > 0
+        """,
+        (network_id, repo_id),
+        dictionary=False,
+    )
+    for row in rows:
+        ref_name = row[0]
+        if isinstance(ref_name, (bytes, bytearray)):
+            ref_name = ref_name.decode("utf-8", errors="replace")
+        commit_id = int(row[1])
+        status = row[2]
+        if status == INGEST_DONE:
+            states[ref_name] = (commit_id, "done")
+        elif status == INGEST_PARSING:
+            states[ref_name] = (commit_id, "interrupted")
+        else:
+            legacy_candidates.append((ref_name, commit_id))
 
-        # One query per 1000 refs (the primary key's commit_id prefix answers it) instead of a COUNT(*) per ref
-        checkpointed: set[int] = set()
-        cids = sorted({cid for _name, cid in legacy_candidates})
-        for i in range(0, len(cids), _IN_CHUNK):
-            chunk = tuple(cids[i:i + _IN_CHUNK])
-            cur.execute(
-                f"SELECT DISTINCT commit_id FROM m_bridge_checkpoint WHERE commit_id IN ({','.join(['%s'] * len(chunk))})",
-                chunk,
-            )
-            checkpointed.update(int(r[0]) for r in cur.fetchall())
-        for rname, cid in legacy_candidates:
-            states[rname] = (cid, "legacy" if cid in checkpointed else "new")
+    # One query per 1000 refs (the primary key's commit_id prefix answers it) instead of a COUNT(*) per ref
+    checkpointed: set[int] = set()
+    cids = sorted({cid for _name, cid in legacy_candidates})
+    for i in range(0, len(cids), _IN_CHUNK):
+        chunk = tuple(cids[i:i + _IN_CHUNK])
+        placeholders = ",".join(["%s"] * len(chunk))
+        res = db.query(
+            f"SELECT DISTINCT commit_id FROM m_bridge_checkpoint WHERE commit_id IN ({placeholders})",
+            chunk,
+            dictionary=False,
+        )
+        checkpointed.update(int(r[0]) for r in res)
+    for rname, cid in legacy_candidates:
+        states[rname] = (cid, "legacy" if cid in checkpointed else "new")
     return states
 
 
-def purge_version_differential_rows(cnx: Any, commit_id: int, pred_commit_id: int | None = None) -> int:
+def purge_version_differential_rows(db: Any, commit_id: int, pred_commit_id: int | None = None) -> int:
     """Purge version-scoped differential rows of a version to prepare clean re-alignment with a new Old_VID base.
 
     Cleans:
@@ -454,7 +593,8 @@ def purge_version_differential_rows(cnx: Any, commit_id: int, pred_commit_id: in
         relative to pred_commit_id (tags are content-addressed and shared across versions: a tag also placed
         in the predecessor's tree keeps the transitions earlier versions recorded for it). Without
         pred_commit_id no transition is removed.
-      - m_bridge_checkpoint for commit_id
+      - m_bridge_checkpoint for commit_id (checkpoints stored as deltas of it are expanded first, and so are the
+        version's and the predecessor's own: core/checkpoints.py)
       - m_commit_file, m_bridge_commit_tag, m_bridge_commit_person, m_commit_email for commit_id
       - m_arch_root for commit_id
       - Resets m_ingest_state to INGEST_PARSING
@@ -463,61 +603,65 @@ def purge_version_differential_rows(cnx: Any, commit_id: int, pred_commit_id: in
     Returns total count of deleted rows.
     """
     total = 0
-    if cnx is None:
+    if db is None:
         return 0
-    with contextlib.closing(cnx.cursor()) as cur:
-        # 1. Transitions into tags this version introduced (placed in its new blobs, absent from the predecessor)
-        if pred_commit_id:
-            try:
-                cur.execute(
-                    """
-                    SELECT DISTINCT bt.tag_id
-                    FROM m_bridge_checkpoint bcp
-                    LEFT JOIN m_bridge_checkpoint pred ON pred.commit_id = %s AND pred.blob_id = bcp.blob_id
-                    JOIN m_bridge_tag bt ON bt.blob_id = bcp.blob_id
-                    WHERE bcp.commit_id = %s AND pred.blob_id IS NULL
-                      AND NOT EXISTS (
-                          SELECT 1 FROM m_bridge_tag pbt
-                          JOIN m_bridge_checkpoint pcp ON pcp.blob_id = pbt.blob_id AND pcp.commit_id = %s
-                          WHERE pbt.tag_id = bt.tag_id
-                      )
-                    """,
-                    (pred_commit_id, commit_id, pred_commit_id),
-                )
-                target_tag_ids = [int(r[0]) for r in cur.fetchall()]
-                for i in range(0, len(target_tag_ids), _IN_CHUNK):
-                    chunk = tuple(target_tag_ids[i:i + _IN_CHUNK])
-                    in_fmt = ",".join(["%s"] * len(chunk))
-                    cur.execute(f"DELETE FROM m_moved_tag WHERE e_tag_id IN ({in_fmt})", chunk)
-                    total += cur.rowcount or 0
-            except Exception as e:
-                logger.debug(f"Inbound m_moved_tag purge error for commit_id {commit_id}: {e}")
+    from core import checkpoints
+    checkpoints.expand_dependents(db, commit_id)
+    checkpoints.expand(db, commit_id)
+    if pred_commit_id:
+        checkpoints.expand(db, pred_commit_id)
 
-        # 2. Delete version-scoped records
-        for table in (
-            "m_bridge_checkpoint",
-            "m_commit_file",
-            "m_bridge_commit_tag",
-            "m_bridge_commit_person",
-            "m_commit_email",
-            "m_arch_root",
-        ):
-            try:
-                cur.execute(f"DELETE FROM {table} WHERE commit_id = %s", (commit_id,))
-                total += cur.rowcount or 0
-            except Exception as e:
-                logger.debug(f"Version row delete error for {table} (commit_id {commit_id}): {e}")
-
-        # 3. Reset ingestion state to INGEST_PARSING
+    # 1. Transitions into tags this version introduced (placed in its new blobs, absent from the predecessor)
+    if pred_commit_id:
         try:
-            cur.execute(
-                "UPDATE m_ingest_state SET status = %s, updated_at = %s WHERE commit_id = %s",
-                (INGEST_PARSING, int(time.time()), commit_id),
+            tag_rows = db.query(
+                """
+                SELECT DISTINCT bt.tag_id
+                FROM m_bridge_checkpoint bcp
+                LEFT JOIN m_bridge_checkpoint pred ON pred.commit_id = %s AND pred.blob_id = bcp.blob_id
+                JOIN m_bridge_tag bt ON bt.blob_id = bcp.blob_id
+                WHERE bcp.commit_id = %s AND pred.blob_id IS NULL
+                  AND NOT EXISTS (
+                      SELECT 1 FROM m_bridge_tag pbt
+                      JOIN m_bridge_checkpoint pcp ON pcp.blob_id = pbt.blob_id AND pcp.commit_id = %s
+                      WHERE pbt.tag_id = bt.tag_id
+                  )
+                """,
+                (pred_commit_id, commit_id, pred_commit_id),
+                dictionary=False,
             )
+            target_tag_ids = [int(r[0]) for r in tag_rows]
+            for i in range(0, len(target_tag_ids), _IN_CHUNK):
+                chunk = tuple(target_tag_ids[i:i + _IN_CHUNK])
+                in_fmt = ",".join(["%s"] * len(chunk))
+                total += int(db.execute(f"DELETE FROM m_moved_tag WHERE e_tag_id IN ({in_fmt})", chunk) or 0)
         except Exception as e:
-            logger.debug(f"m_ingest_state status reset error for commit_id {commit_id}: {e}")
+            logger.debug(f"Inbound m_moved_tag purge error for commit_id {commit_id}: {e}")
 
-    cnx.commit()
+    # 2. Delete version-scoped records
+    for table in (
+        "m_bridge_checkpoint",
+        "m_commit_file",
+        "m_bridge_commit_tag",
+        "m_bridge_commit_person",
+        "m_commit_email",
+        "m_arch_root",
+    ):
+        try:
+            total += int(db.execute(f"DELETE FROM {table} WHERE commit_id = %s", (commit_id,)) or 0)
+        except Exception as e:
+            logger.debug(f"Version row delete error for {table} (commit_id {commit_id}): {e}")
+
+    # 3. Reset ingestion state to INGEST_PARSING
+    try:
+        db.execute(
+            "UPDATE m_ingest_state SET status = %s, updated_at = %s WHERE commit_id = %s",
+            (INGEST_PARSING, int(time.time()), commit_id),
+        )
+    except Exception as e:
+        logger.debug(f"m_ingest_state status reset error for commit_id {commit_id}: {e}")
+
+    db.commit()
     logger.info(
         f"Purged {total} version-scoped differential rows for commit_id {commit_id} to prepare clean re-alignment."
     )

@@ -93,7 +93,6 @@ class TestResumePipeline(unittest.TestCase):
             "v1.2": (102, "done"),
         }
         mock_db = MagicMock()
-        mock_db.cnx = MagicMock()
         mock_db.select.return_value = (1, 1, 1, "v1.1", 101, None, None, None)
         mock_db_ctx.return_value.__enter__.return_value = mock_db
 
@@ -112,7 +111,7 @@ class TestResumePipeline(unittest.TestCase):
         mock_update.assert_any_call("v1.1", repo_path="/fake/repo")
         mock_update.assert_any_call("v1.2", repo_path="/fake/repo")
         # Should have purged differential rows of v1.2
-        mock_purge.assert_called_once_with(mock_db.cnx, 102, pred_commit_id=101)
+        mock_purge.assert_called_once_with(mock_db, 102, pred_commit_id=101)
 
 
 if __name__ == "__main__":

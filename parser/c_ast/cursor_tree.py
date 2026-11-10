@@ -13,6 +13,7 @@ from collections import deque
 from pathlib import Path
 import ctypes
 import os
+import re
 from typing import Any, Callable
 import clang.cindex as cc
 
@@ -171,6 +172,31 @@ _VAR_DECL_MACROS = frozenset({
     "DEFINE_SHOW_ATTRIBUTE",
     "DEFINE_PROC_SHOW_ATTRIBUTE",
     "DEFINE_DEBUGFS_ATTRIBUTE",
+    "DEVICE_ATTR",
+    "DEVICE_ATTR_RO",
+    "DEVICE_ATTR_WO",
+    "DEVICE_ATTR_RW",
+    "DEVICE_ATTR_ADMIN_RO",
+    "DEVICE_ATTR_ADMIN_RW",
+    "DRIVER_ATTR",
+    "DRIVER_ATTR_RO",
+    "DRIVER_ATTR_WO",
+    "DRIVER_ATTR_RW",
+    "CLASS_ATTR",
+    "CLASS_ATTR_RO",
+    "CLASS_ATTR_WO",
+    "CLASS_ATTR_RW",
+    "CLASS_ATTR_STRING",
+    "BUS_ATTR",
+    "BUS_ATTR_RO",
+    "BUS_ATTR_WO",
+    "BUS_ATTR_RW",
+    "BIN_ATTR",
+    "BIN_ATTR_RO",
+    "BIN_ATTR_WO",
+    "BIN_ATTR_RW",
+    "BIN_ATTR_ADMIN_RO",
+    "BIN_ATTR_ADMIN_RW",
 })
 _LOCK_MACROS = _VAR_DECL_MACROS
 _TRACE_MACROS_ARG0 = frozenset({
@@ -1186,9 +1212,13 @@ class Ast_Statement(Ast):
         elif k is not None and k not in _SKIP_REF_KINDS:
             ref = getattr(cursor, "referenced", None)
             ref_k = getattr(ref, "kind", None) if ref is not None else None
-            if ref_k in (cc.CursorKind.FUNCTION_DECL, cc.CursorKind.CXX_METHOD):
+            if ref_k in (cc.CursorKind.FUNCTION_DECL, cc.CursorKind.CXX_METHOD) and getattr(token, "called", True):
                 self.call_exprs.append(Ast_CallExpr(token.line, token.spelling_str, cursor=cursor))
                 self.call_exprs[-1].callee_cursor = cursor
+            elif ref_k in (cc.CursorKind.FUNCTION_DECL, cc.CursorKind.CXX_METHOD):
+                # Named, not called (`.read = foo`, `&foo`, a callback argument): a reference (SymbolRole.DeclRef)
+                self.decl_refs.append(Ast_DeclRefExpr(token.line, token.spelling_str, cursor=cursor))
+                self.decl_refs[-1].decl_cursor = cursor
             elif ref_k == cc.CursorKind.FIELD_DECL:
                 self.member_refs.append(Ast_MemberRefExpr(token.line, token.spelling_str, cursor=cursor))
                 self.member_refs[-1].member_cursor = cursor
@@ -1296,7 +1326,8 @@ class Ast_CaseStmt(Ast_Statement):
 
     def extract(self, CS: Any, create_tag: bool = True) -> None:
         self._extract_nested(CS, create_tags=False)
-        self.extract_1arg(CS, self.type_id, "", self.extent, create_tag=create_tag)
+        case_val = " ".join([op for op in self.operands if op != "case" and op != ":"]).strip()[:255]
+        self.extract_1arg(CS, self.type_id, case_val, self.extent, create_tag=create_tag)
 
 
 class Ast_DefaultStmt(Ast_Statement):
@@ -1341,7 +1372,8 @@ class Ast_ReturnStmt(Ast_Statement):
 
     def extract(self, CS: Any, create_tag: bool = True) -> None:
         self._extract_nested(CS, create_tags=False)
-        self.extract_1arg(CS, self.type_id, "", self.extent, create_tag=create_tag)
+        expr_str = " ".join([op for op in self.operands if op != "return"]).strip()[:255]
+        self.extract_1arg(CS, self.type_id, expr_str, self.extent, create_tag=create_tag)
 
 
 class Ast_BreakStmt(Ast_Statement):
@@ -1366,9 +1398,20 @@ class Ast_GotoStmt(Ast_Statement):
     """AST node for goto statements."""
     type_id = ASTT.C_GotoStmt
 
+    def exec_identifier(self, token: Any, cursor: Any) -> None:
+        if not getattr(self, "target_label", ""):
+            self.target_label = token.spelling_str
+        super().exec_identifier(token, cursor)
+
     def extract(self, CS: Any, create_tag: bool = True) -> None:
         self._extract_nested(CS, create_tags=False)
-        self.extract_1arg(CS, self.type_id, "", self.extent, create_tag=create_tag)
+        target = getattr(self, "target_label", "") or (self.operands[-1] if self.operands and self.operands[-1] != "goto" else "")
+        self.extract_1arg(CS, self.type_id, target[:255], self.extent, create_tag=create_tag)
+        if target:
+            tag_ref = getattr(self, "tag_ref", 0)
+            if tag_ref:
+                with CS(REF_POS):
+                    record_symbol_ref(CS, tag_ref, target, 0, int(SymbolRole.DeclRef), self.extent.line_pos[0], self.extent.char_pos[0])
 
 
 class Ast_AsmStmt(Ast_Statement):
@@ -1377,7 +1420,8 @@ class Ast_AsmStmt(Ast_Statement):
 
     def extract(self, CS: Any, create_tag: bool = True) -> None:
         self._extract_nested(CS, create_tags=False)
-        self.extract_1arg(CS, self.type_id, "", self.extent, create_tag=create_tag)
+        asm_code = " ".join([op for op in self.operands if op not in {"asm", "__asm__", "volatile", "__volatile__"}])[:255]
+        self.extract_1arg(CS, self.type_id, asm_code, self.extent, create_tag=create_tag)
 
 
 class Ast_LabelStmt(Ast_Statement):
@@ -1826,9 +1870,13 @@ class AST_Initializer(AST_Expression):
         elif k is not None and k not in _SKIP_REF_KINDS:
             ref = getattr(cursor, "referenced", None)
             ref_k = getattr(ref, "kind", None) if ref is not None else None
-            if ref_k in (cc.CursorKind.FUNCTION_DECL, cc.CursorKind.CXX_METHOD):
+            if ref_k in (cc.CursorKind.FUNCTION_DECL, cc.CursorKind.CXX_METHOD) and getattr(token, "called", True):
                 self.call_exprs.append(Ast_CallExpr(token.line, token.spelling_str, cursor=cursor))
                 self.call_exprs[-1].callee_cursor = cursor
+            elif ref_k in (cc.CursorKind.FUNCTION_DECL, cc.CursorKind.CXX_METHOD):
+                # Named, not called (`.read = foo`, `&foo`, a callback argument): a reference (SymbolRole.DeclRef)
+                self.decl_refs.append(Ast_DeclRefExpr(token.line, token.spelling_str, cursor=cursor))
+                self.decl_refs[-1].decl_cursor = cursor
             elif ref_k == cc.CursorKind.FIELD_DECL:
                 self.member_refs.append(Ast_MemberRefExpr(token.line, token.spelling_str, cursor=cursor))
                 self.member_refs[-1].member_cursor = cursor
@@ -1844,11 +1892,30 @@ class AST_Initializer(AST_Expression):
         spelling = token.spelling_str
 
         if self.brace_depth >= 1:
-            if spelling == "." and self.brace_depth == 1 and self.paren_depth == 0 and self.bracket_depth == 0:
+            if spelling == "." and self.paren_depth == 0 and self.bracket_depth == 0:
                 if self.cur_entry is not None:
                     self.entries.append(self.cur_entry)
                     self.cur_entry = None
                 self.entry_state = 1
+                return
+
+            if spelling == "[" and self.paren_depth == 0 and self.bracket_depth == 1:
+                if self.cur_entry is not None:
+                    self.entries.append(self.cur_entry)
+                    self.cur_entry = None
+                self.entry_state = 4
+                self._array_desig_tokens = []
+                return
+
+            if self.entry_state == 4:
+                if spelling == "]":
+                    desig_name = "[" + "".join(getattr(self, "_array_desig_tokens", [])) + "]"
+                    self.cur_entry = InitializerEntry(desig_name, token.line, cursor)
+                    self.entry_state = 2
+                    return
+                if not hasattr(self, "_array_desig_tokens"):
+                    self._array_desig_tokens = []
+                self._array_desig_tokens.append(spelling)
                 return
 
             if self.entry_state == 1:
@@ -1863,7 +1930,7 @@ class AST_Initializer(AST_Expression):
                     return
 
             if self.entry_state == 3:
-                if self.brace_depth == 1 and self.paren_depth == 0 and self.bracket_depth == 0 and spelling in (",", "}"):
+                if self.paren_depth == 0 and self.bracket_depth == 0 and spelling in (",", "}"):
                     if self.cur_entry is not None:
                         self.entries.append(self.cur_entry)
                         self.cur_entry = None
@@ -1992,8 +2059,13 @@ class AST_Enum_Equal(AST_Expression):
             return
         self.data.append(token.spelling_str)
 
-    def extract(self, CS: Any) -> None:
-        pass
+    def extract(self, CS: Any, create_tag: bool = False) -> None:
+        expr_str = " ".join(self.data).lstrip("= ").strip()[:255]
+        if expr_str:
+            with CS(REF_POS):
+                CS.store(m_ast.view(((m_ast.ast_id,),), None, expr_str, int(ASTT.C_enumequal)))
+                ast_id_route = CS.get_route_parse()
+            self.ast_ref = CS.ref(m_ast.ast_id, *ast_id_route)
 
 
 class C_Type(Ast):
@@ -3442,6 +3514,10 @@ class C_Type(Ast):
                                     self.ast_ref = CS.ref(m_ast.ast_id, *ast_id_route)
                                     typesegment.ref_type = TSRef.Route_Ref
                                     typesegment.ref = ast_id_route
+                                attrs = getattr(self, "attributes", ())
+                                for idx, (a_name, a_val) in enumerate(attrs):
+                                    with CS(REF_POS):
+                                        CS.store(m_ast_attribute.set(self.ast_ref, idx, str(a_name)[:64], str(a_val)[:255]))
                             else:
                                 attrs = getattr(self, "attributes", ())
                                 flat_attrs = [val for idx, (a_name, a_val) in enumerate(attrs) for val in (None, idx, str(a_name)[:64], str(a_val)[:255])]
@@ -3461,6 +3537,18 @@ class C_Type(Ast):
                                     typesegment.ref_type = TSRef.Route_Ref
                                     typesegment.ref = ast_id_route
                         else:
+                            if ast_staging_type in (ASTT.C_struct, ASTT.C_union) and self.cursor is not None:
+                                try:
+                                    cur_t = getattr(self.cursor, "type", None)
+                                    if cur_t is not None:
+                                        sz = cur_t.get_size()
+                                        if sz >= 0 and ("size_bytes", str(sz)) not in self.attributes:
+                                            self.attributes.append(("size_bytes", str(sz)))
+                                        al = cur_t.get_align()
+                                        if al >= 0 and ("align_bytes", str(al)) not in self.attributes:
+                                            self.attributes.append(("align_bytes", str(al)))
+                                except Exception:
+                                    pass
                             if target_link:
                                 with CS(REF_POS):
                                     CS.store(m_ast.ref_view(
@@ -3483,6 +3571,10 @@ class C_Type(Ast):
                                     self.ast_ref = CS.ref(m_ast.ast_id, *ast_id_route)
                                     typesegment.ref_type = TSRef.Route_Ref
                                     typesegment.ref = ast_id_route
+                                attrs = getattr(self, "attributes", ())
+                                for idx, (a_name, a_val) in enumerate(attrs):
+                                    with CS(REF_POS):
+                                        CS.store(m_ast_attribute.set(self.ast_ref, idx, str(a_name)[:64], str(a_val)[:255]))
                             else:
                                 attrs = getattr(self, "attributes", ())
                                 flat_attrs = [val for idx, (a_name, a_val) in enumerate(attrs) for val in (None, idx, str(a_name)[:64], str(a_val)[:255])]
@@ -3754,6 +3846,10 @@ class C_Type(Ast):
                     sz = cur_t.get_size()
                     if sz >= 0:
                         self.attributes.append(("size_bytes", str(sz)))
+                    spelling = getattr(cur_t, "spelling", None)
+                    if spelling:
+                        clean_spelling = re.sub(r"\((?:unnamed|anonymous)[^)]*at [^)]+\)", "(anonymous)", spelling)
+                        self.attributes.append(("type_str", str(clean_spelling)[:255]))
             except Exception:
                 pass
             bf_width = 0

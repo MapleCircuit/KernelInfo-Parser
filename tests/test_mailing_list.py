@@ -1305,6 +1305,72 @@ class TestResolveBatchTimeBudget(unittest.TestCase):
         self.assertGreater(captured[0], 0.0)
         self.assertLess(captured[0], 100.0)
 
+    def test_line_counter_and_commentary_isolation(self):
+        """Hunk parsing respects hunk header counts and isolates post-diff commentary."""
+        from parser.mailing_list.ml_patch_parser import parse_patch_from_body, extract_review_trailers
+        patch_email = (
+            "From: dev@example.com\n"
+            "Subject: [PATCH] fix counter bug\n\n"
+            "Fix the counter decrement logic.\n"
+            "---\n"
+            " counter.c | 2 +-\n"
+            " 1 file changed, 1 insertion(+), 1 deletion(-)\n\n"
+            "diff --git a/counter.c b/counter.c\n"
+            "--- a/counter.c\n"
+            "+++ b/counter.c\n"
+            "@@ -10,3 +10,3 @@ int decrement(void)\n"
+            " int a = 1;\n"
+            "---count;\n"
+            "+--counter;\n"
+            " return a;\n\n"
+            "Great patch, tested thoroughly.\n"
+            "Reviewed-by: Reviewer <rev@example.com>\n"
+            "Tested-by: Tester <test@example.com>\n"
+            "-- \n"
+            "2.43.0\n"
+        )
+        res = parse_patch_from_body(patch_email)
+        self.assertTrue(res["is_patch"])
+        self.assertEqual(len(res["diff"]["files"]), 1)
+        f = res["diff"]["files"][0]
+        self.assertEqual(len(f["hunks"]), 1)
+        h = f["hunks"][0]
+        # Hunk lines should have: 1 context ("int a = 1;"), 1 del ("--count;"), 1 add ("--counter;"), 1 context ("return a;")
+        self.assertEqual(len(h["lines"]), 4)
+        del_line = [l for l in h["lines"] if l[0] == "-"][0]
+        self.assertEqual(del_line[3], "--count;")
+        add_line = [l for l in h["lines"] if l[0] == "+"][0]
+        self.assertEqual(add_line[3], "--counter;")
+
+        # Commentary and reviews must NOT be inside the hunk!
+        all_hunk_text = "".join(l[3] for l in h["lines"])
+        self.assertNotIn("Great patch", all_hunk_text)
+        self.assertNotIn("Reviewed-by", all_hunk_text)
+
+        # Review trailers must be extracted
+        trailers = res.get("review_trailers", [])
+        trailer_types = {t["type"]: t["name"] for t in trailers}
+        self.assertEqual(trailer_types.get("Reviewed-by"), "Reviewer")
+        self.assertEqual(trailer_types.get("Tested-by"), "Tester")
+
+    def test_pull_from_and_branch_merge_auto_extraction(self):
+        """CommitFeatures auto-extracts maintainer pull_from and branch terms."""
+        merge_msg = (
+            "Merge tag 'v6.1-fixes' of git://git.kernel.org/pub/scm/linux/kernel/git/arm64/linux\n\n"
+            "Pull arm64 fixes from Will Deacon <will@kernel.org>:\n\n"
+            "arm64 core fixes for v6.1:\n"
+            "- Fix kexec page fault\n"
+        )
+        feat = CommitFeatures(
+            sha="abcdef" * 6 + "0123",
+            subject="Merge tag 'v6.1-fixes' of git://...",
+            message=merge_msg,
+            is_merge=True,
+        )
+        self.assertEqual(feat.pull_from_name, "Will Deacon")
+        self.assertEqual(feat.pull_from_email, "will@kernel.org")
+        self.assertEqual(feat.merge_branch, "v6.1-fixes")
+
 
 if __name__ == "__main__":
     unittest.main()

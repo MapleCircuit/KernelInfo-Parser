@@ -1,10 +1,13 @@
 /**
  * diff_view.js - Compare view: file and Kconfig deltas between any two tags or commits.
  */
+import { API_KINDS, API_STATUSES, apiDiffHtml, apiDiffMarkdown, apiDiffRows, apiDiffTsv, filterApiRows } from "./api_diff.js";
+import { progressLabel } from "../../utils/job_poll.js";
 import { api } from "../../api.js";
 import { state } from "../../state.js";
 import { refPicker, shortRef } from "../../components/ref_picker.js";
 import { downloadText } from "../../components/modal.js";
+import { contextMenu } from "../../components/context_menu.js";
 import { previousTag } from "../code_view/file_diff.js";
 
 const PAGE_SIZE = 500;
@@ -69,7 +72,12 @@ export class DiffView {
     this.containerEl = containerEl;
     this.versionB = tabData.versionB || state.currentVersion;
     this.versionA = tabData.versionA || await this.defaultBaseFor(this.versionB);
-    this.currentMode = tabData.mode === "kconfig" ? "kconfig" : "files";
+    this.currentMode = ["kconfig", "api"].includes(tabData.mode) ? tabData.mode : "files";
+    // API mode (A6): kinds, statuses, filter and ARCH, recorded on the tab
+    this.apiKinds = new Set(String(tabData.apiKinds || "").split(",").filter((k) => API_KINDS.includes(k)));
+    this.apiStatuses = new Set(String(tabData.apiStatuses || "").split(",").filter((k) => API_STATUSES.includes(k)));
+    this.apiQuery = tabData.apiQuery || "";
+    this.apiArch = tabData.apiArch || state.kconfigArch() || "x86_64";
     // View state recorded on the tab (and so in the URL, §5.26): chips, filters, rename searches
     this.statusFilter = new Set(String(tabData.statuses || "").split(",").filter((k) => FILE_STATUSES.includes(k)));
     this.fileFilter = tabData.query || "";
@@ -105,6 +113,7 @@ export class DiffView {
         <div class="compare-modes">
           <button class="code-btn" data-mode="files" type="button">Files <span class="compare-mode-count" id="cmp-count-files"></span></button>
           <button class="code-btn" data-mode="kconfig" type="button">Kconfig <span class="compare-mode-count" id="cmp-count-kconfig"></span></button>
+          <button class="code-btn" data-mode="api" type="button" title="Kernel API changes: syscalls, exports, parameters, tracepoints, modules">API <span class="compare-mode-count" id="cmp-count-api"></span></button>
         </div>
 
         <div id="diff-results-container"></div>
@@ -173,7 +182,11 @@ export class DiffView {
     this.persistTabState({
       versionA: this.versionA,
       versionB: this.versionB,
-      mode: this.currentMode === "kconfig" ? "kconfig" : "",
+      mode: this.currentMode === "files" ? "" : this.currentMode,
+      apiKinds: API_KINDS.filter((k) => this.apiKinds?.has(k)).join(","),
+      apiStatuses: API_STATUSES.filter((k) => this.apiStatuses?.has(k)).join(","),
+      apiQuery: this.apiQuery || "",
+      apiArch: this.currentMode === "api" ? this.apiArch : "",
       statuses: FILE_STATUSES.filter((k) => this.statusFilter.has(k)).join(","),
       query: this.fileFilter,
       kconfigQuery: this.kconfigFilter,
@@ -210,7 +223,19 @@ export class DiffView {
     resContainer.innerHTML = `<div class="compare-empty">Comparing ${escapeHtml(shortRef(this.versionA))} → ${escapeHtml(shortRef(this.versionB))}…</div>`;
 
     try {
-      if (this.currentMode === "kconfig") {
+      if (this.currentMode === "api") {
+        this.apiAbort?.abort();
+        this.apiAbort = new AbortController();
+        const res = await api.requestJob(`/api/kapi/diff?a=${encodeURIComponent(this.versionA)}&b=${encodeURIComponent(this.versionB)}&arch=${encodeURIComponent(this.apiArch)}`, {
+          signal: this.apiAbort.signal, timeoutMs: 60000,
+          onProgress: (p) => {
+            if (seq === this.loadSeq) resContainer.innerHTML = `<div class="compare-empty">Building the Kernel API catalogs… ${escapeHtml(progressLabel(p))}</div>`;
+          },
+        });
+        if (seq !== this.loadSeq) return;
+        this.apiResult = res;
+        this.renderApiDiff(resContainer);
+      } else if (this.currentMode === "kconfig") {
         const res = await api.getKconfigDiff(this.versionA, this.versionB);
         if (seq !== this.loadSeq) return;
         this.kconfigResult = res;
@@ -233,6 +258,86 @@ export class DiffView {
       if (seq !== this.loadSeq) return;
       resContainer.innerHTML = `<div class="compare-empty error">Failed: ${escapeHtml(e.message)}</div>`;
     }
+  }
+
+  // ---------------------------------------------------------------------------
+  // API mode (A6)
+  // ---------------------------------------------------------------------------
+  renderApiDiff(container) {
+    const res = this.apiResult;
+    const rows = apiDiffRows(res);
+    const count = this.containerEl.querySelector("#cmp-count-api");
+    if (count) count.textContent = rows.length ? `(${rows.length})` : "";
+    container.innerHTML = `<div class="compare-api-arch">ARCH <select class="api-diff-arch"><option value="${escapeHtml(this.apiArch)}">${escapeHtml(this.apiArch)}</option></select>
+      <span class="compare-subtitle">Renames are not inferred: a renamed symbol shows as removed + added.</span></div>`
+      + apiDiffHtml(res, rows, { kinds: this.apiKinds, statuses: this.apiStatuses, query: this.apiQuery });
+    const archSel = container.querySelector(".api-diff-arch");
+    api.getKconfigPresets(this.versionB).then((p) => {
+      archSel.innerHTML = (p?.targets || []).map((t) => `<option value="${escapeHtml(t.id)}" ${t.id === this.apiArch ? "selected" : ""}>${escapeHtml(t.label || t.id)}</option>`).join("") || archSel.innerHTML;
+    }).catch(() => {});
+    archSel.onchange = () => {
+      this.apiArch = archSel.value;
+      this.persist();
+      this.loadDiff();
+    };
+    const rerender = () => {
+      this.persist();
+      this.renderApiDiff(container);
+    };
+    container.querySelectorAll("[data-api-kind]").forEach((b) => {
+      b.onclick = () => {
+        const k = b.dataset.apiKind;
+        if (this.apiKinds.has(k)) this.apiKinds.delete(k);
+        else this.apiKinds.add(k);
+        rerender();
+      };
+    });
+    container.querySelectorAll("[data-api-status]").forEach((b) => {
+      b.onclick = () => {
+        const k = b.dataset.apiStatus;
+        if (this.apiStatuses.has(k)) this.apiStatuses.delete(k);
+        else this.apiStatuses.add(k);
+        rerender();
+      };
+    });
+    const filter = container.querySelector(".api-diff-filter");
+    let t = null;
+    filter.oninput = () => {
+      clearTimeout(t);
+      t = setTimeout(() => {
+        this.apiQuery = filter.value.trim();
+        rerender();
+        const f = container.querySelector(".api-diff-filter");
+        f.focus();
+        f.setSelectionRange(f.value.length, f.value.length);
+      }, 200);
+    };
+    container.querySelector(".api-diff-download").onclick = (e) => {
+      const shown = filterApiRows(rows, this.apiKinds, this.apiStatuses, this.apiQuery);
+      const r = e.currentTarget.getBoundingClientRect();
+      const base = `api-${String(this.versionA).replace(/[^A-Za-z0-9._-]/g, "_")}-${String(this.versionB).replace(/[^A-Za-z0-9._-]/g, "_")}`;
+      contextMenu.renderMenu(r.left, r.bottom + 4, { header: { title: "Download", sub: `${shown.length} changes` }, items: [
+        { label: "Summary (.md)", icon: "⬇", onClick: () => downloadText(`${base}.md`, apiDiffMarkdown(res, shown), "text/markdown") },
+        { label: "Table (.tsv)", icon: "⬇", onClick: () => downloadText(`${base}.tsv`, apiDiffTsv(shown)) },
+        { label: "JSON", icon: "⬇", onClick: () => downloadText(`${base}.json`, JSON.stringify(res, null, 1), "application/json") },
+      ] });
+    };
+    const open = (row, forceNew) => {
+      const removed = row.dataset.status === "removed";
+      state.openTab({ type: "api", title: "Kernel API", view: row.dataset.kind, sel: "", query: row.dataset.key,
+        arch: this.apiArch, version: removed ? this.versionA : this.versionB, forceNew });
+    };
+    container.querySelector(".api-diff-list").addEventListener("click", (e) => {
+      const row = e.target.closest(".api-diff-row");
+      if (row) open(row, e.ctrlKey || e.metaKey);
+    });
+    container.querySelector(".api-diff-list").addEventListener("auxclick", (e) => {
+      const row = e.target.closest(".api-diff-row");
+      if (row && e.button === 1) {
+        e.preventDefault();
+        open(row, true);
+      }
+    });
   }
 
   // ---------------------------------------------------------------------------

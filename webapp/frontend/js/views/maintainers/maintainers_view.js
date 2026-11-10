@@ -26,6 +26,26 @@ function personKey(p) {
   return String(p.email || p.person_id || p.name || "");
 }
 
+const PATTERN_TAG_MAP = {
+  1: "F:",
+  2: "X:",
+  3: "K:",
+  4: "N:",
+  5: "D:",
+  FILE: "F:",
+  EXCLUDE: "X:",
+  KEYWORD: "K:",
+  REGEX: "N:",
+  DOC: "D:",
+};
+
+function formatPatternTag(type) {
+  const str = String(type ?? "").trim();
+  if (PATTERN_TAG_MAP[str]) return PATTERN_TAG_MAP[str];
+  if (/^[A-Z]:?$/i.test(str)) return str.endsWith(":") ? str.toUpperCase() : `${str.toUpperCase()}:`;
+  return str ? `${str}:` : "";
+}
+
 export class MaintainersView {
   constructor() {
     this.tabId = null;
@@ -393,19 +413,23 @@ export class MaintainersView {
               <div><strong style="color:var(--text-muted);">Mailing List:</strong> ${escapeHtml(sec.mailing_list || "None")}</div>
               <div><strong style="color:var(--text-muted);">Web Page:</strong> ${sec.web_page ? `<a href="${escapeHtml(sec.web_page)}" target="_blank" style="color:var(--accent-blue);">${escapeHtml(sec.web_page)}</a>` : "None"}</div>
               <div><strong style="color:var(--text-muted);">SCM Tree:</strong> ${escapeHtml(sec.scm_tree || "None")}</div>
+              ${sec.patchwork ? `<div><strong style="color:var(--text-muted);">Patchwork:</strong> <a href="${escapeHtml(sec.patchwork)}" target="_blank" style="color:var(--accent-blue);">${escapeHtml(sec.patchwork)}</a></div>` : ""}
+              ${sec.bug_url ? `<div><strong style="color:var(--text-muted);">Bug Tracker:</strong> <a href="${escapeHtml(sec.bug_url)}" target="_blank" style="color:var(--accent-blue);">${escapeHtml(sec.bug_url)}</a></div>` : ""}
+              ${sec.chat_channel ? `<div><strong style="color:var(--text-muted);">Chat Channel:</strong> ${escapeHtml(sec.chat_channel)}</div>` : ""}
+              ${sec.profile_doc ? `<div><strong style="color:var(--text-muted);">Profile Doc:</strong> <span class="m-profile-doc-link" data-path="${escapeHtml(sec.profile_doc)}" style="color:var(--accent-blue);cursor:pointer;">${escapeHtml(sec.profile_doc)}</span></div>` : ""}
             </div>
           </div>
         </div>
 
         <!-- Files & Match Rules -->
         <div class="m-card">
-          <div class="m-card-title">File Matching Rules (F: / X:)</div>
+          <div class="m-card-title">File Matching Rules (F: / X: / N: / K: / D:)</div>
           <div style="display:flex;flex-direction:column;gap:4px;font-family:var(--font-mono);font-size:11px;">
             ${
               Array.isArray(sec.patterns) && sec.patterns.length > 0
                 ? sec.patterns.map((p) => `
                     <div style="display:flex;gap:8px;">
-                      <span style="color:var(--accent-orange);font-weight:bold;">${escapeHtml(p.pattern_type || "")}:</span>
+                      <span style="color:var(--accent-orange);font-weight:bold;">${escapeHtml(formatPatternTag(p.pattern_type || p.pat_type || p.type))}</span>
                       <span>${escapeHtml(p.pattern)}</span>
                     </div>
                   `).join("")
@@ -447,6 +471,18 @@ export class MaintainersView {
             });
           }
         });
+      });
+
+      // Documentation click -> Open in Code View
+      detailEl.querySelectorAll(".m-profile-doc-link").forEach((link) => {
+        link.onclick = () => {
+          state.openTab({
+            type: "code",
+            title: link.dataset.path.split("/").pop(),
+            path: link.dataset.path,
+            version: this.currentVersion,
+          });
+        };
       });
 
       // File click -> Open in Code View

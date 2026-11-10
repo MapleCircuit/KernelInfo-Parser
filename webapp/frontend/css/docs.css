@@ -1,6 +1,6 @@
 /* docs.css - kernel.org (Sphinx/Alabaster) documentation layout, adapted to the IDE dark theme */
 
-:root {
+:where(:root) {
   --kdoc-font-body: Georgia, "Goudy Old Style", "Minion Pro", "Bell MT", "Hiragino Mincho Pro", "DejaVu Serif", serif;
   --kdoc-text: #d4d9df;
   --kdoc-heading: #eef2f6;
@@ -309,12 +309,12 @@
   padding: 1px 5px;
   border-radius: 3px;
   background: var(--kdoc-inline-code-bg);
-  color: #e6edf3;
+  color: var(--text-bright);
 }
 
 .kdoc-body code.xref {
   background: rgba(56, 139, 253, 0.12);
-  color: #a5d6ff;
+  color: var(--syn-string);
 }
 
 .kdoc-body pre {
@@ -327,7 +327,7 @@
   background: var(--kdoc-code-bg);
   border: 1px solid var(--border-color);
   border-radius: 4px;
-  color: #e6edf3;
+  color: var(--text-bright);
   white-space: pre;
 }
 
@@ -336,11 +336,11 @@
   border-style: dashed;
 }
 
-.kdoc-body .hl-k { color: #ff7b72; }
-.kdoc-body .hl-s { color: #a5d6ff; }
-.kdoc-body .hl-c { color: #8b949e; font-style: italic; }
-.kdoc-body .hl-n { color: #79c0ff; }
-.kdoc-body .hl-p { color: #d2a8ff; }
+.kdoc-body .hl-k { color: var(--syn-keyword); }
+.kdoc-body .hl-s { color: var(--syn-string); }
+.kdoc-body .hl-c { color: var(--syn-comment); font-style: italic; }
+.kdoc-body .hl-n { color: var(--syn-number); }
+.kdoc-body .hl-p { color: var(--syn-preproc); }
 
 .kdoc-body kbd.kbd {
   padding: 1px 6px;
@@ -636,7 +636,7 @@
 
 .kdoc-body mark.kdoc-hl.current {
   background: rgba(240, 136, 62, 0.75);
-  color: #0d1117;
+  color: var(--text-inverse);
 }
 
 .kdoc-body .kdoc-target-flash {
@@ -692,7 +692,7 @@
   padding: 8px;
   border-radius: 4px;
   /* Most kernel figures are drawn for white pages */
-  background: #f6f8fa;
+  background: var(--figure-bg);
 }
 
 /* Inline badges & linked images (crates.io, shields.io, build badges) */

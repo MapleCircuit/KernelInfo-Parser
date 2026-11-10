@@ -12,7 +12,6 @@ different files (and with different dependencies) per architecture, e.g. 64BIT.
 """
 from __future__ import annotations
 
-import gzip
 import hashlib
 import json
 import logging
@@ -27,6 +26,7 @@ from fastapi import HTTPException
 
 from parser.kbuild_conditions import KbuildConditionResolver, is_other_arch_path
 from parser.kbuild_parser import KbuildParser
+from parser import kbuild_symbols
 from parser.kconfig_ast.kconfig_eval import KconfigEvaluator, escape_string, solve
 from parser.kconfig_ast.kconfig_preprocess import KconfigPreprocessor
 from parser.kconfig_ast.kconfig_toolchain import ToolchainProfile, ToolchainShell
@@ -47,6 +47,7 @@ from webapp.backend.security.git import safe_rev
 from webapp.backend.services.tree_resolver import git_tree_resolver
 from webapp.backend.security.sql import is_valid_identifier
 from webapp.backend.services.git_reader import git_reader
+from webapp.backend.services.disk_cache import DiskCache, module_fingerprint
 
 logger = logging.getLogger(__name__)
 
@@ -99,50 +100,25 @@ class _ModelEntry:
 
 # Built models persist across restarts as gzipped JSON, keyed by commit SHA, ARCH, toolchain and the
 # model code (a cold build of a modern tree costs ~2 s); KERNELINFO_CACHE_DIR overrides the location
-_MODEL_DISK_DIR = Path(os.environ.get("KERNELINFO_CACHE_DIR") or "~/.cache/kernelinfo").expanduser() / "kconfig-models"
-_MODEL_DISK_LIMIT = 32
+# (services/disk_cache.py, webapp/API.md section 2.14)
+_MODEL_DISK = DiskCache("kconfig-models", max_bytes=512 << 20, max_entries=32)
+# Basenames of the .c/.S files other files #include, per commit SHA (immutable)
+_INCLUDED_DISK = DiskCache("included-sources", max_bytes=16 << 20, max_entries=256)
 _MODEL_CODE_FILES = ("kconfig_lexer.py", "kconfig_parser.py", "kconfig_model.py", "kconfig_preprocess.py", "kconfig_toolchain.py")
-_model_code_fingerprint: str | None = None
 
 
 def _code_fingerprint() -> str:
     """Hash of the model-building code: a cached model is only reused by the code that built it."""
-    global _model_code_fingerprint
-    if _model_code_fingerprint is None:
-        h = hashlib.sha1(str(MODEL_FORMAT).encode())
-        base = Path(__file__).resolve().parents[3] / "parser" / "kconfig_ast"
-        for name in _MODEL_CODE_FILES:
-            try:
-                h.update((base / name).read_bytes())
-            except OSError:
-                h.update(name.encode())
-        _model_code_fingerprint = h.hexdigest()
-    return _model_code_fingerprint
+    return module_fingerprint(*(f"parser/kconfig_ast/{name}" for name in _MODEL_CODE_FILES), salt=str(MODEL_FORMAT))
 
 
 def _disk_load(key: str) -> dict[str, Any] | None:
-    path = _MODEL_DISK_DIR / f"{key}.json.gz"
-    try:
-        with gzip.open(path, "rt", encoding="utf-8") as fh:
-            data = json.load(fh)
-        os.utime(path)  # least recently used eviction by mtime
-        return data
-    except (OSError, ValueError, EOFError):
-        return None
+    data = _MODEL_DISK.get(key)
+    return data if isinstance(data, dict) else None
 
 
 def _disk_store(key: str, data: dict[str, Any]) -> None:
-    try:
-        _MODEL_DISK_DIR.mkdir(parents=True, exist_ok=True)
-        tmp = _MODEL_DISK_DIR / f".{key}.{os.getpid()}.tmp"
-        with gzip.open(tmp, "wt", encoding="utf-8", compresslevel=5) as fh:
-            json.dump(data, fh, separators=(",", ":"))
-        os.replace(tmp, _MODEL_DISK_DIR / f"{key}.json.gz")
-        entries = sorted(_MODEL_DISK_DIR.glob("*.json.gz"), key=lambda p: p.stat().st_mtime)
-        for old in entries[:-_MODEL_DISK_LIMIT]:
-            old.unlink(missing_ok=True)
-    except OSError as exc:
-        logger.debug("Kconfig model not cached on disk: %s", exc)
+    _MODEL_DISK.put(key, data)
 
 
 _MODELS: "RepoScopedCache" = RepoScopedCache()
@@ -158,6 +134,15 @@ _LISTING_CACHE: "RepoScopedCache" = RepoScopedCache(maxsize=64)
 _PATHS_CACHE: "RepoScopedCache" = RepoScopedCache(maxsize=4)
 # Bounded: keyed by the requested symbol name, and each entry holds that symbol's reference list
 _USAGE_CACHE: "RepoScopedCache" = RepoScopedCache(maxsize=256)
+# Commit SHA -> {(blob_id, fnid): path} of its Makefile/Kbuild files when all are in m_kbuild_symbol ({}: not
+# all indexed, final); content addressed per commit
+_KBUILD_COVERAGE: "RepoScopedCache" = RepoScopedCache(maxsize=16)
+# Makefiles one kbuild_usage() answer reads at most (both paths)
+KBUILD_USAGE_MAKEFILES = 200
+
+
+def _text(value: Any) -> str:
+    return value.decode("utf-8", "replace") if isinstance(value, (bytes, bytearray)) else ("" if value is None else str(value))
 _BUILD_RESOLVERS: "RepoScopedCache" = RepoScopedCache()
 # resolve_arch() answers per (commit SHA, ARCH): bounded, any revision a caller names adds one
 _ARCH_INFO_CACHE: "RepoScopedCache" = RepoScopedCache(maxsize=256)
@@ -497,6 +482,18 @@ class KconfigService:
             "defconfigs": items,
         }
 
+    def list_fragments(self, version_name: str, arch: str = DEFAULT_ARCH) -> dict[str, Any]:
+        """Configuration fragments `merge_config.sh` merges (K2): `kernel/configs/*.config` and
+        `arch/$SRCARCH/configs/*.config` (none before v3.17)."""
+        info = self.resolve_arch(version_name, arch)
+        rev, srcarch = info["rev"], info["srcarch"]
+        items = []
+        for base in ("kernel/configs", f"arch/{srcarch}/configs"):
+            for name in sorted(self._tree_listing(rev, base)):
+                if name.endswith(".config"):
+                    items.append({"name": name, "path": f"{base}/{name}", "scope": "common" if base.startswith("kernel/") else srcarch})
+        return {"version": version_name, "arch": info["arch"], "fragments": items}
+
     def get_defconfig_content(self, version_name: str, name_or_path: str = "", arch: str = DEFAULT_ARCH, toolchain: Any = None) -> dict[str, Any]:
         """Raw defconfig text plus its literal assignments (nothing injected: kconfig derives the rest)."""
         info = self.resolve_arch(version_name, arch)
@@ -504,7 +501,14 @@ class KconfigService:
         clean = (name_or_path or "").strip().lstrip("/")
         if not clean:
             clean = self._default_defconfig(rev, info["arch"], srcarch) or ""
-        if clean.startswith("arch/"):
+        if ".." in clean.split("/") or "\\" in clean:
+            raise HTTPException(status_code=400, detail="Invalid defconfig path.")
+        if clean.startswith("kernel/configs/"):
+            # Configuration fragments (K2): `kernel/configs/*.config` only
+            if not re.fullmatch(r"kernel/configs/[\w.+-]+\.config", clean):
+                raise HTTPException(status_code=400, detail="Fragments are kernel/configs/<name>.config files.")
+            candidates = [clean]
+        elif clean.startswith("arch/"):
             candidates = [clean]
         elif clean.startswith("configs/"):
             candidates = [f"arch/{srcarch}/{clean}"]
@@ -564,6 +568,17 @@ class KconfigService:
         return out
 
     def _other_arch_definitions(self, rev: str, name: str) -> list[dict[str, Any]]:
+        """Definitions of a symbol the ARCH's Kconfig tree does not reach (at most 50, by path then line).
+
+        From the Kconfig entry tags when the revision is a finished version (every Kconfig blob of its tree
+        is parsed), otherwise `git grep` over the `*Kconfig*` files."""
+        try:
+            stored = self._other_arch_definitions_db(rev, name)
+        except Exception as exc:  # noqa: BLE001 - git grep answers
+            logger.debug("Kconfig definitions of %s from tags failed: %s", name, exc)
+            stored = None
+        if stored is not None:
+            return stored
         out = self._git(["grep", "-n", "-E", rf"^\s*(menu)?config\s+{re.escape(name)}\s*$", rev, "--", "*Kconfig*"]) or ""
         defs = []
         for line in out.splitlines()[:50]:
@@ -571,6 +586,44 @@ class KconfigService:
             if len(parts) == 4 and parts[2].isdigit():
                 defs.append({"file_path": parts[1], "line_s": int(parts[2]), "line_e": int(parts[2])})
         return defs
+
+    @staticmethod
+    def _other_arch_definitions_db(rev: str, name: str) -> list[dict[str, Any]] | None:
+        """The tag form of _other_arch_definitions(), or None when the revision is not a finished version."""
+        from webapp.backend.services.history_service import KCONFIG_TYPES
+        sha = git_tree_resolver.resolve_commit_sha(rev)
+        if sha is None or not is_valid_identifier(name):
+            return None
+        with get_db_cursor() as cursor:
+            if not git_tree_resolver._is_finished_version(cursor, sha):
+                return None
+            blob_paths = git_tree_resolver.blob_paths(cursor, sha)
+            if blob_paths is None:
+                return None
+            # The revision's Kconfig blobs only (the name alone would also walk every older definition)
+            kconfig_blobs = sorted(b for b, paths in blob_paths.items() if any("Kconfig" in p for p in paths))
+            rows = []
+            for i in range(0, len(kconfig_blobs), 2000):
+                chunk = kconfig_blobs[i : i + 2000]
+                cursor.execute(
+                    f"""
+                    SELECT bt.blob_id, bt.line_s, bt.line_e
+                    FROM m_bridge_tag bt
+                    JOIN m_tag t ON t.tag_id = bt.tag_id
+                    JOIN m_ast a ON a.ast_id = t.ast_id
+                    WHERE bt.blob_id IN ({",".join(["%s"] * len(chunk))})
+                      AND a.name = %s AND a.type_id IN ({",".join(["%s"] * len(KCONFIG_TYPES))});
+                    """,
+                    (*chunk, name, *KCONFIG_TYPES),
+                )
+                rows.extend(cursor.fetchall())
+        found = {
+            (path, int(r["line_s"]), int(r["line_e"]))
+            for r in rows
+            for path in blob_paths.get(r["blob_id"], ())
+            if "Kconfig" in path
+        }
+        return [{"file_path": p, "line_s": ls, "line_e": le} for p, ls, le in sorted(found)[:50]]
 
     def get_symbol_detail(self, version_name: str, name: str, arch: str = DEFAULT_ARCH, toolchain: Any = None) -> dict[str, Any]:
         """Arch-scoped definition(s), dependencies, help and compiled files of a symbol."""
@@ -641,43 +694,113 @@ class KconfigService:
         key = ("kbuild", rev, name)
         rules = _USAGE_CACHE.get(key)
         if rules is None:
-            # -F: the symbol name is a literal, not a pattern (without it git grep reads it as a
-            # basic regex, where `.` and `*` would still match beyond the name)
-            out = self._git(["grep", "-l", "-w", "-F", "-e", f"CONFIG_{name}", rev, "--", "*Makefile*", "*Kbuild*"])
-            if out is None:
-                return []
-            makefiles = sorted({line.split(":", 1)[1] for line in out.splitlines() if ":" in line})
-            paths = self._all_paths(rev)
-            parser = KbuildParser()
-            rules = []
-            for mk in makefiles[:200]:
-                content = self._read(rev, mk)
-                if not content:
-                    continue
-                for b in parser.parse_makefile_content(content, dir_path=os.path.dirname(mk)):
-                    if b.symbol_name != name and name not in b.cond_symbols:
-                        continue
-                    target = b.source_file_rel
-                    exists = target in paths
-                    if not exists and target.endswith(".c") and target[:-2] + ".S" in paths:
-                        target, exists = target[:-2] + ".S", True
-                    if b.is_directory:
-                        target = target[: -len("/Makefile")] + "/" if target.endswith("/Makefile") else target
-                        exists = any(p.startswith(target) for p in paths) if not exists else True
-                    rules.append({
-                        "makefile": mk,
-                        "line": b.source_line,
-                        "rule": b.details,
-                        "target_obj": b.target_obj,
-                        "path": target,
-                        "exists": exists,
-                        "kind": "directory" if b.is_directory else ("composite" if b.is_composite else "object"),
-                        "via": "condition" if b.symbol_name != name else "rule",
-                        "compile_mode": {1: "built-in", 2: "module", 3: "conditional"}.get(b.compile_mode, "conditional"),
-                    })
+            try:
+                rules = self._kbuild_usage_db(rev, name)
+            except Exception as exc:  # noqa: BLE001 - the Git path answers
+                logger.debug("Kbuild usage of %s from m_kbuild_symbol failed: %s", name, exc)
+                rules = None
+            if rules is None:
+                rules = self._kbuild_usage_git(rev, name)
+                if rules is None:
+                    return []
             _USAGE_CACHE[key] = rules
         trees = self._arch_trees(rev, info["arch"])
         return [dict(r, other_arch=is_other_arch_path(r["path"], srcarch, trees)) for r in rules]
+
+    def _kbuild_usage_git(self, rev: str, name: str) -> list[dict[str, Any]] | None:
+        """kbuild_usage() rules from Git: the Makefiles naming CONFIG_<name>, parsed (at most 200)."""
+        # -F: the symbol name is a literal, not a pattern (without it git grep reads it as a
+        # basic regex, where `.` and `*` would still match beyond the name)
+        out = self._git(["grep", "-l", "-w", "-F", "-e", f"CONFIG_{name}", rev, "--", "*Makefile*", "*Kbuild*"])
+        if out is None:
+            return None
+        makefiles = sorted({line.split(":", 1)[1] for line in out.splitlines() if ":" in line})
+        paths = self._all_paths(rev)
+        parser = KbuildParser()
+        rules: list[dict[str, Any]] = []
+        for mk in makefiles[:KBUILD_USAGE_MAKEFILES]:
+            content = self._read(rev, mk)
+            if content:
+                rules.extend(kbuild_symbols.bindings_usage(mk, parser.parse_makefile_content(content, dir_path=os.path.dirname(mk)), name, paths))
+        return rules
+
+    def _kbuild_usage_db(self, rev: str, name: str) -> list[dict[str, Any]] | None:
+        """kbuild_usage() rules from m_kbuild_symbol (parser/kbuild_symbols.py), or None when the revision's
+        Makefile/Kbuild (path, blob) pairs are not all stored (an older database, a backfill not run, a
+        revision whose Makefiles were never parsed)."""
+        sha = git_tree_resolver.resolve_commit_sha(rev)
+        if sha is None:
+            return None
+        with get_db_cursor() as cursor:
+            pairs = self._kbuild_pairs_covered(cursor, sha)
+            if pairs is None:
+                return None
+            cursor.execute(
+                """
+                SELECT r.source_blob_id, r.source_fnid, r.idx, r.via, r.line_no, r.compile_mode, r.kind,
+                       r.target_obj, r.target_path, r.rule
+                FROM m_kbuild_symbol r
+                WHERE r.symbol = %s AND r.via IN (1, 2);
+                """,
+                (name,),
+            )
+            rows = [r for r in cursor.fetchall() if (int(r["source_blob_id"]), int(r["source_fnid"])) in pairs]
+        paths = self._all_paths(rev)
+        # One entry per binding (a binding naming the symbol in its rule and a condition is a rule)
+        best: dict[tuple[str, int], dict[str, Any]] = {}
+        for r in rows:
+            mk = pairs[(int(r["source_blob_id"]), int(r["source_fnid"]))]
+            k = (mk, int(r["idx"]))
+            if k not in best or int(r["via"]) < int(best[k]["via"]):
+                best[k] = r
+        makefiles = sorted({mk for mk, _idx in best})[:KBUILD_USAGE_MAKEFILES]
+        keep = set(makefiles)
+        return [
+            kbuild_symbols.usage_rule(mk, int(r["line_no"]), _text(r["rule"]), _text(r["target_obj"]), _text(r["target_path"]),
+                                      int(r["kind"]), int(r["via"]), int(r["compile_mode"]), paths)
+            for (mk, _idx), r in sorted(best.items()) if mk in keep
+        ]
+
+    @staticmethod
+    def _kbuild_pairs_covered(cursor: Any, sha: str) -> dict[tuple[int, int], str] | None:
+        """(blob_id, fnid) -> path of the revision's Makefile/Kbuild files when every one of them has
+        m_kbuild_symbol rows (marker rows included), else None. Cached per commit."""
+        hit = _KBUILD_COVERAGE.get(sha)
+        if hit is not None:
+            return hit or None
+        tree = git_tree_resolver.list_tree(sha)
+        if tree is None:
+            return None
+        files = [p for p in tree if kbuild_symbols.is_kbuild_file(p)]
+        meta = git_tree_resolver.map_blob_hashes(cursor, [tree[p] for p in files])
+        if any(tree[p] not in meta for p in files):
+            _KBUILD_COVERAGE[sha] = {}
+            return None
+        fnid_of: dict[str, int] = {}
+        for i in range(0, len(files), 1000):
+            chunk = files[i:i + 1000]
+            cursor.execute(f"SELECT fnid, fname FROM m_file_name WHERE fname IN ({','.join(['%s'] * len(chunk))});", tuple(chunk))
+            fnid_of.update({_text(r["fname"]): int(r["fnid"]) for r in cursor.fetchall()})
+        pairs: dict[tuple[int, int], str] = {}
+        for p in files:
+            if p not in fnid_of:
+                _KBUILD_COVERAGE[sha] = {}
+                return None
+            pairs[(int(meta[tree[p]][0]), fnid_of[p])] = p
+        blobs = sorted({b for b, _f in pairs})
+        stored: set[tuple[int, int]] = set()
+        for i in range(0, len(blobs), 1000):
+            chunk = blobs[i:i + 1000]
+            cursor.execute(
+                f"SELECT DISTINCT source_blob_id, source_fnid FROM m_kbuild_symbol WHERE source_blob_id IN ({','.join(['%s'] * len(chunk))});",
+                tuple(chunk),
+            )
+            stored.update((int(r["source_blob_id"]), int(r["source_fnid"])) for r in cursor.fetchall())
+        if any(pair not in stored for pair in pairs):
+            # Not cached as final: a running backfill or parse fills the rest
+            return None
+        _KBUILD_COVERAGE[sha] = pairs
+        return pairs
 
     @staticmethod
     def _compiled_files(kbuild: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -698,13 +821,42 @@ class KconfigService:
         key = ("incsrc", rev)
         # Read into a local: the cache evicts, so re-reading after the write could miss
         sources = _USAGE_CACHE.get(key)
-        if sources is None:
-            out = self._git(["grep", "-h", "-o", "-E", _INCLUDED_SOURCE_RE, rev, "--", "*.c", "*.h", "*.S"], timeout=60)
-            if out is None:
-                return set()
-            sources = {re.split(r'[/"<]', line.strip().rstrip('">'))[-1] for line in out.splitlines() if line.strip()}
-            _USAGE_CACHE[key] = sources
+        if sources is not None:
+            return sources
+        sha = git_tree_resolver.resolve_commit_sha(rev)
+        hit = _INCLUDED_DISK.get(sha) if sha else None
+        if hit is not None:
+            sources = set(hit)
+        else:
+            sources = self._included_sources_db(sha) if sha else None
+            if sources is None:
+                out = self._git(["grep", "-h", "-o", "-E", _INCLUDED_SOURCE_RE, rev, "--", "*.c", "*.h", "*.S"], timeout=60)
+                if out is None:
+                    return set()
+                sources = {re.split(r'[/"<]', line.strip().rstrip('">'))[-1] for line in out.splitlines() if line.strip()}
+            if sha:
+                _INCLUDED_DISK.put(sha, sorted(sources))
+        _USAGE_CACHE[key] = sources
         return sources
+
+    @staticmethod
+    def _included_sources_db(sha: str) -> set[str] | None:
+        """The same set from the parser's stored `#include` directives (m_blob_facts family 3) when every
+        `.c` / `.h` / `.S` blob of the commit has them; None otherwise. Directives start a line, so an
+        `#include "x.c"` inside a comment, which `git grep` also matched, is not counted."""
+        from parser import include_facts
+        from webapp.backend.services.source_index import db_facts
+        tree = git_tree_resolver.list_tree(sha) or {}
+        blobs = sorted({b for p, b in tree.items() if include_facts.applies(p)})
+        if not blobs:
+            return None
+        stored = db_facts(blobs, include_facts.FAMILY, include_facts.FORMAT, include_facts.decode)
+        if len(stored) != len(blobs):
+            return None
+        out: set[str] = set()
+        for directives in stored.values():
+            out |= include_facts.included_sources(directives)
+        return out
 
     @staticmethod
     def _arch_trees(rev: str, arch: str) -> set[str] | None:

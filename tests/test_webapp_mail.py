@@ -133,6 +133,8 @@ class TestMailingListService(unittest.TestCase):
         )
         parsed = parse_patch_from_body(sample_patch)
         self.assertTrue(parsed["is_patch"])
+        self.assertIn("Commit message", parsed["commit_message"])
+        self.assertIn("drivers/net/eth.c | 2 +-", parsed["diffstat"])
         self.assertEqual(parsed["diff"]["additions"], 1)
         self.assertEqual(parsed["diff"]["deletions"], 1)
         self.assertEqual(len(parsed["diff"]["files"]), 1)
@@ -565,8 +567,8 @@ class TestFrontendMailAssets(unittest.TestCase):
             content = f.read()
 
         self.assertIn('"mail"', content)
-        # v4 added the mail store, v5 the updated_at index every data store is pruned by
-        self.assertIn("DB_VERSION = 5", content)
+        # v4 added the mail store, v5 the updated_at index every data store is pruned by, v6 the user store (S06)
+        self.assertIn("DB_VERSION = 6", content)
         self.assertIn('createIndex("updated_at", "updated_at")', content)
 
     def test_api_js_includes_mail_methods(self) -> None:
@@ -593,3 +595,62 @@ class TestFrontendMailAssets(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestMergedCommits(unittest.TestCase):
+    """GET /api/mail/merged (P2): database path, trailer fallback, series aggregation, read-only SQL."""
+
+    def test_db_path_and_series(self) -> None:
+        from unittest.mock import MagicMock, patch
+        from webapp.backend.services import merged_service as ms
+        rows = [
+            {"message_id": "p1@x", "thread_id": 9, "relation_type": 1, "match_tier": 1, "patch_version": 2, "patch_idx": 1,
+             "patch_total": 3, "commit_hash": bytes.fromhex("aa" * 20), "subject": "one"},
+            {"message_id": "p2@x", "thread_id": 9, "relation_type": 1, "match_tier": 1, "patch_version": 2, "patch_idx": 2,
+             "patch_total": 3, "commit_hash": bytes.fromhex("bb" * 20), "subject": "two"},
+        ]
+        cursor = MagicMock()
+        cursor.fetchone.return_value = {"n": 2}
+        cursor.fetchall.return_value = rows
+        ms._INDEXED.clear()
+        badges = {"aa" * 20: {"released": True, "first_tag": "v3.1-rc1", "first_release": "v3.1"},
+                  "bb" * 20: {"released": True, "first_tag": "v3.2-rc1", "first_release": "v3.2"}}
+        with patch.object(ms, "get_db_cursor") as gc, patch.object(ms, "get_active_network_id", return_value=4), \
+                patch("webapp.backend.services.commit_facts.release_badges", return_value=badges):
+            gc.return_value.__enter__.return_value = cursor
+            out = ms.merged_commits(mid="<p1@x>", tid=9)
+        self.assertEqual(out["source"], "db")
+        self.assertEqual(out["mid"], "p1@x")
+        self.assertEqual(out["series"], {"total": 3, "merged": 2, "first_release": "v3.1"})
+        self.assertEqual([c["hash"] for c in out["commits"]], ["aa" * 20, "bb" * 20])
+        for call in cursor.execute.call_args_list:
+            self.assertTrue(call[0][0].strip().upper().startswith("SELECT"))
+        self.assertEqual(cursor.execute.call_args_list[-1][0][1][:2], (4, 9))
+
+    def test_trailer_fallback_without_indexes(self) -> None:
+        from unittest.mock import MagicMock, patch
+        from webapp.backend.services import merged_service as ms
+        cursor = MagicMock()
+        cursor.fetchone.return_value = {"n": 0}
+        ms._INDEXED.clear()
+        with patch.object(ms, "get_db_cursor") as gc, patch.object(ms, "get_active_network_id", return_value=4), \
+                patch.object(ms, "_from_trailers", return_value=[{"hash": "cc" * 20, "subject": "s", "relation": "patch", "patch_idx": 0,
+                                                                  "patch_total": 0, "message_id": "m@x"}]) as fb, \
+                patch("webapp.backend.services.commit_facts.release_badges", return_value={}):
+            gc.return_value.__enter__.return_value = cursor
+            out = ms.merged_commits(mid="m@x")
+        fb.assert_called_once_with("m@x", 0)
+        self.assertEqual(out["source"], "trailers")
+        self.assertEqual(out["series"]["merged"], 1)
+        with self.assertRaises(Exception):
+            ms.merged_commits()
+
+    def test_parser_creates_missing_declared_indexes(self) -> None:
+        from unittest.mock import MagicMock
+        from main import ensure_declared_indexes
+        from core.DBLayout import m_commit_email
+        db = MagicMock()
+        db.index_exists.side_effect = lambda name, table: name == "commit_email_tid_idx"
+        self.assertEqual(ensure_declared_indexes(db, (m_commit_email,)), ["commit_email_mid_idx"])
+        name, table, cols = db.create_index.call_args[0]
+        self.assertEqual((name, table, cols), ("commit_email_mid_idx", m_commit_email, (m_commit_email.message_id,)))

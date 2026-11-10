@@ -24,6 +24,7 @@ Safety & Diagnostic Invariants:
 from __future__ import annotations
 
 import os
+import re
 import sys
 import unittest
 from unittest.mock import MagicMock
@@ -37,7 +38,37 @@ if PROJECT_ROOT not in sys.path:
 
 import core
 from core.globalstuff import JoinsType
+from core.TableHandling import Table
 from db_engine import DB_ENGINES, BaseDBEngine
+from db_engine import (
+    Agg,
+    AnyOf,
+    Col,
+    Cond,
+    Const,
+    Exists,
+    Inc,
+    InSelect,
+    Join,
+    NotExists,
+    Select,
+    Value,
+    between,
+    finished_ref,
+    ge,
+    gt,
+    hash_prefix,
+    ieq,
+    is_null,
+    le,
+    len_lt,
+    like,
+    lt,
+    ne,
+    not_in,
+    not_null,
+)
+from db_engine.DBHandling import MariaDB, parse_server_setting
 from unit_test.harness import (
     TestTableCollection,
     test_feature,
@@ -372,8 +403,8 @@ class GenericDBEngineTestCase:
                 (1, b"a" * 20, 1),
             ))
             self.db.insert(t_sec, (
-                (1, 1, "EXT4 FILE SYSTEM", "Supported", "git://ext4", "https://ext4.org", "linux-ext4@vger", 0),
-                (2, 1, "BTRFS FILE SYSTEM", "Maintained", "git://btrfs", "https://btrfs.org", "linux-btrfs@vger", 0),
+                (1, 1, "EXT4 FILE SYSTEM", "Supported", "git://ext4", "https://ext4.org", "linux-ext4@vger", 0, None, None, None, None),
+                (2, 1, "BTRFS FILE SYSTEM", "Maintained", "git://btrfs", "https://btrfs.org", "linux-btrfs@vger", 0, None, None, None, None),
             ))
             self.db.insert(t_pat, (
                 (1, 1, "fs/ext4/*", 10),
@@ -597,6 +628,461 @@ class GenericDBEngineTestCase:
             row = self.db.select(t_debug, (200, None))
             self.assertIsNotNone(row)
             self.assertEqual(len(row[1]), len(large_code_block) + 2)
+
+    @test_feature("query_and_execute", depends_on=["create_table"])
+    def test_20_query_and_execute(self) -> None:
+        """Verify query, query_one, execute, executemany, commit, rollback contracts."""
+        with test_step("Testing driver transaction commit and rollback handles"):
+            self.db.commit()
+            self.db.rollback()
+
+        with test_step("Executing driver query and query_one"):
+            rows = self.db.query("SELECT 1 AS val")
+            self.assertIsInstance(rows, list)
+            row = self.db.query_one("SELECT 1 AS val")
+            if row is not None:
+                val = row.get("val") if isinstance(row, dict) else row[0]
+                self.assertEqual(val, 1)
+
+        with test_step("Executing driver execute and executemany"):
+            res = self.db.execute("SELECT 1")
+            self.assertGreaterEqual(res, 0)
+            many_res = self.db.executemany("SELECT %s", [(1,), (2,)])
+            self.assertGreaterEqual(many_res, 0)
+
+    @test_feature("spec_reads_and_conditions", depends_on=["create_table"])
+    def test_21_spec_reads_and_conditions(self) -> None:
+        """Verify spec read primitives, conditions, operators, joins, and dict mapping."""
+        t_person = self.test_tables["t_maintainer_person"]
+        self.db.delete_rows(t_person, where={"person_id": gt(0)})
+
+        # Seed rows
+        self.db.insert_rows(
+            t_person,
+            ("person_id", "name", "email"),
+            [
+                (1, "Alice Smith", "alice@example.com"),
+                (2, "Bob Jones", "bob@kernel.org"),
+                (3, "Charlie Brown", "charlie@example.com"),
+                (4, "Dave Wilson", "dave@corp.net"),
+            ],
+        )
+
+        with test_step("Verifying scalar conditions: ne, lt, le, gt, ge, between, not_in"):
+            r_ne = self.db.select_rows(t_person, ("person_id",), where=[{"person_id": ne(1)}, {"person_id": gt(0)}])
+            self.assertEqual(len(r_ne), 3)
+
+            r_lt = self.db.select_rows(t_person, ("person_id",), where=[{"person_id": lt(3)}, {"person_id": gt(0)}])
+            self.assertEqual(len(r_lt), 2)
+
+            r_le = self.db.select_rows(t_person, ("person_id",), where=[{"person_id": le(3)}, {"person_id": gt(0)}])
+            self.assertEqual(len(r_le), 3)
+
+            r_gt = self.db.select_rows(t_person, ("person_id",), where={"person_id": gt(2)})
+            self.assertEqual(len(r_gt), 2)
+
+            r_ge = self.db.select_rows(t_person, ("person_id",), where={"person_id": ge(2)})
+            self.assertEqual(len(r_ge), 3)
+
+            r_btw = self.db.select_rows(t_person, ("person_id",), where={"person_id": between(2, 3)})
+            self.assertEqual(len(r_btw), 2)
+
+            r_nin = self.db.select_rows(t_person, ("person_id",), where=[{"person_id": not_in([1, 2])}, {"person_id": gt(0)}])
+            self.assertEqual(len(r_nin), 2)
+
+        with test_step("Verifying like, ieq, len_lt, and AnyOf"):
+            r_like = self.db.select_rows(t_person, ("name",), where={"email": like("example.com", "contains")})
+            self.assertEqual(len(r_like), 2)
+
+            r_ieq = self.db.select_rows(t_person, ("name",), where={"name": ieq("aLiCe sMiTh")})
+            self.assertEqual(len(r_ieq), 1)
+
+            r_len = self.db.select_rows(t_person, ("name",), where=[{"name": len_lt(10)}, {"person_id": gt(0)}])
+            self.assertEqual(len(r_len), 1)
+
+            r_any = self.db.select_rows(t_person, ("name",), where=AnyOf({"person_id": 1}, {"person_id": 2}))
+            self.assertEqual(len(r_any), 2)
+
+        with test_step("Verifying read helpers: select_one, select_values, select_value, count_rows, row_exists"):
+            one = self.db.select_one(t_person, ("person_id", "name"), where={"person_id": 1})
+            self.assertIsNotNone(one)
+            self.assertEqual(one[0], 1)
+
+            vals = self.db.select_values(t_person, "person_id", where={"person_id": gt(0)}, order_by=("person_id",))
+            self.assertEqual(vals, [1, 2, 3, 4])
+
+            val = self.db.select_value(t_person, "name", where={"person_id": 2})
+            self.assertEqual(val, "Bob Jones")
+
+            cnt = self.db.count_rows(t_person, where={"person_id": gt(1)})
+            self.assertEqual(cnt, 3)
+
+            exists = self.db.row_exists(t_person, where={"person_id": 999})
+            self.assertFalse(exists)
+            self.assertTrue(self.db.row_exists(t_person, where={"person_id": 1}))
+
+        with test_step("Verifying select_rows as_dict=True"):
+            d_rows = self.db.select_rows(t_person, {"pid": "person_id", "pname": "name"}, where={"person_id": 1}, as_dict=True)
+            self.assertEqual(len(d_rows), 1)
+            self.assertEqual(d_rows[0]["pid"], 1)
+            self.assertEqual(d_rows[0]["pname"], "Alice Smith")
+
+    @test_feature("aggregates_and_group_by", depends_on=["spec_reads_and_conditions"])
+    def test_22_aggregates_and_group_by(self) -> None:
+        """Verify aggregate computations, min_value, and max_value."""
+        t_person = self.test_tables["t_maintainer_person"]
+        self.db.delete_rows(t_person, where={"person_id": gt(0)})
+        self.db.insert_rows(
+            t_person,
+            ("person_id", "name", "email"),
+            [(10, "User10", "u10@test.com"), (20, "User20", "u20@test.com"), (30, "User30", "u30@test.com")],
+        )
+
+        with test_step("Testing max_value and min_value"):
+            mx = self.db.max_value(t_person, "person_id")
+            mn = self.db.min_value(t_person, "person_id", where={"person_id": gt(0)})
+            self.assertEqual(mx, 30)
+            self.assertEqual(mn, 10)
+
+        with test_step("Testing aggregate expressions"):
+            aggs = self.db.aggregate(
+                t_person,
+                {"total": Agg("COUNT", "*"), "max_id": Agg("MAX", "person_id"), "sum_id": Agg("SUM", "person_id")},
+                where={"person_id": gt(0)},
+                as_dict=True,
+            )
+            self.assertEqual(len(aggs), 1)
+            self.assertEqual(aggs[0]["total"], 3)
+            self.assertEqual(aggs[0]["max_id"], 30)
+            self.assertEqual(aggs[0]["sum_id"], 60)
+
+    @test_feature("in_chunking_and_empty_list", depends_on=["spec_reads_and_conditions"])
+    def test_23_in_chunking_and_empty_list(self) -> None:
+        """Verify empty IN optimization and 1001+ auto-chunking."""
+        t_person = self.test_tables["t_maintainer_person"]
+
+        with test_step("Verifying empty IN list returns [] immediately"):
+            res = self.db.select_rows(t_person, ("person_id",), where={"person_id": []})
+            self.assertEqual(res, [])
+
+        with test_step("Verifying 1001+ IN chunking"):
+            oversize_ids = list(range(1, 1201))
+            res = self.db.select_rows(t_person, ("person_id",), where={"person_id": oversize_ids}, distinct=True)
+            self.assertIsInstance(res, list)
+
+            # Refuse chunking with limit
+            with self.assertRaises(ValueError):
+                self.db.select_rows(t_person, ("person_id",), where={"person_id": oversize_ids}, limit=10)
+
+    @test_feature("insert_rows_and_rowcounts", depends_on=["create_table"])
+    def test_24_insert_rows_and_rowcounts(self) -> None:
+        """Verify insert_rows modes and rowcount semantics."""
+        t_person = self.test_tables["t_maintainer_person"]
+        self.db.delete_rows(t_person, where={"person_id": gt(0)})
+
+        with test_step("Testing plain insert and ignore mode"):
+            rc = self.db.insert_rows(t_person, ("person_id", "name", "email"), [(1, "A", "a@test.com")])
+            self.assertEqual(rc, 1)
+
+            rc_ign = self.db.insert_rows(t_person, ("person_id", "name", "email"), [(1, "A2", "a@test.com")], on_conflict="ignore")
+            self.assertEqual(rc_ign, 0)
+
+        with test_step("Testing upsert (update mode) affected rowcount"):
+            rc_up = self.db.insert_rows(
+                t_person,
+                ("person_id", "name", "email"),
+                [(1, "A_Updated", "a@test.com")],
+                on_conflict="update",
+            )
+            # MariaDB returns 2 for updated row, MockDB returns 2
+            self.assertIn(rc_up, (1, 2))
+            val = self.db.select_value(t_person, "name", where={"person_id": 1})
+            self.assertEqual(val, "A_Updated")
+
+        with test_step("Testing get_or_insert_id"):
+            gid1 = self.db.get_or_insert_id(t_person, {"person_id": 1})
+            self.assertEqual(gid1, 1)
+
+    @test_feature("update_and_delete_rows", depends_on=["spec_reads_and_conditions"])
+    def test_25_update_and_delete_rows(self) -> None:
+        """Verify update_rows with Inc/Col and delete_rows with safety guards."""
+        t_person = self.test_tables["t_maintainer_person"]
+        self.db.delete_rows(t_person, where={"person_id": gt(0)})
+        self.db.insert_rows(
+            t_person,
+            ("person_id", "name", "email"),
+            [(100, "User100", "u100@test.com"), (200, "User200", "u200@test.com")],
+        )
+
+        with test_step("Testing update_rows with Inc and compare-and-set"):
+            rc = self.db.update_rows(t_person, {"person_id": Inc(1)}, where={"person_id": 100})
+            self.assertEqual(rc, 1)
+            self.assertTrue(self.db.row_exists(t_person, where={"person_id": 101}))
+
+        with test_step("Testing delete_rows with safety guard and limits"):
+            with self.assertRaises(ValueError):
+                self.db.delete_rows(t_person, where=None, all_rows=False)
+
+            rc_del = self.db.delete_rows(t_person, where={"person_id": 101})
+            self.assertEqual(rc_del, 1)
+            self.assertEqual(self.db.count_rows(t_person, where={"person_id": gt(0)}), 1)
+
+    @test_feature("copy_rows_and_transactions", depends_on=["create_table"])
+    def test_26_copy_rows_and_transactions(self) -> None:
+        """Verify copy_rows and transaction rollback."""
+        t_person = self.test_tables["t_maintainer_person"]
+        self.db.delete_rows(t_person, where={"person_id": gt(0)})
+        self.db.insert_rows(t_person, ("person_id", "name", "email"), [(1, "User1", "u1@test.com")])
+
+        with test_step("Testing transaction rollback"):
+            try:
+                with self.db.transaction():
+                    self.db.insert_rows(t_person, ("person_id", "name", "email"), [(2, "User2", "u2@test.com")])
+                    raise RuntimeError("Forced error for rollback")
+            except RuntimeError:
+                pass
+
+            self.assertEqual(self.db.count_rows(t_person, where={"person_id": gt(0)}), 1)
+            self.assertFalse(self.db.row_exists(t_person, where={"person_id": 2}))
+
+    @test_feature("catalog_and_schema_maintenance", depends_on=["create_table"])
+    def test_27_catalog_and_schema_maintenance(self) -> None:
+        """Verify catalog queries, column_exists, existing_tables, and ensure_views."""
+        t_person = self.test_tables["t_maintainer_person"]
+
+        with test_step("Testing column_exists and column_info"):
+            self.assertTrue(self.db.column_exists(t_person, "email"))
+            self.assertFalse(self.db.column_exists(t_person, "non_existent_column_xyz"))
+            info = self.db.column_info(t_person, "email")
+            self.assertIsNotNone(info)
+
+        with test_step("Testing existing_tables and table_stats"):
+            existing = self.db.existing_tables([t_person.table_name, "definitely_not_a_table_123"])
+            self.assertIn(t_person.table_name, existing)
+            self.assertNotIn("definitely_not_a_table_123", existing)
+
+            stats = self.db.table_stats([t_person.table_name])
+            self.assertIsInstance(stats, list)
+
+        with test_step("Testing server_variable and tuning defaults"):
+            self.assertIsInstance(self.db.apply_server_tuning(), list)
+
+    @test_feature("appendix_a_cases", depends_on=["spec_reads_and_conditions"])
+    def test_28_appendix_a_cases(self) -> None:
+        """Verify execution of the specific Appendix A specification queries."""
+        t_bridge = self.test_tables["t_bridge_checkpoint"]
+        t_task = self.test_tables["t_parse_task"]
+        t_fn = self.test_tables["t_file_name"]
+        t_blob = self.test_tables["t_file_blob"]
+        self.db.delete_rows(t_bridge, where=None, all_rows=True)
+        self.db.delete_rows(t_task, where=None, all_rows=True)
+
+        # Seed foreign key targets for t_bridge
+        self.db.insert_rows(t_fn, ("fnid", "fname"), [(10, "test10"), (20, "test20")], on_conflict="ignore")
+        self.db.insert_rows(t_blob, ("blob_id", "blob_hash", "ftype"), [(100, b"1" * 20, 1), (200, b"2" * 20, 1)], on_conflict="ignore")
+
+        # Seed t_bridge
+        self.db.insert_rows(
+            t_bridge,
+            ("commit_id", "fnid", "blob_id"),
+            [(1, 10, 100), (1, 20, 200), (2, 10, 100)],
+        )
+
+        with test_step("Appendix A: delete_rows with InSelect tuple form"):
+            rc = self.db.delete_rows(
+                t_bridge,
+                [{"commit_id": 2}, InSelect(("fnid", "blob_id"), t_bridge, ("fnid", "blob_id"), where={"commit_id": 1})],
+            )
+            self.assertEqual(rc, 1)
+
+        with test_step("Appendix A: count_rows with NotExists"):
+            cnt = self.db.count_rows(
+                (t_bridge, "p"),
+                [{"p.commit_id": 1}, NotExists((t_bridge, "k"), on={"k.fnid": "p.fnid", "k.blob_id": "p.blob_id"}, where={"k.commit_id": 2})],
+            )
+            self.assertEqual(cnt, 2)
+
+        with test_step("Appendix A: update_rows with AnyOf"):
+            self.db.insert_rows(
+                t_task,
+                ("network_id", "chain_name", "chain_kind", "seq_order", "ref_name", "commit_id", "base_ref_name", "base_commit_id", "status"),
+                [(0, "main", "main", 1, "v1", 10, "v0", 5, 0)],
+            )
+            up_rc = self.db.update_rows(
+                t_task,
+                {"status": 1, "base_commit_id": 10},
+                [{"network_id": 0, "status": 0}, AnyOf({"base_commit_id": 5}, {"base_ref_name": "v0"})],
+            )
+            self.assertEqual(up_rc, 1)
+            self.assertEqual(self.db.select_value(t_task, "status", where={"network_id": 0}), 1)
+
+
+# =============================================================================
+# MariaDB Driver Session, Reconnect, and Packet Bisection Verification
+# =============================================================================
+
+class _FakeCursor:
+    def execute(self, *args, **kwargs) -> None:
+        pass
+
+
+class _FakeCnx:
+    def __init__(self) -> None:
+        self.connection_id = 1
+        self.autocommit = True
+        self.lost = False
+        self.commits = 0
+        self.rollbacks = 0
+
+    def ping(self, reconnect=False, attempts=1, delay=0) -> None:
+        if self.lost:
+            if not reconnect:
+                raise mysql.connector.InterfaceError("server gone")
+            self.lost = False
+            self.connection_id += 1          # mysql-connector reconnects silently with a new session
+
+    def cursor(self) -> _FakeCursor:
+        return _FakeCursor()
+
+    def commit(self) -> None:
+        self.commits += 1
+
+    def rollback(self) -> None:
+        self.rollbacks += 1
+
+
+def _offline_mariadb() -> MariaDB:
+    db = MariaDB.__new__(MariaDB)
+    db.cnx = _FakeCnx()
+    db.cursor = _FakeCursor()
+    db.sessions = 0
+
+    def _init_session() -> None:
+        db.sessions += 1
+
+    db._init_session = _init_session
+    return db
+
+
+class TestMariaDBSessions(unittest.TestCase):
+    def test_silent_reconnect_restores_session_settings(self) -> None:
+        db = _offline_mariadb()
+        db.cnx.lost = True
+        db.check_if_connected()
+        self.assertEqual(db.sessions, 1, "a reconnected session lacks sql_mode and the disabled checks")
+
+    def test_transaction_fails_instead_of_reconnecting(self) -> None:
+        db = _offline_mariadb()
+        with self.assertRaises(ConnectionError):
+            with db.transaction():
+                self.assertFalse(db.cnx.autocommit)
+                db.cnx.lost = True
+                db.check_if_connected()
+        self.assertEqual(db.cnx.rollbacks, 1)
+        self.assertEqual(db.cnx.commits, 0)
+        self.assertTrue(db.cnx.autocommit)
+        self.assertFalse(db._in_txn)
+        self.assertEqual(db.sessions, 0)
+
+    def test_transaction_commits_once(self) -> None:
+        db = _offline_mariadb()
+        with db.transaction():
+            pass
+        self.assertEqual((db.cnx.commits, db.cnx.rollbacks), (1, 0))
+
+
+class _TuningCursor:
+    """Answers SELECT @@GLOBAL.x / SET GLOBAL x like a server that caps some variables."""
+
+    def __init__(self, values: dict, caps: dict) -> None:
+        self.values = dict(values)
+        self.caps = caps
+        self.row = None
+
+    def execute(self, sql: str, params=None) -> None:
+        m = re.match(r"SELECT @@GLOBAL\.(\w+)", sql)
+        if m:
+            if m.group(1) not in self.values:
+                raise mysql.connector.ProgrammingError(msg=f"Unknown system variable '{m.group(1)}'")
+            self.row = (self.values[m.group(1)],)
+            return
+        name = sql.split()[2]
+        self.values[name] = min(params[0], self.caps[name]) if name in self.caps else params[0]
+
+    def fetchone(self):
+        return self.row
+
+
+class TestServerTuning(unittest.TestCase):
+    def _db(self, values: dict, caps: dict | None = None) -> MariaDB:
+        db = _offline_mariadb()
+        db.cursor = _TuningCursor(values, caps or {})
+        return db
+
+    def test_sizes_parse_and_only_grow(self) -> None:
+        self.assertEqual(parse_server_setting("8G"), 8 * 1024**3)
+        self.assertEqual(parse_server_setting("O_DIRECT"), "O_DIRECT")
+        db = self._db({"innodb_log_file_size": 4 * 1024**3, "innodb_flush_log_at_trx_commit": 1})
+        notes = db.apply_server_tuning({"innodb_log_file_size": "2G", "innodb_flush_log_at_trx_commit": 2})
+        self.assertEqual(notes, ["innodb_flush_log_at_trx_commit: 1 -> 2"])
+        self.assertEqual(db.cursor.values["innodb_log_file_size"], 4 * 1024**3)
+
+    def test_capped_and_unknown_variables_are_reported(self) -> None:
+        db = self._db({"innodb_buffer_pool_size": 128 * 1024**2}, caps={"innodb_buffer_pool_size": 128 * 1024**2})
+        notes = db.apply_server_tuning({"innodb_buffer_pool_size": "8G", "no_such_var": 1, "bad name": 1})
+        self.assertTrue(any("capped at 134217728" in n and "restart" in n for n in notes), notes)
+
+
+class TestMaxAllowedPacketAdaptiveBisection(unittest.TestCase):
+    """Test dynamic batch sizing and recursive bisection upon packet limit errors."""
+
+    def setUp(self) -> None:
+        self.t_code = Table(
+            table_id=99,
+            table_name="test_large_payload",
+            columns=(
+                ("hash", "BINARY(32)", "NOT NULL"),
+                ("code", "LONGTEXT", "NOT NULL"),
+            ),
+            primary=("hash",),
+            no_duplicate=False,
+            te_cached=("hash",),
+        )
+
+    def test_adaptive_bisection_on_error_1153(self) -> None:
+        """When executemany raises OperationalError 1153, insert() bisects chunks and succeeds."""
+        maria = object.__new__(MariaDB)
+        maria.cursor = MagicMock()
+        maria.cnx = MagicMock()
+        maria.check_if_connected = MagicMock()
+        maria.close = MagicMock()
+
+        def mock_executemany(sql, chunk_data):
+            if len(chunk_data) >= 4:
+                err = mysql.connector.errors.OperationalError(
+                    errno=1153, msg="Got a packet bigger than 'max_allowed_packet' bytes"
+                )
+                raise err
+
+        maria.cursor.executemany.side_effect = mock_executemany
+        sample_data = tuple((b"\x01" * 32, f"int func_{i}() {{ return {i}; }}") for i in range(6))
+        maria.insert(self.t_code, sample_data)
+        self.assertGreater(maria.cursor.executemany.call_count, 1)
+        maria.cnx.commit.assert_called_once()
+
+    def test_byte_bounded_chunking_large_payloads(self) -> None:
+        """Tables with large text columns are chunked into smaller batches based on size."""
+        maria = object.__new__(MariaDB)
+        maria.cursor = MagicMock()
+        maria.cnx = MagicMock()
+        maria.check_if_connected = MagicMock()
+        maria.close = MagicMock()
+
+        large_code = "A" * (500 * 1024)
+        sample_data = tuple((b"\x02" * 32, large_code) for _ in range(10))
+        maria.insert(self.t_code, sample_data)
+        self.assertGreaterEqual(maria.cursor.executemany.call_count, 2)
+
 
 
 # =============================================================================

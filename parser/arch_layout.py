@@ -24,10 +24,12 @@ uses `x86_64` (arch/x86_64/, include/asm-x86_64/) at v2.6.12 and `x86` at v3.0; 
 """
 from __future__ import annotations
 
+import hashlib
 import logging
 import posixpath
 import shlex
 from collections.abc import Callable, Iterable
+from typing import Any
 from dataclasses import dataclass, field
 
 from parser.kconfig_ast.kconfig_model import arch_aliases
@@ -48,17 +50,26 @@ def path_arch(path: str) -> str | None:
     """Architecture tree holding `path`: `arch/<a>/...`, or `include/asm-<a>/...` (the arch headers
     before they moved to arch/<a>/include/asm/, 2.6.x); None for generic code and include/asm-generic/."""
     parts = (path or "").split("/")
-    if len(parts) > 2:
-        if parts[0] == "arch":
+    if len(parts) >= 2:
+        if parts[0] == "arch" and parts[1] and parts[1] != "Kconfig" and "." not in parts[1]:
             return parts[1]
         if parts[0] == "include" and parts[1].startswith("asm-") and parts[1] != "asm-generic":
             return parts[1][len("asm-"):]
     return None
 
 
+def layout_digest(rows: Iterable[tuple[int, int, str, str]]) -> bytes:
+    """Identity of a layout (m_arch_layout.layout_hash): first 16 bytes of the SHA-256 of its sorted
+    (role, priority, path, target) rows, so equal layouts of different versions are stored once."""
+    h = hashlib.sha256()
+    for role, priority, path, target in sorted(set(rows)):
+        h.update(f"{int(role)}\t{int(priority)}\t{path}\t{target or ''}\n".encode("utf-8", "surrogatepass"))
+    return h.digest()[:16]
+
+
 @dataclass(frozen=True)
 class ArchRoot:
-    """One row of m_arch_root (core/DBLayout.py)."""
+    """One row of a layout (m_arch_layout_entry, core/DBLayout.py)."""
     arch: str
     role: int
     priority: int
@@ -171,6 +182,13 @@ def _sources(ev: MakeEvaluator, srcarch: str, tree: Tree) -> list[str]:
             d = _dir(rel) if w.endswith("/") else _dir(posixpath.dirname(rel))
             if tree.is_dir(d) and not any(d.startswith(o) for o in out):
                 out.append(d)
+    # Ensure sub-architecture directories (e.g. arch/arm/mach-*, arch/arm/plat-*) are properly traversed
+    for prefix in (f"arch/{srcarch}/mach-", f"arch/{srcarch}/plat-"):
+        for d in sorted(tree.glob(f"{prefix}*")):
+            if tree.is_dir(d):
+                d_dir = _dir(d)
+                if d_dir not in out:
+                    out.append(d_dir)
     return out
 
 
@@ -339,3 +357,153 @@ def compute_layouts(files: Iterable[str], read: Callable[[str], str | None], arc
         if layout is not None:
             out[arch] = layout
     return out
+
+
+# --------------------------------------------------------------------------- reuse across versions
+
+_VERSION_LINE = ("VERSION", "PATCHLEVEL", "SUBLEVEL", "EXTRAVERSION", "NAME")
+
+
+def input_key_of(blob_of: Callable[[str], Any], read: Callable[[str], str | None]) -> Callable[[str], Any]:
+    """The key a trace records for a file: its blob, except the top Makefile, whose release lines
+    (`VERSION =`, `PATCHLEVEL =`, `SUBLEVEL =`, `EXTRAVERSION =`, `NAME =`) change with every release and
+    name no path of a layout: the digest of its other lines."""
+    def key(path: str) -> Any:
+        if path != "Makefile":
+            return blob_of(path)
+        text = read(path)
+        if text is None:
+            return None
+        kept = [ln for ln in text.splitlines() if ln.split("=", 1)[0].strip() not in _VERSION_LINE]
+        return "top:" + hashlib.sha1("\n".join(kept).encode("utf-8", "replace")).hexdigest()
+    return key
+
+
+def layout_rows(layout: ArchLayout) -> list[tuple[int, int, str, str]]:
+    """(role, priority, path, target) rows of a layout as m_arch_layout_entry stores them (paths cut to 255)."""
+    return sorted({(r.role, r.priority, r.path[:255], r.target[:255]) for r in layout.rows()})
+
+
+class InputTrace:
+    """Everything one ARCH's evaluation read from a revision, so a later revision can tell whether the same
+    evaluation would give the same layout: every file used (its blob, None when absent) and every tree
+    query with its answer (`is_file`, `is_dir`, `exists`, `glob`). Passed to `layout_for()` as the tree;
+    `read()` is its file reader. Listing the whole tree (`files`, `dirs`) makes the trace unreplayable."""
+
+    def __init__(self, tree: Tree, read: Callable[[str], str | None], blob_of: Callable[[str], Any]) -> None:
+        self._tree = tree
+        self._read = read
+        self._blob_of = blob_of
+        self.entries: dict[tuple[str, str], Any] = {}
+        self.replayable = True
+
+    def note_file(self, path: str) -> None:
+        self.entries.setdefault(("file", path), self._blob_of(path))
+
+    def read(self, path: str) -> str | None:
+        self.note_file(path)
+        return self._read(path)
+
+    def _ask(self, kind: str, arg: str, value: Any) -> Any:
+        self.entries.setdefault((kind, arg), value)
+        return value
+
+    def is_file(self, path: str) -> bool:
+        return self._ask("is_file", path, self._tree.is_file(path))
+
+    def is_dir(self, path: str) -> bool:
+        return self._ask("is_dir", path, self._tree.is_dir(path))
+
+    def exists(self, path: str) -> bool:
+        return self._ask("exists", path, self._tree.exists(path))
+
+    def glob(self, pattern: str) -> list[str]:
+        hits = self._tree.glob(pattern)
+        self._ask("glob", pattern, tuple(hits))
+        return hits
+
+    @property
+    def files(self) -> set[str]:
+        self.replayable = False
+        return self._tree.files
+
+    @property
+    def dirs(self) -> set[str]:
+        self.replayable = False
+        return self._tree.dirs
+
+    def replays(self, tree: Tree, blob_of: Callable[[str], Any]) -> bool:
+        """True when every recorded input has the same answer in `tree` (with its blobs `blob_of`)."""
+        if not self.replayable:
+            return False
+        for (kind, arg), value in self.entries.items():
+            if kind == "file":
+                now = blob_of(arg)
+            elif kind == "glob":
+                now = tuple(tree.glob(arg))
+            else:
+                now = getattr(tree, kind)(arg)
+            if now != value:
+                return False
+        return True
+
+
+class _TracedParsed(dict):
+    """The parsed-makefile cache shared by the ARCH evaluations: a hit is a file use of the current trace."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.trace: InputTrace | None = None
+
+    def __contains__(self, key: object) -> bool:
+        if self.trace is not None and isinstance(key, str):
+            self.trace.note_file(key)
+        return super().__contains__(key)
+
+    def __getitem__(self, key: str) -> Any:
+        if self.trace is not None:
+            self.trace.note_file(key)
+        return super().__getitem__(key)
+
+
+def compute_layout_rows(tree: Tree, read: Callable[[str], str | None], blob_of: Callable[[str], Any],
+                        memo: dict[str, tuple[InputTrace, list | None]] | None = None,
+                        host_machine: str = HOST_MACHINE) -> tuple[dict[str, list], dict[str, tuple[InputTrace, list | None]], int]:
+    """`compute_layouts()` as rows ({arch: layout_rows}), reusing the rows of `memo` (the previous
+    revision's {arch: (trace, rows or None)}) for every ARCH whose trace replays against this tree.
+    `blob_of(path)` is the blob of a file of the tree (None when absent). Returns (rows by ARCH, the memo
+    for the next revision, number of ARCH values reused)."""
+    top = read("Makefile") if tree.is_file("Makefile") else None
+    if top is None:
+        return {}, {}, 0
+    blob_of = input_key_of(blob_of, read)
+    memo = memo or {}
+    out: dict[str, list] = {}
+    new_memo: dict[str, tuple[InputTrace, list | None]] = {}
+    parsed = _TracedParsed()
+    reused = 0
+    for arch in arch_values(tree, top):
+        prev = memo.get(arch)
+        if prev is not None and prev[0].replays(tree, blob_of):
+            reused += 1
+            new_memo[arch] = prev
+            if prev[1] is not None:
+                out[arch] = prev[1]
+            continue
+        trace = InputTrace(tree, read, blob_of)
+        parsed.trace = trace
+        try:
+            layout = layout_for(arch, trace, trace.read, host_machine, parsed)
+        except RecursionError:
+            layout = None
+            logger.warning("ARCH=%s: Makefile evaluation recursed too deeply", arch)
+        except Exception as exc:  # one architecture's Makefiles must not stop the others
+            layout = None
+            logger.warning("ARCH=%s: Makefile evaluation failed: %s", arch, exc)
+        finally:
+            parsed.trace = None
+        rows = layout_rows(layout) if layout is not None else None
+        new_memo[arch] = (trace, rows)
+        if rows is not None:
+            out[arch] = rows
+    return out, new_memo, reused

@@ -102,9 +102,21 @@ from core.DBLayout import (
     m_tag_def,
     m_tag_ref,
     m_blob_symbol,
+    m_blob_symbol_file,
     m_symbol_own,
     m_file_reference,
     m_ast_attribute,
+    m_person_identity,
+    m_commit_release,
+    m_kbuild_symbol,
+    m_cve_commit_hash,
+    m_commit_relation,
+    m_commit_link,
+    m_cve_file,
+)
+from core.encoding import (
+    safe_split_lines,
+    safe_byte_coordinates,
 )
 
 __all__ = [
@@ -195,10 +207,21 @@ __all__ = [
     "m_tag_def",
     "m_tag_ref",
     "m_blob_symbol",
+    "m_blob_symbol_file",
     "m_symbol_own",
     "m_file_reference",
     "m_ast_attribute",
+    "m_person_identity",
+    "m_commit_release",
+    "m_kbuild_symbol",
+    "m_cve_commit_hash",
+    "m_commit_relation",
+    "m_commit_link",
+    "m_cve_file",
     "FileRefType",
     "FILE_REF_TYPE_LABELS",
     "format_ref_type_label",
+    # Encoding
+    "safe_split_lines",
+    "safe_byte_coordinates",
 ]

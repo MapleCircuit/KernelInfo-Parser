@@ -13,6 +13,8 @@
   <link rel="manifest" href="/manifest.json" />
   <link rel="icon" type="image/svg+xml" href="/static/assets/icon.svg" />
 
+  <!-- Theme (G08): set before the stylesheets paint -->
+  <script src="/static/js/theme_boot.js"></script>
   <!-- Design System & Stylesheets -->
   <link rel="stylesheet" href="/static/css/variables.css" />
   <link rel="stylesheet" href="/static/css/layout.css" />
@@ -27,6 +29,10 @@
   <link rel="stylesheet" href="/static/css/modals.css" />
   <link rel="stylesheet" href="/static/css/docs.css" />
   <link rel="stylesheet" href="/static/css/mail.css" />
+  <link rel="stylesheet" href="/static/css/search.css" />
+  <link rel="stylesheet" href="/static/css/status.css" />
+  <link rel="stylesheet" href="/static/css/patch.css" />
+  <link rel="stylesheet" href="/static/css/sections.css" />
 </head>
 <body>
   <div id="app-container">
@@ -74,6 +80,7 @@
           <span class="search-label">Search…</span>
           <kbd>Ctrl K</kbd>
         </button>
+        <button id="watch-bell" class="watch-bell" type="button" title="Watch list" aria-label="Watch list">🔔<span class="watch-bell-count" hidden></span></button>
         <div id="offline-badge" class="offline-badge">
           <span class="badge-dot">●</span>
           <span class="badge-text">Online</span>
@@ -102,6 +109,12 @@
         </button>
         <button class="activity-btn" data-action="mail" title="Mailing List &amp; LKML Threads">
           <svg viewBox="0 0 16 16"><path d="M0 4a2 2 0 0 1 2-2h12a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H2a2 2 0 0 1-2-2V4zm2-1a1 1 0 0 0-1 1v.217l7 4.2 7-4.2V4a1 1 0 0 0-1-1H2zm13 2.383-4.708 2.825L15 11.105V5.383zm-.034 6.876-5.64-3.471L8 9.583l-1.326-.795-5.64 3.47A1 1 0 0 0 2 13h12a1 1 0 0 0 .966-.741zM1 11.105l4.708-2.897L1 5.383v5.722z"/></svg>
+        </button>
+        <button class="activity-btn" data-action="api" title="Kernel API: syscalls, exports, parameters, tracepoints, modules">
+          <svg viewBox="0 0 16 16"><path d="M4.72 3.22a.75.75 0 0 1 1.06 1.06L2.06 8l3.72 3.72a.75.75 0 1 1-1.06 1.06L.47 8.53a.75.75 0 0 1 0-1.06l4.25-4.25zm6.56 0a.75.75 0 1 0-1.06 1.06L13.94 8l-3.72 3.72a.75.75 0 1 0 1.06 1.06l4.25-4.25a.75.75 0 0 0 0-1.06l-4.25-4.25z"/></svg>
+        </button>
+        <button class="activity-btn" data-action="insights" title="Insights: release stats, merge window, subsystem health, stable, security">
+          <svg viewBox="0 0 16 16"><path d="M1.5 14.25V1.75a.75.75 0 0 0-1.5 0v12.5C0 15.216.784 16 1.75 16h12.5a.75.75 0 0 0 0-1.5H1.75a.25.25 0 0 1-.25-.25zM5 12V8.5h2V12H5zm3.5 0V4h2v8h-2zM12 12V6.5h2V12h-2z"/></svg>
         </button>
         <button class="activity-btn" data-action="compare" title="Compare Versions & Commits">
           <svg viewBox="0 0 16 16"><path d="M8.75 1.75V5H6.5L9.5 8 6.5 11h2.25v3.25a.75.75 0 0 1-1.5 0V12.5H2.75A1.75 1.75 0 0 1 1 10.75v-5.5C1 4.28 1.78 3.5 2.75 3.5h4.5V1.75a.75.75 0 0 1 1.5 0zM2.75 5a.25.25 0 0 0-.25.25v5.5c0 .14.11.25.25.25h4.5V5h-4.5zm7.75-1.5h2.75c.97 0 1.75.78 1.75 1.75v5.5c0 .97-.78 1.75-1.75 1.75H10.5V11h2.75a.25.25 0 0 0 .25-.25v-5.5a.25.25 0 0 0-.25-.25H10.5V3.5z"/></svg>

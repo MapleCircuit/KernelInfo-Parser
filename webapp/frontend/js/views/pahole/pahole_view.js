@@ -4,6 +4,8 @@
 import { api } from "../../api.js";
 import { state } from "../../state.js";
 import { escapeHtml } from "../../components/modal.js";
+import { refPicker } from "../../components/ref_picker.js";
+import { compareHtml, historySvg } from "./pahole_compare.js";
 
 export class PaholeView {
   constructor() {
@@ -36,9 +38,12 @@ export class PaholeView {
               <input type="text" id="pahole-search-input" value="${escapeHtml(this.structName)}" placeholder="Struct name..." />
               <button class="code-btn active" id="pahole-search-btn">Analyze</button>
               <button class="code-btn" id="pahole-btn-nodemap" title="Open struct layout in NodeMap">🗺️ Open in NodeMap</button>
+              <button class="code-btn" id="pahole-btn-compare" title="Compare this layout with another revision, member by member (N3)">⇄ Compare with…</button>
+              <button class="code-btn" id="pahole-btn-history" title="Size, holes and cachelines at each release where the definition changed (N3)">📈 History</button>
             </div>
           </div>
 
+          <div id="pahole-extra" class="pcmp-panel" hidden></div>
           <div id="pahole-results-container">
             <div style="color:var(--text-muted);">Analyzing struct layout: struct ${escapeHtml(this.structName)}...</div>
           </div>
@@ -82,7 +87,68 @@ export class PaholeView {
       }
     });
 
+    this.bindOverTime(tabData);
     await this.loadLayout();
+  }
+
+  /** Compare / History panels (N3), restored from the tab (`cmp`, `hist`). */
+  bindOverTime(tabData) {
+    const c = this.containerEl;
+    c.querySelector("#pahole-btn-compare").onclick = (e) => refPicker.open(e.currentTarget, {
+      current: tabData.cmp || "",
+      onSelect: (ref) => this.showCompare(ref),
+    });
+    c.querySelector("#pahole-btn-history").onclick = () => this.showHistory(!state.findTab(this.tabId)?.hist);
+    if (tabData.cmp) this.showCompare(tabData.cmp);
+    else if (tabData.hist) this.showHistory(true);
+  }
+
+  async showCompare(other) {
+    const panel = this.containerEl.querySelector("#pahole-extra");
+    state.updateTabState(this.tabId, { cmp: other, hist: false });
+    panel.hidden = false;
+    panel.innerHTML = `<div class="kconfig-muted">Comparing struct ${escapeHtml(this.structName)} at ${escapeHtml(this.currentVersion)} and ${escapeHtml(other)}…</div>`;
+    try {
+      const res = await api.request(`/api/tools/pahole/compare?${new URLSearchParams({ a: this.currentVersion, b: other, struct: this.structName })}`, { timeoutMs: 60000 });
+      panel.innerHTML = `<div class="pcmp-head"><strong>Layout ${escapeHtml(this.currentVersion)} → ${escapeHtml(other)}</strong><button class="code-btn" type="button" data-close>✕</button></div>${compareHtml(res, this.currentVersion, other)}`;
+    } catch (err) {
+      panel.innerHTML = `<div class="pcmp-head"><span style="color:var(--accent-red);">Compare failed: ${escapeHtml(err.message)}</span><button class="code-btn" type="button" data-close>✕</button></div>`;
+    }
+    this.bindPanelClose(panel);
+  }
+
+  async showHistory(on) {
+    const panel = this.containerEl.querySelector("#pahole-extra");
+    state.updateTabState(this.tabId, { hist: on, cmp: "" });
+    if (!on) {
+      panel.hidden = true;
+      return;
+    }
+    panel.hidden = false;
+    panel.innerHTML = `<div class="kconfig-muted pcmp-progress">Computing the layout at each release where struct ${escapeHtml(this.structName)} changed…</div>`;
+    try {
+      const res = await api.requestJob(`/api/tools/${encodeURIComponent(this.currentVersion)}/pahole/${encodeURIComponent(this.structName)}/history`, {
+        timeoutMs: 120000,
+        onProgress: (p) => { const el = panel.querySelector(".pcmp-progress"); if (el) el.textContent = `Computing ${p?.note || "…"} (${p?.done ?? 0}/${p?.total ?? "?"})…`; },
+      });
+      const missing = res.stops.filter((s) => !s.available).length;
+      panel.innerHTML = `<div class="pcmp-head"><strong>${escapeHtml(res.struct)} over time</strong> <span class="kconfig-muted">${res.stops.length} release${res.stops.length === 1 ? "" : "s"} where the definition changed${missing ? `, ${missing} not indexed` : ""} · bars: holes · hollow points: estimates · click a point to open that layout</span><button class="code-btn" type="button" data-close>✕</button></div>
+        ${historySvg(res.stops) || '<div class="kconfig-muted">No indexed release has this definition.</div>'}`;
+      panel.querySelectorAll("circle[data-version]").forEach((dot) => {
+        dot.addEventListener("click", (e) => state.openTab({ type: "pahole", title: `struct ${this.structName}`, structName: this.structName, version: dot.dataset.version, forceNew: true }));
+      });
+    } catch (err) {
+      panel.innerHTML = `<div class="pcmp-head"><span style="color:var(--accent-red);">History failed: ${escapeHtml(err.message)}</span><button class="code-btn" type="button" data-close>✕</button></div>`;
+    }
+    this.bindPanelClose(panel);
+  }
+
+  bindPanelClose(panel) {
+    const btn = panel.querySelector("[data-close]");
+    if (btn) btn.onclick = () => {
+      panel.hidden = true;
+      state.updateTabState(this.tabId, { cmp: "", hist: false });
+    };
   }
 
   async loadLayout() {
@@ -159,7 +225,7 @@ export class PaholeView {
                 type: "struct",
                 x: 240,
                 y: 120,
-                color: "#58a6ff",
+                color: "var(--accent-blue)",
                 expanded: true,
                 constituents
               }

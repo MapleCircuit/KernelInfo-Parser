@@ -688,3 +688,50 @@
 .treemap-tooltip span {
   color: var(--text-muted);
 }
+
+/* Compare view, API mode (A6, webapp/API.md §5.11) */
+.compare-api-arch { display: flex; gap: 8px; align-items: center; padding: 6px 0; font-size: 12px; }
+.api-diff-sep { width: 12px; }
+.api-diff-list { display: flex; flex-direction: column; font-size: 12px; }
+.api-diff-row { display: grid; grid-template-columns: 18px 92px minmax(160px, 30%) 1fr; gap: 8px; padding: 3px 8px; border-bottom: 1px solid var(--border-color); cursor: pointer; }
+.api-diff-row:hover { background: var(--bg-hover); }
+.api-diff-row.status-added .api-diff-status { color: var(--accent-green); }
+.api-diff-row.status-removed .api-diff-status { color: var(--accent-red); }
+.api-diff-row.status-changed .api-diff-status { color: var(--accent-yellow); }
+.api-diff-kind { color: var(--text-secondary); }
+.api-diff-key { font-family: var(--font-mono, monospace); overflow: hidden; text-overflow: ellipsis; }
+.api-diff-detail { color: var(--text-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* Treemap build overlay (K4, webapp/API.md §5.17) */
+.treemap-legend { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; padding: 4px 12px; font-size: 11px; color: var(--text-secondary); border-bottom: 1px solid var(--border-color); }
+.treemap-legend-item i { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 4px; vertical-align: -1px; }
+.treemap-legend-total { margin-left: auto; color: var(--text-primary); }
+
+/* Call path finder (N2, §4.7) */
+.callpath-panel { margin: 10px 0; padding: 8px 10px; border: 1px solid var(--border-color); border-radius: var(--radius-md); background: var(--bg-secondary); }
+.callpath-form { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; font-size: var(--fs-12, 12px); }
+.callpath-form input { background: var(--bg-primary); color: var(--text-primary); border: 1px solid var(--border-color); border-radius: var(--radius-sm); padding: 3px 6px; font-family: var(--font-mono); min-width: 0; }
+.callpath-form input[type="number"] { width: 4em; }
+.callpath-status { margin: 6px 0; font-size: var(--fs-11, 11px); }
+.callpath-row { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; padding: 4px 0; border-bottom: 1px solid var(--border-color); font-family: var(--font-mono); font-size: var(--fs-12, 12px); }
+.callpath-hop { display: inline-flex; flex-direction: column; padding: 2px 6px; border: 1px solid var(--border-color); border-radius: var(--radius-sm); background: var(--bg-primary); }
+.callpath-site { font-size: var(--fs-10, 10px); color: var(--text-muted); }
+.callpath-arrow { color: var(--text-muted); }
+.callpath-arrow.callpath-indirect { color: var(--accent-yellow); }
+.callpath-arrow.callpath-indirect small { font-size: var(--fs-10, 10px); }
+.callpath-hop.via { border-style: dashed; }
+
+/* Struct layout over time (N3) */
+.pcmp-panel { margin: 10px 0; padding: 8px 10px; border: 1px solid var(--border-color); border-radius: var(--radius-md); background: var(--bg-secondary); }
+.pcmp-head { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-bottom: 6px; }
+.pcmp-head [data-close] { margin-left: auto; }
+.pcmp-summary { font-size: var(--fs-12, 12px); margin-bottom: 6px; }
+.pcmp-scroll { max-height: 420px; overflow: auto; }
+.pcmp-table { width: 100%; border-collapse: collapse; font-size: var(--fs-11, 11px); }
+.pcmp-table th, .pcmp-table td { padding: 2px 6px; border-bottom: 1px solid var(--border-color); text-align: left; white-space: nowrap; }
+.pcmp-table th { position: sticky; top: 0; background: var(--bg-tertiary); color: var(--text-secondary); }
+.pcmp-added .pcmp-status { color: var(--accent-green); }
+.pcmp-removed .pcmp-status { color: var(--accent-red); }
+.pcmp-moved .pcmp-status, .pcmp-resized .pcmp-status { color: var(--accent-yellow); }
+.pcmp-type_changed .pcmp-status { color: var(--accent-purple); }
+.pcmp-same { color: var(--text-muted); }

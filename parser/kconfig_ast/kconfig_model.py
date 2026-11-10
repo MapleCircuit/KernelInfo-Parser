@@ -137,6 +137,11 @@ class ExprTable:
                     return True
                 if op == "!=" and right == ("s", "n"):
                     return True
+            if right == ("s", name):
+                if op == "=" and left in (("s", "y"), ("s", "m")):
+                    return True
+                if op == "!=" and left == ("s", "n"):
+                    return True
         return False
 
     def contains_symbol_negated(self, eid: int | None, name: str) -> bool:
@@ -151,9 +156,11 @@ class ExprTable:
             return self.nodes[node[1]] == ("s", name)
         if op in ("=", "!="):
             left, right = self.nodes[node[1]], self.nodes[node[2]]
-            if left != ("s", name):
-                return False
-            return right == ("s", "n") if op == "=" else right in (("s", "y"), ("s", "m"))
+            if left == ("s", name):
+                return right == ("s", "n") if op == "=" else right in (("s", "y"), ("s", "m"))
+            if right == ("s", name):
+                return left == ("s", "n") if op == "=" else left in (("s", "y"), ("s", "m"))
+            return False
         return False
 
     def conjuncts(self, eid: int | None) -> set[int]:

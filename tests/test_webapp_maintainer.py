@@ -86,6 +86,7 @@ class TestWebAppMaintainerEndpoints(unittest.TestCase):
         self.assertIn("Andrew", res_akpm["person"]["name"])
 
     def test_credits_overview_and_keyword_search(self) -> None:
+        require_indexed_ref("v3.0")
         # Search credits for Linus
         res = get_credits_overview("v3.0", "Linus")
         self.assertIn("credits", res)

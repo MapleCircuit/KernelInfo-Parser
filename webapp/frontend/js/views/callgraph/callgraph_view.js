@@ -36,15 +36,36 @@ export class CallgraphView {
             <input type="text" id="callgraph-input" value="${escapeHtml(this.functionName)}" placeholder="Function name..." />
             <button class="code-btn active" id="callgraph-btn">Explore</button>
             <button class="code-btn" id="callgraph-btn-nodemap" title="Open interactive DAG in NodeMap">🗺️ Open in NodeMap</button>
+            <button class="code-btn" id="callgraph-btn-path" title="Shortest call chains from this function to another (N2)">⇢ Find path to…</button>
+            <button class="code-btn" id="callgraph-btn-ops" title="Indirect callers: the ops tables (struct initializers) that hold this function in a function-pointer field (N1)">🧩 Indirect callers (ops tables)</button>
           </div>
         </div>
 
+        <div id="callgraph-path" class="callpath-panel" hidden>
+          <div class="callpath-form">
+            <span>Path from <code class="callpath-from"></code> to</span>
+            <input type="text" id="callpath-to" placeholder="target function" spellcheck="false" list="callpath-suggest" />
+            <datalist id="callpath-suggest"></datalist>
+            <label class="kconfig-muted">depth <input type="number" id="callpath-depth" min="1" max="10" value="6" /></label>
+            <input type="text" id="callpath-exclude" placeholder="skip: printk, kmalloc" spellcheck="false" title="Functions not to go through (hubs)" />
+            <label class="kconfig-muted" title="Also follow calls through struct members (x->ops->read(...)) to the functions ops tables assign to that field. Matched by field name: approximate, and it widens the search"><input type="checkbox" id="callpath-indirect" /> through ops tables</label>
+            <button class="code-btn active" id="callpath-go" type="button">Find</button>
+            <button class="code-btn" id="callpath-close" type="button" title="Close">✕</button>
+          </div>
+          <div class="callpath-status kconfig-muted" aria-live="polite"></div>
+          <div class="callpath-results"></div>
+        </div>
         <div id="callgraph-results" style="flex:1;display:flex;gap:20px;">
           <div style="color:var(--text-muted);">Loading callgraph...</div>
         </div>
       </div>
     `;
 
+    containerEl.querySelector("#callgraph-btn-ops").onclick = async () => {
+      const { showOpsModal } = await import("../code_view/ops_modal.js");
+      showOpsModal({ version: this.currentVersion, name: this.functionName });
+    };
+    this.bindCallPath(tabData.pathTo || "");
     const btn = containerEl.querySelector("#callgraph-btn");
     const input = containerEl.querySelector("#callgraph-input");
 
@@ -61,6 +82,97 @@ export class CallgraphView {
     });
 
     await this.loadCallgraph();
+  }
+
+  /** Call path finder (N2): `GET /api/tools/{v}/callpath`, shortest chains with the call site of every hop. */
+  bindCallPath(initialTo) {
+    const c = this.containerEl;
+    const panel = c.querySelector("#callgraph-path");
+    const toInput = c.querySelector("#callpath-to");
+    const status = c.querySelector(".callpath-status");
+    const results = c.querySelector(".callpath-results");
+    const open = (show) => {
+      panel.hidden = !show;
+      c.querySelector(".callpath-from").textContent = `${this.functionName}()`;
+      if (show) toInput.focus();
+    };
+    c.querySelector("#callgraph-btn-path").onclick = () => open(panel.hidden);
+    c.querySelector("#callpath-close").onclick = () => {
+      open(false);
+      state.updateTabState(this.tabId, { pathTo: "" });
+    };
+    let suggestTimer = null;
+    toInput.addEventListener("input", () => {
+      clearTimeout(suggestTimer);
+      const q = toInput.value.trim();
+      if (q.length < 3) return;
+      suggestTimer = setTimeout(async () => {
+        try {
+          const res = await api.searchSymbols(this.currentVersion, q, 15);
+          c.querySelector("#callpath-suggest").innerHTML = (res.symbols || []).map((s) => `<option value="${escapeHtml(s.name || s.symbol_name || "")}">`).join("");
+        } catch {
+          // suggestions are optional
+        }
+      }, 250);
+    });
+    const run = async () => {
+      const to = toInput.value.trim();
+      if (!/^[A-Za-z_]\w*$/.test(to)) {
+        status.textContent = "Type a function name";
+        return;
+      }
+      state.updateTabState(this.tabId, { pathTo: to });
+      const params = new URLSearchParams({ from: this.functionName, to, max_depth: c.querySelector("#callpath-depth").value || "6", k: "5" });
+      const exclude = c.querySelector("#callpath-exclude").value.split(/[\s,]+/).filter(Boolean).join(",");
+      if (exclude) params.set("exclude", exclude);
+      const indirect = c.querySelector("#callpath-indirect").checked;
+      if (indirect) params.set("indirect", "1");
+      status.textContent = `Searching call chains ${this.functionName} → ${to}…`;
+      results.innerHTML = "";
+      let res;
+      try {
+        res = await api.requestJob(`/api/tools/${encodeURIComponent(this.currentVersion)}/callpath?${params}`, {
+          // 202 while the revision's source index is assembled (the first search of a revision, §2.19)
+          timeoutMs: 600000, onProgress: (p) => { status.textContent = `Indexing the sources of ${this.currentVersion}: ${p?.note || "…"} ${p?.total ? `${p.done ?? 0}/${p.total}` : ""}`; },
+        });
+      } catch (err) {
+        status.textContent = `Search failed: ${err.message}`;
+        return;
+      }
+      const why = res.timed_out ? " (time limit reached)" : res.budget_exhausted ? " (expansion budget reached)" : "";
+      const missing = !res.found?.from ? ` · ${this.functionName} is not defined or called in this revision` : !res.found?.to ? ` · ${to} is not defined or called in this revision` : "";
+      status.textContent = res.paths.length
+        ? `${res.paths.length} shortest chain${res.paths.length === 1 ? "" : "s"} of ${res.paths[0].length - 1} call${res.paths[0].length === 2 ? "" : "s"} · ${res.explored} functions expanded · ${res.elapsed_ms} ms · ARCH ${res.arch}${indirect ? " · hops through ops tables are dashed (matched by field name)" : " · calls through function pointers are not followed"}`
+        : `No call chain within depth ${res.depth}${why} · ${res.explored} functions expanded${missing}`;
+      results.innerHTML = res.paths.map((p) => `<div class="callpath-row">${p.map((h, i) => {
+        const prev = p[i - 1];
+        const arrow = !i ? "" : prev?.via
+          ? `<span class="callpath-arrow callpath-indirect" title="Through a function pointer: ${escapeHtml(prev.via)}">⇢ <small>${escapeHtml(prev.via)}</small></span>`
+          : '<span class="callpath-arrow">→</span>';
+        return `${arrow}<span class="callpath-hop${prev?.via ? " via" : ""}">
+          <a href="#" data-fn="${escapeHtml(h.function)}" title="Open the call graph of ${escapeHtml(h.function)}${h.file ? ` (static in ${escapeHtml(h.file)})` : ""}">${escapeHtml(h.function)}</a>${h.file ? `<span class="callpath-site" title="A static function or macro of this file">${escapeHtml(h.file.split("/").pop())}</span>` : ""}${h.path ? `<a href="#" class="callpath-site" data-path="${escapeHtml(h.path)}" data-line="${h.line}" title="The call in ${escapeHtml(h.function)}">${escapeHtml(h.path.split("/").pop())}:${h.line}</a>` : ""}</span>`;
+      }).join("")}</div>`).join("");
+    };
+    c.querySelector("#callpath-go").onclick = run;
+    toInput.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") run();
+    });
+    results.addEventListener("click", (e) => {
+      const a = e.target.closest("a");
+      if (!a) return;
+      e.preventDefault();
+      const forceNew = e.ctrlKey || e.metaKey;
+      if (a.dataset.path) {
+        state.openTab({ type: "code", title: a.dataset.path.split("/").pop(), path: a.dataset.path, cursorLine: Number(a.dataset.line), version: this.currentVersion, forceNew });
+      } else if (a.dataset.fn) {
+        state.openTab({ type: "callgraph", title: `Callgraph: ${a.dataset.fn}`, functionName: a.dataset.fn, version: this.currentVersion, forceNew: true });
+      }
+    });
+    if (initialTo) {
+      toInput.value = initialTo;
+      open(true);
+      run();
+    }
   }
 
   async loadCallgraph() {
@@ -98,7 +210,7 @@ export class CallgraphView {
               type: "func",
               x: 420,
               y: 180,
-              color: "#bc8cff"
+              color: "var(--accent-purple)"
             }
           ];
           const initialEdges = [];
@@ -112,7 +224,7 @@ export class CallgraphView {
               type: "func",
               x: 80,
               y: 80 + idx * 120,
-              color: "#a371f7"
+              color: "var(--accent-purple)"
             });
             initialEdges.push({
               fromNodeId: cId,
@@ -129,7 +241,7 @@ export class CallgraphView {
               type: "func",
               x: 760,
               y: 80 + idx * 120,
-              color: "#58a6ff"
+              color: "var(--accent-blue)"
             });
             initialEdges.push({
               fromNodeId: "target-root",

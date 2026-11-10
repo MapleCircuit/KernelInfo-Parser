@@ -5,6 +5,7 @@ from typing import Any
 from fastapi import HTTPException
 from webapp.backend.database.pool import get_db_cursor
 from webapp.backend.database.helpers import (
+    tree_source,
     safe_decode,
     hash_hex,
     get_version_info,
@@ -18,6 +19,8 @@ from parser.maintainer_ast.maintainer_types import (
     MaintainerSection,
 )
 from parser.maintainer_ast.maintainer_matcher import MaintainerMatcher
+from parser.maintainer_ast import maintainer_store
+from parser.git_ast.identity import build_identity_index, clean_name, identity_key, merge_emails
 
 # Bounded: keyed by the requested version, and any revision a caller names (a commit SHA) adds a whole
 # MAINTAINERS model
@@ -26,6 +29,13 @@ _MAINTAINER_CACHE: dict[str, tuple[list[MaintainerSection], MaintainerMatcher]] 
 _FILE_SUBSYSTEMS_CACHE: dict[tuple[str, str], list[dict[str, Any]]] = RepoScopedCache(maxsize=4096)
 # Sections of one MAINTAINERS blob / entries of one CREDITS blob (content addressed, keyed by blob_id)
 _BLOB_SECTIONS_CACHE: dict[int, list[int]] = RepoScopedCache(maxsize=64)
+# Whether m_maintainer_file has the per-section layout (core/DBLayout.py table 19); an older database keyed
+# by MAINTAINERS blob holds incomplete rows, so it is not read
+_MAINT_FILE_LAYOUT: dict[str, bool] = RepoScopedCache(maxsize=2)
+# Whether m_maintainer_section has extended columns (patchwork, bug_url, chat_channel, profile_doc)
+_EXTENDED_SEC_COLS: dict[str, bool] = RepoScopedCache(maxsize=2)
+# Files of a section detail: page size
+SECTION_FILES_LIMIT = 500
 _BLOB_CREDITS_CACHE: dict[int, list[int]] = RepoScopedCache(maxsize=64)
 # (emails, names) of the version's CREDITS entries, for the in_credits flags of resolve_subsystems_for_file
 _CREDITS_KEYS_CACHE: dict[str, tuple[set[str], set[str]]] = RepoScopedCache(maxsize=16)
@@ -35,37 +45,13 @@ _IDENTITY_CACHE: dict[str, Any] = RepoScopedCache(maxsize=4)
 MAX_PATCH_FILES = 200
 
 
-def _clean_name(name: str | None) -> str:
-    """Display form of a persona name: trims whitespace, surrounding quotes and a leaked 'From:' header prefix."""
-    clean = " ".join((name or "").split())
-    if clean[:5].casefold() == "from:":
-        clean = clean[5:].strip()
-    while len(clean) >= 2 and clean[0] == clean[-1] and clean[0] in "\"'":
-        clean = clean[1:-1].strip()
-    return clean
+# Identity rule shared with the parser's release statistics: parser/git_ast/identity.py
+_clean_name = clean_name
+_identity_key = identity_key
 
 
-def _identity_key(name: str | None, email: str | None) -> str:
-    """Normalized identity of a persona: m_maintainer_person holds one row per (name, email) alias,
-    so the same developer appears under several person_ids. Group by case/whitespace-folded name,
-    falling back to the email when the name is empty."""
-    norm_name = _clean_name(name).casefold()
-    if norm_name:
-        return f"n:{norm_name}"
-    return f"e:{(email or '').strip().casefold()}"
-
-
-def _merge_emails(emails: list[str | None]) -> list[str]:
-    """Split comma-joined email fields and return the distinct addresses, first-seen order."""
-    out: list[str] = []
-    seen: set[str] = set()
-    for field in emails:
-        for addr in (field or "").split(","):
-            addr = addr.strip()
-            if addr and addr.casefold() not in seen:
-                seen.add(addr.casefold())
-                out.append(addr)
-    return out
+# Shared with the parser, which stores the index in m_person_identity (parser/git_ast/identity.py)
+_merge_emails = merge_emails
 
 
 def _domain_query(query: str | None) -> str | None:
@@ -105,36 +91,7 @@ def _in_ids(column: str, ids: list[int] | None) -> tuple[str, list[int]]:
     return f"{column} IN ({','.join(['%s'] * len(ids))})", list(ids)
 
 
-def _build_identity_index(personas: Any) -> dict[int, str]:
-    """Map each (person_id, name, email) persona to its identity key.
-
-    Personas group by normalized name. A name-less persona joins the named identity that owns its
-    address; when several named identities use it (typo'd name, nickname), the one using it on the
-    most personas, then the largest, wins. Named identities are never merged with each other by
-    email: shared or mistyped addresses would chain distinct people together."""
-    pid_to_key: dict[int, str] = {}
-    pid_emails: dict[int, list[str]] = {}
-    sizes: dict[str, int] = {}
-    email_owners: dict[str, dict[str, int]] = {}
-    for pid, name, email in personas:
-        key = _identity_key(name, email)
-        pid_to_key[pid] = key
-        pid_emails[pid] = [a.casefold() for a in _merge_emails([email])]
-        sizes[key] = sizes.get(key, 0) + 1
-        if key.startswith("n:"):
-            for addr in pid_emails[pid]:
-                owners = email_owners.setdefault(addr, {})
-                owners[key] = owners.get(key, 0) + 1
-    for pid, key in pid_to_key.items():
-        if not key.startswith("e:"):
-            continue
-        candidates: dict[str, int] = {}
-        for addr in pid_emails[pid]:
-            for owner, cnt in email_owners.get(addr, {}).items():
-                candidates[owner] = candidates.get(owner, 0) + cnt
-        if candidates:
-            pid_to_key[pid] = max(candidates, key=lambda k: (candidates[k], sizes[k], k))
-    return pid_to_key
+_build_identity_index = build_identity_index
 
 
 class MaintainerService:
@@ -148,10 +105,10 @@ class MaintainerService:
             cursor.execute(
                 """
                 SELECT fn.fname, bc.blob_id
-                FROM m_bridge_checkpoint bc
+                FROM m_checkpoint_tree bc
                 JOIN m_file_name fn ON bc.fnid = fn.fnid
                 WHERE bc.commit_id = %s AND fn.fname IN ('MAINTAINERS', 'CREDITS');
-                """,
+                """.replace("m_checkpoint_tree", tree_source(cursor)),
                 (vid,),
             )
             for row in cursor.fetchall():
@@ -176,53 +133,99 @@ class MaintainerService:
 
     @staticmethod
     def _blob_section_ids(cursor: Any, blob_id: int) -> list[int]:
-        """sec_ids of the sections one MAINTAINERS blob holds.
+        """sec_ids of the section versions one MAINTAINERS blob holds, one per section name.
 
-        Sections are content addressed: one unchanged since an earlier MAINTAINERS keeps the row stored
-        with that earlier blob (`m_maintainer_section.blob_id`), so a blob's sections are the rows whose
-        AST is one of the blob's tags. One row per section name, the newest when several share it.
+        Sections are content addressed (an unchanged section keeps the row of an earlier blob) and one
+        AST names every stored version of a section: the version the blob holds is chosen by
+        parser/maintainer_ast/maintainer_store.py, which Step 6.7 uses too.
         """
         cached = _BLOB_SECTIONS_CACHE.get(blob_id)
         if cached is not None:
             return cached
-        cursor.execute(
-            """
-            SELECT MAX(s.sec_id) AS sec_id, s.name
-            FROM m_bridge_tag bt
-            JOIN m_tag t ON t.tag_id = bt.tag_id
-            JOIN m_maintainer_section s ON s.ast_id = t.ast_id
-            WHERE bt.blob_id = %s AND s.sec_id > 0
-            GROUP BY s.ast_id, s.name;
-            """,
-            (blob_id,),
-        )
-        newest: dict[str, int] = {}
-        for r in cursor.fetchall():
-            key = (safe_decode(r["name"]) or "").strip().lower()
-            newest[key] = max(newest.get(key, 0), int(r["sec_id"]))
-        ids = sorted(newest.values())
+        ids = sorted(maintainer_store.blob_section_ids(cursor, blob_id).values())
         _BLOB_SECTIONS_CACHE[blob_id] = ids
         return ids
 
     @staticmethod
     def _blob_credit_ids(cursor: Any, blob_id: int) -> list[int]:
-        """credit_ids of the entries one CREDITS blob holds (found through its tags, as sections are)."""
+        """credit_ids of the entry versions one CREDITS blob holds (chosen as sections are)."""
         cached = _BLOB_CREDITS_CACHE.get(blob_id)
         if cached is not None:
             return cached
-        cursor.execute(
-            """
-            SELECT DISTINCT ce.credit_id
-            FROM m_bridge_tag bt
-            JOIN m_tag t ON t.tag_id = bt.tag_id
-            JOIN m_credits_entry ce ON ce.ast_id = t.ast_id
-            WHERE bt.blob_id = %s AND ce.credit_id > 0;
-            """,
-            (blob_id,),
-        )
-        ids = sorted(int(r["credit_id"]) for r in cursor.fetchall())
+        ids = maintainer_store.blob_credit_ids(cursor, blob_id)
         _BLOB_CREDITS_CACHE[blob_id] = ids
         return ids
+
+    @staticmethod
+    def _section_file_rows_readable(cursor: Any) -> bool:
+        """True when m_maintainer_file has the per-section layout (rows complete per section version)."""
+        hit = _MAINT_FILE_LAYOUT.get("per_section")
+        if hit is not None:
+            return hit
+        try:
+            cursor.execute(
+                "SELECT COUNT(*) AS n FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() "
+                "AND TABLE_NAME = 'm_maintainer_file' AND COLUMN_NAME = 'maintainers_blob_id'"
+            )
+            row = cursor.fetchone() or {}
+            n = row.get("n") if isinstance(row, dict) else row[0]
+        except Exception:  # noqa: BLE001 - unreadable: use the matcher
+            return False
+        if not isinstance(n, int):
+            return False
+        ok = n == 0
+        _MAINT_FILE_LAYOUT["per_section"] = ok
+        return ok
+
+    @staticmethod
+    def _has_extended_section_columns(cursor: Any) -> bool:
+        """True when m_maintainer_section has extended columns (patchwork, bug_url, chat_channel, profile_doc)."""
+        hit = _EXTENDED_SEC_COLS.get("has_cols")
+        if hit is not None:
+            return hit
+        try:
+            cursor.execute(
+                "SELECT COUNT(*) AS n FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() "
+                "AND TABLE_NAME = 'm_maintainer_section' AND COLUMN_NAME = 'patchwork'"
+            )
+            row = cursor.fetchone() or {}
+            n = row.get("n") if isinstance(row, dict) else row[0]
+            ok = bool(isinstance(n, int) and n > 0)
+        except Exception:  # noqa: BLE001 - unreadable: assume standard schema
+            ok = False
+        _EXTENDED_SEC_COLS["has_cols"] = ok
+        return ok
+
+    @staticmethod
+    def _section_select_cols(cursor: Any) -> str:
+        """Columns for SELECT from m_maintainer_section."""
+        if MaintainerService._has_extended_section_columns(cursor):
+            return "s.sec_id, s.name, s.status, s.scm_tree, s.web_page, s.mailing_list, s.ast_id, s.patchwork, s.bug_url, s.chat_channel, s.profile_doc"
+        return "s.sec_id, s.name, s.status, s.scm_tree, s.web_page, s.mailing_list, s.ast_id"
+
+    @staticmethod
+    def _stored_sections_for_paths(cursor: Any, paths: list[str], sec_ids: list[int] | None) -> dict[str, set[int]]:
+        """path -> sec_ids of the version (sec_ids) that m_maintainer_file maps it to; paths without rows
+        (every path matches THE REST, so none means "not computed yet") are left out."""
+        if not paths or not sec_ids or not MaintainerService._section_file_rows_readable(cursor):
+            return {}
+        fmt = ",".join(["%s"] * len(paths))
+        cursor.execute(f"SELECT fnid, fname FROM m_file_name WHERE fname IN ({fmt});", tuple(paths))
+        by_fnid = {int(r["fnid"]): safe_decode(r["fname"]) for r in cursor.fetchall()}
+        if not by_fnid:
+            return {}
+        wanted = set(int(s) for s in sec_ids)
+        out: dict[str, set[int]] = {}
+        fnids = sorted(by_fnid)
+        cursor.execute(
+            f"SELECT fnid, sec_id FROM m_maintainer_file WHERE fnid IN ({','.join(['%s'] * len(fnids))});",
+            tuple(fnids),
+        )
+        for r in cursor.fetchall():
+            sid = int(r["sec_id"])
+            if sid in wanted:
+                out.setdefault(by_fnid[int(r["fnid"])], set()).add(sid)
+        return out
 
     @staticmethod
     def _version_scope(cursor: Any, vid: int | None, vname: str) -> tuple[list[int] | None, list[int] | None]:
@@ -238,17 +241,37 @@ class MaintainerService:
         """(person_id -> identity key, identity key -> person_ids) over m_maintainer_person.
 
         Shared by the Developers directory and the profile modal so both resolve the same aliases.
-        Cached per repository until the persona registry grows."""
+        Read from m_person_identity, which the parser refreshes after each version
+        (parser/git_ast/identity.py); persons registered since its last refresh get their own key
+        (`identity_key()`, without the name-less merge) until the next one. Without stored rows (an older
+        database) the index is computed from the whole registry. Cached per repository until the
+        registry or the stored identities change."""
         cursor.execute("SELECT COUNT(*) AS cnt, MAX(person_id) AS max_id FROM m_maintainer_person;")
         sig_row = cursor.fetchone() or {}
-        sig = (int(sig_row.get("cnt") or 0), int(sig_row.get("max_id") or 0))
+        stored_cnt = stored_max = 0
+        try:
+            cursor.execute("SELECT COUNT(*) AS cnt, MAX(person_id) AS max_id FROM m_person_identity;")
+            st = cursor.fetchone() or {}
+            stored_cnt, stored_max = int(st.get("cnt") or 0), int(st.get("max_id") or 0)
+        except Exception:  # noqa: BLE001 - a database without the table: compute the index
+            stored_cnt = stored_max = 0
+        sig = (int(sig_row.get("cnt") or 0), int(sig_row.get("max_id") or 0), stored_cnt, stored_max)
         cached = _IDENTITY_CACHE.get("index")
         if cached is not None and cached[0] == sig:
             return cached[1], cached[2]
-        cursor.execute("SELECT person_id, name, email FROM m_maintainer_person WHERE person_id > 0;")
-        pid_to_key = _build_identity_index(
-            (int(r["person_id"]), safe_decode(r["name"]), safe_decode(r["email"])) for r in cursor.fetchall()
-        )
+        if stored_cnt:
+            cursor.execute("SELECT person_id, identity_key FROM m_person_identity;")
+            pid_to_key = {int(r["person_id"]): safe_decode(r["identity_key"]) for r in cursor.fetchall()}
+            cursor.execute(
+                "SELECT person_id, name, email FROM m_maintainer_person WHERE person_id > %s;", (stored_max,)
+            )
+            for r in cursor.fetchall():
+                pid_to_key.setdefault(int(r["person_id"]), _identity_key(safe_decode(r["name"]), safe_decode(r["email"])))
+        else:
+            cursor.execute("SELECT person_id, name, email FROM m_maintainer_person WHERE person_id > 0;")
+            pid_to_key = _build_identity_index(
+                (int(r["person_id"]), safe_decode(r["name"]), safe_decode(r["email"])) for r in cursor.fetchall()
+            )
         members: dict[str, list[int]] = {}
         for pid, key in pid_to_key.items():
             members.setdefault(key, []).append(pid)
@@ -284,8 +307,9 @@ class MaintainerService:
             sec_ids, _ = self._version_scope(cursor, vid, vname)
             in_secs, params = _in_ids("s.sec_id", sec_ids)
 
+            cols = self._section_select_cols(cursor)
             sql = f"""
-                SELECT s.sec_id, s.name, s.status, s.scm_tree, s.web_page, s.mailing_list
+                SELECT {cols}
                 FROM m_maintainer_section s
                 WHERE {in_secs}
             """
@@ -358,6 +382,10 @@ class MaintainerService:
                     "scm_tree": safe_decode(s["scm_tree"]),
                     "web_page": safe_decode(s["web_page"]),
                     "mailing_list": safe_decode(s["mailing_list"]),
+                    "patchwork": safe_decode(s.get("patchwork")),
+                    "bug_url": safe_decode(s.get("bug_url")),
+                    "chat_channel": safe_decode(s.get("chat_channel")),
+                    "profile_doc": safe_decode(s.get("profile_doc")),
                     "maintainers": members_by_sec.get(sec_id, []),
                 })
 
@@ -514,6 +542,49 @@ class MaintainerService:
                 "developers": developers,
             }
 
+    def _credited_identities(self, cursor: Any, credit_ids: list[int] | None) -> set[str]:
+        """Identity keys (see _identity_index) of the people with an entry among credit_ids."""
+        if not credit_ids:
+            return set()
+        in_sql, params = _in_ids("credit_id", credit_ids)
+        cursor.execute(f"SELECT DISTINCT person_id FROM m_credits_entry WHERE {in_sql};", tuple(params))
+        pids = [int(r["person_id"]) for r in cursor.fetchall()]
+        pid_to_key, _ = self._identity_index(cursor)
+        return {pid_to_key.get(pid, f"p:{pid}") for pid in pids}
+
+    def _section_files(self, cursor: Any, sec_id: int, vid: int | None, vname: str) -> list[str]:
+        """Sorted paths of the version's tree that the section version covers (m_maintainer_file; both
+        layouts have the sec_id and fnid columns)."""
+        cursor.execute(
+            """
+            SELECT fn.fname
+            FROM m_maintainer_file mf
+            JOIN m_file_name fn ON mf.fnid = fn.fnid
+            WHERE mf.sec_id = %s;
+            """,
+            (sec_id,),
+        )
+        paths = {safe_decode(r["fname"]) for r in cursor.fetchall()}
+        if not paths:
+            return []
+        from webapp.backend.services.tree_resolver import git_tree_resolver
+        tree = git_tree_resolver.list_tree(vname)
+        if tree is not None:
+            return sorted(p for p in paths if p in tree)
+        if vid and vid > 0:
+            cursor.execute(
+                f"""
+                SELECT fn.fname
+                FROM m_maintainer_file mf
+                JOIN {tree_source(cursor)} t ON t.commit_id = %s AND t.fnid = mf.fnid
+                JOIN m_file_name fn ON mf.fnid = fn.fnid
+                WHERE mf.sec_id = %s;
+                """,
+                (vid, sec_id),
+            )
+            return sorted({safe_decode(r["fname"]) for r in cursor.fetchall()})
+        return []
+
     def get_section_detail(self, version_name: str, section_name: str) -> dict[str, Any]:
         """Retrieve subsystem details, pattern rules, and file matches."""
         with get_db_cursor() as cursor:
@@ -521,14 +592,15 @@ class MaintainerService:
             if vid is None:
                 raise HTTPException(status_code=404, detail=f"Version '{version_name}' not found.")
 
-            sec_ids, _ = self._version_scope(cursor, vid, vname)
+            sec_ids, credit_ids = self._version_scope(cursor, vid, vname)
             in_secs_sql, sec_params = _in_ids("s.sec_id", sec_ids)
 
             sec_param = str(section_name).strip()
+            cols = self._section_select_cols(cursor)
             if sec_param.isdigit():
                 cursor.execute(
-                    """
-                    SELECT s.sec_id, s.name, s.status, s.scm_tree, s.web_page, s.mailing_list
+                    f"""
+                    SELECT {cols}
                     FROM m_maintainer_section s
                     WHERE s.sec_id > 0 AND (s.sec_id = %s OR s.name = %s)
                     ORDER BY s.sec_id DESC
@@ -539,7 +611,7 @@ class MaintainerService:
             else:
                 cursor.execute(
                     f"""
-                    SELECT s.sec_id, s.name, s.status, s.scm_tree, s.web_page, s.mailing_list
+                    SELECT {cols}
                     FROM m_maintainer_section s
                     WHERE s.name = %s AND {in_secs_sql}
                     ORDER BY s.sec_id DESC
@@ -553,11 +625,10 @@ class MaintainerService:
 
             sec_id = sec_row["sec_id"]
 
-            # Members
+            # Members; in_credits: an alias of the member has an entry in the version's CREDITS file
             cursor.execute(
                 """
-                SELECT p.person_id, p.name, p.email, m.role_type,
-                       EXISTS(SELECT 1 FROM m_credits_entry c WHERE c.person_id = p.person_id) AS in_credits
+                SELECT p.person_id, p.name, p.email, m.role_type
                 FROM m_maintainer_member m
                 JOIN m_maintainer_person p ON m.person_id = p.person_id
                 WHERE m.sec_id = %s
@@ -565,6 +636,9 @@ class MaintainerService:
                 """,
                 (sec_id,),
             )
+            member_rows = cursor.fetchall()
+            credited = self._credited_identities(cursor, credit_ids)
+            pid_to_key, _ = self._identity_index(cursor) if credited else ({}, {})
             members = [
                 {
                     "person_id": m["person_id"],
@@ -573,9 +647,9 @@ class MaintainerService:
                     "role_type": m["role_type"],
                     "role": "Maintainer" if m["role_type"] == 1 else "Reviewer",
                     "role_name": "Maintainer" if m["role_type"] == 1 else "Reviewer",
-                    "in_credits": bool(m["in_credits"]),
+                    "in_credits": pid_to_key.get(int(m["person_id"]), f"p:{m['person_id']}") in credited,
                 }
-                for m in cursor.fetchall()
+                for m in member_rows
             ]
 
             # Patterns
@@ -597,19 +671,24 @@ class MaintainerService:
                 for r in cursor.fetchall()
             ]
 
-            # Touched / Maintained Files sample
-            cursor.execute(
-                """
-                SELECT DISTINCT fn.fname
-                FROM m_maintainer_file mf
-                JOIN m_file_name fn ON mf.fnid = fn.fnid
-                WHERE mf.sec_id = %s
-                ORDER BY fn.fname ASC
-                LIMIT 500;
-                """,
-                (sec_id,),
-            )
-            files = [{"fname": safe_decode(r["fname"])} for r in cursor.fetchall()]
+            # Files of the section version present in this version's tree (first SECTION_FILES_LIMIT by path)
+            all_files = self._section_files(cursor, int(sec_id), vid, vname)
+            files = [{"fname": f} for f in all_files[:SECTION_FILES_LIMIT]]
+
+            # Extended section attributes (patchwork, bug_url, chat_channel)
+            attrs: dict[str, str] = {}
+            if sec_row.get("ast_id"):
+                cursor.execute(
+                    """
+                    SELECT name, val
+                    FROM m_ast_attribute
+                    WHERE ast_id = %s
+                    ORDER BY priority ASC;
+                    """,
+                    (sec_row["ast_id"],),
+                )
+                for r in cursor.fetchall():
+                    attrs[safe_decode(r["name"])] = safe_decode(r["val"])
 
             sec_dict = {
                 "sec_id": sec_id,
@@ -618,10 +697,15 @@ class MaintainerService:
                 "scm_tree": safe_decode(sec_row["scm_tree"]),
                 "web_page": safe_decode(sec_row["web_page"]),
                 "mailing_list": safe_decode(sec_row["mailing_list"]),
+                "patchwork": safe_decode(sec_row.get("patchwork")) or attrs.get("patchwork", ""),
+                "bug_url": safe_decode(sec_row.get("bug_url")) or attrs.get("bug_url", ""),
+                "chat_channel": safe_decode(sec_row.get("chat_channel")) or attrs.get("chat_channel", ""),
+                "profile_doc": safe_decode(sec_row.get("profile_doc")) or attrs.get("profile_doc", ""),
                 "members": members,
                 "patterns": patterns,
                 "files": files,
-                "file_count": len(files),
+                "file_count": len(all_files),
+                "files_truncated": len(all_files) > len(files),
             }
             return {
                 "version": vname,
@@ -878,9 +962,10 @@ class MaintainerService:
             sec_ids, _ = self._version_scope(cursor, vid, vname)
             in_secs_sql, sec_params = _in_ids("s.sec_id", sec_ids)
 
+            cols = self._section_select_cols(cursor)
             cursor.execute(
                 f"""
-                SELECT s.sec_id, s.name, s.status, s.scm_tree, s.web_page, s.mailing_list
+                SELECT {cols}
                 FROM m_maintainer_section s
                 WHERE {in_secs_sql}
                 ORDER BY s.sec_id DESC;
@@ -905,8 +990,12 @@ class MaintainerService:
                     scm_tree=safe_decode(r["scm_tree"]) or "",
                     web_page=safe_decode(r["web_page"]) or "",
                     mailing_list=safe_decode(r["mailing_list"]) or "",
+                    patchwork=safe_decode(r.get("patchwork")) or "",
+                    bug_url=safe_decode(r.get("bug_url")) or "",
+                    chat_channel=safe_decode(r.get("chat_channel")) or "",
+                    profile_doc=safe_decode(r.get("profile_doc")) or "",
+                    sec_id=sec_id,
                 )
-                setattr(sec, "sec_id", sec_id)
                 sec_map[sec_id] = sec
 
             # Members
@@ -957,6 +1046,39 @@ class MaintainerService:
         _MAINTAINER_CACHE[version_name] = (sections, matcher)
         return sections, matcher
 
+    def sections_for_paths(self, version_name: str, paths: list[str]) -> dict[str, list[MaintainerSection]]:
+        """Sections covering each path, in the matcher's order.
+
+        Database first: m_maintainer_file names the sections of each path (Step 6.7), and a matcher over
+        only those few sections orders them as the full matcher would (sections match independently).
+        Paths without rows (not computed yet, unknown path, a database keyed by MAINTAINERS blob, a
+        revision whose MAINTAINERS was never indexed) use the full matcher."""
+        clean = list(dict.fromkeys(p.strip().lstrip("/") for p in paths if p and p.strip().lstrip("/")))
+        sections, matcher = self.get_maintainer_data(version_name)
+        out: dict[str, list[MaintainerSection]] = {}
+        stored: dict[str, set[int]] = {}
+        if clean and sections:
+            ids = [getattr(sec, "sec_id", None) for sec in sections]
+            try:
+                with get_db_cursor() as cursor:
+                    for i in range(0, len(clean), 500):
+                        stored.update(self._stored_sections_for_paths(cursor, clean[i : i + 500], [x for x in ids if x]))
+            except Exception:  # noqa: BLE001 - the matcher answers every path
+                stored = {}
+        for path in clean:
+            found = stored.get(path)
+            if found:
+                subset = [sec for sec in sections if getattr(sec, "sec_id", None) in found]
+                matched = MaintainerMatcher(subset).match_file(path)
+                if matched:
+                    out[path] = matched
+                    continue
+                elif subset:
+                    out[path] = subset
+                    continue
+            out[path] = matcher.match_file(path)
+        return out
+
     def _credits_keys(self, version_name: str) -> tuple[set[str], set[str]]:
         """Lower-cased emails and names of the version's CREDITS entries, read once per version."""
         keys = _CREDITS_KEYS_CACHE.get(version_name)
@@ -977,10 +1099,12 @@ class MaintainerService:
         cached = _FILE_SUBSYSTEMS_CACHE.get(cache_key)
         if cached is not None:
             return cached
+        matched_secs = self.sections_for_paths(version_name, [file_path]).get(file_path.strip().lstrip("/"), [])
+        return self._subsystems_result(version_name, file_path, matched_secs)
 
-        sections, matcher = self.get_maintainer_data(version_name)
-        matched_secs = matcher.match_file(file_path)
-
+    def _subsystems_result(self, version_name: str, file_path: str, matched_secs: list[MaintainerSection]) -> list[dict[str, Any]]:
+        """Response rows of resolve_subsystems_for_file() for the sections matched_secs (cached)."""
+        cache_key = (version_name, file_path)
         credits_emails, credits_names = self._credits_keys(version_name)
 
         results = []
@@ -1017,6 +1141,10 @@ class MaintainerService:
                 "scm_tree": sec.scm_tree,
                 "web_page": sec.web_page,
                 "mailing_list": sec.mailing_list,
+                "patchwork": getattr(sec, "patchwork", "") or "",
+                "bug_url": getattr(sec, "bug_url", "") or "",
+                "chat_channel": getattr(sec, "chat_channel", "") or "",
+                "profile_doc": getattr(sec, "profile_doc", "") or "",
                 "maintainers": maintainers,
                 "reviewers": reviewers,
             })
@@ -1068,9 +1196,16 @@ class MaintainerService:
         all_lists: set[str] = set()
         all_subsystems: set[str] = set()
 
+        # One database lookup for every file; resolve_subsystems_for_file() then reads its cache
+        uncached = [f for f in touched_files if _FILE_SUBSYSTEMS_CACHE.get((vname, f)) is None]
+        prefetched = self.sections_for_paths(vname, uncached) if len(uncached) > 1 else {}
         file_breakdown = []
         for fpath in touched_files:
-            subs = self.resolve_subsystems_for_file(vname, fpath)
+            key = fpath.strip().lstrip("/")
+            if key in prefetched:
+                subs = _FILE_SUBSYSTEMS_CACHE.get((vname, fpath)) or self._subsystems_result(vname, fpath, prefetched[key])
+            else:
+                subs = self.resolve_subsystems_for_file(vname, fpath)
             file_breakdown.append({
                 "file_path": fpath,
                 "subsystems": subs,

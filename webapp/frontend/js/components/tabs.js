@@ -4,6 +4,7 @@
  * two sessions, & drag-out), the tab right-click menu (elevate into a browser tab of its own, push
  * to another session), and delegates active tab rendering to domain views.
  */
+import { tabRoute } from "../tab_routes.js";
 import { state } from "../state.js";
 import { sessionManager } from "../session_manager.js";
 import { shortRef } from "./ref_picker.js";
@@ -765,7 +766,7 @@ export class TabsComponent {
       case "treemap": return "[T]";
       case "explorer": return "[E]";
       case "mail": return "[L]";
-      default: return "[?]";
+      default: return tabRoute(type)?.badge || "[?]";
     }
   }
 }

@@ -141,8 +141,8 @@
 }
 
 .context-menu-item.danger:hover {
-  background: #e06c75;
-  color: #ffffff;
+  background: var(--accent-rose);
+  color: var(--text-on-accent);
 }
 
 .context-menu-sep {
@@ -390,13 +390,13 @@
 }
 
 .settings-btn.danger {
-  color: #e06c75;
+  color: var(--accent-rose);
 }
 
 .settings-btn.danger:hover {
   background: rgba(224, 108, 117, 0.12);
-  border-color: #e06c75;
-  color: #ff7b72;
+  border-color: var(--accent-rose);
+  color: var(--diff-del-fg);
 }
 
 /* 6. XRef Definition Card */
@@ -423,7 +423,7 @@
   font-size: var(--fs-10, 10px);
   font-weight: 600;
   background: var(--accent-purple);
-  color: #ffffff;
+  color: var(--text-on-accent);
   padding: 2px 6px;
   border-radius: 4px;
   letter-spacing: 0.3px;
@@ -1213,12 +1213,12 @@
 
 .session-btn-open {
   background: var(--accent-blue);
-  color: #fff;
+  color: var(--text-on-accent);
   border: 1px solid transparent;
 }
 
 .session-btn-open:hover {
-  background: #4a94e8;
+  background: var(--accent-blue-strong);
 }
 
 .session-btn-duplicate {
@@ -1251,7 +1251,7 @@
   padding: 5px 12px;
   border-radius: var(--radius-sm);
   background: var(--accent-green);
-  color: #fff;
+  color: var(--text-on-accent);
   border: 1px solid transparent;
   font-size: var(--fs-12, 12px);
   font-weight: 600;
@@ -1260,7 +1260,7 @@
 }
 
 .session-btn-primary:hover {
-  background: #34a853;
+  background: var(--accent-green-strong);
 }
 
 .session-empty-state {
@@ -1269,3 +1269,38 @@
   color: var(--text-secondary);
 }
 
+
+/* Keyboard shortcut overlay (G09, webapp/API.md §5.31.1) */
+.kbd-overlay .ki-modal-body { display: flex; flex-direction: column; gap: 10px; }
+.kbd-search {
+  width: 100%; padding: 6px 10px; background: var(--bg-primary); color: var(--text-primary);
+  border: 1px solid var(--border-color); border-radius: 4px; font-size: 13px;
+}
+.kbd-search:focus { outline: none; border-color: var(--accent-blue); }
+.kbd-group h4 { margin: 8px 0 4px; font-size: 12px; text-transform: uppercase; letter-spacing: 0.04em; color: var(--text-secondary); }
+.kbd-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+.kbd-table td { padding: 4px 6px; border-bottom: 1px solid var(--border-color); vertical-align: middle; }
+.kbd-table tr.customized .kbd-keys kbd { border-color: var(--accent-blue); }
+.kbd-table tr.conflict .kbd-keys kbd { border-color: var(--accent-red); }
+.kbd-desc { color: var(--text-primary); }
+.kbd-keys { white-space: nowrap; text-align: right; }
+.kbd-keys kbd {
+  display: inline-block; min-width: 18px; padding: 1px 6px; margin-left: 3px; border: 1px solid var(--border-color);
+  border-bottom-width: 2px; border-radius: 4px; background: var(--bg-tertiary); color: var(--text-primary);
+  font-family: var(--font-mono, monospace); font-size: 11px; text-align: center;
+}
+.kbd-actions { width: 120px; text-align: right; white-space: nowrap; }
+.kbd-edit, .kbd-reset {
+  padding: 2px 8px; margin-left: 4px; background: var(--bg-tertiary); color: var(--text-secondary);
+  border: 1px solid var(--border-color); border-radius: 4px; cursor: pointer; font-size: 11px;
+}
+.kbd-edit:hover, .kbd-reset:hover { color: var(--text-primary); border-color: var(--accent-blue); }
+.kbd-fixed, .kbd-none { color: var(--text-muted); font-size: 11px; }
+.kbd-capturing { color: var(--accent-yellow); font-size: 11px; }
+.kbd-msg { margin-top: 3px; color: var(--accent-red); font-size: 11px; }
+.kbd-empty { padding: 16px; text-align: center; color: var(--text-muted); }
+
+/* Session export / import (G07) */
+.sx-opts { display: flex; flex-direction: column; gap: 8px; font-size: var(--fs-12, 12px); }
+.sx-opts label { display: flex; align-items: center; gap: 6px; cursor: pointer; }
+.si-table select { background: var(--bg-primary); color: var(--text-primary); border: 1px solid var(--border-color); border-radius: var(--radius-sm); }

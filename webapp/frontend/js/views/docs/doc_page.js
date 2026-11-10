@@ -96,11 +96,16 @@ export class DocPage {
     this.fillToctreeTitles();
     this.renderRelated();
     this.hydrateImages();
-    this.hydrateKernelDoc();
+    const kdocPromise = this.hydrateKernelDoc();
     this.resolveCrossDocRefs();
 
-    if (this.opts.anchor) this.scrollToId(this.opts.anchor, false);
-    return { title };
+    if (this.opts.anchor) {
+      this.scrollToId(this.opts.anchor, false);
+      kdocPromise.then(() => {
+        if (this.opts.anchor) this.scrollToId(this.opts.anchor, false);
+      });
+    }
+    return { title, ready: kdocPromise };
   }
 
   renderToc(toc, maxLevel) {

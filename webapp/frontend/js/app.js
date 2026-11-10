@@ -11,6 +11,8 @@ import { contextMenu } from "./components/context_menu.js";
 import { refPicker, shortRef, isCommitRef } from "./components/ref_picker.js";
 import { requestVersionSwitch, openVersionInNewTab } from "./components/version_switch.js";
 import { commandPalette } from "./components/command_palette.js";
+import { shortcuts } from "./utils/shortcuts.js";
+import { showShortcutsOverlay } from "./components/shortcuts_overlay.js";
 import { showPatchModal } from "./components/patch_modal.js";
 import { showSymbolHistoryModal } from "./components/symbol_history_modal.js";
 import { localDB } from "./db.js";
@@ -30,6 +32,55 @@ import { DiffView } from "./views/diff/diff_view.js";
 import { TreemapView } from "./views/treemap/treemap_view.js";
 import { ExplorerView } from "./views/explorer/explorer_view.js";
 import { MailView } from "./views/mail/mail_view.js";
+import { SearchView } from "./views/search/search_view.js";
+import { StatusView } from "./views/status/status_view.js";
+import { PatchSeriesView } from "./views/patch/patch_series_view.js";
+import { BookmarksView } from "./views/bookmarks/bookmarks_view.js";
+import { WatchView } from "./views/watch/watch_view.js";
+import { initWatchRuntime } from "./views/watch/watch_runtime.js";
+import { KernelApiView, apiSections } from "./views/kernel_api/kernel_api_view.js";
+import { InsightsView, insightsSections } from "./views/insights/insights_view.js";
+import "./views/sections/all_sections.js";
+import { statusLine } from "./views/status/status_model.js";
+import { STICKY_KEY, stickyEnabled } from "./views/code_view/outline_panel.js";
+import "./routes.js";
+import { exportDocument, importRecords, mergeImport } from "./utils/user_records.js";
+import { THEMES, applyTheme, savedTheme } from "./utils/theme.js";
+
+/** Settings → Export User Data (S06): every user record as a `kip-user` JSON document. */
+async function exportUserData() {
+  const records = await localDB.userList();
+  const blob = new Blob([JSON.stringify(exportDocument(records), null, 1)], { type: "application/json" });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = `kernelinfo-user-data-${new Date().toISOString().slice(0, 10)}.json`;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+  toast.success(`Exported ${records.length} user record${records.length === 1 ? "" : "s"}`);
+}
+
+/** Settings → Import User Data: adds the records of an export; records already here are kept. */
+function importUserData() {
+  const input = document.createElement("input");
+  input.type = "file";
+  input.accept = "application/json,.json";
+  input.onchange = async () => {
+    const file = input.files?.[0];
+    if (!file) return;
+    try {
+      const incoming = importRecords(JSON.parse(await file.text()));
+      const existing = new Map((await localDB.userList()).map((r) => [r.key, r]));
+      const { put, skipped } = mergeImport(existing, incoming, "skip-existing");
+      for (const r of put) await localDB.userPut(r);
+      toast.success(`Imported ${put.length} user record${put.length === 1 ? "" : "s"}${skipped ? ` (${skipped} already here, kept)` : ""}`);
+    } catch (err) {
+      toast.error(`Import failed: ${err.message}`);
+    }
+  };
+  input.click();
+}
 
 /** Per-browser UI preference: whether the left explorer sidebar is collapsed. */
 const SIDEBAR_COLLAPSED_KEY = "kernel_ide_sidebar_collapsed";
@@ -51,7 +102,14 @@ class KernelIdeApp {
       pahole: () => new PaholeView(),
       callgraph: () => new CallgraphView(),
       diff: () => new DiffView(),
-      treemap: () => new TreemapView()
+      treemap: () => new TreemapView(),
+      search: () => new SearchView(),
+      status: () => new StatusView(),
+      patch: () => new PatchSeriesView(),
+      bookmarks: () => new BookmarksView(),
+      watch: () => new WatchView(),
+      api: () => new KernelApiView(),
+      insights: () => new InsightsView()
     };
   }
 
@@ -86,6 +144,8 @@ class KernelIdeApp {
     // 4. Mount Multi-Tab Split-Pane Workspace
     const workspaceEl = document.getElementById("workspace");
     this.tabsComponent = new TabsComponent(workspaceEl, this.viewRenderers);
+    // Watch list (G10): bell count and checks when a watched branch moves
+    initWatchRuntime();
     this.tabsComponent.render();
 
     // 4a. Initialize Multi-Window Workspace Sessions
@@ -109,6 +169,18 @@ class KernelIdeApp {
     // 7. Command palette (Ctrl+K / Ctrl+P search, Ctrl+Shift+P commands)
     commandPalette.setCommandProvider(() => this.paletteCommands());
     commandPalette.init();
+
+    // Keyboard shortcuts (§5.31): one capture listener; the scope is the open dialog or the active tab's type
+    shortcuts.setContextProvider(() => {
+      const tab = state.getActiveTab();
+      return {
+        tab,
+        tabType: tab?.type || null,
+        view: tab ? this.tabsComponent?.perTabViews?.get(tab.id) || null : null,
+        modal: Boolean(document.querySelector(".ki-modal-backdrop")),
+      };
+    });
+    shortcuts.install(document);
     document.getElementById("global-search-btn")?.addEventListener("click", () => commandPalette.open(""));
 
     // Re-render tabs and sidebar when global version changes
@@ -429,6 +501,8 @@ class KernelIdeApp {
     const commitsCount = storeCounts.commits || 0;
     const toolsCount = storeCounts.tools || 0;
     const totalCachedItems = filesCount + symbolsCount + kconfigsCount + maintainersCount + commitsCount + toolsCount;
+    // User data (S06): never pruned, never part of the cache clears
+    const userCount = storeCounts.user || 0;
 
     const tabsCount = Array.isArray(state.tabs)
       ? state.tabs.length
@@ -481,10 +555,45 @@ class KernelIdeApp {
               <span style="font-size:10px;color:var(--accent-green);font-weight:500;">● Synced</span>
             </div>
 
+            <button class="settings-btn" id="btn-parser-status" title="Open the parser status page (G11)">
+              <span id="settings-parser-line" style="font-size:11px;">⛏ Parser: …</span>
+              <span style="font-size:10px;color:var(--text-muted);">status page &rarr;</span>
+            </button>
+
+            <button class="settings-btn" id="btn-keyboard-shortcuts" title="List every keyboard shortcut and rebind them">
+              <span>⌨ Keyboard Shortcuts</span>
+              <span style="font-size:10px;color:var(--text-muted);">${escapeHtml(shortcuts.label("help.shortcuts") || "?")}</span>
+            </button>
+
             <button class="settings-btn" id="btn-check-updates" ${isOnline ? "" : "disabled"} title="Sync with the server now (frontend build, database, parsed versions, Git refs, repositories) and restart the page when an update is found">
               <span>🔄 Check for Updates</span>
               <span id="check-updates-status" style="font-size:10px;color:var(--text-muted);">${isOnline ? "&rarr;" : linkDown ? "Offline" : "Unreachable"}</span>
             </button>
+          </div>
+        </div>
+
+        <!-- Theme (G08) -->
+        <div>
+          <div class="settings-section-title">Theme</div>
+          <select id="setting-theme" style="width:100%;background:var(--bg-primary);color:var(--text-primary);border:1px solid var(--border-color);border-radius:var(--radius-sm);padding:4px 6px;">
+            ${THEMES.map(([id, label]) => `<option value="${id}" ${savedTheme() === id ? "selected" : ""}>${label}</option>`).join("")}
+          </select>
+        </div>
+
+        <!-- Hover cards (G04) -->
+        <div>
+          <div class="settings-section-title">Hover Cards</div>
+          <div style="display:flex;flex-direction:column;gap:8px;background:var(--bg-primary);padding:10px 12px;border-radius:var(--radius-md);border:1px solid var(--border-color);">
+            <label style="display:flex;align-items:center;gap:6px;font-size:11px;color:var(--text-secondary);cursor:pointer;">
+              <input type="checkbox" id="setting-hover-enabled" ${localStorage.getItem("kip-hover-cards") === "0" ? "" : "checked"} /> Show a card when the pointer rests on a symbol
+            </label>
+            <div>
+              <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;">
+                <label for="setting-hover-delay" style="font-size:11px;font-weight:600;color:var(--text-secondary);">Delay</label>
+                <span id="setting-hover-delay-val" style="font-size:11px;font-family:var(--font-mono);color:var(--accent-blue);">${parseInt(localStorage.getItem("kip-hover-delay") || "450", 10)} ms</span>
+              </div>
+              <input type="range" id="setting-hover-delay" min="300" max="1000" step="50" value="${parseInt(localStorage.getItem("kip-hover-delay") || "450", 10)}" style="width:100%;cursor:pointer;" />
+            </div>
           </div>
         </div>
 
@@ -519,6 +628,10 @@ class KernelIdeApp {
                 <span>160%</span>
               </div>
             </div>
+
+            <label style="display:flex;align-items:center;gap:6px;font-size:11px;color:var(--text-secondary);cursor:pointer;" title="Pin the first line of the function or struct being read at the top of the code view (G03)">
+              <input type="checkbox" id="setting-sticky-scroll" ${stickyEnabled() ? "checked" : ""} /> Sticky scroll (pin the enclosing definition)
+            </label>
 
             <button class="settings-reset-font-btn" id="btn-reset-fonts" style="align-self:flex-start;padding:3px 8px;font-size:10px;cursor:pointer;border:1px solid var(--border-color);background:var(--bg-tertiary);color:var(--text-secondary);border-radius:var(--radius-sm);transition:var(--transition-fast);">Reset to Defaults</button>
           </div>
@@ -555,6 +668,10 @@ class KernelIdeApp {
               <div class="settings-metric-val">${toolsCount}</div>
               <div class="settings-metric-lbl">Tools</div>
             </div>
+            <div class="settings-metric-card" title="Bookmarks, notes, tours and watches you made: not part of the offline cache, never pruned">
+              <div class="settings-metric-val">${userCount}</div>
+              <div class="settings-metric-lbl">User data</div>
+            </div>
           </div>
         </div>
 
@@ -568,6 +685,7 @@ class KernelIdeApp {
             <button class="settings-chip-btn" data-store="maintainers">Clear Maintainers</button>
             <button class="settings-chip-btn" data-store="commits">Clear Commits</button>
             <button class="settings-chip-btn" data-store="tools">Clear Tools</button>
+            <button class="settings-chip-btn" id="btn-clear-user" ${userCount ? "" : "disabled"} title="Delete your bookmarks, notes, tours and watches (asks first)">Clear User Data</button>
           </div>
         </div>
 
@@ -577,6 +695,14 @@ class KernelIdeApp {
           <div class="settings-actions">
             <button class="settings-btn" id="btn-clear-cache">
               <span>🧹 Clear All Offline Cache (IndexedDB)</span>
+              <span style="font-size:10px;color:var(--text-muted);">&rarr;</span>
+            </button>
+            <button class="settings-btn" id="btn-export-user" title="Download your bookmarks, notes, tours and watches as JSON">
+              <span>⬇ Export User Data (${userCount})</span>
+              <span style="font-size:10px;color:var(--text-muted);">&rarr;</span>
+            </button>
+            <button class="settings-btn" id="btn-import-user" title="Add bookmarks, notes, tours and watches from an export (existing ones are kept)">
+              <span>⬆ Import User Data…</span>
               <span style="font-size:10px;color:var(--text-muted);">&rarr;</span>
             </button>
             <button class="settings-btn" id="btn-reset-tabs">
@@ -610,6 +736,34 @@ class KernelIdeApp {
     popover.querySelector("#close-settings-btn").onclick = closePopover;
 
     popover.querySelector("#btn-check-updates").onclick = (e) => this.checkForUpdates(e.currentTarget);
+    popover.querySelector("#setting-sticky-scroll").onchange = (e) => {
+      try {
+        if (e.target.checked) localStorage.removeItem(STICKY_KEY);
+        else localStorage.setItem(STICKY_KEY, "off");
+      } catch {
+        // storage unavailable: the choice lasts for this page
+      }
+      document.querySelectorAll(".code-sticky").forEach((el) => { if (!e.target.checked) el.hidden = true; });
+      document.dispatchEvent(new CustomEvent("code:sticky-changed"));
+    };
+    popover.querySelector("#btn-parser-status").onclick = () => {
+      closePopover();
+      state.openTab({ type: "status", title: "Parser status" });
+    };
+    // One line of ingestion status (G11), filled when the server answers
+    if (isOnline) {
+      api.getIngestStatus().then((st) => {
+        const el = popover.querySelector("#settings-parser-line");
+        if (el && popover.isConnected) el.textContent = `⛏ ${statusLine(st)}`;
+      }).catch(() => {
+        const el = popover.querySelector("#settings-parser-line");
+        if (el) el.textContent = "⛏ Parser status unavailable";
+      });
+    }
+    popover.querySelector("#btn-keyboard-shortcuts").onclick = () => {
+      closePopover();
+      showShortcutsOverlay();
+    };
 
     const codeSlider = popover.querySelector("#setting-code-font-slider");
     const codeVal = popover.querySelector("#setting-code-font-val");
@@ -621,6 +775,15 @@ class KernelIdeApp {
       };
     }
 
+    const themeSelect = popover.querySelector("#setting-theme");
+    if (themeSelect) themeSelect.onchange = () => applyTheme(themeSelect.value);
+    const hoverToggle = popover.querySelector("#setting-hover-enabled");
+    const hoverDelay = popover.querySelector("#setting-hover-delay");
+    if (hoverToggle) hoverToggle.onchange = () => { try { localStorage.setItem("kip-hover-cards", hoverToggle.checked ? "1" : "0"); } catch { /* not kept */ } };
+    if (hoverDelay) hoverDelay.oninput = () => {
+      popover.querySelector("#setting-hover-delay-val").textContent = `${hoverDelay.value} ms`;
+      try { localStorage.setItem("kip-hover-delay", hoverDelay.value); } catch { /* not kept */ }
+    };
     const uiSlider = popover.querySelector("#setting-ui-font-slider");
     const uiVal = popover.querySelector("#setting-ui-font-val");
     if (uiSlider) {
@@ -703,9 +866,19 @@ class KernelIdeApp {
       }
     };
 
+    popover.querySelector("#btn-export-user").onclick = () => exportUserData();
+    popover.querySelector("#btn-import-user").onclick = () => importUserData();
+    popover.querySelector("#btn-clear-user").onclick = async () => {
+      if (!confirm(`Delete your ${userCount} bookmarks, notes, tours and watches?\n\nThis cannot be undone (use Export User Data first to keep a copy).`)) return;
+      await localDB.userClear();
+      toast.success("User data deleted");
+      closePopover();
+    };
+
     popover.querySelector("#btn-full-reset").onclick = async () => {
       const confirmed = confirm(
         "Are you sure you want to reset all local data?\n\nThis will wipe offline IndexedDB caches, clear tabs and local storage settings, and reload the application."
+        + (userCount ? `\n\nIt also deletes your ${userCount} bookmarks, notes, tours and watches. Cancel and use Export User Data first to keep them.` : "")
       );
       if (!confirmed) return;
 
@@ -1293,6 +1466,47 @@ class KernelIdeApp {
         }
       },
       { title: "Compare versions or commits", hint: "Files & Kconfig changes", keywords: "diff compare", run: () => state.openTab({ type: "diff", title: "Compare" }) },
+      { title: "Compare kernel APIs", hint: "Syscalls, exports, parameters, tracepoints and modules added, removed or changed between two revisions", keywords: "api changelog diff exports compare", run: () => state.openTab({ type: "diff", title: "Compare", mode: "api", versionB: v() }) },
+      { title: "Open Kernel API", hint: "Syscalls, exports, parameters, tracepoints, modules, device tables", keywords: "kapi api catalog", run: () => state.openTab({ type: "api", title: "Kernel API", version: v() }) },
+      ...apiSections().map((sec) => ({ title: `Kernel API: ${sec.label}`, hint: sec.hint || "", keywords: `kapi ${sec.keywords || ""}`,
+        run: () => state.openTab({ type: "api", title: `Kernel API · ${sec.label}`, view: sec.id, version: v() }) })),
+      { title: "Open Insights", hint: "Release stats, merge window, subsystem health, stable, security", keywords: "insights report statistics", run: () => state.openTab({ type: "insights", title: "Insights", version: v() }) },
+      ...insightsSections().map((sec) => ({ title: `Insights: ${sec.label}`, hint: sec.hint || "", keywords: `insights ${sec.keywords || ""}`,
+        run: () => state.openTab({ type: "insights", title: `Insights · ${sec.label}`, view: sec.id, version: v() }) })),
+      { title: "Show watch list", hint: "Files, symbols, Kconfig options and MAINTAINERS sections you follow", keywords: "watch follow notify bell changes", run: () => state.openTab({ type: "watch", title: "Watch list" }) },
+      { title: "Watch this tab", hint: "The file of a code tab, the directory of an explorer, a Kconfig option, a MAINTAINERS section", keywords: "watch follow notify", run: async () => {
+        const { toggleWatch } = await import("./views/watch/watch_runtime.js");
+        const tab = state.getActiveTab();
+        const t = tab?.type === "code" && tab.path ? { type: "file", path: tab.path }
+          : tab?.type === "explorer" && tab.path ? { type: "dir", path: tab.path.replace(/\/+$/, "") }
+          : tab?.type === "kconfig" && tab.symbol ? { type: "kconfig", name: tab.symbol, arch: tab.arch }
+          : tab?.type === "maintainers" && tab.section ? { type: "section", name: tab.section } : null;
+        if (!t) {
+          toast.info("This tab has nothing to watch");
+          return;
+        }
+        try {
+          const r = await toggleWatch(t);
+          toast.success(r.added ? `Watching ${r.label}` : `Stopped watching ${r.label}`);
+        } catch (err) {
+          toast.error(err.message);
+        }
+      } },
+      { title: "Show bookmarks & tours", hint: "Bookmarks, notes and code tours (Ctrl+Alt+B bookmarks a line)", keywords: "bookmark note tour favorites saved", run: () => state.openTab({ type: "bookmarks", title: "Bookmarks" }) },
+      { title: "Bookmark this tab", hint: "A commit, mail thread or Kconfig option tab (code lines: Ctrl+Alt+B)", keywords: "bookmark save favorite", run: async () => {
+        const { targetOfTab, toggleBookmark } = await import("./views/bookmarks/bookmark_store.js");
+        const t = targetOfTab(state.getActiveTab());
+        if (!t) {
+          toast.info("This tab has nothing to bookmark (in a code tab, press Ctrl+Alt+B on a line)");
+          return;
+        }
+        const r = await toggleBookmark(t);
+        toast.success(r.added ? `Bookmarked ${r.record.data.label}` : `Bookmark ${r.record.data.label} removed`);
+      } },
+      { title: "Open patch series", hint: "Files staged with ✎ Create patch → Add to series: patches, cover letter, recipients, mbox", keywords: "patch series format-patch mbox cover letter send", run: () => state.openTab({ type: "patch", title: "Patch series", version: state.getPatchDrafts()?.base || state.currentVersion }) },
+      { title: "Show parser status", hint: "Versions parsed and being parsed, database size, server caches", keywords: "ingest ingestion parser progress database status", run: () => state.openTab({ type: "status", title: "Parser status" }) },
+      { title: "Keyboard shortcuts", hint: `List and rebind them (${shortcuts.label("help.shortcuts") || "?"})`, keywords: "keys keybindings hotkeys help rebind", run: () => showShortcutsOverlay() },
+      { title: "Search text in files…", hint: "git grep over the revision (or type % in the palette)", keywords: "grep find code full-text search", run: () => state.openTab({ type: "search", title: "Search", version: v() }) },
       { title: "Select commit…", hint: "Tags and commits", keywords: "version checkout ref", run: () => document.getElementById("commit-picker-btn")?.click() },
       { title: "Open source treemap", hint: "Bytes / files per directory", keywords: "size disk usage", run: () => state.openTab({ type: "treemap", title: "Treemap: root", path: "", version: v() }) },
       {
@@ -1416,6 +1630,10 @@ class KernelIdeApp {
           state.openTab({ type: "commits", title: "Commits" });
         } else if (action === "mail") {
           state.openTab({ type: "mail", title: "Mailing List" });
+        } else if (action === "api") {
+          state.openTab({ type: "api", title: "Kernel API" });
+        } else if (action === "insights") {
+          state.openTab({ type: "insights", title: "Insights" });
         } else if (action === "compare" || action === "tools") {
           state.openTab({ type: "diff", title: "Compare" });
         }

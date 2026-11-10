@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import posixpath
 import re
-from collections import deque
 from collections.abc import Callable
 
 from parser.arch_layout import ArchLayout
@@ -29,6 +28,33 @@ _MAX_LINK_HOPS = 8
 def include_directives(content: str) -> list[tuple[str, bool]]:
     """(name, quoted) of every `#include` / `#include_next` with a literal name, in file order."""
     return [(m.group(2).strip(), m.group(1) == '"') for m in INCLUDE_RE.finditer(content or "")]
+
+
+def include_directives_with_conditions(content: str) -> list[tuple[str, bool, list[str]]]:
+    """(name, quoted, conditions) of every `#include` with enclosing `#if` conditions, in file order."""
+    results: list[tuple[str, bool, list[str]]] = []
+    cond_stack: list[str] = []
+    for line in (content or "").splitlines():
+        line = line.strip()
+        if not line.startswith("#"):
+            continue
+        directive = line[1:].strip()
+        if directive.startswith(("if ", "ifdef ", "ifndef ")):
+            cond_stack.append(directive)
+        elif directive.startswith("elif "):
+            if cond_stack:
+                cond_stack[-1] = directive
+        elif directive.startswith("else"):
+            if cond_stack:
+                cond_stack[-1] = f"!({cond_stack[-1]})"
+        elif directive.startswith("endif"):
+            if cond_stack:
+                cond_stack.pop()
+        else:
+            m = re.match(r'^include(?:_next)?[ \t]*([<"])([^>"\n]+)[>"]', directive)
+            if m:
+                results.append((m.group(2).strip(), m.group(1) == '"', list(cond_stack)))
+    return results
 
 
 class IncludeResolver:
@@ -71,23 +97,39 @@ class IncludeResolver:
                 return hit
         return None
 
-    def reachable(self, start: str, directives: Callable[[str], list[tuple[str, bool]] | None],
-                  limit: int = 8000) -> dict[str, str | None]:
+    def reachable(self, start: str, directives: Callable[[str], list[tuple[str, bool]] | list[tuple[str, bool, list[str]]] | None],
+                  limit: int = 8000,
+                  filter_cond: Callable[[list[str]], bool] | None = None,
+                  prefetch: Callable[[list[str]], None] | None = None) -> dict[str, str | None]:
         """Files the compilation of `start` reads: {path: the file that included it} (None for `start`
-        and the forced includes), in breadth-first order. `directives(path)` lists a file's includes."""
+        and the forced includes), in breadth-first order. `directives(path)` lists a file's includes;
+        `prefetch(paths)`, when given, receives each breadth-first level before its files' directives are
+        asked for (the webapp loads one level's stored directives in one query)."""
         parents: dict[str, str | None] = {}
-        queue: deque[str] = deque()
+        level: list[str] = []
         for path in [*self.layout.forced, start]:
             if path and path not in parents and self.is_file(path):
                 parents[path] = None
-                queue.append(path)
-        while queue and len(parents) < limit:
-            current = queue.popleft()
-            for name, quoted in directives(current) or ():
-                hit = self.resolve(name, current, quoted)
-                if hit and hit not in parents:
-                    parents[hit] = current
-                    queue.append(hit)
+                level.append(path)
+        while level and len(parents) < limit:
+            if prefetch is not None:
+                prefetch(level)
+            nxt: list[str] = []
+            for current in level:
+                if len(parents) >= limit:
+                    break
+                for item in directives(current) or ():
+                    if len(item) == 3:
+                        name, quoted, conds = item
+                        if filter_cond is not None and not filter_cond(conds):
+                            continue
+                    else:
+                        name, quoted = item[0], item[1]
+                    hit = self.resolve(name, current, quoted)
+                    if hit and hit not in parents:
+                        parents[hit] = current
+                        nxt.append(hit)
+            level = nxt
         return parents
 
 

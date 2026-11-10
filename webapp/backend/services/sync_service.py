@@ -36,6 +36,8 @@ SYNC_HEADER = "X-KIP-Sync"
 INGEST_PARSING = 1
 
 _FRONTEND_TTL = 5.0
+# Top-level frontend directories left out of the build digest (the JS unit tests, webapp/API.md section 2.11)
+_FRONTEND_EXCLUDED_DIRS = frozenset({"tests"})
 _DB_TTL = 30.0
 _REPO_TTL = 15.0
 _PROJECTS_TTL = 30.0
@@ -105,7 +107,9 @@ class SyncService:
     def _frontend_files(self) -> list[tuple[str, int, int, int, int]]:
         files = []
         for root, dirs, names in os.walk(self.frontend_dir):
-            dirs[:] = sorted(d for d in dirs if not d.startswith("."))
+            # webapp/frontend/tests holds the JS unit tests (node --test): not part of a build
+            top = Path(root) == self.frontend_dir
+            dirs[:] = sorted(d for d in dirs if not d.startswith(".") and not (top and d in _FRONTEND_EXCLUDED_DIRS))
             for name in sorted(names):
                 if name.startswith("."):
                     continue
@@ -250,6 +254,17 @@ class SyncService:
         return f"{db}.{parsed}.{git}"
 
 
+# Called when the refs or the parsed versions change: derived indexes over Git (release index, commit
+# relations, webapp/API.md sections 2.16-2.17) drop their tag and head lists and refresh lazily
+_REFS_CHANGED_HOOKS: list = []
+
+
+def register_refs_changed(hook) -> None:
+    """Run `hook()` whenever the `git` or `parsed` token of a repository changes (cheap; no Git work)."""
+    if hook not in _REFS_CHANGED_HOOKS:
+        _REFS_CHANGED_HOOKS.append(hook)
+
+
 def clear_parse_dependent_caches() -> None:
     """Drop server caches holding per-version data derived from what was parsed (a version finished or was
     rolled back, so its name now resolves to other rows)."""
@@ -273,7 +288,7 @@ def clear_parse_dependent_caches() -> None:
         history_service._FACTS_CACHE, history_service._TAG_CODE_CACHE,
         kconfig_service._MODELS, kconfig_service._BUILD_RESOLVERS,
         kconfig_service._LISTING_CACHE, kconfig_service._PATHS_CACHE, kconfig_service._USAGE_CACHE,
-        kconfig_service._ARCH_INFO_CACHE,
+        kconfig_service._ARCH_INFO_CACHE, kconfig_service._KBUILD_COVERAGE,
     ):
         try:
             cache.clear()
@@ -294,6 +309,12 @@ def clear_parse_dependent_caches() -> None:
         git_tree_resolver.clear_revision_caches()
     except Exception:
         pass
+
+    for hook in list(_REFS_CHANGED_HOOKS):
+        try:
+            hook()
+        except Exception:
+            pass
 
 
 sync_service = SyncService()

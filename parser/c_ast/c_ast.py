@@ -171,7 +171,6 @@ _REFERENCING_KIND_IDS: frozenset[int] = frozenset({
     48,   # LABEL_REF
     49,   # OVERLOADED_DECL_REF
     50,   # VARIABLE_REF
-    100,  # UNEXPOSED_EXPR
     101,  # DECL_REF_EXPR
     102,  # MEMBER_REF_EXPR
     103,  # CALL_EXPR
@@ -222,7 +221,8 @@ def extract_include_symbols(parsed_tu: cc.TranslationUnit, fullfilename: str, CS
             if src_ptr == target_ptr or (target_ptr is None and (src.name == fullfilename or get_real(src.name) == target_real)):
                 current_direct_line = inc.location.line if inc.location else None
                 if current_direct_line is not None:
-                    ptr_to_direct_line[inc_ptr] = current_direct_line
+                    if inc_ptr not in ptr_to_direct_line:
+                        ptr_to_direct_line[inc_ptr] = current_direct_line
                     inc_name = inc_file.name
                     r_inc = get_real(inc_name)
                     base_dir = getattr(CS, "mfdir", None) or getattr(G, "CURRENT_PARSING_DIR", None)
@@ -236,7 +236,8 @@ def extract_include_symbols(parsed_tu: cc.TranslationUnit, fullfilename: str, CS
                     if not rel_inc.startswith(".."):
                         CS.resolved_includes_by_line[current_direct_line] = rel_inc
         elif current_direct_line is not None and inc.depth > 1:
-            ptr_to_direct_line[inc_ptr] = current_direct_line
+            if inc_ptr not in ptr_to_direct_line:
+                ptr_to_direct_line[inc_ptr] = current_direct_line
 
     found_symbols_by_line: dict[int, set[tuple[str, int]]] = defaultdict(set)
     f_ptr = ctypes.c_void_p()
@@ -248,14 +249,16 @@ def extract_include_symbols(parsed_tu: cc.TranslationUnit, fullfilename: str, CS
     get_ref = _CLANG_GET_CURSOR_REFERENCED
     visit_children = _CLANG_VISIT_CHILDREN
     # Most references in a file point at declarations it already referenced (every call of the same function,
-    # every use of the same type): resolve each referenced cursor once. Key: the raw CXCursor bytes.
-    resolved_refs: dict[bytes, tuple[int, tuple[str, ASTT]] | None] = {}
+    # every use of the same type): resolve each referenced cursor once. Key: (ref.data[0], ref.data[1], ref.data[2]).
+    resolved_refs: dict[tuple, tuple[int, tuple[str, ASTT]] | None] = {}
 
     def visitor(cursor: Any, parent: Any, client_data: Any) -> int:
         k_id = cursor._kind_id
+        if k_id == 100:  # UNEXPOSED_EXPR
+            return 2  # CXChildVisit_Recurse
         if k_id in _REFERENCING_KIND_IDS:
             ref = get_ref(cursor)
-            ref_key = bytes(ref)
+            ref_key = (ref.data[0], ref.data[1], ref.data[2])
             if ref_key in resolved_refs:
                 found = resolved_refs[ref_key]
             else:
@@ -484,6 +487,21 @@ class Ast_Manager:
         t_parse_0 = time.perf_counter() if prof is not None else 0.0
 
         inc_dir = self.filename.rpartition("/")[0]
+        parts = self.filename.split("/")
+        arch = "x86"
+        if len(parts) > 1 and parts[0] == "arch":
+            arch = parts[1]
+        arch_includes = [
+            f"-I{self.mfdir}/arch/{arch}/include",
+            f"-I{self.mfdir}/arch/{arch}/include/uapi",
+            f"-I{self.mfdir}/arch/{arch}/include/generated",
+            f"-I{self.mfdir}/arch/{arch}/include/generated/uapi",
+        ]
+        if arch != "x86":
+            arch_includes.extend([
+                f"-I{self.mfdir}/arch/x86/include",
+                f"-I{self.mfdir}/arch/x86/include/uapi",
+            ])
 
         translation_unit = index.parse(
             self.fullfilename,
@@ -492,10 +510,9 @@ class Ast_Manager:
                 "-w",
                 *_CLANG_KERNEL_MACRO_DEFINES,
                 f"-I{self.mfdir}/{inc_dir}",
+                *arch_includes,
                 f"-I{self.mfdir}/include",
                 f"-I{self.mfdir}/include/uapi",
-                f"-I{self.mfdir}/arch/x86/include",
-                f"-I{self.mfdir}/arch/x86/include/uapi",
             ],
             options=_CLANG_PARSE_OPTIONS,
         )

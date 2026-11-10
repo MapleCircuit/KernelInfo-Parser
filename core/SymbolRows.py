@@ -6,8 +6,8 @@ tags, changed or not. Here a parser records definitions and references against t
 
 - `m_tag_def` / `m_tag_ref`: the items of a new tag, with lines relative to the tag's first line. A tag reused
   from the file's previous version (tier-1 recycling in `Ast.tag()` / `CSExtractor.stage_tag()`) writes nothing.
-- `m_blob_symbol`: per blob, one row per symbol key the shared rows use, resolving it to the AST id (and file)
-  it means in this blob. A reference's target is a content-addressed AST id, so it changes whenever the target's
+- `m_blob_symbol`: per blob, one row per symbol key the shared rows use, resolving it to the AST id it means in
+  this blob; `m_blob_symbol_file` adds the target's file for the few keys that have one (declarations). A reference's target is a content-addressed AST id, so it changes whenever the target's
   definition changes; the key does not. Keys come from the tag's own text only (`_KeyContext.ref_key()` /
   `def_key()`): a digest of the tag's code with the identifier at the reference and its role, or the definition's
   name and type. They never depend on how far the parser resolved the target (an unresolved route in a file's
@@ -31,6 +31,7 @@ from typing import Any
 
 from core.DBLayout import (
     m_blob_symbol,
+    m_blob_symbol_file,
     m_blob_symbol_def,
     m_blob_symbol_ref,
     m_file_blob,
@@ -154,6 +155,23 @@ def register_tag(CS: Any, tag_ref: Any, line_s: int, line_e: int, char_s: int = 
         col.placements[tag_ref] = Placement(tag_ref, int(line_s), int(line_e), int(char_s or 1), code)
 
 
+def _validate_target_ast_id(target_ast_id: Any) -> None:
+    """Enforce strict type assertion on target_ast_id to prevent Table 60 schema corruption.
+
+    target_ast_id MUST be an int or tuple (RefType or None), NEVER a str or non-integer object.
+    """
+    if isinstance(target_ast_id, str):
+        raise TypeError(
+            f"target_ast_id MUST be an int or tuple (RefType or None), NEVER a str; "
+            f"got str: {target_ast_id!r}"
+        )
+    if target_ast_id is not None and (not isinstance(target_ast_id, (int, tuple)) or isinstance(target_ast_id, bool)):
+        raise TypeError(
+            f"target_ast_id MUST be an int or tuple (RefType or None), NEVER a {type(target_ast_id).__name__}; "
+            f"got: {target_ast_id!r}"
+        )
+
+
 def record_ref(CS: Any, tag_ref: Any, target: Any, target_fnid: Any, role: int, line: int, char_s: int) -> None:
     """Record a reference to `target` (an m_ast id or route) at `line`/`char_s`, enclosed by `tag_ref`."""
     col = collector(CS)
@@ -163,6 +181,26 @@ def record_ref(CS: Any, tag_ref: Any, target: Any, target_fnid: Any, role: int, 
         col.loose_refs.append((tag_ref or 0, item))
     else:
         placement.refs.append(item)
+
+
+def record_symbol_ref(
+    CS: Any,
+    tag_ref: Any,
+    sym_key: Any,
+    target_ast_id: Any,
+    role: int = 0,
+    line: int = 0,
+    char_s: int = 1,
+    *args: Any,
+    **kwargs: Any,
+) -> None:
+    """Record a symbol reference into SymbolRows with strict type assertion on target_ast_id.
+
+    target_ast_id MUST be an int or tuple (RefType or None), NEVER a str or non-integer object.
+    """
+    actual_target = kwargs.get("target_ast_id", target_ast_id)
+    _validate_target_ast_id(actual_target)
+    record_ref(CS, tag_ref, actual_target, 0, int(role), int(line), int(char_s))
 
 
 def flush_pending_refs(CS: Any, tag_ref: Any) -> None:
@@ -189,6 +227,9 @@ def record_def(CS: Any, tag_ref: Any, ast_ref: Any, name: str, type_id: int, lin
         col.loose_defs.append((tag_ref or 0, item))
     else:
         placement.defs.append(item)
+
+
+record_symbol_def = record_def
 
 
 def load_prior_items(CS: Any, tag_ids: Iterable[int]) -> None:
@@ -463,12 +504,27 @@ def finish(CS: Any) -> None:
                 if key not in mapped:
                     mapped.add(key)
                     target, fnid = first_target[key]
-                    _store(CS, m_blob_symbol.set(_BLOB_REF, key, target, fnid))
+                    _store(CS, m_blob_symbol.set(_BLOB_REF, key, target))
+                    if fnid:  # an int file id or a route to the file's m_file_name row; 0 / None: no file
+                        _store(CS, m_blob_symbol_file.set(_BLOB_REF, key, fnid))
 
     for tag_ref, (target, fnid, role, line, char_s) in blob_refs:
         _store(CS, m_blob_symbol_ref.set(None, _BLOB_REF, tag_ref, target, fnid, role, line, char_s))
     for tag_ref, (ast_ref, name, type_id, linkage, line_s, line_e) in blob_defs:
         _store(CS, m_blob_symbol_def.set(None, _BLOB_REF, tag_ref, ast_ref, name, type_id, linkage, line_s, line_e))
+
+
+def stage_symbol_rows(CS: Any = None, *args: Any, **kwargs: Any) -> None:
+    """Stage recorded symbol rows with strict type assertion on target_ast_id."""
+    if "target_ast_id" in kwargs:
+        _validate_target_ast_id(kwargs["target_ast_id"])
+    if args and len(args) >= 1:
+        _validate_target_ast_id(args[0])
+    if CS is not None:
+        finish(CS)
+
+
+finish_symbol_rows = finish
 
 
 def _store(CS: Any, op: Any) -> None:
@@ -520,11 +576,17 @@ _VIEW_PARTS: dict[str, tuple[str, str, str, int]] = {
     ),
     "m_symbol_ref": (
         "r.ref_id, r.blob_id, r.tag_id, r.ast_id, r.target_fnid, r.role, r.line, r.char_s FROM m_blob_symbol_ref r",
-        "NULL AS ref_id, bt.blob_id, ti.tag_id, bs.target_ast_id AS ast_id, bs.target_fnid, ti.role, "
-        "bt.line_s + ti.rel_line AS line, ti.char_s",
+        "NULL AS ref_id, bt.blob_id, ti.tag_id, bs.target_ast_id AS ast_id, COALESCE(bf.target_fnid, 0) AS target_fnid, "
+        "ti.role, bt.line_s + ti.rel_line AS line, ti.char_s",
         "m_tag_ref",
         KIND_REFS,
     ),
+}
+
+# The target's file (m_symbol_ref only): set for the few keys of m_blob_symbol_file, else 0
+_FILE_JOIN = {
+    "m_symbol_def": "",
+    "m_symbol_ref": "LEFT JOIN m_blob_symbol_file bf ON bf.blob_id = bs.blob_id AND bf.sym_key = bs.sym_key ",
 }
 
 SYMBOL_VIEW_SQL: dict[str, str] = {
@@ -532,6 +594,7 @@ SYMBOL_VIEW_SQL: dict[str, str] = {
         f"CREATE OR REPLACE VIEW {view} AS SELECT {blob_cols} UNION ALL SELECT {shared_cols} "
         f"FROM m_bridge_tag bt JOIN {tag_table} ti ON ti.tag_id = bt.tag_id "
         "JOIN m_blob_symbol bs ON bs.blob_id = bt.blob_id AND bs.sym_key = ti.sym_key "
+        f"{_FILE_JOIN[view]}"
         f"WHERE {_OWN.format(kind=kind)};"
     )
     for view, (blob_cols, shared_cols, tag_table, kind) in _VIEW_PARTS.items()
@@ -555,6 +618,7 @@ def rows_of_targets_sql(view: str, n_targets: int) -> tuple[str, int]:
         f"JOIN {tag_table} ti ON ti.sym_key = k.sym_key "
         "JOIN m_bridge_tag bt ON bt.tag_id = ti.tag_id "
         "JOIN m_blob_symbol bs ON bs.blob_id = bt.blob_id AND bs.sym_key = ti.sym_key "
+        f"{_FILE_JOIN[view]}"
         f"WHERE bs.target_ast_id IN ({ids}) AND {_OWN.format(kind=kind)}"
     )
     return sql, 3
@@ -576,7 +640,8 @@ def symbol_view_rows(tables: Mapping[str, Iterable[tuple[Any, ...]]], view: str)
         return list(data.values()) if isinstance(data, Mapping) else list(data)
 
     own = {(r[0], r[1], r[2]) for r in rows("m_symbol_own")}
-    resolve = {(r[0], r[1]): (r[2], r[3]) for r in rows("m_blob_symbol")}
+    files = {(r[0], r[1]): r[2] for r in rows("m_blob_symbol_file")}
+    resolve = {(r[0], r[1]): (r[2], files.get((r[0], r[1]), 0)) for r in rows("m_blob_symbol")}
     placements = sorted(rows("m_bridge_tag"), key=lambda r: (r[0], r[2], r[1]))
     out: list[tuple[Any, ...]] = []
     if view == "m_symbol_def":

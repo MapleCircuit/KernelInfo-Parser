@@ -41,7 +41,7 @@ LINUX_REPO = str(get_default_repo_path())
 
 FIXTURE_PATH = os.path.join(ROOT, "tests", "fixtures", "cast_golden.json")
 # Physical symbol tables: hashed through their m_symbol_def / m_symbol_ref view rows instead (core/SymbolRows.py)
-_PHYSICAL_SYMBOL_TABLES = frozenset({"m_blob_symbol_def", "m_blob_symbol_ref", "m_tag_def", "m_tag_ref", "m_blob_symbol", "m_symbol_own"})
+_PHYSICAL_SYMBOL_TABLES = frozenset({"m_blob_symbol_def", "m_blob_symbol_ref", "m_tag_def", "m_tag_ref", "m_blob_symbol", "m_blob_symbol_file", "m_symbol_own"})
 GOLDEN_CACHE = "/dev/shm/kip_v30_golden_cache"
 
 

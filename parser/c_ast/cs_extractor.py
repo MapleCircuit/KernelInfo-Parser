@@ -65,6 +65,8 @@ class CSExtractor:
             if recycled_tag_id is not None:
                 stage_bridge_tag(CS, recycled_tag_id, extent.line_pos, extent.char_pos)
                 register_symbol_tag(CS, recycled_tag_id, extent.line_pos[0], extent.line_pos[1], extent.char_pos[0], code_str)
+                CS.last_tag_ref = recycled_tag_id
+                flush_pending_symbol_refs(CS, recycled_tag_id)
                 return recycled_tag_id
 
         # Check evolved prior tag match via 5-tier tag_tracker
@@ -81,4 +83,6 @@ class CSExtractor:
         stage_bridge_tag(CS, tag_ref, extent.line_pos, extent.char_pos)
         register_symbol_tag(CS, tag_ref, extent.line_pos[0], extent.line_pos[1], extent.char_pos[0], code_str)
         stage_tag_map(CS, tag_ref, ast_ref, max(1, extent.line_pos[1] - extent.line_pos[0] + 1), extent.char_pos[1])
+        CS.last_tag_ref = tag_ref
+        flush_pending_symbol_refs(CS, tag_ref)
         return tag_ref

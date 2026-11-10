@@ -1066,7 +1066,7 @@ class TestTECachedDBIntegrity(unittest.TestCase):
         """Verify m_tag is table_id=10 and all foreign keys point strictly backward."""
         from core.DBLayout import TABLES, m_tag
 
-        self.assertEqual(len(TABLES), 44)
+        self.assertEqual(len(TABLES), 66)
         self.assertEqual(m_tag.table_id, 10)
 
         # Verify TABLES order matches table_id

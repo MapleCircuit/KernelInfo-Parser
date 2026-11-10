@@ -108,6 +108,7 @@ import os
 import re
 import ssl
 import time
+from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any, Iterator, Sequence, Self
 from types import TracebackType
 import mysql.connector
@@ -185,7 +186,34 @@ from core.globalstuff import (
     PointerType,
 )
 
-from db_engine.base import BaseDBEngine, TableCommitStat, estimate_column_bytes
+from db_engine.base import BaseDBEngine, TableCommitStat, estimate_column_bytes, ColumnInfo, TableStats, NewPairs
+from db_engine.spec import (
+    Agg,
+    AnyOf,
+    Col,
+    Cond,
+    Const,
+    Exists,
+    Inc,
+    InSelect,
+    Join,
+    Select,
+    Source,
+    Value,
+    Where,
+    dedup_rows as _dedup_rows,
+    find_oversize_in_term as _find_oversize_in_term,
+    has_empty_in_term as _has_empty_in_term,
+    replace_in_term as _replace_in_term,
+)
+from db_engine.sql_render import (
+    render_select,
+    render_insert,
+    render_update,
+    render_delete,
+    render_copy,
+    validate_ident,
+)
 
 if TYPE_CHECKING:
     from core.TableHandling import Table
@@ -271,7 +299,7 @@ class MariaDB(BaseDBEngine):
         self._next_id_sql_cache: dict[int, str] = {}
         self._init_session()
 
-    def apply_server_tuning(self, settings: dict[str, Any]) -> list[str]:
+    def apply_server_tuning(self, settings: dict[str, Any] | None = None) -> list[str]:
         """Raise global server variables to `settings` with `SET GLOBAL` (needs the SUPER privilege).
 
         Args:
@@ -283,6 +311,8 @@ class MariaDB(BaseDBEngine):
             A user without the SUPER privilege gets a single `server tuning skipped: ...` note instead.
             Runtime changes last until the server restarts.
         """
+        if settings is None:
+            settings = {}
         notes: list[str] = []
         self.check_if_connected()
         for name in sorted(settings, key=lambda n: (n not in _TUNING_FIRST, n)):
@@ -1767,3 +1797,715 @@ class MariaDB(BaseDBEngine):
                 except mysql.connector.Error:
                     pass
         return violations
+
+    def commit(self) -> None:
+        """Commit pending transaction on connection."""
+        if hasattr(self, "cnx") and self.cnx:
+            self.cnx.commit()
+
+    def rollback(self) -> None:
+        """Roll back pending transaction on connection."""
+        if hasattr(self, "cnx") and self.cnx:
+            try:
+                self.cnx.rollback()
+            except Exception:
+                pass
+
+    def cursor(self, dictionary: bool = False) -> Any:
+        """Lease a cursor handle on the underlying connection."""
+        self.check_if_connected()
+        return self.cnx.cursor(dictionary=dictionary)
+
+
+    def query(
+        self,
+        sql: str,
+        params: Sequence[Any] | None = None,
+        dictionary: bool = True,
+    ) -> list[dict[str, Any] | tuple[SafeDataType, ...]]:
+        """Execute a SQL query and return all matching records."""
+        self.check_if_connected()
+        import contextlib
+        with contextlib.closing(self.cnx.cursor(dictionary=dictionary)) as cursor:
+            cursor.execute(sql, tuple(params or ()))
+            rows = cursor.fetchall()
+            return list(rows) if rows else []
+
+    def query_one(
+        self,
+        sql: str,
+        params: Sequence[Any] | None = None,
+        dictionary: bool = True,
+    ) -> dict[str, Any] | tuple[SafeDataType, ...] | None:
+        """Execute a SQL query and return a single record or None."""
+        self.check_if_connected()
+        import contextlib
+        with contextlib.closing(self.cnx.cursor(dictionary=dictionary)) as cursor:
+            cursor.execute(sql, tuple(params or ()))
+            return cursor.fetchone()
+
+    def query_iter(
+        self,
+        sql: str,
+        params: Sequence[Any] | None = None,
+        dictionary: bool = True,
+        chunk_size: int = 2000,
+    ) -> Iterator[dict[str, Any] | tuple[SafeDataType, ...]]:
+        """Stream query result rows in batches of chunk_size."""
+        self.check_if_connected()
+        import contextlib
+        with contextlib.closing(self.cnx.cursor(dictionary=dictionary)) as cursor:
+            cursor.execute(sql, tuple(params or ()))
+            while True:
+                chunk = cursor.fetchmany(chunk_size)
+                if not chunk:
+                    break
+                yield from chunk
+
+    def execute(self, sql: str, params: Sequence[Any] | None = None) -> int:
+        """Execute a DML or DDL SQL statement."""
+        self.check_if_connected()
+        import contextlib
+        with contextlib.closing(self.cnx.cursor()) as cursor:
+            cursor.execute(sql, tuple(params or ()))
+            if getattr(cursor, "with_rows", False):
+                try:
+                    cursor.fetchall()
+                except Exception:
+                    pass
+            rowcount = cursor.rowcount
+        if getattr(self.cnx, "autocommit", True):
+            self.cnx.commit()
+        return max(0, rowcount)
+
+    def executemany(self, sql: str, params_seq: Sequence[Sequence[Any]]) -> int:
+        """Execute a parameterized SQL statement repeatedly."""
+        if not params_seq:
+            return 0
+        self.check_if_connected()
+        import contextlib
+        with contextlib.closing(self.cnx.cursor()) as cursor:
+            cursor.executemany(sql, [tuple(p) for p in params_seq])
+            if getattr(cursor, "with_rows", False):
+                try:
+                    cursor.fetchall()
+                except Exception:
+                    pass
+            rowcount = cursor.rowcount
+        if getattr(self.cnx, "autocommit", True):
+            self.cnx.commit()
+        return max(0, rowcount)
+
+    # -------------------------------------------------------------------------
+    # Sequence Reservation Override (§9)
+    # -------------------------------------------------------------------------
+    def reserve_id_block(
+        self,
+        table: Table,
+        block_size: int,
+        commit_id: int = 0,
+    ) -> tuple[int, int]:
+        """Reserve an atomic block of primary key IDs [start_id, end_id] for target table."""
+        table_id = getattr(table, "table_id", None)
+        if table_id is not None and hasattr(self, "cnx") and getattr(self, "cnx", None):
+            import contextlib
+            old_autocommit = getattr(self.cnx, "autocommit", True)
+            for attempt in range(3):
+                try:
+                    self.cnx.autocommit = False
+                    with contextlib.closing(self.cnx.cursor()) as cur:
+                        pk_col = table.init_columns[0][0]
+                        cur.execute(
+                            f"INSERT INTO m_table_sequence (seq_table_id, next_id) "
+                            f"SELECT %s, COALESCE(MAX({pk_col}), 0) + 1 FROM {table.table_name} "
+                            f"ON DUPLICATE KEY UPDATE next_id = GREATEST(next_id, VALUES(next_id))",
+                            (table_id,),
+                        )
+                        cur.execute(
+                            "SELECT next_id FROM m_table_sequence WHERE seq_table_id = %s FOR UPDATE",
+                            (table_id,),
+                        )
+                        row = cur.fetchone()
+                        start_id = int(row[0]) if row and row[0] is not None else 1
+                        end_id = start_id + block_size - 1
+                        cur.execute(
+                            "UPDATE m_table_sequence SET next_id = %s WHERE seq_table_id = %s",
+                            (end_id + 1, table_id),
+                        )
+                        if commit_id > 0:
+                            try:
+                                cur.execute(
+                                    "INSERT INTO m_ingest_id_range (commit_id, marked_table_id, start_id, end_id) "
+                                    "VALUES (%s, %s, %s, %s) ON DUPLICATE KEY UPDATE end_id = GREATEST(end_id, VALUES(end_id))",
+                                    (commit_id, table_id, start_id, end_id),
+                                )
+                            except Exception as e_range:
+                                logger.warning(f"[DB] Error recording ingest ID range for table {table_id}: {e_range}")
+                    self.cnx.commit()
+                    return (start_id, end_id)
+                except Exception as e:
+                    try:
+                        self.cnx.rollback()
+                    except Exception:
+                        pass
+                    logger.warning(f"[DB] reserve_id_block attempt {attempt + 1}/3 failed for {table.table_name}: {e}")
+                    if attempt == 2:
+                        raise
+                finally:
+                    try:
+                        self.cnx.autocommit = old_autocommit
+                    except Exception:
+                        pass
+        return super().reserve_id_block(table, block_size, commit_id)
+
+    # -------------------------------------------------------------------------
+    # Spec Read Primitives (§2)
+    # -------------------------------------------------------------------------
+    def select_rows(
+        self,
+        source: Source,
+        columns: Sequence[str | Agg | Const] | Mapping[str, str | Agg | Const],
+        where: Where | None = None,
+        *,
+        joins: Sequence[Join] = (),
+        distinct: bool = False,
+        order_by: Sequence[str] = (),
+        limit: int | None = None,
+        offset: int | None = None,
+        as_dict: bool | None = None,
+    ) -> list[tuple | dict]:
+        """Execute parameterized SELECT query from spec and return rows."""
+        # 1. Empty IN check: returns [] without sending any query
+        if _has_empty_in_term(where):
+            return []
+
+        # 2. Check for oversize IN list chunking (> 1000 values)
+        term_idx, target_col, oversize_vals = _find_oversize_in_term(where, chunk_size=1000)
+        if oversize_vals is not None and target_col is not None:
+            if limit is not None or offset is not None:
+                raise ValueError("Auto-chunking cannot be combined with limit/offset")
+            merged_rows: list[Any] = []
+            col_names_cached: list[str] = []
+            for i in range(0, len(oversize_vals), 1000):
+                chunk = oversize_vals[i : i + 1000]
+                chunk_where = _replace_in_term(where, term_idx, target_col, chunk)
+                sub_rows = self.select_rows(
+                    source,
+                    columns,
+                    where=chunk_where,
+                    joins=joins,
+                    distinct=distinct,
+                    order_by=order_by,
+                    as_dict=as_dict,
+                )
+                merged_rows.extend(sub_rows)
+
+            if distinct:
+                merged_rows = _dedup_rows(merged_rows, bool(as_dict))
+
+            if order_by:
+                # Introspect col_names from spec for sorting
+                _, _, col_names = render_select(
+                    Select(source, columns, None, joins, distinct, order_by),
+                    dialect="mariadb",
+                )
+                merged_rows = _sort_rows(merged_rows, order_by, col_names, bool(as_dict))
+
+            return merged_rows
+
+        # 3. Direct execution
+        select_spec = Select(
+            source=source,
+            columns=columns,
+            where=where,
+            joins=joins,
+            distinct=distinct,
+            order_by=order_by,
+            limit=limit,
+            offset=offset,
+        )
+        sql, params, _ = render_select(select_spec, dialect="mariadb")
+        rows = self.query(sql, params, dictionary=bool(as_dict))
+        return [_normalize_row(r, bool(as_dict)) for r in rows]
+
+    def iter_rows(
+        self,
+        source: Source,
+        columns: Sequence[str | Agg | Const] | Mapping[str, str | Agg | Const],
+        where: Where | None = None,
+        *,
+        joins: Sequence[Join] = (),
+        distinct: bool = False,
+        order_by: Sequence[str] = (),
+        limit: int | None = None,
+        offset: int | None = None,
+        as_dict: bool | None = None,
+    ) -> Iterator[tuple | dict]:
+        """Stream query result rows using cursor streaming."""
+        if _has_empty_in_term(where):
+            return
+        term_idx, target_col, oversize_vals = _find_oversize_in_term(where, chunk_size=1000)
+        if oversize_vals is not None:
+            # Fall back to iterating merged rows for chunked queries
+            rows = self.select_rows(
+                source,
+                columns,
+                where=where,
+                joins=joins,
+                distinct=distinct,
+                order_by=order_by,
+                limit=limit,
+                offset=offset,
+                as_dict=as_dict,
+            )
+            yield from rows
+            return
+
+        select_spec = Select(
+            source=source,
+            columns=columns,
+            where=where,
+            joins=joins,
+            distinct=distinct,
+            order_by=order_by,
+            limit=limit,
+            offset=offset,
+        )
+        sql, params, _ = render_select(select_spec, dialect="mariadb")
+        for r in self.query_iter(sql, params, dictionary=bool(as_dict)):
+            yield _normalize_row(r, bool(as_dict))
+
+    # -------------------------------------------------------------------------
+    # Spec Write Primitives (§3)
+    # -------------------------------------------------------------------------
+    def insert_rows(
+        self,
+        table: Table | str,
+        columns: Sequence[str],
+        rows: Sequence[Sequence[Any]] | Any,
+        *,
+        on_conflict: Literal["error", "ignore", "update", "replace"] = "error",
+        update_columns: Sequence[str] | None = None,
+        chunk_size: int | None = None,
+    ) -> int:
+        """Insert row(s) matching columns with adaptive bisection. Returns total affected rows."""
+        tbl_name = table.table_name if hasattr(table, "table_name") else str(table)
+        clean_cols = [validate_ident(c) for c in columns]
+        if not clean_cols:
+            raise ValueError("insert_rows requires at least one column")
+
+        max_batch_rows = chunk_size or 5000
+        max_batch_bytes = 4 * 1024 * 1024
+
+        def _estimate_row_bytes(row: Sequence[Any]) -> int:
+            return sum(len(x) if isinstance(x, (str, bytes, bytearray, memoryview)) else 8 for x in row)
+
+        def _exec_batch(batch: list[tuple[Any, ...]]) -> int:
+            if not batch:
+                return 0
+            sql = render_insert(
+                tbl_name,
+                clean_cols,
+                len(batch),
+                on_conflict=on_conflict,
+                update_columns=update_columns,
+                dialect="mariadb",
+            )
+            flat_params = [v for r in batch for v in r]
+            for attempt in range(3):
+                self.check_if_connected()
+                try:
+                    import contextlib
+                    with contextlib.closing(self.cnx.cursor()) as cur:
+                        cur.execute(sql, flat_params)
+                        rc = cur.rowcount
+                        if getattr(self.cnx, "autocommit", True) and not self._in_txn:
+                            self.cnx.commit()
+                        return max(0, rc)
+                except mysql.connector.Error as err:
+                    if (getattr(err, "errno", None) == 1153 or "max_allowed_packet" in str(err).lower()) and len(batch) > 1:
+                        mid = len(batch) // 2
+                        logger.warning(
+                            f"Packet exceeded max_allowed_packet inserting into '{tbl_name}' with {len(batch)} rows. "
+                            f"Bisecting into {mid} and {len(batch) - mid} rows..."
+                        )
+                        return _exec_batch(batch[:mid]) + _exec_batch(batch[mid:])
+                    if isinstance(err, (mysql.connector.OperationalError, mysql.connector.InterfaceError)):
+                        if self._in_txn:
+                            raise
+                        self.close()
+                        if attempt == 2:
+                            raise
+                        time.sleep(0.5 * (attempt + 1))
+                    else:
+                        raise
+            return 0
+
+        total_affected = 0
+        current_batch: list[tuple[Any, ...]] = []
+        current_bytes = 0
+
+        for r in rows:
+            r_tuple = tuple(r)
+            r_bytes = _estimate_row_bytes(r_tuple)
+            if current_batch and (len(current_batch) >= max_batch_rows or current_bytes + r_bytes > max_batch_bytes):
+                total_affected += _exec_batch(current_batch)
+                current_batch = [r_tuple]
+                current_bytes = r_bytes
+            else:
+                current_batch.append(r_tuple)
+                current_bytes += r_bytes
+
+        if current_batch:
+            total_affected += _exec_batch(current_batch)
+
+        return total_affected
+
+    def update_rows(
+        self,
+        table: Table | str,
+        values: Mapping[str, Any],
+        where: Where | None,
+        *,
+        limit: int | None = None,
+    ) -> int:
+        """Update rows matching where filter. Returns affected row count."""
+        if _has_empty_in_term(where):
+            return 0
+
+        term_idx, target_col, oversize_vals = _find_oversize_in_term(where, chunk_size=1000)
+        if oversize_vals is not None and target_col is not None:
+            if limit is not None:
+                raise ValueError("Auto-chunking cannot be combined with limit")
+            total_rc = 0
+            for i in range(0, len(oversize_vals), 1000):
+                chunk = oversize_vals[i : i + 1000]
+                chunk_where = _replace_in_term(where, term_idx, target_col, chunk)
+                total_rc += self.update_rows(table, values, chunk_where)
+            return total_rc
+
+        sql, params = render_update(table, values, where, limit=limit, dialect="mariadb")
+        return self.execute(sql, params)
+
+    def delete_rows(
+        self,
+        table: Table | str,
+        where: Where | None,
+        *,
+        limit: int | None = None,
+        all_rows: bool = False,
+    ) -> int:
+        """Delete rows matching where filter. Returns affected row count."""
+        if where is None and not all_rows:
+            raise ValueError("delete_rows without where requires all_rows=True")
+        if _has_empty_in_term(where):
+            return 0
+
+        term_idx, target_col, oversize_vals = _find_oversize_in_term(where, chunk_size=1000)
+        if oversize_vals is not None and target_col is not None:
+            if limit is not None:
+                raise ValueError("Auto-chunking cannot be combined with limit")
+            total_rc = 0
+            for i in range(0, len(oversize_vals), 1000):
+                chunk = oversize_vals[i : i + 1000]
+                chunk_where = _replace_in_term(where, term_idx, target_col, chunk)
+                total_rc += self.delete_rows(table, chunk_where, all_rows=all_rows)
+            return total_rc
+
+        sql, params = render_delete(table, where, limit=limit, all_rows=all_rows, dialect="mariadb")
+        return self.execute(sql, params)
+
+    def copy_rows(
+        self,
+        table: Table | str,
+        columns: Sequence[str],
+        select: Select,
+        *,
+        on_conflict: Literal["error", "ignore"] = "error",
+    ) -> int:
+        """Insert rows selected by select query into table. Returns affected rows."""
+        sql, params = render_copy(table, columns, select, on_conflict=on_conflict, dialect="mariadb")
+        return self.execute(sql, params)
+
+    def drop_tables(
+        self,
+        names: Sequence[str],
+        *,
+        if_exists: bool = True,
+        disable_fk_checks: bool = True,
+    ) -> None:
+        """Drop tables by name safely."""
+        if not names:
+            return
+        self.check_if_connected()
+        clean_names = [validate_ident(n) for n in names]
+        if disable_fk_checks:
+            self.cursor.execute("SET foreign_key_checks = 0;")
+        try:
+            if_str = "IF EXISTS " if if_exists else ""
+            self.cursor.execute(f"DROP TABLE {if_str}{', '.join(clean_names)};")
+            if not self._in_txn:
+                self.commit()
+        finally:
+            if disable_fk_checks:
+                try:
+                    self.cursor.execute("SET foreign_key_checks = 1;")
+                except Exception:
+                    pass
+
+    # -------------------------------------------------------------------------
+    # Pipeline Intent Methods (§7.1)
+    # -------------------------------------------------------------------------
+    @contextlib.contextmanager
+    def new_checkpoint_pairs(
+        self,
+        commit_id: int,
+        prev_commit_id: int,
+    ) -> Iterator[NewPairs]:
+        """Context manager yielding NewPairs for (fnid, blob_id) diff between commits."""
+        self.check_if_connected()
+        has_tmp = False
+        pairs: set[tuple[int, int]] = set()
+        try:
+            self.execute("DROP TEMPORARY TABLE IF EXISTS tmp_new_pairs")
+            self.execute(
+                "CREATE TEMPORARY TABLE tmp_new_pairs (fnid INT NOT NULL, blob_id INT NOT NULL, PRIMARY KEY (fnid, blob_id))"
+            )
+            self.execute(
+                "INSERT INTO tmp_new_pairs (fnid, blob_id) "
+                "SELECT cur_v.fnid, cur_v.blob_id FROM m_bridge_checkpoint cur_v "
+                "LEFT JOIN m_bridge_checkpoint old_v "
+                "       ON old_v.commit_id = %s AND old_v.fnid = cur_v.fnid AND old_v.blob_id = cur_v.blob_id "
+                "WHERE cur_v.commit_id = %s AND old_v.blob_id IS NULL",
+                (prev_commit_id, commit_id),
+            )
+            rows = self.query("SELECT fnid, blob_id FROM tmp_new_pairs", dictionary=False)
+            pairs = {(int(f), int(b)) for f, b in rows}
+            has_tmp = True
+        except Exception as e:
+            logger.debug(f"Temporary table tmp_new_pairs unavailable ({e}); falling back to inline anti-join.")
+            rows = self.query(
+                "SELECT cur_v.fnid, cur_v.blob_id FROM m_bridge_checkpoint cur_v "
+                "LEFT JOIN m_bridge_checkpoint old_v "
+                "       ON old_v.commit_id = %s AND old_v.fnid = cur_v.fnid AND old_v.blob_id = cur_v.blob_id "
+                "WHERE cur_v.commit_id = %s AND old_v.blob_id IS NULL",
+                (prev_commit_id, commit_id),
+                dictionary=False,
+            )
+            pairs = {(int(f), int(b)) for f, b in rows}
+            has_tmp = False
+
+        yield MariaDBNewPairs(self, commit_id, prev_commit_id, has_tmp, pairs)
+
+        if has_tmp:
+            try:
+                self.execute("DROP TEMPORARY TABLE IF EXISTS tmp_new_pairs")
+                if not self._in_txn:
+                    self.commit()
+            except Exception:
+                pass
+
+    def enqueue_parse_tasks(self, rows: Sequence[Sequence[Any]]) -> int:
+        """Insert or update tasks in m_parse_task. Returns count of modified/inserted rows."""
+        if not rows:
+            return 0
+        enqueued = 0
+        sql = (
+            "INSERT INTO m_parse_task (network_id, chain_name, chain_kind, seq_order, ref_name, "
+            "commit_id, base_ref_name, base_commit_id, status) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) "
+            "ON DUPLICATE KEY UPDATE "
+            "chain_name = VALUES(chain_name), "
+            "chain_kind = VALUES(chain_kind), "
+            "seq_order = VALUES(seq_order), "
+            "commit_id = IF(VALUES(commit_id) > 0, VALUES(commit_id), commit_id), "
+            "base_ref_name = VALUES(base_ref_name), "
+            "base_commit_id = IF(VALUES(base_commit_id) > 0, VALUES(base_commit_id), base_commit_id), "
+            "retry_count = IF(status = 4 OR (status = 3 AND VALUES(status) != 3), 0, retry_count), "
+            "error_msg = IF(status = 4 OR (status = 3 AND VALUES(status) != 3), '', error_msg), "
+            "status = IF(status = 4, VALUES(status), "
+            "            IF(status = 3 AND VALUES(status) != 3, VALUES(status), "
+            "               IF(status IN (2, 5), IF(VALUES(status) = 3, 3, status), VALUES(status))))"
+        )
+        for r in rows:
+            rc = self.execute(sql, tuple(r))
+            if rc > 0:
+                enqueued += 1
+        if not self._in_txn:
+            self.commit()
+        return enqueued
+
+    def record_task_failure(
+        self,
+        task_id: int,
+        error_msg: str,
+        *,
+        worker_id: str | None = None,
+        max_attempts: int = 3,
+    ) -> int:
+        """Record task failure, incrementing retry_count and updating status to FAILED or ELIGIBLE."""
+        if worker_id:
+            sql = (
+                "UPDATE m_parse_task SET "
+                "status = IF(retry_count + 1 >= %s, 4, 1), "
+                "retry_count = retry_count + 1, "
+                "error_msg = %s, worker_id = '' "
+                "WHERE task_id = %s AND status IN (2, 5) AND worker_id = %s"
+            )
+            params = (max_attempts, error_msg[:1000], task_id, worker_id)
+        else:
+            sql = (
+                "UPDATE m_parse_task SET "
+                "status = IF(retry_count + 1 >= %s, 4, 1), "
+                "retry_count = retry_count + 1, "
+                "error_msg = %s, worker_id = '' "
+                "WHERE task_id = %s AND status IN (2, 5)"
+            )
+            params = (max_attempts, error_msg[:1000], task_id)
+        rc = self.execute(sql, params)
+        if not self._in_txn:
+            self.commit()
+        return rc
+
+    def next_eligible_parse_tasks(
+        self,
+        network_id: int,
+        status: int,
+        *,
+        limit: int = 10,
+    ) -> list[tuple]:
+        """Fetch next batch of eligible parse tasks ordered by chain preference."""
+        sql = (
+            "SELECT task_id, chain_name, chain_kind, ref_name, commit_id, base_ref_name, base_commit_id "
+            "FROM m_parse_task WHERE network_id = %s AND status = %s "
+            f"ORDER BY (chain_kind = 'stable') DESC, LENGTH(chain_name) ASC, chain_name ASC, seq_order ASC LIMIT {int(limit)}"
+        )
+        rows = self.query(sql, (network_id, status), dictionary=False)
+        return [tuple(r) for r in rows]
+
+
+class MariaDBNewPairs(NewPairs):
+    """MariaDB implementation of NewPairs."""
+
+    def __init__(
+        self,
+        db: MariaDB,
+        commit_id: int,
+        prev_commit_id: int,
+        has_tmp: bool,
+        pairs: set[tuple[int, int]],
+    ) -> None:
+        self.db = db
+        self.commit_id = commit_id
+        self.prev_commit_id = prev_commit_id
+        self.has_tmp = has_tmp
+        self.pairs = pairs
+
+    def delete_rows_of(self, table: Table | str) -> int:
+        tbl_name = table.table_name if hasattr(table, "table_name") else str(table)
+        validate_ident(tbl_name)
+        if self.has_tmp:
+            sql = f"DELETE r FROM tmp_new_pairs p JOIN {tbl_name} r ON r.source_blob_id = p.blob_id AND r.source_fnid = p.fnid"
+            return self.db.execute(sql)
+        sql = (
+            f"DELETE r FROM m_bridge_checkpoint cur_v "
+            f"LEFT JOIN m_bridge_checkpoint old_v "
+            f"       ON old_v.commit_id = %s AND old_v.fnid = cur_v.fnid AND old_v.blob_id = cur_v.blob_id "
+            f"JOIN {tbl_name} r ON r.source_blob_id = cur_v.blob_id AND r.source_fnid = cur_v.fnid "
+            f"WHERE cur_v.commit_id = %s AND old_v.blob_id IS NULL"
+        )
+        return self.db.execute(sql, (self.prev_commit_id, self.commit_id))
+
+    def insert_include_references(
+        self,
+        kconfig_type_ids: Sequence[int] | str,
+        kconfig_ref_type: int,
+        include_ref_type: int,
+    ) -> int:
+        if isinstance(kconfig_type_ids, (tuple, list, set)):
+            kconfig_types = ", ".join(str(int(x)) for x in kconfig_type_ids)
+        else:
+            kconfig_types = str(kconfig_type_ids)
+        if self.has_tmp:
+            sql = f"""
+                INSERT IGNORE INTO m_file_reference (source_blob_id, source_fnid, target_fnid, ref_type, line_no, details)
+                SELECT STRAIGHT_JOIN DISTINCT bt.blob_id, p.fnid, inc.fnid,
+                       CASE WHEN a.type_id IN ({kconfig_types}) THEN %s ELSE %s END AS ref_type,
+                       bt.line_s,
+                       LEFT(a.name, 255)
+                FROM tmp_new_pairs p
+                JOIN m_bridge_tag bt ON p.blob_id = bt.blob_id
+                JOIN m_tag t ON bt.tag_id = t.tag_id
+                JOIN m_ast_include inc ON t.ast_id = inc.ast_id
+                JOIN m_ast a ON inc.ast_id = a.ast_id;
+            """
+            return self.db.execute(sql, (kconfig_ref_type, include_ref_type))
+        sql = f"""
+            INSERT IGNORE INTO m_file_reference (source_blob_id, source_fnid, target_fnid, ref_type, line_no, details)
+            SELECT STRAIGHT_JOIN DISTINCT bt.blob_id, bf.fnid, inc.fnid,
+                   CASE WHEN a.type_id IN ({kconfig_types}) THEN %s ELSE %s END AS ref_type,
+                   bt.line_s,
+                   LEFT(a.name, 255)
+            FROM m_bridge_checkpoint bf
+            LEFT JOIN m_bridge_checkpoint old_v
+                   ON old_v.commit_id = %s AND old_v.fnid = bf.fnid AND old_v.blob_id = bf.blob_id
+            JOIN m_bridge_tag bt ON bf.blob_id = bt.blob_id
+            JOIN m_tag t ON bt.tag_id = t.tag_id
+            JOIN m_ast_include inc ON t.ast_id = inc.ast_id
+            JOIN m_ast a ON inc.ast_id = a.ast_id
+            WHERE bf.commit_id = %s AND old_v.blob_id IS NULL;
+        """
+        return self.db.execute(sql, (kconfig_ref_type, include_ref_type, self.prev_commit_id, self.commit_id))
+
+
+
+
+
+def _sort_rows(
+    rows: list[Any],
+    order_by: Sequence[str],
+    col_names: list[str],
+    as_dict: bool,
+) -> list[Any]:
+    """Sort rows in Python across chunks."""
+    if not order_by or not rows:
+        return rows
+    result = list(rows)
+    for order_spec in reversed(order_by):
+        clean = order_spec.strip()
+        desc = clean.startswith("-")
+        col = clean[1:] if desc else clean
+        base_col = col.rsplit(".", 1)[-1]
+
+        def _get_val(r: Any) -> Any:
+            if as_dict and isinstance(r, dict):
+                return r.get(col, r.get(base_col))
+            else:
+                if col in col_names:
+                    idx = col_names.index(col)
+                elif base_col in col_names:
+                    idx = col_names.index(base_col)
+                else:
+                    return None
+                return r[idx] if idx < len(r) else None
+
+        result.sort(key=lambda r: (_get_val(r) is None, _get_val(r)), reverse=desc)
+    return result
+
+
+def _normalize_binary(val: Any) -> Any:
+    """Normalize bytearray or memoryview to bytes."""
+    if isinstance(val, (bytearray, memoryview)):
+        return bytes(val)
+    return val
+
+
+def _normalize_row(row: Any, as_dict: bool) -> Any:
+    """Normalize BINARY fields in a row."""
+    if as_dict and isinstance(row, dict):
+        return {k: _normalize_binary(v) for k, v in row.items()}
+    if isinstance(row, (tuple, list)):
+        return tuple(_normalize_binary(v) for v in row)
+    return row
+
+

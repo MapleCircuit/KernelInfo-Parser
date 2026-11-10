@@ -9,7 +9,7 @@ import subprocess as sp
 from pathlib import Path
 from core.globalstuff import G, is_safe_git_rev, is_safe_git_spec
 
-_VERSION_TAG_RE = re.compile(r"^v?\d+(?:\.\d+)*(?:-(?:rc|alpha|beta|pre)\d*)?$")
+_VERSION_TAG_RE = re.compile(r"^(?:v?\d+(?:\.\d+)*(?:[a-zA-Z](?:\+[a-zA-Z]?)?)?(?:-?(?:rc|alpha|beta|pre|patch)\d*)?|next-\d{8})$")
 logger = logging.getLogger(__name__)
 
 # Scratch directories carry the PID of the process that created them, so `--clean-temp` can leave the

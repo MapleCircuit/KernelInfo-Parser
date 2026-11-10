@@ -5,6 +5,9 @@
 import { localDB } from "./db.js";
 import { state } from "./state.js";
 import { VERSION_CATALOG_FORMAT, catalogFromBody, isCatalog, versionsFromCatalog } from "./utils/version_catalog.js";
+import { pollJob } from "./utils/job_poll.js";
+import { grepParams } from "./utils/grep_format.js";
+import { blameQuery, formatBlameOpts } from "./views/code_view/blame_options.js";
 
 // Heartbeat probing GET /api/sync (cheap, server-cached): slow while the backend answers, fast while it
 // does not, so the badge recovers quickly once the server is back.
@@ -178,6 +181,12 @@ class ApiClient {
   async _fetchJson(url, options = {}, timeoutMs = 0) {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs || REQUEST_TIMEOUT_MS);
+    // A caller's own signal (a hover card the pointer left) cancels the request too
+    const callerSignal = options.signal || null;
+    if (callerSignal) {
+      if (callerSignal.aborted) controller.abort();
+      else callerSignal.addEventListener("abort", () => controller.abort(), { once: true });
+    }
     this._onRequestStart();
     let answered = false;
 
@@ -211,14 +220,22 @@ class ApiClient {
           if (errText) errMsg = errText;
         }
         console.error(`API Error [${response.status}] for ${url}: ${errMsg}`);
-        throw new Error(errMsg);
+        const error = new Error(errMsg);
+        error.status = response.status;
+        throw error;
       }
       return { response, data: await response.json() };
     } catch (err) {
       clearTimeout(timer);
       // Only a transport failure or the timeout means the server is unreachable; an HTTP error status
       // threw above but already proved it answered.
-      if (!answered) this._setServerUp(false);
+      // A request the caller cancelled says nothing about the server
+      if (!answered && !callerSignal?.aborted) this._setServerUp(false);
+      if (callerSignal?.aborted && err?.name !== "AbortError") {
+        const abortErr = new Error("Aborted");
+        abortErr.name = "AbortError";
+        throw abortErr;
+      }
       throw err;
     } finally {
       this._onRequestEnd();
@@ -264,10 +281,127 @@ class ApiClient {
     }
   }
 
+  /**
+   * A background-job endpoint (webapp/API.md §2.15). While the server answers 202 Accepted (body
+   * {state: "building", progress, retry_after_ms}) the request is repeated with a backoff from 500 ms to
+   * 5 s and `onProgress({done, total, note})` is called; the final 200 body is returned. `signal` (the
+   * view's AbortController) stops polling with an AbortError. Only final bodies are stored in IndexedDB
+   * (cacheStore/cacheKey, read first like `request`); 202 bodies never are.
+   */
+  async requestJob(endpoint, { onProgress = null, signal = null, cacheStore = null, cacheKey = null,
+    method = "GET", body = undefined, timeoutMs = 0, networkFirst = false } = {}) {
+    const url = `${this.baseUrl}${endpoint}`;
+    if (cacheKey && this.repo) cacheKey = `${this.repo}::${cacheKey}`;
+    if (!networkFirst && cacheStore && cacheKey && method === "GET") {
+      const cached = await localDB.get(cacheStore, cacheKey);
+      if (cached !== null && cached !== undefined) return cached;
+    }
+    const options = { method };
+    if (body !== undefined) options.body = typeof body === "string" ? body : JSON.stringify(body);
+    let offline = false;
+    try {
+      const data = await pollJob(async () => {
+        const { response, data: answer } = await this._fetchJson(url, options, timeoutMs);
+        offline = Boolean(response.headers.get("X-KIP-Offline"));
+        return { status: response.status, data: answer };
+      }, { onProgress, signal });
+      if (cacheStore && cacheKey && !offline && data != null) {
+        localDB.set(cacheStore, cacheKey, data).catch((e) => console.warn("Cache write failed:", e));
+      }
+      return data;
+    } catch (err) {
+      if (err?.name !== "AbortError" && cacheStore && cacheKey) {
+        const cached = await localDB.get(cacheStore, cacheKey);
+        if (cached !== null && cached !== undefined) return cached;
+      }
+      throw err;
+    }
+  }
+
+  /**
+   * First tag and release containing a commit (`GET /api/commits/{v}/released/{hash}`, H3). A released
+   * answer never changes and is kept in the `commits` store; "not released yet" is asked again later.
+   * Polls while the release index is first built (202, §2.15).
+   */
+  async getCommitRelease(version, hash, { onProgress = null, signal = null } = {}) {
+    const ver = this._sanitizeVer(version);
+    const key = this.repo ? `${this.repo}::rel_${hash}` : `rel_${hash}`;
+    const cached = await localDB.get("commits", key);
+    if (cached) return cached;
+    const data = await this.requestJob(`/api/commits/${encodeURIComponent(ver)}/released/${encodeURIComponent(hash)}`, { onProgress, signal });
+    if (data?.released) localDB.set("commits", key, data).catch(() => {});
+    return data;
+  }
+
+  /**
+   * Relations of a commit (`GET /api/commits/{v}/relations/{hash}`, H1/H2): fixes, fixed by, reverts,
+   * backports, Cc: stable, mail links, each enriched with its first release. Polls while the index is
+   * first built; never cached (later commits add to "fixed by").
+   */
+  async getCommitRelations(version, hash, { onProgress = null, signal = null } = {}) {
+    const ver = this._sanitizeVer(version);
+    return this.requestJob(`/api/commits/${encodeURIComponent(ver)}/relations/${encodeURIComponent(hash)}`, { onProgress, signal, timeoutMs: 30000 });
+  }
+
+  /** Relation counts of up to 200 commits (timeline chips): {results: {hash: {fixes, fixed_by, reverted_by, backports, stable_cc}}}. */
+  async getRelationCounts(version, hashes, { signal = null } = {}) {
+    const ver = this._sanitizeVer(version);
+    return this.requestJob(`/api/commits/${encodeURIComponent(ver)}/relations`, { method: "POST", body: { hashes: hashes.slice(0, 200) }, signal, timeoutMs: 30000 });
+  }
+
+  /** Structured commit query (`GET /api/commits/{v}/query`, H8); `params` from commit_query.queryParams(). Not cached. */
+  async queryCommits(version, params) {
+    const ver = this._sanitizeVer(version);
+    return this.request(`/api/commits/${encodeURIComponent(ver)}/query?${params}`, { timeoutMs: COMMITS_TIMEOUT_MS });
+  }
+
+  /** Commits a mail thread or patch became (`GET /api/mail/merged`, P2); kept in the `mail` store under the `parsed` token. */
+  async getMergedCommits({ mid = "", tid = 0 } = {}) {
+    const params = new URLSearchParams();
+    if (mid) params.set("mid", mid);
+    if (tid) params.set("tid", String(tid));
+    // The parser may link more commits later: the cache key follows the `parsed` token (§2.11)
+    const token = ((await localDB.get("meta", "sync_tokens").catch(() => null)) || {}).parsed || "";
+    return this.request(`/api/mail/merged?${params}`, { timeoutMs: 30000 }, "tools", `merged_${token}_${params}`);
+  }
+
+  /** CVE records for a file at a version (`GET /api/cve/file?version={v}&file_path={p}`). */
+  async getFileCves(version, filePath) {
+    const ver = this._sanitizeVer(version);
+    const q = new URLSearchParams({ version: ver, file_path: filePath || "" }).toString();
+    return this.request(`/api/cve/file?${q}`, {}, "tools", `cve_file_${this._vk(ver)}_${filePath}`);
+  }
+
+  /**
+   * An Insights report (`GET /api/insights/{v}/<path>`, §4.10): polls while its background job runs
+   * (202, §2.15). `cacheKey` (optional) keeps the final body in the `tools` store.
+   */
+  async getInsights(version, path, { onProgress = null, signal = null, cacheKey = null } = {}) {
+    const ver = this._sanitizeVer(version);
+    return this.requestJob(`/api/insights/${encodeURIComponent(ver)}/${path}`, { onProgress, signal, timeoutMs: 60000,
+      cacheStore: cacheKey ? "tools" : null, cacheKey });
+  }
+
+  /** A Kernel API catalog (`GET /api/kapi/{v}/<path>`, §4.9), polling while its job runs. */
+  async getKapi(version, path, { onProgress = null, signal = null, cacheKey = null } = {}) {
+    const ver = this._sanitizeVer(version);
+    return this.requestJob(`/api/kapi/${encodeURIComponent(ver)}/${path}`, { onProgress, signal, timeoutMs: 60000,
+      cacheStore: cacheKey ? "tools" : null, cacheKey: cacheKey ? `${cacheKey}_${this._vk(ver)}` : null });
+  }
+
   /** Cache-key form of a version: "<name>@<stamp>~" once its stamp is known (see versionStamps). */
   _vk(v) {
     const stamp = this.versionStamps[v];
     return stamp ? `${v}@${stamp}~` : v;
+  }
+
+  /**
+   * Ingestion status of the active repository (`GET /api/system/ingest`, §4.1, G11): versions parsed and
+   * being parsed, recent completions, database size, the server's tokens, jobs and caches. Always asked
+   * of the server (cached 10 s there); the last answer is kept for offline display.
+   */
+  async getIngestStatus() {
+    return this.request("/api/system/ingest", { networkFirst: true }, "tools", "ingest_status");
   }
 
   /** Server change tokens {db, frontend, parsed, git, repo}; never cached. `fresh` makes the server recompute them. */
@@ -406,6 +540,35 @@ class ApiClient {
     return this.withRepo(`/api/fs/compile_commands/${encodeURIComponent(ver)}/export?arch=${encodeURIComponent(arch)}`);
   }
 
+  /**
+   * Full-text search of a revision (`GET /api/fs/grep`, §4.2, §2.1.3). `opts`: {q, regex, caseSensitive,
+   * word, paths, limit}. Answers are kept in the `tools` store under the version's stamp (a commit's
+   * content never changes); a timed-out, partial answer is never stored.
+   */
+  async grepCode(version, opts = {}) {
+    const ver = this._sanitizeVer(version);
+    const params = grepParams(opts);
+    const cacheKey = `grep_${this._vk(ver)}_${params.toString()}`;
+    const scopedKey = this.repo ? `${this.repo}::${cacheKey}` : cacheKey;
+    const cached = await localDB.get("tools", scopedKey);
+    if (cached) return cached;
+    const data = await this.request(`/api/fs/grep/${encodeURIComponent(ver)}?${params}`, { timeoutMs: 30000 });
+    if (data && !data.timed_out) localDB.set("tools", scopedKey, data).catch(() => {});
+    return data;
+  }
+
+  /** What refers to a file at a revision (`GET /api/fs/references`, §4.2): includers, Kconfig sources, Kbuild rules, documents. */
+  async getFileReferences(version, path) {
+    const ver = this._sanitizeVer(version);
+    return this.request(`/api/fs/references/${encodeURIComponent(ver)}?path=${encodeURIComponent(path)}`, {}, "files", `fref_${this._vk(ver)}_${path}`);
+  }
+
+  /** Definitions of one file for the outline and sticky scroll (`GET /api/fs/outline`, §4.2, G03). */
+  async getOutline(version, path) {
+    const ver = this._sanitizeVer(version);
+    return this.request(`/api/fs/outline/${encodeURIComponent(ver)}?path=${encodeURIComponent(path)}`, {}, "files", `outline_${this._vk(ver)}_${path}`);
+  }
+
   async searchFiles(version, query, limit = 50) {
     const ver = this._sanitizeVer(version);
     const q = new URLSearchParams({ q: query, limit }).toString();
@@ -478,9 +641,17 @@ class ApiClient {
     return this.request(`/api/fs/file/${encodeURIComponent(ver)}?${q}`, {}, "files", `file_${this._vk(ver)}_${path}`);
   }
 
-  async getFileBlame(version, path) {
+  /** `git blame` of a file (§4.6); `opts` = {move, copy, ws} or their letters ("mcw", H9). */
+  async getFileBlame(version, path, opts = null) {
     const ver = this._sanitizeVer(version);
-    return this.request(`/api/commits/${encodeURIComponent(ver)}/blame/${encodeURIComponent(path)}`, {}, "files", `blame_${this._vk(ver)}_${path}`);
+    const query = blameQuery(opts);
+    const letters = typeof opts === "string" ? opts : formatBlameOpts(opts);
+    return this.request(
+      `/api/commits/${encodeURIComponent(ver)}/blame/${encodeURIComponent(path)}${query ? `?${query}` : ""}`,
+      { timeoutMs: opts && (opts.copy || String(opts).includes("c")) ? 45000 : 0 },
+      "files",
+      `blame2_${this._vk(ver)}_${letters}_${path}`,
+    );
   }
 
   async resolveInclude(version, header, astId = null, currentFile = null, arch = state.definitionContext().arch) {
@@ -532,6 +703,14 @@ class ApiClient {
     return this.request(`/api/symbols/${encodeURIComponent(ver)}/detail/${encodeURIComponent(symbolName)}?${params}`, {}, "symbols", `sym2_${this._vk(ver)}_${arch}_${symbolName}${fromFile ? `_from_${fromFile}` : ""}`);
   }
 
+  /** Hover card of a symbol (G04): kind, signature, definition, kernel-doc or Kconfig summary; cached like detail. */
+  async getSymbolHover(version, symbolName, arch, fromFile = null, signal = null) {
+    const ver = this._sanitizeVer(version);
+    const params = new URLSearchParams({ arch });
+    if (fromFile) params.set("from_file", fromFile);
+    return this.request(`/api/symbols/${encodeURIComponent(ver)}/hover/${encodeURIComponent(symbolName)}?${params}`, signal ? { signal } : {}, "symbols", `hover1_${this._vk(ver)}_${arch}_${symbolName}${fromFile ? `_from_${fromFile}` : ""}`);
+  }
+
   async getSymbolXref(version, symbolName, limit = null, arch = state.definitionContext().arch) {
     const ver = this._sanitizeVer(version);
     const params = new URLSearchParams({ arch });
@@ -581,6 +760,40 @@ class ApiClient {
     const ver = this._sanitizeVer(version);
     const q = new URLSearchParams({ arch }).toString();
     return this.request(`/api/kconfig/${encodeURIComponent(ver)}/defconfigs?${q}`, {}, "kconfigs", `defconfigs_${this._vk(ver)}_${arch}`);
+  }
+
+  /** Run checkpatch.pl of the configured release tag on a patch (P4; {enabled: false} when the operator has not enabled it). */
+  async checkpatch(version, patch) {
+    const ver = this._sanitizeVer(version);
+    return this.request(`/api/tools/${encodeURIComponent(ver)}/checkpatch`, { method: "POST", body: JSON.stringify({ patch }), timeoutMs: 60000 });
+  }
+
+  /** Format a multi-file patch series (P3): {patches: [{name, subject, text}], mbox, diffstat, base, check}. */
+  async formatPatchSeries(version, payload) {
+    const ver = this._sanitizeVer(version);
+    return this.request(`/api/version/${encodeURIComponent(ver)}/patch/series`, { method: "POST", body: JSON.stringify(payload), timeoutMs: 60000 });
+  }
+
+  /** Apply archive messages (series order) to a revision in memory (P1): results per patch, file and hunk. */
+  async applyMailPatches(revision, messageIds) {
+    return this.request(`/api/mail/apply`, { method: "POST", body: JSON.stringify({ revision, message_ids: messageIds }), timeoutMs: 60000 });
+  }
+
+  /** Changed lines of one patched file (blob-diff hunk shape); a 410 means the result was evicted: apply again. */
+  async getAppliedFile(applyId, path) {
+    return this.request(`/api/mail/apply/${encodeURIComponent(applyId)}/file?${new URLSearchParams({ path })}`);
+  }
+
+  /** Configuration fragments of a revision (K2): kernel/configs/*.config and arch/$SRCARCH/configs/*.config. */
+  async getKconfigFragments(version, arch = "x86_64") {
+    const ver = this._sanitizeVer(version);
+    return this.request(`/api/kconfig/${encodeURIComponent(ver)}/fragments?${new URLSearchParams({ arch })}`, {}, "kconfigs", `fragments_${this._vk(ver)}_${arch}`);
+  }
+
+  /** Objects and required symbols of module names (K1; `gates` adds every symbol gating a module-capable object). */
+  async getKbuildModules(version, arch, names, { gates = false, onProgress = null, signal = null } = {}) {
+    const ver = this._sanitizeVer(version);
+    return this.requestJob(`/api/kconfig/${encodeURIComponent(ver)}/kbuild/modules`, { method: "POST", body: { arch, names: names.slice(0, 2000), gates }, onProgress, signal, timeoutMs: 120000 });
   }
 
   /** Defconfig text (empty filePath: the arch's default, i.e. what `make ARCH=<arch> defconfig` loads). */

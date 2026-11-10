@@ -70,3 +70,62 @@ class TestWebappSystem(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestIngestStatus(unittest.TestCase):
+    """GET /api/system/ingest (G11): shape, stale detection, read-only SQL, repository scoping."""
+
+    def _run(self, states, refs, tables, now=1_000_000.0, network_id=7, repo_id=3):
+        from webapp.backend.routers import system
+        cursor = MagicMock()
+        results = [states, refs, tables]
+        cursor.fetchall.side_effect = lambda: results.pop(0)
+        with patch.object(system, "get_db_cursor") as get_cursor, \
+                patch.object(system, "get_active_network_id", return_value=network_id), \
+                patch.object(system, "get_active_repo_id", return_value=repo_id), \
+                patch.object(system, "_git_tag_count", return_value=10):
+            get_cursor.return_value.__enter__.return_value = cursor
+            out = system.ingest_status(now)
+        return out, cursor
+
+    def test_shape_and_staleness(self) -> None:
+        now = 1_000_000.0
+        states = [
+            {"commit_id": 1, "status": 1, "updated_at": int(now - 60), "commit_hash": "a" * 40},
+            {"commit_id": 2, "status": 1, "updated_at": int(now - 3600), "commit_hash": "b" * 40},
+            {"commit_id": 3, "status": 2, "updated_at": int(now - 10), "commit_hash": "c" * 40},
+        ]
+        refs = [{"commit_id": 1, "ref_name": "v3.2-rc4"}, {"commit_id": 3, "ref_name": "v3.1"}]
+        tables = [{"TABLE_NAME": "m_ast", "TABLE_ROWS": 5, "DATA_LENGTH": 3 << 20, "INDEX_LENGTH": 1 << 20}]
+        out, cursor = self._run(states, refs, tables, now)
+        self.assertEqual(out["catalog"], {"tags": 10, "parsed": 1, "parsing": 2, "git_only": 9})
+        self.assertEqual([(p["version"], p["stale"]) for p in out["parsing"]], [("v3.2-rc4", False), ("b" * 12, True)])
+        self.assertEqual(out["recent"], [{"version": "v3.1", "commit": "c" * 12, "finished_at": int(now - 10)}])
+        self.assertEqual(out["db"], {"tables": [{"name": "m_ast", "rows_estimate": 5, "data_mb": 3.0, "index_mb": 1.0}], "total_mb": 4.0})
+        # Read-only (section 2.5) and scoped to the active repository's network and refs
+        for call in cursor.execute.call_args_list:
+            sql = call[0][0].strip().upper()
+            self.assertTrue(sql.startswith("SELECT"), sql)
+            for word in ("INSERT", "UPDATE ", "DELETE", "CREATE", "ALTER", "DROP"):
+                self.assertNotIn(word, sql)
+        self.assertEqual(cursor.execute.call_args_list[0][0][1][0], 7)
+        self.assertEqual(cursor.execute.call_args_list[1][0][1], (3,))
+
+    def test_unparsed_repository_and_missing_database(self) -> None:
+        from webapp.backend.routers import system
+        cursor = MagicMock()
+        cursor.fetchall.return_value = []
+        with patch.object(system, "get_db_cursor") as get_cursor, \
+                patch.object(system, "get_active_network_id", return_value=None), \
+                patch.object(system, "get_active_repo_id", return_value=-1), \
+                patch.object(system, "_git_tag_count", return_value=4):
+            get_cursor.return_value.__enter__.return_value = cursor
+            out = system.ingest_status(1.0)
+        self.assertEqual(out["catalog"]["parsed"], 0)
+        self.assertEqual(out["catalog"]["git_only"], 4)
+        self.assertEqual(cursor.execute.call_count, 1)  # only information_schema
+        with patch.object(system, "get_db_cursor", side_effect=Exception("no database")), \
+                patch.object(system, "_git_tag_count", return_value=None):
+            out = system.ingest_status(1.0)
+        self.assertFalse(out["available"])
+        self.assertIn("no database", out["error"])

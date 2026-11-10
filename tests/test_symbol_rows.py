@@ -165,7 +165,8 @@ class TestViewRows(unittest.TestCase):
             "m_bridge_tag": [(7, 30, 100, 110, 1, 1), (8, 30, 200, 210, 1, 1)],
             "m_tag_def": [(30, 0, 111, "foo", 21, 1, 0, 10)],
             "m_tag_ref": [(30, 0, 222, 3, 4, 9)],
-            "m_blob_symbol": [(7, 111, 500, 0), (7, 222, 600, 0), (8, 111, 501, 0), (8, 222, 601, 5)],
+            "m_blob_symbol": [(7, 111, 500), (7, 222, 600), (8, 111, 501), (8, 222, 601)],
+            "m_blob_symbol_file": [(8, 222, 5)],
             "m_symbol_own": list(own),
             "m_blob_symbol_def": [(1, 8, 30, 777, "foo", 21, 1, 201, 211)],
             "m_blob_symbol_ref": [],
@@ -186,36 +187,12 @@ class TestViewRows(unittest.TestCase):
         self.assertEqual([r[1] for r in refs], [7])
 
 
-class _LegacyCursor:
-    """Like mysql-connector 8.0's MySQLCursor: no context manager protocol, only close()."""
-
-    def __init__(self, names: list[str]) -> None:
-        self.names = names
-        self.closed = False
-
-    def close(self) -> None:
-        self.closed = True
-
-    def execute(self, sql: str, params=None) -> None:
-        self.sql = sql
-
-    def fetchall(self) -> list:
-        return [(n,) for n in self.names]
-
-
 class TestOldLayoutGuard(unittest.TestCase):
     def test_database_with_per_blob_tables_is_refused(self) -> None:
-        cursors: list[_LegacyCursor] = []
-
-        def cursor() -> _LegacyCursor:
-            cursors.append(_LegacyCursor(["m_symbol_def", "m_symbol_ref"]))
-            return cursors[-1]
-
-        db = types.SimpleNamespace(cnx=types.SimpleNamespace(cursor=cursor))
+        db = types.SimpleNamespace(query=lambda sql, params=None, dictionary=False: [("m_symbol_def",), ("m_symbol_ref",)])
         with self.assertRaises(RuntimeError) as ctx:
             main.ensure_db_views(db)
         self.assertIn("--reset", str(ctx.exception))
-        self.assertTrue(all(c.closed for c in cursors))
 
 
 class TestRelativePaths(unittest.TestCase):

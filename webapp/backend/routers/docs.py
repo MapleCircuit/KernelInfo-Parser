@@ -24,8 +24,9 @@ def get_kernel_doc(
     export: bool = Query(False),
     internal: bool = Query(False),
     functions: str = Query(""),
+    identifiers: str = Query(""),
     doc: str = Query(""),
     no_identifiers: str = Query(""),
 ) -> dict[str, Any]:
     """kernel-doc comments of a source file, filtered like the `.. kernel-doc::` directive options."""
-    return docs_service.get_kernel_doc(version_name, path, export, internal, functions, doc, no_identifiers)
+    return docs_service.get_kernel_doc(version_name, path, export, internal, functions, doc, no_identifiers, identifiers=identifiers)

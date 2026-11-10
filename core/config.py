@@ -12,6 +12,7 @@ import fnmatch
 import json
 import logging
 import os
+import re
 import stat
 import subprocess
 from pathlib import Path
@@ -115,6 +116,28 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "host": "0.0.0.0",
         "port": 8000,
         "reload": True,
+        # Disk cache of derived data under KERNELINFO_CACHE_DIR (webapp/API.md section 2.14)
+        "cache": {"max_mb": 1024},
+        # Background jobs: worker threads per process (webapp/API.md section 2.15)
+        "jobs": {"workers": 2},
+        # Build the commit relation and Kbuild object indexes at startup (webapp/API.md section 2.12)
+        "prewarm_indexes": False,
+        # Repository scripts the webapp may run (webapp/API.md section 2.18): off by default. checkpatch.pl
+        # is taken only from `ref` ("latest-release" or a release tag), never from a caller's revision;
+        # `sandbox` optionally names a wrapper command (e.g. "bwrap") the run goes through.
+        "tools": {"checkpatch": {"enabled": False, "ref": "latest-release"}, "sandbox": ""},
+        # Source index (webapp/API.md section 2.19): the facts of ingested blobs come from the database (written by
+        # the parser, Step 6.9); these low-priority processes only extract blobs it lacks (revisions the parser never
+        # ingested), into a SQLite store capped at max_mb (least recently used blobs dropped past it). Assembled
+        # revisions are kept on disk (at most `revisions`), so a restart does not assemble them again.
+        "source_index": {"workers": 2, "max_mb": 1024, "revisions": 8},
+    },
+    # CVE records: a local clone of the CVE Program's list (cvelistV5) or of the kernel CNA's vulns.git, kept
+    # current by the operator (git pull). The parser ingests it into m_cve / m_cve_commit when its HEAD changed
+    # (at the start of every run, or alone with --cve; core/API.md section 9); the webapp reads those tables
+    # (webapp/API.md section 4.11). A relative path is under the project root; empty, or no clone there: off.
+    "cve": {
+        "repo_dir": "cvelistV5",
     },
     "parser": {
         "table_engine": "cached",
@@ -129,6 +152,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "cache_max_table_mb": 0,
         # "tag": symbol definitions/references stored once per tag (core/SymbolRows.py); "blob": per blob
         "symbol_layout": "tag",
+        # A version's checkpoint is kept as a delta of an earlier full one once the next version is ingested,
+        # when it differs from it in at most this share of its files (core/checkpoints.py); 0 keeps every one full
+        "checkpoint_delta_ratio": 0.3,
+        # Processes extracting the functions/calls/ops tables of new C blobs (Step 6.9, m_blob_facts)
+        "facts_workers": 4,
         "single_version": False,
         "include_pre_releases": True,
     },
@@ -710,12 +738,29 @@ def find_repository_branches(
 
     def_b = default_branch or ("main" if "main" in candidates else ("master" if "master" in candidates else ""))
 
-    def branch_sort_key(b: str) -> tuple[int, str]:
+    def branch_sort_key(b: str) -> tuple[int, tuple, str]:
+        # Tier 0: History trunk
+        if b in ("history/master", "history/HEAD"):
+            return (0, (), b)
+        # Tier 1: Secondary history branches
+        if b.startswith("history/"):
+            return (1, (), b)
+        # Tier 2: Mainline default branch or main/master
         if def_b and b == def_b:
-            return (0, b)
-        if b in ("main", "master"):
-            return (1, b)
-        return (2, b)
+            return (2, (0,), b)
+        if b in ("master", "main", "origin/master", "origin/main"):
+            return (2, (1,), b)
+        # Tier 3: Stable series sorted by dotted version numbers
+        if b.startswith("stable/") or (b.startswith("linux-") and not b.startswith("linux-next/")):
+            nums = tuple(int(n) for n in re.findall(r"\d+", b))
+            return (3, nums if nums else (999,), b)
+        # Tier 4: Linux-next integration branches (linux-next/master first)
+        if b in ("linux-next/master", "linux-next/HEAD"):
+            return (4, (0,), b)
+        if b.startswith("linux-next/") or b.startswith("next/"):
+            return (4, (1,), b)
+        # Tier 5: Remaining topic branches
+        return (5, (), b)
 
     candidates.sort(key=branch_sort_key)
     return candidates

@@ -5,7 +5,7 @@ import re
 import subprocess
 import time
 import urllib.parse
-from webapp.backend.config import get_repo_dir
+from webapp.backend.config import RepoScopedCache, get_repo_dir
 from functools import lru_cache
 from typing import Any
 from fastapi import HTTPException
@@ -25,6 +25,11 @@ from webapp.backend.services.mailing_list_service import LORE_BASE_URL
 logger = logging.getLogger(__name__)
 
 _HEX_REF = re.compile(r"[0-9a-f]{4,40}")
+# (path, blob_id) -> the only ingested commit that wrote this content at this path (dict), or False when
+# m_commit_file holds zero or several such commits; never stale (commit rows are immutable)
+_LAST_WRITER_CACHE: dict[tuple[str, int], Any] = RepoScopedCache(maxsize=4096)
+# commit_ids of finished version ingestions
+_FINISHED_CACHE: dict[int, bool] = RepoScopedCache(maxsize=4096)
 _EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
 _HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@ ?(.*)$")
 MAX_COMMIT_PAGE = 500
@@ -182,6 +187,73 @@ def _cached_git_file_history(
     return last_changed, commits
 
 
+def _is_finished_version(cursor: Any, commit_id: int) -> bool:
+    """True when commit_id is the head of a finished version ingestion (m_ingest_state status 2)."""
+    hit = _FINISHED_CACHE.get(commit_id)
+    if hit:
+        return True
+    cursor.execute("SELECT 1 AS ok FROM m_ingest_state WHERE commit_id = %s AND status = 2 LIMIT 1;", (commit_id,))
+    ok = cursor.fetchone() is not None
+    if ok:  # a finished version stays finished; an unfinished one is asked again
+        _FINISHED_CACHE[commit_id] = True
+    return ok
+
+
+# Names of m_bridge_commit_person.role_type (parser/git_ast/git_types.CommitRole)
+ROLE_NAMES = {
+    1: "Author",
+    2: "Committer",
+    3: "Co-developed-by",
+    4: "Signed-off-by",
+    5: "Reviewed-by",
+    6: "Acked-by",
+    7: "Tested-by",
+    8: "Reported-by",
+    9: "Suggested-by",
+    10: "Merged-by",
+    11: "Requested-by",
+    12: "Other",
+}
+
+
+def message_trailers(message: str) -> list[dict[str, Any]]:
+    """Contributor trailers of a commit message as the database path reports them: every trailer
+    `iter_trailers()` reads (all roles, name-less and bare addresses), the person normalized like the
+    parser's (`identity.person_key`), one entry per (person, role) in message order."""
+    from parser.git_ast.git_commit_parser import iter_trailers
+    from parser.git_ast.git_types import CommitRole
+    from parser.git_ast.identity import person_key
+    out: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, int]] = set()
+    for prefix, t_name, t_email in iter_trailers(message):
+        role = int(CommitRole.from_trailer_prefix(prefix))
+        name, email = person_key(t_name or t_email, t_email)
+        key = (name.lower(), email.lower(), role)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append({"person_id": 0, "name": name[:128], "email": email[:128], "role_type": role, "role_name": ROLE_NAMES.get(role, "Contributor")})
+    return out
+
+
+def merge_contributors(trailers: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """One contributor per person (name, email), with all their roles in trailer order."""
+    contributors_map: dict[tuple[str, str], dict[str, Any]] = {}
+    for t in trailers:
+        key = ((t["name"] or "").strip().lower(), (t["email"] or "").strip().lower())
+        if key not in contributors_map:
+            contributors_map[key] = {
+                "name": t["name"],
+                "email": t["email"],
+                "roles": [t["role_name"]],
+                "role_types": [t["role_type"]],
+            }
+        elif t["role_name"] not in contributors_map[key]["roles"]:
+            contributors_map[key]["roles"].append(t["role_name"])
+            contributors_map[key]["role_types"].append(t["role_type"])
+    return list(contributors_map.values())
+
+
 class GitService:
     """Service handling git blame, paginated commit history, and patch formatting."""
 
@@ -197,51 +269,61 @@ class GitService:
         )
         return proc.stdout, proc.stderr, proc.returncode
 
-    def get_blame(self, version_name: str, file_path: str) -> dict[str, Any]:
-        """Line-by-line `git blame` of a file at a revision: the commit, author, date and subject of each line."""
-        import urllib.parse
-        clean_file_path = urllib.parse.unquote(str(file_path).strip()).strip("/")
-        target_path = resolve_and_verify_repo_path(clean_file_path)
-        rel_path = str(target_path.relative_to(get_repo_dir()))
+    # Blame options (webapp/API.md section 4.6): follow moved lines (-M), copied lines (-C, one level),
+    # ignore whitespace (-w). Following copies compares against every file of the commit: slower.
+    BLAME_TIMEOUT = 12.0
+    BLAME_COPY_TIMEOUT = 30.0
+    BLAME_SLOW_S = 10.0
 
-        with get_db_cursor() as cursor:
-            vid, vname = get_version_info(cursor, version_name)
-        # An unresolved version falls back to the raw name, which git would read as an option
-        rev = safe_rev(vname or str(version_name).strip(), "version")
+    @staticmethod
+    def blame_flags(move: bool = False, copy: bool = False, ignore_ws: bool = False) -> list[str]:
+        flags = []
+        if move:
+            flags.append("-M")
+        if copy:
+            flags.append("-C")
+        if ignore_ws:
+            flags.append("-w")
+        return flags
 
-        try:
-            # --porcelain names each commit's author and summary once, on its first line only
-            stdout, stderr, code = self.run_git(["blame", "--porcelain", rev, "--", rel_path])
-        except subprocess.TimeoutExpired:
-            raise HTTPException(status_code=504, detail="Git blame operation timed out.") from None
-        if code != 0:
-            raise HTTPException(status_code=404, detail=f"Git blame failed: {stderr.strip() or 'Unknown error'}")
-
+    @staticmethod
+    def parse_blame_porcelain(stdout: str) -> list[dict[str, Any]]:
+        """Lines of `git blame --porcelain`: commit, author, date, subject, plus the line number in the
+        blamed commit's version (`orig_line`), the path there (`source_path`, differs after -M/-C followed
+        a move or copy) and the commit before it (`previous_sha`, `previous_path`; absent for root commits)."""
         commits: dict[str, dict[str, Any]] = {}
         entries: list[dict[str, Any]] = []
         info: dict[str, Any] | None = None
         sha = ""
         final_line = 1
+        orig_line = 1
         for raw_line in stdout.split("\n"):
             line = raw_line.rstrip("\r")
             if not line:
                 continue
             if line.startswith("\t"):
-                entries.append({
+                entry = {
                     "line": final_line,
+                    "orig_line": orig_line,
                     "commit_hash": sha,
                     "author_name": info.get("author", "Unknown") if info else "Unknown",
                     "author_email": info.get("author_mail", "") if info else "",
                     "date": info.get("author_time", 0) if info else 0,
                     "subject": info.get("summary", "") if info else "",
-                })
+                    "source_path": info.get("filename", "") if info else "",
+                }
+                if info and info.get("previous_sha"):
+                    entry["previous_sha"] = info["previous_sha"]
+                    entry["previous_path"] = info.get("previous_path", "")
+                entries.append(entry)
                 info = None
                 continue
             if info is None:
                 # Line header: "<sha> <orig_line> <final_line> [<lines in group>]"
                 parts = line.split(" ")
-                if len(parts) >= 3 and parts[2].isdigit():
+                if len(parts) >= 3 and parts[1].isdigit() and parts[2].isdigit():
                     sha = parts[0]
+                    orig_line = int(parts[1])
                     final_line = int(parts[2])
                     info = commits.setdefault(sha, {})
             elif line.startswith("author "):
@@ -252,21 +334,130 @@ class GitService:
                 info["author_time"] = int(line[12:]) if line[12:].isdigit() else 0
             elif line.startswith("summary "):
                 info["summary"] = line[8:]
+            elif line.startswith("filename "):
+                # Per line group, not per commit: a commit can reach the file from several paths
+                info["filename"] = line[9:]
+            elif line.startswith("previous "):
+                prev = line[9:].split(" ", 1)
+                if len(prev) == 2 and len(prev[0]) >= 7:
+                    info["previous_sha"], info["previous_path"] = prev[0], prev[1]
+        return entries
 
+    def get_blame(self, version_name: str, file_path: str, *, move: bool = False, copy: bool = False,
+                  ignore_ws: bool = False) -> dict[str, Any]:
+        """Line-by-line `git blame` of a file at a revision: the commit, author, date and subject of each
+        line, where the line was in that commit and the commit before it (\"blame before this change\")."""
+        import urllib.parse
+        clean_file_path = urllib.parse.unquote(str(file_path).strip()).strip("/")
+        target_path = resolve_and_verify_repo_path(clean_file_path)
+        rel_path = str(target_path.relative_to(get_repo_dir()))
+
+        with get_db_cursor() as cursor:
+            vid, vname = get_version_info(cursor, version_name)
+        # An unresolved version falls back to the raw name, which git would read as an option
+        rev = safe_rev(vname or str(version_name).strip(), "version")
+        flags = self.blame_flags(move, copy, ignore_ws)
+        timeout = self.BLAME_COPY_TIMEOUT if copy else self.BLAME_TIMEOUT
+        started = time.monotonic()
+        try:
+            # --porcelain names each commit's author and summary once, on its first line only
+            stdout, stderr, code = self.run_git(["blame", "--porcelain", *flags, rev, "--", rel_path], timeout=timeout)
+        except subprocess.TimeoutExpired:
+            raise HTTPException(status_code=504, detail="Git blame operation timed out.") from None
+        if code != 0:
+            raise HTTPException(status_code=404, detail=f"Git blame failed: {stderr.strip() or 'Unknown error'}")
+        elapsed = time.monotonic() - started
         return {
             "version": vname or version_name,
             "vid": vid,
             "path": rel_path,
-            "lines": entries,
+            "options": {"move": bool(move), "copy": bool(copy), "ignore_ws": bool(ignore_ws)},
+            "slow": elapsed > self.BLAME_SLOW_S,
+            "elapsed_ms": int(elapsed * 1000),
+            "lines": self.parse_blame_porcelain(stdout),
         }
 
-    def get_file_last_changed(self, version_name: str, file_path: str) -> dict[str, Any] | None:
-        """Retrieve the most recent git commit modifying file_path up to version_name."""
+    def get_file_last_changed(self, version_name: str, file_path: str, blob_id: int | None = None) -> dict[str, Any] | None:
+        """Retrieve the most recent git commit modifying file_path up to version_name.
+
+        With the indexed blob of the file (`blob_id`), the database answers when exactly one ingested
+        commit wrote this content at this path (`m_commit_file`) and that commit is an ancestor of the
+        revision: content at the revision equals that write, so no later commit can have touched the path
+        without another write of the same content. Rows of version head commits are ignored: databases
+        ingested before 2026-11-07 hold version-diff rows there (core/API.md section 4, row 23). Otherwise
+        `git log -n1`."""
+        if blob_id:
+            try:
+                hit = self._db_last_changed(version_name, file_path, int(blob_id))
+            except Exception:  # noqa: BLE001 - Git answers
+                hit = None
+            if hit is not None:
+                return hit
         try:
             history = self.get_file_history(version_name, file_path, limit=1)
             return history.get("last_changed")
         except Exception:
             return None
+
+    @staticmethod
+    def _db_last_changed(version_name: str, file_path: str, blob_id: int) -> dict[str, Any] | None:
+        """The database form of get_file_last_changed() (None: ask Git)."""
+        path = str(file_path).strip().strip("/")
+        key = (path, blob_id)
+        writer = _LAST_WRITER_CACHE.get(key)
+        if writer is None:
+            writer = False
+            with get_db_cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT cf.commit_id
+                    FROM m_file_name fn
+                    JOIN m_commit_file cf ON cf.fnid = fn.fnid
+                    WHERE fn.fname = %s AND cf.blob_id = %s
+                      AND NOT EXISTS (SELECT 1 FROM m_ingest_state s WHERE s.commit_id = cf.commit_id)
+                    LIMIT 2;
+                    """,
+                    (path, blob_id),
+                )
+                rows = cursor.fetchall()
+                if len(rows) == 1:
+                    cursor.execute(
+                        """
+                        SELECT c.commit_hash, c.author_date, c.subject, p.name AS author_name, p.email AS author_email
+                        FROM m_commit c
+                        LEFT JOIN m_maintainer_person p ON p.person_id = c.author_id
+                        WHERE c.commit_id = %s;
+                        """,
+                        (rows[0]["commit_id"],),
+                    )
+                    c = cursor.fetchone()
+                    if c:
+                        chash = format_commit_hash(c["commit_hash"])
+                        adate = int(c["author_date"] or 0)
+                        from datetime import datetime, timezone
+                        writer = {
+                            "commit_id": int(rows[0]["commit_id"]),
+                            "commit_hash": chash,
+                            "commit_hash_short": chash[:10],
+                            "author_name": safe_decode(c["author_name"]) or "",
+                            "author_email": safe_decode(c["author_email"]) or "",
+                            "author_date": adate,
+                            "author_date_iso": datetime.fromtimestamp(adate, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S") if adate else "",
+                            "subject": safe_decode(c["subject"]) or "",
+                            "source": "db",
+                        }
+            _LAST_WRITER_CACHE[key] = writer
+        if not writer:
+            return None
+        # The writer must be in the revision's history. A finished version's commits were ingested with it or
+        # before it (every non-merge commit of its range has m_commit_file rows), so a writer with a higher
+        # commit_id is not its ancestor; other revisions ask Git (merge-base costs as much as git log).
+        with get_db_cursor() as cursor:
+            vid, _vname = get_version_info(cursor, version_name)
+            if not vid or vid <= 0 or writer["commit_id"] > vid or not _is_finished_version(cursor, int(vid)):
+                return None
+        out = {k: v for k, v in writer.items() if k != "commit_id"}
+        return out
 
     def get_file_history(
         self, version_name: str, file_path: str, limit: int = 50
@@ -597,20 +788,7 @@ class GitService:
             files = [{"change_type": safe_decode(r["change_type"]), "file": safe_decode(r["fname"])} for r in cursor.fetchall()]
 
             # Contributor trailers (trailers have role_type >= 3, excluding author=1 and committer=2)
-            role_names = {
-                1: "Author",
-                2: "Committer",
-                3: "Co-developed-by",
-                4: "Signed-off-by",
-                5: "Reviewed-by",
-                6: "Acked-by",
-                7: "Tested-by",
-                8: "Reported-by",
-                9: "Suggested-by",
-                10: "Merged-by",
-                11: "Requested-by",
-                12: "Other",
-            }
+            role_names = ROLE_NAMES
             cursor.execute(
                 """
                 SELECT p.person_id, p.name, p.email, bp.role_type
@@ -633,22 +811,7 @@ class GitService:
                 for r in raw_trailers
             ]
 
-            # Deduplicate contributors by person, consolidating all their roles without duplication
-            contributors_map: dict[str, dict[str, Any]] = {}
-            for t in trailers:
-                key = ((t["name"] or "").strip().lower(), (t["email"] or "").strip().lower())
-                if key not in contributors_map:
-                    contributors_map[key] = {
-                        "name": t["name"],
-                        "email": t["email"],
-                        "roles": [t["role_name"]],
-                        "role_types": [t["role_type"]],
-                    }
-                else:
-                    if t["role_name"] not in contributors_map[key]["roles"]:
-                        contributors_map[key]["roles"].append(t["role_name"])
-                        contributors_map[key]["role_types"].append(t["role_type"])
-            contributors = list(contributors_map.values())
+            contributors = merge_contributors(trailers)
 
             # Linked mailing list emails from m_commit_email
             tier_names = {
@@ -746,42 +909,9 @@ class GitService:
             logger.warning("Git inspection for commit %s failed: %s", ref, exc)
             raise HTTPException(status_code=500, detail="Failed to inspect commit in Git.") from exc
 
-        # Parse contributor trailers from commit message
-        trailers = []
-        contributors = []
-        seen_contribs = set()
-        TRAILER_ROLES = {
-            "signed-off-by": (4, "Signed-off-by"),
-            "reviewed-by": (5, "Reviewed-by"),
-            "acked-by": (6, "Acked-by"),
-            "tested-by": (7, "Tested-by"),
-            "reported-by": (8, "Reported-by"),
-            "suggested-by": (9, "Suggested-by"),
-            "co-developed-by": (3, "Co-developed-by"),
-        }
-        for line in message.splitlines():
-            line = line.strip()
-            if ":" not in line:
-                continue
-            key, val = line.split(":", 1)
-            key_clean = key.strip().lower()
-            val_clean = val.strip()
-            if key_clean in TRAILER_ROLES and "<" in val_clean and ">" in val_clean:
-                role_type, role_name = TRAILER_ROLES[key_clean]
-                trailers.append({"role_type": role_type, "role_name": role_name, "raw_val": val_clean})
-                c_name = val_clean.split("<")[0].strip()
-                c_email = val_clean.split("<")[1].split(">")[0].strip()
-                c_key = (c_name.lower(), c_email.lower())
-                if c_key not in seen_contribs:
-                    seen_contribs.add(c_key)
-                    contributors.append({
-                        "person_id": 0,
-                        "name": c_name,
-                        "email": c_email,
-                        "role_type": role_type,
-                        "role_name": role_name,
-                        "roles": [role_name],
-                    })
+        # Contributor trailers, read as version ingestion stores them (m_bridge_commit_person)
+        trailers = message_trailers(message)
+        contributors = merge_contributors(trailers)
 
         detail = {
             "commit_id": sha,

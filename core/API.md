@@ -1,6 +1,22 @@
 # Core Subsystem API & State Architecture Specification
 
-Dense architectural contract and state interaction reference across `globalstuff.py`, `FileHandler.py`, `GreatProcessor.py`, `DBLayout.py`, and `TableHandling.py`. Designed as an authoritative reference for AI agents.
+Dense architectural contract and state interaction reference across `globalstuff.py`, `FileHandler.py`,
+`GreatProcessor.py`, `DBLayout.py`, and `TableHandling.py`. Designed as an authoritative reference for AI
+agents.
+
+## Table of Contents
+- **§1**: Global Runtime & Type Subsystem (`core/globalstuff.py`) [L23-L211]
+- **§2**: Filesystem & Git Subsystem (`core/FileHandler.py`) [L212-L279]
+- **§3**: Runtime State & Multiprocessing IPC (`core/GreatProcessor.py`) [L280-L459]
+- **§4**: Relational Database Schema Registry (`core/DBLayout.py`, `core/ingest_state.py`, `core/checkpoints.py`) [L460-L641]
+- **§5**: Data Staging, Routing & Reference Resolution (`core/TableHandling.py`) [L642-L801]
+- **§6**: End-to-End Inter-Module Execution Lifecycle [L802-L943]
+- **§7**: Configuration & SSH Port Forwarding (`core/config.py`, `core/ssh_tunnel.py`) [L944-L1172]
+- **§8**: Mailing List Commit Resolver (`parser/mailing_list/`) [L1173-L1421]
+- **§9**: CVE List Ingestion (`parser/cve/`) [L1422-L1454]
+- **§10**: Release Statistics (`parser/git_ast/release_stats.py`) [L1455-L1508]
+- **§11**: Distributed Multi-Computer Parsing (`core/distributed.py`) [L1509-L1599]
+- **§12**: Backfills of Derived Tables (`core/backfills.py`) [L1600-L1635]
 
 ---
 
@@ -8,56 +24,105 @@ Dense architectural contract and state interaction reference across `globalstuff
 
 ### 1.1. Singleton Context (`G = GlobalStuff()`)
 - **Engine & Driver Handles**:
-  - `G.DB`: Active database driver instance (`BaseDBEngine` / `MariaDB` / `MockDB`).
+  - `G.DB`: Active database driver instance (`BaseDBEngine` / `MariaDB` / `MockDB`). All persistence, queries, DDL, and state tracking across `core/`, `main.py`, and backfills must route through this handle; raw driver socket or cursor access (`db.cnx`) is strictly prohibited.
   - `G.TE`: Active TableEngine instance (`TECachedDB` or `TEDirectDB`).
   - `G.MF`: Active `MasterFile` instance.
 - **Environment & Configuration**:
   - `G.RAMDISK`: Path to temporary working directory mount (default `"/dev/shm"`).
   - `G.CPUS`: Worker process count for parallel parsing (default `8`).
-  - `G.linux_directory`: Active repository location. Defaults to `repos/linux` until `main()` selects the configured repository (`MF.set_repo_dir()`).
+  - `G.linux_directory`: Active repository location. Defaults to `repos/linux` until `main()` selects the
+    configured repository (`MF.set_repo_dir()`).
   - `G.CURRENT_PARSING_FILE`: Thread/process-local relative file path for log formatting.
-  - `G.LOW_MEMORY_MODE`: Enabled via `--low-mem`; throttles worker pool to `CPUS // 2` (batch size 50) and executes chunked commits every 500 ChangeSets.
-  - `G.VERY_LOW_MEMORY_MODE`: Enabled via `--very-low-mem`; limits workers to `min(2, CPUS // 4)` (batch size 25) with chunked commits every 300 ChangeSets for hosts with < 64GB RAM.
+  - `G.LOW_MEMORY_MODE`: Enabled via `--low-mem`; throttles worker pool to `CPUS // 2` (batch size 50) and
+    executes chunked commits every 500 ChangeSets.
+  - `G.VERY_LOW_MEMORY_MODE`: Enabled via `--very-low-mem`; limits workers to `min(2, CPUS // 4)` (batch size
+    25) with chunked commits every 300 ChangeSets for hosts with < 64GB RAM.
   - `G.MEMORY_MODE`: String indicator (`"normal"`, `"low"`, `"very-low"`).
 - **Flags & Debugging**:
   - `G.DEBUG_TYPECHECK`: Enables runtime assertions on type validation decorators.
   - `G.BP_ON_SHUTDOWN`: Triggers `sys.breakpointhook()` on emergency exit.
   - `G.BP_ON_REF_FAIL`: Triggers `sys.breakpointhook()` when a `RefType` cannot be resolved.
   - `G.PROFILING_ENABLED`: Enables AST & execution duration profiling.
-  - `G.STAGE_PROFILER`: System-level `PipelineStageProfiler` instance tracking end-to-end stage wall-clock timings, items/throughput, parallel worker CPU breakdowns, and top identified bottlenecks. Worker profiles with no measured time (e.g. directory ChangeSets) are not counted as parsed files; the CPU breakdown lists only measured components, with `include_symbols_s` (`extract_include_symbols()`) separate from the libclang parse; percent cells are padded before they are coloured, so columns stay aligned.
-  - `G.EXECUTION_DEADLINE`: Optional UNIX timestamp epoch after which pipeline stages halt early and print diagnostic profiling summaries.
+  - `G.STAGE_PROFILER`: System-level `PipelineStageProfiler` instance tracking end-to-end stage wall-clock
+    timings, items/throughput, parallel worker CPU breakdowns, and top identified bottlenecks. Worker profiles
+    with no measured time (e.g. directory ChangeSets) are not counted as parsed files; the CPU breakdown lists
+    only measured components, with `include_symbols_s` (`extract_include_symbols()`) separate from the
+    libclang parse; percent cells are padded before they are coloured, so columns stay aligned.
+  - `G.EXECUTION_DEADLINE`: Optional UNIX timestamp epoch after which pipeline stages halt early and print
+    diagnostic profiling summaries.
 - **Control Methods & Utilities**:
-  - `G.set_execution_deadline(duration_s: float | None) -> None`: Sets an execution deadline duration in seconds from invocation.
+  - `G.set_execution_deadline(duration_s: float | None) -> None`: Sets an execution deadline duration in
+    seconds from invocation.
   - `G.is_deadline_exceeded() -> bool`: Returns True if the execution deadline has been reached.
   - `G.get_time_remaining() -> float | None`: Returns remaining seconds until execution deadline.
-- **Interactive quit (`core/quit_listener.py`)**: `GracefulQuitListener` puts an interactive POSIX terminal in cbreak mode (no echo or line buffering; Ctrl+C still raises SIGINT) and reads keys on a daemon thread. Pressing `q`/`Q` sets `requested` and logs `[Quit Requested]`; the release loop in `main()` checks it before each version, so the version being parsed finishes and commits, the remaining versions are skipped, and the profiler report and normal shutdown run. Terminal settings are restored on stop and via `atexit`. The listener stays off when stdin is not a TTY (pipes, CI, `nohup`) or a debugger is attached (`sys.gettrace()`), since debuggers need stdin.
-  - `G.measure_stage(name: str, count: int = 0, units: str = "items")`: Context manager measuring wall-clock duration and throughput for discrete pipeline stages when profiling is active. It yields this call's metric: its `count` (initially `count`; the block may assign a better one) is added once to the stage's total, so a stage measured once per version reports the sum over all versions.
+- **Interactive quit (`core/quit_listener.py`)**: `GracefulQuitListener` puts an interactive POSIX terminal in
+  cbreak mode (no echo or line buffering; Ctrl+C still raises SIGINT) and reads keys on a daemon thread.
+  Pressing `q`/`Q` sets `requested` and logs `[Quit Requested]`; the release loop in `main()` checks it before
+  each version, so the version being parsed finishes and commits, the remaining versions are skipped, and the
+  profiler report and normal shutdown run. Terminal settings are restored on stop and via `atexit`. The
+  listener stays off when stdin is not a TTY (pipes, CI, `nohup`) or a debugger is attached
+  (`sys.gettrace()`), since debuggers need stdin.
+  - `G.measure_stage(name: str, count: int = 0, units: str = "items")`: Context manager measuring wall-clock
+    duration and throughput for discrete pipeline stages when profiling is active. It yields this call's
+    metric: its `count` (initially `count`; the block may assign a better one) is added once to the stage's
+    total, so a stage measured once per version reports the sum over all versions.
   - `G.emergency_shutdown(code: int = 1) -> None`: Cleans all paths in `gp.PURGE_LIST` and exits.
   - `G.BP() -> None`: Drops into breakpoint hook (`sys.breakpointhook()`).
   - `G.type_check(*expected_types)`: Method decorator enforcing runtime type validation.
-  - `reclaim_system_memory() -> None`: Runs explicit garbage collection (`gc.collect()`) and invokes glibc `malloc_trim(0)` to return free memory pages to OS.
-  - `trim_heap() -> None`: Only invokes glibc `malloc_trim(0)` (no garbage collection pass); used after TableEngine commits, whose freed rows need no cycle collection.
-  - `MEMORY_RECLAIM_STATS`: Per-process calls and seconds of both helpers (`collect_calls`, `collect_s`, `trim_calls`, `trim_s`); the stage time split reports their difference as GC/trim time.
-  - `freeze_system_memory() -> None`: Reclaims unreferenced memory and moves living parent objects into permanent GC generation (`gc.freeze()`), making them immune to worker GC cycle traversal and preventing Copy-on-Write page duplication.
-  - `unfreeze_system_memory() -> None`: Restores permanent GC generation back to generational tracking (`gc.unfreeze()`).
-  - `compute_code_hash(code: str) -> bytes`: Computes a deterministic 32-byte binary SHA-256 digest (`BINARY(32)`) from normalized code snippet strings for `m_tag.hash` deduplication.
-  - `is_safe_git_rev(rev) -> bool`: True when `rev` is a plain tag, branch or commit SHA safe to pass to git as an argument: at most 255 characters, starting with `[A-Za-z0-9]` and otherwise limited to `[A-Za-z0-9._/+-]`. Git reads an argument starting with `-` as an option, so a revision placed before `--` must never start with one (`--contents=<file>` makes `git blame` print that file, `--output=<file>` makes `git log` write one). `MasterFile._checked_rev()` raises `ValueError` on a rejected revision before it reaches `git archive` / `diff` / `ls-tree` / `show`; the webapp wraps the same predicate as `HTTP 400` (`webapp/backend/security/git.py`, `webapp/API.md` §2.1.1).
-  - `is_safe_git_spec(spec) -> bool`: True when a `<rev>:<path>` spec is one single `git cat-file --batch` request. That protocol reads one request per line, so a newline or NUL inside a spec injects further requests and desynchronizes every later answer on the long-lived stream — each blob then arrives for the wrong path. `MasterFile._read_blob()` returns `None` for such a spec instead of writing it.
-  - `type_check(name: str, content: str | None = None) -> int`: File type of a path (`T_*`, §1.3); with `content`, a `.c`/`.h` that `is_pure_asm_content()` recognizes is `T_ASM`. `is_pure_asm_content()` requires assembly evidence (m68k `|` comment lines, `.macro`/`.set`/... directives) outside C comments and `\`-continued lines, and no C evidence (declarations at line start, `= {` and designated initializers), so ASCII tables in comments and `| FLAG` continuations of C headers stay `T_C`.
-  - `clean_unnamed_spelling(spelling: str) -> str`: Normalizes Libclang anonymous/unnamed cursor spellings (e.g. `(unnamed at /dev/shm/.../include/linux/foo.h:12:1)`) down to clean relative git repository paths (`(unnamed at include/linux/foo.h:12:1)`), stripping host and RAMDISK prefix directories.
-  - `setup_memory_limit(limit_gb: float = 60.0) -> None`: Enforces an OS-level 60GB boundary via Linux cgroups v2 (`memory.max=60G`, `memory.high=54G`, `memory.oom.group=1`) via `systemd-run --user --scope` re-exec, with graceful fallback to per-process address space limit (`RLIMIT_AS`), preventing Linux OOM kernel freezes during massive multicore AST translation unit parsing.
+  - `reclaim_system_memory() -> None`: Runs explicit garbage collection (`gc.collect()`) and invokes glibc
+    `malloc_trim(0)` to return free memory pages to OS.
+  - `trim_heap() -> None`: Only invokes glibc `malloc_trim(0)` (no garbage collection pass); used after
+    TableEngine commits, whose freed rows need no cycle collection.
+  - `MEMORY_RECLAIM_STATS`: Per-process calls and seconds of both helpers (`collect_calls`, `collect_s`,
+    `trim_calls`, `trim_s`); the stage time split reports their difference as GC/trim time.
+  - `freeze_system_memory() -> None`: Reclaims unreferenced memory and moves living parent objects into
+    permanent GC generation (`gc.freeze()`), making them immune to worker GC cycle traversal and preventing
+    Copy-on-Write page duplication.
+  - `unfreeze_system_memory() -> None`: Restores permanent GC generation back to generational tracking
+    (`gc.unfreeze()`).
+  - `compute_code_hash(code: str) -> bytes`: Computes a deterministic 32-byte binary SHA-256 digest
+    (`BINARY(32)`) from normalized code snippet strings for `m_tag.hash` deduplication.
+  - `is_safe_git_rev(rev) -> bool`: True when `rev` is a plain tag, branch or commit SHA safe to pass to git
+    as an argument: at most 255 characters, starting with `[A-Za-z0-9]` and otherwise limited to
+    `[A-Za-z0-9._/+-]`. Git reads an argument starting with `-` as an option, so a revision placed before `--`
+    must never start with one (`--contents=<file>` makes `git blame` print that file, `--output=<file>` makes
+    `git log` write one). `MasterFile._checked_rev()` raises `ValueError` on a rejected revision before it
+    reaches `git archive` / `diff` / `ls-tree` / `show`; the webapp wraps the same predicate as `HTTP 400`
+    (`webapp/backend/security/git.py`, `webapp/API.md` §2.1.1).
+  - `is_safe_git_spec(spec) -> bool`: True when a `<rev>:<path>` spec is one single `git cat-file --batch`
+    request. That protocol reads one request per line, so a newline or NUL inside a spec injects further
+    requests and desynchronizes every later answer on the long-lived stream — each blob then arrives for the
+    wrong path. `MasterFile._read_blob()` returns `None` for such a spec instead of writing it.
+  - `type_check(name: str, content: str | None = None) -> int`: File type of a path (`T_*`, §1.3); with
+    `content`, a `.c`/`.h` that `is_pure_asm_content()` recognizes is `T_ASM`. `is_pure_asm_content()`
+    requires assembly evidence (m68k `|` comment lines, `.macro`/`.set`/... directives) outside C comments and
+    `\`-continued lines, and no C evidence (declarations at line start, `= {` and designated initializers), so
+    ASCII tables in comments and `| FLAG` continuations of C headers stay `T_C`.
+  - `clean_unnamed_spelling(spelling: str) -> str`: Normalizes Libclang anonymous/unnamed cursor spellings
+    (e.g. `(unnamed at /dev/shm/.../include/linux/foo.h:12:1)`) down to clean relative git repository paths
+    (`(unnamed at include/linux/foo.h:12:1)`), stripping host and RAMDISK prefix directories.
+  - `setup_memory_limit(limit_gb: float = 60.0) -> None`: Enforces an OS-level 60GB boundary via Linux cgroups
+    v2 (`memory.max=60G`, `memory.high=54G`, `memory.oom.group=1`) via `systemd-run --user --scope` re-exec,
+    with graceful fallback to per-process address space limit (`RLIMIT_AS`), preventing Linux OOM kernel
+    freezes during massive multicore AST translation unit parsing.
 
 
 ### 1.2. Core Data Types & Canonical Bounds
 - **`PointerType`**: `tuple[int, int]` &mdash; `(table_id, col_idx)` referencing a table column.
-- **`JoinType`**: `tuple[PointerType, PointerType, int] | tuple[PointerType]` &mdash; Relational link `((from_t, from_c), (to_t, to_c), repeat_count)` or single table root `((t_id, c_idx),)`.
+- **`JoinType`**: `tuple[PointerType, PointerType, int] | tuple[PointerType]` &mdash; Relational link
+  `((from_t, from_c), (to_t, to_c), repeat_count)` or single table root `((t_id, c_idx),)`.
 - **`JoinsType`**: `tuple[JoinType, ...]` &mdash; Immutable relational join graph tuple.
 - **`OperationType`**: `tuple[JoinsType | int, int, tuple]` &mdash; `(target, op_code, data_tuple)`.
-- **`LinkType`**: `int | str` &mdash; Context route marker (`REF_ROOT`, `REF_C_AST`, `REF_OLD`, `REF_POS`, `REF_MULTI`, `REF_FILE`, `REF_NO_REF`, or custom string identifier).
-- **`RouteType`**: `tuple[LinkType, ...] | list[LinkType, ...]` &mdash; Path sequence identifying a stored operation.
-- **`RefType`**: `tuple[PointerType, int, RouteType]` &mdash; Unresolved reference tuple: `(query_pointer, OP_REF, route_tuple)`.
-- **`SafeDataType`**: `int | str | bytes | None` &mdash; Primitive scalar values acceptable to TableEngine and SQL backends (supports `bytes` for raw 32-byte binary SHA-256 digests).
-- **`UnSafeDataType`**: `SafeDataType | RefType` &mdash; Data scalar containing either a primitive or an unresolved reference.
+- **`LinkType`**: `int | str` &mdash; Context route marker (`REF_ROOT`, `REF_C_AST`, `REF_OLD`, `REF_POS`,
+  `REF_MULTI`, `REF_FILE`, `REF_NO_REF`, or custom string identifier).
+- **`RouteType`**: `tuple[LinkType, ...] | list[LinkType, ...]` &mdash; Path sequence identifying a stored
+  operation.
+- **`RefType`**: `tuple[PointerType, int, RouteType]` &mdash; Unresolved reference tuple: `(query_pointer,
+  OP_REF, route_tuple)`.
+- **`SafeDataType`**: `int | str | bytes | None` &mdash; Primitive scalar values acceptable to TableEngine and
+  SQL backends (supports `bytes` for raw 32-byte binary SHA-256 digests).
+- **`UnSafeDataType`**: `SafeDataType | RefType` &mdash; Data scalar containing either a primitive or an
+  unresolved reference.
 
 ### 1.3. Global Constants & Enums
 - **Operation Codes (`op_code`)**:
@@ -79,7 +144,8 @@ Dense architectural contract and state interaction reference across `globalstuff
 - **File Types**:
   - `T_DIR = 0`: Directory container.
   - `T_C = 1`: C and Preprocessor source file (`.c`, `.h`).
-  - `T_KCONFIG = 2`: Kconfig menu definitions (`Kconfig` and the `Kconfig.*` fragments they source, e.g. `lib/Kconfig.debug`).
+  - `T_KCONFIG = 2`: Kconfig menu definitions (`Kconfig` and the `Kconfig.*` fragments they source, e.g.
+    `lib/Kconfig.debug`).
   - `T_RUST = 3`: Rust source file (`.rs`).
   - `T_ASM = 4`: Architecture assembly source (`.S`, `.s`).
   - `T_MAINTAINERS = 5`: Kernel subsystem maintainer directory (`MAINTAINERS`).
@@ -93,14 +159,22 @@ Dense architectural contract and state interaction reference across `globalstuff
   - `SymbolRole(IntEnum)`: Categorical classification for symbol occurrences staged in `m_symbol_ref`:
     - `Declaration = 1`: Explicit symbol forward declaration or prototype.
     - `TypeUsage = 2`: Use of symbol as a type specifier or typecast.
-    - `Call = 3`: Function invocation expression (`Ast_CallExpr`).
+    - `Call = 3`: Function invocation expression (`Ast_CallExpr`): a function name followed by `(`
+      (`ParsedToken.called`, `parser/c_ast/CAST_API.md` §4.4). A function named without a call (`.read = foo`
+      in an ops table, `&foo`, a callback argument, `p->fn = foo`) is a `DeclRef`, so `Call` rows are exactly
+      the direct calls. Also includes assembly branch/call/jump instruction symbol targets
+      (`parser/asm_ast/ASM_API.md`).
     - `MemberRef = 4`: Struct, union, or enum member access (`Ast_MemberRefExpr`).
-    - `DeclRef = 5`: Direct variable, constant, or identifier reference (`Ast_DeclRefExpr`).
-    - `MacroExpansion = 6`: Preprocessor macro instantiation or expansion (`Ast_MacroRefExpr`).
+    - `DeclRef = 5`: Direct variable, constant, or identifier reference (`Ast_DeclRefExpr`), and `goto
+      <label>;` jump statement target labels.
+    - `MacroExpansion = 6`: Preprocessor macro instantiation or expansion (`Ast_MacroRefExpr`), identifiers
+      referenced within macro replacement bodies, and Rust binding references.
 
   - `FileRefType(IntEnum)`: Categorical classification for cross-file references staged in `m_file_reference`:
-    - `Include = 1`: C and Preprocessor `#include <...>` or Assembly include statements.
-    - `Kconfig = 2`: Kconfig `source`, `rsource` and `osource` references with a literal path (a path naming `$(SRCARCH)` or another variable is not linked to a file).
+    - `Include = 1`: C and Preprocessor `#include <...>` or Assembly include statements, and Rust `mod x;`
+      declarations (the file the module loads, `parser/rust_ast/RUST_API.md` §5).
+    - `Kconfig = 2`: Kconfig `source`, `rsource` and `osource` references with a literal path (a path naming
+      `$(SRCARCH)` or another variable is not linked to a file).
     - `Kbuild = 3`: Kbuild compilation object mappings (`obj-$(CONFIG_...) += ...` and `*-objs`).
     - `Makefile = 4`: Makefile includes and subdirectory recursions.
     - `Documentation = 5`: Documentation and plain text file cross-references.
@@ -111,10 +185,26 @@ Dense architectural contract and state interaction reference across `globalstuff
     - `PrototypeDecl = 2`: Forward declaration or header prototype without body.
     - `InlineHeaderDef = 3`: Static inline or extern inline definition in a header (`.h`).
     - `WeakOrAliasDef = 4`: `__weak` or `__alias(...)` definition.
-    - `MacroOrKernelDef = 5`: Preprocessor `#define`, `SYSCALL_DEFINE*`, `TRACE_EVENT`, `DEFINE_SPINLOCK`, `EXPORT_SYMBOL`.
+    - `MacroOrKernelDef = 5`: Preprocessor `#define`, `SYSCALL_DEFINE*`, `TRACE_EVENT`, `DEFINE_SPINLOCK`,
+      `EXPORT_SYMBOL`.
 
-  - `STANDARD_C_KEYWORDS: dict[str, ASTT]`: Fast keyword-to-AST category mapping covering C control flow (`if`, `switch`, `case`, `default`, `while`, `do`, `for`, `return`, `break`, `continue`, `goto`, `asm`), qualifiers (`const`, `volatile`, `restrict`, `_Atomic`), storage classes (`static`, `extern`, `typedef`, `inline`), and primitive types (`void`, `char`, `short`, `int`, `long`, `signed`, `unsigned`, `float`, `double`, `_Bool`, `bool`, `_Complex`, `_Imaginary`, `__float128`, `_Float128`, `__fp16`, `_Float16`, `char16_t`, `char32_t`, `wchar_t`, `struct`, `union`, `enum`).
-  - `ASTT(IntEnum)`: AST construct category identifiers across C (`C_struct`, `C_Compound`, `C_SizeofExpr`, `C_TypeRef`, `C_PerCpuVarDef`, `C_ModuleParamDef`, `C_CastExpr`, `C_ConditionalOperator`, `C_ArraySubscriptExpr`, `C_DesignatedInitExpr`, `C_CompoundAssignOperator`, `C_CompoundLiteralExpr`, `C_IndirectGotoStmt`, `C_AddrLabelExpr`, `C_NullStmt`, `C_ParenExpr`, `C_InitcallDef`, `C_ExportSymbolDef`, `C_Bitfield`, `C_char16`, `C_char32`, `C_wchar`, `C_longdouble`, `C_float128`, `C_float16`, `C_Vector`, `C_vla`), Preprocessor (`CPPro_define`, `CPPro_include`), ASM (`ASM_Instruction`, `ASM_Macro`), and Kconfig (`Kconfig_Config`, `Kconfig_Menu`, `Kconfig_Choice`, `Kconfig_Depends_On`, `Kconfig_Select`, `Kconfig_Op_And`, etc.).
+  - `STANDARD_C_KEYWORDS: dict[str, ASTT]`: Fast keyword-to-AST category mapping covering C control flow
+    (`if`, `switch`, `case`, `default`, `while`, `do`, `for`, `return`, `break`, `continue`, `goto`, `asm`),
+    qualifiers (`const`, `volatile`, `restrict`, `_Atomic`), storage classes (`static`, `extern`, `typedef`,
+    `inline`), and primitive types (`void`, `char`, `short`, `int`, `long`, `signed`, `unsigned`, `float`,
+    `double`, `_Bool`, `bool`, `_Complex`, `_Imaginary`, `__float128`, `_Float128`, `__fp16`, `_Float16`,
+    `char16_t`, `char32_t`, `wchar_t`, `struct`, `union`, `enum`).
+  - `ASTT(IntEnum)`: AST construct category identifiers across C (`C_struct`, `C_Compound`, `C_SizeofExpr`,
+    `C_TypeRef`, `C_PerCpuVarDef`, `C_ModuleParamDef`, `C_CastExpr`, `C_ConditionalOperator`,
+    `C_ArraySubscriptExpr`, `C_DesignatedInitExpr`, `C_CompoundAssignOperator`, `C_CompoundLiteralExpr`,
+    `C_IndirectGotoStmt`, `C_AddrLabelExpr`, `C_NullStmt`, `C_ParenExpr`, `C_InitcallDef`,
+    `C_ExportSymbolDef`, `C_Bitfield`, `C_char16`, `C_char32`, `C_wchar`, `C_longdouble`, `C_float128`,
+    `C_float16`, `C_Vector`, `C_vla`), Rust (`Rust_Struct` … `Rust_Comment`; `Rust_Signature`, an item's
+    header text stored as its child; `Rust_ModuleAttr`, an entry of a `module!` macro; `Rust_BindingRef`, the
+    leaf AST named by a C symbol that Rust uses through bindgen reference, `parser/rust_ast/RUST_API.md` §7),
+    Preprocessor (`CPPro_define`, `CPPro_include`), ASM (`ASM_Instruction`, `ASM_Macro`), and Kconfig
+    (`Kconfig_Config`, `Kconfig_Menu`, `Kconfig_Choice`, `Kconfig_Depends_On`, `Kconfig_Select`,
+    `Kconfig_Op_And`, etc.).
 
 
 ---
@@ -127,23 +217,63 @@ Manages RAMDISK temporary working trees and Git repository extraction.
   - `version_dict`: `dict[str, str]` &mdash; `version_name -> ramdisk_path`.
   - `file_dict`: `dict[str, dict[str, str]]` &mdash; `version_name -> {relative_path: file_content}`.
   - `workspace_dir`: `str | None` &mdash; Path to persistent RAMDISK workspace directory.
-  - `workspace_dir` / `workspace_rev`: the persistent RAMDISK workspace and the revision it holds (`None` while it is being changed).
-  - `_cat_file_proc`: `sp.Popen | None` &mdash; Persistent `git cat-file --batch` subprocess of the process that started it (`_cat_file_owner`): a forked worker starts its own instead of sharing the parent's pipes, and never terminates the parent's.
+  - `workspace_dir` / `workspace_rev`: the persistent RAMDISK workspace and the revision it holds (`None`
+    while it is being changed).
+  - `_cat_file_proc`: `sp.Popen | None` &mdash; Persistent `git cat-file --batch` subprocess of the process
+    that started it (`_cat_file_owner`): a forked worker starts its own instead of sharing the parent's pipes,
+    and never terminates the parent's.
 - **Key Methods**:
-  - `_checked_rev(rev: str) -> str`: Returns `rev`, or raises `ValueError` when `is_safe_git_rev()` rejects it (§1.1). Every method below that interpolates a revision into a git argument passes it through this guard first (`git_clone`, `get_file`, `generate_change_list`, `git_file_list`, `get_dir_list`); `_commit_start_sequence()` and `get_root_commit()` check the predicate directly and return their empty result instead of raising.
-  - `create_temp_dir() -> str`: Spawns `/dev/shm/code-parser.XXXXXX` via `mktemp` and records the creating process in it (`mark_owner()`, file `.kip-owner`; `owner_alive()` tells whether that process still runs).
-  - `add_version(version_name: str, purge_list: list) -> None`: Clones a version tree into its own RAMDISK directory and registers it in `purge_list` (the pipeline uses `checkout_version()`).
-  - `checkout_version(version: str, base_rev: str | None, purge_list: list) -> str`: Step 3 of `main.update()`. When the workspace holds `base_rev` (the previous version), `_apply_tree_diff()` rewrites only what `git diff-tree -r -z --no-renames` reports: deleted paths are unlinked (and emptied directories removed), every added/modified path is unlinked first (writing through an existing symlink would overwrite its target) and written from `cat-file` by blob id, symlinks (mode `120000`) are recreated as symlinks, `100755` files made executable, submodules skipped. Otherwise (first version, a skipped base, a failed update) the tree is extracted in full with `git_clone()`. Other versions mapped to the workspace are dropped from `version_dict`, so reading the previous version goes to git instead of returning the new content.
-  - `git_clone(version: str) -> str`: Executes `git archive <version> | tar -x` and provisions `include/asm` and `include/uapi/asm` symlinks pointing to `asm-generic`.
-  - `get_file(file_path: str, version: str) -> str`: Returns cached content from RAMDISK (latin-1), or for a version without a working tree reads `<version>:<file_path>` from the persistent `cat-file` stream (`_read_blob()`, `""` when missing). Defensively inspects paths: if `p.is_symlink() and p.is_dir()` or on read errors, extracts link target via `os.readlink(p)` to eliminate exceptions on directory symlinks (e.g. `arch/*/boot/dts/include/dt-bindings`).
-  - `_read_blob(target_spec: str) -> bytes | None`: Reads raw blob bytes from persistent `git cat-file --batch` subprocess.
-  - `generate_change_list(gp: GreatProcessor) -> list[str]`: Runs `git diff <Old_Version_Name> <Version_Name> --name-status` and sets `gp.Change_List`.
-  - `git_file_list(version: str) -> str`: Executes `git ls-tree -r --name-only <version>`; successful listings are cached per (repository, version) (at most 4, dropped by `clear_version_cache()` / `clear_all_version()` / `set_repo_dir()`), since one version is listed by several pipeline steps.
+  - `_checked_rev(rev: str) -> str`: Returns `rev`, or raises `ValueError` when `is_safe_git_rev()` rejects it
+    (§1.1). Every method below that interpolates a revision into a git argument passes it through this guard
+    first (`git_clone`, `get_file`, `generate_change_list`, `git_file_list`, `get_dir_list`);
+    `_commit_start_sequence()` and `get_root_commit()` check the predicate directly and return their empty
+    result instead of raising.
+  - `create_temp_dir() -> str`: Spawns `/dev/shm/code-parser.XXXXXX` via `mktemp` and records the creating
+    process in it (`mark_owner()`, file `.kip-owner`; `owner_alive()` tells whether that process still runs).
+  - `add_version(version_name: str, purge_list: list) -> None`: Clones a version tree into its own RAMDISK
+    directory and registers it in `purge_list` (the pipeline uses `checkout_version()`).
+  - `checkout_version(version: str, base_rev: str | None, purge_list: list) -> str`: Step 3 of
+    `main.update()`. When the workspace holds `base_rev` (the previous version), `_apply_tree_diff()` rewrites
+    only what `git diff-tree -r -z --no-renames` reports: deleted paths are unlinked (and emptied directories
+    removed), every added/modified path is unlinked first (writing through an existing symlink would overwrite
+    its target) and written from `cat-file` by blob id, symlinks (mode `120000`) are recreated as symlinks,
+    `100755` files made executable, submodules skipped. Otherwise (first version, a skipped base, a failed
+    update) the tree is extracted in full with `git_clone()`. Other versions mapped to the workspace are
+    dropped from `version_dict`, so reading the previous version goes to git instead of returning the new
+    content.
+  - `git_clone(version: str) -> str`: Executes `git archive <version> | tar -x` and provisions `include/asm`
+    and `include/uapi/asm` symlinks pointing to `asm-generic`.
+  - `get_file(file_path: str, version: str) -> str`: Returns cached content from RAMDISK (latin-1), or for a
+    version without a working tree reads `<version>:<file_path>` from the persistent `cat-file` stream
+    (`_read_blob()`, `""` when missing). Defensively inspects paths: if `p.is_symlink() and p.is_dir()` or on
+    read errors, extracts link target via `os.readlink(p)` to eliminate exceptions on directory symlinks (e.g.
+    `arch/*/boot/dts/include/dt-bindings`).
+  - `_read_blob(target_spec: str) -> bytes | None`: Reads raw blob bytes from persistent `git cat-file
+    --batch` subprocess.
+  - `generate_change_list(gp: GreatProcessor) -> list[str]`: Runs `git diff <Old_Version_Name> <Version_Name>
+    --name-status` and sets `gp.Change_List`.
+  - `git_file_list(version: str) -> str`: Executes `git ls-tree -r --name-only <version>`; successful listings
+    are cached per (repository, version) (at most 4, dropped by `clear_version_cache()` /
+    `clear_all_version()` / `set_repo_dir()`), since one version is listed by several pipeline steps.
   - `get_dir_list(version_name: str) -> list[str]`: Executes `git ls-tree -r -d --name-only <version_name>`.
-  - `get_version_tags(start_ref: str | None = None, include_pre_releases: bool | None = None) -> list[str]`: Discovers and sequences repository release tags using `git -c versionsort.suffix=-rc -c versionsort.suffix=-pre tag -l --sort=v:refname`, ensuring `-rc#` pre-releases are correctly ordered prior to final releases. Release candidates and other pre-releases (`-rc`, `-pre`, `-alpha`, `-beta`) are included by default (`include_pre_releases=None` → `True`, config `parser.include_pre_releases`, default `true`), so a run walks e.g. `v3.0 → v3.1-rc1 … v3.1-rc10 → v3.1`; `--no-rc` / `--releases-only` (or `"include_pre_releases": false`) keeps final releases only. Canonical release tags are filtered by matching `^v?\d+(\.\d+)*(?:-(?:rc|alpha|beta|pre)\d*)?$`, strictly ignoring non-release topic tags (e.g. `assoc-array-fixes`) as well as `-tree` tags (which point at trees, not commits). When `start_ref` is not a listed tag but resolves to a commit (e.g. the repository's first commit), `_commit_start_sequence()` returns `[start, *tags containing start]` in version order; a tag pointing exactly at `start` (e.g. `v2.6.12-rc2` on Linux's root commit) replaces the raw SHA as the first snapshot name.
-  - `get_root_commit(rev="HEAD") -> str | None`: First commit of `rev`'s history (`git rev-list --max-parents=0 --first-parent`).
-  - `trim_version(keep: int = 1) -> int`: Drops the oldest versions beyond `keep`, deleting a directory only when no remaining version maps to it (the workspace is forgotten when deleted).
-  - `clear_all_version() -> None`: Cleans all version trees and the workspace from disk, terminates `_cat_file_proc`, and resets dictionaries.
+  - `get_version_tags(start_ref: str | None = None, include_pre_releases: bool | None = None) -> list[str]`:
+    Discovers and sequences repository release tags using `git -c versionsort.suffix=-rc -c
+    versionsort.suffix=-pre tag -l --sort=v:refname`, ensuring `-rc#` pre-releases are correctly ordered prior
+    to final releases. Release candidates and other pre-releases (`-rc`, `-pre`, `-alpha`, `-beta`) are
+    included by default (`include_pre_releases=None` → `True`, config `parser.include_pre_releases`, default
+    `true`), so a run walks e.g. `v3.0 → v3.1-rc1 … v3.1-rc10 → v3.1`; `--no-rc` / `--releases-only` (or
+    `"include_pre_releases": false`) keeps final releases only. Canonical release tags are filtered by
+    matching `^v?\d+(\.\d+)*(?:-(?:rc|alpha|beta|pre)\d*)?$`, strictly ignoring non-release topic tags (e.g.
+    `assoc-array-fixes`) as well as `-tree` tags (which point at trees, not commits). When `start_ref` is not
+    a listed tag but resolves to a commit (e.g. the repository's first commit), `_commit_start_sequence()`
+    returns `[start, *tags containing start]` in version order; a tag pointing exactly at `start` (e.g.
+    `v2.6.12-rc2` on Linux's root commit) replaces the raw SHA as the first snapshot name.
+  - `get_root_commit(rev="HEAD") -> str | None`: First commit of `rev`'s history (`git rev-list
+    --max-parents=0 --first-parent`).
+  - `trim_version(keep: int = 1) -> int`: Drops the oldest versions beyond `keep`, deleting a directory only
+    when no remaining version maps to it (the workspace is forgotten when deleted).
+  - `clear_all_version() -> None`: Cleans all version trees and the workspace from disk, terminates
+    `_cat_file_proc`, and resets dictionaries.
 
 ---
 
@@ -154,158 +284,399 @@ Central runtime container, schema registry, and worker IPC coordinator.
 - **State Registry**:
   - `PURGE_LIST: list[str]`: Working directory paths for cleanup on exit.
   - `Table_Array: list[Table]`: Registered `Table` instances (indexed by `table_id`).
-  - `Version_Name: str`: Active Git release tag (default empty git tree hash `"4b825dc642cb6eb9a060e54bf8d69288fbee4904"`).
+  - `Version_Name: str`: Active Git release tag (default empty git tree hash
+    `"4b825dc642cb6eb9a060e54bf8d69288fbee4904"`).
   - `Old_Version_Name: str | int`: Prior Git release tag.
   - `VID: int` / `Old_VID: int`: Monotonic database primary keys for current and prior versions in `m_v_main`.
   - `Change_List: list[str] | None`: Raw diff lines (`"M\tpath"`, `"R100\told\tnew"`).
-  - `worker_change_list: list[str] | None`: Filtered subset of changed files passed to multicore workers after content-addressable blob deduplication (`Step 4.5`), preserving authoritative git diff status in `gp.Change_List`. `None` means Step 4.5 did not filter (workers parse `gp.Change_List`); an empty list means every change was deduplicated and nothing is parsed (`main._select_worker_changes()`).
-  - `Symlink_List: list[str]`: Buffers symlinks partitioned from `gp.Change_List` for zero-duplication deferred aliasing directly into `m_bridge_file` via `processing_symlinks()`.
-  - `ChangeSet_Dict: dict[str, ChangeSet] | CompressedChangeSetDict`: Main process dictionary mapping relative file paths to parsed `ChangeSet` objects.
-  - `Alt_ChangeSet_Dict: dict[str, ChangeSet] | CompressedChangeSetDict`: Secondary cache for on-demand parsed foreign `ChangeSets` during cross-file reference resolution.
-  - `unchanged_symbol_cache: dict[str, dict[tuple[str, int], int]]`: In-memory cache of symbol mappings `(name, type_id) -> ast_id` queried from the database for unchanged files.
-  - `blob_symbol_cache: dict[int, dict[tuple[str, int], int]]`: The same maps by blob id, kept across versions (a blob's rows never change), filled only for files unchanged in the current update. `get_file_symbols_from_db()` checks it before querying, and queries both tag definitions (`m_tag`) and inner symbol definitions (`m_blob_symbol_def`, `m_tag_def` joined with `m_blob_symbol`, such as enum constants and global variables). Forked workers read the parent's copy and collect what they load (`_blob_symbols_fetched`) and look up (`_blob_symbols_used`); each batch result frame streams newly fetched maps back to the parent to immediately populate the parent's cache during streaming ingestion and eliminate synchronous DB queries and background commit contention, while the done frame merges the final usage counters (`merge_blob_symbols()`). `prune_blob_symbol_cache(max_idle_versions=8)`, called by `reset_cs()`, advances the version counter and drops maps not looked up for 8 versions (`blob_symbol_used`). Each worker used to re-query every unchanged header it needed in every version (8–30s of worker time per small version).
+  - `worker_change_list: list[str] | None`: Filtered subset of changed files passed to multicore workers after
+    content-addressable blob deduplication (`Step 4.5`), preserving authoritative git diff status in
+    `gp.Change_List`. `None` means Step 4.5 did not filter (workers parse `gp.Change_List`); an empty list
+    means every change was deduplicated and nothing is parsed (`main._select_worker_changes()`).
+  - `Symlink_List: list[str]`: Buffers symlinks partitioned from `gp.Change_List` for zero-duplication
+    deferred aliasing directly into `m_bridge_file` via `processing_symlinks()`.
+  - `ChangeSet_Dict: dict[str, ChangeSet] | CompressedChangeSetDict`: Main process dictionary mapping relative
+    file paths to parsed `ChangeSet` objects.
+  - `Alt_ChangeSet_Dict: dict[str, ChangeSet] | CompressedChangeSetDict`: Secondary cache for on-demand parsed
+    foreign `ChangeSets` during cross-file reference resolution.
+  - `unchanged_symbol_cache: dict[str, dict[tuple[str, int], int]]`: In-memory cache of symbol mappings
+    `(name, type_id) -> ast_id` queried from the database for unchanged files.
+  - `blob_symbol_cache: dict[int, dict[tuple[str, int], int]]`: The same maps by blob id, kept across versions
+    (a blob's rows never change), filled only for files unchanged in the current update.
+    `get_file_symbols_from_db()` checks it before querying, and queries both tag definitions (`m_tag`) and
+    inner symbol definitions (`m_blob_symbol_def`, `m_tag_def` joined with `m_blob_symbol`, such as enum
+    constants and global variables). Forked workers read the parent's copy and collect what they load
+    (`_blob_symbols_fetched`) and look up (`_blob_symbols_used`); each batch result frame streams newly
+    fetched maps back to the parent to immediately populate the parent's cache during streaming ingestion and
+    eliminate synchronous DB queries and background commit contention, while the done frame merges the final
+    usage counters (`merge_blob_symbols()`). `prune_blob_symbol_cache(max_idle_versions=8)`, called by
+    `reset_cs()`, advances the version counter and drops maps not looked up for 8 versions
+    (`blob_symbol_used`).
   - `_changed_paths_set: set[str]`: Set of all relative file paths modified in the active release version.
-  - `file_deps: dict[str, set[str]]`: Lightweight dependency graph mapping each changed file path to its set of unresolved foreign file dependencies (`foreign_deps`).
-  - `cs_op_counts: dict[str, int]`: Operation count of each ingested ChangeSet, recorded by `DependencyScheduler.ingest_batch()`; the wave pass breaks cycles with it instead of decompressing stored ChangeSets.
-  - `commit_ids_by_hash: dict[str, int]`: Commit hash -> `commit_id` for the version's range, registered in bulk by `ingest_git_dag()` (Step 1) and reused by `processing_git_commits()` (Step 6.5).
-    `ingest_git_dag()` reports a version as already existing when its head commit's ingestion is done (`m_ingest_state`, §4.1), whether under this ref or another one (tags sharing a commit, e.g. `v2.6.32-rc1`/`v2.6.32-rc2`: the new ref is then only registered in `m_git_ref`, since re-ingesting the commit would insert duplicate `m_bridge_checkpoint` rows). An interrupted ingestion is rolled back and parsed again (§4.1).
-  - `deduped_paths: set[str]`: Changed paths whose blob Step 4.5 reused instead of parsing; `processing_git_commits()` loads their tags from `m_bridge_tag` to link them to this range's commits.
-  - `file_symbols: dict[str, dict[tuple[str, int], int]]`: Per-file exported symbols map `rel_file -> {(sym_name, type_id): ast_id}` populated during Phase 1 staging.
-  - `completed_paths: set[str]`: Paths whose ChangeSet executed in the current update, recorded by `extract_tags_and_evacuate_cs()` (even when the file publishes no symbol). `resolve_ref()` treats these as completed after Stage 2 clears `file_symbols` (symbols moved to `_shared_symbols`); reset by `init_cs_dict()`.
-  - `file_names: dict[str, dict[str, int]]`: Per-file exported symbol names map `rel_file -> {sym_name: ast_id}` for name-only fallback resolution.
-  - `file_pre_extracted_tags: dict[str, list[tuple[int, int, int, int]]]`: Lightweight bridge tags map `rel_file -> [(tag_id, blob_id, line_s, line_e)]` populated upon ChangeSet evacuation to allow zero-decompression tag-to-commit mapping during post-processing.
-  - `file_blob_ids: dict[str, int]`: Mapping `rel_file -> blob_id` populated during ChangeSet evacuation to enable $O(1)$ checkpoint staging without decompressing pickled ChangeSets.
-  - `_ast_negative_cache: set[tuple[str, int]]`: Negative query cache tracking verified non-existent `(symbol_name, type_id)` AST symbols across TableEngine and database queries, cleared upon chunk commits.
-  - `_shared_symbols`: `SharedSymbolChain | None` &mdash; File-scoped shared memory symbol segments published during Stage 2 (`main._publish_file_symbols()`), inherited by forked Stage 2 workers and read by `TableHandling.resolve_ref()` (step 0b) to resolve cross-file symbols in $O(1)$ time without heap duplication or IPC serialization. Released by `close_shared_symbols()` from `DependencyScheduler.finalize()`, `init_cs_dict()` and `reset_cs()`, so a version never resolves against a previous version's table.
-  - `_commit_proc` / `_commit_result_dir`: Background git commit parser process (`main._git_commit_worker`, forked by `update()` right after Step 4) and the RAMDISK directory (registered in `PURGE_LIST`) where it pickles `(commits, file_hunks_map, ml_results, commit_patch_ids, commit_file_blobs)` before exiting, precomputing patch-ids, diff-tree blobs, and lore mailing-list resolution in parallel with multicore file parsing. `processing_git_commits()` waits for it via `main._collect_git_commit_result()`; `stop_commit_worker()` terminates it and deletes the directory.
-  - `parsed_blob_ids: set[int]`: Registry of parsed content `blob_id`s in current wave/run to eliminate redundant worker dispatches on identical copies (C100).
+  - `file_deps: dict[str, set[str]]`: Lightweight dependency graph mapping each changed file path to its set
+    of unresolved foreign file dependencies (`foreign_deps`).
+  - `cs_op_counts: dict[str, int]`: Operation count of each ingested ChangeSet, recorded by
+    `DependencyScheduler.ingest_batch()`; the wave pass breaks cycles with it instead of decompressing stored
+    ChangeSets.
+  - `commit_ids_by_hash: dict[str, int]`: Commit hash -> `commit_id` for the version's range, registered in
+    bulk by `ingest_git_dag()` (Step 1) and reused by `processing_git_commits()` (Step 6.5).
+    `ingest_git_dag()` reports a version as already existing when its head commit's ingestion is done
+    (`m_ingest_state`, §4.1), whether under this ref or another one (tags sharing a commit, e.g.
+    `v2.6.32-rc1`/`v2.6.32-rc2`: the new ref is then only registered in `m_git_ref`, since re-ingesting the
+    commit would insert duplicate `m_bridge_checkpoint` rows). An interrupted ingestion is rolled back and
+    parsed again (§4.1).
+  - `deduped_paths: set[str]`: Changed paths whose blob Step 4.5 reused instead of parsing;
+    `processing_git_commits()` loads their tags from `m_bridge_tag` to link them to this range's commits.
+  - `file_symbols: dict[str, dict[tuple[str, int], int]]`: Per-file exported symbols map `rel_file ->
+    {(sym_name, type_id): ast_id}` populated during Phase 1 staging.
+  - `completed_paths: set[str]`: Paths whose ChangeSet executed in the current update, recorded by
+    `extract_tags_and_evacuate_cs()` (even when the file publishes no symbol). `resolve_ref()` treats these as
+    completed after Stage 2 clears `file_symbols` (symbols moved to `_shared_symbols`); reset by
+    `init_cs_dict()`.
+  - `file_names: dict[str, dict[str, int]]`: Per-file exported symbol names map `rel_file -> {sym_name:
+    ast_id}` for name-only fallback resolution.
+  - `file_pre_extracted_tags: dict[str, list[tuple[int, int, int, int]]]`: Lightweight bridge tags map
+    `rel_file -> [(tag_id, blob_id, line_s, line_e)]` populated upon ChangeSet evacuation to allow
+    zero-decompression tag-to-commit mapping during post-processing.
+  - `file_blob_ids: dict[str, int]`: Mapping `rel_file -> blob_id` populated during ChangeSet evacuation to
+    enable $O(1)$ checkpoint staging without decompressing pickled ChangeSets.
+  - `_ast_negative_cache: set[tuple[str, int]]`: Negative query cache tracking verified non-existent
+    `(symbol_name, type_id)` AST symbols across TableEngine and database queries, cleared upon chunk commits.
+  - `_shared_symbols`: `SharedSymbolChain | None` &mdash; File-scoped shared memory symbol segments published
+    during Stage 2 (`main._publish_file_symbols()`), inherited by forked Stage 2 workers and read by
+    `TableHandling.resolve_ref()` (step 0b) to resolve cross-file symbols in $O(1)$ time without heap
+    duplication or IPC serialization. Released by `close_shared_symbols()` from
+    `DependencyScheduler.finalize()`, `init_cs_dict()` and `reset_cs()`, so a version never resolves against a
+    previous version's table.
+  - `_commit_proc` / `_commit_result_dir`: Background git commit parser process (`main._git_commit_worker`,
+    forked by `update()` right after Step 4) and the RAMDISK directory (registered in `PURGE_LIST`) where it
+    pickles `(commits, file_hunks_map, ml_results, commit_patch_ids, commit_file_blobs)` before exiting,
+    precomputing patch-ids, diff-tree blobs, and lore mailing-list resolution in parallel with multicore file
+    parsing. `processing_git_commits()` waits for it via `main._collect_git_commit_result()`;
+    `stop_commit_worker()` terminates it and deletes the directory.
+  - `parsed_blob_ids: set[int]`: Registry of parsed content `blob_id`s in current wave/run to eliminate
+    redundant worker dispatches on identical copies (C100).
 - **Worker Lifecycle, Multi-Epoch Streaming & Copy-on-Write Isolation**:
-  - **Worker Heap Isolation**: Workers shallow-copy `gp_ref` on startup and re-point large symbol/ChangeSet collections (`ChangeSet_Dict`, `_ast_staged_symbols`, `_ast_staged_names`, `unchanged_symbol_cache`, `file_symbols`, `file_names`, `_ast_negative_cache`, `_blob_symbols_fetched`, `_blob_symbols_used`) to empty process-local containers (`blob_symbol_cache` stays shared and is only read), and set `gp_ref._is_worker = True` so `resolve_ref()` never stages stubs into the worker's never-committed TableEngine. Worker-local mutations never dirty parent memory pages or trigger Copy-on-Write duplication.
-  - Workers invoke `reclaim_system_memory()` after processing each batch to release fragmented C-heap pages back to the OS via glibc `malloc_trim(0)`.
-  - **Worker Stage Runner (`main._run_worker_stage`)**: Stage 1, every Stage 2 epoch and retries share one runner. Workers are forked from the `fork` multiprocessing context with the parent DB socket closed and reopened around the fork (`on_started` callbacks run after the reopen). Each worker owns a duplex pipe (no shared task queue or lock): the parent's reader thread sends it batches in order, two ahead of the one it parses, and a stop frame once none is left; the worker answers each with one result frame (pickled once, `(batch_cs_dict, per_file_errors)`, zlib-compressed in low memory modes) and ends with a done frame. The reader thread hands at most 2 serialized batches to the ingest thread, and `send_bytes` blocks while the parent is behind, so memory stays bounded on both sides. A pipe closed without its done frame marks the worker as crashed: the oldest batch it had not returned is the one it died on (re-parsed one file per batch), and its other queued batches go back to the surviving workers. Retry rounds continue while they make progress; files that kill a worker again are reported. If no worker can initialize (an init-failure frame from every worker, e.g. the database is unreachable), the stage raises. Ingest failures are recorded per batch without stopping the stage. The deadline is checked while waiting, so an idle stage still stops on time. Stage 1 header batches are bounded by bytes and kept in include order; Stage 1 and each epoch log their parsing time and the gap between the first and the last worker exit.
-  - **Background commits during stages**: Between forking its workers and reaping them, `_run_worker_stage` sets `G.TE.async_commits` (`_begin_background_commits()`), so chunk commits triggered while ingesting are written by the TableEngine's writer thread while the parent keeps ingesting. `_end_background_commits()` switches them off and joins the last one before anything forks again (also called first thing in every stage); a failed background commit put its rows back into staging, and they are committed again there through `_commit_all_with_retry()`. While the parent waits for worker results (a 1s poll without a batch), `_maybe_idle_commit()` also starts a background commit once 100k rows are staged (`_IDLE_COMMIT_MIN_ROWS`, `G.TE.staged_rows`) and none is running: chunk commits come every 1000 executed files, so a small version used to write all its rows in one commit after parsing with every worker idle. Commits outside the stages (header resolution, epoch boundaries, Phase 2, Steps 6.x and 7) stay synchronous.
-  - **Stage time split**: Each stage logs `<label> time split: ...` (`_stage_time_split()`, `_format_time_split()`): how long the parent waited for results, decoded and ingested them (with its database reads), how long it was blocked by commits out of how long they took to write and how many rows, its GC/trim time, and the workers' share of time parsing (dependency pruning and database reads called out), blocked sending results to the parent, without a task (including the time a worker had already exited while another still parsed, `worker_tail_idle_s`), and in GC. Workers measure their part and send it with their done frame (`_WORKER_SPLIT_KEYS`; a bare done frame is still accepted). In normal memory modes the parent no longer runs a full collection every 10 ingested batches (the automatic collector and the trim after each commit cover it). Batch sizes shrink for small stages (`_balanced_batch_size()`: about 4 batches per worker, at least 4 files each, at most the memory profile's size) so a version with a few hundred changed files does not leave most workers waiting on one large batch. When Stage 2's sources (or Stage 1's headers, kept in include order) fit in one epoch, `partition_source_epochs(num_workers=...)` also caps a batch's bytes at an equal share (`_BATCHES_PER_WORKER` batches per worker), so batches cost about the same.
-  - **Symbol counters**: Workers send `core/SymbolRows.STATS` with their done frame (`symbol_stats`), and each version logs `[Symbols] '<version>': N items stored in tags (M of them in reused tags, not rewritten); K per blob (changed reused tag, conflicting key, outside tag, without tag); R keys refined by position` (`_log_symbol_stats()`). Many items per blob under "changed reused tag" means reused tags are not being shared.
-  - **Memory Modes (`main._memory_profile()`)**: normal: `CPUS - 1` workers, 200-file header batches, Stage 2 batches of 200 (50 with heavy files) up to 1.5MB, ~4,500-file epochs; low: `CPUS // 2` workers, 50 / 50 (25) / 750KB / 4,500; very-low: `min(2, CPUS // 4)` workers, 25 / 25 (10) / 350KB / 2,000.
-  - **Stage 2 Multi-Epoch Streaming**: Source files are partitioned into natural subsystem-aligned epochs (bounded at modular directory transitions) using project-agnostic dynamic complexity batching: batches are bounded by file count (smaller when heavy AST files &ge;64KB are present) and cumulative source bytes, and each epoch's batches are queued largest-first so the epoch does not end waiting on one late heavy batch.
-  - Workers run for the duration of an epoch, then exit and are reaped at the epoch boundary. Each epoch logs its parsing time, the gap between the first and the last worker exit, the boundary time, parent RSS and `gc.get_freeze_count()`, after its time split line.
-  - **Inter-Epoch Publishing & Deferred Drain**: At each epoch boundary, `DependencyScheduler.drain_deferred_queue()` unblocks deferred ChangeSets, TableEngine commits staged rows (`G.TE.commit_all()`), and the symbols published since the previous boundary are packed into one new file-scoped segment appended to `gp._shared_symbols`, so later epochs pre-resolve cross-file symbols in $O(1)$ time. Parent heap symbol dictionaries (`file_symbols`, `_ast_staged_symbols`) are cleared after publishing to keep parent resident memory low.
+  - **Worker Heap Isolation**: Workers shallow-copy `gp_ref` on startup and re-point large symbol/ChangeSet
+    collections (`ChangeSet_Dict`, `_ast_staged_symbols`, `_ast_staged_names`, `unchanged_symbol_cache`,
+    `file_symbols`, `file_names`, `_ast_negative_cache`, `_blob_symbols_fetched`, `_blob_symbols_used`) to
+    empty process-local containers (`blob_symbol_cache` stays shared and is only read), and set
+    `gp_ref._is_worker = True` so `resolve_ref()` never stages stubs into the worker's never-committed
+    TableEngine. Worker-local mutations never dirty parent memory pages or trigger Copy-on-Write duplication.
+  - Workers invoke `reclaim_system_memory()` after processing each batch to release fragmented C-heap pages
+    back to the OS via glibc `malloc_trim(0)`.
+  - **Worker Stage Runner (`main._run_worker_stage`)**: Stage 1, every Stage 2 epoch and retries share one
+    runner. Workers are forked from the `fork` multiprocessing context with the parent DB socket closed and
+    reopened around the fork (`on_started` callbacks run after the reopen). Each worker owns a duplex pipe (no
+    shared task queue or lock): the parent's reader thread sends it batches in order, two ahead of the one it
+    parses, and a stop frame once none is left; the worker answers each with one result frame (pickled once,
+    `(batch_cs_dict, per_file_errors)`, zlib-compressed in low memory modes) and ends with a done frame. The
+    reader thread hands at most 2 serialized batches to the ingest thread, and `send_bytes` blocks while the
+    parent is behind, so memory stays bounded on both sides. A pipe closed without its done frame marks the
+    worker as crashed: the oldest batch it had not returned is the one it died on (re-parsed one file per
+    batch), and its other queued batches go back to the surviving workers. Retry rounds continue while they
+    make progress; files that kill a worker again are reported. If no worker can initialize (an init-failure
+    frame from every worker, e.g. the database is unreachable), the stage raises. Ingest failures are recorded
+    per batch without stopping the stage. The deadline is checked while waiting, so an idle stage still stops
+    on time. Stage 1 header batches are bounded by bytes and kept in include order; Stage 1 and each epoch log
+    their parsing time and the gap between the first and the last worker exit.
+  - **Background commits during stages**: Between forking its workers and reaping them, `_run_worker_stage`
+    sets `G.TE.async_commits` (`_begin_background_commits()`), so chunk commits triggered while ingesting are
+    written by the TableEngine's writer thread while the parent keeps ingesting. `_end_background_commits()`
+    switches them off and joins the last one before anything forks again (also called first thing in every
+    stage); a failed background commit puts its rows back into staging, and they are committed again there
+    through `_commit_all_with_retry()`. While the parent waits for worker results (a 1s poll without a batch),
+    `_maybe_idle_commit()` also starts a background commit once 100k rows are staged (`_IDLE_COMMIT_MIN_ROWS`,
+    `G.TE.staged_rows`) and none is running. Commits outside the stages (header resolution, epoch boundaries,
+    Phase 2, Steps 6.x and 7) stay synchronous.
+  - **Stage time split**: Each stage logs `<label> time split: ...` (`_stage_time_split()`,
+    `_format_time_split()`): how long the parent waited for results, decoded and ingested them (with its
+    database reads), how long it was blocked by commits out of how long they took to write and how many rows,
+    its GC/trim time, and the workers' share of time parsing (dependency pruning and database reads called
+    out), blocked sending results to the parent, without a task (including the time a worker had already
+    exited while another still parsed, `worker_tail_idle_s`), and in GC. Workers measure their part and send
+    it with their done frame (`_WORKER_SPLIT_KEYS`; a bare done frame is still accepted). In normal memory
+    modes the parent no longer runs a full collection every 10 ingested batches (the automatic collector and
+    the trim after each commit cover it). Batch sizes shrink for small stages (`_balanced_batch_size()`: about
+    4 batches per worker, at least 4 files each, at most the memory profile's size) so a version with a few
+    hundred changed files does not leave most workers waiting on one large batch. When Stage 2's sources (or
+    Stage 1's headers, kept in include order) fit in one epoch, `partition_source_epochs(num_workers=...)`
+    also caps a batch's bytes at an equal share (`_BATCHES_PER_WORKER` batches per worker), so batches cost
+    about the same.
+  - **Symbol counters**: Workers send `core/SymbolRows.STATS` with their done frame (`symbol_stats`), and each
+    version logs `[Symbols] '<version>': N items stored in tags (M of them in reused tags, not rewritten); K
+    per blob (changed reused tag, conflicting key, outside tag, without tag); R keys refined by position`
+    (`_log_symbol_stats()`). Many items per blob under "changed reused tag" means reused tags are not being
+    shared.
+  - **Memory Modes (`main._memory_profile()`)**: normal: `CPUS - 1` workers, 200-file header batches, Stage 2
+    batches of 200 (50 with heavy files) up to 1.5MB, ~4,500-file epochs; low: `CPUS // 2` workers, 50 / 50
+    (25) / 750KB / 4,500; very-low: `min(2, CPUS // 4)` workers, 25 / 25 (10) / 350KB / 2,000.
+  - **Stage 2 Multi-Epoch Streaming**: Source files are partitioned into natural subsystem-aligned epochs
+    (bounded at modular directory transitions) using project-agnostic dynamic complexity batching: batches are
+    bounded by file count (smaller when heavy AST files &ge;64KB are present) and cumulative source bytes, and
+    each epoch's batches are queued largest-first so the epoch does not end waiting on one late heavy batch.
+  - Workers run for the duration of an epoch, then exit and are reaped at the epoch boundary. Each epoch logs
+    its parsing time, the gap between the first and the last worker exit, the boundary time, parent RSS and
+    `gc.get_freeze_count()`, after its time split line.
+  - **Inter-Epoch Publishing & Deferred Drain**: At each epoch boundary,
+    `DependencyScheduler.drain_deferred_queue()` unblocks deferred ChangeSets, TableEngine commits staged rows
+    (`G.TE.commit_all()`), and the symbols published since the previous boundary are packed into one new
+    file-scoped segment appended to `gp._shared_symbols`, so later epochs pre-resolve cross-file symbols in
+    $O(1)$ time. Parent heap symbol dictionaries (`file_symbols`, `_ast_staged_symbols`) are cleared after
+    publishing to keep parent resident memory low.
 - **Memory Compression (`CompressedChangeSetDict`)**:
-  - Implements a hybrid zero-overhead store backed by `_evacuated_store` (storing lightweight evacuated ChangeSets directly in memory with zero `pickle` or `zlib` CPU cost) and an LRU cache (`OrderedDict`, default capacity 500 items, throttled to 25 items under `--very-low-mem`).
-  - Active ChangeSets remain in `_lru_cache` uncompressed upon insertion, and are only serialized and compressed (`zlib.compress(pickle.dumps(cs), level=1)`, without their `gp`/`mf`/`batch_cs_dict` references) into `_compressed_store` when evicted from `_lru_cache` upon exceeding capacity. An entry handed out by `[]`/`get()` may have been mutated, so every evicted entry is compressed again; an entry that cannot be pickled stays in the cache and eviction stops there (it never loops over the same entries).
+  - Implements a hybrid zero-overhead store backed by `_evacuated_store` (storing lightweight evacuated
+    ChangeSets directly in memory with zero `pickle` or `zlib` CPU cost) and an LRU cache (`OrderedDict`,
+    default capacity 500 items, throttled to 25 items under `--very-low-mem`).
+  - Active ChangeSets remain in `_lru_cache` uncompressed upon insertion, and are only serialized and
+    compressed (`zlib.compress(pickle.dumps(cs), level=1)`, without their `gp`/`mf`/`batch_cs_dict`
+    references) into `_compressed_store` when evicted from `_lru_cache` upon exceeding capacity. An entry
+    handed out by `[]`/`get()` may have been mutated, so every evicted entry is compressed again; an entry
+    that cannot be pickled stays in the cache and eviction stops there (it never loops over the same entries).
   - Exposes `flush()` to compress every cached entry before serialization (`__reduce__`).
-  - Provides `clear()` to thoroughly release compressed blobs, evacuated instances, and LRU items upon completion of an update cycle.
+  - Provides `clear()` to thoroughly release compressed blobs, evacuated instances, and LRU items upon
+    completion of an update cycle.
 - **IPC Protocol & Query Helpers**:
-  - `safe_get_cs(path: str) -> ChangeSet | None`: Lookup sequence: `ChangeSet_Dict` &rarr; `Alt_ChangeSet_Dict` &rarr; checks existence in RAMDISK tree (skips absolute system paths `/usr/`, `/etc/`, `/lib/`, `/opt/`; relative `lib/` and `usr/` are kernel directories) &rarr; creates `ChangeSet("M", path)`, triggers `CS.parse()`, stores in `Alt_ChangeSet_Dict`, and returns `CS`.
-  - `get_file_symbols_from_db(rel_file: str) -> dict[tuple[str, int], int] | None`: Queries TableEngine joined tables (`m_file_name` &rarr; `m_bridge_file` &rarr; `m_bridge_tag` &rarr; `m_tag` &rarr; `m_ast`) to extract active symbol mappings `(ast_name, ast_type) -> ast_id` for unchanged files without re-parsing source text. Falls back to `Old_VID` only for files outside `_changed_paths_set`: a changed file without a `VID` row yet returns `None` uncached, since its previous version's symbols would be stale. Definitions stored once per tag are resolved with one `get_in(m_blob_symbol, blob_id)` read for the blob (plus a staged lookup per missing key for a blob written in this update) instead of one read per symbol key.
-  - `reset_cs() -> None`: Clears `Change_List`, `Symlink_List`, `ChangeSet_Dict`, `Alt_ChangeSet_Dict`, `unchanged_symbol_cache` and the per-version symbol state also reset by `init_cs_dict()` (`_clear_version_symbols()`: `file_deps`, `cs_op_counts`, `file_symbols`, `file_names`, `completed_paths`, `_ast_staged_symbols`/`_names`, `file_pre_extracted_tags`, `file_blob_ids`, `_ast_negative_cache`), prunes `blob_symbol_cache`; stops the git commit worker (`stop_commit_worker()`) and unmaps the shared symbol segments (`close_shared_symbols()`).
+  - `safe_get_cs(path: str) -> ChangeSet | None`: Lookup sequence: `ChangeSet_Dict` &rarr;
+    `Alt_ChangeSet_Dict` &rarr; checks existence in RAMDISK tree (skips absolute system paths `/usr/`,
+    `/etc/`, `/lib/`, `/opt/`; relative `lib/` and `usr/` are kernel directories) &rarr; creates
+    `ChangeSet("M", path)`, triggers `CS.parse()`, stores in `Alt_ChangeSet_Dict`, and returns `CS`.
+  - `get_file_symbols_from_db(rel_file: str) -> dict[tuple[str, int], int] | None`: Queries TableEngine joined
+    tables (`m_file_name` &rarr; `m_bridge_file` &rarr; `m_bridge_tag` &rarr; `m_tag` &rarr; `m_ast`) to
+    extract active symbol mappings `(ast_name, ast_type) -> ast_id` for unchanged files without re-parsing
+    source text. Falls back to `Old_VID` only for files outside `_changed_paths_set`: a changed file without a
+    `VID` row yet returns `None` uncached, since its previous version's symbols would be stale. Definitions
+    stored once per tag are resolved with one `get_in(m_blob_symbol, blob_id)` read for the blob (plus a
+    staged lookup per missing key for a blob written in this update) instead of one read per symbol key.
+  - `reset_cs() -> None`: Clears `Change_List`, `Symlink_List`, `ChangeSet_Dict`, `Alt_ChangeSet_Dict`,
+    `unchanged_symbol_cache` and the per-version symbol state also reset by `init_cs_dict()`
+    (`_clear_version_symbols()`: `file_deps`, `cs_op_counts`, `file_symbols`, `file_names`, `completed_paths`,
+    `_ast_staged_symbols`/`_names`, `file_pre_extracted_tags`, `file_blob_ids`, `_ast_negative_cache`), prunes
+    `blob_symbol_cache`; stops the git commit worker (`stop_commit_worker()`) and unmaps the shared symbol
+    segments (`close_shared_symbols()`).
 
 ---
 
 ## 4. Relational Database Schema Registry (`core/DBLayout.py`)
 
-45 Zero-VID Git-Native Core Tables defined via `Table` instances and exported in `TABLES` tuple (`init_db_layout(gp)` sets `gp.Table_Array = list(TABLES)`). The database schema eliminates synthetic linear release versions (`vid`), modeling the kernel codebase directly as a Git DAG rooted at `m_repository` $\to$ `m_commit` $\to$ `m_bridge_checkpoint` $\to$ `m_file_blob`:
+66 Zero-VID Git-Native Core Tables defined via `Table` instances and exported in `TABLES` tuple
+(`init_db_layout(gp)` sets `gp.Table_Array = list(TABLES)`). `core/DBLayout.py` is the single authoritative
+source of truth for table definitions, columns, and types. The database schema eliminates synthetic linear
+release versions (`vid`), modeling the kernel codebase directly as a Git DAG rooted at `m_repository` $\to$
+`m_commit` $\to$ `m_bridge_checkpoint` $\to$ `m_file_blob`:
 
-| `table_id` | Table Name | Columns | Primary Key | `no_duplicate` | `te_cached` | `hashing_table` | Description |
-| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| **0** | `m_project` | `(project_id, name, slug)` | `("project_id",)` | `True` | `True` | `False` | Top-level project container |
-| **1** | `m_file_name` | `(fnid, fname)` | `("fnid",)` | `True` | `True` | `False` | Unique repository path string registry |
-| **2** | `m_file_blob` | `(blob_id, blob_hash, ftype)` | `("blob_id",)` | `True` | `True` | `False` | Content-addressed file blob store (aliased as `m_file`) |
-| **3** | `m_bridge_checkpoint` | `(commit_id, fnid, blob_id)` | `("commit_id", "fnid")` | `False` | `True` | `False` | Checkpoint tree bridge (aliased as `m_bridge_file`) |
-| **4** | `m_blob_transition` | `(old_blob_id, new_blob_id)` | `("old_blob_id", "new_blob_id")` | `False` | `True` | `False` | Inter-blob transition delta (aliased as `m_moved_file`) |
-| **5** | `m_type_descriptor`| `(type_id, name)` | `("type_id",)` | `False` | `True` | `False` | AST node type registry (seeded from `ASTT`) |
-| **6** | `m_ast` | `(ast_id, name, type_id)` | `("ast_id",)` | `False` | `False`| `"m_ast_hash"` | AST symbol nodes |
-| **7** | `m_ast_container` | `(ast_id, priority, type_id, ref_ast_id)`| `("ast_id", "priority")`| `False` | `False` | `False` | AST child hierarchy links |
-| **8** | `m_ast_include` | `(ast_id, fnid)` | `("ast_id",)` | `False` | `False`| `False` | AST `#include` / `source` references |
-| **9** | `m_ast_debug` | `(ast_id, ast_raw)` | `("ast_id",)` | `False` | `False`| `False` | JSON dumps of AST structures |
-| **10** | `m_tag` | `(tag_id, hash, ast_id, hl_s, hl_l)` | `("tag_id",)` | `False` | `False` | `False` | Content-addressed code snippet tag |
-| **11** | `m_bridge_tag` | `(blob_id, tag_id, line_s, line_e, char_s, char_e)` | `("blob_id", "tag_id")` | `False` | `False` | `False` | Blob coordinate and line mapping |
-| **12** | `m_map_ast` | `(map_id, line_s, char_s, line_e, char_e, ast_id)`| `("map_id", "line_s", ...)`| `False` | `False`| `False` | Spatial AST coordinate region |
-| **13** | `m_bridge_map` | `(tag_id, map_id)` | `("tag_id", "map_id")` | `False` | `False` | `False` | No longer written: every row was `(tag_id, tag_id)`. `m_map_ast.map_id` is the tag id; join `m_map_ast.map_id = m_bridge_tag.tag_id`. Kept registered so table ids never shift |
-| **14** | `m_ast_hash` | `(hash, ast_id)` | `("hash",)` | `False` | `True` | `False` | Binary 32-byte SHA-256 AST structural hash deduplication |
-| **15** | `m_maintainer_person`| `(person_id, name, email)` | `("person_id",)` | `True` | `True` | `False` | Canonical person identity registry |
-| **16** | `m_maintainer_section`| `(sec_id, blob_id, name, status, scm_tree, web_page, mailing_list, ast_id)` | `("sec_id",)` | `True` | `True` | `False` | Subsystem maintainer sections per blob |
-| **17** | `m_maintainer_member`| `(sec_id, person_id, role_type, priority)` | `("sec_id", "person_id", "role_type")` | `False` | `True` | `False` | Maintainer subsystem personnel roles |
-| **18** | `m_maintainer_pattern`| `(sec_id, pat_type, pattern, priority)` | `("sec_id", "pat_type", "pattern", "priority")` | `False` | `True` | `False` | Section file matching patterns |
-| **19** | `m_maintainer_file`| `(maintainers_blob_id, fnid, sec_id)` | `("maintainers_blob_id", "fnid", "sec_id")` | `False` | `False` | `False` | Path to maintainer section resolution |
-| **20** | `m_credits_entry` | `(credit_id, blob_id, person_id, web_page, pgp_key, description, snail_mail, ast_id)` | `("credit_id",)` | `True` | `True` | `False` | CREDITS contributor biographies |
-| **21** | `m_commit` | `(commit_id, network_id, commit_hash, author_id, author_date, committer_id, committer_date, subject, message)` | `("commit_id",)` | `False` | `False` | `False` | Git commit metadata registry |
-| **22** | `m_bridge_commit_person`| `(commit_id, person_id, role_type, priority)` | `("commit_id", "person_id", "role_type")` | `False` | `False` | `False` | Commit author, committer, and trailers (write-only, idempotent: not preloaded) |
-| **23** | `m_commit_file` | `(commit_id, fnid, blob_id, old_fnid, old_blob_id, change_type)` | `("commit_id", "fnid")` | `False` | `False` | `False` | Files touched per commit (aliased as `m_bridge_commit_file`), with the blobs that commit read (`old_*`, 0 for an added file) and wrote (0 for a deleted one), from the patch's `index` lines; an intermediate commit's blob gets its `m_file_blob` row there |
-| **24** | `m_bridge_commit_tag`| `(commit_id, blob_id, tag_id)` | `("commit_id", "tag_id")` | `False` | `False` | `False` | Tags affected per commit |
-| **25** | `m_moved_tag` | `(s_tag_id, e_tag_id)` | `("s_tag_id", "e_tag_id")` | `False` | `False` | `False` | Tag cross-blob evolution tracking |
-| **26** | `m_blob_symbol_def` | `(def_id, blob_id, tag_id, ast_id, name, type_id, linkage, line_s, line_e)` | `("def_id",)` | `False` | `False` | `False` | Symbol definitions stored per blob: outside their tag, tagless, or a recycled tag whose definitions changed (see `m_symbol_def` view) |
-| **27** | `m_blob_symbol_ref` | `(ref_id, blob_id, tag_id, ast_id, target_fnid, role, line, char_s)` | `("ref_id",)` | `False` | `False` | `False` | Symbol references stored per blob (same cases) |
-| **28** | `m_file_reference` | `(ref_id, source_blob_id, source_fnid, target_fnid, ref_type, line_no, details)` | `("ref_id",)` | `False` | `False` | `False` | Cross-file usage and includes, per source (blob, path) pair |
-| **29** | `m_db_instance` | `(instance_hash, created_at)` | `("instance_hash",)` | `True` | `False` | `False` | Database instance fingerprint |
-| **30** | `m_git_network` | `(network_id, project_id, name, root_commit_hash)` | `("network_id",)` | `False` | `True` | `False` | Multi-remote repository network |
-| **31** | `m_repository` | `(repo_id, network_id, name, git_url, default_branch)` | `("repo_id",)` | `False` | `True` | `False` | Tracked Git repository instance |
-| **32** | `m_git_ref` | `(ref_id, repo_id, ref_type, ref_name, commit_id, tagger_id, tagger_date, tag_message)` | `("ref_id",)` | `False` | `True` | `False` | Named Git reference (aliased as `m_v_main`); `ref_type`: 1 = tag, 2 = branch (local or remote), 3 = bare commit |
-| **33** | `m_commit_parent` | `(commit_id, parent_commit_id, parent_idx)` | `("commit_id", "parent_idx")` | `False` | `False` | `False` | Full Git commit DAG topology (write-only, idempotent: not preloaded) |
-| **34** | `m_ast_attribute` | `(ast_id, priority, name, val)` | `("ast_id", "priority")` | `False` | `False` | `False` | AST compiler/kernel attributes |
-| **35** | `m_ingest_state` | `(network_id, commit_id, status, updated_at)` | `("network_id", "commit_id")` | `False` | `False` | `False` | Ingestion status of a version's head commit: 1 = parsing, 2 = done (§4.1); the webapp only lists done versions |
-| **36** | `m_tag_def` | `(tag_id, def_idx, sym_key, name, type_id, linkage, rel_line_s, rel_line_e)` | `("tag_id", "def_idx")` | `False` | `False` | `False` | A tag's definitions, lines relative to the tag, written once when the tag is new |
-| **37** | `m_tag_ref` | `(tag_id, ref_idx, sym_key, role, rel_line, char_s)` | `("tag_id", "ref_idx")` | `False` | `False` | `False` | A tag's references, written once when the tag is new |
-| **38** | `m_blob_symbol` | `(blob_id, sym_key, target_ast_id, target_fnid)` | `("blob_id", "sym_key")` | `False` | `False` | `False` | Per-blob resolution of the keys the shared rows use (idempotent) |
-| **39** | `m_symbol_own` | `(blob_id, tag_id, kind)` | `("blob_id", "tag_id", "kind")` | `False` | `False` | `False` | Tag placements whose references (1) / definitions (2) are stored per blob instead (idempotent) |
-| **40** | `m_ingest_watermark` | `(commit_id, marked_table_id, max_id)` | `("commit_id", "marked_table_id")` | `False` | `False` | `False` | Highest id of each id-allocating table when a version run started (§4.1); no foreign keys, removed when the version is done |
-| **41** | `m_ingest_blob` | `(commit_id, blob_id)` | `("commit_id", "blob_id")` | `False` | `False` | `False` | Pre-existing blobs (never parsed, e.g. from intermediate commits) a version run parses (§4.1); removed when the version is done |
-| **42** | `m_arch_root` | `(commit_id, arch, role, priority, path, target)` | `("commit_id", "arch", "role", "path")` | `False` | `False` | `False` | Build layout of every ARCH value at a version's head commit, evaluated from its Makefiles (`parser/arch_layout.py`, `parser/kconfig_ast/KCONFIG_API.md` §6.5): role 1 source directory, 2 include directory (`priority` = `-I` order), 3 symlink the build creates (`path` -> `target`), 4 generated asm-generic wrapper (`path` -> the header it includes), 5 forced `-include` file; directories end with `/`. Written by Step 6.8 |
-| **43** | `m_commit_email` | `(email_id, commit_id, email_type, raw_email, address, domain)` | `("email_id",)` | `False` | `False` | `False` | Git commit email addresses |
+For authoritative table definitions, primary keys, indexes, and the full relational graph, refer directly to `core/DBLayout.py` (lines 1–93 provide the concise entity-relationship map and column lists across all 66 tables; individual `Table(...)` declarations define specific column types, unique keys, and `te_cached` flags).
+
+### Relational Table Families (`core/DBLayout.py`)
+- **Projects & File Blobs** (Tables 0–4): `m_project`, `m_file_name`, `m_file_blob`, `m_bridge_checkpoint`, `m_blob_transition`.
+- **AST Nodes & Spatial Mapping** (Tables 5–14, 34): `m_type_descriptor`, `m_ast`, `m_ast_container`, `m_ast_include`, `m_ast_debug`, `m_tag`, `m_bridge_tag`, `m_map_ast`, `m_bridge_map`, `m_ast_hash`, `m_ast_attribute`.
+- **Maintainers & CREDITS** (Tables 15–20): `m_maintainer_person`, `m_maintainer_section`, `m_maintainer_member`, `m_maintainer_pattern`, `m_maintainer_file`, `m_credits_entry`. `m_maintainer_section` records subsystem metadata: `(sec_id, blob_id, name, status, scm_tree, web_page, mailing_list, ast_id, patchwork, bug_url, chat_channel, profile_doc)`.
+- **Git Commit DAG & Lineage** (Tables 21–25, 30–33, 43, 60, 63–64): `m_commit`, `m_bridge_commit_person`, `m_commit_file`, `m_bridge_commit_tag`, `m_moved_tag`, `m_git_network`, `m_repository`, `m_git_ref`, `m_commit_parent`, `m_commit_email`, `m_commit_release`, `m_commit_relation`, `m_commit_link`.
+- **Symbol Definitions & Cross-References** (Tables 26–28, 36–39, 44, 48, 61): `m_blob_symbol_def`, `m_blob_symbol_ref`, `m_file_reference`, `m_tag_def`, `m_tag_ref`, `m_blob_symbol`, `m_symbol_own`, `m_blob_symbol_file`, `m_blob_facts`, `m_kbuild_symbol`. Joined views `m_symbol_def` and `m_symbol_ref` exposed via `core/SymbolRows.py`.
+- **Ingestion State, Watermarks & Checkpoints** (Tables 29, 35, 40–41, 47, 55–58): `m_db_instance`, `m_ingest_state`, `m_ingest_watermark`, `m_ingest_blob`, `m_checkpoint_base`, `m_table_sequence`, `m_ingest_id_range`, `m_parse_node`, `m_parse_task`. Table 58 `m_parse_task` coordinates distributed secondary work: `(task_id, network_id, chain_name, chain_kind, seq_order, ref_name, commit_id, base_ref_name, base_commit_id, status, worker_id, lease_expires_at, retry_count, error_msg)`, with unique key `(network_id, ref_name)`.
+- **Build Layouts & Statistics** (Tables 42, 45–46, 52–54, 59): `m_arch_root`, `m_arch_layout`, `m_arch_layout_entry`, `m_release_segment`, `m_release_person`, `m_person_first_release`, `m_person_identity`.
+- **CVE Catalogs & Tracking** (Tables 49–51, 62, 65): `m_cve_source`, `m_cve`, `m_cve_commit`, `m_cve_commit_hash`, `m_cve_file`. Table 65 `m_cve_file` maps CVE records to affected kernel source and header file paths: `(cve_id, file_path)`, indexed by `file_path`.
 
 > [!NOTE]
-> **Kconfig has no tables of its own.** Kconfig entries are tags like any other construct (`m_ast` named after the entry with type `Kconfig_Config` / `Kconfig_Menuconfig` / `Kconfig_Menu` / `Kconfig_Choice` / `Kconfig_If` / `Kconfig_Comment` / `Kconfig_Source`..., placed by `m_tag` + `m_bridge_tag`; `source` with a literal path links the sourced file through `m_ast_include`), see `parser/kconfig_ast/KCONFIG_API.md` §2. Menus, dependencies and values come from the semantic model the webapp builds from Git per revision and ARCH. The former `m_kconfig_symbol`, `m_kconfig_relation`, `m_kconfig_tree` and `m_kconfig_kbuild` (table ids 16-19) were dropped: two were never read, and the other two were read wrongly (a definition was not tied to the blob holding it). On startup `main.drop_obsolete_kconfig_tables()` drops them from an existing database and first renumbers the `m_ingest_watermark` rows of interrupted runs, since the later tables moved: old ids 20-34 became 16-30, `m_git_network`/`m_repository`/`m_git_ref`/`m_commit_parent` (36-39) became 31-34 and 40-48 became 36-44, while `m_ast_attribute` keeps id 35 — `m_ast_hash` hashes each view's join graph, table ids included, so the id of a table joined in AST views (`m_ast`, `m_ast_container`, `m_ast_include`, `m_ast_attribute`) must never change. A commit's marks are in the old numbering exactly when they include id 18 (then `m_kconfig_tree`, a marked table; id 18 is now the unmarked `m_maintainer_member`), so a re-run is harmless.
+> **Kconfig has no tables of its own.** Kconfig entries are tags like any other construct (`m_ast` named after
+> the entry with type `Kconfig_Config` / `Kconfig_Menuconfig` / `Kconfig_Menu` / `Kconfig_Choice` /
+> `Kconfig_If` / `Kconfig_Comment` / `Kconfig_Source`..., placed by `m_tag` + `m_bridge_tag`; `source` with a
+> literal path links the sourced file through `m_ast_include`), see `parser/kconfig_ast/KCONFIG_API.md` §2.
+> Menus, dependencies and values come from the semantic model the webapp builds from Git per revision and
+> ARCH. The former `m_kconfig_symbol`, `m_kconfig_relation`, `m_kconfig_tree` and `m_kconfig_kbuild` (table
+> ids 16-19) were dropped: two were never read, and the other two were read wrongly (a definition was not tied
+> to the blob holding it). On startup `main.drop_obsolete_kconfig_tables()` drops them from an existing
+> database and first renumbers the `m_ingest_watermark` rows of interrupted runs, since the later tables
+> moved: old ids 20-34 became 16-30, `m_git_network`/`m_repository`/`m_git_ref`/`m_commit_parent` (36-39)
+> became 31-34 and 40-48 became 36-44, while `m_ast_attribute` keeps id 35 — `m_ast_hash` hashes each view's
+> join graph, table ids included, so the id of a table joined in AST views (`m_ast`, `m_ast_container`,
+> `m_ast_include`, `m_ast_attribute`) must never change. A commit's marks are in the old numbering exactly
+> when they include id 18 (then `m_kconfig_tree`, a marked table; id 18 is now the unmarked
+> `m_maintainer_member`), so a re-run is harmless.
 
 > [!NOTE]
-> **Symbol views** (`core/SymbolRows.py`, created by `main.ensure_db_views()`): `m_symbol_def` and `m_symbol_ref` are SQL views returning, in the former per-blob shape, the per-blob rows plus the shared rows placed through `m_bridge_tag` (`line = bt.line_s + rel_line`, target from `m_blob_symbol`), skipping placements marked in `m_symbol_own`. A shared definition's `def_id` is computed (`1 << 62 | blob_id << 37 | tag_id << 6 | def_idx`) and a shared reference's `ref_id` is NULL, so neither can be looked up by id efficiently. `symbol_view_rows()` computes the same rows from in-memory tables (MockDB, tests). Filtering a view by `ast_id` is slow (the database joins each blob using the target with every tag holding its key); `rows_of_targets_sql(view, n)` returns the same rows for `n` target AST ids starting from their keys (`m_blob_symbol.target_ast_id` → `m_tag_ref` / `m_tag_def` by `sym_key` → `m_bridge_tag` → `m_blob_symbol`), for use as a derived table. Keys come from the tag's text (`parser/c_ast/CAST_API.md` §9.3); `m_tag_def` and `m_tag_ref` are indexed on `(sym_key, tag_id)`. A database that still has `m_symbol_def` / `m_symbol_ref` as tables is refused (run `--reset`; the reset drops them).
+> **Older databases.** A database created with the layout before `m_arch_layout`, `m_blob_symbol_file`,
+> 16-byte AST hashes and the narrower columns cannot be extended in place: `main.outdated_layout()` detects it
+> at start (`m_arch_root.layout_id` missing, `m_blob_symbol.target_fnid` still present, `m_ast_hash.hash` not
+> `BINARY(16)`) and the parser stops, asking for `--reset`. The webapp keeps reading such a database until
+> then (`webapp/backend/database/helpers.py` `tree_source()` falls back to `m_bridge_checkpoint` without the
+> `m_checkpoint_tree` view).
+
+> [!NOTE]
+> **Column widths.** Line, column and index numbers (`m_bridge_tag`, `m_map_ast`, `m_tag_def`, `m_tag_ref`,
+> `m_blob_symbol_def`, `m_blob_symbol_ref`, `m_file_reference.line_no`) are `MEDIUMINT` (3 bytes, ±8.3M;
+> `m_tag_ref.ref_idx` unsigned, 16.7M): the largest values seen are line 3,195 within a tag and index 8,286.
+> The session runs without strict mode (`sql_mode = 'NO_AUTO_VALUE_ON_ZERO'`, `db_engine/DB_API.md` §2.1), so
+> an out-of-range value would be clamped, not rejected. The database also holds `m_tag_code (hash, code)`,
+> written by the database driver (`db_engine`) outside this registry.
+
+> [!NOTE]
+> **Symbol views** (`core/SymbolRows.py`, created by `main.ensure_db_views()`): `m_symbol_def` and
+> `m_symbol_ref` are SQL views returning, in the former per-blob shape, the per-blob rows plus the shared rows
+> placed through `m_bridge_tag` (`line = bt.line_s + rel_line`, target from `m_blob_symbol`, its file from
+> `m_blob_symbol_file` or 0), skipping placements marked in `m_symbol_own`. A shared definition's `def_id` is
+> computed (`1 << 62 | blob_id << 37 | tag_id << 6 | def_idx`) and a shared reference's `ref_id` is NULL, so
+> neither can be looked up by id efficiently. `symbol_view_rows()` computes the same rows from in-memory
+> tables (MockDB, tests). Filtering a view by `ast_id` is slow (the database joins each blob using the target
+> with every tag holding its key); `rows_of_targets_sql(view, n)` returns the same rows for `n` target AST ids
+> starting from their keys (`m_blob_symbol.target_ast_id` → `m_tag_ref` / `m_tag_def` by `sym_key` →
+> `m_bridge_tag` → `m_blob_symbol`), for use as a derived table. Keys come from the tag's text
+> (`parser/c_ast/CAST_API.md` §9.3); `m_tag_def` and `m_tag_ref` are indexed on `(sym_key, tag_id)`. A
+> database that still has `m_symbol_def` / `m_symbol_ref` as tables is refused (run `--reset`; the reset drops
+> them).
 
 > [!IMPORTANT]
-> **ChangeSet Tag Reference Order Invariant**: When staging tags in ChangeSets (`with CS(REF_POS):`), `m_tag.set` MUST be the first operation inside the block (`m_tag.set(None, code_hash, ast_ref, 0, 0)`) so that `tag_ref = ((m_tag.table_id, 0), OP_REF, (REF_POS, CS.route[-1]))` points directly to `m_tag`. Auxiliary deduplication operations (such as `m_moved_tag.set`) must always be staged after `m_tag.set` within the block.
+> **ChangeSet Tag Reference Order Invariant**: When staging tags in ChangeSets (`with CS(REF_POS):`),
+> `m_tag.set` MUST be the first operation inside the block (`m_tag.set(None, code_hash, ast_ref, 0, 0)`) so
+> that `tag_ref = ((m_tag.table_id, 0), OP_REF, (REF_POS, CS.route[-1]))` points directly to `m_tag`.
+> Auxiliary deduplication operations (such as `m_moved_tag.set`) must always be staged after `m_tag.set`
+> within the block.
 
 > [!NOTE]
-> **Foreign Key Handling During Setup**: Table creation wraps execution in `SET FOREIGN_KEY_CHECKS = 0;` and restores checks in a `finally` block, safely supporting forward and circular foreign key relationships.
+> **Foreign Key Handling During Setup**: Table creation wraps execution in `SET FOREIGN_KEY_CHECKS = 0;` and
+> restores checks in a `finally` block, safely supporting forward and circular foreign key relationships.
 
 ### 4.1. Version Ingestion State & Recovery of Interrupted Runs (`core/ingest_state.py`)
-The TableEngine commits each table atomically but tables independently, so a run stopped in the middle (crash, kill, `--duration` limit) can leave half-written rows: a blob with tags but without its symbol rows, a tag without its definitions, an AST node without its children. Content-addressed deduplication (`_reuse_parsed_blobs()`, tag and AST hashes) would reuse them in every later version. Each version run is therefore bracketed:
-- **Begin** (`ingest_state.begin()`, end of `ingest_git_dag()` once the head commit, its DAG and its `m_git_ref` row exist): `m_ingest_state` = `INGEST_PARSING` and one `m_ingest_watermark` row per id-allocating table (`marked_tables()`: single INT primary key that is not a foreign key, outside the static registries `m_type_descriptor`, `m_project`, `m_git_network`, `m_repository`, `m_git_ref`). Ids are allocated increasingly by a single writer, so every row above a watermark belongs to the run *while that run is the newest one*. A ref whose head commit could not be resolved (`commit_id` 0, the `m_git_ref` sentinel) is never watermarked and gets no state row.
-- **Step 4.5** (`_record_reparsed_blobs()`): blobs that already exist but are parsed now (they are not reused) go to `m_ingest_blob` before any of their rows are written.
-- **Done** (`finish_version_ingest()`, end of `update()`, also after a graceful `q` quit, which finishes the version): `INGEST_DONE`, and the version's watermark and blob rows are removed. Early returns on the duration limit leave the version `INGEST_PARSING`.
-- **Fast-Forward Startup** (`ingest_state.fetch_repo_version_states()`, `main.py`): on startup, the parser queries `m_git_ref` and `m_ingest_state` in a single batch query for the active repository (plus one existence query per 1000 refs without a state row), fast-forwarding through the contiguous prefix of completed (`INGEST_DONE`) versions. A ref without a state row but with checkpoint rows is `"legacy"`: the scan decides it with `_previous_ingest()`'s 90% rule (`main._resolve_legacy_state()`), so a partial legacy version stops the prefix and is purged (`"legacy_partial"`) instead of being skipped as done. `gp.Old_VID` and `gp.Old_Version_Name` are initialized directly from the last completed version, skipping per-version git subprocesses and DB roundtrips.
-- **RAMDISK Scratch Cleanup** (`ingest_state.cleanup_ramdisk_artifacts()`, `--clean-temp`): purges orphaned `/dev/shm/code-parser.*` and `kip-*` temporary directories left by previous crashes or killed processes; a directory whose recorded owner (`core.FileHandler.mark_owner()`) still runs belongs to a live parser instance and is kept.
-- **Next start** (`_previous_ingest()` in `ingest_git_dag()`): `done` skips the version (registering an alias ref when another ref ingested the commit); `interrupted` (`INGEST_PARSING`) calls `rollback_version()` and parses the version again from Step 1 (when that returns `False` — no watermarks, or stale ones — `_purge_partial_version()` runs instead). Refs without a state row predate this mechanism: they count as done when their checkpoint covers at least 90% of the tree (`INGEST_DONE` is then backfilled), otherwise their version-scoped rows (`m_bridge_checkpoint`, `m_commit_file`, `m_bridge_commit_tag`, `m_bridge_commit_person` of the head commit) are purged as before; their blob-level rows cannot be identified.
-- **Rollback** (`rollback_plan()` + `rollback_version()`): first `precheck_queries()` look for rows older than the run (id at or below their table's watermark) that reference rows of the run; any hit raises `RecoveryError` instead of deleting older data. The plan then deletes, children before parents along the declared foreign keys: the version's `m_bridge_checkpoint` and `m_arch_root` rows; every row derived from the `m_ingest_blob` blobs in the tables referencing `m_file_blob` (except the commit-scoped `m_bridge_checkpoint`, `m_commit_file`, `m_bridge_commit_tag`, `m_blob_transition`), including the rows hanging off them (e.g. `m_maintainer_member` of a deleted section); and for each watermarked table, in child-first order, the link-table rows referencing ids above its mark, then its own rows above the mark (a watermarked child's new rows go with its own mark). Statements run as `DELETE ... LIMIT 50000` loops, each chunk committed; every one uses the foreign-key indexes, and re-running a partially executed rollback is harmless. A step is probed with a `SELECT 1 ... LIMIT 1` first and skipped when it matches nothing (most of the ~76 steps of a plan), and every executed step logs its table, row count and duration, with a progress line every 20s inside a long one: a rollback deletes millions of rows over several minutes and must stay visibly alive. Once the plan has run, `discard_marks()` drops the spent watermark and blob rows. The TableEngine then drops its carried tables (`discard_carried()`) and `main.py` clears its in-process caches (`_forget_rolled_back_rows()`).
-- **Stale watermarks** (`_completed_after()`): watermarks locate a run's rows only until another version is ingested on top of them. `begin()` records the highest `m_commit` id along with the other marks, so a version with `INGEST_DONE` and a higher head `commit_id` was ingested afterwards and its rows sit above the same marks. `rollback_version()` checks this before deleting anything: on a hit it logs a warning, discards the unusable marks and returns `False`, and the caller falls back to `_purge_partial_version()` (version-scoped rows only) rather than deleting a finished version's data. This happens when several interrupted runs accumulate — e.g. a branch left `INGEST_PARSING` while later releases completed.
-- **Retroactive Backfill & Downstream Re-alignment** (`orchestrate_repair_pipeline()`, `--repair`, `--backfill <ref>`, `--dry-run`): when an earlier version ($V_2$) was skipped or broken while a future version ($V_3$) was parsed against $V_1$:
+The TableEngine commits each table atomically but tables independently, so a run stopped in the middle (crash,
+kill, `--duration` limit) can leave half-written rows: a blob with tags but without its symbol rows, a tag
+without its definitions, an AST node without its children. Content-addressed deduplication
+(`_reuse_parsed_blobs()`, tag and AST hashes) would reuse them in every later version. Each version run is
+therefore bracketed:
+- **Begin** (`ingest_state.begin()`, end of `ingest_git_dag()` once the head commit, its DAG and its
+  `m_git_ref` row exist): `m_ingest_state` = `INGEST_PARSING` and one `m_ingest_watermark` row per
+  id-allocating table (`marked_tables()`: single INT primary key that is not a foreign key, outside the static
+  registries `m_type_descriptor`, `m_project`, `m_git_network`, `m_repository`, `m_git_ref`). Ids are
+  allocated increasingly by a single writer, so every row above a watermark belongs to the run *while that run
+  is the newest one*. A ref whose head commit could not be resolved (`commit_id` 0, the `m_git_ref` sentinel)
+  is never watermarked and gets no state row.
+- **Step 4.5** (`_record_reparsed_blobs()`): blobs that already exist but are parsed now (they are not reused)
+  go to `m_ingest_blob` before any of their rows are written.
+- **Done** (`finish_version_ingest()`, end of `update()`, also after a graceful `q` quit, which finishes the
+  version): `INGEST_DONE`, and the version's watermark and blob rows are removed. Early returns on the
+  duration limit leave the version `INGEST_PARSING`.
+- **Fast-Forward Startup** (`ingest_state.fetch_repo_version_states()`, `main.py`): on startup, the parser
+  queries `m_git_ref` and `m_ingest_state` in a single batch query for the active repository (plus one
+  existence query per 1000 refs without a state row), fast-forwarding through the contiguous prefix of
+  completed (`INGEST_DONE`) versions. A ref without a state row but with checkpoint rows is `"legacy"`: the
+  scan decides it with `_previous_ingest()`'s 90% rule (`main._resolve_legacy_state()`), so a partial legacy
+  version stops the prefix and is purged (`"legacy_partial"`) instead of being skipped as done. `gp.Old_VID`
+  and `gp.Old_Version_Name` are initialized directly from the last completed version, skipping per-version git
+  subprocesses and DB roundtrips.
+- **RAMDISK Scratch Cleanup** (`ingest_state.cleanup_ramdisk_artifacts()`, `--clean-temp`): purges orphaned
+  `/dev/shm/code-parser.*` and `kip-*` temporary directories left by previous crashes or killed processes; a
+  directory whose recorded owner (`core.FileHandler.mark_owner()`) still runs belongs to a live parser
+  instance and is kept.
+- **Next start** (`_previous_ingest()` in `ingest_git_dag()`): `done` skips the version (registering an alias
+  ref when another ref ingested the commit); `interrupted` (`INGEST_PARSING`) calls `rollback_version()` and
+  parses the version again from Step 1 (when that returns `False` — no watermarks, or stale ones —
+  `_purge_partial_version()` runs instead). Refs without a state row predate this mechanism: they count as
+  done when their checkpoint covers at least 90% of the tree (`INGEST_DONE` is then backfilled), otherwise
+  their version-scoped rows (`m_bridge_checkpoint`, `m_commit_file`, `m_bridge_commit_tag`,
+  `m_bridge_commit_person` of the head commit) are purged as before; their blob-level rows cannot be
+  identified.
+- **Rollback** (`rollback_plan()` + `rollback_version()`): first `precheck_queries()` look for rows older than
+  the run (id at or below their table's watermark) that reference rows of the run; any hit raises
+  `RecoveryError` instead of deleting older data. The plan then deletes, children before parents along the
+  declared foreign keys: the version's `m_checkpoint_base`, `m_bridge_checkpoint` and `m_arch_root` rows (a
+  layout the run created, `m_arch_layout` above its watermark, goes with its entries); every row derived from
+  the `m_ingest_blob` blobs in the tables referencing `m_file_blob` (except the commit-scoped
+  `m_bridge_checkpoint`, `m_commit_file`, `m_bridge_commit_tag`, `m_blob_transition`), including the rows
+  hanging off them (e.g. `m_maintainer_member` of a deleted section); and for each watermarked table, in
+  child-first order, the link-table rows referencing ids above its mark, then its own rows above the mark (a
+  watermarked child's new rows go with its own mark). Statements run as `DELETE ... LIMIT 50000` loops, each
+  chunk committed; every one uses the foreign-key indexes, and re-running a partially executed rollback is
+  harmless. A step is probed with a `SELECT 1 ... LIMIT 1` first and skipped when it matches nothing (most of
+  the ~76 steps of a plan), and every executed step logs its table, row count and duration, with a progress
+  line every 20s inside a long one: a rollback deletes millions of rows over several minutes and must stay
+  visibly alive. Once the plan has run, `discard_marks()` drops the spent watermark and blob rows. The
+  TableEngine then drops its carried tables (`discard_carried()`) and `main.py` clears its in-process caches
+  (`_forget_rolled_back_rows()`).
+- **Stale watermarks** (`_completed_after()`): watermarks locate a run's rows only until another version is
+  ingested on top of them. `begin()` records the highest `m_commit` id along with the other marks, so a
+  version with `INGEST_DONE` and a higher head `commit_id` was ingested afterwards and its rows sit above the
+  same marks. `rollback_version()` checks this before deleting anything: on a hit it logs a warning, discards
+  the unusable marks and returns `False`, and the caller falls back to `_purge_partial_version()`
+  (version-scoped rows only) rather than deleting a finished version's data. This happens when several
+  interrupted runs accumulate — e.g. a branch left `INGEST_PARSING` while later releases completed.
+- **Retroactive Backfill & Downstream Re-alignment** (`orchestrate_repair_pipeline()`, `--repair`, `--backfill
+  <ref>`, `--dry-run`): when an earlier version ($V_2$) was skipped or broken while a future version ($V_3$)
+  was parsed against $V_1$:
   1. $V_2$ is backfilled using its predecessor $V_1$ as baseline (`Old_VID = V1`).
-  2. The downstream successor $V_3$ is prepared via `purge_version_differential_rows()`: purges $V_3$'s version-scoped differential rows (`m_bridge_checkpoint`, `m_commit_file`, `m_bridge_commit_tag`, `m_arch_root`, and inbound `m_moved_tag` entries targeting tags placed only in blobs new in $V_3$ relative to the predecessor — tags are shared across versions, so transitions into tags already in the predecessor's tree belong to earlier versions and are kept) while preserving universal content stores (`m_file_blob`, `m_ast`, `m_tag`).
-  3. $V_3$ is re-ingested with `Old_VID = V2`. Content-addressable deduplication (`_reuse_parsed_blobs()`) reuses existing ASTs and blobs in $O(1)$ time, cleanly repairing tag movements and commit deltas without attributing $V_2$'s changes to $V_3$.
+  2. The downstream successor $V_3$ is prepared via `purge_version_differential_rows()`: expands the
+     checkpoints stored as deltas of $V_3$'s, and $V_3$'s and its predecessor's own (§4.2), then purges
+     $V_3$'s version-scoped differential rows (`m_bridge_checkpoint`, `m_commit_file`, `m_bridge_commit_tag`,
+     `m_arch_root`, and inbound `m_moved_tag` entries targeting tags placed only in blobs new in $V_3$
+     relative to the predecessor — tags are shared across versions, so transitions into tags already in the
+     predecessor's tree belong to earlier versions and are kept) while preserving universal content stores
+     (`m_file_blob`, `m_ast`, `m_tag`).
+  3. $V_3$ is re-ingested with `Old_VID = V2`. Content-addressable deduplication (`_reuse_parsed_blobs()`)
+     reuses existing ASTs and blobs in $O(1)$ time, cleanly repairing tag movements and commit deltas without
+     attributing $V_2$'s changes to $V_3$.
+
+### 4.2. Checkpoints Stored as Deltas (`core/checkpoints.py`)
+A version's tree (`m_bridge_checkpoint`, ~52k rows) is nearly the same as the versions around it: a stable
+update changes well under 1% of its files, and 2,917 of 4,076 versions are stable updates. Full rows are only
+needed while a version is the newest one, which the next run reads as its previous version (TableEngine
+preload `commit_id >= Old_VID`, `processing_unchanges()`, `_new_version_file_pairs()`, the tag tracker).
+- **Compaction** (`finish_version_ingest()` → `checkpoints.compact()`): once version $V$ is `INGEST_DONE`, its
+  predecessor $P$ (`gp.Old_VID`) is compared with the newest finished full checkpoint ingested before it
+  (`choose_base()`: highest `commit_id` below $P$ without an `m_checkpoint_base` row, never $V$). When they
+  differ in at most `parser.checkpoint_delta_ratio` (default 0.3) of $P$'s rows, one transaction keeps only
+  $P$'s rows whose blob differs, adds `blob_id = 0` via `INSERT IGNORE` for the base's paths $P$ lacks, and records
+  `m_checkpoint_base(P, base, delta_rows)`; otherwise $P$ stays full and becomes the base of the versions
+  after it. A base is never compacted (`dependents()`), so a tree is at most one base plus one delta. A
+  52k-row checkpoint compacts in ~0.4 s (MariaDB 11.8), keeping ~1% of its rows for a stable update. A failed
+  compaction only logs a warning.
+- **Expansion** (`checkpoints.expand()`): restores the full rows (~0.4 s) using `INSERT IGNORE INTO m_bridge_checkpoint`
+  so concurrent worker expansions of the same base version do not clash on `PRIMARY KEY (commit_id, fnid)`. Step 1.5 of `update()` expands the
+  previous version when it is a delta (a backfill or repair base); `purge_version_differential_rows()` and
+  `main._purge_partial_version()` expand the deltas resting on a checkpoint before deleting it
+  (`expand_dependents()`).
+- **Reading**: the `m_checkpoint_tree (commit_id, fnid, blob_id)` view (`TREE_VIEW_SQL`, created by
+  `main.ensure_db_views()`; `m_bridge_file` reads it) returns every version's full tree. Filtered by
+  `commit_id`, MariaDB pushes the condition into both of its `UNION ALL` branches (0.27 s for a 52k-row tree).
+  `tree_rows()` computes the same in Python. Looking a blob's paths up across versions (`WHERE blob_id IN
+  ...`) stays on `m_bridge_checkpoint`: every blob of a delta version is in its own rows or its base's.
 
 ---
 
 ## 5. Data Staging, Routing & Reference Resolution (`core/TableHandling.py`)
 
 ### 5.1. Data Sanitization Helpers
-- `to_safe_data(val: Any) -> SafeDataType`: Coerces Enums/IntEnums, booleans, and custom objects to native Python `int`, `str`, or `None`.
+- `to_safe_data(val: Any) -> SafeDataType`: Coerces Enums/IntEnums, booleans, and custom objects to native
+  Python `int`, `str`, or `None`.
 - `is_data_unsafe(data: tuple) -> bool`: Returns `True` if any element in `data` is a reference tuple.
-- `normalize_data_tuple(data: tuple) -> tuple[UnSafeDataType, ...]`: Converts primitive elements via `to_safe_data()` while preserving reference tuples intact.
+- `normalize_data_tuple(data: tuple) -> tuple[UnSafeDataType, ...]`: Converts primitive elements via
+  `to_safe_data()` while preserving reference tuples intact.
 
 ### 5.2. `Table` Class Interface
-- **Dynamic Pointer Attributes**: On init, sets `self.<col_name> = (table_id, col_idx)` (e.g. `m_file_name.fnid = (1, 0)`). Injects table instance into `parser.c_ast.c_ast` and `parser.c_ast`.
+- **Dynamic Pointer Attributes**: On init, sets `self.<col_name> = (table_id, col_idx)` (e.g.
+  `m_file_name.fnid = (1, 0)`). Injects table instance into `parser.c_ast.c_ast` and `parser.c_ast`.
 - **Extended Schema Attributes**:
   - `table.indexes`: Secondary multi-column indices: `(("idx_name", ("col_a", "col_b")), ...)`.
   - `table.unique_keys`: Explicit unique key constraints: `(("col_a", "col_b"), ...)`.
-  - `table.idempotent_pk`: Flag enabling deduplicated insertion: rows whose primary key already exists are skipped individually (`MariaDB.insert` appends a no-op `ON DUPLICATE KEY UPDATE`).
+  - `table.idempotent_pk`: Flag enabling deduplicated insertion: rows whose primary key already exists are
+    skipped individually (`MariaDB.insert` appends a no-op `ON DUPLICATE KEY UPDATE`).
   - `table.blob_scoped`: Flag marking blob-scoped content-addressable preloading.
-  - Backward-compatible column aliases: `m_file_blob.fid = m_file_blob.blob_id`, `m_git_ref.vid = m_git_ref.commit_id`, `m_git_ref.vname = m_git_ref.ref_name`.
+  - Backward-compatible column aliases: `m_file_blob.fid = m_file_blob.blob_id`, `m_git_ref.vid =
+    m_git_ref.commit_id`, `m_git_ref.vname = m_git_ref.ref_name`.
 - **Operation Builders**:
-  - `set(*columns) -> OperationType`: Returns `(table_id, OP_SET, columns)` (redirects to `get_set()` if `table.no_duplicate == True`). Rows are given in full: there is no 2-column `m_v_main` shorthand.
-  - `update(*columns) -> OperationType`: Returns `(table_id, OP_UPDATE, columns)`. If partial row provided, queries `G.TE.get()` to populate missing values.
-  - `get(*columns) -> OperationType | None`: Queries `G.TE.get()` immediately; returns `(table_id, OP_DONE, result)` or `None`.
-  - `get_set(*columns) -> OperationType`: Queries `G.TE.get()`; returns `(table_id, OP_DONE, result)` if found, else `(table_id, OP_SET, columns)`.
-  - `view(joins, *data) -> OperationType`: Checks `G.TE.view_get()`; returns `(joins, OP_VIEW_DONE, result)` if found, else `(joins, OP_VIEW_SET, data)`.
-  - `view_get(joins, *data) -> OperationType | None`: Queries `G.TE.view_get()`; returns `(joins, OP_VIEW_DONE, result)` or `None`.
-  - `view_get_multiple(joins, *data) -> list[tuple] | None`: Returns list of matching row tuples from `G.TE.view_get_multiple()`.
-  - `ref_view(joins, *data) -> OperationType`: Returns `(joins, OP_REF_VIEW, data)` for dynamic AST schema resolution.
+  - `set(*columns) -> OperationType`: Returns `(table_id, OP_SET, columns)` (redirects to `get_set()` if
+    `table.no_duplicate == True`). Rows are given in full: there is no 2-column `m_v_main` shorthand.
+  - `update(*columns) -> OperationType`: Returns `(table_id, OP_UPDATE, columns)`. If partial row provided,
+    queries `G.TE.get()` to populate missing values.
+  - `get(*columns) -> OperationType | None`: Queries `G.TE.get()` immediately; returns `(table_id, OP_DONE,
+    result)` or `None`.
+  - `get_set(*columns) -> OperationType`: Queries `G.TE.get()`; returns `(table_id, OP_DONE, result)` if
+    found, else `(table_id, OP_SET, columns)`.
+  - `view(joins, *data) -> OperationType`: Checks `G.TE.view_get()`; returns `(joins, OP_VIEW_DONE, result)`
+    if found, else `(joins, OP_VIEW_SET, data)`.
+  - `view_get(joins, *data) -> OperationType | None`: Queries `G.TE.view_get()`; returns `(joins,
+    OP_VIEW_DONE, result)` or `None`.
+  - `view_get_multiple(joins, *data) -> list[tuple] | None`: Returns list of matching row tuples from
+    `G.TE.view_get_multiple()`.
+  - `ref_view(joins, *data) -> OperationType`: Returns `(joins, OP_REF_VIEW, data)` for dynamic AST schema
+    resolution.
 
 ### 5.3. `ChangeSet` (`CS`) Class & Context Routing
 Represents a parsed file diff and acts as the relational staging buffer.
@@ -315,7 +686,8 @@ Represents a parsed file diff and acts as the relational staging buffer.
   - `old_path`: Relative source file path (for renames).
   - `cs: list[OperationType]`: Ordered queue of operations to execute.
   - `cs_result: list[tuple[SafeDataType, ...]]`: Resolved execution output rows matching `cs`.
-  - `store_dict: dict`: Multi-dimensional routing index: `store_dict[parsed_route][table_id] = op_idx` and `store_dict[REF_MULTI] = [ [op_idx, ...], ... ]`.
+  - `store_dict: dict`: Multi-dimensional routing index: `store_dict[parsed_route][table_id] = op_idx` and
+    `store_dict[REF_MULTI] = [ [op_idx, ...], ... ]`.
   - `route: list[LinkType]`: Active context route stack (initialized to `[REF_ROOT]`).
   - `route_count: list[int]`: Number of items to pop on context exit.
   - `multi_stack: list[int]`: Active `REF_MULTI` bucket indices.
@@ -325,57 +697,106 @@ Represents a parsed file diff and acts as the relational staging buffer.
   - Context exit (`__exit__()`) pops exactly `route_count.pop()` elements from `self.route`.
 - **Route Canonicalization (`route_parse(route) -> list`)**:
   - Normalizes route list by applying link reduction rules:
-    - `REF_POS` & `REF_MULTI`: Clears preceding links; enables `data_bypass` to capture subsequent position argument.
+    - `REF_POS` & `REF_MULTI`: Clears preceding links; enables `data_bypass` to capture subsequent position
+      argument.
     - `REF_ROOT`, `REF_C_AST`, `REF_NO_REF`: Clears all preceding links.
     - `REF_FILE`: Extracts target file path and prefixes canonical route with `[REF_FILE, target_file]`.
 - **Storing & Referencing**:
   - `store(operation: OperationType, *route: LinkType) -> None`:
     - Appends `operation` to `self.cs`.
     - Canonicalizes current route stack + `route` arguments via `route_parse()`.
-    - Indexes position in `store_dict[parsed_route][target_table_id] = len(self.cs) - 1` (or appends to `store_dict[REF_MULTI][idx]`).
+    - Indexes position in `store_dict[parsed_route][target_table_id] = len(self.cs) - 1` (or appends to
+      `store_dict[REF_MULTI][idx]`).
   - `ref(query: PointerType, *route_args: LinkType) -> UnSafeDataType`:
     - If resolvable immediately via `resolve_ref()`, returns primitive `SafeDataType`.
     - Otherwise returns reference tuple: `(query, OP_REF, parsed_route)`.
 - **Reference Resolution (`resolve_ref(query, parsed_route, force_stubs=False) -> SafeDataType | list`)**:
   1. `parsed_route[0] == REF_NO_REF`: Returns `None`.
   2. `parsed_route[0] == REF_FILE`: Evaluates foreign cross-file symbol lookups with multi-tier fast paths:
-     - **Step 0 (Per-File Symbols)**: Checks `gp.file_symbols[rel_file]` and `gp.file_names[rel_file]` for immediate $O(1)$ resolved symbol `ast_id`.
-     - **Step 0b (File-Scoped Shared Symbols)**: Queries the file-scoped shared table (`_phase2_symbols` set by `pre_resolve_operations()` in workers, else `gp._shared_symbols`) for `(sym_name, sym_type)` then `sym_name` defined in `rel_file`, the same semantics as step 0. Plain `(name, type)` snapshot dicts passed to `pre_resolve_operations()` are still matched globally.
-     - **Step 1 (Active Batch / Evacuated & LRU Stores)**: Inspects `batch_cs_dict`, `ChangeSet_Dict._evacuated_store[rel_file]`, or `ChangeSet_Dict._lru_cache[rel_file]`. For evacuated ChangeSets, reads from `foreign_cs.resolved_symbols` in $O(1)$ memory without deserialization or DB queries.
-     - **Step 1b (In-Flight Check)**: `rel_file` is in flight when it is in `gp._changed_paths_set` or `ChangeSet_Dict` and in neither `gp.completed_paths` nor `gp.file_symbols`. An in-flight file is never looked up in the DB (the DB still holds its previous version), and for AST queries with `force_stubs=False` `resolve_ref()` sets `self.blocked_on = rel_file` and returns `None`.
-     - **Step 1c (Database Lookup)**: For files not in flight, `gp.get_file_symbols_from_db(rel_file)` returns the file's symbols, cached into `gp.file_symbols` / `gp.file_names`.
-     - **Step 2 (Global Fallback & Negative Caching)**: Checks `gp._ast_staged_symbols`, then `gp._ast_negative_cache` before global `G.TE.get(m_ast.table_id, ...)` lookups by `(name, type)`, notbind type and name. Misses are recorded in `gp._ast_negative_cache`.
-     - **Step 3 (Stubs)**: With `force_stubs=True`, or for a file that is not in flight, stages a canonical `notbind` stub symbol (discarding negative cache entries). Parsing workers (`gp._is_worker`) never stage stubs: their TableEngine is never committed, so the reference is left for the parent.
+     - **Step 0 (Per-File Symbols)**: Checks `gp.file_symbols[rel_file]` and `gp.file_names[rel_file]` for
+       immediate $O(1)$ resolved symbol `ast_id`.
+     - **Step 0b (File-Scoped Shared Symbols)**: Queries the file-scoped shared table (`_phase2_symbols` set
+       by `pre_resolve_operations()` in workers, else `gp._shared_symbols`) for `(sym_name, sym_type)` then
+       `sym_name` defined in `rel_file`, the same semantics as step 0. Plain `(name, type)` snapshot dicts
+       passed to `pre_resolve_operations()` are still matched globally.
+     - **Step 1 (Active Batch / Evacuated & LRU Stores)**: Inspects `batch_cs_dict`,
+       `ChangeSet_Dict._evacuated_store[rel_file]`, or `ChangeSet_Dict._lru_cache[rel_file]`. For evacuated
+       ChangeSets, reads from `foreign_cs.resolved_symbols` in $O(1)$ memory without deserialization or DB
+       queries.
+     - **Step 1b (In-Flight Check)**: `rel_file` is in flight when it is in `gp._changed_paths_set` or
+       `ChangeSet_Dict` and in neither `gp.completed_paths` nor `gp.file_symbols`. An in-flight file is never
+       looked up in the DB (the DB still holds its previous version), and for AST queries with
+       `force_stubs=False` `resolve_ref()` sets `self.blocked_on = rel_file` and returns `None`.
+     - **Step 1c (Database Lookup)**: For files not in flight, `gp.get_file_symbols_from_db(rel_file)` returns
+       the file's symbols, cached into `gp.file_symbols` / `gp.file_names`.
+     - **Step 2 (Global Fallback & Negative Caching)**: Checks `gp._ast_staged_symbols`, then
+       `gp._ast_negative_cache` before global `G.TE.get(m_ast.table_id, ...)` lookups by `(name, type)`,
+       notbind type and name. Misses are recorded in `gp._ast_negative_cache`.
+     - **Step 3 (Stubs)**: With `force_stubs=True`, or for a file that is not in flight, stages a canonical
+       `notbind` stub symbol (discarding negative cache entries). Parsing workers (`gp._is_worker`) never
+       stage stubs: their TableEngine is never committed, so the reference is left for the parent.
   3. `parsed_route[0] == REF_POS`: Fetches directly from `self.cs[parsed_route[1]]` column `query[1]`.
-  4. `parsed_route[0] == REF_MULTI`: Fetches list of column values across `store_dict[REF_MULTI][parsed_route[1]]`.
+  4. `parsed_route[0] == REF_MULTI`: Fetches list of column values across
+     `store_dict[REF_MULTI][parsed_route[1]]`.
   5. Default: Looks up `pos = store_dict[parsed_route][query[0]]` and extracts column value `query[1]`.
 - **Worker Optimization & View Preprocessing**:
-  - `preprocess_ref_views() -> None`: Pre-unpacks intra-file `OP_REF_VIEW` operations into concrete `OP_VIEW_SET` on worker cores before IPC serialization, distributing schema pattern matching across CPU cores.
-  - `prune_unchanged_dependencies() -> None`: Queries `gp.get_file_symbols_from_db()` in workers during Phase 1 to pre-resolve references targeting unchanged files in a single unified pass over `self.cs` and prunes satisfied entries from `foreign_deps`.
-  - `pre_resolve_operations(resolved_symbols_map, resolved_names_map=None) -> list`: Worker-side method invoked during Stage 2 to resolve foreign `REF_FILE` references and unpack dynamic views in a fused single iteration over `self.cs`, returning a pre-resolved operation list to the main process for sequential lock-free staging. `resolved_symbols_map` is the file-scoped `SharedSymbolChain` / `SharedSymbolReader` (queried per target file), or a plain `{(name, type): ast_id}` snapshot.
+  - `preprocess_ref_views() -> None`: Pre-unpacks intra-file `OP_REF_VIEW` operations into concrete
+    `OP_VIEW_SET` on worker cores before IPC serialization, distributing schema pattern matching across CPU
+    cores.
+  - `prune_unchanged_dependencies() -> None`: Queries `gp.get_file_symbols_from_db()` in workers during Phase
+    1 to pre-resolve references targeting unchanged files in a single unified pass over `self.cs` and prunes
+    satisfied entries from `foreign_deps`.
+  - `pre_resolve_operations(resolved_symbols_map, resolved_names_map=None) -> list`: Worker-side method
+    invoked during Stage 2 to resolve foreign `REF_FILE` references and unpack dynamic views in a fused single
+    iteration over `self.cs`, returning a pre-resolved operation list to the main process for sequential
+    lock-free staging. `resolved_symbols_map` is the file-scoped `SharedSymbolChain` / `SharedSymbolReader`
+    (queried per target file), or a plain `{(name, type): ast_id}` snapshot.
 - **Dynamic AST Views (`_unpack_ref_view(operation) -> OperationType | None`)**:
-  - Evaluates AST rule schemas against records in `store_dict`, matches conditional rules (`schema_ifs`), dynamically constructs joined table graph (`schema_thens`), and converts `OP_REF_VIEW` into concrete `(joins_tuple, OP_VIEW_SET, data_tuple)`.
-  - Queries candidate rows via `CS.get_available_data(route, target_table_id)`, which filters candidate operations strictly by `tableid` (handling both integer IDs and joined view tuples) to isolate `m_ast` records from co-located tag and bridge operations.
+  - Evaluates AST rule schemas against records in `store_dict`, matches conditional rules (`schema_ifs`),
+    dynamically constructs joined table graph (`schema_thens`), and converts `OP_REF_VIEW` into concrete
+    `(joins_tuple, OP_VIEW_SET, data_tuple)`.
+  - Queries candidate rows via `CS.get_available_data(route, target_table_id)`, which filters candidate
+    operations strictly by `tableid` (handling both integer IDs and joined view tuples) to isolate `m_ast`
+    records from co-located tag and bridge operations.
 - **Pipeline Execution (`execute(force_stubs=False) -> bool`)**:
-  - Iterates over the unresolved operations (`unresolved_indices`, in order: the first pass walks `range(len(cs))` without sorting), so independent operations run even when an earlier one is deferred.
+  - Iterates over the unresolved operations (`unresolved_indices`, in order: the first pass walks
+    `range(len(cs))` without sorting), so independent operations run even when an earlier one is deferred.
   - Unpacks dynamic views (`OP_REF_VIEW` &rarr; `OP_VIEW_SET`).
   - Converts all reference tuples in data to `SafeDataType` via `_resolve_ref_from_tuple()`.
-  - Dispatches operations downstream directly to `G.TE.set()`, `G.TE.update()`, or `G.TE.view_set()` (avoiding redundant preliminary `view_get` queries since `te_view_set` deduplicates automatically).
+  - Dispatches operations downstream directly to `G.TE.set()`, `G.TE.update()`, or `G.TE.view_set()` (avoiding
+    redundant preliminary `view_get` queries since `te_view_set` deduplicates automatically).
   - Appends resulting rows to `CS.cs_result` and marks `cs_processed = True`.
-- **Parsing (`parse() -> None`)**: dispatches on `get_file_type()` (content-aware: a `.c`/`.h` written in assembly is `T_ASM`, `core.globalstuff.type_check(path, content)`); the C and assembly parsers emit their recorded symbol rows themselves (`core.SymbolRows.finish()`).
+- **Parsing (`parse() -> None`)**: dispatches on `get_file_type()` (content-aware: a `.c`/`.h` written in
+  assembly is `T_ASM`, `core.globalstuff.type_check(path, content)`); the C and assembly parsers emit their
+  recorded symbol rows themselves (`core.SymbolRows.finish()`).
 - **IPC Sanitization (`clear_bloat() -> None`)**:
-  - Drops unpicklable object handles (`self.gp = None`, `self.mf = None`, `self.file = None`, `self.parsers = {}`, `self.prior_tags = None`, `self.prior_tags_map = None`, `self.active_tag_list = None`, `self.pending_symbol_refs = []`, `self.last_tag_ref = None`, `self.batch_cs_dict = None`, `self.blocked_on = None`) before worker IPC serialization.
+  - Drops unpicklable object handles (`self.gp = None`, `self.mf = None`, `self.file = None`, `self.parsers =
+    {}`, `self.prior_tags = None`, `self.prior_tags_map = None`, `self.active_tag_list = None`,
+    `self.pending_symbol_refs = []`, `self.last_tag_ref = None`, `self.batch_cs_dict = None`, `self.blocked_on
+    = None`) before worker IPC serialization.
 
 ### 5.4. Subsystem Verification & Regression Suite (`unit_test/test_table_handling.py`)
-Comprehensive unit testing and behavioral verification of `TableHandling.py` is implemented in `unit_test/test_table_handling.py` using the reusable harness in `unit_test/harness.py`:
-- **Pure Unit Isolation**: Backed by a mock `RecordingTableEngine` stand-in, eliminating database socket and filesystem dependencies.
-- **Prefix Isolation**: Uses `TestTableCollection` with `t_*` schemas to ensure test execution never touches production database tables.
+Comprehensive unit testing and behavioral verification of `TableHandling.py` is implemented in
+`unit_test/test_table_handling.py` using the reusable harness in `unit_test/harness.py`:
+- **Pure Unit Isolation**: Backed by a mock `RecordingTableEngine` stand-in, eliminating database socket and
+  filesystem dependencies.
+- **Prefix Isolation**: Uses `TestTableCollection` with `t_*` schemas to ensure test execution never touches
+  production database tables.
 - **Granular Test Coverage**: Divided across 5 focused test classes:
-  1. `Test_DataSanitization`: Primitives, Enum/IntEnum unboxing, boolean conversion, `is_data_unsafe` detection, `normalize_data_tuple`.
-  2. `Test_TableSchemaAndOperations`: Dynamic column pointers, auto-increment detection, `set` (and `no_duplicate` delegation), `update` backfill, `get` unsafe crash guard, `get_set`, relational views (`view`, `view_get`, `view_get_multiple`, `ref_view`).
-  3. `Test_ChangeSetRoutingAndStaging`: Git diff parsing, context manager routing (`with cs(...)`), route stack unwinding on exceptions, route canonicalization (`route_parse`), bucketed storing (`REF_MULTI`), `ref` generation, and `last_not_none`.
-  4. `Test_ChangeSetReferenceResolution`: `REF_NO_REF`, direct numerical `REF_POS`, array `REF_MULTI`, context route resolution, foreign `REF_FILE` fast-paths, in-flight dependency blocking (`blocked_on`), and circular dependency breaking (`force_stubs`).
-  5. `Test_ChangeSetExecutionAndLifecycle`: Multi-pass execution resolution loops, operation dispatch, unresolved dependency detection, `preprocess_ref_views`, `get_file_type` classification, `clear_bloat` IPC pickling, and bridge map deduplication.
+  1. `Test_DataSanitization`: Primitives, Enum/IntEnum unboxing, boolean conversion, `is_data_unsafe`
+     detection, `normalize_data_tuple`.
+  2. `Test_TableSchemaAndOperations`: Dynamic column pointers, auto-increment detection, `set` (and
+     `no_duplicate` delegation), `update` backfill, `get` unsafe crash guard, `get_set`, relational views
+     (`view`, `view_get`, `view_get_multiple`, `ref_view`).
+  3. `Test_ChangeSetRoutingAndStaging`: Git diff parsing, context manager routing (`with cs(...)`), route
+     stack unwinding on exceptions, route canonicalization (`route_parse`), bucketed storing (`REF_MULTI`),
+     `ref` generation, and `last_not_none`.
+  4. `Test_ChangeSetReferenceResolution`: `REF_NO_REF`, direct numerical `REF_POS`, array `REF_MULTI`, context
+     route resolution, foreign `REF_FILE` fast-paths, in-flight dependency blocking (`blocked_on`), and
+     circular dependency breaking (`force_stubs`).
+  5. `Test_ChangeSetExecutionAndLifecycle`: Multi-pass execution resolution loops, operation dispatch,
+     unresolved dependency detection, `preprocess_ref_views`, `get_file_type` classification, `clear_bloat`
+     IPC pickling, and bridge map deduplication.
 
 ---
 
@@ -391,8 +812,13 @@ MasterFile (MF)                   GreatProcessor (gp)               TableEngine 
   │                                       │ and m_repository for target git tree
   ├─ ingest_git_dag(version_or_ref) ─────►│ Registers commit DAG, parents (m_commit_parent),
   │                                       │ contributors, and m_git_ref (m_v_main); gp.VID = head_cid
+  │                                       │ and, for the new commits, m_commit_relation / m_commit_link
+  │                                       │ (Fixes:, reverts, backports, Cc: stable, Link:; prefixes resolved
+  │                                       │ with one git cat-file per range)
   │                                       │ Done version: skipped. Interrupted one: rolled back (§4.1).
   │                                       │ ingest_state.begin(): INGEST_PARSING + id watermarks
+  ├─ Step 1.5: the previous version's checkpoint expanded when it is a delta (§4.2)
+  ├─ Step 2: the declared ast_index / file_name_index ensured (no index duplicating a primary key)
   ├─ checkout_version(vname, base)        ├─ init_db_layout(gp)             │
   │  (Clones git tree to /dev/shm)        │  (Populates gp.Table_Array)     │
   ├─ generate_change_list(gp) ───────────►│                                 │
@@ -405,7 +831,7 @@ MasterFile (MF)                   GreatProcessor (gp)               TableEngine 
   │                                       │                                 │
   └─ Content-Addressable Blob Dedup (Step 4.5, _reuse_parsed_blobs):       │
      └── Looks (blob_hash, ftype) up in the TableEngine m_file_blob cache; one query on m_bridge_tag
-         - Reused files: m_file_name / m_bridge_checkpoint / m_commit_file staged via the TableEngine
+         - Reused files: m_file_name / m_bridge_checkpoint staged via the TableEngine
          - Remaining new/modified files: dispatched to multicore workers (pre-existing blobs among
            them recorded in m_ingest_blob first, §4.1)
 ==================================================================================================
@@ -504,10 +930,13 @@ Main Process (STEP 6.1+: Post-Processing Subsystems) TableEngine (G.TE)         
   │  │                                            │  via file_pre_extracted_tags)   │
   │  ├─ processing_maintainer_files(version) ────►│                                 │
   │  ├─ processing_kbuild(version) ──────────────►│                                 │
-  │  └─ processing_arch_layouts(version) (Step 6.8: m_arch_root rows of every ARCH, raw SQL) ──►│
+  │  ├─ processing_arch_layouts(version) (Step 6.8: m_arch_root -> shared m_arch_layout rows, raw SQL) ──►│
+  │  └─ processing_source_facts(version) (Step 6.9: m_blob_facts the database lacks, families 1-5) ──►│
   │                                               │                                 │
   ├─ Final Teardown Commit:                       │                                 │
   │  └─ G.TE.commit_all(update_in_mem_indexes=False) ──────────────────────────────►│
+  │                                               │                                 │
+  └─ finish_version_ingest(): INGEST_DONE, then the previous version's checkpoint becomes a delta (§4.2) ──►│
 ==================================================================================================
 ```
 
@@ -516,76 +945,245 @@ Main Process (STEP 6.1+: Post-Processing Subsystems) TableEngine (G.TE)         
 ## 7. Configuration & SSH Port Forwarding Subsystem (`core/config.py` & `core/ssh_tunnel.py`)
 
 ### 7.1. Unified Configuration Hierarchy
-- Configuration settings follow strict precedence: `CLI Flags > Environment Variables > config.json > Built-in Defaults`.
-- When configuring or synchronizing database parameters, `DB_*` and `MYSQL_*` environment variables (including `DB_SOCKET`, `MYSQL_UNIX_PORT`, `MYSQL_SOCKET`) remain synchronized via `sync_environ()`, tracking internally exported keys in `_EXPORTED_ENV_VARS` via `_get_user_env()` to prevent environment self-pollution during configuration reloads.
+- Configuration settings follow strict precedence: `CLI Flags > Environment Variables > config.json > Built-in
+  Defaults`.
+- When configuring or synchronizing database parameters, `DB_*` and `MYSQL_*` environment variables (including
+  `DB_SOCKET`, `MYSQL_UNIX_PORT`, `MYSQL_SOCKET`) remain synchronized via `sync_environ()`, tracking
+  internally exported keys in `_EXPORTED_ENV_VARS` via `_get_user_env()` to prevent environment self-pollution
+  during configuration reloads.
 - Sections:
-  - `"database"`: MariaDB/MySQL connection settings (`host`, `port`, `user`, `password`, `database`, `timeout`, `engine`, `unix_socket`), `server_tuning` (`innodb_buffer_pool_size`, `innodb_log_file_size`, `innodb_flush_log_at_trx_commit`, `innodb_io_capacity`), and embedded feature `ssh_tunnel` (`enabled`, `host`, `port`, `user`, `password`, `key_file`, `remote_host`, `remote_port`, `local_port`, `strict_host_key_checking`, `connect_timeout`).
-    - **Unix Domain Socket Support**: When `ssh_tunnel` is inactive, MariaDB connections on local hosts (`localhost`, `127.0.0.1`) can connect via low-latency Unix domain sockets (`/run/mysqld/mysqld.sock`, `/var/run/mysqld/mysqld.sock`, `/tmp/mysql.sock`), bypassing the TCP loopback network stack. Controlled by `"unix_socket"` (`"auto"`, explicit path, or `"disabled"`/`"none"` to force TCP), environment variables (`DB_SOCKET` / `MYSQL_UNIX_PORT`), or CLI flag `--db-socket`.
-  - `"webapp"`: FastAPI server settings (`host`, `port`, `reload`).
-  - `"parser"`: TableEngine, memory mode, fidelity auditing, memory limits (`table_engine`, `memory_mode`, `fidelity`, `mem_max`, `hugepages`, `preload_flush_mb`: MB of preloaded rows held on the heap before they are packed into a shared-memory segment, env `PRELOAD_FLUSH_MB`; `cache_max_table_mb`: ceiling (MB) on the size of one TE-cached table, a bigger one is read straight from the database instead of being cached, 0 for no ceiling, env `CACHE_MAX_TABLE_MB`, flag `--cache-max-table-mb`) and `symbol_layout` (`"tag"`, default: symbol rows stored once per tag; `"blob"`: per blob, sets `G.SYMBOL_LAYOUT`).
+  - `"database"`: MariaDB/MySQL connection settings (`host`, `port`, `user`, `password`, `database`,
+    `timeout`, `engine`, `unix_socket`), `server_tuning` (`innodb_buffer_pool_size`, `innodb_log_file_size`,
+    `innodb_flush_log_at_trx_commit`, `innodb_io_capacity`), and embedded feature `ssh_tunnel` (`enabled`,
+    `host`, `port`, `user`, `password`, `key_file`, `remote_host`, `remote_port`, `local_port`,
+    `strict_host_key_checking`, `connect_timeout`).
+    - **Unix Domain Socket Support**: When `ssh_tunnel` is inactive, MariaDB connections on local hosts
+      (`localhost`, `127.0.0.1`) can connect via low-latency Unix domain sockets (`/run/mysqld/mysqld.sock`,
+      `/var/run/mysqld/mysqld.sock`, `/tmp/mysql.sock`), bypassing the TCP loopback network stack. Controlled
+      by `"unix_socket"` (`"auto"`, explicit path, or `"disabled"`/`"none"` to force TCP), environment
+      variables (`DB_SOCKET` / `MYSQL_UNIX_PORT`), or CLI flag `--db-socket`.
+  - `"webapp"`: FastAPI server settings (`host`, `port`, `reload`), plus `cache.max_mb` (default 1024: global
+    cap of the webapp's disk cache of derived data under `KERNELINFO_CACHE_DIR`), `jobs.workers` (default 2:
+    background job threads per process) `prewarm_indexes` (default `false`: build the commit relation and
+    Kbuild object indexes at startup), `source_index` (`workers` default `2`, `max_mb` default `1024`,
+    `revisions` default `8`: the source index's extraction processes for blobs the database lacks, their store
+    cap, and how many assembled revisions stay on disk, `webapp/API.md` §2.19) and `tools`
+    (`checkpatch.enabled` default `false`, `checkpatch.ref` default `"latest-release"`, `sandbox` default
+    `""`: running the repository's `scripts/checkpatch.pl`, off by default); see `webapp/API.md` §2.14–§2.15,
+    §2.18 and §7.1.
+  - `"parser"`: TableEngine, memory mode, fidelity auditing, memory limits, `checkpoint_delta_ratio` (default
+    0.3: largest share of a version's files that may differ from its base for its checkpoint to be kept as a
+    delta, §4.2; 0 keeps every checkpoint full), `facts_workers` (default 4: processes of Step 6.9)
+    (`table_engine`, `memory_mode`, `fidelity`, `mem_max`, `hugepages`, `preload_flush_mb`: MB of preloaded
+    rows held on the heap before they are packed into a shared-memory segment, env `PRELOAD_FLUSH_MB`;
+    `cache_max_table_mb`: ceiling (MB) on the size of one TE-cached table, a bigger one is read straight from
+    the database instead of being cached, 0 for no ceiling, env `CACHE_MAX_TABLE_MB`, flag
+    `--cache-max-table-mb`) and `symbol_layout` (`"tag"`, default: symbol rows stored once per tag; `"blob"`:
+    per blob, sets `G.SYMBOL_LAYOUT`).
   - `"mailing_list"`: Mailing list ingestion feature configuration, including dedicated `ssh_tunnel` settings.
+  - `"cve"`: `repo_dir` (default `"cvelistV5"`, relative to the project root): a local clone of the CVE
+    Program's list (`cvelistV5`) or of the kernel CNA's `vulns.git`, ingested into `m_cve` / `m_cve_commit`
+    (§9) and read from there by the webapp's CVE features (`webapp/API.md` §4.11); not a source tree (never
+    parsed as one, not under `workspace.repos_dir`).
   - `"ssh_tunnel"`: Backward compatibility alias mirroring `database.ssh_tunnel` for legacy configurations.
-  - `"workspace"`: `repos_dir` (default `"repos"`, relative to the project root) holding the Git repositories to parse, and `auto_detect_repos` (default `true`).
-  - `"repositories"`: List of tracked repositories. Each entry carries `name`, `path` (relative to the project root; symlinked repositories keep their `repos/<name>` path), `project`, `default_branch`, `git_url`, `root_commit`, `start_ref` (default: `root_commit`), `enabled`, `branch_filter` (`{"include": ["*"], "exclude": ["*rc*"]}`), `branches` (persisted list of active branch short names), `tag_views` (custom branch dropdown view entries configuring regex grouping rules for tag layouts, defaulting to `DEFAULT_TAG_VIEWS`), and optionally `"default": true`.
-- Functions: `init_config(path)`, `get_config()`, `get_db_config()`, `get_webapp_config()`, `get_parser_config()`, `get_mailing_list_config()`, `get_ssh_tunnel_config(feature="database")`, `get_workspace_config()`, `sync_environ(cfg)`, `resolve_unix_socket(socket_path, host)`, `matches_branch_filter(branch, branch_filter)`, `find_repository_branches(repo, branch_filter, default_branch)`, `update_repository_branches(name_or_path, write=True)`. Constants: `DEFAULT_CONFIG`, `DEFAULT_BRANCH_FILTER`, `DEFAULT_TAG_VIEWS`, `REPOSITORY_KEYS`.
+  - `"workspace"`: `repos_dir` (default `"repos"`, relative to the project root) holding the Git repositories
+    to parse, and `auto_detect_repos` (default `true`).
+  - `"repositories"`: List of tracked repositories. Each entry carries `name`, `path` (relative to the project
+    root; symlinked repositories keep their `repos/<name>` path), `project`, `default_branch`, `git_url`,
+    `root_commit`, `start_ref` (default: `root_commit`), `enabled`, `branch_filter` (`{"include": ["*"],
+    "exclude": ["*rc*"]}`), `branches` (persisted list of active branch short names), `tag_views` (custom
+    branch dropdown view entries configuring regex grouping rules for tag layouts, defaulting to
+    `DEFAULT_TAG_VIEWS`), and optionally `"default": true`.
+- Functions: `init_config(path)`, `get_config()`, `get_db_config()`, `get_webapp_config()`,
+  `get_parser_config()`, `get_mailing_list_config()`, `get_ssh_tunnel_config(feature="database")`,
+  `get_workspace_config()`, `sync_environ(cfg)`, `resolve_unix_socket(socket_path, host)`,
+  `matches_branch_filter(branch, branch_filter)`, `find_repository_branches(repo, branch_filter,
+  default_branch)`, `update_repository_branches(name_or_path, write=True)`. Constants: `DEFAULT_CONFIG`,
+  `DEFAULT_BRANCH_FILTER`, `DEFAULT_TAG_VIEWS`, `REPOSITORY_KEYS`.
 
 ### 7.1.1. Repository Auto-Detection & Selection
-- `find_repository_dirs()` lists Git repositories (work trees, gitfiles, or bare repositories) directly under `workspace.repos_dir`; `detect_repository(path)` describes one (`git symbolic-ref` for the branch, falling back to `origin/HEAD`, then `main`/`master`; `remote.origin.url`; `rev-list --max-parents=0 --first-parent <branch>` for `root_commit`; `find_repository_branches()` for `branches` matching `branch_filter`). Results are cached per path for the process.
-- `sync_repositories(write=True)` adds newly found repositories and fills keys missing from known entries without overwriting user-set values, then atomically rewrites the loaded config file (`config.json`), preserving all other keys. `main.py` runs it on every start when `auto_detect_repos` is true; `python3 main.py --detect-repos` runs it, prints the repositories with branch counts, and exits.
-- `update_repository_branches(name_or_path=None, write=True)` refreshes the discovered `branches` list for the matching repository and atomically persists it to `config.json`.
-- `get_repositories_config()` returns enabled repositories, merging undetected-but-present ones in memory (no write). `get_repository(name_or_path=None)` looks a repository up by name or path, or returns the default (`"default": true`, else the first). `get_default_repo_path()` / `resolve_repo_path(entry)` return absolute paths; the webapp's `LINUX_REPO_DIR` is `get_default_repo_path()`.
-- **Commit DAG**: `ingest_git_dag()` ingests the complete history of the first version (no implicit 1,000-commit cap) and every commit of later ranges, merges included (see `parser/git_ast/GIT_API.md` §6); `--limit N` bounds the commits recorded per range. Shared commit history across branches is content-deduplicated per `network_id` in `m_commit` and `m_file_blob`.
-- **Default parse target**: Without `--ref`, `main()` starts at the selected repository's `start_ref` (its first commit by default) and continues through every subsequent release tag (`get_version_tags`). `--branches` (or `--all-branches`) automatically refreshes `config.json` and ingests the tip commit of every branch matching `branch_filter` as an independent checkpoint (`m_git_ref` with `ref_type = 2`). `--repo` accepts a configured repository name or a filesystem path.
+- `find_repository_dirs()` lists Git repositories (work trees, gitfiles, or bare repositories) directly under
+  `workspace.repos_dir`; `detect_repository(path)` describes one (`git symbolic-ref` for the branch, falling
+  back to `origin/HEAD`, then `main`/`master`; `remote.origin.url`; `rev-list --max-parents=0 --first-parent
+  <branch>` for `root_commit`; `find_repository_branches()` for `branches` matching `branch_filter`). Results
+  are cached per path for the process.
+- `sync_repositories(write=True)` adds newly found repositories and fills keys missing from known entries
+  without overwriting user-set values, then atomically rewrites the loaded config file (`config.json`),
+  preserving all other keys. `main.py` runs it on every start when `auto_detect_repos` is true; `python3
+  main.py --detect-repos` runs it, prints the repositories with branch counts, and exits.
+- `update_repository_branches(name_or_path=None, write=True)` refreshes the discovered `branches` list for the
+  matching repository and atomically persists it to `config.json`, ordering discovered branches in deterministic
+  topological and chronological tiers: `history/*` (Tier 0: `history/master`, Tier 1: secondary history branches) $\to$
+  Tier 2: mainline trunk (`master` / `main`) $\to$ Tier 3: `stable/*` series (version-ordered: `linux-2.6.11.y` $\to$
+  `linux-7.3.y`) $\to$ Tier 4: `linux-next/*` integration branches (`linux-next/master` first, then topic branches) $\to$
+  Tier 5: remaining topic branches.
+- `get_repositories_config()` returns enabled repositories, merging undetected-but-present ones in memory (no
+  write). `get_repository(name_or_path=None)` looks a repository up by name or path, or returns the default
+  (`"default": true`, else the first). `get_default_repo_path()` / `resolve_repo_path(entry)` return absolute
+  paths; the webapp's `LINUX_REPO_DIR` is `get_default_repo_path()`.
+- **Commit DAG**: `ingest_git_dag()` ingests the complete history of the first version (no implicit
+  1,000-commit cap) and every commit of later ranges, merges included (see `parser/git_ast/GIT_API.md` §6);
+  `--limit N` bounds the commits recorded per range. Shared commit history across branches is
+  content-deduplicated per `network_id` in `m_commit` and `m_file_blob`.
+- **Default parse target**: Without `--ref`, `main()` starts at the selected repository's `start_ref` (its
+  first commit by default) and continues through every subsequent release tag (`get_version_tags`).
+  `--branches` (or `--all-branches`) automatically refreshes `config.json` and ingests the tip commit of every
+  branch matching `branch_filter` as an independent checkpoint (`m_git_ref` with `ref_type = 2`). `--repo`
+  accepts a configured repository name or a filesystem path.
 
 ### 7.2. SSH Tunnel Manager (`SSHTunnelManager`)
-- **Purpose**: Encrypts and forwards remote connections across hosts (e.g. MariaDB database or mailing list services), allowing local orchestration workers to reach remote instances securely without exposing ports over public networks. Disabled by default (`enabled: false`).
+- **Purpose**: Encrypts and forwards remote connections across hosts (e.g. MariaDB database or mailing list
+  services), allowing local orchestration workers to reach remote instances securely without exposing ports
+  over public networks. Disabled by default (`enabled: false`).
 - **Per-Feature Architecture**:
-  - Tunnels are configured per feature (embedded within each feature's configuration section such as `database.ssh_tunnel` and `mailing_list.ssh_tunnel`).
-  - Multiple feature tunnels can run concurrently without collision, each binding to its own configured or dynamically assigned local ephemeral port.
-  - Backward compatibility: Legacy flat `ssh_tunnel` definitions in configuration files automatically migrate into `database.ssh_tunnel`.
-- **Subprocess Execution**: Uses system OpenSSH binary (`/usr/bin/ssh`) via `subprocess.Popen` with `-N -L <local_port>:<remote_host>:<remote_port>`, `-o ExitOnForwardFailure=yes`, `-o ServerAliveInterval=15`, `-o ServerAliveCountMax=3`.
-- **Dynamic Port Binding**: If `local_port` is 0 or already occupied, dynamically allocates an ephemeral localhost port to avoid collisions with any local services.
+  - Tunnels are configured per feature (embedded within each feature's configuration section such as
+    `database.ssh_tunnel` and `mailing_list.ssh_tunnel`).
+  - Multiple feature tunnels can run concurrently without collision, each binding to its own configured or
+    dynamically assigned local ephemeral port.
+  - Backward compatibility: Legacy flat `ssh_tunnel` definitions in configuration files automatically migrate
+    into `database.ssh_tunnel`.
+- **Subprocess Execution**: Uses system OpenSSH binary (`/usr/bin/ssh`) via `subprocess.Popen` with `-N -L
+  <local_port>:<remote_host>:<remote_port>`, `-o ExitOnForwardFailure=yes`, `-o ServerAliveInterval=15`, `-o
+  ServerAliveCountMax=3`.
+- **Dynamic Port Binding**: If `local_port` is 0 or already occupied, dynamically allocates an ephemeral
+  localhost port to avoid collisions with any local services.
 - **Authentication**:
   - Private key: Configurable path via `key_file` (`-i <key> -o IdentitiesOnly=yes`).
-  - Password: Supports non-interactive authentication via `sshpass` (if installed) or dynamically provisioned secure `SSH_ASKPASS` helper scripts (with `SSH_ASKPASS_REQUIRE=force`).
+  - Password: Supports non-interactive authentication via `sshpass` (if installed) or dynamically provisioned
+    secure `SSH_ASKPASS` helper scripts (with `SSH_ASKPASS_REQUIRE=force`).
   - User: Custom login username via `-l <user>` / `user@host`.
   - Host Key Verification: Defaults to `accept-new`, configurable to `no` or `yes`.
 - **Lifecycle Integration**:
   - Invoked during startup via `start_ssh_tunnel(cfg=None, feature="database")`.
-  - Probes local port socket connectivity until listening (up to `connect_timeout` seconds) before declaring readiness.
-  - Automatically updates active configuration: for `"database"`, sets `db_cfg["host"] = "127.0.0.1"`, `db_cfg["port"] = local_port` and calls `sync_environ()`, transparently routing `G.DB` and all multiprocessing workers through the tunnel. For other features (e.g. `"mailing_list"`), updates the feature's active host and port settings.
-  - Individual teardown via `stop_ssh_tunnel(feature)` or comprehensive teardown via `stop_ssh_tunnel()` (registered with `atexit` and `G.emergency_shutdown()`).
-- **One Tunnel Per Run (Fork Ownership)**: Both tunnels are opened once before any version is parsed - `database.ssh_tunnel` in `arg_handling()`, and `mailing_list.ssh_tunnel` in `main()` (when both `mailing_list.enabled` and `mailing_list.ssh_tunnel.enabled` are set), so no tunnel is opened by the `-u` / `-T` test paths, which never reach `main()`. Every forked per-version worker reuses that single forward instead of opening its own:
-  - A tunnel is **owned** by the process that spawned its `ssh` child (`_owner_pid`, `is_owner()`). A fork inherits the manager object, and the forward itself is just a TCP listener on `127.0.0.1`, usable from any process.
-  - `is_active()` in a non-owner process must not call `Popen.poll()`: `waitpid()` on a process that is not our child fails with `ECHILD`, which CPython reports as a clean exit (`returncode = 0`), so a worker would conclude the tunnel is dead and open a second one. The inherited forward is validated instead by `_pid_alive(proc.pid) and _is_port_in_use(local_port)`.
-  - `stop()` in a non-owner process only drops the local handle. Signalling the inherited `ssh` PID would tear down the parent's tunnel for every other worker, and the askpass script belongs to the owner. This also makes `stop_ssh_tunnel()` safe to call unconditionally in a worker (see `_git_commit_worker`'s `client.close(stop_tunnel=True)`), which reaps a tunnel a worker did have to open itself rather than orphaning the `ssh` process when the worker exits.
+  - Probes local port socket connectivity until listening (up to `connect_timeout` seconds) before declaring
+    readiness.
+  - Automatically updates active configuration: for `"database"`, sets `db_cfg["host"] = "127.0.0.1"`,
+    `db_cfg["port"] = local_port` and calls `sync_environ()`, transparently routing `G.DB` and all
+    multiprocessing workers through the tunnel. For other features (e.g. `"mailing_list"`), updates the
+    feature's active host and port settings.
+  - Individual teardown via `stop_ssh_tunnel(feature)` or comprehensive teardown via `stop_ssh_tunnel()`
+    (registered with `atexit` and `G.emergency_shutdown()`).
+- **One Tunnel Per Run (Fork Ownership)**: Both tunnels are opened once before any version is parsed -
+  `database.ssh_tunnel` in `arg_handling()`, and `mailing_list.ssh_tunnel` in `main()` (when both
+  `mailing_list.enabled` and `mailing_list.ssh_tunnel.enabled` are set), so no tunnel is opened by the `-u` /
+  `-T` test paths, which never reach `main()`. Every forked per-version worker reuses that single forward
+  instead of opening its own:
+  - A tunnel is **owned** by the process that spawned its `ssh` child (`_owner_pid`, `is_owner()`). A fork
+    inherits the manager object, and the forward itself is just a TCP listener on `127.0.0.1`, usable from any
+    process.
+  - `is_active()` in a non-owner process must not call `Popen.poll()`: `waitpid()` on a process that is not
+    our child fails with `ECHILD`, which CPython reports as a clean exit (`returncode = 0`), so a worker would
+    conclude the tunnel is dead and open a second one. The inherited forward is validated instead by
+    `_pid_alive(proc.pid) and _is_port_in_use(local_port)`.
+  - `stop()` in a non-owner process only drops the local handle. Signalling the inherited `ssh` PID would tear
+    down the parent's tunnel for every other worker, and the askpass script belongs to the owner. This also
+    makes `stop_ssh_tunnel()` safe to call unconditionally in a worker (see `_git_commit_worker`'s
+    `client.close(stop_tunnel=True)`), which reaps a tunnel a worker did have to open itself rather than
+    orphaning the `ssh` process when the worker exits.
 
 ### 7.3. Cross-Chunk Deduplication & Multiprocessing Fork Safety
-- **Cross-Chunk Deduplication**: Intermediate chunk commits (`G.TE.commit_all()`) flush and clear staged queues (`queued_set`). To prevent subsequent ChangeSets or waves from attempting duplicate `INSERT INTO` queries for already-committed rows:
-  - TableEngine tracks committed records across chunks using `_committed_nodup_keys` (mapping unique column keys to assigned sequence IDs for `no_duplicate=True` tables such as `m_file_name`), `_committed_pks` (tracking 32-byte cryptographic hashes for `m_ast_hash`), and `_committed_unique_keys` (tracking composite/single unique key values for tables with `unique_keys` such as `m_file_reference`).
-  - In `TEDirectDB.set()`, when auto-increment generation is requested (`columns[0] is None`), if `table.unique_keys` is configured and matches an already staged row or a committed unique key in `_committed_unique_keys`, `set()` returns the existing record immediately without generating a duplicate sequence ID or queuing a duplicate row.
-  - During `commit()` and `commit_all()`, staged rows matching previously committed keys/hashes are filtered out before dispatching batch inserts.
-  - In `trigger_multicore()`, all file paths (`gp.Change_List`, plus the forgotten / missing files returned by `processing_unchanges()`) are registered into `m_file_name` and committed (`_register_file_names()`) before the workers that parse them are forked, ensuring stable sequence ID assignment.
+- **Cross-Chunk Deduplication**: Intermediate chunk commits (`G.TE.commit_all()`) flush and clear staged
+  queues (`queued_set`). To prevent subsequent ChangeSets or waves from attempting duplicate `INSERT INTO`
+  queries for already-committed rows:
+  - TableEngine tracks committed records across chunks using `_committed_nodup_keys` (mapping unique column
+    keys to assigned sequence IDs for `no_duplicate=True` tables such as `m_file_name`), `_committed_pks`
+    (tracking 32-byte cryptographic hashes for `m_ast_hash`), and `_committed_unique_keys` (tracking
+    composite/single unique key values for tables with `unique_keys` such as `m_file_reference`).
+  - In `TEDirectDB.set()`, when auto-increment generation is requested (`columns[0] is None`), if
+    `table.unique_keys` is configured and matches an already staged row or a committed unique key in
+    `_committed_unique_keys`, `set()` returns the existing record immediately without generating a duplicate
+    sequence ID or queuing a duplicate row.
+  - During `commit()` and `commit_all()`, staged rows matching previously committed keys/hashes are filtered
+    out before dispatching batch inserts.
+  - In `trigger_multicore()`, all file paths (`gp.Change_List`, plus the forgotten / missing files returned by
+    `processing_unchanges()`) are registered into `m_file_name` and committed (`_register_file_names()`)
+    before the workers that parse them are forked, ensuring stable sequence ID assignment.
 - **Content-Addressable Blob Deduplication (Step 4.5)**:
-  - Before worker dispatch (and after `G.TE.start()`), `_reuse_parsed_blobs()` looks each changed file's `(blob_hash, ftype)` up in the TableEngine's `m_file_blob` cache and confirms which matches already have tags with one targeted `m_bridge_tag` query (no full-table loads). Files whose exact content was already parsed in any prior version or tree are registered into `m_file_name`, `m_bridge_checkpoint` and `m_commit_file` through the TableEngine, skipping redundant worker translation units; their paths go to `gp.deduped_paths` so Step 6.5 still links their tags to this range's commits.
+  - Before worker dispatch (and after `G.TE.start()`), `_reuse_parsed_blobs()` looks each changed file's
+    `(blob_hash, ftype)` up in the TableEngine's `m_file_blob` cache and confirms which matches already have
+    tags with one targeted `m_bridge_tag` query (no full-table loads). Files whose exact content was already
+    parsed in any prior version or tree are registered into `m_file_name` and `m_bridge_checkpoint` through
+    the TableEngine (no `m_commit_file` row: those are the files each commit touched, written by Step 6.5),
+    skipping redundant worker translation units; their paths go to `gp.deduped_paths` so Step 6.5 still links
+    their tags to this range's commits.
 - **Referential Integrity & Staged Pipeline Commit Boundaries**:
-  - Multicore Stage 2 parsing (`scheduler.finalize()`) and git commit parsing (`processing_git_commits`) enforce full TableEngine commits prior to initiating downstream child table staging (`m_file_reference`, `m_maintainer_file`). Both commits at the end of Stage 2 (inside `scheduler.finalize()` and the one after it) keep the in-memory caches (`G.TE.commit_all()`): Step 6.1 stages `m_file_name` / `m_file_blob` rows, and a cleared cache would mint new ids for paths and blobs already in the database (duplicate `m_file_name` rows, `m_file_blob` unique-key violations on `(blob_hash, ftype)`). The commit after git commit parsing clears them (`update_in_mem_indexes=False`), from where no step stages into those parent tables any more. Independently of the order, a `no_duplicate` key the purged caches miss is resolved against the database before a new id is assigned (`_committed_nodup_id()`, `table_engine/TE_API.md` §3.4).
-  - Step 6.6 (`processing_file_references`) commits all pending parent table rows (`m_file_blob`, `m_file_name`, `m_bridge_checkpoint`), then clears and recomputes the references of the `(fnid, blob_id)` pairs of this version's checkpoint that `gp.Old_VID`'s checkpoint does not hold (`_new_version_file_pairs()`; Makefile references, documentation scans and the include `INSERT IGNORE ... SELECT`). Rows are keyed by the source file's blob and path (`source_blob_id`, `source_fnid`): Kbuild targets resolve against the Makefile's directory, so identical copies of a Makefile in two directories have rows of their own, and a blob that appears at a path it did not have before (a copy, a rename) gets rows for that path while pairs carried over keep theirs. Include rows take their targets from the blob's AST (`m_ast_include`), the same for every path holding it, but are also stored per path so every source can be joined by `(blob_id, fnid)` against `m_bridge_checkpoint`. `processing_kbuild` only parses the Makefile/Kbuild files whose pair is new (it only stages `m_file_reference`); which Kconfig symbols govern a file is answered from Git by the webapp. Step 6.7 (`processing_maintainer_files`) short-circuits in $O(1)$ when `MaintainerMatcher` has no `F:` patterns (`not matcher.exact_index and not matcher.dir_prefix_map and not matcher.general_rules`), and skips files already mapped for the same MAINTAINERS blob. Step 6.8 (`processing_arch_layouts`) evaluates the version's Makefiles for every ARCH value (`parser/arch_layout.py` over the Step 4 tree listing and the RAMDISK files) and replaces the head commit's `m_arch_root` rows (about 90 rows at v2.6.12, 1,600 at v6.1).
-  - Git network and repository resolution in `resolve_git_network_and_repo` caches `(network_id, repo_id)` per canonical `repo_dir`, bypassing repeated 5.5s root-commit traversals (`git rev-list --max-parents=0 HEAD`) on subsequent versions.
-  - Parsing worker processes bypass uncached remote database `SELECT` queries on `m_ast` in `core/TableHandling.py` (`skip_db_lookup = is_neg_cached or is_worker`), eliminating remote SSH tunnel query latency for unresolved symbols.
-  - Milestone checkpointing correctly targets active version `gp.VID` (falling back to HEAD commit id) rather than oldest ancestor commits.
+  - Multicore Stage 2 parsing (`scheduler.finalize()`) and git commit parsing (`processing_git_commits`)
+    enforce full TableEngine commits prior to initiating downstream child table staging (`m_file_reference`,
+    `m_maintainer_file`). Both commits at the end of Stage 2 (inside `scheduler.finalize()` and the one after
+    it) keep the in-memory caches (`G.TE.commit_all()`): Step 6.1 stages `m_file_name` / `m_file_blob` rows,
+    and a cleared cache would mint new ids for paths and blobs already in the database (duplicate
+    `m_file_name` rows, `m_file_blob` unique-key violations on `(blob_hash, ftype)`). The commit after git
+    commit parsing clears them (`update_in_mem_indexes=False`), from where no step stages into those parent
+    tables any more. Independently of the order, a `no_duplicate` key the purged caches miss is resolved
+    against the database before a new id is assigned (`_committed_nodup_id()`, `table_engine/TE_API.md` §3.4).
+  - Step 6.6 (`processing_file_references` and `processing_kbuild`) commits all pending parent table rows (`m_file_blob`,
+    `m_file_name`, `m_bridge_checkpoint`), then clears and recomputes the references of the `(fnid, blob_id)`
+    pairs of this version's checkpoint that `gp.Old_VID`'s checkpoint does not hold (Makefile rules,
+    documentation scans and the include `INSERT IGNORE ... SELECT`). The pairs are computed once per version
+    into a temporary table of one connection (`_new_pairs_table()`, ~7 s on the reference database), which the
+    clearing `DELETE`s and the include `INSERT ... SELECT` join; without SQL access, or when the table cannot
+    be created, each statement runs the anti-join itself (`_new_version_file_pairs()`,
+    `_clear_new_pair_rows()`). Rows are keyed by the source file's blob and path (`source_blob_id`,
+    `source_fnid`): Kbuild targets resolve against the Makefile's directory, so identical copies of a Makefile
+    in two directories have rows of their own, and a blob that appears at a path it did not have before (a
+    copy, a rename) gets rows for that path while pairs carried over keep theirs. Include rows take their
+    targets from the blob's AST (`m_ast_include`), the same for every path holding it, but are also stored per
+    path so every source can be joined by `(blob_id, fnid)` against `m_bridge_checkpoint`. `processing_kbuild`
+    only parses the Makefile/Kbuild files whose pair is new and stages their rules with the symbols governing
+    them into `m_kbuild_symbol` (cleared for the new pairs like `m_file_reference`;
+    `parser/kconfig_ast/KCONFIG_API.md` §6.1).
+  - Step 6.7 (`processing_maintainer_files`) maps files to MAINTAINERS section versions incrementally: sections new or changed since the base version are matched
+    against every path, the others against the paths new in this version only, and when neither exists it logs
+    one line and returns without parsing MAINTAINERS (`parser/maintainer_ast/MAINTAINER_API.md` §5).
+  - Step 6.8 (`processing_arch_layouts`) evaluates the version's Makefiles for every ARCH value
+    (`parser/arch_layout.py` over the Step 4 tree listing and the RAMDISK files) and replaces the head
+    commit's `m_arch_root` rows, one per ARCH, each pointing at its layout. An ARCH whose inputs are unchanged
+    since the previous version of the run reuses its rows (`compute_layout_rows()`: each evaluation records an
+    `InputTrace` of the files it used, by blob, the top Makefile without its release lines, and every tree
+    query with its answer; the trace is replayed against the next tree; logged as `reused N of M ARCH
+    layouts`, all 31 at v3.0.1; the memo lives for the run, so its first version evaluates everything): a
+    layout is looked up by `layout_digest()` and only a new one writes its `m_arch_layout_entry` rows (v3.0:
+    31 ARCH values, 167 rows; v3.0.1 then writes none).
+  - Step 6.9 (`processing_source_facts`, `parser/facts_ingest.py`) extracts the per-blob facts `m_blob_facts` lacks (or holds in an older format)
+    for the version's files across all 5 fact families:
+    - family 1 (`source_facts.FAMILY`): functions, calls, member calls and ops tables of `.c`/`.h` blobs (`parser/source_facts.py`, `source_facts.FACTS_FORMAT`);
+    - family 2 (`kapi_facts.FAMILY`): Kernel API macros of `.c`/`.h`/`.S` blobs (`parser/kapi_facts.py`, `kapi_facts.KAPI_FORMAT`);
+    - family 3 (`include_facts.FAMILY`): `#include` directives of `.c`/`.h`/`.S` blobs (`parser/include_facts.py`, `include_facts.FORMAT`);
+    - family 4 (`kconfig_definitions.FAMILY`): symbol, menu, and choice definitions of Kconfig blobs (`parser/kconfig_ast/kconfig_definitions.py`, `kconfig_definitions.FORMAT`);
+    - family 5 (`doc_labels.FAMILY`): `.. _label:` targets of `Documentation/**/*.rst` blobs (`parser/doc_labels.py`, `doc_labels.FORMAT`).
+    Each blob is read once from the RAMDISK files for all its missing families, and the comment/string mask is computed once for masked extractors (families 1 and 2), in `parser.facts_workers` (default 4) forked low-priority processes; the first version
+    extracts its whole tree, later ones only their new blobs.
+  - Git network and repository resolution in `resolve_git_network_and_repo` caches `(network_id, repo_id)` per
+    canonical `repo_dir`, bypassing repeated 5.5s root-commit traversals (`git rev-list --max-parents=0 HEAD`)
+    on subsequent versions.
+  - Parsing worker processes bypass uncached remote database `SELECT` queries on `m_ast` in
+    `core/TableHandling.py` (`skip_db_lookup = is_neg_cached or is_worker`), eliminating remote SSH tunnel
+    query latency for unresolved symbols.
+  - Milestone checkpointing correctly targets active version `gp.VID` (falling back to HEAD commit id) rather
+    than oldest ancestor commits.
 - **Milestone Release Checkpointing**:
-  - Snapshot registration into `m_bridge_checkpoint` uses a one-shot count check (`COUNT(*) FROM m_bridge_checkpoint WHERE commit_id = %s`). If already complete, snapshot staging is bypassed in $0\text{ms}$; if partial or fresh, existing file IDs are filtered in memory and missing entries are staged directly without row-by-row `G.TE.get()` database roundtrips.
+  - Snapshot registration into `m_bridge_checkpoint` uses a one-shot count check (`COUNT(*) FROM
+    m_bridge_checkpoint WHERE commit_id = %s`). If already complete, snapshot staging is bypassed in
+    $0\text{ms}$; if partial or fresh, existing file IDs are filtered in memory and missing entries are staged
+    directly without row-by-row `G.TE.get()` database roundtrips.
 - **Multiprocessing Socket Refresh**:
-  - The parent process must never call `start_new_db(..., is_worker=True)` after forking workers, as this resets in-memory caches and destroys preloaded table state.
-  - The parent process refreshes its dedicated database socket (`if G.TE.db: G.TE.db.close(); G.TE.db = G.DB()`) to avoid socket descriptor sharing across `fork()` without altering cached state or staging queues.
+  - The parent process must never call `start_new_db(..., is_worker=True)` after forking workers, as this
+    resets in-memory caches and destroys preloaded table state.
+  - The parent process refreshes its dedicated database socket (`if G.TE.db: G.TE.db.close(); G.TE.db =
+    G.DB()`) to avoid socket descriptor sharing across `fork()` without altering cached state or staging
+    queues.
 
 ---
 
 ## 8. Mailing List Commit Resolver Subsystem (`parser/mailing_list/`)
 
 ### 8.1. High-Level Architecture
-The Mailing List subsystem maps Git revisions to corresponding patch submissions, series cover letters, and pull requests on the Linux Kernel Mailing List (LKML) via public-inbox v2 / extindex archives (`/srv/lore`).
+The Mailing List subsystem maps Git revisions to corresponding patch submissions, series cover letters, and
+pull requests on the Linux Kernel Mailing List (LKML) via public-inbox v2 / extindex archives (`/srv/lore`).
+
+Commit-to-email linkage operates across two distinct relational tables with separate operational lifecycles:
+- **`m_commit_link` (Table 64: Offline Trailer Extraction)**: High-throughput offline extraction performed at Step 6.5 (`processing_git_commits`) and via `--backfill-commit-relations`. Uses fast regular expressions directly on stored commit messages to capture explicit `Link: https://lore.kernel.org/r/<mid>` and `Message-Id: <mid>` trailers into `(commit_id, message_id)`. Operates without network access, SSH tunnels, or local public-inbox indices.
+- **`m_commit_email` (Table 43: Dynamic Public-Inbox Resolution)**: Dynamic archive-resolved mapping executed via `KernelCommitEmailResolver` (or remote `ml_server.py` over an SSH tunnel). Traverses a 6-tier resolution waterfall to associate commits with full conversation threads (`thread_id`), relation types (`Patch`, `CoverLetter`, `SiblingPatch`, `PullRequest`), series versioning (`patch_version`, `patch_idx`, `patch_total`), and matched confidence tiers (1 through 6).
 
 ```
 ==================================================================================================
@@ -605,7 +1203,7 @@ Execution Routing:
   ├── Co-located: Direct in-process PublicInboxLocalStore & KernelCommitEmailResolver
   └── Remote: HTTP batch resolution over persistent SSH tunnel to ml_server.py daemon (port 8192)
   │
-  ▼ [parser/mailing_list/ml_resolver.py: KernelCommitEmailResolver (5-Tier Waterfall)]
+  ▼ [parser/mailing_list/ml_resolver.py: KernelCommitEmailResolver (6-Tier Waterfall)]
 Tier 1: Trailer Message-ID (Link: or Message-Id:)
 Tier 2: Stable Patch-ID match (XPATCHID)
 Tier 3: Post/Pre-Image blob hash match (XDFPOST / XDFPRE)
@@ -615,7 +1213,7 @@ Tier 6: Pull request ([GIT PULL]) thread match for merge commits
   │
   ▼ [TableEngine Staging]
 Relational Database Mapping:
-  └── m_commit_email (Table 48):
+  └── m_commit_email (Table 43):
         (commit_id, message_id, thread_id, relation_type, match_tier, patch_version, patch_idx, patch_total)
   │
   ▼ [Pull Request Propagation]
@@ -623,10 +1221,10 @@ Merge commit PR links propagated across all child commits (m_parents[0]..m_hash)
 ==================================================================================================
 ```
 
-### 8.2. Relational Schema Mapping (Table 44: `m_commit_email`)
+### 8.2. Relational Schema Mapping (Table 43: `m_commit_email`)
 | Table ID | Table Name | Columns | Primary Key | `no_duplicate` | Description |
 | :---: | :--- | :--- | :--- | :---: | :--- |
-| **44** | `m_commit_email` | `(commit_id, message_id, thread_id, relation_type, match_tier, patch_version, patch_idx, patch_total)` | `("commit_id", "message_id", "relation_type")` | `False` | Bridge linking Git commits to public-inbox mailing list articles. Foreign key to `m_commit(commit_id)`. |
+| **43** | `m_commit_email` | `(commit_id, message_id, thread_id, relation_type, match_tier, patch_version, patch_idx, patch_total)` | `("commit_id", "message_id", "relation_type")` | `False` | Bridge linking Git commits to public-inbox mailing list articles. Foreign key to `m_commit(commit_id)`. |
 
 - **Relation Types (`MLRelationType`)**:
   - `1`: `Patch` — The specific patch email introducing this commit.
@@ -641,63 +1239,435 @@ Merge commit PR links propagated across all child commits (m_parents[0]..m_hash)
   - `5`: `MetadataFallback` — Constrained author, timestamp, and subject fallback.
   - `6`: `PullRequest` — Matched pull request announcement for merge commits and children.
 
+- **Secondary indexes**: `commit_email_mid_idx (message_id)` and `commit_email_tid_idx (thread_id)` (the
+  primary key starts with `commit_id`, so mail → commit lookups would scan the table). They are declared on
+  the table in `core/DBLayout.py`; a database created before them gets them when the parser starts
+  (`main.ensure_declared_indexes()`, called after `ensure_db_views()`; `ENSURED_INDEX_TABLES`: also
+  `m_maintainer_member`, `m_maintainer_section`, `m_credits_entry` and `m_file_reference`). The webapp's
+  "merged as" lookup (`GET /api/mail/merged`) uses the table only when both exist, and otherwise falls back to
+  `Link:` trailers.
+
 ### 8.3. Public-Inbox Storage & Micro-Daemon (`ml_store.py` & `ml_server.py`)
 - **Direct Storage Access**: Directly reads public-inbox v2 / extindex files without Perl dependencies:
-  - `over.sqlite3` (`?mode=ro`): Thread hierarchy (`tid`), timestamps (`ts`, `ds`), and zlib-compressed overview metadata (`ddd`). Ghost parent rows (`num <= 0`) are filtered.
+  - `over.sqlite3` (`?mode=ro`): Thread hierarchy (`tid`), timestamps (`ts`, `ds`), and zlib-compressed
+    overview metadata (`ddd`). Ghost parent rows (`num <= 0`) are filtered.
   - `msgmap.sqlite3` (`?mode=ro`): High-speed mapping of `mid` to article `num`.
-  - Sharded Xapian B-trees: Unified database querying with automatic `reopen()` recovery on concurrent writer updates (`DatabaseModifiedError`). A `xapian.Database` is **not thread-safe**, so every search (`execute_xapian`) and every query parse (`parse_query`) serializes on `_qp_lock`; concurrent searches on the shared handle abort the daemon process inside `libxapian`. Only matched Message-IDs are collected while the lock is held, so the overview lookups resolving them run outside the critical section. Callers must parse through `store.parse_query(...)` rather than touching `store.qp` directly.
+  - Sharded Xapian B-trees: Unified database querying with automatic `reopen()` recovery on concurrent writer
+    updates (`DatabaseModifiedError`). A `xapian.Database` is **not thread-safe**, so every search
+    (`execute_xapian`) and every query parse (`parse_query`) serializes on `_qp_lock`; concurrent searches on
+    the shared handle abort the daemon process inside `libxapian`. Only matched Message-IDs are collected
+    while the lock is held, so the overview lookups resolving them run outside the critical section. Callers
+    must parse through `store.parse_query(...)` rather than touching `store.qp` directly.
   - `all.git`: Persistent `git cat-file --batch` coprocess for RFC822 raw header verification.
 - **Micro-Daemon (`ml_server.py`)**:
-  - Standalone multi-threaded HTTP query service (`ThreadingHTTPServer`) listening on localhost port 8192 on the remote storage host (`DAEMON_VERSION = "1.4.6"`).
+  - Standalone multi-threaded HTTP query service (`ThreadingHTTPServer`) listening on localhost port 8192 on
+    the remote storage host (`DAEMON_VERSION = "1.4.6"`).
   - Endpoints:
     - `GET /health`: Storage status, directory paths, daemon version, and Xapian availability.
     - `POST /resolve_commit`: Single commit resolution.
-    - `POST /resolve_batch`: Chunked batch commit resolution returning structured `ResolvedCommitContext` dictionaries. Accepts an optional `budget_s` time budget; the daemon checks the deadline between commits (`resolve_batch_until`) and always answers within it, returning the commits it could not reach in a `pending` SHA list alongside `count`, `results`, and `elapsed_s`. Without `budget_s` the batch runs to completion.
-    - `GET /message` & `POST /message`: Fetch full email metadata, headers, body, raw RFC-822, and parsed diff hunks by `mid` or article sequential `num`.
-    - `GET /thread` & `POST /thread`: Fetch chronological thread messages by `tid` or starting `mid`, with participant and cover letter metadata. Accepts `limit` / `offset`; the response carries the thread's real `total` plus `truncated`, since the messages unpacked per request are capped.
-    - `GET /search` & `POST /search`: Full-text/Xapian search across subjects, authors, and patch metadata with pagination and filter types (`all`, `patch`, `cover`, `pull`).
-  - Thread safety: Every request runs in an isolated thread with top-level exception guards ensuring JSON HTTP responses and clean socket closure. `BrokenPipeError` / `ConnectionResetError` from a client that abandoned a slow request are logged at debug level instead of raising.
-  - **Memory ceiling (`MemoryGuard`)**: the daemon shares its host with the archive mirror and a database server, and the kernel's OOM killer picks the largest process rather than the guilty one, so the footprint is explicit. `--max-rss-mb` (default `DEFAULT_MAX_RSS_MB = 1024`, env `ML_MAX_RSS_MB`) sets the hard ceiling and `SOFT_RSS_FRACTION = 0.75` the soft one: above the soft limit heavy requests (`HEAVY_PATHS`) are refused with `503` so in-flight work can finish, and at the hard limit the process logs the breach and exits so the client relaunches a clean daemon.
-  - **Enforcement is continuous, not per-checkpoint**: admission checks and the per-commit budget cannot see a single request that allocates gigabytes inside one operation, which is how the daemon reached 7GB while its log was still empty. `start_watchdog()` therefore samples memory every `WATCHDOG_INTERVAL_SECONDS` on its own thread, dumps every thread's stack through `faulthandler` the first time the soft limit is crossed (so the offending query names itself in the log), and exits at the ceiling. `apply_heap_limit()` additionally sets `RLIMIT_DATA` to the ceiling plus headroom, so a runaway allocation raises `MemoryError` mid-request — answered as `503` — rather than growing unbounded; the limit covers the heap and private anonymous mappings while leaving the Xapian and SQLite file mappings alone. `resolve_batch` also receives the guard as a `should_stop` predicate, deferring the rest of a batch into `pending` under memory pressure exactly as it does when the time budget runs out. `/health` reports `rss_mb`, `peak_rss_mb`, and `max_rss_mb`.
-  - **Admission control**: `--max-concurrent` (default `DEFAULT_MAX_CONCURRENT = 4`, env `ML_MAX_CONCURRENT`) bounds heavy requests in flight through a `BoundedSemaphore` (Xapian access is serialized anyway, so extra concurrency only multiplies the per-request working set); a request body over `MAX_REQUEST_BYTES` (64MB) is refused with `413` before being read; request threads use a `THREAD_STACK_BYTES` (512KB) stack instead of the default 8MB; and each request releases its thread-local SQLite handles when it finishes.
-  - Startup: the listen bind retries for `BIND_RETRY_SECONDS` (5s) on `EADDRINUSE`, since a just-stopped predecessor can still hold the listening socket for a moment and `SO_REUSEADDR` does not override a live listener. The window is kept short so a daemon that loses the race exits instead of lingering and later stealing the port.
-  - Resolution cost: Tier 5 subject lookup (`search_subject_candidates`) and the pull request subject fallback use the indexed Xapian subject term (`s:"<subject>"`); the `over.sqlite3` substring scan runs only when Xapian is unavailable, since it only covers the newest overview rows and decompresses hundreds of them per commit.
-  - Per-commit work caps: `MAX_BLOB_PROBES = 4` bounds how many of a commit's file blobs are probed in Tiers 3 and 4 (a commit can touch hundreds of files, and a patch that reached the list matches on any one of its hunks), and `MAX_SIBLING_PATCHES = 128` bounds the siblings recorded for a series.
-  - **Blob term construction** (`_normalize_blob`, `_blob_term_query`, `blob_queries_for`): a blob id becomes a query term only when it is hex, at least `MIN_BLOB_PREFIX = 8` characters, and not all zeroes. A deleted file has no post-image and the extractor represents the missing side as an empty string, so **a blob must never be interpolated into a term unchecked**: `XDFPOST` with an empty blob is a wildcard on the bare prefix, which expands to every blob term in the archive — over a gigabyte of resident memory per commit (the daemon reached 7GB before the kernel killed it) and a candidate list broad enough to produce false `BlobHash` matches. Every wildcard is also built with an explicit expansion limit (`MAX_WILDCARD_EXPANSION = 1000`, `WILDCARD_LIMIT_FIRST`) so no pattern can expand without bound, and a deletion now matches on its pre-image term (`XDFPRE`) instead of being skipped, which is what the tier's name always implied. Tier 2 likewise rejects empty patch ids and Tier 4 skips an empty file path rather than building `dfn:` with nothing.
-  - Tier 5 candidate preference (`_subject_candidate_pools`): the subject index also matches replies (`Re: [PATCH] ...`), so candidates are scored in the order patch submissions, then non-replies, then any match, keeping the staged Message-ID the patch itself rather than a reply to it.
+    - `POST /resolve_batch`: Chunked batch commit resolution returning structured `ResolvedCommitContext`
+      dictionaries. Accepts an optional `budget_s` time budget; the daemon checks the deadline between commits
+      (`resolve_batch_until`) and always answers within it, returning the commits it could not reach in a
+      `pending` SHA list alongside `count`, `results`, and `elapsed_s`. Without `budget_s` the batch runs to
+      completion.
+    - `GET /message` & `POST /message`: Fetch full email metadata, headers, body, raw RFC-822, and parsed diff
+      hunks by `mid` or article sequential `num`.
+    - `GET /thread` & `POST /thread`: Fetch chronological thread messages by `tid` or starting `mid`, with
+      participant and cover letter metadata. Accepts `limit` / `offset`; the response carries the thread's
+      real `total` plus `truncated`, since the messages unpacked per request are capped.
+    - `GET /search` & `POST /search`: Full-text/Xapian search across subjects, authors, and patch metadata
+      with pagination and filter types (`all`, `patch`, `cover`, `pull`).
+  - Thread safety: Every request runs in an isolated thread with top-level exception guards ensuring JSON HTTP
+    responses and clean socket closure. `BrokenPipeError` / `ConnectionResetError` from a client that
+    abandoned a slow request are logged at debug level instead of raising.
+  - **Memory ceiling (`MemoryGuard`)**: the daemon shares its host with the archive mirror and a database
+    server, and the kernel's OOM killer picks the largest process rather than the guilty one, so the footprint
+    is explicit. `--max-rss-mb` (default `DEFAULT_MAX_RSS_MB = 1024`, env `ML_MAX_RSS_MB`) sets the hard
+    ceiling and `SOFT_RSS_FRACTION = 0.75` the soft one: above the soft limit heavy requests (`HEAVY_PATHS`)
+    are refused with `503` so in-flight work can finish, and at the hard limit the process logs the breach and
+    exits so the client relaunches a clean daemon.
+  - **Enforcement is continuous, not per-checkpoint**: admission checks and the per-commit budget cannot see a
+    single request that allocates gigabytes inside one operation, which is how the daemon reached 7GB while
+    its log was still empty. `start_watchdog()` therefore samples memory every `WATCHDOG_INTERVAL_SECONDS` on
+    its own thread, dumps every thread's stack through `faulthandler` the first time the soft limit is crossed
+    (so the offending query names itself in the log), and exits at the ceiling. `apply_heap_limit()`
+    additionally sets `RLIMIT_DATA` to the ceiling plus headroom, so a runaway allocation raises `MemoryError`
+    mid-request — answered as `503` — rather than growing unbounded; the limit covers the heap and private
+    anonymous mappings while leaving the Xapian and SQLite file mappings alone. `resolve_batch` also receives
+    the guard as a `should_stop` predicate, deferring the rest of a batch into `pending` under memory pressure
+    exactly as it does when the time budget runs out. `/health` reports `rss_mb`, `peak_rss_mb`, and
+    `max_rss_mb`.
+  - **Admission control**: `--max-concurrent` (default `DEFAULT_MAX_CONCURRENT = 4`, env `ML_MAX_CONCURRENT`)
+    bounds heavy requests in flight through a `BoundedSemaphore` (Xapian access is serialized anyway, so extra
+    concurrency only multiplies the per-request working set); a request body over `MAX_REQUEST_BYTES` (64MB)
+    is refused with `413` before being read; request threads use a `THREAD_STACK_BYTES` (512KB) stack instead
+    of the default 8MB; and each request releases its thread-local SQLite handles when it finishes.
+  - Startup: the listen bind retries for `BIND_RETRY_SECONDS` (5s) on `EADDRINUSE`, since a just-stopped
+    predecessor can still hold the listening socket for a moment and `SO_REUSEADDR` does not override a live
+    listener. The window is kept short so a daemon that loses the race exits instead of lingering and later
+    stealing the port.
+  - Resolution cost: Tier 5 subject lookup (`search_subject_candidates`) and the pull request subject fallback
+    use the indexed Xapian subject term (`s:"<subject>"`); the `over.sqlite3` substring scan runs only when
+    Xapian is unavailable, since it only covers the newest overview rows and decompresses hundreds of them per
+    commit.
+  - Per-commit work caps: `MAX_BLOB_PROBES = 4` bounds how many of a commit's file blobs are probed in Tiers 3
+    and 4 (a commit can touch hundreds of files, and a patch that reached the list matches on any one of its
+    hunks), and `MAX_SIBLING_PATCHES = 128` bounds the siblings recorded for a series.
+  - **Blob term construction** (`_normalize_blob`, `_blob_term_query`, `blob_queries_for`): a blob id becomes
+    a query term only when it is hex, at least `MIN_BLOB_PREFIX = 8` characters, and not all zeroes. A deleted
+    file has no post-image and the extractor represents the missing side as an empty string, so **a blob must
+    never be interpolated into a term unchecked**: `XDFPOST` with an empty blob is a wildcard on the bare
+    prefix, which expands to every blob term in the archive — over a gigabyte of resident memory per commit
+    (the daemon reached 7GB before the kernel killed it) and a candidate list broad enough to produce false
+    `BlobHash` matches. Every wildcard is also built with an explicit expansion limit (`MAX_WILDCARD_EXPANSION
+    = 1000`, `WILDCARD_LIMIT_FIRST`) so no pattern can expand without bound, and a deletion now matches on its
+    pre-image term (`XDFPRE`) instead of being skipped, which is what the tier's name always implied. Tier 2
+    likewise rejects empty patch ids and Tier 4 skips an empty file path rather than building `dfn:` with
+    nothing.
+  - Tier 5 candidate preference (`_subject_candidate_pools`): the subject index also matches replies (`Re:
+    [PATCH] ...`), so candidates are scored in the order patch submissions, then non-replies, then any match,
+    keeping the staged Message-ID the patch itself rather than a reply to it.
 - **Patch Parser (`ml_patch_parser.py`)**:
-  - Parses raw unified diffs within commit email bodies into structured AST dictionaries (`files`, `hunks`, `additions`, `deletions`, file modification types `M`, `A`, `D`, `R`, and new line offsets).
-  - Integrates directly with `ml_store.py` and `ml_server.py` to deliver pre-parsed, syntax-highlighted diff hunks directly to frontend viewers.
+  - Parses raw unified diffs within commit email bodies into structured AST dictionaries (`files`, `hunks`,
+    `additions`, `deletions`, file modification types `M`, `A`, `D`, `R`, and new line offsets).
+  - Integrates directly with `ml_store.py` and `ml_server.py` to deliver pre-parsed, syntax-highlighted diff
+    hunks directly to frontend viewers.
 - **Client & Tunnel Management (`ml_client.py`)**:
-  - Reuses the dedicated `"mailing_list"` SSH tunnel established once at startup (§7.2), including in forked per-version workers, and only activates one itself if none is active.
-  - Verifies local archive presence when tunnel is disabled; returns descriptive errors if neither local archive nor SSH tunnel is available.
-  - Negotiates daemon version (`DAEMON_VERSION = "1.4.6"`) against `/health`; if inactive or outdated, synchronizes the `parser/mailing_list` package to the remote host and detaches a fresh daemon (`ssh -f -n` + `nohup`). **Any change to the daemon, resolver, or store requires bumping `DAEMON_VERSION`**, since a version match is what keeps an already-running daemon (and its stale code) in place.
+  - Reuses the dedicated `"mailing_list"` SSH tunnel established once at startup (§7.2), including in forked
+    per-version workers, and only activates one itself if none is active.
+  - Verifies local archive presence when tunnel is disabled; returns descriptive errors if neither local
+    archive nor SSH tunnel is available.
+  - Negotiates daemon version (`DAEMON_VERSION = "1.4.6"`) against `/health`; if inactive or outdated,
+    synchronizes the `parser/mailing_list` package to the remote host and detaches a fresh daemon (`ssh -f -n`
+    + `nohup`). **Any change to the daemon, resolver, or store requires bumping `DAEMON_VERSION`**, since a
+    version match is what keeps an already-running daemon (and its stale code) in place.
   - Remote restart protocol (idempotent and race-free):
-    - An advisory `flock` on fd 9 (`/tmp/ml_server.<port>.lock`) serializes concurrent startups from parser workers. A contender waits `LOCK_WAIT_SECONDS` (8s) for the lock instead of giving up, then finds the new daemon healthy and returns without touching it. The lock is held `LOCK_HOLD_SECONDS` (5s) past the launch so a worker arriving right behind cannot kill the daemon just started, and the daemon is launched with `9>&-` so it does not inherit the lock fd and hold the lock for its whole lifetime, which would silently block every later restart.
-    - A retrying `/health` pre-check inside the lock makes a redundant restart a no-op and prevents a momentarily busy daemon from being mistaken for a dead one.
-    - Only the process owning the **listening** socket is stopped (`ss -ltnpH 'sport = :<port>'`, `SIGTERM` then `SIGKILL`), and the listening socket is drained before the new daemon binds. `fuser -k <port>/tcp` must **not** be used: it also kills every process merely *connected* to the port, including the `sshd` serving other workers' tunnels, which tears down their in-flight queries. A `pkill -f` on the module path is equally unusable, as it matches the startup shell's own command line.
-    - Startup is attempted up to `DAEMON_START_ATTEMPTS` (2) times within `DAEMON_START_TIMEOUT` (30s total), so a launch that lost a lock race is retried rather than reported as unreachable.
-  - Adaptive batch resolution (`mailing_list.batch_size`, default `50`; `mailing_list.request_timeout`, default `180` seconds): each `POST /resolve_batch` carries `budget_s` at 80% of the socket timeout so the daemon replies with partial results first. Commits reported `pending` are re-queued in half-size chunks (up to `MAX_CHUNK_ATTEMPTS = 3` passes); a chunk that times out anyway is split in half and retried, and a single commit that still exceeds the timeout is dropped with a warning once `/health` confirms the daemon is alive. HTTP errors (e.g. 500, 400) from the daemon are isolated to the offending chunk/commit, logging the daemon error payload, halving multi-commit chunks, and dropping a single failing commit with a warning rather than aborting or misdiagnosing connection loss. `CommitFeatures` and `ResolvedCommitContext` DTOs resiliently normalize non-numeric or string `commit_id` values to `0` (supporting unparsed Git-only commits). `ConnectionError` is raised only for a genuinely unreachable daemon, so slow queries never abort a parse run. A dropped connection (typically a daemon restarted by another worker) triggers one re-establish-and-retry of the affected chunk before the error is raised.
-  - Hands the remote daemon its resource ceiling on launch: `--max-rss-mb` from `mailing_list.daemon_max_rss_mb` (default `1024`) and `--max-concurrent` from `mailing_list.daemon_max_concurrent` (default `4`). A `503` / `429` answer is treated as backpressure rather than failure (`_is_backpressure`): the client pauses `BACKPRESSURE_SLEEP` (2s), halves the chunk, and retries up to `MAX_CHUNK_ATTEMPTS` before dropping a single commit with a warning.
+    - An advisory `flock` on fd 9 (`/tmp/ml_server.<port>.lock`) serializes concurrent startups from parser
+      workers. A contender waits `LOCK_WAIT_SECONDS` (8s) for the lock instead of giving up, then finds the
+      new daemon healthy and returns without touching it. The lock is held `LOCK_HOLD_SECONDS` (5s) past the
+      launch so a worker arriving right behind cannot kill the daemon just started, and the daemon is launched
+      with `9>&-` so it does not inherit the lock fd and hold the lock for its whole lifetime, which would
+      silently block every later restart.
+    - A retrying `/health` pre-check inside the lock makes a redundant restart a no-op and prevents a
+      momentarily busy daemon from being mistaken for a dead one.
+    - Only the process owning the **listening** socket is stopped (`ss -ltnpH 'sport = :<port>'`, `SIGTERM`
+      then `SIGKILL`), and the listening socket is drained before the new daemon binds. `fuser -k <port>/tcp`
+      must **not** be used: it also kills every process merely *connected* to the port, including the `sshd`
+      serving other workers' tunnels, which tears down their in-flight queries. A `pkill -f` on the module
+      path is equally unusable, as it matches the startup shell's own command line.
+    - Startup is attempted up to `DAEMON_START_ATTEMPTS` (2) times within `DAEMON_START_TIMEOUT` (30s total),
+      so a launch that lost a lock race is retried rather than reported as unreachable.
+  - Adaptive batch resolution (`mailing_list.batch_size`, default `50`; `mailing_list.request_timeout`,
+    default `180` seconds): each `POST /resolve_batch` carries `budget_s` at 80% of the socket timeout so the
+    daemon replies with partial results first. Commits reported `pending` are re-queued in half-size chunks
+    (up to `MAX_CHUNK_ATTEMPTS = 3` passes); a chunk that times out anyway is split in half and retried, and a
+    single commit that still exceeds the timeout is dropped with a warning once `/health` confirms the daemon
+    is alive. HTTP errors (e.g. 500, 400) from the daemon are isolated to the offending chunk/commit, logging
+    the daemon error payload, halving multi-commit chunks, and dropping a single failing commit with a warning
+    rather than aborting or misdiagnosing connection loss. `CommitFeatures` and `ResolvedCommitContext` DTOs
+    resiliently normalize non-numeric or string `commit_id` values to `0` (supporting unparsed Git-only
+    commits). `ConnectionError` is raised only for a genuinely unreachable daemon, so slow queries never abort
+    a parse run. A dropped connection (typically a daemon restarted by another worker) triggers one
+    re-establish-and-retry of the affected chunk before the error is raised.
+  - Hands the remote daemon its resource ceiling on launch: `--max-rss-mb` from
+    `mailing_list.daemon_max_rss_mb` (default `1024`) and `--max-concurrent` from
+    `mailing_list.daemon_max_concurrent` (default `4`). A `503` / `429` answer is treated as backpressure
+    rather than failure (`_is_backpressure`): the client pauses `BACKPRESSURE_SLEEP` (2s), halves the chunk,
+    and retries up to `MAX_CHUNK_ATTEMPTS` before dropping a single commit with a warning.
   - `get_thread(tid, limit, offset)` pages a long thread rather than requesting all of it.
-  - `close(stop_tunnel=True)` terminates the SSH tunnel; a tunnel inherited from the parent process is never torn down by a worker (§7.2).
-  - Materializes pull request linkage across both the merge commit and all child commits in the merged branch lineage for $O(1)$ lookup performance.
+  - `close(stop_tunnel=True)` terminates the SSH tunnel; a tunnel inherited from the parent process is never
+    torn down by a worker (§7.2).
+  - Materializes pull request linkage across both the merge commit and all child commits in the merged branch
+    lineage for $O(1)$ lookup performance.
 - **Store & Concurrency Architecture (`ml_store.py`)**:
   - Automatically resolves extindex archives under `all/` (e.g. `/srv/lore/all/ei15`).
-  - Resilient Concurrent Read-Only Architecture: Opens `over.sqlite3` and `msgmap.sqlite3` in read-only URI mode with `immutable=1` (`?mode=ro&immutable=1`), bypassing POSIX file locking (`F_SETLK`) and hot journal recovery to completely avoid write lock contention with background `public-inbox-extindex` processes.
-  - Thread-local handles (`threading.local`) and `isolation_level=None` (autocommit mode) ensure zero cursor contention across concurrent worker threads.
-  - Exponential backoff retry helper (`_execute_query`) with `PRAGMA busy_timeout = 60000;` and `PRAGMA query_only = ON;`.
-  - Serialized `git cat-file --batch` pipeline using `threading.Lock()` to prevent stream interleaving across threads.
-  - Chronological search querying indexed via `idx_ds` (`ORDER BY ds DESC`) for instant sub-millisecond retrieval without table-scan locks.
-  - Utilizes indexed `xref3.oidbin` lookups for Git blob SHA-to-document ID resolution, avoiding full table scans over multi-million row PublicInbox archives, with direct `xref3` fallback when `rec.git_blob` is missing in overview records.
-  - Multi-candidate Message-ID lookups supporting raw, unquoted, angle-bracketed, and space-to-plus (`+` query string space interpretation) variants.
+  - Resilient Concurrent Read-Only Architecture: Opens `over.sqlite3` and `msgmap.sqlite3` in read-only URI
+    mode with `immutable=1` (`?mode=ro&immutable=1`), bypassing POSIX file locking (`F_SETLK`) and hot journal
+    recovery to completely avoid write lock contention with background `public-inbox-extindex` processes.
+  - Thread-local handles (`threading.local`) and `isolation_level=None` (autocommit mode) ensure zero cursor
+    contention across concurrent worker threads.
+  - Exponential backoff retry helper (`_execute_query`) with `PRAGMA busy_timeout = 60000;` and `PRAGMA
+    query_only = ON;`.
+  - Serialized `git cat-file --batch` pipeline using `threading.Lock()` to prevent stream interleaving across
+    threads.
+  - Chronological search querying indexed via `idx_ds` (`ORDER BY ds DESC`) for instant sub-millisecond
+    retrieval without table-scan locks.
+  - Utilizes indexed `xref3.oidbin` lookups for Git blob SHA-to-document ID resolution, avoiding full table
+    scans over multi-million row PublicInbox archives, with direct `xref3` fallback when `rec.git_blob` is
+    missing in overview records.
+  - Multi-candidate Message-ID lookups supporting raw, unquoted, angle-bracketed, and space-to-plus (`+` query
+    string space interpretation) variants.
   - Provides thread and cover letter reconstruction via `over.sqlite3` indexed by `tid` and `ds`.
-  - **Bounded Memory Architecture**: the extindex overview database is multi-gigabyte (22M messages / 19GB on the reference host), so every result set is bounded by construction — one unbounded fetch was enough to grow the daemon to 14.7GB and have the kernel OOM-kill it alongside its neighbours:
-    - `search_emails`: `limit` and `offset` are clamped (`MAX_SEARCH_LIMIT = 200`, `MAX_SEARCH_OFFSET = 5_000_000`) and the offset is pushed **into** the data source — `search_xapian_page()` passes it to `Enquire.get_mset(offset, limit)`, the chronological browse uses SQL `LIMIT ? OFFSET ?`, and `search_over_subjects()` streams its bounded scan (`MAX_SEARCH_SCAN = 20_000`) while retaining only the requested page. Fetching `limit + offset` records and slicing cost 3.1GB and 43s at offset 2M; the same page now costs 33MB and 0.16s. `total` is Xapian's `get_matches_estimated()` where available, and the response carries `has_more`.
-    - `get_thread_by_tid(tid, limit, offset)` is capped at `MAX_THREAD_MESSAGES = 1000` (the reference archive's largest thread holds 12,342 messages, each with a compressed overview blob). `get_thread_messages()` pages over it and reports the thread's real size from the indexed `count_thread_messages()` plus a `truncated` flag.
-    - `lookup_by_blob()` runs its recency scan only when Xapian is unavailable; the indexed `xref3.oidbin` lookup is authoritative otherwise, and the scan cost hundreds of random overview reads per commit.
-    - `_read_cat_payload()` validates the size declared by `git cat-file --batch` against `MAX_RAW_EMAIL_BYTES` (32MB) before allocating, and drains any excess in chunks so a desynchronized stream resyncs instead of turning a garbage header into a multi-gigabyte `read()`.
-    - Thread-local SQLite handles are opened with `PRAGMA cache_size = -8000` (8MB) and `PRAGMA temp_store = FILE` so sorters spill to disk, and `close_thread_handles()` releases a request thread's handles (the daemon serves each request on a new thread, which would otherwise leak two connections and their caches per request).
+  - **Bounded Memory Architecture**: the extindex overview database is multi-gigabyte (22M messages / 19GB on
+    the reference host), so every result set is bounded by construction — one unbounded fetch was enough to
+    grow the daemon to 14.7GB and have the kernel OOM-kill it alongside its neighbours:
+    - `search_emails`: `limit` and `offset` are clamped (`MAX_SEARCH_LIMIT = 200`, `MAX_SEARCH_OFFSET =
+      5_000_000`) and the offset is pushed **into** the data source — `search_xapian_page()` passes it to
+      `Enquire.get_mset(offset, limit)`, the chronological browse uses SQL `LIMIT ? OFFSET ?`, and
+      `search_over_subjects()` streams its bounded scan (`MAX_SEARCH_SCAN = 20_000`) while retaining only the
+      requested page. Fetching `limit + offset` records and slicing cost 3.1GB and 43s at offset 2M; the same
+      page now costs 33MB and 0.16s. `total` is Xapian's `get_matches_estimated()` where available, and the
+      response carries `has_more`.
+    - `get_thread_by_tid(tid, limit, offset)` is capped at `MAX_THREAD_MESSAGES = 1000` (the reference
+      archive's largest thread holds 12,342 messages, each with a compressed overview blob).
+      `get_thread_messages()` pages over it and reports the thread's real size from the indexed
+      `count_thread_messages()` plus a `truncated` flag.
+    - `lookup_by_blob()` runs its recency scan only when Xapian is unavailable; the indexed `xref3.oidbin`
+      lookup is authoritative otherwise, and the scan cost hundreds of random overview reads per commit.
+    - `_read_cat_payload()` validates the size declared by `git cat-file --batch` against
+      `MAX_RAW_EMAIL_BYTES` (32MB) before allocating, and drains any excess in chunks so a desynchronized
+      stream resyncs instead of turning a garbage header into a multi-gigabyte `read()`.
+    - Thread-local SQLite handles are opened with `PRAGMA cache_size = -8000` (8MB) and `PRAGMA temp_store =
+      FILE` so sorters spill to disk, and `close_thread_handles()` releases a request thread's handles (the
+      daemon serves each request on a new thread, which would otherwise leak two connections and their caches
+      per request).
 
+---
 
+## 9. CVE List Ingestion (`parser/cve/`)
 
+The parser keeps the database's CVE tables (`m_cve_source`, `m_cve`, `m_cve_commit`, §4) at the HEAD of a
+local clone of the CVE list (config `cve.repo_dir`, §7.1; kept current by the operator with `git pull`). The
+webapp only reads them (`webapp/API.md` §4.11).
+- **When**: at the start of every parser run (`main.processing_cve_list()`, after the repository is selected),
+  unless `--no-cve`; `python3 main.py --cve` does only this and exits; `--cve-full` ingests the whole list
+  again. A failure is logged and never stops parsing.
+- **Abbreviated hashes** (`cve_ingest.resolve_commit_prefixes()`): after each ingestion (also when the HEAD is
+  current), every distinct `m_cve_commit.commit_hash` shorter than 40 digits without an `m_cve_commit_hash`
+  row for the selected repository is resolved with one `git cat-file --batch-check`
+  (`parser/git_ast/commit_relations.resolve_prefixes()`); a prefix naming no commit or several gets no row and
+  is tried again next run. A full ingestion empties the table with the others. The webapp's CVE reports read
+  it instead of one `git rev-parse` per hash (`webapp/API.md` §4.11).
+- **Layouts** (`cve_ingest.detect_layout()`): the CVE Program's `cvelistV5` (`cves/<year>/<n>xxx/CVE-*.json`,
+  every CNA, ~420k records: one `git grep -l -i -F` over HEAD keeps the records naming the kernel CNA, a
+  kernel commit URL or "Linux kernel") or the kernel CNA's `vulns.git` (`cve/published/<year>/CVE-*.json`,
+  every record). Records are read through one `git cat-file --batch`; a record over 1 MB is skipped.
+- **Records** (`cve_records.parse_record()`, pure and shared with the webapp): kind `cna` (the kernel CNA's
+  git ranges and per-product version entries), `commit` (another CNA linking a kernel commit: its fixes) or
+  `text` (about the kernel without a commit: versions from the products or the description). Rejected records
+  and records about other software are dropped. `RECORD_FORMAT` versions what is kept.
+- **Updates** (`cve_ingest.prepare()` / `write()`): the HEAD, layout and record format of the last ingestion
+  are in `m_cve_source`. Same HEAD: nothing is read. A newer HEAD of the same list and format: only the record
+  paths `git diff --name-only` names are read again; their CVE ids are deleted, then the kernel records among
+  them inserted (~0.2 s). Otherwise (first run, another list, a new `RECORD_FORMAT`, `--cve-full`): every
+  table is emptied and the list ingested again (22,023 kernel records of cvelistV5 in ~24 s). Each ingestion
+  is one transaction, so the webapp never reads half of one.
+- **Rows** (`record_row()`, `commit_rows()`): `m_cve` keeps the parsed record (zlib JSON, ~1 KB) with the
+  columns the webapp filters on (kind, publication and update dates, CVSS × 10, KEV listing); `m_cve_commit`
+  one row per (commit, role) the record names: the fixing commits (role 1, ~98k rows, abbreviated as the
+  record gives them) and the introducing ones (role 2, ~26k rows, always full SHAs).
+
+## 10. Release Statistics (`parser/git_ast/release_stats.py`)
+
+The parser summarizes every release tag of the repository — ingested as a version or not — into
+`m_release_segment`, `m_release_person` and `m_person_first_release` (§4), so release reports (the webapp's
+Insights · Release stats, `webapp/API.md` §4.10) can be answered from a few rows instead of re-reading the
+history with Git.
+- **When**: after the repository is resolved at the start of every run (`main.processing_release_stats()`),
+  and again after the version loop, unless `--no-release-stats` (or `--dry-run`); `python3 main.py
+  --release-stats` does only this and exits. Skipped (logged) while any version ingestion is interrupted
+  (`m_ingest_state` status 1): its rollback (§4.1) deletes the `m_maintainer_person` rows above its watermark
+  together with every row naming them, so the step waits for the recovery, which the same run's version loop
+  performs before the second call. A failure is logged and never stops parsing.
+- **Ranges** (`parser/git_ast/release_order.py`, pure, shared with the webapp's release index, `webapp/API.md`
+  §2.17): release tags are the `refs/tags` names `parse_tag()` accepts that name a commit (annotated tags
+  peeled). `release_ranges()` gives each tag its **segment** — from the previous tag of its chain: the
+  previous mainline tag (release candidates included) for a mainline tag, `previous_in()` for a stable update
+  — and its **diff range** from `previous_in()`, the range a release report covers: a final release's whole
+  cycle from the previous release, otherwise the segment itself. A chain's segments are disjoint and add up to
+  any range on it (`v3.0..v3.1` = `v3.0..v3.1-rc1` + … + `v3.1-rc8..v3.1`), so a release's commits, merges and
+  contributors are the sums of its segments; its diffstat is not additive, hence the diff range.
+- **Per tag** (`compute()`, `WORKERS` = 4 threads): `git log --format=%x1e%H%x1f%P%x1f%an%x1f%ae%x1f%B
+  <segment>` (merges included) read by `summarize_records()`: a record with two or more parents counts as a
+  merge and is not summarized, so the figures are those `--no-merges` gave, and every commit of the segment
+  goes to `m_commit_release` (`INSERT IGNORE`, written in release order, so the earliest segment of a chain
+  keeps a commit; the rows of every segment summarized again are deleted before the run, so a commit moving to
+  an earlier segment is not lost). People: the author (role 1) and every contributor trailer through
+  `git_commit_parser.iter_trailers()` (the same reading version ingestion stores into
+  `m_bridge_commit_person`); within one commit and role an identity (`identity.identity_key()`, the Developers
+  directory's rule) counts once, and a Signed-off-by of the author's identity is left out. Per diff range:
+  `git diff --shortstat <diff range>`.
+- **Identities**: when a pass inserts persons, `m_person_identity` is refreshed (§4 row 59).
+- **Persons**: the `m_maintainer_person` rows version ingestion uses (`identity.person_key()`, which
+  `main._person_key()` delegates to; names and emails cut to the 128-character columns). Persons first met
+  here (commits the parser never ingested) are inserted with the next ids.
+- **First releases**: written with each mainline segment, in release order: an author without a row gets the
+  segment; a segment earlier in release order than the stored one replaces it. Release order, not author
+  dates: patches merged long after they were written carry old dates (on the reference clone, author dates
+  misplaced 16–76 first-time authors per release). When a stored mainline segment is replaced, the table is
+  rebuilt from the author rows.
+- **Incremental**: a tag whose stored commit, segment base (name and commit), diff base and `FORMAT` match
+  costs nothing; otherwise (new tag, moved tag, a tag inserted before it, a new `FORMAT`) the segment is
+  summarized again and its rows replaced. Ranges are computed in parallel and written in release order, one
+  transaction per tag, so an interrupted run resumes where it stopped. `FORMAT` 2 (`m_commit_release`) made
+  every tag be summarized again once (~9 minutes on the reference clone), which fills the table on existing
+  databases. On the reference clone: 5,761 release tags summarized from scratch in ~530 s (1.53M
+  `m_release_person` rows, 44.6k first releases); a run with nothing new costs ~0.2 s.
+- **Reading** (the webapp's Release stats, `webapp/API.md` §4.10, which falls back to Git for a release these
+  rows do not cover): a release's figures are its segments' sums — the segments of `range_base..tag` on its
+  chain; contributors folded into identities with the webapp's `_identity_index` and employers mapped from the
+  person's address at read time, so neither rule needs a re-parse; first-time authors are the identities whose
+  aliases' earliest `m_person_first_release` segment lies in the release's range.
+
+---
+
+## 11. Distributed Multi-Computer Parsing (`core/distributed.py`)
+
+An opt-in distributed execution mode enabling multiple parser computers to operate concurrently against a
+single shared MariaDB instance while maintaining strict database integrity, deterministic sequence allocation,
+and isolated crash recovery.
+
+### 11.1. Architecture & Roles
+- **Opt-In Configuration**: Disabled by default (`config.json` `parser.distributed.enabled = false` or `--role
+  standalone`).
+- **Task Status Lifecycle (`m_parse_task`)**:
+  - `TASK_PENDING` (0): Task is waiting for its prerequisite `base_commit_id` / `base_ref_name` to reach `INGEST_DONE`.
+  - `TASK_ELIGIBLE` (1): Prerequisite base is `INGEST_DONE`; task is ready to be claimed by a secondary worker.
+  - `TASK_LEASED` (2): Task is actively claimed and being processed by a worker; lease is actively renewed by `NodeHeartbeatDaemon`.
+  - `TASK_DONE` (3): Ingestion completed successfully and verified.
+  - `TASK_FAILED` (4): Ingestion failed after exhausting 3 retry attempts, or aborted due to an unrecoverable rollback failure.
+  - `TASK_RECLAIMING` (5): Worker lease expired or worker died; atomic CAS lease reclamation is actively executing rollback before re-enqueue or failure transition.
+- **Master Parser Computer (`--role master`)**:
+  - Sequentially parses the mainline and primary trunk chains in chronological order (`history/master` $\to$
+    `1da177e4c3f4` bridged incrementally from `v2.6.12-rc1` $\to$ `v2.6.x` $\to$ `v3.0` $\to$ `master`) and owns
+    singleton global maintenance tasks (`ensure_db_views`, `processing_cve_list`, `processing_release_stats`).
+    Trunk references (`history/master`, `history/HEAD`, `master`, `main`) are preserved on Master when `--delegate-stable`
+    is active.
+  - Automatically publishes delegable tasks into `m_parse_task` (keyed by unique constraint `(network_id, ref_name)`):
+    - **Stable Chains (Case B)**: Series branches `vX.Y.1 .. vX.Y.Z` whose base commit is already `INGEST_DONE`.
+    - **Past, Secondary & Next Branches (Case A)**: Discovered non-trunk branches (`history/*` secondary,
+      `stable/*`, `linux-next/*`) or explicit `--delegate-branch` targets. Uses `resolve_branch_base_dependency()`
+      via `git merge-base` against upstream trunks (`history/master` for history branches, `master` for stable and
+      linux-next) to resolve `base_ref_name` and `base_commit_id`, enqueuing tasks in `TASK_PENDING` (or `TASK_ELIGIBLE`
+      if base is already `INGEST_DONE`).
+    - **Preservation of Resolved IDs & Status**: Task publishing preserves existing non-zero commit IDs upon duplicate-key collision via `commit_id = IF(VALUES(commit_id) > 0, VALUES(commit_id), commit_id)` and `base_commit_id = IF(VALUES(base_commit_id) > 0, VALUES(base_commit_id), base_commit_id)`.
+    - **Republishing Recovery**: Tasks in `TASK_FAILED` (4) are reset to their initial status (`TASK_ELIGIBLE` or `TASK_PENDING`) with `retry_count = 0` and cleared `error_msg`. Tasks previously marked `TASK_DONE` (3) that are no longer marked `"done"` in `version_states` (due to version purge or rollback) are reset to their initial computed status. In-flight leased (`TASK_LEASED`) and reclaiming (`TASK_RECLAIMING`) tasks retain their operational state unless `version_states` confirms completion.
+  - Automatically transitions dependent tasks from `TASK_PENDING` (0) to `TASK_ELIGIBLE` (1) upon completing a
+    base version in `finish_version_ingest()`.
+  - Enforces single-master leadership exclusivity: `distributed.register_node()` verifies no other master node on
+    the `network_id` holds an active heartbeat within 120 seconds (`heartbeat_at >= now - 120`), atomically registers with `active_commit_id = 0`, and executes a post-insert verification with deterministic tie-breaking to prevent concurrent registration races.
+- **Secondary Worker Computers (`--role worker`)**:
+  - Connects to the shared database (directly or via SSH tunnel) and claims tasks from `m_parse_task` where
+    `status = TASK_ELIGIBLE`.
+  - Prioritizes the same release chain previously processed to maximize `TECachedDB` warm-cache and checkpoint
+    delta locality, ordering candidate queries naturally across topological tiers: `history` secondary branches
+    first, stable update series second, and `linux-next` integration tasks third (`ORDER BY CASE WHEN chain_name LIKE 'history%' OR chain_kind = 'history' THEN 1 WHEN chain_kind = 'stable' THEN 2 WHEN chain_name LIKE '%next%' OR chain_kind = 'next' THEN 3 ELSE 4 END ASC, LENGTH(chain_name) ASC, chain_name ASC, seq_order ASC`).
+  - While waiting when the queue is temporarily empty, monitors active Master heartbeats, in-progress tasks, and dependency states via `is_parsing_finished()`, exiting cleanly only when all parsing across the repository has completed.
+- **Task Leasing & Dependency Unlocking (`core/distributed.py`)**:
+  - **Task Claiming**: `distributed.claim_next_task()` atomically leases an eligible task, sets `status = TASK_LEASED` (2),
+    records `worker_id` and `lease_expires_at`, re-queries fresh `commit_id`, `base_commit_id`, and `base_ref_name` from `m_parse_task` to prevent stale snapshot candidate data, assigns `gp._active_task_id`, and registers the active task and commit in `heartbeat_daemon`.
+  - **Node Identification**: `distributed.get_default_node_id()` generates unique node identifiers across replica containers (bounded to 128 characters) by checking exact token matches for `hostname` and `pid` separated by colons and hashing overflows.
+  - **Ingestion Linkage**: When DAG ingestion starts in `ingest_git_dag()`, `m_parse_task.commit_id` is updated with the resolved
+    `head_commit_id`, and `ingest_state.begin()` registers both `base_commit_id` and `worker_id` into `m_ingest_state`.
+  - **Completion & Unlocking Ordering**: When a version finishes, `finish_version_ingest()` validates lease validity before committing completion: if running as a secondary worker (`distributed_role == "worker"`), it verifies `m_parse_task` for `task_id = gp._active_task_id`, `worker_id = node_id`, `status = TASK_LEASED`, and `lease_expires_at > now`; if the lease expired or was revoked, completion aborts with `RuntimeError` before marking `INGEST_DONE`. In `finish_version_ingest()`, `ingest_state.set_status(..., INGEST_DONE)` and `_compact_checkpoint()` execute before `unlock_dependent_tasks()`, guaranteeing that dependent tasks are unlocked only after ancestor checkpoints are fully compacted. Next, on workers, `distributed.mark_task_done(db, task_id, commit_id, network_id, ref_name=ref_name, worker_id=node_id)` sets `status = TASK_DONE` (3), records `commit_id`, and invokes `unlock_dependent_tasks()`.
+  - **Heartbeat & Node Registration**: Background renewals via `NodeHeartbeatDaemon` and `update_node_heartbeat()` propagate node `role` and `network_id` across periodic updates. `NodeHeartbeatDaemon` synchronizes state changes using internal mutex locking, provides idempotent `start()`, joins gracefully on stop, and suppresses node re-insertion after shutdown.
+  - **Worker Base Preservation**: In secondary worker mode (`distributed_role == "worker"`), `gp.Old_VID` and `gp.Old_Version_Name` are initialized from the claimed task's `base_commit_id` and `base_ref_name`. `ingest_git_dag()` preserves these values across DAG ingestion (shifting `gp.Old_VID = gp.VID` only in non-worker mode when `_repair_base_set` is false), ensuring diff calculations and delta checkpoints anchor to the task's base.
+  - **Safe Dependency Unlocking**: In `unlock_dependent_tasks()`, matching requires a positive `base_commit_id > 0` or non-empty `base_ref_name`. When `base_ref_name` is None and querying `m_git_ref` by `commit_id`, it joins `m_repository` to filter by `repo.network_id = %s` and orders by `r.ref_type ASC LIMIT 1` (preferring tags over branch aliases). When `base_commit_id` is zero (unresolved base commit), matching evaluates strictly by `base_ref_name`. Matching tasks are assigned `base_commit_id = commit_id` and transitioned from `TASK_PENDING` (0) to `TASK_ELIGIBLE` (1).
+  - **Clean Termination Evaluation (`is_parsing_finished`)**: Workers evaluate all remaining `TASK_PENDING` tasks. If any task's prerequisite base is currently in progress (`TASK_PENDING`, `TASK_ELIGIBLE`, `TASK_LEASED`, `TASK_RECLAIMING`, or `m_ingest_state` is `INGEST_PARSING`), termination evaluates to `False`. If a prerequisite base is detected as already completed (`TASK_DONE` or `INGEST_DONE`), `unlock_dependent_tasks()` unblocks the dependent task and termination evaluates to `False`. Termination evaluates to `True` only when all pending tasks cannot be unblocked due to failed or missing bases.
+
+### 11.2. Concurrency Guarantees & ID Block Leasing
+- **Disjoint ID Blocks (`m_table_sequence`)**:
+  - `TableEngine._allocate_id()` dynamically leases primary-key blocks (50,000 for `m_ast` /
+    `m_blob_symbol_ref`, 10,000 for `m_tag` / `m_blob_symbol_def`, 1,000 for `m_file_blob` / `m_file_name` /
+    `m_commit`, 128 default) using atomic `INSERT INTO m_table_sequence ... ON DUPLICATE KEY UPDATE` initialization
+    followed by `SELECT next_id FROM m_table_sequence WHERE seq_table_id = %s FOR UPDATE` transactions.
+  - `reserve_id_block()` disables `autocommit` during sequence allocation, commits atomically, and restores original
+    autocommit state in a `finally` block. On deadlock or retryable database error, it retries up to 3 times before raising,
+    logging failures with `logger.warning`.
+  - Active blocks leased by a version run are recorded in `m_ingest_id_range(commit_id, marked_table_id,
+    start_id, end_id)`.
+  - During Git DAG ingestion (`ingest_git_dag`), new commits in `m_commit` and reference records in `m_git_ref`
+    atomically reserve their primary key IDs using `db.reserve_id_block(table, 1)` via `m_table_sequence`
+    whenever distributed mode (`G.distributed`) is enabled, preventing ID allocation collisions across concurrent workers.
+    Concurrent inserts into `m_git_ref` catch duplicate key collisions and recover the existing `ref_id`.
+  - During commit range ingestion (`_ingest_commit_range`), primary keys for `m_commit` and `m_maintainer_person`
+    are allocated in atomic blocks via `db.reserve_id_block(table, block_size, commit_id=...)` (1,000 for `m_commit`,
+    256 for `m_maintainer_person`) with per-table cursor tracking (`id_cursors` and `id_limits`) when distributed mode is enabled,
+    ensuring `gp.VID` does not carry over stale prior version IDs when leasing blocks.
+- **Active In-Progress Ingestion Protection**:
+  - `_previous_ingest()` checks `m_ingest_state` joined with `m_parse_node` (`s.worker_id != '' AND n.heartbeat_at >= now - 180`)
+    for versions in `INGEST_PARSING` status under distributed mode. When actively processed by a live peer worker node, the state
+    evaluates to `"in_progress"`, instructing `ingest_git_dag()` to preserve partial rows rather than executing an interrupted rollback.
+- **Negative Cache Poisoning Prevention**:
+  - In `table_engine/te_cached_db.py:_committed_nodup_id()`, misses (`row is None`) are cached in `_committed_nodup_keys`
+    only when distributed mode is disabled (`not self.distributed`). In distributed mode, negative misses are not retained
+    in-memory, ensuring that when a peer worker commits a new deduplicated row, subsequent queries on other worker nodes
+    read the record from MariaDB instead of permanently returning `None`.
+- **Atomic Blob & AST Hash Visibility**:
+  - `_tagged_blob_ids()` ignores blobs currently claimed by an active in-flight `INGEST_PARSING` run in
+    `m_ingest_blob`.
+  - Secondary indexing on `m_ingest_blob(blob_id)` enables high-performance lookups of active blob reservations.
+  - `m_ast_hash` commits are deferred until Step 7, ensuring peer nodes never link against an uncommitted AST
+    node from another machine.
+- **Checkpoint Pinning (`core/checkpoints.py`)**:
+  - `is_checkpoint_pinned()` prevents compacting an ancestor base checkpoint into a delta while a secondary
+    worker is actively using or scheduled to use it as `Old_VID`, checking both leased tasks in `m_parse_task`
+    by `base_commit_id`, matching `base_ref_name` via `m_git_ref` for active/pending tasks (`status IN (0, 1, 2)`),
+    and active runs in `m_ingest_state` recorded by `worker_id` and `base_commit_id`.
+
+### 11.3. Surgical Range-Isolated Crash Recovery
+- If any node (Master or Worker) crashes mid-version, `core/ingest_state.py:rollback_version()` uses
+  `fetch_id_ranges()` to execute range-bounded deletes (`DELETE FROM table WHERE pk BETWEEN start_id AND
+  end_id`) along with version-scoped rows and derived blob rows.
+- Universal Git registry entries (`m_file_name`, `m_file_blob`, `m_maintainer_person`, `m_commit`) are
+  preserved, ensuring concurrent peer nodes sharing paths, authors, or commits are never broken.
+- **Worker Crash Rollback Sequencing & Lease Validation**:
+  - In the worker loop, `check_lease_held()` verifies that the worker still holds an active, unexpired lease on its assigned task before calling `rollback_version()` and `mark_task_failed(..., worker_id=node_id)`. If the lease was lost or reclaimed by a peer, rollback is skipped, preventing an expired worker from deleting rows committed or actively written by another node.
+- **Atomic CAS Lease Reclamation & Dead Node Cleanup**:
+  - `distributed.reclaim_expired_leases()` purges dead nodes inactive for >24 hours (`heartbeat_at < now - 86400`)
+    from `m_parse_node`.
+  - When resolving `commit_id` from `m_git_ref` by `ref_name`, `reclaim_expired_leases()` joins `m_repository` to
+    scope the query by `repo.network_id = %s`.
+  - Tasks already in `TASK_RECLAIMING` whose reclaim lease is unexpired are strictly excluded from re-selection.
+  - For expired leased tasks, reclamation executes an atomic Compare-And-Swap update:
+    `UPDATE m_parse_task SET status = TASK_RECLAIMING, lease_expires_at = now + 300, worker_id = 'reclaiming', error_msg = 'Reclaiming expired lease' WHERE task_id = %s AND status = TASK_LEASED AND worker_id = %s AND (lease_expires_at <= %s OR %s = 1)`.
+  - Only when `cur.rowcount > 0` does reclamation proceed.
+  - If `m_ingest_state` indicates that the version was already completed (`INGEST_DONE`), rollback is skipped, the task transitions to `TASK_DONE`, and dependent tasks are unlocked.
+  - If `rollback_version()` raises an exception or returns `False`, the task is marked directly as `TASK_FAILED` with an unrecoverable error message and its dependents cascaded, preventing retry loops on corrupted tables. When rollback succeeds, `mark_task_failed(db, t_id, ..., worker_id="reclaiming")` atomically increments retries and re-enqueues as `TASK_ELIGIBLE` if retries remain.
+- **Atomic Multi-Level Failure Cascade**:
+  - `mark_task_failed(db, task_id, error_msg, worker_id=...)` executes an atomic conditional update:
+    `UPDATE m_parse_task SET retry_count = retry_count + 1, status = IF(retry_count + 1 >= 3, 4, 1), error_msg = %s, worker_id = '' WHERE task_id = %s AND status IN (2, 5) AND worker_id = %s`.
+  - Only when `cur.rowcount > 0` does the status change apply.
+  - When a task reaches `TASK_FAILED` (4), `_cascade_task_failure()` performs an iterative downstream cascade across all dependent tasks in `TASK_PENDING` and `TASK_ELIGIBLE` whose `base_commit_id` or `base_ref_name` connects to any failed version, transitioning each to `TASK_FAILED` until a fixed-point is reached.
+- **Active Heartbeat Exclusion for Backfill Safety**:
+  - `core/backfills.py:interrupted_ingests()` checks `m_ingest_state` joined with `m_parse_node`. Versions
+    with `INGEST_PARSING` assigned to an active worker whose heartbeat is within 180 seconds are treated as
+    in progress rather than interrupted, ensuring automatic backfills on the master node are not deferred
+    by concurrent actively running workers.
+
+## 12. Backfills of Derived Tables (`core/backfills.py`)
+
+New features consumed by `webapp/` that require database writes or source/commit parsing are pushed to the
+parser pipeline (`main.py`, `core/DBLayout.py`, `parser/`) rather than parsed or written inside `webapp/`,
+leaving an on-demand `"git"` fallback in `webapp/` only for revisions not yet parsed (`webapp/API.md` §2.5).
+Some tables hold data derived from what the parser already stored or can read from Git again. When such a
+table is added or re-keyed, the versions ingested before it get their rows from a backfill, run from the
+command line (`python3 main.py <flag>`, standalone or master role; the run exits afterwards):
+
+| Flag | Fills | Rule |
+|---|---|---|
+| `--backfill-maintainer-files [--from <ref>]` | `m_maintainer_file` (§4 row 19) | Walks the finished versions in ingestion order (`m_ingest_state.updated_at`), each against its `base_commit_id`, with Step 6.7's rule (`parser/maintainer_ast/MAINTAINER_API.md` §5): MAINTAINERS and the trees are read from Git. One commit per version; `--from` resumes at a version. |
+
+| `--repair-head-commit-files` | `m_commit_file` (§4 row 23) | Deletes the rows of finished version head commits that name a file the commit did not change (`git diff-tree --stdin -r --root --no-renames`); a merge head keeps none. Idempotent. |
+
+| `--backfill-facts [--families 1,2,3,4,5]` | `m_blob_facts` (§4 row 48) | The (path, blob) pairs of every finished version's checkpoint rows (read per version by primary key) with a fact family: one path per blob, each blob read from Git by SHA (the persistent `git cat-file --batch`), only the families it lacks in their current format (`facts_ingest.missing()`: the work list and the resume state), extracted by `parser.facts_workers` low-priority processes and stored as Step 6.9 does. |
+
+| `--backfill-commit-relations [--from-commit-id N]` | `m_commit_relation`, `m_commit_link` (§4 rows 63-64) | Parses the stored message of every commit (`m_commit`, all networks) in chunks of 5,000, abbreviated targets resolved against the selected repository once per chunk, `INSERT IGNORE`. The state row (`commit_id 0, kind 0`) records `next:<last id>` after each chunk and `done:<max id>` at the end; the next run resumes from it (`--from-commit-id` overrides). Runs automatically at start until the state says done (a new database is done at once); until then the webapp keeps its SQLite relation index. |
+
+| `--backfill-kbuild` | `m_kbuild_symbol` (§4 row 61) | The Makefile/Kbuild (path, blob) pairs of every finished version's checkpoint (read by primary key, restricted to those paths) without rows: each blob read from Git by SHA (`git cat-file --batch`) and parsed against its directory; also deletes the old `m_file_reference` rows of `ref_type` 3/4. Runs once automatically at start when the table is empty and the database holds finished versions. |
+
+| `--backfill-doc-references` | `m_file_reference` (§4 row 28) | Scans documentation files (`Documentation/**/*.rst`, `.txt`) across finished checkpoints using `DocReferenceScanner` (`parser/doc_parser.py`) for file paths and C symbol identifiers, staging cross-references of `ref_type = 5` (`Documentation`) into `m_file_reference`. |
+
+| `--backfill-cve-files` | `m_cve_file` (§4 row 65) | Populates affected source and header file paths for CVE records from parsed `m_cve.data`. |
+
+| `--backfill-mailing-list [--ml-range <range>]` | `m_commit_email` (§4 row 43) | Executes the 6-tier public-inbox resolution waterfall across the specified commit range (or `HEAD~100..HEAD`) via `standalone_resolve_mailing_list()`, populating `m_commit_email` with thread mappings, patch series numbers, and match tiers. |
+
+`--no-backfill` skips the automatic one-off backfills (run when their table is empty while the database holds
+finished versions, e.g. just after an upgrade added it).
+
+Every backfill follows the same rules (`backfills.guarded()`):
+- it never blocks parsing: a failure is logged and the run goes on;
+- it is skipped (logged) while any version ingestion is interrupted (`m_ingest_state` status 1), since that
+  version's rollback (§4.1) deletes rows the backfill would reference;
+- it is resumable: idempotent primary keys (`INSERT IGNORE`) or "rows still missing" as the state;
+- it logs its progress every 20 seconds (`backfills.Progress`).

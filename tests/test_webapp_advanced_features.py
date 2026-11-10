@@ -159,6 +159,7 @@ class TestWebappAdvancedFeatures(unittest.TestCase):
         self.assertTrue(cmds[0]["file"].endswith(".c"))
 
     def test_struct_layout_pahole(self) -> None:
+        require_indexed_ref("v3.0")
         res = get_struct_layout("v3.0", "task_struct")
         self.assertIn("total_size", res)
         self.assertIn("alignment", res)
@@ -197,6 +198,7 @@ class TestWebappAdvancedFeatures(unittest.TestCase):
         self.assertGreater(len(tree["children"]), 0)
 
     def test_function_callgraph(self) -> None:
+        require_indexed_ref("v3.0")
         res = get_function_callgraph("v3.0", "ext4_fill_super")
         self.assertEqual(res["function"], "ext4_fill_super")
         self.assertEqual(res["file_path"], "fs/ext4/super.c")

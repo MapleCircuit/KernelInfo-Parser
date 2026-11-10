@@ -6,6 +6,7 @@
  * (`state.branchTags`, §5.13), so its tag search holds the same releases as the Tag dropdown beside
  * it. The Compare view opens it unscoped: comparing two branches means reaching tags of both.
  */
+import { shortcuts } from "../utils/shortcuts.js";
 import { api } from "../api.js";
 import { state } from "../state.js";
 import { debounce } from "../utils/debounce.js";
@@ -221,3 +222,10 @@ class RefPicker {
 }
 
 export const refPicker = new RefPicker();
+
+// Keys of the revision picker's filter box (listed by the shortcut overlay, webapp/API.md §5.31)
+shortcuts.registerAll([
+  { id: "refpicker.move", keys: ["ArrowUp", "ArrowDown"], scope: "picker", docOnly: true, description: "Move through tags, branches and commits" },
+  { id: "refpicker.pick", keys: ["Enter"], scope: "picker", docOnly: true, description: "Select the highlighted revision" },
+  { id: "refpicker.close", keys: ["Escape"], scope: "picker", docOnly: true, description: "Close the picker" },
+]);

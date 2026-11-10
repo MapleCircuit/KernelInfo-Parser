@@ -1,0 +1,16 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Read",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$CLAUDE_PROJECT_DIR\"/.agents/scripts/pre_tool_guard.py",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}

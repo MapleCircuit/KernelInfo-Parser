@@ -195,6 +195,23 @@ class TestMaintainerParser(unittest.TestCase):
         self.assertEqual(len(sec2_excludes), 2)
         self.assertIn("net/ipv6/", sec2_excludes)
 
+    def test_parse_extended_tags(self) -> None:
+        raw = """FOO SUBSYSTEM
+M: Alice <alice@foo.org>
+S: Maintained
+Q: https://patchwork.kernel.org/project/foo/
+B: https://bugzilla.kernel.org/
+C: #foo:matrix.org
+F: drivers/foo/
+"""
+        sections = MaintainerParser(raw).parse()
+        self.assertEqual(len(sections), 1)
+        sec = sections[0]
+        self.assertEqual(sec.name, "FOO SUBSYSTEM")
+        self.assertEqual(sec.patchwork, "https://patchwork.kernel.org/project/foo/")
+        self.assertEqual(sec.bug_url, "https://bugzilla.kernel.org/")
+        self.assertEqual(sec.chat_channel, "#foo:matrix.org")
+
 
 class TestCreditsParser(unittest.TestCase):
     """Test CREDITS file text parsing and contributor profile extraction."""
@@ -296,6 +313,17 @@ class TestMaintainerMatcher(unittest.TestCase):
         self.assertIn("adilger.kernel@dilger.ca", maintainer_emails)
         reviewer_emails = [r["email"] for r in res[0]["reviewers"]]
         self.assertIn("jack@suse.cz", reviewer_emails)
+
+    def test_regex_pattern_matching(self) -> None:
+        """Verify N: pattern rules match regexes against candidate paths."""
+        sec = MaintainerSection(
+            name="JSON PARSER",
+            patterns=[PatternRule(PatternType.REGEX, r"\.json$")],
+        )
+        matcher = MaintainerMatcher([sec])
+        self.assertEqual([s.name for s in matcher.match_file("schema/config.json")], ["JSON PARSER"])
+        self.assertEqual(matcher.match_file("schema/config.json.bak"), [])
+        self.assertEqual(matcher.match_file("src/main.c"), [])
 
 
 class TestMaintainerAndCreditsIntegration(unittest.TestCase):
@@ -496,9 +524,9 @@ class TestMaintainerAndCreditsIntegration(unittest.TestCase):
             main.G.MF = FakeMF()
 
             # Seed section and symbol
-            sec_ext4 = G.TE.set(m_maintainer_section.table_id, (None, 1, "EXT4 FILE SYSTEM", "Maintained", "", "", "linux-ext4@vger.kernel.org", 1))
+            sec_ext4 = G.TE.set(m_maintainer_section.table_id, (None, 1, "EXT4 FILE SYSTEM", "Maintained", "", "", "linux-ext4@vger.kernel.org", 1, None, None, None, None))
             sec_ext4_id = sec_ext4[0]
-            sec_ipv6 = G.TE.set(m_maintainer_section.table_id, (None, 1, "IPV6 NETWORKING", "Maintained", "", "", "netdev@vger.kernel.org", 2))
+            sec_ipv6 = G.TE.set(m_maintainer_section.table_id, (None, 1, "IPV6 NETWORKING", "Maintained", "", "", "netdev@vger.kernel.org", 2, None, None, None, None))
             sec_ipv6_id = sec_ipv6[0]
 
             # Seed files
@@ -524,28 +552,33 @@ class TestMaintainerAndCreditsIntegration(unittest.TestCase):
 
             # Verify m_maintainer_file staging:
             # balloc.c and inode.c and core.c matched EXT4 FILE SYSTEM
-            sec_ext4_row = m_maintainer_section.get(None, None, "EXT4 FILE SYSTEM", None, None, None, None, None)
+            sec_ext4_row = m_maintainer_section.get(None, None, "EXT4 FILE SYSTEM", None, None, None, None, None, None, None, None, None)
             self.assertIsNotNone(sec_ext4_row)
             sec_ext4_id = sec_ext4_row[2][0]
 
-            sec_ipv6_row = m_maintainer_section.get(None, None, "IPV6 NETWORKING", None, None, None, None, None)
+            sec_ipv6_row = m_maintainer_section.get(None, None, "IPV6 NETWORKING", None, None, None, None, None, None, None, None, None)
             self.assertIsNotNone(sec_ipv6_row)
             sec_ipv6_id = sec_ipv6_row[2][0]
 
             maint_file_rows = G.TE.queued_set.get(m_maintainer_file.table_id, {})
-            self.assertIn((1, fn_ids["fs/ext4/balloc.c"], sec_ext4_id), maint_file_rows)
-            self.assertIn((1, fn_ids["fs/ext4/inode.c"], sec_ext4_id), maint_file_rows)
-            self.assertIn((1, fn_ids["fs/ext4/core.c"], sec_ext4_id), maint_file_rows)
-            self.assertIn((1, fn_ids["net/ipv6/ip6_output.c"], sec_ipv6_id), maint_file_rows)
+            self.assertIn((sec_ext4_id, fn_ids["fs/ext4/balloc.c"]), maint_file_rows)
+            self.assertIn((sec_ext4_id, fn_ids["fs/ext4/inode.c"]), maint_file_rows)
+            self.assertIn((sec_ext4_id, fn_ids["fs/ext4/core.c"]), maint_file_rows)
+            self.assertIn((sec_ipv6_id, fn_ids["net/ipv6/ip6_output.c"]), maint_file_rows)
 
             # 2. Run processing_kbuild
             processing_kbuild("v3.0")
 
-            # Verify the Makefile's build references (m_file_reference, ref_type 3 = Kbuild):
-            # ext4.o's members balloc.c / inode.c and core.o, all keyed by the Makefile's (blob 9, path)
-            refs = {(row[1], row[2], row[3], row[4]) for row in G.TE.queued_set.get(m_file_reference.table_id, {}).values()}
-            for name in ("fs/ext4/balloc.c", "fs/ext4/inode.c", "fs/ext4/core.c"):
-                self.assertIn((9, fn_ids["fs/ext4/Makefile"], fn_ids[name], 3), refs)
+            # Verify the Makefile's rules (m_kbuild_symbol): ext4.o's members balloc.c / inode.c and core.o,
+            # all keyed by the Makefile's (blob 9, path), with the symbol of their rule; no m_file_reference row
+            from core.DBLayout import m_kbuild_symbol
+            rules = {(row[0], row[1], row[10], row[3]) for row in G.TE.queued_set.get(m_kbuild_symbol.table_id, {}).values()}
+            mk = fn_ids["fs/ext4/Makefile"]
+            self.assertIn((9, mk, fn_ids["fs/ext4/balloc.c"], "EXT4_FS"), rules)
+            self.assertIn((9, mk, fn_ids["fs/ext4/inode.c"], "EXT4_FS"), rules)
+            self.assertIn((9, mk, fn_ids["fs/ext4/core.c"], "y"), rules)
+            kbuild_refs = [row for row in G.TE.queued_set.get(m_file_reference.table_id, {}).values() if row[4] in (3, 4)]
+            self.assertEqual(kbuild_refs, [])
         finally:
             if orig_mf is not None:
                 main.MF = orig_mf

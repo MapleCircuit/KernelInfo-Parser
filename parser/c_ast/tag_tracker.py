@@ -13,6 +13,7 @@ Provides:
 Prior tags are immutable content records under the Git DAG: nothing closes them.
 """
 from __future__ import annotations
+import bisect
 from typing import Any
 import logging
 from core.globalstuff import ASTT, OP_REF, REF_POS, REF_ROOT, compute_code_hash
@@ -42,6 +43,14 @@ NAMED_CONSTRUCT_TYPES = {
     int(ASTT.CPPro_define),
     int(ASTT.ASM_Macro),
     int(ASTT.ASM_Label),
+    int(ASTT.Rust_Fn),
+    int(ASTT.Rust_Struct),
+    int(ASTT.Rust_Enum),
+    int(ASTT.Rust_Union),
+    int(ASTT.Rust_Trait),
+    int(ASTT.Rust_TraitAlias),
+    int(ASTT.Rust_Mod),
+    int(ASTT.Rust_MacroDef),
 }
 
 
@@ -156,6 +165,11 @@ def get_prior_tags(CS: Any, with_indexes: bool = True, with_symbols: bool = True
                 CS.prior_unmatched_symbols.append((x, tag_id, ast_name, type_val, line_s, line_e))
 
         CS.prior_tags_by_pos.append((line_s, line_e, x, tag_id, ast_name, ast_type))
+
+    if CS.prior_tags_by_pos:
+        CS.prior_tags_by_pos.sort(key=lambda t: t[0])
+        CS._prior_tags_by_pos_sorted = True
+        CS.prior_tags_max_span = max((t[1] - t[0] for t in CS.prior_tags_by_pos), default=0)
 
 
 def check_exact_match(CS: Any, code_hash: bytes) -> int | None:
@@ -324,9 +338,22 @@ def match_prior_tag_transition(
     # =========================================================================
     by_pos = getattr(CS, "prior_tags_by_pos", [])
     if by_pos and (line_s > 0 or line_e > 0):
+        if not getattr(CS, "_prior_tags_by_pos_sorted", False):
+            by_pos.sort(key=lambda t: t[0])
+            CS._prior_tags_by_pos_sorted = True
+            CS.prior_tags_max_span = max((t[1] - t[0] for t in by_pos), default=0)
+
+        max_span = getattr(CS, "prior_tags_max_span", 0)
+        min_ls = min(line_s - 2, line_s - max_span)
+        max_ls = max(line_e, line_s + 2)
+
+        idx_left = bisect.bisect_left(by_pos, min_ls, key=lambda t: t[0])
+        idx_right = bisect.bisect_right(by_pos, max_ls, key=lambda t: t[0])
+
         best_match = None
         best_overlap = -1
-        for p_ls, p_le, idx, tag_id, p_name, p_type in by_pos:
+        for i in range(idx_left, idx_right):
+            p_ls, p_le, idx, tag_id, p_name, p_type = by_pos[i]
             if idx in active_set or idx in transitioned:
                 continue
             p_type_val = int(p_type) if p_type is not None else None

@@ -19,10 +19,17 @@ class CommitRole(IntEnum):
     OTHER = 12
 
     @classmethod
-    def from_trailer_prefix(cls, prefix: str) -> "CommitRole":
+    def from_trailer_prefix(cls, prefix: str | "CommitRole") -> "CommitRole":
         """Map git commit trailer tag prefix to CommitRole enum."""
-        p = prefix.strip().lower()
-        if "co-developed-by" in p:
+        if isinstance(prefix, cls):
+            return prefix
+        if not prefix:
+            return cls.OTHER
+        p_clean = str(prefix).strip().replace("-", "_").upper()
+        if p_clean in cls.__members__:
+            return cls[p_clean]
+        p = str(prefix).strip().lower()
+        if "co-developed-by" in p or "co-authored-by" in p or "originally-by" in p:
             return cls.CO_DEVELOPED_BY
         if "signed-off-by" in p:
             return cls.SIGNED_OFF_BY
@@ -30,17 +37,31 @@ class CommitRole(IntEnum):
             return cls.REVIEWED_BY
         if "acked-by" in p:
             return cls.ACKED_BY
-        if "tested-by" in p:
+        if "reported-and-tested-by" in p:
+            return cls.REPORTED_BY
+        if "tested-by" in p or "debugged-by" in p:
             return cls.TESTED_BY
         if "reported-by" in p:
             return cls.REPORTED_BY
-        if "suggested-by" in p:
+        if "suggested-by" in p or "fix-suggested-by" in p:
             return cls.SUGGESTED_BY
         if "merged-by" in p or "merger" in p:
             return cls.MERGED_BY
         if "requested-by" in p or "pull-from" in p:
             return cls.REQUESTED_BY
         return cls.OTHER
+
+    @classmethod
+    def roles_from_trailer_prefix(cls, prefix: str | "CommitRole") -> tuple["CommitRole", ...]:
+        """Return all CommitRole enum values corresponding to trailer prefix (e.g. compound trailers)."""
+        if isinstance(prefix, cls):
+            return (prefix,)
+        p = str(prefix).strip().lower()
+        if "reported-and-tested-by" in p:
+            return (cls.REPORTED_BY, cls.TESTED_BY)
+        if "reviewed-and-tested-by" in p:
+            return (cls.REVIEWED_BY, cls.TESTED_BY)
+        return (cls.from_trailer_prefix(prefix),)
 
 
 @dataclass(slots=True)
@@ -78,6 +99,8 @@ class GitCommit:
     merge_requester_email: str | None = None
     merged_branch: str | None = None
     merged_commits_summary: list[str] = field(default_factory=list)
+    fixes_commits: list[str] = field(default_factory=list)
+    reverted_commits: list[str] = field(default_factory=list)
 
 
 @dataclass(slots=True)

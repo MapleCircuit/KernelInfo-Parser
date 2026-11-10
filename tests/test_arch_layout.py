@@ -218,36 +218,118 @@ class TestArchLayout(unittest.TestCase):
         self.assertIsNone(path_arch("arch/Kconfig"))
 
 
+class TestLayoutReuse(unittest.TestCase):
+    """compute_layout_rows(): an ARCH whose recorded inputs replay against the next tree reuses its rows."""
+
+    @staticmethod
+    def run_tree(files: dict[str, str], memo=None):
+        from parser.arch_layout import compute_layout_rows
+        blobs = {p: str(hash(t)) for p, t in files.items()}
+        return compute_layout_rows(Tree(files), files.get, blobs.get, memo)
+
+    @staticmethod
+    def fresh(files: dict[str, str]):
+        from parser.arch_layout import compute_layouts, layout_rows
+        return {a: layout_rows(lay) for a, lay in compute_layouts(Tree(files), files.get).items()}
+
+    def test_unchanged_inputs_reuse_every_arch(self) -> None:
+        for tree in (OLD_TREE, NEW_TREE):
+            rows, memo, reused = self.run_tree(tree)
+            self.assertEqual((rows, reused), (self.fresh(tree), 0))
+            # A release bump of the top Makefile and an unrelated file changed: everything reused
+            bumped = {**tree, "Makefile": "VERSION = 9\nSUBLEVEL = 1\n" + tree["Makefile"], "include/linux/sched.h": "x"}
+            rows2, _memo, reused2 = self.run_tree(bumped, memo)
+            self.assertEqual(reused2, len(memo))
+            self.assertEqual(rows2, self.fresh(bumped))
+
+    def test_a_changed_input_recomputes_that_arch(self) -> None:
+        rows, memo, _ = self.run_tree(OLD_TREE)
+        changed = {**OLD_TREE, "arch/um/Makefile": OLD_TREE["arch/um/Makefile"].replace("-I$(srctree)/$(ARCH_DIR)/include", "-I$(srctree)/$(ARCH_DIR)/inc2")}
+        changed["arch/um/inc2/user.h"] = ""
+        rows2, _memo, reused = self.run_tree(changed, memo)
+        self.assertEqual(reused, len(memo) - 1)          # only um is evaluated again
+        self.assertEqual(rows2, self.fresh(changed))
+        self.assertNotEqual(rows2["um"], rows["um"])
+
+    def test_a_changed_tree_answer_recomputes(self) -> None:
+        rows, memo, _ = self.run_tree(OLD_TREE)
+        # The um include directory disappears: an is_dir answer of um's trace changes
+        gone = {k: v for k, v in OLD_TREE.items() if not k.startswith("arch/um/include/")}
+        rows2, _memo, reused = self.run_tree(gone, memo)
+        self.assertLess(reused, len(memo))
+        self.assertEqual(rows2, self.fresh(gone))
+
+    def test_listing_the_tree_is_not_replayable(self) -> None:
+        from parser.arch_layout import InputTrace
+        trace = InputTrace(Tree(OLD_TREE), OLD_TREE.get, lambda p: None)
+        _ = trace.dirs
+        self.assertFalse(trace.replays(Tree(OLD_TREE), lambda p: None))
+
+
 class TestStoredLayouts(unittest.TestCase):
     def test_step_6_8_replaces_the_version_rows(self) -> None:
-        """main.processing_arch_layouts(): rows of every ARCH for the head commit, previous rows replaced."""
+        """main.processing_arch_layouts(): one m_arch_root row per ARCH of the head commit, pointing at a layout
+        stored once (m_arch_layout by digest, its rows in m_arch_layout_entry); previous rows replaced."""
         from contextlib import contextmanager
         from unittest.mock import MagicMock, patch
 
         import main
+        from parser.arch_layout import layout_digest
 
+        known: dict[bytes, int] = {}
         log: list = []
-        cursor = MagicMock()
-        cursor.execute.side_effect = lambda sql, params=(): log.append((sql.split()[0], params))
-        cursor.executemany.side_effect = lambda sql, rows: log.append(("INSERT", list(rows)))
-        db = MagicMock()
-        db.cnx.cursor.return_value = cursor
+
+        class FakeDB:
+            lastrowid = 0
+
+            def __init__(self):
+                self.commit = MagicMock()
+
+            def execute(self, sql, params=()):
+                log.append((sql.split()[0] + " " + sql.split()[2], params))
+                if sql.startswith("INSERT INTO m_arch_layout "):
+                    FakeDB.lastrowid = len(known) + 1
+                    known[params[0]] = FakeDB.lastrowid
+
+            def executemany(self, sql, rows):
+                log.append(("INSERT entries", list(rows)))
+
+            def query(self, sql, params=(), dictionary=False):
+                return []
+
+            def query_one(self, sql, params=(), dictionary=False):
+                if sql.startswith("SELECT layout_id FROM m_arch_layout"):
+                    return (known[params[0]],) if params[0] in known else None
+                return None
+
+        db = FakeDB()
 
         @contextmanager
         def fake_db():
             yield db
 
-        with patch.object(main.gp, "VID", 7), patch.object(main.gp, "Version_Name", "v2.6.12"), \
-             patch.object(main.gp, "file_blob_hashes", dict.fromkeys(OLD_TREE, b"\0" * 20), create=True), \
-             patch.object(main.MF, "get_file", side_effect=lambda path, version: OLD_TREE[path]), \
-             patch.object(main.G, "DB", fake_db):
-            stored = main.processing_arch_layouts("v2.6.12")
-        self.assertEqual(log[0], ("DELETE", (7,)))
-        rows = log[1][1]
-        self.assertEqual(stored, len(rows))
-        self.assertIn((7, "x86_64", ROLE_LINK, 0, "include/asm/", "include/asm-x86_64/"), rows)
-        self.assertEqual({r[1] for r in rows}, {"i386", "um", "x86_64"})
-        db.cnx.commit.assert_called_once()
+        def run():
+            log.clear()
+            with patch.object(main.gp, "VID", 7), patch.object(main.gp, "Version_Name", "v2.6.12"), \
+                 patch.object(main.gp, "file_blob_hashes", dict.fromkeys(OLD_TREE, b"\0" * 20), create=True), \
+                 patch.object(main.MF, "get_file", side_effect=lambda path, version: OLD_TREE[path]), \
+                 patch.object(main.G, "DB", fake_db):
+                return main.processing_arch_layouts("v2.6.12")
+
+        stored = run()
+        self.assertEqual(log[0], ("DELETE m_arch_root", (7,)))
+        entries = [r for kind, rows in log if kind == "INSERT entries" for r in rows]
+        self.assertEqual(stored, len(entries))
+        roots = [params for kind, params in log if kind == "INSERT m_arch_root"]
+        self.assertEqual({r[1] for r in roots}, {"i386", "um", "x86_64"})
+        x86 = next(r[2] for r in roots if r[1] == "x86_64")
+        self.assertIn((x86, ROLE_LINK, 0, "include/asm/", "include/asm-x86_64/"), entries)
+        self.assertEqual(len(known), 3, "one layout per ARCH")
+        self.assertEqual(layout_digest([(1, 0, "a/", "")]), layout_digest([(1, 0, "a/", ""), (1, 0, "a/", "")]))
+        # The next version with the same Makefiles: the layouts exist, only m_arch_root is written
+        self.assertEqual(run(), 0)
+        self.assertEqual([kind for kind, _ in log if kind.startswith("INSERT")], ["INSERT m_arch_root"] * 3)
+        self.assertEqual(db.commit.call_count, 2)
 
 
 REPO = Path(__file__).resolve().parent.parent / "repos" / "linux"

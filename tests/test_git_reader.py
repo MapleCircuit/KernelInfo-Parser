@@ -147,7 +147,10 @@ class TestGitBlameService(unittest.TestCase):
         self.assertEqual([e["line"] for e in res["lines"]], list(range(1, len(res["lines"]) + 1)))
 
         for entry in res["lines"]:
-            self.assertEqual(set(entry), {"line", "commit_hash", "author_name", "author_email", "date", "subject"})
+            # orig_line / source_path come from the porcelain header (H9, webapp/API.md section 4.6); previous_sha /
+            # previous_path only when the blamed commit has a parent
+            required = {"line", "commit_hash", "author_name", "author_email", "date", "subject", "orig_line", "source_path"}
+            self.assertEqual(set(entry) - {"previous_sha", "previous_path"}, required)
             # --porcelain names a commit's author once; every later line of it still carries it
             self.assertNotEqual(entry["author_name"], "Unknown")
             self.assertGreater(entry["date"], 0)

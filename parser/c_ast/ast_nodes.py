@@ -12,6 +12,7 @@ from typing import Any
 from core.globalstuff import G, ASTT, OP_REF, REF_POS, REF_NO_REF, REF_FILE, SymbolRole, SymbolLinkage, compute_code_hash, normalize_repo_path
 from core.DBLayout import (
     m_ast,
+    m_ast_attribute,
     m_ast_container,
     m_ast_include,
     m_ast_debug,
@@ -21,6 +22,7 @@ from core.DBLayout import (
 from core.SymbolRows import (
     flush_pending_refs as flush_pending_symbol_refs,
     record_def as record_symbol_def,
+    record_ref as record_symbol_ref,
     register_tag as register_symbol_tag,
 )
 from parser.c_ast.tokenizer import AST_KIND, Line
@@ -169,14 +171,25 @@ class Ast:
                 if G.OVERRIDE_FORCE_AST_DEBUG:
                     self.ast_debug(CS, ast_id_route)
                 tag_ref = self.tag(CS, ast_id_route, extent or self.extent, ast_name=safe_name, ast_type=type_id)
-                if type_id in {ASTT.ASM_Label, ASTT.ASM_Macro, ASTT.C_LabelStmt, ASTT.CPPro_define, ASTT.CPPro_define_macro} and safe_name:
+                if (
+                    type_id in {ASTT.ASM_Label, ASTT.ASM_Macro, ASTT.C_LabelStmt, ASTT.CPPro_define, ASTT.CPPro_define_macro}
+                    and safe_name
+                    and not safe_name.isdigit()
+                    and not getattr(self, "is_numeric", False)
+                ):
                     if hasattr(CS, "symbol_dict"):
                         CS.symbol_dict[(safe_name, type_id)] = ast_id_route[1]
                         if type_id in (ASTT.CPPro_define, ASTT.CPPro_define_macro):
                             CS.symbol_dict[(safe_name, ASTT.CPPro_define)] = ast_id_route[1]
                             CS.symbol_dict[(safe_name, ASTT.CPPro_define_macro)] = ast_id_route[1]
                     ext = extent or self.extent
-                    linkage = int(SymbolLinkage.MacroOrKernelDef) if type_id in (ASTT.CPPro_define, ASTT.CPPro_define_macro, ASTT.ASM_Macro) else int(SymbolLinkage.InternalStaticDef)
+                    def_linkage = getattr(self, "linkage", None)
+                    if def_linkage is not None:
+                        linkage = int(def_linkage)
+                    elif type_id in (ASTT.CPPro_define, ASTT.CPPro_define_macro, ASTT.ASM_Macro):
+                        linkage = int(SymbolLinkage.MacroOrKernelDef)
+                    else:
+                        linkage = int(SymbolLinkage.InternalStaticDef)
                     with CS(REF_POS):
                         record_symbol_def(
                             CS,
@@ -317,15 +330,16 @@ class Ast_Comment(Ast):
 class Ast_ASM_Comment(Ast):
     """Assembly Source Comment."""
 
-    def __init__(self, extent: Line | None = None) -> None:
+    def __init__(self, extent: Line | None = None, comment: str = "") -> None:
         super().__init__(extent, End_Mode.Extent)
         self.type_id = ASTT.ASM_Comment
+        self.comment = comment
 
     def extract(self, CS: Any, create_tag: bool = True) -> None:
         parser_obj = CS.parsers.get("C_AM") or CS.parsers.get("ASM_AM")
         if parser_obj and hasattr(parser_obj, "rawfile"):
             self.extent.cc(parser_obj.rawfile)
-        self.extract_1arg(CS, ASTT.ASM_Comment, self.extent.code[:255], self.extent, create_tag=create_tag)
+        self.extract_1arg(CS, ASTT.ASM_Comment, self.comment[:255] or self.extent.code[:255], self.extent, create_tag=create_tag)
 
 
 # --- Assembly Directives and Instructions ---
@@ -337,6 +351,29 @@ class Ast_ASM_Directive(Ast):
         super().__init__(extent, End_Mode.No_Check)
         self.type_id = ASTT.ASM_Directive
         self.payload = payload
+
+    def within_range(self, token: Any, ast_kind: int) -> bool:
+        if not self.need_processing:
+            return False
+        if ast_kind == AST_KIND.comment:
+            return False
+        t_line = token.line.line_pos[0]
+        cur_line = self.extent.line_pos[1]
+        if t_line <= cur_line:
+            self.extent.grow(token.line)
+            return True
+        rawfile = getattr(G, "CURRENT_RAWFILE", None)
+        if rawfile:
+            all_continued = True
+            for l in range(cur_line - 1, t_line - 1):
+                if not (0 <= l < len(rawfile) and rawfile[l].rstrip().endswith("\\")):
+                    all_continued = False
+                    break
+            if all_continued:
+                self.extent.grow(token.line)
+                return True
+        self.need_processing = False
+        return False
 
     def extract(self, CS: Any, create_tag: bool = True) -> None:
         parser_obj = CS.parsers.get("C_AM") or CS.parsers.get("ASM_AM")
@@ -354,11 +391,67 @@ class Ast_ASM_Macro(Ast):
         self.type_id = ASTT.ASM_Macro
         self.name = name
 
+    def within_range(self, token: Any, ast_kind: int) -> bool:
+        if not self.need_processing:
+            return False
+        if token.spelling_str == "endm":
+            self.extent.grow(token.line)
+            self.need_processing = False
+            return True
+        self.extent.grow(token.line)
+        return True
+
     def extract(self, CS: Any, create_tag: bool = True) -> None:
         parser_obj = CS.parsers.get("C_AM") or CS.parsers.get("ASM_AM")
         if parser_obj and hasattr(parser_obj, "rawfile"):
             self.extent.cc(parser_obj.rawfile)
-        self.extract_1arg(CS, ASTT.ASM_Macro, self.name[:255], self.extent, create_tag=create_tag)
+        self.extract_1arg(CS, ASTT.ASM_Macro, self.name[:255] or self.extent.code[:255], self.extent, create_tag=create_tag)
+
+
+_ASM_BRANCH_MNEMONICS = frozenset({
+    # x86
+    "call", "callq", "jmp", "jmpq", "je", "jne", "jz", "jnz", "ja", "jb", "jae", "jbe",
+    "jg", "jge", "jl", "jle", "js", "jns", "jc", "jnc", "jo", "jno", "jp", "jnp", "loop", "loope", "loopne",
+    # ARM & ARM64
+    "b", "bl", "bx", "blx", "blr", "br", "cbz", "cbnz", "tbz", "tbnz",
+    "b.eq", "b.ne", "b.cs", "b.cc", "b.mi", "b.pl", "b.vs", "b.vc", "b.hi", "b.ls", "b.ge", "b.lt", "b.gt", "b.le", "b.al",
+    # RISC-V
+    "jal", "jalr", "j", "call", "jump", "tail", "beq", "bne", "blt", "bge", "bltu", "bgeu",
+    "beqz", "bnez", "blez", "bgez", "bltz", "bgtz",
+    # PowerPC
+    "bctrl", "bal", "ba", "bla", "bdnz", "bdz", "bclr", "bcctr",
+    # MIPS
+    "bal", "jal", "jalr", "jr", "bgez", "bgtz", "blez", "bltz",
+    # s390
+    "bras", "brasl", "brc", "brcl", "jg", "jgn", "jge", "jgl", "jgh", "jgle", "jhe", "jnl", "jh",
+    # SPARC
+    "ba", "bn", "bne", "be", "bg", "ble", "bge", "bl", "bgu", "bleu",
+    # LoongArch
+    "jirl", "bceqz", "bcnez",
+})
+
+_ASM_REGISTER_NAMES = frozenset({
+    # x86 general-purpose & control registers
+    "rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "rsp",
+    "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15",
+    "eax", "ebx", "ecx", "edx", "esi", "edi", "ebp", "esp",
+    "ax", "bx", "cx", "dx", "al", "bl", "cl", "dl", "ah", "bh", "ch", "dh",
+    "cr0", "cr1", "cr2", "cr3", "cr4", "cr8", "dr0", "dr1", "dr2", "dr3", "dr6", "dr7", "rip",
+    # ARM / ARM64
+    *(f"r{i}" for i in range(32)),
+    *(f"x{i}" for i in range(32)),
+    *(f"w{i}" for i in range(32)),
+    "sp", "lr", "pc", "xzr", "wzr",
+    # RISC-V
+    "zero", "ra", "gp", "tp", "t0", "t1", "t2", "t3", "t4", "t5", "t6",
+    "s0", "s1", "s2", "s3", "s4", "s5", "s6", "s7", "s8", "s9", "s10", "s11",
+    "a0", "a1", "a2", "a3", "a4", "a5", "a6", "a7",
+    # PowerPC
+    *(f"f{i}" for i in range(32)),
+    "ctr", "xer", "cr",
+    # MIPS
+    "at", "v0", "v1", "k0", "k1", "fp",
+})
 
 
 class Ast_ASM_Instruction(Ast):
@@ -368,6 +461,33 @@ class Ast_ASM_Instruction(Ast):
         super().__init__(extent, End_Mode.No_Check)
         self.type_id = ASTT.ASM_Instruction
         self.mnemonic = mnemonic
+        self.operands: list[str] = []
+
+    def within_range(self, token: Any, ast_kind: int) -> bool:
+        if not self.need_processing:
+            return False
+        if ast_kind == AST_KIND.comment:
+            return False
+        t_line = token.line.line_pos[0]
+        cur_line = self.extent.line_pos[1]
+        if t_line <= cur_line:
+            self.extent.grow(token.line)
+            return True
+        rawfile = getattr(G, "CURRENT_RAWFILE", None)
+        if rawfile:
+            all_continued = True
+            for l in range(cur_line - 1, t_line - 1):
+                if not (0 <= l < len(rawfile) and rawfile[l].rstrip().endswith("\\")):
+                    all_continued = False
+                    break
+            if all_continued:
+                self.extent.grow(token.line)
+                return True
+        self.need_processing = False
+        return False
+
+    def exec_identifier(self, token: Any, cursor: Any) -> None:
+        self.operands.append(token.spelling_str)
 
     def extract(self, CS: Any, create_tag: bool = True) -> None:
         parser_obj = CS.parsers.get("C_AM") or CS.parsers.get("ASM_AM")
@@ -375,17 +495,42 @@ class Ast_ASM_Instruction(Ast):
             self.extent.cc(parser_obj.rawfile)
         name = self.mnemonic or self.extent.code
         self.extract_1arg(CS, ASTT.ASM_Instruction, name[:255], self.extent, create_tag=create_tag)
+        if self.mnemonic.lower() in _ASM_BRANCH_MNEMONICS and self.operands:
+            for op in self.operands:
+                op_lower = op.lower()
+                if not op.isidentifier():
+                    continue
+                if op_lower in _ASM_REGISTER_NAMES:
+                    continue
+                if op.startswith("L") or op.startswith(".L"):
+                    continue
+                if op.isdigit() or (op[:-1].isdigit() and op[-1].lower() in ("f", "b")):
+                    continue
+                tag_ref = getattr(self, "tag_ref", 0)
+                if tag_ref:
+                    with CS(REF_POS):
+                        CS.store(m_ast.view(((m_ast.ast_id,),), None, str(op)[:255], int(ASTT.ASM_Instruction)))
+                        callee_route = CS.get_route_parse()
+                    callee_ast_ref = CS.ref(m_ast.ast_id, *callee_route)
+                    with CS(REF_POS):
+                        record_symbol_ref(CS, tag_ref, callee_ast_ref, 0, int(SymbolRole.Call), self.extent.line_pos[0], self.extent.char_pos[0])
 
 
 class Ast_ASM_Label(Ast):
     """Assembly Jump / Function Label."""
 
-    def __init__(self, extent: Line | None = None, label: str = "") -> None:
+    def __init__(self, extent: Line | None = None, label: str = "", linkage: Any = None, is_numeric: bool = False) -> None:
         super().__init__(extent, End_Mode.No_Check)
         self.type_id = ASTT.ASM_Label
         self.label = label
+        self.linkage = linkage
+        self.is_numeric = is_numeric
+        self.need_processing = False
 
     def extract(self, CS: Any, create_tag: bool = True) -> None:
+        parser_obj = CS.parsers.get("C_AM") or CS.parsers.get("ASM_AM")
+        if parser_obj and hasattr(parser_obj, "rawfile"):
+            self.extent.cc(parser_obj.rawfile)
         self.extract_1arg(CS, ASTT.ASM_Label, self.label[:255], self.extent, create_tag=create_tag)
 
 
@@ -531,17 +676,23 @@ class CPPro_if(CPPro):
         self.expression = ""
         self.type_id = ASTT.CPPro_if
 
+    def _append_tok(self, spelling: str) -> None:
+        if self.expression and (self.expression[-1].isalnum() or self.expression[-1] == '_') and (spelling and (spelling[0].isalnum() or spelling[0] == '_')):
+            self.expression += " " + spelling
+        else:
+            self.expression += spelling
+
     def exec_punctuation(self, token: Any, cursor: Any) -> None:
-        self.expression += token.spelling_str
+        self._append_tok(token.spelling_str)
 
     def exec_keyword(self, token: Any, cursor: Any) -> None:
-        self.expression += token.spelling_str
+        self._append_tok(token.spelling_str)
 
     def exec_identifier(self, token: Any, cursor: Any) -> None:
-        self.expression += token.spelling_str
+        self._append_tok(token.spelling_str)
 
     def exec_literal(self, token: Any, cursor: Any) -> None:
-        self.expression += token.spelling_str
+        self._append_tok(token.spelling_str)
 
     def extract(self, CS: Any, create_tag: bool = True) -> None:
         self.extract_1arg(CS, ASTT.CPPro_if, self.expression[:255], self.extent, create_tag=create_tag)
@@ -559,17 +710,23 @@ class CPPro_elif(CPPro):
         self.expression = ""
         self.type_id = ASTT.CPPro_elif
 
+    def _append_tok(self, spelling: str) -> None:
+        if self.expression and (self.expression[-1].isalnum() or self.expression[-1] == '_') and (spelling and (spelling[0].isalnum() or spelling[0] == '_')):
+            self.expression += " " + spelling
+        else:
+            self.expression += spelling
+
     def exec_punctuation(self, token: Any, cursor: Any) -> None:
-        self.expression += token.spelling_str
+        self._append_tok(token.spelling_str)
 
     def exec_keyword(self, token: Any, cursor: Any) -> None:
-        self.expression += token.spelling_str
+        self._append_tok(token.spelling_str)
 
     def exec_identifier(self, token: Any, cursor: Any) -> None:
-        self.expression += token.spelling_str
+        self._append_tok(token.spelling_str)
 
     def exec_literal(self, token: Any, cursor: Any) -> None:
-        self.expression += token.spelling_str
+        self._append_tok(token.spelling_str)
 
     def extract(self, CS: Any, create_tag: bool = True) -> None:
         self.extract_1arg(CS, ASTT.CPPro_elif, self.expression[:255], self.extent, create_tag=create_tag)
@@ -812,6 +969,19 @@ class CPPro_define(CPPro):
                 ast_id_route = CS.get_route_parse()
 
         self.ast_ref = CS.ref(m_ast.ast_id, *ast_id_route)
+        if self.replacement:
+            with CS(REF_POS):
+                CS.store(m_ast_attribute.set(self.ast_ref, 0, "replacement", str(self.replacement)[:255]))
+            import re
+            words = set(re.findall(r"\b[A-Za-z_][A-Za-z0-9_]*\b", self.replacement))
+            ignored = set(self.func_args) | {self.identifier, "defined", "sizeof", "typeof", "__typeof__"}
+            tag_ref = getattr(self, "tag_ref", 0)
+            if tag_ref:
+                for w in words:
+                    if w not in ignored:
+                        with CS(REF_POS):
+                            record_symbol_ref(CS, tag_ref, w, 0, int(SymbolRole.MacroExpansion), self.extent.line_pos[0], self.extent.char_pos[0])
+
         if create_tag:
             with CS(REF_NO_REF):
                 if G.OVERRIDE_FORCE_AST_DEBUG:

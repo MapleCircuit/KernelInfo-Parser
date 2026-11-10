@@ -86,9 +86,13 @@ def seeded() -> MemoryDB:
     db.add("m_blob_symbol_def", 1, 1, 1, 1, "schedule", 1, 0, 1, 5)
     db.add("m_blob_symbol_def", 12, 3, 1, 1, "schedule", 1, 0, 1, 5)
     db.add("m_ingest_state", 1, 10, I.INGEST_PARSING, 0)
-    db.add("m_arch_root", 5, "x86_64", 2, 0, "include/", "")
-    db.add("m_arch_root", 10, "x86_64", 2, 0, "include/", "")   # the interrupted version's layout
-    db.add("m_arch_root", 11, "x86_64", 2, 0, "include/", "")
+    db.add("m_arch_layout", 1, b"L" * 16)
+    db.add("m_arch_layout", 11, b"N" * 16)                       # a layout the run created
+    db.add("m_arch_layout_entry", 1, 2, 0, "include/", "")
+    db.add("m_arch_layout_entry", 11, 2, 0, "include2/", "")
+    db.add("m_arch_root", 5, "x86_64", 1)
+    db.add("m_arch_root", 10, "x86_64", 1)    # the interrupted version's layout (an older, shared one)
+    db.add("m_arch_root", 11, "x86_64", 11)
     return db
 
 
@@ -131,6 +135,8 @@ class TestRollbackPlan(unittest.TestCase):
         # The version's checkpoint and the re-parsed blob's partial rows too
         self.assertEqual([r["commit_id"] for r in rows["m_bridge_checkpoint"]], [5])
         self.assertEqual([r["commit_id"] for r in rows["m_arch_root"]], [5])
+        self.assertEqual([r["layout_id"] for r in rows["m_arch_layout"]], [1], "the run's new layout goes, the shared one stays")
+        self.assertEqual([r["layout_id"] for r in rows["m_arch_layout_entry"]], [1])
         self.assertEqual([r["blob_id"] for r in rows["m_bridge_tag"]], [1])
         self.assertEqual(rows["m_symbol_own"], [])
         self.assertEqual([r["def_id"] for r in rows["m_blob_symbol_def"]], [1])
@@ -182,6 +188,26 @@ class FakeCnx:
         self.log: list = []
         self.results = results or {}
         self.commits = 0
+
+    def query(self, sql: str, params=(), dictionary: bool = True) -> list:
+        cur = self.cursor()
+        cur.execute(sql, params)
+        return cur.fetchall()
+
+    def query_one(self, sql: str, params=(), dictionary: bool = True):
+        cur = self.cursor()
+        cur.execute(sql, params)
+        return cur.fetchone()
+
+    def execute(self, sql: str, params=()) -> int:
+        cur = self.cursor()
+        cur.execute(sql, params)
+        return cur.rowcount
+
+    def executemany(self, sql: str, rows) -> int:
+        cur = self.cursor()
+        cur.executemany(sql, rows)
+        return len(rows)
 
     def cursor(self) -> FakeCursor:
         return FakeCursor(self.log, self.results)

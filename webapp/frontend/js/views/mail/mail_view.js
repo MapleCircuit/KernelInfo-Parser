@@ -7,6 +7,8 @@
  * The left column switches between two modes: archive search, and a reply tree of the
  * active thread with a revision picker for multi-version patch series.
  */
+import { mergedListHtml, mergedSummary } from "./merged_render.js";
+import { pickAndTry, seriesMessages } from "./patch_try.js";
 import { api } from "../../api.js";
 import { state } from "../../state.js";
 import { debounce } from "../../utils/debounce.js";
@@ -18,7 +20,7 @@ import { COLLAPSE_ICON } from "../../utils/icons.js";
 const STATUS_COLORS = {
   A: "var(--accent-green)",
   D: "var(--accent-red)",
-  R: "#d2a8ff",
+  R: "var(--diff-rename-fg)",
   M: "var(--accent-yellow)",
 };
 
@@ -874,7 +876,11 @@ export class MailView {
             <span><strong>${participants.length}</strong> contributor${participants.length === 1 ? '' : 's'}</span>
             <span>·</span>
             <a href="${escapeHtml(threadData.lore_url || (LORE_BASE_URL + 't/' + (threadData.tid || 0)))}" target="_blank" rel="noopener noreferrer" class="lore-link">lore.kernelinfo.org ↗</a>
+            <span>·</span>
+            <span class="mail-merged-badge pending" id="mail-merged-badge" title="Looking for the commits this thread became">Merged: …</span>
+            ${seriesMessages(messages).some((m) => m.is_patch) ? `<span>·</span><button class="code-btn mail-try-series" type="button" title="Apply the newest version of this series to a revision, in memory">Try the series…</button>` : ""}
           </div>
+          <div class="mail-merged-list" id="mail-merged-list" hidden></div>
         </div>
 
         <!-- Messages Conversation Cards -->
@@ -882,6 +888,14 @@ export class MailView {
       </div>
     `;
 
+    const trySeries = container.querySelector(".mail-try-series");
+    if (trySeries) {
+      trySeries.onclick = () => {
+        const series = seriesMessages(messages);
+        const v = Math.max(...series.map((m) => m.patch_version || 1));
+        pickAndTry(trySeries, series.map((m) => m.message_id), `Series${v > 1 ? ` v${v}` : ""} (${series.filter((m) => m.is_patch && !m.is_cover).length} patches)`);
+      };
+    }
     const cardsContainer = container.querySelector("#mail-cards-list");
     let targetCardEl = null;
     messages.forEach((m, idx) => {
@@ -899,6 +913,67 @@ export class MailView {
         targetCardEl.scrollIntoView({ behavior: "smooth", block: "start" });
       }, 50);
     }
+    this.loadMergedState(container, threadData, messages[targetIdx]?.message_id || targetMid);
+  }
+
+  /** "Merged k/N · v3.1" for the thread, and "Merged as <sha>" on its patches (P2). */
+  async loadMergedState(container, threadData, mid) {
+    const badge = container.querySelector("#mail-merged-badge");
+    const list = container.querySelector("#mail-merged-list");
+    if (!badge) return;
+    let res;
+    try {
+      res = await api.getMergedCommits({ tid: threadData.tid || 0, mid: threadData.tid ? "" : mid });
+    } catch (err) {
+      if (badge.isConnected) {
+        badge.className = "mail-merged-badge unknown";
+        badge.textContent = "Merged: unknown";
+        badge.title = err.message;
+      }
+      return;
+    }
+    if (!badge.isConnected) return;
+    const view = mergedSummary(res);
+    badge.className = `mail-merged-badge ${view.cls}`;
+    badge.textContent = view.label;
+    badge.title = view.title;
+    if (!res?.commits?.length) return;
+    badge.style.cursor = "pointer";
+    list.innerHTML = mergedListHtml(res);
+    badge.onclick = () => { list.hidden = !list.hidden; };
+    const openCommit = (hash, forceNew) => state.openTab({ type: "commits", title: `Commit ${hash.slice(0, 7)}`, commitId: hash, listCollapsed: true, forceNew });
+    list.addEventListener("click", (e) => {
+      const a = e.target.closest("[data-commit]");
+      if (!a) return;
+      e.preventDefault();
+      openCommit(a.dataset.commit, e.ctrlKey || e.metaKey);
+    });
+    list.addEventListener("auxclick", (e) => {
+      const a = e.target.closest("[data-commit]");
+      if (!a || e.button !== 1) return;
+      e.preventDefault();
+      openCommit(a.dataset.commit, true);
+    });
+    // Message cards of patches that landed
+    const byMid = new Map(res.commits.filter((c) => c.message_id).map((c) => [normalizeMid(c.message_id), c]));
+    container.querySelectorAll(".mail-card[data-mid]").forEach((card) => {
+      const c = byMid.get(normalizeMid(card.dataset.mid));
+      if (!c || card.querySelector(".mail-merged-as")) return;
+      const holder = card.querySelector(".mail-card-actions");
+      if (!holder) return;
+      const el = document.createElement("a");
+      el.href = "#";
+      el.className = "mail-merged-as";
+      el.dataset.commit = c.hash;
+      el.textContent = `Merged as ${c.hash.slice(0, 12)}`;
+      el.title = `${c.subject}${c.released?.released ? ` — first in ${c.released.first_release || c.released.first_tag}` : ""}`;
+      el.onclick = (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        openCommit(c.hash, e.ctrlKey || e.metaKey);
+      };
+      holder.prepend(el);
+    });
   }
 
   createMessageCard(msgSummary, startExpanded = false) {
@@ -946,6 +1021,7 @@ export class MailView {
             </div>
             <button class="code-btn mail-action-btn" data-act="copy" title="Copy RFC-822 payload to clipboard">📋 Copy</button>
             <button class="code-btn mail-action-btn" data-act="download" title="Download message as .eml / .patch">⬇ Download</button>
+            ${msgSummary.is_patch && !/^\s*re\s*:/i.test(msgSummary.subject || "") ? `<button class="code-btn mail-action-btn" data-act="try" title="Apply this patch to a revision, in memory">Try on revision…</button>` : ""}
             <a href="${LORE_BASE_URL}${encodeURIComponent(msgSummary.message_id)}/" target="_blank" class="lore-link" title="Open on lore.kernelinfo.org">Lore ↗</a>
           </div>
         </div>
@@ -1009,6 +1085,14 @@ export class MailView {
         }
       };
     });
+
+    const tryBtn = card.querySelector('[data-act="try"]');
+    if (tryBtn) {
+      tryBtn.onclick = (e) => {
+        e.stopPropagation();
+        pickAndTry(tryBtn, [msgSummary.message_id], msgSummary.subject || "Patch");
+      };
+    }
 
     const copyBtn = card.querySelector('[data-act="copy"]');
     if (copyBtn) {
@@ -1153,9 +1237,21 @@ export class MailView {
       diffHtml = this.renderPatchDiff(detail.diff);
     }
 
+    let extraPatchMetaHtml = "";
+    if (detail.base_commit) {
+      extraPatchMetaHtml += `<div style="margin:6px 0;font-size:12px;color:var(--text-muted);"><strong>Base commit:</strong> <code style="color:var(--accent-cyan);">${escapeHtml(detail.base_commit)}</code></div>`;
+    }
+    if (detail.commentary) {
+      extraPatchMetaHtml += `<div class="mail-commentary" style="margin:8px 0;padding:8px 12px;border-left:3px solid var(--accent-orange);background:var(--bg-secondary);font-size:12px;border-radius:0 4px 4px 0;"><strong style="color:var(--accent-orange);">Author Notes (under ---):</strong><div style="white-space:pre-wrap;margin-top:4px;">${escapeHtml(detail.commentary)}</div></div>`;
+    }
+    if (detail.diffstat) {
+      extraPatchMetaHtml += `<pre class="mail-diffstat" style="font-size:11px;color:var(--text-muted);padding:8px;background:var(--bg-tertiary);border-radius:4px;overflow-x:auto;margin:8px 0;">${escapeHtml(detail.diffstat)}</pre>`;
+    }
+
     bodyEl.innerHTML = `
       ${headersSummaryHtml}
       <div class="mail-body-content">${beautifiedBodyHtml}</div>
+      ${extraPatchMetaHtml}
       ${diffHtml}
     `;
 

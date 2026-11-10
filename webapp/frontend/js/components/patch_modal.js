@@ -6,6 +6,9 @@ import { toast } from "./toast.js";
 import { copyToClipboard } from "../utils/clipboard.js";
 import { openModal, escapeHtml, downloadText } from "./modal.js";
 import { shortRef } from "./ref_picker.js";
+import { state } from "../state.js";
+import { addEdit, gitBlobSha } from "../views/patch/series_model.js";
+import { runCheckpatch } from "./checkpatch_panel.js";
 
 const DRAFT_KEY = "kernel_ide_patch_identity";
 
@@ -25,12 +28,16 @@ function saveIdentity(identity) {
   }
 }
 
-export async function showPatchModal(version, filePath, originalContent = null) {
+/**
+ * Edit one file and either generate a single patch or **Add to series** (P3): the edit is staged in the
+ * session's patch series draft, against the blob it was made from. `staged` re-opens a staged text.
+ */
+export async function showPatchModal(version, filePath, originalContent = null, { staged = null } = {}) {
   const modal = openModal({
     title: "✎ Create patch",
     subtitle: `${filePath} @ ${shortRef(version)}`,
     width: "980px",
-    footerHtml: `<button class="code-btn active" id="patch-generate" type="button">Generate patch</button>`,
+    footerHtml: `<button class="code-btn" id="patch-add-series" type="button" title="Stage this edit in the patch series of this session (several files, several patches, cover letter)">Add to series</button><button class="code-btn active" id="patch-generate" type="button">Generate patch</button>`,
   });
   modal.body.innerHTML = `<div class="ki-modal-empty">Loading ${escapeHtml(filePath)}…</div>`;
 
@@ -62,7 +69,7 @@ export async function showPatchModal(version, filePath, originalContent = null) 
     <textarea class="ki-textarea" id="patch-editor" spellcheck="false"></textarea>
     <div id="patch-output" style="margin-top:12px;"></div>`;
   const editor = modal.body.querySelector("#patch-editor");
-  editor.value = original;
+  editor.value = staged ?? original;
   editor.addEventListener("keydown", (e) => {
     if (e.key === "Tab") {
       e.preventDefault();
@@ -70,6 +77,29 @@ export async function showPatchModal(version, filePath, originalContent = null) 
       editor.setRangeText("\t", s, t, "end");
     }
   });
+
+  modal.footer.querySelector("#patch-add-series").onclick = async () => {
+    if (editor.value === original) {
+      toast.info("No changes to the file yet");
+      return;
+    }
+    const subject = modal.body.querySelector("#patch-subject").value.trim();
+    const res = addEdit(state.getPatchDrafts(), {
+      base: version, path: filePath, originalBlob: await gitBlobSha(original), modified: editor.value,
+      subject: /:\s*$/.test(subject) ? "" : subject, body: modal.body.querySelector("#patch-body").value,
+    });
+    if (res.error) {
+      toast.error(res.error);
+      return;
+    }
+    const name = modal.body.querySelector("#patch-author").value.trim();
+    const email = modal.body.querySelector("#patch-email").value.trim();
+    if (name || email) res.draft.author = { name: name || res.draft.author.name, email: email || res.draft.author.email };
+    state.setPatchDrafts(res.draft);
+    modal.close();
+    toast.success(`${filePath} staged (${Object.keys(res.draft.edits).length} file${Object.keys(res.draft.edits).length === 1 ? "" : "s"} in the series)`);
+    state.openTab({ type: "patch", title: "Patch series", version });
+  };
 
   modal.footer.querySelector("#patch-generate").onclick = async () => {
     const out = modal.body.querySelector("#patch-output");
@@ -101,12 +131,28 @@ export async function showPatchModal(version, filePath, originalContent = null) 
           <div class="diff-header" style="display:flex;justify-content:space-between;align-items:center;">
             <span>git format-patch preview</span>
             <span style="display:flex;gap:6px;">
+              <button class="code-btn" id="patch-checkpatch" type="button" title="scripts/checkpatch.pl of a release tag, run on the server">Run checkpatch</button>
               <button class="code-btn" id="patch-copy" type="button">Copy</button>
               <button class="code-btn" id="patch-download" type="button">Download .patch</button>
             </span>
           </div>
           <div class="diff-content" style="max-height:360px;overflow:auto;">${lines}</div>
-        </div>`;
+        </div>
+        <div id="patch-checkpatch-out" class="cp-host"></div>`;
+      const content = out.querySelector(".diff-content");
+      out.querySelector("#patch-checkpatch").onclick = async () => {
+        const res = await runCheckpatch(out.querySelector("#patch-checkpatch-out"), version, patch, {
+          onJump: (line) => {
+            const row = content.children[line - 1];
+            if (!row) return;
+            content.querySelectorAll(".cp-focus").forEach((el) => el.classList.remove("cp-focus"));
+            row.classList.add("cp-focus");
+            row.scrollIntoView({ block: "center" });
+          },
+        });
+        // Gutter marks on the preview lines checkpatch reported
+        for (const r of res?.results || []) content.children[r.line - 1]?.classList.add(`cp-mark-${r.level.toLowerCase()}`);
+      };
       out.querySelector("#patch-copy").onclick = async () => {
         if (await copyToClipboard(patch)) toast.success("Patch copied to clipboard");
       };

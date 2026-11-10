@@ -536,6 +536,14 @@
         "tag_message": null
       }
     ],
+    "m_ast_attribute": [
+      {
+        "ast_id": "$ast_1",
+        "priority": 0,
+        "name": "replacement",
+        "val": "net"
+      }
+    ],
     "m_symbol_def": [
       {
         "blob_id": "$fid_0",

@@ -6,25 +6,9 @@ import { api } from "../../api.js";
 import { state } from "../../state.js";
 import { showPersonModal } from "../../components/person_modal.js";
 import { escapeHtml } from "../../components/modal.js";
+import { movedFrom } from "./blame_options.js";
 
-const AUTHOR_PALETTE = [
-  "#58a6ff", // Blue
-  "#3fb950", // Green
-  "#f0883e", // Orange
-  "#bc8cff", // Purple
-  "#39c5bb", // Cyan
-  "#e3b341", // Gold
-  "#ff7b72", // Coral
-  "#79c0ff", // Sky Blue
-  "#56d364", // Lime Mint
-  "#d2a8ff", // Lavender
-  "#ffa657", // Peach
-  "#ec65c4", // Pink / Magenta
-  "#20c997", // Turquoise
-  "#e5c07b", // Warm Yellow
-  "#f47067", // Light Salmon
-  "#80b5ff", // Periwinkle
-];
+const AUTHOR_PALETTE = Array.from({ length: 16 }, (_, k) => `var(--chart-${k + 1})`); // theme tokens (G08)
 
 export class BlameView {
   constructor() {
@@ -35,12 +19,13 @@ export class BlameView {
     this.version = "";
   }
 
-  async loadBlame(version, filePath) {
+  async loadBlame(version, filePath, opts = null) {
     this.blameByLine.clear();
     this.authorColors.clear();
     this.version = version;
+    this.filePath = filePath;
     try {
-      this.blameData = await api.getFileBlame(version, filePath);
+      this.blameData = await api.getFileBlame(version, filePath, opts);
       if (Array.isArray(this.blameData.lines)) {
         this.blameData.lines.forEach((b) => {
           this.blameByLine.set(b.line, b);
@@ -77,9 +62,12 @@ export class BlameView {
     const cleanAuthor = escapeHtml(author);
     const cleanCommit = escapeHtml(b.commit_hash || "");
     const authorColor = this._getAuthorColor(author);
+    // -M/-C followed this line from another file (H9)
+    const from = movedFrom(b, this.filePath);
+    const fromTitle = from ? `\nmoved from ${escapeHtml(from)}` : "";
 
     return `
-      <div class="gutter-blame" title="${cleanSubject} (${cleanAuthor})" data-commit="${cleanCommit}" style="border-left:2px solid ${authorColor};">
+      <div class="gutter-blame${from ? " blame-moved" : ""}" title="${cleanSubject} (${cleanAuthor})${fromTitle}" data-commit="${cleanCommit}" style="border-left:2px solid ${authorColor};">${from ? `<span class="blame-moved-mark" title="moved from ${escapeHtml(from)}">↪</span>` : ""}
         <span style="color:${authorColor};font-family:var(--font-mono);font-weight:600;">${escapeHtml(hashShort)}</span>
         <span class="blame-author-link" style="cursor:pointer;" data-author="${cleanAuthor}" title="Click to view developer profile: ${cleanAuthor}">${cleanAuthor}</span>
         <span style="font-size:9px;color:var(--text-muted);">${escapeHtml(dateStr)}</span>

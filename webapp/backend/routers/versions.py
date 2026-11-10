@@ -361,10 +361,22 @@ def get_branch_tags(branch: str = Query(..., min_length=1)) -> dict[str, Any]:
     return {"branch": branch, "head": head, "total": len(tags), "tags": tags}
 
 
+# Progress of the startup warm-up, reported by GET /api/system/ingest (webapp/API.md section 4.1)
+PREWARM_STATE: dict[str, Any] = {"state": "idle", "started_at": None, "finished_at": None}
+
+
 def prewarm_catalog() -> None:
     """Startup warm-up (webapp/API.md section 2.12): for every available repository, read the version and
     branch catalogs and walk the default branch's tags, so the first page load after a restart does not
     pay for them. Runs in a background thread; errors are logged and never stop the server."""
+    PREWARM_STATE.update(state="running", started_at=time.time(), finished_at=None)
+    try:
+        _prewarm_repositories()
+    finally:
+        PREWARM_STATE.update(state="done", finished_at=time.time())
+
+
+def _prewarm_repositories() -> None:
     for repo in list_repositories():
         name = repo.get("name")
         if not name or not resolve_repo_path(repo).exists():

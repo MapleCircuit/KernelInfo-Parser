@@ -1,199 +1,284 @@
 # Native Rust AST Subsystem API & Architectural Contract Specification (`rust_ast`)
 
-Authoritative architectural specification and relational staging reference for `parser/rust_ast/` ([rust_ast.py](parser/rust_ast/rust_ast.py), [rust_ast_type.py](parser/rust_ast/rust_ast_type.py), [rust_tree_parser.py](parser/rust_ast/rust_tree_parser.py)). Designed as an exhaustive reference for AI agents extending, maintaining, or querying the Linux kernel Rust language parsing subsystem.
+Authoritative specification of `parser/rust_ast/` ([rust_ast.py](rust_ast.py),
+[rust_ast_type.py](rust_ast_type.py), [rust_tree_parser.py](rust_tree_parser.py),
+[rust_text.py](rust_text.py), [rust_facts.py](rust_facts.py),
+[rust_pure_extractor.py](rust_pure_extractor.py)): how Linux kernel Rust files (`.rs`) become AST nodes, tags, file links, symbol
+definitions, references to C symbols, and driver ops tables. Tests: `tests/test_rust_ast.py` (fixture
+`tests/fixtures/rust/sample.rs`, golden snapshot `tests/fixtures/rust_ast_golden.json`).
+
+## Table of Contents
+- **§1**: Pipeline [L21-L63]
+- **§2**: Coordinates and text [L64-L82]
+- **§3**: Construct Taxonomy [L83-L131]
+- **§4**: Tags and coverage [L132-L170]
+- **§5**: Module files (`mod x;`) [L171-L192]
+- **§6**: Symbol definitions [L193-L223]
+- **§7**: References to C symbols (`bindings::foo`) [L224-L253]
+- **§8**: Invariants [L254-L267]
+- **§9**: Facts & Pure Outline Extraction [L268-L300]
 
 ---
 
-## 1. High-Level Architecture & Pipeline Flow
-
-The Rust AST subsystem extracts syntax tree nodes, visibility qualifiers, generics, doc comments, structural child hierarchies, code tags, and coordinate regions from Linux kernel Rust source files (`.rs`).
+## 1. Pipeline
 
 ```
 ==================================================================================================
-RUST AST PARSING PIPELINE (rust_ast.py)
+RUST AST PARSING PIPELINE
 --------------------------------------------------------------------------------------------------
-Rust Source Code (.rs)
-  │
-  ├─ Git Operation: "R100" (Exact Rename) ──► No-op (Reuses old fid automatically)
-  │
-  ├─ Git Operation: "D" (Deleted) ──► No-op (tags are immutable content records; no prior tags are loaded)
-  │
-  └─ Git Operation: "A" / "M" / "R*" (Added / Modified / Content Rename)
-     ├─ get_prior_tags(CS) (if M or R*)
-     │
-     ▼ [Rust_Manager (rust_ast.py)]
-Source Ingestion & AST Tree Parsing:
-  ├── Loads raw file content via CS.mf.get_file(CS.current_path, Version_Name)
-  ├── Slices source lines and extracts Line extent boundaries
-  └── parse_rust_ast_tree (rust_tree_parser.py):
-        ├── Parses items: structs, enums, functions, traits, impls, modules, macros
-        ├── Extracts generics, attributes (#[...]), doc comments (///), visibility (pub, pub(crate))
-        ├── unquote_string(token): decodes a quoted STRING token's escapes (\n, \t, \", \\, \xNN,
-        │   \u{...}); an unknown or malformed escape is kept verbatim. The dump is subprocess
-        │   output, so it is decoded as data and never evaluated as a Python literal (which would
-        │   also mangle non-ASCII bytes, e.g. "café")
-        └── Instantiates strongly typed Ast_Rust node hierarchy
-  │
-  ▼ [Ast_Rust.extract() -> Relational ChangeSet Staging (rust_ast_type.py)]
-Relational Extraction inside with CS(REF_NO_REF):
-  ├── Hierarchical AST Staging:
-  │     ├── Single Node: m_ast.view(((m_ast.ast_id,),), None, name, type_id) [Rule 23]
-  │     └── With Children: m_ast.view(((m_ast.ast_id, m_ast_container.ast_id, N),), ..., *flat_payload) [Rule 21]
-  │
-  ├── Spatial Tagging & 5-Tier Prior Tag Evolution Matching:
-  │     ├── Tier 1: Exact 32-byte binary SHA-256 hash match -> Recycle existing tag_id
-  │     ├── Tier 2: Exact symbol name & construct category match -> Transition evolved tag_id
-  │     ├── Tier 3-5: Positional anchors and spatial line proximity fallback
-  │     │
-  │     ├── Rule 12 Staging Order inside with CS(REF_POS):
-  │     │     ├── 1. m_tag.set(None, code_hash, ast_ref, 0, 0)          [MUST BE FIRST, 5 columns: tag_id, hash, ast_id, hl_s, hl_l]
-  │     │     │      tag_ref = ((m_tag.table_id, 0), OP_REF, (REF_POS, CS.route[-1]))
-  │     │     └── 2. m_moved_tag.set(s_tag_id, tag_ref)                  [If evolved tag match]
-  │     │
-  │     ├── File-to-Tag Bridge: m_bridge_tag.set(blob_id, tag_ref, line_s, line_e, char_s, char_e)
-  │     └── Spatial AST Map: m_map_ast.set(tag_ref, 1, 1, rel_line_e, rel_char_e, ast_ref)  (map_id = tag_id;
-  │         m_bridge_map is no longer written)
+rust_ast_parse(CS)                                                         [rust_ast.py]
+  ├─ "R100" (exact rename) ──► no-op (the blob is reused)
+  ├─ "D" (deleted)         ──► no-op (tags are immutable content records)
+  ├─ "A"                   ──► Rust_Manager(CS)
+  ├─ "M" / "R*"            ──► get_prior_tags(CS)  (with_indexes=True, with_symbols=True)
+  │                            Rust_Manager(CS)
+  └─ finish_symbol_rows(CS)    (core/SymbolRows.py: the definitions recorded while extracting)
+
+Rust_Manager(CS)
+  ├─ reads <work tree>/<path> as latin-1 (one character per byte, like every parser)
+  ├─ run_rustc_ast_tree(path): RUSTC_BOOTSTRAP=1 rustc --edition=2021 --crate-type=lib
+  │      -Z unpretty=ast-tree -o - <path>   (timeout RUSTC_TIMEOUT = 120 s, output decoded as UTF-8)
+  │      "" when rustc is missing (logged once per process), fails or times out
+  ├─ parse_rust_ast_tree(dump, lines, rel_path, file_exists, source_path)   [rust_tree_parser.py]
+  │      1. shorten_span_paths(): the file's path in every span becomes "@"
+  │      2. strip_unused_blocks(): `tokens: Some(…)`, `tokens: TokenStream(…)`, `body: Some(…)` and
+  │         `expr: Some(…)` blocks become `<key>: Stripped` (found by indentation; ~60% of the dump)
+  │      3. RustAstTreeTokenizer (lazy) + RustAstTreeParser -> dicts ({"_type", "_items", fields}),
+  │         spans as `Span((line_s, char_s, line_e, char_e))` (rustc numbers: characters, exclusive end)
+  │      4. RustTreeBuilder.build() -> Ast_Rust nodes in source order (§3, §4); from the source text
+  │         (rust_text.py): module macro entries (§3) and each top-level item's bindgen uses (§7)
+  ├─ no node at all (rustc failed) ──► RawManager(CS): one whole-file Raw_Content tag
+  └─ every top-level node: with CS(REF_NO_REF): node.extract(CS, binding_cache)   [rust_ast_type.py]
 ==================================================================================================
 ```
 
+rustc parses without expanding macros or loading `mod x;` files, so each file is parsed alone
+(`--crate-type=lib`). The installed rustc's version is logged once (`rustc_version()`). rustc 1.93 parses
+every Rust file of v6.6 through v7.3; in v6.1, `rust/alloc/boxed.rs` and `rust/alloc/vec/mod.rs` use the
+removed `box_syntax` and fall back to the raw tag.
+
+`unquote_string(token)` decodes a quoted STRING token's escapes (`\n`, `\t`, `\"`, `\\`, `\xNN`, `\u{...}`);
+an unknown or malformed escape is kept verbatim. The dump is subprocess output, so it is decoded as data and
+never evaluated as a Python literal.
+
 ---
 
-## 2. Relational Schema Mapping & ChangeSet Operations
+## 2. Coordinates and text
 
-`rust_ast` maps Rust constructs into core relational tables using TableEngine joined views:
+- Stored coordinates follow the C convention: 1-based lines, 1-based **byte** columns, exclusive end
+  (`m_bridge_tag.char_e`, `m_map_ast.char_e`). rustc reports character columns; `RustSource.byte_col()` maps
+  them on non-ASCII lines (the line is re-decoded as UTF-8 to count its characters).
+- `extract_code_snippet(lines, ls, le, cs, ce)` slices `[cs-1 : ce-1]` (exclusive end). A tag's code (and its
+  SHA-256, `compute_code_hash`) is exactly its span's text.
+- Display text is **sliced from the source at the node's span**, never re-rendered from the dump: types (`&'a
+  mut T`, `impl Fn(u8) -> u8`), parameters (`mut y: u8`, `&mut self`, `(a, b): (u8, u8)`), generics, where
+  clauses, bounds, visibility (`pub(super)`, `pub(in crate::x)`), use trees, impl headers, discriminants and
+  attributes. Only the `span` keys are needed, which every rustc version prints; text is whitespace-normalized
+  (`norm()`).
+- `clean_ident()` drops the hygiene suffix only (`foo#0` -> `foo`, `r#type#0` -> `r#type`); definitions are
+  named without the raw prefix (`type`).
+- Shape helpers absorb rustc layout differences: `_some()` (`Some(x)`), `_payload()` (the struct inside an
+  ItemKind tuple), `_find_ident()` (identifier on the item or in its kind).
 
-### 2.1. Atomic AST & Container Hierarchy Staging (Rules 21 & 23)
+---
 
-1. **Leaf Construct (Single AST Node)**:
-   ```python
-   with CS(REF_POS):
-       CS.store(m_ast.view(
-           ((m_ast.ast_id,),),
-           None,
-           symbol_name[:255],
-           type_id,
-       ))
-       ast_ref = ((m_ast.table_id, 0), OP_REF, (REF_POS, CS.route[-1]))
-   ```
+## 3. Construct Taxonomy
 
-2. **Parent Construct with Children (Flat Positional Scalars per Rule 21)**:
-   Container items must be passed as **flat positional scalars** (`*container_payload` where each child contributes `None, priority, child_ast_type, child_ref`), never as nested tuples inside lists:
-   ```python
-   container_payload = []
-   for priority, (child, child_ref) in enumerate(zip(self.children, child_refs)):
-       container_payload.extend([None, priority, int(child.ast_type), child_ref])
+| Class | `ASTT` | ID | m_ast name | Children (role = child type) | Definition (`def_name`) |
+| :--- | :--- | :---: | :--- | :--- | :--- |
+| `Ast_Rust_Struct` | `Rust_Struct` | 123 | `Foo` | Signature, [attributes], fields | `Foo` |
+| `Ast_Rust_Field` | `Rust_Field` | 124 | `pub a: &'a mut T`, tuple: `pub 0: u32` | [attributes] | field name (named fields) |
+| `Ast_Rust_Enum` | `Rust_Enum` | 125 | `E` | Signature, [attributes], variants | `E` |
+| `Ast_Rust_Variant` | `Rust_Variant` | 126 | `A`, `C = 5` | [attributes], fields | `A` |
+| `Ast_Rust_Union` | `Rust_Union` | 127 | `U` | Signature, [attributes], fields | `U` |
+| `Ast_Rust_Fn` | `Rust_Fn` | 128 | `new` | Signature, [attributes], params | `new` |
+| `Ast_Rust_Param` | `Rust_Param` | 129 | `x: u32`, `&self`, `...` | — | — |
+| `Ast_Rust_Trait` | `Rust_Trait` | 130 | `Tr` | Signature, [attributes], items | `Tr` |
+| `Ast_Rust_TraitAlias` | `Rust_TraitAlias` | 131 | `Alias` | Signature, [attributes] | `Alias` |
+| `Ast_Rust_Impl` | `Rust_Impl` | 132 | header: `unsafe impl<T: Send> Send for Arc<T>`, `impl !Sync for X`, `impl Foo` | [attributes], items | the header |
+| `Ast_Rust_Type` | `Rust_Type` | 133 | `type R<T> = Result<T, E>`, `type A: Bound`, `type A` | [attributes] | `R` |
+| `Ast_Rust_Const` | `Rust_Const` | 134 | `const N: usize` | [attributes] | `N` (not `_`) |
+| `Ast_Rust_Static` | `Rust_Static` | 135 | `static mut S: u32` | [attributes] | `S` |
+| `Ast_Rust_Mod` | `Rust_Mod` | 136 | `inner` | [attributes], items; `mod x;`: `m_ast_include` (§5) | `inner` |
+| `Ast_Rust_Use` | `Rust_Use` | 137 | `use kernel::{prelude::*, sync::Arc as A}`, `extern crate alloc` | [attributes] | — |
+| `Ast_Rust_MacroDef` | `Rust_MacroDef` | 138 | `macro_rules! mm` | [attributes] | `mm` |
+| `Ast_Rust_MacroCall` | `Rust_MacroCall` | 139 | `module!`, `kernel::module_platform_driver!`, `global_asm!` | [attributes], module entries (module macros) | — |
+| `Ast_Rust_ModuleAttr` | `Rust_ModuleAttr` | 212 | `license: "GPL"`, `authors: ["A <a@b.c>"]`, `type: M`; block: `params`; parameter: `p: i64` | entries of a block value | `name`: the module's name (`"x"` -> `x`); a parameter: its name |
+| `Ast_Rust_ForeignMod` | `Rust_ForeignMod` | 140 | `extern "C"`, `unsafe extern "C"` | [attributes], items (fn, static, type, macro calls) | — |
+| `Ast_Rust_Attribute` | `Rust_Attribute` | 141 | `#[derive(Debug)]`, `#![no_std]`, `#[cfg(CONFIG_X86)]` | — | — |
+| `Ast_Rust_DocComment` | `Rust_DocComment` | 142 | the block's text (lines joined by `\n`) | — | — |
+| `Ast_Rust_Comment` | `Rust_Comment` | 143 | the comment as written | — | — |
+| `Ast_Rust_Signature` | `Rust_Signature` | 211 | `pub const unsafe fn f<T>(x: T) -> u32 where T: Copy`, `pub(crate) struct Foo<'a, T> where T: Copy`, `pub trait Tr: Send + Sync` | — | — |
+| — | `Rust_BindingRef` | 213 | the C symbol (`kfree`): the target of Rust uses through bindgen (§7), never a tag | — | — |
 
-   with CS(REF_POS):
-       CS.store(m_ast.view(
-           ((m_ast.ast_id, m_ast_container.ast_id, len(child_refs)),),
-           None,
-           symbol_name[:255],
-           type_id,
-           *container_payload,
-       ))
-       ast_ref = ((m_ast.table_id, 0), OP_REF, (REF_POS, CS.route[-1]))
-   ```
+- **Signature**: the item's text from its start to the end of its generics / where clause (fn: of its
+  signature; trait: of its bounds), normalized, without a trailing `;`.
+- **Attributes as children** (`[attributes]`) only for **nested** items (members of impls, traits, inline
+  modules, extern blocks): their attributes lie inside the enclosing top-level tag. Top-level items'
+  attributes and doc comments are tagged on their own (§4), never stored in the item, so an item's AST only
+  depends on its own tag's text and a tier-1 recycled tag always means the same AST.
+- `Fn` also exposes `qualifiers` (`const`, `async`, `unsafe`/`safe`, `extern "ABI"`), `ret_type`, `generics`,
+  `has_body`; `Impl` exposes `self_ty`, `of_trait` (`!Trait` for negative impls); `Mod.is_inline` is False for
+  `mod x;`.
+- m_ast names are cut to 255 characters (`NAME_MAX`, `m_ast.name VARCHAR(255)`).
+- **Module macros** (`is_module_macro()`: the path's last segment is `module` or starts with `module_`, e.g.
+  `module!`, `kernel::module_pci_driver!`, `kernel::module_phy_driver!`): `macro_fields()` (`rust_text.py`)
+  reads the macro's `key: value` entries from its text (comments and literals masked, commas inside brackets
+  or strings kept), one `Rust_ModuleAttr` each, the value as written and whitespace-normalized. A block value
+  (`params: { … }`) is named by its key and a typed block (`p: i64 { default: 1, description: "…" }`) by `key:
+  type`; their entries are children. A macro whose arguments are not entries (`module_firmware!(T)`,
+  zerocopy's own `module!(a, B, "c")`) has none. In v7.3: 31 module macros, 142 entries.
 
-### 2.2. Occurrence Tagging & Code Deduplication (Rule 12 Order)
+---
 
-Inside `with CS(REF_POS):`, `m_tag.set` **must be the first operation** so that `tag_ref = ((m_tag.table_id, 0), OP_REF, (REF_POS, CS.route[-1]))` points directly to `m_tag`:
+## 4. Tags and coverage
+
+Top-level nodes are tagged, in source order:
+
+1. Crate inner doc comments (`//!`) — one `Rust_DocComment` per block of consecutive lines — and inner
+   attributes (`#![...]`), one `Rust_Attribute` each.
+2. For every item: its outer doc comments (`///`, `/** */`, blocks of consecutive lines) and attributes, then
+   the item itself (rustc's item span excludes them).
+3. `scan_comments()`: plain comments in the text no node covers — consecutive `//` lines form one
+   `Rust_Comment`, a `/* */` (nested) one each, a trailing `// x` after an item its own.
+
+Every non-blank line of a parsed file is covered (all 568 Rust files of v7.3). Item kinds the builder does not
+know (none in the kernel today) are left untagged, and their text is excluded from the comment scan.
+
+`Ast_Rust.extract(CS)` (Rule 12, `parser/c_ast/tag_tracker.py`):
+
 ```python
-with CS(REF_POS):
-    CS.store(m_tag.set(
-        None,            # tag_id (AUTO_INCREMENT)
-        code_hash,       # 32-byte binary SHA-256 digest
-        ast_ref,         # reference to m_ast node
-        0,               # hl_s
-        0,               # hl_l
-    ))
-    tag_ref = ((m_tag.table_id, 0), OP_REF, (REF_POS, CS.route[-1]))
-    if s_tag_id is not None:
-        CS.store(m_moved_tag.set(s_tag_id, tag_ref))
+ast_ref = self.extract_ast_node(CS)                    # m_ast.view (Rules 21, 23)
+code_hash = compute_code_hash(self.extent.code)        # 32-byte SHA-256 (Rule 14)
+tag = check_exact_match(CS, code_hash)                 # Tier 1
+if tag is not None:
+    stage_bridge_tag(CS, tag, line_pos, char_pos)      # the recycled tag keeps its m_map_ast row
+else:
+    s_tag_id = match_prior_tag_transition(CS, extent, name, ast_type)   # Tiers 2-4
+    tag = stage_new_tag(CS, code_hash, ast_ref, s_tag_id)               # m_tag (hl 0, 0) [+ m_moved_tag]
+    stage_bridge_tag(CS, tag, line_pos, char_pos)
+    stage_tag_map(CS, tag, ast_ref, rel_line_e, char_e)                 # m_map_ast, map_id = tag_id
+register_tag(CS, tag, line_s, line_e, char_s, code)    # core/SymbolRows.py
+self.record_defs(CS, tag)                              # §6
 ```
 
-### 2.3. Spatial Mapping
-```python
-CS.store(m_bridge_tag.set(
-    ((m_file.table_id, 0), OP_REF, (REF_ROOT,)),
-    tag_ref,
-    self.extent.line_pos[0],
-    self.extent.line_pos[1],
-    self.extent.char_pos[0],
-    self.extent.char_pos[1],
-))
-CS.store(m_map_ast.set(tag_ref, 1, 1, rel_line_e, rel_char_e, ast_ref))  # tag_tracker.stage_tag_map(); map_id = tag_id
-```
-
-### 2.4. Cross-Language Definition Indexing (`m_symbol_def` view)
-Rust definition symbols (`Rust_Fn`, `Rust_Struct`, `Rust_Enum`, `Rust_Trait`) are staged per blob into `m_blob_symbol_def` (Table 27, read through the `m_symbol_def` view) across both top-level and nested constructs (such as methods in `impl` blocks or functions in `mod` blocks):
-```python
-with CS(REF_POS):
-    CS.store(m_blob_symbol_def.set(
-        None,                                        # def_id (AUTO_INCREMENT)
-        ((m_file.table_id, 0), OP_REF, (REF_ROOT,)), # blob_id reference
-        actual_tag,                                  # tag_id (new tag_ref or recycled prior_tag_id)
-        node.ast_ref,                                # ast_id reference
-        safe_name,                                   # symbol name (e.g. "KernelBuffer", "reset")
-        int(node.ast_type),                          # type_id (ASTT.Rust_Fn, Rust_Struct, etc.)
-        SymbolLinkage.ExternalDef,                   # linkage (ExternalDef = 0)
-        node.extent.line_pos[0],                     # line_s
-        node.extent.line_pos[1],                     # line_e
-    ))
-```
+- Tier 2 matches by m_ast name and AST type (impl headers and full use trees keep names distinct within a
+  file); Tier 3 (bulk renames) covers Rust fn/struct/enum/union/trait/trait alias/mod/macro_rules
+  (`NAMED_CONSTRUCT_TYPES`); doc comments and comments are matched spatially (Tier 4, `COMMENT_TYPES`).
+- `get_prior_tags()` loads the indices and the stored symbol items of the previous version's tags
+  (`with_symbols=True`).
 
 ---
 
-## 3. Construct Taxonomy & Grammar
+## 5. Module files (`mod x;`)
 
-The Rust AST parser defines dedicated `Ast_Rust` classes for every major language construct:
+A module declaration is linked to the file it loads: the node stages `m_file_name.get_set(None, target)` and
+its AST joins `m_ast_include` (`((m_ast.ast_id, m_ast_include.ast_id, 1), …)`, like C `#include` and Kconfig
+`source`). `processing_include_references()` (`main.py`) then writes the `m_file_reference` row
+(`FileRefType.Include`, details = the module name).
 
-| Construct Class | `ASTT` Constant | Numeric ID | Description |
-| :--- | :--- | :---: | :--- |
-| **`Ast_Rust_Struct`** | `ASTT.Rust_Struct` | 107 | Struct definitions (`struct Foo { ... }`, tuple structs `struct Bar(u32);`). Encapsulates fields as child container items. |
-| **`Ast_Rust_Enum`** | `ASTT.Rust_Enum` | 108 | Enum definitions (`enum Baz { A, B(u64) }`). Variants staged under enum container. |
-| **`Ast_Rust_Fn`** | `ASTT.Rust_Fn` | 109 | Free-standing or associated functions (`fn qux<T>(...) -> R { ... }`). Tracks signature, parameters, and return type. |
-| **`Ast_Rust_Trait`** | `ASTT.Rust_Trait` | 110 | Trait declarations (`pub trait Driver { ... }`). Child methods linked at priorities 0..N. |
-| **`Ast_Rust_Impl`** | `ASTT.Rust_Impl` | 111 | Trait implementations (`impl Driver for MyDriver`) or inherent impl blocks (`impl Foo`). |
-| **`Ast_Rust_Mod`** | `ASTT.Rust_Mod` | 112 | In-line module blocks (`mod bar { ... }`) or external module declarations (`mod bar;`). |
-| **`Ast_Rust_Macro`** | `ASTT.Rust_Macro` | 113 | Macro declarations (`macro_rules! my_macro { ... }`) or macro invocations. |
-| **`Ast_Rust_Type`** | `ASTT.Rust_Type` | 114 | Type aliases (`type Result<T> = core::result::Result<T, Error>;`). |
-| **`Ast_Rust_Const`** | `ASTT.Rust_Const` | 115 | Associated or module constants (`const MAX_SIZE: usize = 1024;`). |
-| **`Ast_Rust_Static`** | `ASTT.Rust_Static` | 116 | Static memory bindings (`static COUNTER: AtomicU32 = ...;`). |
-| **`Ast_Rust_DocComment`**| `ASTT.Rust_DocComment` | 117 | Multi-line and inner doc comments (`///` and `//!`). |
+`RustTreeBuilder.resolve_module_file(ident, path_attr, ctx)` returns the first candidate present in the
+version's tree (`Rust_Manager.file_exists()`), or None (no link):
 
----
+- `#[path = "p"]`: `p` relative to the file's directory (inside an inline module: to that module's directory).
+- Otherwise `<mod dir>/x.rs`, `<mod dir>/x/mod.rs`, where the module directory is the file's directory for
+  `mod.rs` / `lib.rs` / `main.rs` and `<dir>/<stem>/` for any other file; for top-level declarations then
+  `<dir>/x.rs`, `<dir>/x/mod.rs`, since a crate root such as `drivers/block/rnull/rnull.rs` keeps its modules
+  beside it. Inline modules extend the module directory (`mod a { mod b; }` -> `<mod dir>/a/b.rs`).
+- Paths leaving the tree (`..`, absolute) are refused. In v7.3, 513 of 515 declarations resolve; the other two
+  (`#[cfg(test)]` modules) have no file.
 
-## 4. Tag Lifecycle & Prior Tag Evolution
-
-`rust_ast` tracks construct continuity across Git versions using `get_prior_tags` and `match_prior_tag_transition`:
-
-1. **Prior Tag Indexing (`get_prior_tags`)**:
-   `tag_tracker.get_prior_tags(CS, with_indexes=True, with_symbols=False)`: the shared 14-column `m_bridge_tag` -> `m_tag` -> `m_ast` join for `old_fid` in `Old_VID` (from the parsing worker's batch prefetch when present). Builds `CS.prior_tags_map[code_hash]` and the name/position indices `match_prior_tag_transition` uses.
-2. **Exact Tag Recycling (Tier 1)**:
-   If `compute_code_hash(self.extent.code)` matches an unconsumed prior tag, the existing `tag_id` is recycled directly into `m_bridge_tag`, producing zero duplicate entries in `m_tag` or `m_ast`.
-3. **Modified Tag Evolution (Tier 2)**:
-   If code has changed, `match_prior_tag_transition` matches by symbol name and AST type constant, linking the old tag to the new tag via `m_moved_tag(s_tag_id, tag_ref)`.
-4. **Immutable Tags**: under the Git DAG architecture prior tags are permanent content records; nothing closes them.
+`use` declarations name crate paths, not files: they are recorded as `Rust_Use` nodes only.
 
 ---
 
-## 5. Cross-File Reference Handling
+## 6. Symbol definitions
 
-1. **`mod` Declarations**:
-   - For external modules (`mod sub_module;`), the parser computes the expected file path (`sub_module.rs` or `sub_module/mod.rs`).
-   - Registers target path in `m_file_name.get_set` and links the dependency via `m_ast_include`.
-2. **`use` Imports**:
-   - `use` statements (e.g. `use kernel::prelude::*;`) record symbol dependencies in `CS.foreign_deps` for resolution in the DependencyScheduler.
+`record_defs()` records, against the enclosing top-level tag, every node whose type is in `DEF_TYPES` (Fn,
+Struct, Enum, Union, Trait, TraitAlias, Type, Const, Static, MacroDef, Mod, Impl, Variant, Field, ModuleAttr)
+with its `def_name`, AST and lines (`core/SymbolRows.record_def`). `finish()` stores them once per tag
+(`m_tag_def`; a tier-1 recycled tag writes nothing) and read through the `m_symbol_def` view by the outline,
+symbol search and symbol history (`webapp/API.md` §4).
+
+Linkage (`SymbolLinkage`):
+
+| Case | Linkage |
+| :--- | :--- |
+| function without a body (trait declaration, `extern` block item) | `PrototypeDecl` (2) |
+| any item of an `extern` block | `PrototypeDecl` (2) |
+| `macro_rules!` / `macro` | `MacroOrKernelDef` (5) |
+| `pub…` item, member of a trait or trait impl, variant, field, impl block | `ExternalDef` (0) |
+| `fn` with a body or `static` linked under a C symbol (below), whatever its visibility | `ExternalDef` (0) |
+| module macro entry (module name, parameter) | `MacroOrKernelDef` (5) |
+| other private item | `InternalStaticDef` (1) |
+
+**C-callable items** (`c_symbol_of()`): a `fn` with a body or a `static` (outside `extern` blocks) carrying
+`#[no_mangle]` / `#[unsafe(no_mangle)]`, the kernel's `#[export]` (a `#[no_mangle]` checked against the C
+prototype) or `#[export_name = "x"]` / `#[unsafe(export_name = "x")]` gets `c_symbol` (the identifier, or `x`)
+and `ExternalDef`. With `export_name`, a second definition named `x` (same AST, type and lines) is recorded,
+so C's name finds the Rust definition (symbol search, Go to Definition, the callgraph: a Rust body ranks
+before its C prototype). In v7.3: 127 items (binder, kasan, iommu, `rust/kernel`). The attributes of a
+top-level item are tagged on their own (§4); a change to them alone changes the definition's linkage, which
+SymbolRows stores per blob for that placement.
 
 ---
 
-## 6. Performance Invariants & Architectural Rules
+## 7. References to C symbols (`bindings::foo`)
 
-1. **Rule 12 Staging Order**:
-   `m_tag.set` MUST be the first operation inside `with CS(REF_POS):` so `tag_ref` references `m_tag`. Auxiliary tables (such as `m_moved_tag.set`) follow immediately within the block.
-2. **Rule 21 Flat Scalar Container Payload**:
-   In `m_ast.view` joined with `m_ast_container`, container arguments MUST be passed as flat positional scalars (`*container_payload`), never as nested tuples inside lists.
-3. **Rule 23 View Deduplication**:
-   All AST node creation must use `m_ast.view(...)`, never direct `m_ast.set` or `m_ast.get_set`.
-4. **Binary SHA-256 Hashes (Rule 14)**:
-   Code hashes are always 32-byte binary digests computed via `compute_code_hash(self.extent.code)` for storage in `m_tag.hash` (`BINARY(32)`).
+Rust code uses C through the bindgen crates: `bindings::kfree(p)`, `kernel::bindings::GFP_KERNEL`, `*mut
+bindings::page`, `uapi::BMCR_FULLDPLX`. rustc's dump expands nothing and the function bodies are dropped (§1),
+so `scan_binding_refs()` (`rust_text.py`) reads every top-level item's text (not comments, doc comments or
+attributes), with comments and string / char literals masked (`mask_code()`):
+
+- A use is `bindings::<name>`, `uapi::<name>`, `c_bindings::<name>`, or `ffi::<name>`, the crate segment a
+  whole identifier (`my_bindings::x` is not one), not followed by `!`. A path through it
+  (`bindings::lru_status::LRU_SKIP`) is a use of its first item.
+- bindgen's enumerator names `<enum>_<ENUMERATOR>` (`phy_state_PHY_RUNNING`, `irqreturn_IRQ_NONE`) are the C
+  enumerator (`PHY_RUNNING`); bindgen's own names (`__BindgenBitfieldUnit`, `…__bindgen_ty_1`) are skipped.
+- Role (`SymbolRole`): followed by `(` -> `Call` (3); followed by `::` -> `TypeUsage` (2); a name without
+  lowercase letters -> `DeclRef` (5, a constant); followed by `{` (struct literal) or after a type position
+  (`*const` / `*mut`, `&`, `&'a mut`, `->`, `dyn`, `impl`, `as`, a single `:`, a generic `<`, `type X =`,
+  `struct X(`, `offset_of!(`, `container_of!(p,`) -> `TypeUsage`; anything else -> `DeclRef` (a function named
+  without a call, `Some(bindings::seq_lseek)`, as in C).
+- Columns are byte columns of the identifier as written.
+
+Each use is a reference (`core/SymbolRows.record_ref`, target file 0) from the enclosing top-level tag to the
+**`Rust_BindingRef` AST of the symbol's name**: a leaf `m_ast.view(((m_ast.ast_id,),), None, name,
+ASTT.Rust_BindingRef)`, staged once per file (`binding_cache`) and, being content-addressed, the same row in
+every file and version. The name is not resolved to a C definition (Rust gives no header to look it up in, and
+the right definition depends on the revision): `SymbolService` / `CallgraphService` add the AST found by
+(name, type) — `binding_ref_asts()`, through `m_ast.ast_index` — to the targets of a name (`webapp/API.md`
+§4.3 xref, §4.7 callgraph). Its keys come from the tag's text like every reference, so a recycled tag's uses
+compare equal and write nothing. In v7.3: 2,425 uses of 1,581 C symbols (623 calls, 866 type uses, 936 other).
+
+---
+
+## 8. Invariants
+
+1. **Rule 12**: `m_tag.set` is the first operation of its `with CS(REF_POS):` scope (`stage_new_tag`);
+   `m_moved_tag` follows.
+2. **Rule 21**: container children are flat positional scalars (`None, priority, child_type, child_ref` each);
+   with an include join, the include payload (`None, fnid_ref`) precedes them.
+3. **Rule 23**: AST nodes are only created with `m_ast.view(...)`.
+4. **Rule 14**: tag hashes are 32-byte binary SHA-256 digests of the tag's exact text.
+5. An AST holds only what its tag's text says (§3), so recycling by hash never attaches a stale AST.
+6. Definitions and references come from the tag's own text only (an item's `c_symbol` from its attributes,
+   which also sit in the file's text), so recycling never attaches stale symbol rows.
+7. The dump format is rustc-internal: a change in its layout shows in `tests.test_rust_ast`
+   (`TestRustExtractionDetails`, golden snapshot recording the rustc version). Regenerate the snapshot with
+   `REGEN_GOLDEN=1 python3 -m unittest tests.test_rust_ast` once a change is intended.
+
+---
+
+## 9. Facts & Pure Outline Extraction
+
+### 9.1. Driver Operations & Facts Extraction (`rust_facts.py`)
+`RustFactsExtractor` extracts Family 1 facts (`m_blob_facts`) from Rust sources:
+- Trait implementations (`impl Trait for Type`) are mapped to ops tables (`t: [[trait, type, line, 0, [[method, method, line], ...]]]`).
+- Functions and trait methods are indexed (`d: [[name, line, col, kind], ...]`).
+- Powers webapp driver operations navigation (`webapp/API.md` §4.10) for Rust drivers (`pci::Driver`, `platform::Driver`, etc.).
+
+### 9.2. Pure Outline Extraction (`rust_pure_extractor.py`)
+- Independent of `TableEngine` or `GreatProcessor`: provides `extract_rust_outline(source_bytes: bytes) -> list[dict]`.
+- Extracts modules, structs, enums, unions, traits, impl blocks, functions, and macro calls with byte and line coordinate spans.
+- Serves as the Git fallback extractor for unparsed revisions in `webapp/backend/services/outline_service.py`.

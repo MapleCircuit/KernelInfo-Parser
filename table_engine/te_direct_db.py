@@ -56,10 +56,15 @@ if TYPE_CHECKING:
     from db_engine.base import BaseDBEngine
 
 
+AST_HASH_BYTES = 16
+
+
 def compute_ast_hash(joins: JoinsType, filtered_columns: tuple[SafeDataType, ...]) -> bytes:
-    """Compute deterministic 32-byte binary SHA-256 hash for canonical AST join graph and filtered column data."""
+    """Deterministic 16-byte structural hash (`m_ast_hash.hash`, BINARY(16)) of a canonical AST join graph and its
+    filtered column data: the first 128 bits of their SHA-256. Two nodes differing in any column or child (same name
+    and type, another construction) get different hashes; a collision needs ~2^64 nodes."""
     key_str = f"{joins}:{filtered_columns}"
-    return hashlib.sha256(key_str.encode("utf-8")).digest()
+    return hashlib.sha256(key_str.encode("utf-8")).digest()[:AST_HASH_BYTES]
 
 
 def _is_hash_keyed(table: Table) -> bool:
@@ -129,6 +134,23 @@ class TEDirectDB:
         self.queued_update: dict[int, list[tuple[SafeDataType, ...]]] = {}
         self.queued_view: dict[JoinsType, dict[tuple[SafeDataType, ...], int]] = {}
         self.next_id: dict[int, int] = {}
+        self._id_cursor: dict[int, int] = {}
+        self._id_limit: dict[int, int] = {}
+        self.distributed: bool = False
+        self.current_commit_id: int = 0
+        self.defer_ast_hash: bool = False
+        self.DEFAULT_ID_BLOCK_SIZE: int = 128
+        self._id_block_sizes: dict[str, int] = {
+            "m_ast": 50_000,
+            "m_blob_symbol_ref": 50_000,
+            "m_tag": 10_000,
+            "m_blob_symbol_def": 10_000,
+            "m_file_reference": 10_000,
+            "m_file_blob": 1_000,
+            "m_file_name": 1_000,
+            "m_commit": 1_000,
+            "m_maintainer_person": 1_000,
+        }
         self._pk_getters: dict[int, Callable[[tuple[SafeDataType, ...]], Any]] = {}
         self._join_plan_cache: dict[JoinsType, list[tuple[int, int, int]]] = {}
         self._committed_pks: dict[int, set[Any]] = {}
@@ -267,6 +289,9 @@ class TEDirectDB:
         self.close()
         self.db = db()
         self.queued_view = {}
+        if self.distributed:
+            self._id_cursor.clear()
+            self._id_limit.clear()
         for table_id, table in self.tables.items():
             self.queued_set[table_id] = {}
             self.queued_update[table_id] = []
@@ -455,6 +480,29 @@ class TEDirectDB:
 
         return self._db_read((table_id,), self.db.select, table, columns)
 
+    def _allocate_id(self, table_id: int) -> int:
+        """Allocate next sequential ID, leasing blocks from m_table_sequence in distributed mode."""
+        cursor = self._id_cursor.get(table_id)
+        limit = self._id_limit.get(table_id)
+        if cursor is not None and limit is not None and cursor <= limit:
+            assigned_id = cursor
+            self._id_cursor[table_id] = cursor + 1
+            self.next_id[table_id] = cursor + 1
+            return assigned_id
+
+        table = self.tables.get(table_id)
+        if self.distributed and self.db is not None and hasattr(self.db, "reserve_id_block") and table is not None:
+            block_size = self._id_block_sizes.get(table.table_name, self.DEFAULT_ID_BLOCK_SIZE)
+            start_id, end_id = self.db.reserve_id_block(table, block_size, commit_id=self.current_commit_id)
+            self._id_cursor[table_id] = start_id + 1
+            self._id_limit[table_id] = end_id
+            self.next_id[table_id] = start_id + 1
+            return start_id
+
+        assigned_id = self.next_id.get(table_id, 1)
+        self.next_id[table_id] = assigned_id + 1
+        return assigned_id
+
     def set(
         self,
         table_id: int,
@@ -502,9 +550,10 @@ class TEDirectDB:
                 assigned_id = columns[0]
                 if isinstance(assigned_id, int) and assigned_id >= self.next_id[table_id]:
                     self.next_id[table_id] = assigned_id + 1
+                    if table_id in self._id_cursor and assigned_id >= self._id_cursor[table_id]:
+                        self._id_cursor[table_id] = assigned_id + 1
             else:
-                assigned_id = self.next_id[table_id]
-                self.next_id[table_id] += 1
+                assigned_id = self._allocate_id(table_id)
             self.queued_set[table_id][key] = assigned_id
             row = (assigned_id, *columns[1:])
             self._index_staged_row(table_id, row)
@@ -535,10 +584,9 @@ class TEDirectDB:
                             if existing:
                                 return tuple(existing)
 
-            assigned_id = self.next_id[table_id]
+            assigned_id = self._allocate_id(table_id)
             row = (assigned_id, *columns[1:])
             self.queued_set[table_id][assigned_id] = row
-            self.next_id[table_id] += 1
             self._index_staged_row(table_id, row)
             return row
 
@@ -684,7 +732,7 @@ class TEDirectDB:
             2. Checks `self.queued_view` cache for matching `joins` and `filtered`:
                - If cached: returns `columns` with None positions replaced by cached `view_id`.
             3. If main table has `hashing_table` configured:
-               - Computes deterministic SHA-256 hash `h = compute_ast_hash(joins, filtered)`.
+               - Computes the deterministic 16-byte hash `h = compute_ast_hash(joins, filtered)`.
                - Checks staged `queued_set[hash_table]` or queries `self.get(hash_table.table_id, (h, None))`.
                - If existing: caches in `queued_view` and returns tuple with existing `ast_id`.
                - If new: generates `current_view_id = self.next_id[main_table_id]`, decomposes across
@@ -726,9 +774,8 @@ class TEDirectDB:
                 return tuple(val if val is not None else current_view_id for val in columns)
 
             # New AST - allocate monotonic ID
-            current_view_id = self.next_id[main_table_id]
+            current_view_id = self._allocate_id(main_table_id)
             self.queued_view[joins][filtered_columns] = current_view_id
-            self.next_id[main_table_id] += 1
 
             result = tuple(val if val is not None else current_view_id for val in columns)
 
@@ -751,9 +798,8 @@ class TEDirectDB:
             return result
 
         # Standard non-hashed view_set decomposition
-        current_view_id = self.next_id[main_table_id]
+        current_view_id = self._allocate_id(main_table_id)
         self.queued_view[joins][filtered_columns] = current_view_id
-        self.next_id[main_table_id] += 1
 
         result = tuple(val if val is not None else current_view_id for val in columns)
 
@@ -858,11 +904,15 @@ class TEDirectDB:
         """
         batch = CommitBatch()
         for table_id in table_ids:
+            table = self.tables.get(table_id)
+            if table is None:
+                continue
+            if self.defer_ast_hash and table.table_name == "m_ast_hash":
+                continue
             staged_set = self.queued_set.get(table_id)
             staged_upd = self.queued_update.get(table_id)
             if not staged_set and not staged_upd:
                 continue
-            table = self.tables[table_id]
             insert_payload: tuple[tuple[SafeDataType, ...], ...] = ()
             if staged_set:
                 if table.no_duplicate:

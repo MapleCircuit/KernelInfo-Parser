@@ -1,6 +1,7 @@
 """webapp/backend/database/helpers.py - Version Caching & Data Serialization Helpers."""
 from __future__ import annotations
 import logging
+import time
 from webapp.backend.config import RepoScopedCache, get_active_repository, get_repo_dir
 from core.globalstuff import is_safe_git_rev
 from typing import Any
@@ -23,6 +24,60 @@ def finished_ref_sql(alias: str = "r") -> str:
     """SQL condition keeping refs whose ingestion finished (or predates m_ingest_state): a version still
     being parsed, or left interrupted, is hidden until its run completes."""
     return f"NOT EXISTS (SELECT 1 FROM m_ingest_state s WHERE s.commit_id = {alias}.commit_id AND s.status = {INGEST_PARSING})"
+
+
+_TREE_SOURCE: dict[str, Any] = {}
+
+
+def _exec_query(db_or_cur: Any, sql: str, params: tuple = (), dictionary: bool = True) -> list:
+    if hasattr(db_or_cur, "query") and callable(db_or_cur.query):
+        return db_or_cur.query(sql, params, dictionary=dictionary)
+    if hasattr(db_or_cur, "execute"):
+        db_or_cur.execute(sql, params)
+        if hasattr(db_or_cur, "fetchall"):
+            return list(db_or_cur.fetchall() or ())
+    return []
+
+
+def _exec_query_one(db_or_cur: Any, sql: str, params: tuple = (), dictionary: bool = True) -> Any:
+    if hasattr(db_or_cur, "query_one") and callable(db_or_cur.query_one):
+        return db_or_cur.query_one(sql, params, dictionary=dictionary)
+    if hasattr(db_or_cur, "execute"):
+        db_or_cur.execute(sql, params)
+        if hasattr(db_or_cur, "fetchone"):
+            return db_or_cur.fetchone()
+    return None
+
+
+def tree_source(cursor: Any) -> str:
+    """The relation holding every version's full checkpoint tree: the `m_checkpoint_tree` view (core/API.md section
+    4.2: a checkpoint may be stored as a delta of another), or `m_bridge_checkpoint` on a database created before the
+    view existed (every checkpoint full there). A definite answer from the database driver is kept for the process."""
+    hit = _TREE_SOURCE.get("name")
+    # The view is permanent once there; its absence is checked again every 5 minutes (a database reset to the
+    # current layout while the webapp runs)
+    if hit is not None and (hit == "m_checkpoint_tree" or time.monotonic() - _TREE_SOURCE.get("at", 0.0) < 300.0):
+        return hit
+    try:
+        rows = _exec_query(
+            cursor,
+            "SELECT COUNT(*) AS n FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() "
+            "AND TABLE_NAME = 'm_checkpoint_tree'",
+            dictionary=True,
+        )
+    except Exception as exc:  # noqa: BLE001 - keep the view's name; the query itself reports the problem
+        logger.debug("checkpoint tree view check failed: %s", exc)
+        return "m_checkpoint_tree"
+    n = None
+    if len(rows) == 1:
+        row = rows[0]
+        n = row.get("n") if isinstance(row, dict) else (row[0] if isinstance(row, (tuple, list)) else None)
+    if not isinstance(n, int):
+        return "m_checkpoint_tree"  # not a database answer (a test double): nothing to remember
+    hit = "m_checkpoint_tree" if n else "m_bridge_checkpoint"
+    if type(cursor).__module__.startswith("mysql"):
+        _TREE_SOURCE.update(name=hit, at=time.monotonic())
+    return hit
 
 
 # Bounded: besides the repository's refs (preloaded), any commit SHA or prefix a caller names adds entries
@@ -88,11 +143,9 @@ def get_active_repo_id(cursor: Any) -> int:
     repo = get_active_repository()
     repo_id = -1
     try:
-        cursor.execute("SELECT repo_id FROM m_repository WHERE name = %s AND repo_id > 0 LIMIT 1;", (repo.get("name"),))
-        row = cursor.fetchone()
+        row = _exec_query_one(cursor, "SELECT repo_id FROM m_repository WHERE name = %s AND repo_id > 0 LIMIT 1;", (repo.get("name"),))
         if not row and repo.get("git_url"):
-            cursor.execute("SELECT repo_id FROM m_repository WHERE git_url = %s AND repo_id > 0 LIMIT 1;", (repo["git_url"],))
-            row = cursor.fetchone()
+            row = _exec_query_one(cursor, "SELECT repo_id FROM m_repository WHERE git_url = %s AND repo_id > 0 LIMIT 1;", (repo["git_url"],))
         if row:
             repo_id = row["repo_id"] if isinstance(row, dict) else row[0]
     except Exception as e:
@@ -112,8 +165,7 @@ def get_active_network_id(cursor: Any) -> int | None:
     network_id = -1
     if repo_id > 0:
         try:
-            cursor.execute("SELECT network_id FROM m_repository WHERE repo_id = %s LIMIT 1;", (repo_id,))
-            row = cursor.fetchone()
+            row = _exec_query_one(cursor, "SELECT network_id FROM m_repository WHERE repo_id = %s LIMIT 1;", (repo_id,))
             if row:
                 network_id = int(row["network_id"] if isinstance(row, dict) else row[0])
         except Exception as e:
@@ -127,12 +179,12 @@ def preload_version_cache(cursor: Any) -> None:
     """Preload the active repository's refs into in-memory caches from native m_git_ref."""
     _PRELOADED["loaded"] = True
     try:
-        cursor.execute(
+        rows = _exec_query(
+            cursor,
             f"SELECT r.commit_id, r.ref_name FROM m_git_ref r WHERE r.commit_id > 0 AND r.repo_id = %s AND {finished_ref_sql()} "
             "ORDER BY r.commit_id ASC;",
             (get_active_repo_id(cursor),),
         )
-        rows = cursor.fetchall()
         for r in rows:
             if isinstance(r, dict):
                 rvid = r.get("commit_id")
@@ -170,17 +222,17 @@ def get_version_info(cursor: Any, version_name_or_id: str | int) -> tuple[int | 
     # Database query: try m_git_ref (for tags/branches), then m_commit (for arbitrary Git commit SHAs)
     try:
         if ver_str.isdigit():
-            cursor.execute(
+            row = _exec_query_one(
+                cursor,
                 f"SELECT r.commit_id AS vid, r.ref_name AS vname FROM m_git_ref r WHERE r.commit_id = %s AND r.repo_id = %s AND {finished_ref_sql()} LIMIT 1;",
                 (int(ver_str), get_active_repo_id(cursor)),
             )
-            row = cursor.fetchone()
             if not row:
-                cursor.execute(
+                c_row = _exec_query_one(
+                    cursor,
                     "SELECT commit_id AS vid, commit_hash FROM m_commit WHERE commit_id = %s LIMIT 1;",
                     (int(ver_str),),
                 )
-                c_row = cursor.fetchone()
                 if c_row:
                     cid = c_row["vid"] if isinstance(c_row, dict) else c_row[0]
                     c_h = c_row["commit_hash"] if isinstance(c_row, dict) else c_row[1]
@@ -191,11 +243,11 @@ def get_version_info(cursor: Any, version_name_or_id: str | int) -> tuple[int | 
                         _VID_TO_NAME_CACHE[cid] = hex_str
                     return cid, hex_str
         else:
-            cursor.execute(
+            row = _exec_query_one(
+                cursor,
                 f"SELECT r.commit_id AS vid, r.ref_name AS vname FROM m_git_ref r WHERE r.ref_name = %s AND r.repo_id = %s AND {finished_ref_sql()} LIMIT 1;",
                 (ver_str, get_active_repo_id(cursor)),
             )
-            row = cursor.fetchone()
 
         if row:
             if isinstance(row, dict):
@@ -214,20 +266,20 @@ def get_version_info(cursor: Any, version_name_or_id: str | int) -> tuple[int | 
         if is_hex:
             if len(ver_str) == 40:
                 c_bytes = bytes.fromhex(ver_str)
-                cursor.execute(
+                c_rows = _exec_query(
+                    cursor,
                     f"SELECT c.commit_id, c.commit_hash FROM m_commit c WHERE c.commit_hash = %s AND {finished_ref_sql('c')} LIMIT 1;",
                     (c_bytes,),
                 )
-                c_rows = cursor.fetchall()
             else:
                 # Every digit counts (git abbreviates to 7), and a prefix two commits share names neither
                 lo, hi = commit_prefix_range(ver_str)
-                cursor.execute(
+                c_rows = _exec_query(
+                    cursor,
                     f"SELECT c.commit_id, c.commit_hash FROM m_commit c WHERE c.commit_hash >= %s"
                     f"{' AND c.commit_hash < %s' if hi else ''} AND {finished_ref_sql('c')} LIMIT 2;",
                     (lo, hi) if hi else (lo,),
                 )
-                c_rows = cursor.fetchall()
                 if len(c_rows) > 1:
                     return None, ver_str
             c_row = c_rows[0] if c_rows else None
@@ -259,11 +311,11 @@ def get_version_info(cursor: Any, version_name_or_id: str | int) -> tuple[int | 
                 git_sha = out.stdout.strip()
                 if len(git_sha) == 40:
                     c_bytes = bytes.fromhex(git_sha)
-                    cursor.execute(
+                    c_row = _exec_query_one(
+                        cursor,
                         f"SELECT c.commit_id FROM m_commit c WHERE c.commit_hash = %s AND {finished_ref_sql('c')} LIMIT 1;",
                         (c_bytes,),
                     )
-                    c_row = cursor.fetchone()
                     if c_row:
                         cid = c_row["commit_id"] if isinstance(c_row, dict) else c_row[0]
                         _NAME_TO_VID_CACHE[ver_str] = cid

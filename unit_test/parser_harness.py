@@ -101,7 +101,7 @@ def _content_hash(cs: ChangeSet, gp_inst: Any) -> bytes:
 
 
 # Physical symbol tables (core/SymbolRows.py); snapshots hold the layout-independent view rows instead
-_PHYSICAL_SYMBOL_TABLES = ("m_blob_symbol_def", "m_blob_symbol_ref", "m_tag_def", "m_tag_ref", "m_blob_symbol", "m_symbol_own")
+_PHYSICAL_SYMBOL_TABLES = ("m_blob_symbol_def", "m_blob_symbol_ref", "m_tag_def", "m_tag_ref", "m_blob_symbol", "m_blob_symbol_file", "m_symbol_own")
 _SYMBOL_VIEW_COLUMNS = {
     "m_symbol_def": ("blob_id", "tag_id", "ast_id", "name", "type_id", "linkage", "line_s", "line_e"),
     "m_symbol_ref": ("blob_id", "tag_id", "ast_id", "target_fnid", "role", "line", "char_s"),

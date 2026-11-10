@@ -79,6 +79,27 @@ class TestInsertSemantics(unittest.TestCase):
     def test_symbol_definitions_are_not_cached(self) -> None:
         self.assertFalse(m_blob_symbol_def.te_cached)
 
+    def test_reserve_id_block_sql_advances_sequence_beyond_existing_max(self) -> None:
+        from unittest import mock
+        from core.DBLayout import m_file_reference
+
+        db = MariaDB.__new__(MariaDB)
+        mock_cnx = mock.MagicMock()
+        mock_cursor = mock.MagicMock()
+        mock_cnx.cursor.return_value = mock_cursor
+        db.cnx = mock_cnx
+
+        executed = []
+        mock_cursor.execute.side_effect = lambda sql, params=None: executed.append((sql, params))
+        mock_cursor.fetchone.return_value = (50000,)
+
+        start_id, end_id = db.reserve_id_block(m_file_reference, 1000)
+        self.assertEqual(start_id, 50000)
+        self.assertEqual(end_id, 50999)
+
+        upsert_sql = executed[0][0]
+        self.assertIn("ON DUPLICATE KEY UPDATE next_id = GREATEST(next_id, VALUES(next_id))", upsert_sql)
+
 
 class TestBlobHashGuard(unittest.TestCase):
     def test_files_needing_a_hash_without_one_are_refused(self) -> None:
@@ -147,6 +168,13 @@ class TestCommitRangeIngestion(unittest.TestCase):
         self.assertEqual(main._person_key(None, None), ("Unknown", ""))
 
 
+class TestPreloadSummary(_TableEngineTestCase):
+    def test_preload_summary_logs_cached_tables(self) -> None:
+        with self.assertLogs("main", level="INFO") as cm:
+            main._log_preload_summary(0.42)
+        self.assertTrue(any("Preloaded cached tables in 0.4s" in output for output in cm.output))
+
+
 class TestReuseParsedBlobs(_TableEngineTestCase):
     def test_already_parsed_blobs_are_linked_instead_of_parsed(self) -> None:
         known = b"\x07" * 20
@@ -164,7 +192,8 @@ class TestReuseParsedBlobs(_TableEngineTestCase):
         self.assertEqual(main.gp.file_blob_ids["drivers/a.c"], 7)
         fnid = G.TE.get(main.m_file_name.table_id, (None, "drivers/a.c"))[0]
         self.assertIsNotNone(G.TE.get(m_bridge_checkpoint.table_id, (5, fnid, None)))
-        self.assertIn((5, fnid), G.TE.queued_set[m_commit_file.table_id])
+        # The head commit gets no version-diff m_commit_file row (only Step 6.5 writes what commits touched)
+        self.assertNotIn((5, fnid), G.TE.queued_set.get(m_commit_file.table_id, {}))
         self.assertEqual(main._load_blob_tags([7]), {7: [(70, 7, 1, 3)]})
 
     def test_untagged_blobs_are_parsed_again(self) -> None:

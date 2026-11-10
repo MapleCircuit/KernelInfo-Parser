@@ -972,6 +972,41 @@ export class KconfigEngine {
     }
   }
 
+  /**
+   * `conf --listnewconfig` (check_conf): the options `make oldconfig` would ask about — in menu order, inside
+   * visible menus, changeable and without a user value; a choice without a value is one entry (K3).
+   * @returns {Array<{name, nodeId, kind: "symbol"|"choice", type, prompt, value, menuPath, depends, members?}>}
+   */
+  newSymbols() {
+    const out = [];
+    const seen = new Set();
+    const walk = (id) => {
+      const node = this.nodes[id];
+      if (id !== 0 && !this.menuVisible(id)) return;
+      const name = node.sym;
+      const s = name ? this.syms[name] : null;
+      if (s && !seen.has(name) && s.type !== "unknown" && !s.transitional && node.prompt !== null && node.prompt !== undefined) {
+        const entry = (kind, extra = {}) => {
+          seen.add(name);
+          out.push({
+            name, nodeId: id, kind, type: this.getType(name), prompt: node.prompt, value: this.value(name),
+            menuPath: this.menuPath(id), depends: s.dir_dep >= 0 ? this.exprStr(s.dir_dep, true) : "", ...extra,
+          });
+        };
+        if (s.is_choice) {
+          const members = s.members.filter((m) => this.isDefined(m));
+          const answered = this.hasUser(name) || this.choiceUser.has(name) || members.some((m) => this.hasUser(m));
+          if (!answered && this.symTri(name) === 2) entry("choice", { members, selected: this.choiceSelection(name) });
+        } else if (!s.choice && !this.hasUser(name) && this.isChangeable(name)) {
+          entry("symbol");
+        }
+      }
+      for (const c of node.children) walk(c);
+    };
+    if (this.nodes.length) walk(0);
+    return out;
+  }
+
   // ------------------------------------------------------------------ menus and output
   /** menu_is_visible. */
   menuVisible(id) {

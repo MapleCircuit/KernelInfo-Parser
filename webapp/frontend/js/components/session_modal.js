@@ -6,6 +6,7 @@ import { sessionManager } from "../session_manager.js";
 import { state } from "../state.js";
 import { toast } from "./toast.js";
 import { escapeHtml } from "./modal.js";
+import { exportSessionDialog, importSessionDialog } from "./session_transfer_ui.js";
 
 function formatRelativeTime(timestamp) {
   if (!timestamp) return "Just now";
@@ -76,6 +77,9 @@ export function showSessionPickerModal({ allowClose = false, onSelect = null } =
                 <button type="button" class="session-btn session-btn-duplicate" data-dup-id="${escapeHtml(s.id)}" title="Duplicate this session into a new session">
                   Duplicate
                 </button>
+                <button type="button" class="session-btn session-btn-export" data-export-id="${escapeHtml(s.id)}" title="Export this session to a JSON file (G07)">
+                  ⤓ Export
+                </button>
                 <button type="button" class="session-btn session-btn-delete" title="Delete this session" data-delete-id="${escapeHtml(s.id)}">
                   &times;
                 </button>
@@ -104,6 +108,9 @@ export function showSessionPickerModal({ allowClose = false, onSelect = null } =
           <div style="display:flex;align-items:center;gap:8px;">
             <button type="button" id="btn-modal-new-session" class="session-btn-primary">
               ➕ New Session
+            </button>
+            <button type="button" id="btn-modal-import-session" class="session-btn" title="Import a session exported from another browser (G07)">
+              ⤒ Import…
             </button>
             ${allowClose ? '<button type="button" class="ki-modal-close" id="btn-modal-close">&times;</button>' : ''}
           </div>
@@ -165,6 +172,21 @@ export function showSessionPickerModal({ allowClose = false, onSelect = null } =
         openSession(btn.dataset.openId);
       };
     });
+
+    backdrop.querySelectorAll(".session-btn-export").forEach((btn) => {
+      btn.onclick = (e) => {
+        e.stopPropagation();
+        exportSessionDialog(btn.dataset.exportId);
+      };
+    });
+    const importBtn = backdrop.querySelector("#btn-modal-import-session");
+    if (importBtn) {
+      importBtn.onclick = () => importSessionDialog(() => {
+        // Show the new session in the list
+        backdrop.remove();
+        showSessionPickerModal({ allowClose, onSelect });
+      });
+    }
 
     backdrop.querySelectorAll(".session-btn-duplicate").forEach((btn) => {
       btn.onclick = (e) => {

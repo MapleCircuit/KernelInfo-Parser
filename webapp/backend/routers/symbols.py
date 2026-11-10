@@ -31,6 +31,18 @@ def get_symbol_detail(
     return symbol_service.get_symbol_detail(version_name, symbol_name, arch, from_file)
 
 
+@router.get("/symbols/{version_name}/hover/{symbol_name}")
+def get_symbol_hover(
+    version_name: str,
+    symbol_name: str,
+    arch: ArchParam = DEFAULT_DEFINITION_ARCH,
+    from_file: Annotated[str | None, Query(description="File the symbol is used in")] = None,
+) -> dict[str, Any]:
+    """Hover card (G04): kind, signature, location and kernel-doc of the definition Go to Definition opens."""
+    from webapp.backend.services.hover_service import hover_service
+    return hover_service.hover(version_name, symbol_name, arch, from_file, symbol_service.get_symbol_detail)
+
+
 @router.get("/symbols/{version_name}/xref/{symbol_name}")
 def get_symbol_xref(
     version_name: str,

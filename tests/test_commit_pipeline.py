@@ -17,8 +17,6 @@ import tempfile
 import threading
 import unittest
 
-import mysql.connector
-
 import main
 from core.DBLayout import m_ast, m_blob_symbol_def, m_bridge_checkpoint, m_bridge_tag, m_file_name, m_tag
 from core.GreatProcessor import GreatProcessor
@@ -266,120 +264,6 @@ class TestRetriedCommit(_EngineCase):
         self.te._committed_nodup_keys[m_file_name.table_id][key] = 99
         self.te.commit_all()
         self.assertEqual(self.te.queued_set[m_file_name.table_id], {})
-
-
-class _FakeCursor:
-    def execute(self, *args, **kwargs) -> None:
-        pass
-
-
-class _FakeCnx:
-    def __init__(self) -> None:
-        self.connection_id = 1
-        self.autocommit = True
-        self.lost = False
-        self.commits = 0
-        self.rollbacks = 0
-
-    def ping(self, reconnect=False, attempts=1, delay=0) -> None:
-        if self.lost:
-            if not reconnect:
-                raise mysql.connector.InterfaceError("server gone")
-            self.lost = False
-            self.connection_id += 1          # mysql-connector reconnects silently with a new session
-
-    def cursor(self) -> _FakeCursor:
-        return _FakeCursor()
-
-    def commit(self) -> None:
-        self.commits += 1
-
-    def rollback(self) -> None:
-        self.rollbacks += 1
-
-
-def _offline_mariadb() -> MariaDB:
-    db = MariaDB.__new__(MariaDB)
-    db.cnx = _FakeCnx()
-    db.cursor = _FakeCursor()
-    db.sessions = 0
-
-    def _init_session() -> None:
-        db.sessions += 1
-
-    db._init_session = _init_session
-    return db
-
-
-class TestMariaDBSessions(unittest.TestCase):
-    def test_silent_reconnect_restores_session_settings(self) -> None:
-        db = _offline_mariadb()
-        db.cnx.lost = True
-        db.check_if_connected()
-        self.assertEqual(db.sessions, 1, "a reconnected session lacks sql_mode and the disabled checks")
-
-    def test_transaction_fails_instead_of_reconnecting(self) -> None:
-        db = _offline_mariadb()
-        with self.assertRaises(ConnectionError):
-            with db.transaction():
-                self.assertFalse(db.cnx.autocommit)
-                db.cnx.lost = True
-                db.check_if_connected()
-        self.assertEqual(db.cnx.rollbacks, 1)
-        self.assertEqual(db.cnx.commits, 0)
-        self.assertTrue(db.cnx.autocommit)
-        self.assertFalse(db._in_txn)
-        self.assertEqual(db.sessions, 0)
-
-    def test_transaction_commits_once(self) -> None:
-        db = _offline_mariadb()
-        with db.transaction():
-            pass
-        self.assertEqual((db.cnx.commits, db.cnx.rollbacks), (1, 0))
-
-
-class _TuningCursor:
-    """Answers SELECT @@GLOBAL.x / SET GLOBAL x like a server that caps some variables."""
-
-    def __init__(self, values: dict, caps: dict) -> None:
-        self.values = dict(values)
-        self.caps = caps
-        self.row = None
-
-    def execute(self, sql: str, params=None) -> None:
-        m = re.match(r"SELECT @@GLOBAL\.(\w+)", sql)
-        if m:
-            if m.group(1) not in self.values:
-                raise mysql.connector.ProgrammingError(msg=f"Unknown system variable '{m.group(1)}'")
-            self.row = (self.values[m.group(1)],)
-            return
-        name = sql.split()[2]
-        self.values[name] = min(params[0], self.caps[name]) if name in self.caps else params[0]
-
-    def fetchone(self):
-        return self.row
-
-
-class TestServerTuning(unittest.TestCase):
-    def _db(self, values: dict, caps: dict | None = None) -> MariaDB:
-        db = _offline_mariadb()
-        db.cursor = _TuningCursor(values, caps or {})
-        return db
-
-    def test_sizes_parse_and_only_grow(self) -> None:
-        self.assertEqual(parse_server_setting("8G"), 8 * 1024**3)
-        self.assertEqual(parse_server_setting("O_DIRECT"), "O_DIRECT")
-        db = self._db({"innodb_log_file_size": 4 * 1024**3, "innodb_flush_log_at_trx_commit": 1})
-        notes = db.apply_server_tuning({"innodb_log_file_size": "2G", "innodb_flush_log_at_trx_commit": 2})
-        self.assertEqual(notes, ["innodb_flush_log_at_trx_commit: 1 -> 2"])
-        self.assertEqual(db.cursor.values["innodb_log_file_size"], 4 * 1024**3)
-
-    def test_capped_and_unknown_variables_are_reported(self) -> None:
-        db = self._db({"innodb_buffer_pool_size": 128 * 1024**2}, caps={"innodb_buffer_pool_size": 128 * 1024**2})
-        notes = db.apply_server_tuning({"innodb_buffer_pool_size": "8G", "no_such_var": 1, "bad name": 1})
-        self.assertTrue(any("capped at 134217728" in n and "restart" in n for n in notes), notes)
-        self.assertTrue(any(n.startswith("no_such_var: not available") for n in notes), notes)
-        self.assertTrue(any(n.startswith("bad name: skipped") for n in notes), notes)
 
 
 class TestStageCounts(unittest.TestCase):

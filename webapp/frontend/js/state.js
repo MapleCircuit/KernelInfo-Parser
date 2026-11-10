@@ -2,6 +2,7 @@
  * state.js - Reactive Global State Store.
  * Manages versions, multi-pane tabs, active tab, kconfig engines and the event bus.
  */
+import { tabRoute } from "./tab_routes.js";
 import { localDB } from "./db.js";
 import { sessionManager } from "./session_manager.js";
 
@@ -95,6 +96,8 @@ class GlobalState {
     this.kconfigProfiles = {};
     // Toolchain profile per "version|ARCH" (compiler, versions, env and probe overrides; see the API docs)
     this.kconfigToolchains = {};
+    // Patch series drafts (P3, §5.33): saved with the session, shared by its tabs
+    this.patchDrafts = null;
 
     // Cross-session synchronization via BroadcastChannel
     // An engine appearing or going away in another session changes what the code tabs here can
@@ -758,6 +761,9 @@ class GlobalState {
           if (t.type === "diff") return true;
           if (t.type === "pahole") return (t.structName || "") === (tabData.structName || "") && t.version === tabData.version;
           if (t.type === "callgraph") return (t.functionName || "") === (tabData.functionName || "") && t.version === tabData.version;
+          // Types registered in tab_routes.js decide themselves (default: one tab of the type is reused)
+          const route = tabRoute(t.type);
+          if (route) return route.sameTab ? route.sameTab(t, tabData) : true;
           return t.title === tabData.title;
         });
 
@@ -770,13 +776,26 @@ class GlobalState {
         "section", "secId", "person", "role", "sort", "structName", "functionName"];
       // An empty value ("", 0, null) addresses the same thing as an absent one
       const navValue = (x) => JSON.stringify(x === "" || x === 0 || x === null ? undefined : x);
-      if (NAV_KEYS.some((k) => tabData[k] !== undefined && navValue(tabData[k]) !== navValue(existing[k]))) {
+      const routeOf = tabRoute(existing.type);
+      const navKeys = routeOf ? [...NAV_KEYS, ...routeOf.keys] : NAV_KEYS;
+      if (navKeys.some((k) => tabData[k] !== undefined && navValue(tabData[k]) !== navValue(existing[k]))) {
         delete existing.scrollPositions;
+      }
+      if (routeOf) {
+        // A registered tab type: the fields that address what it shows come from the link (empty = cleared)
+        for (const key of routeOf.keys) {
+          if (tabData[key] === undefined) continue;
+          if (tabData[key] === "" || tabData[key] === 0 || tabData[key] === null || tabData[key] === false) delete existing[key];
+          else existing[key] = tabData[key];
+        }
       }
       if (tabData.cursorLine) {
         existing.cursorLine = tabData.cursorLine;
         // Navigating to a line overrides the position this tab was left at
         delete existing.scrollTop;
+        // A line (or a range, G06) replaces the selected range
+        if (tabData.lineEnd && tabData.lineEnd > tabData.cursorLine) existing.lineEnd = tabData.lineEnd;
+        else delete existing.lineEnd;
       }
       if ("diffMarks" in tabData) existing.diffMarks = tabData.diffMarks;
       // "⇄ Diff" (§5.21): a deep link sets or clears the file the tab is diffed with; another diff
@@ -790,6 +809,12 @@ class GlobalState {
       if ("diffLayout" in tabData) {
         if (tabData.diffLayout) existing.diffLayout = tabData.diffLayout;
         else delete existing.diffLayout;
+      }
+      // Blame on/off and its options (H9): a link or "blame before this change" sets them
+      for (const key of ["blame", "blameOpts"]) {
+        if (!(key in tabData)) continue;
+        if (tabData[key]) existing[key] = tabData[key];
+        else delete existing[key];
       }
       if (tabData.symbol !== undefined) existing.symbol = tabData.symbol;
       if (tabData.title) existing.title = tabData.title;
@@ -818,7 +843,7 @@ class GlobalState {
       }
       if (tabData.type === "diff") {
         // A Compare deep link: the revisions (when given), mode, chips, filters and rename searches
-        for (const key of ["versionA", "versionB", "mode", "statuses", "kconfigQuery", "kconfigStatuses", "renameSearches"]) {
+        for (const key of ["versionA", "versionB", "mode", "statuses", "kconfigQuery", "kconfigStatuses", "renameSearches", "apiKinds", "apiStatuses", "apiQuery", "apiArch"]) {
           if (tabData[key] !== undefined) existing[key] = tabData[key];
         }
       }
@@ -1042,6 +1067,7 @@ class GlobalState {
     }
     this.kconfigProfiles = sharedProfiles;
     this.kconfigToolchains = sharedToolchains;
+    this.patchDrafts = sessionData.patchDrafts && typeof sessionData.patchDrafts === "object" ? sessionData.patchDrafts : null;
 
     // Rehydrate engines for live Kconfig tabs
     const engineIds = Array.isArray(sessionData.kconfigEngineTabIds) ? sessionData.kconfigEngineTabIds : [];
@@ -1070,6 +1096,18 @@ class GlobalState {
     this.emit("layout:changed", { splitMode: this.splitMode, panes: this.panes });
     this.emit("tabs:changed", { paneId: this.activePaneId, activeTabId: this.getActiveTab()?.id });
     this.emit("version:changed", this.currentVersion);
+  }
+
+  /** The session's patch series draft (P3), or null. */
+  getPatchDrafts() {
+    return this.patchDrafts;
+  }
+
+  /** Replace the patch series draft (null clears it); saved with the session. */
+  setPatchDrafts(draft) {
+    this.patchDrafts = draft || null;
+    this.saveState();
+    this.emit("patch:drafts", this.patchDrafts);
   }
 
   /**
@@ -1105,6 +1143,7 @@ class GlobalState {
         splitMode: this.splitMode,
         activePaneId: this.activePaneId,
         panes: this.panes,
+        patchDrafts: this.patchDrafts,
       };
 
       if (this.currentSessionId) {

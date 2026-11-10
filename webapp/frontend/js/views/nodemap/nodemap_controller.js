@@ -11,6 +11,7 @@ import { escapeHtml } from "../../components/modal.js";
 import { NodeModel, EdgeModel } from "./node_model.js";
 import { EdgeRouter } from "./edge_router.js";
 import { NodeRenderer } from "./node_renderer.js";
+import { resolveColor, token } from "../../utils/theme.js";
 
 export class NodeMapController {
   constructor() {
@@ -268,7 +269,7 @@ export class NodeMapController {
       type: "func",
       x: 120,
       y: 100,
-      color: "#bc8cff",
+      color: "var(--accent-purple)",
       constituents: [{ name: "__schedule()" }, { name: "context_switch()" }]
     });
 
@@ -278,7 +279,7 @@ export class NodeMapController {
       type: "struct",
       x: 440,
       y: 100,
-      color: "#58a6ff",
+      color: "var(--accent-blue)",
       constituents: [{ name: "state" }, { name: "stack" }, { name: "flags" }, { name: "prio" }]
     });
 
@@ -310,7 +311,7 @@ export class NodeMapController {
       astId: data.astId,
       x: Math.round((200 - this.panX) / this.zoom),
       y: Math.round((150 - this.panY) / this.zoom),
-      color: data.type === 5 || data.type === 6 || data.type === "func" ? "#bc8cff" : "#58a6ff",
+      color: data.type === 5 || data.type === 6 || data.type === "func" ? "var(--accent-purple)" : "var(--accent-blue)",
       constituents: data.constituents || []
     });
 
@@ -494,7 +495,7 @@ export class NodeMapController {
       type: name.startsWith("struct ") ? "struct" : "symbol",
       x: fromNode.x + (fromNode.width || 200) + 80,
       y: fromNode.y,
-      color: name.startsWith("struct ") ? "#58a6ff" : "#bc8cff"
+      color: name.startsWith("struct ") ? "var(--accent-blue)" : "var(--accent-purple)"
     });
 
     this.nodes.push(newNode);
@@ -522,7 +523,7 @@ export class NodeMapController {
       type: title.startsWith("struct ") ? "struct" : "symbol",
       x: fromNode.x + (fromNode.width || 200) + 80,
       y: fromNode.y + constituentIndex * 24,
-      color: title.startsWith("struct ") ? "#58a6ff" : "#bc8cff"
+      color: title.startsWith("struct ") ? "var(--accent-blue)" : "var(--accent-purple)"
     });
 
     this.nodes.push(newNode);
@@ -670,7 +671,7 @@ export class NodeMapController {
 
   exportSVG() {
     // Lossless SVG export
-    let svgContent = `<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1200" viewBox="0 0 1600 1200" style="background:#0a0d12;">\n`;
+    let svgContent = `<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1200" viewBox="0 0 1600 1200" style="background:${resolveColor("var(--bg-canvas)")};">\n`;
 
     // Edges
     this.edges.forEach((edge) => {
@@ -678,7 +679,7 @@ export class NodeMapController {
       const toNode = this.nodes.find((n) => n.id === edge.toNodeId);
       if (fromNode && toNode) {
         const p = EdgeRouter.computeBezierPath(fromNode.x + fromNode.width, fromNode.y + 40, toNode.x, toNode.y + 40);
-        svgContent += `  <path d="${p.svgPath}" stroke="#58a6ff" stroke-width="2" fill="none"/>\n`;
+        svgContent += `  <path d="${p.svgPath}" stroke="${resolveColor("var(--accent-blue)")}" stroke-width="2" fill="none"/>\n`;
       }
     });
 
@@ -686,9 +687,9 @@ export class NodeMapController {
     this.nodes.forEach((node) => {
       svgContent += `
         <g transform="translate(${node.x}, ${node.y})">
-          <rect width="${node.width}" height="100" rx="6" fill="#161b22" stroke="${node.color}" stroke-width="2"/>
-          <text x="12" y="24" fill="#ffffff" font-family="sans-serif" font-weight="bold" font-size="12">${escapeHtml(node.title)}</text>
-          <text x="12" y="44" fill="#8b949e" font-family="monospace" font-size="10">${escapeHtml(node.type)}</text>
+          <rect width="${node.width}" height="100" rx="6" fill="${resolveColor("var(--bg-secondary)")}" stroke="${resolveColor(node.color)}" stroke-width="2"/>
+          <text x="12" y="24" fill="${resolveColor("var(--text-primary)")}" font-family="sans-serif" font-weight="bold" font-size="12">${escapeHtml(node.title)}</text>
+          <text x="12" y="44" fill="${resolveColor("var(--text-secondary)")}" font-family="monospace" font-size="10">${escapeHtml(node.type)}</text>
         </g>
       `;
     });
@@ -709,11 +710,11 @@ export class NodeMapController {
     canvas.height = 1200;
     const ctx = canvas.getContext("2d");
 
-    ctx.fillStyle = "#0a0d12";
+    ctx.fillStyle = token("--bg-canvas", "#0a0d12");
     ctx.fillRect(0, 0, canvas.width, canvas.height);
 
     // Draw edges first so they sit beneath nodes
-    ctx.strokeStyle = "#58a6ff";
+    ctx.strokeStyle = token("--accent-blue", "#58a6ff");
     ctx.lineWidth = 2;
     this.edges.forEach((edge) => {
       const fromNode = this.nodes.find((n) => n.id === edge.fromNodeId);
@@ -733,17 +734,17 @@ export class NodeMapController {
 
     // Draw nodes
     this.nodes.forEach((node) => {
-      ctx.fillStyle = "#161b22";
+      ctx.fillStyle = token("--bg-secondary", "#161b22");
       ctx.strokeStyle = node.color;
       ctx.lineWidth = 2;
       ctx.fillRect(node.x, node.y, node.width, 100);
       ctx.strokeRect(node.x, node.y, node.width, 100);
 
-      ctx.fillStyle = "#ffffff";
+      ctx.fillStyle = token("--text-primary", "#ffffff");
       ctx.font = "bold 12px sans-serif";
       ctx.fillText(node.title, node.x + 12, node.y + 24);
 
-      ctx.fillStyle = "#8b949e";
+      ctx.fillStyle = token("--text-secondary", "#8b949e");
       ctx.font = "10px monospace";
       ctx.fillText(node.type, node.x + 12, node.y + 44);
     });

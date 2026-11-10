@@ -9,7 +9,7 @@ import bisect
 import subprocess
 import logging
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Iterator, Sequence
 
 from core.globalstuff import G
 from parser.git_ast.git_types import (
@@ -33,9 +33,32 @@ BODY_END_SEP = "\x1d"  # Separates body from file status list
 INITIAL_HUNK_COMMIT_CAP = 1000  # whole history up to new_rev (no old_rev)
 RANGE_HUNK_COMMIT_CAP = 20000   # old_rev..new_rev
 
-# Regex to extract structured git trailers
+# Regex to extract structured git trailers (supports Co-authored-by, Reported-and-tested-by, <email>, and bare email)
 TRAILER_PATTERN = re.compile(
-    r"^(Co-developed-by|Signed-off-by|Reviewed-by|Acked-by|Tested-by|Reported-by|Suggested-by|Merged-by|Requested-by):\s*(.+?)\s*<([^>\n\r]+)>",
+    r"^(Co-developed-by|Co-authored-by|Originally-by|Signed-off-by|Reviewed-by|Acked-by|Tested-by|Debugged-by|Reported-by|Reported-and-tested-by|Reviewed-and-tested-by|Suggested-by|Fix-suggested-by|Merged-by|Requested-by):\s*(?:([^<\n\r]+?)\s*)??(?:<([^>\n\r]+)>|([^\s<>@]+@[^\s<>@]+))",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def iter_trailers(message: str) -> Iterator[tuple[str, str, str]]:
+    """(trailer prefix, name, email) of every contributor trailer of a message (TRAILER_PATTERN).
+
+    The one reading of a trailer's groups, shared by the parser and the webapp (release passes): a
+    trailer without a name (`Reported-by: a@b`, `Reported-by: <a@b>`) takes its address as the name;
+    the email is the `<...>` part, else the bare address."""
+    for match in TRAILER_PATTERN.finditer(message or ""):
+        prefix, name, email_angle, email_bare = match.groups()
+        email = (email_angle or email_bare or "").strip()
+        yield prefix, (name or "").strip() or email, email
+
+
+# Regexes to extract Fixes: tags and revert references
+FIXES_PATTERN = re.compile(
+    r"^Fixes:\s*([0-9a-fA-F]{7,40})",
+    re.IGNORECASE | re.MULTILINE,
+)
+REVERT_PATTERN = re.compile(
+    r"(?:This reverts commit\s+|^Revert\s+[\"']?)([0-9a-fA-F]{7,40})",
     re.IGNORECASE | re.MULTILINE,
 )
 
@@ -390,7 +413,23 @@ class GitCommitParser:
         if not raw_output:
             return [], {}
 
-        return self.parse_commit_log_with_hunks(raw_output)
+        commits, file_hunks_map = self.parse_commit_log_with_hunks(raw_output)
+        if range_count > RANGE_HUNK_COMMIT_CAP and not limit:
+            skip_count = len(commits)
+            remain_args = [
+                "log",
+                f"--format={fmt_spec}",
+                "--name-status",
+                f"--skip={skip_count}",
+                revision_arg,
+                "--",
+            ]
+            remain_out = self._run_git(remain_args, max_output_bytes=512 * 1024 * 1024, timeout=300)
+            if remain_out:
+                older_commits = self.parse_commit_log(remain_out)
+                commits.extend(older_commits)
+
+        return commits, file_hunks_map
 
     @classmethod
     def parse_commit_log(cls, raw_output: str) -> list[GitCommit]:
@@ -599,35 +638,62 @@ class GitCommitParser:
 
             # 4. Trailers in commit message body
             priority_idx = len(contributors)
-            for match in TRAILER_PATTERN.finditer(message):
-                trailer_tag, t_name, t_email = match.groups()
-                t_role = CommitRole.from_trailer_prefix(trailer_tag)
-                t_name = t_name.strip()
-                t_email = t_email.strip()
-                t_key = (t_name.lower(), t_email.lower(), int(t_role))
-                if t_key not in seen_contributors:
-                    contributors.append(
-                        GitContributor(
-                            name=t_name or t_email,
-                            email=t_email,
-                            role=t_role,
-                            priority=priority_idx,
+            for trailer_tag, t_name, t_email in iter_trailers(message):
+                for t_role in CommitRole.roles_from_trailer_prefix(trailer_tag):
+                    t_key = (t_name.lower(), t_email.lower(), int(t_role))
+                    if t_key not in seen_contributors:
+                        contributors.append(
+                            GitContributor(
+                                name=t_name or t_email,
+                                email=t_email,
+                                role=t_role,
+                                priority=priority_idx,
+                            )
                         )
-                    )
-                    seen_contributors.add(t_key)
-                    priority_idx += 1
+                        seen_contributors.add(t_key)
+                        priority_idx += 1
+
+            # Fixes and reverts
+            fixes_commits = [m.group(1).lower() for m in FIXES_PATTERN.finditer(message)]
+            reverted_commits = [m.group(1).lower() for m in REVERT_PATTERN.finditer(message)]
 
             # 5. Parse modified files
             modified_files: list[tuple[str, str]] = []
+            file_blobs: dict[str, tuple[str, str, str]] = {}
             for file_line in file_part.strip().splitlines():
                 file_line = file_line.strip()
                 if not file_line:
                     continue
-                parts = file_line.split("\t")
-                if len(parts) >= 2:
-                    change_type = parts[0][0].upper()
-                    file_path = parts[-1].strip()
-                    modified_files.append((change_type, file_path))
+                if file_line.startswith(":"):
+                    parts = file_line.split("\t")
+                    if len(parts) >= 2:
+                        meta = parts[0].split()
+                        if len(meta) >= 5:
+                            status = meta[4]
+                            ch_type = status[0].upper()
+                            old_sha = meta[2].strip("0")
+                            new_sha = meta[3].strip("0")
+                            if ch_type in ("R", "C") and len(parts) >= 3:
+                                old_p = parts[1].strip()
+                                new_p = parts[2].strip()
+                            else:
+                                new_p = parts[1].strip()
+                                old_p = "" if ch_type == "A" else new_p
+                            modified_files.append((ch_type, new_p))
+                            if old_sha or new_sha or old_p != new_p:
+                                file_blobs[new_p] = (old_p, old_sha, new_sha)
+                else:
+                    parts = file_line.split("\t")
+                    if len(parts) >= 2:
+                        change_type = parts[0][0].upper()
+                        if change_type in ("R", "C") and len(parts) >= 3:
+                            old_path = parts[1].strip()
+                            file_path = parts[2].strip()
+                            modified_files.append((change_type, file_path))
+                            file_blobs[file_path] = (old_path, "", "")
+                        else:
+                            file_path = parts[-1].strip()
+                            modified_files.append((change_type, file_path))
 
             commits.append(
                 GitCommit(
@@ -642,12 +708,15 @@ class GitCommitParser:
                     message=message,
                     contributors=contributors,
                     files=modified_files,
+                    file_blobs=file_blobs,
                     is_merge=is_merge,
                     parents=parents,
                     merge_requester_name=req_name,
                     merge_requester_email=req_email,
                     merged_branch=merged_branch,
                     merged_commits_summary=merged_summaries,
+                    fixes_commits=fixes_commits,
+                    reverted_commits=reverted_commits,
                 )
             )
 
@@ -875,23 +944,24 @@ class GitCommitParser:
                         seen_contributors.add(c_key)
 
             priority_idx = len(contributors)
-            for match in TRAILER_PATTERN.finditer(message):
-                trailer_tag, t_name, t_email = match.groups()
-                t_role = CommitRole.from_trailer_prefix(trailer_tag)
-                t_name = t_name.strip()
-                t_email = t_email.strip()
-                t_key = (t_name.lower(), t_email.lower(), int(t_role))
-                if t_key not in seen_contributors:
-                    contributors.append(
-                        GitContributor(
-                            name=t_name or t_email,
-                            email=t_email,
-                            role=t_role,
-                            priority=priority_idx,
+            for trailer_tag, t_name, t_email in iter_trailers(message):
+                for t_role in CommitRole.roles_from_trailer_prefix(trailer_tag):
+                    t_key = (t_name.lower(), t_email.lower(), int(t_role))
+                    if t_key not in seen_contributors:
+                        contributors.append(
+                            GitContributor(
+                                name=t_name or t_email,
+                                email=t_email,
+                                role=t_role,
+                                priority=priority_idx,
+                            )
                         )
-                    )
-                    seen_contributors.add(t_key)
-                    priority_idx += 1
+                        seen_contributors.add(t_key)
+                        priority_idx += 1
+
+            # Fixes and reverts
+            fixes_commits = [m.group(1).lower() for m in FIXES_PATTERN.finditer(message)]
+            reverted_commits = [m.group(1).lower() for m in REVERT_PATTERN.finditer(message)]
 
             # Parse patch_part for modified files, their blobs and diff hunks (header lines are only read
             # between `diff --git` and the first hunk, so patch content can never be taken for them)
@@ -904,8 +974,13 @@ class GitCommitParser:
 
             for line in patch_part.splitlines():
                 if line.startswith("diff --git "):
-                    m_paths = _DIFF_GIT_RE.match(line)
-                    a_path, b_path = m_paths.groups() if m_paths else ("", line.split(" ")[-1].removeprefix("b/"))
+                    rest = line[len("diff --git "):]
+                    guess = rest[2: 2 + (len(rest) - 5) // 2] if len(rest) >= 5 and rest.startswith("a/") else ""
+                    if guess and f"a/{guess} b/{guess}" == rest:
+                        a_path, b_path = guess, guess
+                    else:
+                        m_paths = _DIFF_GIT_RE.match(line)
+                        a_path, b_path = m_paths.groups() if m_paths else ("", line.split(" ")[-1].removeprefix("b/"))
                     cur = {"path": b_path, "old_path": a_path, "change": "M", "hunks": [], "old_sha": "", "new_sha": ""}
                     entries.append(cur)
                     in_header = True
@@ -915,12 +990,20 @@ class GitCommitParser:
                         cur["change"] = "A"
                     elif line.startswith("deleted file mode"):
                         cur["change"] = "D"
-                    elif line.startswith(("similarity index", "rename from ", "copy from ")):
-                        cur["change"] = "C" if line.startswith("copy") else "R"
-                        if line.startswith(("rename from ", "copy from ")):
-                            cur["old_path"] = line.split(" from ", 1)[1]
-                    elif line.startswith(("rename to ", "copy to ")):
+                    elif line.startswith("copy from "):
+                        cur["change"] = "C"
+                        cur["old_path"] = line.split(" from ", 1)[1]
+                    elif line.startswith("copy to "):
+                        cur["change"] = "C"
                         cur["path"] = line.split(" to ", 1)[1]
+                    elif line.startswith("rename from "):
+                        cur["change"] = "R"
+                        cur["old_path"] = line.split(" from ", 1)[1]
+                    elif line.startswith("rename to "):
+                        cur["change"] = "R"
+                        cur["path"] = line.split(" to ", 1)[1]
+                    elif line.startswith("similarity index"):
+                        pass
                     elif line.startswith("index "):
                         shas = line[6:].split(" ", 1)[0].split("..")
                         if len(shas) == 2:
@@ -932,13 +1015,45 @@ class GitCommitParser:
                     if h_match:
                         os_, oc, ns, nc = h_match.groups()
                         cur["hunks"].append((int(os_), 1 if oc is None else int(oc), int(ns), 1 if nc is None else int(nc)))
-                elif line.startswith(("M\t", "A\t", "D\t", "R")) and "\t" in line and cur is None:
-                    # Name-status records (logs without patches)
-                    parts = line.strip().split("\t")
-                    f_path = parts[-1].strip()
-                    if f_path not in seen_files:
-                        seen_files.add(f_path)
-                        modified_files.append((parts[0][0].upper(), f_path))
+                elif line.startswith(("M\t", "A\t", "D\t", "R", "C", ":")) and cur is None:
+                    # Name-status records or raw records (logs without patches)
+                    if line.startswith(":"):
+                        # :100644 100644 <old_sha> <new_sha> <status>\t<path1>[\t<path2>]
+                        parts = line.split("\t")
+                        if len(parts) >= 2:
+                            meta = parts[0].split()
+                            if len(meta) >= 5:
+                                status = meta[4]
+                                ch_type = status[0].upper()
+                                old_sha = meta[2].strip("0")
+                                new_sha = meta[3].strip("0")
+                                if ch_type in ("R", "C") and len(parts) >= 3:
+                                    old_p = parts[1].strip()
+                                    new_p = parts[2].strip()
+                                else:
+                                    new_p = parts[1].strip()
+                                    old_p = "" if ch_type == "A" else new_p
+                                if new_p not in seen_files:
+                                    seen_files.add(new_p)
+                                    modified_files.append((ch_type, new_p))
+                                if old_sha or new_sha or old_p != new_p:
+                                    file_blobs[new_p] = (old_p, old_sha, new_sha)
+                    else:
+                        parts = line.strip().split("\t")
+                        if len(parts) >= 2:
+                            ch_type = parts[0][0].upper()
+                            if ch_type in ("R", "C") and len(parts) >= 3:
+                                old_p = parts[1].strip()
+                                new_p = parts[2].strip()
+                                if new_p not in seen_files:
+                                    seen_files.add(new_p)
+                                    modified_files.append((ch_type, new_p))
+                                file_blobs[new_p] = (old_p, "", "")
+                            else:
+                                f_path = parts[-1].strip()
+                                if f_path not in seen_files:
+                                    seen_files.add(f_path)
+                                    modified_files.append((ch_type, f_path))
 
             for entry in entries:
                 path = entry["path"]
@@ -971,6 +1086,8 @@ class GitCommitParser:
                     merge_requester_email=req_email,
                     merged_branch=merged_branch,
                     merged_commits_summary=merged_summaries,
+                    fixes_commits=fixes_commits,
+                    reverted_commits=reverted_commits,
                 )
             )
 

@@ -18,6 +18,7 @@
  * Disabling it keeps every value (the tab's profile is untouched; editing just stops being constrained).
  */
 import { api } from "../../api.js";
+import { shortcuts } from "../../utils/shortcuts.js";
 import { state, kconfigProfileKey } from "../../state.js";
 import { toast } from "../../components/toast.js";
 import { KconfigEngine } from "./kconfig_engine.js";
@@ -25,8 +26,10 @@ import { KconfigParser } from "./kconfig_parser.js";
 import { MenuconfigTui } from "./menuconfig_tui.js";
 import { KconfigHistory } from "./kconfig_history.js";
 import { openModal, escapeHtml, downloadText } from "../../components/modal.js";
+import { showChangePreview, previewOrApply } from "../../components/change_preview.js";
 import { showKconfigHistoryModal } from "../../components/symbol_history_modal.js";
 import { COLLAPSE_ICON } from "../../utils/icons.js";
+import { renderReview, setReview, showFragmentsDialog, showHardwareDialog, startReview } from "./kconfig_workflows.js";
 
 const DEFAULT_ARCH = "x86_64";
 const TRI_CHAR = ["n", "m", "y"];
@@ -68,8 +71,7 @@ export class KconfigView {
     // consecutive states, in memory only. Commits made while loading a model are not changes.
     this.history = new KconfigHistory();
     this.historyPaused = 0;
-    this.onUndoKey = (e) => this.handleUndoKey(e);
-    document.addEventListener("keydown", this.onUndoKey);
+    // Mod+Z / Mod+Shift+Z / Mod+Y come from the shortcut registry (module end, webapp/API.md §5.31)
 
     // This tab's engine can be switched off elsewhere (the command palette's *Disable every KConfig
     // engine*, a tab being closed): follow it so the toolbar and the tree never claim an engine this
@@ -96,7 +98,6 @@ export class KconfigView {
   dispose() {
     if (this.unsubscribeEngine) this.unsubscribeEngine();
     if (this.unsubscribeEngineRequest) this.unsubscribeEngineRequest();
-    document.removeEventListener("keydown", this.onUndoKey);
     this.history.clear("");
     this.unsubscribeEngine = null;
     this.unsubscribeEngineRequest = null;
@@ -145,6 +146,7 @@ export class KconfigView {
     this.configName = tabData.configName || "";
     this.searchQuery = tabData.query || "";
     this.listCollapsed = Boolean(tabData.listCollapsed);
+    this.newReview = tabData.newReview || null;
     // A revision or ARCH switch can land on another tab's configuration: take a free name instead
     const ownTab = state.findTab(this.tabId);
     if (ownTab) {
@@ -195,8 +197,14 @@ export class KconfigView {
               <button class="code-btn" id="btn-validate-config" title="Check the configuration against Kconfig constraints">Validate</button>
               <input type="file" id="kconfig-import-file" accept=".config,text/plain,*" hidden />
             </div>
+            <div class="kconfig-btn-row">
+              <button class="code-btn" id="btn-kconfig-fragments" title="Merge configuration fragments (merge_config.sh): preview, then apply">Fragments…</button>
+              <button class="code-btn" id="btn-kconfig-hardware" title="Trim, ensure or build in the modules a machine uses (lsmod, lspci -k)">Hardware…</button>
+              <button class="code-btn" id="btn-kconfig-newopts" title="Review the options make oldconfig would ask about (no value yet)">New options</button>
+            </div>
             <div class="kconfig-status" id="kconfig-status"></div>
           </div>
+          <div class="kconfig-new-banner" id="kconfig-new-banner" hidden></div>
           <div class="kconfig-tree-scroll" id="kconfig-tree-scroll">
             <div class="kconfig-empty">Loading KConfig model for ${escapeHtml(this.currentArch)}...</div>
           </div>
@@ -259,6 +267,9 @@ export class KconfigView {
     };
     c.querySelector("#btn-validate-config").onclick = () => this.showValidation();
     c.querySelector("#btn-compare-config").onclick = () => this.showCompareModal();
+    c.querySelector("#btn-kconfig-fragments").onclick = () => showFragmentsDialog(this);
+    c.querySelector("#btn-kconfig-hardware").onclick = () => showHardwareDialog(this);
+    c.querySelector("#btn-kconfig-newopts").onclick = () => startReview(this);
 
     const searchInput = c.querySelector("#kconfig-search-input");
     searchInput.oninput = () => {
@@ -303,6 +314,7 @@ export class KconfigView {
       this.expandedNodeIds.clear();
       this.selectedSymbol = null;
       this.selectedNodeId = null;
+      if (this.newReview) setReview(this, null); // the review belonged to the ARCH being left
     }
     this.currentArch = arch;
     // The tab carries the ARCH and the name the profile key is built from, so update it first.
@@ -348,6 +360,7 @@ export class KconfigView {
     this.resolvedProfileKey = this.profileKey;
     this.renderTree();
     if (this.selectedSymbol) this.inspectSymbol(this.selectedSymbol);
+    renderReview(this);
   }
 
   /** Load the saved values of this tab's profile into the freshly loaded model (or its defconfig). */
@@ -367,6 +380,8 @@ export class KconfigView {
         if (this.resolvedProfileKey && this.resolvedProfileKey !== this.profileKey) {
           const dropped = report.unknown.length ? `, ${report.unknown.length} unknown for ARCH=${this.currentArch} dropped` : "";
           toast.info(`${Object.keys(saved).length} values loaded and resolved for ${this.currentVersion}${dropped}`);
+          // Options the carried configuration never answered (make oldconfig's questions): reviewable (K3)
+          startReview(this, { from: this.resolvedProfileKey.split("|")[0], quiet: true });
         }
       } else {
         this.rawValues = { ...saved };
@@ -496,20 +511,10 @@ export class KconfigView {
   }
 
   /** Ctrl+Z / Cmd+Z undoes, Ctrl+Shift+Z / Ctrl+Y redoes, while this tab is the one shown. */
-  handleUndoKey(e) {
-    if (!(e.ctrlKey || e.metaKey) || e.altKey) return;
-    const key = e.key.toLowerCase();
-    const redo = (key === "z" && e.shiftKey) || (key === "y" && !e.shiftKey);
-    if (key !== "z" && !redo) return;
-    if (!this.containerEl || !this.containerEl.isConnected || !this.engine.loaded) return;
-    if (state.getActiveTab()?.id !== this.tabId) return;
-    // Text fields keep their own undo; a dialog (or the TUI) owns the keyboard while it is open
-    const t = e.target;
-    if (t && (t.isContentEditable || ["INPUT", "TEXTAREA", "SELECT"].includes(t.tagName))) return;
-    if (document.querySelector(".ki-modal-backdrop")) return;
-    e.preventDefault();
-    if (redo) this.redo();
-    else this.undo();
+  /** Whether this tab's undo/redo keys apply now (shortcut registry `when`; text fields and dialogs are excluded there). */
+  acceptsUndoKeys() {
+    if (!this.containerEl || !this.containerEl.isConnected || !this.engine.loaded) return false;
+    return state.getActiveTab()?.id === this.tabId;
   }
 
   undo() {
@@ -625,33 +630,42 @@ export class KconfigView {
    * when the resolution changes nothing.
    */
   confirmEngineResolution() {
-    const MAX_ROWS = 300;
     const { adjusted, unknown } = this.resolutionDiff();
     if (!adjusted.length && !unknown.length) return Promise.resolve(true);
-    return new Promise((resolve) => {
-      let confirmed = false;
-      const parts = [];
-      if (adjusted.length) parts.push(`${adjusted.length} value${adjusted.length === 1 ? "" : "s"} changed`);
-      if (unknown.length) parts.push(`${unknown.length} unknown symbol${unknown.length === 1 ? "" : "s"} dropped`);
-      const modal = openModal({
-        title: "Enabling the engine changes this configuration",
-        subtitle: `kconfig would not keep it as it is: ${parts.join(", ")}`,
-        width: "820px",
-        footerHtml: `<button class="code-btn active" id="kconfig-confirm-resolve" type="button">Enable engine and apply these changes</button>`,
-        onClose: () => resolve(confirmed),
+
+    const parts = [];
+    if (adjusted.length) parts.push(`${adjusted.length} value${adjusted.length === 1 ? "" : "s"} changed`);
+    if (unknown.length) parts.push(`${unknown.length} unknown symbol${unknown.length === 1 ? "" : "s"} dropped`);
+
+    const sections = [];
+    if (adjusted.length) {
+      sections.push({
+        label: "Adjusted values",
+        rows: adjusted.map((a) => ({
+          name: a.name,
+          from: a.want || '""',
+          to: a.got || '""',
+          why: a.reason,
+        })),
+        fields: ["from", "to", "why"],
+        columns: ["Option", "Now", "After", "Why"],
       });
-      modal.body.innerHTML = `
-        <div class="kconfig-muted" style="margin-bottom:10px;">With the engine on, only configurations kconfig accepts exist, so loading these values resolves them (ARCH=${escapeHtml(this.currentArch)} @ ${escapeHtml(this.currentVersion)}). <strong>Close</strong> leaves the engine off and the values exactly as they are.</div>
-        ${adjusted.length ? `<table class="kconfig-cmp-table"><thead><tr><th>Option</th><th>Now</th><th>After</th><th>Why</th></tr></thead>
-        <tbody>${adjusted.slice(0, MAX_ROWS).map((a) => `<tr><td>CONFIG_${escapeHtml(a.name)}</td><td>${escapeHtml(a.want || '""')}</td><td>${escapeHtml(a.got || '""')}</td><td class="kconfig-muted">${escapeHtml(a.reason)}</td></tr>`).join("")}</tbody></table>
-        ${adjusted.length > MAX_ROWS ? `<div class="kconfig-muted" style="margin-top:8px;">… and ${adjusted.length - MAX_ROWS} more</div>` : ""}` : ""}
-        ${unknown.length ? `<div class="kconfig-prop-card" style="margin-top:10px;"><div class="kconfig-prop-title">Unknown for ARCH=${escapeHtml(this.currentArch)} (${unknown.length}, dropped by kconfig)</div><div class="kconfig-muted" style="font-family:var(--font-mono);font-size:11px;">${unknown.slice(0, 200).map(escapeHtml).join(" ")}</div></div>` : ""}`;
-      const ok = modal.footer.querySelector("#kconfig-confirm-resolve");
-      ok.onclick = () => {
-        confirmed = true;
-        modal.close();
-      };
-      ok.focus();
+    }
+
+    const notes = [];
+    if (unknown.length) {
+      notes.push(`Unknown for ARCH=${this.currentArch} (${unknown.length}, dropped by kconfig): ${unknown.slice(0, 100).join(", ")}${unknown.length > 100 ? " …" : ""}`);
+    }
+
+    return showChangePreview({
+      title: "Enabling the engine changes this configuration",
+      summary: `kconfig would not keep it as it is: ${parts.join(", ")}`,
+      intro: `With the engine on, only configurations kconfig accepts exist, so loading these values resolves them (ARCH=${this.currentArch} @ ${this.currentVersion}). Close leaves the engine off and the values exactly as they are.`,
+      sections,
+      notes,
+      confirmLabel: "Enable engine and apply these changes",
+      onInspect: (name) => this.selectAndInspectSymbol(name),
+      width: "820px",
     });
   }
 
@@ -853,34 +867,26 @@ export class KconfigView {
 
   /** Ask before a change that lowers other options; resolves true to go ahead. */
   confirmSideEffects(sym, text, lowered) {
-    const MAX_ROWS = 300;
     const value = String(text).toLowerCase()[0];
-    return new Promise((resolve) => {
-      let confirmed = false;
-      const modal = openModal({
-        title: `Set CONFIG_${sym}=${value}?`,
-        subtitle: `${lowered.length} other option${lowered.length === 1 ? "" : "s"} would change as a side effect`,
-        width: "820px",
-        footerHtml: `<button class="code-btn active" id="kconfig-confirm-lower" type="button">Set to ${escapeHtml(value)} anyway</button>`,
-        onClose: () => resolve(confirmed),
-      });
-      modal.body.innerHTML = `
-        <div class="kconfig-muted" style="margin-bottom:10px;">These options need CONFIG_${escapeHtml(sym)} (they depend on it or are selected through it) and are lowered with it:</div>
-        <table class="kconfig-cmp-table"><thead><tr><th>Option</th><th>Now</th><th>After</th><th>Why</th></tr></thead>
-        <tbody>${lowered.slice(0, MAX_ROWS).map((r) => `<tr data-symbol="${escapeHtml(r.name)}" title="Inspect CONFIG_${escapeHtml(r.name)} (cancels this change)"><td>CONFIG_${escapeHtml(r.name)}</td><td>${escapeHtml(r.before)}</td><td>${escapeHtml(r.after)}</td><td class="kconfig-muted">${escapeHtml(r.reason)}</td></tr>`).join("")}</tbody></table>
-        ${lowered.length > MAX_ROWS ? `<div class="kconfig-muted" style="margin-top:8px;">… and ${lowered.length - MAX_ROWS} more</div>` : ""}`;
-      modal.body.querySelectorAll("tr[data-symbol]").forEach((tr) => {
-        tr.onclick = () => {
-          modal.close();
-          this.selectAndInspectSymbol(tr.dataset.symbol);
-        };
-      });
-      const ok = modal.footer.querySelector("#kconfig-confirm-lower");
-      ok.onclick = () => {
-        confirmed = true;
-        modal.close();
-      };
-      ok.focus();
+    const rows = (lowered || []).map((r) => ({
+      name: r.name,
+      from: r.before,
+      to: r.after,
+      why: r.reason,
+    }));
+    return showChangePreview({
+      title: `Set CONFIG_${sym}=${value}?`,
+      summary: `${rows.length} other option${rows.length === 1 ? "" : "s"} would change as a side effect`,
+      intro: `These options need CONFIG_${sym} (they depend on it or are selected through it) and are lowered with it:`,
+      sections: [{
+        label: "Lowered options",
+        rows,
+        fields: ["from", "to", "why"],
+        columns: ["Option", "Now", "After", "Why"],
+      }],
+      confirmLabel: `Set to ${value} anyway`,
+      onInspect: (name) => this.selectAndInspectSymbol(name),
+      width: "820px",
     });
   }
 
@@ -1453,24 +1459,24 @@ export class KconfigView {
     const colY = (count, i) => (H - count * ROW) / 2 + i * ROW + ROW / 2;
     const val = (sym) => (this.engine.isDefined(sym) ? this.valueOf(sym) : "?");
     const fill = (sym) => ({ y: "rgba(63,185,80,0.25)", m: "rgba(210,153,34,0.25)" }[val(sym)] || "rgba(110,118,129,0.18)");
-    const stroke = (sym) => ({ y: "#3fb950", m: "#d29922" }[val(sym)] || "#6e7681");
+    const stroke = (sym) => ({ y: "var(--accent-green)", m: "var(--accent-yellow)" }[val(sym)] || "var(--text-muted)");
     const node = (sym, x, y, isRoot = false) => `
       <g class="kgraph-node" data-symbol="${escapeHtml(sym)}" style="cursor:pointer;">
-        <rect x="${x}" y="${y - 10}" width="${NODE_W}" height="20" rx="4" fill="${isRoot ? "rgba(56,139,253,0.25)" : fill(sym)}" stroke="${isRoot ? "#58a6ff" : stroke(sym)}" />
-        <text x="${x + 8}" y="${y + 4}" font-size="11" font-family="var(--font-mono)" fill="#c9d1d9">${escapeHtml(sym.length > 22 ? `${sym.slice(0, 21)}…` : sym)} = ${escapeHtml(val(sym))}</text>
+        <rect x="${x}" y="${y - 10}" width="${NODE_W}" height="20" rx="4" fill="${isRoot ? "rgba(56,139,253,0.25)" : fill(sym)}" stroke="${isRoot ? "var(--accent-blue)" : stroke(sym)}" />
+        <text x="${x + 8}" y="${y + 4}" font-size="11" font-family="var(--font-mono)" fill="var(--text-primary)">${escapeHtml(sym.length > 22 ? `${sym.slice(0, 21)}…` : sym)} = ${escapeHtml(val(sym))}</text>
         <title>CONFIG_${escapeHtml(sym)} = ${escapeHtml(val(sym))}</title>
       </g>`;
     const rootX = (W - NODE_W) / 2;
     let svg = `<svg viewBox="0 0 ${W} ${H}" width="100%" style="max-width:${W}px;display:block;">
-      <text x="10" y="14" font-size="10" fill="#8b949e">depends on</text>
-      <text x="${W - 10}" y="14" font-size="10" fill="#8b949e" text-anchor="end">selects / implies</text>`;
+      <text x="10" y="14" font-size="10" fill="var(--text-secondary)">depends on</text>
+      <text x="${W - 10}" y="14" font-size="10" fill="var(--text-secondary)" text-anchor="end">selects / implies</text>`;
     left.forEach((_sym, i) => {
       const y = colY(left.length, i);
-      svg += `<path d="M ${10 + NODE_W} ${y} C ${rootX - 30} ${y}, ${rootX - 30} ${rootY}, ${rootX} ${rootY}" fill="none" stroke="#6e7681" stroke-opacity="0.6" />`;
+      svg += `<path d="M ${10 + NODE_W} ${y} C ${rootX - 30} ${y}, ${rootX - 30} ${rootY}, ${rootX} ${rootY}" fill="none" stroke="var(--text-muted)" stroke-opacity="0.6" />`;
     });
     right.forEach((_sym, i) => {
       const y = colY(right.length, i);
-      svg += `<path d="M ${rootX + NODE_W} ${rootY} C ${W - NODE_W - 40} ${rootY}, ${W - NODE_W - 40} ${y}, ${W - NODE_W - 10} ${y}" fill="none" stroke="#bc8cff" stroke-opacity="0.6" />`;
+      svg += `<path d="M ${rootX + NODE_W} ${rootY} C ${W - NODE_W - 40} ${rootY}, ${W - NODE_W - 40} ${y}, ${W - NODE_W - 10} ${y}" fill="none" stroke="var(--accent-purple)" stroke-opacity="0.6" />`;
     });
     left.forEach((sym, i) => { svg += node(sym, 10, colY(left.length, i)); });
     right.forEach((sym, i) => { svg += node(sym, W - NODE_W - 10, colY(right.length, i)); });
@@ -1732,27 +1738,23 @@ export class KconfigView {
 
   /** Ask before keeping a rebuilt model that resolves the configuration differently. */
   confirmModelChanges(changes) {
-    const MAX_ROWS = 300;
-    return new Promise((resolve) => {
-      let confirmed = false;
-      const modal = openModal({
-        title: "This toolchain changes the configuration",
-        subtitle: `${changes.length} value${changes.length === 1 ? "" : "s"} resolve differently with the rebuilt model`,
-        width: "760px",
-        footerHtml: `<button class="code-btn active" id="kconfig-confirm-model" type="button">Apply the toolchain and these changes</button>`,
-        onClose: () => resolve(confirmed),
-      });
-      modal.body.innerHTML = `
-        <div class="kconfig-muted" style="margin-bottom:10px;">The toolchain answers the <code>$(shell,…)</code> checks and environment variables Kconfig reads while it is parsed, so dependencies, defaults and ranges can differ. <strong>Close</strong> keeps the current toolchain, model and values.</div>
-        <table class="kconfig-cmp-table"><thead><tr><th>Option</th><th>Now</th><th>After</th></tr></thead>
-        <tbody>${changes.slice(0, MAX_ROWS).map((c) => `<tr><td>CONFIG_${escapeHtml(c.name)}</td><td>${escapeHtml(c.want || '""')}</td><td>${escapeHtml(c.got || '""')}</td></tr>`).join("")}</tbody></table>
-        ${changes.length > MAX_ROWS ? `<div class="kconfig-muted" style="margin-top:8px;">… and ${changes.length - MAX_ROWS} more</div>` : ""}`;
-      const ok = modal.footer.querySelector("#kconfig-confirm-model");
-      ok.onclick = () => {
-        confirmed = true;
-        modal.close();
-      };
-      ok.focus();
+    return showChangePreview({
+      title: "This toolchain changes the configuration",
+      summary: `${changes.length} value${changes.length === 1 ? "" : "s"} resolve differently with the rebuilt model`,
+      intro: "The toolchain answers the $(shell,…) checks and environment variables Kconfig reads while it is parsed, so dependencies, defaults and ranges can differ. Close keeps the current toolchain, model and values.",
+      sections: [{
+        label: "Changed values",
+        rows: changes.map((c) => ({
+          name: c.name,
+          from: c.want || '""',
+          to: c.got || '""',
+        })),
+        fields: ["from", "to"],
+        columns: ["Option", "Now", "After"],
+      }],
+      confirmLabel: "Apply the toolchain and these changes",
+      onInspect: (name) => this.selectAndInspectSymbol(name),
+      width: "760px",
     });
   }
 
@@ -1907,3 +1909,11 @@ export class KconfigView {
     };
   }
 }
+
+// Undo/redo of the configuration (webapp/API.md §5.8, §5.31): the active KConfig tab's view handles them
+shortcuts.registerAll([
+  { id: "kconfig.undo", keys: ["Mod+Z"], scope: "kconfig", description: "Undo the last configuration change",
+    when: (ctx) => Boolean(ctx.view?.acceptsUndoKeys?.()), handler: (e, ctx) => ctx.view.undo() },
+  { id: "kconfig.redo", keys: ["Mod+Shift+Z", "Mod+Y"], scope: "kconfig", description: "Redo the configuration change",
+    when: (ctx) => Boolean(ctx.view?.acceptsUndoKeys?.()), handler: (e, ctx) => ctx.view.redo() },
+]);

@@ -2,9 +2,11 @@
 from __future__ import annotations
 from typing import Any
 from fastapi import HTTPException
+from core.globalstuff import ASTT
 from core.SymbolRows import rows_of_targets_sql
 from webapp.backend.database.pool import get_db_cursor
 from webapp.backend.database.helpers import (
+    tree_source,
     safe_decode,
     get_version_info,
 )
@@ -53,6 +55,19 @@ def format_symbol_type(type_name: str) -> str:
     return type_name
 
 
+def binding_ref_asts(cursor: Any, symbol_name: str) -> list[int]:
+    """The `Rust_BindingRef` AST of a C symbol: what Rust uses of it through bindgen (`bindings::foo`) reference.
+
+    The AST is a leaf named by the symbol (parser/rust_ast/RUST_API.md §7), one row whatever the file or version,
+    found through `m_ast`'s (name, type_id) index.
+    """
+    cursor.execute(
+        "SELECT ast_id FROM m_ast WHERE name = %s AND type_id = %s;",
+        (symbol_name, int(ASTT.Rust_BindingRef)),
+    )
+    return [r["ast_id"] for r in cursor.fetchall() if r["ast_id"]]
+
+
 def _symbol_asts(def_rows: list[dict[str, Any]], symbol_name: str) -> list[int]:
     """The ASTs of `def_rows` that are the symbol itself, deduplicated, at most MAX_XREF_TARGETS.
 
@@ -86,10 +101,10 @@ class SymbolService:
             cursor.execute(
                 """
                 SELECT bc.blob_id, fn.fname
-                FROM m_bridge_checkpoint bc
+                FROM m_checkpoint_tree bc
                 JOIN m_file_name fn ON bc.fnid = fn.fnid
                 WHERE bc.commit_id = %s;
-                """,
+                """.replace("m_checkpoint_tree", tree_source(cursor)),
                 (vid,),
             )
             blob_paths = {}
@@ -294,6 +309,19 @@ class SymbolService:
                     return k_res
                 raise HTTPException(status_code=404, detail=f"Symbol '{name}' not found in version '{version_name}'.")
 
+            attrs = []
+            if s_row.get("ast_id"):
+                cursor.execute(
+                    "SELECT name, val FROM m_ast_attribute WHERE ast_id = %s ORDER BY priority ASC;",
+                    (s_row["ast_id"],),
+                )
+                raw_attrs = cursor.fetchall() or []
+                attrs = [
+                    {"name": safe_decode(r.get("name")), "val": safe_decode(r.get("val", ""))}
+                    for r in raw_attrs
+                    if isinstance(r, dict) and "val" in r
+                ]
+
             return {
                 "version": vname,
                 "name": name,
@@ -313,6 +341,7 @@ class SymbolService:
                     "file": safe_decode(s_row["fname"]),
                     "line_s": s_row["line_s"],
                     "line_e": s_row["line_e"],
+                    "attributes": attrs,
                 },
                 "definitions": [
                     {
@@ -405,7 +434,8 @@ class SymbolService:
                         "ast_id": f_row["ast_id"],
                     })
 
-            ast_ids = ref_targets
+            # Rust uses of a C symbol (`bindings::foo`) reference the symbol's name, not one of its ASTs
+            ast_ids = list(dict.fromkeys(ref_targets + binding_ref_asts(cursor, symbol_name)))
             targets = set(ast_ids)
             primary_ast_id = next((d["ast_id"] for d in defs if d["ast_id"] in targets), ast_ids[0] if ast_ids else 0)
 

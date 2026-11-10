@@ -221,7 +221,8 @@ export class MarkdownRenderer {
       }
 
       // 3. ATX Headings (# Heading)
-      const atxMatch = /^(#{1,6})\s+(.*)$/.exec(line);
+      // CommonMark: up to three spaces may precede the opening #
+      const atxMatch = /^ {0,3}(#{1,6})\s+(.*)$/.exec(line);
       if (atxMatch) {
         const level = atxMatch[1].length;
         const headingRaw = atxMatch[2].replace(/\s+#+\s*$/, "").trim();
@@ -317,6 +318,12 @@ export class MarkdownRenderer {
         i++;
       }
 
+      // A line that looks like a block start once trimmed but that no block above accepted (e.g. a
+      // heading indented four spaces) is text: consume it, or this loop would never advance
+      if (paraLines.length === 0 && i < lines.length) {
+        paraLines.push(lines[i]);
+        i++;
+      }
       if (paraLines.length > 0) {
         const paraText = paraLines.join(" ");
         out.push(`<p>${this.inline(paraText)}</p>`);

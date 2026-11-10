@@ -1,7 +1,8 @@
 """webapp/backend/services/docs_service.py - Documentation Cross-References & kernel-doc Extraction.
 
 1. Label index: every `.. _label:` hyperlink target under Documentation/ at a revision, with the
-   title of the section it precedes, so `:ref:` roles resolve across documents.
+   title of the section it precedes, so `:ref:` roles resolve across documents: from the parser's
+   stored labels (`m_blob_facts` family 5) when it holds every `.rst` blob of the revision, else `git grep`.
 2. kernel-doc: parses `/** ... */` kernel-doc comments of a source file at a revision into
    structured entries (functions, structs/unions/enums, typedefs, macros, DOC: sections),
    honouring the `.. kernel-doc::` directive selectors (:export:, :internal:, :functions:,
@@ -18,6 +19,9 @@ from typing import Any
 
 from fastapi import HTTPException
 
+from parser import doc_labels
+from parser.doc_labels import ADORNMENT_RE, LABEL_RE  # noqa: F401 - moved to parser/doc_labels.py, re-exported
+
 from webapp.backend.config import get_repo_dir
 from webapp.backend.database.helpers import get_version_info
 from webapp.backend.database.pool import get_db_cursor
@@ -27,8 +31,6 @@ from webapp.backend.services.tree_resolver import git_tree_resolver
 
 logger = logging.getLogger(__name__)
 
-ADORNMENT_RE = re.compile(r"""^([=\-`:.'"~^_*+#<>!$%&,;?@\[\]\\/|{}()])\1{2,}\s*$""")
-LABEL_RE = re.compile(r"^\.\.\s+_([^:`][^:]*|`[^`]+`):\s*$")
 
 KDOC_START_RE = re.compile(r"^\s*/\*\*\s*$")
 KDOC_HEAD_RE = re.compile(
@@ -70,37 +72,37 @@ class DocsService:
                 self._label_cache.move_to_end(cache_key)
                 return self._label_cache[cache_key]
 
-        try:
-            out = subprocess.run(
-                ["git", "-C", str(get_repo_dir()), "grep", "-I", "-n", "-A6", "--full-name", "-E",
-                 # Pathspec wildcards match across "/", so this covers every .rst below Documentation/
-                 r"^\.\.[[:space:]]+_[^:]+:[[:space:]]*$", sha, "--", "Documentation/*.rst"],
-                capture_output=True,
-                timeout=60,
-                check=False,
-            )
-        except (OSError, subprocess.SubprocessError) as e:
-            logger.warning("git grep for doc labels at %s failed: %s", sha, e)
-            raise HTTPException(status_code=500, detail="git grep failed") from e
-
-        labels: dict[str, dict[str, Any]] = {}
-        groups = out.stdout.decode("utf-8", errors="replace").split("\n--\n")
-        line_re = re.compile(r"^[0-9a-f]{40}:(?P<path>[^:\n]+?)(?P<sep>[:-])(?P<line>\d+)(?P=sep)(?P<text>.*)$")
-        for group in groups:
-            current: list[tuple[str, int, str, bool]] = []
-            for raw in group.splitlines():
-                m = line_re.match(raw)
-                if m:
-                    current.append((m["path"], int(m["line"]), m["text"], m["sep"] == ":"))
-            for idx, (path, line_no, text, is_match) in enumerate(current):
-                lm = LABEL_RE.match(text) if is_match else None
-                if not lm:
-                    continue
-                label = lm.group(1).strip("`").strip().lower()
-                title = self._title_after([t for p, _, t, _ in current[idx + 1:] if p == path])
-                labels.setdefault(label, {"path": path, "line": line_no, "title": title})
-
-        result = {"version": vname, "total": len(labels), "labels": labels}
+        labels = self._labels_from_facts(sha)
+        if labels is not None:
+            source = "db"
+        else:
+            source = "git"
+            tree = git_tree_resolver.list_tree(sha) or {}
+            files = [(p, b) for p, b in tree.items() if doc_labels.applies(p)]
+            from webapp.backend.services.source_index import db_facts
+            repo_dir = str(get_repo_dir())
+            stored = db_facts(sorted({b for _p, b in files}), doc_labels.FAMILY, doc_labels.FORMAT, doc_labels.decode)
+            missing = {b for _p, b in files if b not in stored}
+            for b in missing:
+                try:
+                    res = subprocess.run(
+                        ["git", "-C", repo_dir, "cat-file", "-p", b],
+                        capture_output=True,
+                        timeout=5,
+                        check=False,
+                    )
+                    if res.returncode == 0:
+                        text = res.stdout.decode("utf-8", errors="replace")
+                        stored[b] = doc_labels.extract(text)
+                    else:
+                        stored[b] = []
+                except Exception:
+                    stored[b] = []
+            labels = {}
+            for path, blob in files:
+                for label, line, title in stored.get(blob, []):
+                    labels.setdefault(label, {"path": path, "line": line, "title": title})
+        result = {"version": vname, "total": len(labels), "labels": labels, "source": source}
         with self._lock:
             self._label_cache[cache_key] = result
             if len(self._label_cache) > self._max_cache_size:
@@ -110,15 +112,25 @@ class DocsService:
     @staticmethod
     def _title_after(lines: list[str]) -> str:
         """Section title following a label (skips blank lines, further labels, and overlines)."""
-        rest = lines
-        i = 0
-        while i < len(rest) and (not rest[i].strip() or LABEL_RE.match(rest[i])):
-            i += 1
-        if i < len(rest) and ADORNMENT_RE.match(rest[i]):
-            i += 1
-        if i + 1 < len(rest) and rest[i].strip() and ADORNMENT_RE.match(rest[i + 1]):
-            return rest[i].strip()
-        return ""
+        return doc_labels.title_after(lines)
+
+    @staticmethod
+    def _labels_from_facts(sha: str) -> dict[str, dict[str, Any]] | None:
+        """The label index from the parser's stored labels (m_blob_facts family 5, parser/doc_labels.py),
+        or None when any blob is missing."""
+        from webapp.backend.services.source_index import db_facts
+        tree = git_tree_resolver.list_tree(sha) or {}
+        files = [(p, b) for p, b in tree.items() if doc_labels.applies(p)]
+        if not files:
+            return {}
+        stored = db_facts(sorted({b for _p, b in files}), doc_labels.FAMILY, doc_labels.FORMAT, doc_labels.decode)
+        if any(b not in stored for _p, b in files):
+            return None
+        labels: dict[str, dict[str, Any]] = {}
+        for path, blob in files:
+            for label, line, title in stored.get(blob, []):
+                labels.setdefault(label, {"path": path, "line": line, "title": title})
+        return labels
 
     # ------------------------------------------------------------------
     # kernel-doc
@@ -132,6 +144,7 @@ class DocsService:
         functions: str = "",
         doc: str = "",
         no_identifiers: str = "",
+        identifiers: str = "",
     ) -> dict[str, Any]:
         """Extract kernel-doc entries of `path` at the revision, filtered like the Sphinx directive."""
         norm_path = path.strip().strip("/")
@@ -148,7 +161,7 @@ class DocsService:
 
         entries = parse_kernel_doc(source)
         exported = set(EXPORT_RE.findall(source))
-        wanted = {n for n in re.split(r"[\s,]+", functions.strip()) if n}
+        wanted = {n for n in re.split(r"[\s,]+", f"{functions} {identifiers}".strip()) if n}
         excluded = {n for n in re.split(r"[\s,]+", no_identifiers.strip()) if n}
 
         selected = []

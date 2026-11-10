@@ -564,19 +564,32 @@ class TestObsoleteKconfigTables(unittest.TestCase):
         def close(self) -> None:
             pass
 
-    class FakeCnx:
+    class FakeDB:
         def __init__(self, store: dict) -> None:
             self.store = store
+            self._cur = TestObsoleteKconfigTables.FakeCursor(store)
 
         def cursor(self):
-            return TestObsoleteKconfigTables.FakeCursor(self.store)
+            return self._cur
+
+        def execute(self, sql: str, params: tuple = ()) -> None:
+            self._cur.execute(sql, params)
+
+        def query(self, sql: str, params: tuple = (), dictionary: bool = False) -> list:
+            self._cur.execute(sql, params)
+            return self._cur.fetchall()
+
+        def drop_table(self, tables) -> None:
+            tbl_list = tables if isinstance(tables, (list, tuple)) else [tables]
+            for t in tbl_list:
+                name = getattr(t, "table_name", str(t))
+                self.store["tables"].discard(name)
+
+        def fetchall(self) -> list:
+            return self._cur.fetchall()
 
         def commit(self) -> None:
             pass
-
-    class FakeDB:
-        def __init__(self, store: dict) -> None:
-            self.cnx = TestObsoleteKconfigTables.FakeCnx(store)
 
     def test_drop_and_renumber_is_idempotent(self) -> None:
         import main

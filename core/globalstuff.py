@@ -431,7 +431,7 @@ class PointerGetter:
 
 
 _RE_C_DECLARATION = re.compile(
-    r"^\s*(#\s*include|typedef|struct\s+\w+\s*\{|union\s+\w+\s*\{|enum\s+\w+\s*\{|extern|static|inline|__inline__|void|int|char|long)\b",
+    r"^\s*(typedef|struct\s+\w+\s*\{|union\s+\w+\s*\{|enum\s+\w+\s*\{|extern|static|inline|__inline__|void|int|char|long)\b",
     re.MULTILINE,
 )
 # C initializers (`... = {`, designated `.field =` / `[IDX] =`): tables built from #define-d types have no keyword
@@ -442,6 +442,7 @@ _RE_ASM_DIRECTIVE = re.compile(
     r"^\s*\.(set|globl|global|macro|endm|section|equ|equiv|ascii|asciz|byte|short|long|quad|word|space|align|balign|fill|text|data|bss)\s+[a-zA-Z0-9_.]+",
     re.MULTILINE,
 )
+_RE_ASM_ENTRY = re.compile(r"^\s*(SYM_FUNC_START\w*|SYM_CODE_START\w*|ENTRY)\s*\(", re.MULTILINE)
 
 
 def is_pure_asm_content(content: str) -> bool:
@@ -455,7 +456,7 @@ def is_pure_asm_content(content: str) -> bool:
     code = _RE_C_COMMENT.sub("", content).replace("\\\n", " ")
     if _RE_C_INITIALIZER.search(code):
         return False
-    return bool(_RE_ASM_PIPE_COMMENT.search(code) or _RE_ASM_DIRECTIVE.search(code))
+    return bool(_RE_ASM_PIPE_COMMENT.search(code) or _RE_ASM_DIRECTIVE.search(code) or _RE_ASM_ENTRY.search(code))
 
 
 def type_check(name: str, content: str | None = None) -> int:
@@ -714,6 +715,10 @@ class ASTT(IntEnum):
     C_float16 = auto()
     C_Vector = auto()
     C_vla = auto()
+    ## Rust details (parser/rust_ast/RUST_API.md)
+    Rust_Signature = auto()
+    Rust_ModuleAttr = auto()
+    Rust_BindingRef = auto()
 
 
 class SymbolLinkage(IntEnum):

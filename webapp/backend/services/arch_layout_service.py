@@ -2,13 +2,14 @@
 files a compilation reaches through its #include chain.
 
 The parser stores, for the head commit of every ingested version, what `make ARCH=<arch>` uses
-(`m_arch_root`, written by `main.processing_arch_layouts()` from `parser/arch_layout.py`). Revisions
+(`m_arch_root` -> `m_arch_layout_entry`, written by `main.processing_arch_layouts()` from `parser/arch_layout.py`). Revisions
 without rows (branches, commits never ingested) are evaluated from their Git tree with the same code.
 Layouts depend only on the commit's files, so they are cached per (commit, ARCH).
 
 `reachable()` / `resolve_include()` follow `#include` directives with that layout
 (`parser/include_graph.py`); each blob's directives are read once (cached by blob SHA) and each walk
-is cached per (commit, ARCH, start file).
+is cached per (commit, ARCH, start file). Directives come from the parser's per-blob facts
+(`m_blob_facts` family 3, one query per walk level) before Git.
 """
 from __future__ import annotations
 
@@ -88,14 +89,36 @@ class ArchLayoutService:
             if key in self._walks:
                 self._walks.move_to_end(key)
                 return self._walks[key]
-        walk = resolver.reachable(start, lambda path: self._file_directives(sha, path, files))
+        walk = resolver.reachable(start, lambda path: self._file_directives(sha, path, files),
+                                  prefetch=lambda paths: self._prefetch_directives(paths, files))
         with self._lock:
             self._walks[key] = walk
             while len(self._walks) > _WALK_CACHE_SIZE:
                 self._walks.popitem(last=False)
         return walk
 
+    def _remember(self, blob: str, directives: list[tuple[str, bool]]) -> None:
+        with self._lock:
+            self._directives[blob] = directives
+            self._directives.move_to_end(blob)
+            while len(self._directives) > _DIRECTIVES_CACHE_SIZE:
+                self._directives.popitem(last=False)
+
+    def _prefetch_directives(self, paths: list[str], files: dict[str, str]) -> None:
+        """Load the stored `#include` directives (m_blob_facts family 3, parser/include_facts.py) of one walk
+        level's blobs missing from the in-process cache, in one query per 500 blobs."""
+        with self._lock:
+            want = sorted({b for p in paths if (b := files.get(p)) and b not in self._directives})
+        if not want:
+            return
+        from parser import include_facts
+        from webapp.backend.services.source_index import db_facts
+        for blob, directives in db_facts(want, include_facts.FAMILY, include_facts.FORMAT, include_facts.decode).items():
+            self._remember(blob, directives)
+
     def _file_directives(self, sha: str, path: str, files: dict[str, str]) -> list[tuple[str, bool]]:
+        """The `#include` directives of a file of the walk: in-process cache (filled level by level from the
+        parser's stored ones, family 3, by _prefetch_directives()), else the file read from Git."""
         blob = files.get(path)
         if not blob:
             return []
@@ -110,10 +133,7 @@ class ArchLayoutService:
             logger.debug("git read %s:%s failed: %s", sha, path, exc)
             raw, is_dir = None, False
         directives = include_directives(raw.decode("utf-8", errors="replace")) if raw and not is_dir else []
-        with self._lock:
-            self._directives[blob] = directives
-            while len(self._directives) > _DIRECTIVES_CACHE_SIZE:
-                self._directives.popitem(last=False)
+        self._remember(blob, directives)
         return directives
 
     # ------------------------------------------------------------------ storage
@@ -123,9 +143,10 @@ class ArchLayoutService:
             with get_db_cursor() as cursor:
                 cursor.execute(
                     """
-                    SELECT r.role, r.priority, r.path, r.target
+                    SELECT e.role, e.priority, e.path, e.target
                     FROM m_commit c
                     JOIN m_arch_root r ON r.commit_id = c.commit_id
+                    JOIN m_arch_layout_entry e ON e.layout_id = r.layout_id
                     WHERE c.commit_hash = %s AND r.arch = %s;
                     """,
                     (bytes.fromhex(sha), arch),

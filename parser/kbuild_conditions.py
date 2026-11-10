@@ -740,6 +740,99 @@ class KbuildConditionResolver:
                 "reason": f"{own.path} does not build {base_obj}"}
 
 
+    # -------------------------------------------------------------- objects
+    def objects(self) -> "Iterable[KbuildObject]":
+        """Every object the Kbuild files of this ARCH name, from the top goal lists down (KCONFIG_API.md §6.4).
+
+        Yields one KbuildObject per object (a composite object once, with all its member sources):
+        its condition includes the directory chain (`dir_condition`) and agrees with `file_condition()`
+        of each member, since both come from the same rules. Directories never built for the ARCH
+        (other architectures, condition "n") are not walked."""
+        top = self._top_file()
+        seen_dirs: set[str] = set()
+        yielded: set[str] = set()  # an object named twice (head-y at the top and extra-y below) once
+        queue: list[str] = []
+
+        def enqueue(directory: str) -> None:
+            directory = directory.strip("/")
+            if directory and directory not in seen_dirs:
+                seen_dirs.add(directory)
+                queue.append(directory)
+
+        for directory in top.subdirs:
+            enqueue(directory)
+        for target, rules in top.objects.items():
+            members = self._members(top, target, Y)
+            if members:
+                yielded.add(target)
+                yield KbuildObject(target=target, directory=os.path.dirname(target), kind=_kind_of(rules),
+                                   condition=or_(*(r.cond for r in rules)), members=members,
+                                   composite=target in top.composites, rules=_dedup(list(rules))[:4])
+        while queue:
+            directory = queue.pop(0)
+            dcond, drules = self.dir_condition(directory)
+            if dcond == N:
+                continue
+            kfile = self.kbuild_file(directory)
+            if kfile is None:
+                continue
+            for sub in kfile.subdirs:
+                if not self.is_other_arch(sub + "/"):
+                    enqueue(sub)
+            for target, rules in kfile.objects.items():
+                if self.is_other_arch(target) or target in yielded:
+                    continue
+                cond = and_(or_(*(r.cond for r in rules)), dcond)
+                members = self._members(kfile, target, Y)
+                if not members:
+                    continue
+                yielded.add(target)
+                yield KbuildObject(target=target, directory=directory, kind=_kind_of(rules), condition=cond,
+                                   members=members, composite=target in kfile.composites,
+                                   rules=_dedup([*rules, *drules])[:6])
+
+    def _members(self, kfile: KbuildFile, target: str, cond: Expr, depth: int = 0) -> list[tuple[str, Expr]]:
+        """Sources of an object: its own .c/.S/.rs, or those of its composite members (nested once)."""
+        if target in kfile.composites and depth < 3:
+            out: list[tuple[str, Expr]] = []
+            for member, mrule in kfile.composites[target]:
+                out.extend(self._members(kfile, member, and_(cond, mrule.cond), depth + 1))
+            return out
+        stem = target[:-2] if target.endswith(".o") else target
+        for ext in SOURCE_SUFFIXES:
+            if self.exists(stem + ext):
+                return [(stem + ext, cond)]
+        return []
+
+
+@dataclass
+class KbuildObject:
+    """One object of the build: `target` (e.g. drivers/net/e1000e/e1000e.o), its Kbuild `kind` (obj, lib,
+    extra, head), the condition under which it is built (directory chain included: "y" built in, "m" a
+    module, "n" not built), its member sources with their own conditions, and the rules naming it."""
+    target: str
+    directory: str
+    kind: str
+    condition: Expr
+    members: list[tuple[str, Expr]]
+    composite: bool
+    rules: list[Rule]
+
+    @property
+    def modname(self) -> str:
+        """KBUILD_MODNAME: the target's basename without .o, "-" replaced by "_"."""
+        base = os.path.basename(self.target)
+        return (base[:-2] if base.endswith(".o") else base).replace("-", "_")
+
+
+def _kind_of(rules: list[Rule]) -> str:
+    for r in rules:
+        m = re.match(r"^\s*(obj|lib|extra|head|core|drivers|net|libs|init)\b", r.text)
+        if m:
+            return {"core": "obj", "drivers": "obj", "net": "obj", "libs": "lib", "init": "obj"}.get(m.group(1), m.group(1))
+    return "obj"
+
+
 def _dedup(rules: list[Rule]) -> list[Rule]:
     seen: set[tuple[str, int]] = set()
     out = []

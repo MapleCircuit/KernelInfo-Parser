@@ -98,7 +98,7 @@
 .mail-list-mode-btn.active {
   background: var(--accent-blue);
   border-color: var(--accent-blue);
-  color: #fff;
+  color: var(--text-on-accent);
 }
 
 .mail-list-pane {
@@ -175,7 +175,7 @@
 
 .mail-chip.active {
   background: var(--accent-blue);
-  color: #ffffff;
+  color: var(--text-on-accent);
   border-color: var(--accent-blue);
   font-weight: 500;
 }
@@ -258,7 +258,7 @@
 
 .mail-badge.cover {
   background: rgba(210, 168, 255, 0.15);
-  color: #d2a8ff;
+  color: var(--diff-rename-fg);
   border: 1px solid rgba(210, 168, 255, 0.3);
 }
 
@@ -332,7 +332,7 @@
 .mail-version-chip.active {
   background: var(--accent-blue);
   border-color: var(--accent-blue);
-  color: #fff;
+  color: var(--text-on-accent);
 }
 
 .mail-version-count {
@@ -719,7 +719,7 @@
 
 .mail-mode-btn.active {
   background: var(--accent-blue);
-  color: #fff;
+  color: var(--text-on-accent);
 }
 
 .mail-action-btn {
@@ -832,3 +832,27 @@
   padding-top: 14px;
   min-width: 0;
 }
+/* Merged commits of a thread (P2, webapp/API.md §5.22) */
+.mail-merged-badge { padding: 0 8px; border-radius: 10px; border: 1px solid var(--border-color); color: var(--text-muted); font-size: 11px; }
+.mail-merged-badge.merged { border-color: var(--accent-green); color: var(--accent-green); }
+.mail-merged-badge.partial { border-color: var(--accent-yellow); color: var(--accent-yellow); }
+.mail-merged-list { margin-top: 6px; display: flex; flex-direction: column; gap: 3px; font-size: 12px; }
+.mail-merged-row a { color: var(--accent-blue); text-decoration: none; }
+.mail-merged-row a:hover { text-decoration: underline; }
+.mail-merged-rel { color: var(--accent-green); font-family: var(--font-mono, monospace); font-size: 11px; }
+.mail-merged-as { font-size: 11px; color: var(--accent-green); margin-right: 8px; text-decoration: none; font-family: var(--font-mono, monospace); }
+
+/* Try a patch on a revision (P1, §5.22) */
+.ptry-patch { margin-bottom: 12px; }
+.ptry-head { display: flex; align-items: center; gap: 8px; margin-bottom: 4px; overflow-wrap: anywhere; }
+.ptry-file { margin: 2px 0 2px 16px; }
+.ptry-file > summary { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; cursor: pointer; }
+.ptry-file > summary code { overflow-wrap: anywhere; }
+.ptry-badge { font-size: var(--fs-10, 10px); font-family: var(--font-mono); padding: 1px 6px; border-radius: var(--radius-sm); border: 1px solid var(--border-color); white-space: nowrap; }
+.ptry-badge.ok { color: var(--accent-green); border-color: var(--accent-green); }
+.ptry-badge.warn { color: var(--accent-yellow); border-color: var(--accent-yellow); }
+.ptry-badge.bad { color: var(--accent-red); border-color: var(--accent-red); }
+.ptry-badge.muted { color: var(--text-muted); }
+.ptry-hunks { margin: 4px 0 6px; padding-left: 20px; font-size: var(--fs-11, 11px); color: var(--text-secondary); }
+.ptry-hunk.bad { color: var(--accent-red); }
+.ptry-ctx { margin: 4px 0; padding: 4px 6px; background: var(--bg-tertiary); color: var(--text-primary); font-size: var(--fs-10, 10px); overflow-x: auto; max-height: 160px; }
