@@ -133,7 +133,7 @@ class TestConfigManagement(unittest.TestCase):
                 "timeout": 15,
             },
             "webapp": {"host": "0.0.0.0", "port": 8000, "reload": True},
-            "parser": {"table_engine": "cached", "memory_mode": "normal", "fidelity": True},
+            "parser": {"table_engine": "cached", "memory_mode": "normal"},
         }
         sync_environ(cfg)
 
@@ -194,7 +194,6 @@ class TestConfigManagement(unittest.TestCase):
             "parser": {
                 "table_engine": "direct",
                 "memory_mode": "low",
-                "fidelity": False,
             },
             "database": {
                 "engine": "mysql",
@@ -208,7 +207,6 @@ class TestConfigManagement(unittest.TestCase):
             with mock.patch("sys.argv", ["main.py", "-c", temp_path]):
                 args = main.arg_handling()
                 self.assertEqual(args.config, temp_path)
-                self.assertFalse(args.fidelity)
                 from core.globalstuff import G
                 self.assertEqual(G.MEMORY_MODE, "low")
         finally:

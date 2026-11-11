@@ -242,8 +242,9 @@ class MaintainerService:
 
         Shared by the Developers directory and the profile modal so both resolve the same aliases.
         Read from m_person_identity, which the parser refreshes after each version
-        (parser/git_ast/identity.py); persons registered since its last refresh get their own key
-        (`identity_key()`, without the name-less merge) until the next one. Without stored rows (an older
+        (parser/git_ast/identity.py); persons without a stored row (registered since its last refresh,
+        whatever their person_id) get their own key (`identity_key()`, without the name-less merge) until
+        the next one. Without stored rows (an older
         database) the index is computed from the whole registry. Cached per repository until the
         registry or the stored identities change."""
         cursor.execute("SELECT COUNT(*) AS cnt, MAX(person_id) AS max_id FROM m_maintainer_person;")
@@ -262,8 +263,12 @@ class MaintainerService:
         if stored_cnt:
             cursor.execute("SELECT person_id, identity_key FROM m_person_identity;")
             pid_to_key = {int(r["person_id"]): safe_decode(r["identity_key"]) for r in cursor.fetchall()}
+            # Every person without a stored row, not only those above its highest person_id: persons are
+            # not registered in person_id order, so a refresh can leave gaps below it
             cursor.execute(
-                "SELECT person_id, name, email FROM m_maintainer_person WHERE person_id > %s;", (stored_max,)
+                "SELECT p.person_id, p.name, p.email FROM m_maintainer_person p"
+                " LEFT JOIN m_person_identity i ON i.person_id = p.person_id"
+                " WHERE p.person_id > 0 AND i.person_id IS NULL;"
             )
             for r in cursor.fetchall():
                 pid_to_key.setdefault(int(r["person_id"]), _identity_key(safe_decode(r["name"]), safe_decode(r["email"])))

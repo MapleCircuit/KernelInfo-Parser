@@ -3948,7 +3948,6 @@ def format_fidelity_table(results: list[dict[str, Any]]) -> str:
 def run_c_ast_tests(
     target_file: str | None = None,
     profile: bool = False,
-    fidelity: bool = True,
     table_engine: str = "cached",
 ) -> int:
 
@@ -3957,7 +3956,6 @@ def run_c_ast_tests(
     Args:
         target_file: Optional single file path to test.
         profile: Whether to collect and print granular stage profiler breakdowns.
-        fidelity: Whether to print detailed tag text and source code fidelity audit.
         table_engine: Table engine variant ('cached' or 'direct').
         
     Returns:
@@ -3977,8 +3975,6 @@ def run_c_ast_tests(
     print(f"TableEngine: {COLOR.magenta(te_display.capitalize())}")
     if G.PROFILING_ENABLED:
         print(f"Profiler:    {COLOR.green('ACTIVE (-p / --profile)')}")
-    if fidelity:
-        print(f"Fidelity:    {COLOR.green('ACTIVE (-f / --fidelity)')}")
     print()
 
     start_time = time.time()
@@ -4096,8 +4092,7 @@ def run_c_ast_tests(
         print(COLOR.yellow("[*] NOTE: Operation count deltas detected."))
         print("    Length changes reflect AST optimization / output changes and are tracked for review.\n")
 
-    if fidelity:
-        print(format_fidelity_table(results))
+    print(format_fidelity_table(results))
 
     if G.PROFILING_ENABLED and profiler_list:
         from core.Profiler import format_profiling_report
@@ -4118,8 +4113,6 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="C-AST Parser Test Suite")
     parser.add_argument("target_file", nargs="?", default=None, help="Target file to parse")
     parser.add_argument("-p", "--profile", action="store_true", help="Enable granular stage timing profiler")
-    parser.add_argument("-f", "--fidelity", action="store_true", default=True, help="Display full tag text & source code fidelity audit report (default: True)")
-    parser.add_argument("--no-fidelity", dest="fidelity", action="store_false", help="Disable tag text & source code fidelity audit report")
 
     parser.add_argument(
         "--te", "--table-engine",
@@ -4132,7 +4125,6 @@ if __name__ == "__main__":
     sys.exit(run_c_ast_tests(
         target_file=args.target_file,
         profile=args.profile,
-        fidelity=args.fidelity,
         table_engine=args.table_engine,
     ))
 

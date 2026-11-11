@@ -8,15 +8,15 @@ agents.
 - **§1**: Global Runtime & Type Subsystem (`core/globalstuff.py`) [L23-L211]
 - **§2**: Filesystem & Git Subsystem (`core/FileHandler.py`) [L212-L279]
 - **§3**: Runtime State & Multiprocessing IPC (`core/GreatProcessor.py`) [L280-L459]
-- **§4**: Relational Database Schema Registry (`core/DBLayout.py`, `core/ingest_state.py`, `core/checkpoints.py`) [L460-L641]
-- **§5**: Data Staging, Routing & Reference Resolution (`core/TableHandling.py`) [L642-L801]
-- **§6**: End-to-End Inter-Module Execution Lifecycle [L802-L943]
-- **§7**: Configuration & SSH Port Forwarding (`core/config.py`, `core/ssh_tunnel.py`) [L944-L1172]
-- **§8**: Mailing List Commit Resolver (`parser/mailing_list/`) [L1173-L1421]
-- **§9**: CVE List Ingestion (`parser/cve/`) [L1422-L1454]
-- **§10**: Release Statistics (`parser/git_ast/release_stats.py`) [L1455-L1508]
-- **§11**: Distributed Multi-Computer Parsing (`core/distributed.py`) [L1509-L1599]
-- **§12**: Backfills of Derived Tables (`core/backfills.py`) [L1600-L1635]
+- **§4**: Relational Database Schema Registry (`core/DBLayout.py`, `core/ingest_state.py`, `core/checkpoints.py`) [L460-L647]
+- **§5**: Data Staging, Routing & Reference Resolution (`core/TableHandling.py`) [L648-L807]
+- **§6**: End-to-End Inter-Module Execution Lifecycle [L808-L949]
+- **§7**: Configuration, SSH Port Forwarding & TUI (`core/config.py`, `core/ssh_tunnel.py`, `core/tui/`) [L950-L1234]
+- **§8**: Mailing List Commit Resolver (`parser/mailing_list/`) [L1235-L1483]
+- **§9**: CVE List Ingestion (`parser/cve/`) [L1484-L1516]
+- **§10**: Release Statistics (`parser/git_ast/release_stats.py`) [L1517-L1570]
+- **§11**: Distributed Multi-Computer Parsing (`core/distributed.py`) [L1571-L1694]
+- **§12**: Backfills of Derived Tables (`core/backfills.py`) [L1695-L1731]
 
 ---
 
@@ -37,7 +37,7 @@ agents.
     executes chunked commits every 500 ChangeSets.
   - `G.VERY_LOW_MEMORY_MODE`: Enabled via `--very-low-mem`; limits workers to `min(2, CPUS // 4)` (batch size
     25) with chunked commits every 300 ChangeSets for hosts with < 64GB RAM.
-  - `G.MEMORY_MODE`: String indicator (`"normal"`, `"low"`, `"very-low"`).
+  - `G.MEMORY_MODE`: String indicator (`"normal"`, `"low"`, `"very_low"`).
 - **Flags & Debugging**:
   - `G.DEBUG_TYPECHECK`: Enables runtime assertions on type validation decorators.
   - `G.BP_ON_SHUTDOWN`: Triggers `sys.breakpointhook()` on emergency exit.
@@ -101,8 +101,8 @@ agents.
   - `clean_unnamed_spelling(spelling: str) -> str`: Normalizes Libclang anonymous/unnamed cursor spellings
     (e.g. `(unnamed at /dev/shm/.../include/linux/foo.h:12:1)`) down to clean relative git repository paths
     (`(unnamed at include/linux/foo.h:12:1)`), stripping host and RAMDISK prefix directories.
-  - `setup_memory_limit(limit_gb: float = 60.0) -> None`: Enforces an OS-level 60GB boundary via Linux cgroups
-    v2 (`memory.max=60G`, `memory.high=54G`, `memory.oom.group=1`) via `systemd-run --user --scope` re-exec,
+  - `setup_memory_limit(limit_gb: float = 60.0) -> None`: Enforces an OS-level `limit_gb` boundary (`main.py` passes `--mm`, else `parser.mem_max`, else 60; `0` skips the guard) via Linux cgroups
+    v2 (`memory.max=<limit>G`, `memory.high=<90% of limit>G`, `memory.oom.group=1`) via `systemd-run --user --scope` re-exec,
     with graceful fallback to per-process address space limit (`RLIMIT_AS`), preventing Linux OOM kernel
     freezes during massive multicore AST translation unit parsing.
 
@@ -569,11 +569,16 @@ therefore bracketed:
 - **Next start** (`_previous_ingest()` in `ingest_git_dag()`): `done` skips the version (registering an alias
   ref when another ref ingested the commit); `interrupted` (`INGEST_PARSING`) calls `rollback_version()` and
   parses the version again from Step 1 (when that returns `False` — no watermarks, or stale ones —
-  `_purge_partial_version()` runs instead). Refs without a state row predate this mechanism: they count as
+  `ingest_state.purge_partial_version()` runs instead, deleting the head commit's rows of
+  `PARTIAL_VERSION_TABLES`). Refs without a state row predate this mechanism: they count as
   done when their checkpoint covers at least 90% of the tree (`INGEST_DONE` is then backfilled), otherwise
   their version-scoped rows (`m_bridge_checkpoint`, `m_commit_file`, `m_bridge_commit_tag`,
   `m_bridge_commit_person` of the head commit) are purged as before; their blob-level rows cannot be
   identified.
+- **Clean without parsing** (`ingest_state.clean_interrupted_version(db, network_id, commit_id, tables)`):
+  `rollback_version()` with the `purge_partial_version()` fallback, then deletes the `INGEST_PARSING` state
+  row, so the version reads as `new`; returns `"rollback"` or `"purge"`. The TUI's DB Content Viewer
+  (§7.3) runs it for interrupted versions.
 - **Rollback** (`rollback_plan()` + `rollback_version()`): first `precheck_queries()` look for rows older than
   the run (id at or below their table's watermark) that reference rows of the run; any hit raises
   `RecoveryError` instead of deleting older data. The plan then deletes, children before parents along the
@@ -595,7 +600,7 @@ therefore bracketed:
   ingested on top of them. `begin()` records the highest `m_commit` id along with the other marks, so a
   version with `INGEST_DONE` and a higher head `commit_id` was ingested afterwards and its rows sit above the
   same marks. `rollback_version()` checks this before deleting anything: on a hit it logs a warning, discards
-  the unusable marks and returns `False`, and the caller falls back to `_purge_partial_version()`
+  the unusable marks and returns `False`, and the caller falls back to `purge_partial_version()`
   (version-scoped rows only) rather than deleting a finished version's data. This happens when several
   interrupted runs accumulate — e.g. a branch left `INGEST_PARSING` while later releases completed.
 - **Retroactive Backfill & Downstream Re-alignment** (`orchestrate_repair_pipeline()`, `--repair`, `--backfill
@@ -630,7 +635,7 @@ preload `commit_id >= Old_VID`, `processing_unchanges()`, `_new_version_file_pai
 - **Expansion** (`checkpoints.expand()`): restores the full rows (~0.4 s) using `INSERT IGNORE INTO m_bridge_checkpoint`
   so concurrent worker expansions of the same base version do not clash on `PRIMARY KEY (commit_id, fnid)`. Step 1.5 of `update()` expands the
   previous version when it is a delta (a backfill or repair base); `purge_version_differential_rows()` and
-  `main._purge_partial_version()` expand the deltas resting on a checkpoint before deleting it
+  `ingest_state.purge_partial_version()` expand the deltas resting on a checkpoint before deleting it
   (`expand_dependents()`).
 - **Reading**: the `m_checkpoint_tree (commit_id, fnid, blob_id)` view (`TREE_VIEW_SQL`, created by
   `main.ensure_db_views()`; `m_bridge_file` reads it) returns every version's full tree. Filtered by
@@ -950,7 +955,8 @@ Main Process (STEP 6.1+: Post-Processing Subsystems) TableEngine (G.TE)         
 - When configuring or synchronizing database parameters, `DB_*` and `MYSQL_*` environment variables (including
   `DB_SOCKET`, `MYSQL_UNIX_PORT`, `MYSQL_SOCKET`) remain synchronized via `sync_environ()`, tracking
   internally exported keys in `_EXPORTED_ENV_VARS` via `_get_user_env()` to prevent environment self-pollution
-  during configuration reloads.
+  during configuration reloads. `scoped_environ(cfg)` is a context manager that exports `cfg` the same way
+  for the duration of a block and then restores the previous variables and `_EXPORTED_ENV_VARS`.
 - Sections:
   - `"database"`: MariaDB/MySQL connection settings (`host`, `port`, `user`, `password`, `database`,
     `timeout`, `engine`, `unix_socket`), `server_tuning` (`innodb_buffer_pool_size`, `innodb_log_file_size`,
@@ -971,10 +977,10 @@ Main Process (STEP 6.1+: Post-Processing Subsystems) TableEngine (G.TE)         
     (`checkpatch.enabled` default `false`, `checkpatch.ref` default `"latest-release"`, `sandbox` default
     `""`: running the repository's `scripts/checkpatch.pl`, off by default); see `webapp/API.md` §2.14–§2.15,
     §2.18 and §7.1.
-  - `"parser"`: TableEngine, memory mode, fidelity auditing, memory limits, `checkpoint_delta_ratio` (default
+  - `"parser"`: TableEngine, memory mode, memory limits, `checkpoint_delta_ratio` (default
     0.3: largest share of a version's files that may differ from its base for its checkpoint to be kept as a
     delta, §4.2; 0 keeps every checkpoint full), `facts_workers` (default 4: processes of Step 6.9)
-    (`table_engine`, `memory_mode`, `fidelity`, `mem_max`, `hugepages`, `preload_flush_mb`: MB of preloaded
+    (`table_engine`, `memory_mode`, `mem_max`: memory guard ceiling in GB, `--mm` overrides it, 0 disables the guard, `hugepages`, `preload_flush_mb`: MB of preloaded
     rows held on the heap before they are packed into a shared-memory segment, env `PRELOAD_FLUSH_MB`;
     `cache_max_table_mb`: ceiling (MB) on the size of one TE-cached table, a bigger one is read straight from
     the database instead of being cached, 0 for no ceiling, env `CACHE_MAX_TABLE_MB`, flag
@@ -996,7 +1002,7 @@ Main Process (STEP 6.1+: Post-Processing Subsystems) TableEngine (G.TE)         
     `DEFAULT_TAG_VIEWS`), and optionally `"default": true`.
 - Functions: `init_config(path)`, `get_config()`, `get_db_config()`, `get_webapp_config()`,
   `get_parser_config()`, `get_mailing_list_config()`, `get_ssh_tunnel_config(feature="database")`,
-  `get_workspace_config()`, `sync_environ(cfg)`, `resolve_unix_socket(socket_path, host)`,
+  `get_workspace_config()`, `sync_environ(cfg)`, `scoped_environ(cfg)`, `resolve_unix_socket(socket_path, host)`,
   `matches_branch_filter(branch, branch_filter)`, `find_repository_branches(repo, branch_filter,
   default_branch)`, `update_repository_branches(name_or_path, write=True)`. Constants: `DEFAULT_CONFIG`,
   `DEFAULT_BRANCH_FILTER`, `DEFAULT_TAG_VIEWS`, `REPOSITORY_KEYS`.
@@ -1030,6 +1036,13 @@ Main Process (STEP 6.1+: Post-Processing Subsystems) TableEngine (G.TE)         
   `--branches` (or `--all-branches`) automatically refreshes `config.json` and ingests the tip commit of every
   branch matching `branch_filter` as an independent checkpoint (`m_git_ref` with `ref_type = 2`). `--repo`
   accepts a configured repository name or a filesystem path.
+- **TUI Management**: `RepositoriesScreen` and `RepoDetailScreen` (`core/tui/screens/repos.py`) provide interactive
+  curses management of configured git repositories, `workspace.repos_dir` scanning, default branches, start refs,
+  branch filtering rules, tag grouping regex presets (`DEFAULT_TAG_VIEWS`), and diagnostic validation via `test_repository()`.
+  In `RepoDetailScreen`, `↑`/`↓` move between rows inside the Branches and Tag View Regex Rules boxes and leave a box only
+  past its first/last row (`Tab`/`Shift-Tab` always switch widgets); `Space` toggles the highlighted branch, and on the rules
+  box `Enter` edits, `A`/`Insert` adds (after the highlighted rule, same tag view), and `D`/`Delete` removes the highlighted
+  regex rule. Rules are validated with `re.compile` before they are applied; a tag view left without rules is dropped.
 
 ### 7.2. SSH Tunnel Manager (`SSHTunnelManager`)
 - **Purpose**: Encrypts and forwards remote connections across hosts (e.g. MariaDB database or mailing list
@@ -1044,7 +1057,8 @@ Main Process (STEP 6.1+: Post-Processing Subsystems) TableEngine (G.TE)         
     into `database.ssh_tunnel`.
 - **Subprocess Execution**: Uses system OpenSSH binary (`/usr/bin/ssh`) via `subprocess.Popen` with `-N -L
   <local_port>:<remote_host>:<remote_port>`, `-o ExitOnForwardFailure=yes`, `-o ServerAliveInterval=15`, `-o
-  ServerAliveCountMax=3`.
+  ServerAliveCountMax=3`. `detach_tty=True` starts the process in a new session (`start_new_session`), so it
+  has no controlling terminal to prompt on.
 - **Dynamic Port Binding**: If `local_port` is 0 or already occupied, dynamically allocates an ephemeral
   localhost port to avoid collisions with any local services.
 - **Authentication**:
@@ -1081,7 +1095,51 @@ Main Process (STEP 6.1+: Post-Processing Subsystems) TableEngine (G.TE)         
     `client.close(stop_tunnel=True)`), which reaps a tunnel a worker did have to open itself rather than
     orphaning the `ssh` process when the worker exits.
 
-### 7.3. Cross-Chunk Deduplication & Multiprocessing Fork Safety
+### 7.3. Interactive Terminal User Interface (TUI) Configuration Subsystem (`core/tui/`)
+- **Zero-Dependency Architecture**: Built entirely on Python standard library `curses` without external UI packages.
+- **Triggering & CLI Invocation**:
+  - Explicit CLI arguments: `python3 main.py --configure` or `--config-tui` launches the TUI directly.
+  - Automatic fallback: If no configuration file is detected (`find_config_path() is None`) and standard input is an interactive terminal (`sys.stdin.isatty() is True`), `main.py` launches `run_config_tui()` automatically. Non-interactive environments (CI/cron/pipelines) fall back to built-in defaults without prompting.
+  - **Pipeline launch hand-off**: `main.py` calls `run_config_tui_launch()`, which returns `None` when the user exits and otherwise a dict of CLI argument overrides that `main.py` sets on the argparse namespace (`setattr(args, key, value)`) before `init_config()` reads the configuration file (`{}` for a plain run). `run_config_tui()` returns `run_config_tui_launch() is not None`. Screens request a launch with `TUIApp.request_launch(save=False, **launch_args)`, which saves first only with `save=True`, stores `TUIApp.launch_args`, and exits the event loop; a failed save leaves the TUI running. `TUIApp.disk_config()` returns the configuration as saved on disk. `core/tui/screens/launch.py` holds the shared flow: `choose_launch_config(stdscr, app, action)` returns `RUN_SAVED` without unsaved edits and otherwise asks `Save & <action>` (`SAVE_AND_RUN`) / `Use saved config.json` (`RUN_SAVED`) / `Cancel` (`None`); `launch_pipeline(stdscr, app, mode, **launch_args)` calls `request_launch()` and reports a failed save.
+  - `reset_only` launch override: after the table reset in `main()` (`args.reset`), `args.reset_only` exits through `G.emergency_shutdown(0)` without parsing.
+- **Screen Navigation & Lifecycle (`core/tui/app.py`, `core/tui/screens/`)**:
+  - `TUIApp`: Orchestrates the curses lifecycle (`curses.wrapper`), manages a screen stack (`push_screen`, `pop_screen`, `current_screen`), tracks configuration dirty state (`is_dirty`), and performs atomic JSON persistence via temporary file replacement. Loading moves a legacy top-level `ssh_tunnel` section into `database.ssh_tunnel` when the latter is absent (as `load_config()` does), and `save_config()` writes `database.ssh_tunnel` as the only database tunnel section (the top-level alias is left out of the file).
+  - `ModalDialog.show()` resolves to the highlighted button when `getch()` reports no input (`-1`), so a dialog on a non-blocking window never spins.
+  - **Terminal output capture (`core/tui/output_capture.py`)**: `TUIApp.run()` runs its event loop inside `TerminalOutputCapture`, which detaches log handlers that write to stdout/stderr (file handlers keep logging), collects every record through one root capture handler (also installed as `logging.lastResort`), swaps `sys.stdout`/`sys.stderr` for buffers, and redirects file descriptor 2 to a temporary file (child processes such as `ssh` included). Whenever captured output grows, the loop calls `clearok(True)` so the next refresh repaints every cell. After `curses.wrapper` returns, `run_config_tui()` replays the captured records and text on the restored terminal.
+  - **Terminal state restore (`core/tui/app.py` `TerminalState`)**: `run_config_tui_launch()` saves the tty attributes and the dispositions of `SIGTSTP`, `SIGCONT`, `SIGWINCH`, `SIGINT`, `SIGTERM`, `SIGHUP` and `SIGQUIT` before `curses.wrapper` starts, and restores both as soon as it returns (normally or with an error), before the captured output is replayed. ncurses' `initscr()` installs C-level handlers for these signals that `endwin()` leaves in place; restoring the dispositions keeps a later `SIGTSTP`/`SIGCONT` (Ctrl+Z, `fg`) from switching the pipeline's terminal back to curses program mode (`ONLCR` off).
+  - **View state**: `TUIApp.view_state` maps a screen key to its UI state (highlighted rows, focused list). `BaseScreen.remember_view(key, **state)` / `recall_view(key)` store and read it, so a screen re-created from the main menu reopens on the same rows.
+  - `MainMenuScreen`: Top-level menu with hotkeys `[1-9, S, R, P, Q]` (`HOTKEYS`, case-insensitive; `Esc` = `Q`): the configuration screens (`1`-`4`), `Run Diagnostics` (`5`), `Git Repository Manager` (`6`, opens `GitRepoSelectScreen`), `Parse Specific Versions / Tags` (`7`), `Table Reset` (`8`), `DB Content Viewer` (`9`), `Save Configuration` (`S`, described as "Saves to Active Config File": writes `app.config_path`, the Active File shown in the header), `Save & Run Pipeline` (`R`, `request_launch(save=True)`), `Run Pipeline (saved config.json)` (`P`, `request_launch()` without saving; with unsaved edits it first confirms that they are discarded), and `Exit` (`Q`). Items take two rows when the list fits the menu box and one row otherwise; the list scrolls to keep the selection visible, with `↑`/`↓` markers on the box border.
+  - `GitRepoSelectScreen` (`core/tui/screens/git_select.py`): repository hub in front of `GitManagerScreen`. It lists `repository_candidates()` (`core/tui/screens/git_manager.py`): the configured `repositories[]` entries that are git repositories, then the clone target `<workspace.repos_dir>/linux` (kind `linux`) and the CVE catalog `cve.repo_dir` (kind `cve`; relative to the project root, empty means `cvelistV5`) unless a configured entry already has that path; each row shows name, kind, clone state (remote count or "not cloned") and path. Keys: `Enter`/`→` pushes `GitManagerScreen(repo_path=...)` on the highlighted row; `c` clones a missing `linux` or `cve` row (same flow as the manager's `c`); `n` adds another repository, either `Clone URL` (URL prompt, `https://`/`git://` only, then a directory-name prompt defaulting to `repo_dirname_from_url()`, validated by `is_valid_repo_dirname()`; clones into `<workspace.repos_dir>/<name>`, which must not exist) or `Add local` (path of an existing git repository, relative paths under the project root); both register it in `repositories[]` (`detect_repository()`, deduplicated by path, `is_dirty = True`). `a` fetches every cloned repository that has remotes in turn with `fetch_command(path, None)` (`git fetch --progress --tags --all`: every branch of every remote), each through `run_streaming_command()`; a cancel stops the pass and the status bar reports fetched, failed and not-started repositories. `Esc` returns. The highlighted path persists in `view_state["git_select"]`; rows are re-read on every return from the manager.
+  - `GitManagerScreen` (`core/tui/screens/git_manager.py`): Git repository manager for one repository at a time, over the same `repository_candidates()`; it opens on its `repo_path` argument, else the remembered repository, else `linux`, and `r`/`R` cycles forward/back. The list shows the repository's remotes (name and fetch URL). Keys: `c` clones the current `linux` or `cve` candidate when its directory is missing (`clone_current()`). For `linux`, a URL prompt defaults to `DEFAULT_LINUX_URL`, then a download-size confirmation, and the clone is registered in `repositories[]` (`detect_repository()`, deduplicated by path, `is_dirty = True`). For `cve`, a dialog offers `cvelistV5` (default, `DEFAULT_CVE_URL`), `vulns.git` (`KERNEL_CVE_URL`) or `Custom URL`; the clone is not added to `repositories[]`, and `cve.repo_dir` is pointed at it when it differs (`is_dirty = True`). URLs are validated as `https://`/`git://` (`clone_into()`); a failed or cancelled clone that leaves a directory asks `Keep` (default) / `Delete`. `a` adds remotes (`add_remote_menu()`): an `Add Remote` dialog offers `Standard` (default), `Custom` or `Cancel`; the `cve` candidate skips the dialog and goes straight to `Custom`. `Standard` opens `StandardRemotesDialog`, a checklist of `STANDARD_REMOTES` where presets already present by name or URL (`remote_url_key()` ignores scheme, case, trailing `/` and `.git`) read "(added)" and cannot be toggled; `Custom` adds a remote from a name prompt and a URL prompt (`https://` or `git://` only). After adding, `Fetch now` / `Later` offers to fetch the new remotes. `f` fetches the highlighted remote, `g` fetches all remotes, `d`/`Delete` removes the highlighted remote after a confirmation defaulting to `Cancel`, and `Esc` returns. Clone and fetch run through `run_streaming_command()` with `git_env()`; after a fetch the status bar points to "Repositories, Git & Branch Filters" for selecting the new remote-tracking branches (the screen never edits branch selections). The repository path and highlighted remote persist in `view_state["git_manager"]`.
+  - `VersionParseScreen` (`core/tui/screens/version_parse.py`): Tag selector for parsing chosen releases. It lists the enabled `repositories[]` entries whose path is a git repository (a repository SelectList appears with two or more), loads each repository's tags once with `list_version_tags()` (cached per path), and highlights `v3.0` when present without checking it. The filter input matches case-insensitively as a substring, or as a glob when it contains `*`/`?`; the `Include -rc / pre-release tags` checkbox filters the list locally. In the tag list `Space`/`Enter` toggles a tag, `a` toggles every visible tag, `n`/`c` clears the selection; `P` (outside the filter) or the `Parse` button launches after a confirmation naming the repository, the first ten tags (`... (+N more)`), and the mode. Launch arguments: `repo=<name>`, `ref=[selected tags in version order]`, `single_version=True`; with exactly one tag and `Continue through later releases` checked, `single_version=False` and `include_pre_releases=<rc checkbox>` (the checkbox reads "n/a" with several tags). An empty selection is refused, and `Use saved config.json` is refused when the repository is absent from the saved file ("Repository Not Saved"). The repository, filter, and highlighted tag persist in `view_state["version_parse"]`; the selection does not.
+  - **Table Reset (`core/tui/screens/table_reset.py`)**: `run_table_reset(stdscr, app)` picks the configuration with `choose_launch_config(..., "Reset")`, names the database it drops (`describe_reset_target()`: engine, schema, `host:port`, SSH tunnel) from that configuration (`app.disk_config()` for `RUN_SAVED`), and offers `Reset Only` / `Reset & Parse` / `Cancel` (default `Cancel`). It then requires the word `RESET` typed exactly in a `ModalTextInputDialog`; any other text shows "Reset Aborted" and changes nothing. A confirmed reset launches with `reset=True` and `reset_only=True` (`Reset Only`) or `reset_only=False` (`Reset & Parse`).
+  - **DB Content Viewer (`core/tui/screens/db_content.py`, `core/tui/db_content.py`)**: `DBContentScreen` connects to the database of `app.config` (unsaved edits included) and shows it on four tabs: `Versions`, `Repos & Branches`, `Mailing List & CVE`, `Tables & Size`. `Tab`/`Shift-Tab`, `←`/`→` or `1`-`4` switch tabs; `Enter`/`Space` opens a details dialog for the highlighted row; `R` reloads; `E` lists the sections that failed to load; `Esc`/`q` returns. Constructor hooks `session_factory`, `collector`, `cleaner` and `text_prompt` default to `open_db_session`, `collect_snapshot`, `clean_versions` and `ModalTextInputDialog`. The active tab and the Versions filter persist in `view_state["db_content"]`. A connection failure is shown on the screen, which stays usable.
+    - **Session** (`open_db_session(cfg)`): reuses this process's database tunnel or opens a temporary forward (`open_test_tunnel()`) when `database.ssh_tunnel.enabled` is set, exports the connection settings only for the session (`core.config.scoped_environ()`), and opens the `get_db_engine(database.engine)` driver. The active configuration and the environment the pipeline reads afterwards stay unchanged. `collect_snapshot(db, target)` reads every section through `BaseDBEngine` spec reads into a `DBSnapshot`; a section that fails is listed in `DBSnapshot.errors` and the others still load.
+    - **Versions**: one row per `m_git_ref` ref (`tag`, `branch`, `commit`) plus `m_ingest_state` rows no ref points at (`no ref`), with the state of its commit: `done` (`INGEST_DONE`, "parsed"), `interrupted` (`INGEST_PARSING` with no live worker), `in_progress` (`INGEST_PARSING` whose `worker_id` heartbeated in `m_parse_node` within `HEARTBEAT_WINDOW_S` = 180 s), `legacy` (no state row but `m_bridge_checkpoint` rows; the pipeline decides with its 90% rule whether it is complete) and `new` ("not parsed"). `interrupted`, `in_progress` and `legacy` count as partial. `F` cycles the filter all → partial → parsed → not parsed (and switches to the tab).
+    - **Repos & Branches**: one row per `m_repository` (network name, default branch, tag/branch/commit ref counts, parsed and partial counts); the details dialog lists the branch refs.
+    - **Mailing List & CVE**: whether `m_commit_email` / `m_commit_link` and the CVE tables (`m_cve_source`, `m_cve`, `m_cve_commit`, `m_cve_file`, `m_cve_commit_hash`) exist and hold rows (exact, `row_exists()`), with estimated rows and size, plus the `m_cve_source` rows (name, records, head, build time).
+    - **Tables & Size**: `BaseDBEngine.table_stats()` per table, largest first (rows are InnoDB estimates), totals for rows, data, index and the whole database, tables outside `core/DBLayout.py`, and schema tables missing from the database.
+    - **Clean partial runs** (`C`): lists the `interrupted` versions (`DBSnapshot.cleanable_versions()`, one per network and commit; on a highlighted interrupted row it first asks `This version` / `All interrupted (N)` / `Cancel`), shows a preview naming the database and each version (`Clean` / `Cancel`, default `Cancel`), and requires `CLEAN` typed exactly. `clean_versions(db, versions)` then re-reads each version's state row and skips it when it is no longer `INGEST_PARSING` or its worker heartbeats again, runs `ingest_state.clean_interrupted_version()` for the rest, reports the method or error per version, and the snapshot reloads. `in_progress` and `legacy` versions are never cleaned.
+  - **Git helpers (`core/tui/git_ops.py`)**: `list_version_tags(repo, include_pre_releases=True)` (release tags matching `VERSION_TAG_RE`, `git tag --sort=v:refname` with `-rc`/`-pre` version-sort suffixes, `-tree` tags excluded), `list_remotes()`, `add_remote()` / `remove_remote()` (validated by `is_valid_remote_name()` and `is_valid_remote_url()`, which accepts only `https://` and `git://` URLs), `clone_command()` / `fetch_command(repo, remote=None)` (argv builders; `remote=None` fetches `--all`, always with `--tags`), `DEFAULT_LINUX_URL` (torvalds tree), `DEFAULT_CVE_URL` (CVE Program `cvelistV5`) / `KERNEL_CVE_URL` (kernel CNA `vulns.git`) with `DEFAULT_CVE_DIRNAME`, `is_valid_repo_dirname()` / `repo_dirname_from_url()` (directory names for clones under `workspace.repos_dir`), and `STANDARD_REMOTES` (`stable`, `linux-next`, `net`, `net-next`, `tip`, `mm`, `bpf-next`, `rt-devel`, `rust`). `git_env()` sets `GIT_TERMINAL_PROMPT=0` so git never prompts on the terminal curses owns.
+  - **Streaming process view (`core/tui/process_view.py`)**: `run_streaming_command(stdscr, argv, title, cwd=None, env=None, wait_for_key=True)` runs a child (stdin `/dev/null`, stdout and stderr merged into a pipe, own session), reads it on a thread, and repaints the last lines every 100 ms (`stdscr.timeout(100)`, restored to blocking on return). A carriage return makes the next text replace the current line, so git progress counters update in place. `Esc`/`c` asks `Keep Running` / `Stop`; `Stop` terminates (then kills after 5 s). It returns `ProcessResult(returncode, cancelled, lines, error)` (`ok` when the exit code is 0 and it was not cancelled) and, with `wait_for_key`, waits for a key on a success/failure footer.
+  - `RepositoriesScreen` & `RepoDetailScreen` (`core/tui/screens/repos.py`): Scans `workspace.repos_dir`, manages repository entries, allows interactive multi-select branch checklists, customizes start refs, and manages tag view regex rules (`DEFAULT_TAG_VIEWS`). `RepositoriesScreen` remembers the highlighted repository (`view_state["repositories"]`); `RepoDetailScreen` remembers, per repository path (`view_state["repo_detail:<path>"]`), the focused list and the highlighted branch and tag-rule rows when saving, and restores them on the next visit. The rows between the buttons and the status bar show the full text of the highlighted tag rule (`Rule [<view>]: <regex>`, wrapped). A saved `project` or `default_branch` (an empty string included) is shown as saved; the repository name and `master` only fill a missing key. The last remaining tag rule cannot be deleted, because an empty `tag_views` list means `DEFAULT_TAG_VIEWS` to every reader. `Esc` / `Cancel` with unsaved edits asks for confirmation before discarding.
+  - `DatabaseSSHScreen` (`core/tui/screens/database_ssh.py`): Configures database connection parameters (host, port, user, password, unix_socket) and SSH tunnel port forwarding credentials. The forward destination fields are labelled `DB Host @SSH` / `DB Port @SSH` (`ssh_tunnel.remote_host` / `remote_port`: the address the SSH server connects to, `127.0.0.1` when MariaDB runs on the SSH host). With the tunnel enabled and the database `Port` different from the SSH `Local Port` (a `0` local port included), saving shows a "Port Mismatch" confirmation (`Save Anyway` / `Cancel`); `Cancel` keeps the screen open with nothing committed. Saving first validates the port inputs (`Port`, `SSH Port`, `DB Port @SSH`: 1-65535; `Local Port`: 0-65535) and reports invalid ones in an "Invalid Value" dialog without committing; `ssh_tunnel.enabled` is read with `core.config._coerce_bool`. `Esc` with unsaved edits asks before discarding.
+  - `ParserDistributedScreen` (`core/tui/screens/parser_dist.py`): Configures TableEngine, memory limits, hugepages, and distributed worker identification (`worker_id`, `role`, `delegate_stable`). The distributed fields are stored under `parser.distributed`; a key present there (an empty `worker_id` included) is shown as saved, and the flat `parser.<key>` value seeds the form only when the key is absent; with neither, the form shows the parser defaults (empty `worker_id`, i.e. `<role>:<hostname>:<pid>`, and `delegate_stable` on). `Memory Mode` offers `normal`, `low` and `very_low` (`normalize_memory_mode()` in `core/config.py` maps the aliases `compact` and `very-low` to `very_low` and any other value to `normal`, at config load and in `main.py`). When the terminal has room right of the form (≥ 87 columns), a side panel shows help for the focused field from `HELP_TOPICS` (Table Engine, Memory Mode, Max TE Table, Distributed; an overview for other fields); `F1`, or `?` outside a text field, shows the same topic in a dialog.
+  - `CVEMailingListScreen` (`core/tui/screens/cve_ml.py`): Configures local CVE catalog clone paths and public-inbox mailing list storage and daemon tunnels.
+  - Both screens read checkbox values with `core.config._coerce_bool` (string booleans such as `"false"` read as `False`). Saving validates the numeric inputs first (`mem_max` and `cache_max_table_mb`: whole numbers >= 0; the daemon and SSH ports: 1-65535); an invalid input leaves the configuration untouched, names the field in an "Invalid Value" dialog, and keeps the screen open. `Esc` (or `Cancel`) leaves without saving; with unsaved edits it first asks for confirmation (`BaseScreen.confirm_discard()`, which compares the widget values against the baseline recorded by `mark_form_clean()` at construction and after a save).
+- **Headless Diagnostic Testing Engine (`core/tui/testing.py`)**:
+  - Headless test routines returning structured `DiagnosticResult(name, passed, latency_ms, message, details)`:
+    - `open_test_tunnel(ssh_cfg, feature_name)`: Context manager yielding the local port of a usable SSH forward. It reuses this process's active tunnel for the feature, or spawns a temporary `SSHTunnelManager` under the private feature key `tui-test:<feature>` (so the active configuration's host/port are never rewritten) and stops it on exit. The remote port defaults to `3306` (`database`) or `8192` (`mailing_list`).
+    - `test_database_connection(db_cfg, ssh_tunnel_cfg, establish_tunnel=True)`: Probes MariaDB/MySQL/SQLite connection and round-trip latency via low-timeout ping. With the SSH tunnel enabled, it requires an active tunnel or a listening `local_port`, otherwise it opens a temporary forward with `open_test_tunnel()` for the duration of the probe (`establish_tunnel=False` reports the missing tunnel instead). The probe always connects to the configured database `host`/`port`, never to the forward's own port, so a `port` that differs from the forward's local port fails the test with a hint naming both ports.
+    - `test_ssh_tunnel(ssh_cfg, feature_name, establish=True)`: Validates SSH host reachability and key readability, then authenticates and opens the `ssh -L` forward through `open_test_tunnel()` and closes it (`establish=False` limits it to the TCP reachability check).
+    - `test_repository()`: Validates git repository paths, verifies default branch and start ref commits via `git rev-parse`, and counts filter-matching branches.
+    - `test_cve_catalog()`: Detects catalog layouts (`cvelistV5` vs `vulns.git`) and inspects HEAD commit metadata.
+    - `test_mailing_list()`: With `ssh_tunnel.enabled`, opens the mailing-list forward through `open_test_tunnel()` and probes the remote daemon's `/health` through it (a stopped daemon passes when `auto_start_daemon` is set). Otherwise it probes a local daemon on `127.0.0.1:<port>` and falls back to checking `storage_dir` readability.
+    - `run_all_diagnostics()`: Unified health runner for all subsystems.
+  - Exposes in-place quick testing (`T` key) within each settings screen, plus a dedicated `DiagnosticsScreen` displaying live pass/fail indicators, durations, and modal detail views.
+  - In-place tests paint a busy notice on the bottom row (`BaseScreen.show_busy()`) while a forward is being established; `show_busy()` also requests a full repaint (`BaseScreen.request_full_redraw()`). Temporary test tunnels run `ssh` in its own session (`SSHTunnelManager(detach_tty=True)`), so it never prompts on the controlling terminal. `DatabaseSSHScreen` tests the tunnel first and reports the database probe as skipped when the tunnel fails. `CVEMailingListScreen` merges its tunnel widgets over the stored `mailing_list.ssh_tunnel` section, so fields without a widget (`password`, `remote_host`, `remote_port`, `local_port`) reach the diagnostic.
+
+### 7.4. Cross-Chunk Deduplication & Multiprocessing Fork Safety
 - **Cross-Chunk Deduplication**: Intermediate chunk commits (`G.TE.commit_all()`) flush and clear staged
   queues (`queued_set`). To prevent subsequent ChangeSets or waves from attempting duplicate `INSERT INTO`
   queries for already-committed rows:
@@ -1560,7 +1618,7 @@ and isolated crash recovery.
   - **Ingestion Linkage**: When DAG ingestion starts in `ingest_git_dag()`, `m_parse_task.commit_id` is updated with the resolved
     `head_commit_id`, and `ingest_state.begin()` registers both `base_commit_id` and `worker_id` into `m_ingest_state`.
   - **Completion & Unlocking Ordering**: When a version finishes, `finish_version_ingest()` validates lease validity before committing completion: if running as a secondary worker (`distributed_role == "worker"`), it verifies `m_parse_task` for `task_id = gp._active_task_id`, `worker_id = node_id`, `status = TASK_LEASED`, and `lease_expires_at > now`; if the lease expired or was revoked, completion aborts with `RuntimeError` before marking `INGEST_DONE`. In `finish_version_ingest()`, `ingest_state.set_status(..., INGEST_DONE)` and `_compact_checkpoint()` execute before `unlock_dependent_tasks()`, guaranteeing that dependent tasks are unlocked only after ancestor checkpoints are fully compacted. Next, on workers, `distributed.mark_task_done(db, task_id, commit_id, network_id, ref_name=ref_name, worker_id=node_id)` sets `status = TASK_DONE` (3), records `commit_id`, and invokes `unlock_dependent_tasks()`.
-  - **Heartbeat & Node Registration**: Background renewals via `NodeHeartbeatDaemon` and `update_node_heartbeat()` propagate node `role` and `network_id` across periodic updates. `NodeHeartbeatDaemon` synchronizes state changes using internal mutex locking, provides idempotent `start()`, joins gracefully on stop, and suppresses node re-insertion after shutdown.
+  - **Heartbeat & Node Registration**: Background renewals via `NodeHeartbeatDaemon` and `update_node_heartbeat()` propagate node `role` and `network_id` across periodic updates. `NodeHeartbeatDaemon` synchronizes state changes using internal mutex locking, provides idempotent `start()`, joins gracefully on stop, and suppresses node re-insertion after shutdown. The heartbeat interval and lease length come from `parser.distributed.heartbeat_seconds` (default 30) and `lease_ttl_seconds` (default 180) through `distributed.resolve_lease_settings()`, which replaces a missing or non-positive value with its default and raises the lease to at least twice the interval; the worker loop passes the same lease to `claim_next_task()` and `reclaim_expired_leases()`.
   - **Worker Base Preservation**: In secondary worker mode (`distributed_role == "worker"`), `gp.Old_VID` and `gp.Old_Version_Name` are initialized from the claimed task's `base_commit_id` and `base_ref_name`. `ingest_git_dag()` preserves these values across DAG ingestion (shifting `gp.Old_VID = gp.VID` only in non-worker mode when `_repair_base_set` is false), ensuring diff calculations and delta checkpoints anchor to the task's base.
   - **Safe Dependency Unlocking**: In `unlock_dependent_tasks()`, matching requires a positive `base_commit_id > 0` or non-empty `base_ref_name`. When `base_ref_name` is None and querying `m_git_ref` by `commit_id`, it joins `m_repository` to filter by `repo.network_id = %s` and orders by `r.ref_type ASC LIMIT 1` (preferring tags over branch aliases). When `base_commit_id` is zero (unresolved base commit), matching evaluates strictly by `base_ref_name`. Matching tasks are assigned `base_commit_id = commit_id` and transitioned from `TASK_PENDING` (0) to `TASK_ELIGIBLE` (1).
   - **Clean Termination Evaluation (`is_parsing_finished`)**: Workers evaluate all remaining `TASK_PENDING` tasks. If any task's prerequisite base is currently in progress (`TASK_PENDING`, `TASK_ELIGIBLE`, `TASK_LEASED`, `TASK_RECLAIMING`, or `m_ingest_state` is `INGEST_PARSING`), termination evaluates to `False`. If a prerequisite base is detected as already completed (`TASK_DONE` or `INGEST_DONE`), `unlock_dependent_tasks()` unblocks the dependent task and termination evaluates to `False`. Termination evaluates to `True` only when all pending tasks cannot be unblocked due to failed or missing bases.

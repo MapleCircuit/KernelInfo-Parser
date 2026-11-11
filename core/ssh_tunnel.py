@@ -79,6 +79,7 @@ class SSHTunnelManager:
         strict_host_key_checking: str = "accept-new",
         connect_timeout: int = 10,
         feature: str = "database",
+        detach_tty: bool = False,
     ) -> None:
         self.host = host.strip()
         self.port = int(port or 22)
@@ -92,6 +93,8 @@ class SSHTunnelManager:
         self.strict_host_key_checking = strict_host_key_checking.strip() or "accept-new"
         self.connect_timeout = max(1, int(connect_timeout or 10))
         self.feature = feature.strip() or "database"
+        # Run ssh in its own session (no controlling terminal), so it can never prompt on /dev/tty
+        self.detach_tty = bool(detach_tty)
 
         self.proc: subprocess.Popen[str] | None = None
         self._askpass_path: Path | None = None
@@ -251,6 +254,7 @@ class SSHTunnelManager:
                 stdin=subprocess.DEVNULL,
                 text=True,
                 env=env,
+                start_new_session=self.detach_tty,
             )
         except Exception as exc:
             self._cleanup_askpass()

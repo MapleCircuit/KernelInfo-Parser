@@ -11,7 +11,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from core import ingest_state as I
 from core.DBLayout import TABLES
-from parser.git_ast.identity import build_identity_index, refresh_person_identities
+from parser.git_ast.identity import build_identity_index, identity_key, refresh_person_identities
 
 
 class FakeDB:
@@ -146,8 +146,8 @@ class TestWebappIndex(unittest.TestCase):
                     self.rows = [{"cnt": len(stored), "max_id": max(stored) if stored else None}]
                 elif sql.startswith("SELECT person_id, identity_key"):
                     self.rows = [{"person_id": k, "identity_key": v} for k, v in stored.items()]
-                elif "WHERE person_id > %s" in sql:
-                    self.rows = [{"person_id": p, "name": n, "email": e} for p, n, e in persons if p > params[0]]
+                elif "i.person_id IS NULL" in sql:
+                    self.rows = [{"person_id": p, "name": n, "email": e} for p, n, e in persons if p not in stored]
                 elif "WHERE person_id > 0" in sql:
                     self.rows = [{"person_id": p, "name": n, "email": e} for p, n, e in persons]
                 else:
@@ -179,6 +179,17 @@ class TestWebappIndex(unittest.TestCase):
         pid_to_key, _ = self.ms.MaintainerService._identity_index(self._cursor(stored))
         self.assertEqual(pid_to_key[5], "n:carl")
         self.assertEqual(pid_to_key[6], "e:shared@lists.org")   # no name-less merge until the next refresh
+
+    def test_persons_missing_below_the_highest_stored_id_get_their_own_key(self) -> None:
+        # Persons are not registered in person_id order: a refresh can store 5 but not 2 and 4
+        stored = {k: v for k, v in build_identity_index(PERSONAS).items() if k not in (2, 4)}
+        pid_to_key, members = self.ms.MaintainerService._identity_index(self._cursor(stored))
+        expected = {p: identity_key(n, e) for p, n, e in PERSONAS if p in (2, 4)}
+        self.assertEqual({p: pid_to_key[p] for p in expected}, expected)
+        self.assertNotIn(None, [pid_to_key.get(p) for p, _, _ in PERSONAS])
+        # A named alias without a stored row still joins its identity's other aliases
+        named = next(p for p in expected if expected[p].startswith("n:"))
+        self.assertGreater(len(members[pid_to_key[named]]), 1)
 
     def test_without_the_table_the_index_is_computed(self) -> None:
         for stored in (None, {}):

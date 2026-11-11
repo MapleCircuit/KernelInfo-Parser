@@ -56,6 +56,26 @@ DEFAULT_LEASE_TTL = 180
 DEFAULT_HEARTBEAT_INTERVAL = 30
 
 
+def resolve_lease_settings(dist_cfg: Any) -> tuple[int, int]:
+    """Return (lease_ttl, heartbeat_interval) in seconds from a `parser.distributed` config section.
+
+    Reads `lease_ttl_seconds` and `heartbeat_seconds`; a missing or non-positive value takes its default. The
+    lease is raised to at least twice the heartbeat interval so a live node always renews before it expires.
+    """
+    cfg = dist_cfg if isinstance(dist_cfg, dict) else {}
+
+    def _positive(key: str, default: int) -> int:
+        try:
+            val = int(cfg.get(key, default))
+        except (TypeError, ValueError):
+            return default
+        return val if val > 0 else default
+
+    interval = _positive("heartbeat_seconds", DEFAULT_HEARTBEAT_INTERVAL)
+    lease_ttl = max(_positive("lease_ttl_seconds", DEFAULT_LEASE_TTL), 2 * interval)
+    return lease_ttl, interval
+
+
 def get_default_node_id(role: str, worker_id: str | None = None) -> str:
     """Generate or sanitize unique identifier for this parser node (max 128 chars)."""
     hostname = socket.gethostname() or "node"

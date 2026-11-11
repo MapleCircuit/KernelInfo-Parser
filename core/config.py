@@ -7,6 +7,7 @@ and web application services with strict precedence:
 """
 from __future__ import annotations
 
+import contextlib
 import copy
 import fnmatch
 import json
@@ -16,6 +17,7 @@ import re
 import stat
 import subprocess
 from pathlib import Path
+from collections.abc import Iterator
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -142,7 +144,6 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "parser": {
         "table_engine": "cached",
         "memory_mode": "normal",
-        "fidelity": True,
         "mem_max": 60,
         "hugepages": "auto",
         # MB of preloaded rows held on the heap before they are packed into a shared-memory segment
@@ -280,6 +281,20 @@ def _coerce_int(val: Any, default: int) -> int:
         return default
 
 
+MEMORY_MODES = ("normal", "low", "very_low")
+_MEMORY_MODE_ALIASES = {"compact": "very_low", "very-low": "very_low", "verylow": "very_low"}
+
+
+def normalize_memory_mode(val: Any) -> str:
+    """Return the canonical memory mode for `val`: one of MEMORY_MODES.
+
+    Accepts the aliases "compact" and "very-low" for "very_low"; any other unknown value is "normal".
+    """
+    mode = str(val or "").strip().lower()
+    mode = _MEMORY_MODE_ALIASES.get(mode, mode)
+    return mode if mode in MEMORY_MODES else "normal"
+
+
 def _coerce_bool(val: Any, default: bool) -> bool:
     """Safely coerce value or string to boolean."""
     if val is None:
@@ -345,6 +360,29 @@ def sync_environ(cfg: dict[str, dict[str, Any]]) -> None:
     for k, v in vars_to_sync.items():
         os.environ[k] = v
         _EXPORTED_ENV_VARS[k] = v
+
+
+@contextlib.contextmanager
+def scoped_environ(cfg: dict[str, dict[str, Any]]) -> Iterator[None]:
+    """Export `cfg` with `sync_environ()` for the duration of the block, then restore the previous variables.
+
+    Lets a caller open a database engine against a configuration other than the active one (the TUI's
+    DB Content Viewer) without changing what the rest of the process reads afterwards.
+    """
+    global _EXPORTED_ENV_VARS
+    saved_env = dict(os.environ)
+    saved_exported = dict(_EXPORTED_ENV_VARS)
+    sync_environ(copy.deepcopy(cfg))
+    changed = [key for key in _EXPORTED_ENV_VARS if os.environ.get(key) != saved_env.get(key)]
+    try:
+        yield
+    finally:
+        for key in changed:
+            if key in saved_env:
+                os.environ[key] = saved_env[key]
+            else:
+                os.environ.pop(key, None)
+        _EXPORTED_ENV_VARS = saved_exported
 
 
 def load_config(config_path: str | Path | None = None) -> dict[str, dict[str, Any]]:
@@ -436,11 +474,7 @@ def load_config(config_path: str | Path | None = None) -> dict[str, dict[str, An
         parser_sec["table_engine"] = env_p_te
     if env_p_mem := _get_user_env("MEMORY_MODE"):
         parser_sec["memory_mode"] = env_p_mem
-    if env_p_fid := _get_user_env("FIDELITY"):
-        parser_sec["fidelity"] = _coerce_bool(env_p_fid, parser_sec["fidelity"])
-    else:
-        parser_sec["fidelity"] = _coerce_bool(parser_sec.get("fidelity"), True)
-
+    parser_sec["memory_mode"] = normalize_memory_mode(parser_sec.get("memory_mode"))
     if env_p_hp := (_get_user_env("HUGEPAGES") or _get_user_env("TE_HUGEPAGES")):
         parser_sec["hugepages"] = env_p_hp.lower().strip()
     else:

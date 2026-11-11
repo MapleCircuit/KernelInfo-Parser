@@ -1348,8 +1348,8 @@ registry (`m_maintainer_person`).
 under many `person_id`s. Rows are merged into one entry per identity (`MaintainerService._identity_index`,
 cached per repository until the registry or the stored identities change). The parser stores each alias's
 identity in `m_person_identity` (`core/API.md` §4 row 59, refreshed after each version, after release
-statistics and at start), so the index is read from it; aliases registered since its last refresh get their
-own `identity_key()` (no name-less merge) until the next one, and a database without stored rows computes the
+statistics and at start), so the index is read from it; aliases without a stored row (registered since its
+last refresh, whatever their `person_id`) get their own `identity_key()` (no name-less merge) until the next one, and a database without stored rows computes the
 index from the whole registry (`build_identity_index`, `parser/git_ast/identity.py`):
 - Identity = name folded for case/whitespace, with surrounding quotes and a leaked `From:` prefix stripped
   (`_clean_name`, also the displayed name; `clean_name` / `identity_key` of `parser/git_ast/identity.py`,

@@ -68,6 +68,7 @@ from core.globalstuff import (
 from core.quit_listener import GracefulQuitListener
 from core import ingest_state, distributed
 from core.config import (
+    find_config_path,
     init_config,
     get_config,
     sync_environ,
@@ -80,6 +81,7 @@ from core.config import (
     get_default_repo_path,
     resolve_repo_path,
     sync_repositories,
+    normalize_memory_mode,
 )
 from core.ssh_tunnel import start_ssh_tunnel, stop_ssh_tunnel
 from core.Profiler import parse_duration, PipelineStageProfiler, format_profiling_report
@@ -2555,6 +2557,15 @@ def trigger_multicore(batch_size: int | None = None, scheduler: DependencySchedu
     _report_worker_errors(error_list, failed_workers)
 
 
+def _resolve_mem_max(value: Any) -> float:
+    """Return the memory guard ceiling in GB from a config value: a number >= 0, else the 60 GB default."""
+    try:
+        gb = float(value)
+    except (TypeError, ValueError):
+        return 60.0
+    return gb if gb >= 0 else 60.0
+
+
 def _apply_db_server_tuning(db: Any, mem_max_gb: float) -> None:
     """Raise the MariaDB settings listed in `database.server_tuning` (config) for this run.
 
@@ -2592,7 +2603,7 @@ def _apply_db_server_tuning(db: Any, mem_max_gb: float) -> None:
             pool = int(row[0]) if row and row[0] is not None else pool
         except Exception:
             pass
-    if local and ram and isinstance(pool, int) and mem_max_gb * 1024**3 + pool > ram:
+    if local and ram and isinstance(pool, int) and mem_max_gb > 0 and mem_max_gb * 1024**3 + pool > ram:
         logger.warning(COLOR.yellow(
             f"[DB Tuning] The memory guard ({mem_max_gb:.0f} GB) plus the InnoDB buffer pool ({pool / 1024**3:.0f} GB) "
             f"exceed this machine's {ram / 1024**3:.0f} GB of RAM; lower parser.mem_max if the parser ever gets close."
@@ -2706,7 +2717,8 @@ def orchestrate_repair_pipeline(
 def main() -> None:
     """Set the plan for what version to parse."""
     args = arg_handling()
-    setup_memory_limit(float(args.mem_max))
+    if args.mem_max > 0:
+        setup_memory_limit(float(args.mem_max))
     role = getattr(args, "role", "standalone") or "standalone"
     is_distributed = role in (distributed.ROLE_MASTER, distributed.ROLE_WORKER)
     G.distributed = is_distributed
@@ -2730,6 +2742,9 @@ def main() -> None:
             ensure_db_views(db)
             if hasattr(G.TE, "start_new_db") and getattr(G.TE, "tables", None):
                 G.TE.start_new_db(G.DB, is_worker=False)
+            if getattr(args, "reset_only", False):
+                logger.info(COLOR.green("Table reset complete; exiting without parsing (reset_only)."))
+                G.emergency_shutdown(0)
         else:
             if role != distributed.ROLE_WORKER:
                 drop_obsolete_kconfig_tables(db)
@@ -2854,12 +2869,15 @@ def main() -> None:
 
     node_id = None
     heartbeat_daemon = None
+    lease_ttl, heartbeat_interval = distributed.resolve_lease_settings(get_parser_config().get("distributed"))
     if is_distributed:
         node_id = distributed.get_default_node_id(role, getattr(args, "worker_id", None))
         G.node_id = node_id
         with G.DB() as db:
             distributed.register_node(db, node_id, role, network_id)
-        heartbeat_daemon = distributed.NodeHeartbeatDaemon(G.DB, node_id, role=role, network_id=network_id)
+        heartbeat_daemon = distributed.NodeHeartbeatDaemon(
+            G.DB, node_id, interval=heartbeat_interval, lease_ttl=lease_ttl, role=role, network_id=network_id
+        )
         heartbeat_daemon.start()
         G.heartbeat_daemon = heartbeat_daemon
     else:
@@ -2880,8 +2898,10 @@ def main() -> None:
         try:
             while not G.is_deadline_exceeded() and not quit_listener.requested.is_set():
                 with G.DB() as db:
-                    distributed.reclaim_expired_leases(db, network_id)
-                    task = distributed.claim_next_task(db, network_id, node_id, preferred_chain=preferred_chain)
+                    distributed.reclaim_expired_leases(db, network_id, lease_ttl=lease_ttl)
+                    task = distributed.claim_next_task(
+                        db, network_id, node_id, preferred_chain=preferred_chain, lease_ttl=lease_ttl
+                    )
 
                 if task is not None:
                     t_id = task["task_id"]
@@ -3143,6 +3163,13 @@ def arg_handling() -> argparse.Namespace:
         help="Path to JSON configuration file",
     )
     parser.add_argument(
+        "--configure", "--config-tui",
+        dest="configure",
+        action="store_true",
+        default=False,
+        help="Launch the interactive Terminal User Interface (TUI) to configure config.json",
+    )
+    parser.add_argument(
         "--repo", "--repository",
         dest="repo",
         default=None,
@@ -3263,19 +3290,6 @@ def arg_handling() -> argparse.Namespace:
         help="Preview version discovery, gap detection, and planned repair actions without modifying the database",
     )
     parser.add_argument(
-        "-f", "--fidelity",
-        dest="fidelity",
-        action="store_true",
-        default=None,
-        help="Display full tag text & source code fidelity audit report across test files (default: True)",
-    )
-    parser.add_argument(
-        "--no-fidelity",
-        dest="fidelity",
-        action="store_false",
-        help="Disable tag text & source code fidelity audit report",
-    )
-    parser.add_argument(
         "-l", "--low-mem", "--low-memory",
         dest="low_mem",
         action="store_true",
@@ -3290,8 +3304,9 @@ def arg_handling() -> argparse.Namespace:
     parser.add_argument(
         "--mm", "--mem-max",
         dest="mem_max",
-        default=60,
-        help="Set memory max limit in GB. Defaults to 60GB",
+        default=None,
+        type=float,
+        help="Set memory max limit in GB (0 disables the memory guard). Defaults to parser.mem_max, else 60GB",
     )
     parser.add_argument(
         "--db", "--db-engine",
@@ -3580,7 +3595,25 @@ def arg_handling() -> argparse.Namespace:
     )
     args = parser.parse_args()
 
-    if args.config is not None:
+    # Launch configuration TUI if requested or if no configuration file exists in an interactive session
+    cfg_file = find_config_path(args.config)
+    launch_tui = bool(getattr(args, "configure", False)) or (
+        cfg_file is None
+        and sys.stdin.isatty()
+        and args.unit_test is None
+        and not args.detect_repos
+        and not getattr(args, "worker_once", False)
+    )
+    if launch_tui:
+        from core.tui.app import run_config_tui_launch
+        launch = run_config_tui_launch(args.config)
+        if launch is None:
+            sys.exit(0)
+        # TUI run actions (parse selected tags, table reset) arrive as CLI argument overrides
+        for key, value in launch.items():
+            setattr(args, key, value)
+        init_config(args.config)
+    elif args.config is not None:
         init_config(args.config)
 
     # Register repositories found under workspace.repos_dir into the config file
@@ -3597,10 +3630,15 @@ def arg_handling() -> argparse.Namespace:
                 )
             sys.exit(0)
 
-    # Enforce memory limit early so re-exec (systemd-run) occurs before opening SSH tunnels or DB connections
-    setup_memory_limit(float(args.mem_max))
-
     parser_cfg = get_parser_config()
+
+    # --mm wins over parser.mem_max; both fall back to 60 GB
+    if args.mem_max is None:
+        args.mem_max = _resolve_mem_max(parser_cfg.get("mem_max"))
+
+    # Enforce memory limit early so re-exec (systemd-run) occurs before opening SSH tunnels or DB connections
+    if args.mem_max > 0:
+        setup_memory_limit(float(args.mem_max))
     dist_cfg = parser_cfg.get("distributed", {}) if isinstance(parser_cfg, dict) else {}
     if getattr(args, "role", None) is None:
         args.role = dist_cfg.get("role", "standalone") if dist_cfg.get("enabled", False) else "standalone"
@@ -3656,13 +3694,7 @@ def arg_handling() -> argparse.Namespace:
     elif args.low_mem:
         G.MEMORY_MODE = "low"
     elif parser_cfg.get("memory_mode"):
-        G.MEMORY_MODE = parser_cfg["memory_mode"]
-
-    if args.fidelity is None:
-        args.fidelity = parser_cfg.get("fidelity", True)
-
-    if args.mem_max == 60:
-        args.mem_max = parser_cfg.get("mem_max")
+        G.MEMORY_MODE = normalize_memory_mode(parser_cfg["memory_mode"])
 
     if getattr(args, "single_version", None) is None:
         args.single_version = parser_cfg.get("single_version", False)
@@ -3723,11 +3755,11 @@ def arg_handling() -> argparse.Namespace:
         target = args.unit_test if args.unit_test != "" else None
         from tests.test_c_ast import run_c_ast_tests
         if target:
-            code = run_c_ast_tests(target, profile=args.profile, fidelity=args.fidelity, table_engine=args.table_engine)
+            code = run_c_ast_tests(target, profile=args.profile, table_engine=args.table_engine)
             sys.exit(code)
 
         # 1. Multi-Core C-AST regression suite
-        c_ast_code = run_c_ast_tests(None, profile=args.profile, fidelity=args.fidelity, table_engine=args.table_engine)
+        c_ast_code = run_c_ast_tests(None, profile=args.profile, table_engine=args.table_engine)
 
         # 2. Comprehensive Unittest Suite across all test modules
         print(COLOR.cyan("=========================================================================================="))
@@ -3813,6 +3845,27 @@ def arg_handling() -> argparse.Namespace:
             "tests.test_webapp_watch",
             "tests.test_webapp_theme_contrast",
             "tests.test_webapp_frontend_js",
+            "tests.test_tui",
+            "tests.test_tui_app",
+            "tests.test_tui_testing",
+            "tests.test_tui_output_capture",
+            "tests.test_tui_reentry",
+            "tests.test_tui_launch",
+            "tests.test_tui_process_view",
+            "tests.test_repos_screen",
+            "tests.test_database_ssh_screen",
+            "tests.test_parser_cve_screens",
+            "tests.test_git_manager_screen",
+            "tests.test_version_parse_screen",
+            "tests.test_db_content",
+            "tests.test_db_content_screen",
+            "tests.test_git_select_screen",
+            "tests.test_distributed_parsing",
+            "tests.test_linux_branches_distributed",
+            "tests.test_max_allowed_packet",
+            "tests.test_resume_pipeline",
+            "tests.test_te_chunk_dedup",
+            "unit_test.test_sqlite_store",
         ]
         suite = unittest.TestSuite()
         for mod_name in test_modules:
@@ -3832,7 +3885,7 @@ def arg_handling() -> argparse.Namespace:
         sys.exit(0 if all_ok else 1)
     if args.Test:
         from tests.test_c_ast import run_c_ast_tests
-        code = run_c_ast_tests(args.Test, profile=args.profile, fidelity=args.fidelity, table_engine=args.table_engine)
+        code = run_c_ast_tests(args.Test, profile=args.profile, table_engine=args.table_engine)
         sys.exit(code)
 
     return args
@@ -4328,15 +4381,7 @@ def _resolve_legacy_state(ref: str, version_states: dict[str, tuple[int, str]], 
 
 def _purge_partial_version(db: Any, commit_id: int) -> None:
     """Remove the version-scoped rows of an interrupted run that left no watermarks."""
-    if db is None:
-        return
-    checkpoints.expand_dependents(db, commit_id)
-    if hasattr(db, "execute"):
-        for table in ("m_checkpoint_base", "m_bridge_checkpoint", "m_arch_root", "m_commit_file", "m_bridge_commit_tag",
-                      "m_bridge_commit_person", "m_commit_email"):
-            db.execute(f"DELETE FROM {table} WHERE commit_id = %s", (commit_id,))  # noqa: S608
-        if hasattr(db, "commit"):
-            db.commit()
+    ingest_state.purge_partial_version(db, commit_id)
 
 
 def _forget_rolled_back_rows() -> None:

@@ -21,6 +21,9 @@ from __future__ import annotations
 import os
 import sys
 import unittest
+from contextlib import ExitStack, contextmanager
+from types import SimpleNamespace
+from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -35,7 +38,15 @@ from webapp.backend.services.git_service import GitService, _compute_structured_
 from webapp.backend.services.kconfig_service import KconfigService
 from webapp.backend.services.maintainer_service import MaintainerService
 from webapp.backend.services.pahole_service import PaholeService
+from webapp.backend.services import (
+    callgraph_service as callgraph_mod,
+    filesystem_service as filesystem_mod,
+    pahole_service as pahole_mod,
+    symbol_service as symbol_mod,
+)
+from webapp.backend.services.arch_layout_service import arch_layout_service
 from webapp.backend.services.symbol_service import SymbolService
+from webapp.backend.services.tree_resolver import ArchScope
 
 _diff, _fs, _kconfig, _symbols = DiffService(), FilesystemService(), KconfigService(), SymbolService()
 get_versions_diff = _diff.get_versions_diff
@@ -52,6 +63,137 @@ get_function_callgraph = CallgraphService().get_function_callgraph
 get_struct_layout = PaholeService().get_struct_layout
 match_patch_maintainers = MaintainerService().match_maintainers
 generate_formatted_patch = GitService().format_patch
+
+
+# --- Fixture data for the tests that must not depend on a parsed database ---------------------------------
+# Revision tree: blob_id -> paths
+_FIXTURE_BLOBS: dict[int, list[str]] = {
+    101: ["include/linux/slab.h"],
+    102: ["mm/slab.c"],
+    103: ["include/linux/sched.h"],
+    104: ["fs/ext4/super.c"],
+    105: ["fs/ext4/inode.c"],
+}
+# Symbol definitions (the m_symbol_def view's columns; `fid` is the view's blob_id alias)
+_FIXTURE_DEFS: list[dict] = [
+    {"def_id": 1, "name": "kmalloc", "type_id": 10, "type_name": "C_functiondecl", "blob_id": 101,
+     "line_s": 300, "line_e": 312, "ast_id": 5001, "tag_id": 1, "linkage": None, "ast_name": "kmalloc"},
+    {"def_id": 2, "name": "task_struct", "type_id": 11, "type_name": "C_structdecl", "blob_id": 103,
+     "line_s": 1193, "line_e": 1580, "ast_id": 5002, "tag_id": 2, "linkage": None, "ast_name": "task_struct"},
+    {"def_id": 3, "name": "task_nice", "type_id": 10, "type_name": "C_functiondecl", "blob_id": 103,
+     "line_s": 1700, "line_e": 1703, "ast_id": 5003, "tag_id": 3, "linkage": None, "ast_name": "task_nice"},
+    {"def_id": 4, "name": "ext4_fill_super", "type_id": 10, "type_name": "C_functiondecl", "blob_id": 104,
+     "line_s": 3000, "line_e": 3700, "ast_id": 5004, "tag_id": 4, "linkage": None, "ast_name": "ext4_fill_super"},
+    {"def_id": 5, "name": "ext4_iget", "type_id": 10, "type_name": "C_functiondecl", "blob_id": 105,
+     "line_s": 3800, "line_e": 4000, "ast_id": 5005, "tag_id": 5, "linkage": None, "ast_name": "ext4_iget"},
+    # A definition whose blob is not in the revision's tree: never returned for this revision
+    {"def_id": 6, "name": "ext4_old_helper", "type_id": 10, "type_name": "C_functiondecl", "blob_id": 999,
+     "line_s": 10, "line_e": 20, "ast_id": 5006, "tag_id": 6, "linkage": None, "ast_name": "ext4_old_helper"},
+]
+# References to kmalloc (ast 5001): a call in ext4 and a declaration in mm/slab.c
+_FIXTURE_REFS: list[dict] = [
+    {"role": 3, "line": 3120, "char_s": 9, "fid": 104, "tag_id": 4, "caller": "ext4_fill_super", "target": 5001},
+    {"role": 1, "line": 42, "char_s": 1, "fid": 102, "tag_id": 7, "caller": None, "target": 5001},
+    {"role": 3, "line": 77, "char_s": 3, "fid": 999, "tag_id": 8, "caller": "gone", "target": 5001},  # out of tree
+]
+_FIXTURE_REV = "fixture-rev"
+
+
+class _FixtureCursor:
+    """DB cursor answering the symbol queries of the webapp services from the fixture lists above."""
+
+    def __init__(self) -> None:
+        self._rows: list[dict] = []
+
+    def execute(self, sql: str, args: tuple | list = ()) -> None:
+        args = list(args or ())
+        rows: list[dict] = []
+        if "FROM m_tag_def WHERE name LIKE" in sql:
+            prefix = str(args[0]).rstrip("%")
+            rows = [{"name": n} for n in sorted({d["name"] for d in _FIXTURE_DEFS}) if n.startswith(prefix)]
+        elif "FROM m_symbol_def s" in sql and "s.name IN" in sql:
+            names = set(args[:-1])
+            rows = [{**d, "fid": d["blob_id"]} for d in _FIXTURE_DEFS if d["name"] in names]
+        elif "FROM m_symbol_def s" in sql and "s.name = %s" in sql:
+            rows = [{**d, "fid": d["blob_id"]} for d in _FIXTURE_DEFS if d["name"] == args[0]]
+            if "t.name IN" in sql:
+                rows = [r for r in rows if r["type_name"] in args[1:]]
+        elif "r.role, r.line" in sql:
+            targets = set(args)
+            rows = [{k: v for k, v in r.items() if k != "target"} for r in _FIXTURE_REFS if r["target"] in targets]
+        self._rows = [dict(r) for r in rows]
+
+    def fetchall(self) -> list[dict]:
+        return self._rows
+
+    def fetchone(self) -> dict | None:
+        return self._rows[0] if self._rows else None
+
+
+@contextmanager
+def _fixture_db_cursor():
+    yield _FixtureCursor()
+
+
+def _fixture_scope(cursor, version_name):
+    return 1, version_name, {k: list(v) for k, v in _FIXTURE_BLOBS.items()}
+
+
+def _fixture_arch(version_name, arch):
+    return "x86_64", ArchScope.of("x86"), 64
+
+
+def _fixture_tree() -> dict[str, int]:
+    """{path: size} of a small synthetic kernel tree (more than 1000 files under arch/)."""
+    sizes: dict[str, int] = {}
+    for arch in ("arm", "x86"):
+        for i in range(600):
+            sizes[f"arch/{arch}/mach-{i % 12}/board-{i}.c"] = 1000 + i
+        sizes[f"arch/{arch}/include/asm/io.h"] = 4096
+    for i in range(50):
+        sizes[f"fs/ext4/file{i}.c"] = 2000 + i
+        sizes[f"kernel/sched/part{i}.c"] = 3000 + i
+    sizes["include/linux/sched.h"] = 80000
+    sizes["Makefile"] = 50000
+    return sizes
+
+
+def _fixture_kconfig_model():
+    """A Kconfig model entry (KconfigService.get_model) with EXT4_FS and BTRFS_FS and their relations."""
+    symbols = {
+        "EXT4_FS": {"selects": [("JBD2", None), ("CRC16", None)], "implies": []},
+        "BTRFS_FS": {"selects": [("LIBCRC32C", None), ("ZLIB_DEFLATE", None)], "implies": []},
+        "BLOCK": {"selects": [], "implies": []},
+    }
+    return SimpleNamespace(
+        model={"symbols": symbols},
+        own_depends={"EXT4_FS": ["BLOCK"], "BTRFS_FS": ["BLOCK"]},
+        selected_by={},
+        arch={"arch": "x86_64"},
+    )
+
+
+@contextmanager
+def _fixture_services():
+    """Point the symbol, struct-layout, callgraph, filesystem and Kconfig services at the fixtures above
+    (no database rows, Git tree or parsed version needed)."""
+    with ExitStack() as stack:
+        for mod in (symbol_mod, pahole_mod, callgraph_mod, filesystem_mod):
+            stack.enter_context(patch.object(mod, "get_db_cursor", _fixture_db_cursor))
+        for mod in (symbol_mod, pahole_mod, callgraph_mod):
+            stack.enter_context(patch.object(mod, "definition_arch", _fixture_arch))
+        stack.enter_context(patch.object(SymbolService, "_scope", staticmethod(_fixture_scope)))
+        stack.enter_context(patch.object(filesystem_mod, "get_version_info", lambda cursor, v: (1, _FIXTURE_REV)))
+        tree = _fixture_tree()
+        stack.enter_context(patch.object(filesystem_mod.git_tree_resolver, "list_tree", lambda rev: list(tree)))
+        stack.enter_context(patch.object(filesystem_mod.git_tree_resolver, "list_tree_sizes", lambda rev: dict(tree)))
+        stack.enter_context(patch.object(arch_layout_service, "layout", lambda rev, arch: None))
+        stack.enter_context(patch.object(KconfigService, "get_model", lambda self, *a, **k: _fixture_kconfig_model()))
+        filesystem_mod._TREEMAP_CACHE.clear()
+        try:
+            yield
+        finally:
+            filesystem_mod._TREEMAP_CACHE.clear()
 
 
 class TestWebappAdvancedFeatures(unittest.TestCase):
@@ -72,23 +214,28 @@ class TestWebappAdvancedFeatures(unittest.TestCase):
         self.assertEqual(k_res["summary"]["removed"], 0)
 
     def test_symbol_xref_and_search(self) -> None:
-        # Rich symbol search from m_symbol_def
-        search_res = search_symbols("v3.0", "ext4", limit=10)
-        self.assertIsInstance(search_res, list)
-        if len(search_res) > 0:
+        with _fixture_services():
+            # Rich symbol search from m_symbol_def: in-tree prefix matches only, shorter names first
+            search_res = search_symbols("v3.0", "ext4", limit=10)
+            self.assertIsInstance(search_res, list)
+            self.assertEqual([s["name"] for s in search_res], ["ext4_iget", "ext4_fill_super"])
             sym = search_res[0]
-            self.assertIn("name", sym)
-            self.assertIn("type_name", sym)
-            self.assertIn("file_path", sym)
-            self.assertIn("line_s", sym)
-            self.assertIn("ast_id", sym)
+            for key in ("name", "type_name", "file_path", "line_s", "ast_id"):
+                self.assertIn(key, sym)
+            self.assertEqual(sym["file_path"], "fs/ext4/inode.c")
 
-        # XRef search for kmalloc or ext4 symbol
-        xref = get_symbol_xref("v3.0", "kmalloc")
+            # XRef search for kmalloc
+            xref = get_symbol_xref("v3.0", "kmalloc")
         self.assertIn("symbol", xref)
         self.assertEqual(xref["symbol"], "kmalloc")
         self.assertIn("definitions", xref)
         self.assertIn("references", xref)
+        self.assertEqual([d["file"] for d in xref["definitions"]], ["include/linux/slab.h"])
+        self.assertEqual(xref["ast_id"], 5001)
+        # Only references from blobs in the revision's tree, grouped by role
+        self.assertEqual([(r["type"], r["file"]) for r in xref["references"]],
+                         [("Decl", "mm/slab.c"), ("Call", "fs/ext4/super.c")])
+        self.assertEqual(xref["references"][1]["caller"], "ext4_fill_super")
         # Every reference carries its role badge (the categories are not repeated as separate lists)
         badges = {"Decl", "TypeUsage", "Call", "MemberRef", "DeclRef", "MacroExp", "Ref"}
         self.assertTrue(all(r["type"] in badges for r in xref["references"]))
@@ -223,6 +370,10 @@ class TestWebappAdvancedFeatures(unittest.TestCase):
         self.assertIn("Subject: [PATCH] ext4: update b value", res["formatted_patch"])
 
     def test_edge_cases_empty_and_fallback(self) -> None:
+        with _fixture_services():
+            self._check_edge_cases()
+
+    def _check_edge_cases(self) -> None:
         # 1. Empty Patch Review
         empty_patch = match_patch_maintainers("v3.0", patch_text="")
         self.assertEqual(len(empty_patch["files"]), 0)
@@ -272,19 +423,25 @@ class TestWebappAdvancedFeatures(unittest.TestCase):
         self.assertGreater(len(g2["edges"]), 0)
 
     def test_symbol_endpoints(self) -> None:
-        try:
+        with _fixture_services():
             detail = get_symbol_detail("v3.0", "task_struct")
             self.assertIn("symbol_name", detail)
             self.assertEqual(detail["symbol_name"], "task_struct")
             self.assertIn("definition", detail)
             self.assertIn("definitions", detail)
+            self.assertEqual(detail["file_path"], "include/linux/sched.h")
+            self.assertEqual(detail["definition"]["ast_id"], 5002)
             # References are xref's: symbol detail (Go to Definition) does not compute them
             self.assertNotIn("usages", detail)
-        except HTTPException as e:
-            self.assertEqual(e.status_code, 404)
 
-        results = search_symbols("v3.0", "task", limit=10)
+            # A symbol the revision does not define is a 404
+            with self.assertRaises(HTTPException) as ctx:
+                get_symbol_detail("v3.0", "no_such_symbol_xyz")
+            self.assertEqual(ctx.exception.status_code, 404)
+
+            results = search_symbols("v3.0", "task", limit=10)
         self.assertIsInstance(results, list)
+        self.assertEqual([r["name"] for r in results], ["task_nice", "task_struct"])
 
     def test_include_symbols_endpoint_and_dom(self) -> None:
         """Verify get_include_symbols endpoint and includeSymbolsPopover UI structure."""

@@ -493,6 +493,51 @@ def rollback_version(db: Any, network_id: int, commit_id: int, tables: Sequence[
     return True
 
 
+# Commit-scoped rows of a version run; `purge_partial_version()` deletes them when the run left no watermarks
+PARTIAL_VERSION_TABLES = (
+    "m_checkpoint_base",
+    "m_bridge_checkpoint",
+    "m_arch_root",
+    "m_commit_file",
+    "m_bridge_commit_tag",
+    "m_bridge_commit_person",
+    "m_commit_email",
+)
+
+
+def purge_partial_version(db: Any, commit_id: int) -> int:
+    """Remove the version-scoped rows (`PARTIAL_VERSION_TABLES`) of an interrupted run that left no watermarks.
+
+    Versions stored as checkpoint deltas of `commit_id` are expanded first. Returns the deleted row count.
+    """
+    if db is None or not commit_id:
+        return 0
+    from core import checkpoints
+
+    checkpoints.expand_dependents(db, commit_id)
+    total = 0
+    for table in PARTIAL_VERSION_TABLES:
+        total += int(db.delete_rows(table, {"commit_id": commit_id}) or 0)
+    db.commit()
+    return total
+
+
+def clean_interrupted_version(db: Any, network_id: int, commit_id: int, tables: Sequence[Any]) -> str:
+    """Remove every row an interrupted run of `commit_id` wrote and its `INGEST_PARSING` state row.
+
+    Rolls back by ID range or watermark (`rollback_version()`) and falls back to `purge_partial_version()`
+    when the run left no usable watermarks. The version then reads as "new" and the next run parses it
+    from scratch. Returns "rollback" or "purge" (the method used); raises RecoveryError like
+    `rollback_version()`.
+    """
+    method = "rollback" if rollback_version(db, network_id, commit_id, tables) else "purge"
+    if method == "purge":
+        purge_partial_version(db, commit_id)
+    db.delete_rows("m_ingest_state", {"network_id": network_id, "commit_id": commit_id, "status": INGEST_PARSING})
+    db.commit()
+    return method
+
+
 def cleanup_ramdisk_artifacts(ramdisk_dir: str | None = None, search_system_temps: bool = True) -> int:
     """Purge orphaned scratch directories left in RAMDISK or temp directories from previous crashed parser runs.
 

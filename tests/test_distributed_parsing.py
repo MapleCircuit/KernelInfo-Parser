@@ -506,8 +506,8 @@ class MockDBDriver:
         return []
 
     def reserve_id_block(self, table, block_size, commit_id=0):
-        from db_engine.base import BaseDBEngine
-        return BaseDBEngine.reserve_id_block(self, table, block_size, commit_id)
+        from db_engine.DBHandling import MariaDB
+        return MariaDB.reserve_id_block(self, table, block_size, commit_id)
 
 
 class TestDistributedParsing(unittest.TestCase):
@@ -1141,16 +1141,18 @@ class TestDistributedParsing(unittest.TestCase):
             def __init__(self, cnx):
                 self.cnx = cnx
 
-        from db_engine.base import BaseDBEngine
+        from db_engine.DBHandling import MariaDB
         engine = MockBaseEngine(mock_cnx)
-        start, end = BaseDBEngine.reserve_id_block(engine, m_ast, block_size=1000, commit_id=12)
+        start, end = MariaDB.reserve_id_block(engine, m_ast, block_size=1000, commit_id=12)
 
         self.assertEqual(start, 500)
         self.assertEqual(end, 1499)
 
         exec_calls = mock_cur.execute.call_args_list
         self.assertIn("INSERT INTO m_table_sequence", exec_calls[0][0][0])
-        self.assertIn("ON DUPLICATE KEY UPDATE seq_table_id = seq_table_id", exec_calls[0][0][0])
+        # The upsert seeds a missing sequence row from MAX(pk) + 1 and never moves an existing one backwards
+        self.assertIn("COALESCE(MAX(ast_id), 0) + 1 FROM m_ast", exec_calls[0][0][0])
+        self.assertIn("ON DUPLICATE KEY UPDATE next_id = GREATEST(next_id, VALUES(next_id))", exec_calls[0][0][0])
         self.assertIn("SELECT next_id FROM m_table_sequence WHERE seq_table_id = %s FOR UPDATE", exec_calls[1][0][0])
         self.assertIn("UPDATE m_table_sequence SET next_id = %s WHERE seq_table_id = %s", exec_calls[2][0][0])
         self.assertEqual(exec_calls[2][0][1], (1500, m_ast.table_id))
@@ -1356,6 +1358,9 @@ class TestDistributedParsing(unittest.TestCase):
             mock_cur = mock.MagicMock()
             mock_db.cnx.cursor.return_value = mock_cur
             mock_cur.fetchall.return_value = []
+            # No stored person matches, so the author needs a new m_maintainer_person id
+            mock_db.query.return_value = []
+            mock_db.select.return_value = None
 
             # Reserve blocks: for m_commit return (1001, 2000), for m_maintainer_person return (501, 756)
             def mock_reserve(table, block_size, commit_id=0):
@@ -1648,9 +1653,9 @@ class TestDistributedParsing(unittest.TestCase):
             def __init__(self, cnx):
                 self.cnx = cnx
 
-        from db_engine.base import BaseDBEngine
+        from db_engine.DBHandling import MariaDB
         engine = MockBaseEngine(mock_cnx)
-        start, end = BaseDBEngine.reserve_id_block(engine, m_ast, block_size=100, commit_id=5)
+        start, end = MariaDB.reserve_id_block(engine, m_ast, block_size=100, commit_id=5)
 
         self.assertEqual(start, 100)
         self.assertEqual(end, 199)
@@ -1883,6 +1888,37 @@ class TestDistributedCoreFixes(unittest.TestCase):
             t1 = next(t for t in cnx.tasks if t["task_id"] == 1)
             self.assertEqual(t1["status"], distributed.TASK_FAILED)
             self.assertIn("Rollback failed during reclaim", t1["error_msg"])
+
+
+
+class TestLeaseSettings(unittest.TestCase):
+    """parser.distributed lease/heartbeat config resolution."""
+
+    def test_defaults_when_missing_or_invalid(self) -> None:
+        defaults = (distributed.DEFAULT_LEASE_TTL, distributed.DEFAULT_HEARTBEAT_INTERVAL)
+        self.assertEqual(distributed.resolve_lease_settings(None), defaults)
+        self.assertEqual(distributed.resolve_lease_settings({}), defaults)
+        self.assertEqual(
+            distributed.resolve_lease_settings({"lease_ttl_seconds": "x", "heartbeat_seconds": 0}), defaults
+        )
+
+    def test_configured_values_and_lease_floor(self) -> None:
+        self.assertEqual(distributed.resolve_lease_settings({"lease_ttl_seconds": 300, "heartbeat_seconds": 20}), (300, 20))
+        # A lease shorter than two heartbeats is raised so live nodes renew before expiry
+        self.assertEqual(distributed.resolve_lease_settings({"lease_ttl_seconds": 30, "heartbeat_seconds": 25}), (50, 25))
+
+
+class TestMemMaxResolution(unittest.TestCase):
+    """parser.mem_max resolution for the memory guard."""
+
+    def test_resolve_mem_max(self) -> None:
+        import main
+
+        self.assertEqual(main._resolve_mem_max(48), 48.0)
+        self.assertEqual(main._resolve_mem_max(0), 0.0)
+        self.assertEqual(main._resolve_mem_max(None), 60.0)
+        self.assertEqual(main._resolve_mem_max("bad"), 60.0)
+        self.assertEqual(main._resolve_mem_max(-5), 60.0)
 
 
 if __name__ == "__main__":

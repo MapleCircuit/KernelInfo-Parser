@@ -10,20 +10,20 @@ description: >-
 
 ## 1. Targeted Spec Slice Lookup
 Never read `core/API.md` from line 1. Jump directly to the relevant slice or run `python3 .agents/scripts/spec_section.py core/API.md <section>`:
-- **Relational Schema Registry & Tables**: `core/API.md` (§4 `[L460-L641]`)
-- **Data Staging, Routing & ChangeSets**: `core/API.md` (§5 `[L642-L801]`)
-- **Derived Table Backfills**: `core/API.md` (§12 `[L1559-L1588]`)
+- **Relational Schema Registry & Tables**: `core/API.md` (§4 `[L460-L647]`)
+- **Data Staging, Routing & ChangeSets**: `core/API.md` (§5 `[L648-L807]`)
+- **Derived Table Backfills**: `core/API.md` (§12 `[L1695-L1731]`)
 - **TableEngine Interface & Caching**: `table_engine/TE_API.md` (§1 `[L18-L59]`, §4 `[L211-L530]`, §6 `[L551-L641]`)
 
 ## 2. Core Subsystem Fast Lookup & Test Map
 
 | Component / Task | Source Files | Spec Reference | Targeted Unit Test |
 | :--- | :--- | :--- | :--- |
-| **Schema & Table Definition** | `core/DBLayout.py` | `core/API.md` §4 `[L460-L641]`, `DBLayout.py` [L1-93] | `python3 -m unittest unit_test.test_table_handling unit_test.test_te_db_integrity` |
-| **TableEngine & ChangeSet** | `core/TableHandling.py`, `table_engine/` | `core/API.md` §5 `[L642-L801]`, `table_engine/TE_API.md` `[L18-L59]` | `python3 -m unittest unit_test.test_table_engine` |
-| **Database Views** | `main.py` (`ensure_db_views`) | `core/API.md` §4 `[L460-L641]` | `python3 -m unittest tests.test_symbol_rows` |
-| **Derived Backfills** | `core/backfills.py`, `main.py` | `core/API.md` §12 `[L1559-L1588]` | `python3 -m unittest tests.test_facts_ingest` |
-| **Ingest State & Checkpoints** | `core/ingest_state.py`, `core/checkpoints.py` | `core/API.md` §4 `[L460-L641]` | `python3 -m unittest tests.test_ingest_state` |
+| **Schema & Table Definition** | `core/DBLayout.py` | `core/API.md` §4 `[L460-L647]`, `DBLayout.py` [L1-93] | `python3 -m unittest unit_test.test_table_handling unit_test.test_te_db_integrity` |
+| **TableEngine & ChangeSet** | `core/TableHandling.py`, `table_engine/` | `core/API.md` §5 `[L648-L807]`, `table_engine/TE_API.md` `[L18-L59]` | `python3 -m unittest unit_test.test_table_engine` |
+| **Database Views** | `main.py` (`ensure_db_views`) | `core/API.md` §4 `[L460-L647]` | `python3 -m unittest tests.test_symbol_rows` |
+| **Derived Backfills** | `core/backfills.py`, `main.py` | `core/API.md` §12 `[L1695-L1731]` | `python3 -m unittest tests.test_facts_ingest` |
+| **Ingest State & Checkpoints** | `core/ingest_state.py`, `core/checkpoints.py` | `core/API.md` §4 `[L460-L647]` | `python3 -m unittest tests.test_ingest_state` |
 
 ## 3. Step-by-Step Schema & Backfill Workflow
 Enforce the invariants loaded from `core/AGENTS.md` (authoritative schema in `core/DBLayout.py`, pure extractor reuse, restartable backfills):
