@@ -21,7 +21,7 @@ export class StatusView {
     this.sortKey = "total";
     this.sortDir = "desc";
     this.onVisibility = () => {
-      if (!document.hidden) this.refresh();
+      if (!document.hidden && this.containerEl?.isConnected) this.refresh();
     };
   }
 
@@ -66,14 +66,16 @@ export class StatusView {
   }
 
   async refresh() {
-    if (!this.containerEl?.isConnected) return;
+    // Not gated on `isConnected`: render() runs before the pane appends the container to the document
+    const el = this.containerEl;
+    if (!el) return;
     try {
       this.data = await api.getIngestStatus();
       this.error = null;
     } catch (err) {
       this.error = err.message;
     }
-    if (!this.containerEl?.isConnected) return;
+    if (this.containerEl !== el) return; // disposed or re-rendered meanwhile
     this.renderBody();
   }
 
