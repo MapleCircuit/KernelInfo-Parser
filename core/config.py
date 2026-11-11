@@ -674,6 +674,31 @@ def detect_root_commit(repo: Path, rev: str = "HEAD") -> str:
     return roots[-1] if roots else ""
 
 
+def detect_start_ref(repo: Path, root_commit: str, branches: list[str]) -> str:
+    """First version to parse: the earliest release tag on a root of the default or a history/* branch.
+
+    A history remote (e.g. bootlin's linux-history next to torvalds/linux) carries roots older than the
+    default branch's (Linux 0.01 vs. 2.6.12-rc2); the start is the root whose release tag sorts first, named
+    by that tag so the release walk crosses into the later, unconnected histories. Without one, it is
+    root_commit."""
+    from core.FileHandler import _VERSION_TAG_RE, _VERSIONSORT_SUFFIX_ARGS
+
+    roots = {root_commit} if root_commit else set()
+    for b in branches:
+        if b.startswith("history/") and b != "history/HEAD":
+            lines = _git_out(repo, "rev-list", "--max-parents=0", "--first-parent", b).splitlines()
+            if lines:
+                roots.add(lines[-1])
+    tags = [
+        t for r in sorted(roots) for t in _git_out(repo, "tag", "--points-at", r).splitlines()
+        if not t.endswith("-tree") and _VERSION_TAG_RE.match(t) and not t.startswith("next-")
+    ]
+    if len(roots) < 2 or not tags:
+        return root_commit
+    ordered = _git_out(repo, *_VERSIONSORT_SUFFIX_ARGS, "tag", "-l", "--sort=v:refname", *tags).splitlines()
+    return ordered[0] if ordered else root_commit
+
+
 _DETECTED_REPO_CACHE: dict[str, dict[str, Any]] = {}
 
 
@@ -821,8 +846,8 @@ def detect_repository(path: Path) -> dict[str, Any]:
         "default_branch": branch,
         "git_url": _git_out(path, "config", "--get", "remote.origin.url"),
         "root_commit": root_commit,
-        # Parsing starts from the first commit of the repository unless overridden
-        "start_ref": root_commit,
+        # Parsing starts from the first version of the repository (history/* roots included) unless overridden
+        "start_ref": detect_start_ref(path, root_commit, branches),
         "enabled": True,
         "branch_filter": branch_filter,
         "branches": branches,

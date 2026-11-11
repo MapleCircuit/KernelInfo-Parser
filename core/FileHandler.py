@@ -10,6 +10,11 @@ from pathlib import Path
 from core.globalstuff import G, is_safe_git_rev, is_safe_git_spec
 
 _VERSION_TAG_RE = re.compile(r"^(?:v?\d+(?:\.\d+)*(?:[a-zA-Z](?:\+[a-zA-Z]?)?)?(?:-?(?:rc|alpha|beta|pre|patch)\d*)?|next-\d{8})$")
+# Pre-release suffixes git's version sort places before their release: v3.1-rc1 < v3.1, v2.5.4-pre1 <
+# v2.5.4, and the historical 2.0.31pre1 < 2.0.31, 1.0alpha < 1.0
+_VERSIONSORT_SUFFIX_ARGS = tuple(
+    arg for suffix in ("-rc", "-pre", "pre", "alpha", "beta") for arg in ("-c", f"versionsort.suffix={suffix}")
+)
 logger = logging.getLogger(__name__)
 
 # Scratch directories carry the PID of the process that created them, so `--clean-temp` can leave the
@@ -439,10 +444,7 @@ class MasterFile:
         command = [
             "git",
             f"--git-dir={git_dir}",
-            "-c",
-            "versionsort.suffix=-rc",
-            "-c",
-            "versionsort.suffix=-pre",
+            *_VERSIONSORT_SUFFIX_ARGS,
             "tag",
             "-l",
             "--sort=v:refname",
@@ -463,6 +465,9 @@ class MasterFile:
         # Filter for canonical version release tags (e.g. v2.6.12, v3.0, v6.12.1, v2.6.12-rc2).
         # Excludes non-release topic tags (e.g. assoc-array-fixes) and tree tags (v2.6.11-tree).
         raw_tags = [t for t in raw_tags if not t.endswith("-tree") and _VERSION_TAG_RE.match(t)]
+        # Daily next-YYYYMMDD snapshots follow every release (name sorting would put them between the
+        # unprefixed historical tags such as 2.4.31 and the v-prefixed ones)
+        raw_tags = [t for t in raw_tags if not t.startswith("next-")] + [t for t in raw_tags if t.startswith("next-")]
         if not include_pre_releases:
             tags = [t for t in raw_tags if not any(pre in t for pre in ("-rc", "-alpha", "-beta", "-pre"))]
             if not tags:

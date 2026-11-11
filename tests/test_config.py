@@ -301,6 +301,16 @@ class TestConfigManagement(unittest.TestCase):
             self.assertIn("v3.0-rc1", tags_rc)
             self.assertIn("v3.0-rc2", tags_rc)
 
+        # Daily next-YYYYMMDD tags follow every release, even unprefixed historical tags
+        mock_output = "0.01\n2.4.31\nnext-20260810\nnext-20260811\nv2.5.0\nv2.6.12-rc2\n"
+        with mock.patch("subprocess.run") as mock_run:
+            mock_run.return_value = mock.MagicMock(returncode=0, stdout=mock_output)
+            self.assertEqual(
+                mf.get_version_tags(start_ref="0.01"),
+                ["0.01", "2.4.31", "v2.5.0", "v2.6.12-rc2", "next-20260810", "next-20260811"],
+            )
+            self.assertIn("versionsort.suffix=pre", mock_run.call_args.args[0])
+
 
 
 def _make_git_repo(path: Path, commits: int = 3, tags: dict[int, str] | None = None) -> list[str]:
@@ -381,6 +391,19 @@ class TestRepositoryDetection(unittest.TestCase):
         self.assertEqual(mf.get_version_tags(start_ref=shas[0]), ["v1.0-rc1", "v1.0", "v1.1"])
         # An untagged start commit keeps its SHA and continues through releases containing it
         self.assertEqual(mf.get_version_tags(start_ref=shas[1]), [shas[1], "v1.0", "v1.1"])
+
+    def test_start_ref_prefers_the_earliest_history_root(self) -> None:
+        from core.config import detect_start_ref
+        repo = self.root / "history"
+        shas = _make_git_repo(repo, commits=2, tags={0: "v2.6.12-rc2", 1: "v2.6.12"})
+        env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
+        for cmd in (["checkout", "-q", "--orphan", "history/master"], ["commit", "-q", "-m", "0.01"], ["tag", "0.01"],
+                    ["commit", "-q", "--allow-empty", "-m", "2.4.0"], ["tag", "2.4.0"], ["checkout", "-q", "main"]):
+            subprocess.run(["git", "-C", str(repo), *cmd], check=True, env=env)
+        # Without a history branch the default branch's first commit stays the start
+        self.assertEqual(detect_start_ref(repo, shas[0], ["main"]), shas[0])
+        # The history root's release tag sorts before the default branch's: the walk starts there, by name
+        self.assertEqual(detect_start_ref(repo, shas[0], ["history/master", "main"]), "0.01")
 
     def test_branch_filtering(self) -> None:
         self.assertTrue(matches_branch_filter("master"))

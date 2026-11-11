@@ -257,9 +257,10 @@ Manages RAMDISK temporary working trees and Git repository extraction.
     `clear_all_version()` / `set_repo_dir()`), since one version is listed by several pipeline steps.
   - `get_dir_list(version_name: str) -> list[str]`: Executes `git ls-tree -r -d --name-only <version_name>`.
   - `get_version_tags(start_ref: str | None = None, include_pre_releases: bool | None = None) -> list[str]`:
-    Discovers and sequences repository release tags using `git -c versionsort.suffix=-rc -c
-    versionsort.suffix=-pre tag -l --sort=v:refname`, ensuring `-rc#` pre-releases are correctly ordered prior
-    to final releases. Release candidates and other pre-releases (`-rc`, `-pre`, `-alpha`, `-beta`) are
+    Discovers and sequences repository release tags using `git tag -l --sort=v:refname` with the
+    `versionsort.suffix` values `-rc`, `-pre`, `pre`, `alpha`, `beta` (`_VERSIONSORT_SUFFIX_ARGS`), so
+    pre-releases precede their release (`v3.1-rc1 < v3.1`, historical `2.0.31pre1 < 2.0.31`,
+    `1.0alpha < 1.0`); daily `next-YYYYMMDD` tags follow all releases. Release candidates and other pre-releases (`-rc`, `-pre`, `-alpha`, `-beta`) are
     included by default (`include_pre_releases=None` → `True`, config `parser.include_pre_releases`, default
     `true`), so a run walks e.g. `v3.0 → v3.1-rc1 … v3.1-rc10 → v3.1`; `--no-rc` / `--releases-only` (or
     `"include_pre_releases": false`) keeps final releases only. Canonical release tags are filtered by
@@ -996,7 +997,7 @@ Main Process (STEP 6.1+: Post-Processing Subsystems) TableEngine (G.TE)         
     to parse, and `auto_detect_repos` (default `true`).
   - `"repositories"`: List of tracked repositories. Each entry carries `name`, `path` (relative to the project
     root; symlinked repositories keep their `repos/<name>` path), `project`, `default_branch`, `git_url`,
-    `root_commit`, `start_ref` (default: `root_commit`), `enabled`, `branch_filter` (`{"include": ["*"],
+    `root_commit`, `start_ref` (default: `detect_start_ref()`), `enabled`, `branch_filter` (`{"include": ["*"],
     "exclude": ["*rc*"]}`), `branches` (persisted list of active branch short names), `tag_views` (custom
     branch dropdown view entries configuring regex grouping rules for tag layouts, defaulting to
     `DEFAULT_TAG_VIEWS`), and optionally `"default": true`.
@@ -1013,6 +1014,12 @@ Main Process (STEP 6.1+: Post-Processing Subsystems) TableEngine (G.TE)         
   back to `origin/HEAD`, then `main`/`master`; `remote.origin.url`; `rev-list --max-parents=0 --first-parent
   <branch>` for `root_commit`; `find_repository_branches()` for `branches` matching `branch_filter`). Results
   are cached per path for the process.
+- `detect_start_ref(repo, root_commit, branches)` picks the first version to parse: among the first-parent
+  roots of the default branch and of every `history/*` branch, the root whose release tag sorts first,
+  named by that tag (Linux with the bootlin `linux-history` remote: `0.01`, root of
+  `history/0.10-fix-RCS`, before `2.4.0` of `history/master` and `v2.6.12-rc2` of `master`). A tag name
+  makes `get_version_tags()` walk every later release tag, across the unconnected history roots. Without
+  history roots (or tags on them) it is `root_commit`.
 - `sync_repositories(write=True)` adds newly found repositories and fills keys missing from known entries
   without overwriting user-set values, then atomically rewrites the loaded config file (`config.json`),
   preserving all other keys. `main.py` runs it on every start when `auto_detect_repos` is true; `python3
@@ -1032,7 +1039,7 @@ Main Process (STEP 6.1+: Post-Processing Subsystems) TableEngine (G.TE)         
   `--limit N` bounds the commits recorded per range. Shared commit history across branches is
   content-deduplicated per `network_id` in `m_commit` and `m_file_blob`.
 - **Default parse target**: Without `--ref`, `main()` starts at the selected repository's `start_ref` (its
-  first commit by default) and continues through every subsequent release tag (`get_version_tags`).
+  first version by default, `detect_start_ref()`) and continues through every subsequent release tag (`get_version_tags`).
   `--branches` (or `--all-branches`) automatically refreshes `config.json` and ingests the tip commit of every
   branch matching `branch_filter` as an independent checkpoint (`m_git_ref` with `ref_type = 2`). `--repo`
   accepts a configured repository name or a filesystem path.
