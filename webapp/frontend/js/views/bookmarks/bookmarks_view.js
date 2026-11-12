@@ -191,7 +191,8 @@ export class BookmarksView {
       downloadText(`${tour.data.title.replace(/[^\w.-]+/g, "_").slice(0, 60) || "tour"}.kiptour.json`, JSON.stringify({ format: "kiptour", version: 1, tour: tour.data }, null, 1), "application/json");
     } else if (tour && act === "link") {
       const t2 = await encodeTour(tour.data);
-      const link = `${location.origin}${location.pathname}#tab=bookmarks&t=${t2}`;
+      const repo = this.api?.repo || "";
+      const link = `${location.origin}${location.pathname}#${repo ? `repo=${encodeURIComponent(repo)}&` : ""}tab=bookmarks&t=${t2}`;
       if (link.length > LINK_MAX) {
         toast.warning("This tour is too large for a link: use Export and share the file");
         return;

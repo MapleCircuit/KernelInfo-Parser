@@ -976,8 +976,9 @@ class RstRenderer {
     if (r === "manpage") {
       const mm = /^([\w.+-]+)\((\w+)\)$/.exec(target);
       const href = mm ? `https://man7.org/linux/man-pages/man${mm[2][0]}/${mm[1]}.${mm[2]}.html` : null;
+      // data-man-link/-sec: doc_page.js opens our man-pages copy (§5.38); the man7.org href is the fallback
       return href
-        ? `<a class="reference external manpage" href="${escapeHtml(href)}" target="_blank" rel="noopener noreferrer"><em class="manpage">${escapeHtml(shown)}</em></a>`
+        ? `<a class="reference external manpage man-link" href="${escapeHtml(href)}" data-man-link="${escapeHtml(mm[1])}" data-man-sec="${escapeHtml(mm[2])}" target="_blank" rel="noopener noreferrer"><em class="manpage">${escapeHtml(shown)}</em></a>`
         : `<em class="manpage">${escapeHtml(shown)}</em>`;
     }
     if (r === "kbd") return shown.split(/\s+|(?<=\w)-(?=\w)/).map((k) => `<kbd class="kbd">${escapeHtml(k)}</kbd>`).join("+");

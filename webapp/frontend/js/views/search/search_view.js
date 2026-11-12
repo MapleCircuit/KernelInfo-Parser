@@ -126,7 +126,7 @@ export class SearchView {
     resultsEl.classList.add("loading");
     let res;
     try {
-      res = await api.grepCode(this.version, {
+      res = await this.api.grepCode(this.version, {
         q: t.query, regex: t.regex, caseSensitive: t.caseSensitive, word: t.word, paths: t.paths || [],
         limit: t.limit || 2000, perFile: 200,
       });

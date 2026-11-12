@@ -1,9 +1,9 @@
 """core/tui/screens/git_manager.py - Git Repository Manager screen.
 
-Operates on one repository at a time (configured git repositories, the `<repos_dir>/linux`
-clone target and the CVE catalog `cve.repo_dir`; `repository_candidates()`, also listed by
-`core/tui/screens/git_select.py`): clones the torvalds tree or the CVE catalog, adds standard or
-custom remotes, fetches one or all remotes, and removes remotes after confirmation. Clone and fetch run through
+Operates on one repository at a time (configured git repositories, the `<repos_dir>/linux` and
+`<repos_dir>/man-pages` clone targets and the CVE catalog `cve.repo_dir`; `repository_candidates()`, also
+listed by `core/tui/screens/git_select.py`): clones the torvalds tree, the Linux man-pages or the CVE
+catalog, adds standard or custom remotes, fetches one or all remotes, and removes remotes after confirmation. Clone and fetch run through
 `core.tui.process_view.run_streaming_command()` so progress stays visible and cancellable.
 """
 
@@ -16,12 +16,19 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from core.config import REPO_ROOT, detect_repository, resolve_repo_path
+from core.config import (
+    MANPAGES_PROJECT,
+    REPO_ROOT,
+    detect_repository,
+    resolve_repo_path,
+)
 from core.tui.git_ops import (
     DEFAULT_CVE_DIRNAME,
     DEFAULT_CVE_URL,
     DEFAULT_LINUX_DIRNAME,
     DEFAULT_LINUX_URL,
+    DEFAULT_MANPAGES_DIRNAME,
+    DEFAULT_MANPAGES_URL,
     KERNEL_CVE_URL,
     STANDARD_REMOTES,
     RemotePreset,
@@ -62,7 +69,11 @@ RunCommand = Callable[..., ProcessResult]
 
 KIND_REPO = "repo"    # a configured repositories[] entry
 KIND_LINUX = "linux"  # the `<repos_dir>/linux` clone target (not configured yet)
+KIND_MANPAGES = "man-pages"  # the `<repos_dir>/man-pages` clone target (not configured yet)
 KIND_CVE = "cve"      # the CVE catalog clone (`cve.repo_dir`)
+# Clone targets the Git screens offer to clone when their directory is missing
+CLONE_KINDS = (KIND_LINUX, KIND_MANPAGES, KIND_CVE)
+CLONE_LABELS = {KIND_LINUX: "Clone Linux", KIND_MANPAGES: "Clone man-pages", KIND_CVE: "Clone CVE"}
 
 
 @dataclass
@@ -73,6 +84,14 @@ class RepoCandidate:
     path: Path
     entry: dict[str, Any] | None = None
     kind: str = KIND_REPO
+
+    @property
+    def is_kernel_tree(self) -> bool:
+        """False for the CVE catalog and the man-pages tree (target or configured `project: "man-pages"`),
+        which the kernel `STANDARD_REMOTES` do not apply to."""
+        if self.kind in (KIND_CVE, KIND_MANPAGES):
+            return False
+        return str((self.entry or {}).get("project") or "") != MANPAGES_PROJECT
 
 
 def config_repos_dir(config: dict[str, Any]) -> Path:
@@ -90,7 +109,8 @@ def cve_repo_path(config: dict[str, Any]) -> Path:
 
 
 def repository_candidates(config: dict[str, Any]) -> list[RepoCandidate]:
-    """Configured git repositories, then the Linux clone target and the CVE catalog unless already listed."""
+    """Configured git repositories, then the Linux and man-pages clone targets and the CVE catalog unless
+    already listed."""
     cands: list[RepoCandidate] = []
     seen: set[Path] = set()
     for entry in config.get("repositories") or []:
@@ -102,10 +122,11 @@ def repository_candidates(config: dict[str, Any]) -> list[RepoCandidate]:
             continue
         seen.add(key)
         cands.append(RepoCandidate(str(entry.get("name") or path.name), path, entry))
-    target = config_repos_dir(config) / DEFAULT_LINUX_DIRNAME
-    if target.resolve() not in seen:
-        seen.add(target.resolve())
-        cands.append(RepoCandidate(DEFAULT_LINUX_DIRNAME, target, None, KIND_LINUX))
+    for dirname, kind in ((DEFAULT_LINUX_DIRNAME, KIND_LINUX), (DEFAULT_MANPAGES_DIRNAME, KIND_MANPAGES)):
+        target = config_repos_dir(config) / dirname
+        if target.resolve() not in seen:
+            seen.add(target.resolve())
+            cands.append(RepoCandidate(dirname, target, None, kind))
     cve = cve_repo_path(config)
     if cve.resolve() not in seen:
         cands.append(RepoCandidate("cve", cve, None, KIND_CVE))
@@ -284,6 +305,10 @@ class GitManagerScreen(BaseScreen):
         """Destination of the default Linux clone: `<repos_dir>/linux`."""
         return self.repos_dir() / DEFAULT_LINUX_DIRNAME
 
+    def manpages_target(self) -> Path:
+        """Destination of the default man-pages clone: `<repos_dir>/man-pages`."""
+        return self.repos_dir() / DEFAULT_MANPAGES_DIRNAME
+
     def reload_candidates(self, prefer_path: str | None = None) -> None:
         """Rebuild the repository candidates and select `prefer_path`, else `linux`, else the first."""
         current = str(self.current_repo.path) if self.candidates else None
@@ -402,17 +427,19 @@ class GitManagerScreen(BaseScreen):
         return True
 
     def can_clone_current(self) -> bool:
-        """True when the current candidate is the Linux or CVE clone target and its directory is missing."""
+        """True when the current candidate is the Linux, man-pages or CVE clone target and its directory is missing."""
         repo = self.current_repo
-        return repo.kind in (KIND_LINUX, KIND_CVE) and not repo.path.exists()
+        return repo.kind in CLONE_KINDS and not repo.path.exists()
 
     def clone_current(self) -> bool:
-        """Clone the current candidate (Linux tree or CVE catalog) when its directory is missing."""
+        """Clone the current candidate (Linux tree, man-pages or CVE catalog) when its directory is missing."""
         repo = self.current_repo
         if repo.kind == KIND_CVE:
             return self.clone_cve()
         if repo.kind == KIND_LINUX:
             return self.clone_linux()
+        if repo.kind == KIND_MANPAGES:
+            return self.clone_manpages()
         self.status_bar.set_message(f"'{repo.name}' is already present at {repo.path}.", color=PAIR_ERROR)
         return False
 
@@ -429,6 +456,20 @@ class GitManagerScreen(BaseScreen):
                 return False
         return self.clone_into(url, dest, "Clone Linux", confirmed=confirmed, register=True,
                                size_note="This is a multi-GB download and can take a long time.")
+
+    def clone_manpages(self, url: str | None = None, confirmed: bool = False) -> bool:
+        """Clone the Linux man-pages into `<repos_dir>/man-pages` and register it; returns True on success."""
+        dest = self.manpages_target()
+        if dest.exists():
+            self.status_bar.set_message(f"Clone target already exists: {dest}", color=PAIR_ERROR)
+            return False
+        if url is None:
+            url = self._prompt(self.stdscr, "Clone man-pages", "Repository URL to clone:", DEFAULT_MANPAGES_URL)
+            if url is None:
+                self.status_bar.set_message("Clone cancelled.")
+                return False
+        return self.clone_into(url, dest, "Clone man-pages", confirmed=confirmed, register=True,
+                               size_note="This is a download of about 50 MB.")
 
     def clone_cve(self, url: str | None = None, confirmed: bool = False) -> bool:
         """Clone a CVE catalog into the `cve.repo_dir` path and point `cve.repo_dir` at it."""
@@ -588,8 +629,9 @@ class GitManagerScreen(BaseScreen):
         """Add the chosen `STANDARD_REMOTES` (dialog when `names` is None); returns the names added."""
         if not self._require_repo():
             return []
-        if self.current_repo.kind == KIND_CVE:
-            self.status_bar.set_message("Standard kernel remotes do not apply to the CVE catalog.", color=PAIR_ERROR)
+        if not self.current_repo.is_kernel_tree:
+            what = "the CVE catalog" if self.current_repo.kind == KIND_CVE else "the man-pages tree"
+            self.status_bar.set_message(f"Standard kernel remotes do not apply to {what}.", color=PAIR_ERROR)
             return []
         if names is None:
             chosen = StandardRemotesDialog(self.stdscr, STANDARD_REMOTES, self.remotes).show()
@@ -631,10 +673,10 @@ class GitManagerScreen(BaseScreen):
         return added
 
     def add_remote_menu(self) -> bool:
-        """Ask Standard vs Custom (Custom only for the CVE catalog) and run that add flow."""
+        """Ask Standard vs Custom (Custom only for the CVE catalog and the man-pages tree) and run that add flow."""
         if not self._require_repo():
             return False
-        if self.current_repo.kind == KIND_CVE:
+        if not self.current_repo.is_kernel_tree:
             return self.add_custom_remote()
         choice = safe_modal_dialog(
             self.stdscr, title="Add Remote",
@@ -714,7 +756,7 @@ class GitManagerScreen(BaseScreen):
     # --- Rendering & keys ---
 
     def _clone_label(self) -> str:
-        return "Clone CVE" if self.current_repo.kind == KIND_CVE else "Clone Linux"
+        return CLONE_LABELS.get(self.current_repo.kind, "Clone Linux")
 
     def _shortcuts(self) -> list[tuple[str, str]]:
         if not self.repo_exists:
@@ -751,6 +793,9 @@ class GitManagerScreen(BaseScreen):
         if exists and repo.kind == KIND_CVE:
             state = f" CVE catalog (cve.repo_dir) - {len(self.remotes)} remote(s)"
             self.safe_addstr(4, 2, state[: max_x - 4], get_color(PAIR_SUCCESS))
+        elif exists and not repo.is_kernel_tree:
+            state = f" Linux man-pages - {len(self.remotes)} remote(s)"
+            self.safe_addstr(4, 2, state[: max_x - 4], get_color(PAIR_SUCCESS))
         elif exists:
             missing = sum(1 for p in STANDARD_REMOTES if not preset_is_present(p, self.remotes))
             state = f" Git repository - {len(self.remotes)} remote(s), {missing} standard preset(s) available [A]"
@@ -758,8 +803,11 @@ class GitManagerScreen(BaseScreen):
         else:
             state = " Not cloned yet"
             if self.can_clone_current():
-                what = "the CVE catalog" if repo.kind == KIND_CVE else "the Linux tree"
-                state += f" - press [C] to clone {what} (multi-GB download)"
+                if repo.kind == KIND_MANPAGES:
+                    state += " - press [C] to clone the Linux man-pages (~50 MB download)"
+                else:
+                    what = "the CVE catalog" if repo.kind == KIND_CVE else "the Linux tree"
+                    state += f" - press [C] to clone {what} (multi-GB download)"
             self.safe_addstr(4, 2, state[: max_x - 4], get_color(PAIR_ERROR))
 
         self.remote_list.title = f" Remotes of {repo.name} "
@@ -767,7 +815,7 @@ class GitManagerScreen(BaseScreen):
         if not self.remotes:
             if not exists:
                 hint = "Repository not present."
-            elif repo.kind == KIND_CVE:
+            elif not repo.is_kernel_tree:
                 hint = "No remotes - press A (custom URL)."
             else:
                 hint = "No remotes - press A (standard trees or custom URL)."
@@ -808,8 +856,11 @@ class GitManagerScreen(BaseScreen):
 
 
 __all__ = [
+    "CLONE_KINDS",
+    "CLONE_LABELS",
     "KIND_CVE",
     "KIND_LINUX",
+    "KIND_MANPAGES",
     "KIND_REPO",
     "GitManagerScreen",
     "RepoCandidate",

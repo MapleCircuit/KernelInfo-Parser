@@ -50,11 +50,11 @@ registerInsightsSection({
   emptyText: "No CVE record affects this release or is fixed in it.",
   async releaseOptions(ctx) {
     // Mainline releases plus the stable updates: a stable tag carries backported fixes
-    const res = await api.getVersionsCached(true);
+    const res = await (ctx.api || api).getVersionsCached(true);
     return (res?.versions || []).map((v) => v.vname || v).filter((n) => /^v\d+\.\d+(\.\d+)*$/.test(n)).reverse();
   },
   async fetchList(ctx) {
-    const res = await api.getInsights(ctx.release, "cves", ctx);
+    const res = await (ctx.api || api).getInsights(ctx.release, "cves", ctx);
     if (res?.configured === false || res?.ingested === false) {
       this._setup = true;
       return { rows: [], note: res?.configured === false ? "not configured" : "not ingested", summaryHtml: res?.configured === false ? SETUP : NOT_INGESTED };
@@ -78,7 +78,7 @@ registerInsightsSection({
     { id: "high", label: "CVSS ≥ 7", title: "High or critical CVSS base score", test: (r) => r.score != null && r.score >= 7 },
     { id: "kev", label: "exploited", title: "Listed in CISA's Known Exploited Vulnerabilities catalog", test: (r) => !!r.kev },
   ],
-  fetchDetail: (ctx, key) => api.request(`/api/cve/${encodeURIComponent(key)}${ctx.release ? `?release=${encodeURIComponent(ctx.release)}` : ""}`),
+  fetchDetail: (ctx, key) => (ctx.api || api).request(`/api/cve/${encodeURIComponent(key)}${ctx.release ? `?release=${encodeURIComponent(ctx.release)}` : ""}`),
   detailHtml: (c, ctx) => {
     const st = c.release_state;
     const cvss = c.cvss;

@@ -194,12 +194,12 @@ export class TreemapView {
       if (eng && state.kconfigConfigActive(this.engineTabId)) {
         // Unprefixed names only: the engine publishes both X and CONFIG_X
         const assignments = Object.fromEntries(Object.entries(eng.assignments || {}).filter(([k]) => !k.startsWith("CONFIG_")));
-        this.data = await api.requestJob(`/api/version/${encodeURIComponent(this.version)}/treemap/build`, {
+        this.data = await this.api.requestJob(`/api/version/${encodeURIComponent(this.version)}/treemap/build`, {
           method: "POST", body: { arch: eng.arch, assignments, path: this.path, max_depth: 2 }, timeoutMs: 60000,
           onProgress: (p) => { canvas.innerHTML = `<div class="treemap-loading">Indexing Kbuild objects… ${escapeHtml(progressLabel(p))}</div>`; },
         });
       } else {
-        this.data = await api.getTreemap(this.version, 2, this.path);
+        this.data = await this.api.getTreemap(this.version, 2, this.path);
       }
     } catch (err) {
       canvas.innerHTML = `<div class="treemap-loading error">Failed: ${escapeHtml(err.message)}</div>`;

@@ -13,6 +13,7 @@ from webapp.backend.routers.insights import router as insights_router
 from webapp.backend.routers.cve import router as cve_router
 from webapp.backend.routers.kapi import router as kapi_router
 from webapp.backend.routers.watch import router as watch_router
+from webapp.backend.routers.man import router as man_router
 
 __all__ = [
     "versions_router",
@@ -29,5 +30,6 @@ __all__ = [
     "cve_router",
     "kapi_router",
     "watch_router",
+    "man_router",
 ]
 

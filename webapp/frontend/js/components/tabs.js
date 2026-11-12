@@ -13,6 +13,8 @@ import { contextMenu } from "./context_menu.js";
 import { toast } from "./toast.js";
 import { requestVersionSwitch } from "./version_switch.js";
 import { attachScrollMemory } from "./scroll_memory.js";
+import { bindViewApi } from "../api.js";
+import { projectBadge } from "../utils/projects.js";
 
 // Dragged tab in the drag event's data transfer; the text form is what survives browsers that
 // hand a custom type only to the window the drag started in.
@@ -103,9 +105,10 @@ export class TabsComponent {
         paneEl.classList.add("active-pane");
       }
 
-      paneEl.addEventListener("click", () => {
-        state.setActivePane(pane.id);
-      });
+      // Activated before the clicked control reacts (capture), so what a click or a context menu opens
+      // follows this pane's tab: its revision and its project (the one the shared client addresses)
+      paneEl.addEventListener("click", () => state.setActivePane(pane.id), true);
+      paneEl.addEventListener("contextmenu", () => state.setActivePane(pane.id), true);
 
       // 1. Tabstrip
       const tabstrip = document.createElement("div");
@@ -142,6 +145,17 @@ export class TabsComponent {
         verSpan.className = "tab-version";
         verSpan.textContent = shortRef(tab.version || state.currentVersion);
 
+        // Project badge: a tab of another project than the linux kernel names it (§5.18)
+        const badge = projectBadge(tab.repo || state.currentRepo);
+        let projSpan = null;
+        if (badge) {
+          projSpan = document.createElement("span");
+          projSpan.className = "tab-project";
+          projSpan.textContent = badge.length > 14 ? `${badge.slice(0, 13)}…` : badge;
+          projSpan.title = `Project ${badge}`;
+          tabEl.title = `${tabEl.title} · ${badge}`;
+        }
+
         // Close button
         const closeBtn = document.createElement("button");
         closeBtn.className = "tab-close";
@@ -153,6 +167,7 @@ export class TabsComponent {
         });
 
         tabEl.appendChild(iconSpan);
+        if (projSpan) tabEl.appendChild(projSpan);
         tabEl.appendChild(titleSpan);
         tabEl.appendChild(verSpan);
         tabEl.appendChild(closeBtn);
@@ -551,7 +566,7 @@ export class TabsComponent {
     const newSession = sessionManager.createSession({
       name: `${tab.title} Window`,
       version: tab.version || state.currentVersion,
-      repo: state.currentRepo,
+      repo: tab.repo || state.currentRepo,
       splitMode: "single",
       panes: [
         {
@@ -721,14 +736,25 @@ export class TabsComponent {
     });
   }
 
-  /** View rendering a tab: the type's shared instance, or this tab's own one for factory types. */
+  /**
+   * View rendering a tab: the type's shared instance, or this tab's own one for factory types. A per-tab
+   * view gets `view.api`, the client of its tab's repository (bindViewApi); a tab moved to another
+   * project gets a fresh view, since everything the old one holds belongs to the other repository.
+   */
   rendererFor(tab) {
     const entry = this.viewRenderers[tab.type];
     if (typeof entry !== "function") return entry;
+    this.viewRepos = this.viewRepos || new Map();
     let view = this.perTabViews.get(tab.id);
+    const repo = tab.repo || "";
+    if (view && this.viewRepos.get(tab.id) !== repo) {
+      if (typeof view.dispose === "function") view.dispose();
+      view = null;
+    }
     if (!view) {
-      view = entry();
+      view = bindViewApi(entry(), tab.id, tab);
       this.perTabViews.set(tab.id, view);
+      this.viewRepos.set(tab.id, repo);
     }
     return view;
   }
@@ -740,6 +766,7 @@ export class TabsComponent {
       if (open.has(tabId)) continue;
       if (typeof view.dispose === "function") view.dispose();
       this.perTabViews.delete(tabId);
+      this.viewRepos?.delete(tabId);
     }
   }
 

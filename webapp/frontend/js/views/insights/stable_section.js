@@ -14,11 +14,11 @@ registerInsightsSection({
   hint: "Mainline fixes marked for a stable series that it does not carry",
   emptyText: "Every marked commit has a backport in this series.",
   async releaseOptions(ctx) {
-    const res = await api.getInsights(ctx.version, "stable/series", { cacheKey: null });
+    const res = await (ctx.api || api).getInsights(ctx.version, "stable/series", { cacheKey: null });
     return (res?.series || []).map((s) => s.series);
   },
   async fetchList(ctx) {
-    const res = await api.getInsights(ctx.version, `stable/missing?series=${encodeURIComponent(ctx.release)}&limit=20000`, ctx);
+    const res = await (ctx.api || api).getInsights(ctx.version, `stable/missing?series=${encodeURIComponent(ctx.release)}&limit=20000`, ctx);
     if (!res?.available) return { rows: [], note: res?.reason || "no stable history" };
     return {
       rows: res.candidates, total: res.total,

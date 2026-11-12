@@ -42,3 +42,12 @@ export function setIf(params, key, value) {
 export function appendAll(params, key, values) {
   for (const v of values || []) if (v !== "" && v != null) params.append(key, String(v));
 }
+
+/**
+ * Repository a hash addresses (`repo=<configured repository name>`, §5.26), "" when it names none.
+ * Shareable links carry it so a link into another project opens there.
+ */
+export function hashRepo(params) {
+  const r = (params && typeof params.get === "function" ? params.get("repo") : "") || "";
+  return /^[\w.@+-]{1,128}$/.test(r) ? r : "";
+}

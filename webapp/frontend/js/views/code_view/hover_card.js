@@ -78,7 +78,7 @@ export class HoverCard {
       this.abort = new AbortController();
       this.lastFetch = performance.now();
       try {
-        data = await api.getSymbolHover(v, name, ctx.arch, this.view.currentFilePath, this.abort.signal);
+        data = await (this.view.api || api).getSymbolHover(v, name, ctx.arch, this.view.currentFilePath, this.abort.signal);
         this.cache.set(key, data);
       } catch (err) {
         if (err?.name === "AbortError") return;
@@ -148,7 +148,7 @@ export class HoverCard {
       const { openDefinition } = await import("../../utils/definition_picker.js");
       openDefinition(v, name, { fromFile: this.view.currentFilePath });
     } else if (act === "refs") {
-      const xref = await api.getSymbolXref(v, name, 250);
+      const xref = await (this.view.api || api).getSymbolXref(v, name, 250);
       contextMenu.showXrefModal(name, xref, v);
     } else if (act === "hist") {
       const m = await import("../../components/symbol_history_modal.js");

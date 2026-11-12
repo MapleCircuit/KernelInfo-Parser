@@ -7,7 +7,7 @@
  * rail of the other list views (`lc=1`) and a download menu. Each feature only provides a section:
  *
  *   { id, label, releaseScoped, archScoped,
- *     fetchList(ctx) -> {rows, total?, note?, truncated?, summaryHtml?},   // ctx: {version, release, arch, signal, onProgress}
+ *     fetchList(ctx) -> {rows, total?, note?, truncated?, summaryHtml?},   // ctx: {version, release, arch, api, signal, onProgress}
  *     rowKey(row), rowHtml(row), rowText?(row), rowHeight?,
  *     chips?: [{id, label, test(row)}],
  *     detailHtml?(row, ctx) | fetchDetail?(ctx, key, row) + detailHtml(detail, ctx),
@@ -26,7 +26,7 @@ import { contextMenu } from "../../components/context_menu.js";
 import { VirtualList } from "../../components/virtual_list.js";
 import { COLLAPSE_ICON } from "../../utils/icons.js";
 import { progressFraction, progressLabel } from "../../utils/job_poll.js";
-import { chipCounts, filterRows, formatChips, parseChips } from "./section_model.js";
+import { chipCounts, filterRows, findRowBySel, formatChips, parseChips } from "./section_model.js";
 import { releaseKey, isFinalRelease } from "./release_order.js";
 
 export class SectionedView {
@@ -54,7 +54,8 @@ export class SectionedView {
     return {
       version: this.version, release: this.tab.release || "", arch: this.tab.arch || "",
       window: this.tab.window || this.section?.windowDefault || 0,
-      view: this, signal: this.abort?.signal, ...extra,
+      // The client of this tab's repository: every request a section makes names it (§5.18)
+      view: this, api: this.api, signal: this.abort?.signal, ...extra,
     };
   }
 
@@ -67,6 +68,13 @@ export class SectionedView {
       if (v === null || v === undefined || v === "" || v === false) delete this.tab[k];
       else this.tab[k] = v;
     }
+  }
+
+  /** A tab field corrected in place (the address it was reached by stays the history entry). */
+  persistReplace(patch) {
+    if (!this.containerEl?.isConnected) return;
+    state.updateTabState(this.tabId, patch, { replace: true });
+    for (const [k, v] of Object.entries(patch)) this.tab[k] = v;
   }
 
   async render(containerEl, tabData) {
@@ -183,7 +191,7 @@ export class SectionedView {
     if (sec.archScoped) {
       let targets = [];
       try {
-        targets = (await api.getKconfigPresets(this.version))?.targets || [];
+        targets = (await this.api.getKconfigPresets(this.version))?.targets || [];
       } catch {
         targets = [];
       }
@@ -200,7 +208,7 @@ export class SectionedView {
 
   /** Final mainline releases of the repository, newest first. */
   async defaultReleases() {
-    const res = await api.getVersionsCached(true);
+    const res = await this.api.getVersionsCached(true);
     const names = (res?.versions || []).map((v) => v.vname || v).filter((n) => typeof n === "string" && isFinalRelease(n));
     return [...new Set(names)].sort((a, b) => (releaseKey(b) > releaseKey(a) ? 1 : releaseKey(b) < releaseKey(a) ? -1 : 0));
   }
@@ -251,11 +259,11 @@ export class SectionedView {
     const summary = this.containerEl.querySelector(".sv-summary");
     summary.hidden = !this.result.summaryHtml;
     summary.innerHTML = this.result.summaryHtml || "";
+    // A `sel` naming only the last key segment (a syscall name, §5.29) selects that row under its full key
+    const selRow = this.tab.sel ? findRowBySel(this.rows, sec.rowKey, this.tab.sel) : null;
+    if (selRow && String(sec.rowKey(selRow)) !== this.tab.sel) this.persistReplace({ sel: String(sec.rowKey(selRow)) });
     this.applyFilter({ keepSelection: true });
-    if (this.tab.sel) {
-      const row = this.rows.find((r) => String(sec.rowKey(r)) === this.tab.sel);
-      this.showDetail(row || null, this.tab.sel);
-    }
+    if (this.tab.sel) this.showDetail(selRow, this.tab.sel);
   }
 
   applyFilter({ keepSelection = false } = {}) {

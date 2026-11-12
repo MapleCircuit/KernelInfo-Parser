@@ -9,13 +9,27 @@ import subprocess as sp
 from pathlib import Path
 from core.globalstuff import G, is_safe_git_rev, is_safe_git_spec
 
-_VERSION_TAG_RE = re.compile(r"^(?:v?\d+(?:\.\d+)*(?:[a-zA-Z](?:\+[a-zA-Z]?)?)?(?:-?(?:rc|alpha|beta|pre|patch)\d*)?|next-\d{8})$")
+# Kernel-scheme release tags: kernel versions (v3.0, 2.0.31pre1, v2.6.12-rc2) and next-YYYYMMDD snapshots. A
+# repository without any is sequenced by its prefixed releases (man-pages-6.9.1, foo-1.2-rc1; release_order)
+_VERSION_TAG_RE = re.compile(
+    r"^(?:v?\d+(?:\.\d+)*(?:[a-zA-Z](?:\+[a-zA-Z]?)?)?(?:-?(?:rc|alpha|beta|pre|patch)\d*)?|next-\d{8})$"
+)
 # Pre-release suffixes git's version sort places before their release: v3.1-rc1 < v3.1, v2.5.4-pre1 <
 # v2.5.4, and the historical 2.0.31pre1 < 2.0.31, 1.0alpha < 1.0
 _VERSIONSORT_SUFFIX_ARGS = tuple(
     arg for suffix in ("-rc", "-pre", "pre", "alpha", "beta") for arg in ("-c", f"versionsort.suffix={suffix}")
 )
 logger = logging.getLogger(__name__)
+
+
+def _version_tag_predicate(names: list[str]):
+    """Release-tag test for a repository with tags `names`: the kernel scheme (`_VERSION_TAG_RE`, `-tree` tags
+    left out) when any name uses it, else the prefixed releases of `release_order.release_tag_names()`."""
+    if any(not t.endswith("-tree") and _VERSION_TAG_RE.match(t) for t in names):
+        return lambda t: not t.endswith("-tree") and bool(_VERSION_TAG_RE.match(t))
+    from parser.git_ast.release_order import release_tag_names
+    releases = set(release_tag_names(names))
+    return lambda t: t in releases
 
 # Scratch directories carry the PID of the process that created them, so `--clean-temp` can leave the
 # directories of a parser instance that is still running alone (core/ingest_state.cleanup_ramdisk_artifacts)
@@ -457,14 +471,23 @@ class MasterFile:
         if not raw_tags:
             return [start_ref] if start_ref else ["v3.0"]
 
+        # Canonical release tags (e.g. v2.6.12, v3.0, v6.12.1, v2.6.12-rc2); excludes non-release topic tags
+        # (e.g. assoc-array-fixes) and tree tags (v2.6.11-tree). A repository without kernel-scheme tags uses its
+        # prefixed releases (man-pages-6.9.1, foo-1.2.3) in release order and, without a start ref, starts at
+        # its first release
+        is_version_tag = _version_tag_predicate(raw_tags)
+        prefixed = not any(not t.endswith("-tree") and _VERSION_TAG_RE.match(t) for t in raw_tags)
+        raw_tags = [t for t in raw_tags if is_version_tag(t)]
+        if prefixed:
+            from parser.git_ast.release_order import release_key
+            raw_tags.sort(key=release_key)
+            if not start_ref and raw_tags:
+                start_ref = raw_tags[0]
         start = start_ref or "v3.0"
         # Release candidates are parsed by default (each -rc# becomes its own snapshot)
         if include_pre_releases is None:
             include_pre_releases = True
 
-        # Filter for canonical version release tags (e.g. v2.6.12, v3.0, v6.12.1, v2.6.12-rc2).
-        # Excludes non-release topic tags (e.g. assoc-array-fixes) and tree tags (v2.6.11-tree).
-        raw_tags = [t for t in raw_tags if not t.endswith("-tree") and _VERSION_TAG_RE.match(t)]
         # Daily next-YYYYMMDD snapshots follow every release (name sorting would put them between the
         # unprefixed historical tags such as 2.4.31 and the v-prefixed ones)
         raw_tags = [t for t in raw_tags if not t.startswith("next-")] + [t for t in raw_tags if t.startswith("next-")]
@@ -483,7 +506,7 @@ class MasterFile:
                 break
 
         if matched_idx is None:
-            return self._commit_start_sequence(start, tags)
+            return self._commit_start_sequence(start, tags, is_version_tag)
 
         return tags[matched_idx:]
 
@@ -493,7 +516,7 @@ class MasterFile:
             return []
         return [line.strip() for line in res.stdout.splitlines() if line.strip()]
 
-    def _commit_start_sequence(self, start: str, tags: list[str]) -> list[str]:
+    def _commit_start_sequence(self, start: str, tags: list[str], is_version_tag=None) -> list[str]:
         """Sequence for a start ref that is not a listed release tag (e.g. the repository's first commit).
 
         Returns [start, <every listed tag whose history contains start>] in version order. A tag
@@ -504,7 +527,8 @@ class MasterFile:
         points_at = set(self._git_lines("tag", "--points-at", start))
         descendants = set(self._git_lines("tag", "--contains", start)) - points_at
         # Name the snapshot after a tag on that exact commit even when pre-release tags are filtered out
-        exact = sorted(t for t in points_at if not t.endswith("-tree") and _VERSION_TAG_RE.match(t))
+        is_version_tag = is_version_tag or _version_tag_predicate(list(points_at))
+        exact = sorted(t for t in points_at if is_version_tag(t))
         first = exact[0] if exact else start
         return [first] + [t for t in tags if t in descendants]
 

@@ -16,7 +16,7 @@ import { configLookup, evalBuild } from "../views/kconfig/build_condition.js";
 const MAX_CANDIDATE_FILES = 6;
 
 /** First of `defs` (backend rank order) the configuration compiles, or null when none is known to be. */
-async function pickConfiguredDefinition(version, defs, ctx = state.definitionContext()) {
+async function pickConfiguredDefinition(version, defs, ctx = state.definitionContext(), client = api) {
   const files = [...new Set(defs.map((d) => d.file).filter(Boolean))].slice(0, MAX_CANDIDATE_FILES);
   const candidates = defs.filter((d) => files.includes(d.file));
   if (candidates.length < 2) return null;
@@ -24,7 +24,7 @@ async function pickConfiguredDefinition(version, defs, ctx = state.definitionCon
   const lookup = configLookup(ctx);
   let build = {};
   try {
-    build = (await api.getBuildConditions(version, files, ctx.arch))?.files || {};
+    build = (await client.getBuildConditions(version, files, ctx.arch))?.files || {};
   } catch (err) {
     console.warn("Build conditions unavailable:", err);
   }
@@ -35,7 +35,7 @@ async function pickConfiguredDefinition(version, defs, ctx = state.definitionCon
       let lines = new Set();
       if (PREPROCESSED_RE.test(file)) {
         try {
-          const res = await api.getFileContent(version, file);
+          const res = await client.getFileContent(version, file);
           lines = evaluator.evaluateDimmedLines((res?.content || "").split(/\r?\n/));
         } catch (err) {
           console.warn(`Could not evaluate #ifdef branches of ${file}:`, err);
@@ -55,12 +55,12 @@ async function pickConfiguredDefinition(version, defs, ctx = state.definitionCon
   return null;
 }
 
-/** getSymbolDetail() whose definition is the one the active configuration compiles. */
-async function resolveDefinition(version, name, fromFile = null) {
+/** getSymbolDetail() whose definition is the one the active configuration compiles (`client`: the repository's). */
+async function resolveDefinition(version, name, fromFile = null, client = api) {
   const ctx = state.definitionContext();
-  const detail = await api.getSymbolDetail(version, name, ctx.arch, fromFile);
+  const detail = await client.getSymbolDetail(version, name, ctx.arch, fromFile);
   if (!detail || detail.is_kconfig || !Array.isArray(detail.definitions) || detail.definitions.length < 2) return detail;
-  const pick = await pickConfiguredDefinition(version, detail.definitions, ctx);
+  const pick = await pickConfiguredDefinition(version, detail.definitions, ctx, client);
   if (!pick || (pick.file === detail.file_path && pick.line_s === detail.line_s)) return detail;
   return {
     ...detail,
@@ -72,11 +72,15 @@ async function resolveDefinition(version, name, fromFile = null) {
   };
 }
 
-/** Open the definition of `name` (used in `fromFile`, when known) in a code tab; false when none was found. */
-export async function openDefinition(version, name, { forceNew = false, fromFile = null } = {}) {
-  const detail = await resolveDefinition(version, name, fromFile);
+/**
+ * Open the definition of `name` (used in `fromFile`, when known) in a code tab; false when none was found.
+ * `repo` names the repository to look in and open the tab in (default: the active tab's).
+ */
+export async function openDefinition(version, name, { forceNew = false, fromFile = null, repo = "" } = {}) {
+  const detail = await resolveDefinition(version, name, fromFile, repo ? api.forRepo(repo) : api);
   if (!detail || !detail.file_path) return false;
   state.openTab({
+    ...(repo ? { repo } : {}),
     type: "code",
     title: detail.file_path.split("/").pop(),
     path: detail.file_path,

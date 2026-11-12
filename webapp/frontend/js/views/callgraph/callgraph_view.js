@@ -108,7 +108,7 @@ export class CallgraphView {
       if (q.length < 3) return;
       suggestTimer = setTimeout(async () => {
         try {
-          const res = await api.searchSymbols(this.currentVersion, q, 15);
+          const res = await this.api.searchSymbols(this.currentVersion, q, 15);
           c.querySelector("#callpath-suggest").innerHTML = (res.symbols || []).map((s) => `<option value="${escapeHtml(s.name || s.symbol_name || "")}">`).join("");
         } catch {
           // suggestions are optional
@@ -131,7 +131,7 @@ export class CallgraphView {
       results.innerHTML = "";
       let res;
       try {
-        res = await api.requestJob(`/api/tools/${encodeURIComponent(this.currentVersion)}/callpath?${params}`, {
+        res = await this.api.requestJob(`/api/tools/${encodeURIComponent(this.currentVersion)}/callpath?${params}`, {
           // 202 while the revision's source index is assembled (the first search of a revision, §2.19)
           timeoutMs: 600000, onProgress: (p) => { status.textContent = `Indexing the sources of ${this.currentVersion}: ${p?.note || "…"} ${p?.total ? `${p.done ?? 0}/${p.total}` : ""}`; },
         });
@@ -195,7 +195,7 @@ export class CallgraphView {
 
     const resContainer = this.containerEl.querySelector("#callgraph-results");
     try {
-      const res = await api.getCallgraph(this.currentVersion, this.functionName);
+      const res = await this.api.getCallgraph(this.currentVersion, this.functionName);
       const callers = res.callers || [];
       const callees = res.callees || [];
 

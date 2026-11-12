@@ -255,18 +255,18 @@ export class CommitsView {
     try {
       if (this.currentQuery && isStructured(this.currentQuery)) {
         // Structured query (H8): git log, downward pagination only
-        const res = await api.queryCommits(this.currentVersion, queryParams(parseCommitQuery(this.currentQuery), this.currentPage, 50));
+        const res = await this.api.queryCommits(this.currentVersion, queryParams(parseCommitQuery(this.currentQuery), this.currentPage, 50));
         if (token !== this._listToken) return;
         this.commits = res.commits || [];
         this.hasMore = Boolean(res.has_more);
       } else if (this.currentQuery) {
-        const res = await api.getCommits(this.currentVersion, this.currentPage, 50, this.currentQuery);
+        const res = await this.api.getCommits(this.currentVersion, this.currentPage, 50, this.currentQuery);
         if (token !== this._listToken) return;
         const newCommits = res.commits || [];
         this.commits = newCommits;
         this.hasMore = newCommits.length === 50;
       } else {
-        const res = await api.getCommitTimeline(this.currentVersion, 50, "past", null);
+        const res = await this.api.getCommitTimeline(this.currentVersion, 50, "past", null);
         if (token !== this._listToken) return;
         this.commits = res.timeline || [];
         this.hasPast = Boolean(res.has_past);
@@ -296,7 +296,7 @@ export class CommitsView {
     const prevScrollTop = listContainer.scrollTop;
 
     try {
-      const res = await api.getCommitTimeline(this.currentVersion, 50, "future", this.nextFutureCursor);
+      const res = await this.api.getCommitTimeline(this.currentVersion, 50, "future", this.nextFutureCursor);
       const newCommits = [...(res.timeline || [])].reverse();
       const known = new Set(this.commits.map((c) => c.commit_id ?? c.commit_hash));
       const fresh = newCommits.filter((c) => !known.has(c.commit_id ?? c.commit_hash));
@@ -333,17 +333,17 @@ export class CommitsView {
       const known = new Set(this.commits.map((c) => c.commit_id ?? c.commit_hash));
       if (this.currentQuery && isStructured(this.currentQuery)) {
         this.currentPage += 1;
-        const res = await api.queryCommits(this.currentVersion, queryParams(parseCommitQuery(this.currentQuery), this.currentPage, 50));
+        const res = await this.api.queryCommits(this.currentVersion, queryParams(parseCommitQuery(this.currentQuery), this.currentPage, 50));
         this.commits.push(...(res.commits || []).filter((c) => !known.has(c.commit_id ?? c.commit_hash)));
         this.hasMore = Boolean(res.has_more);
       } else if (this.currentQuery) {
         this.currentPage += 1;
-        const res = await api.getCommits(this.currentVersion, this.currentPage, 50, this.currentQuery);
+        const res = await this.api.getCommits(this.currentVersion, this.currentPage, 50, this.currentQuery);
         const newCommits = res.commits || [];
         this.commits.push(...newCommits.filter((c) => !known.has(c.commit_id ?? c.commit_hash)));
         this.hasMore = newCommits.length === 50;
       } else {
-        const res = await api.getCommitTimeline(this.currentVersion, 50, "past", this.nextPastCursor);
+        const res = await this.api.getCommitTimeline(this.currentVersion, 50, "past", this.nextPastCursor);
         const newCommits = res.timeline || [];
         this.commits.push(...newCommits.filter((c) => !known.has(c.commit_id ?? c.commit_hash)));
         this.hasPast = Boolean(res.has_past);
@@ -473,7 +473,7 @@ export class CommitsView {
     if (panel.dataset.loaded === commitHash) return;
     panel.innerHTML = `<div class="cdiff-status">Loading diff…</div>`;
     try {
-      const diff = await api.getCommitDiff(this.currentVersion, commitHash);
+      const diff = await this.api.getCommitDiff(this.currentVersion, commitHash);
       panel.dataset.loaded = commitHash;
       this.renderCommitDiff(panel, diff);
     } catch (e) {
@@ -639,7 +639,7 @@ export class CommitsView {
     this.factsAbort = controller;
     const live = () => token === this._detailToken && detailEl.isConnected;
     const badgeEl = detailEl.querySelector("#commit-release-badge");
-    api.getCommitRelease(this.currentVersion, hash, {
+    this.api.getCommitRelease(this.currentVersion, hash, {
       signal: controller.signal,
       onProgress: (p) => { if (live() && badgeEl) badgeEl.innerHTML = `<span class="release-badge pending">Indexing releases… ${escapeHtml(progressLabel(p))}</span>`; },
     }).then((info) => {
@@ -651,7 +651,7 @@ export class CommitsView {
     });
     const body = detailEl.querySelector("#commit-relations-body");
     const countEl = detailEl.querySelector("#commit-relations-count");
-    api.getCommitRelations(this.currentVersion, hash, {
+    this.api.getCommitRelations(this.currentVersion, hash, {
       signal: controller.signal,
       onProgress: (p) => { if (live() && body) body.innerHTML = `<span class="rel-loading">Indexing commit relations (first use)… ${escapeHtml(progressLabel(p))}</span>`; },
     }).then((rel) => {
@@ -712,7 +712,7 @@ export class CommitsView {
     }
     if (missing.length) {
       try {
-        const res = await api.getRelationCounts(this.currentVersion, missing.slice(0, 200));
+        const res = await this.api.getRelationCounts(this.currentVersion, missing.slice(0, 200));
         for (const h of missing) this.relationCounts.set(h, res?.results?.[h] || null);
       } catch {
         return;
@@ -742,7 +742,7 @@ export class CommitsView {
     const token = this._detailToken = (this._detailToken || 0) + 1;
 
     try {
-      const c = await api.getCommitDetail(this.currentVersion, commitIdOrHash);
+      const c = await this.api.getCommitDetail(this.currentVersion, commitIdOrHash);
       if (token !== this._detailToken) return;
       // The commit on screen is recorded on the tab by its hash, never by the integer
       // commit_id: a shared link has to survive a database rebuild (§5.26)
@@ -993,7 +993,7 @@ export class CommitsView {
         resolveBtn.disabled = true;
         resolveBtn.textContent = "Resolving...";
         try {
-          const res = await api.resolveCommitMail(this.currentVersion, c.commit_hash || c.commit_id);
+          const res = await this.api.resolveCommitMail(this.currentVersion, c.commit_hash || c.commit_id);
           if (res.resolved && res.linked_emails?.length) {
             c.linked_emails = res.linked_emails;
             const bodyEl = detailEl.querySelector("#commit-linked-emails-body");

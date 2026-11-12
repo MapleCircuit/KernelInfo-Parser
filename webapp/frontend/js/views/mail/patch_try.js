@@ -127,17 +127,20 @@ export function showResults(res, label = "") {
   }
 }
 
-/** The diff source of a code tab in `patch` mode: re-applies when the server evicted the result. */
-export async function patchedFileDiff(target) {
+/**
+ * The diff source of a code tab in `patch` mode: re-applies when the server evicted the result. `client` is
+ * the code tab's repository client (view.api).
+ */
+export async function patchedFileDiff(target, client = api) {
   const reapply = async () => {
-    const res = await api.applyMailPatches(target.revision, target.mids || []);
+    const res = await client.applyMailPatches(target.revision, target.mids || []);
     target.applyId = res.apply_id;
-    return api.getAppliedFile(res.apply_id, target.path);
+    return client.getAppliedFile(res.apply_id, target.path);
   };
   // A deep link carries the message ids only: the result is rebuilt by applying them again
   if (!target.applyId) return reapply();
   try {
-    return await api.getAppliedFile(target.applyId, target.path);
+    return await client.getAppliedFile(target.applyId, target.path);
   } catch (err) {
     if (err.status !== 410) throw err;
     return reapply();

@@ -1,0 +1,252 @@
+# Man Page AST Subsystem API & Architectural Contract Specification
+
+Authoritative contract for `parser/man_ast/` — the pure parser for the Linux man-pages repository
+(`https://git.kernel.org/pub/scm/docs/man-pages/man-pages.git`): roff `man` pages (plus a basic `mdoc`
+subset) to a JSON document model, per-blob page facts (`m_blob_facts` family 6), and repository path helpers.
+
+## Table of Contents
+- **§1**: High-Level Architecture & Purpose [L18-L43]
+- **§2**: API Specifications [L44-L96]
+- **§3**: Document Model (format 1) [L97-L144]
+- **§4**: roff Coverage [L145-L196]
+- **§5**: Page Facts Record (family 6, format 1) [L197-L222]
+- **§6**: Critical Invariants & Rules [L223-L236]
+- **§7**: Unit Testing & Corpus Validation [L237-L252]
+
+---
+
+## 1. High-Level Architecture & Purpose
+
+The package is free of database, git and `TableEngine` state: every function takes text or paths and returns
+plain data. The parser pipeline (`parser/facts_ingest.py`) persists `man_facts.extract()` records per blob, and
+the webapp calls the same functions as its `"git"` fallback and to render pages.
+
+| Module | Role |
+|---|---|
+| `man_paths.py` | Page file recognition (`man/manS/name.S`, `manS/name.S`), candidate paths, `.so` target resolution, section search order. |
+| `man_parser.py` | roff interpreter: logical lines -> roff layer (macros, strings, conditions) -> `man` block builder -> inline escape scanner -> normalized document model. |
+| `man_facts.py` | Facts record of a page (NAME, `.TH`, `.so`, cross references, SYNOPSIS declarations) with zlib-JSON `encode`/`decode`, same shape as `parser/doc_labels.py`. |
+
+```
+page text ──► so_target() ── alias? ──► {"so": target, "sections": []}
+   │
+   └─► _logical_lines()   comments (\" \#) dropped, \<newline> joined
+         └─► _Parser.run()  queue of (line, macro depth)
+               ├─ roff layer   .de/.de1/.am .ds/.as .ig .if/.ie/.el .rm/.rn   (user macros expanded in place)
+               ├─ man macros   .TH .SH .SS .TP/.TQ .IP .P .RS/.RE .nf/.fi .EX/.EE .SY/.OP/.YS .UR/.UE .MT/.ME .MR .TS/.TE
+               ├─ mdoc subset  .Dd .Dt .Os .Sh .Ss .Pp .Nm .Nd .Bl/.It/.El .Bd/.Ed .Xr .Fn ...
+               └─ inline scan  font escapes, named chars, strings, sizes, \c continuation
+         └─► _finish()     runs merged, cross references detected, empty blocks dropped, ids assigned
+```
+
+---
+
+## 2. API Specifications
+
+### 2.1. `man_paths`
+- `page_of_path(path: str) -> tuple[str, str] | None` — `(name, section)` for `man/man{S}/{name}.{S}` or
+  `man{S}/{name}.{S}` where `S` is a digit plus an optional lowercase suffix equal to the directory suffix
+  (`2`, `2const`, `2type`, `3type`, `3head`, `3attr`, `3p`, `0p`, ...). Names may contain dots (`ld.so.8`).
+  Any other path (root symlinks `man2`, `README`, mismatched suffix) gives `None`.
+- `candidate_paths(name: str, section: str) -> list[str]` — `["man/man{S}/{name}.{S}", "man{S}/{name}.{S}"]`.
+- `resolve_so(so_target: str, page_path: str) -> str` — repository path of a `.so` target. Targets are
+  relative to the man root: `man/` is prefixed when the page lives under `man/`; a bare file name resolves
+  in the page's directory.
+- `SECTION_ORDER: list[str]` — bare-name search order:
+  `2 2type 2const 3 3type 3const 3head 3attr 3p 1 1p 8 5 4 7 6 9 0 0p`.
+- `section_rank(section: str) -> int` — sort key following `SECTION_ORDER`; an unlisted suffixed section sorts
+  right after its base section, anything else after all listed sections.
+
+### 2.2. `man_parser`
+- `parse(text: str) -> dict` — document model (§3). Never raises: malformed input yields a best-effort model,
+  an internal error yields a single `pre` block holding the raw lines, non-`str` input is decoded as UTF-8.
+- `so_target(text: str) -> str | None` — raw target of a `.so`-only page (comments and blank lines aside);
+  `None` when the page has any other content.
+- `plain_text(runs: list[dict]) -> str` — concatenated run text, `{"br":1}` as a newline.
+- `walk_blocks(blocks: list[dict])` — depth-first iterator over blocks including nested `body` lists.
+- `parse_args(s: str) -> list[str]` — roff macro argument splitting (double quotes group, `""` is a literal
+  quote, escapes kept verbatim).
+- `FORMAT = 1`.
+
+### 2.3. `man_facts`
+- `FAMILY = 6`, `FORMAT = 1`.
+- `applies(path: str) -> bool` — `page_of_path(path) is not None`.
+- `extract(text: str) -> dict | None` — facts record (§5); `None` for empty/blank text.
+- `section_text(section: dict) -> str` — plain text of a model section, one line per paragraph / pre line /
+  tag / table row, no-break spaces as spaces.
+- `encode(obj: dict | None) -> bytes` — zlib-compressed compact JSON (`ensure_ascii=False`), `b""` for `None`.
+- `decode(data: bytes | bytearray | memoryview | None) -> dict | None` — inverse of `encode`; `None` for
+  `None`, `b""`, corrupt or non-object payloads.
+
+### 2.4. Package exports (`parser/man_ast/__init__.py`)
+`FAMILY`, `FORMAT`, `SECTION_ORDER`, `applies`, `candidate_paths`, `decode`, `encode`, `extract`,
+`page_of_path`, `parse`, `plain_text`, `resolve_so`, `section_rank`, `so_target`.
+
+### 2.5. Usage
+```python
+from parser.man_ast import parse, extract, page_of_path, resolve_so
+
+doc = parse(text)                       # JSON-serialisable document model
+if doc["so"]:
+    target = resolve_so(doc["so"], "man/man2/pwrite.2")   # -> "man/man2/pread.2"
+facts = extract(text)                   # {"n": ["read"], "s": "...", "fn": ["read"], ...}
+```
+
+---
+
+## 3. Document Model (format 1)
+
+```
+{"format": 1,
+ "th": {"title": "read", "section": "2", "date": "2024-05-02", "source": "Linux man-pages 6.9", "manual": ""},
+ "so": null | "man2/pread.2",
+ "sections": [{"id": "name", "title": "NAME", "blocks": [BLOCK, ...]}, ...]}
+```
+
+| Block | Shape | Source |
+|---|---|---|
+| paragraph | `{"t":"p","c":[INL...]}` | filled text; `.P/.PP/.LP/.HP`, `.sp`, blank lines and block macros end it |
+| subsection | `{"t":"ss","id":"...","title":"..."}` | `.SS`, always at section top level |
+| tagged paragraph | `{"t":"tp","tags":[[INL...],...],"body":[BLOCK...]}` | `.TP` (tag = next input line, `\c` continues it), each `.TQ` adds a tag, `.IP tag` with a non-blank tag (bullets) |
+| indented paragraph | `{"t":"ip","body":[BLOCK...]}` | `.IP` without tag (or blank tag); a `.TP` whose tags are all empty |
+| relative indent | `{"t":"rs","body":[BLOCK...]}` | `.RS`/`.RE`; `.RS 0` opens a level without an `rs` block |
+| no-fill | `{"t":"pre","ex":bool,"lines":[[INL...],...]}` | `.nf/.fi` (`ex=false`), `.EX/.EE` (`ex=true`); `[]` is a blank line |
+| table | `{"t":"table","align":[...],"box":bool,"rows":[[[INL...],...],...],"header":int}` | tbl `.TS/.TE` |
+
+| Inline run | Meaning |
+|---|---|
+| `{"x":"text"}` | roman text |
+| `{"x":"text","f":"B"\|"I"\|"BI"\|"CR"}` | bold / italic / bold-italic / constant width |
+| `{"x":"read","f":"B","ref":["read","2"]}` | cross reference; the `(2)` text follows as its own run |
+| `{"x":"text","url":"https://..."}` | `.UR/.UE` link; `mailto:` URL for `.MT/.ME` |
+| `{"br":1}` | forced line break inside a paragraph, tag or table cell |
+
+- **Section ids**: lowercase title with each run of non-alphanumerics replaced by `-` (trimmed):
+  `RETURN VALUE` -> `return-value`; duplicates get `-2`, `-3`, ... Text before the first `.SH` forms a leading
+  section `{"id": "", "title": ""}` only when it holds content.
+- **Subsection ids**: slug of the title; when it collides with a section id (or earlier subsection id) it is
+  prefixed with `<section id>-`, then numbered on further collision. Section ids are assigned first.
+- **Indentation**: an `.RS` closes the open `tp`/`ip` item and opens an `rs` block in the enclosing container,
+  so its content sits at the item body's indent; text after `.RE` returns to the enclosing container (groff's
+  `an-margin` behaviour).
+- **Cross references**: a `B`/`I`/`BI`/`CR` run whose whole text is a page name (`[A-Za-z_][\w.+:-]*`) and whose
+  next run starts with `(<digit><letters>)` carries `ref` — from `.BR name (2)`, `.IR`, inline `\fBname\fP(3type)`,
+  `.MR name 2` and mdoc `.Xr name 2`. `name()` is not a reference.
+- **Normalization**: adjacent runs with equal attributes merge; paragraphs and tags are trimmed and dropped when
+  textless; `pre` blocks lose leading/trailing blank lines; empty `ip`/`rs` blocks are dropped.
+- **Tables**: `align` comes from the last format row (`l`, `c`, `r`; `n` -> `r`; spans/rules -> `l`); `b`/`i`/`f`
+  key modifiers give the cell font; `box` is set by `box`, `allbox`, `frame`, `doublebox`, `doubleframe`; `header`
+  is the row count before a tbl `.TH`, else the row count before the first `_`/`=` rule (1-3 rows), else 1 for a
+  bold or spanned first format row, else 0. `T{ ... T}` text blocks are parsed as roff (fonts, `.br`), `\_`/`\^`
+  cells are empty, rule rows are dropped.
+
+---
+
+## 4. roff Coverage
+
+### 4.1. Input & roff layer
+- Comments `\"` (rest of line) and `\#` (rest of line plus newline) are removed; lines that held only a comment
+  (`.\" ...`, `'\" t`) vanish. A line ending in an odd number of backslashes joins the next line.
+- Control lines start with `.` or `'`; the request name ends at a blank or backslash. Unknown requests are ignored
+  (`.in .ad .na .nh .hy .PD .ta .ti .ne .ce .ft`-like layout requests have no model effect; `.ft` changes the
+  current font).
+- `.de/.de1/.am/.am1 name [end]` store copy-mode bodies (`\\` -> `\`) until `..`/`.end`; a call substitutes
+  `\$1..\$9`, `\$(NN`, `\$[N]`, `\$*`, `\$@`, `\$0`, `\n(.$` and expands in place. Built-in man macros take
+  precedence over user macros of the same name. Expansion stops at depth 32 and after 200 000 added lines.
+- `.ds/.ds1/.as/.as1` define strings (one leading `"` dropped); `.rm`, `.rn` remove/rename; `.ig [end]` skips.
+- `.if/.ie/.el` evaluate as nroff: `n`/`o` true, `t`/`e`/`v` false, `c X` true, `d`/`m`/`r name` by definition,
+  `'a'b'` string comparison of rendered text, numeric expressions (`\n(.g` = 1, units stripped, groff
+  left-to-right operators). Bodies may be a single line or a `\{ ... \}` block; false blocks are skipped by
+  brace counting.
+
+### 4.2. Inline escapes
+| Escape | Result |
+|---|---|
+| `\fB \fI \fR \fP \f[B] \f[] \f(CW \f[CR] \f[BI] \f1..\f4` | font switch (`P`/empty = previous); `CW`/`C`/`TT` -> `CR` |
+| `\- \e \\ \' \` \.` | `-`, `\`, `\`, `'`, `` ` ``, `.` |
+| `\& \% \) \| \^ \, \/ \: \{ \} \z \p \a` | removed (zero width) |
+| `\~ \<space> \0` | no-break space U+00A0 |
+| `\(xx \[name] \C'name'` | named characters (`em en bu aq dq lq rq oq cq co rg tm mu di pl ti ha ga ua da ra la <= >= != hy dg sc`, Greek `*a`, accents `'e :a`, ...), `\[uXXXX]`/`\[uXXXX_YYYY]` Unicode, `\[charNN]`, `\N'NN'` |
+| `\*x \*(xx \*[name]` | string interpolation: predefined `R` ®, `Tm` ™, `lq` “, `rq` ”, `S` (empty), mdoc strings; `.ds` strings |
+| `\s±N \s(NN \s[N] \m[] \M[] \F[] \h'..' \v'..' \w'..' \X'..' \o'..' ...` | removed |
+| `\c` | continuation: the next input line joins without a space (also inside `.TP` tags and font macros) |
+| `\nx \n(xx \n[name]` | register value for known registers (`.g` = 1), else empty |
+
+### 4.3. man macros
+- Font macros `.B .I .SB .SM` (no argument: applies to the next text line) and alternating `.BR .BI .IB .IR
+  .RB .RI` (arguments joined without spaces) render in their own font and leave the current font unchanged.
+- Fill mode joins input lines with one space; a text line starting with a blank breaks the line first; a blank
+  line ends the paragraph. In no-fill mode each input line is one `pre` line, `\&` placeholder lines are blank
+  lines, and `.P` inside `.nf` adds a blank line.
+- `.SY cmd` starts a synopsis line (new paragraph in fill mode, new `pre` line inside `.EX`/`.nf`) to which
+  following lines and `.OP opt [arg]` (`[`**opt** *arg*`]`) are appended with spaces until `.YS`.
+- `.UR url` / `.MT addr` mark following text as a link until `.UE`/`.ME`, whose argument is appended without a
+  space; an empty link shows its address. `.MR name sec [punct]` emits a cross reference.
+- `.SH`/`.SS` reset fill mode, link and relative-indent state; `.SH`/`.SS` without arguments take the title
+  from the next input line. Only the first `.TH` sets `th`.
+
+### 4.4. mdoc subset
+`.Dd .Dt .Os` fill `th`; `.Sh .Ss .Pp .Lp` map to sections/paragraphs; `.Nm .Nd` build NAME; `.Bl/.It/.El`
+build `tp` items (`-bullet`, `-dash`, `-enum` tags, `-item` -> `ip`, nested lists and `-offset` -> `rs`);
+`.Bd -literal|-unfilled` -> `pre`; `.D1 .Dl` -> indented line. Inline macros (`Fn Fa Ft Fd In Ar Fl Op Em Sy
+Dv Er Ev Pa Li Ql Xr Dq Pq Aq Sq Bq Qq Ns Pf St Ux Bx At ...`) map to fonts, enclosures and spacing rules. In
+SYNOPSIS, `.Fd`/`.In`/`.Ft` start a line, `.In h` renders `#include <h>`, `.Fn` ends with `;`.
+
+---
+
+## 5. Page Facts Record (family 6, format 1)
+
+```
+{"n": ["pread", "pwrite"], "s": "read from or write to a file descriptor at a given offset",
+ "th": [title, section, date, source, manual], "so": "" | "<raw .so target>",
+ "x": [[name, section], ...], "fn": ["pread", "pwrite"], "hd": ["unistd.h"], "id": ["ssize_t", "off_t"]}
+```
+
+- `n` / `s`: NAME section text split at the first ` - ` (also em/en dash, `--`); names split on commas and
+  blanks, trailing `()` removed.
+- `th`: the five `.TH` fields (`""` when absent). `so`: raw `.so` target of an alias page, whose other fields
+  are empty.
+- `x`: references of SEE ALSO first (plain-text `name(sec)` patterns, then `ref` runs), then `ref` runs of all
+  other sections in document order, de-duplicated by `[name, section]`.
+- `hd`: `#include <...>` / `"..."` headers of SYNOPSIS, in order.
+- `fn` (pages outside sections `1`, `6`, `8`): SYNOPSIS text before "Feature Test Macro Requirements", with C
+  comments, string literals, `[[...]]`/`__attribute__((...))`, GNU forward parameter declarations and prose
+  sentences removed, split into statements at `;{}`. A statement declares a function when the text before its
+  first `(` is 1-6 type words plus a name (`ssize_t read(`), a function-pointer return form
+  (`void (*signal(`), or a usage form `var = name(`. `syscall(SYS_foo, ...)` declares `foo`.
+- `id`: `struct`/`union`/`enum` tags, `typedef` names, `#define` names, `*_t` identifiers and upper-case
+  identifiers (`FILE`, `O_RDONLY`, `SYS_gettid`) of SYNOPSIS statements, minus `fn`, C keywords/qualifiers,
+  `NULL` and feature-test macros (`_GNU_SOURCE`, `_XOPEN_SOURCE`, `_FILE_OFFSET_BITS`, ...).
+
+---
+
+## 6. Critical Invariants & Rules
+
+1. **Purity**: no imports of `db_engine`, `core`, git, subprocess or groff; stdlib only.
+2. **Never raise**: `parse()`, `so_target()` and `extract()` return a value for any input; corpus validation
+   runs them with the module hook `man_parser._RAISE = True` (re-raise instead of falling back) to surface
+   internal errors.
+3. **Determinism**: equal text gives equal model and facts (no time, locale or environment dependence), so
+   family-6 rows written by the parser and the webapp's git fallback agree.
+4. **JSON-only values**: models and records contain only dicts, lists, strings, ints and bools.
+5. **Format bumps**: any change to the model or record shape increments `man_parser.FORMAT` /
+   `man_facts.FORMAT` together with this specification.
+
+---
+
+## 7. Unit Testing & Corpus Validation
+
+- `tests/test_man_ast.py` (`python3 -m unittest tests.test_man_ast`) holds inline roff fixtures covering every
+  block and inline type, tag continuation, `.TQ`, `.RS` nesting, `.SY/.OP/.YS`, links, `.MR`, escapes and fonts,
+  comments and continuations, conditions, strings and user macros, bounded recursion, tbl (options, formats,
+  `T{ T}`, rules, header detection), `.so` aliases, the mdoc subset, robustness on malformed input, the error
+  fallback, path helpers for both layouts and suffixed sections, and every facts field plus encode/decode.
+- Corpus validation parses every page file (symlinks excluded) of release tags `man-pages-6.20`, `-5.00`, `-3.35`
+  and `-2.00` with `parse()` + `extract()` + `json.dumps` + `encode`/`decode` round trip:
+
+| Tag | Page files | `.so` aliases | Tables | Exceptions | Pages without NAME names |
+|---|---|---|---|---|---|
+| `man-pages-6.20` | 3153 | 1591 | 727 | 0 | 0 |
+| `man-pages-5.00` | 2386 | 1346 | 721 | 0 | 0 |
+| `man-pages-3.35` | 2094 | 1161 | 120 | 0 | 0 |
+| `man-pages-2.00` | 3066 | 1351 | 171 | 0 | 0 |

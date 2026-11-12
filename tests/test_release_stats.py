@@ -41,6 +41,111 @@ class TestReleaseRanges(unittest.TestCase):
             self.assertEqual(r["range_base"], previous_in(r["tag"], self.TAGS), r["tag"])
 
 
+class TestManPagesTags(unittest.TestCase):
+    """man-pages release tags (`man-pages-X.Y[.Z][-rcN]`) are one prefixed family: numeric order (zero-padded
+    minors included), their own chains, kernel tags untouched."""
+    TAGS = ["man-pages-1.70", "man-pages-2.00", "man-pages-5.13", "man-pages-5.19-rc1", "man-pages-6.0-rc1",
+            "man-pages-6.00", "man-pages-6.04", "man-pages-6.04.01", "man-pages-6.05", "man-pages-6.05-a1",
+            "man-pages-6.06", "man-pages-6.7", "man-pages-6.9", "man-pages-6.9.1", "man-pages-6.10"]
+
+    def test_parse(self) -> None:
+        from parser.git_ast.release_order import PREFIXED_SERIES, parse_tag
+        self.assertEqual(parse_tag("man-pages-6.04")["series"], (PREFIXED_SERIES, "man-pages-", 6, 4))
+        self.assertEqual(parse_tag("man-pages-6.04")["series"], parse_tag("man-pages-6.4")["series"])
+        self.assertEqual(parse_tag("man-pages-6.9.1")["kind"], "stable")
+        self.assertEqual(parse_tag("man-pages-6.0-rc1")["pre"], 1)
+        self.assertTrue(parse_tag("man-pages-6.10")["final"])
+        self.assertEqual(parse_tag("man-pages-6.10")["family"], "man-pages-")
+        for bad in ("man-pages-6.05-a1", "man-pages-6", "man-pages-x.y", "man-pages-6.9.1-rc1"):
+            self.assertIsNone(parse_tag(bad), bad)
+        # Kernel tags are unaffected
+        self.assertEqual(parse_tag("v6.9")["series"], (6, 9, 0))
+        self.assertEqual(parse_tag("v6.9")["family"], "")
+
+    def test_order_and_names(self) -> None:
+        from parser.git_ast.release_order import final_of, parse_tag, release_key, series_name
+        ordered = sorted((t for t in self.TAGS if parse_tag(t)), key=release_key)
+        self.assertEqual(ordered, [
+            "man-pages-1.70", "man-pages-2.00", "man-pages-5.13", "man-pages-5.19-rc1", "man-pages-6.0-rc1",
+            "man-pages-6.00", "man-pages-6.04", "man-pages-6.04.01", "man-pages-6.05", "man-pages-6.06",
+            "man-pages-6.7", "man-pages-6.9", "man-pages-6.9.1", "man-pages-6.10",
+        ])
+        # A series name parses back to its series (minor without zero padding)
+        self.assertEqual(series_name(parse_tag("man-pages-6.05")["series"]), "man-pages-6.5")
+        self.assertEqual(parse_tag("man-pages-6.5")["series"], parse_tag("man-pages-6.05")["series"])
+        self.assertEqual(series_name(parse_tag("man-pages-6.10")["series"]), "man-pages-6.10")
+        self.assertEqual(final_of("man-pages-6.0-rc1", set(self.TAGS)), "man-pages-6.00")
+        self.assertIsNone(final_of("man-pages-5.19-rc1", set(self.TAGS)))
+
+    def test_ranges(self) -> None:
+        got = {r["tag"]: (r["kind"], r["segment_base"], r["range_base"]) for r in release_ranges(self.TAGS)}
+        self.assertNotIn("man-pages-6.05-a1", got)
+        self.assertEqual(got["man-pages-1.70"], ("mainline", None, None))
+        self.assertEqual(got["man-pages-6.7"], ("mainline", "man-pages-6.06", "man-pages-6.06"))
+        self.assertEqual(got["man-pages-6.9.1"], ("stable", "man-pages-6.9", "man-pages-6.9"))
+        self.assertEqual(got["man-pages-6.10"], ("mainline", "man-pages-6.9", "man-pages-6.9"))
+        self.assertEqual(got["man-pages-6.00"], ("mainline", "man-pages-6.0-rc1", "man-pages-5.13"))
+        for r in release_ranges(self.TAGS):
+            self.assertEqual(r["range_base"], previous_in(r["tag"], self.TAGS), r["tag"])
+
+
+class TestGenericTagSchemes(unittest.TestCase):
+    """Any `<prefix>X.Y[.Z][-rcN]` scheme orders naturally per prefix; each prefix has its own chains."""
+
+    def test_semver_prefix(self) -> None:
+        from parser.git_ast.release_order import family_of, final_of, parse_tag, release_key, series_name
+        tags = ["foo-1.2", "foo-1.9", "foo-1.10-rc1", "foo-1.10-rc2", "foo-1.10", "foo-1.10.1",
+                "foo-2.0-pre1", "foo-2.0", "release_3.1", "gtk2-1.2"]
+        self.assertEqual(sorted(tags[:8], key=release_key), [
+            "foo-1.2", "foo-1.9", "foo-1.10-rc1", "foo-1.10-rc2", "foo-1.10", "foo-1.10.1",
+            "foo-2.0-pre1", "foo-2.0"])
+        self.assertEqual((family_of("release_3.1"), family_of("gtk2-1.2"), family_of("foo-1.2")), ("release_", "gtk2-", "foo-"))
+        self.assertEqual(parse_tag("foo-1.10.1")["kind"], "stable")
+        self.assertEqual(parse_tag("foo-2.0-pre1")["pre_kind"], "pre")
+        self.assertEqual(final_of("foo-1.10-rc2", set(tags)), "foo-1.10")
+        self.assertEqual(series_name(parse_tag("foo-1.10.1")["series"]), "foo-1.10")
+        for bad in ("foo", "foo-1", "foo.1.2", "foo-1.2-beta1", "foo-1.2.3-rc1", "for-linus", "v1.2-beta", "1.2.3.4.5"):
+            self.assertIsNone(parse_tag(bad), bad)
+
+    def test_families_have_their_own_chains(self) -> None:
+        tags = ["foo-1.0", "foo-1.1-rc1", "foo-1.1", "foo-1.1.1", "bar-0.9", "bar-1.0"]
+        got = {r["tag"]: (r["kind"], r["segment_base"], r["range_base"]) for r in release_ranges(tags)}
+        self.assertEqual(got["bar-0.9"], ("mainline", None, None))
+        self.assertEqual(got["bar-1.0"], ("mainline", "bar-0.9", "bar-0.9"))
+        self.assertEqual(got["foo-1.0"], ("mainline", None, None))   # not after bar-1.0
+        self.assertEqual(got["foo-1.1-rc1"], ("mainline", "foo-1.0", "foo-1.0"))
+        self.assertEqual(got["foo-1.1"], ("mainline", "foo-1.1-rc1", "foo-1.0"))
+        self.assertEqual(got["foo-1.1.1"], ("stable", "foo-1.1", "foo-1.1"))
+        for r in release_ranges(tags):
+            self.assertEqual(r["range_base"], previous_in(r["tag"], tags), r["tag"])
+
+    def test_release_tag_names(self) -> None:
+        from parser.git_ast.release_order import release_tag_names
+        # A kernel tree: prefixed names (pull-request tags) are not releases
+        self.assertEqual(release_tag_names(["v6.0", "for-linus-6.1", "v6.1-rc1", "next-20221010", "kvm-6.1-1"]),
+                         ["v6.0", "v6.1-rc1", "next-20221010"])
+        # Without kernel-scheme tags every prefixed release counts
+        self.assertEqual(release_tag_names(["man-pages-6.9", "nofwd-fix", "man-pages-6.05-a1", "foo-1.0"]),
+                         ["man-pages-6.9", "foo-1.0"])
+        self.assertEqual(release_tag_names([]), [])
+
+    def test_kernel_semantics_unchanged(self) -> None:
+        from parser.git_ast.release_order import parse_tag, release_key, series_name
+        self.assertEqual(parse_tag("v2.6.39.4"), {"series": (2, 6, 39), "stable": 4, "pre": 0, "pre_kind": "",
+                                                  "kind": "stable", "final": False, "family": ""})
+        self.assertEqual(parse_tag("2.4.0")["series"], (2, 4, 0))
+        self.assertEqual(parse_tag("next-20260810")["kind"], "next")
+        self.assertIsNone(parse_tag("v2.6"))
+        self.assertIsNone(parse_tag("v3.0.1.2"))
+        self.assertEqual(series_name((3, 1, 0)), "v3.1")
+        self.assertEqual(series_name((2, 6, 39)), "v2.6.39")
+        # Kernel tags sort before prefixed ones; next tags keep following the last kernel release
+        mixed = ["foo-1.0", "v3.1", "next-20110801", "v3.0"]
+        self.assertEqual(sorted(mixed, key=release_key), ["v3.0", "v3.1", "next-20110801", "foo-1.0"])
+        got = {r["tag"]: r["segment_base"] for r in release_ranges(mixed)}
+        self.assertEqual(got, {"v3.0": None, "v3.1": "v3.0", "next-20110801": "v3.1", "foo-1.0": None})
+
+
 class TestSummarizeLog(unittest.TestCase):
     def test_roles_aliases_and_own_signoff(self) -> None:
         log = (
@@ -255,6 +360,28 @@ class TestIngest(unittest.TestCase):
         again = rst.ingest(self.db, self.dir, repo_id=1)
         self.assertEqual((again["state"], again["segments"]), ("updated", 1))
         self.assertEqual(self.rows("SELECT base_tag, commits FROM m_release_segment WHERE tag = 'v3.0.2'"), [("v3.0.1", 1)])
+
+    def test_prefixed_tags_and_kernel_tree_filter(self) -> None:
+        """A repository tagged `man-pages-X.Y` is summarized like a kernel one; a kernel tree ignores prefixed tags."""
+        self.assertEqual(set(rst.release_tags(self.dir)), {"v3.0", "v3.1-rc1", "v3.1", "v3.0.1"})
+        self.git("tag", "for-linus-3.1", "v3.1")   # a pull-request tag in a kernel tree is no release
+        self.assertNotIn("for-linus-3.1", rst.release_tags(self.dir))
+        for old_tag, new_tag in (("v3.0", "man-pages-6.00"), ("v3.1-rc1", "man-pages-6.1-rc1"),
+                                 ("v3.1", "man-pages-6.01"), ("v3.0.1", "man-pages-6.00.1")):
+            self.git("tag", new_tag, f"{old_tag}^{{commit}}")
+        for t in ("v3.0", "v3.1-rc1", "v3.1", "v3.0.1", "for-linus-3.1"):
+            self.git("tag", "-d", t)
+        summary = rst.ingest(self.db, self.dir, repo_id=2, workers=2)
+        self.assertEqual((summary["state"], summary["tags"], summary["segments"]), ("updated", 4, 4))
+        seg = {t: (c, b, d) for t, c, b, d in self.rows(
+            "SELECT tag, commits, base_tag, diff_base_tag FROM m_release_segment WHERE repo_id = 2")}
+        self.assertEqual(seg["man-pages-6.00"], (1, "", ""))
+        self.assertEqual(seg["man-pages-6.1-rc1"], (2, "man-pages-6.00", "man-pages-6.00"))
+        self.assertEqual(seg["man-pages-6.01"], (2, "man-pages-6.1-rc1", "man-pages-6.00"))
+        self.assertEqual(seg["man-pages-6.00.1"], (1, "man-pages-6.00", "man-pages-6.00"))
+        first = {n for (n,) in self.rows(
+            "SELECT p.name FROM m_person_first_release f JOIN m_maintainer_person p USING (person_id) WHERE f.repo_id = 2")}
+        self.assertEqual(first, {"Ann B", "Neo N", "Cy D"})
 
     def test_moved_mainline_tag_rebuilds_first_releases(self) -> None:
         rst.ingest(self.db, self.dir, repo_id=1)

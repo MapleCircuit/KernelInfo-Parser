@@ -109,7 +109,7 @@ export class PaholeView {
     panel.hidden = false;
     panel.innerHTML = `<div class="kconfig-muted">Comparing struct ${escapeHtml(this.structName)} at ${escapeHtml(this.currentVersion)} and ${escapeHtml(other)}…</div>`;
     try {
-      const res = await api.request(`/api/tools/pahole/compare?${new URLSearchParams({ a: this.currentVersion, b: other, struct: this.structName })}`, { timeoutMs: 60000 });
+      const res = await this.api.request(`/api/tools/pahole/compare?${new URLSearchParams({ a: this.currentVersion, b: other, struct: this.structName })}`, { timeoutMs: 60000 });
       panel.innerHTML = `<div class="pcmp-head"><strong>Layout ${escapeHtml(this.currentVersion)} → ${escapeHtml(other)}</strong><button class="code-btn" type="button" data-close>✕</button></div>${compareHtml(res, this.currentVersion, other)}`;
     } catch (err) {
       panel.innerHTML = `<div class="pcmp-head"><span style="color:var(--accent-red);">Compare failed: ${escapeHtml(err.message)}</span><button class="code-btn" type="button" data-close>✕</button></div>`;
@@ -127,7 +127,7 @@ export class PaholeView {
     panel.hidden = false;
     panel.innerHTML = `<div class="kconfig-muted pcmp-progress">Computing the layout at each release where struct ${escapeHtml(this.structName)} changed…</div>`;
     try {
-      const res = await api.requestJob(`/api/tools/${encodeURIComponent(this.currentVersion)}/pahole/${encodeURIComponent(this.structName)}/history`, {
+      const res = await this.api.requestJob(`/api/tools/${encodeURIComponent(this.currentVersion)}/pahole/${encodeURIComponent(this.structName)}/history`, {
         timeoutMs: 120000,
         onProgress: (p) => { const el = panel.querySelector(".pcmp-progress"); if (el) el.textContent = `Computing ${p?.note || "…"} (${p?.done ?? 0}/${p?.total ?? "?"})…`; },
       });
@@ -175,7 +175,7 @@ export class PaholeView {
     }
 
     try {
-      const res = await api.getPaholeLayout(this.currentVersion, this.structName);
+      const res = await this.api.getPaholeLayout(this.currentVersion, this.structName);
       const members = res.members || [];
 
       // Link to definition in Code View

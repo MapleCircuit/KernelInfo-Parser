@@ -1,0 +1,173 @@
+/* man.css - Man pages tab and rendered man pages (webapp/API_FRONTEND.md §5.38).
+   Colors come from the theme tokens (variables.css), so every theme restyles them. */
+
+.activity-btn[hidden] { display: none; }
+
+.man-view {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+  background: var(--bg-primary);
+  color: var(--text-primary);
+}
+
+.man-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 10px;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--border-color);
+  background: var(--bg-secondary);
+  font-size: var(--fs-12, 12px);
+}
+.man-toolbar .man-title { font-family: var(--font-mono); }
+.man-tag-label { display: inline-flex; align-items: center; gap: 4px; color: var(--text-secondary); }
+.man-tag { max-width: 170px; font-size: var(--fs-12, 12px); }
+.man-mode { display: inline-flex; gap: 0; }
+.man-mode .code-btn:first-child { border-top-right-radius: 0; border-bottom-right-radius: 0; }
+.man-mode .code-btn:last-child { border-top-left-radius: 0; border-bottom-left-radius: 0; margin-left: -1px; }
+.man-linux { display: inline-flex; flex-wrap: wrap; align-items: baseline; gap: 4px 8px; color: var(--text-secondary); }
+.man-linux a { color: var(--accent-blue); text-decoration: none; }
+.man-linux a:hover { text-decoration: underline; }
+.man-linux-label { color: var(--text-muted); }
+.man-ext { margin-left: auto; color: var(--text-secondary); text-decoration: none; }
+.man-ext:hover { color: var(--accent-blue); }
+.man-muted { color: var(--text-muted); }
+
+.man-body {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+}
+.man-status { padding: 20px; color: var(--text-secondary); }
+.man-status a { color: var(--accent-blue); }
+.man-alias { padding: 6px 16px; color: var(--text-muted); font-size: var(--fs-12, 12px); }
+
+/* ---------------------------------------------------------------- web mode (man7.org-like) */
+.man-web {
+  max-width: 980px;
+  padding: 12px 24px 32px;
+  font-family: var(--font-sans);
+  font-size: var(--fs-14, 14px);
+  line-height: 1.5;
+}
+.man-web-head, .man-web-foot {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  font-family: var(--font-mono);
+  color: var(--text-secondary);
+  border-bottom: 1px solid var(--border-color);
+  padding: 4px 0 6px;
+}
+.man-web-foot { border-bottom: 0; border-top: 1px solid var(--border-color); margin-top: 24px; padding-top: 6px; }
+.man-web-tag { font-weight: 600; color: var(--text-bright); }
+.man-web-toc {
+  margin: 8px 0 4px;
+  font-size: var(--fs-12, 12px);
+  line-height: 1.8;
+}
+.man-web-toc a { color: var(--accent-blue); text-decoration: none; white-space: nowrap; }
+.man-web-toc a:hover { text-decoration: underline; }
+.man-toc-sep { color: var(--text-muted); }
+.man-web h2 {
+  margin: 20px 0 6px;
+  font-family: var(--font-mono);
+  font-size: var(--fs-14, 14px);
+  font-weight: 700;
+  color: var(--accent-green);
+  letter-spacing: 0.02em;
+}
+.man-web .man-ss {
+  margin: 14px 0 4px -24px;
+  font-family: var(--font-mono);
+  font-size: var(--fs-13, 13px);
+  color: var(--accent-cyan);
+}
+.man-web-body { padding-left: 48px; }
+.man-web-body p { margin: 0 0 10px; }
+.man-web b { color: var(--text-bright); }
+.man-web i { font-style: italic; text-decoration: underline; text-decoration-color: var(--border-color); text-underline-offset: 2px; }
+.man-web code { font-family: var(--font-mono); font-size: 0.95em; }
+.man-tp { margin: 0 0 8px; }
+.man-tp dt { font-family: var(--font-mono); font-size: 0.95em; }
+.man-tp dd { margin: 2px 0 0 40px; }
+.man-tp dd > p:last-child { margin-bottom: 4px; }
+.man-ip, .man-rs { margin-left: 40px; }
+.man-pre {
+  margin: 4px 0 12px;
+  padding: 8px 12px;
+  font-family: var(--font-mono);
+  font-size: var(--fs-13, 13px);
+  line-height: 1.4;
+  white-space: pre;
+  overflow-x: auto;
+  background: var(--bg-secondary);
+  border-radius: var(--radius-md, 4px);
+}
+.man-pre.man-ex { border-left: 3px solid var(--accent-blue); }
+.man-tbl-wrap { overflow-x: auto; margin: 4px 0 12px; }
+.man-tbl { border-collapse: collapse; font-size: var(--fs-13, 13px); }
+.man-tbl th, .man-tbl td { padding: 2px 12px 2px 0; vertical-align: top; }
+.man-tbl th { font-weight: 700; border-bottom: 1px solid var(--border-color); text-align: left; }
+.man-tbl.man-box th, .man-tbl.man-box td { border: 1px solid var(--border-color); padding: 3px 8px; }
+.man-al-center { text-align: center; }
+.man-al-right { text-align: right; }
+.man-web a.man-ref, .man-web a.man-url { color: var(--accent-blue); text-decoration: none; }
+.man-web a.man-ref:hover, .man-web a.man-url:hover { text-decoration: underline; }
+.man-empty { color: var(--text-muted); }
+
+/* ---------------------------------------------------------------- terminal mode (man(1)) */
+.man-mode-term { padding: 12px; }
+.man-term {
+  display: inline-block;
+  min-width: calc(var(--man-cols, 80) * 1ch + 32px);
+  margin: 0;
+  padding: 12px 16px;
+  font-family: var(--font-mono);
+  font-size: var(--fs-13, 13px);
+  line-height: 1.35;
+  white-space: pre;
+  color: var(--text-primary);
+  background: var(--bg-canvas);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-md, 4px);
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.25);
+}
+.man-term .mt-b { font-weight: 700; color: var(--text-bright); }
+.man-term .mt-u { text-decoration: underline; text-underline-offset: 2px; }
+.man-term a.man-ref, .man-term a.man-url { color: inherit; text-decoration: none; }
+.man-term a.man-ref:hover, .man-term a.man-url:hover { color: var(--accent-blue); text-decoration: underline; }
+.man-term a.man-ref .mt-b { color: var(--accent-cyan); }
+
+/* ---------------------------------------------------------------- index */
+.man-index { padding: 10px 20px 32px; }
+.man-index-head { display: flex; align-items: center; gap: 12px; margin-bottom: 8px; }
+.man-filter {
+  width: min(420px, 100%);
+  padding: 4px 8px;
+  font-size: var(--fs-13, 13px);
+  color: var(--text-primary);
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-md, 4px);
+}
+.man-index-toc { display: flex; flex-wrap: wrap; gap: 4px 12px; margin-bottom: 8px; font-family: var(--font-mono); font-size: var(--fs-12, 12px); }
+.man-index-toc a { color: var(--accent-blue); text-decoration: none; }
+.man-index-sec h2 {
+  margin: 16px 0 6px;
+  font-size: var(--fs-14, 14px);
+  color: var(--accent-green);
+  border-bottom: 1px solid var(--border-color);
+  padding-bottom: 3px;
+}
+.man-index-list { list-style: none; margin: 0; padding: 0; columns: 2 420px; column-gap: 32px; }
+.man-index-list li { break-inside: avoid; padding: 1px 0; font-size: var(--fs-13, 13px); }
+.man-index-list a { font-family: var(--font-mono); color: var(--accent-blue); text-decoration: none; }
+.man-index-list a:hover { text-decoration: underline; }
+.man-summary { color: var(--text-secondary); }
+
+/* Kernel-side man page links (Kernel API detail, rst :manpage:) */
+a.man-link { cursor: pointer; }

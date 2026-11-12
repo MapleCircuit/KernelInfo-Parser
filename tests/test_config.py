@@ -479,5 +479,124 @@ class TestRepositoryDetection(unittest.TestCase):
         self.assertEqual(parse("v6.6-rc1"), ("v6.6", "-rc1", True))
 
 
+
+class TestManPagesRepository(unittest.TestCase):
+    """The Linux man-pages: detection, release tags, project names."""
+
+    def setUp(self) -> None:
+        reset_config()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+
+    def tearDown(self) -> None:
+        reset_config()
+        self.tmp.cleanup()
+
+    def _repo(self, name: str, tags: dict[int, str] | None = None) -> tuple[Path, list[str]]:
+        path = self.root / name
+        shas = _make_git_repo(path, commits=3, tags=tags)
+        subprocess.run(["git", "-C", str(path), "branch", "-m", "master"], check=True)
+        subprocess.run(["git", "-C", str(path), "branch", "topic"], check=True)
+        return path, shas
+
+    def test_detected_by_directory_name(self) -> None:
+        from core.config import (
+            MANPAGES_BRANCH_FILTER,
+            MANPAGES_TAG_VIEWS,
+            detect_repository,
+        )
+        path, shas = self._repo("man-pages", tags={0: "man-pages-1.70", 2: "man-pages-2.00"})
+        entry = detect_repository(path)
+        self.assertEqual(entry["project"], "man-pages")
+        self.assertEqual(entry["default_branch"], "master")
+        self.assertEqual(entry["root_commit"], shas[0])
+        self.assertEqual(entry["start_ref"], shas[0])
+        self.assertEqual(entry["branch_filter"], MANPAGES_BRANCH_FILTER)
+        self.assertEqual(entry["branches"], ["master"])
+        self.assertEqual(entry["tag_views"], MANPAGES_TAG_VIEWS)
+
+    def test_detected_by_url_or_root_commit(self) -> None:
+        from core import config
+        path, _shas = self._repo("mirror")
+        subprocess.run(["git", "-C", str(path), "remote", "add", "origin",
+                        "https://git.kernel.org/pub/scm/docs/man-pages/man-pages.git"], check=True)
+        self.assertEqual(config.detect_repository(path)["project"], "man-pages")
+        other, _ = self._repo("docs")
+        with mock.patch.object(config, "detect_root_commit", return_value=config.MANPAGES_ROOT_COMMIT):
+            entry = config.detect_repository(other)
+        self.assertEqual((entry["project"], entry["start_ref"]), ("man-pages", config.MANPAGES_ROOT_COMMIT))
+
+    def test_other_repositories_unchanged(self) -> None:
+        from core.config import detect_repository
+        path, shas = self._repo("linux")
+        entry = detect_repository(path)
+        self.assertEqual(entry["project"], "linux")
+        self.assertEqual(entry["start_ref"], shas[0])
+        self.assertEqual(entry["branch_filter"], DEFAULT_BRANCH_FILTER)
+        self.assertEqual(entry["tag_views"], DEFAULT_TAG_VIEWS)
+        self.assertEqual(sorted(entry["branches"]), ["master", "topic"])
+
+    def test_linux_root_commit_names_the_linux_project(self) -> None:
+        from core import config
+        other, _shas = self._repo("custom")
+        self.assertEqual(config.detect_repository(other)["project"], "custom")
+        path, _shas = self._repo("torvalds")
+        with mock.patch.object(config, "detect_root_commit", return_value=config.LINUX_ROOT_COMMIT):
+            self.assertEqual(config.detect_repository(path)["project"], "linux")
+
+    def test_project_helpers(self) -> None:
+        from core.config import (
+            is_kernel_project,
+            is_manpages_repository,
+            project_display_name,
+            repository_project,
+        )
+        self.assertEqual(project_display_name("linux"), "Linux Kernel")
+        self.assertEqual(project_display_name(None), "Linux Kernel")
+        self.assertEqual(project_display_name("man-pages"), "Linux man-pages")
+        self.assertEqual(project_display_name("rt"), "rt")
+        self.assertTrue(is_kernel_project("linux"))
+        self.assertTrue(is_kernel_project("torvalds"))
+        self.assertFalse(is_kernel_project("man-pages"))
+        self.assertEqual(repository_project(None), "linux")
+        self.assertEqual(repository_project({"project": "man-pages"}), "man-pages")
+        self.assertTrue(is_manpages_repository("x", "git://example.com/man-pages.git"))
+        self.assertTrue(is_manpages_repository("man-pages"))
+        self.assertFalse(is_manpages_repository("linux", "https://git.kernel.org/torvalds/linux.git", "1da177e4"))
+
+    def test_tag_view_groups_by_major(self) -> None:
+        import re
+
+        from core.config import MANPAGES_TAG_VIEWS
+        rule = re.compile(MANPAGES_TAG_VIEWS[0]["regex_rules"][0])
+        self.assertEqual(rule.match("man-pages-6.9.1").groups(), ("man-pages-6", ".9.1"))
+        self.assertEqual(rule.match("man-pages-2.00").groups(), ("man-pages-2", ".00"))
+
+    def test_version_tags_accept_manpages_releases(self) -> None:
+        from core.FileHandler import MasterFile
+        mf = MasterFile()
+        mock_output = ("man-pages-1.70\nman-pages-2.00\nman-pages-6.0-rc1\nman-pages-6.00\nman-pages-6.05-a1\n"
+                       "man-pages-6.9\nman-pages-6.9.1\nman-pages-6.10\nnofwd-fix\n")
+        with mock.patch("subprocess.run") as mock_run:
+            mock_run.return_value = mock.MagicMock(returncode=0, stdout=mock_output)
+            every = ["man-pages-1.70", "man-pages-2.00", "man-pages-6.0-rc1", "man-pages-6.00", "man-pages-6.9",
+                     "man-pages-6.9.1", "man-pages-6.10"]
+            # Without a start ref a man-pages repository starts at its first release
+            self.assertEqual(mf.get_version_tags(), every)
+            self.assertEqual(mf.get_version_tags(start_ref="man-pages-6.9", include_pre_releases=False), every[4:])
+            self.assertNotIn("man-pages-6.0-rc1", mf.get_version_tags(include_pre_releases=False))
+
+    def test_version_sequence_from_root_commit_and_tui_listing(self) -> None:
+        from core.FileHandler import MasterFile
+        from core.tui.git_ops import list_version_tags
+        path, shas = self._repo("man-pages", tags={1: "man-pages-6.9", 2: "man-pages-6.10"})
+        subprocess.run(["git", "-C", str(path), "tag", "v3.0-tree"], check=True)
+        mf = MasterFile()
+        mf.set_repo_dir(path)
+        self.assertEqual(mf.get_version_tags(start_ref=shas[0]), [shas[0], "man-pages-6.9", "man-pages-6.10"])
+        self.assertEqual(list_version_tags(path), ["man-pages-6.9", "man-pages-6.10"])
+        self.assertEqual(list_version_tags(path, include_pre_releases=False), ["man-pages-6.9", "man-pages-6.10"])
+
+
 if __name__ == "__main__":
     unittest.main()

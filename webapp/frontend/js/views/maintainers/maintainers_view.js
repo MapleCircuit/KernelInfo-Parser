@@ -226,7 +226,7 @@ export class MaintainersView {
 
     if (this.activeTab === "subsystems") {
       try {
-        const res = await api.getMaintainersOverview(this.currentVersion, query);
+        const res = await this.api.getMaintainersOverview(this.currentVersion, query);
         this.subsystems = res.sections || [];
         this.renderSubsystemsList();
         if (!this.subsystems.length) {
@@ -239,7 +239,7 @@ export class MaintainersView {
       }
     } else if (this.activeTab === "developers") {
       try {
-        const res = await api.getDevelopers(this.currentVersion, {
+        const res = await this.api.getDevelopers(this.currentVersion, {
           query,
           role: this.currentDevRole,
           sort: this.currentDevSort,
@@ -251,7 +251,7 @@ export class MaintainersView {
       }
     } else if (this.activeTab === "credits") {
       try {
-        const res = await api.getCredits(this.currentVersion, query);
+        const res = await this.api.getCredits(this.currentVersion, query);
         this.renderCreditsList(res.credits || res.entries || []);
       } catch (e) {
         listContainer.innerHTML = `<div style="padding:16px;color:var(--accent-red);">Failed: ${escapeHtml(e.message)}</div>`;
@@ -373,7 +373,7 @@ export class MaintainersView {
     detailEl.innerHTML = `<div style="color:var(--text-muted);">Loading subsystem details...</div>`;
 
     try {
-      const res = await api.getMaintainerSection(this.currentVersion, secId);
+      const res = await this.api.getMaintainerSection(this.currentVersion, secId);
       const sec = res.section || res;
 
       detailEl.innerHTML = `
@@ -545,7 +545,7 @@ export class MaintainersView {
     detailEl.innerHTML = `<div style="color:var(--text-muted);">Loading developer profile...</div>`;
 
     try {
-      const p = await api.getPersonProfile(this.currentVersion, emailOrName);
+      const p = await this.api.getPersonProfile(this.currentVersion, emailOrName);
       const stats = p.contribution_stats || {};
       const sections = p.sections || p.subsystems || [];
 
@@ -665,7 +665,7 @@ export class MaintainersView {
       resContainer.innerHTML = `<div style="color:var(--text-muted);">Analyzing patch...</div>`;
 
       try {
-        const matchRes = await api.matchMaintainers(this.currentVersion, text);
+        const matchRes = await this.api.matchMaintainers(this.currentVersion, text);
         const toList = (matchRes.suggested_to || []).map((p) => {
           const str = typeof p === "string" ? p : `${p.name || p.email} <${p.email || ""}> (${p.role || "Maintainer"})`;
           return `<div>• ${escapeHtml(str)}</div>`;

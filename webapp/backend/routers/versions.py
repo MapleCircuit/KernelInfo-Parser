@@ -5,6 +5,7 @@ import copy
 import difflib
 import json
 import logging
+import re
 import subprocess
 import threading
 import time
@@ -14,20 +15,40 @@ from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query, Request, Response
 
-from core.config import DEFAULT_TAG_VIEWS, detect_default_branch, matches_branch_filter
+from core.config import (
+    DEFAULT_TAG_VIEWS,
+    LINUX_PROJECT,
+    MANPAGES_TAG_VIEWS,
+    detect_default_branch,
+    matches_branch_filter,
+)
+from parser.git_ast.release_order import PREFIXED_SERIES, PREFIXED_TAG_RE, parse_tag, release_key
 from webapp.backend.config import (
     get_active_repo_name,
     get_active_repository,
     get_repo_dir,
     list_repositories,
+    repository_project_slug,
     reset_active_repository,
     resolve_repo_path,
     set_active_repository,
 )
-from webapp.backend.database.helpers import finished_ref_sql, get_active_repo_id, hash_hex, safe_decode
+from webapp.backend.database.helpers import (
+    finished_ref_sql,
+    get_active_repo_id,
+    hash_hex,
+    safe_decode,
+)
 from webapp.backend.database.pool import get_db_cursor
 from webapp.backend.security.git import safe_rev
-from webapp.backend.services.catalog_cache import JsonBody, TokenCache, client_etags, digest, dumps, respond
+from webapp.backend.services.catalog_cache import (
+    JsonBody,
+    TokenCache,
+    client_etags,
+    digest,
+    dumps,
+    respond,
+)
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api", tags=["versions"])
@@ -135,6 +156,8 @@ def projects_catalog() -> list[dict[str, Any]]:
     projects = []
     for idx, repo in enumerate(list_repositories()):
         name = repo.get("name") or f"repo{idx}"
+        project = repository_project_slug(repo)
+        default_views = MANPAGES_TAG_VIEWS if project == "man-pages" else DEFAULT_TAG_VIEWS
         db_row = indexed.get(name) or next((r for r in indexed.values() if repo.get("git_url") and safe_decode(r["git_url"]) == repo.get("git_url")), None)
         projects.append({
             "project_id": db_row["project_id"] if db_row and db_row.get("project_id") else idx + 1,
@@ -142,13 +165,14 @@ def projects_catalog() -> list[dict[str, Any]]:
             "name": safe_decode(db_row["project_name"]) if db_row and db_row.get("project_name") else name,
             "repo": name,
             "slug": repo.get("project") or name,
+            "project": project,
             "path": repo.get("path", ""),
             "default_branch": default_branch_of(repo),
             "git_url": repo.get("git_url", ""),
             "indexed": db_row is not None,
             "available": resolve_repo_path(repo).exists(),
             "active": False,
-            "tag_views": repo.get("tag_views") or copy.deepcopy(DEFAULT_TAG_VIEWS),
+            "tag_views": repo.get("tag_views") or copy.deepcopy(default_views),
         })
     return projects
 
@@ -412,6 +436,21 @@ def _is_prerelease(name: str) -> bool:
     return any(m in name for m in PRERELEASE_MARKERS)
 
 
+# `<prefix>X.Y` followed by a suffix release_order does not parse (`man-pages-6.05-a1`, `foo-1.2-beta1`)
+_PREFIXED_HEAD_RE = re.compile(r"^([A-Za-z][A-Za-z0-9_+-]*?)(\d+)\.(\d+)(?=[^\d.]|$)")
+
+
+def release_tag_key(name: str) -> tuple:
+    """Release order of tags (`release_key`, any `<prefix>X.Y[.Z][-rcN]` scheme); a name it does not parse that
+    starts with a prefixed release (`man-pages-6.05-a1`) sorts before that release, other names first."""
+    if parse_tag(name) is not None:
+        return release_key(name)
+    m = _PREFIXED_HEAD_RE.match(name)
+    if m and m.group(1) not in ("v", "V") and not PREFIXED_TAG_RE.match(name):
+        return (1, (PREFIXED_SERIES, m.group(1), int(m.group(2)), int(m.group(3))), 0, 0, 0, name)
+    return release_key(name)
+
+
 def _version_rows(include_rc: bool) -> list[tuple[int, str, str, int, int | None]]:
     """Versions of the active repository as (vid, vname, commit_hash, ref_type, parsed), in catalog order.
 
@@ -464,8 +503,13 @@ def _version_rows(include_rc: bool) -> list[tuple[int, str, str, int, int | None
         # Annotated tags list the peeled commit (%(*objectname)) first; lightweight tags only have %(objectname)
         rows.append((0, tname, parts[2], 1, None))
 
-    # Version order (git versionsort) for tags; other indexed refs (branches, commits) keep DB order at the end
-    order = {line.split()[0]: i for i, line in enumerate(tag_lines)}
+    # Version order for tags: git versionsort for the Linux kernel, release order (release_tag_key) for every
+    # other project, whose `-rc` tags and zero-padded minors (man-pages-6.05) versionsort misplaces; other
+    # indexed refs (branches, commits) keep DB order at the end
+    names = [line.split()[0] for line in tag_lines]
+    if repository_project_slug(get_active_repository()) != LINUX_PROJECT:
+        names.sort(key=release_tag_key)
+    order = {name: i for i, name in enumerate(names)}
     rows.sort(key=lambda row: order.get(row[1], len(order)))
     return rows
 

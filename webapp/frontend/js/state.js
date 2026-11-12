@@ -63,7 +63,12 @@ class GlobalState {
     // and the Commit picker's tag search all narrow to the same set.
     this.branchTags = null;
     this.branchTagsFor = "";
-    this.currentRepo = ""; // configured repository name ("" = server default)
+    // Project (configured repository name, "" = server default) of the header: the active tab's repository,
+    // and the one new tabs open in. Every tab records its own (`tab.repo`), so one session holds tabs of
+    // several projects; the shared API client addresses the active tab's (§5.18).
+    this.currentRepo = "";
+    // Branch scope of the header per repository: switching to a tab of another project restores its own
+    this.selectedBranchByRepo = {};
     // KConfig tabs holding the Kconfig constraint engine. Several may hold it at once: each one
     // resolves its own configuration, and a code tab picks which of them it follows.
     this.kconfigEngineTabIds = [];
@@ -162,6 +167,8 @@ class GlobalState {
   }
 
   emit(event, data) {
+    // The header's project follows the active tab before anyone reacts to the change (§5.18)
+    if (event === "tabs:changed" || event === "pane:activated") this.syncRepoFromActiveTab();
     if (this.subscribers.has(event)) {
       this.subscribers.get(event).forEach((cb) => {
         try {
@@ -257,24 +264,108 @@ class GlobalState {
     this.saveState();
   }
 
-  /** Switch the active repository (project); tabs belong to one repository so the workspace resets. */
-  setRepository(name, defaultVersion) {
-    if (!name || name === this.currentRepo) return;
-    this.currentRepo = name;
-    this.currentVersion = defaultVersion || this.currentVersion;
-    this.selectedVersion = this.currentVersion;
-    this.selectedBranch = ""; // branches belong to one repository
-    this.setBranchTags("", null);
-    this.panes = [{ id: "pane-1", activeTabId: null, tabs: [] }];
-    this.activePaneId = "pane-1";
-    this.splitMode = "single";
-    const hadEngines = this.kconfigEngineTabIds.length > 0;
-    this.kconfigEngineTabIds = []; // the tabs that held them are gone
-    this.kconfigEngines = {};
+  /** Repository of a tab (a tab recorded before tabs carried one belongs to the header's project). */
+  repoOf(tab) {
+    return (tab && tab.repo) || this.currentRepo || "";
+  }
+
+  /** Repository links opened from the active tab follow (its own, else the header's project). */
+  activeRepo() {
+    return this.repoOf(this.getActiveTab());
+  }
+
+  /** Every repository a tab of this session is open in (the header's project first). */
+  openRepos() {
+    const out = new Set(this.currentRepo ? [this.currentRepo] : []);
+    for (const pane of this.panes) for (const t of pane.tabs) if (t.repo) out.add(t.repo);
+    return [...out];
+  }
+
+  /** Make `repo` the header's project, keeping each project's own branch scope. */
+  _enterRepo(repo) {
+    if (this.currentRepo) this.selectedBranchByRepo[this.currentRepo] = this.selectedBranch;
+    this.currentRepo = repo;
+    this.selectedBranch = typeof this.selectedBranchByRepo[repo] === "string" ? this.selectedBranchByRepo[repo] : "";
+    this.setBranchTags("", null); // app.js reads the tags of that project's branch
+  }
+
+  /**
+   * The header's project (and explored revision) follow the active tab: called before every
+   * `tabs:changed` / `pane:activated` is delivered. Emits `repo:synced` when the project changed.
+   */
+  syncRepoFromActiveTab() {
+    const tab = this.getActiveTab();
+    const repo = tab?.repo || "";
+    if (!repo || repo === this.currentRepo) return false;
+    this._enterRepo(repo);
+    const v = GlobalState.refOf(tab.version);
+    if (v) {
+      this.currentVersion = v;
+      this.selectedVersion = v;
+    }
+    this.emit("repo:synced", repo);
     this.saveState();
-    if (hadEngines) this.emit("kconfig:engine:changed", { tabId: "", active: false, engineTabIds: [] });
-    this.emit("layout:changed", { splitMode: this.splitMode, panes: this.panes });
+    return true;
+  }
+
+  /** Header project for new tabs while no tab is open (nothing else changes). */
+  setDefaultRepository(repo, defaultVersion = "") {
+    if (!repo || repo === this.currentRepo) return false;
+    this._enterRepo(repo);
+    const v = GlobalState.refOf(defaultVersion);
+    if (v) {
+      this.currentVersion = v;
+      this.selectedVersion = v;
+    }
+    this.saveState();
+    this.emit("repo:synced", repo);
     this.emit("version:changed", this.currentVersion);
+    return true;
+  }
+
+  /**
+   * Move a tab to another repository at `version` (the header's Project, §5.18), as `setVersion` moves it
+   * to another revision; `patch` sets ("" / null / undefined clears) the fields that address what it shows
+   * there (an explorer's directory). No other tab is touched.
+   */
+  moveTabToRepository(tab, repo, version, patch = {}) {
+    if (!tab || !repo) return false;
+    tab.repo = repo;
+    const v = GlobalState.refOf(version);
+    if (v) tab.version = v;
+    // The tab re-opens at the top: its saved positions belong to the other repository (§5.28)
+    delete tab.scrollTop;
+    delete tab.scrollPositions;
+    for (const [key, value] of Object.entries(patch || {})) {
+      if (value === undefined || value === null || value === "") delete tab[key];
+      else tab[key] = value;
+    }
+    if (tab === this.getActiveTab()) {
+      this.syncRepoFromActiveTab();
+      this.currentVersion = tab.version;
+      this.selectedVersion = tab.version;
+      this.emit("version:changed", this.currentVersion);
+    } else {
+      this.emit("tabs:changed", { paneId: this.activePaneId, activeTabId: this.getActivePane()?.activeTabId || null });
+    }
+    this.saveState();
+    return true;
+  }
+
+  /** Give every tab without a repository `repo` (sessions saved before tabs carried one). */
+  assignTabRepos(repo) {
+    if (!repo) return 0;
+    let n = 0;
+    for (const pane of this.panes) {
+      for (const t of pane.tabs) {
+        if (!t.repo) {
+          t.repo = repo;
+          n += 1;
+        }
+      }
+    }
+    if (n) this.saveState();
+    return n;
   }
 
   /**
@@ -742,12 +833,15 @@ class GlobalState {
   openTab(tabData, targetPaneId = null) {
     const pane = targetPaneId ? this.getPane(targetPaneId) : this.getActivePane();
     if (!pane) return;
+    // The repository the tab belongs to: the one a link names, else the tab it is opened from (§5.18)
+    const repo = (typeof tabData.repo === "string" && tabData.repo) || this.activeRepo();
 
-    // Check if duplicate tab exists (bypassed if tabData.forceNew is true)
+    // Check if duplicate tab exists (bypassed if tabData.forceNew is true); a tab of another project never is one
     const existing = tabData.forceNew
       ? null
       : pane.tabs.find((t) => {
           if (t.type !== tabData.type) return false;
+          if (this.repoOf(t) !== repo) return false;
           if (t.type === "code") return t.path === tabData.path && t.version === tabData.version;
           if (t.type === "explorer") return (t.path || "") === (tabData.path || "") && t.version === tabData.version;
           if (t.type === "kconfig") return t.arch === tabData.arch && t.version === tabData.version && (t.configName || "") === (tabData.configName || "");
@@ -849,13 +943,16 @@ class GlobalState {
       }
     } else {
       const id = "tab-" + Math.random().toString(36).substring(2, 9);
-      // A tab opened from another one inherits that tab's revision, never the header selection
-      const tabVer = GlobalState.refOf(tabData.version) || this.activeVersion();
+      // A tab opened from another one inherits that tab's revision, never the header selection; a tab of
+      // another project without one is left to pick its project's default (man_view.js: the newest tag)
+      const tabVer = GlobalState.refOf(tabData.version) || (repo === this.activeRepo() ? this.activeVersion() : "");
       const newTab = {
         id,
         ...tabData,
+        repo,
         version: tabVer
       };
+      if (!newTab.repo) delete newTab.repo;
       pane.tabs.push(newTab);
       pane.activeTabId = id;
     }
@@ -1023,6 +1120,8 @@ class GlobalState {
     this.selectedBranch = typeof sessionData.selectedBranch === "string" ? sessionData.selectedBranch : "";
     this.setBranchTags("", null); // app.js reads the tags of the adopted session's branch
     if (typeof sessionData.repo === "string") this.currentRepo = sessionData.repo;
+    this.selectedBranchByRepo = sessionData.selectedBranchByRepo && typeof sessionData.selectedBranchByRepo === "object"
+      ? { ...sessionData.selectedBranchByRepo } : {};
     this.splitMode = sessionData.splitMode || "single";
     this.activePaneId = sessionData.activePaneId || "pane-1";
     if (Array.isArray(sessionData.panes) && sessionData.panes.length > 0) {
@@ -1030,6 +1129,8 @@ class GlobalState {
         if (Array.isArray(p.tabs)) {
           p.tabs.forEach((t) => {
             if (!GlobalState.refOf(t.version)) t.version = "v3.0";
+            // A tab saved before tabs carried their repository belongs to the session's project
+            if (!t.repo && this.currentRepo) t.repo = this.currentRepo;
           });
         }
       });
@@ -1134,6 +1235,7 @@ class GlobalState {
         selectedVersion: this.selectedVersion,
         selectedBranch: this.selectedBranch,
         repo: this.currentRepo,
+        selectedBranchByRepo: { ...this.selectedBranchByRepo, ...(this.currentRepo ? { [this.currentRepo]: this.selectedBranch } : {}) },
         kconfigEngineTabIds: this.kconfigEngineTabIds,
         // Only the descriptors: each engine's values live in kconfigProfiles under profileKey
         kconfigEngineProfiles: Object.fromEntries(Object.entries(this.kconfigEngines).map(([id, e]) => [

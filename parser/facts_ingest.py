@@ -12,7 +12,9 @@ Families of facts are stored per Git blob SHA, one row each (`(blob_hash, family
 - family 4 (`kconfig_definitions.FAMILY`): the definitions of a Kconfig blob (`parser/kconfig_ast/kconfig_definitions.py`):
   the webapp's Kconfig history and Compare;
 - family 5 (`doc_labels.FAMILY`): the `.. _label:` targets of a `Documentation/**/*.rst` blob (`parser/doc_labels.py`):
-  the webapp's documentation label index.
+  the webapp's documentation label index;
+- family 6 (`man_facts.FAMILY`): the NAME, `.TH` header, `.so` alias, cross references and SYNOPSIS declarations of
+  a man page blob (`man/manS/name.S` or `manS/name.S`, `parser/man_ast/man_facts.py`): the webapp's man page index.
 
 All of a blob's missing families are read from one text in one pass; the comment/string mask (families 1 and 2) is
 computed once, and only when one of them is requested. A version only extracts the blobs (and families) no earlier
@@ -36,6 +38,7 @@ from parser import include_facts as inc
 from parser import kapi_facts as kf
 from parser import source_facts as sf
 from parser.kconfig_ast import kconfig_definitions as kd
+from parser.man_ast import man_facts as mf
 from parser.source_facts import init_worker
 
 logger = logging.getLogger(__name__)
@@ -43,7 +46,7 @@ logger = logging.getLogger(__name__)
 
 # family -> current format
 FAMILIES: dict[int, int] = {sf.FAMILY: sf.FACTS_FORMAT, kf.FAMILY: kf.KAPI_FORMAT, inc.FAMILY: inc.FORMAT,
-                            kd.FAMILY: kd.FORMAT, dl.FAMILY: dl.FORMAT}
+                            kd.FAMILY: kd.FORMAT, dl.FAMILY: dl.FORMAT, mf.FAMILY: mf.FORMAT}
 _MASKED = {sf.FAMILY, kf.FAMILY}
 SUFFIXES = (".c", ".h", ".S", ".s", ".rs")
 MAX_TEXT = 4 << 20   # larger files are stored without facts (generated tables, firmware)
@@ -181,7 +184,8 @@ def _is_asm(path: str, text: str) -> bool:
 
 def families_of(path: str) -> tuple[int, ...]:
     """The fact families of a file: calls, Kernel API and includes for C and Rust sources and headers;
-    Kernel API and includes for assembly; definitions for Kconfig files; labels for Documentation `.rst` files."""
+    Kernel API and includes for assembly; definitions for Kconfig files; labels for Documentation `.rst` files;
+    man facts for man pages."""
     if path.endswith((".c", ".h")):
         return (sf.FAMILY, kf.FAMILY, inc.FAMILY)
     if path.endswith(".rs"):
@@ -192,6 +196,8 @@ def families_of(path: str) -> tuple[int, ...]:
         return (kd.FAMILY,)
     if dl.applies(path):
         return (dl.FAMILY,)
+    if mf.applies(path):
+        return (mf.FAMILY,)
     return ()
 
 
@@ -245,9 +251,11 @@ def _encoded(family: int, text: str, masked: str | None, path: str = "") -> byte
             return kd.encode(kd.extract(text))
         if family == dl.FAMILY:
             return dl.encode(dl.extract(text))
+        if family == mf.FAMILY:
+            return mf.encode(mf.extract(text))
     except (RecursionError, ValueError, IndexError):
         pass
-    module = {sf.FAMILY: sf, kf.FAMILY: kf, inc.FAMILY: inc, kd.FAMILY: kd, dl.FAMILY: dl}[family]
+    module = {sf.FAMILY: sf, kf.FAMILY: kf, inc.FAMILY: inc, kd.FAMILY: kd, dl.FAMILY: dl, mf.FAMILY: mf}[family]
     return module.encode(None)
 
 

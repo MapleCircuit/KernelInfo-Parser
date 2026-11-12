@@ -76,7 +76,7 @@ export class OutlinePanel {
       indexed = true;
     } else {
       try {
-        const res = await api.getOutline(ed.currentVersion, ed.currentFilePath);
+        const res = await (ed.api || api).getOutline(ed.currentVersion, ed.currentFilePath);
         items = res?.items || [];
         indexed = Boolean(res?.indexed);
       } catch {

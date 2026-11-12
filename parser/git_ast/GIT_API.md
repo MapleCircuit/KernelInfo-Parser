@@ -10,10 +10,10 @@ multi-person trailer contributions, merge lineages, and commit-to-code tag bridg
 - **§2**: Relational Schema Mapping (Tables 15, 21–24, 30–33, 63–64) [L51-L110]
 - **§3**: Contributor Taxonomy & Structured Trailers [L111-L150]
 - **§4**: Diff Hunk Extraction & Line Coordinate Tag Bridging [L151-L176]
-- **§5**: Multi-Tree DAG Ingestion & Content Deduplication [L177-L210]
-- **§6**: Performance Invariants & Architectural Rules [L211-L278]
-- **§7**: Release Statistics & Release Order [L279-L293]
-- **§8**: Commit Relations (`commit_relations.py`) [L294-L316]
+- **§5**: Multi-Tree DAG Ingestion & Content Deduplication [L177-L213]
+- **§6**: Performance Invariants & Architectural Rules [L214-L281]
+- **§7**: Release Statistics & Release Order [L282-L314]
+- **§8**: Commit Relations (`commit_relations.py`) [L315-L337]
 
 ---
 
@@ -186,6 +186,9 @@ For Linux, this resolves to root commit `1da177e4c3f41524e886b7f1b8a0c1fc7321cac
 - Trees that share the identical root commit hash are registered under the same `m_git_network` record.
 - Distinct repositories pointing to that network are tracked individually in `m_repository(repo_id,
   network_id, name, git_url, default_branch)`.
+- A new network belongs to the `m_project` of the repository's configured `project` slug (`linux`
+  "Linux Kernel", `man-pages` "Linux man-pages" for the man-pages tree rooted at
+  `fea681dafb1363a154b7fc6d59baa83d2a9ebc5c`) and is named `<slug>-network` (`core/API.md` §7.1.1).
 
 ### 5.2. Complete Git DAG Ingestion (`ingest_git_dag`)
 The Git commit DAG is ingested upfront before file AST parsing:
@@ -279,16 +282,34 @@ Git trees are enumerated via `git ls-tree -r {version}` into 20-byte SHA-1 diges
 ## 7. Release Statistics & Release Order (`release_stats.py`, `release_order.py`)
 
 - **Release order** (`release_order.py`, pure, shared with the webapp's release index, `webapp/API.md` §2.17):
-  `parse_tag()`, `release_key()` (`v3.0 < v3.0.1 < v3.1-rc1 < v3.1 < v3.1.1`; v2.6.x stable updates are the
-  fourth number), `previous_in()`, `final_of()`, `series_name()`, and `release_ranges(tags)` — every release
-  tag with its segment base (previous tag of its chain: mainline with release candidates, or its stable
-  series) and its report range base (`previous_in()`), in one linear pass.
+  release tags of any project, in two schemes, each tag carrying its **family** (`parse_tag()["family"]`,
+  `family_of()`):
+  - **Kernel scheme** (family `""`, `KERNEL_FAMILY`): `vX.Y[.Z][-rcN|-preN]` and bare `X.Y[.Z]`, with v2.6.x
+    stable updates as the fourth number (series `(2, 6, x)`), `(X, Y, 0)` series from v3.0 on, and daily
+    `next-YYYYMMDD` tags (series `(NEXT_SERIES, year, month)`, kind `next`).
+  - **Prefixed scheme** (family = the prefix): `<prefix>X.Y[.Z][-rcN|-preN]` (`PREFIXED_TAG_RE`: the prefix
+    starts with a letter and holds no dot, `v` alone being the kernel scheme), e.g. `man-pages-6.9.1`,
+    `foo-1.2.3`, `release_2.0-rc1`. The series is `(PREFIXED_SERIES, prefix, X, Y)` compared as numbers
+    (`man-pages-6.04` and `man-pages-6.4` name the same series), Z the point release (kind `stable`); a
+    release candidate of a point release is not a release.
+  - `release_tag_names(names)`: the release tags of a repository — the kernel scheme's when any name uses it
+    (prefixed names in a kernel tree, such as `for-linus-6.1` pull-request tags, are not releases), else every
+    prefixed release (each prefix its own family).
+  - `release_key()` (`v3.0 < v3.0.1 < v3.1-rc1 < v3.1 < v3.1.1`, `foo-1.9 < foo-1.10-rc1 < foo-1.10 <
+    foo-1.10.1`; kernel tags before prefixed ones, prefixes alphabetically), `previous_in()` (within the tag's
+    family), `final_of()` (a prefixed release candidate leads to the final tag of its series whatever its
+    spelling: `man-pages-6.0-rc1` → `man-pages-6.00`), `series_name()` (a name parsing back to the series:
+    `v3.1`, `v2.6.39`, `man-pages-6.4`), and `release_ranges(tags)` — every release tag with its segment base
+    (previous tag of its chain: the mainline of its family with release candidates, or its stable series) and
+    its report range base (`previous_in()`), in one linear pass; every family has chains of its own.
 - **Release statistics** (`release_stats.py`): summarizes every release tag into `m_release_segment`,
   `m_release_person`, `m_person_first_release` (`core/API.md` §4, §10): one `git log` per segment, merges
   included (`%H`/`%P` with the message; `summarize_records()` counts a record with two or more parents as a
   merge and skips it for commits and people), read with `iter_trailers()`, plus `git diff --shortstat` over
   the report range; every commit of the segment also gets its `m_commit_release` row (`FORMAT = 2`);
-  incremental per tag. `main.processing_release_stats()` runs it at the start and end of a run; `python3
+  incremental per tag. Release tags are `release_order.release_tag_names()` of the repository's commit-pointing
+  tags, so every project (the Linux kernel, the man-pages, any `<prefix>X.Y` scheme) is summarized.
+  `main.processing_release_stats()` runs it at the start and end of every run, whatever the project; `python3
   main.py --release-stats` alone.
 
 ## 8. Commit Relations (`commit_relations.py`)

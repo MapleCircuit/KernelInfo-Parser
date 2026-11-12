@@ -64,7 +64,8 @@ SCHEMA ENTITY-RELATIONSHIP GRAPH:
 
 7. Source facts and CVEs (read by the webapp's source index and CVE pages):
    m_blob_facts (blob_hash, family, format, data)                 -- per-blob facts: calls/ops tables (1), Kernel API (2),
-                                                                     includes (3), Kconfig definitions (4), doc labels (5)
+                                                                     includes (3), Kconfig definitions (4), doc labels (5),
+                                                                     man pages (6)
    m_cve_source (name, layout, head, format, records, built_at)   -- the CVE list ingested
      └── m_cve (cve_id, kind, published, updated, score, kev, record_path, title, data)
            ├── m_cve_commit (commit_hash, role, cve_id)
@@ -1328,7 +1329,10 @@ m_checkpoint_base = Table(
 #       family 4: parser/kconfig_ast/kconfig_definitions.py extract() of a Kconfig blob ({symbol: [facts]}, help
 #                 texts included), read by the webapp's Kconfig history and Compare;
 #       family 5: parser/doc_labels.py extract() of a Documentation/**/*.rst blob ([[label, line, title]]),
-#                 read by the webapp's documentation label index.
+#                 read by the webapp's documentation label index;
+#       family 6: parser/man_ast/man_facts.py extract() of a man page blob (man/manS/name.S or manS/name.S:
+#                 NAME names and summary, .TH header, .so target, cross references, SYNOPSIS functions, headers
+#                 and identifiers; zlib JSON), read by the webapp's man page index.
 #     Every family stores empty data for a blob without anything to record. --backfill-facts fills them for
 #     versions ingested earlier (core/backfills.py).
 # -----------------------------------------------------------------------------

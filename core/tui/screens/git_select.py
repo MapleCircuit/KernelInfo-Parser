@@ -1,11 +1,11 @@
 """core/tui/screens/git_select.py - Repository selection hub in front of the Git Repository Manager.
 
 Lists every repository the Git screens operate on (`repository_candidates()`: configured git
-repositories, the `<repos_dir>/linux` clone target and the CVE catalog `cve.repo_dir`) with its
-clone state and remote count. `Enter` opens `GitManagerScreen` on the highlighted repository;
-the hub also clones the Linux tree or the CVE catalog, adds another repository (clone from a URL
-into `<repos_dir>/<name>`, or register an existing local clone) and fetches every remote of every
-cloned repository in one pass.
+repositories, the `<repos_dir>/linux` and `<repos_dir>/man-pages` clone targets and the CVE catalog
+`cve.repo_dir`) with its clone state and remote count. `Enter` opens `GitManagerScreen` on the
+highlighted repository; the hub also clones the Linux tree, the man-pages or the CVE catalog, adds
+another repository (clone from a URL into `<repos_dir>/<name>`, or register an existing local clone)
+and fetches every remote of every cloned repository in one pass.
 """
 
 from __future__ import annotations
@@ -29,8 +29,11 @@ from core.tui.process_view import ProcessResult, run_streaming_command
 from core.tui.screens.base import BaseScreen
 from core.tui.screens.git_manager import (
     BRANCH_HINT,
+    CLONE_KINDS,
+    CLONE_LABELS,
     KIND_CVE,
     KIND_LINUX,
+    KIND_MANPAGES,
     URL_RULE,
     GitManagerScreen,
     RepoCandidate,
@@ -43,7 +46,7 @@ from core.tui.theme import PAIR_ERROR, PAIR_HEADER, PAIR_MUTED, PAIR_SUCCESS, ge
 from core.tui.widgets import ScrollableList, StatusBar
 
 MIN_W, MIN_H = 50, 12
-KIND_LABELS = {KIND_LINUX: "linux", KIND_CVE: "cve"}
+KIND_LABELS = {KIND_LINUX: "linux", KIND_MANPAGES: "man", KIND_CVE: "cve"}
 DIRNAME_RULE = "Directory names start with a letter or digit and use only letters, digits, '.', '_' or '-'."
 
 
@@ -64,7 +67,7 @@ def _render_row(row: RepoRow) -> str:
 
 
 class GitRepoSelectScreen(BaseScreen):
-    """Pick the repository to manage, clone Linux / CVE / other repositories, and fetch everything."""
+    """Pick the repository to manage, clone Linux / man-pages / CVE / other repositories, and fetch everything."""
 
     VIEW_KEY = "git_select"
 
@@ -161,12 +164,12 @@ class GitRepoSelectScreen(BaseScreen):
         return screen
 
     def clone_selected(self) -> bool:
-        """Clone the highlighted Linux or CVE target when it is missing."""
+        """Clone the highlighted Linux, man-pages or CVE target when it is missing."""
         row = self.selected_row()
         if row is None:
             return False
         cand = row.candidate
-        if cand.kind not in (KIND_LINUX, KIND_CVE) or cand.path.exists():
+        if cand.kind not in CLONE_KINDS or cand.path.exists():
             self.status_bar.set_message(
                 f"Nothing to clone for '{cand.name}' (press N to clone another repository).", color=PAIR_ERROR)
             return False
@@ -280,8 +283,8 @@ class GitRepoSelectScreen(BaseScreen):
     def _shortcuts(self) -> list[tuple[str, str]]:
         keys = [("Enter", "Manage"), ("A", "Fetch all"), ("N", "Add repo")]
         row = self.selected_row()
-        if row and row.candidate.kind in (KIND_LINUX, KIND_CVE) and not row.candidate.path.exists():
-            keys.insert(1, ("C", "Clone CVE" if row.candidate.kind == KIND_CVE else "Clone Linux"))
+        if row and row.candidate.kind in CLONE_KINDS and not row.candidate.path.exists():
+            keys.insert(1, ("C", CLONE_LABELS[row.candidate.kind]))
         return [*keys, ("Esc", "Back"), ("↑/↓", "Navigate")]
 
     def draw(self) -> None:

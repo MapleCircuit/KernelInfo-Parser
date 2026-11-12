@@ -91,9 +91,10 @@ def _release_pass(tag: str) -> list[dict[str, Any]]:
 
 # ------------------------------------------------------------------------------- first-time authors
 
-def author_first_seen(progress: Callable | None = None) -> dict[str, int]:
-    """identity -> time of its first commit on the mainline chain (one pass over history, cached per head)."""
-    releases = rs.releases("mainline")
+def author_first_seen(progress: Callable | None = None, family: str = rs.KERNEL_FAMILY) -> dict[str, int]:
+    """identity -> time of its first commit on the mainline chain of a tag family (`""`: the kernel scheme; one
+    pass over history, cached per head)."""
+    releases = [t for t in rs.releases("mainline") if rs.family_of(t) == family]
     if not releases:
         return {}
     head = rs.tag_commits()[releases[-1]]
@@ -186,8 +187,9 @@ def compute_release_stats(tag: str, progress: Callable | None = None) -> dict[st
     m_files = re.search(r"(\d+) files? changed", stat)
     m_add = re.search(r"(\d+) insertions?", stat)
     m_del = re.search(r"(\d+) deletions?", stat)
-    mainline = rs.parse_tag(tag)["kind"] == "mainline"
-    first_seen = author_first_seen(progress) if mainline else {}
+    p = rs.parse_tag(tag)
+    mainline = p["kind"] == "mainline"
+    first_seen = author_first_seen(progress, p["family"]) if mainline else {}
     names: dict[str, tuple[str, str]] = {}
     authors: Counter = Counter()
     roles = {k: Counter() for k in _ROLE_NAMES.values()}
@@ -220,21 +222,23 @@ def compute_release_stats(tag: str, progress: Callable | None = None) -> dict[st
 
 
 def _release_range(tag: str) -> dict[str, Any] | None:
-    """{range_base, kind, tags: {tag on the release's chain in range_base..tag: (segment base)}} from Git's tags."""
+    """{range_base, kind, tags: {tag on the release's chain in range_base..tag: (segment base)}} from Git's tags
+    (the chain of the release's tag family: a repository may tag several prefixed families)."""
     tags = rs.tag_commits()
     hit = _RANGES.get("ranges")
     if hit is None or hit[0] is not tags:
         all_ranges = release_ranges(tags)
-        hit = (tags, {r["tag"]: r for r in all_ranges}, {r["tag"]: (rs.release_key(r["tag"]), rs.parse_tag(r["tag"])["series"]) for r in all_ranges})
+        hit = (tags, {r["tag"]: r for r in all_ranges},
+               {r["tag"]: (rs.release_key(r["tag"]), (p := rs.parse_tag(r["tag"]))["series"], p["family"]) for r in all_ranges})
         _RANGES["ranges"] = hit
     _, ranges, keys = hit
     r = ranges.get(tag)
     if r is None:
         return None
     lo = rs.release_key(r["range_base"]) if r["range_base"] else None
-    hi, series = keys[tag]
+    hi, series, family = keys[tag]
     members = {t: x["segment_base"] for t, x in ranges.items()
-               if x["kind"] == r["kind"] and keys[t][0] <= hi and (lo is None or keys[t][0] > lo)
+               if x["kind"] == r["kind"] and keys[t][2] == family and keys[t][0] <= hi and (lo is None or keys[t][0] > lo)
                and (r["kind"] == "mainline" or keys[t][1] == series)}
     return {"range_base": r["range_base"], "kind": r["kind"], "tags": members}
 
@@ -546,7 +550,7 @@ def _pull_threads(commit_ids: list[int]) -> dict[int, dict[str, Any]]:
 def merge_window(tag: str, wait: float = 0.0) -> dict[str, Any]:
     _check_release(tag)
     if not rs.parse_tag(tag)["final"]:
-        raise HTTPException(status_code=400, detail="A merge window belongs to a release (vX.Y), not to an -rc or a stable update.")
+        raise HTTPException(status_code=400, detail="A merge window belongs to a release (vX.Y, <prefix>X.Y), not to an -rc or a stable update.")
     sha = rs.tag_commits()[tag]
     ck = f"{get_active_repo_name()}|mw|{REPORT_FORMAT}|{sha}"
     return _job(f"insights:{ck}", lambda p: compute_merge_window(tag, p), ck, wait)
@@ -589,7 +593,9 @@ HEALTH_CHUNK = 2000
 
 
 def _health_window(tag: str, window: int) -> list[str]:
-    finals = [t for t in rs.releases("mainline") if rs.parse_tag(t)["final"] and rs.release_key(t) <= rs.release_key(tag)]
+    family = rs.family_of(tag)
+    finals = [t for t in rs.releases("mainline") if (p := rs.parse_tag(t))["final"] and p["family"] == family
+              and rs.release_key(t) <= rs.release_key(tag)]
     return finals[-window:]
 
 

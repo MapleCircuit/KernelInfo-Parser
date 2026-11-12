@@ -5,11 +5,15 @@ through core.config with strict precedence:
     CLI Flags > Environment Variables > config.json > Built-in Defaults
 """
 from __future__ import annotations
+
+import threading
 from contextvars import ContextVar
 from pathlib import Path
-import threading
 from typing import Any
+
 from core.config import (
+    LINUX_PROJECT,
+    MANPAGES_PROJECT,
     get_db_config,
     get_default_repo_path,
     get_repositories_config,
@@ -35,6 +39,25 @@ def get_active_repository() -> dict[str, Any]:
     """Repository entry for the current request (the configured default when none was selected)."""
     repo = _ACTIVE_REPO.get() or get_repository()
     return repo or {"name": "linux", "path": str(LINUX_REPO_DIR)}
+
+
+def repository_project_slug(repo: dict[str, Any] | None) -> str:
+    """Project slug of a repositories[] entry: `man-pages` for the Linux man-pages (its `project`, else its
+    name, root commit or URL, `core.config.is_manpages_repository`), else its `project` (default `linux`)."""
+    from core.config import is_manpages_repository
+
+    entry = repo or {}
+    project = str(entry.get("project") or "").strip()
+    if project == MANPAGES_PROJECT or is_manpages_repository(
+        str(entry.get("name") or ""), str(entry.get("git_url") or ""), str(entry.get("root_commit") or "")
+    ):
+        return MANPAGES_PROJECT
+    return project or LINUX_PROJECT
+
+
+def is_manpages_entry(repo: dict[str, Any] | None) -> bool:
+    """True for the repositories[] entry of a Linux man-pages clone."""
+    return repository_project_slug(repo) == MANPAGES_PROJECT
 
 
 def get_active_repo_name() -> str:

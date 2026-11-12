@@ -5,18 +5,18 @@ Dense architectural contract and state interaction reference across `globalstuff
 agents.
 
 ## Table of Contents
-- **§1**: Global Runtime & Type Subsystem (`core/globalstuff.py`) [L23-L211]
-- **§2**: Filesystem & Git Subsystem (`core/FileHandler.py`) [L212-L280]
-- **§3**: Runtime State & Multiprocessing IPC (`core/GreatProcessor.py`) [L281-L472]
-- **§4**: Relational Database Schema Registry (`core/DBLayout.py`, `core/ingest_state.py`, `core/checkpoints.py`) [L473-L660]
-- **§5**: Data Staging, Routing & Reference Resolution (`core/TableHandling.py`) [L661-L820]
-- **§6**: End-to-End Inter-Module Execution Lifecycle [L821-L962]
-- **§7**: Configuration, SSH Port Forwarding & TUI (`core/config.py`, `core/ssh_tunnel.py`, `core/tui/`) [L963-L1254]
-- **§8**: Mailing List Commit Resolver (`parser/mailing_list/`) [L1255-L1503]
-- **§9**: CVE List Ingestion (`parser/cve/`) [L1504-L1536]
-- **§10**: Release Statistics (`parser/git_ast/release_stats.py`) [L1537-L1590]
-- **§11**: Distributed Multi-Computer Parsing (`core/distributed.py`) [L1591-L1715]
-- **§12**: Backfills of Derived Tables (`core/backfills.py`) [L1716-L1751]
+- **§1**: Global Runtime & Type Subsystem (`core/globalstuff.py`) [L23-L212]
+- **§2**: Filesystem & Git Subsystem (`core/FileHandler.py`) [L213-L285]
+- **§3**: Runtime State & Multiprocessing IPC (`core/GreatProcessor.py`) [L286-L477]
+- **§4**: Relational Database Schema Registry (`core/DBLayout.py`, `core/ingest_state.py`, `core/checkpoints.py`) [L478-L665]
+- **§5**: Data Staging, Routing & Reference Resolution (`core/TableHandling.py`) [L666-L825]
+- **§6**: End-to-End Inter-Module Execution Lifecycle [L826-L970]
+- **§7**: Configuration, SSH Port Forwarding & TUI (`core/config.py`, `core/ssh_tunnel.py`, `core/tui/`) [L971-L1290]
+- **§8**: Mailing List Commit Resolver (`parser/mailing_list/`) [L1291-L1539]
+- **§9**: CVE List Ingestion (`parser/cve/`) [L1540-L1573]
+- **§10**: Release Statistics (`parser/git_ast/release_stats.py`) [L1574-L1634]
+- **§11**: Distributed Multi-Computer Parsing (`core/distributed.py`) [L1635-L1762]
+- **§12**: Backfills of Derived Tables (`core/backfills.py`) [L1763-L1798]
 
 ---
 
@@ -150,7 +150,8 @@ agents.
   - `T_ASM = 4`: Architecture assembly source (`.S`, `.s`).
   - `T_MAINTAINERS = 5`: Kernel subsystem maintainer directory (`MAINTAINERS`).
   - `T_CREDITS = 6`: Kernel contributor biographies (`CREDITS`).
-  - `T_RAW = 7`: Fallback raw/unparsed text file (Documentation, README, licenses, build scripts).
+  - `T_RAW = 7`: Fallback raw/unparsed text file (Documentation, README, licenses, build scripts, the man pages of
+    the Linux man-pages repository).
 - **Helper Classes**:
   - `PointerGetter(joins)`: Iterator extracting `(repeat_count, pointer)` sequentially from `JoinsType`.
     - `get_first_pointer() -> PointerType`: Root table pointer.
@@ -264,8 +265,12 @@ Manages RAMDISK temporary working trees and Git repository extraction.
     included by default (`include_pre_releases=None` → `True`, config `parser.include_pre_releases`, default
     `true`), so a run walks e.g. `v3.0 → v3.1-rc1 … v3.1-rc10 → v3.1`; `--no-rc` / `--releases-only` (or
     `"include_pre_releases": false`) keeps final releases only. Canonical release tags are filtered by
-    matching `^v?\d+(\.\d+)*(?:-(?:rc|alpha|beta|pre)\d*)?$`, strictly ignoring non-release topic tags (e.g.
-    `assoc-array-fixes`) as well as `-tree` tags (which point at trees, not commits). When `start_ref` is not
+    `_VERSION_TAG_RE` (kernel tags `^v?\d+(\.\d+)*(?:-(?:rc|alpha|beta|pre)\d*)?$` and `next-YYYYMMDD`),
+    strictly ignoring non-release topic tags (e.g. `assoc-array-fixes`) as well as `-tree` tags (which point at
+    trees, not commits). A repository without any kernel-scheme tag uses its prefixed releases instead
+    (`parser/git_ast/release_order.release_tag_names()`: `man-pages-6.9.1`, `foo-1.2-rc1`), sorted by
+    `release_key()`, and without `start_ref` its sequence starts at its first release; otherwise it starts at
+    `v3.0`. When `start_ref` is not
     a listed tag but resolves to a commit (e.g. the repository's first commit), `_commit_start_sequence()`
     returns `[start, *tags containing start]` in version order; a tag pointing exactly at `start` (e.g.
     `v2.6.12-rc2` on Linux's root commit) replaces the raw SHA as the first snapshot name.
@@ -826,8 +831,9 @@ Comprehensive unit testing and behavioral verification of `TableHandling.py` is 
 --------------------------------------------------------------------------------------------------
 MasterFile (MF)                   GreatProcessor (gp)               TableEngine (G.TE) / DB
   │                                       │                                 │
-  ├─ resolve_git_network_and_repo() ─────►│ Ingests m_project, m_git_network (root_commit_hash),
-  │                                       │ and m_repository for target git tree
+  ├─ resolve_git_network_and_repo() ─────►│ Ingests m_project (slug = repositories[].project, §7.1.1),
+  │                                       │ m_git_network (root_commit_hash, `<slug>-network`) and
+  │                                       │ m_repository for target git tree; sets gp.project_slug
   ├─ ingest_git_dag(version_or_ref) ─────►│ Registers commit DAG, parents (m_commit_parent),
   │                                       │ contributors, and m_git_ref (m_v_main); gp.VID = head_cid
   │                                       │ and, for the new commits, m_commit_relation / m_commit_link
@@ -949,7 +955,9 @@ Main Process (STEP 6.1+: Post-Processing Subsystems) TableEngine (G.TE)         
   │  ├─ processing_maintainer_files(version) ────►│                                 │
   │  ├─ processing_kbuild(version) ──────────────►│                                 │
   │  ├─ processing_arch_layouts(version) (Step 6.8: m_arch_root -> shared m_arch_layout rows, raw SQL) ──►│
-  │  └─ processing_source_facts(version) (Step 6.9: m_blob_facts the database lacks, families 1-5) ──►│
+  │  ├─ processing_source_facts(version) (Step 6.9: m_blob_facts the database lacks, families 1-6) ──►│
+  │  └─ Kernel-only steps (processing_kbuild, processing_maintainer_files, processing_arch_layouts) return
+  │     at once for a project that is not a kernel tree (kernel_steps_apply(): gp.project_slug "man-pages")
   │                                               │                                 │
   ├─ Final Teardown Commit:                       │                                 │
   │  └─ G.TE.commit_all(update_in_mem_indexes=False) ──────────────────────────────►│
@@ -1017,15 +1025,36 @@ Main Process (STEP 6.1+: Post-Processing Subsystems) TableEngine (G.TE)         
   `get_parser_config()`, `get_mailing_list_config()`, `get_ssh_tunnel_config(feature="database")`,
   `get_workspace_config()`, `sync_environ(cfg)`, `scoped_environ(cfg)`, `resolve_unix_socket(socket_path, host)`,
   `matches_branch_filter(branch, branch_filter)`, `find_repository_branches(repo, branch_filter,
-  default_branch)`, `update_repository_branches(name_or_path, write=True)`. Constants: `DEFAULT_CONFIG`,
-  `DEFAULT_BRANCH_FILTER`, `DEFAULT_TAG_VIEWS`, `REPOSITORY_KEYS`.
+  default_branch)`, `update_repository_branches(name_or_path, write=True)`, `project_display_name(slug)`,
+  `is_kernel_project(slug)`, `repository_project(entry)`, `is_manpages_repository(name, git_url, root_commit)`.
+  Constants: `DEFAULT_CONFIG`, `DEFAULT_BRANCH_FILTER`, `DEFAULT_TAG_VIEWS`, `REPOSITORY_KEYS`, `LINUX_PROJECT`,
+  `MANPAGES_PROJECT`, `PROJECT_DISPLAY_NAMES`, `NON_KERNEL_PROJECTS`, `MANPAGES_ROOT_COMMIT`,
+  `MANPAGES_BRANCH_FILTER`, `MANPAGES_TAG_VIEWS`.
 
 ### 7.1.1. Repository Auto-Detection & Selection
 - `find_repository_dirs()` lists Git repositories (work trees, gitfiles, or bare repositories) directly under
   `workspace.repos_dir`; `detect_repository(path)` describes one (`git symbolic-ref` for the branch, falling
   back to `origin/HEAD`, then `main`/`master`; `remote.origin.url`; `rev-list --max-parents=0 --first-parent
   <branch>` for `root_commit`; `find_repository_branches()` for `branches` matching `branch_filter`). Results
-  are cached per path for the process.
+  are cached per path for the process. `project` is the directory name, except for a clone rooted at
+  `LINUX_ROOT_COMMIT` (`1da177e4c3f4…`, project `linux` whatever its directory name) and the Linux man-pages.
+- **Linux man-pages** (`is_manpages_repository()`): a clone whose root commit is `MANPAGES_ROOT_COMMIT`
+  (`fea681dafb1363a154b7fc6d59baa83d2a9ebc5c`), whose directory is `man-pages`, or whose `origin` URL ends in
+  `/man-pages.git` (or `/man-pages`) is detected as project `man-pages`: `default_branch` `master` when no
+  branch is checked out, `start_ref` = `root_commit` (tagged `man-pages-1.70`), `branch_filter`
+  `MANPAGES_BRANCH_FILTER` (`master` only), and `tag_views` `MANPAGES_TAG_VIEWS` (one view grouping
+  `^(man-pages-\d+)(\..*)$` by major release). Other repositories are detected as described above.
+  `config.example.json` lists both the `linux` and the `man-pages` entries.
+- **Projects** (`m_project`): `main.resolve_git_network_and_repo()` registers each repository under the slug of
+  its entry's `project` (`main.repo_project_slug()`: else `man-pages` for a tree rooted at
+  `MANPAGES_ROOT_COMMIT`, else `linux`), named by `project_display_name()` ("Linux Kernel" for `linux`,
+  "Linux man-pages" for `man-pages`, otherwise the slug); a new network is named `<slug>-network`, and a tree
+  whose root commit already has a network reuses it. Projects in `NON_KERNEL_PROJECTS` (`man-pages`) are
+  parsed like any tree (their pages are `T_RAW` files) but skip the kernel-only work: Kbuild rules, MAINTAINERS
+  matching and ARCH layouts per version (§6), the CVE list ingestion and its commit resolution at start (§9),
+  the automatic Kbuild backfill (§12). The tag-driven steps run for every project: release statistics (§10)
+  and the master role's delegation of stable / `next` chains (§11), both from the repository's own release
+  tags (`parser/git_ast/release_order.release_tag_names()`).
 - `detect_start_ref(repo, root_commit, branches)` picks the first version to parse: among the first-parent
   roots of the default branch and of every `history/*` branch, the root whose release tag sorts first,
   named by that tag (Linux with the bootlin `linux-history` remote: `0.01`, root of
@@ -1128,8 +1157,8 @@ Main Process (STEP 6.1+: Post-Processing Subsystems) TableEngine (G.TE)         
   - **Terminal state restore (`core/tui/app.py` `TerminalState`)**: `run_config_tui_launch()` saves the tty attributes and the dispositions of `SIGTSTP`, `SIGCONT`, `SIGWINCH`, `SIGINT`, `SIGTERM`, `SIGHUP` and `SIGQUIT` before `curses.wrapper` starts, and restores both as soon as it returns (normally or with an error), before the captured output is replayed. ncurses' `initscr()` installs C-level handlers for these signals that `endwin()` leaves in place; restoring the dispositions keeps a later `SIGTSTP`/`SIGCONT` (Ctrl+Z, `fg`) from switching the pipeline's terminal back to curses program mode (`ONLCR` off).
   - **View state**: `TUIApp.view_state` maps a screen key to its UI state (highlighted rows, focused list). `BaseScreen.remember_view(key, **state)` / `recall_view(key)` store and read it, so a screen re-created from the main menu reopens on the same rows.
   - `MainMenuScreen`: Top-level menu with hotkeys `[1-9, S, R, P, Q]` (`HOTKEYS`, case-insensitive; `Esc` = `Q`): the configuration screens (`1`-`4`), `Run Diagnostics` (`5`), `Git Repository Manager` (`6`, opens `GitRepoSelectScreen`), `Parse Specific Versions / Tags` (`7`), `Table Reset` (`8`), `DB Content Viewer` (`9`), `Save Configuration` (`S`, described as "Saves to Active Config File": writes `app.config_path`, the Active File shown in the header), `Save & Run Pipeline` (`R`, `request_launch(save=True)`), `Run Pipeline (saved config.json)` (`P`, `request_launch()` without saving; with unsaved edits it first confirms that they are discarded), and `Exit` (`Q`). Items take two rows when the list fits the menu box and one row otherwise; the list scrolls to keep the selection visible, with `↑`/`↓` markers on the box border.
-  - `GitRepoSelectScreen` (`core/tui/screens/git_select.py`): repository hub in front of `GitManagerScreen`. It lists `repository_candidates()` (`core/tui/screens/git_manager.py`): the configured `repositories[]` entries that are git repositories, then the clone target `<workspace.repos_dir>/linux` (kind `linux`) and the CVE catalog `cve.repo_dir` (kind `cve`; relative to the project root, empty means `cvelistV5`) unless a configured entry already has that path; each row shows name, kind, clone state (remote count or "not cloned") and path. Keys: `Enter`/`→` pushes `GitManagerScreen(repo_path=...)` on the highlighted row; `c` clones a missing `linux` or `cve` row (same flow as the manager's `c`); `n` adds another repository, either `Clone URL` (URL prompt, `https://`/`git://` only, then a directory-name prompt defaulting to `repo_dirname_from_url()`, validated by `is_valid_repo_dirname()`; clones into `<workspace.repos_dir>/<name>`, which must not exist) or `Add local` (path of an existing git repository, relative paths under the project root); both register it in `repositories[]` (`detect_repository()`, deduplicated by path, `is_dirty = True`). `a` fetches every cloned repository that has remotes in turn with `fetch_command(path, None)` (`git fetch --progress --tags --all`: every branch of every remote), each through `run_streaming_command()`; a cancel stops the pass and the status bar reports fetched, failed and not-started repositories. `Esc` returns. The highlighted path persists in `view_state["git_select"]`; rows are re-read on every return from the manager.
-  - `GitManagerScreen` (`core/tui/screens/git_manager.py`): Git repository manager for one repository at a time, over the same `repository_candidates()`; it opens on its `repo_path` argument, else the remembered repository, else `linux`, and `r`/`R` cycles forward/back. The list shows the repository's remotes (name and fetch URL). Keys: `c` clones the current `linux` or `cve` candidate when its directory is missing (`clone_current()`). For `linux`, a URL prompt defaults to `DEFAULT_LINUX_URL`, then a download-size confirmation, and the clone is registered in `repositories[]` (`detect_repository()`, deduplicated by path, `is_dirty = True`). For `cve`, a dialog offers `cvelistV5` (default, `DEFAULT_CVE_URL`), `vulns.git` (`KERNEL_CVE_URL`) or `Custom URL`; the clone is not added to `repositories[]`, and `cve.repo_dir` is pointed at it when it differs (`is_dirty = True`). URLs are validated as `https://`/`git://` (`clone_into()`); a failed or cancelled clone that leaves a directory asks `Keep` (default) / `Delete`. `a` adds remotes (`add_remote_menu()`): an `Add Remote` dialog offers `Standard` (default), `Custom` or `Cancel`; the `cve` candidate skips the dialog and goes straight to `Custom`. `Standard` opens `StandardRemotesDialog`, a checklist of `STANDARD_REMOTES` where presets already present by name or URL (`remote_url_key()` ignores scheme, case, trailing `/` and `.git`) read "(added)" and cannot be toggled; `Custom` adds a remote from a name prompt and a URL prompt (`https://` or `git://` only). After adding, `Fetch now` / `Later` offers to fetch the new remotes. `f` fetches the highlighted remote, `g` fetches all remotes, `d`/`Delete` removes the highlighted remote after a confirmation defaulting to `Cancel`, and `Esc` returns. Clone and fetch run through `run_streaming_command()` with `git_env()`; after a fetch the status bar points to "Repositories, Git & Branch Filters" for selecting the new remote-tracking branches (the screen never edits branch selections). The repository path and highlighted remote persist in `view_state["git_manager"]`.
+  - `GitRepoSelectScreen` (`core/tui/screens/git_select.py`): repository hub in front of `GitManagerScreen`. It lists `repository_candidates()` (`core/tui/screens/git_manager.py`): the configured `repositories[]` entries that are git repositories, then the clone targets `<workspace.repos_dir>/linux` (kind `linux`) and `<workspace.repos_dir>/man-pages` (kind `man-pages`, shown as `man`) and the CVE catalog `cve.repo_dir` (kind `cve`; relative to the project root, empty means `cvelistV5`) unless a configured entry already has that path; each row shows name, kind, clone state (remote count or "not cloned") and path. Keys: `Enter`/`→` pushes `GitManagerScreen(repo_path=...)` on the highlighted row; `c` clones a missing `linux`, `man-pages` or `cve` row (`CLONE_KINDS`, labelled by `CLONE_LABELS`; same flow as the manager's `c`); `n` adds another repository, either `Clone URL` (URL prompt, `https://`/`git://` only, then a directory-name prompt defaulting to `repo_dirname_from_url()`, validated by `is_valid_repo_dirname()`; clones into `<workspace.repos_dir>/<name>`, which must not exist) or `Add local` (path of an existing git repository, relative paths under the project root); both register it in `repositories[]` (`detect_repository()`, deduplicated by path, `is_dirty = True`). `a` fetches every cloned repository that has remotes in turn with `fetch_command(path, None)` (`git fetch --progress --tags --all`: every branch of every remote), each through `run_streaming_command()`; a cancel stops the pass and the status bar reports fetched, failed and not-started repositories. `Esc` returns. The highlighted path persists in `view_state["git_select"]`; rows are re-read on every return from the manager.
+  - `GitManagerScreen` (`core/tui/screens/git_manager.py`): Git repository manager for one repository at a time, over the same `repository_candidates()`; it opens on its `repo_path` argument, else the remembered repository, else `linux`, and `r`/`R` cycles forward/back. The list shows the repository's remotes (name and fetch URL). Keys: `c` clones the current `linux`, `man-pages` or `cve` candidate when its directory is missing (`clone_current()`). For `linux`, a URL prompt defaults to `DEFAULT_LINUX_URL`, then a download-size confirmation, and the clone is registered in `repositories[]` (`detect_repository()`, deduplicated by path, `is_dirty = True`). For `man-pages` (`clone_manpages()`), the same flow clones `DEFAULT_MANPAGES_URL` into `<workspace.repos_dir>/man-pages` and registers it, detected as project `man-pages` (§7.1.1). For `cve`, a dialog offers `cvelistV5` (default, `DEFAULT_CVE_URL`), `vulns.git` (`KERNEL_CVE_URL`) or `Custom URL`; the clone is not added to `repositories[]`, and `cve.repo_dir` is pointed at it when it differs (`is_dirty = True`). URLs are validated as `https://`/`git://` (`clone_into()`); a failed or cancelled clone that leaves a directory asks `Keep` (default) / `Delete`. `a` adds remotes (`add_remote_menu()`): an `Add Remote` dialog offers `Standard` (default), `Custom` or `Cancel`; the CVE catalog and the man-pages tree (`RepoCandidate.is_kernel_tree` is false for kind `cve`/`man-pages` and for an entry with `project: "man-pages"`) skip the dialog and go straight to `Custom`, and `add_standard_remotes()` refuses them. `Standard` opens `StandardRemotesDialog`, a checklist of `STANDARD_REMOTES` where presets already present by name or URL (`remote_url_key()` ignores scheme, case, trailing `/` and `.git`) read "(added)" and cannot be toggled; `Custom` adds a remote from a name prompt and a URL prompt (`https://` or `git://` only). After adding, `Fetch now` / `Later` offers to fetch the new remotes. `f` fetches the highlighted remote, `g` fetches all remotes, `d`/`Delete` removes the highlighted remote after a confirmation defaulting to `Cancel`, and `Esc` returns. Clone and fetch run through `run_streaming_command()` with `git_env()`; after a fetch the status bar points to "Repositories, Git & Branch Filters" for selecting the new remote-tracking branches (the screen never edits branch selections). The repository path and highlighted remote persist in `view_state["git_manager"]`.
   - `VersionParseScreen` (`core/tui/screens/version_parse.py`): Tag selector for parsing chosen releases. It lists the enabled `repositories[]` entries whose path is a git repository (a repository SelectList appears with two or more), loads each repository's tags once with `list_version_tags()` (cached per path), and highlights `v3.0` when present without checking it. The filter input matches case-insensitively as a substring, or as a glob when it contains `*`/`?`; the `Include -rc / pre-release tags` checkbox filters the list locally. In the tag list `Space`/`Enter` toggles a tag, `a` toggles every visible tag, `n`/`c` clears the selection; `P` (outside the filter) or the `Parse` button launches after a confirmation naming the repository, the first ten tags (`... (+N more)`), and the mode. Launch arguments: `repo=<name>`, `ref=[selected tags in version order]`, `single_version=True`; with exactly one tag and `Continue through later releases` checked, `single_version=False` and `include_pre_releases=<rc checkbox>` (the checkbox reads "n/a" with several tags). An empty selection is refused, and `Use saved config.json` is refused when the repository is absent from the saved file ("Repository Not Saved"). The repository, filter, and highlighted tag persist in `view_state["version_parse"]`; the selection does not.
   - **Table Reset (`core/tui/screens/table_reset.py`)**: `run_table_reset(stdscr, app)` picks the configuration with `choose_launch_config(..., "Reset")`, names the database it drops (`describe_reset_target()`: engine, schema, `host:port`, SSH tunnel) from that configuration (`app.disk_config()` for `RUN_SAVED`), and offers `Reset Only` / `Reset & Parse` / `Cancel` (default `Cancel`). It then requires the word `RESET` typed exactly in a `ModalTextInputDialog`; any other text shows "Reset Aborted" and changes nothing. A confirmed reset launches with `reset=True` and `reset_only=True` (`Reset Only`) or `reset_only=False` (`Reset & Parse`).
   - **DB Content Viewer (`core/tui/screens/db_content.py`, `core/tui/db_content.py`)**: `DBContentScreen` connects to the database of `app.config` (unsaved edits included) and shows it on four tabs: `Versions`, `Repos & Branches`, `Mailing List & CVE`, `Tables & Size`. `Tab`/`Shift-Tab`, `←`/`→` or `1`-`4` switch tabs; `Enter`/`Space` opens a details dialog for the highlighted row; `R` reloads; `E` lists the sections that failed to load; `Esc`/`q` returns. Constructor hooks `session_factory`, `collector`, `cleaner` and `text_prompt` default to `open_db_session`, `collect_snapshot`, `clean_versions` and `ModalTextInputDialog`. The active tab and the Versions filter persist in `view_state["db_content"]`. A connection failure is shown on the screen, which stays usable.
@@ -1139,7 +1168,7 @@ Main Process (STEP 6.1+: Post-Processing Subsystems) TableEngine (G.TE)         
     - **Mailing List & CVE**: whether `m_commit_email` / `m_commit_link` and the CVE tables (`m_cve_source`, `m_cve`, `m_cve_commit`, `m_cve_file`, `m_cve_commit_hash`) exist and hold rows (exact, `row_exists()`), with estimated rows and size, plus the `m_cve_source` rows (name, records, head, build time).
     - **Tables & Size**: `BaseDBEngine.table_stats()` per table, largest first (rows are InnoDB estimates), totals for rows, data, index and the whole database, tables outside `core/DBLayout.py`, and schema tables missing from the database.
     - **Clean partial runs** (`C`): lists the `interrupted` versions (`DBSnapshot.cleanable_versions()`, one per network and commit; on a highlighted interrupted row it first asks `This version` / `All interrupted (N)` / `Cancel`), shows a preview naming the database and each version (`Clean` / `Cancel`, default `Cancel`), and requires `CLEAN` typed exactly. `clean_versions(db, versions)` then re-reads each version's state row and skips it when it is no longer `INGEST_PARSING` or its worker heartbeats again, runs `ingest_state.clean_interrupted_version()` for the rest, reports the method or error per version, and the snapshot reloads. `in_progress` and `legacy` versions are never cleaned.
-  - **Git helpers (`core/tui/git_ops.py`)**: `list_version_tags(repo, include_pre_releases=True)` (release tags matching `VERSION_TAG_RE`, `git tag --sort=v:refname` with `-rc`/`-pre` version-sort suffixes, `-tree` tags excluded), `list_remotes()`, `add_remote()` / `remove_remote()` (validated by `is_valid_remote_name()` and `is_valid_remote_url()`, which accepts only `https://` and `git://` URLs), `clone_command()` / `fetch_command(repo, remote=None)` (argv builders; `remote=None` fetches `--all`, always with `--tags`), `DEFAULT_LINUX_URL` (torvalds tree), `DEFAULT_CVE_URL` (CVE Program `cvelistV5`) / `KERNEL_CVE_URL` (kernel CNA `vulns.git`) with `DEFAULT_CVE_DIRNAME`, `is_valid_repo_dirname()` / `repo_dirname_from_url()` (directory names for clones under `workspace.repos_dir`), and `STANDARD_REMOTES` (`stable`, `linux-next`, `net`, `net-next`, `tip`, `mm`, `bpf-next`, `rt-devel`, `rust`). `git_env()` sets `GIT_TERMINAL_PROMPT=0` so git never prompts on the terminal curses owns.
+  - **Git helpers (`core/tui/git_ops.py`)**: `list_version_tags(repo, include_pre_releases=True)` (release tags matching the kernel `VERSION_TAG_RE`, else, in a repository without any, its prefixed releases from `release_order.release_tag_names()` in `release_key()` order (`man-pages-X.Y[.Z][-rcN]`, `foo-1.2.3`); kernel tags use `git tag --sort=v:refname` with `-rc`/`-pre` version-sort suffixes, `-tree` tags excluded), `list_remotes()`, `add_remote()` / `remove_remote()` (validated by `is_valid_remote_name()` and `is_valid_remote_url()`, which accepts only `https://` and `git://` URLs), `clone_command()` / `fetch_command(repo, remote=None)` (argv builders; `remote=None` fetches `--all`, always with `--tags`), `DEFAULT_LINUX_URL` (torvalds tree), `DEFAULT_MANPAGES_URL` (Linux man-pages, `DEFAULT_MANPAGES_DIRNAME` `man-pages`), `DEFAULT_CVE_URL` (CVE Program `cvelistV5`) / `KERNEL_CVE_URL` (kernel CNA `vulns.git`) with `DEFAULT_CVE_DIRNAME`, `is_valid_repo_dirname()` / `repo_dirname_from_url()` (directory names for clones under `workspace.repos_dir`), and `STANDARD_REMOTES` (`stable`, `linux-next`, `net`, `net-next`, `tip`, `mm`, `bpf-next`, `rt-devel`, `rust`). `git_env()` sets `GIT_TERMINAL_PROMPT=0` so git never prompts on the terminal curses owns.
   - **Streaming process view (`core/tui/process_view.py`)**: `run_streaming_command(stdscr, argv, title, cwd=None, env=None, wait_for_key=True)` runs a child (stdin `/dev/null`, stdout and stderr merged into a pipe, own session), reads it on a thread, and repaints the last lines every 100 ms (`stdscr.timeout(100)`, restored to blocking on return). A carriage return makes the next text replace the current line, so git progress counters update in place. `Esc`/`c` asks `Keep Running` / `Stop`; `Stop` terminates (then kills after 5 s). It returns `ProcessResult(returncode, cancelled, lines, error)` (`ok` when the exit code is 0 and it was not cancelled) and, with `wait_for_key`, waits for a key on a success/failure footer.
   - `RepositoriesScreen` & `RepoDetailScreen` (`core/tui/screens/repos.py`): Scans `workspace.repos_dir`, manages repository entries, allows interactive multi-select branch checklists, customizes start refs, and manages tag view regex rules (`DEFAULT_TAG_VIEWS`). `RepositoriesScreen` remembers the highlighted repository (`view_state["repositories"]`); `RepoDetailScreen` remembers, per repository path (`view_state["repo_detail:<path>"]`), the focused list and the highlighted branch and tag-rule rows when saving, and restores them on the next visit. The rows between the buttons and the status bar show the full text of the highlighted tag rule (`Rule [<view>]: <regex>`, wrapped). A saved `project` or `default_branch` (an empty string included) is shown as saved; the repository name and `master` only fill a missing key. The last remaining tag rule cannot be deleted, because an empty `tag_views` list means `DEFAULT_TAG_VIEWS` to every reader. `Esc` / `Cancel` with unsaved edits asks for confirmation before discarding.
   - `DatabaseSSHScreen` (`core/tui/screens/database_ssh.py`): Configures database connection parameters (host, port, user, password, unix_socket) and SSH tunnel port forwarding credentials. The forward destination fields are labelled `DB Host @SSH` / `DB Port @SSH` (`ssh_tunnel.remote_host` / `remote_port`: the address the SSH server connects to, `127.0.0.1` when MariaDB runs on the SSH host). With the tunnel enabled and the database `Port` different from the SSH `Local Port` (a `0` local port included), saving shows a "Port Mismatch" confirmation (`Save Anyway` / `Cancel`); `Cancel` keeps the screen open with nothing committed. Saving first validates the port inputs (`Port`, `SSH Port`, `DB Port @SSH`: 1-65535; `Local Port`: 0-65535) and reports invalid ones in an "Invalid Value" dialog without committing; `ssh_tunnel.enabled` is read with `core.config._coerce_bool`. `Esc` with unsaved edits asks before discarding.
@@ -1212,6 +1241,12 @@ Main Process (STEP 6.1+: Post-Processing Subsystems) TableEngine (G.TE)         
   - Step 6.7 (`processing_maintainer_files`) maps files to MAINTAINERS section versions incrementally: sections new or changed since the base version are matched
     against every path, the others against the paths new in this version only, and when neither exists it logs
     one line and returns without parsing MAINTAINERS (`parser/maintainer_ast/MAINTAINER_API.md` §5).
+  - Kernel-only steps: Step 6.6's Kbuild rules (`processing_kbuild`), Step 6.7 (`processing_maintainer_files`)
+    and Step 6.8 (`processing_arch_layouts`) return at once when `kernel_steps_apply()` is false (`gp.project_slug`,
+    set by `resolve_git_network_and_repo()`, is in `NON_KERNEL_PROJECTS`: `man-pages`, §7.1.1); Step 6.8 also
+    returns for a tree with neither a top-level `Makefile` nor an `arch/` file. The other steps run for every
+    tree: a man-pages version stores its pages as `T_RAW` files, its doc references (Step 6.6) and its facts
+    (Step 6.9, family 6).
   - Step 6.8 (`processing_arch_layouts`) evaluates the version's Makefiles for every ARCH value
     (`parser/arch_layout.py` over the Step 4 tree listing and the RAMDISK files) and replaces the head
     commit's `m_arch_root` rows, one per ARCH, each pointing at its layout. An ARCH whose inputs are unchanged
@@ -1222,16 +1257,17 @@ Main Process (STEP 6.1+: Post-Processing Subsystems) TableEngine (G.TE)         
     layout is looked up by `layout_digest()` and only a new one writes its `m_arch_layout_entry` rows (v3.0:
     31 ARCH values, 167 rows; v3.0.1 then writes none).
   - Step 6.9 (`processing_source_facts`, `parser/facts_ingest.py`) extracts the per-blob facts `m_blob_facts` lacks (or holds in an older format)
-    for the version's files across all 5 fact families:
+    for the version's files across all 6 fact families:
     - family 1 (`source_facts.FAMILY`): functions, calls, member calls and ops tables of `.c`/`.h` blobs (`parser/source_facts.py`, `source_facts.FACTS_FORMAT`);
     - family 2 (`kapi_facts.FAMILY`): Kernel API macros of `.c`/`.h`/`.S` blobs (`parser/kapi_facts.py`, `kapi_facts.KAPI_FORMAT`);
     - family 3 (`include_facts.FAMILY`): `#include` directives of `.c`/`.h`/`.S` blobs (`parser/include_facts.py`, `include_facts.FORMAT`);
     - family 4 (`kconfig_definitions.FAMILY`): symbol, menu, and choice definitions of Kconfig blobs (`parser/kconfig_ast/kconfig_definitions.py`, `kconfig_definitions.FORMAT`);
-    - family 5 (`doc_labels.FAMILY`): `.. _label:` targets of `Documentation/**/*.rst` blobs (`parser/doc_labels.py`, `doc_labels.FORMAT`).
+    - family 5 (`doc_labels.FAMILY`): `.. _label:` targets of `Documentation/**/*.rst` blobs (`parser/doc_labels.py`, `doc_labels.FORMAT`);
+    - family 6 (`man_facts.FAMILY`): NAME names and summary, `.TH` header, `.so` alias target, cross references and SYNOPSIS functions / headers / identifiers of man page blobs (`man/manS/name.S` or `manS/name.S`, `man_facts.applies()`; `parser/man_ast/man_facts.py`, `man_facts.FORMAT`).
     Each blob is read once from the RAMDISK files for all its missing families, and the comment/string mask is computed once for masked extractors (families 1 and 2), in `parser.facts_workers` (default 4) forked low-priority processes; the first version
     extracts its whole tree, later ones only their new blobs.
   - Git network and repository resolution in `resolve_git_network_and_repo` caches `(network_id, repo_id)` per
-    canonical `repo_dir`, bypassing repeated 5.5s root-commit traversals (`git rev-list --max-parents=0 HEAD`)
+    canonical `repo_dir` and project (`repo_project_slug()` caches the slug per `repo_dir`), bypassing repeated 5.5s root-commit traversals (`git rev-list --max-parents=0 HEAD`)
     on subsequent versions.
   - Parsing worker processes bypass uncached remote database `SELECT` queries on `m_ast` in
     `core/TableHandling.py` (`skip_db_lookup = is_neg_cached or is_worker`), eliminating remote SSH tunnel
@@ -1508,7 +1544,8 @@ local clone of the CVE list (config `cve.repo_dir`, §7.1; kept current by the o
 webapp only reads them (`webapp/API.md` §4.11).
 - **When**: at the start of every parser run (`main.processing_cve_list()`, after the repository is selected),
   unless `--no-cve`; `python3 main.py --cve` does only this and exits; `--cve-full` ingests the whole list
-  again. A failure is logged and never stops parsing.
+  again. A failure is logged and never stops parsing. A run on a repository of a project that is not a kernel
+  tree (`man-pages`, §7.1.1) skips it (`--cve` then only logs a warning).
 - **Abbreviated hashes** (`cve_ingest.resolve_commit_prefixes()`): after each ingestion (also when the HEAD is
   current), every distinct `m_cve_commit.commit_hash` shorter than 40 digits without an `m_cve_commit_hash`
   row for the selected repository is resolved with one `git cat-file --batch-check`
@@ -1546,10 +1583,16 @@ history with Git.
   (`m_ingest_state` status 1): its rollback (§4.1) deletes the `m_maintainer_person` rows above its watermark
   together with every row naming them, so the step waits for the recovery, which the same run's version loop
   performs before the second call. A failure is logged and never stops parsing.
+- **Projects**: every repository, whatever its project (`linux`, `man-pages`, any other slug): release
+  statistics are driven by the repository's tags alone, and `m_release_segment` / `m_person_first_release` rows
+  are keyed by `repo_id`.
 - **Ranges** (`parser/git_ast/release_order.py`, pure, shared with the webapp's release index, `webapp/API.md`
-  §2.17): release tags are the `refs/tags` names `parse_tag()` accepts that name a commit (annotated tags
-  peeled). `release_ranges()` gives each tag its **segment** — from the previous tag of its chain: the
-  previous mainline tag (release candidates included) for a mainline tag, `previous_in()` for a stable update
+  §2.17): release tags are the `refs/tags` names that name a commit (annotated tags peeled) and that
+  `release_tag_names()` keeps: the kernel scheme (`vX.Y[.Z][-rcN]`, `X.Y`, `next-YYYYMMDD`) when the
+  repository has any such tag, else every `<prefix>X.Y[.Z][-rcN]` tag (`man-pages-6.9`, `foo-1.2.3`), each
+  prefix a family of its own chains (`parser/git_ast/GIT_API.md` §7). `release_ranges()` gives each tag its
+  **segment** — from the previous tag of its chain: the previous mainline tag of its family (release
+  candidates included) for a mainline tag, `previous_in()` for a stable update
   — and its **diff range** from `previous_in()`, the range a release report covers: a final release's whole
   cycle from the previous release, otherwise the segment itself. A chain's segments are disjoint and add up to
   any range on it (`v3.0..v3.1` = `v3.0..v3.1-rc1` + … + `v3.1-rc8..v3.1`), so a release's commits, merges and
@@ -1572,7 +1615,8 @@ history with Git.
   segment; a segment earlier in release order than the stored one replaces it. Release order, not author
   dates: patches merged long after they were written carry old dates (on the reference clone, author dates
   misplaced 16–76 first-time authors per release). When a stored mainline segment is replaced, the table is
-  rebuilt from the author rows.
+  rebuilt from the author rows. In a repository tagging several prefixed families, the first release is the
+  earliest in `release_key()` order across them (prefixes alphabetically).
 - **Incremental**: a tag whose stored commit, segment base (name and commit), diff base and `FORMAT` match
   costs nothing; otherwise (new tag, moved tag, a tag inserted before it, a new `FORMAT`) the segment is
   summarized again and its rows replaced. Ranges are computed in parallel and written in release order, one
@@ -1608,8 +1652,11 @@ and isolated crash recovery.
   - Sequentially parses the mainline and primary trunk chains in chronological order (`history/master` $\to$
     `1da177e4c3f4` bridged incrementally from `v2.6.12-rc1` $\to$ `v2.6.x` $\to$ `v3.0` $\to$ `master`) and owns
     singleton global maintenance tasks (`ensure_db_views`, `processing_cve_list`, `processing_release_stats`).
-    Trunk references (`history/master`, `history/HEAD`, `master`, `main`) are preserved on Master when `--delegate-stable`
-    is active.
+    With `--delegate-stable` (every project: the chains come from the repository's release tags,
+    `release_order.release_tag_names()`), the master keeps in its own sequence only the mainline tags of every
+    tag family (`release_ranges()` kind `mainline`) and the trunk branches (`history/master`, `history/HEAD`,
+    `master`, `main`, `origin/master`, `origin/main`); the stable and `next` chains and the delegated branches
+    go to `publish_delegable_chains()`.
   - Automatically publishes delegable tasks into `m_parse_task` (keyed by unique constraint `(network_id, ref_name)`):
     - **Stable Chains (Case B)**: Series branches `vX.Y.1 .. vX.Y.Z` whose base commit is already `INGEST_DONE`.
     - **Past, Secondary & Next Branches (Case A)**: Discovered non-trunk branches (`history/*` secondary,
@@ -1728,11 +1775,11 @@ command line (`python3 main.py <flag>`, standalone or master role; the run exits
 
 | `--repair-head-commit-files` | `m_commit_file` (§4 row 23) | Deletes the rows of finished version head commits that name a file the commit did not change (`git diff-tree --stdin -r --root --no-renames`); a merge head keeps none. Idempotent. |
 
-| `--backfill-facts [--families 1,2,3,4,5]` | `m_blob_facts` (§4 row 48) | The (path, blob) pairs of every finished version's checkpoint rows (read per version by primary key) with a fact family: one path per blob, each blob read from Git by SHA (the persistent `git cat-file --batch`), only the families it lacks in their current format (`facts_ingest.missing()`: the work list and the resume state), extracted by `parser.facts_workers` low-priority processes and stored as Step 6.9 does. |
+| `--backfill-facts [--families 1,2,3,4,5,6]` | `m_blob_facts` (§4 row 48) | The (path, blob) pairs of every finished version's checkpoint rows (read per version by primary key) with a fact family: one path per blob, each blob read from Git by SHA (the persistent `git cat-file --batch`), only the families it lacks in their current format (`facts_ingest.missing()`: the work list and the resume state), extracted by `parser.facts_workers` low-priority processes and stored as Step 6.9 does. |
 
 | `--backfill-commit-relations [--from-commit-id N]` | `m_commit_relation`, `m_commit_link` (§4 rows 63-64) | Parses the stored message of every commit (`m_commit`, all networks) in chunks of 5,000, abbreviated targets resolved against the selected repository once per chunk, `INSERT IGNORE`. The state row (`commit_id 0, kind 0`) records `next:<last id>` after each chunk and `done:<max id>` at the end; the next run resumes from it (`--from-commit-id` overrides). Runs automatically at start until the state says done (a new database is done at once); until then the webapp keeps its SQLite relation index. |
 
-| `--backfill-kbuild` | `m_kbuild_symbol` (§4 row 61) | The Makefile/Kbuild (path, blob) pairs of every finished version's checkpoint (read by primary key, restricted to those paths) without rows: each blob read from Git by SHA (`git cat-file --batch`) and parsed against its directory; also deletes the old `m_file_reference` rows of `ref_type` 3/4. Runs once automatically at start when the table is empty and the database holds finished versions. |
+| `--backfill-kbuild` | `m_kbuild_symbol` (§4 row 61) | The Makefile/Kbuild (path, blob) pairs of every finished version's checkpoint (read by primary key, restricted to those paths) without rows: each blob read from Git by SHA (`git cat-file --batch`) and parsed against its directory; also deletes the old `m_file_reference` rows of `ref_type` 3/4. Runs once automatically at start when the table is empty and the database holds finished versions, unless the run's repository is not a kernel tree (`man-pages`). |
 
 | `--backfill-doc-references` | `m_file_reference` (§4 row 28) | Scans documentation files (`Documentation/**/*.rst`, `.txt`) across finished checkpoints using `DocReferenceScanner` (`parser/doc_parser.py`) for file paths and C symbol identifiers, staging cross-references of `ref_type = 5` (`Documentation`) into `m_file_reference`. |
 

@@ -36,8 +36,10 @@ export function pinnedSha(version, stamp) {
 }
 
 /** Hash of a code tab showing `path` at `rev`, lines start-end, with the file diff it shows (§5.26). */
-export function codeHash({ rev, path, start = 1, end = start, diffWith = null, diffLayout = "" }) {
+export function codeHash({ repo = "", rev, path, start = 1, end = start, diffWith = null, diffLayout = "" }) {
   const params = new URLSearchParams();
+  // The tab's repository, so the link opens in its project (§5.26)
+  if (repo) params.set("repo", repo);
   params.set("v", rev);
   params.set("tab", "code");
   params.set("file", path);

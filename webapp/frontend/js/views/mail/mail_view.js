@@ -285,7 +285,7 @@ export class MailView {
     this.isLoadingVersions = true;
     this.renderVersionSelector();
     try {
-      const data = await api.getMailThreadVersions(this.activeThreadId, this.activeMessageId);
+      const data = await this.api.getMailThreadVersions(this.activeThreadId, this.activeMessageId);
       if (token !== this._versionsToken) return;
       this.versionsData = data;
       if (data?.available && data.current_version) {
@@ -617,7 +617,7 @@ export class MailView {
     if (this._checkingDaemon || this.daemonStatus !== null) return;
     this._checkingDaemon = true;
     try {
-      const st = await api.getMailStatus();
+      const st = await this.api.getMailStatus();
       this.daemonStatus = st;
       const banner = this.containerEl?.querySelector("#mail-status-banner");
       if (!banner) return;
@@ -663,7 +663,7 @@ export class MailView {
 
     this.isLoadingSearch = true;
     try {
-      const data = await api.searchMailingList(this.currentQuery, {
+      const data = await this.api.searchMailingList(this.currentQuery, {
         page: this.currentPage,
         limit: 50,
         filterType: this.currentFilter,
@@ -808,7 +808,7 @@ export class MailView {
     detailEl.innerHTML = `<div style="padding:32px;color:var(--text-muted);text-align:center;">Loading thread discussion...</div>`;
 
     try {
-      const threadData = await api.getMailThread(tid, targetMid);
+      const threadData = await this.api.getMailThread(tid, targetMid);
       if (token !== this._threadToken) return;
       this.activeThreadData = threadData;
       this.activeThreadId = threadData.tid || tid;
@@ -923,7 +923,7 @@ export class MailView {
     if (!badge) return;
     let res;
     try {
-      res = await api.getMergedCommits({ tid: threadData.tid || 0, mid: threadData.tid ? "" : mid });
+      res = await this.api.getMergedCommits({ tid: threadData.tid || 0, mid: threadData.tid ? "" : mid });
     } catch (err) {
       if (badge.isConnected) {
         badge.className = "mail-merged-badge unknown";
@@ -1101,7 +1101,7 @@ export class MailView {
         const mid = msgSummary.message_id || msgSummary.num;
         let detail = this.loadedMessageDetails.get(mid);
         if (!detail) {
-          detail = await api.getMailMessage(mid);
+          detail = await this.api.getMailMessage(mid);
         }
         const textToCopy = detail?.raw || detail?.body || "";
         if (textToCopy) {
@@ -1120,7 +1120,7 @@ export class MailView {
         const mid = msgSummary.message_id || msgSummary.num;
         let detail = this.loadedMessageDetails.get(mid);
         if (!detail) {
-          detail = await api.getMailMessage(mid);
+          detail = await this.api.getMailMessage(mid);
         }
         const content = detail?.raw || detail?.body || "";
         const filename = `${(detail?.subject || mid).replace(/[^a-zA-Z0-9._-]+/g, "_").slice(0, 40)}.eml`;
@@ -1149,7 +1149,7 @@ export class MailView {
     if (!bodyEl) return;
 
     try {
-      const detail = await api.getMailMessage(mid);
+      const detail = await this.api.getMailMessage(mid);
       this.loadedMessageDetails.set(mid, detail);
       const isRaw = this.rawModeMap.get(mid) || false;
       this.renderCardContent(bodyEl, detail, isRaw);

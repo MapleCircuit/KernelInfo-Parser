@@ -13,6 +13,8 @@ Consult only the API specification and schemas for the subsystem(s) touched by t
 - **Maintainer AST**: `parser/maintainer_ast/MAINTAINER_API.md`.
 - **Fallback Raw AST**: `parser/raw_ast/RAW_AST_API.md`.
 - **Git Commit AST**: `parser/git_ast/GIT_API.md`.
+- **Man Page AST**: `parser/man_ast/MAN_API.md`.
+- **Man Page AST**: `parser/man_ast/MAN_API.md`.
 - **Web Application**: `webapp/API.md` (core architecture, security, caching, sync), `webapp/API_ENDPOINTS.md` (§4 REST endpoints), `webapp/API_FRONTEND.md` (§5 frontend modules & UI).
 - **Targeted slice reads**: For specs >40 KB (`core/API.md`, `parser/c_ast/CAST_API.md`, `parser/kconfig_ast/KCONFIG_API.md`, `table_engine/TE_API.md`, `webapp/API.md`, `webapp/API_ENDPOINTS.md`, `webapp/API_FRONTEND.md`), never read from line 1. Check the line-indexed Table of Contents at lines 1–45, jump straight to the line range listed in `AGENTS.md` / `SKILL.md`, or run `python3 .agents/scripts/spec_section.py <file> <section>` (`--lines-only`). Call `read_file` with a narrow `StartLine`–`EndLine` range (Claude Code: `Read` with `offset`/`limit`) (~100–200 lines, max 300).
 - **Fast search over root grep**: Never run `grep -rn` from repository root `.` without directory scoping. Always use `git grep -n "<pattern>"` (which automatically respects `.gitignore` and ignores `repos/`, `.git/`, and cache artifacts in ~10ms), or scope standard grep to target directories (e.g. `grep -rn "<pattern>" core/ main.py table_engine/`).

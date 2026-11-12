@@ -23,6 +23,8 @@ test("permalinks pin the commit", () => {
   assert.equal(codeHash({ rev: "02f8c6aee8df", path: "init/main.c", start: 490, end: 500 }),
     "#v=02f8c6aee8df&tab=code&file=init%2Fmain.c&line=490-500");
   assert.equal(codeHash({ rev: "v3.0", path: "a.c", start: 1, end: 1 }), "#v=v3.0&tab=code&file=a.c");
+  // The tab's repository leads every permalink (§5.26)
+  assert.equal(codeHash({ repo: "linux", rev: "v3.0", path: "a.c" }), "#repo=linux&v=v3.0&tab=code&file=a.c");
   assert.equal(codeHash({ rev: "v3.0", path: "a.c", start: 5, diffWith: { version: "v2.6.39", path: "b.c", swap: true }, diffLayout: "split" }),
     "#v=v3.0&tab=code&file=a.c&line=5&dv=v2.6.39&dp=b.c&ds=1&dm=split");
 });

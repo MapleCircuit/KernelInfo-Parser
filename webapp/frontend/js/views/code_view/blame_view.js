@@ -19,13 +19,13 @@ export class BlameView {
     this.version = "";
   }
 
-  async loadBlame(version, filePath, opts = null) {
+  async loadBlame(version, filePath, opts = null, client = api) {
     this.blameByLine.clear();
     this.authorColors.clear();
     this.version = version;
     this.filePath = filePath;
     try {
-      this.blameData = await api.getFileBlame(version, filePath, opts);
+      this.blameData = await client.getFileBlame(version, filePath, opts);
       if (Array.isArray(this.blameData.lines)) {
         this.blameData.lines.forEach((b) => {
           this.blameByLine.set(b.line, b);

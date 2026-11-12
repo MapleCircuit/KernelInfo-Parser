@@ -10,6 +10,7 @@ import { toTsv } from "../sections/section_model.js";
 import { configLookup, evalBuild } from "../kconfig/build_condition.js";
 import { openDefinition } from "../../utils/definition_picker.js";
 import { showSymbolHistoryModal } from "../../components/symbol_history_modal.js";
+import { handleManLinkClick, manLinkHtml } from "../man/man_links.js";
 
 const fileLink = (path, line, label = null, version = "") =>
   `<a href="#" data-open-file="${escapeHtml(path)}" data-line="${line || 1}"${version ? ` data-version="${escapeHtml(version)}"` : ""}>${escapeHtml(label || `${path}:${line || 1}`)}</a>`;
@@ -41,6 +42,8 @@ const optionLinks = (opts, version) => (opts || []).map((o) => `<a href="#" data
 
 function commonClicks(e, ctx) {
   const nt = ctx.forceNew || e.ctrlKey || e.metaKey;
+  // man 2 <name>: our man-pages copy at the tag of this kernel revision, else man7.org (§5.38)
+  if (handleManLinkClick(e, { kernel: ctx.version, repo: ctx.api?.repo || "", forceNew: nt })) return true;
   const k = e.target.closest("[data-kconfig]");
   if (k) {
     e.preventDefault();
@@ -75,7 +78,7 @@ registerApiSection({
   id: "syscalls", label: "Syscalls", order: 10, archScoped: true, keywords: "system calls syscall table",
   hint: "System call numbers, entry points and SYSCALL_DEFINE signatures",
   async fetchList(ctx) {
-    const r = await api.getKapi(ctx.version, `syscalls?arch=${encodeURIComponent(ctx.arch)}`, { ...ctx, cacheKey: `kapi_sys_${ctx.arch}` });
+    const r = await (ctx.api || api).getKapi(ctx.version, `syscalls?arch=${encodeURIComponent(ctx.arch)}`, { ...ctx, cacheKey: `kapi_sys_${ctx.arch}` });
     const rows = [...r.syscalls.map((s) => ({ ...s, key: `${s.abi}:${s.nr}:${s.name}` })),
       ...r.unnumbered.map((u) => ({ nr: null, abi: "", name: u.name, entry: `sys_${u.name}`, status: "unnumbered", definition: u, key: `u:${u.name}` }))];
     return { rows, note: `from ${r.sources.map((s) => s.path).join(", ") || "no table found"}` };
@@ -100,7 +103,7 @@ registerApiSection({
       ${d ? `<dt>Definition</dt><dd>${fileLink(d.path, d.line_s, null, ctx.version)} <code>${escapeHtml(d.macro)}</code></dd>` : ""}</dl>
       ${sig ? `<pre>${escapeHtml(sig)}</pre>` : ""}
       <p>${d ? `<a href="#" data-definition="${escapeHtml(r.entry)}">Go to definition</a> · <a href="#" data-history-path="${escapeHtml(d.path)}" data-history-line="${d.line_s}">History</a> · <a href="#" data-callgraph="${escapeHtml(r.entry)}">Callers</a> · ` : ""}
-      <a href="https://man7.org/linux/man-pages/man2/${encodeURIComponent(r.name)}.2.html" target="_blank" rel="noopener noreferrer">man 2 ${escapeHtml(r.name)} ↗</a></p>`;
+      ${manLinkHtml(r.name, "2", `man 2 ${escapeHtml(r.name)}`)}</p>`;
   },
   onDetailClick: commonClicks,
   downloads: [{ label: "Syscalls", ext: "tsv", build: (rows) => toTsv(rows, [["nr", (r) => r.nr ?? ""], ["abi", (r) => r.abi], ["name", (r) => r.name], ["entry", (r) => r.entry],
@@ -113,14 +116,14 @@ registerApiSection({
   id: "exports", label: "Exports", order: 20, keywords: "export symbol gpl module api",
   hint: "EXPORT_SYMBOL* of the revision and the object that exports them",
   async fetchList(ctx) {
-    const r = await api.getKapi(ctx.version, "exports", { ...ctx, cacheKey: "kapi_exports" });
+    const r = await (ctx.api || api).getKapi(ctx.version, "exports", { ...ctx, cacheKey: "kapi_exports" });
     return { rows: r.exports, note: `${r.total.toLocaleString("en-US")} exports · ${(r.counts.gpl || 0).toLocaleString("en-US")} GPL-only` };
   },
   rowKey: (r) => `${r.symbol}@${r.path}:${r.line}`,
   rowText: (r) => `${r.symbol} ${r.namespace} ${r.path}`,
   rowHtml: (r) => `<span class="sv-row-main">${escapeHtml(r.symbol)}</span>${r.variant !== "plain" ? `<span class="sv-tag ${r.variant.includes("gpl") ? "warn" : "info"}">${escapeHtml(VARIANT[r.variant] || r.variant)}</span>` : ""}${r.namespace ? `<span class="sv-tag info">${escapeHtml(r.namespace)}</span>` : ""}<span class="sv-row-sub">${escapeHtml(r.path.split("/").slice(-2).join("/"))}</span>`,
   chips: Object.entries(VARIANT).map(([id, label]) => ({ id, label, test: (r) => r.variant === id })),
-  fetchDetail: (ctx, key, row) => api.request(`/api/kapi/${encodeURIComponent(ctx.version)}/exports/${encodeURIComponent(row?.symbol || key.split("@")[0])}?arch=${encodeURIComponent(state.kconfigArch())}`),
+  fetchDetail: (ctx, key, row) => (ctx.api || api).request(`/api/kapi/${encodeURIComponent(ctx.version)}/exports/${encodeURIComponent(row?.symbol || key.split("@")[0])}?arch=${encodeURIComponent(state.kconfigArch())}`),
   detailHtml: (d, ctx) => `<h2>${escapeHtml(d.symbol)}</h2>
     <h3>Exported at</h3>${d.sites.map((s) => {
       const built = s.owner ? builtUnderEngine(s.owner.expr, ctx.version, "") : "";
@@ -140,7 +143,7 @@ registerApiSection({
   id: "params", label: "Parameters", order: 30, archScoped: true, keywords: "boot command line module parameters setup",
   hint: "Boot (__setup, early_param) and module parameters with their documentation",
   async fetchList(ctx) {
-    const r = await api.getKapi(ctx.version, `params?arch=${encodeURIComponent(ctx.arch)}`, { ...ctx, cacheKey: `kapi_params_${ctx.arch}` });
+    const r = await (ctx.api || api).getKapi(ctx.version, `params?arch=${encodeURIComponent(ctx.arch)}`, { ...ctx, cacheKey: `kapi_params_${ctx.arch}` });
     this._doc = r.doc_path;
     const stale = r.stale_docs.map((s) => ({ kind: "stale", name: s.name, full_name: s.name, doc: { line: s.line, tags: s.tags }, path: r.doc_path, line: s.line, key: `stale:${s.name}` }));
     return { rows: [...r.params.map((p) => ({ ...p, key: `${p.kind}:${p.full_name}:${p.path}:${p.line}` })), ...stale], note: r.doc_path ? `documentation: ${r.doc_path}` : "no kernel-parameters.txt" };
@@ -156,7 +159,7 @@ registerApiSection({
   ],
   async fetchDetail(ctx, key, row) {
     if (!row) return null;
-    const doc = row.doc ? await api.request(`/api/kapi/${encodeURIComponent(ctx.version)}/params/doc?line=${row.doc.line}`).catch(() => null) : null;
+    const doc = row.doc ? await (ctx.api || api).request(`/api/kapi/${encodeURIComponent(ctx.version)}/params/doc?line=${row.doc.line}`).catch(() => null) : null;
     return { ...row, docText: doc };
   },
   detailHtml: (r, ctx) => (!r ? '<div class="sv-empty">Not in this list.</div>' : `<h2>${escapeHtml(r.full_name)}</h2>
@@ -176,7 +179,7 @@ registerApiSection({
   id: "tracepoints", label: "Tracepoints", order: 40, keywords: "trace events tracepoint ftrace",
   hint: "TRACE_EVENT definitions: prototype, fields, format and call sites",
   async fetchList(ctx) {
-    const r = await api.getKapi(ctx.version, "tracepoints", { ...ctx, cacheKey: "kapi_tp" });
+    const r = await (ctx.api || api).getKapi(ctx.version, "tracepoints", { ...ctx, cacheKey: "kapi_tp" });
     const rows = [...r.tracepoints].sort((a, b) => a.system.localeCompare(b.system) || a.name.localeCompare(b.name));
     return { rows, note: `${new Set(rows.map((t) => t.system)).size} systems` };
   },
@@ -185,7 +188,7 @@ registerApiSection({
   rowHtml: (r) => `<span class="sv-row-sub" style="min-width:90px">${escapeHtml(r.system)}</span><span class="sv-row-main">${escapeHtml(r.name)}</span>${r.kind !== "event" ? `<span class="sv-tag info">${escapeHtml(r.kind)}</span>` : ""}`,
   chips: [{ id: "event", label: "events", test: (r) => r.kind === "event" }, { id: "class", label: "classes", test: (r) => r.kind === "class" }, { id: "raw", label: "raw", test: (r) => r.kind === "raw" }],
   async fetchDetail(ctx, key, row) {
-    const sites = row?.kind === "class" ? null : await api.request(`/api/kapi/${encodeURIComponent(ctx.version)}/tracepoints/${encodeURIComponent(key)}`).catch(() => null);
+    const sites = row?.kind === "class" ? null : await (ctx.api || api).request(`/api/kapi/${encodeURIComponent(ctx.version)}/tracepoints/${encodeURIComponent(key)}`).catch(() => null);
     return { ...(row || { name: key }), sites };
   },
   detailHtml: (t, ctx) => `<h2>${escapeHtml(t.name)}</h2>
@@ -204,7 +207,7 @@ registerApiSection({
   id: "modules", label: "Modules", order: 50, archScoped: true, keywords: "modules ko driver license firmware",
   hint: "Loadable modules: options, license, description, firmware, device tables",
   async fetchList(ctx) {
-    const r = await api.getKapi(ctx.version, `modules?arch=${encodeURIComponent(ctx.arch)}`, { ...ctx, cacheKey: `kapi_mod_${ctx.arch}` });
+    const r = await (ctx.api || api).getKapi(ctx.version, `modules?arch=${encodeURIComponent(ctx.arch)}`, { ...ctx, cacheKey: `kapi_mod_${ctx.arch}` });
     const rows = r.modules.map((m) => ({ ...m, built: builtUnderEngine(m.expr, ctx.version, ctx.arch) }));
     const engineNote = rows.some((m) => m.built) ? " · built: values from the KConfig engine of this revision" : "";
     return { rows, note: `ARCH=${r.arch}${engineNote}` };
@@ -218,7 +221,7 @@ registerApiSection({
     { id: "firmware", label: "firmware", test: (m) => m.firmware.length > 0 }, { id: "devtable", label: "device table", test: (m) => m.device_tables.length > 0 },
     { id: "asmodule", label: "built as module", test: (m) => m.built === "m" }, { id: "notbuilt", label: "not built", test: (m) => m.built === "n" },
   ],
-  fetchDetail: (ctx, key) => api.request(`/api/kapi/${encodeURIComponent(ctx.version)}/modules/${encodeURIComponent(key)}?arch=${encodeURIComponent(ctx.arch)}`, { timeoutMs: 60000 }),
+  fetchDetail: (ctx, key) => (ctx.api || api).request(`/api/kapi/${encodeURIComponent(ctx.version)}/modules/${encodeURIComponent(key)}?arch=${encodeURIComponent(ctx.arch)}`, { timeoutMs: 60000 }),
   detailHtml: (m, ctx) => `<h2>${escapeHtml(m.modname)}.ko</h2>
     <dl class="sv-kv"><dt>Object</dt><dd><code>${escapeHtml(m.target)}</code></dd>
     <dt>Built when</dt><dd><code>${escapeHtml(exprText(m.expr))}</code>${builtUnderEngine(m.expr, ctx.version, ctx.arch) ? ` · built: <b>${escapeHtml(builtUnderEngine(m.expr, ctx.version, ctx.arch))}</b>` : ""}</dd>

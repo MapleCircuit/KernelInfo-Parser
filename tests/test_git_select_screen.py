@@ -11,9 +11,21 @@ import unittest
 from pathlib import Path
 from typing import Any
 
-from core.tui.git_ops import DEFAULT_CVE_URL, DEFAULT_LINUX_URL, add_remote, clone_command, fetch_command
+from core.tui.git_ops import (
+    DEFAULT_CVE_URL,
+    DEFAULT_LINUX_URL,
+    DEFAULT_MANPAGES_URL,
+    add_remote,
+    clone_command,
+    fetch_command,
+)
 from core.tui.process_view import ProcessResult
-from core.tui.screens.git_manager import KIND_CVE, KIND_LINUX, GitManagerScreen
+from core.tui.screens.git_manager import (
+    KIND_CVE,
+    KIND_LINUX,
+    KIND_MANPAGES,
+    GitManagerScreen,
+)
 from core.tui.screens.git_select import GitRepoSelectScreen
 from core.tui.screens.main_menu import MainMenuScreen
 from tests.test_git_manager_screen import FakeRunner, _git_init
@@ -73,6 +85,7 @@ class TestRows(GitSelectTestBase):
         self.assertEqual(summary, [
             ("work", "repo", True, 2),
             ("linux", KIND_LINUX, False, 0),
+            ("man-pages", KIND_MANPAGES, False, 0),
             ("cve", KIND_CVE, False, 0),
         ])
 
@@ -133,6 +146,21 @@ class TestClone(GitSelectTestBase):
         self.assertEqual(screen.selected_row().candidate.path, dest)
         self.assertTrue(screen.selected_row().exists)
         self.assertIn("Cloned", screen.status_bar.message)
+
+    def test_clone_selected_manpages(self) -> None:
+        self.runner.effect = lambda argv: _git_init(Path(argv[-1]))
+        screen = self.make_screen()
+        self.select(screen, "man-pages")
+        screen.draw()
+        self.assertIn("Clone man-pages", self.text())
+        self.assertIn("[man  ]", self.text())
+        # Empty key queue: the URL prompt returns its default, the confirm dialog its default (Clone)
+        self.assertTrue(screen.handle_key(ord("c")))
+        dest = self.repos_dir / "man-pages"
+        self.assertEqual(self.runner.calls[0]["argv"], clone_command(DEFAULT_MANPAGES_URL, dest))
+        entry = next(r for r in self.app.config["repositories"] if r["path"] == str(dest))
+        self.assertEqual(entry["project"], "man-pages")
+        self.assertTrue(screen.selected_row().exists)
 
     def test_clone_selected_cve(self) -> None:
         self.runner.effect = lambda argv: _git_init(Path(argv[-1]))

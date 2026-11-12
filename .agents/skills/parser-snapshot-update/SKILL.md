@@ -25,6 +25,7 @@ Never read `*_API.md` from line 1. Jump directly to the relevant slice or run `p
 | **Rust AST** | `parser/rust_ast/` | `RUST_API.md` `[L21-L63]` | `python3 -m unittest tests.test_rust_ast` | `REGEN_GOLDEN=1 python3 -m unittest tests.test_rust_ast` |
 | **Git Commit AST** | `parser/git_ast/` | `GIT_API.md` `[L20-L63]` | `python3 -m unittest tests.test_git_commit_parser tests.test_commit_pipeline` | `UPDATE_SNAPSHOTS=1 python3 -m unittest unit_test.test_git_parser` |
 | **Maintainers** | `parser/maintainer_ast/` | `MAINTAINER_API.md` `[L22-L71]` | `python3 -m unittest tests.test_maintainer_ast tests.test_maintainer_files` | `UPDATE_SNAPSHOTS=1 python3 -m unittest unit_test.test_maintainer_parser` |
+| **Man Page AST** | `parser/man_ast/` | `MAN_API.md` `[L18-L43]` | `python3 -m unittest tests.test_man_ast` | — (no snapshots) |
 | **Raw / Fallback AST**| `parser/raw_ast/` | `RAW_AST_API.md` | `python3 -m unittest tests.test_raw_ast unit_test.test_raw_parser` | `UPDATE_SNAPSHOTS=1 python3 -m unittest unit_test.test_raw_parser` |
 | **Table Engine** | `table_engine/` | `table_engine/TE_API.md` `[L18-L59]` | `python3 -m unittest unit_test.test_table_engine unit_test.test_table_handling` | N/A |
 

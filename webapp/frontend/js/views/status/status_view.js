@@ -70,7 +70,7 @@ export class StatusView {
     const el = this.containerEl;
     if (!el) return;
     try {
-      this.data = await api.getIngestStatus();
+      this.data = await this.api.getIngestStatus();
       this.error = null;
     } catch (err) {
       this.error = err.message;

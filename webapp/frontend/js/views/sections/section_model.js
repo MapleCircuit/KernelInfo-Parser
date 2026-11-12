@@ -66,6 +66,24 @@ export function sectionParamsFromState(tab, params) {
   if (tab.listCollapsed) params.set("lc", "1");
 }
 
+/**
+ * Row a `sel` value addresses: the row whose key is `sel`, else the first whose key's last
+ * `:`-segment is `sel` — so a link naming a syscall (`sel=read`) selects `common:0:read` or `:0:read`
+ * without knowing its ABI and number. Null when none matches.
+ */
+export function findRowBySel(rows, rowKey, sel) {
+  const want = String(sel ?? "");
+  if (!want || !Array.isArray(rows)) return null;
+  const keyOf = (r) => String(rowKey(r));
+  const exact = rows.find((r) => keyOf(r) === want);
+  if (exact) return exact;
+  if (want.includes(":")) return null;
+  return rows.find((r) => {
+    const k = keyOf(r);
+    return k.includes(":") && k.slice(k.lastIndexOf(":") + 1) === want;
+  }) || null;
+}
+
 /** TSV export of rows for given columns [[header, row => value]]. */
 export function toTsv(rows, columns) {
   const clean = (v) => String(v ?? "").replace(/[\t\r\n]+/g, " ");

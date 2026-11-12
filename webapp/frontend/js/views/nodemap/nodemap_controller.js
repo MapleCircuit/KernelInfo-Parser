@@ -452,24 +452,24 @@ export class NodeMapController {
     if (node.expanded && (!node.constituents || node.constituents.length === 0)) {
       try {
         if (node.astId) {
-          const res = await api.getAstTree(this.currentVersion, node.astId);
+          const res = await this.api.getAstTree(this.currentVersion, node.astId);
           const children = res.node?.children || res.children || [];
           node.constituents = children.map((c) => ({ name: c.spelling || c.name || c.type_name }));
         } else if (node.title) {
           const cleanName = node.title.replace(/^struct\s+/, "").replace(/\(\)$/, "").trim();
           if (node.type === "struct" || node.title.startsWith("struct")) {
             // 404 when the revision defines no such struct: fall through to the definition's AST
-            const res = await api.getPaholeLayout(this.currentVersion, cleanName).catch(() => null);
+            const res = await this.api.getPaholeLayout(this.currentVersion, cleanName).catch(() => null);
             if (res && Array.isArray(res.members) && res.members.length > 0) {
               node.constituents = res.members.map((m) => ({ name: `${m.type} ${m.name}` }));
             }
           }
           if (!node.constituents || node.constituents.length === 0) {
             // The children of the definition's AST (symbol detail itself lists no members)
-            const detail = await api.getSymbolDetail(this.currentVersion, cleanName);
+            const detail = await this.api.getSymbolDetail(this.currentVersion, cleanName);
             const astId = detail?.definition?.ast_id;
             if (astId) {
-              const res = await api.getAstTree(this.currentVersion, astId);
+              const res = await this.api.getAstTree(this.currentVersion, astId);
               const children = res.node?.children || res.children || [];
               node.constituents = children.map((c) => ({ name: c.spelling || c.name || c.type_name }));
             }

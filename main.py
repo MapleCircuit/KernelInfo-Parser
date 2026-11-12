@@ -82,6 +82,12 @@ from core.config import (
     resolve_repo_path,
     sync_repositories,
     normalize_memory_mode,
+    LINUX_PROJECT,
+    MANPAGES_PROJECT,
+    MANPAGES_ROOT_COMMIT,
+    is_kernel_project,
+    project_display_name,
+    repository_project,
 )
 from core.ssh_tunnel import start_ssh_tunnel, stop_ssh_tunnel
 from core.Profiler import parse_duration, PipelineStageProfiler, format_profiling_report
@@ -1016,7 +1022,8 @@ def update(version: str, repo_path: str | None = None) -> None:
             layout_metric.count = stored
 
     # -------------------------------------------------------------------------
-    # STEP 6.9: Per-blob facts the database lacks (m_blob_facts: calls/ops tables, Kernel API macros)
+    # STEP 6.9: Per-blob facts the database lacks (m_blob_facts: calls/ops tables, Kernel API macros, includes,
+    # Kconfig definitions, doc labels, man page facts)
     # -------------------------------------------------------------------------
     with G.measure_stage("Step 6.9: Source Facts", units="blobs") as facts_metric:
         extracted = processing_source_facts(version)
@@ -2869,8 +2876,15 @@ def main() -> None:
     logger.info(f"[Repository] Using '{(repo_entry or {}).get('name', repo_path)}' at {repo_path}")
 
     # The CVE list (cve.repo_dir) is ingested when its HEAD moved, and its abbreviated commit hashes resolved
-    # in this repository; --cve does only this
-    if role != distributed.ROLE_WORKER and (getattr(args, "cve", False) or not getattr(args, "no_cve", False)):
+    # in this repository; --cve does only this. A repository of a project that is not a kernel tree (man-pages)
+    # has no kernel commits to resolve: the CVE list is left to the kernel repository's runs
+    if repo_entry is None:
+        kernel_repo = is_kernel_project(repo_project_slug(repo_path, [MF.get_root_commit() or ""]))
+    else:
+        kernel_repo = is_kernel_project(repository_project(repo_entry))
+    if not kernel_repo and getattr(args, "cve", False):
+        logger.warning(COLOR.yellow(f"[CVE] '{repo_path}' is not a kernel repository; --cve has nothing to resolve in it."))
+    if kernel_repo and role != distributed.ROLE_WORKER and (getattr(args, "cve", False) or not getattr(args, "no_cve", False)):
         _cve_net, cve_repo_id = resolve_git_network_and_repo(repo_path)
         summary = processing_cve_list(force=bool(getattr(args, "cve_full", False)), kernel_repo=repo_path, repo_id=cve_repo_id)
         if summary and summary.get("state") == "current":
@@ -3087,9 +3101,12 @@ def main() -> None:
                 repo_dir=repo_path,
             )
         if getattr(args, "delegate_stable", True):
+            # Every project: the stable / next chains of the repository's release tags (any tag scheme,
+            # release_order.release_tag_names) and the delegated branches are published above; the master
+            # keeps the mainline release tags and the trunk branches
             from parser.git_ast import release_order
-            ranges = release_order.release_ranges(target_refs)
-            mainline_set = {r["tag"] for r in ranges if r["kind"] == "mainline"}
+            releases = set(release_order.release_tag_names(all_tags))
+            mainline_set = {r["tag"] for r in release_order.release_ranges(releases) if r["kind"] == "mainline"}
             trunk_refs = {"history/master", "history/HEAD", "master", "main", "origin/master", "origin/main"}
             orig_len = len(target_refs)
             target_refs = [t for t in target_refs if t in mainline_set or t in trunk_refs]
@@ -3589,7 +3606,7 @@ def arg_handling() -> argparse.Namespace:
         "--backfill-facts",
         dest="backfill_facts",
         action="store_true",
-        help="Fill m_blob_facts (per-blob facts, families 1-5) for the blobs of every finished version that lack "
+        help="Fill m_blob_facts (per-blob facts, families 1-6) for the blobs of every finished version that lack "
              "them, then exit (core/API.md section 12)",
     )
     parser.add_argument(
@@ -3597,7 +3614,7 @@ def arg_handling() -> argparse.Namespace:
         dest="facts_families",
         type=lambda v: [int(x) for x in v.split(",") if x.strip()],
         default=None,
-        metavar="1,2,3,4,5",
+        metavar="1,2,3,4,5,6",
         help="With --backfill-facts: only these fact families",
     )
     parser.add_argument(
@@ -3948,6 +3965,8 @@ def arg_handling() -> argparse.Namespace:
             "tests.test_webapp_hover",
             "tests.test_webapp_source_index",
             "tests.test_facts_ingest",
+            "tests.test_man_ast",
+            "tests.test_webapp_man",
             "tests.test_kapi_facts",
             "tests.test_checkpoints",
             "tests.test_webapp_ops",
@@ -4003,22 +4022,59 @@ def arg_handling() -> argparse.Namespace:
 
 
 _network_repo_cache: dict[tuple[str, str, str, str], tuple[int, int]] = {}
+# repo_dir (absolute) -> project slug of its repositories[] entry (configured `project`, else by root commit)
+_repo_project_cache: dict[str, str] = {}
+
+
+def repo_project_slug(repo_dir: str | None = None, roots: Iterable[str] | None = None) -> str:
+    """Project slug of the git tree at `repo_dir`: the `project` of its repositories[] entry, else `man-pages`
+    for a tree rooted at the man-pages root commit, else `linux`."""
+    repo_dir = repo_dir or getattr(MF, "repo_dir", None) or "linux"
+    key = os.path.abspath(repo_dir)
+    if key in _repo_project_cache:
+        return _repo_project_cache[key]
+    entry = None
+    with contextlib.suppress(Exception):
+        entry = get_repository(key)
+    if entry and str(entry.get("project") or "").strip():
+        slug = repository_project(entry)
+    elif roots is not None:
+        slug = MANPAGES_PROJECT if MANPAGES_ROOT_COMMIT in set(roots) else LINUX_PROJECT
+    else:
+        return LINUX_PROJECT
+    _repo_project_cache[key] = slug
+    return slug
+
+
+def kernel_steps_apply() -> bool:
+    """False while the version being ingested belongs to a project known not to be a kernel tree (`man-pages`):
+    the Linux-only steps (Kbuild rules, ARCH layouts, MAINTAINERS matching) are skipped for it."""
+    return is_kernel_project(getattr(gp, "project_slug", None) or LINUX_PROJECT)
 
 
 def resolve_git_network_and_repo(
     repo_dir: str | None = None,
     repo_name: str | None = None,
-    project_name: str = "Linux Kernel",
-    project_slug: str = "linux",
+    project_name: str | None = None,
+    project_slug: str | None = None,
 ) -> tuple[int, int]:
-    """Discover or register m_project, m_git_network, and m_repository for the given git tree."""
+    """Discover or register m_project, m_git_network, and m_repository for the given git tree.
+
+    The project comes from the tree's repositories[] entry (`repo_project_slug()`) unless `project_slug` is given:
+    `linux` ("Linux Kernel"), `man-pages` ("Linux man-pages"), or any other slug (named after itself); its network is
+    `<slug>-network`. The slug is kept in `gp.project_slug` for the per-version steps (`kernel_steps_apply()`)."""
     repo_dir = repo_dir or getattr(MF, "repo_dir", None) or "linux"
-    cache_key = (os.path.abspath(repo_dir), repo_name or "", project_name, project_slug)
-    if cache_key in _network_repo_cache:
-        net_id, r_id = _network_repo_cache[cache_key]
-        gp.network_id = net_id
-        gp.repo_id = r_id
-        return net_id, r_id
+    abs_dir = os.path.abspath(repo_dir)
+    if project_slug is None and abs_dir in _repo_project_cache:
+        project_slug = _repo_project_cache[abs_dir]
+    if project_slug is not None:
+        cache_key = (abs_dir, repo_name or "", project_name or project_display_name(project_slug), project_slug)
+        if cache_key in _network_repo_cache:
+            net_id, r_id = _network_repo_cache[cache_key]
+            gp.network_id = net_id
+            gp.repo_id = r_id
+            gp.project_slug = project_slug
+            return net_id, r_id
 
     git_dir = os.path.join(repo_dir, ".git") if os.path.isdir(os.path.join(repo_dir, ".git")) else repo_dir
 
@@ -4039,6 +4095,18 @@ def resolve_git_network_and_repo(
         root_bytes = bytes.fromhex(root_hex) if len(root_hex) == 40 else b"\x00" * 20
     else:
         root_bytes = b"\x00" * 20
+
+    if project_slug is None:
+        project_slug = repo_project_slug(repo_dir, roots)
+    if project_name is None:
+        project_name = project_display_name(project_slug)
+    cache_key = (abs_dir, repo_name or "", project_name, project_slug)
+    if cache_key in _network_repo_cache:
+        net_id, r_id = _network_repo_cache[cache_key]
+        gp.network_id = net_id
+        gp.repo_id = r_id
+        gp.project_slug = project_slug
+        return net_id, r_id
 
     if not repo_name:
         repo_name = os.path.basename(os.path.abspath(repo_dir)) or "linux"
@@ -4096,6 +4164,7 @@ def resolve_git_network_and_repo(
 
     gp.network_id = network_id
     gp.repo_id = repo_id
+    gp.project_slug = project_slug
     _network_repo_cache[cache_key] = (network_id, repo_id)
     return network_id, repo_id
 
@@ -6208,9 +6277,10 @@ def processing_kbuild(
     Rows are keyed by the Makefile's (blob, path), since the targets resolve against its directory: only
     the (fnid, blob_id) pairs in `new_pairs` (None: every file) are parsed, and a Makefile carried over
     at the same path keeps the rows computed when it first appeared there. Every binding is kept, also
-    when its target file does not exist. `staged_file_refs` is unused (kept for callers).
+    when its target file does not exist. `staged_file_refs` is unused (kept for callers). Skipped for a project
+    that is not a kernel tree (`kernel_steps_apply()`: the man-pages' GNUmakefile is no Kbuild file).
     """
-    if gp.VID == 0:
+    if gp.VID == 0 or not kernel_steps_apply():
         return
     from parser.kbuild_parser import KbuildParser
     from parser import kbuild_symbols
@@ -6560,8 +6630,9 @@ def processing_maintainer_files(version: str) -> None:
     A (sec_id, fnid) row holds for every MAINTAINERS blob containing that section version, so only the
     sections new or changed since the base version are matched against every path, and the unchanged ones
     against the paths new in this version. Nothing is parsed when neither exists. The matching is not cut
-    short by the duration limit: a section matched against part of the tree only would stay incomplete."""
-    if gp.VID == 0:
+    short by the duration limit: a section matched against part of the tree only would stay incomplete.
+    Skipped for a project that is not a kernel tree (`kernel_steps_apply()`)."""
+    if gp.VID == 0 or not kernel_steps_apply():
         return
     from parser.maintainer_ast import maintainer_store
 
@@ -6643,8 +6714,11 @@ def processing_arch_layouts(version: str) -> int:
     source and include directories, build-time symlinks, generated asm-generic wrappers and forced
     includes, evaluated from the version's own Makefiles. A layout is stored once (m_arch_layout, keyed by
     `layout_digest()`, its rows in m_arch_layout_entry); the version's m_arch_root rows point at it.
-    Returns the number of layout rows written (0 when every layout already existed)."""
-    if gp.VID == 0 or not getattr(gp, "file_blob_hashes", None):
+    Returns the number of layout rows written (0 when every layout already existed). Skipped for a project that
+    is not a kernel tree (`kernel_steps_apply()`) and for a tree with neither a top Makefile nor an `arch/` file."""
+    if gp.VID == 0 or not getattr(gp, "file_blob_hashes", None) or not kernel_steps_apply():
+        return 0
+    if "Makefile" not in gp.file_blob_hashes and not any(p.startswith("arch/") for p in gp.file_blob_hashes):
         return 0
     tree = Tree(gp.file_blob_hashes)
 
@@ -6706,8 +6780,8 @@ def processing_arch_layouts(version: str) -> int:
 def processing_source_facts(version: str) -> int:
     """Step 6.9: extract the per-blob facts `m_blob_facts` lacks of this version's files (parser/facts_ingest.py):
     functions, calls and ops tables of the `.c` / `.h` blobs (family 1), Kernel API macros of the `.c` / `.h` / `.S`
-    blobs (family 2), their `#include` directives (family 3), Kconfig definitions (family 4) and Documentation
-    labels (family 5), each blob read once; returns how many blobs were extracted."""
+    blobs (family 2), their `#include` directives (family 3), Kconfig definitions (family 4), Documentation
+    labels (family 5) and man page facts (family 6), each blob read once; returns how many blobs were extracted."""
     if gp.VID == 0 or not getattr(gp, "file_blob_hashes", None):
         return 0
     blobs = facts_ingest.fact_blobs(gp.file_blob_hashes)
@@ -6859,7 +6933,8 @@ def run_automatic_backfills(args: argparse.Namespace) -> None:
                 backfills.backfill_commit_relations(db, str(MF.repo_dir))
         if not finished:
             return
-        if kbuild_empty:
+        # The Kbuild backfill reads the Makefiles of this run's repository: none for a project that is not a kernel tree
+        if kbuild_empty and kernel_steps_apply():
             if getattr(args, "no_backfill", False):
                 logger.info("[Backfill Kbuild] m_kbuild_symbol is empty; skipped (--no-backfill). Run --backfill-kbuild to fill it.")
             else:

@@ -6,7 +6,7 @@
 export const SESSION_FORMAT = "kip-session";
 export const MAX_SESSION_BYTES = 5 << 20;
 export const TAB_TYPES = ["code", "kconfig", "explorer", "mail", "nodemap", "maintainers", "commits", "pahole", "callgraph",
-  "diff", "treemap", "search", "status", "patch", "bookmarks", "api", "insights"];
+  "diff", "treemap", "search", "status", "patch", "bookmarks", "api", "insights", "man"];
 
 export const profileKeyOf = (version, arch, name = "") => `${version}|${arch}${String(name || "").trim() ? `|${String(name).trim()}` : ""}`;
 
@@ -151,4 +151,29 @@ export function resolveSessionImport(imported, plan, choices, freeName) {
     }
   }
   return { session, profiles, toolchains, copies };
+}
+
+/**
+ * Repositories of an imported session's tabs (§5.18): a tab without one belongs to the file's `repository`;
+ * a tab naming a repository this server does not have (`known`, configured names; empty = unknown, nothing
+ * remapped) moves to `fallback`. Returns {panes, missing: [names not configured here]}; the input is not changed.
+ */
+export function remapSessionRepos(panes, { fileRepo = "", known = [], fallback = "" } = {}) {
+  const have = new Set(known);
+  const missing = new Set();
+  const out = (panes || []).map((p) => ({
+    ...p,
+    tabs: (p.tabs || []).map((t) => {
+      let repo = typeof t.repo === "string" && t.repo ? t.repo : fileRepo;
+      if (repo && have.size && !have.has(repo)) {
+        missing.add(repo);
+        repo = fallback;
+      }
+      const tab = { ...t };
+      if (repo) tab.repo = repo;
+      else delete tab.repo;
+      return tab;
+    }),
+  }));
+  return { panes: out, missing: [...missing] };
 }

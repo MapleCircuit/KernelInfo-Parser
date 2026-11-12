@@ -130,6 +130,44 @@ class TestReleaseStatsSources(unittest.TestCase):
         state = ins.release_stats("v3.1", wait=60)
         self.assertEqual((state["state"], state["result"]["source"], state["result"]["commits"]), ("done", "git", 4))
 
+    def test_prefixed_repository(self) -> None:
+        """A repository tagged `man-pages-X.Y` (no kernel-scheme tag) answers release stats from both sources."""
+        from parser.git_ast import release_stats as rst
+        for old_tag, new_tag in (("v3.0", "man-pages-6.00"), ("v3.1-rc1", "man-pages-6.1-rc1"),
+                                 ("v3.1", "man-pages-6.01"), ("v3.0.1", "man-pages-6.00.1")):
+            self.git("tag", new_tag, f"{old_tag}^{{commit}}")
+            self.git("tag", "-d", old_tag)
+        for table in ("m_release_segment", "m_release_person", "m_person_first_release", "m_commit_release"):
+            self.cnx.db.execute(f"DELETE FROM {table}")
+        rst.ingest(self.cnx, self.dir, repo_id=1)
+        rs._TAGS_CACHE.clear()
+        ins._RANGES.clear()
+        self.assertEqual(rs.releases("mainline"), ["man-pages-6.00", "man-pages-6.1-rc1", "man-pages-6.01"])
+        rng = ins._release_range("man-pages-6.01")
+        self.assertEqual(rng, {"range_base": "man-pages-6.00", "kind": "mainline",
+                               "tags": {"man-pages-6.1-rc1": "man-pages-6.00", "man-pages-6.01": "man-pages-6.1-rc1"}})
+        self.assertEqual(ins._release_range("man-pages-6.00")["tags"], {"man-pages-6.00": None})
+        self.assertEqual(ins._health_window("man-pages-6.01", 4), ["man-pages-6.00", "man-pages-6.01"])
+        for tag in ("man-pages-6.01", "man-pages-6.00.1"):
+            db, git = ins.db_release_stats(tag), ins.compute_release_stats(tag)
+            self.assertEqual((db.pop("source"), git.pop("source")), ("database", "git"))
+            if tag != "man-pages-6.00.1":
+                for r in (db, git):
+                    r.pop("first_time_authors"), r.pop("first_timers")
+            self.assertEqual(db, git, tag)
+        db = ins.db_release_stats("man-pages-6.01")
+        self.assertEqual((db["prev"], db["commits"], db["merges"], db["rc_count"]), ("man-pages-6.00", 4, 1, 1))
+        self.assertEqual(sorted(p["person"] for p in db["first_timers"]), ["Cy D", "Neo N"])
+        self.assertEqual(ins.release_stats("man-pages-6.01")["result"]["source"], "database")
+        # Another prefixed family has chains of its own: it joins neither the range nor the health window
+        self.git("tag", "for-review-1.0", "master")
+        rs._TAGS_CACHE.clear()
+        ins._RANGES.clear()
+        self.assertEqual(ins._release_range("for-review-1.0"), {"range_base": None, "kind": "mainline",
+                                                                "tags": {"for-review-1.0": None}})
+        self.assertEqual(ins._release_range("man-pages-6.00")["tags"], {"man-pages-6.00": None})
+        self.assertEqual(ins._health_window("man-pages-6.01", 4), ["man-pages-6.00", "man-pages-6.01"])
+
 
 if __name__ == "__main__":
     unittest.main()

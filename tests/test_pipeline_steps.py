@@ -497,5 +497,91 @@ class TestSymbolTableAllocation(unittest.TestCase):
         reader.close()
 
 
+
+class TestNonKernelProjects(unittest.TestCase):
+    """Projects from repositories[].project (m_project / m_git_network) and the kernel-only steps a man-pages
+    tree skips (core/API.md section 7.1.1)."""
+
+    def setUp(self) -> None:
+        from unittest import mock
+        self.mock = mock
+        self.saved = (G.DB, main.gp.VID, getattr(main.gp, "project_slug", None), getattr(main.gp, "file_blob_hashes", None))
+        _reset_mock_db()
+        G.DB = MockDB
+        main._network_repo_cache.clear()
+        main._repo_project_cache.clear()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.repo = os.path.join(self.tmp.name, "pages")
+        env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+               "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
+        subprocess.run(["git", "init", "-q", "-b", "master", self.repo], check=True, env=env)
+        subprocess.run(["git", "-C", self.repo, "commit", "-q", "--allow-empty", "-m", "c0"], check=True, env=env)
+
+    def tearDown(self) -> None:
+        G.DB, main.gp.VID, main.gp.project_slug, main.gp.file_blob_hashes = self.saved
+        main._network_repo_cache.clear()
+        main._repo_project_cache.clear()
+        _reset_mock_db()
+        self.tmp.cleanup()
+
+    def _resolve(self, entry):
+        with self.mock.patch.object(main, "get_repository", return_value=entry):
+            return main.resolve_git_network_and_repo(self.repo)
+
+    def test_manpages_entry_gets_its_own_project_and_network(self) -> None:
+        from core.DBLayout import m_git_network, m_project, m_repository
+        net_id, repo_id = self._resolve({"name": "man-pages", "path": self.repo, "project": "man-pages"})
+        self.assertEqual(main.gp.project_slug, "man-pages")
+        self.assertFalse(main.kernel_steps_apply())
+        projects = list(MockDB._global_store[m_project.table_name].values())
+        self.assertEqual([(p[1], p[2]) for p in projects], [("Linux man-pages", "man-pages")])
+        networks = list(MockDB._global_store[m_git_network.table_name].values())
+        self.assertEqual([(n[0], n[1], n[2]) for n in networks], [(net_id, projects[0][0], "man-pages-network")])
+        self.assertIn(repo_id, [r[0] for r in MockDB._global_store[m_repository.table_name].values()])
+        # Cached: a second call answers without the configuration
+        with self.mock.patch.object(main, "get_repository", side_effect=AssertionError("looked up again")):
+            self.assertEqual(main.resolve_git_network_and_repo(self.repo), (net_id, repo_id))
+
+    def test_unconfigured_tree_stays_linux(self) -> None:
+        from core.DBLayout import m_git_network, m_project
+        self._resolve(None)
+        self.assertEqual(main.gp.project_slug, "linux")
+        self.assertTrue(main.kernel_steps_apply())
+        projects = list(MockDB._global_store[m_project.table_name].values())
+        self.assertEqual([(p[1], p[2]) for p in projects], [("Linux Kernel", "linux")])
+        self.assertEqual([n[2] for n in MockDB._global_store[m_git_network.table_name].values()], ["linux-network"])
+
+    def test_project_slug_from_root_commit_and_explicit_arguments(self) -> None:
+        from core.config import MANPAGES_ROOT_COMMIT
+        with self.mock.patch.object(main, "get_repository", return_value=None):
+            self.assertEqual(main.repo_project_slug(self.repo, [MANPAGES_ROOT_COMMIT]), "man-pages")
+            main._repo_project_cache.clear()
+            self.assertEqual(main.repo_project_slug(self.repo, ["0" * 40]), "linux")
+        with self.mock.patch.object(main, "get_repository", return_value={"project": "linux-stable"}):
+            main._repo_project_cache.clear()
+            self.assertEqual(main.repo_project_slug(self.repo, []), "linux-stable")
+        main._repo_project_cache.clear()
+        main.resolve_git_network_and_repo(self.repo, project_slug="rt")
+        self.assertEqual(main.gp.project_slug, "rt")
+        from core.DBLayout import m_project
+        self.assertIn(("rt", "rt"), [(p[1], p[2]) for p in MockDB._global_store[m_project.table_name].values()])
+
+    def test_kernel_only_steps_skip_manpages(self) -> None:
+        main.gp.VID = 5
+        main.gp.project_slug = "man-pages"
+        main.gp.file_blob_hashes = {"GNUmakefile": b"\1" * 20, "man/man2/read.2": b"\2" * 20}
+        boom = AssertionError("kernel-only step ran")
+        with self.mock.patch.object(main, "_version_file_list", side_effect=boom), \
+                self.mock.patch.object(main, "get_fid_for_path", side_effect=boom), \
+                self.mock.patch.object(main, "compute_layout_rows", side_effect=boom):
+            main.processing_kbuild("man-pages-6.9")
+            main.processing_maintainer_files("man-pages-6.9")
+            self.assertEqual(main.processing_arch_layouts("man-pages-6.9"), 0)
+        # A kernel project without any kernel build input skips the ARCH layouts too
+        main.gp.project_slug = "linux"
+        with self.mock.patch.object(main, "compute_layout_rows", side_effect=boom):
+            self.assertEqual(main.processing_arch_layouts("v0"), 0)
+
+
 if __name__ == "__main__":
     unittest.main()

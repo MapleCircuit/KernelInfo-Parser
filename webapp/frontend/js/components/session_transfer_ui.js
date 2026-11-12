@@ -12,7 +12,7 @@ import { localDB } from "../db.js";
 import { sessionManager } from "../session_manager.js";
 import { toast } from "./toast.js";
 import { openModal, escapeHtml, downloadText } from "./modal.js";
-import { buildSessionExport, planSessionImport, profileKeyOf, referencedProfileKeys, resolveSessionImport, validateSessionFile } from "../utils/session_transfer.js";
+import { buildSessionExport, planSessionImport, profileKeyOf, referencedProfileKeys, remapSessionRepos, resolveSessionImport, validateSessionFile } from "../utils/session_transfer.js";
 import { importRecords, mergeImport } from "../utils/user_records.js";
 
 export async function exportSessionDialog(sessionId) {
@@ -36,7 +36,7 @@ export async function exportSessionDialog(sessionId) {
       session, profiles, toolchains: sessionManager.getSharedKconfigToolchains(),
       includeAll: modal.body.querySelector("#sx-all").checked,
       userRecords: modal.body.querySelector("#sx-user").checked ? await localDB.userList() : null,
-      build: window.KIP_BUILD || "", repo: session.repo || api.repo || "",
+      build: window.KIP_BUILD || "", repo: session.repo || state.currentRepo || "",
     });
     const slug = (session.name || "session").replace(/[^\w.-]+/g, "_").slice(0, 40);
     downloadText(`kip-session-${slug}-${new Date().toISOString().slice(0, 10)}.json`, JSON.stringify(doc, null, 1), "application/json");
@@ -78,16 +78,21 @@ export async function importSessionText(text, onDone = null) {
     toast.error(`Cannot import: ${err.message}`);
     return;
   }
-  let repo = imported.repository;
+  // Every tab keeps its project; tabs of a repository this server does not have move to the active one
+  const fallback = state.activeRepo() || "";
+  let known = [];
   try {
-    const projects = (await api.getProjects?.())?.projects || [];
-    if (repo && projects.length && !projects.some((p) => p.repo === repo || p.slug === repo)) {
-      if (!confirm(`This session was exported from repository “${repo}”, which this server does not have.\n\nImport it into the active repository “${api.repo || state.currentRepo}” instead?`)) return;
-      repo = api.repo || state.currentRepo || "";
-    }
+    known = ((await api.getProjects?.())?.projects || []).flatMap((p) => [p.repo, p.slug].filter(Boolean));
   } catch {
-    // projects unavailable: keep the exported name
+    // projects unavailable: keep the exported names
   }
+  const mapped = remapSessionRepos(imported.session.panes, { fileRepo: imported.repository, known, fallback });
+  if (mapped.missing.length) {
+    if (!confirm(`This session has tabs of ${mapped.missing.map((r) => `“${r}”`).join(", ")}, which this server does not have.\n\nOpen those tabs in “${fallback}” instead?`)) return;
+  }
+  imported.session.panes = mapped.panes;
+  let repo = imported.repository;
+  if (repo && known.length && !known.includes(repo)) repo = fallback;
   const localProfiles = sessionManager.getSharedKconfigProfiles();
   const plan = planSessionImport(imported, localProfiles);
   const tabCount = imported.session.panes.reduce((n, p) => n + p.tabs.length, 0);

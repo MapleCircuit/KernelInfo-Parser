@@ -1,49 +1,50 @@
 # WebApp Frontend Client Architecture & Module Specifications (`webapp/API_FRONTEND.md`)
 
-Authoritative specification for Section 5 (`§5.0`–`§5.37`) of the WebApp subsystem. For core architecture, security, caching, sync, and configuration (`§1`–`§3`, `§6`–`§8`), see `webapp/API.md`. For REST API endpoints (`§4.1`–`§4.12`), see `webapp/API_ENDPOINTS.md`.
+Authoritative specification for Section 5 (`§5.0`–`§5.38`) of the WebApp subsystem. For core architecture, security, caching, sync, and configuration (`§1`–`§3`, `§6`–`§8`), see `webapp/API.md`. For REST API endpoints (`§4.1`–`§4.13`), see `webapp/API_ENDPOINTS.md`.
 
 ---
 
 ## Table of Contents
 - 5. Frontend Client Architecture & Module Specifications
-  - 5.0. Interaction Invariant: No Unrequested Change Without Confirmation [L54-L143]
-  - 5.1. `ApiClient` (`webapp/frontend/js/api.js`) [L144-L225]
-  - 5.2. `AstOverlay` (`webapp/frontend/js/views/code_view/ast_overlay.js`) [L226-L279]
-  - 5.3. `NodeRenderer` & Drag Controller (`webapp/frontend/js/views/nodemap/`) [L280-L292]
-  - 5.4. `FidelityClipboard` (`webapp/frontend/js/views/code_view/fidelity_clipboard.js`) [L293-L297]
-  - 5.5. `LocalDatabase` & Storage Settings (`webapp/frontend/js/db.js`, `webapp/frontend/js/app.js`) [L298-L406]
-  - 5.6. Context Menu & Cross-References Modal (`webapp/frontend/js/components/context_menu.js`) [L407-L479]
-  - 5.7. `IncludeSymbolsPopover` (`webapp/frontend/js/components/include_symbols_popover.js`) [L480-L494]
-  - 5.8. `KconfigView` & `KconfigEngine` (`webapp/frontend/js/views/kconfig/`) [L495-L692]
-  - 5.9. Universal Middle-Click Tab & Navigation Capture [L693-L733]
-  - 5.10. Developer Profiles & Kconfig Compiled Source Navigation [L734-L776]
-  - 5.11. Compare View: Files & Kconfig Between Any Two Revisions (`diff_view.js`) [L777-L850]
-  - 5.12. Git Commits Timeline & Bi-Directional Pagination (`commits_view.js`) [L851-L949]
-  - 5.13. Header Navigation, Version Selector, Apply & Responsive Controls [L950-L1071]
-  - 5.14. Documentation Viewer (`webapp/frontend/js/views/docs/`) [L1072-L1184]
-  - 5.15. Command Palette (`webapp/frontend/js/components/command_palette.js`) [L1185-L1213]
-  - 5.16. `#ifdef` Dimming (`directive_evaluator.js`) [L1214-L1280]
-  - 5.17. Treemap, Symbol History & Patch Staging [L1281-L1334]
-  - 5.18. Projects (Multiple Repositories) [L1335-L1350]
-  - 5.19. Definition Context & Picker (`definition_picker.js`) [L1351-L1374]
-  - 5.20. Repository Explorer Tab (`explorer_view.js`) [L1375-L1396]
-  - 5.21. Code View Toolbar, Saved Position & Minimap (`virtual_editor.js`) [L1397-L1553]
-  - 5.22. Mailing List & LKML Discussions Tab (`mail_view.js`) [L1554-L1678]
-  - 5.23. Multi-Window Workspace Sessions & Coordination (`session_manager.js`) [L1679-L1814]
-  - 5.24. Universal Tab Drag-and-Drop, Pane Transfers & Tab Menu (`tabs.js`) [L1815-L1917]
-  - 5.25. Multi-Pane Split Editor Layout & Resizable Dividers (`tabs.js`) [L1918-L1938]
-  - 5.26. Deep Links: URL Hash as Tab Address (`url_sync.js`) [L1939-L2049]
-  - 5.27. Explorer Sidebar Collapse (`app.js`, `layout.css`) [L2050-L2072]
-  - 5.28. Tab Scroll Memory (`scroll_memory.js`) [L2073-L2108]
-  - 5.29. Kernel API Tab (`kernel_api_view.js`) & Sectioned Tabs (`sections/`) [L2109-L2161]
-  - 5.30. Insights Tab (`webapp/frontend/js/views/insights/`) [L2162-L2203]
-  - 5.31. Keyboard Shortcuts (`shortcuts.js`) [L2204-L2256]
-  - 5.32. Change Preview Component (`change_preview.js`, `kconfig_dry_run.js`) [L2257-L2283]
-  - 5.33. Patch Series Tab (`patch_series_view.js`, `series_model.js`) [L2284-L2303]
-  - 5.34. Search Tab: Full-Text Code Search (`search_view.js`) [L2304-L2326]
-  - 5.35. Bookmarks, Notes & Code Tours (`webapp/frontend/js/views/bookmarks/`) [L2327-L2356]
-  - 5.36. Watch List (`webapp/frontend/js/views/watch/`) [L2357-L2379]
-  - 5.37. Parser Status Tab (`status_view.js`, `status_model.js`) [L2380-L2395]
+  - 5.0. Interaction Invariant: No Unrequested Change Without Confirmation [L55-L144]
+  - 5.1. `ApiClient` (`webapp/frontend/js/api.js`) [L145-L238]
+  - 5.2. `AstOverlay` (`webapp/frontend/js/views/code_view/ast_overlay.js`) [L239-L292]
+  - 5.3. `NodeRenderer` & Drag Controller (`webapp/frontend/js/views/nodemap/`) [L293-L305]
+  - 5.4. `FidelityClipboard` (`webapp/frontend/js/views/code_view/fidelity_clipboard.js`) [L306-L310]
+  - 5.5. `LocalDatabase` & Storage Settings (`webapp/frontend/js/db.js`, `webapp/frontend/js/app.js`) [L311-L422]
+  - 5.6. Context Menu & Cross-References Modal (`webapp/frontend/js/components/context_menu.js`) [L423-L495]
+  - 5.7. `IncludeSymbolsPopover` (`webapp/frontend/js/components/include_symbols_popover.js`) [L496-L510]
+  - 5.8. `KconfigView` & `KconfigEngine` (`webapp/frontend/js/views/kconfig/`) [L511-L708]
+  - 5.9. Universal Middle-Click Tab & Navigation Capture [L709-L749]
+  - 5.10. Developer Profiles & Kconfig Compiled Source Navigation [L750-L792]
+  - 5.11. Compare View: Files & Kconfig Between Any Two Revisions (`diff_view.js`) [L793-L866]
+  - 5.12. Git Commits Timeline & Bi-Directional Pagination (`commits_view.js`) [L867-L965]
+  - 5.13. Header Navigation, Version Selector, Apply & Responsive Controls [L966-L1090]
+  - 5.14. Documentation Viewer (`webapp/frontend/js/views/docs/`) [L1091-L1203]
+  - 5.15. Command Palette (`webapp/frontend/js/components/command_palette.js`) [L1204-L1232]
+  - 5.16. `#ifdef` Dimming (`directive_evaluator.js`) [L1233-L1299]
+  - 5.17. Treemap, Symbol History & Patch Staging [L1300-L1353]
+  - 5.18. Projects (Multiple Repositories) [L1354-L1396]
+  - 5.19. Definition Context & Picker (`definition_picker.js`) [L1397-L1420]
+  - 5.20. Repository Explorer Tab (`explorer_view.js`) [L1421-L1442]
+  - 5.21. Code View Toolbar, Saved Position & Minimap (`virtual_editor.js`) [L1443-L1599]
+  - 5.22. Mailing List & LKML Discussions Tab (`mail_view.js`) [L1600-L1724]
+  - 5.23. Multi-Window Workspace Sessions & Coordination (`session_manager.js`) [L1725-L1861]
+  - 5.24. Universal Tab Drag-and-Drop, Pane Transfers & Tab Menu (`tabs.js`) [L1862-L1964]
+  - 5.25. Multi-Pane Split Editor Layout & Resizable Dividers (`tabs.js`) [L1965-L1985]
+  - 5.26. Deep Links: URL Hash as Tab Address (`url_sync.js`) [L1986-L2104]
+  - 5.27. Explorer Sidebar Collapse (`app.js`, `layout.css`) [L2105-L2127]
+  - 5.28. Tab Scroll Memory (`scroll_memory.js`) [L2128-L2163]
+  - 5.29. Kernel API Tab (`kernel_api_view.js`) & Sectioned Tabs (`sections/`) [L2164-L2221]
+  - 5.30. Insights Tab (`webapp/frontend/js/views/insights/`) [L2222-L2263]
+  - 5.31. Keyboard Shortcuts (`shortcuts.js`) [L2264-L2316]
+  - 5.32. Change Preview Component (`change_preview.js`, `kconfig_dry_run.js`) [L2317-L2343]
+  - 5.33. Patch Series Tab (`patch_series_view.js`, `series_model.js`) [L2344-L2363]
+  - 5.34. Search Tab: Full-Text Code Search (`search_view.js`) [L2364-L2386]
+  - 5.35. Bookmarks, Notes & Code Tours (`webapp/frontend/js/views/bookmarks/`) [L2387-L2416]
+  - 5.36. Watch List (`webapp/frontend/js/views/watch/`) [L2417-L2439]
+  - 5.37. Parser Status Tab (`status_view.js`, `status_model.js`) [L2440-L2456]
+  - 5.38. Man Pages Tab & Renderer (`webapp/frontend/js/views/man/`) [L2457-L2510]
 
 ---
 
@@ -178,8 +179,20 @@ Handles unified HTTP communication, response caching, offline fallback, and netw
   answered by refetching the full catalog, a failure or an offline reply keeps the catalog held. Concurrent
   calls of the same kind share one request; the decoded answer is kept in memory per repository and
   generation.
+- **Repository of a request (§5.18)**: `api.repo` is the active tab's repository (else the header's Project,
+  `state.currentRepo`); `api.forRepo(repo)` / `api.forTab(tab)` return a client bound to one repository
+  (memoized `Proxy` over the shared client: every method, `X-KI-Repo`, `withRepo()` URLs, IndexedDB cache
+  keys and `versionStamps` name that repository, while reachability, the spinner, the heartbeat and the
+  version memos stay shared — writes go to the shared client). `bindViewApi(view, tabId)` gives each per-tab
+  view `view.api`, resolving its tab by id at every call (tabs.js binds every view it creates), so a view of a
+  background tab or another pane keeps asking its own repository. Views and their helpers (hover card,
+  outline, blame, ⇄ Diff picker, documentation page, Kconfig workflows, section fetchers via `ctx.api`) use
+  that client; global components (palette, context menu, modals, ref picker) use the shared one, i.e. the
+  active tab's repository (a click or context menu activates its pane first, in the capture phase).
+  `versionStamps` is kept per repository (`_stampsByRepo`).
 - `_fetchJson(url, options, timeoutMs)`: The fetch shared by `request()` and `getVersions()`: timeout, loading
-  indicator, `X-KI-Repo`, reachability and `X-KIP-Sync` handling; resolves to `{response, data}` (`data` null
+  indicator, `X-KI-Repo` of the client's repository, reachability and `X-KIP-Sync` handling (`onSyncHeader(value,
+  repo)`); resolves to `{response, data}` (`data` null
   for a `304`), rejects on transport failure, timeout or an HTTP error status.
 - `getVersionsCached(includeRc)`: That in-memory catalog — refreshed by every `getVersions()` call (startup,
   each sync refresh, §2.11) — fetched only when this page has none yet. Used where a lookup must not wait on
@@ -339,8 +352,11 @@ client-side fallback:
 - **Server Synchronization (`syncManager`, `js/sync.js`, §2.11)**: on bootstrap, tab open, session restore,
   periodic 60 s heartbeat, and on every `X-KIP-Sync` header, the server state is synchronized: a changed `db`
   token purges all data caches (`files`, `symbols`, `kconfigs`, `maintainers`, `commits`, `tools`) and stores
-  the token in `meta/db_instance_hash`; changed `parsed`/`git` tokens refresh the version stamps
-  (`meta/version_stamps`) and drop cached entries of changed versions; a changed `projects` token refetches
+  the token in `meta/db_instance_hash`; `parsed`/`git` tokens are kept per repository (`meta/sync_tokens`
+  `repos`), each `X-KIP-Sync` header compared with those of the repository its request named, and a change
+  refreshes that repository's version stamps (`meta/version_stamps::<repo>`) and drops its cached entries
+  (keys `<repo>::…`) of changed versions (`versions:updated` carries `repo`); *Check for Updates* checks
+  every repository a tab is open in; a changed `projects` token refetches
   the repository list and re-renders the selectors; a changed `frontend` token announces the new build
   immediately.
 - **Keys of the `files` store** include `fref_<version stamp>_<path>` (`api.getFileReferences`, §4.2), next to
@@ -534,8 +550,8 @@ client-side fallback:
   `KconfigView` follows that event only for its own tab. `state.requestKconfigEngine(tabId)` /
   `takeKconfigEngineRequest(tabId)` (event `kconfig:engine:requested`, not persisted) let the command palette
   ask a tab — including one in the background, which claims the request when it renders — to enable its engine
-  through that same confirmation instead of switching it on behind the view's back. Closing a tab, switching
-  project or restoring a session whose tab is gone switches that engine off; no configuration is lost in any
+  through that same confirmation instead of switching it on behind the view's back. Closing a tab or restoring a
+  session whose tab is gone switches that engine off (a project change closes no tab, §5.18); no configuration is lost in any
   of these cases (`state.kconfigProfiles` keeps one per `version|ARCH`). `state.kconfigEngineActive` is
   derived (any engine running **in this window**), `state.isKconfigEngineOwner(tabId)` asks about one tab of
   this window, `state.hasEngine(tabId)` asks whether that engine runs anywhere (this window or another
@@ -981,6 +997,9 @@ interactive UI surfaces:
   hidden`, ensuring that absolutely positioned dropdown menus (such as `.session-dropdown-menu`) and custom
   popovers remain fully visible when opened. Layout clipping and horizontal scroll prevention are handled
   exclusively at the root `#app-container` level and via responsive media query collapsing.
+- **The header follows the active tab's project (§5.18)**: Project, Branch, Tag, Release and Commit list the
+  active tab's repository (`initVersionSelector()` on `repo:synced`, later calls superseding earlier ones);
+  each project keeps its own branch scope (`state.selectedBranchByRepo`).
 - **Two revisions, not one**: `state.selectedVersion` is what the header's controls point at,
   `state.currentVersion` is the revision of the active tab (what links opened from it follow,
   `state.activeVersion()`). Both are persisted, with the branch the lists are scoped to
@@ -1163,7 +1182,7 @@ interactive UI surfaces:
   `list-table`/`flat-table`/`csv-table`, `kernel-doc`/`include`/`literalinclude`/`kernel-*` as source-link
   cards, figures as placeholders, `c:function`-style domain entries, `versionadded`/`deprecated`, `only`,
   `rubric`, `topic`). Inline markup covers literals, emphasis, roles (`:doc:`, `:ref:`,
-  `:c:func:`/`:c:type:`…, `:manpage:`, `:kbd:`, `:abbr:`, `:menuselection:`…), embedded and named links, bare
+  `:c:func:`/`:c:type:`…, `:manpage:` (a `data-man-link` link opening the man tab, §5.38), `:kbd:`, `:abbr:`, `:menuselection:`…), embedded and named links, bare
   URLs, `Documentation/…` paths, and kernel automarkup (`func()`, `struct foo`, `CONFIG_FOO`). Legacy
   plain-text docs keep aligned/indented text as preformatted blocks and promote tab-centered lines to
   headings. All source text is HTML-escaped.
@@ -1209,7 +1228,7 @@ interactive UI surfaces:
   the palette never changes values on its own; with no such tab it says so), *Disable every KConfig engine*
   (`state.disableAllKconfigEngines()`, configurations kept), *Open repository explorer tab* (§5.20), commits,
   maintainers, NodeMap, documentation, explorer toggle, plus *Create patch* / *Symbol history* for the active
-  code tab and *Switch project* entries.
+  code tab and *Switch project* entries (the header's Project change of §5.18: no tab is closed).
 
 ### 5.16. `#ifdef` Dimming (`webapp/frontend/js/views/kconfig/directive_evaluator.js`)
 - **Which engine a file follows** (`tab.kconfigEngineTabId`, persisted): several KConfig tabs may run an
@@ -1333,11 +1352,38 @@ interactive UI surfaces:
   engine is kept on the tab (`buildEngineTabId`), not in the URL (engine ids are session-local, §5.26).
 
 ### 5.18. Projects (Multiple Repositories)
-- The header **Project** selector lists `/api/projects` (parsed repositories plus *git only* ones).
-  `api.setRepository(name)` adds `X-KI-Repo` to every request, prefixes IndexedDB cache keys with the
-  repository, and `withRepo()` appends `?repo=` to URLs used directly (images, downloads). Switching asks for
-  confirmation, closes the workspace tabs (`state.setRepository`), and selects the repository's latest parsed
-  version (else its default branch).
+- **Tabs of several projects in one session**: every tab records its repository (`tab.repo`) when it opens —
+  the repository a link names, else the one of the tab it is opened from (`state.activeRepo()`) — and every
+  request its view makes names that repository (`view.api`, §5.1), including deferred requests of background
+  tabs and other panes. Tab reuse (`state.openTab`) never matches a tab of another repository, a tab of
+  another project opened without a revision is left to its project's default (`""`: the man tab picks the
+  newest tag), and tabs saved before tabs carried a repository take the session's project
+  (`state.assignTabRepos`, `adoptSession`). No project change closes a tab or asks for confirmation.
+- The header **Project** selector lists `/api/projects` (parsed repositories plus *git only* ones) and shows
+  the active tab's repository: `state.currentRepo` follows the active tab before every `tabs:changed` /
+  `pane:activated` is delivered (`state.syncRepoFromActiveTab()`, event `repo:synced`, which also takes the
+  tab's revision), and it is the repository new tabs open in. Picking another project (`switchProject`, also
+  the palette's *Switch project*) moves the active tab when its address holds in any repository
+  (`PROJECT_MOVABLE_TABS` in `utils/projects.js`: explorer at the root, commits without a selected commit,
+  search, treemap, parser status) to that project's default revision (`state.moveTabToRepository`, like Apply
+  moves it to a revision); any other active tab stays and the project's default view opens next to it — the
+  man index in the man-pages project, else a repository explorer. Without an open tab it only sets the
+  project of new tabs (`state.setDefaultRepository`). The default revision (`defaultVersionOf`) is the
+  repository's latest parsed version, else its newest tag, else its default branch; the man-pages project's
+  is its newest release tag, parsed or not. A tab moved to another repository gets a fresh view (tabs.js).
+- **Tab strip badge**: a tab whose repository is not a linux kernel shows a small `.tab-project` label with
+  the project's name before its title (`projectBadge()`).
+- **Project kinds** (`utils/projects.js`, filled from every `/api/projects` read): an entry's `project` (else
+  its `slug`) names what the repository holds — `linux` for the kernel, `man-pages` for the Linux man-pages
+  (§5.38). `manPagesRepo()` / `linuxRepo()` name the first available repository of each; the **Man** activity
+  button is shown while a man-pages repository is configured. In the man-pages project the Tag dropdown lists
+  its `man-pages-*` tags, grouped like any prefixed release scheme (`<prefix>X.Y[.Z][-rcN]`,
+  `views/sections/release_order.js`, the rules of `parser/git_ast/release_order.py`): in a repository without
+  kernel-scheme tags (`vX.Y…`) a point release or candidate sits under its series' final tag in the Release
+  dropdown (`man-pages-6.9.1` → `man-pages-6.9`, `man-pages-6.0-rc1` → `man-pages-6.00`; `prefixedReleaseOf`,
+  `parseTagVersion` after the tag-view rules), while kernel repositories keep their tag-view grouping; a stored revision that is no tag of it falls back to the newest tag (natural
+  order, `newestTag`), page files open rendered as man pages in the code view, and **Man** opens the index at
+  the explored tag.
 - The **Tag** dropdown lists base releases (in custom tag views, or on real Git branches without a branch
   scope) grouped into *Parsed* and *Git only (not parsed)*; a release that so far only has candidates appears
   as `vX.Y (rc only)` and selects its latest candidate. The **Release** dropdown (shown when the selected
@@ -1805,8 +1851,9 @@ interactive UI surfaces:
   toolchain profiles its KConfig tabs and engines use (or every saved one, a checkbox) and optionally the user
   data (bookmarks, notes, tours, §5.5). **⤒ Import…** in the picker header reads such a file, which is
   untrusted: at most 5 MB, known tab types only, repository paths without `..`, strings capped, unknown fields
-  dropped, configuration values checked (`validateSessionFile`). A repository the server does not have is
-  offered to be mapped to the active one. The import always creates a **new** session (*name (imported)*,
+  dropped, configuration values checked (`validateSessionFile`). Every tab keeps its repository (a tab without
+  one takes the file's `repository`); tabs of repositories the server does not have are offered, in one
+  question, to open in the active tab's project instead (`remapSessionRepos`). The import always creates a **new** session (*name (imported)*,
   fresh tab ids remapped as in duplication, engines carried); configurations absent here are added, identical
   ones skipped, and when one differs from the local one a dialog asks per key — *Keep mine* (default), *Use
   imported* (replaces yours) or *Import as a copy* (a new configuration name, the imported tabs and engines
@@ -1962,8 +2009,10 @@ would otherwise have to reproduce by hand, so **copying the URL reopens the same
 | `api` | `#v=<rev>&tab=api&view=<section>&arch=<ARCH>&q=<filter>&f=<chips>&sel=<key>&lc=1` (Kernel API, §5.29) |
 | `insights` | `#v=<rev>&tab=insights&view=<section>&r=<release>&w=<window>&q=<filter>&f=<chips>&sel=<key>&lc=1` (Insights, §5.30; `w`: releases of the Subsystem health window) |
 | `search` | `#v=<rev>&tab=search&q=<text>&re=1&cs=1&w=1&p=<path filter>…&n=<500\|10000>` (full-text search, §5.34; the query and its options are navigation: a new search is a history entry) |
+| `man` | `#repo=<man-pages repo>&v=<man-pages tag>&tab=man&page=<name>&sec=<section>&mode=<web\|term>&kv=<kernel rev>&krepo=<kernel repo>&path=<page file>&q=<index filter>` (man pages, §5.38; no `page`/`path` = the index; the repository, tag and page are navigation, `mode` and `q` replace the entry; an address with `mrepo=`/`mv=` opens the man tab of that repository and tag) |
 
-   Empty, default and absent values are left out (`f=all`, `mode=search`, `line=1`, `view=subsystems`,
+   Every address always carries **`repo=<repository>`**, the active tab's repository (§5.18), first in the
+   hash; permalinks (`codeHash`, §5.21) and tour links (§5.35) carry it too. Empty, default and absent values are left out (`f=all`, `mode=search`, `line=1`, `view=subsystems`,
    `role=all`, the Activity sort, an unnamed configuration, no selection), so the hash stays as short as what
    it actually addresses. `sym` is the bare symbol name (no `CONFIG_` prefix), `cid` is always the **commit
    hash**, never the integer `commit_id`, so a shared link survives a database rebuild, `st` lists the
@@ -1972,7 +2021,13 @@ would otherwise have to reproduce by hand, so **copying the URL reopens the same
    applied (empty directory = whole tree), and `mid` is the message's `Message-ID` (percent-encoded, compared
    normalized — unbracketed and case-insensitive).
 
-2. **Reading a hash** (`applyHash`, from `init` on load and from `handleHashChange` on every `hashchange`):
+2. **Reading a hash** (`applyAddress` → `applyHash`, from `init` on load and from `handleHashChange` on every
+   `hashchange`): the tab opens in the repository `repo=` names, next to the open tabs of any project — no tab
+   is closed, nothing is asked, and no browser window is opened (`urlSync.resolveRepo`, with the resolver
+   `app.js` installs through `urlSync.setRepoHandler`: a configured repository is used as named and an address
+   without `v=` takes its default branch; a repository not configured here is reported by a toast and the
+   tab opens in the active tab's project; an address without `repo=` opens in the active tab's project).
+   In-app links into another project (man back-links, man cross references, §5.38) open the same way. Then
    the revision is selected in the header and the tab is opened with those fields. An already open tab of the
    same identity is reused rather than duplicated (`state.openTab`: a KConfig tab is identified by revision +
    ARCH + configuration name, a mailing list tab by its thread and message, a commits tab by its title) and
@@ -2128,7 +2183,10 @@ Two list-and-detail tabs host the catalogs and reports — **Kernel API** (type 
 - **Address** (§5.26):
   `#tab=api|insights&view=<section>&r=<release>&arch=<ARCH>&q=<filter>&f=<chips>&sel=<key>&lc=1` — the
   section, selection, release and ARCH are navigation (history entries), the search and chips replace the
-  entry.
+  entry. A `sel` that matches no row key selects the row whose key's last `:` segment equals it
+  (`findRowBySel`, `section_model.js`), and the tab's `sel` becomes that row's key in place — `sel=read`
+  selects `common:0:read` or `:0:read`, so a link naming only a syscall (the man tab's back-link, §5.38) needs
+  neither its ABI nor its number. A `sel` holding a `:` never falls back.
 - **Opening**: the activity bar, palette commands *Open Kernel API* / *Open Insights* and one per section
   (*Kernel API: <section>*, *Insights: <section>*).
 
@@ -2138,7 +2196,9 @@ Two list-and-detail tabs host the catalogs and reports — **Kernel API** (type 
   - **Syscalls** (ARCH-scoped): `nr`, name, argument count, ABI and status; chips *defined*, *sys_ni_syscall*,
     *no definition*, *unnumbered* (a `SYSCALL_DEFINE` with no number on this ARCH); the detail gives the entry
     point, the signature rebuilt from `SYSCALL_DEFINEn`, *Go to definition*, *History* (§5.17), *Callers*
-    (callgraph) and the `man 2` page. The status line names the table the numbers come from. Download: TSV.
+    (callgraph) and the `man 2` page (a `data-man-link` link: the man tab on the man-pages tag of this
+    revision, else man7.org; middle-click opens man7.org, §5.38). The status line names the table the numbers
+    come from. Download: TSV.
   - **Exports**: symbol, variant and namespace badges; one chip per variant with counts; the detail lists
     every export site with the object that contains it (*module X* or built in, its condition, and *built:
     y/m/n* when a KConfig engine runs for the revision), *Go to definition* and *Search uses*. Downloads:
@@ -2393,3 +2453,58 @@ A tab (type `status`, badge `[I]`) showing what the parser has done for the acti
   it offline.
 - **Not covered**: live progress inside a version (current step, files done) would need the parser to publish
   it; it does not today.
+
+### 5.38. Man Pages Tab & Renderer (`webapp/frontend/js/views/man/`, `webapp/frontend/css/man.css`)
+The Linux man-pages repository (the configured repository whose project is `man-pages`, §5.18) is rendered
+from the page document model of `parser/man_ast/MAN_API.md` (format 1) served by `/api/man/*`
+(`webapp/API_ENDPOINTS.md`). The kernel links to it at the man-pages tag released on or before the kernel
+revision, and its pages link back into the kernel.
+- **Renderers** (`man_render.js`, pure, tested by `tests/man_render.test.mjs`): `renderManWeb(doc, opts)` is a
+  man7.org-like page — a `NAME(S)  manual  NAME(S)` title bar, a section TOC (`data-man-anchor` links: the view
+  scrolls, the hash stays the app's address), `h2` section headings and `h3` subsections, indented bodies, tag
+  lists (`.TP`/`.IP`), relative indents, no-fill blocks and examples, tbl tables (alignment, box, header rows)
+  and a `source  date  NAME(S)` footer. `renderManTerm(doc, opts)` is man(1) in a terminal: a `<pre>` of
+  `opts.width` (80) columns, header and footer lines, text filled and justified with a 7-column body
+  indent, subsections at 3, tags at the current indent with their body 7 further (a tag shorter than 6
+  columns shares its line with the body), tables drawn in box characters, bold as bright bold (`mt-b`),
+  italic as underline (`mt-u`), and `.UR` text followed by `<url>`. Both escape every text; cross references
+  are `<a data-man-ref="name" data-man-sec="S">`, URLs are links only for `http(s)://` and `mailto:`
+  (`safeUrl`; other schemes stay plain text) and open with `target="_blank" rel="noopener noreferrer"`.
+- **Tab** (`man_view.js`, type `man`, badge `[H]`; route in `routes.js`): a tab of the man-pages repository
+  like any other (§5.18) — its `repo` is the man-pages repository and its `version` the man-pages tag — with
+  `manPage`/`manSec` or `manPath`, `manMode`, `kernelVersion`/`kernelRepo` (the kernel revision the reader came
+  from) and `manQuery` (the index filter); hash keys in §5.26. Every request names the man-pages repository
+  (`?repo=` and `X-KI-Repo`, `view.api.getManPage` / `getManIndex` / `getManTags`). A tab without a tag opens
+  on the newest one of `/api/man/tags`; a tab of another repository takes the configured man-pages one; tabs
+  saved with `manRepo`/`manVersion` fields take them as their repository and tag.
+  - **Toolbar**: *☰ Index*; the page title and its other NAME aliases; the **Tag** dropdown (`/api/man/tags`;
+    it moves the tab's revision, `state.setVersion`, the header following while the tab is active); the **Web / Terminal** toggle
+    (per tab in `manMode`, the last choice kept as the default in `localStorage` `kip-man-mode`, read and
+    written in try/catch); the **Linux** back-links of the page answer's `linux` block; *man7.org ↗*.
+  - **Back-links**: `linux.syscall` (section 2 pages) opens the Kernel API tab on
+    `view=syscalls&arch=x86_64&sel=<name>` at the kernel revision (`kernelVersion`, else `linux.version`; the
+    `sel` name fallback of §5.29 selects the row); each `linux.symbols` entry opens its definition
+    (`openDefinition(version, name, {repo})`, else a whole-word search). They open as tabs of the kernel's
+    repository (`kernelRepo`, else the answer's `linux.repo`) next to the man tab, in this workspace
+    (`linuxApiTab`, `linuxSymbolTab`).
+  - **Cross references** fetch the page first and then navigate the same tab (a history entry), so a page
+    missing at the tag is a toast and the tab stays where it is; Ctrl/Cmd+click opens a new man tab.
+  - **Index** (no page): `/api/man/{v}/index` grouped by section in man(1) search order (`groupIndex`,
+    `sectionTitle`: `2`, `3`, `1`, `8`, `5`, `4`, `7`, `6`, `9`, suffixed sections after their base) with a
+    filter box (every word in the name or summary), a section jump bar and page counts; alias pages are marked.
+  - **States**: loading lines, a missing page (with a link to the tag's index), request errors and "no
+    man-pages repository configured".
+- **Opening**: the **Man** activity button and the palette command *Open man pages* (`app.openManIndex`): in
+  the man-pages project, the index at the explored tag; from the kernel, the index at the tag
+  `/api/man/resolve?name=intro&section=1&kernel=<rev>` names (else the newest tag). Kernel links
+  (`man_links.js`): the Kernel API syscall detail's `man 2 <name>` and the rst `:manpage:` role render
+  `<a data-man-link data-man-sec href="<man7.org URL>">`; a click asks `/api/man/resolve` for the repository and
+  revision of the tab it is in (`openManReference(name, sec, {kernel, repo})`) and opens (or reuses) a man tab
+  of the answer's repository at its tag and page, next to the kernel tab, when
+  `available`, else opens the answer's man7.org `url` in a new browser tab; a middle-click follows the plain
+  man7.org href.
+- **Code view** (man-pages project): a file matching `^(man/)?man\d[a-z]*/[^/]+\.\d[a-z]*$` is a document
+  (§5.21): it opens rendered (`mountManDocument`, from `/api/man/{v}/page?path=`) with the Web/Terminal
+  toggle, *Source* (the rendered/source toggle of documentation tabs), *Man tab* and the Linux back-links;
+  cross references open the referenced page file in the same code tab (its back history), Ctrl/Cmd+click in a
+  new one.

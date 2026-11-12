@@ -15,9 +15,9 @@ import { debounce } from "../../utils/debounce.js";
  * The release tag preceding `target` (the latest tag when target is a commit): a release is compared
  * with the previous release, a release candidate with the previous tag. Shared with the Compare view.
  */
-export async function previousTag(target) {
+export async function previousTag(target, client = api) {
   try {
-    const res = await api.getVersionsCached(true);
+    const res = await client.getVersionsCached(true);
     const all = (res.versions || []).filter((v) => typeof v === "string" || v.ref_type !== 3);
     const isPre = (name) => /-(rc|pre|alpha|beta)\d*$/.test(name);
     const tags = all.map((v) => (typeof v === "string" ? v : v.vname)).filter((n) => n && (isPre(target) || !isPre(n) || n === target));
@@ -125,13 +125,13 @@ let openPicker = null;
  * revision), quick picks and the direction. `onPick({ version, path, swap })` runs on **Show diff**;
  * nothing changes when it is dismissed.
  */
-export async function showDiffPicker(anchorEl, { tabId, version, path, current, onPick }) {
+export async function showDiffPicker(anchorEl, { tabId, version, path, current, onPick, client = api }) {
   if (openPicker) {
     const same = openPicker.anchorEl === anchorEl;
     openPicker.close();
     if (same) return;
   }
-  const prev = await previousTag(version);
+  const prev = await previousTag(version, client);
   let selVersion = current?.version || prev;
   let selPath = current?.path || path;
   let swap = Boolean(current?.swap);
@@ -255,7 +255,7 @@ export async function showDiffPicker(anchorEl, { tabId, version, path, current, 
     }
     let files = [];
     try {
-      files = (await api.searchFiles(selVersion, q, 12))?.files || [];
+      files = (await client.searchFiles(selVersion, q, 12))?.files || [];
     } catch {
       files = [];
     }

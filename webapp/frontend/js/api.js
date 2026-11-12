@@ -34,10 +34,15 @@ class ApiClient {
     // browser's link state, so it stays true when the server is down; this is what the badge follows.
     this.serverUp = navigator.onLine;
     this.activeRequests = 0;
-    // Version name -> stamp (commit + parse completion) from /api/versions and /api/branches; part of every
-    // cache key of version data, so a re-parsed version or a moved branch never serves older cached data
-    this.versionStamps = {};
-    // Called with the X-KIP-Sync header of every API response (js/sync.js)
+    // Repository -> {version name -> stamp (commit + parse completion)} from /api/versions and /api/branches;
+    // part of every cache key of version data, so a re-parsed version or a moved branch never serves older
+    // cached data. `versionStamps` is the map of the client's repository.
+    this._stampsByRepo = {};
+    // Repository-scoped clients (forRepo), one per repository name
+    this._scoped = new Map();
+    this._versionsInFlight = new Map();
+    this._versionsMemo = new Map();
+    // Called with (X-KIP-Sync header, repository of the request) of every API response (js/sync.js)
     this.onSyncHeader = null;
     // Called with the parsed JSON body of GET /api/sync (js/sync.js)
     this.onSyncData = null;
@@ -103,7 +108,7 @@ class ApiClient {
         }
         const syncHeader = res.headers.get("X-KIP-Sync");
         if (syncHeader && this.onSyncHeader && !this.onSyncData) {
-          this.onSyncHeader(syncHeader);
+          this.onSyncHeader(syncHeader, this.repo || "");
         }
       }
       return ok;
@@ -167,9 +172,48 @@ class ApiClient {
     }
   }
 
-  /** Repository selected in the header; sent with every request and namespacing offline cache keys. */
-  setRepository(name) {
-    this.repo = name || "";
+  /**
+   * Repository this client addresses: sent with every request (X-KI-Repo), namespacing offline cache keys and
+   * version stamps. The shared client follows the active tab's repository (else the header's Project); a
+   * client of `forRepo()` / `forTab()` always names its own (§5.18).
+   */
+  get repo() {
+    return state.getActiveTab()?.repo || state.currentRepo || "";
+  }
+
+  /** Version stamps of this client's repository (see _stampsByRepo). */
+  get versionStamps() {
+    const r = this.repo || "";
+    return this._stampsByRepo[r] || (this._stampsByRepo[r] = {});
+  }
+
+  set versionStamps(stamps) {
+    this._stampsByRepo[this.repo || ""] = stamps && typeof stamps === "object" ? stamps : {};
+  }
+
+  /**
+   * Client bound to one repository: the same methods, every request (headers, `?repo=` URLs, cache keys,
+   * stamps) naming `repo`. Connection state (reachability, spinner, heartbeat, memos) stays shared: writes
+   * go to the shared client. "" gives the shared client itself.
+   */
+  forRepo(repo) {
+    const root = this._root || this;
+    const name = typeof repo === "string" ? repo : "";
+    if (!name) return root;
+    let client = root._scoped.get(name);
+    if (!client) {
+      client = new Proxy(root, {
+        get: (target, prop, receiver) => (prop === "repo" ? name : Reflect.get(target, prop, receiver)),
+        set: (target, prop, value, receiver) => (prop === "repo" ? true : Reflect.set(target, prop, value, receiver)),
+      });
+      root._scoped.set(name, client);
+    }
+    return client;
+  }
+
+  /** Client of a tab's repository (the shared client for a tab without one). */
+  forTab(tab) {
+    return this.forRepo(tab?.repo || "");
   }
 
   /**
@@ -207,7 +251,7 @@ class ApiClient {
       answered = !response.headers.get("X-KIP-Offline");
       this._setServerUp(answered);
       const syncHeader = response.headers.get("X-KIP-Sync");
-      if (syncHeader && this.onSyncHeader) this.onSyncHeader(syncHeader);
+      if (syncHeader && this.onSyncHeader) this.onSyncHeader(syncHeader, this.repo || "");
 
       if (response.status === 304) return { response, data: null };
       if (!response.ok) {
@@ -464,7 +508,6 @@ class ApiClient {
    */
   getVersions(includeRc = true, { networkFirst = false } = {}) {
     const key = `${this.repo || ""}|${includeRc}|${networkFirst ? "net" : "cache"}`;
-    this._versionsInFlight = this._versionsInFlight || new Map();
     let pending = this._versionsInFlight.get(key);
     if (!pending) {
       pending = this._loadVersions(includeRc, networkFirst).finally(() => this._versionsInFlight.delete(key));
@@ -505,7 +548,6 @@ class ApiClient {
 
   /** The decoded catalog, kept per repository (getVersionsCached) and decoded once per generation. */
   _rememberVersions(memoKey, catalog) {
-    this._versionsMemo = this._versionsMemo || new Map();
     const memo = this._versionsMemo.get(memoKey);
     if (memo && memo.g === catalog.g) return memo;
     const versions = versionsFromCatalog(catalog);
@@ -586,6 +628,49 @@ class ApiClient {
     for (const key of ["export", "internal"]) if (options[key]) params.set(key, "true");
     for (const key of ["functions", "doc", "no_identifiers"]) if (options[key]) params.set(key, options[key]);
     return this.request(`/api/docs/${encodeURIComponent(ver)}/kernel-doc?${params.toString()}`, {}, "files", `kdoc_${this._vk(ver)}_${params.toString()}`);
+  }
+
+  // --- Man pages (§5.38): the man-pages repository is named per request (`repo`), so a man tab works
+  // while another project is the active one. The header names it too, since X-KI-Repo wins over ?repo=.
+  _manRequest(repo, endpoint, params, cacheKey = null) {
+    const q = new URLSearchParams(params || {});
+    if (repo) q.set("repo", repo);
+    const qs = q.toString();
+    return this.request(`${endpoint}${qs ? `?${qs}` : ""}`, { networkFirst: true, ...(repo ? { headers: { "X-KI-Repo": repo } } : {}) },
+      cacheKey ? "files" : null, cacheKey ? `man_${repo}_${cacheKey}` : null);
+  }
+
+  /** `GET /api/man/{v}/index`: every page of a man-pages tag. */
+  async getManIndex(repo, version) {
+    const ver = this._sanitizeVer(version);
+    return this._manRequest(repo, `/api/man/${encodeURIComponent(ver)}/index`, null, `index_${ver}`);
+  }
+
+  /** `GET /api/man/{v}/page`: a page by `path`, or by `name` (+ `section`); `kernel`/`kernelRepo` name where the reader came from. */
+  async getManPage(repo, version, { path = "", name = "", section = "", kernel = "", kernelRepo = "" } = {}) {
+    const ver = this._sanitizeVer(version);
+    const params = {};
+    if (path) params.path = path;
+    else {
+      params.name = name;
+      if (section) params.section = section;
+    }
+    if (kernel) params.kernel = kernel;
+    if (kernelRepo) params.kernel_repo = kernelRepo;
+    return this._manRequest(repo, `/api/man/${encodeURIComponent(ver)}/page`, params, `page_${ver}_${new URLSearchParams(params).toString()}`);
+  }
+
+  /** `GET /api/man/tags`: the man-pages release tags, newest first. */
+  async getManTags(repo) {
+    return this._manRequest(repo, "/api/man/tags", null, "tags");
+  }
+
+  /** `GET /api/man/resolve` (current repository = the kernel): our copy of name(section) for `kernel`, or the man7.org URL. */
+  async resolveMan(name, section = "", kernel = "") {
+    const params = new URLSearchParams({ name });
+    if (section) params.set("section", section);
+    if (kernel) params.set("kernel", kernel);
+    return this.request(`/api/man/resolve?${params.toString()}`, { networkFirst: true });
   }
 
   /** Release-by-release history of the definition at path:line (`name`: symbol under the cursor). */
@@ -1080,5 +1165,20 @@ class ApiClient {
 }
 
 export const api = new ApiClient();
+api._root = api;
+
+/**
+ * Give a tab's view its repository-scoped client: `view.api` resolves the tab by id at every call, so a
+ * view keeps addressing its tab's repository after a project switch moved it, and a view of an inactive
+ * tab or pane never follows the active one (tabs.js binds every per-tab view, §5.18).
+ */
+export function bindViewApi(view, tabId, fallbackTab = null) {
+  if (!view || Object.prototype.hasOwnProperty.call(view, "api")) return view;
+  Object.defineProperty(view, "api", {
+    configurable: true,
+    get: () => api.forTab(state.findTab(tabId) || fallbackTab),
+  });
+  return view;
+}
 
 

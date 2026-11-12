@@ -285,7 +285,7 @@ export class MenuconfigTui {
     paint(sym ? "(loading help…)" : "");
     if (sym) {
       try {
-        const detail = await api.getKconfigSymbol(this.view.currentVersion, sym, this.view.currentArch, this.view.toolchain);
+        const detail = await (this.view.api || api).getKconfigSymbol(this.view.currentVersion, sym, this.view.currentArch, this.view.toolchain);
         paint(detail.help || "There is no help available for this option.");
       } catch {
         paint("(help unavailable)");

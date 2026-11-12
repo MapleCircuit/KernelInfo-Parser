@@ -27,7 +27,17 @@ from fastapi import HTTPException
 
 from parser.git_ast.git_commit_parser import iter_trailers
 from parser.git_ast.git_types import CommitRole
-from parser.git_ast.release_order import final_of, parse_tag, previous_in, release_key, series_name  # noqa: F401 - re-exported
+from parser.git_ast.release_order import (  # noqa: F401 - re-exported
+    KERNEL_FAMILY,
+    family_of,
+    final_of,
+    parse_tag,
+    previous_in,
+    release_key,
+    release_ranges,
+    release_tag_names,
+    series_name,
+)
 from webapp.backend.config import RepoScopedCache, get_active_repo_name, get_repo_dir
 from webapp.backend.database.helpers import get_active_repo_id
 from webapp.backend.database.pool import get_db_cursor
@@ -78,8 +88,8 @@ _TAGS_LOCK = threading.Lock()
 
 
 def tag_commits(refresh: bool = False) -> dict[str, str]:
-    """Release tags of the repository -> their commit SHA (annotated tags peeled). Cached until the
-    `git` sync token changes (clear_caches)."""
+    """Release tags of the repository (`release_tag_names()`) -> their commit SHA (annotated tags peeled). Cached
+    until the `git` sync token changes (clear_caches)."""
     if not refresh:
         hit = _TAGS_CACHE.get("tags")
         if hit is not None:
@@ -97,6 +107,8 @@ def tag_commits(refresh: bool = False) -> dict[str, str]:
             # Only tags of commits are releases (v2.6.11 tags a tree: history starts at v2.6.12-rc2)
             if kind == "commit" and parse_tag(name) is not None and _FULL_SHA.match(sha):
                 tags[name] = sha
+        # The kernel scheme's tags when the repository has any, else every prefixed release (man-pages-X.Y, foo-1.2)
+        tags = {name: tags[name] for name in release_tag_names(tags)}
         if out is not None:
             _TAGS_CACHE["tags"] = tags
         return tags
@@ -217,20 +229,12 @@ class ReleaseIndex:
         if any(name in tags and tags[name] != sha for name, sha in built.items()):
             conn.executescript("DELETE FROM first_tag; DELETE FROM tags; DELETE FROM meta;")
             built = {}
-        mainline = sorted((t for t in tags if parse_tag(t)["kind"] == "mainline"), key=release_key)
-        stable = sorted((t for t in tags if parse_tag(t)["kind"] == "stable"), key=release_key)
-        jobs_list: list[tuple[str, str | None, int]] = []
-        prev = None
-        for t in mainline:
-            if t not in built:
-                jobs_list.append((t, prev, CHAIN_MAINLINE))
-            prev = t
-        names = set(tags)
-        for t in stable:
-            if t in built:
-                continue
-            p = previous_in(t, [x for x in names if parse_tag(x)["series"] == parse_tag(t)["series"]])
-            jobs_list.append((t, p, CHAIN_STABLE))
+        # Each range ends at a tag and starts at the tag before it on its chain (release_ranges: the previous
+        # mainline tag of its family, the previous update of its stable series)
+        ranges = [r for r in release_ranges(tags) if r["kind"] in ("mainline", "stable")]
+        jobs_list: list[tuple[str, str | None, int]] = [
+            (r["tag"], r["segment_base"], CHAIN_MAINLINE if r["kind"] == "mainline" else CHAIN_STABLE)
+            for r in sorted(ranges, key=lambda r: r["kind"] != "mainline") if r["tag"] not in built]
         total = len(jobs_list)
         if progress:
             progress(0, total, "release ranges")

@@ -101,6 +101,33 @@
           ]
         }
       ]
+    },
+    {
+      "name": "man-pages",
+      "path": "repos/man-pages",
+      "project": "man-pages",
+      "default_branch": "master",
+      "git_url": "https://git.kernel.org/pub/scm/docs/man-pages/man-pages.git",
+      "root_commit": "fea681dafb1363a154b7fc6d59baa83d2a9ebc5c",
+      "start_ref": "fea681dafb1363a154b7fc6d59baa83d2a9ebc5c",
+      "enabled": true,
+      "branch_filter": {
+        "include": [
+          "master"
+        ],
+        "exclude": []
+      },
+      "branches": [
+        "master"
+      ],
+      "tag_views": [
+        {
+          "name": "— man-pages —",
+          "regex_rules": [
+            "^(man-pages-\\d+)(\\..*)$"
+          ]
+        }
+      ]
     }
   ]
 }

@@ -9,12 +9,15 @@
  * inspected subsystem or developer of a Maintainers tab. Copying the URL
  * therefore reopens that same search and that same target (§5.26).
  *
+ * Every address names the repository of its tab (`repo=`, always written): one session holds tabs of
+ * several projects, and a link into another project opens its tab next to the open ones (§5.26).
+ *
  * Tab and revision changes are announced as `tabs:changed` / `version:changed`; a navigation
  * *inside* a tab is announced as `tab:state` (`state.updateTabState`), because redrawing the
  * pane would discard the view that reported it.
  */
 import { state } from "./state.js";
-import { routeKeys, tabRoute } from "./tab_routes.js";
+import { hashRepo, routeKeys, tabRoute } from "./tab_routes.js";
 
 /** Compare rename searches from `rn=<similarity>:<directory>` entries (applied in order; empty dir = whole tree). */
 function parseRenameSearches(values) {
@@ -39,6 +42,10 @@ class UrlSynchronizer {
     // lose its target if it were applied before that choice is made (§5.26).
     this.deferred = false;
     this.deferredHash = null;
+    // `repo=` of an address naming another project than the active tab's (§5.26): app.js says which
+    // repository the tab opens in (that one when configured, else "" = the active tab's) and its default
+    // revision for an address without `v=`. No tab is closed and nothing is asked.
+    this.repoHandler = null;
 
     // Listen to browser popstate (Back/Forward navigation)
     window.addEventListener("popstate", (e) => this.handlePopState(e));
@@ -67,16 +74,42 @@ class UrlSynchronizer {
     this.deferred = true;
   }
 
+  /**
+   * Install the project resolver: (repo) -> {repo, version}: the repository a link naming `repo` opens in
+   * ("" = the active tab's, when `repo` is not configured here) and the revision used when the link has no `v=`.
+   */
+  setRepoHandler(fn) {
+    this.repoHandler = typeof fn === "function" ? fn : null;
+  }
+
+  /** Apply an address (or, without one, write the active tab's): a tab of the project its `repo=` names. */
+  applyAddress(hash, done = null) {
+    if (hash) this.applyHash(hash);
+    else this.updateHashFromState();
+    done?.();
+  }
+
+  /** Repository and fallback revision of an address: {repo ("" = the active tab's), version}. */
+  resolveRepo(params) {
+    const named = hashRepo(params);
+    if (!named || named === state.activeRepo()) return { repo: named, version: "" };
+    let answer = { repo: named, version: "" };
+    try {
+      if (this.repoHandler) answer = this.repoHandler(named) || answer;
+    } catch (err) {
+      console.warn(`Could not resolve project ${named}:`, err);
+    }
+    return { repo: typeof answer.repo === "string" ? answer.repo : "", version: typeof answer.version === "string" ? answer.version : "" };
+  }
+
   init() {
     this.deferred = false;
     const hash = this.deferredHash || window.location.hash.substring(1);
     this.deferredHash = null;
-    if (hash) {
-      this.applyHash(hash);
-    } else {
-      this.updateHashFromState();
-    }
+    this.applyAddress(hash, () => this.commitInitialSnapshot());
+  }
 
+  commitInitialSnapshot() {
     const initialSnapshot = this.createSnapshot(window.location.hash);
     if (initialSnapshot) {
       this.lastCommittedSnapshot = initialSnapshot;
@@ -97,7 +130,7 @@ class UrlSynchronizer {
       this.justPoppedState = false;
       return;
     }
-    this.applyHash(window.location.hash.substring(1));
+    this.applyAddress(window.location.hash.substring(1));
   }
 
   handlePopState(e) {
@@ -175,6 +208,7 @@ class UrlSynchronizer {
           }
         }
         if (savedTab.title) liveTab.title = savedTab.title;
+        if (savedTab.repo) liveTab.repo = savedTab.repo;
         if (savedTab.version) liveTab.version = savedTab.version;
       }
     }
@@ -220,7 +254,7 @@ class UrlSynchronizer {
    */
   getNavKey(tab) {
     if (!tab) return "";
-    const v = tab.version || state.currentVersion || "";
+    const v = `${state.repoOf(tab)}@${tab.version || state.currentVersion || ""}`;
     const route = tabRoute(tab.type);
     if (route?.navKey) return `${v}:${tab.type}:${route.navKey(tab)}`;
     switch (tab.type) {
@@ -272,6 +306,7 @@ class UrlSynchronizer {
           paneId: pane.id,
           type: t.type,
           title: t.title,
+          repo: t.repo,
           version: t.version,
           path: t.path,
           cursorLine: t.cursorLine,
@@ -343,28 +378,34 @@ class UrlSynchronizer {
       const dir = params.get("dir") || "";
       const cfg = params.get("cfg") || ""; // named copy of that ARCH's configuration, if any
       const query = params.get("q") || ""; // search typed in the tab's own filter box
+      // The tab opens in the project the address names, next to the open tabs (§5.26)
+      const { repo, version: repoDefault } = this.resolveRepo(params);
+      const foreign = Boolean(repo) && repo !== state.activeRepo();
+      const ver = v || (foreign ? repoDefault || "HEAD" : state.currentVersion);
+      const open = (data) => state.openTab({ ...(repo ? { repo } : {}), ...data });
 
       // Restoring a revision from the hash selects it in the header; the tab opened below carries it
       if (v) state.setSelectedVersion(v);
 
       const route = tabRoute(tabType);
       if (route?.fromHash) {
-        state.openTab({ type: tabType, ...route.fromHash(params, v || state.currentVersion), version: v || state.currentVersion });
+        const fields = route.fromHash(params, ver);
+        open({ type: tabType, ...fields, version: fields.version || ver });
       } else if (tabType === "code" && file) {
         // "⇄ Diff" of the file (§5.21): dv/dp = the other file, ds=1 swapped sides, dm=split layout.
         // A link without dv addresses the plain file, so a reused tab drops its diff.
         const dv = params.get("dv") || "";
         // dk=patch&dmid=<message ids>: the file against what those archive patches make of it (P1)
         const dmid = params.get("dk") === "patch" ? (params.get("dmid") || "").split(",").map((m) => m.trim()).filter(Boolean).slice(0, 50) : [];
-        const diffWith = dmid.length ? { kind: "patch", mids: dmid, revision: v || state.currentVersion, path: file, applyId: "" }
+        const diffWith = dmid.length ? { kind: "patch", mids: dmid, revision: ver, path: file, applyId: "" }
           : dv ? { version: dv, path: params.get("dp") || file, swap: params.get("ds") === "1" } : null;
-        state.openTab({
+        open({
           type: "code",
           title: file.split("/").pop(),
           path: file,
           cursorLine: line,
           lineEnd,
-          version: v || state.currentVersion,
+          version: ver,
           diffWith,
           diffLayout: (dv || dmid.length) && params.get("dm") === "split" ? "split" : "",
           // Blame shown, and its options (H9, §5.21): bl=1, bo=<m|c|w>
@@ -372,7 +413,7 @@ class UrlSynchronizer {
           blameOpts: params.get("bl") === "1" ? (params.get("bo") || "").replace(/[^mcw]/g, "").slice(0, 3) : "",
         });
       } else if (tabType === "kconfig") {
-        state.openTab({
+        open({
           type: "kconfig",
           title: `KConfig (${arch})${cfg ? ` · ${cfg}` : ""}`,
           arch,
@@ -380,23 +421,23 @@ class UrlSynchronizer {
           query,
           symbol: params.get("sym") || "",
           listCollapsed: params.get("lc") === "1",
-          version: v || state.currentVersion
+          version: ver
         });
       } else if (tabType === "explorer") {
-        state.openTab({
+        open({
           type: "explorer",
-          title: dir ? dir.split("/").pop() : `Explorer ${v || state.currentVersion}`,
+          title: dir ? dir.split("/").pop() : `Explorer ${ver}`,
           path: dir,
-          version: v || state.currentVersion
+          version: ver
         });
       } else if (tabType === "nodemap") {
-        state.openTab({
+        open({
           type: "nodemap",
           title: "NodeMap Canvas",
-          version: v || state.currentVersion
+          version: ver
         });
       } else if (tabType === "mail") {
-        state.openTab({
+        open({
           type: "mail",
           title: "Mailing List",
           threadId: parseInt(params.get("tid") || "0", 10),
@@ -405,19 +446,19 @@ class UrlSynchronizer {
           filter: params.get("f") || "all",
           listMode: params.get("mode") === "tree" ? "tree" : "search",
           listCollapsed: params.get("lc") === "1",
-          version: v || state.currentVersion
+          version: ver
         });
       } else if (tabType === "diff" && params.get("mode") === "api") {
         // API mode (A6): k = kinds, st = statuses, q = filter, arch
-        state.openTab({
+        open({
           type: "diff", title: "Compare",
           versionA: params.get("a") || undefined, versionB: params.get("b") || undefined, mode: "api",
           apiKinds: params.get("k") || "", apiStatuses: params.get("st") || "", apiQuery: query, apiArch: params.get("arch") || "",
-          version: v || state.currentVersion,
+          version: ver,
         });
       } else if (tabType === "diff") {
         const kconfigMode = params.get("mode") === "kconfig";
-        state.openTab({
+        open({
           type: "diff",
           title: "Compare",
           // Without a/b the tab keeps its revisions (or picks its defaults)
@@ -429,21 +470,21 @@ class UrlSynchronizer {
           kconfigQuery: kconfigMode ? query : undefined,
           kconfigStatuses: kconfigMode ? (params.get("st") || "") : undefined,
           renameSearches: kconfigMode ? undefined : parseRenameSearches(params.getAll("rn")),
-          version: v || state.currentVersion
+          version: ver
         });
       } else if (tabType === "commits") {
-        state.openTab({
+        open({
           type: "commits",
           title: "Commits",
           commitId: params.get("cid") || "",
           listCollapsed: params.get("lc") === "1",
           query,
-          version: v || state.currentVersion
+          version: ver
         });
       } else if (tabType === "maintainers") {
         // Every field is given (empty when absent), so a reused tab takes exactly what the link addresses
         const secId = parseInt(params.get("sec") || "0", 10) || 0;
-        state.openTab({
+        open({
           type: "maintainers",
           title: "Maintainers",
           section: params.get("view") || "",
@@ -453,34 +494,34 @@ class UrlSynchronizer {
           sort: params.get("sort") === "alpha" ? "alpha" : "",
           query,
           listCollapsed: params.get("lc") === "1",
-          version: v || state.currentVersion
+          version: ver
         });
       } else if (tabType === "pahole") {
         const structName = params.get("struct") || "task_struct";
-        state.openTab({
+        open({
           type: "pahole",
           title: `struct ${structName}`,
           structName,
           // Layout over time (N3): cmp=<rev> compares with another revision, hist=1 shows the size history
           cmp: params.get("cmp") || "",
           hist: params.get("hist") === "1",
-          version: v || state.currentVersion
+          version: ver
         });
       } else if (tabType === "callgraph") {
         const funcName = params.get("fn") || "schedule";
-        state.openTab({
+        open({
           type: "callgraph",
           title: `Callgraph: ${funcName}`,
           functionName: funcName,
           // Call path search target (N2): navigation, like the function
           pathTo: params.get("to") || "",
-          version: v || state.currentVersion
+          version: ver
         });
       } else if (tabType === "treemap") {
-        state.openTab({
+        open({
           type: "treemap",
           title: "Architecture Treemap",
-          version: v || state.currentVersion
+          version: ver
         });
       }
     } finally {
@@ -496,6 +537,9 @@ class UrlSynchronizer {
     if (!activeTab) return;
 
     const params = new URLSearchParams();
+    // The project the tab belongs to, always: a shared link opens in it (§5.26)
+    const repo = state.repoOf(activeTab);
+    if (repo) params.set("repo", repo);
     params.set("v", activeTab.version || state.currentVersion);
     params.set("tab", activeTab.type);
 

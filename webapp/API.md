@@ -5,19 +5,19 @@ for the **KernelInfo-Parser** repository. It features a modular FastAPI REST bac
 ES-Module IDE frontend.
 
 ## Table of Contents
-- **§1**: Architectural Overview & Component Structure [L24-L124]
-- **§2**: Security & Sandbox Specifications (`§2.1`–`§2.6`) [L125-L339]
-- **§2B**: Backend Domain & Infrastructure Services (`§2.7`–`§2.19`) [L340-L865]
-  - `2.7` Tree Resolver [L342] | `2.8` Diff Engine [L422] | `2.9` Commit Hashes [L455]
-  - `2.10` Multi-Repo Context [L485] | `2.11` Sync Tokens [L522] | `2.12` Warm-Up [L603]
-  - `2.13` Catalog Caching [L623] | `2.14` Disk Cache [L659] | `2.15` Background Jobs [L680]
-  - `2.16` Commit Relations [L709] | `2.17` Release Index [L759] | `2.18` Checkpatch [L798] | `2.19` Source Index [L816]
-- **§3**: Database Schema & Underlying Tables [L866-L880]
-- **§4**: REST API Endpoint Catalog (`§4.1`–`§4.12` &rarr; detailed in [`webapp/API_ENDPOINTS.md`](webapp/API_ENDPOINTS.md)) [L881-L886]
-- **§5**: Frontend Client Architecture & Views (`§5.0`–`§5.37` &rarr; detailed in [`webapp/API_FRONTEND.md`](webapp/API_FRONTEND.md)) [L887-L892]
-- **§6**: Using the Services from Python [L893-L910]
-- **§7**: Configuration & Execution (`§7.1`–`§7.2`) [L911-L965]
-- **§8**: Error Handling, Status Codes & Offline Storage (`IndexedDB`) [L966-L996]
+- **§1**: Architectural Overview & Component Structure [L24-L126]
+- **§2**: Security & Sandbox Specifications (`§2.1`–`§2.6`) [L127-L342]
+- **§2B**: Backend Domain & Infrastructure Services (`§2.7`–`§2.20`) [L343-L935]
+  - `2.7` Tree Resolver [L345] | `2.8` Diff Engine [L425] | `2.9` Commit Hashes [L458]
+  - `2.10` Multi-Repo Context [L488] | `2.11` Sync Tokens [L539] | `2.12` Warm-Up [L620]
+  - `2.13` Catalog Caching [L640] | `2.14` Disk Cache [L676] | `2.15` Background Jobs [L697]
+  - `2.16` Commit Relations [L726] | `2.17` Release Index [L776] | `2.18` Checkpatch [L821] | `2.19` Source Index [L839] | `2.20` Man Pages [L889]
+- **§3**: Database Schema & Underlying Tables [L936-L950]
+- **§4**: REST API Endpoint Catalog (`§4.1`–`§4.13` &rarr; detailed in [`webapp/API_ENDPOINTS.md`](webapp/API_ENDPOINTS.md)) [L951-L956]
+- **§5**: Frontend Client Architecture & Views (`§5.0`–`§5.38` &rarr; detailed in [`webapp/API_FRONTEND.md`](webapp/API_FRONTEND.md)) [L957-L962]
+- **§6**: Using the Services from Python [L963-L980]
+- **§7**: Configuration & Execution (`§7.1`–`§7.2`) [L981-L1035]
+- **§8**: Error Handling, Status Codes & Offline Storage (`IndexedDB`) [L1036-L1066]
 
 ---
 
@@ -81,7 +81,8 @@ webapp/
 │   │   ├── callpath_service.py     # Call path finder over the source index (§4.7, N2)
 │   │   ├── pahole_compare.py       # Struct layout compare and history (§4.7, N3)
 │   │   ├── watch_service.py        # Watch list change checks (§4.12, G10)
-│   │   └── kapi_diff_service.py    # Kernel API changelog between two revisions (§4.9)
+│   │   ├── kapi_diff_service.py    # Kernel API changelog between two revisions (§4.9)
+│   │   └── man_service.py          # Linux man-pages: index, pages, kernel <-> man-pages tag matching (§2.20, §4.13)
 │   └── routers/
 │       ├── versions.py             # Kernel versions catalog
 │       ├── filesystem.py           # Directory trees, source files, include resolution
@@ -95,6 +96,7 @@ webapp/
 │       ├── insights.py             # Insights reports (§4.10)
 │       ├── cve.py                  # CVE records of the kernel CNA (§4.11)
 │       ├── kapi.py                 # Kernel API catalogs (§4.9)
+│       ├── man.py                  # Linux man-pages (§4.13)
 │       └── tools.py                # Pahole layout, callgraph, semantic version diff
 ├── frontend/
 │   ├── index.html                  # Single-page application shell (served with its build's asset URLs)
@@ -519,6 +521,20 @@ evaluated in three progressive tiers to optimize latency:
    callers read once into a local (`.get()`) rather than testing and then indexing.
 5. **Unparsed repositories** remain browsable: tags absent from `m_git_ref` resolve through `git rev-parse` to
    `vid = 0`, and trees, files, searches, diffs and treemaps read Git directly.
+6. **Projects**: an entry's project slug (`repository_project_slug()`: its `project`, else `man-pages` for a
+   Linux man-pages clone recognised by `core.config.is_manpages_repository()`, else `linux`) is listed by
+   `GET /api/projects` as `project`; `is_manpages_entry()` tells the man-pages entry. A man-pages entry without
+   configured `tag_views` gets `core.config.MANPAGES_TAG_VIEWS` (one view grouping `man-pages-X.*` by major).
+   The Git-only tags of every project other than `linux` are listed in release order
+   (`versions.release_tag_key()` over `parser/git_ast/release_order.py`, any `<prefix>X.Y[.Z][-rcN]` scheme:
+   `man-pages-6.0-rc1` < `man-pages-6.00` < `man-pages-6.04` < `man-pages-6.04.01` < `man-pages-6.7`; a name with
+   a release prefix that does not parse, `man-pages-6.05-a1`, just before that release); `linux` keeps git's
+   version sort.
+7. **Another repository within a request**: a service that answers from a second configured repository (the
+   man-pages repository from a kernel request and back, §2.20) runs that part inside
+   `man_service.using_repo(name)`, which sets the request's repository `ContextVar` for the block and resets it
+   afterwards, so `get_repo_dir()`, the Git reader pool, `git_tree_resolver` and `RepoScopedCache` keys all
+   follow the other repository.
 
 ### 2.11. Client Synchronization & Build-Bound Assets (`webapp/backend/services/sync_service.py`, `webapp/frontend/js/sync.js`)
 Clients must follow server changes without the user knowing to reload. The server keeps five change tokens
@@ -759,12 +775,18 @@ request open.
 
 ### 2.17. Release Index (`webapp/backend/services/release_service.py`)
 Shared answers about releases, from Git:
-- **Ordering** (`release_key`, `parse_tag`; with `previous_in`, `final_of`, `series_name` they live in
-  `parser/git_ast/release_order.py`, shared with the parser's release statistics step, `core/API.md` §10, and
-  re-exported here): release candidates sort before their release, a release before its stable updates (`v3.0
-  < v3.0.1 < v3.1-rc1 < v3.1-rc10 < v3.1 < v3.1.1`); v2.6.x releases are series `2.6.x` with the fourth number
-  as the stable update. Only tags of commits are releases (`v2.6.11` tags a tree; history starts at
-  `v2.6.12-rc2`).
+- **Ordering** (`release_key`, `parse_tag`; with `previous_in`, `final_of`, `series_name`, `family_of`,
+  `release_ranges`, `release_tag_names` they live in `parser/git_ast/release_order.py`, shared with the parser's
+  release statistics step, `core/API.md` §10, and re-exported here): release candidates sort before their
+  release, a release before its stable updates (`v3.0 < v3.0.1 < v3.1-rc1 < v3.1-rc10 < v3.1 < v3.1.1`); v2.6.x
+  releases are series `2.6.x` with the fourth number as the stable update. Only tags of commits are releases
+  (`v2.6.11` tags a tree; history starts at `v2.6.12-rc2`).
+- **Every project** (the request's repository, `X-KI-Repo`): `tag_commits()` keeps `release_tag_names()` of the
+  repository's tags — the kernel scheme's (`vX.Y…`, `next-YYYYMMDD`) when it has any, else every
+  `<prefix>X.Y[.Z][-rcN]` release (`man-pages-6.9`, `foo-1.2.3`), the prefix being the tag's family with chains
+  of its own (`parser/git_ast/GIT_API.md` §7). A man-pages or any other tagged repository therefore has a
+  release index, release statistics and release reports like the kernel; the SQLite index's ranges come from
+  `release_ranges()` (the previous tag of each chain), as the parser's.
 - **Previous release** (`previous`): `v3.1 → v3.0`, `v3.1-rc1 → v3.0`, `v3.1-rc2 → v3.1-rc1`, `v3.0.5 →
   v3.0.4`, `v3.0.1 → v3.0`, `v2.6.39 → v2.6.38`; `range_of(tag)` gives the commit range `(previous, tag)`.
 - **Release membership from the database** (`release_lookup(shas)`, `db_lookup`, `db_covers_all`): the
@@ -864,6 +886,53 @@ facts instead (`m_blob_facts`, Step 6.9, `core/API.md` §6).
   (matched by the field name's last component, for any struct: approximate), labelled `via:
   "<struct>.<field>"`, at most 300 per field and node.
 
+### 2.20. Linux man-pages (`webapp/backend/services/man_service.py`, `webapp/backend/routers/man.py`)
+The man-pages repository (the entry `is_manpages_entry()` recognises, §2.10) is read from Git at any revision
+with the pure parser `parser/man_ast/` (`man_paths`, `man_parser`, `man_facts`; `parser/man_ast/MAN_API.md`).
+Man endpoints (§4.13) answer from the request's repository when it is the man-pages, else from the first
+available configured man-pages repository; `/api/man/resolve` answers for a kernel revision of the request's
+repository.
+- **Page files**: `page_map(commit)` lists the tree's page files (`man_paths.page_of_path()`: `man/manS/name.S`
+  or `manS/name.S`) once per `(name, section)`, preferring the `man/` path. Root `manS -> man/manS` symlinks of
+  the new layout are blobs in the tree listing, so their targets are never listed twice; a request for an
+  old-layout path (`man2/read.2`) at a new-layout tag answers with its `man/` path. A name lookup tries the
+  given section, then its siblings sharing the base number (`2` -> `2type`, `2const`; `3type` -> `3`), and
+  without a section every section in `SECTION_ORDER`; names match exactly, then case-insensitively.
+- **Aliases**: a `.so` page (`man_parser.so_target()`) is followed through `man_paths.resolve_so()` (targets are
+  relative to the man root) for at most `MAX_SO_HOPS` (5) hops; a loop stops at the last page reached.
+- **Index facts**: summaries and alias targets come from the parser's `m_blob_facts` family 6 rows
+  (`source_index.db_facts()` / `db_has()`, `"source": "db"`) when every page blob has one, else the missing
+  ones are read with one `git cat-file --batch` and extracted with `man_facts.extract()` (`"source": "git"`,
+  about 2 s for the 3,150 pages of a recent tag). An alias without a summary shows its target's.
+- **Release dates**: `tag_dates()` maps every commit-pointing tag of a repository to the committer date of the
+  commit it names (`%(*committerdate)` of an annotated tag, `%(committerdate)` of a lightweight one) and that
+  peeled commit; the tag's own creation date is never used, so retroactive tags (`man-pages-1.70`, tagged in
+  2014 on a 2004 commit) date from their release commit. Any other revision dates from its commit's committer
+  date. Every date below (tag lists, tag choice, kernel release dates, release headers) is this date.
+- **Kernel for a man page**: `linux.version` is the `kernel` parameter when it resolves in the kernel repository
+  (`kernel_repo` when it names a configured repository that is not the man-pages, else the entry of project
+  `linux`, else the first other available one), otherwise the newest final kernel release tag (`vX.Y`, no
+  release candidates, stable updates or `next` tags) whose commit is dated on or before the man-pages
+  revision's commit, the oldest one when all are later. `linux.syscall` is the page name for section `2`; `linux.symbols` the SYNOPSIS functions and
+  identifiers (`fn`, `id` of the facts) that are C identifiers and not keywords, at most 64.
+- **Release headers**: in the Git tree, recent pages carry the unreleased placeholders `.TH ... (date)
+  "Linux man-pages (unreleased)"`; for a `man-pages-X.Y` revision the page answer substitutes the tagged commit's
+  committer date (UTC, `YYYY-MM-DD`) and `Linux man-pages X.Y` on a copy of the document (the cached parse is untouched).
+- **Man-pages tag for a kernel**: the newest `man-pages-*` release tag (release candidates left out) whose commit
+  is dated on or before the kernel revision's commit, the oldest tag when all are later; when the page is missing there, older
+  tags are tried first, then newer ones. One `git cat-file --batch-check` answers every candidate path
+  (`man/manS/name.S`, `manS/name.S` for each section to try) at every tag. Without a usable man-pages
+  repository, kernel revision or page, the answer is the man7.org URL.
+- **Caches** (§2.10): `_TAG_DATES` (per repository), `_PAGE_MAPS` (64 commits), `_INDEXES` (32 commits),
+  `_FACTS` (16,384 blobs), `_DOCS` (256 parsed blobs) and `_RESOLVED` (1,024 `(man-pages repository, name,
+  section, kernel commit)` answers, scoped by the kernel repository) are `RepoScopedCache`s; tag dates and
+  resolve answers are dropped when the refs change (`register_refs_changed`), the commit- and blob-keyed
+  entries are immutable.
+- **Input validation**: revisions go through `safe_rev()` (`kernel` of a page silently falls back when it does
+  not resolve); names match `^[A-Za-z0-9_.:+-]{1,128}$`, sections `^[0-9][a-z]{0,12}$`, paths must pass
+  `is_safe_rel_path()` and be page paths; blobs are read by their tree SHA and `cat-file` specs pass
+  `is_safe_git_spec()`. Git runs as an argument list, never through a shell.
+
 ## 3. Database Schema & Underlying Tables
 
 | Domain Area | Key Database Tables | Primary Role |
@@ -881,7 +950,7 @@ facts instead (`m_blob_facts`, Step 6.9, `core/API.md` §6).
 
 ## 4. REST API Endpoint Catalog (`webapp/API_ENDPOINTS.md`)
 
-Full endpoint contracts, query parameters, response schemas, and service behaviors for `§4.1`–`§4.12` live exclusively in [`webapp/API_ENDPOINTS.md`](webapp/API_ENDPOINTS.md).
+Full endpoint contracts, query parameters, response schemas, and service behaviors for `§4.1`–`§4.13` live exclusively in [`webapp/API_ENDPOINTS.md`](webapp/API_ENDPOINTS.md).
 
 ---
 

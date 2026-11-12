@@ -512,7 +512,7 @@ def backfill_commit_relations(db: Any, repo_dir: str | None, from_commit_id: int
 
 
 # -----------------------------------------------------------------------------
-# D07: m_blob_facts (--backfill-facts [--families 1,2,3,4,5])
+# D07: m_blob_facts (--backfill-facts [--families 1,2,3,4,5,6])
 # -----------------------------------------------------------------------------
 
 def fact_blob_paths(db: Any, versions: list[tuple[str, int, int]]) -> dict[bytes, str]:

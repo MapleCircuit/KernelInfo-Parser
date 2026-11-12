@@ -191,7 +191,7 @@ export class PatchSeriesView {
     const d = this.draft;
     btn.disabled = true;
     try {
-      const res = await api.matchMaintainers(d.base, "", Object.keys(d.edits));
+      const res = await this.api.matchMaintainers(d.base, "", Object.keys(d.edits));
       const next = structuredClone(d);
       const merge = (have, add) => [...new Set([...have, ...(add || [])])];
       next.to = merge(next.to, res.suggested_to);
@@ -215,7 +215,7 @@ export class PatchSeriesView {
     btn.disabled = true;
     let res;
     try {
-      res = await api.formatPatchSeries(d.base, seriesPayload(d));
+      res = await this.api.formatPatchSeries(d.base, seriesPayload(d));
     } catch (err) {
       toast.error(`Could not generate the series: ${err.message}`);
       return;

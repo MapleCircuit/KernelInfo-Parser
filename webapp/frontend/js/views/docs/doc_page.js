@@ -9,6 +9,7 @@ import { state } from "../../state.js";
 import { toast } from "../../components/toast.js";
 import { shortRef } from "../../components/ref_picker.js";
 import { openDefinition } from "../../utils/definition_picker.js";
+import { handleManLinkClick } from "../man/man_links.js";
 import { renderDocument, renderRstFragment, extractTitle, escapeHtml, highlightCode, slugify } from "./rst_renderer.js";
 
 const TITLE_FETCH_LIMIT = 80;
@@ -31,6 +32,8 @@ export class DocPage {
    */
   constructor(opts) {
     this.opts = opts;
+    // Client of the code tab's repository (view.api), the shared one otherwise
+    this.client = opts.api || api;
     this.root = null;
     this.searchMarks = [];
     this.searchIdx = -1;
@@ -171,6 +174,9 @@ export class DocPage {
       } else if (a.dataset.symbol) {
         e.preventDefault();
         await this.openSymbol(a.dataset.symbol, newTab);
+      } else if (a.dataset.manLink) {
+        // :manpage: — our man-pages copy at the tag of this kernel revision, else man7.org (§5.38)
+        handleManLinkClick(e, { kernel: this.opts.version, repo: this.client.repo, forceNew: newTab });
       } else if (a.dataset.kconfig) {
         e.preventDefault();
         state.openTab({ type: "kconfig", title: `KConfig (${state.kconfigArch()})`, arch: state.kconfigArch(), version: this.opts.version, symbol: a.dataset.kconfig });
@@ -207,7 +213,7 @@ export class DocPage {
 
   async openSymbol(name, forceNew) {
     try {
-      if (await openDefinition(this.opts.version, name, { forceNew })) return;
+      if (await openDefinition(this.opts.version, name, { forceNew, repo: this.client.repo })) return;
     } catch {
       // fall through to the toast below
     }
@@ -221,7 +227,7 @@ export class DocPage {
       while (next < links.length) {
         const a = links[next++];
         try {
-          const res = await api.getFileContent(this.opts.version, a.dataset.doc);
+          const res = await this.client.getFileContent(this.opts.version, a.dataset.doc);
           const title = res && !res.is_binary && res.content ? extractTitle(res.content) : "";
           if (title && a.isConnected) {
             const span = a.querySelector(".doc") || a;
@@ -249,7 +255,7 @@ export class DocPage {
           innerHTML: `🖼 <a class="reference internal" data-src="${escapeHtml(path)}" href="#">${escapeHtml(path)}</a> <span class="kdoc-muted">(image not renderable here)</span>`,
         }));
       }, { once: true });
-      img.src = api.getRawFileUrl(this.opts.version, img.dataset.raw);
+      img.src = this.client.getRawFileUrl(this.opts.version, img.dataset.raw);
     });
   }
 
@@ -274,7 +280,7 @@ export class DocPage {
           no_identifiers: opts["no-identifiers"] || "",
         };
         try {
-          const res = await api.getKernelDoc(this.opts.version, el.dataset.kdocPath, query);
+          const res = await this.client.getKernelDoc(this.opts.version, el.dataset.kdocPath, query);
           if (!el.isConnected) return;
           if (!res.entries?.length) {
             el.querySelector(".kdoc-directive-card")?.insertAdjacentHTML("beforeend", `<div class="kdoc-muted">No matching kernel-doc comments.</div>`);
@@ -333,7 +339,7 @@ export class DocPage {
     if (!refs.length) return;
     let index;
     try {
-      index = (await api.getDocLabels(this.opts.version)).labels || {};
+      index = (await this.client.getDocLabels(this.opts.version)).labels || {};
     } catch {
       return;
     }
@@ -358,7 +364,7 @@ export class DocPage {
     const dir = path.slice(0, path.lastIndexOf("/"));
     const links = [];
     try {
-      const listing = await api.getDirectoryTree(this.opts.version, dir);
+      const listing = await this.client.getDirectoryTree(this.opts.version, dir);
       const names = new Set((listing.entries || []).map((e) => e.name));
       const base = path.split("/").pop();
       for (const idx of ["index.rst", "00-INDEX"]) {

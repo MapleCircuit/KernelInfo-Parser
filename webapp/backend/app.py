@@ -25,6 +25,7 @@ from webapp.backend.routers import (
     cve_router,
     kapi_router,
     watch_router,
+    man_router,
 )
 from webapp.backend.services.sync_service import SyncHeaderMiddleware, sync_service
 
@@ -138,6 +139,7 @@ def create_app() -> FastAPI:
     app.include_router(cve_router)
     app.include_router(kapi_router)
     app.include_router(watch_router)
+    app.include_router(man_router)
 
     # 3. Frontend files outside a build (the manifest's icon); the shell loads /b/<build>/...
     if FRONTEND_DIR.is_dir():

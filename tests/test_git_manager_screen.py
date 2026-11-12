@@ -19,6 +19,7 @@ from core.config import REPO_ROOT
 from core.tui.git_ops import (
     DEFAULT_CVE_URL,
     DEFAULT_LINUX_URL,
+    DEFAULT_MANPAGES_URL,
     KERNEL_CVE_URL,
     STANDARD_REMOTES,
     add_remote,
@@ -33,6 +34,7 @@ from core.tui.screens.git_manager import (
     BRANCH_HINT,
     KIND_CVE,
     KIND_LINUX,
+    KIND_MANPAGES,
     KIND_REPO,
     GitManagerScreen,
     StandardRemotesDialog,
@@ -101,7 +103,7 @@ class TestRepositorySelection(GitManagerTestBase):
     def test_candidates_include_clone_target_and_default_to_linux(self) -> None:
         screen = self.make_screen()
         names = [c.name for c in screen.candidates]
-        self.assertEqual(names, ["work", "linux", "cve"])
+        self.assertEqual(names, ["work", "linux", "man-pages", "cve"])
         self.assertEqual(screen.current_repo.path, self.repos_dir / "linux")
         self.assertFalse(screen.repo_exists)
         self.assertEqual(screen.remotes, [])
@@ -116,6 +118,8 @@ class TestRepositorySelection(GitManagerTestBase):
         add_remote(self.work, "origin", DEFAULT_LINUX_URL)
         screen = self.make_screen()
         self.assertTrue(screen.handle_key(ord("r")))
+        self.assertEqual(screen.current_repo.name, "man-pages")
+        self.assertTrue(screen.handle_key(ord("r")))
         self.assertEqual(screen.current_repo.name, "cve")
         self.assertTrue(screen.handle_key(ord("r")))
         self.assertEqual(screen.current_repo.name, "work")
@@ -123,6 +127,8 @@ class TestRepositorySelection(GitManagerTestBase):
         self.assertEqual(screen.remotes, [("origin", DEFAULT_LINUX_URL)])
         screen.handle_key(ord("R"))
         self.assertEqual(screen.current_repo.name, "cve")
+        screen.handle_key(ord("R"))
+        self.assertEqual(screen.current_repo.name, "man-pages")
         screen.handle_key(ord("R"))
         self.assertEqual(screen.current_repo.name, "linux")
 
@@ -359,7 +365,7 @@ class TestCveCatalog(GitManagerTestBase):
 
     def test_candidate_kinds_and_cve_path(self) -> None:
         kinds = [(c.name, c.kind) for c in repository_candidates(self.app.config)]
-        self.assertEqual(kinds, [("work", KIND_REPO), ("linux", KIND_LINUX), ("cve", KIND_CVE)])
+        self.assertEqual(kinds, [("work", KIND_REPO), ("linux", KIND_LINUX), ("man-pages", KIND_MANPAGES), ("cve", KIND_CVE)])
         self.assertEqual(cve_repo_path(self.app.config), self.cve_dir)
         self.assertEqual(cve_repo_path({"cve": {"repo_dir": ""}}), REPO_ROOT / "cvelistV5")
         self.assertEqual(cve_repo_path({}), REPO_ROOT / "cvelistV5")
@@ -433,3 +439,63 @@ class TestGitOpsHelpers(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestManPages(GitManagerTestBase):
+    def dest(self) -> Path:
+        return self.repos_dir / "man-pages"
+
+    def manpages_screen(self) -> GitManagerScreen:
+        return GitManagerScreen(self.win, self.app, run_command=self.runner, repo_path=str(self.dest()))
+
+    def test_candidate_is_offered_until_configured(self) -> None:
+        screen = self.manpages_screen()
+        self.assertEqual(screen.current_repo.kind, KIND_MANPAGES)
+        self.assertTrue(screen.can_clone_current())
+        self.assertIn(("C", "Clone man-pages"), screen._shortcuts())
+        screen.draw()
+        text = " ".join(str(c[1][2]) for c in self.win.calls if c[0] == "addstr")
+        self.assertIn("Clone man-pages", text)
+        self.assertIn("Linux man-pages", text)
+        # A configured clone at the target path replaces the clone candidate
+        _git_init(self.dest())
+        self.app.config["repositories"].append({"name": "man-pages", "path": str(self.dest()), "project": "man-pages"})
+        kinds = [(c.name, c.kind) for c in repository_candidates(self.app.config)]
+        self.assertEqual(kinds, [("work", KIND_REPO), ("man-pages", KIND_REPO), ("linux", KIND_LINUX), ("cve", KIND_CVE)])
+
+    def test_c_key_clones_default_url_and_registers_project(self) -> None:
+        self.runner.effect = lambda argv: _git_init(Path(argv[-1]))
+        screen = self.manpages_screen()
+        # Empty key queue: the URL prompt returns its default, the confirm dialog its default (Clone)
+        self.assertTrue(screen.handle_key(ord("c")))
+        self.assertEqual(self.runner.calls[0]["argv"], clone_command(DEFAULT_MANPAGES_URL, self.dest()))
+        entry = next(r for r in self.app.config["repositories"] if r["path"] == str(self.dest()))
+        self.assertEqual(entry["project"], "man-pages")
+        self.assertEqual(entry["branch_filter"], {"include": ["master"], "exclude": []})
+        self.assertTrue(self.app.is_dirty)
+        self.assertTrue(screen.repo_exists)
+        self.assertEqual(screen.current_repo.path, self.dest())
+        self.assertIn("Cloned", screen.status_bar.message)
+
+    def test_clone_refused_when_present(self) -> None:
+        self.dest().mkdir()
+        screen = self.make_screen()
+        self.assertFalse(screen.clone_manpages(url=DEFAULT_MANPAGES_URL, confirmed=True))
+        self.assertEqual(self.runner.calls, [])
+        self.assertIn("already exists", screen.status_bar.message)
+
+    def test_standard_remotes_refused_on_manpages(self) -> None:
+        _git_init(self.dest())
+        self.app.config["repositories"].append({"name": "man-pages", "path": str(self.dest()), "project": "man-pages"})
+        screen = self.manpages_screen()
+        self.assertEqual(screen.current_repo.kind, KIND_REPO)
+        self.assertFalse(screen.current_repo.is_kernel_tree)
+        self.assertEqual(screen.add_standard_remotes(names=[STANDARD_REMOTES[0].name], fetch=False), [])
+        self.assertIn("man-pages", screen.status_bar.message)
+        self.assertEqual(list_remotes(self.dest()), [])
+        with patch("core.tui.screens.git_manager.safe_modal_dialog", return_value="Later") as dialog, \
+                patch("core.tui.screens.git_manager.ModalTextInputDialog.show",
+                      side_effect=["mirror", "https://example.com/man-pages.git"]):
+            self.assertTrue(screen.handle_key(ord("a")))
+        self.assertEqual([c.kwargs.get("title") for c in dialog.call_args_list], ["Fetch New Remotes"])
+        self.assertEqual(list_remotes(self.dest()), [("mirror", "https://example.com/man-pages.git")])

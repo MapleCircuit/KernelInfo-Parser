@@ -13,7 +13,8 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
-# Canonical release tags (v2.6.12, v3.0, v6.12.1, v2.6.12-rc2); `-tree` snapshot tags are excluded
+# Canonical kernel release tags (v2.6.12, v3.0, v6.12.1, v2.6.12-rc2); `-tree` snapshot tags are excluded. A
+# repository without any lists its prefixed releases instead (man-pages-6.9.1, foo-1.2-rc1; release_order)
 VERSION_TAG_RE = re.compile(r"^v?\d+(?:\.\d+)+(?:-(?:rc|pre)\d*)?$")
 PRE_RELEASE_RE = re.compile(r"-(?:rc|pre|alpha|beta)\d*$")
 
@@ -28,6 +29,9 @@ DEFAULT_LINUX_DIRNAME = "linux"
 DEFAULT_CVE_URL = "https://github.com/CVEProject/cvelistV5.git"
 KERNEL_CVE_URL = "https://git.kernel.org/pub/scm/linux/security/vulns.git"
 DEFAULT_CVE_DIRNAME = "cvelistV5"
+# The Linux man-pages project, parsed next to the kernel (`<repos_dir>/man-pages`)
+DEFAULT_MANPAGES_URL = "https://git.kernel.org/pub/scm/docs/man-pages/man-pages.git"
+DEFAULT_MANPAGES_DIRNAME = "man-pages"
 # Directory names for repositories cloned under `workspace.repos_dir` from the TUI
 REPO_DIRNAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
@@ -117,7 +121,8 @@ def is_valid_remote_url(url: str) -> bool:
 
 
 def list_version_tags(repo: Path | str, include_pre_releases: bool = True) -> list[str]:
-    """Release tags of `repo` in version order (`v3.0-rc1` sorts before `v3.0`); [] on failure."""
+    """Release tags of `repo` in version order (`v3.0-rc1` sorts before `v3.0`); a repository without kernel
+    release tags lists its prefixed releases (`release_order.release_tag_names()`) in release order; [] on failure."""
     try:
         res = _git(
             repo,
@@ -130,7 +135,11 @@ def list_version_tags(repo: Path | str, include_pre_releases: bool = True) -> li
         return []
     if res.returncode != 0:
         return []
-    tags = [t.strip() for t in res.stdout.splitlines() if VERSION_TAG_RE.match(t.strip())]
+    names = [t.strip() for t in res.stdout.splitlines() if t.strip()]
+    tags = [t for t in names if VERSION_TAG_RE.match(t)]
+    if not tags:
+        from parser.git_ast.release_order import release_key, release_tag_names
+        tags = sorted(release_tag_names(names), key=release_key)
     if not include_pre_releases:
         tags = [t for t in tags if not PRE_RELEASE_RE.search(t)]
     return tags

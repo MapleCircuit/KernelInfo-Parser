@@ -718,6 +718,58 @@ DEFAULT_TAG_VIEWS: list[dict[str, Any]] = [
 ]
 
 
+# Projects the parser knows by slug (repositories[].project, m_project.slug) and their display names
+LINUX_PROJECT = "linux"
+MANPAGES_PROJECT = "man-pages"
+PROJECT_DISPLAY_NAMES: dict[str, str] = {LINUX_PROJECT: "Linux Kernel", MANPAGES_PROJECT: "Linux man-pages"}
+# Projects whose trees are not kernel trees: the Linux-only per-version steps (Kbuild, ARCH layouts, CVE
+# commit resolution) skip them
+NON_KERNEL_PROJECTS = frozenset({MANPAGES_PROJECT})
+
+# The Linux man-pages repository (https://git.kernel.org/pub/scm/docs/man-pages/man-pages.git): every
+# release tag (man-pages-X.Y[.Z]) descends from this root commit
+MANPAGES_ROOT_COMMIT = "fea681dafb1363a154b7fc6d59baa83d2a9ebc5c"
+# Root commit of torvalds/linux (v2.6.12-rc2): a clone rooted there is the `linux` project whatever its directory name
+LINUX_ROOT_COMMIT = "1da177e4c3f41524e886b7f1b8a0c1fc7321cac2"
+MANPAGES_DEFAULT_BRANCH = "master"
+MANPAGES_BRANCH_FILTER: dict[str, list[str]] = {
+    "include": ["master"],
+    "exclude": [],
+}
+MANPAGES_TAG_VIEWS: list[dict[str, Any]] = [
+    {
+        "name": "— man-pages —",
+        "regex_rules": [r"^(man-pages-\d+)(\..*)$"],
+    }
+]
+
+
+def project_display_name(slug: str | None) -> str:
+    """Display name of a project slug: "Linux Kernel" for `linux`, "Linux man-pages" for `man-pages`, else the slug."""
+    slug = str(slug or "").strip() or LINUX_PROJECT
+    return PROJECT_DISPLAY_NAMES.get(slug, slug)
+
+
+def is_kernel_project(slug: str | None) -> bool:
+    """False for projects known not to be kernel trees (`man-pages`); unknown slugs count as kernel trees."""
+    return str(slug or "").strip() not in NON_KERNEL_PROJECTS
+
+
+def repository_project(entry: dict[str, Any] | None) -> str:
+    """Project slug of a repositories[] entry (`project`, else `linux`)."""
+    return str((entry or {}).get("project") or "").strip() or LINUX_PROJECT
+
+
+def is_manpages_repository(name: str, git_url: str = "", root_commit: str = "") -> bool:
+    """True for a clone of the Linux man-pages: its root commit, a `man-pages` directory or a `man-pages.git` URL."""
+    url = (git_url or "").strip().rstrip("/")
+    return (
+        root_commit == MANPAGES_ROOT_COMMIT
+        or name == MANPAGES_PROJECT
+        or url.endswith(("/man-pages.git", "/man-pages"))
+    )
+
+
 def matches_branch_filter(branch: str, branch_filter: dict[str, Any] | None = None) -> bool:
     """True if branch matches include patterns and does not match exclude patterns."""
     bf = branch_filter if isinstance(branch_filter, dict) else DEFAULT_BRANCH_FILTER
@@ -837,21 +889,32 @@ def detect_repository(path: Path) -> dict[str, Any]:
         rel_path = str(path)
     branch = detect_default_branch(path)
     root_commit = detect_root_commit(path, branch)
-    branch_filter = copy.deepcopy(DEFAULT_BRANCH_FILTER)
-    branches = find_repository_branches(path, branch_filter, default_branch=branch)
+    git_url = _git_out(path, "config", "--get", "remote.origin.url")
+    if is_manpages_repository(path.name, git_url, root_commit):
+        # The man-pages: its own project, the master branch only, parsed from its root commit, tags by major
+        if branch == "HEAD" or not branch:
+            branch = MANPAGES_DEFAULT_BRANCH
+        branch_filter = copy.deepcopy(MANPAGES_BRANCH_FILTER)
+        branches = find_repository_branches(path, branch_filter, default_branch=branch)
+        project, start_ref, tag_views = MANPAGES_PROJECT, root_commit, copy.deepcopy(MANPAGES_TAG_VIEWS)
+    else:
+        branch_filter = copy.deepcopy(DEFAULT_BRANCH_FILTER)
+        branches = find_repository_branches(path, branch_filter, default_branch=branch)
+        # Parsing starts from the first version of the repository (history/* roots included) unless overridden
+        project = LINUX_PROJECT if root_commit == LINUX_ROOT_COMMIT else path.name
+        start_ref, tag_views = detect_start_ref(path, root_commit, branches), copy.deepcopy(DEFAULT_TAG_VIEWS)
     entry = {
         "name": path.name,
         "path": rel_path,
-        "project": path.name,
+        "project": project,
         "default_branch": branch,
-        "git_url": _git_out(path, "config", "--get", "remote.origin.url"),
+        "git_url": git_url,
         "root_commit": root_commit,
-        # Parsing starts from the first version of the repository (history/* roots included) unless overridden
-        "start_ref": detect_start_ref(path, root_commit, branches),
+        "start_ref": start_ref,
         "enabled": True,
         "branch_filter": branch_filter,
         "branches": branches,
-        "tag_views": copy.deepcopy(DEFAULT_TAG_VIEWS),
+        "tag_views": tag_views,
     }
     _DETECTED_REPO_CACHE[str(path)] = entry
     return dict(entry)

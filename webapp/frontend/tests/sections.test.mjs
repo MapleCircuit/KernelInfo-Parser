@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { scrollToShow, stepIndex, visibleRange } from "../js/components/virtual_list.js";
-import { chipCounts, filterRows, formatChips, parseChips, sectionParamsFromState, sectionStateFromParams, toTsv } from "../js/views/sections/section_model.js";
+import { chipCounts, filterRows, findRowBySel, formatChips, parseChips, sectionParamsFromState, sectionStateFromParams, toTsv } from "../js/views/sections/section_model.js";
 import { compareReleases, isFinalRelease, seriesOf } from "../js/views/sections/release_order.js";
 import { tabRoute } from "../js/tab_routes.js";
 import "../js/routes.js";
@@ -57,4 +57,20 @@ test("release ordering on the client", () => {
   assert.equal(isFinalRelease("v3.1-rc1"), false);
   assert.equal(seriesOf("v2.6.39.4"), "v2.6.39");
   assert.equal(seriesOf("v3.0.5"), "v3.0");
+});
+
+test("sel selects by exact key, else by the key's last segment", () => {
+  const rows = [{ key: "64:0:read" }, { key: "common:1:write" }, { key: ":2:open" }, { key: "u:mmap_pgoff" }, { key: "plain" }];
+  const key = (r) => r.key;
+  assert.equal(findRowBySel(rows, key, "common:1:write"), rows[1]);
+  assert.equal(findRowBySel(rows, key, "read"), rows[0]);
+  assert.equal(findRowBySel(rows, key, "write"), rows[1]);
+  assert.equal(findRowBySel(rows, key, "open"), rows[2]);
+  assert.equal(findRowBySel(rows, key, "mmap_pgoff"), rows[3]);
+  assert.equal(findRowBySel(rows, key, "plain"), rows[4]);
+  assert.equal(findRowBySel(rows, key, "pla"), null);
+  assert.equal(findRowBySel(rows, key, "x:9:read"), null); // a full key never falls back
+  assert.equal(findRowBySel(rows, key, ""), null);
+  // An exact key wins over a segment match
+  assert.equal(findRowBySel([{ key: "a:read" }, { key: "read" }], key, "read").key, "read");
 });

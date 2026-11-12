@@ -115,6 +115,20 @@
   border-radius: 3px;
 }
 
+/* Project of a tab of another repository than the linux kernel (§5.18): small, before the title */
+.tab-project {
+  font-size: var(--fs-10, 10px);
+  color: var(--text-muted);
+  border: 1px solid var(--border-color);
+  padding: 0 4px;
+  border-radius: 3px;
+  max-width: 9em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
 .tab-close {
   width: calc(16px * var(--ui-layout-scale, 1));
   height: calc(16px * var(--ui-layout-scale, 1));

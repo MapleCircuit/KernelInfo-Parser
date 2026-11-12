@@ -87,3 +87,32 @@ for (const [type, title, badge] of [["api", "Kernel API", "[A]"], ["insights", "
     navKey: (tab) => `${tab.view || ""}:${tab.sel || ""}:${tab.release || ""}:${tab.arch || ""}:${tab.window || ""}`,
   });
 }
+
+// ---------------------------------------------------------------- man pages (§5.38): page/sec/mode/kv/krepo/path/q
+// A man tab belongs to the man-pages repository (`repo=`) at one of its tags (`v=`), like any tab;
+// kv/krepo name the kernel revision the reader came from. Addresses written before tabs carried their
+// repository named them `mrepo` / `mv`: they still open the man-pages tab they address.
+export const MAN_MODES = ["web", "term"];
+const MAN_HASH = [["manPage", "page"], ["manSec", "sec"], ["manMode", "mode"],
+  ["kernelVersion", "kv"], ["kernelRepo", "krepo"], ["manPath", "path"], ["manQuery", "q"]];
+registerTabRoute("man", {
+  badge: "[H]",
+  keys: MAN_HASH.map(([k]) => k),
+  fromHash: (params) => {
+    const tab = Object.fromEntries(MAN_HASH.map(([k, h]) => [k, params.get(h) || ""]));
+    if (!MAN_MODES.includes(tab.manMode)) tab.manMode = "";
+    const legacyRepo = params.get("mrepo") || "";
+    if (legacyRepo && /^[\w.@+-]{1,128}$/.test(legacyRepo)) {
+      tab.repo = legacyRepo;
+      tab.version = params.get("mv") || "";
+    }
+    const page = tab.manPage || (tab.manPath ? tab.manPath.split("/").pop().replace(/\.\d[a-z]*$/, "") : "");
+    return { title: page ? `man ${page}${tab.manSec ? `(${tab.manSec})` : ""}` : "Man pages", ...tab };
+  },
+  toHash: (tab, params) => {
+    for (const [k, h] of MAN_HASH) setIf(params, h, tab[k]);
+  },
+  // The page is navigation (the repository and tag are part of every tab's key); the display mode and the
+  // index filter replace the entry
+  navKey: (tab) => `${tab.manPath || ""}:${tab.manPage || ""}:${tab.manSec || ""}`,
+});

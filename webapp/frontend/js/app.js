@@ -40,6 +40,10 @@ import { WatchView } from "./views/watch/watch_view.js";
 import { initWatchRuntime } from "./views/watch/watch_runtime.js";
 import { KernelApiView, apiSections } from "./views/kernel_api/kernel_api_view.js";
 import { InsightsView, insightsSections } from "./views/insights/insights_view.js";
+import { ManView } from "./views/man/man_view.js";
+import { newestTag } from "./views/man/man_model.js";
+import { KERNEL_FAMILY, familyOf, prefixedFinals, prefixedReleaseOf } from "./views/sections/release_order.js";
+import { PROJECT_MOVABLE_TABS, isManPagesRepo, manPagesRepo, setProjects } from "./utils/projects.js";
 import "./views/sections/all_sections.js";
 import { statusLine } from "./views/status/status_model.js";
 import { STICKY_KEY, stickyEnabled } from "./views/code_view/outline_panel.js";
@@ -109,7 +113,8 @@ class KernelIdeApp {
       bookmarks: () => new BookmarksView(),
       watch: () => new WatchView(),
       api: () => new KernelApiView(),
-      insights: () => new InsightsView()
+      insights: () => new InsightsView(),
+      man: () => new ManView()
     };
   }
 
@@ -124,9 +129,6 @@ class KernelIdeApp {
 
     // 2. Setup Online/Offline Status Indicator
     this.setupNetworkStatus();
-
-    // 2a. Repository selected in a previous session scopes every API request
-    api.setRepository(state.currentRepo);
 
     // 2b. Synchronize with the server's change tokens (database, parsed versions, Git refs, frontend build)
     try {
@@ -163,7 +165,18 @@ class KernelIdeApp {
     this.setupSidebarCollapse();
     await this.loadSidebarFileTree();
 
-    // 6. Initialize URL Synchronization (held above while the startup session picker is open)
+    // 6. Initialize URL Synchronization (held above while the startup session picker is open).
+    // An address naming another project (`repo=`, §5.26) opens its tab in that project, next to the
+    // open tabs; a repository not configured here opens in the active tab's project instead.
+    urlSync.setRepoHandler((repo) => {
+      const known = this.projects || [];
+      const project = known.find((p) => p.repo === repo);
+      if (known.length && (!project || project.available === false)) {
+        toast.warning(`The link names project '${repo}', which is not configured here: opened in ${state.activeRepo() || "the current project"}`);
+        return { repo: "", version: "" };
+      }
+      return { repo, version: project?.default_branch || "" };
+    });
     if (!urlSync.deferred) urlSync.init();
 
     // 7. Command palette (Ctrl+K / Ctrl+P search, Ctrl+Shift+P commands)
@@ -193,13 +206,22 @@ class KernelIdeApp {
     // A repository was added, removed, parsed for the first time or went missing (sync `projects` token)
     state.subscribe("projects:updated", () => this.initVersionSelector());
 
-    // A version finished parsing (or was rolled back), a branch moved or tags were fetched
-    state.subscribe("versions:updated", async ({ changed, removed, newlyIndexed }) => {
+    // The active tab belongs to another project: the header lists that project's branches and revisions
+    state.subscribe("repo:synced", async () => {
       await this.initVersionSelector();
+      await this.loadSidebarFileTree();
+    });
+
+    // A version finished parsing (or was rolled back), a branch moved or tags were fetched
+    // (of one repository: `repo`; the header lists the active tab's project)
+    state.subscribe("versions:updated", async ({ repo = state.currentRepo, changed, removed, newlyIndexed }) => {
+      const headerRepo = repo === state.currentRepo;
+      if (headerRepo) await this.initVersionSelector();
       if (newlyIndexed.length) {
-        toast.success(`Now indexed: ${newlyIndexed.slice(0, 3).join(", ")}${newlyIndexed.length > 3 ? ` and ${newlyIndexed.length - 3} more` : ""}`);
+        toast.success(`Now indexed${headerRepo ? "" : ` in ${repo}`}: ${newlyIndexed.slice(0, 3).join(", ")}${newlyIndexed.length > 3 ? ` and ${newlyIndexed.length - 3} more` : ""}`);
       }
-      const shown = new Set([state.currentVersion, ...state.panes.flatMap((p) => p.tabs.map((t) => t.version))]);
+      const shown = new Set([...(headerRepo ? [state.currentVersion] : []),
+        ...state.panes.flatMap((p) => p.tabs.filter((t) => state.repoOf(t) === repo).map((t) => t.version))]);
       if ([...changed, ...removed].some((v) => shown.has(v))) {
         await this.loadSidebarFileTree();
         this.tabsComponent.render();
@@ -316,7 +338,8 @@ class KernelIdeApp {
 
     state.subscribe("session:adopted", async () => {
       updateLabel();
-      api.setRepository(state.currentRepo);
+      // The adopted session's active tab may belong to another project: the header lists its revisions
+      if (this.headerRepo !== undefined && this.headerRepo !== state.currentRepo) await this.initVersionSelector();
       if (typeof this.loadBranchScope === "function") {
         await this.loadBranchScope(state.selectedBranch);
       }
@@ -930,32 +953,45 @@ class KernelIdeApp {
     const select = document.getElementById("version-select");
     const projSelect = document.getElementById("project-select");
     const branchSelect = document.getElementById("branch-select");
+    // The header shows the active tab's project; a later call (another tab activated) supersedes this one
+    const seq = (this._headerSeq = (this._headerSeq || 0) + 1);
+    const stale = () => seq !== this._headerSeq;
 
-    // 1. Projects (configured repositories; selection is sent as X-KI-Repo with every request)
+    // 1. Projects (configured repositories; each tab's requests name its own, §5.18)
     if (projSelect) {
       try {
-        const pRes = await api.getProjects();
+        const pRes = await api.forRepo(state.currentRepo).getProjects();
+        if (stale()) return;
         this.projects = pRes.projects || [];
+        setProjects(this.projects);
         if (!state.currentRepo || !this.projects.some((p) => p.repo === state.currentRepo)) {
           state.currentRepo = pRes.active || this.projects[0]?.repo || "";
-          api.setRepository(state.currentRepo);
           state.saveState();
         }
+        // Tabs saved before tabs carried their repository belong to this project
+        state.assignTabRepos(state.currentRepo);
         projSelect.innerHTML = this.projects.map((p) => {
           const label = `${p.name}${p.indexed ? "" : " (git only)"}${p.available ? "" : " — missing"}`;
           return `<option value="${escapeAttr(p.repo)}" ${p.repo === state.currentRepo ? "selected" : ""} ${p.available ? "" : "disabled"}>${escapeAttr(label)}</option>`;
         }).join("");
         projSelect.title = "Repository (projects detected under workspace.repos_dir)";
+        // The Man activity button (§5.38) exists while a man-pages repository is configured
+        const manBtn = document.querySelector('.activity-btn[data-action="man"]');
+        if (manBtn) manBtn.hidden = !manPagesRepo();
         projSelect.onchange = () => this.switchProject(projSelect.value);
       } catch (err) {
         console.warn("Could not load projects:", err);
       }
     }
 
+    this.headerRepo = state.currentRepo;
+    const client = api.forRepo(state.currentRepo);
+
     // 2. Branches: the selected one scopes the Tag and RC lists to the tags reachable from it
     if (branchSelect) {
       try {
-        const bRes = await api.getBranches();
+        const bRes = await client.getBranches();
+        if (stale()) return;
         this.branches = bRes.branches || [{ name: "master" }];
         this.tagViews = bRes.tag_views || (this.projects || []).find((p) => p.repo === state.currentRepo)?.tag_views || [];
         const isTagView = (scope) => !scope || scope.startsWith("view:") || (this.tagViews || []).some((v) => v.name === scope);
@@ -973,7 +1009,8 @@ class KernelIdeApp {
     if (!select) return;
     try {
       // Every tag including release candidates; releases fill the Tag selector, -rc# the RC selector
-      const res = await api.getVersions(true);
+      const res = await client.getVersions(true);
+      if (stale()) return;
       this.rawVersions = res.versions || ["v3.0"];
       this.buildVersionCatalog(this.rawVersions);
       const branchNames = (this.branches || []).map((b) => b.name);
@@ -985,6 +1022,11 @@ class KernelIdeApp {
       // are valid targets too)
       const valid = (ref) => this.versionByName.has(ref) || isCommitRef(ref) || branchNames.includes(ref);
       const fallback = () => {
+        // The man-pages project (§5.38): its newest tag, parsed or not (its pages render from Git too)
+        if (isManPagesRepo(state.currentRepo)) {
+          const newest = newestTag(this.tagVersions.map((t) => t.vname));
+          if (newest) return newest;
+        }
         const indexed = this.tagVersions.filter((t) => t.indexed && !t.rcOnly);
         return (indexed[indexed.length - 1] || this.tagVersions[this.tagVersions.length - 1] || { vname: "v3.0" }).vname;
       };
@@ -1157,7 +1199,9 @@ class KernelIdeApp {
     const select = document.getElementById("version-select");
     if (select) select.title = `Reading the releases of ${b}\u2026`;
     try {
-      const res = await api.getBranchTags(b);
+      const repo = state.currentRepo;
+      const res = await api.forRepo(repo).getBranchTags(b);
+      if (state.currentRepo !== repo) return; // the header moved to another project meanwhile
       state.setBranchTags(b, res?.tags || []);
     } catch (err) {
       console.warn(`Could not list the tags of ${b}:`, err);
@@ -1202,14 +1246,25 @@ class KernelIdeApp {
           console.warn(`Invalid tag_view regex rule '${rule}':`, e);
         }
       }
-      return { base: vname, suffix: "", isSub: false };
+      return this.prefixedRelease(vname) || { base: vname, suffix: "", isSub: false };
     }
+    const prefixed = this.prefixedRelease(vname);
+    if (prefixed) return prefixed;
     // Real Git branch: standard Git pre-release grouping (only -rc/-pre/etc are sub-versions)
     const m = /^(.*?)(-(?:rc|pre|alpha|beta)\d*)$/.exec(vname || "");
     if (m && m[1] && m[2]) {
       return { base: m[1], suffix: m[2], isSub: true };
     }
     return { base: vname, suffix: "", isSub: false };
+  }
+
+  /**
+   * Release of a prefixed release tag (`<prefix>X.Y[.Z][-rcN]`, release_order.js) in a repository without
+   * kernel-scheme tags: point releases and candidates group under their series' final tag
+   * (`man-pages-6.9.1` → `man-pages-6.9`). Null in a kernel repository (its tags keep the tag_view rules).
+   */
+  prefixedRelease(vname) {
+    return this._prefixedFinals ? prefixedReleaseOf(vname, this._prefixedFinals) : null;
   }
 
   /** Release a tag belongs to: "v3.1-rc4" → "v3.1", "v3.0.1" → "v3.0" (in tag_view), etc. */
@@ -1230,6 +1285,9 @@ class KernelIdeApp {
         : { vname: v.vname || v.name, commit_hash: v.commit_hash || "", indexed: v.indexed !== false, ref_type: v.ref_type ?? 1, is_prerelease: Boolean(v.is_prerelease) }))
       .filter((v) => v.vname);
     this.versionByName = new Map(entries.map((v) => [v.vname, v]));
+    // Prefixed release tags group by series only where no kernel-scheme tag exists (release_tag_names rule)
+    const tagNames = entries.filter((v) => v.ref_type !== 2 && v.ref_type !== 3).map((v) => v.vname);
+    this._prefixedFinals = tagNames.some((n) => familyOf(n) === KERNEL_FAMILY) ? null : prefixedFinals(tagNames);
     this.rcsByBase = new Map();
     const releases = [];
     const seenBases = new Set();
@@ -1401,32 +1459,49 @@ class KernelIdeApp {
     if (newTabBtn) newTabBtn.title = `Open a repository explorer on ${shortRef(cur)} in a new tab`;
   }
 
-  /** Switch the active repository: resets the workspace and reloads the version catalog. */
-  async switchProject(repo) {
-    const projSelect = document.getElementById("project-select");
-    if (!repo || repo === state.currentRepo) return;
-    const openTabs = state.panes.reduce((n, p) => n + p.tabs.length, 0);
-    if (openTabs > 0 && !confirm(`Switch project to '${repo}'? Open tabs (${openTabs}) belong to the current repository and will be closed.`)) {
-      if (projSelect) projSelect.value = state.currentRepo;
-      return;
-    }
-    api.setRepository(repo);
-    let defaultVersion = "";
+  /**
+   * Default revision of a project: its latest parsed release (else its newest tag, else its default
+   * branch); the man-pages project's newest release tag, parsed or not (§5.38).
+   */
+  async defaultVersionOf(repo) {
+    let version = "";
     try {
-      const res = await api.getVersions(true);
+      const res = await api.forRepo(repo).getVersions(true);
       const versions = (res.versions || []).filter((v) => !v.is_prerelease);
       const indexed = versions.filter((v) => v.indexed !== false && v.ref_type !== 3);
-      defaultVersion = (indexed[indexed.length - 1] || versions[versions.length - 1] || {}).vname || "";
+      version = (indexed[indexed.length - 1] || versions[versions.length - 1] || {}).vname || "";
+      if (isManPagesRepo(repo)) version = newestTag(versions.filter((v) => v.ref_type !== 2 && v.ref_type !== 3).map((v) => v.vname)) || version;
     } catch (err) {
       console.warn("Could not load versions for project:", err);
     }
-    if (!defaultVersion) {
-      const project = (this.projects || []).find((p) => p.repo === repo);
-      defaultVersion = project?.default_branch || "HEAD";
+    return version || (this.projects || []).find((p) => p.repo === repo)?.default_branch || "HEAD";
+  }
+
+  /**
+   * The header's Project picked `repo` (§5.18): no tab is closed and nothing is asked. A tab whose address
+   * holds in any repository (explorer, commits, search, treemap, status) moves to `repo` at its default
+   * revision, like Apply moves it to another revision; any other active tab stays and the project's
+   * default view opens next to it (the man index in the man-pages project, else a repository explorer).
+   * Without an open tab it only becomes the project new tabs open in.
+   */
+  async switchProject(repo) {
+    const projSelect = document.getElementById("project-select");
+    const tab = state.getActiveTab();
+    if (!repo || repo === state.activeRepo()) return;
+    const version = await this.defaultVersionOf(repo);
+    const label = (this.projects || []).find((p) => p.repo === repo)?.name || repo;
+    if (!tab) {
+      state.setDefaultRepository(repo, version);
+    } else if (PROJECT_MOVABLE_TABS[tab.type]) {
+      const patch = PROJECT_MOVABLE_TABS[tab.type](tab, label);
+      state.moveTabToRepository(tab, repo, version, patch);
+    } else if (isManPagesRepo(repo)) {
+      state.openTab({ type: "man", title: "Man pages", manPage: "", manSec: "", manPath: "", manQuery: "", repo, version, kernelVersion: "", kernelRepo: "" });
+    } else {
+      state.openTab({ type: "explorer", title: `Explorer ${shortRef(version)}`, path: "", repo, version, forceNew: true });
     }
-    state.setRepository(repo, defaultVersion);
-    await this.initVersionSelector();
-    toast.success(`Switched to ${repo} @ ${shortRef(defaultVersion)}`);
+    if (projSelect) projSelect.value = state.currentRepo;
+    toast.success(`Project ${label} @ ${shortRef(version)}`);
   }
 
   /** Commands listed in the palette (">" prefix). */
@@ -1467,6 +1542,7 @@ class KernelIdeApp {
       },
       { title: "Compare versions or commits", hint: "Files & Kconfig changes", keywords: "diff compare", run: () => state.openTab({ type: "diff", title: "Compare" }) },
       { title: "Compare kernel APIs", hint: "Syscalls, exports, parameters, tracepoints and modules added, removed or changed between two revisions", keywords: "api changelog diff exports compare", run: () => state.openTab({ type: "diff", title: "Compare", mode: "api", versionB: v() }) },
+      { title: "Open man pages", hint: "Linux man-pages index (sections, filter), Web or Terminal rendering", keywords: "man manual manpage man-pages syscall", run: () => this.openManIndex() },
       { title: "Open Kernel API", hint: "Syscalls, exports, parameters, tracepoints, modules, device tables", keywords: "kapi api catalog", run: () => state.openTab({ type: "api", title: "Kernel API", version: v() }) },
       ...apiSections().map((sec) => ({ title: `Kernel API: ${sec.label}`, hint: sec.hint || "", keywords: `kapi ${sec.keywords || ""}`,
         run: () => state.openTab({ type: "api", title: `Kernel API · ${sec.label}`, view: sec.id, version: v() }) })),
@@ -1560,7 +1636,7 @@ class KernelIdeApp {
     if ((this.projects || []).length > 1) {
       for (const p of this.projects) {
         if (p.repo !== state.currentRepo && p.available) {
-          commands.push({ title: `Switch project: ${p.name}`, hint: p.path, keywords: "repository project", run: () => this.switchProject(p.repo) });
+          commands.push({ title: `Switch project: ${p.name}`, hint: p.path, keywords: "repository project tab", run: () => this.switchProject(p.repo) });
         }
       }
     }
@@ -1610,6 +1686,35 @@ class KernelIdeApp {
     this.setSidebarCollapsed(collapsed);
   }
 
+  /**
+   * Man activity button (§5.38): the man pages index. In the man-pages project, at the explored tag;
+   * from the kernel, at the man-pages tag released on or before the explored kernel revision
+   * (`/api/man/resolve`), else the newest tag.
+   */
+  async openManIndex() {
+    const index = { manPage: "", manSec: "", manPath: "", manQuery: "", title: "Man pages" };
+    if (isManPagesRepo(state.activeRepo())) {
+      state.openTab({ type: "man", ...index, repo: state.activeRepo(), version: state.activeVersion(), kernelVersion: "", kernelRepo: "" });
+      return;
+    }
+    const repo = manPagesRepo();
+    if (!repo) {
+      toast.info("No man-pages repository is configured (a repository whose project is man-pages)");
+      return;
+    }
+    const kernel = state.activeVersion();
+    const kernelRepo = state.activeRepo();
+    let mv = "";
+    try {
+      const res = await api.forRepo(kernelRepo).resolveMan("intro", "1", kernel);
+      if (res?.available && res.repo === repo) mv = res.version;
+    } catch (err) {
+      console.warn("Man-pages tag lookup failed:", err);
+    }
+    // Without a resolved tag the man tab opens on the newest one (man_view.js)
+    state.openTab({ type: "man", ...index, repo, version: mv, kernelVersion: kernel, kernelRepo });
+  }
+
   setupActivityBar() {
     const buttons = document.querySelectorAll(".activity-btn");
 
@@ -1634,6 +1739,8 @@ class KernelIdeApp {
           state.openTab({ type: "api", title: "Kernel API" });
         } else if (action === "insights") {
           state.openTab({ type: "insights", title: "Insights" });
+        } else if (action === "man") {
+          this.openManIndex();
         } else if (action === "compare" || action === "tools") {
           state.openTab({ type: "diff", title: "Compare" });
         }

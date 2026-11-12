@@ -239,5 +239,38 @@ class TestNewFamilies(unittest.TestCase):
             mock_doc_ins.assert_called_once()
 
 
+
+class TestManFacts(unittest.TestCase):
+    """Family 6: man pages of the Linux man-pages tree (parser/man_ast/man_facts.py)."""
+
+    PAGE = (".TH READ 2 2024-05-02 \"Linux man-pages 6.9\"\n.SH NAME\nread \\- read from a file descriptor\n"
+            ".SH SYNOPSIS\n.nf\n.B #include <unistd.h>\n.P\n.BI \"ssize_t read(int \" fd \", void \" buf \", size_t \" count );\n"
+            ".fi\n.SH SEE ALSO\n.BR close (2),\n.BR readv (2)\n")
+
+    def test_routing(self) -> None:
+        from parser.man_ast import man_facts as mf
+        self.assertEqual(mf.FAMILY, 6)
+        self.assertEqual(fi.FAMILIES[mf.FAMILY], mf.FORMAT)
+        for path in ("man/man2/read.2", "man2/read.2", "man/man3type/size_t.3type", "man/man2const/EPOLL_CTL_ADD.2const"):
+            self.assertEqual(fi.families_of(path), (mf.FAMILY,), path)
+        for path in ("man2", "GNUmakefile", "Documentation/man/man2/x.2", "README", "man/man2/read.3"):
+            self.assertEqual(fi.families_of(path), (), path)
+        tree = {"man/man2/read.2": b"\1" * 20, "man2": b"\2" * 20, "README": b"\3" * 20}
+        self.assertEqual(fi.fact_blobs(tree), {b"\1" * 20: "man/man2/read.2"})
+
+    def test_ingest_stores_family_6(self) -> None:
+        from parser.man_ast import man_facts as mf
+        sha = b"\7" * 20
+        conn = FactsConnection()
+        res = fi.ingest(conn, {sha: "man/man2/read.2"}, lambda path: self.PAGE, workers=1)
+        self.assertEqual((res["extracted"], res["rows"]), (1, 1))
+        fmt, data = conn.rows[(sha, mf.FAMILY)]
+        self.assertEqual(fmt, mf.FORMAT)
+        self.assertEqual(mf.decode(data), mf.decode(mf.encode(mf.extract(self.PAGE))))
+        self.assertIn("read", mf.decode(data)["n"])
+        # Stored once: a second version finds the row
+        self.assertEqual(fi.ingest(conn, {sha: "man/man2/read.2"}, lambda path: self.fail("read again"))["extracted"], 0)
+
+
 if __name__ == "__main__":
     unittest.main()

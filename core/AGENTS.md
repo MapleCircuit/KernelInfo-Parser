@@ -20,7 +20,7 @@ Always enforce these invariants when modifying `core/`:
    - Deduplicate AST nodes using `m_ast.view(...)`, never `m_ast.set(...)` or `m_ast.get_set(...)`.
    - Never mutate `Table` column schema tuples at runtime.
 5. **Pure Extractor Reuse**:
-   - Parsers feeding `m_blob_facts` (calls/ops tables `1`, Kernel API `2`, includes `3`, Kconfig definitions `4`, doc labels `5`) must keep extraction logic in pure functions under `parser/` so `core/` persists them during ingestion and `webapp/` can invoke them for unparsed revisions.
+   - Parsers feeding `m_blob_facts` (calls/ops tables `1`, Kernel API `2`, includes `3`, Kconfig definitions `4`, doc labels `5`, man pages `6`) must keep extraction logic in pure functions under `parser/` so `core/` persists them during ingestion and `webapp/` can invoke them for unparsed revisions.
 6. **Distributed Multi-Computer Invariants (`core/distributed.py`, `main.py`)**:
    - **Sequence block leasing**: Always lease primary key ID blocks using `db.reserve_id_block(table, block_size, commit_id)` in distributed mode (`G.distributed == True`, e.g. in `_ingest_commit_range` for `m_commit` and `m_maintainer_person`); never use raw `db.get_next_id()`.
    - **Active worker states**: In `_previous_ingest`, check `m_parse_node.heartbeat_at >= now - 180` before treating `m_ingest_state.status == INGEST_PARSING` as interrupted to prevent premature rollback of in-flight peer runs.

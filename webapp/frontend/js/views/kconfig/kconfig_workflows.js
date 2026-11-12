@@ -30,7 +30,7 @@ export async function showFragmentsDialog(view) {
   if (!view.engine.loaded) return;
   let listing = [];
   try {
-    listing = (await api.getKconfigFragments(view.currentVersion, view.currentArch)).fragments || [];
+    listing = (await (view.api || api).getKconfigFragments(view.currentVersion, view.currentArch)).fragments || [];
   } catch (err) {
     toast.error(`Could not list fragments: ${err.message}`);
   }
@@ -69,7 +69,7 @@ export async function showFragmentsDialog(view) {
     const fragments = [];
     try {
       for (const idx of order) {
-        const res = await api.getKconfigDefconfigContent(view.currentVersion, listing[idx].path, view.currentArch, view.toolchain);
+        const res = await (view.api || api).getKconfigDefconfigContent(view.currentVersion, listing[idx].path, view.currentArch, view.toolchain);
         fragments.push({ name: listing[idx].name, text: res.content || "" });
       }
     } catch (err) {
@@ -189,7 +189,7 @@ export function showHardwareDialog(view) {
 /** Compute the dry run of one hardware operation. */
 export async function planHardware(view, names, mode, say = () => {}) {
   say(`Looking up ${plural(names.length, "module")}…`);
-  const res = await api.getKbuildModules(view.currentVersion, view.currentArch, names, {
+  const res = await (view.api || api).getKbuildModules(view.currentVersion, view.currentArch, names, {
     gates: mode === "trim",
     onProgress: (p) => say(`Building the Kbuild index… ${p?.done ?? ""}/${p?.total ?? ""}`),
   });
@@ -210,7 +210,7 @@ export async function planHardware(view, names, mode, say = () => {}) {
     const built = (m) => m.objects.some((o) => evalBuild(o.expr, (n) => values[n] ?? "n") !== "n");
     const missing = Object.fromEntries(Object.entries(modules).filter(([, m]) => !built(m)));
     out.alreadyBuilt = Object.keys(modules).length - Object.keys(missing).length;
-    const solve = (name, value, current) => api.autosolveKconfig(view.currentVersion, {
+    const solve = (name, value, current) => (view.api || api).autosolveKconfig(view.currentVersion, {
       target_symbol: name, value, arch: view.currentArch, toolchain: view.toolchain, current_values: current,
     });
     out.ensure = await ensureModules(probe, missing, solve, { onProgress: (i, n, mod) => say(`Solving ${mod} (${i}/${n})…`) });

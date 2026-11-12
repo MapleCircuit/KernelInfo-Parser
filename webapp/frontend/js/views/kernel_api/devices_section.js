@@ -31,7 +31,7 @@ registerApiSection({
   id: "devices", label: "Devices", order: 60, archScoped: true, keywords: "hardware driver pci usb lspci modalias device table",
   hint: "Which driver handles a device: paste lspci -nn / lsusb / modalias",
   async fetchList(ctx) {
-    const r = await api.getKapi(ctx.version, `devices?arch=${encodeURIComponent(ctx.arch)}`, { ...ctx, cacheKey: "kapi_devices" });
+    const r = await (ctx.api || api).getKapi(ctx.version, `devices?arch=${encodeURIComponent(ctx.arch)}`, { ...ctx, cacheKey: "kapi_devices" });
     return { rows: r.entries, note: `${r.tables.toLocaleString("en-US")} device tables`, summaryHtml: PASTE };
   },
   rowKey: (e) => `${e.path}:${e.table}:${e.id}:${e.text}`,
@@ -66,7 +66,7 @@ document.addEventListener("click", async (e) => {
   const arch = tab?.arch || state.kconfigArch();
   results.innerHTML = '<p class="sv-empty">Matching…</p>';
   try {
-    const res = await api.request(`/api/kapi/${encodeURIComponent(version || tab?.version || state.currentVersion)}/devices/match`, {
+    const res = await api.forTab(tab).request(`/api/kapi/${encodeURIComponent(version || tab?.version || state.currentVersion)}/devices/match`, {
       method: "POST", body: JSON.stringify({ text, arch }), timeoutMs: 90000,
     });
     results.innerHTML = resultsHtml(res, { version: tab?.version || state.currentVersion, arch });

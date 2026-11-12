@@ -219,7 +219,7 @@ export class KconfigView {
     this.bindToolbar();
 
     try {
-      const presetsRes = await api.getKconfigPresets(this.currentVersion);
+      const presetsRes = await this.api.getKconfigPresets(this.currentVersion);
       this.archPresets = (presetsRes && presetsRes.targets) || [];
       if (!this.archPresets.some((p) => p.id === this.currentArch)) {
         const fallback = presetsRes?.default_arch || this.archPresets[0]?.id || DEFAULT_ARCH;
@@ -333,7 +333,7 @@ export class KconfigView {
     if (scrollEl) scrollEl.innerHTML = `<div class="kconfig-empty">Loading KConfig model for ARCH=${escapeHtml(arch)}...</div>`;
 
     try {
-      const raw = await api.getKconfigTree(this.currentVersion, arch, this.toolchain);
+      const raw = await this.api.getKconfigTree(this.currentVersion, arch, this.toolchain);
       this.engine.setModel(raw);
     } catch (err) {
       if (scrollEl) scrollEl.innerHTML = `<div class="kconfig-error">Failed to load the Kconfig model: ${escapeHtml(err.message)}</div>`;
@@ -696,7 +696,7 @@ export class KconfigView {
   async loadDefconfig(path, { quiet = false } = {}) {
     let res;
     try {
-      res = await api.getKconfigDefconfigContent(this.currentVersion, path, this.currentArch, this.toolchain);
+      res = await this.api.getKconfigDefconfigContent(this.currentVersion, path, this.currentArch, this.toolchain);
     } catch (err) {
       if (!quiet) toast.error(`Failed to load defconfig: ${err.message}`);
       this.engine.loadConfig("");
@@ -1344,7 +1344,7 @@ export class KconfigView {
   async fillRemoteDetail(sym, token, detailCol) {
     let detail;
     try {
-      detail = await api.getKconfigSymbol(this.currentVersion, sym, this.currentArch, this.toolchain);
+      detail = await this.api.getKconfigSymbol(this.currentVersion, sym, this.currentArch, this.toolchain);
     } catch (err) {
       if (token === this.detailToken) {
         const box = detailCol.querySelector("#kconfig-detail-remote");
@@ -1388,7 +1388,7 @@ export class KconfigView {
     container.innerHTML = `<div class="kconfig-muted">Searching ${escapeHtml(this.currentVersion)}…</div>`;
     let usage;
     try {
-      usage = await api.getKconfigUsage(this.currentVersion, sym, this.currentArch, this.toolchain);
+      usage = await this.api.getKconfigUsage(this.currentVersion, sym, this.currentArch, this.toolchain);
     } catch (err) {
       container.innerHTML = `<div class="kconfig-error">${escapeHtml(err.message)}</div>`;
       return;
@@ -1418,7 +1418,7 @@ export class KconfigView {
     toast.info(`Searching prerequisites for CONFIG_${sym}…`);
     let res;
     try {
-      res = await api.autosolveKconfig(this.currentVersion, { target_symbol: sym, arch: this.currentArch, toolchain: this.toolchain, current_values: this.engine.configValues() });
+      res = await this.api.autosolveKconfig(this.currentVersion, { target_symbol: sym, arch: this.currentArch, toolchain: this.toolchain, current_values: this.engine.configValues() });
     } catch (err) {
       toast.error(`Auto-solve failed: ${err.message}`);
       return;
@@ -1438,7 +1438,7 @@ export class KconfigView {
     container.innerHTML = `<div class="kconfig-muted">Loading graph…</div>`;
     let graph;
     try {
-      graph = await api.getKconfigGraph(this.currentVersion, this.currentArch, symbolName, this.toolchain);
+      graph = await this.api.getKconfigGraph(this.currentVersion, this.currentArch, symbolName, this.toolchain);
     } catch (err) {
       container.innerHTML = `<div class="kconfig-error">${escapeHtml(err.message)}</div>`;
       return;
@@ -1534,7 +1534,7 @@ export class KconfigView {
     let list = [];
     let listError = "";
     try {
-      const defs = await api.getKconfigDefconfigs(this.currentVersion, this.currentArch);
+      const defs = await this.api.getKconfigDefconfigs(this.currentVersion, this.currentArch);
       list = (defs && defs.defconfigs) || [];
     } catch (err) {
       listError = err.message;
@@ -1584,7 +1584,7 @@ export class KconfigView {
   /** Right-hand side of the compare window: a defconfig resolved for this ARCH. */
   async defconfigSide(path) {
     if (!this.engine.loaded) throw new Error("The Kconfig model of this tab is not loaded yet");
-    const res = await api.getKconfigDefconfigContent(this.currentVersion, path, this.currentArch, this.toolchain);
+    const res = await this.api.getKconfigDefconfigContent(this.currentVersion, path, this.currentArch, this.toolchain);
     const probe = new KconfigEngine(this.engine.model);
     probe.loadConfig(res.content || "");
     probe.setAllNewSymbols("default");
@@ -1660,7 +1660,7 @@ export class KconfigView {
   async showDefconfigModal() {
     let list = [];
     try {
-      const defs = await api.getKconfigDefconfigs(this.currentVersion, this.currentArch);
+      const defs = await this.api.getKconfigDefconfigs(this.currentVersion, this.currentArch);
       list = (defs && defs.defconfigs) || [];
     } catch (err) {
       toast.error(`Failed to fetch defconfigs: ${err.message}`);
@@ -1708,7 +1708,7 @@ export class KconfigView {
    */
   async reloadModel() {
     const before = { ...(this.rawValues || {}) };
-    const raw = await api.getKconfigTree(this.currentVersion, this.currentArch, this.toolchain);
+    const raw = await this.api.getKconfigTree(this.currentVersion, this.currentArch, this.toolchain);
     // Resolve on a throwaway engine: the live one keeps the current model until this is accepted
     let changes = [];
     if (this.engineActive) {
@@ -1770,7 +1770,7 @@ export class KconfigView {
     spec.probes = spec.probes || {};
     let defaults = null;
     try {
-      defaults = await api.getKconfigToolchainDefaults(this.currentVersion, this.currentArch);
+      defaults = await this.api.getKconfigToolchainDefaults(this.currentVersion, this.currentArch);
     } catch (err) {
       console.warn("Toolchain defaults unavailable:", err);
     }

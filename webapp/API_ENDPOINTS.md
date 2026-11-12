@@ -1,23 +1,24 @@
 # WebApp REST API Endpoint Catalog (`webapp/API_ENDPOINTS.md`)
 
-Authoritative specification for Section 4 (`§4.1`–`§4.12`) of the WebApp subsystem. For core architecture, security, caching, sync, and configuration (`§1`–`§3`, `§6`–`§8`), see `webapp/API.md`. For frontend modules and views (`§5.0`–`§5.37`), see `webapp/API_FRONTEND.md`.
+Authoritative specification for Section 4 (`§4.1`–`§4.13`) of the WebApp subsystem. For core architecture, security, caching, sync, and configuration (`§1`–`§3`, `§6`–`§8`), see `webapp/API.md`. For frontend modules and views (`§5.0`–`§5.38`), see `webapp/API_FRONTEND.md`.
 
 ---
 
 ## Table of Contents
 - 4. REST API Endpoint Catalog
-  - 4.1. Version Catalog [L31-L214]
-  - 4.2. Filesystem & Code View API [L215-L508]
-  - 4.3. Symbols, Cross-References & AST Inspection API [L509-L889]
-  - 4.4. Kconfig & Architecture Defconfigs API [L890-L1120]
-  - 4.5. Maintainers & CREDITS API [L1121-L1397]
-  - 4.6. Git Commits & Patch Management API [L1398-L1816]
-  - 4.7. Visual Modeling & Analysis Tools API [L1817-L2164]
-  - 4.8. Linux Kernel Mailing List (LKML) & Public-Inbox API [L2165-L2480]
-  - 4.9. Kernel API Catalogs (`kapi.py`) [L2481-L2573]
-  - 4.10. Insights API (`insights.py`) [L2574-L2673]
-  - 4.11. CVE Records API (`cve.py`) [L2674-L2724]
-  - 4.12. Watch API (`watch.py`) [L2725-L2741]
+  - 4.1. Version Catalog [L32-L217]
+  - 4.2. Filesystem & Code View API [L218-L511]
+  - 4.3. Symbols, Cross-References & AST Inspection API [L512-L892]
+  - 4.4. Kconfig & Architecture Defconfigs API [L893-L1123]
+  - 4.5. Maintainers & CREDITS API [L1124-L1400]
+  - 4.6. Git Commits & Patch Management API [L1401-L1819]
+  - 4.7. Visual Modeling & Analysis Tools API [L1820-L2167]
+  - 4.8. Linux Kernel Mailing List (LKML) & Public-Inbox API [L2168-L2483]
+  - 4.9. Kernel API Catalogs (`kapi.py`) [L2484-L2576]
+  - 4.10. Insights API (`insights.py`) [L2577-L2683]
+  - 4.11. CVE Records API (`cve.py`) [L2684-L2734]
+  - 4.12. Watch API (`watch.py`) [L2735-L2753]
+  - 4.13. Linux man-pages API (`man.py`) [L2754-L2798]
 
 ---
 
@@ -33,7 +34,7 @@ alias routes are supported.
 #### `GET /api/versions`
 Versions of the active repository (§2.10): parsed refs from `m_git_ref` (`"indexed": true`) plus every
 commit-pointing Git tag that was not parsed (`"indexed": false`, `vid: 0`), sorted in Git version order
-(`versionsort`). Tags pointing at trees (e.g. `v2.6.11`) are skipped.
+(`versionsort`; release order for a man-pages repository, `webapp/API.md` §2.10). Tags pointing at trees (e.g. `v2.6.11`) are skipped.
 - **Query Parameters**:
   - `include_rc` (query, bool): If `true`, unparsed pre-release tags (`-rc`, `-pre`, `-alpha`, `-beta`) are
     included; parsed refs are always listed. Default `true`.
@@ -79,8 +80,10 @@ commit-pointing Git tag that was not parsed (`"indexed": false`, `vid: 0`), sort
 #### `GET /api/projects`
 List the configured repositories (core config `"repositories"`, auto-detected under `workspace.repos_dir`)
 joined with `m_repository`/`m_project`. Each entry has `repo` (the name sent as `X-KI-Repo`), `name`, `slug`,
-`path`, `default_branch`, `git_url`, `repo_id`, `indexed` (parsed into the database), `available` (work tree
-present), `tag_views` (configured regex tag layouts), and `active`; the envelope adds `active`. Clients
+`project` (the project slug, `linux` or `man-pages`, `webapp/API.md` §2.10), `path`, `default_branch`,
+`git_url`, `repo_id`, `indexed` (parsed into the database), `available` (work tree present), `tag_views`
+(configured regex tag layouts; a man-pages entry without them gets the `man-pages-X.*` view), and `active`;
+the envelope adds `active`. Clients
 refetch it only when the `projects` sync token changes or on a manual check (§2.11), not with every parsed
 version.
 - **Query Parameters**: None
@@ -2573,7 +2576,12 @@ Catalogs of any revision (git-only ones included), assembled from the Kernel API
 
 ### 4.10. Insights API (`webapp/backend/routers/insights.py`)
 Reports over the history, served under `/api/insights/{version_name}/…`. Long ones run as background jobs and
-answer `202` with progress until done (§2.15, `job_answer`).
+answer `202` with progress until done (§2.15, `job_answer`). They answer for the request's repository
+(`X-KI-Repo` / `?repo=`), whatever its project: release tags are that repository's `release_tag_names()`
+(`webapp/API.md` §2.17; `vX.Y…` for the kernel, `man-pages-X.Y…` for the man-pages, any `<prefix>X.Y[.Z][-rcN]`
+scheme), and a release's chain, previous release, -rc count and first-timer history stay within its tag
+family. The MAINTAINERS-based reports (subsystem health, merge-window sections) and CVE reports have nothing to
+read in a tree without MAINTAINERS / kernel commits.
 
 #### `GET /api/insights/{version_name}/stable/series`
 Releases that have stable tags: `{"series": [{"series": "v3.0", "stable_tags": 101, "last": "v3.0.101"}, …]}`,
@@ -2621,8 +2629,9 @@ count, share}]}, employers: [{org, commits, authors}]}`. `source` says where the
 - **`git`** (the fallback: tables missing, repository never parsed, a tag fetched or moved since the parser
   ran): commits from the release's commit pass (§2.17); merges and line counts from `git rev-list --count
   --merges` and `git diff --shortstat`; identities merged with `maintainer_service._identity_key`; a
-  first-timer is an author whose first commit on the mainline chain (one `git log` over history, cached per
-  head) is not dated before the release's earliest commit of theirs. A job (202 while building, ~20 s cold for
+  first-timer is an author whose first commit on the mainline chain of the release's tag family (one `git log`
+  over history from its newest mainline tag, cached per head) is not dated before the release's earliest
+  commit of theirs. A job (202 while building, ~20 s cold for
   v3.0) cached on disk per tag commit (`REPORT_FORMAT` 2).
 - **Both**: a commit counts once per identity and role (two aliases or a repeated trailer in one commit count
   once; the author's own Signed-off-by is left out); top lists hold the 25 largest counts, ties in identity
@@ -2635,7 +2644,8 @@ The `series` form returns, per tag, the database figures, else cached Git statis
 authors, first_time_authors, days}`), else `{release, pending: true}` and queues the Git job; at most 40 tags.
 
 #### `GET /api/insights/{version_name}/merge-window`
-The pulls of a release (H5; a final release only, else 400): per first-parent merge of `<prev>..<tag>` —
+The pulls of a release (H5; a final release `vX.Y` / `<prefix>X.Y` only, else 400; `rc1` is null for a
+release without release candidates): per first-parent merge of `<prev>..<tag>` —
 `{merge, parents, date, day (days since the previous release), after_rc1, subject, source_url, ref, sender,
 commits (git rev-list --count --no-merges p1..p2), dirs (git diff --dirstat=files,3,cumulative, top 8),
 section (the MAINTAINERS T: tree matching the source, by URL or by the tree owner's directory when that owner
@@ -2739,3 +2749,50 @@ type:
 {compare: {a, b, path}, commits: {path | section}, history: {version, path, line, name}}, error?}]}`; an
 invalid path or name answers that item's `error`, not the request. v3.0 → v3.1: `kernel/fork.c` modified,
 `copy_process` and `fork_init` modified, `list_add` same, `fs/ext4/` 21 files changed.
+
+
+### 4.13. Linux man-pages API (`webapp/backend/routers/man.py`, `webapp/backend/services/man_service.py`)
+Man pages of the Linux man-pages repository (`webapp/API.md` §2.20). The index, page and tags endpoints answer
+from the request's repository when it is the man-pages (`X-KI-Repo` header or `?repo=`; the header wins), else
+from the configured man-pages repository; 404 when none is configured. Revisions pass `safe_rev` (400),
+unknown ones answer 404.
+
+#### `GET /api/man/{v}/index`
+Every page file of revision `v`, one entry per page, sorted by section (`SECTION_ORDER`) then name.
+- **Response**: `{"version": v, "repo", "commit", "source": "db" | "git", "total", "pages": [{"name", "section",
+  "path", "summary", "so"}]}`. `so` is the repository path a `.so` alias finally resolves to (null for a
+  page); `summary` is the NAME line after `\-` (an alias's own, else its target's). `source` is `db` when
+  every page blob has a stored family 6 row.
+
+#### `GET /api/man/{v}/page`
+- **Query Parameters**: `path` (a page path in either layout, `man/man2/read.2` or `man2/read.2`) or `name`
+  (`^[A-Za-z0-9_.:+-]+$`) with optional `section` (`^[0-9][a-z]*$`; without it the first section in
+  `SECTION_ORDER` that has the page, with it that section then its siblings, `2` -> `2type`, `2const`);
+  `kernel`, `kernel_repo` (the kernel revision and repository the reader came from).
+- **Response**: `{"version", "repo", "path", "resolved_path", "name", "section", "aliases", "facts", "doc",
+  "date", "linux": {"repo", "version", "syscall", "symbols"}}`. `path`, `name`, `section` name the requested
+  page; `resolved_path` the page its `.so` chain ends at, whose document model (`doc`, format 1,
+  `parser/man_ast/MAN_API.md`; unreleased `.TH` placeholders replaced at a release tag) and facts
+  (`man_facts.extract()`) are returned; `aliases` are its NAME entries; `date` the committer date (unix) of the
+  revision's commit (a tag's: the commit it names, never the tag's creation date). `linux.version` is `kernel`
+  when it resolves in `linux.repo`, else the newest `vX.Y` kernel release whose commit is dated on or before
+  `date`; `linux.syscall` the page name for section `2` (else null); `linux.symbols` the
+  SYNOPSIS identifiers. `linux.repo` / `linux.version` are null without a kernel repository.
+- **Errors**: 400 for an invalid or missing path / name / section, 404 when the page does not exist at `v`.
+
+#### `GET /api/man/resolve`
+For the request's repository (a kernel): our copy of `name(section)` for kernel revision `kernel`.
+- **Query Parameters**: `name` (required), `section` (optional), `kernel` (default: the repository's newest
+  `vX.Y` release, else `HEAD`).
+- **Response** (found): `{"available": true, "repo": "<man-pages repository>", "version": "man-pages-X.Y",
+  "path", "name", "section", "kernel", "kernel_date", "tag_date", "url"}` — the newest `man-pages-*` release
+  tag whose commit is dated on or before the kernel revision's commit (`kernel_date`, `tag_date`: committer
+  dates of those commits; the oldest tag when all are later; older tags, then newer ones, when the page is
+  missing there); `section` is the section found. Otherwise `{"available": false, "url":
+  "https://man7.org/linux/man-pages/man{S}/{name}.{S}.html", "name", "section"}` (plus `kernel`,
+  `kernel_date` when the revision resolved); `url` is the man7.org page index without a section. 400 for an
+  invalid name, section or kernel revision.
+
+#### `GET /api/man/tags`
+- **Response**: `{"repo", "tags": [{"name", "date", "commit"}]}` — every `man-pages-*` tag of the man-pages
+  repository with its release date (unix: the committer date of the commit it names), newest first.

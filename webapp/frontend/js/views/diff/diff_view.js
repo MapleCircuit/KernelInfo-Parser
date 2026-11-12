@@ -163,7 +163,7 @@ export class DiffView {
 
   /** Default base: the release tag preceding target (or the latest tag when target is a commit). */
   async defaultBaseFor(target) {
-    return previousTag(target);
+    return previousTag(target, this.api);
   }
 
   /**
@@ -226,7 +226,7 @@ export class DiffView {
       if (this.currentMode === "api") {
         this.apiAbort?.abort();
         this.apiAbort = new AbortController();
-        const res = await api.requestJob(`/api/kapi/diff?a=${encodeURIComponent(this.versionA)}&b=${encodeURIComponent(this.versionB)}&arch=${encodeURIComponent(this.apiArch)}`, {
+        const res = await this.api.requestJob(`/api/kapi/diff?a=${encodeURIComponent(this.versionA)}&b=${encodeURIComponent(this.versionB)}&arch=${encodeURIComponent(this.apiArch)}`, {
           signal: this.apiAbort.signal, timeoutMs: 60000,
           onProgress: (p) => {
             if (seq === this.loadSeq) resContainer.innerHTML = `<div class="compare-empty">Building the Kernel API catalogs… ${escapeHtml(progressLabel(p))}</div>`;
@@ -236,12 +236,12 @@ export class DiffView {
         this.apiResult = res;
         this.renderApiDiff(resContainer);
       } else if (this.currentMode === "kconfig") {
-        const res = await api.getKconfigDiff(this.versionA, this.versionB);
+        const res = await this.api.getKconfigDiff(this.versionA, this.versionB);
         if (seq !== this.loadSeq) return;
         this.kconfigResult = res;
         this.renderKconfigDiff(resContainer);
       } else {
-        const res = await api.getVersionsDiff(this.versionA, this.versionB);
+        const res = await this.api.getVersionsDiff(this.versionA, this.versionB);
         if (seq !== this.loadSeq) return;
         this.fileChanges = res.changes || [];
         this.fileSummary = res.summary || {};
@@ -272,7 +272,7 @@ export class DiffView {
       <span class="compare-subtitle">Renames are not inferred: a renamed symbol shows as removed + added.</span></div>`
       + apiDiffHtml(res, rows, { kinds: this.apiKinds, statuses: this.apiStatuses, query: this.apiQuery });
     const archSel = container.querySelector(".api-diff-arch");
-    api.getKconfigPresets(this.versionB).then((p) => {
+    this.api.getKconfigPresets(this.versionB).then((p) => {
       archSel.innerHTML = (p?.targets || []).map((t) => `<option value="${escapeHtml(t.id)}" ${t.id === this.apiArch ? "selected" : ""}>${escapeHtml(t.label || t.id)}</option>`).join("") || archSel.innerHTML;
     }).catch(() => {});
     archSel.onchange = () => {
@@ -528,7 +528,7 @@ export class DiffView {
     this.renderRenameSearch();
     const started = performance.now();
     try {
-      const res = await api.searchRenames(this.versionA, this.versionB, scope, similarity);
+      const res = await this.api.searchRenames(this.versionA, this.versionB, scope, similarity);
       if (seq !== this.loadSeq) return;
       const c = res.candidates || {};
       if (res.reason === "too_many") {
@@ -611,7 +611,7 @@ export class DiffView {
     if (this.unchangedFiles || this.unchangedLoading) return this.unchangedLoading || Promise.resolve();
     const seq = this.loadSeq;
     this.unchangedError = "";
-    this.unchangedLoading = api.getUnchangedFiles(this.versionA, this.versionB).then((res) => {
+    this.unchangedLoading = this.api.getUnchangedFiles(this.versionA, this.versionB).then((res) => {
       if (seq !== this.loadSeq) return;
       this.unchangedFiles = (res.files || []).map((p) => ({ type: "unchanged", file: p, file_path: p, name: p }));
     }).catch((e) => {
@@ -794,7 +794,7 @@ export class DiffView {
     rowEl.appendChild(box);
 
     try {
-      const res = await api.getFileDiff(this.versionA, this.versionB, path, oldPath || "", similarity ?? 50);
+      const res = await this.api.getFileDiff(this.versionA, this.versionB, path, oldPath || "", similarity ?? 50);
       if (!rowEl.contains(box)) return;
       if (res.is_binary) {
         box.innerHTML = `<div class="diff-content">Binary file changed.</div>`;

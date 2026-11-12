@@ -20,7 +20,7 @@ registerInsightsSection({
   id: "release-stats", label: "Release stats", order: 10, releaseScoped: true, keywords: "statistics contributors employers authors",
   hint: "Commits, contributors, first-timers, reviewers and employers of a release",
   async fetchList(ctx) {
-    const r = await api.getInsights(ctx.release, "release-stats", { ...ctx, cacheKey: `rstats2_${ctx.release}` });
+    const r = await (ctx.api || api).getInsights(ctx.release, "release-stats", { ...ctx, cacheKey: `rstats2_${ctx.release}` });
     const rows = [];
     for (const [role, list] of Object.entries(r.top || {})) {
       list.forEach((p, i) => rows.push({ role, rank: i + 1, ...p, key: `${role}:${p.email || p.person}` }));
@@ -32,7 +32,7 @@ registerInsightsSection({
       const all = (await ctx.view?.defaultReleases?.()) || [];
       const idx = all.indexOf(ctx.release);
       const window = all.slice(idx, idx + 12).reverse();
-      const series = await api.request(`/api/insights/release-stats/series?${window.map((t) => `tag=${encodeURIComponent(t)}`).join("&")}`);
+      const series = await (ctx.api || api).request(`/api/insights/release-stats/series?${window.map((t) => `tag=${encodeURIComponent(t)}`).join("&")}`);
       const pts = (series.series || []).filter((x) => !x.pending);
       if (pts.length > 1) trend = `<div class="sv-trend">Commits, last ${pts.length} releases ${sparklineSvg(pts.map((x) => x.commits), { title: pts.map((x) => `${x.release}: ${x.commits}`).join(", ") })}</div>`;
     } catch {
@@ -80,7 +80,7 @@ registerInsightsSection({
   id: "merge-window", label: "Merge window", order: 20, releaseScoped: true, keywords: "pulls merge window rc1 maintainers",
   hint: "The pulls merged for a release, day by day",
   async fetchList(ctx) {
-    const r = await api.getInsights(ctx.release, "merge-window", { ...ctx, cacheKey: `mwin_${ctx.release}` });
+    const r = await (ctx.api || api).getInsights(ctx.release, "merge-window", { ...ctx, cacheKey: `mwin_${ctx.release}` });
     const pts = (r.totals?.by_day || []).map((d) => ({ x: d.day, value: d.commits, label: `day ${d.day}` }));
     const summaryHtml = kpiHtml([[n(r.totals?.pulls), "pulls"], [n(r.totals?.commits), "commits pulled"], [n(r.totals?.before_rc1), "before rc1"], [r.rc1_day == null ? "—" : `day ${r.rc1_day}`, r.rc1 || "rc1"]])
       + barChartSvg(pts, { markers: r.rc1_day != null ? [{ x: r.rc1_day, label: r.rc1 }] : [], unit: " commits", x0: 0 });
@@ -139,7 +139,7 @@ registerInsightsSection({
   hint: "Review coverage, bus factor and maintainer activity of every MAINTAINERS section",
   windowOptions: [1, 2, 3, 4, 6, 8, 12], windowDefault: 4, windowLabel: (w) => `${w} release${w > 1 ? "s" : ""}`,
   async fetchList(ctx) {
-    const r = await api.getInsights(ctx.release, `subsystems?window=${ctx.window || 4}`, { ...ctx, cacheKey: `health_${ctx.release}_${ctx.window || 4}` });
+    const r = await (ctx.api || api).getInsights(ctx.release, `subsystems?window=${ctx.window || 4}`, { ...ctx, cacheKey: `health_${ctx.release}_${ctx.window || 4}` });
     this._window = r.window;
     const flagged = {};
     for (const s of r.sections) for (const f of s.flags) flagged[f] = (flagged[f] || 0) + 1;

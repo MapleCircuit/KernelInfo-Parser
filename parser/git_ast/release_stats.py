@@ -35,7 +35,7 @@ from typing import Any, Callable, Iterable
 from parser.git_ast.git_commit_parser import iter_trailers
 from parser.git_ast.git_types import CommitRole
 from parser.git_ast.identity import identity_key, person_key
-from parser.git_ast.release_order import parse_tag, release_key, release_ranges
+from parser.git_ast.release_order import parse_tag, release_key, release_ranges, release_tag_names
 
 logger = logging.getLogger(__name__)
 
@@ -151,8 +151,8 @@ def _git(repo: Path, args: list[str], timeout: float = 900.0) -> str:
 
 
 def release_tags(repo: Path) -> dict[str, str]:
-    """Release tags (release_order.parse_tag) -> the commit they name (annotated tags peeled; tags of
-    trees such as v2.6.11 are not releases)."""
+    """Release tags (release_order.release_tag_names: the kernel scheme's, else every `<prefix>X.Y` tag) -> the
+    commit they name (annotated tags peeled; tags of trees such as v2.6.11 are not releases)."""
     out = _git(repo, ["for-each-ref", "--format=%(refname:short)%09%(objectname)%09%(objecttype)%09%(*objectname)%09%(*objecttype)",
                       "refs/tags"], timeout=60)
     tags: dict[str, str] = {}
@@ -164,7 +164,7 @@ def release_tags(repo: Path) -> dict[str, str]:
         sha, kind = (peeled, ptype) if peeled else (obj, otype)
         if kind == "commit" and parse_tag(name) is not None and _FULL_SHA.match(sha):
             tags[name] = sha
-    return tags
+    return {name: tags[name] for name in release_tag_names(tags)}
 
 
 def compute(repo: Path, rng: dict[str, Any]) -> dict[str, Any]:

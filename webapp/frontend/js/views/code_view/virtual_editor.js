@@ -16,6 +16,12 @@ import { showFileHistoryModal } from "../../components/file_history_modal.js";
 import { DocPage } from "../docs/doc_page.js";
 import { showPatchModal } from "../../components/patch_modal.js";
 import { isDocumentationPath } from "../docs/rst_renderer.js";
+import { isManPagePath } from "../man/man_model.js";
+import { mountManDocument } from "../man/man_view.js";
+import { isManPagesRepo } from "../../utils/projects.js";
+
+/** A page file of the man-pages project renders as a man page (§5.38). */
+const isManDocument = (path, repo) => isManPagesRepo(repo) && isManPagePath(path);
 import { DirectiveEvaluator, PREPROCESSED_RE, archMacros } from "../kconfig/directive_evaluator.js";
 import { configLookup, evalBuild, explainBuild } from "../kconfig/build_condition.js";
 import { escapeHtml } from "../../components/modal.js";
@@ -433,11 +439,11 @@ export class VirtualEditor {
 
   /** SHA a permalink pins: the tab's revision when it is one, else the SHA of its catalog stamp. */
   async pinnedRevision() {
-    let sha = pinnedSha(this.currentVersion, api.versionStamps[this.currentVersion]);
+    let sha = pinnedSha(this.currentVersion, this.api.versionStamps[this.currentVersion]);
     if (!sha) {
       try {
-        await api.getBranches();
-        sha = pinnedSha(this.currentVersion, api.versionStamps[this.currentVersion]);
+        await this.api.getBranches();
+        sha = pinnedSha(this.currentVersion, this.api.versionStamps[this.currentVersion]);
       } catch {
         sha = "";
       }
@@ -458,7 +464,7 @@ export class VirtualEditor {
       else toast.error(`Could not copy the ${what}`);
     };
     const hashFor = (rev) => codeHash({
-      rev, path: this.currentFilePath, start, end,
+      repo: this.api.repo, rev, path: this.currentFilePath, start, end,
       diffWith: this.fileDiff ? this.tabData?.diffWith : null, diffLayout: this.tabData?.diffLayout || "",
     });
     const items = [
@@ -498,7 +504,7 @@ export class VirtualEditor {
             return;
           }
           // The web viewers need the full SHA; resolve the short one through the commit catalog when possible
-          const full = sha.length === 40 ? sha : (await resolveFullSha(this.currentVersion, sha));
+          const full = sha.length === 40 ? sha : (await resolveFullSha(this.currentVersion, sha, this.api));
           await copy(externalLink(gitUrl, this.currentFilePath, full, start, end), "external link");
         },
       });
@@ -518,7 +524,7 @@ export class VirtualEditor {
     if (persist && this.tabId) state.updateTabState(this.tabId, { blame: this.showBlame || null }, { replace: true });
     if (this.showBlame) {
       const opts = this.tabData?.blameOpts || "";
-      await this.blameView.loadBlame(this.currentVersion, this.currentFilePath, opts);
+      await this.blameView.loadBlame(this.currentVersion, this.currentFilePath, opts, this.api);
       if (this.blameView.blameData?.slow) {
         toast.info(`Blame took ${Math.round((this.blameView.blameData.elapsed_ms || 0) / 1000)} s (following copies compares every file of each commit)`);
       }
@@ -637,9 +643,9 @@ export class VirtualEditor {
   async loadBookmarkMarks() {
     const path = this.currentFilePath;
     if (!path || !this.rawLines.length) return;
-    const [marks, notes] = await Promise.all([localDB.userList("bookmark", api.repo || ""), localDB.userList("note", api.repo || "")]);
+    const [marks, notes] = await Promise.all([localDB.userList("bookmark", this.api.repo || ""), localDB.userList("note", this.api.repo || "")]);
     const noteOf = new Map(notes.map((n) => [n.data.bookmark_key, n.data.markdown]));
-    const sha = pinnedSha(this.currentVersion, api.versionStamps[this.currentVersion]);
+    const sha = pinnedSha(this.currentVersion, this.api.versionStamps[this.currentVersion]);
     const out = new Map();
     for (const m of marks) {
       const t = m.data.target;
@@ -657,7 +663,7 @@ export class VirtualEditor {
 
   /** The bookmark target of a line of this tab (pinned to the commit shown). */
   lineTarget(line = this.targetCursorLine) {
-    const sha = pinnedSha(this.currentVersion, api.versionStamps[this.currentVersion]);
+    const sha = pinnedSha(this.currentVersion, this.api.versionStamps[this.currentVersion]);
     return { type: "line", path: this.currentFilePath, rev: this.currentVersion, ...(sha ? { sha } : {}), line, snippet: (this.rawLines[line - 1] || "").trim().slice(0, 300) };
   }
 
@@ -736,7 +742,7 @@ export class VirtualEditor {
       const token = ++this.buildToken;
       let cond = null;
       try {
-        cond = (await api.getBuildConditions(this.currentVersion, [path], ctx.arch))?.files?.[path] || null;
+        cond = (await this.api.getBuildConditions(this.currentVersion, [path], ctx.arch))?.files?.[path] || null;
       } catch (err) {
         console.warn("Build condition unavailable:", err);
       }
@@ -839,7 +845,8 @@ export class VirtualEditor {
       for (let n = a; n <= b; n++) this.diffMarkedLines.add(n);
     }
     // Documentation renders kernel.org-style by default unless a specific source line was requested
-    this.isDoc = isDocumentationPath(this.currentFilePath);
+    this.isMan = isManDocument(this.currentFilePath, this.api.repo);
+    this.isDoc = this.isMan || isDocumentationPath(this.currentFilePath);
     if (this.isDoc && !tabData.docMode) {
       tabData.docMode = this.targetCursorLine > 1 ? "source" : "rendered";
     }
@@ -980,6 +987,7 @@ export class VirtualEditor {
         path: this.currentFilePath,
         current: this.fileDiff?.target || this.tabData.diffWith || null,
         onPick: (target) => this.enterFileDiff(target),
+        client: this.api,
       });
     };
 
@@ -1010,9 +1018,9 @@ export class VirtualEditor {
     };
     // The repository's web viewer (G06 "Copy External Link"), from the project catalog
     this.repoGitUrl = "";
-    api.getProjects().then((res) => {
+    this.api.getProjects().then((res) => {
       const projects = res?.projects || [];
-      const p = projects.find((x) => x.repo === state.currentRepo) || projects.find((x) => x.active) || projects[0];
+      const p = projects.find((x) => x.repo === this.api.repo) || projects.find((x) => x.active) || projects[0];
       this.repoGitUrl = p?.git_url || "";
     }).catch(() => {});
     const blameOptsBtn = containerEl.querySelector("#btn-blame-opts");
@@ -1292,7 +1300,7 @@ export class VirtualEditor {
     }
     this.linesContainer.innerHTML = `<div style="padding:20px;color:var(--text-muted);">Loading ${escapeHtml(this.currentFilePath)}...</div>`;
     try {
-      const res = await api.getFileContent(this.currentVersion, this.currentFilePath);
+      const res = await this.api.getFileContent(this.currentVersion, this.currentFilePath);
       if (!res) {
         throw new Error("No response received from server for file content");
       }
@@ -1374,7 +1382,7 @@ export class VirtualEditor {
       }
 
       // Fetch CVE security badge for this file
-      api.getFileCves(this.currentVersion, this.currentFilePath).then((cveRes) => {
+      this.api.getFileCves(this.currentVersion, this.currentFilePath).then((cveRes) => {
         const badge = this.viewportEl?.closest(".code-viewer-container")?.querySelector("#file-security-badge");
         if (!badge) return;
         const total = cveRes?.total ?? (Array.isArray(cveRes?.cves) ? cveRes.cves.length : 0);
@@ -1397,7 +1405,7 @@ export class VirtualEditor {
       }).catch((err) => console.warn("CVE lookup failed:", err));
 
       // Fetch Subsystem indicator for this file
-      api.matchMaintainers(this.currentVersion, "", [this.currentFilePath]).then((matchRes) => {
+      this.api.matchMaintainers(this.currentVersion, "", [this.currentFilePath]).then((matchRes) => {
         const subChip = this.viewportEl?.closest(".code-viewer-container")?.querySelector("#file-subsystem");
         if (!subChip) return;
         const subs = matchRes?.subsystems || [];
@@ -1502,9 +1510,27 @@ export class VirtualEditor {
     editorBody.hidden = true;
     docViewport.hidden = false;
     const history = this.tabData.docHistory || [];
+    if (this.isMan) {
+      // Rendered from the page's document model (`/api/man/{v}/page?path=`), not from the roff text
+      mountManDocument(docViewport, {
+        repo: this.api.repo,
+        version: this.currentVersion,
+        path: this.currentFilePath,
+        tab: this.tabData,
+        canGoBack: history.length > 0,
+        onShowSource: () => this.setDocMode("source"),
+        onNavigate: (path) => this.navigateDoc(path, true),
+        onBack: () => {
+          const prev = (this.tabData.docHistory || []).pop();
+          if (prev) this.navigateDoc(prev, false);
+        },
+      });
+      return;
+    }
     const page = new DocPage({
       path: this.currentFilePath,
       version: this.currentVersion,
+      api: this.api,
       anchor: this.tabData.docAnchor,
       canGoBack: history.length > 0,
       onShowSource: () => this.setDocMode("source"),
@@ -1527,7 +1553,7 @@ export class VirtualEditor {
     this.tabData.title = docPath.split("/").pop();
     this.tabData.cursorLine = 1;
     this.tabData.docAnchor = anchor || "";
-    this.tabData.docMode = isDocumentationPath(docPath) ? "rendered" : "source";
+    this.tabData.docMode = isDocumentationPath(docPath) || isManDocument(docPath) ? "rendered" : "source";
     state.saveState();
     state.emit("tabs:changed", { paneId: state.activePaneId, activeTabId: this.tabData.id });
   }
@@ -1609,7 +1635,7 @@ export class VirtualEditor {
       : [pick.version, pick.path, this.currentVersion, this.currentFilePath];
     let res;
     try {
-      res = isPatch ? await patchedFileDiff(pick) : await api.getBlobDiff(va, pa, vb, pb);
+      res = isPatch ? await patchedFileDiff(pick, this.api) : await this.api.getBlobDiff(va, pa, vb, pb);
     } catch (err) {
       if (token !== this.fileDiffToken || !this.isLive()) return;
       toast.error(`Diff with ${label} failed: ${err.message}`);
@@ -2024,9 +2050,9 @@ export class VirtualEditor {
 }
 
 /** Full 40-hex SHA of a revision for external viewers (the catalog only keeps 12 hex characters). */
-async function resolveFullSha(version, sha12) {
+async function resolveFullSha(version, sha12, client = api) {
   try {
-    const res = await api.searchCommits(version, sha12, 1);
+    const res = await client.searchCommits(version, sha12, 1);
     const hit = (res?.commits || []).find((c) => String(c.commit_hash || "").startsWith(sha12));
     if (hit?.commit_hash?.length === 40) return hit.commit_hash;
   } catch {

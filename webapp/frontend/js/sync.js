@@ -3,9 +3,11 @@
  * webapp/backend/services/sync_service.py).
  *
  * - db: a rebuilt database clears every cached API response.
- * - parsed / git: version and branch lists are refetched; each version carries a stamp (commit + parse
- *   completion) that is part of its cache keys (api._vk), and entries of versions whose stamp changed
- *   are deleted.
+ * - parsed / git: tokens of one repository (each response's X-KIP-Sync header is compared with the tokens
+ *   of the repository that request named, so tabs of several projects never mistake each other's tokens
+ *   for a change): that repository's version and branch lists are refetched; each version carries a stamp
+ *   (commit + parse completion) that is part of its cache keys (api._vk, stamps kept per repository), and
+ *   that repository's entries of versions whose stamp changed are deleted.
  * - projects: the repository list is refetched (and the selectors re-rendered) only when it changed.
  * - frontend: compared on every sync (page open, opening a new tab, restoring a session, and periodic
  *   60s sync). When a newer build than the running page (window.KIP_BUILD, see boot.js) is detected,
@@ -29,9 +31,14 @@ const LAST_PRUNE_KEY = "kip-last-cache-prune";
 // (3: symbol detail, file, callgraph, Pahole, blame, version diff and maintainers responses changed)
 const CACHE_LAYOUT = 3;
 
+/** IndexedDB `meta` key of a repository's version stamps. */
+const stampsKey = (repo) => `version_stamps::${repo || ""}`;
+
 class SyncManager {
   constructor() {
+    // Server-wide tokens {db, frontend, projects}; `repos` holds {parsed, git} per repository
     this.tokens = {};
+    this._stampsLoaded = new Set();
     this.queue = Promise.resolve();
     this.reloadTimer = null;
     this.postponedBuild = null;
@@ -57,11 +64,11 @@ class SyncManager {
         await caches.delete("kip-api");
       }
       await localDB.set("meta", "cache_layout", CACHE_LAYOUT);
-      await localDB.set("meta", "version_stamps", {});
     }
     this.pruneOldEntries();
-    api.versionStamps = (await localDB.get("meta", "version_stamps")) || {};
+    for (const repo of state.openRepos()) await this.loadStamps(repo);
     this.tokens = (await localDB.get("meta", "sync_tokens")) || {};
+    if (!this.tokens.repos || typeof this.tokens.repos !== "object") this.tokens.repos = {};
     api.onSyncHeader = (value) => this.onHeader(value);
     api.onSyncData = (data) => this.onSyncData(data);
     this.pruneOtherBuilds();
@@ -96,11 +103,27 @@ class SyncManager {
     return this._inFlightSync;
   }
 
-  onHeader(value) {
+  /** Stamps of a repository as last saved (once per page); a repository's client keeps them in memory. */
+  async loadStamps(repo) {
+    const r = repo || "";
+    if (this._stampsLoaded.has(r)) return;
+    this._stampsLoaded.add(r);
+    const saved = await localDB.get("meta", stampsKey(r)).catch(() => null);
+    const client = api.forRepo(r);
+    if (saved && typeof saved === "object" && !Object.keys(client.versionStamps).length) client.versionStamps = saved;
+  }
+
+  /** Tokens {parsed, git} last seen for a repository. */
+  repoTokens(repo) {
+    return (this.tokens.repos || {})[repo || ""] || {};
+  }
+
+  /** X-KIP-Sync of a response to a request naming `repo` ("db.parsed.git"). */
+  onHeader(value, repo = api.repo) {
     const [db, parsed, git] = String(value).split(".");
-    const t = this.tokens;
-    if ((db && db !== t.db) || (parsed && parsed !== t.parsed) || (git && git !== t.git)) {
-      this.enqueue({ db, parsed, git }, { notify: true });
+    const t = this.repoTokens(repo);
+    if ((db && db !== this.tokens.db) || (parsed && parsed !== t.parsed) || (git && git !== t.git)) {
+      this.enqueue({ db, parsed, git, repo: repo || "" }, { notify: true });
     }
   }
 
@@ -120,9 +143,14 @@ class SyncManager {
    */
   async apply(sync, { notify, force = false, announce = true }) {
     if (!sync) return null;
+    // The repository these tokens belong to (`repo` of /api/sync, else the request's)
+    const repo = typeof sync.repo === "string" ? sync.repo : (api.repo || "");
+    await this.loadStamps(repo);
     const prev = this.tokens;
-    const next = { ...prev };
-    let refresh = force || !Object.keys(api.versionStamps).length;
+    const prevRepo = this.repoTokens(repo);
+    const next = { ...prev, repos: { ...(prev.repos || {}) } };
+    const nextRepo = { ...prevRepo };
+    let refresh = force || !Object.keys(api.forRepo(repo).versionStamps).length;
     // The repository list has its own token: refetched when it changed, not with every parsed version
     let refreshProjects = force;
 
@@ -139,29 +167,31 @@ class SyncManager {
         if ("caches" in window) {
           await caches.delete("kip-api");
         }
-        api.versionStamps = {};
+        // Every repository's stamps belonged to the old database
+        api._stampsByRepo = {};
       }
       await localDB.set("meta", "db_instance_hash", sync.db);
       next.db = sync.db;
       refresh = true;
     }
     for (const key of ["parsed", "git"]) {
-      if (sync[key] && sync[key] !== prev[key]) {
-        next[key] = sync[key];
-        refresh = refresh || Boolean(prev[key]);
+      if (sync[key] && sync[key] !== prevRepo[key]) {
+        nextRepo[key] = sync[key];
+        refresh = refresh || Boolean(prevRepo[key]);
       }
     }
+    next.repos[repo] = nextRepo;
     if (sync.projects && sync.projects !== prev.projects) {
       next.projects = sync.projects;
       refreshProjects = refreshProjects || Boolean(prev.projects);
     }
-    if (sync.repo) {
-      next.repo = sync.repo;
-    }
+    delete next.parsed;
+    delete next.git;
+    delete next.repo;
     this.tokens = next;
     await localDB.set("meta", "sync_tokens", next);
     if (refreshProjects) await this.refreshProjects({ notify });
-    return refresh ? this.refreshVersions({ notify }) : null;
+    return refresh ? this.refreshVersions({ notify, repo }) : null;
   }
 
   /**
@@ -174,11 +204,22 @@ class SyncManager {
    * any of them did. Rejects when the server is unreachable or the update could not be applied.
    */
   async checkNow() {
-    const prev = { ...this.tokens };
+    const prev = { ...this.tokens, ...this.repoTokens(api.repo) };
     const sync = await api.getSync();
     const run = this.queue.then(() => this.apply(sync, { notify: false, announce: false }));
     this.queue = run.catch((err) => console.warn("[Sync] Update failed:", err));
     const versions = (await run) || { changed: [], removed: [], added: [] };
+    // The other projects this session has tabs of are checked too
+    for (const repo of state.openRepos()) {
+      if (repo === (sync.repo || api.repo)) continue;
+      try {
+        const other = await api.forRepo(repo).getSync();
+        const res = await this.queue.then(() => this.apply({ ...other, repo }, { notify: false, announce: false }));
+        if (res) for (const k of ["changed", "removed", "added"]) versions[k].push(...res[k]);
+      } catch (err) {
+        console.warn(`[Sync] Could not check ${repo}:`, err);
+      }
+    }
     const newBuild = sync.frontend && this.build && !this.build.startsWith("__") && sync.frontend !== this.build ? sync.frontend : null;
     const changedToken = (k) => Boolean(sync[k] && prev[k] && sync[k] !== prev[k]);
     const found = {
@@ -229,31 +270,35 @@ class SyncManager {
     }
   }
 
-  /** Refetch version and branch stamps; drop cached data of versions whose stamp changed. */
-  async refreshVersions({ notify }) {
+  /** Refetch a repository's version and branch stamps; drop its cached data of versions whose stamp changed. */
+  async refreshVersions({ notify, repo = api.repo }) {
+    const client = api.forRepo(repo);
     const [vRes, bRes] = await Promise.all([
-      api.getVersions(true, { networkFirst: true }),
-      api.getBranches({ networkFirst: true }),
+      client.getVersions(true, { networkFirst: true }),
+      client.getBranches({ networkFirst: true }),
     ]);
     const nextStamps = {};
     for (const v of vRes?.versions || []) if (v.vname && v.stamp) nextStamps[v.vname] = v.stamp;
     for (const b of bRes?.branches || []) if (b.name && b.stamp) nextStamps[b.name] = b.stamp;
 
-    const prevStamps = api.versionStamps || {};
+    const prevStamps = client.versionStamps || {};
     const changed = Object.keys(nextStamps).filter((v) => prevStamps[v] !== undefined && prevStamps[v] !== nextStamps[v]);
     const removed = Object.keys(prevStamps).filter((v) => !(v in nextStamps));
     const added = Object.keys(nextStamps).filter((v) => prevStamps[v] === undefined);
-    api.versionStamps = nextStamps;
-    await localDB.set("meta", "version_stamps", nextStamps);
+    client.versionStamps = nextStamps;
+    await localDB.set("meta", stampsKey(repo), nextStamps);
 
     const stale = [...changed, ...removed];
     if (stale.length) {
-      const dropped = await localDB.deleteDataWhere((key) => stale.some((v) => isStaleKey(key, v, nextStamps[v])));
+      // Only this repository's entries (cache keys are prefixed "<repo>::")
+      const prefix = repo ? `${repo}::` : "";
+      const dropped = await localDB.deleteDataWhere((key) => (!prefix || String(key).startsWith(prefix))
+        && stale.some((v) => isStaleKey(key, v, nextStamps[v])));
       console.info(`[Sync] ${stale.length} version(s) changed (${stale.slice(0, 5).join(", ")}); ${dropped} cached entries dropped.`);
     }
     if (notify && (changed.length || removed.length || added.length)) {
       const newlyIndexed = changed.filter((v) => prevStamps[v].endsWith(".git") && !nextStamps[v].endsWith(".git"));
-      state.emit("versions:updated", { changed, removed, added, newlyIndexed });
+      state.emit("versions:updated", { repo: repo || "", changed, removed, added, newlyIndexed });
     }
     return { changed, removed, added };
   }
