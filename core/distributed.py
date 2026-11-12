@@ -559,6 +559,21 @@ def publish_delegable_chains(
     return enqueued
 
 
+# Eligible tasks read per claim scan: one ready head per chain whose base is parsed, far fewer in practice
+_CLAIM_SCAN_LIMIT = 2000
+
+
+def _claim_priority(chain_name: str, chain_kind: str) -> int:
+    """Chain preference of `claim_next_task()`: history branches, stable series, linux-next, other branches."""
+    if chain_name.startswith("history") or chain_kind == "history":
+        return 1
+    if chain_kind == "stable":
+        return 2
+    if "next" in chain_name or chain_kind == "next":
+        return 3
+    return 4
+
+
 def claim_next_task(
     db: Any,
     network_id: int,
@@ -591,7 +606,7 @@ def claim_next_task(
             for r in rows
         ]
 
-    # 2. If no candidate in preferred chain, scan across all eligible tasks
+    # 2. If no candidate in preferred chain, scan across all eligible tasks, oldest release first
     if not candidates:
         rows = db.query(
             "SELECT task_id, chain_name, chain_kind, ref_name, commit_id, base_ref_name, base_commit_id "
@@ -601,7 +616,7 @@ def claim_next_task(
             "  WHEN chain_kind = 'stable' THEN 2 "
             "  WHEN chain_name LIKE '%next%' OR chain_kind = 'next' THEN 3 "
             "  ELSE 4 END ASC, "
-            "LENGTH(chain_name) ASC, chain_name ASC, seq_order ASC LIMIT 10",
+            f"chain_name ASC, seq_order ASC LIMIT {_CLAIM_SCAN_LIMIT}",
             (network_id, TASK_ELIGIBLE),
             dictionary=False,
         )
@@ -609,6 +624,9 @@ def claim_next_task(
             (int(r[0]), str(r[1]), str(r[2]), str(r[3]), int(r[4]), str(r[5]), int(r[6]))
             for r in rows
         ]
+        # SQL orders chain names as text (stable:v3.0 < stable:v3.10 < stable:v2.6.11 by length or bytes)
+        candidates.sort(key=lambda c: (_claim_priority(c[1], c[2]), release_order.release_key(c[3])))
+        candidates = candidates[:10]
 
     for cand in candidates:
         t_id, c_name, c_kind, r_name, cid, b_name, b_cid = cand
@@ -877,6 +895,29 @@ def mark_task_failed(
         _cascade_task_failure(db, task_id)
 
     return True
+
+
+def release_task(db: Any, task_id: int, reason: str, worker_id: str) -> bool:
+    """Hand a task leased by `worker_id` back to the queue as ELIGIBLE without counting an attempt.
+
+    For failures of the node rather than of the task (a broken parser environment): another node parses it.
+    Returns True if the task was released, False if `worker_id` no longer held its lease.
+    """
+    if not _has_db(db):
+        return False
+    rc = db.execute(
+        "UPDATE m_parse_task SET status = %s, worker_id = '', lease_expires_at = 0, error_msg = %s "
+        f"WHERE task_id = %s AND status IN ({TASK_LEASED}, {TASK_RECLAIMING}) AND worker_id = %s",
+        (TASK_ELIGIBLE, reason[:1000], task_id, worker_id),
+    )
+    try:
+        released = rc > 0
+    except TypeError:
+        released = bool(rc)
+    db.commit()
+    if released:
+        logger.warning(f"[Distributed] Task {task_id} released back to the queue by '{worker_id}': {reason}")
+    return released
 
 
 def reclaim_expired_leases(db: Any, network_id: int, lease_ttl: int = DEFAULT_LEASE_TTL) -> int:

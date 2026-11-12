@@ -2160,6 +2160,9 @@ def _run_worker_stage(
     received: set[int] = set()
     total = len(batches)
     completed = False
+    # Per-file errors the workers returned in this stage, to stop on an error that hits most files
+    stage_file_errors: list[tuple[str, str, str]] = []
+    files_returned = 0
     parent_split = {"wait_s": 0.0, "decode_s": 0.0, "ingest_s": 0.0}
     split_base = _parent_split_counters()
     try:
@@ -2203,6 +2206,10 @@ def _run_worker_stage(
                 del body
                 parent_split["decode_s"] += time.perf_counter() - t_decode
             error_list.extend(batch_errors)
+            files_returned += len(batch_files.get(b_id, ()))
+            if batch_errors:
+                stage_file_errors.extend(batch_errors)
+                _raise_if_systemic(label, stage_file_errors, files_returned)
             t_ingest = time.perf_counter()
             try:
                 ingest(batch_dict)
@@ -2323,6 +2330,73 @@ def _run_worker_stage(
     result.deadline_hit = result.deadline_hit or retry.deadline_hit
     result.lost_files += retry.lost_files
     return result
+
+
+# One error message on at least this many files, and on at least this share of the files parsed so far,
+# stops the version: the parser or its environment (libclang, Python packages) is broken, not the sources
+SYSTEMIC_ERROR_MIN_FILES = 5
+SYSTEMIC_ERROR_FRACTION = 0.5
+_TB_FRAME_RE = re.compile(r'^\s*File "([^"]+)", line (\d+), in (\S+)', re.MULTILINE)
+
+
+class SystemicParseError(RuntimeError):
+    """Many files of a version failed with the same error, so the version is not recorded."""
+
+
+def _error_origin(tb: str) -> str:
+    """Where a worker traceback was raised: its innermost frame, and the innermost frame in this repository.
+
+    'clang/cindex.py:1629 in inner, called from parser/c_ast/cursor_tree.py:2607 in exec_punctuation'
+    """
+    frames = _TB_FRAME_RE.findall(tb or "")
+    if not frames:
+        return ""
+    root = os.path.dirname(os.path.abspath(__file__)) + os.sep
+
+    def _fmt(frame: tuple[str, str, str]) -> str:
+        path, line, func = frame
+        return f"{path.removeprefix(root)}:{line} in {func}"
+
+    own = next((fr for fr in reversed(frames) if fr[0].startswith(root)), None)
+    if own is None or own == frames[-1]:
+        return _fmt(frames[-1])
+    return f"{_fmt(frames[-1])}, called from {_fmt(own)}"
+
+
+def _raise_if_systemic(label: str, errors: list[tuple[str, str, str]], files_seen: int) -> None:
+    """Raise SystemicParseError when one error message accounts for most of the files parsed so far."""
+    counts = Counter(err for _f, err, _tb in errors)
+    if not counts:
+        return
+    message, count = counts.most_common(1)[0]
+    if count < SYSTEMIC_ERROR_MIN_FILES or count < SYSTEMIC_ERROR_FRACTION * files_seen:
+        return
+    tb = next((tb for _f, err, tb in errors if err == message and tb), "")
+    origin = _error_origin(tb)
+    examples = [f.split("\t")[-1] for f, err, _tb in errors if err == message][:3]
+    text = (
+        f"{label}: {count} of {files_seen} files failed with the same error {message!r}"
+        f"{f' raised at {origin}' if origin else ''} (e.g. {', '.join(examples)}). The same error on this many "
+        "files comes from the parser or its environment (libclang, Python packages), not from the sources; "
+        "the version is stopped before it is recorded."
+    )
+    logger.critical(COLOR.red(text))
+    if tb:
+        logger.error(f"First traceback of that error:\n{tb}")
+    raise SystemicParseError(text)
+
+
+def _preflight_libclang() -> None:
+    """Exit before parsing when libclang or its Python bindings cannot run the C parser."""
+    from parser.c_ast.ctypes_bindings import libclang_self_test
+    try:
+        logger.info(f"[Preflight] libclang: {libclang_self_test()}")
+    except RuntimeError as e:
+        logger.critical(COLOR.red(
+            f"[Preflight] {e}. The C parser cannot run with these bindings; install Python bindings matching "
+            "the libclang library (requirements.txt pins clang==21.1.7) before parsing."
+        ))
+        sys.exit(1)
 
 
 def _report_worker_errors(error_list: list[tuple[str, str, str]], failed_workers: int) -> None:
@@ -2555,6 +2629,15 @@ def trigger_multicore(batch_size: int | None = None, scheduler: DependencySchedu
     if scheduler is None:
         gp.close_shared_symbols()
     _report_worker_errors(error_list, failed_workers)
+    # Across both stages, which each check on their own while they run; file entries are change items
+    # ("M\tpath"), unlike worker and batch entries
+    files_parsed = len(header_files) + len(source_files) + (len(extra_files) if header_files else 0)
+    file_errors = [e for e in error_list if "\t" in e[0]]
+    try:
+        _raise_if_systemic(f"Version '{gp.Version_Name}'", file_errors, files_parsed)
+    except SystemicParseError:
+        gp.close_shared_symbols()
+        raise
 
 
 def _resolve_mem_max(value: Any) -> float:
@@ -2867,6 +2950,10 @@ def main() -> None:
     with G.DB() as db:
         version_states = ingest_state.fetch_repo_version_states(db, repo_id, network_id)
 
+    if not (getattr(args, "release_stats", False) or getattr(args, "dry_run", False) or getattr(args, "backfill", None)):
+        # Before registering as a node or leasing a task
+        _preflight_libclang()
+
     node_id = None
     heartbeat_daemon = None
     lease_ttl, heartbeat_interval = distributed.resolve_lease_settings(get_parser_config().get("distributed"))
@@ -2895,6 +2982,7 @@ def main() -> None:
         logger.info(COLOR.cyan(f"[Worker] Starting secondary worker parser loop (node: '{node_id}')..."))
         preferred_chain = None
         gp._active_task_id = None
+        worker_exit_code = 0
         try:
             while not G.is_deadline_exceeded() and not quit_listener.requested.is_set():
                 with G.DB() as db:
@@ -2926,6 +3014,19 @@ def main() -> None:
                             )
                             if not success:
                                 logger.warning(COLOR.yellow(f"[Worker] Task {t_id} lease was lost/revoked before completion. Skipping rollback to avoid corrupting peer data."))
+                    except SystemicParseError as e:
+                        # This node cannot parse: undo the version, return the task unpenalized, and stop
+                        with G.DB() as db:
+                            if distributed.check_lease_held(db, t_id, node_id):
+                                if getattr(gp, "VID", 0):
+                                    ingest_state.rollback_version(db, network_id, gp.VID, gp.Table_Array)
+                                distributed.release_task(db, t_id, f"Released by {node_id}: {e}", node_id)
+                        logger.critical(COLOR.red(
+                            f"[Worker] Stopping: '{ref_name}' failed with one error across most files, so every task "
+                            "would fail the same way on this node. Fix the cause above and restart the worker."
+                        ))
+                        worker_exit_code = 1
+                        break
                     except Exception as e:
                         logger.error(f"[Worker] Failed parsing '{ref_name}': {e}", exc_info=True)
                         with G.DB() as db:
@@ -2954,15 +3055,19 @@ def main() -> None:
         finally:
             quit_listener.stop()
             heartbeat_daemon.stop()
-            with G.DB() as db:
-                if db is not None:
-                    refresh_person_identities(db, "worker shutdown", only_if_incomplete=True)
-            with G.DB() as db:
-                distributed.unregister_node(db, node_id)
+            try:
+                with G.DB() as db:
+                    if db is not None:
+                        refresh_person_identities(db, "worker shutdown", only_if_incomplete=True)
+                with G.DB() as db:
+                    distributed.unregister_node(db, node_id)
+            except Exception as e:  # noqa: BLE001
+                # E.g. Ctrl+C also stopped the SSH tunnel: an unfinished lease expires and a peer reclaims it
+                logger.warning(COLOR.yellow(f"[Worker] Shutdown cleanup skipped, database unreachable: {e}"))
             G.heartbeat_daemon = None
             G.node_id = None
         logger.info("[Worker] Secondary worker shutdown complete.")
-        G.emergency_shutdown(0)
+        G.emergency_shutdown(worker_exit_code)
         return
 
     if role == distributed.ROLE_MASTER:
@@ -3131,6 +3236,12 @@ def main() -> None:
             update(ref, repo_path=repo_path)
     except MemoryError:
         logger.critical(COLOR.red("FATAL: Memory limit of 60.0 GB (RLIMIT_AS) exceeded! Terminating execution cleanly."))
+        sys.exit(1)
+    except SystemicParseError:
+        logger.critical(COLOR.red(
+            f"[Release Pipeline] Stopped at '{current['ref']}'; its partial rows are rolled back on the next start. "
+            "Fix the cause above, then run again to resume."
+        ))
         sys.exit(1)
     finally:
         quit_listener.stop()

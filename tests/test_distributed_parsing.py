@@ -1753,6 +1753,112 @@ class TestDistributedParsing(unittest.TestCase):
         self.assertEqual(call_order[0], ("rollback", 101))
         self.assertEqual(call_order[1], ("mark_failed", 42))
 
+    def test_worker_systemic_error_releases_task_and_stops(self):
+        """A SystemicParseError rolls the version back, releases the task unpenalized and stops the worker."""
+        from main import G, SystemicParseError, gp, main
+        saved = (getattr(G, "distributed_role", None), getattr(G, "distributed", False), getattr(G, "node_id", None), G.DB)
+
+        cnx = MockConnection()
+        cnx.tasks = [
+            {"task_id": 42, "status": distributed.TASK_LEASED, "worker_id": "test-worker-1", "lease_expires_at": 2000000000}
+        ]
+        db = MockDBDriver(cnx)
+        task = {"task_id": 42, "ref_name": "v3.0.1", "base_ref_name": "v3.0", "base_commit_id": 10,
+                "commit_id": 101, "chain_name": "stable:v3.0"}
+        second = dict(task, task_id=43, ref_name="v3.0.2")
+        call_order = []
+
+        def mock_update(ref_name, repo_path=None):
+            call_order.append(("update", ref_name))
+            gp.VID = 101
+            raise SystemicParseError("63 of 82 files failed with the same error")
+
+        mock_args = mock.MagicMock()
+        mock_args.role = "worker"
+        mock_args.worker_id = "test-worker-1"
+        mock_args.worker_once = False
+        mock_args.repo = "linux"
+        mock_args.ref = ["v3.0.1"]
+        mock_args.single_version = True
+        mock_args.deadline_minutes = 0
+        mock_args.mem_max = 16.0
+        mock_args.config = None
+        mock_args.unit_tests = False
+        for flag in ("reset", "Drop", "cve", "clean_temp", "resolve_ml", "branches", "detect_repos", "delegate_stable"):
+            setattr(mock_args, flag, False)
+
+        with mock.patch("main.arg_handling", return_value=mock_args), \
+             mock.patch("main.setup_memory_limit"), \
+             mock.patch("main._apply_db_server_tuning"), \
+             mock.patch("main.get_mailing_list_config", return_value={"enabled": False}), \
+             mock.patch("main.resolve_git_network_and_repo", return_value=(1, 1)), \
+             mock.patch("core.ingest_state.fetch_repo_version_states", return_value={}), \
+             mock.patch("core.distributed.register_node"), \
+             mock.patch("core.distributed.NodeHeartbeatDaemon"), \
+             mock.patch("core.distributed.reclaim_expired_leases"), \
+             mock.patch("core.distributed.claim_next_task", side_effect=[task, second, None]), \
+             mock.patch("main.update", side_effect=mock_update), \
+             mock.patch("core.ingest_state.rollback_version",
+                        side_effect=lambda d, n, vid, t: call_order.append(("rollback", vid)) or True), \
+             mock.patch("core.distributed.release_task",
+                        side_effect=lambda d, t_id, reason, w: call_order.append(("release", t_id, w)) or True), \
+             mock.patch("core.distributed.mark_task_failed") as mark_failed:
+            G.DB = lambda: unittest.mock.MagicMock(__enter__=lambda s: db, __exit__=lambda s, e, t, b: None)
+            try:
+                with self.assertRaises(SystemExit) as ctx:
+                    main()
+            finally:
+                G.distributed_role, G.distributed, G.node_id, G.DB = saved
+
+        self.assertEqual(ctx.exception.code, 1)
+        self.assertEqual(call_order[:2], [("update", "v3.0.1"), ("rollback", 101)])
+        self.assertEqual(len(call_order), 3)
+        self.assertEqual(call_order[2][:2], ("release", 42))
+        self.assertTrue(call_order[2][2].startswith("test-worker-1"))
+        mark_failed.assert_not_called()
+
+    def test_claim_prefers_the_oldest_release_across_chains(self):
+        """Eligible chains are claimed in release order, not in text order of their names."""
+        mock_db = MagicMock()
+        mock_db.query.return_value = [
+            (1, "stable:v3.0", "stable", "v3.0.1", 0, "v3.0", 5),
+            (2, "stable:v3.10", "stable", "v3.10.1", 0, "v3.10", 6),
+            (3, "stable:v2.6.11", "stable", "v2.6.11.1", 0, "v2.6.11", 4),
+            (4, "next:next-20110101", "next", "next-20110101", 0, "v2.6.37", 3),
+            (5, "branch:history/2.4-stable", "history", "history/2.4-stable", 0, "2.4.15", 2),
+            (6, "stable:v1.1", "stable", "1.1.1", 0, "1.1.0", 1),
+        ]
+        claimed: list[int] = []
+
+        def _execute(sql, params):
+            if sql.startswith("UPDATE m_parse_task SET status") and not claimed:
+                claimed.append(params[3])
+                return 1
+            return 0
+
+        mock_db.execute.side_effect = _execute
+        mock_db.query_one.return_value = None
+        task = distributed.claim_next_task(mock_db, network_id=1, worker_id="w")
+        self.assertEqual(task["ref_name"], "history/2.4-stable")
+        self.assertEqual(claimed, [5])
+
+        mock_db.query.return_value = [r for r in mock_db.query.return_value if r[0] != 5]
+        claimed.clear()
+        order = []
+        mock_db.execute.side_effect = lambda sql, params: order.append(params[3]) or 0
+        self.assertIsNone(distributed.claim_next_task(mock_db, network_id=1, worker_id="w"))
+        self.assertEqual(order, [6, 3, 1, 2, 4])
+
+    def test_release_task_returns_lease_without_counting_an_attempt(self):
+        mock_db = MagicMock()
+        mock_db.execute.return_value = 1
+        self.assertTrue(distributed.release_task(mock_db, 42, "node broken", "w1"))
+        sql, params = mock_db.execute.call_args[0]
+        self.assertNotIn("retry_count", sql)
+        self.assertEqual(params, (distributed.TASK_ELIGIBLE, "node broken", 42, "w1"))
+        mock_db.execute.return_value = 0
+        self.assertFalse(distributed.release_task(mock_db, 42, "node broken", "w1"))
+
 
 
 class TestDistributedCoreFixes(unittest.TestCase):

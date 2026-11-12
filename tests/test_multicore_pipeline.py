@@ -73,6 +73,32 @@ def _crashing_worker(conn, vid, gp_ref, mf_ref, worker_id=0) -> None:
     conn.close()
 
 
+def _failing_worker(conn, vid, gp_ref, mf_ref, worker_id=0) -> None:
+    """Fake parsing worker that reports the same error for every file, like broken libclang bindings."""
+    while True:
+        task = main._recv_task(conn)
+        if task is None:
+            break
+        batch_id, files = task
+        errors = [(f"M\t{f}", "Tried calling method on a null-cursor.", _NULL_CURSOR_TB) for f in files]
+        conn.send_bytes(main._encode_batch_result(batch_id, {}, errors, compress=False))
+    conn.send_bytes(main._FRAME_DONE)
+    conn.close()
+
+
+_REPO = os.path.dirname(os.path.abspath(main.__file__))
+_NULL_CURSOR_TB = (
+    "Traceback (most recent call last):\n"
+    f'  File "{_REPO}/parser/c_ast/c_ast.py", line 137, in c_ast_parse\n'
+    "    process_c_ast(CS)\n"
+    f'  File "{_REPO}/parser/c_ast/cursor_tree.py", line 2607, in exec_punctuation\n'
+    "    kids = tuple(cursor.get_children())\n"
+    '  File "/usr/lib/python3.14/site-packages/clang/cindex.py", line 1629, in inner\n'
+    '    raise Exception("Tried calling method on a null-cursor.")\n'
+    "Exception: Tried calling method on a null-cursor.\n"
+)
+
+
 def _unstartable_worker(conn, vid, gp_ref, mf_ref, worker_id=0) -> None:
     """Fake worker that cannot reach the database."""
     conn.send_bytes(main._FRAME_INIT_FAILED + pickle.dumps((f"Worker {worker_id}", "DB connection failed: refused", "")))
@@ -332,6 +358,50 @@ class TestWorkerStage(unittest.TestCase):
         )
         self.assertEqual(len(seen), 1)
         self.assertIsNotNone(seen[0])
+
+    def test_same_error_on_most_files_stops_the_stage(self) -> None:
+        """A stage stops as soon as one error message covers most files, without ingesting the rest."""
+        errors: list = []
+        ingested: list = []
+        batches = [(i, [f"f{i}_{j}.c" for j in range(2)]) for i in range(20)]
+        with self.assertLogs(main.logger, level="CRITICAL"), self.assertRaises(main.SystemicParseError) as ctx:
+            main._run_worker_stage("[test]", batches, ingested.append, 2, errors, worker_target=_failing_worker)
+        message = str(ctx.exception)
+        self.assertIn("'Tried calling method on a null-cursor.'", message)
+        self.assertIn("clang/cindex.py:1629 in inner, called from parser/c_ast/cursor_tree.py:2607 in exec_punctuation", message)
+        self.assertLess(len(ingested), len(batches))
+
+
+class TestSystemicFailure(unittest.TestCase):
+    """main._raise_if_systemic(): one error across most files stops the version."""
+
+    @staticmethod
+    def _errors(n: int, message: str = "boom") -> list:
+        return [(f"M\tdir/f{i}.c", message, _NULL_CURSOR_TB) for i in range(n)]
+
+    def test_scattered_file_errors_do_not_stop(self) -> None:
+        errors = [(f"M\tf{i}.c", f"error {i}", "") for i in range(30)]
+        main._raise_if_systemic("[test]", errors, 40)
+
+    def test_few_files_do_not_stop(self) -> None:
+        main._raise_if_systemic("[test]", self._errors(main.SYSTEMIC_ERROR_MIN_FILES - 1), main.SYSTEMIC_ERROR_MIN_FILES - 1)
+
+    def test_same_error_on_a_minority_of_files_does_not_stop(self) -> None:
+        main._raise_if_systemic("[test]", self._errors(10), 100)
+
+    def test_same_error_on_most_files_stops(self) -> None:
+        with self.assertLogs(main.logger, level="CRITICAL"), self.assertRaises(main.SystemicParseError) as ctx:
+            main._raise_if_systemic("Version 'v3.0.1'", self._errors(63), 82)
+        self.assertIn("63 of 82 files", str(ctx.exception))
+        self.assertIn("dir/f0.c", str(ctx.exception))
+
+    def test_error_origin_names_the_raising_and_the_calling_frame(self) -> None:
+        self.assertEqual(
+            main._error_origin(_NULL_CURSOR_TB),
+            "/usr/lib/python3.14/site-packages/clang/cindex.py:1629 in inner, "
+            "called from parser/c_ast/cursor_tree.py:2607 in exec_punctuation",
+        )
+        self.assertEqual(main._error_origin(""), "")
 
 
 class TestTriggerMulticore(unittest.TestCase):

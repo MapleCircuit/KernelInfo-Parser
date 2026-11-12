@@ -13,6 +13,95 @@ import clang.cindex as cc
 from core.globalstuff import clean_unnamed_spelling
 
 
+def _restore_null_cursor_semantics() -> int:
+    """Remove the `cursor_null_guard` wrapper that clang >= 22 bindings put on `cc.Cursor` methods.
+
+    The guard raises "Tried calling method on a null-cursor." on any guarded method of the null cursor, and
+    costs an extra `clang_equalCursors` call on every guarded call. The parser reads the null cursor's kind
+    (`INVALID_FILE`) and children on purpose, which libclang supports, as the bindings up to clang 21 did.
+    Returns the number of methods and properties restored (0 for bindings without the guard).
+    """
+    guard = getattr(cc, "cursor_null_guard", None)
+    if guard is None:
+        return 0
+    guard_code = guard(lambda self: None).__code__
+
+    def _unwrap(fn: Any) -> Any:
+        code = getattr(fn, "__code__", None)
+        if code is not guard_code or not fn.__closure__ or "func" not in code.co_freevars:
+            return None
+        return fn.__closure__[code.co_freevars.index("func")].cell_contents
+
+    restored = 0
+    for name, attr in list(vars(cc.Cursor).items()):
+        if isinstance(attr, property):
+            original = _unwrap(attr.fget)
+            if original is not None:
+                setattr(cc.Cursor, name, property(original, attr.fset, attr.fdel, attr.__doc__))
+                restored += 1
+        else:
+            original = _unwrap(attr)
+            if original is not None:
+                setattr(cc.Cursor, name, original)
+                restored += 1
+    return restored
+
+
+# Applied on import, before any cursor is created (forked parsing workers inherit the patched class)
+NULL_GUARDS_REMOVED = _restore_null_cursor_semantics()
+
+_SELF_TEST_SOURCE = (
+    "struct s { int a; };\n"
+    "typedef struct s s_t;\n"
+    "static int f(s_t *p) { return p->a + sizeof(int); }\n"
+)
+
+
+def libclang_version() -> str:
+    """The loaded libclang's version string, e.g. "clang version 22.1.0" ("unknown" if it cannot be read)."""
+    try:
+        fn = cc.conf.lib.clang_getClangVersion
+        fn.argtypes = []
+        fn.restype = cc._CXString
+        return str(cc._CXString.from_result(fn()))
+    except Exception:  # noqa: BLE001
+        return "unknown"
+
+
+def libclang_self_test() -> str:
+    """Check that libclang and its Python bindings behave the way the C parser relies on.
+
+    Parses a small in-memory translation unit, walks every cursor reading the attributes the parser reads,
+    and uses the null cursor the way the parser does. Returns a one-line description of the bindings.
+
+    Raises:
+        RuntimeError: naming the bindings file, the libclang version and the failing operation.
+    """
+    version = libclang_version()
+    where = f"bindings {cc.__file__}, {version}"
+    try:
+        null = cc.conf.lib.clang_getNullCursor()
+        if null.kind != cc.CursorKind.INVALID_FILE:
+            raise RuntimeError(f"the null cursor reports kind {null.kind}, not INVALID_FILE")
+        list(null.get_children())
+        tu = cc.Index.create().parse(
+            "kip_self_test.c", args=["-x", "c"], unsaved_files=[("kip_self_test.c", _SELF_TEST_SOURCE)]
+        )
+        walked = 0
+        for cursor in tu.cursor.walk_preorder():
+            _ = (cursor.kind, cursor.spelling, cursor.extent, cursor.location, cursor.type.kind)
+            ref = cursor.referenced
+            if ref is not None:
+                _ = (ref.kind, ref.spelling, ref.location)
+            walked += 1
+        if walked < 5:
+            raise RuntimeError(f"the self-test translation unit produced only {walked} cursor(s)")
+    except Exception as e:
+        raise RuntimeError(f"libclang self-test failed ({where}): {type(e).__name__}: {e}") from e
+    guards = f"; removed the null-cursor guard from {NULL_GUARDS_REMOVED} Cursor methods" if NULL_GUARDS_REMOVED else ""
+    return f"{where}{guards}"
+
+
 class AST_KIND(IntEnum):
     punctuation = 0
     keyword = 1

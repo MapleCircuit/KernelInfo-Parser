@@ -6,17 +6,17 @@ agents.
 
 ## Table of Contents
 - **§1**: Global Runtime & Type Subsystem (`core/globalstuff.py`) [L23-L211]
-- **§2**: Filesystem & Git Subsystem (`core/FileHandler.py`) [L212-L279]
-- **§3**: Runtime State & Multiprocessing IPC (`core/GreatProcessor.py`) [L280-L459]
-- **§4**: Relational Database Schema Registry (`core/DBLayout.py`, `core/ingest_state.py`, `core/checkpoints.py`) [L460-L647]
-- **§5**: Data Staging, Routing & Reference Resolution (`core/TableHandling.py`) [L648-L807]
-- **§6**: End-to-End Inter-Module Execution Lifecycle [L808-L949]
-- **§7**: Configuration, SSH Port Forwarding & TUI (`core/config.py`, `core/ssh_tunnel.py`, `core/tui/`) [L950-L1234]
-- **§8**: Mailing List Commit Resolver (`parser/mailing_list/`) [L1235-L1483]
-- **§9**: CVE List Ingestion (`parser/cve/`) [L1484-L1516]
-- **§10**: Release Statistics (`parser/git_ast/release_stats.py`) [L1517-L1570]
-- **§11**: Distributed Multi-Computer Parsing (`core/distributed.py`) [L1571-L1694]
-- **§12**: Backfills of Derived Tables (`core/backfills.py`) [L1695-L1731]
+- **§2**: Filesystem & Git Subsystem (`core/FileHandler.py`) [L212-L280]
+- **§3**: Runtime State & Multiprocessing IPC (`core/GreatProcessor.py`) [L281-L472]
+- **§4**: Relational Database Schema Registry (`core/DBLayout.py`, `core/ingest_state.py`, `core/checkpoints.py`) [L473-L660]
+- **§5**: Data Staging, Routing & Reference Resolution (`core/TableHandling.py`) [L661-L820]
+- **§6**: End-to-End Inter-Module Execution Lifecycle [L821-L962]
+- **§7**: Configuration, SSH Port Forwarding & TUI (`core/config.py`, `core/ssh_tunnel.py`, `core/tui/`) [L963-L1254]
+- **§8**: Mailing List Commit Resolver (`parser/mailing_list/`) [L1255-L1503]
+- **§9**: CVE List Ingestion (`parser/cve/`) [L1504-L1536]
+- **§10**: Release Statistics (`parser/git_ast/release_stats.py`) [L1537-L1590]
+- **§11**: Distributed Multi-Computer Parsing (`core/distributed.py`) [L1591-L1715]
+- **§12**: Backfills of Derived Tables (`core/backfills.py`) [L1716-L1751]
 
 ---
 
@@ -381,6 +381,18 @@ Central runtime container, schema registry, and worker IPC coordinator.
     per batch without stopping the stage. The deadline is checked while waiting, so an idle stage still stops
     on time. Stage 1 header batches are bounded by bytes and kept in include order; Stage 1 and each epoch log
     their parsing time and the gap between the first and the last worker exit.
+  - **Systemic failure stop (`main._raise_if_systemic`)**: One error message on at least
+    `SYSTEMIC_ERROR_MIN_FILES` (5) files and on at least `SYSTEMIC_ERROR_FRACTION` (half) of the files parsed
+    so far raises `SystemicParseError`. Each stage checks its own files after every batch that carries errors
+    (stopping its workers at once), and `trigger_multicore()` checks both stages together at the end. The
+    message names the error, where it was raised (`_error_origin()`: the innermost traceback frame and the
+    innermost frame inside the repository, e.g. `clang/cindex.py:… in inner, called from
+    parser/c_ast/cursor_tree.py:… in exec_punctuation`) and example files, and the first traceback is logged
+    at error level. The version is not recorded: the master exits with status 1 and the next start rolls the
+    interrupted version back; a worker releases its task (§11). Before registering as a node or parsing,
+    `main._preflight_libclang()` runs `parser.c_ast.ctypes_bindings.libclang_self_test()` and exits with
+    status 1 when libclang or its bindings cannot run the C parser (skipped for `--release-stats`,
+    `--dry-run` and `--backfill`).
   - **Background commits during stages**: Between forking its workers and reaping them, `_run_worker_stage`
     sets `G.TE.async_commits` (`_begin_background_commits()`), so chunk commits triggered while ingesting are
     written by the TableEngine's writer thread while the parent keeps ingesting. `_end_background_commits()`
@@ -1616,7 +1628,8 @@ and isolated crash recovery.
     `status = TASK_ELIGIBLE`.
   - Prioritizes the same release chain previously processed to maximize `TECachedDB` warm-cache and checkpoint
     delta locality, ordering candidate queries naturally across topological tiers: `history` secondary branches
-    first, stable update series second, and `linux-next` integration tasks third (`ORDER BY CASE WHEN chain_name LIKE 'history%' OR chain_kind = 'history' THEN 1 WHEN chain_kind = 'stable' THEN 2 WHEN chain_name LIKE '%next%' OR chain_kind = 'next' THEN 3 ELSE 4 END ASC, LENGTH(chain_name) ASC, chain_name ASC, seq_order ASC`).
+    first, stable update series second, and `linux-next` integration tasks third (`_claim_priority()`, the same tiers as `ORDER BY CASE WHEN chain_name LIKE 'history%' OR chain_kind = 'history' THEN 1 WHEN chain_kind = 'stable' THEN 2 WHEN chain_name LIKE '%next%' OR chain_kind = 'next' THEN 3 ELSE 4 END`). Within a tier the oldest release comes first: the scan reads up to `_CLAIM_SCAN_LIMIT` (2000) eligible tasks and sorts them by `release_order.release_key(ref_name)`, because text order of chain names puts `stable:v3.0` before `stable:v2.6.11`. A chain is eligible only once its base release is `done`, so a stable chain whose base an earlier run already parsed (for example `stable:v3.0` on a database that holds `v3.0`) is claimed while the master is still parsing older mainline releases.
+  - **Node Failures Release Tasks**: When a version fails with `SystemicParseError` (one error across most of its files, §3 systemic failure stop), the worker rolls back the version, hands the task back with `distributed.release_task()` (`TASK_ELIGIBLE`, `worker_id = ''`, `retry_count` unchanged, reason in `error_msg`) and exits with status 1, so a node with a broken environment neither burns the task's three attempts nor cascades failure to its dependents. The worker's shutdown cleanup (`refresh_person_identities()`, `unregister_node()`) logs a warning instead of raising when the database is unreachable (Ctrl+C also stops an SSH tunnel's `ssh` process); the lease of an unfinished task then expires and `reclaim_expired_leases()` recovers it.
   - While waiting when the queue is temporarily empty, monitors active Master heartbeats, in-progress tasks, and dependency states via `is_parsing_finished()`, exiting cleanly only when all parsing across the repository has completed.
 - **Task Leasing & Dependency Unlocking (`core/distributed.py`)**:
   - **Task Claiming**: `distributed.claim_next_task()` atomically leases an eligible task, sets `status = TASK_LEASED` (2),

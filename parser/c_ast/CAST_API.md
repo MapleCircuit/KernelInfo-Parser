@@ -6,20 +6,20 @@ Authoritative, dense architectural specification and technical contract across `
 maintaining, or interfacing with the next-generation C & Assembly AST parsing engine.
 
 ## Table of Contents
-- **§1**: High-Level Architecture & 2-Stage Parsing Pipeline [L25-L105]
-- **§2**: File Lifecycle Dispatch & ChangeSet Lifecycle (`c_ast.py`) [L106-L233]
-- **§3**: Libclang Ctypes FFI Fast-Path (`ctypes_bindings.py`) [L234-L340]
-- **§4**: Spatial Coordinate Model & Token Streaming (`tokenizer.py`) [L341-L400]
-- **§5**: Intermediate AST Node Hierarchy (`ast_nodes.py`, `cursor_tree.py`) [L401-L570]
-- **§6**: C Type System, Qualifiers & Declarations (`ast_nodes.py`, `cursor_tree.py`) [L571-L623]
-- **§7**: Semantic Scope & AST Partitioning (`cursor_tree.py`, `ast_nodes.py`) [L624-L1031]
-  - `7.1` Zone Types & Cursor Sweeps [L626-L639] | `7.3` Declarator State Machine [L726-L1031]
-- **§8**: 4-Tier Prior Tag Evolution Matching Engine (`tag_tracker.py`) [L1032-L1097]
-- **§9**: Relational ChangeSet Extraction & `SymbolRows` (`cs_extractor.py`, `core/SymbolRows.py`) [L1098-L1181]
-- **§10**: Complete `ASTT` Type System & Keyword Mappings [L1182-L1230]
-- **§11**: Critical Engine Invariants & AI Development Guidelines [L1231-L1279]
-- **§12**: Unit Testing & Snapshot Verification Contract (`unit_test/test_c_parser.py`) [L1280-L1330]
-- **§13**: Pure C Outline Extractor (`c_pure_extractor.py`) [L1331-L1350]
+- **§1**: High-Level Architecture & 2-Stage Parsing Pipeline [L26-L106]
+- **§2**: File Lifecycle Dispatch & ChangeSet Lifecycle (`c_ast.py`) [L107-L234]
+- **§3**: Libclang Ctypes FFI Fast-Path (`ctypes_bindings.py`) [L235-L357]
+- **§4**: Spatial Coordinate Model & Token Streaming (`tokenizer.py`) [L358-L417]
+- **§5**: Intermediate AST Node Hierarchy (`ast_nodes.py`, `cursor_tree.py`) [L418-L587]
+- **§6**: C Type System, Qualifiers & Declarations (`ast_nodes.py`, `cursor_tree.py`) [L588-L640]
+- **§7**: Semantic Scope & AST Partitioning (`cursor_tree.py`, `ast_nodes.py`) [L641-L1048]
+  - `7.1` Zone Types & Cursor Sweeps [L643-L656] | `7.3` Declarator State Machine [L743-L1048]
+- **§8**: 4-Tier Prior Tag Evolution Matching Engine (`tag_tracker.py`) [L1049-L1114]
+- **§9**: Relational ChangeSet Extraction & `SymbolRows` (`cs_extractor.py`, `core/SymbolRows.py`) [L1115-L1198]
+- **§10**: Complete `ASTT` Type System & Keyword Mappings [L1199-L1247]
+- **§11**: Critical Engine Invariants & AI Development Guidelines [L1248-L1296]
+- **§12**: Unit Testing & Snapshot Verification Contract (`unit_test/test_c_parser.py`) [L1297-L1347]
+- **§13**: Pure C Outline Extractor (`c_pure_extractor.py`) [L1348-L1360]
 
 ---
 
@@ -236,6 +236,22 @@ Compatibility adapter connecting `TokenStream` with `Zone` execution:
 
 Bypasses Python-C API boundary overhead in `clang.cindex` by binding directly to shared library foreign
 function pointers with pre-allocated ctypes buffers.
+
+### 3.0 Bindings Compatibility & Self-Test
+- **Null-cursor semantics**: The parser reads the null cursor's kind (`CursorKind.INVALID_FILE`) and children
+  on purpose (e.g. `exec_identifier`, `exec_punctuation` in `cursor_tree.py`), which libclang supports.
+  Bindings from clang 22 on wrap most `cc.Cursor` methods and properties in `cursor_null_guard`, which raises
+  `Exception("Tried calling method on a null-cursor.")` there and adds a `clang_equalCursors` call to every
+  guarded call. On import, `_restore_null_cursor_semantics()` replaces each guarded attribute of `cc.Cursor`
+  with the function the guard wraps (identified by the guard's code object, the function read from its
+  closure) and stores the count in `NULL_GUARDS_REMOVED` (0 for bindings without the guard). Forked parsing
+  workers inherit the patched class.
+- **`libclang_version() -> str`**: `clang_getClangVersion()` of the loaded library (`"unknown"` if unreadable).
+- **`libclang_self_test() -> str`**: Parses a small in-memory C translation unit, walks every cursor reading
+  `kind`, `spelling`, `extent`, `location`, `type.kind` and `referenced`, and reads the null cursor's kind and
+  children. Returns `"bindings <cindex.py path>, <libclang version>[; removed the null-cursor guard from N
+  Cursor methods]"`; raises `RuntimeError` naming the bindings file, the libclang version and the failing
+  operation. `main._preflight_libclang()` runs it before parsing (`core/API.md` §3).
 
 ### 3.1 Direct Ctypes Function Signatures
 ```python

@@ -347,6 +347,70 @@ def run_single_file_worker(item: dict[str, Any]) -> dict[str, Any]:
             shutil.rmtree(temp_dir, ignore_errors=True)
 
 
+class TestLibclangCompat(unittest.TestCase):
+    """parser/c_ast/ctypes_bindings.py: null-cursor guard removal (clang >= 22 bindings) and self-test."""
+
+    @staticmethod
+    def _guard(func):
+        """Same shape as clang 22's `cindex.cursor_null_guard`."""
+
+        def inner(self, *args, **kwargs):
+            if self.is_null():
+                raise Exception("Tried calling method on a null-cursor.")  # noqa: TRY002
+            return func(self, *args, **kwargs)
+
+        return inner
+
+    def test_guarded_cursor_methods_are_restored(self) -> None:
+        import clang.cindex as cc
+
+        from parser.c_ast import ctypes_bindings
+
+        saved = {name: vars(cc.Cursor)[name] for name in ("kind", "get_children")}
+        had_guard = hasattr(cc, "cursor_null_guard")
+        saved_guard = getattr(cc, "cursor_null_guard", None)
+        saved_is_null = vars(cc.Cursor).get("is_null")
+        try:
+            cc.cursor_null_guard = self._guard
+            if saved_is_null is None:
+                cc.Cursor.is_null = lambda self: self == cc.conf.lib.clang_getNullCursor()
+            cc.Cursor.kind = property(self._guard(saved["kind"].fget))
+            cc.Cursor.get_children = self._guard(saved["get_children"])
+            null = cc.conf.lib.clang_getNullCursor()
+            with self.assertRaisesRegex(Exception, "null-cursor"):
+                _ = null.kind
+
+            self.assertGreaterEqual(ctypes_bindings._restore_null_cursor_semantics(), 2)
+            self.assertEqual(null.kind, cc.CursorKind.INVALID_FILE)
+            self.assertEqual(list(null.get_children()), [])
+            self.assertIn("bindings", ctypes_bindings.libclang_self_test())
+        finally:
+            for name, attr in saved.items():
+                setattr(cc.Cursor, name, attr)
+            if saved_is_null is None and "is_null" in vars(cc.Cursor):
+                del cc.Cursor.is_null
+            if had_guard:
+                cc.cursor_null_guard = saved_guard
+            elif hasattr(cc, "cursor_null_guard"):
+                del cc.cursor_null_guard
+
+    def test_self_test_reports_broken_bindings(self) -> None:
+        import clang.cindex as cc
+
+        from parser.c_ast import ctypes_bindings
+
+        saved = vars(cc.Cursor)["get_children"]
+        try:
+            def _broken(cursor):
+                raise Exception("Tried calling method on a null-cursor.")  # noqa: TRY002
+
+            cc.Cursor.get_children = _broken
+            with self.assertRaisesRegex(RuntimeError, r"libclang self-test failed \(bindings .*cindex\.py"):
+                ctypes_bindings.libclang_self_test()
+        finally:
+            cc.Cursor.get_children = saved
+
+
 class TestCASTParser(unittest.TestCase):
     """Unit test suite for Clang C-AST parser and ChangeSet execution."""
 
